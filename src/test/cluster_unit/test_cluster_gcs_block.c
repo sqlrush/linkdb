@@ -4342,6 +4342,51 @@ UT_TEST(test_pcm_x_drive_anomaly_streak_gates_fail_closed)
 }
 
 
+/* The generic master-drive fuse used to collapse every hard result onto its
+ * own helper line.  Preserve the winning operation, numeric result, and the
+ * best exact ticket/request identity at all ten call sites so a critical-
+ * section fuse remains reconstructable from pg_cluster_state alone. */
+UT_TEST(test_pcm_x_master_drive_fail_closed_preserves_operation_context)
+{
+	char *source = read_gcs_block_source();
+	const char *helper;
+	const char *detail;
+	const char *macro;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	helper = strstr(source, "\ngcs_block_pcm_x_master_drive_fail_closed_at(");
+	detail = helper != NULL
+			 ? strstr(helper, "cluster_pcm_x_runtime_fail_closed_detail_at(site_file, site_line, stage,")
+			 : NULL;
+	macro = detail != NULL
+			? strstr(detail, "#define gcs_block_pcm_x_master_drive_fail_closed(stage, result, context_id)")
+			: NULL;
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(detail);
+	UT_ASSERT_NOT_NULL(macro);
+	UT_ASSERT_NOT_NULL(strstr(source, "gcs_block_pcm_x_master_drive_fail_closed(\n"
+								  "\t\t\t\"promote\", result,"));
+	UT_ASSERT_NOT_NULL(strstr(source,
+						  "gcs_block_pcm_x_master_drive_fail_closed(\"snapshot\", result,"));
+	UT_ASSERT_NOT_NULL(strstr(source,
+						  "gcs_block_pcm_x_master_drive_fail_closed(drive_stage, result,"));
+	UT_ASSERT_NOT_NULL(strstr(source,
+						  "gcs_block_pcm_x_master_drive_fail_closed(\"terminal-cleanup\", result,"));
+	UT_ASSERT_NOT_NULL(strstr(source,
+						  "gcs_block_pcm_x_master_drive_fail_closed(\"terminal-snapshot\", result,"));
+	UT_ASSERT_NOT_NULL(strstr(source,
+						  "gcs_block_pcm_x_master_drive_fail_closed(\"passive-authorize\","));
+	UT_ASSERT_NOT_NULL(strstr(source, "\"invalidate-backoff\", queue_result,"));
+	UT_ASSERT_NOT_NULL(strstr(source, "\"invalidate-match\", queue_result,"));
+	UT_ASSERT_NOT_NULL(strstr(source, "\"invalidate-authority\", PCM_X_QUEUE_BAD_STATE,"));
+	UT_ASSERT_NOT_NULL(strstr(source, "\"invalidate-bitmap\", queue_result,"));
+	UT_ASSERT_EQ(count_occurrences(source, "gcs_block_pcm_x_master_drive_fail_closed("), 11);
+	free(source);
+}
+
+
 /* Pin the four transient-churn recovery arms in the source:  benign slot
  * churn and two-phase cookie windows must route to per-request refresh or
  * per-ticket damping instead of an immediate runtime fuse. */
@@ -5645,7 +5690,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(108);
+	UT_PLAN(109);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5733,6 +5778,7 @@ main(void)
 	UT_RUN(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles);
 	UT_RUN(test_pcm_x_requester_retry_policy_is_operation_exact);
 	UT_RUN(test_pcm_x_drive_anomaly_streak_gates_fail_closed);
+	UT_RUN(test_pcm_x_master_drive_fail_closed_preserves_operation_context);
 	UT_RUN(test_pcm_x_transient_churn_recovers_without_runtime_fuse);
 	UT_RUN(test_pcm_x_remote_reservation_preflight_binds_identity_base);
 	UT_RUN(test_pcm_x_requester_wait_backoff_saturates);

@@ -567,7 +567,8 @@ typedef enum PcmXDirectoryMatch {
 } PcmXDirectoryMatch;
 
 
-static void pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line);
+static void pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line,
+											const char *stage, uint32 result, uint64 context_id);
 static PcmXSlotHeader *pcm_x_domain_slot(PcmXAllocatorKind kind, PcmXSlotRef ref,
 										 const BufferTag *expected_tag, uint32 allowed_state_mask);
 static void pcm_x_local_gate_acquire_guarded(LWLock *lock, LWLockMode mode,
@@ -575,7 +576,8 @@ static void pcm_x_local_gate_acquire_guarded(LWLock *lock, LWLockMode mode,
 
 /* Capture each internal fail-closed arm (file:line) while keeping the many
  * zero-argument call sites in this file textually unchanged. */
-#define pcm_x_runtime_fail_closed() pcm_x_runtime_fail_closed_impl(__FILE__, __LINE__)
+#define pcm_x_runtime_fail_closed() \
+	pcm_x_runtime_fail_closed_impl(__FILE__, __LINE__, NULL, 0, 0)
 
 
 /* Required runtime precondition: never nest allocator under a tag domain. */
@@ -1103,7 +1105,8 @@ cluster_pcm_x_stats_note_barrier_unwind(void)
 
 
 static void
-pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line)
+pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line, const char *stage,
+							   uint32 result, uint64 context_id)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	bool transitioned;
@@ -1121,8 +1124,13 @@ pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line)
 		 * in between, so writes are serialized. */
 		base = strrchr(site_file, '/');
 		base = (base != NULL) ? base + 1 : site_file;
-		snprintf(header->fail_closed_site, sizeof(header->fail_closed_site), "%s:%d", base,
-				 site_line);
+		if (stage != NULL)
+			snprintf(header->fail_closed_site, sizeof(header->fail_closed_site),
+					 "%s:%d r=%u id=%llu s=%s", base, site_line, result,
+					 (unsigned long long)context_id, stage);
+		else
+			snprintf(header->fail_closed_site, sizeof(header->fail_closed_site), "%s:%d", base,
+					 site_line);
 		pcm_x_stats_increment(&header->stats.recovery_blocked_count);
 
 		/* At most one log line per ACTIVE generation (single CAS winner), so
@@ -1130,8 +1138,8 @@ pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line)
 		 * above stays observable through pg_cluster_state either way. */
 		if (CritSectionCount == 0)
 			ereport(LOG,
-					(errmsg("cluster PCM-X runtime fail-closed (recovery blocked) at %s:%d", base,
-							site_line),
+					(errmsg("cluster PCM-X runtime fail-closed (recovery blocked) at %s",
+							header->fail_closed_site),
 					 errhint("Writer conversions on this node stay fail-closed until the PCM-X "
 							 "runtime is reformed.")));
 	}
@@ -1141,7 +1149,15 @@ pcm_x_runtime_fail_closed_impl(const char *site_file, int site_line)
 void
 cluster_pcm_x_runtime_fail_closed_at(const char *site_file, int site_line)
 {
-	pcm_x_runtime_fail_closed_impl(site_file, site_line);
+	pcm_x_runtime_fail_closed_impl(site_file, site_line, NULL, 0, 0);
+}
+
+
+void
+cluster_pcm_x_runtime_fail_closed_detail_at(const char *site_file, int site_line,
+										const char *stage, uint32 result, uint64 context_id)
+{
+	pcm_x_runtime_fail_closed_impl(site_file, site_line, stage, result, context_id);
 }
 
 

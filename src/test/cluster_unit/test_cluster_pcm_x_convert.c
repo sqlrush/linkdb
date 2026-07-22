@@ -8094,6 +8094,26 @@ UT_TEST(test_runtime_fail_closed_records_winning_site_only)
 	UT_ASSERT(strcmp(site, first) == 0);
 }
 
+UT_TEST(test_runtime_fail_closed_detail_records_complete_winning_context)
+{
+	char site[PCM_X_FAIL_CLOSED_SITE_LEN];
+	const char *expected = "cluster_gcs_block.c:16175 r=9 id=18446744073709551615 "
+						   "s=invalidate-authority";
+
+	init_active_pcm_x(UINT64_C(77));
+	cluster_pcm_x_runtime_fail_closed_detail_at(
+		"/build/src/backend/cluster/cluster_gcs_block.c", 16175, "invalidate-authority",
+		(uint32)PCM_X_QUEUE_BAD_STATE, UINT64_MAX);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT(cluster_pcm_x_runtime_fail_closed_site(site, sizeof(site)));
+	UT_ASSERT(strcmp(site, expected) == 0);
+	UT_ASSERT_EQ(strlen(site), strlen(expected));
+	/* A later losing generic caller cannot erase the winning operation data. */
+	cluster_pcm_x_runtime_fail_closed();
+	UT_ASSERT(cluster_pcm_x_runtime_fail_closed_site(site, sizeof(site)));
+	UT_ASSERT(strcmp(site, expected) == 0);
+}
+
 UT_TEST(test_master_debug_iterators_report_live_slots)
 {
 	PcmXMasterAdmission admission;
@@ -16900,7 +16920,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(280);
+	UT_PLAN(281);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -17041,6 +17061,7 @@ main(void)
 	UT_RUN(test_recovery_blocked_runtime_cannot_promote_or_begin_transfer);
 	UT_RUN(test_recovery_blocked_runtime_refuses_ack_and_local_mutators);
 	UT_RUN(test_runtime_fail_closed_records_winning_site_only);
+	UT_RUN(test_runtime_fail_closed_detail_records_complete_winning_context);
 	UT_RUN(test_master_debug_iterators_report_live_slots);
 	UT_RUN(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage);
 	UT_RUN(test_master_terminal_work_scan_covers_younger_tickets);

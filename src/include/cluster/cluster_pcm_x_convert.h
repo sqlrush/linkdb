@@ -1248,7 +1248,7 @@ typedef struct PcmXOutboundTargetFrontier {
 	uint64 next_prehandle_sequence;
 } PcmXOutboundTargetFrontier;
 
-/* Bytes reserved for the "file:line" fail-closed provenance string. */
+/* Bytes reserved for the winning fail-closed provenance string. */
 #define PCM_X_FAIL_CLOSED_SITE_LEN 80
 
 typedef struct PcmXShmemHeader {
@@ -1271,9 +1271,10 @@ typedef struct PcmXShmemHeader {
 	PcmXPeerFrontier peer_frontiers[PCM_X_PROTOCOL_NODE_LIMIT];
 	PcmXStats stats;
 	PcmXOutboundTargetFrontier outbound_targets[PCM_X_PROTOCOL_NODE_LIMIT];
-	/* "file:line" of the call site that most recently won the transition into
-	 * PCM_X_RUNTIME_RECOVERY_BLOCKED.  Single-writer by construction: only the
-	 * CAS winner inside pcm_x_runtime_fail_closed_at() writes it, and two
+	/* Provenance of the call site that most recently won the transition into
+	 * PCM_X_RUNTIME_RECOVERY_BLOCKED.  The generic form is "file:line"; a
+	 * context-aware caller appends queue result, ticket/request id, and stage.
+	 * Single-writer by construction: only the CAS winner writes it, and two
 	 * successful transitions are always separated by a full reactivation.
 	 * Readers are diagnostic-only (pg_cluster_state dump) and tolerate an
 	 * in-progress overwrite after such a reactivation. */
@@ -1408,6 +1409,11 @@ extern bool cluster_pcm_x_runtime_transition(PcmXRuntimeState expected, PcmXRunt
  * can be diagnosed post-mortem without per-site plumbing. */
 extern void cluster_pcm_x_runtime_fail_closed_at(const char *site_file, int site_line);
 #define cluster_pcm_x_runtime_fail_closed() cluster_pcm_x_runtime_fail_closed_at(__FILE__, __LINE__)
+/* Context-aware diagnostic variant for a shared fail-closed helper.  The
+ * context id is the best exact ticket or request identity available. */
+extern void cluster_pcm_x_runtime_fail_closed_detail_at(const char *site_file, int site_line,
+												 const char *stage, uint32 result,
+												 uint64 context_id);
 /* Copies the recorded fail-closed site into buf; false when never fused. */
 extern bool cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen);
 /* Diagnostic iterators over live master tag / occupied ticket slots for the

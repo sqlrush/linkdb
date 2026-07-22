@@ -10272,11 +10272,17 @@ gcs_block_pcm_x_master_drive_requires_recovery(PcmXQueueResult result)
 
 
 static void
-gcs_block_pcm_x_master_drive_fail_closed(PcmXQueueResult result)
+gcs_block_pcm_x_master_drive_fail_closed_at(const char *site_file, int site_line,
+										 const char *stage, PcmXQueueResult result,
+										 uint64 context_id)
 {
 	if (gcs_block_pcm_x_master_drive_requires_recovery(result))
-		cluster_pcm_x_runtime_fail_closed();
+		cluster_pcm_x_runtime_fail_closed_detail_at(site_file, site_line, stage, (uint32)result,
+											context_id);
 }
+
+#define gcs_block_pcm_x_master_drive_fail_closed(stage, result, context_id) \
+	gcs_block_pcm_x_master_drive_fail_closed_at(__FILE__, __LINE__, stage, result, context_id)
 
 
 /* Process-local BAD_STATE damping for the drive dispatch (one table per
@@ -10960,14 +10966,16 @@ gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 			cluster_gcs_pcm_x_drive_anomaly_settle(gcs_block_pcm_x_drive_anomaly_table,
 												   GCS_BLOCK_PCM_X_DRIVE_ANOMALY_SLOTS, tag);
 		gcs_block_pcm_x_master_drive_note("promote", result, tag, cluster_epoch, observed_ptr);
-		gcs_block_pcm_x_master_drive_fail_closed(result);
+		gcs_block_pcm_x_master_drive_fail_closed(
+			"promote", result,
+			observed_ptr != NULL ? observed.ref.handle.ticket_id : active.handle.ticket_id);
 		return;
 	}
 	result = cluster_pcm_x_master_drive_snapshot_exact(tag, cluster_epoch, &snapshot);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result != PCM_X_QUEUE_OK) {
 		gcs_block_pcm_x_master_drive_note("snapshot", result, tag, cluster_epoch, NULL);
-		gcs_block_pcm_x_master_drive_fail_closed(result);
+		gcs_block_pcm_x_master_drive_fail_closed("snapshot", result, active.handle.ticket_id);
 		return;
 	}
 	if (snapshot.ticket_state == PCM_XT_ACTIVE_PROBE
@@ -11009,7 +11017,8 @@ gcs_block_pcm_x_master_drive_tag(const BufferTag *tag, uint64 cluster_epoch)
 												 GCS_BLOCK_PCM_X_DRIVE_ANOMALY_SLOTS, tag,
 												 snapshot.ref.handle.ticket_id))
 		return;
-	gcs_block_pcm_x_master_drive_fail_closed(result);
+	gcs_block_pcm_x_master_drive_fail_closed(drive_stage, result,
+										 snapshot.ref.handle.ticket_id);
 }
 
 
@@ -13957,13 +13966,15 @@ cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref)
 		cluster_pcm_x_terminal_note(PCM_X_TERMINAL_NOTE_CANCEL_CLEANUP, (uint32)result,
 									ref->handle.ticket_id);
 		if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE) {
-			gcs_block_pcm_x_master_drive_fail_closed(result);
+			gcs_block_pcm_x_master_drive_fail_closed("terminal-cleanup", result,
+											 ref->handle.ticket_id);
 			return;
 		}
 		result = cluster_pcm_x_master_cancel_ack_snapshot_exact(ref, &cancelled, &prehandle_cancel);
 		cluster_pcm_x_stats_note_queue_result(result);
 		if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE) {
-			gcs_block_pcm_x_master_drive_fail_closed(result);
+			gcs_block_pcm_x_master_drive_fail_closed("terminal-snapshot", result,
+											 ref->handle.ticket_id);
 			return;
 		}
 		/* The requester must observe the phase-exact cancel ACK before DRAIN.
@@ -15646,7 +15657,8 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 			} else if (queue_result == PCM_X_QUEUE_CORRUPT
 					   || queue_result == PCM_X_QUEUE_COUNTER_EXHAUSTED
 					   || queue_result == PCM_X_QUEUE_INVALID) {
-				gcs_block_pcm_x_master_drive_fail_closed(queue_result);
+				gcs_block_pcm_x_master_drive_fail_closed("passive-authorize", queue_result,
+												 inv->request_id);
 				return false;
 			}
 		}
@@ -16093,12 +16105,14 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 			if (queue_result == PCM_X_QUEUE_OK || queue_result == PCM_X_QUEUE_DUPLICATE)
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->invalidate_busy_received_count, 1);
 			else
-				gcs_block_pcm_x_master_drive_fail_closed(queue_result);
+				gcs_block_pcm_x_master_drive_fail_closed(
+					"invalidate-backoff", queue_result, queue_snapshot.ref.handle.ticket_id);
 			return;
 		} else if (queue_result == PCM_X_QUEUE_BAD_STATE || queue_result == PCM_X_QUEUE_CORRUPT
 				   || queue_result == PCM_X_QUEUE_COUNTER_EXHAUSTED
 				   || queue_result == PCM_X_QUEUE_INVALID)
-			gcs_block_pcm_x_master_drive_fail_closed(queue_result);
+			gcs_block_pcm_x_master_drive_fail_closed(
+				"invalidate-match", queue_result, queue_snapshot.ref.handle.ticket_id);
 		if (!queue_positive)
 			return;
 	}
@@ -16158,7 +16172,9 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		queue_authority_applied = cluster_pcm_lock_apply_gcs_transition(
 			ack->tag, PCM_TRANS_S_TO_N_INVALIDATE, ack->sender_node);
 		if (queue_positive && !queue_authority_applied) {
-			gcs_block_pcm_x_master_drive_fail_closed(PCM_X_QUEUE_BAD_STATE);
+			gcs_block_pcm_x_master_drive_fail_closed(
+				"invalidate-authority", PCM_X_QUEUE_BAD_STATE,
+				queue_snapshot.ref.handle.ticket_id);
 			return;
 		}
 		/* PGRAC: spec-6.12h D-h2 — the holder reported its dropped copy was
@@ -16197,7 +16213,8 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 		if (queue_result == PCM_X_QUEUE_OK || queue_result == PCM_X_QUEUE_DUPLICATE)
 			gcs_block_pcm_x_master_drive_tag(&ack->tag, ack->epoch);
 		else
-			gcs_block_pcm_x_master_drive_fail_closed(queue_result);
+			gcs_block_pcm_x_master_drive_fail_closed(
+				"invalidate-bitmap", queue_result, queue_snapshot.ref.handle.ticket_id);
 		return;
 	}
 
