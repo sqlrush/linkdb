@@ -2428,6 +2428,19 @@ UT_TEST(test_pcm_x_final_ack_fail_closed_names_exact_handoff_stage)
 	const char *watermark_request = handler != NULL ? strstr(handler, "wm_request_id=%llu") : NULL;
 	const char *watermark_old = handler != NULL ? strstr(handler, "wm_old_scn=%llu") : NULL;
 	const char *watermark_new = handler != NULL ? strstr(handler, "wm_new_scn=%llu") : NULL;
+	const char *prepare = handler != NULL
+						  ? strstr(handler, "cluster_pcm_x_master_final_ack_prepare_exact(")
+						  : NULL;
+	const char *prepare_recovery
+		= prepare != NULL
+			  ? strstr(prepare, "!gcs_block_pcm_x_master_drive_requires_recovery(result)")
+			  : NULL;
+	const char *prepare_replay_return
+		= prepare_recovery != NULL ? strstr(prepare_recovery, "return;") : NULL;
+	const char *prepare_fail_stage
+		= prepare_replay_return != NULL
+			  ? strstr(prepare_replay_return, "fail_stage = \"prepare\"")
+			  : NULL;
 
 	UT_ASSERT_NOT_NULL(handler);
 	UT_ASSERT_NOT_NULL(handler_end);
@@ -2441,7 +2454,17 @@ UT_TEST(test_pcm_x_final_ack_fail_closed_names_exact_handoff_stage)
 	UT_ASSERT_NOT_NULL(watermark_request);
 	UT_ASSERT_NOT_NULL(watermark_old);
 	UT_ASSERT_NOT_NULL(watermark_new);
+	UT_ASSERT_NOT_NULL(prepare);
+	UT_ASSERT_NOT_NULL(prepare_recovery);
+	UT_ASSERT_NOT_NULL(prepare_replay_return);
+	UT_ASSERT_NOT_NULL(prepare_fail_stage);
 	UT_ASSERT_NULL(source != NULL ? strstr(source, "cluster_pcm_x_runtime_transition(") : NULL);
+	/* A terminal/stale at-least-once replay is absorbed before the rich hard
+	 * failure log and canonical node fuse. */
+	if (prepare != NULL && prepare_recovery != NULL && prepare_replay_return != NULL
+		&& prepare_fail_stage != NULL && stage_log != NULL)
+		UT_ASSERT(prepare < prepare_recovery && prepare_recovery < prepare_replay_return
+				  && prepare_replay_return < prepare_fail_stage && prepare_fail_stage < stage_log);
 	/* A blocked runtime must always publish the canonical counter and file:line arm. */
 	if (handler != NULL && handler_end != NULL && stage_log != NULL && canonical != NULL)
 		UT_ASSERT(handler < stage_log && stage_log < canonical && canonical < handler_end);

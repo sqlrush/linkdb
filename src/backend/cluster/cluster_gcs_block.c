@@ -10222,12 +10222,19 @@ gcs_block_pcm_x_handler_tag_shard_exact(const BufferTag *tag)
 }
 
 
+static bool
+gcs_block_pcm_x_master_drive_requires_recovery(PcmXQueueResult result)
+{
+	return result == PCM_X_QUEUE_CORRUPT || result == PCM_X_QUEUE_COUNTER_EXHAUSTED
+		   || result == PCM_X_QUEUE_BAD_STATE || result == PCM_X_QUEUE_INVALID
+		   || result == PCM_X_QUEUE_NO_CAPACITY;
+}
+
+
 static void
 gcs_block_pcm_x_master_drive_fail_closed(PcmXQueueResult result)
 {
-	if (result == PCM_X_QUEUE_CORRUPT || result == PCM_X_QUEUE_COUNTER_EXHAUSTED
-		|| result == PCM_X_QUEUE_BAD_STATE || result == PCM_X_QUEUE_INVALID
-		|| result == PCM_X_QUEUE_NO_CAPACITY)
+	if (gcs_block_pcm_x_master_drive_requires_recovery(result))
 		cluster_pcm_x_runtime_fail_closed();
 }
 
@@ -13364,6 +13371,8 @@ cluster_gcs_handle_pcm_x_final_ack_envelope(const ClusterICEnvelope *env, const 
 														  &token);
 	cluster_pcm_x_stats_note_queue_result(result);
 	if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE) {
+		if (!gcs_block_pcm_x_master_drive_requires_recovery(result))
+			return;
 		fail_stage = "prepare";
 		goto final_ack_fail_closed;
 	}

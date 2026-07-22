@@ -103,6 +103,8 @@ static void pcm_x_stats_increment(pg_atomic_uint64 *counter);
 static bool pcm_x_stats_depth_increment(PcmXShmemHeader *header);
 static bool pcm_x_stats_depth_decrement(PcmXShmemHeader *header);
 static bool pcm_x_master_terminal_leg_is_clear(const PcmXReliableLegState *leg);
+static PcmXQueueResult pcm_x_master_terminal_outcome_exact(const PcmXMasterTicketSlot *ticket,
+														uint32 state);
 static bool pcm_x_master_blocker_stage_metadata_valid(const PcmXMasterTicketSlot *ticket);
 static bool pcm_x_transfer_leg_exact(const PcmXReliableLegState *leg, uint16 opcode,
 									 int32 responder_node, uint64 responder_session);
@@ -7919,6 +7921,7 @@ cluster_pcm_x_master_final_ack_prepare_exact(const PcmXFinalAckPayload *final_ac
 	PcmXQueueResult result;
 	uint64 expected_generation;
 	uint32 partition;
+	uint32 state;
 
 	if (token_out != NULL)
 		memset(token_out, 0, sizeof(*token_out));
@@ -7954,8 +7957,29 @@ cluster_pcm_x_master_final_ack_prepare_exact(const PcmXFinalAckPayload *final_ac
 		result = PCM_X_QUEUE_STALE;
 	else if (!pcm_x_runtime_token_exact(&runtime, ticket->master_session_incarnation))
 		result = PCM_X_QUEUE_NOT_READY;
-	else if (pcm_x_slot_state_read(&ticket->slot) != PCM_XT_ACTIVE_TRANSFER)
-		result = PCM_X_QUEUE_BAD_STATE;
+	else if ((state = pcm_x_slot_state_read(&ticket->slot)) != PCM_XT_ACTIVE_TRANSFER) {
+		/* FINAL_CONFIRM is positive proof that this exact requester already
+		 * observed FINAL_COMMIT_ACK.  A preceding FINAL_ACK may arrive after
+		 * COMPLETE and even after DRAIN has been armed; absorb only a byte-exact
+		 * successful terminal replay and reject nonmatching evidence as stale. */
+		if (state != PCM_XT_COMPLETE && state != PCM_XT_RETIRE_CREDIT)
+			result = PCM_X_QUEUE_BAD_STATE;
+		else {
+			result = pcm_x_master_terminal_outcome_exact(ticket, state);
+			if (result == PCM_X_QUEUE_OK) {
+				if (ticket->image.image_id != final_ack->image_id
+					|| !pcm_x_image_token_valid(&ticket->image)
+					|| !cluster_pcm_x_generation_next(
+						pcm_x_master_ticket_effective_grant_base(ticket), &expected_generation)
+					|| final_ack->committed_own_generation != expected_generation
+					|| !pcm_x_transfer_peer_exact(ticket, authenticated_node,
+											 authenticated_session))
+					result = PCM_X_QUEUE_STALE;
+				else
+					result = PCM_X_QUEUE_RETIRED;
+			}
+		}
+	}
 	else if ((claim_result = pcm_x_master_pending_x_claim_required(ticket)) != PCM_X_QUEUE_OK)
 		result = claim_result;
 	else if (ticket->image.image_id != final_ack->image_id

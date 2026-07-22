@@ -6266,6 +6266,7 @@ UT_TEST(test_master_transfer_wire_49_56_is_generation_exact)
 	PcmXMasterFinalAckToken final_ack_token;
 	PcmXMasterFinalAckToken replay_final_ack_token;
 	PcmXMasterFinalAckToken stale_final_ack_token;
+	PcmXTerminalLegToken drain_token;
 	PcmXPhasePayload final_commit;
 	PcmXPhasePayload final_confirm;
 	PcmXMasterTicketSlot before;
@@ -6426,6 +6427,7 @@ UT_TEST(test_master_transfer_wire_49_56_is_generation_exact)
 	UT_ASSERT_EQ(
 		cluster_pcm_x_master_final_ack_exact(&final_ack, 0, requester_session, &final_commit),
 		PCM_X_QUEUE_STALE);
+	final_ack.committed_own_generation--;
 
 	memset(&final_confirm, 0, sizeof(final_confirm));
 	final_confirm.ref = transfer;
@@ -6437,6 +6439,34 @@ UT_TEST(test_master_transfer_wire_49_56_is_generation_exact)
 	UT_ASSERT_EQ(test_slot_flags(&ticket->slot), 0);
 	UT_ASSERT_EQ(cluster_pcm_x_master_final_confirm_exact(&final_confirm, 0, requester_session),
 				 PCM_X_QUEUE_DUPLICATE);
+
+	/* Loop8 / R2: FINAL_CONFIRM has made the transfer successful and the
+	 * terminal pump has already armed DRAIN.  An older at-least-once FINAL_ACK
+	 * for the same exact ticket may still arrive; terminal success is positive
+	 * replay authority, not an ACTIVE_TRANSFER state violation. */
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(
+					 &transfer, PCM_X_TERMINAL_LEG_DRAIN, 0, requester_session, &drain_token),
+				 PCM_X_QUEUE_OK);
+	before = *ticket;
+	memset(&final_ack_token, 0x7f, sizeof(final_ack_token));
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+														  &final_ack_token),
+				 PCM_X_QUEUE_RETIRED);
+	UT_ASSERT(memcmp(ticket, &before, sizeof(*ticket)) == 0);
+	UT_ASSERT(memcmp(&final_ack_token, &(PcmXMasterFinalAckToken){ 0 },
+				 sizeof(final_ack_token)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	final_ack.image_id++;
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+														  &final_ack_token),
+				 PCM_X_QUEUE_STALE);
+	final_ack.image_id--;
+	final_ack.committed_own_generation++;
+	UT_ASSERT_EQ(cluster_pcm_x_master_final_ack_prepare_exact(&final_ack, 0, requester_session,
+														  &final_ack_token),
+				 PCM_X_QUEUE_STALE);
+	final_ack.committed_own_generation--;
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
 }
 
 /* Admit with an explicit nonzero enqueue-time base_own_generation, so the
