@@ -13176,6 +13176,95 @@ cluster_bufmgr_pcm_own_begin_x_revoke(BufferDesc *buf,
 }
 
 /*
+ * Begin a queued X-source transfer without racing a pending ITL finish.
+ *
+ * The generic reservation helper is header-exact but intentionally knows
+ * nothing about page contents.  A transfer additionally needs the D11
+ * ACTIVE-ITL boundary: in the default non-self-contained mode, a local
+ * transaction still has to dirty this exact page at COMMIT.  Bind the mapped
+ * descriptor with our own raw pin, acquire content EXCLUSIVE conditionally,
+ * and publish REVOKING under the same hold that proves the page may migrate.
+ * Once REVOKING is visible, later writers fail the ordinary content-write
+ * gate, so releasing the content lock cannot reopen the race.
+ */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_begin_x_transfer_revoke(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_x, bool allow_active_itl_transfer,
+	ClusterPcmOwnSnapshot *out_revoking)
+{
+	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
+	BufferTag tag;
+	LWLock *content_lock;
+	LWLock *partition_lock;
+	uint32 hashcode;
+	uint32 buf_state;
+	int mapped_buf_id;
+
+	if (buf == NULL || expected_x == NULL || out_revoking == NULL)
+		return CLUSTER_PCM_OWN_INVALID;
+	memset(out_revoking, 0, sizeof(*out_revoking));
+	if (expected_x->pcm_state != (uint8)PCM_STATE_X || expected_x->flags != 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+
+	tag = expected_x->tag;
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	mapped_buf_id = BufTableLookup(&tag, hashcode);
+	if (mapped_buf_id != buf->buf_id) {
+		LWLockRelease(partition_lock);
+		return CLUSTER_PCM_OWN_STALE;
+	}
+
+	buf_state = LockBufHdr(buf);
+	if (!cluster_pcm_own_snapshot_matches_locked(buf, expected_x)
+		|| (buf_state & BM_VALID) == 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else {
+		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+		buf_state = 0;
+	}
+	if (buf_state != 0)
+		UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+	if (result != CLUSTER_PCM_OWN_OK)
+		return result;
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return CLUSTER_PCM_OWN_BUSY;
+	}
+
+	if (!cluster_bufmgr_pcm_x_content_write_permitted(buf))
+		result = CLUSTER_PCM_OWN_BUSY;
+	else {
+		buf_state = LockBufHdr(buf);
+		if (!cluster_pcm_own_snapshot_matches_locked(buf, expected_x)
+			|| (buf_state & BM_VALID) == 0)
+			result = CLUSTER_PCM_OWN_STALE;
+		else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
+			result = CLUSTER_PCM_OWN_CORRUPT;
+		UnlockBufHdr(buf, buf_state);
+	}
+
+	if (result == CLUSTER_PCM_OWN_OK && !allow_active_itl_transfer
+		&& cluster_pcm_x_revoke_finish_mode(&tag, 0) == CLUSTER_PCM_X_REVOKE_FINISH_RETAIN
+		&& cluster_itl_page_has_active_slot((Page) BufHdrGetBlock(buf)))
+		result = CLUSTER_PCM_OWN_BUSY;
+	if (result == CLUSTER_PCM_OWN_OK)
+		result = cluster_bufmgr_pcm_own_begin_x_revoke(buf, expected_x, out_revoking);
+
+	LWLockRelease(content_lock);
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return result;
+}
+
+/*
  * Abort one exact source-holder revoke before any ownership transfer.
  */
 ClusterPcmOwnResult

@@ -12516,6 +12516,7 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 	volatile bool copy_ok = false;
 	bool descriptor_retained;
 	bool self_source_handoff;
+	bool allow_active_itl_transfer;
 	int buffer_id;
 
 	holder_result = cluster_pcm_x_local_holder_snapshot(&work->tag, NULL, 0, &holder_snapshot);
@@ -12554,6 +12555,7 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 		return;
 	}
 	buf = GetBufferDescriptor(buffer_id);
+	allow_active_itl_transfer = cluster_block_self_contained;
 	if (source_is_n) {
 		PG_TRY();
 		{
@@ -12584,7 +12586,8 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 		PG_END_TRY();
 		own_result = (ClusterPcmOwnResult)n_prepare_result;
 	} else
-		own_result = cluster_bufmgr_pcm_own_begin_x_revoke(buf, &current, &revoking);
+		own_result = cluster_bufmgr_pcm_own_begin_x_transfer_revoke(
+			buf, &current, allow_active_itl_transfer, &revoking);
 	gcs_block_pcm_x_note_own_result(own_result);
 	if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY
 		|| own_result == CLUSTER_PCM_OWN_STALE) {

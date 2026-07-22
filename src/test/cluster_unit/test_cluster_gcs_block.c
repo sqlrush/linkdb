@@ -2575,7 +2575,7 @@ UT_TEST(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change)
 		UT_ASSERT_NOT_NULL(strstr(source, "materialize-begin-s-dirty-flushed"));
 		UT_ASSERT_NOT_NULL(strstr(source, "materialize-begin-s-dirty-raced"));
 		UT_ASSERT_NOT_NULL(strstr(source, "materialize-begin-s-io-in-progress"));
-		UT_ASSERT_NOT_NULL(strstr(begin, "cluster_bufmgr_pcm_own_begin_x_revoke("));
+		UT_ASSERT_NOT_NULL(strstr(begin, "cluster_bufmgr_pcm_own_begin_x_transfer_revoke("));
 		UT_ASSERT_NOT_NULL(strstr(begin, "cluster_pcm_x_revoke_finish_mode("));
 		UT_ASSERT_NOT_NULL(strstr(begin, "CLUSTER_PCM_X_REVOKE_FINISH_DROP"));
 		copy = strstr(begin, "cluster_bufmgr_copy_block_for_gcs(");
@@ -2655,6 +2655,100 @@ UT_TEST(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change)
 			UT_ASSERT(content < gate && gate < copy);
 	}
 	free(source);
+}
+
+
+UT_TEST(test_pcm_x_remote_x_source_preserves_active_itl_commit_dependency)
+{
+	char *bufmgr_source = read_source_path(BUFMGR_SOURCE_PATH);
+	char *gcs_source = read_gcs_block_source();
+	const char *helper;
+	const char *helper_end;
+	const char *content_lock;
+	const char *write_gate;
+	const char *policy_gate;
+	const char *retain_mode;
+	const char *active_itl;
+	const char *begin_revoke;
+	const char *content_unlock;
+	const char *materialize;
+	const char *materialize_end;
+	const char *policy;
+	const char *transfer_begin;
+	const char *copy;
+
+	UT_ASSERT_NOT_NULL(bufmgr_source);
+	UT_ASSERT_NOT_NULL(gcs_source);
+	if (bufmgr_source == NULL || gcs_source == NULL) {
+		free(bufmgr_source);
+		free(gcs_source);
+		return;
+	}
+
+	/* S3-P0-01: with self-containment disabled, the ACTIVE ITL is a pending
+	 * COMMIT dirty dependency.  The transfer-specific X-source reservation
+	 * must reject that page under the same content-EXCLUSIVE hold that
+	 * publishes REVOKING, closing the check-to-reservation race. */
+	helper = strstr(bufmgr_source, "\ncluster_bufmgr_pcm_own_begin_x_transfer_revoke(");
+	helper_end = helper != NULL ? strstr(helper, "\n}\n") : NULL;
+	content_lock
+		= helper != NULL ? strstr(helper, "LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)")
+						 : NULL;
+	write_gate = content_lock != NULL
+					 ? strstr(content_lock, "cluster_bufmgr_pcm_x_content_write_permitted(buf)")
+					 : NULL;
+	policy_gate
+		= write_gate != NULL ? strstr(write_gate, "!allow_active_itl_transfer") : NULL;
+	retain_mode = policy_gate != NULL
+				  ? strstr(policy_gate, "CLUSTER_PCM_X_REVOKE_FINISH_RETAIN")
+				  : NULL;
+	active_itl = retain_mode != NULL
+				 ? strstr(retain_mode, "cluster_itl_page_has_active_slot((Page) BufHdrGetBlock(buf))")
+				 : NULL;
+	begin_revoke = active_itl != NULL
+				   ? strstr(active_itl, "cluster_bufmgr_pcm_own_begin_x_revoke(buf, expected_x,")
+				   : NULL;
+	content_unlock = begin_revoke != NULL ? strstr(begin_revoke, "LWLockRelease(content_lock)")
+									  : NULL;
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(helper_end);
+	UT_ASSERT_NOT_NULL(content_lock);
+	UT_ASSERT_NOT_NULL(write_gate);
+	UT_ASSERT_NOT_NULL(policy_gate);
+	UT_ASSERT_NOT_NULL(retain_mode);
+	UT_ASSERT_NOT_NULL(active_itl);
+	UT_ASSERT_NOT_NULL(begin_revoke);
+	UT_ASSERT_NOT_NULL(content_unlock);
+	if (helper != NULL && helper_end != NULL && content_lock != NULL && write_gate != NULL
+		&& policy_gate != NULL && retain_mode != NULL && active_itl != NULL && begin_revoke != NULL
+		&& content_unlock != NULL)
+		UT_ASSERT(helper < content_lock && content_lock < write_gate && write_gate < policy_gate
+				  && policy_gate < retain_mode && retain_mode < active_itl && active_itl < begin_revoke
+				  && begin_revoke < content_unlock && content_unlock < helper_end);
+
+	/* Only the queued remote X-source arm needs this policy-aware begin.  It
+	 * must bind the explicit GUC policy before any byte copy/materialization. */
+	materialize = strstr(gcs_source, "\ngcs_block_pcm_x_materialize_reserved_work(");
+	materialize_end = materialize != NULL ? strstr(materialize, "\n}\n") : NULL;
+	policy = materialize != NULL ? strstr(materialize, "cluster_block_self_contained") : NULL;
+	transfer_begin = policy != NULL
+					 ? strstr(policy, "cluster_bufmgr_pcm_own_begin_x_transfer_revoke(")
+					 : NULL;
+	copy = transfer_begin != NULL
+			   ? strstr(transfer_begin, "cluster_bufmgr_copy_block_for_gcs(")
+			   : NULL;
+	UT_ASSERT_NOT_NULL(materialize);
+	UT_ASSERT_NOT_NULL(materialize_end);
+	UT_ASSERT_NOT_NULL(policy);
+	UT_ASSERT_NOT_NULL(transfer_begin);
+	UT_ASSERT_NOT_NULL(copy);
+	if (materialize != NULL && materialize_end != NULL && policy != NULL
+		&& transfer_begin != NULL && copy != NULL)
+		UT_ASSERT(materialize < policy && policy < transfer_begin && transfer_begin < copy
+				  && copy < materialize_end);
+
+	free(bufmgr_source);
+	free(gcs_source);
 }
 
 
@@ -5234,7 +5328,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(104);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5304,6 +5398,7 @@ main(void)
 	UT_RUN(test_pcm_x_pending_x_marker_is_only_a_pre_handoff_gate);
 	UT_RUN(test_pcm_x_ready_publication_follows_exact_retained_commit);
 	UT_RUN(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change);
+	UT_RUN(test_pcm_x_remote_x_source_preserves_active_itl_commit_dependency);
 	UT_RUN(test_pcm_x_s_source_hard_failure_observation_is_reason_exact);
 	UT_RUN(test_pcm_x_self_and_remote_drain_share_full_image_release_wrapper);
 	UT_RUN(test_pcm_x_ready_admission_marks_before_send_and_rolls_back_refusal);

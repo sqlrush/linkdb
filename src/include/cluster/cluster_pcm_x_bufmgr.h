@@ -454,6 +454,12 @@ cluster_bufmgr_pcm_own_abort_x_reservation(BufferDesc *buf, const ClusterPcmOwnS
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_begin_x_revoke(BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_x,
 									  ClusterPcmOwnSnapshot *out_revoking);
+/* Queue transfer entry for an X source.  It binds the descriptor with a raw
+ * pin and serializes the active-ITL policy check with REVOKING publication
+ * under content EXCLUSIVE.  BUSY is retryable and leaves no reservation. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_begin_x_transfer_revoke(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_x, bool allow_active_itl_transfer,
+	ClusterPcmOwnSnapshot *out_revoking);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_x_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);
