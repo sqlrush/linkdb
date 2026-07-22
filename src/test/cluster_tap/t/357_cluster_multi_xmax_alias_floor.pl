@@ -42,6 +42,9 @@
 #   L5  revert valve: cluster.multi_xmax_remote_resolve = off drops the
 #       D3-b ask and keeps the derived-foreign fail-closed floor (never a
 #       native silent-wrong alias)
+#   L6  index HOT-chain follow after a positively-resolved foreign updater
+#       multi must fail closed before the LOCAL pg_multixact decode; the
+#       backend and postmaster stay alive (S3-C05 / Loop6 production RED)
 #
 # Spec: spec-7.1-cross-instance-positive-interread.md (D3-a origin
 #       derivation + D3-b origin member-verdict serve)
@@ -147,7 +150,7 @@ sub wait_mxid_floor
 
 ok(wait_mxid_floor(), 'mxid activation floor published + latched on both nodes');
 
-ok(mirrored_coincident_create('mxf_t', 'CREATE TABLE mxf_t (aid int, v int)'),
+ok(mirrored_coincident_create('mxf_t', 'CREATE TABLE mxf_t (aid int PRIMARY KEY, v int)'),
 	'mxf_t relfilepath coincidence holds');
 ok(write_retry($node0, 'INSERT INTO mxf_t SELECT g, 0 FROM generate_series(1, 20) g'), 'seeded');
 
@@ -259,6 +262,32 @@ sub read_converge
 	  read_converge($node1, 'SELECT aid, v FROM mxf_t WHERE aid = 11', '11|100', 20);
 	is($rc, 0, 'L3 probe F: aliased read resolves positively (derivation immune to counter position)');
 	is($out, '11|100', 'L3 probe F: converges to the committed update, never the superseded 11|0 alias');
+}
+
+# ------------------------------------------------------------------
+# L6: force the index HOT-chain path across node0's updater-bearing multi.
+#
+# HeapTupleSatisfiesMVCC positively resolves the old version's foreign multi
+# through D3-b and returns invisible.  heap_hot_search_buffer must then follow
+# t_ctid without asking HeapTupleHeaderGetUpdateXid to decode that same foreign
+# mxid against node1's LOCAL offsets SLRU.  Before S3-C05 that decode reached
+# GetMultiXactIdMembers: a striped-gap offset was zero and Assert(offset != 0)
+# killed the backend/postmaster.  Until the served updater xid is plumbed into
+# HOT traversal, a retryable 53R9C refusal is the narrow fail-closed answer.
+# ------------------------------------------------------------------
+{
+	my ($rc, $out, $err) = $node1->psql(
+		'postgres',
+		'SET enable_seqscan = off; SET enable_bitmapscan = off; '
+		  . 'SELECT aid, v FROM mxf_t WHERE aid = 11',
+		timeout => 15);
+	isnt($rc, 0, 'L6 foreign updater multi: index HOT follow fails closed');
+	like($err, qr/cannot decode foreign multixact .* against local member storage/,
+		'L6 refusal is the clean local-SLRU alias guard');
+	unlike($err, qr/failed Assert|server closed the connection unexpectedly/,
+		'L6 never reaches the offsets Assert or loses the server');
+	is($node1->safe_psql('postgres', 'SELECT 1'), '1',
+		'L6 node1 remains alive after the fail-closed HOT refusal');
 }
 
 # ------------------------------------------------------------------

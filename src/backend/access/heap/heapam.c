@@ -82,6 +82,7 @@
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled / cluster_peer_mode_enabled */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
+#include "cluster/cluster_mxid_stripe.h" /* derived-own guard for local pg_multixact decode */
 #include "cluster/cluster_dl.h"	/* spec-5.7 DL bulk-load lease */
 #include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
 #include "cluster/cluster_tt_status.h" /* spec-3.14 D2b writer wait bridge */
@@ -10219,6 +10220,48 @@ MultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask)
 
 	Assert(!(t_infomask & HEAP_XMAX_LOCK_ONLY));
 	Assert(t_infomask & HEAP_XMAX_IS_MULTI);
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: foreign multixact local-SLRU decode guard (S3-C05 / Loop6).
+	 *
+	 * MultiXactIdGetUpdateXid is the common native decoder behind both
+	 * HeapTupleGetUpdateXid and update-chain helpers.  In particular,
+	 * heap_hot_search_buffer calls HeapTupleHeaderGetUpdateXid after the
+	 * visibility fork has rejected an old HOT member.  For a foreign striped
+	 * mxid, letting that follow-up call reach GetMultiXactIdMembers decodes the
+	 * peer id against this node's unrelated pg_multixact offsets/members.  A
+	 * skipped stripe position has offset zero and trips the native
+	 * Assert(offset != 0); an occupied alias can be worse and return the wrong
+	 * updater xid.
+	 *
+	 * Local SLRU decode is therefore permitted only for a derived-own mxid in
+	 * peer mode.  Foreign and underivable ids fail closed with the existing
+	 * retryable 53R9C family.  The origin member-verdict path remains the
+	 * positive foreign visibility resolver; it does not yet return the updater
+	 * xid needed to validate a HOT link.  Keep the native offsets Assert intact:
+	 * it still detects corruption in an mxid this node provably owns.
+	 */
+	if (cluster_peer_mode_enabled()) {
+		int mx_origin = cluster_mxid_origin_slot((MultiXactId)xmax);
+
+		if (mx_origin < 0)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
+							errmsg("cluster multixact %u cannot be attributed to an origin node",
+								   (unsigned)xmax),
+							errhint("Multixact ids are node-local; retry after the origin is "
+									"derivable or the tuple version is pruned.")));
+		if (mx_origin != cluster_node_id)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
+					 errmsg("cannot decode foreign multixact %u against local member storage",
+							(unsigned)xmax),
+					 errdetail("Multixact %u derives to node %d, but this backend runs on node %d.",
+							   (unsigned)xmax, mx_origin, cluster_node_id),
+					 errhint("Retry after the foreign updater multixact is pruned or its updater "
+							 "identity can be served by the origin.")));
+	}
+#endif
 
 	/*
 	 * Since we know the LOCK_ONLY bit is not set, this cannot be a multi from

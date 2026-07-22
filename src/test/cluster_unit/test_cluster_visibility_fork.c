@@ -5,7 +5,7 @@
  *	  HeapTupleSatisfiesMVCC cluster visibility fork (D5) + D5b inject
  *	  mechanism.
  *
- *	  12 static + presence tests (v0.3 N3 + N4 + L177 + L178 enforcement):
+ *	  15 static + presence tests (v0.3 N3 + N4 + L177 + L178 enforcement):
  *	    T1   ClusterUndoTTSlotRef sizeof / offsetof contract
  *	    T2   ClusterUndoTTSlotRef field offsets stable (origin/segment/
  *	         slot/epoch/local_xid/commit_scn/has_cached_status/_padding)
@@ -29,6 +29,9 @@
  *	    T12  ClusterTTStatus enum 5 values stable (defensive duplicate
  *	         of test_cluster_tt_status T3-T7 to keep this binary self-
  *	         contained per L107 N+5 producer-consumer pattern)
+ *	    S3-C05  production MultiXactIdGetUpdateXid derives mxid origin
+ *	         before GetMultiXactIdMembers and refuses foreign/underivable
+ *	         ids, so HOT traversal cannot decode a peer mxid in local SLRU
  *
  *	  No HeapTupleSatisfiesMVCC behavioral testing here — that requires
  *	  a real PG backend.  Behavioral coverage in cluster_tap t/204.
@@ -376,6 +379,54 @@ UT_TEST(test_p033_active_and_safety_boundary_matrix)
 				 (int)CVV_FAILCLOSED_UNKNOWN);
 }
 
+/* S3-C05 / Loop6: heap_hot_search_buffer follows an invisible HOT member by
+ * calling HeapTupleHeaderGetUpdateXid.  That funnels through the production
+ * MultiXactIdGetUpdateXid helper, so this is the narrow SSOT at which a peer
+ * mxid must be rejected before GetMultiXactIdMembers can touch the LOCAL
+ * offsets/member SLRUs.  The native Assert(offset != 0) remains intact; the
+ * cluster guard prevents an unowned id from ever reaching it. */
+UT_TEST(test_s3c05_foreign_multixact_local_slru_decode_guard)
+{
+	char *heap_source = read_source(HEAPAM_SOURCE_PATH);
+	const char *helper;
+	const char *helper_end;
+	const char *origin;
+	const char *refuse;
+	const char *decode;
+
+	UT_ASSERT(heap_source != NULL);
+	if (heap_source == NULL)
+		return;
+
+	helper = strstr(heap_source, "\nMultiXactIdGetUpdateXid(TransactionId xmax");
+	helper_end = helper != NULL ? strstr(helper, "\n}\n\n/*\n * HeapTupleGetUpdateXid") : NULL;
+	origin = helper != NULL ? strstr(helper, "cluster_mxid_origin_slot((MultiXactId)xmax)") : NULL;
+	refuse = helper != NULL
+				 ? strstr(helper, "cannot decode foreign multixact %u against local member storage")
+				 : NULL;
+	decode = helper != NULL ? strstr(helper, "GetMultiXactIdMembers(xmax") : NULL;
+
+	UT_ASSERT(helper != NULL);
+	UT_ASSERT(helper_end != NULL);
+	UT_ASSERT(origin != NULL);
+	UT_ASSERT(refuse != NULL);
+	UT_ASSERT(decode != NULL);
+	if (helper_end != NULL) {
+		UT_ASSERT(origin != NULL && origin < helper_end);
+		UT_ASSERT(refuse != NULL && refuse < helper_end);
+		UT_ASSERT(decode != NULL && decode < helper_end);
+	}
+	if (origin != NULL && refuse != NULL && decode != NULL) {
+		UT_ASSERT(origin < refuse);
+		UT_ASSERT(refuse < decode);
+	}
+	UT_ASSERT(strstr(helper, "if (mx_origin < 0)") != NULL);
+	UT_ASSERT(strstr(helper, "if (mx_origin != cluster_node_id)") != NULL);
+	UT_ASSERT(strstr(helper, "ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS") != NULL);
+
+	free(heap_source);
+}
+
 
 int
 main(void)
@@ -394,5 +445,6 @@ main(void)
 	UT_RUN(test_t12_status_enum_5_values);
 	UT_RUN(test_p033_data_dml_publishes_active_identity);
 	UT_RUN(test_p033_active_and_safety_boundary_matrix);
+	UT_RUN(test_s3c05_foreign_multixact_local_slru_decode_guard);
 	UT_DONE();
 }
