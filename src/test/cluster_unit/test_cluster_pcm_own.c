@@ -419,6 +419,59 @@ UT_TEST(test_s_new_fresh_token_finish_shape_stays_invalid)
 				 CLUSTER_PCM_X_GRANT_RESERVATION_INVALID);
 }
 
+UT_TEST(test_legacy_begin_rechecks_stable_cover_under_header_lock)
+{
+	static const char *const locked_cover_contract[]
+		= { "LockBufHdr", "cluster_pcm_own_snapshot_locked",
+			"cluster_pcm_x_cached_cover_reverify_accepts(", "*out_covered = true",
+			"cluster_pcm_own_reservation_begin_exact", "UnlockBufHdr" };
+	static const char *const retry_cover_contract[]
+		= { "cluster_bufmgr_pcm_begin_grant_reservation_wait", "if (begin_covered)",
+			"*covered_generation = base->generation", "return CLUSTER_BUFMGR_PCM_RETRY_COVERED" };
+	static const char *const initial_cover_contract[]
+		= { "cluster_bufmgr_pcm_begin_grant_reservation_wait", "&pcm_covered",
+			"if (pcm_covered)", "pcm_covered_gen = pcm_pending_base.generation",
+			"goto pcm_legacy_acquire_done", "cluster_bufmgr_pcm_legacy_begin_probe" };
+	static const char *const revalidate_cover_contract[]
+		= { "cluster_bufmgr_pcm_begin_grant_reservation_wait", "&pcm_covered",
+			"if (pcm_covered)", "pcm_covered_gen = pcm_pending_base.generation",
+			"goto pcm_revalidate_acquire_done", "cluster_bufmgr_pcm_legacy_begin_probe" };
+	ClusterPcmOwnSnapshot base;
+	ClusterPcmOwnSnapshot live;
+	char *source = read_bufmgr_source();
+
+	/* LockBuffer's unlocked cover probe can observe N immediately before a
+	 * competing local backend commits S.  The legacy begin must repeat the
+	 * cover decision from its complete header-locked snapshot and hand that
+	 * stable cover back to the existing content-lock reverify path before it
+	 * can mint a token. */
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(7),
+													UINT64_C(7), (uint8)PCM_STATE_S, 0));
+	assert_ordered_in_function(source, "\ncluster_pcm_own_begin_grant_reservation(",
+							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_begin_x_reservation(",
+							   locked_cover_contract, lengthof(locked_cover_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_retry_denied_rearm(", "\nstatic ",
+							   retry_cover_contract, lengthof(retry_cover_contract));
+	assert_ordered_in_function(source, "Legacy acquire path:", "pcm_legacy_acquire_done:",
+							   initial_cover_contract, lengthof(initial_cover_contract));
+	assert_ordered_in_function(source, "cluster_pcm_note_writer_cover_stale_detected();",
+							   "pcm_revalidate_acquire_done:", revalidate_cover_contract,
+							   lengthof(revalidate_cover_contract));
+
+	/* The repair belongs at begin, not at finish: accepting a fresh token over
+	 * an S base would bypass the X convert queue's FIFO/WFG arbitration. */
+	memset(&base, 0, sizeof(base));
+	base.generation = 7;
+	base.reservation_token = 3;
+	base.pcm_state = (uint8)PCM_STATE_S;
+	live = base;
+	live.reservation_token = 4;
+	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	UT_ASSERT_EQ(cluster_pcm_x_grant_reservation_kind(&live, &base, 4),
+				 CLUSTER_PCM_X_GRANT_RESERVATION_INVALID);
+	free(source);
+}
+
 UT_TEST(test_share_cover_reverify_accepts_stable_successor_grant)
 {
 	/* Once content authority is held, a stable current S/X successor is the
@@ -2736,7 +2789,7 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(61);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_writer_activation_fence_blocks_revoke_until_exact_clear);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
@@ -2745,6 +2798,7 @@ main(void)
 	UT_RUN(test_s_revoke_handoff_reuses_exact_token_and_bumps_once);
 	UT_RUN(test_revoke_handoff_kinds_cover_n_s_x_with_one_lifecycle);
 	UT_RUN(test_s_new_fresh_token_finish_shape_stays_invalid);
+	UT_RUN(test_legacy_begin_rechecks_stable_cover_under_header_lock);
 	UT_RUN(test_share_cover_reverify_accepts_stable_successor_grant);
 	UT_RUN(test_retained_release_retag_respects_pin_contract);
 	UT_RUN(test_retained_release_and_finish_never_cover_invalid_bytes);
