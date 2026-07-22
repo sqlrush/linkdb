@@ -19827,8 +19827,10 @@ pcm_x_local_ready_leader_wake_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag
 									 PcmXWaitIdentity *identity_out, PcmXLocalHandle *handle_out,
 									 bool *candidate_out)
 {
+	const PcmXTicketRef *external_ref;
 	PcmXLocalMembershipSlot *leader;
 	PcmXSlotRef leader_ref;
+	uint32 flags;
 	uint32 member_flags;
 	uint32 member_state;
 
@@ -19863,10 +19865,39 @@ pcm_x_local_ready_leader_wake_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag
 		|| !BufferTagsEqual(&leader->identity.tag, &tag_slot->tag)
 		|| leader->identity.cluster_epoch != tag_slot->cluster_epoch)
 		return PCM_X_QUEUE_CORRUPT;
-	member_flags = pcm_x_slot_flags_read(&leader->slot);
-	if ((member_flags & PCM_X_LOCAL_MEMBER_F_WRITER_COMPLETE) != 0)
-		return PCM_X_QUEUE_CORRUPT;
 	member_state = pcm_x_slot_state_read(&leader->slot);
+	member_flags = pcm_x_slot_flags_read(&leader->slot);
+	if ((member_flags & PCM_X_LOCAL_MEMBER_F_WRITER_COMPLETE) != 0) {
+		/* A cross-ticket holder may finish DRAIN while the resident writer has
+		 * completed FINAL_CONFIRM but has not received its own DRAIN yet.  That
+		 * canonical leader is deliberately still linked and is not wakeable:
+		 * - an older holder watermark may retire with no wake, preserving the
+		 *   newer writer's complete leg;
+		 * - a newer holder watermark must wait, because advancing the local
+		 *   prefix past the older writer would make its later RETIRE duplicate
+		 *   and strand the writer terminal forever.
+		 * The mutating RETIRE pass legitimately holds ADMISSION_GATE; keep every
+		 * other wider WRITER_COMPLETE leader shape fail-closed. */
+		flags = pcm_x_slot_flags_read(&tag_slot->slot);
+		external_ref = pcm_x_local_external_terminal_ref(tag_slot);
+		if ((flags & ~PCM_X_LOCAL_TAG_F_ADMISSION_GATE)
+				== (PCM_X_LOCAL_TAG_F_REVOKE_BARRIER | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)
+			&& member_state == PCM_XL_GRANTED
+			&& member_flags == PCM_X_LOCAL_MEMBER_F_WRITER_COMPLETE
+			&& tag_slot->terminal_drain_generation == 0 && external_ref != NULL
+			&& external_ref->handle.ticket_id != tag_slot->ref.handle.ticket_id
+			&& pcm_x_local_terminal_ref_valid(&tag_slot->ref)
+			&& pcm_x_ticket_handle_equal(&tag_slot->ref.handle, &leader->handle)
+			&& pcm_x_local_holder_lane_retire_state(tag_slot, flags) == PCM_X_QUEUE_OK
+			&& pcm_x_local_reliable_leg_valid(tag_slot, leader)
+			&& tag_slot->reliable.pending_opcode == PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM
+			&& tag_slot->reliable.phase == PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM
+			&& tag_slot->reliable.last_response_opcode == PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK)
+			return external_ref->handle.ticket_id > tag_slot->ref.handle.ticket_id
+					   ? PCM_X_QUEUE_NOT_READY
+					   : PCM_X_QUEUE_OK;
+		return PCM_X_QUEUE_CORRUPT;
+	}
 	if (!pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)) {
 		if (!pcm_x_local_reliable_leg_valid(tag_slot, leader))
 			return PCM_X_QUEUE_CORRUPT;

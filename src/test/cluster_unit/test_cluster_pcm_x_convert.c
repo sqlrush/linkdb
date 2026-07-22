@@ -10913,6 +10913,7 @@ typedef struct TestLocalIndependentDualTerminal {
 	PcmXLocalHandle writer;
 	PcmXTicketRef writer_ref;
 	PcmXTicketRef holder_ref;
+	PcmXDrainPollPayload writer_poll;
 	PcmXLocalTagSlot *tag_slot;
 	uint64 master_session;
 } TestLocalIndependentDualTerminal;
@@ -10934,10 +10935,10 @@ typedef struct TestLocalIndependentDualTerminal {
  * with two DISTINCT master tickets -- the 2026-07-19 t/400 first-fuse shape.
  */
 static void
-prepare_local_independent_dual_terminal(BlockNumber block, uint64 master_session,
-										uint64 writer_ticket, uint64 holder_ticket,
-										bool cancelled_external,
-										TestLocalIndependentDualTerminal *fixture)
+prepare_local_independent_dual_terminal_common(BlockNumber block, uint64 master_session,
+											   uint64 writer_ticket, uint64 holder_ticket,
+											   bool cancelled_external, bool drain_writer,
+											   TestLocalIndependentDualTerminal *fixture)
 {
 	PcmXShmemHeader *header;
 	PcmXLocalWriterClaim writer_claim;
@@ -11077,22 +11078,26 @@ prepare_local_independent_dual_terminal(BlockNumber block, uint64 master_session
 		fixture->holder_ref = revoke.ref;
 	}
 
-	/* Both lanes now DRAIN: the delayed writer leg first, then the holder. */
-	memset(&poll, 0, sizeof(poll));
-	poll.ref = fixture->writer_ref;
-	poll.drain_generation = UINT64_C(7);
-	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
+	/* The normal independent-dual fixture drains the delayed writer first.
+	 * The S3-C02 ordering fixture deliberately leaves that older writer at
+	 * WRITER_COMPLETE while the newer holder finishes DRAIN. */
+	memset(&fixture->writer_poll, 0, sizeof(fixture->writer_poll));
+	fixture->writer_poll.ref = fixture->writer_ref;
+	fixture->writer_poll.drain_generation = UINT64_C(7);
+	if (drain_writer)
+		UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&fixture->writer_poll, 1, master_session),
+					 PCM_X_QUEUE_OK);
 	memset(&poll, 0, sizeof(poll));
 	poll.ref = fixture->holder_ref;
 	poll.drain_generation = UINT64_C(7);
 	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
 
-	/* Pin the t/400 dump shape byte-exactly: flags 0x3d, one closed round of
-	 * one, two distinct tickets, one unlinked terminal membership, every
-	 * FIFO index invalid. */
+	/* Pin either the historical 0x3d dual or the S3-C02 0x31 ordering
+	 * byte-exactly. */
 	fixture->tag_slot = &local_tag_slots(header)[fixture->writer.tag_slot.slot_index];
 	flags = test_slot_flags(&fixture->tag_slot->slot);
-	UT_ASSERT_EQ(flags, PCM_X_LOCAL_TAG_F_REVOKE_BARRIER | PCM_X_LOCAL_TAG_F_TERMINAL_MASK
+	UT_ASSERT_EQ(flags, PCM_X_LOCAL_TAG_F_REVOKE_BARRIER
+							| (drain_writer ? PCM_X_LOCAL_TAG_F_TERMINAL_MASK : 0)
 							| PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
 	UT_ASSERT_EQ(fixture->tag_slot->closed_round_member_count, 1);
 	UT_ASSERT_EQ(fixture->tag_slot->ref.handle.ticket_id, writer_ticket);
@@ -11105,12 +11110,149 @@ prepare_local_independent_dual_terminal(BlockNumber block, uint64 master_session
 		UT_ASSERT_EQ(fixture->tag_slot->holder_ref.handle.ticket_id, holder_ticket);
 	}
 	UT_ASSERT_EQ(fixture->tag_slot->membership_count, 1);
-	UT_ASSERT_EQ(fixture->tag_slot->head_index, PCM_X_INVALID_SLOT_INDEX);
-	UT_ASSERT_EQ(fixture->tag_slot->tail_index, PCM_X_INVALID_SLOT_INDEX);
-	UT_ASSERT_EQ(fixture->tag_slot->leader_index, PCM_X_INVALID_SLOT_INDEX);
+	UT_ASSERT_EQ(fixture->tag_slot->head_index, drain_writer
+													? PCM_X_INVALID_SLOT_INDEX
+													: fixture->writer.membership_slot.slot_index);
+	UT_ASSERT_EQ(fixture->tag_slot->tail_index, drain_writer
+													? PCM_X_INVALID_SLOT_INDEX
+													: fixture->writer.membership_slot.slot_index);
+	UT_ASSERT_EQ(fixture->tag_slot->leader_index, drain_writer
+													  ? PCM_X_INVALID_SLOT_INDEX
+													  : fixture->writer.membership_slot.slot_index);
 	UT_ASSERT_EQ(fixture->tag_slot->active_writer_index, PCM_X_INVALID_SLOT_INDEX);
-	UT_ASSERT(fixture->tag_slot->terminal_drain_generation != 0);
+	UT_ASSERT_EQ(fixture->tag_slot->terminal_drain_generation != 0, drain_writer);
 	UT_ASSERT(fixture->tag_slot->holder_terminal_drain_generation != 0);
+}
+
+static void
+prepare_local_independent_dual_terminal(BlockNumber block, uint64 master_session,
+										uint64 writer_ticket, uint64 holder_ticket,
+										bool cancelled_external,
+										TestLocalIndependentDualTerminal *fixture)
+{
+	prepare_local_independent_dual_terminal_common(
+		block, master_session, writer_ticket, holder_ticket, cancelled_external, true, fixture);
+}
+
+/*
+ * RED for S3 Loop 3 (2026-07-22): a newer holder ticket can finish DRAIN on
+ * this participant while an older writer on the same tag is WRITER_COMPLETE
+ * but has not received DRAIN yet.  RETIRE_UP_TO(newer) is a prefix watermark:
+ * it must wait byte-exactly for the older writer terminal instead of treating
+ * the completed, still-linked leader as a corrupt wake candidate.  Once the
+ * delayed writer DRAIN lands, the same watermark consumes both lanes.
+ */
+UT_TEST(test_local_retire_waits_for_older_writer_complete_before_newer_holder)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalMembershipSlot *writer_member;
+	PcmXLocalTagSlot saved;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1833);
+
+	prepare_local_independent_dual_terminal_common(7128, master_session, UINT64_C(96001),
+												   UINT64_C(96002), false, false, &fixture);
+	writer_member
+		= &membership_slots(ClusterPcmXConvertShmem)[fixture.writer.membership_slot.slot_index];
+	UT_ASSERT((test_slot_flags(&writer_member->slot) & PCM_X_LOCAL_MEMBER_F_WRITER_COMPLETE) != 0);
+	UT_ASSERT_EQ(test_slot_flags(&fixture.tag_slot->slot),
+				 PCM_X_LOCAL_TAG_F_REVOKE_BARRIER | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+	saved = *fixture.tag_slot;
+
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT(memcmp(&saved, fixture.tag_slot, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 0);
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&fixture.writer_poll, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(test_slot_flags(&fixture.tag_slot->slot),
+				 PCM_X_LOCAL_TAG_F_REVOKE_BARRIER | PCM_X_LOCAL_TAG_F_TERMINAL_MASK
+					 | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
+}
+
+/* The inverse ticket order is also legal: an older holder terminal may retire
+ * without waking or disturbing a newer writer that has completed FINAL_CONFIRM
+ * but still awaits DRAIN. */
+UT_TEST(test_local_older_holder_retires_without_waking_completed_newer_writer)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalMembershipSlot saved_member;
+	PcmXReliableLegState saved_reliable;
+	PcmXTicketRef saved_writer_ref;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1834);
+
+	prepare_local_independent_dual_terminal_common(7129, master_session, UINT64_C(96002),
+												   UINT64_C(96001), false, false, &fixture);
+	saved_member
+		= membership_slots(ClusterPcmXConvertShmem)[fixture.writer.membership_slot.slot_index];
+	saved_writer_ref = fixture.tag_slot->ref;
+	saved_reliable = fixture.tag_slot->reliable;
+
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(test_slot_flags(&fixture.tag_slot->slot), PCM_X_LOCAL_TAG_F_REVOKE_BARRIER);
+	UT_ASSERT(ticket_refs_equal(&fixture.tag_slot->ref, &saved_writer_ref));
+	UT_ASSERT(memcmp(&fixture.tag_slot->reliable, &saved_reliable, sizeof(saved_reliable)) == 0);
+	UT_ASSERT(memcmp(&membership_slots(
+						 ClusterPcmXConvertShmem)[fixture.writer.membership_slot.slot_index],
+					 &saved_member, sizeof(saved_member))
+			  == 0);
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&fixture.writer_poll, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	retire.retire_through_ticket_id = fixture.writer_ref.handle.ticket_id;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
+}
+
+/* The retryable ordering is exact, not a general WRITER_COMPLETE exemption.
+ * Any unknown tag flag remains structural corruption and keeps the RETIRE
+ * episode witness for recovery. */
+UT_TEST(test_local_completed_writer_holder_retire_rejects_wider_tag_shape)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXRetirePayload retire;
+	uint32 state_flags;
+	const uint64 master_session = UINT64_C(1835);
+
+	prepare_local_independent_dual_terminal_common(7130, master_session, UINT64_C(96001),
+												   UINT64_C(96002), false, false, &fixture);
+	state_flags = pg_atomic_read_u32(&fixture.tag_slot->slot.state_flags);
+	pg_atomic_write_u32(&fixture.tag_slot->slot.state_flags,
+						state_flags | (UINT32_C(0x40) << PCM_X_SLOT_FLAGS_SHIFT));
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id,
+				 fixture.holder_ref.handle.ticket_id);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 2);
 }
 
 /*
@@ -16617,7 +16759,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(275);
+	UT_PLAN(278);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16797,6 +16939,9 @@ main(void)
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
+	UT_RUN(test_local_retire_waits_for_older_writer_complete_before_newer_holder);
+	UT_RUN(test_local_older_holder_retires_without_waking_completed_newer_writer);
+	UT_RUN(test_local_completed_writer_holder_retire_rejects_wider_tag_shape);
 	UT_RUN(test_local_independent_dual_terminal_retires_writer_then_holder);
 	UT_RUN(test_local_independent_dual_terminal_alias_and_malformed_lanes_fail_closed);
 	UT_RUN(test_local_independent_dual_terminal_supports_pre_joined_follower);
