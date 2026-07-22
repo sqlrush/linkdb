@@ -1792,7 +1792,8 @@ cluster_bufmgr_pcm_x_holder_drain_deferred(ClusterPcmXHolderLedgerEntry *entry)
 }
 
 static ClusterPcmXHolderLedgerEntry *
-cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
+cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused, bool grant_pending,
+									bool *grant_pending_barrier)
 {
 	ClusterPcmXHolderLedgerEntry *entry;
 	ClusterPcmXWriterLedgerEntry *writer_entry;
@@ -1808,6 +1809,9 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
 	LWLock *content_lock;
 	uint32 wait_index = 0;
 	bool writer_authorized = false;
+
+	Assert(grant_pending_barrier != NULL);
+	*grant_pending_barrier = false;
 
 	cluster_bufmgr_pcm_x_holder_drain_deferred_nowait();
 	entry = cluster_bufmgr_pcm_x_holder_find(buf);
@@ -1929,6 +1933,18 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
 				&key, &writer_entry->claim, &handle, &committed_own_generation);
 		else
 			result = cluster_pcm_x_local_holder_register(&key, &handle);
+		/* A consumed GCS grant no longer has an outstanding request slot.
+		 * Waiting here with its exact GRANT_PENDING token would make a closed
+		 * same-tag revoke barrier circular: INVALIDATE cannot clear the barrier
+		 * until the token disappears, while this backend cannot publish its
+		 * holder until the barrier opens.  Return to the token owner before the
+		 * ordinary holder wait; it exact-aborts and re-enters through the
+		 * established pending-X retry boundary. */
+		if (grant_pending && result == PCM_X_QUEUE_BARRIER_CLOSED)
+		{
+			*grant_pending_barrier = true;
+			return NULL;
+		}
 		current_runtime = cluster_pcm_x_runtime_snapshot();
 		action = cluster_pcm_x_holder_register_retry_action(
 			result, current_runtime.state == PCM_X_RUNTIME_ACTIVE
@@ -1959,6 +1975,70 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
 	}
 
 	return entry;
+}
+
+/* Complete holder-ledger admission after a legacy GCS acquire.  The normal
+ * path is one nonblocking registration.  If the GCS request already consumed
+ * its slot but the local revoke barrier closed before holder publication, the
+ * owning backend must remove GRANT_PENDING before it waits.  Reuse the exact
+ * DENIED_PENDING_X abort/gap/rearm protocol so the pending INVALIDATE can ACK,
+ * then obtain a fresh ownership and request identity. */
+static ClusterPcmXHolderLedgerEntry *
+cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(
+	BufferDesc *buf, PcmLockMode pcm_mode, bool *barrier_refused,
+	ClusterPcmOwnSnapshot *pcm_pending_base, uint64 *pcm_pending_token,
+	bool *pcm_acquired, bool *pcm_pending_set, bool *pcm_covered,
+	uint64 *pcm_covered_gen, uint32 *pcm_retry_wait_index)
+{
+	Assert(buf != NULL);
+	Assert(pcm_pending_base != NULL);
+	Assert(pcm_pending_token != NULL);
+	Assert(pcm_acquired != NULL);
+	Assert(pcm_pending_set != NULL);
+	Assert(pcm_covered != NULL);
+	Assert(pcm_covered_gen != NULL);
+	Assert(pcm_retry_wait_index != NULL);
+
+	for (;;)
+	{
+		ClusterPcmXHolderLedgerEntry *pcm_x_holder;
+		bool		pcm_pending_barrier = false;
+
+		pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, barrier_refused,
+														 *pcm_pending_set, &pcm_pending_barrier);
+		if (!pcm_pending_barrier)
+			return pcm_x_holder;
+
+		Assert(*pcm_pending_set);
+		*pcm_pending_set = false;
+		*pcm_acquired = false;
+		for (;;)
+		{
+			ClusterBufmgrPcmRetryRearmResult rearm_result;
+			bool		pcm_retry_denied = false;
+
+			rearm_result = cluster_bufmgr_pcm_retry_denied_rearm(
+				buf, pcm_mode, pcm_pending_base, pcm_pending_token,
+				*pcm_retry_wait_index, barrier_refused, pcm_covered_gen);
+			if (*pcm_retry_wait_index < PG_UINT32_MAX)
+				(*pcm_retry_wait_index)++;
+			if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED)
+				return NULL;
+			if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_COVERED)
+			{
+				*pcm_covered = true;
+				break;
+			}
+
+			*pcm_pending_set = true;
+			*pcm_acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode,
+															  &pcm_retry_denied);
+			if (!pcm_retry_denied)
+				break;
+			*pcm_pending_set = false;
+			*pcm_acquired = false;
+		}
+	}
 }
 
 static void
@@ -8750,7 +8830,10 @@ pcm_legacy_acquire_done:
 			CLUSTER_INJECTION_POINT("cluster-pcm-writer-cached-x-stall");
 		PG_TRY();
 		{
-			pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, pcm_barrier_refused);
+			pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(
+				buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base, &pcm_pending_token,
+				&pcm_acquired, &pcm_pending_set, &pcm_covered, &pcm_covered_gen,
+				&pcm_retry_wait_index);
 			if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
 			{
 				/*
@@ -8889,7 +8972,10 @@ pcm_revalidate_acquire_done:
 						}
 						if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
 						{
-							pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, NULL);
+							pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(
+								buf, pcm_mode, NULL, &pcm_pending_base, &pcm_pending_token,
+								&pcm_acquired, &pcm_pending_set, &pcm_covered,
+								&pcm_covered_gen, &pcm_retry_wait_index);
 							if (mode == BUFFER_LOCK_SHARE)
 								LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
 							else

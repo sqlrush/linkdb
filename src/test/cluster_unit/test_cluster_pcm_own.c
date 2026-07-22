@@ -1810,10 +1810,10 @@ UT_TEST(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires)
 			"LWLockRelease(BufferDescriptorGetContentLock(buf))",
 			"cluster_bufmgr_pcm_x_holder_unregister" };
 	static const char *const acquire_contract[]
-		= { "pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf,",
+		= { "pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"LWLockRelease(BufferDescriptorGetContentLock(buf))",
-			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf,",
+			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"cluster_bufmgr_pcm_x_holder_activate(pcm_x_holder)" };
 	char *source = read_bufmgr_source();
@@ -2010,6 +2010,48 @@ UT_TEST(test_bufmgr_pcm_x_holder_gate_retry_is_bounded_outside_content_lock)
 	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_holder_unregister(", "\nstatic ",
 							   unregister_contract, lengthof(unregister_contract));
 	UT_ASSERT_NOT_NULL(strstr(source, "cluster_bufmgr_pcm_x_holder_drain_deferred_nowait();"));
+	free(source);
+}
+
+UT_TEST(test_granted_pending_holder_barrier_restarts_before_wait)
+{
+	static const char *const prepare_contract[]
+		= { "grant_pending && result == PCM_X_QUEUE_BARRIER_CLOSED",
+			"*grant_pending_barrier = true",
+			"return NULL",
+			"cluster_pcm_x_holder_register_retry_action(",
+			"cluster_bufmgr_pcm_x_holder_retry_wait(" };
+	static const char *const restart_contract[]
+		= { "pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf,",
+			"pcm_pending_set, &pcm_pending_barrier",
+			"if (!pcm_pending_barrier)",
+			"pcm_pending_set = false",
+			"pcm_acquired = false",
+			"cluster_bufmgr_pcm_retry_denied_rearm(",
+			"cluster_pcm_lock_acquire_buffer(buf, pcm_mode" };
+	static const char *const lockbuffer_contract[]
+		= { "cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(",
+			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
+			"LWLockRelease(BufferDescriptorGetContentLock(buf))",
+			"cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(",
+			"LWLockAcquire(BufferDescriptorGetContentLock(buf)" };
+	char *source = read_bufmgr_source();
+
+	/* Once a remote N->S request has consumed its GCS slot, an exact
+	 * GRANT_PENDING token may still precede holder-ledger publication.  If a
+	 * same-tag revoke barrier is already closed, waiting in holder registration
+	 * would retain that token while the writer's INVALIDATE waits for it: the
+	 * P0-29 residual cycle.  The owning backend must instead return before the
+	 * holder wait, exact-abort via the established pending-X rearm boundary,
+	 * and issue a fresh acquire only after the invalidate gap. */
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_holder_prepare(", "\nstatic ",
+							   prepare_contract, lengthof(prepare_contract));
+	assert_ordered_in_function(source,
+		"\ncluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(", "\nstatic ",
+		restart_contract, lengthof(restart_contract));
+	assert_ordered_in_function(source, "\nLockBufferInternal(Buffer buffer, int mode",
+		"\n/*\n * Acquire the content_lock for the buffer, but only if we don't have to wait.",
+		lockbuffer_contract, lengthof(lockbuffer_contract));
 	free(source);
 }
 
@@ -2411,7 +2453,7 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 	static const char *const acquire_contract[]
 		= { "pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(",
 			"pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,",
-			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf,",
+			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer)" };
 	static const char *const cleanup_contract[]
@@ -2789,7 +2831,7 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(62);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_writer_activation_fence_blocks_revoke_until_exact_clear);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
@@ -2836,6 +2878,7 @@ main(void)
 	UT_RUN(test_bufmgr_pcm_x_holder_ledger_is_bounded_and_uses_private_identity);
 	UT_RUN(test_unlockbuffers_exceptionally_detaches_released_pcm_x_holders);
 	UT_RUN(test_bufmgr_pcm_x_holder_gate_retry_is_bounded_outside_content_lock);
+	UT_RUN(test_granted_pending_holder_barrier_restarts_before_wait);
 	UT_RUN(test_bufmgr_pcm_x_holder_reuse_and_deferred_failure_are_fail_closed);
 	UT_RUN(test_queue_holder_snapshot_by_tag_is_mapping_and_header_exact);
 	UT_RUN(test_queue_passive_pinned_s_release_serializes_bytes_and_ownership);
