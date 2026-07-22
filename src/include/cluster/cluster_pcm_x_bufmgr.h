@@ -197,8 +197,17 @@ cluster_pcm_x_writer_grant_snapshot_exact(const PcmXLocalWriterClaim *claim,
 		   && claim->local_round == claim->writer.local_round && claim->role == claim->writer.role
 		   && (claim->role == PCM_X_LOCAL_ROLE_NODE_LEADER
 			   || claim->role == PCM_X_LOCAL_ROLE_FOLLOWER)
+		   /* The node leader owns the single grant->content activation fence.
+			* FIFO followers share this node-level grant only after that fence has
+			* been consumed, so their exact snapshot must observe zero. */
+		   && granted->writer_activation_token
+				  == (claim->role == PCM_X_LOCAL_ROLE_NODE_LEADER
+						  ? granted->reservation_token
+						  : 0)
 		   && BufferTagsEqual(&live->tag, &granted->tag) && live->generation == granted->generation
-		   && live->reservation_token == granted->reservation_token && live->flags == granted->flags
+		   && live->reservation_token == granted->reservation_token
+		   && live->writer_activation_token == granted->writer_activation_token
+		   && live->flags == granted->flags
 		   && live->pcm_state == granted->pcm_state;
 }
 

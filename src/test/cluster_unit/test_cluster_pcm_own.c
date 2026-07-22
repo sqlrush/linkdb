@@ -2386,6 +2386,7 @@ UT_TEST(test_queue_writer_grant_snapshot_is_claim_and_generation_exact)
 	memset(&granted, 0, sizeof(granted));
 	granted.generation = 11;
 	granted.reservation_token = 13;
+	granted.writer_activation_token = granted.reservation_token;
 	granted.pcm_state = (uint8)PCM_STATE_X;
 	live = granted;
 
@@ -2431,6 +2432,138 @@ UT_TEST(test_queue_writer_grant_snapshot_is_claim_and_generation_exact)
 														 PCM_OWN_FLAG_GRANT_PENDING));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_X,
 														 PCM_OWN_FLAG_REVOKING));
+}
+
+/* S3 Loop 15 (2026-07-23), P0-32 residual: one node leader commits the
+ * ownership grant and owns its grant->content activation fence.  Same-round
+ * local followers intentionally inherit that same node-level generation and
+ * reservation token after FIFO predecessor completion; they do not own a
+ * second activation fence. */
+UT_TEST(test_queue_writer_activation_fence_is_leader_owned_per_grant)
+{
+	PcmXLocalWriterClaim leader;
+	PcmXLocalWriterClaim follower;
+	ClusterPcmOwnSnapshot granted;
+	ClusterPcmOwnSnapshot live;
+	char *source;
+	const char *activate;
+	const char *activate_end;
+	const char *prepare;
+	const char *prepare_end;
+	uint64 committed = 0;
+	uint64 token = 0;
+
+	reset_fixture();
+	pg_atomic_write_u64(&ClusterPcmOwnArray[0].generation, UINT64_C(8));
+	UT_ASSERT_EQ(
+		cluster_pcm_own_reservation_begin_exact(0, UINT64_C(8), PCM_OWN_FLAG_GRANT_PENDING,
+										&token),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_own_writer_grant_commit_exact(0, UINT64_C(8), token, &committed),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(committed, UINT64_C(9));
+
+	memset(&leader, 0, sizeof(leader));
+	leader.writer.identity.base_own_generation = UINT64_C(8);
+	leader.writer.membership_slot.slot_index = 2;
+	leader.writer.membership_slot.slot_generation = UINT64_C(631);
+	leader.writer.local_round = 3;
+	leader.writer.role = PCM_X_LOCAL_ROLE_NODE_LEADER;
+	leader.active_slot = leader.writer.membership_slot;
+	leader.claim_generation = 2;
+	leader.local_round = leader.writer.local_round;
+	leader.role = leader.writer.role;
+	memset(&granted, 0, sizeof(granted));
+	granted.generation = committed;
+	granted.reservation_token = token;
+	granted.writer_activation_token = token;
+	granted.pcm_state = (uint8)PCM_STATE_X;
+	live = granted;
+	UT_ASSERT(cluster_pcm_x_writer_grant_snapshot_exact(&leader, &granted, &live));
+
+	/* The leader consumes the one shared activation fence. */
+	UT_ASSERT_EQ(cluster_pcm_own_writer_activation_clear_exact(0, committed, token),
+				 CLUSTER_PCM_OWN_OK);
+	assert_writer_activation(0);
+
+	/* The FIFO follower has a distinct local claim but deliberately names the
+	 * same committed node-level X grant.  Its exact activation snapshot is the
+	 * already-consumed zero fence, and a second clear is correctly STALE. */
+	follower = leader;
+	follower.writer.membership_slot.slot_index = 3;
+	follower.writer.membership_slot.slot_generation = UINT64_C(632);
+	follower.writer.role = PCM_X_LOCAL_ROLE_FOLLOWER;
+	follower.active_slot = follower.writer.membership_slot;
+	follower.claim_generation = 3;
+	follower.role = follower.writer.role;
+	granted.writer_activation_token = 0;
+	live = granted;
+	UT_ASSERT(cluster_pcm_x_writer_grant_snapshot_exact(&follower, &granted, &live));
+	UT_ASSERT_EQ(cluster_pcm_own_writer_activation_clear_exact(0, committed, token),
+				 CLUSTER_PCM_OWN_STALE);
+
+	/* Role/token crossovers are not accepted as a generic stable-X snapshot. */
+	granted.writer_activation_token = token;
+	live = granted;
+	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&follower, &granted, &live));
+	leader.writer.role = PCM_X_LOCAL_ROLE_NODE_LEADER;
+	leader.role = leader.writer.role;
+	granted.writer_activation_token = 0;
+	live = granted;
+	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&leader, &granted, &live));
+	granted.writer_activation_token = token;
+	live = granted;
+	live.writer_activation_token = 0;
+	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&leader, &granted, &live));
+
+	/* The bufmgr ledger must derive fence ownership from that exact snapshot;
+	 * activation then clears only the armed leader and merely revalidates a
+	 * follower under content authority. */
+	source = read_bufmgr_source();
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	prepare = strstr(source, "\ncluster_bufmgr_pcm_x_writer_prepare(");
+	prepare_end = prepare != NULL ? strstr(prepare, "\nstatic ") : NULL;
+	activate = strstr(source, "\ncluster_bufmgr_pcm_x_writer_activation_clear(");
+	activate_end = activate != NULL ? strstr(activate, "\nstatic bool\n") : NULL;
+	UT_ASSERT_NOT_NULL(prepare);
+	UT_ASSERT_NOT_NULL(prepare_end);
+	UT_ASSERT_NOT_NULL(activate);
+	UT_ASSERT_NOT_NULL(activate_end);
+	if (prepare != NULL && prepare_end != NULL) {
+		const char *assignment
+			= strstr(prepare,
+					 "entry->activation_fence_armed = granted.writer_activation_token != 0");
+
+		UT_ASSERT(assignment != NULL);
+		if (assignment != NULL)
+			UT_ASSERT(assignment < prepare_end);
+	}
+	if (activate != NULL && activate_end != NULL) {
+		const char *conditional = strstr(activate, "if (entry->activation_fence_armed)");
+		const char *clear
+			= strstr(activate, "cluster_pcm_own_writer_activation_clear_exact(");
+		const char *observe = strstr(activate, "else\n\t\tresult = CLUSTER_PCM_OWN_OK;");
+
+		const char *early_unarmed
+			= strstr(activate, "buf == NULL || !entry->activation_fence_armed");
+
+		UT_ASSERT(conditional != NULL);
+		if (conditional != NULL)
+			UT_ASSERT(conditional < activate_end);
+		UT_ASSERT(clear != NULL);
+		if (clear != NULL)
+			UT_ASSERT(clear < activate_end);
+		UT_ASSERT(observe != NULL);
+		if (observe != NULL)
+			UT_ASSERT(observe < activate_end);
+		if (conditional != NULL && clear != NULL && observe != NULL)
+			UT_ASSERT(conditional < clear && clear < observe);
+		if (early_unarmed != NULL)
+			UT_ASSERT(early_unarmed >= activate_end);
+	}
+	free(source);
 }
 
 UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_authority)
@@ -2831,7 +2964,7 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 int
 main(void)
 {
-	UT_PLAN(62);
+	UT_PLAN(63);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_writer_activation_fence_blocks_revoke_until_exact_clear);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
@@ -2889,6 +3022,7 @@ main(void)
 	UT_RUN(test_queue_passive_n_mirror_is_never_gcs_ship_authority);
 	UT_RUN(test_gcs_ship_copy_reports_exact_nonblocking_refusal_stage);
 	UT_RUN(test_queue_writer_grant_snapshot_is_claim_and_generation_exact);
+	UT_RUN(test_queue_writer_activation_fence_is_leader_owned_per_grant);
 	UT_RUN(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_authority);
 	UT_RUN(test_preflight_busy_waits_then_clean_resnapshot_begins_reservation);
 	UT_RUN(test_own_lifecycle_counters_land_on_exact_begin_and_x_commit);

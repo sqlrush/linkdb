@@ -2297,19 +2297,22 @@ cluster_bufmgr_pcm_x_writer_activation_clear(ClusterPcmXWriterLedgerEntry *entry
 	ClusterPcmOwnResult result;
 	uint32 buf_state;
 
-	if (entry == NULL || buf == NULL || !entry->activation_fence_armed)
+	if (entry == NULL || buf == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
 	buf_state = LockBufHdr(buf);
 	cluster_pcm_own_snapshot_locked(buf, &live);
 	if (live_out != NULL)
 		*live_out = live;
 	if (!cluster_pcm_x_writer_grant_snapshot_exact(&entry->claim, &entry->granted, &live)
+		|| entry->activation_fence_armed != (entry->granted.writer_activation_token != 0)
 		|| cluster_pcm_own_writer_activation_token_get(buf->buf_id)
-			   != entry->granted.reservation_token)
+			   != entry->granted.writer_activation_token)
 		result = CLUSTER_PCM_OWN_STALE;
-	else
+	else if (entry->activation_fence_armed)
 		result = cluster_pcm_own_writer_activation_clear_exact(
 			buf->buf_id, entry->granted.generation, entry->granted.reservation_token);
+	else
+		result = CLUSTER_PCM_OWN_OK;
 	UnlockBufHdr(buf, buf_state);
 	cluster_pcm_own_activation_diag_emit("writer-activation-clear", buf->buf_id, &live, result);
 	if (result == CLUSTER_PCM_OWN_OK)
@@ -2515,7 +2518,7 @@ cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode, bool *bar
 
 	entry->granted = granted;
 	entry->grant_snapshot_exact = true;
-	entry->activation_fence_armed = true;
+	entry->activation_fence_armed = granted.writer_activation_token != 0;
 	entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING;
 	return entry;
 }
