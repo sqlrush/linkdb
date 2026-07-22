@@ -11134,6 +11134,117 @@ prepare_local_independent_dual_terminal(BlockNumber block, uint64 master_session
 		block, master_session, writer_ticket, holder_ticket, cancelled_external, true, fixture);
 }
 
+/* Append one admitted writer on a different tag without reinitializing the
+ * shared queue.  Its exact master ticket is live but deliberately has not
+ * crossed DRAIN, which makes it a prefix blocker for every newer RETIRE_UP_TO
+ * from the same master session. */
+static void
+append_local_undrained_writer(BlockNumber block, uint64 master_session, uint64 writer_ticket,
+							  PcmXLocalHandle *writer_out, PcmXLocalTagSlot **tag_slot_out)
+{
+	PcmXLocalWriterClaim writer_claim;
+	PcmXLocalCutoff cutoff;
+	PcmXWaitIdentity identity;
+	PcmXEnqueuePayload enqueue;
+	PcmXAdmitAckPayload admit_ack;
+	PcmXLocalReliableToken token;
+
+	UT_ASSERT_NOT_NULL(writer_out);
+	UT_ASSERT_NOT_NULL(tag_slot_out);
+	identity = make_wait_identity(block, 0, 4, master_session + writer_ticket);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, master_session, writer_out),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(writer_out, &writer_claim),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_begin_revoke_cutoff_exact(writer_out, &cutoff),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(writer_out, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&admit_ack, 0, sizeof(admit_ack));
+	admit_ack.ref.identity = identity;
+	admit_ack.ref.handle.ticket_id = writer_ticket;
+	admit_ack.ref.handle.queue_generation = UINT64_C(1);
+	admit_ack.prehandle = enqueue.prehandle;
+	admit_ack.result = PCM_X_QUEUE_OK;
+	admit_ack.phase = PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE;
+	UT_ASSERT_EQ(cluster_pcm_x_local_apply_admit_ack_exact(writer_out, &admit_ack, 1,
+													 master_session),
+				 PCM_X_QUEUE_OK);
+	*tag_slot_out
+		= &local_tag_slots(ClusterPcmXConvertShmem)[writer_out->tag_slot.slot_index];
+	UT_ASSERT_EQ((*tag_slot_out)->ref.handle.ticket_id, writer_ticket);
+	UT_ASSERT_EQ(test_slot_flags(&(*tag_slot_out)->slot) & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
+}
+
+/* RED for S3 Loop 4 (2026-07-22): RETIRE_UP_TO is a prefix watermark across
+ * every local tag owned by one master session.  The old first pass ignored a
+ * lower live ticket when that different tag had not reached DRAIN yet, then
+ * retired a newer terminal.  A late DRAIN of the skipped ticket could publish
+ * its terminal after the frontier; a duplicate RETIRE would remove only its
+ * DRAINED image record, and the next DRAIN replay returned IMAGE_NOT_FOUND(7)
+ * with the local 0x3d terminal still durable. */
+UT_TEST(test_local_retire_waits_for_undrained_lower_ticket_on_another_tag)
+{
+	TestLocalIndependentDualTerminal terminal;
+	PcmXLocalHandle older_writer;
+	PcmXLocalTagSlot *older_tag;
+	PcmXLocalTagSlot older_saved;
+	PcmXLocalTagSlot terminal_saved;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1836);
+
+	prepare_local_independent_dual_terminal(7131, master_session, UINT64_C(96002),
+											UINT64_C(96003), false, &terminal);
+	append_local_undrained_writer(7132, master_session, UINT64_C(96001), &older_writer,
+								  &older_tag);
+	older_saved = *older_tag;
+	terminal_saved = *terminal.tag_slot;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = terminal.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = terminal.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT(memcmp(&older_saved, older_tag, sizeof(older_saved)) == 0);
+	UT_ASSERT(memcmp(&terminal_saved, terminal.tag_slot, sizeof(terminal_saved)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retired_ticket_id, 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 0);
+}
+
+/* A newer undrained ticket is outside the requested prefix and must not block
+ * retirement of the exact terminal watermark. */
+UT_TEST(test_local_retire_ignores_undrained_higher_ticket_on_another_tag)
+{
+	TestLocalIndependentDualTerminal terminal;
+	PcmXLocalHandle newer_writer;
+	PcmXLocalTagSlot *newer_tag;
+	PcmXLocalTagSlot newer_saved;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1837);
+
+	prepare_local_independent_dual_terminal(7133, master_session, UINT64_C(96002),
+											UINT64_C(96003), false, &terminal);
+	append_local_undrained_writer(7134, master_session, UINT64_C(96004), &newer_writer,
+								  &newer_tag);
+	newer_saved = *newer_tag;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = terminal.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = terminal.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT(memcmp(&newer_saved, newer_tag, sizeof(newer_saved)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retired_ticket_id,
+				 terminal.holder_ref.handle.ticket_id);
+}
+
 /*
  * RED for S3 Loop 3 (2026-07-22): a newer holder ticket can finish DRAIN on
  * this participant while an older writer on the same tag is WRITER_COMPLETE
@@ -16759,7 +16870,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(278);
+	UT_PLAN(280);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16939,6 +17050,8 @@ main(void)
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
+	UT_RUN(test_local_retire_waits_for_undrained_lower_ticket_on_another_tag);
+	UT_RUN(test_local_retire_ignores_undrained_higher_ticket_on_another_tag);
 	UT_RUN(test_local_retire_waits_for_older_writer_complete_before_newer_holder);
 	UT_RUN(test_local_older_holder_retires_without_waking_completed_newer_writer);
 	UT_RUN(test_local_completed_writer_holder_retire_rejects_wider_tag_shape);
