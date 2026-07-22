@@ -3607,6 +3607,72 @@ UT_TEST(test_pcm_x_post_handoff_progress_waits_out_only_admission_gate_busy)
 }
 
 
+/* A self-source adopt can report BUSY only before the ownership handoff:
+ * either the exact queue progress is hidden by the admission gate or the
+ * live own slot is in a reversible lifecycle state.  Dispatch that one
+ * result through an operation-specific wait before marking the reservation
+ * irreversible; every structural verdict still reaches the common
+ * fail-closed check. */
+UT_TEST(test_pcm_x_self_image_adopt_busy_waits_before_irreversible_mark)
+{
+	char *source = read_gcs_block_source();
+	const char *driver;
+	const char *driver_end;
+	const char *self_adopt;
+	const char *self_policy;
+	const char *self_wait;
+	const char *remote_branch;
+	const char *remote_begin;
+	const char *common_stats;
+	const char *common_fail_closed;
+	const char *irreversible_mark;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	driver = strstr(source, "\ngcs_block_pcm_x_acquire_writer_impl(");
+	driver_end = driver != NULL ? strstr(driver + 1, "\n}\n\n\n") : NULL;
+	self_adopt = driver != NULL ? strstr(driver, "cluster_gcs_pcm_x_adopt_self_image(") : NULL;
+	self_policy
+		= self_adopt != NULL
+			  ? strstr(self_adopt, "GCS_BLOCK_PCM_X_RETRY_SITE_SELF_IMAGE_ADOPT")
+			  : NULL;
+	self_wait = self_policy != NULL ? strstr(self_policy, "goto requester_wait;") : NULL;
+	remote_branch = self_adopt != NULL ? strstr(self_adopt, "} else {") : NULL;
+	remote_begin = remote_branch != NULL
+					   ? strstr(remote_branch, "cluster_bufmgr_pcm_own_begin_x_reservation(")
+					   : NULL;
+	common_stats = remote_begin != NULL
+					   ? strstr(remote_begin, "cluster_pcm_x_stats_note_queue_result(result);")
+					   : NULL;
+	common_fail_closed
+		= common_stats != NULL
+			  ? strstr(common_stats, "GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();")
+			  : NULL;
+	irreversible_mark
+		= common_fail_closed != NULL ? strstr(common_fail_closed, "reservation_started = true;") : NULL;
+
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(driver_end);
+	UT_ASSERT_NOT_NULL(self_adopt);
+	UT_ASSERT_NOT_NULL(self_policy);
+	UT_ASSERT_NOT_NULL(self_wait);
+	UT_ASSERT_NOT_NULL(remote_branch);
+	UT_ASSERT_NOT_NULL(remote_begin);
+	UT_ASSERT_NOT_NULL(common_stats);
+	UT_ASSERT_NOT_NULL(common_fail_closed);
+	UT_ASSERT_NOT_NULL(irreversible_mark);
+	if (driver != NULL && driver_end != NULL && self_adopt != NULL && self_policy != NULL
+		&& self_wait != NULL && remote_branch != NULL && remote_begin != NULL
+		&& common_stats != NULL && common_fail_closed != NULL && irreversible_mark != NULL)
+		UT_ASSERT(driver < self_adopt && self_adopt < self_policy && self_policy < self_wait
+				  && self_wait < remote_branch && remote_branch < remote_begin
+				  && remote_begin < common_stats && common_stats < common_fail_closed
+				  && common_fail_closed < irreversible_mark && irreversible_mark < driver_end);
+	free(source);
+}
+
+
 UT_TEST(test_pcm_x_retire_wake_identity_is_wait_generation_exact)
 {
 	PcmXWaitIdentity identity;
@@ -4138,6 +4204,17 @@ UT_TEST(test_pcm_x_requester_retry_policy_is_operation_exact)
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM, PCM_X_QUEUE_BAD_STATE,
 		  GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS },
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM, PCM_X_QUEUE_STALE,
+		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
+		/* A returned self-image BUSY is necessarily pre-handoff: post-handoff
+		 * admission BUSY is absorbed inside adopt_self_image.  Only that one
+		 * transient result may wait; immutable/structural verdicts still fuse. */
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_SELF_IMAGE_ADOPT, PCM_X_QUEUE_BUSY,
+		  GCS_BLOCK_PCM_X_RETRY_WAIT },
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_SELF_IMAGE_ADOPT, PCM_X_QUEUE_STALE,
+		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_SELF_IMAGE_ADOPT, PCM_X_QUEUE_CORRUPT,
+		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_SELF_IMAGE_ADOPT, PCM_X_QUEUE_NOT_READY,
 		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
 		/* Remote-reservation preflight: BUSY is a transient own-slot lifecycle
 		 * (a revoke/grant flag mid-flight on this node) and must wait, never
@@ -5568,7 +5645,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(107);
+	UT_PLAN(108);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5651,6 +5728,7 @@ main(void)
 	UT_RUN(test_pcm_x_requester_fetch_revalidates_queue_and_reservation_before_install);
 	UT_RUN(test_pcm_x_self_source_handoff_is_no_copy_and_drain_preserves_x);
 	UT_RUN(test_pcm_x_post_handoff_progress_waits_out_only_admission_gate_busy);
+	UT_RUN(test_pcm_x_self_image_adopt_busy_waits_before_irreversible_mark);
 	UT_RUN(test_pcm_x_retire_wake_identity_is_wait_generation_exact);
 	UT_RUN(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles);
 	UT_RUN(test_pcm_x_requester_retry_policy_is_operation_exact);

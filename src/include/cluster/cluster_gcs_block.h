@@ -177,7 +177,8 @@ typedef enum GcsBlockPcmXRequesterSite {
 	GCS_BLOCK_PCM_X_RETRY_SITE_IMAGE_FETCH,
 	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_ARM,
 	GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM,
-	GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT
+	GCS_BLOCK_PCM_X_RETRY_SITE_RESERVATION_PREFLIGHT,
+	GCS_BLOCK_PCM_X_RETRY_SITE_SELF_IMAGE_ADOPT
 } GcsBlockPcmXRequesterSite;
 
 typedef enum GcsBlockPcmXRetryAction {
@@ -414,6 +415,14 @@ cluster_gcs_pcm_x_requester_retry_action(GcsBlockPcmXRequesterSite site, PcmXQue
 		 * revoke consumed the queued identity's base_own_generation, which the
 		 * grant/final-ack chain cannot absorb without a master-visible rebase;
 		 * keep the fail-closed verdict until that amendment lands. */
+		if (result == PCM_X_QUEUE_BUSY)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
+	case GCS_BLOCK_PCM_X_RETRY_SITE_SELF_IMAGE_ADOPT:
+		/* adopt_self_image absorbs admission-gate BUSY after its ownership
+		 * handoff.  A BUSY returned to this caller therefore proves the exact
+		 * queue/own snapshot was blocked before any irreversible transition;
+		 * wait and reload the same request authority. */
 		if (result == PCM_X_QUEUE_BUSY)
 			return GCS_BLOCK_PCM_X_RETRY_WAIT;
 		break;

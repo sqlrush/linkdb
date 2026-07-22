@@ -9626,10 +9626,17 @@ requester_role_dispatch:
 					if (result != PCM_X_QUEUE_OK)
 						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					self_source = progress.image.source_node == (uint32)cluster_node_id;
-					if (self_source)
+					if (self_source) {
 						result = cluster_gcs_pcm_x_adopt_self_image(buf, &handle, &reservation_base,
-																	&reservation_token);
-					else {
+															&reservation_token);
+						if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE) {
+							retry_action = cluster_gcs_pcm_x_requester_retry_action(
+								GCS_BLOCK_PCM_X_RETRY_SITE_SELF_IMAGE_ADOPT, result);
+							if (retry_action == GCS_BLOCK_PCM_X_RETRY_WAIT)
+								goto requester_wait;
+							fail_site = "self-image-adopt";
+						}
+					} else {
 						result = cluster_gcs_pcm_x_remote_reservation_preflight(&reservation_base,
 																				&progress.identity);
 						cluster_pcm_x_stats_note_queue_result(result);
