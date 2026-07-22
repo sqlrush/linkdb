@@ -3541,6 +3541,9 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 	const char *follower_snapshot;
 	const char *graph_replace;
 	const char *graph_clear;
+	const char *graph_clear_policy;
+	const char *graph_clear_wait;
+	const char *graph_clear_retry;
 	const char *self_adopt;
 	const char *remote_fetch;
 	const char *install_ready;
@@ -3794,7 +3797,7 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 		wait_scan++;
 	}
 	UT_ASSERT_EQ(raw_wait_count, 1);
-	UT_ASSERT_EQ(exact_wait_count, 9);
+	UT_ASSERT_EQ(exact_wait_count, 10);
 	snapshot_before
 		= rekey_helper != NULL ? strstr(rekey_helper, "cluster_bufmgr_pcm_own_snapshot(") : NULL;
 	rekey_exact
@@ -3816,9 +3819,15 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 								 : NULL;
 	enqueue = claim != NULL ? strstr(claim, "cluster_pcm_x_local_enqueue_arm_exact(") : NULL;
 	graph_clear = strstr(driver, "cluster_pcm_x_local_follower_wfg_clear_exact(");
+	graph_clear_policy
+		= graph_clear != NULL ? strstr(graph_clear, "GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR") : NULL;
+	graph_clear_wait = graph_clear_policy != NULL
+						   ? strstr(graph_clear_policy, "gcs_block_pcm_x_requester_wait_exact(")
+						   : NULL;
+	graph_clear_retry = graph_clear_wait != NULL ? strstr(graph_clear_wait, "continue;") : NULL;
 	follower_snapshot
-		= graph_clear != NULL
-			  ? strstr(graph_clear, "cluster_pcm_x_local_follower_wfg_snapshot_exact(")
+		= graph_clear_retry != NULL
+			  ? strstr(graph_clear_retry, "cluster_pcm_x_local_follower_wfg_snapshot_exact(")
 			  : NULL;
 	graph_replace = follower_snapshot != NULL
 						? strstr(follower_snapshot, "cluster_lmd_graph_replace_waiter_edges_exact(")
@@ -3839,6 +3848,9 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 	UT_ASSERT_NOT_NULL(follower_snapshot);
 	UT_ASSERT_NOT_NULL(graph_replace);
 	UT_ASSERT_NOT_NULL(graph_clear);
+	UT_ASSERT_NOT_NULL(graph_clear_policy);
+	UT_ASSERT_NOT_NULL(graph_clear_wait);
+	UT_ASSERT_NOT_NULL(graph_clear_retry);
 	UT_ASSERT_NOT_NULL(self_adopt);
 	UT_ASSERT_NOT_NULL(remote_fetch);
 	UT_ASSERT_NOT_NULL(install_ready);
@@ -3870,9 +3882,11 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 		if (preflight != NULL && preflight_retry != NULL && remote_fetch != NULL)
 			UT_ASSERT(preflight < preflight_retry && preflight_retry < remote_fetch);
 	}
-	if (follower_snapshot != NULL && graph_replace != NULL && graph_clear != NULL)
-		UT_ASSERT(graph_clear < follower_snapshot && follower_snapshot < graph_replace
-				  && graph_replace < driver_end);
+	if (follower_snapshot != NULL && graph_replace != NULL && graph_clear != NULL
+		&& graph_clear_policy != NULL && graph_clear_wait != NULL && graph_clear_retry != NULL)
+		UT_ASSERT(graph_clear < graph_clear_policy && graph_clear_policy < graph_clear_wait
+				  && graph_clear_wait < graph_clear_retry && graph_clear_retry < follower_snapshot
+				  && follower_snapshot < graph_replace && graph_replace < driver_end);
 	if (self_adopt != NULL && remote_fetch != NULL && install_ready != NULL)
 		UT_ASSERT(self_adopt < install_ready && remote_fetch < install_ready);
 	if (self_finish != NULL && remote_finish != NULL && final_ack != NULL)
@@ -3922,6 +3936,12 @@ UT_TEST(test_pcm_x_requester_retry_policy_is_operation_exact)
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_WFG_COMMIT, PCM_X_QUEUE_STALE,
 		  GCS_BLOCK_PCM_X_RETRY_RESNAPSHOT_WFG },
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_WFG_COMMIT, PCM_X_QUEUE_CORRUPT,
+		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
+		/* A follower WFG clear races the per-tag admission gate.  BUSY is
+		 * temporary cross-lock contention and must wait before retrying the
+		 * same exact generation; structural outcomes remain fail-closed. */
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR, PCM_X_QUEUE_BUSY, GCS_BLOCK_PCM_X_RETRY_WAIT },
+		{ GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR, PCM_X_QUEUE_CORRUPT,
 		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },
 		{ GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR, PCM_X_QUEUE_NOT_READY,
 		  GCS_BLOCK_PCM_X_RETRY_FAIL_CLOSED },

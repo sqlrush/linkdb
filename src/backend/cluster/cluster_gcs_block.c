@@ -9383,11 +9383,24 @@ requester_role_dispatch:
 				}
 				if (remove_result == CLUSTER_LMD_GRAPH_REMOVE_REMOVED)
 					cluster_lmd_pcm_convert_wfg_note_remove();
+				fail_site = "follower-wfg-clear";
 				result = cluster_pcm_x_local_follower_wfg_clear_exact(&handle,
 																	  follower_graph_generation);
 				cluster_pcm_x_stats_note_queue_result(result);
-				if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
-					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+				if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE) {
+					retry_action = cluster_gcs_pcm_x_requester_retry_action(
+						GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR, result);
+					if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+					result = gcs_block_pcm_x_requester_wait_exact(
+						&wait_index, &request_runtime, master_node, cluster_epoch, master_session);
+					if (result != PCM_X_QUEUE_OK) {
+						if (result == PCM_X_QUEUE_CORRUPT)
+							GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+						GCS_BLOCK_PCM_X_REQUESTER_DONE();
+					}
+					continue;
+				}
 				follower_graph_generation = 0;
 				gcs_block_pcm_x_requester_cleanup_context.wfg_live = false;
 				gcs_block_pcm_x_requester_cleanup_context.wfg_generation = 0;

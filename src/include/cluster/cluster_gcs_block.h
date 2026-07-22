@@ -418,6 +418,12 @@ cluster_gcs_pcm_x_requester_retry_action(GcsBlockPcmXRequesterSite site, PcmXQue
 			return GCS_BLOCK_PCM_X_RETRY_WAIT;
 		break;
 	case GCS_BLOCK_PCM_X_RETRY_SITE_WFG_CLEAR:
+		/* The clear helper takes the same per-tag admission gate as concurrent
+		 * local ownership mutators.  BUSY therefore reports only cross-lock
+		 * contention; preserve the exact graph generation and retry it. */
+		if (result == PCM_X_QUEUE_BUSY)
+			return GCS_BLOCK_PCM_X_RETRY_WAIT;
+		break;
 	case GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_ARM:
 		break;
 	}
