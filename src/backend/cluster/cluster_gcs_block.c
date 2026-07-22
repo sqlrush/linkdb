@@ -464,6 +464,7 @@ static bool gcs_block_pcm_x_authenticated_session(int32 node_id, uint64 expected
 static bool gcs_block_pcm_x_revalidate_peer_binding(int32 node_id, uint64 epoch, uint64 session);
 static bool gcs_block_pcm_x_source_capable(int32 node_id);
 static PcmXQueueResult gcs_block_pcm_x_fetch_own_result(ClusterPcmOwnResult result);
+static void gcs_block_pcm_x_requester_wait(uint32 *wait_index);
 static PcmXQueueResult
 gcs_block_pcm_x_fetch_reservation_mismatch(const ClusterPcmOwnSnapshot *live);
 static void gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page_lsn);
@@ -3073,6 +3074,41 @@ gcs_block_pcm_x_self_handoff_kind(uint8 pcm_state)
 }
 
 
+/* An admission rekey may hold the local tag's cross-lock gate while an exact
+ * ownership handoff or image install is already irreversible.  The progress
+ * API deliberately reports BUSY without dereferencing resident identity in
+ * that window.  Wait out only that legal gate: every other result remains an
+ * exact protocol verdict for the caller's existing fail-closed checks.
+ *
+ * A cancel/die while waiting cannot expose the mutated buffer as an ordinary
+ * retry, so preserve the recovery boundary before propagating the error. */
+static PcmXQueueResult
+gcs_block_pcm_x_post_handoff_progress_exact(const PcmXLocalHandle *leader,
+										PcmXLocalProgress *progress_out)
+{
+	volatile PcmXQueueResult result = PCM_X_QUEUE_CORRUPT;
+	uint32 wait_index = 0;
+
+	PG_TRY();
+	{
+		for (;;) {
+			result = cluster_pcm_x_local_progress_exact(leader, progress_out);
+			cluster_pcm_x_stats_note_queue_result((PcmXQueueResult)result);
+			if (result != PCM_X_QUEUE_BUSY)
+				break;
+			gcs_block_pcm_x_requester_wait(&wait_index);
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_pcm_x_runtime_fail_closed();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return (PcmXQueueResult)result;
+}
+
+
 PcmXQueueResult
 cluster_gcs_pcm_x_adopt_self_image(BufferDesc *buf, const PcmXLocalHandle *leader,
 								   const ClusterPcmOwnSnapshot *revoking_base,
@@ -3171,8 +3207,7 @@ cluster_gcs_pcm_x_adopt_self_image(BufferDesc *buf, const PcmXLocalHandle *leade
 	if (queue_result != PCM_X_QUEUE_OK)
 		return queue_result;
 
-	queue_result = cluster_pcm_x_local_progress_exact(leader, &progress_after);
-	cluster_pcm_x_stats_note_queue_result(queue_result);
+	queue_result = gcs_block_pcm_x_post_handoff_progress_exact(leader, &progress_after);
 	if (queue_result != PCM_X_QUEUE_OK
 		|| memcmp(&progress_before, &progress_after, sizeof(progress_after)) != 0
 		|| !gcs_block_pcm_x_fetch_authority_exact(&progress_after)) {
@@ -3225,8 +3260,7 @@ cluster_gcs_pcm_x_finish_self_image_x(BufferDesc *buf, const PcmXLocalHandle *le
 		return gcs_block_pcm_x_fetch_reservation_mismatch(&live);
 	handoff_live = true;
 
-	queue_result = cluster_pcm_x_local_progress_exact(leader, &progress);
-	cluster_pcm_x_stats_note_queue_result(queue_result);
+	queue_result = gcs_block_pcm_x_post_handoff_progress_exact(leader, &progress);
 	if (queue_result != PCM_X_QUEUE_OK
 		|| !gcs_block_pcm_x_self_progress_exact(&progress, leader, revoking_base,
 												PGRAC_IC_MSG_PCM_X_COMMIT_X)
@@ -3633,8 +3667,7 @@ cluster_gcs_pcm_x_fetch_image_and_install(BufferDesc *buf, const PcmXLocalHandle
 
 			/* Once bytes landed, a disappearing queue/reservation has no local
 			 * rollback proof.  Preserve evidence and close the runtime. */
-			queue_result = cluster_pcm_x_local_progress_exact(leader, &progress_now);
-			cluster_pcm_x_stats_note_queue_result(queue_result);
+			queue_result = gcs_block_pcm_x_post_handoff_progress_exact(leader, &progress_now);
 			own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live_own);
 			if (queue_result != PCM_X_QUEUE_OK
 				|| memcmp(&progress_before, &progress_now, sizeof(progress_now)) != 0

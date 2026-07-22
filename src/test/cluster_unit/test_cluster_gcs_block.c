@@ -3387,7 +3387,8 @@ UT_TEST(test_pcm_x_self_source_handoff_is_no_copy_and_drain_preserves_x)
 		UT_ASSERT(adopt_page_check < adopt_end && adopt_handoff < adopt_end);
 	if (finish_end != NULL) {
 		finish_preflight = strstr(finish, "cluster_bufmgr_pcm_own_snapshot(");
-		finish_progress = strstr(finish, "cluster_pcm_x_local_progress_exact(");
+		finish_progress
+			= strstr(finish, "gcs_block_pcm_x_post_handoff_progress_exact(");
 		finish_try = strstr(finish, "PG_TRY();");
 		finish_fail_closed = strstr(finish, "cluster_pcm_x_runtime_fail_closed();");
 		finish_commit = strstr(finish, "cluster_bufmgr_pcm_own_finish_x_commit(");
@@ -3451,6 +3452,123 @@ UT_TEST(test_pcm_x_self_source_handoff_is_no_copy_and_drain_preserves_x)
 		&& release_retained != NULL && drain_end != NULL)
 		UT_ASSERT(verify_x < release_retained && release_retained < release_record
 				  && release_record < self_return && self_return < drain_end);
+	free(source);
+}
+
+
+UT_TEST(test_pcm_x_post_handoff_progress_waits_out_only_admission_gate_busy)
+{
+	char *source = read_gcs_block_source();
+	const char *helper;
+	const char *helper_end;
+	const char *helper_progress;
+	const char *helper_busy;
+	const char *helper_wait;
+	const char *helper_try;
+	const char *helper_catch;
+	const char *helper_fail_closed;
+	const char *helper_rethrow;
+	const char *adopt;
+	const char *adopt_handoff;
+	const char *adopt_progress;
+	const char *adopt_strict;
+	const char *finish;
+	const char *finish_handoff;
+	const char *finish_progress;
+	const char *finish_strict;
+	const char *fetch;
+	const char *fetch_end;
+	const char *fetch_install;
+	const char *fetch_progress;
+	const char *fetch_strict;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	helper = strstr(source, "\ngcs_block_pcm_x_post_handoff_progress_exact(");
+	adopt = strstr(source, "\ncluster_gcs_pcm_x_adopt_self_image(");
+	finish = strstr(source, "\ncluster_gcs_pcm_x_finish_self_image_x(");
+	fetch = strstr(source, "\ncluster_gcs_pcm_x_fetch_image_and_install(");
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(adopt);
+	UT_ASSERT_NOT_NULL(finish);
+	UT_ASSERT_NOT_NULL(fetch);
+	if (helper == NULL || adopt == NULL || finish == NULL || fetch == NULL) {
+		free(source);
+		return;
+	}
+
+	helper_end = adopt;
+	helper_progress = strstr(helper, "cluster_pcm_x_local_progress_exact(");
+	helper_busy = helper_progress != NULL
+					  ? strstr(helper_progress, "if (result != PCM_X_QUEUE_BUSY)")
+					  : NULL;
+	helper_wait = helper_busy != NULL ? strstr(helper_busy, "gcs_block_pcm_x_requester_wait(") : NULL;
+	helper_try = strstr(helper, "PG_TRY();");
+	helper_catch = helper_try != NULL ? strstr(helper_try, "PG_CATCH();") : NULL;
+	helper_fail_closed
+		= helper_catch != NULL ? strstr(helper_catch, "cluster_pcm_x_runtime_fail_closed();") : NULL;
+	helper_rethrow
+		= helper_fail_closed != NULL ? strstr(helper_fail_closed, "PG_RE_THROW();") : NULL;
+	UT_ASSERT_NOT_NULL(helper_progress);
+	UT_ASSERT_NOT_NULL(helper_busy);
+	UT_ASSERT_NOT_NULL(helper_wait);
+	UT_ASSERT_NOT_NULL(helper_try);
+	UT_ASSERT_NOT_NULL(helper_catch);
+	UT_ASSERT_NOT_NULL(helper_fail_closed);
+	UT_ASSERT_NOT_NULL(helper_rethrow);
+	if (helper_progress != NULL && helper_busy != NULL && helper_wait != NULL
+		&& helper_try != NULL && helper_catch != NULL && helper_fail_closed != NULL
+		&& helper_rethrow != NULL)
+		UT_ASSERT(helper_try < helper_progress && helper_progress < helper_busy
+				  && helper_busy < helper_wait && helper_wait < helper_catch
+				  && helper_catch < helper_fail_closed && helper_fail_closed < helper_rethrow
+				  && helper_rethrow < helper_end);
+
+	adopt_handoff = strstr(adopt, "cluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation(");
+	adopt_progress = adopt_handoff != NULL
+					 ? strstr(adopt_handoff, "gcs_block_pcm_x_post_handoff_progress_exact(")
+					 : NULL;
+	adopt_strict
+		= adopt_progress != NULL ? strstr(adopt_progress, "memcmp(&progress_before, &progress_after")
+								  : NULL;
+	UT_ASSERT_NOT_NULL(adopt_handoff);
+	UT_ASSERT_NOT_NULL(adopt_progress);
+	UT_ASSERT_NOT_NULL(adopt_strict);
+	if (adopt_handoff != NULL && adopt_progress != NULL && adopt_strict != NULL)
+		UT_ASSERT(adopt_handoff < adopt_progress && adopt_progress < adopt_strict
+				  && adopt_strict < finish);
+
+	finish_handoff = strstr(finish, "handoff_live = true;");
+	finish_progress = finish_handoff != NULL
+					  ? strstr(finish_handoff, "gcs_block_pcm_x_post_handoff_progress_exact(")
+					  : NULL;
+	finish_strict = finish_progress != NULL
+					? strstr(finish_progress, "gcs_block_pcm_x_self_progress_exact(")
+					: NULL;
+	UT_ASSERT_NOT_NULL(finish_handoff);
+	UT_ASSERT_NOT_NULL(finish_progress);
+	UT_ASSERT_NOT_NULL(finish_strict);
+	if (finish_handoff != NULL && finish_progress != NULL && finish_strict != NULL)
+		UT_ASSERT(finish_handoff < finish_progress && finish_progress < finish_strict
+				  && finish_strict < fetch);
+
+	fetch_end = strstr(fetch, "\n}\n\n\n/*");
+	fetch_install = strstr(fetch, "gcs_block_pcm_x_install_reserved_image_exact(");
+	fetch_progress = fetch_install != NULL
+					 ? strstr(fetch_install, "gcs_block_pcm_x_post_handoff_progress_exact(")
+					 : NULL;
+	fetch_strict
+		= fetch_progress != NULL ? strstr(fetch_progress, "memcmp(&progress_before, &progress_now")
+								  : NULL;
+	UT_ASSERT_NOT_NULL(fetch_end);
+	UT_ASSERT_NOT_NULL(fetch_install);
+	UT_ASSERT_NOT_NULL(fetch_progress);
+	UT_ASSERT_NOT_NULL(fetch_strict);
+	if (fetch_end != NULL && fetch_install != NULL && fetch_progress != NULL
+		&& fetch_strict != NULL)
+		UT_ASSERT(fetch_install < fetch_progress && fetch_progress < fetch_strict
+				  && fetch_strict < fetch_end);
 	free(source);
 }
 
@@ -5416,7 +5534,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(105);
+	UT_PLAN(106);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5497,6 +5615,7 @@ main(void)
 	UT_RUN(test_pcm_x_image_fetch_intercepts_canonical_id_before_generic_dedup);
 	UT_RUN(test_pcm_x_requester_fetch_revalidates_queue_and_reservation_before_install);
 	UT_RUN(test_pcm_x_self_source_handoff_is_no_copy_and_drain_preserves_x);
+	UT_RUN(test_pcm_x_post_handoff_progress_waits_out_only_admission_gate_busy);
 	UT_RUN(test_pcm_x_retire_wake_identity_is_wait_generation_exact);
 	UT_RUN(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles);
 	UT_RUN(test_pcm_x_requester_retry_policy_is_operation_exact);
