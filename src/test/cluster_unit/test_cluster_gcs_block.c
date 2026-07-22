@@ -2509,6 +2509,40 @@ UT_TEST(test_pcm_x_holder_image_evidence_never_uses_generation_as_presence)
 }
 
 
+UT_TEST(test_pcm_x_duplicate_drain_accepts_only_holder_retired_after_first_consumption)
+{
+	char *source = read_gcs_block_source();
+	const char *drain;
+	const char *drain_end;
+	const char *loss_guard;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	drain = strstr(source, "\ngcs_block_pcm_x_local_drain_apply_exact(");
+	drain_end = drain != NULL ? strstr(drain + 1, "\n}\n\n\n") : NULL;
+	loss_guard
+		= drain != NULL
+			  ? strstr(drain,
+					   "if (holder_ref && !holder_image\n"
+					   "\t\t&& !(result == PCM_X_QUEUE_DUPLICATE\n"
+					   "\t\t\t && progress_result == PCM_X_QUEUE_NOT_FOUND))")
+			  : NULL;
+
+	/* A DUPLICATE proves that the first local DRAIN consumption already
+	 * processed the exact holder image.  RETIRE may therefore clear the live
+	 * holder between the pre/post snapshots.  First-consumption OK plus
+	 * NOT_FOUND, and DUPLICATE plus an OK mismatched successor, remain outside
+	 * this exact exception and must still fail closed. */
+	UT_ASSERT_NOT_NULL(drain);
+	UT_ASSERT_NOT_NULL(drain_end);
+	UT_ASSERT_NOT_NULL(loss_guard);
+	if (loss_guard != NULL && drain_end != NULL)
+		UT_ASSERT(loss_guard < drain_end);
+	free(source);
+}
+
+
 UT_TEST(test_pcm_x_pending_x_marker_is_only_a_pre_handoff_gate)
 {
 	UT_ASSERT(cluster_gcs_pcm_x_transfer_pre_handoff_phase(0));
@@ -5534,7 +5568,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(106);
+	UT_PLAN(107);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5602,6 +5636,7 @@ main(void)
 	UT_RUN(test_pcm_x_final_ack_builds_exact_grd_handoff_token);
 	UT_RUN(test_pcm_x_final_ack_fail_closed_names_exact_handoff_stage);
 	UT_RUN(test_pcm_x_holder_image_evidence_never_uses_generation_as_presence);
+	UT_RUN(test_pcm_x_duplicate_drain_accepts_only_holder_retired_after_first_consumption);
 	UT_RUN(test_pcm_x_pending_x_marker_is_only_a_pre_handoff_gate);
 	UT_RUN(test_pcm_x_ready_publication_follows_exact_retained_commit);
 	UT_RUN(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change);

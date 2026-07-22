@@ -13645,7 +13645,12 @@ gcs_block_pcm_x_local_drain_apply_exact(const PcmXDrainPollPayload *poll,
 		cluster_pcm_x_runtime_fail_closed();
 		return PCM_X_QUEUE_CORRUPT;
 	}
-	if (holder_ref && !holder_image) {
+	/* A duplicate DRAIN has already consumed this exact holder image.  RETIRE
+	 * may legally clear the live holder between the snapshots above.  An OK
+	 * mismatched successor is not absence and remains fail-closed. */
+	if (holder_ref && !holder_image
+		&& !(result == PCM_X_QUEUE_DUPLICATE
+			 && progress_result == PCM_X_QUEUE_NOT_FOUND)) {
 		cluster_pcm_x_runtime_fail_closed();
 		return PCM_X_QUEUE_CORRUPT;
 	}
