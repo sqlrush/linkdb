@@ -119,6 +119,12 @@ static PcmXMasterTicketSlot *drive_terminal_interlock_ticket;
 static bool drive_terminal_interlock_reclaim;
 static LWLock *local_generation_interlock_lock;
 static PcmXSlotHeader *local_generation_interlock_slot;
+static LWLock *local_retire_admit_ack_interlock_lock;
+static PcmXLocalTagSlot *local_retire_admit_ack_interlock_tag;
+static PcmXLocalMembershipSlot *local_retire_admit_ack_interlock_member;
+static PcmXTicketRef local_retire_admit_ack_interlock_ref;
+static int local_retire_admit_ack_interlock_match;
+static bool local_retire_admit_ack_interlock_fired;
 static LWLock *holder_abort_interlock_lock;
 static PcmXLocalMembershipSlot *holder_abort_interlock_target;
 static int holder_abort_interlock_match;
@@ -441,6 +447,39 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 			pg_atomic_write_u32(&slot->generation_change_seq,
 								pg_atomic_read_u32(&slot->generation_change_seq) | 1U);
 		}
+		if (lock->tranche == LWTRANCHE_CLUSTER_PCM_X_LOCAL
+			&& lock == local_retire_admit_ack_interlock_lock && mode == LW_SHARED
+			&& local_retire_admit_ack_interlock_tag != NULL
+			&& --local_retire_admit_ack_interlock_match == 0) {
+			PcmXLocalTagSlot *tag_slot = local_retire_admit_ack_interlock_tag;
+			PcmXLocalMembershipSlot *member = local_retire_admit_ack_interlock_member;
+			PcmXReliableLegState *leg = &tag_slot->reliable;
+
+			/* Model the exact ADMIT_ACK actor that wins after RETIRE's read-only
+			 * pass released this partition but before its mutating pass reacquires
+			 * it.  The production ACK path takes only this local lock, so the
+			 * already-published global retire gate does not exclude it. */
+			UT_ASSERT(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate) != 0);
+			UT_ASSERT_NOT_NULL(member);
+			UT_ASSERT_EQ(leg->pending_opcode, PGRAC_IC_MSG_PCM_X_ENQUEUE);
+			UT_ASSERT_EQ(leg->phase, PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE);
+			UT_ASSERT(ticket_refs_equal(&tag_slot->ref, &(PcmXTicketRef){ 0 }));
+			tag_slot->ref = local_retire_admit_ack_interlock_ref;
+			member->handle = local_retire_admit_ack_interlock_ref.handle;
+			leg->retry_deadline_ms = 0;
+			leg->expected_responder_session = 0;
+			leg->retry_count = 0;
+			leg->last_responder_node = (uint32)tag_slot->master_node;
+			leg->expected_responder_node = 0;
+			leg->pending_opcode = 0;
+			leg->last_response_opcode = PGRAC_IC_MSG_PCM_X_ADMIT_ACK;
+			leg->phase = 0;
+			leg->flags = 0;
+			leg->reserved = 0;
+			local_retire_admit_ack_interlock_tag = NULL;
+			local_retire_admit_ack_interlock_member = NULL;
+			local_retire_admit_ack_interlock_fired = true;
+		}
 		if (lock->tranche == LWTRANCHE_CLUSTER_PCM_X_LOCAL && lock == local_transfer_peer_drift_lock
 			&& mode == LW_EXCLUSIVE && local_transfer_peer_drift_frontier != NULL) {
 			local_transfer_peer_drift_lock = NULL;
@@ -635,6 +674,13 @@ reset_fake_shmem(void)
 	drive_terminal_interlock_reclaim = false;
 	local_generation_interlock_lock = NULL;
 	local_generation_interlock_slot = NULL;
+	local_retire_admit_ack_interlock_lock = NULL;
+	local_retire_admit_ack_interlock_tag = NULL;
+	local_retire_admit_ack_interlock_member = NULL;
+	memset(&local_retire_admit_ack_interlock_ref, 0,
+		   sizeof(local_retire_admit_ack_interlock_ref));
+	local_retire_admit_ack_interlock_match = 0;
+	local_retire_admit_ack_interlock_fired = false;
 	holder_abort_interlock_lock = NULL;
 	holder_abort_interlock_target = NULL;
 	holder_abort_interlock_match = 0;
@@ -11226,6 +11272,157 @@ append_local_undrained_writer(BlockNumber block, uint64 master_session, uint64 w
 	UT_ASSERT_EQ(test_slot_flags(&(*tag_slot_out)->slot) & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
 }
 
+/* Leave one canonical writer exactly between ENQUEUE arm and ADMIT_ACK.  The
+ * master ticket exists remotely, but its local ref is still zero until the ACK
+ * actor publishes it under the local partition lock. */
+static void
+append_local_inflight_enqueue(BlockNumber block, uint64 master_session, uint64 writer_ticket,
+							  PcmXLocalHandle *writer_out, PcmXLocalTagSlot **tag_slot_out,
+							  PcmXLocalMembershipSlot **member_out, PcmXTicketRef *ack_ref_out)
+{
+	PcmXLocalWriterClaim writer_claim;
+	PcmXLocalCutoff cutoff;
+	PcmXWaitIdentity identity;
+	PcmXEnqueuePayload enqueue;
+	PcmXLocalReliableToken token;
+
+	UT_ASSERT_NOT_NULL(writer_out);
+	UT_ASSERT_NOT_NULL(tag_slot_out);
+	UT_ASSERT_NOT_NULL(member_out);
+	UT_ASSERT_NOT_NULL(ack_ref_out);
+	identity = make_wait_identity(block, 0, 4, master_session + writer_ticket);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, master_session, writer_out),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(writer_out, &writer_claim), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_begin_revoke_cutoff_exact(writer_out, &cutoff),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(writer_out, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	*tag_slot_out
+		= &local_tag_slots(ClusterPcmXConvertShmem)[writer_out->tag_slot.slot_index];
+	*member_out
+		= &membership_slots(ClusterPcmXConvertShmem)[writer_out->membership_slot.slot_index];
+	memset(ack_ref_out, 0, sizeof(*ack_ref_out));
+	ack_ref_out->identity = identity;
+	ack_ref_out->handle.ticket_id = writer_ticket;
+	ack_ref_out->handle.queue_generation = UINT64_C(1);
+	UT_ASSERT(ticket_refs_equal(&(*tag_slot_out)->ref, &(PcmXTicketRef){ 0 }));
+	UT_ASSERT_EQ((*tag_slot_out)->reliable.pending_opcode, PGRAC_IC_MSG_PCM_X_ENQUEUE);
+	UT_ASSERT_EQ((*tag_slot_out)->reliable.phase, PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE);
+}
+
+
+/* RED for S3 Loop 14 (2026-07-23): the S3-P0-02 prefix guard covered a
+ * canonical lower/equal live writer only after ADMIT_ACK had published its
+ * ticket ref.  A valid ENQUEUE-in-flight leader therefore passed RETIRE's
+ * first scan with ref==0; its ACK could publish a lower ticket before the
+ * second scan, after an older terminal tag had already been detached.  The
+ * second scan then returned NOT_READY(7) and correctly fused on partial
+ * mutation.  Refuse the exact in-flight lifecycle in the read-only pass so
+ * both tags, wake accounting, and the frontier remain byte-exact. */
+UT_TEST(test_local_retire_waits_for_inflight_enqueue_before_first_mutation)
+{
+	TestLocalIndependentDualTerminal terminal;
+	PcmXLocalHandle inflight_writer;
+	PcmXLocalMembershipSlot *inflight_member;
+	PcmXLocalMembershipSlot inflight_member_saved;
+	PcmXLocalMembershipSlot *terminal_member;
+	PcmXLocalMembershipSlot terminal_member_saved;
+	PcmXLocalTagSlot *inflight_tag;
+	PcmXLocalTagSlot inflight_saved;
+	PcmXLocalTagSlot terminal_saved;
+	PcmXRetirePayload retire;
+	PcmXTicketRef ack_ref;
+	BlockNumber inflight_block = 7136;
+	uint32 inflight_partition;
+	uint32 terminal_partition;
+	const uint64 master_session = UINT64_C(1838);
+
+	prepare_local_independent_dual_terminal(7135, master_session, UINT64_C(97002),
+										UINT64_C(97003), false, &terminal);
+	terminal_partition
+		= cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&terminal.tag_slot->tag));
+	do {
+		PcmXWaitIdentity candidate
+			= make_wait_identity(inflight_block, 0, 4, master_session + UINT64_C(97001));
+
+		inflight_partition
+			= cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&candidate.tag));
+		if (inflight_partition != terminal_partition)
+			break;
+		inflight_block++;
+	} while (inflight_block < 7200);
+	UT_ASSERT(inflight_partition != terminal_partition);
+	append_local_inflight_enqueue(inflight_block, master_session, UINT64_C(97001),
+								  &inflight_writer, &inflight_tag, &inflight_member, &ack_ref);
+	terminal_member
+		= &membership_slots(ClusterPcmXConvertShmem)[terminal.writer.membership_slot.slot_index];
+	terminal_saved = *terminal.tag_slot;
+	terminal_member_saved = *terminal_member;
+	inflight_saved = *inflight_tag;
+	inflight_member_saved = *inflight_member;
+
+	local_retire_admit_ack_interlock_lock
+		= &ClusterPcmXConvertShmem->local_locks[inflight_partition].lock;
+	local_retire_admit_ack_interlock_tag = inflight_tag;
+	local_retire_admit_ack_interlock_member = inflight_member;
+	local_retire_admit_ack_interlock_ref = ack_ref;
+	local_retire_admit_ack_interlock_match = 2;
+	local_retire_admit_ack_interlock_fired = false;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = terminal.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = terminal.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT(!local_retire_admit_ack_interlock_fired);
+	UT_ASSERT_NOT_NULL(local_retire_admit_ack_interlock_tag);
+	UT_ASSERT(memcmp(&terminal_saved, terminal.tag_slot, sizeof(terminal_saved)) == 0);
+	UT_ASSERT(memcmp(&terminal_member_saved, terminal_member, sizeof(terminal_member_saved)) == 0);
+	UT_ASSERT(memcmp(&inflight_saved, inflight_tag, sizeof(inflight_saved)) == 0);
+	UT_ASSERT(memcmp(&inflight_member_saved, inflight_member, sizeof(inflight_member_saved)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retired_ticket_id, 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	local_retire_admit_ack_interlock_lock = NULL;
+	local_retire_admit_ack_interlock_tag = NULL;
+	local_retire_admit_ack_interlock_member = NULL;
+
+	/* The refusal is not a blanket exemption for zero-ref state.  A malformed
+	 * reliable leg keeps the exact RETIRE witness and fails closed before the
+	 * terminal tag can be changed. */
+	prepare_local_independent_dual_terminal(7137, master_session + 1, UINT64_C(97102),
+										UINT64_C(97103), false, &terminal);
+	append_local_inflight_enqueue(7138, master_session + 1, UINT64_C(97101), &inflight_writer,
+								  &inflight_tag, &inflight_member, &ack_ref);
+	inflight_tag->reliable.phase = 0;
+	terminal_member
+		= &membership_slots(ClusterPcmXConvertShmem)[terminal.writer.membership_slot.slot_index];
+	terminal_saved = *terminal.tag_slot;
+	terminal_member_saved = *terminal_member;
+	inflight_saved = *inflight_tag;
+	inflight_member_saved = *inflight_member;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = terminal.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session + 1;
+	retire.retire_through_ticket_id = terminal.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session + 1),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT(memcmp(&terminal_saved, terminal.tag_slot, sizeof(terminal_saved)) == 0);
+	UT_ASSERT(memcmp(&terminal_member_saved, terminal_member, sizeof(terminal_member_saved)) == 0);
+	UT_ASSERT(memcmp(&inflight_saved, inflight_tag, sizeof(inflight_saved)) == 0);
+	UT_ASSERT(memcmp(&inflight_member_saved, inflight_member, sizeof(inflight_member_saved)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id,
+				 retire.retire_through_ticket_id);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 2);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
+
 /* RED for S3 Loop 4 (2026-07-22): RETIRE_UP_TO is a prefix watermark across
  * every local tag owned by one master session.  The old first pass ignored a
  * lower live ticket when that different tag had not reached DRAIN yet, then
@@ -16920,7 +17117,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(281);
+	UT_PLAN(282);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -17101,6 +17298,7 @@ main(void)
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
+	UT_RUN(test_local_retire_waits_for_inflight_enqueue_before_first_mutation);
 	UT_RUN(test_local_retire_waits_for_undrained_lower_ticket_on_another_tag);
 	UT_RUN(test_local_retire_ignores_undrained_higher_ticket_on_another_tag);
 	UT_RUN(test_local_retire_waits_for_older_writer_complete_before_newer_holder);
