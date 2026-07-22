@@ -292,10 +292,11 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 		/*
 		 * Requester leg (e) of the retention proof: the bound commit_scn <=
 		 * horizon decides against read_scn only when the horizon is not
-		 * newer than read_scn.  A caller without snapshot semantics
-		 * (read_scn invalid) can never consume a bound.
+		 * newer than read_scn.  A terminal-state-only caller (read_scn
+		 * invalid) consumes only the origin+CLOG-proven COMMITTED fact; the
+		 * is_bound marker below still forbids stamping/caching the horizon.
 		 */
-		if (!SCN_VALID(read_scn) || scn_time_cmp((SCN)verdict.horizon_scn, read_scn) > 0) {
+		if (!cluster_vis_committed_bound_admissible((SCN)verdict.horizon_scn, read_scn)) {
 			cluster_rtvis_verdict_note_inadmissible();
 			elog(DEBUG1,
 				 "rtvis verdict: xid %u origin %d BELOW_HORIZON " UINT64_FORMAT
@@ -505,10 +506,10 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
  *	resolution reuses cluster_lms_undo_verdict_fill_page — the very function
  *	the origin serves foreign requesters with — so a node's self answer and
  *	its served answer over one xid can never diverge (Rule 8.A).  A
- *	COMMITTED_BOUND then applies the same read_scn admissibility (requester leg
- *	(e)) the foreign path applies: observe the horizon (Lamport self-heal),
- *	admit only when read_scn is at/after it, else fail-closed for THIS
- *	snapshot.
+ *	COMMITTED_BOUND then applies the same admission as the foreign path:
+ *	observe the horizon (Lamport self-heal); a snapshot admits only when
+ *	read_scn is at/after it, while a terminal-state-only caller consumes only
+ *	the proven COMMITTED fact and keeps the bound marker.
  */
 static ClusterUndoVerdictResult
 rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
@@ -530,9 +531,9 @@ rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
 
 	if (r.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND) {
 		cluster_scn_observe(r.commit_scn);
-		if (!SCN_VALID(read_scn) || scn_time_cmp(r.commit_scn, read_scn) > 0) {
+		if (!cluster_vis_committed_bound_admissible(r.commit_scn, read_scn)) {
 			cluster_rtvis_resolve_note_failclosed();
-			return unknown; /* bound inadmissible for this snapshot; heals next */
+			return unknown; /* bound inadmissible for this consumer; snapshot heals next */
 		}
 	}
 

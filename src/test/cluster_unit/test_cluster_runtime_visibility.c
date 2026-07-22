@@ -163,6 +163,27 @@ UT_TEST(test_failclosed_epoch_differs_above_32bit)
 	UT_ASSERT_EQ(cluster_vis_live_authority_covers_policy((SCN)1, a, wide_epoch), true);
 }
 
+/*
+ * S3-P0-03: after a retained TT slot is recycled, the origin can still prove
+ * from its own CLOG that the old xid COMMITTED, but can ship only a horizon
+ * bound.  A no-snapshot consumer (Update/Self/Dirty/Toast/writer-chain) needs
+ * only that terminal fact.  Snapshot visibility keeps the stricter
+ * horizon <= read_scn rule.
+ */
+UT_TEST(test_committed_bound_admission_terminal_vs_snapshot)
+{
+	/* InvalidScn is the resolver contract for terminal-state-only consumers. */
+	UT_ASSERT_EQ(cluster_vis_committed_bound_admissible((SCN)500, InvalidScn), true);
+
+	/* Snapshot visibility admits only at/after the bound. */
+	UT_ASSERT_EQ(cluster_vis_committed_bound_admissible((SCN)500, (SCN)500), true);
+	UT_ASSERT_EQ(cluster_vis_committed_bound_admissible((SCN)500, (SCN)499), false);
+
+	/* An absent horizon is never evidence, for either consumer kind. */
+	UT_ASSERT_EQ(cluster_vis_committed_bound_admissible(InvalidScn, InvalidScn), false);
+	UT_ASSERT_EQ(cluster_vis_committed_bound_admissible(InvalidScn, (SCN)500), false);
+}
+
 /* CP2: authority trailer little-endian carrier roundtrip (wire ABI). */
 UT_TEST(test_undo_auth_trailer_roundtrip)
 {
@@ -860,7 +881,7 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(24);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -870,6 +891,7 @@ main(void)
 	UT_RUN(test_failclosed_when_authority_scn_below_demand);
 	UT_RUN(test_failclosed_epoch_mismatch_dominates_good_scn);
 	UT_RUN(test_failclosed_epoch_differs_above_32bit);
+	UT_RUN(test_committed_bound_admission_terminal_vs_snapshot);
 	UT_RUN(test_ttproof_committed_and_aborted);
 	UT_RUN(test_ttproof_committed_is_evidence_not_verdict);
 	UT_RUN(test_ttproof_recycled_same_xid_reports_bumped_wrap_not_gated);

@@ -87,6 +87,17 @@ extern bool cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLive
 													 uint64 local_epoch);
 
 /*
+ * S3-P0-03: pure admission for a COMMITTED_BELOW_HORIZON proof.  A valid
+ * snapshot may consume the bound only when horizon_scn <= read_scn.  The
+ * plain visibility resolver passes InvalidScn for terminal-state-only
+ * consumers (Update/Self/Dirty/Toast/writer-chain); those consumers may use
+ * the origin+CLOG-proven COMMITTED fact, but must preserve the bound marker
+ * and never treat horizon_scn as an exact commit SCN.  An invalid horizon is
+ * never evidence.
+ */
+extern bool cluster_vis_committed_bound_admissible(SCN horizon_scn, SCN read_scn);
+
+/*
  * Runtime wrapper: supplies the local membership epoch to the pure gate.
  * (cluster_runtime_visibility.c; the pure policy above is CP1.)
  */
@@ -238,20 +249,22 @@ cluster_vis_undo_multi_verdict_page_usable(const struct ClusterGcsUndoMultiVerdi
  *	    COMPLETE own-TT by-xid verdict (complete scan + CLOG cross-check +
  *	    retention origin legs; ≈ the spec-3.22 retention theorem served
  *	    cross-instance).  A COMMITTED_BELOW_HORIZON verdict carries only a
- *	    bound (the true commit_scn is at or below horizon_scn), so it is
- *	    consumed IFF the caller's read_scn is at/after the horizon
- *	    (requester leg (e)); the shipped
+ *	    bound (the true commit_scn is at or below horizon_scn).  Snapshot
+ *	    callers consume it IFF read_scn is at/after the horizon (requester
+ *	    leg (e)); terminal-state-only callers consume only the proven
+ *	    COMMITTED fact.  The shipped
  *	    horizon is Lamport-observed either way (AD-008) so a leg-(e) miss
  *	    self-heals on the next snapshot.
  *
- * read_scn = the caller's snapshot SCN, or InvalidScn for callers without
- * snapshot semantics (below-horizon verdicts are then inadmissible; exact
- * verdicts still resolve).  true only when a terminal verdict is proven
+ * read_scn = the caller's snapshot SCN, or InvalidScn for terminal-state-only
+ * callers without snapshot ordering.  true only when a terminal verdict is
+ * proven
  * (*out_committed says which).  On true with *out_commit_scn_is_bound set,
- * *out_commit_scn is the HORIZON BOUND, not the exact commit_scn: it decides
- * correctly against THIS read_scn only, and must never be stamped/cached as
- * an exact scn (a later smaller read_scn would falsely read it as
- * committed-after — false-invisible, Rule 8.A).  false = caller keeps the
+ * *out_commit_scn is the HORIZON BOUND, not the exact commit_scn: a snapshot
+ * may compare it only against THIS read_scn, while a terminal-only caller may
+ * use only *out_committed.  It must never be stamped/cached as an exact scn
+ * (a later smaller read_scn would falsely read it as committed-after —
+ * false-invisible, Rule 8.A).  false = caller keeps the
  * pre-existing STALE_OR_AMBIGUOUS -> 53R97 fail-closed.
  */
 extern bool cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,

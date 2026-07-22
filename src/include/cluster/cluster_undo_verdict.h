@@ -128,8 +128,10 @@ extern ClusterUndoVerdictResult cluster_undo_verdict_from_resolve(bool ok, bool 
  * tuple.  origin_node = the xid's owner; undo_segment_id = the ITL-ref segment
  * (CP3 block0 locator); anchor_lsn = this tuple's page LSN (version-coverage
  * gate); read_scn = the snapshot SCN (COMMITTED_BOUND admissibility), or
- * InvalidScn for callers without snapshot semantics.  master==self routes to
- * the local durable resolve; master!=self to the CP3 S-grant + CP5 verdict.
+ * InvalidScn for terminal-state-only callers without snapshot ordering (a
+ * committed bound may resolve status but remains non-exact).  master==self
+ * routes to the local durable resolve; master!=self to the CP3 S-grant + CP5
+ * verdict.
  * kind == UNKNOWN_FAIL_CLOSED => the caller keeps 53R97 (never false-visible).
  *
  * authoritative (spec-5.22f D6-7) = the origin was chosen from the tuple page's
