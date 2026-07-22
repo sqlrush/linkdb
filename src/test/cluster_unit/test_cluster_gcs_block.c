@@ -1967,6 +1967,51 @@ UT_TEST(test_pcm_x_terminal_retry_reclaims_cancel_cleanup_after_owner_death)
 }
 
 
+/* RED for the Loop5 P0-10 residual (2026-07-22): a bounded retry tick that
+ * restarts its younger-ticket scan at zero every time only ever visits the
+ * oldest B tickets.  If the oldest RETIRE is waiting for ticket B+1's DRAIN,
+ * the fixed budget becomes a permanent cross-ticket cycle.  Keep the oldest
+ * kick on every tick, but require a persistent younger cursor that reaches
+ * beyond the budget and wraps only after observing the tail. */
+UT_TEST(test_pcm_x_terminal_retry_tick_rotates_beyond_stuck_prefix)
+{
+	static const char *const ordered[] = {
+		"static uint64 younger_cursor = 0;",
+		"PcmXTicketRef oldest;",
+		"cluster_pcm_x_master_terminal_work_next(&oldest)",
+		"cluster_gcs_pcm_x_terminal_kick(&oldest);",
+		"if (younger_cursor < oldest.handle.ticket_id)",
+		"younger_cursor = oldest.handle.ticket_id;",
+		"for (kicks = 1;",
+		"cluster_pcm_x_master_terminal_work_next_after(younger_cursor, &ref)",
+		"if (result == PCM_X_QUEUE_NOT_FOUND) {",
+		"younger_cursor = oldest.handle.ticket_id;",
+		"return;",
+		"cluster_gcs_pcm_x_terminal_kick(&ref);",
+		"younger_cursor = ref.handle.ticket_id;",
+	};
+	char *source = read_gcs_block_source();
+	char *tick;
+	char *end;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	tick = strstr(source, "\ngcs_block_pcm_x_terminal_retry_tick(");
+	end = tick != NULL ? strstr(tick, "\n}\n\n\nstatic") : NULL;
+	UT_ASSERT_NOT_NULL(tick);
+	UT_ASSERT_NOT_NULL(end);
+	if (tick != NULL && end != NULL) {
+		assert_ordered_in_function(source, "\ngcs_block_pcm_x_terminal_retry_tick(",
+								   "\n}\n\n\nstatic", ordered,
+								   (int)(sizeof(ordered) / sizeof(ordered[0])));
+		UT_ASSERT(strstr(tick, "uint64 after = 0;") == NULL
+				  || strstr(tick, "uint64 after = 0;") > end);
+	}
+	free(source);
+}
+
+
 UT_TEST(test_pcm_x_invalidate_ack_matches_only_exact_unacked_holder)
 {
 	GcsBlockInvalidateAckPayload ack;
@@ -5328,7 +5373,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(104);
+	UT_PLAN(105);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5387,6 +5432,7 @@ main(void)
 	UT_RUN(test_pcm_x_master_drive_wiring_binds_grd_barrier_to_exact_ticket);
 	UT_RUN(test_pcm_x_cancel_cleanup_classifies_exact_wfg_and_post_clear_failure);
 	UT_RUN(test_pcm_x_terminal_retry_reclaims_cancel_cleanup_after_owner_death);
+	UT_RUN(test_pcm_x_terminal_retry_tick_rotates_beyond_stuck_prefix);
 	UT_RUN(test_pcm_x_invalidate_ack_matches_only_exact_unacked_holder);
 	UT_RUN(test_pcm_x_invalidate_busy_routes_to_exact_ticket_backoff);
 	UT_RUN(test_pcm_x_local_pending_s_denial_match_is_attempt_exact);

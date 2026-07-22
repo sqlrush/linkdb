@@ -14066,19 +14066,34 @@ gcs_block_pcm_x_master_drive_retry_tick(void)
 static void
 gcs_block_pcm_x_terminal_retry_tick(void)
 {
+	static uint64 younger_cursor = 0;
+	PcmXTicketRef oldest;
 	PcmXTicketRef ref;
-	uint64 after = 0;
+	PcmXQueueResult result;
 	int kicks;
 
-	/* The oldest ticket keeps frontier priority, but a stuck head must not
-	 * starve younger terminal tickets: the head's own RETIRE preflight can be
-	 * waiting for exactly the younger ticket's DRAIN evidence (cross-lane
-	 * holder interlock), so each tick walks the terminal set in id order. */
-	for (kicks = 0; kicks < GCS_BLOCK_PCM_X_TERMINAL_TICK_BUDGET; kicks++) {
-		if (cluster_pcm_x_master_terminal_work_next_after(after, &ref) != PCM_X_QUEUE_OK)
+	/* Keep the contiguous frontier's oldest ticket on every tick, then spend
+	 * the remaining bounded budget from a persistent younger cursor.  Starting
+	 * that scan at zero on every tick permanently starves ticket B+1 when B
+	 * older terminals cannot detach; the oldest RETIRE can itself be waiting
+	 * for exactly that ticket's DRAIN evidence.  Reaching the tail resets the
+	 * next tick to the first younger ticket without duplicating work in this
+	 * tick. */
+	if (cluster_pcm_x_master_terminal_work_next(&oldest) != PCM_X_QUEUE_OK)
+		return;
+	cluster_gcs_pcm_x_terminal_kick(&oldest);
+	if (younger_cursor < oldest.handle.ticket_id)
+		younger_cursor = oldest.handle.ticket_id;
+	for (kicks = 1; kicks < GCS_BLOCK_PCM_X_TERMINAL_TICK_BUDGET; kicks++) {
+		result = cluster_pcm_x_master_terminal_work_next_after(younger_cursor, &ref);
+		if (result == PCM_X_QUEUE_NOT_FOUND) {
+			younger_cursor = oldest.handle.ticket_id;
+			return;
+		}
+		if (result != PCM_X_QUEUE_OK)
 			return;
 		cluster_gcs_pcm_x_terminal_kick(&ref);
-		after = ref.handle.ticket_id;
+		younger_cursor = ref.handle.ticket_id;
 	}
 }
 
