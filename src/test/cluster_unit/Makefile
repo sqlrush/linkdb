@@ -904,7 +904,8 @@ test_cluster_ic_router: test_cluster_ic_router.c unit_test.h \
 test_cluster_conf: test_cluster_conf.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_CONF_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_CONF_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_CONF_O) \
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # test_cluster_ic_mock links cluster_ic.o standalone (same as
 # test_cluster_ic but exercises the mock vtable additions and the four
@@ -950,7 +951,8 @@ test_cluster_pgstat: test_cluster_pgstat.c unit_test.h $(CLUSTER_VERSION_O) \
 test_cluster_debug: test_cluster_debug.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_DEBUG_O) $(CLUSTER_STARTUP_PHASE_O) \
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # test_cluster_xnode_profile links cluster_xnode_profile.o standalone (spec-5.59
 # D10).  The test defines the GUC variable itself (cluster_guc.o is not
@@ -1028,12 +1030,13 @@ test_cluster_shared_fs: test_cluster_shared_fs.c unit_test.h \
 		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.5a D12: runtime unit for the shared_fs backend + shared-root
-# sentinel.  Links ONLY cluster_shared_fs_sharedfs.o with functional
-# stubs (real open/pread/pwrite/software-crc32c), no server needed.
+# sentinel.  Links cluster_shared_fs_sharedfs.o with functional stubs
+# (real open/pread/pwrite/software-crc32c) plus server portability helpers.
 test_cluster_shared_fs_sharedfs: test_cluster_shared_fs_sharedfs.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_SHAREDFS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_SHAREDFS_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_SHAREDFS_O) \
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.0a: runtime unit for the raw block_device backend over a
 # temporary regular file that stands in for a block device.  Links only
@@ -1041,7 +1044,8 @@ test_cluster_shared_fs_sharedfs: test_cluster_shared_fs_sharedfs.c unit_test.h \
 test_cluster_shared_fs_block_device: test_cluster_shared_fs_block_device.c unit_test.h \
 		$(CLUSTER_SHARED_FS_BLOCK_DEVICE_O) $(CLUSTER_PR_SCSI_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_SHARED_FS_BLOCK_DEVICE_O) $(CLUSTER_PR_SCSI_O) -o $@
+		$(CLUSTER_SHARED_FS_BLOCK_DEVICE_O) $(CLUSTER_PR_SCSI_O) \
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # test_cluster_smgr links cluster_smgr.o + the three cluster_shared_fs
 # objects standalone.  cluster_smgr.c references HTAB / md.c / fd.c /
@@ -1061,7 +1065,8 @@ test_cluster_smgr: test_cluster_smgr.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SMGR_O) $(CLUSTER_SHARED_CATALOG_O) \
 		$(CLUSTER_SHARED_FS_O) $(CLUSTER_SHARED_FS_STUB_O) \
 		$(CLUSTER_SHARED_FS_LOCAL_O) \
-		$(CLUSTER_SHARED_FS_SHAREDFS_O) -o $@
+		$(CLUSTER_SHARED_FS_SHAREDFS_O) \
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # test_cluster_startup_phase links cluster_startup_phase.o standalone.
 # cluster_startup_phase.c references ereport / GetCurrentTimestamp /
