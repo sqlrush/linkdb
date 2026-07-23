@@ -82,6 +82,9 @@ UT_DEFINE_GLOBALS();
 #ifndef HEAPAM_SOURCE_PATH
 #error "HEAPAM_SOURCE_PATH must identify production heapam.c"
 #endif
+#ifndef HEAPAM_VISIBILITY_SOURCE_PATH
+#error "HEAPAM_VISIBILITY_SOURCE_PATH must identify production heapam_visibility.c"
+#endif
 #ifndef TT_LOCAL_SOURCE_PATH
 #error "TT_LOCAL_SOURCE_PATH must identify production cluster_tt_local.c"
 #endif
@@ -428,6 +431,141 @@ UT_TEST(test_s3c05_foreign_multixact_local_slru_decode_guard)
 }
 
 
+/* A locally composed MultiXact has only local members and is safe to resolve
+ * with PG's native member/CLOG machinery even when xmin was proved committed
+ * by remote cluster evidence.  Remote or missing marker evidence remains
+ * fail-closed before any local SLRU decoder can run. */
+UT_TEST(test_local_multixact_over_remote_xmin_uses_native_update_semantics)
+{
+	char *source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	const char *helper;
+	const char *helper_end;
+	const char *validator;
+	const char *validator_end;
+	const char *members_decode;
+	const char *member_loop;
+	const char *member_normal_gate;
+	const char *member_origin_gate;
+	const char *validate_call;
+	const char *validate_error;
+	const char *is_running;
+	const char *get_update_xid;
+	const char *committed;
+	const char *committed_lock_only;
+	const char *committed_ok;
+	const char *locked_upgraded;
+	const char *current_xid;
+	const char *did_commit;
+	const char *set_hint_bits;
+	const char *fork;
+	const char *fork_end;
+	const char *multi;
+	const char *remote;
+	const char *local_gate;
+	const char *mxid_derive;
+	const char *mxid_gate;
+	const char *local_call;
+	const char *fork_call;
+
+	UT_ASSERT(source != NULL);
+	if (source == NULL)
+		return;
+
+	validator = strstr(source, "\ncluster_satisfies_update_validate_local_multixact(");
+	validator_end = validator != NULL ? strstr(validator, "\n}\n") : NULL;
+	members_decode = validator != NULL ? strstr(validator, "GetMultiXactIdMembers") : NULL;
+	member_loop = members_decode != NULL ? strstr(members_decode, "for (i = 0; i < nmembers; i++)") : NULL;
+	member_normal_gate = member_loop != NULL
+						 ? strstr(member_loop, "!TransactionIdIsNormal(members[i].xid)")
+						 : NULL;
+	member_origin_gate = member_normal_gate != NULL
+						 ? strstr(member_normal_gate, "!cluster_xid_is_mine(members[i].xid)")
+						 : NULL;
+	helper = strstr(source, "\ncluster_satisfies_update_local_multixact(");
+	helper_end = helper != NULL ? strstr(helper, "\n}\n") : NULL;
+	committed = helper != NULL ? strstr(helper, "if (tuple->t_infomask & HEAP_XMAX_COMMITTED)") : NULL;
+	committed_lock_only
+		= committed != NULL ? strstr(committed, "HEAP_XMAX_IS_LOCKED_ONLY") : NULL;
+	committed_ok = committed_lock_only != NULL ? strstr(committed_lock_only, "return TM_Ok") : NULL;
+	validate_call = helper != NULL
+					? strstr(helper, "if (!cluster_satisfies_update_validate_local_multixact(raw_mxid))")
+					: NULL;
+	validate_error = validate_call != NULL ? strstr(validate_call, "ereport(ERROR") : NULL;
+	is_running = helper != NULL ? strstr(helper, "MultiXactIdIsRunning") : NULL;
+	get_update_xid = helper != NULL ? strstr(helper, "HeapTupleGetUpdateXid") : NULL;
+	locked_upgraded = helper != NULL ? strstr(helper, "HEAP_LOCKED_UPGRADED") : NULL;
+	current_xid = helper != NULL ? strstr(helper, "TransactionIdIsCurrentTransactionId") : NULL;
+	did_commit = helper != NULL ? strstr(helper, "TransactionIdDidCommit") : NULL;
+	set_hint_bits = helper != NULL ? strstr(helper, "SetHintBits") : NULL;
+	fork = strstr(source, "\ncluster_satisfies_update_fork(");
+	fork_end = fork != NULL ? strstr(fork, "\n}\n#endif") : NULL;
+	multi = fork != NULL ? strstr(fork, "if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)") : NULL;
+	remote = multi != NULL ? strstr(multi, "if (mr.multi_marker_is_remote)") : NULL;
+	local_gate
+		= remote != NULL ? strstr(remote, "if (mr.evidence != CLUSTER_VIS_EVIDENCE_LOCAL)") : NULL;
+	mxid_derive = local_gate != NULL ? strstr(local_gate, "mx_origin = cluster_mxid_origin_slot(raw_mxid)")
+										 : NULL;
+	mxid_gate = mxid_derive != NULL ? strstr(mxid_derive, "mx_origin != cluster_node_id") : NULL;
+	local_call
+		= mxid_gate != NULL
+			  ? strstr(local_gate, "cluster_satisfies_update_local_multixact(htup, curcid, buffer)")
+			  : NULL;
+	fork_call = fork_end != NULL
+					? strstr(fork_end, "cluster_satisfies_update_fork(htup, curcid, buffer")
+					: NULL;
+
+	UT_ASSERT(validator != NULL);
+	UT_ASSERT(validator_end != NULL);
+	UT_ASSERT(members_decode != NULL);
+	UT_ASSERT(member_loop != NULL);
+	UT_ASSERT(member_normal_gate != NULL);
+	UT_ASSERT(member_origin_gate != NULL);
+	UT_ASSERT(helper != NULL);
+	UT_ASSERT(helper_end != NULL);
+	UT_ASSERT(committed != NULL);
+	UT_ASSERT(committed_lock_only != NULL);
+	UT_ASSERT(committed_ok != NULL);
+	UT_ASSERT(validate_call != NULL);
+	UT_ASSERT(validate_error != NULL);
+	UT_ASSERT(is_running != NULL);
+	UT_ASSERT(get_update_xid != NULL);
+	UT_ASSERT(locked_upgraded != NULL);
+	UT_ASSERT(current_xid != NULL);
+	UT_ASSERT(did_commit != NULL);
+	UT_ASSERT(set_hint_bits != NULL);
+	UT_ASSERT(fork != NULL);
+	UT_ASSERT(fork_end != NULL);
+	UT_ASSERT(multi != NULL);
+	UT_ASSERT(remote != NULL);
+	UT_ASSERT(local_gate != NULL);
+	UT_ASSERT(mxid_derive != NULL);
+	UT_ASSERT(mxid_gate != NULL);
+	UT_ASSERT(local_call != NULL);
+	UT_ASSERT(fork_call != NULL);
+	if (validator != NULL && validator_end != NULL && members_decode != NULL
+		&& member_loop != NULL && member_normal_gate != NULL && member_origin_gate != NULL)
+		UT_ASSERT(validator < members_decode && members_decode < member_loop
+				  && member_loop < member_normal_gate && member_normal_gate < member_origin_gate
+				  && member_origin_gate < validator_end);
+	if (helper != NULL && helper_end != NULL && committed != NULL && committed_lock_only != NULL
+		&& committed_ok != NULL && locked_upgraded != NULL && validate_call != NULL
+		&& validate_error != NULL && is_running != NULL && get_update_xid != NULL
+		&& current_xid != NULL && did_commit != NULL && set_hint_bits != NULL)
+		UT_ASSERT(helper < committed && committed < committed_lock_only
+				  && committed_lock_only < committed_ok && committed_ok < locked_upgraded
+				  && locked_upgraded < validate_call && validate_call < validate_error
+				  && validate_error < is_running && validate_error < get_update_xid
+				  && get_update_xid < current_xid && current_xid < did_commit
+				  && did_commit < helper_end && validate_error < set_hint_bits
+				  && set_hint_bits < helper_end);
+	if (multi != NULL && remote != NULL && local_gate != NULL && mxid_derive != NULL
+		&& mxid_gate != NULL && local_call != NULL && fork_end != NULL)
+		UT_ASSERT(multi < remote && remote < local_gate && local_gate < mxid_derive
+				  && mxid_derive < mxid_gate && mxid_gate < local_call && local_call < fork_end);
+	free(source);
+}
+
+
 int
 main(void)
 {
@@ -446,5 +584,6 @@ main(void)
 	UT_RUN(test_p033_data_dml_publishes_active_identity);
 	UT_RUN(test_p033_active_and_safety_boundary_matrix);
 	UT_RUN(test_s3c05_foreign_multixact_local_slru_decode_guard);
+	UT_RUN(test_local_multixact_over_remote_xmin_uses_native_update_semantics);
 	UT_DONE();
 }

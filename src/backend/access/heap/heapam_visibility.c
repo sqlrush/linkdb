@@ -805,7 +805,94 @@ HeapTupleSatisfiesToast(HeapTuple htup, Snapshot snapshot, Buffer buffer)
  *	lock-only remote path reuses the spec-3.4d bridge unchanged.
  */
 static bool
-cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
+cluster_satisfies_update_validate_local_multixact(MultiXactId raw_mxid)
+{
+	MultiXactMember *members = NULL;
+	int nmembers;
+	int i;
+
+	nmembers = GetMultiXactIdMembers(raw_mxid, &members, false, false);
+	if (nmembers < 2 || members == NULL) {
+		if (members != NULL)
+			pfree(members);
+		return false;
+	}
+
+	for (i = 0; i < nmembers; i++) {
+		if (!TransactionIdIsNormal(members[i].xid) || !cluster_xid_is_mine(members[i].xid)) {
+			pfree(members);
+			return false;
+		}
+	}
+
+	pfree(members);
+	return true;
+}
+
+static TM_Result
+cluster_satisfies_update_local_multixact(HeapTuple htup, CommandId curcid, Buffer buffer)
+{
+	HeapTupleHeader tuple = htup->t_data;
+	MultiXactId raw_mxid = HeapTupleHeaderGetRawXmax(tuple);
+	TransactionId xmax;
+
+	Assert(tuple->t_infomask & HEAP_XMAX_IS_MULTI);
+
+	if (tuple->t_infomask & HEAP_XMAX_COMMITTED) {
+		if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+			return TM_Ok;
+		if (!ItemPointerEquals(&htup->t_self, &tuple->t_ctid))
+			return TM_Updated;
+		return TM_Deleted;
+	}
+
+	if (HEAP_LOCKED_UPGRADED(tuple->t_infomask))
+		return TM_Ok;
+	if (!cluster_satisfies_update_validate_local_multixact(raw_mxid))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+						errmsg("cross-node write conflict on multixact-locked tuple"),
+						errhint("Retry the transaction; every multixact member must be proven "
+								"local before native member inspection.")));
+
+	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)) {
+		if (MultiXactIdIsRunning(raw_mxid, true))
+			return TM_BeingModified;
+
+		SetHintBits(tuple, buffer, HEAP_XMAX_INVALID, InvalidTransactionId);
+		return TM_Ok;
+	}
+
+	xmax = HeapTupleGetUpdateXid(tuple);
+	if (!TransactionIdIsValid(xmax) && MultiXactIdIsRunning(raw_mxid, false))
+		return TM_BeingModified;
+
+	Assert(TransactionIdIsValid(xmax));
+
+	if (TransactionIdIsCurrentTransactionId(xmax)) {
+		if (HeapTupleHeaderGetCmax(tuple) >= curcid)
+			return TM_SelfModified;
+		return TM_Invisible;
+	}
+
+	if (MultiXactIdIsRunning(raw_mxid, false))
+		return TM_BeingModified;
+
+	if (TransactionIdDidCommit(xmax)) {
+		if (!ItemPointerEquals(&htup->t_self, &tuple->t_ctid))
+			return TM_Updated;
+		return TM_Deleted;
+	}
+
+	if (!MultiXactIdIsRunning(raw_mxid, false)) {
+		SetHintBits(tuple, buffer, HEAP_XMAX_INVALID, InvalidTransactionId);
+		return TM_Ok;
+	}
+
+	return TM_BeingModified;
+}
+
+static bool
+cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer, TM_Result *res)
 {
 	HeapTupleHeader tuple = htup->t_data;
 	TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
@@ -884,20 +971,33 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 
 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
 		ClusterVisResolve mr;
+		MultiXactId raw_mxid = (MultiXactId)raw_xmax;
+		int mx_origin;
 
-		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_MULTI, &mr);
+		cluster_visibility_resolve_tuple(buffer, tuple, raw_mxid, CLUSTER_VIS_XMAX_MULTI, &mr);
 		if (mr.multi_marker_is_remote) {
 			*res = TM_BeingModified; /* remote multixact -> D2b bridge 53R9H */
 			return true;
 		}
-		if (xmin_remote_visible)
-			/* local multixact over a remote-inserted tuple: rare; cannot
-			 * judge members against the remote xmin safely here. Conservative
-			 * fail-closed (53R9H, retryable) rather than risk a wrong verdict. */
-			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
-							errmsg("cross-node write conflict on multixact-locked tuple"),
-							errhint("Retry the transaction; cross-node multixact wait lands "
-									"at Stage 5.2.")));
+		if (xmin_remote_visible) {
+			/* A local marker is necessary page evidence.  The value-derived
+			 * origin and member gates below establish local SLRU authority. */
+			if (mr.evidence != CLUSTER_VIS_EVIDENCE_LOCAL)
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+								errmsg("cross-node write conflict on multixact-locked tuple"),
+								errhint("Retry the transaction; local multixact evidence is not "
+										"available.")));
+			mx_origin = cluster_mxid_origin_slot(raw_mxid);
+			if (mx_origin < 0)
+				cluster_multixact_note_underivable_read();
+			if (mx_origin != cluster_node_id)
+				ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+								errmsg("cross-node write conflict on multixact-locked tuple"),
+								errhint("Retry the transaction; the multixact id must be proven local "
+										"before native member inspection.")));
+			*res = cluster_satisfies_update_local_multixact(htup, curcid, buffer);
+			return true;
+		}
 		return false; /* fully local: PG-native */
 	}
 
@@ -997,7 +1097,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
 	{
 		TM_Result cluster_res;
 
-		if (cluster_satisfies_update_fork(htup, buffer, &cluster_res)) {
+		if (cluster_satisfies_update_fork(htup, curcid, buffer, &cluster_res)) {
 			cluster_vis_bump_vis_update_fork_count();
 			return cluster_res;
 		}
