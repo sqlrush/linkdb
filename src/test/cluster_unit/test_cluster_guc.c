@@ -142,6 +142,11 @@ static GucBoolCheckHook smart_fusion_check_hook = NULL;
 static bool *smart_fusion_value_addr = NULL;
 static bool smart_fusion_boot_value = true;
 static GucContext smart_fusion_context = PGC_INTERNAL;
+static bool *current_mx_value_addr = NULL;
+static bool current_mx_boot_value = false;
+static GucContext current_mx_context = PGC_INTERNAL;
+
+extern bool cluster_multixact_current_dml;
 
 void
 DefineCustomBoolVariable(const char *name, const char *short_desc pg_attribute_unused(),
@@ -158,6 +163,11 @@ DefineCustomBoolVariable(const char *name, const char *short_desc pg_attribute_u
 		smart_fusion_value_addr = valueAddr;
 		smart_fusion_boot_value = bootValue;
 		smart_fusion_context = context;
+	}
+	if (strcmp(name, "cluster.multixact_current_dml") == 0) {
+		current_mx_value_addr = valueAddr;
+		current_mx_boot_value = bootValue;
+		current_mx_context = context;
 	}
 }
 
@@ -412,17 +422,32 @@ UT_TEST(test_smart_fusion_guc_is_guarded_failclosed)
 		UT_ASSERT(strstr(GUC_check_errdetail_string, "cluster.smart_fusion") != NULL);
 }
 
+UT_TEST(test_current_multixact_dml_guc_is_sighup_default_on)
+{
+	current_mx_value_addr = NULL;
+	current_mx_boot_value = false;
+	current_mx_context = PGC_INTERNAL;
+
+	cluster_init_guc();
+
+	UT_ASSERT_EQ(current_mx_value_addr == &cluster_multixact_current_dml,
+				 true);
+	UT_ASSERT_EQ(current_mx_boot_value, true);
+	UT_ASSERT_EQ(current_mx_context, PGC_SIGHUP);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);
 	UT_RUN(test_cluster_phase_remains_plain_global);
 	UT_RUN(test_cluster_adg_guc_defaults);
 	UT_RUN(test_smart_fusion_guc_is_guarded_failclosed);
+	UT_RUN(test_current_multixact_dml_guc_is_sighup_default_on);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

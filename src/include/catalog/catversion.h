@@ -736,7 +736,9 @@
  * catalog surface re-bumps 202606380 -> 202606390. */
 /* spec-6.12h D-h3b: PI recovery differential catalog surface —
  * cluster_pi_apply_redo_test SRF (oid 8975).  Bump 202606390 -> 202607060. */
-#define CATALOG_VERSION_NO 202607060
+/* spec-3.6b D8: current-DML MultiXact local/global stats SRFs (oids
+ * 8976/8977) and views.  Bump 202607060 -> 202607230. */
+#define CATALOG_VERSION_NO 202607230
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

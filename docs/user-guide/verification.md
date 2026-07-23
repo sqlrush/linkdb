@@ -193,6 +193,51 @@ PERL5LIB="$HOME/perl5/lib/perl5" \
 make check && make -C src/test cluster-check
 ```
 
+### Current-DML MultiXact verification
+
+Confirm the feature gate and observability surface:
+
+```sql
+SHOW cluster.multixact_current_dml;
+
+SELECT node_id, collection_status, stats_since,
+       describe_remote_ask_count, member_proof_ask_count,
+       wait_count, aba_restart_count, restart_max,
+       foreign_slru_guard_count
+  FROM pg_stat_gcluster_multixact_current
+ ORDER BY node_id;
+
+SELECT type, name
+  FROM pg_stat_cluster_wait_events
+ WHERE name IN ('GcsMultixactDescribeWait',
+                'GcsMultixactMemberProofWait',
+                'GcsMultixactStatsWait')
+ ORDER BY name;
+```
+
+For a completed workload, check the terminal-outcome equalities on each
+row whose `collection_status` is `OK`:
+
+```sql
+SELECT node_id,
+       describe_remote_ask_count =
+         describe_remote_hit_count + describe_remote_denied_count +
+         describe_remote_supported_limit_count +
+         describe_remote_timeout_count + describe_remote_unknown_count
+           AS describe_balanced,
+       member_proof_ask_count =
+         member_proof_hit_count + member_proof_unknown_count +
+         member_proof_denied_count + member_proof_supported_limit_count +
+         member_proof_timeout_count AS proof_balanced,
+       wait_count =
+         wait_resolved_count + wait_dead_holder_count + wait_timeout_count +
+         wait_retry_count + wait_interrupted_count + deadlock_victim_count
+           AS wait_balanced
+  FROM pg_stat_gcluster_multixact_current
+ WHERE collection_status = 'OK'
+ ORDER BY node_id;
+```
+
 ### Lint / style gates
 
 ```bash

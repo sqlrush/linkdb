@@ -146,8 +146,8 @@ ok($phase_val =~ /^(init|running|shutdown|reconfig)$/,
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'125',
-	'E1 pg_stat_cluster_wait_events returns 125 rows (including current-DML MultiXact waits; merge sum 118+3+2+2)');
+	'126',
+	'E1 pg_stat_cluster_wait_events returns 126 rows (including current-DML MultiXact waits; merge sum 118+3+3+2)');
 
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_stat_cluster_wait_events WHERE type='Cluster: GES'})
@@ -159,7 +159,7 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'125', 'E4 pg_stat_gcluster_wait_events returns 125 rows (including current-DML MultiXact waits; merge sum 118+3+2+2)');
+	'126', 'E4 pg_stat_gcluster_wait_events returns 126 rows (including current-DML MultiXact waits; merge sum 118+3+3+2)');
 
 
 # ============================================================
@@ -178,9 +178,21 @@ $node->psql('postgres',
 ok($serr =~ /unknown cluster injection point/i,
 	'F2 cluster injection unknown-name path raises WARNING');
 
+# spec-3.6b: the positive-path 256-member wire cap is not a PostgreSQL
+# validity limit.  Pin the outer-caller mapping so it cannot regress into a
+# cluster corruption/conflict code.
+open my $cmx_heap_fh, '<',
+	"$FindBin::RealBin/../../../backend/access/heap/heapam.c"
+	or die "open heapam.c for current-MX source contract: $!";
+my $cmx_heap_source = do { local $/; <$cmx_heap_fh> };
+close $cmx_heap_fh;
+like($cmx_heap_source,
+	qr/ERRCODE_FEATURE_NOT_SUPPORTED.*cross-node current-DML does not support MultiXact with more than 256 members/s,
+	'F3 current-MX supported limit maps to PG 0A000 with the fixed message');
+
 
 # ============================================================
-# §G  GUC framework (12 tests)
+# §G  GUC framework (14 tests)
 # ============================================================
 
 is($node->get_cluster_state_value('guc', 'cluster.node_id'),
@@ -225,6 +237,14 @@ my $sf_guard_log = do { local $/; <$sf_guard_log_fh> };
 like($sf_guard_log, qr/cluster\.smart_fusion is fail-closed/i,
 	'G12 startup log explains the Smart Fusion guardrail');
 
+is($node->safe_psql('postgres',
+		q{SHOW "cluster.multixact_current_dml"}),
+	'on', 'G13 cluster.multixact_current_dml defaults on');
+
+is($node->safe_psql('postgres',
+		q{SELECT context FROM pg_settings WHERE name='cluster.multixact_current_dml'}),
+	'sighup', 'G14 cluster.multixact_current_dml is a PGC_SIGHUP gate');
+
 
 # ============================================================
 # §H  shmem framework (3 tests)
@@ -264,6 +284,55 @@ is($node->safe_psql('postgres',
 ok($node->safe_psql('postgres',
 		q{SELECT count(*) > 0 FROM pg_views WHERE viewname='pg_stat_cluster_wait_events'})
 	eq 't', 'I4 pg_stat_cluster_wait_events present in pg_views');
+
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_views
+		    WHERE viewname IN ('pg_stat_cluster_multixact_current',
+		                       'pg_stat_gcluster_multixact_current')}),
+	'2', 'I5 current-MX local/global stats views are installed');
+
+my $cmx_view_columns =
+	'node_id,cluster_epoch,collection_status,stats_since,'
+	. 'describe_local_count,describe_remote_ask_count,describe_remote_hit_count,'
+	. 'describe_remote_denied_count,describe_remote_supported_limit_count,'
+	. 'describe_remote_timeout_count,describe_remote_unknown_count,'
+	. 'describe_invalid_reply_count,member_proof_ask_count,member_proof_hit_count,'
+	. 'member_proof_unknown_count,member_proof_denied_count,'
+	. 'member_proof_supported_limit_count,member_proof_timeout_count,'
+	. 'member_proof_invalid_reply_count,wait_count,wait_resolved_count,'
+	. 'wait_dead_holder_count,wait_timeout_count,wait_retry_count,'
+	. 'wait_interrupted_count,deadlock_victim_count,wakeup_count,'
+	. 'recompose_success_count,recompose_failclosed_count,hot_proof_hit_count,'
+	. 'hot_proof_failclosed_count,aba_restart_count,restart_bucket_0_count,'
+	. 'restart_bucket_1_count,restart_bucket_2_3_count,'
+	. 'restart_bucket_4_7_count,restart_bucket_8_plus_count,restart_max,'
+	. 'foreign_slru_guard_count';
+is($node->safe_psql('postgres',
+		q{SELECT string_agg(attname, ',' ORDER BY attnum)
+		    FROM pg_attribute
+		   WHERE attrelid = 'pg_stat_cluster_multixact_current'::regclass
+		     AND attnum > 0 AND NOT attisdropped}),
+	$cmx_view_columns, 'I6 current-MX local stats view has the frozen 39-column schema');
+
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_stat_cluster_multixact_current}),
+	'1', 'I7 current-MX local stats view emits exactly one self row');
+
+ok($node->safe_psql('postgres',
+		q{SELECT bool_and(collection_status IN ('OK','UNAVAILABLE'))
+		    FROM pg_stat_gcluster_multixact_current})
+	eq 't', 'I8 current-MX global rows carry an explicit collection status');
+
+ok($node->safe_psql('postgres',
+		q{SELECT count(*) >= 1 FROM pg_stat_gcluster_multixact_current})
+	eq 't', 'I9 current-MX global stats view preserves a single-node fallback row');
+
+ok($node->safe_psql('postgres',
+		q{SELECT NOT has_function_privilege(
+		             'public', 'cluster_get_multixact_current_stats()', 'EXECUTE')
+		          AND NOT has_function_privilege(
+		             'public', 'cluster_get_gcluster_multixact_current_stats()', 'EXECUTE')})
+	eq 't', 'I10 direct execution of current-MX stats SRFs is revoked from PUBLIC');
 
 
 # ============================================================
@@ -395,8 +464,19 @@ ok($node->safe_psql('postgres',
 
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,pcm,pgstat,phase,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
-	'O2 pg_cluster_state has all 56 categories (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.12 adds xnode_lever; spec-6.2 adds smart_fusion; spec-6.14 adds catalog)');
+	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,multixact_current,pcm,pgstat,phase,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
+	'O2 pg_cluster_state has all 57 categories (spec-3.6b adds multixact_current)');
+
+is($node->safe_psql('postgres',
+		q{SELECT count(*) FROM pg_cluster_state
+		    WHERE category='multixact_current'}),
+	'35', 'O2a current-MX debug category exposes all 35 frozen counters');
+
+is($node->safe_psql('postgres',
+		q{SELECT string_agg(key, ',' ORDER BY key) FROM pg_cluster_state
+		    WHERE category='multixact_current'}),
+	'aba_restart_count,deadlock_victim_count,describe_invalid_reply_count,describe_local_count,describe_remote_ask_count,describe_remote_denied_count,describe_remote_hit_count,describe_remote_supported_limit_count,describe_remote_timeout_count,describe_remote_unknown_count,foreign_slru_guard_count,hot_proof_failclosed_count,hot_proof_hit_count,member_proof_ask_count,member_proof_denied_count,member_proof_hit_count,member_proof_invalid_reply_count,member_proof_supported_limit_count,member_proof_timeout_count,member_proof_unknown_count,recompose_failclosed_count,recompose_success_count,restart_bucket_0_count,restart_bucket_1_count,restart_bucket_2_3_count,restart_bucket_4_7_count,restart_bucket_8_plus_count,restart_max,wait_count,wait_dead_holder_count,wait_interrupted_count,wait_resolved_count,wait_retry_count,wait_timeout_count,wakeup_count',
+	'O2b current-MX debug counter name-list is exact');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

@@ -60,6 +60,7 @@
 #include "cluster/cluster_hang.h" /* spec-5.11 D1: long-wait sampling tick */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_diag.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_shmem.h"
 
 
@@ -508,6 +509,7 @@ DiagMain(void)
 			break;
 
 		diag_advance_liveness_tick();
+		cluster_multixact_current_stats_alert_sample();
 
 		/*
 		 * spec-5.11 D1 — Hang Manager long-wait sampling tick.  DIAG fulfils

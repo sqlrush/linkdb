@@ -1,6 +1,6 @@
 # Cluster wait events
 
-linkdb registers 124 cluster-specific wait events distributed across
+linkdb registers 126 cluster-specific wait events distributed across
 13 classes.  Each row in `pg_stat_cluster_wait_events` corresponds
 to one entry in this table.
 
@@ -25,7 +25,7 @@ Global Enqueue Service — distributed lock manager events.
 | `GesMasterQuery` | Waiting for a GES master lookup response |
 | `GesLocalFastPath` | Local-only GES fast-path serialisation |
 
-## Cluster: PCM (25 events)
+## Cluster: PCM (27 events)
 
 Parallel Cache Management — block-level cluster locks, GCS block
 shipping, and Smart Fusion terminal-authority waits.
@@ -57,6 +57,8 @@ shipping, and Smart Fusion terminal-authority waits.
 | `ClusterSmartFusionOriginDurable` | Reserved Smart Fusion durable-LSN gossip wait; the enabled path is currently guarded off |
 | `ClusterCfTerminalResolve` | Waiting while terminal authority resolves cross-instance undo / TT evidence |
 | `GcsMultixactDescribeWait` | Waiting for an immutable current-DML MultiXact member descriptor from its value-derived origin |
+| `GcsMultixactMemberProofWait` | Waiting for current member-state or updater-identity proof from a member's transaction owner |
+| `GcsMultixactStatsWait` | Waiting for a capability- and generation-bound current-DML MultiXact statistics snapshot from a peer |
 
 ## Cluster: BufferShip (5 events)
 
@@ -228,7 +230,7 @@ waits.
 ## Querying
 
 ```sql
--- Total registered (118):
+-- Total registered (126):
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 
 -- Per-class counts:

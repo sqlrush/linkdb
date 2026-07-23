@@ -94,14 +94,13 @@ typedef enum {
 	/*
 	 * spec-3.6 v0.3 D7b NEW page-format ITL flag:  MultiXact xmax marker.
 	 *	slot->xid stores the local MultiXactId (NOT a TransactionId).
-	 *	Used by cluster_itl_find_multixact_origin_by_xmax() reader to
-	 *	derive origin info for building ClusterMultiXactKey overlay
-	 *	lookup.  Page-format ABI extension (HC208 catversion bump).
+	 *	Used only as an optional local-own/page-format hint.  It is not an
+	 *	authority key and may be recast or omitted under safe-slot pressure.
+	 *	Page-format ABI extension (HC208 catversion bump).
 	 *
-	 *	Spec-3.6 partial coverage caveat:  origin_node_id derived from
-	 *	current cluster_node_id (ClusterPair fixture writer = reader);
-	 *	真 shared-heap Stage 4+ 时需 marker slot 自身编码 origin (UBA
-	 *	high bytes 或扩 slot field;留 spec-3.6b/3.7).
+	 *	The current-DML authority path derives origin from the MXID value and
+	 *	uses on-demand describe/member proof; no marker-origin encoding is
+	 *	required.
 	 */
 	ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI = 8
 } ClusterItlFlags;

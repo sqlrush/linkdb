@@ -23,6 +23,7 @@
 
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_multixact_current_stats.h"
 
 
 #define CLUSTER_CURRENT_MX_WIRE_MAGIC ((uint32)0x5047434d)
@@ -81,6 +82,11 @@ typedef struct ClusterCurrentMxDescribeForwardV2 {
 	ClusterCurrentMxDescribePrefixWire prefix;
 	ClusterCurrentMxDescribeTrailerWire trailer;
 } ClusterCurrentMxDescribeForwardV2;
+
+typedef struct ClusterCurrentMxStatsForwardV2 {
+	ClusterCurrentMxRoutingPrefixWire prefix;
+	ClusterCurrentMxDescribeTrailerWire trailer;
+} ClusterCurrentMxStatsForwardV2;
 
 
 typedef struct ClusterCurrentMxProofAskWire {
@@ -242,6 +248,32 @@ typedef struct ClusterCurrentMxProofReplyPage {
 	uint8 reserved[CLUSTER_CURRENT_MX_PROOF_REPLY_RESERVED_SIZE];
 } ClusterCurrentMxProofReplyPage;
 
+typedef struct ClusterCurrentMxStatsReplyHeader {
+	uint32 magic;
+	uint16 version;
+	uint8 kind;
+	uint8 flags;
+	uint32 source_node_id;
+	uint32 reserved32_a;
+	uint64 request_id;
+	uint64 epoch;
+	int64 stats_since;
+	uint16 counter_count;
+	uint16 wire_length;
+	uint32 reserved32_b;
+	uint8 reserved[16];
+} ClusterCurrentMxStatsReplyHeader;
+
+#define CLUSTER_CURRENT_MX_STATS_REPLY_RESERVED_SIZE                      \
+	(BLCKSZ - sizeof(ClusterCurrentMxStatsReplyHeader)                   \
+	 - CMX_STAT_COUNT * sizeof(uint64))
+
+typedef struct ClusterCurrentMxStatsReplyPage {
+	ClusterCurrentMxStatsReplyHeader header;
+	uint64 counters[CMX_STAT_COUNT];
+	uint8 reserved[CLUSTER_CURRENT_MX_STATS_REPLY_RESERVED_SIZE];
+} ClusterCurrentMxStatsReplyPage;
+
 
 StaticAssertDecl(sizeof(ClusterCurrentMxRoutingPrefixWire) == sizeof(GcsBlockForwardPayload),
 				 "current MX routing prefix must preserve the shipped 64-byte frame");
@@ -277,6 +309,11 @@ StaticAssertDecl(sizeof(ClusterCurrentMxDescribeForwardV2)
 				 "current MX describe forward V2 must remain 128 bytes");
 StaticAssertDecl(offsetof(ClusterCurrentMxDescribeForwardV2, trailer) == 64,
 				 "current MX describe trailer must begin at byte 64");
+StaticAssertDecl(sizeof(ClusterCurrentMxStatsForwardV2)
+					 == GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE,
+				 "current MX stats forward V2 must remain 128 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMxStatsForwardV2, trailer) == 64,
+				 "current MX stats trailer must begin at byte 64");
 StaticAssertDecl(sizeof(ClusterCurrentMxProofAskWire) == 8,
 				 "current MX proof ask wire ABI must remain 8 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMxUpdaterChallengeWire) == 32,
@@ -346,6 +383,12 @@ StaticAssertDecl(sizeof(ClusterCurrentMxProofReplyPage) == BLCKSZ,
 				 "current MX proof reply page must fill one GCS block data area");
 StaticAssertDecl(CLUSTER_CURRENT_MX_PROOF_REPLY_RESERVED_SIZE > 0,
 				 "current MX proof reply must fit one block");
+StaticAssertDecl(sizeof(ClusterCurrentMxStatsReplyHeader) == 64,
+				 "current MX stats reply header wire ABI must remain 64 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxStatsReplyPage) == BLCKSZ,
+				 "current MX stats reply page must fill one GCS block data area");
+StaticAssertDecl(CLUSTER_CURRENT_MX_STATS_REPLY_RESERVED_SIZE > 0,
+				 "current MX stats reply must fit one block");
 
 
 static inline void
@@ -392,6 +435,14 @@ extern ClusterMxDescribeResult cluster_multixact_current_wire_validate_describe_
 	uint64 expected_request_id, const ClusterCurrentMxKey *expected_key,
 	ClusterCurrentMxMemberDesc *members, uint16 members_cap, uint16 *members_count,
 	uint32 *reported_total_members);
+extern bool cluster_multixact_current_wire_validate_stats_forward(
+	const void *payload, uint32 payload_length, int32 envelope_source,
+	int32 local_node, uint64 current_epoch,
+	ClusterCurrentMxStatsForwardV2 *decoded);
+extern bool cluster_multixact_current_wire_validate_stats_reply(
+	const void *payload, uint32 payload_length, int32 expected_source,
+	uint64 current_epoch, uint64 expected_request_id,
+	ClusterCurrentMxStatsSnapshot *snapshot);
 extern bool cluster_multixact_current_wire_validate_proof_forward(
 	const void *payload, uint32 payload_length, int32 envelope_source, int32 local_node,
 	uint64 current_epoch, ClusterCurrentMxProofForwardV2 *decoded);

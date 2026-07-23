@@ -1402,6 +1402,103 @@ REVOKE ALL ON pg_stat_gcluster_wait_events FROM PUBLIC;
 GRANT SELECT ON pg_stat_gcluster_wait_events TO PUBLIC;
 
 /*
+ * Current-DML MultiXact authority diagnostics.  The global view keeps one
+ * row per declared node; remote collection is intentionally explicit:
+ * UNAVAILABLE rows retain identity/status and expose NULL metrics.
+ */
+CREATE VIEW pg_stat_cluster_multixact_current AS
+    SELECT node_id,
+           cluster_epoch,
+           collection_status,
+           stats_since,
+           describe_local_count,
+           describe_remote_ask_count,
+           describe_remote_hit_count,
+           describe_remote_denied_count,
+           describe_remote_supported_limit_count,
+           describe_remote_timeout_count,
+           describe_remote_unknown_count,
+           describe_invalid_reply_count,
+           member_proof_ask_count,
+           member_proof_hit_count,
+           member_proof_unknown_count,
+           member_proof_denied_count,
+           member_proof_supported_limit_count,
+           member_proof_timeout_count,
+           member_proof_invalid_reply_count,
+           wait_count,
+           wait_resolved_count,
+           wait_dead_holder_count,
+           wait_timeout_count,
+           wait_retry_count,
+           wait_interrupted_count,
+           deadlock_victim_count,
+           wakeup_count,
+           recompose_success_count,
+           recompose_failclosed_count,
+           hot_proof_hit_count,
+           hot_proof_failclosed_count,
+           aba_restart_count,
+           restart_bucket_0_count,
+           restart_bucket_1_count,
+           restart_bucket_2_3_count,
+           restart_bucket_4_7_count,
+           restart_bucket_8_plus_count,
+           restart_max,
+           foreign_slru_guard_count
+      FROM cluster_get_multixact_current_stats();
+
+REVOKE ALL ON pg_stat_cluster_multixact_current FROM PUBLIC;
+GRANT SELECT ON pg_stat_cluster_multixact_current TO PUBLIC;
+
+CREATE VIEW pg_stat_gcluster_multixact_current AS
+    SELECT node_id,
+           cluster_epoch,
+           collection_status,
+           stats_since,
+           describe_local_count,
+           describe_remote_ask_count,
+           describe_remote_hit_count,
+           describe_remote_denied_count,
+           describe_remote_supported_limit_count,
+           describe_remote_timeout_count,
+           describe_remote_unknown_count,
+           describe_invalid_reply_count,
+           member_proof_ask_count,
+           member_proof_hit_count,
+           member_proof_unknown_count,
+           member_proof_denied_count,
+           member_proof_supported_limit_count,
+           member_proof_timeout_count,
+           member_proof_invalid_reply_count,
+           wait_count,
+           wait_resolved_count,
+           wait_dead_holder_count,
+           wait_timeout_count,
+           wait_retry_count,
+           wait_interrupted_count,
+           deadlock_victim_count,
+           wakeup_count,
+           recompose_success_count,
+           recompose_failclosed_count,
+           hot_proof_hit_count,
+           hot_proof_failclosed_count,
+           aba_restart_count,
+           restart_bucket_0_count,
+           restart_bucket_1_count,
+           restart_bucket_2_3_count,
+           restart_bucket_4_7_count,
+           restart_bucket_8_plus_count,
+           restart_max,
+           foreign_slru_guard_count
+      FROM cluster_get_gcluster_multixact_current_stats();
+
+REVOKE ALL ON pg_stat_gcluster_multixact_current FROM PUBLIC;
+GRANT SELECT ON pg_stat_gcluster_multixact_current TO PUBLIC;
+REVOKE ALL ON FUNCTION cluster_get_multixact_current_stats() FROM PUBLIC;
+REVOKE ALL ON FUNCTION cluster_get_gcluster_multixact_current_stats() FROM PUBLIC;
+
+/*
  * pg_cluster_nodes -- cluster topology, parsed from pgrac.conf at
  * postmaster startup.  Stage 0.19 ships the framework + single-node
  * fallback (one row, the local node, when pgrac.conf is absent).

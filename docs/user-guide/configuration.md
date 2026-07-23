@@ -919,6 +919,37 @@ closed with `53R9C` on a cluster read.  Rows that only carry row locks
 (`FOR SHARE` / `FOR KEY SHARE` with no updater) are always readable
 under either setting.
 
+### `cluster.multixact_current_dml`
+
+| | |
+|---|---|
+| Type | bool |
+| Default | `on` |
+| Context | sighup |
+
+Enables cluster-authoritative handling of a current row version whose
+`xmax` is a MultiXact created on this node or another node.  `UPDATE`,
+`DELETE`, row-lock, and HOT-chain operations use the MultiXact owner for
+the immutable member list and each transaction owner for current member
+state.  The requester creates any replacement MultiXact locally.
+
+Turning the setting `off` is an emergency fail-closed gate: a remote
+current-DML MultiXact is refused rather than decoded from this node's
+local `pg_multixact` storage.  Ordinary single-node and no-peer
+PostgreSQL paths are unchanged under either setting.
+
+This protocol version handles up to 256 members in one current-DML
+MultiXact.  A larger, PostgreSQL-valid member set is refused with
+SQLSTATE `0A000` and a hint to reduce concurrent row lockers or retry
+after lockers finish.
+
+Reload after changing the setting:
+
+```sql
+ALTER SYSTEM SET cluster.multixact_current_dml = off;
+SELECT pg_reload_conf();
+```
+
 ## Reconfig coordinator observability
 
 ### `pg_cluster_reconfig_state` view

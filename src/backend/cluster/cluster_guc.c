@@ -767,6 +767,7 @@ bool cluster_gcs_block_local_cache = true;
  * remote row-lock conflict block until the holder completes; off reverts to
  * the spec-3.4d fail-closed (53R98) honest degradation. */
 bool cluster_tx_enqueue_wait_enabled = true;
+bool cluster_multixact_current_dml = true;
 bool cluster_ic_duty_lazy = true; /* spec-7.2 D1 duty-chain on-demand gating */
 
 /* PGRAC: spec-7.1a D0 -- cross-node write-write chaining (default off).
@@ -4115,6 +4116,17 @@ cluster_init_guc(void)
 										  "spec-5.2 D4.  PGC_SUSET."),
 							 &cluster_tx_enqueue_wait_enabled, true, PGC_SUSET, 0, NULL, NULL,
 							 NULL);
+
+	DefineCustomBoolVariable(
+		"cluster.multixact_current_dml",
+		gettext_noop("Use cluster authority for current-DML MultiXacts."),
+		gettext_noop("When on (default), current-DML operations resolve "
+					 "MultiXact descriptors and member state at their owning "
+					 "nodes.  When off, a remote current MultiXact fails closed; "
+					 "it never falls back to decoding foreign pg_multixact SLRU.  "
+					 "PGC_SIGHUP."),
+		&cluster_multixact_current_dml, true, PGC_SIGHUP, 0, NULL, NULL,
+		NULL);
 
 	DefineCustomBoolVariable(
 		"cluster.ic_duty_lazy",

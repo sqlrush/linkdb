@@ -36,8 +36,10 @@
 #include "postgres.h"
 
 #include "cluster/cluster_apply_master_election.h"
+#include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mrp.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_views.h"
 
 /*
@@ -156,6 +158,42 @@ cluster_apply_master_current_node_id(void)
 #include "cluster/cluster_shmem.h"
 
 ClusterShmemCtl *ClusterShmem = NULL;
+ClusterConf *ClusterConfShmem = NULL;
+
+TimestampTz
+cluster_multixact_current_stats_since(void)
+{
+	return 0;
+}
+
+uint64
+cluster_multixact_current_stats_get(ClusterCurrentMxStatId stat pg_attribute_unused())
+{
+	return 0;
+}
+
+bool
+cluster_multixact_current_stats_snapshot(
+	uint32 node_id pg_attribute_unused(),
+	uint64 cluster_epoch pg_attribute_unused(),
+	ClusterCurrentMxStatsSnapshot *snapshot pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_gcs_current_mx_stats_fetch_and_wait(
+	int32 origin_node pg_attribute_unused(),
+	ClusterCurrentMxStatsSnapshot *snapshot pg_attribute_unused())
+{
+	return false;
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return 0;
+}
 
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
@@ -207,14 +245,26 @@ UT_TEST(test_gcluster_adg_srf_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_get_gcluster_adg);
 }
 
+UT_TEST(test_current_multixact_local_srf_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_get_multixact_current_stats);
+}
+
+UT_TEST(test_current_multixact_gcluster_srf_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)cluster_get_gcluster_multixact_current_stats);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(5);
 	UT_RUN(test_local_srf_still_linkable);
 	UT_RUN(test_gcluster_srf_linkable);
 	UT_RUN(test_gcluster_adg_srf_linkable);
+	UT_RUN(test_current_multixact_local_srf_linkable);
+	UT_RUN(test_current_multixact_gcluster_srf_linkable);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -1053,6 +1053,9 @@ pgstat_get_wait_cluster_pcm(WaitEventCluster w)
 	case WAIT_EVENT_GCS_MULTIXACT_MEMBER_PROOF_WAIT:
 		event_name = "GcsMultixactMemberProofWait";
 		break;
+	case WAIT_EVENT_GCS_MULTIXACT_STATS_WAIT:
+		event_name = "GcsMultixactStatsWait";
+		break;
 	default:
 		break;
 	}

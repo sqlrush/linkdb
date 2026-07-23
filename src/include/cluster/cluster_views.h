@@ -51,8 +51,8 @@
  *	internal table in cluster_views.c stays in sync with the enum.
  */
 #define CLUSTER_WAIT_EVENTS_COUNT                                                                  \
-	125 /* spec-6.13 D8 RDMA included; spec-5.22b D2-6 +3 undo-block grant-plane; \
-		 * spec-7.2 D6 +2 LMS data-plane; spec-3.6b +2 current-MX waits */
+	126 /* spec-6.13 D8 RDMA included; spec-5.22b D2-6 +3 undo-block grant-plane; \
+		 * spec-7.2 D6 +2 LMS data-plane; spec-3.6b +3 current-MX waits */
 
 
 /*
@@ -85,6 +85,14 @@ extern Datum cluster_get_wait_events(PG_FUNCTION_ARGS);
  *	column contract is a stable interface from 0.17 onward.
  */
 extern Datum cluster_get_gcluster_wait_events(PG_FUNCTION_ARGS);
+
+/*
+ * Local and declared-membership current-DML MultiXact observability.
+ * The global SRF preserves one row per declared node; unreachable remote
+ * nodes are emitted with collection_status = "UNAVAILABLE" and NULL metrics.
+ */
+extern Datum cluster_get_multixact_current_stats(PG_FUNCTION_ARGS);
+extern Datum cluster_get_gcluster_multixact_current_stats(PG_FUNCTION_ARGS);
 
 /*
  * cluster_get_adg_state / cluster_get_gcluster_adg -- SRFs backing

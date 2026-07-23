@@ -1423,6 +1423,84 @@ cluster_gcs_current_mx_describe_serve_inline(const ClusterICEnvelope *env, const
 	MemoryContextReset(CrServeScratchCtx);
 }
 
+void
+cluster_gcs_current_mx_stats_serve_inline(
+	const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterCurrentMxStatsForwardV2 request;
+	ClusterCurrentMxStatsSnapshot snapshot;
+	uint32 reply_total
+		= (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+	char *reply;
+	GcsBlockReplyHeader *outer;
+	ClusterCurrentMxStatsReplyPage *page;
+	BufferTag route_tag;
+	int recv_worker;
+	int expected_worker;
+	int i;
+	MemoryContext old_context;
+
+	if (env == NULL || payload == NULL
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| !cluster_multixact_current_wire_validate_stats_forward(
+			payload, env->payload_length, (int32)env->source_node_id,
+			cluster_node_id, cluster_epoch_get_current(), &request))
+		return;
+
+	route_tag = GcsBlockCurrentMxRouteTagMake(
+		request.prefix.request_id, request.prefix.epoch,
+		request.prefix.original_requester_node,
+		request.prefix.requester_backend_id);
+	recv_worker = cluster_ic_tier1_my_data_channel();
+	expected_worker = cluster_lms_shard_for_tag(
+		&route_tag, cluster_lms_workers);
+	Assert(expected_worker == recv_worker);
+	if (expected_worker != recv_worker)
+		return;
+
+	old_context = MemoryContextSwitchTo(cr_serve_scratch_context());
+	reply = (char *)palloc0(reply_total);
+	outer = (GcsBlockReplyHeader *)reply;
+	page = (ClusterCurrentMxStatsReplyPage *)(reply + sizeof(*outer));
+	memset(&snapshot, 0, sizeof(snapshot));
+	(void)cluster_multixact_current_stats_snapshot(
+		(uint32)cluster_node_id, request.prefix.epoch, &snapshot);
+
+	page->header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page->header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page->header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
+	page->header.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
+	page->header.source_node_id = (uint32)cluster_node_id;
+	page->header.request_id = request.prefix.request_id;
+	page->header.epoch = request.prefix.epoch;
+	page->header.stats_since = snapshot.stats_since;
+	page->header.counter_count = CMX_STAT_COUNT;
+	page->header.wire_length
+		= sizeof(page->header) + sizeof(page->counters);
+	for (i = 0; i < CMX_STAT_COUNT; i++)
+		page->counters[i] = snapshot.counters[i];
+
+	outer->request_id = request.prefix.request_id;
+	outer->epoch = request.prefix.epoch;
+	outer->sender_node = cluster_node_id;
+	outer->requester_backend_id = request.prefix.requester_backend_id;
+	outer->transition_id = 0;
+	outer->status = (uint8)GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	outer->checksum
+		= cluster_gcs_block_compute_checksum((const char *)page);
+
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_REPLY,
+		cluster_ic_send_envelope(
+			PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+			request.prefix.original_requester_node, reply, reply_total));
+	MemoryContextSwitchTo(old_context);
+	MemoryContextReset(CrServeScratchCtx);
+}
+
 static bool
 current_mx_origin_exact_lookup(const ClusterTTStatusKey *key, ClusterTTStatusResult *result,
 							   void *arg)

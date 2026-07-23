@@ -11,6 +11,8 @@ operator-facing.
 | `pg_cluster_nodes` | Cluster topology (the parsed `pgrac.conf`) |
 | `pg_stat_cluster_wait_events` | Cluster-specific wait events on the local node |
 | `pg_stat_gcluster_wait_events` | Cluster wait events globally (cross-node placeholder) |
+| `pg_stat_cluster_multixact_current` | Local current-DML MultiXact authority counters |
+| `pg_stat_gcluster_multixact_current` | Per-node current-DML MultiXact authority counters |
 | `pg_cluster_ic_peers` | Tier1 TCP interconnect peer state and counters |
 | `pg_stat_cluster_ic` | TCP/RDMA mux and RDMA transport observability |
 | `pg_stat_cluster_adg` | Local ADG standby apply/read-only service state |
@@ -272,7 +274,7 @@ SELECT role, count(*) FROM pg_cluster_nodes GROUP BY role;
 ## pg_stat_cluster_wait_events
 
 Lists the cluster-specific wait event registry on the local node.
-Always returns 118 rows in `--enable-cluster` builds (one per
+Always returns 126 rows in `--enable-cluster` builds (one per
 registered cluster wait event).
 
 ### Columns
@@ -300,7 +302,7 @@ See [Wait events](wait-events.md) for the full event roster.
 ## pg_stat_gcluster_wait_events
 
 Cross-node placeholder for cluster-wide wait events.  In the
-current release returns 118 rows for the local node only;
+current release returns 126 rows for the local node only;
 `node_id` is always the value of the local `cluster.node_id` GUC.
 
 The column shape `(node_id, type, name)` is the public contract
@@ -528,12 +530,67 @@ SELECT path, state, read_count, io_error_count FROM pg_cluster_voting_disks;
  /srv/voting/disk3  | unknown |          0 |              0
 ```
 
+## pg_stat_cluster_multixact_current
+
+One local row of current-DML MultiXact authority counters.  The first
+four columns identify the sample:
+
+| Column | Type | Description |
+|---|---|---|
+| `node_id` | `int4` | Local configured node id. |
+| `cluster_epoch` | `int8` | Membership epoch for the sample. |
+| `collection_status` | `text` | `OK` when local statistics are available; otherwise `UNAVAILABLE`. |
+| `stats_since` | `timestamptz` | Postmaster start of the current counter lifetime. |
+
+The remaining `int8` columns cover these counter families:
+
+- descriptor resolution:
+  `describe_local_count`, `describe_remote_ask_count`, and the
+  `describe_remote_{hit,denied,supported_limit,timeout,unknown}_count`
+  outcomes, plus `describe_invalid_reply_count`;
+- member proof:
+  `member_proof_ask_count`, the
+  `member_proof_{hit,unknown,denied,supported_limit,timeout}_count`
+  outcomes, and `member_proof_invalid_reply_count`;
+- row-lock waits:
+  `wait_count`, `wait_resolved_count`, `wait_dead_holder_count`,
+  `wait_timeout_count`, `wait_retry_count`, `wait_interrupted_count`,
+  `deadlock_victim_count`, and `wakeup_count`;
+- recompose/HOT/ABA:
+  `recompose_success_count`, `recompose_failclosed_count`,
+  `hot_proof_hit_count`, `hot_proof_failclosed_count`, and
+  `aba_restart_count`;
+- operation restarts:
+  `restart_bucket_0_count`, `restart_bucket_1_count`,
+  `restart_bucket_2_3_count`, `restart_bucket_4_7_count`,
+  `restart_bucket_8_plus_count`, and `restart_max`;
+- safety guard:
+  `foreign_slru_guard_count`.
+
+`pg_stat_gcluster_multixact_current` has the same 39-column schema and
+keeps one row per declared node.  Reachable peers are sampled through the
+generation- and capability-bound current-MultiXact statistics RPC.  A node
+that cannot be sampled is retained as `collection_status = 'UNAVAILABLE'`;
+its epoch, timestamp, and counters are `NULL`.
+
+```sql
+SELECT node_id, collection_status, stats_since,
+       describe_remote_ask_count, member_proof_ask_count,
+       wait_count, aba_restart_count, restart_max
+  FROM pg_stat_gcluster_multixact_current
+ ORDER BY node_id;
+```
+
+Both views are readable by `PUBLIC`.  Direct execution of
+`cluster_get_multixact_current_stats()` and
+`cluster_get_gcluster_multixact_current_stats()` is revoked.
+
 ## --disable-cluster builds
 
 In binaries built with `--disable-cluster`:
 
-- All five views still exist in the catalog.
-- All five return zero rows.
+- Read-only diagnostic views still exist in the catalog.
+- Their cluster-backed SRFs return zero rows.
 - The underlying `cluster_get_*` SRFs are present as no-op symbols.
 
 This means SQL written against these views works on both build

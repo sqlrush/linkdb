@@ -56,8 +56,11 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_apply_master_election.h"
 #include "cluster/cluster_conf.h"			/* cluster_conf_lookup_node, role helpers */
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"			/* cluster_node_id */
 #include "cluster/cluster_mrp.h"			/* cluster_mrp_shared_state */
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_shmem.h"			/* ClusterShmem->created_at */
 #include "cluster/cluster_version_macros.h" /* PGRAC_VERSION_STRING */
 #endif
@@ -206,7 +209,7 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_GES_MASTER_QUERY,
 	WAIT_EVENT_GES_LOCAL_FAST_PATH,
 
-	/* Cluster: PCM (25; prior 24 + spec-3.6b describe wait) */
+	/* Cluster: PCM (27; prior 24 + spec-3.6b describe/proof/stats waits) */
 	WAIT_EVENT_PCM_BLOCK_READ_N_S,
 	WAIT_EVENT_PCM_BLOCK_READ_N_X,
 	WAIT_EVENT_PCM_BLOCK_WRITE_S_X,
@@ -233,6 +236,7 @@ static const uint32 cluster_wait_event_infos[CLUSTER_WAIT_EVENTS_COUNT] = {
 	WAIT_EVENT_CLUSTER_CF_TERMINAL_RESOLVE,			/* PGRAC spec-6.2 D10 */
 	WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT,			/* PGRAC spec-3.6b */
 	WAIT_EVENT_GCS_MULTIXACT_MEMBER_PROOF_WAIT,		/* PGRAC spec-3.6b */
+	WAIT_EVENT_GCS_MULTIXACT_STATS_WAIT,				/* PGRAC spec-3.6b D8 */
 
 	/* Cluster: BufferShip (5) */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD,
@@ -482,6 +486,129 @@ cluster_get_gcluster_wait_events(PG_FUNCTION_ARGS)
 
 				tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 			}
+		}
+	}
+#endif
+
+	return (Datum)0;
+}
+
+/* ============================================================
+ * Current-DML MultiXact local/global observability.
+ * ============================================================ */
+
+#ifdef USE_PGRAC_CLUSTER
+static void
+cluster_put_multixact_current_stats_row(ReturnSetInfo *rsinfo, int32 node_id,
+										const ClusterCurrentMxStatsSnapshot *snapshot)
+{
+	Datum values[4 + CMX_STAT_COUNT];
+	bool nulls[4 + CMX_STAT_COUNT];
+	bool available;
+	int i;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, 0, sizeof(nulls));
+	available = snapshot != NULL && snapshot->stats_since != 0
+				&& snapshot->node_id == (uint32)node_id;
+
+	values[0] = Int32GetDatum(node_id);
+	if (available) {
+		values[1] = Int64GetDatum((int64)snapshot->cluster_epoch);
+		values[2] = CStringGetTextDatum("OK");
+		values[3] = TimestampTzGetDatum(snapshot->stats_since);
+		for (i = 0; i < CMX_STAT_COUNT; i++)
+			values[4 + i] = Int64GetDatum((int64)snapshot->counters[i]);
+	} else {
+		/*
+		 * Identity/status survive a partial global collection.  The epoch,
+		 * stats lifetime, and every counter remain NULL because this node
+		 * supplied no authenticated observation.
+		 */
+		nulls[1] = true;
+		values[2] = CStringGetTextDatum("UNAVAILABLE");
+		nulls[3] = true;
+		for (i = 0; i < CMX_STAT_COUNT; i++)
+			nulls[4 + i] = true;
+	}
+
+	tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+}
+#endif
+
+PG_FUNCTION_INFO_V1(cluster_get_multixact_current_stats);
+
+Datum
+cluster_get_multixact_current_stats(PG_FUNCTION_ARGS)
+{
+	InitMaterializedSRF(fcinfo, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+		ClusterCurrentMxStatsSnapshot snapshot;
+		bool available;
+
+		available = cluster_multixact_current_stats_snapshot(
+			(uint32)cluster_node_id, cluster_epoch_get_current(),
+			&snapshot);
+		cluster_put_multixact_current_stats_row(
+			rsinfo, (int32)cluster_node_id,
+			available ? &snapshot : NULL);
+	}
+#endif
+
+	return (Datum)0;
+}
+
+PG_FUNCTION_INFO_V1(cluster_get_gcluster_multixact_current_stats);
+
+Datum
+cluster_get_gcluster_multixact_current_stats(PG_FUNCTION_ARGS)
+{
+	InitMaterializedSRF(fcinfo, 0);
+
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *)fcinfo->resultinfo;
+		bool emitted = false;
+		int i;
+
+		if (ClusterConfShmem != NULL) {
+			for (i = 0; i < ClusterConfShmem->node_count; i++) {
+				int32 node_id = ClusterConfShmem->nodes[i].node_id;
+				ClusterCurrentMxStatsSnapshot snapshot;
+				bool available;
+
+				if (node_id < 0)
+					continue;
+				if (node_id == cluster_node_id)
+					available
+						= cluster_multixact_current_stats_snapshot(
+							(uint32)node_id,
+							cluster_epoch_get_current(), &snapshot);
+				else
+					available
+						= cluster_gcs_current_mx_stats_fetch_and_wait(
+							node_id, &snapshot);
+				cluster_put_multixact_current_stats_row(
+					rsinfo, node_id, available ? &snapshot : NULL);
+				emitted = true;
+			}
+		}
+
+		/* Preserve the single-node fallback if topology shmem is absent. */
+		if (!emitted)
+		{
+			ClusterCurrentMxStatsSnapshot snapshot;
+			bool available;
+
+			available = cluster_multixact_current_stats_snapshot(
+				(uint32)cluster_node_id, cluster_epoch_get_current(),
+				&snapshot);
+			cluster_put_multixact_current_stats_row(
+				rsinfo, (int32)cluster_node_id,
+				available ? &snapshot : NULL);
 		}
 	}
 #endif

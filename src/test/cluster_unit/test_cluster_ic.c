@@ -598,11 +598,10 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * authority flock (0x40) + ownership-gen ruling② invalidate BUSY
 	 * (0x80) + TT-lane undo-horizon idle sentinel (0x100) + PCM-X
 	 * conversion (0x200) + A' rebase V2 INSTALL_READY (0x400) + PCM-X
-	 * source-floor type49 V2 (0x800).  The atomic current-MX family bit
-	 * remains reserved until both request kinds land (smart-fusion is off
-	 * in this fixture). */
+	 * source-floor type49 V2 (0x800) + atomic current-MX describe/member
+	 * proof (0x1000; smart-fusion is off in this fixture). */
 	UT_ASSERT_EQ(wire[36], 0xFE);
-	UT_ASSERT_EQ(wire[37], 0x0F);
+	UT_ASSERT_EQ(wire[37], 0x1F);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
 	/* remaining _pad must be all zero: a CONTROL-plane HELLO with
@@ -702,11 +701,12 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
 			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1
+			| PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1);
 	/* Keep the aggregate word byte-exact as well as symbolically composed:
 	 * parallel protocol lanes have collided while preserving the same symbolic
 	 * expectation, so the literal catches accidental bit reuse. */
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), (uint32)0x00000FFEU);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), (uint32)0x00001FFEU);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -721,7 +721,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
 			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1
+			| PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -736,7 +737,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
 			| PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1
 			| PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1
+			| PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
@@ -833,7 +835,7 @@ UT_TEST(test_hello_gcs_done_and_wrap_barrier_gates)
 			  != 0);
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1) != 0);
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1)
-			  == 0);
+			  != 0);
 
 	/* suppressed (old-binary simulation): DONE bit absent, the other
 	 * protocol bits untouched */
@@ -845,6 +847,8 @@ UT_TEST(test_hello_gcs_done_and_wrap_barrier_gates)
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1)
 			  != 0);
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1) != 0);
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1)
+			  != 0);
 
 	cluster_ic_suppress_gcs_done_cap = false;
 }

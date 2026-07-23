@@ -836,10 +836,22 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 	if (origin_slot < 0 || origin_slot != (int)key->origin_node_id)
 		return CMX_DESC_UNKNOWN;
 	if (key->origin_node_id != (uint16)cluster_node_id) {
+		if (!cluster_multixact_current_dml)
+			return CMX_DESC_UNKNOWN;
 		cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_ASK);
-		result = cluster_gcs_current_mx_describe_fetch_and_wait(
-			(int32)key->origin_node_id, key, members, members_cap, nmembers,
-			reported_total_members);
+		PG_TRY();
+		{
+			result = cluster_gcs_current_mx_describe_fetch_and_wait(
+				(int32)key->origin_node_id, key, members, members_cap,
+				nmembers, reported_total_members);
+		}
+		PG_CATCH();
+		{
+			cluster_multixact_current_stats_bump(
+				CMX_STAT_DESCRIBE_REMOTE_UNKNOWN);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
 		switch (result) {
 		case CMX_DESC_OK:
 			cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_HIT);
@@ -1002,10 +1014,22 @@ cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
 				chunk_updater.verdict = candidate_verdict;
 			}
 		} else {
+			if (!cluster_multixact_current_dml)
+				goto unknown;
 			cluster_multixact_current_stats_bump(CMX_STAT_MEMBER_PROOF_ASK);
-			result = cluster_gcs_current_mx_member_proof_fetch_and_wait(
-				plans[i].destination_node_id, request, chunk_proofs, lengthof(chunk_proofs),
-				&chunk_count, &chunk_updater);
+			PG_TRY();
+			{
+				result = cluster_gcs_current_mx_member_proof_fetch_and_wait(
+					plans[i].destination_node_id, request, chunk_proofs,
+					lengthof(chunk_proofs), &chunk_count, &chunk_updater);
+			}
+			PG_CATCH();
+			{
+				cluster_multixact_current_stats_bump(
+					CMX_STAT_MEMBER_PROOF_UNKNOWN);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
 			switch (result) {
 			case CMX_RESOLVE_OK:
 				cluster_multixact_current_stats_bump(CMX_STAT_MEMBER_PROOF_HIT);
@@ -1240,6 +1264,5 @@ cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 		return CMX_RECOMPOSE_SUPPORTED_LIMIT;
 	memcpy(normalized_members, scratch, sizeof(*normalized_members) * out_count);
 	*normalized_count = out_count;
-	cluster_multixact_current_stats_bump(CMX_STAT_RECOMPOSE_SUCCESS);
 	return CMX_RECOMPOSE_OK;
 }

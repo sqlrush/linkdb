@@ -670,10 +670,12 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	 * frame on the selected peer's current verified connection. */
 	capabilities |= PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
 	/*
-	 * spec-3.6b: MULTIXACT_CURRENT_V1 is an atomic describe + member-proof /
-	 * updater-challenge family.  D2 reserves and implements describe, but
-	 * must not advertise the family until the kind-7 half lands.
+	 * spec-3.6b: MULTIXACT_CURRENT_V1 is the atomic describe + member-proof
+	 * family.  Both halves are implemented and DATA sends are bound to the
+	 * selected connection generation, so advertise the protocol capability
+	 * unconditionally.  The runtime GUC is policy, not wire compatibility.
 	 */
+	capabilities |= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

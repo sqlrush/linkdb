@@ -41,6 +41,15 @@
 
 UT_DEFINE_GLOBALS();
 
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+pg_attribute_noreturn() void
+pg_re_throw(void)
+{
+	abort();
+}
+
 static char *
 read_source(const char *path)
 {
@@ -103,6 +112,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
  */
 int cluster_node_id = -1;
 int cluster_subtrans_max_chain_depth = 32;
+bool cluster_multixact_current_dml = true;
 BackendId MyBackendId = 7;
 static uint64 test_runtime_epoch;
 static int test_runtime_mxid_origin = -1;
@@ -498,6 +508,8 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT == 21,
 				 "current MX describe reply status must append at 21");
 StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT == 22,
 				 "current MX member-proof reply status must append at 22");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT == 23,
+				 "current MX stats reply status must append at 23");
 
 
 UT_TEST(test_current_multixact_public_symbols_link)
@@ -2799,11 +2811,164 @@ UT_TEST(test_current_multixact_heap_bridge_uses_decoded_cmax_and_follows_active_
 	free(source);
 }
 
+UT_TEST(test_current_multixact_operation_local_descriptor_memo_contract)
+{
+	char *source = read_source(HEAPAM_SOURCE_PATH);
+	const char *lookup;
+	const char *store;
+	const char *finish;
+
+	if (source == NULL)
+		return;
+	lookup = strstr(source, "\ncluster_current_mx_memo_lookup(");
+	store = strstr(source, "\ncluster_current_mx_memo_store(");
+	finish = strstr(source, "\ncluster_current_mx_operation_finish(");
+
+	UT_ASSERT_NOT_NULL(lookup);
+	UT_ASSERT_NOT_NULL(store);
+	UT_ASSERT_NOT_NULL(finish);
+	UT_ASSERT_STR_CONTAINS(source, "memo->operation_id != operation->operation_id");
+	UT_ASSERT_STR_CONTAINS(source, "cluster_current_mx_capture_equal(&memo->fingerprint");
+	UT_ASSERT_STR_CONTAINS(source, "cluster_mxid_origin_slot(key->multixact_id)");
+	UT_ASSERT_STR_CONTAINS(source, "cluster_multixact_current_descriptor_hash(");
+	UT_ASSERT_STR_CONTAINS(source, "cluster_multixact_current_validate_descriptor(");
+	UT_ASSERT_STR_CONTAINS(source, "cluster_multixact_current_stats_record_restarts(");
+	UT_ASSERT_STR_CONTAINS(source, "CMX_STAT_WAIT_INTERRUPTED");
+	UT_ASSERT_STR_CONTAINS(source, "CMX_STAT_FOREIGN_SLRU_GUARD");
+	UT_ASSERT(strstr(source,
+					 "ClusterCurrentMxOperationState "
+					 "*cluster_current_mx_active_operation") == NULL);
+	UT_ASSERT_STR_CONTAINS(source,
+						   "cluster_current_mx_failclosed(\n"
+						   "\tClusterCurrentMxOperationState *operation,\n"
+						   "\tClusterCurrentMxFailurePhase phase,");
+	UT_ASSERT_STR_CONTAINS(source, "case CCMH_FAIL_RECOMPOSE:");
+	UT_ASSERT_STR_CONTAINS(source, "case CCMH_FAIL_HOT_PROOF:");
+	UT_ASSERT_STR_CONTAINS(source, "phase=%s; %s");
+	UT_ASSERT_STR_CONTAINS(source,
+						   "cluster_current_mx_operation_finish(\n"
+						   "\t\t\t\t\t&cluster_current_mx_operation);\n"
+						   "#endif\n"
+						   "\t\t\t\treturn true;");
+	UT_ASSERT_STR_CONTAINS(source,
+						   "cluster_current_mx_operation_finish(\n"
+						   "\t\t&cluster_current_mx_operation);\n"
+						   "#endif\n"
+						   "\treturn false;");
+	UT_ASSERT_STR_CONTAINS(source,
+						   "cluster_current_mx_operation_finish(\n"
+						   "\t\t&cluster_current_mx_operation);\n"
+						   "#endif\n"
+						   "}\n\n\n/*\n * UpdateXmaxHintBits");
+	free(source);
+}
+
+UT_TEST(test_current_multixact_supported_limit_outer_mapping_contract)
+{
+	char *source = read_source(HEAPAM_SOURCE_PATH);
+
+	if (source == NULL)
+		return;
+	UT_ASSERT_STR_CONTAINS(source, "ERRCODE_FEATURE_NOT_SUPPORTED");
+	UT_ASSERT_STR_CONTAINS(
+		source,
+		"cross-node current-DML does not support MultiXact with more than 256 members");
+	UT_ASSERT_STR_CONTAINS(
+		source,
+		"PostgreSQL permits larger member sets, but this pgrac protocol version "
+		"supports at most 256.");
+	UT_ASSERT_STR_CONTAINS(
+		source,
+		"Reduce concurrent row lockers or retry after lockers finish; upgrade "
+		"when chunked member-list support is available.");
+	UT_ASSERT_EQ(count_occurrences(
+					 source, "cluster_current_mx_supported_limit("),
+				 7);
+	UT_ASSERT_EQ(count_occurrences(
+					 source,
+					 "if (recompose_result == "
+					 "CMX_RECOMPOSE_SUPPORTED_LIMIT) {\n"
+					 "\t\t\t\tcluster_multixact_current_stats_bump(\n"
+					 "\t\t\t\t\tCMX_STAT_RECOMPOSE_FAILCLOSED);\n"
+					 "\t\t\t\tcluster_current_mx_supported_limit("),
+				 2);
+	free(source);
+}
+
+UT_TEST(test_current_multixact_gate_and_recompose_counter_are_publish_exact)
+{
+	char *heap_source = read_source(HEAPAM_SOURCE_PATH);
+	char *current_source = read_current_multixact_source();
+	const char *remote_single;
+	const char *remote_single_end;
+	const char *gate;
+	const char *recompose;
+	const char *recompose_end;
+	const char *make_stamp;
+	const char *create;
+	const char *success_counter;
+
+	if (heap_source == NULL || current_source == NULL)
+		goto out;
+
+	remote_single
+		= strstr(heap_source, "\ncluster_current_mx_compose_remote_single(");
+	remote_single_end
+		= remote_single != NULL
+			  ? strstr(remote_single, "\nstatic ClusterCurrentMxHeapDisposition")
+			  : NULL;
+	gate = remote_single != NULL
+			   ? strstr(remote_single, "!cluster_multixact_current_dml")
+			   : NULL;
+	UT_ASSERT_NOT_NULL(remote_single);
+	UT_ASSERT_NOT_NULL(remote_single_end);
+	UT_ASSERT_NOT_NULL(gate);
+	UT_ASSERT(gate == NULL || remote_single_end == NULL
+			  || gate < remote_single_end);
+
+	recompose = strstr(current_source,
+					   "\ncluster_multixact_current_recompose(");
+	recompose_end = recompose != NULL ? strstr(recompose, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(recompose);
+	UT_ASSERT_NOT_NULL(recompose_end);
+	if (recompose != NULL && recompose_end != NULL)
+		UT_ASSERT(strstr(recompose, "CMX_STAT_RECOMPOSE_SUCCESS") == NULL
+				  || strstr(recompose, "CMX_STAT_RECOMPOSE_SUCCESS")
+						 > recompose_end);
+
+	make_stamp = strstr(heap_source, "\ncluster_current_mx_make_stamp(");
+	create = make_stamp != NULL
+				 ? strstr(make_stamp,
+						  "MultiXactIdCreateFromCurrentMembers(")
+				 : NULL;
+	success_counter
+		= create != NULL
+			  ? strstr(create, "CMX_STAT_RECOMPOSE_SUCCESS")
+			  : NULL;
+	UT_ASSERT_NOT_NULL(make_stamp);
+	UT_ASSERT_NOT_NULL(create);
+	UT_ASSERT_NOT_NULL(success_counter);
+	if (make_stamp != NULL && create != NULL && success_counter != NULL)
+		UT_ASSERT(make_stamp < create && create < success_counter);
+	UT_ASSERT_STR_CONTAINS(
+		current_source,
+		"CMX_STAT_DESCRIBE_REMOTE_UNKNOWN);\n"
+		"\t\t\tPG_RE_THROW();");
+	UT_ASSERT_STR_CONTAINS(
+		current_source,
+		"CMX_STAT_MEMBER_PROOF_UNKNOWN);\n"
+		"\t\t\t\tPG_RE_THROW();");
+
+out:
+	free(heap_source);
+	free(current_source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(34);
 	UT_RUN(test_current_multixact_public_symbols_link);
 	UT_RUN(test_current_multixact_descriptor_validation);
 	UT_RUN(test_current_multixact_descriptor_accepts_cap_and_hashes_order);
@@ -2835,6 +3000,9 @@ main(void)
 	UT_RUN(test_current_multixact_reader_overlay_unknown_asks_origin);
 	UT_RUN(test_current_multixact_latest_tid_uses_authoritative_hot_updater);
 	UT_RUN(test_current_multixact_heap_bridge_uses_decoded_cmax_and_follows_active_updater);
+	UT_RUN(test_current_multixact_operation_local_descriptor_memo_contract);
+	UT_RUN(test_current_multixact_supported_limit_outer_mapping_contract);
+	UT_RUN(test_current_multixact_gate_and_recompose_counter_are_publish_exact);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

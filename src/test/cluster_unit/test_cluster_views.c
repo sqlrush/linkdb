@@ -39,6 +39,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_apply_master_election.h"
+#include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mrp.h"
 #include "cluster/cluster_views.h"
@@ -164,9 +165,47 @@ cluster_apply_master_current_node_id(void)
  * the SRF symbol address (the SRF body itself is never invoked here).
  */
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_shmem.h"
 
 ClusterShmemCtl *ClusterShmem = NULL;
+ClusterConf *ClusterConfShmem = NULL;
+
+TimestampTz
+cluster_multixact_current_stats_since(void)
+{
+	return 0;
+}
+
+uint64
+cluster_multixact_current_stats_get(ClusterCurrentMxStatId stat pg_attribute_unused())
+{
+	return 0;
+}
+
+bool
+cluster_multixact_current_stats_snapshot(
+	uint32 node_id pg_attribute_unused(),
+	uint64 cluster_epoch pg_attribute_unused(),
+	ClusterCurrentMxStatsSnapshot *snapshot pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_gcs_current_mx_stats_fetch_and_wait(
+	int32 origin_node pg_attribute_unused(),
+	ClusterCurrentMxStatsSnapshot *snapshot pg_attribute_unused())
+{
+	return false;
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return 0;
+}
 
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
@@ -206,8 +245,13 @@ cluster_shmem_iter_regions(int *idx pg_attribute_unused(),
 
 UT_DEFINE_GLOBALS();
 
+static Datum (*volatile current_mx_local_srf)(FunctionCallInfo)
+	= cluster_get_multixact_current_stats;
+static Datum (*volatile current_mx_global_srf)(FunctionCallInfo)
+	= cluster_get_gcluster_multixact_current_stats;
 
-UT_TEST(test_cluster_wait_events_count_is_125)
+
+UT_TEST(test_cluster_wait_events_count_is_126)
 {
 	/*
 	 * Cumulative registration roster: 61 prior + 3 added by spec-2.6 D11
@@ -240,8 +284,8 @@ UT_TEST(test_cluster_wait_events_count_is_125)
 	 * enum in wait_event.h and CLUSTER_WAIT_EVENTS_COUNT must move
 	 * together, and this test number must be bumped in lockstep.
 	 */
-	/* spec-3.6b: describe + member-proof waits -> 125. */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 125);
+	/* spec-3.6b: describe + member-proof + stats waits -> 126. */
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 126);
 }
 
 
@@ -253,6 +297,12 @@ UT_TEST(test_srf_symbol_linkable)
 UT_TEST(test_adg_srf_symbol_linkable)
 {
 	UT_ASSERT_NOT_NULL((void *)cluster_get_adg_state);
+}
+
+UT_TEST(test_current_multixact_stats_srf_symbols_linkable)
+{
+	UT_ASSERT_NOT_NULL((void *)current_mx_local_srf);
+	UT_ASSERT_NOT_NULL((void *)current_mx_global_srf);
 }
 
 
@@ -285,10 +335,11 @@ UT_TEST(test_adg_wal_receive_lag_in_adg_class)
 int
 main(void)
 {
-	UT_PLAN(5);
-	UT_RUN(test_cluster_wait_events_count_is_125);
+	UT_PLAN(6);
+	UT_RUN(test_cluster_wait_events_count_is_126);
 	UT_RUN(test_srf_symbol_linkable);
 	UT_RUN(test_adg_srf_symbol_linkable);
+	UT_RUN(test_current_multixact_stats_srf_symbols_linkable);
 	UT_RUN(test_first_event_is_ges_enqueue_acquire);
 	UT_RUN(test_adg_wal_receive_lag_in_adg_class);
 	UT_DONE();

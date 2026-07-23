@@ -53,6 +53,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_status.h"
@@ -69,6 +70,7 @@
  */
 typedef struct ClusterTxwWaitSlot {
 	ClusterTTStatusKey holder_key; /* full 24B exact identity (H1) */
+	bool current_mx_wait;		   /* exact SetLatch feeds current-MX stats */
 	uint32 waiting;				   /* 1 = owner backend is blocked */
 } ClusterTxwWaitSlot;
 
@@ -170,12 +172,14 @@ cluster_tx_enqueue_shmem_register(void)
  * ============================================================ */
 
 static void
-txw_slot_set(int procno, const ClusterTTStatusKey *holder_key)
+txw_slot_set(int procno, const ClusterTTStatusKey *holder_key,
+			 bool current_mx_wait)
 {
 	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
 	if (ClusterTxw->slots[procno].waiting == 0)
 		pg_atomic_fetch_add_u32(&ClusterTxw->active_waiters, 1);
 	ClusterTxw->slots[procno].holder_key = *holder_key;
+	ClusterTxw->slots[procno].current_mx_wait = current_mx_wait;
 	ClusterTxw->slots[procno].waiting = 1;
 	LWLockRelease(&ClusterTxw->lock);
 }
@@ -187,11 +191,14 @@ txw_slot_clear(int procno)
 	if (ClusterTxw->slots[procno].waiting != 0)
 		pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
 	ClusterTxw->slots[procno].waiting = 0;
+	ClusterTxw->slots[procno].current_mx_wait = false;
 	LWLockRelease(&ClusterTxw->lock);
 }
 
-ClusterTxwResult
-cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_timeout_ms)
+static ClusterTxwResult
+cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key,
+								 int effective_timeout_ms,
+								 bool current_mx_wait)
 {
 	int procno;
 	TimestampTz deadline;
@@ -221,7 +228,7 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	pg_atomic_fetch_add_u64(&ClusterTxw->wait_count, 1);
 	deadline = GetCurrentTimestamp() + (TimestampTz)effective_timeout_ms * 1000;
 
-	txw_slot_set(procno, holder_key);
+	txw_slot_set(procno, holder_key, current_mx_wait);
 
 	/*
 	 * spec-5.8 D1d — publish the cluster wait-state so the LMD deadlock
@@ -341,6 +348,22 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	return result;
 }
 
+ClusterTxwResult
+cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key,
+						int effective_timeout_ms)
+{
+	return cluster_tx_enqueue_wait_internal(holder_key, effective_timeout_ms,
+											false);
+}
+
+ClusterTxwResult
+cluster_tx_enqueue_wait_current_mx(const ClusterTTStatusKey *holder_key,
+								   int effective_timeout_ms)
+{
+	return cluster_tx_enqueue_wait_internal(holder_key, effective_timeout_ms,
+											true);
+}
+
 void
 cluster_txw_wake_waiters(const ClusterTTStatusKey *holder_key)
 {
@@ -361,6 +384,8 @@ cluster_txw_wake_waiters(const ClusterTTStatusKey *holder_key)
 		if (ClusterTxw->slots[i].waiting != 0
 			&& txw_key_equal(&ClusterTxw->slots[i].holder_key, holder_key)) {
 			pg_atomic_fetch_add_u64(&ClusterTxw->wakeup_count, 1);
+			if (ClusterTxw->slots[i].current_mx_wait)
+				cluster_multixact_current_stats_bump(CMX_STAT_WAKEUP);
 			SetLatch(&GetPGProcByNumber(i)->procLatch);
 		}
 	}

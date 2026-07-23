@@ -125,6 +125,44 @@ cluster_multixact_current_wire_validate_describe_forward(
 	return true;
 }
 
+bool
+cluster_multixact_current_wire_validate_stats_forward(
+	const void *payload, uint32 payload_length, int32 envelope_source,
+	int32 local_node, uint64 current_epoch,
+	ClusterCurrentMxStatsForwardV2 *decoded)
+{
+	ClusterCurrentMxStatsForwardV2 message;
+
+	if (decoded != NULL)
+		memset(decoded, 0, sizeof(*decoded));
+	if (payload == NULL || decoded == NULL
+		|| payload_length != sizeof(message)
+		|| envelope_source < 0 || envelope_source >= CLUSTER_MAX_NODES
+		|| local_node < 0 || local_node >= CLUSTER_MAX_NODES
+		|| !wire_epoch_valid(current_epoch))
+		return false;
+
+	memcpy(&message, payload, sizeof(message));
+	if (message.prefix.request_id == 0
+		|| message.prefix.epoch != current_epoch
+		|| message.prefix.original_requester_node != envelope_source
+		|| message.prefix.requester_backend_id <= 0
+		|| message.prefix.kind != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS
+		|| !bytes_are_zero(message.prefix.kind_body_a,
+						   sizeof(message.prefix.kind_body_a))
+		|| !bytes_are_zero(message.prefix.kind_body_b,
+						   sizeof(message.prefix.kind_body_b))
+		|| message.trailer.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+		|| message.trailer.version != CLUSTER_CURRENT_MX_WIRE_VERSION
+		|| message.trailer.flags != CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE
+		|| !bytes_are_zero(message.trailer.reserved,
+						   sizeof(message.trailer.reserved)))
+		return false;
+
+	*decoded = message;
+	return true;
+}
+
 
 bool
 cluster_multixact_current_wire_validate_proof_forward(
@@ -659,4 +697,48 @@ cluster_multixact_current_wire_validate_describe_reply(
 	*members_count = header->entry_count;
 	*reported_total_members = header->total_count;
 	return CMX_DESC_OK;
+}
+
+bool
+cluster_multixact_current_wire_validate_stats_reply(
+	const void *payload, uint32 payload_length, int32 expected_source,
+	uint64 current_epoch, uint64 expected_request_id,
+	ClusterCurrentMxStatsSnapshot *snapshot)
+{
+	ClusterCurrentMxStatsReplyPage page;
+	Size expected_wire_length;
+
+	if (snapshot != NULL)
+		memset(snapshot, 0, sizeof(*snapshot));
+	if (payload == NULL || payload_length != sizeof(page)
+		|| snapshot == NULL || expected_source < 0
+		|| expected_source >= CLUSTER_MAX_NODES
+		|| expected_request_id == 0 || !wire_epoch_valid(current_epoch))
+		return false;
+
+	memcpy(&page, payload, sizeof(page));
+	expected_wire_length
+		= sizeof(page.header) + sizeof(page.counters);
+	if (page.header.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+		|| page.header.version != CLUSTER_CURRENT_MX_WIRE_VERSION
+		|| page.header.kind != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS
+		|| page.header.flags != CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE
+		|| page.header.source_node_id != (uint32)expected_source
+		|| page.header.request_id != expected_request_id
+		|| page.header.epoch != current_epoch
+		|| page.header.stats_since == 0
+		|| page.header.counter_count != CMX_STAT_COUNT
+		|| page.header.wire_length != expected_wire_length
+		|| page.header.reserved32_a != 0
+		|| page.header.reserved32_b != 0
+		|| !bytes_are_zero(page.header.reserved,
+						   sizeof(page.header.reserved))
+		|| !bytes_are_zero(page.reserved, sizeof(page.reserved)))
+		return false;
+
+	snapshot->node_id = page.header.source_node_id;
+	snapshot->cluster_epoch = page.header.epoch;
+	snapshot->stats_since = page.header.stats_since;
+	memcpy(snapshot->counters, page.counters, sizeof(snapshot->counters));
+	return true;
 }

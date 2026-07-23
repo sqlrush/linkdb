@@ -7,7 +7,8 @@
 #    was added in PG 17), so this test cannot enumerate the registered
 #    cluster events directly via SQL.  The 46 event registrations and
 #    10 class IDs are validated at compile time by
-#    src/test/cluster_unit/test_cluster_wait_events.c.
+#    src/test/cluster_unit/test_cluster_wait_events.c.  The pgrac-specific
+#    pg_stat_cluster_wait_events view also exposes the registered name table.
 #
 #    What this test proves at runtime:
 #      - The server starts cleanly with the 10 cluster wait classes
@@ -95,6 +96,19 @@ my $bgproc_lmon_waits = $node->safe_psql(
 	   WHERE wait_event_type = 'Cluster: BgProc' AND wait_event = 'ClusterBgProcLmonMainLoop'});
 ok($bgproc_lmon_waits eq '0' || $bgproc_lmon_waits eq '1',
 	'LMON main loop wait state count is 0 (mid-tick) or 1 (sleeping in WaitLatch)');
+
+# spec-3.6b: both current-DML MultiXact network blocking points are stable
+# Cluster: PCM events (the GCS block DATA-plane family).  This is the runtime
+# catalog half of the four-surface
+# wait-event contract; focused unit tests pin the enum/name switch values.
+is($node->safe_psql(
+	'postgres',
+	q{SELECT count(*) FROM pg_stat_cluster_wait_events
+	   WHERE type = 'Cluster: PCM'
+	     AND name IN ('GcsMultixactDescribeWait',
+	                  'GcsMultixactMemberProofWait',
+	                  'GcsMultixactStatsWait')}),
+	'3', 'current-DML MultiXact describe/member-proof/stats wait events are registered');
 
 
 # ----------

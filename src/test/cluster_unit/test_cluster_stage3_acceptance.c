@@ -18,7 +18,7 @@
  *	        string invariants;  runtime emission verified by t/226 L10.
  *	    L4  SQLSTATE 53R97 / 53R9C / 53R9D / 53R9E / 53R9G / 53R9H 全
  *	        encodable via MAKE_SQLSTATE (Stage 3 MVCC error surface).
- *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 98 (spec-4.6 D4
+ *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 126 (spec-3.6b D8
  *	        ship value;  update-required contract — any future spec adding
  *	        wait events MUST bump this snapshot).
  *	    L6  ClusterTTStatus 6-value enum (0-5) + TTSlotStatus 5 functional
@@ -373,17 +373,17 @@ UT_TEST(test_stage3_sqlstate_mvcc_surface_encodable)
 }
 
 
-/* ===== L5 — CLUSTER_WAIT_EVENTS_COUNT current snapshot 125 ===== */
+/* ===== L5 — CLUSTER_WAIT_EVENTS_COUNT current snapshot 126 ===== */
 
-UT_TEST(test_stage3_wait_events_count_snapshot_125)
+UT_TEST(test_stage3_wait_events_count_snapshot_126)
 {
 	/* spec-4.2 D5 value (95 + 2 wal-state registry I/O).  Update-required contract:  a future spec
 	 * adding a wait event MUST bump this snapshot (it is current state, not
 	 * "==93 forever").  spec-4.6 D4: 97 → 98;  spec-4.7 D1: 98 → 99
 	 * (+ ClusterGCSBlockRecovering);  spec-4.11 D5: 99 → 100
 	 * (+ ClusterThreadRecovery).  spec-6.13 D8 -> 118; spec-5.22b +3;
-	 * spec-7.2 +2 -> 123; spec-3.6b current-MX waits -> 125. */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 125);
+	 * spec-7.2 +2 -> 123; spec-3.6b current-MX waits -> 126. */
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 126);
 }
 
 
@@ -476,7 +476,7 @@ main(void)
 	UT_RUN(test_undo_4_8ab_redo_determinism_converges);
 	UT_RUN(test_stage3_capability_dump_category_names);
 	UT_RUN(test_stage3_sqlstate_mvcc_surface_encodable);
-	UT_RUN(test_stage3_wait_events_count_snapshot_125);
+	UT_RUN(test_stage3_wait_events_count_snapshot_126);
 	UT_RUN(test_stage3_tt_enum_values_locked);
 	UT_RUN(test_stage3_retention_active_retains_invariant);
 	UT_RUN(test_stage3_bind_opcode_reserved);

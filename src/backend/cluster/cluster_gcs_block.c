@@ -71,6 +71,7 @@
 #include "cluster/cluster_ic_tier1.h" /* PGRAC: spec-7.3 D5 — my DATA channel = worker id */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_own.h" /* S3 forensics — ownership gen in 53R93 errdetail */
@@ -4142,6 +4143,7 @@ cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterC
 	BufferTag route_tag;
 	uint64 request_id = 0;
 	uint64 request_epoch;
+	uint32 capability_generation;
 	int worker_id;
 	bool got_reply = false;
 	ClusterMxDescribeResult result = CMX_DESC_UNKNOWN;
@@ -4158,6 +4160,9 @@ cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterC
 		|| key->cluster_epoch != cluster_epoch_get_current()
 		|| !MultiXactIdIsValid(key->multixact_id)
 		|| !cluster_gcs_block_family_on_data_plane())
+		return CMX_DESC_UNKNOWN;
+	if (!cluster_sf_peer_multixact_current_capability_generation(
+			origin_node, &capability_generation))
 		return CMX_DESC_UNKNOWN;
 
 	request_epoch = cluster_epoch_get_current();
@@ -4201,9 +4206,10 @@ cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterC
 												(int32)MyBackendId);
 		worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 		if (worker_id < 0
-			|| !cluster_lms_outbound_enqueue(
+			|| !cluster_lms_outbound_enqueue_cap_bound(
 				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, &request,
-				sizeof(request))) {
+				sizeof(request), PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+				capability_generation)) {
 			result = CMX_DESC_UNKNOWN;
 			goto describe_done;
 		}
@@ -4277,6 +4283,159 @@ cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterC
 	return result;
 }
 
+bool
+cluster_gcs_current_mx_stats_fetch_and_wait(
+	int32 origin_node, ClusterCurrentMxStatsSnapshot *snapshot)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterCurrentMxStatsForwardV2 request;
+	ClusterCurrentMxStatsReplyPage reply_page;
+	GcsBlockReplyHeader reply_header;
+	BufferTag slot_tag;
+	BufferTag route_tag;
+	uint64 request_id = 0;
+	uint64 request_epoch;
+	uint32 capability_generation;
+	int worker_id;
+	bool got_reply = false;
+	bool result = false;
+
+	if (snapshot != NULL)
+		memset(snapshot, 0, sizeof(*snapshot));
+	if (snapshot == NULL || origin_node < 0
+		|| origin_node == cluster_node_id
+		|| origin_node >= CLUSTER_MAX_NODES
+		|| !cluster_gcs_block_family_on_data_plane())
+		return false;
+	if (!cluster_sf_peer_multixact_current_capability_generation(
+			origin_node, &capability_generation))
+		return false;
+
+	request_epoch = cluster_epoch_get_current();
+	slot_tag = GcsBlockCurrentMxRouteTagMake(
+		UINT64CONST(1), request_epoch, cluster_node_id,
+		(int32)MyBackendId);
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_reserve_slot(
+		slot_tag, 0, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0,
+			   sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+		slot->request_epoch = request_epoch;
+		slot->expected_master_node = origin_node;
+		slot->expected_reply_status
+			= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT;
+		slot->expected_current_mx_key_valid = false;
+		slot->expected_current_mx_proof_valid = false;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&request, 0, sizeof(request));
+		request.prefix.request_id = request_id;
+		request.prefix.epoch = request_epoch;
+		request.prefix.original_requester_node = cluster_node_id;
+		request.prefix.requester_backend_id = (int32)MyBackendId;
+		request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
+		request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+		request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+		request.trailer.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
+
+		route_tag = GcsBlockCurrentMxRouteTagMake(
+			request_id, request_epoch, cluster_node_id,
+			(int32)MyBackendId);
+		worker_id = cluster_lms_shard_for_tag(
+			&route_tag, cluster_lms_workers);
+		if (worker_id < 0
+			|| !cluster_lms_outbound_enqueue_cap_bound(
+				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+				(uint32)origin_node, &request, sizeof(request),
+				PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+				capability_generation))
+			goto stats_done;
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms)
+						 * (TimestampTz)1000;
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;)
+		{
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply)
+			{
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(
+				&slot->reply_cv, timeout_ms,
+				WAIT_EVENT_GCS_MULTIXACT_STATS_WAIT);
+		}
+		ConditionVariableCancelSleep();
+		if (!got_reply)
+			goto stats_done;
+
+		reply_header = slot->reply_header;
+		memcpy(&reply_page, slot->reply_block_data, sizeof(reply_page));
+		if (reply_header.status
+				!= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT
+			|| reply_header.sender_node != origin_node
+			|| reply_header.request_id != request_id
+			|| reply_header.epoch != request_epoch
+			|| reply_header.requester_backend_id != (int32)MyBackendId
+			|| reply_header.transition_id != 0
+			|| reply_header.page_lsn != 0
+			|| !gcs_block_reply_reserved_zero(&reply_header)
+			|| GcsBlockReplyHeaderGetForwardingMasterNode(&reply_header)
+				   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+			|| reply_header.checksum
+				   != cluster_gcs_block_compute_checksum(
+						  (const char *)&reply_page)
+			|| cluster_epoch_get_current() != request_epoch)
+			goto stats_done;
+
+		result = cluster_multixact_current_wire_validate_stats_reply(
+			&reply_page, sizeof(reply_page), origin_node, request_epoch,
+			request_id, snapshot);
+		if (result)
+			gcs_block_stamp_touched(
+				origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+
+	stats_done:
+		;
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+	return result;
+}
+
 
 ClusterMxResolveResult
 cluster_gcs_current_mx_member_proof_fetch_and_wait(
@@ -4292,6 +4451,7 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	BufferTag route_tag;
 	uint64 request_id = 0;
 	uint64 request_epoch;
+	uint32 capability_generation;
 	int worker_id;
 	bool got_reply = false;
 	ClusterMxResolveResult result = CMX_RESOLVE_UNKNOWN;
@@ -4312,6 +4472,9 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	if (request == NULL || proofs == NULL || proof_count == NULL || updater_proof == NULL
 		|| origin_node < 0 || origin_node == cluster_node_id || origin_node >= CLUSTER_MAX_NODES
 		|| !cluster_gcs_block_family_on_data_plane())
+		return CMX_RESOLVE_UNKNOWN;
+	if (!cluster_sf_peer_multixact_current_capability_generation(
+			origin_node, &capability_generation))
 		return CMX_RESOLVE_UNKNOWN;
 
 	request_epoch = cluster_epoch_get_current();
@@ -4360,9 +4523,10 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 												(int32)MyBackendId);
 		worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 		if (worker_id < 0
-			|| !cluster_lms_outbound_enqueue(
+			|| !cluster_lms_outbound_enqueue_cap_bound(
 				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, request,
-				sizeof(*request))) {
+				sizeof(*request), PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+				capability_generation)) {
 			result = CMX_RESOLVE_UNKNOWN;
 			goto proof_done;
 		}
@@ -8213,6 +8377,7 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	uint8 sf_flags = 0;
 	ClusterSfDepVec sf_dep_vec;
 	const ClusterGcsUndoAuthTrailer *undo_trailer = NULL;
+	bool transport_source_valid;
 	int backend_idx;
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
@@ -8223,10 +8388,11 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		return;
 	/* Bind the payload's claimed sender to the authenticated DATA envelope.
 	 * The canonical PCM-X image-id path is direct holder -> requester, so
-	 * accepting a forged header source here would bypass its holder proof. */
-	if (env->source_node_id != (uint32)hdr->sender_node
-		|| env->dest_node_id != (uint32)cluster_node_id)
-		return;
+	 * accepting a forged header source here would bypass its holder proof.
+	 * Preserve the boolean until the exact slot is known so current-MX can
+	 * count a spoofed matching reply before the common fail-closed drop. */
+	transport_source_valid = env->source_node_id == (uint32)hdr->sender_node
+							 && env->dest_node_id == (uint32)cluster_node_id;
 
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
 	backend_idx = hdr->requester_backend_id - 1;
@@ -8296,12 +8462,15 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			fwd_master = GcsBlockReplyHeaderGetForwardingMasterNode(hdr);
 			current_reply
 				= hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
-				  || hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
+				  || hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+				  || hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT;
 			current_slot
 				= slot->expected_reply_status
 					  == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
 				  || slot->expected_reply_status
-						 == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
+						 == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+				  || slot->expected_reply_status
+						 == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT;
 
 			if (current_slot || current_reply) {
 				/*
@@ -8365,6 +8534,16 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 										scratch_proofs, lengthof(scratch_proofs),
 										&scratch_count, &scratch_updater);
 						authorized = typed_valid;
+					} else if (hdr->status
+							   == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT) {
+						ClusterCurrentMxStatsSnapshot scratch_stats;
+
+						authorized
+							= cluster_multixact_current_wire_validate_stats_reply(
+								block_data, GCS_BLOCK_DATA_SIZE,
+								slot->expected_master_node,
+								slot->request_epoch, slot->request_id,
+								&scratch_stats);
 					}
 				}
 			} else if (fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
@@ -8392,8 +8571,18 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 					authorized = true;
 			}
 
-			if (!authorized || hdr->epoch < slot->request_epoch
+			if (!transport_source_valid || !authorized || hdr->epoch < slot->request_epoch
 				|| hdr->transition_id != slot->transition_id) {
+				if (current_slot) {
+					if (slot->expected_reply_status
+						== (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT)
+						cluster_multixact_current_stats_bump(
+							CMX_STAT_DESCRIBE_INVALID_REPLY);
+					else if (slot->expected_reply_status
+							 == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT)
+						cluster_multixact_current_stats_bump(
+							CMX_STAT_MEMBER_PROOF_INVALID_REPLY);
+				}
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 				LWLockRelease(&blk->lock.lock);
 				return;
@@ -8496,9 +8685,9 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 		return;
 
 	/*
-	 * spec-3.6b D2: kinds 6/7 are the only 128-byte FORWARD frames.  Branch
-	 * before the shipped BufferTag/transition/SCN decoder: those bytes are a
-	 * typed current-MX overlay and must never reach block-holder logic.
+	 * spec-3.6b D2/D8: kinds 6/7/8 are the only 128-byte FORWARD frames.
+	 * Branch before the shipped BufferTag/transition/SCN decoder: those bytes
+	 * are a typed current-MX overlay and must never reach block-holder logic.
 	 */
 	if (env->payload_length == GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE) {
 		ClusterCurrentMxRoutingPrefixWire routing;
@@ -8508,6 +8697,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			cluster_gcs_current_mx_describe_serve_inline(env, payload);
 		else if (routing.kind == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF)
 			cluster_gcs_current_mx_member_proof_serve_inline(env, payload);
+		else if (routing.kind == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS)
+			cluster_gcs_current_mx_stats_serve_inline(env, payload);
 		return;
 	}
 	if (env->payload_length != sizeof(GcsBlockForwardPayload))
@@ -8518,7 +8709,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	/* A new kind carried in an old 64-byte frame is never progressively
 	 * decoded by a new peer. */
 	if (GcsBlockForwardPayloadIsCurrentMxDescribe(fwd)
-		|| GcsBlockForwardPayloadIsCurrentMxMemberProof(fwd))
+		|| GcsBlockForwardPayloadIsCurrentMxMemberProof(fwd)
+		|| GcsBlockForwardPayloadIsCurrentMxStats(fwd))
 		return;
 	sf_peer_v2
 		= cluster_smart_fusion && cluster_sf_peer_supports_reply_v2(fwd->original_requester_node);

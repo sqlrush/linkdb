@@ -282,6 +282,8 @@ extern void cluster_gcs_current_mx_describe_serve_inline(const struct ClusterICE
 														 const void *payload);
 extern void cluster_gcs_current_mx_member_proof_serve_inline(
 	const struct ClusterICEnvelope *env, const void *payload);
+extern void cluster_gcs_current_mx_stats_serve_inline(
+	const struct ClusterICEnvelope *env, const void *payload);
 extern ClusterMxDescribeResult cluster_gcs_current_mx_describe_fetch_and_wait(
 	int32 origin_node, const ClusterCurrentMxKey *key, ClusterCurrentMxMemberDesc *members,
 	uint16 members_cap, uint16 *members_count, uint32 *reported_total_members);
@@ -289,6 +291,8 @@ extern ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait
 	int32 origin_node, ClusterCurrentMxProofForwardV2 *request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
 	ClusterCurrentUpdaterProof *updater_proof);
+extern bool cluster_gcs_current_mx_stats_fetch_and_wait(
+	int32 origin_node, ClusterCurrentMxStatsSnapshot *snapshot);
 
 /* Requester side (backend): fetch a CR page for (locator, fork, block) at
  * read_scn from origin_node.  On success copies the shipped page into

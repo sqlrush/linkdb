@@ -27,7 +27,7 @@
  *	        reconfig-in-progress / 53R61 join-rejected-stale / 53R62 clean-
  *	        leave-in-progress / 53R64 node-removed-fenced / 53R70 ges-timeout
  *	        / 55R01 pcm-state-invalid.
- *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 125, including the
+ *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 126, including the
  *	        current-DML MultiXact waits (update-required contract) +
  *	        the multi-node write-path
  *	        wait events present and pairwise distinct (GES_S4 / GES_REPLY /
@@ -193,7 +193,7 @@ UT_TEST(test_stage5_wait_events_count_and_multinode_set)
 	 * authority waits and spec-6.13 adds 2 RDMA tier3 waits.  update-required
 	 * contract: a future spec adding cluster wait events MUST bump this snapshot
 	 * (and the dump/test baselines that count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 125);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 126);
 
 	/* The multi-node write-path wait events MG-B aggregates for the M2 share
 	 * must all be present and pairwise distinct (a reorder/removal would change

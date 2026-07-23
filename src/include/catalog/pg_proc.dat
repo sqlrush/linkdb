@@ -12917,6 +12917,29 @@
   proargnames => '{rel,forknum,blocknum,thread_id,start_lsn,end_lsn,use_pi}',
   prosrc => 'cluster_pi_apply_redo_test' },
 
+# spec-3.6b D8: current-DML MultiXact authority observability.  The local
+# SRF emits self; the global SRF preserves every declared member row and
+# reports unreachable remote rows as UNAVAILABLE with NULL metrics.
+{ oid => '8976',
+  descr => 'show local current-DML MultiXact authority statistics',
+  proname => 'cluster_get_multixact_current_stats', prorows => '1',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,int8,text,timestamptz,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,cluster_epoch,collection_status,stats_since,describe_local_count,describe_remote_ask_count,describe_remote_hit_count,describe_remote_denied_count,describe_remote_supported_limit_count,describe_remote_timeout_count,describe_remote_unknown_count,describe_invalid_reply_count,member_proof_ask_count,member_proof_hit_count,member_proof_unknown_count,member_proof_denied_count,member_proof_supported_limit_count,member_proof_timeout_count,member_proof_invalid_reply_count,wait_count,wait_resolved_count,wait_dead_holder_count,wait_timeout_count,wait_retry_count,wait_interrupted_count,deadlock_victim_count,wakeup_count,recompose_success_count,recompose_failclosed_count,hot_proof_hit_count,hot_proof_failclosed_count,aba_restart_count,restart_bucket_0_count,restart_bucket_1_count,restart_bucket_2_3_count,restart_bucket_4_7_count,restart_bucket_8_plus_count,restart_max,foreign_slru_guard_count}',
+  prosrc => 'cluster_get_multixact_current_stats' },
+
+{ oid => '8977',
+  descr => 'show current-DML MultiXact authority statistics for declared cluster nodes',
+  proname => 'cluster_get_gcluster_multixact_current_stats', prorows => '8',
+  proretset => 't', provolatile => 'v', proparallel => 'r',
+  prorettype => 'record', proargtypes => '',
+  proallargtypes => '{int4,int8,text,timestamptz,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8,int8}',
+  proargmodes => '{o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{node_id,cluster_epoch,collection_status,stats_since,describe_local_count,describe_remote_ask_count,describe_remote_hit_count,describe_remote_denied_count,describe_remote_supported_limit_count,describe_remote_timeout_count,describe_remote_unknown_count,describe_invalid_reply_count,member_proof_ask_count,member_proof_hit_count,member_proof_unknown_count,member_proof_denied_count,member_proof_supported_limit_count,member_proof_timeout_count,member_proof_invalid_reply_count,wait_count,wait_resolved_count,wait_dead_holder_count,wait_timeout_count,wait_retry_count,wait_interrupted_count,deadlock_victim_count,wakeup_count,recompose_success_count,recompose_failclosed_count,hot_proof_hit_count,hot_proof_failclosed_count,aba_restart_count,restart_bucket_0_count,restart_bucket_1_count,restart_bucket_2_3_count,restart_bucket_4_7_count,restart_bucket_8_plus_count,restart_max,foreign_slru_guard_count}',
+  prosrc => 'cluster_get_gcluster_multixact_current_stats' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

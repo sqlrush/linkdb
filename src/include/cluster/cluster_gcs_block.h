@@ -1522,7 +1522,8 @@ typedef enum GcsBlockReplyStatus {
 													 * multi is a DENIED reply — the
 														 * requester keeps 53R97 (Rule 8.A). */
 	GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT = 21,
-	GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT = 22
+	GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT = 22,
+	GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT = 23
 } GcsBlockReplyStatus;
 
 /*
@@ -1572,7 +1573,10 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
 				 "current MX describe result must follow undo multi verdict");
 StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
 						 == GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT + 1,
-				 "current MX member-proof result must be the tail reply status");
+				 "current MX member-proof result must follow describe");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT
+						 == GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT + 1,
+				 "current MX stats result must be the tail reply status");
 
 /* PGRAC: spec-6.12i / spec-7.1 — every undo-plane reply kind (TT-header fetch,
  * single-xid verdict, batched multi-member verdict) ships the BLCKSZ page plus
@@ -2774,6 +2778,7 @@ GcsBlockForwardPayloadIsUndoMultiVerdictRequest(const GcsBlockForwardPayload *p)
  */
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE 6
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF 7
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS 8
 #define GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE 128
 
 StaticAssertDecl(GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE == 2 * sizeof(GcsBlockForwardPayload),
@@ -2821,6 +2826,18 @@ static inline bool
 GcsBlockForwardPayloadIsCurrentMxMemberProof(const GcsBlockForwardPayload *p)
 {
 	return p->reserved_0[6] == (uint8)GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+}
+
+static inline void
+GcsBlockForwardPayloadSetCurrentMxStats(GcsBlockForwardPayload *p)
+{
+	p->reserved_0[6] = (uint8)GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxStats(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
 }
 
 /* PGRAC: spec-6.12i D-i1 — synthetic undo-address tag for the fetch wire.

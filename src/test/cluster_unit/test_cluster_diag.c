@@ -276,6 +276,10 @@ void
 cluster_hang_resolve_once(void)
 {}
 
+void
+cluster_multixact_current_stats_alert_sample(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 

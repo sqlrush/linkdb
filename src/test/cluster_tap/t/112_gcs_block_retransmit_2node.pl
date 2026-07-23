@@ -12,7 +12,7 @@
 #	  L3  pg_cluster_state.gcs has 119 keys (PCM-X queue observability +3)
 #	  L4  2 NEW wait events registered (ClusterGCSBlockRetransmitWait +
 #	       ClusterGCSBlockEpochStaleRetry)
-#	  L5  CLUSTER_WAIT_EVENTS_COUNT = 125 (including current-DML MultiXact waits)
+#	  L5  CLUSTER_WAIT_EVENTS_COUNT = 126 (including current-DML MultiXact waits)
 #	  L6  3 NEW GUC visible + defaults + contexts:
 #	       cluster.gcs_block_retransmit_max_retries PGC_SUSET 4
 #	       cluster.gcs_block_retransmit_initial_backoff_ms PGC_SUSET 10 (spec-7.2 D1)
@@ -143,13 +143,13 @@ for my $we_name (
 
 
 # ============================================================
-# L5: total wait event count = 125.
+# L5: total wait event count = 126.
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '125',
-   'L5 pg_stat_cluster_wait_events returns 125 rows (including current-DML MultiXact waits; merge sum 118+3+2+2)');
+   '126',
+   'L5 pg_stat_cluster_wait_events returns 126 rows (including current-DML MultiXact waits; merge sum 118+3+3+2)');
 
 
 # ============================================================

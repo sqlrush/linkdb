@@ -986,6 +986,7 @@ extern int cluster_gcs_block_retransmit_initial_backoff_ms;
  * (default on).  See cluster_guc.c for semantics. */
 extern bool cluster_gcs_block_local_cache;
 extern bool cluster_tx_enqueue_wait_enabled; /* spec-5.2 D4 */
+extern bool cluster_multixact_current_dml; /* spec-3.6b current authority */
 
 /*
  *	cluster.ic_duty_lazy

@@ -268,6 +268,8 @@ my $guard_before = state_int($node1, 'foreign_slru_guard_count');
 
 my $writer = $node1->background_psql('postgres', on_error_die => 1);
 start_blocking($writer, 'UPDATE cmxm_t SET v = v + 1 WHERE id = 1');
+ok(wait_for_authority_wait($node1, 15),
+	'RED-M exposes the authoritative wait through pg_stat_activity');
 ok(wait_for(
 		sub { state_int($node1, 'wait_count') > $wait_before },
 		15),

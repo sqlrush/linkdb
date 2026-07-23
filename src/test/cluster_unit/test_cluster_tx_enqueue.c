@@ -136,10 +136,13 @@ UT_TEST(test_all_production_callers_use_the_five_way_closed_set)
 	if (source == NULL)
 		return;
 
-	UT_ASSERT_EQ(count_occurrences(source, "cluster_tx_enqueue_wait("), 3);
+	UT_ASSERT_EQ(count_occurrences(source, "cluster_tx_enqueue_wait("), 2);
+	UT_ASSERT_EQ(count_occurrences(source,
+								   "cluster_tx_enqueue_wait_current_mx("),
+				 1);
 	first = strstr(source, "cluster_tx_enqueue_wait(");
 	second = first != NULL ? strstr(first + 1, "cluster_tx_enqueue_wait(") : NULL;
-	third = second != NULL ? strstr(second + 1, "cluster_tx_enqueue_wait(") : NULL;
+	third = strstr(source, "cluster_tx_enqueue_wait_current_mx(");
 	assert_exhaustive_result_switch(first);
 	assert_exhaustive_result_switch(second);
 	assert_exhaustive_result_switch(third);
@@ -161,13 +164,50 @@ UT_TEST(test_wait_loop_consumes_a_matching_deadlock_token)
 	free(source);
 }
 
+UT_TEST(test_current_mx_wakeup_counts_the_matching_setlatch_event)
+{
+	char *source = read_source(TX_ENQUEUE_SOURCE_PATH);
+	const char *slot_flag;
+	const char *current_api;
+	const char *wake;
+	const char *current_branch;
+	const char *counter;
+	const char *set_latch;
+
+	if (source == NULL)
+		return;
+
+	slot_flag = strstr(source, "bool current_mx_wait;");
+	current_api = strstr(source, "\ncluster_tx_enqueue_wait_current_mx(");
+	wake = strstr(source, "\ncluster_txw_wake_waiters(");
+	current_branch
+		= wake != NULL ? strstr(wake, "if (ClusterTxw->slots[i].current_mx_wait)")
+					   : NULL;
+	counter = current_branch != NULL
+				  ? strstr(current_branch,
+						   "CMX_STAT_WAKEUP")
+				  : NULL;
+	set_latch = counter != NULL ? strstr(counter, "SetLatch(") : NULL;
+
+	UT_ASSERT_NOT_NULL(slot_flag);
+	UT_ASSERT_NOT_NULL(current_api);
+	UT_ASSERT_NOT_NULL(wake);
+	UT_ASSERT_NOT_NULL(current_branch);
+	UT_ASSERT_NOT_NULL(counter);
+	UT_ASSERT_NOT_NULL(set_latch);
+	if (current_branch != NULL && counter != NULL && set_latch != NULL)
+		UT_ASSERT(current_branch < counter && counter < set_latch);
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(2);
+	UT_PLAN(3);
 	UT_RUN(test_all_production_callers_use_the_five_way_closed_set);
 	UT_RUN(test_wait_loop_consumes_a_matching_deadlock_token);
+	UT_RUN(test_current_mx_wakeup_counts_the_matching_setlatch_event);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

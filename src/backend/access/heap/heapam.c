@@ -211,13 +211,61 @@ static void GetMultiXactIdHintBits(MultiXactId multi, uint16 *new_infomask,
 static TransactionId MultiXactIdGetUpdateXid(TransactionId xmax,
 											 uint16 t_infomask);
 #ifdef USE_PGRAC_CLUSTER
+typedef struct ClusterCurrentMxHeapFingerprint
+{
+	ClusterPcmOwnSnapshot pcm;
+	XLogRecPtr	page_lsn;
+	ItemPointerData tid;
+	ItemIdData	line_pointer;
+	uint16		tuple_len;
+	uint8		tuple_header[SizeofHeapTupleHeader];
+	ClusterItlSlotData itl_slots[CLUSTER_ITL_INITRANS_DEFAULT];
+} ClusterCurrentMxHeapFingerprint;
+
+typedef struct ClusterCurrentMxDescriptorMemo
+{
+	bool		valid;
+	uint64		operation_id;
+	ClusterCurrentMxKey key;
+	MultiXactId raw_xmax;
+	ClusterCurrentMxHeapFingerprint fingerprint;
+	uint64		descriptor_hash;
+	uint32		total_count;
+	uint16		nmembers;
+	ClusterCurrentMxMemberDesc members[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+} ClusterCurrentMxDescriptorMemo;
+
+typedef struct ClusterCurrentMxOperationState
+{
+	uint64		operation_id;
+	uint32		restarts;
+	bool		active;
+	bool		finished;
+	ClusterCurrentMxDescriptorMemo memo;
+} ClusterCurrentMxOperationState;
+
+typedef enum ClusterCurrentMxFailurePhase
+{
+	CCMH_FAIL_DESCRIBE = 0,
+	CCMH_FAIL_MEMBER_PROOF,
+	CCMH_FAIL_WAIT,
+	CCMH_FAIL_RECOMPOSE,
+	CCMH_FAIL_HOT_PROOF,
+	CCMH_FAIL_ABA_FENCE
+} ClusterCurrentMxFailurePhase;
+
 static bool cluster_current_mx_hot_updater_for_chain(
 	Relation relation, Buffer buffer, HeapTuple tuple,
 	TransactionId *updater_xid, bool *restart,
-	ClusterHeapSuccessorProof *successor_proof);
+	ClusterHeapSuccessorProof *successor_proof,
+	ClusterCurrentMxOperationState *operation);
 static bool cluster_current_mx_successor_key_matches(
 	Buffer buffer, HeapTuple tuple, const ClusterHeapSuccessorProof *proof);
-static void cluster_current_mx_failclosed(const char *detail);
+static void cluster_current_mx_operation_finish(
+	ClusterCurrentMxOperationState *operation);
+static void cluster_current_mx_failclosed(
+	ClusterCurrentMxOperationState *operation,
+	ClusterCurrentMxFailurePhase phase, const char *detail);
 #endif
 static bool DoesMultiXactIdConflict(MultiXactId multi, uint16 infomask,
 									LockTupleMode lockmode, bool *current_is_member);
@@ -1636,6 +1684,7 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
 #ifdef USE_PGRAC_CLUSTER
 	bool		cluster_content_exclusive = false;
 	ClusterHeapSuccessorProof cluster_expected_successor;
+	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
 #endif
 
 	/* If this is not the first call, previous call returned a (live!) tuple */
@@ -1704,6 +1753,8 @@ cluster_hot_search_restart:
 			if (!cluster_current_mx_successor_key_matches(
 					buffer, heapTuple, &cluster_expected_successor))
 				cluster_current_mx_failclosed(
+					&cluster_current_mx_operation,
+					CCMH_FAIL_ABA_FENCE,
 					"the HOT scan successor no longer matches its full-key proof");
 			memset(&cluster_expected_successor, 0,
 				   sizeof(cluster_expected_successor));
@@ -1746,6 +1797,10 @@ cluster_hot_search_restart:
 								 HeapTupleHeaderGetXmin(heapTuple->t_data));
 				if (all_dead)
 					*all_dead = false;
+#ifdef USE_PGRAC_CLUSTER
+				cluster_current_mx_operation_finish(
+					&cluster_current_mx_operation);
+#endif
 				return true;
 			}
 		}
@@ -1809,7 +1864,8 @@ cluster_hot_search_restart:
 				}
 				if (!cluster_current_mx_hot_updater_for_chain(
 						relation, buffer, heapTuple, &prev_xmax, &restart,
-						&cluster_expected_successor))
+						&cluster_expected_successor,
+						&cluster_current_mx_operation))
 				{
 					Assert(restart);
 					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -1835,6 +1891,10 @@ cluster_hot_search_restart:
 			break;				/* end of chain */
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_current_mx_operation_finish(
+		&cluster_current_mx_operation);
+#endif
 	return false;
 }
 
@@ -1857,6 +1917,9 @@ heap_get_latest_tid(TableScanDesc sscan,
 	Snapshot	snapshot = sscan->rs_snapshot;
 	ItemPointerData ctid;
 	TransactionId priorXmax;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
+#endif
 
 	/*
 	 * table_tuple_get_latest_tid() verified that the passed in tid is valid.
@@ -1934,6 +1997,8 @@ cluster_latest_tid_recheck:
 			if (!cluster_current_mx_successor_key_matches(
 					buffer, &tp, &cluster_expected_successor))
 				cluster_current_mx_failclosed(
+					&cluster_current_mx_operation,
+					CCMH_FAIL_ABA_FENCE,
 					"the latest-TID successor no longer matches its full-key proof");
 			memset(&cluster_expected_successor, 0,
 				   sizeof(cluster_expected_successor));
@@ -2001,7 +2066,8 @@ cluster_latest_tid_recheck:
 			}
 			if (!cluster_current_mx_hot_updater_for_chain(
 					relation, buffer, &tp, &priorXmax, &restart,
-					&cluster_expected_successor))
+					&cluster_expected_successor,
+					&cluster_current_mx_operation))
 			{
 				Assert(restart);
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -2026,6 +2092,10 @@ cluster_latest_tid_recheck:
 		ctid = tp.t_data->t_ctid;
 		UnlockReleaseBuffer(buffer);
 	}							/* end of loop */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_current_mx_operation_finish(
+		&cluster_current_mx_operation);
+#endif
 }
 
 
@@ -3263,16 +3333,10 @@ cluster_writer_chain_probe_new_version(Relation relation, Buffer oldbuf,
  * return holds the original buffer EXCLUSIVE again.  A complete tuple,
  * page-ITL, and PCM ownership fingerprint closes each unlocked window.
  */
-typedef struct ClusterCurrentMxHeapFingerprint
-{
-	ClusterPcmOwnSnapshot pcm;
-	XLogRecPtr	page_lsn;
-	ItemPointerData tid;
-	ItemIdData	line_pointer;
-	uint16		tuple_len;
-	uint8		tuple_header[SizeofHeapTupleHeader];
-	ClusterItlSlotData itl_slots[CLUSTER_ITL_INITRANS_DEFAULT];
-} ClusterCurrentMxHeapFingerprint;
+static uint64 cluster_current_mx_next_operation_id;
+static bool cluster_current_mx_capture_equal(
+	const ClusterCurrentMxHeapFingerprint *left,
+	const ClusterCurrentMxHeapFingerprint *right);
 
 typedef enum ClusterCurrentMxHeapDisposition
 {
@@ -3297,6 +3361,156 @@ typedef enum ClusterCurrentMxStampKind
 	CCMH_STAMP_TEMP_LOCK,
 	CCMH_STAMP_SURVIVORS
 } ClusterCurrentMxStampKind;
+
+static void
+cluster_current_mx_operation_init(ClusterCurrentMxOperationState *operation)
+{
+	Assert(operation != NULL);
+	memset(operation, 0, sizeof(*operation));
+	cluster_current_mx_next_operation_id++;
+	if (cluster_current_mx_next_operation_id == 0)
+		cluster_current_mx_next_operation_id++;
+	operation->operation_id = cluster_current_mx_next_operation_id;
+}
+
+static void
+cluster_current_mx_operation_activate(ClusterCurrentMxOperationState *operation)
+{
+	Assert(operation != NULL);
+	if (operation->finished || operation->operation_id == 0)
+		cluster_current_mx_operation_init(operation);
+	operation->active = true;
+}
+
+static void
+cluster_current_mx_memo_purge(ClusterCurrentMxOperationState *operation)
+{
+	if (operation != NULL)
+		memset(&operation->memo, 0, sizeof(operation->memo));
+}
+
+static void
+cluster_current_mx_operation_restart(ClusterCurrentMxOperationState *operation)
+{
+	cluster_current_mx_operation_activate(operation);
+	if (operation->restarts < UINT32_MAX)
+		operation->restarts++;
+}
+
+static void
+cluster_current_mx_operation_finish(ClusterCurrentMxOperationState *operation)
+{
+	if (operation == NULL || !operation->active || operation->finished)
+		return;
+	cluster_multixact_current_stats_record_restarts(operation->restarts);
+	cluster_current_mx_memo_purge(operation);
+	operation->active = false;
+	operation->finished = true;
+}
+
+static bool
+cluster_current_mx_memo_lookup(
+	ClusterCurrentMxOperationState *operation,
+	const ClusterCurrentMxKey *key, MultiXactId raw_xmax,
+	const ClusterCurrentMxHeapFingerprint *fingerprint,
+	ClusterCurrentMxMemberDesc *members, uint16 members_cap,
+	uint16 *nmembers, uint32 *total_count)
+{
+	ClusterCurrentMxDescriptorMemo *memo;
+	uint64 descriptor_hash;
+	uint64 current_epoch;
+	int origin;
+
+	Assert(operation != NULL);
+	Assert(key != NULL);
+	Assert(fingerprint != NULL);
+	Assert(members != NULL);
+	Assert(nmembers != NULL);
+	Assert(total_count != NULL);
+
+	memo = &operation->memo;
+	if (!memo->valid)
+		return false;
+	if (memo->operation_id != operation->operation_id
+		|| memo->key.origin_node_id != key->origin_node_id
+		|| memo->key.multixact_id != key->multixact_id
+		|| memo->key.cluster_epoch != key->cluster_epoch
+		|| memo->raw_xmax != raw_xmax
+		|| !cluster_current_mx_capture_equal(&memo->fingerprint,
+											fingerprint)
+		|| memo->nmembers > members_cap) {
+		cluster_current_mx_memo_purge(operation);
+		return false;
+	}
+
+	current_epoch = cluster_epoch_get_current();
+	origin = cluster_mxid_origin_slot(key->multixact_id);
+	if (current_epoch > UINT32_MAX
+		|| key->cluster_epoch != (uint32) current_epoch
+		|| origin < 0 || origin != (int) key->origin_node_id
+		|| (origin == cluster_node_id
+			&& !cluster_mxid_is_mine(key->multixact_id))) {
+		cluster_current_mx_memo_purge(operation);
+		return false;
+	}
+
+	descriptor_hash = cluster_multixact_current_descriptor_hash(
+		key, memo->members, memo->nmembers);
+	if (descriptor_hash != memo->descriptor_hash
+		|| cluster_multixact_current_validate_descriptor(
+			   key, key->origin_node_id, key->cluster_epoch,
+			   memo->members, memo->nmembers, memo->total_count)
+			   != CMX_DESC_OK) {
+		cluster_current_mx_memo_purge(operation);
+		return false;
+	}
+
+	memcpy(members, memo->members,
+		   sizeof(*members) * memo->nmembers);
+	*nmembers = memo->nmembers;
+	*total_count = memo->total_count;
+	return true;
+}
+
+static bool
+cluster_current_mx_memo_store(
+	ClusterCurrentMxOperationState *operation,
+	const ClusterCurrentMxKey *key, MultiXactId raw_xmax,
+	const ClusterCurrentMxHeapFingerprint *fingerprint,
+	const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	uint32 total_count)
+{
+	ClusterCurrentMxDescriptorMemo *memo;
+	uint64 descriptor_hash;
+
+	Assert(operation != NULL);
+	Assert(key != NULL);
+	Assert(fingerprint != NULL);
+	Assert(members != NULL);
+
+	if (nmembers < 2 || nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS
+		|| total_count != nmembers
+		|| cluster_multixact_current_validate_descriptor(
+			   key, key->origin_node_id, key->cluster_epoch,
+			   members, nmembers, total_count) != CMX_DESC_OK)
+		return false;
+
+	cluster_current_mx_operation_activate(operation);
+	cluster_current_mx_memo_purge(operation);
+	memo = &operation->memo;
+	descriptor_hash = cluster_multixact_current_descriptor_hash(
+		key, members, nmembers);
+	memo->operation_id = operation->operation_id;
+	memo->key = *key;
+	memo->raw_xmax = raw_xmax;
+	memo->fingerprint = *fingerprint;
+	memo->descriptor_hash = descriptor_hash;
+	memo->total_count = total_count;
+	memo->nmembers = nmembers;
+	memcpy(memo->members, members, sizeof(*members) * nmembers);
+	memo->valid = true;
+	return true;
+}
 
 static bool
 cluster_current_mx_capture(Buffer buffer, HeapTuple tuple,
@@ -3405,14 +3619,61 @@ cluster_current_mx_successor_matches(
 }
 
 static void
-cluster_current_mx_failclosed(const char *detail)
+cluster_current_mx_failclosed(
+	ClusterCurrentMxOperationState *operation,
+	ClusterCurrentMxFailurePhase phase, const char *detail)
 {
-	cluster_multixact_current_stats_bump(CMX_STAT_RECOMPOSE_FAILCLOSED);
+	const char *phase_name;
+
+	cluster_current_mx_operation_finish(operation);
+	switch (phase)
+	{
+		case CCMH_FAIL_DESCRIBE:
+			phase_name = "DESCRIBE";
+			break;
+		case CCMH_FAIL_MEMBER_PROOF:
+			phase_name = "MEMBER_PROOF";
+			break;
+		case CCMH_FAIL_WAIT:
+			phase_name = "WAIT";
+			break;
+		case CCMH_FAIL_RECOMPOSE:
+			cluster_multixact_current_stats_bump(
+				CMX_STAT_RECOMPOSE_FAILCLOSED);
+			phase_name = "RECOMPOSE";
+			break;
+		case CCMH_FAIL_HOT_PROOF:
+			cluster_multixact_current_stats_bump(
+				CMX_STAT_HOT_PROOF_FAILCLOSED);
+			phase_name = "HOT_PROOF";
+			break;
+		case CCMH_FAIL_ABA_FENCE:
+			phase_name = "ABA_FENCE";
+			break;
+		default:
+			phase_name = "UNKNOWN";
+			break;
+	}
 	ereport(ERROR,
 			(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 			 errmsg("cross-node current MultiXact authority is not provable"),
-			 errdetail_internal("%s", detail),
+			 errdetail_internal("phase=%s; %s", phase_name, detail),
 			 errhint("Retry the transaction after the current row lockers finish.")));
+}
+
+pg_attribute_noreturn() static void
+cluster_current_mx_supported_limit(ClusterCurrentMxOperationState *operation,
+								   MultiXactId raw_mxid,
+								   uint32 member_count)
+{
+	cluster_current_mx_operation_finish(operation);
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cross-node current-DML does not support MultiXact with more than 256 members"),
+			 errdetail("MultiXact %u has %u members; PostgreSQL permits larger member sets, but this pgrac protocol version supports at most 256.",
+					   raw_mxid, member_count),
+			 errhint("Reduce concurrent row lockers or retry after lockers finish; upgrade when chunked member-list support is available.")));
+	pg_unreachable();
 }
 
 static bool
@@ -3512,7 +3773,8 @@ static bool
 cluster_current_mx_hot_updater_for_chain(
 	Relation relation, Buffer buffer, HeapTuple tuple,
 	TransactionId *updater_xid, bool *restart,
-	ClusterHeapSuccessorProof *successor_proof)
+	ClusterHeapSuccessorProof *successor_proof,
+	ClusterCurrentMxOperationState *operation)
 {
 	ClusterCurrentMxHeapFingerprint before;
 	ClusterCurrentMxHeapFingerprint live;
@@ -3540,6 +3802,7 @@ cluster_current_mx_hot_updater_for_chain(
 	Assert(tuple != NULL);
 	Assert(updater_xid != NULL);
 	Assert(restart != NULL);
+	Assert(operation != NULL);
 
 	*updater_xid = InvalidTransactionId;
 	*restart = false;
@@ -3549,9 +3812,14 @@ cluster_current_mx_hot_updater_for_chain(
 		|| HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_data->t_infomask)
 		|| ItemPointerEquals(&tuple->t_self, &tuple->t_data->t_ctid))
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_HOT_PROOF,
 			"the HOT chain root is not an updater-bearing current MultiXact");
+	cluster_current_mx_operation_activate(operation);
 	if (!cluster_current_mx_capture(buffer, tuple, &before))
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
 			"the HOT chain root has no stable PCM-X/ITL fingerprint");
 
 	raw_mxid = (MultiXactId) HeapTupleHeaderGetRawXmax(tuple->t_data);
@@ -3560,12 +3828,16 @@ cluster_current_mx_hot_updater_for_chain(
 	if (current_epoch > UINT32_MAX || mx_origin < 0
 		|| mx_origin >= CLUSTER_MAX_NODES)
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
 			"the HOT chain MultiXact origin or epoch is not derivable");
 	if (cluster_itl_find_multixact_origin_by_xmax(
 			BufferGetPage(buffer), raw_mxid, &marker_origin)
 		&& mx_origin == cluster_node_id
 		&& marker_origin != (uint16) mx_origin)
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
 			"the own-origin HOT chain marker disagrees with the striped MultiXact origin");
 
 	memset(&key, 0, sizeof(key));
@@ -3573,24 +3845,49 @@ cluster_current_mx_hot_updater_for_chain(
 	key.multixact_id = raw_mxid;
 	key.cluster_epoch = (uint32) current_epoch;
 
-	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-	describe_result = cluster_multixact_current_describe(
-		&key, members, lengthof(members), &nmembers, &reported_total);
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	if (!cluster_current_mx_capture(buffer, tuple, &live)
-		|| !cluster_current_mx_capture_equal(&before, &live))
+	if (!cluster_current_mx_memo_lookup(
+			operation, &key, raw_mxid, &before, members,
+			lengthof(members), &nmembers, &reported_total))
 	{
-		cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
-		*restart = true;
-		return false;
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		describe_result = cluster_multixact_current_describe(
+			&key, members, lengthof(members), &nmembers,
+			&reported_total);
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (!cluster_current_mx_capture(buffer, tuple, &live)
+			|| !cluster_current_mx_capture_equal(&before, &live))
+		{
+			cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
+			cluster_current_mx_operation_restart(operation);
+			*restart = true;
+			return false;
+		}
 	}
+	else
+		describe_result = CMX_DESC_OK;
+	if (describe_result == CMX_DESC_SUPPORTED_LIMIT)
+		cluster_current_mx_supported_limit(operation, raw_mxid,
+										  reported_total);
 	if (describe_result == CMX_DESC_TIMEOUT)
+	{
+		cluster_current_mx_operation_finish(operation);
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
 				 errmsg("timed out describing current MultiXact %u", raw_mxid)));
+	}
 	if (describe_result != CMX_DESC_OK || reported_total != nmembers)
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
 			"the HOT chain MultiXact descriptor was denied or incomplete");
+	if (!operation->memo.valid
+		&& !cluster_current_mx_memo_store(
+			operation, &key, raw_mxid, &before, members, nmembers,
+			reported_total))
+		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
+			"the HOT chain MultiXact descriptor could not be memoized");
 
 	for (i = 0; i < nmembers; i++)
 	{
@@ -3598,15 +3895,21 @@ cluster_current_mx_hot_updater_for_chain(
 			continue;
 		if (updater_ordinal >= 0)
 			cluster_current_mx_failclosed(
+				operation,
+				CCMH_FAIL_HOT_PROOF,
 				"the HOT chain descriptor contains more than one updater");
 		updater_ordinal = i;
 	}
 	if (updater_ordinal < 0)
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_HOT_PROOF,
 			"the HOT chain descriptor contains no updater");
 	updater_origin = cluster_xid_origin_slot(members[updater_ordinal].xid);
 	if (updater_origin < 0 || updater_origin >= CLUSTER_MAX_NODES)
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_HOT_PROOF,
 			"the HOT chain updater origin is not derivable");
 
 	memset(&challenge, 0, sizeof(challenge));
@@ -3616,8 +3919,9 @@ cluster_current_mx_hot_updater_for_chain(
 			relation, buffer, tuple, members[updater_ordinal].xid,
 			(uint16) updater_ordinal, &challenge, &candidate_before))
 	{
-		cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_FAILCLOSED);
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_HOT_PROOF,
 			"the HOT successor is not an exact same-page ITL/TT binding");
 	}
 
@@ -3634,21 +3938,29 @@ cluster_current_mx_hot_updater_for_chain(
 			buffer, relation, &candidate_tid, &candidate_before))
 	{
 		cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
+		cluster_current_mx_operation_restart(operation);
 		*restart = true;
 		return false;
 	}
+	if (resolve_result == CMX_RESOLVE_SUPPORTED_LIMIT)
+		cluster_current_mx_supported_limit(operation, raw_mxid,
+										  reported_total);
 	if (resolve_result == CMX_RESOLVE_TIMEOUT)
+	{
+		cluster_current_mx_operation_finish(operation);
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
 				 errmsg("timed out resolving current MultiXact %u members",
 						raw_mxid)));
+	}
 	if (resolve_result != CMX_RESOLVE_OK
 		|| !cluster_multixact_current_validate_updater_proof(
 			&key, members, proofs, nmembers, &challenge, &updater_proof,
 			(uint16) updater_origin))
 	{
-		cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_FAILCLOSED);
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_HOT_PROOF,
 			"the full-key HOT updater proof was denied or incomplete");
 	}
 
@@ -3658,6 +3970,7 @@ cluster_current_mx_hot_updater_for_chain(
 			successor_proof, &candidate_tid, *updater_xid,
 			&challenge.candidate_next_xmin_key);
 	cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_HIT);
+	cluster_current_mx_operation_finish(operation);
 	return true;
 }
 
@@ -3671,7 +3984,8 @@ cluster_current_mx_hot_updater_for_chain(
 static ClusterCurrentMxHeapDisposition
 cluster_current_mx_compose_remote_single(
 	Buffer buffer, HeapTuple tuple, TransactionId requester_xid,
-	LockTupleMode lock_mode, ClusterCurrentMxHeapResult *heap_result)
+	LockTupleMode lock_mode, ClusterCurrentMxHeapResult *heap_result,
+	ClusterCurrentMxOperationState *operation)
 {
 	ClusterCurrentMxHeapFingerprint before;
 	ClusterCurrentMxHeapFingerprint live;
@@ -3691,7 +4005,8 @@ cluster_current_mx_compose_remote_single(
 	memset(heap_result, 0, sizeof(*heap_result));
 	heap_result->result = TM_BeingModified;
 	infomask = tuple->t_data->t_infomask;
-	if (!cluster_peer_mode_enabled() || (infomask & HEAP_XMAX_IS_MULTI)
+	if (!cluster_peer_mode_enabled() || !cluster_multixact_current_dml
+		|| (infomask & HEAP_XMAX_IS_MULTI)
 		|| !HEAP_XMAX_IS_LOCKED_ONLY(infomask))
 		return CCMH_NOT_APPLICABLE;
 	old_xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
@@ -3704,11 +4019,14 @@ cluster_current_mx_compose_remote_single(
 		|| ref.tt_slot_id == 0 || ref.local_xid != old_xmax
 		|| ref.origin_node_id == (uint16) cluster_node_id)
 		return CCMH_NOT_APPLICABLE;
+	cluster_current_mx_operation_activate(operation);
 	if (current_epoch > UINT32_MAX
 		|| ref.cluster_epoch != (uint32) current_epoch
 		|| old_origin < 0 || old_origin >= CLUSTER_MAX_NODES
 		|| ref.origin_node_id != (uint16) old_origin)
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_RECOMPOSE,
 			"the remote single locker full TT key is stale or underivable");
 
 	if (HEAP_XMAX_IS_KEYSHR_LOCKED(infomask))
@@ -3721,6 +4039,8 @@ cluster_current_mx_compose_remote_single(
 			: MultiXactStatusForNoKeyUpdate;
 	else {
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_RECOMPOSE,
 			"the remote single locker has no valid lock strength");
 		return CCMH_NOT_APPLICABLE;
 	}
@@ -3730,6 +4050,8 @@ cluster_current_mx_compose_remote_single(
 		return CCMH_NOT_APPLICABLE;
 	if (!cluster_current_mx_capture(buffer, tuple, &before))
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_RECOMPOSE,
 			"the remote single locker has no stable PCM-X/ITL fingerprint");
 
 	memset(&key, 0, sizeof(key));
@@ -3744,6 +4066,7 @@ cluster_current_mx_compose_remote_single(
 	if (!cluster_current_mx_capture(buffer, tuple, &live)
 		|| !cluster_current_mx_capture_equal(&before, &live)) {
 		cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
+		cluster_current_mx_operation_restart(operation);
 		return CCMH_RESTART;
 	}
 	if (status_found && status_result.authoritative
@@ -3751,6 +4074,7 @@ cluster_current_mx_compose_remote_single(
 			|| status_result.status == CLUSTER_TT_STATUS_ABORTED
 			|| status_result.status == CLUSTER_TT_STATUS_CLEANED_OUT)) {
 		cluster_heap_stamp_released_xmax_invalid(tuple->t_data, buffer);
+		cluster_current_mx_operation_restart(operation);
 		return CCMH_RESTART;
 	}
 
@@ -3766,7 +4090,7 @@ cluster_current_mx_compose_remote_single(
 	heap_result->normalized[1].status = requester_status;
 	heap_result->normalized_count = 2;
 	heap_result->result = TM_Ok;
-	cluster_multixact_current_stats_bump(CMX_STAT_RECOMPOSE_SUCCESS);
+	cluster_current_mx_operation_finish(operation);
 	return CCMH_DECIDED;
 }
 
@@ -3777,7 +4101,8 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 							 LockTupleMode lock_mode, bool is_update,
 							 LockWaitPolicy wait_policy, bool wait_for_conflict,
 							 bool follow_updates,
-							 ClusterCurrentMxHeapResult *heap_result)
+							 ClusterCurrentMxHeapResult *heap_result,
+							 ClusterCurrentMxOperationState *operation)
 {
 	ClusterCurrentMxHeapFingerprint before;
 	ClusterCurrentMxHeapFingerprint live;
@@ -3811,16 +4136,23 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 		|| !(tuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI)
 		|| (tuple->t_data->t_infomask & (HEAP_XMAX_INVALID | HEAP_XMAX_COMMITTED)))
 		return CCMH_NOT_APPLICABLE;
+	cluster_current_mx_operation_activate(operation);
 	if (!TransactionIdIsNormal(requester_xid)
 		|| !cluster_current_mx_capture(buffer, tuple, &before))
-		cluster_current_mx_failclosed("the old tuple has no stable PCM-X/ITL fingerprint");
+		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
+			"the old tuple has no stable PCM-X/ITL fingerprint");
 
 	raw_mxid = (MultiXactId) HeapTupleHeaderGetRawXmax(tuple->t_data);
 	current_epoch = cluster_epoch_get_current();
 	mx_origin = cluster_mxid_origin_slot(raw_mxid);
 	if (current_epoch > UINT32_MAX || mx_origin < 0
 		|| mx_origin >= CLUSTER_MAX_NODES)
-		cluster_current_mx_failclosed("the current MultiXact origin or epoch is not derivable");
+		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
+			"the current MultiXact origin or epoch is not derivable");
 	/*
 	 * The legacy page marker persists only the raw MultiXactId; its reader
 	 * currently reports cluster_node_id rather than an encoded origin.  It
@@ -3835,6 +4167,8 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 		&& mx_origin == cluster_node_id
 		&& marker_origin != (uint16) mx_origin)
 		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
 			"the own-origin page marker disagrees with the striped MultiXact origin");
 
 	memset(&key, 0, sizeof(key));
@@ -3842,26 +4176,56 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 	key.multixact_id = raw_mxid;
 	key.cluster_epoch = (uint32) current_epoch;
 
-	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-	describe_result = cluster_multixact_current_describe(
-		&key, members, lengthof(members), &nmembers, &reported_total);
-	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	if (!cluster_current_mx_capture(buffer, tuple, &live)
-		|| !cluster_current_mx_capture_equal(&before, &live)) {
-		cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
-		return CCMH_RESTART;
+	if (!cluster_current_mx_memo_lookup(
+			operation, &key, raw_mxid, &before, members,
+			lengthof(members), &nmembers, &reported_total))
+	{
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		describe_result = cluster_multixact_current_describe(
+			&key, members, lengthof(members), &nmembers,
+			&reported_total);
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (!cluster_current_mx_capture(buffer, tuple, &live)
+			|| !cluster_current_mx_capture_equal(&before, &live))
+		{
+			cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
+			cluster_current_mx_operation_restart(operation);
+			return CCMH_RESTART;
+		}
 	}
+	else
+		describe_result = CMX_DESC_OK;
+	if (describe_result == CMX_DESC_SUPPORTED_LIMIT)
+		cluster_current_mx_supported_limit(operation, raw_mxid,
+										  reported_total);
 	if (describe_result == CMX_DESC_TIMEOUT)
+	{
+		cluster_current_mx_operation_finish(operation);
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
 				 errmsg("timed out describing current MultiXact %u", raw_mxid)));
+	}
 	if (describe_result != CMX_DESC_OK || reported_total != nmembers)
-		cluster_current_mx_failclosed("the immutable MultiXact descriptor was denied or incomplete");
+		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
+			"the immutable MultiXact descriptor was denied or incomplete");
+	if (!operation->memo.valid
+		&& !cluster_current_mx_memo_store(
+			operation, &key, raw_mxid, &before, members, nmembers,
+			reported_total))
+		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_DESCRIBE,
+			"the immutable MultiXact descriptor could not be memoized");
 
 	for (i = 0; i < nmembers; i++)
 		if (ISUPDATE_from_mxstatus(members[i].member_status)) {
 			if (updater_ordinal >= 0)
-				cluster_current_mx_failclosed("the descriptor contains more than one updater");
+				cluster_current_mx_failclosed(
+					operation,
+					CCMH_FAIL_DESCRIBE,
+					"the descriptor contains more than one updater");
 			updater_ordinal = i;
 			heap_result->authoritative_updater = members[i].xid;
 		}
@@ -3874,8 +4238,9 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 		if (!cluster_current_mx_build_hot_challenge(
 				relation, buffer, tuple, members[updater_ordinal].xid,
 				(uint16) updater_ordinal, &challenge, &candidate_before)) {
-			cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_FAILCLOSED);
 			cluster_current_mx_failclosed(
+				operation,
+				CCMH_FAIL_HOT_PROOF,
 				"the updater successor is not an exact same-page ITL/TT binding");
 		}
 		have_challenge = true;
@@ -3894,14 +4259,24 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			&& !cluster_current_mx_hot_capture_still_exact(
 				buffer, relation, &candidate_tid, &candidate_before))) {
 		cluster_multixact_current_stats_bump(CMX_STAT_ABA_RESTART);
+		cluster_current_mx_operation_restart(operation);
 		return CCMH_RESTART;
 	}
+	if (resolve_result == CMX_RESOLVE_SUPPORTED_LIMIT)
+		cluster_current_mx_supported_limit(operation, raw_mxid,
+										  reported_total);
 	if (resolve_result == CMX_RESOLVE_TIMEOUT)
+	{
+		cluster_current_mx_operation_finish(operation);
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
 				 errmsg("timed out resolving current MultiXact %u members", raw_mxid)));
+	}
 	if (resolve_result != CMX_RESOLVE_OK)
-		cluster_current_mx_failclosed("the current member proof set was denied or incomplete");
+		cluster_current_mx_failclosed(
+			operation,
+			CCMH_FAIL_MEMBER_PROOF,
+			"the current member proof set was denied or incomplete");
 
 	memset(&ctx, 0, sizeof(ctx));
 	ctx.mxkey = key;
@@ -3947,24 +4322,38 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 				members, proofs, nmembers, requester_xid, ctx.desired_status,
 				heap_result->normalized, lengthof(heap_result->normalized),
 				&heap_result->normalized_count);
+			if (recompose_result == CMX_RECOMPOSE_SUPPORTED_LIMIT) {
+				cluster_multixact_current_stats_bump(
+					CMX_STAT_RECOMPOSE_FAILCLOSED);
+				cluster_current_mx_supported_limit(
+					operation, raw_mxid, (uint32) nmembers + 1);
+			}
 			if (recompose_result != CMX_RECOMPOSE_OK)
 				cluster_current_mx_failclosed(
+					operation,
+					CCMH_FAIL_RECOMPOSE,
 					"the authority-proven member set could not be normalized");
 			heap_result->result = TM_Ok;
+			cluster_current_mx_operation_finish(operation);
 			return CCMH_DECIDED;
 		case CMDL_INVISIBLE:
 			heap_result->result = TM_Invisible;
+			cluster_current_mx_operation_finish(operation);
 			return CCMH_DECIDED;
 		case CMDL_SELF_MODIFIED:
 			heap_result->result = TM_SelfModified;
+			cluster_current_mx_operation_finish(operation);
 			return CCMH_DECIDED;
 		case CMDL_BEING_MODIFIED:
 			heap_result->result = TM_BeingModified;
+			cluster_current_mx_operation_finish(operation);
 			return CCMH_DECIDED;
 		case CMDL_WOULD_BLOCK:
 			heap_result->result = TM_WouldBlock;
+			cluster_current_mx_operation_finish(operation);
 			return CCMH_DECIDED;
 		case CMDL_LOCK_NOT_AVAILABLE:
+			cluster_current_mx_operation_finish(operation);
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 					 errmsg("could not obtain lock on row in relation \"%s\"",
@@ -3979,9 +4368,11 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 				cluster_multixact_current_stats_bump(CMX_STAT_HOT_PROOF_HIT);
 			}
 			heap_result->result = TM_Updated;
+			cluster_current_mx_operation_finish(operation);
 			return CCMH_DECIDED;
 		case CMDL_DELETED:
 			heap_result->result = TM_Deleted;
+			cluster_current_mx_operation_finish(operation);
 			return CCMH_DECIDED;
 		case CMDL_FOLLOW_UPDATED:
 			Assert(have_challenge);
@@ -3989,8 +4380,16 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 				members, proofs, nmembers, requester_xid, ctx.desired_status,
 				heap_result->normalized, lengthof(heap_result->normalized),
 				&heap_result->normalized_count);
+			if (recompose_result == CMX_RECOMPOSE_SUPPORTED_LIMIT) {
+				cluster_multixact_current_stats_bump(
+					CMX_STAT_RECOMPOSE_FAILCLOSED);
+				cluster_current_mx_supported_limit(
+					operation, raw_mxid, (uint32) nmembers + 1);
+			}
 			if (recompose_result != CMX_RECOMPOSE_OK)
 				cluster_current_mx_failclosed(
+					operation,
+					CCMH_FAIL_RECOMPOSE,
 					"the active updater member set could not be normalized");
 			cluster_current_mx_set_successor_proof(
 				&heap_result->successor_proof, &candidate_tid,
@@ -4006,31 +4405,44 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 
 			cluster_multixact_current_stats_bump(CMX_STAT_WAIT);
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-			txw = cluster_tx_enqueue_wait(&wait_key, cluster_ges_request_timeout_ms);
+			PG_TRY();
+			{
+				txw = cluster_tx_enqueue_wait_current_mx(
+					&wait_key, cluster_ges_request_timeout_ms);
+			}
+			PG_CATCH();
+			{
+				cluster_multixact_current_stats_bump(
+					CMX_STAT_WAIT_INTERRUPTED);
+				cluster_current_mx_operation_finish(operation);
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
 			switch (txw)
 			{
 				case CLUSTER_TXW_RESOLVED:
 					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RESOLVED);
-					cluster_multixact_current_stats_bump(CMX_STAT_WAKEUP);
 					break;
 				case CLUSTER_TXW_DEAD_HOLDER:
 					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_DEAD_HOLDER);
-					cluster_multixact_current_stats_bump(CMX_STAT_WAKEUP);
 					break;
 				case CLUSTER_TXW_RETRY:
 					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RETRY);
+					cluster_current_mx_operation_finish(operation);
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
 							 errmsg("current MultiXact wait crossed a PCM-X remaster")));
 					break;
 				case CLUSTER_TXW_TIMEOUT:
 					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_TIMEOUT);
+					cluster_current_mx_operation_finish(operation);
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
 							 errmsg("timed out waiting for a current MultiXact member")));
 					break;
 				case CLUSTER_TXW_DEADLOCK:
 					cluster_multixact_current_stats_bump(CMX_STAT_DEADLOCK_VICTIM);
+					cluster_current_mx_operation_finish(operation);
 					ereport(ERROR,
 							(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
 							 errmsg("deadlock detected"),
@@ -4038,10 +4450,14 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 					break;
 			}
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			cluster_current_mx_operation_restart(operation);
 			return CCMH_RESTART;
 		}
 		case CMDL_UNKNOWN:
-			cluster_current_mx_failclosed("the current-DML compositor returned UNKNOWN");
+			cluster_current_mx_failclosed(
+				operation,
+				CCMH_FAIL_RECOMPOSE,
+				"the current-DML compositor returned UNKNOWN");
 			break;
 	}
 
@@ -4107,6 +4523,7 @@ cluster_current_mx_make_stamp(const ClusterCurrentMxHeapResult *authority,
 	}
 
 	*xmax = MultiXactIdCreateFromCurrentMembers(count, members);
+	cluster_multixact_current_stats_bump(CMX_STAT_RECOMPOSE_SUCCESS);
 	GetMultiXactIdHintBits((MultiXactId) *xmax, infomask, infomask2);
 }
 
@@ -4579,6 +4996,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	UBA			cluster_itl_uba = InvalidUba_init;	/* spec-3.4b D5 real UBA */
 	TM_Result	cluster_writer_res = TM_Ok; /* spec-7.1a D0 chained result */
 	ClusterCurrentMxHeapResult cluster_current_mx;
+	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
 	bool		cluster_current_mx_handled = false;
 	bool		cluster_current_mx_recomposed = false;
 #endif
@@ -4640,6 +5058,11 @@ l1:
 	}
 
 	result = HeapTupleSatisfiesUpdate(&tp, cid, buffer);
+#ifdef USE_PGRAC_CLUSTER
+	if (result != TM_BeingModified || !wait)
+		cluster_current_mx_operation_finish(
+			&cluster_current_mx_operation);
+#endif
 
 	if (result == TM_Invisible)
 	{
@@ -4664,7 +5087,7 @@ l1:
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, buffer, &tp, xid, CCM_ACTION_DELETE,
 				LockTupleExclusive, true, LockWaitBlock, wait, true,
-				&cluster_current_mx);
+				&cluster_current_mx, &cluster_current_mx_operation);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l1;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -4675,6 +5098,8 @@ l1:
 				goto cluster_current_mx_delete_decided;
 			}
 		}
+		cluster_current_mx_operation_finish(
+			&cluster_current_mx_operation);
 
 		/*
 		 * spec-5.2 §3.2 (C4/D11): cross-node locker/writer handling.  A true
@@ -5370,6 +5795,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	UBA			cluster_itl_uba = InvalidUba_init;
 	TM_Result	cluster_writer_res = TM_Ok; /* spec-7.1a D0 chained result */
 	ClusterCurrentMxHeapResult cluster_current_mx;
+	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
 	bool		cluster_current_mx_handled = false;
 	bool		cluster_current_mx_recomposed = false;
 #endif
@@ -5565,6 +5991,11 @@ l2:
 	checked_lockers = false;
 	locker_remains = false;
 	result = HeapTupleSatisfiesUpdate(&oldtup, cid, buffer);
+#ifdef USE_PGRAC_CLUSTER
+	if (result != TM_BeingModified || !wait)
+		cluster_current_mx_operation_finish(
+			&cluster_current_mx_operation);
+#endif
 
 	/* see below about the "no wait" case */
 	Assert(result != TM_BeingModified || wait);
@@ -5606,7 +6037,7 @@ l2:
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, buffer, &oldtup, xid, CCM_ACTION_UPDATE,
 				*lockmode, true, LockWaitBlock, wait, true,
-				&cluster_current_mx);
+				&cluster_current_mx, &cluster_current_mx_operation);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l2;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -5622,6 +6053,8 @@ l2:
 				goto cluster_current_mx_update_decided;
 			}
 		}
+		cluster_current_mx_operation_finish(
+			&cluster_current_mx_operation);
 
 		/*
 		 * spec-5.2 §3.2 (C4/D11): cross-node locker/writer handling.  A true
@@ -7213,6 +7646,7 @@ heap_lock_tuple(Relation relation, HeapTuple tuple,
 	UBA			cluster_lock_uba = InvalidUba_init;
 	SCN			cluster_lock_write_scn = InvalidScn;
 	ClusterCurrentMxHeapResult cluster_current_mx;
+	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
 	bool		cluster_current_mx_handled = false;
 	bool		cluster_current_mx_recomposed = false;
 #endif
@@ -7251,6 +7685,8 @@ l3:
 		if (!cluster_current_mx_successor_matches(
 				*buffer, tuple, expected_successor))
 			cluster_current_mx_failclosed(
+				&cluster_current_mx_operation,
+				CCMH_FAIL_ABA_FENCE,
 				"the update-chain successor no longer matches its full-key proof");
 	}
 #endif
@@ -7259,6 +7695,12 @@ l3:
 	cluster_current_mx_recomposed = false;
 #endif
 	result = HeapTupleSatisfiesUpdate(tuple, cid, *buffer);
+#ifdef USE_PGRAC_CLUSTER
+	if (result != TM_BeingModified && result != TM_Updated
+		&& result != TM_Deleted)
+		cluster_current_mx_operation_finish(
+			&cluster_current_mx_operation);
+#endif
 
 	if (result == TM_Invisible)
 	{
@@ -7297,7 +7739,8 @@ l3:
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, *buffer, tuple, GetCurrentTransactionId(),
 				CCM_ACTION_LOCK, mode, false, wait_policy, true,
-				follow_updates, &cluster_current_mx);
+				follow_updates, &cluster_current_mx,
+				&cluster_current_mx_operation);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l3;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -7318,22 +7761,34 @@ l3:
 							HeapTupleHeaderGetRawXmax(tuple->t_data), xwait)
 						|| !ItemPointerEquals(&tuple->t_data->t_ctid,
 											  &t_ctid))
+					{
+						cluster_multixact_current_stats_bump(
+							CMX_STAT_ABA_RESTART);
+						cluster_current_mx_operation_restart(
+							&cluster_current_mx_operation);
 						goto l3;
+					}
 					if (follow_result != TM_Ok)
 					{
+						cluster_current_mx_operation_finish(
+							&cluster_current_mx_operation);
 						result = follow_result;
 						goto failed;
 					}
 				}
+				cluster_current_mx_operation_finish(
+					&cluster_current_mx_operation);
 				cluster_current_mx_handled = true;
 				cluster_current_mx_recomposed = cluster_current_mx.result == TM_Ok;
 				result = cluster_current_mx.result;
 				goto failed;
 			}
 
+			cluster_current_mx_operation_finish(
+				&cluster_current_mx_operation);
 			current_mx_disposition = cluster_current_mx_compose_remote_single(
 				*buffer, tuple, GetCurrentTransactionId(), mode,
-				&cluster_current_mx);
+				&cluster_current_mx, &cluster_current_mx_operation);
 			if (current_mx_disposition == CCMH_RESTART)
 				goto l3;
 			if (current_mx_disposition == CCMH_DECIDED)
@@ -7343,6 +7798,8 @@ l3:
 				result = TM_Ok;
 				goto failed;
 			}
+			cluster_current_mx_operation_finish(
+				&cluster_current_mx_operation);
 		}
 
 		/*
@@ -8449,8 +8906,10 @@ failed:
 			(void) cluster_itl_stamp_multixact_marker(*buffer, (MultiXactId) xid);
 			/*
 			 * Don't set cluster_did_lock_stamp:  no spec-3.4d single-xid
-			 * lock-only slot was allocated.  Marker is page-format hint
-			 * only;  V4 wire carries authoritative member list.
+			 * lock-only slot was allocated.  Marker is only a page-format
+			 * hint; the value-derived MXID origin plus on-demand
+			 * describe/member proof is authoritative, and V4 is an optional
+			 * all-local fast path.
 			 */
 		}
 		else
@@ -9282,6 +9741,8 @@ l4:
 			&& !cluster_current_mx_successor_matches(
 				buf, &mytup, &expected_successor))
 			cluster_current_mx_failclosed(
+				NULL,
+				CCMH_FAIL_ABA_FENCE,
 				"the recursively locked successor no longer matches its full-key proof");
 #endif
 
@@ -9351,6 +9812,8 @@ l4:
 			&& !(old_infomask & HEAP_XMAX_INVALID)
 			&& (old_infomask & HEAP_XMAX_IS_MULTI))
 			cluster_current_mx_failclosed(
+				NULL,
+				CCMH_FAIL_HOT_PROOF,
 				"a recursive update-chain hop carries an unproven current MultiXact");
 
 		/*
@@ -10123,6 +10586,9 @@ heap_inplace_lock(Relation relation,
 	HeapTupleData oldtup = *oldtup_ptr; /* minimize diff vs. heap_update() */
 	TM_Result	result;
 	bool		ret;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
+#endif
 
 #ifdef USE_ASSERT_CHECKING
 	if (RelationGetRelid(relation) == RelationRelationId)
@@ -10194,7 +10660,8 @@ heap_inplace_lock(Relation relation,
 			current_mx_disposition = cluster_current_mx_authorize(
 				relation, buffer, &oldtup, GetCurrentTransactionId(),
 				CCM_ACTION_LOCK, LockTupleNoKeyExclusive, false,
-				LockWaitBlock, true, false, &current_mx);
+				LockWaitBlock, true, false, &current_mx,
+				&cluster_current_mx_operation);
 			if (current_mx_disposition != CCMH_NOT_APPLICABLE)
 			{
 				ret = current_mx_disposition == CCMH_DECIDED
@@ -10204,9 +10671,13 @@ heap_inplace_lock(Relation relation,
 					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 					release_callback(arg);
 				}
+				cluster_current_mx_operation_finish(
+					&cluster_current_mx_operation);
 				goto cluster_current_mx_inplace_decided;
 			}
 		}
+		cluster_current_mx_operation_finish(
+			&cluster_current_mx_operation);
 #endif
 
 		if (infomask & HEAP_XMAX_IS_MULTI)
@@ -11634,6 +12105,9 @@ MultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask)
 							errhint("Multixact ids are node-local; retry after the origin is "
 									"derivable or the tuple version is pruned.")));
 		if (mx_origin != cluster_node_id)
+		{
+			cluster_multixact_current_stats_bump(
+				CMX_STAT_FOREIGN_SLRU_GUARD);
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
 					 errmsg("cannot decode foreign multixact %u against local member storage",
@@ -11642,6 +12116,7 @@ MultiXactIdGetUpdateXid(TransactionId xmax, uint16 t_infomask)
 							   (unsigned)xmax, mx_origin, cluster_node_id),
 					 errhint("Retry after the foreign updater multixact is pruned or its updater "
 							 "identity can be served by the origin.")));
+		}
 	}
 #endif
 

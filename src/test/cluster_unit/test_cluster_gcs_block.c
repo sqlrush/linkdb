@@ -301,6 +301,10 @@ UT_TEST(test_gcs_block_wait_events_distinct)
 	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH != (int)WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 	UT_ASSERT((int)WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT
 			  != (int)WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+	UT_ASSERT((int)WAIT_EVENT_GCS_MULTIXACT_STATS_WAIT
+			  != (int)WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT);
+	UT_ASSERT((int)WAIT_EVENT_GCS_MULTIXACT_STATS_WAIT
+			  != (int)WAIT_EVENT_GCS_MULTIXACT_MEMBER_PROOF_WAIT);
 	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH
 			  != (int)WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH);
 	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_CHECKSUM_FAIL != (int)WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH);
@@ -708,8 +712,8 @@ UT_TEST(test_forward_payload_undo_verdict_kinds_no_collision)
 
 /*
  * spec-3.6b current-DML MultiXact: reserved_0[6] is a closed request-kind
- * enum.  Values 6/7 extend the shipped 1..5 legend without allowing any
- * existing predicate to steal a current describe/member-proof request.
+ * enum.  Values 6/7/8 extend the shipped 1..5 legend without allowing any
+ * existing predicate to steal a current describe/member-proof/stats request.
  */
 UT_TEST(test_forward_payload_current_mx_kinds_no_collision)
 {
@@ -718,8 +722,9 @@ UT_TEST(test_forward_payload_current_mx_kinds_no_collision)
 
 	UT_ASSERT_EQ(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE, 6);
 	UT_ASSERT_EQ(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF, 7);
+	UT_ASSERT_EQ(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS, 8);
 
-	for (value = 0; value <= GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF; value++) {
+	for (value = 0; value <= GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS; value++) {
 		int matches;
 
 		memset(&fwd, 0, sizeof(fwd));
@@ -729,7 +734,8 @@ UT_TEST(test_forward_payload_current_mx_kinds_no_collision)
 				  + (GcsBlockForwardPayloadIsUndoMultiVerdictRequest(&fwd) ? 1 : 0)
 				  + (GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0)
 				  + (GcsBlockForwardPayloadIsCurrentMxDescribe(&fwd) ? 1 : 0)
-				  + (GcsBlockForwardPayloadIsCurrentMxMemberProof(&fwd) ? 1 : 0);
+				  + (GcsBlockForwardPayloadIsCurrentMxMemberProof(&fwd) ? 1 : 0)
+				  + (GcsBlockForwardPayloadIsCurrentMxStats(&fwd) ? 1 : 0);
 		UT_ASSERT_EQ(matches, value == 0 ? 0 : 1);
 	}
 
@@ -741,6 +747,12 @@ UT_TEST(test_forward_payload_current_mx_kinds_no_collision)
 	GcsBlockForwardPayloadSetCurrentMxMemberProof(&fwd);
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxDescribe(&fwd) ? 1 : 0, 0);
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxMemberProof(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxStats(&fwd) ? 1 : 0, 0);
+
+	GcsBlockForwardPayloadSetCurrentMxStats(&fwd);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxDescribe(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxMemberProof(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxStats(&fwd) ? 1 : 0, 1);
 }
 
 
@@ -3434,8 +3446,13 @@ UT_TEST(test_pcm_x_requester_fetch_revalidates_queue_and_reservation_before_inst
 	UT_ASSERT_NOT_NULL(reply_handler);
 	if (reply_handler != NULL) {
 		UT_ASSERT_NOT_NULL(
-			strstr(reply_handler, "env->source_node_id != (uint32)hdr->sender_node"));
-		UT_ASSERT_NOT_NULL(strstr(reply_handler, "env->dest_node_id != (uint32)cluster_node_id"));
+			strstr(reply_handler,
+				   "transport_source_valid = env->source_node_id == (uint32)hdr->sender_node"));
+		UT_ASSERT_NOT_NULL(
+			strstr(reply_handler,
+				   "env->dest_node_id == (uint32)cluster_node_id"));
+		UT_ASSERT_NOT_NULL(
+			strstr(reply_handler, "if (!transport_source_valid || !authorized"));
 	}
 	free(source);
 }
@@ -5870,10 +5887,13 @@ UT_TEST(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse)
 	const char *routing_copy;
 	const char *describe;
 	const char *proof;
+	const char *stats;
 	const char *v2_return;
 	const char *v1_length;
 	const char *legacy_parse;
-	const char *legacy_current_reject;
+	const char *legacy_describe_reject;
+	const char *legacy_proof_reject;
+	const char *legacy_stats_reject;
 
 	UT_ASSERT_NOT_NULL(source);
 	if (source == NULL)
@@ -5890,30 +5910,214 @@ UT_TEST(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse)
 	proof = describe != NULL
 				? strstr(describe, "cluster_gcs_current_mx_member_proof_serve_inline(")
 				: NULL;
-	v2_return = proof != NULL ? strstr(proof, "return;") : NULL;
+	stats = proof != NULL ? strstr(proof, "cluster_gcs_current_mx_stats_serve_inline(") : NULL;
+	v2_return = stats != NULL ? strstr(stats, "return;") : NULL;
 	v1_length
 		= v2_return != NULL ? strstr(v2_return, "sizeof(GcsBlockForwardPayload)") : NULL;
 	legacy_parse = v1_length != NULL ? strstr(v1_length, "fwd = (const GcsBlockForwardPayload *)")
 									 : NULL;
-	legacy_current_reject
+	legacy_describe_reject
 		= legacy_parse != NULL ? strstr(legacy_parse, "GcsBlockForwardPayloadIsCurrentMxDescribe")
 							  : NULL;
+	legacy_proof_reject
+		= legacy_describe_reject != NULL
+			  ? strstr(legacy_describe_reject, "GcsBlockForwardPayloadIsCurrentMxMemberProof")
+			  : NULL;
+	legacy_stats_reject
+		= legacy_proof_reject != NULL
+			  ? strstr(legacy_proof_reject, "GcsBlockForwardPayloadIsCurrentMxStats")
+			  : NULL;
 
 	UT_ASSERT_NOT_NULL(handler);
 	UT_ASSERT_NOT_NULL(v2_length);
 	UT_ASSERT_NOT_NULL(routing_copy);
 	UT_ASSERT_NOT_NULL(describe);
 	UT_ASSERT_NOT_NULL(proof);
+	UT_ASSERT_NOT_NULL(stats);
 	UT_ASSERT_NOT_NULL(v2_return);
 	UT_ASSERT_NOT_NULL(v1_length);
 	UT_ASSERT_NOT_NULL(legacy_parse);
-	UT_ASSERT_NOT_NULL(legacy_current_reject);
+	UT_ASSERT_NOT_NULL(legacy_describe_reject);
+	UT_ASSERT_NOT_NULL(legacy_proof_reject);
+	UT_ASSERT_NOT_NULL(legacy_stats_reject);
 	if (handler != NULL && v2_length != NULL && routing_copy != NULL && describe != NULL
-		&& proof != NULL && v2_return != NULL && v1_length != NULL && legacy_parse != NULL
-		&& legacy_current_reject != NULL)
+		&& proof != NULL && stats != NULL && v2_return != NULL && v1_length != NULL
+		&& legacy_parse != NULL && legacy_describe_reject != NULL
+		&& legacy_proof_reject != NULL && legacy_stats_reject != NULL)
 		UT_ASSERT(handler < v2_length && v2_length < routing_copy && routing_copy < describe
-				  && describe < proof && proof < v2_return && v2_return < v1_length
-				  && v1_length < legacy_parse && legacy_parse < legacy_current_reject);
+				  && describe < proof && proof < stats && stats < v2_return
+				  && v2_return < v1_length && v1_length < legacy_parse
+				  && legacy_parse < legacy_describe_reject
+				  && legacy_describe_reject < legacy_proof_reject
+				  && legacy_proof_reject < legacy_stats_reject);
+	free(source);
+}
+
+UT_TEST(test_current_mx_requests_are_capability_generation_bound)
+{
+	char *source = read_gcs_block_source();
+	const char *describe;
+	const char *proof;
+	const char *describe_cap;
+	const char *describe_enqueue;
+	const char *proof_cap;
+	const char *proof_enqueue;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	describe = strstr(source,
+					  "\ncluster_gcs_current_mx_describe_fetch_and_wait(");
+	proof = describe != NULL
+				? strstr(describe,
+						 "\ncluster_gcs_current_mx_member_proof_fetch_and_wait(")
+				: NULL;
+	describe_cap = describe != NULL
+					   ? strstr(describe,
+								"cluster_sf_peer_multixact_current_capability_generation(")
+					   : NULL;
+	describe_enqueue = describe_cap != NULL
+						   ? strstr(describe_cap,
+									"cluster_lms_outbound_enqueue_cap_bound(")
+						   : NULL;
+	proof_cap = proof != NULL
+					? strstr(proof,
+							 "cluster_sf_peer_multixact_current_capability_generation(")
+					: NULL;
+	proof_enqueue = proof_cap != NULL
+						? strstr(proof_cap,
+								 "cluster_lms_outbound_enqueue_cap_bound(")
+						: NULL;
+
+	UT_ASSERT_NOT_NULL(describe);
+	UT_ASSERT_NOT_NULL(proof);
+	UT_ASSERT_NOT_NULL(describe_cap);
+	UT_ASSERT_NOT_NULL(describe_enqueue);
+	UT_ASSERT_NOT_NULL(proof_cap);
+	UT_ASSERT_NOT_NULL(proof_enqueue);
+	UT_ASSERT_STR_CONTAINS(source, "PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1");
+	if (describe != NULL && describe_cap != NULL && describe_enqueue != NULL
+		&& proof != NULL && proof_cap != NULL && proof_enqueue != NULL)
+	{
+		UT_ASSERT(describe < describe_cap && describe_cap < describe_enqueue
+				  && describe_enqueue < proof);
+		UT_ASSERT(proof < proof_cap && proof_cap < proof_enqueue);
+	}
+	free(source);
+}
+
+UT_TEST(test_current_mx_spoofed_reply_is_counted_before_fail_closed_drop)
+{
+	char *source = read_gcs_block_source();
+	const char *handler;
+	const char *source_binding;
+	const char *slot_lookup;
+	const char *current_slot;
+	const char *invalid_branch;
+	const char *describe_counter;
+	const char *proof_counter;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+
+	handler = strstr(source, "\ncluster_gcs_handle_block_reply_envelope(");
+	source_binding
+		= handler != NULL
+			  ? strstr(handler, "transport_source_valid = env->source_node_id")
+			  : NULL;
+	slot_lookup = source_binding != NULL
+					  ? strstr(source_binding, "slot->in_use && slot->request_id")
+					  : NULL;
+	current_slot
+		= slot_lookup != NULL
+			  ? strstr(slot_lookup,
+					   "current_slot\n\t\t\t\t= slot->expected_reply_status")
+			  : NULL;
+	invalid_branch
+		= current_slot != NULL
+			  ? strstr(current_slot,
+					   "if (!transport_source_valid || !authorized")
+			  : NULL;
+	describe_counter
+		= invalid_branch != NULL
+			  ? strstr(invalid_branch, "CMX_STAT_DESCRIBE_INVALID_REPLY")
+			  : NULL;
+	proof_counter
+		= describe_counter != NULL
+			  ? strstr(describe_counter, "CMX_STAT_MEMBER_PROOF_INVALID_REPLY")
+			  : NULL;
+
+	UT_ASSERT_NOT_NULL(handler);
+	UT_ASSERT_NOT_NULL(source_binding);
+	UT_ASSERT_NOT_NULL(slot_lookup);
+	UT_ASSERT_NOT_NULL(current_slot);
+	UT_ASSERT_NOT_NULL(invalid_branch);
+	UT_ASSERT_NOT_NULL(describe_counter);
+	UT_ASSERT_NOT_NULL(proof_counter);
+	if (source_binding != NULL && slot_lookup != NULL && current_slot != NULL
+		&& invalid_branch != NULL && describe_counter != NULL
+		&& proof_counter != NULL)
+		UT_ASSERT(source_binding < slot_lookup && slot_lookup < current_slot
+				  && current_slot < invalid_branch
+				  && invalid_branch < describe_counter
+				  && describe_counter < proof_counter);
+	free(source);
+}
+
+UT_TEST(test_current_mx_global_stats_rpc_is_slot_and_capability_bound)
+{
+	char *source = read_gcs_block_source();
+	const char *fetch;
+	const char *capability;
+	const char *enqueue;
+	const char *wait;
+	const char *validate;
+	const char *forward_handler;
+	const char *dispatch;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+
+	fetch = strstr(source,
+				   "\ncluster_gcs_current_mx_stats_fetch_and_wait(");
+	capability
+		= fetch != NULL
+			  ? strstr(fetch,
+					   "cluster_sf_peer_multixact_current_capability_generation(")
+			  : NULL;
+	enqueue = capability != NULL
+				  ? strstr(capability,
+						   "cluster_lms_outbound_enqueue_cap_bound(")
+				  : NULL;
+	wait = enqueue != NULL
+			   ? strstr(enqueue, "WAIT_EVENT_GCS_MULTIXACT_STATS_WAIT")
+			   : NULL;
+	validate
+		= wait != NULL
+			  ? strstr(wait,
+					   "cluster_multixact_current_wire_validate_stats_reply(")
+			  : NULL;
+	forward_handler
+		= strstr(source, "\ncluster_gcs_handle_block_forward_envelope(");
+	dispatch
+		= forward_handler != NULL
+			  ? strstr(forward_handler,
+					   "cluster_gcs_current_mx_stats_serve_inline(")
+			  : NULL;
+
+	UT_ASSERT_NOT_NULL(fetch);
+	UT_ASSERT_NOT_NULL(capability);
+	UT_ASSERT_NOT_NULL(enqueue);
+	UT_ASSERT_NOT_NULL(wait);
+	UT_ASSERT_NOT_NULL(validate);
+	UT_ASSERT_NOT_NULL(forward_handler);
+	UT_ASSERT_NOT_NULL(dispatch);
+	if (fetch != NULL && capability != NULL && enqueue != NULL
+		&& wait != NULL && validate != NULL)
+		UT_ASSERT(fetch < capability && capability < enqueue
+				  && enqueue < wait && wait < validate);
 	free(source);
 }
 
@@ -5921,7 +6125,7 @@ UT_TEST(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse)
 int
 main(void)
 {
-	UT_PLAN(113);
+	UT_PLAN(116);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -6035,6 +6239,9 @@ main(void)
 	UT_RUN(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain);
 	UT_RUN(test_current_mx_reply_is_exact_before_first_reply_wins);
 	UT_RUN(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse);
+	UT_RUN(test_current_mx_requests_are_capability_generation_bound);
+	UT_RUN(test_current_mx_spoofed_reply_is_counted_before_fail_closed_drop);
+	UT_RUN(test_current_mx_global_stats_rpc_is_slot_and_capability_bound);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

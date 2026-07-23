@@ -7,7 +7,7 @@
 #    Stage 0.17 ships ONE global view: pg_stat_gcluster_wait_events,
 #    backed by the cluster_get_gcluster_wait_events SRF (OID 8899) and
 #    declared in src/backend/catalog/system_views.sql.  At 0.17 the
-#    SRF emits 51 rows for the local node only (node_id = the
+#    SRF originally emitted 51 rows for the local node only (node_id = the
 #    cluster.node_id GUC value, default -1); the (node_id, type, name)
 #    column shape is the stable contract from 0.17 onward and stays
 #    unchanged when Stage 6+ swaps the SRF body for a real cross-node
@@ -15,7 +15,7 @@
 #
 #    What this test verifies:
 #      - The global view exists and is queryable.
-#      - It returns exactly 125 rows (1 node x 125 cluster wait events).
+#      - It returns exactly 126 rows (1 node x 126 cluster wait events).
 #      - It exposes exactly 1 distinct node_id at 0.17 (placeholder).
 #      - The single node_id matches the cluster.node_id GUC.
 #      - Per-class row counts match docs/wait-events-design.md §2.1.
@@ -58,12 +58,12 @@ my $node_id = $node->safe_psql('postgres', 'SHOW cluster.node_id');
 
 
 # ----------
-# Total row count: 1 node x 121 events (spec-6.13 RDMA + spec-5.22b D2-6 undo-block waits).
+# Total row count: 1 node x 126 events.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'125',
-	'pg_stat_gcluster_wait_events returns 125 rows (including current-DML MultiXact waits; merge sum 118+3+2+2)');
+	'126',
+	'pg_stat_gcluster_wait_events returns 126 rows (including current-DML MultiXact waits; merge sum 118+3+3+2)');
 
 is($node->safe_psql(
 		'postgres',
@@ -96,7 +96,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 26,	# spec-3.6b: +describe and member-proof waits
+	'Cluster: PCM' => 27,	# spec-3.6b: +describe, member-proof, and stats waits
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait

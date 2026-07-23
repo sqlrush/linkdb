@@ -75,6 +75,14 @@ extern ClusterTxwResult cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder
 												int effective_timeout_ms);
 
 /*
+ * Current-DML MultiXact uses the same TX wait semantics and WFG integration,
+ * but marks its waiter slot so the exact matching SetLatch producer can feed
+ * the feature-local wakeup counter.
+ */
+extern ClusterTxwResult cluster_tx_enqueue_wait_current_mx(
+	const ClusterTTStatusKey *holder_key, int effective_timeout_ms);
+
+/*
  * cluster_txw_wake_waiters — wake every backend waiting on holder_key.
  *
  *   Called from the TT-status-hint apply path when a holder transaction's
