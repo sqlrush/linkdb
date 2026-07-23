@@ -128,6 +128,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 		'cluster.gcs_reply_timeout_ms = 5000',
 		'cluster.cssd_heartbeat_interval_ms = 2000',
 		'cluster.cssd_dead_deadband_factor = 10',
+		'cluster.online_join = on',
 		'cluster.xid_striping = on',
 	]);
 $pair->start_pair;
