@@ -35,10 +35,12 @@ sub wait_for
 
 	while (time() < $deadline)
 	{
-		return 1 if $predicate->();
+		my $matched = eval { $predicate->() };
+		return 1 if $matched;
 		usleep(200_000);
 	}
-	return $predicate->() ? 1 : 0;
+	my $matched = eval { $predicate->() };
+	return $matched ? 1 : 0;
 }
 
 
@@ -167,9 +169,9 @@ ok(wait_for(
 		20),
 	'derived-own mixed-member UPDATE rejudges and succeeds');
 
-$writer->quit;
-$remote_locker->quit;
-$local_locker->quit;
+eval { $writer->quit };
+eval { $remote_locker->quit };
+eval { $local_locker->quit };
 
 cmp_ok(state_int($node1, 'describe_local_count'), '>', 0,
 	'own immutable descriptor was read at its origin');

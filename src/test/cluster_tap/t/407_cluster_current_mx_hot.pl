@@ -35,10 +35,12 @@ sub wait_for
 
 	while (time() < $deadline)
 	{
-		return 1 if $predicate->();
+		my $matched = eval { $predicate->() };
+		return 1 if $matched;
 		usleep(200_000);
 	}
-	return $predicate->() ? 1 : 0;
+	my $matched = eval { $predicate->() };
+	return $matched ? 1 : 0;
 }
 
 
@@ -140,8 +142,10 @@ ok(wait_for(
 	'authoritative full-key HOT MATCH counter advanced');
 is(state_int($node1, 'hot_proof_failclosed_count'), 0,
 	'positive HOT path did not accept raw-only or unknown evidence');
-is($node1->safe_psql('postgres', 'SELECT v FROM cmxh_t WHERE id = 1'), '11',
-	'committed value is visible through the primary-key HOT search');
+my ($read_rc, $read_out, $read_err) =
+  $node1->psql('postgres', 'SELECT v FROM cmxh_t WHERE id = 1', timeout => 30);
+is($read_rc, 0, 'committed HOT successor remains readable');
+is($read_out, '11', 'committed value is visible through the HOT chain');
 
 $pair->stop_pair;
 done_testing();

@@ -47,10 +47,12 @@ sub wait_for
 
 	while (time() < $deadline)
 	{
-		return 1 if $predicate->();
+		my $matched = eval { $predicate->() };
+		return 1 if $matched;
 		usleep(200_000);
 	}
-	return $predicate->() ? 1 : 0;
+	my $matched = eval { $predicate->() };
+	return $matched ? 1 : 0;
 }
 
 
@@ -166,9 +168,9 @@ ok(wait_for(
 		sub { $node1->safe_psql('postgres', 'SELECT v FROM cmxf_t WHERE id = 1') eq '1' },
 		20),
 	'foreign lock-only MultiXact rejudges and UPDATE succeeds');
-$writer->quit;
-$locker1->quit;
-$locker2->quit;
+eval { $writer->quit };
+eval { $locker1->quit };
+eval { $locker2->quit };
 
 cmp_ok(state_int($node1, 'describe_remote_ask_count'), '>', 0,
 	'foreign descriptor RPC counter advanced');
