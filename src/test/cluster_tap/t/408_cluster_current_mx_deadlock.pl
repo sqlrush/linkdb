@@ -169,7 +169,13 @@ ok(mirrored_coincident_create(
 		$node0, $node1, 'cmxd_t',
 		'CREATE TABLE cmxd_t (id int, v int)'),
 	'L2 relation identity coincides') or BAIL_OUT('could not create a coincident relation');
-$node0->safe_psql('postgres', 'INSERT INTO cmxd_t VALUES (1, 0), (2, 0)');
+# Keep the two deadlock targets on distinct heap blocks.  Otherwise the second
+# initial row lock waits for page-X conversion before an ABBA graph can exist.
+$node0->safe_psql('postgres', 'INSERT INTO cmxd_t VALUES (1, 0)');
+$node0->safe_psql(
+	'postgres',
+	'INSERT INTO cmxd_t SELECT g, 0 FROM generate_series(100, 2100) AS g');
+$node0->safe_psql('postgres', 'INSERT INTO cmxd_t VALUES (2, 0)');
 $node0->safe_psql('postgres', 'CHECKPOINT');
 
 my $victims_before =
@@ -203,7 +209,9 @@ eval { $h1->quit };
 
 ok(wait_for(
 		sub {
-			my $sum = $node0->safe_psql('postgres', 'SELECT sum(v) FROM cmxd_t');
+			my $sum = $node0->safe_psql(
+				'postgres',
+				'SELECT sum(v) FROM cmxd_t WHERE id IN (1, 2)');
 			return $sum eq '1';
 		},
 		20),
