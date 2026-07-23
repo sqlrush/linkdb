@@ -157,6 +157,26 @@ cr_server_wake_lms(void)
 		SetLatch((Latch *)(uintptr_t)raw);
 }
 
+StaticAssertDecl(CLUSTER_LMS_CR_SLOTS == 4,
+				 "update the undo submit saturation diagnostic for a new slot count");
+
+static void
+cr_log_undo_submit_slots_busy(const GcsBlockForwardPayload *fwd, ClusterLmsCrSlotKind req_kind,
+							  uint32 segment_id, TransactionId xid, int32 undo_owner,
+							  const uint32 slot_states[CLUSTER_LMS_CR_SLOTS])
+{
+	ereport(LOG,
+			(errmsg_internal("cluster undo submit refused: all slots busy"),
+			 errdetail_internal("req_kind=%u xid=%u segment=%u owner=%d epoch=" UINT64_FORMAT
+							" requester_node=%d requester_backend=%d request_id=" UINT64_FORMAT
+							" slot_states=%u,%u,%u,%u",
+							(unsigned)req_kind, (unsigned)xid, (unsigned)segment_id, undo_owner,
+							fwd->epoch, fwd->original_requester_node, fwd->requester_backend_id,
+							fwd->request_id,
+							(unsigned)slot_states[0], (unsigned)slot_states[1],
+							(unsigned)slot_states[2], (unsigned)slot_states[3])));
+}
+
 /*
  * cluster_lms_cr_submit — CONTROL-plane park.  The caller (the GCS_BLOCK_
  * FORWARD handler running in LMON when the family is on the control plane)
@@ -214,6 +234,7 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 {
 	uint32 segment_id = 0;
 	uint32 block_no = 0;
+	uint32 slot_states[CLUSTER_LMS_CR_SLOTS];
 
 	if (CrServerShared == NULL || fwd == NULL)
 		return false;
@@ -226,8 +247,10 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING)) {
+			slot_states[i] = expected;
 			continue;
+		}
 
 		slot->tag = fwd->tag;
 		slot->read_scn = InvalidScn; /* no snapshot semantics on this kind */
@@ -252,6 +275,8 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 		return true;
 	}
 
+	cr_log_undo_submit_slots_busy(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_FETCH, segment_id,
+							  InvalidTransactionId, -1, slot_states);
 	return false; /* all slots busy — fail closed, requester retries/refuses */
 }
 
@@ -278,6 +303,7 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 	uint32 block_no = 0;
 	int32 wire_owner = -1;
 	uint64 carrier;
+	uint32 slot_states[CLUSTER_LMS_CR_SLOTS];
 
 	if (CrServerShared == NULL || fwd == NULL)
 		return false;
@@ -305,8 +331,10 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
 		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING)) {
+			slot_states[i] = expected;
 			continue;
+		}
 
 		slot->tag = fwd->tag;
 		slot->read_scn = InvalidScn; /* the carrier held the xid, not a snapshot */
@@ -332,6 +360,8 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 		return true;
 	}
 
+	cr_log_undo_submit_slots_busy(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT, segment_id,
+							  (TransactionId)carrier, wire_owner, slot_states);
 	return false; /* all slots busy — fail closed, requester retries/refuses */
 }
 
@@ -361,6 +391,7 @@ cluster_lms_undo_multi_verdict_submit(const GcsBlockForwardPayload *fwd)
 	uint32 segment_id = 0;
 	uint32 block_no = 0;
 	uint64 carrier;
+	uint32 slot_states[CLUSTER_LMS_CR_SLOTS];
 
 	if (CrServerShared == NULL || fwd == NULL)
 		return false;
@@ -380,8 +411,10 @@ cluster_lms_undo_multi_verdict_submit(const GcsBlockForwardPayload *fwd)
 		/* Reserve producer-only FILLING first (spec-7.1 integration review):
 		 * landing directly on PENDING would let the LMS drain acquire the
 		 * slot before the request fields below are written. */
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
+		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING)) {
+			slot_states[i] = expected;
 			continue;
+		}
 
 		slot->tag = fwd->tag;
 		slot->read_scn = InvalidScn; /* the carrier held the mxid, not a snapshot */
@@ -405,6 +438,8 @@ cluster_lms_undo_multi_verdict_submit(const GcsBlockForwardPayload *fwd)
 		return true;
 	}
 
+	cr_log_undo_submit_slots_busy(fwd, CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT, segment_id,
+							  (TransactionId)carrier, -1, slot_states);
 	return false; /* all slots busy — fail closed, requester retries/refuses */
 }
 
@@ -1021,10 +1056,27 @@ cr_serve_slot(ClusterLmsCrSlot *slot)
 			}
 			PG_CATCH();
 			{
+				ErrorData *edata;
+
 				/* Fail-closed serve; keep the worker/LMS alive. */
 				served = false;
 				MemoryContextSwitchTo(TopMemoryContext);
+				edata = CopyErrorData();
 				FlushErrorState();
+				ereport(LOG,
+						(errmsg_internal(
+							 "cluster undo serve caught error; keeping fail-closed DENIED"),
+						 errdetail_internal(
+							 "req_kind=%u xid=%u segment=%u owner=%d epoch=" UINT64_FORMAT
+							 " requester_node=%d requester_backend=%d request_id=" UINT64_FORMAT
+							 " sqlstate=%s message=%s",
+							 (unsigned)slot->req_kind, (unsigned)slot->undo_xid,
+							 (unsigned)slot->undo_segment_id, slot->undo_owner,
+							 slot->epoch, slot->requester_node, slot->requester_backend,
+							 slot->request_id,
+							 unpack_sql_state(edata->sqlerrcode),
+							 edata->message != NULL ? edata->message : "(no message)")));
+				FreeErrorData(edata);
 			}
 			PG_END_TRY();
 		}
