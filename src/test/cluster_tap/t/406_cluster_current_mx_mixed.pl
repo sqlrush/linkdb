@@ -155,7 +155,21 @@ my $local_locker = $node1->background_psql('postgres', on_error_die => 1);
 $remote_locker->query_safe('BEGIN');
 $remote_locker->query_safe('SELECT v FROM cmxm_t WHERE id = 1 FOR SHARE');
 $local_locker->query_safe('BEGIN');
-$local_locker->query_safe('SELECT v FROM cmxm_t WHERE id = 1 FOR SHARE');
+$local_locker->query_safe(q{SET LOCAL statement_timeout = '10s'});
+my $mixed_ready =
+  eval { $local_locker->query_safe('SELECT v FROM cmxm_t WHERE id = 1 FOR SHARE'); 1 };
+ok($mixed_ready, 'RED-M compatible remote member composes into a local MultiXact');
+if (!$mixed_ready)
+{
+	diag("mixed-member setup failed closed: $@");
+	eval { $remote_locker->query_safe('COMMIT') };
+	eval { $local_locker->query_safe('ROLLBACK') };
+	eval { $remote_locker->quit };
+	eval { $local_locker->quit };
+	$pair->stop_pair;
+	done_testing();
+	exit 0;
+}
 
 my $writer = $node1->background_psql('postgres', on_error_die => 1);
 start_blocking($writer, 'UPDATE cmxm_t SET v = v + 1 WHERE id = 1');

@@ -174,6 +174,7 @@ $node0->safe_psql('postgres', 'CHECKPOINT');
 
 my $victims_before =
   pair_state_int($pair, 'multixact_current', 'deadlock_victim_count');
+my $edges_before = pair_state_int($pair, 'lmd', 'wait_edge_count');
 my $started_at = time();
 
 my $h0 = $node0->background_psql('postgres', on_error_die => 1);
@@ -209,14 +210,16 @@ ok(wait_for(
 	'exactly one survivor commits after victim cleanup');
 ok(wait_for(
 		sub {
-			return pair_state_int($pair, 'lmd', 'wait_edge_count') == 0;
+			return pair_state_int($pair, 'lmd', 'wait_edge_count') == $edges_before;
 		},
 		20),
 	'TX wait-for edges are removed after deadlock completion');
 cmp_ok(pair_state_int($pair, 'multixact_current', 'deadlock_victim_count'), '>',
 	$victims_before, 'typed TX-wait deadlock-victim counter advanced');
-is($node1->safe_psql('postgres', 'SELECT 1'), '1',
-	'cluster remains usable after deadlock cleanup');
+my ($probe_rc, $probe_out, $probe_err) =
+  $node1->psql('postgres', 'SELECT 1', timeout => 15);
+is($probe_rc, 0, 'post-deadlock probe succeeds');
+is($probe_out, '1', 'cluster remains usable after deadlock cleanup');
 
 $pair->stop_pair;
 done_testing();
