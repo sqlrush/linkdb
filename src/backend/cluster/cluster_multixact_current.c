@@ -20,14 +20,18 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_mxid_stripe.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "storage/lock.h"
 #include "utils/elog.h"
+
+#define CLUSTER_CURRENT_MX_MAX_PARENT_CHAIN_DEPTH 1024
 
 
 static bool
@@ -60,11 +64,113 @@ tt_key_valid(const ClusterTTStatusKey *key, TransactionId xid, uint32 epoch, int
 {
 	if (key == NULL || key->origin_node_id >= CLUSTER_MAX_NODES || key->_reserved != 0
 		|| key->_reserved2 != 0 || key->undo_segment_id == 0 || key->tt_slot_id == 0
-		|| key->cluster_epoch != epoch || key->local_xid != xid)
+		|| key->cluster_epoch != epoch || !TransactionIdIsNormal(key->local_xid)
+		|| (TransactionIdIsValid(xid) && key->local_xid != xid))
 		return false;
 	if (expected_origin >= 0 && key->origin_node_id != (uint16)expected_origin)
 		return false;
 	return true;
+}
+
+static bool
+tt_key_valid_holder(const ClusterTTStatusKey *key, TransactionId member_xid,
+					uint32 epoch, int expected_origin)
+{
+	return tt_key_valid(key, InvalidTransactionId, epoch, expected_origin)
+		   && (key->local_xid == member_xid
+			   || TransactionIdPrecedes(key->local_xid, member_xid));
+}
+
+
+bool
+cluster_multixact_current_resolve_origin_member_proof(
+	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
+	uint16 member_origin_node, uint32 current_epoch, bool requester_self,
+	const ClusterTTStatusKey *initial_key, const ClusterTTStatusResult *initial_result,
+	ClusterCurrentMxExactLookupFn exact_lookup, void *exact_lookup_arg,
+	ClusterCurrentMemberProof *proof)
+{
+	ClusterTTStatusKey seen_keys[CLUSTER_CURRENT_MX_MAX_PARENT_CHAIN_DEPTH + 1];
+	ClusterTTStatusKey resolved_key;
+	ClusterTTStatusResult resolved_result;
+	uint16 followed_count = 0;
+	uint16 seen_count = 0;
+
+	if (proof != NULL) {
+		memset(proof, 0, sizeof(*proof));
+		proof->state = CCM_UNKNOWN;
+	}
+	if (proof == NULL || !TransactionIdIsNormal(member_xid)
+		|| member_status > MaxMultiXactStatus || member_origin_node >= CLUSTER_MAX_NODES
+		|| current_epoch == 0 || initial_key == NULL || initial_result == NULL
+		|| !initial_result->authoritative || initial_result->status_epoch != current_epoch
+		|| !tt_key_valid(initial_key, member_xid, current_epoch, member_origin_node))
+		return false;
+
+	resolved_key = *initial_key;
+	resolved_result = *initial_result;
+	seen_keys[seen_count++] = resolved_key;
+
+	while (resolved_result.status == CLUSTER_TT_STATUS_SUBCOMMITTED) {
+		ClusterTTStatusKey parent_key;
+		ClusterTTStatusResult parent_result;
+		uint16 i;
+
+		if (!resolved_result.has_parent_key || exact_lookup == NULL
+			|| cluster_subtrans_max_chain_depth <= 0
+			|| followed_count >= (uint16)Min(cluster_subtrans_max_chain_depth,
+											 CLUSTER_CURRENT_MX_MAX_PARENT_CHAIN_DEPTH)
+			|| seen_count >= lengthof(seen_keys))
+			goto unknown;
+		parent_key = resolved_result.parent_key;
+		if (!tt_key_valid(&parent_key, InvalidTransactionId, current_epoch,
+						  member_origin_node)
+			|| !TransactionIdPrecedes(parent_key.local_xid, resolved_key.local_xid))
+			goto unknown;
+		for (i = 0; i < seen_count; i++)
+			if (memcmp(&seen_keys[i], &parent_key, sizeof(parent_key)) == 0)
+				goto unknown;
+		memset(&parent_result, 0, sizeof(parent_result));
+		if (!exact_lookup(&parent_key, &parent_result, exact_lookup_arg)
+			|| !parent_result.authoritative || parent_result.status_epoch != current_epoch)
+			goto unknown;
+		seen_keys[seen_count++] = parent_key;
+		followed_count++;
+		resolved_key = parent_key;
+		resolved_result = parent_result;
+	}
+
+	proof->member_xid = member_xid;
+	proof->member_ordinal = member_ordinal;
+	proof->member_status = member_status;
+	switch (resolved_result.status) {
+	case CLUSTER_TT_STATUS_IN_PROGRESS:
+		if (resolved_result.has_parent_key || resolved_result.commit_scn != InvalidScn)
+			goto unknown;
+		proof->key = resolved_key;
+		proof->state = requester_self ? CCM_SELF : CCM_ACTIVE;
+		return true;
+	case CLUSTER_TT_STATUS_COMMITTED:
+	case CLUSTER_TT_STATUS_CLEANED_OUT:
+		if (resolved_result.has_parent_key || !SCN_VALID(resolved_result.commit_scn))
+			goto unknown;
+		proof->commit_scn = resolved_result.commit_scn;
+		proof->state = CCM_COMMITTED;
+		return true;
+	case CLUSTER_TT_STATUS_ABORTED:
+		if (resolved_result.has_parent_key || resolved_result.commit_scn != InvalidScn)
+			goto unknown;
+		proof->state = CCM_ABORTED;
+		return true;
+	case CLUSTER_TT_STATUS_UNKNOWN:
+	case CLUSTER_TT_STATUS_SUBCOMMITTED:
+		break;
+	}
+
+unknown:
+	memset(proof, 0, sizeof(*proof));
+	proof->state = CCM_UNKNOWN;
+	return false;
 }
 
 
@@ -204,7 +310,8 @@ proof_entry_semantic_valid(const ClusterCurrentMemberProof *proof,
 	case CCM_SELF:
 	case CCM_ACTIVE:
 		return proof->commit_scn == InvalidScn
-			   && tt_key_valid(&proof->key, proof->member_xid, epoch, expected_origin);
+			   && tt_key_valid_holder(&proof->key, proof->member_xid, epoch,
+									  expected_origin);
 
 	case CCM_COMMITTED:
 		return tt_key_is_zero(&proof->key) && SCN_VALID(proof->commit_scn);
@@ -229,6 +336,53 @@ proof_array_set_unknown(ClusterCurrentMemberProof *proofs, uint16 nmembers)
 	memset(proofs, 0, sizeof(*proofs) * nmembers);
 	for (i = 0; i < nmembers; i++)
 		proofs[i].state = CCM_UNKNOWN;
+}
+
+
+static bool
+current_mx_exact_lookup(const ClusterTTStatusKey *key, ClusterTTStatusResult *result,
+						void *arg)
+{
+	(void)arg;
+	return cluster_tt_status_lookup_exact(key, result);
+}
+
+
+ClusterUpdaterCandidateVerdict
+cluster_multixact_current_updater_candidate_verdict(
+	const ClusterTTStatusKey *candidate, TransactionId updater_xid,
+	uint16 updater_origin_node, uint32 current_epoch, ClusterTTStatusKey *current_binding,
+	ClusterTTStatusResult *current_result)
+{
+	ClusterTTCurrentKeyVerdict verdict;
+
+	if (current_binding != NULL)
+		memset(current_binding, 0, sizeof(*current_binding));
+	if (current_result != NULL) {
+		memset(current_result, 0, sizeof(*current_result));
+		current_result->status = CLUSTER_TT_STATUS_UNKNOWN;
+		current_result->commit_scn = InvalidScn;
+	}
+	if (candidate == NULL || current_binding == NULL || current_result == NULL
+		|| updater_origin_node >= CLUSTER_MAX_NODES || current_epoch == 0
+		|| cluster_node_id < 0 || updater_origin_node != (uint16)cluster_node_id
+		|| !tt_key_valid(candidate, updater_xid, current_epoch, updater_origin_node))
+		return CUCP_UNKNOWN;
+
+	verdict = cluster_tt_status_lookup_current_own_xid_candidate(
+		updater_xid, candidate, current_binding, current_result);
+	if (!current_result->authoritative || current_result->status_epoch != current_epoch)
+		return CUCP_UNKNOWN;
+
+	switch (verdict) {
+	case CLUSTER_TT_CURRENT_KEY_MATCH:
+		return CUCP_MATCH;
+	case CLUSTER_TT_CURRENT_KEY_MISMATCH:
+		return CUCP_MISMATCH;
+	case CLUSTER_TT_CURRENT_KEY_UNKNOWN:
+		break;
+	}
+	return CUCP_UNKNOWN;
 }
 
 
@@ -543,9 +697,12 @@ cluster_multixact_current_decide(const ClusterCurrentMxMemberDesc *members,
 
 		switch ((ClusterCurrentMemberState)proofs[i].state) {
 		case CCM_SELF:
-			if (proofs[i].member_xid != ctx->current_member_xid
-				&& proofs[i].member_xid != ctx->top_xid)
-				return CMDL_UNKNOWN;
+			/*
+			 * Native MultiXact semantics treat any xid in the current
+			 * transaction tree as self, including a previously subcommitted
+			 * child.  SELF is authenticated only by the local resolver;
+			 * remote proof ingress rejects it.
+			 */
 			if (ISUPDATE_from_mxstatus(members[i].member_status)
 				&& ctx->action != CCM_ACTION_HOT_FOLLOW)
 				self_result = ctx->tuple_cmax >= ctx->curcid ? CMDL_SELF_MODIFIED : CMDL_INVISIBLE;
@@ -688,10 +845,14 @@ cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
 										  ClusterCurrentMemberProof *proofs,
 										  ClusterCurrentUpdaterProof *updater_proof)
 {
-	(void)key;
-	(void)members;
-	(void)descriptor_hash;
-	(void)challenge;
+	ClusterCurrentMxProofRequestPlan plans[CLUSTER_CURRENT_MX_MAX_CHUNKS];
+	uint16 member_origins[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	bool seen[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	uint64 current_epoch;
+	uint16 plan_count = 0;
+	uint16 i;
+	ClusterMxResolveResult result;
+
 	if (updater_proof != NULL) {
 		memset(updater_proof, 0, sizeof(*updater_proof));
 		updater_proof->verdict = CUCP_UNKNOWN;
@@ -699,6 +860,148 @@ cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
 	if (nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS)
 		return CMX_RESOLVE_SUPPORTED_LIMIT;
 	proof_array_set_unknown(proofs, nmembers);
+	if (key == NULL || members == NULL || proofs == NULL || updater_proof == NULL || nmembers < 2
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return CMX_RESOLVE_UNKNOWN;
+
+	current_epoch = cluster_epoch_get_current();
+	if (current_epoch == 0 || current_epoch > UINT32_MAX
+		|| key->cluster_epoch != (uint32)current_epoch
+		|| descriptor_hash
+			   != cluster_multixact_current_descriptor_hash(key, members, nmembers))
+		return CMX_RESOLVE_UNKNOWN;
+	for (i = 0; i < nmembers; i++) {
+		int origin = cluster_xid_origin_slot(members[i].xid);
+
+		if (origin < 0 || origin >= CLUSTER_MAX_NODES)
+			return CMX_RESOLVE_UNKNOWN;
+		member_origins[i] = (uint16)origin;
+	}
+
+	result = cluster_multixact_current_wire_build_proof_requests(
+		key, members, member_origins, nmembers, descriptor_hash, challenge, UINT64CONST(1),
+		current_epoch, cluster_node_id, (int32)MyBackendId, plans, lengthof(plans), &plan_count);
+	if (result != CMX_RESOLVE_OK)
+		return result;
+
+	memset(seen, 0, sizeof(seen));
+	for (i = 0; i < plan_count; i++) {
+		ClusterCurrentMemberProof chunk_proofs[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+		ClusterCurrentUpdaterProof chunk_updater;
+		ClusterCurrentMxProofForwardV2 *request = &plans[i].request;
+		uint16 chunk_count = 0;
+		uint16 j;
+
+		memset(chunk_proofs, 0, sizeof(chunk_proofs));
+		memset(&chunk_updater, 0, sizeof(chunk_updater));
+		chunk_updater.verdict = CUCP_UNKNOWN;
+
+		if (plans[i].destination_node_id == (uint16)cluster_node_id) {
+			if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS) {
+				for (j = 0; j < request->prefix.entry_count; j++) {
+					const ClusterCurrentMxProofAskWire *ask
+						= &request->trailer.body.asks[j];
+					ClusterTTStatusKey initial_key;
+					ClusterTTStatusResult initial_result;
+
+					if (!cluster_tt_status_lookup_current_own_xid(
+							ask->xid, &initial_key, &initial_result)
+						|| !cluster_multixact_current_resolve_origin_member_proof(
+							ask->xid, ask->member_status, ask->member_ordinal,
+							(uint16)cluster_node_id, (uint32)current_epoch,
+							TransactionIdIsCurrentTransactionId(ask->xid), &initial_key,
+							&initial_result, current_mx_exact_lookup, NULL,
+							&chunk_proofs[j]))
+						goto unknown;
+				}
+				chunk_count = request->prefix.entry_count;
+			} else {
+				const ClusterCurrentMxUpdaterChallengeWire *wire_challenge
+					= &request->trailer.body.updater.challenge;
+				ClusterTTStatusKey initial_key;
+				ClusterTTStatusResult initial_result;
+				ClusterUpdaterCandidateVerdict candidate_verdict;
+
+				candidate_verdict = cluster_multixact_current_updater_candidate_verdict(
+					&wire_challenge->candidate_next_xmin_key,
+					wire_challenge->updater_xid, (uint16)cluster_node_id,
+					(uint32)current_epoch, &initial_key, &initial_result);
+				if (candidate_verdict == CUCP_UNKNOWN
+					|| !cluster_multixact_current_resolve_origin_member_proof(
+						wire_challenge->updater_xid, wire_challenge->member_status,
+						wire_challenge->member_ordinal, (uint16)cluster_node_id,
+						(uint32)current_epoch,
+						TransactionIdIsCurrentTransactionId(wire_challenge->updater_xid),
+						&initial_key, &initial_result, current_mx_exact_lookup, NULL,
+						&chunk_proofs[0]))
+					goto unknown;
+				chunk_count = 1;
+				chunk_updater.mxkey = request->prefix.mxkey;
+				chunk_updater.candidate_next_xmin_key
+					= wire_challenge->candidate_next_xmin_key;
+				chunk_updater.updater_xid = wire_challenge->updater_xid;
+				chunk_updater.member_ordinal = wire_challenge->member_ordinal;
+				chunk_updater.verdict = candidate_verdict;
+			}
+		} else {
+			result = cluster_gcs_current_mx_member_proof_fetch_and_wait(
+				plans[i].destination_node_id, request, chunk_proofs, lengthof(chunk_proofs),
+				&chunk_count, &chunk_updater);
+			if (result != CMX_RESOLVE_OK)
+				goto non_ok;
+		}
+
+		if (chunk_count != request->prefix.entry_count)
+			goto unknown;
+		for (j = 0; j < chunk_count; j++) {
+			uint16 ordinal = chunk_proofs[j].member_ordinal;
+
+			if (ordinal >= nmembers || seen[ordinal]
+				|| member_origins[ordinal] != plans[i].destination_node_id
+				|| !proof_entry_semantic_valid(
+					&chunk_proofs[j], &members[ordinal], ordinal, (uint32)current_epoch,
+					plans[i].destination_node_id)
+				|| chunk_proofs[j].state == CCM_UNKNOWN)
+				goto unknown;
+			seen[ordinal] = true;
+			proofs[ordinal] = chunk_proofs[j];
+		}
+
+		if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
+			const ClusterCurrentMxUpdaterChallengeWire *wire_challenge
+				= &request->trailer.body.updater.challenge;
+
+			if (!current_mx_key_equal(&chunk_updater.mxkey, key)
+				|| memcmp(&chunk_updater.candidate_next_xmin_key,
+						  &wire_challenge->candidate_next_xmin_key,
+						  sizeof(ClusterTTStatusKey))
+					   != 0
+				|| chunk_updater.updater_xid != wire_challenge->updater_xid
+				|| chunk_updater.member_ordinal != wire_challenge->member_ordinal
+				|| chunk_updater.verdict > CUCP_UNKNOWN || chunk_updater.reserved8 != 0
+				|| chunk_updater.verdict == CUCP_UNKNOWN)
+				goto unknown;
+			*updater_proof = chunk_updater;
+		}
+		if (cluster_epoch_get_current() != current_epoch)
+			goto unknown;
+	}
+
+	for (i = 0; i < nmembers; i++)
+		if (!seen[i])
+			goto unknown;
+	return CMX_RESOLVE_OK;
+
+non_ok:
+	proof_array_set_unknown(proofs, nmembers);
+	memset(updater_proof, 0, sizeof(*updater_proof));
+	updater_proof->verdict = CUCP_UNKNOWN;
+	return result;
+
+unknown:
+	proof_array_set_unknown(proofs, nmembers);
+	memset(updater_proof, 0, sizeof(*updater_proof));
+	updater_proof->verdict = CUCP_UNKNOWN;
 	return CMX_RESOLVE_UNKNOWN;
 }
 

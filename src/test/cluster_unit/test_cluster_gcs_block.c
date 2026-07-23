@@ -5784,6 +5784,7 @@ UT_TEST(test_current_mx_reply_is_exact_before_first_reply_wins)
 	const char *reserved_binding;
 	const char *checksum_binding;
 	const char *typed_validation;
+	const char *proof_typed_validation;
 	const char *slot_mutation;
 
 	UT_ASSERT_NOT_NULL(source);
@@ -5824,8 +5825,13 @@ UT_TEST(test_current_mx_reply_is_exact_before_first_reply_wins)
 			  ? strstr(checksum_binding,
 					   "cluster_multixact_current_wire_validate_describe_reply(")
 			  : NULL;
-	slot_mutation = typed_validation != NULL
-						? strstr(typed_validation, "slot->reply_header = *hdr")
+	proof_typed_validation
+		= typed_validation != NULL
+			  ? strstr(typed_validation,
+					   "cluster_multixact_current_wire_validate_proof_reply_frame(")
+			  : NULL;
+	slot_mutation = proof_typed_validation != NULL
+						? strstr(proof_typed_validation, "slot->reply_header = *hdr")
 						: NULL;
 
 	UT_ASSERT_NOT_NULL(handler);
@@ -5839,17 +5845,20 @@ UT_TEST(test_current_mx_reply_is_exact_before_first_reply_wins)
 	UT_ASSERT_NOT_NULL(reserved_binding);
 	UT_ASSERT_NOT_NULL(checksum_binding);
 	UT_ASSERT_NOT_NULL(typed_validation);
+	UT_ASSERT_NOT_NULL(proof_typed_validation);
 	UT_ASSERT_NOT_NULL(slot_mutation);
 	if (handler != NULL && slot_classifier != NULL && current_branch != NULL && exact_v1 != NULL
 		&& status_binding != NULL && source_binding != NULL && direct_binding != NULL
 		&& epoch_binding != NULL && reserved_binding != NULL && checksum_binding != NULL
-		&& typed_validation != NULL && slot_mutation != NULL)
+		&& typed_validation != NULL && proof_typed_validation != NULL && slot_mutation != NULL)
 		UT_ASSERT(handler < slot_classifier && slot_classifier < current_branch
 				  && current_branch < exact_v1
 				  && exact_v1 < status_binding && status_binding < source_binding
 				  && source_binding < direct_binding && direct_binding < epoch_binding
 				  && epoch_binding < reserved_binding && reserved_binding < checksum_binding
-				  && checksum_binding < typed_validation && typed_validation < slot_mutation);
+				  && checksum_binding < typed_validation
+				  && typed_validation < proof_typed_validation
+				  && proof_typed_validation < slot_mutation);
 	free(source);
 }
 
@@ -5860,6 +5869,7 @@ UT_TEST(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse)
 	const char *v2_length;
 	const char *routing_copy;
 	const char *describe;
+	const char *proof;
 	const char *v2_return;
 	const char *v1_length;
 	const char *legacy_parse;
@@ -5877,7 +5887,10 @@ UT_TEST(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse)
 	describe = routing_copy != NULL
 				   ? strstr(routing_copy, "cluster_gcs_current_mx_describe_serve_inline(")
 				   : NULL;
-	v2_return = describe != NULL ? strstr(describe, "return;") : NULL;
+	proof = describe != NULL
+				? strstr(describe, "cluster_gcs_current_mx_member_proof_serve_inline(")
+				: NULL;
+	v2_return = proof != NULL ? strstr(proof, "return;") : NULL;
 	v1_length
 		= v2_return != NULL ? strstr(v2_return, "sizeof(GcsBlockForwardPayload)") : NULL;
 	legacy_parse = v1_length != NULL ? strstr(v1_length, "fwd = (const GcsBlockForwardPayload *)")
@@ -5890,16 +5903,17 @@ UT_TEST(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse)
 	UT_ASSERT_NOT_NULL(v2_length);
 	UT_ASSERT_NOT_NULL(routing_copy);
 	UT_ASSERT_NOT_NULL(describe);
+	UT_ASSERT_NOT_NULL(proof);
 	UT_ASSERT_NOT_NULL(v2_return);
 	UT_ASSERT_NOT_NULL(v1_length);
 	UT_ASSERT_NOT_NULL(legacy_parse);
 	UT_ASSERT_NOT_NULL(legacy_current_reject);
 	if (handler != NULL && v2_length != NULL && routing_copy != NULL && describe != NULL
-		&& v2_return != NULL && v1_length != NULL && legacy_parse != NULL
+		&& proof != NULL && v2_return != NULL && v1_length != NULL && legacy_parse != NULL
 		&& legacy_current_reject != NULL)
 		UT_ASSERT(handler < v2_length && v2_length < routing_copy && routing_copy < describe
-				  && describe < v2_return && v2_return < v1_length && v1_length < legacy_parse
-				  && legacy_parse < legacy_current_reject);
+				  && describe < proof && proof < v2_return && v2_return < v1_length
+				  && v1_length < legacy_parse && legacy_parse < legacy_current_reject);
 	free(source);
 }
 

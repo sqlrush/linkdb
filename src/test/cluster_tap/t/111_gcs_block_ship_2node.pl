@@ -148,13 +148,13 @@ for my $we_name (
 
 
 # ============================================================
-# L5: total wait event count = 124.
+# L5: total wait event count = 125.
 # ============================================================
 is($pair->node0->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-   '124',
-   'L5 total cluster wait event count = 124 (including current-DML MultiXact describe wait)');
+   '125',
+   'L5 total cluster wait event count = 125 (including current-DML MultiXact waits)');
 
 
 # ============================================================

@@ -4,7 +4,7 @@
  *	  pgrac spec-3.1 D9 — cluster_unit static-contract tests for the
  *	  Undo TT status foundation (exact-key API + ITL reader contract).
  *
- *	  22 真 C 单测 enumeration (v0.4 M5):
+ *	  25 真 C 单测 enumeration (v0.4 M5):
  *
  *	    T1   sizeof(ClusterTTStatusKey) == 24 (v0.4 N9 explicit _reserved2)
  *	    T2   sizeof(ClusterUndoTTSlotRef) == 32 (v0.4 M4)
@@ -14,6 +14,9 @@
  *	    T6   CLUSTER_TT_STATUS_ABORTED == 3
  *	    T7   CLUSTER_TT_STATUS_CLEANED_OUT == 4
  *	    T8   public API: cluster_tt_status_lookup_exact prototype linkable
+ *	    T8b  restricted current-origin own-xid authority lookup linkable
+ *	    T8c  current-DML candidate authority is retained-exact only and
+ *	         SUBCOMMITTED synchronizes all current page-reference aliases
  *	    T9   public API: cluster_tt_status_install_local prototype linkable
  *	    T10  public API: cluster_tt_status_flush_all prototype linkable
  *	    T11  public API: cluster_tt_status_generation prototype linkable
@@ -31,8 +34,8 @@
  *	         conflict by value;  Cluster_TT_STATUS_* are wire enum,
  *	         TT_SLOT_* are on-disk slot status)
  *
- *	  No raw xid lookup path is exercised here (HC180 / L176 — by design,
- *	  no such API exists in spec-3.1).  Negative-grep assertions (no
+ *	  The own-xid lookup is restricted to current-epoch origin authority;
+ *	  it is not a general consumer fallback.  Negative-grep assertions (no
  *	  banned CLOG-overlay identifiers — see check-no-clog-overlay.sh for
  *	  the full banned list) live in scripts/ci/check-no-clog-overlay.sh
  *	  (D11);  not encoded as C unit tests (v0.4 N8).
@@ -82,6 +85,33 @@
 
 UT_DEFINE_GLOBALS();
 
+static char *
+read_tt_status_source(void)
+{
+	FILE *file;
+	long length;
+	char *source;
+
+	file = fopen(CLUSTER_TT_STATUS_SOURCE_PATH, "rb");
+	UT_ASSERT_NOT_NULL(file);
+	if (file == NULL)
+		return NULL;
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
+	length = ftell(file);
+	UT_ASSERT(length > 0);
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+	source = malloc((size_t)length + 1);
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) {
+		fclose(file);
+		return NULL;
+	}
+	UT_ASSERT_EQ(fread(source, 1, (size_t)length, file), (size_t)length);
+	source[length] = '\0';
+	fclose(file);
+	return source;
+}
+
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -106,6 +136,24 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key pg_attribute_unused
 							   ClusterTTStatusResult *result pg_attribute_unused())
 {
 	return false;
+}
+
+bool
+cluster_tt_status_lookup_current_own_xid(TransactionId xid pg_attribute_unused(),
+									 ClusterTTStatusKey *key pg_attribute_unused(),
+									 ClusterTTStatusResult *result pg_attribute_unused())
+{
+	return false;
+}
+
+ClusterTTCurrentKeyVerdict
+cluster_tt_status_lookup_current_own_xid_candidate(
+	TransactionId xid pg_attribute_unused(),
+	const ClusterTTStatusKey *candidate pg_attribute_unused(),
+	ClusterTTStatusKey *key pg_attribute_unused(),
+	ClusterTTStatusResult *result pg_attribute_unused())
+{
+	return CLUSTER_TT_CURRENT_KEY_UNKNOWN;
 }
 
 bool
@@ -228,6 +276,54 @@ UT_TEST(test_t7_enum_cleaned_out_four)
 UT_TEST(test_t8_lookup_exact_linkable)
 {
 	UT_ASSERT_NE((void *)cluster_tt_status_lookup_exact, NULL);
+}
+UT_TEST(test_t8b_lookup_current_own_xid_linkable)
+{
+	UT_ASSERT_NE((void *)cluster_tt_status_lookup_current_own_xid, NULL);
+	UT_ASSERT_NE((void *)cluster_tt_status_lookup_current_own_xid_candidate, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_CURRENT_KEY_MATCH, 0);
+	UT_ASSERT_EQ((int)CLUSTER_TT_CURRENT_KEY_MISMATCH, 1);
+	UT_ASSERT_EQ((int)CLUSTER_TT_CURRENT_KEY_UNKNOWN, 2);
+}
+UT_TEST(test_t8c_current_authority_is_retained_exact_and_subcommit_syncs_aliases)
+{
+	char *source = read_tt_status_source();
+	const char *lookup;
+	const char *lookup_end;
+	const char *durable_fallback;
+	const char *subcommit;
+	const char *subcommit_end;
+
+	if (source == NULL)
+		return;
+	lookup = strstr(source, "\ncluster_tt_status_lookup_current_own_xid_internal(");
+	lookup_end
+		= lookup != NULL ? strstr(lookup, "\ncluster_tt_status_lookup_current_own_xid(") : NULL;
+	durable_fallback
+		= lookup != NULL ? strstr(lookup, "cluster_tt_status_lookup_exact(") : NULL;
+	UT_ASSERT_NOT_NULL(lookup);
+	UT_ASSERT_NOT_NULL(lookup_end);
+	UT_ASSERT_NOT_NULL(strstr(lookup, "cluster_xid_origin_slot(xid) != cluster_node_id"));
+	UT_ASSERT_NOT_NULL(strstr(lookup, "candidate_found"));
+	if (lookup_end != NULL)
+		UT_ASSERT(durable_fallback == NULL || durable_fallback > lookup_end);
+
+	subcommit = strstr(source, "\ncluster_tt_status_install_subcommitted(");
+	subcommit_end
+		= subcommit != NULL ? strstr(subcommit, "\ncluster_tt_status_delete_exact(") : NULL;
+	UT_ASSERT_NOT_NULL(subcommit);
+	UT_ASSERT_NOT_NULL(subcommit_end);
+	UT_ASSERT_NOT_NULL(subcommit != NULL ? strstr(subcommit, "hash_seq_init(&seq") : NULL);
+	UT_ASSERT_NOT_NULL(subcommit != NULL
+						   ? strstr(subcommit, "alias->key.tt_slot_id != child_key->tt_slot_id")
+						   : NULL);
+	if (subcommit_end != NULL) {
+		const char *alias_status = strstr(subcommit, "alias->status = CLUSTER_TT_STATUS_SUBCOMMITTED");
+
+		UT_ASSERT_NOT_NULL(alias_status);
+		UT_ASSERT(alias_status == NULL || alias_status < subcommit_end);
+	}
+	free(source);
 }
 UT_TEST(test_t9_install_local_linkable)
 {
@@ -366,6 +462,8 @@ main(void)
 	UT_RUN(test_t6_enum_aborted_three);
 	UT_RUN(test_t7_enum_cleaned_out_four);
 	UT_RUN(test_t8_lookup_exact_linkable);
+	UT_RUN(test_t8b_lookup_current_own_xid_linkable);
+	UT_RUN(test_t8c_current_authority_is_retained_exact_and_subcommit_syncs_aliases);
 	UT_RUN(test_t9_install_local_linkable);
 	UT_RUN(test_t9b_resolve_prepared_commit_linkable);
 	UT_RUN(test_t10_flush_all_linkable);

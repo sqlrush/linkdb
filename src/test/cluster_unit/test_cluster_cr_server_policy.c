@@ -366,10 +366,74 @@ UT_TEST(test_current_mx_describe_rechecks_fence_before_direct_origin_reply)
 	free(source);
 }
 
+UT_TEST(test_current_mx_member_proof_rechecks_fence_before_direct_origin_reply)
+{
+	char *source = read_cr_server_source();
+	const char *serve;
+	const char *validate;
+	const char *own_xid_lookup;
+	const char *candidate_verdict;
+	const char *candidate_exact_fallback;
+	const char *resolve;
+	const char *fence_recheck;
+	const char *body_clear;
+	const char *direct_origin;
+	const char *send;
+
+	if (source == NULL)
+		return;
+	serve = strstr(source, "\ncluster_gcs_current_mx_member_proof_serve_inline(");
+	validate = serve != NULL
+				   ? strstr(serve, "cluster_multixact_current_wire_validate_proof_forward(")
+				   : NULL;
+	own_xid_lookup
+		= validate != NULL ? strstr(validate, "cluster_tt_status_lookup_current_own_xid(") : NULL;
+	candidate_verdict
+		= validate != NULL
+			  ? strstr(validate, "cluster_multixact_current_updater_candidate_verdict(")
+			  : NULL;
+	candidate_exact_fallback
+		= candidate_verdict != NULL
+			  ? strstr(candidate_verdict, "cluster_tt_status_lookup_exact(")
+			  : NULL;
+	resolve = own_xid_lookup != NULL
+				  ? strstr(own_xid_lookup,
+						   "cluster_multixact_current_resolve_origin_member_proof(")
+				  : NULL;
+	fence_recheck = resolve != NULL
+						? strstr(resolve, "cluster_epoch_get_current() != request.prefix.epoch")
+						: NULL;
+	body_clear = fence_recheck != NULL ? strstr(fence_recheck, "memset(&page->body") : NULL;
+	direct_origin = body_clear != NULL
+						? strstr(body_clear,
+								 "GcsBlockReplyHeaderSetForwardingMasterNode("
+								 "outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)")
+						: NULL;
+	send = direct_origin != NULL ? strstr(direct_origin, "cluster_ic_send_envelope(") : NULL;
+
+	UT_ASSERT_NOT_NULL(serve);
+	UT_ASSERT_NOT_NULL(validate);
+	UT_ASSERT_NOT_NULL(own_xid_lookup);
+	UT_ASSERT_NOT_NULL(candidate_verdict);
+	UT_ASSERT_NOT_NULL(resolve);
+	UT_ASSERT_NOT_NULL(fence_recheck);
+	UT_ASSERT_NOT_NULL(body_clear);
+	UT_ASSERT_NOT_NULL(direct_origin);
+	UT_ASSERT_NOT_NULL(send);
+	if (serve != NULL && validate != NULL && own_xid_lookup != NULL && resolve != NULL
+		&& fence_recheck != NULL && body_clear != NULL && direct_origin != NULL && send != NULL)
+		UT_ASSERT(serve < validate && validate < own_xid_lookup && own_xid_lookup < resolve
+				  && resolve < fence_recheck && fence_recheck < body_clear
+				  && body_clear < direct_origin && direct_origin < send);
+	if (candidate_verdict != NULL && fence_recheck != NULL)
+		UT_ASSERT(candidate_exact_fallback == NULL || candidate_exact_fallback > fence_recheck);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -382,6 +446,7 @@ main(void)
 	UT_RUN(test_undo_serve_error_preserves_exact_refusal_context);
 	UT_RUN(test_undo_submit_slots_busy_has_distinct_exact_signature);
 	UT_RUN(test_current_mx_describe_rechecks_fence_before_direct_origin_reply);
+	UT_RUN(test_current_mx_member_proof_rechecks_fence_before_direct_origin_reply);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

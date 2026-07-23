@@ -60,6 +60,7 @@
 
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22d D4-6) */
@@ -279,9 +280,15 @@ extern void cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload 
  * failure is a typed DENIED page or a malformed-frame drop. */
 extern void cluster_gcs_current_mx_describe_serve_inline(const struct ClusterICEnvelope *env,
 														 const void *payload);
+extern void cluster_gcs_current_mx_member_proof_serve_inline(
+	const struct ClusterICEnvelope *env, const void *payload);
 extern ClusterMxDescribeResult cluster_gcs_current_mx_describe_fetch_and_wait(
 	int32 origin_node, const ClusterCurrentMxKey *key, ClusterCurrentMxMemberDesc *members,
 	uint16 members_cap, uint16 *members_count, uint32 *reported_total_members);
+extern ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait(
+	int32 origin_node, ClusterCurrentMxProofForwardV2 *request,
+	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
+	ClusterCurrentUpdaterProof *updater_proof);
 
 /* Requester side (backend): fetch a CR page for (locator, fork, block) at
  * read_scn from origin_node.  On success copies the shipped page into

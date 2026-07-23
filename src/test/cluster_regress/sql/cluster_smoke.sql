@@ -44,10 +44,10 @@ SELECT attname, format_type(atttypid, atttypmod)
 
 
 -- ----------
--- 3. Cluster wait events: 124 rows (anchored by
+-- 3. Cluster wait events: 125 rows (anchored by
 --    CLUSTER_WAIT_EVENTS_COUNT, spec-0.11 + StaticAssertDecl
 --    in cluster_views.c; spec-6.2 D10 +4 authority waits +
---    current-DML MultiXact describe wait).
+--    current-DML MultiXact describe and member-proof waits).
 -- ----------
 SELECT count(*) FROM pg_stat_cluster_wait_events;
 

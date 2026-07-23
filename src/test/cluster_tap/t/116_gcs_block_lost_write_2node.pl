@@ -102,8 +102,8 @@ cmp_ok($catver, '>=', 202605440,
 
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'124',
-	'L2 pg_stat_cluster_wait_events returns 124 rows (including current-DML MultiXact describe wait; merge sum 118+3+2+1)');
+	'125',
+	'L2 pg_stat_cluster_wait_events returns 125 rows (including current-DML MultiXact waits; merge sum 118+3+2+2)');
 
 is($pair->node0->safe_psql(
 		'postgres',

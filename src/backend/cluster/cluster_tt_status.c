@@ -58,6 +58,7 @@
 #include "utils/hsearch.h"
 #include "utils/timestamp.h"
 
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_merge.h" /* spec-4.5a G5: is_materialized */
@@ -66,6 +67,7 @@
 #include "cluster/cluster_tt_durable.h" /* spec-3.11 D5: overlay-miss durable lookup */
 #include "cluster/cluster_tt_slot.h"	/* cluster_tt_slot_id_to_offset, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_xid_stripe.h"
 
 /*
  * ClusterTTOverlayEntry -- HTAB value type.
@@ -644,6 +646,130 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	return true;
 }
 
+static bool
+cluster_tt_status_current_entries_agree(const ClusterTTOverlayEntry *a,
+										const ClusterTTOverlayEntry *b)
+{
+	return a->key.tt_slot_id == b->key.tt_slot_id && a->status == b->status
+		   && a->commit_scn == b->commit_scn && a->status_epoch == b->status_epoch
+		   && a->has_parent_key == b->has_parent_key
+		   && memcmp(&a->parent_key, &b->parent_key, sizeof(a->parent_key)) == 0;
+}
+
+
+static bool
+cluster_tt_status_key_precedes(const ClusterTTStatusKey *a, const ClusterTTStatusKey *b)
+{
+	if (a->undo_segment_id != b->undo_segment_id)
+		return a->undo_segment_id < b->undo_segment_id;
+	if (a->tt_slot_id != b->tt_slot_id)
+		return a->tt_slot_id < b->tt_slot_id;
+	return memcmp(a, b, sizeof(*a)) < 0;
+}
+
+
+static bool
+cluster_tt_status_lookup_current_own_xid_internal(
+	TransactionId xid, const ClusterTTStatusKey *candidate, ClusterTTStatusKey *key,
+	ClusterTTStatusResult *result, ClusterTTCurrentKeyVerdict *candidate_verdict)
+{
+	HASH_SEQ_STATUS seq;
+	ClusterTTOverlayEntry *entry;
+	ClusterTTOverlayEntry selected;
+	TimestampTz now;
+	uint64 epoch;
+	bool found = false;
+	bool ambiguous = false;
+	bool candidate_found = false;
+
+	if (key != NULL)
+		memset(key, 0, sizeof(*key));
+	if (result != NULL) {
+		memset(result, 0, sizeof(*result));
+		result->status = CLUSTER_TT_STATUS_UNKNOWN;
+		result->commit_scn = InvalidScn;
+	}
+	if (candidate_verdict != NULL)
+		*candidate_verdict = CLUSTER_TT_CURRENT_KEY_UNKNOWN;
+	if (key == NULL || result == NULL || !TransactionIdIsNormal(xid) || !cluster_enabled
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| cluster_xid_origin_slot(xid) != cluster_node_id || ClusterTTStatusHTAB == NULL)
+		return false;
+
+	epoch = cluster_epoch_get_current();
+	if (epoch == 0 || epoch > UINT32_MAX)
+		return false;
+	if (candidate != NULL
+		&& (candidate->origin_node_id != (uint16)cluster_node_id
+			|| candidate->local_xid != xid || candidate->cluster_epoch != (uint32)epoch
+			|| candidate->undo_segment_id == 0 || candidate->tt_slot_id == 0
+			|| candidate->_reserved != 0 || candidate->_reserved2 != 0))
+		return false;
+	now = GetCurrentTimestamp();
+	memset(&selected, 0, sizeof(selected));
+
+	LWLockAcquire(ClusterTTStatusLock, LW_SHARED);
+	hash_seq_init(&seq, ClusterTTStatusHTAB);
+	while ((entry = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
+		if (entry->key.origin_node_id != (uint16)cluster_node_id
+			|| entry->key.local_xid != xid || entry->key.cluster_epoch != (uint32)epoch
+			|| entry->key.undo_segment_id == 0 || entry->key.tt_slot_id == 0
+			|| entry->key._reserved != 0 || entry->key._reserved2 != 0
+			|| entry->status_epoch != (uint32)epoch || !is_entry_fresh(entry, now))
+			continue;
+		if (candidate != NULL && memcmp(&entry->key, candidate, sizeof(*candidate)) == 0)
+			candidate_found = true;
+		if (!found) {
+			selected = *entry;
+			found = true;
+			continue;
+		}
+		if (!cluster_tt_status_current_entries_agree(&selected, entry)) {
+			ambiguous = true;
+			hash_seq_term(&seq);
+			break;
+		}
+		if (cluster_tt_status_key_precedes(&entry->key, &selected.key))
+			selected = *entry;
+	}
+	LWLockRelease(ClusterTTStatusLock);
+
+	if (!found || ambiguous) {
+		if (ambiguous)
+			pg_atomic_fetch_add_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+		return false;
+	}
+
+	*key = selected.key;
+	cluster_tt_status_fill_result_from_entry(&selected, result);
+	if (candidate_verdict != NULL && candidate_found)
+		*candidate_verdict = CLUSTER_TT_CURRENT_KEY_MATCH;
+	pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_hit_count, 1);
+	if (result->status == CLUSTER_TT_STATUS_SUBCOMMITTED)
+		pg_atomic_fetch_add_u64(&ClusterTTStatusState->subcommitted_lookup_hit_count, 1);
+	return true;
+}
+
+bool
+cluster_tt_status_lookup_current_own_xid(TransactionId xid, ClusterTTStatusKey *key,
+										 ClusterTTStatusResult *result)
+{
+	return cluster_tt_status_lookup_current_own_xid_internal(xid, NULL, key, result, NULL);
+}
+
+ClusterTTCurrentKeyVerdict
+cluster_tt_status_lookup_current_own_xid_candidate(
+	TransactionId xid, const ClusterTTStatusKey *candidate, ClusterTTStatusKey *key,
+	ClusterTTStatusResult *result)
+{
+	ClusterTTCurrentKeyVerdict verdict = CLUSTER_TT_CURRENT_KEY_UNKNOWN;
+
+	if (candidate == NULL)
+		return verdict;
+	(void)cluster_tt_status_lookup_current_own_xid_internal(xid, candidate, key, result, &verdict);
+	return verdict;
+}
+
 bool
 cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 								SCN commit_scn)
@@ -792,7 +918,10 @@ bool
 cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
 									   const ClusterTTStatusKey *parent_key)
 {
+	HASH_SEQ_STATUS seq;
 	ClusterTTOverlayEntry *e;
+	ClusterTTOverlayEntry *alias;
+	TimestampTz now;
 	bool found;
 
 	Assert(child_key != NULL);
@@ -811,12 +940,27 @@ cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
 		return false;
 	}
 
-	e->status = CLUSTER_TT_STATUS_SUBCOMMITTED;
-	e->commit_scn = InvalidScn; /* subxact not yet finalized */
-	e->status_epoch = child_key->cluster_epoch;
-	e->install_ts = GetCurrentTimestamp();
-	e->has_parent_key = true;
-	e->parent_key = *parent_key;
+	/*
+	 * A transaction may have several retained page-reference aliases for the
+	 * same logical TT slot.  Subcommit is a transaction-state transition, so
+	 * update every current alias atomically; otherwise own-xid authority sees
+	 * stale IN_PROGRESS and SUBCOMMITTED entries disagree and must fail closed.
+	 */
+	now = GetCurrentTimestamp();
+	hash_seq_init(&seq, ClusterTTStatusHTAB);
+	while ((alias = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
+		if (alias->key.origin_node_id != child_key->origin_node_id
+			|| alias->key.local_xid != child_key->local_xid
+			|| alias->key.cluster_epoch != child_key->cluster_epoch
+			|| alias->key.tt_slot_id != child_key->tt_slot_id)
+			continue;
+		alias->status = CLUSTER_TT_STATUS_SUBCOMMITTED;
+		alias->commit_scn = InvalidScn; /* subxact not yet finalized */
+		alias->status_epoch = child_key->cluster_epoch;
+		alias->install_ts = now;
+		alias->has_parent_key = true;
+		alias->parent_key = *parent_key;
+	}
 
 	LWLockRelease(ClusterTTStatusLock);
 
@@ -1070,6 +1214,38 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	}
 	(void)key;
 	return false;
+}
+
+bool
+cluster_tt_status_lookup_current_own_xid(TransactionId xid, ClusterTTStatusKey *key,
+										 ClusterTTStatusResult *result)
+{
+	(void)xid;
+	if (key != NULL)
+		memset(key, 0, sizeof(*key));
+	if (result != NULL) {
+		memset(result, 0, sizeof(*result));
+		result->status = CLUSTER_TT_STATUS_UNKNOWN;
+		result->commit_scn = InvalidScn;
+	}
+	return false;
+}
+
+ClusterTTCurrentKeyVerdict
+cluster_tt_status_lookup_current_own_xid_candidate(
+	TransactionId xid, const ClusterTTStatusKey *candidate, ClusterTTStatusKey *key,
+	ClusterTTStatusResult *result)
+{
+	(void)xid;
+	(void)candidate;
+	if (key != NULL)
+		memset(key, 0, sizeof(*key));
+	if (result != NULL) {
+		memset(result, 0, sizeof(*result));
+		result->status = CLUSTER_TT_STATUS_UNKNOWN;
+		result->commit_scn = InvalidScn;
+	}
+	return CLUSTER_TT_CURRENT_KEY_UNKNOWN;
 }
 
 bool

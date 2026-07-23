@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 124, including current-DML MultiXact describe wait.
+# Total row count: 125, including current-DML MultiXact waits.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'124',
-	'pg_stat_cluster_wait_events returns 124 rows (including current-DML MultiXact describe wait; merge sum 118+3+2+1)');
+	'125',
+	'pg_stat_cluster_wait_events returns 125 rows (including current-DML MultiXact waits; merge sum 118+3+2+2)');
 
 is($node->safe_psql(
 		'postgres',
@@ -82,7 +82,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 25,	# spec-3.6b: +current-DML MultiXact describe wait
+	'Cluster: PCM' => 26,	# spec-3.6b: +describe and member-proof waits
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
@@ -108,7 +108,8 @@ for my $type (sort keys %expected)
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
               'InterconnectRdmaSend', 'ClusterICRdmaFallback',
-              'GcsMultixactDescribeWait', 'AdgWalReceiveLag')
+              'GcsMultixactDescribeWait', 'GcsMultixactMemberProofWait',
+              'AdgWalReceiveLag')
 {
 	my $count = $node->safe_psql(
 		'postgres',

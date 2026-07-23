@@ -13,7 +13,7 @@
 #   L1  catversion bump 202605450 → 202605460
 #   L2  pg_cluster_state sinval category has 16 keys (D8 +3 fanout + D9 +3 ack + D1 applied)
 #   L3  3 NEW GUC defaults (sinval_ack_mode=peer_enqueued / timeout 5000 / slots 256)
-#   L4  pg_stat_cluster_wait_events count == 124 (including current-DML describe wait)
+#   L4  pg_stat_cluster_wait_events count == 125 (including current-DML MultiXact waits)
 #   L5  ClusterSinvalAckWait / ClusterSinvalAckSend / ClusterSinvalAckReceive visible
 #   L6  53R95 ERRCODE_CLUSTER_SINVAL_ACK_TIMEOUT encodable
 #   L7  node0 CREATE TABLE → node1 SELECT visible within 5s ack timeout
@@ -76,12 +76,12 @@ is($pair->node0->safe_psql('postgres', 'SHOW cluster.sinval_ack_wait_slots'),
 	'256',
 	'L3c cluster.sinval_ack_wait_slots default 256');
 
-# L4: pg_stat_cluster_wait_events count == 124.
+# L4: pg_stat_cluster_wait_events count == 125.
 # ============================================================
 is($pair->node0->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'124',
-	'L4 pg_stat_cluster_wait_events returns 124 rows (including current-DML MultiXact describe wait; merge sum 118+3+2+1)');
+	'125',
+	'L4 pg_stat_cluster_wait_events returns 125 rows (including current-DML MultiXact waits; merge sum 118+3+2+2)');
 
 # ============================================================
 # L5: 3 NEW ack wait events visible.

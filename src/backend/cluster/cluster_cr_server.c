@@ -1423,6 +1423,180 @@ cluster_gcs_current_mx_describe_serve_inline(const ClusterICEnvelope *env, const
 	MemoryContextReset(CrServeScratchCtx);
 }
 
+static bool
+current_mx_origin_exact_lookup(const ClusterTTStatusKey *key, ClusterTTStatusResult *result,
+							   void *arg)
+{
+	(void)arg;
+	return cluster_tt_status_lookup_exact(key, result);
+}
+
+
+void
+cluster_gcs_current_mx_member_proof_serve_inline(const ClusterICEnvelope *env,
+												 const void *payload)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	uint32 reply_total = (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+	char *reply;
+	GcsBlockReplyHeader *outer;
+	ClusterCurrentMxProofReplyPage *page;
+	BufferTag route_tag;
+	int recv_worker;
+	int expected_worker;
+	MemoryContext old_context;
+	ClusterMxResolveResult proof_result = CMX_RESOLVE_UNKNOWN;
+
+	if (env == NULL || payload == NULL || env->dest_node_id != (uint32)cluster_node_id
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| !cluster_multixact_current_wire_validate_proof_forward(
+			payload, env->payload_length, (int32)env->source_node_id, cluster_node_id,
+			cluster_epoch_get_current(), &request))
+		return;
+
+	route_tag = GcsBlockCurrentMxRouteTagMake(
+		request.prefix.request_id, request.prefix.epoch,
+		request.prefix.original_requester_node, request.prefix.requester_backend_id);
+	recv_worker = cluster_ic_tier1_my_data_channel();
+	expected_worker = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
+	Assert(expected_worker == recv_worker);
+	if (expected_worker != recv_worker)
+		return;
+
+	old_context = MemoryContextSwitchTo(cr_serve_scratch_context());
+	reply = (char *)palloc0(reply_total);
+	outer = (GcsBlockReplyHeader *)reply;
+	page = (ClusterCurrentMxProofReplyPage *)(reply + sizeof(*outer));
+
+	page->header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page->header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page->header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	page->header.result = (uint8)CMX_RESOLVE_UNKNOWN;
+	page->header.source_node_id = (uint32)cluster_node_id;
+	page->header.request_id = request.prefix.request_id;
+	page->header.mxkey = request.prefix.mxkey;
+	page->header.descriptor_hash
+		= ClusterCurrentMxProofPrefixGetDescriptorHash(&request.prefix);
+	page->header.total_count = request.prefix.total_count;
+	page->header.chunk_ordinal = request.prefix.chunk_ordinal;
+	page->header.chunk_count_minus_one = request.prefix.chunk_count_minus_one;
+	page->header.wire_length = sizeof(page->header);
+
+	if (!cluster_write_fence_enforcing() || cluster_write_fence_allowed()) {
+		PG_TRY();
+		{
+			uint8 i;
+
+			if (request.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS) {
+				proof_result = CMX_RESOLVE_OK;
+				for (i = 0; i < request.prefix.entry_count; i++) {
+					const ClusterCurrentMxProofAskWire *ask
+						= &request.trailer.body.asks[i];
+					ClusterTTStatusKey initial_key;
+					ClusterTTStatusResult initial_result;
+
+					if (!cluster_tt_status_lookup_current_own_xid(
+							ask->xid, &initial_key, &initial_result)
+						|| !cluster_multixact_current_resolve_origin_member_proof(
+							ask->xid, ask->member_status, ask->member_ordinal,
+							(uint16)cluster_node_id, request.prefix.mxkey.cluster_epoch, false,
+							&initial_key, &initial_result, current_mx_origin_exact_lookup, NULL,
+							&page->body.proofs[i])) {
+						proof_result = CMX_RESOLVE_UNKNOWN;
+						break;
+					}
+				}
+				if (proof_result == CMX_RESOLVE_OK) {
+					page->header.entry_count = request.prefix.entry_count;
+					page->header.wire_length
+						= sizeof(page->header)
+						  + request.prefix.entry_count * sizeof(ClusterCurrentMemberProof);
+				}
+			} else {
+				const ClusterCurrentMxUpdaterChallengeWire *challenge
+					= &request.trailer.body.updater.challenge;
+				ClusterTTStatusKey initial_key;
+				ClusterTTStatusResult initial_result;
+				ClusterUpdaterCandidateVerdict candidate_verdict;
+				ClusterCurrentUpdaterProof *updater
+					= &page->body.updater.updater_proof;
+
+				candidate_verdict = cluster_multixact_current_updater_candidate_verdict(
+					&challenge->candidate_next_xmin_key, challenge->updater_xid,
+					(uint16)cluster_node_id, request.prefix.mxkey.cluster_epoch,
+					&initial_key, &initial_result);
+				if (candidate_verdict != CUCP_UNKNOWN
+					&& cluster_multixact_current_resolve_origin_member_proof(
+						challenge->updater_xid, challenge->member_status,
+						challenge->member_ordinal, (uint16)cluster_node_id,
+						request.prefix.mxkey.cluster_epoch, false, &initial_key,
+						&initial_result, current_mx_origin_exact_lookup, NULL,
+						&page->body.updater.member_proof)) {
+					updater->mxkey = request.prefix.mxkey;
+					updater->candidate_next_xmin_key
+						= challenge->candidate_next_xmin_key;
+					updater->updater_xid = challenge->updater_xid;
+					updater->member_ordinal = challenge->member_ordinal;
+					updater->verdict = candidate_verdict;
+					proof_result = CMX_RESOLVE_OK;
+					page->header.entry_count = 1;
+					page->header.wire_length
+						= sizeof(page->header) + sizeof(ClusterCurrentMemberProof)
+						  + sizeof(ClusterCurrentUpdaterProof);
+				}
+			}
+		}
+		PG_CATCH();
+		{
+			ErrorData *edata;
+
+			proof_result = CMX_RESOLVE_DENIED;
+			MemoryContextSwitchTo(cr_serve_scratch_context());
+			edata = CopyErrorData();
+			FlushErrorState();
+			ereport(LOG,
+					(errmsg_internal("current-MX member proof origin serve caught error; "
+									 "returning DENIED"),
+					 errdetail_internal("requester=%d request_id=" UINT64_FORMAT
+									   " sqlstate=%s message=%s",
+									   request.prefix.original_requester_node,
+									   request.prefix.request_id,
+									   unpack_sql_state(edata->sqlerrcode),
+									   edata->message != NULL ? edata->message : "")));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+	} else
+		proof_result = CMX_RESOLVE_DENIED;
+
+	if (cluster_epoch_get_current() != request.prefix.epoch
+		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed()))
+		proof_result = CMX_RESOLVE_DENIED;
+	if (proof_result != CMX_RESOLVE_OK) {
+		memset(&page->body, 0, sizeof(page->body));
+		memset(page->reserved, 0, sizeof(page->reserved));
+		page->header.entry_count = 0;
+		page->header.wire_length = sizeof(page->header);
+	}
+	page->header.result = (uint8)proof_result;
+
+	outer->request_id = request.prefix.request_id;
+	outer->epoch = cluster_epoch_get_current();
+	outer->sender_node = cluster_node_id;
+	outer->requester_backend_id = request.prefix.requester_backend_id;
+	outer->transition_id = 0;
+	outer->status = (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	outer->checksum = cluster_gcs_block_compute_checksum((const char *)page);
+
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_REPLY,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+								 request.prefix.original_requester_node, reply, reply_total));
+	MemoryContextSwitchTo(old_context);
+	MemoryContextReset(CrServeScratchCtx);
+}
+
 /*
  * cluster_gcs_block_forward_serve_inline — spec-7.3 D6 entry.  When the GCS
  * block family is on the DATA plane, the worker[shard] that received a

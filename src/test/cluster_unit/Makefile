@@ -1623,16 +1623,20 @@ test_cluster_stage2_acceptance: test_cluster_stage2_acceptance.c unit_test.h ../
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PGPORT) -o $@
 
-# spec-3.1 D9:  test_cluster_tt_status — 22 真 C 单测 verifying the Undo
+# spec-3.1 D9:  test_cluster_tt_status — 25 真 C 单测 verifying the Undo
 # TT status foundation static contract (24B ClusterTTStatusKey with
 # explicit _reserved2 v0.4 N9 padding, 32B ClusterUndoTTSlotRef v0.4 M4,
 # 5-value ClusterTTStatus enum, public API + GUC defaults + LWTRANCHE
 # slot + self-consumer counter linkable, ITL reader linkable, no
-# SUBCOMMITTED in spec-3.1 enum).  Header-only;  behavioral coverage in
+# SUBCOMMITTED in spec-3.1 enum), plus current-DML retained-exact authority
+# and SUBCOMMITTED alias-sync source contracts.  Behavioral coverage in
 # cluster_tap t/203.
 test_cluster_tt_status: test_cluster_tt_status.c unit_test.h \
-		$(CLUSTER_VERSION_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_tt_status.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DCLUSTER_TT_STATUS_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_tt_status.c"' \
+		$< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PGPORT) -o $@
@@ -1859,8 +1863,11 @@ CLUSTER_MULTIXACT_CURRENT_O = $(top_builddir)/src/backend/cluster/cluster_multix
 CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
 test_cluster_multixact_current: test_cluster_multixact_current.c unit_test.h \
-		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_multixact_current.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DCLUSTER_MULTIXACT_CURRENT_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_multixact_current.c"' \
+		$< \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PGPORT) -o $@

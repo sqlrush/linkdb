@@ -191,6 +191,10 @@ typedef struct ClusterCurrentProofChunkView {
 } ClusterCurrentProofChunkView;
 
 
+typedef bool (*ClusterCurrentMxExactLookupFn)(const ClusterTTStatusKey *key,
+											 ClusterTTStatusResult *result, void *arg);
+
+
 /*
  * Identity for an operation-local immutable-descriptor memo.  The tuple/PCM-X
  * fingerprint is opaque to this module and supplied by the heap caller.
@@ -236,6 +240,16 @@ extern ClusterMxResolveResult cluster_multixact_current_validate_proof_set(
 	const uint16 *member_origin_nodes, uint16 nmembers, uint64 request_id, uint64 descriptor_hash,
 	const ClusterCurrentProofChunkView *chunks, uint16 nchunks,
 	ClusterCurrentMemberProof *ordered_proofs);
+extern bool cluster_multixact_current_resolve_origin_member_proof(
+	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
+	uint16 member_origin_node, uint32 current_epoch, bool requester_self,
+	const ClusterTTStatusKey *initial_key, const ClusterTTStatusResult *initial_result,
+	ClusterCurrentMxExactLookupFn exact_lookup, void *exact_lookup_arg,
+	ClusterCurrentMemberProof *proof);
+extern ClusterUpdaterCandidateVerdict cluster_multixact_current_updater_candidate_verdict(
+	const ClusterTTStatusKey *candidate, TransactionId updater_xid,
+	uint16 updater_origin_node, uint32 current_epoch, ClusterTTStatusKey *current_binding,
+	ClusterTTStatusResult *current_result);
 extern bool cluster_multixact_current_validate_updater_proof(
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
 	const ClusterCurrentMemberProof *proofs, uint16 nmembers,

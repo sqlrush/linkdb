@@ -178,7 +178,8 @@ UT_TEST(test_first_event_per_category_anchors_class_id)
 UT_TEST(test_last_event_per_category_in_class)
 {
 	UT_ASSERT_EQ(((uint32)WAIT_EVENT_GES_LOCAL_FAST_PATH) & 0xFF000000U, PG_WAIT_CLUSTER_GES);
-	UT_ASSERT_EQ(((uint32)WAIT_EVENT_PCM_ITL_CLEANOUT) & 0xFF000000U, PG_WAIT_CLUSTER_PCM);
+	UT_ASSERT_EQ(((uint32)WAIT_EVENT_GCS_MULTIXACT_MEMBER_PROOF_WAIT) & 0xFF000000U,
+				 PG_WAIT_CLUSTER_PCM);
 	UT_ASSERT_EQ(((uint32)WAIT_EVENT_BUFFER_SHIP_CURRENT_RECEIVE) & 0xFF000000U,
 				 PG_WAIT_CLUSTER_BUFFERSHIP);
 	UT_ASSERT_EQ(((uint32)WAIT_EVENT_SCN_ADVANCE_BROADCAST) & 0xFF000000U, PG_WAIT_CLUSTER_SCN);
@@ -199,7 +200,7 @@ UT_TEST(test_last_event_per_category_in_class)
 
 /* ----------
  * Per-category event counts match the design doc roster
- *  (GES 5, PCM 8, BufferShip 5, SCN 4, Reconfig selected range 7,
+ *  (GES 5, PCM 26, BufferShip 5, SCN 4, Reconfig selected range 7,
  *   Recovery 7, Sinval selected range 3, Interconnect 9, Undo 8, ADG 4,
  *   SharedFs 12 -- plus later
  *   subsystem classes, total tracked by CLUSTER_WAIT_EVENTS_COUNT).
@@ -212,8 +213,9 @@ UT_TEST(test_per_category_event_counts)
 {
 	UT_ASSERT_EQ(
 		(uint32)WAIT_EVENT_GES_LOCAL_FAST_PATH - (uint32)WAIT_EVENT_GES_ENQUEUE_ACQUIRE + 1, 5);
-	UT_ASSERT_EQ((uint32)WAIT_EVENT_PCM_ITL_CLEANOUT - (uint32)WAIT_EVENT_PCM_BLOCK_READ_N_S + 1,
-				 6);
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_GCS_MULTIXACT_MEMBER_PROOF_WAIT
+					 - (uint32)WAIT_EVENT_PCM_BLOCK_READ_N_S + 1,
+				 26);
 	UT_ASSERT_EQ((uint32)WAIT_EVENT_BUFFER_SHIP_CURRENT_RECEIVE
 					 - (uint32)WAIT_EVENT_BUFFER_SHIP_CR_BUILD + 1,
 				 5);
@@ -267,11 +269,17 @@ UT_TEST(test_cross_category_jump_is_one_class_step)
 				 0x01000000U - 3U);
 }
 
+UT_TEST(test_current_multixact_member_proof_wait_follows_describe)
+{
+	UT_ASSERT_EQ((uint32)WAIT_EVENT_GCS_MULTIXACT_MEMBER_PROOF_WAIT,
+				 (uint32)WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT + 1);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_class_ids_match_design_doc);
 	UT_RUN(test_class_ids_pairwise_distinct);
 	UT_RUN(test_no_collision_with_pg_native_classes);
@@ -280,6 +288,7 @@ main(void)
 	UT_RUN(test_last_event_per_category_in_class);
 	UT_RUN(test_per_category_event_counts);
 	UT_RUN(test_cross_category_jump_is_one_class_step);
+	UT_RUN(test_current_multixact_member_proof_wait_follows_describe);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

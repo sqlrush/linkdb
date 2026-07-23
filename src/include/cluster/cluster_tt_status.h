@@ -156,6 +156,21 @@ typedef struct ClusterTTStatusResult {
 } ClusterTTStatusResult;
 
 /*
+ * Verdict for a current-DML updater key challenge against the retained
+ * current own-xid overlay.  UNKNOWN is deliberately distinct from a proven
+ * full-identity mismatch: an evicted/recycled page-reference alias cannot be
+ * called a mismatch merely because another alias for the raw xid remains
+ * resident.  V1 therefore emits MISMATCH only when a future independent
+ * incarnation-negative authority can prove it; retained-overlay miss is
+ * always UNKNOWN.
+ */
+typedef enum ClusterTTCurrentKeyVerdict {
+	CLUSTER_TT_CURRENT_KEY_MATCH = 0,
+	CLUSTER_TT_CURRENT_KEY_MISMATCH,
+	CLUSTER_TT_CURRENT_KEY_UNKNOWN
+} ClusterTTCurrentKeyVerdict;
+
+/*
  * ClusterVisibilityDecision -- 3-state visibility decision (spec-3.3 D5).
  *
  * MVCC visibility is fundamentally 3-state: yes / no / data not available.
@@ -229,6 +244,12 @@ cluster_visibility_decide_by_scn(SCN commit_scn, SCN read_scn)
  */
 extern bool cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key,
 										   ClusterTTStatusResult *result);
+extern bool cluster_tt_status_lookup_current_own_xid(TransactionId xid,
+													 ClusterTTStatusKey *key,
+													 ClusterTTStatusResult *result);
+extern ClusterTTCurrentKeyVerdict cluster_tt_status_lookup_current_own_xid_candidate(
+	TransactionId xid, const ClusterTTStatusKey *candidate, ClusterTTStatusKey *key,
+	ClusterTTStatusResult *result);
 extern bool cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 											SCN commit_scn);
 extern int cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn);
