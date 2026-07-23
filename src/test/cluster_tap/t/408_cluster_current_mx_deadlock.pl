@@ -110,9 +110,9 @@ sub start_blocking_script
 }
 
 
-sub wait_for_tx_wait
+sub wait_for_event
 {
-	my ($node, $query_like, $seconds) = @_;
+	my ($node, $query_like, $event_name, $seconds) = @_;
 	return wait_for(
 		sub {
 			my $event = $node->safe_psql(
@@ -123,7 +123,7 @@ sub wait_for_tx_wait
 				      AND pid <> pg_backend_pid()
 				      AND state = 'active'
 				    LIMIT 1});
-			return $event eq 'GesTxEnqueueWait';
+			return $event eq $event_name;
 		},
 		$seconds);
 }
@@ -149,7 +149,7 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.grd_max_entries = 1024',
-		'cluster.ges_request_timeout_ms = 60000',
+		'cluster.ges_request_timeout_ms = 30000',
 		'cluster.global_dd_interval_ms = 1000',
 		'cluster.deadlock_confirm_interval_ms = 500',
 		'cluster.lmd_scan_interval_ms = 500',
@@ -169,53 +169,77 @@ ok(mirrored_coincident_create(
 		$node0, $node1, 'cmxd_t',
 		'CREATE TABLE cmxd_t (id int, v int)'),
 	'L2 relation identity coincides') or BAIL_OUT('could not create a coincident relation');
-# Keep the two deadlock targets on distinct heap blocks.  Otherwise the second
-# initial row lock waits for page-X conversion before an ABBA graph can exist.
+ok(mirrored_coincident_create(
+		$node0, $node1, 'cmxd_gate',
+		'CREATE TABLE cmxd_gate (id int)'),
+	'L2 gate relation identity coincides') or BAIL_OUT('could not create a coincident gate');
 $node0->safe_psql('postgres', 'INSERT INTO cmxd_t VALUES (1, 0)');
-$node0->safe_psql(
-	'postgres',
-	'INSERT INTO cmxd_t SELECT g, 0 FROM generate_series(100, 2100) AS g');
-$node0->safe_psql('postgres', 'INSERT INTO cmxd_t VALUES (2, 0)');
 $node0->safe_psql('postgres', 'CHECKPOINT');
 
 my $victims_before =
   pair_state_int($pair, 'multixact_current', 'deadlock_victim_count');
 my $edges_before = pair_state_int($pair, 'lmd', 'wait_edge_count');
-my $started_at = time();
+my $tokens_before = pair_state_int($pair, 'lmd', 'cancel_token_installed_count');
 
-my $h0 = $node0->background_psql('postgres', on_error_die => 1);
+my $h0 = $node0->background_psql('postgres', timeout => 45);
 $h0->query_safe('BEGIN');
 $h0->query_safe('SELECT v FROM cmxd_t WHERE id = 1 FOR UPDATE');
 
-my $h1 = $node1->background_psql('postgres', on_error_die => 1);
+my $h1 = $node1->background_psql('postgres', timeout => 45);
 $h1->query_safe('BEGIN');
-$h1->query_safe('SELECT v FROM cmxd_t WHERE id = 2 FOR UPDATE');
+$h1->query_safe('LOCK TABLE cmxd_gate IN ACCESS EXCLUSIVE MODE');
 
-start_blocking_script($h0, 'UPDATE cmxd_t SET v = v + 1 WHERE id = 2');
-ok(wait_for_tx_wait($node0, '%UPDATE cmxd_t SET v = v + 1 WHERE id = 2%', 20),
-	'RED-DL node0 publishes the first full-key TX wait');
-
+my $started_at = time();
 start_blocking_script($h1, 'UPDATE cmxd_t SET v = v + 1 WHERE id = 1');
-ok(wait_for_tx_wait($node1, '%UPDATE cmxd_t SET v = v + 1 WHERE id = 1%', 20),
-	'RED-DL node1 publishes the second full-key TX wait');
+ok(wait_for_event(
+		$node1,
+		'%UPDATE cmxd_t SET v = v + 1 WHERE id = 1%',
+		'GesTxEnqueueWait', 20),
+	'RED-DL node1 publishes a full-key TX wait on node0');
 
-ok(wait_for(sub { deadlock_logged($pair) }, 30),
-	'one ABBA victim receives SQLSTATE 40P01 before the TX timeout');
-cmp_ok(time() - $started_at, '<', 60,
+start_blocking_script(
+	$h0,
+	'LOCK TABLE cmxd_gate IN ACCESS EXCLUSIVE MODE; '
+	  . 'INSERT INTO cmxd_gate VALUES (1)');
+ok(wait_for_event(
+		$node0,
+		'%LOCK TABLE cmxd_gate%',
+		'ClusterGesReplyWait', 20),
+	'RED-DL node0 publishes the reverse GES edge and closes the cycle');
+
+ok(wait_for(
+		sub {
+			return pair_state_int($pair, 'lmd', 'cancel_token_installed_count')
+			  > $tokens_before;
+		},
+		20),
+	'LMD installs a typed cancel token for the youngest TX waiter');
+ok(wait_for(sub { deadlock_logged($pair) }, 20),
+	'the TX-wait victim receives SQLSTATE 40P01 before the TX timeout');
+cmp_ok(time() - $started_at, '<', 30,
 	'deadlock resolved before cluster.ges_request_timeout_ms');
 
+for my $handle ($h0, $h1)
+{
+	eval {
+		$handle->query_until(
+			qr/PGRAC_DRAIN/,
+			"ROLLBACK;\n\\echo PGRAC_DRAIN\n");
+	};
+}
 eval { $h0->quit };
 eval { $h1->quit };
 
 ok(wait_for(
 		sub {
-			my $sum = $node0->safe_psql(
-				'postgres',
-				'SELECT sum(v) FROM cmxd_t WHERE id IN (1, 2)');
-			return $sum eq '1';
+			my $survivors =
+			  $node0->safe_psql('postgres', 'SELECT count(*) FROM cmxd_gate');
+			return $survivors eq '1';
 		},
 		20),
-	'exactly one survivor commits after victim cleanup');
+	'the older table-lock waiter survives and commits exactly once');
+is($node0->safe_psql('postgres', 'SELECT v FROM cmxd_t WHERE id = 1'), '0',
+	'cancelled TX waiter did not update the row');
 ok(wait_for(
 		sub {
 			return pair_state_int($pair, 'lmd', 'wait_edge_count') == $edges_before;
