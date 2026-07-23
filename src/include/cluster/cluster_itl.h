@@ -73,6 +73,21 @@
 extern bool cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref);
 
 /*
+ * cluster_itl_find_data_tt_ref_by_xid:
+ *
+ *	Derive a data-writer ITL ref by exact xid when t_itl_slot_idx points at
+ *	a later updater.  Heap UPDATE deliberately makes the old version's
+ *	t_itl_slot_idx name that last writer, so its original xmin authority
+ *	must be recovered from the page's bounded ITL array.
+ *
+ *	Only data states (ACTIVE / COMMITTED / ABORTED / NEEDS_CLEANOUT) with a
+ *	real UBA qualify.  The highest wrap wins; a duplicate at the highest
+ *	wrap is ambiguous and returns false.
+ */
+extern bool cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
+												ClusterUndoTTSlotRef *ref);
+
+/*
  * cluster_itl_find_lock_tt_ref_by_xmax (spec-3.4d D1 / F2 / F6):
  *
  *	Scan the ITL slot array on `page` for a LOCK_ONLY slot whose xid

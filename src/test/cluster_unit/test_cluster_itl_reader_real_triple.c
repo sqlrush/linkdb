@@ -638,6 +638,79 @@ UT_TEST(test_t21_lock_scan_chooses_highest_wrap)
 	UT_ASSERT_EQ((int)ref.tt_slot_id, 10);
 }
 
+UT_TEST(test_t21a_data_scan_ignores_lock_and_marker_same_xid)
+{
+	Page page = build_itl_page();
+	ClusterUndoTTSlotRef ref;
+	ClusterItlSlotData *data = slot_at(page, 0);
+	ClusterItlSlotData *lock = slot_at(page, 1);
+	ClusterItlSlotData *marker = slot_at(page, 2);
+
+	data->flags = ITL_FLAG_COMMITTED;
+	data->xid = (TransactionId)1001;
+	data->wrap = 1;
+	data->undo_segment_head = uba_encode(257, 0, 11, 0);
+	data->commit_scn = (SCN)7000;
+
+	lock->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	lock->xid = (TransactionId)1001;
+	lock->wrap = 8;
+	lock->undo_segment_head = uba_encode(1, 0, 2, 0);
+
+	marker->flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
+	marker->xid = (TransactionId)1001;
+	marker->wrap = 9;
+	marker->undo_segment_head = uba_encode(1, 0, 3, 0);
+
+	UT_ASSERT_EQ(
+		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1001, &ref), 1);
+	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 12);
+	UT_ASSERT_EQ((int)ref.has_cached_status, 1);
+}
+
+UT_TEST(test_t21b_data_scan_rejects_ambiguous_highest_wrap)
+{
+	Page page = build_itl_page();
+	ClusterUndoTTSlotRef ref;
+	ClusterItlSlotData *a = slot_at(page, 0);
+	ClusterItlSlotData *b = slot_at(page, 1);
+
+	a->flags = ITL_FLAG_COMMITTED;
+	a->xid = (TransactionId)1002;
+	a->wrap = 4;
+	a->undo_segment_head = uba_encode(1, 0, 1, 0);
+	b->flags = ITL_FLAG_ABORTED;
+	b->xid = (TransactionId)1002;
+	b->wrap = 4;
+	b->undo_segment_head = uba_encode(257, 0, 2, 0);
+
+	UT_ASSERT_EQ(
+		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1002, &ref), 0);
+}
+
+UT_TEST(test_t21c_data_scan_chooses_unique_highest_wrap)
+{
+	Page page = build_itl_page();
+	ClusterUndoTTSlotRef ref;
+	ClusterItlSlotData *old = slot_at(page, 0);
+	ClusterItlSlotData *newer = slot_at(page, 1);
+
+	old->flags = ITL_FLAG_COMMITTED;
+	old->xid = (TransactionId)1003;
+	old->wrap = 2;
+	old->undo_segment_head = uba_encode(1, 0, 1, 0);
+	newer->flags = ITL_FLAG_NEEDS_CLEANOUT;
+	newer->xid = (TransactionId)1003;
+	newer->wrap = 5;
+	newer->undo_segment_head = uba_encode(257, 0, 13, 0);
+
+	UT_ASSERT_EQ(
+		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1003, &ref), 1);
+	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 14);
+}
+
 
 /* ---------- spec-3.9 Hardening L213: pd_block_scn redo parity ----------
  *
@@ -1010,6 +1083,9 @@ main(void)
 	UT_RUN(test_t19_lock_scan_ignores_data_active_same_xid);
 	UT_RUN(test_t20_lock_scan_rejects_ambiguous_same_wrap);
 	UT_RUN(test_t21_lock_scan_chooses_highest_wrap);
+	UT_RUN(test_t21a_data_scan_ignores_lock_and_marker_same_xid);
+	UT_RUN(test_t21b_data_scan_rejects_ambiguous_highest_wrap);
+	UT_RUN(test_t21c_data_scan_chooses_unique_highest_wrap);
 	UT_RUN(test_t22_redo_parity_sets_pd_block_scn_on_fresh_page);
 	UT_RUN(test_t23_redo_parity_monotonic_older_write_scn_noop);
 	UT_RUN(test_t24_redo_parity_invalid_write_scn_noop);

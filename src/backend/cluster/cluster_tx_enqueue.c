@@ -48,6 +48,7 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
+#include "cluster/cluster_cancel_token.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
@@ -285,6 +286,17 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 				long wait_ms;
 
 				ResetLatch(MyLatch);
+
+				/*
+				 * Consume only a token that still matches the live TX wait
+				 * published above.  Do not ereport or return from inside
+				 * PG_TRY: the shared cleanup envelope below must clear the
+				 * waiter slot, wait-state, and WFG edge first.
+				 */
+				if (cluster_cancel_token_consume()) {
+					result = CLUSTER_TXW_DEADLOCK;
+					break;
+				}
 
 				/* Re-check the holder's TT status (closes the register/wake race:
 				 * a terminal status published before we slept is seen here). */

@@ -27,6 +27,7 @@
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "storage/lock.h"
@@ -41,13 +42,13 @@
 UT_DEFINE_GLOBALS();
 
 static char *
-read_current_multixact_source(void)
+read_source(const char *path)
 {
 	FILE *file;
 	long length;
 	char *source;
 
-	file = fopen(CLUSTER_MULTIXACT_CURRENT_SOURCE_PATH, "rb");
+	file = fopen(path, "rb");
 	UT_ASSERT_NOT_NULL(file);
 	if (file == NULL)
 		return NULL;
@@ -65,6 +66,25 @@ read_current_multixact_source(void)
 	source[length] = '\0';
 	fclose(file);
 	return source;
+}
+
+static char *
+read_current_multixact_source(void)
+{
+	return read_source(CLUSTER_MULTIXACT_CURRENT_SOURCE_PATH);
+}
+
+static int
+count_occurrences(const char *source, const char *needle)
+{
+	int count = 0;
+	const char *cursor = source;
+
+	while ((cursor = strstr(cursor, needle)) != NULL) {
+		count++;
+		cursor += strlen(needle);
+	}
+	return count;
 }
 
 
@@ -108,6 +128,11 @@ void
 pfree(void *pointer)
 {
 	free(pointer);
+}
+
+void
+cluster_multixact_current_stats_bump(ClusterCurrentMxStatId stat pg_attribute_unused())
+{
 }
 
 uint64
@@ -629,6 +654,10 @@ UT_TEST(test_current_multixact_descriptor_validation)
 
 	UT_ASSERT_EQ(cluster_multixact_current_validate_descriptor(&key, 2, 9, members, 2, 2),
 				 CMX_DESC_OK);
+	key.cluster_epoch = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_validate_descriptor(&key, 2, 0, members, 2, 2),
+				 CMX_DESC_OK);
+	key.cluster_epoch = 9;
 	UT_ASSERT_EQ(cluster_multixact_current_descriptor_hash(&key, members, 2),
 				 UINT64CONST(3535096824512523990));
 	UT_ASSERT_EQ(cluster_multixact_current_validate_descriptor(&key, 1, 9, members, 2, 2),
@@ -893,6 +922,17 @@ UT_TEST(test_current_multixact_updater_candidate_requires_current_exact_binding)
 	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
 					 &candidate, 100, 5, 9, &selected, &selected_result),
 				 CUCP_MATCH);
+	current.cluster_epoch = 0;
+	candidate.cluster_epoch = 0;
+	test_runtime_candidate_current_key = current;
+	test_runtime_candidate_current_result.status_epoch = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
+					 &candidate, 100, 5, 0, &selected, &selected_result),
+				 CUCP_MATCH);
+	current.cluster_epoch = 9;
+	candidate.cluster_epoch = 9;
+	test_runtime_candidate_current_key = current;
+	test_runtime_candidate_current_result.status_epoch = 9;
 
 	/* A different current raw-xid slot does not prove whether the challenged
 	 * full key was recycled; without exact retained provenance it is UNKNOWN. */
@@ -1058,6 +1098,14 @@ UT_TEST(test_current_multixact_origin_subcommitted_exact_chain)
 				 true);
 	UT_ASSERT_EQ(proof.state, CCM_SELF);
 	UT_ASSERT_EQ(proof.key.local_xid, 100);
+
+	child_key.cluster_epoch = 0;
+	initial.status_epoch = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_resolve_origin_member_proof(
+					 100, MultiXactStatusForShare, 3, 5, 0, false, &child_key, &initial,
+					 test_exact_lookup, &table, &proof),
+				 true);
+	UT_ASSERT_EQ(proof.state, CCM_ACTIVE);
 }
 
 
@@ -1075,6 +1123,13 @@ UT_TEST(test_current_multixact_proof_forward_wire_binding)
 	UT_ASSERT_EQ(decoded.prefix.entry_count, 7);
 	UT_ASSERT_EQ(ClusterCurrentMxProofPrefixGetDescriptorHash(&decoded.prefix),
 				 UINT64CONST(0x8877665544332211));
+	request.prefix.epoch = 0;
+	request.prefix.mxkey.cluster_epoch = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_forward(
+					 &request, sizeof(request), 3, 5, UINT64CONST(0), &decoded),
+				 true);
+	request.prefix.epoch = 9;
+	request.prefix.mxkey.cluster_epoch = 9;
 	ClusterCurrentMxProofPrefixSetDescriptorHash(&request.prefix, 0);
 	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_forward(
 					 &request, sizeof(request), 3, 5, UINT64CONST(9), &decoded),
@@ -1557,6 +1612,13 @@ UT_TEST(test_current_multixact_describe_wire_binding)
 				 true);
 	UT_ASSERT_EQ(decoded.prefix.request_id, 501);
 	UT_ASSERT_EQ(decoded.prefix.mxkey.multixact_id, key.multixact_id);
+	request.prefix.epoch = 0;
+	request.prefix.mxkey.cluster_epoch = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(0), &decoded),
+				 true);
+	request.prefix.epoch = 9;
+	request.prefix.mxkey.cluster_epoch = 9;
 
 	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
 					 &request, sizeof(request.prefix), 3, 2, UINT64CONST(9), &decoded),
@@ -1869,13 +1931,24 @@ UT_TEST(test_current_multixact_describe_routes_by_mxid_authority)
 	UT_ASSERT_EQ(test_runtime_remote_describe_calls, 1);
 	UT_ASSERT_EQ(members[0].xid, 200);
 
+	/* Epoch zero is the live initial cluster epoch, not an invalid sentinel. */
+	key.cluster_epoch = 0;
+	test_runtime_epoch = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_describe(&key, members, lengthof(members),
+													&members_count, &reported_total),
+				 CMX_DESC_OK);
+	UT_ASSERT_EQ(test_runtime_native_describe_calls, 1);
+	UT_ASSERT_EQ(test_runtime_remote_describe_calls, 2);
+	key.cluster_epoch = 9;
+	test_runtime_epoch = 9;
+
 	/* Underivable/wrong-origin identity fails before either authority read. */
 	test_runtime_mxid_origin = -1;
 	UT_ASSERT_EQ(cluster_multixact_current_describe(&key, members, lengthof(members),
 													&members_count, &reported_total),
 				 CMX_DESC_UNKNOWN);
 	UT_ASSERT_EQ(test_runtime_native_describe_calls, 1);
-	UT_ASSERT_EQ(test_runtime_remote_describe_calls, 1);
+	UT_ASSERT_EQ(test_runtime_remote_describe_calls, 2);
 	UT_ASSERT_EQ(members_count, 0);
 
 	cluster_node_id = -1;
@@ -2051,6 +2124,8 @@ UT_TEST(test_current_multixact_terminal_nonconflict_and_unknown_precedence)
 	ClusterCurrentMxMemberDesc members[2];
 	ClusterCurrentMemberProof proofs[2];
 	ClusterCurrentMxRequestContext ctx;
+	ClusterCurrentUpdaterChallenge challenge;
+	ClusterCurrentUpdaterProof updater_proof;
 
 	test_member(&members[0], 100, MultiXactStatusForKeyShare);
 	test_member(&members[1], 101, MultiXactStatusForUpdate);
@@ -2063,17 +2138,41 @@ UT_TEST(test_current_multixact_terminal_nonconflict_and_unknown_precedence)
 	UT_ASSERT_EQ(cluster_multixact_current_decide(members, proofs, 2, &ctx, NULL, NULL, NULL),
 				 CMDL_CONTINUE);
 
-	/* An ACTIVE updater uses the same matrix and can also be compatible. */
+	/*
+	 * An ACTIVE updater can be lock-compatible with KeyShare, but
+	 * follow_updates must still lock its exact successor chain.  That
+	 * continuation is allowed only with the full-key updater proof.
+	 */
 	members[0].member_status = MultiXactStatusNoKeyUpdate;
 	proofs[0].member_status = MultiXactStatusNoKeyUpdate;
 	ctx.desired_status = MultiXactStatusForKeyShare;
 	ctx.lock_mode = LockTupleKeyShare;
 	ctx.tuple_shape = CCM_SHAPE_UPDATED;
+	ctx.updater_origin_node_id = 2;
+	memset(&challenge, 0, sizeof(challenge));
+	challenge.candidate_next_xmin_key = proofs[0].key;
+	challenge.updater_xid = members[0].xid;
+	challenge.member_ordinal = 0;
+	memset(&updater_proof, 0, sizeof(updater_proof));
+	updater_proof.mxkey = key;
+	updater_proof.candidate_next_xmin_key = challenge.candidate_next_xmin_key;
+	updater_proof.updater_xid = challenge.updater_xid;
+	updater_proof.member_ordinal = challenge.member_ordinal;
+	updater_proof.verdict = CUCP_MATCH;
+	ctx.follow_updates = 0;
 	UT_ASSERT_EQ(cluster_multixact_current_decide(members, proofs, 2, &ctx, NULL, NULL, NULL),
 				 CMDL_CONTINUE);
+	ctx.follow_updates = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_decide(
+					 members, proofs, 2, &ctx, &challenge, &updater_proof, NULL),
+				 CMDL_FOLLOW_UPDATED);
+	UT_ASSERT_EQ(cluster_multixact_current_decide(
+					 members, proofs, 2, &ctx, NULL, NULL, NULL),
+				 CMDL_UNKNOWN);
 
 	proofs[0].state = CCM_ABORTED;
 	memset(&proofs[0].key, 0, sizeof(proofs[0].key));
+	ctx.follow_updates = 0;
 	UT_ASSERT_EQ(cluster_multixact_current_decide(members, proofs, 2, &ctx, NULL, NULL, NULL),
 				 CMDL_CONTINUE);
 
@@ -2274,10 +2373,437 @@ UT_TEST(test_current_multixact_rejects_context_mode_mismatch)
 }
 
 
+UT_TEST(test_current_multixact_recompose_filters_terminal_members)
+{
+	ClusterCurrentMxMemberDesc members[3];
+	ClusterCurrentMemberProof proofs[3];
+	MultiXactMember normalized[4];
+	uint16 normalized_count = 99;
+
+	test_member(&members[0], 501, MultiXactStatusForShare);
+	test_member(&members[1], 502, MultiXactStatusForKeyShare);
+	test_member(&members[2], 503, MultiXactStatusNoKeyUpdate);
+	test_proof(&proofs[0], &members[0], 0, CCM_COMMITTED, 2, 31);
+	test_proof(&proofs[1], &members[1], 1, CCM_ACTIVE, 2, 32);
+	test_proof(&proofs[2], &members[2], 2, CCM_ABORTED, 2, 33);
+
+	UT_ASSERT_EQ(
+		cluster_multixact_current_recompose(
+			members, proofs, 3, 504, MultiXactStatusForShare,
+			normalized, lengthof(normalized), &normalized_count),
+		CMX_RECOMPOSE_OK);
+	UT_ASSERT_EQ(normalized_count, 2);
+	UT_ASSERT_EQ(normalized[0].xid, 502);
+	UT_ASSERT_EQ(normalized[0].status, MultiXactStatusForKeyShare);
+	UT_ASSERT_EQ(normalized[1].xid, 504);
+	UT_ASSERT_EQ(normalized[1].status, MultiXactStatusForShare);
+}
+
+
+UT_TEST(test_current_multixact_recompose_upgrades_requester_member)
+{
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMemberProof proofs[2];
+	MultiXactMember normalized[3];
+	uint16 normalized_count = 0;
+
+	test_member(&members[0], 601, MultiXactStatusForKeyShare);
+	test_member(&members[1], 602, MultiXactStatusForShare);
+	test_proof(&proofs[0], &members[0], 0, CCM_SELF, 2, 41);
+	test_proof(&proofs[1], &members[1], 1, CCM_ACTIVE, 2, 42);
+
+	UT_ASSERT_EQ(
+		cluster_multixact_current_recompose(
+			members, proofs, 2, 601, MultiXactStatusForUpdate,
+			normalized, lengthof(normalized), &normalized_count),
+		CMX_RECOMPOSE_OK);
+	UT_ASSERT_EQ(normalized_count, 2);
+	UT_ASSERT_EQ(normalized[0].xid, 601);
+	UT_ASSERT_EQ(normalized[0].status, MultiXactStatusForUpdate);
+	UT_ASSERT_EQ(normalized[1].xid, 602);
+	UT_ASSERT_EQ(normalized[1].status, MultiXactStatusForShare);
+}
+
+
+UT_TEST(test_current_multixact_recompose_fails_closed_on_incomplete_proof)
+{
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMemberProof proofs[2];
+	MultiXactMember normalized[3];
+	uint16 normalized_count = 99;
+
+	test_member(&members[0], 701, MultiXactStatusForKeyShare);
+	test_member(&members[1], 702, MultiXactStatusForShare);
+	test_proof(&proofs[0], &members[0], 0, CCM_ACTIVE, 2, 51);
+	test_proof(&proofs[1], &members[1], 1, CCM_UNKNOWN, 2, 52);
+
+	UT_ASSERT_EQ(
+		cluster_multixact_current_recompose(
+			members, proofs, 2, 703, MultiXactStatusForShare,
+			normalized, lengthof(normalized), &normalized_count),
+		CMX_RECOMPOSE_UNKNOWN);
+	UT_ASSERT_EQ(normalized_count, 0);
+	UT_ASSERT_EQ(normalized[0].xid, InvalidTransactionId);
+}
+
+UT_TEST(test_current_multixact_recompose_filters_terminal_before_cap_check)
+{
+	ClusterCurrentMxMemberDesc members[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	ClusterCurrentMemberProof proofs[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	MultiXactMember normalized[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	uint16 normalized_count = 0;
+	uint16 i;
+
+	for (i = 0; i < CLUSTER_CURRENT_MX_MAX_MEMBERS; i++)
+	{
+		test_member(&members[i], (TransactionId) (1000 + i),
+					MultiXactStatusForKeyShare);
+		test_proof(&proofs[i], &members[i], i, CCM_ABORTED, 2,
+				   (uint16) (100 + i));
+	}
+	test_proof(&proofs[0], &members[0], 0, CCM_ACTIVE, 2, 100);
+
+	UT_ASSERT_EQ(
+		cluster_multixact_current_recompose(
+			members, proofs, CLUSTER_CURRENT_MX_MAX_MEMBERS, 5000,
+			MultiXactStatusForShare, normalized, lengthof(normalized),
+			&normalized_count),
+		CMX_RECOMPOSE_OK);
+	UT_ASSERT_EQ(normalized_count, 2);
+	UT_ASSERT_EQ(normalized[0].xid, 1000);
+	UT_ASSERT_EQ(normalized[1].xid, 5000);
+}
+
+UT_TEST(test_current_multixact_heap_bridge_orders_authority_before_decision)
+{
+	char *source = read_source(HEAPAM_SOURCE_PATH);
+	const char *bridge;
+	const char *describe;
+	const char *resolve;
+	const char *decide;
+	const char *recompose;
+	const char *wait;
+
+	if (source == NULL)
+		return;
+	bridge = strstr(source, "\ncluster_current_mx_authorize(");
+	describe = bridge != NULL
+		? strstr(bridge, "cluster_multixact_current_describe(") : NULL;
+	resolve = describe != NULL
+		? strstr(describe, "cluster_multixact_current_members_resolve(") : NULL;
+	decide = resolve != NULL
+		? strstr(resolve, "cluster_multixact_current_decide(") : NULL;
+	recompose = decide != NULL
+		? strstr(decide, "cluster_multixact_current_recompose(") : NULL;
+	wait = decide != NULL ? strstr(decide, "cluster_tx_enqueue_wait(") : NULL;
+	UT_ASSERT_NOT_NULL(bridge);
+	UT_ASSERT_NOT_NULL(describe);
+	UT_ASSERT_NOT_NULL(resolve);
+	UT_ASSERT_NOT_NULL(decide);
+	UT_ASSERT_NOT_NULL(recompose);
+	UT_ASSERT_NOT_NULL(wait);
+	UT_ASSERT(describe < resolve && resolve < decide);
+	free(source);
+}
+
+UT_TEST(test_current_multixact_heap_bridge_covers_four_dml_callers)
+{
+	char *source = read_source(HEAPAM_SOURCE_PATH);
+
+	if (source == NULL)
+		return;
+	UT_ASSERT_EQ(count_occurrences(source, "cluster_current_mx_authorize("), 5);
+	UT_ASSERT_STR_CONTAINS(source, "CCM_ACTION_DELETE");
+	UT_ASSERT_STR_CONTAINS(source, "CCM_ACTION_UPDATE");
+	UT_ASSERT_EQ(count_occurrences(source, "CCM_ACTION_LOCK"), 2);
+	UT_ASSERT_STR_CONTAINS(source, "cluster_current_mx_compose_remote_single(");
+	UT_ASSERT_STR_CONTAINS(source, "CCMH_STAMP_PRIMARY");
+	UT_ASSERT_STR_CONTAINS(source, "CCMH_STAMP_TEMP_LOCK");
+	UT_ASSERT_STR_CONTAINS(source, "CCMH_STAMP_SURVIVORS");
+	free(source);
+}
+
+UT_TEST(test_current_multixact_local_compose_installs_requester_tt_authority)
+{
+	char *source = read_source(HEAPAM_SOURCE_PATH);
+	const char *lock_tuple;
+	const char *compose;
+	const char *bind;
+	const char *bind_member;
+	const char *active;
+	const char *lock_tuple_end;
+
+	if (source == NULL)
+		return;
+	lock_tuple = strstr(source, "\nheap_lock_tuple(");
+	compose = lock_tuple != NULL
+		? strstr(lock_tuple, "if (cluster_will_stamp_multixact_marker)") : NULL;
+	bind = compose != NULL
+		? strstr(compose, "cluster_tt_local_get_or_create_binding(") : NULL;
+	bind_member = bind != NULL
+		? strstr(bind, "cluster_multixact_member_xid") : NULL;
+	active = bind != NULL
+		? strstr(bind,
+				 "cluster_tt_local_record_active("
+				 "cluster_multixact_member_xid)") : NULL;
+	lock_tuple_end = lock_tuple != NULL
+		? strstr(lock_tuple, "\n}\n\n/*\n * Acquire heavyweight lock") : NULL;
+	UT_ASSERT_NOT_NULL(lock_tuple);
+	UT_ASSERT_NOT_NULL(compose);
+	UT_ASSERT_NOT_NULL(bind);
+	UT_ASSERT_NOT_NULL(bind_member);
+	UT_ASSERT_NOT_NULL(active);
+	UT_ASSERT_NOT_NULL(lock_tuple_end);
+	if (active != NULL && lock_tuple_end != NULL)
+		UT_ASSERT(active < lock_tuple_end);
+	free(source);
+}
+
+UT_TEST(test_current_multixact_htsu_routes_peer_current_before_local_decode)
+{
+	char *source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	const char *fork;
+	const char *multi;
+	const char *peer_gate;
+	const char *resolve;
+
+	if (source == NULL)
+		return;
+	fork = strstr(source, "\ncluster_satisfies_update_fork(");
+	multi = fork != NULL
+		? strstr(fork, "if (tuple->t_infomask & HEAP_XMAX_IS_MULTI)") : NULL;
+	peer_gate = multi != NULL
+		? strstr(multi, "if (cluster_peer_mode_enabled()") : NULL;
+	resolve = multi != NULL
+		? strstr(multi, "cluster_visibility_resolve_tuple(") : NULL;
+	UT_ASSERT_NOT_NULL(fork);
+	UT_ASSERT_NOT_NULL(multi);
+	UT_ASSERT_NOT_NULL(peer_gate);
+	UT_ASSERT_NOT_NULL(resolve);
+	UT_ASSERT(peer_gate < resolve);
+	free(source);
+}
+
+UT_TEST(test_current_multixact_reader_overlay_unknown_asks_origin)
+{
+	char *source = read_source(CLUSTER_MULTIXACT_SOURCE_PATH);
+	const char *resolve;
+	const char *overlay_decision;
+	const char *unknown_fallback;
+	const char *origin_ask;
+	const char *next_function;
+
+	if (source == NULL)
+		return;
+	resolve = strstr(source, "\ncluster_multixact_remote_xmax_resolve(");
+	overlay_decision = resolve != NULL
+		? strstr(resolve, "decision = cluster_multixact_resolve_visibility(mxres, snap)") : NULL;
+	unknown_fallback = overlay_decision != NULL
+		? strstr(overlay_decision, "if (decision == CLUSTER_VISIBILITY_UNKNOWN)") : NULL;
+	origin_ask = unknown_fallback != NULL
+		? strstr(unknown_fallback,
+				 "cluster_multixact_remote_xmax_ask_origin(origin_slot, mxid, snap)") : NULL;
+	next_function = resolve != NULL
+		? strstr(resolve, "\ncluster_multixact_get_member_count(") : NULL;
+	UT_ASSERT_NOT_NULL(resolve);
+	UT_ASSERT_NOT_NULL(overlay_decision);
+	UT_ASSERT_NOT_NULL(unknown_fallback);
+	UT_ASSERT_NOT_NULL(origin_ask);
+	UT_ASSERT_NOT_NULL(next_function);
+	if (origin_ask != NULL && next_function != NULL)
+		UT_ASSERT(origin_ask < next_function);
+	free(source);
+}
+
+UT_TEST(test_current_multixact_latest_tid_uses_authoritative_hot_updater)
+{
+	char *source = read_source(HEAPAM_SOURCE_PATH);
+	const char *latest;
+	const char *latest_end;
+	const char *all_current_multi;
+	const char *exclusive;
+	const char *authority;
+	const char *same_buffer_recheck;
+	const char *latest_full_key_handoff;
+	const char *latest_share_downgrade;
+	const char *native_decode;
+	const char *hot_search;
+	const char *hot_search_end;
+	const char *hot_authority;
+	const char *hot_full_key_handoff;
+	const char *hot_share_downgrade;
+	const char *hot_native_decode;
+
+	if (source == NULL)
+		return;
+	latest = strstr(source, "\nheap_get_latest_tid(");
+	latest_end = latest != NULL
+		? strstr(latest, "\n}\n\n\n/*\n * UpdateXmaxHintBits") : NULL;
+	all_current_multi = latest != NULL
+		? strstr(latest, "cluster_authoritative_current_multi =") : NULL;
+	exclusive = latest != NULL
+		? strstr(latest, "LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE)") : NULL;
+	authority = latest != NULL
+		? strstr(latest, "cluster_current_mx_hot_updater_for_chain(") : NULL;
+	same_buffer_recheck = authority != NULL
+		? strstr(authority, "goto cluster_latest_tid_recheck") : NULL;
+	latest_full_key_handoff = latest != NULL
+		? strstr(latest, "cluster_current_mx_successor_key_matches(") : NULL;
+	latest_share_downgrade = authority != NULL
+		? strstr(authority, "LockBuffer(buffer, BUFFER_LOCK_SHARE)") : NULL;
+	native_decode = latest != NULL
+		? strstr(latest, "HeapTupleHeaderGetUpdateXid(tp.t_data)") : NULL;
+	hot_search = strstr(source, "\nheap_hot_search_buffer(");
+	hot_search_end = hot_search != NULL
+		? strstr(hot_search, "\n}\n\n/*\n *\theap_get_latest_tid") : NULL;
+	hot_authority = hot_search != NULL
+		? strstr(hot_search, "cluster_current_mx_hot_updater_for_chain(") : NULL;
+	hot_full_key_handoff = hot_search != NULL
+		? strstr(hot_search, "cluster_current_mx_successor_key_matches(") : NULL;
+	hot_share_downgrade = hot_authority != NULL
+		? strstr(hot_authority, "LockBuffer(buffer, BUFFER_LOCK_SHARE)") : NULL;
+	hot_native_decode = hot_search != NULL
+		? strstr(hot_search, "HeapTupleHeaderGetUpdateXid(heapTuple->t_data)") : NULL;
+	UT_ASSERT_NOT_NULL(latest);
+	UT_ASSERT_NOT_NULL(latest_end);
+	UT_ASSERT_NOT_NULL(all_current_multi);
+	UT_ASSERT_NOT_NULL(exclusive);
+	UT_ASSERT_NOT_NULL(authority);
+	UT_ASSERT_NOT_NULL(same_buffer_recheck);
+	UT_ASSERT_NOT_NULL(latest_full_key_handoff);
+	UT_ASSERT_NOT_NULL(latest_share_downgrade);
+	UT_ASSERT_NOT_NULL(native_decode);
+	UT_ASSERT_NOT_NULL(hot_search);
+	UT_ASSERT_NOT_NULL(hot_search_end);
+	UT_ASSERT_NOT_NULL(hot_authority);
+	UT_ASSERT_NOT_NULL(hot_full_key_handoff);
+	UT_ASSERT_NOT_NULL(hot_share_downgrade);
+	UT_ASSERT_NOT_NULL(hot_native_decode);
+	if (latest_end != NULL && exclusive != NULL && authority != NULL
+		&& latest_full_key_handoff != NULL && latest_share_downgrade != NULL)
+		UT_ASSERT(latest_full_key_handoff < authority
+				  && exclusive < authority
+				  && authority < latest_share_downgrade
+				  && latest_share_downgrade < latest_end);
+	if (latest_end != NULL && native_decode != NULL)
+		UT_ASSERT(native_decode < latest_end);
+	if (hot_search_end != NULL && hot_authority != NULL
+		&& hot_full_key_handoff != NULL && hot_share_downgrade != NULL
+		&& hot_native_decode != NULL)
+		UT_ASSERT(hot_full_key_handoff < hot_authority
+				  && hot_authority < hot_share_downgrade
+				  && hot_share_downgrade < hot_native_decode
+				  && hot_native_decode < hot_search_end);
+	free(source);
+}
+
+UT_TEST(test_current_multixact_heap_bridge_uses_decoded_cmax_and_follows_active_updater)
+{
+	char *source = read_source(HEAPAM_SOURCE_PATH);
+	const char *bridge;
+	const char *bridge_end;
+	const char *decoded_cmax;
+	const char *raw_cid;
+	const char *follow_decision;
+	const char *follow_recompose;
+	const char *follow_successor_proof;
+	const char *lock_tuple;
+	const char *lock_tuple_end;
+	const char *follow_flag;
+	const char *follow_helper;
+	const char *recursive;
+	const char *recursive_end;
+	const char *proof_recheck;
+	const char *foreign_xmin_bypass;
+	const char *local_abort_bypass;
+	const char *first_proof_clear;
+	const char *clear_at_next_hop;
+
+	if (source == NULL)
+		return;
+	bridge = strstr(source, "\ncluster_current_mx_authorize(");
+	bridge_end = bridge != NULL
+		? strstr(bridge, "\nstatic void\ncluster_current_mx_make_stamp") : NULL;
+	decoded_cmax = bridge != NULL
+		? strstr(bridge, "ctx.tuple_cmax = HeapTupleHeaderGetCmax(tuple->t_data)") : NULL;
+	raw_cid = bridge != NULL
+		? strstr(bridge, "ctx.tuple_cmax = HeapTupleHeaderGetRawCommandId(tuple->t_data)") : NULL;
+	follow_decision = bridge != NULL
+		? strstr(bridge, "case CMDL_FOLLOW_UPDATED:") : NULL;
+	follow_recompose = follow_decision != NULL
+		? strstr(follow_decision, "cluster_multixact_current_recompose(") : NULL;
+	follow_successor_proof = follow_decision != NULL
+		? strstr(follow_decision, "cluster_current_mx_set_successor_proof(") : NULL;
+	lock_tuple = strstr(source, "\nheap_lock_tuple(");
+	lock_tuple_end = lock_tuple != NULL
+		? strstr(lock_tuple, "\n}\n\n/*\n * Acquire heavyweight lock") : NULL;
+	follow_flag = lock_tuple != NULL
+		? strstr(lock_tuple, "cluster_current_mx.follow_updated_chain") : NULL;
+	follow_helper = lock_tuple != NULL
+		? strstr(lock_tuple, "heap_lock_updated_tuple_authoritative(") : NULL;
+	recursive = strstr(source, "\nheap_lock_updated_tuple_rec(");
+	recursive_end = recursive != NULL
+		? strstr(recursive, "\n}\n\n/*\n * heap_lock_updated_tuple") : NULL;
+	proof_recheck = recursive != NULL
+		? strstr(recursive, "cluster_current_mx_successor_matches(") : NULL;
+	foreign_xmin_bypass = proof_recheck != NULL
+		? strstr(proof_recheck,
+				 "&& !expected_successor.valid\n"
+				 "\t\t\t&& cluster_xid_provably_foreign") : NULL;
+	local_abort_bypass = proof_recheck != NULL
+		? strstr(proof_recheck,
+				 "if (!expected_successor.valid\n"
+				 "\t\t\t&& TransactionIdDidAbort") : NULL;
+	first_proof_clear = proof_recheck != NULL
+		? strstr(proof_recheck,
+				 "memset(&expected_successor, 0, sizeof(expected_successor));") : NULL;
+	clear_at_next_hop = proof_recheck != NULL
+		? strstr(proof_recheck,
+				 "memset(&expected_successor, 0, sizeof(expected_successor));\n"
+				 "\t\tpriorXmax = HeapTupleHeaderGetUpdateXid") : NULL;
+	UT_ASSERT_NOT_NULL(bridge);
+	UT_ASSERT_NOT_NULL(bridge_end);
+	UT_ASSERT_NOT_NULL(decoded_cmax);
+	UT_ASSERT_NULL(raw_cid);
+	UT_ASSERT_NOT_NULL(follow_decision);
+	UT_ASSERT_NOT_NULL(follow_recompose);
+	UT_ASSERT_NOT_NULL(follow_successor_proof);
+	UT_ASSERT_NOT_NULL(lock_tuple);
+	UT_ASSERT_NOT_NULL(lock_tuple_end);
+	UT_ASSERT_NOT_NULL(follow_flag);
+	UT_ASSERT_NOT_NULL(follow_helper);
+	UT_ASSERT_NOT_NULL(recursive);
+	UT_ASSERT_NOT_NULL(recursive_end);
+	UT_ASSERT_NOT_NULL(proof_recheck);
+	UT_ASSERT_NOT_NULL(foreign_xmin_bypass);
+	UT_ASSERT_NOT_NULL(local_abort_bypass);
+	UT_ASSERT_NOT_NULL(first_proof_clear);
+	UT_ASSERT_NOT_NULL(clear_at_next_hop);
+	UT_ASSERT(first_proof_clear == clear_at_next_hop);
+	if (bridge_end != NULL && decoded_cmax != NULL)
+		UT_ASSERT(decoded_cmax < bridge_end);
+	if (bridge_end != NULL && follow_decision != NULL
+		&& follow_recompose != NULL && follow_successor_proof != NULL)
+		UT_ASSERT(follow_decision < follow_recompose
+				  && follow_recompose < follow_successor_proof
+				  && follow_successor_proof < bridge_end);
+	if (lock_tuple_end != NULL && follow_flag != NULL && follow_helper != NULL)
+		UT_ASSERT(follow_flag < follow_helper && follow_helper < lock_tuple_end);
+	if (recursive_end != NULL && proof_recheck != NULL
+		&& foreign_xmin_bypass != NULL && local_abort_bypass != NULL
+		&& clear_at_next_hop != NULL)
+		UT_ASSERT(proof_recheck < foreign_xmin_bypass
+				  && foreign_xmin_bypass < local_abort_bypass
+				  && local_abort_bypass < clear_at_next_hop
+				  && clear_at_next_hop < recursive_end);
+	free(source);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(31);
 	UT_RUN(test_current_multixact_public_symbols_link);
 	UT_RUN(test_current_multixact_descriptor_validation);
 	UT_RUN(test_current_multixact_descriptor_accepts_cap_and_hashes_order);
@@ -2298,6 +2824,17 @@ main(void)
 	UT_RUN(test_current_multixact_member_states_and_self_cid);
 	UT_RUN(test_current_multixact_committed_updater_requires_exact_hot_proof);
 	UT_RUN(test_current_multixact_rejects_context_mode_mismatch);
+	UT_RUN(test_current_multixact_recompose_filters_terminal_members);
+	UT_RUN(test_current_multixact_recompose_upgrades_requester_member);
+	UT_RUN(test_current_multixact_recompose_fails_closed_on_incomplete_proof);
+	UT_RUN(test_current_multixact_recompose_filters_terminal_before_cap_check);
+	UT_RUN(test_current_multixact_heap_bridge_orders_authority_before_decision);
+	UT_RUN(test_current_multixact_heap_bridge_covers_four_dml_callers);
+	UT_RUN(test_current_multixact_local_compose_installs_requester_tt_authority);
+	UT_RUN(test_current_multixact_htsu_routes_peer_current_before_local_decode);
+	UT_RUN(test_current_multixact_reader_overlay_unknown_asks_origin);
+	UT_RUN(test_current_multixact_latest_tid_uses_authoritative_hot_updater);
+	UT_RUN(test_current_multixact_heap_bridge_uses_decoded_cmax_and_follows_active_updater);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -47,6 +47,7 @@
 #include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
+#include "cluster/cluster_multixact_current_stats.h" /* spec-3.6b D4 counter stub */
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched getter stubs */
 #include "cluster/cluster_touched_peers.h"	  /* spec-5.14 D6 self_hex stub */
@@ -74,6 +75,12 @@
 static const char *captured_dump_categories[CAPTURED_DUMP_ROWS_MAX];
 static const char *captured_dump_keys[CAPTURED_DUMP_ROWS_MAX];
 static int captured_dump_row_count;
+
+uint64
+cluster_multixact_current_stats_get(ClusterCurrentMxStatId stat pg_attribute_unused())
+{
+	return 0;
+}
 
 
 /* ----------

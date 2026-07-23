@@ -366,16 +366,29 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	Buffer		buffer;
 	HeapTuple	tuple = &bslot->base.tupdata;
 	bool		follow_updates;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterHeapSuccessorProof expected_successor;
+	ClusterHeapSuccessorProof next_successor;
+#endif
 
 	follow_updates = (flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0;
 	tmfd->traversed = false;
+#ifdef USE_PGRAC_CLUSTER
+	memset(&expected_successor, 0, sizeof(expected_successor));
+	memset(&next_successor, 0, sizeof(next_successor));
+#endif
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
 
 tuple_lock_retry:
 	tuple->t_self = *tid;
 	result = heap_lock_tuple(relation, tuple, cid, mode, wait_policy,
-							 follow_updates, &buffer, tmfd);
+							 follow_updates, &buffer, tmfd
+#ifdef USE_PGRAC_CLUSTER
+							 , expected_successor.valid ? &expected_successor : NULL
+							 , &next_successor
+#endif
+							 );
 
 	if (result == TM_Updated &&
 		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
@@ -389,6 +402,23 @@ tuple_lock_retry:
 		{
 			SnapshotData SnapshotDirty;
 			TransactionId priorXmax;
+
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * A current-MultiXact authority result carries the exact
+			 * successor ITL/TT proof.  Re-enter heap_lock_tuple directly and
+			 * consume that proof under the destination PCM-X; never reduce it
+			 * to tmfd.xmax/raw xmin across this unlocked handoff.
+			 */
+			if (next_successor.valid)
+			{
+				expected_successor = next_successor;
+				*tid = next_successor.tid;
+				tmfd->traversed = true;
+				goto tuple_lock_retry;
+			}
+			memset(&expected_successor, 0, sizeof(expected_successor));
+#endif
 
 			/* it was updated, so look at the updated version */
 			*tid = tmfd->ctid;

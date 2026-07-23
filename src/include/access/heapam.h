@@ -40,6 +40,25 @@ typedef struct BulkInsertStateData *BulkInsertState;
 struct TupleTableSlot;
 struct VacuumCutoffs;
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Requester-local handoff for one authority-proven update-chain successor.
+ * This is not a wire or on-disk ABI.  The consumer must match every field
+ * against the successor's live ITL/TT binding while holding a content lock;
+ * tuple-lock consumers additionally require PCM-X.
+ */
+typedef struct ClusterHeapSuccessorProof
+{
+	ItemPointerData tid;
+	TransactionId updater_xid;
+	uint16		origin_node_id;
+	uint16		undo_segment_id;
+	uint32		tt_slot_id;
+	uint32		cluster_epoch;
+	bool		valid;
+} ClusterHeapSuccessorProof;
+#endif
+
 #define MaxLockTupleMode	LockTupleExclusive
 
 /*
@@ -254,7 +273,12 @@ extern TM_Result heap_update(Relation relation, ItemPointer otid,
 extern TM_Result heap_lock_tuple(Relation relation, HeapTuple tuple,
 								 CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy,
 								 bool follow_updates,
-								 Buffer *buffer, struct TM_FailureData *tmfd);
+								 Buffer *buffer, struct TM_FailureData *tmfd
+#ifdef USE_PGRAC_CLUSTER
+								 , const ClusterHeapSuccessorProof *expected_successor
+								 , ClusterHeapSuccessorProof *next_successor
+#endif
+								 );
 
 extern bool heap_inplace_lock(Relation relation,
 							  HeapTuple oldtup_ptr, Buffer buffer,

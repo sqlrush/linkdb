@@ -4142,7 +4142,6 @@ cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterC
 	BufferTag route_tag;
 	uint64 request_id = 0;
 	uint64 request_epoch;
-	uint32 capability_generation = 0;
 	int worker_id;
 	bool got_reply = false;
 	ClusterMxDescribeResult result = CMX_DESC_UNKNOWN;
@@ -4156,11 +4155,9 @@ cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterC
 	if (key == NULL || members == NULL || members_count == NULL
 		|| reported_total_members == NULL || origin_node < 0 || origin_node == cluster_node_id
 		|| origin_node >= CLUSTER_MAX_NODES || key->origin_node_id != (uint16)origin_node
-		|| key->cluster_epoch == 0 || key->cluster_epoch != cluster_epoch_get_current()
+		|| key->cluster_epoch != cluster_epoch_get_current()
 		|| !MultiXactIdIsValid(key->multixact_id)
-		|| !cluster_gcs_block_family_on_data_plane()
-		|| !cluster_sf_peer_multixact_current_capability_generation(
-			origin_node, &capability_generation))
+		|| !cluster_gcs_block_family_on_data_plane())
 		return CMX_DESC_UNKNOWN;
 
 	request_epoch = cluster_epoch_get_current();
@@ -4204,10 +4201,9 @@ cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterC
 												(int32)MyBackendId);
 		worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 		if (worker_id < 0
-			|| !cluster_lms_outbound_enqueue_cap_bound(
+			|| !cluster_lms_outbound_enqueue(
 				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, &request,
-				sizeof(request), PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
-				capability_generation)) {
+				sizeof(request))) {
 			result = CMX_DESC_UNKNOWN;
 			goto describe_done;
 		}
@@ -4296,7 +4292,6 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	BufferTag route_tag;
 	uint64 request_id = 0;
 	uint64 request_epoch;
-	uint32 capability_generation = 0;
 	int worker_id;
 	bool got_reply = false;
 	ClusterMxResolveResult result = CMX_RESOLVE_UNKNOWN;
@@ -4316,9 +4311,7 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	}
 	if (request == NULL || proofs == NULL || proof_count == NULL || updater_proof == NULL
 		|| origin_node < 0 || origin_node == cluster_node_id || origin_node >= CLUSTER_MAX_NODES
-		|| !cluster_gcs_block_family_on_data_plane()
-		|| !cluster_sf_peer_multixact_current_capability_generation(
-			origin_node, &capability_generation))
+		|| !cluster_gcs_block_family_on_data_plane())
 		return CMX_RESOLVE_UNKNOWN;
 
 	request_epoch = cluster_epoch_get_current();
@@ -4367,10 +4360,9 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 												(int32)MyBackendId);
 		worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 		if (worker_id < 0
-			|| !cluster_lms_outbound_enqueue_cap_bound(
+			|| !cluster_lms_outbound_enqueue(
 				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, request,
-				sizeof(*request), PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
-				capability_generation)) {
+				sizeof(*request))) {
 			result = CMX_RESOLVE_UNKNOWN;
 			goto proof_done;
 		}

@@ -650,7 +650,8 @@ static bool
 cluster_tt_status_current_entries_agree(const ClusterTTOverlayEntry *a,
 										const ClusterTTOverlayEntry *b)
 {
-	return a->key.tt_slot_id == b->key.tt_slot_id && a->status == b->status
+	return memcmp(&a->key, &b->key, sizeof(a->key)) == 0
+		   && a->status == b->status
 		   && a->commit_scn == b->commit_scn && a->status_epoch == b->status_epoch
 		   && a->has_parent_key == b->has_parent_key
 		   && memcmp(&a->parent_key, &b->parent_key, sizeof(a->parent_key)) == 0;
@@ -697,7 +698,8 @@ cluster_tt_status_lookup_current_own_xid_internal(
 		return false;
 
 	epoch = cluster_epoch_get_current();
-	if (epoch == 0 || epoch > UINT32_MAX)
+	/* CLUSTER_EPOCH_INITIAL (zero) is a live epoch, not a miss sentinel. */
+	if (epoch > UINT32_MAX)
 		return false;
 	if (candidate != NULL
 		&& (candidate->origin_node_id != (uint16)cluster_node_id
@@ -742,7 +744,8 @@ cluster_tt_status_lookup_current_own_xid_internal(
 
 	*key = selected.key;
 	cluster_tt_status_fill_result_from_entry(&selected, result);
-	if (candidate_verdict != NULL && candidate_found)
+	if (candidate_verdict != NULL && candidate_found
+		&& memcmp(&selected.key, candidate, sizeof(selected.key)) == 0)
 		*candidate_verdict = CLUSTER_TT_CURRENT_KEY_MATCH;
 	pg_atomic_fetch_add_u64(&ClusterTTStatusState->lookup_hit_count, 1);
 	if (result->status == CLUSTER_TT_STATUS_SUBCOMMITTED)

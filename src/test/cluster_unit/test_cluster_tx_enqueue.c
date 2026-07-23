@@ -131,15 +131,18 @@ UT_TEST(test_all_production_callers_use_the_five_way_closed_set)
 	char *source = read_source(HEAPAM_SOURCE_PATH);
 	const char *first;
 	const char *second;
+	const char *third;
 
 	if (source == NULL)
 		return;
 
-	UT_ASSERT_EQ(count_occurrences(source, "cluster_tx_enqueue_wait("), 2);
+	UT_ASSERT_EQ(count_occurrences(source, "cluster_tx_enqueue_wait("), 3);
 	first = strstr(source, "cluster_tx_enqueue_wait(");
 	second = first != NULL ? strstr(first + 1, "cluster_tx_enqueue_wait(") : NULL;
+	third = second != NULL ? strstr(second + 1, "cluster_tx_enqueue_wait(") : NULL;
 	assert_exhaustive_result_switch(first);
 	assert_exhaustive_result_switch(second);
+	assert_exhaustive_result_switch(third);
 	free(source);
 }
 

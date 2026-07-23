@@ -143,6 +143,20 @@ UT_TEST(test_obs2_update_xmax_full_table)
 				 (int)CVV_GONE_DELETED);
 	UT_ASSERT_EQ((int)cluster_vis_update_xmax_verdict(CLUSTER_TT_STATUS_ABORTED, true),
 				 (int)CVV_VISIBLE);
+
+	/* terminal lock-only xmax never means UPDATE/DELETE */
+	UT_ASSERT_EQ((int)cluster_vis_update_lock_only_xmax_verdict(CLUSTER_TT_STATUS_ABORTED),
+				 (int)CVV_VISIBLE);
+	UT_ASSERT_EQ((int)cluster_vis_update_lock_only_xmax_verdict(CLUSTER_TT_STATUS_COMMITTED),
+				 (int)CVV_VISIBLE);
+	UT_ASSERT_EQ((int)cluster_vis_update_lock_only_xmax_verdict(CLUSTER_TT_STATUS_CLEANED_OUT),
+				 (int)CVV_VISIBLE);
+	UT_ASSERT_EQ((int)cluster_vis_update_lock_only_xmax_verdict(CLUSTER_TT_STATUS_IN_PROGRESS),
+				 (int)CVV_BEING_MODIFIED);
+	UT_ASSERT_EQ((int)cluster_vis_update_lock_only_xmax_verdict(CLUSTER_TT_STATUS_SUBCOMMITTED),
+				 (int)CVV_BEING_MODIFIED);
+	UT_ASSERT_EQ((int)cluster_vis_update_lock_only_xmax_verdict(CLUSTER_TT_STATUS_UNKNOWN),
+				 (int)CVV_FAILCLOSED_UNKNOWN);
 }
 
 /* ---- OBS-3 Dirty: in-progress -> 53R9H conflict (no wait layer) ---- */

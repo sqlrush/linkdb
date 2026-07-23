@@ -312,6 +312,61 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 }
 
 /*
+ * cluster_itl_find_data_tt_ref_by_xid
+ *
+ * Heap UPDATE makes the old tuple version's t_itl_slot_idx point at the
+ * updater, because that slot is the authority for xmax.  Its xmin can still
+ * name an earlier writer whose data ITL slot remains elsewhere on the same
+ * page.  Recover that exact authority by scanning the bounded eight-slot
+ * array.  Lock-only and MultiXact marker states are deliberately excluded:
+ * their xid field has a different consumer (and the marker stores an MXID).
+ */
+bool
+cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
+									ClusterUndoTTSlotRef *ref)
+{
+	const ClusterItlSlotData *slots;
+	int match_idx = -1;
+	uint16 match_wrap = 0;
+	bool highest_wrap_ambiguous = false;
+	uint8 i;
+
+	Assert(page != NULL);
+	Assert(ref != NULL);
+
+	if (!PageHasItl(page))
+		return false;
+	if (!TransactionIdIsValid(raw_xid))
+		return false;
+
+	slots = ClusterPageGetItlSlots(page);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		const ClusterItlSlotData *slot = &slots[i];
+		bool is_data_state;
+
+		is_data_state = slot->flags == ITL_FLAG_ACTIVE
+						|| slot->flags == ITL_FLAG_COMMITTED
+						|| slot->flags == ITL_FLAG_ABORTED
+						|| slot->flags == ITL_FLAG_NEEDS_CLEANOUT;
+		if (!is_data_state || slot->xid != raw_xid
+			|| UBA_is_invalid(slot->undo_segment_head))
+			continue;
+
+		if (match_idx < 0 || slot->wrap > match_wrap) {
+			match_idx = (int)i;
+			match_wrap = slot->wrap;
+			highest_wrap_ambiguous = false;
+		} else if (slot->wrap == match_wrap)
+			highest_wrap_ambiguous = true;
+	}
+
+	if (match_idx < 0 || highest_wrap_ambiguous)
+		return false;
+
+	return cluster_itl_get_tt_ref(page, (uint8)match_idx, ref);
+}
+
+/*
  * cluster_itl_find_lock_tt_ref_by_xmax (spec-3.4d D1 / F2):
  *
  *	Scan the page's ITL slot array for a LOCK_ONLY slot whose xid

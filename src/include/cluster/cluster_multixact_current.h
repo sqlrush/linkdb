@@ -168,7 +168,8 @@ typedef enum ClusterCurrentMxDecision {
 	CMDL_LOCK_NOT_AVAILABLE,
 	CMDL_UPDATED,
 	CMDL_DELETED,
-	CMDL_UNKNOWN
+	CMDL_UNKNOWN,
+	CMDL_FOLLOW_UPDATED
 } ClusterCurrentMxDecision;
 
 

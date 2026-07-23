@@ -51,7 +51,10 @@ typedef enum ClusterTxwResult {
 	CLUSTER_TXW_DEAD_HOLDER,  /* holder node fenced / TT ABORTED — re-judge */
 	/* A PCM-X freeze made sleeping under another held content lock unsafe.
 	 * Process-local only: callers must retry/fail before any terminal handler. */
-	CLUSTER_TXW_RETRY
+	CLUSTER_TXW_RETRY,
+	/* Matching LMD cancel token consumed while the exact wait remained live.
+	 * The wait function returns this only after slot/state/edge cleanup. */
+	CLUSTER_TXW_DEADLOCK
 } ClusterTxwResult;
 
 /*
@@ -62,8 +65,10 @@ typedef enum ClusterTxwResult {
  *   effective_timeout_ms:  finite wait budget; values <= 0 are clamped to a
  *     finite default (perpetual -1 is forbidden, Q6 / 5.1b clause 8).
  *
- * Returns RESOLVED / TIMEOUT / DEAD_HOLDER / RETRY.  RETRY means the caller
- * must leave the current PCM-X freeze window before attempting another wait.
+ * Returns RESOLVED / TIMEOUT / DEAD_HOLDER / RETRY / DEADLOCK.  RETRY means
+ * the caller must leave the current PCM-X freeze window before attempting
+ * another wait.  DEADLOCK means matching-token consumption and all wait
+ * cleanup have completed; the immediate caller maps it to SQLSTATE 40P01.
  * Does not change any tuple.
  */
 extern ClusterTxwResult cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key,

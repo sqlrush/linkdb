@@ -816,8 +816,32 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 
 	switch (which) {
 	case CLUSTER_VIS_XMIN:
-	case CLUSTER_VIS_XMAX_UPDATE:
 		/* The tuple's own ITL slot records the last writer of this version. */
+		if (htup->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
+			&& cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref)) {
+			if (ref.local_xid == raw_xid)
+				classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
+			else {
+				/*
+				 * An updated old tuple points at its xmax writer, not its
+				 * original xmin creator.  Prefer an exact surviving data
+				 * slot for xmin; only if none is available classify the
+				 * recycled last-writer ref through the existing fail-closed
+				 * remote-outcome path.
+				 */
+				ClusterUndoTTSlotRef xmin_ref;
+
+				if (cluster_itl_find_data_tt_ref_by_xid(page, raw_xid, &xmin_ref))
+					classify_ref(raw_xid, &xmin_ref, anchor_lsn, read_scn, out);
+				else
+					classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
+			}
+		} else if (cluster_itl_find_data_tt_ref_by_xid(page, raw_xid, &ref))
+			classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
+		break;
+
+	case CLUSTER_VIS_XMAX_UPDATE:
+		/* The tuple's own ITL slot is the authority for its last updater. */
 		if (htup->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
 			&& cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref))
 			classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);

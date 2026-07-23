@@ -40,6 +40,31 @@ sub state_int
 }
 
 
+sub state_key_exists
+{
+	my ($node, $key) = @_;
+	return $node->safe_psql(
+		'postgres',
+		qq{SELECT EXISTS (
+		     SELECT 1
+		       FROM pg_cluster_state
+		      WHERE category = 'multixact_current' AND key = '$key')}) eq 't';
+}
+
+
+sub tuple_has_multixact
+{
+	my ($node, $relation) = @_;
+	return $node->safe_psql(
+		'postgres',
+		qq{SELECT coalesce(bool_or(
+		     'HEAP_XMAX_IS_MULTI' = ANY(f.raw_flags)), false)
+		   FROM heap_page_items(get_raw_page('$relation', 0)) AS h
+		   CROSS JOIN LATERAL
+		     heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS f}) eq 't';
+}
+
+
 sub wait_for
 {
 	my ($predicate, $seconds) = @_;
@@ -142,6 +167,26 @@ ok($pair->wait_for_peer_state(0, 1, 'connected', 30)
 	  && $pair->wait_for_peer_state(1, 0, 'connected', 30),
 	'L1 peers connected');
 
+ok(wait_for(
+		sub {
+			my $f0 = $node0->safe_psql(
+				'postgres',
+				q{SELECT coalesce(max(value::bigint), 0)
+				    FROM cluster_dump_state()
+				   WHERE key = 'mxid_stripe_activated_floor'});
+			my $f1 = $node1->safe_psql(
+				'postgres',
+				q{SELECT coalesce(max(value::bigint), 0)
+				    FROM cluster_dump_state()
+				   WHERE key = 'mxid_stripe_activated_floor'});
+			return $f0 > 0 && $f1 > 0 && $f0 == $f1;
+		},
+		60),
+	'L1 common MultiXact activation floor is ready') or BAIL_OUT('mxid activation floor did not converge');
+
+ok(write_retry($node0, 'CREATE EXTENSION IF NOT EXISTS pageinspect'),
+	'L1 pageinspect fixture support is writable') or BAIL_OUT('could not install pageinspect');
+
 ok(mirrored_coincident_create(
 		$node0, $node1, 'cmxf_t',
 		'CREATE TABLE cmxf_t (id int, v int)'),
@@ -157,12 +202,41 @@ $locker1->query_safe('SELECT v FROM cmxf_t WHERE id = 1 FOR SHARE');
 $locker2->query_safe('BEGIN');
 $locker2->query_safe('SELECT v FROM cmxf_t WHERE id = 1 FOR SHARE');
 
+$locker1->query_safe('COMMIT');
+ok(tuple_has_multixact($node0, 'cmxf_t'),
+	'RED-F fixture retains a real foreign-origin MultiXact with one ACTIVE member');
+ok(state_key_exists($node1, 'describe_remote_ask_count')
+	  && state_key_exists($node1, 'member_proof_ask_count')
+	  && state_key_exists($node1, 'wait_count')
+	  && state_key_exists($node1, 'foreign_slru_guard_count'),
+	'current-MultiXact observability keys are exposed');
+my $describe_before = state_int($node1, 'describe_remote_ask_count');
+my $proof_before = state_int($node1, 'member_proof_ask_count');
+my $wait_before = state_int($node1, 'wait_count');
+my $guard_before = state_int($node1, 'foreign_slru_guard_count');
+
 my $writer = $node1->background_psql('postgres', on_error_die => 1);
 start_blocking($writer, 'UPDATE cmxf_t SET v = v + 1 WHERE id = 1');
-ok(wait_for_any_wait($node1, '%UPDATE cmxf_t SET v = v + 1 WHERE id = 1%', 15),
+my %observed_waits;
+my $entered_current_wait = wait_for(
+	sub {
+		my $event = $node1->safe_psql(
+			'postgres',
+			q{SELECT coalesce(wait_event, '')
+			     FROM pg_stat_activity
+			    WHERE query LIKE '%UPDATE cmxf_t SET v = v + 1 WHERE id = 1%'
+			      AND pid <> pg_backend_pid()
+			      AND state = 'active'
+			    LIMIT 1});
+		$observed_waits{$event} = 1 if $event ne '';
+		return state_int($node1, 'wait_count') > $wait_before;
+	},
+	15);
+diag('observed writer waits: ' . join(', ', sort keys %observed_waits))
+  unless $entered_current_wait;
+ok($entered_current_wait,
 	'RED-F entered authoritative foreign-MX wait path');
 
-$locker1->query_safe('COMMIT');
 $locker2->query_safe('COMMIT');
 ok(wait_for(
 		sub { $node1->safe_psql('postgres', 'SELECT v FROM cmxf_t WHERE id = 1') eq '1' },
@@ -172,11 +246,11 @@ eval { $writer->quit };
 eval { $locker1->quit };
 eval { $locker2->quit };
 
-cmp_ok(state_int($node1, 'describe_remote_ask_count'), '>', 0,
+cmp_ok(state_int($node1, 'describe_remote_ask_count'), '>', $describe_before,
 	'foreign descriptor RPC counter advanced');
-cmp_ok(state_int($node1, 'member_proof_ask_count'), '>', 0,
+cmp_ok(state_int($node1, 'member_proof_ask_count'), '>', $proof_before,
 	'foreign member-proof RPC counter advanced');
-is(state_int($node1, 'foreign_slru_guard_count'), 0,
+is(state_int($node1, 'foreign_slru_guard_count'), $guard_before,
 	'positive path never attempted requester-local foreign SLRU decode');
 
 $pair->stop_pair;

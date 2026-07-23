@@ -128,6 +128,7 @@
 #include "cluster/cluster_guc.h"			/* cluster_enabled / cluster_node_id */
 #include "cluster/cluster_inject.h"			/* PGRAC: spec-7.1 D3-a half-space limit leg */
 #include "cluster/cluster_multixact.h"		/* overlay install + types */
+#include "cluster/cluster_multixact_current.h" /* requester-local proven create cap */
 #include "cluster/cluster_mxid_stripe.h"	/* PGRAC: spec-7.1 D3-a striped candidate */
 #include "cluster/cluster_tt_local.h"		/* peek_binding */
 #include "cluster/cluster_tt_status_hint.h" /* emit_multixact_overlay */
@@ -934,6 +935,42 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 
 	return multi;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * MultiXactIdCreateFromCurrentMembers
+ *
+ * Narrow current-DML replacement entry.  The heap caller has already
+ * normalized a complete authority-proven list; this routine deliberately
+ * accepts no old MXID, so a foreign ID can never reach
+ * GetMultiXactIdMembers()/MultiXactIdExpand here.
+ */
+MultiXactId
+MultiXactIdCreateFromCurrentMembers(int nmembers, MultiXactMember *members)
+{
+	MultiXactId multi;
+	int i;
+
+	if (nmembers < 2 || nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS || members == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cross-node current-DML cannot create an invalid MultiXact member set")));
+	for (i = 0; i < nmembers; i++)
+		if (!TransactionIdIsNormal(members[i].xid)
+			|| members[i].status > MaxMultiXactStatus)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("cross-node current-DML received an invalid MultiXact member")));
+
+	multi = MultiXactIdCreateFromMembers(nmembers, members);
+	if (cluster_peer_mode_enabled() && !cluster_mxid_is_mine(multi))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+				 errmsg("requester-created MultiXact %u is not owned by this node", multi),
+				 errhint("Retry after MultiXact striping activation completes.")));
+	return multi;
+}
+#endif
 
 /*
  * RecordNewMultiXact

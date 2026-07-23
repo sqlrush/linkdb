@@ -1864,9 +1864,13 @@ CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
 test_cluster_multixact_current: test_cluster_multixact_current.c unit_test.h \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
-		$(top_srcdir)/src/backend/cluster/cluster_multixact_current.c
+		$(top_srcdir)/src/backend/cluster/cluster_multixact_current.c \
+		$(top_srcdir)/src/backend/cluster/cluster_multixact.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DCLUSTER_MULTIXACT_CURRENT_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_multixact_current.c"' \
+		-DCLUSTER_MULTIXACT_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_multixact.c"' \
+		-DHEAPAM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DHEAPAM_VISIBILITY_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam_visibility.c"' \
 		$< \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

@@ -57,6 +57,18 @@ sub state_int
 }
 
 
+sub state_key_exists
+{
+	my ($node, $category, $key) = @_;
+	return $node->safe_psql(
+		'postgres',
+		qq{SELECT EXISTS (
+		     SELECT 1
+		       FROM pg_cluster_state
+		      WHERE category = '$category' AND key = '$key')}) eq 't';
+}
+
+
 sub pair_state_int
 {
 	my ($pair, $category, $key) = @_;
@@ -149,13 +161,16 @@ my $pair = PostgreSQL::Test::ClusterPair->new_pair(
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.grd_max_entries = 1024',
-		'cluster.ges_request_timeout_ms = 30000',
-		'cluster.global_dd_interval_ms = 1000',
-		'cluster.deadlock_confirm_interval_ms = 500',
-		'cluster.lmd_scan_interval_ms = 500',
+		'cluster.ges_request_timeout_ms = 10000',
+		'cluster.global_dd_interval_ms = 200',
+		'cluster.deadlock_confirm_interval_ms = 100',
+		'cluster.lmd_scan_interval_ms = 100',
+		'cluster.cancel_ack_timeout_ms = 100',
 		'cluster.deadlock_detection_enabled = on',
 		'cluster.cssd_heartbeat_interval_ms = 2000',
 		'cluster.cssd_dead_deadband_factor = 10',
+		'cluster.online_join = on',
+		'cluster.xid_striping = on',
 	]);
 $pair->start_pair;
 usleep(2_000_000);
@@ -164,6 +179,26 @@ my ($node0, $node1) = ($pair->node0, $pair->node1);
 ok($pair->wait_for_peer_state(0, 1, 'connected', 30)
 	  && $pair->wait_for_peer_state(1, 0, 'connected', 30),
 	'L1 peers connected');
+
+ok(wait_for(
+		sub {
+			my $f0 = $node0->safe_psql(
+				'postgres',
+				q{SELECT coalesce(max(value::bigint), 0)
+				    FROM cluster_dump_state()
+				   WHERE key = 'mxid_stripe_activated_floor'});
+			my $f1 = $node1->safe_psql(
+				'postgres',
+				q{SELECT coalesce(max(value::bigint), 0)
+				    FROM cluster_dump_state()
+				   WHERE key = 'mxid_stripe_activated_floor'});
+			return $f0 > 0 && $f1 > 0 && $f0 == $f1;
+		},
+		60),
+	'L1 common MultiXact activation floor is ready') or BAIL_OUT('mxid activation floor did not converge');
+
+ok(write_retry($node0, 'CREATE EXTENSION IF NOT EXISTS pgrowlocks'),
+	'L1 pgrowlocks fixture support is writable') or BAIL_OUT('could not install pgrowlocks');
 
 ok(mirrored_coincident_create(
 		$node0, $node1, 'cmxd_t',
@@ -178,12 +213,39 @@ $node0->safe_psql('postgres', 'CHECKPOINT');
 
 my $victims_before =
   pair_state_int($pair, 'multixact_current', 'deadlock_victim_count');
+my $proofs_before =
+  pair_state_int($pair, 'multixact_current', 'member_proof_ask_count');
+my $waits_before =
+  pair_state_int($pair, 'multixact_current', 'wait_count');
 my $edges_before = pair_state_int($pair, 'lmd', 'wait_edge_count');
 my $tokens_before = pair_state_int($pair, 'lmd', 'cancel_token_installed_count');
 
+my $h2 = $node0->background_psql('postgres', timeout => 45);
+$h2->query_safe('BEGIN');
+$h2->query_safe('SELECT v FROM cmxd_t WHERE id = 1 FOR KEY SHARE');
+
+# The first locker owns the tuple's data ITL and is made terminal below.  The
+# second locker stays ACTIVE only through the MultiXact marker, so PCM-X can
+# transfer to node1 while the exact full-key TX member remains waitable.
 my $h0 = $node0->background_psql('postgres', timeout => 45);
 $h0->query_safe('BEGIN');
-$h0->query_safe('SELECT v FROM cmxd_t WHERE id = 1 FOR UPDATE');
+$h0->query_safe('SELECT v FROM cmxd_t WHERE id = 1 FOR SHARE');
+is($node0->safe_psql(
+		'postgres',
+		q{SELECT coalesce(bool_or(
+		     multi
+		    AND modes @> ARRAY['Share', 'Key Share']::text[]), false)
+		   FROM pgrowlocks('cmxd_t')}),
+	't', 'RED-DL fixture contains a real conflicting current MultiXact');
+$h2->query_safe('COMMIT');
+$h2->quit;
+ok(state_key_exists($node0, 'multixact_current', 'member_proof_ask_count')
+	  && state_key_exists($node0, 'multixact_current', 'wait_count')
+	  && state_key_exists($node0, 'multixact_current', 'deadlock_victim_count')
+	  && state_key_exists($node1, 'multixact_current', 'member_proof_ask_count')
+	  && state_key_exists($node1, 'multixact_current', 'wait_count')
+	  && state_key_exists($node1, 'multixact_current', 'deadlock_victim_count'),
+	'current-MultiXact deadlock observability keys are exposed on both nodes');
 
 my $h1 = $node1->background_psql('postgres', timeout => 45);
 $h1->query_safe('BEGIN');
@@ -206,6 +268,10 @@ ok(wait_for_event(
 		'%LOCK TABLE cmxd_gate%',
 		'ClusterGesReplyWait', 20),
 	'RED-DL node0 publishes the reverse GES edge and closes the cycle');
+cmp_ok(pair_state_int($pair, 'multixact_current', 'member_proof_ask_count'), '>',
+	$proofs_before, 'RED-DL edge was reached through member-origin proof');
+cmp_ok(pair_state_int($pair, 'multixact_current', 'wait_count'), '>',
+	$waits_before, 'RED-DL edge was reached through current-MultiXact TX wait');
 
 ok(wait_for(
 		sub {
@@ -216,8 +282,8 @@ ok(wait_for(
 	'LMD installs a typed cancel token for the youngest TX waiter');
 ok(wait_for(sub { deadlock_logged($pair) }, 20),
 	'the TX-wait victim receives SQLSTATE 40P01 before the TX timeout');
-cmp_ok(time() - $started_at, '<', 30,
-	'deadlock resolved before cluster.ges_request_timeout_ms');
+cmp_ok(time() - $started_at, '<', 4,
+	'deadlock resolves within the frozen five-budget bound');
 
 for my $handle ($h0, $h1)
 {

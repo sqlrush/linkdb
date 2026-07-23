@@ -24,6 +24,7 @@ use FindBin;
 use lib "$FindBin::RealBin/../../perl";
 
 use PostgreSQL::Test::ClusterPair;
+use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
 
@@ -53,6 +54,40 @@ sub state_int
 		   FROM pg_cluster_state
 		  WHERE category = 'multixact_current' AND key = '$key'});
 	return int($value // 0);
+}
+
+
+sub state_key_exists
+{
+	my ($node, $key) = @_;
+	return $node->safe_psql(
+		'postgres',
+		qq{SELECT EXISTS (
+		     SELECT 1
+		       FROM pg_cluster_state
+		      WHERE category = 'multixact_current' AND key = '$key')}) eq 't';
+}
+
+
+sub tuple_has_multixact
+{
+	my ($node, $relation) = @_;
+	return $node->safe_psql(
+		'postgres',
+		qq{SELECT coalesce(bool_or(
+		     'HEAP_XMAX_IS_MULTI' = ANY(f.raw_flags)), false)
+		   FROM heap_page_items(get_raw_page('$relation', 0)) AS h
+		   CROSS JOIN LATERAL
+		     heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS f}) eq 't';
+}
+
+
+sub current_mx_failclosed_logged
+{
+	my ($node) = @_;
+	my $log = PostgreSQL::Test::Utils::slurp_file($node->logfile);
+	return $log =~ /cross-node write conflict|MULTIXACT row lock with remote member not supported/
+	  || $log =~ /canceling statement due to statement timeout/;
 }
 
 
@@ -141,6 +176,26 @@ ok($pair->wait_for_peer_state(0, 1, 'connected', 30)
 	  && $pair->wait_for_peer_state(1, 0, 'connected', 30),
 	'L1 peers connected');
 
+ok(wait_for(
+		sub {
+			my $f0 = $node0->safe_psql(
+				'postgres',
+				q{SELECT coalesce(max(value::bigint), 0)
+				    FROM cluster_dump_state()
+				   WHERE key = 'mxid_stripe_activated_floor'});
+			my $f1 = $node1->safe_psql(
+				'postgres',
+				q{SELECT coalesce(max(value::bigint), 0)
+				    FROM cluster_dump_state()
+				   WHERE key = 'mxid_stripe_activated_floor'});
+			return $f0 > 0 && $f1 > 0 && $f0 == $f1;
+		},
+		60),
+	'L1 common MultiXact activation floor is ready') or BAIL_OUT('mxid activation floor did not converge');
+
+ok(write_retry($node1, 'CREATE EXTENSION IF NOT EXISTS pageinspect'),
+	'L1 pageinspect fixture support is writable') or BAIL_OUT('could not install pageinspect');
+
 ok(mirrored_coincident_create(
 		$node0, $node1, 'cmxm_t',
 		'CREATE TABLE cmxm_t (id int, v int)'),
@@ -148,33 +203,75 @@ ok(mirrored_coincident_create(
 $node0->safe_psql('postgres', 'INSERT INTO cmxm_t VALUES (1, 0)');
 $node0->safe_psql('postgres', 'CHECKPOINT');
 
-# The second compatible lock is acquired on node1, so node1 creates the
-# striped MultiXact while retaining node0's member in the immutable list.
+# Two node0 lockers first create a foreign-origin MultiXact.  The first one
+# then commits, leaving a marker-only ACTIVE member: the page can transfer to
+# node1 without weakening the active-data-ITL PCM boundary.  Node1's compatible
+# lock must retain that remote member while creating a requester-owned MXID.
+my $remote_seed = $node0->background_psql('postgres', on_error_die => 1);
 my $remote_locker = $node0->background_psql('postgres', on_error_die => 1);
-my $local_locker = $node1->background_psql('postgres', on_error_die => 1);
+my $local_locker;
+$remote_seed->query_safe('BEGIN');
+$remote_seed->query_safe('SELECT v FROM cmxm_t WHERE id = 1 FOR SHARE');
 $remote_locker->query_safe('BEGIN');
 $remote_locker->query_safe('SELECT v FROM cmxm_t WHERE id = 1 FOR SHARE');
-$local_locker->query_safe('BEGIN');
-$local_locker->query_safe(q{SET LOCAL statement_timeout = '10s'});
-my $mixed_ready =
-  eval { $local_locker->query_safe('SELECT v FROM cmxm_t WHERE id = 1 FOR SHARE'); 1 };
+$remote_seed->query_safe('COMMIT');
+my $recompose_before = state_int($node1, 'recompose_success_count');
+my $mixed_ready = 0;
+my $mixed_error = '';
+for (1 .. 5)
+{
+	$local_locker = $node1->background_psql('postgres', on_error_die => 1);
+	my $attempt = eval {
+		$local_locker->query_safe('BEGIN');
+		$local_locker->query_safe(q{SET LOCAL statement_timeout = '10s'});
+		$local_locker->query_safe('SELECT v FROM cmxm_t WHERE id = 1 FOR SHARE');
+		1;
+	};
+	if ($attempt)
+	{
+		$mixed_ready = 1;
+		last;
+	}
+	$mixed_error = $@;
+	eval { $local_locker->quit };
+	$local_locker = undef;
+	usleep(500_000);
+}
 ok($mixed_ready, 'RED-M compatible remote member composes into a local MultiXact');
 if (!$mixed_ready)
 {
-	diag("mixed-member setup failed closed: $@");
+	diag("mixed-member setup failed closed: $mixed_error");
+	ok(current_mx_failclosed_logged($node1),
+		'RED-M failure is the current-MultiXact authority floor, not harness infrastructure');
 	eval { $remote_locker->query_safe('COMMIT') };
-	eval { $local_locker->query_safe('ROLLBACK') };
+	eval { $local_locker->query_safe('ROLLBACK') } if defined $local_locker;
+	eval { $remote_seed->quit };
 	eval { $remote_locker->quit };
-	eval { $local_locker->quit };
+	eval { $local_locker->quit } if defined $local_locker;
 	$pair->stop_pair;
 	done_testing();
 	exit 0;
 }
 
+ok(tuple_has_multixact($node1, 'cmxm_t'),
+	'RED-M fixture contains a requester-owned mixed MultiXact');
+ok(state_key_exists($node1, 'describe_local_count')
+	  && state_key_exists($node1, 'member_proof_ask_count')
+	  && state_key_exists($node1, 'wait_count')
+	  && state_key_exists($node1, 'recompose_success_count')
+	  && state_key_exists($node1, 'foreign_slru_guard_count'),
+	'current-MultiXact mixed-path observability keys are exposed');
+my $describe_before = state_int($node1, 'describe_local_count');
+my $proof_before = state_int($node1, 'member_proof_ask_count');
+my $wait_before = state_int($node1, 'wait_count');
+my $guard_before = state_int($node1, 'foreign_slru_guard_count');
+
 my $writer = $node1->background_psql('postgres', on_error_die => 1);
 start_blocking($writer, 'UPDATE cmxm_t SET v = v + 1 WHERE id = 1');
-ok(wait_for_authority_wait($node1, 15),
-	'RED-M entered member-origin proof or full-key wait path');
+ok(wait_for(
+		sub { state_int($node1, 'wait_count') > $wait_before },
+		15),
+	'RED-M entered the authoritative full-key wait path');
 
 $remote_locker->query_safe('COMMIT');
 $local_locker->query_safe('COMMIT');
@@ -184,16 +281,17 @@ ok(wait_for(
 	'derived-own mixed-member UPDATE rejudges and succeeds');
 
 eval { $writer->quit };
+eval { $remote_seed->quit };
 eval { $remote_locker->quit };
 eval { $local_locker->quit };
 
-cmp_ok(state_int($node1, 'describe_local_count'), '>', 0,
+cmp_ok(state_int($node1, 'describe_local_count'), '>', $describe_before,
 	'own immutable descriptor was read at its origin');
-cmp_ok(state_int($node1, 'member_proof_ask_count'), '>', 0,
+cmp_ok(state_int($node1, 'member_proof_ask_count'), '>', $proof_before,
 	'remote member was resolved at its member origin');
-cmp_ok(state_int($node1, 'recompose_success_count'), '>', 0,
+cmp_ok(state_int($node1, 'recompose_success_count'), '>', $recompose_before,
 	'requester-owned recomposition completed');
-is(state_int($node1, 'foreign_slru_guard_count'), 0,
+is(state_int($node1, 'foreign_slru_guard_count'), $guard_before,
 	'mixed-member path did not decode a foreign MXID locally');
 
 $pair->stop_pair;

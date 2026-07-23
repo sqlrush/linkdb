@@ -653,6 +653,12 @@ void
 cluster_multixact_shmem_register(void)
 {}
 
+/* spec-3.6b D4 stub: current-MultiXact authority counters use an independent
+ * region; this standalone harness does not link the stats object. */
+void
+cluster_multixact_current_stats_shmem_register(void)
+{}
+
 /* spec-3.7 D5 stub: cluster_init_shmem_module also calls
  * cluster_undo_record_shmem_register (cluster_undo_record.c).  cluster_unit
  * test binary doesn't link cluster_undo_record.o;  provide no-op stub. */

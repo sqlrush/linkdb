@@ -305,8 +305,11 @@ UT_TEST(test_t8c_current_authority_is_retained_exact_and_subcommit_syncs_aliases
 	UT_ASSERT_NOT_NULL(lookup_end);
 	UT_ASSERT_NOT_NULL(strstr(lookup, "cluster_xid_origin_slot(xid) != cluster_node_id"));
 	UT_ASSERT_NOT_NULL(strstr(lookup, "candidate_found"));
-	if (lookup_end != NULL)
+	if (lookup_end != NULL) {
 		UT_ASSERT(durable_fallback == NULL || durable_fallback > lookup_end);
+		UT_ASSERT(strstr(lookup, "epoch == 0") == NULL
+				  || strstr(lookup, "epoch == 0") > lookup_end);
+	}
 
 	subcommit = strstr(source, "\ncluster_tt_status_install_subcommitted(");
 	subcommit_end
@@ -325,6 +328,75 @@ UT_TEST(test_t8c_current_authority_is_retained_exact_and_subcommit_syncs_aliases
 	}
 	free(source);
 }
+
+/*
+ * ===== T8d: current own-xid aliases are unique by the complete 24B key =====
+ *
+ * Two retained entries can carry the same raw xid and TT slot after xid/slot
+ * reuse while naming different undo segments.  Equal status does not make
+ * those incarnations interchangeable; different status is likewise
+ * ambiguous.  Candidate MATCH additionally requires the uniquely selected
+ * complete key to equal the challenged key.
+ */
+UT_TEST(test_t8d_current_authority_rejects_distinct_full_key_aliases)
+{
+	ClusterTTStatusKey first = {
+		.origin_node_id = 2,
+		.undo_segment_id = 11,
+		.tt_slot_id = 7,
+		.cluster_epoch = 19,
+		.local_xid = 900,
+	};
+	ClusterTTStatusKey second = first;
+	ClusterTTStatus same_status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	ClusterTTStatus different_status = CLUSTER_TT_STATUS_COMMITTED;
+	char *source = read_tt_status_source();
+	const char *agree;
+	const char *agree_end;
+	const char *lookup;
+	const char *lookup_end;
+
+	second.undo_segment_id++;
+	UT_ASSERT_EQ(first.local_xid, second.local_xid);
+	UT_ASSERT_EQ(first.tt_slot_id, second.tt_slot_id);
+	UT_ASSERT_NE(first.undo_segment_id, second.undo_segment_id);
+	UT_ASSERT(memcmp(&first, &second, sizeof(first)) != 0);
+	UT_ASSERT_EQ(same_status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_NE(same_status, different_status);
+
+	if (source == NULL)
+		return;
+	agree = strstr(source, "\ncluster_tt_status_current_entries_agree(");
+	agree_end = agree != NULL
+		? strstr(agree, "\n\nstatic bool\ncluster_tt_status_key_precedes(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(agree);
+	UT_ASSERT_NOT_NULL(agree_end);
+	if (agree != NULL && agree_end != NULL) {
+		const char *full_key_compare
+			= strstr(agree, "memcmp(&a->key, &b->key, sizeof(a->key)) == 0");
+		const char *status_compare = strstr(agree, "a->status == b->status");
+
+		UT_ASSERT(full_key_compare != NULL && full_key_compare < agree_end);
+		UT_ASSERT(status_compare != NULL && status_compare < agree_end);
+	}
+
+	lookup = strstr(source, "\ncluster_tt_status_lookup_current_own_xid_internal(");
+	lookup_end
+		= lookup != NULL ? strstr(lookup, "\ncluster_tt_status_lookup_current_own_xid(") : NULL;
+	UT_ASSERT_NOT_NULL(lookup);
+	UT_ASSERT_NOT_NULL(lookup_end);
+	if (lookup != NULL && lookup_end != NULL) {
+		const char *candidate_unique
+			= strstr(lookup,
+					 "candidate_found\n\t\t&& memcmp(&selected.key, candidate, "
+					 "sizeof(selected.key)) == 0");
+
+		UT_ASSERT(candidate_unique != NULL && candidate_unique < lookup_end);
+	}
+	free(source);
+}
+
 UT_TEST(test_t9_install_local_linkable)
 {
 	UT_ASSERT_NE((void *)cluster_tt_status_install_local, NULL);
@@ -464,6 +536,7 @@ main(void)
 	UT_RUN(test_t8_lookup_exact_linkable);
 	UT_RUN(test_t8b_lookup_current_own_xid_linkable);
 	UT_RUN(test_t8c_current_authority_is_retained_exact_and_subcommit_syncs_aliases);
+	UT_RUN(test_t8d_current_authority_rejects_distinct_full_key_aliases);
 	UT_RUN(test_t9_install_local_linkable);
 	UT_RUN(test_t9b_resolve_prepared_commit_linkable);
 	UT_RUN(test_t10_flush_all_linkable);

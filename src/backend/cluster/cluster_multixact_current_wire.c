@@ -41,7 +41,11 @@ bytes_are_zero(const void *data, Size length)
 static bool
 wire_epoch_valid(uint64 current_epoch)
 {
-	return current_epoch != 0 && current_epoch <= UINT32_MAX;
+	/*
+	 * CLUSTER_EPOCH_INITIAL (zero) is a live, wire-visible epoch.  Reject
+	 * only values that cannot be represented by the frozen 32-bit key.
+	 */
+	return current_epoch <= UINT32_MAX;
 }
 
 

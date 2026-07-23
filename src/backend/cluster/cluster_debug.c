@@ -149,6 +149,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_tt_status.h"		 /* TT status overlay counter accessors (spec-3.1 D9) */
 #include "cluster/cluster_tt_status_hint.h"	 /* TT status hint counter accessors (spec-3.2 D8) */
 #include "cluster/cluster_tx_enqueue.h"		 /* TX enqueue wait counters (spec-5.2 D4/D6) */
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_startup_phase.h"	 /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
@@ -3726,6 +3727,54 @@ dump_catalog(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_catalog_stats_buf_miss_count()));
 }
 
+
+static void
+dump_multixact_current(ReturnSetInfo *rsinfo)
+{
+	static const char *const names[CMX_STAT_COUNT] = {
+		[CMX_STAT_DESCRIBE_LOCAL] = "describe_local_count",
+		[CMX_STAT_DESCRIBE_REMOTE_ASK] = "describe_remote_ask_count",
+		[CMX_STAT_DESCRIBE_REMOTE_HIT] = "describe_remote_hit_count",
+		[CMX_STAT_DESCRIBE_REMOTE_DENIED] = "describe_remote_denied_count",
+		[CMX_STAT_DESCRIBE_REMOTE_SUPPORTED_LIMIT] = "describe_remote_supported_limit_count",
+		[CMX_STAT_DESCRIBE_REMOTE_TIMEOUT] = "describe_remote_timeout_count",
+		[CMX_STAT_DESCRIBE_REMOTE_UNKNOWN] = "describe_remote_unknown_count",
+		[CMX_STAT_DESCRIBE_INVALID_REPLY] = "describe_invalid_reply_count",
+		[CMX_STAT_MEMBER_PROOF_ASK] = "member_proof_ask_count",
+		[CMX_STAT_MEMBER_PROOF_HIT] = "member_proof_hit_count",
+		[CMX_STAT_MEMBER_PROOF_UNKNOWN] = "member_proof_unknown_count",
+		[CMX_STAT_MEMBER_PROOF_DENIED] = "member_proof_denied_count",
+		[CMX_STAT_MEMBER_PROOF_SUPPORTED_LIMIT] = "member_proof_supported_limit_count",
+		[CMX_STAT_MEMBER_PROOF_TIMEOUT] = "member_proof_timeout_count",
+		[CMX_STAT_MEMBER_PROOF_INVALID_REPLY] = "member_proof_invalid_reply_count",
+		[CMX_STAT_WAIT] = "wait_count",
+		[CMX_STAT_WAIT_RESOLVED] = "wait_resolved_count",
+		[CMX_STAT_WAIT_DEAD_HOLDER] = "wait_dead_holder_count",
+		[CMX_STAT_WAIT_TIMEOUT] = "wait_timeout_count",
+		[CMX_STAT_WAIT_RETRY] = "wait_retry_count",
+		[CMX_STAT_WAIT_INTERRUPTED] = "wait_interrupted_count",
+		[CMX_STAT_DEADLOCK_VICTIM] = "deadlock_victim_count",
+		[CMX_STAT_WAKEUP] = "wakeup_count",
+		[CMX_STAT_RECOMPOSE_SUCCESS] = "recompose_success_count",
+		[CMX_STAT_RECOMPOSE_FAILCLOSED] = "recompose_failclosed_count",
+		[CMX_STAT_HOT_PROOF_HIT] = "hot_proof_hit_count",
+		[CMX_STAT_HOT_PROOF_FAILCLOSED] = "hot_proof_failclosed_count",
+		[CMX_STAT_ABA_RESTART] = "aba_restart_count",
+		[CMX_STAT_RESTART_BUCKET_0] = "restart_bucket_0_count",
+		[CMX_STAT_RESTART_BUCKET_1] = "restart_bucket_1_count",
+		[CMX_STAT_RESTART_BUCKET_2_3] = "restart_bucket_2_3_count",
+		[CMX_STAT_RESTART_BUCKET_4_7] = "restart_bucket_4_7_count",
+		[CMX_STAT_RESTART_BUCKET_8_PLUS] = "restart_bucket_8_plus_count",
+		[CMX_STAT_RESTART_MAX] = "restart_max",
+		[CMX_STAT_FOREIGN_SLRU_GUARD] = "foreign_slru_guard_count",
+	};
+	int i;
+
+	for (i = 0; i < CMX_STAT_COUNT; i++)
+		emit_row(rsinfo, "multixact_current", names[i],
+				 fmt_int64((int64)cluster_multixact_current_stats_get(i)));
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -3794,6 +3843,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_xnode_profile(rsinfo); /* spec-5.59 D1 */
 		dump_xnode_lever(rsinfo);	/* spec-6.12 */
 		dump_xid_stripe(rsinfo);	/* spec-6.15 D6 */
+		dump_multixact_current(rsinfo);
 		dump_catalog(rsinfo);		/* spec-6.14 D10 */
 	}
 #else
