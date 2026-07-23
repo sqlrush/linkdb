@@ -142,7 +142,7 @@ ok($pair->wait_for_peer_state(0, 1, 'connected', 30)
 
 ok(mirrored_coincident_create(
 		$node0, $node1, 'cmxf_t',
-		'CREATE TABLE cmxf_t (id int PRIMARY KEY, v int)'),
+		'CREATE TABLE cmxf_t (id int, v int)'),
 	'L2 relation identity coincides') or BAIL_OUT('could not create a coincident relation');
 
 $node0->safe_psql('postgres', 'INSERT INTO cmxf_t VALUES (1, 0), (2, 0), (3, 0)');
