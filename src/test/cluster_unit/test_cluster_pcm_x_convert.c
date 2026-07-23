@@ -10654,8 +10654,10 @@ typedef struct TestLocalCrossLaneWedge {
  * HOLDER_TERMINAL_READY|DRAINED with no writer-terminal bits.
  */
 static void
-prepare_local_cross_lane_wedge(BlockNumber block, uint64 master_session, uint64 external_ticket,
-							   uint64 writer_ticket, TestLocalCrossLaneWedge *fixture)
+prepare_local_cross_lane_wedge_common(BlockNumber block, uint64 master_session,
+								  uint64 external_ticket, uint64 writer_ticket,
+								  bool publish_writer_ticket,
+								  TestLocalCrossLaneWedge *fixture)
 {
 	PcmXShmemHeader *header;
 	PcmXLocalHolderKey holder_keys[2];
@@ -10708,15 +10710,17 @@ prepare_local_cross_lane_wedge(BlockNumber block, uint64 master_session, uint64 
 	fixture->admit_ack.prehandle = enqueue.prehandle;
 	fixture->admit_ack.result = PCM_X_QUEUE_OK;
 	fixture->admit_ack.phase = PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE;
-	UT_ASSERT_EQ(cluster_pcm_x_local_apply_admit_ack_exact(&fixture->writer, &fixture->admit_ack, 1,
-														   master_session),
-				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(
-		cluster_pcm_x_local_admit_confirm_arm_exact(&fixture->writer, &admit_confirm, &token),
-		PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(cluster_pcm_x_local_admit_confirm_ack_exact(&fixture->writer, &admit_confirm, 1,
-															 master_session),
-				 PCM_X_QUEUE_OK);
+	if (publish_writer_ticket) {
+		UT_ASSERT_EQ(cluster_pcm_x_local_apply_admit_ack_exact(
+						 &fixture->writer, &fixture->admit_ack, 1, master_session),
+					 PCM_X_QUEUE_OK);
+		UT_ASSERT_EQ(
+			cluster_pcm_x_local_admit_confirm_arm_exact(&fixture->writer, &admit_confirm, &token),
+			PCM_X_QUEUE_OK);
+		UT_ASSERT_EQ(cluster_pcm_x_local_admit_confirm_ack_exact(
+						 &fixture->writer, &admit_confirm, 1, master_session),
+					 PCM_X_QUEUE_OK);
+	}
 
 	/* The older cohort's grant-time PROBE now freezes this node's S holders;
 	 * the blocker ACK tombstones the set. */
@@ -10759,11 +10763,18 @@ prepare_local_cross_lane_wedge(BlockNumber block, uint64 master_session, uint64 
 	UT_ASSERT_EQ(flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK,
 				 PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
 	UT_ASSERT_EQ(flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
-	UT_ASSERT_EQ(fixture->tag_slot->ref.handle.ticket_id, writer_ticket);
-	UT_ASSERT_EQ(fixture->tag_slot->ref.handle.queue_generation, UINT64_C(1));
-	UT_ASSERT_EQ(fixture->tag_slot->ref.grant_generation, 0);
-	UT_ASSERT(memcmp(&fixture->tag_slot->ref.identity, &writer_identity, sizeof(writer_identity))
-			  == 0);
+	if (publish_writer_ticket) {
+		UT_ASSERT_EQ(fixture->tag_slot->ref.handle.ticket_id, writer_ticket);
+		UT_ASSERT_EQ(fixture->tag_slot->ref.handle.queue_generation, UINT64_C(1));
+		UT_ASSERT_EQ(fixture->tag_slot->ref.grant_generation, 0);
+		UT_ASSERT(memcmp(&fixture->tag_slot->ref.identity, &writer_identity,
+						 sizeof(writer_identity))
+				  == 0);
+	} else {
+		UT_ASSERT(ticket_refs_equal(&fixture->tag_slot->ref, &(PcmXTicketRef){ 0 }));
+		UT_ASSERT_EQ(fixture->tag_slot->reliable.pending_opcode, PGRAC_IC_MSG_PCM_X_ENQUEUE);
+		UT_ASSERT_EQ(fixture->tag_slot->reliable.phase, PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE);
+	}
 	UT_ASSERT_EQ(fixture->tag_slot->membership_count, 1);
 	UT_ASSERT_EQ(fixture->tag_slot->closed_round_member_count, 1);
 	UT_ASSERT_EQ(fixture->tag_slot->head_index, fixture->writer.membership_slot.slot_index);
@@ -10773,6 +10784,14 @@ prepare_local_cross_lane_wedge(BlockNumber block, uint64 master_session, uint64 
 				 fixture->writer.membership_slot.slot_index);
 	UT_ASSERT(ticket_refs_equal(&fixture->tag_slot->blocker_snapshot_ref, &fixture->external_ref));
 	UT_ASSERT_EQ(fixture->tag_slot->holder_terminal_drain_generation, poll.drain_generation);
+}
+
+static void
+prepare_local_cross_lane_wedge(BlockNumber block, uint64 master_session, uint64 external_ticket,
+							   uint64 writer_ticket, TestLocalCrossLaneWedge *fixture)
+{
+	prepare_local_cross_lane_wedge_common(block, master_session, external_ticket, writer_ticket,
+									 true, fixture);
 }
 
 /*
@@ -11270,6 +11289,137 @@ append_local_undrained_writer(BlockNumber block, uint64 master_session, uint64 w
 		= &local_tag_slots(ClusterPcmXConvertShmem)[writer_out->tag_slot.slot_index];
 	UT_ASSERT_EQ((*tag_slot_out)->ref.handle.ticket_id, writer_ticket);
 	UT_ASSERT_EQ(test_slot_flags(&(*tag_slot_out)->slot) & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
+}
+
+/* Append one holder-only terminal on a different tag without reinitializing
+ * the shared queue.  Its exact ticket anchors a later RETIRE watermark while
+ * another tag exercises prefix preflight. */
+static void
+append_local_holder_terminal(BlockNumber block, uint64 master_session, uint64 holder_ticket,
+							 PcmXTicketRef *holder_ref_out,
+							 PcmXLocalTagSlot **tag_slot_out)
+{
+	PcmXLocalHolderKey holder_key;
+	PcmXLocalHolderHandle holder;
+	PcmXLocalHolderHandle holder_copy;
+	PcmXLocalHolderSnapshot holder_snapshot;
+	PcmXLocalBlockerSnapshot blocker_snapshot;
+	PcmXTicketRef probe_ref;
+	PcmXRevokePayload revoke;
+	PcmXGrantPayload ready;
+	PcmXGrantPayload replay;
+	PcmXDrainPollPayload poll;
+
+	UT_ASSERT_NOT_NULL(holder_ref_out);
+	UT_ASSERT_NOT_NULL(tag_slot_out);
+	holder_key = make_local_holder_key(block, 0, 25, master_session + holder_ticket, 4);
+	UT_ASSERT_EQ(register_active_local_holder(&holder_key, &holder), PCM_X_QUEUE_OK);
+	memset(&probe_ref, 0, sizeof(probe_ref));
+	probe_ref.identity = make_wait_identity(block, 3, 26, master_session + holder_ticket + 1);
+	probe_ref.handle.ticket_id = holder_ticket;
+	probe_ref.handle.queue_generation = UINT64_C(17);
+	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(
+					 &probe_ref, 1, master_session, &holder_copy, 1, &holder_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(holder_snapshot.holder_count, 1);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(
+					 &probe_ref, 1, master_session, &holder_snapshot, &holder_copy, 1, NULL, 0,
+					 &blocker_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(&probe_ref,
+													 blocker_snapshot.set_generation, 1,
+													 master_session),
+				 PCM_X_QUEUE_OK);
+	memset(&revoke, 0, sizeof(revoke));
+	revoke.ref = probe_ref;
+	revoke.ref.grant_generation = UINT64_C(2);
+	UT_ASSERT(cluster_pcm_x_image_id_encode(1, master_session + holder_ticket, &revoke.image_id));
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_revoke_apply_exact(&revoke, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(release_active_local_holder(&holder), PCM_X_QUEUE_OK);
+	memset(&ready, 0, sizeof(ready));
+	ready.ref = revoke.ref;
+	ready.image.image_id = revoke.image_id;
+	ready.image.source_own_generation = UINT64_C(71);
+	ready.image.page_scn = UINT64_C(72);
+	ready.image.page_lsn = UINT64_C(73);
+	ready.image.source_node = 0;
+	ready.image.page_checksum = UINT32_C(74);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_image_ready_arm_exact(&ready, 1, master_session,
+															 &replay),
+				 PCM_X_QUEUE_OK);
+	memset(&poll, 0, sizeof(poll));
+	poll.ref = revoke.ref;
+	poll.drain_generation = UINT64_C(19);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
+	*holder_ref_out = revoke.ref;
+	*tag_slot_out
+		= &local_tag_slots(ClusterPcmXConvertShmem)[holder_snapshot.tag_slot.slot_index];
+	UT_ASSERT_EQ(test_slot_flags(&(*tag_slot_out)->slot),
+				 PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
+}
+
+/* RED for S3 Loop 18 (2026-07-23): a holder terminal on a tag used to hide
+ * that tag's canonical undrained writer from RETIRE's prefix preflight.  This
+ * affected both a published lower/equal ticket and the preceding zero-ref
+ * ENQUEUE-in-flight lifecycle.  A wider watermark therefore consumed the
+ * older holder lane in the mutating pass, then the same-slot rescan exposed
+ * the writer and returned NOT_READY after mutation, correctly tripping the
+ * second-pass fuse.  The prefix blocker must be found before either this
+ * holder or the exact later terminal on another tag is changed. */
+UT_TEST(test_local_retire_preflights_writer_hidden_by_holder_terminal)
+{
+	TestLocalCrossLaneWedge hidden;
+	PcmXTicketRef watermark_ref;
+	PcmXLocalTagSlot *watermark_tag;
+	PcmXLocalTagSlot hidden_saved;
+	PcmXLocalTagSlot watermark_saved;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1840);
+
+	prepare_local_cross_lane_wedge(7139, master_session, UINT64_C(98001), UINT64_C(98002),
+								   &hidden);
+	append_local_holder_terminal(7140, master_session, UINT64_C(98003), &watermark_ref,
+								 &watermark_tag);
+	hidden_saved = *hidden.tag_slot;
+	watermark_saved = *watermark_tag;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = watermark_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = watermark_ref.handle.ticket_id;
+	retire.sender_node = 0;
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT(memcmp(&hidden_saved, hidden.tag_slot, sizeof(hidden_saved)) == 0);
+	UT_ASSERT(memcmp(&watermark_saved, watermark_tag, sizeof(watermark_saved)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retired_ticket_id, 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	/* The same holder bits must not mask the zero-ref interval before ADMIT_ACK.
+	 * This is the same lifecycle protected by the S3-P0-02 inter-tag guard, now
+	 * made deterministic on one tag without an ACK interlock. */
+	prepare_local_cross_lane_wedge_common(7141, master_session + 1, UINT64_C(98101),
+										UINT64_C(98102), false, &hidden);
+	append_local_holder_terminal(7142, master_session + 1, UINT64_C(98103), &watermark_ref,
+								 &watermark_tag);
+	hidden_saved = *hidden.tag_slot;
+	watermark_saved = *watermark_tag;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = watermark_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session + 1;
+	retire.retire_through_ticket_id = watermark_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session + 1),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT(memcmp(&hidden_saved, hidden.tag_slot, sizeof(hidden_saved)) == 0);
+	UT_ASSERT(memcmp(&watermark_saved, watermark_tag, sizeof(watermark_saved)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retired_ticket_id, 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
 }
 
 /* Leave one canonical writer exactly between ENQUEUE arm and ADMIT_ACK.  The
@@ -17298,6 +17448,7 @@ main(void)
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
+	UT_RUN(test_local_retire_preflights_writer_hidden_by_holder_terminal);
 	UT_RUN(test_local_retire_waits_for_inflight_enqueue_before_first_mutation);
 	UT_RUN(test_local_retire_waits_for_undrained_lower_ticket_on_another_tag);
 	UT_RUN(test_local_retire_ignores_undrained_higher_ticket_on_another_tag);

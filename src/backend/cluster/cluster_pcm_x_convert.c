@@ -20095,60 +20095,75 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 	 * is swept, leaving a durable local terminal with no replay authority. */
 	writer_flags = flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK;
 	holder_flags = flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK;
-	if ((writer_flags | holder_flags) == 0) {
-		/* ENQUEUE and PREHANDLE_CANCEL are the only valid reliable legs whose
-		 * canonical writer ref is still zero.  Their remote ACK may publish or
-		 * preserve the master ticket while RETIRE is between its read-only and
-		 * mutating scans: ACK application owns this local lock but deliberately
-		 * does not claim ADMISSION_GATE.  Refuse the exact in-flight lifecycle
-		 * before any older terminal is detached; once the ACK lands, the next
-		 * RETIRE can compare the now-materialized ticket with its watermark.
-		 * Any wider zero-ref reliable shape is structural corruption, not a
-		 * reason to make the whole second pass accept NOT_READY. */
-		if (pcm_x_ticket_ref_is_zero(&tag_slot->ref)
-			&& !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)) {
-			if (tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
-				|| tag_slot->leader_slot_generation == 0) {
-				result = PCM_X_QUEUE_CORRUPT;
-				goto candidate_done;
-			}
-			leader_ref.slot_index = tag_slot->leader_index;
-			leader_ref.slot_generation = tag_slot->leader_slot_generation;
-			leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
-				PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &tag_slot->tag,
-				PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
-			if (leader == NULL || tag_slot->membership_count == 0
-				|| tag_slot->head_index != leader_ref.slot_index
-				|| leader->tag_slot_index != tag_ref.slot_index
-				|| leader->tag_slot_generation != tag_ref.slot_generation
-				|| leader->prev_index != PCM_X_INVALID_SLOT_INDEX
-				|| leader->role != PCM_X_LOCAL_ROLE_NODE_LEADER
-				|| leader->admitted_round != tag_slot->local_round || leader->graph_generation != 0
-				|| !BufferTagsEqual(&leader->identity.tag, &tag_slot->tag)
-				|| leader->identity.cluster_epoch != tag_slot->cluster_epoch
-				|| !pcm_x_local_reliable_leg_valid(tag_slot, leader)) {
-				result = PCM_X_QUEUE_CORRUPT;
-				goto candidate_done;
-			}
+	/* Preserve structural precedence: a prefix blocker must not hide an
+	 * impossible packed tag flag as an ordinary retry. */
+	if ((flags & ~(PCM_X_LOCAL_TAG_F_REVOKE_BARRIER | PCM_X_LOCAL_TAG_F_ADMISSION_GATE
+				   | PCM_X_LOCAL_TAG_F_TERMINAL_MASK
+				   | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK))
+		!= 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto candidate_done;
+	}
+	/* A holder terminal does not consume or supersede the writer lifecycle on
+	 * the same tag.  Check that lifecycle before branching on terminal flags;
+	 * otherwise the holder bits can hide a prefix blocker in the first pass,
+	 * the second pass can detach the holder, and its same-slot rescan then sees
+	 * the newly unmasked writer only after mutation.
+	 *
+	 * ENQUEUE and PREHANDLE_CANCEL are the only valid reliable legs whose
+	 * canonical writer ref is still zero.  Their remote ACK may publish or
+	 * preserve the master ticket while RETIRE is between its read-only and
+	 * mutating scans: ACK application owns this local lock but deliberately
+	 * does not claim ADMISSION_GATE.  Refuse the exact in-flight lifecycle
+	 * before any terminal is detached; once the ACK lands, the next RETIRE can
+	 * compare the now-materialized ticket with its watermark.  Any wider
+	 * zero-ref reliable shape is structural corruption, not a reason to make
+	 * the whole second pass accept NOT_READY. */
+	if (pcm_x_ticket_ref_is_zero(&tag_slot->ref)
+		&& !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)) {
+		if (tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
+			|| tag_slot->leader_slot_generation == 0) {
+			result = PCM_X_QUEUE_CORRUPT;
+			goto candidate_done;
+		}
+		leader_ref.slot_index = tag_slot->leader_index;
+		leader_ref.slot_generation = tag_slot->leader_slot_generation;
+		leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &tag_slot->tag,
+			PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+		if (leader == NULL || tag_slot->membership_count == 0
+			|| tag_slot->head_index != leader_ref.slot_index
+			|| leader->tag_slot_index != tag_ref.slot_index
+			|| leader->tag_slot_generation != tag_ref.slot_generation
+			|| leader->prev_index != PCM_X_INVALID_SLOT_INDEX
+			|| leader->role != PCM_X_LOCAL_ROLE_NODE_LEADER
+			|| leader->admitted_round != tag_slot->local_round || leader->graph_generation != 0
+			|| !BufferTagsEqual(&leader->identity.tag, &tag_slot->tag)
+			|| leader->identity.cluster_epoch != tag_slot->cluster_epoch
+			|| !pcm_x_local_reliable_leg_valid(tag_slot, leader)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			goto candidate_done;
+		}
+		result = PCM_X_QUEUE_NOT_READY;
+		goto candidate_done;
+	}
+	if (!pcm_x_ticket_ref_is_zero(&tag_slot->ref)
+		&& tag_slot->ref.handle.ticket_id <= request->retire_through_ticket_id
+		&& tag_slot->leader_index != PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->leader_slot_generation != 0) {
+		leader_ref.slot_index = tag_slot->leader_index;
+		leader_ref.slot_generation = tag_slot->leader_slot_generation;
+		leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &tag_slot->tag,
+			PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+		if (leader != NULL
+			&& pcm_x_wait_identity_equal(&leader->identity, &tag_slot->ref.identity)
+			&& pcm_x_ticket_handle_equal(&leader->handle, &tag_slot->ref.handle)) {
 			result = PCM_X_QUEUE_NOT_READY;
 			goto candidate_done;
 		}
-		if (!pcm_x_ticket_ref_is_zero(&tag_slot->ref)
-			&& tag_slot->ref.handle.ticket_id <= request->retire_through_ticket_id
-			&& tag_slot->leader_index != PCM_X_INVALID_SLOT_INDEX
-			&& tag_slot->leader_slot_generation != 0) {
-			leader_ref.slot_index = tag_slot->leader_index;
-			leader_ref.slot_generation = tag_slot->leader_slot_generation;
-			leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
-				PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &tag_slot->tag,
-				PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
-			if (leader != NULL
-				&& pcm_x_wait_identity_equal(&leader->identity, &tag_slot->ref.identity)
-				&& pcm_x_ticket_handle_equal(&leader->handle, &tag_slot->ref.handle)) {
-				result = PCM_X_QUEUE_NOT_READY;
-				goto candidate_done;
-			}
-		}
+	}
+	if ((writer_flags | holder_flags) == 0) {
 		external_ref = !pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)
 						   ? &tag_slot->holder_ref
 						   : (!pcm_x_ticket_ref_is_zero(&tag_slot->blocker_snapshot_ref)
