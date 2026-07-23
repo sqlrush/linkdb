@@ -253,6 +253,11 @@ jobs:
           # t/ file lands in a shard the same commit).  Own shard: the quad
           # formation and the rejoin crash cycle dominate the wall clock.
           - { name: stage7-queue-liveness-rejoin, ranges: "400 404", unit: false, regress: false }
+          # t/405-408 current-DML MultiXact authority closure: foreign origin,
+          # mixed member origins, updater/HOT identity, and full-key TX-wait
+          # deadlock completion.  The four ClusterPair fixtures share one
+          # explicit shard so none can land outside nightly coverage.
+          - { name: stage7-current-multixact, ranges: "405-408", unit: false, regress: false }
     steps:
       - name: Checkout
         uses: actions/checkout@v4
