@@ -105,6 +105,38 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 # Path to the cluster_version object (no PG deps, safe to link standalone).
 CLUSTER_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_version.o
 
+# Server libpgport's Linux/aarch64 CRC32C runtime chooser references backend
+# ereport symbols.  Keep standalone tests isolated with a test-only fallback
+# archive whose one-symbol members are extracted only when a test does not
+# provide its own strong stub.
+CLUSTER_UNIT_EREPORT_STUB_SRC = test_cluster_ereport_fallback.c
+CLUSTER_UNIT_EREPORT_STUB_OBJS = \
+	test_cluster_ereport_errstart.o \
+	test_cluster_ereport_errstart_cold.o \
+	test_cluster_ereport_errmsg_internal.o \
+	test_cluster_ereport_errfinish.o
+CLUSTER_UNIT_EREPORT_STUB_A = libcluster_unit_ereport_stubs.a
+CLUSTER_UNIT_PGPORT = $(top_builddir)/src/port/libpgport_srv.a \
+	$(CLUSTER_UNIT_EREPORT_STUB_A)
+
+test_cluster_ereport_errstart.o: $(CLUSTER_UNIT_EREPORT_STUB_SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_UNIT_STUB_ERRSTART -c $< -o $@
+
+test_cluster_ereport_errstart_cold.o: $(CLUSTER_UNIT_EREPORT_STUB_SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_UNIT_STUB_ERRSTART_COLD -c $< -o $@
+
+test_cluster_ereport_errmsg_internal.o: $(CLUSTER_UNIT_EREPORT_STUB_SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_UNIT_STUB_ERRMSG_INTERNAL -c $< -o $@
+
+test_cluster_ereport_errfinish.o: $(CLUSTER_UNIT_EREPORT_STUB_SRC)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_UNIT_STUB_ERRFINISH -c $< -o $@
+
+$(CLUSTER_UNIT_EREPORT_STUB_A): $(CLUSTER_UNIT_EREPORT_STUB_OBJS)
+	rm -f $@
+	$(AR) $(AROPT) $@ $^
+
+$(TESTS): $(CLUSTER_UNIT_EREPORT_STUB_A)
+
 # Path to cluster_guc.o + cluster_elog.o (needed by test_cluster_guc only).
 # These reference PG backend symbols (DefineCustomIntVariable, etc.) that
 # the test stubs out locally.
@@ -179,7 +211,7 @@ test_cluster_membership: test_cluster_membership.c unit_test.h $(CLUSTER_VERSION
 		$(CLUSTER_MEMBERSHIP_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_MEMBERSHIP_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-7.3 D1: test_cluster_lms_shard links cluster_lms_shard.o (pure layer:
 # BufferTag -> worker shard map).  Links libpgcommon_srv.a for
@@ -190,7 +222,7 @@ test_cluster_lms_shard: test_cluster_lms_shard.c unit_test.h $(CLUSTER_VERSION_O
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMS_SHARD_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-7.3 D5: test_cluster_gcs_block_dedup links cluster_gcs_block_dedup.o
 # (real per-worker sharded lookup/install/GC/counter paths) + cluster_lms_shard.o,
@@ -202,14 +234,14 @@ test_cluster_gcs_block_dedup: test_cluster_gcs_block_dedup.c unit_test.h $(CLUST
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GCS_BLOCK_DEDUP_O) $(CLUSTER_LMS_SHARD_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 CLUSTER_PCM_X_IMAGE_FETCH_O = $(top_builddir)/src/backend/cluster/cluster_pcm_x_image_fetch.o
 test_cluster_pcm_x_image_fetch: test_cluster_pcm_x_image_fetch.c unit_test.h \
 		$(CLUSTER_PCM_X_IMAGE_FETCH_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_PCM_X_IMAGE_FETCH_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-7.3 D9: test_cluster_gcs_block_shard links cluster_gcs_block_shard.o
 # (the REAL staging-path payload -> worker router, extracted as a pure file)
@@ -221,7 +253,7 @@ test_cluster_gcs_block_shard: test_cluster_gcs_block_shard.c unit_test.h $(CLUST
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GCS_BLOCK_SHARD_O) $(CLUSTER_LMS_SHARD_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.5 D0/D1: test_cluster_backup links only the dependency-light
 # manifest/PITR helper object.  Runtime SQL/shmem code stays in
@@ -231,7 +263,7 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_BACKUP_MANIFEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_BACKUP_MANIFEST_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # Most tests link only cluster_version.o.  test_cluster_guc /
 # test_cluster_shmem / test_cluster_signal / test_cluster_views /
@@ -250,7 +282,7 @@ test_cluster_epoch: test_cluster_epoch.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_EPOCH_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_EPOCH_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.1a D6: test_cluster_ges_mode links cluster_ges_mode.o (pure layer:
 # const matrix + compat / convert-class / DLM-alias / PG-name helpers).
@@ -260,7 +292,7 @@ test_cluster_ges_mode: test_cluster_ges_mode.c unit_test.h $(CLUSTER_VERSION_O) 
 		$(CLUSTER_GES_MODE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GES_MODE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.4 D11: test_cluster_sequence links cluster_sequence.o (pure layer:
 # SQ resid encoding + direction-aware batch allocator + instance-cache
@@ -271,7 +303,7 @@ test_cluster_sequence: test_cluster_sequence.c unit_test.h $(CLUSTER_VERSION_O) 
 		$(CLUSTER_SEQUENCE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SEQUENCE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.7a D1: test_cluster_hw links cluster_hw.o (pure layer: HW resid
 # encoding + three-state extend classifier + master-side batch allocator
@@ -282,7 +314,7 @@ test_cluster_hw: test_cluster_hw.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_HW_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_HW_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.7 D4: test_cluster_dl links cluster_dl.o (pure DL resid encoder) +
 # cluster_hw.o (cluster_hw_resid_encode, for the DL-vs-HW distinctness test).
@@ -291,7 +323,7 @@ test_cluster_dl: test_cluster_dl.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_DL_O) $(CLUSTER_HW_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.7 §3.1d (v1.5 amend): test_cluster_extend_gate links cluster_extend_gate.o
 # (pure liveness engage classifier + wrapper).  The wrapper's six runtime
@@ -305,7 +337,7 @@ test_cluster_extend_gate: test_cluster_extend_gate.c unit_test.h $(CLUSTER_VERSI
 		$(CLUSTER_EXTEND_GATE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_EXTEND_GATE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.7 D8: test_cluster_ir links cluster_ir.o (pure IR resid encoder +
 # bootstrap predicate) + cluster_dl.o + cluster_hw.o (resid encoders, for the
@@ -316,7 +348,7 @@ test_cluster_ir: test_cluster_ir.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_IR_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IR_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.7 D5: test_cluster_ts links cluster_ts.o (pure TT resid encoders) +
 # cluster_ir.o/cluster_dl.o/cluster_hw.o (resid encoders, for the TT-vs-others
@@ -327,7 +359,7 @@ test_cluster_ts: test_cluster_ts.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_TS_O) $(CLUSTER_IR_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_TS_O) $(CLUSTER_IR_O) $(CLUSTER_DL_O) $(CLUSTER_HW_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.7 D6: test_cluster_ko links cluster_ko.o (pure KO resid encoder) +
 # cluster_dl.o/cluster_ir.o/cluster_hw.o (resid encoders, for the KO-vs-others
@@ -338,7 +370,7 @@ test_cluster_ko: test_cluster_ko.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_KO_O) $(CLUSTER_DL_O) $(CLUSTER_IR_O) $(CLUSTER_HW_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.11 D9: test_cluster_hang links cluster_hang_policy.o (the pure Hang
 # Manager decision/policy layer: threshold / wait-source tag / exclusion /
@@ -350,7 +382,7 @@ test_cluster_hang: test_cluster_hang.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_HANG_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_HANG_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.12 D9: test_cluster_hang_resolve links cluster_hang_resolve_policy.o
 # (the pure Hang Manager disposition decision layer: victim score + comparator,
@@ -364,7 +396,7 @@ test_cluster_hang_resolve: test_cluster_hang_resolve.c unit_test.h $(CLUSTER_VER
 		$(CLUSTER_HANG_RESOLVE_POLICY_O) $(CLUSTER_HANG_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_HANG_RESOLVE_POLICY_O) $(CLUSTER_HANG_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -lm -o $@
+		$(CLUSTER_UNIT_PGPORT) -lm -o $@
 
 # spec-5.20 D8: test_cluster_hang_acceptance links the same two pure Hang
 # Manager policy objects as the 5.11/5.12 unit tests — cluster_hang_resolve_policy.o
@@ -376,7 +408,7 @@ test_cluster_hang_acceptance: test_cluster_hang_acceptance.c unit_test.h $(CLUST
 		$(CLUSTER_HANG_RESOLVE_POLICY_O) $(CLUSTER_HANG_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_HANG_RESOLVE_POLICY_O) $(CLUSTER_HANG_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -lm -o $@
+		$(CLUSTER_UNIT_PGPORT) -lm -o $@
 
 # spec-6.12b: test_cluster_cr_server_policy links cluster_cr_server_policy.o
 # (the pure FULL/PARTIAL/DENY split over write_scn-DESC chain origins).  No
@@ -389,7 +421,7 @@ test_cluster_cr_server_policy: test_cluster_cr_server_policy.c unit_test.h $(CLU
 		-DCLUSTER_CR_SERVER_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_cr_server.c"' \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CR_SERVER_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.12i: test_cluster_runtime_visibility links cluster_runtime_visibility_policy.o
 # (the pure D-i2 live-authority window gate: epoch match + hwm >= anchor_lsn,
@@ -399,7 +431,7 @@ test_cluster_runtime_visibility: test_cluster_runtime_visibility.c unit_test.h $
 		$(CLUSTER_RUNTIME_VIS_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_RUNTIME_VIS_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.14 D1: test_cluster_touched_peers links cluster_touched_peers.o (the
 # pure per-tx touched bitmap: stamp / poison / intersect / reset / DSM merge).
@@ -411,7 +443,7 @@ test_cluster_touched_peers: test_cluster_touched_peers.c unit_test.h $(CLUSTER_V
 		$(CLUSTER_TOUCHED_PEERS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_TOUCHED_PEERS_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.13 D15: test_cluster_clean_leave links cluster_clean_leave_policy.o (the
 # pure clean-leave decision layer: phase-FSM transition validity, writable-only
@@ -424,7 +456,7 @@ test_cluster_clean_leave: test_cluster_clean_leave.c unit_test.h $(CLUSTER_VERSI
 		$(CLUSTER_CLEAN_LEAVE_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CLEAN_LEAVE_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.18 D18: test_cluster_node_remove links cluster_node_remove_policy.o (the
 # pure permanent-removal decision layer: phase-FSM transition validity, precheck
@@ -439,7 +471,7 @@ test_cluster_node_remove: test_cluster_node_remove.c unit_test.h $(CLUSTER_VERSI
 		$(CLUSTER_NODE_REMOVE_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_NODE_REMOVE_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.7 D3 S1: test_cluster_hw_snapshot links cluster_hw_snapshot.o (the HW
 # authority durable-snapshot envelope: serialize / deserialize+validate /
@@ -452,7 +484,7 @@ test_cluster_hw_snapshot: test_cluster_hw_snapshot.c unit_test.h $(CLUSTER_VERSI
 		$(CLUSTER_HW_SNAPSHOT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_HW_SNAPSHOT_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.6 Da1: test_cluster_cf_authority links cluster_cf_authority.o and
 # exercises the pure classify/decide logic plus a real durable_rename read/
@@ -464,7 +496,7 @@ test_cluster_cf_authority: test_cluster_cf_authority.c unit_test.h \
 		$(CLUSTER_CF_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CF_AUTHORITY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.6a D1: test_cluster_recovery_anchor links cluster_recovery_anchor.o
 # and exercises the pure image classification plus a real torn-safe read/
@@ -476,13 +508,13 @@ test_cluster_recovery_anchor: test_cluster_recovery_anchor.c unit_test.h \
 		$(CLUSTER_RECOVERY_ANCHOR_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RECOVERY_ANCHOR_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.14a D1: test_cluster_gcs_reqid exercises the pure request-id domain
 # helpers (cluster_gcs_reqid.h, c.h-only); links libpgport for pg_printf.
 test_cluster_gcs_reqid: test_cluster_gcs_reqid.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.14 D1: test_cluster_shared_catalog links cluster_shared_catalog.o
 # (the pure vet predicate + "non-temp = shared" routing criterion).  The
@@ -493,7 +525,7 @@ test_cluster_shared_catalog: test_cluster_shared_catalog.c unit_test.h \
 		$(CLUSTER_SHARED_CATALOG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_SHARED_CATALOG_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.14 D6: test_cluster_oid_lease links cluster_oid_lease.o (the pure
 # lease math + torn-safe authority file I/O).  fd.c openers, pg_fsync,
@@ -505,7 +537,7 @@ test_cluster_oid_lease: test_cluster_oid_lease.c unit_test.h \
 		$(CLUSTER_OID_LEASE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_OID_LEASE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.15b D1/D2: test_cluster_xid_authority links cluster_xid_authority.o
 # (the shared XID authority + native-era prehistory: torn-safe file I/O,
@@ -523,7 +555,7 @@ test_cluster_xid_authority: test_cluster_xid_authority.c unit_test.h \
 		$(CLUSTER_XID_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_XID_AUTHORITY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 
 # spec-6.14 D5: test_cluster_relmap_authority links cluster_relmap_authority.o
@@ -535,7 +567,7 @@ test_cluster_relmap_authority: test_cluster_relmap_authority.c unit_test.h \
 		$(CLUSTER_RELMAP_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RELMAP_AUTHORITY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.6 Da2: test_cluster_cf_storage links cluster_cf_storage.o (migration
 # + symlink + storage rename-contract) plus cluster_cf_authority.o (the
@@ -546,7 +578,7 @@ test_cluster_cf_storage: test_cluster_cf_storage.c unit_test.h \
 		$(CLUSTER_CF_STORAGE_O) $(CLUSTER_CF_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CF_STORAGE_O) $(CLUSTER_CF_AUTHORITY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.6 Db1: test_cluster_cf_enqueue links cluster_cf_enqueue.o (the pure
 # resid encoder).  No PG backend deps beyond the Assert hook.
@@ -555,7 +587,7 @@ test_cluster_cf_enqueue: test_cluster_cf_enqueue.c unit_test.h \
 		$(CLUSTER_CF_ENQUEUE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CF_ENQUEUE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.6 Dc4: test_cluster_cf_stats links cluster_cf_stats.o (the CF
 # observability counters); ShmemInitStruct + region register stubbed locally.
@@ -564,7 +596,7 @@ test_cluster_cf_stats: test_cluster_cf_stats.c unit_test.h \
 		$(CLUSTER_CF_STATS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CF_STATS_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.6 increment (iii): test_cluster_cf_phase2 links cluster_cf_phase2.o
 # (the cross-node rename-contract rendezvous).  The probe/ack file I/O and the
@@ -576,7 +608,7 @@ test_cluster_cf_phase2: test_cluster_cf_phase2.c unit_test.h \
 		$(CLUSTER_CF_PHASE2_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CF_PHASE2_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.2 D0: test_cluster_terminal_authority links the pure Smart Fusion
 # terminal-authority decision layer.  It has no backend dependencies beyond the
@@ -587,7 +619,7 @@ test_cluster_terminal_authority: test_cluster_terminal_authority.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_TERMINAL_AUTHORITY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.12 D6: test_cluster_retention links cluster_undo_retention.o (the two
 # pure retention predicates) standalone.  cluster_undo_retention.c references
@@ -606,12 +638,12 @@ test_cluster_tt_2pc: test_cluster_tt_2pc.c unit_test.h \
 		$(CLUSTER_TT_2PC_RECORD_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_TT_2PC_RECORD_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 test_cluster_visibility_variants: test_cluster_visibility_variants.c unit_test.h \
 		$(CLUSTER_VIS_VERDICT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VIS_VERDICT_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.22f D6-1: test_cluster_vis_undo_verdict_map links the same pure
 # verdict object (cluster_visibility_verdict.o) for the two D6 fresh-ref
@@ -622,7 +654,7 @@ test_cluster_vis_undo_verdict_map: test_cluster_vis_undo_verdict_map.c unit_test
 		$(CLUSTER_VIS_VERDICT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VIS_VERDICT_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-7.1a D0/U0: test_cluster_writer_chain links the pure terminal-writer
 # outcome -> TM_Result mapping standalone (no buffer / no page / no backend).
@@ -631,13 +663,13 @@ test_cluster_writer_chain: test_cluster_writer_chain.c unit_test.h \
 		$(CLUSTER_WRITER_CHAIN_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_WRITER_CHAIN_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 test_cluster_retention: test_cluster_retention.c unit_test.h \
 		$(CLUSTER_UNDO_RETENTION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.17 D6: test_cluster_stage3_acceptance — 8 static contract tests
 # (L1-L8) pinning the Stage 3 MVCC final surface (catversion / undo opcodes
@@ -650,7 +682,7 @@ test_cluster_stage3_acceptance: test_cluster_stage3_acceptance.c unit_test.h ../
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.14 D6: test_cluster_stage4_acceptance — 10 static contract tests
 # (L1-L10) pinning the Stage 4 WAL + recovery + fence final surface
@@ -664,7 +696,7 @@ test_cluster_stage4_acceptance: test_cluster_stage4_acceptance.c unit_test.h ../
 		../../../src/include/cluster/cluster_thread_recovery.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.19 D8: test_cluster_stage5_integrated_acceptance — 6 static contract
 # tests (L1-L6) pinning the Stage 5 (through 5.19) integrated-acceptance
@@ -677,7 +709,7 @@ test_cluster_stage5_integrated_acceptance: test_cluster_stage5_integrated_accept
 		../../../src/include/access/heapam_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.21 D3: test_cluster_stage5_beta_acceptance — 6 static contract tests
 # (L1-L6) pinning the Stage 5 (through 5.21) beta close-out release surface
@@ -691,7 +723,7 @@ test_cluster_stage5_beta_acceptance: test_cluster_stage5_beta_acceptance.c unit_
 		../../../src/include/cluster/cluster_gcs_block.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.58 D8: test_cluster_stage5_5_cr_acceptance — 6 static contract tests
 # (L1-L6) pinning the Stage 5.5 CR read-path band (5.51-5.57) final surface
@@ -705,7 +737,7 @@ test_cluster_stage5_5_cr_acceptance: test_cluster_stage5_5_cr_acceptance.c unit_
 		../../../src/include/cluster/cluster_cr_coordinator_stat.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.18 D1:  test_cluster_undo_buf links the real undo buffer pool object
 # and stubs ShmemInitStruct / LWLock* / cluster_undo_smgr_{read,write}_block
@@ -715,7 +747,7 @@ test_cluster_undo_buf: test_cluster_undo_buf.c unit_test.h $(CLUSTER_UNDO_BUF_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_UNDO_BUF_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.10 D3a: test_cluster_block_apply links the real single-block
 # redo-apply framework object and stubs RestoreBlockImage + the
@@ -730,7 +762,7 @@ test_cluster_block_apply: test_cluster_block_apply.c unit_test.h $(CLUSTER_BLOCK
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_BLOCK_APPLY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.11 D1: test_cluster_thread_apply links the real online thread-recovery
 # apply wrapper object and stubs cluster_block_apply_one (its byte-for-byte
@@ -745,7 +777,7 @@ test_cluster_thread_apply: test_cluster_thread_apply.c unit_test.h $(CLUSTER_THR
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_THREAD_APPLY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.11 D1 increment 3a: test_cluster_thread_replay exercises the PURE
 # block-classification gate (cluster_thread_replay_classify_block, a header
@@ -756,7 +788,7 @@ test_cluster_thread_apply: test_cluster_thread_apply.c unit_test.h $(CLUSTER_THR
 test_cluster_thread_replay: test_cluster_thread_replay.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.11 D1 increment 3b-1: test_cluster_thread_driver exercises the driver's
 # PURE decision helpers -- cluster_thread_recovery_should_rethrow (the R13 elevel
@@ -768,7 +800,7 @@ test_cluster_thread_replay: test_cluster_thread_replay.c unit_test.h
 test_cluster_thread_driver: test_cluster_thread_driver.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.11 D1 increment 3b-2: test_cluster_thread_orchestrator exercises the
 # orchestrator's PURE on_unrecoverable escalation gate
@@ -779,7 +811,7 @@ test_cluster_thread_driver: test_cluster_thread_driver.c unit_test.h
 test_cluster_thread_orchestrator: test_cluster_thread_orchestrator.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.12 D3: test_cluster_write_fence exercises the PURE cooperative write-fence
 # judge cluster_write_fence_decide (a header inline -- no cluster object needed;
@@ -788,7 +820,7 @@ test_cluster_thread_orchestrator: test_cluster_thread_orchestrator.c unit_test.h
 test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 $(SIMPLE_TESTS): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
@@ -849,7 +881,7 @@ test_cluster_ic_envelope: test_cluster_ic_envelope.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ENVELOPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ENVELOPE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.3 D4: test_cluster_ic_router links cluster_ic_router.o +
 # cluster_ic_envelope.o (envelope_build called inside send_envelope) +
@@ -862,7 +894,7 @@ test_cluster_ic_router: test_cluster_ic_router.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ROUTER_O) $(CLUSTER_IC_ENVELOPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_ROUTER_O) $(CLUSTER_IC_ENVELOPE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # test_cluster_conf links cluster_conf.o standalone.  cluster_conf.c
 # references ereport / ShmemInitStruct / AllocateFile / FreeFile /
@@ -975,7 +1007,7 @@ test_cluster_ges_handoff: test_cluster_ges_handoff.c unit_test.h \
 		$(CLUSTER_GES_HANDOFF_POLICY_O) $(CLUSTER_GES_MODE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_GES_HANDOFF_POLICY_O) $(CLUSTER_GES_MODE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # test_cluster_shared_fs links the three storage/ objects standalone:
 # cluster_shared_fs.o (registry + dispatch), cluster_shared_fs_stub.o
@@ -993,7 +1025,7 @@ test_cluster_shared_fs: test_cluster_shared_fs.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_SHARED_FS_O) \
 		$(CLUSTER_SHARED_FS_STUB_O) $(CLUSTER_SHARED_FS_LOCAL_O) \
 		$(CLUSTER_SHARED_FS_SHAREDFS_O) $(CLUSTER_SHARED_CATALOG_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.5a D12: runtime unit for the shared_fs backend + shared-root
 # sentinel.  Links ONLY cluster_shared_fs_sharedfs.o with functional
@@ -1091,7 +1123,8 @@ check: all
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) $(CLUSTER_UNIT_EREPORT_STUB_A) \
+		$(CLUSTER_UNIT_EREPORT_STUB_OBJS)
 
 install installdirs uninstall installcheck:
 	@:
@@ -1161,7 +1194,7 @@ test_cluster_reconfig: test_cluster_reconfig.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_RECONFIG_O) $(CLUSTER_EPOCH_O) \
 		$(CLUSTER_TOUCHED_PEERS_O) $(CLUSTER_MEMBERSHIP_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.6 Sprint A Step 2 D3: cluster_voting_disk_io.o standalone test.
 # Real syscalls (open / pread / pwrite / fdatasync) on a temp file —
@@ -1174,7 +1207,7 @@ test_cluster_voting_disk_io: test_cluster_voting_disk_io.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_VOTING_DISK_IO_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_VOTING_DISK_IO_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.6 Sprint A Step 2 D4: cluster_quorum_decision.o standalone test.
 # Pure logic — no shmem, no I/O, no logging.  Synthetic slot matrix
@@ -1211,7 +1244,7 @@ test_cluster_adg: test_cluster_adg.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ADG_O) $(CLUSTER_LNS_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ADG_O) $(CLUSTER_LNS_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.13 D6: test_cluster_ges links cluster_ges.o standalone.
 # cluster_ges.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1225,7 +1258,7 @@ test_cluster_ges: test_cluster_ges.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GES_O) $(CLUSTER_GES_MODE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # P0#3: fixed-capacity, no-overwrite GES cleanup deferred-retry queue.
 test_cluster_grd_outbound: test_cluster_grd_outbound.c unit_test.h \
@@ -1233,7 +1266,7 @@ test_cluster_grd_outbound: test_cluster_grd_outbound.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_OUTBOUND_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.14 D11: test_cluster_grd links cluster_grd.o standalone.
 # cluster_grd.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1246,7 +1279,7 @@ test_cluster_grd: test_cluster_grd.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) $(CLUSTER_GES_MODE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.10 D9: test_cluster_grd_starvation links cluster_grd.o standalone
 # (same stub surface as test_cluster_grd; the spec-5.8 LMD wait-edge API is
@@ -1256,7 +1289,7 @@ test_cluster_grd_starvation: test_cluster_grd_starvation.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GRD_O) $(CLUSTER_GES_MODE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.19 D13: test_cluster_lmd links cluster_lmd.o standalone.
 # cluster_lmd.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1271,7 +1304,7 @@ test_cluster_lmd: test_cluster_lmd.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.8 D1a: test_cluster_lmd_graph links cluster_lmd_graph.o standalone.
 # cluster_lmd_graph.c references ShmemInitStruct + ShmemInitHash + hash_search
@@ -1284,7 +1317,7 @@ test_cluster_lmd_graph: test_cluster_lmd_graph.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_GRAPH_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.8 D1d: test_cluster_lmd_wait_state links cluster_lmd_wait_state.o
 # standalone.  The wait-state object depends only on pg_atomic (libpgport);
@@ -1298,7 +1331,7 @@ test_cluster_lmd_wait_state: test_cluster_lmd_wait_state.c unit_test.h \
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_WAIT_STATE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a $(PTHREAD_LIBS) -o $@
+		$(CLUSTER_UNIT_PGPORT) $(PTHREAD_LIBS) -o $@
 
 # spec-5.9 D3: test_cluster_cancel_token links cluster_cancel_token.o
 # standalone.  The match logic (consume_against) only needs the spinlock +
@@ -1309,7 +1342,7 @@ test_cluster_cancel_token: test_cluster_cancel_token.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CANCEL_TOKEN_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.8 D8: test_cluster_lmd_probe_collector links cluster_lmd_probe_collector.o
 # standalone.  The shmem REPORT collector depends on ShmemInitStruct + LWLock +
@@ -1321,7 +1354,7 @@ test_cluster_lmd_probe_collector: test_cluster_lmd_probe_collector.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMD_PROBE_COLLECTOR_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.20 D13: test_cluster_lock_acquire links cluster_lock_acquire.o
 # standalone.  cluster_lock_acquire.c references cluster_lms_is_ready /
@@ -1333,7 +1366,7 @@ test_cluster_lock_acquire: test_cluster_lock_acquire.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.5 D3/D8: test_cluster_advisory links cluster_advisory.o standalone.
 # cluster_advisory.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1346,7 +1379,7 @@ test_cluster_advisory: test_cluster_advisory.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ADVISORY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.30 D9: test_cluster_pcm_lock links cluster_pcm_lock.o standalone.
 # cluster_pcm_lock.c references 20 PG-runtime symbols (ShmemInit* / LWLock* /
@@ -1361,7 +1394,7 @@ test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.36a C1/D5a: the real cluster_pcm_own object is linked against a
 # fake shmem region.  The test also reads the production bufmgr source through
@@ -1372,7 +1405,7 @@ test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_PCM_OWN_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # S3-core direct-init proof is a dependency-light, process-local decision
 # layer.  The real bufmgr captures/revalidates the snapshots under its header
@@ -1387,14 +1420,14 @@ test_cluster_pcm_direct_init: test_cluster_pcm_direct_init.c unit_test.h \
 		-DHIO_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/hio.c"' \
 		$< \
 		$(CLUSTER_PCM_DIRECT_INIT_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.36a S3-core: wire ABI + checked five-pool external shmem layout.
 test_cluster_pcm_x_convert: test_cluster_pcm_x_convert.c unit_test.h \
 		$(CLUSTER_PCM_X_CONVERT_O)
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_PCM_X_CONVERT_O) \
-		$(top_builddir)/src/port/libpgport_srv.a $(PTHREAD_LIBS) -o $@
+		$(CLUSTER_UNIT_PGPORT) $(PTHREAD_LIBS) -o $@
 
 # GCS-race round-4c tier1-partial-IO: test_cluster_ic_tier1_partial links
 # cluster_ic_tier1.o standalone and drives the PRODUCTION outbound-tail
@@ -1409,7 +1442,7 @@ test_cluster_ic_tier1_partial: test_cluster_ic_tier1_partial.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IC_TIER1_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # GCS serve-stall round-5: test_cluster_lms_outbound links
 # cluster_lms_outbound.o standalone and pins the drain's four-state send
@@ -1422,7 +1455,7 @@ test_cluster_lms_outbound: test_cluster_lms_outbound.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMS_OUTBOUND_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.31 D9 v0.5: test_cluster_bufmgr_pcm_hook verifies the bufmgr
 # LockBuffer/LockBufferForCleanup PCM hook layer in isolation by using a
@@ -1434,7 +1467,7 @@ test_cluster_bufmgr_pcm_hook: test_cluster_bufmgr_pcm_hook.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.32 D9: test_cluster_gcs_dispatch verifies GCS request protocol
 # skeleton invariants (msg_type enum 12/13, payload ABI lock, dispatch
@@ -1445,7 +1478,7 @@ test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GCS_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.33 D13: test_cluster_gcs_block verifies GCS block-shipping
 # substrate compile-time invariants (msg_type 14/15, payload ABI sizes,
@@ -1463,7 +1496,7 @@ test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O
 		$< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.34 D13: test_cluster_gcs_block_retransmit verifies reliability
 # hardening compile-time invariants (status enum 7→8, dedup entry 8312B
@@ -1475,7 +1508,7 @@ test_cluster_gcs_block_retransmit: test_cluster_gcs_block_retransmit.c unit_test
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-7.2a:  test_cluster_gcs_block_dedup_reclaim verifies the eager-reclaim
 # safety decision primitives (review r1): in-window reclaim whitelist
@@ -1489,7 +1522,7 @@ test_cluster_gcs_block_dedup_reclaim: test_cluster_gcs_block_dedup_reclaim.c uni
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-7.2a review F4:  test_cluster_gcs_block_dedup_htab links the REAL
 # cluster_gcs_block_dedup.o and drives lookup_or_register to cap against a
@@ -1503,7 +1536,7 @@ test_cluster_gcs_block_dedup_htab: test_cluster_gcs_block_dedup_htab.c unit_test
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GCS_BLOCK_DEDUP_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.35 D17:  test_cluster_gcs_block_2way verifies CF 2-way protocol
 # compile-time invariants (msg_type 16, status 8, GcsBlockForwardPayload
@@ -1515,7 +1548,7 @@ test_cluster_gcs_block_2way: test_cluster_gcs_block_2way.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.36 D11/D12:  test_cluster_gcs_block_3way verifies CF 3-way
 # protocol compile-time invariants (msg_type 17/18, reply status 9/10/11,
@@ -1528,7 +1561,7 @@ test_cluster_gcs_block_3way: test_cluster_gcs_block_3way.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.37 D13:  test_cluster_gcs_block_lost_write verifies PI watermark
 # + lost-write detection MVP compile-time invariants (reply status 12,
@@ -1540,7 +1573,7 @@ test_cluster_gcs_block_lost_write: test_cluster_gcs_block_lost_write.c unit_test
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.38 D11/D12:  test_cluster_sinval verifies SI Broadcaster skeleton
 # compile-time invariants (msg_type 7,  LMON-mediated SINVAL fanout
@@ -1555,7 +1588,7 @@ test_cluster_sinval: test_cluster_sinval.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.39 D15:  test_cluster_sinval_ack verifies the ack/barrier wire
 # ABI + flag encoding + enum invariants (msg_type 19 not colliding with
@@ -1569,7 +1602,7 @@ test_cluster_sinval_ack: test_cluster_sinval_ack.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-2.40 D8:  test_cluster_stage2_acceptance — 8 static contract
 # tests verifying Stage 2 final surface snapshot (catversion >= 202605460,
@@ -1583,7 +1616,7 @@ test_cluster_stage2_acceptance: test_cluster_stage2_acceptance.c unit_test.h ../
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.1 D9:  test_cluster_tt_status — 22 真 C 单测 verifying the Undo
 # TT status foundation static contract (24B ClusterTTStatusKey with
@@ -1597,7 +1630,7 @@ test_cluster_tt_status: test_cluster_tt_status.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.2 D9:  test_cluster_tt_status_hint — 18 static contract tests
 # verifying cross-node TT status hint wire ABI (32B with embedded
@@ -1611,7 +1644,7 @@ test_cluster_tt_status_hint: test_cluster_tt_status_hint.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.2 D10:  test_cluster_visibility_fork — 12 static contract tests
 # verifying HeapTupleSatisfiesMVCC cluster fork inputs (ClusterUndoTTSlotRef
@@ -1630,7 +1663,7 @@ test_cluster_visibility_fork: test_cluster_visibility_fork.c unit_test.h \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_VIS_VERDICT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.3 D11:  test_cluster_visibility_decide_scn — 22 static +
 # behavioral mock tests verifying cluster_visibility_decide_by_scn() and
@@ -1646,7 +1679,7 @@ test_cluster_visibility_decide_scn: test_cluster_visibility_decide_scn.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.3 D12:  test_cluster_snapshot_source — 18 static + ABI tests
 # verifying SnapshotData explicit 24B cluster tail (D1), the SnapshotSource
@@ -1657,7 +1690,7 @@ test_cluster_snapshot_source: test_cluster_snapshot_source.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4a D11: test_cluster_itl_touch — 23 static + ABI tests
 # verifying ClusterItlTouchHandle 24B layout, writer API symbols
@@ -1671,7 +1704,7 @@ test_cluster_itl_touch: test_cluster_itl_touch.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4a D12: test_cluster_itl_wal — 18 static ABI tests for the
 # heap WAL ITL delta block-local array layout (xl_heap_itl_delta 24B
@@ -1683,7 +1716,7 @@ test_cluster_itl_wal: test_cluster_itl_wal.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4b D10: test_cluster_uba — 24 static + inline-helper tests
 # covering the UBA encode/decode helpers + offset/id sentinel separation
@@ -1694,7 +1727,7 @@ test_cluster_uba: test_cluster_uba.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UBA_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4b D11: test_cluster_tt_slot_allocator — 30 tests linking the
 # real cluster_tt_slot.o + mocked ShmemInitStruct / LWLock / ereport so
@@ -1711,14 +1744,14 @@ test_cluster_tt_durable: test_cluster_tt_durable.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_TT_DURABLE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 test_cluster_tt_slot_allocator: test_cluster_tt_slot_allocator.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_TT_SLOT_O) $(CLUSTER_UNDO_RETENTION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_TT_SLOT_O) $(CLUSTER_UNDO_RETENTION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4b D12: test_cluster_itl_reader_real_triple — 18 tests for
 # the 3-branch reader (FREE / UBA_is_invalid legacy / real decode) on
@@ -1729,7 +1762,7 @@ test_cluster_itl_reader_real_triple: test_cluster_itl_reader_real_triple.c unit_
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_O) $(CLUSTER_UBA_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4c D10: test_cluster_itl_cleanout — 20 tests covering the
 # lazy cleanout helper symbol surface + can_stamp() pure-data
@@ -1744,7 +1777,7 @@ test_cluster_itl_cleanout: test_cluster_itl_cleanout.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_CLEANOUT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4c D11: test_cluster_visibility_inject — 16 tests covering
 # the D5b inject UDF surface + A1 install_local + F4 delete_exact
@@ -1756,7 +1789,7 @@ test_cluster_visibility_inject: test_cluster_visibility_inject.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4c D13: test_cluster_itl_cleanout_perf — 8 tests covering
 # the D14 per-page aggregate layout (ClusterItlPagedHandle
@@ -1769,7 +1802,7 @@ test_cluster_itl_cleanout_perf: test_cluster_itl_cleanout_perf.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4d D13: test_cluster_heap_lock_tuple — 19 tests covering the
 # spec-3.4d ABI / lock-only ITL enum / SQLSTATE / WAL flag / counter
@@ -1781,7 +1814,7 @@ test_cluster_heap_lock_tuple: test_cluster_heap_lock_tuple.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.4e D5: test_cluster_perf_gates — 10 pure ABI / threshold /
 # symbol-link tests for 5-tier × 4 workload class perf gate contract.
@@ -1791,7 +1824,7 @@ test_cluster_perf_gates: test_cluster_perf_gates.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.5 D12: test_cluster_subtrans — 12 pure ABI / offsetof / sizeof /
 # enum / SQLSTATE / symbol-link tests for SUBTRANS cross-node visibility
@@ -1802,7 +1835,7 @@ test_cluster_subtrans: test_cluster_subtrans.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.6 D10: test_cluster_multixact — 16 pure ABI / offsetof / sizeof /
 # enum / SQLSTATE / symbol-link tests for MULTIXACT reader/member-resolution
@@ -1814,7 +1847,7 @@ test_cluster_multixact: test_cluster_multixact.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.7 D12: test_cluster_undo_format — 12 pure ABI / offsetof /
 # sizeof / magic / enum / SQLSTATE tests for Undo Record Format +
@@ -1825,7 +1858,7 @@ test_cluster_undo_format: test_cluster_undo_format.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.7 D12: test_cluster_undo_record — 12 encode/decode round-trip
 # tests for UndoRecordHeader + 4 payloads + slot dir addressing.
@@ -1834,7 +1867,7 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 
 # spec-4.2 D6: test_cluster_wal_state — 14 pure-helper tests for the
@@ -1849,7 +1882,7 @@ test_cluster_wal_state: test_cluster_wal_state.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.5 D11: test_cluster_recovery_merge — 20 pure tests (k-way
 # heap ordering scn->lsn->node, G/S/L/U class matrix, xl_scn layout).
@@ -1861,7 +1894,7 @@ test_cluster_recovery_merge: test_cluster_recovery_merge.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.4 D7: test_cluster_recovery_worker — 15 pure-helper tests
 # (round-robin striping conservation, page-header check incl. the P0
@@ -1873,7 +1906,7 @@ test_cluster_recovery_worker: test_cluster_recovery_worker.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.3 D6: test_cluster_recovery_plan — 16 pure-classifier tests
 # for the recovery plan (§3.2 truth table 1:1: own-priority family,
@@ -1887,7 +1920,7 @@ test_cluster_recovery_plan: test_cluster_recovery_plan.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-4.1 D8: test_cluster_wal_thread — 12 pure-helper tests for the
 # per-thread WAL routing surface (identity mapping / dir name / page
@@ -1900,7 +1933,7 @@ test_cluster_wal_thread: test_cluster_wal_thread.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.8 D12: test_cluster_undo_lifecycle — 10 pure ABI / enum /
 # SQLSTATE / sizeof / offsetof tests for Undo Segment Lifecycle MVP +
@@ -1911,7 +1944,7 @@ test_cluster_undo_lifecycle: test_cluster_undo_lifecycle.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.9 D10: test_cluster_cr — ABI / SQLSTATE + the 4 inverse-apply
 # helpers (cluster_cr_apply.o) on a synthetic ITL page.  Chain walker /
@@ -1922,7 +1955,7 @@ test_cluster_cr: test_cluster_cr.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_APPLY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-3.10 D8: test_cluster_cr_cache — backend-local clock CR cache
 # (cluster_cr_cache.o) with malloc-backed MemoryContext stubs.
@@ -1932,7 +1965,7 @@ test_cluster_cr_cache: test_cluster_cr_cache.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_CACHE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.53 D7: test_cluster_cr_key — CR cache key identity contract
 # (cluster_cr_cache_key_equal): per-field necessity, joint sufficiency,
@@ -1942,7 +1975,7 @@ test_cluster_cr_key: test_cluster_cr_key.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_CACHE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.51: test_cluster_cr_pool — shared CR buffer pool substrate
 # (cluster_cr_pool.o + cluster_cr_cache.o for canonical key_equal) with
@@ -1953,7 +1986,7 @@ test_cluster_cr_pool: test_cluster_cr_pool.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_POOL_O) $(CLUSTER_CR_CACHE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.56: test_cluster_cr_lifecycle — CR pool lifecycle / invalidation contract
 # (C1-C4) + per-relation generation table (composite fence, INV-G1/G2/G3, overflow,
@@ -1963,7 +1996,7 @@ test_cluster_cr_lifecycle: test_cluster_cr_lifecycle.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_POOL_O) $(CLUSTER_CR_CACHE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.52: test_cluster_cr_admit — backend-local admission predicate +
 # scan-kind marker lifecycle + page-identity churn detector + per-backend
@@ -1976,7 +2009,7 @@ test_cluster_cr_admit: test_cluster_cr_admit.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_ADMIT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.55: test_cluster_resolver_cache — shared resolver cache module
 # (cluster_resolver_cache.o) with malloc-backed ShmemInitStruct + no-op LWLock
@@ -1988,7 +2021,7 @@ test_cluster_resolver_cache: test_cluster_resolver_cache.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RESOLVER_CACHE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.52 D9: test_cluster_cr_admit_stat — independent admission reason
 # counter shmem region (cluster_cr_admit_stat.o) with malloc-backed
@@ -1999,7 +2032,7 @@ test_cluster_cr_admit_stat: test_cluster_cr_admit_stat.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_ADMIT_STAT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.54 D5: test_cluster_cr_tuple_stat — independent tuple-level CR fast-path
 # outcome counter shmem region (cluster_cr_tuple_stat.o) with malloc-backed
@@ -2010,7 +2043,7 @@ test_cluster_cr_tuple_stat: test_cluster_cr_tuple_stat.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_TUPLE_STAT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.54 D7: test_cluster_cr_tuple — D1 static eligibility predicate + D2
 # TargetTupleCrState per-record transitions on a synthetic ITL page.  Links
@@ -2022,7 +2055,7 @@ test_cluster_cr_tuple: test_cluster_cr_tuple.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_TUPLE_O) $(CLUSTER_CR_APPLY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.57 D9: test_cluster_cr_coordinator — cross-instance CR/current read-path
 # coordinator boundary module (cluster_cr_coordinator_stat.o): independent
@@ -2036,7 +2069,7 @@ test_cluster_cr_coordinator: test_cluster_cr_coordinator.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CR_COORDINATOR_STAT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-6.15 D2: test_cluster_xid_stripe — U1 truth tables for the xid
 # stripe pure derivation layer (widen signed window / origin_slot floor
@@ -2050,7 +2083,7 @@ test_cluster_xid_stripe: test_cluster_xid_stripe.c unit_test.h \
 		$(CLUSTER_XID_STRIPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_XID_STRIPE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.22a D1: test_cluster_undo_resid — shared-undo block resource
 # identity pure layer (undo resid class byte + encode/decode +
@@ -2063,7 +2096,7 @@ test_cluster_undo_resid: test_cluster_undo_resid.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_HW_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_HW_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.22d D4-1: test_cluster_undo_authority — dead/absent-owner undo
 # serve-authority election pure layer (deterministic lowest-fresh-survivor +
@@ -2077,7 +2110,7 @@ test_cluster_undo_authority: test_cluster_undo_authority.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_AUTHORITY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.22e D5-1: test_cluster_undo_horizon — cluster-wide undo retention
 # horizon pure fold (required-MEMBER report views -> recycle floor, U1-U16
@@ -2092,7 +2125,7 @@ test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.22b D2-1/D2-3: test_cluster_undo_gcs — owner-as-master routing layer
 # (D2-1: cluster_undo_block_lookup_master / _master_is_self) + the pure reader
@@ -2110,7 +2143,7 @@ test_cluster_undo_gcs: test_cluster_undo_gcs.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_UNDO_GCS_O) \
 		$(CLUSTER_RUNTIME_VIS_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-5.22c D3-1/D3-2: test_cluster_undo_verdict — cross-node xid->commit_scn
 # verdict taxonomy (five-value ClusterUndoVerdictKind) + the two pure mapping
@@ -2130,7 +2163,7 @@ test_cluster_undo_verdict: test_cluster_undo_verdict.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RESID_O) $(CLUSTER_UNDO_GCS_O) \
 		$(CLUSTER_RUNTIME_VIS_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-7.1 D3-a: test_cluster_mxid_stripe — truth tables for the mxid
 # stripe pure derivation layer (half-space origin derivation / striped
@@ -2144,7 +2177,7 @@ test_cluster_mxid_stripe: test_cluster_mxid_stripe.c unit_test.h \
 		$(CLUSTER_MXID_STRIPE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_MXID_STRIPE_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
 
 # spec-7.1 D3-b (A1): test_cluster_multixact_served — visibility truth table
 # for the pure served-verdict combination resolver.  Links
@@ -2158,4 +2191,4 @@ test_cluster_multixact_served: test_cluster_multixact_served.c unit_test.h \
 		$(CLUSTER_MULTIXACT_SERVED_O) \
 		$(CLUSTER_VIS_VERDICT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(CLUSTER_UNIT_PGPORT) -o $@
