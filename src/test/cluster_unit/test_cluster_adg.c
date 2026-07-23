@@ -71,6 +71,40 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 	abort();
 }
 
+/*
+ * Linux/aarch64's libpgport_srv pulls in the runtime CRC32C chooser, whose
+ * DEBUG1/Error paths reference the backend ereport machinery.  Keep this
+ * standalone test independent of the backend while preserving ERROR as a
+ * hard test failure.
+ */
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	if (elevel >= ERROR)
+	{
+		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
+		abort();
+	}
+	return false;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
 int
 scn_time_cmp(SCN a, SCN b)
 {
