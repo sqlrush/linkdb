@@ -13677,7 +13677,32 @@ gcs_block_pcm_x_local_drain_apply_exact(const PcmXDrainPollPayload *poll,
 	if (image_result == GCS_BLOCK_PCM_X_IMAGE_DUPLICATE)
 		return result;
 	if (image_result != GCS_BLOCK_PCM_X_IMAGE_NOT_READY) {
-		cluster_pcm_x_runtime_fail_closed();
+		if (CritSectionCount == 0)
+			ereport(LOG,
+					(errmsg_internal("PCM-X DRAIN dedup image is not exact"),
+					 errdetail("image_result=%u drain_result=%u worker=%d "
+							   "tag=%u/%u/%u/%d/%u requester=%d procno=%u request_id=%llu "
+							   "ticket=%llu queue_generation=%llu grant_generation=%llu "
+							   "image_id=%llu source_generation=%llu source_node=%u "
+							   "master=%d master_session=%llu holder_ref=%d holder_image=%d",
+							   (unsigned int)image_result, (unsigned int)result, worker_id,
+							   poll->ref.identity.tag.spcOid, poll->ref.identity.tag.dbOid,
+							   poll->ref.identity.tag.relNumber,
+							   (int)poll->ref.identity.tag.forkNum, poll->ref.identity.tag.blockNum,
+							   poll->ref.identity.node_id, poll->ref.identity.procno,
+							   (unsigned long long)poll->ref.identity.request_id,
+							   (unsigned long long)poll->ref.handle.ticket_id,
+							   (unsigned long long)poll->ref.handle.queue_generation,
+							   (unsigned long long)poll->ref.grant_generation,
+							   (unsigned long long)binding.identity.image.image_id,
+							   (unsigned long long)binding.identity.image.source_own_generation,
+							   binding.identity.image.source_node, authenticated_master_node,
+							   (unsigned long long)authenticated_master_session, holder_ref ? 1 : 0,
+							   holder_image ? 1 : 0)));
+		cluster_pcm_x_runtime_fail_closed_detail_at(
+			__FILE__, __LINE__,
+			result == PCM_X_QUEUE_DUPLICATE ? "drain-dedup-replay" : "drain-dedup-first",
+			(uint32)image_result, poll->ref.handle.ticket_id);
 		return PCM_X_QUEUE_CORRUPT;
 	}
 	self_source_handoff = binding.identity.image.source_node == (uint32)cluster_node_id

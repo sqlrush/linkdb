@@ -2543,6 +2543,50 @@ UT_TEST(test_pcm_x_duplicate_drain_accepts_only_holder_retired_after_first_consu
 }
 
 
+/* A post-DRAIN dedup mismatch is irreversible and must retain enough exact
+ * context to distinguish a legal replay tombstone race from corruption. */
+UT_TEST(test_pcm_x_drain_dedup_fail_closed_preserves_exact_context)
+{
+	char *source = read_gcs_block_source();
+	const char *drain;
+	const char *drain_end;
+	const char *status;
+	const char *guard;
+	const char *detail;
+	const char *fuse;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	drain = strstr(source, "\ngcs_block_pcm_x_local_drain_apply_exact(");
+	drain_end = drain != NULL ? strstr(drain + 1, "\n}\n\n\n") : NULL;
+	status
+		= drain != NULL ? strstr(drain, "cluster_gcs_block_dedup_pcm_x_drain_status_exact(") : NULL;
+	guard = status != NULL ? strstr(status, "if (image_result != GCS_BLOCK_PCM_X_IMAGE_NOT_READY)")
+						   : NULL;
+	detail = guard != NULL ? strstr(guard, "PCM-X DRAIN dedup image is not exact") : NULL;
+	fuse = detail != NULL ? strstr(detail, "cluster_pcm_x_runtime_fail_closed_detail_at(") : NULL;
+
+	UT_ASSERT_NOT_NULL(drain);
+	UT_ASSERT_NOT_NULL(drain_end);
+	UT_ASSERT_NOT_NULL(status);
+	UT_ASSERT_NOT_NULL(guard);
+	UT_ASSERT_NOT_NULL(detail);
+	UT_ASSERT_NOT_NULL(fuse);
+	UT_ASSERT_NOT_NULL(detail != NULL ? strstr(detail, "image_result=%u drain_result=%u") : NULL);
+	UT_ASSERT_NOT_NULL(detail != NULL ? strstr(detail, "tag=%u/%u/%u/%d/%u") : NULL);
+	UT_ASSERT_NOT_NULL(detail != NULL ? strstr(detail, "ticket=%llu queue_generation=%llu") : NULL);
+	UT_ASSERT_NOT_NULL(detail != NULL ? strstr(detail, "image_id=%llu source_generation=%llu")
+									  : NULL);
+	UT_ASSERT_NOT_NULL(fuse != NULL ? strstr(fuse, "drain-dedup-replay") : NULL);
+	UT_ASSERT_NOT_NULL(fuse != NULL ? strstr(fuse, "drain-dedup-first") : NULL);
+	UT_ASSERT_NOT_NULL(fuse != NULL ? strstr(fuse, "poll->ref.handle.ticket_id") : NULL);
+	if (status != NULL && guard != NULL && detail != NULL && fuse != NULL && drain_end != NULL)
+		UT_ASSERT(status < guard && guard < detail && detail < fuse && fuse < drain_end);
+	free(source);
+}
+
+
 UT_TEST(test_pcm_x_pending_x_marker_is_only_a_pre_handoff_gate)
 {
 	UT_ASSERT(cluster_gcs_pcm_x_transfer_pre_handoff_phase(0));
@@ -5690,7 +5734,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(109);
+	UT_PLAN(110);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5759,6 +5803,7 @@ main(void)
 	UT_RUN(test_pcm_x_final_ack_fail_closed_names_exact_handoff_stage);
 	UT_RUN(test_pcm_x_holder_image_evidence_never_uses_generation_as_presence);
 	UT_RUN(test_pcm_x_duplicate_drain_accepts_only_holder_retired_after_first_consumption);
+	UT_RUN(test_pcm_x_drain_dedup_fail_closed_preserves_exact_context);
 	UT_RUN(test_pcm_x_pending_x_marker_is_only_a_pre_handoff_gate);
 	UT_RUN(test_pcm_x_ready_publication_follows_exact_retained_commit);
 	UT_RUN(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change);
