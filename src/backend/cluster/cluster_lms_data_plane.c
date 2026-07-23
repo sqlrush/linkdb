@@ -562,9 +562,24 @@ cluster_lms_data_plane_tick(long timeout_ms)
 
 			if (cluster_ic_tier1_continue_hello_recv(slot, pend_fd, &learned)) {
 				if (learned >= 0) {
-					/* HELLO complete: bind to the learned peer. */
-					if (dp_track[learned].fd >= 0 && dp_track[learned].fd != pend_fd)
-						cluster_ic_tier1_close_peer(learned, "data-plane duplicate connection");
+					/*
+					 * Retire the old connection before binding the verified
+					 * anonymous fd.  close_peer() clears the old byte-stream
+					 * tail, whole-frame FIFO, recv/chunk state and publishes
+					 * DATA DISCONNECTED for the old generation.  The bind then
+					 * publishes CONNECTED for exactly pend_fd's generation.
+					 */
+					if (cluster_ic_tier1_get_peer_fd(learned) >= 0)
+						cluster_ic_tier1_close_peer(learned,
+												   "data-plane duplicate connection");
+					dp_track[learned].fd = -1;
+					if (!cluster_ic_tier1_bind_verified_anon_peer(slot, learned, pend_fd)) {
+						(void)close(pend_fd);
+						dp_pending_fds[slot] = -1;
+						cluster_ic_tier1_anon_hello_reset(slot);
+						dp_wes_dirty = true;
+						continue;
+					}
 					dp_track[learned].fd = pend_fd;
 					dp_track[learned].substate = LMS_DP_CONNECTED;
 					dp_pending_fds[slot] = -1;

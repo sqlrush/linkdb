@@ -598,8 +598,9 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * authority flock (0x40) + ownership-gen ruling② invalidate BUSY
 	 * (0x80) + TT-lane undo-horizon idle sentinel (0x100) + PCM-X
 	 * conversion (0x200) + A' rebase V2 INSTALL_READY (0x400) + PCM-X
-	 * source-floor type49 V2 (0x800)
-	 * (smart-fusion is off in this fixture) */
+	 * source-floor type49 V2 (0x800).  The atomic current-MX family bit
+	 * remains reserved until both request kinds land (smart-fusion is off
+	 * in this fixture). */
 	UT_ASSERT_EQ(wire[36], 0xFE);
 	UT_ASSERT_EQ(wire[37], 0x0F);
 	UT_ASSERT_EQ(wire[38], 0x00);
@@ -796,6 +797,7 @@ UT_TEST(test_hello_gcs_done_and_wrap_barrier_gates)
 	UT_ASSERT_EQ((int)PGRAC_IC_MSG_XID_NATIVE_DISABLE_ACK, 40);
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1, (uint32)0x00000200U);
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1, (uint32)0x00000400U);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1, (uint32)0x00001000U);
 	UT_ASSERT_EQ((int)PGRAC_IC_MSG_PCM_X_ENQUEUE, 41);
 	UT_ASSERT_EQ((int)PGRAC_IC_MSG_PCM_X_ADMIT_ACK, 42);
 	UT_ASSERT_EQ((int)PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM, 43);
@@ -830,6 +832,8 @@ UT_TEST(test_hello_gcs_done_and_wrap_barrier_gates)
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1)
 			  != 0);
 	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1) != 0);
+	UT_ASSERT((cluster_ic_hello_capabilities(&parsed) & PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1)
+			  == 0);
 
 	/* suppressed (old-binary simulation): DONE bit absent, the other
 	 * protocol bits untouched */

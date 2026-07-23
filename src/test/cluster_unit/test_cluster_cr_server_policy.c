@@ -323,10 +323,53 @@ UT_TEST(test_undo_submit_slots_busy_has_distinct_exact_signature)
 	free(source);
 }
 
+UT_TEST(test_current_mx_describe_rechecks_fence_before_direct_origin_reply)
+{
+	char *source = read_cr_server_source();
+	const char *serve;
+	const char *enumerate;
+	const char *end_try;
+	const char *fence_recheck;
+	const char *deny;
+	const char *direct_origin;
+	const char *send;
+
+	if (source == NULL)
+		return;
+	serve = strstr(source, "\ncluster_gcs_current_mx_describe_serve_inline(");
+	enumerate = serve != NULL ? strstr(serve, "GetMultiXactIdMembers(") : NULL;
+	end_try = enumerate != NULL ? strstr(enumerate, "PG_END_TRY();") : NULL;
+	fence_recheck = end_try != NULL
+						? strstr(end_try,
+								 "(cluster_write_fence_enforcing() && "
+								 "!cluster_write_fence_allowed())")
+						: NULL;
+	deny = fence_recheck != NULL ? strstr(fence_recheck, "if (!served)") : NULL;
+	direct_origin = deny != NULL
+						? strstr(deny,
+								 "GcsBlockReplyHeaderSetForwardingMasterNode("
+								 "outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)")
+						: NULL;
+	send = direct_origin != NULL ? strstr(direct_origin, "cluster_ic_send_envelope(") : NULL;
+
+	UT_ASSERT_NOT_NULL(serve);
+	UT_ASSERT_NOT_NULL(enumerate);
+	UT_ASSERT_NOT_NULL(end_try);
+	UT_ASSERT_NOT_NULL(fence_recheck);
+	UT_ASSERT_NOT_NULL(deny);
+	UT_ASSERT_NOT_NULL(direct_origin);
+	UT_ASSERT_NOT_NULL(send);
+	if (serve != NULL && enumerate != NULL && end_try != NULL && fence_recheck != NULL
+		&& deny != NULL && direct_origin != NULL && send != NULL)
+		UT_ASSERT(serve < enumerate && enumerate < end_try && end_try < fence_recheck
+				  && fence_recheck < deny && deny < direct_origin && direct_origin < send);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -338,6 +381,7 @@ main(void)
 	UT_RUN(test_invalid_scn_not_aborted_refuses);
 	UT_RUN(test_undo_serve_error_preserves_exact_refusal_context);
 	UT_RUN(test_undo_submit_slots_busy_has_distinct_exact_signature);
+	UT_RUN(test_current_mx_describe_rechecks_fence_before_direct_origin_reply);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

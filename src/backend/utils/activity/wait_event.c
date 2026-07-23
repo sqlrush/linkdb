@@ -1047,6 +1047,9 @@ pgstat_get_wait_cluster_pcm(WaitEventCluster w)
 	case WAIT_EVENT_CLUSTER_CF_TERMINAL_RESOLVE:
 		event_name = "ClusterCfTerminalResolve";
 		break;
+	case WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT:
+		event_name = "GcsMultixactDescribeWait";
+		break;
 	default:
 		break;
 	}

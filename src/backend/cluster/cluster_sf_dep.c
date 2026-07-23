@@ -401,6 +401,27 @@ cluster_sf_peer_supports_pcm_x_source_floor(int32 peer_id)
 	return (capabilities & PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1) != 0;
 }
 
+/* Current-MX is one atomic protocol family.  Return the generation of the
+ * CONTROL-owned capability record.  The outbound ring separately binds its
+ * selected shard-aligned DATA connection generation. */
+bool
+cluster_sf_peer_multixact_current_capability_generation(int32 peer_id, uint32 *generation)
+{
+	bool supported;
+
+	if (generation != NULL)
+		*generation = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_generation_for_bits(
+		&ClusterSfDep->peer_capabilities[peer_id], PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+		generation);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
 /* One lock-coherent sample for choosing the type-49 wire version.  CONVERT
  * authenticates the PCM-X family; SOURCE_FLOOR and its connection generation
  * are sampled from that same record so callers never pair bits across a

@@ -59,6 +59,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22d D4-6) */
@@ -131,8 +132,16 @@ typedef enum ClusterLmsCrSlotKind {
 	CLUSTER_LMS_SLOT_KIND_CR = 0,				 /* spec-6.12b CR construction */
 	CLUSTER_LMS_SLOT_KIND_UNDO_FETCH = 1,		 /* spec-6.12i undo-TT block fetch */
 	CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT = 2,		 /* spec-6.12i D-i4 complete-scan verdict */
-	CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT = 3 /* spec-7.1 D3-b multi member verdict */
+	CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT = 3, /* spec-7.1 D3-b multi member verdict */
+	CLUSTER_LMS_SLOT_KIND_CURRENT_MX_DESCRIBE = 4,
+	CLUSTER_LMS_SLOT_KIND_CURRENT_MX_MEMBER_PROOF = 5
 } ClusterLmsCrSlotKind;
+
+StaticAssertDecl(CLUSTER_LMS_SLOT_KIND_CURRENT_MX_DESCRIBE
+						 == CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT + 1
+					 && CLUSTER_LMS_SLOT_KIND_CURRENT_MX_MEMBER_PROOF
+							== CLUSTER_LMS_SLOT_KIND_CURRENT_MX_DESCRIBE + 1,
+				 "current MX LMS kinds must append at 4/5");
 
 typedef struct ClusterLmsCrSlot {
 	pg_atomic_uint32 state;	 /* ClusterLmsCrSlotState */
@@ -265,6 +274,14 @@ extern void cluster_lms_cr_ship_ready(void);
  */
 extern void cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd,
 												   ClusterLmsCrSlotKind kind);
+/* spec-3.6b D2: strict 128-byte kind-6 DATA-plane serve.  The request is
+ * validated and memcpy-decoded before any local pg_multixact access; every
+ * failure is a typed DENIED page or a malformed-frame drop. */
+extern void cluster_gcs_current_mx_describe_serve_inline(const struct ClusterICEnvelope *env,
+														 const void *payload);
+extern ClusterMxDescribeResult cluster_gcs_current_mx_describe_fetch_and_wait(
+	int32 origin_node, const ClusterCurrentMxKey *key, ClusterCurrentMxMemberDesc *members,
+	uint16 members_cap, uint16 *members_count, uint32 *reported_total_members);
 
 /* Requester side (backend): fetch a CR page for (locator, fork, block) at
  * read_scn from origin_node.  On success copies the shipped page into

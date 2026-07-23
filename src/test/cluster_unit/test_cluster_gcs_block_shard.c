@@ -326,6 +326,90 @@ UT_TEST(test_route_length_mismatch_refused)
 	}
 }
 
+/*
+ * Current-MX forward kinds are the only 128-byte GCS_BLOCK_FORWARD frames.
+ * The router consumes only the preserved request/epoch/requester identity:
+ * bytes overlaid on the old BufferTag/transition/SCN fields must not affect
+ * the selected worker.  Every old/new cross-kind length combination is
+ * refused instead of being progressively decoded.
+ */
+UT_TEST(test_current_mx_forward_v2_route_contract)
+{
+	struct {
+		GcsBlockForwardPayload prefix;
+		uint8 trailer[64];
+	} describe;
+	struct {
+		GcsBlockForwardPayload prefix;
+		uint8 trailer[64];
+	} proof;
+	struct {
+		GcsBlockForwardPayload prefix;
+		uint8 trailer[64];
+	} old_kind;
+	BufferTag tag_a = make_tag(1663, 5, 24001, MAIN_FORKNUM, 73);
+	BufferTag tag_b = make_tag(9999, 7, 31001, FSM_FORKNUM, 8191);
+	int describe_shard;
+	int proof_shard;
+
+	memset(&describe, 0, sizeof(describe));
+	describe.prefix = make_forward(tag_a);
+	describe.prefix.request_id = UINT64CONST(0x1122334455667788);
+	describe.prefix.epoch = UINT64CONST(17);
+	describe.prefix.original_requester_node = 2;
+	describe.prefix.requester_backend_id = 41;
+	GcsBlockForwardPayloadSetCurrentMxDescribe(&describe.prefix);
+
+	memcpy(&proof, &describe, sizeof(proof));
+	proof.prefix.tag = tag_b;
+	proof.prefix.master_node = 123456;
+	proof.prefix.transition_id = 0xff;
+	memset(proof.prefix.expected_pi_watermark_scn_bytes, 0xa5,
+		   sizeof(proof.prefix.expected_pi_watermark_scn_bytes));
+	memset(proof.prefix.reserved_0, 0x5a, sizeof(proof.prefix.reserved_0) - 1);
+	GcsBlockForwardPayloadSetCurrentMxMemberProof(&proof.prefix);
+
+	memcpy(&old_kind, &describe, sizeof(old_kind));
+	old_kind.prefix.reserved_0[6] = 0;
+	GcsBlockForwardPayloadSetReadImage(&old_kind.prefix, true);
+
+	describe_shard = cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe, sizeof(describe), CLUSTER_LMS_MAX_WORKERS);
+	proof_shard = cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof), CLUSTER_LMS_MAX_WORKERS);
+
+	UT_ASSERT(describe_shard >= 0);
+	UT_ASSERT_EQ(proof_shard, describe_shard);
+
+	/* New kinds never enter the shipped 64-byte decoder. */
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe.prefix,
+												 sizeof(describe.prefix),
+												 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof.prefix,
+												 sizeof(proof.prefix),
+												 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+
+	/* Shipped/unknown kinds never enter the 128-byte current-MX decoder. */
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &old_kind,
+												 sizeof(old_kind), CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+	old_kind.prefix.reserved_0[6] = 8;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &old_kind,
+												 sizeof(old_kind), CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe,
+												 sizeof(describe) - 1,
+												 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe,
+												 sizeof(describe) + 1,
+												 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+}
+
 /* ======================================================================
  * U6 -- N == 1 degenerate: every routable frame lands on worker 0 (the
  *		 spec-7.2 single-LMS topology identity;  rings[0] byte path).
@@ -477,12 +561,13 @@ UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
 	UT_RUN(test_route_unroutable_fail_closed);
 	UT_RUN(test_route_length_mismatch_refused);
+	UT_RUN(test_current_mx_forward_v2_route_contract);
 	UT_RUN(test_route_n1_degenerate_zero);
 	UT_RUN(test_route_ignores_non_tag_fields);
 	UT_RUN(test_pcm_x_route_truth_table);

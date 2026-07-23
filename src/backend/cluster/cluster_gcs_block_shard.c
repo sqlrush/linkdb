@@ -80,6 +80,7 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 {
 	const BufferTag *tag;
 	BufferTag pcm_x_tag;
+	GcsBlockForwardPayload forward_prefix;
 	uint16 pcm_x_expected_len = 0;
 
 	if (payload == NULL)
@@ -92,9 +93,36 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &((const GcsBlockRequestPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
-		if (payload_len != sizeof(GcsBlockForwardPayload))
+		if (payload_len != sizeof(GcsBlockForwardPayload)
+			&& payload_len != GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE)
 			return -1;
-		tag = &((const GcsBlockForwardPayload *)payload)->tag;
+		memcpy(&forward_prefix, payload, sizeof(forward_prefix));
+		if (payload_len == sizeof(GcsBlockForwardPayload)) {
+			if (GcsBlockForwardPayloadIsCurrentMxDescribe(&forward_prefix)
+				|| GcsBlockForwardPayloadIsCurrentMxMemberProof(&forward_prefix))
+				return -1;
+			tag = &forward_prefix.tag;
+			break;
+		}
+
+		if (!GcsBlockForwardPayloadIsCurrentMxDescribe(&forward_prefix)
+			&& !GcsBlockForwardPayloadIsCurrentMxMemberProof(&forward_prefix))
+			return -1;
+		if (forward_prefix.request_id == 0 || forward_prefix.epoch == 0
+			|| forward_prefix.original_requester_node < 0
+			|| forward_prefix.original_requester_node >= CLUSTER_MAX_NODES
+			|| forward_prefix.requester_backend_id <= 0)
+			return -1;
+
+		/*
+		 * Current-MX V2 overlays the old block/transition/SCN carriers.
+		 * Route only on the byte-stable request identity retained by the new
+		 * protocol; the typed ingress validator owns every overlaid byte.
+		 */
+		pcm_x_tag = GcsBlockCurrentMxRouteTagMake(
+			forward_prefix.request_id, forward_prefix.epoch,
+			forward_prefix.original_requester_node, forward_prefix.requester_backend_id);
+		tag = &pcm_x_tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE:
 		if (payload_len != sizeof(GcsBlockInvalidatePayload))

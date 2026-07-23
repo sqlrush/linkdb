@@ -27,10 +27,9 @@
  *	        OFF=0 / BOUNDARY=1(default) and the 4-counter ClusterCrCoordCounter
  *	        enum complete (CR_COORD_COUNTER__COUNT == 4) — the cr_coord
  *	        observability surface 5.58 HG#3 asserts.
- *	    L6  CLUSTER_WAIT_EVENTS_COUNT snapshot = 121 — spec-6.13 adds the RDMA
- *	        wait-event pair after the block_device band; update-
- *	        required contract: a future spec adding cluster wait events MUST bump
- *	        this snapshot (and the dump/test baselines that count them).
+ *	    L6  CLUSTER_WAIT_EVENTS_COUNT snapshot = 124, including the
+ *	        current-DML MultiXact describe wait; future additions must bump
+ *	        this snapshot and all dump/test baselines in lockstep.
  *
  *	  Static contract assertions only.  Behavioral / differential coverage in the
  *	  spec-5.58 cluster_tap acceptance legs.
@@ -182,14 +181,14 @@ UT_TEST(test_stage5_5_cross_instance_coordinator_enums_locked)
 
 /* ===== L6 — wait-events count snapshot ===== */
 
-UT_TEST(test_stage5_5_wait_events_count_snapshot_123)
+UT_TEST(test_stage5_5_wait_events_count_snapshot_124)
 {
 	/* The whole CR read-path band (5.51-5.57) adds NO new wait events — it reuses
 	 * the spec-3.9 ClusterCRConstruct event.  spec-6.0a adds 7 block_device
 	 * wait events after that band; spec-6.1 adds 2 RDMA wait events; spec-6.2
 	 * adds 4 Smart Fusion authority waits; spec-6.13 adds 2 RDMA tier3 waits;
 	 * spec-7.2 D6 adds 2 LMS DATA-plane waits. */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 123);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 124);
 }
 
 
@@ -201,6 +200,6 @@ main(void)
 	UT_RUN(test_stage5_5_cr_dump_category_names);
 	UT_RUN(test_stage5_5_admission_policy_enum_locked);
 	UT_RUN(test_stage5_5_cross_instance_coordinator_enums_locked);
-	UT_RUN(test_stage5_5_wait_events_count_snapshot_123);
+	UT_RUN(test_stage5_5_wait_events_count_snapshot_124);
 	UT_DONE();
 }

@@ -693,9 +693,13 @@ UT_TEST(test_cap_bound_frame_drops_on_connection_generation_drift)
 
 	ut_reset_log();
 	ut_peer_capabilities[UT_PEER_X] = cap;
-	ut_peer_cap_generation[UT_PEER_X] = 18;
+	ut_peer_cap_generation[UT_PEER_X] = 17;
+	cluster_lms_outbound_note_data_peer_disconnected(0, UT_PEER_X);
+	cluster_lms_outbound_note_data_peer_connected(0, UT_PEER_X);
 	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X,
 													 &marker, sizeof(marker), cap, 17));
+	cluster_lms_outbound_note_data_peer_disconnected(0, UT_PEER_X);
+	cluster_lms_outbound_note_data_peer_connected(0, UT_PEER_X);
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
 	UT_ASSERT_EQ(ut_count_marker(marker), 0);
@@ -708,9 +712,13 @@ UT_TEST(test_cap_bound_frame_drops_on_capability_downgrade)
 	uint8 marker = 0x92;
 
 	ut_reset_log();
+	ut_peer_capabilities[UT_PEER_X] = cap;
 	ut_peer_cap_generation[UT_PEER_X] = 21;
+	cluster_lms_outbound_note_data_peer_disconnected(0, UT_PEER_X);
+	cluster_lms_outbound_note_data_peer_connected(0, UT_PEER_X);
 	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X,
 													 &marker, sizeof(marker), cap, 21));
+	ut_peer_capabilities[UT_PEER_X] = 0;
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
 	UT_ASSERT_EQ(ut_count_marker(marker), 0);
@@ -725,6 +733,8 @@ UT_TEST(test_cap_bound_frame_sends_on_exact_connection_capability)
 	ut_reset_log();
 	ut_peer_capabilities[UT_PEER_X] = cap;
 	ut_peer_cap_generation[UT_PEER_X] = 34;
+	cluster_lms_outbound_note_data_peer_disconnected(0, UT_PEER_X);
+	cluster_lms_outbound_note_data_peer_connected(0, UT_PEER_X);
 	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(0, PGRAC_IC_MSG_PCM_X_REVOKE, UT_PEER_X,
 													 &marker, sizeof(marker), cap, 34));
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
@@ -733,10 +743,61 @@ UT_TEST(test_cap_bound_frame_sends_on_exact_connection_capability)
 	UT_ASSERT_EQ(ut_cap_guard_drop_count, 0);
 }
 
+UT_TEST(test_current_mx_v2_exactly_fills_cap_bound_data_slot)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1;
+	uint8 frame[PGRAC_LMS_OUTBOUND_PAYLOAD_MAX + 1];
+
+	memset(frame, 0x94, sizeof(frame));
+	ut_reset_log();
+	ut_peer_capabilities[UT_PEER_X] = cap;
+	ut_peer_cap_generation[UT_PEER_X] = 35;
+	cluster_lms_outbound_note_data_peer_disconnected(0, UT_PEER_X);
+	cluster_lms_outbound_note_data_peer_connected(0, UT_PEER_X);
+
+	UT_ASSERT(cluster_lms_outbound_enqueue_cap_bound(
+		0, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, frame,
+		PGRAC_LMS_OUTBOUND_PAYLOAD_MAX, cap, 35));
+	UT_ASSERT(!cluster_lms_outbound_enqueue_cap_bound(
+		0, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, frame,
+		PGRAC_LMS_OUTBOUND_PAYLOAD_MAX + 1, cap, 35));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len, PGRAC_LMS_OUTBOUND_PAYLOAD_MAX);
+}
+
+UT_TEST(test_cap_bound_enqueue_rejects_absent_capability)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1;
+	uint8 marker = 0x95;
+
+	ut_reset_log();
+	ut_peer_cap_generation[UT_PEER_X] = 36;
+	cluster_lms_outbound_note_data_peer_disconnected(0, UT_PEER_X);
+	cluster_lms_outbound_note_data_peer_connected(0, UT_PEER_X);
+	UT_ASSERT(!cluster_lms_outbound_enqueue_cap_bound(
+		0, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &marker, sizeof(marker), cap, 36));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+}
+
+UT_TEST(test_cap_bound_enqueue_rejects_disconnected_data_worker)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1;
+	uint8 marker = 0x96;
+
+	ut_reset_log();
+	ut_peer_capabilities[UT_PEER_X] = cap;
+	ut_peer_cap_generation[UT_PEER_X] = 37;
+	cluster_lms_outbound_note_data_peer_disconnected(0, UT_PEER_X);
+	UT_ASSERT(!cluster_lms_outbound_enqueue_cap_bound(
+		0, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_PEER_X, &marker, sizeof(marker), cap, 37));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(18);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
@@ -753,6 +814,9 @@ main(void)
 	UT_RUN(test_cap_bound_frame_drops_on_connection_generation_drift);
 	UT_RUN(test_cap_bound_frame_drops_on_capability_downgrade);
 	UT_RUN(test_cap_bound_frame_sends_on_exact_connection_capability);
+	UT_RUN(test_current_mx_v2_exactly_fills_cap_bound_data_slot);
+	UT_RUN(test_cap_bound_enqueue_rejects_absent_capability);
+	UT_RUN(test_cap_bound_enqueue_rejects_disconnected_data_worker);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

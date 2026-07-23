@@ -61,6 +61,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "funcapi.h"
@@ -77,6 +78,35 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+#define LMS_DATA_PLANE_SOURCE_PATH "../../../src/backend/cluster/cluster_lms_data_plane.c"
+
+static char *
+read_lms_data_plane_source(void)
+{
+	FILE *file;
+	long length;
+	char *source;
+
+	file = fopen(LMS_DATA_PLANE_SOURCE_PATH, "rb");
+	UT_ASSERT_NOT_NULL(file);
+	if (file == NULL)
+		return NULL;
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
+	length = ftell(file);
+	UT_ASSERT(length > 0);
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+	source = malloc((size_t)length + 1);
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) {
+		fclose(file);
+		return NULL;
+	}
+	UT_ASSERT_EQ(fread(source, 1, (size_t)length, file), (size_t)length);
+	source[length] = '\0';
+	fclose(file);
+	return source;
+}
 
 /* ============================================================
  * PG-runtime stubs.
@@ -374,6 +404,20 @@ cluster_sf_note_peer_disconnected(int32 peer_id)
 void
 cluster_sf_note_caps_reply_rejected(void)
 {}
+
+void
+cluster_lms_outbound_note_data_peer_connected(int worker_id, int32 peer_id)
+{
+	(void)worker_id;
+	(void)peer_id;
+}
+
+void
+cluster_lms_outbound_note_data_peer_disconnected(int worker_id, int32 peer_id)
+{
+	(void)worker_id;
+	(void)peer_id;
+}
 
 /* ============================================================
  * Test harness helpers.
@@ -946,10 +990,58 @@ UT_TEST(test_close_peer_clears_fifo)
 		(long)(cluster_ic_tier1_get_fifo_dropped_close(CLUSTER_IC_PLANE_CONTROL) - dropped0), 2L);
 }
 
+/*
+ * The anonymous DATA replacement path must retire the old connection through
+ * the full close funnel before binding pend_fd.  That clears the old
+ * byte-stream tail/FIFO/recv/chunk state and publishes the DATA generation in
+ * DISCONNECTED -> CONNECTED order.
+ */
+UT_TEST(test_anon_duplicate_retires_old_carrier_before_bind)
+{
+	char *source = read_lms_data_plane_source();
+	const char *anon_branch;
+	const char *verified;
+	const char *old_fd;
+	const char *close_old;
+	const char *bind_new;
+	const char *install_new;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	anon_branch = strstr(source, "Anonymous accepted fd: accumulate + verify HELLO.");
+	verified = anon_branch != NULL
+				   ? strstr(anon_branch, "cluster_ic_tier1_continue_hello_recv(")
+				   : NULL;
+	old_fd = verified != NULL
+				 ? strstr(verified, "cluster_ic_tier1_get_peer_fd(learned) >= 0")
+				 : NULL;
+	close_old = old_fd != NULL
+					? strstr(old_fd, "cluster_ic_tier1_close_peer(learned,")
+					: NULL;
+	bind_new = close_old != NULL
+				   ? strstr(close_old, "cluster_ic_tier1_bind_verified_anon_peer(")
+				   : NULL;
+	install_new
+		= bind_new != NULL ? strstr(bind_new, "dp_track[learned].fd = pend_fd") : NULL;
+
+	UT_ASSERT_NOT_NULL(anon_branch);
+	UT_ASSERT_NOT_NULL(verified);
+	UT_ASSERT_NOT_NULL(old_fd);
+	UT_ASSERT_NOT_NULL(close_old);
+	UT_ASSERT_NOT_NULL(bind_new);
+	UT_ASSERT_NOT_NULL(install_new);
+	if (anon_branch != NULL && verified != NULL && old_fd != NULL && close_old != NULL
+		&& bind_new != NULL && install_new != NULL)
+		UT_ASSERT(anon_branch < verified && verified < old_fd && old_fd < close_old
+				  && close_old < bind_new && bind_new < install_new);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 
 	UT_RUN(test_connect_registers_peer_fd);
 	UT_RUN(test_initial_eagain_queues_full_frame);
@@ -965,6 +1057,7 @@ main(void)
 	UT_RUN(test_backpressured_peer_does_not_block_other_peer);
 	UT_RUN(test_fifo_full_refuses_honestly);
 	UT_RUN(test_close_peer_clears_fifo);
+	UT_RUN(test_anon_duplicate_retires_old_carrier_before_bind);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

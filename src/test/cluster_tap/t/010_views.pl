@@ -46,12 +46,12 @@ $node->start;
 
 
 # ----------
-# Total row count: 121 (spec-6.13 RDMA + spec-5.22b D2-6 undo-block grant-plane waits).
+# Total row count: 124, including current-DML MultiXact describe wait.
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_cluster_wait_events'),
-	'123',
-	'pg_stat_cluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
+	'124',
+	'pg_stat_cluster_wait_events returns 124 rows (including current-DML MultiXact describe wait; merge sum 118+3+2+1)');
 
 is($node->safe_psql(
 		'postgres',
@@ -82,7 +82,7 @@ is($node->safe_psql('postgres',
 # ----------
 my %expected = (
 	'Cluster: GES' => 5,
-	'Cluster: PCM' => 24,	# spec-6.2 D10: +4 Smart Fusion authority waits
+	'Cluster: PCM' => 25,	# spec-3.6b: +current-DML MultiXact describe wait
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
 	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
@@ -104,10 +104,11 @@ for my $type (sort keys %expected)
 
 
 # ----------
-# Spot-check 6 event names exist.
+# Spot-check representative event names exist.
 # ----------
 for my $name ('GesEnqueueAcquire', 'PcmBlockReadNS', 'SinvalInjectLocalQueue',
-              'InterconnectRdmaSend', 'ClusterICRdmaFallback', 'AdgWalReceiveLag')
+              'InterconnectRdmaSend', 'ClusterICRdmaFallback',
+              'GcsMultixactDescribeWait', 'AdgWalReceiveLag')
 {
 	my $count = $node->safe_psql(
 		'postgres',

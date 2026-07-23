@@ -67,6 +67,7 @@
 #include "cluster/cluster_lmon.h"		 /* PGRAC: spec-7.2 D1 READY-publish wakeup */
 #include "cluster/cluster_lms.h"		 /* PGRAC: spec-7.3 D8 per-worker serve counters */
 #include "cluster/cluster_lms_shard.h"	 /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_mxid_stripe.h" /* cluster_mxid_is_mine (spec-7.1 D3-b) */
 #include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_shmem.h"
@@ -1272,6 +1273,157 @@ cr_serve_scratch_context(void)
 }
 
 /*
+ * cluster_gcs_current_mx_describe_serve_inline — spec-3.6b D2.
+ *
+ * The MXID origin alone enumerates its immutable pg_multixact member list.
+ * The strict decoder binds the authenticated envelope source, destination,
+ * epoch, request id, requester routing identity and value-derived origin
+ * before GetMultiXactIdMembers can run.  Errors are caught at the long-lived
+ * LMS worker boundary and become a typed DENIED page.
+ */
+void
+cluster_gcs_current_mx_describe_serve_inline(const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterCurrentMxDescribeForwardV2 request;
+	uint32 reply_total = (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+	char *reply;
+	GcsBlockReplyHeader *outer;
+	ClusterCurrentMxDescribeReplyPage *page;
+	MultiXactMember *native_members = NULL;
+	int native_count = -1;
+	uint16 i;
+	bool served = false;
+	BufferTag route_tag;
+	int recv_worker;
+	int expected_worker;
+	MemoryContext old_context;
+
+	if (env == NULL || payload == NULL || env->dest_node_id != (uint32)cluster_node_id
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| !cluster_multixact_current_wire_validate_describe_forward(
+			payload, env->payload_length, (int32)env->source_node_id, cluster_node_id,
+			cluster_epoch_get_current(), &request))
+		return;
+
+	route_tag = GcsBlockCurrentMxRouteTagMake(
+		request.prefix.request_id, request.prefix.epoch,
+		request.prefix.original_requester_node, request.prefix.requester_backend_id);
+	recv_worker = cluster_ic_tier1_my_data_channel();
+	expected_worker = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
+	Assert(expected_worker == recv_worker);
+	if (expected_worker != recv_worker)
+		return;
+
+	old_context = MemoryContextSwitchTo(cr_serve_scratch_context());
+	reply = (char *)palloc0(reply_total);
+	outer = (GcsBlockReplyHeader *)reply;
+	page = (ClusterCurrentMxDescribeReplyPage *)(reply + sizeof(*outer));
+
+	page->header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page->header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page->header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	page->header.result = (uint8)CMX_DESC_DENIED;
+	page->header.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
+	page->header.source_node_id = (uint32)cluster_node_id;
+	page->header.request_id = request.prefix.request_id;
+	page->header.mxkey = request.prefix.mxkey;
+	page->header.chunk_ordinal = 0;
+	page->header.chunk_count_minus_one = 0;
+	page->header.wire_length = sizeof(page->header);
+
+	if ((!cluster_write_fence_enforcing() || cluster_write_fence_allowed())
+		&& cluster_mxid_is_mine(request.prefix.mxkey.multixact_id)) {
+		PG_TRY();
+		{
+			native_count = GetMultiXactIdMembers(request.prefix.mxkey.multixact_id,
+												&native_members, false, false);
+			if (native_count > CLUSTER_CURRENT_MX_MAX_MEMBERS) {
+				page->header.result = (uint8)CMX_DESC_SUPPORTED_LIMIT;
+				page->header.total_count = (uint32)native_count;
+				served = true;
+			} else if (native_count >= 2) {
+				for (i = 0; i < (uint16)native_count; i++) {
+					page->members[i].xid = native_members[i].xid;
+					page->members[i].member_status = (uint8)native_members[i].status;
+				}
+				if (cluster_multixact_current_validate_descriptor(
+						&request.prefix.mxkey, (uint16)cluster_node_id,
+						request.prefix.mxkey.cluster_epoch, page->members,
+						(uint16)native_count, (uint32)native_count)
+					== CMX_DESC_OK) {
+					page->header.total_count = (uint32)native_count;
+					page->header.entry_count = (uint16)native_count;
+					page->header.descriptor_hash
+						= cluster_multixact_current_descriptor_hash(
+							&request.prefix.mxkey, page->members, (uint16)native_count);
+					page->header.wire_length
+						= sizeof(page->header)
+						  + (uint16)native_count * sizeof(ClusterCurrentMxMemberDesc);
+					page->header.result = (uint8)CMX_DESC_OK;
+					served = true;
+				}
+			}
+			if (native_members != NULL) {
+				pfree(native_members);
+				native_members = NULL;
+			}
+		}
+		PG_CATCH();
+		{
+			ErrorData *edata;
+
+			served = false;
+			MemoryContextSwitchTo(cr_serve_scratch_context());
+			edata = CopyErrorData();
+			FlushErrorState();
+			ereport(LOG,
+					(errmsg_internal("current-MX describe origin serve caught error; "
+									 "returning DENIED"),
+					 errdetail_internal("mxid=%u origin=%u requester=%d request_id="
+										 UINT64_FORMAT " sqlstate=%s message=%s",
+										 (unsigned)request.prefix.mxkey.multixact_id,
+										 (unsigned)request.prefix.mxkey.origin_node_id,
+										 request.prefix.original_requester_node,
+										 request.prefix.request_id,
+										 unpack_sql_state(edata->sqlerrcode),
+										 edata->message != NULL ? edata->message : "")));
+			FreeErrorData(edata);
+		}
+		PG_END_TRY();
+	}
+
+	/* An epoch transition after enumeration invalidates a positive list. */
+	if (cluster_epoch_get_current() != request.prefix.epoch
+		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed()))
+		served = false;
+	if (!served) {
+		memset(page->members, 0, sizeof(page->members));
+		memset(page->reserved, 0, sizeof(page->reserved));
+		page->header.result = (uint8)CMX_DESC_DENIED;
+		page->header.descriptor_hash = 0;
+		page->header.total_count = 0;
+		page->header.entry_count = 0;
+		page->header.wire_length = sizeof(page->header);
+	}
+
+	outer->request_id = request.prefix.request_id;
+	outer->epoch = cluster_epoch_get_current();
+	outer->sender_node = cluster_node_id;
+	outer->requester_backend_id = request.prefix.requester_backend_id;
+	outer->transition_id = 0;
+	outer->status = (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	outer->checksum = cluster_gcs_block_compute_checksum((const char *)page);
+
+	cluster_gcs_block_note_send_outcome(
+		GCS_BLOCK_SEND_FAMILY_REPLY,
+		cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+								 request.prefix.original_requester_node, reply, reply_total));
+	MemoryContextSwitchTo(old_context);
+	MemoryContextReset(CrServeScratchCtx);
+}
+
+/*
  * cluster_gcs_block_forward_serve_inline — spec-7.3 D6 entry.  When the GCS
  * block family is on the DATA plane, the worker[shard] that received a
  * GCS_BLOCK_FORWARD CR / undo-fetch / undo-verdict request serves it inline
@@ -1428,6 +1580,14 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 		}
 		break;
 	}
+
+	case CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:
+	case CLUSTER_LMS_SLOT_KIND_CURRENT_MX_DESCRIBE:
+	case CLUSTER_LMS_SLOT_KIND_CURRENT_MX_MEMBER_PROOF:
+		/* These kinds have dedicated submit/serve entries and must never be
+		 * decoded through the legacy 64-byte inline carrier. */
+		Assert(false);
+		return;
 	}
 
 	old = MemoryContextSwitchTo(cr_serve_scratch_context());

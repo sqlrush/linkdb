@@ -82,6 +82,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 
@@ -256,6 +257,16 @@ static int tier1_hello_send_remaining[CLUSTER_MAX_NODES];
  */
 static uint8 tier1_anon_hello_buf[CLUSTER_MAX_NODES][PGRAC_IC_HELLO_BYTES];
 static int tier1_anon_hello_len[CLUSTER_MAX_NODES];
+/*
+ * A verified anonymous HELLO must survive duplicate retirement: close_peer()
+ * resets per-peer receive state and anon lengths by peer index, which may be
+ * the same integer as the owning anon slot.  Preserve only the already
+ * authenticated bind token outside that reset domain.
+ */
+static bool tier1_anon_hello_verified[CLUSTER_MAX_NODES];
+static int32 tier1_anon_hello_verified_peer[CLUSTER_MAX_NODES];
+static int tier1_anon_hello_verified_fd[CLUSTER_MAX_NODES];
+static uint32 tier1_anon_hello_verified_capabilities[CLUSTER_MAX_NODES];
 
 /*
  * spec-2.2 additive amendment (spec-5.22e D5 prereq): accept-side
@@ -1482,12 +1493,9 @@ tier1_tier_shutdown(void)
 
 	peer_fds_lazy_init();
 
-	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		if (tier1_peer_fds[i] >= 0) {
-			(void)close(tier1_peer_fds[i]);
-			tier1_peer_fds[i] = -1;
-		}
-	}
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (tier1_peer_fds[i] >= 0)
+			cluster_ic_tier1_close_peer(i, "tier1 shutdown");
 
 	/*
 	 * Hardening v1.0.1 F3: listener fd is process-local; close from
@@ -1891,6 +1899,8 @@ cluster_ic_tier1_continue_hello_send(int32 peer_id, int peer_fd)
 		Tier1Shmem->peers[peer_id].conn_epoch = cluster_epoch_get_current();
 		Tier1Shmem->peers[peer_id].last_connect_at = GetCurrentTimestamp();
 	}
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
+		cluster_lms_outbound_note_data_peer_connected(tier1_my_data_channel, peer_id);
 	ereport(LOG,
 			(errmsg("cluster_ic tier1 peer %d HELLO sent, state CONNECTED (active)", peer_id)));
 	return true;
@@ -2231,7 +2241,8 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 		cluster_sf_note_peer_hello_capabilities_gen(peer_id, cluster_ic_hello_capabilities(&msg),
 													Tier1Shmem->peers[peer_id].reconnect_count);
 		tier1_maybe_send_caps_reply(peer_id, cluster_ic_hello_capabilities(&msg));
-	}
+	} else
+		cluster_lms_outbound_note_data_peer_connected(tier1_my_data_channel, peer_id);
 
 	/* spec-7.3 D3 — tag the DATA-plane CONNECTED log with this worker's
 	 * channel so a 2-node test can prove the shard-aligned i<->i mesh formed
@@ -2424,8 +2435,44 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		return false;
 	}
 
-	/* Bind learned peer_id; record state CONNECTED. */
+	/*
+	 * Verification does not bind the fd.  The owning event loop must first
+	 * retire any duplicate connection through close_peer(), while
+	 * tier1_peer_fds[learned] still names the old carrier, and then call
+	 * cluster_ic_tier1_bind_verified_anon_peer().  This ordering prevents an
+	 * old per-connection tail/FIFO from leaking onto the new DATA socket.
+	 */
 	learned = msg.source_node_id;
+	tier1_anon_hello_verified[anon_slot] = true;
+	tier1_anon_hello_verified_peer[anon_slot] = learned;
+	tier1_anon_hello_verified_fd[anon_slot] = peer_fd;
+	tier1_anon_hello_verified_capabilities[anon_slot]
+		= cluster_ic_hello_capabilities(&msg);
+	if (out_learned_peer_id != NULL)
+		*out_learned_peer_id = learned;
+
+	ereport(LOG,
+			(errmsg("cluster_ic tier1 anon slot %d HELLO verified for peer %d", anon_slot,
+					learned)));
+	return true;
+}
+
+bool
+cluster_ic_tier1_bind_verified_anon_peer(int anon_slot, int32 learned, int peer_fd)
+{
+	uint32 capabilities;
+
+	if (anon_slot < 0 || anon_slot >= CLUSTER_MAX_NODES || learned < 0
+		|| learned >= CLUSTER_MAX_NODES || peer_fd < 0
+		|| !tier1_anon_hello_verified[anon_slot]
+		|| tier1_anon_hello_verified_peer[anon_slot] != learned
+		|| tier1_anon_hello_verified_fd[anon_slot] != peer_fd)
+		return false;
+	capabilities = tier1_anon_hello_verified_capabilities[anon_slot];
+
+	peer_fds_lazy_init();
+	if (tier1_peer_fds[learned] >= 0)
+		return false;
 	tier1_peer_fds[learned] = peer_fd;
 	if (Tier1Shmem != NULL) {
 		peer_record_error(learned, 0, "", ""); /* clear any prior */
@@ -2438,15 +2485,14 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 		/* CONTROL owns caps lifecycle (see the named-peer path above); a
 		 * DATA-plane worker only reads the shared store. */
 		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-			cluster_sf_note_peer_hello_capabilities_gen(learned,
-														cluster_ic_hello_capabilities(&msg),
+			cluster_sf_note_peer_hello_capabilities_gen(learned, capabilities,
 														Tier1Shmem->peers[learned].reconnect_count);
-			tier1_maybe_send_caps_reply(learned, cluster_ic_hello_capabilities(&msg));
+			tier1_maybe_send_caps_reply(learned, capabilities);
 		}
 	}
 
-	if (out_learned_peer_id != NULL)
-		*out_learned_peer_id = learned;
+	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
+		cluster_lms_outbound_note_data_peer_connected(tier1_my_data_channel, learned);
 
 	/* spec-7.3 D3 — same DATA-plane channel tag on the anon (accept) path. */
 	if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
@@ -2467,6 +2513,10 @@ cluster_ic_tier1_anon_hello_reset(int anon_slot)
 	if (anon_slot < 0 || anon_slot >= CLUSTER_MAX_NODES)
 		return;
 	tier1_anon_hello_len[anon_slot] = 0;
+	tier1_anon_hello_verified[anon_slot] = false;
+	tier1_anon_hello_verified_peer[anon_slot] = -1;
+	tier1_anon_hello_verified_fd[anon_slot] = -1;
+	tier1_anon_hello_verified_capabilities[anon_slot] = 0;
 }
 
 int
@@ -2766,6 +2816,8 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 	if (tier1_peer_fds[peer_id] >= 0) {
 		(void)close(tier1_peer_fds[peer_id]);
 		tier1_peer_fds[peer_id] = -1;
+		if (tier1_my_plane == CLUSTER_IC_PLANE_DATA)
+			cluster_lms_outbound_note_data_peer_disconnected(tier1_my_data_channel, peer_id);
 
 		/*
 		 * spec-5.22e D5-2 (Q1' amend) + spec-2.2 additive amendment: HELLO

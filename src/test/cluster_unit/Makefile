@@ -1856,10 +1856,12 @@ test_cluster_multixact: test_cluster_multixact.c unit_test.h \
 
 # spec-3.6b D1: pure current-DML descriptor/proof validators and compositor.
 CLUSTER_MULTIXACT_CURRENT_O = $(top_builddir)/src/backend/cluster/cluster_multixact_current.o
+CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
+	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
 test_cluster_multixact_current: test_cluster_multixact_current.c unit_test.h \
-		$(CLUSTER_MULTIXACT_CURRENT_O)
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_MULTIXACT_CURRENT_O) \
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PGPORT) -o $@
 

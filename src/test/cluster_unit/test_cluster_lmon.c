@@ -401,6 +401,14 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot pg_attribute_unused(),
 		*out_learned_peer_id = -1;
 	return false;
 }
+
+bool
+cluster_ic_tier1_bind_verified_anon_peer(int anon_slot pg_attribute_unused(),
+										 int32 learned_peer_id pg_attribute_unused(),
+										 int peer_fd pg_attribute_unused())
+{
+	return false;
+}
 void
 cluster_ic_tier1_anon_hello_reset(int anon_slot pg_attribute_unused())
 {}

@@ -38,10 +38,12 @@
 #include "postgres.h"
 
 #include "cluster/cluster_gcs_block.h" /* GcsBlockRequestPayload (pre-send hook) */
+#include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_write_fence.h"
@@ -53,7 +55,13 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #define PGRAC_LMS_OUTBOUND_CAPACITY 256
-#define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX 128
+
+StaticAssertDecl(sizeof(ClusterCurrentMxDescribeForwardV2) == PGRAC_LMS_OUTBOUND_PAYLOAD_MAX,
+				 "current-MX describe V2 must exactly fit the DATA outbound slot");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofForwardV2) == PGRAC_LMS_OUTBOUND_PAYLOAD_MAX,
+				 "current-MX proof V2 must exactly fit the DATA outbound slot");
+StaticAssertDecl(sizeof(ClusterCurrentMxDescribeForwardV2) > PGRAC_GES_OUTBOUND_PAYLOAD_MAX,
+				 "current-MX V2 must never fall back to the CONTROL outbound slot");
 
 typedef enum ClusterLmsOutboundKind {
 	CLUSTER_LMS_OUTBOUND_FRAME = 0,
@@ -67,11 +75,12 @@ typedef struct ClusterLmsOutboundSlot {
 	uint8 kind;
 	uint16 payload_len;
 	uint32 required_capability;
-	uint32 connection_generation;
+	uint32 capability_generation;
+	uint64 data_connection_generation;
 	uint8 payload[PGRAC_LMS_OUTBOUND_PAYLOAD_MAX];
 } ClusterLmsOutboundSlot;
 
-StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 144,
+StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 152,
 				 "LMS outbound slot capability guard layout changed");
 
 typedef struct ClusterLmsZeroBlockReplyWire {
@@ -86,6 +95,10 @@ typedef struct ClusterLmsOutboundState {
 	uint32 head; /* next slot to fill */
 	uint32 tail; /* next slot to drain */
 	uint32 count;
+	struct {
+		uint64 generation;
+		bool connected;
+	} data_peers[CLUSTER_MAX_NODES];
 	ClusterLmsOutboundSlot ring[PGRAC_LMS_OUTBOUND_CAPACITY];
 } ClusterLmsOutboundState;
 
@@ -137,6 +150,67 @@ static const ClusterShmemRegion cluster_lms_outbound_region = {
 	.owner_subsys = "cluster_lms_outbound",
 	.reserved_flags = 0,
 };
+
+static bool
+lms_outbound_data_peer_generation_matches(int worker_id, int32 peer_id,
+											uint64 expected_generation)
+{
+	ClusterLmsOutboundState *ring;
+	LWLock *lock;
+	bool matches;
+
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS || peer_id < 0
+		|| peer_id >= CLUSTER_MAX_NODES || expected_generation == 0
+		|| cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
+		return false;
+
+	ring = OB_RING(worker_id);
+	lock = OB_LOCK(worker_id);
+	LWLockAcquire(lock, LW_SHARED);
+	matches = ring->data_peers[peer_id].connected
+			  && ring->data_peers[peer_id].generation == expected_generation;
+	LWLockRelease(lock);
+	return matches;
+}
+
+void
+cluster_lms_outbound_note_data_peer_connected(int worker_id, int32 peer_id)
+{
+	ClusterLmsOutboundState *ring;
+	LWLock *lock;
+
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS || peer_id < 0
+		|| peer_id >= CLUSTER_MAX_NODES || cluster_lms_outbound_rings == NULL
+		|| OB_LOCK(worker_id) == NULL)
+		return;
+
+	ring = OB_RING(worker_id);
+	lock = OB_LOCK(worker_id);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	ring->data_peers[peer_id].generation++;
+	if (ring->data_peers[peer_id].generation == 0)
+		ring->data_peers[peer_id].generation = 1;
+	ring->data_peers[peer_id].connected = true;
+	LWLockRelease(lock);
+}
+
+void
+cluster_lms_outbound_note_data_peer_disconnected(int worker_id, int32 peer_id)
+{
+	ClusterLmsOutboundState *ring;
+	LWLock *lock;
+
+	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS || peer_id < 0
+		|| peer_id >= CLUSTER_MAX_NODES || cluster_lms_outbound_rings == NULL
+		|| OB_LOCK(worker_id) == NULL)
+		return;
+
+	ring = OB_RING(worker_id);
+	lock = OB_LOCK(worker_id);
+	LWLockAcquire(lock, LW_EXCLUSIVE);
+	ring->data_peers[peer_id].connected = false;
+	LWLockRelease(lock);
+}
 
 
 /* Type 50 reports the holder's irreversible X->N handoff; types 51-56 drive
@@ -205,7 +279,7 @@ cluster_lms_outbound_request_lwlocks(void)
 static bool
 lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id,
 							  const void *payload, uint16 payload_len, uint32 required_capability,
-							  uint32 connection_generation)
+							  uint32 capability_generation)
 {
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
@@ -217,11 +291,21 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 		return false;
 	if (payload_len > PGRAC_LMS_OUTBOUND_PAYLOAD_MAX)
 		return false;
+	if (required_capability != 0
+		&& !cluster_sf_peer_capability_generation_matches(
+			(int32)dest_node_id, required_capability, capability_generation))
+		return false;
 
 	ring = OB_RING(worker_id);
 	lock = OB_LOCK(worker_id);
 
 	LWLockAcquire(lock, LW_EXCLUSIVE);
+	if (required_capability != 0
+		&& (!ring->data_peers[dest_node_id].connected
+			|| ring->data_peers[dest_node_id].generation == 0)) {
+		LWLockRelease(lock);
+		return false;
+	}
 	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 		LWLockRelease(lock);
 		return false;
@@ -232,7 +316,9 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 	slot->kind = (uint8)CLUSTER_LMS_OUTBOUND_FRAME;
 	slot->payload_len = payload_len;
 	slot->required_capability = required_capability;
-	slot->connection_generation = connection_generation;
+	slot->capability_generation = capability_generation;
+	slot->data_connection_generation
+		= required_capability != 0 ? ring->data_peers[dest_node_id].generation : 0;
 	if (payload_len > 0)
 		memcpy(slot->payload, payload, payload_len);
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
@@ -258,12 +344,12 @@ cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 bool
 cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type, uint32 dest_node_id,
 									   const void *payload, uint16 payload_len,
-									   uint32 required_capability, uint32 connection_generation)
+									   uint32 required_capability, uint32 capability_generation)
 {
 	if (required_capability == 0 || dest_node_id >= CLUSTER_MAX_NODES)
 		return false;
 	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len,
-										 required_capability, connection_generation);
+										 required_capability, capability_generation);
 }
 
 /*
@@ -302,7 +388,8 @@ cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id
 									 : CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY);
 	slot->payload_len = sizeof(*header);
 	slot->required_capability = 0;
-	slot->connection_generation = 0;
+	slot->capability_generation = 0;
+	slot->data_connection_generation = 0;
 	memcpy(slot->payload, header, sizeof(*header));
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
@@ -383,13 +470,16 @@ cluster_lms_outbound_drain_send(int worker_id)
 		if (!got)
 			break;
 		scanned++;
-		/* Wire-version-sensitive slots are valid only for the exact
-		 * connection generation whose HELLO advertised the required bit.
-		 * A drift consumes this stale ring copy without transport admission;
-		 * no protocol ACK is generated, so the armed reliable leg retries. */
+		/* Wire-version-sensitive slots require both the CONTROL capability
+		 * record and this worker's exact DATA carrier generation to remain
+		 * unchanged.  A drift consumes the stale copy before admission; no
+		 * protocol ACK is generated, so the reliable leg retries. */
 		if (slot.required_capability != 0
-			&& !cluster_sf_peer_capability_generation_matches(
-				(int32)slot.dest_node_id, slot.required_capability, slot.connection_generation)) {
+			&& (!cluster_sf_peer_capability_generation_matches(
+					(int32)slot.dest_node_id, slot.required_capability,
+					slot.capability_generation)
+				|| !lms_outbound_data_peer_generation_matches(
+					worker_id, (int32)slot.dest_node_id, slot.data_connection_generation))) {
 			lms_outbound_pcm_x_image_ready_note(&slot, "capability-guard", -1);
 			cluster_lms_obs_note_outbound_cap_guard_drop(worker_id);
 			continue;

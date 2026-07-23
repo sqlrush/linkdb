@@ -71,6 +71,7 @@
 #include "cluster/cluster_ic_tier1.h" /* PGRAC: spec-7.3 D5 — my DATA channel = worker id */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_own.h" /* S3 forensics — ownership gen in 53R93 errdetail */
 #include "cluster/cluster_pcm_x_bufmgr.h"
@@ -150,6 +151,9 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	 *                        retransmit path (re-lookup_master + retry). */
 	uint64 request_epoch;
 	int32 expected_master_node;
+	uint8 expected_reply_status;
+	bool expected_current_mx_key_valid;
+	ClusterCurrentMxKey expected_current_mx_key;
 	bool stale;
 	uint32 direct_generation;
 	ClusterGcsBlockDirectState direct_state;
@@ -468,6 +472,7 @@ static void gcs_block_pcm_x_requester_wait(uint32 *wait_index);
 static PcmXQueueResult
 gcs_block_pcm_x_fetch_reservation_mismatch(const ClusterPcmOwnSnapshot *live);
 static void gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page_lsn);
+static bool gcs_block_reply_reserved_zero(const GcsBlockReplyHeader *hdr);
 static PcmXQueueResult gcs_block_pcm_x_install_reserved_image_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *reservation_base, uint64 reservation_token,
 	const char *block_data, XLogRecPtr page_lsn, const PcmXRuntimeSnapshot *request_runtime);
@@ -663,6 +668,7 @@ cluster_gcs_block_shmem_init(void)
 				cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 				slot->request_epoch = 0; /* spec-2.34 HC100 */
 				slot->expected_master_node = -1;
+				slot->expected_reply_status = 0;
 				slot->stale = false;
 				slot->direct_generation = 0;
 				slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
@@ -771,6 +777,9 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 			 * handler validates against the latest stamp). */
 			slot->request_epoch = 0;
 			slot->expected_master_node = master_node;
+			slot->expected_reply_status = 0;
+			slot->expected_current_mx_key_valid = false;
+			memset(&slot->expected_current_mx_key, 0, sizeof(slot->expected_current_mx_key));
 			slot->stale = false;
 			slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 			slot->direct_expected_peer = -1;
@@ -839,6 +848,9 @@ gcs_block_try_reserve_exact_slot(BufferTag tag, uint8 transition_id, int32 expec
 			slot->reply_undo_authority_scn = 0;
 			slot->request_epoch = 0;
 			slot->expected_master_node = expected_source_node;
+			slot->expected_reply_status = 0;
+			slot->expected_current_mx_key_valid = false;
+			memset(&slot->expected_current_mx_key, 0, sizeof(slot->expected_current_mx_key));
 			slot->stale = false;
 			slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 			slot->direct_expected_peer = -1;
@@ -890,6 +902,9 @@ gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot)
 	cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
 	slot->request_epoch = 0; /* spec-2.34 HC100 */
 	slot->expected_master_node = -1;
+	slot->expected_reply_status = 0;
+	slot->expected_current_mx_key_valid = false;
+	memset(&slot->expected_current_mx_key, 0, sizeof(slot->expected_current_mx_key));
 	slot->stale = false;
 	slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
 	slot->direct_expected_peer = -1;
@@ -4095,6 +4110,165 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_no
 	gcs_block_release_slot(slot);
 
 	return fetched; /* false -> caller keeps the unchanged 53R9G refusal */
+}
+
+/*
+ * Requester side of the strict kind-6 current-MX describe RPC.  The 128-byte
+ * frame can only use the DATA outbound ring.  Its slot binds both the
+ * CONTROL-authenticated atomic-family capability generation and the exact
+ * selected shard-aligned DATA connection generation.
+ */
+ClusterMxDescribeResult
+cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterCurrentMxKey *key,
+											   ClusterCurrentMxMemberDesc *members,
+											   uint16 members_cap, uint16 *members_count,
+											   uint32 *reported_total_members)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+	ClusterCurrentMxDescribeForwardV2 request;
+	ClusterCurrentMxDescribeReplyPage reply_page;
+	GcsBlockReplyHeader reply_header;
+	BufferTag slot_tag;
+	BufferTag route_tag;
+	uint64 request_id = 0;
+	uint64 request_epoch;
+	uint32 capability_generation = 0;
+	int worker_id;
+	bool got_reply = false;
+	ClusterMxDescribeResult result = CMX_DESC_UNKNOWN;
+
+	if (members != NULL && members_cap > 0)
+		memset(members, 0, sizeof(*members) * members_cap);
+	if (members_count != NULL)
+		*members_count = 0;
+	if (reported_total_members != NULL)
+		*reported_total_members = 0;
+	if (key == NULL || members == NULL || members_count == NULL
+		|| reported_total_members == NULL || origin_node < 0 || origin_node == cluster_node_id
+		|| origin_node >= CLUSTER_MAX_NODES || key->origin_node_id != (uint16)origin_node
+		|| key->cluster_epoch == 0 || key->cluster_epoch != cluster_epoch_get_current()
+		|| !MultiXactIdIsValid(key->multixact_id)
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| !cluster_sf_peer_multixact_current_capability_generation(
+			origin_node, &capability_generation))
+		return CMX_DESC_UNKNOWN;
+
+	request_epoch = cluster_epoch_get_current();
+	slot_tag = GcsBlockCurrentMxRouteTagMake(UINT64CONST(1), request_epoch, cluster_node_id,
+											(int32)MyBackendId);
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	slot = gcs_block_reserve_slot(slot_tag, 0, cluster_node_id, &request_id);
+
+	PG_TRY();
+	{
+		ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+		TimestampTz deadline;
+
+		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+		slot->reply_received = false;
+		memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+		memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+		slot->request_epoch = request_epoch;
+		slot->expected_master_node = origin_node;
+		slot->expected_reply_status = (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT;
+		slot->expected_current_mx_key_valid = true;
+		slot->expected_current_mx_key = *key;
+		slot->stale = false;
+		LWLockRelease(&blk->lock.lock);
+
+		memset(&request, 0, sizeof(request));
+		request.prefix.request_id = request_id;
+		request.prefix.epoch = request_epoch;
+		request.prefix.mxkey = *key;
+		request.prefix.original_requester_node = cluster_node_id;
+		request.prefix.requester_backend_id = (int32)MyBackendId;
+		request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+		request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+		request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+		request.trailer.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
+
+		route_tag = GcsBlockCurrentMxRouteTagMake(request_id, request_epoch, cluster_node_id,
+												(int32)MyBackendId);
+		worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
+		if (worker_id < 0
+			|| !cluster_lms_outbound_enqueue_cap_bound(
+				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, &request,
+				sizeof(request), PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+				capability_generation)) {
+			result = CMX_DESC_UNKNOWN;
+			goto describe_done;
+		}
+
+		deadline = GetCurrentTimestamp()
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
+		ConditionVariablePrepareToSleep(&slot->reply_cv);
+		for (;;) {
+			TimestampTz now;
+			long timeout_ms;
+			bool have_reply;
+
+			LWLockAcquire(&blk->lock.lock, LW_SHARED);
+			have_reply = slot->in_use && slot->reply_received;
+			LWLockRelease(&blk->lock.lock);
+			if (have_reply) {
+				got_reply = true;
+				break;
+			}
+			now = GetCurrentTimestamp();
+			if (now >= deadline)
+				break;
+			timeout_ms = (long)((deadline - now) / 1000);
+			if (timeout_ms <= 0)
+				timeout_ms = 1;
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT);
+		}
+		ConditionVariableCancelSleep();
+
+		if (!got_reply) {
+			result = CMX_DESC_TIMEOUT;
+			goto describe_done;
+		}
+
+		reply_header = slot->reply_header;
+		memcpy(&reply_page, slot->reply_block_data, sizeof(reply_page));
+		if (reply_header.status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+			|| reply_header.sender_node != origin_node || reply_header.request_id != request_id
+			|| reply_header.epoch != request_epoch
+			|| reply_header.requester_backend_id != (int32)MyBackendId
+			|| reply_header.transition_id != 0
+			|| reply_header.page_lsn != 0
+			|| !gcs_block_reply_reserved_zero(&reply_header)
+			|| GcsBlockReplyHeaderGetForwardingMasterNode(&reply_header)
+				   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+			|| reply_header.checksum
+				   != cluster_gcs_block_compute_checksum((const char *)&reply_page)
+			|| cluster_epoch_get_current() != request_epoch) {
+			result = CMX_DESC_UNKNOWN;
+			goto describe_done;
+		}
+
+		result = cluster_multixact_current_wire_validate_describe_reply(
+			&reply_page, sizeof(reply_page), origin_node, request_epoch, request_id, key, members,
+			members_cap, members_count, reported_total_members);
+		if (result == CMX_DESC_OK)
+			gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+
+	describe_done:
+		;
+	}
+	PG_CATCH();
+	{
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+	return result;
 }
 
 
@@ -7771,6 +7945,19 @@ cluster_gcs_block_lmon_drain_direct_land_aborts(void)
 }
 
 static bool
+gcs_block_reply_reserved_zero(const GcsBlockReplyHeader *hdr)
+{
+	int i;
+
+	if (hdr == NULL)
+		return false;
+	for (i = 0; i < (int)sizeof(hdr->reserved_0); i++)
+		if (hdr->reserved_0[i] != 0)
+			return false;
+	return true;
+}
+
+static bool
 gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload,
 							   const GcsBlockReplyHeader **out_hdr, const char **out_block_data,
 							   bool *out_sf_dep_valid, uint8 *out_sf_flags,
@@ -7890,6 +8077,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		if (slot->in_use && slot->request_id == hdr->request_id) {
 			int32 fwd_master;
 			bool authorized = false;
+			bool current_reply;
+			bool current_slot;
 
 			/*
 			 * First-reply-wins (S3 RC-A).  Duplicate replies for the same
@@ -7940,8 +8129,67 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			 *	spec-2.34 P0 race-A fix discipline.
 			 */
 			fwd_master = GcsBlockReplyHeaderGetForwardingMasterNode(hdr);
+			current_reply
+				= hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+				  || hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
+			current_slot
+				= slot->expected_reply_status
+					  == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+				  || slot->expected_reply_status
+						 == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
 
-			if (fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
+			if (current_slot || current_reply) {
+				/*
+				 * Current-MX replies are direct origin-authority replies, never
+				 * forwarded block images.  Lock the exact V1 outer shape and
+				 * source/status/epoch before first-reply-wins mutates the slot.
+				 * Classify by the armed slot as well as the inbound status: a
+				 * legacy direct reply must not poison a current-MX slot.
+				 */
+				if (env->payload_length
+						== sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
+					&& !sf_dep_valid && undo_trailer == NULL
+					&& current_slot && current_reply
+					&& slot->expected_reply_status == hdr->status
+					&& hdr->sender_node == slot->expected_master_node
+					&& fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+					&& hdr->epoch == slot->request_epoch && hdr->transition_id == 0
+					&& hdr->page_lsn == 0 && gcs_block_reply_reserved_zero(hdr)
+					&& hdr->checksum == cluster_gcs_block_compute_checksum(block_data)) {
+					if (hdr->status
+						== (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT) {
+						ClusterCurrentMxMemberDesc scratch_members
+							[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+						uint16 scratch_count = 0;
+						uint32 scratch_total = 0;
+						ClusterMxDescribeResult typed_result;
+
+						/*
+						 * A checksum-valid but typed-malformed first packet must
+						 * not consume first-reply-wins.  Validate the full page
+						 * echo/count/chunk/hash/tail contract under the slot lock
+						 * before publishing reply_received.
+						 */
+						typed_result = slot->expected_current_mx_key_valid
+										   ? cluster_multixact_current_wire_validate_describe_reply(
+												 block_data, GCS_BLOCK_DATA_SIZE,
+												 slot->expected_master_node, slot->request_epoch,
+												 slot->request_id,
+												 &slot->expected_current_mx_key, scratch_members,
+												 CLUSTER_CURRENT_MX_MAX_MEMBERS, &scratch_count,
+												 &scratch_total)
+										   : CMX_DESC_UNKNOWN;
+						authorized = typed_result == CMX_DESC_OK
+									 || typed_result == CMX_DESC_DENIED
+									 || typed_result == CMX_DESC_SUPPORTED_LIMIT;
+					}
+					/*
+					 * Member-proof typed validation lands with Task 4.  Until
+					 * then no status-22 slot is armed and such a frame remains
+					 * fail-closed here.
+					 */
+				}
+			} else if (fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
 				/* direct-from-master path — a master never self-claims a
 				 * holder-shipped status (spec-6.12a ㉕ status included). */
 				if (hdr->sender_node == slot->expected_master_node
@@ -8066,11 +8314,34 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	 * only by the read-image branch below; inactive otherwise). */
 	ClusterXpScope xp_fwd_ship = { .active = false };
 
-	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockForwardPayload))
+	if (env == NULL || payload == NULL)
+		return;
+
+	/*
+	 * spec-3.6b D2: kinds 6/7 are the only 128-byte FORWARD frames.  Branch
+	 * before the shipped BufferTag/transition/SCN decoder: those bytes are a
+	 * typed current-MX overlay and must never reach block-holder logic.
+	 */
+	if (env->payload_length == GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE) {
+		ClusterCurrentMxRoutingPrefixWire routing;
+
+		memcpy(&routing, payload, sizeof(routing));
+		if (routing.kind == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE)
+			cluster_gcs_current_mx_describe_serve_inline(env, payload);
+		/* kind 7 is registered by the same length gate but its authority
+		 * serve lands in Task 4; until then it drops fail-closed. */
+		return;
+	}
+	if (env->payload_length != sizeof(GcsBlockForwardPayload))
 		return;
 
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	fwd = (const GcsBlockForwardPayload *)payload;
+	/* A new kind carried in an old 64-byte frame is never progressively
+	 * decoded by a new peer. */
+	if (GcsBlockForwardPayloadIsCurrentMxDescribe(fwd)
+		|| GcsBlockForwardPayloadIsCurrentMxMemberProof(fwd))
+		return;
 	sf_peer_v2
 		= cluster_smart_fusion && cluster_sf_peer_supports_reply_v2(fwd->original_requester_node);
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_received_count, 1);

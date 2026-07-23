@@ -24,7 +24,11 @@
 
 #include <stddef.h>
 
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_multixact_current_wire.h"
+#include "cluster/cluster_mxid_stripe.h"
 #include "storage/lock.h"
 
 #undef printf
@@ -43,6 +47,86 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 int lineNumber pg_attribute_unused())
 {
 	abort();
+}
+
+/*
+ * The production describe entry adds runtime routing in D2.  This standalone
+ * pure-unit binary supplies fail-closed seams so it can continue linking the
+ * decision object without shmem, pg_multixact SLRU, or DATA transport.
+ */
+int cluster_node_id = -1;
+static uint64 test_runtime_epoch;
+static int test_runtime_mxid_origin = -1;
+static bool test_runtime_mxid_mine;
+static int test_runtime_native_describe_calls;
+static int test_runtime_remote_describe_calls;
+static bool test_runtime_remote_describe_ok;
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return test_runtime_epoch;
+}
+
+int
+cluster_mxid_origin_slot(MultiXactId mxid pg_attribute_unused())
+{
+	return test_runtime_mxid_origin;
+}
+
+bool
+cluster_mxid_is_mine(MultiXactId mxid pg_attribute_unused())
+{
+	return test_runtime_mxid_mine;
+}
+
+int
+GetMultiXactIdMembers(MultiXactId multi pg_attribute_unused(), MultiXactMember **members,
+					  bool from_pgupgrade pg_attribute_unused(),
+					  bool isLockOnly pg_attribute_unused())
+{
+	MultiXactMember *out;
+
+	test_runtime_native_describe_calls++;
+	if (members == NULL)
+		return -1;
+	out = (MultiXactMember *)malloc(2 * sizeof(*out));
+	memset(out, 0, 2 * sizeof(*out));
+	out[0].xid = 100;
+	out[0].status = MultiXactStatusForShare;
+	out[1].xid = 101;
+	out[1].status = MultiXactStatusNoKeyUpdate;
+	*members = out;
+	return 2;
+}
+
+ClusterMxDescribeResult
+cluster_gcs_current_mx_describe_fetch_and_wait(
+	int32 origin_node pg_attribute_unused(), const ClusterCurrentMxKey *key pg_attribute_unused(),
+	ClusterCurrentMxMemberDesc *members pg_attribute_unused(),
+	uint16 members_cap pg_attribute_unused(), uint16 *members_count pg_attribute_unused(),
+	uint32 *reported_total_members pg_attribute_unused())
+{
+	test_runtime_remote_describe_calls++;
+	if (!test_runtime_remote_describe_ok)
+		return CMX_DESC_UNKNOWN;
+	if (members == NULL || members_count == NULL || reported_total_members == NULL
+		|| members_cap < 2)
+		return CMX_DESC_UNKNOWN;
+	memset(members, 0, 2 * sizeof(*members));
+	members[0].xid = 200;
+	members[0].member_status = MultiXactStatusForShare;
+	members[1].xid = 201;
+	members[1].member_status = MultiXactStatusNoKeyUpdate;
+	*members_count = 2;
+	*reported_total_members = 2;
+	return CMX_DESC_OK;
 }
 
 
@@ -158,10 +242,64 @@ StaticAssertDecl(CCM_SHAPE_LOCK_ONLY == 0 && CCM_SHAPE_UPDATED == 1 && CCM_SHAPE
 StaticAssertDecl(CUCP_MATCH == 0 && CUCP_MISMATCH == 1 && CUCP_UNKNOWN == 2,
 				 "current MX updater verdict values changed");
 StaticAssertDecl(CMDL_CONTINUE == 0 && CMDL_INVISIBLE == 1 && CMDL_SELF_MODIFIED == 2
-					 && CMDL_BEING_MODIFIED == 3 && CMDL_WAIT_MEMBER == 4 && CMDL_WOULD_BLOCK == 5
-					 && CMDL_LOCK_NOT_AVAILABLE == 6 && CMDL_UPDATED == 7 && CMDL_DELETED == 8
-					 && CMDL_UNKNOWN == 9,
+						 && CMDL_BEING_MODIFIED == 3 && CMDL_WAIT_MEMBER == 4 && CMDL_WOULD_BLOCK == 5
+						 && CMDL_LOCK_NOT_AVAILABLE == 6 && CMDL_UPDATED == 7 && CMDL_DELETED == 8
+						 && CMDL_UNKNOWN == 9,
 				 "current MX decision values changed");
+StaticAssertDecl(sizeof(ClusterCurrentMxRoutingPrefixWire) == 64,
+				 "current MX routing prefix must remain 64 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMxRoutingPrefixWire, original_requester_node) == 36,
+				 "current MX requester node offset changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxRoutingPrefixWire, requester_backend_id) == 40,
+				 "current MX requester backend offset changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxRoutingPrefixWire, kind) == 63,
+				 "current MX kind offset changed");
+StaticAssertDecl(sizeof(ClusterCurrentMxDescribePrefixWire) == 64,
+				 "current MX describe prefix must remain 64 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMxDescribePrefixWire, mxkey) == 16,
+				 "current MX describe key offset changed");
+StaticAssertDecl(sizeof(ClusterCurrentMxDescribeTrailerWire) == 64,
+				 "current MX describe trailer must remain 64 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxDescribeForwardV2) == 128,
+				 "current MX describe V2 must remain 128 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMxDescribeForwardV2, trailer) == 64,
+				 "current MX describe trailer offset changed");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofAskWire) == 8,
+				 "current MX proof ask must remain 8 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxUpdaterChallengeWire) == 32,
+				 "current MX updater challenge wire must remain 32 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofRequestBodyWire) == 56,
+				 "current MX proof body must remain 56 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofTrailerWire) == 64,
+				 "current MX proof trailer must remain 64 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofForwardV2) == 128,
+				 "current MX proof V2 must remain 128 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMxProofPrefixWire, mxkey) == 16,
+				 "current MX proof key offset changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxProofPrefixWire, total_count) == 44,
+				 "current MX proof total offset changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxProofPrefixWire, chunk_ordinal) == 48,
+				 "current MX proof chunk ordinal offset changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxProofPrefixWire, descriptor_hash_bytes) == 49,
+				 "current MX proof hash offset changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxProofPrefixWire, chunk_count_minus_one) == 57,
+				 "current MX proof chunk count offset changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxProofPrefixWire, kind) == 63,
+				 "current MX proof kind offset changed");
+StaticAssertDecl(sizeof(ClusterCurrentMxDescribeReplyHeader) == 64,
+				 "current MX describe reply header must remain 64 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMxDescribeReplyHeader, entry_count) == 52,
+				 "current MX reply count offset changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxDescribeReplyHeader, wire_length) == 56,
+				 "current MX reply wire length offset changed");
+StaticAssertDecl(sizeof(ClusterCurrentMxDescribeReplyPage) == BLCKSZ,
+				 "current MX describe reply page must remain BLCKSZ");
+StaticAssertDecl(offsetof(ClusterCurrentMxDescribeReplyPage, members) == 64,
+				 "current MX describe members offset changed");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT == 21,
+				 "current MX describe reply status must append at 21");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT == 22,
+				 "current MX member-proof reply status must append at 22");
 
 
 UT_TEST(test_current_multixact_public_symbols_link)
@@ -470,6 +608,363 @@ UT_TEST(test_current_multixact_proof_binding_and_order)
 	UT_ASSERT_EQ(ordered[0].state, CCM_UNKNOWN);
 	UT_ASSERT_EQ(ordered[1].state, CCM_UNKNOWN);
 	UT_ASSERT_EQ(ordered[2].state, CCM_UNKNOWN);
+}
+
+
+UT_TEST(test_current_multixact_describe_wire_binding)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxDescribeForwardV2 request;
+	ClusterCurrentMxDescribeForwardV2 decoded;
+	ClusterCurrentMxDescribeReplyPage page;
+	ClusterCurrentMxMemberDesc out[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	uint16 out_count = 99;
+	uint32 out_total = 99;
+	uint64 hash;
+	uint16 i;
+
+	memset(&request, 0, sizeof(request));
+	request.prefix.request_id = 501;
+	request.prefix.epoch = 9;
+	request.prefix.mxkey = key;
+	request.prefix.original_requester_node = 3;
+	request.prefix.requester_backend_id = 7;
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+
+	memset(&decoded, 0xff, sizeof(decoded));
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 true);
+	UT_ASSERT_EQ(decoded.prefix.request_id, 501);
+	UT_ASSERT_EQ(decoded.prefix.mxkey.multixact_id, key.multixact_id);
+
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request.prefix), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request) - 1, 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request) + 1, 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 4, 2, UINT64CONST(9), &decoded),
+				 false);
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 1, UINT64CONST(9), &decoded),
+				 false);
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(0x100000009), &decoded),
+				 false);
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	request.prefix.reserved_a[0] = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	request.prefix.reserved_a[0] = 0;
+	request.prefix.reserved_b[18] = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	request.prefix.reserved_b[18] = 0;
+	request.prefix.requester_backend_id = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	request.prefix.requester_backend_id = 7;
+	request.trailer.magic++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	request.trailer.magic--;
+	request.trailer.version++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	request.trailer.version--;
+	request.trailer.flags = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	request.trailer.flags = 0;
+	request.trailer.reserved[55] = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &request, sizeof(request), 3, 2, UINT64CONST(9), &decoded),
+				 false);
+	request.trailer.reserved[55] = 0;
+
+	memset(&page, 0, sizeof(page));
+	page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	page.header.source_node_id = 2;
+	page.header.request_id = 501;
+	page.header.mxkey = key;
+	page.header.total_count = 2;
+	page.header.entry_count = 2;
+	page.header.chunk_count_minus_one = 0;
+	page.header.wire_length
+		= sizeof(page.header) + 2 * sizeof(ClusterCurrentMxMemberDesc);
+	page.header.result = CMX_DESC_OK;
+	test_member(&page.members[0], 100, MultiXactStatusForShare);
+	test_member(&page.members[1], 101, MultiXactStatusNoKeyUpdate);
+	hash = cluster_multixact_current_descriptor_hash(&key, page.members, 2);
+	page.header.descriptor_hash = hash;
+
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_OK);
+	UT_ASSERT_EQ(out_count, 2);
+	UT_ASSERT_EQ(out_total, 2);
+	UT_ASSERT_EQ(out[0].xid, 100);
+	UT_ASSERT_EQ(out[1].xid, 101);
+
+	page.header.request_id++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	UT_ASSERT_EQ(out_count, 0);
+	page.header.request_id--;
+
+	page.header.mxkey.multixact_id++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.mxkey.multixact_id--;
+
+	page.header.descriptor_hash++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.descriptor_hash--;
+
+	page.header.magic++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.magic--;
+	page.header.version++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.version--;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	page.header.flags = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.flags = 0;
+	page.header.total_count++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.total_count--;
+	page.header.entry_count--;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.entry_count++;
+	page.header.chunk_ordinal = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.chunk_ordinal = 0;
+	page.header.chunk_count_minus_one = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.chunk_count_minus_one = 0;
+	page.header.reserved16 = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.reserved16 = 0;
+	page.header.reserved32 = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.reserved32 = 0;
+	page.header.wire_length--;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.wire_length++;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page) - 1, 2, UINT64CONST(9), 501, &key, out, lengthof(out),
+					 &out_count, &out_total),
+				 CMX_DESC_UNKNOWN);
+	((uint8 *)&page)[page.header.wire_length] = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	((uint8 *)&page)[page.header.wire_length] = 0;
+	page.header.source_node_id = 3;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.source_node_id = 2;
+
+	memset(&page, 0, sizeof(page));
+	page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	page.header.source_node_id = 2;
+	page.header.request_id = 501;
+	page.header.mxkey = key;
+	page.header.total_count = CLUSTER_CURRENT_MX_MAX_MEMBERS + 1;
+	page.header.wire_length = sizeof(page.header);
+	page.header.result = CMX_DESC_SUPPORTED_LIMIT;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_SUPPORTED_LIMIT);
+	UT_ASSERT_EQ(out_count, 0);
+	UT_ASSERT_EQ(out_total, CLUSTER_CURRENT_MX_MAX_MEMBERS + 1);
+
+	page.header.result = CMX_DESC_TIMEOUT;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+
+	memset(&page, 0, sizeof(page));
+	page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	page.header.source_node_id = 2;
+	page.header.request_id = 501;
+	page.header.mxkey = key;
+	page.header.wire_length = sizeof(page.header);
+	page.header.result = CMX_DESC_DENIED;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_DENIED);
+	page.header.descriptor_hash = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.descriptor_hash = 0;
+	page.header.total_count = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+	page.header.total_count = 0;
+	page.reserved[0] = 1;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_UNKNOWN);
+
+	/* The supported positive limit is a complete one-page round trip. */
+	memset(&page, 0, sizeof(page));
+	page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	page.header.source_node_id = 2;
+	page.header.request_id = 501;
+	page.header.mxkey = key;
+	page.header.total_count = CLUSTER_CURRENT_MX_MAX_MEMBERS;
+	page.header.entry_count = CLUSTER_CURRENT_MX_MAX_MEMBERS;
+	page.header.chunk_count_minus_one = 0;
+	page.header.wire_length = sizeof(page.header)
+							  + CLUSTER_CURRENT_MX_MAX_MEMBERS
+									* sizeof(ClusterCurrentMxMemberDesc);
+	page.header.result = CMX_DESC_OK;
+	for (i = 0; i < CLUSTER_CURRENT_MX_MAX_MEMBERS; i++)
+		test_member(&page.members[i], 1000 + i, MultiXactStatusForShare);
+	page.header.descriptor_hash
+		= cluster_multixact_current_descriptor_hash(&key, page.members,
+												   CLUSTER_CURRENT_MX_MAX_MEMBERS);
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, UINT64CONST(9), 501, &key, out, lengthof(out), &out_count,
+					 &out_total),
+				 CMX_DESC_OK);
+	UT_ASSERT_EQ(out_count, CLUSTER_CURRENT_MX_MAX_MEMBERS);
+	UT_ASSERT_EQ(out[CLUSTER_CURRENT_MX_MAX_MEMBERS - 1].xid,
+				 1000 + CLUSTER_CURRENT_MX_MAX_MEMBERS - 1);
+}
+
+UT_TEST(test_current_multixact_describe_routes_by_mxid_authority)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc members[4];
+	uint16 members_count;
+	uint32 reported_total;
+
+	cluster_node_id = 0;
+	test_runtime_epoch = 9;
+	test_runtime_native_describe_calls = 0;
+	test_runtime_remote_describe_calls = 0;
+	test_runtime_remote_describe_ok = false;
+
+	/* Local origin is the only route allowed to touch local pg_multixact. */
+	key.origin_node_id = 0;
+	test_runtime_mxid_origin = 0;
+	test_runtime_mxid_mine = true;
+	UT_ASSERT_EQ(cluster_multixact_current_describe(&key, members, lengthof(members),
+													&members_count, &reported_total),
+				 CMX_DESC_OK);
+	UT_ASSERT_EQ(test_runtime_native_describe_calls, 1);
+	UT_ASSERT_EQ(test_runtime_remote_describe_calls, 0);
+	UT_ASSERT_EQ(members_count, 2);
+	UT_ASSERT_EQ(members[1].xid, 101);
+
+	/* Foreign origin must use the authority RPC and never local SLRU. */
+	key.origin_node_id = 2;
+	test_runtime_mxid_origin = 2;
+	test_runtime_mxid_mine = false;
+	test_runtime_remote_describe_ok = true;
+	UT_ASSERT_EQ(cluster_multixact_current_describe(&key, members, lengthof(members),
+													&members_count, &reported_total),
+				 CMX_DESC_OK);
+	UT_ASSERT_EQ(test_runtime_native_describe_calls, 1);
+	UT_ASSERT_EQ(test_runtime_remote_describe_calls, 1);
+	UT_ASSERT_EQ(members[0].xid, 200);
+
+	/* Underivable/wrong-origin identity fails before either authority read. */
+	test_runtime_mxid_origin = -1;
+	UT_ASSERT_EQ(cluster_multixact_current_describe(&key, members, lengthof(members),
+													&members_count, &reported_total),
+				 CMX_DESC_UNKNOWN);
+	UT_ASSERT_EQ(test_runtime_native_describe_calls, 1);
+	UT_ASSERT_EQ(test_runtime_remote_describe_calls, 1);
+	UT_ASSERT_EQ(members_count, 0);
+
+	cluster_node_id = -1;
+	test_runtime_epoch = 0;
+	test_runtime_mxid_origin = -1;
+	test_runtime_mxid_mine = false;
+	test_runtime_remote_describe_ok = false;
 }
 
 
@@ -856,11 +1351,13 @@ UT_TEST(test_current_multixact_rejects_context_mode_mismatch)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(test_current_multixact_public_symbols_link);
 	UT_RUN(test_current_multixact_descriptor_validation);
 	UT_RUN(test_current_multixact_descriptor_accepts_cap_and_hashes_order);
 	UT_RUN(test_current_multixact_proof_binding_and_order);
+	UT_RUN(test_current_multixact_describe_wire_binding);
+	UT_RUN(test_current_multixact_describe_routes_by_mxid_authority);
 	UT_RUN(test_current_multixact_native_conflict_matrix);
 	UT_RUN(test_current_multixact_compositor_status_mode_state_cross_product);
 	UT_RUN(test_current_multixact_active_wait_policies_and_stable_key);

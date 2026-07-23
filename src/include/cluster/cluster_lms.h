@@ -89,6 +89,12 @@
 #include "cluster/cluster_grd.h"	   /* ClusterGrdHolderId for probe slot */
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3) */
 
+/*
+ * DATA-plane staging ceiling.  Keep this public so every typed DATA payload
+ * can compile-time prove that it fits the real LMS outbound slot.
+ */
+#define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX 128
+
 
 /*
  * ClusterLmsState -- HC2 4-state semantic SSOT.
@@ -321,8 +327,8 @@ typedef struct ClusterLmsSharedState {
 	 */
 	pg_atomic_uint64 worker_outbound_not_admitted_count[CLUSTER_LMS_MAX_WORKERS];
 	pg_atomic_uint64 worker_outbound_requeue_drop_count[CLUSTER_LMS_MAX_WORKERS];
-	/* Capability-bound wire frames consumed before send because the peer's
-	 * current HELLO record no longer matches the staged connection generation. */
+	/* Capability-bound wire frames consumed before send because either the
+	 * CONTROL capability generation or selected DATA generation drifted. */
 	pg_atomic_uint64 worker_outbound_cap_guard_drop_count[CLUSTER_LMS_MAX_WORKERS];
 } ClusterLmsSharedState;
 
@@ -407,7 +413,14 @@ extern bool cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 d
 extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type,
 												   uint32 dest_node_id, const void *payload,
 												   uint16 payload_len, uint32 required_capability,
-												   uint32 connection_generation);
+												   uint32 capability_generation);
+/*
+ * DATA-peer connection lifecycle.  CONTROL remains the authority for the
+ * peer capability bitmap; these hooks bind a cap-sensitive ring slot to the
+ * exact shard-aligned DATA connection that will carry it.
+ */
+extern void cluster_lms_outbound_note_data_peer_connected(int worker_id, int32 peer_id);
+extern void cluster_lms_outbound_note_data_peer_disconnected(int worker_id, int32 peer_id);
 struct GcsBlockReplyHeader;
 extern bool cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
 														  const struct GcsBlockReplyHeader *header,

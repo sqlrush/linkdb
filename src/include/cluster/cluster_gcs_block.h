@@ -1509,8 +1509,8 @@ typedef enum GcsBlockReplyStatus {
 													 * reply instead — the requester
 													 * keeps 53R97 (Rule 8.A). */
 	,
-	GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT = 20 /* PGRAC: spec-7.1 D3-b NEW; the
-													 * origin's LMS enumerated a foreign
+	GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT = 20, /* PGRAC: spec-7.1 D3-b NEW; the
+														 * origin's LMS enumerated a foreign
 													 * multixact's members and served a
 													 * per-updater-member batch verdict
 													 * (ClusterGcsUndoMultiVerdictPage in
@@ -1520,7 +1520,9 @@ typedef enum GcsBlockReplyStatus {
 													 * every updater member is proven
 													 * (status SERVED); any unprovable
 													 * multi is a DENIED reply — the
-													 * requester keeps 53R97 (Rule 8.A). */
+														 * requester keeps 53R97 (Rule 8.A). */
+	GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT = 21,
+	GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT = 22
 } GcsBlockReplyStatus;
 
 /*
@@ -1563,8 +1565,14 @@ StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT == GCS_BLOCK_REPLY_CR_RESU
 StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT == GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT + 1,
 				 "spec-6.12i undo-verdict status must follow the undo-TT fetch status");
 StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
-					 == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT + 1,
-				 "spec-7.1 D3-b undo-multi-verdict status must be the tail enum value");
+						 == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT + 1,
+				 "spec-7.1 D3-b undo-multi-verdict status must follow undo verdict");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+						 == GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT + 1,
+				 "current MX describe result must follow undo multi verdict");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+						 == GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT + 1,
+				 "current MX member-proof result must be the tail reply status");
 
 /* PGRAC: spec-6.12i / spec-7.1 — every undo-plane reply kind (TT-header fetch,
  * single-xid verdict, batched multi-member verdict) ships the BLCKSZ page plus
@@ -2753,6 +2761,66 @@ static inline bool
 GcsBlockForwardPayloadIsUndoMultiVerdictRequest(const GcsBlockForwardPayload *p)
 {
 	return p->reserved_0[6] == (uint8)3;
+}
+
+/*
+ * Current-DML MultiXact requests extend the closed reserved_0[6] kind legend.
+ * They always use the strict 128-byte forward V2 layout; the 64-byte prefix
+ * remains byte-identical so existing routing and reply-slot identity stay
+ * reusable.  Receivers must check the full payload length before consuming
+ * either kind.
+ *
+ * Spec: spec-3.6b-multixact-current-dml.md
+ */
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE 6
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF 7
+#define GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE 128
+
+StaticAssertDecl(GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE == 2 * sizeof(GcsBlockForwardPayload),
+				 "current-MX forward V2 must be exactly two shipped forward slots");
+
+/*
+ * Current-MX overlays the old BufferTag, so DATA sharding derives a synthetic
+ * tag solely from the preserved routing identity.  It is an ordering key,
+ * never an authority or relation identity.
+ */
+static inline BufferTag
+GcsBlockCurrentMxRouteTagMake(uint64 request_id, uint64 epoch, int32 requester_node,
+							  int32 requester_backend_id)
+{
+	BufferTag tag;
+
+	memset(&tag, 0, sizeof(tag));
+	tag.spcOid = (Oid)((epoch >> 32) ^ (uint64)(uint32)requester_node);
+	tag.dbOid = (Oid)epoch;
+	tag.relNumber = (RelFileNumber)requester_backend_id;
+	tag.forkNum = MAIN_FORKNUM;
+	tag.blockNum = (BlockNumber)(request_id ^ (request_id >> 32));
+	return tag;
+}
+
+static inline void
+GcsBlockForwardPayloadSetCurrentMxDescribe(GcsBlockForwardPayload *p)
+{
+	p->reserved_0[6] = (uint8)GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxDescribe(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+}
+
+static inline void
+GcsBlockForwardPayloadSetCurrentMxMemberProof(GcsBlockForwardPayload *p)
+{
+	p->reserved_0[6] = (uint8)GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxMemberProof(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == (uint8)GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
 }
 
 /* PGRAC: spec-6.12i D-i1 — synthetic undo-address tag for the fetch wire.

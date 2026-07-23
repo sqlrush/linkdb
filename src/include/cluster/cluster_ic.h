@@ -381,6 +381,12 @@ typedef enum ClusterICPlane {
 /* P0-20: this binary accepts the 104-byte PCM-X REVOKE V2 frame and binds its
  * trailing required_page_scn to the immutable source-image lifecycle. */
 #define PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 ((uint32)0x00000800U)
+/* PGRAC: spec-3.6b — atomic fixed-128-byte current-DML MultiXact family.
+ * Reserve the bit in D2, but advertise it only after both describe and
+ * member-proof/updater-challenge request/reply paths are implemented.
+ * Capability authority comes from CONTROL; cap-sensitive staging also binds
+ * each frame to the selected shard-aligned DATA connection generation. */
+#define PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 ((uint32)0x00001000U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).

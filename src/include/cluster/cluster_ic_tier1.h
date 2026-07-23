@@ -337,7 +337,8 @@ extern int cluster_ic_tier1_hello_send_remaining(int32 peer_id);
  *                       the slot until HELLO complete or fd closed).
  *   peer_fd           : the fd to recv from
  *   out_learned_peer_id : on success of full HELLO, set to verified
- *                       source_node_id (caller binds peer fd).  If
+ *                       source_node_id (caller retires any duplicate, then
+ *                       binds peer fd with bind_verified_anon_peer).  If
  *                       still accumulating, set to -1.
  *
  * Returns true while recv is making progress (partial or complete);
@@ -348,6 +349,8 @@ extern int cluster_ic_tier1_hello_send_remaining(int32 peer_id);
  */
 extern bool cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd,
 												 int32 *out_learned_peer_id);
+extern bool cluster_ic_tier1_bind_verified_anon_peer(int anon_slot, int32 learned_peer_id,
+													 int peer_fd);
 extern void cluster_ic_tier1_anon_hello_reset(int anon_slot);
 
 /*

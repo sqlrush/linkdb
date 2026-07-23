@@ -299,6 +299,8 @@ UT_TEST(test_gcs_block_wait_events_distinct)
 {
 	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_SHIP_WAIT != (int)WAIT_EVENT_GCS_REPLY_WAIT);
 	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH != (int)WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+	UT_ASSERT((int)WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT
+			  != (int)WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH
 			  != (int)WAIT_EVENT_GCS_BLOCK_REQUEST_DISPATCH);
 	UT_ASSERT((int)WAIT_EVENT_GCS_BLOCK_CHECKSUM_FAIL != (int)WAIT_EVENT_GCS_BLOCK_REPLY_DISPATCH);
@@ -701,6 +703,44 @@ UT_TEST(test_forward_payload_undo_verdict_kinds_no_collision)
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictRequest(&fwd) ? 1 : 0, 1);
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictAuthoritative(&fwd) ? 1 : 0, 0);
 	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoMultiVerdictRequest(&fwd) ? 1 : 0, 0);
+}
+
+
+/*
+ * spec-3.6b current-DML MultiXact: reserved_0[6] is a closed request-kind
+ * enum.  Values 6/7 extend the shipped 1..5 legend without allowing any
+ * existing predicate to steal a current describe/member-proof request.
+ */
+UT_TEST(test_forward_payload_current_mx_kinds_no_collision)
+{
+	GcsBlockForwardPayload fwd;
+	int value;
+
+	UT_ASSERT_EQ(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE, 6);
+	UT_ASSERT_EQ(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF, 7);
+
+	for (value = 0; value <= GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF; value++) {
+		int matches;
+
+		memset(&fwd, 0, sizeof(fwd));
+		fwd.reserved_0[6] = (uint8)value;
+		matches = (GcsBlockForwardPayloadIsUndoTtFetchRequest(&fwd) ? 1 : 0)
+				  + (GcsBlockForwardPayloadIsUndoVerdictRequest(&fwd) ? 1 : 0)
+				  + (GcsBlockForwardPayloadIsUndoMultiVerdictRequest(&fwd) ? 1 : 0)
+				  + (GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0)
+				  + (GcsBlockForwardPayloadIsCurrentMxDescribe(&fwd) ? 1 : 0)
+				  + (GcsBlockForwardPayloadIsCurrentMxMemberProof(&fwd) ? 1 : 0);
+		UT_ASSERT_EQ(matches, value == 0 ? 0 : 1);
+	}
+
+	memset(&fwd, 0, sizeof(fwd));
+	GcsBlockForwardPayloadSetCurrentMxDescribe(&fwd);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxDescribe(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxMemberProof(&fwd) ? 1 : 0, 0);
+
+	GcsBlockForwardPayloadSetCurrentMxMemberProof(&fwd);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxDescribe(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsCurrentMxMemberProof(&fwd) ? 1 : 0, 1);
 }
 
 
@@ -5730,11 +5770,144 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 	free(source);
 }
 
+UT_TEST(test_current_mx_reply_is_exact_before_first_reply_wins)
+{
+	char *source = read_gcs_block_source();
+	const char *handler;
+	const char *slot_classifier;
+	const char *current_branch;
+	const char *exact_v1;
+	const char *status_binding;
+	const char *source_binding;
+	const char *direct_binding;
+	const char *epoch_binding;
+	const char *reserved_binding;
+	const char *checksum_binding;
+	const char *typed_validation;
+	const char *slot_mutation;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	handler = strstr(source, "\ncluster_gcs_handle_block_reply_envelope(");
+	slot_classifier
+		= handler != NULL ? strstr(handler, "current_slot\n\t\t\t\t= slot->expected_reply_status")
+						  : NULL;
+	current_branch
+		= slot_classifier != NULL ? strstr(slot_classifier, "if (current_slot || current_reply)")
+								 : NULL;
+	exact_v1 = current_branch != NULL
+				   ? strstr(current_branch,
+							"sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE")
+				   : NULL;
+	status_binding
+		= exact_v1 != NULL ? strstr(exact_v1, "slot->expected_reply_status == hdr->status") : NULL;
+	source_binding
+		= status_binding != NULL
+			  ? strstr(status_binding, "hdr->sender_node == slot->expected_master_node")
+			  : NULL;
+	direct_binding = source_binding != NULL
+						 ? strstr(source_binding,
+								  "fwd_master == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER")
+						 : NULL;
+	epoch_binding
+		= direct_binding != NULL ? strstr(direct_binding, "hdr->epoch == slot->request_epoch") : NULL;
+	reserved_binding
+		= epoch_binding != NULL ? strstr(epoch_binding, "gcs_block_reply_reserved_zero(hdr)") : NULL;
+	checksum_binding
+		= reserved_binding != NULL
+			  ? strstr(reserved_binding,
+					   "hdr->checksum == cluster_gcs_block_compute_checksum(block_data)")
+			  : NULL;
+	typed_validation
+		= checksum_binding != NULL
+			  ? strstr(checksum_binding,
+					   "cluster_multixact_current_wire_validate_describe_reply(")
+			  : NULL;
+	slot_mutation = typed_validation != NULL
+						? strstr(typed_validation, "slot->reply_header = *hdr")
+						: NULL;
+
+	UT_ASSERT_NOT_NULL(handler);
+	UT_ASSERT_NOT_NULL(slot_classifier);
+	UT_ASSERT_NOT_NULL(current_branch);
+	UT_ASSERT_NOT_NULL(exact_v1);
+	UT_ASSERT_NOT_NULL(status_binding);
+	UT_ASSERT_NOT_NULL(source_binding);
+	UT_ASSERT_NOT_NULL(direct_binding);
+	UT_ASSERT_NOT_NULL(epoch_binding);
+	UT_ASSERT_NOT_NULL(reserved_binding);
+	UT_ASSERT_NOT_NULL(checksum_binding);
+	UT_ASSERT_NOT_NULL(typed_validation);
+	UT_ASSERT_NOT_NULL(slot_mutation);
+	if (handler != NULL && slot_classifier != NULL && current_branch != NULL && exact_v1 != NULL
+		&& status_binding != NULL && source_binding != NULL && direct_binding != NULL
+		&& epoch_binding != NULL && reserved_binding != NULL && checksum_binding != NULL
+		&& typed_validation != NULL && slot_mutation != NULL)
+		UT_ASSERT(handler < slot_classifier && slot_classifier < current_branch
+				  && current_branch < exact_v1
+				  && exact_v1 < status_binding && status_binding < source_binding
+				  && source_binding < direct_binding && direct_binding < epoch_binding
+				  && epoch_binding < reserved_binding && reserved_binding < checksum_binding
+				  && checksum_binding < typed_validation && typed_validation < slot_mutation);
+	free(source);
+}
+
+UT_TEST(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse)
+{
+	char *source = read_gcs_block_source();
+	const char *handler;
+	const char *v2_length;
+	const char *routing_copy;
+	const char *describe;
+	const char *v2_return;
+	const char *v1_length;
+	const char *legacy_parse;
+	const char *legacy_current_reject;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	handler = strstr(source, "\ncluster_gcs_handle_block_forward_envelope(");
+	v2_length = handler != NULL
+					? strstr(handler,
+							 "env->payload_length == GCS_BLOCK_FORWARD_CURRENT_MX_V2_SIZE")
+					: NULL;
+	routing_copy = v2_length != NULL ? strstr(v2_length, "memcpy(&routing, payload") : NULL;
+	describe = routing_copy != NULL
+				   ? strstr(routing_copy, "cluster_gcs_current_mx_describe_serve_inline(")
+				   : NULL;
+	v2_return = describe != NULL ? strstr(describe, "return;") : NULL;
+	v1_length
+		= v2_return != NULL ? strstr(v2_return, "sizeof(GcsBlockForwardPayload)") : NULL;
+	legacy_parse = v1_length != NULL ? strstr(v1_length, "fwd = (const GcsBlockForwardPayload *)")
+									 : NULL;
+	legacy_current_reject
+		= legacy_parse != NULL ? strstr(legacy_parse, "GcsBlockForwardPayloadIsCurrentMxDescribe")
+							  : NULL;
+
+	UT_ASSERT_NOT_NULL(handler);
+	UT_ASSERT_NOT_NULL(v2_length);
+	UT_ASSERT_NOT_NULL(routing_copy);
+	UT_ASSERT_NOT_NULL(describe);
+	UT_ASSERT_NOT_NULL(v2_return);
+	UT_ASSERT_NOT_NULL(v1_length);
+	UT_ASSERT_NOT_NULL(legacy_parse);
+	UT_ASSERT_NOT_NULL(legacy_current_reject);
+	if (handler != NULL && v2_length != NULL && routing_copy != NULL && describe != NULL
+		&& v2_return != NULL && v1_length != NULL && legacy_parse != NULL
+		&& legacy_current_reject != NULL)
+		UT_ASSERT(handler < v2_length && v2_length < routing_copy && routing_copy < describe
+				  && describe < v2_return && v2_return < v1_length && v1_length < legacy_parse
+				  && legacy_parse < legacy_current_reject);
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(110);
+	UT_PLAN(113);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5759,6 +5932,7 @@ main(void)
 	UT_RUN(test_clean_xfer_stale_break_predicate);
 	UT_RUN(test_forward_payload_undo_authority_verdict_kind4);
 	UT_RUN(test_forward_payload_undo_verdict_kinds_no_collision);
+	UT_RUN(test_forward_payload_current_mx_kinds_no_collision);
 	UT_RUN(test_undo_authority_fetch_tag_owner_roundtrip);
 	UT_RUN(test_undo_verdict_version_authority_distinct);
 	UT_RUN(test_pcm_x_enqueue_ingress_binds_transport_epoch_and_master);
@@ -5845,6 +6019,8 @@ main(void)
 	UT_RUN(test_pi_durable_note_drain_stages_before_consuming_on_data_plane);
 	UT_RUN(test_pi_durable_note_receive_is_observable_before_apply);
 	UT_RUN(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain);
+	UT_RUN(test_current_mx_reply_is_exact_before_first_reply_wins);
+	UT_RUN(test_current_mx_dispatch_length_kind_matrix_precedes_legacy_parse);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

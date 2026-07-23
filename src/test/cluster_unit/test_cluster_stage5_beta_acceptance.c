@@ -27,9 +27,8 @@
  *	        progress / 53R61 join-rejected-stale / 53R62 clean-leave-in-progress
  *	        / 53R64 node-removed-fenced / 53R70 ges-timeout / 55R01
  *	        pcm-state-invalid.
- *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 121 (update-required
- *	        contract) — a future spec adding cluster wait events MUST bump this
- *	        snapshot and the dump/test baselines that count them.
+ *	    L5  CLUSTER_WAIT_EVENTS_COUNT current snapshot = 124, including the
+ *	        current-DML MultiXact describe wait (update-required contract).
  *	    L6  7 RAC core presence (roadmap: only all seven make it "RAC core"):
  *	        each core subsystem's sentinel symbol/enum is referenced at
  *	        compile time, so a release commit that accidentally dropped a core
@@ -191,7 +190,7 @@ UT_TEST(test_beta_wait_events_count)
 	/* Current Stage 5 beta surface value.  update-required contract: a future
 	 * spec adding cluster wait events MUST bump this snapshot (and the dump/test
 	 * baselines that count them). */
-	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 123);
+	UT_ASSERT_EQ((int)CLUSTER_WAIT_EVENTS_COUNT, 124);
 }
 
 

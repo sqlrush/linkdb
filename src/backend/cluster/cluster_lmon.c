@@ -1837,6 +1837,18 @@ LmonMain(void)
 						if (learned >= 0) {
 							/* HELLO complete + verified.  Migrate fd into
 							 * peer_track + free anon slot. */
+							if (cluster_ic_tier1_get_peer_fd(learned) >= 0)
+								cluster_ic_tier1_close_peer(
+									learned, "control-plane duplicate connection");
+							lmon_peer_track[learned].fd = -1;
+							if (!cluster_ic_tier1_bind_verified_anon_peer(slot, learned,
+																		 pend_fd)) {
+								(void)close(pend_fd);
+								lmon_pending_fds[slot] = -1;
+								cluster_ic_tier1_anon_hello_reset(slot);
+								wes_dirty = true;
+								continue;
+							}
 							lmon_peer_track[learned].fd = pend_fd;
 							lmon_peer_track[learned].substate = LMON_SUB_CONNECTED;
 							lmon_pending_fds[slot] = -1;

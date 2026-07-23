@@ -373,6 +373,9 @@ typedef enum {
 	WAIT_EVENT_CLUSTER_SMART_FUSION_DBWR_BRAKE,
 	WAIT_EVENT_CLUSTER_SMART_FUSION_ORIGIN_DURABLE,
 	WAIT_EVENT_CLUSTER_CF_TERMINAL_RESOLVE,
+	/* PGRAC: spec-3.6b — requester waits for an immutable member-list
+	 * reply from the value-derived MultiXact origin. */
+	WAIT_EVENT_GCS_MULTIXACT_DESCRIBE_WAIT,
 
 	/* Cluster: BufferShip (5 events) -- subsystem #5 */
 	WAIT_EVENT_BUFFER_SHIP_CR_BUILD = PG_WAIT_CLUSTER_BUFFERSHIP,

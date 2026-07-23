@@ -669,6 +669,11 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	/* P0-20: V2 REVOKE source-floor carrier.  Senders still gate the extended
 	 * frame on the selected peer's current verified connection. */
 	capabilities |= PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
+	/*
+	 * spec-3.6b: MULTIXACT_CURRENT_V1 is an atomic describe + member-proof /
+	 * updater-challenge family.  D2 reserves and implements describe, but
+	 * must not advertise the family until the kind-7 half lands.
+	 */
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

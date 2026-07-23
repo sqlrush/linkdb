@@ -21,8 +21,13 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_mxid_stripe.h"
 #include "storage/lock.h"
+#include "utils/elog.h"
 
 
 static bool
@@ -180,7 +185,7 @@ cluster_multixact_current_descriptor_hash(const ClusterCurrentMxKey *key,
 		hash = hash_byte(hash, members[i].member_status);
 	}
 
-	return hash == 0 ? 1 : hash;
+	return hash;
 }
 
 
@@ -246,7 +251,7 @@ cluster_multixact_current_validate_proof_set(const ClusterCurrentMxKey *key,
 		return CMX_RESOLVE_SUPPORTED_LIMIT;
 	proof_array_set_unknown(ordered_proofs, nmembers);
 	if (!current_mx_key_valid(key) || !descriptor_entries_valid(members, nmembers)
-		|| member_origin_nodes == NULL || request_id == 0 || descriptor_hash == 0
+		|| member_origin_nodes == NULL || request_id == 0
 		|| descriptor_hash != cluster_multixact_current_descriptor_hash(key, members, nmembers)
 		|| chunks == NULL || nchunks == 0 || nchunks > CLUSTER_CURRENT_MX_MAX_CHUNKS
 		|| ordered_proofs == NULL)
@@ -611,14 +616,67 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 								   ClusterCurrentMxMemberDesc *members, uint16 members_cap,
 								   uint16 *nmembers, uint32 *reported_total_members)
 {
-	(void)key;
+	uint64 current_epoch;
+	MultiXactMember *native_members = NULL;
+	int native_count = -1;
+	ClusterMxDescribeResult result = CMX_DESC_UNKNOWN;
+	int origin_slot;
+	uint16 i;
+
 	if (members != NULL && members_cap > 0)
 		memset(members, 0, sizeof(*members) * members_cap);
 	if (nmembers != NULL)
 		*nmembers = 0;
 	if (reported_total_members != NULL)
 		*reported_total_members = 0;
-	return CMX_DESC_UNKNOWN;
+	if (key == NULL || members == NULL || nmembers == NULL || reported_total_members == NULL
+		|| members_cap < 2 || !current_mx_key_valid(key) || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return CMX_DESC_UNKNOWN;
+
+	current_epoch = cluster_epoch_get_current();
+	if (current_epoch == 0 || current_epoch > UINT32_MAX
+		|| key->cluster_epoch != (uint32)current_epoch)
+		return CMX_DESC_UNKNOWN;
+
+	origin_slot = cluster_mxid_origin_slot(key->multixact_id);
+	if (origin_slot < 0 || origin_slot != (int)key->origin_node_id)
+		return CMX_DESC_UNKNOWN;
+	if (key->origin_node_id != (uint16)cluster_node_id)
+		return cluster_gcs_current_mx_describe_fetch_and_wait(
+			(int32)key->origin_node_id, key, members, members_cap, nmembers,
+			reported_total_members);
+	if (!cluster_mxid_is_mine(key->multixact_id))
+		return CMX_DESC_DENIED;
+
+	native_count = GetMultiXactIdMembers(key->multixact_id, &native_members, false, false);
+	if (native_count > CLUSTER_CURRENT_MX_MAX_MEMBERS) {
+		*reported_total_members = (uint32)native_count;
+		result = CMX_DESC_SUPPORTED_LIMIT;
+	} else if (native_count < 2 || native_count > members_cap) {
+		result = CMX_DESC_DENIED;
+	} else {
+		for (i = 0; i < (uint16)native_count; i++) {
+			members[i].xid = native_members[i].xid;
+			members[i].member_status = (uint8)native_members[i].status;
+		}
+		result = cluster_multixact_current_validate_descriptor(
+			key, (uint16)cluster_node_id, (uint32)current_epoch, members,
+			(uint16)native_count, (uint32)native_count);
+		if (result == CMX_DESC_OK) {
+			*nmembers = (uint16)native_count;
+			*reported_total_members = (uint32)native_count;
+		}
+	}
+
+	if (native_members != NULL)
+		pfree(native_members);
+	if (result != CMX_DESC_OK && result != CMX_DESC_SUPPORTED_LIMIT) {
+		memset(members, 0, sizeof(*members) * members_cap);
+		*nmembers = 0;
+		*reported_total_members = 0;
+	}
+	return result;
 }
 
 
