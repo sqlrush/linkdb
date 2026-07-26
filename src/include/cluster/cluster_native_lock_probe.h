@@ -193,7 +193,8 @@ extern void cluster_lms_native_probe_recv_reply(uint64 probe_id, int32 sender_no
 extern void cluster_lms_native_probe_aggregate_and_resolve(uint32 slot_idx);
 extern void cluster_lms_native_probe_retry_tick(void);
 extern void cluster_lms_native_probe_cleanup_on_node_dead(int32 dead_node_id);
-extern void cluster_lms_native_probe_cleanup_on_backend_exit(int procno);
+extern void cluster_lms_native_probe_cleanup_on_backend_exit(int32 requester_node_id,
+															 int procno);
 extern bool cluster_lms_native_probe_wait_clear(const ClusterResId *resid, LOCKMODE lockmode,
 												const ClusterGrdHolderId *requester,
 												int timeout_ms);
@@ -207,6 +208,11 @@ extern bool cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, L
 													int32 source_node_id, uint32 request_opcode,
 													uint64 shard_master_generation,
 													LOCKMODE convert_current_mode);
+extern bool cluster_lms_native_probe_schedule_grant_identity(
+	const ClusterResId *resid, LOCKMODE lockmode,
+	const ClusterGrdHolderId *requester, int32 source_node_id,
+	uint32 request_opcode, uint64 shard_master_generation,
+	LOCKMODE convert_current_mode, ClusterGrdWaiterMeta waiter_meta);
 
 /* ============================================================
  * GUC defaults — actual values bound in cluster_guc.c (D9).
@@ -214,6 +220,10 @@ extern bool cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, L
 #define CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_INFLIGHT_DEFAULT 8
 #define CLUSTER_LMS_NATIVE_LOCK_PROBE_RETRY_INTERVAL_MS_DEFAULT 500
 #define CLUSTER_LMS_NATIVE_LOCK_PROBE_RETRY_BUDGET_DEFAULT 60
+#define CLUSTER_LMS_NATIVE_LOCK_PROBE_RETRY_BUDGET_MAX 3600
+/* Two-bit packed status and uint16 reply bitmaps support node_id 0..15.
+ * Higher configured ids are rejected fail-closed before any shift. */
+#define CLUSTER_LMS_NATIVE_LOCK_PROBE_NODE_BITMAP_BITS 16
 
 extern int cluster_lms_native_lock_probe_max_inflight;
 extern int cluster_lms_native_lock_probe_retry_interval_ms;

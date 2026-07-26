@@ -161,6 +161,12 @@ typedef struct ClusterLockAcquireRequest {
 	/* spec-5.3 D1: for CONVERT, the strongest already-held cluster-registered
 	 * mode on this locktag — the REDECLARE locator key sent to the master. */
 	LOCKMODE current_mode;
+	/*
+	 * S3-P0-10: for CONVERT, the pre-convert holder's request id (R_old).
+	 * request_id/holder.request_id are rebound to the convert reply id (R_new);
+	 * query-cancel rollback must restore this distinct old identity.
+	 */
+	uint64 convert_old_request_id;
 	/* DEFAULT_LOCKMETHOD / SHORT_LOCKMETHOD / cluster-aware class */
 	int lockmethod_id;
 	/* true → S4 immediate ConditionalLock semantic (no wait) */
@@ -306,6 +312,14 @@ cluster_lock_acquire_s5_promote_holder(const ClusterLockAcquireRequest *req);
  */
 extern ClusterLockAcquireResult
 cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req);
+
+/*
+ * ResourceOwner/error-unwind S6 variant.  Returned failure leaves ownership
+ * of the exact request with the caller; ordinary ERROR and outbound cleanup
+ * queue exhaustion do not escape this entry.
+ */
+extern ClusterLockAcquireResult
+cluster_lock_acquire_s6_release_nothrow(const ClusterLockAcquireRequest *req);
 
 /*
  * S7 cleanup:error/timeout 路径 rollback intent + remove reservation +

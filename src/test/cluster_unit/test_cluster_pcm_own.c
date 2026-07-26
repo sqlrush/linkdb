@@ -90,6 +90,89 @@ assert_writer_activation(uint64 token)
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[0].writer_activation_token), token);
 }
 
+UT_TEST(test_pcm_x_retry_barrier_selector_rejects_other_vm_identity)
+{
+	RelFileLocator target_locator = {
+		.spcOid = 1663,
+		.dbOid = 5,
+		.relNumber = 16384,
+	};
+	RelFileLocator other_locator = {
+		.spcOid = 1663,
+		.dbOid = 5,
+		.relNumber = 16385,
+	};
+	BufferTag target;
+	BufferTag same;
+	BufferTag other_relation;
+	BufferTag other_block;
+
+	InitBufferTag(&target, &target_locator, VISIBILITYMAP_FORKNUM, 0);
+	InitBufferTag(&same, &target_locator, VISIBILITYMAP_FORKNUM, 0);
+	InitBufferTag(&other_relation, &other_locator, VISIBILITYMAP_FORKNUM, 0);
+	InitBufferTag(&other_block, &target_locator, VISIBILITYMAP_FORKNUM, 1);
+
+	UT_ASSERT(cluster_pcm_x_retry_barrier_target_matches(&target, &same));
+	UT_ASSERT(!cluster_pcm_x_retry_barrier_target_matches(&target, &other_relation));
+	UT_ASSERT(!cluster_pcm_x_retry_barrier_target_matches(&target, &other_block));
+}
+
+UT_TEST(test_pcm_x_retry_barrier_writer_deferred_window_source_contract)
+{
+	char *source = read_bufmgr_source();
+	const char *deferred = strstr(
+		source, "\ncluster_bufmgr_pcm_x_retry_barrier_note_deferred(");
+	const char *deferred_end =
+		deferred != NULL ? strstr(deferred + 1, "\nstatic ") : NULL;
+	const char *equality =
+		deferred != NULL
+			? strstr(deferred,
+					 "cluster_bufmgr_pcm_x_retry_barrier_evidence_equal(")
+			: NULL;
+	const char *snapshot =
+		deferred != NULL
+			? strstr(deferred,
+					 "cluster_bufmgr_pcm_x_retry_barrier_trace.deferred = *evidence")
+			: NULL;
+	const char *window =
+		deferred != NULL
+			? strstr(deferred,
+					 "cluster_bufmgr_pcm_x_retry_barrier_hold_writer_deferred_window(")
+			: NULL;
+	const char *helper = strstr(
+		source, "#ifdef USE_ASSERT_CHECKING\nstatic void\n"
+				"cluster_bufmgr_pcm_x_retry_barrier_hold_writer_deferred_window");
+	const char *helper_end =
+		helper != NULL ? strstr(helper + 1, "\n#endif") : NULL;
+	const char *latch =
+		helper != NULL ? strstr(helper, "WaitLatch(MyLatch") : NULL;
+	const char *writer_lane =
+		helper != NULL
+			? strstr(helper, "CLUSTER_BUFMGR_PCM_X_BARRIER_LANE_WRITER")
+			: NULL;
+	const char *armed =
+		helper != NULL ? strstr(helper, "cluster_injection_is_armed(") : NULL;
+	const char *helper_pg_usleep =
+		helper != NULL ? strstr(helper, "pg_usleep(") : NULL;
+
+	/*
+	 * The live-ltag observation window is assertion-only and must occur
+	 * after the exact HIT identity becomes DEFERRED.  It uses a bounded
+	 * latch wait (never pg_usleep/hot-spin) and retains the one production
+	 * injection point.
+	 */
+	UT_ASSERT(deferred != NULL && deferred_end != NULL && equality != NULL
+			  && snapshot != NULL && window != NULL
+			  && equality < snapshot && snapshot < window && window < deferred_end
+			  && helper != NULL && helper_end != NULL
+			  && strstr(source, "CLUSTER_BUFMGR_PCM_X_BARRIER_MAX_HOLD_MS") != NULL
+			  && latch != NULL && latch < helper_end
+			  && writer_lane != NULL && writer_lane < helper_end
+			  && armed != NULL && armed < helper_end
+			  && (helper_pg_usleep == NULL || helper_pg_usleep >= helper_end));
+	free(source);
+}
+
 UT_TEST(test_shmem_initializes_complete_entry)
 {
 	int i;
@@ -102,7 +185,116 @@ UT_TEST(test_shmem_initializes_complete_entry)
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].reservation_token), 0);
 		UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterPcmOwnArray[i].writer_activation_token), 0);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmOwnArray[i].flags), 0);
+		UT_ASSERT_EQ(cluster_pcm_own_durability_generation_get(i), 1);
 	}
+}
+
+UT_TEST(test_durability_generation_is_saturating_and_never_wraps)
+{
+	uint32 generation = 0;
+
+	reset_fixture();
+	UT_ASSERT_EQ(cluster_pcm_own_durability_generation_advance(0, &generation),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(generation, 2);
+	UT_ASSERT_EQ(cluster_pcm_own_durability_generation_get(0), 2);
+
+	pg_atomic_write_u32(&ClusterPcmOwnArray[0].durability_generation, UINT32_MAX - 1);
+	UT_ASSERT_EQ(cluster_pcm_own_durability_generation_advance(0, &generation),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(generation, UINT32_MAX);
+	UT_ASSERT_EQ(cluster_pcm_own_durability_generation_advance(0, &generation),
+				 CLUSTER_PCM_OWN_EXHAUSTED);
+	UT_ASSERT_EQ(generation, UINT32_MAX);
+	UT_ASSERT_EQ(cluster_pcm_own_durability_generation_get(0), UINT32_MAX);
+
+	/* Zero is not a reusable first version after shmem initialization. */
+	pg_atomic_write_u32(&ClusterPcmOwnArray[0].durability_generation, 0);
+	UT_ASSERT_EQ(cluster_pcm_own_durability_generation_advance(0, &generation),
+				 CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(generation, 0);
+}
+
+UT_TEST(test_dirty_transitions_advance_durability_generation_under_header_lock)
+{
+	static const char *const dirty_contract[]
+		= { "LockBufHdr(bufHdr)",
+			"if (!(buf_state & BM_JUST_DIRTIED))",
+			"cluster_pcm_own_durability_generation_advance(bufHdr->buf_id",
+			"buf_state |= BM_DIRTY | BM_JUST_DIRTIED", "UnlockBufHdr(bufHdr, buf_state)" };
+	static const char *const hint_contract[]
+		= { "LockBufHdr(bufHdr)", "if (!(buf_state & BM_JUST_DIRTIED))",
+			"cluster_pcm_own_durability_generation_advance(bufHdr->buf_id",
+			"if (!(buf_state & BM_DIRTY))",
+			"buf_state |= BM_DIRTY | BM_JUST_DIRTIED", "UnlockBufHdr(bufHdr, buf_state)" };
+	char *source = read_bufmgr_source();
+
+	/* Exhaustion disables stale-X seal publication, never native dirtying:
+	 * both paths intentionally ignore the optimization result and still set
+	 * PostgreSQL's dirty/writeback flags under the same header-lock hold. */
+	assert_ordered_in_function(source, "\nMarkBufferDirty(Buffer buffer)",
+							   "\n/*\n * ReleaseAndReadBuffer", dirty_contract,
+							   lengthof(dirty_contract));
+	assert_ordered_in_function(source, "\nMarkBufferDirtyHint(Buffer buffer, bool buffer_std)",
+							   "\n/*\n * Release buffer content locks", hint_contract,
+							   lengthof(hint_contract));
+	free(source);
+}
+
+UT_TEST(test_flush_note_binds_exact_ownership_and_dirty_generations)
+{
+	static const char *const flush_contract[]
+		= { "durability_note.source_node_incarnation",
+			"durability_note.source_own_generation",
+			"cluster_pcm_own_durability_generation_get(buf->buf_id)",
+			"smgrwrite(",
+			"BufferTagsEqual(&buf->tag, &durability_note.tag)",
+			"== durability_note.source_own_generation",
+			"cluster_pcm_own_durability_note_matches(",
+			"(buf_state & BM_JUST_DIRTIED) != 0",
+			"cluster_gcs_block_pi_write_note(&durability_note)" };
+	char *source = read_bufmgr_source();
+
+	/* smgrwrite is only a write submission.  The note carries the exact
+	 * residency tuple into the later presync/ProcessSyncRequests/confirm
+	 * durability boundary; drift suppresses publication. */
+	assert_ordered_in_function(source, "\nFlushBuffer(",
+							   "\n/*\n * RelationGetNumberOfBlocksInFork",
+							   flush_contract, lengthof(flush_contract));
+	free(source);
+}
+
+UT_TEST(test_hint_redirty_during_flush_rejects_old_durability_note)
+{
+	uint32 captured_generation = 41;
+	uint32 live_generation = captured_generation;
+	bool just_dirtied = false;
+
+	/* FlushBuffer cleared JUST_DIRTIED and captured generation 41. */
+	UT_ASSERT(cluster_pcm_own_durability_note_matches(
+		captured_generation, live_generation, just_dirtied));
+
+	/* A concurrent hint dirties an already BM_DIRTY buffer.  The 0->1
+	 * JUST_DIRTIED edge advances generation even though BM_DIRTY stayed set. */
+	just_dirtied = true;
+	live_generation++;
+	UT_ASSERT(!cluster_pcm_own_durability_note_matches(
+		captured_generation, live_generation, just_dirtied));
+
+	/* Clearing JUST_DIRTIED after that write does not resurrect the old note:
+	 * the second flush must capture the new generation. */
+	just_dirtied = false;
+	UT_ASSERT(!cluster_pcm_own_durability_note_matches(
+		captured_generation, live_generation, just_dirtied));
+	captured_generation = live_generation;
+	UT_ASSERT(cluster_pcm_own_durability_note_matches(
+		captured_generation, live_generation, just_dirtied));
+
+	/* Exhausted/invalid evidence never publishes, while native dirtying is
+	 * deliberately outside this stale-X evidence predicate. */
+	UT_ASSERT(!cluster_pcm_own_durability_note_matches(0, 0, false));
+	UT_ASSERT(!cluster_pcm_own_durability_note_matches(
+		UINT32_MAX, UINT32_MAX, false));
 }
 
 UT_TEST(test_writer_activation_fence_blocks_revoke_until_exact_clear)
@@ -814,6 +1006,183 @@ UT_TEST(test_bufmgr_d5a_commitlocked_uses_locked_commit_and_saved_tag_release)
 	UT_ASSERT_NOT_NULL(strstr(source, "static bool\nInvalidateBufferCommitLocked"));
 	UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_lock_release_saved_tag_for_eviction"));
 	UT_ASSERT_NULL(strstr(source, "buf->tag = *oldTag"));
+	free(source);
+}
+
+UT_TEST(test_pi_discard_is_bounded_typed_and_shadow_identity_exact)
+{
+	char *source = read_bufmgr_source();
+	const char *discard = strstr(source,
+		"\ncluster_bufmgr_discard_pi_block(");
+	const char *discard_end = discard != NULL
+		? strstr(discard, "\n/* ========================================================================")
+		: NULL;
+	const char *pi_try = strstr(source, "\nInvalidatePiBufferTry(");
+	const char *pi_try_end = pi_try != NULL
+		? strstr(pi_try, "\n/*\n * Helper routine for GetVictimBuffer()")
+		: NULL;
+	const char *classifier = strstr(source,
+		"\ncluster_bufmgr_pi_discard_classify_locked(");
+	const char *classifier_end = classifier != NULL
+		? strstr(classifier, "\n/*\n * InvalidatePiBufferCommitLocked")
+		: NULL;
+	const char *pi_commit = strstr(source,
+		"\nInvalidatePiBufferCommitLocked(");
+	const char *pi_commit_end = pi_commit != NULL
+		? strstr(pi_commit, "\n/*\n * InvalidatePiBufferTry")
+		: NULL;
+	const char *mapping_x;
+	const char *header_recheck;
+	const char *shape_recheck;
+	const char *refcount_recheck;
+	const char *ownership_snapshot;
+	const char *ownership_commit;
+	const char *policy_call;
+	const char *commit_call;
+	const char *commit_plan;
+	const char *commit_failure;
+	const char *shadow_clear;
+	const char *commit_tail;
+
+	/*
+	 * PI_DISCARD runs in an LMS DATA pump.  Its zero-refcount entry check is
+	 * not authority after the header lock is dropped: a backend can pin in
+	 * that window.  The final attempt must therefore be the bounded Try
+	 * variant, return a typed RETRYABLE_BUSY, and preserve every byte of the
+	 * still-resident PI (including its recovery shadow) on refusal.
+	 *
+	 * Conversely, clearing the shadow after Try returns would race buf_id
+	 * reuse.  The clear belongs only in the successful final
+	 * mapping-X/header identity epoch, after tag/type/valid/refcount/PCM
+	 * revalidation and before the mapping commit.
+	 */
+	UT_ASSERT_NOT_NULL(strstr(source, "ClusterBufmgrPiDiscardResult"));
+	UT_ASSERT_NOT_NULL(strstr(source, "CLUSTER_BUFMGR_PI_DISCARD_DROPPED"));
+	UT_ASSERT_NOT_NULL(strstr(source, "CLUSTER_BUFMGR_PI_DISCARD_RETRYABLE_BUSY"));
+	UT_ASSERT_NOT_NULL(discard);
+	UT_ASSERT_NOT_NULL(discard_end);
+	UT_ASSERT_NOT_NULL(pi_try);
+	UT_ASSERT_NOT_NULL(pi_try_end);
+	UT_ASSERT_NOT_NULL(classifier);
+	UT_ASSERT_NOT_NULL(classifier_end);
+	UT_ASSERT_NOT_NULL(pi_commit);
+	UT_ASSERT_NOT_NULL(pi_commit_end);
+	if (discard == NULL || discard_end == NULL || pi_try == NULL
+		|| pi_try_end == NULL || classifier == NULL || classifier_end == NULL
+		|| pi_commit == NULL || pi_commit_end == NULL)
+	{
+		free(source);
+		return;
+	}
+
+	UT_ASSERT_NOT_NULL(strstr(discard, "InvalidatePiBufferTry("));
+	UT_ASSERT(strstr(discard, "InvalidatePiBufferTry(") < discard_end);
+	UT_ASSERT(strstr(discard, "InvalidateBuffer(buf)") == NULL
+			  || strstr(discard, "InvalidateBuffer(buf)") >= discard_end);
+	UT_ASSERT_NOT_NULL(strstr(discard,
+		"cluster_bufmgr_pi_discard_classify_locked("));
+	UT_ASSERT_NOT_NULL(strstr(discard, "return entry_result;"));
+
+	shape_recheck = strstr(classifier, "shape.tag_matches = BufferTagsEqual(");
+	refcount_recheck = shape_recheck != NULL
+		? strstr(shape_recheck, "shape.refcount = BUF_STATE_GET_REFCOUNT(buf_state)")
+		: NULL;
+	ownership_snapshot = refcount_recheck != NULL
+		? strstr(refcount_recheck, "cluster_pcm_own_snapshot_locked(")
+		: NULL;
+	policy_call = ownership_snapshot != NULL
+		? strstr(ownership_snapshot, "cluster_pi_discard_classify_locked(&shape)")
+		: NULL;
+	UT_ASSERT_NOT_NULL(shape_recheck);
+	UT_ASSERT_NOT_NULL(refcount_recheck);
+	UT_ASSERT_NOT_NULL(ownership_snapshot);
+	UT_ASSERT_NOT_NULL(policy_call);
+	if (shape_recheck != NULL && refcount_recheck != NULL
+		&& ownership_snapshot != NULL && policy_call != NULL)
+		UT_ASSERT(classifier < shape_recheck
+				  && shape_recheck < refcount_recheck
+				  && refcount_recheck < ownership_snapshot
+				  && ownership_snapshot < policy_call
+				  && policy_call < classifier_end);
+
+	mapping_x = strstr(pi_try, "LWLockAcquire(oldPartitionLock, LW_EXCLUSIVE)");
+	header_recheck = mapping_x != NULL ? strstr(mapping_x, "LockBufHdr(buf)") : NULL;
+	shape_recheck = header_recheck != NULL
+		? strstr(header_recheck, "cluster_bufmgr_pi_discard_classify_locked(")
+		: NULL;
+	refcount_recheck = shape_recheck != NULL
+		? strstr(shape_recheck,
+				 "result != CLUSTER_BUFMGR_PI_DISCARD_DROPPED")
+		: NULL;
+	commit_call = refcount_recheck != NULL
+		? strstr(refcount_recheck, "InvalidatePiBufferCommitLocked(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(mapping_x);
+	UT_ASSERT_NOT_NULL(header_recheck);
+	UT_ASSERT_NOT_NULL(shape_recheck);
+	UT_ASSERT_NOT_NULL(refcount_recheck);
+	UT_ASSERT_NOT_NULL(commit_call);
+	if (mapping_x != NULL && header_recheck != NULL && shape_recheck != NULL
+		&& refcount_recheck != NULL && commit_call != NULL)
+		UT_ASSERT(pi_try < mapping_x && mapping_x < header_recheck
+				  && header_recheck < shape_recheck
+				  && shape_recheck < refcount_recheck
+				  && refcount_recheck < commit_call && commit_call < pi_try_end);
+
+	/*
+	 * A legal PI is !BM_VALID and cannot pass the generic CURRENT stale-X
+	 * release gate.  The PI-only commit must retain D5a descriptor ABA by
+	 * capture + exact ownership eviction under this same header epoch, but
+	 * must not invoke stale-X preparation.  Only ownership OK can clear the
+	 * shadow and run the irreversible common tail.  BUSY returns retryable;
+	 * every other ownership refusal returns CORRUPT/fail-closed.
+	 */
+	if (pi_commit != NULL && pi_commit_end != NULL)
+	{
+		ownership_snapshot = strstr(pi_commit,
+			"cluster_pcm_own_eviction_capture_locked(");
+		ownership_commit = ownership_snapshot != NULL
+			? strstr(ownership_snapshot,
+					 "cluster_pcm_own_eviction_commit_locked(")
+			: NULL;
+		commit_plan = ownership_commit != NULL
+			? strstr(ownership_commit, "cluster_pi_discard_commit_plan(")
+			: NULL;
+		commit_failure = commit_plan != NULL
+			? strstr(commit_plan,
+					 "plan.result != CLUSTER_BUFMGR_PI_DISCARD_DROPPED")
+			: NULL;
+		shadow_clear = commit_failure != NULL
+			? strstr(commit_failure,
+					 "cluster_pi_shadow_clear(buf->buf_id)")
+			: NULL;
+		commit_tail = shadow_clear != NULL
+			? strstr(shadow_clear,
+					 "InvalidateBufferCommitTailLocked(")
+			: NULL;
+		UT_ASSERT_NOT_NULL(ownership_snapshot);
+		UT_ASSERT_NOT_NULL(ownership_commit);
+		UT_ASSERT_NOT_NULL(commit_plan);
+		UT_ASSERT_NOT_NULL(commit_failure);
+		UT_ASSERT_NOT_NULL(shadow_clear);
+		UT_ASSERT_NOT_NULL(commit_tail);
+		UT_ASSERT(strstr(pi_commit,
+			"cluster_bufmgr_stale_x_release_prepare_locked(") == NULL
+			|| strstr(pi_commit,
+				"cluster_bufmgr_stale_x_release_prepare_locked(")
+				   >= pi_commit_end);
+		if (ownership_snapshot != NULL && ownership_commit != NULL
+			&& commit_plan != NULL && commit_failure != NULL
+			&& shadow_clear != NULL && commit_tail != NULL)
+			UT_ASSERT(pi_commit < ownership_snapshot
+					  && ownership_snapshot < ownership_commit
+					  && ownership_commit < commit_plan
+					  && commit_plan < commit_failure
+					  && commit_failure < shadow_clear
+					  && shadow_clear < commit_tail
+					  && commit_tail < pi_commit_end);
+	}
+
 	free(source);
 }
 
@@ -2022,11 +2391,13 @@ UT_TEST(test_granted_pending_holder_barrier_restarts_before_wait)
 			"cluster_pcm_x_holder_register_retry_action(",
 			"cluster_bufmgr_pcm_x_holder_retry_wait(" };
 	static const char *const restart_contract[]
-		= { "pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf,",
-			"pcm_pending_set, &pcm_pending_barrier",
+		= { "pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(",
+			"buf, prepare_outcome, *pcm_pending_set, &pcm_pending_barrier",
+			"CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED",
 			"if (!pcm_pending_barrier)",
-			"pcm_pending_set = false",
-			"pcm_acquired = false",
+			"cluster_pcm_lock_release_buffer_for_eviction(buf, pcm_mode)",
+			"*pcm_acquired = false",
+			"*pcm_pending_set = false",
 			"cluster_bufmgr_pcm_retry_denied_rearm(",
 			"cluster_pcm_lock_acquire_buffer(buf, pcm_mode" };
 	static const char *const lockbuffer_contract[]
@@ -2053,6 +2424,107 @@ UT_TEST(test_granted_pending_holder_barrier_restarts_before_wait)
 		"\n/*\n * Acquire the content_lock for the buffer, but only if we don't have to wait.",
 		lockbuffer_contract, lengthof(lockbuffer_contract));
 	free(source);
+}
+
+UT_TEST(test_granted_pending_holder_barrier_releases_completed_pcm_attempt_before_rearm)
+{
+	static const char *const release_contract[]
+		= { "Assert(*pcm_pending_set)",
+			"cluster_pcm_x_pending_holder_barrier_action(",
+			"CLUSTER_PCM_X_PENDING_HOLDER_FAIL_CLOSED",
+			"ereport(ERROR",
+			"CLUSTER_PCM_X_PENDING_HOLDER_RELEASE_RETRY",
+			"cluster_pcm_lock_release_buffer_for_eviction(buf, pcm_mode)",
+			"*pcm_acquired = false",
+			"*pcm_pending_set = false",
+			"cluster_bufmgr_pcm_retry_denied_rearm(",
+			"cluster_pcm_lock_acquire_buffer(buf, pcm_mode" };
+	char *source = read_bufmgr_source();
+	const char *helper;
+	const char *helper_end;
+
+	/*
+	 * T400-P0-21 residual: holder publication can refuse after either a durable
+	 * S/X grant or a legal one-shot S READ_IMAGE.  The three-state classifier
+	 * must reject an impossible X/no-grant shape, release only a completed
+	 * durable grant, and let S/no-grant exact-abort/rearm without releasing a
+	 * grant that does not exist.  The same pending snapshot/token must reach
+	 * rearm, and the branch must not introduce a new interrupt holdoff scope.
+	 */
+	assert_ordered_in_function(
+		source, "\ncluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(", "\nstatic ",
+		release_contract, lengthof(release_contract));
+	helper = strstr(
+		source, "\ncluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(");
+	helper_end = helper != NULL ? strstr(helper + 1, "\nstatic ") : NULL;
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(helper_end);
+	if (helper != NULL && helper_end != NULL)
+	{
+		const char *legacy_assert = strstr(helper, "Assert(*pcm_acquired)");
+		const char *hold = strstr(helper, "HOLD_INTERRUPTS");
+		const char *resume = strstr(helper, "RESUME_INTERRUPTS");
+
+		UT_ASSERT(legacy_assert == NULL || legacy_assert >= helper_end);
+		UT_ASSERT(hold == NULL || hold >= helper_end);
+		UT_ASSERT(resume == NULL || resume >= helper_end);
+	}
+	free(source);
+}
+
+UT_TEST(test_pending_holder_barrier_acquire_outcome_is_three_state)
+{
+	typedef ClusterPcmXPendingHolderBarrierAction (*ActionFn)(
+		uint8, bool, bool);
+	ClusterPcmOwnSnapshot owner_identity;
+	ClusterPcmOwnSnapshot owner_before;
+	uint64 pending_token = UINT64CONST(0x1122334455667788);
+	uint64 token_before = pending_token;
+	int interrupt_holdoff = 7;
+	int holdoff_before = interrupt_holdoff;
+
+	memset(&owner_identity, 0x5A, sizeof(owner_identity));
+	owner_before = owner_identity;
+
+	UT_ASSERT(__builtin_types_compatible_p(
+		__typeof__(&cluster_pcm_x_pending_holder_barrier_action), ActionFn));
+
+	/* Legal one-shot read: no durable grant exists, so release is forbidden. */
+	UT_ASSERT_EQ(
+		cluster_pcm_x_pending_holder_barrier_action(
+			PCM_LOCK_MODE_S, false, true),
+		CLUSTER_PCM_X_PENDING_HOLDER_READ_IMAGE_RETRY);
+
+	/* A writer may not treat a non-durable read image as an X grant. */
+	UT_ASSERT_EQ(
+		cluster_pcm_x_pending_holder_barrier_action(
+			PCM_LOCK_MODE_X, false, true),
+		CLUSTER_PCM_X_PENDING_HOLDER_FAIL_CLOSED);
+
+	/* Both real durable modes owe exactly one release before retry. */
+	UT_ASSERT_EQ(
+		cluster_pcm_x_pending_holder_barrier_action(
+			PCM_LOCK_MODE_S, true, true),
+		CLUSTER_PCM_X_PENDING_HOLDER_RELEASE_RETRY);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_pending_holder_barrier_action(
+			PCM_LOCK_MODE_X, true, true),
+		CLUSTER_PCM_X_PENDING_HOLDER_RELEASE_RETRY);
+
+	/* A barrier restart without the exact pending identity is contradictory. */
+	UT_ASSERT_EQ(
+		cluster_pcm_x_pending_holder_barrier_action(
+			PCM_LOCK_MODE_S, false, false),
+		CLUSTER_PCM_X_PENDING_HOLDER_FAIL_CLOSED);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_pending_holder_barrier_action(
+			PCM_LOCK_MODE_X, true, false),
+		CLUSTER_PCM_X_PENDING_HOLDER_FAIL_CLOSED);
+
+	/* The scalar-only classifier cannot mutate owner identity, token, or holdoff. */
+	UT_ASSERT_EQ(memcmp(&owner_identity, &owner_before, sizeof(owner_identity)), 0);
+	UT_ASSERT_EQ(pending_token, token_before);
+	UT_ASSERT_EQ(interrupt_holdoff, holdoff_before);
 }
 
 UT_TEST(test_bufmgr_pcm_x_holder_reuse_and_deferred_failure_are_fail_closed)
@@ -2189,6 +2661,9 @@ UT_TEST(test_queue_passive_pinned_s_release_serializes_bytes_and_ownership)
 			"BM_IO_ERROR",
 			"cluster_bufmgr_unpin_for_gcs" };
 	char *source = read_bufmgr_source();
+	const char *release;
+	const char *release_end;
+	const char *zero_ref_stale;
 
 	UT_ASSERT(__builtin_types_compatible_p(
 		__typeof__(&cluster_bufmgr_pcm_own_release_pinned_s_for_gcs), PassiveReleaseFn));
@@ -2196,6 +2671,18 @@ UT_TEST(test_queue_passive_pinned_s_release_serializes_bytes_and_ownership)
 		source, "\ncluster_bufmgr_pcm_own_release_pinned_s_for_gcs(",
 		"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_publish_installed_x_image(",
 		release_contract, lengthof(release_contract));
+	release = strstr(source, "\ncluster_bufmgr_pcm_own_release_pinned_s_for_gcs(");
+	release_end
+		= release != NULL
+			  ? strstr(release,
+					   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_publish_installed_x_image(")
+			  : NULL;
+	zero_ref_stale
+		= release != NULL ? strstr(release, "else if (shared_refcount == 0)") : NULL;
+	UT_ASSERT_NOT_NULL(release);
+	UT_ASSERT_NOT_NULL(release_end);
+	if (release != NULL && release_end != NULL)
+		UT_ASSERT(zero_ref_stale == NULL || zero_ref_stale >= release_end);
 	free(source);
 }
 
@@ -2579,13 +3066,13 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 		= { "pcm_x_writer_managed = pcm_x_writer != NULL",
 			"cluster_bufmgr_pcm_x_writer_mark_releasing(pcm_x_writer)",
 			"LWLockRelease(BufferDescriptorGetContentLock(buf))",
-			"cluster_bufmgr_pcm_x_writer_release(pcm_x_writer)",
+			"cluster_bufmgr_pcm_x_writer_release(",
 			"cluster_bufmgr_pcm_x_holder_unregister(pcm_x_holder)",
 			"cluster_pcm_x_should_release_legacy_on_unlock(",
 			"cluster_pcm_lock_unlock_content_buffer(buf, old_mode)" };
 	static const char *const acquire_contract[]
 		= { "pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(",
-			"pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,",
+			"pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(",
 			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer)" };
@@ -2961,11 +3448,375 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 	free(source);
 }
 
+UT_TEST(test_stale_x_release_journal_orders_normal_eviction_before_mapping_unlock)
+{
+	static const char *const prepare_and_commit_contract[]
+		= { "cluster_bufmgr_stale_x_release_prepare_locked(",
+			"cluster_bufmgr_stale_x_release_begin_commit_locked(",
+			"cluster_pcm_own_eviction_commit_locked(",
+			"InvalidateBufferCommitTailLocked" };
+	static const char *const mapping_and_ack_contract[]
+		= { "ClearBufferTag(&buf->tag)",
+			"BufTableDelete(oldTag, oldHash)",
+			"cluster_bufmgr_stale_x_release_mark_released(",
+			"LWLockRelease(oldPartitionLock)",
+			"cluster_pcm_lock_release_saved_tag_for_eviction",
+			"cluster_bufmgr_stale_x_release_finish_ack(",
+			"StrategyFreeBuffer(buf)" };
+	char *source = read_bufmgr_source();
+
+	/*
+	 * The journal is the crash bridge for the interval in which local X has
+	 * become unreachable but the remote master has not yet ACKed X->N.  Its
+	 * COMMITTING record must therefore exist before the ownership bump, and
+	 * RELEASED must be published after BufTableDelete but while mapping X is
+	 * still held.  Only the exact remote ACK may forget the terminal record.
+	 */
+	assert_ordered_in_function(source, "\nInvalidateBufferCommitLocked(",
+							   "\n/*\n * InvalidateBufferCommitTailLocked",
+							   prepare_and_commit_contract,
+							   lengthof(prepare_and_commit_contract));
+	assert_ordered_in_function(source, "\nInvalidateBufferCommitTailLocked(",
+							   "\n/*\n * InvalidateBufferTry",
+							   mapping_and_ack_contract,
+							   lengthof(mapping_and_ack_contract));
+	free(source);
+}
+
+UT_TEST(test_stale_x_release_journal_orders_victim_eviction_without_tag_restore)
+{
+	static const char *const victim_contract[]
+		= { "cluster_bufmgr_stale_x_release_prepare_locked(",
+			"cluster_bufmgr_stale_x_release_begin_commit_locked(",
+			"cluster_pcm_own_eviction_commit_locked(",
+			"ClearBufferTag(&buf_hdr->tag)",
+			"BufTableDelete(&tag, hash)",
+			"cluster_bufmgr_stale_x_release_mark_released(",
+			"LWLockRelease(partition_lock)",
+			"cluster_pcm_lock_release_saved_tag_for_eviction",
+			"cluster_bufmgr_stale_x_release_finish_ack(" };
+	char *source = read_bufmgr_source();
+	const char *victim = strstr(source, "\nInvalidateVictimBuffer(");
+	const char *victim_end = strstr(source, "\nstatic Buffer\nGetVictimBuffer(");
+
+	/*
+	 * The clock-sweep path used to clear the tag, restore it without header
+	 * authority solely for the release helper, then delete the mapping.  That
+	 * creates both a tag ABA and an unjournaled backend-crash interval.  The
+	 * refactored path uses the immutable saved tag and the same exact journal
+	 * order as relation/drop invalidation.
+	 */
+	assert_ordered_in_function(source, "\nInvalidateVictimBuffer(",
+							   "\nstatic Buffer\nGetVictimBuffer(",
+							   victim_contract, lengthof(victim_contract));
+	UT_ASSERT_NOT_NULL(victim);
+	UT_ASSERT_NOT_NULL(victim_end);
+	if (victim != NULL && victim_end != NULL)
+		UT_ASSERT(strstr(victim, "buf_hdr->tag = tag") == NULL
+				  || strstr(victim, "buf_hdr->tag = tag") >= victim_end);
+	free(source);
+}
+
+UT_TEST(test_stale_x_release_bypasses_inactive_pcm_before_ownership_state)
+{
+	char *source = read_bufmgr_source();
+	const char *commit = strstr(source, "\nInvalidateBufferCommitLocked(");
+	const char *commit_end = strstr(source, "\n/*\n * InvalidateBufferCommitTailLocked");
+	const char *victim = strstr(source, "\nInvalidateVictimBuffer(");
+	const char *victim_end = strstr(source, "\nstatic Buffer\nGetVictimBuffer(");
+	const char *commit_gate;
+	const char *commit_capture;
+	const char *victim_gate;
+	const char *victim_capture;
+
+	UT_ASSERT_NOT_NULL(commit);
+	UT_ASSERT_NOT_NULL(commit_end);
+	UT_ASSERT_NOT_NULL(victim);
+	UT_ASSERT_NOT_NULL(victim_end);
+	if (commit == NULL || commit_end == NULL || victim == NULL || victim_end == NULL)
+	{
+		free(source);
+		return;
+	}
+
+	/*
+	 * The ownership array and stale-X journals do not exist as eviction
+	 * authority before PCM is active.  In particular, a cluster-capable
+	 * binary running cluster.enabled=off must retain PostgreSQL's native
+	 * victim progress once shared_buffers fills.  Both descriptor-reuse
+	 * commit sites therefore have to branch around the complete ownership
+	 * transaction before even capturing its generation-zero placeholder.
+	 */
+	commit_gate = strstr(commit, "if (cluster_pcm_is_active())");
+	commit_capture = strstr(commit, "cluster_pcm_own_eviction_capture_locked(");
+	victim_gate = strstr(victim, "if (cluster_pcm_is_active())");
+	victim_capture = strstr(victim, "cluster_pcm_own_eviction_capture_locked(");
+	UT_ASSERT_NOT_NULL(commit_gate);
+	UT_ASSERT_NOT_NULL(commit_capture);
+	UT_ASSERT_NOT_NULL(victim_gate);
+	UT_ASSERT_NOT_NULL(victim_capture);
+	if (commit_gate != NULL && commit_capture != NULL)
+		UT_ASSERT(commit_gate < commit_capture && commit_capture < commit_end);
+	if (victim_gate != NULL && victim_capture != NULL)
+		UT_ASSERT(victim_gate < victim_capture && victim_capture < victim_end);
+
+	free(source);
+}
+
+UT_TEST(test_bufmgr_pcm_x_barrier_policy_is_intent_typed)
+{
+	UT_ASSERT_EQ(cluster_pcm_x_retry_wait_classify(PCM_X_QUEUE_OK),
+				 CLUSTER_BUFMGR_PCM_X_RETRY_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_retry_wait_classify(PCM_X_QUEUE_BARRIER_CLOSED),
+				 CLUSTER_BUFMGR_PCM_X_RETRY_BARRIER_REFUSED);
+	UT_ASSERT_EQ(cluster_pcm_x_retry_wait_classify(PCM_X_QUEUE_BAD_STATE),
+				 CLUSTER_BUFMGR_PCM_X_RETRY_FAIL_CLOSED);
+	UT_ASSERT_EQ(cluster_pcm_x_retry_wait_classify(PCM_X_QUEUE_CORRUPT),
+				 CLUSTER_BUFMGR_PCM_X_RETRY_FAIL_CLOSED);
+	UT_ASSERT_EQ(cluster_pcm_x_barrier_ledger_outcome(
+					 CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP),
+				 CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP_DEFERRED);
+	UT_ASSERT_EQ(cluster_pcm_x_barrier_ledger_outcome(
+					 CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REUSE),
+				 CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED);
+}
+
+UT_TEST(test_bufmgr_pcm_x_holder_prepare_refusal_precedes_reuse)
+{
+	char *source = read_bufmgr_source();
+	const char *prepare = strstr(source, "\ncluster_bufmgr_pcm_x_holder_prepare(");
+	const char *prepare_end = prepare != NULL ? strstr(prepare, "\nstatic ") : NULL;
+	const char *same_drain;
+	const char *same_refusal;
+	const char *same_return;
+	const char *same_reuse;
+	const char *candidate_drain;
+	const char *candidate_refusal;
+	const char *candidate_return;
+	const char *candidate_reuse;
+	const char *new_identity;
+
+	UT_ASSERT_NOT_NULL(prepare);
+	UT_ASSERT_NOT_NULL(prepare_end);
+	if (prepare == NULL || prepare_end == NULL)
+	{
+		free(source);
+		return;
+	}
+
+	/* Mutation caught: ignoring a same-buffer PREPARE_REFUSED would discard
+	 * the old exact handle before allocating a second ledger identity. */
+	same_drain = strstr(prepare,
+						"cluster_bufmgr_pcm_x_holder_drain_deferred(entry)");
+	same_refusal = same_drain != NULL
+					   ? strstr(same_drain,
+								"CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED")
+					   : NULL;
+	same_return = same_refusal != NULL ? strstr(same_refusal, "return NULL;") : NULL;
+	same_reuse = same_drain != NULL ? strstr(same_drain, "entry = NULL;") : NULL;
+	UT_ASSERT_NOT_NULL(same_drain);
+	UT_ASSERT_NOT_NULL(same_refusal);
+	UT_ASSERT_NOT_NULL(same_return);
+	UT_ASSERT_NOT_NULL(same_reuse);
+	if (same_drain != NULL && same_refusal != NULL && same_return != NULL
+		&& same_reuse != NULL)
+		UT_ASSERT(same_drain < same_refusal && same_refusal < same_return
+				  && same_return < same_reuse && same_reuse < prepare_end);
+
+	/* Mutation caught: a full-ledger candidate cannot be overwritten until
+	 * its exact deferred handle reaches terminal completion. */
+	candidate_drain = strstr(prepare,
+							 "cluster_bufmgr_pcm_x_holder_drain_deferred(candidate)");
+	candidate_refusal = candidate_drain != NULL
+							? strstr(candidate_drain,
+									 "CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED")
+							: NULL;
+	candidate_return = candidate_refusal != NULL
+						   ? strstr(candidate_refusal, "return NULL;")
+						   : NULL;
+	candidate_reuse = candidate_drain != NULL
+						  ? strstr(candidate_drain, "entry = candidate;")
+						  : NULL;
+	new_identity = candidate_drain != NULL ? strstr(candidate_drain, "MemSet(&key") : NULL;
+	UT_ASSERT_NOT_NULL(candidate_drain);
+	UT_ASSERT_NOT_NULL(candidate_refusal);
+	UT_ASSERT_NOT_NULL(candidate_return);
+	UT_ASSERT_NOT_NULL(candidate_reuse);
+	UT_ASSERT_NOT_NULL(new_identity);
+	if (candidate_drain != NULL && candidate_refusal != NULL && candidate_return != NULL
+		&& candidate_reuse != NULL && new_identity != NULL)
+		UT_ASSERT(candidate_drain < candidate_refusal && candidate_refusal < candidate_return
+				  && candidate_return < candidate_reuse && candidate_reuse < new_identity
+				  && new_identity < prepare_end);
+
+	free(source);
+}
+
+UT_TEST(test_bufmgr_pcm_x_cleanup_barrier_defers_without_reporting)
+{
+	static const char *const retry_contract[] = {
+		"wait_outcome = cluster_pcm_x_retry_wait_classify(guard_result)",
+		"CLUSTER_BUFMGR_PCM_X_RETRY_BARRIER_REFUSED",
+		"cluster_pcm_x_stats_note_barrier_unwind()",
+		"return wait_outcome",
+		"CLUSTER_BUFMGR_PCM_X_RETRY_FAIL_CLOSED",
+		"cluster_bufmgr_pcm_x_holder_report_failure(",
+		"WaitLatch(MyLatch"
+	};
+	static const char *const holder_contract[] = {
+		"wait_outcome = cluster_bufmgr_pcm_x_holder_retry_wait(",
+		"CLUSTER_BUFMGR_PCM_X_RETRY_BARRIER_REFUSED",
+		"entry->phase = PCM_X_HOLDER_LEDGER_DEFERRED",
+		"return CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP_DEFERRED",
+		"waits_used++"
+	};
+	static const char *const writer_contract[] = {
+		"wait_outcome = cluster_bufmgr_pcm_x_holder_retry_wait(",
+		"CLUSTER_BUFMGR_PCM_X_RETRY_BARRIER_REFUSED",
+		"ledger_outcome = cluster_pcm_x_barrier_ledger_outcome(intent)",
+		"CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP_DEFERRED",
+		"entry->phase = PCM_X_WRITER_LEDGER_DEFERRED",
+		"return ledger_outcome",
+		"waits_used++"
+	};
+	char *source = read_bufmgr_source();
+
+	/*
+	 * Mutation caught: cleanup must consume the typed retry verdict and
+	 * retain exact local evidence.  Reintroducing a NULL bool sink would
+	 * route BARRIER_CLOSED through report_failure and make UNLOCK a client
+	 * ERROR; incrementing the retry index first would also fake a wait.
+	 */
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_holder_retry_wait(",
+							   "\n/*", retry_contract, lengthof(retry_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_holder_unregister(",
+							   "\nstatic ", holder_contract, lengthof(holder_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_writer_release(",
+							   "\nstatic ", writer_contract, lengthof(writer_contract));
+	UT_ASSERT_NOT_NULL(strstr(source,
+		"pcm_x_writer, CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP"));
+	free(source);
+}
+
+UT_TEST(test_bufmgr_pcm_x_writer_prepare_refusal_precedes_claim_and_revalidate_aborts)
+{
+	char *source = read_bufmgr_source();
+	const char *writer_prepare
+		= strstr(source, "\ncluster_bufmgr_pcm_x_writer_prepare(");
+	const char *writer_prepare_end
+		= writer_prepare != NULL ? strstr(writer_prepare, "\nstatic ") : NULL;
+	const char *release;
+	const char *refusal;
+	const char *refusal_return;
+	const char *reuse;
+	const char *free_entry;
+	const char *handoff;
+	const char *acquire;
+	const char *lockbuffer = strstr(source, "\nLockBufferInternal(Buffer buffer, int mode");
+	const char *lockbuffer_end
+		= lockbuffer != NULL
+			  ? strstr(lockbuffer,
+					   "\n/*\n * Acquire the content_lock for the buffer, but only if we don't have to wait.")
+			  : NULL;
+	const char *stale;
+	const char *p4;
+	const char *p4_outcome;
+	const char *p4_refusal;
+	const char *p4_abort;
+	const char *p4_reacquire;
+	const char *p4_activate;
+
+	UT_ASSERT_NOT_NULL(writer_prepare);
+	UT_ASSERT_NOT_NULL(writer_prepare_end);
+	if (writer_prepare != NULL && writer_prepare_end != NULL)
+	{
+		release = strstr(writer_prepare,
+						 "cluster_bufmgr_pcm_x_writer_release(\n"
+						 "\t\t\tentry, CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REUSE)");
+		refusal = release != NULL
+					  ? strstr(release,
+							   "CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED")
+					  : NULL;
+		refusal_return = refusal != NULL ? strstr(refusal, "return NULL;") : NULL;
+		reuse = release != NULL ? strstr(release, "entry = NULL;") : NULL;
+		free_entry = release != NULL
+						 ? strstr(release, "cluster_bufmgr_pcm_x_writer_free_entry()")
+						 : NULL;
+		handoff = release != NULL
+					  ? strstr(release, "entry->phase = PCM_X_WRITER_LEDGER_HANDOFF")
+					  : NULL;
+		acquire = release != NULL
+					  ? strstr(release, "cluster_gcs_pcm_x_acquire_writer(")
+					  : NULL;
+		UT_ASSERT_NOT_NULL(release);
+		UT_ASSERT_NOT_NULL(refusal);
+		UT_ASSERT_NOT_NULL(refusal_return);
+		UT_ASSERT_NOT_NULL(reuse);
+		UT_ASSERT_NOT_NULL(free_entry);
+		UT_ASSERT_NOT_NULL(handoff);
+		UT_ASSERT_NOT_NULL(acquire);
+		if (release != NULL && refusal != NULL && refusal_return != NULL && reuse != NULL
+			&& free_entry != NULL && handoff != NULL && acquire != NULL)
+			UT_ASSERT(release < refusal && refusal < refusal_return
+					  && refusal_return < reuse && reuse < free_entry
+					  && free_entry < handoff && handoff < acquire
+					  && acquire < writer_prepare_end);
+	}
+
+	UT_ASSERT_NOT_NULL(lockbuffer);
+	UT_ASSERT_NOT_NULL(lockbuffer_end);
+	if (lockbuffer != NULL && lockbuffer_end != NULL)
+	{
+		stale = strstr(lockbuffer, "cluster_pcm_note_writer_cover_stale_detected();");
+		p4 = stale != NULL
+				 ? strstr(stale,
+						  "cluster_bufmgr_pcm_x_holder_prepare_with_pending_retry(")
+				 : NULL;
+		p4_outcome = p4 != NULL ? strstr(p4, "&pcm_x_prepare_outcome") : NULL;
+		p4_refusal = p4 != NULL
+						 ? strstr(p4,
+								  "CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED")
+						 : NULL;
+		p4_abort = p4_refusal != NULL
+					   ? strstr(p4_refusal,
+								"cluster_bufmgr_pcm_x_writer_abort_acquiring(pcm_x_writer)")
+					   : NULL;
+		p4_reacquire = p4 != NULL
+						   ? strstr(p4,
+									"LWLockAcquire(BufferDescriptorGetContentLock(buf)")
+						   : NULL;
+		p4_activate = p4 != NULL
+						  ? strstr(p4,
+								   "cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer)")
+						  : NULL;
+		UT_ASSERT_NOT_NULL(stale);
+		UT_ASSERT_NOT_NULL(p4);
+		UT_ASSERT_NOT_NULL(p4_outcome);
+		UT_ASSERT_NOT_NULL(p4_refusal);
+		UT_ASSERT_NOT_NULL(p4_abort);
+		UT_ASSERT_NOT_NULL(p4_reacquire);
+		UT_ASSERT_NOT_NULL(p4_activate);
+		if (p4 != NULL && p4_outcome != NULL && p4_refusal != NULL && p4_abort != NULL
+			&& p4_reacquire != NULL && p4_activate != NULL)
+			UT_ASSERT(p4 < p4_outcome && p4_outcome < p4_refusal
+					  && p4_refusal < p4_abort && p4_abort < p4_reacquire
+					  && p4_reacquire < p4_activate && p4_activate < lockbuffer_end);
+	}
+
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(79);
+	UT_RUN(test_pcm_x_retry_barrier_selector_rejects_other_vm_identity);
+	UT_RUN(test_pcm_x_retry_barrier_writer_deferred_window_source_contract);
 	UT_RUN(test_shmem_initializes_complete_entry);
+	UT_RUN(test_durability_generation_is_saturating_and_never_wraps);
+	UT_RUN(test_dirty_transitions_advance_durability_generation_under_header_lock);
+	UT_RUN(test_flush_note_binds_exact_ownership_and_dirty_generations);
+	UT_RUN(test_hint_redirty_during_flush_rejects_old_durability_note);
 	UT_RUN(test_writer_activation_fence_blocks_revoke_until_exact_clear);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
@@ -2985,6 +3836,7 @@ main(void)
 	UT_RUN(test_ordinary_generation_bump_rejects_live_reservation);
 	UT_RUN(test_eviction_rejects_live_reservation_and_exhaustion);
 	UT_RUN(test_bufmgr_d5a_commitlocked_uses_locked_commit_and_saved_tag_release);
+	UT_RUN(test_pi_discard_is_bounded_typed_and_shadow_identity_exact);
 	UT_RUN(test_bufmgr_abort_cleanup_is_never_silent);
 	UT_RUN(test_bufmgr_finish_failure_rolls_back_acquired_master_grant);
 	UT_RUN(test_bufmgr_s_base_rollback_normalizes_to_n_under_header_authority);
@@ -3012,6 +3864,8 @@ main(void)
 	UT_RUN(test_unlockbuffers_exceptionally_detaches_released_pcm_x_holders);
 	UT_RUN(test_bufmgr_pcm_x_holder_gate_retry_is_bounded_outside_content_lock);
 	UT_RUN(test_granted_pending_holder_barrier_restarts_before_wait);
+	UT_RUN(test_granted_pending_holder_barrier_releases_completed_pcm_attempt_before_rearm);
+	UT_RUN(test_pending_holder_barrier_acquire_outcome_is_three_state);
 	UT_RUN(test_bufmgr_pcm_x_holder_reuse_and_deferred_failure_are_fail_closed);
 	UT_RUN(test_queue_holder_snapshot_by_tag_is_mapping_and_header_exact);
 	UT_RUN(test_queue_passive_pinned_s_release_serializes_bytes_and_ownership);
@@ -3028,6 +3882,13 @@ main(void)
 	UT_RUN(test_own_lifecycle_counters_land_on_exact_begin_and_x_commit);
 	UT_RUN(test_pcm_x_retain_flush_error_injection_is_exact_and_pre_write);
 	UT_RUN(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_boundaries);
+	UT_RUN(test_stale_x_release_journal_orders_normal_eviction_before_mapping_unlock);
+	UT_RUN(test_stale_x_release_journal_orders_victim_eviction_without_tag_restore);
+	UT_RUN(test_stale_x_release_bypasses_inactive_pcm_before_ownership_state);
+	UT_RUN(test_bufmgr_pcm_x_barrier_policy_is_intent_typed);
+	UT_RUN(test_bufmgr_pcm_x_holder_prepare_refusal_precedes_reuse);
+	UT_RUN(test_bufmgr_pcm_x_cleanup_barrier_defers_without_reporting);
+	UT_RUN(test_bufmgr_pcm_x_writer_prepare_refusal_precedes_claim_and_revalidate_aborts);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

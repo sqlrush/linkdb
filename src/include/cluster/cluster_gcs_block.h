@@ -72,6 +72,7 @@
 #include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_pcm_lock.h" /* PcmLockTransition */
+#include "cluster/cluster_pi_discard_policy.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_sf_dep.h" /* ClusterSfDepVec / max origins */
@@ -591,7 +592,7 @@ cluster_gcs_pcm_x_authority_holders_exact(const PcmAuthoritySnapshot *authority,
 		return PCM_X_QUEUE_INVALID;
 	if (!PcmPendingXQueueValue(ticket_id, &pending_x_value))
 		return PCM_X_QUEUE_INVALID;
-	if (authority->reserved[0] != 0 || authority->reserved[1] != 0)
+	if (authority->authority_generation == 0)
 		return PCM_X_QUEUE_CORRUPT;
 	if (authority->pending_x_requester_node != requester_node
 		|| authority->pending_x_since_lsn != pending_x_value)
@@ -2029,6 +2030,27 @@ GcsBlockRequestPayloadGetLifetimeHintMs(const GcsBlockRequestPayload *p)
 		   | ((uint32)p->reserved_0[4] << 16) | ((uint32)p->reserved_0[5] << 24);
 }
 
+/* S3-P0-18: requester qvotec boot identity, LE overlay [6..13]. */
+static inline void
+GcsBlockRequestPayloadSetRequesterBootIncarnation(GcsBlockRequestPayload *p, uint64 boot)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		p->reserved_0[6 + i] = (uint8)((boot >> (8 * i)) & 0xFF);
+}
+
+static inline uint64
+GcsBlockRequestPayloadGetRequesterBootIncarnation(const GcsBlockRequestPayload *p)
+{
+	uint64 boot = 0;
+	int i;
+
+	for (i = 7; i >= 0; i--)
+		boot = (boot << 8) | (uint64)p->reserved_0[6 + i];
+	return boot;
+}
+
 
 /* ============================================================
  * GcsBlockDonePayload -- wire ABI for PGRAC_IC_MSG_GCS_BLOCK_DONE
@@ -2066,6 +2088,48 @@ typedef struct GcsBlockDonePayload {
 
 StaticAssertDecl(sizeof(GcsBlockDonePayload) == 64,
 				 "GCS-race round-2 GcsBlockDonePayload wire ABI 64B (mirrors request)");
+
+static inline void
+GcsBlockDonePayloadSetRequesterBootIncarnation(GcsBlockDonePayload *p, uint64 boot)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		p->reserved_0[6 + i] = (uint8)((boot >> (8 * i)) & 0xFF);
+}
+
+static inline uint64
+GcsBlockDonePayloadGetRequesterBootIncarnation(const GcsBlockDonePayload *p)
+{
+	uint64 boot = 0;
+	int i;
+
+	for (i = 7; i >= 0; i--)
+		boot = (boot << 8) | (uint64)p->reserved_0[6 + i];
+	return boot;
+}
+
+typedef enum GcsBlockRequesterBootAdmission {
+	GCS_BLOCK_REQUESTER_BOOT_REJECT = 0,
+	GCS_BLOCK_REQUESTER_BOOT_WIRE_BOUND = 1,
+	GCS_BLOCK_REQUESTER_BOOT_LEGACY_BOUND = 2
+} GcsBlockRequesterBootAdmission;
+
+/* Pure final admission matrix after one lock-coherent HELLO sample and one
+ * qvotec exact-majority proof. */
+static inline GcsBlockRequesterBootAdmission
+GcsBlockRequesterBootClassify(uint64 wire_boot, bool boot_capable,
+							  uint64 hello_boot, bool qvotec_exact)
+{
+	if (hello_boot == 0 || !qvotec_exact)
+		return GCS_BLOCK_REQUESTER_BOOT_REJECT;
+	if (boot_capable)
+		return wire_boot != 0 && wire_boot == hello_boot
+				   ? GCS_BLOCK_REQUESTER_BOOT_WIRE_BOUND
+				   : GCS_BLOCK_REQUESTER_BOOT_REJECT;
+	return wire_boot == 0 ? GCS_BLOCK_REQUESTER_BOOT_LEGACY_BOUND
+						  : GCS_BLOCK_REQUESTER_BOOT_REJECT;
+}
 
 
 /* ============================================================
@@ -2303,6 +2367,495 @@ StaticAssertDecl(offsetof(GcsBlockForwardPayload, expected_pi_watermark_scn_byte
 				 "spec-2.41 D1 — expected_pi_watermark_scn_bytes[8] must land at "
 				 "offset 49 immediately after transition_id byte at offset 48");
 
+typedef enum GcsBlockForwardCancelPhase {
+	GCS_FORWARD_CANCEL_PHASE_NONE = 0,
+	GCS_FORWARD_CANCEL_PHASE_MASTER_TO_HOLDER = 1,
+	GCS_FORWARD_CANCEL_PHASE_HOLDER_BARRIER = 2,
+	GCS_FORWARD_CANCEL_PHASE_REQUESTER_FENCE_ACK = 3
+} GcsBlockForwardCancelPhase;
+
+typedef enum GcsBlockForwardCancelReason {
+	GCS_FORWARD_CANCEL_REASON_NONE = 0,
+	GCS_FORWARD_CANCEL_REASON_PENDING_X = 1
+} GcsBlockForwardCancelReason;
+
+#define GCS_FORWARD_CANCEL_PROOF_MARKER_CANCELLING UINT8_C(0x01)
+#define GCS_FORWARD_CANCEL_PROOF_HOLDER_STREAM_DRAINED UINT8_C(0x02)
+#define GCS_FORWARD_CANCEL_PROOF_REQUESTER_SLOT_FENCED UINT8_C(0x04)
+#define GCS_FORWARD_CANCEL_PROOF_REQUESTER_OWNERSHIP_CLEAN UINT8_C(0x08)
+#define GCS_FORWARD_CANCEL_PROOF_STALE_X_QUIESCENT UINT8_C(0x10)
+
+#define GCS_FORWARD_CANCEL_PROOF_MASTER_MASK \
+	GCS_FORWARD_CANCEL_PROOF_MARKER_CANCELLING
+#define GCS_FORWARD_CANCEL_PROOF_BARRIER_MASK                                          \
+	(GCS_FORWARD_CANCEL_PROOF_MARKER_CANCELLING                                        \
+	 | GCS_FORWARD_CANCEL_PROOF_HOLDER_STREAM_DRAINED)
+#define GCS_FORWARD_CANCEL_PROOF_ACK_MASK                                              \
+	(GCS_FORWARD_CANCEL_PROOF_BARRIER_MASK                                             \
+	 | GCS_FORWARD_CANCEL_PROOF_REQUESTER_SLOT_FENCED                                  \
+	 | GCS_FORWARD_CANCEL_PROOF_REQUESTER_OWNERSHIP_CLEAN)
+#define GCS_FORWARD_CANCEL_SELF_CAPABILITY_GENERATION UINT32_C(1)
+
+/*
+ * S3-P0-09 exact forward-cancel certificate.  The first 64 bytes bind the
+ * master-private marker generation and the immutable relation/boot identity;
+ * the second half identifies all three participants and the two CONTROL-owned
+ * capability records.  The LMS outbound ring independently binds each staged
+ * frame to the chosen shard-aligned DATA connection generation.
+ */
+typedef struct GcsBlockForwardCancelPayload {
+	uint64 request_id;						 /* [  0,  8) */
+	uint64 request_epoch;					 /* [  8, 16) */
+	uint64 pre_authority_generation;			 /* [ 16, 24) */
+	uint64 relation_generation;				 /* [ 24, 32) */
+	uint64 expected_pi_watermark_scn;			 /* [ 32, 40) */
+	uint64 requester_incarnation;				 /* [ 40, 48) */
+	uint64 master_incarnation;				 /* [ 48, 56) */
+	uint64 holder_incarnation;				 /* [ 56, 64) */
+	BufferTag tag;							 /* [ 64, 84) */
+	int32 requester_node;					 /* [ 84, 88) */
+	int32 requester_backend_id;				 /* [ 88, 92) */
+	int32 master_node;						 /* [ 92, 96) */
+	int32 holder_node;						 /* [ 96,100) */
+	uint8 phase;							 /* [100,101) */
+	uint8 reason;							 /* [101,102) */
+	uint8 proof;							 /* [102,103) */
+	uint8 transition_id;					 /* [103,104) */
+	uint32 master_holder_capability_generation;	 /* [104,108) */
+	uint32 holder_requester_capability_generation; /* [108,112) */
+	uint32 requester_master_capability_generation; /* [112,116) */
+	uint8 reserved[20];						 /* [116,136) */
+} GcsBlockForwardCancelPayload;
+
+StaticAssertDecl(sizeof(GcsBlockForwardCancelPayload) == 136,
+				 "forward-cancel certificate is one fixed 136-byte DATA frame");
+StaticAssertDecl(offsetof(GcsBlockForwardCancelPayload, tag) == 64,
+				 "forward-cancel tag starts after its exact 64-byte identity");
+StaticAssertDecl(offsetof(GcsBlockForwardCancelPayload, phase) == 100,
+				 "forward-cancel phase offset is wire-stable");
+StaticAssertDecl(offsetof(GcsBlockForwardCancelPayload,
+						  master_holder_capability_generation)
+				 == 104,
+				 "forward-cancel capability tuple starts at offset 104");
+
+static inline bool
+GcsBlockForwardCancelReservedZero(const GcsBlockForwardCancelPayload *p)
+{
+	static const uint8 zero[20] = { 0 };
+
+	return p != NULL && memcmp(p->reserved, zero, sizeof(zero)) == 0;
+}
+
+static inline bool
+GcsBlockForwardCancelCommonValid(const GcsBlockForwardCancelPayload *p,
+								 Size payload_length, uint64 current_epoch,
+								 int32 current_master)
+{
+	return p != NULL && payload_length == sizeof(*p) && p->request_id != 0
+		   && p->request_epoch == current_epoch
+		   && p->pre_authority_generation != 0
+		   && p->pre_authority_generation != UINT64_MAX
+		   && p->relation_generation != 0 && p->requester_incarnation != 0
+		   && p->master_incarnation != 0 && p->holder_incarnation != 0
+		   && p->requester_node >= 0
+		   && p->requester_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && p->requester_backend_id > 0 && p->master_node >= 0
+		   && p->master_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && p->holder_node >= 0 && p->holder_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && p->master_node != p->holder_node
+		   && p->requester_node != p->holder_node
+		   && current_master == p->master_node
+		   && p->reason == (uint8)GCS_FORWARD_CANCEL_REASON_PENDING_X
+		   && p->transition_id == (uint8)PCM_TRANS_N_TO_S
+		   && p->master_holder_capability_generation != 0
+		   && GcsBlockForwardCancelReservedZero(p);
+}
+
+static inline bool
+cluster_gcs_forward_cancel_master_ingress_valid(
+	const GcsBlockForwardCancelPayload *p, Size payload_length,
+	int32 authenticated_source, uint64 current_epoch, int32 current_master,
+	int32 local_node, uint64 authenticated_source_incarnation,
+	uint64 local_incarnation)
+{
+	return GcsBlockForwardCancelCommonValid(
+			   p, payload_length, current_epoch, current_master)
+		   && p->phase == (uint8)GCS_FORWARD_CANCEL_PHASE_MASTER_TO_HOLDER
+		   && p->proof == GCS_FORWARD_CANCEL_PROOF_MASTER_MASK
+		   && p->holder_requester_capability_generation == 0
+		   && p->requester_master_capability_generation == 0
+		   && authenticated_source == p->master_node && local_node == p->holder_node
+		   && authenticated_source_incarnation == p->master_incarnation
+		   && local_incarnation == p->holder_incarnation;
+}
+
+static inline bool
+cluster_gcs_forward_cancel_barrier_ingress_valid(
+	const GcsBlockForwardCancelPayload *p, Size payload_length,
+	int32 authenticated_source, uint64 current_epoch, int32 current_master,
+	int32 local_node, uint64 authenticated_source_incarnation,
+	uint64 local_incarnation)
+{
+	return GcsBlockForwardCancelCommonValid(
+			   p, payload_length, current_epoch, current_master)
+		   && p->phase == (uint8)GCS_FORWARD_CANCEL_PHASE_HOLDER_BARRIER
+		   && p->proof == GCS_FORWARD_CANCEL_PROOF_BARRIER_MASK
+		   && p->holder_requester_capability_generation != 0
+		   && p->requester_master_capability_generation == 0
+		   && authenticated_source == p->holder_node
+		   && local_node == p->requester_node
+		   && authenticated_source_incarnation == p->holder_incarnation
+		   && local_incarnation == p->requester_incarnation;
+}
+
+static inline bool
+cluster_gcs_forward_cancel_ack_ingress_valid(
+	const GcsBlockForwardCancelPayload *p, Size payload_length,
+	int32 authenticated_source, uint64 current_epoch, int32 current_master,
+	int32 local_node, uint64 authenticated_source_incarnation,
+	uint64 local_incarnation)
+{
+	return GcsBlockForwardCancelCommonValid(
+			   p, payload_length, current_epoch, current_master)
+		   && p->phase == (uint8)GCS_FORWARD_CANCEL_PHASE_REQUESTER_FENCE_ACK
+		   && p->proof == GCS_FORWARD_CANCEL_PROOF_ACK_MASK
+		   && p->holder_requester_capability_generation != 0
+		   && p->requester_master_capability_generation != 0
+		   && authenticated_source == p->requester_node && local_node == p->master_node
+		   && authenticated_source_incarnation == p->requester_incarnation
+		   && local_incarnation == p->master_incarnation;
+}
+
+/* The barrier is delivered to a backend-indexed shared slot.  Match every
+ * request identity component before setting the immutable cancel fence; a
+ * late barrier for an earlier attempt must not poison a reused slot. */
+static inline bool
+cluster_gcs_forward_cancel_requester_slot_exact(
+	const GcsBlockForwardCancelPayload *p, uint64 slot_request_id,
+	uint64 slot_request_epoch, int32 slot_backend_id,
+	int32 slot_expected_master, uint8 slot_transition_id,
+	const BufferTag *slot_tag)
+{
+	return p != NULL && slot_tag != NULL
+		   && p->request_id == slot_request_id
+		   && p->request_epoch == slot_request_epoch
+		   && p->requester_backend_id == slot_backend_id
+		   && p->master_node == slot_expected_master
+		   && p->transition_id == slot_transition_id
+		   && memcmp(&p->tag, slot_tag, sizeof(*slot_tag)) == 0;
+}
+
+/* Active-backend ACK gate.  Only the exact GRANT_PENDING abort is positive
+ * proof: after it succeeds the same generation/token remains published but
+ * idle.  STALE is deliberately not guessed clean because it may mean the old
+ * forward became a durable S grant and needs normal release first. */
+static inline bool
+cluster_gcs_forward_cancel_exact_abort_quiescent(
+	ClusterPcmOwnResult abort_result, uint64 base_generation,
+	uint64 reservation_token, uint64 live_generation, uint64 live_token,
+	uint32 live_flags)
+{
+	return abort_result == CLUSTER_PCM_OWN_OK
+		   && base_generation == live_generation
+		   && reservation_token != 0 && reservation_token == live_token
+		   && live_flags == 0;
+}
+
+typedef enum GcsStaleXCertPhase {
+	GCS_STALE_X_CERT_PHASE_NONE = 0,
+	/* Holder observed CURRENT_INVALID/NOT_RESIDENT, sealed storage proof, and
+	 * installed a provisional identity fence before reporting. */
+	GCS_STALE_X_CERT_PHASE_MISS_REPORT = 1,
+	/* Master binds the provisional report to the exact marker generation. */
+	GCS_STALE_X_CERT_PHASE_FENCE_INSTALL = 2,
+	/* Holder durably installed the full marker-generation fence. */
+	GCS_STALE_X_CERT_PHASE_FENCE_ACK = 3,
+	/* Master atomically retired stale-X authority and publishes post-gen. */
+	GCS_STALE_X_CERT_PHASE_COMMIT = 4,
+	/* Master refused commit; holder must retain the full fence. */
+	GCS_STALE_X_CERT_PHASE_KEEP_FENCED = 5,
+	/* Holder exact-echoes COMMIT after retaining its terminal tombstone. */
+	GCS_STALE_X_CERT_PHASE_COMMIT_ACK = 6,
+	/* Master observed requester DONE (or equivalent connection quiescence)
+	 * and asks the holder to retire the terminal fence. */
+	GCS_STALE_X_CERT_PHASE_FENCE_RETIRE = 7,
+	/* Holder confirms exact retire; master may then reclaim its marker. */
+	GCS_STALE_X_CERT_PHASE_FENCE_RETIRE_ACK = 8
+} GcsStaleXCertPhase;
+
+typedef enum GcsStaleXCertReason {
+	GCS_STALE_X_CERT_REASON_NONE = 0,
+	GCS_STALE_X_CERT_REASON_NOT_RESIDENT = 1,
+	GCS_STALE_X_CERT_REASON_CURRENT_INVALID = 2
+} GcsStaleXCertReason;
+
+/*
+ * Holder-side eviction may create a type-65 repair record only after both
+ * boot identities are authenticated for the current epoch.  The identity
+ * sampler remains fail-closed until qvotec can publish one coherent
+ * same-incarnation majority observation; callers must preserve the mapping
+ * and X ownership when it returns false.  The nonce is unique only within
+ * holder_incarnation and saturates instead of wrapping.
+ */
+extern bool cluster_gcs_block_stale_x_release_identity(
+	int32 master_node, uint64 expected_epoch, uint64 *master_incarnation_out,
+	uint64 *holder_incarnation_out);
+extern bool cluster_gcs_block_stale_x_release_nonce_next(uint64 *nonce_out);
+
+#define GCS_STALE_X_PROOF_CHECKPOINT_SEALED UINT8_C(0x01)
+#define GCS_STALE_X_PROOF_STORAGE_CURRENT UINT8_C(0x02)
+#define GCS_STALE_X_PROOF_PROVISIONAL_FENCE UINT8_C(0x04)
+#define GCS_STALE_X_PROOF_FULL_FENCE UINT8_C(0x08)
+#define GCS_STALE_X_PROOF_REQUESTER_DONE UINT8_C(0x10)
+#define GCS_STALE_X_PROOF_REPORT_MASK                                                        \
+	(GCS_STALE_X_PROOF_CHECKPOINT_SEALED | GCS_STALE_X_PROOF_STORAGE_CURRENT               \
+	 | GCS_STALE_X_PROOF_PROVISIONAL_FENCE)
+#define GCS_STALE_X_PROOF_FENCED_MASK                                                         \
+	(GCS_STALE_X_PROOF_REPORT_MASK | GCS_STALE_X_PROOF_FULL_FENCE)
+#define GCS_STALE_X_PROOF_RETIRE_MASK                                                         \
+	(GCS_STALE_X_PROOF_FENCED_MASK | GCS_STALE_X_PROOF_REQUESTER_DONE)
+
+/*
+ * Exact holder-storage proof used before MISS_REPORT.  `relation_generation`
+ * is the registered per-RelFileLocator incarnation from the smgr unlink
+ * chokepoint; equality fences DROP/TRUNCATE/rewrite/reuse.  The fresh verified
+ * storage page must carry the exact checkpoint-sealed SCN, not merely a floor:
+ * a different page version is an ambiguous authority transition.
+ */
+static inline bool
+GcsStaleXStorageProofExact(
+	SCN final_page_scn, SCN durable_page_scn, SCN observed_storage_scn,
+	uint64 captured_relation_generation, uint64 current_relation_generation)
+{
+	return captured_relation_generation != 0
+		   && captured_relation_generation == current_relation_generation
+		   && SCN_VALID(final_page_scn) && SCN_VALID(durable_page_scn)
+		   && SCN_VALID(observed_storage_scn)
+		   && observed_storage_scn == durable_page_scn
+		   && scn_local(durable_page_scn) >= scn_local(final_page_scn);
+}
+
+static inline bool
+GcsStaleXRelationGenerationExact(uint64 captured_relation_generation,
+								 uint64 current_relation_generation)
+{
+	return captured_relation_generation != 0
+		   && captured_relation_generation == current_relation_generation;
+}
+
+/*
+ * Capability-gated type-65 stale-X certificate.  One fixed 136-byte shape is
+ * used bidirectionally; phase determines which generation fields are legal.
+ *
+ * REPORT has pre/post generation zero because the legacy 64-byte FORWARD
+ * cannot carry the master's private generation.  FENCE_INSTALL binds the
+ * holder's nonce + storage certificate to pre_authority_generation; ACK
+ * exact-echoes it only after the holder installs a full negative fence.
+ * COMMIT carries both pre and post generations (post == pre + 1).
+ */
+typedef struct GcsStaleXCertPayload {
+	uint64 request_id;					  /* [  0,  8) */
+	uint64 request_epoch;				  /* [  8, 16) */
+	uint64 pre_authority_generation;		  /* [ 16, 24) */
+	uint64 post_authority_generation;	  /* [ 24, 32) */
+	uint64 release_cert_nonce;			  /* [ 32, 40) holder-generated */
+	uint64 source_own_generation;		  /* [ 40, 48) checkpoint binding */
+	SCN final_page_scn;					  /* [ 48, 56) */
+	SCN durable_page_scn;				  /* [ 56, 64) */
+	BufferTag tag;						  /* [ 64, 84) */
+	int32 requester_node;				  /* [ 84, 88) */
+	int32 requester_backend_id;			  /* [ 88, 92) */
+	int32 master_node;					  /* [ 92, 96) */
+	int32 holder_node;					  /* [ 96,100) */
+	uint8 phase;						  /* [100,101) GcsStaleXCertPhase */
+	uint8 reason;						  /* [101,102) GcsStaleXCertReason */
+	uint8 proof;						  /* [102,103) exact proof mask */
+	uint8 transition_id;				  /* [103,104) v1: N_TO_S only */
+	uint64 requester_incarnation;		  /* [104,112) requester boot/session */
+	uint64 master_incarnation;			  /* [112,120) master boot/session */
+	uint64 holder_incarnation;			  /* [120,128) holder boot/session */
+	uint64 relation_generation;			  /* [128,136) relation lifecycle */
+} GcsStaleXCertPayload;
+
+StaticAssertDecl(sizeof(GcsStaleXCertPayload) == 136,
+				 "type-65 stale-X certificate wire ABI includes relation lifecycle");
+StaticAssertDecl(offsetof(GcsStaleXCertPayload, tag) == 64,
+				 "type-65 tag starts after eight uint64/SCN fields");
+StaticAssertDecl(offsetof(GcsStaleXCertPayload, phase) == 100,
+				 "type-65 phase offset is wire-stable");
+StaticAssertDecl(offsetof(GcsStaleXCertPayload, requester_incarnation) == 104,
+				 "type-65 incarnation tuple starts at offset 104");
+
+static inline bool
+GcsStaleXCertPayloadIncarnationsValid(const GcsStaleXCertPayload *p)
+{
+	return p != NULL && p->requester_incarnation != 0
+		   && p->master_incarnation != 0 && p->holder_incarnation != 0;
+}
+
+static inline bool
+GcsStaleXCertPayloadCommonValid(const GcsStaleXCertPayload *p, Size payload_length,
+								uint64 current_epoch)
+{
+	return p != NULL && payload_length == sizeof(*p) && p->request_id != 0
+		   && p->request_epoch == current_epoch
+		   && p->release_cert_nonce != 0
+		   && p->relation_generation != 0
+		   && p->requester_node >= 0 && p->requester_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && p->requester_backend_id > 0 && p->master_node >= 0
+		   && p->master_node < PCM_X_PROTOCOL_NODE_LIMIT && p->holder_node >= 0
+		   && p->holder_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && p->master_node != p->holder_node
+		   && p->transition_id == (uint8)PCM_TRANS_N_TO_S
+		   && (p->reason == (uint8)GCS_STALE_X_CERT_REASON_NOT_RESIDENT
+			   || p->reason == (uint8)GCS_STALE_X_CERT_REASON_CURRENT_INVALID)
+		   && SCN_VALID(p->final_page_scn) && SCN_VALID(p->durable_page_scn)
+		   && scn_local(p->durable_page_scn) >= scn_local(p->final_page_scn)
+		   && GcsStaleXCertPayloadIncarnationsValid(p);
+}
+
+static inline bool
+cluster_gcs_stale_x_report_ingress_valid(const GcsStaleXCertPayload *p,
+										 Size payload_length,
+										 int32 authenticated_source,
+										 uint64 current_epoch,
+										 int32 current_master,
+										 int32 local_node,
+										 uint64 authenticated_source_incarnation,
+										 uint64 local_incarnation)
+{
+	return GcsStaleXCertPayloadCommonValid(p, payload_length, current_epoch)
+		   && p->phase == (uint8)GCS_STALE_X_CERT_PHASE_MISS_REPORT
+		   && p->proof == GCS_STALE_X_PROOF_REPORT_MASK
+		   && p->pre_authority_generation == 0 && p->post_authority_generation == 0
+		   && authenticated_source == p->holder_node && p->master_node == local_node
+		   && current_master == local_node
+		   && authenticated_source_incarnation == p->holder_incarnation
+		   && local_incarnation == p->master_incarnation;
+}
+
+static inline bool
+cluster_gcs_stale_x_fence_install_ingress_valid(
+	const GcsStaleXCertPayload *p, Size payload_length, int32 authenticated_source,
+	uint64 current_epoch, int32 current_master, int32 local_node,
+	uint64 authenticated_source_incarnation, uint64 local_incarnation)
+{
+	return GcsStaleXCertPayloadCommonValid(p, payload_length, current_epoch)
+		   && p->phase == (uint8)GCS_STALE_X_CERT_PHASE_FENCE_INSTALL
+		   && p->proof == GCS_STALE_X_PROOF_REPORT_MASK
+		   && p->pre_authority_generation != 0
+		   && p->pre_authority_generation != UINT64_MAX
+		   && p->post_authority_generation == 0 && authenticated_source == p->master_node
+		   && p->holder_node == local_node && current_master == authenticated_source
+		   && authenticated_source_incarnation == p->master_incarnation
+		   && local_incarnation == p->holder_incarnation;
+}
+
+static inline bool
+cluster_gcs_stale_x_fence_ack_ingress_valid(const GcsStaleXCertPayload *p,
+										 Size payload_length,
+										 int32 authenticated_source,
+										 uint64 current_epoch,
+										 int32 current_master,
+										 int32 local_node,
+										 uint64 authenticated_source_incarnation,
+										 uint64 local_incarnation)
+{
+	return GcsStaleXCertPayloadCommonValid(p, payload_length, current_epoch)
+		   && p->phase == (uint8)GCS_STALE_X_CERT_PHASE_FENCE_ACK
+		   && p->proof == GCS_STALE_X_PROOF_FENCED_MASK
+		   && p->pre_authority_generation != 0
+		   && p->pre_authority_generation != UINT64_MAX
+		   && p->post_authority_generation == 0 && authenticated_source == p->holder_node
+		   && p->master_node == local_node && current_master == local_node
+		   && authenticated_source_incarnation == p->holder_incarnation
+		   && local_incarnation == p->master_incarnation;
+}
+
+static inline bool
+cluster_gcs_stale_x_commit_ingress_valid(const GcsStaleXCertPayload *p,
+										 Size payload_length,
+										 int32 authenticated_source,
+										 uint64 current_epoch,
+										 int32 current_master,
+										 int32 local_node,
+										 uint64 authenticated_source_incarnation,
+										 uint64 local_incarnation)
+{
+	return GcsStaleXCertPayloadCommonValid(p, payload_length, current_epoch)
+		   && p->phase == (uint8)GCS_STALE_X_CERT_PHASE_COMMIT
+		   && p->proof == GCS_STALE_X_PROOF_FENCED_MASK
+		   && p->pre_authority_generation != 0
+		   && p->pre_authority_generation != UINT64_MAX
+		   && p->post_authority_generation == p->pre_authority_generation + 1
+		   && authenticated_source == p->master_node && p->holder_node == local_node
+		   && current_master == authenticated_source
+		   && authenticated_source_incarnation == p->master_incarnation
+		   && local_incarnation == p->holder_incarnation;
+}
+
+static inline bool
+cluster_gcs_stale_x_commit_ack_ingress_valid(const GcsStaleXCertPayload *p,
+											 Size payload_length,
+											 int32 authenticated_source,
+											 uint64 current_epoch,
+											 int32 current_master,
+											 int32 local_node,
+											 uint64 authenticated_source_incarnation,
+											 uint64 local_incarnation)
+{
+	return GcsStaleXCertPayloadCommonValid(p, payload_length, current_epoch)
+		   && p->phase == (uint8)GCS_STALE_X_CERT_PHASE_COMMIT_ACK
+		   && p->proof == GCS_STALE_X_PROOF_FENCED_MASK
+		   && p->pre_authority_generation != 0
+		   && p->pre_authority_generation != UINT64_MAX
+		   && p->post_authority_generation == p->pre_authority_generation + 1
+		   && authenticated_source == p->holder_node && p->master_node == local_node
+		   && current_master == local_node
+		   && authenticated_source_incarnation == p->holder_incarnation
+		   && local_incarnation == p->master_incarnation;
+}
+
+static inline bool
+cluster_gcs_stale_x_fence_retire_ingress_valid(const GcsStaleXCertPayload *p,
+												Size payload_length,
+												int32 authenticated_source,
+												uint64 current_epoch,
+												int32 current_master,
+												int32 local_node,
+												uint64 authenticated_source_incarnation,
+												uint64 local_incarnation)
+{
+	return GcsStaleXCertPayloadCommonValid(p, payload_length, current_epoch)
+		   && p->phase == (uint8)GCS_STALE_X_CERT_PHASE_FENCE_RETIRE
+		   && p->proof == GCS_STALE_X_PROOF_RETIRE_MASK
+		   && p->pre_authority_generation != 0
+		   && p->pre_authority_generation != UINT64_MAX
+		   && p->post_authority_generation == p->pre_authority_generation + 1
+		   && authenticated_source == p->master_node && p->holder_node == local_node
+		   && current_master == authenticated_source
+		   && authenticated_source_incarnation == p->master_incarnation
+		   && local_incarnation == p->holder_incarnation;
+}
+
+static inline bool
+cluster_gcs_stale_x_fence_retire_ack_ingress_valid(
+	const GcsStaleXCertPayload *p, Size payload_length, int32 authenticated_source,
+	uint64 current_epoch, int32 current_master, int32 local_node,
+	uint64 authenticated_source_incarnation, uint64 local_incarnation)
+{
+	return GcsStaleXCertPayloadCommonValid(p, payload_length, current_epoch)
+		   && p->phase == (uint8)GCS_STALE_X_CERT_PHASE_FENCE_RETIRE_ACK
+		   && p->proof == GCS_STALE_X_PROOF_RETIRE_MASK
+		   && p->pre_authority_generation != 0
+		   && p->pre_authority_generation != UINT64_MAX
+		   && p->post_authority_generation == p->pre_authority_generation + 1
+		   && authenticated_source == p->holder_node && p->master_node == local_node
+		   && current_master == local_node
+		   && authenticated_source_incarnation == p->holder_incarnation
+		   && local_incarnation == p->master_incarnation;
+}
+
 /* PGRAC: spec-2.41 D1/D3 — little-endian SCN helpers (the @49 carrier now holds
  * the detector's expected pi_watermark_scn, NOT a page_lsn). */
 static inline void
@@ -2382,6 +2935,44 @@ gcs_block_lost_write_verdict(SCN expected_scn, SCN shipped_scn)
 		< scn_local(expected_scn)) /* SCN_CMP_OK: scn_time_cmp via scn_local */
 		return GCS_LOST_WRITE_FAIL_STALE;
 	return GCS_LOST_WRITE_PASS;
+}
+
+/*
+ * Loop20 stale-holder repair gate.
+ *
+ * A holder-side CURRENT_INVALID / NOT_RESIDENT observation is not ownership
+ * authority and is deliberately absent from this predicate.  The master may
+ * retire a stale X declaration only after an exact forward marker still
+ * names the same authority generation and a verified shared-storage read
+ * covers the master's current Lamport-SCN watermark.
+ */
+static inline bool
+cluster_gcs_stale_holder_storage_proof_exact(bool forward_marker_exact, PcmState current_state,
+											 int32 current_holder, int32 feedback_holder,
+											 uint64 current_transition_count,
+											 uint64 marker_transition_count, SCN storage_scn,
+											 SCN current_watermark_scn)
+{
+	return forward_marker_exact && current_state == PCM_STATE_X && current_holder >= 0
+		   && current_holder < PCM_X_PROTOCOL_NODE_LIMIT && feedback_holder == current_holder
+		   && current_transition_count == marker_transition_count && SCN_VALID(storage_scn)
+		   && SCN_VALID(current_watermark_scn)
+		   && scn_local(storage_scn) >= scn_local(current_watermark_scn);
+}
+
+static inline bool
+cluster_gcs_block_request_transport_exact(int32 authenticated_source, int32 payload_requester)
+{
+	return authenticated_source >= 0 && authenticated_source < PCM_X_PROTOCOL_NODE_LIMIT
+		   && payload_requester == authenticated_source;
+}
+
+static inline bool
+cluster_gcs_block_forward_transport_exact(int32 authenticated_source, int32 payload_master,
+										  int32 current_master)
+{
+	return authenticated_source >= 0 && authenticated_source < PCM_X_PROTOCOL_NODE_LIMIT
+		   && payload_master == authenticated_source && current_master == authenticated_source;
 }
 
 /*
@@ -3031,7 +3622,14 @@ ClusterGcsUndoAuthTrailerGetAuthorityScn(const ClusterGcsUndoAuthTrailer *t)
 typedef enum ClusterGcsUndoVerdictKind {
 	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT = 1,
 	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON = 2,
-	CLUSTER_GCS_UNDO_VERDICT_ABORTED = 3
+	CLUSTER_GCS_UNDO_VERDICT_ABORTED = 3,
+	/*
+	 * S3-P0-13: positive NON-terminal proof.  The origin emits this only
+	 * after exact fresh-ref segment/slot identity, own-stripe, stable
+	 * RESOLVED_SCN, and ProcArray-live gates.  Canonical payload has no SCN
+	 * and no wrap; it is never memoized or hint-stamped.
+	 */
+	CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS = 4
 } ClusterGcsUndoVerdictKind;
 
 typedef struct ClusterGcsUndoVerdictPage {
@@ -3346,10 +3944,12 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
  * (BUF_TYPE_PI)?  Conversion sites use it to report kept-PI to the master.
  * discard_pi_block: drop the tag's buffer iff it is a real unpinned Past
  * Image (strictly type PI + !BM_VALID + refcount 0 — a current copy is
- * NEVER touched); false = no droppable PI (already implicitly discarded,
- * pinned by a racing re-reader, or never kept). */
+ * NEVER touched).  RETRYABLE_BUSY is side-effect-free and must be retained
+ * for a later local attempt; CORRUPT is likewise non-mutating but is not a
+ * terminal miss.
+ */
 extern bool cluster_bufmgr_block_is_pi(BufferTag tag);
-extern bool cluster_bufmgr_discard_pi_block(BufferTag tag);
+extern ClusterBufmgrPiDiscardResult cluster_bufmgr_discard_pi_block(BufferTag tag);
 
 /* PGRAC: spec-6.12h D-h3b — copy a Past Image's frozen bytes + its D-h3a
  * ship-SCN stamp out of the buffer pool for a detached recovery rebuild.
@@ -3484,6 +4084,16 @@ extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
 													int master_node, bool clean_eligible,
 													bool *out_retry_denied);
 
+/* Complete the requester half of an exact forward-cancel after bufmgr has
+ * aborted the matching GRANT_PENDING reservation and sampled its live tuple.
+ * True means there is no pending certificate or its ACK is staged; false is
+ * transient DATA admission/capability backpressure and must be retried before
+ * opening a successor reservation. */
+extern bool cluster_gcs_forward_cancel_finish_exact_abort(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *base,
+	uint64 reservation_token, ClusterPcmOwnResult abort_result,
+	const ClusterPcmOwnSnapshot *live);
+
 /*
  * spec-5.2 D2 (sub-case B) — local-master read-image forward.  Used by
  * cluster_pcm_lock_acquire_buffer when THIS node is the GCS master for a
@@ -3610,6 +4220,8 @@ extern void cluster_gcs_handle_block_reply_envelope(const struct ClusterICEnvelo
  * requester carried in fwd.original_requester_node.  HC103 + HC104 +
  * HC105 (evict race fallback). */
 extern void cluster_gcs_handle_block_forward_envelope(const struct ClusterICEnvelope *env,
+													   const void *payload);
+extern void cluster_gcs_handle_stale_x_cert_envelope(const struct ClusterICEnvelope *env,
 													  const void *payload);
 
 
@@ -3715,6 +4327,9 @@ extern uint64 cluster_gcs_get_install_copy_count(void);
  *	  done_sent_count                — # of GCS_BLOCK_DONE proofs sent (RC-F)
  *	  dedup_done_marked_count        — # of DONE proofs stamped on master (RC-F)
  *	  dedup_done_mismatch_count      — # of DONE proofs dropped on master (RC-F)
+ *	  dedup_done_forwarded_refused_count  — # of DONE proofs refused because
+ *	                                   the cell held a FORWARDED marker (S3-P0-09)
+ *	  dedup_done_cancelling_refused_count — same, on a CANCELLING marker
  * ============================================================ */
 extern uint64 cluster_gcs_get_block_retransmit_attempt_count(void);
 extern uint64 cluster_gcs_get_block_retransmit_send_count(void);
@@ -3732,6 +4347,8 @@ extern uint64 cluster_gcs_get_block_done_sent_count(void);			  /* RC-F DONE */
 extern uint64 cluster_gcs_get_block_done_enqueue_drop_count(void);	  /* review F7 */
 extern uint64 cluster_gcs_get_block_dedup_done_marked_count(void);	  /* RC-F DONE */
 extern uint64 cluster_gcs_get_block_dedup_done_mismatch_count(void);  /* RC-F DONE */
+extern uint64 cluster_gcs_get_block_dedup_done_forwarded_refused_count(void);  /* S3-P0-09 */
+extern uint64 cluster_gcs_get_block_dedup_done_cancelling_refused_count(void); /* S3-P0-09 */
 extern uint64 cluster_gcs_get_block_dedup_hint_violation_count(void); /* review F5 */
 extern uint64 cluster_gcs_get_block_dedup_legacy_pin_count(void);	  /* review F5 */
 extern uint64 cluster_gcs_get_block_dedup_pcm_x_stage_count(void);
@@ -3822,7 +4439,23 @@ extern uint64 cluster_gcs_get_block_x_self_ship_count(void);
  *	fire-and-forget fail-safe: a lost note/notify only leaves a PI lingering
  *	until buffer pressure or the implicit-discard reread.
  * ============================================================ */
-extern void cluster_gcs_block_pi_write_note(BufferTag tag, SCN page_scn);
+typedef struct GcsPiWriteNote {
+	BufferTag tag;
+	int32 source_buf_id;				 /* descriptor-incarnation component */
+	uint32 durability_generation;	 /* clean->dirty version; 0/MAX unsealable */
+	SCN page_scn;					 /* exact bytes submitted by smgrwrite */
+	uint64 source_own_generation;	 /* ownership generation at write */
+	uint64 source_node_incarnation; /* admitted boot incarnation, 0=unsealable */
+} GcsPiWriteNote;
+
+StaticAssertDecl(sizeof(GcsPiWriteNote) == 56,
+				 "checkpoint write note stays a compact 56-byte shmem record");
+StaticAssertDecl(offsetof(GcsPiWriteNote, source_buf_id) == 20,
+				 "checkpoint write note descriptor identity offset is stable");
+StaticAssertDecl(offsetof(GcsPiWriteNote, page_scn) == 32,
+				 "checkpoint write note SCN remains naturally aligned");
+
+extern void cluster_gcs_block_pi_write_note(const GcsPiWriteNote *note);
 extern uint64 cluster_gcs_block_pi_note_presync_snapshot(void);
 extern void cluster_gcs_block_pi_note_confirm(uint64 presync_seq);
 extern void cluster_gcs_block_pi_discard_drain(void);

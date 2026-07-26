@@ -254,6 +254,32 @@ cluster_voting_disk_read_slot(int fd, int expected_disk_index, uint32 node_id,
 	}
 
 	/*
+	 * A newly provisioned fixed-size voting file may contain only zeroed
+	 * blocks before its first qvotec write.  Admit exactly that byte pattern
+	 * as the canonical generation-zero slot.  This is deliberately before
+	 * CRC validation because an all-zero block has no stored CRC yet; any
+	 * nonzero malformed block continues through the ordinary fail-closed
+	 * CRC/header checks below.
+	 */
+	{
+		static const char zero_slot[CLUSTER_VOTING_SLOT_BYTES];
+
+		if (expected_disk_index >= 0
+			&& expected_disk_index < CLUSTER_MAX_VOTING_DISKS
+			&& memcmp(aligned.bytes, zero_slot, sizeof(zero_slot)) == 0) {
+			memset(&aligned.slot, 0, sizeof(aligned.slot));
+			aligned.slot.magic = CLUSTER_VOTING_SLOT_MAGIC;
+			aligned.slot.version = CLUSTER_VOTING_SLOT_VERSION;
+			aligned.slot.node_id = node_id;
+			aligned.slot.disk_index = (uint32)expected_disk_index;
+			aligned.slot.crc32c
+				= cluster_voting_disk_compute_crc32c(&aligned.slot);
+			*out = aligned.slot;
+			return CLUSTER_VOTING_DISK_IO_OK;
+		}
+	}
+
+	/*
 	 * Verify CRC32C first — this catches torn writes and corruption
 	 * before we trust any field.  Mismatch = TORN (caller decrements
 	 * disks_ok_count + retries next cycle per Q2 v0.2 protocol).

@@ -194,6 +194,9 @@ extern void cluster_ges_shmem_register(void);
  */
 extern void cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload);
 extern void cluster_ges_reply_handler(const ClusterICEnvelope *env, const void *payload);
+extern void cluster_ges_dedup_done_handler(const ClusterICEnvelope *env, const void *payload);
+extern void cluster_ges_dedup_ack_handler(const ClusterICEnvelope *env, const void *payload);
+extern void cluster_ges_dedup_lmon_retry_tick(void);
 extern int cluster_ges_lmon_drain_work_queue(void);
 
 /*
@@ -383,6 +386,50 @@ typedef enum GesReplyOpcode {
 	GES_REPLY_OPCODE_REJECT = 2
 } GesReplyOpcode;
 
+/*
+ * S3-P0-10 normal-terminal lifecycle.  DONE and ACK intentionally share one
+ * fixed 64-byte image: ACK changes only kind/status and otherwise echoes the
+ * proof byte-for-byte.  `link_generation` is the sender-side capability
+ * generation that admitted this CONTROL frame; it is echoed for journal
+ * correlation, while each receiver independently authenticates the physical
+ * connection and peer boot.
+ */
+#define GES_DEDUP_LIFECYCLE_VERSION ((uint8)1)
+
+typedef enum GesDedupLifecycleKind {
+	GES_DEDUP_LIFECYCLE_EXACT_DONE = 1,
+	GES_DEDUP_LIFECYCLE_PROC_EXIT_HWM = 2,
+	GES_DEDUP_LIFECYCLE_ACK = 3
+} GesDedupLifecycleKind;
+
+typedef enum GesDedupAckStatus {
+	GES_DEDUP_ACK_REMOVED = 1,
+	GES_DEDUP_ACK_ALREADY_ABSENT = 2,
+	GES_DEDUP_ACK_RETIRE_PENDING = 3,
+	GES_DEDUP_ACK_HWM_APPLIED = 4,
+	GES_DEDUP_ACK_REJECTED = 5
+} GesDedupAckStatus;
+
+typedef struct GesDedupLifecyclePayload {
+	uint8 version;
+	uint8 kind;
+	uint8 status;
+	uint8 flags;
+	uint32 origin_node_id;
+	uint32 holder_procno;
+	uint32 opcode;
+	uint64 request_id; /* exact id, or inclusive HWM for PROC_EXIT_HWM */
+	uint64 cluster_epoch;
+	uint64 shard_master_generation;
+	uint64 origin_boot_incarnation;
+	uint64 target_boot_incarnation;
+	uint32 link_generation;
+	uint32 reserved;
+} GesDedupLifecyclePayload;
+
+StaticAssertDecl(sizeof(GesDedupLifecyclePayload) == 64,
+				 "GES dedup DONE/ACK lifecycle payload is fixed 64 bytes");
+
 typedef enum GesRejectReason {
 	GES_REJECT_REASON_NONE = 0, /* GRANT or undefined */
 	GES_REJECT_REASON_WORK_QUEUE_FULL = 1,
@@ -513,6 +560,14 @@ typedef struct GesRequestPayload {
 	uint64 wait_seq;
 } GesRequestPayload;
 
+/*
+ * Reliable fire-and-forget cleanup RELEASE frames are already idempotent at
+ * GRD (a missing exact holder is a no-op).  They have no waiting requester
+ * that can own a DONE journal, so new receivers must bypass replay caching.
+ * current_mode is otherwise required to be zero for RELEASE.
+ */
+#define GES_RELEASE_CURRENT_MODE_CLEANUP_BYPASS UINT8_MAX
+
 StaticAssertDecl(sizeof(GesRequestPayload) == 72,
 				 "GesRequestPayload wire ABI 72-byte lock (spec-5.3 D2 56->64; spec-5.8 D1c "
 				 "waiter_xid in tail pad; spec-5.8 D1e +8 wait_seq -> 72)");
@@ -621,12 +676,15 @@ extern uint32 cluster_ges_send_redeclare_and_wait(const struct ClusterResId *res
  * resource's master (local master goes through the in-process work queue,
  * remote master over the wire) and wait on WAIT_EVENT_GES_CONVERT_WAIT for
  * the GRANT/REJECT.  The holder carries request_id = convert_request_id
- * (R_new);  current_mode is the REDECLARE locator key for the OLD slot.
+ * (R_new);  current_mode is the REDECLARE locator key for the OLD slot and
+ * old_request_id is that slot's pre-convert identity (R_old), retained for an
+ * ABA-exact rollback if query cancel races the grant.
  * Returns GES_REJECT_REASON_NONE on OK_CONVERTED, ILLEGAL_CONVERT on a
  * non-partial-order conversion (→ 53R74), TIMEOUT on convert wait timeout. */
 extern uint32 cluster_ges_send_convert_and_wait(const struct ClusterResId *resid,
 												uint32 requested_mode, uint32 current_mode,
 												const struct ClusterGrdHolderId *holder,
+												uint64 old_request_id,
 												uint64 convert_request_id, int timeout_ms);
 
 /* spec-5.3 D2/D6 — send opcode-14 CONVERT_ROLLBACK (T4 post-commit backout):

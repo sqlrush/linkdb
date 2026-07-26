@@ -55,6 +55,8 @@
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_gcs_block_dedup.h"
+#include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_hw.h"				 /* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
@@ -101,6 +103,17 @@ static int ut_current_elevel = 0;
  * logic itself is unit-tested in test_cluster_pcm_lock.c). */
 uint64
 cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+cluster_gcs_block_dedup_cleanup_on_node_dead(
+	uint32 dead_node pg_attribute_unused())
+{}
+
+uint32
+cluster_ges_dedup_drop_origin_node(uint32 dead_node pg_attribute_unused())
 {
 	return 0;
 }
@@ -732,6 +745,11 @@ cluster_grd_outbound_enqueue_cleanup_release(uint32 d pg_attribute_unused(),
 {}
 void
 cluster_lmd_cleanup_on_backend_exit_count_inc(uint64 d pg_attribute_unused())
+{}
+void
+cluster_lms_native_probe_cleanup_on_backend_exit(
+	int32 requester_node_id pg_attribute_unused(),
+	int procno pg_attribute_unused())
 {}
 void
 cluster_lmd_cleanup_skip_other_owner_count_inc(uint64 d pg_attribute_unused())
@@ -2635,18 +2653,19 @@ UT_TEST(test_convert_u12_sweep_on_holder_death)
  * fair_queue_seq @72 / skip_count @80 / boosted @84 (72 -> 88). */
 UT_TEST(test_convert_u11_struct_layout)
 {
-	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 88);
+	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 96);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, node_id), 0);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, cluster_epoch), 16);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, current_mode), 24);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, requested_mode), 28);
 	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, convert_request_id), 32);
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, waiter_xid), 52);
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_start), 56);
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_seq), 64);
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, fair_queue_seq), 72); /* spec-5.10 */
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, skip_count), 80);		/* spec-5.10 */
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, boosted), 84);		/* spec-5.10 */
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, origin_boot_incarnation), 48);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, waiter_xid), 60);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_start), 64);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_seq), 72);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, fair_queue_seq), 80); /* spec-5.10 */
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, skip_count), 88);		/* spec-5.10 */
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, boosted), 92);		/* spec-5.10 */
 }
 
 
@@ -2825,6 +2844,11 @@ UT_TEST(test_convert_5_3_u18_master_wrappers)
 {
 	ClusterResId resid;
 	ClusterGrdEntry *e;
+	ClusterGrdHolderId cancel_id;
+	ClusterGrdWaiterIdentity removed;
+	ClusterGrdRetireStats retire_stats;
+	ClusterGrdWaiterMeta exact_meta
+		= { (TransactionId)12345, UINT64CONST(888), UINT64CONST(902) };
 	LOCKMODE m = NoLock;
 
 	/* convert_or_enqueue: single holder -> GRANTED_INPLACE + rebind. */
@@ -2846,11 +2870,51 @@ UT_TEST(test_convert_5_3_u18_master_wrappers)
 	e = convert_make_entry(5306);
 	convert_grant(e, 1, 100, 11, ShareLock);
 	UT_ASSERT_EQ((int)cluster_grd_convert_grant_by_backend(&resid, 1, 100, 0, ShareLock,
-														   AccessExclusiveLock, 77, 1, 0),
+														   AccessExclusiveLock, 77, 1, 456,
+														   exact_meta),
 				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
 	m = NoLock;
 	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
 	UT_ASSERT_EQ((int)m, (int)AccessExclusiveLock);
+	/* Immediate CLEAR commit must stamp the upgraded holder with the
+	 * authenticated boot; otherwise proc-exit/SIGKILL retirement cannot find
+	 * it and leaves a zombie strong holder. */
+	cluster_grd_retire_origin_proc_up_to(
+		1, UINT64CONST(902), 100, 77, NULL, NULL, &retire_stats);
+	UT_ASSERT_EQ(retire_stats.holders_removed, 1);
+	UT_ASSERT(!cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	convert_teardown();
+
+	/* CLEAR raced with a new cluster conflict: by_backend must ENQUEUE with
+	 * the original gen/xid/wait_seq/boot, not a zero synthetic identity. */
+	convert_reset();
+	convert_resid(5307, &resid);
+	e = convert_make_entry(5307);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, ShareLock);
+	UT_ASSERT_EQ((int)cluster_grd_convert_grant_by_backend(&resid, 1, 100, 0, ShareLock,
+														   AccessExclusiveLock, 77, 1, 456,
+														   exact_meta),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+	UT_ASSERT_EQ((int)ut_wfg_waiter_xid(1, 100, 0, 77), 12345);
+	UT_ASSERT(ut_wfg_waiter_wait_seq(1, 100, 0, 77) == UINT64CONST(888));
+	memset(&cancel_id, 0, sizeof(cancel_id));
+	cancel_id.node_id = 1;
+	cancel_id.procno = 100;
+	cancel_id.cluster_epoch = 0;
+	cancel_id.request_id = 77;
+	memset(&removed, 0, sizeof(removed));
+	UT_ASSERT_EQ((int)cluster_grd_cancel_convert_by_id_identity(
+					 &resid, &cancel_id, UINT64CONST(888), &removed),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(removed.shard_master_generation, UINT64CONST(456));
+	UT_ASSERT_EQ(removed.origin_boot_incarnation, UINT64CONST(902));
+	UT_ASSERT_EQ(removed.request_opcode, UT_GES_OPCODE_CONVERT);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	m = NoLock;
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)ShareLock);
 	convert_teardown();
 
 	/* MULTI-OLD-HOLDER (review): the same backend holds TWO cluster modes on
@@ -2867,7 +2931,8 @@ UT_TEST(test_convert_5_3_u18_master_wrappers)
 	convert_grant(e, 1, 100, /* R_suex  */ 12, ShareUpdateExclusiveLock);
 	/* current_mode = ExclusiveLock is held by NEITHER slot -> ILLEGAL. */
 	UT_ASSERT_EQ((int)cluster_grd_convert_grant_by_backend(&resid, 1, 100, 0, ExclusiveLock,
-														   AccessExclusiveLock, 77, 1, 0),
+														   AccessExclusiveLock, 77, 1, 0,
+														   (ClusterGrdWaiterMeta){ 0 }),
 				 (int)CLUSTER_GRD_CONVERT_ILLEGAL);
 	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 2); /* both slots untouched */
 	{
@@ -3713,6 +3778,7 @@ UT_TEST(test_5_8_d1e_u4a_request_waiter_carries_wait_seq)
 	ClusterResId resid;
 	ClusterGrdHolderId h;
 	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdWaiterIdentity removed;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -3727,12 +3793,29 @@ UT_TEST(test_5_8_d1e_u4a_request_waiter_carries_wait_seq)
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
-					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 777 }, 0,
+					 &resid, &h, 2, 2,
+					 (ClusterGrdWaiterMeta){
+						 (TransactionId)0, 777, UINT64CONST(901) },
+					 UINT64CONST(123),
 					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
 	UT_ASSERT(ut_wfg_waiter_wait_seq(2, 200, 0, 2) == 777);
+	memset(&removed, 0, sizeof(removed));
+	UT_ASSERT_EQ(
+		(int)cluster_grd_cancel_waiter_by_id_seq_identity(
+			&resid, &h, 777, &removed),
+		(int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(removed.source_node_id, 2);
+	UT_ASSERT_EQ(removed.holder.node_id, (uint32)2);
+	UT_ASSERT_EQ(removed.holder.procno, (uint32)200);
+	UT_ASSERT_EQ(removed.request_id, UINT64CONST(2));
+	UT_ASSERT_EQ(removed.shard_master_generation, UINT64CONST(123));
+	UT_ASSERT_EQ(removed.origin_boot_incarnation, UINT64CONST(901));
+	UT_ASSERT_EQ(removed.request_opcode, (uint32)UT_GES_OPCODE_REQUEST);
+	UT_ASSERT_EQ((int)removed.mode, (int)ExclusiveLock);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 0);
 
 	cluster_node_id = saved;
 	convert_teardown();
@@ -3745,6 +3828,7 @@ UT_TEST(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq)
 	ClusterResId resid;
 	ClusterGrdHolderId h;
 	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdWaiterIdentity removed;
 	int nc = -1;
 
 	cluster_node_id = 0;
@@ -3765,12 +3849,190 @@ UT_TEST(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq)
 
 	nc = -1;
 	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue_meta(
-					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1, 0,
-					 (ClusterGrdWaiterMeta){ (TransactionId)0, 888 }, conflicts, &nc),
+					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1,
+					 UINT64CONST(456),
+					 (ClusterGrdWaiterMeta){
+						 (TransactionId)0, 888, UINT64CONST(902) },
+					 conflicts, &nc),
 				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
 	UT_ASSERT(ut_wfg_waiter_wait_seq(1, 100, 0, 10) == 888);
+	memset(&removed, 0, sizeof(removed));
+	h = bast_holder(1, 100, 10);
+	UT_ASSERT_EQ(
+		(int)cluster_grd_cancel_convert_by_id_identity(
+			&resid, &h, 888, &removed),
+		(int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(removed.source_node_id, 1);
+	UT_ASSERT_EQ(removed.holder.node_id, (uint32)1);
+	UT_ASSERT_EQ(removed.holder.procno, (uint32)100);
+	UT_ASSERT_EQ(removed.request_id, UINT64CONST(10));
+	UT_ASSERT_EQ(removed.shard_master_generation, UINT64CONST(456));
+	UT_ASSERT_EQ(removed.origin_boot_incarnation, UINT64CONST(902));
+	UT_ASSERT_EQ(removed.request_opcode, (uint32)GES_REQ_OPCODE_CONVERT);
+	UT_ASSERT_EQ((int)removed.mode, (int)ExclusiveLock);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 0);
+
+	cluster_node_id = saved;
+	convert_teardown();
+}
+
+static int ut_hwm_grant_dispatch_count = 0;
+
+static void
+ut_hwm_grant_dispatch(const ClusterGrdGrantIdentity *grant pg_attribute_unused(),
+					  const ClusterResId *resid pg_attribute_unused(),
+					  void *arg pg_attribute_unused())
+{
+	ut_hwm_grant_dispatch_count++;
+}
+
+static bool
+ut_grd_has_holder(const ClusterResId *resid, int32 node_id, uint32 procno)
+{
+	ClusterGrdEntry *entry = NULL;
+	LOCKMODE mode = NoLock;
+	bool found;
+
+	if (cluster_grd_entry_lookup_or_create(
+			resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
+		|| entry == NULL)
+		return false;
+	found = cluster_grd_entry_holder_mode(
+		entry, node_id, procno, &mode);
+	cluster_grd_entry_release(entry);
+	return found;
+}
+
+/*
+ * S3-P0-10 GRD authority closure.  PROC_EXIT_HWM is scoped by
+ * {origin,boot,procno,id<=HWM}: it removes queued and promoted authority from
+ * that exact backend life while preserving a reused procno above the HWM and
+ * every holder from a different boot.
+ */
+UT_TEST(test_ges_dedup_hwm_retires_exact_grd_authority)
+{
+	int saved = cluster_node_id;
+	ClusterResId pre_resid;
+	ClusterResId post_resid;
+	ClusterResId reuse_resid;
+	ClusterResId boot_resid;
+	ClusterResId convert_resid;
+	ClusterGrdHolderId h;
+	ClusterGrdHolderId blocker;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	ClusterGrdRetireStats stats;
+	ClusterGrdEntry *entry = NULL;
+	int nc = -1;
+	int n;
+
+	cluster_node_id = 0;
+	convert_reset();
+	ut_wfg_reset();
+	ut_hwm_grant_dispatch_count = 0;
+	bast_resid(5900, &pre_resid);
+	bast_resid(5901, &post_resid);
+	bast_resid(5902, &reuse_resid);
+	bast_resid(5903, &boot_resid);
+	bast_resid(5904, &convert_resid);
+
+	/* HWM-before-promotion: remove the exact queued waiter. */
+	blocker = bast_holder(1, 101, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &pre_resid, &blocker, 1, 1,
+					 (ClusterGrdWaiterMeta){ InvalidTransactionId, 0, 101 },
+					 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	h = bast_holder(2, 202, 100);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &pre_resid, &h, 2, 100,
+					 (ClusterGrdWaiterMeta){ InvalidTransactionId, 0, 202 },
+					 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
+	cluster_grd_retire_origin_proc_up_to(
+		2, 202, 202, 100, ut_hwm_grant_dispatch, NULL, &stats);
+	UT_ASSERT_EQ(stats.waiters_removed, 1);
+	UT_ASSERT(!cluster_grd_entry_describe_waiter(
+		&pre_resid, &h, NULL, NULL, NULL));
+	n = cluster_grd_release_and_drain(
+		&pre_resid, &blocker, granted, lengthof(granted));
+	UT_ASSERT_EQ(n, 0);
+
+	/* HWM-after-promotion: remove the exact authoritative holder. */
+	h = bast_holder(2, 203, 90);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &post_resid, &h, 2, 90,
+					 (ClusterGrdWaiterMeta){ InvalidTransactionId, 0, 202 },
+					 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	cluster_grd_retire_origin_proc_up_to(
+		2, 202, 203, 100, ut_hwm_grant_dispatch, NULL, &stats);
+	UT_ASSERT_EQ(stats.holders_removed, 1);
+	UT_ASSERT(!ut_grd_has_holder(&post_resid, 2, 203));
+
+	/* Same boot/procno but a fresh request above the inclusive HWM survives. */
+	h = bast_holder(2, 204, 101);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &reuse_resid, &h, 2, 101,
+					 (ClusterGrdWaiterMeta){ InvalidTransactionId, 0, 202 },
+					 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	cluster_grd_retire_origin_proc_up_to(
+		2, 202, 204, 100, ut_hwm_grant_dispatch, NULL, &stats);
+	UT_ASSERT_EQ(stats.holders_removed, 0);
+	UT_ASSERT(ut_grd_has_holder(&reuse_resid, 2, 204));
+
+	/* Same node/procno/id from another boot is outside the authority slice. */
+	h = bast_holder(2, 205, 50);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &boot_resid, &h, 2, 50,
+					 (ClusterGrdWaiterMeta){ InvalidTransactionId, 0, 303 },
+					 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	cluster_grd_retire_origin_proc_up_to(
+		2, 202, 205, 100, ut_hwm_grant_dispatch, NULL, &stats);
+	UT_ASSERT_EQ(stats.holders_removed, 0);
+	UT_ASSERT(ut_grd_has_holder(&boot_resid, 2, 205));
+
+	/* A queued convert and its weaker holder are both HWM authority. */
+	h = bast_holder(2, 206, 40);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &convert_resid, &h, 2, 40,
+					 (ClusterGrdWaiterMeta){ InvalidTransactionId, 0, 202 },
+					 0, UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	blocker = bast_holder(1, 106, 6);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &convert_resid, &blocker, 1, 6,
+					 (ClusterGrdWaiterMeta){ InvalidTransactionId, 0, 101 },
+					 0, UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nc),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue_meta(
+					 &convert_resid, 2, 206, 0, ShareLock, ExclusiveLock,
+					 80, 2, 0,
+					 (ClusterGrdWaiterMeta){ InvalidTransactionId, 0, 202 },
+					 conflicts, &nc),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	cluster_grd_retire_origin_proc_up_to(
+		2, 202, 206, 100, ut_hwm_grant_dispatch, NULL, &stats);
+	UT_ASSERT_EQ(stats.holders_removed, 1);
+	UT_ASSERT_EQ(stats.converts_removed, 1);
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(
+					 &convert_resid, false, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(entry), 0);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(ut_hwm_grant_dispatch_count, 0);
+
+	/* Authenticated boot replacement clears the whole old boot, but never
+	 * the same node/proc state stamped with the replacement boot. */
+	cluster_grd_retire_origin_boot(
+		2, 202, ut_hwm_grant_dispatch, NULL, &stats);
+	UT_ASSERT_EQ(stats.holders_removed, 1);
+	UT_ASSERT(!ut_grd_has_holder(&reuse_resid, 2, 204));
+	UT_ASSERT(ut_grd_has_holder(&boot_resid, 2, 205));
 
 	cluster_node_id = saved;
 	convert_teardown();
@@ -4523,7 +4785,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * +1 (U17 cross-episode fence Hardening);
 	 * spec-4.6a r3-P2-2:+2 (same-epoch dead-set growth re-stamp + no-churn);
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage). */
-	UT_PLAN(84);
+	UT_PLAN(87);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -4612,6 +4874,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	/* spec-5.8 D1e — waiter wait_seq threaded into the WFG vertex (U4a-b). */
 	UT_RUN(test_5_8_d1e_u4a_request_waiter_carries_wait_seq);
 	UT_RUN(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq);
+	UT_RUN(test_ges_dedup_hwm_retires_exact_grd_authority);
 
 	/* spec-5.16 — online node-join GRD/PCM remaster (D7 unit suite). */
 	UT_RUN(test_jr_u1_recompute_moves_joiner_home);

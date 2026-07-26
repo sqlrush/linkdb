@@ -466,6 +466,49 @@ invalid:
 }
 
 
+static int
+validate_updater_proof_common(const ClusterCurrentMxKey *key,
+							  const ClusterCurrentMxMemberDesc *members,
+							  const ClusterCurrentMemberProof *proofs,
+							  uint16 nmembers,
+							  const ClusterCurrentUpdaterChallenge *challenge,
+							  const ClusterCurrentUpdaterProof *updater_proof,
+							  uint16 updater_origin_node_id)
+{
+	int updater_ordinal = -1;
+	uint16 i;
+
+	if (!current_mx_key_valid(key) || !descriptor_entries_valid(members, nmembers) || proofs == NULL
+		|| challenge == NULL || updater_proof == NULL || updater_origin_node_id >= CLUSTER_MAX_NODES
+		|| challenge->reserved16 != 0 || updater_proof->reserved8 != 0
+		|| updater_proof->verdict != CUCP_MATCH
+		|| !current_mx_key_equal(&updater_proof->mxkey, key))
+		return -1;
+
+	for (i = 0; i < nmembers; i++) {
+		if (!proof_entry_semantic_valid(&proofs[i], &members[i], i, key->cluster_epoch, -1)
+			|| proofs[i].state == CCM_UNKNOWN)
+			return -1;
+		if (ISUPDATE_from_mxstatus(members[i].member_status))
+			updater_ordinal = i;
+	}
+
+	if (updater_ordinal < 0
+		|| challenge->member_ordinal != (uint16)updater_ordinal
+		|| updater_proof->member_ordinal != (uint16)updater_ordinal
+		|| challenge->updater_xid != members[updater_ordinal].xid
+		|| updater_proof->updater_xid != members[updater_ordinal].xid
+		|| !tt_key_valid(&challenge->candidate_next_xmin_key, members[updater_ordinal].xid,
+						 key->cluster_epoch, updater_origin_node_id)
+		|| memcmp(&challenge->candidate_next_xmin_key, &updater_proof->candidate_next_xmin_key,
+				  sizeof(ClusterTTStatusKey))
+			   != 0)
+		return -1;
+
+	return updater_ordinal;
+}
+
+
 static bool
 validate_updater_proof_state(const ClusterCurrentMxKey *key,
 							 const ClusterCurrentMxMemberDesc *members,
@@ -476,37 +519,57 @@ validate_updater_proof_state(const ClusterCurrentMxKey *key,
 							 uint16 updater_origin_node_id,
 							 ClusterCurrentMemberState expected_state)
 {
-	int updater_ordinal = -1;
-	uint16 i;
+	int updater_ordinal;
 
-	if (!current_mx_key_valid(key) || !descriptor_entries_valid(members, nmembers) || proofs == NULL
-		|| challenge == NULL || updater_proof == NULL || updater_origin_node_id >= CLUSTER_MAX_NODES
-		|| challenge->reserved16 != 0 || updater_proof->reserved8 != 0
-		|| updater_proof->verdict != CUCP_MATCH
-		|| !current_mx_key_equal(&updater_proof->mxkey, key))
-		return false;
+	updater_ordinal = validate_updater_proof_common(
+		key, members, proofs, nmembers, challenge, updater_proof,
+		updater_origin_node_id);
+	return updater_ordinal >= 0
+		   && proofs[updater_ordinal].state == expected_state;
+}
 
-	for (i = 0; i < nmembers; i++) {
-		if (!proof_entry_semantic_valid(&proofs[i], &members[i], i, key->cluster_epoch, -1)
-			|| proofs[i].state == CCM_UNKNOWN)
-			return false;
-		if (ISUPDATE_from_mxstatus(members[i].member_status))
-			updater_ordinal = i;
+
+ClusterCurrentUpdaterProofOutcome
+cluster_multixact_current_updater_proof_outcome(
+	ClusterMxResolveResult resolve_result, const ClusterCurrentMxKey *key,
+	const ClusterCurrentMxMemberDesc *members,
+	const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+	const ClusterCurrentUpdaterChallenge *challenge,
+	const ClusterCurrentUpdaterProof *updater_proof,
+	uint16 updater_origin_node_id, ClusterTTStatusKey *wait_key)
+{
+	int updater_ordinal;
+
+	if (wait_key != NULL)
+		memset(wait_key, 0, sizeof(*wait_key));
+	if (resolve_result != CMX_RESOLVE_OK)
+		return CCMUPO_FAIL_CLOSED;
+
+	updater_ordinal = validate_updater_proof_common(
+		key, members, proofs, nmembers, challenge, updater_proof,
+		updater_origin_node_id);
+	if (updater_ordinal < 0)
+		return CCMUPO_FAIL_CLOSED;
+
+	switch ((ClusterCurrentMemberState)proofs[updater_ordinal].state) {
+	case CCM_COMMITTED:
+		return CCMUPO_COMMITTED;
+	case CCM_ACTIVE:
+		if (wait_key == NULL
+			|| !tt_key_valid_holder(
+				&proofs[updater_ordinal].key,
+				proofs[updater_ordinal].member_xid, key->cluster_epoch,
+				updater_origin_node_id))
+			return CCMUPO_FAIL_CLOSED;
+		*wait_key = proofs[updater_ordinal].key;
+		return CCMUPO_WAIT_MEMBER;
+	case CCM_SELF:
+	case CCM_ABORTED:
+	case CCM_UNKNOWN:
+		break;
 	}
 
-	if (updater_ordinal < 0 || proofs[updater_ordinal].state != expected_state
-		|| challenge->member_ordinal != (uint16)updater_ordinal
-		|| updater_proof->member_ordinal != (uint16)updater_ordinal
-		|| challenge->updater_xid != members[updater_ordinal].xid
-		|| updater_proof->updater_xid != members[updater_ordinal].xid
-		|| !tt_key_valid(&challenge->candidate_next_xmin_key, members[updater_ordinal].xid,
-						 key->cluster_epoch, updater_origin_node_id)
-		|| memcmp(&challenge->candidate_next_xmin_key, &updater_proof->candidate_next_xmin_key,
-				  sizeof(ClusterTTStatusKey))
-			   != 0)
-		return false;
-
-	return true;
+	return CCMUPO_FAIL_CLOSED;
 }
 
 bool
@@ -518,9 +581,10 @@ cluster_multixact_current_validate_updater_proof(const ClusterCurrentMxKey *key,
 												 const ClusterCurrentUpdaterProof *updater_proof,
 												 uint16 updater_origin_node_id)
 {
-	return validate_updater_proof_state(
-		key, members, proofs, nmembers, challenge, updater_proof,
-		updater_origin_node_id, CCM_COMMITTED);
+	return cluster_multixact_current_updater_proof_outcome(
+			   CMX_RESOLVE_OK, key, members, proofs, nmembers, challenge,
+			   updater_proof, updater_origin_node_id, NULL)
+		   == CCMUPO_COMMITTED;
 }
 
 

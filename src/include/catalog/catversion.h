@@ -738,7 +738,11 @@
  * cluster_pi_apply_redo_test SRF (oid 8975).  Bump 202606390 -> 202607060. */
 /* spec-3.6b D8: current-DML MultiXact local/global stats SRFs (oids
  * 8976/8977) and views.  Bump 202607060 -> 202607230. */
-#define CATALOG_VERSION_NO 202607230
+/* S3-P0-18: assertion-build GCS block dedup exact-probe UDF (oid 8978).
+ * Bump 202607230 -> 202607250. */
+/* S3-P0-13: assertion-build real LMS OTHER trigger UDF (oid 8979).
+ * Bump 202607250 -> 202607260. */
+#define CATALOG_VERSION_NO 202607260
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

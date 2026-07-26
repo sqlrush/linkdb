@@ -567,6 +567,12 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-gcs-block-x-forward-master-side" },
 	{ .name = "cluster-gcs-block-starvation-force-denied" },
 	{ .name = "cluster-catalog-services-ready-force-closed" },
+	/* T400-P0-10: WARNING-arm is observed through the non-consuming
+	 * cluster_injection_is_armed() outbound-capacity probe. */
+	{ .name = "cluster-cf-s6-outbound-double-full" },
+	/* S3 Batch3 CF census: after a successful shared HELD publish and
+	 * before the enqueue caller can release it. */
+	{ .name = "cluster-cf-held-census-window" },
 	{ .name = "cluster-recovery-anchor-force-failclosed" },
 	{ .name = "cluster-relmap-crash-after-stage" },
 	{ .name = "cluster-relmap-crash-before-publish" },
@@ -584,6 +590,17 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 *	  No lock/pin is held across the point.  Driven by t/393.
 	 */
 	{ .name = "cluster-gcs-xfer-copy-drop-window" },
+	/* S3 Batch3 cancellation census: after the dedup entry enters
+	 * CANCELLING and before forward-cancel teardown begins. */
+	{ .name = "cluster-gcs-forward-cancelling-window" },
+	/*
+	 * T400-P0-08 — assertion-only nested barrier propagation.
+	 *
+	 * SKIP_N makes one exact bufmgr holder/writer terminal operation report
+	 * GATE_RETRY, then makes its immediately following nested wait guard
+	 * report BARRIER_CLOSED.  The seam does not mutate shared queue state.
+	 */
+	{ .name = "cluster-bufmgr-pcm-x-retry-barrier" },
 	/*
 	 * GCS serve-stall round-6 wave-2 — ownership-generation P0 REDs.
 	 *
@@ -617,6 +634,9 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	 * SLEEP:0 supplies a success-path observation without changing behavior.
 	 */
 	{ .name = "cluster-pcm-x-retain-flush-error" },
+	/* S3 Batch3 retire census: after marker+gate publication and allocator
+	 * lock release, before the first local retire scan. */
+	{ .name = "cluster-pcm-x-retire-frontier-window" },
 	/*
 	 * cluster-pcm-grant-finalize-window (W3):
 	 *   Fires in LockBuffer AFTER a real X acquire installed the grant and

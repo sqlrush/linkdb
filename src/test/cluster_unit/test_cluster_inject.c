@@ -219,7 +219,34 @@ UT_TEST(test_inject_count_compile_constant)
 	 * setting up a tuplestore.  The TAP test t/015_inject.pl pins this
 	 * to 14 against the live view; the unit test just exercises the
 	 * surface.
-	 */
+	*/
+}
+
+UT_TEST(test_inject_batch3_census_windows_exact_registry)
+{
+	static const char *const required[] = {
+		"cluster-cf-held-census-window",
+		"cluster-gcs-forward-cancelling-window",
+		"cluster-pcm-x-retire-frontier-window",
+	};
+	int seen[lengthof(required)] = { 0 };
+	int count;
+	int i;
+
+	count = cluster_injection_get_count();
+	UT_ASSERT_EQ(count, 189);
+	for (i = 0; i < count; i++) {
+		const char *name = NULL;
+		int j;
+
+		UT_ASSERT_EQ(cluster_injection_get_state_at(i, &name, NULL, NULL), true);
+		for (j = 0; j < (int)lengthof(required); j++) {
+			if (name != NULL && strcmp(name, required[j]) == 0)
+				seen[j]++;
+		}
+	}
+	for (i = 0; i < (int)lengthof(required); i++)
+		UT_ASSERT_EQ(seen[i], 1);
 }
 
 UT_TEST(test_inject_arm_unknown_is_safe)
@@ -377,8 +404,9 @@ UT_TEST(test_inject_armed_count_clamps_at_zero)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_inject_count_compile_constant);
+	UT_RUN(test_inject_batch3_census_windows_exact_registry);
 	UT_RUN(test_inject_arm_unknown_is_safe);
 	UT_RUN(test_inject_initial_disarmed);
 	UT_RUN(test_inject_arm_warning_triggers_dispatch);

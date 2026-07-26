@@ -425,6 +425,21 @@ extern int cluster_lmd_cleanup_sweep_interval_ms;
 extern int cluster_lms_native_lock_probe_max_inflight;
 extern int cluster_lms_native_lock_probe_retry_interval_ms;
 extern int cluster_lms_native_lock_probe_retry_budget;
+#ifdef USE_ASSERT_CHECKING
+/*
+ * r19 L9 deterministic race seam.  Assertion builds only; hidden,
+ * PGC_POSTMASTER, one-shot, and exact relation LOCKTAG + node +
+ * CONVERT + AccessExclusive scoped.
+ */
+extern int cluster_unsafe_test_native_probe_force_clear_once;
+extern int cluster_unsafe_test_native_probe_force_clear_node_id;
+extern int cluster_unsafe_test_native_probe_force_clear_database_oid;
+extern int cluster_unsafe_test_native_probe_force_clear_relation_oid;
+/* S3-P0-18: per-backend one-shot raw requester sequence override. */
+extern int cluster_test_gcs_block_next_request_sequence;
+/* S3-P0-24: postmaster-fixed one-shot peer-reformation refusal class. */
+extern int cluster_unsafe_test_pcm_x_peer_reform_fault;
+#endif
 
 /* spec-2.27 D4 NEW: GES retransmit + dedup HTAB tunables. */
 extern int cluster_ges_retransmit_max_attempts;
@@ -969,7 +984,7 @@ extern int cluster_gcs_reply_timeout_ms;
  *	  1024/16384; 16384 = the measured S1 4-node distinct-read green
  *	  floor on the RACvsRAC rig)
  *	  Per-node cap for the master-side dedup HTAB.  Each entry occupies
- *	  sizeof(GcsBlockDedupEntry) = 8448B, so default cap → ~138 MB shmem
+ *	  sizeof(GcsBlockDedupEntry) = 8512B, so default cap → ~139 MB shmem
  *	  on each node acting as GCS block-ship master.  The effective
  *	  capacity is auto-sized to at least MaxConnections × declared node
  *	  count (capped at the ceiling; spec-7.2a D4 Q4).  Under cap pressure

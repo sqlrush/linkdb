@@ -804,6 +804,22 @@ cluster_ges_reply_handler(const ClusterICEnvelope *env pg_attribute_unused(),
 						  const void *payload pg_attribute_unused())
 {}
 
+void
+cluster_ges_dedup_done_handler(
+	const ClusterICEnvelope *env pg_attribute_unused(),
+	const void *payload pg_attribute_unused())
+{}
+
+void
+cluster_ges_dedup_ack_handler(
+	const ClusterICEnvelope *env pg_attribute_unused(),
+	const void *payload pg_attribute_unused())
+{}
+
+void
+cluster_ges_dedup_lmon_retry_tick(void)
+{}
+
 /* spec-2.14 D12 / L104 stub: cluster_lmon.c calls
  * cluster_grd_master_map_init() at postmaster phase 1.  Vacuous stub
  * for standalone link;  real master_map init behavior verified by

@@ -538,6 +538,9 @@ extern void InitProcGlobal(void);
 extern void InitProcess(void);
 extern void InitProcessPhase2(void);
 extern void InitAuxiliaryProcess(void);
+#ifdef USE_PGRAC_CLUSTER
+extern void InitProcessClusterIdentity(void);
+#endif
 
 extern void SetStartupBufferPinWaitBufId(int bufid);
 extern int GetStartupBufferPinWaitBufId(void);

@@ -136,6 +136,9 @@ extern ClusterUndoVerdictResult cluster_undo_verdict_from_resolve(bool ok, bool 
  *
  * authoritative (spec-5.22f D6-7) = the origin was chosen from the tuple page's
  * PHYSICAL ITL binding (a fresh-ref consumer), not derived from the xid value.
+ * expected_tt_slot_id is that same fresh ref's exact 1-based TT slot binding;
+ * only authoritative + a valid exact binding may consume an origin-proven
+ * IN_PROGRESS result.  Derived/terminal-only callers pass 0.
  * When true the origin serves underivable own xids over its own durable-TT +
  * CLOG authority (skipping the stripe self-check that guards the derived-path
  * 6.12i P0); the positive-proof gates are unchanged.  Derived (recycled) callers
@@ -143,7 +146,9 @@ extern ClusterUndoVerdictResult cluster_undo_verdict_from_resolve(bool ok, bool 
  */
 extern ClusterUndoVerdictResult cluster_undo_verdict_resolve(int origin_node,
 															 uint32 undo_segment_id,
-															 TransactionId raw_xid, SCN read_scn,
+															 TransactionId raw_xid,
+															 uint32 expected_tt_slot_id,
+															 SCN read_scn,
 															 bool authoritative);
 
 #endif /* CLUSTER_UNDO_VERDICT_H */

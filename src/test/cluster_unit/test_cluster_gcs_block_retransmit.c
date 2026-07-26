@@ -16,11 +16,11 @@
  *	  references that document where TAP 112 behavioral verifications
  *	  live):
  *	    L1  GcsBlockReplyStatus enum extends to 8 values (DENIED_DEDUP_FULL=7)
- *	    L2  GcsBlockDedupKey == 24B + offset lock
- *	    L3  GcsBlockDedupEntry == 8472B fixed-size StaticAssertDecl (8448 + 24 RC-F DONE)
- *	    L4  GcsBlockDedupEntry.payload_meta offset 112, block_data offset 240
+ *	    L2  GcsBlockDedupKey == 32B + offset lock
+ *	    L3  GcsBlockDedupEntry == 8520B fixed-size StaticAssertDecl
+ *	    L4  GcsBlockDedupEntry.payload_meta offset 112, block_data offset 280
  *	    L5  GcsBlockDedupEntry.reply_header offset 56 (8-aligned for uint64)
- *	    L6  GcsBlockDedupEntry.completed_at_ts offset 8432 + registered 8440
+ *	    L6  GcsBlockDedupEntry.completed_at_ts offset 8480 + registered 8488
  *	    L7  GcsBlockDedupResult enum 5 values
  *	    L8  Retry math: backoff[N] = initial × 2^(N-1) (N=1..4 → 100/200/400/800)
  *	    L9  Total sends = 1 + max_retries
@@ -100,25 +100,25 @@ UT_TEST(test_dedup_full_status_enum_value)
 
 UT_TEST(test_dedup_key_size_and_offsets)
 {
-	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupKey), 24);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupKey), 32);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupKey, origin_node_id), 0);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupKey, requester_backend_id), 4);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupKey, request_id), 8);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupKey, cluster_epoch), 16);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupKey, origin_boot_incarnation), 24);
 }
 
 
-UT_TEST(test_dedup_entry_size_locked_at_8472)
+UT_TEST(test_dedup_entry_size_locked_at_8520)
 {
-	/* 8448 (spec-6.2) + 24 (GCS-race round-2 RC-F DONE lifecycle tail). */
-	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupEntry), 8472);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupEntry), 8520);
 }
 
 
 UT_TEST(test_dedup_entry_smart_fusion_dep_and_block_offsets)
 {
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, payload_meta), 112);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, block_data), 240);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, payload_meta), 120);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, block_data), 288);
 	UT_ASSERT_EQ((int)GCS_BLOCK_DATA_SIZE, BLCKSZ);
 }
 
@@ -127,21 +127,21 @@ UT_TEST(test_dedup_entry_reply_header_offset_8_aligned)
 {
 	/* HC92 + alignment math: header at offset 56 satisfies 8-byte align
 	 * for uint64 request_id at hdr offset 0 (so absolute 56, 8-aligned). */
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, reply_header), 56);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, reply_header), 64);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, reply_header) % 8, 0);
 }
 
 
 UT_TEST(test_dedup_entry_ttl_anchor_offsets)
 {
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, completed_at_ts), 8432);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, registered_at_ts), 8440);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, completed_at_ts), 8480);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, registered_at_ts), 8488);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, completed_at_ts) % 8, 0);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, registered_at_ts) % 8, 0);
 	/* GCS-race round-2 RC-F: DONE-lifecycle tail, all 8-aligned. */
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, done_at_ts), 8448);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pinned_lifetime_us), 8456);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pinned_done_linger_us), 8464);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, done_at_ts), 8496);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pinned_lifetime_us), 8504);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pinned_done_linger_us), 8512);
 	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, done_at_ts) % 8, 0);
 }
 
@@ -240,9 +240,9 @@ UT_TEST(test_dedup_entry_collision_field_layout)
 {
 	/* HC91 tag/transition fields used for entry-value collision check.
 	 * Must be addressable + correctly typed. */
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, tag), 24);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, transition_id), 44);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, status), 45);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, tag), 32);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, transition_id), 52);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, status), 53);
 }
 
 
@@ -311,7 +311,7 @@ main(void)
 	UT_PLAN(24);
 	UT_RUN(test_dedup_full_status_enum_value);
 	UT_RUN(test_dedup_key_size_and_offsets);
-	UT_RUN(test_dedup_entry_size_locked_at_8472);
+	UT_RUN(test_dedup_entry_size_locked_at_8520);
 	UT_RUN(test_dedup_entry_smart_fusion_dep_and_block_offsets);
 	UT_RUN(test_dedup_entry_reply_header_offset_8_aligned);
 	UT_RUN(test_dedup_entry_ttl_anchor_offsets);

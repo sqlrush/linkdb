@@ -387,17 +387,45 @@ typedef enum ClusterICPlane {
  * Capability authority comes from CONTROL; cap-sensitive staging also binds
  * each frame to the selected shard-aligned DATA connection generation. */
 #define PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 ((uint32)0x00001000U)
+/* S3-P0-04: fixed-136-byte stale-X certificate + holder-fence handshake.
+ * A sender must not emit type 65 until the selected peer connection
+ * advertises this bit together with a nonzero HELLO boot incarnation;
+ * old peers do not register the message type. */
+#define PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1 ((uint32)0x00002000U)
+/* S3-P0-09: the peer registers both fixed-136-byte forward-cancel types and
+ * enforces the master->holder->requester ordered-barrier protocol.  Every
+ * send remains bound to the selected DATA connection generation by the LMS
+ * outbound ring; an old/mixed peer must never receive type 66 or 67. */
+#define PGRAC_IC_HELLO_CAP_GCS_FORWARD_CANCEL_V1 ((uint32)0x00004000U)
+/*
+ * S3-P0-10: this peer registers the GES retransmit-dedup DONE/ACK pair and
+ * binds both directions to the qvotec-published boot identity.  The bit is
+ * advertised only with a nonzero boot incarnation.  A sender must also bind
+ * every staged CONTROL frame to the capability record's current connection
+ * generation; mixed-version peers receive neither type and keep their cached
+ * rows fail-closed.
+ */
+#define PGRAC_IC_HELLO_CAP_GES_DEDUP_DONE_V1 ((uint32)0x00008000U)
+/*
+ * S3-P0-18: generic GCS REQUEST/DONE carries the requester's qvotec-durable
+ * boot incarnation in its existing 64-byte reserved overlay.  The master
+ * binds dedup identity to that boot and authenticates it against the current
+ * HELLO record.  Missing capability takes the quarantined legacy path.
+ */
+#define PGRAC_IC_HELLO_CAP_GCS_REQUEST_BOOT_V1 ((uint32)0x00010000U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).
  * A pre-7.2 sender leaves them zero => plane CONTROL, conn_epoch 0.
  * Offsets 41/42 are reserved for spec-7.3 (worker_id / n_workers) and
- * stay zero in 7.2;  offset 43 pads the group;  52-63 remain reserved.
+ * stay zero in 7.2; offset 43 pads the group.  S3-P0-04 uses 52-59 for
+ * the qvotec-published boot incarnation; 60-63 remain reserved.
  */
 #define PGRAC_IC_HELLO_PLANE_OFFSET 40
 #define PGRAC_IC_HELLO_WORKER_ID_OFFSET 41 /* spec-7.3 reserved, zero in 7.2 */
 #define PGRAC_IC_HELLO_N_WORKERS_OFFSET 42 /* spec-7.3 reserved, zero in 7.2 */
 #define PGRAC_IC_HELLO_CONN_EPOCH_OFFSET 44
+#define PGRAC_IC_HELLO_BOOT_INCARNATION_OFFSET 52
 
 typedef struct ClusterICHelloMsg {
 	uint32 magic;								  /* PGRAC_IC_HELLO_MAGIC */
@@ -442,6 +470,25 @@ cluster_ic_hello_conn_epoch(const ClusterICHelloMsg *msg)
 	if (msg == NULL)
 		return 0;
 	p = msg->_pad + (PGRAC_IC_HELLO_CONN_EPOCH_OFFSET - PGRAC_IC_HELLO_CAPABILITIES_OFFSET);
+	for (i = 7; i >= 0; i--)
+		v = (v << 8) | (uint64)p[i];
+	return v;
+}
+
+/* S3-P0-04: qvotec boot identity carried in HELLO bytes 52..59 (LE).
+ * Zero means the sender cannot advertise or authenticate type65 yet. */
+static inline uint64
+cluster_ic_hello_boot_incarnation(const ClusterICHelloMsg *msg)
+{
+	const uint8 *p;
+	uint64 v = 0;
+	int i;
+
+	if (msg == NULL)
+		return 0;
+	p = msg->_pad
+		+ (PGRAC_IC_HELLO_BOOT_INCARNATION_OFFSET
+		   - PGRAC_IC_HELLO_CAPABILITIES_OFFSET);
 	for (i = 7; i >= 0; i--)
 		v = (v << 8) | (uint64)p[i];
 	return v;

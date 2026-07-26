@@ -101,6 +101,125 @@ typedef enum ClusterCrInvalidScnVerdict {
 extern ClusterCrInvalidScnVerdict cluster_cr_server_invalid_scn_verdict(bool clog_did_abort);
 
 /*
+ * S3-P0-13: pure classifier for the narrow RESOLVED_SCN pre-commit window.
+ * CLOG commit remains authoritative and wins.  Only an independently proven
+ * origin-ProcArray live xid may produce IN_PROGRESS; a plain non-commit is
+ * still UNKNOWN_FAIL_CLOSED.  The runtime caller owns every identity gate
+ * (own stripe + exact durable segment/slot/wrap revalidation).
+ */
+extern ClusterUndoVerdictKind
+cluster_cr_server_resolved_scn_verdict(bool clog_did_commit, bool clog_did_abort,
+									   bool xid_is_in_progress);
+
+/*
+ * S3-P0-13: close the terminal-publication sampling gap without weakening
+ * UNKNOWN.  A transaction publishes CLOG terminal state before leaving
+ * ProcArray, so a non-live ProcArray result is followed by one terminal
+ * re-sample.  Either positive CLOG sample is authoritative; all-false remains
+ * UNKNOWN_FAIL_CLOSED.
+ */
+extern ClusterUndoVerdictKind
+cluster_cr_server_resolved_scn_resampled_verdict(bool clog_did_commit_before,
+												 bool clog_did_abort_before,
+												 bool xid_is_in_progress,
+												 bool clog_did_commit_after,
+												 bool clog_did_abort_after);
+
+/*
+ * Pure gate for the second CLOG sample.  It is reachable only for a fresh
+ * authoritative request whose physical binding is exact, whose first CLOG
+ * sample is non-terminal, and whose origin ProcArray sample is non-live.
+ */
+extern bool cluster_cr_server_terminal_resample_allowed(bool allow_live,
+														bool exact_binding,
+														bool clog_did_commit_before,
+														bool clog_did_abort_before,
+														bool xid_is_in_progress);
+
+/*
+ * S3-P0-13: pure conjunction for the live-proof identity fence.  The durable
+ * matcher reports a 0-based slot offset; the fresh-ref carrier is 1-based.
+ * Every input must agree before the runtime may classify the xid as live.
+ */
+extern bool cluster_cr_server_live_binding_exact(bool xid_is_mine,
+												 uint32 expected_segment_id,
+												 uint32 expected_tt_slot_id,
+												 uint16 matched_segment,
+												 uint16 matched_slot,
+												 bool xid_is_in_progress,
+												 bool durable_binding_stable);
+
+/*
+ * S3-P0-13 r39: pure, mutually-exclusive diagnostic classifiers.  They do
+ * not change the live-proof predicate; they explain which exact-binding or
+ * second durable-scan term failed so the aggregate OTHER bucket can close.
+ */
+#define CLUSTER_CR_SERVER_DIAGNOSTIC_DEFINED 1
+typedef enum ClusterCrServerExactDiagnostic {
+	CLUSTER_CR_SERVER_EXACT_OK = 0,
+	CLUSTER_CR_SERVER_EXACT_NOT_AUTHORITATIVE,
+	CLUSTER_CR_SERVER_EXACT_NOT_MINE,
+	CLUSTER_CR_SERVER_EXACT_EXPECTED_SEGMENT_INVALID,
+	CLUSTER_CR_SERVER_EXACT_EXPECTED_SLOT_INVALID,
+	CLUSTER_CR_SERVER_EXACT_SEGMENT_MISMATCH,
+	CLUSTER_CR_SERVER_EXACT_SLOT_MISMATCH
+} ClusterCrServerExactDiagnostic;
+
+typedef enum ClusterCrServerConfirmDiagnostic {
+	CLUSTER_CR_SERVER_CONFIRM_STABLE = 0,
+	CLUSTER_CR_SERVER_CONFIRM_RESOLVE_KIND,
+	CLUSTER_CR_SERVER_CONFIRM_SEGMENT_MISMATCH,
+	CLUSTER_CR_SERVER_CONFIRM_SLOT_MISMATCH,
+	CLUSTER_CR_SERVER_CONFIRM_WRAP_MISMATCH,
+	CLUSTER_CR_SERVER_CONFIRM_SCN_MISMATCH
+} ClusterCrServerConfirmDiagnostic;
+
+extern ClusterCrServerExactDiagnostic
+cluster_cr_server_exact_diagnostic(bool allow_live, bool xid_is_mine,
+								   uint32 expected_segment_id,
+								   uint32 expected_tt_slot_id,
+								   uint16 matched_segment,
+								   uint16 matched_slot);
+extern ClusterCrServerConfirmDiagnostic
+cluster_cr_server_confirm_diagnostic(bool confirm_resolved_scn,
+									 uint16 matched_segment,
+									 uint16 matched_slot,
+									 uint16 matched_wrap,
+									 SCN matched_scn,
+									 uint16 confirm_segment,
+									 uint16 confirm_slot,
+									 uint16 confirm_wrap,
+									 SCN confirm_scn);
+
+/*
+ * One detail is bumped for every vis53r97 srv_other refusal.  RESIDUAL covers
+ * the older non-RESOLVED_SCN families and malformed/pre-route refusals; the
+ * remaining buckets partition the r39 exact/confirm investigation.
+ */
+typedef enum ClusterCrServerOtherRefusalDetail {
+	CLUSTER_CR_SERVER_OTHER_NOT_AUTHORITATIVE = 0,
+	CLUSTER_CR_SERVER_OTHER_NOT_MINE,
+	CLUSTER_CR_SERVER_OTHER_EXPECTED_SEGMENT_INVALID,
+	CLUSTER_CR_SERVER_OTHER_EXPECTED_SLOT_INVALID,
+	CLUSTER_CR_SERVER_OTHER_SEGMENT_MISMATCH,
+	CLUSTER_CR_SERVER_OTHER_SLOT_MISMATCH,
+	CLUSTER_CR_SERVER_OTHER_CONFIRM_RESOLVE_KIND,
+	CLUSTER_CR_SERVER_OTHER_CONFIRM_SEGMENT_MISMATCH,
+	CLUSTER_CR_SERVER_OTHER_CONFIRM_SLOT_MISMATCH,
+	CLUSTER_CR_SERVER_OTHER_CONFIRM_WRAP_MISMATCH,
+	CLUSTER_CR_SERVER_OTHER_CONFIRM_SCN_MISMATCH,
+	CLUSTER_CR_SERVER_OTHER_TERMINAL_UNKNOWN,
+	CLUSTER_CR_SERVER_OTHER_RESIDUAL,
+	CLUSTER_CR_SERVER_OTHER_DETAIL_COUNT
+} ClusterCrServerOtherRefusalDetail;
+
+extern ClusterCrServerOtherRefusalDetail
+cluster_cr_server_other_refusal_detail_normalize(
+	ClusterCrServerOtherRefusalDetail detail);
+extern void
+cluster_cr_server_other_refusal_detail_bump(ClusterCrServerOtherRefusalDetail detail);
+
+/*
  * LMS CR work slots (shmem, embedded in the cluster_lms region).
  *
  *	Slot lifecycle: FREE -(submit CAS)-> FILLING -(submit publish)->
@@ -201,7 +320,10 @@ typedef enum ClusterCrServerStat {
 	CLUSTER_CR_SERVER_STAT_VERDICT_DENIED = 6,		 /* spec-6.12i D-i4 verdict refuse */
 	CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_SERVED = 7, /* spec-7.1 D3-b multi member serve */
 	CLUSTER_CR_SERVER_STAT_MULTI_VERDICT_DENIED = 8, /* spec-7.1 D3-b multi member refuse */
-	CLUSTER_CR_SERVER_STAT_FENCE_REFUSED = 9		 /* spec-7.3 D7 write-fenced -> refuse ship */
+	CLUSTER_CR_SERVER_STAT_FENCE_REFUSED = 9,		 /* spec-7.3 D7 write-fenced -> refuse ship */
+	CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_COMMIT = 10,
+	CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_ABORT = 11,
+	CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_UNKNOWN = 12
 } ClusterCrServerStat;
 
 extern void cluster_cr_server_stat_bump(ClusterCrServerStat which);
@@ -320,9 +442,14 @@ extern bool cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 s
  * cluster_vis_undo_verdict_page_usable), fills *auth_out and returns true;
  * false = fail-closed (timeout / DENIED / checksum / trailer missing /
  * malformed page — caller keeps the unchanged 53R97 refusal, Rule 8.A).
+ * expected_tt_slot_id is the fresh ref's exact 1-based slot binding (0 for
+ * terminal-only callers).  It rides the already-existing synthetic tag's
+ * blockNum field, so this adds no wire ABI; only a new origin with an exact
+ * segment/slot + own-stripe + ProcArray-live proof may return kind 4.
  * The caller MUST Lamport-observe verdict_out->horizon_scn (and any
  * commit_scn) it consumes — SCNs that crossed the wire (AD-008). */
 extern bool cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
+														  uint32 expected_tt_slot_id,
 														  TransactionId xid, bool authoritative,
 														  ClusterGcsUndoVerdictPage *verdict_out,
 														  ClusterLiveAuthority *auth_out);

@@ -428,6 +428,9 @@ StaticAssertDecl(CMX_DESC_OK == 0 && CMX_DESC_DENIED == 1 && CMX_DESC_SUPPORTED_
 StaticAssertDecl(CMX_RESOLVE_OK == 0 && CMX_RESOLVE_DENIED == 1 && CMX_RESOLVE_SUPPORTED_LIMIT == 2
 					 && CMX_RESOLVE_TIMEOUT == 3 && CMX_RESOLVE_UNKNOWN == 4,
 				 "current MX resolve-result endpoints changed");
+StaticAssertDecl(CCMUPO_COMMITTED == 0 && CCMUPO_WAIT_MEMBER == 1
+					 && CCMUPO_FAIL_CLOSED == 2,
+				 "requester-local updater-proof outcomes changed");
 StaticAssertDecl(CCM_ACTION_UPDATE == 0 && CCM_ACTION_DELETE == 1 && CCM_ACTION_LOCK == 2
 					 && CCM_ACTION_HOT_FOLLOW == 3,
 				 "current MX action values changed");
@@ -519,6 +522,7 @@ UT_TEST(test_current_multixact_public_symbols_link)
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_resolve_origin_member_proof);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_updater_candidate_verdict);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_descriptor_hash);
+	UT_ASSERT_NOT_NULL(cluster_multixact_current_updater_proof_outcome);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_validate_updater_proof);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_decide);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_describe);
@@ -581,6 +585,59 @@ test_proof(ClusterCurrentMemberProof *proof, const ClusterCurrentMxMemberDesc *m
 		proof->key = test_ttkey(origin, member->xid, slot);
 	else if (state == CCM_COMMITTED)
 		proof->commit_scn = 100 + ordinal;
+}
+
+
+static void
+test_updater_proof_fixture(
+	ClusterCurrentMxKey *key,
+	ClusterCurrentMxMemberDesc members[2],
+	ClusterCurrentMemberProof proofs[2],
+	ClusterCurrentUpdaterChallenge *challenge,
+	ClusterCurrentUpdaterProof *updater_proof,
+	ClusterCurrentMemberState updater_state)
+{
+	*key = test_mxkey();
+	test_member(&members[0], 100, MultiXactStatusForKeyShare);
+	test_member(&members[1], 101, MultiXactStatusNoKeyUpdate);
+	test_proof(&proofs[0], &members[0], 0, CCM_ABORTED, 2, 50);
+	test_proof(&proofs[1], &members[1], 1, updater_state, 3, 51);
+
+	memset(challenge, 0, sizeof(*challenge));
+	challenge->candidate_next_xmin_key = test_ttkey(3, 101, 61);
+	challenge->updater_xid = 101;
+	challenge->member_ordinal = 1;
+
+	memset(updater_proof, 0, sizeof(*updater_proof));
+	updater_proof->mxkey = *key;
+	updater_proof->candidate_next_xmin_key
+		= challenge->candidate_next_xmin_key;
+	updater_proof->updater_xid = challenge->updater_xid;
+	updater_proof->member_ordinal = challenge->member_ordinal;
+	updater_proof->verdict = CUCP_MATCH;
+}
+
+
+static void
+assert_updater_proof_fail_closed(
+	ClusterMxResolveResult resolve_result,
+	const ClusterCurrentMxKey *key,
+	const ClusterCurrentMxMemberDesc *members,
+	const ClusterCurrentMemberProof *proofs,
+	const ClusterCurrentUpdaterChallenge *challenge,
+	const ClusterCurrentUpdaterProof *updater_proof,
+	uint16 updater_origin_node_id)
+{
+	ClusterTTStatusKey wait_key;
+	ClusterTTStatusKey zero_key;
+
+	memset(&wait_key, 0xa5, sizeof(wait_key));
+	memset(&zero_key, 0, sizeof(zero_key));
+	UT_ASSERT_EQ(cluster_multixact_current_updater_proof_outcome(
+					 resolve_result, key, members, proofs, 2, challenge,
+					 updater_proof, updater_origin_node_id, &wait_key),
+				 CCMUPO_FAIL_CLOSED);
+	UT_ASSERT_EQ(memcmp(&wait_key, &zero_key, sizeof(wait_key)), 0);
 }
 
 
@@ -967,6 +1024,28 @@ UT_TEST(test_current_multixact_updater_candidate_requires_current_exact_binding)
 				 CUCP_UNKNOWN);
 	candidate = current;
 	candidate.cluster_epoch++;
+	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
+					 &candidate, 100, 5, 9, &selected, &selected_result),
+				 CUCP_UNKNOWN);
+
+	/* A retained-overlay miss and an ambiguous current binding both remain
+	 * UNKNOWN; neither may be synthesized from durable history. */
+	candidate = current;
+	memset(&test_runtime_candidate_current_key, 0,
+		   sizeof(test_runtime_candidate_current_key));
+	memset(&test_runtime_candidate_current_result, 0,
+		   sizeof(test_runtime_candidate_current_result));
+	test_runtime_candidate_current_result.status
+		= CLUSTER_TT_STATUS_UNKNOWN;
+	test_runtime_candidate_verdict = CLUSTER_TT_CURRENT_KEY_UNKNOWN;
+	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
+					 &candidate, 100, 5, 9, &selected, &selected_result),
+				 CUCP_UNKNOWN);
+	test_runtime_candidate_current_key = current;
+	test_runtime_candidate_current_result.status
+		= CLUSTER_TT_STATUS_UNKNOWN;
+	test_runtime_candidate_current_result.status_epoch = 9;
+	test_runtime_candidate_current_result.authoritative = true;
 	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
 					 &candidate, 100, 5, 9, &selected, &selected_result),
 				 CUCP_UNKNOWN);
@@ -2345,6 +2424,233 @@ UT_TEST(test_current_multixact_committed_updater_requires_exact_hot_proof)
 }
 
 
+UT_TEST(test_current_multixact_updater_proof_typed_positive_outcomes)
+{
+	ClusterCurrentMxKey key;
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMemberProof proofs[2];
+	ClusterCurrentUpdaterChallenge challenge;
+	ClusterCurrentUpdaterProof updater_proof;
+	ClusterTTStatusKey wait_key;
+	ClusterTTStatusKey zero_key;
+	ClusterTTStatusKey direct_holder;
+	ClusterTTStatusKey parent_holder = {
+		.origin_node_id = 3,
+		.undo_segment_id = 1,
+		.tt_slot_id = 71,
+		.cluster_epoch = 9,
+		.local_xid = 90,
+	};
+
+	memset(&zero_key, 0, sizeof(zero_key));
+
+	/* P1: a committed updater preserves the existing bool behavior. */
+	test_updater_proof_fixture(
+		&key, members, proofs, &challenge, &updater_proof,
+		CCM_COMMITTED);
+	memset(&wait_key, 0xa5, sizeof(wait_key));
+	UT_ASSERT_EQ(cluster_multixact_current_updater_proof_outcome(
+					 CMX_RESOLVE_OK, &key, members, proofs, 2, &challenge,
+					 &updater_proof, 3, &wait_key),
+				 CCMUPO_COMMITTED);
+	UT_ASSERT_EQ(memcmp(&wait_key, &zero_key, sizeof(wait_key)), 0);
+	UT_ASSERT(cluster_multixact_current_validate_updater_proof(
+		&key, members, proofs, 2, &challenge, &updater_proof, 3));
+
+	/* P2: only an authenticated direct ACTIVE holder is waitable. */
+	test_updater_proof_fixture(
+		&key, members, proofs, &challenge, &updater_proof,
+		CCM_ACTIVE);
+	direct_holder = proofs[1].key;
+	memset(&wait_key, 0xa5, sizeof(wait_key));
+	UT_ASSERT_EQ(cluster_multixact_current_updater_proof_outcome(
+					 CMX_RESOLVE_OK, &key, members, proofs, 2, &challenge,
+					 &updater_proof, 3, &wait_key),
+				 CCMUPO_WAIT_MEMBER);
+	UT_ASSERT_EQ(memcmp(&wait_key, &direct_holder, sizeof(wait_key)), 0);
+	UT_ASSERT(!cluster_multixact_current_validate_updater_proof(
+		&key, members, proofs, 2, &challenge, &updater_proof, 3));
+
+	/*
+	 * P3: a SUBCOMMITTED child echo waits on the final authenticated
+	 * parent holder key, not the child or successor candidate key.
+	 */
+	proofs[1].key = parent_holder;
+	memset(&wait_key, 0xa5, sizeof(wait_key));
+	UT_ASSERT_EQ(cluster_multixact_current_updater_proof_outcome(
+					 CMX_RESOLVE_OK, &key, members, proofs, 2, &challenge,
+					 &updater_proof, 3, &wait_key),
+				 CCMUPO_WAIT_MEMBER);
+	UT_ASSERT_EQ(memcmp(&wait_key, &parent_holder, sizeof(wait_key)), 0);
+	UT_ASSERT_NE(memcmp(&wait_key, &challenge.candidate_next_xmin_key,
+						sizeof(wait_key)),
+				 0);
+	UT_ASSERT_EQ(wait_key.local_xid, 90);
+}
+
+
+UT_TEST(test_current_multixact_updater_proof_typed_negative_ballot)
+{
+	ClusterCurrentMxKey key;
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMemberProof proofs[2];
+	ClusterCurrentUpdaterChallenge challenge;
+	ClusterCurrentUpdaterProof updater_proof;
+	ClusterCurrentMemberProof origin_proof;
+	ClusterTTStatusKey origin_key;
+	ClusterTTStatusResult origin_result;
+	ClusterCurrentProofChunkView chunks[2];
+	ClusterCurrentMemberProof ordered[2];
+	uint16 origins[2] = { 2, 3 };
+	uint64 hash;
+	ClusterMxResolveResult hash_result;
+
+	test_updater_proof_fixture(
+		&key, members, proofs, &challenge, &updater_proof,
+		CCM_ACTIVE);
+
+	UT_ASSERT_EQ(cluster_multixact_current_updater_proof_outcome(
+					 CMX_RESOLVE_OK, &key, members, proofs, 2, &challenge,
+					 &updater_proof, 3, NULL),
+				 CCMUPO_FAIL_CLOSED);
+
+	/* N1/N2: no non-OK resolver result can authenticate a wait. */
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_UNKNOWN, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_DENIED, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_SUPPORTED_LIMIT, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_TIMEOUT, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+
+	/* N3/N4: candidate mismatch or current-overlay ambiguity is not authority. */
+	updater_proof.verdict = CUCP_MISMATCH;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	updater_proof.verdict = CUCP_UNKNOWN;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	updater_proof.verdict = CUCP_MATCH;
+
+	/* N5: holder epoch drift cannot cross the request epoch fence. */
+	proofs[1].key.cluster_epoch++;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	proofs[1].key.cluster_epoch--;
+
+	/* N6: a descriptor-hash mismatch collapses upstream to UNKNOWN. */
+	hash = cluster_multixact_current_descriptor_hash(&key, members, 2);
+	memset(chunks, 0, sizeof(chunks));
+	chunks[0].request_id = 77;
+	chunks[0].mxkey = key;
+	chunks[0].descriptor_hash = hash;
+	chunks[0].total_count = 2;
+	chunks[0].source_node_id = 2;
+	chunks[0].chunk_ordinal = 0;
+	chunks[0].chunk_count = 2;
+	chunks[0].proof_count = 1;
+	chunks[0].proofs = &proofs[0];
+	chunks[1] = chunks[0];
+	chunks[1].source_node_id = 3;
+	chunks[1].chunk_ordinal = 1;
+	chunks[1].proofs = &proofs[1];
+	hash_result = cluster_multixact_current_validate_proof_set(
+		&key, members, origins, 2, 77, hash + 1, chunks, 2, ordered);
+	UT_ASSERT_EQ(hash_result, CMX_RESOLVE_UNKNOWN);
+	assert_updater_proof_fail_closed(
+		hash_result, &key, members, proofs, &challenge, &updater_proof, 3);
+
+	/* N7: the real origin resolver rejects a non-authoritative TT result. */
+	origin_key = proofs[1].key;
+	memset(&origin_result, 0, sizeof(origin_result));
+	origin_result.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	origin_result.status_epoch = 9;
+	origin_result.authoritative = false;
+	UT_ASSERT(!cluster_multixact_current_resolve_origin_member_proof(
+		101, members[1].member_status, 1, 3, 9, false, &origin_key,
+		&origin_result, NULL, NULL, &origin_proof));
+	UT_ASSERT_EQ(origin_proof.state, CCM_UNKNOWN);
+	proofs[1] = origin_proof;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_UNKNOWN, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	test_proof(&proofs[1], &members[1], 1, CCM_ACTIVE, 3, 51);
+
+	/* N8: wrong ordinal and duplicate descriptor identity select no updater. */
+	updater_proof.member_ordinal = 0;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	updater_proof.member_ordinal = 1;
+	members[0].xid = members[1].xid;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	members[0].xid = 100;
+
+	/* N9: member and updater xid echoes must remain exact. */
+	proofs[1].member_xid++;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	proofs[1].member_xid--;
+	updater_proof.updater_xid++;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	updater_proof.updater_xid--;
+
+	/* N10: incomplete, wrong-origin, or reserved holder keys never wait. */
+	proofs[1].key.tt_slot_id = 0;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	proofs[1].key.tt_slot_id = 51;
+	proofs[1].key.origin_node_id = 4;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	proofs[1].key.origin_node_id = 3;
+	proofs[1].key._reserved = 1;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	proofs[1].key._reserved = 0;
+
+	/* N11: ACTIVE with a commit SCN is malformed terminal evidence. */
+	proofs[1].commit_scn = 500;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	proofs[1].commit_scn = InvalidScn;
+
+	/* N12: an UNKNOWN peer makes the complete proof set unusable. */
+	proofs[0].state = CCM_UNKNOWN;
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	proofs[0].state = CCM_ABORTED;
+
+	/* N13: SELF and ABORTED updater states carry no waitable holder. */
+	test_proof(&proofs[1], &members[1], 1, CCM_SELF, 3, 51);
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+	test_proof(&proofs[1], &members[1], 1, CCM_ABORTED, 3, 51);
+	assert_updater_proof_fail_closed(
+		CMX_RESOLVE_OK, &key, members, proofs, &challenge,
+		&updater_proof, 3);
+}
+
+
 UT_TEST(test_current_multixact_rejects_context_mode_mismatch)
 {
 	ClusterCurrentMxKey key = test_mxkey();
@@ -2968,7 +3274,7 @@ out:
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(36);
 	UT_RUN(test_current_multixact_public_symbols_link);
 	UT_RUN(test_current_multixact_descriptor_validation);
 	UT_RUN(test_current_multixact_descriptor_accepts_cap_and_hashes_order);
@@ -2988,6 +3294,8 @@ main(void)
 	UT_RUN(test_current_multixact_terminal_nonconflict_and_unknown_precedence);
 	UT_RUN(test_current_multixact_member_states_and_self_cid);
 	UT_RUN(test_current_multixact_committed_updater_requires_exact_hot_proof);
+	UT_RUN(test_current_multixact_updater_proof_typed_positive_outcomes);
+	UT_RUN(test_current_multixact_updater_proof_typed_negative_ballot);
 	UT_RUN(test_current_multixact_rejects_context_mode_mismatch);
 	UT_RUN(test_current_multixact_recompose_filters_terminal_members);
 	UT_RUN(test_current_multixact_recompose_upgrades_requester_member);

@@ -61,6 +61,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
@@ -296,6 +297,16 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 }
 
 int MyProcPid = 12345;
+volatile sig_atomic_t InterruptPending = false;
+static uint32 ut_process_interrupts_count = 0;
+static uint32 ut_arm_interrupt_after_dispatch = 0;
+
+void
+ProcessInterrupts(void)
+{
+	ut_process_interrupts_count++;
+	InterruptPending = false;
+}
 
 /* SRF plumbing referenced by the tier1 peers view — never called here. */
 void
@@ -324,9 +335,11 @@ cstring_to_text(const char *s)
 	return NULL;
 }
 
-/* Router / envelope / chunk / smart-fusion deps of the recv paths —
- * the test never receives an envelope, so these are vacuous. */
+/* Router / envelope / chunk / smart-fusion deps of the recv paths. */
 bool cluster_ic_suppress_caps_reply = false;
+#define UT_RECV_DRAIN_FRAME_COUNT 65
+static uint32 ut_dispatched_envelopes = 0;
+static uint64 ut_dispatched_scn[UT_RECV_DRAIN_FRAME_COUNT];
 
 bool
 cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES], ClusterICHelloMsg *out_msg)
@@ -356,9 +369,13 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 bool
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
-	(void)env;
 	(void)payload;
 	(void)peer_id;
+	if (ut_dispatched_envelopes < UT_RECV_DRAIN_FRAME_COUNT)
+		ut_dispatched_scn[ut_dispatched_envelopes] = env->scn;
+	ut_dispatched_envelopes++;
+	if (ut_arm_interrupt_after_dispatch == ut_dispatched_envelopes)
+		InterruptPending = true;
 	return true;
 }
 
@@ -389,10 +406,29 @@ cluster_sf_note_peer_hello_capabilities_gen(int32 peer_id, uint32 capabilities, 
 }
 
 void
+cluster_sf_note_peer_hello_identity_gen(
+	int32 peer_id, uint32 capabilities, uint32 generation,
+	uint64 boot_incarnation)
+{
+	(void)peer_id;
+	(void)capabilities;
+	(void)generation;
+	(void)boot_incarnation;
+}
+
+uint64
+cluster_qvotec_get_durable_self_incarnation(void)
+{
+	return 0;
+}
+
+static uint32 ut_disconnected_capability_generation = UINT32_MAX;
+
+void
 cluster_sf_note_peer_disconnected_gen(int32 peer_id, uint32 generation)
 {
 	(void)peer_id;
-	(void)generation;
+	ut_disconnected_capability_generation = generation;
 }
 
 void
@@ -549,6 +585,85 @@ static char ut_acc[64 * 1024 * 1024]; /* shared stream accumulator */
 static long ut_junk_a = 0;			  /* junk bytes written ahead of frame A / frame B */
 static long ut_junk_b = 0;
 
+/*
+ * S3-C18 deterministic RED: one readable notification must not let an
+ * always-readable peer monopolize the LMON/LMS main loop.  Production uses
+ * the same receive drain for both planes, so a fixed per-call frame budget
+ * is the yield boundary that lets the caller process SIGHUP/SIGTERM and
+ * drain queued outbound ACKs.
+ *
+ * The production header publishes the same fixed budget to keep the
+ * scheduler contract single-sourced.
+ */
+#define UT_RECV_DRAIN_PEER_ID 7
+
+UT_TEST(test_recv_drain_yields_after_fixed_frame_budget)
+{
+	ClusterICEnvelope frames[UT_RECV_DRAIN_FRAME_COUNT];
+	int fds[2];
+	int flags;
+	uint32 drain_turns = 0;
+	uint32 i;
+	size_t sent = 0;
+	const size_t wire_bytes = sizeof(frames);
+
+	memset(frames, 0, sizeof(frames));
+	for (i = 0; i < UT_RECV_DRAIN_FRAME_COUNT; i++)
+		frames[i].scn = (uint64)i + 1;
+	UT_ASSERT(UT_RECV_DRAIN_FRAME_COUNT > 64);
+	UT_ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+	flags = fcntl(fds[0], F_GETFL, 0);
+	UT_ASSERT(flags >= 0);
+	UT_ASSERT_EQ(fcntl(fds[0], F_SETFL, flags | O_NONBLOCK), 0);
+
+	while (sent < wire_bytes) {
+		ssize_t n = send(fds[1], (const char *)frames + sent, wire_bytes - sent, 0);
+
+		UT_ASSERT(n > 0);
+		if (n <= 0)
+			break;
+		sent += (size_t)n;
+	}
+	UT_ASSERT_EQ(sent, wire_bytes);
+
+	ut_dispatched_envelopes = 0;
+	memset(ut_dispatched_scn, 0, sizeof(ut_dispatched_scn));
+	ut_process_interrupts_count = 0;
+	ut_arm_interrupt_after_dispatch = 1;
+	UT_ASSERT_EQ(cluster_ic_tier1_get_recv_budget_yield(CLUSTER_IC_PLANE_CONTROL), 0);
+	while (ut_dispatched_envelopes < UT_RECV_DRAIN_FRAME_COUNT) {
+		uint32 before = ut_dispatched_envelopes;
+		uint32 remaining = UT_RECV_DRAIN_FRAME_COUNT - before;
+		uint32 expected = Min(remaining, CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET);
+
+		UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_RECV_DRAIN_PEER_ID, fds[0]));
+		UT_ASSERT_EQ(ut_dispatched_envelopes - before, expected);
+		UT_ASSERT(ut_dispatched_envelopes - before
+				  <= CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET);
+		drain_turns++;
+	}
+	UT_ASSERT_EQ(ut_dispatched_envelopes, UT_RECV_DRAIN_FRAME_COUNT);
+	UT_ASSERT_EQ(drain_turns,
+				 (UT_RECV_DRAIN_FRAME_COUNT
+				  + CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET - 1)
+					 / CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET);
+	for (i = 0; i < UT_RECV_DRAIN_FRAME_COUNT; i++)
+		UT_ASSERT_EQ(ut_dispatched_scn[i], (uint64)i + 1);
+	UT_ASSERT_EQ(ut_process_interrupts_count, 1);
+	UT_ASSERT_EQ((int)InterruptPending, 0);
+	UT_ASSERT_EQ(cluster_ic_tier1_get_recv_budget_yield(CLUSTER_IC_PLANE_CONTROL),
+				 UT_RECV_DRAIN_FRAME_COUNT
+					 / CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET);
+	UT_ASSERT_EQ(
+		cluster_ic_tier1_get_recv_turn_frame_highwater(CLUSTER_IC_PLANE_CONTROL),
+		CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET);
+
+	ut_arm_interrupt_after_dispatch = 0;
+	InterruptPending = false;
+	UT_ASSERT_EQ(close(fds[0]), 0);
+	UT_ASSERT_EQ(close(fds[1]), 0);
+}
+
 UT_TEST(test_connect_registers_peer_fd)
 {
 	int listener;
@@ -677,6 +792,13 @@ UT_TEST(test_close_peer_resets_queued_tail)
 	 * so a reconnect can never start its stream with mid-frame bytes. */
 	cluster_ic_tier1_close_peer(UT_PEER_ID, "test close");
 	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+	/*
+	 * Capability generation zero is the fail-closed "no connection"
+	 * marker consumed by Type65 and the LMS outbound ring.  The first
+	 * tier1 connection therefore maps reconnect_count 0 to generation 1,
+	 * and close must invalidate that same one-based identity.
+	 */
+	UT_ASSERT_EQ(ut_disconnected_capability_generation, 1);
 }
 
 UT_TEST(test_drain_on_dead_peer_hard_errors)
@@ -1041,9 +1163,10 @@ UT_TEST(test_anon_duplicate_retires_old_carrier_before_bind)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 
 	UT_RUN(test_connect_registers_peer_fd);
+	UT_RUN(test_recv_drain_yields_after_fixed_frame_budget);
 	UT_RUN(test_initial_eagain_queues_full_frame);
 	UT_RUN(test_drain_delivers_frame_a_intact);
 	UT_RUN(test_smaller_frame_reuses_grown_buffer);

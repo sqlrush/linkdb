@@ -361,6 +361,8 @@ typedef enum BuiltinTrancheIds {
 	LWTRANCHE_CLUSTER_UNDO_BUF,
 	/* PGRAC: spec-5.4 D1 — SQ sequence node-level instance cache region. */
 	LWTRANCHE_CLUSTER_SQ,
+	/* PGRAC: spec-5.6 — CF published-slot census authority region. */
+	LWTRANCHE_CLUSTER_CF,
 		/* PGRAC: spec-5.7 D1 — HW relation-extend block-number authority region. */
 		LWTRANCHE_CLUSTER_HW,
 		/* PGRAC: spec-6.1 — RDMA transport observability shmem strings/state. */

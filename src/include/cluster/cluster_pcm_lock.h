@@ -142,11 +142,25 @@ typedef struct PcmAuthoritySnapshot {
 	int32 x_holder_node;
 	uint32 s_holders_bitmap;
 	int32 pending_x_requester_node;
-	uint32 reserved[2];
+	uint64 authority_generation;
 } PcmAuthoritySnapshot;
 
 StaticAssertDecl(sizeof(PcmAuthoritySnapshot) == 64,
 				 "PcmAuthoritySnapshot process-local layout must remain 64 bytes");
+
+/*
+ * Return the next non-zero full authority generation without ever wrapping.
+ * The output is left untouched on failure so a mutation caller can preflight
+ * this fence before changing any member of the authoritative core tuple.
+ */
+static inline bool
+PcmAuthorityGenerationNext(uint64 current, uint64 *next_out)
+{
+	if (next_out == NULL || current == 0 || current == UINT64_MAX)
+		return false;
+	*next_out = current + 1;
+	return true;
+}
 
 /*
  * Exact queue-to-GRD X handoff token.  The queue engine builds this only
@@ -187,6 +201,39 @@ typedef enum PcmXTransferCommitResult {
 	PCM_X_TRANSFER_COMMIT_STALE,
 	PCM_X_TRANSFER_COMMIT_BAD_STATE
 } PcmXTransferCommitResult;
+
+/*
+ * Stale-X current-read retirement token.  The master constructs this only
+ * from an exact holder FENCE_ACK.  The full authority snapshot and SCN pair
+ * are revalidated under the same PCM entry lock that publishes X->N.
+ */
+#define PCM_STALE_X_FULL_FENCE_PROOF UINT8_C(0x0f)
+
+typedef struct PcmStaleXCommitToken {
+	BufferTag tag;
+	PcmAuthoritySnapshot authority;
+	uint64 request_id;
+	uint64 request_epoch;
+	SCN final_page_scn;
+	SCN durable_page_scn;
+	int32 holder_node;
+	uint8 holder_proof;
+	uint8 reserved[3];
+	uint64 relation_generation;
+} PcmStaleXCommitToken;
+
+StaticAssertDecl(sizeof(PcmStaleXCommitToken) == 136,
+				 "stale-X process-local commit token includes relation lifecycle");
+
+typedef enum PcmStaleXCommitResult {
+	PCM_STALE_X_COMMIT_OK = 0,
+	PCM_STALE_X_COMMIT_DUPLICATE,
+	PCM_STALE_X_COMMIT_NOT_FOUND,
+	PCM_STALE_X_COMMIT_STALE,
+	PCM_STALE_X_COMMIT_BAD_STATE,
+	PCM_STALE_X_COMMIT_WATERMARK_STALE,
+	PCM_STALE_X_COMMIT_INVALID
+} PcmStaleXCommitResult;
 
 
 typedef enum PcmPendingXReserveResult {
@@ -440,8 +487,19 @@ extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, b
 extern PcmLockMode cluster_pcm_lock_query(BufferTag tag);
 extern bool cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out);
 extern bool cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected);
+extern bool cluster_pcm_lock_authority_watermark_snapshot(BufferTag tag,
+														  PcmAuthoritySnapshot *authority_out,
+														  SCN *watermark_out);
+extern bool cluster_pcm_lock_authority_watermark_matches(
+	BufferTag tag, const PcmAuthoritySnapshot *expected_authority, SCN expected_watermark);
+#ifdef USE_ASSERT_CHECKING
+extern bool cluster_pcm_lock_test_force_authority_generation(BufferTag tag, uint64 generation);
+#endif
 extern PcmXGrdHandoffResult
 cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token);
+extern PcmStaleXCommitResult
+cluster_pcm_lock_stale_x_commit_exact(const PcmStaleXCommitToken *token,
+									  PcmAuthoritySnapshot *post_authority_out);
 extern int cluster_pcm_grd_count(void);
 extern void cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count,
 										int *pi_holders_total, int *convert_queue_active);
@@ -472,6 +530,11 @@ extern void cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransiti
 extern PcmGcsTransitionApplyResult
 cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition trans,
 											 int holder_node_id);
+extern PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_gcs_transition_exact_result(
+	BufferTag tag, PcmLockTransition trans, int holder_node_id,
+	uint64 expected_epoch,
+	const PcmAuthoritySnapshot *expected_authority);
 extern bool cluster_pcm_lock_apply_gcs_transition(BufferTag tag, PcmLockTransition trans,
 												  int holder_node_id);
 
@@ -691,6 +754,7 @@ typedef enum ClusterPcmWmSrc {
 	CLUSTER_PCM_WM_SRC_GRANT_X,		 /* master grant-X ship to remote requester */
 	CLUSTER_PCM_WM_SRC_ACK_SLOTLESS, /* invalidate-ACK slotless e2 fan-out feed */
 	CLUSTER_PCM_WM_SRC_ACK_SLOT,	 /* invalidate-ACK slot-claimed blocking feed */
+	CLUSTER_PCM_WM_SRC_STALE_X_COMMIT, /* exact holder-fenced X->N retirement */
 } ClusterPcmWmSrc;
 
 typedef struct ClusterPcmWmProv {

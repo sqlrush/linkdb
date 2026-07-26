@@ -61,6 +61,16 @@ sub dumpkey
 
 my $wroot = PostgreSQL::Test::Utils::tempdir();
 my $regfile = "$wroot/pgrac_wal_state";
+my $stale_tmp = "$regfile.tmp.n3.p999.1";
+
+# P0-22: a creator can crash after its private image is durable but before
+# unlinking that private name.  Such residue is never the registry authority
+# and must not block a later first boot from publishing the final path.
+{
+	open my $fh, '>:raw', $stale_tmp or die "open $stale_tmp: $!";
+	print {$fh} "torn private candidate";
+	close $fh or die "close $stale_tmp: $!";
+}
 
 my $node = PgracClusterNode->new('wal_state_a');
 $node->init(extra => [ '-X', "$wroot/thread_4" ]);
@@ -78,6 +88,8 @@ $node->start;
 # ============================================================
 ok(-f $regfile, 'L1 registry file exists after first boot');
 is(-s $regfile, 66048, 'L1 registry file is the fixed 66048 bytes');
+ok(-f $stale_tmp, 'L1 stale private creator residue was ignored');
+unlink($stale_tmp) or die "unlink $stale_tmp: $!";
 is(dumpkey($node, 'registry_ready'), 't', 'L1 registry_ready');
 is(dumpkey($node, 'registry_slot_state'), 'active',
 	'L1 own slot is ACTIVE once the node serves SQL');

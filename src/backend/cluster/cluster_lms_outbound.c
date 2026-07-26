@@ -56,10 +56,10 @@
 
 #define PGRAC_LMS_OUTBOUND_CAPACITY 256
 
-StaticAssertDecl(sizeof(ClusterCurrentMxDescribeForwardV2) == PGRAC_LMS_OUTBOUND_PAYLOAD_MAX,
-				 "current-MX describe V2 must exactly fit the DATA outbound slot");
-StaticAssertDecl(sizeof(ClusterCurrentMxProofForwardV2) == PGRAC_LMS_OUTBOUND_PAYLOAD_MAX,
-				 "current-MX proof V2 must exactly fit the DATA outbound slot");
+StaticAssertDecl(sizeof(ClusterCurrentMxDescribeForwardV2) <= PGRAC_LMS_OUTBOUND_PAYLOAD_MAX,
+				 "current-MX describe V2 must fit the DATA outbound slot");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofForwardV2) <= PGRAC_LMS_OUTBOUND_PAYLOAD_MAX,
+				 "current-MX proof V2 must fit the DATA outbound slot");
 StaticAssertDecl(sizeof(ClusterCurrentMxDescribeForwardV2) > PGRAC_GES_OUTBOUND_PAYLOAD_MAX,
 				 "current-MX V2 must never fall back to the CONTROL outbound slot");
 
@@ -80,7 +80,7 @@ typedef struct ClusterLmsOutboundSlot {
 	uint8 payload[PGRAC_LMS_OUTBOUND_PAYLOAD_MAX];
 } ClusterLmsOutboundSlot;
 
-StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 152,
+StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 160,
 				 "LMS outbound slot capability guard layout changed");
 
 typedef struct ClusterLmsZeroBlockReplyWire {

@@ -1163,6 +1163,17 @@ typedef struct PcmXPeerFrontier {
 	uint64 local_retire_in_progress_ticket_id;
 } PcmXPeerFrontier;
 
+/*
+ * Process-local copy of the complete persistent RETIRE authority.  Callers
+ * may interpret the gate/frontiers only when valid is true.
+ */
+typedef struct PcmXRetireFrontierCensus {
+	bool valid;
+	PcmXRuntimeSnapshot runtime;
+	uint32 local_retire_gate;
+	PcmXPeerFrontier peer[PCM_X_PROTOCOL_NODE_LIMIT];
+} PcmXRetireFrontierCensus;
+
 /* Lifetime counters and exact current queue depth in the existing PCM-X region. */
 typedef struct PcmXStats {
 	pg_atomic_uint64 enqueue_count;
@@ -1373,6 +1384,7 @@ cluster_pcm_x_directory_delete_exact(PcmXDirectoryKind kind, const void *key, Pc
 extern uint32 cluster_pcm_x_tag_hash(const BufferTag *tag);
 extern uint32 cluster_pcm_x_lock_partition(uint32 tag_hash);
 extern PcmXRuntimeSnapshot cluster_pcm_x_runtime_snapshot(void);
+extern bool cluster_pcm_x_retire_frontier_census(PcmXRetireFrontierCensus *out);
 extern bool cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out);
 extern void cluster_pcm_x_stats_note_enqueue(void);
 extern void cluster_pcm_x_stats_note_wait(void);
@@ -1401,6 +1413,9 @@ cluster_pcm_x_runtime_activate_bound(uint64 master_session_incarnation,
 extern PcmXQueueResult cluster_pcm_x_runtime_peer_binding_revalidate_exact(int32 peer_node,
 																		   uint64 cluster_epoch,
 																		   uint64 peer_session);
+extern PcmXQueueResult cluster_pcm_x_runtime_reform_peer_restart_bound(
+	uint64 master_session_incarnation,
+	const PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT], bool rebase_wire_active);
 extern bool cluster_pcm_x_runtime_reset_activating(uint32 expected_gate_generation);
 extern bool cluster_pcm_x_runtime_transition(PcmXRuntimeState expected, PcmXRuntimeState desired);
 /* Cross-layer fail-closed seam for adapters that have already consumed an
@@ -1416,6 +1431,9 @@ extern void cluster_pcm_x_runtime_fail_closed_detail_at(const char *site_file, i
 												 uint64 context_id);
 /* Copies the recorded fail-closed site into buf; false when never fused. */
 extern bool cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen);
+#ifdef USE_ASSERT_CHECKING
+extern bool cluster_pcm_x_runtime_peer_binding_debug(int32 peer_node, char *buf, Size buflen);
+#endif
 /* Diagnostic iterators over live master tag / occupied ticket slots for the
  * pg_cluster_state dump; racy-tolerant, never used for protocol decisions. */
 extern bool cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf,
@@ -1739,9 +1757,26 @@ typedef struct PcmXLocalDrainCertificate {
 	bool valid;
 } PcmXLocalDrainCertificate;
 
+/* Read-only proof for tagless RETIRE vs tag-sharded late replay.  The peer
+ * binding and both watermarks are sampled under allocator_lock; callers must
+ * still use retired_ref_state_exact when they need proof that one full ref is
+ * absent from the generation-exact local tag. */
+typedef struct PcmXLocalRetireFrontierSample {
+	uint64 cluster_epoch;
+	uint64 master_session_incarnation;
+	uint64 retired_ticket_id;
+	uint64 in_progress_ticket_id;
+} PcmXLocalRetireFrontierSample;
+
 extern PcmXQueueResult cluster_pcm_x_local_drain_poll_certificate_exact(
 	const PcmXDrainPollPayload *poll, int32 authenticated_master_node,
 	uint64 authenticated_master_session, PcmXLocalDrainCertificate *certificate_out);
+extern PcmXQueueResult cluster_pcm_x_local_retired_frontier_exact(
+	uint64 cluster_epoch, int32 authenticated_master_node, uint64 authenticated_master_session,
+	PcmXLocalRetireFrontierSample *sample_out);
+extern PcmXQueueResult cluster_pcm_x_local_retired_ref_state_exact(
+	const PcmXTicketRef *ref, int32 authenticated_master_node,
+	uint64 authenticated_master_session);
 extern PcmXQueueResult cluster_pcm_x_local_retire_up_to_exact(const PcmXRetirePayload *request,
 															  int32 authenticated_master_node,
 															  uint64 authenticated_master_session);

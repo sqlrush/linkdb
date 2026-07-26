@@ -445,7 +445,8 @@ UT_TEST(test_pi_holder_note_and_collect_prototypes_linkable)
 UT_TEST(test_bufmgr_pi_helpers_prototypes_linkable)
 {
 	bool (*is_pi_fp)(BufferTag) = &cluster_bufmgr_block_is_pi;
-	bool (*discard_fp)(BufferTag) = &cluster_bufmgr_discard_pi_block;
+	ClusterBufmgrPiDiscardResult (*discard_fp)(BufferTag)
+		= &cluster_bufmgr_discard_pi_block;
 
 	UT_ASSERT(is_pi_fp != NULL);
 	UT_ASSERT(discard_fp != NULL);
@@ -453,11 +454,14 @@ UT_TEST(test_bufmgr_pi_helpers_prototypes_linkable)
 
 UT_TEST(test_pi_note_ring_api_prototypes_linkable)
 {
-	void (*note_fp)(BufferTag, SCN) = &cluster_gcs_block_pi_write_note;
+	void (*note_fp)(const GcsPiWriteNote *) = &cluster_gcs_block_pi_write_note;
 	uint64 (*snap_fp)(void) = &cluster_gcs_block_pi_note_presync_snapshot;
 	void (*confirm_fp)(uint64) = &cluster_gcs_block_pi_note_confirm;
 	void (*drain_fp)(void) = &cluster_gcs_block_pi_discard_drain;
 
+	UT_ASSERT_EQ(sizeof(GcsPiWriteNote), 56);
+	UT_ASSERT_EQ(offsetof(GcsPiWriteNote, source_buf_id), 20);
+	UT_ASSERT_EQ(offsetof(GcsPiWriteNote, page_scn), 32);
 	UT_ASSERT(note_fp != NULL);
 	UT_ASSERT(snap_fp != NULL);
 	UT_ASSERT(confirm_fp != NULL);

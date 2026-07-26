@@ -138,6 +138,7 @@ OBJS = \
 	cluster_lck.o \
 	cluster_lock_acquire.o \
 	cluster_native_lock_probe.o \
+	cluster_lms_native_probe_state.o \
 	cluster_lmd.o \
 	cluster_lmd_graph.o \
 	cluster_lmd_probe_collector.o \
@@ -160,6 +161,7 @@ OBJS = \
 	cluster_pcm_x_convert.o \
 	cluster_pcm_x_image_fetch.o \
 	cluster_pgstat.o \
+	cluster_pi_discard_policy.o \
 	cluster_pi_recovery_srf.o \
 	cluster_pi_shadow.o \
 	cluster_quorum_decision.o \

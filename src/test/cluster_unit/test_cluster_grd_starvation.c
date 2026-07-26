@@ -61,6 +61,8 @@
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_gcs_block_dedup.h"
+#include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_hw.h"				 /* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
@@ -96,6 +98,17 @@ bool IsUnderPostmaster = false;
  * dead-holder cleanup; this fixture has no PCM shmem — no-op. */
 uint64
 cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+cluster_gcs_block_dedup_cleanup_on_node_dead(
+	uint32 dead_node pg_attribute_unused())
+{}
+
+uint32
+cluster_ges_dedup_drop_origin_node(uint32 dead_node pg_attribute_unused())
 {
 	return 0;
 }
@@ -669,6 +682,11 @@ cluster_grd_outbound_enqueue_cleanup_release(uint32 d pg_attribute_unused(),
 {}
 void
 cluster_lmd_cleanup_on_backend_exit_count_inc(uint64 d pg_attribute_unused())
+{}
+void
+cluster_lms_native_probe_cleanup_on_backend_exit(
+	int32 requester_node_id pg_attribute_unused(),
+	int procno pg_attribute_unused())
 {}
 void
 cluster_lmd_cleanup_skip_other_owner_count_inc(uint64 d pg_attribute_unused())
@@ -1843,14 +1861,15 @@ UT_TEST(test_starv_u20_max_skips_zero_disables_boost)
  * are exercised behaviourally by U1-U18. */
 UT_TEST(test_starv_u21_layout_and_identity_ownership)
 {
-	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 88);
+	UT_ASSERT_EQ((int)sizeof(ClusterGrdConvert), 96);
 	/* spec-5.8-owned canonical wait identity NOT moved by spec-5.10. */
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, waiter_xid), 52);
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_seq), 64);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, origin_boot_incarnation), 48);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, waiter_xid), 60);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, wait_seq), 72);
 	/* spec-5.10 fairness fields appended after the spec-5.8 identity. */
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, fair_queue_seq), 72);
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, skip_count), 80);
-	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, boosted), 84);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, fair_queue_seq), 80);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, skip_count), 88);
+	UT_ASSERT_EQ((int)offsetof(ClusterGrdConvert, boosted), 92);
 }
 
 /* U22 — runtime-off LMON sweep wiring (fix-forward): turning protection off sets

@@ -82,6 +82,7 @@
 #include "miscadmin.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
+#include "storage/procarray.h" /* S3-P0-13: origin-own exact live proof */
 #include "storage/shmem.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
@@ -530,29 +531,215 @@ lms_undo_fetch_serve(ClusterLmsCrSlot *slot)
 typedef enum LmsOwnXidReason {
 	LMS_OWN_XID_PROVEN = 0,		   /* out_* holds a proven terminal */
 	LMS_OWN_XID_PROVEN_UPGRADE,	   /* proven ABORTED via the invalid_scn CLOG upgrade */
+	LMS_OWN_XID_PROVEN_IN_PROGRESS, /* exact fresh-ref binding + origin ProcArray live */
 	LMS_OWN_XID_REFUSE_OTHER,	   /* not-committed / wrap-suspect / retention-fail / ambiguous */
 	LMS_OWN_XID_REFUSE_ZERO_MATCH, /* recycled 0-match with no explicit CLOG terminal */
 	LMS_OWN_XID_REFUSE_INVALID_SCN /* delayed-cleanout, not provably aborted */
 } LmsOwnXidReason;
 
+static ClusterCrServerOtherRefusalDetail
+lms_exact_refusal_detail(ClusterCrServerExactDiagnostic diagnostic)
+{
+	switch (diagnostic) {
+	case CLUSTER_CR_SERVER_EXACT_NOT_AUTHORITATIVE:
+		return CLUSTER_CR_SERVER_OTHER_NOT_AUTHORITATIVE;
+	case CLUSTER_CR_SERVER_EXACT_NOT_MINE:
+		return CLUSTER_CR_SERVER_OTHER_NOT_MINE;
+	case CLUSTER_CR_SERVER_EXACT_EXPECTED_SEGMENT_INVALID:
+		return CLUSTER_CR_SERVER_OTHER_EXPECTED_SEGMENT_INVALID;
+	case CLUSTER_CR_SERVER_EXACT_EXPECTED_SLOT_INVALID:
+		return CLUSTER_CR_SERVER_OTHER_EXPECTED_SLOT_INVALID;
+	case CLUSTER_CR_SERVER_EXACT_SEGMENT_MISMATCH:
+		return CLUSTER_CR_SERVER_OTHER_SEGMENT_MISMATCH;
+	case CLUSTER_CR_SERVER_EXACT_SLOT_MISMATCH:
+		return CLUSTER_CR_SERVER_OTHER_SLOT_MISMATCH;
+	case CLUSTER_CR_SERVER_EXACT_OK:
+	default:
+		return CLUSTER_CR_SERVER_OTHER_RESIDUAL;
+	}
+}
+
+static ClusterCrServerOtherRefusalDetail
+lms_confirm_refusal_detail(ClusterCrServerConfirmDiagnostic diagnostic)
+{
+	switch (diagnostic) {
+	case CLUSTER_CR_SERVER_CONFIRM_RESOLVE_KIND:
+		return CLUSTER_CR_SERVER_OTHER_CONFIRM_RESOLVE_KIND;
+	case CLUSTER_CR_SERVER_CONFIRM_SEGMENT_MISMATCH:
+		return CLUSTER_CR_SERVER_OTHER_CONFIRM_SEGMENT_MISMATCH;
+	case CLUSTER_CR_SERVER_CONFIRM_SLOT_MISMATCH:
+		return CLUSTER_CR_SERVER_OTHER_CONFIRM_SLOT_MISMATCH;
+	case CLUSTER_CR_SERVER_CONFIRM_WRAP_MISMATCH:
+		return CLUSTER_CR_SERVER_OTHER_CONFIRM_WRAP_MISMATCH;
+	case CLUSTER_CR_SERVER_CONFIRM_SCN_MISMATCH:
+		return CLUSTER_CR_SERVER_OTHER_CONFIRM_SCN_MISMATCH;
+	case CLUSTER_CR_SERVER_CONFIRM_STABLE:
+	default:
+		return CLUSTER_CR_SERVER_OTHER_RESIDUAL;
+	}
+}
+
+/*
+ * The only srv_other bump site: every aggregate event first chooses exactly
+ * one detail bucket.  This construction makes
+ * vis53r97_leg_srv_other_refuse_count == sum(detail counters) invariant.
+ */
+static void
+lms_note_other_refusal_detail(ClusterCrServerOtherRefusalDetail detail)
+{
+	cluster_cr_server_other_refusal_detail_bump(detail);
+	cluster_vis53r97_note_srv_other();
+}
+
 static LmsOwnXidReason
-lms_resolve_own_xid_verdict(TransactionId xid, uint8 *out_verdict, SCN *out_commit_scn,
-							SCN *out_horizon_scn, uint16 *out_wrap)
+lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
+							uint32 expected_tt_slot_id, bool allow_live,
+							uint8 *out_verdict, SCN *out_commit_scn,
+							SCN *out_horizon_scn, uint16 *out_wrap,
+							ClusterCrServerOtherRefusalDetail *out_other_detail)
 {
 	SCN scn = InvalidScn;
 	SCN horizon = InvalidScn;
 	uint16 wrap = 0;
+	uint16 matched_segment = 0;
+	uint16 matched_slot = 0;
+	ClusterTTDurableResolve resolve;
 
 	*out_verdict = 0;
 	*out_commit_scn = InvalidScn;
 	*out_horizon_scn = InvalidScn;
 	*out_wrap = 0;
+	if (out_other_detail != NULL)
+		*out_other_detail = CLUSTER_CR_SERVER_OTHER_RESIDUAL;
 
-	switch (
-		cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, &scn, NULL, NULL, &wrap)) {
+	resolve = cluster_tt_slot_durable_resolve_by_xid(
+		xid, CLUSTER_TT_WRAP_ANY, &scn, &matched_segment, &matched_slot, &wrap);
+	switch (resolve) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
-		if (!TransactionIdDidCommit(xid))
-			return LMS_OWN_XID_REFUSE_OTHER; /* C1b: stamped-then-crashed is in-doubt */
+		{
+			bool did_commit_before = TransactionIdDidCommit(xid);
+			bool did_abort_before = false;
+			bool did_commit_after = false;
+			bool did_abort_after = false;
+			bool exact_live = false;
+			bool xid_is_mine = false;
+			bool xid_is_in_progress = false;
+			bool durable_binding_stable = false;
+			bool exact_binding = false;
+			ClusterCrServerExactDiagnostic exact_diagnostic
+				= CLUSTER_CR_SERVER_EXACT_NOT_AUTHORITATIVE;
+			ClusterCrServerConfirmDiagnostic confirm_diagnostic
+				= CLUSTER_CR_SERVER_CONFIRM_STABLE;
+
+			/*
+			 * S3-P0-13: RESOLVED_SCN is a pre-commit stamp, so CLOG may
+			 * legitimately still say IN_PROGRESS.  Widen only the fresh-ref
+			 * authoritative request that carries the exact physical TT
+			 * segment/slot binding.  The origin must independently prove the
+			 * xid belongs to its stripe and is still in its own ProcArray.
+			 *
+			 * Bracket that ProcArray sample with two complete durable scans
+			 * and require the exact {segment,slot,wrap,scn} binding to remain
+			 * stable.  Any drift, underivable xid, missing slot, or xid that
+			 * has already left ProcArray remains UNKNOWN/53R97.
+			 */
+			if (!did_commit_before) {
+				SCN confirm_scn = InvalidScn;
+				uint16 confirm_segment = 0;
+				uint16 confirm_slot = 0;
+				uint16 confirm_wrap = 0;
+				bool confirm_resolved_scn = false;
+
+				xid_is_mine = allow_live && cluster_xid_is_mine(xid);
+				exact_diagnostic = cluster_cr_server_exact_diagnostic(
+					allow_live, xid_is_mine, expected_segment_id,
+					expected_tt_slot_id, matched_segment, matched_slot);
+				exact_binding = exact_diagnostic == CLUSTER_CR_SERVER_EXACT_OK;
+				if (exact_binding) {
+					/*
+					 * DidAbort is a positive widening only for the same
+					 * authoritative fresh-ref physical binding as kind4.
+					 * Legacy/non-authoritative verdicts retain their old
+					 * UNKNOWN boundary.
+					 */
+					did_abort_before = TransactionIdDidAbort(xid);
+					if (!did_abort_before)
+						xid_is_in_progress = TransactionIdIsInProgress(xid);
+					/*
+					 * CLOG terminal state is published before ProcArray exit.
+					 * Re-sample after a non-live result so an abort/commit that
+					 * lands between the first CLOG sample and the ProcArray
+					 * sample cannot collapse into OTHER.  Both checks remain
+					 * positive-authority only; all-false still fails closed.
+					 */
+					if (cluster_cr_server_terminal_resample_allowed(
+							allow_live, exact_binding, did_commit_before,
+							did_abort_before, xid_is_in_progress)) {
+						did_commit_after = TransactionIdDidCommit(xid);
+						if (!did_commit_after) {
+							did_abort_after = TransactionIdDidAbort(xid);
+							if (did_abort_after)
+								cluster_cr_server_stat_bump(
+									CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_ABORT);
+							else
+								cluster_cr_server_stat_bump(
+									CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_UNKNOWN);
+						} else
+							cluster_cr_server_stat_bump(
+								CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_COMMIT);
+					}
+					if (xid_is_in_progress) {
+						confirm_resolved_scn
+							= cluster_tt_slot_durable_resolve_by_xid(
+								  xid, CLUSTER_TT_WRAP_ANY, &confirm_scn,
+								  &confirm_segment, &confirm_slot,
+								  &confirm_wrap)
+							  == CLUSTER_TT_DURABLE_RESOLVED_SCN;
+						confirm_diagnostic = cluster_cr_server_confirm_diagnostic(
+							confirm_resolved_scn, matched_segment, matched_slot,
+							wrap, scn, confirm_segment, confirm_slot,
+							confirm_wrap, confirm_scn);
+						durable_binding_stable
+							= confirm_diagnostic == CLUSTER_CR_SERVER_CONFIRM_STABLE;
+					}
+				}
+				exact_live = cluster_cr_server_live_binding_exact(
+					xid_is_mine, expected_segment_id,
+					expected_tt_slot_id, matched_segment, matched_slot,
+					xid_is_in_progress, durable_binding_stable);
+			}
+
+			switch (cluster_cr_server_resolved_scn_resampled_verdict(
+				did_commit_before, did_abort_before, exact_live,
+				did_commit_after, did_abort_after)) {
+			case CLUSTER_UNDO_VERDICT_ABORTED:
+				/*
+				 * The pre-commit TT stamp can outlive an explicit abort
+				 * record.  Origin CLOG ABORTED is terminal positive proof,
+				 * not recycled/OTHER just because ProcArray is now empty.
+				 */
+				*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+				return LMS_OWN_XID_PROVEN_UPGRADE;
+			case CLUSTER_UNDO_VERDICT_IN_PROGRESS:
+				*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS;
+				return LMS_OWN_XID_PROVEN_IN_PROGRESS;
+			case CLUSTER_UNDO_VERDICT_COMMITTED_EXACT:
+				break;
+			case CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED:
+			default:
+				if (out_other_detail != NULL) {
+					if (exact_diagnostic != CLUSTER_CR_SERVER_EXACT_OK)
+						*out_other_detail = lms_exact_refusal_detail(exact_diagnostic);
+					else if (xid_is_in_progress
+							 && confirm_diagnostic != CLUSTER_CR_SERVER_CONFIRM_STABLE)
+						*out_other_detail
+							= lms_confirm_refusal_detail(confirm_diagnostic);
+					else
+						*out_other_detail = CLUSTER_CR_SERVER_OTHER_TERMINAL_UNKNOWN;
+				}
+				return LMS_OWN_XID_REFUSE_OTHER;
+			}
+		}
 		if (cluster_cr_accept_resolved_scn(scn)) {
 			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
 			*out_commit_scn = scn;
@@ -681,11 +868,13 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	SCN commit_scn = InvalidScn;
 	SCN horizon_scn = InvalidScn;
 	uint16 wrap = 0;
+	ClusterCrServerOtherRefusalDetail other_detail
+		= CLUSTER_CR_SERVER_OTHER_RESIDUAL;
 
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
 	if (!TransactionIdIsNormal(xid)) {
-		cluster_vis53r97_note_srv_other();
+		lms_note_other_refusal_detail(CLUSTER_CR_SERVER_OTHER_RESIDUAL);
 		return false;
 	}
 
@@ -697,7 +886,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	 * + CLOG authority below, the positive proof unchanged).
 	 */
 	if (!slot->undo_authoritative && !cluster_xid_is_mine(xid)) {
-		cluster_vis53r97_note_srv_other();
+		lms_note_other_refusal_detail(CLUSTER_CR_SERVER_OTHER_RESIDUAL);
 		return false;
 	}
 
@@ -711,11 +900,20 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	slot->undo_auth.authority_scn = cluster_scn_current();
 
 	/* Resolve the terminal via the shared core; attribute the census leg. */
-	switch (lms_resolve_own_xid_verdict(xid, &verdict, &commit_scn, &horizon_scn, &wrap)) {
+	switch (lms_resolve_own_xid_verdict(
+		xid, slot->undo_segment_id, slot->undo_block_no,
+		slot->undo_authoritative, &verdict, &commit_scn,
+		&horizon_scn, &wrap, &other_detail)) {
 	case LMS_OWN_XID_PROVEN:
 		break;
 	case LMS_OWN_XID_PROVEN_UPGRADE:
 		cluster_vis53r97_note_live_upgrade_hit(); /* spec-7.1 D1 serve upgrade */
+		break;
+	case LMS_OWN_XID_PROVEN_IN_PROGRESS:
+		elog(DEBUG1,
+			 "undo verdict: xid %u origin %d IN_PROGRESS exact segment %u slot %u",
+			 xid, cluster_node_id, slot->undo_segment_id,
+			 slot->undo_block_no);
 		break;
 	case LMS_OWN_XID_REFUSE_ZERO_MATCH:
 		cluster_vis53r97_note_srv_zero_match();
@@ -725,7 +923,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		return false;
 	case LMS_OWN_XID_REFUSE_OTHER:
 	default:
-		cluster_vis53r97_note_srv_other();
+		lms_note_other_refusal_detail(other_detail);
 		return false;
 	}
 
@@ -862,7 +1060,9 @@ cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
 	 * abort upgrade into lms_resolve_own_xid_verdict; this wrapper only
 	 * shapes the page.  Census attribution is the caller's (the self leg
 	 * keeps the rtvis counters; this core bumps none). */
-	switch (lms_resolve_own_xid_verdict(xid, &verdict, &commit_scn, &horizon_scn, &wrap)) {
+	switch (lms_resolve_own_xid_verdict(
+		xid, 0, 0, false, &verdict, &commit_scn, &horizon_scn,
+		&wrap, NULL)) {
 	case LMS_OWN_XID_PROVEN:
 	case LMS_OWN_XID_PROVEN_UPGRADE:
 		break;
@@ -966,8 +1166,9 @@ lms_undo_multi_verdict_serve(ClusterLmsCrSlot *slot)
 			pfree(members);
 			return false;
 		}
-		switch (lms_resolve_own_xid_verdict(member_xid, &out->verdict, &out->commit_scn,
-											&out->horizon_scn, &out->wrap)) {
+		switch (lms_resolve_own_xid_verdict(
+			member_xid, 0, 0, false, &out->verdict,
+			&out->commit_scn, &out->horizon_scn, &out->wrap, NULL)) {
 		case LMS_OWN_XID_PROVEN:
 			break;
 		case LMS_OWN_XID_PROVEN_UPGRADE:

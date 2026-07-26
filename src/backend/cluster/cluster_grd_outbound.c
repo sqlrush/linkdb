@@ -41,10 +41,12 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_lms.h" /* PGRAC: spec-7.2 D4 DATA-ring routing */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-7.3 D4 — cluster_lms_workers */
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -110,6 +112,11 @@ typedef struct ClusterGrdOutboundShared {
 
 static ClusterGrdOutboundShared *cluster_grd_outbound_state = NULL;
 static LWLock *cluster_grd_outbound_lock = NULL;
+static uint32 cleanup_release_nonthrow_depth;
+static bool cleanup_release_nonthrow_failed;
+#ifdef USE_ASSERT_CHECKING
+static bool cf_s6_double_full_injection_consumed;
+#endif
 
 #define CLEANUP_RETRY_WARN50_BIT 0x01
 #define CLEANUP_RETRY_WARN90_BIT 0x02
@@ -166,8 +173,9 @@ cluster_grd_outbound_shmem_register(void)
  * ============================================================ */
 
 static bool
-ring_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload,
-		  uint16 payload_len)
+ring_push_cap(uint8 msg_type, uint8 origin, uint32 dest_node_id,
+			  const void *payload, uint16 payload_len,
+			  uint32 required_capability, uint32 capability_generation)
 {
 	ClusterGrdOutboundSlot *slot;
 
@@ -181,6 +189,8 @@ ring_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload
 	slot->msg_type = msg_type;
 	slot->origin = origin;
 	slot->payload_len = payload_len;
+	slot->required_capability = required_capability;
+	slot->capability_generation = capability_generation;
 	if (payload_len > 0)
 		memcpy(slot->payload, payload, payload_len);
 
@@ -191,6 +201,14 @@ ring_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload
 	 * helper so every producer (current and future) is covered. */
 	cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_GRD_OUTBOUND);
 	return true;
+}
+
+static bool
+ring_push(uint8 msg_type, uint8 origin, uint32 dest_node_id,
+		  const void *payload, uint16 payload_len)
+{
+	return ring_push_cap(
+		msg_type, origin, dest_node_id, payload, payload_len, 0, 0);
 }
 
 static void
@@ -225,8 +243,11 @@ reply_dirty_push(uint32 dest_node_id, const void *payload, uint16 payload_len)
 }
 
 static bool
-cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void *payload,
-				   uint16 payload_len, uint8 *new_warnings, uint32 *depth_after)
+cleanup_dirty_push_cap(uint8 msg_type, uint8 origin, uint32 dest_node_id,
+					   const void *payload, uint16 payload_len,
+					   uint32 required_capability,
+					   uint32 capability_generation,
+					   uint8 *new_warnings, uint32 *depth_after)
 {
 	ClusterGrdOutboundSlot *slot;
 	uint8 warnings = 0;
@@ -253,6 +274,8 @@ cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void
 	slot->msg_type = msg_type;
 	slot->origin = origin;
 	slot->payload_len = payload_len;
+	slot->required_capability = required_capability;
+	slot->capability_generation = capability_generation;
 	if (payload_len > 0)
 		memcpy(slot->payload, payload, payload_len);
 
@@ -283,6 +306,82 @@ cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id, const void
 }
 
 static bool
+cleanup_dirty_push(uint8 msg_type, uint8 origin, uint32 dest_node_id,
+				   const void *payload, uint16 payload_len,
+				   uint8 *new_warnings, uint32 *depth_after)
+{
+	return cleanup_dirty_push_cap(
+		msg_type, origin, dest_node_id, payload, payload_len, 0, 0,
+		new_warnings, depth_after);
+}
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Product-bound S3-P0-10 regression seam.
+ *
+ * t/417 arms this point only after its baseline checkpoint.  During the next
+ * checkpointer ResourceOwner callback, the real remote S6 terminal producer
+ * enters the nonthrow scope and enqueues its GES_DEDUP_DONE lifecycle frame.
+ * Fill both physical queues while holding their real lock so that this exact
+ * producer deterministically observes the otherwise timing-dependent
+ * ring-full + cleanup-dirty-full state.  Ordinary cleanup RELEASE and
+ * lifecycle ACK producers cannot consume this one-shot seam.
+ *
+ * The fill is process-local and one-shot.  Slots are valid zero-payload
+ * HEARTBEAT, non-retry BACKEND_REQUEST markers addressed to this node.  Once
+ * the producer has observed full/full, its caller restores the saved heads
+ * and counts under the same lock, so no marker can reach LMON or a peer.
+ */
+static bool
+cf_s6_test_saturate_locked(void)
+{
+	ClusterGrdOutboundSlot *slot;
+
+	if (cleanup_release_nonthrow_depth == 0
+		|| cf_s6_double_full_injection_consumed
+		|| !cluster_injection_is_armed("cluster-cf-s6-outbound-double-full"))
+		return false;
+
+	while (cluster_grd_outbound_state->ring_count
+		   < PGRAC_GES_OUTBOUND_RING_CAPACITY) {
+		slot = &cluster_grd_outbound_state
+					->ring[cluster_grd_outbound_state->ring_head];
+		memset(slot, 0, sizeof(*slot));
+		slot->dest_node_id = (uint32)cluster_node_id;
+		slot->msg_type = PGRAC_IC_MSG_HEARTBEAT;
+		slot->origin = CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST;
+		cluster_grd_outbound_state->ring_head
+			= (cluster_grd_outbound_state->ring_head + 1)
+			  % PGRAC_GES_OUTBOUND_RING_CAPACITY;
+		cluster_grd_outbound_state->ring_count++;
+	}
+
+	while (cluster_grd_outbound_state->cleanup_dirty_count
+		   < PGRAC_GES_CLEANUP_DIRTY_BUDGET) {
+		slot = &cluster_grd_outbound_state
+					->cleanup_dirty[cluster_grd_outbound_state->cleanup_dirty_head];
+		memset(slot, 0, sizeof(*slot));
+		slot->dest_node_id = (uint32)cluster_node_id;
+		slot->msg_type = PGRAC_IC_MSG_HEARTBEAT;
+		slot->origin = CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST;
+		cluster_grd_outbound_state->cleanup_dirty_head
+			= (cluster_grd_outbound_state->cleanup_dirty_head + 1)
+			  % PGRAC_GES_CLEANUP_DIRTY_BUDGET;
+		cluster_grd_outbound_state->cleanup_dirty_count++;
+	}
+
+	cf_s6_double_full_injection_consumed = true;
+	return true;
+}
+#else
+static inline bool
+cf_s6_test_saturate_locked(void)
+{
+	return false;
+}
+#endif
+
+static bool
 requeue_slot(const ClusterGrdOutboundSlot *slot, uint8 *new_warnings, uint32 *depth_after)
 {
 	Assert(slot != NULL);
@@ -294,8 +393,11 @@ requeue_slot(const ClusterGrdOutboundSlot *slot, uint8 *new_warnings, uint32 *de
 	case CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE:
 	case CLUSTER_GRD_OUTBOUND_LMD_CANCEL:
 	case CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE:
-		return cleanup_dirty_push(slot->msg_type, slot->origin, slot->dest_node_id, slot->payload,
-								  slot->payload_len, new_warnings, depth_after);
+	case CLUSTER_GRD_OUTBOUND_GES_DEDUP_LIFECYCLE:
+		return cleanup_dirty_push_cap(
+			slot->msg_type, slot->origin, slot->dest_node_id, slot->payload,
+			slot->payload_len, slot->required_capability,
+			slot->capability_generation, new_warnings, depth_after);
 	case CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST:
 	default:
 		return ring_push(slot->msg_type, slot->origin, slot->dest_node_id, slot->payload,
@@ -326,7 +428,8 @@ cleanup_origin_requires_retry(uint8 origin)
 {
 	return origin == CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE
 		   || origin == CLUSTER_GRD_OUTBOUND_LMD_CANCEL
-		   || origin == CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE;
+		   || origin == CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE
+		   || origin == CLUSTER_GRD_OUTBOUND_GES_DEDUP_LIFECYCLE;
 }
 
 static void
@@ -338,22 +441,43 @@ cleanup_retry_exhausted(uint8 origin, uint32 dest_node_id)
 							 PGRAC_GES_CLEANUP_DIRTY_BUDGET, (uint32)origin, dest_node_id)));
 }
 
+void
+cluster_grd_outbound_cleanup_release_nonthrow_begin(void)
+{
+	if (cleanup_release_nonthrow_depth == 0)
+		cleanup_release_nonthrow_failed = false;
+	if (cleanup_release_nonthrow_depth == PG_UINT32_MAX) {
+		cleanup_release_nonthrow_failed = true;
+		return;
+	}
+	cleanup_release_nonthrow_depth++;
+}
+
+bool
+cluster_grd_outbound_cleanup_release_nonthrow_end(void)
+{
+	bool succeeded;
+
+	if (cleanup_release_nonthrow_depth == 0)
+		return false;
+
+	succeeded = !cleanup_release_nonthrow_failed;
+	cleanup_release_nonthrow_depth--;
+	if (cleanup_release_nonthrow_depth == 0)
+		cleanup_release_nonthrow_failed = false;
+	return succeeded;
+}
+
 
 /* ============================================================
  * 3 producer enqueue paths.
  * ============================================================ */
 
-bool
-cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id, const void *payload,
-											 uint16 payload_len)
-{
-	return cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GES_REQUEST, dest_node_id, payload,
-													payload_len);
-}
-
-bool
-cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, const void *payload,
-										 uint16 payload_len)
+static bool
+enqueue_backend_msg_capability(uint8 msg_type, uint32 dest_node_id,
+							   const void *payload, uint16 payload_len,
+							   uint32 required_capability,
+							   uint32 capability_generation)
 {
 	bool ok;
 
@@ -371,19 +495,28 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 
 		if (pinfo != NULL && (ClusterICPlane)pinfo->plane == CLUSTER_IC_PLANE_DATA) {
 			/*
+			 * The LMS DATA twin does not carry a CONTROL endpoint capability
+			 * generation.  Refuse a capability-bound request rather than
+			 * silently discarding its reconnect fence.
+			 */
+			if (required_capability != 0 || capability_generation != 0)
+				return false;
+			/*
 			 * PGRAC: spec-7.3 D4 (8.A) — route this frame to the worker that
 			 * owns its tag's shard, so every message of a tag rides one
 			 * worker<->worker stream (per-tag FIFO).  -1 = a DATA frame with
 			 * no routable tag → refuse to stage it fail-closed rather than
 			 * default a worker (a misroute would break message order).
 			 */
-			int worker = cluster_gcs_block_payload_shard(msg_type, payload, payload_len,
-														 cluster_lms_workers);
+			{
+				int worker = cluster_gcs_block_payload_shard(
+					msg_type, payload, payload_len, cluster_lms_workers);
 
-			if (worker < 0)
-				return false;
-			return cluster_lms_outbound_enqueue(worker, msg_type, dest_node_id, payload,
-												payload_len);
+				if (worker < 0)
+					return false;
+				return cluster_lms_outbound_enqueue(
+					worker, msg_type, dest_node_id, payload, payload_len);
+			}
 		}
 	}
 
@@ -393,17 +526,47 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 	 * CAPACITY - RESERVED_BUDGET (leaves room for LMON_REPLY).  Above
 	 * that boundary, return false → backend wait latch + timeout. */
 	if (cluster_grd_outbound_state->ring_count
-		>= (PGRAC_GES_OUTBOUND_RING_CAPACITY - PGRAC_GES_OUTBOUND_LMON_REPLY_RESERVED_BUDGET)) {
+		>= (PGRAC_GES_OUTBOUND_RING_CAPACITY
+			- PGRAC_GES_OUTBOUND_LMON_REPLY_RESERVED_BUDGET)) {
 		LWLockRelease(cluster_grd_outbound_lock);
 		return false;
 	}
 
-	ok = ring_push(msg_type, CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST, dest_node_id, payload,
-				   payload_len);
+	ok = ring_push_cap(
+		msg_type, CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST, dest_node_id,
+		payload, payload_len, required_capability, capability_generation);
 	LWLockRelease(cluster_grd_outbound_lock);
 	if (ok)
 		cluster_lmon_wakeup();
 	return ok;
+}
+
+bool
+cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id, const void *payload,
+											 uint16 payload_len)
+{
+	return cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GES_REQUEST, dest_node_id, payload,
+													payload_len);
+}
+
+bool
+cluster_grd_outbound_enqueue_backend_request_capability(
+	uint32 dest_node_id, const void *payload, uint16 payload_len,
+	uint32 required_capability, uint32 capability_generation)
+{
+	Assert(required_capability != 0);
+	Assert(capability_generation != 0);
+	return enqueue_backend_msg_capability(
+		PGRAC_IC_MSG_GES_REQUEST, dest_node_id, payload, payload_len,
+		required_capability, capability_generation);
+}
+
+bool
+cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, const void *payload,
+										 uint16 payload_len)
+{
+	return enqueue_backend_msg_capability(
+		msg_type, dest_node_id, payload, payload_len, 0, 0);
 }
 
 void
@@ -432,25 +595,38 @@ cluster_grd_outbound_enqueue_cleanup_release(uint32 dest_node_id, const void *pa
 	bool queued;
 	uint8 new_warnings = 0;
 	uint32 depth_after = 0;
+	GesRequestPayload marked;
+	const void *wire_payload = payload;
 
 	Assert(cluster_grd_outbound_state != NULL);
+	if (payload != NULL && payload_len == sizeof(GesRequestPayload)) {
+		memcpy(&marked, payload, sizeof(marked));
+		if (marked.opcode == GES_REQ_OPCODE_RELEASE) {
+			marked.current_mode = GES_RELEASE_CURRENT_MODE_CLEANUP_BYPASS;
+			wire_payload = &marked;
+		}
+	}
 
 	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
 
 	/* CLEANUP_RELEASE shares main ring with backend pool.  If full →
 	 * fixed reliable retry list (LockReleaseAll cannot wait). */
 	queued = ring_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE, dest_node_id,
-					   payload, payload_len);
+					   wire_payload, payload_len);
 	if (!queued)
 		queued
 			= cleanup_dirty_push(PGRAC_IC_MSG_GES_REQUEST, CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE,
-								 dest_node_id, payload, payload_len, &new_warnings, &depth_after);
+								 dest_node_id, wire_payload, payload_len, &new_warnings,
+								 &depth_after);
 
 	LWLockRelease(cluster_grd_outbound_lock);
 	cleanup_retry_log_pressure(new_warnings, depth_after);
-	if (!queued)
+	if (!queued && cleanup_release_nonthrow_depth > 0)
+		cleanup_release_nonthrow_failed = true;
+	else if (!queued)
 		cleanup_retry_exhausted(CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE, dest_node_id);
-	cluster_lmon_wakeup();
+	if (queued)
+		cluster_lmon_wakeup();
 }
 
 /*
@@ -531,6 +707,77 @@ cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest_node_id, const void *p
 	cluster_lmon_wakeup();
 }
 
+void
+cluster_grd_outbound_enqueue_ges_dedup_lifecycle(
+	uint8 msg_type, uint32 dest_node_id, const void *payload, uint16 payload_len,
+	uint32 capability_generation)
+{
+	bool queued;
+	bool test_saturated;
+	uint8 new_warnings = 0;
+	uint32 depth_after = 0;
+	uint32 test_ring_head;
+	uint32 test_ring_count;
+	uint32 test_cleanup_dirty_head;
+	uint32 test_cleanup_dirty_count;
+
+	Assert(cluster_grd_outbound_state != NULL);
+	Assert(msg_type == PGRAC_IC_MSG_GES_DEDUP_DONE
+		   || msg_type == PGRAC_IC_MSG_GES_DEDUP_ACK);
+	Assert(capability_generation != 0);
+
+	LWLockAcquire(cluster_grd_outbound_lock, LW_EXCLUSIVE);
+	test_ring_head = cluster_grd_outbound_state->ring_head;
+	test_ring_count = cluster_grd_outbound_state->ring_count;
+	test_cleanup_dirty_head
+		= cluster_grd_outbound_state->cleanup_dirty_head;
+	test_cleanup_dirty_count
+		= cluster_grd_outbound_state->cleanup_dirty_count;
+	test_saturated = msg_type == PGRAC_IC_MSG_GES_DEDUP_DONE
+					 && cf_s6_test_saturate_locked();
+	queued = ring_push_cap(
+		msg_type, CLUSTER_GRD_OUTBOUND_GES_DEDUP_LIFECYCLE,
+		dest_node_id, payload, payload_len,
+		PGRAC_IC_HELLO_CAP_GES_DEDUP_DONE_V1, capability_generation);
+	if (!queued)
+		queued = cleanup_dirty_push_cap(
+			msg_type, CLUSTER_GRD_OUTBOUND_GES_DEDUP_LIFECYCLE,
+			dest_node_id, payload, payload_len,
+			PGRAC_IC_HELLO_CAP_GES_DEDUP_DONE_V1, capability_generation,
+			&new_warnings, &depth_after);
+	if (test_saturated) {
+		/*
+		 * The producer has now observed a real full/full failure.  Roll back
+		 * only the assertion seam's marker occupancy while still holding the
+		 * queue lock; otherwise the committed DONE journal can wake LMON and
+		 * race its retry into this artificial saturation, turning the test
+		 * into an unrelated PANIC.
+		 */
+		cluster_grd_outbound_state->ring_head = test_ring_head;
+		cluster_grd_outbound_state->ring_count = test_ring_count;
+		cluster_grd_outbound_state->cleanup_dirty_head
+			= test_cleanup_dirty_head;
+		cluster_grd_outbound_state->cleanup_dirty_count
+			= test_cleanup_dirty_count;
+	}
+	LWLockRelease(cluster_grd_outbound_lock);
+	if (test_saturated)
+		ereport(LOG,
+				(errmsg_internal("CF S6 test saturation producer=ges_dedup_lifecycle "
+								 "message=GES_DEDUP_DONE filled outbound ring and cleanup dirty "
+								 "list (ring=%u cleanup_dirty=%u)",
+								 PGRAC_GES_OUTBOUND_RING_CAPACITY,
+								 PGRAC_GES_CLEANUP_DIRTY_BUDGET)));
+	cleanup_retry_log_pressure(new_warnings, depth_after);
+	if (!queued && cleanup_release_nonthrow_depth > 0)
+		cleanup_release_nonthrow_failed = true;
+	else if (!queued)
+		cleanup_retry_exhausted(
+			CLUSTER_GRD_OUTBOUND_GES_DEDUP_LIFECYCLE, dest_node_id);
+	if (queued)
+		cluster_lmon_wakeup();
+}
+
 
 /* ============================================================
  * LMON-side consumer.
@@ -571,8 +818,10 @@ cluster_grd_outbound_drain_dirty_lists(void)
 		ClusterGrdOutboundSlot *src
 			= &cluster_grd_outbound_state
 				   ->reply_dirty[cluster_grd_outbound_state->reply_dirty_tail];
-		if (!ring_push(src->msg_type, src->origin, src->dest_node_id, src->payload,
-					   src->payload_len))
+		if (!ring_push_cap(
+				src->msg_type, src->origin, src->dest_node_id, src->payload,
+				src->payload_len, src->required_capability,
+				src->capability_generation))
 			break;
 		cluster_grd_outbound_state->reply_dirty_tail
 			= (cluster_grd_outbound_state->reply_dirty_tail + 1) % PGRAC_GES_REPLY_DIRTY_BUDGET;
@@ -586,8 +835,10 @@ cluster_grd_outbound_drain_dirty_lists(void)
 		ClusterGrdOutboundSlot *src
 			= &cluster_grd_outbound_state
 				   ->cleanup_dirty[cluster_grd_outbound_state->cleanup_dirty_tail];
-		if (!ring_push(src->msg_type, src->origin, src->dest_node_id, src->payload,
-					   src->payload_len))
+		if (!ring_push_cap(
+				src->msg_type, src->origin, src->dest_node_id,
+				src->payload, src->payload_len, src->required_capability,
+				src->capability_generation))
 			break;
 		cluster_grd_outbound_state->cleanup_dirty_tail
 			= (cluster_grd_outbound_state->cleanup_dirty_tail + 1) % PGRAC_GES_CLEANUP_DIRTY_BUDGET;
@@ -652,6 +903,17 @@ cluster_grd_outbound_lmon_drain_send(void)
 			requeue_after_send_refusal(&slot);
 			continue;
 		}
+
+		/* S3-P0-10 mixed-version/reconnect fence.  A slot admitted under an
+		 * older CONTROL capability generation is dropped, never sent to the
+		 * replacement connection.  DONE remains in its shared journal and
+		 * will be restaged under a fresh generation; ACK loss is repaired by
+		 * the requester's next DONE retry. */
+		if (slot.required_capability != 0
+			&& !cluster_sf_peer_capability_generation_matches(
+				(int32)slot.dest_node_id, slot.required_capability,
+				slot.capability_generation))
+			continue;
 
 		if (slot.msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 			&& slot.payload_len == sizeof(GcsBlockRequestPayload))

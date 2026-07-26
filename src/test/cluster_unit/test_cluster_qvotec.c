@@ -9,7 +9,8 @@
  *	        offset (magic@0 / node_id@8 / incarnation@16 /
  *	        heartbeat_ts_us@24 / current_epoch@32 / flags@40 /
  *	        generation@56 / _alive_bitmap@64 / crc32c@508)
- *	    T-2 ClusterQvotecShmem byte layout — size == 128 + per-field
+ *	    T-2 ClusterQvotecShmem byte layout — fixed 128-byte header plus
+ *	        one 40-byte seqlocked peer boot-proof cell per node
  *	        sanity (state @0 / quorum_state @4 / lease_expire_at_us
  *	        offset within first cache line)
  *	    T-3 lifecycle accessor surface — all 7 dump-key accessors
@@ -152,9 +153,8 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 }
 
 #include "storage/shmem.h"
-/* ShmemInitStruct stub: hand back a writable buffer for shmem_init().
- * ClusterQvotecShmem is 128 byte;buffer at 256 byte for headroom. */
-static char shmem_storage[256] __attribute__((aligned(64)));
+/* ShmemInitStruct stub: hand back a writable buffer for shmem_init(). */
+static char shmem_storage[8192] __attribute__((aligned(64)));
 static bool shmem_init_done = false;
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
@@ -747,18 +747,165 @@ UT_TEST(test_voting_slot_field_offsets)
 
 
 /* ============================================================
- * T-2: ClusterQvotecShmem byte layout — size 128 (cache-line × 2).
+ * T-2: ClusterQvotecShmem byte layout — fixed 128-byte header followed
+ *      by 128 × 40-byte seqlocked peer boot-proof cells.
  *
  *	Public test cannot reach private struct sizeof, so verify
  *	indirectly via cluster_qvotec_shmem_size().
  * ============================================================ */
 
-UT_TEST(test_qvotec_shmem_size_128)
+UT_TEST(test_qvotec_shmem_size_includes_peer_boot_proofs)
 {
 	/* ClusterQvotecShmem is private to cluster_qvotec.c;
 	 * cluster_qvotec_shmem_size() returns sizeof(ClusterQvotecShmem) by
-	 * contract.  v0.2 amend per Q4 — 128 byte (2 cache lines). */
-	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 128);
+	 * contract.  The original 128-byte header remains layout-stable. */
+	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 128 + 40 * CLUSTER_MAX_NODES);
+}
+
+
+/* ============================================================
+ * T-2b: peer boot authority is one same-tuple disk majority.
+ *       Fresh but split incarnation/epoch tuples never aggregate.
+ * ============================================================ */
+
+static void
+init_peer_boot_slot(ClusterVotingSlot *slot, uint32 disk, uint32 node,
+					uint64 incarnation, uint64 epoch, uint64 heartbeat)
+{
+	memset(slot, 0, sizeof(*slot));
+	slot->magic = CLUSTER_VOTING_SLOT_MAGIC;
+	slot->version = CLUSTER_VOTING_SLOT_VERSION;
+	slot->node_id = node;
+	slot->incarnation = incarnation;
+	slot->heartbeat_ts_us = heartbeat;
+	slot->current_epoch = epoch;
+	slot->flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
+	slot->disk_index = disk;
+	slot->generation = disk + 1;
+}
+
+UT_TEST(test_peer_boot_majority_requires_same_fresh_tuple)
+{
+	ClusterVotingSlot slots[3 * 4];
+	ClusterVotingDiskIoState io_states[3] = {
+		CLUSTER_VOTING_DISK_IO_OK,
+		CLUSTER_VOTING_DISK_IO_OK,
+		CLUSTER_VOTING_DISK_IO_OK
+	};
+	ClusterQvotecPeerBootProof proof;
+	uint64 now = UINT64_C(1000000);
+	uint32 d;
+
+	memset(slots, 0, sizeof(slots));
+	for (d = 0; d < 3; d++)
+		init_peer_boot_slot(&slots[d * 4 + 2], d, 2, 701, 9,
+						   now - 100);
+	UT_ASSERT(cluster_qvotec_peer_boot_majority_select(
+		slots, io_states, 3, 4, 2, now, 1000, &proof));
+	UT_ASSERT_EQ(proof.valid, 1);
+	UT_ASSERT_EQ(proof.incarnation, 701);
+	UT_ASSERT_EQ(proof.current_epoch, 9);
+	UT_ASSERT_EQ(proof.observed_at_us, now);
+	UT_ASSERT_EQ(proof.supporting_disks, 3);
+
+	/* Two fresh ALIVE disks do not form authority when their boots differ. */
+	init_peer_boot_slot(&slots[1 * 4 + 2], 1, 2, 702, 9, now - 100);
+	slots[2 * 4 + 2].heartbeat_ts_us = now - 1001;
+	UT_ASSERT(!cluster_qvotec_peer_boot_majority_select(
+		slots, io_states, 3, 4, 2, now, 1000, &proof));
+	UT_ASSERT_EQ(proof.valid, 0);
+
+	/* Nor may two different epochs for the same incarnation aggregate. */
+	init_peer_boot_slot(&slots[1 * 4 + 2], 1, 2, 701, 10, now - 100);
+	UT_ASSERT(!cluster_qvotec_peer_boot_majority_select(
+		slots, io_states, 3, 4, 2, now, 1000, &proof));
+
+	/* A failed disk is excluded even if its bytes carry the winning tuple. */
+	init_peer_boot_slot(&slots[1 * 4 + 2], 1, 2, 701, 9, now - 100);
+	io_states[1] = CLUSTER_VOTING_DISK_IO_FAILED;
+	UT_ASSERT(!cluster_qvotec_peer_boot_majority_select(
+		slots, io_states, 3, 4, 2, now, 1000, &proof));
+}
+
+UT_TEST(test_peer_boot_exact_is_null_safe_pre_init)
+{
+	uint64 incarnation = 99;
+
+	shmem_init_done = false;
+	UT_ASSERT(!cluster_qvotec_peer_boot_majority_exact(2, 9, 701,
+													   &incarnation));
+	UT_ASSERT_EQ(incarnation, 0);
+}
+
+UT_TEST(test_self_incarnation_is_strictly_monotonic_across_clock_anomalies)
+{
+	ClusterVotingSlot slots[3];
+	ClusterVotingDiskIoState io_states[3] = {
+		CLUSTER_VOTING_DISK_IO_OK,
+		CLUSTER_VOTING_DISK_IO_OK,
+		CLUSTER_VOTING_DISK_IO_OK
+	};
+	uint64 incarnation = 0;
+	uint32 d;
+
+	for (d = 0; d < 3; d++)
+		init_peer_boot_slot(&slots[d], d, 0, 1000, 9, 100);
+
+	/* Same-microsecond restart must advance, never reuse boot 1000. */
+	UT_ASSERT(cluster_qvotec_next_self_incarnation(
+		1000, slots, io_states, 3, 0, &incarnation));
+	UT_ASSERT_EQ(incarnation, 1001);
+
+	/* A wall-clock rollback is equally subordinate to the durable floor. */
+	UT_ASSERT(cluster_qvotec_next_self_incarnation(
+		900, slots, io_states, 3, 0, &incarnation));
+	UT_ASSERT_EQ(incarnation, 1001);
+
+	/* A strict majority of readable disks is mandatory. */
+	io_states[1] = CLUSTER_VOTING_DISK_IO_FAILED;
+	io_states[2] = CLUSTER_VOTING_DISK_IO_FAILED;
+	UT_ASSERT(!cluster_qvotec_next_self_incarnation(
+		2000, slots, io_states, 3, 0, &incarnation));
+
+	/* Never wrap the authority identity. */
+	io_states[1] = CLUSTER_VOTING_DISK_IO_OK;
+	io_states[2] = CLUSTER_VOTING_DISK_IO_OK;
+	slots[1].incarnation = UINT64_MAX;
+	UT_ASSERT(!cluster_qvotec_next_self_incarnation(
+		2000, slots, io_states, 3, 0, &incarnation));
+}
+
+UT_TEST(test_self_incarnation_accepts_only_canonical_blank_majority)
+{
+	ClusterVotingSlot slots[3];
+	ClusterVotingDiskIoState io_states[3] = {
+		CLUSTER_VOTING_DISK_IO_OK,
+		CLUSTER_VOTING_DISK_IO_OK,
+		CLUSTER_VOTING_DISK_IO_OK
+	};
+	uint64 incarnation = 0;
+	uint32 d;
+
+	for (d = 0; d < 3; d++) {
+		memset(&slots[d], 0, sizeof(slots[d]));
+		slots[d].magic = CLUSTER_VOTING_SLOT_MAGIC;
+		slots[d].version = CLUSTER_VOTING_SLOT_VERSION;
+		slots[d].node_id = 0;
+		slots[d].disk_index = d;
+	}
+
+	/* Three fresh, canonical never-written slots have no historical floor. */
+	UT_ASSERT(cluster_qvotec_next_self_incarnation(
+		123456, slots, io_states, 3, 0, &incarnation));
+	UT_ASSERT_EQ(incarnation, 123456);
+
+	/* One malformed disk is tolerated; two cannot form a readable majority. */
+	slots[1].magic ^= 1;
+	UT_ASSERT(cluster_qvotec_next_self_incarnation(
+		123456, slots, io_states, 3, 0, &incarnation));
+	slots[2].version ^= 1;
+	UT_ASSERT(!cluster_qvotec_next_self_incarnation(
+		123456, slots, io_states, 3, 0, &incarnation));
 }
 
 
@@ -906,10 +1053,14 @@ UT_TEST(test_collision_state_enum_values)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(18);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
-	UT_RUN(test_qvotec_shmem_size_128);
+	UT_RUN(test_qvotec_shmem_size_includes_peer_boot_proofs);
+	UT_RUN(test_peer_boot_majority_requires_same_fresh_tuple);
+	UT_RUN(test_peer_boot_exact_is_null_safe_pre_init);
+	UT_RUN(test_self_incarnation_is_strictly_monotonic_across_clock_anomalies);
+	UT_RUN(test_self_incarnation_accepts_only_canonical_blank_majority);
 	UT_RUN(test_qvotec_accessors_null_safe_pre_init);
 	UT_RUN(test_qvotec_accessors_post_init);
 	UT_RUN(test_in_quorum_pre_shmem_init_false);

@@ -185,6 +185,39 @@ extern ClusterUndoHorizonFoldStatus cluster_undo_horizon_cluster_floor(
 extern const char *cluster_undo_horizon_stall_reason_name(ClusterUndoHorizonStallReason reason);
 
 /*
+ * S3-P0-14: mutually-exclusive read-admission attribution.  Enum order is
+ * the deterministic first-fail priority used by counters + DETAIL.  A valid
+ * operation SCN may equal or follow the active admission lower bound; an
+ * older or malformed operation point is SCN_MISMATCH.
+ */
+typedef enum ClusterUndoAdmissionReason {
+	CLUSTER_UNDO_ADMISSION_ADMIT = 0,
+	CLUSTER_UNDO_ADMISSION_ADMITTED_ZERO,
+	CLUSTER_UNDO_ADMISSION_NO_ACTIVE_SNAPSHOT,
+	CLUSTER_UNDO_ADMISSION_EPOCH_PREDATES,
+	CLUSTER_UNDO_ADMISSION_SCN_MISMATCH,
+	CLUSTER_UNDO_ADMISSION_REASON_COUNT
+} ClusterUndoAdmissionReason;
+
+typedef struct ClusterUndoAdmissionContext {
+	const char *caller;
+	TransactionId xid;
+	int32 origin_node;
+	bool authoritative;
+	uint32 undo_segment_id;
+	uint32 tt_slot_id;
+} ClusterUndoAdmissionContext;
+
+extern ClusterUndoAdmissionReason
+cluster_undo_horizon_admission_reason(uint64 admitted_epoch_biased,
+									  bool active_snapshot,
+									  uint64 snapshot_read_epoch,
+									  SCN snapshot_read_scn,
+									  SCN passed_read_scn);
+extern const char *
+cluster_undo_horizon_admission_reason_name(ClusterUndoAdmissionReason reason);
+
+/*
  * Wire payload (PGRAC_IC_MSG_UNDO_HORIZON, D5-2): 20 bytes packed.  The
  * sender's lmon_main_loop_interval rides along so a slow-tick sender is
  * not misjudged stale by a fast-tick receiver (freshness window =
@@ -214,7 +247,8 @@ extern bool cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch);
  * not-member / pre-join snapshot; false = mixed-capability, caller keeps its
  * UNKNOWN/53R97 fail-closed shape).  Foreign arms only; own reads ungated. */
 extern void cluster_undo_horizon_note_self_member(void);
-extern bool cluster_undo_horizon_read_admission_enforce(SCN read_scn);
+extern bool cluster_undo_horizon_read_admission_enforce(
+	SCN read_scn, const ClusterUndoAdmissionContext *context);
 
 /* observability (D5-5) */
 extern void cluster_undo_horizon_note_stall(void);
@@ -227,6 +261,8 @@ extern void cluster_undo_horizon_note_wire_reject(void);
 extern uint64 cluster_undo_horizon_wire_reject_count(void);
 extern void cluster_undo_horizon_note_admission_refuse(void);
 extern uint64 cluster_undo_horizon_admission_refuse_count(void);
+extern uint64 cluster_undo_horizon_admission_reason_count(
+	ClusterUndoAdmissionReason reason);
 /* TT lane: idle-unconstrained sentinel reports sent (sender-side gauge of
  * the provably-idle predicate actually firing; one bump per peer send). */
 extern uint64 cluster_undo_horizon_idle_sentinel_sent_count(void);

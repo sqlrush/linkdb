@@ -184,6 +184,20 @@ is($node->safe_psql(
    '0',
    'L4 pg_cluster_shmem has no NULL values');
 
+is($node->safe_psql(
+		'postgres',
+		q{SELECT lwlock_count || '|' || owner_subsys
+		     FROM pg_cluster_shmem
+		    WHERE name = 'pgrac cluster cf stats'}),
+   '1|cluster_cf_stats',
+   'L4a CF slot census owns one dedicated LWLock in its region');
+
+is($node->safe_psql(
+		'postgres',
+		q{SELECT sum(lwlock_count) FROM pg_cluster_shmem}),
+   '472',
+   'L4b global registered LWLock total includes the CF slot census lock');
+
 
 # ----------
 # L5: cluster_ctl region size is 24 bytes (sizeof(ClusterShmemCtl) +
@@ -283,8 +297,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '183',
-   'L15 total injection registry size is 183 (branch-1 +2; full breakdown in t/015)');
+   '186',
+   'L15 total injection registry size is 186 (branch-1 +2; full breakdown in t/015)');
 
 
 # ----------

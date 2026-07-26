@@ -61,5 +61,6 @@
  *	    view.  See spec-0.29 §3.1 for the order contract.
  * ---------- */
 extern Datum cluster_dump_state(PG_FUNCTION_ARGS);
+extern Datum pg_cluster_gcs_block_dedup_debug_exact(PG_FUNCTION_ARGS);
 
 #endif /* CLUSTER_DEBUG_H */

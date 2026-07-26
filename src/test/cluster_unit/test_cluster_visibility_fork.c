@@ -85,6 +85,9 @@ UT_DEFINE_GLOBALS();
 #ifndef HEAPAM_VISIBILITY_SOURCE_PATH
 #error "HEAPAM_VISIBILITY_SOURCE_PATH must identify production heapam_visibility.c"
 #endif
+#ifndef VISIBILITY_RESOLVE_SOURCE_PATH
+#error "VISIBILITY_RESOLVE_SOURCE_PATH must identify production cluster_visibility_resolve.c"
+#endif
 #ifndef TT_LOCAL_SOURCE_PATH
 #error "TT_LOCAL_SOURCE_PATH must identify production cluster_tt_local.c"
 #endif
@@ -565,6 +568,268 @@ UT_TEST(test_local_multixact_over_remote_xmin_uses_native_update_semantics)
 	free(source);
 }
 
+/*
+ * S3-P0-15: a cluster-off seed transaction predates the striped allocator
+ * even when its page carries an exact-looking origin-0 ITL ref after
+ * pg_basebackup.  The sealed native prehistory therefore has to preempt both
+ * the self/remote ref classification and the remote live-TT path.  Limiting
+ * the prehistory consume to `ref->local_xid != raw_xid` leaves exact seed refs
+ * asking for a cluster-era overlay that can never exist (53R97 for xids such
+ * as 802/804/806/816).
+ *
+ * The helper itself pins every negative boundary: boot coverage latch and
+ * no-wrap/full-xid proof, XactTruncationLock + oldestClogXid, and the explicit
+ * CLOG alphabet mapper.  SUB_COMMITTED or any doubt returns false to the
+ * existing fail-closed path; callers never get a generic local-CLOG escape.
+ */
+UT_TEST(test_native_prehistory_preempts_exact_remote_seed_ref)
+{
+	char *source = read_source(VISIBILITY_RESOLVE_SOURCE_PATH);
+	const char *helper;
+	const char *helper_end;
+	const char *reader_lock;
+	const char *provable;
+	const char *trunc_lock;
+	const char *oldest_gate;
+	const char *clog_read;
+	const char *status_map;
+	const char *reader_unlock;
+	const char *classify;
+	const char *classify_end;
+	const char *placeholder;
+	const char *prehistory_call;
+	const char *adg_gate;
+	const char *origin_gate;
+	const char *exact_mismatch_gate;
+	const char *remote_resolve;
+
+	UT_ASSERT(source != NULL);
+	if (source == NULL)
+		return;
+
+	helper = strstr(source, "\nresolve_native_prehistory(");
+	helper_end = helper != NULL ? strstr(helper, "\n}\n") : NULL;
+	reader_lock
+		= helper != NULL ? strstr(helper, "cluster_cr_native_prehistory_reader_lock();") : NULL;
+	provable = reader_lock != NULL
+				   ? strstr(reader_lock, "cluster_xid_native_prehistory_provable_full(")
+				   : NULL;
+	trunc_lock = provable != NULL ? strstr(provable, "LWLockAcquire(XactTruncationLock, LW_SHARED)")
+								 : NULL;
+	oldest_gate = trunc_lock != NULL ? strstr(trunc_lock, "ShmemVariableCache->oldestClogXid")
+									: NULL;
+	clog_read = oldest_gate != NULL ? strstr(oldest_gate, "TransactionIdGetStatus(") : NULL;
+	status_map = clog_read != NULL ? strstr(clog_read, "cluster_native_prehistory_map_status(")
+								  : NULL;
+	reader_unlock
+		= status_map != NULL ? strstr(status_map, "cluster_cr_native_prehistory_reader_unlock();")
+							: NULL;
+
+	classify = strstr(source, "\nclassify_ref_guts(");
+	classify_end = classify != NULL ? strstr(classify, "\n}\n") : NULL;
+	placeholder = classify != NULL ? strstr(classify, "if (ref->tt_slot_id == 0)") : NULL;
+	prehistory_call
+		= placeholder != NULL ? strstr(placeholder, "if (resolve_native_prehistory(raw_xid, out))")
+							 : NULL;
+	adg_gate = placeholder != NULL ? strstr(placeholder, "if (cluster_enable_adg") : NULL;
+	origin_gate = placeholder != NULL
+					  ? strstr(placeholder, "if ((int32)ref->origin_node_id == cluster_node_id)")
+					  : NULL;
+	exact_mismatch_gate
+		= origin_gate != NULL ? strstr(origin_gate, "if (ref->local_xid != raw_xid)") : NULL;
+	remote_resolve
+		= classify != NULL ? strstr(classify, "resolve_from_remote_ref(raw_xid, ref, read_scn, out)")
+						  : NULL;
+
+	UT_ASSERT(helper != NULL);
+	UT_ASSERT(helper_end != NULL);
+	UT_ASSERT(reader_lock != NULL);
+	UT_ASSERT(provable != NULL);
+	UT_ASSERT(trunc_lock != NULL);
+	UT_ASSERT(oldest_gate != NULL);
+	UT_ASSERT(clog_read != NULL);
+	UT_ASSERT(status_map != NULL);
+	UT_ASSERT(reader_unlock != NULL);
+	UT_ASSERT(classify != NULL);
+	UT_ASSERT(classify_end != NULL);
+	UT_ASSERT(placeholder != NULL);
+	UT_ASSERT(prehistory_call != NULL);
+	UT_ASSERT(adg_gate != NULL);
+	UT_ASSERT(origin_gate != NULL);
+	UT_ASSERT(exact_mismatch_gate != NULL);
+	UT_ASSERT(remote_resolve != NULL);
+	if (helper != NULL && helper_end != NULL && reader_lock != NULL && provable != NULL
+		&& trunc_lock != NULL && oldest_gate != NULL && clog_read != NULL
+		&& status_map != NULL && reader_unlock != NULL)
+		UT_ASSERT(helper < reader_lock && reader_lock < provable && provable < trunc_lock
+				  && trunc_lock < oldest_gate && oldest_gate < clog_read
+				  && clog_read < status_map && status_map < reader_unlock
+				  && reader_unlock < helper_end);
+	if (classify != NULL && classify_end != NULL && placeholder != NULL
+		&& prehistory_call != NULL && adg_gate != NULL && origin_gate != NULL
+		&& exact_mismatch_gate != NULL && remote_resolve != NULL)
+		UT_ASSERT(classify < placeholder && placeholder < prehistory_call
+				  && prehistory_call < adg_gate && adg_gate < origin_gate
+				  && origin_gate < exact_mismatch_gate
+				  && exact_mismatch_gate < remote_resolve
+				  && remote_resolve < classify_end);
+
+	free(source);
+}
+
+/*
+ * S3-P0-26: a current xmax retains PostgreSQL's native three-state decision
+ * after cluster evidence has proved xmin visible.  Lock-only is an active
+ * lock, while an updater is classified by cmax versus the caller's curcid.
+ * Whether the updater deleted the tuple is relevant only to a terminal
+ * remote verdict, not to the current-xmax cmax decision.
+ */
+UT_TEST(test_p026_remote_xmin_current_xmax_preserves_native_three_states)
+{
+	char *source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	const char *fork;
+	const char *fork_end;
+	const char *is_delete;
+	const char *native_self;
+	const char *remote_verdict;
+	const char *lock_only;
+	const char *being_modified;
+	const char *cmax;
+	const char *self_modified;
+	const char *invisible;
+	const char *native_is_delete;
+	const char *remote_delete_map;
+	const char *native_update;
+	const char *native_current;
+	const char *native_lock_only;
+	const char *native_being_modified;
+	const char *native_cmax;
+	const char *native_self_modified;
+	const char *native_invisible;
+
+	UT_ASSERT(source != NULL);
+	if (source == NULL)
+		return;
+
+	fork = strstr(source, "\ncluster_satisfies_update_fork(");
+	fork_end = fork != NULL ? strstr(fork, "\n}\n#endif") : NULL;
+	is_delete = fork != NULL ? strstr(fork, "is_delete = !lock_only") : NULL;
+	native_self
+		= is_delete != NULL ? strstr(is_delete, "case CLUSTER_VIS_ROUTE_NATIVE_SELF:") : NULL;
+	remote_verdict = native_self != NULL
+						 ? strstr(native_self, "case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:")
+						 : NULL;
+	lock_only = native_self != NULL ? strstr(native_self, "if (lock_only)") : NULL;
+	being_modified
+		= lock_only != NULL ? strstr(lock_only, "*res = TM_BeingModified;") : NULL;
+	cmax = being_modified != NULL
+			   ? strstr(being_modified, "HeapTupleHeaderGetCmax(tuple) >= curcid")
+			   : NULL;
+	self_modified = cmax != NULL ? strstr(cmax, "*res = TM_SelfModified;") : NULL;
+	invisible = self_modified != NULL ? strstr(self_modified, "*res = TM_Invisible;") : NULL;
+	native_is_delete = native_self != NULL ? strstr(native_self, "is_delete") : NULL;
+	remote_delete_map = remote_verdict != NULL
+							? strstr(remote_verdict,
+									 "cluster_vis_update_xmax_verdict(r.status, is_delete)")
+							: NULL;
+
+	/* Independently pin the expectation to PostgreSQL's native non-MultiXact
+	 * current-xmax arm in HeapTupleSatisfiesUpdate. */
+	native_update = fork_end != NULL ? strstr(fork_end, "\nHeapTupleSatisfiesUpdate(") : NULL;
+	native_current = native_update != NULL
+						 ? strstr(native_update,
+								  "if (TransactionIdIsCurrentTransactionId("
+								  "HeapTupleHeaderGetRawXmax(tuple)))")
+						 : NULL;
+	native_lock_only
+		= native_current != NULL ? strstr(native_current, "HEAP_XMAX_IS_LOCKED_ONLY") : NULL;
+	native_being_modified
+		= native_lock_only != NULL ? strstr(native_lock_only, "return TM_BeingModified;") : NULL;
+	native_cmax = native_being_modified != NULL
+					  ? strstr(native_being_modified,
+							   "HeapTupleHeaderGetCmax(tuple) >= curcid")
+					  : NULL;
+	native_self_modified
+		= native_cmax != NULL ? strstr(native_cmax, "return TM_SelfModified;") : NULL;
+	native_invisible
+		= native_self_modified != NULL ? strstr(native_self_modified, "return TM_Invisible;") : NULL;
+
+	UT_ASSERT(fork != NULL);
+	UT_ASSERT(fork_end != NULL);
+	UT_ASSERT(is_delete != NULL);
+	UT_ASSERT(native_self != NULL);
+	UT_ASSERT(remote_verdict != NULL);
+	UT_ASSERT(lock_only != NULL);
+	UT_ASSERT(being_modified != NULL);
+	UT_ASSERT(cmax != NULL);
+	UT_ASSERT(self_modified != NULL);
+	UT_ASSERT(invisible != NULL);
+	UT_ASSERT(remote_delete_map != NULL);
+	UT_ASSERT(native_update != NULL);
+	UT_ASSERT(native_current != NULL);
+	UT_ASSERT(native_lock_only != NULL);
+	UT_ASSERT(native_being_modified != NULL);
+	UT_ASSERT(native_cmax != NULL);
+	UT_ASSERT(native_self_modified != NULL);
+	UT_ASSERT(native_invisible != NULL);
+	if (native_self != NULL && remote_verdict != NULL && lock_only != NULL
+		&& being_modified != NULL && cmax != NULL && self_modified != NULL
+		&& invisible != NULL)
+		UT_ASSERT(native_self < lock_only && lock_only < being_modified
+				  && being_modified < cmax && cmax < self_modified
+				  && self_modified < invisible && invisible < remote_verdict);
+	if (native_is_delete != NULL && remote_verdict != NULL)
+		UT_ASSERT(native_is_delete >= remote_verdict);
+	if (remote_delete_map != NULL && fork_end != NULL)
+		UT_ASSERT(remote_delete_map < fork_end);
+	if (native_current != NULL && native_lock_only != NULL
+		&& native_being_modified != NULL && native_cmax != NULL
+		&& native_self_modified != NULL && native_invisible != NULL)
+		UT_ASSERT(native_current < native_lock_only
+				  && native_lock_only < native_being_modified
+				  && native_being_modified < native_cmax
+				  && native_cmax < native_self_modified
+				  && native_self_modified < native_invisible);
+
+	free(source);
+}
+
+/*
+ * S3-P0-13 G8 diagnostics: when xmin has resolved visible but the deleting
+ * xmax remains unprovable, the error must name the actual deleting xid.
+ * Reporting raw_xmin here sent investigators down the native-prehistory
+ * branch even though the failed authority request was for a striped xmax.
+ */
+UT_TEST(test_deleting_xmax_error_names_actual_xmax)
+{
+	char *source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	const char *message;
+	const char *hint;
+	const char *actual_xmax;
+	const char *wrong_xmin;
+
+	UT_ASSERT(source != NULL);
+	if (source == NULL)
+		return;
+
+	message = strstr(source,
+					 "errmsg(\"cluster TT status unknown for deleting xmax of xid %u\"");
+	hint = message != NULL ? strstr(message, "errhint(") : NULL;
+	actual_xmax
+		= message != NULL ? strstr(message, "HeapTupleHeaderGetRawXmax(tuple)") : NULL;
+	wrong_xmin = message != NULL ? strstr(message, "\n\t\t\t\t\t\t\t\t\t\t\traw_xmin),") : NULL;
+
+	UT_ASSERT(message != NULL);
+	UT_ASSERT(hint != NULL);
+	UT_ASSERT(actual_xmax != NULL);
+	if (message != NULL && hint != NULL && actual_xmax != NULL)
+		UT_ASSERT(message < actual_xmax && actual_xmax < hint);
+	if (message != NULL && hint != NULL && wrong_xmin != NULL)
+		UT_ASSERT(wrong_xmin > hint);
+
+	free(source);
+}
+
 
 int
 main(void)
@@ -585,5 +850,8 @@ main(void)
 	UT_RUN(test_p033_active_and_safety_boundary_matrix);
 	UT_RUN(test_s3c05_foreign_multixact_local_slru_decode_guard);
 	UT_RUN(test_local_multixact_over_remote_xmin_uses_native_update_semantics);
+	UT_RUN(test_native_prehistory_preempts_exact_remote_seed_ref);
+	UT_RUN(test_p026_remote_xmin_current_xmax_preserves_native_three_states);
+	UT_RUN(test_deleting_xmax_error_names_actual_xmax);
 	UT_DONE();
 }

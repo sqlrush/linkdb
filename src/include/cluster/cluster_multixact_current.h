@@ -121,6 +121,16 @@ typedef enum ClusterMxResolveResult {
 } ClusterMxResolveResult;
 
 
+/*
+ * Requester-local outcome for an authenticated updater proof.
+ */
+typedef enum ClusterCurrentUpdaterProofOutcome {
+	CCMUPO_COMMITTED = 0,
+	CCMUPO_WAIT_MEMBER,
+	CCMUPO_FAIL_CLOSED
+} ClusterCurrentUpdaterProofOutcome;
+
+
 typedef enum ClusterCurrentTupleAction {
 	CCM_ACTION_UPDATE = 0,
 	CCM_ACTION_DELETE,
@@ -251,6 +261,14 @@ extern ClusterUpdaterCandidateVerdict cluster_multixact_current_updater_candidat
 	const ClusterTTStatusKey *candidate, TransactionId updater_xid,
 	uint16 updater_origin_node, uint32 current_epoch, ClusterTTStatusKey *current_binding,
 	ClusterTTStatusResult *current_result);
+extern ClusterCurrentUpdaterProofOutcome
+cluster_multixact_current_updater_proof_outcome(
+	ClusterMxResolveResult resolve_result, const ClusterCurrentMxKey *key,
+	const ClusterCurrentMxMemberDesc *members,
+	const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+	const ClusterCurrentUpdaterChallenge *challenge,
+	const ClusterCurrentUpdaterProof *updater_proof,
+	uint16 updater_origin_node_id, ClusterTTStatusKey *wait_key);
 extern bool cluster_multixact_current_validate_updater_proof(
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
 	const ClusterCurrentMemberProof *proofs, uint16 nmembers,

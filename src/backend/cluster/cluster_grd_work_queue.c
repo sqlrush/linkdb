@@ -95,6 +95,15 @@ cluster_grd_work_queue_shmem_register(void)
 bool
 cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint16 payload_len)
 {
+	return cluster_grd_work_queue_enqueue_identity(source_node_id, 0, payload,
+												 payload_len);
+}
+
+bool
+cluster_grd_work_queue_enqueue_identity(uint32 source_node_id,
+										uint64 origin_boot_incarnation,
+										const void *payload, uint16 payload_len)
+{
 	ClusterGrdWorkItem *slot;
 
 	Assert(cluster_grd_work_queue_state != NULL);
@@ -112,6 +121,7 @@ cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint1
 	slot = &cluster_grd_work_queue_state->items[cluster_grd_work_queue_state->head];
 	slot->source_node_id = source_node_id;
 	slot->payload_len = payload_len;
+	slot->origin_boot_incarnation = origin_boot_incarnation;
 	if (payload_len > 0)
 		memcpy(slot->payload, payload, payload_len);
 

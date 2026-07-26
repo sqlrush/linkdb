@@ -80,6 +80,7 @@
 #include "funcapi.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
+#include "cluster/cluster_qvotec.h"
 
 int cluster_node_id = -1;
 int cluster_interconnect_tier = 0; /* CLUSTER_IC_TIER_STUB */
@@ -92,6 +93,13 @@ bool cluster_ic_suppress_caps_reply = false;
  * GCS_DONE_V1 completion-proof capability bit. */
 bool cluster_ic_suppress_gcs_done_cap = false;
 bool cluster_ic_suppress_xid_flock_cap = false;
+static uint64 mock_qvotec_self_incarnation = 0;
+
+uint64
+cluster_qvotec_get_durable_self_incarnation(void)
+{
+	return mock_qvotec_self_incarnation;
+}
 
 /* spec-5.59 D1 stubs: cluster_ic.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
@@ -745,6 +753,57 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 	cluster_smart_fusion_tier_min = CLUSTER_IC_TIER_3;
 }
 
+UT_TEST(test_hello_stale_x_capability_is_boot_identity_bound)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+
+	mock_qvotec_self_incarnation = 0;
+	cluster_ic_build_hello(
+		wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
+		1, "boot-zero", CLUSTER_IC_PLANE_CONTROL, 0);
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_hello_boot_incarnation(&parsed), 0);
+	UT_ASSERT(
+		(cluster_ic_hello_capabilities(&parsed)
+		 & PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1)
+		== 0);
+	UT_ASSERT(
+		(cluster_ic_hello_capabilities(&parsed)
+		 & PGRAC_IC_HELLO_CAP_GCS_FORWARD_CANCEL_V1)
+		== 0);
+	UT_ASSERT(
+		(cluster_ic_hello_capabilities(&parsed)
+		 & PGRAC_IC_HELLO_CAP_GCS_REQUEST_BOOT_V1)
+		== 0);
+
+	mock_qvotec_self_incarnation = UINT64_C(0x0102030405060708);
+	cluster_ic_build_hello(
+		wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
+		1, "boot-live", CLUSTER_IC_PLANE_CONTROL, 0);
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(
+		cluster_ic_hello_boot_incarnation(&parsed),
+		mock_qvotec_self_incarnation);
+	UT_ASSERT(
+		(cluster_ic_hello_capabilities(&parsed)
+		 & PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1)
+		!= 0);
+	UT_ASSERT(
+		(cluster_ic_hello_capabilities(&parsed)
+		 & PGRAC_IC_HELLO_CAP_GCS_FORWARD_CANCEL_V1)
+		!= 0);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_GCS_REQUEST_BOOT_V1,
+				 (uint32)0x00010000U);
+	UT_ASSERT(
+		(cluster_ic_hello_capabilities(&parsed)
+		 & PGRAC_IC_HELLO_CAP_GCS_REQUEST_BOOT_V1)
+		!= 0);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_BOOT_INCARNATION_OFFSET], 0x08);
+	UT_ASSERT_EQ(wire[PGRAC_IC_HELLO_BOOT_INCARNATION_OFFSET + 7], 0x01);
+	mock_qvotec_self_incarnation = 0;
+}
+
 /*
  * spec-2.2 additive amendment (spec-5.22e D5 prereq, B1): the CAPS_REPLY_V1
  * meta bit ("I can receive PEER_CAPS_REPLY") is advertised unconditionally,
@@ -892,7 +951,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(24); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(25); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -915,6 +974,7 @@ main(void)
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);
+	UT_RUN(test_hello_stale_x_capability_is_boot_identity_bound);
 	UT_RUN(test_hello_caps_reply_meta_gate);
 	UT_RUN(test_hello_gcs_done_and_wrap_barrier_gates);
 	UT_RUN(test_hello_parse_rejects_bad_magic);

@@ -57,7 +57,8 @@ cluster_pcm_own_shmem_init(void)
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].reservation_token, 0);
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].writer_activation_token, 0);
 			pg_atomic_init_u32(&ClusterPcmOwnArray[i].flags, 0);
-			ClusterPcmOwnArray[i]._pad = 0;
+			/* Zero is reserved for uninitialized/corrupt evidence. */
+			pg_atomic_init_u32(&ClusterPcmOwnArray[i].durability_generation, 1);
 		}
 	}
 }
@@ -455,6 +456,30 @@ cluster_pcm_own_gen_bump_checked(int buf_id, uint64 *out_generation)
 	if (out_generation != NULL)
 		*out_generation = generation;
 	return true;
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_durability_generation_advance(int buf_id, uint32 *out_generation)
+{
+	ClusterPcmOwnEntry *entry;
+	uint32 generation;
+
+	if (out_generation != NULL)
+		*out_generation = 0;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	generation = pg_atomic_read_u32(&entry->durability_generation);
+	if (out_generation != NULL)
+		*out_generation = generation;
+	if (generation == 0)
+		return CLUSTER_PCM_OWN_CORRUPT;
+	if (generation == UINT32_MAX)
+		return CLUSTER_PCM_OWN_EXHAUSTED;
+	generation++;
+	pg_atomic_write_u32(&entry->durability_generation, generation);
+	if (out_generation != NULL)
+		*out_generation = generation;
+	return CLUSTER_PCM_OWN_OK;
 }
 
 static const ClusterShmemRegion cluster_pcm_own_region = {

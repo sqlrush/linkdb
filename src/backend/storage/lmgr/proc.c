@@ -88,6 +88,63 @@ static LOCALLOCK *lockAwaited = NULL;
 
 static DeadLockState deadlock_state = DS_NOT_YET_CHECKED;
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Clear every cluster identity field before a recycled PGPROC is published
+ * under a new pid.  Generation zero is the fail-closed sentinel used by the
+ * GES terminal-lifecycle journal.
+ */
+static void
+ResetProcessClusterIdentity(PGPROC *proc)
+{
+	Assert(proc != NULL);
+
+	proc->cluster_grd_generation = 0;
+	proc->cluster_grd_bast_pending = false;
+	pg_atomic_write_u64(&proc->cluster_grd_redeclare_acked, 0);
+	pg_atomic_write_u64(&proc->cluster_grd_redeclare_acked_epoch, 0);
+	pg_atomic_write_u32(&proc->cluster_grd_registered_count, 0);
+	cluster_lmd_wait_state_reset(&proc->cluster_lmd_wait);
+	cluster_cancel_token_reset(&proc->cluster_cancel_token);
+}
+
+/*
+ * Complete the cluster identity after the GRD shared-memory pointer is
+ * available.  fork() children complete this from InitProcess() or
+ * InitAuxiliaryProcess(); EXEC_BACKEND first observes generation zero and
+ * retries from BaseInit() after CreateSharedMemoryAndSemaphores().
+ *
+ * This function is deliberately idempotent.  A live process must never
+ * consume a second generation or reset its registered-grant/wait state.
+ */
+void
+InitProcessClusterIdentity(void)
+{
+	uint64		generation;
+
+	if (!cluster_enabled || MyProc == NULL
+		|| MyProc->cluster_grd_generation != 0)
+		return;
+
+	generation = cluster_grd_alloc_generation();
+	if (generation == 0)
+		return;
+
+	/*
+	 * Seed all state before publishing the nonzero generation.  Readers use
+	 * generation as the incarnation-validity gate.
+	 */
+	MyProc->cluster_grd_bast_pending = false;
+	pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked,
+						cluster_grd_redeclare_generation());
+	pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked_epoch,
+						cluster_grd_redeclare_episode_epoch());
+	pg_atomic_write_u32(&MyProc->cluster_grd_registered_count, 0);
+	pg_write_barrier();
+	MyProc->cluster_grd_generation = generation;
+}
+#endif
+
 /* Is a deadlock check pending? */
 static volatile sig_atomic_t got_deadlock_timeout;
 
@@ -396,6 +453,9 @@ InitProcess(void)
 	MyProc->fpLocalTransactionId = InvalidLocalTransactionId;
 	MyProc->xid = InvalidTransactionId;
 	MyProc->xmin = InvalidTransactionId;
+#ifdef USE_PGRAC_CLUSTER
+	ResetProcessClusterIdentity(MyProc);
+#endif
 	MyProc->pid = MyProcPid;
 	/* backendId, databaseId and roleId will be filled in later */
 	MyProc->backendId = InvalidBackendId;
@@ -490,30 +550,7 @@ InitProcess(void)
 	 * Spec: spec-2.17-bast-deadlock-caller-side-4node.md DRAFT v0.1 P1.7
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_enabled && MyProc != NULL) {
-		MyProc->cluster_grd_generation = cluster_grd_alloc_generation();
-		MyProc->cluster_grd_bast_pending = false;
-		/* spec-4.6 D3 — seed the rebind-barrier ack with the CURRENT
-		 * redeclare generation:  a backend born after the broadcast has
-		 * no stale-epoch grants and must not block the barrier.  The
-		 * registered-grant count restarts at zero with the fresh proc. */
-		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked,
-							cluster_grd_redeclare_generation());
-		/* P0-1: seed the ack epoch with the locked episode epoch so a
-		 * backend born mid-episode does not fail the barrier's epoch
-		 * check (it holds no stale grants either way). */
-		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked_epoch,
-							cluster_grd_redeclare_episode_epoch());
-		pg_atomic_write_u32(&MyProc->cluster_grd_registered_count, 0);
-		/* spec-5.8 D1d — clear any wait-state left active by a predecessor
-		 * that reused this proc slot;  wait_seq is preserved (monotonic ABA
-		 * guard), so a stale victim tuple can never re-match. */
-		cluster_lmd_wait_state_reset(&MyProc->cluster_lmd_wait);
-		/* spec-5.9 D3 — drop any cancel token/marker left by a predecessor that
-		 * reused this proc slot (the matched-consume already refuses it, but a
-		 * clean reset removes the stale state outright). */
-		cluster_cancel_token_reset(&MyProc->cluster_cancel_token);
-	}
+	InitProcessClusterIdentity();
 #endif
 }
 
@@ -603,6 +640,9 @@ InitAuxiliaryProcess(void)
 
 	/* Mark auxiliary proc as in use by me */
 	/* use volatile pointer to prevent code rearrangement */
+#ifdef USE_PGRAC_CLUSTER
+	ResetProcessClusterIdentity(auxproc);
+#endif
 	((volatile PGPROC *) auxproc)->pid = MyProcPid;
 
 	MyProc = auxproc;
@@ -668,6 +708,10 @@ InitAuxiliaryProcess(void)
 	 * Arrange to clean up at process exit.
 	 */
 	on_shmem_exit(AuxiliaryProcKill, Int32GetDatum(proctype));
+
+#ifdef USE_PGRAC_CLUSTER
+	InitProcessClusterIdentity();
+#endif
 }
 
 /*

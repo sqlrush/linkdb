@@ -88,12 +88,13 @@
 #include "storage/lwlock.h"
 #include "cluster/cluster_grd.h"	   /* ClusterGrdHolderId for probe slot */
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3) */
+#include "cluster/cluster_lms_native_probe_state.h"
 
 /*
  * DATA-plane staging ceiling.  Keep this public so every typed DATA payload
  * can compile-time prove that it fits the real LMS outbound slot.
  */
-#define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX 128
+#define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX 136
 
 
 /*
@@ -170,34 +171,36 @@ typedef enum ClusterLmsState {
 #define CLUSTER_LMS_SERVE_HIST_BUCKETS 16
 
 typedef struct ClusterLmsNativeLockProbeSlot {
-	pg_atomic_uint64 in_use;		   /* 0 = free, 2 = initializing, 1 = active */
+	/* ClusterLmsNativeProbeSlotState: FREE / RESERVED / ACTIVE / RESOLVING. */
+	pg_atomic_uint64 in_use;
 	uint64 probe_id;				   /* monotonic per-shard id (HC36 epoch) */
 	LOCKTAG locktag;				   /* 16B PG LOCKTAG (RELATION / OBJECT) */
 	LOCKMODE lockmode;				   /* 4B PG LOCKMODE */
-	int32 origin_node_id;			   /* local cluster_node_id at acquire */
-	int32 requester_procno;			   /* pgprocno of backend awaiting grant */
 	uint32 shard_master_generation_lo; /* spec-2.27 dedup carry for async grants */
+	TransactionId waiter_xid;		   /* canonical WFG xid; Invalid if none */
+	uint8 request_opcode;			   /* original GesRequestOpcode (0..17) */
+	uint8 final_status;				   /* sync waiter result; 0 clear,3 timeout */
+	bool grant_on_clear;			   /* async remote-master grant completion */
+	bool final_ready;				   /* sync waiter completion flag */
+	uint64 origin_boot_incarnation;	   /* requester dedup identity; 0 legacy */
+	uint64 wait_seq;				   /* exact CANCEL_WAIT/WFG ABA identity */
 	ClusterGrdHolderId requester;	   /* HC32a exclude_holder identity */
 	ClusterResId resid;				   /* grant-on-clear target resource */
 	TimestampTz start_ts;			   /* dispatch timestamp */
 	int32 grant_source_node_id;		   /* reply destination for async grant */
-	uint32 request_opcode;			   /* original GesRequestOpcode */
-	uint32 retry_count;				   /* HC32 retry-poll counter */
-	uint32 expected_replies_bitmap;	   /* bit set per live peer (1 = need reply) */
-	uint32 received_replies_bitmap;	   /* bit set per received reply */
+	uint16 retry_count;				   /* HC32 counter; max macro 3600 */
+	uint16 expected_replies_bitmap;	   /* supported node_id 0..15 */
+	uint16 received_replies_bitmap;	   /* supported node_id 0..15 */
+	uint8 convert_old_mode;			   /* precise async CONVERT locator */
+	uint8 _pad2;
 	uint32 aggregated_status_packed;   /* 2 bits per node × 16 max nodes */
-	uint32 final_status;			   /* sync waiter result; 0 clear,3 timeout */
-	bool grant_on_clear;			   /* async remote-master grant completion */
-	bool final_ready;				   /* sync waiter completion flag */
 	/* spec-5.3 — for an async CONVERT (grant_on_clear + request_opcode ==
 	 * GES_REQ_OPCODE_CONVERT) this carries the REDECLARE locator's current_mode
 	 * so the resolve path locates the OLD holder by the precise (node, procno,
 	 * current_mode) — a backend may hold multiple cluster modes on one resid
 	 * (e.g. SHARE + SHARE UPDATE EXCLUSIVE), so (node, procno) alone is
-	 * ambiguous.  0 (NoLock) for non-convert opcodes.  Reuses padding — slot
-	 * size is unchanged. */
-	uint8 convert_old_mode;
-	bool _pad2[1];
+	 * ambiguous.  0 (NoLock) for non-convert opcodes.  The compact internal
+	 * fields above keep the fixed 128B prefix while adding xid/wait_seq. */
 	/* spec-2.27 D5 / HC55 — per-slot LWLock serializes mutation of
 	 * expected/received bitmaps + aggregated_status_packed across the
 	 * six concurrent paths (wait_clear backend, recv_reply handler,
@@ -252,6 +255,14 @@ typedef struct ClusterLmsSharedState {
 	/* probe collector slot array + monotonic id allocator (HC36). */
 	pg_atomic_uint64 native_probe_next_id;
 	ClusterLmsNativeLockProbeSlot native_probe_slots[CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS];
+#ifdef USE_ASSERT_CHECKING
+	/*
+	 * r19 L9 deterministic race seam.  Assertion builds only; exact node +
+	 * complete LOCKTAG + CONVERT + AccessExclusive and a single atomic token
+	 * initialized at startup.
+	 */
+	ClusterLmsNativeProbeForceClearOnce unsafe_test_native_probe_force_clear_once;
+#endif
 
 	/* spec-2.27 HC49 / HC50 — shard master generation composite 64-bit.
 	 *

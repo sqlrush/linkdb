@@ -79,6 +79,33 @@ bm_set(uint8 *bm, int node)
 	bm[node >> 3] |= (uint8)(1u << (node & 7));
 }
 
+static char *
+read_admission_runtime_source(void)
+{
+	FILE *file;
+	long length;
+	char *source;
+
+	file = fopen(CLUSTER_UNDO_HORIZON_IC_SOURCE_PATH, "rb");
+	UT_ASSERT_NOT_NULL(file);
+	if (file == NULL)
+		return NULL;
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
+	length = ftell(file);
+	UT_ASSERT(length > 0);
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+	source = malloc((size_t)length + 1);
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) {
+		fclose(file);
+		return NULL;
+	}
+	UT_ASSERT_EQ(fread(source, 1, (size_t)length, file), (size_t)length);
+	source[length] = '\0';
+	fclose(file);
+	return source;
+}
+
 /* a fully healthy report view */
 static ClusterUndoHorizonReportView
 mk_view(uint64 scn)
@@ -527,10 +554,146 @@ UT_TEST(test_reason_names)
 					 "stale");
 }
 
+/*
+ * S3-P0-14 reason-only diagnostics.  These tests do not widen admission:
+ * they freeze the existing fail-closed truth table and its first-fail
+ * priority so a single runtime refusal can be attributed without guessing.
+ */
+UT_TEST(test_admission_reason_admitted_zero_has_first_priority)
+{
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 0, false, 0, (SCN)100, (SCN)200),
+				 CLUSTER_UNDO_ADMISSION_ADMITTED_ZERO);
+}
+
+UT_TEST(test_admission_reason_no_active_snapshot_precedes_epoch_and_scn)
+{
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 8, false, 0, (SCN)100, (SCN)200),
+				 CLUSTER_UNDO_ADMISSION_NO_ACTIVE_SNAPSHOT);
+}
+
+UT_TEST(test_admission_reason_epoch_predates_precedes_scn_mismatch)
+{
+	/* biased admitted=8 means raw admitted epoch=7; snapshot epoch 6 is old */
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 8, true, 6, (SCN)100, (SCN)200),
+				 CLUSTER_UNDO_ADMISSION_EPOCH_PREDATES);
+}
+
+UT_TEST(test_admission_reason_scn_mismatch)
+{
+	/* A visibility authority older than the active admission lower bound
+	 * cannot consume foreign undo. */
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 8, true, 7, scn_encode(1, 200), scn_encode(1, 199)),
+				 CLUSTER_UNDO_ADMISSION_SCN_MISMATCH);
+}
+
+/*
+ * S3-P0-14 RED: UPDATE visibility may legitimately evaluate a tuple with an
+ * operation snapshot minted just after the active statement snapshot.  The
+ * tuple snapshot is the visibility authority; the active snapshot is only
+ * the admission lower bound.  Equality-only admission falsely refuses these
+ * +1/+3 observations as SCN_MISMATCH.
+ */
+UT_TEST(test_admission_reason_current_dml_passed_plus_one_admits)
+{
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 1, true, 0, scn_encode(1, 103452), scn_encode(1, 103453)),
+				 CLUSTER_UNDO_ADMISSION_ADMIT);
+}
+
+UT_TEST(test_admission_reason_current_dml_passed_plus_three_admits)
+{
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 1, true, 0, scn_encode(2, 103494), scn_encode(2, 103497)),
+				 CLUSTER_UNDO_ADMISSION_ADMIT);
+}
+
+UT_TEST(test_admission_reason_invalid_active_scn_domain_refuses)
+{
+	SCN invalid_active = ((SCN)200 << SCN_NODE_ID_SHIFT) | (SCN)103494;
+
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 1, true, 0, invalid_active, scn_encode(2, 103497)),
+				 CLUSTER_UNDO_ADMISSION_SCN_MISMATCH);
+}
+
+UT_TEST(test_admission_reason_epoch_zero_biased_store_admits)
+{
+	/* Cold formation: biased 1 represents admitted raw epoch 0. */
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 1, true, 0, (SCN)100, (SCN)100),
+				 CLUSTER_UNDO_ADMISSION_ADMIT);
+}
+
+UT_TEST(test_admission_reason_invalid_passed_scn_does_not_mismatch)
+{
+	/* Writer terminal-status callers pass InvalidScn; the current gate does
+	 * not invent an SCN mismatch when the active snapshot has a valid SCN. */
+	UT_ASSERT_EQ(cluster_undo_horizon_admission_reason(
+				 8, true, 7, (SCN)100, InvalidScn),
+				 CLUSTER_UNDO_ADMISSION_ADMIT);
+}
+
+UT_TEST(test_admission_runtime_emits_one_reason_counter_and_full_context)
+{
+	char *source = read_admission_runtime_source();
+	const char *gate
+		= source != NULL
+			  ? strstr(source, "\ncluster_undo_horizon_read_admission_enforce(")
+			  : NULL;
+	const char *gate_end
+		= gate != NULL ? strstr(gate, "Mixed-capability hard gate") : NULL;
+	const char *classify
+		= gate != NULL ? strstr(gate, "cluster_undo_horizon_admission_reason(") : NULL;
+	const char *refuse
+		= classify != NULL
+			  ? strstr(classify, "reason != CLUSTER_UNDO_ADMISSION_ADMIT")
+			  : NULL;
+	const char *aggregate
+		= refuse != NULL ? strstr(refuse, "admission_refuse_count") : NULL;
+	const char *per_reason
+		= aggregate != NULL ? strstr(aggregate, "admission_reason_count[reason]") : NULL;
+	const char *detail = per_reason != NULL ? strstr(per_reason, "errdetail(") : NULL;
+	static const char *const fields[] = {
+		"reason=%s", "caller=%s", "xid=%u", "origin=%d",
+		"authoritative=%d", "ref_segment=%u", "ref_slot=%u",
+		"passed_read_scn=", "active_snapshot=%d", "snapshot_read_scn=",
+		"snapshot_read_epoch=", "current_epoch=", "admitted_epoch_biased=",
+		"admitted_epoch="
+	};
+	size_t i;
+
+	UT_ASSERT_NOT_NULL(gate);
+	UT_ASSERT_NOT_NULL(gate_end);
+	UT_ASSERT_NOT_NULL(classify);
+	UT_ASSERT_NOT_NULL(refuse);
+	UT_ASSERT_NOT_NULL(aggregate);
+	UT_ASSERT_NOT_NULL(per_reason);
+	UT_ASSERT_NOT_NULL(detail);
+	if (gate_end != NULL) {
+		UT_ASSERT(classify != NULL && classify < gate_end);
+		UT_ASSERT(refuse != NULL && refuse < gate_end);
+		UT_ASSERT(aggregate != NULL && aggregate < gate_end);
+		UT_ASSERT(per_reason != NULL && per_reason < gate_end);
+		UT_ASSERT(detail != NULL && detail < gate_end);
+	}
+	for (i = 0; i < lengthof(fields); i++) {
+		const char *field = detail != NULL ? strstr(detail, fields[i]) : NULL;
+
+		UT_ASSERT_NOT_NULL(field);
+		if (gate_end != NULL)
+			UT_ASSERT(field != NULL && field < gate_end);
+	}
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(31);
 
 	UT_RUN(test_u1_no_required_peer);
 	UT_RUN(test_u2_all_fresh_min);
@@ -553,6 +716,16 @@ main(void)
 	UT_RUN(test_u17_idle_sentinel_skipped);
 	UT_RUN(test_u17b_idle_sentinel_still_proven);
 	UT_RUN(test_reason_names);
+	UT_RUN(test_admission_reason_admitted_zero_has_first_priority);
+	UT_RUN(test_admission_reason_no_active_snapshot_precedes_epoch_and_scn);
+	UT_RUN(test_admission_reason_epoch_predates_precedes_scn_mismatch);
+	UT_RUN(test_admission_reason_scn_mismatch);
+	UT_RUN(test_admission_reason_current_dml_passed_plus_one_admits);
+	UT_RUN(test_admission_reason_current_dml_passed_plus_three_admits);
+	UT_RUN(test_admission_reason_invalid_active_scn_domain_refuses);
+	UT_RUN(test_admission_reason_epoch_zero_biased_store_admits);
+	UT_RUN(test_admission_reason_invalid_passed_scn_does_not_mismatch);
+	UT_RUN(test_admission_runtime_emits_one_reason_counter_and_full_context);
 
 	UT_DONE();
 }

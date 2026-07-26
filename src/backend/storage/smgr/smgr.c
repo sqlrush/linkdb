@@ -64,6 +64,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"		/* PGRAC: cluster_enabled */
 #include "cluster/cluster_cr_pool.h"			/* PGRAC: spec-5.51 CR pool epoch bump */
+#include "cluster/cluster_gcs_block_dedup.h" /* type65 exact locator generation */
 #include "cluster/cluster_inject.h"			/* PGRAC: spec-5.53 D2b skip-bump fault */
 #include "cluster/storage/cluster_smgr.h"		/* PGRAC: smgrsw[1] + spec-2.7 hooks */
 #endif
@@ -567,6 +568,18 @@ smgrdounlinkall(SMgrRelation *rels, int nrels, bool isRedo)
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_enabled)
 	{
+		/*
+		 * Always-on type65 relation-incarnation authority.  Every locator
+		 * carrying a stale-X release record was registered before ownership
+		 * mutation; bump that exact locator before physical unlink so
+		 * DROP/TRUNCATE/rewrite/reuse invalidates the old storage proof.  An
+		 * unregistered locator has no type65 evidence and is a safe no-op.
+		 * This is independent of the optional CR-pool GUC and its test fault.
+		 */
+		for (i = 0; i < nrels; i++)
+			(void)cluster_gcs_block_stale_x_relation_bump(
+				rlocators[i].locator);
+
 		for (i = 0; i < nrels; i++)
 		{
 			if (rels[i]->smgr_which == CLUSTER_SMGR_SMGRSW_INDEX)

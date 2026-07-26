@@ -122,6 +122,19 @@ extern void cluster_ges_reply_wait_shmem_init(void);
 extern void cluster_ges_reply_wait_shmem_register(void);
 
 /*
+ * The requester completion frontier orders operations by this node-global
+ * sequence.  Returning zero after uint64 wrap would therefore make a new
+ * operation appear older than every persisted HWM.  The allocator must PANIC
+ * while the current value is UINT64_MAX; postmaster restart gives the node a
+ * new boot incarnation before any further distributed request is admitted.
+ */
+static inline bool
+cluster_ges_request_id_can_advance(uint64 current)
+{
+	return current != UINT64_MAX;
+}
+
+/*
  * spec-5.16 (Rule 8.A) — next node-global request_id (never 0).  The reply-wait
  * 5-tuple key requires request_id to be unique node-wide; the lock-acquire path
  * sources it here instead of a backend-local counter (which reused request_id=1

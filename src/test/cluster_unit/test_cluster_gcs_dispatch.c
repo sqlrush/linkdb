@@ -47,6 +47,7 @@
 
 #include "cluster/cluster_conf.h" /* ClusterNodeInfo (spec-2.33 D2 stub) */
 #include "cluster/cluster_cssd.h" /* PGRAC_IC_MSG_CSSD_HEARTBEAT */
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -94,12 +95,55 @@ int MyBackendId = 1;
 sigjmp_buf *PG_exception_stack = NULL;
 struct ErrorContextCallback *error_context_stack = NULL;
 
+extern bool cluster_gcs_send_transition_nowait_exact_epoch(
+	BufferTag tag, PcmLockTransition transition_id, int master_node,
+	uint64 expected_epoch);
+extern PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_gcs_transition_exact_result(
+	BufferTag tag, PcmLockTransition trans, int holder_node_id,
+	uint64 expected_epoch,
+	const PcmAuthoritySnapshot *expected_authority);
+
+static union {
+	uint64 force_align;
+	char data[2 * 1024 * 1024];
+} fake_gcs_shmem;
+static bool fake_gcs_shmem_found = false;
+static uint64 fake_current_epoch = 0;
+static int fake_epoch_read_count = 0;
+static int fake_epoch_flip_on_read = 0;
+static int fake_ic_send_count = 0;
+static int32 fake_ic_send_dest = -1;
+static GcsRequestPayload fake_ic_last_request;
+static int fake_pcm_apply_count = 0;
+static int fake_pcm_exact_apply_count = 0;
+static PcmGcsTransitionApplyResult fake_pcm_exact_apply_result
+	= PCM_GCS_TRANSITION_APPLIED;
+static bool fake_pcm_exact_publish_new_pending = false;
+static int fake_pcm_legacy_clear_count = 0;
+static int32 fake_pcm_pending_requester = -1;
+static uint64 fake_pcm_pending_epoch = 0;
+static uint64 fake_pcm_pending_cookie = 0;
+
+__attribute__((weak)) bool
+cluster_gcs_send_transition_nowait_exact_epoch(
+	BufferTag tag pg_attribute_unused(),
+	PcmLockTransition transition_id pg_attribute_unused(),
+	int master_node pg_attribute_unused(),
+	uint64 expected_epoch pg_attribute_unused())
+{
+	return false;
+}
+
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr)
 {
-	*foundPtr = false;
-	return NULL;
+	if (size > sizeof(fake_gcs_shmem.data))
+		abort();
+	*foundPtr = fake_gcs_shmem_found;
+	fake_gcs_shmem_found = true;
+	return fake_gcs_shmem.data;
 }
 
 HTAB *
@@ -280,7 +324,11 @@ pg_re_throw(void)
 uint64
 cluster_epoch_get_current(void)
 {
-	return 0;
+	fake_epoch_read_count++;
+	if (fake_epoch_flip_on_read > 0
+		&& fake_epoch_read_count >= fake_epoch_flip_on_read)
+		return fake_current_epoch + 1;
+	return fake_current_epoch;
 }
 
 void
@@ -293,10 +341,16 @@ cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unus
 
 ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type pg_attribute_unused(),
-						 int32 dest_node_id pg_attribute_unused(),
-						 const void *payload pg_attribute_unused(),
-						 uint32 payload_len pg_attribute_unused())
+						 int32 dest_node_id,
+						 const void *payload,
+						 uint32 payload_len)
 {
+	fake_ic_send_count++;
+	fake_ic_send_dest = dest_node_id;
+	if (msg_type == PGRAC_IC_MSG_GCS_REQUEST
+		&& payload != NULL
+		&& payload_len == sizeof(GcsRequestPayload))
+		memcpy(&fake_ic_last_request, payload, sizeof(fake_ic_last_request));
 	return CLUSTER_IC_SEND_DONE;
 }
 
@@ -342,7 +396,26 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag pg_attribute_unused(),
 									  PcmLockTransition trans pg_attribute_unused(),
 									  int holder_node_id pg_attribute_unused())
 {
+	fake_pcm_apply_count++;
 	return true;
+}
+
+PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_gcs_transition_exact_result(
+	BufferTag tag pg_attribute_unused(),
+	PcmLockTransition trans pg_attribute_unused(),
+	int holder_node_id pg_attribute_unused(),
+	uint64 expected_epoch pg_attribute_unused(),
+	const PcmAuthoritySnapshot *expected_authority pg_attribute_unused())
+{
+	fake_pcm_exact_apply_count++;
+	if (fake_pcm_exact_publish_new_pending) {
+		fake_current_epoch = expected_epoch + 1;
+		fake_pcm_pending_requester = holder_node_id;
+		fake_pcm_pending_epoch = fake_current_epoch;
+		fake_pcm_pending_cookie = UINT64_C(0xface7101);
+	}
+	return fake_pcm_exact_apply_result;
 }
 
 void
@@ -351,8 +424,15 @@ cluster_pcm_lock_clear_pending_x(BufferTag tag pg_attribute_unused())
 
 bool
 cluster_pcm_lock_clear_pending_x_if(BufferTag tag pg_attribute_unused(),
-									int32 expected_requester pg_attribute_unused())
+									int32 expected_requester)
 {
+	fake_pcm_legacy_clear_count++;
+	if (fake_pcm_pending_requester == expected_requester) {
+		fake_pcm_pending_requester = -1;
+		fake_pcm_pending_epoch = 0;
+		fake_pcm_pending_cookie = 0;
+		return true;
+	}
 	return false;
 }
 
@@ -675,11 +755,178 @@ UT_TEST(test_gcs_module_init_helpers_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_gcs_module_init);
 }
 
+UT_TEST(test_gcs_exact_nowait_fences_epoch_and_master_before_admission)
+{
+	BufferTag tag;
+	const uint64 barrier_epoch = UINT64_C(41);
+	int barrier_master = -1;
+	int blk;
+	int sends_before;
+
+	memset(&tag, 0, sizeof(tag));
+	tag.spcOid = 11;
+	tag.dbOid = 12;
+	tag.relNumber = 13;
+	fake_declared_count = 3;
+	fake_dead_node = -1;
+	for (blk = 0; blk < 256; blk++) {
+		tag.blockNum = (BlockNumber)blk;
+		barrier_master = cluster_gcs_lookup_master(tag);
+		if (barrier_master != cluster_node_id)
+			break;
+	}
+	UT_ASSERT(barrier_master != cluster_node_id);
+	if (!fake_gcs_shmem_found)
+		cluster_gcs_shmem_init();
+	fake_current_epoch = barrier_epoch;
+	fake_epoch_read_count = 0;
+	fake_epoch_flip_on_read = 2;
+	fake_ic_send_count = 0;
+	fake_ic_send_dest = -1;
+	memset(&fake_ic_last_request, 0, sizeof(fake_ic_last_request));
+
+	UT_ASSERT_NOT_NULL(
+		(void *)cluster_gcs_send_transition_nowait_exact_epoch);
+	if (cluster_gcs_send_transition_nowait_exact_epoch == NULL)
+		return;
+
+	/* Identity was exact and remains exact through admission: send once,
+	 * preserving the certificate epoch byte-for-byte in the wire payload. */
+	UT_ASSERT(cluster_gcs_send_transition_nowait_exact_epoch(
+		tag, PCM_TRANS_S_TO_N_RELEASE, barrier_master, barrier_epoch));
+	UT_ASSERT_EQ(fake_ic_send_count, 1);
+	UT_ASSERT_EQ(fake_ic_send_dest, barrier_master);
+	UT_ASSERT_EQ(fake_ic_last_request.epoch, barrier_epoch);
+	fake_epoch_flip_on_read = 0;
+
+	/* Deterministic identity-check -> epoch-advance -> enqueue window. */
+	sends_before = fake_ic_send_count;
+	fake_current_epoch = barrier_epoch + 1;
+	UT_ASSERT(!cluster_gcs_send_transition_nowait_exact_epoch(
+		tag, PCM_TRANS_S_TO_N_RELEASE, barrier_master, barrier_epoch));
+	UT_ASSERT_EQ(fake_ic_send_count, sends_before);
+
+	/* Same epoch, but the current master moved before admission. */
+	fake_current_epoch = barrier_epoch;
+	fake_dead_node = barrier_master;
+	UT_ASSERT(!cluster_gcs_send_transition_nowait_exact_epoch(
+		tag, PCM_TRANS_S_TO_N_RELEASE, barrier_master, barrier_epoch));
+	UT_ASSERT_EQ(fake_ic_send_count, sends_before);
+	fake_declared_count = 1;
+	fake_dead_node = -1;
+}
+
+UT_TEST(test_gcs_receiver_fences_stale_epoch_and_wrong_master_before_pcm)
+{
+	ClusterICEnvelope env;
+	GcsRequestPayload request;
+	BufferTag tag;
+
+	if (!fake_gcs_shmem_found)
+		cluster_gcs_shmem_init();
+	memset(&env, 0, sizeof(env));
+	memset(&request, 0, sizeof(request));
+	memset(&tag, 0, sizeof(tag));
+	tag.relNumber = 21;
+	tag.blockNum = 22;
+	env.payload_length = sizeof(request);
+	request.request_id = 1;
+	request.epoch = UINT64_C(51);
+	request.tag = tag;
+	request.sender_node = 1;
+	request.transition_id = (uint8)PCM_TRANS_S_TO_N_RELEASE;
+	fake_pcm_apply_count = 0;
+	fake_pcm_exact_apply_count = 0;
+	fake_epoch_flip_on_read = 0;
+	fake_declared_count = 3;
+	fake_dead_node = -1;
+
+	/* Old payload at current E+1 is rejected without touching PCM. */
+	fake_current_epoch = request.epoch + 1;
+	cluster_gcs_handle_request_envelope(&env, &request);
+	UT_ASSERT_EQ(fake_pcm_apply_count, 0);
+	UT_ASSERT_EQ(fake_pcm_exact_apply_count, 0);
+
+	/* Same epoch at a non-master receiver is also a zero-mutation reject. */
+	fake_current_epoch = request.epoch;
+	while (cluster_gcs_lookup_master(tag) == cluster_node_id)
+		tag.blockNum++;
+	request.tag = tag;
+	cluster_gcs_handle_request_envelope(&env, &request);
+	UT_ASSERT_EQ(fake_pcm_apply_count, 0);
+	UT_ASSERT_EQ(fake_pcm_exact_apply_count, 0);
+
+	/* Same epoch at the current master reaches the exact PCM seam once. */
+	fake_declared_count = 1;
+	fake_pcm_exact_apply_result = PCM_GCS_TRANSITION_APPLIED;
+	cluster_gcs_handle_request_envelope(&env, &request);
+	UT_ASSERT_EQ(fake_pcm_apply_count, 0);
+	UT_ASSERT_EQ(fake_pcm_exact_apply_count, 1);
+}
+
+UT_TEST(test_gcs_receiver_never_clears_pending_outside_exact_apply)
+{
+	ClusterICEnvelope env;
+	GcsRequestPayload request;
+	const uint64 request_epoch = UINT64_C(71);
+	const uint64 new_cookie = UINT64_C(0xface7101);
+
+	if (!fake_gcs_shmem_found)
+		cluster_gcs_shmem_init();
+	memset(&env, 0, sizeof(env));
+	memset(&request, 0, sizeof(request));
+	env.payload_length = sizeof(request);
+	request.request_id = 2;
+	request.epoch = request_epoch;
+	request.tag.relNumber = 31;
+	request.tag.blockNum = 32;
+	request.sender_node = 1;
+	request.transition_id = (uint8)PCM_TRANS_N_TO_X;
+	fake_declared_count = 1;
+	fake_dead_node = -1;
+	fake_epoch_flip_on_read = 0;
+	fake_pcm_exact_publish_new_pending = true;
+
+	/* Exact apply rejects after its final epoch fence.  Its test stub then
+	 * exposes a new-epoch same-requester pending cookie in the old handler's
+	 * post-apply window; no legacy tag+requester clear may touch it. */
+	fake_current_epoch = request_epoch;
+	fake_pcm_exact_apply_count = 0;
+	fake_pcm_legacy_clear_count = 0;
+	fake_pcm_pending_requester = -1;
+	fake_pcm_pending_epoch = 0;
+	fake_pcm_pending_cookie = 0;
+	fake_pcm_exact_apply_result = PCM_GCS_TRANSITION_INCOMPATIBLE;
+	cluster_gcs_handle_request_envelope(&env, &request);
+	UT_ASSERT_EQ(fake_pcm_exact_apply_count, 1);
+	UT_ASSERT_EQ(fake_pcm_legacy_clear_count, 0);
+	UT_ASSERT_EQ(fake_pcm_pending_requester, request.sender_node);
+	UT_ASSERT_EQ(fake_pcm_pending_epoch, request_epoch + 1);
+	UT_ASSERT_EQ(fake_pcm_pending_cookie, new_cookie);
+
+	/* The same ABA is illegal after an APPLIED return too: apply+old-cookie
+	 * clear must already have completed inside the exact entry-lock seam. */
+	fake_current_epoch = request_epoch;
+	fake_pcm_exact_apply_count = 0;
+	fake_pcm_legacy_clear_count = 0;
+	fake_pcm_pending_requester = -1;
+	fake_pcm_pending_epoch = 0;
+	fake_pcm_pending_cookie = 0;
+	fake_pcm_exact_apply_result = PCM_GCS_TRANSITION_APPLIED;
+	cluster_gcs_handle_request_envelope(&env, &request);
+	UT_ASSERT_EQ(fake_pcm_exact_apply_count, 1);
+	UT_ASSERT_EQ(fake_pcm_legacy_clear_count, 0);
+	UT_ASSERT_EQ(fake_pcm_pending_requester, request.sender_node);
+	UT_ASSERT_EQ(fake_pcm_pending_epoch, request_epoch + 1);
+	UT_ASSERT_EQ(fake_pcm_pending_cookie, new_cookie);
+	fake_pcm_exact_publish_new_pending = false;
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(22);
 	UT_RUN(test_gcs_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_payload_sizes_locked);
 	UT_RUN(test_gcs_payload_field_offsets);
@@ -699,6 +946,9 @@ main(void)
 	UT_RUN(test_gcs_lwlock_tranche_distinct_from_pcm);
 	UT_RUN(test_gcs_hc77_sender_no_double_apply_doc);
 	UT_RUN(test_gcs_module_init_helpers_linkable);
+	UT_RUN(test_gcs_exact_nowait_fences_epoch_and_master_before_admission);
+	UT_RUN(test_gcs_receiver_fences_stale_epoch_and_wrong_master_before_pcm);
+	UT_RUN(test_gcs_receiver_never_clears_pending_outside_exact_apply);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -1073,6 +1073,10 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 			cluster_req.op
 				= cluster_lock_decide_op(&cluster_req, &cluster_current_mode, &cluster_lold);
 			cluster_req.current_mode = cluster_current_mode;
+			if (cluster_req.op == CLUSTER_LOCK_OP_CONVERT) {
+				Assert(cluster_lold != NULL);
+				cluster_req.convert_old_request_id = cluster_lold->cluster_request_id;
+			}
 		}
 
 		cluster_r = cluster_lock_acquire_seven_step(&cluster_req);

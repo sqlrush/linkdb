@@ -58,8 +58,9 @@ typedef struct ClusterSfDepEntry {
  * Per-peer HELLO capability record (spec-2.2 additive amendment; spec-5.22e
  * D5 prereq).  Capability state is a property of the CONNECTION that carried
  * the HELLO / PEER_CAPS_REPLY, so the record binds the learned bits to the
- * transport connection generation (tier1: the peer's reconnect_count while
- * that connection was established).  A clear only applies when the caller's
+ * transport connection generation (tier1: peer reconnect_count + 1 while
+ * that connection was established; zero is reserved for no connection).
+ * A clear only applies when the caller's
  * generation matches the recorded one: a defensive close of a failed dial or
  * of an OLDER connection can never wipe the surviving connection's record
  * (forward hazard for the 7.3 multi-channel plane).  The helpers are pure so
@@ -67,17 +68,27 @@ typedef struct ClusterSfDepEntry {
  * LWLock.
  */
 typedef struct ClusterSfPeerCap {
-	uint32 bits;	   /* learned HELLO capability word (0 when !valid) */
+	uint32 bits;		/* learned HELLO capability word (0 when !valid) */
 	uint32 generation; /* connection generation at learn time */
-	bool valid;		   /* record live?  false reads as "no capability" */
+	uint64 boot_incarnation; /* from the same verified HELLO */
+	bool valid;			/* record live? false reads as "no capability" */
 } ClusterSfPeerCap;
+
+static inline void
+cluster_sf_peer_cap_note_identity(
+	ClusterSfPeerCap *cap, uint32 bits, uint32 generation,
+	uint64 boot_incarnation)
+{
+	cap->bits = bits;
+	cap->generation = generation;
+	cap->boot_incarnation = boot_incarnation;
+	cap->valid = true;
+}
 
 static inline void
 cluster_sf_peer_cap_note(ClusterSfPeerCap *cap, uint32 bits, uint32 generation)
 {
-	cap->bits = bits;
-	cap->generation = generation;
-	cap->valid = true;
+	cluster_sf_peer_cap_note_identity(cap, bits, generation, 0);
 }
 
 static inline uint32
@@ -100,6 +111,25 @@ cluster_sf_peer_cap_generation_for_bits(const ClusterSfPeerCap *cap, uint32 requ
 		return false;
 	if (generation != NULL)
 		*generation = cap->generation;
+	return true;
+}
+
+/* Type65 consumes the capability generation and HELLO boot identity from one
+ * record snapshot.  A zero boot identity is never authority, even if a stale
+ * or synthetic capability bit is present. */
+static inline bool
+cluster_sf_peer_cap_identity_for_bits(
+	const ClusterSfPeerCap *cap, uint32 required_bits, uint32 *generation,
+	uint64 *boot_incarnation)
+{
+	if (boot_incarnation != NULL)
+		*boot_incarnation = 0;
+	if (!cluster_sf_peer_cap_generation_for_bits(
+			cap, required_bits, generation)
+		|| cap->boot_incarnation == 0)
+		return false;
+	if (boot_incarnation != NULL)
+		*boot_incarnation = cap->boot_incarnation;
 	return true;
 }
 
@@ -146,6 +176,7 @@ cluster_sf_peer_cap_invalidate_gen(ClusterSfPeerCap *cap, uint32 generation)
 		return false;
 	cap->valid = false;
 	cap->bits = 0;
+	cap->boot_incarnation = 0;
 	return true;
 }
 
@@ -243,6 +274,9 @@ extern void cluster_sf_publish_origin_durable_lsn(void);
  * registered tier1-only boundary). */
 extern void cluster_sf_note_peer_hello_capabilities_gen(int32 peer_id, uint32 capabilities,
 														uint32 generation);
+extern void cluster_sf_note_peer_hello_identity_gen(
+	int32 peer_id, uint32 capabilities, uint32 generation,
+	uint64 boot_incarnation);
 extern bool cluster_sf_peer_supports_reply_v2(int32 peer_id);
 /* spec-5.22d D4-6: did the peer's HELLO advertise the kind-4 authority-serve
  * protocol capability?  Deliberately NOT gated on any local GUC (unlike the
@@ -262,6 +296,10 @@ extern bool cluster_sf_peer_supports_undo_horizon_idle(int32 peer_id);
  * requester withholds DONE (TTL backstop), the master pins the legacy
  * protocol-maximum lifetime instead of trusting a hint. */
 extern bool cluster_sf_peer_supports_gcs_done(int32 peer_id);
+extern bool cluster_sf_peer_boot_identity(int32 peer_id, uint32 *generation,
+										 uint64 *boot_incarnation);
+extern bool cluster_sf_peer_gcs_request_boot_identity(int32 peer_id, uint32 *generation,
+													  uint64 *boot_incarnation);
 /* GCS-race round-3 P0-1: xid wrap-barrier capability (connection-bound, same
  * discipline).  False for an unknown/old/reconnecting peer, which fails the
  * barrier SAFE: the coordinator withholds DISABLE, the ack bitmap never
@@ -277,6 +315,14 @@ extern bool cluster_sf_peer_supports_pcm_x_source_floor(int32 peer_id);
  * independently by cluster_lms_outbound. */
 extern bool cluster_sf_peer_multixact_current_capability_generation(int32 peer_id,
 																	uint32 *generation);
+extern bool cluster_sf_peer_stale_x_cert_capability_generation(int32 peer_id,
+																uint32 *generation);
+extern bool cluster_sf_peer_stale_x_cert_capability_identity(
+	int32 peer_id, uint32 *generation, uint64 *boot_incarnation);
+extern bool cluster_sf_peer_forward_cancel_capability_identity(
+	int32 peer_id, uint32 *generation, uint64 *boot_incarnation);
+extern bool cluster_sf_peer_ges_dedup_done_capability_identity(
+	int32 peer_id, uint32 *generation, uint64 *boot_incarnation);
 extern bool cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
 													  uint32 *generation_out);
 extern bool cluster_sf_peer_capability_generation_matches(int32 peer_id,

@@ -164,6 +164,25 @@ typedef struct ClusterCRShared {
 	pg_atomic_uint64 cr_server_verdict_served_count;
 	pg_atomic_uint64 cr_server_verdict_denied_count;
 	pg_atomic_uint64 cr_server_fence_refused_count; /* spec-7.3 D7 fence ×N refuse */
+	/* S3-P0-13: the authoritative exact/non-live terminal re-sample is a
+	 * closed three-way census.  Counters replace per-event diagnostic LOGs. */
+	pg_atomic_uint64 cr_server_terminal_resample_commit_count;
+	pg_atomic_uint64 cr_server_terminal_resample_abort_count;
+	pg_atomic_uint64 cr_server_terminal_resample_unknown_count;
+	/* S3-P0-13 r39: mutually-exclusive decomposition of srv_other. */
+	pg_atomic_uint64 cr_server_other_refuse_not_authoritative_count;
+	pg_atomic_uint64 cr_server_other_refuse_not_mine_count;
+	pg_atomic_uint64 cr_server_other_refuse_expected_segment_invalid_count;
+	pg_atomic_uint64 cr_server_other_refuse_expected_slot_invalid_count;
+	pg_atomic_uint64 cr_server_other_refuse_segment_mismatch_count;
+	pg_atomic_uint64 cr_server_other_refuse_slot_mismatch_count;
+	pg_atomic_uint64 cr_server_other_refuse_confirm_resolve_kind_count;
+	pg_atomic_uint64 cr_server_other_refuse_confirm_segment_mismatch_count;
+	pg_atomic_uint64 cr_server_other_refuse_confirm_slot_mismatch_count;
+	pg_atomic_uint64 cr_server_other_refuse_confirm_wrap_mismatch_count;
+	pg_atomic_uint64 cr_server_other_refuse_confirm_scn_mismatch_count;
+	pg_atomic_uint64 cr_server_other_refuse_terminal_unknown_count;
+	pg_atomic_uint64 cr_server_other_refuse_residual_count;
 	/*
 	 * spec-7.1 D3-b (server side): multixact member-verdict batches served vs
 	 * refused (any unprovable updater member refuses the whole multi).
@@ -384,6 +403,22 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_served_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_multi_verdict_denied_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_server_fence_refused_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_terminal_resample_commit_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_terminal_resample_abort_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_terminal_resample_unknown_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_not_authoritative_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_not_mine_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_expected_segment_invalid_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_expected_slot_invalid_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_segment_mismatch_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_slot_mismatch_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_confirm_resolve_kind_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_confirm_segment_mismatch_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_confirm_slot_mismatch_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_confirm_wrap_mismatch_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_confirm_scn_mismatch_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_terminal_unknown_count, 0);
+		pg_atomic_init_u64(&CRShared->cr_server_other_refuse_residual_count, 0);
 		pg_atomic_init_u64(&CRShared->rtvis_underivable_failclosed_count, 0);
 		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_resolved_count, 0);
 		pg_atomic_init_u64(&CRShared->vis_freshref_verdict_failclosed_count, 0);
@@ -484,7 +519,69 @@ cluster_cr_server_stat_bump(ClusterCrServerStat which)
 	case CLUSTER_CR_SERVER_STAT_FENCE_REFUSED:
 		pg_atomic_fetch_add_u64(&CRShared->cr_server_fence_refused_count, 1);
 		break;
+	case CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_COMMIT:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_terminal_resample_commit_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_ABORT:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_terminal_resample_abort_count, 1);
+		break;
+	case CLUSTER_CR_SERVER_STAT_TERMINAL_RESAMPLE_UNKNOWN:
+		pg_atomic_fetch_add_u64(&CRShared->cr_server_terminal_resample_unknown_count, 1);
+		break;
 	}
+}
+
+void
+cluster_cr_server_other_refusal_detail_bump(ClusterCrServerOtherRefusalDetail detail)
+{
+	pg_atomic_uint64 *counter;
+
+	detail = cluster_cr_server_other_refusal_detail_normalize(detail);
+	if (CRShared == NULL)
+		return;
+	switch (detail) {
+	case CLUSTER_CR_SERVER_OTHER_NOT_AUTHORITATIVE:
+		counter = &CRShared->cr_server_other_refuse_not_authoritative_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_NOT_MINE:
+		counter = &CRShared->cr_server_other_refuse_not_mine_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_EXPECTED_SEGMENT_INVALID:
+		counter = &CRShared->cr_server_other_refuse_expected_segment_invalid_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_EXPECTED_SLOT_INVALID:
+		counter = &CRShared->cr_server_other_refuse_expected_slot_invalid_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_SEGMENT_MISMATCH:
+		counter = &CRShared->cr_server_other_refuse_segment_mismatch_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_SLOT_MISMATCH:
+		counter = &CRShared->cr_server_other_refuse_slot_mismatch_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_CONFIRM_RESOLVE_KIND:
+		counter = &CRShared->cr_server_other_refuse_confirm_resolve_kind_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_CONFIRM_SEGMENT_MISMATCH:
+		counter = &CRShared->cr_server_other_refuse_confirm_segment_mismatch_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_CONFIRM_SLOT_MISMATCH:
+		counter = &CRShared->cr_server_other_refuse_confirm_slot_mismatch_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_CONFIRM_WRAP_MISMATCH:
+		counter = &CRShared->cr_server_other_refuse_confirm_wrap_mismatch_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_CONFIRM_SCN_MISMATCH:
+		counter = &CRShared->cr_server_other_refuse_confirm_scn_mismatch_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_TERMINAL_UNKNOWN:
+		counter = &CRShared->cr_server_other_refuse_terminal_unknown_count;
+		break;
+	case CLUSTER_CR_SERVER_OTHER_RESIDUAL:
+	default:
+		counter = &CRShared->cr_server_other_refuse_residual_count;
+		break;
+	}
+	pg_atomic_fetch_add_u64(counter, 1);
 }
 
 /* PGRAC: spec-6.12i — requester-side undo-TT fetch outcome bumps (backend
@@ -874,6 +971,38 @@ CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_served_count,
 CR_COUNTER_ACCESSOR(cluster_cr_server_multi_verdict_denied_count,
 					cr_server_multi_verdict_denied_count)
 CR_COUNTER_ACCESSOR(cluster_cr_server_fence_refused_count, cr_server_fence_refused_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_terminal_resample_commit_count,
+					cr_server_terminal_resample_commit_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_terminal_resample_abort_count,
+					cr_server_terminal_resample_abort_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_terminal_resample_unknown_count,
+					cr_server_terminal_resample_unknown_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_not_authoritative_count,
+					cr_server_other_refuse_not_authoritative_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_not_mine_count,
+					cr_server_other_refuse_not_mine_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_expected_segment_invalid_count,
+					cr_server_other_refuse_expected_segment_invalid_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_expected_slot_invalid_count,
+					cr_server_other_refuse_expected_slot_invalid_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_segment_mismatch_count,
+					cr_server_other_refuse_segment_mismatch_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_slot_mismatch_count,
+					cr_server_other_refuse_slot_mismatch_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_confirm_resolve_kind_count,
+					cr_server_other_refuse_confirm_resolve_kind_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_confirm_segment_mismatch_count,
+					cr_server_other_refuse_confirm_segment_mismatch_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_confirm_slot_mismatch_count,
+					cr_server_other_refuse_confirm_slot_mismatch_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_confirm_wrap_mismatch_count,
+					cr_server_other_refuse_confirm_wrap_mismatch_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_confirm_scn_mismatch_count,
+					cr_server_other_refuse_confirm_scn_mismatch_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_terminal_unknown_count,
+					cr_server_other_refuse_terminal_unknown_count)
+CR_COUNTER_ACCESSOR(cluster_cr_server_other_refuse_residual_count,
+					cr_server_other_refuse_residual_count)
 CR_COUNTER_ACCESSOR(cluster_rtvis_underivable_failclosed_count, rtvis_underivable_failclosed_count)
 /* spec-5.22f D6-3: fresh-remote-ITL-ref widening outcome counters. */
 CR_COUNTER_ACCESSOR(cluster_vis_freshref_verdict_resolved_count,

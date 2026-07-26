@@ -37,6 +37,7 @@
 #include "c.h"
 #include "access/transam.h"
 #include "cluster/cluster_tt_slot.h" /* ClusterUndoTTSlotRef */
+#include "fmgr.h"
 
 /*
  * Lookup helper — called from D5 visibility fork entry when GUC
@@ -49,5 +50,12 @@ extern bool cluster_test_lookup_visibility_inject(TransactionId xid, ClusterUndo
 extern Size cluster_visibility_inject_shmem_size(void);
 extern void cluster_visibility_inject_shmem_init(void);
 extern void cluster_visibility_inject_shmem_register(void);
+
+/*
+ * Assertion-build-only runtime probe for S3-P0-13.  The SQL wrapper sends
+ * one real non-authoritative undo-verdict request for a caller-owned xid;
+ * it never updates the server's OTHER counters itself.
+ */
+extern Datum cluster_test_request_undo_verdict_other(PG_FUNCTION_ARGS);
 
 #endif /* CLUSTER_VISIBILITY_INJECT_H */

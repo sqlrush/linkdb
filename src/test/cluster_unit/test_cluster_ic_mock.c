@@ -75,6 +75,12 @@ bool cluster_ic_suppress_caps_reply = false;
 bool cluster_ic_suppress_gcs_done_cap = false;
 bool cluster_ic_suppress_xid_flock_cap = false;
 
+uint64
+cluster_qvotec_get_durable_self_incarnation(void)
+{
+	return 0;
+}
+
 /* spec-5.59 D6 stubs: cluster_ic.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
  * nor cluster_xnode_profile.o, so define the two gate symbols inertly

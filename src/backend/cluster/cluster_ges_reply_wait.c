@@ -158,10 +158,22 @@ uint64
 cluster_ges_reply_wait_next_request_id(void)
 {
 	static uint64 local_fallback = 0;
+	uint64 current;
 
-	if (reply_wait_state == NULL)
+	if (reply_wait_state == NULL) {
+		if (!cluster_ges_request_id_can_advance(local_fallback))
+			ereport(PANIC,
+					(errmsg_internal("cluster GES node-global request_id exhausted "
+									 "before shared memory attachment")));
 		return ++local_fallback;
-	return pg_atomic_fetch_add_u64(&reply_wait_state->request_id_seq, 1) + 1;
+	}
+
+	current = pg_atomic_fetch_add_u64(&reply_wait_state->request_id_seq, 1);
+	if (!cluster_ges_request_id_can_advance(current))
+		ereport(PANIC,
+				(errmsg_internal("cluster GES node-global request_id exhausted; "
+								 "restart with a new boot incarnation")));
+	return current + 1;
 }
 
 

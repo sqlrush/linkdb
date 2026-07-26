@@ -59,6 +59,7 @@
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_shmem.h"
+#include "../../backend/cluster/cluster_gcs_block_internal.h"
 #include "port/pg_crc32c.h"
 #include "storage/buf_internals.h"
 #include "storage/ipc.h"
@@ -90,6 +91,13 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+int
+s_lock(volatile slock_t *lock pg_attribute_unused(), const char *file pg_attribute_unused(),
+	   int line pg_attribute_unused(), const char *func pg_attribute_unused())
+{
+	return 0;
+}
+
 
 /* ============================================================
  * GUC / global stubs the module reads.
@@ -98,6 +106,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 bool cluster_enabled = true;
 int cluster_node_id = 0;
 int cluster_lms_workers = 2;
+int NBuffers = 8;
 int MaxConnections = 1; /* spec-7.2a D4 floor input (x declared nodes = 1) */
 int cluster_gcs_block_dedup_max_entries = 8;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
@@ -118,14 +127,28 @@ bool IsUnderPostmaster = true;
 typedef struct FakeDedupShardHtab {
 	char entries[FAKE_DEDUP_CAP][sizeof(GcsBlockDedupEntry)];
 	long count;
+	long max_entries;
+	Size keysize;
+	Size entrysize;
 } FakeDedupShardHtab;
 
-static FakeDedupShardHtab fake_htab[CLUSTER_LMS_MAX_WORKERS];
+static FakeDedupShardHtab fake_htab[CLUSTER_LMS_MAX_WORKERS * 4];
 static int fake_htab_init_seq;
-static Size fake_keysize;
-static Size fake_entrysize;
 static int fake_hash_seq_init_count;
 static int fake_hash_seq_term_count;
+#define FAKE_LOCK_EVENT_CAP 256
+static LWLock *fake_lwlock_acquire_order[FAKE_LOCK_EVENT_CAP];
+static LWLockMode fake_lwlock_acquire_mode[FAKE_LOCK_EVENT_CAP];
+static LWLock *fake_lwlock_release_order[FAKE_LOCK_EVENT_CAP];
+static int fake_lwlock_acquire_count;
+static int fake_lwlock_shared_count;
+static int fake_lwlock_exclusive_count;
+static int fake_lwlock_release_count;
+static int fake_lwlock_held_count;
+static int fake_lwlock_max_held_count;
+static int fake_lwlock_release_underflow_count;
+static bool fake_allow_multi_lwlock;
+static int fake_hash_seq_held_count[FAKE_LOCK_EVENT_CAP];
 
 /* ShmemInitStruct blob for the dedup ctl header + per-shard structs. */
 static union {
@@ -142,10 +165,20 @@ reset_fake_dedup(int n_workers, int max_entries)
 {
 	memset(fake_htab, 0, sizeof(fake_htab));
 	fake_htab_init_seq = 0;
-	fake_keysize = 0;
-	fake_entrysize = 0;
 	fake_hash_seq_init_count = 0;
 	fake_hash_seq_term_count = 0;
+	memset(fake_lwlock_acquire_order, 0, sizeof(fake_lwlock_acquire_order));
+	memset(fake_lwlock_acquire_mode, 0, sizeof(fake_lwlock_acquire_mode));
+	memset(fake_lwlock_release_order, 0, sizeof(fake_lwlock_release_order));
+	fake_lwlock_acquire_count = 0;
+	fake_lwlock_shared_count = 0;
+	fake_lwlock_exclusive_count = 0;
+	fake_lwlock_release_count = 0;
+	fake_lwlock_held_count = 0;
+	fake_lwlock_max_held_count = 0;
+	fake_lwlock_release_underflow_count = 0;
+	fake_allow_multi_lwlock = false;
+	memset(fake_hash_seq_held_count, 0, sizeof(fake_hash_seq_held_count));
 	memset(&fake_dedup_struct, 0, sizeof(fake_dedup_struct));
 	fake_dedup_struct_found = false;
 	fake_before_shmem_exit_registered = 0;
@@ -176,17 +209,18 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPt
 
 HTAB *
 ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribute_unused(),
-			  long max_size pg_attribute_unused(), HASHCTL *infoP, int hash_flags)
+			  long max_size, HASHCTL *infoP, int hash_flags)
 {
 	FakeDedupShardHtab *h;
 
 	Assert((hash_flags & HASH_ELEM) != 0);
-	Assert(infoP->entrysize == sizeof(GcsBlockDedupEntry));
-	Assert(fake_htab_init_seq < CLUSTER_LMS_MAX_WORKERS);
-	fake_keysize = infoP->keysize;
-	fake_entrysize = infoP->entrysize;
+	Assert(infoP->entrysize <= sizeof(GcsBlockDedupEntry));
+	Assert(fake_htab_init_seq < CLUSTER_LMS_MAX_WORKERS * 4);
 	h = &fake_htab[fake_htab_init_seq++];
 	h->count = 0;
+	h->max_entries = max_size;
+	h->keysize = infoP->keysize;
+	h->entrysize = infoP->entrysize;
 	return (HTAB *)h;
 }
 
@@ -197,18 +231,18 @@ hash_search(HTAB *hashp, const void *keyPtr, HASHACTION action, bool *foundPtr)
 	long i;
 
 	Assert(h != NULL);
-	Assert(fake_keysize > 0);
+	Assert(h->keysize > 0);
 
 	for (i = 0; i < h->count; i++) {
 		char *entry = h->entries[i];
 
-		if (memcmp(entry, keyPtr, fake_keysize) == 0) {
+		if (memcmp(entry, keyPtr, h->keysize) == 0) {
 			if (foundPtr != NULL)
 				*foundPtr = true;
 			if (action == HASH_REMOVE) {
 				if (i + 1 < h->count)
 					memmove(h->entries[i], h->entries[i + 1],
-							(size_t)(h->count - i - 1) * sizeof(GcsBlockDedupEntry));
+							(size_t)(h->count - i - 1) * h->entrysize);
 				h->count--;
 				return entry;
 			}
@@ -220,13 +254,14 @@ hash_search(HTAB *hashp, const void *keyPtr, HASHACTION action, bool *foundPtr)
 		*foundPtr = false;
 	if (action == HASH_FIND || action == HASH_REMOVE)
 		return NULL;
-	if (action == HASH_ENTER_NULL && h->count >= FAKE_DEDUP_CAP)
+	if (action == HASH_ENTER_NULL
+		&& (h->count >= h->max_entries || h->count >= FAKE_DEDUP_CAP))
 		return NULL;
 	if (action == HASH_ENTER || action == HASH_ENTER_NULL) {
 		char *entry = h->entries[h->count++];
 
-		memset(entry, 0, sizeof(GcsBlockDedupEntry));
-		memcpy(entry, keyPtr, fake_keysize);
+		memset(entry, 0, h->entrysize);
+		memcpy(entry, keyPtr, h->keysize);
 		return entry;
 	}
 	return NULL;
@@ -235,6 +270,8 @@ hash_search(HTAB *hashp, const void *keyPtr, HASHACTION action, bool *foundPtr)
 void
 hash_seq_init(HASH_SEQ_STATUS *status, HTAB *hashp)
 {
+	if (fake_hash_seq_init_count < FAKE_LOCK_EVENT_CAP)
+		fake_hash_seq_held_count[fake_hash_seq_init_count] = fake_lwlock_held_count;
 	fake_hash_seq_init_count++;
 	status->hashp = hashp;
 	status->curBucket = 0;
@@ -270,14 +307,35 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 {}
 
 bool
-LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	Assert(fake_allow_multi_lwlock || fake_lwlock_held_count == 0);
+	if (fake_lwlock_acquire_count < FAKE_LOCK_EVENT_CAP) {
+		fake_lwlock_acquire_order[fake_lwlock_acquire_count] = lock;
+		fake_lwlock_acquire_mode[fake_lwlock_acquire_count] = mode;
+	}
+	fake_lwlock_acquire_count++;
+	if (mode == LW_SHARED)
+		fake_lwlock_shared_count++;
+	else
+		fake_lwlock_exclusive_count++;
+	fake_lwlock_held_count++;
+	if (fake_lwlock_held_count > fake_lwlock_max_held_count)
+		fake_lwlock_max_held_count = fake_lwlock_held_count;
 	return true;
 }
 
 void
-LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+LWLockRelease(LWLock *lock)
+{
+	if (fake_lwlock_release_count < FAKE_LOCK_EVENT_CAP)
+		fake_lwlock_release_order[fake_lwlock_release_count] = lock;
+	fake_lwlock_release_count++;
+	if (fake_lwlock_held_count > 0)
+		fake_lwlock_held_count--;
+	else
+		fake_lwlock_release_underflow_count++;
+}
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -754,6 +812,42 @@ UT_TEST(u10_remove_reopens_in_flight_entry)
 				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
 }
 
+/* S3-P0-21: the HC101 REARM path may publish DENIED_PENDING_X only after an
+ * identity-exact removal.  Wrong tag/transition and completed entries remain
+ * untouched; only the original uncompleted registration can be removed. */
+UT_TEST(u10b_exact_remove_refuses_identity_or_phase_drift)
+{
+	GcsBlockDedupKey k = make_key(0, 3, 401, 7);
+	BufferTag t = make_tag(91);
+	BufferTag wrong_t = make_tag(92);
+	GcsBlockDedupEntry cached;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &k, t, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(!cluster_gcs_block_dedup_remove_inflight_exact(
+		0, &k, &wrong_t, 1));
+	UT_ASSERT(!cluster_gcs_block_dedup_remove_inflight_exact(
+		0, &k, &t, 2));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT(cluster_gcs_block_dedup_remove_inflight_exact(
+		0, &k, &t, 1));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+
+	/* A completed same-identity reply is immutable, never reopened as a
+	 * fresh route attempt. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &k, t, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	install_granted(0, &k);
+	UT_ASSERT(!cluster_gcs_block_dedup_remove_inflight_exact(
+		0, &k, &t, 1));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &k, t, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+}
+
 
 /* ============================================================
  * U11 — a READ_IMAGE forward MARKER classifies FORWARDED, a master-direct
@@ -857,7 +951,7 @@ UT_TEST(u12_ttl_covers_reply_timeout_lifetime)
  *
  *	DONE is advisory: every identity or state doubt drops the proof
  *	(done_mismatch_count++) and leaves the TTL backstop in charge.  Only
- *	a full 4-tuple key + tag + transition_id match on a COMPLETED entry
+ *	a full boot-bound key + tag + transition_id match on a COMPLETED entry
  *	stamps done_at_ts; a duplicate DONE is idempotent-true.
  * ============================================================ */
 UT_TEST(u13_mark_done_truth_table)
@@ -1050,17 +1144,18 @@ UT_TEST(u16_capability_routing_truth_table)
 }
 
 
-/* PCM-X uses the existing 8KB entry payload without moving any established
- * field or increasing the entry size. */
-UT_TEST(u17_pcm_x_binding_layout_is_zero_entry_growth)
+/* PCM-X still overlays the shared metadata cell.  The later FORWARD
+ * boot/capability/relation identity expansion grows that cell by 40B. */
+UT_TEST(u17_pcm_x_binding_layout_tracks_forward_identity_growth)
 {
 	UT_ASSERT_EQ((int)sizeof(GcsBlockPcmXImageBinding), 144);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, entry_kind), 46);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pcm_x_master_session), 48);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, reply_header), 56);
-	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, payload_meta), 112);
-	UT_ASSERT_EQ((int)sizeof(((GcsBlockDedupEntry *)0)->payload_meta), 128);
-	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupEntry), 8472);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, entry_kind), 54);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, pcm_x_master_session), 56);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, reply_header), 64);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, payload_meta), 120);
+	UT_ASSERT_EQ((int)sizeof(((GcsBlockDedupEntry *)0)->payload_meta), 168);
+	UT_ASSERT_EQ((int)offsetof(GcsBlockDedupEntry, block_data), 288);
+	UT_ASSERT_EQ((int)sizeof(GcsBlockDedupEntry), 8520);
 }
 
 
@@ -2012,6 +2107,7 @@ UT_TEST(u36_pcm_x_drain_cleanup_is_replayable_until_exact_retire)
 	GcsBlockDedupEntry cached;
 	char page[GCS_BLOCK_DATA_SIZE];
 	uint64 image_id;
+	uint64 removed;
 
 	reset_fake_dedup(2, FAKE_DEDUP_CAP);
 	UT_ASSERT(cluster_pcm_x_image_id_encode(2, 32, &image_id));
@@ -2049,15 +2145,25 @@ UT_TEST(u36_pcm_x_drain_cleanup_is_replayable_until_exact_retire)
 	cluster_gcs_block_dedup_cleanup_on_backend_exit(1, 3);
 	cluster_gcs_block_dedup_cleanup_on_node_dead(1);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
-	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(12, 2, 122, 29));
+	removed = UINT64_MAX;
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to_observed(12, 2, 122, 29, &removed));
+	UT_ASSERT_EQ(removed, 0);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
-	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(0, 1, 122, 29));
+	removed = UINT64_MAX;
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to_observed(0, 1, 122, 29, &removed));
+	UT_ASSERT_EQ(removed, 0);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
-	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(0, 2, 121, 29));
+	removed = UINT64_MAX;
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to_observed(0, 2, 121, 29, &removed));
+	UT_ASSERT_EQ(removed, 0);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
-	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(0, 2, 122, 28));
+	removed = UINT64_MAX;
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to_observed(0, 2, 122, 28, &removed));
+	UT_ASSERT_EQ(removed, 0);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
-	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to(0, 2, 122, 29));
+	removed = UINT64_MAX;
+	UT_ASSERT(cluster_gcs_block_dedup_pcm_x_retire_up_to_observed(0, 2, 122, 29, &removed));
+	UT_ASSERT_EQ(removed, 1);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 0);
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_pcm_x_release_count(), 1);
 }
@@ -2111,10 +2217,1847 @@ UT_TEST(u37_pcm_x_finish_error_preserves_exact_materialized_evidence)
 	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 0);
 }
 
+UT_TEST(u38_forward_marker_prepare_claim_finish_is_exact_and_serial)
+{
+	BufferTag tag = make_tag(134);
+	GcsBlockDedupKey key = make_key(1, 7, UINT64_C(0x123456789abcdef0), 21);
+	GcsBlockDedupEntry cached;
+	GcsBlockDedupEntry claimed;
+	GcsBlockDedupEntry denied;
+	PcmAuthoritySnapshot authority;
+	PcmAuthoritySnapshot drifted;
+	GcsBlockForwardPayload forward;
+	GcsBlockForwardMarker marker_copy;
+	GcsBlockReplyHeader late;
+	const GcsBlockForwardMarker *marker;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+
+	memset(&authority, 0, sizeof(authority));
+	authority.master_holder.node_id = 2;
+	authority.transition_count = 41;
+	authority.state = PCM_STATE_S;
+	authority.x_holder_node = -1;
+	authority.s_holders_bitmap = UINT32_C(1) << 2;
+	authority.pending_x_requester_node = -1;
+	authority.authority_generation = 43;
+	memset(&forward, 0, sizeof(forward));
+	forward.request_id = key.request_id;
+	forward.epoch = key.cluster_epoch;
+	forward.tag = tag;
+	forward.original_requester_node = (int32)key.origin_node_id;
+	forward.requester_backend_id = key.requester_backend_id;
+	forward.master_node = 0;
+	forward.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&forward, (SCN)47);
+
+	drifted = authority;
+	drifted.authority_generation = 0;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_prepare_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_S, 2, 0,
+					 GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &drifted, &forward, &cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_INVALID);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_prepare_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_S, 2, 0,
+					 GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &authority, &forward, &cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	marker = &cached.payload_meta.forward_marker;
+	UT_ASSERT_EQ(memcmp(&marker->authority, &authority, sizeof(authority)), 0);
+	UT_ASSERT_EQ(memcmp(&marker->forward, &forward, sizeof(forward)), 0);
+	UT_ASSERT_EQ((uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&marker->forward),
+				 UINT64_C(47));
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_PREPARED);
+	UT_ASSERT_EQ((int)cached.completed_at_ts, 0);
+	marker_copy = *marker;
+	marker = &marker_copy;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &claimed),
+				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+
+	/* Generic remove and late reply production cannot erase/overlay PREPARED. */
+	cluster_gcs_block_dedup_remove(0, &key);
+	memset(&late, 0, sizeof(late));
+	late.request_id = key.request_id;
+	late.epoch = key.cluster_epoch;
+	late.sender_node = 0;
+	late.requester_backend_id = key.requester_backend_id;
+	late.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	late.status = (uint8)GCS_BLOCK_REPLY_GRANTED;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&late, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	cluster_gcs_block_dedup_install_reply(
+		0, &key, GCS_BLOCK_REPLY_GRANTED, &late, NULL);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_claim_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, marker,
+					 GCS_BLOCK_FORWARD_MARK_PREPARED, &claimed),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&claimed),
+				 (int)GCS_BLOCK_FORWARD_MARK_SEND_ARMED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &claimed),
+				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_claim_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, marker,
+					 GCS_BLOCK_FORWARD_MARK_PREPARED, &claimed),
+				 (int)GCS_BLOCK_FORWARD_MARK_BUSY);
+	UT_ASSERT(!cluster_gcs_block_dedup_forward_abort_prepared_exact(
+		0, &key, &tag, 2, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, marker));
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_finish_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, marker, &cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_FORWARDED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE);
+	UT_ASSERT_EQ(memcmp(&cached.payload_meta.forward_marker.forward, &forward, sizeof(forward)), 0);
+
+	/* A queue-kind X claim may race this already-admitted legacy-S forward.
+	 * The marker is valid authority, not corruption and not a denial target:
+	 * keep it byte-exact and ask the queue driver to retry after DONE (or the
+	 * stronger stale-X certificate lifecycle) resolves the identity. */
+	memset(&denied, 0, sizeof(denied));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(0, &tag, &denied),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_S, &denied),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &claimed),
+				 (int)GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE);
+	UT_ASSERT_EQ(memcmp(&claimed.payload_meta.forward_marker, marker, sizeof(*marker)), 0);
+
+	/* Replay has one exact send claim.  The marker is back in FORWARDED, and
+	 * S3-P0-09 makes that phase outrank a generic completion proof: a blind or
+	 * duplicate requester DONE carries a perfectly valid identity, but the
+	 * forward leg is still in flight, so mark_done() must refuse it rather than
+	 * stamp done_at_ts.  Refusing keeps the cell in its live posture -- still a
+	 * FORWARDED duplicate to a racing retry, still an exact blocker to queue-kind
+	 * X arbitration -- instead of collapsing it to a retired DONE that
+	 * pending_x_deny_next() would skip into a false NOT_FOUND (which
+	 * pending_x_deny_exact() would simultaneously answer FORWARD_BLOCKED for). */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_claim_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, marker,
+					 GCS_BLOCK_FORWARD_MARK_FORWARDED, &claimed),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_finish_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, marker, &cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(0, &key, &tag, (uint8)PCM_TRANS_N_TO_S));
+	/* The refusal is attributable, not silent: it lands on the FORWARDED
+	 * counter alone.  It is deliberately NOT folded into done_mismatch_count
+	 * (the identity matched perfectly -- this is a phase refusal), and it must
+	 * not be mistaken for an accepted proof.  This is the whole reason the
+	 * counter pair exists: without it a field run cannot tell a refused blind
+	 * DONE from an ordinary accepted one. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_forwarded_refused_count(), 1);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_cancelling_refused_count(), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_marked_count(), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_get_done_mismatch_count(), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(0, &tag, &denied),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_BLOCKED);
+}
+
+UT_TEST(u39_admitted_forward_survives_local_cleanup_without_holder_fence_ack)
+{
+	BufferTag tag = make_tag(135);
+	GcsBlockDedupKey key = make_key(1, 7, UINT64_C(0xabc001), 22);
+	GcsBlockDedupEntry cached;
+	PcmAuthoritySnapshot authority;
+	GcsBlockForwardPayload forward;
+	GcsBlockForwardMarker marker;
+	TimestampTz far_future;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_X, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	memset(&authority, 0, sizeof(authority));
+	authority.master_holder.node_id = 2;
+	authority.transition_count = 51;
+	authority.state = PCM_STATE_X;
+	authority.x_holder_node = 2;
+	authority.pending_x_requester_node = 1;
+	authority.pending_x_since_lsn = UINT64_C(0x34567);
+	authority.authority_generation = 53;
+	memset(&forward, 0, sizeof(forward));
+	forward.request_id = key.request_id;
+	forward.epoch = key.cluster_epoch;
+	forward.tag = tag;
+	forward.original_requester_node = 1;
+	forward.requester_backend_id = key.requester_backend_id;
+	forward.master_node = 0;
+	forward.transition_id = (uint8)PCM_TRANS_N_TO_X;
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&forward, (SCN)57);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_prepare_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_X, 2, 0,
+					 GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER, &authority, &forward, &cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	marker = cached.payload_meta.forward_marker;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_claim_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER, &marker,
+					 GCS_BLOCK_FORWARD_MARK_PREPARED, NULL),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_finish_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER, &marker, NULL),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+
+	/* Backend/node death and wall-clock TTL are not wire-quiescence proofs.
+	 * A paused requester may still consume a late holder grant, so generic
+	 * cleanup must retain the exact marker until a holder-side fence ACK (or
+	 * a stronger membership/connection-incarnation proof) exists. */
+	cluster_gcs_block_dedup_cleanup_on_backend_exit(1, 7);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_X, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE);
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_FORWARDED);
+	UT_ASSERT_EQ(memcmp(&cached.payload_meta.forward_marker, &marker, sizeof(marker)), 0);
+	cluster_gcs_block_dedup_cleanup_on_node_dead(1);
+	far_future = cached.completed_at_ts + cached.pinned_lifetime_us * 4 + 1;
+	cluster_gcs_block_dedup_sweep_expired(far_future);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_X, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_FORWARDED_DUPLICATE);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+
+	/* PREPARED has no admitted frame and may still be aborted, but only by
+	 * the exact producer path; generic death/TTL cleanup does not guess. */
+	key = make_key(3, 9, UINT64_C(0xabc002), 23);
+	tag = make_tag(136);
+	authority.master_holder.node_id = 2;
+	authority.pending_x_requester_node = 3;
+	authority.pending_x_since_lsn = UINT64_C(0x45678);
+	authority.authority_generation++;
+	forward.request_id = key.request_id;
+	forward.epoch = key.cluster_epoch;
+	forward.tag = tag;
+	forward.original_requester_node = 3;
+	forward.requester_backend_id = key.requester_backend_id;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_X, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_prepare_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_X, 2, 0,
+					 GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER, &authority, &forward, &cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	marker = cached.payload_meta.forward_marker;
+	cluster_gcs_block_dedup_cleanup_on_node_dead(3);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_X, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+	UT_ASSERT(cluster_gcs_block_dedup_forward_abort_prepared_exact(
+		0, &key, &tag, 2, GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER, &marker));
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+}
+
+UT_TEST(u40_stale_x_holder_fence_is_exact_replayable_and_not_gc_owned)
+{
+	BufferTag tag = make_tag(137);
+	GcsBlockDedupKey key = make_key(1, 7, UINT64_C(0xabc003), 24);
+	GcsStaleXCertPayload report;
+	GcsStaleXCertPayload install;
+	GcsStaleXCertPayload ack;
+	GcsStaleXCertPayload commit;
+	GcsStaleXCertPayload stored;
+	GcsStaleXCertPayload drifted;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	memset(&report, 0, sizeof(report));
+	report.request_id = key.request_id;
+	report.request_epoch = key.cluster_epoch;
+	report.release_cert_nonce = UINT64_C(0x123456789);
+	report.source_own_generation = 31;
+	report.final_page_scn = (SCN)41;
+	report.durable_page_scn = (SCN)43;
+	report.tag = tag;
+	report.requester_node = (int32)key.origin_node_id;
+	report.requester_backend_id = key.requester_backend_id;
+	report.master_node = 0;
+	report.holder_node = 2;
+	report.requester_incarnation = 51;
+	report.master_incarnation = 31;
+	report.holder_incarnation = 41;
+	report.relation_generation = 9;
+	report.phase = (uint8)GCS_STALE_X_CERT_PHASE_MISS_REPORT;
+	report.reason = (uint8)GCS_STALE_X_CERT_REASON_NOT_RESIDENT;
+	report.proof = GCS_STALE_X_PROOF_REPORT_MASK;
+	report.transition_id = (uint8)PCM_TRANS_N_TO_S;
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+					 0, &key, &report, &stored),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ(memcmp(&stored, &report, sizeof(report)), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+					 0, &key, &report, &stored),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+	drifted = report;
+	drifted.release_cert_nonce++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+					 0, &key, &drifted, NULL),
+				 (int)GCS_STALE_X_FENCE_STALE);
+
+	/* A provisional negative fence is authority state, not a generic cache
+	 * row: requester/backend death and TTL cannot remove it. */
+	cluster_gcs_block_dedup_cleanup_on_backend_exit(
+		key.origin_node_id, key.requester_backend_id);
+	cluster_gcs_block_dedup_cleanup_on_node_dead(key.origin_node_id);
+	cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp() + INT64_C(1000000000));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_lookup(
+					 0, &key, &tag, &stored),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ(memcmp(&stored, &report, sizeof(report)), 0);
+
+	install = report;
+	install.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_INSTALL;
+	install.pre_authority_generation = 47;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_fence_install(
+					 0, &key, &install, &ack),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ((int)ack.phase, (int)GCS_STALE_X_CERT_PHASE_FENCE_ACK);
+	UT_ASSERT_EQ((int)ack.proof, (int)GCS_STALE_X_PROOF_FENCED_MASK);
+	UT_ASSERT_EQ((uint64)ack.pre_authority_generation, UINT64_C(47));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_fence_install(
+					 0, &key, &install, &stored),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+	UT_ASSERT_EQ(memcmp(&stored, &ack, sizeof(ack)), 0);
+
+	drifted = install;
+	drifted.final_page_scn++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_fence_install(
+					 0, &key, &drifted, NULL),
+				 (int)GCS_STALE_X_FENCE_STALE);
+
+	commit = ack;
+	commit.phase = (uint8)GCS_STALE_X_CERT_PHASE_COMMIT;
+	commit.post_authority_generation = commit.pre_authority_generation + 1;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_commit(
+					 0, &key, &commit, &stored),
+				 (int)GCS_STALE_X_FENCE_COMMITTED);
+	UT_ASSERT_EQ(memcmp(&stored, &commit, sizeof(commit)), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_commit(
+					 0, &key, &commit, &stored),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_lookup(
+					 0, &key, &tag, &stored),
+				 (int)GCS_STALE_X_FENCE_COMMITTED);
+
+	drifted = commit;
+	drifted.post_authority_generation++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_commit(
+					 0, &key, &drifted, NULL),
+				 (int)GCS_STALE_X_FENCE_INVALID);
+}
+
+UT_TEST(u41_stale_x_master_report_serializes_with_send_finish_and_ack)
+{
+	BufferTag tag = make_tag(138);
+	GcsBlockDedupKey key = make_key(1, 7, UINT64_C(0xabc004), 25);
+	GcsBlockDedupEntry cached;
+	PcmAuthoritySnapshot authority;
+	GcsBlockForwardPayload forward;
+	GcsBlockForwardBootIdentity boot_identity;
+	GcsBlockForwardMarker marker;
+	GcsBlockForwardMarker marker_out;
+	GcsStaleXCertPayload report;
+	GcsStaleXCertPayload install;
+	GcsStaleXCertPayload ack;
+	GcsStaleXCertPayload commit;
+	GcsStaleXCertPayload commit_ack;
+	GcsStaleXCertPayload retire;
+	GcsStaleXCertPayload retire_ack;
+	GcsStaleXCertPayload drifted;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	memset(&authority, 0, sizeof(authority));
+	authority.master_holder.node_id = 2;
+	authority.transition_count = 61;
+	authority.state = PCM_STATE_X;
+	authority.x_holder_node = 2;
+	authority.pending_x_requester_node = -1;
+	authority.authority_generation = 67;
+	memset(&forward, 0, sizeof(forward));
+	forward.request_id = key.request_id;
+	forward.epoch = key.cluster_epoch;
+	forward.tag = tag;
+	forward.original_requester_node = (int32)key.origin_node_id;
+	forward.requester_backend_id = key.requester_backend_id;
+	forward.master_node = 0;
+	forward.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	forward.reserved_0[0] = 1;
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&forward, (SCN)71);
+	memset(&boot_identity, 0, sizeof(boot_identity));
+	boot_identity.requester_incarnation = 51;
+	boot_identity.master_incarnation = 31;
+	boot_identity.holder_incarnation = 41;
+	boot_identity.relation_generation = 9;
+	boot_identity.capability_generation = 77;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_prepare_identity_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_S, 2, 0,
+					 GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &authority, &forward,
+					 &boot_identity, &cached),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	marker = cached.payload_meta.forward_marker;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_claim_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &marker,
+					 GCS_BLOCK_FORWARD_MARK_PREPARED, NULL),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+
+	memset(&report, 0, sizeof(report));
+	report.request_id = key.request_id;
+	report.request_epoch = key.cluster_epoch;
+	report.release_cert_nonce = UINT64_C(0x777777);
+	report.source_own_generation = 73;
+	report.final_page_scn = (SCN)71;
+	report.durable_page_scn = (SCN)79;
+	report.tag = tag;
+	report.requester_node = (int32)key.origin_node_id;
+	report.requester_backend_id = key.requester_backend_id;
+	report.master_node = 0;
+	report.holder_node = 2;
+	report.requester_incarnation = 51;
+	report.master_incarnation = 31;
+	report.holder_incarnation = 41;
+	report.relation_generation = boot_identity.relation_generation;
+	report.phase = (uint8)GCS_STALE_X_CERT_PHASE_MISS_REPORT;
+	report.reason = (uint8)GCS_STALE_X_CERT_REASON_NOT_RESIDENT;
+	report.proof = GCS_STALE_X_PROOF_REPORT_MASK;
+	report.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_report_exact(
+					 0, &key, 77, &report, &install, &marker_out),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ((uint64)install.pre_authority_generation, UINT64_C(67));
+	UT_ASSERT_EQ((int)install.phase, (int)GCS_STALE_X_CERT_PHASE_FENCE_INSTALL);
+	UT_ASSERT_EQ(memcmp(&marker_out, &marker, sizeof(marker)), 0);
+
+	/* REPORT may arrive before the sender publishes SEND_ARMED->FORWARDED.
+	 * The report owns the stronger state, so finish must replay rather than
+	 * overwrite HOLDER_MISS_PENDING. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_finish_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER, &marker, NULL),
+				 (int)GCS_BLOCK_FORWARD_MARK_REPLAY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_report_exact(
+					 0, &key, 77, &report, &install, NULL),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_report_exact(
+					 0, &key, 78, &report, NULL, NULL),
+				 (int)GCS_STALE_X_FENCE_STALE);
+
+	drifted = report;
+	drifted.durable_page_scn++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_report_exact(
+					 0, &key, 77, &drifted, NULL, NULL),
+				 (int)GCS_STALE_X_FENCE_STALE);
+
+	ack = install;
+	ack.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_ACK;
+	ack.proof = GCS_STALE_X_PROOF_FENCED_MASK;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_ack_exact(
+					 0, &key, 77, &ack, &marker_out),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ(memcmp(&marker_out, &marker, sizeof(marker)), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_ack_exact(
+					 0, &key, 77, &ack, &marker_out),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+	drifted = ack;
+	drifted.pre_authority_generation++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_ack_exact(
+					 0, &key, 77, &drifted, NULL),
+				 (int)GCS_STALE_X_FENCE_STALE);
+
+	/* PCM authority commit happens between ACK and this exact metadata
+	 * publication.  Once COMMIT is recorded, late old FORWARDs can no
+	 * longer re-enter; terminal phases are replayable until exact retire. */
+	commit = ack;
+	commit.phase = (uint8)GCS_STALE_X_CERT_PHASE_COMMIT;
+	commit.post_authority_generation = commit.pre_authority_generation + 1;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_commit_exact(
+					 0, &key, 77, &commit, &marker_out),
+				 (int)GCS_STALE_X_FENCE_COMMITTED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_commit_exact(
+					 0, &key, 77, &commit, &marker_out),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_ack_exact(
+					 0, &key, 77, &ack, &marker_out),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+
+	commit_ack = commit;
+	commit_ack.phase = (uint8)GCS_STALE_X_CERT_PHASE_COMMIT_ACK;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_commit_ack_exact(
+					 0, &key, 77, &commit_ack),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_commit_ack_exact(
+					 0, &key, 77, &commit_ack),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+
+	retire = commit_ack;
+	retire.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_RETIRE;
+	retire.proof = GCS_STALE_X_PROOF_RETIRE_MASK;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_retire_arm_exact(
+					 0, &key, 77, &retire),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_retire_arm_exact(
+					 0, &key, 77, &retire),
+				 (int)GCS_STALE_X_FENCE_REPLAY);
+
+	retire_ack = retire;
+	retire_ack.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_RETIRE_ACK;
+	drifted = retire_ack;
+	drifted.release_cert_nonce++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_retire_ack_exact(
+					 0, &key, 77, &drifted),
+				 (int)GCS_STALE_X_FENCE_STALE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_master_retire_ack_exact(
+					 0, &key, 77, &retire_ack),
+				 (int)GCS_STALE_X_FENCE_RETIRED);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+}
+
+UT_TEST(u42_stale_x_holder_retire_replays_lost_ack_and_reopens_small_cap)
+{
+	GcsStaleXCertPayload last_retire;
+	int i;
+
+	reset_fake_dedup(2, 2);
+	cluster_node_id = 2;
+	memset(&last_retire, 0, sizeof(last_retire));
+
+	/* More attempts than the physical shard cap must complete without a
+	 * stale-X tombstone leak.  RETIRE_ACK loss is represented by replaying
+	 * the exact RETIRE after the holder entry has already been removed. */
+	for (i = 0; i < 6; i++) {
+		BufferTag tag = make_tag((uint32)(140 + i));
+		GcsBlockDedupKey key
+			= make_key(1, 7, UINT64_C(0xabc100) + (uint64)i, (uint32)(30 + i));
+		GcsStaleXCertPayload report;
+		GcsStaleXCertPayload install;
+		GcsStaleXCertPayload ack;
+		GcsStaleXCertPayload commit;
+		GcsStaleXCertPayload retire;
+		GcsStaleXCertPayload retire_ack;
+		GcsStaleXCertPayload expected_retire_ack;
+		GcsStaleXCertPayload replay_ack;
+
+		memset(&report, 0, sizeof(report));
+		report.request_id = key.request_id;
+		report.request_epoch = key.cluster_epoch;
+		report.release_cert_nonce = UINT64_C(0x12346000) + (uint64)i;
+		report.source_own_generation = UINT64_C(100) + (uint64)i;
+		report.final_page_scn = (SCN)(200 + i);
+		report.durable_page_scn = (SCN)(300 + i);
+		report.tag = tag;
+		report.requester_node = (int32)key.origin_node_id;
+		report.requester_backend_id = key.requester_backend_id;
+		report.master_node = 0;
+		report.holder_node = 2;
+		report.requester_incarnation = 51;
+		report.master_incarnation = 31;
+		report.holder_incarnation = 41;
+		report.relation_generation = 9;
+		report.phase = (uint8)GCS_STALE_X_CERT_PHASE_MISS_REPORT;
+		report.reason = (uint8)GCS_STALE_X_CERT_REASON_NOT_RESIDENT;
+		report.proof = GCS_STALE_X_PROOF_REPORT_MASK;
+		report.transition_id = (uint8)PCM_TRANS_N_TO_S;
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+						 0, &key, &report, NULL),
+					 (int)GCS_STALE_X_FENCE_INSTALLED);
+
+		install = report;
+		install.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_INSTALL;
+		install.pre_authority_generation = UINT64_C(400) + (uint64)i * 2;
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_fence_install(
+						 0, &key, &install, &ack),
+					 (int)GCS_STALE_X_FENCE_INSTALLED);
+
+		commit = ack;
+		commit.phase = (uint8)GCS_STALE_X_CERT_PHASE_COMMIT;
+		commit.post_authority_generation = commit.pre_authority_generation + 1;
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_commit(
+						 0, &key, &commit, NULL),
+					 (int)GCS_STALE_X_FENCE_COMMITTED);
+
+		retire = commit;
+		retire.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_RETIRE;
+		retire.proof = GCS_STALE_X_PROOF_RETIRE_MASK;
+		expected_retire_ack = retire;
+		expected_retire_ack.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_RETIRE_ACK;
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_retire(
+						 0, &key, &retire, &retire_ack),
+					 (int)GCS_STALE_X_FENCE_RETIRED);
+		UT_ASSERT_EQ((int)retire_ack.phase,
+					 (int)GCS_STALE_X_CERT_PHASE_FENCE_RETIRE_ACK);
+		UT_ASSERT_EQ(memcmp(&retire_ack, &expected_retire_ack,
+							sizeof(expected_retire_ack)),
+					 0);
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_lookup(
+						 0, &key, &tag, NULL),
+					 (int)GCS_STALE_X_FENCE_NOT_FOUND);
+
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_retire(
+						 0, &key, &retire, &replay_ack),
+					 (int)GCS_STALE_X_FENCE_REPLAY);
+		UT_ASSERT_EQ(memcmp(&replay_ack, &retire_ack, sizeof(retire_ack)), 0);
+		last_retire = retire;
+	}
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+
+	/* Even the current master cannot make an existing different attempt
+	 * disappear by presenting a well-shaped but non-exact RETIRE. */
+	{
+		BufferTag tag = make_tag(150);
+		GcsBlockDedupKey key = make_key(1, 7, UINT64_C(0xabc200), 40);
+		GcsStaleXCertPayload report = last_retire;
+		GcsStaleXCertPayload install;
+		GcsStaleXCertPayload ack;
+		GcsStaleXCertPayload commit;
+		GcsStaleXCertPayload retire;
+		GcsStaleXCertPayload drifted;
+
+		report.request_id = key.request_id;
+		report.request_epoch = key.cluster_epoch;
+		report.release_cert_nonce++;
+		report.tag = tag;
+		report.requester_backend_id = key.requester_backend_id;
+		report.phase = (uint8)GCS_STALE_X_CERT_PHASE_MISS_REPORT;
+		report.proof = GCS_STALE_X_PROOF_REPORT_MASK;
+		report.pre_authority_generation = 0;
+		report.post_authority_generation = 0;
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+						 0, &key, &report, NULL),
+					 (int)GCS_STALE_X_FENCE_INSTALLED);
+		install = report;
+		install.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_INSTALL;
+		install.pre_authority_generation = 600;
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_fence_install(
+						 0, &key, &install, &ack),
+					 (int)GCS_STALE_X_FENCE_INSTALLED);
+		commit = ack;
+		commit.phase = (uint8)GCS_STALE_X_CERT_PHASE_COMMIT;
+		commit.post_authority_generation = 601;
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_commit(
+						 0, &key, &commit, NULL),
+					 (int)GCS_STALE_X_FENCE_COMMITTED);
+		retire = commit;
+		retire.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_RETIRE;
+		retire.proof = GCS_STALE_X_PROOF_RETIRE_MASK;
+		drifted = retire;
+		drifted.release_cert_nonce++;
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_retire(
+						 0, &key, &drifted, NULL),
+					 (int)GCS_STALE_X_FENCE_STALE);
+		UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_retire(
+						 0, &key, &retire, NULL),
+					 (int)GCS_STALE_X_FENCE_RETIRED);
+	}
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 0);
+}
+
+UT_TEST(u43_stale_x_release_journal_is_state_and_residency_exact)
+{
+	GcsStaleXReleaseRecord first;
+	GcsStaleXReleaseRecord newer;
+	GcsStaleXReleaseRecord sealed;
+	GcsStaleXReleaseRecord committing;
+	GcsStaleXReleaseRecord released;
+	GcsStaleXReleaseRecord found;
+	int worker_id;
+
+	reset_fake_dedup(2, 2);
+	memset(&first, 0, sizeof(first));
+	first.key.tag = make_tag(160);
+	first.key.source_buf_id = 5;
+	first.key.durability_generation = 7;
+	first.key.source_own_generation = 0; /* legal first ownership generation */
+	first.key.holder_incarnation = 41;
+	first.key.release_cert_nonce = 12;
+	first.release_epoch = 7;
+	first.relation_generation = 9;
+	first.master_incarnation = 31;
+	first.final_page_scn = InvalidScn;
+	first.durable_page_scn = InvalidScn;
+	first.master_node = 0;
+	first.holder_node = 2;
+	first.state = (uint8)GCS_STALE_X_RELEASE_RESERVED;
+	worker_id = cluster_lms_shard_for_tag(&first.key.tag, cluster_lms_workers);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_stale_x_release_reserve(&first),
+				 (int)GCS_STALE_X_RELEASE_INSTALLED);
+	/* Nothing before RELEASED is reportable. */
+	UT_ASSERT(!cluster_gcs_block_stale_x_release_lookup_exact(
+		worker_id, &first.key.tag, first.release_epoch, first.master_node,
+		first.holder_node, first.master_incarnation, first.key.holder_incarnation,
+		(SCN)501, NULL));
+
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_stale_x_release_seal_exact(
+			&first.key, (SCN)501, (SCN)501, UINT64_C(91), &sealed),
+		(int)GCS_STALE_X_RELEASE_INSTALLED);
+	UT_ASSERT_EQ((int)sealed.state, (int)GCS_STALE_X_RELEASE_SEALED);
+	UT_ASSERT(!cluster_gcs_block_stale_x_release_lookup_exact(
+		worker_id, &first.key.tag, first.release_epoch, first.master_node,
+		first.holder_node, first.master_incarnation, first.key.holder_incarnation,
+		(SCN)501, NULL));
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_stale_x_release_advance_exact(
+			&sealed, GCS_STALE_X_RELEASE_COMMITTING, 0, &committing),
+		(int)GCS_STALE_X_RELEASE_INSTALLED);
+	UT_ASSERT(!cluster_gcs_block_stale_x_release_lookup_exact(
+		worker_id, &first.key.tag, first.release_epoch, first.master_node,
+		first.holder_node, first.master_incarnation, first.key.holder_incarnation,
+		(SCN)501, NULL));
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_stale_x_release_advance_exact(
+			&committing, GCS_STALE_X_RELEASE_RELEASED, UINT64_C(1), &released),
+		(int)GCS_STALE_X_RELEASE_INSTALLED);
+	UT_ASSERT(cluster_gcs_block_stale_x_release_lookup_exact(
+		worker_id, &first.key.tag, first.release_epoch, first.master_node,
+		first.holder_node, first.master_incarnation, first.key.holder_incarnation,
+		(SCN)501, &found));
+	UT_ASSERT_EQ(memcmp(&found, &released, sizeof(released)), 0);
+
+	/* A later unresolved residency of the same tag is a distinct key; it
+	 * cannot overwrite or become consumable as the older release. */
+	newer = first;
+	newer.key.source_buf_id = 6;
+	newer.key.source_own_generation = 21;
+	newer.key.durability_generation = 3;
+	newer.key.release_cert_nonce = 22;
+	UT_ASSERT_EQ((int)cluster_gcs_block_stale_x_release_reserve(&newer),
+				 (int)GCS_STALE_X_RELEASE_INSTALLED);
+	UT_ASSERT(cluster_gcs_block_stale_x_release_lookup_exact(
+		worker_id, &released.key.tag, released.release_epoch, released.master_node,
+		released.holder_node, released.master_incarnation,
+		released.key.holder_incarnation, released.final_page_scn, &found));
+	UT_ASSERT_EQ(memcmp(&found, &released, sizeof(released)), 0);
+	UT_ASSERT(cluster_gcs_block_stale_x_release_forget_exact(&released));
+	UT_ASSERT(!cluster_gcs_block_stale_x_release_forget_exact(&released));
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_stale_x_release_seal_exact(
+			&newer.key, (SCN)601, (SCN)602, UINT64_C(92), &sealed),
+		(int)GCS_STALE_X_RELEASE_INSTALLED);
+}
+
+UT_TEST(u44_checkpoint_durable_seal_is_residency_and_redirty_exact)
+{
+	GcsPiWriteNote note;
+	GcsStaleXReleaseKey release_key;
+	GcsStaleXDurableSeal seal;
+	int worker_id;
+
+	reset_fake_dedup(2, 2);
+	memset(&note, 0, sizeof(note));
+	note.tag = make_tag(161);
+	note.source_buf_id = 5;
+	note.durability_generation = 7;
+	note.source_own_generation = 0;
+	note.source_node_incarnation = 41;
+	note.page_scn = (SCN)501;
+	worker_id = cluster_lms_shard_for_tag(&note.tag, cluster_lms_workers);
+
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_publish(&note, UINT64_C(91)));
+	memset(&release_key, 0, sizeof(release_key));
+	release_key.tag = note.tag;
+	release_key.source_buf_id = note.source_buf_id;
+	release_key.durability_generation = note.durability_generation;
+	release_key.source_own_generation = note.source_own_generation;
+	release_key.holder_incarnation = note.source_node_incarnation;
+	release_key.release_cert_nonce = 1;
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)501, &seal));
+	UT_ASSERT_EQ(seal.checkpoint_seal_id, UINT64_C(91));
+	UT_ASSERT_EQ((uint64)seal.durable_page_scn, UINT64_C(501));
+
+	/* Any residency component drift, especially redirty g->g+1, refuses
+	 * the old checkpoint seal even when the page SCN is unchanged. */
+	release_key.durability_generation++;
+	UT_ASSERT(!cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)501, NULL));
+	release_key.durability_generation--;
+	release_key.source_buf_id++;
+	UT_ASSERT(!cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)501, NULL));
+	release_key.source_buf_id--;
+	release_key.holder_incarnation++;
+	UT_ASSERT(!cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)501, NULL));
+	release_key.holder_incarnation--;
+
+	/* A later confirmed write of the same residency advances, never regresses,
+	 * the independently retained durable floor. */
+	note.page_scn = (SCN)601;
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_publish(&note, UINT64_C(92)));
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)601, &seal));
+	UT_ASSERT_EQ(seal.checkpoint_seal_id, UINT64_C(92));
+	UT_ASSERT_EQ((uint64)seal.durable_page_scn, UINT64_C(601));
+	note.page_scn = (SCN)501;
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_publish(&note, UINT64_C(93)));
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)601, &seal));
+	UT_ASSERT_EQ((uint64)seal.durable_page_scn, UINT64_C(601));
+
+	/* The per-buf fixed slot replaces an older dirty generation instead of
+	 * consuming unbounded HTAB capacity across writeback cycles. */
+	note.durability_generation = 8;
+	note.page_scn = (SCN)701;
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_publish(&note, UINT64_C(94)));
+	UT_ASSERT(!cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)501, NULL));
+	release_key.durability_generation = 8;
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)701, &seal));
+
+	note.durability_generation = UINT32_MAX;
+	UT_ASSERT(!cluster_gcs_block_stale_x_durable_seal_publish(&note, UINT64_C(95)));
+	UT_ASSERT(cluster_gcs_block_stale_x_durable_seal_forget_exact(&seal));
+	UT_ASSERT(!cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+		worker_id, &release_key, (SCN)501, NULL));
+}
+
+UT_TEST(u45_release_journal_capacity_fails_before_evidence_loss)
+{
+	GcsStaleXReleaseRecord first;
+	GcsStaleXReleaseRecord second;
+
+	reset_fake_dedup(1, 1);
+	memset(&first, 0, sizeof(first));
+	first.key.tag = make_tag(170);
+	first.key.source_buf_id = 1;
+	first.key.durability_generation = 2;
+	first.key.holder_incarnation = 41;
+	first.key.release_cert_nonce = 1;
+	first.release_epoch = 7;
+	first.relation_generation = 9;
+	first.master_incarnation = 31;
+	first.final_page_scn = InvalidScn;
+	first.durable_page_scn = InvalidScn;
+	first.master_node = 0;
+	first.holder_node = 2;
+	first.state = (uint8)GCS_STALE_X_RELEASE_RESERVED;
+	second = first;
+	second.key.tag = make_tag(171);
+	second.key.source_buf_id = 2;
+	second.key.release_cert_nonce = 2;
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_stale_x_release_reserve(&first),
+				 (int)GCS_STALE_X_RELEASE_INSTALLED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_stale_x_release_reserve(&second),
+				 (int)GCS_STALE_X_RELEASE_FULL);
+	UT_ASSERT(cluster_gcs_block_stale_x_release_forget_exact(&first));
+	UT_ASSERT_EQ((int)cluster_gcs_block_stale_x_release_reserve(&second),
+				 (int)GCS_STALE_X_RELEASE_INSTALLED);
+}
+
+UT_TEST(u46_eviction_gate_blocks_tag_and_source_until_exact_ack)
+{
+	GcsBlockEvictionGateRecord gate;
+	GcsBlockEvictionGateRecord same_tag;
+	GcsBlockEvictionGateRecord released;
+	GcsBlockEvictionGateRecord found;
+	BufferTag other_tag;
+	int worker_id;
+
+	reset_fake_dedup(2, 2);
+	memset(&gate, 0, sizeof(gate));
+	gate.key.tag = make_tag(180);
+	gate.key.source_buf_id = 3;
+	gate.key.durability_generation = 9;
+	gate.key.source_own_generation = 17;
+	gate.key.holder_incarnation = 41;
+	gate.key.release_cert_nonce = 77;
+	gate.release_epoch = 8;
+	gate.relation_generation = 9;
+	gate.master_incarnation = 31;
+	gate.master_node = 0;
+	gate.holder_node = 2;
+	gate.capability_generation = 11;
+	gate.old_pcm_mode = (uint8)PCM_LOCK_MODE_X;
+	gate.state = (uint8)GCS_BLOCK_EVICTION_GATE_COMMITTING;
+	gate.has_stale_x_journal = 1;
+	worker_id = cluster_lms_shard_for_tag(&gate.key.tag, cluster_lms_workers);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_eviction_gate_reserve(&gate),
+				 (int)GCS_STALE_X_RELEASE_INSTALLED);
+	UT_ASSERT(cluster_gcs_block_eviction_gate_conflict(
+		worker_id, &gate.key.tag, -1, &found));
+	UT_ASSERT_EQ(memcmp(&found, &gate, sizeof(gate)), 0);
+
+	/* A second residency cannot reserve the same logical tag while the old
+	 * release is unacked, even with a different descriptor/generation. */
+	same_tag = gate;
+	same_tag.key.source_buf_id = 4;
+	same_tag.key.source_own_generation = 1;
+	same_tag.key.release_cert_nonce++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_eviction_gate_reserve(&same_tag),
+				 (int)GCS_STALE_X_RELEASE_STALE);
+
+	/* Descriptor reuse for another tag is blocked too. */
+	other_tag = make_tag(181);
+	UT_ASSERT(cluster_gcs_block_eviction_gate_conflict(
+		cluster_lms_shard_for_tag(&other_tag, cluster_lms_workers),
+		&other_tag, gate.key.source_buf_id, &found));
+	UT_ASSERT_EQ(memcmp(&found, &gate, sizeof(gate)), 0);
+
+	UT_ASSERT_EQ(
+		(int)cluster_gcs_block_eviction_gate_advance_exact(
+			&gate, GCS_BLOCK_EVICTION_GATE_RELEASED, UINT64_C(18), &released),
+		(int)GCS_STALE_X_RELEASE_INSTALLED);
+	UT_ASSERT(cluster_gcs_block_eviction_gate_conflict(
+		worker_id, &gate.key.tag, -1, &found));
+	UT_ASSERT_EQ(memcmp(&found, &released, sizeof(released)), 0);
+
+	/* Only exact release ACK removal reopens both tag and descriptor. */
+	UT_ASSERT(cluster_gcs_block_eviction_gate_forget_exact(&released));
+	UT_ASSERT(!cluster_gcs_block_eviction_gate_conflict(
+		worker_id, &gate.key.tag, -1, NULL));
+	UT_ASSERT(!cluster_gcs_block_eviction_gate_conflict(
+		cluster_lms_shard_for_tag(&other_tag, cluster_lms_workers),
+		&other_tag, gate.key.source_buf_id, NULL));
+}
+
+UT_TEST(u47_stale_x_relation_generation_is_always_on_exact_and_bounded)
+{
+	RelFileLocator first = { .spcOid = 1663, .dbOid = 5, .relNumber = 901 };
+	RelFileLocator second = { .spcOid = 1663, .dbOid = 5, .relNumber = 902 };
+	RelFileLocator overflow = { .spcOid = 1663, .dbOid = 5, .relNumber = 903 };
+	RelFileLocator untracked = { .spcOid = 1663, .dbOid = 5, .relNumber = 904 };
+	RelFileLocator invalid = { 0 };
+	GcsStaleXRelationGenerationGuard guard;
+	uint64 generation = 0;
+
+	reset_fake_dedup(1, 2);
+	UT_ASSERT_EQ((int)sizeof(GcsStaleXRelationGenerationEntry), 24);
+
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_register(first, &generation));
+	UT_ASSERT_EQ(generation, UINT64_C(1));
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_current(first, &generation));
+	UT_ASSERT_EQ(generation, UINT64_C(1));
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_guard_acquire(
+		first, generation, &guard));
+	UT_ASSERT_EQ(guard.generation, UINT64_C(1));
+	cluster_gcs_block_stale_x_relation_guard_release(&guard);
+	UT_ASSERT_EQ(guard.shard_index, -1);
+	/* Exact duplicate registration never advances the incarnation. */
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_register(first, &generation));
+	UT_ASSERT_EQ(generation, UINT64_C(1));
+
+	/* smgrdounlinkall's exact-locator bump invalidates the captured value. */
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_bump(first));
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_current(first, &generation));
+	UT_ASSERT_EQ(generation, UINT64_C(2));
+	UT_ASSERT(!cluster_gcs_block_stale_x_relation_guard_acquire(
+		first, UINT64_C(1), &guard));
+	UT_ASSERT(!GcsStaleXStorageProofExact(
+		(SCN)501, (SCN)501, (SCN)501, UINT64_C(1), generation));
+
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_register(second, &generation));
+	UT_ASSERT_EQ(generation, UINT64_C(1));
+	/* Capacity is bounded; overflow fails before a release journal exists. */
+	UT_ASSERT(!cluster_gcs_block_stale_x_relation_register(
+		overflow, &generation));
+	UT_ASSERT_EQ(generation, UINT64_C(0));
+	/* An unlink of an untracked locator is a safe no-op and consumes no slot. */
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_bump(untracked));
+	UT_ASSERT(!cluster_gcs_block_stale_x_relation_current(
+		untracked, &generation));
+	UT_ASSERT(!cluster_gcs_block_stale_x_relation_register(
+		invalid, &generation));
+}
+
+UT_TEST(u48_relation_supersede_keeps_old_holder_fence_fail_closed)
+{
+	BufferTag tag = make_tag(190);
+	RelFileLocator locator = BufTagGetRelFileLocator(&tag);
+	GcsBlockDedupKey key = make_key(1, 8, UINT64_C(0xabc048), 48);
+	GcsStaleXCertPayload report;
+	GcsStaleXCertPayload stored;
+	GcsStaleXCertPayload new_relation_report;
+	uint64 relation_generation = 0;
+	int worker_id;
+
+	reset_fake_dedup(1, FAKE_DEDUP_CAP);
+	worker_id = cluster_lms_shard_for_tag(&tag, cluster_lms_workers);
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_register(
+		locator, &relation_generation));
+	UT_ASSERT_EQ(relation_generation, UINT64_C(1));
+
+	memset(&report, 0, sizeof(report));
+	report.request_id = key.request_id;
+	report.request_epoch = key.cluster_epoch;
+	report.release_cert_nonce = 77;
+	report.source_own_generation = 17;
+	report.relation_generation = relation_generation;
+	report.final_page_scn = (SCN)501;
+	report.durable_page_scn = (SCN)501;
+	report.tag = tag;
+	report.requester_node = (int32)key.origin_node_id;
+	report.requester_backend_id = key.requester_backend_id;
+	report.master_node = 0;
+	report.holder_node = 2;
+	report.requester_incarnation = 51;
+	report.master_incarnation = 31;
+	report.holder_incarnation = 41;
+	report.phase = (uint8)GCS_STALE_X_CERT_PHASE_MISS_REPORT;
+	report.reason = (uint8)GCS_STALE_X_CERT_REASON_NOT_RESIDENT;
+	report.proof = GCS_STALE_X_PROOF_REPORT_MASK;
+	report.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+					 worker_id, &key, &report, &stored),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+
+	/* DROP/reuse invalidates every old-generation phase, but does not delete
+	 * the old negative fence: a legacy FORWARD may still be queued on DATA. */
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_bump(locator));
+	UT_ASSERT(cluster_gcs_block_stale_x_relation_current(
+		locator, &relation_generation));
+	UT_ASSERT_EQ(relation_generation, UINT64_C(2));
+	UT_ASSERT(!GcsStaleXRelationGenerationExact(
+		report.relation_generation, relation_generation));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_lookup(
+					 worker_id, &key, &tag, &stored),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ(memcmp(&stored, &report, sizeof(report)), 0);
+
+	/* The reused physical tag cannot overwrite that same request identity
+	 * with its new lifecycle generation.  Only RETIRE/quiescence may remove
+	 * the old tombstone. */
+	new_relation_report = report;
+	new_relation_report.relation_generation = relation_generation;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+					 worker_id, &key, &new_relation_report, NULL),
+				 (int)GCS_STALE_X_FENCE_STALE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_lookup(
+					 worker_id, &key, &tag, &stored),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ(memcmp(&stored, &report, sizeof(report)), 0);
+	UT_ASSERT_EQ((uint64)cluster_gcs_block_dedup_get_in_flight_count(), 1);
+}
+
+UT_TEST(u49_forward_cancel_master_transition_is_exact_and_replayable)
+{
+	BufferTag tag = make_tag(183);
+	GcsBlockDedupKey key = make_key(1, 7, UINT64_C(0xcace001), 29);
+	GcsBlockDedupEntry entry;
+	GcsBlockDedupEntry replay;
+	GcsBlockDedupEntry denied;
+	PcmAuthoritySnapshot authority;
+	GcsBlockForwardPayload forward;
+	GcsBlockForwardBootIdentity boot;
+	GcsBlockForwardMarker marker;
+	GcsBlockForwardCancelPayload cancel;
+	GcsBlockForwardCancelPayload ack;
+	GcsBlockForwardCancelPayload drifted;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &entry),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	memset(&authority, 0, sizeof(authority));
+	authority.master_holder.node_id = 2;
+	authority.transition_count = 71;
+	authority.state = PCM_STATE_S;
+	authority.x_holder_node = -1;
+	authority.s_holders_bitmap = UINT32_C(1) << 2;
+	authority.pending_x_requester_node = -1;
+	authority.authority_generation = 73;
+	memset(&forward, 0, sizeof(forward));
+	forward.request_id = key.request_id;
+	forward.epoch = key.cluster_epoch;
+	forward.tag = tag;
+	forward.original_requester_node = (int32)key.origin_node_id;
+	forward.requester_backend_id = key.requester_backend_id;
+	forward.master_node = 0;
+	forward.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&forward, (SCN)79);
+	memset(&boot, 0, sizeof(boot));
+	boot.requester_incarnation = 83;
+	boot.master_incarnation = 89;
+	boot.holder_incarnation = 97;
+	boot.relation_generation = 101;
+	boot.capability_generation = 103;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_prepare_identity_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_S, 2, 0,
+					 GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &authority, &forward,
+					 &boot, &entry),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	marker = entry.payload_meta.forward_marker;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_claim_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
+					 &marker, GCS_BLOCK_FORWARD_MARK_PREPARED, NULL),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_finish_exact(
+					 0, &key, &tag, 2, GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
+					 &marker, NULL),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+
+	memset(&entry, 0, sizeof(entry));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(
+					 0, &tag, &entry),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_CANCEL_NEW);
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&entry),
+				 (int)GCS_BLOCK_FORWARD_MARK_CANCELLING);
+	UT_ASSERT_EQ(memcmp(&entry.payload_meta.forward_marker, &marker,
+						sizeof(marker)),
+				 0);
+	memcpy(&cancel, entry.block_data, sizeof(cancel));
+	UT_ASSERT_EQ(cancel.request_id, key.request_id);
+	UT_ASSERT_EQ(cancel.request_epoch, key.cluster_epoch);
+	UT_ASSERT_EQ(cancel.pre_authority_generation,
+				 authority.authority_generation);
+	UT_ASSERT_EQ(cancel.relation_generation, boot.relation_generation);
+	UT_ASSERT_EQ(cancel.expected_pi_watermark_scn, UINT64_C(79));
+	UT_ASSERT_EQ(cancel.requester_incarnation, boot.requester_incarnation);
+	UT_ASSERT_EQ(cancel.master_incarnation, boot.master_incarnation);
+	UT_ASSERT_EQ(cancel.holder_incarnation, boot.holder_incarnation);
+	UT_ASSERT_EQ(cancel.requester_node, (int32)key.origin_node_id);
+	UT_ASSERT_EQ(cancel.requester_backend_id, key.requester_backend_id);
+	UT_ASSERT_EQ(cancel.master_node, 0);
+	UT_ASSERT_EQ(cancel.holder_node, 2);
+	UT_ASSERT_EQ((int)cancel.phase,
+				 (int)GCS_FORWARD_CANCEL_PHASE_MASTER_TO_HOLDER);
+	UT_ASSERT_EQ((int)cancel.proof,
+				 (int)GCS_FORWARD_CANCEL_PROOF_MASTER_MASK);
+	UT_ASSERT_EQ(cancel.master_holder_capability_generation,
+				 boot.capability_generation);
+	UT_ASSERT_EQ(cancel.holder_requester_capability_generation, 0);
+
+	memset(&replay, 0, sizeof(replay));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(
+					 0, &tag, &replay),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_CANCEL_REPLAY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_S, &replay),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_CANCEL_REPLAY);
+	UT_ASSERT_EQ(memcmp(&replay, &entry, sizeof(entry)), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &replay),
+				 (int)GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+
+	ack = cancel;
+	ack.phase = (uint8)GCS_FORWARD_CANCEL_PHASE_REQUESTER_FENCE_ACK;
+	ack.proof = GCS_FORWARD_CANCEL_PROOF_ACK_MASK;
+	ack.holder_requester_capability_generation = 107;
+	ack.requester_master_capability_generation = 109;
+	drifted = ack;
+	drifted.pre_authority_generation++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_ack_exact(
+					 0, &key, 109, &drifted, &denied),
+				 (int)GCS_BLOCK_FORWARD_MARK_STALE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(
+					 0, &tag, &replay),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_CANCEL_REPLAY);
+
+	memset(&denied, 0, sizeof(denied));
+	/* CONTROL capability generations are endpoint-local reconnect counters:
+	 * the requester can legitimately stamp 109 while the master currently
+	 * observes that requester at 111.  Each sender's outbound ring already
+	 * binds its frame to its own exact generation, so ingress must require
+	 * both generations to be live, not falsely require cross-endpoint
+	 * numeric equality. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_ack_exact(
+					 0, &key, 111, &ack, &denied),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT_EQ((int)denied.status,
+				 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
+	UT_ASSERT_EQ((int)denied.reply_header.status,
+				 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&denied),
+				 (int)GCS_BLOCK_FORWARD_MARK_NONE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(
+					 0, &tag, &replay),
+				 (int)GCS_BLOCK_PENDING_X_DENY_REPLAY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_ack_exact(
+					 0, &key, 109, &ack, &denied),
+				 (int)GCS_BLOCK_FORWARD_MARK_REPLAY);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_ack_exact(
+					 0, &key, 109, &ack, &replay),
+				 (int)GCS_BLOCK_FORWARD_MARK_REPLAY);
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(
+		0, &key, &tag, (uint8)PCM_TRANS_N_TO_S));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(
+					 0, &tag, &replay),
+				 (int)GCS_BLOCK_PENDING_X_DENY_NOT_FOUND);
+}
+
+/*
+ * S3-P0-09 R3: S->N release and type67 use different transport planes, so
+ * ACK may reach the master before release.  Exercise the real master dedup
+ * lifecycle around the production policy seam: the early ACK gate keeps the
+ * exact CANCELLING marker; the master's type66 replay causes a second exact
+ * requester ACK; only that post-release ACK terminalizes the marker.
+ */
+UT_TEST(u59_forward_cancel_cross_plane_early_ack_replays_to_terminal)
+{
+#ifndef GCS_BLOCK_FORWARD_CANCEL_REPLAY_POLICY_V1
+	UT_ASSERT(false);
+#else
+	BufferTag tag = make_tag(189);
+	GcsBlockDedupKey key = make_key(1, 9, UINT64_C(0xcace059), 37);
+	GcsBlockDedupEntry entry;
+	GcsBlockDedupEntry replay;
+	GcsBlockDedupEntry denied;
+	PcmAuthoritySnapshot authority;
+	GcsBlockForwardPayload forward;
+	GcsBlockForwardBootIdentity boot;
+	GcsBlockForwardMarker marker;
+	GcsBlockForwardCancelPayload cancel;
+	GcsBlockForwardCancelPayload barrier;
+	GcsBlockForwardCancelPayload ack;
+	GcsBlockForwardCancelReplayEntry ledger[1];
+	size_t ledger_slot = 0;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &entry),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	memset(&authority, 0, sizeof(authority));
+	authority.master_holder.node_id = 2;
+	authority.transition_count = 131;
+	authority.state = PCM_STATE_S;
+	authority.x_holder_node = -1;
+	authority.s_holders_bitmap = UINT32_C(1) << 2;
+	authority.pending_x_requester_node = -1;
+	authority.authority_generation = 137;
+	memset(&forward, 0, sizeof(forward));
+	forward.request_id = key.request_id;
+	forward.epoch = key.cluster_epoch;
+	forward.tag = tag;
+	forward.original_requester_node = (int32)key.origin_node_id;
+	forward.requester_backend_id = key.requester_backend_id;
+	forward.master_node = 0;
+	forward.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&forward, (SCN)139);
+	memset(&boot, 0, sizeof(boot));
+	boot.requester_incarnation = 149;
+	boot.master_incarnation = 151;
+	boot.holder_incarnation = 157;
+	boot.relation_generation = 163;
+	boot.capability_generation = 167;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_prepare_identity_exact(
+					 0, &key, &tag, PCM_TRANS_N_TO_S, 2, 0,
+					 GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &authority,
+					 &forward, &boot, &entry),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	marker = entry.payload_meta.forward_marker;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_claim_exact(
+					 0, &key, &tag, 2,
+					 GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &marker,
+					 GCS_BLOCK_FORWARD_MARK_PREPARED, NULL),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_send_finish_exact(
+					 0, &key, &tag, 2,
+					 GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, &marker, NULL),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+
+	memset(&entry, 0, sizeof(entry));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(
+					 0, &tag, &entry),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_CANCEL_NEW);
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&entry),
+				 (int)GCS_BLOCK_FORWARD_MARK_CANCELLING);
+	memcpy(&cancel, entry.block_data, sizeof(cancel));
+	barrier = cancel;
+	barrier.phase = (uint8)GCS_FORWARD_CANCEL_PHASE_HOLDER_BARRIER;
+	barrier.proof = GCS_FORWARD_CANCEL_PROOF_BARRIER_MASK;
+	barrier.holder_requester_capability_generation = 173;
+	ack = barrier;
+	ack.phase = (uint8)GCS_FORWARD_CANCEL_PHASE_REQUESTER_FENCE_ACK;
+	ack.proof = GCS_FORWARD_CANCEL_PROOF_ACK_MASK;
+	ack.requester_master_capability_generation = 179;
+
+	/* Requester admits release then ACK, but DATA wins the cross-plane race.
+	 * The requester ledger may finish only after ACK admission; the durable
+	 * master marker remains the replay source if that admitted ACK is early. */
+	memset(ledger, 0, sizeof(ledger));
+	UT_ASSERT_EQ((int)gcs_block_forward_cancel_replay_ledger_park(
+					 ledger, lengthof(ledger), &barrier, &ledger_slot),
+				 (int)GCS_BLOCK_FORWARD_CANCEL_REPLAY_PARKED);
+	UT_ASSERT(gcs_block_forward_cancel_replay_mark_release_exact(
+		ledger, lengthof(ledger), ledger_slot, &barrier));
+	UT_ASSERT(gcs_block_forward_cancel_replay_mark_ack_exact(
+		ledger, lengthof(ledger), ledger_slot, &barrier));
+	UT_ASSERT(gcs_block_forward_cancel_replay_finish_exact(
+		ledger, lengthof(ledger), ledger_slot, &barrier));
+
+	authority.s_holders_bitmap = UINT32_C(1) << key.origin_node_id;
+	UT_ASSERT(!gcs_block_forward_cancel_master_ack_ready(
+		&authority, (int32)key.origin_node_id));
+	memset(&replay, 0, sizeof(replay));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(
+					 0, &tag, &replay),
+				 (int)GCS_BLOCK_PENDING_X_DENY_FORWARD_CANCEL_REPLAY);
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&replay),
+				 (int)GCS_BLOCK_FORWARD_MARK_CANCELLING);
+
+	/* CONTROL release now lands.  The master's replay recreates the exact
+	 * requester entry, which again advances monotonically to one admitted
+	 * type67; exact duplicate park never rolls a live phase backward. */
+	authority.s_holders_bitmap = 0;
+	UT_ASSERT(gcs_block_forward_cancel_master_ack_ready(
+		&authority, (int32)key.origin_node_id));
+	UT_ASSERT_EQ((int)gcs_block_forward_cancel_replay_ledger_park(
+					 ledger, lengthof(ledger), &barrier, &ledger_slot),
+				 (int)GCS_BLOCK_FORWARD_CANCEL_REPLAY_PARKED);
+	UT_ASSERT(gcs_block_forward_cancel_replay_mark_release_exact(
+		ledger, lengthof(ledger), ledger_slot, &barrier));
+	UT_ASSERT_EQ((int)gcs_block_forward_cancel_replay_ledger_park(
+					 ledger, lengthof(ledger), &barrier, &ledger_slot),
+				 (int)GCS_BLOCK_FORWARD_CANCEL_REPLAY_DUPLICATE);
+	UT_ASSERT_EQ((int)ledger[ledger_slot].phase,
+				 (int)GCS_BLOCK_FORWARD_CANCEL_REPLAY_RELEASE_STAGED);
+	UT_ASSERT(gcs_block_forward_cancel_replay_mark_ack_exact(
+		ledger, lengthof(ledger), ledger_slot, &barrier));
+
+	memset(&denied, 0, sizeof(denied));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_ack_exact(
+					 0, &key, 181, &ack, &denied),
+				 (int)GCS_BLOCK_FORWARD_MARK_INSTALLED);
+	UT_ASSERT_EQ((int)denied.reply_header.status,
+				 (int)GCS_BLOCK_REPLY_DENIED_PENDING_X);
+	UT_ASSERT_EQ((int)GcsBlockDedupEntryForwardMarkerPhase(&denied),
+				 (int)GCS_BLOCK_FORWARD_MARK_NONE);
+	UT_ASSERT(gcs_block_forward_cancel_replay_finish_exact(
+		ledger, lengthof(ledger), ledger_slot, &barrier));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_pending_x_deny_next(
+					 0, &tag, &replay),
+				 (int)GCS_BLOCK_PENDING_X_DENY_REPLAY);
+#endif
+}
+
+/*
+ * A direct-land request retries with the SAME wire identity after an
+ * authoritative no-forward denial, but deliberately clears the direct-land
+ * transport preference.  That one-way DIRECT -> generic downgrade is not an
+ * identity collision: the cached reply must switch to the generic lane.
+ * Re-arming DIRECT after the generic retry is pinned remains forbidden.
+ */
+UT_TEST(u52_direct_land_same_identity_retry_can_downgrade_to_generic)
+{
+	BufferTag tag = make_tag(186);
+	GcsBlockDedupKey key = make_key(3, 7, UINT64_C(0xd1ec7001), 33);
+	GcsBlockDedupEntry cached;
+	GcsBlockReplyHeader denied;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	UT_ASSERT(cluster_gcs_block_dedup_set_request_flags_exact(
+		0, &key, &tag, PCM_TRANS_N_TO_S,
+		GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
+
+	memset(&denied, 0, sizeof(denied));
+	denied.request_id = key.request_id;
+	denied.epoch = key.cluster_epoch;
+	denied.sender_node = 0;
+	denied.requester_backend_id = key.requester_backend_id;
+	denied.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	denied.status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		&denied, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	cluster_gcs_block_dedup_install_reply(
+		0, &key, GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER, &denied, NULL);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+	UT_ASSERT(cluster_gcs_block_dedup_set_request_flags_exact(
+		0, &key, &tag, PCM_TRANS_N_TO_S, 0));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(
+		(int)cached.request_flags, (int)GCS_BLOCK_DEDUP_REQUEST_F_PINNED);
+
+	UT_ASSERT(!cluster_gcs_block_dedup_set_request_flags_exact(
+		0, &key, &tag, PCM_TRANS_N_TO_S,
+		GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key, tag, PCM_TRANS_N_TO_S, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(
+		(int)cached.request_flags, (int)GCS_BLOCK_DEDUP_REQUEST_F_PINNED);
+}
+
+UT_TEST(u50_forward_cancel_holder_barrier_tombstone_is_exact)
+{
+	BufferTag tag = make_tag(184);
+	GcsBlockDedupKey key = make_key(1, 7, UINT64_C(0xcace002), 31);
+	GcsBlockForwardCancelPayload cancel;
+	GcsBlockForwardCancelPayload barrier;
+	GcsBlockForwardCancelPayload replay;
+	GcsBlockForwardCancelPayload drifted;
+	TimestampTz far_future;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	memset(&cancel, 0, sizeof(cancel));
+	cancel.request_id = key.request_id;
+	cancel.request_epoch = key.cluster_epoch;
+	cancel.pre_authority_generation = 113;
+	cancel.relation_generation = 127;
+	cancel.expected_pi_watermark_scn = 131;
+	cancel.requester_incarnation = 137;
+	cancel.master_incarnation = 139;
+	cancel.holder_incarnation = 149;
+	cancel.tag = tag;
+	cancel.requester_node = (int32)key.origin_node_id;
+	cancel.requester_backend_id = key.requester_backend_id;
+	cancel.master_node = 0;
+	cancel.holder_node = 2;
+	cancel.phase = (uint8)GCS_FORWARD_CANCEL_PHASE_MASTER_TO_HOLDER;
+	cancel.reason = (uint8)GCS_FORWARD_CANCEL_REASON_PENDING_X;
+	cancel.proof = GCS_FORWARD_CANCEL_PROOF_MASTER_MASK;
+	cancel.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	cancel.master_holder_capability_generation = 151;
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_install(
+					 0, &key, &cancel, 157, &barrier),
+				 (int)GCS_FORWARD_CANCEL_INSTALLED);
+	UT_ASSERT_EQ((int)barrier.phase,
+				 (int)GCS_FORWARD_CANCEL_PHASE_HOLDER_BARRIER);
+	UT_ASSERT_EQ((int)barrier.proof,
+				 (int)GCS_FORWARD_CANCEL_PROOF_BARRIER_MASK);
+	UT_ASSERT_EQ(barrier.holder_requester_capability_generation,
+				 UINT32_C(157));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_lookup(
+					 0, &key, &tag, &replay),
+				 (int)GCS_FORWARD_CANCEL_REPLAY);
+	UT_ASSERT_EQ(memcmp(&replay, &barrier, sizeof(barrier)), 0);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_install(
+					 0, &key, &cancel, 157, &replay),
+				 (int)GCS_FORWARD_CANCEL_REPLAY);
+	UT_ASSERT_EQ(memcmp(&replay, &barrier, sizeof(barrier)), 0);
+
+	drifted = cancel;
+	drifted.pre_authority_generation++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_install(
+					 0, &key, &drifted, 157, NULL),
+				 (int)GCS_FORWARD_CANCEL_STALE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_install(
+					 0, &key, &cancel, 0, NULL),
+				 (int)GCS_FORWARD_CANCEL_INVALID);
+
+	/* Generic cleanup and TTL cannot erase a not-yet-admitted ordered
+	 * barrier. */
+	cluster_gcs_block_dedup_cleanup_on_backend_exit(
+		key.origin_node_id, key.requester_backend_id);
+	cluster_gcs_block_dedup_cleanup_on_node_dead(
+		(int32)key.origin_node_id);
+	far_future = GetCurrentTimestamp()
+				 + ((TimestampTz)GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS
+					* (TimestampTz)1000 * 4);
+	cluster_gcs_block_dedup_sweep_expired(far_future);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_lookup(
+					 0, &key, &tag, &replay),
+				 (int)GCS_FORWARD_CANCEL_REPLAY);
+
+	/* Only the byte-exact barrier that the ordered DATA queue admitted may
+	 * release the transient holder tombstone. */
+	drifted = barrier;
+	drifted.holder_requester_capability_generation++;
+	UT_ASSERT(!cluster_gcs_block_dedup_forward_cancel_holder_admitted_exact(
+		0, &key, &drifted));
+	UT_ASSERT(cluster_gcs_block_dedup_forward_cancel_holder_admitted_exact(
+		0, &key, &barrier));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_lookup(
+					 0, &key, &tag, &replay),
+				 (int)GCS_FORWARD_CANCEL_NOT_FOUND);
+
+	/* Lost barrier: replayed master CANCEL reinstalls the same canonical
+	 * barrier without borrowing a new request identity. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_install(
+					 0, &key, &cancel, 157, &replay),
+				 (int)GCS_FORWARD_CANCEL_INSTALLED);
+	UT_ASSERT_EQ(memcmp(&replay, &barrier, sizeof(barrier)), 0);
+}
+
+UT_TEST(u51_forward_cancel_supersedes_only_exact_provisional_stale_x_report)
+{
+	BufferTag tag = make_tag(185);
+	GcsBlockDedupKey key = make_key(1, 7, UINT64_C(0xcace003), 33);
+	GcsStaleXCertPayload report;
+	GcsStaleXCertPayload stored_report;
+	GcsStaleXCertPayload install;
+	GcsStaleXCertPayload fence_ack;
+	GcsBlockForwardCancelPayload cancel;
+	GcsBlockForwardCancelPayload barrier;
+	GcsBlockForwardCancelPayload drifted;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	memset(&report, 0, sizeof(report));
+	report.request_id = key.request_id;
+	report.request_epoch = key.cluster_epoch;
+	report.release_cert_nonce = 173;
+	report.source_own_generation = 179;
+	report.relation_generation = 181;
+	report.final_page_scn = (SCN)191;
+	report.durable_page_scn = (SCN)193;
+	report.tag = tag;
+	report.requester_node = (int32)key.origin_node_id;
+	report.requester_backend_id = key.requester_backend_id;
+	report.master_node = 0;
+	report.holder_node = 2;
+	report.requester_incarnation = 197;
+	report.master_incarnation = 199;
+	report.holder_incarnation = 211;
+	report.phase = (uint8)GCS_STALE_X_CERT_PHASE_MISS_REPORT;
+	report.reason = (uint8)GCS_STALE_X_CERT_REASON_NOT_RESIDENT;
+	report.proof = GCS_STALE_X_PROOF_REPORT_MASK;
+	report.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+					 0, &key, &report, &stored_report),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+
+	memset(&cancel, 0, sizeof(cancel));
+	cancel.request_id = key.request_id;
+	cancel.request_epoch = key.cluster_epoch;
+	cancel.pre_authority_generation = 223;
+	cancel.relation_generation = report.relation_generation;
+	cancel.expected_pi_watermark_scn = (uint64)report.final_page_scn;
+	cancel.requester_incarnation = report.requester_incarnation;
+	cancel.master_incarnation = report.master_incarnation;
+	cancel.holder_incarnation = report.holder_incarnation;
+	cancel.tag = tag;
+	cancel.requester_node = report.requester_node;
+	cancel.requester_backend_id = report.requester_backend_id;
+	cancel.master_node = report.master_node;
+	cancel.holder_node = report.holder_node;
+	cancel.phase = (uint8)GCS_FORWARD_CANCEL_PHASE_MASTER_TO_HOLDER;
+	cancel.reason = (uint8)GCS_FORWARD_CANCEL_REASON_PENDING_X;
+	cancel.proof = GCS_FORWARD_CANCEL_PROOF_MASTER_MASK;
+	cancel.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	cancel.master_holder_capability_generation = 227;
+
+	drifted = cancel;
+	drifted.requester_incarnation++;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_install(
+					 0, &key, &drifted, 229, NULL),
+				 (int)GCS_FORWARD_CANCEL_STALE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_lookup(
+					 0, &key, &tag, &stored_report),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+
+	/* The cancel-wins race atomically replaces only the same attempt's
+	 * provisional MISS_REPORT with its ordered requester barrier. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_install(
+					 0, &key, &cancel, 229, &barrier),
+				 (int)GCS_FORWARD_CANCEL_INSTALLED);
+	UT_ASSERT_EQ((int)barrier.phase,
+				 (int)GCS_FORWARD_CANCEL_PHASE_HOLDER_BARRIER);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_lookup(
+					 0, &key, &tag, &drifted),
+				 (int)GCS_FORWARD_CANCEL_REPLAY);
+	UT_ASSERT_EQ(memcmp(&drifted, &barrier, sizeof(barrier)), 0);
+
+	/* Once stale-X advanced past the provisional report, cancellation may
+	 * not steal its stronger fence. */
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+					 0, &key, &report, &stored_report),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	install = report;
+	install.phase = (uint8)GCS_STALE_X_CERT_PHASE_FENCE_INSTALL;
+	install.pre_authority_generation = cancel.pre_authority_generation;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_fence_install(
+					 0, &key, &install, &fence_ack),
+				 (int)GCS_STALE_X_FENCE_INSTALLED);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_forward_cancel_holder_install(
+					 0, &key, &cancel, 229, NULL),
+				 (int)GCS_FORWARD_CANCEL_STALE);
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_stale_x_holder_lookup(
+					 0, &key, &tag, &stored_report),
+				 (int)GCS_STALE_X_FENCE_FULL);
+}
+
+/* ============================================================
+ * U53 — S3-P0-18 restart request-id incarnation ABA.
+ *
+ *	A requester backend's sequence restarts at 1 with the postmaster, so
+ *	the legacy 4-tuple can alias an old DONE-linger entry even though the
+ *	requester boot/session identity changed.  A different tag is then
+ *	rejected as a key collision; the fresh incarnation must instead own a
+ *	new MISS.  The two incarnation constants document the authenticated
+ *	identity which the production key/wire path must bind.
+ * ============================================================ */
+UT_TEST(u53_restart_incarnation_different_tag_is_fresh_miss)
+{
+	GcsBlockDedupKey old_key = make_key(1, 2, UINT64_C(0x0100010000000058), 0);
+	GcsBlockDedupKey fresh_key = make_key(1, 2, UINT64_C(0x0100010000000058), 0);
+	BufferTag old_tag = make_tag(1249);
+	BufferTag fresh_tag = make_tag(1262);
+	GcsBlockDedupEntry cached;
+	const uint64 old_requester_incarnation = UINT64_C(838266221071564);
+	const uint64 fresh_requester_incarnation = UINT64_C(838266228102000);
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT(old_requester_incarnation != fresh_requester_incarnation);
+	old_key.origin_boot_incarnation = old_requester_incarnation;
+	fresh_key.origin_boot_incarnation = fresh_requester_incarnation;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &old_key, old_tag, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	install_granted(0, &old_key);
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &old_key, &old_tag, 1));
+
+	/* Old code returns VALIDATION_FAIL because requester incarnation is
+	 * absent from the dedup key.  A restart-safe identity must register a
+	 * new entry without weakening tag/transition collision validation. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &fresh_key, fresh_tag, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+}
+
+/* Same ABA with an identical tag is more dangerous: old code silently
+ * returns CACHED_REPLY containing the previous postmaster's page/result. */
+UT_TEST(u54_restart_incarnation_same_tag_never_replays_old_cache)
+{
+	GcsBlockDedupKey old_key = make_key(1, 2, UINT64_C(0x0100010000000059), 0);
+	GcsBlockDedupKey fresh_key = make_key(1, 2, UINT64_C(0x0100010000000059), 0);
+	BufferTag tag = make_tag(2663);
+	GcsBlockDedupEntry cached;
+	const uint64 old_requester_incarnation = UINT64_C(838266221121996);
+	const uint64 fresh_requester_incarnation = UINT64_C(838266230675000);
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT(old_requester_incarnation != fresh_requester_incarnation);
+	old_key.origin_boot_incarnation = old_requester_incarnation;
+	fresh_key.origin_boot_incarnation = fresh_requester_incarnation;
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &old_key, tag, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	install_granted(0, &old_key);
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &old_key, &tag, 1));
+
+	/* Old code returns CACHED_REPLY.  A fresh requester incarnation must
+	 * never inherit the previous process lifetime's cached result. */
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &fresh_key, tag, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+}
+
+UT_TEST(u55_legacy_restart_boot_change_quarantines_unbound_frames)
+{
+	const uint64 boot_a = UINT64_C(838266221071564);
+	const uint64 boot_b = UINT64_C(838266228102000);
+	const TimestampTz t0 = (TimestampTz)100;
+	const int64 quarantine_us = 1000;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT(!cluster_gcs_block_dedup_origin_boot_admit(
+		1, 0, false, t0, quarantine_us));
+	UT_ASSERT(cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_a, false, t0, quarantine_us));
+	UT_ASSERT(cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_a, false, t0 + 1, quarantine_us));
+	UT_ASSERT(!cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_b, false, t0 + 100, quarantine_us));
+	UT_ASSERT(!cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_b, false, t0 + 1099, quarantine_us));
+	UT_ASSERT(cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_b, false, t0 + 1100, quarantine_us));
+
+	/* A wire-bound new-boot request may proceed immediately, but it still
+	 * arms the fence which rejects any unbound late old DATA frame. */
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT(cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_a, false, t0, quarantine_us));
+	UT_ASSERT(cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_b, true, t0 + 100, quarantine_us));
+	UT_ASSERT(!cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_b, false, t0 + 101, quarantine_us));
+	UT_ASSERT(cluster_gcs_block_dedup_origin_boot_admit(
+		1, boot_b, false, t0 + 1100, quarantine_us));
+}
+
+UT_TEST(u56_debug_exact_probe_distinguishes_requester_boot_incarnations)
+{
+	GcsBlockDedupKey key_a = make_key(1, 2, UINT64_C(0x0100010000000060), 17);
+	GcsBlockDedupKey key_b = key_a;
+	GcsBlockDedupKey absent = key_a;
+	BufferTag tag_a = make_tag(2671);
+	BufferTag tag_b = make_tag(2672);
+	GcsBlockDedupEntry cached;
+	GcsBlockDedupDebugExactSnapshot snapshot;
+
+	key_a.origin_boot_incarnation = UINT64_C(838266221071564);
+	key_b.origin_boot_incarnation = UINT64_C(838266228102000);
+	absent.origin_boot_incarnation = UINT64_C(838266299999999);
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 0, &key_a, tag_a, 1, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	install_granted(0, &key_a);
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(0, &key_a, &tag_a, 1));
+	UT_ASSERT_EQ((int)cluster_gcs_block_dedup_lookup_or_register(
+					 1, &key_b, tag_b, 2, 0, false, &cached),
+				 (int)GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	install_granted(1, &key_b);
+	UT_ASSERT(cluster_gcs_block_dedup_mark_done(1, &key_b, &tag_b, 2));
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	UT_ASSERT(cluster_gcs_block_dedup_debug_exact(&key_a, &snapshot));
+	UT_ASSERT_EQ(snapshot.match_count, 1);
+	UT_ASSERT_EQ(snapshot.worker_id, 0);
+	UT_ASSERT(memcmp(&snapshot.key, &key_a, sizeof(key_a)) == 0);
+	UT_ASSERT(memcmp(&snapshot.tag, &tag_a, sizeof(tag_a)) == 0);
+	UT_ASSERT_EQ(snapshot.entry_kind, GCS_BLOCK_DEDUP_ENTRY_GENERIC);
+	UT_ASSERT_EQ(snapshot.transition_id, 1);
+	UT_ASSERT_EQ(snapshot.status, GCS_BLOCK_REPLY_GRANTED);
+	UT_ASSERT(snapshot.completed);
+	UT_ASSERT(snapshot.done);
+	UT_ASSERT_EQ(snapshot.miss_count, 2);
+	UT_ASSERT_EQ(snapshot.hit_count, 0);
+	UT_ASSERT_EQ(snapshot.collision_count, 0);
+	UT_ASSERT_EQ(snapshot.done_marked_count, 2);
+	UT_ASSERT_EQ(snapshot.done_mismatch_count, 0);
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	UT_ASSERT(cluster_gcs_block_dedup_debug_exact(&key_b, &snapshot));
+	UT_ASSERT_EQ(snapshot.match_count, 1);
+	UT_ASSERT_EQ(snapshot.worker_id, 1);
+	UT_ASSERT(memcmp(&snapshot.key, &key_b, sizeof(key_b)) == 0);
+	UT_ASSERT(memcmp(&snapshot.tag, &tag_b, sizeof(tag_b)) == 0);
+	UT_ASSERT_EQ(snapshot.transition_id, 2);
+	UT_ASSERT(snapshot.completed);
+	UT_ASSERT(snapshot.done);
+
+	memset(&snapshot, 0x7f, sizeof(snapshot));
+	UT_ASSERT(!cluster_gcs_block_dedup_debug_exact(&absent, &snapshot));
+	UT_ASSERT_EQ(snapshot.match_count, 0);
+	UT_ASSERT_EQ(snapshot.worker_id, -1);
+	UT_ASSERT(memcmp(&snapshot.key, &absent, sizeof(absent)) == 0);
+}
+
+UT_TEST(u57_forward_phase_census_is_atomic_across_shards)
+{
+	GcsBlockDedupEntry *cancelling;
+	GcsBlockDedupEntry *forwarded;
+	GcsBlockForwardPhaseCensus census;
+
+	memset(&census, 0x7f, sizeof(census));
+	UT_ASSERT(!cluster_gcs_block_dedup_forward_phase_census(&census));
+	UT_ASSERT(!census.valid);
+	UT_ASSERT_EQ(census.marker_count, 0);
+	UT_ASSERT_EQ(census.forwarded_count, 0);
+	UT_ASSERT_EQ(census.cancelling_count, 0);
+	UT_ASSERT_EQ(census.invalid_count, 0);
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	forwarded = (GcsBlockDedupEntry *)fake_htab[0].entries[0];
+	cancelling = (GcsBlockDedupEntry *)fake_htab[1].entries[0];
+	fake_htab[0].count = 1;
+	fake_htab[1].count = 1;
+
+	memset(forwarded, 0, sizeof(*forwarded));
+	forwarded->entry_kind = GCS_BLOCK_DEDUP_ENTRY_GENERIC;
+	forwarded->status = GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
+	forwarded->sf_flags = GCS_BLOCK_DEDUP_FORWARD_MARKER_FLAG
+						  | GCS_BLOCK_FORWARD_MARK_FORWARDED;
+
+	memset(cancelling, 0, sizeof(*cancelling));
+	cancelling->entry_kind = GCS_BLOCK_DEDUP_ENTRY_GENERIC;
+	cancelling->status = GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER;
+	cancelling->sf_flags = GCS_BLOCK_DEDUP_FORWARD_MARKER_FLAG
+						   | GCS_BLOCK_FORWARD_MARK_CANCELLING;
+
+	fake_allow_multi_lwlock = true;
+	memset(&census, 0x7f, sizeof(census));
+	UT_ASSERT(cluster_gcs_block_dedup_forward_phase_census(&census));
+	UT_ASSERT(census.valid);
+	UT_ASSERT_EQ(census.marker_count, 2);
+	UT_ASSERT_EQ(census.forwarded_count, 1);
+	UT_ASSERT_EQ(census.cancelling_count, 1);
+	UT_ASSERT_EQ(census.invalid_count, 0);
+	UT_ASSERT_EQ(fake_lwlock_acquire_count, 2);
+	UT_ASSERT_EQ(fake_lwlock_shared_count, 2);
+	UT_ASSERT_EQ(fake_lwlock_exclusive_count, 0);
+	UT_ASSERT_EQ(fake_lwlock_release_count, 2);
+	UT_ASSERT_EQ(fake_lwlock_release_underflow_count, 0);
+	UT_ASSERT_EQ(fake_lwlock_held_count, 0);
+	UT_ASSERT_EQ(fake_lwlock_max_held_count, 2);
+	UT_ASSERT(fake_lwlock_acquire_order[0] != fake_lwlock_acquire_order[1]);
+	UT_ASSERT(fake_lwlock_release_order[0] == fake_lwlock_acquire_order[1]);
+	UT_ASSERT(fake_lwlock_release_order[1] == fake_lwlock_acquire_order[0]);
+	UT_ASSERT_EQ(fake_hash_seq_init_count, 2);
+	UT_ASSERT_EQ(fake_hash_seq_term_count, 2);
+	UT_ASSERT_EQ(fake_hash_seq_held_count[0], 2);
+	UT_ASSERT_EQ(fake_hash_seq_held_count[1], 2);
+	UT_ASSERT(!cluster_gcs_block_dedup_forward_phase_census(NULL));
+	UT_ASSERT_EQ(fake_lwlock_acquire_count, 2);
+	UT_ASSERT_EQ(fake_lwlock_release_count, 2);
+}
+
+UT_TEST(u58_forward_phase_census_ignores_cache_and_counts_malformed_markers)
+{
+	GcsBlockDedupEntry *generic_cache;
+	GcsBlockDedupEntry *pcm_x_cache;
+	GcsBlockDedupEntry *bad_phase;
+	GcsBlockDedupEntry *bad_kind;
+	GcsBlockDedupEntry *bad_status;
+	GcsBlockForwardPhaseCensus census;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	fake_htab[0].count = 2;
+	fake_htab[1].count = 3;
+	generic_cache = (GcsBlockDedupEntry *)fake_htab[0].entries[0];
+	pcm_x_cache = (GcsBlockDedupEntry *)fake_htab[0].entries[1];
+	bad_phase = (GcsBlockDedupEntry *)fake_htab[1].entries[0];
+	bad_kind = (GcsBlockDedupEntry *)fake_htab[1].entries[1];
+	bad_status = (GcsBlockDedupEntry *)fake_htab[1].entries[2];
+
+	memset(generic_cache, 0, sizeof(*generic_cache));
+	generic_cache->entry_kind = GCS_BLOCK_DEDUP_ENTRY_GENERIC;
+	memset(pcm_x_cache, 0, sizeof(*pcm_x_cache));
+	pcm_x_cache->entry_kind = GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE;
+
+	memset(bad_phase, 0, sizeof(*bad_phase));
+	bad_phase->entry_kind = GCS_BLOCK_DEDUP_ENTRY_GENERIC;
+	bad_phase->status = GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
+	bad_phase->sf_flags = GCS_BLOCK_DEDUP_FORWARD_MARKER_FLAG
+						  | GCS_BLOCK_FORWARD_MARK_PREPARED;
+
+	memset(bad_kind, 0, sizeof(*bad_kind));
+	bad_kind->entry_kind = GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE;
+	bad_kind->status = GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER;
+	bad_kind->sf_flags = GCS_BLOCK_DEDUP_FORWARD_MARKER_FLAG
+						 | GCS_BLOCK_FORWARD_MARK_FORWARDED;
+
+	memset(bad_status, 0, sizeof(*bad_status));
+	bad_status->entry_kind = GCS_BLOCK_DEDUP_ENTRY_GENERIC;
+	bad_status->status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
+	bad_status->sf_flags = GCS_BLOCK_DEDUP_FORWARD_MARKER_FLAG
+						   | GCS_BLOCK_FORWARD_MARK_FORWARDED;
+
+	fake_allow_multi_lwlock = true;
+	UT_ASSERT(cluster_gcs_block_dedup_forward_phase_census(&census));
+	UT_ASSERT(census.valid);
+	UT_ASSERT_EQ(census.marker_count, 3);
+	UT_ASSERT_EQ(census.forwarded_count, 0);
+	UT_ASSERT_EQ(census.cancelling_count, 0);
+	UT_ASSERT_EQ(census.invalid_count, 3);
+}
+
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(60);
+	UT_RUN(u57_forward_phase_census_is_atomic_across_shards);
+	UT_RUN(u58_forward_phase_census_ignores_cache_and_counts_malformed_markers);
 	UT_RUN(u1_per_worker_isolation);
 	UT_RUN(u2_dedup_lifecycle_per_shard);
 	UT_RUN(u3_counters_sum_across_shards);
@@ -2125,13 +4068,14 @@ main(void)
 	UT_RUN(u8_ttl_sweep_all_shards);
 	UT_RUN(u9_backend_exit_cleanup_all_shards);
 	UT_RUN(u10_remove_reopens_in_flight_entry);
+	UT_RUN(u10b_exact_remove_refuses_identity_or_phase_drift);
 	UT_RUN(u11_read_image_marker_classifies_forwarded);
 	UT_RUN(u12_ttl_covers_reply_timeout_lifetime);
 	UT_RUN(u13_mark_done_truth_table);
 	UT_RUN(u14_pinned_ttl_wire_hint_and_no_guc_reread);
 	UT_RUN(u15_done_linger_beats_full_lifetime);
 	UT_RUN(u16_capability_routing_truth_table);
-	UT_RUN(u17_pcm_x_binding_layout_is_zero_entry_growth);
+	UT_RUN(u17_pcm_x_binding_layout_tracks_forward_identity_growth);
 	UT_RUN(u18_pcm_x_stage_duplicate_and_generic_overwrite_refused);
 	UT_RUN(u19_pcm_x_entry_isolated_from_generic_lifecycle);
 	UT_RUN(u20_pcm_x_entry_survives_generic_gc_and_retires_exactly);
@@ -2152,6 +4096,26 @@ main(void)
 	UT_RUN(u35_pcm_x_commit_pending_rotates_to_independent_reserved_tag);
 	UT_RUN(u36_pcm_x_drain_cleanup_is_replayable_until_exact_retire);
 	UT_RUN(u37_pcm_x_finish_error_preserves_exact_materialized_evidence);
+	UT_RUN(u38_forward_marker_prepare_claim_finish_is_exact_and_serial);
+	UT_RUN(u39_admitted_forward_survives_local_cleanup_without_holder_fence_ack);
+	UT_RUN(u40_stale_x_holder_fence_is_exact_replayable_and_not_gc_owned);
+	UT_RUN(u41_stale_x_master_report_serializes_with_send_finish_and_ack);
+	UT_RUN(u42_stale_x_holder_retire_replays_lost_ack_and_reopens_small_cap);
+	UT_RUN(u43_stale_x_release_journal_is_state_and_residency_exact);
+	UT_RUN(u44_checkpoint_durable_seal_is_residency_and_redirty_exact);
+	UT_RUN(u45_release_journal_capacity_fails_before_evidence_loss);
+	UT_RUN(u46_eviction_gate_blocks_tag_and_source_until_exact_ack);
+	UT_RUN(u47_stale_x_relation_generation_is_always_on_exact_and_bounded);
+	UT_RUN(u48_relation_supersede_keeps_old_holder_fence_fail_closed);
+	UT_RUN(u49_forward_cancel_master_transition_is_exact_and_replayable);
+	UT_RUN(u59_forward_cancel_cross_plane_early_ack_replays_to_terminal);
+	UT_RUN(u50_forward_cancel_holder_barrier_tombstone_is_exact);
+	UT_RUN(u51_forward_cancel_supersedes_only_exact_provisional_stale_x_report);
+	UT_RUN(u52_direct_land_same_identity_retry_can_downgrade_to_generic);
+	UT_RUN(u53_restart_incarnation_different_tag_is_fresh_miss);
+	UT_RUN(u54_restart_incarnation_same_tag_never_replays_old_cache);
+	UT_RUN(u55_legacy_restart_boot_change_quarantines_unbound_frames);
+	UT_RUN(u56_debug_exact_probe_distinguishes_requester_boot_incarnations);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

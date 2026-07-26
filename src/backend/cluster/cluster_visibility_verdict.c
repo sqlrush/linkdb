@@ -279,8 +279,20 @@ cluster_vis_from_undo_verdict(ClusterUndoVerdictResult v, ClusterVisResolve *out
 		out->commit_scn_is_bound = false;
 		return true;
 
-	case CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED:
 	case CLUSTER_UNDO_VERDICT_IN_PROGRESS:
+		/*
+		 * S3-P0-13: exact positive live proof.  This is resolved evidence,
+		 * but deliberately non-terminal: the HTSU verdict becomes
+		 * TM_BeingModified and the caller follows the existing cluster TX
+		 * wait.  No SCN is available to memoize or stamp.
+		 */
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		out->commit_scn = InvalidScn;
+		out->commit_scn_is_bound = false;
+		return true;
+
+	case CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED:
 	default:
 		/*
 		 * Not proven terminal -> STALE_OR_AMBIGUOUS so the caller keeps 53R97

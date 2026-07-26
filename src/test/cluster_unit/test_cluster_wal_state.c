@@ -4,7 +4,7 @@
  *	  pgrac spec-4.2 D6 — cluster_unit tests for the ClusterWalState
  *	  registry pure helpers (cluster_wal_state.h, header-only inline).
  *
- *	  15 tests covering:
+ *	  16 tests covering:
  *	    T1   header sizeof == 512 + offsetof locks (incl. explicit
  *	         _pad_12 at 12..15 -- v0.2 P2)
  *	    T2   slot sizeof == 512 + offsetof locks
@@ -24,6 +24,9 @@
  *	    T14  EMPTY requires the full 512B zero: zeroed fields + body
  *	         garbage -> CORRUPT (round-2 P1, absence-as-proof)
  *	    T15  crc covers tli/lsn/scn fields (flip each -> bad crc)
+ *	    T16  first-boot publication is atomic: the final pathname is
+ *	         installed from a complete durable temp image with link(2),
+ *	         never exposed by O_CREAT before initialisation completes
  *
  *	  Linkage mirrors test_cluster_wal_thread: header-only inclusion +
  *	  libpgcommon/libpgport for pg_crc32c -- no module .o, no stubs.
@@ -42,6 +45,8 @@
 #include "postgres.h"
 
 #include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "cluster/cluster_wal_state.h"
@@ -54,6 +59,8 @@
 
 UT_DEFINE_GLOBALS();
 
+#define CLUSTER_WAL_STATE_SOURCE_PATH "../../../src/backend/cluster/cluster_wal_state.c"
+
 
 /* cassert builds pull libpgport objects that reference this. */
 void
@@ -62,6 +69,27 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 int lineNumber pg_attribute_unused())
 {
 	abort();
+}
+
+static char *
+read_source(const char *path)
+{
+	FILE *f;
+	long size;
+	char *buf;
+
+	f = fopen(path, "rb");
+	UT_ASSERT(f != NULL);
+	UT_ASSERT_EQ(fseek(f, 0, SEEK_END), 0);
+	size = ftell(f);
+	UT_ASSERT(size > 0);
+	UT_ASSERT_EQ(fseek(f, 0, SEEK_SET), 0);
+	buf = malloc((size_t)size + 1);
+	UT_ASSERT(buf != NULL);
+	UT_ASSERT_EQ((long)fread(buf, 1, (size_t)size, f), size);
+	buf[size] = '\0';
+	UT_ASSERT_EQ(fclose(f), 0);
+	return buf;
 }
 
 
@@ -285,11 +313,33 @@ UT_TEST(test_crc_covers_watermark_fields)
 				 (int)CLUSTER_WAL_SLOT_CORRUPT);
 }
 
+/*
+ * A shared first boot is concurrent.  Creating the final path before its
+ * 66048-byte image is complete exposes a zero/short/torn registry to peers.
+ * Require create-private + durable-write + link(2) no-clobber publication.
+ * t/361 supplies the process-level concurrent startup RED/GREEN.
+ */
+UT_TEST(test_first_boot_registry_publish_is_atomic)
+{
+	char *source = read_source(CLUSTER_WAL_STATE_SOURCE_PATH);
+	char *temp_create = strstr(source, "BasicOpenFile(tmp_path,");
+	char *publish = strstr(source, "link(tmp_path, path)");
+
+	UT_ASSERT(temp_create != NULL);
+	UT_ASSERT(publish != NULL);
+	if (temp_create != NULL && publish != NULL)
+		UT_ASSERT(temp_create < publish);
+	UT_ASSERT(strstr(source,
+					 "BasicOpenFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY)")
+			  == NULL);
+	free(source);
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 
 	UT_RUN(test_header_layout_locks);
 	UT_RUN(test_slot_layout_locks);
@@ -306,6 +356,7 @@ main(int argc, char **argv)
 	UT_RUN(test_state_enum_on_disk_values);
 	UT_RUN(test_slot_zero_fields_nonzero_body_is_corrupt);
 	UT_RUN(test_crc_covers_watermark_fields);
+	UT_RUN(test_first_boot_registry_publish_is_atomic);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

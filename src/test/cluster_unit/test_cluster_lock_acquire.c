@@ -47,6 +47,7 @@
 
 #include "cluster/cluster_advisory.h"
 #include "cluster/cluster_ges.h" /* GES_REJECT_REASON_* for U6 */
+#include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_lock_acquire.h"
@@ -55,6 +56,7 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
+#include "utils/memutils.h"
 
 /* Drop PG's port.h printf override; unit_test.h uses stdlib printf. */
 #ifdef vprintf
@@ -139,6 +141,12 @@ cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter pg_attribute_un
  */
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+static char ut_caller_memory_context_storage;
+static char ut_error_memory_context_storage;
+MemoryContext CurrentMemoryContext = NULL;
+MemoryContext ErrorContext = NULL;
+volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 QueryCancelHoldoffCount = 0;
 
 void
 pg_re_throw(void)
@@ -205,6 +213,7 @@ struct PGPROC {
 struct PGPROC *MyProc = NULL;
 
 int cluster_node_id = 0;
+static int32 stub_grd_master = -1;
 bool cluster_local_fast_path_enabled = true;
 
 /* spec-5.5 D7 — cluster.advisory_lock_enabled gate GUC (default on).  The real
@@ -378,7 +387,7 @@ cluster_grd_shard_for_resource(const ClusterResId *resid pg_attribute_unused())
 int32
 cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
 {
-	return -1;
+	return stub_grd_master;
 }
 
 /* spec-4.6a: the S4-reject diagnostic references the CSSD peer-state view;
@@ -492,6 +501,29 @@ static PcmXQueueResult stub_pcm_x_nested_guard_result = PCM_X_QUEUE_OK;
 static int stub_ges_request_wait_calls;
 static int stub_ges_request_nowait_wait_calls;
 static int stub_ges_convert_wait_calls;
+static uint64 stub_ges_convert_wait_old_request_id;
+static uint64 stub_ges_convert_wait_new_request_id;
+static uint32 stub_ges_release_reason = GES_REJECT_REASON_NONE;
+static bool stub_ges_release_throw;
+static ClusterResId stub_ges_release_resid;
+static ClusterGrdHolderId stub_ges_release_holder;
+static uint64 stub_ges_release_request_id;
+static bool stub_cleanup_release_scope_ok = true;
+static int stub_cleanup_release_scope_begin_count;
+static int stub_cleanup_release_scope_end_count;
+
+void
+cluster_grd_outbound_cleanup_release_nonthrow_begin(void)
+{
+	stub_cleanup_release_scope_begin_count++;
+}
+
+bool
+cluster_grd_outbound_cleanup_release_nonthrow_end(void)
+{
+	stub_cleanup_release_scope_end_count++;
+	return stub_cleanup_release_scope_ok;
+}
 
 PcmXQueueResult
 cluster_pcm_x_nested_wait_guard_before_block(void)
@@ -525,12 +557,31 @@ cluster_ges_send_request_nowait_and_wait(
 }
 
 uint32
-cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
-								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
-								  uint64 request_id pg_attribute_unused())
+cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
+								  const struct ClusterGrdHolderId *holder,
+								  uint64 request_id)
 {
-	return 0;
+	stub_ges_release_resid = *resid;
+	stub_ges_release_holder = *holder;
+	stub_ges_release_request_id = request_id;
+	if (stub_ges_release_throw && PG_exception_stack != NULL) {
+		/*
+		 * Match errfinish(ERROR): the catch starts in ErrorContext with both
+		 * interrupt holdoff counts reset, rather than merely jumping over the
+		 * call.  This lets the unit exercise the real backend globals that the
+		 * nonthrow boundary must restore for its ResourceOwner caller.
+		 */
+		CurrentMemoryContext = ErrorContext;
+		InterruptHoldoffCount = 0;
+		QueryCancelHoldoffCount = 0;
+		siglongjmp(*PG_exception_stack, 1);
+	}
+	return stub_ges_release_reason;
 }
+
+void
+FlushErrorState(void)
+{}
 
 /* spec-5.5 P0 — local-master release drain (no-op in the standalone fixture;
  * the real drain+wake is exercised by cluster_tap t/286). */
@@ -547,10 +598,13 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid pg_attribute_
 								  uint32 requested_mode pg_attribute_unused(),
 								  uint32 current_mode pg_attribute_unused(),
 								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+								  uint64 old_request_id,
 								  uint64 convert_request_id pg_attribute_unused(),
 								  int timeout_ms pg_attribute_unused())
 {
 	stub_ges_convert_wait_calls++;
+	stub_ges_convert_wait_old_request_id = old_request_id;
+	stub_ges_convert_wait_new_request_id = convert_request_id;
 	return stub_ges_reject_reason;
 }
 
@@ -1005,6 +1059,7 @@ UT_TEST(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits)
 	memset(&req, 0, sizeof(req));
 	req.lockmode = AccessExclusiveLock;
 	req.current_mode = AccessShareLock;
+	req.convert_old_request_id = UINT64_C(77001);
 	req.request_id = UINT64_C(88001);
 	request_calls = stub_ges_request_wait_calls;
 	convert_calls = stub_ges_convert_wait_calls;
@@ -1036,6 +1091,8 @@ UT_TEST(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits)
 	result = cluster_lock_acquire_s5_promote(&req);
 	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
 	UT_ASSERT_EQ(stub_ges_convert_wait_calls, convert_calls + 1);
+	UT_ASSERT_EQ(stub_ges_convert_wait_old_request_id, req.convert_old_request_id);
+	UT_ASSERT_EQ(stub_ges_convert_wait_new_request_id, req.request_id);
 }
 
 
@@ -1107,6 +1164,151 @@ UT_TEST(test_s5_not_found_benign_narrow)
 														   CLUSTER_GRD_ENTRY_OK));
 }
 
+static void
+capture_s6_counter(void *cookie, const char *key, const char *value)
+{
+	uint64 *counter = (uint64 *)cookie;
+
+	if (strcmp(key, "s6_release") == 0)
+		*counter = (uint64)strtoull(value, NULL, 10);
+}
+
+static uint64
+read_s6_counter(void)
+{
+	uint64 counter = UINT64_MAX;
+
+	cluster_lock_acquire_dump(capture_s6_counter, &counter);
+	UT_ASSERT_NE(counter, UINT64_MAX);
+	return counter;
+}
+
+/*
+ * A remote S6 is successful only after a confirmed ACK.  Returned GES failure
+ * reasons remain visible to the caller and do not advance the success counter.
+ */
+UT_TEST(test_s6_remote_result_and_success_counter)
+{
+	ClusterLockAcquireRequest req;
+	ClusterLockAcquireResult result;
+	uint64 before;
+
+	memset(&req, 0, sizeof(req));
+	req.holder.node_id = 0;
+	req.holder.procno = 42;
+	req.holder.cluster_epoch = 9;
+	req.holder.request_id = 77;
+	req.request_id = 77;
+	stub_grd_master = 1;
+
+	before = read_s6_counter();
+	stub_ges_release_reason = GES_REJECT_REASON_TIMEOUT;
+	result = cluster_lock_acquire_s6_release(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT);
+	UT_ASSERT_EQ(read_s6_counter(), before);
+
+	stub_ges_release_reason = GES_REJECT_REASON_NONE;
+	result = cluster_lock_acquire_s6_release(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(read_s6_counter(), before + 1);
+
+	stub_grd_master = -1;
+	result = cluster_lock_acquire_s6_release(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(read_s6_counter(), before + 2);
+}
+
+/*
+ * The unwind-specific S6 entry must convert both an ERROR and a failed real
+ * cleanup staging scope into a returned failure, without counting success.
+ */
+UT_TEST(test_s6_unwind_release_survives_error_and_saturation)
+{
+	ClusterLockAcquireRequest req;
+	ClusterLockAcquireResult result;
+	uint64 before;
+
+	memset(&req, 0, sizeof(req));
+	req.resid.type = 0xF1;
+	req.holder.node_id = 0;
+	req.holder.procno = 42;
+	req.holder.cluster_epoch = UINT64CONST(0x1020304050607080);
+	req.holder.request_id = UINT64CONST(0x1122334455667788);
+	req.request_id = req.holder.request_id;
+	stub_grd_master = 1;
+	before = read_s6_counter();
+
+	stub_ges_release_throw = true;
+	stub_cleanup_release_scope_ok = true;
+	result = cluster_lock_acquire_s6_release_nothrow(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ(read_s6_counter(), before);
+	UT_ASSERT_EQ(stub_cleanup_release_scope_begin_count, 1);
+	UT_ASSERT_EQ(stub_cleanup_release_scope_end_count, 1);
+
+	stub_ges_release_throw = false;
+	stub_ges_release_reason = GES_REJECT_REASON_NONE;
+	stub_cleanup_release_scope_ok = false;
+	result = cluster_lock_acquire_s6_release_nothrow(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT);
+	UT_ASSERT_EQ(read_s6_counter(), before);
+	UT_ASSERT_EQ(stub_cleanup_release_scope_begin_count, 2);
+	UT_ASSERT_EQ(stub_cleanup_release_scope_end_count, 2);
+	UT_ASSERT_EQ(stub_ges_release_resid.type, req.resid.type);
+	UT_ASSERT_EQ(stub_ges_release_holder.node_id, req.holder.node_id);
+	UT_ASSERT_EQ(stub_ges_release_holder.procno, req.holder.procno);
+	UT_ASSERT_EQ(stub_ges_release_holder.cluster_epoch, req.holder.cluster_epoch);
+	UT_ASSERT_EQ(stub_ges_release_holder.request_id, req.holder.request_id);
+	UT_ASSERT_EQ(stub_ges_release_request_id, req.request_id);
+
+	stub_cleanup_release_scope_ok = true;
+	result = cluster_lock_acquire_s6_release_nothrow(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(read_s6_counter(), before + 1);
+	UT_ASSERT_EQ(stub_cleanup_release_scope_begin_count, 3);
+	UT_ASSERT_EQ(stub_cleanup_release_scope_end_count, 3);
+}
+
+/*
+ * Absorbing an S6 ERROR must return with the ResourceOwner caller's backend
+ * global state intact.  Otherwise the caller resumes in ErrorContext with
+ * cleared holdoff counts and its later cleanup can assert or underflow.
+ */
+UT_TEST(test_s6_unwind_error_restores_caller_backend_globals)
+{
+	ClusterLockAcquireRequest req;
+	ClusterLockAcquireResult result;
+	MemoryContext caller_context
+		= (MemoryContext)&ut_caller_memory_context_storage;
+
+	memset(&req, 0, sizeof(req));
+	req.holder.node_id = 0;
+	req.holder.procno = 42;
+	req.holder.cluster_epoch = 9;
+	req.holder.request_id = 77;
+	req.request_id = 77;
+	stub_grd_master = 1;
+	stub_ges_release_throw = true;
+	stub_cleanup_release_scope_ok = true;
+	ErrorContext = (MemoryContext)&ut_error_memory_context_storage;
+	CurrentMemoryContext = caller_context;
+	InterruptHoldoffCount = 2;
+	QueryCancelHoldoffCount = 3;
+
+	result = cluster_lock_acquire_s6_release_nothrow(&req);
+
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	UT_ASSERT_EQ(CurrentMemoryContext, caller_context);
+	UT_ASSERT_EQ(InterruptHoldoffCount, (uint32)2);
+	UT_ASSERT_EQ(QueryCancelHoldoffCount, (uint32)3);
+
+	stub_ges_release_throw = false;
+	CurrentMemoryContext = NULL;
+	ErrorContext = NULL;
+	InterruptHoldoffCount = 0;
+	QueryCancelHoldoffCount = 0;
+}
+
 
 UT_DEFINE_GLOBALS();
 
@@ -1114,7 +1316,7 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(15);
+	UT_PLAN(18);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1131,6 +1333,9 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits);
 	UT_RUN(test_native_probe_same_lock_group_exempt);
 	UT_RUN(test_s5_not_found_benign_narrow);
+	UT_RUN(test_s6_remote_result_and_success_counter);
+	UT_RUN(test_s6_unwind_release_survives_error_and_saturation);
+	UT_RUN(test_s6_unwind_error_restores_caller_backend_globals);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

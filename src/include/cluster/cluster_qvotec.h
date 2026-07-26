@@ -276,7 +276,8 @@ StaticAssertDecl(offsetof(ClusterVotingSlot, crc32c) == 508,
  *
  *	Mirrors cluster_epoch / cluster_diag / cluster_cssd pattern;
  *	registered from cluster_shmem.c (D9).  ClusterQvotecShmem layout
- *	is private to cluster_qvotec.c (128-byte cache-line aligned).
+ *	is private to cluster_qvotec.c; its fixed 128-byte header is followed
+ *	by one seqlocked majority boot-proof cell per cluster node.
  * ---------- */
 extern Size cluster_qvotec_shmem_size(void);
 extern void cluster_qvotec_shmem_init(void);
@@ -313,7 +314,37 @@ extern uint64 cluster_qvotec_get_current_epoch_at_boot(void);
  * region.  QVOTEC is the sole writer; LMS/backends are read-only consumers. */
 extern void cluster_qvotec_publish_self_incarnation(uint64 incarnation);
 extern uint64 cluster_qvotec_get_self_incarnation(void);
+extern uint64 cluster_qvotec_get_durable_self_incarnation(void);
 extern const char *cluster_qvotec_get_collision_state_name(void);
+
+/*
+ * Coherent peer boot authority selected from one qvotec poll's complete
+ * voting-disk matrix.  A proof exists only when a strict majority of the
+ * configured disks independently carry the same fresh ALIVE
+ * (node, incarnation, epoch) tuple; minority tuples are never combined.
+ */
+typedef struct ClusterQvotecPeerBootProof {
+	uint64 incarnation;
+	uint64 current_epoch;
+	uint64 observed_at_us;
+	uint32 supporting_disks;
+	uint32 valid;
+} ClusterQvotecPeerBootProof;
+
+StaticAssertDecl(sizeof(ClusterQvotecPeerBootProof) == 32,
+				 "qvotec peer boot proof is a fixed 32-byte value");
+
+extern bool cluster_qvotec_peer_boot_majority_select(
+	const ClusterVotingSlot *slots, const ClusterVotingDiskIoState *io_states,
+	uint32 n_disks, uint32 n_max_nodes, uint32 peer_node, uint64 now_us,
+	uint64 heartbeat_timeout_us, ClusterQvotecPeerBootProof *proof_out);
+extern bool cluster_qvotec_peer_boot_majority_exact(
+	int32 peer_node, uint64 expected_epoch, uint64 expected_incarnation,
+	uint64 *incarnation_out);
+extern bool cluster_qvotec_next_self_incarnation(
+	uint64 clock_candidate, const ClusterVotingSlot *slots,
+	const ClusterVotingDiskIoState *io_states, uint32 n_disks,
+	uint32 self_node, uint64 *incarnation_out);
 
 
 /* ----------

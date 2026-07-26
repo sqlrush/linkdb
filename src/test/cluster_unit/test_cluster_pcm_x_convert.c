@@ -66,6 +66,7 @@ int MaxBackends = 4;
 int NBuffers = 8;
 int cluster_lmd_max_wait_edges = 3;
 int cluster_node_id = 0;
+int cluster_unsafe_test_pcm_x_peer_reform_fault = 0;
 
 static BufferDescPadded fake_buffer_descriptors[8];
 BufferDescPadded *BufferDescriptors = fake_buffer_descriptors;
@@ -158,6 +159,10 @@ static LWLockMode lwlock_acquire_error_mode;
 static int lwlock_acquire_error_match;
 static bool iterating_held_lwlocks;
 static int lock_acquire_during_iteration_count;
+int cluster_injection_armed_count = 1;
+static int retire_frontier_injection_count;
+static int retire_frontier_injection_held_locks = -1;
+static char retire_frontier_injection_name[64];
 
 static void maybe_publish_staged_prehandle_insert_exists(void);
 static void maybe_inject_local_rekey_insert_failure(void);
@@ -169,6 +174,15 @@ static uint32 test_slot_flags(PcmXSlotHeader *slot);
 static bool ticket_refs_equal(const PcmXTicketRef *left, const PcmXTicketRef *right);
 static void init_active_pcm_x(uint64 master_session_incarnation);
 static void bind_local_master(int32 master_node, uint64 cluster_epoch, uint64 master_session);
+
+void
+cluster_injection_run(const char *name)
+{
+	retire_frontier_injection_count++;
+	retire_frontier_injection_held_locks = held_lwlock_count;
+	strlcpy(retire_frontier_injection_name, name,
+			sizeof(retire_frontier_injection_name));
+}
 
 static void
 test_image_id_domain_is_canonical_and_bounded(void)
@@ -717,6 +731,10 @@ reset_fake_shmem(void)
 	lwlock_acquire_error_match = 0;
 	iterating_held_lwlocks = false;
 	lock_acquire_during_iteration_count = 0;
+	retire_frontier_injection_count = 0;
+	retire_frontier_injection_held_locks = -1;
+	memset(retire_frontier_injection_name, 0,
+		   sizeof(retire_frontier_injection_name));
 }
 
 static void
@@ -1035,7 +1053,7 @@ prepare_promoted_rekey_fixture(BlockNumber block, uint64 master_session, uint64 
 	PcmXLocalHandle handles[2];
 	int i;
 
-	init_active_pcm_x(master_session);
+	init_active_pcm_x(UINT64_C(77));
 	bind_local_master(1, UINT64_C(9), master_session);
 	for (i = 0; i < 2; i++) {
 		PcmXWaitIdentity identity = make_wait_identity(
@@ -4889,6 +4907,37 @@ UT_TEST(test_activation_publishes_bound_frontiers_and_counters_before_active)
 				 PCM_X_QUEUE_OK);
 }
 
+
+UT_TEST(test_activation_refuses_live_retire_gate_without_erasing_evidence)
+{
+	PcmXShmemHeader *header;
+	PcmXRuntimeSnapshot snapshot;
+
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	header = ClusterPcmXConvertShmem;
+	header->peer_frontiers[1].local_retired_ticket_id = UINT64_C(9901);
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id = UINT64_C(9902);
+	pg_atomic_write_u32(&header->local_retire_gate, 2);
+
+	UT_ASSERT(!cluster_pcm_x_runtime_activate_bound(UINT64_C(77), NULL));
+	snapshot = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT_EQ(snapshot.state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(snapshot.gate_generation, 1);
+	UT_ASSERT_EQ(snapshot.master_session_incarnation, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&header->local_retire_gate), 2);
+	UT_ASSERT_EQ(header->peer_frontiers[1].local_retired_ticket_id, UINT64_C(9901));
+	UT_ASSERT_EQ(header->peer_frontiers[1].local_retire_in_progress_ticket_id, UINT64_C(9902));
+
+	/* The false return retained the private ACTIVATING witness rather than
+	 * publishing ACTIVE; exact recovery can still identify and reset it. */
+	UT_ASSERT(cluster_pcm_x_runtime_reset_activating(1));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&header->local_retire_gate), 2);
+	UT_ASSERT_EQ(header->peer_frontiers[1].local_retired_ticket_id, UINT64_C(9901));
+	UT_ASSERT_EQ(header->peer_frontiers[1].local_retire_in_progress_ticket_id, UINT64_C(9902));
+}
+
+
 UT_TEST(test_activation_rejects_partial_binding_before_claiming_gate)
 {
 	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
@@ -4978,6 +5027,127 @@ UT_TEST(test_runtime_peer_binding_session_drift_fails_closed)
 		cluster_pcm_x_runtime_peer_binding_revalidate_exact(1, UINT64_C(19), UINT64_C(602)),
 		PCM_X_QUEUE_STALE);
 	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
+UT_TEST(test_runtime_quiescent_peer_restart_reforms_generation_exactly)
+{
+	PcmXPeerBinding after[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXPeerBinding before[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXShmemHeader *header;
+	PcmXRuntimeSnapshot first;
+	PcmXRuntimeSnapshot second;
+
+	memset(before, 0, sizeof(before));
+	before[0].cluster_epoch = UINT64_C(19);
+	before[0].peer_session_incarnation = UINT64_C(77);
+	before[1].cluster_epoch = UINT64_C(19);
+	before[1].peer_session_incarnation = UINT64_C(601);
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	UT_ASSERT(cluster_pcm_x_runtime_activate_bound(UINT64_C(77), before));
+	header = ClusterPcmXConvertShmem;
+	first = cluster_pcm_x_runtime_snapshot();
+	header->peer_frontiers[1].next_expected_prehandle_sequence = UINT64_C(9);
+	header->peer_frontiers[1].retired_prehandle_sequence = UINT64_C(8);
+	header->peer_frontiers[1].local_retired_ticket_id = UINT64_C(44);
+	header->outbound_targets[1].next_prehandle_sequence = UINT64_C(11);
+
+	memcpy(after, before, sizeof(after));
+	after[1].peer_session_incarnation = UINT64_C(602);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_reform_peer_restart_bound(
+					 UINT64_C(77), after, true),
+				 PCM_X_QUEUE_OK);
+	second = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT_EQ(second.state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(second.master_session_incarnation, UINT64_C(77));
+	UT_ASSERT_EQ(second.gate_generation, first.gate_generation + 1);
+	UT_ASSERT(second.rebase_wire_active);
+	UT_ASSERT_EQ(header->peer_frontiers[1].cluster_epoch, UINT64_C(19));
+	UT_ASSERT_EQ(header->peer_frontiers[1].sender_session_incarnation, UINT64_C(602));
+	UT_ASSERT_EQ(header->peer_frontiers[1].next_expected_prehandle_sequence, UINT64_C(1));
+	UT_ASSERT_EQ(header->peer_frontiers[1].retired_prehandle_sequence, UINT64_C(0));
+	UT_ASSERT_EQ(header->peer_frontiers[1].local_retired_ticket_id, UINT64_C(0));
+	UT_ASSERT_EQ(header->outbound_targets[1].cluster_epoch, UINT64_C(19));
+	UT_ASSERT_EQ(header->outbound_targets[1].target_session_incarnation, UINT64_C(602));
+	UT_ASSERT_EQ(header->outbound_targets[1].next_prehandle_sequence, UINT64_C(1));
+}
+
+UT_TEST(test_runtime_peer_restart_with_live_slot_remains_fail_closed)
+{
+	PcmXPeerBinding after[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXPeerBinding before[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXShmemHeader *header;
+	PcmXPeerFrontier frontier_before;
+	PcmXOutboundTargetFrontier outbound_before;
+	PcmXRuntimeSnapshot runtime_before;
+
+	memset(before, 0, sizeof(before));
+	before[0].cluster_epoch = UINT64_C(19);
+	before[0].peer_session_incarnation = UINT64_C(77);
+	before[1].cluster_epoch = UINT64_C(19);
+	before[1].peer_session_incarnation = UINT64_C(601);
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	UT_ASSERT(cluster_pcm_x_runtime_activate_bound(UINT64_C(77), before));
+	header = ClusterPcmXConvertShmem;
+	runtime_before = cluster_pcm_x_runtime_snapshot();
+	frontier_before = header->peer_frontiers[1];
+	outbound_before = header->outbound_targets[1];
+	header->allocator[PCM_X_ALLOC_MASTER_TICKET].used = 1;
+	memcpy(after, before, sizeof(after));
+	after[1].peer_session_incarnation = UINT64_C(602);
+
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_reform_peer_restart_bound(
+					 UINT64_C(77), after, true),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().gate_generation,
+				 runtime_before.gate_generation + 1);
+	UT_ASSERT_EQ(memcmp(&header->peer_frontiers[1], &frontier_before,
+						sizeof(frontier_before)),
+				 0);
+	UT_ASSERT_EQ(memcmp(&header->outbound_targets[1], &outbound_before,
+						sizeof(outbound_before)),
+				 0);
+}
+
+UT_TEST(test_runtime_peer_restart_epoch_drift_is_not_reformation)
+{
+	PcmXPeerBinding after[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXPeerBinding before[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXShmemHeader *header;
+	PcmXPeerFrontier frontier_before;
+	PcmXOutboundTargetFrontier outbound_before;
+	PcmXRuntimeSnapshot runtime_before;
+
+	memset(before, 0, sizeof(before));
+	before[0].cluster_epoch = UINT64_C(19);
+	before[0].peer_session_incarnation = UINT64_C(77);
+	before[1].cluster_epoch = UINT64_C(19);
+	before[1].peer_session_incarnation = UINT64_C(601);
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	UT_ASSERT(cluster_pcm_x_runtime_activate_bound(UINT64_C(77), before));
+	header = ClusterPcmXConvertShmem;
+	runtime_before = cluster_pcm_x_runtime_snapshot();
+	frontier_before = header->peer_frontiers[1];
+	outbound_before = header->outbound_targets[1];
+	memcpy(after, before, sizeof(after));
+	after[1].cluster_epoch = UINT64_C(20);
+	after[1].peer_session_incarnation = UINT64_C(602);
+
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_reform_peer_restart_bound(
+					 UINT64_C(77), after, true),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().gate_generation,
+				 runtime_before.gate_generation + 1);
+	UT_ASSERT_EQ(memcmp(&header->peer_frontiers[1], &frontier_before,
+						sizeof(frontier_before)),
+				 0);
+	UT_ASSERT_EQ(memcmp(&header->outbound_targets[1], &outbound_before,
+						sizeof(outbound_before)),
+				 0);
 }
 
 UT_TEST(test_runtime_peer_binding_empty_frontier_is_never_late_bound)
@@ -8272,14 +8442,9 @@ UT_TEST(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage)
 	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(&admission[1].ref,
 															 PCM_X_TERMINAL_LEG_RETIRE, 1,
 															 responder_session, &retire_token),
-				 PCM_X_QUEUE_OK);
+				 PCM_X_QUEUE_NOT_READY);
 	retire_ack0 = make_retire_ack(&admission[1].ref, 0);
 	retire_ack1 = make_retire_ack(&admission[1].ref, 1);
-	UT_ASSERT_EQ(cluster_pcm_x_master_retire_ack_exact(
-					 &retire_ack0, 0, header->peer_frontiers[0].sender_session_incarnation),
-				 PCM_X_QUEUE_STALE);
-	UT_ASSERT_EQ(cluster_pcm_x_master_retire_ack_exact(&retire_ack1, 1, responder_session),
-				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_master_detach_terminal_exact(&admission[1].ref),
 				 PCM_X_QUEUE_NOT_READY);
 	UT_ASSERT_EQ(header->fully_retired_ticket_id, 0);
@@ -8292,6 +8457,15 @@ UT_TEST(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage)
 	UT_ASSERT_EQ(cluster_pcm_x_master_cancel_exact(&admission[0].ref), PCM_X_QUEUE_OK);
 	drain_retire_and_detach_master(&admission[0]);
 	UT_ASSERT_EQ(header->fully_retired_ticket_id, 1);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(&admission[1].ref,
+															 PCM_X_TERMINAL_LEG_RETIRE, 1,
+															 responder_session, &retire_token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_retire_ack_exact(
+					 &retire_ack0, 0, header->peer_frontiers[0].sender_session_incarnation),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_master_retire_ack_exact(&retire_ack1, 1, responder_session),
+				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_master_detach_terminal_exact(&admission[1].ref), PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(header->fully_retired_ticket_id, 2);
 	UT_ASSERT_EQ(cluster_pcm_x_master_cancel_exact(&admission[2].ref), PCM_X_QUEUE_OK);
@@ -8332,6 +8506,64 @@ UT_TEST(test_master_terminal_work_scan_covers_younger_tickets)
 	UT_ASSERT_EQ(
 		cluster_pcm_x_master_terminal_work_next_after(admission[2].ref.handle.ticket_id, &work),
 		PCM_X_QUEUE_NOT_FOUND);
+}
+
+UT_TEST(test_younger_terminal_can_drain_but_cannot_retire_past_live_prefix)
+{
+	PcmXShmemHeader *header;
+	PcmXMasterAdmission admission[2];
+	PcmXMasterTicketSlot before;
+	PcmXMasterTicketSlot *ticket;
+	PcmXTerminalLegToken token;
+	PcmXTerminalLegToken zero_token;
+	PcmXRetirePayload retire_key;
+	PcmXSlotRef found;
+	uint64 responder_session;
+	int i;
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	for (i = 0; i < 2; i++) {
+		PcmXEnqueuePayload request
+			= make_enqueue(make_wait_identity(708, i, (uint32)(27 + i), UINT64_C(6201) + i),
+						   UINT64_C(1201) + i, UINT64_C(1));
+
+		bind_enqueue_peer(&request);
+		UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &admission[i]), PCM_X_QUEUE_OK);
+		UT_ASSERT_EQ(cluster_pcm_x_master_admit_confirm_exact(&admission[i].ref, UINT64_C(400) + i),
+					 PCM_X_QUEUE_OK);
+	}
+
+	/*
+	 * Ticket N+1 remains live.  Cross-lane retry may drain terminal N+2,
+	 * but publishing cumulative RETIRE(N+2) would poison the source frontier
+	 * and make later evidence for N+1 look retired before it ever existed.
+	 */
+	UT_ASSERT_EQ(cluster_pcm_x_master_cancel_exact(&admission[1].ref), PCM_X_QUEUE_OK);
+	responder_session = header->peer_frontiers[1].sender_session_incarnation;
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(&admission[1].ref,
+															 PCM_X_TERMINAL_LEG_DRAIN, 1,
+															 responder_session, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_ack_exact(
+					 &admission[1].ref, PCM_X_TERMINAL_LEG_DRAIN, 1, responder_session),
+				 PCM_X_QUEUE_OK);
+	ticket = &master_ticket_slots(header)[admission[1].ticket_slot.slot_index];
+	UT_ASSERT_EQ(test_slot_state(&ticket->slot), PCM_XT_RETIRE_CREDIT);
+	before = *ticket;
+	memset(&zero_token, 0, sizeof(zero_token));
+	retire_key = make_retire_ack(&admission[1].ref, 1);
+
+	UT_ASSERT_EQ(cluster_pcm_x_master_terminal_leg_arm_exact(&admission[1].ref,
+															 PCM_X_TERMINAL_LEG_RETIRE, 1,
+															 responder_session, &token),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT(memcmp(&token, &zero_token, sizeof(token)) == 0);
+	UT_ASSERT(memcmp(ticket, &before, sizeof(before)) == 0);
+	UT_ASSERT_EQ(cluster_pcm_x_directory_find(PCM_X_DIR_MASTER_TICKET_RETIRE, &retire_key, &found),
+				 PCM_X_DIRECTORY_NOT_FOUND);
+	UT_ASSERT_EQ(header->fully_retired_ticket_id, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
 }
 
 UT_TEST(test_master_prehandle_cancel_replays_exactly_and_never_hits_reused_slot)
@@ -9174,14 +9406,14 @@ UT_TEST(test_master_tag_survives_until_every_terminal_ticket_detaches)
 		UT_ASSERT_EQ(cluster_pcm_x_master_cancel_exact(&admission[i].ref), PCM_X_QUEUE_OK);
 		arm_and_ack_master_terminal_leg(&admission[i].ref, PCM_X_TERMINAL_LEG_DRAIN,
 										admission[i].ref.identity.node_id);
-		arm_and_ack_master_terminal_leg(&admission[i].ref, PCM_X_TERMINAL_LEG_RETIRE,
-										admission[i].ref.identity.node_id);
 	}
 	UT_ASSERT_EQ(tag_slot->head_index, PCM_X_INVALID_SLOT_INDEX);
 	UT_ASSERT_EQ(tag_slot->tail_index, PCM_X_INVALID_SLOT_INDEX);
 	UT_ASSERT_EQ(tag_slot->active_index, PCM_X_INVALID_SLOT_INDEX);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&tag_slot->queued_node_bitmap), 0);
 	for (i = 0; i < 3; i++) {
+		arm_and_ack_master_terminal_leg(&admission[i].ref, PCM_X_TERMINAL_LEG_RETIRE,
+										admission[i].ref.identity.node_id);
 		UT_ASSERT_EQ(cluster_pcm_x_master_detach_terminal_exact(&admission[i].ref), PCM_X_QUEUE_OK);
 		UT_ASSERT_EQ(header->fully_retired_ticket_id, (uint64)i + 1);
 		UT_ASSERT_EQ(tag_slot->outstanding_ticket_count, (Size)(2 - i));
@@ -9707,6 +9939,56 @@ UT_TEST(test_writer_and_holder_owner_exit_retry_preserves_exact_evidence)
 					 sizeof(writer_before))
 			  == 0);
 	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
+UT_TEST(test_local_barrier_reject_preserves_exact_then_open_drain)
+{
+	PcmXLocalHolderKey holder_key;
+	PcmXLocalHolderHandle holder;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot holder_before;
+	LWLock content_lock;
+	uint32 state_flags;
+	Size holder_used_before;
+
+	init_active_pcm_x(UINT64_C(179));
+	bind_local_master(1, UINT64_C(9), UINT64_C(8179));
+	holder_key = make_local_holder_key(813, 0, 27, UINT64_C(81301), 1);
+	UT_ASSERT_EQ(register_active_local_holder(&holder_key, &holder), PCM_X_QUEUE_OK);
+	tag_slot = &local_tag_slots(ClusterPcmXConvertShmem)[holder.tag_slot.slot_index];
+	holder_before = membership_slots(ClusterPcmXConvertShmem)[holder.holder_slot.slot_index];
+	holder_used_before = ClusterPcmXConvertShmem->allocator[PCM_X_ALLOC_LOCAL_HOLDER].used;
+	memset(&content_lock, 0, sizeof(content_lock));
+
+	/*
+	 * Model the retry side of a closed cleanup gate: refusal must preserve
+	 * the exact holder bytes and allocator ownership so bufmgr can keep its
+	 * ledger DEFERRED.  Once the gate opens, the same handle drains to the
+	 * shared UNUSED baseline without minting a replacement identity.
+	 */
+	state_flags = pg_atomic_read_u32(&tag_slot->slot.state_flags);
+	pg_atomic_write_u32(&tag_slot->slot.state_flags,
+						state_flags | (PCM_X_LOCAL_TAG_F_ADMISSION_GATE << PCM_X_SLOT_FLAGS_SHIFT));
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_exceptional_detach_exact(&holder, &content_lock),
+				 PCM_X_QUEUE_GATE_RETRY);
+	UT_ASSERT(memcmp(&holder_before,
+					 &membership_slots(ClusterPcmXConvertShmem)[holder.holder_slot.slot_index],
+					 sizeof(holder_before))
+			  == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->allocator[PCM_X_ALLOC_LOCAL_HOLDER].used,
+				 holder_used_before);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	pg_atomic_write_u32(&tag_slot->slot.state_flags, state_flags);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_exceptional_detach_exact(&holder, &content_lock),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		test_slot_state(
+			&membership_slots(ClusterPcmXConvertShmem)[holder.holder_slot.slot_index].slot),
+		PCM_XL_FREE);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->allocator[PCM_X_ALLOC_LOCAL_HOLDER].used,
+				 holder_used_before - 1);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
 }
 
 UT_TEST(test_local_wfg_rejects_completed_blocker_semantic_aba)
@@ -10971,16 +11253,12 @@ UT_TEST(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier)
  * Defense probes for the cross-lane retirement exemption: it must stay
  * strictly cross-lane.  A holder lane that aliases the writer lane's ref (or
  * collides with its ticket id) keeps the pre-exemption NOT_READY verdict.
- * Both alias states are protocol-impossible (master tickets are unique and
- * same-ref forms route through the same-ref-dual path), so they are built by
- * direct slot pokes like the CORRUPT arms elsewhere in this file.  A distinct
- * OLDER writer-lane ref, however, is legal (a cancelled predecessor leader's
- * duplicate-ACK tombstone lingers in tag_slot->ref until the successor's
- * ENQUEUE arm retires it), so the exemption deliberately has no ticket-order
- * requirement: refusing there could wedge the empty-frozen path permanently
- * if the successor dies before arming.
+ * All three protocol-impossible alias/residual states are built by direct
+ * slot pokes like the CORRUPT arms elsewhere in this file.  A distinct
+ * covered writer ref is not a cancellation exception: real cancel ACK sets
+ * TERMINAL_READY and real RETIRE clears the ref and terminal mask together.
  */
-UT_TEST(test_local_cross_lane_retire_exemption_requires_distinct_ticket)
+UT_TEST(test_local_cross_lane_retire_refuses_any_covered_writer_ref)
 {
 	TestLocalCrossLaneWedge fixture;
 	PcmXLocalTagSlot *tag_slot;
@@ -10998,31 +11276,390 @@ UT_TEST(test_local_cross_lane_retire_exemption_requires_distinct_ticket)
 	retire.retire_through_ticket_id = fixture.external_ref.handle.ticket_id;
 	retire.sender_node = 0;
 
-	/* Sub-case order matters: the two NOT_READY alias probes must run before
-	 * the distinct-older-ticket case, which consumes the holder lane. */
-
 	/* Full alias: writer lane ref == external holder lane ref. */
 	tag_slot->ref = fixture.external_ref;
 	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
-				 PCM_X_QUEUE_NOT_READY);
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
 
 	/* Ticket-id collision under a distinct identity. */
+	prepare_local_cross_lane_wedge(7116, master_session, UINT64_C(95001), UINT64_C(95002),
+								   &fixture);
+	tag_slot = fixture.tag_slot;
+	saved_ref = tag_slot->ref;
 	tag_slot->ref = saved_ref;
 	tag_slot->ref.handle.ticket_id = fixture.external_ref.handle.ticket_id;
 	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
-				 PCM_X_QUEUE_NOT_READY);
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
 
-	/* Distinct older writer-lane ref (cancelled-predecessor tombstone shape):
-	 * the exemption must still let the external holder lane retire. */
+	/* Distinct covered writer-lane ref cannot masquerade as a tombstone. */
+	prepare_local_cross_lane_wedge(7116, master_session, UINT64_C(95001), UINT64_C(95002),
+								   &fixture);
+	tag_slot = fixture.tag_slot;
+	saved_ref = tag_slot->ref;
 	tag_slot->ref = saved_ref;
 	tag_slot->ref.handle.ticket_id = fixture.external_ref.handle.ticket_id - 1;
 	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
-				 PCM_X_QUEUE_OK);
-	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK, 0);
-	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
-	tag_slot->ref = saved_ref;
-	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK,
+				 PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK);
 }
+
+
+UT_TEST(test_local_fresh_retire_canonical_live_writer_shape_is_exact)
+{
+	TestLocalCrossLaneWedge fixture;
+	PcmXLocalMembershipSlot *writer;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1812);
+	int arm;
+
+	for (arm = 0; arm < 6; arm++) {
+		prepare_local_cross_lane_wedge((BlockNumber)(7126 + arm), master_session,
+									   UINT64_C(95201), UINT64_C(95202), &fixture);
+		writer = &membership_slots(ClusterPcmXConvertShmem)
+					  [fixture.writer.membership_slot.slot_index];
+		memset(&retire, 0, sizeof(retire));
+		retire.cluster_epoch = fixture.admit_ack.ref.identity.cluster_epoch;
+		retire.master_session_incarnation = master_session;
+		retire.retire_through_ticket_id = fixture.admit_ack.ref.handle.ticket_id;
+		retire.sender_node = 0;
+		switch (arm) {
+			case 0: /* exact live leader is an ordinary prefix blocker */
+				break;
+			case 1:
+				test_set_slot_state(&writer->slot, PCM_XL_CANCELLED);
+				break;
+			case 2:
+				fixture.tag_slot->head_index = PCM_X_INVALID_SLOT_INDEX;
+				break;
+			case 3:
+				writer->tag_slot_generation++;
+				break;
+			case 4:
+				writer->role = PCM_X_LOCAL_ROLE_FOLLOWER;
+				break;
+			case 5:
+				writer->graph_generation = UINT64_C(1);
+				break;
+		}
+		UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+					 arm == 0 ? PCM_X_QUEUE_NOT_READY : PCM_X_QUEUE_CORRUPT);
+		UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state,
+					 arm == 0 ? PCM_X_RUNTIME_ACTIVE : PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	}
+}
+
+
+/*
+ * A PREPARE_GRANT installs the positive grant ref and immutable image before
+ * INSTALL_READY advances the member out of REMOTE_WAIT.  That is a canonical
+ * live writer, not unexplained covered authority: a newer fresh RETIRE must
+ * wait with zero mutation.  The post-frontier duplicate guard remains stricter
+ * and is covered independently below.
+ */
+UT_TEST(test_local_fresh_retire_waits_for_prepared_remote_writer)
+{
+	TestLocalCrossLaneWedge fixture;
+	PcmXLocalMembershipSlot member_before;
+	PcmXLocalMembershipSlot *writer;
+	PcmXLocalTagSlot tag_before;
+	PcmXGrantPayload prepare;
+	PcmXRetirePayload retire;
+	uint32 tag_flags_before;
+	const uint64 master_session = UINT64_C(1816);
+
+	prepare_local_cross_lane_wedge(7132, master_session, UINT64_C(95301), UINT64_C(95302),
+								   &fixture);
+	memset(&prepare, 0, sizeof(prepare));
+	prepare.ref = fixture.admit_ack.ref;
+	prepare.ref.grant_generation = UINT64_C(103);
+	UT_ASSERT(
+		cluster_pcm_x_image_id_encode(1, master_session + UINT64_C(200), &prepare.image.image_id));
+	prepare.image.source_own_generation = UINT64_C(9);
+	prepare.image.page_scn = UINT64_C(10);
+	prepare.image.page_lsn = UINT64_C(11);
+	prepare.image.source_node = 2;
+	prepare.image.page_checksum = UINT32_C(12);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_prepare_grant_exact(&fixture.writer, &prepare, 1, master_session),
+		PCM_X_QUEUE_OK);
+
+	writer = &membership_slots(ClusterPcmXConvertShmem)
+				  [fixture.writer.membership_slot.slot_index];
+	UT_ASSERT_EQ(test_slot_state(&writer->slot), PCM_XL_REMOTE_WAIT);
+	UT_ASSERT_EQ(fixture.tag_slot->ref.grant_generation, prepare.ref.grant_generation);
+	UT_ASSERT_EQ(fixture.tag_slot->reliable.last_response_opcode,
+				 PGRAC_IC_MSG_PCM_X_PREPARE_GRANT);
+	tag_before = *fixture.tag_slot;
+	tag_flags_before = pg_atomic_read_u32(&tag_before.slot.state_flags);
+	member_before = *writer;
+
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = prepare.ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = prepare.ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&fixture.tag_slot->slot.state_flags), tag_flags_before);
+	UT_ASSERT(memcmp(fixture.tag_slot, &tag_before, sizeof(tag_before)) == 0);
+	UT_ASSERT(memcmp(writer, &member_before, sizeof(member_before)) == 0);
+
+	/* Rebase publication is another legal point in the same PREPARE-to-
+	 * INSTALL window.  RETIRE must keep treating the exact writer as a live
+	 * blocker without consuming or rewriting the published effective base. */
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(8)),
+		PCM_X_QUEUE_OK);
+	tag_before = *fixture.tag_slot;
+	tag_flags_before = pg_atomic_read_u32(&tag_before.slot.state_flags);
+	member_before = *writer;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterPcmXConvertShmem->local_retire_gate), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&fixture.tag_slot->slot.state_flags), tag_flags_before);
+	UT_ASSERT(memcmp(fixture.tag_slot, &tag_before, sizeof(tag_before)) == 0);
+	UT_ASSERT(memcmp(writer, &member_before, sizeof(member_before)) == 0);
+}
+
+
+/*
+ * The positive-grant REMOTE_WAIT exception is deliberately narrow.  Every
+ * field below is written or constrained by PREPARE_GRANT/rebase publication;
+ * unexplained residue must still fail the runtime closed instead of turning
+ * into an unbounded fresh-retire wait.
+ */
+UT_TEST(test_local_fresh_retire_rejects_malformed_prepared_remote_writer)
+{
+	TestLocalCrossLaneWedge fixture;
+	PcmXGrantPayload prepare;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1817);
+	int arm;
+
+	for (arm = 0; arm < 9; arm++) {
+		prepare_local_cross_lane_wedge((BlockNumber)(7133 + arm), master_session,
+									   UINT64_C(95401), UINT64_C(95402), &fixture);
+		memset(&prepare, 0, sizeof(prepare));
+		prepare.ref = fixture.admit_ack.ref;
+		prepare.ref.grant_generation = UINT64_C(104);
+		UT_ASSERT(cluster_pcm_x_image_id_encode(
+			1, master_session + UINT64_C(201) + (uint64)arm, &prepare.image.image_id));
+		prepare.image.source_own_generation = UINT64_C(9);
+		prepare.image.page_scn = UINT64_C(10);
+		prepare.image.page_lsn = UINT64_C(11);
+		prepare.image.source_node = 2;
+		prepare.image.page_checksum = UINT32_C(12);
+		UT_ASSERT_EQ(
+			cluster_pcm_x_local_prepare_grant_exact(&fixture.writer, &prepare, 1, master_session),
+			PCM_X_QUEUE_OK);
+
+		switch (arm) {
+			case 0:
+				fixture.tag_slot->reliable.last_response_opcode
+					= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK;
+				break;
+			case 1:
+				fixture.tag_slot->reliable.last_responder_node = 2;
+				break;
+			case 2:
+				fixture.tag_slot->image.image_id = 0;
+				break;
+			case 3:
+				fixture.tag_slot->reliable.pending_opcode
+					= PGRAC_IC_MSG_PCM_X_INSTALL_READY;
+				break;
+			case 4:
+				fixture.tag_slot->committed_own_generation = UINT64_C(1);
+				break;
+			case 5:
+				fixture.tag_slot->grant_base_own_generation = UINT64_MAX;
+				break;
+			case 6:
+				fixture.tag_slot->active_writer_index = PCM_X_INVALID_SLOT_INDEX;
+				fixture.tag_slot->active_writer_slot_generation = 0;
+				break;
+			case 7:
+				fixture.tag_slot->reliable.state_sequence = 0;
+				break;
+			case 8:
+				fixture.tag_slot->prehandle.prehandle_sequence = 0;
+				break;
+		}
+
+		memset(&retire, 0, sizeof(retire));
+		retire.cluster_epoch = prepare.ref.identity.cluster_epoch;
+		retire.master_session_incarnation = master_session;
+		retire.retire_through_ticket_id = prepare.ref.handle.ticket_id;
+		retire.sender_node = 0;
+		UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+					 PCM_X_QUEUE_CORRUPT);
+		UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	}
+}
+
+
+typedef struct TestLocalCancelledPredecessorTombstone {
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *successor;
+	PcmXLocalHandle promoted;
+	PcmXTicketRef tombstone;
+	PcmXPrehandleKey prehandle;
+	PcmXRetirePayload retire;
+	uint64 reliable_sequence;
+} TestLocalCancelledPredecessorTombstone;
+
+/*
+ * Build the real cancellation lifecycle through the production rotation:
+ * PREHANDLE_CANCEL_ACK unlinks the old leader, preserves its exact ref as
+ * terminal replay evidence, and promotes one untouched follower to
+ * NODE_LEADER.  The successor has never received an ADMIT_ACK or claimed the
+ * writer lane, so its ticket handle and active claim are both zero.  The first
+ * RETIRE must consume the cancelled membership, ref, reliable response and
+ * terminal flags in one local transaction.
+ */
+static void
+prepare_local_cancelled_predecessor_tombstone(BlockNumber block, uint64 master_session,
+											  TestLocalCancelledPredecessorTombstone *fixture)
+{
+	PcmXShmemHeader *header;
+	PcmXWaitIdentity leader_identity;
+	PcmXWaitIdentity follower_identity;
+	PcmXLocalHandle leader;
+	PcmXLocalHandle follower;
+	PcmXLocalHandle promoted;
+	PcmXEnqueuePayload enqueue;
+	PcmXPrehandleCancelPayload cancel;
+	PcmXAdmitAckPayload ack;
+	PcmXDrainPollPayload poll;
+	PcmXLocalReliableToken token;
+
+	UT_ASSERT_NOT_NULL(fixture);
+	memset(fixture, 0, sizeof(*fixture));
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	bind_local_master(1, UINT64_C(9), master_session);
+	leader_identity = make_wait_identity(block, 0, 27, master_session + UINT64_C(1));
+	follower_identity = make_wait_identity(block, 0, 28, master_session + UINT64_C(2));
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&leader_identity, 1, master_session, &leader),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&follower_identity, 1, master_session, &follower),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&leader, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_prehandle_cancel_arm_exact(&leader, &cancel, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&ack, 0, sizeof(ack));
+	ack.ref.identity = leader_identity;
+	ack.ref.handle.ticket_id = UINT64_C(95100);
+	ack.ref.handle.queue_generation = UINT64_C(19);
+	ack.prehandle = cancel.prehandle;
+	ack.result = PCM_X_QUEUE_OK;
+	ack.phase = PCM_X_LOCAL_RELIABLE_PHASE_PREHANDLE_CANCEL;
+	UT_ASSERT_EQ(cluster_pcm_x_local_prehandle_cancel_ack_exact(
+					 &leader, &ack, 1, master_session, &promoted),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT(slot_refs_equal(promoted.membership_slot, follower.membership_slot));
+	fixture->tag_slot = &local_tag_slots(header)[promoted.tag_slot.slot_index];
+	fixture->tombstone = ack.ref;
+	fixture->prehandle = fixture->tag_slot->prehandle;
+	fixture->reliable_sequence = fixture->tag_slot->reliable.state_sequence;
+
+	memset(&poll, 0, sizeof(poll));
+	poll.ref = ack.ref;
+	poll.drain_generation = UINT64_C(1);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
+	memset(&fixture->retire, 0, sizeof(fixture->retire));
+	fixture->retire.cluster_epoch = ack.ref.identity.cluster_epoch;
+	fixture->retire.master_session_incarnation = master_session;
+	fixture->retire.retire_through_ticket_id = ack.ref.handle.ticket_id;
+	fixture->retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&fixture->retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+
+	fixture->successor = &membership_slots(header)[promoted.membership_slot.slot_index];
+	fixture->promoted = promoted;
+	UT_ASSERT(ticket_refs_equal(&fixture->tag_slot->ref, &(PcmXTicketRef){ 0 }));
+	UT_ASSERT_EQ(fixture->tag_slot->reliable.last_response_opcode, 0);
+	UT_ASSERT_EQ(test_slot_flags(&fixture->tag_slot->slot) & PCM_X_LOCAL_TAG_F_TERMINAL_MASK, 0);
+	UT_ASSERT_EQ(fixture->tag_slot->membership_count, 1);
+	UT_ASSERT_EQ(fixture->tag_slot->head_index, promoted.membership_slot.slot_index);
+	UT_ASSERT_EQ(fixture->tag_slot->tail_index, promoted.membership_slot.slot_index);
+	UT_ASSERT_EQ(fixture->tag_slot->leader_index, promoted.membership_slot.slot_index);
+	UT_ASSERT_EQ(fixture->tag_slot->active_writer_index, PCM_X_INVALID_SLOT_INDEX);
+	UT_ASSERT_EQ(fixture->tag_slot->active_writer_slot_generation, 0);
+	UT_ASSERT_EQ(test_slot_state(&fixture->successor->slot), PCM_XL_NODE_LEADER);
+	UT_ASSERT_EQ(fixture->successor->handle.ticket_id, 0);
+	UT_ASSERT_EQ(fixture->successor->handle.queue_generation, 0);
+	UT_ASSERT_EQ(fixture->successor->graph_generation, 0);
+}
+
+
+static void
+inject_local_cancel_tombstone_appearance(TestLocalCancelledPredecessorTombstone *fixture)
+{
+	fixture->tag_slot->ref = fixture->tombstone;
+	fixture->tag_slot->prehandle = fixture->prehandle;
+	memset(&fixture->tag_slot->reliable, 0, sizeof(fixture->tag_slot->reliable));
+	fixture->tag_slot->reliable.state_sequence = fixture->reliable_sequence;
+	fixture->tag_slot->reliable.last_responder_node = 1;
+	fixture->tag_slot->reliable.last_response_opcode
+		= PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL_ACK;
+}
+
+
+UT_TEST(test_local_cancel_rotation_retire_consumes_tombstone_before_duplicate)
+{
+	TestLocalCancelledPredecessorTombstone fixture;
+	const uint64 master_session = UINT64_C(1810);
+
+	prepare_local_cancelled_predecessor_tombstone(7117, master_session, &fixture);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&fixture.retire, 1, master_session),
+				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT(ticket_refs_equal(&fixture.tag_slot->ref, &(PcmXTicketRef){ 0 }));
+}
+
+
+/*
+ * Recreate the formerly exempted appearance only after the real rotation and
+ * RETIRE proved that production consumes it: cancellation response fields,
+ * a covered old ref, and an otherwise canonical idle successor.  This is
+ * unexplained post-frontier authority and duplicate RETIRE must fuse.
+ */
+UT_TEST(test_local_duplicate_retire_guard_rejects_cancel_tombstone_appearance)
+{
+	TestLocalCancelledPredecessorTombstone fixture;
+	PcmXEnqueuePayload enqueue;
+	PcmXLocalReliableToken token;
+	const uint64 master_session = UINT64_C(1811);
+
+	prepare_local_cancelled_predecessor_tombstone(7118, master_session, &fixture);
+	inject_local_cancel_tombstone_appearance(&fixture);
+	UT_ASSERT_EQ(test_slot_state(&fixture.successor->slot), PCM_XL_NODE_LEADER);
+	UT_ASSERT_EQ(fixture.successor->handle.ticket_id, 0);
+	UT_ASSERT_EQ(fixture.tag_slot->active_writer_index, PCM_X_INVALID_SLOT_INDEX);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&fixture.promoted, &enqueue, &token),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT(ticket_refs_equal(&fixture.tag_slot->ref, &fixture.tombstone));
+
+	prepare_local_cancelled_predecessor_tombstone(7119, master_session, &fixture);
+	inject_local_cancel_tombstone_appearance(&fixture);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&fixture.retire, 1, master_session),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT(ticket_refs_equal(&fixture.tag_slot->ref, &fixture.tombstone));
+}
+
 
 typedef struct TestLocalIndependentDualTerminal {
 	PcmXLocalHandle writer;
@@ -11734,6 +12371,116 @@ UT_TEST(test_local_older_holder_retires_without_waking_completed_newer_writer)
 	assert_local_queue_baseline(ClusterPcmXConvertShmem);
 }
 
+/*
+ * S3-P0-17 behavior RED (r24 SMOKE3, tag 16952): the inverse ticket order
+ * can reach DRAIN on both independent lanes before the master's prefix
+ * RETIRE for the older holder arrives.  The older holder must retire without
+ * consuming or rewriting the newer writer terminal; otherwise the writer
+ * terminal blocks holder detach while the prefix blocks writer detach and
+ * the tag wedges forever.
+ */
+UT_TEST(test_local_older_holder_retires_before_newer_drained_writer)
+{
+	TestLocalIndependentDualTerminal fixture;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *writer_member;
+	PcmXLocalMembershipSlot writer_member_before;
+	PcmXTicketRef writer_ref_before;
+	PcmXImageToken writer_image_before;
+	PcmXReliableLegState writer_reliable_before;
+	PcmXPrehandleKey writer_prehandle_before;
+	PcmXRetirePayload retire;
+	PcmXQueueResult result;
+	uint64 writer_drain_before;
+	uint64 committed_own_before;
+	uint64 cutoff_sequence_before;
+	uint64 next_sequence_before;
+	Size membership_before;
+	Size closed_before;
+	Size head_before;
+	Size tail_before;
+	Size leader_before;
+	Size active_writer_before;
+	uint32 local_round_before;
+	const uint64 master_session = UINT64_C(1841);
+
+	/* Exact field ordering from the r24 wedge: holder 3149 < writer 3174,
+	 * while both lanes already carry independent terminal+DRAIN proof. */
+	prepare_local_independent_dual_terminal(
+		7169, master_session, UINT64_C(3174), UINT64_C(3149), false, &fixture);
+	tag_slot = fixture.tag_slot;
+	writer_member
+		= &membership_slots(ClusterPcmXConvertShmem)[fixture.writer.membership_slot.slot_index];
+	writer_member_before = *writer_member;
+	writer_ref_before = tag_slot->ref;
+	writer_image_before = tag_slot->image;
+	writer_reliable_before = tag_slot->reliable;
+	writer_prehandle_before = tag_slot->prehandle;
+	writer_drain_before = tag_slot->terminal_drain_generation;
+	committed_own_before = tag_slot->committed_own_generation;
+	cutoff_sequence_before = tag_slot->cutoff_sequence;
+	next_sequence_before = tag_slot->next_sequence;
+	membership_before = tag_slot->membership_count;
+	closed_before = tag_slot->closed_round_member_count;
+	head_before = tag_slot->head_index;
+	tail_before = tag_slot->tail_index;
+	leader_before = tag_slot->leader_index;
+	active_writer_before = tag_slot->active_writer_index;
+	local_round_before = tag_slot->local_round;
+
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	result = cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session);
+	UT_ASSERT_EQ(result, PCM_X_QUEUE_OK);
+	if (result != PCM_X_QUEUE_OK)
+		return; /* keep the old-code RED to one behavior failure */
+
+	/* Only holder-lane evidence is consumed. */
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot),
+				 PCM_X_LOCAL_TAG_F_REVOKE_BARRIER | PCM_X_LOCAL_TAG_F_TERMINAL_MASK);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->holder_ref, &(PcmXTicketRef){ 0 }));
+	UT_ASSERT(memcmp(&tag_slot->holder_image, &(PcmXImageToken){ 0 },
+					 sizeof(tag_slot->holder_image))
+			  == 0);
+	UT_ASSERT(memcmp(&tag_slot->holder_reliable, &(PcmXReliableLegState){ 0 },
+					 sizeof(tag_slot->holder_reliable))
+			  == 0);
+	UT_ASSERT_EQ(tag_slot->holder_terminal_drain_generation, 0);
+
+	/* Newer writer lane and its complete FIFO/round identity stay byte-exact. */
+	UT_ASSERT(ticket_refs_equal(&tag_slot->ref, &writer_ref_before));
+	UT_ASSERT(memcmp(&tag_slot->image, &writer_image_before, sizeof(writer_image_before)) == 0);
+	UT_ASSERT(
+		memcmp(&tag_slot->reliable, &writer_reliable_before, sizeof(writer_reliable_before)) == 0);
+	UT_ASSERT(
+		memcmp(&tag_slot->prehandle, &writer_prehandle_before, sizeof(writer_prehandle_before))
+		== 0);
+	UT_ASSERT_EQ(tag_slot->terminal_drain_generation, writer_drain_before);
+	UT_ASSERT_EQ(tag_slot->committed_own_generation, committed_own_before);
+	UT_ASSERT_EQ(tag_slot->cutoff_sequence, cutoff_sequence_before);
+	UT_ASSERT_EQ(tag_slot->next_sequence, next_sequence_before);
+	UT_ASSERT_EQ(tag_slot->membership_count, membership_before);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, closed_before);
+	UT_ASSERT_EQ(tag_slot->head_index, head_before);
+	UT_ASSERT_EQ(tag_slot->tail_index, tail_before);
+	UT_ASSERT_EQ(tag_slot->leader_index, leader_before);
+	UT_ASSERT_EQ(tag_slot->active_writer_index, active_writer_before);
+	UT_ASSERT_EQ(tag_slot->local_round, local_round_before);
+	UT_ASSERT(memcmp(writer_member, &writer_member_before, sizeof(writer_member_before)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retired_ticket_id,
+				 fixture.holder_ref.handle.ticket_id);
+
+	/* The next prefix then consumes the preserved writer terminal exactly. */
+	retire.retire_through_ticket_id = fixture.writer_ref.handle.ticket_id;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
+}
+
 /* The retryable ordering is exact, not a general WRITER_COMPLETE exemption.
  * Any unknown tag flag remains structural corruption and keeps the RETIRE
  * episode witness for recovery. */
@@ -12329,7 +13076,8 @@ static void prepare_local_rebase_fixture(BlockNumber block, uint64 master_sessio
 static void
 prepare_local_rebase_fixture_with_follower(BlockNumber block, uint64 master_session,
 										   TestLocalRebaseFixture *fixture,
-										   PcmXLocalHandle *same_round_follower_out)
+										   PcmXLocalHandle *same_round_follower_out,
+										   PcmXLocalHandle *second_same_round_follower_out)
 {
 	PcmXLocalHolderKey holder_key;
 	PcmXLocalHolderHandle holder;
@@ -12367,6 +13115,18 @@ prepare_local_rebase_fixture_with_follower(BlockNumber block, uint64 master_sess
 													same_round_follower_out),
 					 PCM_X_QUEUE_OK);
 		UT_ASSERT_EQ(same_round_follower_out->role, PCM_X_LOCAL_ROLE_FOLLOWER);
+	}
+	if (second_same_round_follower_out != NULL) {
+		PcmXWaitIdentity follower_identity;
+
+		UT_ASSERT_NOT_NULL(same_round_follower_out);
+		follower_identity
+			= make_wait_identity(block, 0, 5, master_session + UINT64_C(4));
+		follower_identity.base_own_generation = UINT64_C(5);
+		UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&follower_identity, 1, master_session,
+													second_same_round_follower_out),
+					 PCM_X_QUEUE_OK);
+		UT_ASSERT_EQ(second_same_round_follower_out->role, PCM_X_LOCAL_ROLE_FOLLOWER);
 	}
 	UT_ASSERT_EQ(cluster_pcm_x_local_begin_revoke_cutoff_exact(&fixture->writer, &cutoff),
 				 PCM_X_QUEUE_OK);
@@ -12422,7 +13182,7 @@ static void
 prepare_local_rebase_fixture(BlockNumber block, uint64 master_session,
 							 TestLocalRebaseFixture *fixture)
 {
-	prepare_local_rebase_fixture_with_follower(block, master_session, fixture, NULL);
+	prepare_local_rebase_fixture_with_follower(block, master_session, fixture, NULL, NULL);
 }
 
 /*
@@ -12547,7 +13307,7 @@ UT_TEST(test_local_follower_claim_inherits_published_rebase)
 	ClusterPcmOwnSnapshot granted;
 	const uint64 master_session = UINT64_C(1815);
 
-	prepare_local_rebase_fixture_with_follower(7122, master_session, &fixture, &follower);
+	prepare_local_rebase_fixture_with_follower(7122, master_session, &fixture, &follower, NULL);
 	UT_ASSERT_EQ(cluster_pcm_x_local_grant_rebase_publish_exact(&fixture.writer, UINT64_C(8)),
 				 PCM_X_QUEUE_OK);
 
@@ -12586,6 +13346,135 @@ UT_TEST(test_local_follower_claim_inherits_published_rebase)
 	granted.pcm_state = (uint8)PCM_STATE_X;
 	UT_ASSERT(cluster_pcm_x_writer_grant_snapshot_exact(&follower_claim, &granted, &granted));
 }
+
+
+/*
+ * RED (S3-P0-11): a completed same-round follower has no master ticket of its
+ * own, so leaving it linked behind the terminal leader makes DRAIN wait forever
+ * on closed_round_member_count > 1.  One exact DRAIN retry may consume at most
+ * one such follower and still return NOT_READY; the next retry then publishes
+ * the leader terminal from the canonical one-member closed cohort.
+ */
+UT_TEST(test_local_drain_converges_completed_same_round_follower)
+{
+	TestLocalRebaseFixture fixture;
+	PcmXInstallReadyPayload install_ready;
+	PcmXPhasePayload commit;
+	PcmXFinalAckPayload final_ack;
+	PcmXPhasePayload final_commit;
+	PcmXPhasePayload final_confirm;
+	PcmXLocalFollowerWfgSnapshot follower_wfg;
+	PcmXLocalFollowerWfgSnapshot late_wfg;
+	PcmXLocalReliableToken token;
+	PcmXLocalHandle follower;
+	PcmXLocalHandle follower2;
+	PcmXLocalHandle late;
+	PcmXLocalHandle next_leader;
+	PcmXLocalWriterClaim follower_claim;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXDrainPollPayload poll;
+	PcmXRetirePayload retire;
+	PcmXWaitIdentity late_identity;
+	PcmXSlotRef found;
+	const uint64 master_session = UINT64_C(1837);
+
+	prepare_local_rebase_fixture_with_follower(7130, master_session, &fixture, &follower,
+											   &follower2);
+	tag_slot = fixture.tag_slot;
+	late_identity = make_wait_identity(7130, 0, 6, master_session + UINT64_C(5));
+	late_identity.base_own_generation = UINT64_C(5);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&late_identity, 1, master_session, &late),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(late.role, PCM_X_LOCAL_ROLE_FOLLOWER);
+	UT_ASSERT_EQ(late.local_round, fixture.writer.local_round + 1);
+	UT_ASSERT_EQ(cluster_pcm_x_local_follower_wfg_snapshot_exact(&late, &late_wfg),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_follower_wfg_commit_exact(&late_wfg, UINT64_C(911)),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_follower_wfg_snapshot_exact(&follower, &follower_wfg),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_follower_wfg_commit_exact(&follower_wfg, UINT64_C(912)),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_install_ready_arm_exact(&fixture.writer, &fixture.prepare.ref,
+															 &fixture.prepare.image, &install_ready,
+															 &token),
+				 PCM_X_QUEUE_OK);
+	memset(&commit, 0, sizeof(commit));
+	commit.ref = fixture.prepare.ref;
+	commit.phase = PGRAC_IC_MSG_PCM_X_COMMIT_X;
+	UT_ASSERT_EQ(cluster_pcm_x_local_commit_x_exact(&fixture.writer, &commit, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_final_ack_arm_exact(&fixture.writer, UINT64_C(6), &final_ack, &token),
+		PCM_X_QUEUE_OK);
+	memset(&final_commit, 0, sizeof(final_commit));
+	final_commit.ref = fixture.prepare.ref;
+	final_commit.phase = PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK;
+	UT_ASSERT_EQ(cluster_pcm_x_local_final_commit_ack_exact(&fixture.writer, &final_commit, 1,
+															master_session, &final_confirm, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_release_exact(&fixture.writer_claim),
+				 PCM_X_QUEUE_OK);
+	memset(&poll, 0, sizeof(poll));
+	poll.ref = fixture.prepare.ref;
+	poll.drain_generation = UINT64_C(43);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(tag_slot->membership_count, 4);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, 3);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(cluster_pcm_x_local_follower_wfg_clear_exact(&follower, UINT64_C(912)),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(&follower, &follower_claim),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_release_exact(&follower_claim), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(&follower2, &follower_claim),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_release_exact(&follower_claim), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(tag_slot->membership_count, 4);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, 3);
+
+	/* A live next-round edge keeps the whole completed suffix byte-exact. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(tag_slot->membership_count, 4);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, 3);
+	UT_ASSERT_EQ(cluster_pcm_x_local_follower_wfg_clear_exact(&late, UINT64_C(911)),
+				 PCM_X_QUEUE_OK);
+
+	/* Each retry retires only the tailmost completed member of the closed
+	 * prefix, so no surviving follower can retain an edge to a vanished slot. */
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(tag_slot->membership_count, 3);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, 2);
+	UT_ASSERT_EQ(cluster_pcm_x_directory_find(PCM_X_DIR_LOCAL_WAIT, &follower2.identity, &found),
+				 PCM_X_DIRECTORY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_x_directory_find(PCM_X_DIR_LOCAL_WAIT, &follower.identity, &found),
+				 PCM_X_DIRECTORY_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT_EQ(tag_slot->membership_count, 2);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, 1);
+	UT_ASSERT_EQ(cluster_pcm_x_directory_find(PCM_X_DIR_LOCAL_WAIT, &follower.identity, &found),
+				 PCM_X_DIRECTORY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_drain_poll_exact(&poll, 1, master_session), PCM_X_QUEUE_OK);
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.prepare.ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.prepare.ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_lookup_exact(&late.identity, &next_leader), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(next_leader.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
+	UT_ASSERT_EQ(cluster_pcm_x_local_cancel_exact(&next_leader, NULL), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_detach_terminal_exact(&next_leader), PCM_X_QUEUE_OK);
+	assert_local_queue_baseline(ClusterPcmXConvertShmem);
+}
+
 
 UT_TEST(test_local_cancelled_non_source_participant_gen0_drains_and_retires_exactly)
 {
@@ -16182,6 +17071,197 @@ UT_TEST(test_local_terminal_drain_retire_fences_successor_and_replays_watermark)
 		PCM_X_QUEUE_OK);
 }
 
+/*
+ * A tagless RETIRE watermark is also the replay fence for later tag-sharded
+ * PROBE/REVOKE work.  The decision must linearize under allocator_lock:
+ * either the transfer claims the tag admission gate first and RETIRE waits,
+ * or the committed exact frontier makes the old transfer RETIRED without
+ * allocating a new local tag.
+ */
+UT_TEST(test_local_post_frontier_transfer_cannot_rebuild_retired_tag)
+{
+	PcmXShmemHeader *header;
+	PcmXRevokePayload revoke;
+	const uint64 master_session = UINT64_C(7501);
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	memset(&revoke, 0, sizeof(revoke));
+	revoke.ref.identity = make_wait_identity(769, 0, 18, UINT64_C(75001));
+	revoke.ref.handle.ticket_id = UINT64_C(9601);
+	revoke.ref.handle.queue_generation = UINT64_C(11);
+	revoke.ref.grant_generation = UINT64_C(12);
+	UT_ASSERT(cluster_pcm_x_image_id_encode(1, UINT64_C(201), &revoke.image_id));
+	bind_local_master(1, revoke.ref.identity.cluster_epoch, master_session);
+	header->peer_frontiers[1].local_retired_ticket_id = revoke.ref.handle.ticket_id;
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_revoke_apply_exact(&revoke, 1, master_session),
+				 PCM_X_QUEUE_RETIRED);
+	UT_ASSERT_EQ(header->allocator[PCM_X_ALLOC_LOCAL_TAG].used, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&header->local_retire_gate), 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	/* A published but uncommitted newer RETIRE episode wins before prepare
+	 * inspects the tag directory.  It is retryable BUSY, never RETIRED. */
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id = UINT64_C(9602);
+	pg_atomic_write_u32(&header->local_retire_gate, 2);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_revoke_apply_exact(&revoke, 1, master_session),
+				 PCM_X_QUEUE_BUSY);
+	UT_ASSERT_EQ(header->allocator[PCM_X_ALLOC_LOCAL_TAG].used, 0);
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id = 0;
+	pg_atomic_write_u32(&header->local_retire_gate, 0);
+}
+
+
+/*
+ * The read-only replay proof is an exact peer-session frontier, not merely a
+ * ticket comparison.  A lower watermark is ordinary NOT_FOUND, an old
+ * epoch/session is STALE, and a live RETIRE marker is BUSY.  Once the exact
+ * frontier covers an absent ref, a different newer ticket on the same tag is
+ * unrelated authority and must remain untouched.
+ */
+UT_TEST(test_local_retired_ref_state_truth_table_is_exact)
+{
+	PcmXShmemHeader *header;
+	PcmXLocalHandle leader;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXTicketRef retired_ref;
+	PcmXTicketRef successor_ref;
+	PcmXWaitIdentity identity;
+	const uint64 master_session = UINT64_C(7506);
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	identity = make_wait_identity(772, 0, 23, UINT64_C(75006));
+	bind_local_master(1, identity.cluster_epoch, master_session);
+	memset(&retired_ref, 0, sizeof(retired_ref));
+	retired_ref.identity = identity;
+	retired_ref.handle.ticket_id = UINT64_C(9606);
+	retired_ref.handle.queue_generation = UINT64_C(13);
+	retired_ref.grant_generation = UINT64_C(14);
+
+	header->peer_frontiers[1].local_retired_ticket_id
+		= retired_ref.handle.ticket_id - 1;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retired_ref_state_exact(&retired_ref, 1, master_session),
+		PCM_X_QUEUE_NOT_FOUND);
+	header->peer_frontiers[1].local_retired_ticket_id = retired_ref.handle.ticket_id;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retired_ref_state_exact(&retired_ref, 1, master_session),
+		PCM_X_QUEUE_RETIRED);
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, master_session, &leader),
+				 PCM_X_QUEUE_OK);
+	tag_slot = &local_tag_slots(header)[leader.tag_slot.slot_index];
+	seed_live_local_holder_transfer(tag_slot, 24, UINT64_C(75007), UINT64_C(9607));
+	successor_ref = tag_slot->holder_ref;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retired_ref_state_exact(&retired_ref, 1, master_session),
+		PCM_X_QUEUE_RETIRED);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->holder_ref, &successor_ref));
+
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retired_ref_state_exact(&retired_ref, 1, master_session + 1),
+		PCM_X_QUEUE_STALE);
+	retired_ref.identity.cluster_epoch++;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retired_ref_state_exact(&retired_ref, 1, master_session),
+		PCM_X_QUEUE_STALE);
+	retired_ref.identity.cluster_epoch--;
+
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id
+		= retired_ref.handle.ticket_id + 1;
+	pg_atomic_write_u32(&header->local_retire_gate, 2);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retired_ref_state_exact(&retired_ref, 1, master_session),
+		PCM_X_QUEUE_BUSY);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->holder_ref, &successor_ref));
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id = 0;
+	pg_atomic_write_u32(&header->local_retire_gate, 0);
+
+	/* This helper proves only the queried full ref is absent.  A wider
+	 * frontier does not make a different resident ref an alias; prefix-wide
+	 * residual classification belongs to the RETIRE sweep guard. */
+	header->peer_frontiers[1].local_retired_ticket_id = successor_ref.handle.ticket_id;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retired_ref_state_exact(&retired_ref, 1, master_session),
+		PCM_X_QUEUE_RETIRED);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->holder_ref, &successor_ref));
+
+	retired_ref = successor_ref;
+	retired_ref.handle.queue_generation++;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retired_ref_state_exact(&retired_ref, 1, master_session),
+		PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->holder_ref, &successor_ref));
+}
+
+
+/*
+ * The fresh-path fence must not reinterpret pre-existing impossible state as
+ * a clean retirement.  An exact <=frontier ref still resident in any local
+ * lane is fail-closed evidence, and duplicate RETIRE must detect it before a
+ * caller is allowed to sweep the matching DRAINED image certificate.
+ */
+UT_TEST(test_local_post_frontier_exact_residual_fails_closed)
+{
+	PcmXShmemHeader *header;
+	PcmXLocalHandle leader;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXWaitIdentity identity;
+	PcmXRevokePayload revoke;
+	PcmXRetirePayload retire;
+	PcmXTicketRef residual_ref;
+	const uint64 master_session = UINT64_C(7502);
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	identity = make_wait_identity(770, 0, 19, UINT64_C(75002));
+	bind_local_master(1, identity.cluster_epoch, master_session);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, master_session, &leader),
+				 PCM_X_QUEUE_OK);
+	tag_slot = &local_tag_slots(header)[leader.tag_slot.slot_index];
+	seed_live_local_holder_transfer(tag_slot, 20, UINT64_C(75003), UINT64_C(9603));
+	UT_ASSERT(cluster_pcm_x_image_id_encode(1, UINT64_C(202),
+											&tag_slot->holder_image.image_id));
+
+	memset(&revoke, 0, sizeof(revoke));
+	revoke.ref = tag_slot->holder_ref;
+	revoke.image_id = tag_slot->holder_image.image_id;
+	header->peer_frontiers[1].local_retired_ticket_id = revoke.ref.handle.ticket_id;
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_revoke_apply_exact(&revoke, 1, master_session),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->holder_ref, &revoke.ref));
+
+	/* Rebuild an active runtime solely to pin the duplicate-RETIRE guard. */
+	init_active_pcm_x(UINT64_C(78));
+	header = ClusterPcmXConvertShmem;
+	identity = make_wait_identity(771, 0, 21, UINT64_C(75004));
+	bind_local_master(1, identity.cluster_epoch, master_session + 1);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, master_session + 1, &leader),
+				 PCM_X_QUEUE_OK);
+	tag_slot = &local_tag_slots(header)[leader.tag_slot.slot_index];
+	seed_live_local_holder_transfer(tag_slot, 22, UINT64_C(75005), UINT64_C(9604));
+	residual_ref = tag_slot->holder_ref;
+	header->peer_frontiers[1].local_retired_ticket_id
+		= tag_slot->holder_ref.handle.ticket_id;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = identity.cluster_epoch;
+	retire.master_session_incarnation = master_session + 1;
+	retire.retire_through_ticket_id = tag_slot->holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session + 1),
+		PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(header->peer_frontiers[1].local_retired_ticket_id,
+				 retire.retire_through_ticket_id);
+	UT_ASSERT(ticket_refs_equal(&tag_slot->holder_ref, &residual_ref));
+}
+
 UT_TEST(test_local_reliable_authority_change_fails_closed_without_dropping_ledger)
 {
 	PcmXShmemHeader *header;
@@ -16400,6 +17480,8 @@ UT_TEST(test_runtime_activating_phase_has_exact_recovery_reset)
 	cluster_pcm_x_convert_shmem_init();
 	header = ClusterPcmXConvertShmem;
 	header->master_session_incarnation = 77;
+	header->peer_frontiers[1].local_retired_ticket_id = UINT64_C(9901);
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id = UINT64_C(9902);
 	activating_gate = (UINT32_C(3) << PCM_X_RUNTIME_GATE_STATE_BITS) | UINT32_C(3);
 	pg_atomic_write_u32(&header->runtime_gate, activating_gate);
 	snapshot = cluster_pcm_x_runtime_snapshot();
@@ -16417,6 +17499,9 @@ UT_TEST(test_runtime_activating_phase_has_exact_recovery_reset)
 	UT_ASSERT_EQ(snapshot.master_session_incarnation, 78);
 	UT_ASSERT_EQ(snapshot.gate_generation, 4);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&header->activation_retry_generation), 0);
+	UT_ASSERT_EQ(header->peer_frontiers[1].local_retired_ticket_id, 0);
+	UT_ASSERT_EQ(header->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&header->local_retire_gate), 0);
 }
 
 UT_TEST(test_runtime_gate_generation_prevents_active_aba)
@@ -17235,6 +18320,11 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 	arm_lwlock_acquire_error(&header->local_locks[partition].lock, LW_SHARED, 1);
 	UT_EXPECT_PG_EXCEPTION(
 		(void)cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session));
+	UT_ASSERT_EQ(retire_frontier_injection_count, 1);
+	UT_ASSERT_EQ(strcmp(retire_frontier_injection_name,
+						"cluster-pcm-x-retire-frontier-window"),
+				 0);
+	UT_ASSERT_EQ(retire_frontier_injection_held_locks, 0);
 	UT_ASSERT_NULL(lwlock_acquire_error_lock);
 	UT_ASSERT_EQ(held_lwlock_count, 0);
 	UT_ASSERT_EQ(header->peer_frontiers[1].local_retire_in_progress_ticket_id,
@@ -17264,10 +18354,194 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 }
 
 
+static PcmXShmemHeader *
+setup_retire_frontier_census(PcmXPeerBinding *bindings)
+{
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	UT_ASSERT(cluster_pcm_x_runtime_activate_bound(UINT64_C(77), bindings));
+	return ClusterPcmXConvertShmem;
+}
+
+UT_TEST(test_retire_frontier_census_copies_one_atomic_epoch)
+{
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRetireFrontierCensus census;
+	PcmXShmemHeader *header;
+
+	memset(bindings, 0, sizeof(bindings));
+	bindings[1].cluster_epoch = UINT64_C(19);
+	bindings[1].peer_session_incarnation = UINT64_C(601);
+	bindings[3].cluster_epoch = UINT64_C(23);
+	bindings[3].peer_session_incarnation = UINT64_C(603);
+
+	reset_fake_shmem();
+	memset(&census, 0x7f, sizeof(census));
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(!census.valid);
+	UT_ASSERT_EQ(census.local_retire_gate, 0);
+
+	header = setup_retire_frontier_census(bindings);
+	header->peer_frontiers[1].next_expected_prehandle_sequence = UINT64_C(9);
+	header->peer_frontiers[1].retired_prehandle_sequence = UINT64_C(8);
+	header->peer_frontiers[1].local_retired_ticket_id = UINT64_C(44);
+	header->peer_frontiers[3].next_expected_prehandle_sequence = UINT64_C(12);
+	header->peer_frontiers[3].retired_prehandle_sequence = UINT64_C(11);
+	header->peer_frontiers[3].local_retired_ticket_id = UINT64_C(57);
+
+	allocator_lock_acquire_count = 0;
+	allocator_lock_shared_count = 0;
+	allocator_lock_exclusive_count = 0;
+	lwlock_release_count = 0;
+	memset(&census, 0x7f, sizeof(census));
+	UT_ASSERT(cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(census.valid);
+	UT_ASSERT_EQ(allocator_lock_acquire_count, 1);
+	UT_ASSERT_EQ(allocator_lock_shared_count, 1);
+	UT_ASSERT_EQ(allocator_lock_exclusive_count, 0);
+	UT_ASSERT_EQ(lwlock_release_count, 1);
+	UT_ASSERT_EQ(census.runtime.state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(census.runtime.master_session_incarnation, UINT64_C(77));
+	UT_ASSERT_EQ(census.local_retire_gate, 0);
+	UT_ASSERT_EQ(census.peer[1].cluster_epoch, UINT64_C(19));
+	UT_ASSERT_EQ(census.peer[1].sender_session_incarnation, UINT64_C(601));
+	UT_ASSERT_EQ(census.peer[1].next_expected_prehandle_sequence, UINT64_C(9));
+	UT_ASSERT_EQ(census.peer[1].retired_prehandle_sequence, UINT64_C(8));
+	UT_ASSERT_EQ(census.peer[1].local_retired_ticket_id, UINT64_C(44));
+	UT_ASSERT_EQ(census.peer[1].local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(census.peer[3].cluster_epoch, UINT64_C(23));
+	UT_ASSERT_EQ(census.peer[3].sender_session_incarnation, UINT64_C(603));
+	UT_ASSERT_EQ(census.peer[3].local_retired_ticket_id, UINT64_C(57));
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(NULL));
+}
+
+UT_TEST(test_retire_frontier_census_accepts_one_exact_retiring_peer)
+{
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRetireFrontierCensus census;
+	PcmXShmemHeader *header;
+
+	memset(bindings, 0, sizeof(bindings));
+	bindings[1].cluster_epoch = UINT64_C(19);
+	bindings[1].peer_session_incarnation = UINT64_C(601);
+	header = setup_retire_frontier_census(bindings);
+	header->peer_frontiers[1].next_expected_prehandle_sequence = UINT64_C(9);
+	header->peer_frontiers[1].retired_prehandle_sequence = UINT64_C(8);
+	header->peer_frontiers[1].local_retired_ticket_id = UINT64_C(44);
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id = UINT64_C(45);
+	pg_atomic_write_u32(&header->local_retire_gate, 2);
+
+	UT_ASSERT(cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(census.valid);
+	UT_ASSERT_EQ(census.local_retire_gate, 2);
+	UT_ASSERT_EQ(census.peer[1].local_retired_ticket_id, UINT64_C(44));
+	UT_ASSERT_EQ(census.peer[1].local_retire_in_progress_ticket_id, UINT64_C(45));
+}
+
+UT_TEST(test_retire_frontier_census_rejects_orphan_gate)
+{
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRetireFrontierCensus census;
+	PcmXShmemHeader *header;
+
+	memset(bindings, 0, sizeof(bindings));
+	bindings[1].peer_session_incarnation = UINT64_C(601);
+	header = setup_retire_frontier_census(bindings);
+	pg_atomic_write_u32(&header->local_retire_gate, 2);
+
+	memset(&census, 0x7f, sizeof(census));
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(!census.valid);
+}
+
+UT_TEST(test_retire_frontier_census_rejects_two_markers)
+{
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRetireFrontierCensus census;
+	PcmXShmemHeader *header;
+
+	memset(bindings, 0, sizeof(bindings));
+	bindings[1].peer_session_incarnation = UINT64_C(601);
+	bindings[3].peer_session_incarnation = UINT64_C(603);
+	header = setup_retire_frontier_census(bindings);
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id = UINT64_C(45);
+	header->peer_frontiers[3].local_retire_in_progress_ticket_id = UINT64_C(58);
+	pg_atomic_write_u32(&header->local_retire_gate, 2);
+
+	memset(&census, 0x7f, sizeof(census));
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(!census.valid);
+}
+
+UT_TEST(test_retire_frontier_census_rejects_nonadvancing_ticket)
+{
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRetireFrontierCensus census;
+	PcmXShmemHeader *header;
+
+	memset(bindings, 0, sizeof(bindings));
+	bindings[1].peer_session_incarnation = UINT64_C(601);
+	header = setup_retire_frontier_census(bindings);
+	header->peer_frontiers[1].local_retired_ticket_id = UINT64_C(45);
+	header->peer_frontiers[1].local_retire_in_progress_ticket_id = UINT64_C(45);
+	pg_atomic_write_u32(&header->local_retire_gate, 2);
+
+	memset(&census, 0x7f, sizeof(census));
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(!census.valid);
+}
+
+UT_TEST(test_retire_frontier_census_rejects_noncanonical_unbound_prehandle)
+{
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRetireFrontierCensus census;
+	PcmXShmemHeader *header;
+
+	memset(bindings, 0, sizeof(bindings));
+
+	header = setup_retire_frontier_census(bindings);
+	header->peer_frontiers[5].next_expected_prehandle_sequence = 0;
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(!census.valid);
+
+	header = setup_retire_frontier_census(bindings);
+	header->peer_frontiers[5].next_expected_prehandle_sequence = UINT64_C(2);
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(!census.valid);
+
+	header = setup_retire_frontier_census(bindings);
+	header->peer_frontiers[5].retired_prehandle_sequence = UINT64_C(1);
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(!census.valid);
+}
+
+UT_TEST(test_retire_frontier_census_rejects_unbound_ticket_evidence)
+{
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRetireFrontierCensus census;
+	PcmXShmemHeader *header;
+
+	memset(bindings, 0, sizeof(bindings));
+	header = setup_retire_frontier_census(bindings);
+	header->peer_frontiers[5].local_retired_ticket_id = UINT64_C(91);
+
+	memset(&census, 0x7f, sizeof(census));
+	UT_ASSERT(!cluster_pcm_x_retire_frontier_census(&census));
+	UT_ASSERT(!census.valid);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(282);
+	UT_PLAN(306);
+	UT_RUN(test_retire_frontier_census_copies_one_atomic_epoch);
+	UT_RUN(test_retire_frontier_census_accepts_one_exact_retiring_peer);
+	UT_RUN(test_retire_frontier_census_rejects_orphan_gate);
+	UT_RUN(test_retire_frontier_census_rejects_two_markers);
+	UT_RUN(test_retire_frontier_census_rejects_nonadvancing_ticket);
+	UT_RUN(test_retire_frontier_census_rejects_noncanonical_unbound_prehandle);
+	UT_RUN(test_retire_frontier_census_rejects_unbound_ticket_evidence);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -17343,10 +18617,14 @@ main(void)
 	UT_RUN(test_resident_tag_transitional_states_are_retryable);
 	UT_RUN(test_peer_bind_ack_is_exact_and_mismatch_fails_closed);
 	UT_RUN(test_activation_publishes_bound_frontiers_and_counters_before_active);
+	UT_RUN(test_activation_refuses_live_retire_gate_without_erasing_evidence);
 	UT_RUN(test_activation_rejects_partial_binding_before_claiming_gate);
 	UT_RUN(test_runtime_peer_binding_exact_revalidation_is_read_only);
 	UT_RUN(test_runtime_peer_binding_epoch_drift_fails_closed);
 	UT_RUN(test_runtime_peer_binding_session_drift_fails_closed);
+	UT_RUN(test_runtime_quiescent_peer_restart_reforms_generation_exactly);
+	UT_RUN(test_runtime_peer_restart_with_live_slot_remains_fail_closed);
+	UT_RUN(test_runtime_peer_restart_epoch_drift_is_not_reformation);
 	UT_RUN(test_runtime_peer_binding_empty_frontier_is_never_late_bound);
 	UT_RUN(test_runtime_peer_binding_invalid_node_is_rejected_without_closing_runtime);
 	UT_RUN(test_composite_admission_rejects_zero_wrapping_and_out_of_range_identity);
@@ -17412,6 +18690,7 @@ main(void)
 	UT_RUN(test_master_debug_iterators_report_live_slots);
 	UT_RUN(test_master_cancel_is_exact_and_unlinks_middle_without_fifo_damage);
 	UT_RUN(test_master_terminal_work_scan_covers_younger_tickets);
+	UT_RUN(test_younger_terminal_can_drain_but_cannot_retire_past_live_prefix);
 	UT_RUN(test_master_prehandle_cancel_replays_exactly_and_never_hits_reused_slot);
 	UT_RUN(test_master_prehandle_identity_alias_is_corruption_not_stale_cancel);
 	UT_RUN(test_master_prehandle_cancel_first_publishes_terminal_tombstone_before_late_enqueue);
@@ -17438,6 +18717,7 @@ main(void)
 	UT_RUN(test_local_writer_claim_runs_closed_cohort_and_blocks_next_round);
 	UT_RUN(test_local_writer_claim_completion_is_fifo_and_one_shot);
 	UT_RUN(test_writer_and_holder_owner_exit_retry_preserves_exact_evidence);
+	UT_RUN(test_local_barrier_reject_preserves_exact_then_open_drain);
 	UT_RUN(test_local_wfg_rejects_completed_blocker_semantic_aba);
 	UT_RUN(test_local_cancel_never_unlinks_an_active_writer);
 	UT_RUN(test_local_closed_round_never_promotes_a_late_joiner_early);
@@ -17447,13 +18727,19 @@ main(void)
 	UT_RUN(test_local_tag_only_holder_transfer_persists_until_exact_drain);
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
-	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
+	UT_RUN(test_local_cross_lane_retire_refuses_any_covered_writer_ref);
+	UT_RUN(test_local_fresh_retire_canonical_live_writer_shape_is_exact);
+	UT_RUN(test_local_fresh_retire_waits_for_prepared_remote_writer);
+	UT_RUN(test_local_fresh_retire_rejects_malformed_prepared_remote_writer);
+	UT_RUN(test_local_cancel_rotation_retire_consumes_tombstone_before_duplicate);
+	UT_RUN(test_local_duplicate_retire_guard_rejects_cancel_tombstone_appearance);
 	UT_RUN(test_local_retire_preflights_writer_hidden_by_holder_terminal);
 	UT_RUN(test_local_retire_waits_for_inflight_enqueue_before_first_mutation);
 	UT_RUN(test_local_retire_waits_for_undrained_lower_ticket_on_another_tag);
 	UT_RUN(test_local_retire_ignores_undrained_higher_ticket_on_another_tag);
 	UT_RUN(test_local_retire_waits_for_older_writer_complete_before_newer_holder);
 	UT_RUN(test_local_older_holder_retires_without_waking_completed_newer_writer);
+	UT_RUN(test_local_older_holder_retires_before_newer_drained_writer);
 	UT_RUN(test_local_completed_writer_holder_retire_rejects_wider_tag_shape);
 	UT_RUN(test_local_independent_dual_terminal_retires_writer_then_holder);
 	UT_RUN(test_local_independent_dual_terminal_alias_and_malformed_lanes_fail_closed);
@@ -17469,6 +18755,7 @@ main(void)
 	UT_RUN(test_local_grant_rebase_publish_is_one_shot_and_effective);
 	UT_RUN(test_local_grant_rebase_conflict_fails_closed);
 	UT_RUN(test_local_follower_claim_inherits_published_rebase);
+	UT_RUN(test_local_drain_converges_completed_same_round_follower);
 	UT_RUN(test_local_cancelled_non_source_participant_gen0_drains_and_retires_exactly);
 	UT_RUN(test_local_cancelled_participant_gen0_drain_requires_frozen_round);
 	UT_RUN(test_local_holder_drain_validates_frozen_round_before_terminal_publish);
@@ -17520,6 +18807,9 @@ main(void)
 	UT_RUN(test_local_remote_wait_cancel_is_exact_retriable_and_rotates_only_on_ack);
 	UT_RUN(test_local_exact_prepare_wins_cancel_vs_transfer_race);
 	UT_RUN(test_local_terminal_drain_retire_fences_successor_and_replays_watermark);
+	UT_RUN(test_local_post_frontier_transfer_cannot_rebuild_retired_tag);
+	UT_RUN(test_local_retired_ref_state_truth_table_is_exact);
+	UT_RUN(test_local_post_frontier_exact_residual_fails_closed);
 	UT_RUN(test_local_reliable_authority_change_fails_closed_without_dropping_ledger);
 	UT_RUN(test_capacity_addition_overflow_is_checked);
 	UT_RUN(test_capacity_multiplication_overflow_is_checked);

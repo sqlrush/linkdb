@@ -79,7 +79,9 @@ typedef enum ClusterGrdOutboundOrigin {
 	CLUSTER_GRD_OUTBOUND_LMD_CANCEL
 	= 4, /* spec-2.24 D4 — cross-node victim cancel forward (nofail reserved pool + dirty-list) */
 	CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE
-	= 5 /* spec-2.25 D7 — LMS native-lock probe request + reply (reserved pool + dirty-list nofail) */
+	= 5, /* spec-2.25 D7 — LMS native-lock probe request + reply (reserved pool + dirty-list nofail) */
+	CLUSTER_GRD_OUTBOUND_GES_DEDUP_LIFECYCLE
+	= 6 /* S3-P0-10 reliable capability-bound DONE/ACK */
 } ClusterGrdOutboundOrigin;
 
 /*
@@ -149,7 +151,7 @@ StaticAssertDecl(PGRAC_GES_CLEANUP_DIRTY_WARN90_DEPTH < PGRAC_GES_CLEANUP_DIRTY_
 #define PGRAC_GES_OUTBOUND_PAYLOAD_MAX 72
 
 /*
- * Ring slot — fixed 64B payload + envelope metadata.
+ * Ring slot — fixed 72B payload + envelope metadata.
  *
  *   dest_node_id:  receiver cluster_node_id (single peer; broadcast
  *                  reserved for spec-2.18 LMS)
@@ -164,11 +166,13 @@ typedef struct ClusterGrdOutboundSlot {
 	uint8 msg_type; /* ClusterICMsgType */
 	uint8 origin;	/* ClusterGrdOutboundOrigin */
 	uint16 payload_len;
+	uint32 required_capability;
+	uint32 capability_generation;
 	uint8 payload[PGRAC_GES_OUTBOUND_PAYLOAD_MAX];
 } ClusterGrdOutboundSlot;
 
-StaticAssertDecl(sizeof(ClusterGrdOutboundSlot) == 80,
-				 "ClusterGrdOutboundSlot ABI lock (8 metadata + 72 payload, spec-5.8 D8 — "
+StaticAssertDecl(sizeof(ClusterGrdOutboundSlot) == 88,
+				 "ClusterGrdOutboundSlot ABI lock (16 metadata + 72 payload, S3-P0-10 — "
 				 "payload grown 64->72 to hold the D1e GesRequestPayload)");
 
 /* Shmem lifecycle */
@@ -199,12 +203,26 @@ extern void cluster_grd_outbound_shmem_register(void);
  */
 extern bool cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id, const void *payload,
 														 uint16 payload_len);
+extern bool cluster_grd_outbound_enqueue_backend_request_capability(
+	uint32 dest_node_id, const void *payload, uint16 payload_len,
+	uint32 required_capability, uint32 capability_generation);
 extern bool cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id,
 													 const void *payload, uint16 payload_len);
 extern void cluster_grd_outbound_enqueue_lmon_reply(uint32 dest_node_id, const void *payload,
 													uint16 payload_len);
 extern void cluster_grd_outbound_enqueue_cleanup_release(uint32 dest_node_id, const void *payload,
 														 uint16 payload_len);
+
+/*
+ * Scope one caller-owned cleanup attempt so fixed-queue exhaustion is
+ * returned by end() instead of PANIC.  This is only safe when the caller
+ * retains the complete exact cleanup payload, or a committed requester
+ * journal owns its exact retry, and replacement work remains blocked until
+ * cleanup is confirmed.  Ordinary cleanup producers retain the fail-closed
+ * PANIC contract.
+ */
+extern void cluster_grd_outbound_cleanup_release_nonthrow_begin(void);
+extern bool cluster_grd_outbound_cleanup_release_nonthrow_end(void);
 
 /*
  *   enqueue_lmd_cancel:        spec-2.24 D4 — LMD coordinator cross-node
@@ -230,6 +248,9 @@ extern void cluster_grd_outbound_enqueue_lmd_cancel(uint32 dest_node_id, const v
  */
 extern void cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest_node_id, const void *payload,
 														  uint16 payload_len);
+extern void cluster_grd_outbound_enqueue_ges_dedup_lifecycle(
+	uint8 msg_type, uint32 dest_node_id, const void *payload, uint16 payload_len,
+	uint32 capability_generation);
 
 /*
  * LMON-side consumer API (Step 3 D6 wires real drain).

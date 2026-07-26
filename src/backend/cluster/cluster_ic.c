@@ -52,6 +52,7 @@
 #include "utils/memutils.h"
 
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D6 profiling */
 
 
@@ -135,6 +136,8 @@ PG_FUNCTION_INFO_V1(cluster_test_inject_visibility_tt_ref);
 PG_FUNCTION_INFO_V1(cluster_test_clear_visibility_injects);
 /* PGRAC spec-3.5 D19:  same always-linked pattern for SUBCOMMITTED inject SRF. */
 PG_FUNCTION_INFO_V1(cluster_test_inject_subtrans_subcommitted);
+/* S3-P0-13: assertion-only real-LMS trigger lives with the enabled UDFs. */
+PG_FUNCTION_INFO_V1(cluster_test_request_undo_verdict_other);
 #endif
 
 
@@ -597,6 +600,7 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 {
 	size_t name_len;
 	uint32 capabilities = 0;
+	uint64 boot_incarnation;
 
 	Assert(out_buf != NULL);
 	Assert(cluster_name != NULL);
@@ -676,6 +680,25 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 	 * unconditionally.  The runtime GUC is policy, not wire compatibility.
 	 */
 	capabilities |= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1;
+	/*
+	 * S3-P0-04: type65 is safe only after qvotec has published this
+	 * postmaster's boot identity.  Carry the identity and capability in
+	 * the same deterministic HELLO image; a pre-QVOTEC phase-1 HELLO keeps
+	 * both zero and is refreshed through PEER_CAPS_REPLY once qvotec is
+	 * READY.
+	 */
+	boot_incarnation = cluster_qvotec_get_durable_self_incarnation();
+	if (boot_incarnation != 0) {
+		capabilities |= PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1;
+		/* S3-P0-09 type66/67 handlers share the same boot-bound
+		 * certificate discipline and are registered before the IC starts. */
+		capabilities |= PGRAC_IC_HELLO_CAP_GCS_FORWARD_CANCEL_V1;
+		capabilities |= PGRAC_IC_HELLO_CAP_GES_DEDUP_DONE_V1;
+		capabilities |= PGRAC_IC_HELLO_CAP_GCS_REQUEST_BOOT_V1;
+		ic_le_write_uint64(
+			out_buf + PGRAC_IC_HELLO_BOOT_INCARNATION_OFFSET,
+			boot_incarnation);
+	}
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 
@@ -1522,6 +1545,16 @@ cluster_test_inject_subtrans_subcommitted(PG_FUNCTION_ARGS pg_attribute_unused()
 {
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					errmsg("cluster_test_inject_subtrans_subcommitted requires --enable-cluster")));
+	PG_RETURN_BOOL(false);
+}
+
+/* S3-P0-13: keep the unconditional pg_proc symbol linkable in vanilla builds. */
+Datum
+cluster_test_request_undo_verdict_other(PG_FUNCTION_ARGS pg_attribute_unused())
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cluster_test_request_undo_verdict_other requires --enable-cluster")));
 	PG_RETURN_BOOL(false);
 }
 #endif

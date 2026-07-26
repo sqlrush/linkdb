@@ -3,13 +3,11 @@
  * cluster_cf_stats.h
  *	  CF (control file) shared-authority observability counters (spec-5.6).
  *
- *	  A small, dependency-light owner for the five CF shared-authority
- *	  counters so that every CF module (authority read, storage bootstrap,
- *	  enqueue) can bump a counter by including only this header -- it pulls in
- *	  no lock/GES machinery, unlike cluster_cf_enqueue.h.  The counters live in
- *	  a dedicated lock-free shmem region (mirror cluster_advisory: atomics
- *	  only, no LWLock) so a monitoring backend can read what the checkpointer
- *	  or startup process produced.
+ *	  A small, dependency-light owner for the CF shared-authority
+ *	  counters and the fixed published-slot census.  Every CF module
+ *	  (authority read, storage bootstrap, enqueue) can include this header
+ *	  without pulling in GES machinery.  Counters remain lock-free; live
+ *	  holder cells use the region's census LWLock.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -45,8 +43,55 @@ typedef enum ClusterCfCounter {
 	/* spec-5.6a: per-node recovery anchor observability */
 	CLUSTER_CF_RECOVERY_ANCHOR_WRITE = 5,	   /* anchor durably (re)written */
 	CLUSTER_CF_RECOVERY_ANCHOR_BOOT_ADOPT = 6, /* boot adopted a valid anchor */
-	CLUSTER_CF_COUNTER_COUNT = 7
+	/* CF exact-holder release confirmed by S6 (attempts/failures excluded). */
+	CLUSTER_CF_S6_RELEASE_CONFIRMED = 7,
+	CLUSTER_CF_COUNTER_COUNT = 8
 } ClusterCfCounter;
+
+typedef enum ClusterCfSlotMode {
+	CLUSTER_CF_SLOT_MODE_X = 0,
+	CLUSTER_CF_SLOT_MODE_S = 1,
+	CLUSTER_CF_SLOT_MODE_COUNT = 2
+} ClusterCfSlotMode;
+
+typedef enum ClusterCfPublishedSlotState {
+	CLUSTER_CF_SLOT_EMPTY = 0,
+	CLUSTER_CF_SLOT_HELD = 1,
+	CLUSTER_CF_SLOT_RELEASE_PENDING = 2,
+	CLUSTER_CF_SLOT_INVALID = 3
+} ClusterCfPublishedSlotState;
+
+typedef struct ClusterCfPublishedSlot {
+	uint32 state;
+	uint32 mode;
+	int32 owner_pid;
+	uint32 owner_procno;
+	int64 owner_start_ts_us;
+	int32 node_id;
+	uint32 coordinated;
+	uint64 cluster_epoch;
+	uint64 request_id;
+} ClusterCfPublishedSlot;
+
+typedef enum ClusterCfXOwnerState {
+	CLUSTER_CF_X_OWNER_EMPTY = 0,
+	CLUSTER_CF_X_OWNER_HELD,
+	CLUSTER_CF_X_OWNER_RELEASE_PENDING,
+	CLUSTER_CF_X_OWNER_AMBIGUOUS,
+	CLUSTER_CF_X_OWNER_INVALID
+} ClusterCfXOwnerState;
+
+typedef struct ClusterCfSlotCensus {
+	bool valid;
+	uint64 x_held_count;
+	uint64 s_held_count;
+	uint64 x_release_pending_count;
+	uint64 s_release_pending_count;
+	uint64 pending_retry_count;
+	uint64 invalid_count;
+	ClusterCfXOwnerState x_owner_state;
+	ClusterCfPublishedSlot x_owner;
+} ClusterCfSlotCensus;
 
 /* shmem region lifecycle (mirror cluster_advisory). */
 extern Size cluster_cf_stats_shmem_size(void);
@@ -56,6 +101,18 @@ extern void cluster_cf_stats_shmem_register(void);
 /* counter mutate + read (NULL/uninit-safe; out-of-range is a no-op / 0). */
 extern void cluster_cf_counter_inc(ClusterCfCounter which);
 extern uint64 cluster_cf_counter_read(ClusterCfCounter which);
+
+/*
+ * Fixed per-PGPROC published-slot ledger.  Mutation helpers are nonthrowing
+ * after initialization and preserve contradictory evidence as INVALID.
+ */
+extern bool cluster_cf_slot_is_empty(uint32 owner_procno, ClusterCfSlotMode mode);
+extern bool cluster_cf_slot_publish_held(ClusterCfSlotMode mode,
+										 const ClusterCfPublishedSlot *slot);
+extern bool cluster_cf_slot_publish_release_pending(ClusterCfSlotMode mode,
+													const ClusterCfPublishedSlot *slot);
+extern bool cluster_cf_slot_clear_exact(ClusterCfSlotMode mode, const ClusterCfPublishedSlot *slot);
+extern bool cluster_cf_slot_census(ClusterCfSlotCensus *out);
 
 /*
  * spec-5.6 increment (iii) follow-up -- cross-process JOIN_READONLY bring-up

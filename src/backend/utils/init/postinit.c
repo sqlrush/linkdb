@@ -638,6 +638,16 @@ BaseInit(void)
 {
 	Assert(MyProc != NULL);
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * EXEC_BACKEND binds MyProc before it recreates process-local pointers
+	 * into cluster shared memory.  Complete the fail-closed generation here,
+	 * after CreateSharedMemoryAndSemaphores(); fork() paths are already
+	 * initialized and this call is idempotent.
+	 */
+	InitProcessClusterIdentity();
+#endif
+
 	/*
 	 * Initialize our input/output/debugging file descriptors.
 	 */

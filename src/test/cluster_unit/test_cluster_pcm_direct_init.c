@@ -375,7 +375,7 @@ UT_TEST(test_valid_n_s_x_without_proof_enters_queue_before_legacy_wire)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
-		= { "pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,",
+		= { "pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(",
 			"cluster_bufmgr_pcm_begin_grant_reservation_wait(",
 			"cluster_pcm_lock_acquire_buffer(buf, pcm_mode," };
 
@@ -433,7 +433,10 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 		 * report, and only the barrier-aware entry can consume it. */
 		static const char *const refusal_order[]
 			= { "cluster_gcs_pcm_x_acquire_writer(buf, &entry->claim",
-				"PCM_X_QUEUE_BARRIER_CLOSED && barrier_refused != NULL",
+				"if (result == PCM_X_QUEUE_BARRIER_CLOSED)",
+				"CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED",
+				"cluster_pcm_x_stats_note_barrier_unwind()",
+				"return NULL",
 				"cluster_bufmgr_pcm_x_writer_report_failure(result, buf, \"queue acquire\")" };
 
 		UT_ASSERT(strstr(bufmgr, "ClusterLockBufferExclusiveBarrierAware(Buffer buffer)") != NULL);

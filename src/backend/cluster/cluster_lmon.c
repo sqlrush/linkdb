@@ -323,6 +323,31 @@ cluster_lmon_shmem_init(void)
 		}
 	}
 
+	{
+		static bool ges_dedup_lifecycle_registered = false;
+
+		if (!ges_dedup_lifecycle_registered) {
+			const ClusterICMsgTypeInfo done_info = {
+				.msg_type = PGRAC_IC_MSG_GES_DEDUP_DONE,
+				.name = "ges_dedup_done",
+				.allowed_producer_mask = CLUSTER_IC_PRODUCER_LMON,
+				.broadcast_ok = false,
+				.handler = cluster_ges_dedup_done_handler,
+			};
+			const ClusterICMsgTypeInfo ack_info = {
+				.msg_type = PGRAC_IC_MSG_GES_DEDUP_ACK,
+				.name = "ges_dedup_ack",
+				.allowed_producer_mask = CLUSTER_IC_PRODUCER_LMON,
+				.broadcast_ok = false,
+				.handler = cluster_ges_dedup_ack_handler,
+			};
+
+			cluster_ic_register_msg_type(&done_info);
+			cluster_ic_register_msg_type(&ack_info);
+			ges_dedup_lifecycle_registered = true;
+		}
+	}
+
 	/*
 	 * spec-2.32 D4: register PGRAC_IC_MSG_GCS_REQUEST + GCS_REPLY
 	 * (msg_type 12/13).  Producer mask covers BACKEND for loopback test
@@ -1262,6 +1287,10 @@ LmonMain(void)
 			 * wait table full" (cap = cluster.ges_reply_wait_max_entries).
 			 */
 			(void)cluster_ges_reply_wait_sweep_timeout(GetCurrentTimestamp());
+			/* S3-P0-10: requester completion/HWM intents live in shared
+			 * memory and are retried by LMON until exact ACK or target boot
+			 * invalidation, independent of the originating backend. */
+			cluster_ges_dedup_lmon_retry_tick();
 			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GRD_OUTBOUND, force_all_duties))
 				cluster_grd_outbound_lmon_drain_send();
 			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();

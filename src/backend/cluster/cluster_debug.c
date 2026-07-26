@@ -56,8 +56,10 @@
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "fmgr.h"
 #include "funcapi.h"
+#include "miscadmin.h"
 #include "utils/builtins.h"
 
 #include "cluster/cluster_debug.h"
@@ -67,6 +69,7 @@
 /* SRF info-V1 declaration -- always linked because pg_proc.dat
  * references this regardless of build mode. */
 PG_FUNCTION_INFO_V1(cluster_dump_state);
+PG_FUNCTION_INFO_V1(pg_cluster_gcs_block_dedup_debug_exact);
 
 
 #ifdef USE_PGRAC_CLUSTER
@@ -80,6 +83,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_lck.h"		  /* cluster_lck_status (spec-1.12 D12) */
 #include "cluster/cluster_scn.h"		  /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_ges.h" /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
+#include "cluster/cluster_ges_dedup.h" /* S3-P0-10 lifecycle occupancy/counters */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
 #include "cluster/cluster_grd.h"	  /* cluster_grd_* observability accessors (spec-2.14 D6) */
 #include "cluster/cluster_hw.h"		  /* HW relation-extend authority counters (spec-5.7 §3.1c) */
@@ -92,6 +96,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_lmd.h"	  /* cluster_lmd_* observability accessors (spec-2.19 D10) */
 #include "cluster/cluster_lmd_probe_collector.h" /* spec-5.8 D8 — probe collector counters */
 #include "cluster/cluster_lms.h"	 /* cluster_lms_* observability accessors (spec-2.18 D10) */
+#include "cluster/cluster_pcm_x_bufmgr.h" /* current-backend PCM-X ledger counts */
 #include "cluster/cluster_tt_slot.h" /* spec-3.12 D5 retention counters */
 #include "cluster/cluster_terminal_authority.h" /* spec-6.2 authority counters */
 #include "cluster/cluster_sf_dep.h"				/* spec-6.2 Smart Fusion dep counters */
@@ -223,6 +228,31 @@ static char *
 fmt_bool(bool v)
 {
 	return pstrdup(v ? "t" : "f");
+}
+
+static char *
+fmt_pcm_x_barrier_evidence(const ClusterBufmgrPcmXBarrierEvidence *evidence)
+{
+	const char *lane;
+
+	if (evidence == NULL || !evidence->valid)
+		return pstrdup("valid=0");
+	lane = evidence->lane == CLUSTER_BUFMGR_PCM_X_BARRIER_LANE_HOLDER
+			   ? "holder"
+			   : evidence->lane == CLUSTER_BUFMGR_PCM_X_BARRIER_LANE_WRITER
+					 ? "writer"
+					 : "none";
+	return psprintf(
+		"valid=1 lane=%s buffer=%d spc=%u db=%u rel=%u fork=%d blk=%u "
+		"request=" UINT64_FORMAT " wait=" UINT64_FORMAT " base=" UINT64_FORMAT
+		" tag_slot=%zu/" UINT64_FORMAT " evidence_slot=%zu/" UINT64_FORMAT
+		" claim=" UINT64_FORMAT " round=%u",
+		lane, evidence->buffer_id, evidence->tag.spcOid, evidence->tag.dbOid,
+		evidence->tag.relNumber, (int)evidence->tag.forkNum, evidence->tag.blockNum,
+		evidence->request_id, evidence->wait_seq, evidence->base_own_generation,
+		evidence->tag_slot.slot_index, evidence->tag_slot.slot_generation,
+		evidence->evidence_slot.slot_index, evidence->evidence_slot.slot_generation,
+		evidence->claim_generation, evidence->local_round);
 }
 
 static char *
@@ -419,6 +449,22 @@ dump_ic(ReturnSetInfo *rsinfo)
 		emit_row(
 			rsinfo, "ic", "tier1_writable_drain_data",
 			psprintf(UINT64_FORMAT, cluster_ic_tier1_get_writable_drain(CLUSTER_IC_PLANE_DATA)));
+		/* S3-P0-34: cooperative receive yields prove that an always-readable
+		 * peer cannot monopolize either owner plane's main loop. */
+		emit_row(rsinfo, "ic", "tier1_recv_budget_yield_control",
+				 psprintf(UINT64_FORMAT,
+						  cluster_ic_tier1_get_recv_budget_yield(CLUSTER_IC_PLANE_CONTROL)));
+		emit_row(rsinfo, "ic", "tier1_recv_budget_yield_data",
+				 psprintf(UINT64_FORMAT,
+						  cluster_ic_tier1_get_recv_budget_yield(CLUSTER_IC_PLANE_DATA)));
+		emit_row(rsinfo, "ic", "tier1_recv_turn_frame_highwater_control",
+				 psprintf(UINT64_FORMAT,
+						  cluster_ic_tier1_get_recv_turn_frame_highwater(
+							  CLUSTER_IC_PLANE_CONTROL)));
+		emit_row(rsinfo, "ic", "tier1_recv_turn_frame_highwater_data",
+				 psprintf(UINT64_FORMAT,
+						  cluster_ic_tier1_get_recv_turn_frame_highwater(
+							  CLUSTER_IC_PLANE_DATA)));
 
 		/* PGRAC: GCS serve-stall round-5 — per-peer outbound FIFO accounting
 		 * per plane.  admitted - promoted = frames currently queued (the S3
@@ -1781,6 +1827,29 @@ dump_ges(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_ges_timeout_native_probe_count()));
 	emit_row(rsinfo, "ges", "ges_timeout_master_reject_count",
 			 fmt_int64((int64)cluster_ges_timeout_master_reject_count()));
+	/*
+	 * S3-P0-10: reliable normal-terminal lifecycle evidence.  The two
+	 * occupancy rows must converge to zero after DONE/ACK quiescence:
+	 * receiver-side dedup entries and requester-side retry journal slots.
+	 * The remaining monotonic counters distinguish healthy ACK retirement
+	 * from pressure, replay, or restart cleanup.
+	 */
+	emit_row(rsinfo, "ges", "ges_dedup_entry_count",
+			 fmt_int64((int64)cluster_ges_dedup_entry_count()));
+	emit_row(rsinfo, "ges", "ges_dedup_hit_cached_count",
+			 fmt_int64((int64)cluster_ges_dedup_hit_cached_count()));
+	emit_row(rsinfo, "ges", "ges_dedup_in_flight_dup_count",
+			 fmt_int64((int64)cluster_ges_dedup_in_flight_dup_count()));
+	emit_row(rsinfo, "ges", "ges_dedup_stale_reprocess_count",
+			 fmt_int64((int64)cluster_ges_dedup_stale_reprocess_count()));
+	emit_row(rsinfo, "ges", "ges_dedup_full_reject_count",
+			 fmt_int64((int64)cluster_ges_dedup_full_reject_count()));
+	emit_row(rsinfo, "ges", "ges_dedup_journal_count",
+			 fmt_int64((int64)cluster_ges_dedup_journal_count()));
+	emit_row(rsinfo, "ges", "ges_dedup_journal_full_count",
+			 fmt_int64((int64)cluster_ges_dedup_journal_full_count()));
+	emit_row(rsinfo, "ges", "ges_dedup_journal_ack_count",
+			 fmt_int64((int64)cluster_ges_dedup_journal_ack_count()));
 }
 
 
@@ -1901,6 +1970,140 @@ dump_buffer_format(ReturnSetInfo *rsinfo)
  *	spec-1.7 introduced the initial diagnostic surface.  spec-2.30 expands
  *	it with live PCM state summaries and transition counters.
  */
+typedef enum PcmXRetireDebugPhase {
+	PCM_X_RETIRE_DEBUG_UNBOUND = 0,
+	PCM_X_RETIRE_DEBUG_IDLE,
+	PCM_X_RETIRE_DEBUG_RETIRING,
+	PCM_X_RETIRE_DEBUG_INVALID
+} PcmXRetireDebugPhase;
+
+static PcmXRetireDebugPhase
+pcm_x_retire_debug_phase(const PcmXPeerFrontier *peer)
+{
+	if (peer->sender_session_incarnation == 0)
+		return peer->cluster_epoch == 0
+					   && peer->next_expected_prehandle_sequence == 1
+					   && peer->retired_prehandle_sequence == 0
+					   && peer->local_retired_ticket_id == 0
+					   && peer->local_retire_in_progress_ticket_id == 0
+				   ? PCM_X_RETIRE_DEBUG_UNBOUND
+				   : PCM_X_RETIRE_DEBUG_INVALID;
+	if (peer->next_expected_prehandle_sequence == 0
+		|| peer->retired_prehandle_sequence >= peer->next_expected_prehandle_sequence)
+		return PCM_X_RETIRE_DEBUG_INVALID;
+	if (peer->local_retire_in_progress_ticket_id == 0)
+		return PCM_X_RETIRE_DEBUG_IDLE;
+	return peer->local_retire_in_progress_ticket_id > peer->local_retired_ticket_id
+			   ? PCM_X_RETIRE_DEBUG_RETIRING
+			   : PCM_X_RETIRE_DEBUG_INVALID;
+}
+
+static const char *
+pcm_x_retire_debug_phase_name(PcmXRetireDebugPhase phase)
+{
+	switch (phase) {
+	case PCM_X_RETIRE_DEBUG_UNBOUND:
+		return "UNBOUND";
+	case PCM_X_RETIRE_DEBUG_IDLE:
+		return "IDLE";
+	case PCM_X_RETIRE_DEBUG_RETIRING:
+		return "RETIRING";
+	case PCM_X_RETIRE_DEBUG_INVALID:
+		return "INVALID";
+	}
+	return "INVALID";
+}
+
+static void
+dump_pcm_x_retire_frontier(ReturnSetInfo *rsinfo)
+{
+	PcmXRetireFrontierCensus census;
+	PcmXRetireDebugPhase phase[PCM_X_PROTOCOL_NODE_LIMIT];
+	bool configured[PCM_X_PROTOCOL_NODE_LIMIT] = { false };
+	uint32 configured_count = 0;
+	uint32 bound_count = 0;
+	uint32 idle_count = 0;
+	uint32 in_progress_count = 0;
+	uint32 invalid_count = 0;
+	uint32 marker_count = 0;
+	uint32 marker_node = 0;
+	bool global_shape_valid;
+	bool snapshot_valid;
+	int node;
+
+	memset(&census, 0, sizeof(census));
+	snapshot_valid = cluster_pcm_x_retire_frontier_census(&census) && census.valid;
+	for (node = 0; node < PCM_X_PROTOCOL_NODE_LIMIT; node++) {
+		const PcmXPeerFrontier *peer = &census.peer[node];
+
+		if (peer->local_retire_in_progress_ticket_id != 0) {
+			marker_count++;
+			marker_node = (uint32)node;
+		}
+		if (cluster_conf_lookup_node(node) == NULL) {
+			/* Activation leaves every undeclared protocol slot in one exact
+			 * canonical UNBOUND shape.  Any hidden authority is invalid even
+			 * though it must not gain a dynamic peer row. */
+			if (pcm_x_retire_debug_phase(peer) != PCM_X_RETIRE_DEBUG_UNBOUND)
+				invalid_count++;
+			continue;
+		}
+		configured[node] = true;
+		configured_count++;
+		if (peer->sender_session_incarnation != 0)
+			bound_count++;
+		phase[node] = pcm_x_retire_debug_phase(peer);
+		if (phase[node] == PCM_X_RETIRE_DEBUG_IDLE)
+			idle_count++;
+		else if (phase[node] == PCM_X_RETIRE_DEBUG_RETIRING)
+			in_progress_count++;
+		else if (phase[node] == PCM_X_RETIRE_DEBUG_INVALID)
+			invalid_count++;
+	}
+	global_shape_valid
+		= (marker_count == 0 && census.local_retire_gate == 0)
+		  || (marker_count == 1 && census.local_retire_gate == marker_node + 1);
+	if (invalid_count != 0)
+		snapshot_valid = false;
+	if (!global_shape_valid) {
+		snapshot_valid = false;
+		if (invalid_count == 0)
+			invalid_count++;
+	}
+
+	emit_row(rsinfo, "pcm", "pcm_x_retire_frontier_snapshot_valid",
+			 snapshot_valid ? "1" : "0");
+	emit_row(rsinfo, "pcm", "pcm_x_retire_frontier_configured_node_count",
+			 fmt_int64((int64)configured_count));
+	emit_row(rsinfo, "pcm", "pcm_x_retire_frontier_bound_node_count",
+			 fmt_int64((int64)bound_count));
+	emit_row(rsinfo, "pcm", "pcm_x_retire_frontier_idle_node_count",
+			 fmt_int64((int64)idle_count));
+	emit_row(rsinfo, "pcm", "pcm_x_retire_frontier_in_progress_node_count",
+			 fmt_int64((int64)in_progress_count));
+	emit_row(rsinfo, "pcm", "pcm_x_retire_frontier_invalid_node_count",
+			 fmt_int64((int64)invalid_count));
+
+	for (node = 0; node < PCM_X_PROTOCOL_NODE_LIMIT; node++) {
+		const PcmXPeerFrontier *peer;
+		char key[64];
+
+		if (!configured[node])
+			continue;
+		peer = &census.peer[node];
+		snprintf(key, sizeof(key), "pcm_x_retire_frontier_peer_%d", node);
+		emit_row(rsinfo, "pcm", key,
+				 psprintf("phase=%s epoch=" UINT64_FORMAT " session=" UINT64_FORMAT
+						  " next_prehandle=" UINT64_FORMAT " retired_prehandle=" UINT64_FORMAT
+						  " retired_ticket=" UINT64_FORMAT " in_progress_ticket=" UINT64_FORMAT,
+						  pcm_x_retire_debug_phase_name(phase[node]), peer->cluster_epoch,
+						  peer->sender_session_incarnation,
+						  peer->next_expected_prehandle_sequence,
+						  peer->retired_prehandle_sequence, peer->local_retired_ticket_id,
+						  peer->local_retire_in_progress_ticket_id));
+	}
+}
+
 static void
 dump_pcm(ReturnSetInfo *rsinfo)
 {
@@ -2005,10 +2208,15 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	 * plus one text-valued fail-closed provenance key (excluded from the
 	 * integer-only snapshot tooling in the TAP suite). */
 	{
+		ClusterBufmgrPcmXLedgerCounts ledger_counts;
+		ClusterBufmgrPcmXBarrierDebugSnapshot barrier_debug;
 		PcmXStatsSnapshot stats = { 0 };
 		PcmXRuntimeSnapshot runtime = cluster_pcm_x_runtime_snapshot();
 		char fail_closed_site[PCM_X_FAIL_CLOSED_SITE_LEN];
+		char barrier_target[160];
 
+		cluster_bufmgr_pcm_x_ledger_counts(&ledger_counts);
+		cluster_bufmgr_pcm_x_retry_barrier_debug_snapshot(&barrier_debug);
 		(void)cluster_pcm_x_stats_snapshot(&stats);
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_state", fmt_int32((int32)runtime.state));
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_generation",
@@ -2016,6 +2224,22 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		if (!cluster_pcm_x_runtime_fail_closed_site(fail_closed_site, sizeof(fail_closed_site)))
 			strlcpy(fail_closed_site, "(none)", sizeof(fail_closed_site));
 		emit_row(rsinfo, "pcm", "pcm_x_runtime_fail_closed_site", fail_closed_site);
+#ifdef USE_ASSERT_CHECKING
+		{
+			int32 peer_node;
+
+			for (peer_node = 0; peer_node < PCM_X_PROTOCOL_NODE_LIMIT; peer_node++) {
+				char binding[384];
+				char key[64];
+
+				if (!cluster_pcm_x_runtime_peer_binding_debug(peer_node, binding,
+															 sizeof(binding)))
+					continue;
+				snprintf(key, sizeof(key), "pcm_x_peer_binding_%d", peer_node);
+				emit_row(rsinfo, "pcm", key, binding);
+			}
+		}
+#endif
 
 		/* Text-valued per-slot diagnostic rows; present only while master tag
 		 * or ticket slots are occupied, so the quiescent key count above is
@@ -2096,7 +2320,40 @@ dump_pcm(ReturnSetInfo *rsinfo)
 				 fmt_int64((int64)stats.own_corrupt_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_barrier_unwind_count",
 				 fmt_int64((int64)stats.barrier_unwind_count));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_holder_live_count",
+				 fmt_int64((int64)ledger_counts.holder_live));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_holder_deferred_count",
+				 fmt_int64((int64)ledger_counts.holder_deferred));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_writer_live_count",
+				 fmt_int64((int64)ledger_counts.writer_live));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_writer_deferred_count",
+				 fmt_int64((int64)ledger_counts.writer_deferred));
+		if (barrier_debug.target_valid)
+			snprintf(barrier_target, sizeof(barrier_target),
+					 "valid=1 lane=%s spc=%u db=%u rel=%u fork=%d blk=%u",
+					 barrier_debug.target_lane == CLUSTER_BUFMGR_PCM_X_BARRIER_LANE_HOLDER
+						 ? "holder"
+						 : "writer",
+					 barrier_debug.target.spcOid, barrier_debug.target.dbOid,
+					 barrier_debug.target.relNumber, (int)barrier_debug.target.forkNum,
+					 barrier_debug.target.blockNum);
+		else
+			strlcpy(barrier_target, "valid=0", sizeof(barrier_target));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_barrier_target", barrier_target);
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_barrier_hit",
+				 fmt_pcm_x_barrier_evidence(&barrier_debug.hit));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_barrier_deferred",
+				 fmt_pcm_x_barrier_evidence(&barrier_debug.deferred));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_barrier_unused",
+				 fmt_pcm_x_barrier_evidence(&barrier_debug.unused));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_barrier_non_target_ignored_count",
+				 fmt_int64((int64)barrier_debug.non_target_ignored_count));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_barrier_holder_live_high_water",
+				 fmt_int64((int64)barrier_debug.holder_live_high_water));
+		emit_row(rsinfo, "pcm", "pcm_x_bufmgr_barrier_writer_live_high_water",
+				 fmt_int64((int64)barrier_debug.writer_live_high_water));
 	}
+	dump_pcm_x_retire_frontier(rsinfo);
 }
 
 
@@ -2115,13 +2372,43 @@ dump_pcm(ReturnSetInfo *rsinfo)
  *	cluster_tap CF tests can assert CF X was taken (serialization proof),
  *	fail-closed events, single-node-authority windows, and .bak fallbacks.
  * ============================================================ */
+static const char *
+cf_x_owner_state_name(ClusterCfXOwnerState state)
+{
+	switch (state) {
+	case CLUSTER_CF_X_OWNER_EMPTY:
+		return "EMPTY";
+	case CLUSTER_CF_X_OWNER_HELD:
+		return "HELD";
+	case CLUSTER_CF_X_OWNER_RELEASE_PENDING:
+		return "RELEASE_PENDING";
+	case CLUSTER_CF_X_OWNER_AMBIGUOUS:
+		return "AMBIGUOUS";
+	case CLUSTER_CF_X_OWNER_INVALID:
+		return "INVALID";
+	}
+	return "INVALID";
+}
+
 static void
 dump_cf(ReturnSetInfo *rsinfo)
 {
+	ClusterCfSlotCensus census;
+	ClusterCfXOwnerState owner_state;
+	bool snapshot_valid;
+
+	memset(&census, 0, sizeof(census));
+	snapshot_valid = cluster_cf_slot_census(&census) && census.valid;
+	owner_state = census.x_owner_state;
+	if (!snapshot_valid && owner_state == CLUSTER_CF_X_OWNER_EMPTY)
+		owner_state = CLUSTER_CF_X_OWNER_INVALID;
+
 	emit_row(rsinfo, "cf", "cf_x_acquire",
 			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE)));
 	emit_row(rsinfo, "cf", "cf_s_acquire",
 			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_S_ACQUIRE)));
+	emit_row(rsinfo, "cf", "cf_s6_release_confirmed",
+			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_S6_RELEASE_CONFIRMED)));
 	emit_row(rsinfo, "cf", "cf_failclosed",
 			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_FAILCLOSED)));
 	emit_row(rsinfo, "cf", "cf_single_node_authority",
@@ -2133,6 +2420,27 @@ dump_cf(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_RECOVERY_ANCHOR_WRITE)));
 	emit_row(rsinfo, "cf", "recovery_anchor_boot_adopt_count",
 			 fmt_int64((int64)cluster_cf_counter_read(CLUSTER_CF_RECOVERY_ANCHOR_BOOT_ADOPT)));
+	emit_row(rsinfo, "cf", "cf_slot_snapshot_valid", snapshot_valid ? "1" : "0");
+	emit_row(rsinfo, "cf", "cf_x_held_count",
+			 fmt_int64((int64)census.x_held_count));
+	emit_row(rsinfo, "cf", "cf_s_held_count",
+			 fmt_int64((int64)census.s_held_count));
+	emit_row(rsinfo, "cf", "cf_x_release_pending_count",
+			 fmt_int64((int64)census.x_release_pending_count));
+	emit_row(rsinfo, "cf", "cf_s_release_pending_count",
+			 fmt_int64((int64)census.s_release_pending_count));
+	emit_row(rsinfo, "cf", "cf_pending_retry_count",
+			 fmt_int64((int64)census.pending_retry_count));
+	emit_row(rsinfo, "cf", "cf_slot_invalid_count",
+			 fmt_int64((int64)census.invalid_count));
+	emit_row(rsinfo, "cf", "cf_x_owner",
+			 psprintf("state=%s pid=%d procno=%u start_us=" INT64_FORMAT
+					  " node=%d epoch=" UINT64_FORMAT " request_id=" UINT64_FORMAT
+					  " coordinated=%u",
+					  cf_x_owner_state_name(owner_state), census.x_owner.owner_pid,
+					  census.x_owner.owner_procno, census.x_owner.owner_start_ts_us,
+					  census.x_owner.node_id, census.x_owner.cluster_epoch,
+					  census.x_owner.request_id, census.x_owner.coordinated));
 }
 
 static void
@@ -2159,6 +2467,22 @@ dump_smart_fusion(ReturnSetInfo *rsinfo)
 static void
 dump_gcs(ReturnSetInfo *rsinfo)
 {
+	GcsBlockForwardPhaseCensus forward_phase;
+	bool forward_phase_valid;
+
+	memset(&forward_phase, 0, sizeof(forward_phase));
+	forward_phase_valid
+		= cluster_gcs_block_dedup_forward_phase_census(&forward_phase) && forward_phase.valid;
+	emit_row(rsinfo, "gcs", "dedup_forward_phase_snapshot_valid",
+			 forward_phase_valid ? "1" : "0");
+	emit_row(rsinfo, "gcs", "dedup_forward_marker_count",
+			 fmt_int64((int64)forward_phase.marker_count));
+	emit_row(rsinfo, "gcs", "dedup_forwarded_phase_count",
+			 fmt_int64((int64)forward_phase.forwarded_count));
+	emit_row(rsinfo, "gcs", "dedup_cancelling_phase_count",
+			 fmt_int64((int64)forward_phase.cancelling_count));
+	emit_row(rsinfo, "gcs", "dedup_forward_phase_invalid_count",
+			 fmt_int64((int64)forward_phase.invalid_count));
 	emit_row(rsinfo, "gcs", "api_state", cluster_gcs_get_api_state());
 	emit_row(rsinfo, "gcs", "lookup_master_self_count",
 			 fmt_int64((int64)cluster_gcs_get_lookup_master_self_count()));
@@ -2288,6 +2612,15 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_done_marked_count()));
 	emit_row(rsinfo, "gcs", "dedup_done_mismatch_count",
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_done_mismatch_count()));
+	/* PGRAC: S3-P0-09 — a DONE whose identity verified but whose cell still
+	 * held a live forward leg.  Split by phase: FORWARDED is the marker's
+	 * resting state after the send finishes, CANCELLING only exists after a
+	 * deny_next() flip, so the two rows say different things about how the
+	 * blind DONE arrived.  Nonzero means the refusal fired in the field. */
+	emit_row(rsinfo, "gcs", "dedup_done_forwarded_refused_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_done_forwarded_refused_count()));
+	emit_row(rsinfo, "gcs", "dedup_done_cancelling_refused_count",
+			 fmt_int64((int64)cluster_gcs_get_block_dedup_done_cancelling_refused_count()));
 	emit_row(rsinfo, "gcs", "dedup_hint_violation_count",
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_hint_violation_count()));
 	emit_row(rsinfo, "gcs", "dedup_legacy_pin_count",
@@ -3009,6 +3342,18 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_horizon_wire_reject_count()));
 	emit_row(rsinfo, "undo", "horizon_admission_refuse_count",
 			 fmt_int64((int64)cluster_undo_horizon_admission_refuse_count()));
+	emit_row(rsinfo, "undo", "horizon_admission_admitted_zero_count",
+			 fmt_int64((int64)cluster_undo_horizon_admission_reason_count(
+				 CLUSTER_UNDO_ADMISSION_ADMITTED_ZERO)));
+	emit_row(rsinfo, "undo", "horizon_admission_no_active_snapshot_count",
+			 fmt_int64((int64)cluster_undo_horizon_admission_reason_count(
+				 CLUSTER_UNDO_ADMISSION_NO_ACTIVE_SNAPSHOT)));
+	emit_row(rsinfo, "undo", "horizon_admission_epoch_predates_count",
+			 fmt_int64((int64)cluster_undo_horizon_admission_reason_count(
+				 CLUSTER_UNDO_ADMISSION_EPOCH_PREDATES)));
+	emit_row(rsinfo, "undo", "horizon_admission_scn_mismatch_count",
+			 fmt_int64((int64)cluster_undo_horizon_admission_reason_count(
+				 CLUSTER_UNDO_ADMISSION_SCN_MISMATCH)));
 	emit_row(rsinfo, "undo", "horizon_last_floor_scn",
 			 fmt_int64((int64)cluster_undo_horizon_last_floor()));
 	emit_row(rsinfo, "undo", "horizon_idle_sentinel_sent_count",
@@ -3135,6 +3480,39 @@ dump_cr(ReturnSetInfo *rsinfo)
 	 * write-fenced (image / undo / verdict withheld to avoid a stale ship). */
 	emit_row(rsinfo, "cr", "cr_server_fence_refused_count",
 			 fmt_int64((int64)cluster_cr_server_fence_refused_count()));
+	emit_row(rsinfo, "cr", "cr_server_terminal_resample_commit_count",
+			 fmt_int64((int64)cluster_cr_server_terminal_resample_commit_count()));
+	emit_row(rsinfo, "cr", "cr_server_terminal_resample_abort_count",
+			 fmt_int64((int64)cluster_cr_server_terminal_resample_abort_count()));
+	emit_row(rsinfo, "cr", "cr_server_terminal_resample_unknown_count",
+			 fmt_int64((int64)cluster_cr_server_terminal_resample_unknown_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_not_authoritative_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_not_authoritative_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_not_mine_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_not_mine_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_expected_segment_invalid_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_expected_segment_invalid_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_expected_slot_invalid_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_expected_slot_invalid_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_segment_mismatch_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_segment_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_slot_mismatch_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_slot_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_confirm_resolve_kind_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_confirm_resolve_kind_count()));
+	emit_row(
+		rsinfo, "cr", "cr_server_other_refuse_confirm_segment_mismatch_count",
+		fmt_int64((int64)cluster_cr_server_other_refuse_confirm_segment_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_confirm_slot_mismatch_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_confirm_slot_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_confirm_wrap_mismatch_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_confirm_wrap_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_confirm_scn_mismatch_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_confirm_scn_mismatch_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_terminal_unknown_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_terminal_unknown_count()));
+	emit_row(rsinfo, "cr", "cr_server_other_refuse_residual_count",
+			 fmt_int64((int64)cluster_cr_server_other_refuse_residual_count()));
 	emit_row(rsinfo, "cr", "rtvis_underivable_failclosed_count",
 			 fmt_int64((int64)cluster_rtvis_underivable_failclosed_count()));
 	/* GCS-race round-2 RC-E: recycled refs the native-prehistory gate routed
@@ -3852,6 +4230,82 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 #endif
 
 	return (Datum)0;
+}
+
+/*
+ * S3-P0-18 assertion-build-only exact dedup probe.  Keep the fmgr wrapper
+ * always linked because pg_proc.dat is build-mode independent; non-cluster
+ * and non-assert builds fail explicitly before touching cluster state.
+ */
+Datum
+pg_cluster_gcs_block_dedup_debug_exact(PG_FUNCTION_ARGS)
+{
+#if defined(USE_PGRAC_CLUSTER) && defined(USE_ASSERT_CHECKING)
+#define GCS_BLOCK_DEDUP_DEBUG_COLS 23
+	GcsBlockDedupKey key;
+	GcsBlockDedupDebugExactSnapshot snapshot;
+	TupleDesc tupdesc;
+	HeapTuple tuple;
+	Datum values[GCS_BLOCK_DEDUP_DEBUG_COLS] = { 0 };
+	bool nulls[GCS_BLOCK_DEDUP_DEBUG_COLS] = { 0 };
+	int32 origin_node_id;
+	int32 requester_backend_id;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to inspect the GCS block dedup registry")));
+	if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
+		elog(ERROR, "return type must be a row type");
+
+	origin_node_id = PG_GETARG_INT32(0);
+	requester_backend_id = PG_GETARG_INT32(1);
+	if (origin_node_id < 0 || requester_backend_id <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("invalid GCS block dedup identity"),
+				 errdetail("origin_node_id must be nonnegative and "
+						   "requester_backend_id must be positive.")));
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = (uint32)origin_node_id;
+	key.requester_backend_id = requester_backend_id;
+	key.request_id = (uint64)PG_GETARG_INT64(2);
+	key.cluster_epoch = (uint64)PG_GETARG_INT64(3);
+	key.origin_boot_incarnation = (uint64)PG_GETARG_INT64(4);
+
+	values[0] = BoolGetDatum(cluster_gcs_block_dedup_debug_exact(&key, &snapshot));
+	values[1] = Int32GetDatum((int32)snapshot.match_count);
+	values[2] = Int32GetDatum(snapshot.worker_id);
+	values[3] = Int32GetDatum((int32)snapshot.key.origin_node_id);
+	values[4] = Int32GetDatum(snapshot.key.requester_backend_id);
+	values[5] = Int64GetDatum((int64)snapshot.key.request_id);
+	values[6] = Int64GetDatum((int64)snapshot.key.cluster_epoch);
+	values[7] = Int64GetDatum((int64)snapshot.key.origin_boot_incarnation);
+	values[8] = ObjectIdGetDatum(snapshot.tag.spcOid);
+	values[9] = ObjectIdGetDatum(snapshot.tag.dbOid);
+	values[10] = ObjectIdGetDatum(snapshot.tag.relNumber);
+	values[11] = Int32GetDatum((int32)snapshot.tag.forkNum);
+	values[12] = Int64GetDatum((int64)snapshot.tag.blockNum);
+	values[13] = Int32GetDatum((int32)snapshot.entry_kind);
+	values[14] = Int32GetDatum((int32)snapshot.transition_id);
+	values[15] = Int32GetDatum((int32)snapshot.status);
+	values[16] = BoolGetDatum(snapshot.completed);
+	values[17] = BoolGetDatum(snapshot.done);
+	values[18] = Int64GetDatum((int64)snapshot.hit_count);
+	values[19] = Int64GetDatum((int64)snapshot.miss_count);
+	values[20] = Int64GetDatum((int64)snapshot.collision_count);
+	values[21] = Int64GetDatum((int64)snapshot.done_marked_count);
+	values[22] = Int64GetDatum((int64)snapshot.done_mismatch_count);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	PG_RETURN_DATUM(HeapTupleGetDatum(tuple));
+#undef GCS_BLOCK_DEDUP_DEBUG_COLS
+#else
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_cluster_gcs_block_dedup_debug_exact requires an "
+					"assertion-enabled cluster build")));
+	PG_RETURN_NULL();
+#endif
 }
 
 

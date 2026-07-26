@@ -220,3 +220,70 @@ cluster_undo_horizon_stall_reason_name(ClusterUndoHorizonStallReason reason)
 	}
 	return "unknown";
 }
+
+/*
+ * Pure D5-8 read-admission predicate.  Keep this ordering in lockstep with
+ * the enum: one refused call owns exactly one reason/counter.  S3-P0-14
+ * narrows SCN_MISMATCH below from raw object equality to the operation-SCN
+ * versus active-admission-lower-bound ordering contract.
+ */
+ClusterUndoAdmissionReason
+cluster_undo_horizon_admission_reason(uint64 admitted_epoch_biased,
+									  bool active_snapshot,
+									  uint64 snapshot_read_epoch,
+									  SCN snapshot_read_scn,
+									  SCN passed_read_scn)
+{
+	bool snapshot_scn_well_formed;
+	bool passed_scn_well_formed;
+
+	if (admitted_epoch_biased == 0)
+		return CLUSTER_UNDO_ADMISSION_ADMITTED_ZERO;
+	if (!active_snapshot)
+		return CLUSTER_UNDO_ADMISSION_NO_ACTIVE_SNAPSHOT;
+	if (snapshot_read_epoch < admitted_epoch_biased - 1)
+		return CLUSTER_UNDO_ADMISSION_EPOCH_PREDATES;
+
+	/*
+	 * A valid passed SCN is the visibility operation's authority.  The
+	 * active snapshot is its admission lower bound, not an object-identity
+	 * token: current-DML may legitimately mint the operation snapshot a few
+	 * Lamport ticks after the active statement snapshot.  Admit equal/newer
+	 * operation points; refuse an older or malformed point.  Terminal-state
+	 * callers retain the existing InvalidScn bypass.
+	 */
+	if (SCN_VALID(passed_read_scn)) {
+		snapshot_scn_well_formed
+			= SCN_VALID(snapshot_read_scn)
+			  && SCN_NODE_ID_VALID(scn_node_id(snapshot_read_scn))
+			  && scn_local(snapshot_read_scn) > 0;
+		passed_scn_well_formed
+			= SCN_NODE_ID_VALID(scn_node_id(passed_read_scn))
+			  && scn_local(passed_read_scn) > 0;
+		/* SCN_CMP_OK: both operands are SCNs; active is the lower bound. */
+		if (!snapshot_scn_well_formed || !passed_scn_well_formed
+			|| scn_time_cmp(snapshot_read_scn, passed_read_scn) > 0)
+			return CLUSTER_UNDO_ADMISSION_SCN_MISMATCH;
+	}
+	return CLUSTER_UNDO_ADMISSION_ADMIT;
+}
+
+const char *
+cluster_undo_horizon_admission_reason_name(ClusterUndoAdmissionReason reason)
+{
+	switch (reason) {
+	case CLUSTER_UNDO_ADMISSION_ADMIT:
+		return "admit";
+	case CLUSTER_UNDO_ADMISSION_ADMITTED_ZERO:
+		return "admitted-zero";
+	case CLUSTER_UNDO_ADMISSION_NO_ACTIVE_SNAPSHOT:
+		return "no-active-snapshot";
+	case CLUSTER_UNDO_ADMISSION_EPOCH_PREDATES:
+		return "epoch-predates";
+	case CLUSTER_UNDO_ADMISSION_SCN_MISMATCH:
+		return "scn-mismatch";
+	case CLUSTER_UNDO_ADMISSION_REASON_COUNT:
+		break;
+	}
+	return "unknown";
+}

@@ -719,8 +719,10 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
  *	returns true — a false return leaves the cluster in the exact pre-call
  *	state on both nodes.
  */
-bool
-cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition transition_id, int master_node)
+static bool
+gcs_send_transition_nowait_at_epoch(BufferTag tag,
+									PcmLockTransition transition_id,
+									int master_node, uint64 payload_epoch)
 {
 	GcsRequestPayload payload;
 
@@ -731,7 +733,7 @@ cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition transition_i
 
 	memset(&payload, 0, sizeof(payload));
 	payload.request_id = 0; /* deliberate: no slot; reply HC74-drops */
-	payload.epoch = cluster_epoch_get_current();
+	payload.epoch = payload_epoch;
 	payload.tag = tag;
 	payload.sender_node = cluster_node_id;
 	payload.transition_id = (uint8)transition_id;
@@ -754,6 +756,33 @@ cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition transition_i
 
 		return send_rc == CLUSTER_IC_SEND_DONE || send_rc == CLUSTER_IC_SEND_WOULD_BLOCK;
 	}
+}
+
+bool
+cluster_gcs_send_transition_nowait(BufferTag tag,
+								   PcmLockTransition transition_id,
+								   int master_node)
+{
+	return gcs_send_transition_nowait_at_epoch(
+		tag, transition_id, master_node, cluster_epoch_get_current());
+}
+
+bool
+cluster_gcs_send_transition_nowait_exact_epoch(
+	BufferTag tag, PcmLockTransition transition_id, int master_node,
+	uint64 expected_epoch)
+{
+	/*
+	 * This is an early refusal, not the final receiver fence.  If epoch or
+	 * routing changes after these reads, the payload still carries the old
+	 * certificate epoch; the receiver's master gate plus entry-lock epoch
+	 * check rejects it without mutating PCM.
+	 */
+	if (cluster_epoch_get_current() != expected_epoch
+		|| cluster_gcs_lookup_master(tag) != master_node)
+		return false;
+	return gcs_send_transition_nowait_at_epoch(
+		tag, transition_id, master_node, expected_epoch);
 }
 
 
@@ -782,6 +811,7 @@ void
 cluster_gcs_handle_request_envelope(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsRequestPayload *req;
+	PcmGcsTransitionApplyResult apply_result;
 	uint64 current_epoch;
 
 	(void)env;
@@ -803,24 +833,31 @@ cluster_gcs_handle_request_envelope(const ClusterICEnvelope *env, const void *pa
 
 	/* HC73:  epoch freshness check. */
 	current_epoch = cluster_epoch_get_current();
-	if (req->epoch < current_epoch) {
+	if (req->epoch != current_epoch) {
 		gcs_send_reply(req->sender_node, req->request_id, req->transition_id,
 					   GCS_REPLY_DENIED_EPOCH_STALE);
 		return;
 	}
+	if (cluster_gcs_lookup_master(req->tag) != cluster_node_id) {
+		gcs_send_reply(req->sender_node, req->request_id,
+					   req->transition_id,
+					   GCS_REPLY_DENIED_INCOMPATIBLE);
+		return;
+	}
 
-	/* HC77: master-side handler is the single transition-apply owner. */
-	if (!cluster_pcm_lock_apply_gcs_transition(req->tag, (PcmLockTransition)req->transition_id,
-											   req->sender_node)) {
-		if (req->transition_id == PCM_TRANS_N_TO_X
-			|| req->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-			(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
+	/*
+	 * HC77: master-side handler is the single transition-apply owner.  The
+	 * outer reads are advisory early refusals; the PCM helper rechecks epoch
+	 * after taking the entry lock and mutates under that same lock.
+	 */
+	apply_result = cluster_pcm_lock_apply_gcs_transition_exact_result(
+		req->tag, (PcmLockTransition)req->transition_id,
+		req->sender_node, req->epoch, NULL);
+	if (apply_result != PCM_GCS_TRANSITION_APPLIED) {
 		gcs_send_reply(req->sender_node, req->request_id, req->transition_id,
 					   GCS_REPLY_DENIED_INCOMPATIBLE);
 		return;
 	}
-	if (req->transition_id == PCM_TRANS_N_TO_X || req->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-		(void)cluster_pcm_lock_clear_pending_x_if(req->tag, req->sender_node);
 
 	gcs_send_reply(req->sender_node, req->request_id, req->transition_id, GCS_REPLY_GRANTED);
 }

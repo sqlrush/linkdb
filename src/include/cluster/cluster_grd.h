@@ -745,6 +745,10 @@ extern ClusterGrdEntryResult
 cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid,
 										  const struct ClusterGrdHolderId *new_holder,
 										  int32 source_node_id, int lockmode);
+extern ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder_meta(
+	const ClusterResId *resid, const struct ClusterGrdHolderId *new_holder,
+	int32 source_node_id, int lockmode, uint64 origin_boot_incarnation);
 
 /* spec-4.6 D3 — backend-side cooperative rebind walker (defined in
  * cluster_lock_acquire.c;  runs at CFI from cluster_grd_check_pending_
@@ -926,6 +930,7 @@ StaticAssertDecl(sizeof(ClusterGrdHolderId) == 24, "ClusterGrdHolderId 4-tuple A
 typedef struct ClusterGrdWaiterMeta {
 	TransactionId xid;
 	uint64 wait_seq;
+	uint64 origin_boot_incarnation; /* authenticated requester boot; 0 = legacy */
 } ClusterGrdWaiterMeta;
 
 /*
@@ -1102,12 +1107,19 @@ extern ClusterGrdEntryResult cluster_grd_cancel_waiter_by_id(const ClusterResId 
  * procno, cluster_epoch, convert_request_id, wait_seq).  Both return NOT_FOUND
  * on any mismatch and touch only waiters[]/converts[], never a granted holder.
  */
+struct ClusterGrdWaiterIdentity;
 extern ClusterGrdEntryResult cluster_grd_cancel_waiter_by_id_seq(const ClusterResId *resid,
 																 const ClusterGrdHolderId *holder,
 																 uint64 wait_seq);
+extern ClusterGrdEntryResult cluster_grd_cancel_waiter_by_id_seq_identity(
+	const ClusterResId *resid, const ClusterGrdHolderId *holder,
+	uint64 wait_seq, struct ClusterGrdWaiterIdentity *removed_out);
 extern ClusterGrdEntryResult cluster_grd_cancel_convert_by_id(const ClusterResId *resid,
 															  const ClusterGrdHolderId *holder,
 															  uint64 wait_seq);
+extern ClusterGrdEntryResult cluster_grd_cancel_convert_by_id_identity(
+	const ClusterResId *resid, const ClusterGrdHolderId *holder,
+	uint64 wait_seq, struct ClusterGrdWaiterIdentity *removed_out);
 
 /* ============================================================
  * spec-2.23 D6 — GRD-owned grant / waiter-pop API.
@@ -1152,6 +1164,7 @@ typedef struct ClusterGrdWaiterIdentity {
 	int32 source_node_id;
 	uint64 request_id;
 	uint64 shard_master_generation;
+	uint64 origin_boot_incarnation;
 	uint32 request_opcode;
 	LOCKMODE mode;
 } ClusterGrdWaiterIdentity;
@@ -1325,6 +1338,7 @@ typedef struct ClusterGrdConvert {
 	LOCKMODE requested_mode;		/* target mode */
 	uint64 convert_request_id;		/* convert's own reply key (≠ old grant id) */
 	uint64 shard_master_generation; /* spec-2.27 dedup key carry */
+	uint64 origin_boot_incarnation; /* S3-P0-10 dedup cache identity */
 	uint32 request_opcode;			/* = GES_REQ_OPCODE_CONVERT */
 	TransactionId waiter_xid;		/* spec-5.8 D1c — converter's xid (former pad slot) */
 	TimestampTz wait_start;			/* enqueue timestamp (timeout / observability) */
@@ -1348,9 +1362,9 @@ typedef struct ClusterGrdConvert {
 	bool boosted;		   /* head-of-line boosted (D2; convert: reserved) */
 } ClusterGrdConvert;
 
-StaticAssertDecl(sizeof(ClusterGrdConvert) == 88,
+StaticAssertDecl(sizeof(ClusterGrdConvert) == 96,
 				 "ClusterGrdConvert layout pinned (spec-5.1b D2 64B; spec-5.8 D1e +8 wait_seq; "
-				 "spec-5.10 +16 fair_queue_seq/skip_count/boosted)");
+				 "spec-5.10 +16 fairness; S3-P0-10 +8 source boot)");
 
 /*
  * D4 — convert grant decision result.
@@ -1382,8 +1396,38 @@ typedef struct ClusterGrdGrantIdentity {
 	int32 source_node_id;
 	uint32 request_opcode;			/* GES_REQ_OPCODE_REQUEST or _CONVERT */
 	uint64 shard_master_generation; /* dedup reply key carry */
+	uint64 origin_boot_incarnation; /* authenticated requester boot */
 	LOCKMODE mode;					/* granted mode */
 } ClusterGrdGrantIdentity;
+
+/*
+ * S3-P0-10 backend-lifecycle retirement.  The authenticated requester boot is
+ * part of every remote GRD holder/waiter/convert.  PROC_EXIT_HWM removes only
+ * one {origin,boot,procno,id<=HWM} slice; an authenticated boot replacement
+ * removes every slot from the superseded origin boot.  Removed holders can
+ * unblock other waiters, so grants are returned through a callback after the
+ * entry spinlock is released and before the lifecycle ACK is allowed.
+ */
+typedef void (*ClusterGrdRetireGrantCallback)(
+	const ClusterGrdGrantIdentity *grant, const ClusterResId *resid,
+	void *arg);
+
+typedef struct ClusterGrdRetireStats {
+	uint32 holders_removed;
+	uint32 waiters_removed;
+	uint32 converts_removed;
+	uint32 grants_dispatched;
+} ClusterGrdRetireStats;
+
+extern void cluster_grd_retire_origin_proc_up_to(
+	uint32 origin_node_id, uint64 origin_boot_incarnation,
+	uint32 holder_procno, uint64 request_id_hwm,
+	ClusterGrdRetireGrantCallback grant_cb, void *grant_cb_arg,
+	ClusterGrdRetireStats *stats_out);
+extern void cluster_grd_retire_origin_boot(
+	uint32 origin_node_id, uint64 origin_boot_incarnation,
+	ClusterGrdRetireGrantCallback grant_cb, void *grant_cb_arg,
+	ClusterGrdRetireStats *stats_out);
 
 /*
  * D4 — request a convert against an existing holder (caller holds
@@ -1479,7 +1523,8 @@ extern ClusterGrdConvertResult
 cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, uint32 procno,
 									 uint64 cluster_epoch, LOCKMODE current_mode,
 									 LOCKMODE requested_mode, uint64 convert_request_id,
-									 int32 source_node_id, uint64 shard_master_generation);
+									 int32 source_node_id, uint64 shard_master_generation,
+									 ClusterGrdWaiterMeta meta);
 
 /*
  * GES RELEASE live path: remove the holder then drain converts + one waiter

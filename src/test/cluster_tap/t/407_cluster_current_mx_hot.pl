@@ -68,18 +68,36 @@ sub state_key_exists
 }
 
 
-sub tuple_has_hot_updater_multixact
+sub wait_for_event
 {
-	my ($node, $relation) = @_;
-	return $node->safe_psql(
-		'postgres',
-		qq{SELECT coalesce(bool_or(
+	my ($node, $query_like, $event_name, $seconds, $observed) = @_;
+	return wait_for(
+		sub {
+			my $event = $node->safe_psql(
+				'postgres',
+				qq{SELECT coalesce(wait_event, '')
+				     FROM pg_stat_activity
+				    WHERE query LIKE '$query_like'
+				      AND pid <> pg_backend_pid()
+				      AND state = 'active'
+				    LIMIT 1});
+			$$observed = $event if defined $observed && $event ne '';
+			return $event eq $event_name;
+		},
+		$seconds);
+}
+
+
+sub tuple_has_hot_updater_multixact_sql
+{
+	my ($relation) = @_;
+	return qq{SELECT coalesce(bool_or(
 		     'HEAP_XMAX_IS_MULTI' = ANY(f.raw_flags)
 		     AND 'HEAP_HOT_UPDATED' = ANY(f.raw_flags)
 		     AND h.t_ctid <> format('(0,%s)', h.lp)::tid), false)
 		   FROM heap_page_items(get_raw_page('$relation', 0)) AS h
 		   CROSS JOIN LATERAL
-		     heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS f}) eq 't';
+		     heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS f};
 }
 
 
@@ -166,14 +184,16 @@ ok(mirrored_coincident_create(
 		$node0, $node1, 'cmxh_t',
 		'CREATE TABLE cmxh_t (id int, v int)'),
 	'L2 relation identity coincides') or BAIL_OUT('could not create a coincident relation');
-$node0->safe_psql('postgres', 'INSERT INTO cmxh_t VALUES (1, 0)');
-$node0->safe_psql('postgres', 'CHECKPOINT');
+$node1->safe_psql('postgres', 'INSERT INTO cmxh_t VALUES (1, 0)');
+$node1->safe_psql('postgres', 'CHECKPOINT');
 
-# Position a node1 cursor on the original tuple before node0 creates the HOT
+# Position a node1 cursor on the original tuple before a second backend creates
+# the HOT
 # successor.  WHERE CURRENT OF later presents that stale root TID directly to
 # heap_update, so the current-DML path must prove the updater identity rather
 # than letting a fresh MVCC scan skip straight to the successor.
-my $seeker = $node1->background_psql('postgres', on_error_die => 1);
+my $seeker = $node1->background_psql(
+	'postgres', on_error_stop => 0, timeout => 45);
 $seeker->query_safe('BEGIN');
 $seeker->query_safe(
 	'DECLARE hot_cur NO SCROLL CURSOR FOR SELECT id, v FROM cmxh_t WHERE id = 1');
@@ -183,45 +203,56 @@ BAIL_OUT("could not position HOT root cursor: got '$positioned'")
 
 # A key-share locker plus a non-key UPDATE leaves an updater-bearing old
 # version.  Updating only v keeps the successor on the HOT chain.
-my $locker = $node0->background_psql('postgres', on_error_die => 1);
+my $locker = $node1->background_psql('postgres', on_error_die => 1);
 $locker->query_safe('BEGIN');
 $locker->query_safe('SELECT v FROM cmxh_t WHERE id = 1 FOR KEY SHARE');
-$node0->safe_psql('postgres', 'UPDATE cmxh_t SET v = v + 10 WHERE id = 1');
+# Keep the independent locker and updater on the seeker's node.  Peer mode
+# still routes their live updater-bearing MultiXact through the current-MX
+# authority bridge, while removing any inter-node PCM-X conversion that could
+# mask the exact TX-enqueue wait this test must observe.
+my $updater = $node1->background_psql('postgres', on_error_die => 1);
+$updater->query_safe('BEGIN');
+my $updater_pid = int($updater->query_safe('SELECT pg_backend_pid()'));
+is($updater->query_safe(
+		'UPDATE cmxh_t SET v = v + 10 WHERE id = 1 RETURNING v'),
+	'10', 'RED-HOT updater creates the successor and remains uncommitted');
 $locker->query_safe('COMMIT');
 $locker->quit;
 
-ok(tuple_has_hot_updater_multixact($node0, 'cmxh_t'),
-	'RED-HOT fixture contains a HOT-updated updater-bearing MultiXact');
-ok(state_key_exists($node1, 'hot_proof_hit_count')
-	  && state_key_exists($node1, 'hot_proof_failclosed_count'),
-	'current-MultiXact HOT observability keys are exposed');
-my $before = state_int($node1, 'hot_proof_hit_count');
-my $failclosed_before = state_int($node1, 'hot_proof_failclosed_count');
-my ($out, $err) = ('', '');
-my $updated = eval {
-	$out = $seeker->query_safe(
-		'UPDATE cmxh_t SET v = v + 1 WHERE CURRENT OF hot_cur RETURNING v');
-	1;
-};
-$err = $@ unless $updated;
-if ($updated)
-{
-	$seeker->query_safe('COMMIT');
-}
-else
-{
-	diag("foreign HOT UPDATE failed: $err");
-	eval { $seeker->query_safe('ROLLBACK') };
-	diag($node0->safe_psql(
+is($node1->safe_psql(
 		'postgres',
-		q{SELECT string_agg(
-		     format('lp=%s xmin=%s xmax=%s ctid=%s flags=%s',
-		       h.lp, h.t_xmin, h.t_xmax, h.t_ctid,
-		       array_to_string(f.raw_flags, '|')),
-		     '; ' ORDER BY h.lp)
-		   FROM heap_page_items(get_raw_page('cmxh_t', 0)) AS h
-		   CROSS JOIN LATERAL
-		     heap_tuple_infomask_flags(h.t_infomask, h.t_infomask2) AS f}));
+		qq{SELECT state = 'idle in transaction' AND xact_start IS NOT NULL
+		     FROM pg_stat_activity
+		    WHERE pid = $updater_pid}),
+	't', 'RED-HOT exact updater transaction is still open');
+my @counter_keys = qw(
+  wait_count
+  wait_resolved_count
+  wait_timeout_count
+  deadlock_victim_count
+  wakeup_count
+  hot_proof_hit_count
+  hot_proof_failclosed_count
+  restart_bucket_1_count);
+my $missing_counter_keys
+	= grep { !state_key_exists($node1, $_) } @counter_keys;
+is($missing_counter_keys, 0,
+	'current-MultiXact HOT observability keys are exposed');
+my %before = map { $_ => state_int($node1, $_) } @counter_keys;
+$seeker->query_until(
+	qr/CURRENT_MX_HOT_FIRED/,
+	"\\echo CURRENT_MX_HOT_FIRED\n"
+	  . "UPDATE cmxh_t SET v = v + 1 WHERE CURRENT OF hot_cur RETURNING v;\n"
+	  . "COMMIT;\n"
+	  . "\\echo CURRENT_MX_HOT_DONE\n");
+my $actual_wait_event = '';
+my $wait_observed = wait_for_event(
+	$node1,
+	'%UPDATE cmxh_t SET v = v + 1 WHERE CURRENT OF hot_cur%',
+	'GesTxEnqueueWait', 10, \$actual_wait_event);
+if (!$wait_observed)
+{
+	diag("CURRENT OF observed wait_event=$actual_wait_event");
 	diag($node1->safe_psql(
 		'postgres',
 		q{SELECT current_setting('cluster.multi_xmax_remote_resolve')
@@ -246,15 +277,72 @@ else
 			       'vis53r97_leg_multi_member_serve_hit_count')}));
 	}
 }
+ok($wait_observed,
+	'RED-HOT authenticated ACTIVE updater enters GesTxEnqueueWait');
+is(state_int($node1, 'wait_count'), $before{wait_count} + 1,
+	'RED-HOT current-MultiXact wait counter advances exactly once');
+is(state_int($node1, 'hot_proof_hit_count'), $before{hot_proof_hit_count},
+	'RED-HOT committed-proof hit is not recorded while updater is open');
+is(state_int($node1, 'hot_proof_failclosed_count'),
+	$before{hot_proof_failclosed_count},
+	'RED-HOT exact ACTIVE proof is not rejected while updater is open');
+is(state_int($node1, 'wait_resolved_count'),
+	$before{wait_resolved_count},
+	'RED-HOT wait remains unresolved before updater commit');
+is(state_int($node1, 'restart_bucket_1_count'),
+	$before{restart_bucket_1_count},
+	'RED-HOT operation has not restarted before updater commit');
+
+$updater->query_safe('COMMIT');
+$updater->quit;
+my $tail = $seeker->query_until(qr/CURRENT_MX_HOT_DONE/, "");
 $seeker->quit;
-ok($updated, 'RED-HOT current DML follows the foreign updater chain');
-is($out, '11', 'HOT successor is updated exactly once');
-ok(wait_for(
-	sub { state_int($node1, 'hot_proof_hit_count') > $before },
-		10),
-	'authoritative full-key HOT MATCH counter advanced');
-is(state_int($node1, 'hot_proof_failclosed_count'), $failclosed_before,
-	'positive HOT path did not accept raw-only or unknown evidence');
+is($node0->safe_psql(
+		'postgres', tuple_has_hot_updater_multixact_sql('cmxh_t')),
+	't', 'RED-HOT committed chain retains the updater-bearing MultiXact root');
+like($tail, qr/(?:^|\n)11(?:\n|$)/,
+	'RED-HOT waiter restarts and updates the successor exactly once');
+# hot_proof_hit_count is per successful MATCH consumer, not per outer
+# operation.  This WHERE CURRENT OF statement deterministically consumes one
+# chain-helper MATCH and two ordinary-updated MATCHes after the wait restart.
+# wakeup_count is orthogonal: it counts matching SetLatch signal events, and a
+# same-node holder may resolve on the wait loop's exact terminal TT recheck
+# without an inbound remote-hint signal.
+my $post_commit_contract = wait_for(
+		sub {
+			return state_int($node1, 'wait_resolved_count')
+			  == $before{wait_resolved_count} + 1
+			  && state_int($node1, 'restart_bucket_1_count')
+			  == $before{restart_bucket_1_count} + 1
+			  && state_int($node1, 'hot_proof_hit_count')
+			  == $before{hot_proof_hit_count} + 3;
+		},
+		10);
+my %after = map { $_ => state_int($node1, $_) } qw(
+  wait_resolved_count
+  wakeup_count
+  restart_bucket_1_count
+  hot_proof_hit_count);
+diag("RED-HOT matching SetLatch wakeup signal delta="
+	  . ($after{wakeup_count} - $before{wakeup_count}));
+if (!$post_commit_contract)
+{
+	diag(join(', ',
+			map {
+				"$_=$after{$_} (before=$before{$_}, delta="
+				  . ($after{$_} - $before{$_}) . ')'
+			} sort keys %after));
+}
+ok($post_commit_contract,
+	'RED-HOT terminal recheck resolves once, restarts once, and consumes three MATCH proofs');
+is(state_int($node1, 'wait_timeout_count'), $before{wait_timeout_count},
+	'RED-HOT exact ACTIVE wait does not time out');
+is(state_int($node1, 'deadlock_victim_count'),
+	$before{deadlock_victim_count},
+	'RED-HOT exact ACTIVE wait is not a deadlock victim');
+is(state_int($node1, 'hot_proof_failclosed_count'),
+	$before{hot_proof_failclosed_count},
+	'RED-HOT exact ACTIVE proof never enters fail-closed');
 my ($read_rc, $read_out, $read_err) =
   $node1->psql('postgres', 'SELECT v FROM cmxh_t WHERE id = 1', timeout => 30);
 is($read_rc, 0, 'committed HOT successor remains readable');

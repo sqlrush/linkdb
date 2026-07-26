@@ -12940,6 +12940,29 @@
   proargnames => '{node_id,cluster_epoch,collection_status,stats_since,describe_local_count,describe_remote_ask_count,describe_remote_hit_count,describe_remote_denied_count,describe_remote_supported_limit_count,describe_remote_timeout_count,describe_remote_unknown_count,describe_invalid_reply_count,member_proof_ask_count,member_proof_hit_count,member_proof_unknown_count,member_proof_denied_count,member_proof_supported_limit_count,member_proof_timeout_count,member_proof_invalid_reply_count,wait_count,wait_resolved_count,wait_dead_holder_count,wait_timeout_count,wait_retry_count,wait_interrupted_count,deadlock_victim_count,wakeup_count,recompose_success_count,recompose_failclosed_count,hot_proof_hit_count,hot_proof_failclosed_count,aba_restart_count,restart_bucket_0_count,restart_bucket_1_count,restart_bucket_2_3_count,restart_bucket_4_7_count,restart_bucket_8_plus_count,restart_max,foreign_slru_guard_count}',
   prosrc => 'cluster_get_gcluster_multixact_current_stats' },
 
+# S3-P0-18: assertion-build-only, superuser exact probe for one restart-bound
+# GCS block dedup 5-tuple.  The wrapper is always linked so non-assert builds
+# fail with FEATURE_NOT_SUPPORTED instead of leaving an fmgrtab hole.
+{ oid => '8978',
+  descr => 'TEST-ONLY: inspect one exact restart-bound GCS block dedup identity',
+  proname => 'pg_cluster_gcs_block_dedup_debug_exact',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'record', proargtypes => 'int4 int4 int8 int8 int8',
+  proallargtypes => '{int4,int4,int8,int8,int8,bool,int4,int4,int4,int4,int8,int8,int8,oid,oid,oid,int4,int8,int4,int4,int4,bool,bool,int8,int8,int8,int8,int8}',
+  proargmodes => '{i,i,i,i,i,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o,o}',
+  proargnames => '{origin_node_id_arg,requester_backend_id_arg,request_id_arg,cluster_epoch_arg,origin_boot_incarnation_arg,found,match_count,worker_id,origin_node_id,requester_backend_id,request_id,cluster_epoch,origin_boot_incarnation,spc_oid,db_oid,rel_number,fork_num,block_num,entry_kind,transition_id,status,completed,done,hit_count,miss_count,collision_count,done_marked_count,done_mismatch_count}',
+  prosrc => 'pg_cluster_gcs_block_dedup_debug_exact' },
+
+# S3-P0-13: assertion-build-only, superuser trigger for one real
+# non-authoritative undo-verdict request to a remote LMS.
+{ oid => '8979',
+  descr => 'TEST-ONLY: request a real remote LMS undo-verdict OTHER refusal',
+  proname => 'cluster_test_request_undo_verdict_other',
+  provolatile => 'v', proparallel => 'u',
+  prorettype => 'bool', proargtypes => 'int4 xid',
+  proargnames => '{target_node,xid}',
+  prosrc => 'cluster_test_request_undo_verdict_other' },
+
 # spec-4.10 D2: reconstruct one block via the online single-block recovery
 # orchestrator over an explicit WAL window, for the byte-for-byte differential
 # vs PG real crash-recovery redo.  Returns the reconstructed page as bytea, or

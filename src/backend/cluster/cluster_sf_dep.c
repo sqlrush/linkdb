@@ -158,19 +158,30 @@ cluster_sf_dep_shmem_register(void)
  *
  * spec-2.2 additive amendment (spec-5.22e D5 prereq): record the peer's
  * verified HELLO capability word, bound to the connection generation that
- * carried it (tier1: the peer's reconnect_count while the connection was
- * established).  Called from the acceptor's HELLO verify, from the dialer's
- * PEER_CAPS_REPLY handler, and from RDMA verify (generation 0; tier1-only
- * generation boundary, see cluster_sf_dep.h).
+ * carried it (tier1 supplies the peer's one-based reconnect identity while
+ * the connection was established).  Called from the acceptor's HELLO verify,
+ * from the dialer's PEER_CAPS_REPLY handler, and from RDMA verify (generation
+ * 0; tier1-only generation boundary, see cluster_sf_dep.h).
  */
 void
 cluster_sf_note_peer_hello_capabilities_gen(int32 peer_id, uint32 capabilities, uint32 generation)
+{
+	cluster_sf_note_peer_hello_identity_gen(
+		peer_id, capabilities, generation, 0);
+}
+
+void
+cluster_sf_note_peer_hello_identity_gen(
+	int32 peer_id, uint32 capabilities, uint32 generation,
+	uint64 boot_incarnation)
 {
 	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
-	cluster_sf_peer_cap_note(&ClusterSfDep->peer_capabilities[peer_id], capabilities, generation);
+	cluster_sf_peer_cap_note_identity(
+		&ClusterSfDep->peer_capabilities[peer_id], capabilities, generation,
+		boot_incarnation);
 	LWLockRelease(&ClusterSfDep->lock);
 }
 
@@ -281,6 +292,55 @@ cluster_sf_peer_supports_gcs_done(int32 peer_id)
 	capabilities = cluster_sf_peer_cap_bits(&ClusterSfDep->peer_capabilities[peer_id]);
 	LWLockRelease(&ClusterSfDep->lock);
 	return (capabilities & PGRAC_IC_HELLO_CAP_GCS_DONE_V1) != 0;
+}
+
+bool
+cluster_sf_peer_boot_identity(int32 peer_id, uint32 *generation,
+							  uint64 *boot_incarnation)
+{
+	bool valid;
+
+	if (generation != NULL)
+		*generation = 0;
+	if (boot_incarnation != NULL)
+		*boot_incarnation = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	valid = ClusterSfDep->peer_capabilities[peer_id].valid
+			&& ClusterSfDep->peer_capabilities[peer_id].boot_incarnation != 0;
+	if (valid) {
+		if (generation != NULL)
+			*generation = ClusterSfDep->peer_capabilities[peer_id].generation;
+		if (boot_incarnation != NULL)
+			*boot_incarnation
+				= ClusterSfDep->peer_capabilities[peer_id].boot_incarnation;
+	}
+	LWLockRelease(&ClusterSfDep->lock);
+	return valid;
+}
+
+bool
+cluster_sf_peer_gcs_request_boot_identity(int32 peer_id, uint32 *generation,
+										  uint64 *boot_incarnation)
+{
+	bool supported;
+
+	if (generation != NULL)
+		*generation = 0;
+	if (boot_incarnation != NULL)
+		*boot_incarnation = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_identity_for_bits(
+		&ClusterSfDep->peer_capabilities[peer_id],
+		PGRAC_IC_HELLO_CAP_GCS_REQUEST_BOOT_V1, generation,
+		boot_incarnation);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
 }
 
 /*
@@ -418,6 +478,87 @@ cluster_sf_peer_multixact_current_capability_generation(int32 peer_id, uint32 *g
 	supported = cluster_sf_peer_cap_generation_for_bits(
 		&ClusterSfDep->peer_capabilities[peer_id], PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
 		generation);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
+/* Type-65 is one atomic four-phase protocol.  The caller additionally binds
+ * the chosen shard-aligned DATA connection generation in the LMS outbound
+ * ring, so neither a stale CONTROL capability record nor a reconnected DATA
+ * socket can inherit a certificate frame. */
+bool
+cluster_sf_peer_stale_x_cert_capability_generation(int32 peer_id, uint32 *generation)
+{
+	uint64 boot_incarnation;
+
+	return cluster_sf_peer_stale_x_cert_capability_identity(
+		peer_id, generation, &boot_incarnation);
+}
+
+bool
+cluster_sf_peer_stale_x_cert_capability_identity(
+	int32 peer_id, uint32 *generation, uint64 *boot_incarnation)
+{
+	bool supported;
+
+	if (generation != NULL)
+		*generation = 0;
+	if (boot_incarnation != NULL)
+		*boot_incarnation = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_identity_for_bits(
+		&ClusterSfDep->peer_capabilities[peer_id], PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1,
+		generation, boot_incarnation);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
+/* Types 66/67 share one protocol capability and the same QVOTEC-published
+ * peer boot identity discipline as type 65.  Callers additionally bind the
+ * staged frame to the selected DATA connection generation in the LMS ring. */
+bool
+cluster_sf_peer_forward_cancel_capability_identity(
+	int32 peer_id, uint32 *generation, uint64 *boot_incarnation)
+{
+	bool supported;
+
+	if (generation != NULL)
+		*generation = 0;
+	if (boot_incarnation != NULL)
+		*boot_incarnation = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_identity_for_bits(
+		&ClusterSfDep->peer_capabilities[peer_id],
+		PGRAC_IC_HELLO_CAP_GCS_FORWARD_CANCEL_V1, generation,
+		boot_incarnation);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
+bool
+cluster_sf_peer_ges_dedup_done_capability_identity(
+	int32 peer_id, uint32 *generation, uint64 *boot_incarnation)
+{
+	bool supported;
+
+	if (generation != NULL)
+		*generation = 0;
+	if (boot_incarnation != NULL)
+		*boot_incarnation = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_identity_for_bits(
+		&ClusterSfDep->peer_capabilities[peer_id],
+		PGRAC_IC_HELLO_CAP_GES_DEDUP_DONE_V1, generation,
+		boot_incarnation);
 	LWLockRelease(&ClusterSfDep->lock);
 	return supported;
 }

@@ -370,11 +370,17 @@ ok(-e "$shared_root/global/pgrac_xid_prehistory",
 	'G2: clean seed shutdown published XID prehistory');
 
 append_strict_two_node_conf($node0, $disks_csv, $wal_root);
-$node0->append_conf('postgresql.conf', "cluster.node_id = 0\n");
+$node0->append_conf('postgresql.conf', <<EOC);
+cluster.node_id = 0
+cluster.crossnode_runtime_visibility = on
+EOC
 
 append_common_shared_catalog_conf($node1, $shared_root);
 append_strict_two_node_conf($node1, $disks_csv, $wal_root);
-$node1->append_conf('postgresql.conf', "cluster.node_id = 1\n");
+$node1->append_conf('postgresql.conf', <<EOC);
+cluster.node_id = 1
+cluster.crossnode_runtime_visibility = on
+EOC
 
 my $data0 = PostgreSQL::Test::Cluster::get_free_port();
 my $data1 = PostgreSQL::Test::Cluster::get_free_port();
@@ -390,6 +396,10 @@ wait_sql_eq($node0,
 	"SELECT COALESCE(bool_or(heartbeat_recv_count > 0), false) "
 	. "FROM pg_cluster_ic_peers WHERE node_id = 1",
 	't', 'G3: node0 sees node1 heartbeats');
+is($node0->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'),
+	'on', 'G3: origin runtime-visibility serve gate is armed');
+is($node1->safe_psql('postgres', 'SHOW cluster.crossnode_runtime_visibility'),
+	'on', 'G3: requester runtime-visibility consume gate is armed');
 
 wait_sql_eq($node1,
 	q{SELECT count(*) FROM pg_namespace WHERE nspname = 'sxid'},
@@ -503,7 +513,45 @@ wait_sql_eq($node1,
 my ($g8_rc, $g8_out, $g8_err) = $node1->psql('postgres', q{
 SET cluster.crossnode_runtime_visibility = on;
 SELECT count(*) FROM sxid.reuse});
+is($g8_rc, 0, 'G8: post-restart native-row scan completes without fail-closed error');
 is($g8_out, '20', 'G8: native rows stay resolvable after joiner restart');
+if ($g8_rc != 0)
+{
+	diag('G8 requester error: ' . ($g8_err // '<none>'));
+	my $counter_sql = q{
+SELECT string_agg(key || '=' || value, ',' ORDER BY key)
+  FROM pg_cluster_state
+ WHERE category = 'cr'
+   AND key IN (
+     'rtvis_resolve_committed_count',
+     'rtvis_resolve_aborted_count',
+     'rtvis_resolve_failclosed_count',
+     'rtvis_verdict_wire_count',
+     'rtvis_verdict_failclosed_count',
+     'rtvis_verdict_exact_count',
+     'rtvis_verdict_below_horizon_count',
+     'rtvis_verdict_inadmissible_count',
+     'cr_server_verdict_served_count',
+     'cr_server_verdict_denied_count',
+     'vis_freshref_verdict_resolved_count',
+     'vis_freshref_verdict_failclosed_count',
+     'vis53r97_leg_invalid_scn_refuse_count',
+     'vis53r97_leg_zero_match_refuse_count',
+     'vis53r97_leg_srv_other_refuse_count',
+     'vis53r97_leg_covers_refuse_count',
+     'vis53r97_leg_xmax_unprovable_count')};
+	for my $counter_node ($node0, $node1)
+	{
+		my ($counter_rc, $counter_out, $counter_err)
+			= $counter_node->psql('postgres', $counter_sql);
+		diag(
+			'G8 '
+			  . $counter_node->name
+			  . " cr counters rc=$counter_rc: "
+			  . ($counter_out // '<none>')
+			  . (($counter_err // '') ne '' ? " stderr=$counter_err" : ''));
+	}
+}
 
 $node1->stop;
 $node0->stop;

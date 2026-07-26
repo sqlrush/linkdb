@@ -60,6 +60,11 @@
 
 #define CLUSTER_IC_TIER1_LAST_ERROR_LEN 128
 #define CLUSTER_IC_TIER1_ADDR_LEN 64
+/*
+ * Bound one readable-event receive turn so an always-readable peer cannot
+ * starve the owning LMON/LMS loop's signal handling or outbound drain.
+ */
+#define CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET 6
 
 typedef struct ClusterICPeerStateShmem {
 	int32 node_id; /* peer's node_id */
@@ -266,6 +271,8 @@ extern bool cluster_ic_tier1_pending_outbound(int32 peer_id);
  */
 extern ClusterICSendResult cluster_ic_tier1_drain_outbound(int32 peer_id);
 extern uint64 cluster_ic_tier1_get_writable_drain(ClusterICPlane plane);
+extern uint64 cluster_ic_tier1_get_recv_budget_yield(ClusterICPlane plane);
+extern uint64 cluster_ic_tier1_get_recv_turn_frame_highwater(ClusterICPlane plane);
 
 /*
  * PGRAC: GCS serve-stall round-5 — plane-scoped outbound-FIFO accounting.
@@ -354,11 +361,13 @@ extern bool cluster_ic_tier1_bind_verified_anon_peer(int anon_slot, int32 learne
 extern void cluster_ic_tier1_anon_hello_reset(int anon_slot);
 
 /*
- * Drain pending heartbeat frames from peer_fd.  Reads until EAGAIN,
- * accumulating bytes into a per-peer recv buffer; for each fully
- * received 24-byte ClusterMsgHeader (msg_type=HEARTBEAT, payload_len=0,
- * CRC OK) bumps heartbeat_recv_count + last_heartbeat_recv_at.
- * Returns false on hard recv error (caller should close_peer).
+ * Drain generic envelope frames from peer_fd.  Accumulates a 36-byte
+ * envelope plus its optional payload in per-peer receive state, verifies
+ * and dispatches each complete frame, and checks interrupts after each
+ * frame.  Returns after EAGAIN or
+ * CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET complete frames so the owning
+ * LMON/LMS loop can process signals and queued outbound work.
+ * Returns false on hard recv/verify/dispatch error (caller closes peer).
  */
 extern bool cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd);
 

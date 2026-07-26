@@ -46,6 +46,7 @@
 #include "cluster/cluster_cr_coordinator_stat.h" /* cluster_cross_instance_cr_* (spec-5.57 D3) */
 #include "cluster/cluster_cr_cache.h"			 /* cluster_cr_cache_max_blocks (spec-3.10 D4) */
 #include "cluster/cluster_grd.h"				 /* spec-5.10 starvation-protection shared flag */
+#include "cluster/cluster_native_lock_probe.h" /* native-probe packed counter bounds */
 #include "cluster/cluster_cr_pool.h"			 /* cluster_shared_cr_pool_* (spec-5.51 D8) */
 #include "cluster/cluster_resolver_cache.h" /* cluster_shared_resolver_cache_* (spec-5.55 D7) */
 #include "cluster/cluster_guc.h"
@@ -262,6 +263,20 @@ int cluster_lmd_cleanup_sweep_interval_ms = 5000; /* LMD safety net cleanup inte
 int cluster_lms_native_lock_probe_max_inflight = 8;		   /* per-shard slot capacity */
 int cluster_lms_native_lock_probe_retry_interval_ms = 500; /* retry poll cadence */
 int cluster_lms_native_lock_probe_retry_budget = 60;	   /* ~30s @ 500ms before 53R83 */
+#ifdef USE_ASSERT_CHECKING
+/*
+ * r19 L9 deterministic race seam.  It is absent from non-assert binaries,
+ * hidden from normal GUC output, startup-fixed, and disabled by default.
+ */
+int cluster_unsafe_test_native_probe_force_clear_once = 0;
+int cluster_unsafe_test_native_probe_force_clear_node_id = -1;
+int cluster_unsafe_test_native_probe_force_clear_database_oid = 0;
+int cluster_unsafe_test_native_probe_force_clear_relation_oid = 0;
+/* S3-P0-18 runtime-only restart-ABA proof seam; 0 disables. */
+int cluster_test_gcs_block_next_request_sequence = 0;
+/* S3-P0-24 runtime-only peer-reformation refusal seam; 0 disables. */
+int cluster_unsafe_test_pcm_x_peer_reform_fault = 0;
+#endif
 
 /* spec-2.27 D4 — GES retransmit + dedup HTAB tunables (HC51 / HC52 / HC53). */
 int cluster_ges_retransmit_max_attempts = 5; /* finite default; 0 = disabled */
@@ -2598,7 +2613,68 @@ cluster_init_guc(void)
 					 "ERRCODE_CLUSTER_NATIVE_LOCK_PROBE_TIMEOUT returned to caller; "
 					 "transaction must retry / abort.  spec-2.27 fairness escalation "
 					 "(priority-boost-after-K) will reduce default after wire."),
-		&cluster_lms_native_lock_probe_retry_budget, 60, 1, 3600, PGC_SIGHUP, 0, NULL, NULL, NULL);
+		&cluster_lms_native_lock_probe_retry_budget, 60, 1,
+		CLUSTER_LMS_NATIVE_LOCK_PROBE_RETRY_BUDGET_MAX, PGC_SIGHUP, 0,
+		NULL, NULL, NULL);
+
+#ifdef USE_ASSERT_CHECKING
+	/*
+	 * r19 L9 only: force exactly one completed CONVERT + AccessExclusive
+	 * native-probe aggregate to CLEAR for one exact (node, relation LOCKTAG).
+	 * These knobs do not exist in non-assert binaries and cannot be
+	 * SET/reloaded after startup.
+	 */
+	DefineCustomIntVariable(
+		"cluster.unsafe_test_native_probe_force_clear_once",
+		gettext_noop("Unsafe assertion-build test seam: one exact native probe CLEAR."),
+		gettext_noop("Test only.  0 (default) disables the seam; 1 atomically consumes "
+					 "one exact node + relation LOCKTAG + CONVERT + AccessExclusive "
+					 "match after all real peer replies."),
+		&cluster_unsafe_test_native_probe_force_clear_once, 0, 0, 1,
+		PGC_POSTMASTER, GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.unsafe_test_native_probe_force_clear_node_id",
+		gettext_noop("Unsafe assertion-build test seam target node."),
+		NULL, &cluster_unsafe_test_native_probe_force_clear_node_id, -1, -1,
+		CLUSTER_MAX_NODES - 1, PGC_POSTMASTER,
+		GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.unsafe_test_native_probe_force_clear_database_oid",
+		gettext_noop("Unsafe assertion-build test seam relation database OID."),
+		NULL, &cluster_unsafe_test_native_probe_force_clear_database_oid, 0, 0,
+		INT_MAX, PGC_POSTMASTER,
+		GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.unsafe_test_native_probe_force_clear_relation_oid",
+		gettext_noop("Unsafe assertion-build test seam relation OID."),
+		NULL, &cluster_unsafe_test_native_probe_force_clear_relation_oid, 0, 0,
+		INT_MAX, PGC_POSTMASTER,
+		GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.unsafe_test_gcs_block_next_request_sequence",
+		gettext_noop("Unsafe assertion-build test seam: next GCS block request sequence."),
+		gettext_noop("Test only.  A positive value is consumed once by the current "
+					 "backend's next ordinary block-request reservation, then reset "
+					 "to zero before the requester-domain id is minted."),
+		&cluster_test_gcs_block_next_request_sequence, 0, 0, INT_MAX,
+		PGC_SUSET,
+		GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
+	DefineCustomIntVariable(
+		"cluster.unsafe_test_pcm_x_peer_reform_fault",
+		gettext_noop("Unsafe assertion-build test seam: peer-reformation refusal class."),
+		gettext_noop("Test only.  0 (default) disables the seam; 1 consumes one "
+					 "remote-session advance as live-slot evidence; 2 consumes it "
+					 "as an epoch-drift proof failure."),
+		&cluster_unsafe_test_pcm_x_peer_reform_fault, 0, 0, 2,
+		PGC_POSTMASTER,
+		GUC_NOT_IN_SAMPLE | GUC_NO_SHOW_ALL | GUC_SUPERUSER_ONLY,
+		NULL, NULL, NULL);
+#endif
 
 	/* spec-2.17 D11:  BAST retry GUC(Q11 v0.6 — 不 kill healthy holder). */
 	DefineCustomIntVariable("cluster.ges_bast_retry_interval_ms",
@@ -4165,9 +4241,9 @@ cluster_init_guc(void)
 
 	DefineCustomIntVariable("cluster.gcs_block_dedup_max_entries",
 							gettext_noop("Master-side GCS block dedup HTAB capacity (entries)."),
-							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8448B.  "
-										 "Default 16384 → ~138MB shmem on each node serving as "
-										 "GCS block-ship master; ceiling 65536 → ~554MB; "
+							gettext_noop("Each entry occupies sizeof(GcsBlockDedupEntry) = 8512B.  "
+										 "Default 16384 → ~139MB shmem on each node serving as "
+										 "GCS block-ship master; ceiling 65536 → ~558MB; "
 										 "bootstrap/initdb with no configured cluster.node_id does "
 										 "not allocate the HTAB.  The effective capacity is never "
 										 "below MaxConnections × declared node count (auto-size "

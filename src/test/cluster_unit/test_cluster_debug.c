@@ -36,18 +36,23 @@
  *	  aggregator -- linking it standalone requires stubs for the public
  *	  symbols from other cluster_*.o files.  The stubs below are the
  *	  minimum set.  The SRF body is invoked to validate its category/key
- *	  surface, while stub return values remain inert zero-state inputs.
+ *	  surface; most stubs remain inert zero-state inputs, while selected
+ *	  dump-contract tests use distinct values to detect accessor miswiring.
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
+#include "access/htup_details.h"
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
+#include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_debug.h"
+#include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_multixact_current_stats.h" /* spec-3.6b D4 counter stub */
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched getter stubs */
 #include "cluster/cluster_touched_peers.h"	  /* spec-5.14 D6 self_hex stub */
@@ -56,6 +61,9 @@
 #include "cluster/cluster_hw_lease.h"		  /* spec-6.12d lease counter stub */
 #include "cluster/cluster_relmap_authority.h" /* spec-6.14 D5 header-read stub */
 #include "cluster/cluster_xid_authority.h"	  /* spec-6.15b XID authority dump stubs */
+#include "cluster/cluster_undo_horizon.h"	  /* S3-P0-14 reason counter stub */
+#include "funcapi.h"
+#include "miscadmin.h"
 
 #undef printf
 #undef fprintf
@@ -72,9 +80,69 @@
 
 
 #define CAPTURED_DUMP_ROWS_MAX 2048
-static const char *captured_dump_categories[CAPTURED_DUMP_ROWS_MAX];
-static const char *captured_dump_keys[CAPTURED_DUMP_ROWS_MAX];
+#define CAPTURED_DUMP_VALUE_MAX 384
+#define CAPTURED_DUMP_CATEGORY_MAX 64
+#define CAPTURED_DUMP_KEY_MAX 96
+static char captured_dump_categories[CAPTURED_DUMP_ROWS_MAX][CAPTURED_DUMP_CATEGORY_MAX];
+static char captured_dump_keys[CAPTURED_DUMP_ROWS_MAX][CAPTURED_DUMP_KEY_MAX];
+static char captured_dump_values[CAPTURED_DUMP_ROWS_MAX][CAPTURED_DUMP_VALUE_MAX];
 static int captured_dump_row_count;
+static PcmXRetireFrontierCensus retire_census_fixture;
+static bool retire_census_result;
+static GcsBlockForwardPhaseCensus forward_phase_census_fixture;
+static bool forward_phase_census_result;
+static ClusterCfSlotCensus cf_slot_census_fixture;
+static bool cf_slot_census_result;
+static ClusterNodeInfo conf_node_fixture[4];
+static int conf_node_fixture_count;
+
+#ifdef USE_ASSERT_CHECKING
+bool
+cluster_gcs_block_dedup_debug_exact(
+	const GcsBlockDedupKey *key pg_attribute_unused(),
+	GcsBlockDedupDebugExactSnapshot *snapshot_out)
+{
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	return false;
+}
+#endif
+
+bool
+cluster_gcs_block_dedup_forward_phase_census(GcsBlockForwardPhaseCensus *out)
+{
+	if (out == NULL)
+		return false;
+	*out = forward_phase_census_fixture;
+	return forward_phase_census_result;
+}
+
+bool
+superuser(void)
+{
+	return true;
+}
+
+TypeFuncClass
+get_call_result_type(FunctionCallInfo fcinfo pg_attribute_unused(),
+					 Oid *resultTypeId pg_attribute_unused(), TupleDesc *resultTupleDesc)
+{
+	if (resultTupleDesc != NULL)
+		*resultTupleDesc = NULL;
+	return TYPEFUNC_COMPOSITE;
+}
+
+HeapTuple
+heap_form_tuple(TupleDesc tupleDescriptor pg_attribute_unused(),
+				Datum *values pg_attribute_unused(), bool *isnull pg_attribute_unused())
+{
+	return NULL;
+}
+
+Datum
+HeapTupleHeaderGetDatum(HeapTupleHeader tuple)
+{
+	return PointerGetDatum(tuple);
+}
 
 uint64
 cluster_multixact_current_stats_get(ClusterCurrentMxStatId stat pg_attribute_unused())
@@ -186,6 +254,18 @@ cluster_ic_tier1_get_listener_port(void)
 }
 uint64
 cluster_ic_tier1_get_writable_drain(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
+uint64
+cluster_ic_tier1_get_recv_budget_yield(ClusterICPlane plane)
+{
+	(void)plane;
+	return 0;
+}
+uint64
+cluster_ic_tier1_get_recv_turn_frame_highwater(ClusterICPlane plane)
 {
 	(void)plane;
 	return 0;
@@ -305,10 +385,19 @@ cluster_pgstat_get_count(void)
 /* spec-5.6 Dc4: dump_cf reads the CF counters; cluster_cf_stats.o is not
  * linked into this dump test, so a trivial stub satisfies the link. */
 uint64
-cluster_cf_counter_read(int which)
+cluster_cf_counter_read(ClusterCfCounter which)
 {
 	(void)which;
 	return 0;
+}
+
+bool
+cluster_cf_slot_census(ClusterCfSlotCensus *out)
+{
+	if (out == NULL)
+		return false;
+	*out = cf_slot_census_fixture;
+	return cf_slot_census_result;
 }
 
 bool
@@ -322,12 +411,17 @@ cluster_pgstat_get_at(int idx pg_attribute_unused(), const char **name_out pg_at
 int
 cluster_conf_node_count(void)
 {
-	return 0;
+	return conf_node_fixture_count;
 }
 
 const ClusterNodeInfo *
-cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
+cluster_conf_lookup_node(int32 node_id)
 {
+	int i;
+
+	for (i = 0; i < conf_node_fixture_count; i++)
+		if (conf_node_fixture[i].node_id == node_id)
+			return &conf_node_fixture[i];
 	return NULL;
 }
 
@@ -930,6 +1024,28 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 	return false;
 }
 
+bool
+cluster_pcm_x_retire_frontier_census(PcmXRetireFrontierCensus *out)
+{
+	if (out == NULL)
+		return false;
+	*out = retire_census_fixture;
+	return retire_census_result;
+}
+
+void
+cluster_bufmgr_pcm_x_ledger_counts(ClusterBufmgrPcmXLedgerCounts *out)
+{
+	memset(out, 0, sizeof(*out));
+}
+
+void
+cluster_bufmgr_pcm_x_retry_barrier_debug_snapshot(
+	ClusterBufmgrPcmXBarrierDebugSnapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+}
+
 PcmXRuntimeSnapshot
 cluster_pcm_x_runtime_snapshot(void)
 {
@@ -942,6 +1058,15 @@ cluster_pcm_x_runtime_snapshot(void)
 
 bool
 cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen)
+{
+	if (buf != NULL && buflen > 0)
+		buf[0] = '\0';
+	return false;
+}
+
+bool
+cluster_pcm_x_runtime_peer_binding_debug(int32 peer_node pg_attribute_unused(),
+										 char *buf, Size buflen)
 {
 	if (buf != NULL && buflen > 0)
 		buf[0] = '\0';
@@ -1266,6 +1391,18 @@ cluster_gcs_get_block_dedup_done_marked_count(void)
 }
 uint64
 cluster_gcs_get_block_dedup_done_mismatch_count(void)
+{
+	return 0;
+}
+
+/* S3-P0-09 stubs: 2 NEW live-forward-marker DONE refusal counters. */
+uint64
+cluster_gcs_get_block_dedup_done_forwarded_refused_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_get_block_dedup_done_cancelling_refused_count(void)
 {
 	return 0;
 }
@@ -2246,6 +2383,21 @@ cluster_cr_server_fence_refused_count(void)
 	return 0;
 }
 uint64
+cluster_cr_server_terminal_resample_commit_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_terminal_resample_abort_count(void)
+{
+	return 0;
+}
+uint64
+cluster_cr_server_terminal_resample_unknown_count(void)
+{
+	return 0;
+}
+uint64
 cluster_rtvis_underivable_failclosed_count(void)
 {
 	return 0;
@@ -2324,7 +2476,74 @@ cluster_vis53r97_leg_zero_match_refuse_count(void)
 uint64
 cluster_vis53r97_leg_srv_other_refuse_count(void)
 {
-	return 0;
+	return 91;
+}
+/* S3-P0-13 test-only values: the production dump must preserve each
+ * accessor/key pairing, then its aggregate must equal sum(1..13). */
+uint64
+cluster_cr_server_other_refuse_not_authoritative_count(void)
+{
+	return 1;
+}
+uint64
+cluster_cr_server_other_refuse_not_mine_count(void)
+{
+	return 2;
+}
+uint64
+cluster_cr_server_other_refuse_expected_segment_invalid_count(void)
+{
+	return 3;
+}
+uint64
+cluster_cr_server_other_refuse_expected_slot_invalid_count(void)
+{
+	return 4;
+}
+uint64
+cluster_cr_server_other_refuse_segment_mismatch_count(void)
+{
+	return 5;
+}
+uint64
+cluster_cr_server_other_refuse_slot_mismatch_count(void)
+{
+	return 6;
+}
+uint64
+cluster_cr_server_other_refuse_confirm_resolve_kind_count(void)
+{
+	return 7;
+}
+uint64
+cluster_cr_server_other_refuse_confirm_segment_mismatch_count(void)
+{
+	return 8;
+}
+uint64
+cluster_cr_server_other_refuse_confirm_slot_mismatch_count(void)
+{
+	return 9;
+}
+uint64
+cluster_cr_server_other_refuse_confirm_wrap_mismatch_count(void)
+{
+	return 10;
+}
+uint64
+cluster_cr_server_other_refuse_confirm_scn_mismatch_count(void)
+{
+	return 11;
+}
+uint64
+cluster_cr_server_other_refuse_terminal_unknown_count(void)
+{
+	return 12;
+}
+uint64
+cluster_cr_server_other_refuse_residual_count(void)
+{
+	return 13;
 }
 uint64
 cluster_vis53r97_leg_covers_refuse_count(void)
@@ -2851,6 +3070,12 @@ cluster_undo_horizon_admission_refuse_count(void)
 	return 0;
 }
 uint64
+cluster_undo_horizon_admission_reason_count(
+	ClusterUndoAdmissionReason reason pg_attribute_unused())
+{
+	return 0;
+}
+uint64
 cluster_undo_horizon_idle_sentinel_sent_count(void)
 {
 	return 0;
@@ -3167,8 +3392,15 @@ tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
 	UT_ASSERT(captured_dump_row_count < CAPTURED_DUMP_ROWS_MAX);
 	if (captured_dump_row_count >= CAPTURED_DUMP_ROWS_MAX)
 		return;
-	captured_dump_categories[captured_dump_row_count] = (const char *)DatumGetPointer(values[0]);
-	captured_dump_keys[captured_dump_row_count] = (const char *)DatumGetPointer(values[1]);
+	strlcpy(captured_dump_categories[captured_dump_row_count],
+			(const char *)DatumGetPointer(values[0]),
+			sizeof(captured_dump_categories[captured_dump_row_count]));
+	strlcpy(captured_dump_keys[captured_dump_row_count],
+			(const char *)DatumGetPointer(values[1]),
+			sizeof(captured_dump_keys[captured_dump_row_count]));
+	strlcpy(captured_dump_values[captured_dump_row_count],
+			(const char *)DatumGetPointer(values[2]),
+			sizeof(captured_dump_values[captured_dump_row_count]));
 	captured_dump_row_count++;
 }
 
@@ -3179,9 +3411,15 @@ cstring_to_text(const char *s)
 }
 
 char *
-psprintf(const char *fmt pg_attribute_unused(), ...)
+psprintf(const char *fmt, ...)
 {
-	return (char *)"";
+	static char buffer[CAPTURED_DUMP_VALUE_MAX];
+	va_list	args;
+
+	va_start(args, fmt);
+	(void)vsnprintf(buffer, sizeof(buffer), fmt, args);
+	va_end(args);
+	return buffer;
 }
 
 char *
@@ -3832,6 +4070,55 @@ cluster_ges_timeout_master_reject_count(void)
 	return 0;
 }
 
+/* S3-P0-10: normal-terminal GES dedup lifecycle occupancy/counter stubs. */
+uint32
+cluster_ges_dedup_entry_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_dedup_hit_cached_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_dedup_in_flight_dup_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_dedup_stale_reprocess_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_dedup_full_reject_count(void)
+{
+	return 0;
+}
+
+uint32
+cluster_ges_dedup_journal_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_dedup_journal_full_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_ges_dedup_journal_ack_count(void)
+{
+	return 0;
+}
+
 /* spec-2.14 D12 / L104 stubs: cluster_debug dump_grd references 7 new
  * spec-2.14 cluster_grd module accessors;  test_cluster_debug standalone
  * binary doesn't link cluster_grd.o,  vacuous stubs. */
@@ -4263,6 +4550,19 @@ UT_TEST(test_debug_dump_srf_linkable)
 	UT_ASSERT_NOT_NULL((void *)cluster_dump_state);
 }
 
+static void
+set_retire_peer(PcmXPeerFrontier *peer, uint64 epoch, uint64 session,
+				uint64 next_prehandle, uint64 retired_prehandle,
+				uint64 retired_ticket, uint64 in_progress_ticket)
+{
+	peer->cluster_epoch = epoch;
+	peer->sender_session_incarnation = session;
+	peer->next_expected_prehandle_sequence = next_prehandle;
+	peer->retired_prehandle_sequence = retired_prehandle;
+	peer->local_retired_ticket_id = retired_ticket;
+	peer->local_retire_in_progress_ticket_id = in_progress_ticket;
+}
+
 static int
 captured_dump_count(const char *category, const char *key)
 {
@@ -4276,6 +4576,276 @@ captured_dump_count(const char *category, const char *key)
 			count++;
 	}
 	return count;
+}
+
+static const char *
+captured_dump_value(const char *category, const char *key)
+{
+	int i;
+
+	for (i = 0; i < captured_dump_row_count; i++)
+		if (strcmp(captured_dump_categories[i], category) == 0
+			&& strcmp(captured_dump_keys[i], key) == 0)
+			return captured_dump_values[i];
+	return NULL;
+}
+
+static void
+capture_debug_dump(void)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
+	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	memset(captured_dump_values, 0, sizeof(captured_dump_values));
+	captured_dump_row_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+}
+
+static uint64
+captured_dump_uint64(const char *category, const char *key)
+{
+	const char *value = captured_dump_value(category, key);
+	char *end = NULL;
+	unsigned long long parsed;
+
+	UT_ASSERT_NOT_NULL(value);
+	if (value == NULL)
+		return 0;
+	parsed = strtoull(value, &end, 10);
+	UT_ASSERT_NOT_NULL(end);
+	if (end != NULL)
+		UT_ASSERT_EQ(*end, '\0');
+	return (uint64)parsed;
+}
+
+/*
+ * Batch3 RETIRE break caught: omitting the census call/rows, projecting an
+ * undeclared peer, misclassifying IDLE/RETIRING, or suppressing rows when the
+ * snapshot is invalid must fail this exact SRF behavior contract.
+ */
+UT_TEST(test_debug_dump_retire_frontier_census_exact_rows_and_failure_shape)
+{
+	static const char *const aggregate_keys[] = {
+		"pcm_x_retire_frontier_snapshot_valid",
+		"pcm_x_retire_frontier_configured_node_count",
+		"pcm_x_retire_frontier_bound_node_count",
+		"pcm_x_retire_frontier_idle_node_count",
+		"pcm_x_retire_frontier_in_progress_node_count",
+		"pcm_x_retire_frontier_invalid_node_count",
+	};
+	int i;
+
+	memset(&retire_census_fixture, 0, sizeof(retire_census_fixture));
+	memset(conf_node_fixture, 0, sizeof(conf_node_fixture));
+	conf_node_fixture_count = 4;
+	for (i = 0; i < conf_node_fixture_count; i++)
+		conf_node_fixture[i].node_id = i;
+	for (i = 0; i < PCM_X_PROTOCOL_NODE_LIMIT; i++)
+		retire_census_fixture.peer[i].next_expected_prehandle_sequence = UINT64_C(1);
+	retire_census_result = true;
+	retire_census_fixture.valid = true;
+	retire_census_fixture.runtime.state = PCM_X_RUNTIME_ACTIVE;
+	retire_census_fixture.runtime.master_session_incarnation = UINT64_C(9001);
+	retire_census_fixture.runtime.gate_generation = 77;
+	retire_census_fixture.local_retire_gate = 2;
+	set_retire_peer(&retire_census_fixture.peer[0], 0, 100, 10, 9, 7, 0);
+	set_retire_peer(&retire_census_fixture.peer[1], 5, 101, 20, 19, 8, 9);
+	set_retire_peer(&retire_census_fixture.peer[2], 6, 102, 30, 29, 10, 0);
+	set_retire_peer(&retire_census_fixture.peer[3], 7, 103, 40, 39, 11, 0);
+
+	capture_debug_dump();
+	for (i = 0; i < (int)lengthof(aggregate_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("pcm", aggregate_keys[i]), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "pcm_x_retire_frontier_peer_0"), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "pcm_x_retire_frontier_peer_1"), 1);
+	if (captured_dump_count("pcm", aggregate_keys[0]) != 1
+		|| captured_dump_count("pcm", "pcm_x_retire_frontier_peer_0") != 1
+		|| captured_dump_count("pcm", "pcm_x_retire_frontier_peer_1") != 1)
+		return;
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[0]), UINT64_C(1));
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[1]), UINT64_C(4));
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[2]), UINT64_C(4));
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[3]), UINT64_C(3));
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[4]), UINT64_C(1));
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[5]), UINT64_C(0));
+	UT_ASSERT_EQ(
+		strcmp(captured_dump_value("pcm", "pcm_x_retire_frontier_peer_0"),
+			   "phase=IDLE epoch=0 session=100 next_prehandle=10 retired_prehandle=9 "
+			   "retired_ticket=7 in_progress_ticket=0"),
+		0);
+	UT_ASSERT_EQ(
+		strcmp(captured_dump_value("pcm", "pcm_x_retire_frontier_peer_1"),
+			   "phase=RETIRING epoch=5 session=101 next_prehandle=20 retired_prehandle=19 "
+			   "retired_ticket=8 in_progress_ticket=9"),
+		0);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "pcm_x_retire_frontier_peer_4"), 0);
+
+	retire_census_result = false;
+	retire_census_fixture.valid = false;
+	retire_census_fixture.local_retire_gate = 0;
+	set_retire_peer(&retire_census_fixture.peer[1], 0, 0, 0, 0, 5, 0);
+	capture_debug_dump();
+	for (i = 0; i < (int)lengthof(aggregate_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("pcm", aggregate_keys[i]), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "pcm_x_retire_frontier_peer_1"), 1);
+	if (captured_dump_count("pcm", aggregate_keys[0]) != 1
+		|| captured_dump_count("pcm", "pcm_x_retire_frontier_peer_1") != 1)
+		return;
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[0]), UINT64_C(0));
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[5]), UINT64_C(1));
+	UT_ASSERT_EQ(
+		strcmp(captured_dump_value("pcm", "pcm_x_retire_frontier_peer_1"),
+			   "phase=INVALID epoch=0 session=0 next_prehandle=0 retired_prehandle=0 "
+			   "retired_ticket=5 in_progress_ticket=0"),
+		0);
+
+	memset(&retire_census_fixture, 0, sizeof(retire_census_fixture));
+	retire_census_result = false;
+	retire_census_fixture.valid = false;
+	for (i = 0; i < PCM_X_PROTOCOL_NODE_LIMIT; i++)
+		retire_census_fixture.peer[i].next_expected_prehandle_sequence = UINT64_C(1);
+	retire_census_fixture.peer[1].next_expected_prehandle_sequence = 0;
+	capture_debug_dump();
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[0]), UINT64_C(0));
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[5]), UINT64_C(1));
+	UT_ASSERT_EQ(
+		strcmp(captured_dump_value("pcm", "pcm_x_retire_frontier_peer_1"),
+			   "phase=INVALID epoch=0 session=0 next_prehandle=0 retired_prehandle=0 "
+			   "retired_ticket=0 in_progress_ticket=0"),
+		0);
+
+	memset(&retire_census_fixture, 0, sizeof(retire_census_fixture));
+	retire_census_result = true;
+	retire_census_fixture.valid = true;
+	for (i = 0; i < PCM_X_PROTOCOL_NODE_LIMIT; i++)
+		retire_census_fixture.peer[i].next_expected_prehandle_sequence = UINT64_C(1);
+	for (i = 0; i < conf_node_fixture_count; i++)
+		set_retire_peer(&retire_census_fixture.peer[i], UINT64_C(77),
+						UINT64_C(601) + (uint64)i, UINT64_C(2), UINT64_C(1), 0, 0);
+	set_retire_peer(&retire_census_fixture.peer[5], UINT64_C(77), UINT64_C(699),
+					UINT64_C(2), UINT64_C(1), UINT64_C(9), 0);
+	capture_debug_dump();
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[0]), UINT64_C(0));
+	UT_ASSERT_EQ(captured_dump_uint64("pcm", aggregate_keys[5]), UINT64_C(1));
+	UT_ASSERT_EQ(captured_dump_count("pcm", "pcm_x_retire_frontier_peer_5"), 0);
+}
+
+/*
+ * Batch3 CANCEL break caught: omitting one row, wiring a phase count to the
+ * wrong field, or suppressing the four count rows on a failed atomic census
+ * must fail this low-cardinality SRF contract.
+ */
+UT_TEST(test_debug_dump_forward_phase_census_exact_rows_and_failure_shape)
+{
+	static const char *const keys[] = {
+		"dedup_forward_phase_snapshot_valid",
+		"dedup_forward_marker_count",
+		"dedup_forwarded_phase_count",
+		"dedup_cancelling_phase_count",
+		"dedup_forward_phase_invalid_count",
+	};
+	static const uint64 expected[] = {
+		UINT64_C(1), UINT64_C(9), UINT64_C(4), UINT64_C(5), UINT64_C(0),
+	};
+	int i;
+
+	memset(&forward_phase_census_fixture, 0, sizeof(forward_phase_census_fixture));
+	forward_phase_census_result = true;
+	forward_phase_census_fixture.valid = true;
+	forward_phase_census_fixture.marker_count = 9;
+	forward_phase_census_fixture.forwarded_count = 4;
+	forward_phase_census_fixture.cancelling_count = 5;
+	capture_debug_dump();
+	for (i = 0; i < (int)lengthof(keys); i++) {
+		UT_ASSERT_EQ(captured_dump_count("gcs", keys[i]), 1);
+		if (captured_dump_count("gcs", keys[i]) == 1)
+			UT_ASSERT_EQ(captured_dump_uint64("gcs", keys[i]), expected[i]);
+	}
+
+	memset(&forward_phase_census_fixture, 0, sizeof(forward_phase_census_fixture));
+	forward_phase_census_result = false;
+	capture_debug_dump();
+	for (i = 0; i < (int)lengthof(keys); i++) {
+		UT_ASSERT_EQ(captured_dump_count("gcs", keys[i]), 1);
+		if (captured_dump_count("gcs", keys[i]) == 1)
+			UT_ASSERT_EQ(captured_dump_uint64("gcs", keys[i]), UINT64_C(0));
+	}
+}
+
+/*
+ * Batch3 CF break caught: each aggregate must be emitted exactly once from
+ * the shared census, the X owner must preserve exact identity/field order,
+ * and a failed census must say INVALID rather than impersonating EMPTY.
+ */
+UT_TEST(test_debug_dump_cf_slot_census_exact_rows_owner_and_failure_shape)
+{
+	static const char *const keys[] = {
+		"cf_slot_snapshot_valid",
+		"cf_x_held_count",
+		"cf_s_held_count",
+		"cf_x_release_pending_count",
+		"cf_s_release_pending_count",
+		"cf_pending_retry_count",
+		"cf_slot_invalid_count",
+		"cf_x_owner",
+	};
+	int i;
+
+	memset(&cf_slot_census_fixture, 0, sizeof(cf_slot_census_fixture));
+	cf_slot_census_result = true;
+	cf_slot_census_fixture.valid = true;
+	cf_slot_census_fixture.x_held_count = 1;
+	cf_slot_census_fixture.s_held_count = 2;
+	cf_slot_census_fixture.s_release_pending_count = 3;
+	cf_slot_census_fixture.pending_retry_count = 3;
+	cf_slot_census_fixture.x_owner_state = CLUSTER_CF_X_OWNER_HELD;
+	cf_slot_census_fixture.x_owner.state = CLUSTER_CF_SLOT_HELD;
+	cf_slot_census_fixture.x_owner.mode = CLUSTER_CF_SLOT_MODE_X;
+	cf_slot_census_fixture.x_owner.owner_pid = 1234;
+	cf_slot_census_fixture.x_owner.owner_procno = 42;
+	cf_slot_census_fixture.x_owner.owner_start_ts_us = INT64_C(9999);
+	cf_slot_census_fixture.x_owner.node_id = 2;
+	cf_slot_census_fixture.x_owner.coordinated = 1;
+	cf_slot_census_fixture.x_owner.cluster_epoch = UINT64_C(77);
+	cf_slot_census_fixture.x_owner.request_id = UINT64_C(88);
+	capture_debug_dump();
+	for (i = 0; i < (int)lengthof(keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("cf", keys[i]), 1);
+	if (captured_dump_count("cf", keys[0]) != 1
+		|| captured_dump_count("cf", keys[7]) != 1)
+		return;
+	UT_ASSERT_EQ(captured_dump_uint64("cf", keys[0]), UINT64_C(1));
+	UT_ASSERT_EQ(captured_dump_uint64("cf", keys[1]), UINT64_C(1));
+	UT_ASSERT_EQ(captured_dump_uint64("cf", keys[2]), UINT64_C(2));
+	UT_ASSERT_EQ(captured_dump_uint64("cf", keys[3]), UINT64_C(0));
+	UT_ASSERT_EQ(captured_dump_uint64("cf", keys[4]), UINT64_C(3));
+	UT_ASSERT_EQ(captured_dump_uint64("cf", keys[5]), UINT64_C(3));
+	UT_ASSERT_EQ(captured_dump_uint64("cf", keys[6]), UINT64_C(0));
+	UT_ASSERT_EQ(
+		strcmp(captured_dump_value("cf", keys[7]),
+			   "state=HELD pid=1234 procno=42 start_us=9999 node=2 epoch=77 "
+			   "request_id=88 coordinated=1"),
+		0);
+
+	memset(&cf_slot_census_fixture, 0, sizeof(cf_slot_census_fixture));
+	cf_slot_census_result = false;
+	capture_debug_dump();
+	for (i = 0; i < (int)lengthof(keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("cf", keys[i]), 1);
+	if (captured_dump_count("cf", keys[0]) != 1
+		|| captured_dump_count("cf", keys[7]) != 1)
+		return;
+	UT_ASSERT_EQ(captured_dump_uint64("cf", keys[0]), UINT64_C(0));
+	UT_ASSERT_EQ(
+		strcmp(captured_dump_value("cf", keys[7]),
+			   "state=INVALID pid=0 procno=0 start_us=0 node=0 epoch=0 "
+			   "request_id=0 coordinated=0"),
+		0);
 }
 
 UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
@@ -4312,6 +4882,17 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 		"pcm_x_own_abort_count",
 		"pcm_x_own_busy_count",
 		"pcm_x_own_corrupt_count",
+		"pcm_x_bufmgr_holder_live_count",
+		"pcm_x_bufmgr_holder_deferred_count",
+		"pcm_x_bufmgr_writer_live_count",
+		"pcm_x_bufmgr_writer_deferred_count",
+		"pcm_x_bufmgr_barrier_target",
+		"pcm_x_bufmgr_barrier_hit",
+		"pcm_x_bufmgr_barrier_deferred",
+		"pcm_x_bufmgr_barrier_unused",
+		"pcm_x_bufmgr_barrier_non_target_ignored_count",
+		"pcm_x_bufmgr_barrier_holder_live_high_water",
+		"pcm_x_bufmgr_barrier_writer_live_high_water",
 	};
 	static const char *const lmd_keys[] = {
 		"pcm_convert_wfg_replace_count",
@@ -4328,6 +4909,20 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 		"pcm_x_self_handoff_count",
 		"pcm_x_self_handoff_drain_count",
 		"pi_durable_note_apply_count",
+		/* S3-P0-09: the live-forward-marker DONE refusal must be readable
+		 * from the operator surface, not just from the shard counters. */
+		"dedup_done_forwarded_refused_count",
+		"dedup_done_cancelling_refused_count",
+	};
+	static const char *const ges_keys[] = {
+		"ges_dedup_entry_count",
+		"ges_dedup_hit_cached_count",
+		"ges_dedup_in_flight_dup_count",
+		"ges_dedup_stale_reprocess_count",
+		"ges_dedup_full_reject_count",
+		"ges_dedup_journal_count",
+		"ges_dedup_journal_full_count",
+		"ges_dedup_journal_ack_count",
 	};
 	LOCAL_FCINFO(fcinfo, 0);
 	ReturnSetInfo rsinfo;
@@ -4341,15 +4936,93 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
 	(void)cluster_dump_state(fcinfo);
 
-	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 60);
+	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 81);
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
-	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 120);
+	/* 125 + 2 S3-P0-09 DONE-refusal rows. */
+	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 127);
+	UT_ASSERT_EQ(captured_dump_count("ges", NULL), 22);
 	for (i = 0; i < (int)lengthof(pcm_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_keys[i]), 1);
 	for (i = 0; i < (int)lengthof(lmd_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("lmd", lmd_keys[i]), 1);
 	for (i = 0; i < (int)lengthof(gcs_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("gcs", gcs_keys[i]), 1);
+	for (i = 0; i < (int)lengthof(ges_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("ges", ges_keys[i]), 1);
+}
+
+/*
+ * S3-P0-13 behavior break caught: removing or failing to emit any required
+ * srv_other key must be observable as an absent row, never silently treated
+ * as a zero value by a consumer.
+ */
+UT_TEST(test_debug_dump_requires_p013_other_key_roster)
+{
+	static const char *const required_keys[] = {
+		"cr_server_other_refuse_not_authoritative_count",
+		"cr_server_other_refuse_not_mine_count",
+		"cr_server_other_refuse_expected_segment_invalid_count",
+		"cr_server_other_refuse_expected_slot_invalid_count",
+		"cr_server_other_refuse_segment_mismatch_count",
+		"cr_server_other_refuse_slot_mismatch_count",
+		"cr_server_other_refuse_confirm_resolve_kind_count",
+		"cr_server_other_refuse_confirm_segment_mismatch_count",
+		"cr_server_other_refuse_confirm_slot_mismatch_count",
+		"cr_server_other_refuse_confirm_wrap_mismatch_count",
+		"cr_server_other_refuse_confirm_scn_mismatch_count",
+		"cr_server_other_refuse_terminal_unknown_count",
+		"cr_server_other_refuse_residual_count",
+		"vis53r97_leg_srv_other_refuse_count",
+	};
+	int i;
+
+	capture_debug_dump();
+	for (i = 0; i < (int)lengthof(required_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("cr", required_keys[i]), 1);
+}
+
+/*
+ * Quiescent test-only capture: distinct accessor values make missing,
+ * duplicate, and miswired dump rows observable without relying on direct
+ * accessor calls.  This deliberately says nothing about a concurrent
+ * production dump of independent atomics.
+ */
+UT_TEST(test_debug_dump_p013_other_conserves_quiescent_values)
+{
+	static const char *const detail_keys[] = {
+		"cr_server_other_refuse_not_authoritative_count",
+		"cr_server_other_refuse_not_mine_count",
+		"cr_server_other_refuse_expected_segment_invalid_count",
+		"cr_server_other_refuse_expected_slot_invalid_count",
+		"cr_server_other_refuse_segment_mismatch_count",
+		"cr_server_other_refuse_slot_mismatch_count",
+		"cr_server_other_refuse_confirm_resolve_kind_count",
+		"cr_server_other_refuse_confirm_segment_mismatch_count",
+		"cr_server_other_refuse_confirm_slot_mismatch_count",
+		"cr_server_other_refuse_confirm_wrap_mismatch_count",
+		"cr_server_other_refuse_confirm_scn_mismatch_count",
+		"cr_server_other_refuse_terminal_unknown_count",
+		"cr_server_other_refuse_residual_count",
+	};
+	uint64 sum = 0;
+	int i;
+
+	capture_debug_dump();
+	for (i = 0; i < (int)lengthof(detail_keys); i++) {
+		if (captured_dump_count("cr", detail_keys[i]) != 1) {
+			UT_ASSERT_EQ(captured_dump_count("cr", detail_keys[i]), 1);
+			return;
+		}
+		sum += captured_dump_uint64("cr", detail_keys[i]);
+		UT_ASSERT_EQ(sum, (uint64)((i + 1) * (i + 2) / 2));
+	}
+	if (captured_dump_count("cr", "vis53r97_leg_srv_other_refuse_count") != 1) {
+		UT_ASSERT_EQ(captured_dump_count("cr", "vis53r97_leg_srv_other_refuse_count"), 1);
+		return;
+	}
+	UT_ASSERT_EQ(captured_dump_uint64("cr", "vis53r97_leg_srv_other_refuse_count"),
+				 (uint64)91);
+	UT_ASSERT_EQ(sum, (uint64)91);
 }
 
 
@@ -4929,9 +5602,14 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(17);
 	UT_RUN(test_debug_dump_srf_linkable);
+	UT_RUN(test_debug_dump_retire_frontier_census_exact_rows_and_failure_shape);
+	UT_RUN(test_debug_dump_forward_phase_census_exact_rows_and_failure_shape);
+	UT_RUN(test_debug_dump_cf_slot_census_exact_rows_owner_and_failure_shape);
 	UT_RUN(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets);
+	UT_RUN(test_debug_dump_requires_p013_other_key_roster);
+	UT_RUN(test_debug_dump_p013_other_conserves_quiescent_values);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);
 	UT_RUN(test_debug_inject_get_state_at_null_outs);

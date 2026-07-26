@@ -53,6 +53,7 @@
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_next_request_id (spec-5.16: node-global request_id) */
 #include "cluster/cluster_ges_mode.h" /* spec-5.3 D1 — ges_mode_convert_class for UPGRADE filter */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ir.h" /* spec-5.7 D8 — CLUSTER_IR_RESID_TYPE (freeze-gate bypass belt) */
 #include "cluster/cluster_inject.h" /* spec-4.6 L11/L14 — redeclare-skip probe */
@@ -493,7 +494,8 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 		if (guard_result == PCM_X_QUEUE_OK)
 			reject = cluster_ges_send_convert_and_wait(
 				&req->resid, (uint32)req->lockmode, (uint32)req->current_mode, &req->holder,
-				req->request_id, /* timeout = GUC default */ 0);
+				req->convert_old_request_id, req->request_id,
+				/* timeout = GUC default */ 0);
 	}
 	PG_CATCH();
 	{
@@ -574,12 +576,11 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 /*
  * S6 release — backend done(LockRelease hook;spec-2.21 wire to PG)。
  */
-ClusterLockAcquireResult
-cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
+static ClusterLockAcquireResult
+cluster_lock_acquire_s6_release_internal(const ClusterLockAcquireRequest *req)
 {
 	int32 master;
-
-	ensure_counter_initialized();
+	uint32 reject_reason = GES_REJECT_REASON_NONE;
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
@@ -614,11 +615,92 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		 * authoritative drain + wake.
 		 */
 		(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
-		(void)cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
+		reject_reason
+			= cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
 	}
 
-	pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);
+	if (reject_reason != GES_REJECT_REASON_NONE) {
+		switch ((GesRejectReason)reject_reason) {
+		case GES_REJECT_REASON_TIMEOUT:
+		case GES_REJECT_REASON_WORK_QUEUE_FULL:
+			return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		case GES_REJECT_REASON_EPOCH_MISMATCH:
+			return CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION;
+		case GES_REJECT_REASON_SHARD_FROZEN:
+			return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
+		case GES_REJECT_REASON_DEADLOCK_VICTIM:
+			return CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK;
+		case GES_REJECT_REASON_FEATURE_NOT_SUPPORTED:
+			return CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED;
+		case GES_REJECT_REASON_ILLEGAL_CONVERT:
+			return CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT;
+		case GES_REJECT_REASON_NONE:
+		default:
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		}
+	}
+
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+ClusterLockAcquireResult
+cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
+{
+	ClusterLockAcquireResult result;
+
+	ensure_counter_initialized();
+	result = cluster_lock_acquire_s6_release_internal(req);
+	if (result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+		pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);
+	return result;
+}
+
+/*
+ * ResourceOwner callbacks must not turn an existing ERROR into a process or
+ * postmaster termination.  The outbound scope makes fixed-queue saturation a
+ * returned failure, while PG_TRY converts ordinary S6 ERROR to the same
+ * caller-owned exact-retry contract.
+ */
+ClusterLockAcquireResult
+cluster_lock_acquire_s6_release_nothrow(const ClusterLockAcquireRequest *req)
+{
+	volatile ClusterLockAcquireResult result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	volatile bool release_threw = false;
+	MemoryContext caller_context = CurrentMemoryContext;
+	uint32 caller_interrupt_holdoff_count = InterruptHoldoffCount;
+	uint32 caller_query_cancel_holdoff_count = QueryCancelHoldoffCount;
+	bool cleanup_staged;
+
+	ensure_counter_initialized();
+	cluster_grd_outbound_cleanup_release_nonthrow_begin();
+	PG_TRY();
+	{
+		result = cluster_lock_acquire_s6_release_internal(req);
+	}
+	PG_CATCH();
+	{
+		/*
+		 * errfinish(ERROR) enters the catch in ErrorContext and clears both
+		 * holdoff counts.  This boundary absorbs only the nested S6 failure,
+		 * so restore the ResourceOwner caller's state before it resumes its
+		 * outer error cleanup.
+		 */
+		MemoryContextSwitchTo(caller_context);
+		FlushErrorState();
+		InterruptHoldoffCount = caller_interrupt_holdoff_count;
+		QueryCancelHoldoffCount = caller_query_cancel_holdoff_count;
+		release_threw = true;
+	}
+	PG_END_TRY();
+	cleanup_staged = cluster_grd_outbound_cleanup_release_nonthrow_end();
+
+	if (release_threw)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	if (!cleanup_staged)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	if (result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+		pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);
+	return result;
 }
 
 /*

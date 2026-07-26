@@ -202,6 +202,16 @@ extern bool cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition 
 											   int master_node);
 
 /*
+ * Certificate-bound nowait variant.  The caller supplies the epoch and
+ * master captured by an immutable replay certificate.  Admission fails
+ * before transport ownership unless both still match; the emitted payload
+ * always carries expected_epoch rather than a later ambient epoch read.
+ */
+extern bool cluster_gcs_send_transition_nowait_exact_epoch(
+	BufferTag tag, PcmLockTransition transition_id, int master_node,
+	uint64 expected_epoch);
+
+/*
  * cluster_gcs_try_send_transition_and_wait — spec-6.12a ㉕ non-throwing
  * twin of cluster_gcs_send_transition_and_wait: same slot + wait machinery,
  * but every non-GRANTED outcome (denied, timeout, send failure) returns

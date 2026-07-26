@@ -183,6 +183,9 @@ extern void cluster_voting_disk_io_set_timeout_ms(int timeout_ms);
  *
  *	`expected_disk_index` is the caller's record of which voting disk
  *	this fd should be (its 0-based index in cluster.voting_disks CSV).
+ *	An exact all-zero 512-byte block is the one admitted pre-format state:
+ *	it is returned as a canonical generation-zero slot for the requested
+ *	node/disk coordinates.  Any nonzero malformed block remains fail-closed.
  *	If slot.disk_index != expected_disk_index → SAN/NFS misroute / wrong
  *	mount / wrong file: refuse to trust the slot and return FAILED.  Per
  *	Q3 v0.2 design this is the only line of defense for misrouted I/O

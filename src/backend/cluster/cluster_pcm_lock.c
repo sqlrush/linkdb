@@ -42,6 +42,7 @@
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-2.33 D7 — send_block_request_and_wait */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_cssd.h" /* PGRAC: spec-4.7a D4 — peer liveness for other-holder check */
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
@@ -240,6 +241,7 @@ struct GrdEntry {
 	 *	The two are ORTHOGONAL (§2.8.1): detector never reads lsn, serve-gate
 	 *	never reads scn.  Both monotone-max, both cleared together on retire. */
 	SCN pi_watermark_scn;	   /*  8B [112, 120) spec-2.41 D2 §2.8 Option A */
+	pg_atomic_uint64 authority_generation; /* full core-tuple ABA fence */
 	ConditionVariable wait_cv; /* spec-2.31 D1 v0.4 incompatible state wait */
 	LWLockPadded entry_lock;   /*128B PG_CACHE_LINE_SIZE — must stay last */
 };
@@ -261,14 +263,9 @@ struct GrdEntry {
  *	expected constant on this build platform, so silent layout drift
  *	(e.g. a future struct change in a dependency) cannot slip past CI.
  */
-StaticAssertDecl(sizeof(struct GrdEntry) == 264,
-				 "spec-2.41 D2 §2.8 Option A GrdEntry size 256 → 264 (added pi_watermark_scn "
-				 "8B dual watermark for the lost-write detector; pi_watermark_lsn retained for "
-				 "the spec-4.7 D5 redo-coverage serve-gate);  spec-2.37 baseline was 256B (had "
-				 "pi_watermark_lsn 8B for HC125/HC126);  field inserted after pi_watermark_lsn "
-				 "and before wait_cv to keep entry_lock LWLockPadded must-stay-last invariant;  "
-				 "amend this constant with Hardening appendix if a different platform produces a "
-				 "different size");
+StaticAssertDecl(sizeof(struct GrdEntry) == 272,
+				 "GrdEntry adds an 8-byte full authority generation before wait_cv; "
+				 "entry_lock remains last");
 
 
 /*
@@ -478,13 +475,14 @@ pcm_transition_target(PcmLockTransition trans)
 static inline void
 pcm_master_holder_set_node(struct GrdEntry *entry, int32 node_id)
 {
+	ClusterGrdHolderId holder;
+
 	Assert(node_id >= 0 && node_id < 32);
-	if (entry->master_holder.node_id == (uint32)node_id)
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = (uint32)node_id;
+	if (memcmp(&entry->master_holder, &holder, sizeof(holder)) == 0)
 		return; /* no-op; do not bump lifecycle counter */
-	entry->master_holder.node_id = (uint32)node_id;
-	/* procno / cluster_epoch / request_id intentionally remain zero on a
-	 * fresh entry; node_id starts at the no-holder sentinel and is set here.
-	 * HC110. */
+	entry->master_holder = holder;
 	cluster_gcs_block_bump_master_holder_lifecycle();
 }
 
@@ -513,6 +511,131 @@ pcm_master_holder_is_valid(const struct GrdEntry *entry)
 	return entry->master_holder.node_id != INVALID_PCM_MASTER_HOLDER_NODE;
 }
 
+typedef struct PcmAuthorityCore {
+	ClusterGrdHolderId master_holder;
+	uint64 pending_x_since_lsn;
+	PcmState state;
+	int32 x_holder_node;
+	uint32 s_holders_bitmap;
+	int32 pending_x_requester_node;
+	uint32 reserved;
+} PcmAuthorityCore;
+
+StaticAssertDecl(sizeof(PcmAuthorityCore) == 56,
+				 "PCM authority core tuple remains a padding-free 56 bytes");
+
+static void
+pcm_authority_core_capture_raw_locked(struct GrdEntry *entry, PcmAuthorityCore *out)
+{
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	memset(out, 0, sizeof(*out));
+	out->master_holder = entry->master_holder;
+	out->pending_x_since_lsn = entry->pending_x_since_lsn;
+	out->state = (PcmState)pg_atomic_read_u32(&entry->master_state);
+	out->x_holder_node = entry->x_holder_node;
+	out->s_holders_bitmap = pg_atomic_read_u32(&entry->s_holders_bitmap);
+	out->pending_x_requester_node = entry->pending_x_requester_node;
+}
+
+static void
+pcm_authority_core_capture_locked(struct GrdEntry *entry, PcmAuthorityCore *out)
+{
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	pcm_authority_core_capture_raw_locked(entry, out);
+}
+
+/*
+ * Generation exhaustion is checked only at an actual core-tuple mutation
+ * linearization point.  A duplicate, stale token, conflict, occupied reserve,
+ * or mismatched clear remains a read-only no-op even when the generation has
+ * reached UINT64_MAX.
+ */
+static void
+pcm_authority_core_preflight_locked(struct GrdEntry *entry)
+{
+	uint64 next_generation;
+
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (!PcmAuthorityGenerationNext(pg_atomic_read_u64(&entry->authority_generation),
+									&next_generation))
+		ereport(PANIC,
+				(errmsg_internal("PCM authority generation cannot advance for block %u",
+								 (unsigned int)entry->tag.blockNum)));
+}
+
+static void
+pcm_authority_core_preflight_steps_locked(
+	struct GrdEntry *entry, uint32 steps)
+{
+	uint64 generation;
+	uint64 next_generation;
+	uint32 step;
+
+	Assert(LWLockHeldByMeInMode(
+		&entry->entry_lock.lock, LW_EXCLUSIVE));
+	Assert(steps > 0);
+	generation
+		= pg_atomic_read_u64(&entry->authority_generation);
+	for (step = 0; step < steps; step++) {
+		if (!PcmAuthorityGenerationNext(
+				generation, &next_generation))
+			ereport(
+				PANIC,
+				(errmsg_internal(
+					"PCM authority generation cannot advance %u steps for block %u",
+					steps,
+					(unsigned int)entry->tag.blockNum)));
+		generation = next_generation;
+	}
+}
+
+static bool
+pcm_authority_core_commit_locked(struct GrdEntry *entry, const PcmAuthorityCore *before)
+{
+	PcmAuthorityCore after;
+	uint64 generation;
+	uint64 next_generation;
+	uint32 holder_bit;
+
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	Assert(before != NULL);
+	pcm_authority_core_capture_raw_locked(entry, &after);
+	if ((after.pending_x_requester_node == -1) != (after.pending_x_since_lsn == 0))
+		ereport(PANIC, (errmsg_internal("PCM authority pending-X tuple is non-canonical")));
+	switch (after.state) {
+	case PCM_STATE_N:
+		if (after.x_holder_node != -1 || after.s_holders_bitmap != 0
+			|| pcm_master_holder_is_valid(entry))
+			ereport(PANIC, (errmsg_internal("PCM N authority tuple is non-canonical")));
+		break;
+	case PCM_STATE_X:
+		if (after.x_holder_node < 0 || after.x_holder_node >= 32 || after.s_holders_bitmap != 0
+			|| !pcm_master_holder_is_valid(entry)
+			|| entry->master_holder.node_id != (uint32)after.x_holder_node)
+			ereport(PANIC, (errmsg_internal("PCM X authority tuple is non-canonical")));
+		break;
+	case PCM_STATE_S:
+		holder_bit = pcm_master_holder_is_valid(entry) && entry->master_holder.node_id < 32
+						 ? (UINT32_C(1) << entry->master_holder.node_id)
+						 : 0;
+		if (after.x_holder_node != -1 || after.s_holders_bitmap == 0 || holder_bit == 0
+			|| (after.s_holders_bitmap & holder_bit) == 0)
+			ereport(PANIC, (errmsg_internal("PCM S authority tuple is non-canonical")));
+		break;
+	default:
+		ereport(PANIC, (errmsg_internal("PCM authority state is invalid")));
+	}
+	if (memcmp(before, &after, sizeof(after)) == 0)
+		return false;
+	generation = pg_atomic_read_u64(&entry->authority_generation);
+	if (!PcmAuthorityGenerationNext(generation, &next_generation))
+		ereport(PANIC,
+				(errmsg_internal("PCM authority generation exhausted for block %u",
+								 (unsigned int)entry->tag.blockNum)));
+	pg_atomic_write_u64(&entry->authority_generation, next_generation);
+	return true;
+}
+
 static void
 pcm_authority_snapshot_locked(struct GrdEntry *entry, PcmAuthoritySnapshot *out)
 {
@@ -524,6 +647,7 @@ pcm_authority_snapshot_locked(struct GrdEntry *entry, PcmAuthoritySnapshot *out)
 	out->x_holder_node = entry->x_holder_node;
 	out->s_holders_bitmap = pg_atomic_read_u32(&entry->s_holders_bitmap);
 	out->pending_x_requester_node = entry->pending_x_requester_node;
+	out->authority_generation = pg_atomic_read_u64(&entry->authority_generation);
 }
 
 static bool
@@ -534,7 +658,8 @@ pcm_authority_snapshot_equal(const PcmAuthoritySnapshot *left, const PcmAuthorit
 		   && left->pending_x_since_lsn == right->pending_x_since_lsn && left->state == right->state
 		   && left->x_holder_node == right->x_holder_node
 		   && left->s_holders_bitmap == right->s_holders_bitmap
-		   && left->pending_x_requester_node == right->pending_x_requester_node;
+		   && left->pending_x_requester_node == right->pending_x_requester_node
+		   && left->authority_generation == right->authority_generation;
 }
 
 static inline int32
@@ -582,19 +707,21 @@ cluster_pcm_master_holder_node_by_tag(BufferTag tag)
  * sentinels so diagnostic callers never observe uninitialized bytes.
  */
 bool
-cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out)
+cluster_pcm_lock_authority_watermark_snapshot(BufferTag tag, PcmAuthoritySnapshot *authority_out,
+											  SCN *watermark_out)
 {
 	struct GrdEntry *entry;
 	bool found;
 
-	if (out == NULL)
+	if (authority_out == NULL || watermark_out == NULL)
 		return false;
 
-	memset(out, 0, sizeof(*out));
-	out->state = PCM_STATE_N;
-	out->x_holder_node = -1;
-	out->pending_x_requester_node = -1;
-	out->master_holder.node_id = INVALID_PCM_MASTER_HOLDER_NODE;
+	memset(authority_out, 0, sizeof(*authority_out));
+	authority_out->state = PCM_STATE_N;
+	authority_out->x_holder_node = -1;
+	authority_out->pending_x_requester_node = -1;
+	authority_out->master_holder.node_id = INVALID_PCM_MASTER_HOLDER_NODE;
+	*watermark_out = InvalidScn;
 
 	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
 		return false;
@@ -603,7 +730,8 @@ cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out)
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-		pcm_authority_snapshot_locked(entry, out);
+		pcm_authority_snapshot_locked(entry, authority_out);
+		*watermark_out = entry->pi_watermark_scn;
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
@@ -612,27 +740,158 @@ cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out)
 }
 
 bool
+cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out)
+{
+	SCN watermark;
+
+	return cluster_pcm_lock_authority_watermark_snapshot(tag, out, &watermark);
+}
+
+bool
+cluster_pcm_lock_authority_watermark_matches(BufferTag tag,
+											 const PcmAuthoritySnapshot *expected_authority,
+											 SCN expected_watermark)
+{
+	PcmAuthoritySnapshot current;
+	SCN current_watermark;
+
+	if (expected_authority == NULL
+		|| !cluster_pcm_lock_authority_watermark_snapshot(tag, &current, &current_watermark))
+		return false;
+	return pcm_authority_snapshot_equal(&current, expected_authority)
+		   && current_watermark == expected_watermark;
+}
+
+bool
 cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected)
 {
-	struct GrdEntry *entry;
 	PcmAuthoritySnapshot current;
+
+	return expected != NULL && cluster_pcm_lock_authority_snapshot(tag, &current)
+		   && pcm_authority_snapshot_equal(&current, expected);
+}
+
+PcmStaleXCommitResult
+cluster_pcm_lock_stale_x_commit_exact(const PcmStaleXCommitToken *token,
+									 PcmAuthoritySnapshot *post_authority_out)
+{
+	struct GrdEntry *entry;
+	PcmAuthorityCore core_before;
+	PcmAuthoritySnapshot current;
+	bool authority_changed;
 	bool found;
-	bool matches = false;
+	bool broadcast = false;
 
-	if (expected == NULL || ClusterPcm == NULL || cluster_pcm_htab == NULL)
+	if (post_authority_out != NULL)
+		memset(post_authority_out, 0, sizeof(*post_authority_out));
+	if (token == NULL || token->request_id == 0 || token->holder_node < 0
+		|| token->holder_node >= 32
+		|| token->holder_proof != PCM_STALE_X_FULL_FENCE_PROOF
+		|| memcmp(token->reserved, "\0\0\0", sizeof(token->reserved)) != 0
+		|| token->relation_generation == 0
+		|| !SCN_VALID(token->final_page_scn) || !SCN_VALID(token->durable_page_scn)
+		|| scn_local(token->durable_page_scn) < scn_local(token->final_page_scn)
+		|| token->authority.authority_generation == 0)
+		return PCM_STALE_X_COMMIT_INVALID;
+	if (token->authority.state != PCM_STATE_X
+		|| token->authority.x_holder_node != token->holder_node
+		|| token->authority.s_holders_bitmap != 0
+		|| token->authority.pending_x_requester_node != -1
+		|| token->authority.pending_x_since_lsn != 0
+		|| token->authority.master_holder.node_id != (uint32)token->holder_node)
+		return PCM_STALE_X_COMMIT_BAD_STATE;
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return PCM_STALE_X_COMMIT_NOT_FOUND;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &token->tag, HASH_FIND, &found);
+	if (!found || entry == NULL) {
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return PCM_STALE_X_COMMIT_NOT_FOUND;
+	}
+
+	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	pcm_authority_snapshot_locked(entry, &current);
+
+	/* Exact local replay after the single core commit.  Generation and
+	 * transition_count both move by one, while the durable storage proof is
+	 * retained as the tag watermark. */
+	if (token->authority.authority_generation != UINT64_MAX
+		&& token->authority.transition_count != UINT64_MAX
+		&& current.authority_generation == token->authority.authority_generation + 1
+		&& current.transition_count == token->authority.transition_count + 1
+		&& current.state == PCM_STATE_N && current.x_holder_node == -1
+		&& current.s_holders_bitmap == 0 && current.pending_x_requester_node == -1
+		&& current.pending_x_since_lsn == 0 && !pcm_master_holder_is_valid(entry)
+		&& SCN_VALID(entry->pi_watermark_scn)
+		&& scn_local(entry->pi_watermark_scn) >= scn_local(token->durable_page_scn)) {
+		if (post_authority_out != NULL)
+			*post_authority_out = current;
+		LWLockRelease(&entry->entry_lock.lock);
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return PCM_STALE_X_COMMIT_DUPLICATE;
+	}
+
+	if (!pcm_authority_snapshot_equal(&current, &token->authority)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return PCM_STALE_X_COMMIT_STALE;
+	}
+	if (entry->pi_watermark_scn != token->final_page_scn) {
+		LWLockRelease(&entry->entry_lock.lock);
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		return PCM_STALE_X_COMMIT_WATERMARK_STALE;
+	}
+
+	pcm_authority_core_capture_locked(entry, &core_before);
+	pcm_authority_core_preflight_locked(entry);
+	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+	entry->x_holder_node = -1;
+	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+	entry->s_holder_refcount_local = 0;
+	pcm_master_holder_clear(entry);
+	if (scn_local(token->durable_page_scn) > scn_local(entry->pi_watermark_scn)) {
+		SCN old_scn = entry->pi_watermark_scn;
+
+		entry->pi_watermark_scn = token->durable_page_scn;
+		pcm_wm_prov_record(token->tag, old_scn, token->durable_page_scn,
+						   CLUSTER_PCM_WM_SRC_STALE_X_COMMIT, token->holder_node,
+						   token->request_id, token->request_epoch);
+	}
+	entry->last_transition_at = GetCurrentTimestamp();
+	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+	authority_changed = pcm_authority_core_commit_locked(entry, &core_before);
+	Assert(authority_changed);
+	if (post_authority_out != NULL)
+		pcm_authority_snapshot_locked(entry, post_authority_out);
+	broadcast = true;
+	LWLockRelease(&entry->entry_lock.lock);
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	return PCM_STALE_X_COMMIT_OK;
+}
+
+#ifdef USE_ASSERT_CHECKING
+bool
+cluster_pcm_lock_test_force_authority_generation(BufferTag tag, uint64 generation)
+{
+	struct GrdEntry *entry;
+	bool found;
+
+	if (generation == 0 || ClusterPcm == NULL || cluster_pcm_htab == NULL)
 		return false;
-
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
-		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-		pcm_authority_snapshot_locked(entry, &current);
-		matches = pcm_authority_snapshot_equal(&current, expected);
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pg_atomic_write_u64(&entry->authority_generation, generation);
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
-	return matches;
+	return found && entry != NULL;
 }
+#endif
 
 /*
  * Atomically install the queue winner as the sole X holder, but only if the
@@ -647,6 +906,7 @@ cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token)
 	PcmAuthoritySnapshot current;
 	ClusterGrdHolderId requester;
 	PcmXGrdHandoffResult result = PCM_X_GRD_HANDOFF_BAD_STATE;
+	PcmAuthorityCore core_before;
 	bool found;
 	bool broadcast = false;
 	uint64 pending_x_value;
@@ -676,6 +936,7 @@ cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token)
 	}
 
 	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	pcm_authority_core_capture_locked(entry, &core_before);
 	pcm_authority_snapshot_locked(entry, &current);
 
 	/* A retry after the commit barrier is harmless only for the same full
@@ -726,6 +987,7 @@ cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token)
 		goto done;
 	}
 
+	pcm_authority_core_preflight_locked(entry);
 	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
 	entry->x_holder_node = token->requester_node;
 	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
@@ -743,6 +1005,7 @@ cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token)
 	}
 	entry->last_transition_at = GetCurrentTimestamp();
 	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+	(void)pcm_authority_core_commit_locked(entry, &core_before);
 	broadcast = true;
 	result = PCM_X_GRD_HANDOFF_OK;
 
@@ -790,12 +1053,17 @@ pcm_lock_try_reserve_pending_x_value(BufferTag tag, int32 requester_node, uint64
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
+		PcmAuthorityCore core_before;
+
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pcm_authority_core_capture_locked(entry, &core_before);
 		if (entry->pending_x_requester_node == -1) {
+			pcm_authority_core_preflight_locked(entry);
 			entry->pending_x_requester_node = requester_node;
 			entry->pending_x_since_lsn = value;
 			result = PCM_PENDING_X_RESERVE_OK;
 		}
+		(void)pcm_authority_core_commit_locked(entry, &core_before);
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
@@ -805,7 +1073,7 @@ pcm_lock_try_reserve_pending_x_value(BufferTag tag, int32 requester_node, uint64
 PcmPendingXReserveResult
 cluster_pcm_lock_set_pending_x(BufferTag tag, int32 requester_node, uint64 current_lsn)
 {
-	if ((current_lsn & PCM_PENDING_X_QUEUE_KIND) != 0)
+	if (current_lsn == 0 || (current_lsn & PCM_PENDING_X_QUEUE_KIND) != 0)
 		return PCM_PENDING_X_RESERVE_INVALID;
 	return pcm_lock_try_reserve_pending_x_value(tag, requester_node, current_lsn);
 }
@@ -867,13 +1135,18 @@ cluster_pcm_lock_clear_queue_pending_x_exact(BufferTag tag, int32 requester_node
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
+		PcmAuthorityCore core_before;
+
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pcm_authority_core_capture_locked(entry, &core_before);
 		if (entry->pending_x_requester_node == requester_node
 			&& entry->pending_x_since_lsn == expected) {
+			pcm_authority_core_preflight_locked(entry);
 			entry->pending_x_requester_node = -1;
 			entry->pending_x_since_lsn = 0;
 			cleared = true;
 		}
+		(void)pcm_authority_core_commit_locked(entry, &core_before);
 		LWLockRelease(&entry->entry_lock.lock);
 		if (cleared)
 			ConditionVariableBroadcast(&entry->wait_cv);
@@ -895,13 +1168,18 @@ cluster_pcm_lock_clear_pending_x(BufferTag tag)
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
+		PcmAuthorityCore core_before;
+
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pcm_authority_core_capture_locked(entry, &core_before);
 		if (entry->pending_x_requester_node != -1
 			&& (entry->pending_x_since_lsn & PCM_PENDING_X_QUEUE_KIND) == 0) {
+			pcm_authority_core_preflight_locked(entry);
 			entry->pending_x_requester_node = -1;
 			entry->pending_x_since_lsn = 0;
 			cleared = true;
 		}
+		(void)pcm_authority_core_commit_locked(entry, &core_before);
 		LWLockRelease(&entry->entry_lock.lock);
 		if (cleared)
 			ConditionVariableBroadcast(&entry->wait_cv);
@@ -933,13 +1211,18 @@ cluster_pcm_lock_clear_pending_x_if(BufferTag tag, int32 expected_requester)
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
 	if (found && entry != NULL) {
+		PcmAuthorityCore core_before;
+
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pcm_authority_core_capture_locked(entry, &core_before);
 		if (entry->pending_x_requester_node == expected_requester
 			&& (entry->pending_x_since_lsn & PCM_PENDING_X_QUEUE_KIND) == 0) {
+			pcm_authority_core_preflight_locked(entry);
 			entry->pending_x_requester_node = -1;
 			entry->pending_x_since_lsn = 0;
 			cleared = true;
 		}
+		(void)pcm_authority_core_commit_locked(entry, &core_before);
 		LWLockRelease(&entry->entry_lock.lock);
 		if (cleared)
 			ConditionVariableBroadcast(&entry->wait_cv);
@@ -1104,22 +1387,26 @@ cluster_pcm_lock_clear_pending_x_for_node(int32 dead_node)
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	hash_seq_init(&scan, cluster_pcm_htab);
 	while ((entry = (struct GrdEntry *)hash_seq_search(&scan)) != NULL) {
+		PcmAuthorityCore core_before;
 		bool cleared_entry = false;
 
 		/* Fast SHARED read first — most entries will not match. */
 		if (entry->pending_x_requester_node != dead_node)
 			continue;
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pcm_authority_core_capture_locked(entry, &core_before);
 		/* HC124 idempotent recheck under entry_lock: another path
 		 * (X grant install ack / reconfig epoch advance) may have
 		 * cleared the field between our SHARED read and the
 		 * EXCLUSIVE acquire. */
 		if (entry->pending_x_requester_node == dead_node) {
+			pcm_authority_core_preflight_locked(entry);
 			entry->pending_x_requester_node = -1;
 			entry->pending_x_since_lsn = 0;
 			cleared++;
 			cleared_entry = true;
 		}
+		(void)pcm_authority_core_commit_locked(entry, &core_before);
 		LWLockRelease(&entry->entry_lock.lock);
 		if (cleared_entry)
 			ConditionVariableBroadcast(&entry->wait_cv);
@@ -1145,6 +1432,8 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	hash_seq_init(&scan, cluster_pcm_htab);
 	while ((entry = (struct GrdEntry *)hash_seq_search(&scan)) != NULL) {
+		PcmAuthorityCore core_before;
+		bool authority_changed;
 		bool changed = false;
 		bool broadcast_needed = false;
 		bool master_holder_was_dead;
@@ -1162,9 +1451,15 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 			continue;
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pcm_authority_core_capture_locked(entry, &core_before);
 		before_state = (PcmState)pg_atomic_read_u32(&entry->master_state);
 		master_holder_was_dead
 			= pcm_master_holder_is_valid(entry) && (int32)entry->master_holder.node_id == dead_node;
+		authority_changed = entry->x_holder_node == dead_node
+							|| (pg_atomic_read_u32(&entry->s_holders_bitmap) & dead_bit) != 0
+							|| master_holder_was_dead;
+		if (authority_changed)
+			pcm_authority_core_preflight_locked(entry);
 
 		if (entry->x_holder_node == dead_node) {
 			entry->x_holder_node = -1;
@@ -1182,30 +1477,35 @@ cluster_pcm_lock_cleanup_on_node_dead(int32 dead_node)
 			changed = true;
 		}
 
-		if (entry->x_holder_node >= 0) {
-			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
-			if (master_holder_was_dead)
-				pcm_master_holder_set_node(entry, entry->x_holder_node);
-		} else if (s_bitmap != 0) {
-			int32 next_holder = pcm_lowest_set_bit_node(s_bitmap);
+		if (authority_changed) {
+			if (entry->x_holder_node >= 0) {
+				pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+				if (!pcm_master_holder_is_valid(entry)
+					|| entry->master_holder.node_id != (uint32)entry->x_holder_node)
+					pcm_master_holder_set_node(entry, entry->x_holder_node);
+			} else if (s_bitmap != 0) {
+				int32 next_holder = pcm_lowest_set_bit_node(s_bitmap);
 
-			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
-			if (master_holder_was_dead) {
-				if (next_holder >= 0)
-					pcm_master_holder_set_node(entry, next_holder);
-				else
+				pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
+				if (!pcm_master_holder_is_valid(entry) || entry->master_holder.node_id >= 32
+					|| (s_bitmap & (UINT32_C(1) << entry->master_holder.node_id)) == 0) {
+					if (next_holder >= 0)
+						pcm_master_holder_set_node(entry, next_holder);
+					else
+						pcm_master_holder_clear(entry);
+				}
+			} else {
+				pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+				if (pcm_master_holder_is_valid(entry))
 					pcm_master_holder_clear(entry);
 			}
-		} else {
-			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
-			if (pcm_master_holder_is_valid(entry))
-				pcm_master_holder_clear(entry);
 		}
 		if (master_holder_was_dead)
 			changed = true;
 		after_state = (PcmState)pg_atomic_read_u32(&entry->master_state);
 		if (changed && after_state != before_state)
 			broadcast_needed = true;
+		(void)pcm_authority_core_commit_locked(entry, &core_before);
 
 		LWLockRelease(&entry->entry_lock.lock);
 
@@ -1257,9 +1557,17 @@ cluster_pcm_lock_clean_leave_release_all_self(uint64 leave_epoch)
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	hash_seq_init(&scan, cluster_pcm_htab);
 	while ((entry = (struct GrdEntry *)hash_seq_search(&scan)) != NULL) {
+		PcmAuthorityCore core_before;
+		bool authority_changed;
 		bool changed = false;
+		uint32 s_bitmap;
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pcm_authority_core_capture_locked(entry, &core_before);
+		authority_changed = entry->x_holder_node == cluster_node_id
+							|| (pg_atomic_read_u32(&entry->s_holders_bitmap) & self_bit) != 0;
+		if (authority_changed)
+			pcm_authority_core_preflight_locked(entry);
 
 		if (entry->x_holder_node == cluster_node_id) {
 			entry->x_holder_node = -1;
@@ -1274,10 +1582,24 @@ cluster_pcm_lock_clean_leave_release_all_self(uint64 leave_epoch)
 			changed = true;
 		}
 
-		/* No X holder and no S holders left -> the block is unheld; demote the
-		 * mastered state to N (shared storage becomes the sole authority). */
-		if (entry->x_holder_node < 0 && pg_atomic_read_u32(&entry->s_holders_bitmap) == 0)
-			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+		if (authority_changed) {
+			s_bitmap = pg_atomic_read_u32(&entry->s_holders_bitmap);
+			if (entry->x_holder_node >= 0) {
+				pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+				if (!pcm_master_holder_is_valid(entry)
+					|| entry->master_holder.node_id != (uint32)entry->x_holder_node)
+					pcm_master_holder_set_node(entry, entry->x_holder_node);
+			} else if (s_bitmap != 0) {
+				pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
+				if (!pcm_master_holder_is_valid(entry) || entry->master_holder.node_id >= 32
+					|| (s_bitmap & (UINT32_C(1) << entry->master_holder.node_id)) == 0)
+					pcm_master_holder_set_node(entry, pcm_lowest_set_bit_node(s_bitmap));
+			} else {
+				pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_N);
+				pcm_master_holder_clear(entry);
+			}
+		}
+		(void)pcm_authority_core_commit_locked(entry, &core_before);
 
 		LWLockRelease(&entry->entry_lock.lock);
 
@@ -1356,6 +1678,7 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 												uint64 cluster_epoch)
 {
 	struct GrdEntry *entry;
+	PcmAuthorityCore core_before;
 	uint32 holder_bit;
 
 	/* epoch already gated by the handler (L235/L236); recorded below as the
@@ -1375,10 +1698,13 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 	holder_bit = pcm_holder_bit(source_node);
 
 	pcm_entry_lock_exclusive(entry);
+	pcm_authority_core_capture_locked(entry, &core_before);
 
 	if (held_mode == (uint8)PCM_STATE_X) {
+		ClusterGrdHolderId desired_holder;
 		int32 cur_x = entry->x_holder_node;
 		uint32 other_s = pg_atomic_read_u32(&entry->s_holders_bitmap) & ~holder_bit;
+		bool authority_changed;
 
 		/*
 		 * spec-4.7 D3 not-double-X + X-vs-S contradiction (规则 8.A): another
@@ -1396,11 +1722,21 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 			LWLockRelease(&entry->entry_lock.lock);
 			return false;
 		}
+		memset(&desired_holder, 0, sizeof(desired_holder));
+		desired_holder.node_id = (uint32)source_node;
+		authority_changed
+			= core_before.state != PCM_STATE_X || core_before.x_holder_node != source_node
+			  || core_before.s_holders_bitmap != 0
+			  || memcmp(&core_before.master_holder, &desired_holder, sizeof(desired_holder)) != 0;
 		/* X holder is authoritative for the block (first declarer, or the same
 		 * node re-declaring). */
-		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
-		entry->x_holder_node = source_node;
-		pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+		if (authority_changed) {
+			pcm_authority_core_preflight_locked(entry);
+			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+			entry->x_holder_node = source_node;
+			pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+			pcm_master_holder_set_node(entry, source_node);
+		}
 	} else if ((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_X) {
 		/*
 		 * spec-4.7 D3 S-vs-X contradiction (规则 8.A, code-review P1 fix): the
@@ -1414,10 +1750,29 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 		LWLockRelease(&entry->entry_lock.lock);
 		return false;
 	} else {
+		ClusterGrdHolderId desired_holder = core_before.master_holder;
+		uint32 desired_bitmap = core_before.s_holders_bitmap | holder_bit;
+		bool authority_changed;
+
+		if (desired_holder.node_id == INVALID_PCM_MASTER_HOLDER_NODE
+			|| desired_holder.node_id >= 32
+			|| (desired_bitmap & (UINT32_C(1) << desired_holder.node_id)) == 0) {
+			memset(&desired_holder, 0, sizeof(desired_holder));
+			desired_holder.node_id = (uint32)source_node;
+		}
+		authority_changed
+			= core_before.state != PCM_STATE_S || core_before.x_holder_node != -1
+			  || core_before.s_holders_bitmap != desired_bitmap
+			  || memcmp(&core_before.master_holder, &desired_holder, sizeof(desired_holder)) != 0;
 		/* S residency: merge the bit;  raise N→S. */
-		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
-		if ((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N)
+		if (authority_changed) {
+			pcm_authority_core_preflight_locked(entry);
+			entry->x_holder_node = -1;
+			pg_atomic_write_u32(&entry->s_holders_bitmap, desired_bitmap);
 			pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_S);
+			if (memcmp(&entry->master_holder, &desired_holder, sizeof(desired_holder)) != 0)
+				pcm_master_holder_set_exact(entry, &desired_holder);
+		}
 	}
 
 	/* spec-2.41 D3 — advance BOTH watermarks from the survivor re-declare,
@@ -1441,6 +1796,7 @@ cluster_gcs_block_master_rebuild_from_redeclare(BufferTag tag, uint8 held_mode, 
 		}
 	}
 
+	(void)pcm_authority_core_commit_locked(entry, &core_before);
 	LWLockRelease(&entry->entry_lock.lock);
 	return true; /* holder recorded */
 }
@@ -1461,8 +1817,10 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthorityS
 											  uint64 epoch)
 {
 	struct GrdEntry *entry;
+	PcmAuthorityCore core_before;
 	PcmAuthoritySnapshot current;
 	ClusterGrdHolderId requester;
+	bool authority_changed;
 	bool found;
 
 	if (expected == NULL || holder_node < 0 || holder_node >= 32 || request_id == 0)
@@ -1483,6 +1841,7 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthorityS
 	}
 
 	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+	pcm_authority_core_capture_locked(entry, &core_before);
 	pcm_authority_snapshot_locked(entry, &current);
 	if (!pcm_authority_snapshot_equal(&current, expected)) {
 		LWLockRelease(&entry->entry_lock.lock);
@@ -1497,11 +1856,17 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthorityS
 		return PCM_X_TRANSFER_COMMIT_BAD_STATE;
 	}
 
-	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
-	entry->x_holder_node = cluster_node_id;
-	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
-	entry->s_holder_refcount_local = 0;
-	pcm_master_holder_set_exact(entry, &requester);
+	authority_changed
+		= current.x_holder_node != cluster_node_id
+		  || memcmp(&current.master_holder, &requester, sizeof(requester)) != 0;
+	if (authority_changed) {
+		pcm_authority_core_preflight_locked(entry);
+		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+		entry->x_holder_node = cluster_node_id;
+		pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+		entry->s_holder_refcount_local = 0;
+		pcm_master_holder_set_exact(entry, &requester);
+	}
 	if ((uint64)page_lsn > entry->pi_watermark_lsn)
 		entry->pi_watermark_lsn = (uint64)page_lsn;
 	if (SCN_VALID(page_scn)) {
@@ -1515,6 +1880,7 @@ cluster_pcm_lock_master_take_x_after_transfer(BufferTag tag, const PcmAuthorityS
 	}
 	entry->last_transition_at = GetCurrentTimestamp();
 	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+	(void)pcm_authority_core_commit_locked(entry, &core_before);
 	LWLockRelease(&entry->entry_lock.lock);
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 	return PCM_X_TRANSFER_COMMIT_OK;
@@ -1541,6 +1907,9 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 								   SCN page_scn, uint64 request_id, uint64 epoch)
 {
 	struct GrdEntry *entry;
+	PcmAuthorityCore core_before;
+	ClusterGrdHolderId requester;
+	bool authority_changed;
 
 	if (cluster_pcm_htab == NULL)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1556,11 +1925,22 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 						errmsg("cluster_pcm_lock_master_grant_x_to: PCM GRD HTAB FULL (cap=%d)",
 							   pcm_grd_effective)));
 
+	memset(&requester, 0, sizeof(requester));
+	requester.node_id = (uint32)requester_node;
+
 	pcm_entry_lock_exclusive(entry);
-	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
-	entry->x_holder_node = requester_node;
-	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
-	pcm_master_holder_set_node(entry, requester_node);
+	pcm_authority_core_capture_locked(entry, &core_before);
+	authority_changed
+		= core_before.state != PCM_STATE_X || core_before.x_holder_node != requester_node
+		  || core_before.s_holders_bitmap != 0
+		  || memcmp(&core_before.master_holder, &requester, sizeof(requester)) != 0;
+	if (authority_changed) {
+		pcm_authority_core_preflight_locked(entry);
+		pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
+		entry->x_holder_node = requester_node;
+		pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
+		pcm_master_holder_set_node(entry, requester_node);
+	}
 	/* spec-2.41 D2 (§2.8.1) — local-page source advances BOTH watermarks (lsn
 	 * for redo-coverage, scn for the detector) from the shipped page. */
 	if ((uint64)page_lsn > entry->pi_watermark_lsn)
@@ -1578,6 +1958,7 @@ cluster_pcm_lock_master_grant_x_to(BufferTag tag, int32 requester_node, XLogRecP
 							   request_id, epoch);
 		}
 	}
+	(void)pcm_authority_core_commit_locked(entry, &core_before);
 	LWLockRelease(&entry->entry_lock.lock);
 }
 
@@ -1728,6 +2109,8 @@ cluster_pcm_wm_src_text(ClusterPcmWmSrc src)
 		return "invalidate-ack-slotless";
 	case CLUSTER_PCM_WM_SRC_ACK_SLOT:
 		return "invalidate-ack-slot";
+	case CLUSTER_PCM_WM_SRC_STALE_X_COMMIT:
+		return "stale-x-commit";
 	}
 	return "unknown";
 }
@@ -2057,12 +2440,15 @@ cluster_pcm_lock_pi_discard_collect(BufferTag tag, SCN written_scn, uint32 *hold
 void
 cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, int holder_node_id)
 {
+	PcmAuthorityCore core_before;
 	uint32 holder_bit;
 
 	Assert(entry != NULL);
 	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	Assert(holder_node_id >= 0 && holder_node_id < 32);
 
+	pcm_authority_core_capture_locked(entry, &core_before);
+	pcm_authority_core_preflight_locked(entry);
 	holder_bit = (uint32)1u << (uint32)holder_node_id;
 
 	switch (trans) {
@@ -2172,6 +2558,7 @@ cluster_pcm_transition_apply(struct GrdEntry *entry, PcmLockTransition trans, in
 
 	entry->last_transition_at = GetCurrentTimestamp();
 	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
+	(void)pcm_authority_core_commit_locked(entry, &core_before);
 }
 
 /* The pending-X cookie and S-holder bitmap are both protected by entry_lock.
@@ -2188,6 +2575,47 @@ pcm_s_admission_allowed_locked(struct GrdEntry *entry, uint32 holder_bit)
 }
 
 /*
+ * The exact GCS X transition owns its legacy pending-X cleanup in the same
+ * entry-lock interval as the final epoch/authority check and the transition.
+ * Queue tickets have a separate exact lifecycle and are never consumed here.
+ */
+static bool
+pcm_gcs_exact_legacy_pending_matches_locked(
+	struct GrdEntry *entry, PcmLockTransition trans, int holder_node_id)
+{
+	Assert(entry != NULL);
+	Assert(LWLockHeldByMeInMode(
+		&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (trans != PCM_TRANS_N_TO_X
+		&& trans != PCM_TRANS_S_TO_X_UPGRADE)
+		return false;
+	if (entry->pending_x_requester_node != holder_node_id
+		|| entry->pending_x_since_lsn == 0
+		|| (entry->pending_x_since_lsn
+			& PCM_PENDING_X_QUEUE_KIND) != 0)
+		return false;
+	return true;
+}
+
+static bool
+pcm_gcs_exact_clear_legacy_pending_locked(
+	struct GrdEntry *entry, PcmLockTransition trans, int holder_node_id)
+{
+	PcmAuthorityCore core_before;
+
+	if (!pcm_gcs_exact_legacy_pending_matches_locked(
+			entry, trans, holder_node_id))
+		return false;
+
+	pcm_authority_core_capture_locked(entry, &core_before);
+	pcm_authority_core_preflight_locked(entry);
+	entry->pending_x_requester_node = -1;
+	entry->pending_x_since_lsn = 0;
+	(void)pcm_authority_core_commit_locked(entry, &core_before);
+	return true;
+}
+
+/*
  * Apply a GCS-requested PCM transition on the master side.
  *
  * Unlike the public local APIs, the exact helper distinguishes a raced
@@ -2196,11 +2624,15 @@ pcm_s_admission_allowed_locked(struct GrdEntry *entry, uint32 holder_bit)
  * reply wait.  The bool wrapper preserves existing callers' applied/not-
  * applied contract.
  */
-PcmGcsTransitionApplyResult
-cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition trans,
-											 int holder_node_id)
+static PcmGcsTransitionApplyResult
+pcm_lock_apply_gcs_transition_internal(
+	BufferTag tag, PcmLockTransition trans, int holder_node_id,
+	bool enforce_exact, uint64 expected_epoch,
+	const PcmAuthoritySnapshot *expected_authority)
 {
 	struct GrdEntry *entry;
+	PcmAuthoritySnapshot current_authority;
+	PcmAuthorityCore core_before;
 	PcmState cur;
 	PcmState target;
 	uint32 holder_bit;
@@ -2214,8 +2646,12 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	if (trans == PCM_TRANS_S_TO_X_CLEANOUT)
 		return PCM_GCS_TRANSITION_INCOMPATIBLE;
+	if (enforce_exact
+		&& cluster_epoch_get_current() != expected_epoch)
+		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 
-	if (trans == PCM_TRANS_N_TO_S || trans == PCM_TRANS_N_TO_X)
+	if ((trans == PCM_TRANS_N_TO_S || trans == PCM_TRANS_N_TO_X)
+		&& expected_authority == NULL)
 		entry = pcm_get_or_create_entry(tag);
 	else
 		entry = pcm_find_entry(tag);
@@ -2226,6 +2662,27 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 	target = pcm_transition_target(trans);
 
 	pcm_entry_lock_exclusive(entry);
+	if (enforce_exact) {
+		/*
+		 * The epoch and optional full authority token are checked only after
+		 * entry_lock EXCLUSIVE and the transition is applied before that lock
+		 * is released.  Thus a same-tag new-epoch authority either wins the
+		 * entry lock first and is rejected here, or is installed after this
+		 * old-authority transition has already linearized.
+		 */
+		if (cluster_epoch_get_current() != expected_epoch) {
+			LWLockRelease(&entry->entry_lock.lock);
+			return PCM_GCS_TRANSITION_INCOMPATIBLE;
+		}
+		if (expected_authority != NULL) {
+			pcm_authority_snapshot_locked(entry, &current_authority);
+			if (!pcm_authority_snapshot_equal(
+					&current_authority, expected_authority)) {
+				LWLockRelease(&entry->entry_lock.lock);
+				return PCM_GCS_TRANSITION_INCOMPATIBLE;
+			}
+		}
+	}
 	if (trans == PCM_TRANS_N_TO_S && !pcm_s_admission_allowed_locked(entry, holder_bit)) {
 		LWLockRelease(&entry->entry_lock.lock);
 		return PCM_GCS_TRANSITION_PENDING_X;
@@ -2239,7 +2696,12 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 	 * S and only gains another S holder bit.
 	 */
 	if (trans == PCM_TRANS_N_TO_S && cur == PCM_STATE_S) {
-		pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
+		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) == 0) {
+			pcm_authority_core_capture_locked(entry, &core_before);
+			pcm_authority_core_preflight_locked(entry);
+			pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
+			(void)pcm_authority_core_commit_locked(entry, &core_before);
+		}
 		LWLockRelease(&entry->entry_lock.lock);
 		return PCM_GCS_TRANSITION_APPLIED;
 	}
@@ -2259,7 +2721,14 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 	}
 
 	if (!cluster_pcm_transition_legal(cur, target, trans)) {
+		bool pending_cleared
+			= enforce_exact
+				  && pcm_gcs_exact_clear_legacy_pending_locked(
+					  entry, trans, holder_node_id);
+
 		LWLockRelease(&entry->entry_lock.lock);
+		if (pending_cleared)
+			ConditionVariableBroadcast(&entry->wait_cv);
 		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	}
 
@@ -2270,7 +2739,14 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 	case PCM_TRANS_S_TO_X_UPGRADE:
 		if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) == 0
 			|| (pg_atomic_read_u32(&entry->s_holders_bitmap) & ~holder_bit) != 0) {
+			bool pending_cleared
+				= enforce_exact
+					  && pcm_gcs_exact_clear_legacy_pending_locked(
+						  entry, trans, holder_node_id);
+
 			LWLockRelease(&entry->entry_lock.lock);
+			if (pending_cleared)
+				ConditionVariableBroadcast(&entry->wait_cv);
 			return PCM_GCS_TRANSITION_INCOMPATIBLE;
 		}
 		break;
@@ -2294,7 +2770,15 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 		return PCM_GCS_TRANSITION_INCOMPATIBLE;
 	}
 
+	if (enforce_exact
+		&& pcm_gcs_exact_legacy_pending_matches_locked(
+			entry, trans, holder_node_id))
+		pcm_authority_core_preflight_steps_locked(entry, 2);
 	cluster_pcm_transition_apply(entry, trans, holder_node_id);
+	if (enforce_exact
+		&& pcm_gcs_exact_clear_legacy_pending_locked(
+			entry, trans, holder_node_id))
+		broadcast_needed = true;
 	if ((PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N
 		|| trans == PCM_TRANS_X_TO_S_DOWNGRADE)
 		broadcast_needed = true;
@@ -2303,6 +2787,26 @@ cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag, PcmLockTransition tr
 	if (broadcast_needed)
 		ConditionVariableBroadcast(&entry->wait_cv);
 	return PCM_GCS_TRANSITION_APPLIED;
+}
+
+PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_gcs_transition_result(BufferTag tag,
+											 PcmLockTransition trans,
+											 int holder_node_id)
+{
+	return pcm_lock_apply_gcs_transition_internal(
+		tag, trans, holder_node_id, false, 0, NULL);
+}
+
+PcmGcsTransitionApplyResult
+cluster_pcm_lock_apply_gcs_transition_exact_result(
+	BufferTag tag, PcmLockTransition trans, int holder_node_id,
+	uint64 expected_epoch,
+	const PcmAuthoritySnapshot *expected_authority)
+{
+	return pcm_lock_apply_gcs_transition_internal(
+		tag, trans, holder_node_id, true, expected_epoch,
+		expected_authority);
 }
 
 bool
@@ -2599,8 +3103,13 @@ pcm_lock_acquire_local(BufferTag tag, PcmLockMode mode, PcmAuthoritySnapshot *re
 				if ((pg_atomic_read_u32(&entry->s_holders_bitmap) & holder_bit) != 0)
 					entry->s_holder_refcount_local++;
 				else {
+					PcmAuthorityCore core_before;
+
+					pcm_authority_core_capture_locked(entry, &core_before);
+					pcm_authority_core_preflight_locked(entry);
 					pg_atomic_fetch_or_u32(&entry->s_holders_bitmap, holder_bit);
 					entry->s_holder_refcount_local = 1;
+					(void)pcm_authority_core_commit_locked(entry, &core_before);
 				}
 				LWLockRelease(&entry->entry_lock.lock);
 				if (cv_prepared)
@@ -3732,6 +4241,7 @@ pcm_get_or_create_entry(BufferTag tag)
 		/* PGRAC: spec-2.37 D2 HC125+HC126 — PI watermark single field default 0. */
 		entry->pi_watermark_lsn = InvalidXLogRecPtr;
 		entry->pi_watermark_scn = InvalidScn;	/* spec-2.41 D2 — SCN watermark default */
+		pg_atomic_init_u64(&entry->authority_generation, 1);
 		ConditionVariableInit(&entry->wait_cv); /* PGRAC: spec-2.31 D1 v0.4 */
 		LWLockInitialize(&entry->entry_lock.lock, LWTRANCHE_CLUSTER_PCM);
 	}

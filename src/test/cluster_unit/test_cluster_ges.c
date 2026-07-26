@@ -53,6 +53,7 @@
 
 #include "access/transam.h" /* spec-5.8 D1c — InvalidTransactionId for the GetTopTransactionIdIfAny stub */
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_grd.h"
@@ -63,6 +64,8 @@
 #include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B stub — peer state */
 #include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B stub — sole-native */
 #include "cluster/cluster_inject.h"		   /* S3 forensics step 1a stub prototypes */
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2 stub — profiling gate */
 #include "port/atomics.h"
 
@@ -235,11 +238,53 @@ cluster_shmem_register_region(const void *r pg_attribute_unused())
  * ============================================================ */
 
 int cluster_node_id = 0;
+static bool stub_dedup_lifecycle_enabled = false;
+static uint64 stub_dedup_lifecycle_enqueue_count = 0;
+static GesDedupLifecyclePayload stub_dedup_lifecycle_last;
+static uint32 stub_dedup_retire_pending = 0;
+static uint64 stub_grd_retire_proc_count = 0;
+static uint64 stub_lookup_superseded_boot = 0;
+static uint64 stub_grd_retire_boot_count = 0;
+static uint32 stub_grd_retire_boot_origin = 0;
+static uint64 stub_grd_retire_boot_value = 0;
+static uint64 stub_dedup_journal_register_count = 0;
+static uint64 stub_dedup_journal_commit_count = 0;
+static bool stub_dedup_journal_register_success = true;
+static uint64 stub_dedup_record_identity_count = 0;
+static ClusterGesDedupKey stub_dedup_record_identity_key;
+static uint64 stub_dedup_record_identity_boot = 0;
+static uint16 stub_dedup_record_identity_reply_len = 0;
 
 bool
 cluster_qvotec_in_quorum(void)
 {
 	return true; /* default in-quorum so validation step 4 passes */
+}
+
+uint64
+cluster_qvotec_get_durable_self_incarnation(void)
+{
+	return stub_dedup_lifecycle_enabled ? UINT64CONST(101) : 0;
+}
+
+bool
+cluster_qvotec_peer_boot_majority_exact(
+	int32 peer pg_attribute_unused(), uint64 epoch pg_attribute_unused(),
+	uint64 boot pg_attribute_unused(), uint64 *incarnation_out pg_attribute_unused())
+{
+	return stub_dedup_lifecycle_enabled;
+}
+
+bool
+cluster_sf_peer_ges_dedup_done_capability_identity(
+	int32 peer pg_attribute_unused(), uint32 *generation_out,
+	uint64 *boot_out)
+{
+	if (generation_out)
+		*generation_out = stub_dedup_lifecycle_enabled ? 7 : 0;
+	if (boot_out)
+		*boot_out = stub_dedup_lifecycle_enabled ? UINT64CONST(202) : 0;
+	return stub_dedup_lifecycle_enabled;
 }
 
 /*
@@ -265,6 +310,14 @@ uint64
 cluster_epoch_get_current(void)
 {
 	return 0; /* default epoch 0 — matches env_sentinel.epoch */
+}
+
+uint64
+cluster_ges_reply_wait_next_request_id(void)
+{
+	static uint64 next_id = 1000;
+
+	return ++next_id;
 }
 
 /* cluster_conf — return non-NULL so validation step 4 declared check
@@ -327,6 +380,16 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
+ClusterGrdEntryResult
+cluster_grd_entry_rebind_or_insert_holder_meta(
+	const ClusterResId *resid pg_attribute_unused(),
+	const struct ClusterGrdHolderId *nh pg_attribute_unused(),
+	int32 src pg_attribute_unused(), int lockmode pg_attribute_unused(),
+	uint64 boot pg_attribute_unused())
+{
+	return CLUSTER_GRD_ENTRY_OK;
+}
+
 static int32 stub_remote_master = -1;
 
 int32
@@ -360,9 +423,15 @@ static uint64 stub_bast_ack = 0;
 static uint64 stub_deadlock_probe_drop = 0;
 static uint64 stub_backend_request_enqueue_count = 0;
 static GesRequestPayload stub_backend_request_last;
+static uint64 stub_backend_request_fail_on_call = 0;
+static uint64 stub_cleanup_release_enqueue_count = 0;
+static GesRequestPayload stub_cleanup_release_last;
 static uint64 stub_cancel_wait_enqueue_count = 0;
 static uint32 stub_cancel_wait_last_dest = 0;
 static GesCancelWaitPayload stub_cancel_wait_last;
+static int stub_release_drain_calls = 0;
+static bool stub_release_drain_emit_once = false;
+static ClusterGrdGrantIdentity stub_release_drain_grant;
 
 void
 cluster_grd_inc_ges_work_queue_full(void)
@@ -467,6 +536,15 @@ cluster_grd_work_queue_enqueue(uint32 src pg_attribute_unused(),
 }
 
 bool
+cluster_grd_work_queue_enqueue_identity(
+	uint32 src pg_attribute_unused(), uint64 boot pg_attribute_unused(),
+	const void *p pg_attribute_unused(), uint16 l pg_attribute_unused())
+{
+	stub_work_queue_enqueue_count++;
+	return true;
+}
+
+bool
 cluster_grd_work_queue_dequeue(ClusterGrdWorkItem *out pg_attribute_unused())
 {
 	return false;
@@ -479,12 +557,28 @@ cluster_grd_outbound_enqueue_lmon_reply(uint32 d pg_attribute_unused(),
 {
 	stub_lmon_reply_enqueue_count++;
 }
+
+void
+cluster_grd_outbound_enqueue_ges_dedup_lifecycle(
+	uint8 mt pg_attribute_unused(), uint32 d pg_attribute_unused(),
+	const void *p, uint16 l,
+	uint32 gen pg_attribute_unused())
+{
+	stub_dedup_lifecycle_enqueue_count++;
+	if (p != NULL && l == sizeof(GesDedupLifecyclePayload))
+		memcpy(&stub_dedup_lifecycle_last, p,
+			   sizeof(stub_dedup_lifecycle_last));
+}
 /* spec-5.16 orphan-grant auto-release uses the cleanup-release producer. */
 void
 cluster_grd_outbound_enqueue_cleanup_release(uint32 d pg_attribute_unused(),
-											 const void *p pg_attribute_unused(),
-											 uint16 l pg_attribute_unused())
-{}
+											 const void *p, uint16 l)
+{
+	stub_cleanup_release_enqueue_count++;
+	if (p != NULL && l == sizeof(GesRequestPayload))
+		memcpy(&stub_cleanup_release_last, p,
+			   sizeof(stub_cleanup_release_last));
+}
 
 /* spec-2.23 D14 R13 stub audit — new symbol surface introduced by
  * Steps 1-9 needs file-local stubs so cluster_ges.o links standalone
@@ -498,7 +592,20 @@ cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(), con
 	stub_backend_request_enqueue_count++;
 	if (p != NULL && l == sizeof(GesRequestPayload))
 		memcpy(&stub_backend_request_last, p, sizeof(stub_backend_request_last));
+	if (stub_backend_request_fail_on_call != 0
+		&& stub_backend_request_enqueue_count
+			   == stub_backend_request_fail_on_call)
+		return false;
 	return true;
+}
+
+bool
+cluster_grd_outbound_enqueue_backend_request_capability(
+	uint32 d, const void *p, uint16 l,
+	uint32 required_capability pg_attribute_unused(),
+	uint32 capability_generation pg_attribute_unused())
+{
+	return cluster_grd_outbound_enqueue_backend_request(d, p, l);
 }
 
 /* spec-5.8 D8 — REPORT send-back deps newly referenced by cluster_ges.o.  The
@@ -610,19 +717,20 @@ cluster_lms_native_probe_recv_reply(uint64 probe_id pg_attribute_unused(),
 /* spec-2.27 D2 / D7 R10 stub audit. */
 int cluster_ges_retransmit_max_attempts = 5;
 int cluster_ges_dedup_max_entries = 8192;
+static uint64 stub_shard_master_generation = 0;
 
 uint64
 cluster_lms_get_shard_master_generation(void)
 {
-	return 0;
+	return stub_shard_master_generation;
 }
 
 void
 cluster_lms_inc_priority_starvation_observed(void)
 {}
 
-int /* ClusterGesDedupLookupStatus */
-cluster_ges_dedup_lookup_or_register(const void *key pg_attribute_unused(),
+ClusterGesDedupLookupStatus
+cluster_ges_dedup_lookup_or_register(const ClusterGesDedupKey *key pg_attribute_unused(),
 									 uint8 *reply_out pg_attribute_unused(),
 									 uint16 reply_buf_len pg_attribute_unused(),
 									 uint16 *reply_len_out pg_attribute_unused())
@@ -632,15 +740,152 @@ cluster_ges_dedup_lookup_or_register(const void *key pg_attribute_unused(),
 	return 0; /* CLUSTER_GES_DEDUP_MISS_REGISTERED */
 }
 
+ClusterGesDedupLookupStatus
+cluster_ges_dedup_lookup_or_register_identity(
+	const ClusterGesDedupKey *key pg_attribute_unused(),
+	uint64 boot pg_attribute_unused(), uint8 *reply_out pg_attribute_unused(),
+	uint16 reply_buf_len pg_attribute_unused(),
+	uint16 *reply_len_out pg_attribute_unused())
+{
+	if (reply_len_out)
+		*reply_len_out = 0;
+	return CLUSTER_GES_DEDUP_MISS_REGISTERED;
+}
+
+ClusterGesDedupLookupStatus
+cluster_ges_dedup_lookup_or_register_identity_ex(
+	const ClusterGesDedupKey *key pg_attribute_unused(),
+	uint64 boot pg_attribute_unused(), uint64 *superseded_boot_out,
+	uint8 *reply_out pg_attribute_unused(),
+	uint16 reply_buf_len pg_attribute_unused(),
+	uint16 *reply_len_out)
+{
+	if (superseded_boot_out)
+		*superseded_boot_out = stub_lookup_superseded_boot;
+	if (reply_len_out)
+		*reply_len_out = 0;
+	return CLUSTER_GES_DEDUP_MISS_REGISTERED;
+}
+
+bool
+cluster_ges_dedup_request_is_retired(
+	const ClusterGesDedupKey *key pg_attribute_unused(),
+	uint64 boot pg_attribute_unused())
+{
+	return false;
+}
+
 void
-cluster_ges_dedup_record_reply(const void *key pg_attribute_unused(),
+cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key pg_attribute_unused(),
 							   const uint8 *reply pg_attribute_unused(),
 							   uint16 reply_len pg_attribute_unused())
 {}
 
+void
+cluster_ges_dedup_record_reply_identity(
+	const ClusterGesDedupKey *key, uint64 boot,
+	const uint8 *reply pg_attribute_unused(), uint16 reply_len)
+{
+	stub_dedup_record_identity_count++;
+	if (key != NULL)
+		stub_dedup_record_identity_key = *key;
+	stub_dedup_record_identity_boot = boot;
+	stub_dedup_record_identity_reply_len = reply_len;
+}
+
+ClusterGesDedupRetireResult
+cluster_ges_dedup_retire_exact(
+	const ClusterGesDedupKey *key pg_attribute_unused(),
+	uint64 boot pg_attribute_unused())
+{
+	return CLUSTER_GES_DEDUP_RETIRE_ALREADY_ABSENT;
+}
+
+uint32
+cluster_ges_dedup_retire_origin_proc_up_to(
+	uint32 origin pg_attribute_unused(), uint32 procno pg_attribute_unused(),
+	uint64 hwm pg_attribute_unused(), uint64 boot pg_attribute_unused(),
+	uint32 *pending_out, bool *applied_out)
+{
+	if (pending_out)
+		*pending_out = stub_dedup_retire_pending;
+	if (applied_out)
+		*applied_out = true;
+	return 0;
+}
+
+bool
+cluster_ges_dedup_journal_register(
+	uint32 dest pg_attribute_unused(),
+	const GesDedupLifecyclePayload *done pg_attribute_unused())
+{
+	stub_dedup_journal_register_count++;
+	return stub_dedup_journal_register_success;
+}
+
+bool
+cluster_ges_dedup_journal_commit(
+	uint32 dest pg_attribute_unused(),
+	const GesDedupLifecyclePayload *done pg_attribute_unused())
+{
+	stub_dedup_journal_commit_count++;
+	return true;
+}
+
+bool
+cluster_ges_dedup_journal_cancel(
+	uint32 dest pg_attribute_unused(),
+	const GesDedupLifecyclePayload *done pg_attribute_unused())
+{
+	return true;
+}
+
+bool
+cluster_ges_dedup_journal_claim_due(
+	TimestampTz now pg_attribute_unused(), uint32 *dest pg_attribute_unused(),
+	GesDedupLifecyclePayload *done pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_ges_dedup_journal_ack(
+	uint32 source pg_attribute_unused(),
+	const GesDedupLifecyclePayload *ack pg_attribute_unused())
+{
+	return true;
+}
+
+uint32
+cluster_ges_dedup_journal_drop_target_boot_mismatch(
+	uint32 dest pg_attribute_unused(), uint64 boot pg_attribute_unused())
+{
+	return 0;
+}
+
+uint32
+cluster_ges_dedup_journal_reap_dead_backend(void)
+{
+	return 0;
+}
+
 bool
 cluster_lms_native_probe_required(const struct ClusterResId *resid pg_attribute_unused(),
 								  int lockmode pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_lms_native_probe_schedule_grant_identity(
+	const struct ClusterResId *resid pg_attribute_unused(),
+	int lockmode pg_attribute_unused(),
+	const struct ClusterGrdHolderId *requester pg_attribute_unused(),
+	int32 source_node_id pg_attribute_unused(),
+	uint32 request_opcode pg_attribute_unused(),
+	uint64 shard_master_generation pg_attribute_unused(),
+	int convert_current_mode pg_attribute_unused(),
+	ClusterGrdWaiterMeta waiter_meta pg_attribute_unused())
 {
 	return false;
 }
@@ -699,10 +944,46 @@ cluster_grd_convert_or_enqueue_meta(
 int
 cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unused(),
 							  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
-							  ClusterGrdGrantIdentity *granted_out pg_attribute_unused(),
+							  ClusterGrdGrantIdentity *granted_out,
 							  int max_out pg_attribute_unused())
 {
+	stub_release_drain_calls++;
+	if (stub_release_drain_emit_once) {
+		stub_release_drain_emit_once = false;
+		*granted_out = stub_release_drain_grant;
+		return 1;
+	}
 	return 0;
+}
+
+void
+cluster_grd_retire_origin_proc_up_to(
+	uint32 origin_node_id pg_attribute_unused(),
+	uint64 origin_boot_incarnation pg_attribute_unused(),
+	uint32 holder_procno pg_attribute_unused(),
+	uint64 request_id_hwm pg_attribute_unused(),
+	ClusterGrdRetireGrantCallback grant_cb pg_attribute_unused(),
+	void *grant_cb_arg pg_attribute_unused(),
+	ClusterGrdRetireStats *stats_out)
+{
+	stub_grd_retire_proc_count++;
+	if (stats_out)
+		memset(stats_out, 0, sizeof(*stats_out));
+}
+
+void
+cluster_grd_retire_origin_boot(
+	uint32 origin_node_id pg_attribute_unused(),
+	uint64 origin_boot_incarnation pg_attribute_unused(),
+	ClusterGrdRetireGrantCallback grant_cb pg_attribute_unused(),
+	void *grant_cb_arg pg_attribute_unused(),
+	ClusterGrdRetireStats *stats_out)
+{
+	stub_grd_retire_boot_count++;
+	stub_grd_retire_boot_origin = origin_node_id;
+	stub_grd_retire_boot_value = origin_boot_incarnation;
+	if (stats_out)
+		memset(stats_out, 0, sizeof(*stats_out));
 }
 
 ClusterGrdEntryResult
@@ -868,6 +1149,12 @@ cluster_grd_cancel_waiter_by_id(const struct ClusterResId *r pg_attribute_unused
 
 /* spec-5.9 D4 stubs — the CANCEL_WAIT handler dequeues via these; the real
  * dequeue is covered by test_cluster_grd / the 2-node TAP. */
+static ClusterGrdEntryResult stub_cancel_wait_result
+	= CLUSTER_GRD_ENTRY_NOT_FOUND;
+static ClusterGrdWaiterIdentity stub_cancel_wait_removed;
+static uint64 stub_cancel_request_identity_calls;
+static uint64 stub_cancel_convert_identity_calls;
+
 ClusterGrdEntryResult
 cluster_grd_cancel_waiter_by_id_seq(const struct ClusterResId *r pg_attribute_unused(),
 									const struct ClusterGrdHolderId *h pg_attribute_unused(),
@@ -877,11 +1164,37 @@ cluster_grd_cancel_waiter_by_id_seq(const struct ClusterResId *r pg_attribute_un
 }
 
 ClusterGrdEntryResult
+cluster_grd_cancel_waiter_by_id_seq_identity(
+	const struct ClusterResId *r pg_attribute_unused(),
+	const struct ClusterGrdHolderId *h pg_attribute_unused(),
+	uint64 ws pg_attribute_unused(),
+	struct ClusterGrdWaiterIdentity *removed_out)
+{
+	stub_cancel_request_identity_calls++;
+	if (removed_out != NULL)
+		*removed_out = stub_cancel_wait_removed;
+	return stub_cancel_wait_result;
+}
+
+ClusterGrdEntryResult
 cluster_grd_cancel_convert_by_id(const struct ClusterResId *r pg_attribute_unused(),
 								 const struct ClusterGrdHolderId *h pg_attribute_unused(),
 								 uint64 ws pg_attribute_unused())
 {
 	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_convert_by_id_identity(
+	const struct ClusterResId *r pg_attribute_unused(),
+	const struct ClusterGrdHolderId *h pg_attribute_unused(),
+	uint64 ws pg_attribute_unused(),
+	struct ClusterGrdWaiterIdentity *removed_out)
+{
+	stub_cancel_convert_identity_calls++;
+	if (removed_out != NULL)
+		*removed_out = stub_cancel_wait_removed;
+	return stub_cancel_wait_result;
 }
 
 void
@@ -914,10 +1227,13 @@ ProcessInterrupts(void)
  * these only need to satisfy the standalone link. */
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+static bool stub_cv_throws_error = false;
 
 void
 pg_re_throw(void)
 {
+	if (stub_cv_throws_error && PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
 
@@ -929,6 +1245,7 @@ DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
 
 static bool stub_clock_advances = false;
 static TimestampTz stub_now = 0;
+static bool stub_cv_timed_sleep_returns = true;
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -954,7 +1271,9 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
 							long timeout pg_attribute_unused(),
 							uint32 wait_event pg_attribute_unused())
 {
-	return true;
+	if (stub_cv_throws_error && PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	return stub_cv_timed_sleep_returns;
 }
 
 
@@ -1099,6 +1418,154 @@ UT_TEST(test_ges_reply_valid_payload_echoes_local_holder)
 
 	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
 	UT_ASSERT_EQ(cluster_ges_reply_defer_count(), pre_reply + 1);
+}
+
+UT_TEST(test_ges_duplicate_grant_without_waiter_does_not_release_live_holder)
+{
+	ClusterICEnvelope env;
+	GesReplyPayload rep;
+	uint64 pre_cleanup = stub_cleanup_release_enqueue_count;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	memset(&env, 0, sizeof(env));
+	env.source_node_id = 1;
+	env.epoch = 0;
+	env.payload_length = sizeof(rep);
+	memset(&rep, 0, sizeof(rep));
+	rep.opcode = GES_REPLY_OPCODE_GRANT;
+	rep.reply_for_opcode = GES_REQ_OPCODE_REQUEST;
+	rep.holder_node_id = 0;
+	rep.holder_procno = 17;
+	rep.holder_request_id_lo = 99;
+
+	/* Fixture deliver() returns NO_WAITER: this is indistinguishable from
+	 * a retransmitted GRANT after the successful waiter was deleted. */
+	cluster_ges_reply_handler(&env, &rep);
+	UT_ASSERT_EQ(stub_cleanup_release_enqueue_count, pre_cleanup);
+}
+
+UT_TEST(test_ges_hwm_ack_waits_for_inflight_and_grd_retirement)
+{
+	ClusterICEnvelope env;
+	GesDedupLifecyclePayload hwm;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	stub_dedup_lifecycle_enabled = true;
+	memset(&env, 0, sizeof(env));
+	env.source_node_id = 1;
+	env.epoch = 0;
+	env.payload_length = sizeof(hwm);
+	memset(&hwm, 0, sizeof(hwm));
+	hwm.version = GES_DEDUP_LIFECYCLE_VERSION;
+	hwm.kind = GES_DEDUP_LIFECYCLE_PROC_EXIT_HWM;
+	hwm.origin_node_id = 1;
+	hwm.holder_procno = 17;
+	hwm.request_id = 55;
+	hwm.origin_boot_incarnation = UINT64CONST(202);
+	hwm.target_boot_incarnation = UINT64CONST(101);
+	hwm.link_generation = 7;
+
+	stub_dedup_lifecycle_enqueue_count = 0;
+	stub_grd_retire_proc_count = 0;
+	stub_dedup_retire_pending = 1;
+	cluster_ges_dedup_done_handler(&env, &hwm);
+	UT_ASSERT_EQ(stub_grd_retire_proc_count, (uint64)1);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_enqueue_count, (uint64)0);
+
+	stub_dedup_retire_pending = 0;
+	cluster_ges_dedup_done_handler(&env, &hwm);
+	UT_ASSERT_EQ(stub_grd_retire_proc_count, (uint64)2);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_last.kind,
+				 (uint8)GES_DEDUP_LIFECYCLE_ACK);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_last.status,
+				 (uint8)GES_DEDUP_ACK_HWM_APPLIED);
+
+	stub_dedup_lifecycle_enabled = false;
+}
+
+UT_TEST(test_ges_authenticated_boot_switch_retires_old_grd_boot)
+{
+	ClusterICEnvelope env;
+	GesRequestPayload req;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	stub_dedup_lifecycle_enabled = true;
+	stub_lookup_superseded_boot = UINT64CONST(303);
+	stub_grd_retire_boot_count = 0;
+	stub_work_queue_enqueue_count = 0;
+	memset(&env, 0, sizeof(env));
+	env.source_node_id = 1;
+	env.epoch = 0;
+	env.payload_length = sizeof(req);
+	memset(&req, 0, sizeof(req));
+	req.opcode = GES_REQ_OPCODE_REQUEST;
+	req.holder_node_id = 1;
+	req.holder_procno = 17;
+	req.holder_request_id_lo = 1;
+	req.shard_master_generation_lo = 1;
+
+	cluster_ges_request_handler(&env, &req);
+
+	UT_ASSERT_EQ(stub_grd_retire_boot_count, (uint64)1);
+	UT_ASSERT_EQ(stub_grd_retire_boot_origin, (uint32)1);
+	UT_ASSERT_EQ(stub_grd_retire_boot_value, UINT64CONST(303));
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, (uint64)1);
+
+	stub_lookup_superseded_boot = 0;
+	stub_dedup_lifecycle_enabled = false;
+}
+
+/*
+ * P0#10 crash/recovery regression: a queued REQUEST retains its authenticated
+ * origin boot.  If that node reconnects under a newer boot before the waiter
+ * is promoted, the master must undo the promoted stale holder instead of
+ * sending a GRANT that no post-restart reply-wait HTAB can own.  A grant for
+ * the currently authenticated boot must still be delivered normally.
+ */
+UT_TEST(test_ges_drain_drops_grant_from_superseded_origin_boot)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId releasing;
+	uint64 pre_reply;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	stub_dedup_lifecycle_enabled = true;
+	memset(&resid, 0xA5, sizeof(resid));
+	memset(&releasing, 0, sizeof(releasing));
+	memset(&stub_release_drain_grant, 0,
+		   sizeof(stub_release_drain_grant));
+	stub_release_drain_grant.source_node_id = 1;
+	stub_release_drain_grant.holder.node_id = 1;
+	stub_release_drain_grant.holder.procno = 17;
+	stub_release_drain_grant.holder.cluster_epoch = 0;
+	stub_release_drain_grant.holder.request_id
+		= UINT64CONST(0x1122334455667788);
+	stub_release_drain_grant.request_opcode = GES_REQ_OPCODE_REQUEST;
+	stub_release_drain_grant.origin_boot_incarnation = UINT64CONST(201);
+
+	pre_reply = stub_lmon_reply_enqueue_count;
+	stub_release_drain_calls = 0;
+	stub_release_drain_emit_once = true;
+	cluster_ges_release_and_drain_local(&resid, &releasing);
+
+	/* First drain promotes stale waiter; recursive exact release drains again. */
+	UT_ASSERT_EQ(stub_release_drain_calls, 2);
+	UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, pre_reply);
+
+	/* The current authenticated boot (fixture value 202) remains deliverable. */
+	stub_release_drain_grant.origin_boot_incarnation = UINT64CONST(202);
+	stub_release_drain_calls = 0;
+	stub_release_drain_emit_once = true;
+	cluster_ges_release_and_drain_local(&resid, &releasing);
+	UT_ASSERT_EQ(stub_release_drain_calls, 1);
+	UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, pre_reply + 1);
+
+	stub_dedup_lifecycle_enabled = false;
 }
 
 UT_TEST(test_ges_lmon_drain_work_queue_symbol_linkable)
@@ -1285,6 +1752,118 @@ UT_TEST(test_ges_native_lock_probe_reply_dispatch)
 	UT_ASSERT_EQ(stub_native_probe_recv_calls, pre_recv + 1);
 }
 
+UT_TEST(test_cancel_wait_success_terminalizes_exact_receiver_dedup)
+{
+	ClusterICEnvelope env;
+	GesCancelWaitPayload cancel;
+	uint64 request_calls;
+	uint64 convert_calls;
+	uint64 validation_fail;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	memset(&env, 0, sizeof(env));
+	env.source_node_id = 9; /* coordinator need not host the waiter */
+	env.payload_length = sizeof(cancel);
+	memset(&cancel, 0, sizeof(cancel));
+	cancel.opcode = GES_REQ_OPCODE_CANCEL_WAIT;
+	cancel.kind = GES_CANCEL_WAIT_KIND_REQUEST;
+	cancel.waiter_node_id = 4;
+	cancel.waiter_procno = 17;
+	cancel.waiter_cluster_epoch = UINT64CONST(23);
+	cancel.waiter_request_id = UINT64CONST(99);
+	cancel.wait_seq = UINT64CONST(7);
+	memset(&stub_cancel_wait_removed, 0,
+		   sizeof(stub_cancel_wait_removed));
+	stub_cancel_wait_removed.holder.node_id = 4;
+	stub_cancel_wait_removed.holder.procno = 17;
+	stub_cancel_wait_removed.holder.cluster_epoch = UINT64CONST(23);
+	stub_cancel_wait_removed.holder.request_id = UINT64CONST(99);
+	stub_cancel_wait_removed.source_node_id = 4;
+	stub_cancel_wait_removed.request_id = UINT64CONST(99);
+	stub_cancel_wait_removed.shard_master_generation = UINT64CONST(77);
+	stub_cancel_wait_removed.origin_boot_incarnation = UINT64CONST(101);
+	stub_cancel_wait_removed.request_opcode = GES_REQ_OPCODE_REQUEST;
+	stub_cancel_wait_result = CLUSTER_GRD_ENTRY_OK;
+	stub_cancel_request_identity_calls = 0;
+	stub_cancel_convert_identity_calls = 0;
+	stub_dedup_record_identity_count = 0;
+	memset(&stub_dedup_record_identity_key, 0,
+		   sizeof(stub_dedup_record_identity_key));
+
+	cluster_ges_request_handler(&env, &cancel);
+
+	UT_ASSERT_EQ(stub_cancel_request_identity_calls, UINT64CONST(1));
+	UT_ASSERT_EQ(stub_cancel_convert_identity_calls, UINT64CONST(0));
+	UT_ASSERT_EQ(stub_dedup_record_identity_count, UINT64CONST(1));
+	UT_ASSERT_EQ(stub_dedup_record_identity_key.origin_node_id,
+				 (uint32)4);
+	UT_ASSERT_EQ(stub_dedup_record_identity_key.opcode,
+				 (uint32)GES_REQ_OPCODE_REQUEST);
+	UT_ASSERT_EQ(stub_dedup_record_identity_key.request_id,
+				 UINT64CONST(99));
+	UT_ASSERT_EQ(stub_dedup_record_identity_key.cluster_epoch,
+				 UINT64CONST(23));
+	UT_ASSERT_EQ(
+		stub_dedup_record_identity_key.shard_master_generation,
+		UINT64CONST(77));
+	UT_ASSERT_EQ(stub_dedup_record_identity_key.holder_procno,
+				 (uint32)17);
+	UT_ASSERT_EQ(stub_dedup_record_identity_boot, UINT64CONST(101));
+	UT_ASSERT_EQ(stub_dedup_record_identity_reply_len, (uint16)0);
+
+	/* A stale/missed cancellation may have raced a real GRANT.  It must
+	 * never terminalize the dedup row for that live holder. */
+	stub_cancel_wait_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	stub_dedup_record_identity_count = 0;
+	cluster_ges_request_handler(&env, &cancel);
+	UT_ASSERT_EQ(stub_dedup_record_identity_count, UINT64CONST(0));
+
+	/* CONVERT success terminalizes only the exact convert cache key. */
+	cancel.kind = GES_CANCEL_WAIT_KIND_CONVERT;
+	stub_cancel_wait_removed.request_opcode = GES_REQ_OPCODE_CONVERT;
+	stub_cancel_wait_removed.shard_master_generation = UINT64CONST(78);
+	stub_cancel_wait_removed.origin_boot_incarnation = UINT64CONST(102);
+	stub_cancel_wait_result = CLUSTER_GRD_ENTRY_OK;
+	stub_dedup_record_identity_count = 0;
+	request_calls = stub_cancel_request_identity_calls;
+	convert_calls = stub_cancel_convert_identity_calls;
+	cluster_ges_request_handler(&env, &cancel);
+	UT_ASSERT_EQ(stub_cancel_request_identity_calls, request_calls);
+	UT_ASSERT_EQ(stub_cancel_convert_identity_calls, convert_calls + 1);
+	UT_ASSERT_EQ(stub_dedup_record_identity_count, UINT64CONST(1));
+	UT_ASSERT_EQ(stub_dedup_record_identity_key.opcode,
+				 (uint32)GES_REQ_OPCODE_CONVERT);
+	UT_ASSERT_EQ(
+		stub_dedup_record_identity_key.shard_master_generation,
+		UINT64CONST(78));
+	UT_ASSERT_EQ(stub_dedup_record_identity_boot, UINT64CONST(102));
+	UT_ASSERT_EQ(stub_dedup_record_identity_reply_len, (uint16)0);
+
+	/* NOT_FOUND may leave a poisoned output buffer in a buggy/mock primitive;
+	 * the handler must not publish anything unless the return code is OK. */
+	stub_cancel_wait_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	stub_cancel_wait_removed.request_opcode = GES_REQ_OPCODE_REQUEST;
+	stub_dedup_record_identity_count = 0;
+	cluster_ges_request_handler(&env, &cancel);
+	UT_ASSERT_EQ(stub_dedup_record_identity_count, UINT64CONST(0));
+
+	/* Unknown wire kinds fail validation before either GRD queue mutates. */
+	cancel.kind = UINT8_MAX;
+	request_calls = stub_cancel_request_identity_calls;
+	convert_calls = stub_cancel_convert_identity_calls;
+	validation_fail = stub_inbound_validation_fail;
+	cluster_ges_request_handler(&env, &cancel);
+	UT_ASSERT_EQ(stub_inbound_validation_fail, validation_fail + 1);
+	UT_ASSERT_EQ(stub_cancel_request_identity_calls, request_calls);
+	UT_ASSERT_EQ(stub_cancel_convert_identity_calls, convert_calls);
+	UT_ASSERT_EQ(stub_dedup_record_identity_count, UINT64CONST(0));
+
+	stub_cancel_wait_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	memset(&stub_cancel_wait_removed, 0,
+		   sizeof(stub_cancel_wait_removed));
+}
+
 /*
  * P0#3 regression: a finite remote REQUEST timeout must remove the exact
  * master-side waiter.  The deadlock-victim path already sends CANCEL_WAIT;
@@ -1334,10 +1913,361 @@ UT_TEST(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait)
 	stub_now = 0;
 }
 
+UT_TEST(test_ges_release_timeout_stages_dedup_bypass_cleanup)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint32 result;
+	int saved_timeout = cluster_ges_request_timeout_ms;
+
+	memset(&resid, 0x6B, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 17;
+	holder.cluster_epoch = 0;
+	holder.request_id = UINT64CONST(0x2233445566778899);
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = true;
+	stub_now = 0;
+	stub_backend_request_enqueue_count = 0;
+	stub_cleanup_release_enqueue_count = 0;
+	memset(&stub_cleanup_release_last, 0,
+		   sizeof(stub_cleanup_release_last));
+	cluster_ges_request_timeout_ms = 1;
+
+	result = cluster_ges_send_release_and_wait(
+		&resid, &holder, holder.request_id);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_TIMEOUT);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_cleanup_release_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_cleanup_release_last.opcode,
+				 (uint32)GES_REQ_OPCODE_RELEASE);
+	UT_ASSERT_EQ(stub_cleanup_release_last.holder_request_id_lo,
+				 (uint32)(holder.request_id & UINT64CONST(0xffffffff)));
+	UT_ASSERT_EQ(stub_cleanup_release_last.holder_request_id_hi,
+				 (uint32)(holder.request_id >> 32));
+
+	cluster_ges_request_timeout_ms = saved_timeout;
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_clock_advances = false;
+	stub_now = 0;
+}
+
+static void
+assert_lifecycle_timeout_result(uint32 result, uint32 expected_opcode)
+{
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_TIMEOUT);
+	UT_ASSERT_EQ(stub_dedup_journal_register_count, (uint64)1);
+	UT_ASSERT_EQ(stub_dedup_journal_commit_count, (uint64)1);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_last.kind,
+				 (uint8)GES_DEDUP_LIFECYCLE_EXACT_DONE);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_last.opcode, expected_opcode);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_last.origin_boot_incarnation,
+				 UINT64CONST(101));
+	UT_ASSERT_EQ(stub_dedup_lifecycle_last.target_boot_incarnation,
+				 UINT64CONST(202));
+}
+
+static void
+reset_lifecycle_timeout_case(void)
+{
+	stub_now = 0;
+	stub_dedup_journal_register_count = 0;
+	stub_dedup_journal_commit_count = 0;
+	stub_dedup_lifecycle_enqueue_count = 0;
+	memset(&stub_dedup_lifecycle_last, 0,
+		   sizeof(stub_dedup_lifecycle_last));
+}
+
+UT_TEST(test_five_cached_opcodes_terminalize_lifecycle_on_timeout)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint64 request_id = UINT64CONST(0x3344556677889900);
+	int saved_timeout = cluster_ges_request_timeout_ms;
+
+	memset(&resid, 0x7C, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 17;
+	holder.cluster_epoch = 9;
+	holder.request_id = request_id;
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = true;
+	stub_dedup_lifecycle_enabled = true;
+	stub_shard_master_generation = 77;
+	cluster_ges_request_timeout_ms = 1;
+
+	reset_lifecycle_timeout_case();
+	assert_lifecycle_timeout_result(
+		cluster_ges_send_request_and_wait(
+			&resid, AccessExclusiveLock, &holder, request_id, 1, 0),
+		GES_REQ_OPCODE_REQUEST);
+
+	reset_lifecycle_timeout_case();
+	assert_lifecycle_timeout_result(
+		cluster_ges_send_request_nowait_and_wait(
+			&resid, AccessExclusiveLock, &holder, request_id + 1, 1, 0),
+		GES_REQ_OPCODE_REQUEST_NOWAIT);
+
+	reset_lifecycle_timeout_case();
+	assert_lifecycle_timeout_result(
+		cluster_ges_send_redeclare_and_wait(
+			&resid, AccessExclusiveLock, &holder, request_id + 2),
+		GES_REQ_OPCODE_REDECLARE);
+
+	reset_lifecycle_timeout_case();
+	assert_lifecycle_timeout_result(
+		cluster_ges_send_release_and_wait(
+			&resid, &holder, request_id),
+		GES_REQ_OPCODE_RELEASE);
+
+	reset_lifecycle_timeout_case();
+	assert_lifecycle_timeout_result(
+		cluster_ges_send_convert_and_wait(
+			&resid, AccessExclusiveLock, ShareLock, &holder,
+			request_id, request_id + 3, 1),
+		GES_REQ_OPCODE_CONVERT);
+
+	cluster_ges_request_timeout_ms = saved_timeout;
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_clock_advances = false;
+	stub_dedup_lifecycle_enabled = false;
+	stub_shard_master_generation = 0;
+	stub_now = 0;
+}
+
+/*
+ * S3-P0-10 grant-wins cancellation: the CONVERT holder carries R_new, but
+ * rollback must restore the pre-convert holder's distinct R_old.  Force the
+ * real query-cancel PG_CATCH boundary and inspect the actual opcode-14 payload.
+ */
+UT_TEST(test_convert_cancel_rollback_restores_distinct_old_request_id)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	const uint64 old_request_id = UINT64CONST(0x1111222233334444);
+	const uint64 convert_request_id = UINT64CONST(0xaaaabbbbccccdddd);
+	uint64 rollback_request_id;
+	volatile bool caught = false;
+
+	memset(&resid, 0xA7, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 17;
+	holder.cluster_epoch = 9;
+	holder.request_id = convert_request_id;
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = false;
+	stub_dedup_lifecycle_enabled = false;
+	stub_backend_request_enqueue_count = 0;
+	stub_cancel_wait_enqueue_count = 0;
+	stub_cv_throws_error = true;
+
+	PG_TRY();
+	{
+		(void)cluster_ges_send_convert_and_wait(
+			&resid, AccessExclusiveLock, ShareLock, &holder,
+			old_request_id, convert_request_id, 1000);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+
+	stub_cv_throws_error = false;
+	rollback_request_id
+		= ((uint64)stub_backend_request_last.holder_request_id_lo)
+		  | (((uint64)stub_backend_request_last.holder_request_id_hi) << 32);
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)2);
+	UT_ASSERT_EQ(stub_cancel_wait_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_backend_request_last.opcode,
+				 (uint32)GES_REQ_OPCODE_CONVERT_ROLLBACK);
+	UT_ASSERT_EQ(stub_backend_request_last.wait_seq, convert_request_id);
+	/* Old code fails here with actual=R_new (0xaaaabbbbccccdddd),
+	 * expected=R_old (0x1111222233334444). */
+	UT_ASSERT_EQ(rollback_request_id, old_request_id);
+	UT_ASSERT_NE(rollback_request_id, convert_request_id);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_backend_request_enqueue_count = 0;
+	stub_cancel_wait_enqueue_count = 0;
+}
+
+UT_TEST(test_convert_zero_old_request_id_fails_before_send)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	const uint64 convert_request_id = UINT64CONST(0x123456789abcdef0);
+	uint32 result;
+
+	memset(&resid, 0x31, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 18;
+	holder.cluster_epoch = 10;
+	holder.request_id = convert_request_id;
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = true;
+	stub_now = 0;
+	stub_dedup_lifecycle_enabled = false;
+	stub_backend_request_enqueue_count = 0;
+	stub_cancel_wait_enqueue_count = 0;
+
+	result = cluster_ges_send_convert_and_wait(
+		&resid, AccessExclusiveLock, ShareLock, &holder,
+		0, convert_request_id, 1);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_ILLEGAL_CONVERT);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)0);
+	UT_ASSERT_EQ(stub_cancel_wait_enqueue_count, (uint64)0);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_clock_advances = false;
+	stub_now = 0;
+}
+
+UT_TEST(test_convert_equal_old_and_new_request_id_fails_before_send)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	const uint64 request_id = UINT64CONST(0x23456789abcdef01);
+	uint32 result;
+
+	memset(&resid, 0x32, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 19;
+	holder.cluster_epoch = 11;
+	holder.request_id = request_id;
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = true;
+	stub_now = 0;
+	stub_dedup_lifecycle_enabled = false;
+	stub_backend_request_enqueue_count = 0;
+	stub_cancel_wait_enqueue_count = 0;
+
+	result = cluster_ges_send_convert_and_wait(
+		&resid, AccessExclusiveLock, ShareLock, &holder,
+		request_id, request_id, 1);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_ILLEGAL_CONVERT);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)0);
+	UT_ASSERT_EQ(stub_cancel_wait_enqueue_count, (uint64)0);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_clock_advances = false;
+	stub_now = 0;
+}
+
+UT_TEST(test_request_retransmit_ring_full_cancels_wait_before_done)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint64 request_id = UINT64CONST(0x4455667788990011);
+	uint32 result;
+
+	memset(&resid, 0x8D, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 17;
+	holder.cluster_epoch = 9;
+	holder.request_id = request_id;
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = true;
+	stub_cv_timed_sleep_returns = false;
+	stub_dedup_lifecycle_enabled = true;
+	stub_shard_master_generation = 77;
+	stub_now = 0;
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_fail_on_call = 2;
+	stub_cancel_wait_enqueue_count = 0;
+	reset_lifecycle_timeout_case();
+
+	result = cluster_ges_send_request_and_wait(
+		&resid, AccessExclusiveLock, &holder, request_id, 100, 0);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_WORK_QUEUE_FULL);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)2);
+	UT_ASSERT_EQ(stub_cancel_wait_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_dedup_journal_commit_count, (uint64)1);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_enqueue_count, (uint64)1);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_last.opcode,
+				 (uint32)GES_REQ_OPCODE_REQUEST);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_clock_advances = false;
+	stub_cv_timed_sleep_returns = true;
+	stub_dedup_lifecycle_enabled = false;
+	stub_shard_master_generation = 0;
+	stub_backend_request_fail_on_call = 0;
+	stub_now = 0;
+}
+
+UT_TEST(test_journal_full_refuses_first_request_before_ring)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint64 request_id = UINT64CONST(0x5566778899001122);
+	uint32 result;
+
+	memset(&resid, 0x9E, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 17;
+	holder.cluster_epoch = 9;
+	holder.request_id = request_id;
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_dedup_lifecycle_enabled = true;
+	stub_shard_master_generation = 77;
+	stub_dedup_journal_register_success = false;
+	stub_backend_request_enqueue_count = 0;
+	reset_lifecycle_timeout_case();
+
+	result = cluster_ges_send_request_and_wait(
+		&resid, AccessExclusiveLock, &holder, request_id, 100, 0);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_WORK_QUEUE_FULL);
+	UT_ASSERT_EQ(stub_dedup_journal_register_count, (uint64)1);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)0);
+	UT_ASSERT_EQ(stub_dedup_journal_commit_count, (uint64)0);
+	UT_ASSERT_EQ(stub_dedup_lifecycle_enqueue_count, (uint64)0);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_dedup_lifecycle_enabled = false;
+	stub_shard_master_generation = 0;
+	stub_dedup_journal_register_success = true;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(17);
+	UT_PLAN(29);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -1347,6 +2277,10 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_handler_counter_monotonic_n_invocations);
 	UT_RUN(test_ges_request_valid_payload_enqueues_work);
 	UT_RUN(test_ges_reply_valid_payload_echoes_local_holder);
+	UT_RUN(test_ges_duplicate_grant_without_waiter_does_not_release_live_holder);
+	UT_RUN(test_ges_hwm_ack_waits_for_inflight_and_grd_retirement);
+	UT_RUN(test_ges_authenticated_boot_switch_retires_old_grd_boot);
+	UT_RUN(test_ges_drain_drops_grant_from_superseded_origin_boot);
 	UT_RUN(test_ges_lmon_drain_work_queue_symbol_linkable);
 	UT_RUN(test_ges_opcode_enum_spec_2_17_extension);
 	UT_RUN(test_ges_bast_opcode_validates_as_target_local);
@@ -1355,7 +2289,15 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_native_lock_probe_opcode_enum_extension);
 	UT_RUN(test_ges_native_lock_probe_request_dispatch);
 	UT_RUN(test_ges_native_lock_probe_reply_dispatch);
+	UT_RUN(test_cancel_wait_success_terminalizes_exact_receiver_dedup);
 	UT_RUN(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait);
+	UT_RUN(test_ges_release_timeout_stages_dedup_bypass_cleanup);
+	UT_RUN(test_five_cached_opcodes_terminalize_lifecycle_on_timeout);
+	UT_RUN(test_convert_cancel_rollback_restores_distinct_old_request_id);
+	UT_RUN(test_convert_zero_old_request_id_fails_before_send);
+	UT_RUN(test_convert_equal_old_and_new_request_id_fails_before_send);
+	UT_RUN(test_request_retransmit_ring_full_cancels_wait_before_done);
+	UT_RUN(test_journal_full_refuses_first_request_before_ring);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

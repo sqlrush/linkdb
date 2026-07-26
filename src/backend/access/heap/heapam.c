@@ -1950,6 +1950,7 @@ heap_get_latest_tid(TableScanDesc sscan,
 #ifdef USE_PGRAC_CLUSTER
 		bool		cluster_content_exclusive = false;
 		bool		cluster_authoritative_current_multi = false;
+		ItemPointerData cluster_authoritative_next_ctid;
 		ClusterHeapSuccessorProof cluster_expected_successor;
 #endif
 
@@ -2020,6 +2021,53 @@ cluster_latest_tid_recheck:
 			break;
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * WHERE CURRENT OF needs the latest chain member, so authenticate a
+		 * current MultiXact updater before the generic MVCC visibility probe.
+		 * That probe's legacy remote-multixact path accepts terminals only
+		 * and would reject an exact ACTIVE updater before it could reach the
+		 * typed wait below.
+		 */
+		if (cluster_authoritative_current_multi
+			&& !(tp.t_data->t_infomask & HEAP_XMAX_INVALID)
+			&& !HeapTupleHeaderIndicatesMovedPartitions(tp.t_data)
+			&& !ItemPointerEquals(&tp.t_self, &tp.t_data->t_ctid))
+		{
+			bool		restart = false;
+
+			/*
+			 * Promote the page to PCM-X, then obtain the updater only from the
+			 * immutable descriptor plus the exact same-page HOT/TT challenge.
+			 * Never decode a foreign mxid against this node's pg_multixact.
+			 */
+			if (!cluster_content_exclusive)
+			{
+				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				cluster_content_exclusive = true;
+				goto cluster_latest_tid_recheck;
+			}
+			if (!cluster_current_mx_hot_updater_for_chain(
+					relation, buffer, &tp, &priorXmax, &restart,
+					&cluster_expected_successor,
+					&cluster_current_mx_operation))
+			{
+				Assert(restart);
+				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				LockBuffer(buffer, BUFFER_LOCK_SHARE);
+				cluster_content_exclusive = false;
+				goto cluster_latest_tid_recheck;
+			}
+			/*
+			 * The authority helper returned with this same page PCM-X and an
+			 * exact successor proof.  Keep this content-lock epoch through the
+			 * ordinary visibility/conflict work and authenticated t_ctid copy;
+			 * no proof-bound tuple pointer may survive an unlock.
+			 */
+		}
+#endif
+
 		/*
 		 * Check tuple visibility; if visible, set it as the new result
 		 * candidate.
@@ -2049,44 +2097,15 @@ cluster_latest_tid_recheck:
 #ifdef USE_PGRAC_CLUSTER
 		if (cluster_authoritative_current_multi)
 		{
-			bool		restart = false;
-
-			/*
-			 * WHERE CURRENT OF reaches this chain follower before heap_update.
-			 * Promote the page to PCM-X, then obtain the updater only from the
-			 * immutable descriptor plus the exact same-page HOT/TT challenge.
-			 * Never decode a foreign mxid against this node's pg_multixact.
-			 */
-			if (!cluster_content_exclusive)
-			{
-				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-				cluster_content_exclusive = true;
-				goto cluster_latest_tid_recheck;
-			}
-			if (!cluster_current_mx_hot_updater_for_chain(
-					relation, buffer, &tp, &priorXmax, &restart,
-					&cluster_expected_successor,
-					&cluster_current_mx_operation))
-			{
-				Assert(restart);
-				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-				LockBuffer(buffer, BUFFER_LOCK_SHARE);
-				cluster_content_exclusive = false;
-				goto cluster_latest_tid_recheck;
-			}
-			/*
-			 * The authority helper returned with this same page PCM-X and an
-			 * exact successor proof.  Downgrade to SHARE before visibility
-			 * work, then consume the full key at the top of the recheck.
-			 */
-			ctid = tp.t_data->t_ctid;
+			Assert(cluster_content_exclusive);
+			ItemPointerCopy(&tp.t_data->t_ctid,
+							&cluster_authoritative_next_ctid);
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 			LockBuffer(buffer, BUFFER_LOCK_SHARE);
 			cluster_content_exclusive = false;
+			ctid = cluster_authoritative_next_ctid;
 			goto cluster_latest_tid_recheck;
 		}
-		else
 #endif
 		priorXmax = HeapTupleHeaderGetUpdateXid(tp.t_data);
 		ctid = tp.t_data->t_ctid;
@@ -3408,6 +3427,82 @@ cluster_current_mx_operation_finish(ClusterCurrentMxOperationState *operation)
 	operation->finished = true;
 }
 
+/*
+ * Wait for an exact current-MultiXact member and restart the operation.
+ *
+ * The caller holds the buffer content lock EXCLUSIVE.  Only terminal holder
+ * outcomes reacquire that lock and return; every other outcome finishes the
+ * operation and raises the matching closed-set error while the lock is free.
+ */
+static void
+cluster_current_mx_wait_member_restart(
+	Buffer buffer, const ClusterTTStatusKey *wait_key,
+	ClusterCurrentMxOperationState *operation)
+{
+	ClusterTxwResult txw;
+
+	Assert(BufferIsValid(buffer));
+	Assert(wait_key != NULL);
+	Assert(operation != NULL);
+
+	cluster_multixact_current_stats_bump(CMX_STAT_WAIT);
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	PG_TRY();
+	{
+		txw = cluster_tx_enqueue_wait_current_mx(
+			wait_key, cluster_ges_request_timeout_ms);
+	}
+	PG_CATCH();
+	{
+		cluster_multixact_current_stats_bump(CMX_STAT_WAIT_INTERRUPTED);
+		cluster_current_mx_operation_finish(operation);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	switch (txw)
+	{
+		case CLUSTER_TXW_RESOLVED:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RESOLVED);
+			break;
+		case CLUSTER_TXW_DEAD_HOLDER:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_DEAD_HOLDER);
+			break;
+		case CLUSTER_TXW_RETRY:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RETRY);
+			cluster_current_mx_operation_finish(operation);
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
+					 errmsg("current MultiXact wait crossed a PCM-X remaster")));
+			break;
+		case CLUSTER_TXW_TIMEOUT:
+			cluster_multixact_current_stats_bump(CMX_STAT_WAIT_TIMEOUT);
+			cluster_current_mx_operation_finish(operation);
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+					 errmsg("timed out waiting for a current MultiXact member")));
+			break;
+		case CLUSTER_TXW_DEADLOCK:
+			cluster_multixact_current_stats_bump(CMX_STAT_DEADLOCK_VICTIM);
+			cluster_current_mx_operation_finish(operation);
+			ereport(ERROR,
+					(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
+					 errmsg("deadlock detected"),
+					 errdetail("The current MultiXact TX wait was selected as the victim.")));
+			break;
+		default:
+			cluster_current_mx_operation_finish(operation);
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("unexpected current MultiXact TX wait result: %d",
+							(int) txw)));
+			break;
+	}
+
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	cluster_current_mx_operation_restart(operation);
+}
+
 static bool
 cluster_current_mx_memo_lookup(
 	ClusterCurrentMxOperationState *operation,
@@ -3783,7 +3878,9 @@ cluster_current_mx_hot_updater_for_chain(
 	ClusterCurrentMemberProof proofs[CLUSTER_CURRENT_MX_MAX_MEMBERS];
 	ClusterCurrentUpdaterChallenge challenge;
 	ClusterCurrentUpdaterProof updater_proof;
+	ClusterCurrentUpdaterProofOutcome proof_outcome;
 	ClusterCurrentMxKey key;
+	ClusterTTStatusKey wait_key;
 	ClusterMxDescribeResult describe_result;
 	ClusterMxResolveResult resolve_result;
 	MultiXactId raw_mxid;
@@ -3953,15 +4050,24 @@ cluster_current_mx_hot_updater_for_chain(
 				 errmsg("timed out resolving current MultiXact %u members",
 						raw_mxid)));
 	}
-	if (resolve_result != CMX_RESOLVE_OK
-		|| !cluster_multixact_current_validate_updater_proof(
-			&key, members, proofs, nmembers, &challenge, &updater_proof,
-			(uint16) updater_origin))
+	proof_outcome = cluster_multixact_current_updater_proof_outcome(
+		resolve_result, &key, members, proofs, nmembers, &challenge,
+		&updater_proof, (uint16) updater_origin, &wait_key);
+	switch (proof_outcome)
 	{
-		cluster_current_mx_failclosed(
-			operation,
-			CCMH_FAIL_HOT_PROOF,
-			"the full-key HOT updater proof was denied or incomplete");
+		case CCMUPO_COMMITTED:
+			break;
+		case CCMUPO_WAIT_MEMBER:
+			cluster_current_mx_wait_member_restart(
+				buffer, &wait_key, operation);
+			*restart = true;
+			return false;
+		case CCMUPO_FAIL_CLOSED:
+			cluster_current_mx_failclosed(
+				operation,
+				CCMH_FAIL_HOT_PROOF,
+				"the full-key HOT updater proof was denied or incomplete");
+			break;
 	}
 
 	*updater_xid = members[updater_ordinal].xid;
@@ -4400,59 +4506,9 @@ cluster_current_mx_authorize(Relation relation, Buffer buffer, HeapTuple tuple,
 			heap_result->result = TM_Ok;
 			return CCMH_DECIDED;
 		case CMDL_WAIT_MEMBER:
-		{
-			ClusterTxwResult txw;
-
-			cluster_multixact_current_stats_bump(CMX_STAT_WAIT);
-			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-			PG_TRY();
-			{
-				txw = cluster_tx_enqueue_wait_current_mx(
-					&wait_key, cluster_ges_request_timeout_ms);
-			}
-			PG_CATCH();
-			{
-				cluster_multixact_current_stats_bump(
-					CMX_STAT_WAIT_INTERRUPTED);
-				cluster_current_mx_operation_finish(operation);
-				PG_RE_THROW();
-			}
-			PG_END_TRY();
-			switch (txw)
-			{
-				case CLUSTER_TXW_RESOLVED:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RESOLVED);
-					break;
-				case CLUSTER_TXW_DEAD_HOLDER:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_DEAD_HOLDER);
-					break;
-				case CLUSTER_TXW_RETRY:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_RETRY);
-					cluster_current_mx_operation_finish(operation);
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_GRD_SHARD_REMASTERING),
-							 errmsg("current MultiXact wait crossed a PCM-X remaster")));
-					break;
-				case CLUSTER_TXW_TIMEOUT:
-					cluster_multixact_current_stats_bump(CMX_STAT_WAIT_TIMEOUT);
-					cluster_current_mx_operation_finish(operation);
-					ereport(ERROR,
-							(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
-							 errmsg("timed out waiting for a current MultiXact member")));
-					break;
-				case CLUSTER_TXW_DEADLOCK:
-					cluster_multixact_current_stats_bump(CMX_STAT_DEADLOCK_VICTIM);
-					cluster_current_mx_operation_finish(operation);
-					ereport(ERROR,
-							(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
-							 errmsg("deadlock detected"),
-							 errdetail("The current MultiXact TX wait was selected as the victim.")));
-					break;
-			}
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-			cluster_current_mx_operation_restart(operation);
+			cluster_current_mx_wait_member_restart(
+				buffer, &wait_key, operation);
 			return CCMH_RESTART;
-		}
 		case CMDL_UNKNOWN:
 			cluster_current_mx_failclosed(
 				operation,
@@ -4707,6 +4763,13 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 								 errdetail("Cluster TX wait on transaction %u at node %u was "
 										   "selected as the victim.",
 										   xwait, cref.origin_node_id)));
+						break;
+					default:
+						cluster_vis_bump_vis_conflict_failclosed_count();
+						ereport(ERROR,
+								(errcode(ERRCODE_INTERNAL_ERROR),
+								 errmsg("unexpected cluster TX wait result %d for remote writer %u on node %u",
+										(int) txw, xwait, cref.origin_node_id)));
 						break;
 				}
 				/* Holder is now terminal; fall through to the terminal handler
@@ -8447,6 +8510,13 @@ l3:
 														 errdetail("Cluster TX wait on transaction %u at "
 																   "node %u was selected as the victim.",
 																   xwait, cref.origin_node_id)));
+												break;
+											default:
+												ereport(ERROR,
+														(errcode(ERRCODE_INTERNAL_ERROR),
+														 errmsg("unexpected cluster TX wait result %d for remote row lock %u on node %u",
+																(int) txw, xwait,
+																cref.origin_node_id)));
 												break;
 										}
 									}

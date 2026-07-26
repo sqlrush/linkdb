@@ -27,13 +27,19 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_inject.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
+
+typedef enum CfSlotState { CF_SLOT_EMPTY = 0, CF_SLOT_HELD, CF_SLOT_RELEASE_PENDING } CfSlotState;
 
 /*
  * CfHoldState -- per-backend record of a held CF lock so the matching
@@ -44,13 +50,16 @@
  * mode (X / S); CF is not reentrant within a backend for a given mode.
  */
 typedef struct CfHoldState {
-	bool held;
+	CfSlotState state;
 	bool coordinated;
+	ResourceOwner owner;
 	ClusterLockAcquireRequest req; /* resid + holder + request_id for release */
+	ClusterCfPublishedSlot published;
 } CfHoldState;
 
 static CfHoldState cf_hold_x;
 static CfHoldState cf_hold_s;
+static bool cf_resowner_callback_registered;
 
 /*
  * spec-5.6: set while this process is the bootstrap single-node authority
@@ -74,6 +83,131 @@ cf_slot(LOCKMODE mode)
 {
 	Assert(mode == ShareLock || mode == ExclusiveLock);
 	return (mode == ExclusiveLock) ? &cf_hold_x : &cf_hold_s;
+}
+
+static ClusterCfSlotMode
+cf_published_mode(LOCKMODE mode)
+{
+	Assert(mode == ShareLock || mode == ExclusiveLock);
+	return mode == ExclusiveLock ? CLUSTER_CF_SLOT_MODE_X : CLUSTER_CF_SLOT_MODE_S;
+}
+
+static void
+cf_clear_slot(CfHoldState *slot)
+{
+	memset(slot, 0, sizeof(*slot));
+}
+
+static bool
+cf_build_published_slot(CfHoldState *slot, LOCKMODE mode)
+{
+	ClusterCfPublishedSlot *published = &slot->published;
+
+	memset(published, 0, sizeof(*published));
+	published->state = CLUSTER_CF_SLOT_HELD;
+	published->mode = cf_published_mode(mode);
+	published->owner_pid = MyProcPid;
+	published->owner_procno
+		= MyProc != NULL && MyProc->pgprocno >= 0 ? (uint32)MyProc->pgprocno : 0;
+	published->owner_start_ts_us = MyStartTimestamp;
+	published->node_id = cluster_node_id;
+	published->coordinated = slot->coordinated ? 1 : 0;
+	if (slot->coordinated) {
+		published->cluster_epoch = slot->req.holder.cluster_epoch;
+		published->request_id = slot->req.request_id;
+	}
+
+	if (MyProc == NULL || MyProc->pgprocno < 0 || MyProcPid <= 0 || MyStartTimestamp <= 0
+		|| cluster_node_id < 0)
+		return false;
+	if (!slot->coordinated)
+		return true;
+	return slot->req.holder.procno == (uint32)MyProc->pgprocno
+		   && slot->req.holder.node_id == (uint32)cluster_node_id
+		   && slot->req.holder.request_id == slot->req.request_id && slot->req.request_id != 0;
+}
+
+/*
+ * Release or retry one exact holder.  HELD is revoked locally before S6 so
+ * write permission disappears even if remote cleanup fails.  On failure the
+ * exact handle remains RELEASE_PENDING and blocks a fresh acquire.
+ */
+static bool
+cf_try_release_slot(CfHoldState *slot)
+{
+	ClusterLockAcquireRequest exact_req;
+	ClusterLockAcquireResult result;
+	bool retrying_pending;
+	bool shared_pending = true;
+	ClusterCfSlotMode mode;
+
+	if (slot->state == CF_SLOT_EMPTY)
+		return true;
+
+	retrying_pending = slot->state == CF_SLOT_RELEASE_PENDING;
+	exact_req = slot->req;
+	mode = (ClusterCfSlotMode)slot->published.mode;
+	if (slot->state == CF_SLOT_HELD) {
+		slot->state = CF_SLOT_RELEASE_PENDING;
+		slot->owner = NULL;
+		slot->published.state = CLUSTER_CF_SLOT_RELEASE_PENDING;
+		shared_pending = cluster_cf_slot_publish_release_pending(mode, &slot->published);
+	}
+
+	if (!slot->coordinated) {
+		if (shared_pending && cluster_cf_slot_clear_exact(mode, &slot->published)) {
+			cf_clear_slot(slot);
+			return true;
+		}
+		return false;
+	}
+
+	result = cluster_lock_acquire_s6_release_nothrow(&exact_req);
+
+	if (result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+		cluster_cf_counter_inc(CLUSTER_CF_S6_RELEASE_CONFIRMED);
+		if (retrying_pending)
+			elog(LOG,
+				 "CF pending holder release retry confirmed: node=%u procno=%u epoch=" UINT64_FORMAT
+				 " request_id=" UINT64_FORMAT,
+				 exact_req.holder.node_id, exact_req.holder.procno, exact_req.holder.cluster_epoch,
+				 exact_req.request_id);
+		if (shared_pending && cluster_cf_slot_clear_exact(mode, &slot->published)) {
+			cf_clear_slot(slot);
+			return true;
+		}
+		return false;
+	}
+
+	elog(LOG,
+		 "CF holder release was not confirmed: node=%u procno=%u epoch=" UINT64_FORMAT
+		 " request_id=" UINT64_FORMAT " result=%d; exact holder retained pending",
+		 exact_req.holder.node_id, exact_req.holder.procno, exact_req.holder.cluster_epoch,
+		 exact_req.request_id, (int)result);
+	return false;
+}
+
+static void
+cf_resource_release_callback(ResourceReleasePhase phase, bool isCommit pg_attribute_unused(),
+							 bool isTopLevel pg_attribute_unused(), void *arg pg_attribute_unused())
+{
+	if (phase != RESOURCE_RELEASE_LOCKS)
+		return;
+
+	/* Fixed X then S order; child-first recursion is provided by resowner.c. */
+	if (cf_hold_x.state == CF_SLOT_HELD && cf_hold_x.owner == CurrentResourceOwner)
+		(void)cf_try_release_slot(&cf_hold_x);
+	if (cf_hold_s.state == CF_SLOT_HELD && cf_hold_s.owner == CurrentResourceOwner)
+		(void)cf_try_release_slot(&cf_hold_s);
+}
+
+static void
+cf_register_resowner_callback(void)
+{
+	if (!cf_resowner_callback_registered) {
+		RegisterResourceReleaseCallback(cf_resource_release_callback, NULL);
+		cf_resowner_callback_registered = true;
+	}
 }
 
 /*
@@ -108,9 +242,30 @@ cluster_cf_lock(LOCKMODE mode)
 	ClusterLockAcquireRequest req;
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
+	ClusterCfSlotMode published_mode = cf_published_mode(mode);
+
+	cf_register_resowner_callback();
+
+	/*
+	 * A failed prior S6 must be confirmed against its retained exact handle
+	 * before a new request_id is allowed onto the seven-step acquire path.
+	 */
+	if (slot->state == CF_SLOT_RELEASE_PENDING && !cf_try_release_slot(slot)) {
+		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+		return false;
+	}
 
 	/* CF is not reentrant within a backend (one caller-level acquire). */
-	Assert(!slot->held);
+	if (slot->state != CF_SLOT_EMPTY || CurrentResourceOwner == NULL || MyProc == NULL
+		|| MyProc->pgprocno < 0) {
+		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+		return false;
+	}
+	Assert(slot->state == CF_SLOT_EMPTY);
+	if (!cluster_cf_slot_is_empty((uint32)MyProc->pgprocno, published_mode)) {
+		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+		return false;
+	}
 
 	memset(&req, 0, sizeof(req));
 	cluster_cf_resid_encode(&req.resid);
@@ -136,9 +291,17 @@ cluster_cf_lock(LOCKMODE mode)
 			 * node coordination is needed and nothing was registered in the
 			 * GRD.  Treat as held but uncoordinated so release is a no-op.
 			 */
-		slot->held = true;
-		slot->coordinated = false;
 		slot->req = req;
+		slot->coordinated = false;
+		slot->owner = CurrentResourceOwner;
+		slot->state = CF_SLOT_HELD;
+		if (!cf_build_published_slot(slot, mode)
+			|| !cluster_cf_slot_publish_held(published_mode, &slot->published)) {
+			cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+			(void)cf_try_release_slot(slot);
+			return false;
+		}
+		CLUSTER_INJECTION_POINT("cluster-cf-held-census-window");
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
 
@@ -157,9 +320,17 @@ cluster_cf_lock(LOCKMODE mode)
 			cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
 			return false;
 		}
-		slot->held = true;
-		slot->coordinated = true;
 		slot->req = req; /* holder + request_id for the release */
+		slot->coordinated = true;
+		slot->owner = CurrentResourceOwner;
+		slot->state = CF_SLOT_HELD;
+		if (!cf_build_published_slot(slot, mode)
+			|| !cluster_cf_slot_publish_held(published_mode, &slot->published)) {
+			cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+			(void)cf_try_release_slot(slot);
+			return false;
+		}
+		CLUSTER_INJECTION_POINT("cluster-cf-held-census-window");
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
 
@@ -184,20 +355,40 @@ cluster_cf_unlock(LOCKMODE mode)
 {
 	CfHoldState *slot = cf_slot(mode);
 
-	if (!slot->held)
+	if (slot->state == CF_SLOT_EMPTY)
 		return;
 
 	/*
-	 * Release the exact GRD holder the acquire registered, draining + waking
-	 * any blocked cross-node waiters (S6).  Use the captured request (CF
-	 * resid + holder + request_id) rather than cluster_lock_release(), which
-	 * re-derives the resid from a PG LOCKTAG that CF does not have.
+	 * Explicit release is owner-scoped too.  Without this guard a child
+	 * ResourceOwner in the same process could consume its parent's exact
+	 * cluster holder even though the callback path correctly rejects it.
 	 */
-	if (slot->coordinated)
-		(void)cluster_lock_acquire_s6_release(&slot->req);
+	if (slot->state == CF_SLOT_HELD && slot->owner != CurrentResourceOwner) {
+		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg(
+				 "cannot release the cluster control-file lock from a non-owning resource owner"),
+			 errhint("Release the lock from the ResourceOwner that acquired it.")));
+	}
 
-	slot->held = false;
-	slot->coordinated = false;
+	/*
+	 * A normal caller must not observe pseudo-success when S6 did not confirm
+	 * release.  cf_try_release_slot() has already revoked local permission and
+	 * retained the exact handle, so expose the failure while leaving the next
+	 * acquire able to replay that same release before issuing a new request.
+	 * ResourceOwner unwind remains nonthrowing because its callback invokes
+	 * cf_try_release_slot() directly rather than this public wrapper.
+	 */
+	if (!cf_try_release_slot(slot)) {
+		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg("could not confirm release of the cluster control-file lock"),
+			 errhint("The exact holder is retained and will be retried before the next acquire.")));
+	}
 }
 
 /*
@@ -206,7 +397,7 @@ cluster_cf_unlock(LOCKMODE mode)
 bool
 cluster_cf_held(LOCKMODE mode)
 {
-	return cf_slot(mode)->held;
+	return cf_slot(mode)->state == CF_SLOT_HELD;
 }
 
 /*

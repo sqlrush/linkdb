@@ -295,8 +295,20 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_PCM_X_DRAIN_POLL = 61,
 	PGRAC_IC_MSG_PCM_X_DRAIN_ACK = 62,
 	PGRAC_IC_MSG_PCM_X_RETIRE_UP_TO = 63,
-	PGRAC_IC_MSG_PCM_X_RETIRE_ACK = 64
-	/* values 65..255 available for future sub-spec; never reuse 0..64 */
+	PGRAC_IC_MSG_PCM_X_RETIRE_ACK = 64,
+	/* S3-P0-04 stale-X repair: one fixed bidirectional certificate frame;
+	 * phase byte selects REPORT/FENCE_INSTALL/FENCE_ACK/COMMIT/KEEP_FENCED. */
+	PGRAC_IC_MSG_GCS_STALE_X_CERT = 65,
+	/* S3-P0-09: exact forward cancellation.  CANCEL carries both the
+	 * master->holder directive and the holder->requester ordered barrier;
+	 * ACK is requester->master only. */
+	PGRAC_IC_MSG_GCS_BLOCK_FORWARD_CANCEL = 66,
+	PGRAC_IC_MSG_GCS_BLOCK_FORWARD_CANCEL_ACK = 67,
+	/* S3-P0-10: requester normal-terminal proof and receiver exact ACK.
+	 * CONTROL-plane, capability/boot/connection-generation gated. */
+	PGRAC_IC_MSG_GES_DEDUP_DONE = 68,
+	PGRAC_IC_MSG_GES_DEDUP_ACK = 69
+	/* values 70..255 available for future sub-spec; never reuse 0..69 */
 } ClusterICMsgType;
 
 

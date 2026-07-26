@@ -25,19 +25,23 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
+
+#include "cluster/cluster_conf.h"
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_visibility_inject.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "fmgr.h"
 
 #ifdef ENABLE_INJECTION
 
-#include "miscadmin.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
 
-#include "cluster/cluster_guc.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_status.h"
@@ -433,3 +437,57 @@ cluster_test_inject_subtrans_subcommitted(PG_FUNCTION_ARGS)
 }
 
 #endif /* ENABLE_INJECTION */
+
+/*
+ * S3-P0-13 assertion-build-only runtime probe.
+ *
+ * This wrapper contributes no synthetic counter state.  It validates that
+ * the supplied xid belongs to the requester's active stripe, then sends one
+ * ordinary non-authoritative undo-verdict request to a different node.  That
+ * node's real LMS producer must reject the requester-owned xid as OTHER; the
+ * ordinary request API therefore returns false after receiving DENIED.
+ */
+PG_FUNCTION_INFO_V1(cluster_test_request_undo_verdict_other);
+
+Datum
+cluster_test_request_undo_verdict_other(PG_FUNCTION_ARGS)
+{
+#if defined(USE_PGRAC_CLUSTER) && defined(USE_ASSERT_CHECKING)
+	int32 target_node;
+	TransactionId xid;
+	ClusterGcsUndoVerdictPage verdict;
+	ClusterLiveAuthority authority;
+	bool fetched;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to request a test undo verdict")));
+	if (!cluster_enabled || cluster_node_id < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cluster_test_request_undo_verdict_other requires an active cluster")));
+
+	target_node = PG_GETARG_INT32(0);
+	xid = PG_GETARG_TRANSACTIONID(1);
+
+	if (target_node < 0 || target_node >= CLUSTER_MAX_NODES || target_node == cluster_node_id)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("test undo-verdict target must be a different cluster node")));
+	if (!TransactionIdIsNormal(xid) || !cluster_xid_is_mine(xid))
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("test undo-verdict xid must belong to the requester stripe")));
+
+	fetched = cluster_gcs_block_undo_verdict_fetch_and_wait(
+		target_node, 1, 0, xid, false, &verdict, &authority);
+	PG_RETURN_BOOL(fetched);
+#else
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("cluster_test_request_undo_verdict_other requires an "
+					"assertion-enabled cluster build")));
+	PG_RETURN_BOOL(false);
+#endif
+}

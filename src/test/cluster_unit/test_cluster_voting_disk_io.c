@@ -156,6 +156,44 @@ UT_TEST(test_io_2_crc_mismatch_returns_torn)
 	free(path);
 }
 
+UT_TEST(test_io_raw_zero_slot_is_canonical_never_written)
+{
+	char *path = make_temp_path("raw_zero");
+	int fd;
+	ClusterVotingSlot slot;
+	ClusterVotingDiskIoState rc;
+	uint8 malformed = 0x01;
+
+	fd = cluster_voting_disk_open(path, /*create*/ true);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(ftruncate(fd, CLUSTER_VOTING_FILE_BYTES_MIN), 0);
+
+	memset(&slot, 0xA5, sizeof(slot));
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 2, 5, &slot);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(slot.magic, CLUSTER_VOTING_SLOT_MAGIC);
+	UT_ASSERT_EQ(slot.version, CLUSTER_VOTING_SLOT_VERSION);
+	UT_ASSERT_EQ(slot.node_id, 5);
+	UT_ASSERT_EQ(slot.disk_index, 2);
+	UT_ASSERT_EQ(slot.generation, 0);
+	UT_ASSERT_EQ(slot.incarnation, 0);
+
+	/*
+	 * The admission is exact: one nonzero byte is malformed/torn input,
+	 * not a never-written slot that may contribute to a boot majority.
+	 */
+	UT_ASSERT_EQ(
+		pwrite(fd, &malformed, 1, CLUSTER_VOTING_SLOT_OFFSET(5) + 100),
+		1);
+	UT_ASSERT_EQ(fdatasync(fd), 0);
+	rc = cluster_voting_disk_read_slot(fd, /*expected_disk_index*/ 2, 5, &slot);
+	UT_ASSERT_EQ(rc, CLUSTER_VOTING_DISK_IO_TORN);
+
+	cluster_voting_disk_close(fd);
+	(void)unlink(path);
+	free(path);
+}
+
 
 UT_TEST(test_io_3_magic_mismatch_failed)
 {
@@ -381,9 +419,10 @@ UT_TEST(test_io_9_marker_regions_are_disjoint)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_io_1_round_trip);
 	UT_RUN(test_io_2_crc_mismatch_returns_torn);
+	UT_RUN(test_io_raw_zero_slot_is_canonical_never_written);
 	UT_RUN(test_io_3_magic_mismatch_failed);
 	UT_RUN(test_io_4_node_id_mismatch_failed);
 	UT_RUN(test_io_5_short_read_returns_failed);

@@ -149,20 +149,27 @@ UT_TEST(test_map_unknown_is_stale_fail_closed)
 }
 
 /* ======================================================================
- * U5 -- IN_PROGRESS (D3 folds it to UNKNOWN, defensive) -> STALE, false.
+ * S3-P0-13 RED / U5 -- a PROVEN-LIVE origin verdict is an exact
+ * non-terminal result, not stale identity evidence.  A fresh remote ITL ref
+ * still binds this xid physically, so map it to REMOTE/IN_PROGRESS and let
+ * HeapTupleSatisfiesUpdate return TM_BeingModified (the caller then enters
+ * the existing cluster TX wait).  This must never manufacture COMMITTED or
+ * ABORTED, and must never surface the recycled-slot 53R97 branch.
  * ====================================================================== */
-UT_TEST(test_map_in_progress_is_stale_fail_closed)
+UT_TEST(test_map_in_progress_is_remote_live_not_stale)
 {
 	ClusterVisResolve out;
-	bool terminal;
+	bool resolved;
 
 	poison_out(&out);
-	terminal = cluster_vis_from_undo_verdict(
+	resolved = cluster_vis_from_undo_verdict(
 		make_verdict(CLUSTER_UNDO_VERDICT_IN_PROGRESS, InvalidScn), &out);
 
-	UT_ASSERT_EQ((int)terminal, 0);
-	UT_ASSERT_EQ((int)out.evidence, (int)CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
-	UT_ASSERT_EQ((int)out.status, (int)CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT_EQ((int)resolved, 1);
+	UT_ASSERT_EQ((int)out.evidence, (int)CLUSTER_VIS_EVIDENCE_REMOTE);
+	UT_ASSERT_EQ((int)out.status, (int)CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ((uint64)out.commit_scn, (uint64)InvalidScn);
+	UT_ASSERT_EQ((int)out.commit_scn_is_bound, 0);
 }
 
 /* ======================================================================
@@ -238,7 +245,7 @@ main(void)
 	UT_RUN(test_map_committed_bound_sets_is_bound);
 	UT_RUN(test_map_aborted);
 	UT_RUN(test_map_unknown_is_stale_fail_closed);
-	UT_RUN(test_map_in_progress_is_stale_fail_closed);
+	UT_RUN(test_map_in_progress_is_remote_live_not_stale);
 	UT_RUN(test_map_zero_init_verdict_is_stale);
 	UT_RUN(test_map_stale_clears_scn_residue);
 	UT_RUN(test_origin_corroborated_is_ask);

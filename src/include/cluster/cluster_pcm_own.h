@@ -27,12 +27,14 @@
  *	  value after finish/abort, preventing delayed cleanup from aliasing a
  *	  later reservation.
  *
- *	  The (pcm_state, generation, reservation_token, flags) tuple MUST be read
- *	  and written under the SAME lock -- the buffer header spinlock -- to be
- *	  free of a read-check-act race (TOCTOU).  The transition/read helpers
- *	  that enforce that live in bufmgr.c (they need BufferDesc + LockBufHdr);
- *	  this header owns only the shmem array and the by-buf_id raw atomic
- *	  accessors.
+ *	  The (pcm_state, generation, reservation_token, flags,
+ *	  durability_generation) tuple MUST be read and written under the SAME
+ *	  lock -- the buffer header spinlock -- to be free of a read-check-act
+ *	  race (TOCTOU).  durability_generation is an independent saturating
+ *	  clean-to-dirty version: UINT32_MAX is an exhausted sentinel and never
+ *	  wraps to a reusable value.  The transition/read helpers that enforce
+ *	  that live in bufmgr.c (they need BufferDesc + LockBufHdr); this header
+ *	  owns only the shmem array and the by-buf_id raw atomic accessors.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -65,7 +67,7 @@ typedef struct ClusterPcmOwnEntry {
 	pg_atomic_uint64 reservation_token;		  /* monotone; active iff a transient flag is set */
 	pg_atomic_uint64 writer_activation_token; /* committed X not yet activated under content X */
 	pg_atomic_uint32 flags;					  /* PCM_OWN_FLAG_* */
-	uint32 _pad;							  /* keep 32B aligned */
+	pg_atomic_uint32 durability_generation;	  /* clean->dirty version; MAX=exhausted */
 } ClusterPcmOwnEntry;
 
 StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 32, "ClusterPcmOwnEntry must remain 32 bytes");
@@ -157,6 +159,11 @@ extern ClusterPcmOwnResult cluster_pcm_own_revoke_retain_release_exact(int buf_i
 																	   uint64 committed_generation,
 																	   uint64 reservation_token);
 extern bool cluster_pcm_own_gen_bump_checked(int buf_id, uint64 *out_generation);
+/* Caller holds the matching BufferDesc header spinlock.  A MAX result is
+ * sticky: callers must preserve PostgreSQL dirty/writeback behavior but may
+ * no longer publish stale-X durability evidence for that residency. */
+extern ClusterPcmOwnResult
+cluster_pcm_own_durability_generation_advance(int buf_id, uint32 *out_generation);
 
 /*
  * Raw by-buf_id atomic accessors.  Callers that need the
@@ -196,6 +203,31 @@ cluster_pcm_own_writer_activation_token_get(int buf_id)
 	if (ClusterPcmOwnArray == NULL || buf_id < 0)
 		return 0;
 	return pg_atomic_read_u64(&ClusterPcmOwnArray[buf_id].writer_activation_token);
+}
+
+static inline uint32
+cluster_pcm_own_durability_generation_get(int buf_id)
+{
+	if (ClusterPcmOwnArray == NULL || buf_id < 0)
+		return 0;
+	return pg_atomic_read_u32(&ClusterPcmOwnArray[buf_id].durability_generation);
+}
+
+/*
+ * A write submission may publish durability evidence only if no content
+ * change re-armed BM_JUST_DIRTIED while the I/O was in flight and the
+ * generation captured when that bit was cleared is still current.  Keep
+ * this predicate shared by bufmgr and the concurrency model test so the
+ * redirty fault cannot regress into a source-text-only assertion.
+ */
+static inline bool
+cluster_pcm_own_durability_note_matches(uint32 captured_generation,
+									   uint32 current_generation,
+									   bool just_dirtied)
+{
+	return !just_dirtied && captured_generation != 0
+		   && captured_generation != UINT32_MAX
+		   && current_generation == captured_generation;
 }
 
 static inline void

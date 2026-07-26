@@ -60,6 +60,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "storage/backendid.h"
@@ -84,6 +85,7 @@ int cluster_gcs_block_retransmit_max_retries = 4;
 int cluster_gcs_reply_timeout_ms = 5000;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
 int MaxConnections = 1;
+int NBuffers = 8;
 bool IsUnderPostmaster = false;
 BackendId MyBackendId = InvalidBackendId;
 
@@ -114,6 +116,21 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 int lineNumber pg_attribute_unused())
 {
 	abort();
+}
+
+int
+s_lock(volatile slock_t *lock pg_attribute_unused(),
+	   const char *file pg_attribute_unused(),
+	   int line pg_attribute_unused(), const char *func pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+cluster_lms_shard_for_tag(const BufferTag *tag pg_attribute_unused(),
+						  int n_workers)
+{
+	return n_workers > 0 ? 0 : -1;
 }
 
 bool
@@ -236,6 +253,14 @@ static union {
 
 static bool fake_slot_used[FAKE_DEDUP_MAX_SLOTS];
 static char fake_dedup_htab_token;
+/*
+ * The real module owns three auxiliary HTAB families in addition to the
+ * generic block-request dedup table.  This fixture drives only the latter,
+ * but ShmemInitHash must still hand the module distinct non-NULL handles for
+ * the auxiliary tables during shared-memory initialisation.
+ */
+static char fake_aux_htab_tokens[3];
+static int fake_aux_htab_count = 0;
 static bool fake_dedup_header_found = false;
 static long fake_dedup_entry_max = 0;
 static Size fake_dedup_keysize = 0;
@@ -254,7 +279,12 @@ ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribut
 			  long max_size, HASHCTL *infoP, int hash_flags pg_attribute_unused())
 {
 	Assert((hash_flags & HASH_ELEM) != 0);
-	Assert(infoP->entrysize == sizeof(GcsBlockDedupEntry));
+
+	if (infoP->entrysize != sizeof(GcsBlockDedupEntry)) {
+		Assert(fake_aux_htab_count < lengthof(fake_aux_htab_tokens));
+		return (HTAB *)&fake_aux_htab_tokens[fake_aux_htab_count++];
+	}
+
 	Assert(max_size <= FAKE_DEDUP_MAX_SLOTS);
 	fake_dedup_keysize = infoP->keysize;
 	fake_dedup_entry_max = max_size;
@@ -280,6 +310,7 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *keyPtr, HASHACTION ac
 {
 	long i;
 
+	Assert(hashp == (HTAB *)&fake_dedup_htab_token);
 	Assert(fake_dedup_keysize > 0);
 
 	for (i = 0; i < FAKE_DEDUP_MAX_SLOTS; i++) {
@@ -334,6 +365,7 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *keyPtr, HASHACTION ac
 void
 hash_seq_init(HASH_SEQ_STATUS *status, HTAB *hashp pg_attribute_unused())
 {
+	Assert(hashp == (HTAB *)&fake_dedup_htab_token);
 	status->curBucket = 0;
 	status->hashp = NULL;
 }
@@ -362,6 +394,7 @@ static void
 fixture_reset(int configured, int max_conns, int declared_nodes)
 {
 	fake_dedup_header_found = false;
+	fake_aux_htab_count = 0;
 	fake_dedup_entry_max = 0;
 	fake_dedup_keysize = 0;
 	memset(fake_slot_used, 0, sizeof(fake_slot_used));

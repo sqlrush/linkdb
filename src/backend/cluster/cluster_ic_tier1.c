@@ -83,6 +83,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 
@@ -95,6 +96,20 @@
 
 
 #ifdef USE_PGRAC_CLUSTER
+
+/*
+ * Capability generation zero is reserved as "no authenticated connection"
+ * by capability-bound protocols and the LMS DATA outbound ring.  The public
+ * reconnect_count remains a count (zero on the first connection), so map it
+ * to a one-based identity at every capability note/invalidate boundary.
+ * Refuse to wrap: an exhausted counter yields generation zero and authority
+ * consumers fail closed instead of reusing the first connection's identity.
+ */
+static inline uint32
+tier1_capability_generation(uint32 reconnect_count)
+{
+	return reconnect_count == UINT32_MAX ? 0 : reconnect_count + 1;
+}
 
 /* ============================================================
  * Shmem layout.
@@ -123,6 +138,12 @@ typedef struct ClusterICTier1Shmem {
 	 * tails drained by this plane instance on a WL_SOCKET_WRITEABLE wakeup
 	 * (the DATA plane previously parked such tails forever — 56s wall). */
 	pg_atomic_uint64 writable_drain_count;
+	/* S3-P0-34: receive turns that consumed the full cooperative frame
+	 * budget before yielding to the owning LMON/LMS main loop. */
+	pg_atomic_uint64 recv_budget_yield_count;
+	/* Maximum number of complete frames consumed by one receive turn.
+	 * Diagnostic only; used to choose and verify the cooperative budget. */
+	pg_atomic_uint64 recv_turn_frame_highwater;
 	/* PGRAC: GCS serve-stall round-5 — per-peer outbound FIFO accounting.
 	 * admitted = whole frames copied into the FIFO because an older tail
 	 * was still backpressured (pre-fix these frames were silently LOST);
@@ -267,6 +288,7 @@ static bool tier1_anon_hello_verified[CLUSTER_MAX_NODES];
 static int32 tier1_anon_hello_verified_peer[CLUSTER_MAX_NODES];
 static int tier1_anon_hello_verified_fd[CLUSTER_MAX_NODES];
 static uint32 tier1_anon_hello_verified_capabilities[CLUSTER_MAX_NODES];
+static uint64 tier1_anon_hello_verified_boot_incarnation[CLUSTER_MAX_NODES];
 
 /*
  * spec-2.2 additive amendment (spec-5.22e D5 prereq): accept-side
@@ -283,6 +305,7 @@ static uint32 tier1_anon_hello_verified_capabilities[CLUSTER_MAX_NODES];
  */
 static bool tier1_caps_reply_wanted[CLUSTER_MAX_NODES];
 static uint64 tier1_caps_reply_epoch[CLUSTER_MAX_NODES];
+static uint64 tier1_caps_reply_boot_incarnation[CLUSTER_MAX_NODES];
 
 /*
  * spec-2.4 hardening v1.0.1 F2: outbound tail buffer is now dynamic
@@ -582,6 +605,8 @@ tier1_shmem_init(void)
 			s->listener_incarnation = 0;
 			pg_atomic_init_u64(&s->plane_misroute_reject, 0);
 			pg_atomic_init_u64(&s->writable_drain_count, 0);
+			pg_atomic_init_u64(&s->recv_budget_yield_count, 0);
+			pg_atomic_init_u64(&s->recv_turn_frame_highwater, 0);
 			pg_atomic_init_u64(&s->fifo_admitted_count, 0);
 			pg_atomic_init_u64(&s->fifo_promoted_count, 0);
 			pg_atomic_init_u64(&s->send_not_admitted_count, 0);
@@ -776,6 +801,38 @@ uint64
 cluster_ic_tier1_get_fifo_admitted(ClusterICPlane plane)
 {
 	return tier1_sum_plane_counter(plane, offsetof(ClusterICTier1Shmem, fifo_admitted_count));
+}
+
+uint64
+cluster_ic_tier1_get_recv_budget_yield(ClusterICPlane plane)
+{
+	return tier1_sum_plane_counter(plane,
+								   offsetof(ClusterICTier1Shmem, recv_budget_yield_count));
+}
+
+uint64
+cluster_ic_tier1_get_recv_turn_frame_highwater(ClusterICPlane plane)
+{
+	uint64 highwater = 0;
+	int first_slot;
+	int last_slot;
+	int slot;
+
+	if (plane < 0 || plane >= CLUSTER_IC_PLANE_N)
+		return 0;
+	first_slot = plane == CLUSTER_IC_PLANE_DATA ? 1 : 0;
+	last_slot = plane == CLUSTER_IC_PLANE_DATA
+					? CLUSTER_IC_TIER1_SLOTS - 1 : 0;
+	for (slot = first_slot; slot <= last_slot; slot++) {
+		uint64 value;
+
+		if (Tier1ShmemSlots[slot] == NULL)
+			continue;
+		value = pg_atomic_read_u64(
+			&Tier1ShmemSlots[slot]->recv_turn_frame_highwater);
+		highwater = Max(highwater, value);
+	}
+	return highwater;
 }
 
 uint64
@@ -1959,6 +2016,8 @@ tier1_maybe_send_caps_reply(int32 peer_id, uint32 dialer_caps)
 	if (peer_id >= 0 && peer_id < CLUSTER_MAX_NODES) {
 		tier1_caps_reply_wanted[peer_id] = true;
 		tier1_caps_reply_epoch[peer_id] = cluster_epoch_get_current();
+		tier1_caps_reply_boot_incarnation[peer_id]
+			= cluster_qvotec_get_durable_self_incarnation();
 	}
 	elog(DEBUG1, "cluster_ic tier1 sent PEER_CAPS_REPLY to peer %d", peer_id);
 }
@@ -1982,6 +2041,7 @@ tier1_caps_reply_epoch_recheck(int32 peer_id)
 	uint8 self_hello[PGRAC_IC_HELLO_BYTES];
 	const char *self_cluster_name;
 	uint64 now_epoch;
+	uint64 now_boot_incarnation;
 
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return;
@@ -1994,7 +2054,10 @@ tier1_caps_reply_epoch_recheck(int32 peer_id)
 	if (cluster_ic_suppress_caps_reply)
 		return; /* test-only old-acceptor simulation */
 	now_epoch = cluster_epoch_get_current();
-	if (now_epoch == tier1_caps_reply_epoch[peer_id])
+	now_boot_incarnation = cluster_qvotec_get_durable_self_incarnation();
+	if (now_epoch == tier1_caps_reply_epoch[peer_id]
+		&& now_boot_incarnation
+			   == tier1_caps_reply_boot_incarnation[peer_id])
 		return;
 
 	self_cluster_name = (ClusterConfShmem != NULL) ? ClusterConfShmem->cluster_name : "";
@@ -2006,7 +2069,11 @@ tier1_caps_reply_epoch_recheck(int32 peer_id)
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_PEER_CAPS_REPLY, peer_id, self_hello,
 								   PGRAC_IC_HELLO_BYTES);
 	tier1_caps_reply_epoch[peer_id] = now_epoch;
-	elog(DEBUG1, "cluster_ic tier1 resent PEER_CAPS_REPLY to peer %d after epoch advance", peer_id);
+	tier1_caps_reply_boot_incarnation[peer_id] = now_boot_incarnation;
+	elog(DEBUG1,
+		 "cluster_ic tier1 refreshed PEER_CAPS_REPLY to peer %d after "
+		 "epoch/boot identity advance",
+		 peer_id);
 }
 
 /*
@@ -2079,8 +2146,24 @@ tier1_peer_caps_reply_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 
-	cluster_sf_note_peer_hello_capabilities_gen(sender, cluster_ic_hello_capabilities(&msg),
-												Tier1Shmem->peers[sender].reconnect_count);
+	cluster_sf_note_peer_hello_identity_gen(
+		sender, cluster_ic_hello_capabilities(&msg),
+		tier1_capability_generation(Tier1Shmem->peers[sender].reconnect_count),
+		cluster_ic_hello_boot_incarnation(&msg));
+	/*
+	 * Refresh is symmetric.  The passive side already marks this from the
+	 * dialer's HELLO; the active side learns it from the first reply and
+	 * sends one reply of its own.  Never re-arm an already-wanted peer or
+	 * the two replies would echo indefinitely.
+	 */
+	if ((cluster_ic_hello_capabilities(&msg)
+		 & PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1)
+			!= 0
+		&& !tier1_caps_reply_wanted[sender]) {
+		tier1_caps_reply_wanted[sender] = true;
+		tier1_caps_reply_epoch[sender] = UINT64_MAX;
+		tier1_caps_reply_boot_incarnation[sender] = UINT64_MAX;
+	}
 	elog(DEBUG1, "cluster_ic tier1 learned peer %d capabilities 0x%X via PEER_CAPS_REPLY", sender,
 		 cluster_ic_hello_capabilities(&msg));
 }
@@ -2238,8 +2321,10 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	 * cross-node write (t/360 L5.5).  CONTROL owns caps; DATA only reads them.
 	 */
 	if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-		cluster_sf_note_peer_hello_capabilities_gen(peer_id, cluster_ic_hello_capabilities(&msg),
-													Tier1Shmem->peers[peer_id].reconnect_count);
+		cluster_sf_note_peer_hello_identity_gen(
+			peer_id, cluster_ic_hello_capabilities(&msg),
+			tier1_capability_generation(Tier1Shmem->peers[peer_id].reconnect_count),
+			cluster_ic_hello_boot_incarnation(&msg));
 		tier1_maybe_send_caps_reply(peer_id, cluster_ic_hello_capabilities(&msg));
 	} else
 		cluster_lms_outbound_note_data_peer_connected(tier1_my_data_channel, peer_id);
@@ -2448,6 +2533,8 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 	tier1_anon_hello_verified_fd[anon_slot] = peer_fd;
 	tier1_anon_hello_verified_capabilities[anon_slot]
 		= cluster_ic_hello_capabilities(&msg);
+	tier1_anon_hello_verified_boot_incarnation[anon_slot]
+		= cluster_ic_hello_boot_incarnation(&msg);
 	if (out_learned_peer_id != NULL)
 		*out_learned_peer_id = learned;
 
@@ -2485,8 +2572,10 @@ cluster_ic_tier1_bind_verified_anon_peer(int anon_slot, int32 learned, int peer_
 		/* CONTROL owns caps lifecycle (see the named-peer path above); a
 		 * DATA-plane worker only reads the shared store. */
 		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
-			cluster_sf_note_peer_hello_capabilities_gen(learned, capabilities,
-														Tier1Shmem->peers[learned].reconnect_count);
+			cluster_sf_note_peer_hello_identity_gen(
+				learned, capabilities,
+				tier1_capability_generation(Tier1Shmem->peers[learned].reconnect_count),
+				tier1_anon_hello_verified_boot_incarnation[anon_slot]);
 			tier1_maybe_send_caps_reply(learned, capabilities);
 		}
 	}
@@ -2517,6 +2606,7 @@ cluster_ic_tier1_anon_hello_reset(int anon_slot)
 	tier1_anon_hello_verified_peer[anon_slot] = -1;
 	tier1_anon_hello_verified_fd[anon_slot] = -1;
 	tier1_anon_hello_verified_capabilities[anon_slot] = 0;
+	tier1_anon_hello_verified_boot_incarnation[anon_slot] = 0;
 }
 
 int
@@ -2525,6 +2615,21 @@ cluster_ic_tier1_hello_send_remaining(int32 peer_id)
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return 0;
 	return tier1_hello_send_remaining[peer_id];
+}
+
+static inline void
+tier1_recv_turn_note_highwater(uint32 frames_processed)
+{
+	uint64 observed;
+
+	if (Tier1Shmem == NULL)
+		return;
+	observed = pg_atomic_read_u64(&Tier1Shmem->recv_turn_frame_highwater);
+	while (observed < frames_processed
+		   && !pg_atomic_compare_exchange_u64(
+			   &Tier1Shmem->recv_turn_frame_highwater, &observed,
+			   frames_processed))
+		;
 }
 
 /*
@@ -2548,11 +2653,17 @@ cluster_ic_tier1_hello_send_remaining(int32 peer_id)
  *   Returns false on hard recv error / EOF / verify failure / unregistered
  *   msg_type -- caller (LMON) is expected to close_peer per spec-2.3
  *   §3.5b inbound rule (peer-level failure; NEVER ereport ERROR LMON).
- *   Returns true on EAGAIN (drained for now).
+ *   Returns true on EAGAIN (drained for now) or after the fixed complete-
+ *   frame budget.  The latter is a cooperative yield boundary: CONTROL
+ *   LMON and DATA LMS share this function and must regain their main loops
+ *   to process SIGHUP/SIGTERM and queued outbound frames even when the peer
+ *   remains continuously readable.
  */
 bool
 cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 {
+	uint32 frames_processed = 0;
+
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
 		return false;
 	if (peer_fd < 0)
@@ -2587,8 +2698,10 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			if (got < 0) {
 				int saved = errno;
 
-				if (saved == EAGAIN || saved == EWOULDBLOCK)
+				if (saved == EAGAIN || saved == EWOULDBLOCK) {
+					tier1_recv_turn_note_highwater(frames_processed);
 					return true; /* drained for now */
+				}
 				peer_record_error(peer_id, saved, "08006", "envelope recv: %s", strerror(saved));
 				return false;
 			}
@@ -2672,8 +2785,10 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			if (got < 0) {
 				int saved = errno;
 
-				if (saved == EAGAIN || saved == EWOULDBLOCK)
+				if (saved == EAGAIN || saved == EWOULDBLOCK) {
+					tier1_recv_turn_note_highwater(frames_processed);
 					return true;
+				}
 				peer_record_error(peer_id, saved, "08006", "payload recv: %s", strerror(saved));
 				return false;
 			}
@@ -2747,6 +2862,13 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 				tier1_recv_phase[peer_id] = 0;
 				tier1_recv_payload_filled[peer_id] = 0;
 				tier1_recv_payload_total[peer_id] = 0;
+				frames_processed++;
+				CHECK_FOR_INTERRUPTS();
+				if (frames_processed >= CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET) {
+					tier1_recv_turn_note_highwater(frames_processed);
+					pg_atomic_fetch_add_u64(&Tier1Shmem->recv_budget_yield_count, 1);
+					return true;
+				}
 				continue; /* loop back to read next frame */
 			}
 			if (vrc == CLUSTER_IC_ENVELOPE_PEER_FAILURE) {
@@ -2800,6 +2922,13 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 		tier1_recv_phase[peer_id] = 0;
 		tier1_recv_payload_filled[peer_id] = 0;
 		tier1_recv_payload_total[peer_id] = 0;
+		frames_processed++;
+		CHECK_FOR_INTERRUPTS();
+		if (frames_processed >= CLUSTER_IC_TIER1_RECV_DRAIN_FRAME_BUDGET) {
+			tier1_recv_turn_note_highwater(frames_processed);
+			pg_atomic_fetch_add_u64(&Tier1Shmem->recv_budget_yield_count, 1);
+			return true;
+		}
 		/* loop again; peer may have queued multiple frames */
 	}
 	}
@@ -2829,11 +2958,10 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		 * matched: close_peer is also called defensively for failed dials
 		 * and duplicate-connection tie-breaks where no established link
 		 * existed -- wiping the surviving connection's capabilities there
-		 * would zero them with no new HELLO to renote.  The generation of
-		 * the closing connection is the peer's reconnect_count BEFORE the
-		 * increment below (the same value the learn sites stamped while
-		 * this connection was established), so only the matching record is
-		 * invalidated.
+		 * would zero them with no new HELLO to renote.  The closing
+		 * connection uses the one-based mapping of reconnect_count BEFORE
+		 * the increment below (the same identity the learn sites stamped),
+		 * so only the matching record is invalidated.
 		 */
 		/*
 		 * spec-5.22e Hardening (RC#1 integration review): ONLY a CONTROL-plane
@@ -2848,13 +2976,17 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 		 */
 		if (tier1_my_plane == CLUSTER_IC_PLANE_CONTROL) {
 			if (Tier1Shmem != NULL)
-				cluster_sf_note_peer_disconnected_gen(peer_id,
-													  Tier1Shmem->peers[peer_id].reconnect_count);
+				cluster_sf_note_peer_disconnected_gen(
+					peer_id,
+					tier1_capability_generation(
+						Tier1Shmem->peers[peer_id].reconnect_count));
 			else
 				cluster_sf_note_peer_disconnected(peer_id);
 		}
 		/* caps-reply resend state is per-connection too */
 		tier1_caps_reply_wanted[peer_id] = false;
+		tier1_caps_reply_epoch[peer_id] = 0;
+		tier1_caps_reply_boot_incarnation[peer_id] = 0;
 	}
 
 	/*

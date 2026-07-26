@@ -1032,9 +1032,17 @@ cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer, T
 						errhint("ITL slot no longer maps to this xid; retry.")));
 		break;
 	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
-		/* Our own xmax: PG-native (self-modified). */
+		/*
+		 * Preserve PostgreSQL's three native current-xmax outcomes even
+		 * when xmin visibility was established from remote evidence.
+		 */
 		if (xmin_remote_visible) {
-			*res = TM_SelfModified;
+			if (lock_only)
+				*res = TM_BeingModified;
+			else if (HeapTupleHeaderGetCmax(tuple) >= curcid)
+				*res = TM_SelfModified;
+			else
+				*res = TM_Invisible;
 			return true;
 		}
 		return false;
@@ -2125,7 +2133,7 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 							ereport(ERROR,
 									(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 									 errmsg("cluster TT status unknown for deleting xmax of xid %u",
-											raw_xmin),
+											HeapTupleHeaderGetRawXmax(tuple)),
 									 errhint("Remote deleter commit state not yet propagated; "
 											 "retry or abort.")));
 						}

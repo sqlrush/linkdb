@@ -67,10 +67,11 @@ typedef struct ClusterGrdWorkItem {
 	uint32 source_node_id;
 	uint16 payload_len;
 	uint8 payload[72]; /* GES_REQUEST payload image (spec-5.8 D1e: 72B) */
+	uint64 origin_boot_incarnation; /* authenticated source boot; 0 = legacy */
 } ClusterGrdWorkItem;
 
-StaticAssertDecl(sizeof(ClusterGrdWorkItem) == 80,
-				 "ClusterGrdWorkItem ABI lock (6 metadata + 72 payload + 2 pad, spec-5.8 D8)");
+StaticAssertDecl(sizeof(ClusterGrdWorkItem) == 88,
+				 "ClusterGrdWorkItem ABI lock (80 legacy bytes + source boot, S3-P0-10)");
 
 extern Size cluster_grd_work_queue_shmem_size(void);
 extern void cluster_grd_work_queue_shmem_init(void);
@@ -85,6 +86,9 @@ extern void cluster_grd_work_queue_shmem_register(void);
  */
 extern bool cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload,
 										   uint16 payload_len);
+extern bool cluster_grd_work_queue_enqueue_identity(
+	uint32 source_node_id, uint64 origin_boot_incarnation, const void *payload,
+	uint16 payload_len);
 
 /*
  * LMON consumer API.  Returns false on empty.

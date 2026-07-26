@@ -8,9 +8,9 @@
  *	  backend file I/O:
  *
  *	    ensure()           postmaster startup, after the spec-4.1 claim
- *	                       validation: create-once (O_EXCL + L47 fsync
- *	                       discipline) or validate the existing header.
- *	                       Fail-closed FATAL 53RA2.
+ *	                       validation: create a durable private image,
+ *	                       atomically publish it with link(2), or validate
+ *	                       the existing header.  Fail-closed FATAL 53RA2.
  *	    publish_active()   phase4 -> CLUSTER_PHASE_RUNNING transition:
  *	                       recovery succeeded, the node is about to
  *	                       serve -- ONLY now does the slot say ACTIVE
@@ -166,73 +166,136 @@ bool
 cluster_wal_state_ensure(void)
 {
 	char path[MAXPGPATH];
+	char tmp_path[MAXPGPATH];
 	int fd;
 	ClusterWalStateHeader header;
 	int got;
 	const char *reason = NULL;
 	struct stat st;
+	bool created = false;
+	int ret;
 
 	if (!registry_configured())
 		return false;
 
 	registry_path(path, sizeof(path));
 
-	fd = BasicOpenFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
-	if (fd >= 0) {
-		/* First boot of the whole registry: zero file + header. */
-		char *zeros = palloc0(CLUSTER_WAL_STATE_FILE_SIZE);
-		ssize_t nwritten;
-		bool ok;
-
-		cluster_wal_state_header_fill((ClusterWalStateHeader *)zeros, (int64)GetCurrentTimestamp());
-
-		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_WRITE);
-		nwritten = pg_pwrite(fd, zeros, CLUSTER_WAL_STATE_FILE_SIZE, 0);
-		ok = (nwritten == (ssize_t)CLUSTER_WAL_STATE_FILE_SIZE) && pg_fsync(fd) == 0;
-		pgstat_report_wait_end();
-		pfree(zeros);
-
-		if (!ok) {
-			int save_errno = errno;
-
-			close(fd);
-			(void)unlink(path);
-			errno = save_errno;
-			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-							errmsg("could not initialise WAL state registry \"%s\": %m", path),
-							errhint("Check that the shared WAL storage is writable.")));
-		}
+	/*
+	 * Existing registries are the normal restart path.  Probe without
+	 * O_CREAT so only a genuinely missing registry pays the private-image
+	 * creation cost below.  A concurrent publisher after ENOENT is handled
+	 * by link(2)'s EEXIST result.
+	 */
+	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+	if (fd >= 0)
 		close(fd);
-
-		/* L47 create side: make the new dirent durable too. */
-		fd = BasicOpenFile(cluster_wal_threads_dir, O_RDONLY | PG_BINARY);
-		if (fd < 0)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					 errmsg("could not open WAL threads root \"%s\": %m", cluster_wal_threads_dir),
-					 errhint("Check that the shared WAL storage is writable.")));
-		if (pg_fsync(fd) != 0) {
-			int save_errno = errno;
-
-			close(fd);
-			errno = save_errno;
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					 errmsg("could not fsync WAL threads root \"%s\": %m", cluster_wal_threads_dir),
-					 errhint("Check that the shared WAL storage is writable.")));
-		}
-		close(fd);
-
-		ereport(LOG, (errmsg("pgrac WAL state registry created at \"%s\"", path)));
-		return true;
-	}
-	if (errno != EEXIST)
+	else if (errno != ENOENT)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
 						errmsg("could not open WAL state registry \"%s\": %m", path),
 						errhint("Check that the shared WAL storage is reachable.")));
+	else {
+		/*
+		 * A multi-node first boot is concurrent.  Never create the final
+		 * pathname directly: O_CREAT makes a zero-byte dirent visible before
+		 * the first pwrite, so a peer can misclassify an in-progress create as
+		 * corruption.  Build a private, durable image and use link(2) as an
+		 * atomic no-clobber publish; exactly one creator wins and every reader
+		 * sees either ENOENT or the complete 66048-byte image.
+		 *
+		 * The timestamp keeps crash residue from colliding with a later
+		 * incarnation.  O_EXCL remains the authority if two creators happen
+		 * to choose the same suffix.
+		 */
+		ret = snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.n%d.p%d.%lld", path, cluster_node_id,
+					   MyProcPid, (long long)GetCurrentTimestamp());
+		if (ret < 0 || (size_t)ret >= sizeof(tmp_path))
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+							errmsg("WAL state registry temporary path is too long"),
+							errdetail("Final path is \"%s\".", path)));
+
+		fd = BasicOpenFile(tmp_path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
+		if (fd < 0)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+							errmsg("could not create WAL state registry temporary file \"%s\": %m",
+								   tmp_path),
+							errhint("Check that the shared WAL storage is writable.")));
+		{
+			/* Candidate first-boot image: zero file + valid header. */
+			char *zeros = palloc0(CLUSTER_WAL_STATE_FILE_SIZE);
+			ssize_t nwritten;
+			bool ok;
+
+			cluster_wal_state_header_fill((ClusterWalStateHeader *)zeros,
+										  (int64)GetCurrentTimestamp());
+
+			pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_WRITE);
+			nwritten = pg_pwrite(fd, zeros, CLUSTER_WAL_STATE_FILE_SIZE, 0);
+			ok = (nwritten == (ssize_t)CLUSTER_WAL_STATE_FILE_SIZE) && pg_fsync(fd) == 0;
+			pgstat_report_wait_end();
+			pfree(zeros);
+
+			if (!ok) {
+				int save_errno = errno;
+
+				close(fd);
+				(void)unlink(tmp_path);
+				errno = save_errno;
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+								errmsg("could not initialise WAL state registry temporary file "
+									   "\"%s\": %m",
+									   tmp_path),
+								errhint("Check that the shared WAL storage is writable.")));
+			}
+			close(fd);
+
+			if (link(tmp_path, path) == 0)
+				created = true;
+			else if (errno != EEXIST) {
+				int save_errno = errno;
+
+				(void)unlink(tmp_path);
+				errno = save_errno;
+				ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+								errmsg("could not publish WAL state registry \"%s\": %m", path),
+								errhint("Check that the shared WAL storage supports atomic "
+										"hard-link creation.")));
+			}
+
+			/*
+			 * L47 create side: make the winning final dirent durable.  A
+			 * losing creator also fsyncs the directory, so the observed
+			 * winner is durable even if that postmaster dies immediately
+			 * after link().
+			 */
+			fd = BasicOpenFile(cluster_wal_threads_dir, O_RDONLY | PG_BINARY);
+			if (fd < 0)
+				ereport(
+					FATAL,
+					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+					 errmsg("could not open WAL threads root \"%s\": %m", cluster_wal_threads_dir),
+					 errhint("Check that the shared WAL storage is writable.")));
+			if (pg_fsync(fd) != 0) {
+				int save_errno = errno;
+
+				close(fd);
+				errno = save_errno;
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+						 errmsg("could not fsync WAL threads root \"%s\": %m",
+								cluster_wal_threads_dir),
+						 errhint("Check that the shared WAL storage is writable.")));
+			}
+			close(fd);
+			(void)unlink(tmp_path);
+
+			if (created)
+				ereport(LOG, (errmsg("pgrac WAL state registry created at \"%s\"", path)));
+		}
+	}
 
 	/*
-	 * Exists (possibly created by a concurrent first boot): validate.
+	 * The final path now exists (published here or by a concurrent first
+	 * boot): validate.
 	 * The layout is a fixed 66048 bytes; a valid header glued to a
 	 * truncated (or extended) slot area must not pass, and the file is
 	 * never auto-resized (spec-4.2 user codereview round 2, P1).

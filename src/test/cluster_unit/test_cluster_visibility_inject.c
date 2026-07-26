@@ -62,6 +62,11 @@
 
 #include "unit_test.h"
 
+StaticAssertDecl(
+	__builtin_types_compatible_p(__typeof__(cluster_test_request_undo_verdict_other),
+								 Datum(FunctionCallInfo)),
+	"real LMS OTHER test UDF must expose the fmgr entry signature");
+
 
 UT_DEFINE_GLOBALS();
 

@@ -91,6 +91,7 @@ typedef struct ClusterUndoHorizonShmem {
 	pg_atomic_uint64 pass_abort_count;
 	pg_atomic_uint64 wire_reject_count;
 	pg_atomic_uint64 admission_refuse_count;
+	pg_atomic_uint64 admission_reason_count[CLUSTER_UNDO_ADMISSION_REASON_COUNT];
 	pg_atomic_uint64 idle_sentinel_sent_count; /* TT lane: sentinel sends */
 	pg_atomic_uint64 last_floor_scn;		   /* gauge: last OK fold result */
 	pg_atomic_uint64 self_admitted_epoch;	   /* D5-8: (epoch self last became
@@ -127,6 +128,8 @@ cluster_undo_horizon_shmem_init(void)
 		pg_atomic_init_u64(&shmem->pass_abort_count, 0);
 		pg_atomic_init_u64(&shmem->wire_reject_count, 0);
 		pg_atomic_init_u64(&shmem->admission_refuse_count, 0);
+		for (i = 0; i < CLUSTER_UNDO_ADMISSION_REASON_COUNT; i++)
+			pg_atomic_init_u64(&shmem->admission_reason_count[i], 0);
 		pg_atomic_init_u64(&shmem->idle_sentinel_sent_count, 0);
 		pg_atomic_init_u64(&shmem->last_floor_scn, 0);
 		pg_atomic_init_u64(&shmem->self_admitted_epoch, 0);
@@ -537,10 +540,12 @@ cluster_undo_horizon_note_self_member(void)
  *	bound arm -- fail-closed, never false-visible.
  */
 bool
-cluster_undo_horizon_read_admission_enforce(SCN read_scn)
+cluster_undo_horizon_read_admission_enforce(
+	SCN read_scn, const ClusterUndoAdmissionContext *context)
 {
 	uint64 admitted;
 	Snapshot snap;
+	ClusterUndoAdmissionReason reason;
 	int pi;
 
 	if (cluster_node_id < 0)
@@ -560,13 +565,39 @@ cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 	admitted
 		= UndoHorizonShmem == NULL ? 0 : pg_atomic_read_u64(&UndoHorizonShmem->self_admitted_epoch);
 	snap = ActiveSnapshotSet() ? GetActiveSnapshot() : NULL;
-	if (admitted == 0 || snap == NULL || snap->read_epoch < admitted - 1
-		|| (SCN_VALID(read_scn) && SCN_VALID(snap->read_scn) && snap->read_scn != read_scn)) {
-		if (UndoHorizonShmem != NULL)
+	reason = cluster_undo_horizon_admission_reason(
+		admitted, snap != NULL, snap != NULL ? snap->read_epoch : 0,
+		snap != NULL ? snap->read_scn : InvalidScn, read_scn);
+	if (reason != CLUSTER_UNDO_ADMISSION_ADMIT) {
+		if (UndoHorizonShmem != NULL) {
 			pg_atomic_fetch_add_u64(&UndoHorizonShmem->admission_refuse_count, 1);
+			pg_atomic_fetch_add_u64(
+				&UndoHorizonShmem->admission_reason_count[reason], 1);
+		}
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 						errmsg("cross-node undo access refused: snapshot predates this node's "
 							   "cluster admission"),
+						errdetail("reason=%s caller=%s xid=%u origin=%d authoritative=%d "
+								  "ref_segment=%u ref_slot=%u passed_read_scn=" UINT64_FORMAT
+								  " active_snapshot=%d snapshot_read_scn=" UINT64_FORMAT
+								  " snapshot_read_epoch=" UINT64_FORMAT
+								  " current_epoch=" UINT64_FORMAT
+								  " admitted_epoch_biased=" UINT64_FORMAT
+								  " admitted_epoch=" UINT64_FORMAT,
+								  cluster_undo_horizon_admission_reason_name(reason),
+								  context != NULL && context->caller != NULL
+									  ? context->caller
+									  : "unknown",
+								  context != NULL ? context->xid : InvalidTransactionId,
+								  context != NULL ? context->origin_node : -1,
+								  context != NULL && context->authoritative ? 1 : 0,
+								  context != NULL ? context->undo_segment_id : 0,
+								  context != NULL ? context->tt_slot_id : 0,
+								  (uint64)read_scn, snap != NULL ? 1 : 0,
+								  (uint64)(snap != NULL ? snap->read_scn : InvalidScn),
+								  snap != NULL ? snap->read_epoch : 0,
+								  cluster_epoch_get_current(), admitted,
+								  admitted > 0 ? admitted - 1 : 0),
 						errhint("Take a new snapshot (new statement or transaction) after the "
 								"join completed and retry.")));
 	}
@@ -677,6 +708,17 @@ UNDO_HORIZON_NOTE(peer_stale)
 UNDO_HORIZON_NOTE(pass_abort)
 UNDO_HORIZON_NOTE(wire_reject)
 UNDO_HORIZON_NOTE(admission_refuse)
+
+uint64
+cluster_undo_horizon_admission_reason_count(
+	ClusterUndoAdmissionReason reason)
+{
+	if (UndoHorizonShmem == NULL || reason <= CLUSTER_UNDO_ADMISSION_ADMIT
+		|| reason >= CLUSTER_UNDO_ADMISSION_REASON_COUNT)
+		return 0;
+	return pg_atomic_read_u64(
+		&UndoHorizonShmem->admission_reason_count[reason]);
+}
 
 /* TT lane: sender-side sentinel gauge (bumped inline in the tick; only the
  * reader half of the NOTE pattern is needed). */

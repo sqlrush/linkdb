@@ -696,8 +696,9 @@ rdma_verify_private_hello(const void *data, uint8 len, int32 expected_peer, uint
 	 * close-funnel clear (pre-existing; registered tier1-only boundary).
 	 * RDMA HELLO exchange is CM-bidirectional (both sides carry HELLO in
 	 * private_data), so no PEER_CAPS_REPLY leg is needed here. */
-	cluster_sf_note_peer_hello_capabilities_gen(msg.source_node_id,
-												cluster_ic_hello_capabilities(&msg), 0);
+	cluster_sf_note_peer_hello_identity_gen(
+		msg.source_node_id, cluster_ic_hello_capabilities(&msg), 0,
+		cluster_ic_hello_boot_incarnation(&msg));
 	if (out_reason != NULL)
 		*out_reason = NULL;
 	return true;

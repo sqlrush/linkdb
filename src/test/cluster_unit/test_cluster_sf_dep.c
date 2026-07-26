@@ -331,6 +331,32 @@ UT_TEST(test_pcm_x_source_floor_capability_guard_is_generation_exact)
 		&cap, PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1, 42));
 }
 
+UT_TEST(test_stale_x_capability_identity_is_one_record_snapshot)
+{
+	ClusterSfPeerCap cap;
+	uint32 generation = UINT32_MAX;
+	uint64 boot_incarnation = UINT64_MAX;
+
+	memset(&cap, 0, sizeof(cap));
+	cluster_sf_peer_cap_note(
+		&cap, PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1, 40);
+	UT_ASSERT(!cluster_sf_peer_cap_identity_for_bits(
+		&cap, PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1, &generation,
+		&boot_incarnation));
+	UT_ASSERT_EQ(generation, (uint32)40);
+	UT_ASSERT_EQ(boot_incarnation, 0);
+
+	cluster_sf_peer_cap_note_identity(
+		&cap, PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1, 41, 701);
+	UT_ASSERT(cluster_sf_peer_cap_identity_for_bits(
+		&cap, PGRAC_IC_HELLO_CAP_GCS_STALE_X_CERT_V1, &generation,
+		&boot_incarnation));
+	UT_ASSERT_EQ(generation, (uint32)41);
+	UT_ASSERT_EQ(boot_incarnation, 701);
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&cap, 41));
+	UT_ASSERT_EQ(cap.boot_incarnation, 0);
+}
+
 int
 main(void)
 {
@@ -347,5 +373,6 @@ main(void)
 	UT_RUN(test_pcm_x_capability_generation_snapshot_is_exact);
 	UT_RUN(test_pcm_x_capability_family_sample_is_record_coherent);
 	UT_RUN(test_pcm_x_source_floor_capability_guard_is_generation_exact);
+	UT_RUN(test_stale_x_capability_identity_is_one_record_snapshot);
 	UT_DONE();
 }

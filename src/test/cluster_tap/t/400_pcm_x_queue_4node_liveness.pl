@@ -13,11 +13,14 @@
 use strict;
 use warnings FATAL => 'all';
 
-use IPC::Run qw(start finish timeout);
+use Digest::SHA qw(sha256_hex);
+use IPC::Run qw(run start finish timeout);
 use PostgreSQL::Test::ClusterQuad;
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(time usleep);
+
+my $p034_lifecycle_only = $ENV{PGRAC_T400_P034_ONLY} ? 1 : 0;
 
 sub state_int
 {
@@ -265,6 +268,38 @@ sub write_file
 	close($fh) or die "close $path: $!";
 }
 
+sub file_sha256
+{
+	my ($path) = @_;
+	open(my $fh, '<', $path) or return '<unavailable>';
+	binmode($fh);
+	my $sha = Digest::SHA->new(256);
+	$sha->addfile($fh);
+	close($fh) or die "close $path: $!";
+	return $sha->hexdigest;
+}
+
+sub find_on_path
+{
+	my ($program) = @_;
+	for my $dir (split(/:/, $ENV{PATH} // ''))
+	{
+		my $candidate = "$dir/$program";
+		return $candidate if -x $candidate && -f $candidate;
+	}
+	return undef;
+}
+
+sub tracked_diff_sha256
+{
+	my $top_builddir = $ENV{top_builddir};
+	return '<unavailable>' unless defined($top_builddir) && -e "$top_builddir/.git";
+	my ($diff, $err) = ('', '');
+	my $ok = run ['git', '-C', $top_builddir, 'diff', '--binary', '--no-ext-diff'],
+		'>', \$diff, '2>', \$err;
+	return $ok ? sha256_hex($diff) : '<unavailable>';
+}
+
 my $quad = PostgreSQL::Test::ClusterQuad->new_quad(
 	'pcm_xq_liveness',
 	quorum_voting_disks => 3,
@@ -287,6 +322,26 @@ my $quad = PostgreSQL::Test::ClusterQuad->new_quad(
 		'cluster.cssd_heartbeat_interval_ms = 2000',
 		'cluster.cssd_dead_deadband_factor = 10',
 	]);
+
+my $postgres_path = find_on_path('postgres');
+my $build_postgres_path = defined($ENV{top_builddir})
+	? "$ENV{top_builddir}/src/backend/postgres" : undef;
+my $installed_postgres_sha256 = defined($postgres_path)
+	? file_sha256($postgres_path) : '<unavailable>';
+my $build_postgres_sha256 = defined($build_postgres_path)
+	? file_sha256($build_postgres_path) : '<unavailable>';
+BAIL_OUT('L5F run binary fingerprint unavailable')
+	if $installed_postgres_sha256 eq '<unavailable>'
+		|| $build_postgres_sha256 eq '<unavailable>';
+BAIL_OUT("L5F stale installed postgres: build=$build_postgres_sha256 "
+	. "installed=$installed_postgres_sha256 path=$postgres_path")
+	if $installed_postgres_sha256 ne $build_postgres_sha256;
+diag('L5F run fingerprint: t400_sha256=' . file_sha256($0)
+	. ' build_postgres_path=' . $build_postgres_path
+	. ' build_postgres_sha256=' . $build_postgres_sha256
+	. ' installed_postgres_path=' . $postgres_path
+	. ' installed_postgres_sha256=' . $installed_postgres_sha256
+	. ' tracked_diff_sha256=' . tracked_diff_sha256());
 
 $quad->start_quad;
 usleep(3_000_000);
@@ -342,6 +397,8 @@ for my $node ($quad->nodes)
 		) WITH (fillfactor = 100)
 	});
 }
+
+goto L5F if $ENV{PGRAC_T400_L5F_ONLY};
 
 my @paths = map {
 	$quad->node($_)->safe_psql('postgres',
@@ -610,6 +667,12 @@ my @lmd_before_by_node = map {
 my %pcm_before = %{aggregate_snapshots(\@pcm_before_by_node, \@pcm_x_pcm_keys)};
 my %lmd_before = %{aggregate_snapshots(\@lmd_before_by_node, \@pcm_x_lmd_keys)};
 my $queue_before = $pcm_before{pcm_x_queue_enqueue_count};
+my @recv_budget_yield_before_by_node = map {
+	state_int($quad->node($_), 'ic', 'tier1_recv_budget_yield_data')
+} (0 .. 3);
+my @recv_turn_highwater_before_by_node = map {
+	state_int($quad->node($_), 'ic', 'tier1_recv_turn_frame_highwater_data')
+} (0 .. 3);
 my $denied_before = 0;
 $denied_before += state_int($quad->node($_), 'gcs',
 	'starvation_denied_pending_x_count') for (0 .. 3);
@@ -632,16 +695,21 @@ for my $i (0 .. 3)
 	write_file($script,
 		"SELECT pg_sleep(GREATEST(0.0, EXTRACT(EPOCH FROM "
 		. "(TIMESTAMPTZ '$start_at' - clock_timestamp()))));\n"
-		. "UPDATE pcm_xq_hot SET v = v + 1 WHERE id = $id;\n");
+		. "UPDATE pcm_xq_hot SET v = v + 1 WHERE id = $id;\n"
+		. ($p034_lifecycle_only ? "SELECT pg_sleep(0.02);\n" : ''));
 
 	my %run = (stdout => '', stderr => '', timed_out => 0);
 	my @cmd = (
 		$quad->node($i)->installed_command('pgbench'),
-		'-n', '-c', '1', '-j', '1', '-T', '15', '--max-tries=1',
+		'-n',
+		'-c', '1',
+		'-j', '1',
+		'-T', ($p034_lifecycle_only ? '30' : '15'),
+		'--max-tries=1',
 		'-f', $script, '-h', $quad->node($i)->host,
 		'-p', $quad->node($i)->port, 'postgres');
 	$run{handle} = start(\@cmd, '<', \undef, '>', \$run{stdout},
-		'2>', \$run{stderr}, timeout(45));
+		'2>', \$run{stderr}, timeout($p034_lifecycle_only ? 90 : 45));
 	push @runs, \%run;
 }
 
@@ -771,6 +839,16 @@ my @lmd_after_by_node = map {
 my %pcm_after = %{aggregate_snapshots(\@pcm_after_by_node, \@pcm_x_pcm_keys)};
 my %lmd_after = %{aggregate_snapshots(\@lmd_after_by_node, \@pcm_x_lmd_keys)};
 my $queue_after = $pcm_after{pcm_x_queue_enqueue_count};
+my @recv_budget_yield_after_by_node = map {
+	state_int($quad->node($_), 'ic', 'tier1_recv_budget_yield_data')
+} (0 .. 3);
+my @recv_turn_highwater_after_by_node = map {
+	state_int($quad->node($_), 'ic', 'tier1_recv_turn_frame_highwater_data')
+} (0 .. 3);
+my $recv_budget_yield_delta = 0;
+$recv_budget_yield_delta +=
+	$recv_budget_yield_after_by_node[$_] - $recv_budget_yield_before_by_node[$_]
+	for (0 .. 3);
 my $denied_after = 0;
 $denied_after += state_int($quad->node($_), 'gcs',
 	'starvation_denied_pending_x_count') for (0 .. 3);
@@ -782,6 +860,11 @@ my @holder_evicted_after_by_node = map {
 } (0 .. 3);
 diag('L3 path probes: pcm_x_queue_enqueue_delta='
 	. ($queue_after - $queue_before)
+	. ' tier1_recv_budget_yield_data_delta='
+	. $recv_budget_yield_delta
+	. ' tier1_recv_turn_frame_highwater_data_before=['
+	. join(',', @recv_turn_highwater_before_by_node)
+	. '] after=[' . join(',', @recv_turn_highwater_after_by_node) . ']'
 	. ' legacy_denied_pending_x_delta='
 	. ($denied_after - $denied_before)
 	. ' passive_s_release_delta='
@@ -933,6 +1016,13 @@ for my $i (0 .. 3)
 # non-master nodes is a false topology assumption.
 cmp_ok($queue_after - $queue_before, '>=', 4,
 	'L3 aggregate PCM-X queue admission floor reached four');
+if ($p034_lifecycle_only)
+{
+	cmp_ok($queue_after - $queue_before, '>=', 65,
+		'P0-34 targeted pressure generated at least 65 queued conversions');
+	cmp_ok($recv_budget_yield_delta, '>', 0,
+		'P0-34 DATA receive drain exercised a fixed-budget cooperative yield');
+}
 cmp_ok($denied_after - $denied_before, '>', 0,
 	'L3 Shape-B arbitration denied an in-flight legacy reader without a client error');
 cmp_ok($passive_s_after - $passive_s_before, '>', 0,
@@ -1018,10 +1108,93 @@ is($sum_v, "$expected_sum",
 	'L4 aggregate value equals total committed pgbench transactions')
 	or diag("L4 expected_sum=$expected_sum stderr=[$sum_err]");
 
+if ($p034_lifecycle_only)
+{
+	my @reload_log_offsets
+		= map { (-s $quad->node($_)->logfile) // 0 } (0 .. 3);
+	my @expected_workers = map {
+		$quad->node($_)->safe_psql('postgres', 'SHOW cluster.lms_workers') + 0
+	} (0 .. 3);
+	my @expected_worker_pids;
+	for my $i (0 .. 3)
+	{
+		my $pid_list = $quad->node($i)->safe_psql('postgres', q{
+			SELECT coalesce(string_agg(pid::text, ',' ORDER BY pid), '')
+			FROM pg_stat_activity
+			WHERE backend_type IN ('lms', 'lms worker')
+		});
+		my @pids = grep { $_ =~ /\A\d+\z/ } split(/,/, $pid_list);
+		$expected_worker_pids[$i] = { map { $_ => 1 } @pids };
+		is(scalar(@pids), $expected_workers[$i],
+			"P0-34 node$i captured every configured DATA-worker PID before SIGHUP");
+	}
+	my $reload_value = 'cluster-pcm-x-retain-flush-error:skipn:999999';
+
+	for my $i (0 .. 3)
+	{
+		my $reload_started_at = time();
+		my $reload_ready_at;
+		my $reload_log = '';
+		$quad->node($i)->safe_psql('postgres', qq{
+			ALTER SYSTEM SET cluster.injection_points = '$reload_value';
+			SELECT pg_reload_conf()
+		});
+		my $reload_deadline = $reload_started_at + 1.0;
+		do
+		{
+			$reload_log
+				= substr(slurp_file($quad->node($i)->logfile),
+					$reload_log_offsets[$i]);
+			my %ready_workers;
+			my %ready_pids;
+			while ($reload_log
+				=~ /cluster_lms: DATA worker=(\d+) applied PCM-X finish Flush injection config: pid=(\d+) armed=true value="\Q$reload_value\E"/g)
+			{
+				$ready_workers{$1} = 1;
+				$ready_pids{$2} = 1
+					if exists($expected_worker_pids[$i]{$2});
+			}
+			$reload_ready_at = time()
+				if scalar(keys %ready_workers) == $expected_workers[$i]
+				&& scalar(keys %ready_pids) == $expected_workers[$i];
+			usleep(10_000) unless defined($reload_ready_at);
+		} while (!defined($reload_ready_at) && time() <= $reload_deadline);
+		my $elapsed = defined($reload_ready_at)
+			? $reload_ready_at - $reload_started_at : 999;
+		ok(defined($reload_ready_at) && $elapsed <= 1.0,
+			"P0-34 node$i every DATA worker ACKed SIGHUP within 1 second")
+			or diag("P0-34 node$i reload elapsed=$elapsed expected_workers="
+				. $expected_workers[$i] . " log=[$reload_log]");
+	}
+
+	for my $i (0 .. 3)
+	{
+		my $shutdown_started_at = time();
+		local $ENV{PGCTLTIMEOUT} = 15;
+		my $stopped = $quad->node($i)->stop('fast', fail_ok => 1);
+		my $shutdown_elapsed = time() - $shutdown_started_at;
+		ok($stopped, "P0-34 node$i fast shutdown returned success");
+		cmp_ok($shutdown_elapsed, '<', 15,
+			"P0-34 node$i completed fast shutdown within 15 seconds");
+		if (!$stopped)
+		{
+			local $ENV{PGCTLTIMEOUT} = 5;
+			$quad->node($i)->stop('immediate', fail_ok => 1);
+		}
+		my $shutdown_log = slurp_file($quad->node($i)->logfile);
+		unlike($shutdown_log,
+			qr/lost track of buffer IO|\bPANIC:|failed Assert|ExceptionalCondition/,
+			"P0-34 node$i shutdown log has no BufferIO/PANIC/assert failure");
+	}
+	done_testing();
+	exit 0;
+}
+
 # The destructive leg is deliberately last: its expected outcome is a
 # fail-closed runtime, so no later assertion may depend on ACTIVE or drained
 # gauges.  GUC+reload is required because injection state is process-local;
 # the DATA worker, not this SQL backend, executes the finish boundary.
+L5F:
 ok(write_retry($quad->node0,
 	q{INSERT INTO pcm_xq_flush_error(id, v) VALUES (1, 0)}),
 	'L5F seeded the direct-X target page');
@@ -1038,32 +1211,74 @@ my $flush_error_release_before = state_int($quad->node0, 'gcs',
 my $flush_error_blocked_before = state_int($quad->node0, 'pcm',
 	'pcm_x_queue_recovery_blocked_count');
 my $flush_error_log_offset = (-s $quad->node0->logfile) // 0;
+my $flush_error_requester_log_offset = (-s $quad->node1->logfile) // 0;
+my $flush_error_lms_workers = $quad->node0->safe_psql('postgres',
+	'SHOW cluster.lms_workers') + 0;
+my $flush_error_requester_lms_workers = $quad->node1->safe_psql('postgres',
+	'SHOW cluster.lms_workers') + 0;
+
+my ($flush_seed_rc, $flush_seed_out, $flush_seed_err) = $quad->node0->psql(
+	'postgres', q{UPDATE pcm_xq_flush_error SET v = 1 WHERE id = 1}, timeout => 30);
+is($flush_seed_rc, 0, 'L5F node0 created the destructive-leg X source')
+	or diag("L5F seed stdout=[$flush_seed_out] stderr=[$flush_seed_err]");
+for my $i (0 .. 3)
+{
+	my $prearm_slots = $quad->node($i)->safe_psql('postgres', qq{
+		SELECT coalesce(string_agg(key || '=[' || value || ']', ' ' ORDER BY key),
+			'<empty>')
+		FROM pg_cluster_state
+		WHERE category = 'pcm'
+		  AND (key LIKE 'pcm_x_tag_%' OR key LIKE 'pcm_x_ticket_%'
+			OR key LIKE 'pcm_x_ltag_%')
+		  AND value LIKE '%rel=$flush_error_relfilenode %'
+		  AND value LIKE '%blk=0%'
+	});
+	is($prearm_slots, '<empty>',
+		"L5F prearm node$i has no queue slot for rel=$flush_error_relfilenode block=0")
+		or diag("L5F prearm node$i matching slots=[$prearm_slots]");
+}
 
 $quad->node0->safe_psql('postgres', q{
 	ALTER SYSTEM SET cluster.injection_points =
 		'cluster-pcm-x-retain-flush-error:skipn:1';
 	SELECT pg_reload_conf()
 });
+$quad->node1->safe_psql('postgres', q{
+	ALTER SYSTEM SET cluster.injection_points =
+		'cluster-pcm-x-retain-flush-error';
+	SELECT pg_reload_conf()
+});
 my ($flush_error_reload_ready, $flush_error_reload_log)
 	= wait_for_lms_finish_flush_reload(
-		$quad->node0, $flush_error_log_offset, $dirty_lms_workers, 'true',
+		$quad->node0, $flush_error_log_offset, $flush_error_lms_workers, 'true',
 		'cluster-pcm-x-retain-flush-error:skipn:1', 15);
 ok($flush_error_reload_ready,
 	'L5F every node0 DATA worker applied the one-shot finish-Flush fault arm')
 	or diag("L5F DATA-worker reload log=[$flush_error_reload_log]");
+my ($flush_error_requester_reload_ready, $flush_error_requester_reload_log)
+	= wait_for_lms_finish_flush_reload(
+		$quad->node1, $flush_error_requester_log_offset,
+		$flush_error_requester_lms_workers, 'true',
+		'cluster-pcm-x-retain-flush-error', 15);
+ok($flush_error_requester_reload_ready,
+	'L5F every node1 DATA worker applied the transfer-boundary diagnostic arm')
+	or diag("L5F requester DATA-worker reload log=[$flush_error_requester_reload_log]");
 
-my ($flush_seed_rc, $flush_seed_out, $flush_seed_err) = $quad->node0->psql(
-	'postgres', q{UPDATE pcm_xq_flush_error SET v = 1 WHERE id = 1}, timeout => 30);
-is($flush_seed_rc, 0, 'L5F node0 created the destructive-leg X source')
-	or diag("L5F seed stdout=[$flush_seed_out] stderr=[$flush_seed_err]");
 my ($flush_error_rc, $flush_error_out, $flush_error_err) = $quad->node1->psql(
 	'postgres', q{
+		\set VERBOSITY verbose
 		SET statement_timeout = '5s';
 		INSERT INTO pcm_xq_flush_error(id, v) VALUES (2, 1)
 	}, timeout => 30);
 isnt($flush_error_rc, 0,
-	'L5F remote writer failed when finish FlushBuffer raised the injected ERROR')
+	'L5F requester cleanup returned a nonzero status')
 	or diag("L5F unexpected success stdout=[$flush_error_out] stderr=[$flush_error_err]");
+my $flush_error_requester_timed_out
+	= $flush_error_err
+		=~ /ERROR:\s+57014:\s+canceling statement due to statement timeout/;
+ok($flush_error_requester_timed_out,
+	'L5F requester cleanup observed its bounded statement timeout')
+	or diag("L5F wrong failure stdout=[$flush_error_out] stderr=[$flush_error_err]");
 
 my ($flush_error_runtime_after, $flush_error_blocked_after);
 my $flush_error_deadline = time() + 15;
@@ -1085,23 +1300,240 @@ is($flush_error_runtime_after, 0,
 	'L5F node0 PCM-X runtime moved to RECOVERY_BLOCKED');
 cmp_ok($flush_error_blocked_after - $flush_error_blocked_before, '>', 0,
 	'L5F recovery-blocked counter recorded the finish error');
-cmp_ok(state_int($quad->node0, 'gcs', 'dedup_pcm_x_stage_count')
-		- $flush_error_stage_before, '>', 0,
+my $flush_error_stage_after = state_int($quad->node0, 'gcs',
+	'dedup_pcm_x_stage_count');
+my $flush_error_stage_delta
+	= $flush_error_stage_after - $flush_error_stage_before;
+cmp_ok($flush_error_stage_delta, '>', 0,
 	'L5F immutable A-record reached MATERIALIZED_UNCOMMITTED before ERROR');
 my $flush_error_log = substr(slurp_file($quad->node0->logfile),
 	$flush_error_log_offset);
-like($flush_error_log,
-	qr/PCM-X finish-error evidence exact.*?preserve_result=12 retained=true worker=\d+ tag=\d+\/\d+\/\Q$flush_error_relfilenode\E\/0\/0 requester=1 backend=\d+ request_id=\d+ ticket=\d+ queue_generation=\d+ grant_generation=\d+ image_id=\d+ reservation_token=\d+ source_state=\d+/s,
+my $flush_error_requester_log
+	= substr(slurp_file($quad->node1->logfile),
+		$flush_error_requester_log_offset);
+my @flush_error_requester_identity
+	= $flush_error_requester_log
+		=~ /\QPCM-X finish-Flush requester boundary: local-join\E[^\r\n]*\R
+			[^\r\n]*DETAIL:[ \t]+
+			tag=(\d+)\/(\d+)\/\Q$flush_error_relfilenode\E\/0\/0
+			[ \t]+local=1[ \t]+backend=(\d+)[ \t]+procno=(\d+)
+			[ \t]+master=(\d+)[ \t]+role=1
+			[ \t]+request_id=(\d+)[ \t]+wait_seq=(\d+)
+			[ \t]+base_generation=(\d+)
+			[ \t]+tag_slot=(\d+)\/(\d+)
+			[ \t]+membership_slot=(\d+)\/(\d+)
+			[ \t]+local_round=(\d+)[^\r\n]*/x;
+my $flush_error_requester_join_present
+	= scalar(@flush_error_requester_identity) == 13;
+my ($flush_error_spc, $flush_error_db, $flush_error_backend,
+	$flush_error_procno, $flush_error_master, $flush_error_request_id,
+	$flush_error_wait_seq, $flush_error_base_generation,
+	$flush_error_tag_slot, $flush_error_tag_slot_generation,
+	$flush_error_membership_slot, $flush_error_membership_slot_generation,
+	$flush_error_local_round) = @flush_error_requester_identity;
+my $flush_error_enqueue_present = 0;
+my $flush_error_master_revoke_present = 0;
+my $flush_error_work_reserved_present = 0;
+my $flush_error_work_dequeued_present = 0;
+my $flush_error_materialized_present = 0;
+my ($flush_error_ticket, $flush_error_queue_generation,
+	$flush_error_grant_generation, $flush_error_image_id,
+	$flush_error_source_generation, $flush_error_source_worker,
+	$flush_error_reservation_token);
+if ($flush_error_requester_join_present)
+{
+	$flush_error_enqueue_present
+		= $flush_error_requester_log
+			=~ /\QPCM-X finish-Flush requester boundary: enqueue-staged\E[^\r\n]*\R
+				[^\r\n]*DETAIL:[ \t]+
+				tag=\Q$flush_error_spc\E\/\Q$flush_error_db\E\/
+					\Q$flush_error_relfilenode\E\/0\/0
+				[ \t]+local=1[ \t]+backend=\Q$flush_error_backend\E
+				[ \t]+procno=\Q$flush_error_procno\E
+				[ \t]+master=\Q$flush_error_master\E
+				[ \t]+request_id=\Q$flush_error_request_id\E
+				[ \t]+wait_seq=\Q$flush_error_wait_seq\E
+				[ \t]+base_generation=\Q$flush_error_base_generation\E
+				[ \t]+tag_slot=\Q$flush_error_tag_slot\E\/
+					\Q$flush_error_tag_slot_generation\E
+				[ \t]+membership_slot=\Q$flush_error_membership_slot\E\/
+					\Q$flush_error_membership_slot_generation\E
+				[ \t]+local_round=\Q$flush_error_local_round\E[^\r\n]*/x;
+	my @master_identity
+		= $flush_error_log
+			=~ /\QPCM-X finish-Flush master boundary: revoke-armed\E[^\r\n]*\R
+				[^\r\n]*DETAIL:[ \t]+result=\d+[ \t]+
+				tag=\Q$flush_error_spc\E\/\Q$flush_error_db\E\/
+					\Q$flush_error_relfilenode\E\/0\/0
+				[ \t]+local=\Q$flush_error_master\E[ \t]+requester=1
+				[ \t]+procno=\Q$flush_error_procno\E[ \t]+source=0
+				[ \t]+request_id=\Q$flush_error_request_id\E
+				[ \t]+ticket=(\d+)[ \t]+queue_generation=(\d+)
+				[ \t]+grant_generation=(\d+)
+				[ \t]+image_id=(\d+)[^\r\n]*/x;
+	$flush_error_master_revoke_present = scalar(@master_identity) == 4;
+	($flush_error_ticket, $flush_error_queue_generation,
+		$flush_error_grant_generation, $flush_error_image_id) = @master_identity;
+}
+if ($flush_error_master_revoke_present)
+{
+	my $source_ref_re
+		= qr/tag=\Q$flush_error_spc\E\/\Q$flush_error_db\E\/
+				\Q$flush_error_relfilenode\E\/0\/0
+			[ \t]+requester=1
+			[ \t]+backend=\Q$flush_error_backend\E
+			[ \t]+procno=\Q$flush_error_procno\E
+			[ \t]+master=\Q$flush_error_master\E
+			[ \t]+request_id=\Q$flush_error_request_id\E
+			[ \t]+ticket=\Q$flush_error_ticket\E
+			[ \t]+queue_generation=\Q$flush_error_queue_generation\E
+			[ \t]+grant_generation=\Q$flush_error_grant_generation\E/x;
+	my @reserved_identity
+		= $flush_error_log
+			=~ /\QPCM-X finish-Flush source boundary: work-reserved\E[^\r\n]*\R
+				[^\r\n]*DETAIL:[ \t]+result=\d+
+				[ \t]+worker=(\d+)[ \t]+$source_ref_re
+				[ \t]+image_id=\Q$flush_error_image_id\E
+				[ \t]+source_generation=(\d+)[^\r\n]*/x;
+	$flush_error_work_reserved_present = scalar(@reserved_identity) == 2;
+	($flush_error_source_worker, $flush_error_source_generation) = @reserved_identity
+		if $flush_error_work_reserved_present;
+	my $source_work_re
+		= qr/tag=\Q$flush_error_spc\E\/\Q$flush_error_db\E\/
+				\Q$flush_error_relfilenode\E\/0\/0
+			[ \t]+requester=1
+			[ \t]+backend=\Q$flush_error_backend\E
+			[ \t]+request_id=\Q$flush_error_request_id\E
+			[ \t]+ticket=\Q$flush_error_ticket\E
+			[ \t]+queue_generation=\Q$flush_error_queue_generation\E
+			[ \t]+grant_generation=\Q$flush_error_grant_generation\E
+			[ \t]+image_id=\Q$flush_error_image_id\E/x;
+	$flush_error_work_dequeued_present
+		= $flush_error_work_reserved_present
+			&& $flush_error_log
+			=~ /\QPCM-X finish-Flush source boundary: work\E(?!-reserved)[^\r\n]*\R
+				[^\r\n]*DETAIL:[ \t]+result=\d+
+				[ \t]+worker=\Q$flush_error_source_worker\E
+				[ \t]+$source_work_re
+				[ \t]+source_generation=\Q$flush_error_source_generation\E[^\r\n]*/x;
+	my @materialized_token
+		= $flush_error_work_reserved_present
+			? $flush_error_log
+				=~ /\QPCM-X finish-Flush source boundary: materialized\E[^\r\n]*\R
+					[^\r\n]*DETAIL:[ \t]+result=\d+
+					[ \t]+worker=\Q$flush_error_source_worker\E
+					[ \t]+$source_work_re
+					[ \t]+reservation_token=(\d+)
+					[ \t]+source_state=2[^\r\n]*/x
+			: ();
+	$flush_error_materialized_present = scalar(@materialized_token) == 1;
+	$flush_error_reservation_token = $materialized_token[0]
+		if $flush_error_materialized_present;
+}
+my $flush_error_first_missing
+	= !$flush_error_requester_join_present ? 'requester-local-join'
+	: !$flush_error_enqueue_present ? 'requester-enqueue-staged'
+	: !$flush_error_master_revoke_present ? 'master-revoke-armed'
+	: !$flush_error_work_reserved_present ? 'source-work-reserved'
+	: !$flush_error_work_dequeued_present ? 'source-work-dequeued'
+	: !$flush_error_materialized_present ? 'source-materialized'
+	: 'none';
+is($flush_error_first_missing, 'none',
+	'L5F same-request chain reached source MATERIALIZED_UNCOMMITTED')
+	or diag("L5F_PRODUCER_UNREACHABLE first_missing=$flush_error_first_missing "
+		. "request_id="
+		. (defined($flush_error_request_id) ? $flush_error_request_id : '<none>')
+		. " ticket=" . (defined($flush_error_ticket) ? $flush_error_ticket : '<none>'));
+ok($flush_error_requester_join_present
+		&& defined($flush_error_master) && $flush_error_master == 0,
+	'L5F exact target resolved to the expected static master node0');
+my $flush_error_exact_evidence_re
+	= $flush_error_materialized_present
+		? qr/\QPCM-X finish-error evidence exact\E[^\r\n]*\R
+				[^\r\n]*DETAIL:[ \t]+preserve_result=12[ \t]+retained=true
+				[ \t]+worker=\Q$flush_error_source_worker\E
+				[ \t]+tag=\Q$flush_error_spc\E\/\Q$flush_error_db\E\/
+					\Q$flush_error_relfilenode\E\/0\/0
+				[ \t]+requester=1[ \t]+backend=\Q$flush_error_backend\E
+				[ \t]+request_id=\Q$flush_error_request_id\E
+				[ \t]+ticket=\Q$flush_error_ticket\E
+				[ \t]+queue_generation=\Q$flush_error_queue_generation\E
+				[ \t]+grant_generation=\Q$flush_error_grant_generation\E
+				[ \t]+image_id=\Q$flush_error_image_id\E
+				[ \t]+reservation_token=\Q$flush_error_reservation_token\E
+				[ \t]+source_state=2[ \t]+sqlstate=58030[^\r\n]*/x
+		: qr/(?!)/;
+my ($flush_error_exact_evidence_record)
+	= $flush_error_log =~ /($flush_error_exact_evidence_re)/;
+my $flush_error_exact_evidence_present
+	= defined($flush_error_exact_evidence_record);
+ok($flush_error_exact_evidence_present,
 	'L5F exact immutable A-record remains retained after ERROR');
-is(state_int($quad->node0, 'gcs', 'dedup_pcm_x_release_count'),
-	$flush_error_release_before,
-	'L5F ERROR did not release immutable evidence or its REVOKING fence');
-like($flush_error_log,
-	qr/injected PCM-X retained-image FlushBuffer failure/,
-	'L5F exact pre-smgrwrite finish FlushBuffer ERROR reached the DATA worker');
-like($flush_error_log,
-	qr/cluster PCM-X runtime fail-closed \(recovery blocked\)/,
+my $flush_error_aba_record = $flush_error_exact_evidence_record // '';
+if ($flush_error_exact_evidence_present)
+{
+	my $wrong_worker = $flush_error_source_worker + 1;
+	my $wrong_token = $flush_error_reservation_token + 1;
+	$flush_error_aba_record
+		=~ s/worker=\Q$flush_error_source_worker\E/worker=$wrong_worker/;
+	$flush_error_aba_record
+		=~ s/reservation_token=\Q$flush_error_reservation_token\E/reservation_token=$wrong_token/;
+}
+ok($flush_error_exact_evidence_present
+		&& $flush_error_aba_record !~ $flush_error_exact_evidence_re,
+	'L5F exact evidence oracle rejects a different worker/reservation token ABA');
+my $flush_error_domain_confused_record
+	= $flush_error_exact_evidence_record // '';
+if ($flush_error_exact_evidence_present)
+{
+	$flush_error_domain_confused_record
+		=~ s/backend=\Q$flush_error_backend\E/backend=$flush_error_procno/;
+}
+ok($flush_error_exact_evidence_present
+		&& defined($flush_error_backend)
+		&& defined($flush_error_procno)
+		&& $flush_error_backend != $flush_error_procno
+		&& $flush_error_domain_confused_record !~ $flush_error_exact_evidence_re,
+	'L5F exact evidence oracle rejects BackendId/ProcNumber domain confusion');
+my $flush_error_wrong_image_record
+	= $flush_error_exact_evidence_record // '';
+if ($flush_error_exact_evidence_present)
+{
+	my $wrong_image_id = $flush_error_image_id + 1;
+	$flush_error_wrong_image_record
+		=~ s/image_id=\Q$flush_error_image_id\E/image_id=$wrong_image_id/;
+}
+ok($flush_error_exact_evidence_present
+		&& $flush_error_wrong_image_record !~ $flush_error_exact_evidence_re,
+	'L5F exact evidence oracle rejects a different master-minted image id');
+my $flush_error_release_after = state_int($quad->node0, 'gcs',
+	'dedup_pcm_x_release_count');
+ok($flush_error_exact_evidence_present
+		&& $flush_error_release_after == $flush_error_release_before,
+	'L5F exact retained A-record was not released after ERROR')
+	or diag("L5F evidence_present=$flush_error_exact_evidence_present "
+		. "release_before=$flush_error_release_before "
+		. "release_after=$flush_error_release_after");
+my $flush_error_injected_catch_present
+	= $flush_error_log
+		=~ /cluster PCM-X retained-image finish FlushBuffer failed; preserved immutable evidence and blocked recovery: sqlstate=58030 message=injected PCM-X retained-image FlushBuffer failure/;
+ok($flush_error_injected_catch_present,
+	'L5F exact pre-smgrwrite 58030 I/O ERROR reached the source DATA-worker catch');
+my $flush_error_fuse_log_present
+	= $flush_error_log
+		=~ /cluster PCM-X runtime fail-closed \(recovery blocked\)/;
+ok($flush_error_fuse_log_present,
 	'L5F GCS finish catch preserved evidence and fused the runtime');
+ok($flush_error_requester_timed_out
+		&& $flush_error_stage_delta > 0
+		&& $flush_error_first_missing eq 'none'
+		&& $flush_error_exact_evidence_present
+		&& $flush_error_backend != $flush_error_procno
+		&& $flush_error_injected_catch_present
+		&& $flush_error_fuse_log_present
+		&& $flush_error_runtime_after == 0
+		&& $flush_error_blocked_after > $flush_error_blocked_before,
+	'L5F composite fault oracle rejects an ordinary requester timeout');
 
 $quad->stop_quad;
 my $flush_error_shutdown_log = substr(slurp_file($quad->node0->logfile),

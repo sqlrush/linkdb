@@ -34,6 +34,130 @@
  * becomes a transaction ERROR merely because RETIRE owns the short gate. */
 #define CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS 5
 
+typedef enum ClusterBufmgrPcmXRetryWaitOutcome {
+	CLUSTER_BUFMGR_PCM_X_RETRY_READY = 0,
+	CLUSTER_BUFMGR_PCM_X_RETRY_BARRIER_REFUSED,
+	CLUSTER_BUFMGR_PCM_X_RETRY_FAIL_CLOSED
+} ClusterBufmgrPcmXRetryWaitOutcome;
+
+typedef enum ClusterBufmgrPcmXLedgerIntent {
+	CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP = 0,
+	CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REUSE
+} ClusterBufmgrPcmXLedgerIntent;
+
+typedef enum ClusterBufmgrPcmXLedgerOutcome {
+	CLUSTER_BUFMGR_PCM_X_LEDGER_COMPLETE = 0,
+	CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP_DEFERRED,
+	CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED
+} ClusterBufmgrPcmXLedgerOutcome;
+
+/*
+ * A holder-ledger barrier can race three distinct acquire outcomes while the
+ * exact GRANT_PENDING token is still live:
+ *
+ *   - a durable S/X grant owes one master release before retry;
+ *   - a one-shot S READ_IMAGE owns no grant and must retry without release;
+ *   - X/no-grant (or any missing/invalid identity) is contradictory and must
+ *     fail closed without mutating the pending evidence.
+ *
+ * Keep this classifier scalar-only.  The caller retains sole ownership of the
+ * pending snapshot/token and of interrupt holdoff state.
+ */
+typedef enum ClusterPcmXPendingHolderBarrierAction {
+	CLUSTER_PCM_X_PENDING_HOLDER_RELEASE_RETRY = 0,
+	CLUSTER_PCM_X_PENDING_HOLDER_READ_IMAGE_RETRY,
+	CLUSTER_PCM_X_PENDING_HOLDER_FAIL_CLOSED
+} ClusterPcmXPendingHolderBarrierAction;
+
+static inline ClusterPcmXPendingHolderBarrierAction
+cluster_pcm_x_pending_holder_barrier_action(uint8 pcm_mode, bool acquired,
+											bool pending_set)
+{
+	if (!pending_set)
+		return CLUSTER_PCM_X_PENDING_HOLDER_FAIL_CLOSED;
+	if (acquired)
+		return (pcm_mode == (uint8) PCM_STATE_S
+				|| pcm_mode == (uint8) PCM_STATE_X)
+				   ? CLUSTER_PCM_X_PENDING_HOLDER_RELEASE_RETRY
+				   : CLUSTER_PCM_X_PENDING_HOLDER_FAIL_CLOSED;
+	return pcm_mode == (uint8) PCM_STATE_S
+			   ? CLUSTER_PCM_X_PENDING_HOLDER_READ_IMAGE_RETRY
+			   : CLUSTER_PCM_X_PENDING_HOLDER_FAIL_CLOSED;
+}
+
+typedef struct ClusterBufmgrPcmXLedgerCounts {
+	uint32 holder_live;
+	uint32 holder_deferred;
+	uint32 writer_live;
+	uint32 writer_deferred;
+} ClusterBufmgrPcmXLedgerCounts;
+
+typedef enum ClusterBufmgrPcmXBarrierLane {
+	CLUSTER_BUFMGR_PCM_X_BARRIER_LANE_NONE = 0,
+	CLUSTER_BUFMGR_PCM_X_BARRIER_LANE_HOLDER,
+	CLUSTER_BUFMGR_PCM_X_BARRIER_LANE_WRITER
+} ClusterBufmgrPcmXBarrierLane;
+
+/*
+ * Read-only process-local trace of the exact ledger evidence selected by the
+ * P0-08 retry-barrier injection.  Slot references and request identity are
+ * included so a TAP consumer can prove that HIT -> DEFERRED -> UNUSED names
+ * one object, rather than three same-tag lifecycles.
+ */
+typedef struct ClusterBufmgrPcmXBarrierEvidence {
+	bool valid;
+	ClusterBufmgrPcmXBarrierLane lane;
+	int32 buffer_id;
+	BufferTag tag;
+	uint64 request_id;
+	uint64 wait_seq;
+	uint64 base_own_generation;
+	PcmXSlotRef tag_slot;
+	PcmXSlotRef evidence_slot;
+	uint64 claim_generation;
+	uint32 local_round;
+} ClusterBufmgrPcmXBarrierEvidence;
+
+typedef struct ClusterBufmgrPcmXBarrierDebugSnapshot {
+	bool target_valid;
+	BufferTag target;
+	ClusterBufmgrPcmXBarrierLane target_lane;
+	ClusterBufmgrPcmXBarrierEvidence hit;
+	ClusterBufmgrPcmXBarrierEvidence deferred;
+	ClusterBufmgrPcmXBarrierEvidence unused;
+	uint64 non_target_ignored_count;
+	uint32 holder_live_high_water;
+	uint32 writer_live_high_water;
+} ClusterBufmgrPcmXBarrierDebugSnapshot;
+
+/* Exact selector contract: same fork/block is insufficient when another
+ * relation's terminal operation runs first in the same backend. */
+static inline bool
+cluster_pcm_x_retry_barrier_target_matches(const BufferTag *target,
+										   const BufferTag *candidate)
+{
+	return target != NULL && candidate != NULL
+		   && BufferTagsEqual(target, candidate);
+}
+
+static inline ClusterBufmgrPcmXRetryWaitOutcome
+cluster_pcm_x_retry_wait_classify(PcmXQueueResult result)
+{
+	if (result == PCM_X_QUEUE_OK)
+		return CLUSTER_BUFMGR_PCM_X_RETRY_READY;
+	if (result == PCM_X_QUEUE_BARRIER_CLOSED)
+		return CLUSTER_BUFMGR_PCM_X_RETRY_BARRIER_REFUSED;
+	return CLUSTER_BUFMGR_PCM_X_RETRY_FAIL_CLOSED;
+}
+
+static inline ClusterBufmgrPcmXLedgerOutcome
+cluster_pcm_x_barrier_ledger_outcome(ClusterBufmgrPcmXLedgerIntent intent)
+{
+	return intent == CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP
+			   ? CLUSTER_BUFMGR_PCM_X_LEDGER_CLEANUP_DEFERRED
+			   : CLUSTER_BUFMGR_PCM_X_LEDGER_PREPARE_REFUSED;
+}
+
 /* FSM pages are advisory and may be consumed without a content lock, so they
  * are outside PCM/PCM-X ownership.  Every other fork keeps the relation-level
  * user/shared-catalog tracking policy. */
@@ -402,6 +526,10 @@ cluster_pcm_own_eviction_reuse_allowed(const ClusterPcmOwnEvictionCapture *captu
 
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf,
 														   ClusterPcmOwnSnapshot *out_snapshot);
+/* Current-backend, read-only ledger observability for cluster_dump_state. */
+extern void cluster_bufmgr_pcm_x_ledger_counts(ClusterBufmgrPcmXLedgerCounts *out);
+extern void cluster_bufmgr_pcm_x_retry_barrier_debug_snapshot(
+	ClusterBufmgrPcmXBarrierDebugSnapshot *out);
 /* Resolve one resident descriptor and snapshot its ownership tuple while the
  * mapping partition and buffer header still bind the same BufferTag.  The
  * returned buffer id is only a locator; every later lifecycle call rechecks

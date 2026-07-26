@@ -8,17 +8,17 @@
  *	  is retransmitted by the sender (after timeout, eager wake, or epoch
  *	  stale retry), the master-side handler can return the cached reply
  *	  without re-flushing WAL or re-copying the page (HC99).  The HTAB
- *	  uses a 4-tuple key {origin_node, requester_backend_id, request_id,
- *	  cluster_epoch} (HC90), with entry value containing the full reply
+ *	  uses a restart-bound 5-tuple key {origin_node, requester_backend_id,
+ *	  request_id, cluster_epoch, origin_boot_incarnation} (HC90), with entry value containing the full reply
  *	  payload plus tag + transition_id for collision validation (HC91).
  *
  *	  Key safety properties:
- *	    HC90  4-tuple key; LMON-owned shmem region; built-in tranche
+ *	    HC90  restart-bound 5-tuple key; LMON-owned shmem region
  *	    HC91  duplicate hit must validate entry.tag == req.tag &&
  *	          entry.transition_id == req.transition_id; mismatch →
  *	          DENIED_VALIDATOR_REJECT + dedup_collision_count++
- *	    HC92  fixed-size sizeof(GcsBlockDedupEntry) == 8448B (PG dynahash
- *	          cap × 8.5KB master memory ceiling; default 1024 → 8.5MB on
+ *	    HC92  fixed-size sizeof(GcsBlockDedupEntry) == 8520B (PG dynahash
+ *	          cap × 8.5KB master memory ceiling; default 16384 → ~139MB on
  *	          configured cluster nodes; bootstrap/initdb with node_id=-1
  *	          does not allocate the HTAB)
  *	    HC93  TTL sweep (completed_at_ts + registered_at_ts) + local
@@ -56,13 +56,14 @@
 #ifdef USE_PGRAC_CLUSTER
 
 /* ============================================================
- * GcsBlockDedupKey — 4-tuple key (HC90; 24B).
+ * GcsBlockDedupKey — restart-bound 5-tuple key (HC90; 32B).
  *
  *	Layout:
  *	  [ 0,  4) origin_node_id           uint32
  *	  [ 4,  8) requester_backend_id     int32
  *	  [ 8, 16) request_id               uint64
  *	  [16, 24) cluster_epoch            uint64
+ *	  [24, 32) origin_boot_incarnation  uint64
  *
  *	Routing-wise the 4-tuple is sufficient.  Tag/transition collision
  *	protection lives in the entry value (HC91), not the key — keeps key
@@ -74,35 +75,36 @@ typedef struct GcsBlockDedupKey {
 	int32 requester_backend_id;
 	uint64 request_id;
 	uint64 cluster_epoch;
+	uint64 origin_boot_incarnation;
 } GcsBlockDedupKey;
 
-StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 24B "
-												 "(origin 4 + backend 4 + req 8 + epoch 8)");
+StaticAssertDecl(sizeof(GcsBlockDedupKey) == 32, "S3-P0-18 GcsBlockDedupKey 32B "
+												 "(origin 4 + backend 4 + req 8 + epoch 8 + boot 8)");
 
 
 /* ============================================================
- * GcsBlockDedupEntry — fixed-size HTAB entry (HC92 + HC99; 8472B).
+ * GcsBlockDedupEntry — fixed-size HTAB entry (HC92 + HC99; 8520B).
  *
  *	Layout (offsets explicit so alignment review is mechanical):
- *	  [    0,    24) key                 GcsBlockDedupKey (24B)
- *	  [   24,    44) tag                 BufferTag (20B)         HC91
- *	  [   44,    45) transition_id       uint8                   HC91
- *	  [   45,    46) status              uint8 (GcsBlockReplyStatus)
- *	  [   46,    47) entry_kind          uint8
- *	  [   47,    48) _pad0               explicit pad to 8-align
- *	  [   48,    56) pcm_x_master_session uint64 (PCM-X kind only)
- *	  [   56,   104) reply_header        GcsBlockReplyHeader (48B)
- *	  [  104,   105) has_sf_dep          bool                    spec-6.2
- *	  [  105,   106) sf_flags            uint8                   spec-6.2
- *	  [  106,   107) sf_dep_count        uint8                   spec-6.2
- *	  [  107,   112) _pad1[5]            explicit pad to 8-align
- *	  [  112,   240) payload_meta        sf_dep_vec or PCM-X identity
- *	  [  240,  8432) block_data          char[GCS_BLOCK_DATA_SIZE]
- *	  [ 8432,  8440) completed_at_ts     TimestampTz (TTL sweep — replied)
- *	  [ 8440,  8448) registered_at_ts    TimestampTz (TTL sweep — in-flight)
- *	  [ 8448,  8456) done_at_ts          TimestampTz (round-2 DONE proof)
- *	  [ 8456,  8464) pinned_lifetime_us  int64 (round-2 pinned TTL)
- *	  [ 8464,  8472) pinned_done_linger_us int64 (round-2 pinned quarantine)
+ *	  [    0,    32) key                 GcsBlockDedupKey (32B)
+ *	  [   32,    52) tag                 BufferTag (20B)         HC91
+ *	  [   52,    53) transition_id       uint8                   HC91
+ *	  [   53,    54) status              uint8 (GcsBlockReplyStatus)
+ *	  [   54,    55) entry_kind          uint8
+ *	  [   55,    56) request_flags       uint8
+ *	  [   56,    64) pcm_x_master_session uint64 (PCM-X kind only)
+ *	  [   64,   112) reply_header        GcsBlockReplyHeader (48B)
+ *	  [  112,   113) has_sf_dep          bool                    spec-6.2
+ *	  [  113,   114) sf_flags            uint8                   spec-6.2
+ *	  [  114,   115) sf_dep_count        uint8                   spec-6.2
+ *	  [  115,   120) _pad1[5]            explicit pad to 8-align
+ *	  [  120,   288) payload_meta        sf_dep_vec, PCM-X, or FORWARD marker
+ *	  [  288,  8480) block_data          char[GCS_BLOCK_DATA_SIZE]
+ *	  [ 8480,  8488) completed_at_ts     TimestampTz (TTL sweep — replied)
+ *	  [ 8488,  8496) registered_at_ts    TimestampTz (TTL sweep — in-flight)
+ *	  [ 8496,  8504) done_at_ts          TimestampTz (round-2 DONE proof)
+ *	  [ 8504,  8512) pinned_lifetime_us  int64 (round-2 pinned TTL)
+ *	  [ 8512,  8520) pinned_done_linger_us int64 (round-2 pinned quarantine)
  *
  *	reply_header lands at offset 56 = 8 × 7, satisfying the 8-byte
  *	alignment required by reply_header.request_id (uint64).  block_data
@@ -134,8 +136,8 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
  *	                        suppresses type-50 resends until exact type 49
  *	                        clears it.  It is never application completion;
  *	                        exact DRAIN publishes a replay tombstone; exact
- *	                        RETIRE removes it, and all
- generic reclaim paths *	                        reject non-GENERIC kinds.
+ *	                        RETIRE removes it, and all generic reclaim paths
+ *	                        reject non-GENERIC kinds.
  *	  pinned_lifetime_us    the legal-request-lifetime threshold, pinned
  *	                        at REGISTRATION from the requester's wire
  *	                        hint (2x margin applied) or, absent a hint,
@@ -156,19 +158,89 @@ typedef enum GcsBlockDedupEntryKind {
 	GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED = 3,
 	/* Exact descriptor/byte cleanup completed after local TERMINAL_DRAINED.
 	 * Keep the binding as an ACK replay tombstone until exact RETIRE. */
-	GCS_BLOCK_DEDUP_ENTRY_PCM_X_DRAINED = 4
+	GCS_BLOCK_DEDUP_ENTRY_PCM_X_DRAINED = 4,
+	/* Holder-local negative fence for one type-65 stale-X attempt.  Non-
+	 * GENERIC makes every legacy TTL/backend/node cleanup path retain it. */
+	GCS_BLOCK_DEDUP_ENTRY_STALE_X_HOLDER_FENCE = 5,
+	/* Holder-local transient tombstone between exact CANCEL ingress and
+	 * admission of its ordered barrier onto holder->requester DATA. */
+	GCS_BLOCK_DEDUP_ENTRY_FORWARD_CANCEL_HOLDER = 6
 } GcsBlockDedupEntryKind;
+
+typedef enum GcsBlockForwardMarkerPhase {
+	GCS_BLOCK_FORWARD_MARK_NONE = 0,
+	/* Complete marker bytes exist, but duplicate lookup must still report
+	 * IN_FLIGHT until the authority/watermark revalidation succeeds. */
+	GCS_BLOCK_FORWARD_MARK_PREPARED = 1,
+	/* One sender owns the exact marker.  Duplicate lookup remains IN_FLIGHT
+	 * until the owner publishes the transport outcome. */
+	GCS_BLOCK_FORWARD_MARK_SEND_ARMED = 2,
+	GCS_BLOCK_FORWARD_MARK_FORWARDED = 3,
+	GCS_BLOCK_FORWARD_MARK_HOLDER_MISS_PENDING = 4,
+	GCS_BLOCK_FORWARD_MARK_HOLDER_FENCE_ACKED = 5,
+	GCS_BLOCK_FORWARD_MARK_COMMITTED = 6,
+	GCS_BLOCK_FORWARD_MARK_KEEP_FENCED = 7,
+	GCS_BLOCK_FORWARD_MARK_COMMIT_ACKED = 8,
+	GCS_BLOCK_FORWARD_MARK_RETIRE_ARMED = 9,
+	/* Queue-kind X has atomically revoked this marker's re-forward right,
+	 * but holder stream + requester slot quiescence are not yet proven. */
+	GCS_BLOCK_FORWARD_MARK_CANCELLING = 10,
+	/* Reserved terminal proof phase.  V1 installs the denial in the same
+	 * locked ACK transition, so readers do not observe this phase. */
+	GCS_BLOCK_FORWARD_MARK_CANCEL_FENCED = 11
+} GcsBlockForwardMarkerPhase;
+
+/*
+ * Master-local forward authority marker.  The complete 64-bit authority
+ * generation deliberately lives here, not in the exhausted 64-byte legacy
+ * FORWARD wire.  Preserve the complete canonical FORWARD bytes as the other
+ * half of the cell: replay must not resample epoch/GUC-derived control flags.
+ * Capability-on markers also pin all three boot incarnations, the relation
+ * lifecycle generation, and the holder's admitted capability generation.
+ * A legacy marker stores the all-zero identity.  The phase lives in
+ * GcsBlockDedupEntry.sf_flags.
+ */
+typedef struct GcsBlockForwardBootIdentity {
+	uint64 requester_incarnation;
+	uint64 master_incarnation;
+	uint64 holder_incarnation;
+	uint64 relation_generation;
+	uint32 capability_generation;
+	uint8 reserved[4];
+} GcsBlockForwardBootIdentity;
+
+StaticAssertDecl(sizeof(GcsBlockForwardBootIdentity) == 40,
+				 "forward boot/capability/relation identity is a fixed 40-byte cell");
+
+typedef struct GcsBlockForwardMarker {
+	PcmAuthoritySnapshot authority; /* 64B exact entry-lock snapshot */
+	GcsBlockForwardPayload forward; /* 64B byte-exact canonical send intent */
+	GcsBlockForwardBootIdentity boot_identity; /* 40B admitted boot/cap/relation tuple */
+} GcsBlockForwardMarker;
+
+StaticAssertDecl(sizeof(GcsBlockForwardMarker) == 168,
+				 "forward marker is authority + canonical wire + boot identity");
+StaticAssertDecl(offsetof(GcsBlockForwardMarker, forward) == 64,
+				 "canonical forward bytes immediately follow full authority");
+StaticAssertDecl(offsetof(GcsBlockForwardMarker, boot_identity) == 128,
+				 "boot identity immediately follows canonical forward bytes");
+
+#define GCS_BLOCK_DEDUP_FORWARD_MARKER_FLAG UINT8_C(0x80)
+#define GCS_BLOCK_DEDUP_FORWARD_PHASE_MASK UINT8_C(0x0f)
 
 typedef union GcsBlockDedupPayloadMeta {
 	ClusterSfDepVec sf_dep_vec;
 	GcsBlockPcmXImageIdentity pcm_x_identity;
+	GcsBlockForwardMarker forward_marker;
+	GcsStaleXCertPayload stale_x_cert;
+	GcsBlockForwardCancelPayload forward_cancel;
 } GcsBlockDedupPayloadMeta;
 
-StaticAssertDecl(sizeof(GcsBlockDedupPayloadMeta) == 128,
-				 "dedup payload metadata remains the established 128-byte cell");
+StaticAssertDecl(sizeof(GcsBlockDedupPayloadMeta) == 168,
+				 "dedup payload metadata includes the 168-byte forward marker");
 
 typedef struct GcsBlockDedupEntry {
-	GcsBlockDedupKey key;				   /* 24B — HTAB key */
+	GcsBlockDedupKey key;				   /* 32B — HTAB key */
 	BufferTag tag;						   /* 20B — HC91 collision check */
 	uint8 transition_id;				   /*  1B — HC91 collision check */
 	uint8 status;						   /*  1B — GcsBlockReplyStatus */
@@ -181,7 +253,7 @@ typedef struct GcsBlockDedupEntry {
 	uint8 sf_flags;						   /*  1B — metadata cell overlays the */
 	uint8 sf_dep_count;					   /*  1B — exact reservation token */
 	uint8 _pad1[5];						   /*  5B — dep_vec @ 112 */
-	GcsBlockDedupPayloadMeta payload_meta; /* 128B — deps or exact PCM-X identity */
+	GcsBlockDedupPayloadMeta payload_meta; /* 168B — deps, PCM-X, or FORWARD marker */
 	char block_data[GCS_BLOCK_DATA_SIZE];  /* 8192B — full page payload */
 	TimestampTz completed_at_ts;		   /*  8B — TTL sweep replied */
 	TimestampTz registered_at_ts;		   /*  8B — TTL sweep in-flight */
@@ -194,16 +266,39 @@ typedef struct GcsBlockDedupEntry {
 #define GCS_BLOCK_DEDUP_REQUEST_F_VALID_MASK GCS_BLOCK_DEDUP_REQUEST_F_DIRECT_LAND
 #define GCS_BLOCK_DEDUP_REQUEST_F_PINNED UINT8_C(0x80)
 
-StaticAssertDecl(offsetof(GcsBlockDedupEntry, entry_kind) == 46,
-				 "dedup entry kind occupies established padding at offset 46");
-StaticAssertDecl(offsetof(GcsBlockDedupEntry, pcm_x_master_session) == 48,
-				 "PCM-X master session occupies established padding at offset 48");
-StaticAssertDecl(offsetof(GcsBlockDedupEntry, reply_header) == 56,
-				 "dedup reply header offset remains 56");
-StaticAssertDecl(offsetof(GcsBlockDedupEntry, payload_meta) == 112,
-				 "dedup payload metadata offset remains 112");
-StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8472,
-				 "GcsBlockDedupEntry 8472B (8448 spec-6.2 + 24 round-2 DONE lifecycle)");
+StaticAssertDecl(offsetof(GcsBlockDedupEntry, entry_kind) == 54,
+				 "boot-bound dedup entry kind offset is 54");
+StaticAssertDecl(offsetof(GcsBlockDedupEntry, pcm_x_master_session) == 56,
+				 "boot-bound PCM-X master session offset is 56");
+StaticAssertDecl(offsetof(GcsBlockDedupEntry, reply_header) == 64,
+				 "boot-bound dedup reply header offset is 64");
+StaticAssertDecl(offsetof(GcsBlockDedupEntry, payload_meta) == 120,
+				 "boot-bound dedup payload metadata offset is 120");
+StaticAssertDecl(offsetof(GcsBlockDedupEntry, block_data) == 288,
+				 "dedup block bytes follow the expanded forward marker cell");
+
+static inline GcsBlockForwardMarkerPhase
+GcsBlockDedupEntryForwardMarkerPhase(const GcsBlockDedupEntry *entry)
+{
+	uint8 phase;
+
+	if (entry == NULL || (entry->sf_flags & GCS_BLOCK_DEDUP_FORWARD_MARKER_FLAG) == 0)
+		return GCS_BLOCK_FORWARD_MARK_NONE;
+	phase = entry->sf_flags & GCS_BLOCK_DEDUP_FORWARD_PHASE_MASK;
+	if (phase < (uint8)GCS_BLOCK_FORWARD_MARK_PREPARED
+		|| phase > (uint8)GCS_BLOCK_FORWARD_MARK_CANCEL_FENCED)
+		return GCS_BLOCK_FORWARD_MARK_NONE;
+	return (GcsBlockForwardMarkerPhase)phase;
+}
+
+static inline bool
+GcsBlockDedupEntryHasForwardMarker(const GcsBlockDedupEntry *entry)
+{
+	return entry != NULL
+		   && (entry->sf_flags & GCS_BLOCK_DEDUP_FORWARD_MARKER_FLAG) != 0;
+}
+StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8520,
+				 "S3-P0-18 GcsBlockDedupEntry 8520B with boot-bound key");
 
 typedef enum GcsBlockPcmXImageResult {
 	GCS_BLOCK_PCM_X_IMAGE_RESERVED = 0,
@@ -236,7 +331,7 @@ typedef struct GcsBlockPcmXImageWork {
 	uint8 _reserved[2];
 } GcsBlockPcmXImageWork;
 
-StaticAssertDecl(sizeof(GcsBlockPcmXImageWork) == 200,
+StaticAssertDecl(sizeof(GcsBlockPcmXImageWork) == 208,
 				 "PCM-X LMS work descriptor includes the exact source floor binding");
 
 
@@ -284,6 +379,10 @@ typedef enum GcsBlockDedupResult {
 												* requests for the same X tag
 												* fall through to retransmit
 												* path rather than re-broadcast. */
+	/* Exact DONE proof already terminated a forward marker.  The requester
+	 * may have retransmitted before observing its local completion; drop it
+	 * silently rather than re-forwarding a completed round. */
+	GCS_BLOCK_DEDUP_DONE_DUPLICATE = 7,
 } GcsBlockDedupResult;
 
 /* Result of advancing the exact legacy-reader termination set after a
@@ -294,8 +393,191 @@ typedef enum GcsBlockPendingXDenyResult {
 	GCS_BLOCK_PENDING_X_DENY_INVALID = -1,
 	GCS_BLOCK_PENDING_X_DENY_NOT_FOUND = 0,
 	GCS_BLOCK_PENDING_X_DENY_NEW = 1,
-	GCS_BLOCK_PENDING_X_DENY_REPLAY = 2
+	GCS_BLOCK_PENDING_X_DENY_REPLAY = 2,
+	/* A canonical forward authority record owns this legacy-S identity.
+	 * Queue arbitration must wait for its exact DONE/certificate transition;
+	 * it may neither overwrite the marker nor classify the overlap as shared
+	 * memory corruption. */
+	GCS_BLOCK_PENDING_X_DENY_FORWARD_BLOCKED = 3,
+	GCS_BLOCK_PENDING_X_DENY_FORWARD_CANCEL_NEW = 4,
+	GCS_BLOCK_PENDING_X_DENY_FORWARD_CANCEL_REPLAY = 5
 } GcsBlockPendingXDenyResult;
+
+typedef enum GcsBlockForwardMarkResult {
+	GCS_BLOCK_FORWARD_MARK_INVALID = -1,
+	GCS_BLOCK_FORWARD_MARK_NOT_FOUND = 0,
+	GCS_BLOCK_FORWARD_MARK_INSTALLED = 1,
+	GCS_BLOCK_FORWARD_MARK_REPLAY = 2,
+	GCS_BLOCK_FORWARD_MARK_STALE = 3,
+	GCS_BLOCK_FORWARD_MARK_BUSY = 4,
+	GCS_BLOCK_FORWARD_MARK_DONE = 5
+} GcsBlockForwardMarkResult;
+
+typedef enum GcsStaleXFenceResult {
+	GCS_STALE_X_FENCE_INVALID = -1,
+	GCS_STALE_X_FENCE_NOT_FOUND = 0,
+	GCS_STALE_X_FENCE_INSTALLED = 1,
+	GCS_STALE_X_FENCE_REPLAY = 2,
+	GCS_STALE_X_FENCE_STALE = 3,
+	GCS_STALE_X_FENCE_FULL = 4,
+	GCS_STALE_X_FENCE_COMMITTED = 5,
+	GCS_STALE_X_FENCE_RETIRED = 6
+} GcsStaleXFenceResult;
+
+typedef enum GcsBlockForwardCancelResult {
+	GCS_FORWARD_CANCEL_INVALID = -1,
+	GCS_FORWARD_CANCEL_NOT_FOUND = 0,
+	GCS_FORWARD_CANCEL_INSTALLED = 1,
+	GCS_FORWARD_CANCEL_REPLAY = 2,
+	GCS_FORWARD_CANCEL_STALE = 3,
+	GCS_FORWARD_CANCEL_FULL = 4
+} GcsBlockForwardCancelResult;
+
+typedef enum GcsStaleXReleaseState {
+	GCS_STALE_X_RELEASE_RESERVED = 1,
+	GCS_STALE_X_RELEASE_SEALED = 2,
+	GCS_STALE_X_RELEASE_COMMITTING = 3,
+	GCS_STALE_X_RELEASE_RELEASED = 4
+} GcsStaleXReleaseState;
+
+typedef enum GcsStaleXReleaseResult {
+	GCS_STALE_X_RELEASE_INVALID = -1,
+	GCS_STALE_X_RELEASE_NOT_FOUND = 0,
+	GCS_STALE_X_RELEASE_INSTALLED = 1,
+	GCS_STALE_X_RELEASE_REPLAY = 2,
+	GCS_STALE_X_RELEASE_STALE = 3,
+	GCS_STALE_X_RELEASE_FULL = 4
+} GcsStaleXReleaseResult;
+
+/*
+ * One holder residency/release identity.  BufferTag alone is never an ABA
+ * fence: source_buf_id distinguishes descriptors, ownership generation
+ * distinguishes reuse of one descriptor, durability generation distinguishes
+ * a redirty of the same residency, and holder incarnation fences postmaster
+ * restart.  release_cert_nonce is monotonic only within holder incarnation.
+ */
+typedef struct GcsStaleXReleaseKey {
+	BufferTag tag;
+	int32 source_buf_id;
+	uint32 durability_generation;
+	uint64 source_own_generation;
+	uint64 holder_incarnation;
+	uint64 release_cert_nonce;
+} GcsStaleXReleaseKey;
+
+StaticAssertDecl(sizeof(GcsStaleXReleaseKey) == 56,
+				 "stale-X release key is a fixed 56-byte residency identity");
+
+/*
+ * Holder-local crash journal.  Visibility is a state-machine contract:
+ * RESERVED/SEALED/COMMITTING are never reportable; only RELEASED means the
+ * mapping was deleted and X authority became locally unreachable while the
+ * mapping partition remained exclusive.  A normal exact master release ACK
+ * forgets the record; a crash before ACK leaves RELEASED evidence for type65.
+ */
+typedef struct GcsStaleXReleaseRecord {
+	GcsStaleXReleaseKey key;
+	uint64 release_epoch;
+	uint64 relation_generation;
+	uint64 master_incarnation;
+	uint64 checkpoint_seal_id;
+	uint64 result_own_generation;
+	SCN final_page_scn;
+	SCN durable_page_scn;
+	int32 master_node;
+	int32 holder_node;
+	uint8 state;
+	uint8 reserved[7];
+} GcsStaleXReleaseRecord;
+
+StaticAssertDecl(sizeof(GcsStaleXReleaseRecord) == 128,
+				 "stale-X release journal includes the relation lifecycle fence");
+
+/*
+ * Holder-local eviction gate.  This record exists for every authenticated
+ * remote-X/type65 release.  It is reserved before the ownership commit and
+ * remains visible until the exact saved-tag release ACK, so a same-tag
+ * mapping or a reuse of source_buf_id cannot cross the unresolved X->N
+ * boundary.
+ *
+ * The key deliberately repeats the complete residency identity used by the
+ * type65 journal.  Both peer incarnations and the capability generation are
+ * therefore mandatory for a valid record.
+ */
+typedef enum GcsBlockEvictionGateState {
+	GCS_BLOCK_EVICTION_GATE_COMMITTING = 1,
+	GCS_BLOCK_EVICTION_GATE_RELEASED = 2
+} GcsBlockEvictionGateState;
+
+typedef struct GcsBlockEvictionGateRecord {
+	GcsStaleXReleaseKey key;
+	uint64 release_epoch;
+	uint64 relation_generation;
+	uint64 master_incarnation;
+	uint64 result_own_generation;
+	int32 master_node;
+	int32 holder_node;
+	uint32 capability_generation;
+	uint8 old_pcm_mode;
+	uint8 state;
+	uint8 has_stale_x_journal;
+	uint8 reserved[9];
+} GcsBlockEvictionGateRecord;
+
+StaticAssertDecl(sizeof(GcsBlockEvictionGateRecord) == 112,
+				 "eviction gate includes the relation lifecycle fence");
+StaticAssertDecl(offsetof(GcsBlockEvictionGateRecord, result_own_generation) == 80,
+				 "eviction gate result generation offset is wire-independent and fixed");
+
+typedef struct GcsStaleXDurableSealKey {
+	BufferTag tag;
+	int32 source_buf_id;
+	uint32 durability_generation;
+	uint64 source_own_generation;
+	uint64 holder_incarnation;
+} GcsStaleXDurableSealKey;
+
+typedef struct GcsStaleXDurableSeal {
+	GcsStaleXDurableSealKey key;
+	uint64 checkpoint_seal_id;
+	SCN durable_page_scn;
+} GcsStaleXDurableSeal;
+
+StaticAssertDecl(sizeof(GcsStaleXDurableSealKey) == 48,
+				 "stale-X durable seal key is a fixed 48-byte residency identity");
+StaticAssertDecl(sizeof(GcsStaleXDurableSeal) == 64,
+				 "stale-X durable seal stays a compact 64-byte entry");
+
+/*
+ * Always-on, bounded relation-incarnation authority for type65.  It is
+ * deliberately independent of the optional CR pool/GUCs.  A locator is
+ * registered before the first release record; smgrdounlinkall bumps the same
+ * exact locator before physical unlink.  Unregistered locators have no type65
+ * evidence and need no entry.  Entries are append-only and capacity failure
+ * blocks type65 admission before ownership mutation.
+ */
+typedef struct GcsStaleXRelationGenerationEntry {
+	RelFileLocator locator;
+	uint32 reserved;
+	uint64 generation;
+} GcsStaleXRelationGenerationEntry;
+
+StaticAssertDecl(sizeof(GcsStaleXRelationGenerationEntry) == 24,
+				 "stale-X relation generation entry is fixed 24B");
+
+/*
+ * Opaque shared guard held across the master's one-lock PCM authority commit.
+ * smgrdounlinkall's exclusive generation bump cannot cross this guard, closing
+ * the relation-check -> X-to-N publication race.
+ */
+typedef struct GcsStaleXRelationGenerationGuard {
+	RelFileLocator locator;
+	int32 shard_index;
+	uint64 generation;
+} GcsStaleXRelationGenerationGuard;
+
+StaticAssertDecl(sizeof(GcsStaleXRelationGenerationGuard) == 24,
+				 "stale-X relation generation guard is a fixed stack token");
 
 
 /* ============================================================
@@ -398,6 +680,10 @@ GcsBlockDedupEntryIsReclaimSafe(const GcsBlockDedupEntry *entry, TimestampTz now
 		return false;
 	if (entry->completed_at_ts == 0)
 		return false;
+	/* A live forward marker is an authority/fence record, not merely a
+	 * retransmit cache row.  Only exact DONE makes generic reclaim legal. */
+	if (GcsBlockDedupEntryHasForwardMarker(entry) && entry->done_at_ts == 0)
+		return false;
 
 	/*
 	 * GCS-race round-2 RC-F: a requester completion proof makes the entry
@@ -477,6 +763,115 @@ extern GcsBlockDedupResult cluster_gcs_block_dedup_lookup_or_register(
 	int worker_id, const GcsBlockDedupKey *key, BufferTag tag, uint8 transition_id,
 	uint32 requester_lifetime_hint_ms, bool requester_done_capable,
 	GcsBlockDedupEntry *cached_reply_out);
+extern GcsBlockForwardMarkResult cluster_gcs_block_dedup_forward_prepare_exact(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag, uint8 transition_id,
+	int32 expected_holder_node, int32 forwarding_master_node, GcsBlockReplyStatus status,
+	const PcmAuthoritySnapshot *authority, const GcsBlockForwardPayload *forward,
+	GcsBlockDedupEntry *marker_out);
+extern GcsBlockForwardMarkResult
+cluster_gcs_block_dedup_forward_prepare_identity_exact(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
+	uint8 transition_id, int32 expected_holder_node,
+	int32 forwarding_master_node, GcsBlockReplyStatus status,
+	const PcmAuthoritySnapshot *authority,
+	const GcsBlockForwardPayload *forward,
+	const GcsBlockForwardBootIdentity *boot_identity,
+	GcsBlockDedupEntry *marker_out);
+extern GcsBlockForwardMarkResult cluster_gcs_block_dedup_forward_send_claim_exact(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
+	int32 expected_holder_node, GcsBlockReplyStatus status,
+	const GcsBlockForwardMarker *marker, GcsBlockForwardMarkerPhase expected_phase,
+	GcsBlockDedupEntry *marker_out);
+extern GcsBlockForwardMarkResult cluster_gcs_block_dedup_forward_send_finish_exact(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
+	int32 expected_holder_node, GcsBlockReplyStatus status,
+	const GcsBlockForwardMarker *marker, GcsBlockDedupEntry *marker_out);
+extern bool cluster_gcs_block_dedup_forward_abort_prepared_exact(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
+	int32 expected_holder_node, GcsBlockReplyStatus status,
+	const GcsBlockForwardMarker *marker);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_holder_report_prepare(
+	int worker_id, const GcsBlockDedupKey *key, const GcsStaleXCertPayload *report,
+	GcsStaleXCertPayload *stored_out);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_holder_fence_install(
+	int worker_id, const GcsBlockDedupKey *key, const GcsStaleXCertPayload *install,
+	GcsStaleXCertPayload *ack_out);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_holder_commit(
+	int worker_id, const GcsBlockDedupKey *key, const GcsStaleXCertPayload *commit,
+	GcsStaleXCertPayload *stored_out);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_holder_retire(
+	int worker_id, const GcsBlockDedupKey *key, const GcsStaleXCertPayload *retire,
+	GcsStaleXCertPayload *ack_out);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_holder_lookup(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
+	GcsStaleXCertPayload *stored_out);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_master_report_exact(
+	int worker_id, const GcsBlockDedupKey *key, uint32 capability_generation,
+	const GcsStaleXCertPayload *report,
+	GcsStaleXCertPayload *install_out, GcsBlockForwardMarker *marker_out);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_master_ack_exact(
+	int worker_id, const GcsBlockDedupKey *key, uint32 capability_generation,
+	const GcsStaleXCertPayload *ack,
+	GcsBlockForwardMarker *marker_out);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_master_commit_exact(
+	int worker_id, const GcsBlockDedupKey *key, uint32 capability_generation,
+	const GcsStaleXCertPayload *commit,
+	GcsBlockForwardMarker *marker_out);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_master_commit_ack_exact(
+	int worker_id, const GcsBlockDedupKey *key, uint32 capability_generation,
+	const GcsStaleXCertPayload *ack);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_master_retire_arm_exact(
+	int worker_id, const GcsBlockDedupKey *key, uint32 capability_generation,
+	const GcsStaleXCertPayload *retire);
+extern GcsStaleXFenceResult cluster_gcs_block_dedup_stale_x_master_retire_ack_exact(
+	int worker_id, const GcsBlockDedupKey *key, uint32 capability_generation,
+	const GcsStaleXCertPayload *ack);
+extern GcsStaleXReleaseResult
+cluster_gcs_block_stale_x_release_reserve(const GcsStaleXReleaseRecord *record);
+extern GcsStaleXReleaseResult cluster_gcs_block_stale_x_release_seal_exact(
+	const GcsStaleXReleaseKey *key, SCN final_page_scn, SCN durable_page_scn,
+	uint64 checkpoint_seal_id, GcsStaleXReleaseRecord *record_out);
+extern GcsStaleXReleaseResult cluster_gcs_block_stale_x_release_advance_exact(
+	const GcsStaleXReleaseRecord *expected, GcsStaleXReleaseState target_state,
+	uint64 result_own_generation, GcsStaleXReleaseRecord *record_out);
+extern bool cluster_gcs_block_stale_x_durable_seal_publish(
+	const GcsPiWriteNote *note, uint64 checkpoint_seal_id);
+extern bool cluster_gcs_block_stale_x_durable_seal_lookup_exact(
+	int worker_id, const GcsStaleXReleaseKey *release_key, SCN expected_final_page_scn,
+	GcsStaleXDurableSeal *seal_out);
+extern bool cluster_gcs_block_stale_x_durable_seal_forget_exact(
+	const GcsStaleXDurableSeal *seal);
+extern bool cluster_gcs_block_stale_x_release_lookup_exact(
+	int worker_id, const BufferTag *tag, uint64 release_epoch, int32 master_node,
+	int32 holder_node, uint64 master_incarnation, uint64 holder_incarnation,
+	SCN expected_final_page_scn, GcsStaleXReleaseRecord *record_out);
+extern bool
+cluster_gcs_block_stale_x_release_forget_exact(const GcsStaleXReleaseRecord *record);
+extern GcsStaleXReleaseResult
+cluster_gcs_block_eviction_gate_reserve(const GcsBlockEvictionGateRecord *record);
+extern GcsStaleXReleaseResult cluster_gcs_block_eviction_gate_advance_exact(
+	const GcsBlockEvictionGateRecord *expected, GcsBlockEvictionGateState target_state,
+	uint64 result_own_generation, GcsBlockEvictionGateRecord *record_out);
+/* Conflict means either this logical tag or this source descriptor is still
+ * fenced.  Callers hold the relevant mapping partition X lock before this
+ * shard lock, preserving mapping->gate order. */
+extern bool cluster_gcs_block_eviction_gate_conflict(
+	int worker_id, const BufferTag *tag, int32 source_buf_id,
+	GcsBlockEvictionGateRecord *record_out);
+extern bool cluster_gcs_block_eviction_gate_forget_exact(
+	const GcsBlockEvictionGateRecord *record);
+extern bool cluster_gcs_block_stale_x_release_lookup_key_exact(
+	const GcsStaleXReleaseKey *key, GcsStaleXReleaseRecord *record_out);
+extern bool cluster_gcs_block_stale_x_relation_register(
+	RelFileLocator locator, uint64 *generation_out);
+extern bool cluster_gcs_block_stale_x_relation_current(
+	RelFileLocator locator, uint64 *generation_out);
+extern bool cluster_gcs_block_stale_x_relation_guard_acquire(
+	RelFileLocator locator, uint64 expected_generation,
+	GcsStaleXRelationGenerationGuard *guard);
+extern void cluster_gcs_block_stale_x_relation_guard_release(
+	GcsStaleXRelationGenerationGuard *guard);
+extern bool cluster_gcs_block_stale_x_relation_bump(RelFileLocator locator);
 
 /* Under the routed shard lock, terminate one same-tag, still-live legacy
  * N->S grant/forward identity after PCM-X publishes its queue-kind claim.
@@ -484,7 +879,24 @@ extern GcsBlockDedupResult cluster_gcs_block_dedup_lookup_or_register(
  * exact DONE removes it from the replay set. */
 extern GcsBlockPendingXDenyResult
 cluster_gcs_block_dedup_pending_x_deny_next(int worker_id, const BufferTag *tag,
-											GcsBlockDedupEntry *denied_out);
+											 GcsBlockDedupEntry *denied_out);
+extern GcsBlockForwardMarkResult
+cluster_gcs_block_dedup_forward_cancel_ack_exact(
+	int worker_id, const GcsBlockDedupKey *key, uint32 capability_generation,
+	const GcsBlockForwardCancelPayload *ack, GcsBlockDedupEntry *denied_out);
+extern GcsBlockForwardCancelResult
+cluster_gcs_block_dedup_forward_cancel_holder_install(
+	int worker_id, const GcsBlockDedupKey *key,
+	const GcsBlockForwardCancelPayload *cancel,
+	uint32 holder_requester_capability_generation,
+	GcsBlockForwardCancelPayload *barrier_out);
+extern GcsBlockForwardCancelResult
+cluster_gcs_block_dedup_forward_cancel_holder_lookup(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
+	GcsBlockForwardCancelPayload *barrier_out);
+extern bool cluster_gcs_block_dedup_forward_cancel_holder_admitted_exact(
+	int worker_id, const GcsBlockDedupKey *key,
+	const GcsBlockForwardCancelPayload *barrier);
 extern GcsBlockPendingXDenyResult
 cluster_gcs_block_dedup_pending_x_deny_exact(int worker_id, const GcsBlockDedupKey *key,
 											 const BufferTag *tag, uint8 transition_id,
@@ -494,6 +906,11 @@ extern bool cluster_gcs_block_dedup_set_request_flags_exact(int worker_id,
 															const BufferTag *tag,
 															uint8 transition_id,
 															uint8 request_flags);
+extern bool cluster_gcs_block_dedup_snapshot_exact(int worker_id,
+												   const GcsBlockDedupKey *key,
+												   const BufferTag *tag,
+												   uint8 transition_id,
+												   GcsBlockDedupEntry *entry_out);
 
 /* Dedicated PCM-X image storage over the existing dedup entry pool.  Reserve
  * claims capacity before the revoke lifecycle starts.  Materialize publishes
@@ -525,6 +942,9 @@ extern bool cluster_gcs_block_dedup_pcm_x_retire_up_to(uint64 cluster_epoch,
 													   int32 authenticated_master_node,
 													   uint64 authenticated_master_session,
 													   uint64 retire_through_ticket_id);
+extern bool cluster_gcs_block_dedup_pcm_x_retire_up_to_observed(
+	uint64 cluster_epoch, int32 authenticated_master_node, uint64 authenticated_master_session,
+	uint64 retire_through_ticket_id, uint64 *removed_out);
 extern GcsBlockPcmXImageResult cluster_gcs_block_dedup_pcm_x_preserve_finish_error_exact(
 	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
 	const GcsBlockPcmXImageBinding *binding, uint64 reservation_token, uint8 source_pcm_state);
@@ -557,6 +977,11 @@ extern bool cluster_gcs_block_dedup_pcm_x_restart_audit(int worker_id);
  */
 extern bool cluster_gcs_block_dedup_mark_done(int worker_id, const GcsBlockDedupKey *key,
 											  const BufferTag *tag, uint8 transition_id);
+extern bool cluster_gcs_block_dedup_origin_boot_admit(uint32 origin_node_id,
+													  uint64 boot_incarnation,
+													  bool wire_bound,
+													  TimestampTz now,
+													  int64 legacy_quarantine_us);
 
 /* Count a handler-level DONE drop (transport identity / reserved-pad
  * validation, review F6) on the shard that would have consumed it. */
@@ -596,10 +1021,17 @@ extern void cluster_gcs_block_dedup_install_reply_ex(int worker_id, const GcsBlo
 													 const char *block_data,
 													 const ClusterSfDepVec *sf_dep_vec,
 													 bool has_sf_dep);
-
 /* Remove a specific entry by key (rare path; mostly used by tests).
  * worker_id selects the shard (spec-7.3 D5). */
 extern void cluster_gcs_block_dedup_remove(int worker_id, const GcsBlockDedupKey *key);
+/*
+ * Remove only the still-uncompleted generic registration whose full
+ * key/tag/transition identity matches.  A forward marker, completed reply,
+ * DONE proof, PCM-X entry, or any identity drift refuses without mutation.
+ */
+extern bool cluster_gcs_block_dedup_remove_inflight_exact(
+	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
+	uint8 transition_id);
 
 
 /* ============================================================
@@ -641,6 +1073,16 @@ extern void cluster_gcs_block_dedup_cleanup_on_node_dead(uint32 node_id);
 /* ============================================================
  * Observability accessors (counter exposure).
  * ============================================================ */
+typedef struct GcsBlockForwardPhaseCensus {
+	bool valid;
+	uint64 marker_count;
+	uint64 forwarded_count;
+	uint64 cancelling_count;
+	uint64 invalid_count;
+} GcsBlockForwardPhaseCensus;
+
+extern bool cluster_gcs_block_dedup_forward_phase_census(
+	GcsBlockForwardPhaseCensus *out);
 extern uint64 cluster_gcs_block_dedup_get_hit_count(void);
 extern uint64 cluster_gcs_block_dedup_get_miss_count(void);
 extern uint64 cluster_gcs_block_dedup_get_collision_count(void);
@@ -650,12 +1092,44 @@ extern uint64 cluster_gcs_block_dedup_get_evict_count(void);		  /* spec-7.2a D5 
 extern uint64 cluster_gcs_block_dedup_get_max_entries(void);		  /* spec-7.2a D5 */
 extern uint64 cluster_gcs_block_dedup_get_done_marked_count(void);	  /* RC-F DONE */
 extern uint64 cluster_gcs_block_dedup_get_done_mismatch_count(void);  /* RC-F DONE */
+/* S3-P0-09: identity-valid DONE refused on a live forward marker, by phase. */
+extern uint64 cluster_gcs_block_dedup_get_done_forwarded_refused_count(void);
+extern uint64 cluster_gcs_block_dedup_get_done_cancelling_refused_count(void);
 extern uint64 cluster_gcs_block_dedup_get_hint_violation_count(void); /* review F5 */
 extern uint64 cluster_gcs_block_dedup_get_legacy_pin_count(void);	  /* review F5 */
 extern uint64 cluster_gcs_block_dedup_get_pcm_x_stage_count(void);
 extern uint64 cluster_gcs_block_dedup_get_pcm_x_replay_count(void);
 extern uint64 cluster_gcs_block_dedup_get_pcm_x_release_count(void);
 extern uint64 cluster_gcs_block_dedup_get_pcm_x_failclosed_count(void);
+
+#ifdef USE_ASSERT_CHECKING
+/*
+ * Assert-build-only exact probe used by the S3-P0-18 restart-ABA runtime
+ * gate.  The key remains the complete restart-bound 5-tuple.  The
+ * implementation probes each live shard once with HASH_FIND; it must not
+ * expose a generic table iterator to SQL test code.
+ */
+typedef struct GcsBlockDedupDebugExactSnapshot {
+	GcsBlockDedupKey key;
+	BufferTag tag;
+	uint64 hit_count;
+	uint64 miss_count;
+	uint64 collision_count;
+	uint64 done_marked_count;
+	uint64 done_mismatch_count;
+	int32 worker_id;
+	uint32 match_count;
+	uint8 entry_kind;
+	uint8 transition_id;
+	uint8 status;
+	bool completed;
+	bool done;
+	uint8 reserved[3];
+} GcsBlockDedupDebugExactSnapshot;
+
+extern bool cluster_gcs_block_dedup_debug_exact(
+	const GcsBlockDedupKey *key, GcsBlockDedupDebugExactSnapshot *snapshot_out);
+#endif
 
 /*
  * PGRAC: spec-7.3 D5 — count of dedup accesses rejected because worker_id
