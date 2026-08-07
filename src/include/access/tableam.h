@@ -12,6 +12,12 @@
  * NOTES
  *		See tableam.sgml for higher level documentation.
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - Appends an optional typed index-fetch callback for barrier-aware
+ *		unique-index requalification.
+ *		Spec: spec-8.2-share-barrier-aware-unwind-requalify.md
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef TABLEAM_H
@@ -273,6 +279,14 @@ typedef void (*IndexBuildCallback) (Relation index,
 									bool *isnull,
 									bool tupleIsAlive,
 									void *state);
+
+/* PGRAC: typed result for a heap lookup that may refuse before reading. */
+typedef enum TableIndexFetchTupleResult
+{
+	TABLE_INDEX_FETCH_NOT_FOUND = 0,
+	TABLE_INDEX_FETCH_FOUND,
+	TABLE_INDEX_FETCH_BARRIER_CLOSED
+} TableIndexFetchTupleResult;
 
 /*
  * API struct for a table AM.  Note this must be allocated in a
@@ -872,6 +886,14 @@ typedef struct TableAmRoutine
 										   struct SampleScanState *scanstate,
 										   TupleTableSlot *slot);
 
+	/* PGRAC: optional typed counterpart to index_fetch_tuple. */
+	TableIndexFetchTupleResult (*index_fetch_tuple_barrier_aware) (
+		struct IndexFetchTableData *scan,
+		ItemPointer tid,
+		Snapshot snapshot,
+		TupleTableSlot *slot,
+		bool *call_again, bool *all_dead);
+
 } TableAmRoutine;
 
 
@@ -1268,6 +1290,10 @@ extern bool table_index_fetch_tuple_check(Relation rel,
 										  ItemPointer tid,
 										  Snapshot snapshot,
 										  bool *all_dead);
+
+/* PGRAC: preserve refusal as a third result for lock-owning callers. */
+extern TableIndexFetchTupleResult table_index_fetch_tuple_check_barrier_aware(
+	Relation rel, ItemPointer tid, Snapshot snapshot, bool *all_dead);
 
 
 /* ------------------------------------------------------------------------

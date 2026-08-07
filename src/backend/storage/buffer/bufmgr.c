@@ -8494,6 +8494,94 @@ UnlockBuffers(void)
  * that owns the outer (frozen-tag) content lock.  A NULL pointer keeps the
  * historical behavior (the refusal escalates to a client ERROR).
  */
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: spec-8.2 D2 — the one common clean-refusal epilogue for every
+ * barrier-aware LockBufferInternal exit (SHARE and EXCLUSIVE alike).
+ *
+ * Postconditions on return: this backend holds no target content lock, no
+ * ACQUIRING holder/writer ledger entry remains, no durable master grant and
+ * no exact GRANT_PENDING reservation taken by this call survives.  A cover
+ * that pre-existed the call (cached node residency) is deliberately kept.
+ *
+ * Master release failure propagates ERROR and leaves the reservation
+ * fail-closed.  Local convergence failure after a successful master release
+ * raises the existing data-corruption-class ERROR because local and master
+ * ownership can no longer be proven equal; that is cleanup failure, never a
+ * normal barrier outcome.
+ */
+static void
+cluster_bufmgr_pcm_unwind_barrier_refusal(BufferDesc *buf,
+										  PcmLockMode pcm_mode,
+										  ClusterPcmOwnSnapshot *pending_base,
+										  uint64 pending_token,
+										  bool pcm_pending_set,
+										  bool pcm_acquired,
+										  ClusterPcmXHolderLedgerEntry **holder,
+										  ClusterPcmXWriterLedgerEntry **writer)
+{
+	/* Step 1: a refused call must not own the target content lock, and a
+	 * durable grant is only convergeable through its pending marker. */
+	Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
+	Assert(!pcm_acquired || pcm_pending_set);
+
+	/* Steps 2-3: detach ACQUIRING ledger entries before ownership rollback
+	 * so no concurrent reader can bind them to a grant we are undoing. */
+	if (*holder != NULL)
+	{
+		cluster_bufmgr_pcm_x_holder_abort_acquiring(*holder);
+		*holder = NULL;
+	}
+	if (*writer != NULL)
+	{
+		cluster_bufmgr_pcm_x_writer_abort_acquiring(*writer);
+		*writer = NULL;
+	}
+
+	if (pcm_acquired)
+	{
+		ClusterPcmOwnResult convergence_result;
+
+		/* Step 4: release the durable master S/X grant first; an ERROR here
+		 * leaves the exact reservation fail-closed on purpose. */
+		cluster_pcm_lock_release_buffer_for_eviction(buf, pcm_mode);
+
+		/* Step 5: only after successful master release, converge the exact
+		 * local reservation back to its pre-grant base. */
+		convergence_result = cluster_pcm_own_abort_grant_after_master_rollback(
+			buf, pending_base, pending_token);
+		if (convergence_result != CLUSTER_PCM_OWN_OK)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not converge exact cluster PCM reservation after "
+							"barrier-refusal master rollback: result=%d",
+							(int)convergence_result),
+					 errdetail("buffer=%d generation=%llu token=%llu", buf->buf_id,
+							   (unsigned long long)pending_base->generation,
+							   (unsigned long long)pending_token)));
+	}
+	else if (pcm_pending_set)
+	{
+		/* Step 6: no durable grant existed (READ_IMAGE or pre-acquire), so
+		 * only the exact pending marker needs to be taken back. */
+		cluster_pcm_own_abort_grant_or_error(buf, pending_base, pending_token,
+											 "barrier refusal unwind");
+	}
+
+	/*
+	 * Step 7: prove the postcondition rather than assume it — no target
+	 * content lock, no residual holder/writer ledger entry for this buffer,
+	 * and no exact GRANT_PENDING marker left behind.  Step 8 is the wrapper
+	 * returning false to the caller that owns the outer locks.
+	 */
+	Assert(!LWLockHeldByMe(BufferDescriptorGetContentLock(buf)));
+	Assert(cluster_bufmgr_pcm_x_holder_find(buf) == NULL);
+	Assert(cluster_bufmgr_pcm_x_writer_find(buf) == NULL);
+	Assert((cluster_pcm_own_flags_get(buf->buf_id) & PCM_OWN_FLAG_GRANT_PENDING) == 0);
+}
+#endif							/* USE_PGRAC_CLUSTER */
+
 static void
 LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 {
@@ -8553,7 +8641,7 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 			pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,
 															   pcm_barrier_refused);
 		if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
-			return;				/* barrier-aware caller owns the unwind */
+			goto cluster_lockbuffer_barrier_refusal;	/* caller owns the unwind */
 		if (pcm_x_writer == NULL && !pcm_covered) {
 			/*
 			 * PGRAC: spec-4.7a D2 — hold-until-revoked acquire gate.
@@ -8668,7 +8756,11 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 					if (pcm_retry_wait_index < PG_UINT32_MAX)
 						pcm_retry_wait_index++;
 					if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED)
-						return;
+					{
+						/* The rearm already exact-aborted its old reservation;
+						 * the epilogue still proves nothing else is held. */
+						goto cluster_lockbuffer_barrier_refusal;
+					}
 					if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_COVERED)
 					{
 						pcm_covered = true;
@@ -8718,17 +8810,36 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 			CLUSTER_INJECTION_POINT("cluster-pcm-writer-cached-x-stall");
 		PG_TRY();
 		{
-			pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, pcm_barrier_refused);
+			/* PGRAC: spec-8.2 D8 — count-controlled test seam.  Consulted
+			 * only in barrier-aware SHARE mode, once the legacy acquire or
+			 * cover decision is complete and strictly before both the holder
+			 * gate and the target content lock: refusing here arms no holder
+			 * state at all, which is exactly the shape a real lower refusal
+			 * has.  skipn:N forces the typed refusal on exactly N attempts.
+			 * It only sets the flag — the refusal must leave through the
+			 * post-PG_END_TRY exit so the exception stack is popped once
+			 * before the common epilogue.  Ordinary callers pass NULL and
+			 * never reach this point. */
+			if (pcm_barrier_refused != NULL && !*pcm_barrier_refused
+				&& pcm_mode == PCM_LOCK_MODE_S)
+			{
+				CLUSTER_INJECTION_POINT("cluster-pcm-share-barrier-refuse-after-acquire");
+				if (cluster_injection_should_skip(
+						"cluster-pcm-share-barrier-refuse-after-acquire"))
+					*pcm_barrier_refused = true;
+			}
+			if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+				pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, pcm_barrier_refused);
 			if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
 			{
 				/*
-				 * PGRAC (t/400 L3 item 3, holder lane): the holder gate
-				 * refused under the frozen barrier.  Roll the granted writer
-				 * claim back exactly like the ERROR path would and take
-				 * nothing; the barrier-aware caller owns the unwind.
+				 * PGRAC (t/400 L3 item 3, holder lane; spec-8.2 D2): the
+				 * holder gate (or the test seam above) refused under the
+				 * frozen barrier.  Take nothing here — the one common
+				 * clean-refusal epilogue at the barrier exit below rolls
+				 * back the writer claim, any published holder entry and any
+				 * legacy grant/reservation exactly.
 				 */
-				if (pcm_x_writer != NULL)
-					cluster_bufmgr_pcm_x_writer_abort_acquiring(pcm_x_writer);
 			}
 			else
 			{
@@ -8906,10 +9017,11 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 		}
 		PG_END_TRY();
 
-		/* PGRAC (t/400 L3 item 3, holder lane): nothing is held and the
-		 * writer claim was rolled back — hand the refusal to the caller. */
+		/* Holder-gate refusals (with or without a durable legacy grant),
+		 * stale-cover requeue refusals and the SHARE test seam all converge
+		 * on the same epilogue before the refusal reaches the caller. */
 		if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
-			return;
+			goto cluster_lockbuffer_barrier_refusal;
 
 		/*
 		 * PGRAC ownership-generation wave (W3) — grant-finalize window.  A
@@ -9023,6 +9135,21 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 			cluster_pcm_own_transition(buf, (uint8)cluster_pcm_lock_query(buf->tag), 0, 0);
 		}
 	}
+	return;
+
+cluster_lockbuffer_barrier_refusal:
+
+	/*
+	 * PGRAC: spec-8.2 D2 — the one common clean-refusal epilogue.  Every
+	 * barrier-aware refusal in this function jumps here instead of returning
+	 * raw, so exactly one implementation proves the postconditions: no target
+	 * content lock, no ACQUIRING holder/writer entry, no durable grant and no
+	 * exact GRANT_PENDING reservation taken by this call survive.  A second
+	 * SHARE cleanup implementation is forbidden.
+	 */
+	cluster_bufmgr_pcm_unwind_barrier_refusal(buf, pcm_mode, &pcm_pending_base,
+											  pcm_pending_token, pcm_pending_set, pcm_acquired,
+											  &pcm_x_holder, &pcm_x_writer);
 #endif
 }
 
@@ -9051,6 +9178,25 @@ ClusterLockBufferExclusiveBarrierAware(Buffer buffer)
 	bool		barrier_refused = false;
 
 	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused);
+	return !barrier_refused;
+}
+
+/*
+ * PGRAC: spec-8.2 D1 — SHARE counterpart with the same clean-refusal
+ * contract.  False means exactly one thing: the lower layer returned the
+ * process-local BARRIER_CLOSED refusal and the common epilogue proved this
+ * backend holds no target content lock and left no holder/writer acquisition
+ * or GRANT_PENDING reservation behind; caller-owned outer locks and every
+ * pin are untouched.  A pre-existing cached node residency may remain.
+ * Local buffers and cluster-disabled builds behave exactly like
+ * LockBuffer(..., BUFFER_LOCK_SHARE) and return true.
+ */
+bool
+ClusterLockBufferShareBarrierAware(Buffer buffer)
+{
+	bool		barrier_refused = false;
+
+	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused);
 	return !barrier_refused;
 }
 

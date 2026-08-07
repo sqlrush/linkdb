@@ -18,6 +18,9 @@
  *	  - _bt_check_unique: decode reverse-key stored values back to the
  *	    logical key in the duplicate-key error detail.
  *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (f)
+ *	  - _bt_check_unique: propagate typed heap SHARE barrier refusal so the
+ *	    leaf owner can unwind, warm the heap block, and search from the root.
+ *	    Spec: spec-8.2-share-barrier-aware-unwind-requalify.md
  *
  *-------------------------------------------------------------------------
  */
@@ -49,7 +52,8 @@ static BTStack _bt_search_insert(Relation rel, Relation heaprel,
 static TransactionId _bt_check_unique(Relation rel, BTInsertState insertstate,
 									  Relation heapRel,
 									  IndexUniqueCheck checkUnique, bool *is_unique,
-									  uint32 *speculativeToken);
+									  uint32 *speculativeToken, bool *barrier_closed,
+									  ItemPointer barrier_tid);
 static OffsetNumber _bt_findinsertloc(Relation rel,
 									  BTInsertState insertstate,
 									  bool checkingunique,
@@ -220,9 +224,44 @@ search:
 	{
 		TransactionId xwait;
 		uint32		speculativeToken;
+		bool		barrier_closed = false;
+		ItemPointerData barrier_tid;
+
+		ItemPointerSetInvalid(&barrier_tid);
 
 		xwait = _bt_check_unique(rel, &insertstate, heapRel, checkUnique,
-								 &is_unique, &speculativeToken);
+								 &is_unique, &speculativeToken,
+								 &barrier_closed, &barrier_tid);
+
+		if (barrier_closed)
+		{
+			TableIndexFetchTupleResult warm_result;
+			ItemPointerData warm_tid;
+
+			Assert(!TransactionIdIsValid(xwait));
+			Assert(ItemPointerIsValid(&barrier_tid));
+			Assert(BufferIsValid(insertstate.buf));
+			insertstate.bounds_valid = false;
+			insertstate.postingoff = 0;
+			_bt_relbuf(rel, insertstate.buf);
+			insertstate.buf = InvalidBuffer;
+			if (stack)
+			{
+				_bt_freestack(stack);
+				stack = NULL;
+			}
+
+			do
+			{
+				warm_tid = barrier_tid;
+				warm_result = table_index_fetch_tuple_check_barrier_aware(
+					heapRel, &warm_tid, SnapshotAny, NULL);
+				if (warm_result == TABLE_INDEX_FETCH_BARRIER_CLOSED)
+					CHECK_FOR_INTERRUPTS();
+			} while (warm_result == TABLE_INDEX_FETCH_BARRIER_CLOSED);
+
+			goto search;
+		}
 
 		if (unlikely(TransactionIdIsValid(xwait)))
 		{
@@ -421,7 +460,8 @@ _bt_search_insert(Relation rel, Relation heaprel, BTInsertState insertstate)
 static TransactionId
 _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				 IndexUniqueCheck checkUnique, bool *is_unique,
-				 uint32 *speculativeToken)
+				 uint32 *speculativeToken, bool *barrier_closed,
+				 ItemPointer barrier_tid)
 {
 	IndexTuple	itup = insertstate->itup;
 	IndexTuple	curitup = NULL;
@@ -437,6 +477,9 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 	bool		inposting = false;
 	bool		prevalldead = true;
 	int			curposti = 0;
+
+	*barrier_closed = false;
+	ItemPointerSetInvalid(barrier_tid);
 
 	/* Assume unique until we find a duplicate */
 	*is_unique = true;
@@ -519,6 +562,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 			if (inposting || !ItemIdIsDead(curitemid))
 			{
 				ItemPointerData htid;
+				TableIndexFetchTupleResult fetch_result;
 				bool		all_dead = false;
 
 				if (!inposting)
@@ -571,9 +615,9 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				 * with optimizations like heap's HOT, we have just a single
 				 * index entry for the entire chain.
 				 */
-				else if (table_index_fetch_tuple_check(heapRel, &htid,
-													   &SnapshotDirty,
-													   &all_dead))
+				else if ((fetch_result = table_index_fetch_tuple_check_barrier_aware(
+							  heapRel, &htid, &SnapshotDirty, &all_dead))
+						 == TABLE_INDEX_FETCH_FOUND)
 				{
 					TransactionId xwait;
 
@@ -629,8 +673,18 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 					 * entry.
 					 */
 					htid = itup->t_tid;
-					if (table_index_fetch_tuple_check(heapRel, &htid,
-													  SnapshotSelf, NULL))
+					fetch_result = table_index_fetch_tuple_check_barrier_aware(
+						heapRel, &htid, SnapshotSelf, NULL);
+					if (fetch_result == TABLE_INDEX_FETCH_BARRIER_CLOSED)
+					{
+						*barrier_tid = htid;
+						if (nbuf != InvalidBuffer)
+							_bt_relbuf(rel, nbuf);
+						insertstate->bounds_valid = false;
+						*barrier_closed = true;
+						return InvalidTransactionId;
+					}
+					if (fetch_result == TABLE_INDEX_FETCH_FOUND)
 					{
 						/* Normal case --- it's still live */
 					}
@@ -699,9 +753,18 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 													  key_desc) : 0,
 								 errtableconstraint(heapRel,
 													RelationGetRelationName(rel))));
+						}
 					}
-				}
-				else if (all_dead && (!inposting ||
+					else if (fetch_result == TABLE_INDEX_FETCH_BARRIER_CLOSED)
+					{
+						*barrier_tid = htid;
+						if (nbuf != InvalidBuffer)
+							_bt_relbuf(rel, nbuf);
+						insertstate->bounds_valid = false;
+						*barrier_closed = true;
+						return InvalidTransactionId;
+					}
+					else if (all_dead && (!inposting ||
 									  (prevalldead &&
 									   curposti == BTreeTupleGetNPosting(curitup) - 1)))
 				{

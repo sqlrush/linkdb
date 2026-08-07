@@ -9,6 +9,12 @@
  *
  * src/include/storage/bufmgr.h
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - Adds the barrier-aware SHARE lock entry point used by typed heap
+ *		index fetches.
+ *		Spec: spec-8.2-share-barrier-aware-unwind-requalify.md
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef BUFMGR_H
@@ -246,6 +252,8 @@ extern void LockBuffer(Buffer buffer, int mode);
 /* PGRAC: EXCLUSIVE lock that hands a nested-guard BARRIER_CLOSED refusal
  * back to the caller (false, nothing held) instead of raising an ERROR. */
 extern bool ClusterLockBufferExclusiveBarrierAware(Buffer buffer);
+/* PGRAC: SHARE counterpart with the same clean-refusal contract. */
+extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
 /* PGRAC: operation-scoped PCM-X direct-init entrances for zero VM/FSM pages. */
 extern void LockBufferForVisibilityMapPageInit(Buffer buffer);
 extern void LockBufferForFreeSpaceMapPageInit(Buffer buffer);

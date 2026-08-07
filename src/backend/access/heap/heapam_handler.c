@@ -15,6 +15,12 @@
  *	  This files wires up the lower level heapam.c et al routines with the
  *	  tableam abstraction.
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - Adds a typed barrier-aware index-fetch callback while retaining one
+ *		common HOT-chain implementation.
+ *		Spec: spec-8.2-share-barrier-aware-unwind-requalify.md
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -108,12 +114,18 @@ heapam_index_fetch_end(IndexFetchTableData *scan)
 	pfree(hscan);
 }
 
-static bool
-heapam_index_fetch_tuple(struct IndexFetchTableData *scan,
-						 ItemPointer tid,
-						 Snapshot snapshot,
-						 TupleTableSlot *slot,
-						 bool *call_again, bool *all_dead)
+/*
+ * PGRAC: common heap index-fetch body.  The legacy callback always takes the
+ * ordinary SHARE lock; the typed callback may return before visibility work
+ * when bufmgr proves an exact barrier refusal.
+ */
+static TableIndexFetchTupleResult
+heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
+								  ItemPointer tid,
+								  Snapshot snapshot,
+								  TupleTableSlot *slot,
+								  bool *call_again, bool *all_dead,
+								  bool barrier_aware)
 {
 	IndexFetchHeapData *hscan = (IndexFetchHeapData *) scan;
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
@@ -138,8 +150,20 @@ heapam_index_fetch_tuple(struct IndexFetchTableData *scan,
 			heap_page_prune_opt(hscan->xs_base.rel, hscan->xs_cbuf);
 	}
 
-	/* Obtain share-lock on the buffer so we can examine visibility */
-	LockBuffer(hscan->xs_cbuf, BUFFER_LOCK_SHARE);
+	/* Obtain share-lock on the buffer so we can examine visibility. */
+	if (barrier_aware)
+	{
+		if (!ClusterLockBufferShareBarrierAware(hscan->xs_cbuf))
+		{
+			*call_again = false;
+			if (all_dead != NULL)
+				*all_dead = false;
+			ExecClearTuple(slot);
+			return TABLE_INDEX_FETCH_BARRIER_CLOSED;
+		}
+	}
+	else
+		LockBuffer(hscan->xs_cbuf, BUFFER_LOCK_SHARE);
 	got_heap_tuple = heap_hot_search_buffer(tid,
 											hscan->xs_base.rel,
 											hscan->xs_cbuf,
@@ -167,7 +191,30 @@ heapam_index_fetch_tuple(struct IndexFetchTableData *scan,
 		*call_again = false;
 	}
 
-	return got_heap_tuple;
+	return got_heap_tuple ? TABLE_INDEX_FETCH_FOUND : TABLE_INDEX_FETCH_NOT_FOUND;
+}
+
+static bool
+heapam_index_fetch_tuple(struct IndexFetchTableData *scan,
+						 ItemPointer tid,
+						 Snapshot snapshot,
+						 TupleTableSlot *slot,
+						 bool *call_again, bool *all_dead)
+{
+	return heapam_index_fetch_tuple_internal(scan, tid, snapshot, slot,
+										 call_again, all_dead, false)
+		== TABLE_INDEX_FETCH_FOUND;
+}
+
+static TableIndexFetchTupleResult
+heapam_index_fetch_tuple_barrier_aware(struct IndexFetchTableData *scan,
+									  ItemPointer tid,
+									  Snapshot snapshot,
+									  TupleTableSlot *slot,
+									  bool *call_again, bool *all_dead)
+{
+	return heapam_index_fetch_tuple_internal(scan, tid, snapshot, slot,
+										 call_again, all_dead, true);
 }
 
 
@@ -2605,7 +2652,10 @@ static const TableAmRoutine heapam_methods = {
 	.scan_bitmap_next_block = heapam_scan_bitmap_next_block,
 	.scan_bitmap_next_tuple = heapam_scan_bitmap_next_tuple,
 	.scan_sample_next_block = heapam_scan_sample_next_block,
-	.scan_sample_next_tuple = heapam_scan_sample_next_tuple
+	.scan_sample_next_tuple = heapam_scan_sample_next_tuple,
+
+	/* PGRAC: optional typed callback is tail-appended in TableAmRoutine. */
+	.index_fetch_tuple_barrier_aware = heapam_index_fetch_tuple_barrier_aware
 };
 
 

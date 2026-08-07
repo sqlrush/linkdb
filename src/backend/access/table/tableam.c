@@ -15,6 +15,12 @@
  *	  here. That's because there's a lot of inline functions in tableam.h and
  *	  it'd be harder to understand if one constantly had to switch between files.
  *
+ * PGRAC MODIFICATIONS
+ *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  - Adds the typed index-fetch convenience helper used by unique-index
+ *		barrier requalification.
+ *		Spec: spec-8.2-share-barrier-aware-unwind-requalify.md
+ *
  *----------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -233,6 +239,40 @@ table_index_fetch_tuple_check(Relation rel,
 	ExecDropSingleTupleTableSlot(slot);
 
 	return found;
+}
+
+/*
+ * PGRAC: perform the same one-shot lookup while preserving a clean buffer
+ * barrier refusal as a distinct result.  Existing AMs remain compatible: a
+ * missing optional callback maps only the legacy found/not-found outcomes.
+ */
+TableIndexFetchTupleResult
+table_index_fetch_tuple_check_barrier_aware(Relation rel,
+										ItemPointer tid,
+										Snapshot snapshot,
+										bool *all_dead)
+{
+	IndexFetchTableData *scan;
+	TupleTableSlot *slot;
+	TableIndexFetchTupleResult result;
+	bool		call_again = false;
+
+	if (all_dead != NULL)
+		*all_dead = false;
+	slot = table_slot_create(rel, NULL);
+	scan = table_index_fetch_begin(rel);
+	if (rel->rd_tableam->index_fetch_tuple_barrier_aware != NULL)
+		result = rel->rd_tableam->index_fetch_tuple_barrier_aware(
+			scan, tid, snapshot, slot, &call_again, all_dead);
+	else if (table_index_fetch_tuple(scan, tid, snapshot, slot, &call_again,
+										 all_dead))
+		result = TABLE_INDEX_FETCH_FOUND;
+	else
+		result = TABLE_INDEX_FETCH_NOT_FOUND;
+	table_index_fetch_end(scan);
+	ExecDropSingleTupleTableSlot(slot);
+
+	return result;
 }
 
 
