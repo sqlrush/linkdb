@@ -24,8 +24,7 @@
 
 typedef UBA ClusterUndoByteAddress;
 
-StaticAssertDecl(sizeof(ClusterUndoByteAddress) == 16,
-				 "R4 UBA alias must remain 16 bytes");
+StaticAssertDecl(sizeof(ClusterUndoByteAddress) == 16, "R4 UBA alias must remain 16 bytes");
 
 typedef enum ClusterTxResolveMode {
 	CLUSTER_TX_RESOLVE_VISIBILITY = 0,
@@ -127,16 +126,14 @@ typedef struct ClusterMultiResolution {
 	ClusterMultiResolutionMember members[CLUSTER_R4_MAX_MULTI_MEMBERS];
 } ClusterMultiResolution;
 
-extern bool cluster_tx_locator_from_itl(Page page, uint8 slot_index,
-										ClusterTxLocator *out,
+extern bool cluster_tx_locator_from_itl(Page page, uint8 slot_index, ClusterTxLocator *out,
 										ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_tx_resolve_exact(const ClusterTxLocator *locator,
 												 ClusterTxResolveMode mode,
 												 ClusterTxResolution *out,
 												 ClusterTxResolveReason *reason_out);
-extern ClusterTxOutcome cluster_tx_resolve_multixact(MultiXactId mxid,
-												 ClusterMultiResolution *out,
-												 ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
+													 ClusterTxResolveReason *reason_out);
 extern const char *cluster_tx_resolve_reason_name(ClusterTxResolveReason reason);
 
 #endif /* USE_PGRAC_CLUSTER */

@@ -28,7 +28,8 @@ UT_DEFINE_GLOBALS();
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
-					 const char *fileName pg_attribute_unused(), int lineNumber pg_attribute_unused())
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
 {
 	abort();
 }
@@ -67,6 +68,32 @@ bytes_are_zero(const void *ptr, size_t size)
 			return false;
 	}
 	return true;
+}
+
+static ClusterItlSlotData *
+set_slot(Page page, uint8 index, uint8 flags, TransactionId xid, uint16 wrap, uint32 segment_id,
+		 uint32 block_no, uint16 tt_slot_offset, uint16 row_offset)
+{
+	ClusterItlSlotData *slot = slot_at(page, index);
+
+	slot->flags = flags;
+	slot->xid = xid;
+	slot->wrap = wrap;
+	slot->undo_segment_head.raw[0] = ((uint64)block_no << 32) | segment_id;
+	slot->undo_segment_head.raw[1] = ((uint64)row_offset << 16) | tt_slot_offset;
+	return slot;
+}
+
+static void
+assert_locator_failure(Page page, uint8 index, ClusterTxResolveReason expected_reason)
+{
+	ClusterTxLocator locator;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+	memset(&locator, 0xA5, sizeof(locator));
+	UT_ASSERT(!cluster_tx_locator_from_itl(page, index, &locator, &reason));
+	UT_ASSERT_EQ(reason, expected_reason);
+	UT_ASSERT(bytes_are_zero(&locator, sizeof(locator)));
 }
 
 UT_TEST(test_frozen_identity_layout)
@@ -115,8 +142,9 @@ UT_TEST(test_exact_resolver_is_dormant_and_zeroes_output)
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
 	memset(&resolution, 0xA5, sizeof(resolution));
-	UT_ASSERT_EQ(cluster_tx_resolve_exact(NULL, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
-				 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(
+		cluster_tx_resolve_exact(NULL, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+		CLUSTER_TX_UNKNOWN);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_TARGET_DISABLED);
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
 }
@@ -158,12 +186,274 @@ UT_TEST(test_valid_caller_selected_data_slot_forms_exact_locator)
 	slot->undo_segment_head.raw[1] = 5;
 
 	UT_ASSERT(cluster_tx_locator_from_itl(page, 3, &locator, &reason));
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(locator.uba.raw[0], slot->undo_segment_head.raw[0]);
+	UT_ASSERT_EQ(locator.uba.raw[1], slot->undo_segment_head.raw[1]);
+	UT_ASSERT_EQ(locator.xid, slot->xid);
+	UT_ASSERT_EQ(locator.tt_wrap, slot->wrap);
+	UT_ASSERT_EQ(locator.itl_kind, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(locator.itl_slot_index, 3);
+}
+
+UT_TEST(test_lock_only_active_forms_exact_locator)
+{
+	Page page = build_itl_page();
+	ClusterTxLocator locator;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
+
+	set_slot(page, 4, ITL_FLAG_LOCK_ONLY_ACTIVE, (TransactionId)900, 2, 9, 17, 6, 1);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 4, &locator, &reason));
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(locator.itl_kind, ITL_FLAG_LOCK_ONLY_ACTIVE);
+	UT_ASSERT_EQ(locator.itl_slot_index, 4);
+}
+
+UT_TEST(test_data_terminal_states_form_locators)
+{
+	Page page = build_itl_page();
+	ClusterTxLocator locator;
+	ClusterTxResolveReason reason;
+
+	set_slot(page, 0, ITL_FLAG_COMMITTED, (TransactionId)901, 2, 9, 17, 6, 1);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 0, &locator, &reason));
+	set_slot(page, 1, ITL_FLAG_ABORTED, (TransactionId)902, 3, 10, 18, 7, 2);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 1, &locator, &reason));
+	set_slot(page, 2, ITL_FLAG_NEEDS_CLEANOUT, (TransactionId)903, 4, 11, 19, 8, 3);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 2, &locator, &reason));
+}
+
+UT_TEST(test_lock_only_terminal_states_form_locators)
+{
+	Page page = build_itl_page();
+	ClusterTxLocator locator;
+	ClusterTxResolveReason reason;
+
+	set_slot(page, 0, ITL_FLAG_LOCK_ONLY_COMMITTED, (TransactionId)904, 2, 9, 17, 6, 1);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 0, &locator, &reason));
+	set_slot(page, 1, ITL_FLAG_LOCK_ONLY_ABORTED, (TransactionId)905, 3, 10, 18, 7, 2);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 1, &locator, &reason));
+}
+
+UT_TEST(test_wrap_zero_is_valid_fresh_generation)
+{
+	Page page = build_itl_page();
+	ClusterTxLocator locator;
+	ClusterTxResolveReason reason;
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)906, TT_WRAP_INITIAL, 9, 17, 6, 1);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 0, &locator, &reason));
+	UT_ASSERT_EQ(locator.tt_wrap, TT_WRAP_INITIAL);
+}
+
+UT_TEST(test_null_output_fails_bad_locator)
+{
+	Page page = build_itl_page();
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)907, 1, 9, 17, 6, 1);
+	UT_ASSERT(!cluster_tx_locator_from_itl(page, 0, NULL, &reason));
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+}
+
+UT_TEST(test_page_without_itl_fails_bad_locator)
+{
+	Page page = build_itl_page();
+
+	((PageHeader)page)->pd_flags = 0;
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+}
+
+UT_TEST(test_short_itl_special_area_fails_bad_locator)
+{
+	Page page = build_itl_page();
+
+	((PageHeader)page)->pd_special = (LocationIndex)(BLCKSZ - CLUSTER_ITL_ARRAY_SIZE + 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+}
+
+UT_TEST(test_slot_eight_fails_slot_mismatch)
+{
+	Page page = build_itl_page();
+
+	assert_locator_failure(page, CLUSTER_ITL_INITRANS_DEFAULT, CLUSTER_TX_RESOLVE_SLOT_MISMATCH);
+}
+
+UT_TEST(test_slot_255_fails_slot_mismatch)
+{
+	Page page = build_itl_page();
+
+	assert_locator_failure(page, UINT8_MAX, CLUSTER_TX_RESOLVE_SLOT_MISMATCH);
+}
+
+UT_TEST(test_free_slot_fails_bad_locator)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, ITL_FLAG_FREE, (TransactionId)908, 1, 9, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+}
+
+UT_TEST(test_multixact_marker_fails_bad_locator)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI, (TransactionId)908, 1, 9, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+}
+
+UT_TEST(test_unknown_slot_kind_fails_bad_locator)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, UINT8_MAX, (TransactionId)908, 1, 9, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+}
+
+UT_TEST(test_invalid_xid_fails_xid_mismatch)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, InvalidTransactionId, 1, 9, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_XID_MISMATCH);
+}
+
+UT_TEST(test_special_xids_fail_xid_mismatch)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, BootstrapTransactionId, 1, 9, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_XID_MISMATCH);
+	set_slot(page, 0, ITL_FLAG_ACTIVE, FrozenTransactionId, 1, 9, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_XID_MISMATCH);
+}
+
+UT_TEST(test_invalid_wrap_fails_wrap_mismatch)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)909, TT_WRAP_INVALID, 9, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_WRAP_MISMATCH);
+}
+
+UT_TEST(test_zero_uba_fails_bad_uba)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *slot;
+
+	slot = set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)910, 1, 9, 17, 6, 1);
+	slot->undo_segment_head = (UBA)InvalidUba_init;
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_UBA);
+}
+
+UT_TEST(test_zero_segment_fails_bad_uba)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)911, 1, 0, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_UBA);
+}
+
+UT_TEST(test_oversize_segment_fails_bad_uba)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)912, 1, (uint32)UINT16_MAX + 1, 17, 6, 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_UBA);
+}
+
+UT_TEST(test_out_of_range_tt_offset_fails_bad_uba)
+{
+	Page page = build_itl_page();
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)913, 1, 9, 17, (uint16)TT_SLOTS_PER_SEGMENT,
+			 1);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_UBA);
+}
+
+UT_TEST(test_reserved_uba_bits_fail_bad_uba)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *slot;
+
+	slot = set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)914, 1, 9, 17, 6, 1);
+	slot->undo_segment_head.raw[1] |= ((uint64)1 << 32);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_UBA);
+}
+
+UT_TEST(test_caller_selected_slot_never_scans_raw_xid_alternate)
+{
+	Page page = build_itl_page();
+	ClusterTxLocator locator;
+	ClusterTxResolveReason reason;
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)797, 1, 7, 12, 3, 1);
+	set_slot(page, 4, ITL_FLAG_ACTIVE, (TransactionId)915, 9, 12, 21, 8, 2);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 4, &locator, &reason));
+	UT_ASSERT_EQ(locator.xid, 915);
+	UT_ASSERT_EQ(locator.itl_slot_index, 4);
+	UT_ASSERT_NE(locator.xid, 797);
+}
+
+UT_TEST(test_t408_current_xid798_is_not_rewritten_to_xmin797)
+{
+	Page page = build_itl_page();
+	ClusterTxLocator locator;
+	ClusterTxResolveReason reason;
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)797, 2, 7, 408, 3, 1);
+	set_slot(page, 1, ITL_FLAG_ACTIVE, (TransactionId)798, 3, 8, 408, 4, 1);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 1, &locator, &reason));
+	UT_ASSERT_EQ(locator.xid, 798);
+	UT_ASSERT_NE(locator.xid, 797);
+	UT_ASSERT_EQ(locator.uba.raw[0], (((uint64)408 << 32) | 8));
+}
+
+UT_TEST(test_duplicate_xid_has_no_uba_winner_selection)
+{
+	Page page = build_itl_page();
+	ClusterTxLocator locator;
+	ClusterTxResolveReason reason;
+
+	set_slot(page, 2, ITL_FLAG_ACTIVE, (TransactionId)916, 4, 13, 22, 5, 1);
+	set_slot(page, 6, ITL_FLAG_ACTIVE, (TransactionId)916, 5, 14, 23, 6, 2);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 6, &locator, &reason));
+	UT_ASSERT_EQ(locator.itl_slot_index, 6);
+	UT_ASSERT_EQ(locator.uba.raw[0], (((uint64)23 << 32) | 14));
+	UT_ASSERT_NE(locator.uba.raw[0], (((uint64)22 << 32) | 13));
+}
+
+UT_TEST(test_reason_output_is_optional)
+{
+	Page page = build_itl_page();
+	ClusterTxLocator locator;
+
+	set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)917, 1, 9, 17, 6, 1);
+	UT_ASSERT(cluster_tx_locator_from_itl(page, 0, &locator, NULL));
+	UT_ASSERT(!cluster_tx_locator_from_itl(NULL, 0, &locator, NULL));
+}
+
+UT_TEST(test_failure_zeroes_previous_locator)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *slot;
+
+	slot = set_slot(page, 0, ITL_FLAG_ACTIVE, (TransactionId)918, 1, 9, 17, 6, 1);
+	slot->undo_segment_head.raw[1] |= ((uint64)1 << 32);
+	assert_locator_failure(page, 0, CLUSTER_TX_RESOLVE_BAD_UBA);
+}
+
+UT_TEST(test_epoch_is_absent_from_locator_value)
+{
+	UT_ASSERT_EQ(sizeof(ClusterTxLocator), sizeof(ClusterUndoByteAddress) + sizeof(TransactionId)
+											   + sizeof(uint16) + sizeof(uint8) + sizeof(uint8));
+	UT_ASSERT_EQ(offsetof(ClusterTxLocator, itl_slot_index) + sizeof(uint8),
+				 sizeof(ClusterTxLocator));
 }
 
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(33);
 	UT_RUN(test_frozen_identity_layout);
 	UT_RUN(test_frozen_closed_domains);
 	UT_RUN(test_reason_names_are_stable);
@@ -171,6 +461,32 @@ main(void)
 	UT_RUN(test_multixact_resolver_is_dormant_and_zeroes_output);
 	UT_RUN(test_bad_locator_scaffold_fails_closed_and_zeroes_output);
 	UT_RUN(test_valid_caller_selected_data_slot_forms_exact_locator);
+	UT_RUN(test_lock_only_active_forms_exact_locator);
+	UT_RUN(test_data_terminal_states_form_locators);
+	UT_RUN(test_lock_only_terminal_states_form_locators);
+	UT_RUN(test_wrap_zero_is_valid_fresh_generation);
+	UT_RUN(test_null_output_fails_bad_locator);
+	UT_RUN(test_page_without_itl_fails_bad_locator);
+	UT_RUN(test_short_itl_special_area_fails_bad_locator);
+	UT_RUN(test_slot_eight_fails_slot_mismatch);
+	UT_RUN(test_slot_255_fails_slot_mismatch);
+	UT_RUN(test_free_slot_fails_bad_locator);
+	UT_RUN(test_multixact_marker_fails_bad_locator);
+	UT_RUN(test_unknown_slot_kind_fails_bad_locator);
+	UT_RUN(test_invalid_xid_fails_xid_mismatch);
+	UT_RUN(test_special_xids_fail_xid_mismatch);
+	UT_RUN(test_invalid_wrap_fails_wrap_mismatch);
+	UT_RUN(test_zero_uba_fails_bad_uba);
+	UT_RUN(test_zero_segment_fails_bad_uba);
+	UT_RUN(test_oversize_segment_fails_bad_uba);
+	UT_RUN(test_out_of_range_tt_offset_fails_bad_uba);
+	UT_RUN(test_reserved_uba_bits_fail_bad_uba);
+	UT_RUN(test_caller_selected_slot_never_scans_raw_xid_alternate);
+	UT_RUN(test_t408_current_xid798_is_not_rewritten_to_xmin797);
+	UT_RUN(test_duplicate_xid_has_no_uba_winner_selection);
+	UT_RUN(test_reason_output_is_optional);
+	UT_RUN(test_failure_zeroes_previous_locator);
+	UT_RUN(test_epoch_is_absent_from_locator_value);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
