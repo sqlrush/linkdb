@@ -188,10 +188,7 @@ extern void cluster_lever_a_note_fwd_oneshot(void);
 extern void cluster_lever_a_note_remote_downgrade(bool downgraded);
 extern void cluster_lever_a_note_remote_ack_degraded(void);
 
-/*
- * Wave-g counters (block self-containment; gated on cluster.block_self_contained
- * or cluster.xnode_profile inside).
- */
+/* Active-ITL transfer and terminal-hint counters are always observed. */
 extern void cluster_lever_g_note_active_itl_transfer(void);
 extern void cluster_lever_g_note_stamp_skipped(void);
 extern void cluster_lever_g_note_drift_resolved_via_tt(void);

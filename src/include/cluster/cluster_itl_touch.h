@@ -125,6 +125,27 @@ typedef struct ClusterItlTerminalProof {
 	bool valid;
 } ClusterItlTerminalProof;
 
+/* Exact local-owner and slot checks used by terminal hinting. */
+static inline bool
+cluster_itl_terminal_proof_owner_exact(const ClusterItlTerminalProof *proof,
+									   uint64 own_generation, uint64 acquisition_epoch,
+									   bool local_x, uint32 own_flags,
+									   uint64 writer_activation_token)
+{
+	return proof != NULL && proof->valid && local_x && own_flags == 0
+		&& writer_activation_token == 0 && own_generation == proof->own_generation
+		&& acquisition_epoch == proof->acquisition_epoch;
+}
+
+static inline bool
+cluster_itl_terminal_proof_slot_exact(const ClusterItlTerminalProof *proof,
+									  TransactionId xid, uint16 slot_wrap,
+									  uint8 slot_class)
+{
+	return proof != NULL && proof->valid && xid == proof->xid
+		&& slot_wrap == proof->slot_wrap && slot_class == proof->slot_class;
+}
+
 /*
  * ClusterItlTouchRecord -- private touched-list element: the frozen public
  * 24-byte handle plus the terminal-stamp proof.  The public handle layout

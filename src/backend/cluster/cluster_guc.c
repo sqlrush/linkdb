@@ -108,8 +108,7 @@ bool cluster_read_scache = false;
 bool cluster_ges_handoff = false;
 /* spec-6.12b: cross-instance CR-server data plane (default OFF = 53R9G). */
 bool cluster_crossnode_cr_data_plane = false;
-/* spec-6.12g: block self-containment (active-ITL migration + opportunistic
- * commit cleanout; default OFF = the spec-5.2 D11 writer-transfer deferral). */
+/* Deprecated compatibility setting; active-writer transfer safety is invariant. */
 bool cluster_block_self_contained = false;
 /* spec-6.12e2: master->holder BAST nudge on live-X-holder deny.  Default
  * ON since GCS-race round-4 FUNC-1: the nudge + requester bounded retry
@@ -1725,28 +1724,11 @@ cluster_init_guc(void)
 					 "the hard fail-closed refusal limit is 64x this value."),
 		&cluster_xid_herding_slack, 4194304, 65536, 268435456, PGC_SIGHUP, 0, NULL, NULL, NULL);
 
-	/*
-	 * cluster.block_self_contained -- spec-6.12 wave g (write-write
-	 * collapse root).  When on, a block may be X-transferred across
-	 * instances WITH an uncommitted (ACTIVE) ITL slot -- the spec-5.2 D11
-	 * deferral that kept a block pinned to its holder until the holder's
-	 * transaction went terminal is lifted, so a same-block DIFFERENT-row
-	 * writer no longer waits on the holder's unrelated row.  The holder's
-	 * later commit stamps the ITL slot only if the block is still resident
-	 * (opportunistic cleanout); a drifted ACTIVE slot is left unstamped and
-	 * every reader resolves its committed-ness through the TT authority
-	 * (ITL->UBA->TT, AD-006), exactly as for any remote ITL ref.  SAME-row
-	 * conflicts still serialize through the cross-node TX enqueue wait
-	 * (spec-5.2 D4/D5, t/280).  8.A: the TT is the SOLE post-stamp-skip
-	 * commit_scn authority; any UNKNOWN resolution fails closed (53R97 /
-	 * 53R9G), never visible.  Default OFF: the D11 deferral is
-	 * byte-identical.  SUSET for a measurement / chaos window.
-	 */
+	/* Retained for configuration compatibility; it no longer selects protocol behavior. */
 	DefineCustomBoolVariable(
 		"cluster.block_self_contained",
-		gettext_noop("Allow active-ITL block migration + opportunistic commit cleanout "
-					 "(spec-6.12g)."),
-		gettext_noop("Off keeps the spec-5.2 D11 writer-transfer deferral for active-ITL blocks."),
+		gettext_noop("Deprecated compatibility setting; changing it has no effect."),
+		gettext_noop("Active-writer block transfer safety is always enforced."),
 		&cluster_block_self_contained, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
