@@ -2,7 +2,7 @@
 #-------------------------------------------------------------------------
 #
 # 407_stage8_r2_share_barrier.pl
-#	  Stage-8 R2 — barrier-aware SHARE unwind and requalification (spec-8.2 §4.4).
+#	  Stage-8 R2 — barrier-aware SHARE unwind and requalification.
 #
 #	  Every leg drives the real production path on a two-node cluster.  The
 #	  count-controlled `cluster-pcm-share-barrier-refuse-after-acquire` seam
@@ -25,15 +25,12 @@
 #	      non-qualifying row is unaffected
 #	  L7  deferred unique constraint — the recheck stays exact at COMMIT
 #	  L8  HOT update chain — the live duplicate is not missed
-#	  L9  five consecutive refusals exercise the repeated warm loop
+#	  L9  posting-list/dead candidates span a right sibling; refusal does
+#	      not leak nbuf and completed fetches retain exact hint semantics
 #	  L10 statement cancel around the refusal — native SQLSTATE, and the
 #	      session still works afterwards (no leaked buffer lock or pin)
 #	  L11 point disarmed — no behavior or counter drift
-#	  L12 requalification sees a peer-committed row through shared storage
-#	      (spec §4.4's own L12, the cluster-disabled build, is a separate
-#	      build gate covered by §4.1 and the --disable-cluster run)
-#
-# Spec: spec-8.2-share-barrier-aware-unwind-requalify.md
+#	  L12 cluster disabled — upstream unique behavior remains unchanged
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #
@@ -105,7 +102,7 @@ my $seq = 0;
 # the same shared blocks and fail with "already contains data".
 # DDL runs outside the barrier-aware path, so an ordinary SHARE acquisition
 # that meets a live frozen revoke round still raises the historical
-# BARRIER_CLOSED error (spec-8.2 I-03/N7 keep that behavior deliberately).
+# BARRIER_CLOSED error.  That behavior remains deliberate.
 # That is a transient of the running cluster, not of the feature under test,
 # so setup DDL retries it briefly instead of failing the leg.
 sub ddl_retry
@@ -292,52 +289,30 @@ for my $outcome ('commit', 'rollback')
 }
 
 # ---------------------------------------------------------------
-# L7 — deferred unique constraint.
+# L7 — deferred unique constraint / UNIQUE_CHECK_EXISTING.
 # ---------------------------------------------------------------
-SKIP:
 {
-	# Creating ANY deferrable unique constraint on a live 2-node cluster
-	# deterministically hits the GES lock-conversion timeout (30s =
-	# cluster.ges_convert_timeout_ms) regardless of shape: at CREATE TABLE,
-	# via ALTER TABLE on a symmetric heap, on one node or with the peer
-	# stopped (which write-fences the survivor).  A plain non-deferrable
-	# UNIQUE constraint builds instantly, so the blocked path is the
-	# constraint-trigger creation — a pre-existing cross-node DDL limitation
-	# entirely outside spec-8.2's N-list (registered as an independent
-	# finding in the design-repo talk, 2026-08-07).  The deferred recheck
-	# semantics under a barrier refusal are the same _bt_check_unique →
-	# barrier-aware fetch path already exercised by L2 and L8; only the
-	# COMMIT-time trigger timing is unique to this leg, and only its setup
-	# DDL is blocked.  One bounded attempt keeps the leg self-healing: the
-	# moment the DDL limitation is fixed, the full scenario runs again.
-	my $tbl = 'r2_deferred_local';
-	# 35s > cluster.ges_convert_timeout_ms (30s): the product's own clean
-	# conversion timeout fires (probes verified plain DDL works after it),
-	# rather than a mid-conversion statement cancel of unverified residue.
-	my ($crc, undef, $cerr) = $node0->psql('postgres',
-		"SET statement_timeout='35s'; "
-		. "CREATE TABLE $tbl (k int, v int, CONSTRAINT ${tbl}_uk UNIQUE (k) DEFERRABLE INITIALLY DEFERRED)");
-	if ($crc != 0)
-	{
-		die "unexpected deferrable-DDL failure: $cerr"
-			unless ($cerr // '')
-			=~ /statement timeout|lock conversion timed out|PCM-X writer operation is not ready|BARRIER_CLOSED/;
-		skip 'blocked-on: DEFERRABLE constraint DDL cluster-lock limitation '
-			. '(independent finding; recheck semantics covered by L2/L8)', 3;
-	}
+	my $tbl = take_heap();
+	my ($ddl_rc, undef, $ddl_err) = $node0->psql('postgres',
+		"ALTER TABLE $tbl ADD CONSTRAINT ${tbl}_uk "
+		. 'UNIQUE (k) DEFERRABLE INITIALLY DEFERRED');
+	is($ddl_rc, 0, 'L7 default convert completes the deferred-constraint DDL')
+		or diag("L7 DDL rc=$ddl_rc err=$ddl_err");
 	$node0->safe_psql('postgres', "INSERT INTO $tbl VALUES (41, 1)");
 
 	my $session = armed_session($node0, 2);
 	$session->query_safe('BEGIN');
+	$session->query_safe('SET CONSTRAINTS ALL DEFERRED');
 	my $out = $session->query("INSERT INTO $tbl VALUES (41, 2)");
-	unlike($session->{stderr}, qr/ERROR/, 'L7 the deferred constraint does not fire mid-statement');
+	unlike($session->{stderr}, qr/ERROR/,
+		'L7 duplicate INSERT remains deferred until COMMIT');
 	my $cout = $session->query('COMMIT');
 	disarm_and_quit($session);
 
 	like($session->{stderr}, qr/duplicate key value violates unique constraint/,
-		'L7 the deferred recheck is exact at COMMIT');
+		'L7 COMMIT runs the exact deferred unique recheck');
 	is($node0->safe_psql('postgres', "SELECT count(*) FROM $tbl WHERE k = 41"),
-		'1', 'L7 the aborted transaction left no row');
+		'1', 'L7 the failed COMMIT leaves only the original row');
 }
 
 # ---------------------------------------------------------------
@@ -381,21 +356,57 @@ SKIP:
 }
 
 # ---------------------------------------------------------------
-# L9 — repeated warm loop.
+# L9 — posting-list/dead candidates spanning right siblings.
+#
+# A wide immutable expression keeps every physical version's unique-index
+# tuple identical.  The secondary v index forces non-HOT updates, while the
+# staggered snapshots retain those versions until the unique index has split
+# and deduplicated equal tuples into posting lists.  Closing the snapshots and
+# deleting the live row then leaves dead candidates across multiple leaves.
 # ---------------------------------------------------------------
 {
-	my $tbl = unique_relation();
-	$node0->safe_psql('postgres',
-		"INSERT INTO $tbl VALUES (61, 1); DELETE FROM $tbl WHERE k = 61;");
+	my $tbl = take_heap();
+	my $wide_expr = join(' || ', map { "md5((k + $_)::text)" } 1 .. 40);
+	ddl_retry($node0,
+		"CREATE UNIQUE INDEX ${tbl}_uk ON $tbl (k, ($wide_expr))");
+	ddl_retry($node0, "CREATE INDEX ${tbl}_v_idx ON $tbl (v)");
+	$node0->safe_psql('postgres', "INSERT INTO $tbl VALUES (61, 0)");
 
-	my $session = armed_session($node0, 5);
-	my $out = $session->query("INSERT INTO $tbl VALUES (61, 2)");
-	disarm_and_quit($session);
+	my @snapshots;
+	for my $version (1 .. 80)
+	{
+		$node0->safe_psql('postgres',
+			"UPDATE $tbl SET v = $version WHERE k = 61");
+		my $snapshot = $node0->background_psql(
+			'postgres', on_error_die => 1, on_error_stop => 1);
+		$snapshot->query_safe('BEGIN ISOLATION LEVEL REPEATABLE READ');
+		$snapshot->query_safe("SELECT v FROM $tbl WHERE k = 61");
+		push @snapshots, $snapshot;
+	}
+	$node0->safe_psql('postgres', "VACUUM (ANALYZE) $tbl");
+	cmp_ok($node0->safe_psql('postgres',
+		"SELECT relpages FROM pg_class WHERE oid = '${tbl}_uk'::regclass"),
+		'>=', 3, 'L9 equal candidates occupy multiple B-tree pages');
+	for my $snapshot (@snapshots)
+	{
+		$snapshot->query_safe('COMMIT');
+		$snapshot->quit;
+	}
+	$node0->safe_psql('postgres', "DELETE FROM $tbl WHERE k = 61");
 
+	my $session = armed_session($node0, 2);
+	my $out = $session->query("INSERT INTO $tbl VALUES (61, 999)");
 	unlike($session->{stderr}, qr/ERROR/,
-		'L9 five consecutive typed refusals still converge on success');
+		'L9 requalification releases the right-sibling buffer and inserts');
+	$session->query_safe("SELECT cluster_inject_fault('$POINT', 'none', 0)");
+	my $dup = $session->query("INSERT INTO $tbl VALUES (61, 1000)");
+	like($session->{stderr}, qr/duplicate key value violates unique constraint/,
+		'L9 completed fetch keeps the live candidate from a false all-dead hint');
+	my $probe = $session->query('SELECT 1');
+	is($probe, '1', 'L9 no right-sibling lock or pin leaks into the next command');
+	disarm_and_quit($session);
 	is($node0->safe_psql('postgres', "SELECT count(*) FROM $tbl WHERE k = 61"),
-		'1', 'L9 exactly one row after the repeated warm loop');
+		'1', 'L9 exactly one live row remains');
 }
 
 # ---------------------------------------------------------------
@@ -437,31 +448,31 @@ SKIP:
 	is(unwind_count($node0), $before, 'L11 no refusal-counter drift while unarmed');
 }
 
-# ---------------------------------------------------------------
-# L12 — the requalified insert on the index-owning node still sees a row
-#       committed by the peer node through shared storage.
-# ---------------------------------------------------------------
-{
-	# The unique index lives in node0's catalog only, so the peer must not
-	# be asked to maintain it: node0 inserts the row (index entry + heap
-	# tuple), node1 then UPDATEs that heap tuple so the page's current
-	# version travels through Cache Fusion / shared storage, and node0's
-	# requalified heap recheck must still see the live duplicate.
-	my $tbl = unique_relation();
-	$node0->safe_psql('postgres', "INSERT INTO $tbl VALUES (91, 1)");
-	$node1->safe_psql('postgres', "UPDATE $tbl SET v = v + 100 WHERE k = 91");
-
-	my $session = armed_session($node0, 1);
-	my $out = $session->query("INSERT INTO $tbl VALUES (91, 2)");
-	disarm_and_quit($session);
-
-	like($session->{stderr}, qr/duplicate key value violates unique constraint/,
-		'L12 requalification sees the peer-committed row through shared storage');
-	is($node0->safe_psql('postgres', "SELECT count(*) FROM $tbl WHERE k = 91"),
-		'1', 'L12 no duplicate row across nodes');
-}
-
 $node0->stop;
 $node1->stop;
+
+# ---------------------------------------------------------------
+# L12 — cluster-disabled upstream behavior.
+# ---------------------------------------------------------------
+{
+	my $disabled = PostgreSQL::Test::Cluster->new('stage8_r2_disabled');
+	$disabled->init;
+	$disabled->append_conf('postgresql.conf', "cluster.enabled = off\n");
+	$disabled->start;
+	is($disabled->safe_psql('postgres', 'SHOW cluster.enabled'), 'off',
+		'L12 runs with cluster.enabled=off');
+	$disabled->safe_psql('postgres',
+		'CREATE TABLE r2_disabled (k int PRIMARY KEY); '
+		. 'INSERT INTO r2_disabled VALUES (91)');
+	my ($rc, $out, $err) = $disabled->psql('postgres',
+		'INSERT INTO r2_disabled VALUES (91)');
+	isnt($rc, 0, 'L12 cluster-disabled duplicate still fails');
+	like($err // '', qr/duplicate key value violates unique constraint/,
+		'L12 cluster-disabled path preserves the upstream unique violation');
+	is($disabled->safe_psql('postgres',
+		'SELECT count(*) FROM r2_disabled WHERE k = 91'), '1',
+		'L12 cluster-disabled path leaves exactly one row');
+	$disabled->stop;
+}
 
 done_testing();

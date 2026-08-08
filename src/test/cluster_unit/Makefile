@@ -2156,29 +2156,21 @@ test_cluster_multixact_served: test_cluster_multixact_served.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-# spec-8.2 D9: test_cluster_share_barrier and test_cluster_heap_barrier pin
-# the barrier-aware SHARE refusal contract.  bufmgr.c cannot be linked
-# outside a backend, so these execute mutation-sensitive checks against the
-# production sources: the single clean-refusal epilogue and its ownership
-# order, the PG_TRY-safe seam, the typed TableAM result, the heap common
-# body, and the nbtree unwind/warm/research owner sequence.  The dynamic
-# end-to-end proof lives in cluster_tap t/407.
-test_cluster_share_barrier: test_cluster_share_barrier.c unit_test.h $(CLUSTER_VERSION_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) \
-		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
-		-DBUFMGR_HEADER_PATH='"$(top_srcdir)/src/include/storage/bufmgr.h"' \
-		$< \
-		$(CLUSTER_VERSION_O) \
+# Executable U1-U12 refusal choreography.  The test links the
+# dependency-light sequencer that bufmgr.c consumes; no production source is
+# opened or scanned by the test process.
+BUFMGR_BARRIER_O = $(top_builddir)/src/backend/storage/buffer/bufmgr_barrier.o
+test_cluster_share_barrier: test_cluster_share_barrier.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(BUFMGR_BARRIER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(BUFMGR_BARRIER_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-test_cluster_heap_barrier: test_cluster_heap_barrier.c unit_test.h $(CLUSTER_VERSION_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) \
-		-DTABLEAM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/table/tableam.c"' \
-		-DTABLEAM_HEADER_PATH='"$(top_srcdir)/src/include/access/tableam.h"' \
-		-DHEAPAM_HANDLER_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam_handler.c"' \
-		-DNBTINSERT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/nbtree/nbtinsert.c"' \
-		$< \
-		$(CLUSTER_VERSION_O) \
+TABLEAM_BARRIER_O = $(top_builddir)/src/backend/access/table/tableam_barrier.o
+test_cluster_heap_barrier: test_cluster_heap_barrier.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(TABLEAM_BARRIER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(TABLEAM_BARRIER_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

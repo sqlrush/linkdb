@@ -19,7 +19,6 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  - Adds the typed index-fetch convenience helper used by unique-index
  *		barrier requalification.
- *		Spec: spec-8.2-share-barrier-aware-unwind-requalify.md
  *
  *----------------------------------------------------------------------
  */
@@ -29,6 +28,7 @@
 
 #include "access/syncscan.h"
 #include "access/tableam.h"
+#include "access/tableam_barrier.h"
 #include "access/xact.h"
 #include "optimizer/plancat.h"
 #include "port/pg_bitutils.h"
@@ -241,6 +241,48 @@ table_index_fetch_tuple_check(Relation rel,
 	return found;
 }
 
+typedef struct TableIndexFetchBarrierContext
+{
+	IndexFetchTableData *scan;
+	ItemPointer tid;
+	Snapshot	snapshot;
+	TupleTableSlot *slot;
+} TableIndexFetchBarrierContext;
+
+static TableIndexFetchTupleResult
+table_index_fetch_barrier_typed(void *arg, bool *call_again, bool *all_dead)
+{
+	TableIndexFetchBarrierContext *context = arg;
+
+	return context->scan->rel->rd_tableam->index_fetch_tuple_barrier_aware(
+		context->scan, context->tid, context->snapshot, context->slot,
+		call_again, all_dead);
+}
+
+static bool
+table_index_fetch_barrier_legacy(void *arg, bool *call_again, bool *all_dead)
+{
+	TableIndexFetchBarrierContext *context = arg;
+
+	return table_index_fetch_tuple(context->scan, context->tid,
+		context->snapshot, context->slot, call_again, all_dead);
+}
+
+static void
+table_index_fetch_barrier_cleanup(void *arg)
+{
+	TableIndexFetchBarrierContext *context = arg;
+
+	table_index_fetch_end(context->scan);
+	ExecDropSingleTupleTableSlot(context->slot);
+}
+
+static const TableIndexFetchBarrierOps table_index_fetch_barrier_ops = {
+	.typed_fetch = table_index_fetch_barrier_typed,
+	.legacy_fetch = table_index_fetch_barrier_legacy,
+	.cleanup = table_index_fetch_barrier_cleanup
+};
+
 /*
  * PGRAC: perform the same one-shot lookup while preserving a clean buffer
  * barrier refusal as a distinct result.  Existing AMs remain compatible: a
@@ -252,27 +294,15 @@ table_index_fetch_tuple_check_barrier_aware(Relation rel,
 										Snapshot snapshot,
 										bool *all_dead)
 {
-	IndexFetchTableData *scan;
-	TupleTableSlot *slot;
-	TableIndexFetchTupleResult result;
-	bool		call_again = false;
+	TableIndexFetchBarrierContext context;
 
-	if (all_dead != NULL)
-		*all_dead = false;
-	slot = table_slot_create(rel, NULL);
-	scan = table_index_fetch_begin(rel);
-	if (rel->rd_tableam->index_fetch_tuple_barrier_aware != NULL)
-		result = rel->rd_tableam->index_fetch_tuple_barrier_aware(
-			scan, tid, snapshot, slot, &call_again, all_dead);
-	else if (table_index_fetch_tuple(scan, tid, snapshot, slot, &call_again,
-										 all_dead))
-		result = TABLE_INDEX_FETCH_FOUND;
-	else
-		result = TABLE_INDEX_FETCH_NOT_FOUND;
-	table_index_fetch_end(scan);
-	ExecDropSingleTupleTableSlot(slot);
-
-	return result;
+	context.slot = table_slot_create(rel, NULL);
+	context.scan = table_index_fetch_begin(rel);
+	context.tid = tid;
+	context.snapshot = snapshot;
+	return table_index_fetch_barrier_execute(&table_index_fetch_barrier_ops,
+		&context, rel->rd_tableam->index_fetch_tuple_barrier_aware != NULL,
+		all_dead);
 }
 
 

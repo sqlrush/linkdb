@@ -14,6 +14,7 @@ include $(top_builddir)/src/Makefile.global
 
 OBJS = \
 	buf_init.o \
+	bufmgr_barrier.o \
 	buf_table.o \
 	bufmgr.o \
 	freelist.o \

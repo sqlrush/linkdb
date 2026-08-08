@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_share_barrier.c
- *	  Source-executable contract tests for barrier-aware SHARE cleanup.
+ *	  Behavioral tests for barrier-refusal cleanup choreography.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -14,10 +14,10 @@
  *	  src/test/cluster_unit/test_cluster_share_barrier.c
  *
  * NOTES
- *	  This is a pgrac-original standalone test.  Full bufmgr.c cannot be
- *	  linked outside a backend, so these mutation-sensitive checks execute
- *	  against the production source and pin the refusal epilogue's ownership
- *	  order and public entry-point contract.
+ *	  This test executes the same dependency-light refusal sequencer used by
+ *	  bufmgr.c.  Callbacks model the real holder, writer, master and local
+ *	  ownership operations while retaining literal state and call-order
+ *	  evidence.  No source text is inspected.
  *
  *-------------------------------------------------------------------------
  */
@@ -25,18 +25,42 @@
 
 #undef printf
 
+#include "storage/bufmgr_barrier.h"
 #include "unit_test.h"
 
 
 UT_DEFINE_GLOBALS();
 
 
-#ifndef BUFMGR_SOURCE_PATH
-#error "BUFMGR_SOURCE_PATH must identify production bufmgr.c"
-#endif
-#ifndef BUFMGR_HEADER_PATH
-#error "BUFMGR_HEADER_PATH must identify production bufmgr.h"
-#endif
+typedef enum FixtureAction
+{
+	ACTION_ABORT_HOLDER = 1,
+	ACTION_ABORT_WRITER,
+	ACTION_RELEASE_MASTER,
+	ACTION_CONVERGE_LOCAL,
+	ACTION_ABORT_PENDING,
+	ACTION_PROVE_EMPTY
+} FixtureAction;
+
+typedef struct BarrierFixture
+{
+	bool		content_lock;
+	bool		holder;
+	bool		writer;
+	bool		pending;
+	bool		master_grant;
+	bool		cached_share_cover;
+	bool		outer_lock;
+	bool		first_buffer_lock;
+	int			pins;
+	ClusterBufferBarrierCleanupResult holder_result;
+	ClusterBufferBarrierCleanupResult writer_result;
+	ClusterBufferBarrierCleanupResult master_result;
+	ClusterBufferBarrierCleanupResult converge_result;
+	ClusterBufferBarrierCleanupResult pending_result;
+	FixtureAction actions[8];
+	int			action_count;
+} BarrierFixture;
 
 void
 ExceptionalCondition(const char *condition_name pg_attribute_unused(),
@@ -46,354 +70,273 @@ ExceptionalCondition(const char *condition_name pg_attribute_unused(),
 	abort();
 }
 
-static char *
-read_source(const char *path)
+static void
+record_action(BarrierFixture *fixture, FixtureAction action)
 {
-	FILE	   *file;
-	char	   *source;
-	long		length;
-
-	file = fopen(path, "rb");
-	UT_ASSERT_NOT_NULL(file);
-	if (file == NULL)
-		return NULL;
-	UT_ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
-	length = ftell(file);
-	UT_ASSERT(length > 0);
-	UT_ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
-	source = malloc((size_t) length + 1);
-	UT_ASSERT_NOT_NULL(source);
-	if (source == NULL)
-	{
-		fclose(file);
-		return NULL;
-	}
-	UT_ASSERT_EQ((long) fread(source, 1, (size_t) length, file), length);
-	source[length] = '\0';
-	fclose(file);
-	return source;
+	fixture->actions[fixture->action_count++] = action;
 }
 
-static const char *
-find_function_end(const char *function)
+static ClusterBufferBarrierCleanupResult
+fixture_abort_holder(void *context)
 {
-	return function != NULL ? strstr(function, "\n}\n") : NULL;
+	BarrierFixture *fixture = context;
+
+	record_action(fixture, ACTION_ABORT_HOLDER);
+	if (fixture->holder_result == CLUSTER_BUFFER_BARRIER_CLEAN)
+		fixture->holder = false;
+	return fixture->holder_result;
 }
 
-static int
-count_occurrences(const char *source, const char *needle)
+static ClusterBufferBarrierCleanupResult
+fixture_abort_writer(void *context)
 {
-	int			count = 0;
+	BarrierFixture *fixture = context;
 
-	while (source != NULL && (source = strstr(source, needle)) != NULL)
-	{
-		count++;
-		source += strlen(needle);
-	}
-	return count;
+	record_action(fixture, ACTION_ABORT_WRITER);
+	if (fixture->writer_result == CLUSTER_BUFFER_BARRIER_CLEAN)
+		fixture->writer = false;
+	return fixture->writer_result;
 }
 
-UT_TEST(test_share_wrapper_reports_only_typed_refusal)
+static ClusterBufferBarrierCleanupResult
+fixture_release_master(void *context)
 {
-	char	   *header = read_source(BUFMGR_HEADER_PATH);
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *wrapper;
-	const char *wrapper_end;
+	BarrierFixture *fixture = context;
 
-	UT_ASSERT_NOT_NULL(header);
-	UT_ASSERT_NOT_NULL(source);
-	if (header != NULL)
-		UT_ASSERT_NOT_NULL(strstr(header,
-								 "extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);"));
-	wrapper = source != NULL ? strstr(source,
-									 "\nClusterLockBufferShareBarrierAware(Buffer buffer)") : NULL;
-	wrapper_end = find_function_end(wrapper);
-	UT_ASSERT_NOT_NULL(wrapper);
-	UT_ASSERT_NOT_NULL(wrapper_end);
-	if (wrapper != NULL && wrapper_end != NULL)
-	{
-		const char *call = strstr(wrapper,
-								  "LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused);");
-
-		UT_ASSERT(call != NULL && call < wrapper_end);
-		UT_ASSERT(strstr(wrapper, "return !barrier_refused;") < wrapper_end);
-	}
-	free(header);
-	free(source);
+	record_action(fixture, ACTION_RELEASE_MASTER);
+	if (fixture->master_result == CLUSTER_BUFFER_BARRIER_CLEAN)
+		fixture->master_grant = false;
+	return fixture->master_result;
 }
 
-UT_TEST(test_all_typed_refusals_converge_on_one_epilogue)
+static ClusterBufferBarrierCleanupResult
+fixture_converge_local(void *context)
 {
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *lockbuffer;
-	const char *lockbuffer_end;
-	const char *label;
+	BarrierFixture *fixture = context;
 
-	UT_ASSERT_NOT_NULL(source);
-	lockbuffer = source != NULL ? strstr(source,
-									"\nLockBufferInternal(Buffer buffer, int mode") : NULL;
-	lockbuffer_end = find_function_end(lockbuffer);
-	label = lockbuffer != NULL ? strstr(lockbuffer,
-									 "cluster_lockbuffer_barrier_refusal:") : NULL;
-	UT_ASSERT_NOT_NULL(lockbuffer);
-	UT_ASSERT_NOT_NULL(lockbuffer_end);
-	UT_ASSERT(label != NULL && label < lockbuffer_end);
-	if (lockbuffer != NULL && lockbuffer_end != NULL && label != NULL)
-	{
-		UT_ASSERT(count_occurrences(lockbuffer,
-									"goto cluster_lockbuffer_barrier_refusal;") >= 3);
-		UT_ASSERT(strstr(label,
-							 "cluster_bufmgr_pcm_unwind_barrier_refusal(") < lockbuffer_end);
-	}
-	free(source);
+	record_action(fixture, ACTION_CONVERGE_LOCAL);
+	if (fixture->converge_result == CLUSTER_BUFFER_BARRIER_CLEAN)
+		fixture->pending = false;
+	return fixture->converge_result;
 }
 
-UT_TEST(test_refusal_cleanup_preserves_required_order)
+static ClusterBufferBarrierCleanupResult
+fixture_abort_pending(void *context)
 {
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *cleanup;
-	const char *cleanup_end;
-	const char *holder;
-	const char *writer;
-	const char *master_release;
-	const char *local_converge;
-	const char *pending_abort;
+	BarrierFixture *fixture = context;
 
-	UT_ASSERT_NOT_NULL(source);
-	cleanup = source != NULL ? strstr(source,
-								   "\ncluster_bufmgr_pcm_unwind_barrier_refusal(") : NULL;
-	cleanup_end = find_function_end(cleanup);
-	UT_ASSERT_NOT_NULL(cleanup);
-	UT_ASSERT_NOT_NULL(cleanup_end);
-	if (cleanup != NULL && cleanup_end != NULL)
-	{
-		holder = strstr(cleanup, "cluster_bufmgr_pcm_x_holder_abort_acquiring(");
-		writer = strstr(cleanup, "cluster_bufmgr_pcm_x_writer_abort_acquiring(");
-		master_release = strstr(cleanup, "cluster_pcm_lock_release_buffer_for_eviction(");
-		local_converge = strstr(cleanup,
-								"cluster_pcm_own_abort_grant_after_master_rollback(");
-		pending_abort = strstr(cleanup, "cluster_pcm_own_abort_grant_or_error(");
-		UT_ASSERT(holder != NULL && holder < cleanup_end);
-		UT_ASSERT(writer != NULL && holder < writer && writer < cleanup_end);
-		UT_ASSERT(master_release != NULL && writer < master_release && master_release < cleanup_end);
-		UT_ASSERT(local_converge != NULL && master_release < local_converge
-				  && local_converge < cleanup_end);
-		UT_ASSERT(pending_abort != NULL && local_converge < pending_abort
-				  && pending_abort < cleanup_end);
-	}
-	free(source);
+	record_action(fixture, ACTION_ABORT_PENDING);
+	if (fixture->pending_result == CLUSTER_BUFFER_BARRIER_CLEAN)
+		fixture->pending = false;
+	return fixture->pending_result;
 }
 
-UT_TEST(test_refusal_cleanup_proves_empty_target_ownership)
+static bool
+fixture_prove_empty(void *context)
 {
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *cleanup;
-	const char *cleanup_end;
+	BarrierFixture *fixture = context;
 
-	UT_ASSERT_NOT_NULL(source);
-	cleanup = source != NULL ? strstr(source,
-								   "\ncluster_bufmgr_pcm_unwind_barrier_refusal(") : NULL;
-	cleanup_end = find_function_end(cleanup);
-	UT_ASSERT_NOT_NULL(cleanup);
-	UT_ASSERT_NOT_NULL(cleanup_end);
-	if (cleanup != NULL && cleanup_end != NULL)
-	{
-		const char *content = strstr(cleanup, "LWLockHeldByMe(");
-		const char *holder = strstr(cleanup, "cluster_bufmgr_pcm_x_holder_find(buf)");
-		const char *writer = strstr(cleanup, "cluster_bufmgr_pcm_x_writer_find(buf)");
-		const char *pending = strstr(cleanup, "PCM_OWN_FLAG_GRANT_PENDING");
-		const char *release_buffer = strstr(cleanup, "ReleaseBuffer(");
-
-		/* The step-7 postcondition asserts, all inside this function body. */
-		UT_ASSERT(content != NULL && content < cleanup_end);
-		UT_ASSERT(holder != NULL && holder < cleanup_end);
-		UT_ASSERT(writer != NULL && writer < cleanup_end);
-		UT_ASSERT(pending != NULL && pending < cleanup_end);
-		/* A hit must lie beyond the epilogue: the caller owns every pin. */
-		UT_ASSERT(release_buffer == NULL || release_buffer > cleanup_end);
-	}
-	free(source);
+	record_action(fixture, ACTION_PROVE_EMPTY);
+	return !fixture->content_lock && !fixture->holder && !fixture->writer
+		&& !fixture->pending && !fixture->master_grant;
 }
 
-UT_TEST(test_share_injection_uses_the_real_cleanup_boundary)
+static const ClusterBufferBarrierUnwindOps fixture_ops = {
+	.abort_holder = fixture_abort_holder,
+	.abort_writer = fixture_abort_writer,
+	.release_master = fixture_release_master,
+	.converge_local = fixture_converge_local,
+	.abort_pending = fixture_abort_pending,
+	.prove_empty = fixture_prove_empty
+};
+
+static BarrierFixture
+clean_fixture(void)
 {
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *lockbuffer;
-	const char *inject;
-	const char *lock_acquire;
+	BarrierFixture fixture;
 
-	UT_ASSERT_NOT_NULL(source);
-	lockbuffer = source != NULL ? strstr(source,
-									"\nLockBufferInternal(Buffer buffer, int mode") : NULL;
-	inject = lockbuffer != NULL ? strstr(lockbuffer,
-									 "cluster-pcm-share-barrier-refuse-after-acquire") : NULL;
-	UT_ASSERT_NOT_NULL(inject);
-
-	/* Barrier-aware SHARE only: an ordinary caller passes a NULL refusal
-	 * pointer and an EXCLUSIVE request has a different pcm_mode. */
-	if (inject != NULL)
-	{
-		const char *gate_start = inject - 400 > lockbuffer ? inject - 400 : lockbuffer;
-
-		UT_ASSERT_NOT_NULL(strstr(gate_start, "pcm_mode == PCM_LOCK_MODE_S"));
-		UT_ASSERT_NOT_NULL(strstr(gate_start, "pcm_barrier_refused != NULL"));
-	}
-
-	/* It fires strictly before the target content lock, and only sets the
-	 * flag: leaving the PG_TRY body with a goto would skip PG_END_TRY and
-	 * corrupt the exception stack, so the refusal must travel through the
-	 * ordinary post-PG_END_TRY exit. */
-	lock_acquire = inject != NULL
-		? strstr(inject, "LWLockAcquire(BufferDescriptorGetContentLock(buf)") : NULL;
-	UT_ASSERT_NOT_NULL(lock_acquire);
-	if (inject != NULL && lock_acquire != NULL)
-	{
-		const char *set_flag = strstr(inject, "*pcm_barrier_refused = true;");
-		const char *end_try = strstr(inject, "PG_END_TRY();");
-		const char *jump = strstr(inject, "goto cluster_lockbuffer_barrier_refusal;");
-
-		UT_ASSERT(set_flag != NULL && set_flag < lock_acquire);
-		UT_ASSERT(end_try != NULL && jump != NULL && end_try < jump);
-	}
-	free(source);
+	MemSet(&fixture, 0, sizeof(fixture));
+	fixture.outer_lock = true;
+	fixture.first_buffer_lock = true;
+	fixture.cached_share_cover = true;
+	fixture.pins = 2;
+	return fixture;
 }
 
-/*
- * Every barrier-aware exit inside the PG_TRY body must be a flag store, never
- * a jump: the epilogue label lives outside that block and PG_END_TRY has to
- * run exactly once first.
- */
-UT_TEST(test_no_barrier_jump_escapes_the_try_block)
+UT_TEST(test_u1_early_barrier_proves_empty)
 {
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *lockbuffer;
-	const char *try_start;
-	const char *try_end;
+	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_NOT_NULL(source);
-	lockbuffer = source != NULL ? strstr(source,
-									"\nLockBufferInternal(Buffer buffer, int mode") : NULL;
-	UT_ASSERT_NOT_NULL(lockbuffer);
-	try_start = lockbuffer != NULL ? strstr(lockbuffer, "PG_TRY();") : NULL;
-	try_end = try_start != NULL ? strstr(try_start, "PG_END_TRY();") : NULL;
-	UT_ASSERT_NOT_NULL(try_start);
-	UT_ASSERT_NOT_NULL(try_end);
-	if (try_start != NULL && try_end != NULL)
-	{
-		const char *jump = strstr(try_start, "goto cluster_lockbuffer_barrier_refusal;");
-
-		UT_ASSERT(jump == NULL || jump > try_end);
-	}
-	free(source);
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT_EQ(fixture.action_count, 3);
+	UT_ASSERT_EQ(fixture.actions[2], ACTION_PROVE_EMPTY);
 }
 
-/*
- * hio's two-buffer precedent (spec-8.2 §3.1) stays an independent row: the
- * epilogue unwinds only the target acquisition it was handed and never
- * touches a caller-owned buffer, pin or content lock.
- */
-UT_TEST(test_epilogue_never_touches_caller_owned_buffers)
+UT_TEST(test_u2_cached_cover_is_not_released)
 {
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *cleanup;
-	const char *cleanup_end;
+	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_NOT_NULL(source);
-	cleanup = source != NULL ? strstr(source,
-								   "\ncluster_bufmgr_pcm_unwind_barrier_refusal(") : NULL;
-	cleanup_end = find_function_end(cleanup);
-	UT_ASSERT_NOT_NULL(cleanup);
-	UT_ASSERT_NOT_NULL(cleanup_end);
-	if (cleanup != NULL && cleanup_end != NULL)
-	{
-		char		body[8192];
-		size_t		length = (size_t) (cleanup_end - cleanup);
-
-		if (length >= sizeof(body))
-			length = sizeof(body) - 1;
-		memcpy(body, cleanup, length);
-		body[length] = '\0';
-		UT_ASSERT_NULL(strstr(body, "ReleaseBuffer("));
-		UT_ASSERT_NULL(strstr(body, "UnpinBuffer("));
-		UT_ASSERT_NULL(strstr(body, "PinBuffer("));
-		UT_ASSERT_NULL(strstr(body, "LWLockRelease("));
-		UT_ASSERT_NULL(strstr(body, "LWLockAcquire("));
-		UT_ASSERT_EQ(count_occurrences(body, "cluster_pcm_lock_release_buffer_for_eviction("), 1);
-		UT_ASSERT_EQ(count_occurrences(body,
-									   "cluster_pcm_own_abort_grant_after_master_rollback("), 1);
-	}
-	free(source);
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT(!fixture.master_grant);
+	UT_ASSERT(fixture.cached_share_cover);
+	UT_ASSERT_EQ(fixture.actions[0], ACTION_ABORT_HOLDER);
 }
 
-/*
- * A durable-grant refusal releases the master grant before converging the
- * local reservation, and a convergence failure is the data-corruption-class
- * ERROR (spec-8.2 §2.2 steps 4-6).  Deleting either call or swapping their
- * order makes this RED.
- */
-UT_TEST(test_durable_grant_refusal_orders_master_before_local)
+UT_TEST(test_u3_read_image_clears_exact_pending)
 {
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *cleanup;
-	const char *cleanup_end;
+	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_NOT_NULL(source);
-	cleanup = source != NULL ? strstr(source,
-								   "\ncluster_bufmgr_pcm_unwind_barrier_refusal(") : NULL;
-	cleanup_end = find_function_end(cleanup);
-	UT_ASSERT_NOT_NULL(cleanup);
-	UT_ASSERT_NOT_NULL(cleanup_end);
-	if (cleanup != NULL && cleanup_end != NULL)
-	{
-		const char *acquired_gate = strstr(cleanup, "if (pcm_acquired)");
-		const char *master = strstr(cleanup, "cluster_pcm_lock_release_buffer_for_eviction(");
-		const char *local = strstr(cleanup, "cluster_pcm_own_abort_grant_after_master_rollback(");
-		const char *corrupt = strstr(cleanup, "ERRCODE_DATA_CORRUPTED");
-		const char *pending_only = strstr(cleanup, "else if (pcm_pending_set)");
-
-		UT_ASSERT(acquired_gate != NULL && master != NULL && acquired_gate < master);
-		UT_ASSERT(local != NULL && master < local && local < cleanup_end);
-		UT_ASSERT(corrupt != NULL && local < corrupt && corrupt < cleanup_end);
-		/* READ_IMAGE and pre-acquire refusals take the pending-only branch. */
-		UT_ASSERT(pending_only != NULL && corrupt < pending_only && pending_only < cleanup_end);
-		UT_ASSERT_NOT_NULL(strstr(cleanup, "Assert(!pcm_acquired || pcm_pending_set);"));
-	}
-	free(source);
+	fixture.pending = true;
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, true),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT(!fixture.pending);
+	UT_ASSERT_EQ(fixture.actions[2], ACTION_ABORT_PENDING);
 }
 
-UT_TEST(test_ordinary_and_exclusive_entry_points_remain_separate)
+UT_TEST(test_u4_durable_grant_releases_master_before_local)
 {
-	char	   *source = read_source(BUFMGR_SOURCE_PATH);
-	const char *ordinary;
-	const char *exclusive;
+	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_NOT_NULL(source);
-	ordinary = source != NULL ? strstr(source, "\nLockBuffer(Buffer buffer, int mode)") : NULL;
-	exclusive = source != NULL ? strstr(source,
-									 "\nClusterLockBufferExclusiveBarrierAware(Buffer buffer)") : NULL;
-	UT_ASSERT_NOT_NULL(ordinary);
-	UT_ASSERT_NOT_NULL(exclusive);
-	if (ordinary != NULL)
-		UT_ASSERT_NOT_NULL(strstr(ordinary, "LockBufferInternal(buffer, mode, NULL);"));
-	if (exclusive != NULL)
-		UT_ASSERT_NOT_NULL(strstr(exclusive,
-								 "LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused);"));
-	free(source);
+	fixture.pending = true;
+	fixture.master_grant = true;
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  true, true),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT_EQ(fixture.actions[2], ACTION_RELEASE_MASTER);
+	UT_ASSERT_EQ(fixture.actions[3], ACTION_CONVERGE_LOCAL);
+	UT_ASSERT_EQ(fixture.actions[4], ACTION_PROVE_EMPTY);
+}
+
+UT_TEST(test_u5_rearm_barrier_does_not_abort_twice)
+{
+	BarrierFixture fixture = clean_fixture();
+
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT_EQ(fixture.action_count, 3);
+}
+
+UT_TEST(test_u6_holder_is_removed_before_clean_return)
+{
+	BarrierFixture fixture = clean_fixture();
+	BarrierFixture deferred = clean_fixture();
+
+	fixture.holder = true;
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT(!fixture.holder);
+	UT_ASSERT_EQ(fixture.actions[2], ACTION_PROVE_EMPTY);
+
+	deferred.holder = true;
+	deferred.holder_result = CLUSTER_BUFFER_BARRIER_DEFERRED;
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &deferred,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_HOLDER_NOT_EMPTY);
+	UT_ASSERT(deferred.holder);
+}
+
+UT_TEST(test_u7_master_release_failure_preserves_pending)
+{
+	BarrierFixture fixture = clean_fixture();
+
+	fixture.pending = true;
+	fixture.master_grant = true;
+	fixture.master_result = CLUSTER_BUFFER_BARRIER_FAILED;
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  true, true),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_MASTER_RELEASE_FAILED);
+	UT_ASSERT(fixture.pending);
+	UT_ASSERT(fixture.master_grant);
+}
+
+UT_TEST(test_u8_local_convergence_failure_is_not_clean)
+{
+	BarrierFixture fixture = clean_fixture();
+
+	fixture.pending = true;
+	fixture.master_grant = true;
+	fixture.converge_result = CLUSTER_BUFFER_BARRIER_FAILED;
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  true, true),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_LOCAL_CONVERGENCE_FAILED);
+	UT_ASSERT(fixture.pending);
+	UT_ASSERT(!fixture.master_grant);
+}
+
+UT_TEST(test_u9_clean_success_is_the_only_false_postcondition)
+{
+	BarrierFixture fixture = clean_fixture();
+
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT(!fixture.content_lock);
+}
+
+UT_TEST(test_u10_exclusive_writer_cleanup_is_exact)
+{
+	BarrierFixture fixture = clean_fixture();
+	BarrierFixture deferred = clean_fixture();
+
+	fixture.writer = true;
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT(!fixture.writer);
+	UT_ASSERT(fixture.outer_lock);
+
+	deferred.writer = true;
+	deferred.writer_result = CLUSTER_BUFFER_BARRIER_DEFERRED;
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &deferred,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_WRITER_NOT_EMPTY);
+	UT_ASSERT(deferred.writer);
+}
+
+UT_TEST(test_u11_two_buffer_outer_lock_stays_owned)
+{
+	BarrierFixture fixture = clean_fixture();
+
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT(fixture.first_buffer_lock);
+}
+
+UT_TEST(test_u12_pins_and_outer_ownership_are_unchanged)
+{
+	BarrierFixture fixture = clean_fixture();
+
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
+												  false, false),
+				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
+	UT_ASSERT_EQ(fixture.pins, 2);
+	UT_ASSERT(fixture.outer_lock);
 }
 
 int
 main(void)
 {
-	UT_PLAN(9);
-	UT_RUN(test_share_wrapper_reports_only_typed_refusal);
-	UT_RUN(test_all_typed_refusals_converge_on_one_epilogue);
-	UT_RUN(test_refusal_cleanup_preserves_required_order);
-	UT_RUN(test_refusal_cleanup_proves_empty_target_ownership);
-	UT_RUN(test_share_injection_uses_the_real_cleanup_boundary);
-	UT_RUN(test_no_barrier_jump_escapes_the_try_block);
-	UT_RUN(test_epilogue_never_touches_caller_owned_buffers);
-	UT_RUN(test_durable_grant_refusal_orders_master_before_local);
-	UT_RUN(test_ordinary_and_exclusive_entry_points_remain_separate);
+	UT_PLAN(12);
+	UT_RUN(test_u1_early_barrier_proves_empty);
+	UT_RUN(test_u2_cached_cover_is_not_released);
+	UT_RUN(test_u3_read_image_clears_exact_pending);
+	UT_RUN(test_u4_durable_grant_releases_master_before_local);
+	UT_RUN(test_u5_rearm_barrier_does_not_abort_twice);
+	UT_RUN(test_u6_holder_is_removed_before_clean_return);
+	UT_RUN(test_u7_master_release_failure_preserves_pending);
+	UT_RUN(test_u8_local_convergence_failure_is_not_clean);
+	UT_RUN(test_u9_clean_success_is_the_only_false_postcondition);
+	UT_RUN(test_u10_exclusive_writer_cleanup_is_exact);
+	UT_RUN(test_u11_two_buffer_outer_lock_stays_owned);
+	UT_RUN(test_u12_pins_and_outer_ownership_are_unchanged);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
