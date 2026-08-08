@@ -179,15 +179,22 @@ itl_touch_capture_proof(const ClusterItlTouchHandle *handle, Buffer buffer, Tran
 		|| (slot->flags != ITL_FLAG_ACTIVE && slot->flags != ITL_FLAG_LOCK_ONLY_ACTIVE))
 		return;
 
+	/*
+	 * The slot incarnation is confirmed: record its identity even when the
+	 * authority projection below fails, so the caller's dedupe can find and
+	 * invalidate an existing record for the same (xid, wrap) incarnation.
+	 * `valid` stays false on that path.
+	 */
+	proof->xid = xid;
+	proof->buffer_id = buffer - 1;
+	proof->slot_wrap = slot->wrap;
+	proof->slot_class = slot->flags;
+
 	if (!cluster_bufmgr_pcm_x_holder_stamp_authority(buffer, &own_generation, &acquisition_epoch))
 		return;
 
-	proof->xid = xid;
-	proof->buffer_id = buffer - 1;
 	proof->own_generation = own_generation;
 	proof->acquisition_epoch = acquisition_epoch;
-	proof->slot_wrap = slot->wrap;
-	proof->slot_class = slot->flags;
 	proof->valid = true;
 }
 
@@ -228,13 +235,22 @@ cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle, Buffer buf
 		 * generation would let the stamp trust a round that has already
 		 * moved on.
 		 */
-		existing->key.flags |= handle->flags;
+		existing->key.flags |= (handle->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL);
 		if (proof.valid)
 			existing->proof = proof;
 		else
 			existing->proof.valid = false;
 		return;
 	}
+
+	/*
+	 * A failed capture never appends: the authority proof is obtained
+	 * first, and only then is a record appended.  The slot stays safe
+	 * without an entry -- the terminal stamp is a hint and TT/CLOG/undo
+	 * resolves it.
+	 */
+	if (!proof.valid)
+		return;
 
 	itl_touch_append(handle, &proof);
 }
