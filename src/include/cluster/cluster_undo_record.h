@@ -66,6 +66,10 @@
 #include "cluster/cluster_itl_slot.h"	 /* UBA */
 #include "cluster/cluster_undo_format.h" /* UndoBlockHeader for cap macro */
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_tx_resolve.h" /* R4 exact locator + typed reason */
+#endif
+
 
 /*
  * UndoRecordType -- op-specific record type discriminator.
@@ -142,6 +146,42 @@ typedef struct UndoRecordHeader {
 } UndoRecordHeader;
 
 StaticAssertDecl(sizeof(UndoRecordHeader) == 64, "UndoRecordHeader must be 64B — HC213");
+
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * R4 B1 callable scaffold.  These pure validators deliberately fail closed
+ * until their behavior has executed RED in test_cluster_r4_cr_walk.
+ */
+static inline bool
+cluster_undo_record_validate_identity(const ClusterTxLocator *locator, UBA record_uba,
+									  const UndoRecordHeader *record,
+									  ClusterTxResolveReason *reason_out)
+{
+	(void)locator;
+	(void)record_uba;
+	(void)record;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
+	return false;
+}
+
+static inline bool
+cluster_undo_record_validate_prev_edge(const ClusterTxLocator *locator, UBA current_uba,
+									   const UndoRecordHeader *current, UBA previous_uba,
+									   const UndoRecordHeader *previous,
+									   ClusterTxResolveReason *reason_out)
+{
+	(void)locator;
+	(void)current_uba;
+	(void)current;
+	(void)previous_uba;
+	(void)previous;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
+	return false;
+}
+#endif /* USE_PGRAC_CLUSTER */
 
 
 /*
