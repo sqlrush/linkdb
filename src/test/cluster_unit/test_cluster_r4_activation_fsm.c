@@ -71,14 +71,14 @@ valid_ack(void)
 		UT_ASSERT_EQ(next, (state_value));                                                         \
 	}
 
-#define DEFINE_FAILURE_TEST(test_name, state_value, expected_revert)                               \
+#define DEFINE_FAILURE_TEST(test_name, state_value, expected_closed, expected_revert)              \
 	UT_TEST(test_name)                                                                             \
 	{                                                                                              \
 		SemanticActivationFailurePolicy policy;                                                    \
 		memset(&policy, 0, sizeof(policy));                                                        \
 		UT_ASSERT(semantic_activation_failure_policy((state_value), &policy));                     \
 		UT_ASSERT_EQ(policy.target, SEMANTIC_ACTIVATION_STATE_SOURCE_OPEN);                        \
-		UT_ASSERT(policy.admission_closed_until_source_open);                                      \
+		UT_ASSERT_EQ(policy.admission_closed_until_source_open, (expected_closed));                \
 		UT_ASSERT_EQ(policy.revert_source_closed, (expected_revert));                              \
 	}
 
@@ -314,25 +314,31 @@ UT_TEST(test_54_invalid_high_state_has_no_edge)
 }
 
 DEFINE_FAILURE_TEST(test_55_failure_at_source_open_restores_source,
-					SEMANTIC_ACTIVATION_STATE_SOURCE_OPEN, false)
+					SEMANTIC_ACTIVATION_STATE_SOURCE_OPEN, false, false)
 DEFINE_FAILURE_TEST(test_56_failure_after_admission_stop_restores_source,
-					SEMANTIC_ACTIVATION_STATE_SOURCE_ADMISSION_STOPPED, false)
+					SEMANTIC_ACTIVATION_STATE_SOURCE_ADMISSION_STOPPED, true, false)
 DEFINE_FAILURE_TEST(test_57_failure_during_drain_restores_source,
-					SEMANTIC_ACTIVATION_STATE_SOURCE_DRAIN_OR_RECOVERY, false)
+					SEMANTIC_ACTIVATION_STATE_SOURCE_DRAIN_OR_RECOVERY, true, false)
 DEFINE_FAILURE_TEST(test_58_failure_after_logical_zero_restores_source,
-					SEMANTIC_ACTIVATION_STATE_SOURCE_LOGICAL_ZERO, false)
+					SEMANTIC_ACTIVATION_STATE_SOURCE_LOGICAL_ZERO, true, false)
 DEFINE_FAILURE_TEST(test_59_failure_during_ordered_barrier_restores_source,
-					SEMANTIC_ACTIVATION_STATE_ORDERED_TRANSPORT_BARRIER, false)
+					SEMANTIC_ACTIVATION_STATE_ORDERED_TRANSPORT_BARRIER, true, false)
 DEFINE_FAILURE_TEST(test_60_failure_after_transport_zero_restores_source,
-					SEMANTIC_ACTIVATION_STATE_TRANSPORT_BACKED_ZERO, false)
+					SEMANTIC_ACTIVATION_STATE_TRANSPORT_BACKED_ZERO, true, false)
 DEFINE_FAILURE_TEST(test_61_failure_at_epoch_barrier_restores_source,
-					SEMANTIC_ACTIVATION_STATE_EPOCH_CAPABILITY_BARRIER, false)
+					SEMANTIC_ACTIVATION_STATE_EPOCH_CAPABILITY_BARRIER, true, false)
 DEFINE_FAILURE_TEST(test_62_failure_after_prepare_restores_source,
-					SEMANTIC_ACTIVATION_STATE_TARGET_STAGED, false)
+					SEMANTIC_ACTIVATION_STATE_TARGET_STAGED, true, false)
 DEFINE_FAILURE_TEST(test_63_failure_after_commit_requires_revert_closed,
-					SEMANTIC_ACTIVATION_STATE_TARGET_COMMITTED_CLOSED, true)
-DEFINE_FAILURE_TEST(test_64_failure_before_open_never_leaves_half_open,
-					SEMANTIC_ACTIVATION_STATE_TARGET_OPEN, true)
+					SEMANTIC_ACTIVATION_STATE_TARGET_COMMITTED_CLOSED, true, true)
+
+UT_TEST(test_64_target_open_is_not_reinterpreted_as_transition_failure)
+{
+	SemanticActivationFailurePolicy policy;
+
+	memset(&policy, 0, sizeof(policy));
+	UT_ASSERT(!semantic_activation_failure_policy(SEMANTIC_ACTIVATION_STATE_TARGET_OPEN, &policy));
+}
 
 UT_TEST(test_65_identical_ack_tuple_matches)
 {
@@ -623,7 +629,7 @@ main(void)
 	UT_RUN(test_61_failure_at_epoch_barrier_restores_source);
 	UT_RUN(test_62_failure_after_prepare_restores_source);
 	UT_RUN(test_63_failure_after_commit_requires_revert_closed);
-	UT_RUN(test_64_failure_before_open_never_leaves_half_open);
+	UT_RUN(test_64_target_open_is_not_reinterpreted_as_transition_failure);
 	UT_RUN(test_65_identical_ack_tuple_matches);
 	UT_RUN(test_66_node_change_invalidates_ack);
 	UT_RUN(test_67_boot_change_invalidates_ack);
