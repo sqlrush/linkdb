@@ -33,9 +33,15 @@ UT_DEFINE_GLOBALS();
 #define TEST_TT_OFFSET ((uint16)3)
 
 static UBA
+make_record_uba_in_segment(uint32 segment, uint32 block, uint16 row)
+{
+	return uba_encode(segment, block, TEST_TT_OFFSET, row);
+}
+
+static UBA
 make_record_uba(uint32 block, uint16 row)
 {
-	return uba_encode(TEST_SEGMENT, block, TEST_TT_OFFSET, row);
+	return make_record_uba_in_segment(TEST_SEGMENT, block, row);
 }
 
 static ClusterTxLocator
@@ -171,7 +177,8 @@ UT_TEST(test_head_tt_segment_mismatch_is_rejected)
 	ClusterTxLocator locator = make_locator();
 	UndoRecordHeader head = make_record(locator.uba, 2);
 
-	head.tt_slot_segment_id++;
+	/* Segment 257 belongs to a different owner partition than segment 1. */
+	head.tt_slot_segment_id = 257;
 	assert_head_rejected(&locator, locator.uba, &head, CLUSTER_TX_RESOLVE_SLOT_MISMATCH);
 }
 
@@ -201,6 +208,22 @@ UT_TEST(test_previous_edge_accepts_same_tx_different_target_offset)
 	UndoRecordHeader previous = make_record(previous_uba, 1);
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
+	head.prev_uba = previous_uba;
+	UT_ASSERT(cluster_undo_record_validate_prev_edge(&locator, locator.uba, &head, previous_uba,
+													 &previous, &reason));
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+}
+
+UT_TEST(test_previous_edge_accepts_same_owner_physical_segment_rollover)
+{
+	ClusterTxLocator locator = make_locator();
+	UBA previous_uba = make_record_uba_in_segment(2, 9, 500);
+	UndoRecordHeader head = make_record(locator.uba, 2);
+	UndoRecordHeader previous = make_record(previous_uba, 1);
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	/* Physical segment 2 is a same-owner alias; canonical TT binding stays 1. */
+	previous.tt_slot_segment_id = head.tt_slot_segment_id;
 	head.prev_uba = previous_uba;
 	UT_ASSERT(cluster_undo_record_validate_prev_edge(&locator, locator.uba, &head, previous_uba,
 													 &previous, &reason));
@@ -288,7 +311,7 @@ UT_TEST(test_previous_edge_tt_segment_mismatch_is_rejected)
 	UndoRecordHeader previous = make_record(previous_uba, 1);
 
 	head.prev_uba = previous_uba;
-	previous.tt_slot_segment_id++;
+	previous.tt_slot_segment_id = 257;
 	assert_edge_rejected(&locator, locator.uba, &head, previous_uba, &previous,
 						 CLUSTER_TX_RESOLVE_SLOT_MISMATCH);
 }
@@ -322,7 +345,7 @@ UT_TEST(test_previous_edge_origin_mismatch_is_rejected)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 
 	UT_RUN(test_head_identity_accepts_exact_uba_xid_wrap_and_tt_slot);
 	UT_RUN(test_head_target_offset_is_not_transaction_identity);
@@ -335,6 +358,7 @@ main(int argc, char **argv)
 	UT_RUN(test_head_tt_slot_mismatch_is_rejected);
 	UT_RUN(test_head_origin_mismatch_is_rejected);
 	UT_RUN(test_previous_edge_accepts_same_tx_different_target_offset);
+	UT_RUN(test_previous_edge_accepts_same_owner_physical_segment_rollover);
 	UT_RUN(test_previous_edge_pointer_mismatch_is_rejected);
 	UT_RUN(test_previous_edge_malformed_uba_is_rejected);
 	UT_RUN(test_previous_edge_self_cycle_is_rejected);
