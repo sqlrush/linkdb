@@ -6155,41 +6155,16 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 										 &block_payload_release_cb, &block_payload_release_arg,
 										 &sf_dep_vec, &sf_dep_valid, NULL)) {
 				/*
-				 * PGRAC: spec-5.2 §3.5 D11 — active-ITL hard boundary.  Even as master+holder,
-				 * if WE still have an uncommitted ITL slot on this block
-				 * (ITL_FLAG_ACTIVE / LOCK_ONLY_ACTIVE), our own commit's
-				 * itl_finish_stamp_page needs that in-memory slot.  Revoking our X
-				 * and no-wire dropping the block now would discard the state our
-				 * COMMIT must stamp -> the stamp assert trips on re-read (the P0-2
-				 * crash).  Defer: ship a read-image (keep our X, NO drop, NO
-				 * grant), so the remote requester sees our row lock, enters the
-				 * cross-node TX completion wait, and retries the transfer only
-				 * after we go terminal.  The requester's send_block_request_and_wait
-				 * already treats READ_IMAGE_FROM_XHOLDER as a non-durable one-shot
-				 * image (returns false; pcm_state stays N).  Rule 8.A: a GCS
-				 * ownership transfer must satisfy the holder's local commit
-				 * dependency, not just the bufmgr API contract.
-				 *
-				 * PGRAC: spec-6.12g D-g2 — with block self-containment this
-				 * deferral is lifted HERE TOO (twin site of the holder-forward
-				 * handler's gate below): the block ships WITH its uncommitted
-				 * ITL and our copy is dropped; our later commit skips the stamp
-				 * for the drifted block (D-g1 resident-for-stamp) and readers
-				 * resolve the migrated ACTIVE slot through the TT authority
-				 * (AD-006).  A same-ROW writer still serializes through the
-				 * cross-node TX enqueue.  This site was missed by the original
-				 * D-g2 change; a committed-but-unstamped (Fast Commit) ITL
-				 * keeps the ACTIVE bit until cleanout, so without the gate a
-				 * peer writer waits for a "terminal" that already happened.
+				 * PGRAC: spec-8.3 — an active DATA or LOCK_ONLY ITL slot no
+				 * longer defers the X handoff (the old spec-5.2 D11 page-wide
+				 * transaction wait): the block ships WITH its uncommitted ITL
+				 * and our copy is dropped.  Our later commit stamps only under
+				 * the exact terminal-stamp proof and safely skips the drifted
+				 * block; readers resolve the migrated ACTIVE slot through the
+				 * TT authority (AD-006).  A same-ROW writer still serializes
+				 * through the cross-node TX enqueue.  One correctness behavior:
+				 * no GUC selects the old defer semantics.
 				 */
-				if (cluster_itl_page_has_active_slot((Page)block_payload)
-					&& !cluster_block_self_contained) {
-					status = GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
-					if (ClusterGcsBlock != NULL)
-						pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
-					goto build_and_send_reply;
-				}
-
 				{
 					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
 
@@ -6205,14 +6180,14 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
 
 					/*
-					 * PGRAC: spec-6.12g D-g2 (twin site) — count a self-ship
-					 * transfer that carries an uncommitted ITL slot, and
-					 * materialize an SGE-backed image into block_buf BEFORE the
-					 * drop (the drop invalidates the buffer the SGE may point
-					 * at; same recipe as the holder-forward destructive branch).
+					 * PGRAC: spec-8.3 (twin site) — count a self-ship transfer
+					 * that carries an uncommitted ITL slot (unconditional: no GUC
+					 * selects the active semantics), and materialize an SGE-backed
+					 * image into block_buf BEFORE the drop (the drop invalidates
+					 * the buffer the SGE may point at; same recipe as the
+					 * holder-forward destructive branch).
 					 */
-					if (cluster_block_self_contained
-						&& cluster_itl_page_has_active_slot((Page)block_payload))
+					if (cluster_itl_page_has_active_slot((Page)block_payload))
 						cluster_lever_g_note_active_itl_transfer();
 					if (block_payload_release_cb != NULL) {
 						memcpy(block_buf, block_payload, GCS_BLOCK_DATA_SIZE);
@@ -8324,29 +8299,15 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 				 */
 				hdr->status = (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
-			} else if (GcsBlockForwardPayloadIsReadImage(fwd)
-					   || (GcsBlockForwardPayloadIsXTransfer(fwd)
-						   && (fwd->transition_id == PCM_TRANS_N_TO_X
-							   || fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE)
-						   && cluster_itl_page_has_active_slot((Page)block_payload)
-						   /* PGRAC: spec-6.12g D-g2 — with block self-containment
-							* the active-ITL X-transfer is NO LONGER deferred: the
-							* block ships WITH its uncommitted ITL and is dropped
-							* here (falls to the destructive-transfer branch below).
-							* The holder's later commit skips the stamp for this
-							* now-drifted block (D-g1) and readers resolve the
-							* migrated ACTIVE slot through the TT authority (AD-006).
-							* A same-ROW writer on the new holder still serializes
-							* through the cross-node TX enqueue wait (spec-5.2 D4/D5,
-							* t/280); only the same-block DIFFERENT-row false
-							* serialization is removed. */
-						   && !cluster_block_self_contained)) {
-				/* Holder keeps its X; the requester consumes this image —
-				 * read-image (D2) reads once and never registers as an S holder,
-				 * X-transfer deferral (D11) sees the row lock and waits, retrying
-				 * the transfer once we are terminal.  No local state change: the
-				 * holder forward handler never mutates its own PCM lock and never
-				 * drops a block on which it still owns an active ITL slot. */
+			} else if (GcsBlockForwardPayloadIsReadImage(fwd)) {
+				/* Holder keeps its X; the requester consumes this one-shot
+				 * read-image (D2) and never registers as an S holder.  PGRAC:
+				 * spec-8.3 — an active DATA or LOCK_ONLY ITL slot no longer
+				 * routes an X-transfer here (the old spec-5.2 D11 defer): the
+				 * destructive-transfer branch below ships the block WITH its
+				 * uncommitted ITL unconditionally, and the holder commit stamps
+				 * only under the exact terminal-stamp proof.  No local state
+				 * change in this branch. */
 				hdr->status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
 				/* PGRAC: spec-5.59 D3 — holder-forward read-image ship: time
@@ -8383,13 +8344,12 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
 
 					/*
-					 * PGRAC: spec-6.12g D-g2 — count a transfer that carries an
-					 * uncommitted ITL slot (the D11 deferral we just lifted).
-					 * block_payload still points at the current image here, so
-					 * the active-ITL probe is exact.
+					 * PGRAC: spec-8.3 — count a transfer that carries an
+					 * uncommitted ITL slot (unconditional: no GUC selects the
+					 * active semantics).  block_payload still points at the
+					 * current image here, so the active-ITL probe is exact.
 					 */
-					if (cluster_block_self_contained
-						&& cluster_itl_page_has_active_slot((Page)block_payload))
+					if (cluster_itl_page_has_active_slot((Page)block_payload))
 						cluster_lever_g_note_active_itl_transfer();
 
 					if (block_payload_release_cb != NULL) {

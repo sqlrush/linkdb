@@ -2333,7 +2333,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		handle.forknum = MAIN_FORKNUM;
 		handle.slot_idx = cluster_itl_slot;
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
-		cluster_itl_touch_register(&handle);
+		cluster_itl_touch_register_exact(&handle, buffer, xid);
 	}
 #endif
 
@@ -2865,7 +2865,7 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			handle.forknum = MAIN_FORKNUM;
 			handle.slot_idx = cluster_mi_slot;
 			handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
-			cluster_itl_touch_register(&handle);
+			cluster_itl_touch_register_exact(&handle, buffer, xid);
 		}
 #endif
 
@@ -4149,7 +4149,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		handle.forknum = MAIN_FORKNUM;
 		handle.slot_idx = cluster_itl_slot;
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
-		cluster_itl_touch_register(&handle);
+		cluster_itl_touch_register_exact(&handle, buffer, xid);
 	}
 #endif
 
@@ -5698,7 +5698,7 @@ l_pgrac_reacquire:
 		handle.forknum = MAIN_FORKNUM;
 		handle.slot_idx = cluster_itl_old_slot;
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
-		cluster_itl_touch_register(&handle);
+		cluster_itl_touch_register_exact(&handle, buffer, xid);
 	}
 	if (cluster_itl_new_active && newbuf != buffer)
 	{
@@ -5709,7 +5709,7 @@ l_pgrac_reacquire:
 		handle.forknum = MAIN_FORKNUM;
 		handle.slot_idx = cluster_itl_new_slot;
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
-		cluster_itl_touch_register(&handle);
+		cluster_itl_touch_register_exact(&handle, newbuf, xid);
 	}
 #endif
 
@@ -7525,7 +7525,7 @@ failed:
 		handle.slot_idx = cluster_lock_slot_idx;
 		handle.flags = RelationNeedsWAL(relation) ?
 			CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
-		cluster_itl_touch_register(&handle);
+		cluster_itl_touch_register_exact(&handle, *buffer, xid);
 	}
 #endif
 
@@ -8458,7 +8458,7 @@ l4:
 			chain_handle.slot_idx = cluster_chain_slot_idx;
 			chain_handle.flags = RelationNeedsWAL(rel) ?
 				CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
-			cluster_itl_touch_register(&chain_handle);
+			cluster_itl_touch_register_exact(&chain_handle, buf, xid);
 		}
 #endif
 

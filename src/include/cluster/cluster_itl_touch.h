@@ -95,6 +95,47 @@ StaticAssertDecl(offsetof(ClusterItlTouchHandle, flags) == 22, "spec-3.4a D1 —
 #define CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL 0x0001
 
 /*
+ * ClusterItlTerminalProof -- backend-local exact-authority capture for the
+ * transaction-terminal ITL stamp.
+ *
+ *	Captured at ITL registration while the writer still holds the exact
+ *	content lock and local PCM X round.  The terminal stamp may mutate a
+ *	slot only if every field still matches under the content lock; a
+ *	mismatch is a safe typed skip (TT/CLOG/undo remains the visibility
+ *	authority).  Residency or a same-tag refetch can never substitute for
+ *	this proof: both ABA classes (block refetch/re-own and slot reuse)
+ *	present the same tag with a different incarnation.
+ *
+ *	`valid` is explicit because the initial legal cluster epoch is zero;
+ *	`acquisition_epoch != 0` is forbidden as a presence test.  `slot_class`
+ *	stores the active ClusterItlFlags value (ITL_FLAG_ACTIVE or
+ *	ITL_FLAG_LOCK_ONLY_ACTIVE); it routes the terminal flag and is never a
+ *	visibility verdict.  Process memory only: no wire, WAL, page, catalog
+ *	or shared-memory representation.
+ *
+ *	Spec: spec-8.3-active-itl-current-block-transfer-semantics.md
+ */
+typedef struct ClusterItlTerminalProof {
+	TransactionId xid;
+	int32 buffer_id;
+	uint64 own_generation;
+	uint64 acquisition_epoch;
+	uint16 slot_wrap;
+	uint8 slot_class;
+	bool valid;
+} ClusterItlTerminalProof;
+
+/*
+ * ClusterItlTouchRecord -- private touched-list element: the frozen public
+ * 24-byte handle plus the terminal-stamp proof.  The public handle layout
+ * and its StaticAssertDecl set above are unchanged.
+ */
+typedef struct ClusterItlTouchRecord {
+	ClusterItlTouchHandle key; /* frozen 24-byte public value */
+	ClusterItlTerminalProof proof;
+} ClusterItlTouchRecord;
+
+/*
  * cluster_itl_touch_register -- append a handle to the xact-local
  * touched list.  Must be called AFTER the critical section that wrote
  * the ITL slot (no palloc inside critical sections).  Caller stores
@@ -107,8 +148,37 @@ StaticAssertDecl(offsetof(ClusterItlTouchHandle, flags) == 22, "spec-3.4a D1 —
  *
  *	Subtransactions: spec-3.5 callers may register from a subxact; the
  *	subxact start/commit/abort APIs below maintain the range ownership.
+ *
+ *	This legacy entry point records no terminal-stamp proof; the finish
+ *	hook resolves such records through the exact no-fetch helper and skips
+ *	them safely.  Production heap write sites use
+ *	cluster_itl_touch_register_exact below.
  */
 extern void cluster_itl_touch_register(const ClusterItlTouchHandle *handle);
+
+/*
+ * cluster_itl_touch_register_exact -- register a touched ITL slot together
+ * with its terminal-stamp authority proof.
+ *
+ *	Must run after the ITL/tuple change is WAL-protected and outside the
+ *	critical section, while the caller still holds the same buffer's
+ *	content lock EXCLUSIVE and the same local PCM X round (all seven heap
+ *	production registration sites satisfy this).  Reads the slot's xid,
+ *	wrap and active class from the page under that content lock and
+ *	projects the local ownership generation and acquisition epoch from the
+ *	exact ACTIVE-holder ledger.  A failed capture registers the record
+ *	with proof.valid=false: the terminal stamp then skips it safely and
+ *	TT/CLOG/undo resolves the slot.
+ *
+ *	Dedupe is by (rloc, fork, block, slot, xid, slot_wrap) within the
+ *	current subtransaction owner range only.  The same exact slot
+ *	incarnation ORs NEEDS_WAL and replaces the proof with the newest
+ *	successful capture; if the newest capture fails, the existing record
+ *	is invalidated (an older valid generation would be unsafe).  A
+ *	different xid or wrap is a distinct entry, never an overwrite.
+ */
+extern void cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle, Buffer buffer,
+											 TransactionId xid);
 
 /*
  * spec-3.5 hardening: subxact range ownership for touched ITL slots.
