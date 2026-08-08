@@ -32,8 +32,8 @@
 #define PCM_X_PROTOCOL_NODE_LIMIT 32
 #define PCM_X_SHMEM_REGION_NAME "pgrac cluster pcm convert queue"
 #define PCM_X_SHMEM_MAGIC ((uint32)0x50435851) /* "PCXQ" */
-/* 13: A' rebase slot growth (ticket 392 / local tag 760 / header stats). */
-#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)14)
+/* 15: append passive writer-acquisition observation after the v14 prefix. */
+#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)15)
 #define PCM_X_INVALID_SLOT_INDEX ((Size) - 1)
 #define PCM_X_LOCK_PARTITIONS NUM_BUFFER_PARTITIONS
 #define PCM_X_LWLOCK_COUNT (1 + 2 * PCM_X_LOCK_PARTITIONS)
@@ -449,6 +449,10 @@ typedef enum PcmXQueueResult {
 	PCM_X_QUEUE_GATE_RETRY,
 	PCM_X_QUEUE_BARRIER_CLOSED
 } PcmXQueueResult;
+
+/* Array bound for per-result terminal accounting.  This is not a protocol
+ * result and therefore does not extend or renumber the enum. */
+#define PCM_X_QUEUE_RESULT_COUNT ((int)PCM_X_QUEUE_BARRIER_CLOSED + 1)
 
 /* Process-local classification for the holder-side IMAGE_READY arm.  This is
  * diagnostic evidence only: the queue result remains the protocol verdict and
@@ -1228,6 +1232,29 @@ typedef struct PcmXStatsSnapshot {
 	uint64 barrier_unwind_count;
 } PcmXStatsSnapshot;
 
+/* Passive writer-acquisition observation.  One episode starts when a wait
+ * identity is published and ends at its ordinary result or exception. */
+#define PCM_X_ACQUIRE_HIST_BUCKETS 32
+
+typedef struct PcmXAcquireObservation {
+	pg_atomic_uint64 started_count;
+	pg_atomic_uint64 active_count;
+	pg_atomic_uint64 exception_count;
+	pg_atomic_uint64 terminal_result_count[PCM_X_QUEUE_RESULT_COUNT];
+	pg_atomic_uint64 success_latency_bucket[PCM_X_ACQUIRE_HIST_BUCKETS];
+	pg_atomic_uint64 success_latency_overflow_count;
+} PcmXAcquireObservation;
+
+/* Process-local copy used by diagnostics and tests. */
+typedef struct PcmXAcquireObservationSnapshot {
+	uint64 started_count;
+	uint64 active_count;
+	uint64 exception_count;
+	uint64 terminal_result_count[PCM_X_QUEUE_RESULT_COUNT];
+	uint64 success_latency_bucket[PCM_X_ACQUIRE_HIST_BUCKETS];
+	uint64 success_latency_overflow_count;
+} PcmXAcquireObservationSnapshot;
+
 /* Optional peer authority installed while the runtime gate is ACTIVATING. */
 typedef struct PcmXPeerBinding {
 	uint64 cluster_epoch;
@@ -1294,6 +1321,8 @@ typedef struct PcmXShmemHeader {
 	 * frame, never the base protocol. */
 	uint32 rebase_wire_active;
 	uint32 rebase_reserved;
+	/* Appended last so every member in the prior layout keeps its offset. */
+	PcmXAcquireObservation acquire_observation;
 } PcmXShmemHeader;
 
 /* Terminal-kick note arms (diagnostic identifiers, not protocol state). */
@@ -1331,7 +1360,15 @@ StaticAssertDecl(offsetof(PcmXShmemHeader, peer_frontiers) == 33664,
 StaticAssertDecl(offsetof(PcmXShmemHeader, stats) == 35200, "PCM-X stats offset");
 StaticAssertDecl(offsetof(PcmXShmemHeader, outbound_targets) == 35384,
 				 "PCM-X outbound target frontier array offset");
-StaticAssertDecl(sizeof(PcmXShmemHeader) == 36520, "PCM-X shmem header ABI");
+StaticAssertDecl(PCM_X_QUEUE_RESULT_COUNT == PCM_X_QUEUE_BARRIER_CLOSED + 1,
+				 "PCM-X queue result count marker");
+StaticAssertDecl(sizeof(((PcmXAcquireObservation *)0)->success_latency_bucket)
+					 == PCM_X_ACQUIRE_HIST_BUCKETS * sizeof(pg_atomic_uint64),
+				 "PCM-X acquire histogram bucket array length");
+StaticAssertDecl(sizeof(PcmXAcquireObservation) == 400, "PCM-X acquire observation ABI");
+StaticAssertDecl(offsetof(PcmXShmemHeader, acquire_observation) == 36520,
+				 "PCM-X acquire observation append offset");
+StaticAssertDecl(sizeof(PcmXShmemHeader) == 36920, "PCM-X shmem header ABI");
 
 typedef enum PcmXAttachResult {
 	PCM_X_ATTACH_OK = 0,
@@ -1390,6 +1427,10 @@ extern void cluster_pcm_x_stats_note_own_abort(void);
 extern void cluster_pcm_x_stats_note_own_busy(void);
 extern void cluster_pcm_x_stats_note_own_corrupt(void);
 extern void cluster_pcm_x_stats_note_barrier_unwind(void);
+extern void cluster_pcm_x_acquire_observation_begin(uint64 start_us);
+extern void cluster_pcm_x_acquire_observation_finish(PcmXQueueResult result, uint64 finish_us);
+extern void cluster_pcm_x_acquire_observation_exception(void);
+extern void cluster_pcm_x_acquire_observation_snapshot(PcmXAcquireObservationSnapshot *out);
 extern bool cluster_pcm_x_runtime_activate(uint64 master_session_incarnation);
 /* A' rebase: publish formation-wide PCM_X_REBASE_V1 coverage.  Legal only
  * from the activating formation tick, strictly before activate_bound(). */

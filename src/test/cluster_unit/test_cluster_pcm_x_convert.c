@@ -2232,7 +2232,7 @@ UT_TEST(test_wire_abi_offsets_are_exact)
 
 UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 {
-	UT_ASSERT_EQ(PCM_X_SHMEM_LAYOUT_VERSION, 14);
+	UT_ASSERT_EQ(PCM_X_SHMEM_LAYOUT_VERSION, 15);
 	UT_ASSERT_EQ(PCM_X_LOCK_PARTITIONS, NUM_BUFFER_PARTITIONS);
 	UT_ASSERT_EQ(PCM_X_LWLOCK_COUNT, 257);
 	UT_ASSERT_EQ(sizeof(PcmXShmemLayout), 440);
@@ -2303,7 +2303,13 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, peer_frontiers), 33664);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, stats), 35200);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35384);
-	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36520);
+	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, (int)PCM_X_QUEUE_BARRIER_CLOSED + 1);
+	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, 14);
+	UT_ASSERT_EQ(PCM_X_ACQUIRE_HIST_BUCKETS, 32);
+	UT_ASSERT_EQ(sizeof(PcmXAcquireObservation), 400);
+	UT_ASSERT_EQ(sizeof(PcmXAcquireObservationSnapshot), 400);
+	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, acquire_observation), 36520);
+	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36920);
 }
 
 UT_TEST(test_lwlock_held_limit_is_shared_200)
@@ -2351,12 +2357,12 @@ UT_TEST(test_exactly_five_pools_and_bounded_directories)
 	UT_ASSERT_EQ(layout.local_holder.directory_capacity, layout.local_holder.capacity * 2);
 }
 
-UT_TEST(test_layout_v13_records_transfer_and_terminal_frontiers)
+UT_TEST(test_layout_v15_preserves_transfer_and_terminal_frontiers)
 {
 	PcmXShmemLayout layout;
 
 	cluster_pcm_x_layout_compute(122, 25, 16384, 1024, &layout);
-	UT_ASSERT_EQ(layout.version, 14);
+	UT_ASSERT_EQ(layout.version, 15);
 	UT_ASSERT_EQ(layout.lock_partition_count, PCM_X_LOCK_PARTITIONS);
 	UT_ASSERT_EQ(layout.lwlock_count, PCM_X_LWLOCK_COUNT);
 	UT_ASSERT_EQ(sizeof(PcmXPeerFrontier), 48);
@@ -2445,6 +2451,72 @@ UT_TEST(test_generation_max_never_wraps)
 
 	UT_ASSERT(!cluster_pcm_x_generation_next(UINT64_MAX, &next));
 	UT_ASSERT_EQ(next, 77);
+}
+
+/*
+ * One ordinary success and one ordinary non-success exercise the real
+ * acquisition-accounting API.  Removing either result increment, sampling
+ * non-success latency, or failing to close the active gauge breaks this test.
+ */
+UT_TEST(test_acquire_observation_separates_success_and_non_success)
+{
+	PcmXAcquireObservationSnapshot baseline;
+	PcmXAcquireObservationSnapshot after_success_begin;
+	PcmXAcquireObservationSnapshot after_success;
+	PcmXAcquireObservationSnapshot after_busy_begin;
+	PcmXAcquireObservationSnapshot after_busy;
+	uint64 success_histogram_total = 0;
+	uint64 busy_histogram_total = 0;
+	int i;
+
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	cluster_pcm_x_acquire_observation_snapshot(&baseline);
+
+	cluster_pcm_x_acquire_observation_begin(UINT64_C(100));
+	cluster_pcm_x_acquire_observation_snapshot(&after_success_begin);
+	UT_ASSERT_EQ(after_success_begin.started_count, baseline.started_count + 1);
+	UT_ASSERT_EQ(after_success_begin.active_count, baseline.active_count + 1);
+	cluster_pcm_x_acquire_observation_finish(PCM_X_QUEUE_OK, UINT64_C(101));
+	cluster_pcm_x_acquire_observation_snapshot(&after_success);
+
+	UT_ASSERT_EQ(after_success.started_count, 1);
+	UT_ASSERT_EQ(after_success.active_count, 0);
+	UT_ASSERT_EQ(after_success.exception_count, 0);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		UT_ASSERT_EQ(after_success.terminal_result_count[i],
+					 i == PCM_X_QUEUE_OK ? 1 : 0);
+	UT_ASSERT_EQ(after_success.success_latency_bucket[0], 1);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		success_histogram_total += after_success.success_latency_bucket[i];
+	success_histogram_total += after_success.success_latency_overflow_count;
+	UT_ASSERT_EQ(success_histogram_total, 1);
+
+	cluster_pcm_x_acquire_observation_begin(UINT64_C(200));
+	cluster_pcm_x_acquire_observation_snapshot(&after_busy_begin);
+	UT_ASSERT_EQ(after_busy_begin.started_count, after_success.started_count + 1);
+	UT_ASSERT_EQ(after_busy_begin.active_count, after_success.active_count + 1);
+	cluster_pcm_x_acquire_observation_finish(PCM_X_QUEUE_BUSY, UINT64_C(250));
+	cluster_pcm_x_acquire_observation_snapshot(&after_busy);
+
+	UT_ASSERT_EQ(after_busy.started_count, 2);
+	UT_ASSERT_EQ(after_busy.active_count, 0);
+	UT_ASSERT_EQ(after_busy.exception_count, 0);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		UT_ASSERT_EQ(after_busy.terminal_result_count[i],
+					 i == PCM_X_QUEUE_OK || i == PCM_X_QUEUE_BUSY ? 1 : 0);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		busy_histogram_total += after_busy.success_latency_bucket[i];
+	busy_histogram_total += after_busy.success_latency_overflow_count;
+	UT_ASSERT_EQ(busy_histogram_total, success_histogram_total);
+
+	/* A second close without a begin cannot double-account the episode. */
+	cluster_pcm_x_acquire_observation_finish(PCM_X_QUEUE_OK, UINT64_C(300));
+	cluster_pcm_x_acquire_observation_snapshot(&after_busy);
+	UT_ASSERT_EQ(after_busy.started_count, 2);
+	UT_ASSERT_EQ(after_busy.active_count, 0);
+	UT_ASSERT_EQ(after_busy.terminal_result_count[PCM_X_QUEUE_OK], 1);
+	UT_ASSERT_EQ(after_busy.terminal_result_count[PCM_X_QUEUE_BUSY], 1);
 }
 
 UT_TEST(test_slot_generation_seqlock_crosses_u32_rollover)
@@ -16617,7 +16689,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(275);
+	UT_PLAN(276);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16626,11 +16698,12 @@ main(void)
 	UT_RUN(test_lwlock_held_limit_is_shared_200);
 	UT_RUN(test_default_capacity_formulas_are_exact);
 	UT_RUN(test_exactly_five_pools_and_bounded_directories);
-	UT_RUN(test_layout_v13_records_transfer_and_terminal_frontiers);
+	UT_RUN(test_layout_v15_preserves_transfer_and_terminal_frontiers);
 	UT_RUN(test_offsets_are_aligned_ordered_and_bounded);
 	UT_RUN(test_membership_wait_and_holder_partitions_do_not_overlap);
 	UT_RUN(test_generation_zero_advances_without_being_a_sentinel);
 	UT_RUN(test_generation_max_never_wraps);
+	UT_RUN(test_acquire_observation_separates_success_and_non_success);
 	UT_RUN(test_slot_generation_seqlock_crosses_u32_rollover);
 	UT_RUN(test_slot_generation_revalidate_never_accepts_torn_pair);
 	UT_RUN(test_slot_generation_writer_in_progress_is_retryable);

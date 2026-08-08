@@ -94,6 +94,7 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 #include "storage/spin.h" /* PGRAC: spec-6.12h D-h2 — PI-discard note ring lock */
+#include "portability/instr_time.h"
 #include "utils/elog.h"
 #include "utils/pg_crc.h"
 #include "utils/timestamp.h"
@@ -9205,6 +9206,14 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 	}
 	wait_published = true;
 	gcs_block_pcm_x_requester_cleanup_context.wait_published = true;
+	/* PGRAC: observe the acquisition only after publishing its wait identity. */
+	{
+		instr_time acquire_observation_now;
+
+		INSTR_TIME_SET_CURRENT(acquire_observation_now);
+		cluster_pcm_x_acquire_observation_begin(
+			(uint64)INSTR_TIME_GET_MICROSEC(acquire_observation_now));
+	}
 
 	/* Publish first, then close the freeze-before-wait race for every content
 	 * lock already held by this backend.  If a holder barrier is already frozen
@@ -9816,6 +9825,13 @@ requester_fail_closed:
 		result = PCM_X_QUEUE_CORRUPT;
 
 requester_done:
+	if (wait_published) {
+		instr_time acquire_observation_now;
+
+		INSTR_TIME_SET_CURRENT(acquire_observation_now);
+		cluster_pcm_x_acquire_observation_finish(
+			result, (uint64)INSTR_TIME_GET_MICROSEC(acquire_observation_now));
+	}
 	if (wait_published)
 		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 	gcs_block_pcm_x_requester_cleanup_context.wait_published = false;
@@ -9858,6 +9874,8 @@ cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf, PcmXLocalWriterClaim *claim_ou
 		MemoryContextSwitchTo(error_context);
 		original_error = CopyErrorData();
 		FlushErrorState();
+		if (cleanup->wait_published)
+			cluster_pcm_x_acquire_observation_exception();
 		gcs_block_pcm_x_requester_cleanup_noexcept(cleanup);
 		ReThrowError(original_error);
 	}

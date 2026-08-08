@@ -33,6 +33,7 @@
 #include "storage/proc.h"
 #include "storage/shmem.h"
 
+#include "port/pg_bitutils.h"
 #include "port/pg_crc32c.h"
 
 #include "cluster/cluster_guc.h"
@@ -847,6 +848,22 @@ pcm_x_init_stats(PcmXStats *stats)
 
 
 static void
+pcm_x_init_acquire_observation(PcmXAcquireObservation *observation)
+{
+	int i;
+
+	pg_atomic_init_u64(&observation->started_count, 0);
+	pg_atomic_init_u64(&observation->active_count, 0);
+	pg_atomic_init_u64(&observation->exception_count, 0);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		pg_atomic_init_u64(&observation->terminal_result_count[i], 0);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		pg_atomic_init_u64(&observation->success_latency_bucket[i], 0);
+	pg_atomic_init_u64(&observation->success_latency_overflow_count, 0);
+}
+
+
+static void
 pcm_x_stats_increment(pg_atomic_uint64 *counter)
 {
 	if (counter != NULL)
@@ -963,6 +980,112 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 	if (!allocator_lock_held)
 		LWLockRelease(&header->allocator_lock.lock);
 	return true;
+}
+
+
+/*
+ * Passive writer-acquisition observation.
+ *
+ * The running marker is backend-local because a backend can own at most one
+ * enclosing writer-acquisition wrapper at a time.  It makes preflight closes
+ * and duplicate closes no-ops while the counters remain shared atomics.
+ */
+static uint64 pcm_x_acquire_observation_start_us;
+static bool pcm_x_acquire_observation_running;
+
+static inline int
+pcm_x_acquire_success_bucket_index(uint64 elapsed_us)
+{
+	if (elapsed_us <= 1)
+		return 0;
+	return pg_leftmost_one_pos64(elapsed_us - 1) + 1;
+}
+
+static inline void
+pcm_x_acquire_observation_increment(pg_atomic_uint64 *counter)
+{
+	uint64 old_value = pg_atomic_read_u64(counter);
+
+	while (old_value != PG_UINT64_MAX
+		   && !pg_atomic_compare_exchange_u64(counter, &old_value, old_value + 1))
+		;
+}
+
+void
+cluster_pcm_x_acquire_observation_begin(uint64 start_us)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header == NULL || pcm_x_acquire_observation_running)
+		return;
+	pcm_x_acquire_observation_start_us = start_us;
+	pcm_x_acquire_observation_running = true;
+	pcm_x_acquire_observation_increment(&header->acquire_observation.started_count);
+	(void)pg_atomic_fetch_add_u64(&header->acquire_observation.active_count, 1);
+}
+
+void
+cluster_pcm_x_acquire_observation_finish(PcmXQueueResult result, uint64 finish_us)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	int result_index = (int)result;
+
+	if (header == NULL || !pcm_x_acquire_observation_running)
+		return;
+	pcm_x_acquire_observation_running = false;
+	if (result_index >= 0 && result_index < PCM_X_QUEUE_RESULT_COUNT)
+		pcm_x_acquire_observation_increment(
+			&header->acquire_observation.terminal_result_count[result_index]);
+	if (result == PCM_X_QUEUE_OK) {
+		uint64 elapsed_us = 0;
+
+		if (finish_us > pcm_x_acquire_observation_start_us)
+			elapsed_us = finish_us - pcm_x_acquire_observation_start_us;
+		if (elapsed_us > (UINT64CONST(1) << 31))
+			pcm_x_acquire_observation_increment(
+				&header->acquire_observation.success_latency_overflow_count);
+		else
+			pcm_x_acquire_observation_increment(
+				&header->acquire_observation
+					 .success_latency_bucket[pcm_x_acquire_success_bucket_index(elapsed_us)]);
+	}
+	(void)pg_atomic_fetch_sub_u64(&header->acquire_observation.active_count, 1);
+}
+
+void
+cluster_pcm_x_acquire_observation_exception(void)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header == NULL || !pcm_x_acquire_observation_running)
+		return;
+	pcm_x_acquire_observation_running = false;
+	pcm_x_acquire_observation_increment(&header->acquire_observation.exception_count);
+	(void)pg_atomic_fetch_sub_u64(&header->acquire_observation.active_count, 1);
+}
+
+void
+cluster_pcm_x_acquire_observation_snapshot(PcmXAcquireObservationSnapshot *out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	int i;
+
+	if (out == NULL)
+		return;
+	memset(out, 0, sizeof(*out));
+	if (header == NULL)
+		return;
+	out->started_count = pg_atomic_read_u64(&header->acquire_observation.started_count);
+	out->active_count = pg_atomic_read_u64(&header->acquire_observation.active_count);
+	out->exception_count = pg_atomic_read_u64(&header->acquire_observation.exception_count);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		out->terminal_result_count[i]
+			= pg_atomic_read_u64(&header->acquire_observation.terminal_result_count[i]);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		out->success_latency_bucket[i]
+			= pg_atomic_read_u64(&header->acquire_observation.success_latency_bucket[i]);
+	out->success_latency_overflow_count
+		= pg_atomic_read_u64(&header->acquire_observation.success_latency_overflow_count);
 }
 
 
@@ -20957,6 +21080,7 @@ cluster_pcm_x_convert_shmem_init(void)
 		pg_atomic_init_u32(&header->activation_retry_generation, 0);
 		pg_atomic_init_u32(&header->local_retire_gate, 0);
 		pcm_x_init_stats(&header->stats);
+		pcm_x_init_acquire_observation(&header->acquire_observation);
 		pcm_x_init_allocators(header);
 		LWLockInitialize(&header->allocator_lock.lock, LWTRANCHE_CLUSTER_PCM_X_ALLOCATOR);
 		for (i = 0; i < PCM_X_LOCK_PARTITIONS; i++) {
