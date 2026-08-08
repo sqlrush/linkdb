@@ -3169,10 +3169,65 @@ extern bool cluster_bufmgr_block_grant_pending(BufferTag tag);
 extern bool cluster_gcs_block_test_deliver_self_invalidate(BufferTag tag);
 /* PGRAC: spec-6.12g — no-fetch resident-buffer acquire for the commit-time
  * ITL stamp; residency proves ownership (a self-contained transfer drops the
- * copy).  InvalidBuffer -> block transferred away -> skip the stamp. */
+ * copy).  InvalidBuffer -> block transferred away -> skip the stamp.
+ * Superseded by the exact-proof helper below (spec-8.3); retained as the
+ * rollback target until the formal acceptance runs pass. */
 extern Buffer cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forknum,
 													 BlockNumber blocknum);
 extern void cluster_bufmgr_unlock_resident_stamp(Buffer buffer);
+
+/*
+ * PGRAC: spec-8.3 — exact-authority ITL terminal stamp acquisition.
+ *
+ *	ClusterItlStampSkipReason enumerates every safe no-stamp outcome of the
+ *	no-fetch helper.  All values are hint skips, never errors: the slot's
+ *	terminal state stays with TT/CLOG/undo.  A malformed proof or an
+ *	impossible local ownership tuple is fail-closed inside the helper and
+ *	never surfaces as one of these reasons.
+ */
+typedef enum ClusterItlStampSkipReason {
+	CLUSTER_ITL_STAMP_SKIP_NONE = 0,
+	CLUSTER_ITL_STAMP_SKIP_INVALID_PROOF,
+	CLUSTER_ITL_STAMP_SKIP_NOT_RESIDENT,
+	CLUSTER_ITL_STAMP_SKIP_TAG_CHANGED,
+	CLUSTER_ITL_STAMP_SKIP_NOT_VALID,
+	CLUSTER_ITL_STAMP_SKIP_NOT_CURRENT_IMAGE,
+	CLUSTER_ITL_STAMP_SKIP_NOT_LOCAL_X,
+	CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_FLAGS_BUSY,
+	CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_GENERATION_CHANGED,
+	CLUSTER_ITL_STAMP_SKIP_CLUSTER_EPOCH_CHANGED,
+	CLUSTER_ITL_STAMP_SKIP_NO_ITL,
+	CLUSTER_ITL_STAMP_SKIP_SLOT_OUT_OF_RANGE,
+	CLUSTER_ITL_STAMP_SKIP_XID_CHANGED,
+	CLUSTER_ITL_STAMP_SKIP_WRAP_CHANGED,
+	CLUSTER_ITL_STAMP_SKIP_CLASS_CHANGED,
+	CLUSTER_ITL_STAMP_SKIP_ALREADY_TERMINAL
+} ClusterItlStampSkipReason;
+
+/* PGRAC: spec-8.3 — read-only projection of the process-local ACTIVE
+ * PCM-X holder ledger for terminal-stamp proof capture.  Caller must hold
+ * the buffer's content lock EXCLUSIVE.  Returns true and fills the
+ * ownership generation and acquisition epoch iff the exact holder entry
+ * validates and the BufferDesc ownership tuple samples as a quiescent
+ * current local X (state X, flags zero, activation token zero, generation
+ * equal to the holder identity's base generation).  Creates no authority
+ * or lifecycle state. */
+extern bool cluster_bufmgr_pcm_x_holder_stamp_authority(Buffer buffer, uint64 *own_generation,
+														uint64 *acquisition_epoch);
+
+/* PGRAC: spec-8.3 — no-fetch exact-proof acquire for the commit-time ITL
+ * stamp.  Replaces the residency-only semantic: under mapping authority,
+ * pin, content EXCLUSIVE and the buffer-header lock it revalidates the
+ * exact tag, current image, local X, quiescent ownership tuple, captured
+ * generation/epoch and the slot's xid/wrap/class before returning a
+ * stampable buffer.  On any normal mismatch it unlocks/unpins and returns
+ * InvalidBuffer with a typed skip reason; it never reads storage, never
+ * invokes Cache Fusion, never retries and never ERRORs on a normal skip.
+ * Release with cluster_bufmgr_unlock_resident_stamp(). */
+struct ClusterItlTouchRecord; /* cluster/cluster_itl_touch.h */
+extern Buffer
+cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRecord *record,
+												 ClusterItlStampSkipReason *out_reason);
 
 /*
  * PGRAC: GCS serve-stall round-5 (A2) — bounded drop result.

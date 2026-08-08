@@ -289,8 +289,10 @@ cluster_lever_a_note_remote_ack_degraded(void)
 static inline bool
 lever_g_counting(void)
 {
-	return (cluster_block_self_contained || cluster_xnode_profile_enabled)
-		   && ClusterXnodeLeverCtl != NULL;
+	/* PGRAC: spec-8.3 — the wave-g observations lost their GUC gate when
+	 * the active-ITL transfer became the one correctness behavior; these
+	 * counters must always have a producer (R1 census). */
+	return ClusterXnodeLeverCtl != NULL;
 }
 
 /* spec-6.12g — an X-transfer shipped WITH an uncommitted ITL slot. */
