@@ -1088,7 +1088,7 @@ check: all
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O)
 
 install installdirs uninstall installcheck:
 	@:
