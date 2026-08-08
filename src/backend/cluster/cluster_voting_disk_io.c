@@ -736,25 +736,57 @@ cluster_voting_disk_write_stripe_activation(int fd, const void *in_slot512)
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
-/*
- * Fail-closed TDD scaffold for the fixed append-only tail boundary.  The RED
- * tests below exercise the real object and require the five distinct read
- * outcomes plus durable write behavior before this scaffold can turn green.
- */
 ClusterVotingDiskRawReadState
-cluster_voting_disk_read_raw_tail_slot(int fd, void *out_slot512 pg_attribute_unused())
+cluster_voting_disk_read_raw_tail_slot(int fd, void *out_slot512)
 {
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nread;
+
 	if (fd < 0)
 		return CLUSTER_VOTING_DISK_RAW_READ_NOT_TRIED;
+	if (out_slot512 == NULL)
+		return CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
+
+	memset(aligned, 0, sizeof(aligned));
+	voting_disk_io_arm_timeout();
+	nread = pread(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_FILE_BYTES_MIN);
+	voting_disk_io_disarm_timeout();
+
+	if (nread == CLUSTER_VOTING_SLOT_BYTES) {
+		memcpy(out_slot512, aligned, CLUSTER_VOTING_SLOT_BYTES);
+		return CLUSTER_VOTING_DISK_RAW_READ_FULL;
+	}
+	if (nread == 0)
+		return CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF;
+	if (nread > 0)
+		return CLUSTER_VOTING_DISK_RAW_READ_SHORT;
 	return CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
 }
 
 ClusterVotingDiskIoState
-cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512 pg_attribute_unused())
+cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512)
 {
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nwritten;
+
 	if (fd < 0)
 		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
-	return CLUSTER_VOTING_DISK_IO_FAILED;
+	if (in_slot512 == NULL)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
+	voting_disk_io_arm_timeout();
+	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_FILE_BYTES_MIN);
+	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	if (fdatasync(fd) != 0) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	voting_disk_io_disarm_timeout();
+	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
 #endif /* USE_PGRAC_CLUSTER */
