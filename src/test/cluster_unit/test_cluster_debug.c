@@ -71,9 +71,15 @@
 
 
 #define CAPTURED_DUMP_ROWS_MAX 2048
+#define CAPTURED_FORMATTED_VALUES_MAX 4096
 static const char *captured_dump_categories[CAPTURED_DUMP_ROWS_MAX];
 static const char *captured_dump_keys[CAPTURED_DUMP_ROWS_MAX];
+static const char *captured_dump_values[CAPTURED_DUMP_ROWS_MAX];
 static int captured_dump_row_count;
+static char captured_formatted_values[CAPTURED_FORMATTED_VALUES_MAX][128];
+static int captured_formatted_value_count;
+static int captured_undo_observation_ensure_calls;
+static int captured_pi_retire_accessor_calls;
 
 
 /* ----------
@@ -923,6 +929,22 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 	return false;
 }
 
+void
+cluster_pcm_x_acquire_observation_snapshot(PcmXAcquireObservationSnapshot *snapshot_out)
+{
+	int i;
+
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	snapshot_out->started_count = 11;
+	snapshot_out->active_count = 12;
+	snapshot_out->exception_count = 13;
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		snapshot_out->terminal_result_count[i] = UINT64CONST(100) + (uint64)i;
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		snapshot_out->success_latency_bucket[i] = UINT64CONST(200) + (uint64)i;
+	snapshot_out->success_latency_overflow_count = 999;
+}
+
 PcmXRuntimeSnapshot
 cluster_pcm_x_runtime_snapshot(void)
 {
@@ -1552,7 +1574,8 @@ cluster_gcs_get_pi_watermark_advance_count(void)
 uint64
 cluster_gcs_get_pi_watermark_retire_count(void)
 {
-	return 0;
+	captured_pi_retire_accessor_calls++;
+	return 73;
 }
 uint64
 cluster_gcs_get_pi_durable_note_apply_count(void)
@@ -2006,6 +2029,36 @@ uint64
 cluster_undo_segment_hard_cap_fail_count(void)
 {
 	return 0;
+}
+
+void
+cluster_undo_record_observation_ensure(void)
+{
+	captured_undo_observation_ensure_calls++;
+}
+
+uint64
+cluster_undo_segment_allocated_count(void)
+{
+	return 51;
+}
+
+uint64
+cluster_undo_segment_allocated_high_water(void)
+{
+	return 52;
+}
+
+uint32
+cluster_undo_segment_effective_cap(void)
+{
+	return 53;
+}
+
+const char *
+cluster_undo_segment_observation_status_string(void)
+{
+	return "READY";
 }
 /* P0 perf hardening: per-commit fsync + smgr syscall counter accessors
  * (dump_undo emits these; cluster_undo_record.o not linked here). */
@@ -3162,6 +3215,7 @@ tuplestore_putvalues(Tuplestorestate *state pg_attribute_unused(),
 		return;
 	captured_dump_categories[captured_dump_row_count] = (const char *)DatumGetPointer(values[0]);
 	captured_dump_keys[captured_dump_row_count] = (const char *)DatumGetPointer(values[1]);
+	captured_dump_values[captured_dump_row_count] = (const char *)DatumGetPointer(values[2]);
 	captured_dump_row_count++;
 }
 
@@ -3172,9 +3226,19 @@ cstring_to_text(const char *s)
 }
 
 char *
-psprintf(const char *fmt pg_attribute_unused(), ...)
+psprintf(const char *fmt, ...)
 {
-	return (char *)"";
+	char *result;
+	va_list args;
+
+	if (captured_formatted_value_count >= CAPTURED_FORMATTED_VALUES_MAX)
+		return (char *)"";
+
+	result = captured_formatted_values[captured_formatted_value_count++];
+	va_start(args, fmt);
+	(void)vsnprintf(result, sizeof(captured_formatted_values[0]), fmt, args);
+	va_end(args);
+	return result;
 }
 
 char *
@@ -3308,6 +3372,22 @@ uint64
 cluster_lmon_slow_iter_count(void)
 {
 	return 0;
+}
+uint64
+cluster_lmon_timed_duty_sample_count(void)
+{
+	return 41;
+}
+uint64
+cluster_lmon_total_iter_us(void)
+{
+	return 42;
+}
+void
+cluster_lmon_timed_duty_pair(uint64 *sample_count, uint64 *total_us)
+{
+	*sample_count = cluster_lmon_timed_duty_sample_count();
+	*total_us = cluster_lmon_total_iter_us();
 }
 int
 cluster_lmon_status(void)
@@ -4263,12 +4343,25 @@ captured_dump_count(const char *category, const char *key)
 	int i;
 
 	for (i = 0; i < captured_dump_row_count; i++) {
-		if (strcmp(captured_dump_categories[i], category) != 0)
+		if (category != NULL && strcmp(captured_dump_categories[i], category) != 0)
 			continue;
 		if (key == NULL || strcmp(captured_dump_keys[i], key) == 0)
 			count++;
 	}
 	return count;
+}
+
+static const char *
+captured_dump_value(const char *category, const char *key)
+{
+	int i;
+
+	for (i = 0; i < captured_dump_row_count; i++) {
+		if (strcmp(captured_dump_categories[i], category) == 0
+			&& strcmp(captured_dump_keys[i], key) == 0)
+			return captured_dump_values[i];
+	}
+	return NULL;
 }
 
 UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
@@ -4312,6 +4405,10 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 		"pcm_convert_wfg_replace_fail_count",
 		"pcm_convert_wfg_exact_remove_stale_count",
 	};
+	static const char *const lmon_keys[] = {
+		"lmon_timed_duty_sample_count",
+		"lmon_total_iter_us",
+	};
 	static const char *const gcs_keys[] = {
 		"dedup_pcm_x_stage_count",
 		"dedup_pcm_x_replay_count",
@@ -4321,28 +4418,125 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 		"pcm_x_self_handoff_count",
 		"pcm_x_self_handoff_drain_count",
 		"pi_durable_note_apply_count",
+		"pi_master_metadata_retire_count",
+	};
+	static const char *const result_labels[] = {
+		"ok",
+		"duplicate",
+		"retired",
+		"not_found",
+		"stale",
+		"no_capacity",
+		"counter_exhausted",
+		"not_ready",
+		"busy",
+		"bad_state",
+		"corrupt",
+		"invalid",
+		"gate_retry",
+		"barrier_closed",
+	};
+	static const char *const pcm_acquire_scalar_keys[] = {
+		"pcm_x_acquire_started_count",
+		"pcm_x_acquire_active_count",
+		"pcm_x_acquire_exception_count",
+		"pcm_x_acquire_success_us_overflow_count",
+	};
+	static const char *const undo_capacity_keys[] = {
+		"segment_observation_status",
+		"segment_allocated_count",
+		"segment_allocated_high_water",
+		"segment_effective_cap",
+	};
+	static const char *const o1_keys[] = {
+		"remote_install_observed_count",
+		"remote_grant_after_image_count",
+		"remote_image_at_or_after_grant_count",
+		"remote_episode_excluded_no_install",
+		"remote_episode_excluded_missing_grant",
+		"remote_episode_excluded_missing_image",
+		"last_remote_t_image_us",
+		"last_remote_t_grant_us",
+		"last_remote_t_install_us",
 	};
 	LOCAL_FCINFO(fcinfo, 0);
 	ReturnSetInfo rsinfo;
+	char key[96];
+	char expected_value[32];
+	const char *old_alias_value;
+	const char *new_alias_value;
 	int i;
 
 	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
 	memset(&rsinfo, 0, sizeof(rsinfo));
 	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
 	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	memset(captured_dump_values, 0, sizeof(captured_dump_values));
 	captured_dump_row_count = 0;
+	captured_formatted_value_count = 0;
+	captured_undo_observation_ensure_calls = 0;
+	captured_pi_retire_accessor_calls = 0;
 	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
 	(void)cluster_dump_state(fcinfo);
 
-	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 60);
+	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, 14);
+	UT_ASSERT_EQ(PCM_X_ACQUIRE_HIST_BUCKETS, 32);
+	UT_ASSERT_EQ((int)lengthof(result_labels), PCM_X_QUEUE_RESULT_COUNT);
+	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 110);
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
-	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 120);
+	UT_ASSERT_EQ(captured_dump_count("lmon", NULL), 12);
+	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 121);
 	for (i = 0; i < (int)lengthof(pcm_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_keys[i]), 1);
 	for (i = 0; i < (int)lengthof(lmd_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("lmd", lmd_keys[i]), 1);
+	for (i = 0; i < (int)lengthof(lmon_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("lmon", lmon_keys[i]), 1);
 	for (i = 0; i < (int)lengthof(gcs_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("gcs", gcs_keys[i]), 1);
+
+	/* R1-A exact 57-row census: 4 scalar O2 rows include overflow. */
+	for (i = 0; i < (int)lengthof(pcm_acquire_scalar_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_acquire_scalar_keys[i]), 1);
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[0]), "11");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[1]), "12");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[2]), "13");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[3]), "999");
+
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++) {
+		snprintf(key, sizeof(key), "pcm_x_acquire_result_%s_count", result_labels[i]);
+		snprintf(expected_value, sizeof(expected_value), "%d", 100 + i);
+		UT_ASSERT_EQ(captured_dump_count("pcm", key), 1);
+		UT_ASSERT_STR_EQ(captured_dump_value("pcm", key), expected_value);
+	}
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++) {
+		snprintf(key, sizeof(key), "pcm_x_acquire_success_us_le_2p%02d_count", i);
+		snprintf(expected_value, sizeof(expected_value), "%d", 200 + i);
+		UT_ASSERT_EQ(captured_dump_count("pcm", key), 1);
+		UT_ASSERT_STR_EQ(captured_dump_value("pcm", key), expected_value);
+	}
+
+	UT_ASSERT_STR_EQ(captured_dump_value("lmon", lmon_keys[0]), "41");
+	UT_ASSERT_STR_EQ(captured_dump_value("lmon", lmon_keys[1]), "42");
+	for (i = 0; i < (int)lengthof(undo_capacity_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("undo", undo_capacity_keys[i]), 1);
+	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[0]), "READY");
+	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[1]), "51");
+	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[2]), "52");
+	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[3]), "53");
+	UT_ASSERT_EQ(captured_undo_observation_ensure_calls, 1);
+
+	old_alias_value = captured_dump_value("gcs", "pi_watermark_retire_count");
+	new_alias_value = captured_dump_value("gcs", "pi_master_metadata_retire_count");
+	UT_ASSERT_NOT_NULL(old_alias_value);
+	UT_ASSERT_NOT_NULL(new_alias_value);
+	UT_ASSERT_STR_EQ(old_alias_value, "73");
+	UT_ASSERT_STR_EQ(old_alias_value, new_alias_value);
+	UT_ASSERT_EQ(captured_pi_retire_accessor_calls, 1);
+
+	/* The complete R10-owned O1 cohort remains absent, never zero-valued. */
+	for (i = 0; i < (int)lengthof(o1_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count(NULL, o1_keys[i]), 0);
 }
 
 

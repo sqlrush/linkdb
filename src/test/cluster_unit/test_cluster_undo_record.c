@@ -4,7 +4,7 @@
  *	  pgrac spec-3.7 D12 — cluster_unit encode/decode round-trip tests
  *	  for UndoRecordHeader + 4 op payloads + slot directory.
  *
- *	  12 tests covering:
+ *	  19 tests covering:
  *	    T1   UndoRecordHeader encode + decode round-trip (full fields)
  *	    T2   UndoInsertPayload encode + decode round-trip
  *	    T3   UndoUpdatePayload encode + decode round-trip
@@ -17,6 +17,9 @@
  *	    T10  PGRAC_UNDO_BLOCK_MAGIC roundtrip after init
  *	    T11  flags + record_type byte-for-byte fidelity
  *	    T12  prev_uba 16B preserved through encode → decode chain
+ *	    T13–T19  R1 O4 complete-pool scan, failure classification,
+ *	              once-per-postmaster publication, restart reconstruction,
+ *	              create/reuse cardinality and effective-cap floor
  *
  * Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 2026, pgrac contributors
@@ -32,11 +35,28 @@
 
 #include "postgres.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <stddef.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
+#include "cluster/cluster_conf.h"
+#include "cluster/cluster_shmem.h"
+#include "cluster/cluster_undo_gcs.h"
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_xnode_profile.h"
+#include "cluster/storage/cluster_shared_fs.h"
+#include "cluster/storage/cluster_undo_alloc.h"
+#include "storage/backendid.h"
+#include "storage/fd.h"
+#include "storage/proc.h"
+#include "utils/elog.h"
+#include "utils/wait_event.h"
 
 #undef printf
 #undef fprintf
@@ -45,6 +65,282 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+
+#define UNDO_TEST_SHMEM_BYTES 16384
+
+static union {
+	max_align_t alignment;
+	char bytes[UNDO_TEST_SHMEM_BYTES];
+} undo_test_shmem;
+static bool undo_test_shmem_found;
+static char undo_test_root[MAXPGPATH];
+static char undo_test_open_fail_path[MAXPGPATH];
+static int undo_test_observer_open_calls;
+static bool undo_test_track_observer_opens;
+static uint32 undo_test_wait_event_info;
+
+char *DataDir = NULL;
+bool cluster_enabled = false;
+bool cluster_undo_gcs_coherence = false;
+int cluster_node_id = 0;
+int cluster_undo_segments_max_per_instance = CLUSTER_UNDO_SEGS_PER_INSTANCE;
+int cluster_undo_extent_blocks = 1;
+int cluster_undo_record_inline_max_bytes = 2048;
+bool cluster_undo_record_segment_commit_on_rollover = true;
+ClusterConf *ClusterConfShmem = NULL;
+ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
+bool cluster_xnode_profile_enabled = false;
+int MaxBackends = 1;
+BackendId MyBackendId = InvalidBackendId;
+PGPROC *MyProc = NULL;
+int max_prepared_xacts = 0;
+uint32 *my_wait_event_info = &undo_test_wait_event_info;
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+
+/*
+ * The O4 tests below link the real record/allocator implementation, trimmed to
+ * the functions reachable from this binary.  These stubs are the runtime
+ * boundaries actually crossed by that observation slice; no product branch is
+ * replaced.
+ */
+void
+ExceptionalCondition(const char *conditionName pg_attribute_unused(),
+					 const char *fileName pg_attribute_unused(), int lineNumber pg_attribute_unused())
+{
+	abort();
+}
+
+Size
+add_size(Size s1, Size s2)
+{
+	if (s1 > SIZE_MAX - s2)
+		abort();
+	return s1 + s2;
+}
+
+Size
+mul_size(Size s1, Size s2)
+{
+	if (s1 != 0 && s2 > SIZE_MAX / s1)
+		abort();
+	return s1 * s2;
+}
+
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
+{
+	if (size > sizeof(undo_test_shmem))
+		abort();
+	if (foundPtr != NULL)
+		*foundPtr = undo_test_shmem_found;
+	undo_test_shmem_found = true;
+	return undo_test_shmem.bytes;
+}
+
+int
+LWLockNewTrancheId(void)
+{
+	return 1;
+}
+
+void
+LWLockRegisterTranche(int tranche_id pg_attribute_unused(),
+					  const char *tranche_name pg_attribute_unused())
+{}
+
+void
+LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
+{}
+
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+
+bool
+LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{}
+
+int
+BasicOpenFile(const char *fileName, int fileFlags)
+{
+	if (undo_test_track_observer_opens)
+		undo_test_observer_open_calls++;
+	if (undo_test_open_fail_path[0] != '\0'
+		&& strcmp(fileName, undo_test_open_fail_path) == 0) {
+		errno = EIO;
+		return -1;
+	}
+	if ((fileFlags & O_CREAT) != 0)
+		return open(fileName, fileFlags, S_IRUSR | S_IWUSR);
+	return open(fileName, fileFlags);
+}
+
+bool
+cluster_undo_path_uses_shared_root(ClusterUndoPathIntent intent pg_attribute_unused(),
+								   bool peer_mode pg_attribute_unused(),
+								   bool coherence_on pg_attribute_unused())
+{
+	return false;
+}
+
+int
+cluster_shared_fs_undo_path_resolve(uint8 owner_instance pg_attribute_unused(),
+									uint32 segment_id pg_attribute_unused(),
+									char *buf pg_attribute_unused(),
+									size_t buf_size pg_attribute_unused())
+{
+	return -1;
+}
+
+
+static void
+undo_test_segment_path(uint32 segment_id, char *path, size_t path_size)
+{
+	(void)snprintf(path, path_size, "%s/pg_undo/instance_0/seg_%u.dat", undo_test_root,
+				   (unsigned)segment_id);
+}
+
+static bool
+undo_test_fixture_begin(void)
+{
+	char template[] = "/tmp/pgrac-r1-undo-XXXXXX";
+	char path[MAXPGPATH];
+
+	if (mkdtemp(template) == NULL) {
+		UT_ASSERT(false);
+		return false;
+	}
+	(void)snprintf(undo_test_root, sizeof(undo_test_root), "%s", template);
+	if (strncmp(undo_test_root, "/tmp/pgrac-r1-undo-", strlen("/tmp/pgrac-r1-undo-")) != 0) {
+		UT_ASSERT(false);
+		return false;
+	}
+
+	(void)snprintf(path, sizeof(path), "%s/pg_undo", undo_test_root);
+	if (mkdir(path, S_IRWXU) != 0) {
+		UT_ASSERT(false);
+		return false;
+	}
+	(void)snprintf(path, sizeof(path), "%s/pg_undo/instance_0", undo_test_root);
+	if (mkdir(path, S_IRWXU) != 0) {
+		UT_ASSERT(false);
+		return false;
+	}
+
+	DataDir = undo_test_root;
+	cluster_node_id = 0;
+	cluster_enabled = false;
+	cluster_undo_gcs_coherence = false;
+	cluster_undo_segments_max_per_instance = CLUSTER_UNDO_SEGS_PER_INSTANCE;
+	undo_test_open_fail_path[0] = '\0';
+	undo_test_observer_open_calls = 0;
+	undo_test_track_observer_opens = false;
+	return true;
+}
+
+static void
+undo_test_fixture_end(void)
+{
+	char path[MAXPGPATH];
+	uint32 segment_id;
+
+	if (undo_test_root[0] == '\0')
+		return;
+	if (strncmp(undo_test_root, "/tmp/pgrac-r1-undo-", strlen("/tmp/pgrac-r1-undo-")) != 0)
+		abort();
+
+	for (segment_id = 1; segment_id <= CLUSTER_UNDO_SEGS_PER_INSTANCE; segment_id++) {
+		undo_test_segment_path(segment_id, path, sizeof(path));
+		if (unlink(path) != 0 && errno != ENOENT)
+			abort();
+	}
+	(void)snprintf(path, sizeof(path), "%s/pg_undo/instance_0", undo_test_root);
+	if (rmdir(path) != 0)
+		abort();
+	(void)snprintf(path, sizeof(path), "%s/pg_undo", undo_test_root);
+	if (rmdir(path) != 0)
+		abort();
+	if (rmdir(undo_test_root) != 0)
+		abort();
+
+	DataDir = NULL;
+	undo_test_root[0] = '\0';
+}
+
+static void
+undo_test_make_header(uint32 segment_id, uint8 owner_instance, uint8 state, char *page)
+{
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)page;
+
+	memset(page, 0, BLCKSZ);
+	header->pd_flags = PD_UNDO_SEG_HEADER;
+	header->pd_lower = SizeOfPageHeaderData;
+	header->pd_upper = BLCKSZ;
+	header->pd_special = BLCKSZ;
+	header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
+	header->segment_id = segment_id;
+	header->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	header->segment_state = state;
+	header->owner_instance = owner_instance;
+	header->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+}
+
+static bool
+undo_test_write_header(uint32 segment_id, uint8 state)
+{
+	char page[BLCKSZ];
+	char path[MAXPGPATH];
+	ssize_t written;
+	int fd;
+
+	undo_test_segment_path(segment_id, path, sizeof(path));
+	undo_test_make_header(segment_id, 1, state, page);
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+	if (fd < 0)
+		return false;
+	written = write(fd, page, sizeof(page));
+	if (close(fd) != 0)
+		return false;
+	return written == sizeof(page);
+}
+
+static bool
+undo_test_write_invalid_header(uint32 segment_id)
+{
+	char page[BLCKSZ];
+	char path[MAXPGPATH];
+	ssize_t written;
+	int fd;
+
+	memset(page, 0, sizeof(page));
+	undo_test_segment_path(segment_id, path, sizeof(path));
+	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+	if (fd < 0)
+		return false;
+	written = write(fd, page, sizeof(page));
+	if (close(fd) != 0)
+		return false;
+	return written == sizeof(page);
+}
+
+static void
+undo_test_reset_record_shmem(void)
+{
+	memset(&undo_test_shmem, 0, sizeof(undo_test_shmem));
+	undo_test_shmem_found = false;
+	cluster_undo_record_shmem_init();
+}
 
 
 /* ---- T1: UndoRecordHeader encode + decode round-trip ---- */
@@ -278,10 +574,193 @@ UT_TEST(test_prev_uba_preserved)
 }
 
 
+/* ---- R1-A O4: real full-pool observer and record publication ---- */
+UT_TEST(test_undo_pool_observer_scans_all_256_slots_across_gaps)
+{
+	ClusterUndoPoolObservation observation;
+	ClusterUndoPoolObservationResult result;
+
+	if (!undo_test_fixture_begin())
+		return;
+	UT_ASSERT(undo_test_write_header(1, SEGMENT_ALLOCATED));
+	UT_ASSERT(undo_test_write_header(3, SEGMENT_ACTIVE));
+
+	undo_test_track_observer_opens = true;
+	result = cluster_undo_segment_observe_pool(1, &observation);
+	undo_test_track_observer_opens = false;
+
+	UT_ASSERT_EQ(result, CLUSTER_UNDO_POOL_OBS_OK);
+	UT_ASSERT_EQ(observation.allocated_count, 2);
+	UT_ASSERT_EQ(observation.configured_cap, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	UT_ASSERT_EQ(observation.effective_cap, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	UT_ASSERT_EQ(undo_test_observer_open_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_undo_pool_observer_rejects_invalid_owner_and_null_output)
+{
+	ClusterUndoPoolObservation observation = { 7, 8, 9 };
+
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(0, &observation),
+				 CLUSTER_UNDO_POOL_OBS_INVALID_OWNER);
+	UT_ASSERT_EQ(observation.allocated_count, 0);
+	UT_ASSERT_EQ(observation.configured_cap, 0);
+	UT_ASSERT_EQ(observation.effective_cap, 0);
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, NULL),
+				 CLUSTER_UNDO_POOL_OBS_INVALID_OWNER);
+}
+
+UT_TEST(test_undo_pool_observer_distinguishes_io_failure_and_invalid_header)
+{
+	ClusterUndoPoolObservation observation;
+	char path[MAXPGPATH];
+
+	if (!undo_test_fixture_begin())
+		return;
+	undo_test_segment_path(19, path, sizeof(path));
+	(void)snprintf(undo_test_open_fail_path, sizeof(undo_test_open_fail_path), "%s", path);
+	undo_test_track_observer_opens = true;
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation),
+				 CLUSTER_UNDO_POOL_OBS_IO_ERROR);
+	undo_test_track_observer_opens = false;
+	UT_ASSERT_EQ(undo_test_observer_open_calls, 19);
+	UT_ASSERT_EQ(observation.allocated_count, 0);
+
+	undo_test_open_fail_path[0] = '\0';
+	undo_test_observer_open_calls = 0;
+	UT_ASSERT(undo_test_write_invalid_header(7));
+	undo_test_track_observer_opens = true;
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation),
+				 CLUSTER_UNDO_POOL_OBS_INVALID_HEADER);
+	undo_test_track_observer_opens = false;
+	UT_ASSERT_EQ(undo_test_observer_open_calls, 7);
+	UT_ASSERT_EQ(observation.allocated_count, 0);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_undo_record_restart_reconstructs_and_dump_ensure_never_rescans)
+{
+	int first_scan_calls;
+
+	if (!undo_test_fixture_begin())
+		return;
+	UT_ASSERT(undo_test_write_header(1, SEGMENT_ALLOCATED));
+	UT_ASSERT(undo_test_write_header(3, SEGMENT_COMMITTED));
+	undo_test_reset_record_shmem();
+
+	undo_test_track_observer_opens = true;
+	cluster_undo_record_observation_ensure();
+	undo_test_track_observer_opens = false;
+	first_scan_calls = undo_test_observer_open_calls;
+	UT_ASSERT_STR_EQ(cluster_undo_segment_observation_status_string(), "READY");
+	UT_ASSERT_EQ(cluster_undo_segment_allocated_count(), 2);
+	UT_ASSERT_EQ(cluster_undo_segment_allocated_high_water(), 2);
+	UT_ASSERT_EQ(first_scan_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+
+	/* A later file must not make a diagnostic dump rescan this incarnation. */
+	UT_ASSERT(undo_test_write_header(5, SEGMENT_RECYCLABLE));
+	undo_test_track_observer_opens = true;
+	cluster_undo_record_observation_ensure();
+	undo_test_track_observer_opens = false;
+	UT_ASSERT_EQ(undo_test_observer_open_calls, first_scan_calls);
+	UT_ASSERT_EQ(cluster_undo_segment_allocated_count(), 2);
+
+	/* A fresh postmaster incarnation reconstructs all three on-disk headers. */
+	undo_test_reset_record_shmem();
+	undo_test_observer_open_calls = 0;
+	undo_test_track_observer_opens = true;
+	cluster_undo_record_observation_ensure();
+	undo_test_track_observer_opens = false;
+	UT_ASSERT_STR_EQ(cluster_undo_segment_observation_status_string(), "READY");
+	UT_ASSERT_EQ(cluster_undo_segment_allocated_count(), 3);
+	UT_ASSERT_EQ(cluster_undo_segment_allocated_high_water(), 3);
+	UT_ASSERT_EQ(undo_test_observer_open_calls, CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_undo_record_failed_lazy_scan_is_attempted_once)
+{
+	char path[MAXPGPATH];
+	int failed_scan_calls;
+
+	if (!undo_test_fixture_begin())
+		return;
+	undo_test_segment_path(4, path, sizeof(path));
+	(void)snprintf(undo_test_open_fail_path, sizeof(undo_test_open_fail_path), "%s", path);
+	undo_test_reset_record_shmem();
+
+	undo_test_track_observer_opens = true;
+	cluster_undo_record_observation_ensure();
+	undo_test_track_observer_opens = false;
+	failed_scan_calls = undo_test_observer_open_calls;
+	UT_ASSERT_STR_EQ(cluster_undo_segment_observation_status_string(), "UNAVAILABLE_IO_ERROR");
+	UT_ASSERT_EQ(cluster_undo_segment_allocated_count(), 0);
+	UT_ASSERT_EQ(cluster_undo_segment_allocated_high_water(), 0);
+	UT_ASSERT_EQ(failed_scan_calls, 4);
+
+	undo_test_open_fail_path[0] = '\0';
+	undo_test_track_observer_opens = true;
+	cluster_undo_record_observation_ensure();
+	undo_test_track_observer_opens = false;
+	UT_ASSERT_EQ(undo_test_observer_open_calls, failed_scan_calls);
+	UT_ASSERT_STR_EQ(cluster_undo_segment_observation_status_string(), "UNAVAILABLE_IO_ERROR");
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_undo_pool_create_increments_but_reuse_keeps_cardinality)
+{
+	ClusterUndoPoolObservation observation;
+
+	if (!undo_test_fixture_begin())
+		return;
+	UT_ASSERT(undo_test_write_header(1, SEGMENT_ACTIVE));
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation), CLUSTER_UNDO_POOL_OBS_OK);
+	UT_ASSERT_EQ(observation.allocated_count, 1);
+
+	UT_ASSERT(undo_test_write_header(2, SEGMENT_ALLOCATED));
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation), CLUSTER_UNDO_POOL_OBS_OK);
+	UT_ASSERT_EQ(observation.allocated_count, 2);
+
+	/* Rebirth rewrites one valid identity in place; it cannot create a row. */
+	UT_ASSERT(undo_test_write_header(2, SEGMENT_RECYCLABLE));
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation), CLUSTER_UNDO_POOL_OBS_OK);
+	UT_ASSERT_EQ(observation.allocated_count, 2);
+	undo_test_fixture_end();
+}
+
+UT_TEST(test_undo_effective_cap_clamps_and_never_falls_below_current)
+{
+	ClusterUndoPoolObservation observation;
+	uint32 segment_id;
+
+	if (!undo_test_fixture_begin())
+		return;
+	for (segment_id = 1; segment_id <= 17; segment_id++)
+		UT_ASSERT(undo_test_write_header(segment_id, SEGMENT_ALLOCATED));
+
+	cluster_undo_segments_max_per_instance = 4;
+	UT_ASSERT_EQ(cluster_undo_segment_observe_pool(1, &observation), CLUSTER_UNDO_POOL_OBS_OK);
+	UT_ASSERT_EQ(observation.allocated_count, 17);
+	UT_ASSERT_EQ(observation.configured_cap, 16);
+	UT_ASSERT_EQ(observation.effective_cap, 17);
+
+	undo_test_reset_record_shmem();
+	cluster_undo_record_observation_ensure();
+	UT_ASSERT_EQ(cluster_undo_segment_effective_cap(), 17);
+	cluster_undo_segments_max_per_instance = 32;
+	UT_ASSERT_EQ(cluster_undo_segment_effective_cap(), 32);
+	cluster_undo_segments_max_per_instance = 999;
+	UT_ASSERT_EQ(cluster_undo_segment_effective_cap(), CLUSTER_UNDO_SEGS_PER_INSTANCE);
+	cluster_undo_segments_max_per_instance = 4;
+	UT_ASSERT_EQ(cluster_undo_segment_effective_cap(), 17);
+	undo_test_fixture_end();
+}
+
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(12);
+	UT_PLAN(19);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);
@@ -295,6 +774,13 @@ main(int argc, char **argv)
 	UT_RUN(test_block_magic_init);
 	UT_RUN(test_record_type_flags_bytes);
 	UT_RUN(test_prev_uba_preserved);
+	UT_RUN(test_undo_pool_observer_scans_all_256_slots_across_gaps);
+	UT_RUN(test_undo_pool_observer_rejects_invalid_owner_and_null_output);
+	UT_RUN(test_undo_pool_observer_distinguishes_io_failure_and_invalid_header);
+	UT_RUN(test_undo_record_restart_reconstructs_and_dump_ensure_never_rescans);
+	UT_RUN(test_undo_record_failed_lazy_scan_is_attempted_once);
+	UT_RUN(test_undo_pool_create_increments_but_reuse_keeps_cardinality);
+	UT_RUN(test_undo_effective_cap_clamps_and_never_falls_below_current);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

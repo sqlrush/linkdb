@@ -36,7 +36,9 @@
  */
 #include "postgres.h"
 
+#include <setjmp.h>
 #include <signal.h>
+#include <time.h>
 
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_lmon.h"
@@ -66,6 +68,16 @@ bool IsUnderPostmaster = false;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 int MyProcPid = 0;
+
+static ClusterLmonSharedState test_lmon_state;
+static bool test_lmon_shmem_found = false;
+static bool test_lmon_exit_armed = false;
+static jmp_buf test_lmon_exit_jump;
+static int test_lmon_wait_calls = 0;
+static bool test_lmon_clock_active = false;
+static uint64 test_lmon_clock_ns[2];
+static int test_lmon_clock_calls = 0;
+static bool test_lmon_seed_saturation = false;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -148,8 +160,9 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 				bool *foundPtr)
 {
 	if (foundPtr != NULL)
-		*foundPtr = false;
-	return NULL;
+		*foundPtr = test_lmon_shmem_found;
+	test_lmon_shmem_found = true;
+	return &test_lmon_state;
 }
 
 #include "cluster/cluster_shmem.h"
@@ -161,6 +174,28 @@ cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unus
 TimestampTz
 GetCurrentTimestamp(void)
 {
+	return 0;
+}
+
+/*
+ * R1-A O3: instr_time is deliberately sourced from a deterministic
+ * monotonic clock while the real LmonMain duty loop runs.  Wall-clock
+ * scheduling continues to use the independent GetCurrentTimestamp stub.
+ */
+int
+clock_gettime(clockid_t clock_id pg_attribute_unused(), struct timespec *tp)
+{
+	uint64 now_ns = 0;
+
+	if (test_lmon_clock_active) {
+		int index = Min(test_lmon_clock_calls, 1);
+
+		now_ns = test_lmon_clock_ns[index];
+		test_lmon_clock_calls++;
+	}
+
+	tp->tv_sec = (time_t)(now_ns / UINT64CONST(1000000000));
+	tp->tv_nsec = (long)(now_ns % UINT64CONST(1000000000));
 	return 0;
 }
 
@@ -620,6 +655,8 @@ init_ps_display(const char *fixed_part pg_attribute_unused())
 void
 proc_exit(int code pg_attribute_unused())
 {
+	if (test_lmon_exit_armed)
+		longjmp(test_lmon_exit_jump, 1);
 	abort();
 }
 
@@ -645,6 +682,8 @@ int
 WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
 {
+	test_lmon_wait_calls++;
+	ShutdownRequestPending = true;
 	return 0;
 }
 void
@@ -667,7 +706,13 @@ BackendType MyBackendType = B_INVALID;
 void cluster_fence_lmon_tick(void);
 void
 cluster_fence_lmon_tick(void)
-{}
+{
+	if (test_lmon_seed_saturation) {
+		test_lmon_state.timed_duty_sample_count = PG_UINT64_MAX;
+		test_lmon_state.total_iter_us = PG_UINT64_MAX - 5;
+		test_lmon_seed_saturation = false;
+	}
+}
 
 /* spec-2.29 Sprint A Step 2 stub: cluster_lmon.c now calls
  * cluster_reconfig_lmon_tick() in its main loop.  Empty stub for
@@ -876,7 +921,94 @@ UT_TEST(test_lmon_iteration_counters_null_safe)
 	UT_ASSERT_EQ((unsigned long long)cluster_lmon_last_iter_us(), 0ULL);
 	UT_ASSERT_EQ((unsigned long long)cluster_lmon_max_iter_us(), 0ULL);
 	UT_ASSERT_EQ((unsigned long long)cluster_lmon_slow_iter_count(), 0ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_timed_duty_sample_count(), 0ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_total_iter_us(), 0ULL);
 	cluster_lmon_marker_complete_wakeup();
+}
+
+static void
+run_one_real_lmon_duty(uint64 start_us, uint64 finish_us, bool seed_saturation)
+{
+	if (!test_lmon_shmem_found)
+		cluster_lmon_shmem_init();
+
+	IsUnderPostmaster = true;
+	cluster_enabled = false;
+	ConfigReloadPending = false;
+	ShutdownRequestPending = false;
+	test_lmon_state.shutdown_requested = false;
+	test_lmon_wait_calls = 0;
+	test_lmon_clock_ns[0] = start_us * UINT64CONST(1000);
+	test_lmon_clock_ns[1] = finish_us * UINT64CONST(1000);
+	test_lmon_clock_calls = 0;
+	test_lmon_clock_active = true;
+	test_lmon_seed_saturation = seed_saturation;
+	test_lmon_exit_armed = true;
+
+	if (setjmp(test_lmon_exit_jump) == 0)
+		LmonMain();
+
+	test_lmon_exit_armed = false;
+	test_lmon_clock_active = false;
+	IsUnderPostmaster = false;
+}
+
+/*
+ * R1-A O3: execute the real disabled-interconnect LMON loop once.  The
+ * recorder consumes one monotonic interval and publishes every member of
+ * the old timing triple plus the new exact count/time pair from that same
+ * elapsed value.  WaitLatch requests shutdown only after the completed duty.
+ */
+UT_TEST(test_lmon_completed_duty_records_one_exact_timed_pair)
+{
+	uint64 sample_count = 0;
+	uint64 total_us = 0;
+
+	cluster_lmon_slow_iteration_warn_ms = 1;
+	run_one_real_lmon_duty(500, 2000, false);
+
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_last_iter_us(), 1500ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_max_iter_us(), 1500ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_slow_iter_count(), 1ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_timed_duty_sample_count(), 1ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_total_iter_us(), 1500ULL);
+	UT_ASSERT_EQ((long long)cluster_lmon_main_loop_iters(), 1LL);
+	UT_ASSERT_EQ(test_lmon_clock_calls, 2);
+	UT_ASSERT_EQ(test_lmon_wait_calls, 1);
+
+	cluster_lmon_timed_duty_pair(&sample_count, &total_us);
+	UT_ASSERT_EQ((unsigned long long)sample_count, 1ULL);
+	UT_ASSERT_EQ((unsigned long long)total_us, 1500ULL);
+}
+
+UT_TEST(test_lmon_zero_elapsed_is_still_one_completed_sample)
+{
+	cluster_lmon_slow_iteration_warn_ms = 1;
+	run_one_real_lmon_duty(700, 700, false);
+
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_last_iter_us(), 0ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_max_iter_us(), 0ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_slow_iter_count(), 0ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_timed_duty_sample_count(), 1ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_total_iter_us(), 0ULL);
+	UT_ASSERT_EQ((long long)cluster_lmon_main_loop_iters(), 1LL);
+	UT_ASSERT_EQ(test_lmon_clock_calls, 2);
+	UT_ASSERT_EQ(test_lmon_wait_calls, 1);
+}
+
+UT_TEST(test_lmon_timed_pair_saturates_without_wrapping)
+{
+	cluster_lmon_slow_iteration_warn_ms = 1;
+	run_one_real_lmon_duty(900, 910, true);
+
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_last_iter_us(), 10ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_max_iter_us(), 10ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_slow_iter_count(), 0ULL);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_timed_duty_sample_count(), PG_UINT64_MAX);
+	UT_ASSERT_EQ((unsigned long long)cluster_lmon_total_iter_us(), PG_UINT64_MAX);
+	UT_ASSERT_EQ((long long)cluster_lmon_main_loop_iters(), 1LL);
+	UT_ASSERT_EQ(test_lmon_clock_calls, 2);
+	UT_ASSERT_EQ(test_lmon_wait_calls, 1);
 }
 
 /*
@@ -931,13 +1063,16 @@ UT_TEST(test_lmon_duty_lazy_truth_table)
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(10);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
 	UT_RUN(test_lmon_status_unknown_returns_unknown);
 	UT_RUN(test_lmon_public_symbols_linkable);
 	UT_RUN(test_lmon_iteration_counters_null_safe);
+	UT_RUN(test_lmon_completed_duty_records_one_exact_timed_pair);
+	UT_RUN(test_lmon_zero_elapsed_is_still_one_completed_sample);
+	UT_RUN(test_lmon_timed_pair_saturates_without_wrapping);
 	UT_RUN(test_lmon_duty_lazy_truth_table);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
