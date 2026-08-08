@@ -8,6 +8,8 @@
  *	  control plane.  This unit binary checks compile-time invariants
  *	  (struct sizes, field offsets, enum values, hash math) that are
  *	  verifiable from headers alone — no linking of cluster_gcs_block.o.
+ *	  The R1 acquisition-observation group links cluster_pcm_x_convert.o
+ *	  solely to exercise its real accounting and snapshot API.
  *	  Symbol linkability + behavioral coverage (XLogFlush invocation order,
  *	  checksum fail-closed, PageSetLSN install, HC89 single-retry
  *	  revalidation, sparse-topology end-to-end ship) lives in cluster_tap
@@ -65,6 +67,7 @@
 #include "postgres.h"
 
 #include <stddef.h>
+#include <setjmp.h>
 
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_gcs.h"
@@ -72,10 +75,12 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_shmem.h"
 #include "cluster/cluster_thread_recovery.h"
 #include "common/hashfn.h"
 #include "storage/buf_internals.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
 #include "utils/wait_event.h"
 
 #undef printf
@@ -93,6 +98,144 @@
 
 
 UT_DEFINE_GLOBALS();
+
+
+/* Backend dependencies of cluster_pcm_x_convert.o are unreachable from the
+ * observation-only test below.  Keep their test stubs fail-fast so this unit
+ * cannot silently expand into a second PCM-X behavioral harness. */
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+volatile uint32 CritSectionCount = 0;
+int MaxBackends = 4;
+int NBuffers = 1;
+int cluster_lmd_max_wait_edges = 1;
+int cluster_node_id = 0;
+
+static BufferDescPadded observation_buffer_descriptors[1];
+BufferDescPadded *BufferDescriptors = observation_buffer_descriptors;
+
+static PROC_HDR observation_proc_global;
+PROC_HDR *ProcGlobal = &observation_proc_global;
+
+void
+pg_re_throw(void)
+{
+	abort();
+}
+
+void
+FlushErrorState(void)
+{}
+
+Size
+add_size(Size left, Size right)
+{
+	if (left > SIZE_MAX - right)
+		abort();
+	return left + right;
+}
+
+Size
+mul_size(Size left, Size right)
+{
+	if (left != 0 && right > SIZE_MAX / left)
+		abort();
+	return left * right;
+}
+
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
+				bool *found_ptr pg_attribute_unused())
+{
+	abort();
+}
+
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	abort();
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	abort();
+}
+
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	abort();
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	abort();
+}
+
+int
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	abort();
+}
+
+void
+LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	abort();
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockHeldByMe(LWLock *lock pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+LWLockAnyHeldByMe(LWLock *lock pg_attribute_unused(), int nlocks pg_attribute_unused(),
+				  size_t stride pg_attribute_unused())
+{
+	abort();
+}
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *) pg_attribute_unused(),
+					  void *context pg_attribute_unused())
+{
+	abort();
+}
 
 
 static char *
@@ -342,6 +485,105 @@ UT_TEST(test_pcm_x_session_auth_sample_classifies_epoch_zero_and_torn_reads)
 	sample.connection_generation_after = 1;
 	UT_ASSERT_EQ(cluster_gcs_pcm_x_auth_sample_classify(&sample, 0),
 				 PCM_X_SESSION_AUTH_CONNECTION_TORN);
+}
+
+
+/*
+ * Exercise the real PCM-X acquisition-accounting object from this GCS unit.
+ * The production wrapper's preflight, ordinary-return, and error paths are
+ * covered by cluster_tap t/418; this test only pins the accounting API and
+ * snapshot contract without introducing a wrapper double or test seam.
+ */
+UT_TEST(test_pcm_x_acquire_observation_real_api_counts_exactly_once)
+{
+	PcmXShmemHeader header;
+	PcmXAcquireObservationSnapshot baseline;
+	PcmXAcquireObservationSnapshot after_begin;
+	PcmXAcquireObservationSnapshot after_success;
+	PcmXAcquireObservationSnapshot after_non_success;
+	PcmXAcquireObservationSnapshot after_exception;
+	PcmXAcquireObservationSnapshot after_duplicate_close;
+	int i;
+
+	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, 14);
+	UT_ASSERT_EQ(PCM_X_ACQUIRE_HIST_BUCKETS, 32);
+	memset(&header, 0, sizeof(header));
+	pg_atomic_init_u64(&header.acquire_observation.started_count, 0);
+	pg_atomic_init_u64(&header.acquire_observation.active_count, 0);
+	pg_atomic_init_u64(&header.acquire_observation.exception_count, 0);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		pg_atomic_init_u64(&header.acquire_observation.terminal_result_count[i], 0);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		pg_atomic_init_u64(&header.acquire_observation.success_latency_bucket[i], 0);
+	pg_atomic_init_u64(&header.acquire_observation.success_latency_overflow_count, 0);
+	ClusterPcmXConvertShmem = &header;
+
+	cluster_pcm_x_acquire_observation_snapshot(&baseline);
+	UT_ASSERT_EQ(baseline.started_count, 0);
+	UT_ASSERT_EQ(baseline.active_count, 0);
+	UT_ASSERT_EQ(baseline.exception_count, 0);
+
+	cluster_pcm_x_acquire_observation_begin(UINT64_C(100));
+	cluster_pcm_x_acquire_observation_snapshot(&after_begin);
+	UT_ASSERT_EQ(after_begin.started_count, 1);
+	UT_ASSERT_EQ(after_begin.active_count, 1);
+	UT_ASSERT_EQ(after_begin.exception_count, 0);
+	cluster_pcm_x_acquire_observation_finish(PCM_X_QUEUE_OK, UINT64_C(101));
+	cluster_pcm_x_acquire_observation_snapshot(&after_success);
+	UT_ASSERT_EQ(after_success.started_count, 1);
+	UT_ASSERT_EQ(after_success.active_count, 0);
+	UT_ASSERT_EQ(after_success.exception_count, 0);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		UT_ASSERT_EQ(after_success.terminal_result_count[i], i == PCM_X_QUEUE_OK ? 1 : 0);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		UT_ASSERT_EQ(after_success.success_latency_bucket[i], i == 0 ? 1 : 0);
+	UT_ASSERT_EQ(after_success.success_latency_overflow_count, 0);
+
+	cluster_pcm_x_acquire_observation_begin(UINT64_C(200));
+	cluster_pcm_x_acquire_observation_finish(PCM_X_QUEUE_BUSY, UINT64_C(250));
+	cluster_pcm_x_acquire_observation_snapshot(&after_non_success);
+	UT_ASSERT_EQ(after_non_success.started_count, 2);
+	UT_ASSERT_EQ(after_non_success.active_count, 0);
+	UT_ASSERT_EQ(after_non_success.exception_count, 0);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		UT_ASSERT_EQ(after_non_success.terminal_result_count[i],
+					 i == PCM_X_QUEUE_OK || i == PCM_X_QUEUE_BUSY ? 1 : 0);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		UT_ASSERT_EQ(after_non_success.success_latency_bucket[i],
+					 after_success.success_latency_bucket[i]);
+	UT_ASSERT_EQ(after_non_success.success_latency_overflow_count,
+				 after_success.success_latency_overflow_count);
+
+	cluster_pcm_x_acquire_observation_begin(UINT64_C(300));
+	cluster_pcm_x_acquire_observation_exception();
+	cluster_pcm_x_acquire_observation_snapshot(&after_exception);
+	UT_ASSERT_EQ(after_exception.started_count, 3);
+	UT_ASSERT_EQ(after_exception.active_count, 0);
+	UT_ASSERT_EQ(after_exception.exception_count, 1);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		UT_ASSERT_EQ(after_exception.terminal_result_count[i],
+					 after_non_success.terminal_result_count[i]);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		UT_ASSERT_EQ(after_exception.success_latency_bucket[i],
+					 after_non_success.success_latency_bucket[i]);
+	UT_ASSERT_EQ(after_exception.success_latency_overflow_count,
+				 after_non_success.success_latency_overflow_count);
+
+	cluster_pcm_x_acquire_observation_finish(PCM_X_QUEUE_OK, UINT64_C(400));
+	cluster_pcm_x_acquire_observation_snapshot(&after_duplicate_close);
+	UT_ASSERT_EQ(after_duplicate_close.started_count, after_exception.started_count);
+	UT_ASSERT_EQ(after_duplicate_close.active_count, after_exception.active_count);
+	UT_ASSERT_EQ(after_duplicate_close.exception_count, after_exception.exception_count);
+	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+		UT_ASSERT_EQ(after_duplicate_close.terminal_result_count[i],
+					 after_exception.terminal_result_count[i]);
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		UT_ASSERT_EQ(after_duplicate_close.success_latency_bucket[i],
+					 after_exception.success_latency_bucket[i]);
+	UT_ASSERT_EQ(after_duplicate_close.success_latency_overflow_count,
+				 after_exception.success_latency_overflow_count);
+
+	ClusterPcmXConvertShmem = NULL;
 }
 
 
@@ -5234,7 +5476,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(104);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5246,6 +5488,7 @@ main(void)
 	UT_RUN(test_gcs_block_wait_events_distinct);
 	UT_RUN(test_gcs_block_reply_total_size_is_8240);
 	UT_RUN(test_pcm_x_session_auth_sample_classifies_epoch_zero_and_torn_reads);
+	UT_RUN(test_pcm_x_acquire_observation_real_api_counts_exactly_once);
 	UT_RUN(test_gcs_block_reply_key_is_compound);
 	UT_RUN(test_gcs_block_reserved_padding_present);
 	UT_RUN(test_gcs_block_data_size_equals_blcksz);

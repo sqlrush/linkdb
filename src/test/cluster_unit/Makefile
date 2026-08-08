@@ -1447,20 +1447,22 @@ test_cluster_gcs_dispatch: test_cluster_gcs_dispatch.c unit_test.h \
 # spec-2.33 D13: test_cluster_gcs_block verifies GCS block-shipping
 # substrate compile-time invariants (msg_type 14/15, payload ABI sizes,
 # field offsets, deterministic hash math, wait events + tranches
-# distinct, BLCKSZ cross-check).  Pure header-only checks — does NOT
-# link cluster_gcs_block.o.  Behavioral coverage (HC82 / HC83 / HC84 /
-# HC88 / HC89 paths) lives in cluster_tap t/111.
-test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) \
+# distinct, BLCKSZ cross-check).  The GCS substrate checks do not link
+# cluster_gcs_block.o.  The R1 observation group additionally links the
+# real cluster_pcm_x_convert.o accounting API; wrapper behavior lives in
+# cluster_tap t/418.  Other behavioral coverage lives in t/111.
+test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O) \
+		$(CLUSTER_PCM_X_CONVERT_O)
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		-DLMS_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms.c"' \
 		-DLMS_OUTBOUND_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c"' \
 		-DT400_SOURCE_PATH='"$(top_srcdir)/src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl"' \
 		$< \
-		$(CLUSTER_VERSION_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_X_CONVERT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(top_builddir)/src/port/libpgport_srv.a $(PTHREAD_LIBS) -o $@
 
 # spec-2.34 D13: test_cluster_gcs_block_retransmit verifies reliability
 # hardening compile-time invariants (status enum 7→8, dedup entry 8312B
