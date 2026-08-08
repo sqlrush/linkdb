@@ -2447,6 +2447,38 @@ UT_TEST(test_convert_u6_self_exclusion)
 	convert_teardown();
 }
 
+/* U6b — PG permits one backend to hold several additive modes on one
+ * relation.  A convert must self-exclude every holder owned by that backend,
+ * not only the precise old-mode slot selected by the REDECLARE locator. */
+UT_TEST(test_convert_u6_multiple_self_holders_excluded)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId converted;
+	bool drain = false;
+
+	convert_reset();
+	e = convert_make_entry(2016);
+	convert_grant(e, 1, 100, 11, ShareLock);       /* precise convert source */
+	convert_grant(e, 1, 100, 12, AccessShareLock); /* additive self holder */
+
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 2);
+
+	/* The precise Share slot was upgraded/rebound; the additive self slot stays. */
+	memset(&converted, 0, sizeof(converted));
+	converted.node_id = 1;
+	converted.procno = 100;
+	converted.request_id = 77;
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &converted),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1);
+	convert_teardown();
+}
+
 /* U7 — anti-starvation: with a pending convert, a new request that
  * conflicts with the convert's target mode must be blocked (must wait);
  * one compatible with the target is not blocked. */
@@ -4523,7 +4555,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * +1 (U17 cross-episode fence Hardening);
 	 * spec-4.6a r3-P2-2:+2 (same-epoch dead-set growth re-stamp + no-churn);
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage). */
-	UT_PLAN(84);
+	UT_PLAN(85);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -4570,6 +4602,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_convert_u4_upgrade_inplace_or_enqueue);
 	UT_RUN(test_convert_u5_lateral_and_no_holder_illegal);
 	UT_RUN(test_convert_u6_self_exclusion);
+	UT_RUN(test_convert_u6_multiple_self_holders_excluded);
 	UT_RUN(test_convert_u7_new_request_blocked_by_pending_convert);
 	UT_RUN(test_convert_u8_drain_converts_before_waiters);
 	UT_RUN(test_convert_u9_queue_full_fail_closed);

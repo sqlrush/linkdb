@@ -27,6 +27,10 @@
 #          until node1 commits, then it is granted (green-path coexistence).
 #      L5  illegal convert: SHARE UPDATE EXCLUSIVE then SHARE is a LATERAL (non
 #          partial-order) conversion -> 53R74 with an actionable errhint.
+#      L7  deferred uniqueness: default convert permits real two-node
+#          DEFERRABLE INITIALLY DEFERRED DDL; a duplicate INSERT succeeds and
+#          COMMIT reports native 23505.  Per-node native-probe and convert
+#          verdict/capacity deltas attribute any failure to the existing path.
 #      L9  additive escape hatch: cluster.tm_convert_mode = 'additive' routes the
 #          L2 sequence through the additive REQUEST path -> no convert counter
 #          bump, no 53R74.
@@ -118,6 +122,57 @@ sub convert_count
 		$sum += ($v // 0);
 	}
 	return $sum;
+}
+
+# Capture the existing TM/GES attribution surfaces per node.  Keep the
+# individual nodes separate: the relation master, native-probe collector and
+# requester need not be colocated.
+sub tmges_attribution_snapshot
+{
+	my ($pair) = @_;
+	my %snapshot;
+
+	for my $i (0, 1)
+	{
+		my $node = $i == 0 ? $pair->node0 : $pair->node1;
+		my $rows = $node->safe_psql(
+			'postgres', q{
+			SELECT category || '|' || key || '|' || value
+			FROM pg_cluster_state
+			WHERE (category = 'lms' AND key LIKE 'native_probe_%')
+			   OR (category = 'ges' AND key = 'ges_timeout_native_probe_count')
+			   OR (category = 'grd' AND key IN
+			       ('grd_convert_enqueued_count',
+			        'grd_convert_granted_inplace_count',
+			        'grd_convert_illegal_count',
+			        'grd_converts_full_count',
+			        'grd_ges_work_queue_full_count'))
+			ORDER BY category, key});
+
+		for my $row (split /\n/, ($rows // ''))
+		{
+			my ($category, $key, $value) = split /\|/, $row, 3;
+
+			next unless defined $value;
+			$snapshot{"node$i:$category.$key"} = 0 + $value;
+		}
+	}
+
+	return \%snapshot;
+}
+
+sub diag_tmges_attribution_delta
+{
+	my ($before, $after, $label) = @_;
+	my %keys = map { $_ => 1 } (keys %$before, keys %$after);
+
+	for my $key (sort keys %keys)
+	{
+		my $old = $before->{$key} // 0;
+		my $new = $after->{$key} // 0;
+
+		diag("  [$label] $key before=$old after=$new delta=" . ($new - $old));
+	}
 }
 
 # Diagnostic: dump every per-node grd convert/relation counter + the
@@ -293,6 +348,66 @@ my ($rc5, $out5, $err5) = $pair->node0->psql(
 	COMMIT;});
 is($rc5, 0, 'L5 a LATERAL multi-mode hold stays additive (legal PG semantics, no 53R74)')
 	or diag("L5 rc=$rc5 err=$err5");
+
+
+# ----------
+# L7: the default convert path must support the real DDL used by a deferred
+# unique constraint.  The duplicate INSERT itself must succeed; only COMMIT's
+# UNIQUE_CHECK_EXISTING recheck may decide the native 23505 result.
+# ----------
+is($pair->node0->safe_psql('postgres', 'SHOW cluster.tm_convert_mode'),
+	'convert', 'L7 node0 uses the default TM convert path');
+is($pair->node1->safe_psql('postgres', 'SHOW cluster.tm_convert_mode'),
+	'convert', 'L7 node1 uses the default TM convert path');
+
+$pair->node0->safe_psql('postgres', 'CREATE TABLE tm_deferred_l7 (k int, v int)');
+$pair->node1->safe_psql('postgres', 'CREATE TABLE tm_deferred_l7 (k int, v int)');
+is($pair->node0->safe_psql('postgres', "SELECT pg_relation_filepath('tm_deferred_l7')"),
+	$pair->node1->safe_psql('postgres', "SELECT pg_relation_filepath('tm_deferred_l7')"),
+	'L7 deferred test heap has one shared relation identity');
+
+my $l7_before = tmges_attribution_snapshot($pair);
+my ($ddl_rc, undef, $ddl_err) = $pair->node0->psql(
+	'postgres', q{
+	\set VERBOSITY verbose
+	ALTER TABLE tm_deferred_l7 ADD CONSTRAINT tm_deferred_l7_uk
+	  UNIQUE (k) DEFERRABLE INITIALLY DEFERRED;});
+my $l7_after = tmges_attribution_snapshot($pair);
+diag_tmges_attribution_delta($l7_before, $l7_after, 'L7 deferrable DDL');
+is($ddl_rc, 0,
+	'L7 default convert completes DEFERRABLE INITIALLY DEFERRED DDL')
+	or diag("L7 DDL rc=$ddl_rc err=$ddl_err");
+
+if ($ddl_rc == 0)
+{
+	$pair->node0->safe_psql('postgres',
+		'INSERT INTO tm_deferred_l7 VALUES (41, 1)');
+	my ($commit_rc, $commit_out, $commit_err) = $pair->node0->psql(
+		'postgres', q{
+		\set ON_ERROR_STOP on
+		\set VERBOSITY verbose
+		BEGIN;
+		SET CONSTRAINTS ALL DEFERRED;
+		INSERT INTO tm_deferred_l7 VALUES (41, 2);
+		SELECT 'PGRAC_DEFERRED_INSERT_OK';
+		COMMIT;});
+
+	like($commit_out, qr/PGRAC_DEFERRED_INSERT_OK/,
+		'L7 duplicate INSERT remains deferred until COMMIT');
+	ok($commit_rc != 0, 'L7 duplicate transaction fails at COMMIT');
+	like($commit_err, qr/ERROR:\s+23505:.*tm_deferred_l7_uk/s,
+		'L7 COMMIT reports native 23505 for the deferred unique constraint');
+	is($pair->node0->safe_psql('postgres',
+			'SELECT count(*) FROM tm_deferred_l7 WHERE k = 41'),
+		'1', 'L7 failed COMMIT leaves only the original row');
+}
+else
+{
+	fail('L7 duplicate INSERT can remain deferred after the DDL');
+	fail('L7 duplicate transaction can reach COMMIT');
+	fail('L7 COMMIT can report native 23505');
+	fail('L7 failed COMMIT can preserve only the original row');
+}
 
 
 # ----------

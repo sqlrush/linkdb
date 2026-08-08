@@ -4981,9 +4981,9 @@ cluster_grd_entry_generation(ClusterGrdEntry *entry)
  *	the real backend convert trigger + wire/identity land in spec-5.2.
  *
  *	Holder identity for the convert locator is (node_id, procno,
- *	current_mode) — the REDECLARE convention — and the convert's own slot
- *	is self-excluded from the UPGRADE conflict scan, so a holder already
- *	in a self-conflicting mode (SUE/SRE/E/AE) can still upgrade.
+ *	current_mode) — the REDECLARE convention — and every holder belonging
+ *	to the converting backend is self-excluded from the UPGRADE conflict
+ *	scan, so PostgreSQL's legal additive same-backend holds cannot block it.
  * ============================================================ */
 
 /* Locate the holder being converted by the (node,procno,mode) locator. */
@@ -5042,11 +5042,14 @@ cluster_grd_entry_request_convert(ClusterGrdEntry *entry, const ClusterGrdConver
 	case GES_CONVERT_UPGRADE:
 		/*
 		 * requested_mode must be compatible with every OTHER holder
-		 * (self-excluded by slot) before we may mutate in place; otherwise
-		 * enqueue with strict priority over new waiters (anti-starvation).
+		 * (all {node_id,procno} self holders excluded) before we may mutate in
+		 * place; otherwise enqueue with strict priority over new waiters
+		 * (anti-starvation).
 		 */
 		for (int i = 0; i < entry->ngranted; i++) {
-			if (i == hslot)
+			if (i == hslot
+				|| (entry->holders[i].node_id == req->node_id
+					&& entry->holders[i].procno == req->procno))
 				continue;
 			if (!ges_modes_compatible(entry->holders[i].mode, req->requested_mode)) {
 				if (entry->nconverts >= PGRAC_GRD_MAX_CONVERTS) {
@@ -5189,10 +5192,10 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 
 	/*
 	 * Phase 1 — grant every pending convert now compatible with the other
-	 * holders (self-excluded), in place.  Granting a convert changes a
-	 * holder mode, which may unblock an earlier-skipped convert, so we
-	 * restart the scan after each grant.  Each grant removes one queue
-	 * entry, so the loop is bounded.
+	 * holders (all {node_id,procno} self holders excluded), in place.  Granting
+	 * a convert changes a holder mode, which may unblock an earlier-skipped
+	 * convert, so we restart the scan after each grant.  Each grant removes one
+	 * queue entry, so the loop is bounded.
 	 */
 	for (int c = 0; c < entry->nconverts && n < max_out;) {
 		ClusterGrdConvert *cv = &entry->converts[c];
@@ -5206,7 +5209,9 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			continue; /* re-check slot c (now the swapped-in entry) */
 		}
 		for (int i = 0; i < entry->ngranted; i++) {
-			if (i == hslot)
+			if (i == hslot
+				|| (entry->holders[i].node_id == cv->node_id
+					&& entry->holders[i].procno == cv->procno))
 				continue;
 			if (!ges_modes_compatible(entry->holders[i].mode, cv->requested_mode)) {
 				compatible = false;
