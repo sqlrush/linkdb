@@ -255,6 +255,7 @@ OBJS = \
 	storage/cluster_pr_scsi.o \
 	storage/cluster_smgr.o \
 	storage/cluster_undo_alloc.o \
+	storage/cluster_undo_block0.o \
 	storage/cluster_undo_buf.o \
 	storage/cluster_undo_smgr.o \
 	storage/cluster_undo_xlog.o \
