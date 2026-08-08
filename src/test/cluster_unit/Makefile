@@ -1823,14 +1823,39 @@ test_cluster_undo_format: test_cluster_undo_format.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-# spec-3.7 D12: test_cluster_undo_record — 12 encode/decode round-trip
-# tests for UndoRecordHeader + 4 payloads + slot dir addressing.
+# spec-3.7 D12 + spec-8.1 O4: encode/decode tests plus the real read-only
+# pool observer and once-per-postmaster publication lifecycle.  Build the two
+# product sources with function sections so the standalone unit links only the
+# observation slice it executes, rather than requiring stubs for unrelated DML,
+# WAL, cleaner and GCS paths in the same large translation units.
+CLUSTER_UNDO_RECORD_TEST_O = test_cluster_undo_record_product.o
+CLUSTER_UNDO_ALLOC_TEST_O = test_cluster_undo_alloc_product.o
+ifeq ($(PORTNAME),darwin)
+CLUSTER_UNDO_TEST_GC_SECTIONS = -Wl,-dead_strip
+else
+CLUSTER_UNDO_TEST_GC_SECTIONS = -Wl,--gc-sections
+endif
+
+$(CLUSTER_UNDO_RECORD_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_undo_record.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_record_api.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+$(CLUSTER_UNDO_ALLOC_TEST_O): $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c \
+		$(top_srcdir)/src/include/cluster/cluster_undo_gcs.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_alloc.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
-		$(CLUSTER_VERSION_O)
+		../../../src/include/cluster/cluster_undo_record_api.h \
+		../../../src/include/cluster/storage/cluster_undo_alloc.h \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(top_builddir)/src/port/libpgport_srv.a $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 
 # spec-4.2 D6: test_cluster_wal_state — 14 pure-helper tests for the
