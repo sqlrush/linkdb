@@ -736,4 +736,25 @@ cluster_voting_disk_write_stripe_activation(int fd, const void *in_slot512)
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
+/*
+ * Fail-closed TDD scaffold for the fixed append-only tail boundary.  The RED
+ * tests below exercise the real object and require the five distinct read
+ * outcomes plus durable write behavior before this scaffold can turn green.
+ */
+ClusterVotingDiskRawReadState
+cluster_voting_disk_read_raw_tail_slot(int fd, void *out_slot512 pg_attribute_unused())
+{
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_RAW_READ_NOT_TRIED;
+	return CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512 pg_attribute_unused())
+{
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	return CLUSTER_VOTING_DISK_IO_FAILED;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

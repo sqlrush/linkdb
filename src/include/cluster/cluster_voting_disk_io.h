@@ -142,6 +142,19 @@
 #define CLUSTER_VOTING_FILE_BYTES_MIN                                                              \
 	((off_t)(5 * CLUSTER_MAX_NODES + 1) * CLUSTER_VOTING_SLOT_BYTES)
 
+/*
+ * Payload-neutral read outcomes for the fixed append-only tail slot.  Unlike
+ * the older marker helpers, callers must be able to distinguish a clean old
+ * file boundary from a partial sector and an I/O failure.
+ */
+typedef enum ClusterVotingDiskRawReadState {
+	CLUSTER_VOTING_DISK_RAW_READ_NOT_TRIED = 0,
+	CLUSTER_VOTING_DISK_RAW_READ_FULL = 1,
+	CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF = 2,
+	CLUSTER_VOTING_DISK_RAW_READ_SHORT = 3,
+	CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED = 4
+} ClusterVotingDiskRawReadState;
+
 
 /*
  * cluster_voting_disk_open — open a voting disk file for R/W with
@@ -303,6 +316,16 @@ extern ClusterVotingDiskIoState cluster_voting_disk_read_stripe_activation(int f
 																		   void *out_slot512);
 extern ClusterVotingDiskIoState cluster_voting_disk_write_stripe_activation(int fd,
 																			const void *in_slot512);
+
+/*
+ * Fixed append-only tail boundary.  The offset is deliberately not a caller
+ * parameter: it is always the old CLUSTER_VOTING_FILE_BYTES_MIN.  A full
+ * all-zero page remains FULL; payload policy belongs to the caller.
+ */
+extern ClusterVotingDiskRawReadState
+cluster_voting_disk_read_raw_tail_slot(int fd, void *out_slot512);
+extern ClusterVotingDiskIoState
+cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512);
 
 #endif /* USE_PGRAC_CLUSTER */
 
