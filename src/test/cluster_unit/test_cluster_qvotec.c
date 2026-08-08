@@ -56,7 +56,8 @@
 #include <stddef.h>
 
 #include "cluster/cluster_qvotec.h"
-#include "cluster/cluster_reconfig.h"	 /* ReconfigEvent for spec-4.12b D2 stub */
+#include "cluster/cluster_reconfig.h" /* ReconfigEvent for spec-4.12b D2 stub */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
 
 #undef printf
@@ -902,11 +903,25 @@ UT_TEST(test_collision_state_enum_values)
 	UT_ASSERT_EQ(CLUSTER_COLLISION_FATAL_NEWER_SELF, 2);
 }
 
+/*
+ * R4 §2.6d: this exact bridge is implemented by the existing QVOTEC
+ * consumer.  Address-taking keeps this file-local test independent of a
+ * test-only disk/mailbox seam while still making a missing or misplaced
+ * bridge a real compile/link RED.
+ */
+UT_TEST(test_semantic_activation_cas_bridge_symbol_resolves)
+{
+	ClusterSemanticActivationResult (*cas_write)(uint64, const uint8[512])
+		= cluster_semantic_activation_record_cas_write;
+
+	UT_ASSERT_NOT_NULL((void *)cas_write);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_shmem_size_128);
@@ -921,6 +936,7 @@ main(void)
 	UT_RUN(test_quorum_state_enum_values);
 	UT_RUN(test_voting_disk_io_state_enum_values);
 	UT_RUN(test_collision_state_enum_values);
+	UT_RUN(test_semantic_activation_cas_bridge_symbol_resolves);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
