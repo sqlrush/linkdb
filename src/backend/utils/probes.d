@@ -22,6 +22,19 @@
 #define ForkNumber int
 #define bool unsigned char
 
+/* R2 D11 uses unique aliases so the non-DTrace generator preserves all nine
+ * independent numeric payload positions instead of treating types as macro
+ * parameter names. */
+#define R2SiteId unsigned int
+#define R2Phase unsigned int
+#define R2SpcOid unsigned int
+#define R2DbOid unsigned int
+#define R2RelNumber unsigned int
+#define R2ForkNumber int
+#define R2BlockNumber unsigned int
+#define R2Outcome unsigned int
+#define R2ProofMask unsigned long long
+
 provider postgresql {
 
 	probe transaction__start(LocalTransactionId);
@@ -91,4 +104,6 @@ provider postgresql {
 	probe wal__switch();
 	probe wal__buffer__write__dirty__start();
 	probe wal__buffer__write__dirty__done();
+
+	probe r2__passive__identity__receipt(R2SiteId, R2Phase, R2SpcOid, R2DbOid, R2RelNumber, R2ForkNumber, R2BlockNumber, R2Outcome, R2ProofMask);
 };

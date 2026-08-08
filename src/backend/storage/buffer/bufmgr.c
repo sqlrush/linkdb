@@ -8655,8 +8655,34 @@ cluster_bufmgr_pcm_unwind_barrier_refusal(BufferDesc *buf,
 }
 #endif							/* USE_PGRAC_CLUSTER */
 
+/*
+ * Copy one already-decided R2 D11 event to the static trace sink.  This void
+ * observer owns no state and cannot alter the lock, cleanup or caller path;
+ * when tracing is disabled the generated macro is a no-op.
+ */
+void
+ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_id,
+									ClusterBufferBarrierPhase phase,
+									RelFileLocator rlocator,
+									ForkNumber forknum,
+									BlockNumber blocknum,
+									ClusterBufferBarrierOutcome outcome,
+									uint64 proof_mask)
+{
+	TRACE_POSTGRESQL_R2_PASSIVE_IDENTITY_RECEIPT((unsigned int) site_id,
+												 (unsigned int) phase,
+												 rlocator.spcOid,
+												 rlocator.dbOid,
+												 rlocator.relNumber,
+												 (int) forknum,
+												 blocknum,
+												 (unsigned int) outcome,
+												 (unsigned long long) proof_mask);
+}
+
 static void
-LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
+LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
+				   const ClusterBufferBarrierSiteId *barrier_site_id)
 {
 	BufferDesc *buf;
 #ifdef USE_PGRAC_CLUSTER
@@ -9212,6 +9238,15 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 
 cluster_lockbuffer_barrier_refusal:
 
+	if (barrier_site_id != NULL)
+		ClusterObserveBufferBarrierReceipt(*barrier_site_id,
+										CLUSTER_BUFFER_BARRIER_PHASE_LOWER_REFUSED,
+										BufTagGetRelFileLocator(&buf->tag),
+										BufTagGetForkNum(&buf->tag),
+										buf->tag.blockNum,
+										CLUSTER_BUFFER_BARRIER_OUTCOME_BARRIER_CLOSED,
+										CLUSTER_BUFFER_BARRIER_PROOF_LOWER_REFUSED);
+
 	/*
 	 * PGRAC: the one common clean-refusal epilogue.  Every
 	 * barrier-aware refusal in this function jumps here instead of returning
@@ -9223,13 +9258,21 @@ cluster_lockbuffer_barrier_refusal:
 	cluster_bufmgr_pcm_unwind_barrier_refusal(buf, pcm_mode, &pcm_pending_base,
 											  pcm_pending_token, pcm_pending_set, pcm_acquired,
 											  &pcm_x_holder, &pcm_x_writer);
+	if (barrier_site_id != NULL)
+		ClusterObserveBufferBarrierReceipt(*barrier_site_id,
+										CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY,
+										BufTagGetRelFileLocator(&buf->tag),
+										BufTagGetForkNum(&buf->tag),
+										buf->tag.blockNum,
+										CLUSTER_BUFFER_BARRIER_OUTCOME_EMPTY,
+										CLUSTER_BUFFER_BARRIER_PROOF_COMMON_EMPTY);
 #endif
 }
 
 void
 LockBuffer(Buffer buffer, int mode)
 {
-	LockBufferInternal(buffer, mode, NULL);
+	LockBufferInternal(buffer, mode, NULL, NULL);
 }
 
 /*
@@ -9246,11 +9289,12 @@ LockBuffer(Buffer buffer, int mode)
  * conversion while holding no content lock, and re-enter a requalify point.
  */
 bool
-ClusterLockBufferExclusiveBarrierAware(Buffer buffer)
+ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
+									   ClusterBufferBarrierSiteId site_id)
 {
 	bool		barrier_refused = false;
 
-	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused);
+	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused, &site_id);
 	return !barrier_refused;
 }
 
@@ -9269,7 +9313,7 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 {
 	bool		barrier_refused = false;
 
-	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused);
+	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused, NULL);
 	return !barrier_refused;
 }
 

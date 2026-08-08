@@ -81,12 +81,33 @@ cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
 	for (;;)
 	{
 		LockBuffer(first, BUFFER_LOCK_EXCLUSIVE);
-		if (ClusterLockBufferExclusiveBarrierAware(second))
+		if (ClusterLockBufferExclusiveBarrierAware(second,
+												 CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND))
 			return;
 
-		LockBuffer(first, BUFFER_LOCK_UNLOCK);
-		LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
-		LockBuffer(second, BUFFER_LOCK_UNLOCK);
+		{
+			RelFileLocator refused_rlocator;
+			ForkNumber	refused_forknum;
+			BlockNumber refused_blocknum;
+
+			BufferGetTag(second, &refused_rlocator, &refused_forknum,
+						 &refused_blocknum);
+			LockBuffer(first, BUFFER_LOCK_UNLOCK);
+			ClusterObserveBufferBarrierReceipt(
+				CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND,
+				CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST,
+				refused_rlocator, refused_forknum, refused_blocknum,
+				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
+				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
+			LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
+			LockBuffer(second, BUFFER_LOCK_UNLOCK);
+			ClusterObserveBufferBarrierReceipt(
+				CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND,
+				CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
+				refused_rlocator, refused_forknum, refused_blocknum,
+				CLUSTER_BUFFER_BARRIER_OUTCOME_HIO_RETRY,
+				CLUSTER_BUFFER_BARRIER_PROOF_REENTRY);
+		}
 	}
 }
 

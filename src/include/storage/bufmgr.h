@@ -249,9 +249,61 @@ extern void MarkBufferDirtyHint(Buffer buffer, bool buffer_std);
 
 extern void UnlockBuffers(void);
 extern void LockBuffer(Buffer buffer, int mode);
+
+/*
+ * PGRAC Stage-8 R2 D11: evidence-only identities for the seven real
+ * EXCLUSIVE barrier-refusal callers.  These values select no behavior; they
+ * are copied to one passive trace probe after the corresponding fact has
+ * already been decided by the existing lock/cleanup/re-entry path.
+ */
+typedef enum ClusterBufferBarrierSiteId
+{
+	CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM = 1,
+	CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM = 2,
+	CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST = 3,
+	CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND = 4,
+	CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD = 5,
+	CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW = 6,
+	CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND = 7
+} ClusterBufferBarrierSiteId;
+
+typedef enum ClusterBufferBarrierPhase
+{
+	CLUSTER_BUFFER_BARRIER_PHASE_LOWER_REFUSED = 1,
+	CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY = 2,
+	CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST = 3,
+	CLUSTER_BUFFER_BARRIER_PHASE_REENTRY = 4
+} ClusterBufferBarrierPhase;
+
+typedef enum ClusterBufferBarrierOutcome
+{
+	CLUSTER_BUFFER_BARRIER_OUTCOME_BARRIER_CLOSED = 1,
+	CLUSTER_BUFFER_BARRIER_OUTCOME_EMPTY = 2,
+	CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK = 3,
+	CLUSTER_BUFFER_BARRIER_OUTCOME_REQUALIFIED = 4,
+	CLUSTER_BUFFER_BARRIER_OUTCOME_HIO_RETRY = 5
+} ClusterBufferBarrierOutcome;
+
+#define CLUSTER_BUFFER_BARRIER_PROOF_LOWER_REFUSED \
+	UINT64CONST(0x0000000000000001)
+#define CLUSTER_BUFFER_BARRIER_PROOF_COMMON_EMPTY \
+	UINT64CONST(0x000000000000001e)
+#define CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST \
+	UINT64CONST(0x00000000000000e0)
+#define CLUSTER_BUFFER_BARRIER_PROOF_REENTRY \
+	UINT64CONST(0x0000000000000100)
+
+extern void ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_id,
+											ClusterBufferBarrierPhase phase,
+											RelFileLocator rlocator,
+											ForkNumber forknum,
+											BlockNumber blocknum,
+											ClusterBufferBarrierOutcome outcome,
+											uint64 proof_mask);
 /* PGRAC: EXCLUSIVE lock that hands a nested-guard BARRIER_CLOSED refusal
  * back to the caller (false, nothing held) instead of raising an ERROR. */
-extern bool ClusterLockBufferExclusiveBarrierAware(Buffer buffer);
+extern bool ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
+											 ClusterBufferBarrierSiteId site_id);
 /* PGRAC: SHARE counterpart with the same clean-refusal contract. */
 extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
 /* PGRAC: operation-scoped PCM-X direct-init entrances for zero VM/FSM pages. */
