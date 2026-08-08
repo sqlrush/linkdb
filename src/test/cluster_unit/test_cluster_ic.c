@@ -612,6 +612,52 @@ UT_TEST(test_hello_wire_reference_bytes)
 }
 
 /*
+ * R4 §2.6d: the existing HELLO V1 capability word advertises both the
+ * semantic-activation framework and the R4 synchronous-CR feature.  The
+ * literals are intentional here: this RED must not depend on declarations
+ * that have not landed yet, and the two accepted values are part of the
+ * wire contract rather than test-local aliases.
+ */
+UT_TEST(test_hello_r4_capabilities_preserve_v1_reference)
+{
+	static const uint8 reference_without_capabilities[PGRAC_IC_HELLO_BYTES] = {
+		[0] = 0x48, [1] = 0x4C, [2] = 0x4C,	 [3] = 0x4F,  [4] = 0x01, [6] = 0x01,
+		[8] = 0x04, [9] = 0x03, [10] = 0x02, [11] = 0x01, [12] = 'A', [13] = 'B',
+	};
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+	uint32 capabilities;
+	int i;
+
+	UT_ASSERT_EQ(sizeof(ClusterICHelloMsg), 64);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_BYTES, 64);
+	UT_ASSERT_EQ(offsetof(ClusterICHelloMsg, _pad), 36);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAPABILITIES_OFFSET, 36);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_PLANE_OFFSET, 40);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CONN_EPOCH_OFFSET, 44);
+
+	cluster_smart_fusion = false;
+	cluster_ic_suppress_caps_reply = false;
+	cluster_ic_suppress_gcs_done_cap = false;
+	cluster_ic_suppress_xid_flock_cap = false;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
+						   0x01020304, "AB", CLUSTER_IC_PLANE_CONTROL, 0);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	capabilities = cluster_ic_hello_capabilities(&parsed);
+	UT_ASSERT_EQ(capabilities & UINT32_C(0x00003000), UINT32_C(0x00003000));
+	UT_ASSERT_EQ(capabilities & ~UINT32_C(0x00003000), UINT32_C(0x00000FFE));
+
+	/* Every V1 reference byte outside the four-byte capability word is frozen. */
+	for (i = 0; i < PGRAC_IC_HELLO_BYTES; i++) {
+		if (i >= PGRAC_IC_HELLO_CAPABILITIES_OFFSET
+			&& i < PGRAC_IC_HELLO_CAPABILITIES_OFFSET + (int)sizeof(uint32))
+			continue;
+		UT_ASSERT_EQ(wire[i], reference_without_capabilities[i]);
+	}
+}
+
+/*
  * spec-7.2 D2 — DATA-plane HELLO reference bytes:  plane byte at offset
  * 40, conn_epoch LE at 44-51, spec-7.3 worker bytes (41/42) still zero,
  * tail 52-63 still zero.  Plus accessor roundtrip.
@@ -884,7 +930,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(24); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(25); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -904,6 +950,7 @@ main(void)
 	/* HELLO wire encode/decode + reference bytes (post-codex review) */
 	UT_RUN(test_hello_wire_roundtrip);
 	UT_RUN(test_hello_wire_reference_bytes);
+	UT_RUN(test_hello_r4_capabilities_preserve_v1_reference);
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);
