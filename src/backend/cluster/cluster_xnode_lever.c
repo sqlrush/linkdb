@@ -289,9 +289,6 @@ cluster_lever_a_note_remote_ack_degraded(void)
 static inline bool
 lever_g_counting(void)
 {
-	/* PGRAC: spec-8.3 — the wave-g observations lost their GUC gate when
-	 * the active-ITL transfer became the one correctness behavior; these
-	 * counters must always have a producer (R1 census). */
 	return ClusterXnodeLeverCtl != NULL;
 }
 

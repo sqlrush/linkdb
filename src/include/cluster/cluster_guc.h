@@ -184,7 +184,7 @@ extern bool cluster_ges_handoff;
 /* spec-6.12b: cross-instance CR-server data plane (default off = 53R9G). */
 extern bool cluster_crossnode_cr_data_plane;
 
-/* spec-6.12g: block self-containment switch (default off = D11 deferral). */
+/* Deprecated compatibility setting; accepted but does not select behavior. */
 extern bool cluster_block_self_contained;
 
 /* spec-6.12e2: master->holder BAST nudge on live-X-holder deny (default

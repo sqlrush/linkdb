@@ -151,8 +151,8 @@ ok(write_retry($node0, 'INSERT INTO g_t VALUES (1, 10), (2, 20)'), 'L1 seeded ro
 ok(write_retry($node0, 'CHECKPOINT'), 'L1 checkpoint');
 
 # ============================================================
-# L2: collapse baseline (GUC off).  node0 holds an uncommitted row2; a node1
-# write of the DIFFERENT row1 fails closed 53R9H (the D11 false serialization).
+# L2: the compatibility GUC is off.  A different-row writer still uses the
+# canonical writer-transfer path while node0 keeps row2 uncommitted.
 # ============================================================
 {
 	my $a = $node0->background_psql('postgres', on_error_stop => 0);
@@ -162,11 +162,8 @@ ok(write_retry($node0, 'CHECKPOINT'), 'L1 checkpoint');
 	# resolve the block via the propagated TT hint).
 	$a->query_safe('SELECT v FROM g_t WHERE id = 2 FOR UPDATE');
 
-	# node1 writes row1 (different row).  Off baseline -> read-image deferral ->
-	# 53R9H fail-closed.
-	my ($rc, $out, $err) = $node1->psql('postgres', 'UPDATE g_t SET v = 11 WHERE id = 1');
-	like($err, qr/53R9H|cross[- ]node write/i,
-		'L2 GUC-off: node1 write of a DIFFERENT row fails closed 53R9H (D11 false serialization)');
+	ok(write_retry($node1, 'UPDATE g_t SET v = 11 WHERE id = 1'),
+		'L2 GUC-off: different-row writer uses canonical active transfer');
 
 	$a->query_safe('ROLLBACK');
 	$a->quit;
@@ -183,8 +180,7 @@ is($node1->safe_psql('postgres', 'SHOW cluster.block_self_contained'), 'on',
 	'L3 block_self_contained armed on both nodes');
 
 # ============================================================
-# L3: collapse LIFTED (GUC on).  Same setup -> node1's row1 write SUCCEEDS
-# while node0's row2 stays uncommitted.
+# L3: the compatibility GUC is on.  The same operation has identical behavior.
 # ============================================================
 {
 	my $g0 = state_val($node1, 'xnode_lever', 'g_active_itl_transfer_count')
@@ -197,7 +193,7 @@ is($node1->safe_psql('postgres', 'SHOW cluster.block_self_contained'), 'on',
 	$a->query_safe('SELECT v FROM g_t WHERE id = 2 FOR UPDATE');   # lock-only hold on row2
 
 	my $ok = write_retry($node1, 'UPDATE g_t SET v = 11 WHERE id = 1');   # DIFFERENT row1
-	ok($ok, 'L3 GUC-on: node1 write of a DIFFERENT row SUCCEEDS (collapse lifted)');
+	ok($ok, 'L3 GUC-on: different-row writer uses the same canonical active transfer');
 
 	# node0's ROLLBACK finishes the lock-only ITL slot; the block has drifted
 	# to node1, so D-g1 skips the stamp (block not resident here).
@@ -257,8 +253,8 @@ is($node1->safe_psql('postgres', 'SHOW cluster.block_self_contained'), 'on',
 	cmp_ok($made, '>=', 4, "L3b enough coincident probe tables ($made/6)");
 	my $ship1 = state_val($node0, 'gcs', 'block_x_self_ship_count')
 			  + state_val($node1, 'gcs', 'block_x_self_ship_count');
-	cmp_ok($ship1, '>', $ship0,
-		'L3b master==holder self-ship engaged under active ITL (twin-site gate)');
+	is($ship1, $ship0,
+		'L3b active requests do not enter the legacy master==holder destructive path');
 }
 
 # ============================================================

@@ -14,6 +14,17 @@ Most bootstrap and storage-routing GUCs require server restart to
 change (PGC_POSTMASTER). Runtime maintenance knobs are marked with
 their own context below.
 
+### `cluster.block_self_contained`
+
+| | |
+|---|---|
+| Type | boolean |
+| Default | `off` |
+| Context | superuser |
+
+Deprecated compatibility setting. Existing configuration files may keep either
+`on` or `off`; both values are accepted and have identical runtime behavior.
+
 ### `cluster.node_id`
 
 | | |

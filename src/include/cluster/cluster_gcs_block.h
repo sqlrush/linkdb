@@ -273,6 +273,21 @@ typedef enum GcsBlockPcmXFormationAction {
 	GCS_BLOCK_PCM_X_FORMATION_PROCEED
 } GcsBlockPcmXFormationAction;
 
+/* An active writer image is observable but cannot surrender its local X. */
+static inline bool
+cluster_gcs_block_must_preserve_x(bool read_image, bool x_transfer, bool has_active_itl)
+{
+	return read_image || (x_transfer && has_active_itl);
+}
+
+/* Count the first immutable active-X source image, never replay. */
+static inline bool
+cluster_gcs_block_count_active_source_prepare(bool image_stored, bool source_is_x,
+										 bool has_active_itl)
+{
+	return image_stored && source_is_x && has_active_itl;
+}
+
 /* A pristine startup has never published a queue authority token, so a
  * writer may wait interruptibly for LMON formation.  Once any generation or
  * session has been published, a non-ACTIVE state is fail-stop evidence and

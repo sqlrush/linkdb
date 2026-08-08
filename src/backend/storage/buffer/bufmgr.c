@@ -2393,64 +2393,22 @@ cluster_bufmgr_pcm_x_writer_drain_deferred_nowait(void)
  * LEGACY_SAFE decision (the canonical protocol is truly inapplicable and
  * no local active-current transfer episode exists).
  */
-typedef enum ClusterPcmXWriterRoute
-{
-	CLUSTER_PCM_X_WRITER_COVERED = 0,
-	CLUSTER_PCM_X_WRITER_CLAIM,
-	CLUSTER_PCM_X_WRITER_LEGACY_SAFE,
-	CLUSTER_PCM_X_WRITER_RETRY_CANONICAL,
-	CLUSTER_PCM_X_WRITER_FAIL_CLOSED
-} ClusterPcmXWriterRoute;
-
-/*
- * Classify a NULL writer claim that arrived without barrier refusal and
- * without ERROR.  The only legal NULL sources in writer_prepare are a
- * non-tracked object and a buffer with no local current bytes; anything
- * else is capability corruption and must fail closed rather than reach
- * the legacy acquire.
- */
+/* Classify a NULL writer claim without granting implicit legacy authority. */
 static ClusterPcmXWriterRoute
 cluster_bufmgr_pcm_x_writer_classify_null_claim(BufferDesc *buf)
 {
-	uint32		buf_state;
-	bool		bm_valid;
-
-	if (!cluster_bufmgr_should_pcm_track(buf))
-		return CLUSTER_PCM_X_WRITER_LEGACY_SAFE;	/* provably non-R3 object */
-
-	buf_state = LockBufHdr(buf);
-	bm_valid = (buf_state & BM_VALID) != 0;
-	UnlockBufHdr(buf, buf_state);
-	if (!bm_valid)
-	{
-		/*
-		 * No local current bytes: the canonical local writer conversion is
-		 * inapplicable and no local active-current transfer episode exists.
-		 * The legacy fetch+grant protocol serves the from-scratch acquire;
-		 * an active source image is handled unconditionally by the remote
-		 * holder destructive-transfer branch (spec-8.3).
-		 */
-		return CLUSTER_PCM_X_WRITER_LEGACY_SAFE;
-	}
-
-	/*
-	 * A tracked, valid buffer whose writer_prepare returned no claim,
-	 * no barrier refusal and no ERROR matches no known NULL source.
-	 */
-	return CLUSTER_PCM_X_WRITER_FAIL_CLOSED;
+	return cluster_pcm_x_writer_null_route(cluster_bufmgr_should_pcm_track(buf));
 }
 
 static ClusterPcmXWriterLedgerEntry *
 cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode, bool *barrier_refused)
 {
 	ClusterPcmXWriterLedgerEntry *entry;
-	ClusterPcmDirectInitSnapshot observed;
 	ClusterPcmOwnSnapshot granted;
 	ClusterPcmOwnResult own_result;
 	PcmXQueueResult release_result;
 	PcmXQueueResult result;
 	LWLock *content_lock;
-	uint32 buf_state;
 
 	if (mode != PCM_LOCK_MODE_X || buf == NULL || !cluster_bufmgr_should_pcm_track(buf))
 		return NULL;
@@ -2481,13 +2439,6 @@ cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode, bool *bar
 	entry->grant_snapshot_exact = false;
 	entry->activation_fence_armed = false;
 
-	buf_state = LockBufHdr(buf);
-	cluster_bufmgr_pcm_direct_init_snapshot_locked(buf, buf_state, false, &observed);
-	UnlockBufHdr(buf, buf_state);
-	if ((observed.buf_state & BM_VALID) == 0) {
-		cluster_bufmgr_pcm_x_writer_clear(entry);
-		return NULL;
-	}
 	MemSet(&entry->claim, 0, sizeof(entry->claim));
 	entry->claim_handed_off = false;
 	pg_write_barrier();
@@ -11581,29 +11532,6 @@ cluster_bufmgr_pcm_x_holder_stamp_authority(Buffer buffer, uint64 *own_generatio
 	buf = GetBufferDescriptor(buffer - 1);
 	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
 
-	/*
-	 * A buffer outside PCM tracking (single-node/no-peer formation, or a
-	 * relation class the cluster protocol never converts) can never be
-	 * transferred away, so the refetch ABA class does not exist for it.
-	 * Record a local-scope authority: generation zero plus the current
-	 * epoch.  The stamp helper skips the ownership-tuple comparison for the
-	 * same scope, and any later formation change bumps the epoch, which
-	 * safely invalidates these proofs.  Slot xid/wrap/class rechecks still
-	 * guard the slot-reuse ABA class.
-	 */
-	if (!cluster_pcm_is_active() || !cluster_bufmgr_should_pcm_track(buf))
-	{
-		buf_state = LockBufHdr(buf);
-		header_ok = (buf_state & BM_VALID) != 0
-			&& !cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state);
-		UnlockBufHdr(buf, buf_state);
-		if (!header_ok)
-			return false;
-		*own_generation = 0;
-		*acquisition_epoch = cluster_epoch_get_current();
-		return true;
-	}
-
 	entry = cluster_bufmgr_pcm_x_holder_find(buf);
 	if (entry == NULL || entry->phase != PCM_X_HOLDER_LEDGER_ACTIVE
 		|| entry->content_lock != BufferDescriptorGetContentLock(buf)
@@ -11655,7 +11583,6 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 	bool		header_valid;
 	bool		header_retained;
 	bool		header_tag_ok;
-	bool		pcm_tracked;
 
 	Assert(record != NULL);
 	Assert(out_reason != NULL);
@@ -11724,28 +11651,26 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 	header_tag_ok = BufferTagsEqual(&buf->tag, &tag);
 	UnlockBufHdr(buf, buf_state);
 
-	/*
-	 * The ownership-tuple comparison applies only to a PCM-tracked buffer:
-	 * an untracked buffer never transfers away, its authority proof was
-	 * captured with generation zero, and a scope change between capture and
-	 * stamp is covered by the epoch comparison below.
-	 */
-	pcm_tracked = cluster_pcm_is_active() && cluster_bufmgr_should_pcm_track(buf);
-
 	if (!header_tag_ok)
 		reason = CLUSTER_ITL_STAMP_SKIP_TAG_CHANGED;
 	else if (!header_valid)
 		reason = CLUSTER_ITL_STAMP_SKIP_NOT_VALID;
 	else if (header_retained)
 		reason = CLUSTER_ITL_STAMP_SKIP_NOT_CURRENT_IMAGE;
-	else if (pcm_tracked && own.pcm_state != (uint8) PCM_STATE_X)
-		reason = CLUSTER_ITL_STAMP_SKIP_NOT_LOCAL_X;
-	else if (pcm_tracked && (own.flags != 0 || own.writer_activation_token != 0))
-		reason = CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_FLAGS_BUSY;
-	else if (pcm_tracked && own.generation != proof->own_generation)
-		reason = CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_GENERATION_CHANGED;
-	else if (cluster_epoch_get_current() != proof->acquisition_epoch)
-		reason = CLUSTER_ITL_STAMP_SKIP_CLUSTER_EPOCH_CHANGED;
+	else if (!cluster_itl_terminal_proof_owner_exact(
+			 proof, own.generation, cluster_epoch_get_current(),
+			 own.pcm_state == (uint8) PCM_STATE_X, own.flags,
+			 own.writer_activation_token))
+	{
+		if (own.pcm_state != (uint8) PCM_STATE_X)
+			reason = CLUSTER_ITL_STAMP_SKIP_NOT_LOCAL_X;
+		else if (own.flags != 0 || own.writer_activation_token != 0)
+			reason = CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_FLAGS_BUSY;
+		else if (own.generation != proof->own_generation)
+			reason = CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_GENERATION_CHANGED;
+		else
+			reason = CLUSTER_ITL_STAMP_SKIP_CLUSTER_EPOCH_CHANGED;
+	}
 
 	if (reason != CLUSTER_ITL_STAMP_SKIP_NONE)
 	{
@@ -11764,13 +11689,14 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 	else
 	{
 		slot = &ClusterPageGetItlSlots(page)[record->key.slot_idx];
-		if (slot->xid != proof->xid)
-			reason = CLUSTER_ITL_STAMP_SKIP_XID_CHANGED;
-		else if (slot->wrap != proof->slot_wrap)
-			reason = CLUSTER_ITL_STAMP_SKIP_WRAP_CHANGED;
-		else if (slot->flags != proof->slot_class)
+		if (!cluster_itl_terminal_proof_slot_exact(proof, slot->xid, slot->wrap,
+											   slot->flags))
 		{
-			if (slot->flags == ITL_FLAG_ACTIVE
+			if (slot->xid != proof->xid)
+				reason = CLUSTER_ITL_STAMP_SKIP_XID_CHANGED;
+			else if (slot->wrap != proof->slot_wrap)
+				reason = CLUSTER_ITL_STAMP_SKIP_WRAP_CHANGED;
+			else if (slot->flags == ITL_FLAG_ACTIVE
 				|| slot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE)
 				reason = CLUSTER_ITL_STAMP_SKIP_CLASS_CHANGED;
 			else

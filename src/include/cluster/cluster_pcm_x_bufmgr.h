@@ -59,6 +59,22 @@ typedef enum ClusterPcmXWriterRetryAction {
 	CLUSTER_PCM_X_WRITER_RETRY_FAIL
 } ClusterPcmXWriterRetryAction;
 
+/* Exhaustive result for the EXCLUSIVE buffer-acquisition boundary. */
+typedef enum ClusterPcmXWriterRoute {
+	CLUSTER_PCM_X_WRITER_COVERED = 0,
+	CLUSTER_PCM_X_WRITER_CLAIM,
+	CLUSTER_PCM_X_WRITER_LEGACY_SAFE,
+	CLUSTER_PCM_X_WRITER_RETRY_CANONICAL,
+	CLUSTER_PCM_X_WRITER_FAIL_CLOSED
+} ClusterPcmXWriterRoute;
+
+/* A missing canonical claim is safe only when PCM tracking is inapplicable. */
+static inline ClusterPcmXWriterRoute
+cluster_pcm_x_writer_null_route(bool tracked)
+{
+	return tracked ? CLUSTER_PCM_X_WRITER_FAIL_CLOSED : CLUSTER_PCM_X_WRITER_LEGACY_SAFE;
+}
+
 typedef enum ClusterPcmXOwnerExitAction {
 	CLUSTER_PCM_X_OWNER_EXIT_COMPLETE = 0,
 	CLUSTER_PCM_X_OWNER_EXIT_RETRY,

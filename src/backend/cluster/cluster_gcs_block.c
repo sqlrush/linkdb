@@ -6154,17 +6154,15 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 										 &block_payload, &block_payload_lkey,
 										 &block_payload_release_cb, &block_payload_release_arg,
 										 &sf_dep_vec, &sf_dep_valid, NULL)) {
-				/*
-				 * PGRAC: spec-8.3 — an active DATA or LOCK_ONLY ITL slot no
-				 * longer defers the X handoff (the old spec-5.2 D11 page-wide
-				 * transaction wait): the block ships WITH its uncommitted ITL
-				 * and our copy is dropped.  Our later commit stamps only under
-				 * the exact terminal-stamp proof and safely skips the drifted
-				 * block; readers resolve the migrated ACTIVE slot through the
-				 * TT authority (AD-006).  A same-ROW writer still serializes
-				 * through the cross-node TX enqueue.  One correctness behavior:
-				 * no GUC selects the old defer semantics.
-				 */
+				/* Active writer bytes may be observed, but the holder keeps X. */
+				if (cluster_gcs_block_must_preserve_x(false, true,
+										  cluster_itl_page_has_active_slot((Page)block_payload))) {
+					status = GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
+					if (ClusterGcsBlock != NULL)
+						pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
+					goto build_and_send_reply;
+				}
+
 				{
 					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
 
@@ -6179,16 +6177,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 					if (GcsBlockRequestPayloadIsCleanEligible(req) && ClusterGcsBlock != NULL)
 						pg_atomic_fetch_add_u64(&ClusterGcsBlock->clean_page_xfer_count, 1);
 
-					/*
-					 * PGRAC: spec-8.3 (twin site) — count a self-ship transfer
-					 * that carries an uncommitted ITL slot (unconditional: no GUC
-					 * selects the active semantics), and materialize an SGE-backed
-					 * image into block_buf BEFORE the drop (the drop invalidates
-					 * the buffer the SGE may point at; same recipe as the
-					 * holder-forward destructive branch).
-					 */
-					if (cluster_itl_page_has_active_slot((Page)block_payload))
-						cluster_lever_g_note_active_itl_transfer();
+					/* Materialize an SGE-backed image before invalidating its buffer. */
 					if (block_payload_release_cb != NULL) {
 						memcpy(block_buf, block_payload, GCS_BLOCK_DATA_SIZE);
 						gcs_block_release_ship_image(block_payload_release_cb,
@@ -8299,15 +8288,13 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 				 */
 				hdr->status = (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE;
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_from_holder_ship_count, 1);
-			} else if (GcsBlockForwardPayloadIsReadImage(fwd)) {
-				/* Holder keeps its X; the requester consumes this one-shot
-				 * read-image (D2) and never registers as an S holder.  PGRAC:
-				 * spec-8.3 — an active DATA or LOCK_ONLY ITL slot no longer
-				 * routes an X-transfer here (the old spec-5.2 D11 defer): the
-				 * destructive-transfer branch below ships the block WITH its
-				 * uncommitted ITL unconditionally, and the holder commit stamps
-				 * only under the exact terminal-stamp proof.  No local state
-				 * change in this branch. */
+			} else if (cluster_gcs_block_must_preserve_x(
+						   GcsBlockForwardPayloadIsReadImage(fwd),
+						   GcsBlockForwardPayloadIsXTransfer(fwd)
+							   && (fwd->transition_id == PCM_TRANS_N_TO_X
+								   || fwd->transition_id == PCM_TRANS_S_TO_X_UPGRADE),
+						   cluster_itl_page_has_active_slot((Page)block_payload))) {
+				/* The requester consumes a one-shot image; the holder keeps X. */
 				hdr->status = (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER;
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->cf_xheld_read_ship_count, 1);
 				/* PGRAC: spec-5.59 D3 — holder-forward read-image ship: time
@@ -8342,15 +8329,6 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 				if (GcsBlockForwardPayloadIsXTransfer(fwd)
 					&& hdr->status == (uint8)GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER) {
 					XLogRecPtr drop_lsn = InvalidXLogRecPtr;
-
-					/*
-					 * PGRAC: spec-8.3 — count a transfer that carries an
-					 * uncommitted ITL slot (unconditional: no GUC selects the
-					 * active semantics).  block_payload still points at the
-					 * current image here, so the active-ITL probe is exact.
-					 */
-					if (cluster_itl_page_has_active_slot((Page)block_payload))
-						cluster_lever_g_note_active_itl_transfer();
 
 					if (block_payload_release_cb != NULL) {
 						memcpy(block_buf, block_payload, GCS_BLOCK_DATA_SIZE);
@@ -12632,6 +12610,10 @@ gcs_block_pcm_x_materialize_reserved_work(int worker_id, const GcsBlockPcmXImage
 												  true);
 		return;
 	}
+	if (cluster_gcs_block_count_active_source_prepare(
+			image_result == GCS_BLOCK_PCM_X_IMAGE_STORED, source_is_x,
+			cluster_itl_page_has_active_slot((Page)block_data)))
+		cluster_lever_g_note_active_itl_transfer();
 
 	if (self_source_handoff) {
 		/* A requester acting as its own N/S/X source keeps the one exact
