@@ -203,6 +203,12 @@ fmt_int64(int64 v)
 }
 
 static char *
+fmt_uint64(uint64 v)
+{
+	return psprintf(UINT64_FORMAT, v);
+}
+
+static char *
 fmt_uint32_hex(uint32 v)
 {
 	return psprintf("0x%08X", v);
@@ -604,6 +610,14 @@ dump_lmon(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "lmon", "lmon_max_iter_us", fmt_int64((int64)cluster_lmon_max_iter_us()));
 	emit_row(rsinfo, "lmon", "lmon_slow_iter_count",
 			 fmt_int64((int64)cluster_lmon_slow_iter_count()));
+	{
+		uint64 sample_count;
+		uint64 total_us;
+
+		cluster_lmon_timed_duty_pair(&sample_count, &total_us);
+		emit_row(rsinfo, "lmon", "lmon_timed_duty_sample_count", fmt_uint64(sample_count));
+		emit_row(rsinfo, "lmon", "lmon_total_iter_us", fmt_uint64(total_us));
+	}
 }
 
 /*
@@ -2095,6 +2109,77 @@ dump_pcm(ReturnSetInfo *rsinfo)
 				 fmt_int64((int64)stats.own_corrupt_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_barrier_unwind_count",
 				 fmt_int64((int64)stats.barrier_unwind_count));
+
+		{
+			static const char *const result_keys[PCM_X_QUEUE_RESULT_COUNT] = {
+				"pcm_x_acquire_result_ok_count",
+				"pcm_x_acquire_result_duplicate_count",
+				"pcm_x_acquire_result_retired_count",
+				"pcm_x_acquire_result_not_found_count",
+				"pcm_x_acquire_result_stale_count",
+				"pcm_x_acquire_result_no_capacity_count",
+				"pcm_x_acquire_result_counter_exhausted_count",
+				"pcm_x_acquire_result_not_ready_count",
+				"pcm_x_acquire_result_busy_count",
+				"pcm_x_acquire_result_bad_state_count",
+				"pcm_x_acquire_result_corrupt_count",
+				"pcm_x_acquire_result_invalid_count",
+				"pcm_x_acquire_result_gate_retry_count",
+				"pcm_x_acquire_result_barrier_closed_count",
+			};
+			static const char *const bucket_keys[PCM_X_ACQUIRE_HIST_BUCKETS] = {
+				"pcm_x_acquire_success_us_le_2p00_count",
+				"pcm_x_acquire_success_us_le_2p01_count",
+				"pcm_x_acquire_success_us_le_2p02_count",
+				"pcm_x_acquire_success_us_le_2p03_count",
+				"pcm_x_acquire_success_us_le_2p04_count",
+				"pcm_x_acquire_success_us_le_2p05_count",
+				"pcm_x_acquire_success_us_le_2p06_count",
+				"pcm_x_acquire_success_us_le_2p07_count",
+				"pcm_x_acquire_success_us_le_2p08_count",
+				"pcm_x_acquire_success_us_le_2p09_count",
+				"pcm_x_acquire_success_us_le_2p10_count",
+				"pcm_x_acquire_success_us_le_2p11_count",
+				"pcm_x_acquire_success_us_le_2p12_count",
+				"pcm_x_acquire_success_us_le_2p13_count",
+				"pcm_x_acquire_success_us_le_2p14_count",
+				"pcm_x_acquire_success_us_le_2p15_count",
+				"pcm_x_acquire_success_us_le_2p16_count",
+				"pcm_x_acquire_success_us_le_2p17_count",
+				"pcm_x_acquire_success_us_le_2p18_count",
+				"pcm_x_acquire_success_us_le_2p19_count",
+				"pcm_x_acquire_success_us_le_2p20_count",
+				"pcm_x_acquire_success_us_le_2p21_count",
+				"pcm_x_acquire_success_us_le_2p22_count",
+				"pcm_x_acquire_success_us_le_2p23_count",
+				"pcm_x_acquire_success_us_le_2p24_count",
+				"pcm_x_acquire_success_us_le_2p25_count",
+				"pcm_x_acquire_success_us_le_2p26_count",
+				"pcm_x_acquire_success_us_le_2p27_count",
+				"pcm_x_acquire_success_us_le_2p28_count",
+				"pcm_x_acquire_success_us_le_2p29_count",
+				"pcm_x_acquire_success_us_le_2p30_count",
+				"pcm_x_acquire_success_us_le_2p31_count",
+			};
+			PcmXAcquireObservationSnapshot observation;
+			int i;
+
+			cluster_pcm_x_acquire_observation_snapshot(&observation);
+			emit_row(rsinfo, "pcm", "pcm_x_acquire_started_count",
+					 fmt_uint64(observation.started_count));
+			emit_row(rsinfo, "pcm", "pcm_x_acquire_active_count",
+					 fmt_uint64(observation.active_count));
+			emit_row(rsinfo, "pcm", "pcm_x_acquire_exception_count",
+					 fmt_uint64(observation.exception_count));
+			for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
+				emit_row(rsinfo, "pcm", result_keys[i],
+						 fmt_uint64(observation.terminal_result_count[i]));
+			for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+				emit_row(rsinfo, "pcm", bucket_keys[i],
+						 fmt_uint64(observation.success_latency_bucket[i]));
+			emit_row(rsinfo, "pcm", "pcm_x_acquire_success_us_overflow_count",
+					 fmt_uint64(observation.success_latency_overflow_count));
+		}
 	}
 }
 
@@ -2404,8 +2489,14 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	/* PGRAC: spec-2.37 D12 — 4 NEW counter rows for PI watermark + lost-write. */
 	emit_row(rsinfo, "gcs", "pi_watermark_advance_count",
 			 fmt_int64((int64)cluster_gcs_get_pi_watermark_advance_count()));
-	emit_row(rsinfo, "gcs", "pi_watermark_retire_count",
-			 fmt_int64((int64)cluster_gcs_get_pi_watermark_retire_count()));
+	{
+		uint64 metadata_retire_count = cluster_gcs_get_pi_watermark_retire_count();
+
+		emit_row(rsinfo, "gcs", "pi_watermark_retire_count",
+				 fmt_uint64(metadata_retire_count));
+		emit_row(rsinfo, "gcs", "pi_master_metadata_retire_count",
+				 fmt_uint64(metadata_retire_count));
+	}
 	emit_row(rsinfo, "gcs", "pi_durable_note_apply_count",
 			 fmt_int64((int64)cluster_gcs_get_pi_durable_note_apply_count()));
 	emit_row(rsinfo, "gcs", "lost_write_detected_count",
@@ -2896,6 +2987,15 @@ dump_undo(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_undo_segment_create_fail_count()));
 	emit_row(rsinfo, "undo", "segment_hard_cap_fail_count",
 			 fmt_int64((int64)cluster_undo_segment_hard_cap_fail_count()));
+	cluster_undo_record_observation_ensure();
+	emit_row(rsinfo, "undo", "segment_observation_status",
+			 cluster_undo_segment_observation_status_string());
+	emit_row(rsinfo, "undo", "segment_allocated_count",
+			 fmt_uint64(cluster_undo_segment_allocated_count()));
+	emit_row(rsinfo, "undo", "segment_allocated_high_water",
+			 fmt_uint64(cluster_undo_segment_allocated_high_water()));
+	emit_row(rsinfo, "undo", "segment_effective_cap",
+			 fmt_uint64((uint64)cluster_undo_segment_effective_cap()));
 	/* spec-4.12a D5: record-segment ACTIVE->COMMITTED drain observability.
 	 *   record_segments_committed          : record segments drained to COMMITTED
 	 *                                         (the leak fix advancing them).

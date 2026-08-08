@@ -1197,3 +1197,65 @@ cluster_undo_segment_scan_resumable_active(uint8 owner_instance)
 
 	return found;
 }
+
+
+/* Read-only full-pool observation.  Unlike first-gap allocator probes, this
+ * scans every native slot so restart reconstruction remains exact across gaps. */
+ClusterUndoPoolObservationResult
+cluster_undo_segment_observe_pool(uint8 owner_instance, ClusterUndoPoolObservation *out)
+{
+	uint32 base_segment_id;
+	uint32 slot;
+	uint32 allocated = 0;
+	uint32 configured_cap;
+	int guc_val = cluster_undo_segments_max_per_instance;
+
+	if (out == NULL)
+		return CLUSTER_UNDO_POOL_OBS_INVALID_OWNER;
+	out->allocated_count = 0;
+	out->configured_cap = 0;
+	out->effective_cap = 0;
+	if (owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
+		return CLUSTER_UNDO_POOL_OBS_INVALID_OWNER;
+
+	base_segment_id = (uint32)(owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	for (slot = 0; slot < CLUSTER_UNDO_SEGS_PER_INSTANCE; slot++) {
+		PGAlignedBlock blockbuf;
+		char path[MAXPGPATH];
+		uint32 segment_id = base_segment_id + slot;
+		ssize_t nread;
+		int fd;
+
+		if (cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance), owner_instance,
+									  segment_id, path, sizeof(path))
+			!= 0)
+			return CLUSTER_UNDO_POOL_OBS_IO_ERROR;
+
+		fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+		if (fd < 0) {
+			if (errno == ENOENT)
+				continue;
+			return CLUSTER_UNDO_POOL_OBS_IO_ERROR;
+		}
+		nread = read(fd, blockbuf.data, BLCKSZ);
+		close(fd);
+		if (nread < 0)
+			return CLUSTER_UNDO_POOL_OBS_IO_ERROR;
+		if (nread != BLCKSZ
+			|| !cluster_undo_segment_header_identity_ok(blockbuf.data, segment_id, owner_instance))
+			return CLUSTER_UNDO_POOL_OBS_INVALID_HEADER;
+		allocated++;
+	}
+
+	if (guc_val < 16)
+		configured_cap = 16;
+	else if (guc_val > (int)CLUSTER_UNDO_SEGS_PER_INSTANCE)
+		configured_cap = CLUSTER_UNDO_SEGS_PER_INSTANCE;
+	else
+		configured_cap = (uint32)guc_val;
+
+	out->allocated_count = allocated;
+	out->configured_cap = configured_cap;
+	out->effective_cap = Max(configured_cap, allocated);
+	return CLUSTER_UNDO_POOL_OBS_OK;
+}

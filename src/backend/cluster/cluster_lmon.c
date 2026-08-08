@@ -44,6 +44,7 @@
 #include "miscadmin.h"
 #include "postmaster/auxprocess.h"
 #include "postmaster/interrupt.h"
+#include "portability/instr_time.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -827,6 +828,48 @@ cluster_lmon_slow_iter_count(void)
 	return result;
 }
 
+uint64
+cluster_lmon_timed_duty_sample_count(void)
+{
+	uint64 result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->timed_duty_sample_count;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+uint64
+cluster_lmon_total_iter_us(void)
+{
+	uint64 result;
+
+	if (cluster_lmon_state == NULL)
+		return 0;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	result = cluster_lmon_state->total_iter_us;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return result;
+}
+
+void
+cluster_lmon_timed_duty_pair(uint64 *sample_count, uint64 *total_us)
+{
+	*sample_count = 0;
+	*total_us = 0;
+	if (cluster_lmon_state == NULL)
+		return;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	*sample_count = cluster_lmon_state->timed_duty_sample_count;
+	*total_us = cluster_lmon_state->total_iter_us;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+}
+
 void
 cluster_lmon_marker_complete_wakeup(void)
 {
@@ -882,6 +925,8 @@ lmon_publish_status(ClusterLmonStatus status)
 		cluster_lmon_state->last_iter_us = 0;
 		cluster_lmon_state->max_iter_us = 0;
 		cluster_lmon_state->slow_iter_count = 0;
+		cluster_lmon_state->timed_duty_sample_count = 0;
+		cluster_lmon_state->total_iter_us = 0;
 		cluster_lmon_state->lmon_latch = NULL;
 	} else if (status == CLUSTER_LMON_READY) {
 		cluster_lmon_state->ready_at = now;
@@ -938,18 +983,19 @@ lmon_advance_liveness_tick(void)
 }
 
 static void
-lmon_record_iteration(TimestampTz iter_started_at)
+lmon_record_iteration(instr_time iter_started_at)
 {
-	TimestampTz now = GetCurrentTimestamp();
+	instr_time iter_finished_at;
+	TimestampTz now;
 	uint64 elapsed_us;
 	bool slow;
 	bool should_log = false;
 	static TimestampTz last_slow_log_at = 0;
 
-	if (now <= iter_started_at)
-		elapsed_us = 0;
-	else
-		elapsed_us = (uint64)(now - iter_started_at);
+	INSTR_TIME_SET_CURRENT(iter_finished_at);
+	INSTR_TIME_SUBTRACT(iter_finished_at, iter_started_at);
+	elapsed_us = (uint64)INSTR_TIME_GET_MICROSEC(iter_finished_at);
+	now = GetCurrentTimestamp();
 
 	slow = (cluster_lmon_slow_iteration_warn_ms >= 0)
 		   && elapsed_us >= (uint64)cluster_lmon_slow_iteration_warn_ms * 1000ULL;
@@ -960,6 +1006,12 @@ lmon_record_iteration(TimestampTz iter_started_at)
 		cluster_lmon_state->max_iter_us = elapsed_us;
 	if (slow)
 		cluster_lmon_state->slow_iter_count++;
+	if (cluster_lmon_state->timed_duty_sample_count < PG_UINT64_MAX)
+		cluster_lmon_state->timed_duty_sample_count++;
+	if (elapsed_us > PG_UINT64_MAX - cluster_lmon_state->total_iter_us)
+		cluster_lmon_state->total_iter_us = PG_UINT64_MAX;
+	else
+		cluster_lmon_state->total_iter_us += elapsed_us;
 	LWLockRelease(&cluster_lmon_state->lwlock);
 
 	if (slow && cluster_lmon_slow_iteration_warn_ms > 0
@@ -1156,7 +1208,8 @@ LmonMain(void)
 			int n_events;
 			long wait_ms;
 			TimestampTz now;
-			TimestampTz iter_started_at;
+			TimestampTz duty_started_at;
+			instr_time iter_started_at;
 			int32 i;
 			bool force_all_duties;
 
@@ -1170,7 +1223,8 @@ LmonMain(void)
 			if (ShutdownRequestPending || lmon_shutdown_requested())
 				break;
 
-			iter_started_at = GetCurrentTimestamp();
+			duty_started_at = GetCurrentTimestamp();
+			INSTR_TIME_SET_CURRENT(iter_started_at);
 
 			/*
 			 * PGRAC: spec-7.2 D1 -- >= 1 Hz floor for the lazy duty
@@ -1180,7 +1234,7 @@ LmonMain(void)
 			 * run every iteration, order verbatim.  Reuse the iteration
 			 * start timestamp (stage7-p0 profiling) as "now".
 			 */
-			now = iter_started_at;
+			now = duty_started_at;
 			force_all_duties = (now >= next_duty_floor_at);
 			if (force_all_duties)
 				next_duty_floor_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
@@ -1875,7 +1929,8 @@ LmonMain(void)
 
 		for (;;) {
 			int rc;
-			TimestampTz iter_started_at;
+			TimestampTz duty_started_at;
+			instr_time iter_started_at;
 			bool force_all_duties;
 			TimestampTz dnow;
 
@@ -1889,10 +1944,11 @@ LmonMain(void)
 			if (ShutdownRequestPending || lmon_shutdown_requested())
 				break;
 
-			iter_started_at = GetCurrentTimestamp();
+			duty_started_at = GetCurrentTimestamp();
+			INSTR_TIME_SET_CURRENT(iter_started_at);
 
 			/* PGRAC: spec-7.2 D1 — >= 1 Hz floor (see the TIER_1 loop). */
-			dnow = iter_started_at;
+			dnow = duty_started_at;
 			force_all_duties = (dnow >= next_duty_floor_at);
 			if (force_all_duties)
 				next_duty_floor_at

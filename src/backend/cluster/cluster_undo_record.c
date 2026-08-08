@@ -206,6 +206,14 @@ typedef struct ClusterUndoRecordShared {
 	pg_atomic_uint64 smgr_pread_count;
 	pg_atomic_uint64 smgr_pwrite_count;
 
+	/* Passive pool-capacity observation.  Numeric gauges stay valid while
+	 * readiness/status independently report whether the latest scan is usable. */
+	pg_atomic_uint64 segment_allocated_count;
+	pg_atomic_uint64 segment_allocated_high_water;
+	pg_atomic_uint32 segment_observation_ready;
+	pg_atomic_uint32 segment_observation_status;
+	pg_atomic_uint32 segment_observation_attempted;
+
 	LWLockPadded cursor_lock;
 	/* spec-3.8 D3: lifecycle_lock — protects autoextend slow path
 	 * (active_segment_id publication + state transitions).  Per spec
@@ -309,6 +317,7 @@ typedef struct ClusterUndoPendingBlock {
 static ClusterUndoPendingBlock cluster_undo_pending = { 0 };
 
 static bool cluster_undo_pending_flush_internal(bool error_on_fail);
+static void cluster_undo_record_observation_apply_locked(uint8 owner_instance);
 
 /*
  * P0 perf hardening (2026-05-31): per-backend touched-undo-segment list.
@@ -528,6 +537,12 @@ cluster_undo_record_shmem_init(void)
 		pg_atomic_init_u64(&UndoRecordShared->smgr_close_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->smgr_pread_count, 0);
 		pg_atomic_init_u64(&UndoRecordShared->smgr_pwrite_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->segment_allocated_count, 0);
+		pg_atomic_init_u64(&UndoRecordShared->segment_allocated_high_water, 0);
+		pg_atomic_init_u32(&UndoRecordShared->segment_observation_ready, 0);
+		pg_atomic_init_u32(&UndoRecordShared->segment_observation_status,
+						   (uint32)CLUSTER_UNDO_POOL_OBS_INVALID_OWNER);
+		pg_atomic_init_u32(&UndoRecordShared->segment_observation_attempted, 0);
 
 		LWLockInitialize(&UndoRecordShared->cursor_lock.lock, tranche_id);
 		LWLockInitialize(&UndoRecordShared->lifecycle_lock.lock, tranche_id);
@@ -1212,6 +1227,7 @@ claim_undo_extent(ClusterUndoExtent *ext, uint8 owner_instance, uint32 ensured_s
 		}
 		pg_atomic_fetch_add_u64(&UndoRecordShared->autoextend_count, 1);
 		pg_atomic_fetch_add_u64(&UndoRecordShared->segment_switch_count, 1);
+		cluster_undo_record_observation_apply_locked(owner_instance);
 		if (old_seg != 0 && old_seg != new_seg) {
 			(void)cluster_undo_segment_mark_full(old_seg, owner_instance);
 
@@ -1375,6 +1391,7 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 		cluster_xp_end(&xps); /* PGRAC: spec-5.59 D7 profiling */
 		return InvalidUba;
 	}
+	cluster_undo_record_observation_ensure();
 
 	/*
 	 * spec-3.8 Fix 4: post-restart resume.  If shared cursor is fresh
@@ -2025,6 +2042,117 @@ cluster_undo_reader_lookup_count(void)
 	return pg_atomic_read_u64(&UndoRecordShared->reader_lookup_count);
 }
 
+/* Caller holds lifecycle_lock EXCLUSIVE. */
+static void
+cluster_undo_record_observation_apply_locked(uint8 owner_instance)
+{
+	ClusterUndoPoolObservation observation;
+	ClusterUndoPoolObservationResult scan_result;
+	uint64 high_water;
+
+	if (UndoRecordShared == NULL)
+		return;
+	Assert(LWLockHeldByMeInMode(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE));
+	scan_result = cluster_undo_segment_observe_pool(owner_instance, &observation);
+	pg_atomic_write_u32(&UndoRecordShared->segment_observation_status, (uint32)scan_result);
+	if (scan_result != CLUSTER_UNDO_POOL_OBS_OK) {
+		pg_atomic_write_u32(&UndoRecordShared->segment_observation_ready, 0);
+		return;
+	}
+
+	pg_atomic_write_u64(&UndoRecordShared->segment_allocated_count,
+						(uint64)observation.allocated_count);
+	high_water = pg_atomic_read_u64(&UndoRecordShared->segment_allocated_high_water);
+	while (high_water < (uint64)observation.allocated_count
+		   && !pg_atomic_compare_exchange_u64(&UndoRecordShared->segment_allocated_high_water,
+											 &high_water, (uint64)observation.allocated_count))
+		;
+	pg_write_barrier();
+	pg_atomic_write_u32(&UndoRecordShared->segment_observation_ready, 1);
+}
+
+void
+cluster_undo_record_observation_ensure(void)
+{
+	if (UndoRecordShared == NULL)
+		return;
+	if (pg_atomic_read_u32(&UndoRecordShared->segment_observation_ready) == 1
+		|| pg_atomic_read_u32(&UndoRecordShared->segment_observation_attempted) == 1)
+		return;
+	if (cluster_node_id < 0 || cluster_node_id >= UNDO_OWNER_INSTANCE_MAX) {
+		pg_atomic_write_u32(&UndoRecordShared->segment_observation_status,
+							(uint32)CLUSTER_UNDO_POOL_OBS_INVALID_OWNER);
+		return;
+	}
+
+	LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u32(&UndoRecordShared->segment_observation_ready) == 0
+		&& pg_atomic_read_u32(&UndoRecordShared->segment_observation_attempted) == 0) {
+		cluster_undo_record_observation_apply_locked((uint8)(cluster_node_id + 1));
+		pg_atomic_write_u32(&UndoRecordShared->segment_observation_attempted, 1);
+	}
+	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+}
+
+uint64
+cluster_undo_segment_allocated_count(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->segment_allocated_count);
+}
+
+uint64
+cluster_undo_segment_allocated_high_water(void)
+{
+	if (UndoRecordShared == NULL)
+		return 0;
+	return pg_atomic_read_u64(&UndoRecordShared->segment_allocated_high_water);
+}
+
+uint32
+cluster_undo_segment_effective_cap(void)
+{
+	int guc_val = cluster_undo_segments_max_per_instance;
+	uint32 configured_cap;
+	uint64 current = 0;
+
+	if (guc_val < 16)
+		configured_cap = 16;
+	else if (guc_val > (int)CLUSTER_UNDO_SEGS_PER_INSTANCE)
+		configured_cap = CLUSTER_UNDO_SEGS_PER_INSTANCE;
+	else
+		configured_cap = (uint32)guc_val;
+	if (UndoRecordShared != NULL)
+		current = pg_atomic_read_u64(&UndoRecordShared->segment_allocated_count);
+	if (current > (uint64)configured_cap)
+		return (uint32)current;
+	return configured_cap;
+}
+
+const char *
+cluster_undo_segment_observation_status_string(void)
+{
+	uint32 status;
+
+	if (UndoRecordShared == NULL)
+		return "UNAVAILABLE_INVALID_OWNER";
+	status = pg_atomic_read_u32(&UndoRecordShared->segment_observation_status);
+	if (pg_atomic_read_u32(&UndoRecordShared->segment_observation_ready) == 1
+		&& status == (uint32)CLUSTER_UNDO_POOL_OBS_OK)
+		return "READY";
+	switch ((ClusterUndoPoolObservationResult)status) {
+	case CLUSTER_UNDO_POOL_OBS_IO_ERROR:
+		return "UNAVAILABLE_IO_ERROR";
+	case CLUSTER_UNDO_POOL_OBS_INVALID_HEADER:
+		return "UNAVAILABLE_INVALID_HEADER";
+	case CLUSTER_UNDO_POOL_OBS_OK:
+	case CLUSTER_UNDO_POOL_OBS_INVALID_OWNER:
+	default:
+		return "UNAVAILABLE_INVALID_OWNER";
+	}
+}
+
 /* spec-3.8 D10: 4 NEW lifecycle counter accessors. */
 uint64
 cluster_undo_autoextend_count(void)
@@ -2096,6 +2224,7 @@ cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at
 		cluster_undo_cleaner_wakeup();
 		return 0;
 	}
+	cluster_undo_record_observation_apply_locked(owner_instance);
 
 	/*
 	 * A TT-only rollover segment does not receive record writes, so it would

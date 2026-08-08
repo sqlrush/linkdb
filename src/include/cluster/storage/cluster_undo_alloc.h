@@ -296,7 +296,23 @@ extern uint32 cluster_undo_segment_generation(uint32 segment_id, uint8 owner_ins
 
 /* spec-3.13: identity check exported for redo + reuse peek (L212 surface). */
 extern bool cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
-													uint8 owner_instance);
+											uint8 owner_instance);
+
+typedef enum ClusterUndoPoolObservationResult {
+	CLUSTER_UNDO_POOL_OBS_OK = 0,
+	CLUSTER_UNDO_POOL_OBS_INVALID_OWNER,
+	CLUSTER_UNDO_POOL_OBS_IO_ERROR,
+	CLUSTER_UNDO_POOL_OBS_INVALID_HEADER
+} ClusterUndoPoolObservationResult;
+
+typedef struct ClusterUndoPoolObservation {
+	uint32 allocated_count;
+	uint32 configured_cap;
+	uint32 effective_cap;
+} ClusterUndoPoolObservation;
+
+extern ClusterUndoPoolObservationResult
+cluster_undo_segment_observe_pool(uint8 owner_instance, ClusterUndoPoolObservation *out);
 
 
 #endif /* CLUSTER_UNDO_ALLOC_H */

@@ -189,6 +189,13 @@ extern uint64 cluster_undo_segment_switch_count(void);
 extern uint64 cluster_undo_segment_create_fail_count(void);
 extern uint64 cluster_undo_segment_hard_cap_fail_count(void);
 
+/* Passive pool-capacity observation. */
+extern void cluster_undo_record_observation_ensure(void);
+extern uint64 cluster_undo_segment_allocated_count(void);
+extern uint64 cluster_undo_segment_allocated_high_water(void);
+extern uint32 cluster_undo_segment_effective_cap(void);
+extern const char *cluster_undo_segment_observation_status_string(void);
+
 /*
  * spec-3.12 D2b: TT-slot retention-pressure segment rollover.
  *
