@@ -160,3 +160,18 @@ cluster_undo_block0_state_transition_allowed(ClusterUndoBlock0SlotState from,
 		return false;
 	}
 }
+
+/*
+ * cluster_undo_block0_r4_prerequisite_snapshot -- Report dormant readiness.
+ *
+ *	The current prerequisite is immutable and carries no recovery authority.
+ */
+ClusterR4PrerequisiteSnapshot
+cluster_undo_block0_r4_prerequisite_snapshot(void)
+{
+	return (ClusterR4PrerequisiteSnapshot){
+		.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED,
+		.ready = false,
+		.reserved = {0, 0, 0},
+	};
+}

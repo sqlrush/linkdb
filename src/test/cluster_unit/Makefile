@@ -1854,10 +1854,10 @@ test_cluster_undo_format: test_cluster_undo_format.c unit_test.h \
 CLUSTER_UNDO_BLOCK0_O = $(top_builddir)/src/backend/cluster/storage/cluster_undo_block0.o
 test_cluster_undo_block0: test_cluster_undo_block0.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(top_builddir)/src/port/libpgport_srv.a $(PTHREAD_LIBS) -o $@
 
 # spec-3.7 D12: test_cluster_undo_record — 12 encode/decode round-trip
 # tests for UndoRecordHeader + 4 payloads + slot dir addressing.

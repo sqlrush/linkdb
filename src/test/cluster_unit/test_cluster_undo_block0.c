@@ -22,6 +22,8 @@
 #include "postgres.h"
 
 #include "cluster/storage/cluster_undo_block0.h"
+#include "port/atomics.h"
+#include "port/pg_pthread.h"
 
 #undef printf
 #undef fprintf
@@ -30,6 +32,14 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+void
+ExceptionalCondition(const char *condition_name pg_attribute_unused(),
+					 const char *file_name pg_attribute_unused(),
+					 int line_number pg_attribute_unused())
+{
+	abort();
+}
 
 static ClusterUndoBlock0LogicalKey
 make_key(uint8 owner_instance, uint32 segment_id)
@@ -60,6 +70,49 @@ make_generation(bool known, uint32 value)
 	generation.known = known;
 	generation.value = value;
 	return generation;
+}
+
+static bool
+r4_prerequisite_snapshot_is_fixed_false(const ClusterR4PrerequisiteSnapshot *snapshot)
+{
+	static const uint8 expected[8] = {0};
+
+	return snapshot != NULL && snapshot->status == CLUSTER_R4_PREREQUISITE_RF_DEFERRED
+		   && !snapshot->ready && snapshot->reserved[0] == 0 && snapshot->reserved[1] == 0
+		   && snapshot->reserved[2] == 0
+		   && memcmp(snapshot, expected, sizeof(expected)) == 0;
+}
+
+#define R4_PREREQUISITE_THREAD_COUNT 8
+#define R4_PREREQUISITE_CALLS_PER_THREAD 10000
+
+typedef struct R4PrerequisiteThreadResult {
+	pg_atomic_uint32 *ready;
+	pg_atomic_uint32 *start;
+	uint32 calls;
+	uint32 mismatches;
+} R4PrerequisiteThreadResult;
+
+static void *
+r4_prerequisite_snapshot_caller(void *arg)
+{
+	R4PrerequisiteThreadResult *result = (R4PrerequisiteThreadResult *)arg;
+	int i;
+
+	pg_atomic_fetch_add_u32(result->ready, 1);
+	while (pg_atomic_read_u32(result->start) == 0)
+		;
+
+	for (i = 0; i < R4_PREREQUISITE_CALLS_PER_THREAD; i++) {
+		ClusterR4PrerequisiteSnapshot snapshot;
+
+		snapshot = cluster_undo_block0_r4_prerequisite_snapshot();
+		result->calls++;
+		if (!r4_prerequisite_snapshot_is_fixed_false(&snapshot))
+			result->mismatches++;
+	}
+
+	return NULL;
 }
 
 UT_TEST(test_block0_key_endpoints_map_to_direct_slots)
@@ -209,10 +262,70 @@ UT_TEST(test_block0_slot_state_rejects_direct_publish_and_double_publish)
 															CLUSTER_UNDO_BLOCK0_SLOT_EMPTY));
 }
 
+UT_TEST(test_r4_prerequisite_snapshot_is_exact_and_repeatable)
+{
+	int i;
+
+	UT_ASSERT_EQ((int)sizeof(ClusterR4PrerequisiteSnapshot), 8);
+	UT_ASSERT_EQ((int)CLUSTER_R4_PREREQUISITE_RF_DEFERRED, 0);
+	for (i = 0; i < 4096; i++) {
+		ClusterR4PrerequisiteSnapshot snapshot;
+
+		memset(&snapshot, 0xA5, sizeof(snapshot));
+		snapshot = cluster_undo_block0_r4_prerequisite_snapshot();
+		UT_ASSERT(r4_prerequisite_snapshot_is_fixed_false(&snapshot));
+	}
+}
+
+UT_TEST(test_r4_prerequisite_snapshot_is_fixed_for_concurrent_callers)
+{
+	R4PrerequisiteThreadResult results[R4_PREREQUISITE_THREAD_COUNT];
+	pthread_t threads[R4_PREREQUISITE_THREAD_COUNT];
+	pg_atomic_uint32 ready;
+	pg_atomic_uint32 start;
+	uint32 calls = 0;
+	uint32 mismatches = 0;
+	int created = 0;
+	int i;
+	int rc;
+
+	pg_atomic_init_u32(&ready, 0);
+	pg_atomic_init_u32(&start, 0);
+	memset(results, 0, sizeof(results));
+	for (i = 0; i < R4_PREREQUISITE_THREAD_COUNT; i++) {
+		results[i].ready = &ready;
+		results[i].start = &start;
+		rc = pthread_create(&threads[i], NULL, r4_prerequisite_snapshot_caller, &results[i]);
+		UT_ASSERT_EQ(rc, 0);
+		if (rc != 0)
+			break;
+		created++;
+	}
+	if (created != R4_PREREQUISITE_THREAD_COUNT) {
+		pg_atomic_write_u32(&start, 1);
+		for (i = 0; i < created; i++)
+			(void)pthread_join(threads[i], NULL);
+		return;
+	}
+
+	while (pg_atomic_read_u32(&ready) != R4_PREREQUISITE_THREAD_COUNT)
+		;
+	pg_atomic_write_u32(&start, 1);
+	for (i = 0; i < R4_PREREQUISITE_THREAD_COUNT; i++) {
+		rc = pthread_join(threads[i], NULL);
+		UT_ASSERT_EQ(rc, 0);
+		calls += results[i].calls;
+		mismatches += results[i].mismatches;
+	}
+	UT_ASSERT_EQ(calls,
+				 R4_PREREQUISITE_THREAD_COUNT * R4_PREREQUISITE_CALLS_PER_THREAD);
+	UT_ASSERT_EQ(mismatches, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_accepts_only_declared_intents);
@@ -221,6 +334,8 @@ main(void)
 	UT_RUN(test_block0_generation_exhaustion_never_wraps);
 	UT_RUN(test_block0_slot_state_allows_only_frozen_edges);
 	UT_RUN(test_block0_slot_state_rejects_direct_publish_and_double_publish);
+	UT_RUN(test_r4_prerequisite_snapshot_is_exact_and_repeatable);
+	UT_RUN(test_r4_prerequisite_snapshot_is_fixed_for_concurrent_callers);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

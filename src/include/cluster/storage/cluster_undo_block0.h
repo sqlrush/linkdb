@@ -74,6 +74,19 @@ typedef enum ClusterUndoBlock0SlotState {
 	CLUSTER_UNDO_BLOCK0_SLOT_RETIRING
 } ClusterUndoBlock0SlotState;
 
+typedef enum ClusterR4PrerequisiteStatus {
+	CLUSTER_R4_PREREQUISITE_RF_DEFERRED = 0
+} ClusterR4PrerequisiteStatus;
+
+typedef struct ClusterR4PrerequisiteSnapshot {
+	ClusterR4PrerequisiteStatus status;
+	bool ready;
+	uint8 reserved[3];
+} ClusterR4PrerequisiteSnapshot;
+
+StaticAssertDecl(sizeof(ClusterR4PrerequisiteSnapshot) == 8,
+				 "R4 prerequisite snapshot must remain 8 bytes");
+
 extern ClusterUndoBlock0Result
 cluster_undo_block0_logical_slot(const ClusterUndoBlock0LogicalKey *logical, uint32 *slot);
 extern bool cluster_undo_block0_root_valid(const ClusterUndoBlock0ResolvedRoot *root);
@@ -85,5 +98,6 @@ extern bool cluster_undo_block0_generation_advance(const ClusterUndoBlock0Genera
 												   ClusterUndoBlock0Generation *next);
 extern bool cluster_undo_block0_state_transition_allowed(ClusterUndoBlock0SlotState from,
 														 ClusterUndoBlock0SlotState to);
+extern ClusterR4PrerequisiteSnapshot cluster_undo_block0_r4_prerequisite_snapshot(void);
 
 #endif /* CLUSTER_UNDO_BLOCK0_H */
