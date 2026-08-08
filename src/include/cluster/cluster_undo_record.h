@@ -150,20 +150,106 @@ StaticAssertDecl(sizeof(UndoRecordHeader) == 64, "UndoRecordHeader must be 64B â
 
 #ifdef USE_PGRAC_CLUSTER
 /*
- * R4 B1 callable scaffold.  These pure validators deliberately fail closed
- * until their behavior has executed RED in test_cluster_r4_cr_walk.
+ * R4 transaction-head identity validation.  These helpers are pure over a
+ * record already read at the supplied UBA.  Physical heap target and payload
+ * validation belongs to the CR builder, not this transaction identity gate.
  */
+static inline bool
+cluster_undo_record_identity_fail(ClusterTxResolveReason *reason_out, ClusterTxResolveReason reason)
+{
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return false;
+}
+
+static inline bool
+cluster_undo_record_uba_equal(UBA left, UBA right)
+{
+	return left.raw[0] == right.raw[0] && left.raw[1] == right.raw[1];
+}
+
+static inline bool
+cluster_undo_record_validate_member(const ClusterTxLocator *locator, UBA record_uba,
+									const UndoRecordHeader *record,
+									ClusterTxResolveReason *reason_out)
+{
+	uint32 decoded_segment;
+	uint32 decoded_block;
+	uint16 locator_tt_offset;
+	uint16 record_tt_offset;
+	uint16 decoded_row;
+	NodeId locator_origin;
+	NodeId record_origin;
+	NodeId tt_binding_origin;
+	UBA tt_binding_uba;
+	bool data_kind;
+
+	if (locator == NULL || record == NULL)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+
+	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE || locator->itl_kind == ITL_FLAG_COMMITTED
+				|| locator->itl_kind == ITL_FLAG_ABORTED
+				|| locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT;
+	if (locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| (!data_kind && !ITL_FLAG_IS_LOCK_ONLY(locator->itl_kind)))
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+	if (!TransactionIdIsNormal(locator->xid))
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_XID_MISMATCH);
+	if (locator->tt_wrap == TT_WRAP_INVALID)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_WRAP_MISMATCH);
+
+	if (!uba_decode(locator->uba, &decoded_segment, &decoded_block, &locator_tt_offset,
+					&decoded_row)
+		|| decoded_block == 0
+		|| decoded_row >= (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry))
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+	locator_origin = uba_origin_node_id(locator->uba);
+	if (locator_origin == InvalidNodeId)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+
+	if (!uba_decode(record_uba, &decoded_segment, &decoded_block, &record_tt_offset, &decoded_row)
+		|| decoded_block == 0
+		|| decoded_row >= (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry))
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+	if (record_tt_offset != locator_tt_offset)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_SLOT_MISMATCH);
+
+	record_origin = uba_origin_node_id(record_uba);
+	if (record_origin == InvalidNodeId || record_origin != locator_origin)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+
+	/*
+	 * The physical record segment may roll over inside one owner partition.
+	 * Validate the persisted canonical TT segment as a separate identity.
+	 */
+	tt_binding_uba = record_uba;
+	tt_binding_uba.raw[0] = ((uint64)decoded_block << 32) | record->tt_slot_segment_id;
+	tt_binding_origin = uba_origin_node_id(tt_binding_uba);
+	if (tt_binding_origin == InvalidNodeId || tt_binding_origin != locator_origin
+		|| record->tt_slot_id != (uint32)locator_tt_offset + 1)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_SLOT_MISMATCH);
+	if (record->origin_node_id != (uint16)record_origin)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+	if (record->xid != locator->xid)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_XID_MISMATCH);
+	if (record->tt_wrap_plus1 == 0 || (uint16)(record->tt_wrap_plus1 - 1) != locator->tt_wrap)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_WRAP_MISMATCH);
+
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return true;
+}
+
 static inline bool
 cluster_undo_record_validate_identity(const ClusterTxLocator *locator, UBA record_uba,
 									  const UndoRecordHeader *record,
 									  ClusterTxResolveReason *reason_out)
 {
-	(void)locator;
-	(void)record_uba;
-	(void)record;
-	if (reason_out != NULL)
-		*reason_out = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
-	return false;
+	if (locator == NULL || record == NULL)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+	if (!cluster_undo_record_uba_equal(locator->uba, record_uba))
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+	return cluster_undo_record_validate_member(locator, record_uba, record, reason_out);
 }
 
 static inline bool
@@ -172,14 +258,36 @@ cluster_undo_record_validate_prev_edge(const ClusterTxLocator *locator, UBA curr
 									   const UndoRecordHeader *previous,
 									   ClusterTxResolveReason *reason_out)
 {
-	(void)locator;
-	(void)current_uba;
-	(void)current;
-	(void)previous_uba;
-	(void)previous;
-	if (reason_out != NULL)
-		*reason_out = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
-	return false;
+	uint32 current_segment;
+	uint32 current_block;
+	uint16 current_tt_offset;
+	uint16 current_row;
+	uint32 previous_segment;
+	uint32 previous_block;
+	uint16 previous_tt_offset;
+	uint16 previous_row;
+
+	if (locator == NULL || current == NULL || previous == NULL)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_LOCATOR);
+	if (!cluster_undo_record_validate_member(locator, current_uba, current, reason_out))
+		return false;
+	if (UBA_is_invalid(current->prev_uba)
+		|| !cluster_undo_record_uba_equal(current->prev_uba, previous_uba)
+		|| cluster_undo_record_uba_equal(current_uba, previous_uba))
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+	if (!uba_decode(current_uba, &current_segment, &current_block, &current_tt_offset, &current_row)
+		|| !uba_decode(previous_uba, &previous_segment, &previous_block, &previous_tt_offset,
+					   &previous_row))
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+	if (previous_tt_offset != current_tt_offset
+		|| previous->tt_slot_segment_id != current->tt_slot_segment_id
+		|| previous->tt_slot_id != current->tt_slot_id)
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_SLOT_MISMATCH);
+	if (previous_segment == current_segment
+		&& (previous_block > current_block
+			|| (previous_block == current_block && previous_row >= current_row)))
+		return cluster_undo_record_identity_fail(reason_out, CLUSTER_TX_RESOLVE_BAD_UBA);
+	return cluster_undo_record_validate_member(locator, previous_uba, previous, reason_out);
 }
 #endif /* USE_PGRAC_CLUSTER */
 
