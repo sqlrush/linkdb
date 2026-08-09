@@ -128,6 +128,7 @@
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_shmem_register (spec-2.6 Sprint A Step 1) */
 #include "cluster/cluster_fence.h"	/* cluster_fence_shmem_register (spec-2.28 Sprint A Step 1) */
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_shmem_register (spec-2.29 Sprint A Step 1) */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b shmem size/init */
 #include "cluster/cluster_write_fence.h"	 /* cluster_write_fence_shmem_register (spec-4.12 D7) */
 #include "cluster/cluster_lms.h" /* cluster_lms_shmem_register (spec-2.18 Sprint A Step 1) */
@@ -197,6 +198,15 @@ static const ClusterShmemRegion cluster_conf_region = {
 	.init_fn = cluster_conf_shmem_init,
 	.lwlock_count = 0,
 	.owner_subsys = "cluster_conf",
+	.reserved_flags = 0,
+};
+
+static const ClusterShmemRegion cluster_semantic_activation_region = {
+	.name = "pgrac cluster semantic activation",
+	.size_fn = cluster_semantic_activation_shmem_size,
+	.init_fn = cluster_semantic_activation_shmem_init,
+	.lwlock_count = 0,
+	.owner_subsys = "semantic_activation",
 	.reserved_flags = 0,
 };
 
@@ -394,6 +404,8 @@ cluster_init_shmem_module(void)
 		cluster_shmem_register_region(&cluster_ctl_region);
 	if (cluster_shmem_lookup_region(cluster_conf_region.name) == NULL)
 		cluster_shmem_register_region(&cluster_conf_region);
+	if (cluster_shmem_lookup_region(cluster_semantic_activation_region.name) == NULL)
+		cluster_shmem_register_region(&cluster_semantic_activation_region);
 
 	/* spec-3.18 D1: undo block buffer pool (size_fn returns 0 when
 	 * cluster.undo_buffers=0, so registration is near-free when disabled). */

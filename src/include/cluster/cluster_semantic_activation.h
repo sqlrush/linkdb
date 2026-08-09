@@ -90,6 +90,13 @@ typedef struct ClusterSemanticActivationRecord {
 	ClusterSemanticActivationPhase phase;
 } ClusterSemanticActivationRecord;
 
+typedef struct ClusterSemanticActivationCasRequest {
+	uint64 request_seq;
+	uint64 expected_generation;
+	uint64 expected_source_feature_bitmap;
+	uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+} ClusterSemanticActivationCasRequest;
+
 typedef ClusterSemanticActivationResult (*ClusterSemanticReadinessCallback)(
 	uint64 expected_generation, ClusterSemanticActivationRefusal *refusal);
 typedef ClusterSemanticActivationResult (*ClusterSemanticStageCallback)(uint64 generation);
@@ -124,10 +131,16 @@ cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *
 extern bool cluster_semantic_activation_record_encode(const ClusterSemanticActivationRecord *record,
 													  uint8 bytes[512]);
 extern bool cluster_semantic_activation_record_decode(const uint8 bytes[512],
-													  ClusterSemanticActivationRecord *record,
-													  ClusterSemanticActivationRefusal *refusal);
+												  ClusterSemanticActivationRecord *record,
+												  ClusterSemanticActivationRefusal *refusal);
 extern ClusterSemanticActivationResult
-cluster_semantic_activation_record_cas_write(uint64 expected_generation, const uint8 bytes[512]);
+cluster_semantic_activation_record_cas_write(uint64 expected_generation,
+											 uint64 expected_source_feature_bitmap,
+											 const uint8 bytes[512]);
+extern bool cluster_semantic_activation_qvotec_poll_record_cas(
+	ClusterSemanticActivationCasRequest *out);
+extern bool cluster_semantic_activation_qvotec_complete_record_cas(
+	uint64 request_seq, ClusterSemanticActivationResult result);
 extern void cluster_semantic_activation_lmon_tick(void);
 extern ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,

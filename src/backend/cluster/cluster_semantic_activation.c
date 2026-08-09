@@ -18,7 +18,9 @@
 
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/storage/cluster_undo_block0.h"
+#include "port/atomics.h"
 #include "port/pg_crc32c.h"
+#include "storage/shmem.h"
 
 #define CLUSTER_SEMANTIC_RECORD_MAGIC UINT32_C(0x50475341)
 #define CLUSTER_SEMANTIC_RECORD_VERSION 1
@@ -29,6 +31,24 @@ typedef struct ClusterSemanticRecordSample {
 	bool readable;
 	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 } ClusterSemanticRecordSample;
+
+typedef struct ClusterSemanticActivationShmem {
+	pg_atomic_uint64 record_cas_request_seq;
+	pg_atomic_uint64 record_cas_completion_seq;
+	pg_atomic_uint32 record_cas_result;
+	uint64 record_cas_expected_generation;
+	uint64 record_cas_expected_source_feature_bitmap;
+	uint8 record_cas_desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+} ClusterSemanticActivationShmem;
+
+static ClusterSemanticActivationShmem *SemanticActivationShmem = NULL;
+
+static bool semantic_activation_record_cas_mailbox_submit(
+	uint64 expected_generation, uint64 expected_source_feature_bitmap,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
+	uint64 *out_request_seq) pg_attribute_unused();
+static bool semantic_activation_record_cas_mailbox_poll_completion(
+	uint64 request_seq, ClusterSemanticActivationResult *out_result) pg_attribute_unused();
 
 typedef enum SemanticActivationState {
 	SEMANTIC_ACTIVATION_STATE_INVALID = -1,
@@ -503,12 +523,118 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 Size
 cluster_semantic_activation_shmem_size(void)
 {
-	return 0;
+	return MAXALIGN(sizeof(ClusterSemanticActivationShmem));
 }
 
 void
 cluster_semantic_activation_shmem_init(void)
-{}
+{
+	bool found;
+
+	SemanticActivationShmem = (ClusterSemanticActivationShmem *)ShmemInitStruct(
+		"pgrac cluster semantic activation", cluster_semantic_activation_shmem_size(), &found);
+	if (SemanticActivationShmem == NULL || found)
+		return;
+
+	pg_atomic_init_u64(&SemanticActivationShmem->record_cas_request_seq, 0);
+	pg_atomic_init_u64(&SemanticActivationShmem->record_cas_completion_seq, 0);
+	pg_atomic_init_u32(&SemanticActivationShmem->record_cas_result,
+					   CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	SemanticActivationShmem->record_cas_expected_generation = 0;
+	SemanticActivationShmem->record_cas_expected_source_feature_bitmap = 0;
+	memset(SemanticActivationShmem->record_cas_desired_bytes, 0,
+		   sizeof(SemanticActivationShmem->record_cas_desired_bytes));
+}
+
+static bool
+semantic_activation_record_cas_mailbox_submit(
+	uint64 expected_generation, uint64 expected_source_feature_bitmap,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES], uint64 *out_request_seq)
+{
+	uint64 request_seq;
+	uint64 completion_seq;
+
+	if (SemanticActivationShmem == NULL || desired_bytes == NULL || out_request_seq == NULL)
+		return false;
+
+	request_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+	completion_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq);
+	if (request_seq != completion_seq || request_seq == UINT64_MAX)
+		return false;
+
+	SemanticActivationShmem->record_cas_expected_generation = expected_generation;
+	SemanticActivationShmem->record_cas_expected_source_feature_bitmap
+		= expected_source_feature_bitmap;
+	memcpy(SemanticActivationShmem->record_cas_desired_bytes, desired_bytes,
+		   sizeof(SemanticActivationShmem->record_cas_desired_bytes));
+	pg_write_barrier();
+	request_seq++;
+	pg_atomic_write_u64(&SemanticActivationShmem->record_cas_request_seq, request_seq);
+	*out_request_seq = request_seq;
+	return true;
+}
+
+bool
+cluster_semantic_activation_qvotec_poll_record_cas(ClusterSemanticActivationCasRequest *out)
+{
+	uint64 request_seq;
+	uint64 completion_seq;
+
+	if (SemanticActivationShmem == NULL || out == NULL)
+		return false;
+
+	request_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+	completion_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq);
+	if (request_seq == completion_seq || completion_seq == UINT64_MAX
+		|| request_seq != completion_seq + 1)
+		return false;
+
+	pg_read_barrier();
+	out->request_seq = request_seq;
+	out->expected_generation = SemanticActivationShmem->record_cas_expected_generation;
+	out->expected_source_feature_bitmap
+		= SemanticActivationShmem->record_cas_expected_source_feature_bitmap;
+	memcpy(out->desired_bytes, SemanticActivationShmem->record_cas_desired_bytes,
+		   sizeof(out->desired_bytes));
+	return true;
+}
+
+bool
+cluster_semantic_activation_qvotec_complete_record_cas(
+	uint64 request_seq, ClusterSemanticActivationResult result)
+{
+	uint64 current_request_seq;
+	uint64 completion_seq;
+
+	if (SemanticActivationShmem == NULL)
+		return false;
+
+	current_request_seq
+		= pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+	completion_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq);
+	if (current_request_seq != request_seq || completion_seq == UINT64_MAX
+		|| completion_seq + 1 != request_seq)
+		return false;
+
+	pg_atomic_write_u32(&SemanticActivationShmem->record_cas_result, (uint32)result);
+	pg_write_barrier();
+	pg_atomic_write_u64(&SemanticActivationShmem->record_cas_completion_seq, request_seq);
+	return true;
+}
+
+static bool
+semantic_activation_record_cas_mailbox_poll_completion(
+	uint64 request_seq, ClusterSemanticActivationResult *out_result)
+{
+	if (SemanticActivationShmem == NULL || out_result == NULL
+		|| pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq) != request_seq)
+		return false;
+
+	pg_read_barrier();
+	*out_result = (ClusterSemanticActivationResult)pg_atomic_read_u32(
+		&SemanticActivationShmem->record_cas_result);
+	return true;
+}
 
 void
 cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor)
