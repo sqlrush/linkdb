@@ -42,6 +42,7 @@ int cluster_node_id = 3;
 
 static PGPROC dummy_proc;
 PGPROC *MyProc = &dummy_proc;
+volatile uint32 CritSectionCount = 0;
 
 static uint32 local_wait_event_info = 0;
 uint32 *my_wait_event_info = &local_wait_event_info;
@@ -275,6 +276,8 @@ cluster_cf_unlock(LOCKMODE mode)
 static unsigned char virtual_file[CLUSTER_WAL_STATE_FILE_SIZE];
 static off_t virtual_file_size = CLUSTER_WAL_STATE_FILE_SIZE;
 static int open_count = 0;
+static int read_only_open_count = 0;
+static int read_write_open_count = 0;
 static int pwrite_count = 0;
 static int fsync_count = 0;
 static int slot_pread_count = 0;
@@ -288,8 +291,14 @@ static ClusterWalStateSlot last_pwrite_image;
 int
 BasicOpenFile(const char *fileName pg_attribute_unused(), int fileFlags)
 {
-	UT_ASSERT((fileFlags & O_ACCMODE) == O_RDONLY || (fileFlags & O_ACCMODE) == O_RDWR);
+	int access_mode = fileFlags & O_ACCMODE;
+
+	UT_ASSERT(access_mode == O_RDONLY || access_mode == O_RDWR);
 	UT_ASSERT((fileFlags & (O_CREAT | O_TRUNC)) == 0);
+	if (access_mode == O_RDONLY)
+		read_only_open_count++;
+	else
+		read_write_open_count++;
 	open_count++;
 	record_event(RMW_EVENT_OPEN);
 	return 42;
@@ -411,6 +420,8 @@ fixture_reset(void)
 	virtual_file_size = CLUSTER_WAL_STATE_FILE_SIZE;
 	event_count = 0;
 	open_count = 0;
+	read_only_open_count = 0;
+	read_write_open_count = 0;
 	pwrite_count = 0;
 	fsync_count = 0;
 	slot_pread_count = 0;
@@ -423,6 +434,7 @@ fixture_reset(void)
 	cluster_injection_armed_count = 0;
 	stub_injection_skip_pending = false;
 	stub_injection_dispatch_count = 0;
+	CritSectionCount = 0;
 }
 
 static ClusterWalStateUpdate
@@ -512,6 +524,8 @@ UT_TEST(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread)
 	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
 					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, &published),
 				 (int)CLUSTER_WAL_STATE_UPDATE_OK);
+	UT_ASSERT_EQ(read_only_open_count, 0);
+	UT_ASSERT_EQ(read_write_open_count, 1);
 	UT_ASSERT_EQ(event_count, (int)lengthof(expected_events));
 	for (i = 0; i < lengthof(expected_events); i++)
 		UT_ASSERT_EQ((int)event_log[i], (int)expected_events[i]);
@@ -686,15 +700,19 @@ UT_TEST(test_a1_armed_write_fail_dispatches_before_live_rmw_write)
 	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
 }
 
-UT_TEST(test_a1_armed_write_fail_dispatches_before_legacy_owner_write)
+UT_TEST(test_a1_legacy_owner_write_does_not_dispatch_in_critical_section)
 {
 	fixture_reset();
 	cluster_injection_armed_count = 1;
+	CritSectionCount = 1;
 	cluster_wal_state_publish_checkpoint_redo(800, 900);
-	UT_ASSERT_EQ(stub_injection_dispatch_count, 1);
+	CritSectionCount = 0;
+	UT_ASSERT_EQ(stub_injection_dispatch_count, 0);
 	UT_ASSERT_EQ(slot_pread_count, 1);
-	UT_ASSERT_EQ(pwrite_count, 0);
-	UT_ASSERT_EQ(fsync_count, 0);
+	UT_ASSERT_EQ(read_only_open_count, 1);
+	UT_ASSERT_EQ(read_write_open_count, 1);
+	UT_ASSERT_EQ(pwrite_count, 1);
+	UT_ASSERT_EQ(fsync_count, 1);
 	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
 }
 
@@ -710,7 +728,7 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_a1_borrow_verified_cf_does_not_reenter_or_unlock);
 	UT_RUN(test_a1_fresh_header_slot_typed_rejections);
 	UT_RUN(test_a1_armed_write_fail_dispatches_before_live_rmw_write);
-	UT_RUN(test_a1_armed_write_fail_dispatches_before_legacy_owner_write);
+	UT_RUN(test_a1_legacy_owner_write_does_not_dispatch_in_critical_section);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
