@@ -490,6 +490,7 @@ UT_TEST(test_exact_origin_active_and_native_in_progress_stays_live)
 	test_tt_slot.status = TT_SLOT_ACTIVE;
 	test_tt_slot.commit_scn = InvalidScn;
 	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
 	memset(&resolution, 0xa5, sizeof(resolution));
 
 	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
@@ -508,6 +509,7 @@ UT_TEST(test_exact_origin_active_and_native_in_progress_stays_live)
 	UT_ASSERT_EQ(test_tt_exact_calls, 1);
 	UT_ASSERT_EQ(test_tt_snapshot_calls, 1);
 	UT_ASSERT_EQ(test_native_status_calls, 2);
+	UT_ASSERT_EQ(test_twophase_calls, 1);
 	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
 }
 

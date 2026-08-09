@@ -749,6 +749,39 @@ GetNumberOfPreparedTransactions(void)
 }
 #endif							/* USE_PGRAC_CLUSTER */
 
+/*
+ * TwoPhaseTransactionIdIsPrepared
+ *
+ * Return whether the live prepared-transaction owner currently contains an
+ * exact, fully valid entry for xid.  This deliberately exposes only the
+ * boolean fact: no GlobalTransaction pointer or prepared-transaction
+ * metadata escapes the TwoPhaseStateLock-protected owner.
+ */
+bool
+TwoPhaseTransactionIdIsPrepared(TransactionId xid)
+{
+	bool found = false;
+	int i;
+
+	if (!TransactionIdIsNormal(xid) || max_prepared_xacts <= 0 || TwoPhaseState == NULL)
+		return false;
+
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+	for (i = 0; i < TwoPhaseState->numPrepXacts; i++)
+	{
+		GlobalTransaction gxact = TwoPhaseState->prepXacts[i];
+
+		if (gxact->valid && TransactionIdEquals(gxact->xid, xid))
+		{
+			found = true;
+			break;
+		}
+	}
+	LWLockRelease(TwoPhaseStateLock);
+
+	return found;
+}
+
 
 /* Working status for pg_prepared_xact */
 typedef struct {
