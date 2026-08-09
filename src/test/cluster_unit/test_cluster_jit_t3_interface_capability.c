@@ -125,8 +125,8 @@ main(void)
 		bool		result;
 
 		memset(&left, 0, sizeof(left));
-		left.locator.system_identifier = 1;
-		left.incarnation[0] = 2;
+		left.system_identifier = 1;
+		left.space_incarnation[0] = 2;
 		right = left;
 		left_before = left;
 		right_before = right;
