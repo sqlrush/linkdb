@@ -150,13 +150,13 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 	return NULL;
 }
 
-/* timestamp.h stubs -- cluster_advance_phase calls GetCurrentTimestamp;
- * the runtime tests below exercise only the pure function lookups so
- * these stubs return zero. */
+/* Test clock: pg_usleep advances it without wall-clock delay. */
+static TimestampTz phase4_test_now = 0;
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 0;
+	return phase4_test_now;
 }
 void
 TimestampDifference(TimestampTz start_time pg_attribute_unused(),
@@ -180,8 +180,10 @@ timestamptz_to_str(TimestampTz dt pg_attribute_unused())
 }
 
 void
-pg_usleep(long microsec pg_attribute_unused())
-{}
+pg_usleep(long microsec)
+{
+	phase4_test_now += microsec;
+}
 
 /* pg_snprintf: cluster_startup_phase.c uses snprintf (macro'd to
  * pg_snprintf in PG).  Forward to libc vsnprintf in unit test. */
@@ -280,6 +282,8 @@ cluster_write_fence_startup_self_check(void)
 
 static char phase4_events[32];
 static int phase4_event_count = 0;
+static bool phase4_test_in_quorum = true;
+static int phase4_quorum_check_calls = 0;
 
 static void
 record_phase4_event(char event)
@@ -372,8 +376,9 @@ cluster_qvotec_wait_for_ready(int timeout_ms pg_attribute_unused())
 bool
 cluster_qvotec_in_quorum(void)
 {
-	record_phase4_event('V');
-	return true;
+	if (phase4_quorum_check_calls++ == 0)
+		record_phase4_event('V');
+	return phase4_test_in_quorum;
 }
 
 /* spec-2.18 Sprint A stubs. */
@@ -547,6 +552,9 @@ UT_TEST(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready)
 {
 	phase4_event_count = 0;
 	phase4_events[0] = '\0';
+	phase4_test_now = 0;
+	phase4_test_in_quorum = true;
+	phase4_quorum_check_calls = 0;
 	cluster_allow_single_node = false;
 	cluster_voting_disks = "disk1,disk2,disk3";
 	cluster_phase_shmem_init();
@@ -558,6 +566,30 @@ UT_TEST(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready)
 	cluster_run_phase4_sequence();
 
 	UT_ASSERT_STR_EQ(phase4_events, "DdCcQqVLlESs");
+}
+
+
+UT_TEST(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc)
+{
+	phase4_event_count = 0;
+	phase4_events[0] = '\0';
+	phase4_test_now = 0;
+	phase4_test_in_quorum = false;
+	phase4_quorum_check_calls = 0;
+	cluster_allow_single_node = true;
+	cluster_wal_threads_dir = "/rf-a1/formed";
+	cluster_phase_shmem_init();
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
+	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
+	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
+
+	cluster_run_phase4_sequence();
+
+	UT_ASSERT_STR_EQ(phase4_events, "DdCcQqV");
+	UT_ASSERT(phase4_quorum_check_calls > 0);
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_4_NORMAL);
+	phase4_test_in_quorum = true;
 }
 
 
@@ -602,7 +634,7 @@ UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -614,6 +646,7 @@ main(void)
 	UT_RUN(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
 	UT_RUN(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order);
+	UT_RUN(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
