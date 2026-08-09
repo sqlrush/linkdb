@@ -4,7 +4,7 @@
 # 244_wal_state_registry.pl
 #    spec-4.2 -- ClusterWalState registry, single-node surface.
 #
-#      L1   first boot creates <root>/pgrac_wal_state (66048 bytes);
+#      L1   offline init creates <root>/pgrac_wal_state (66048 bytes);
 #           registry_ready=t; own slot reaches 'active' only after the
 #           node serves (phase -> RUNNING publish)
 #      L2   cluster_stats refresh advances registry_last_updated and
@@ -13,15 +13,15 @@
 #           and via the dump key after restart)
 #      L4   kill -9 leaves the slot ACTIVE (crash never writes STOPPED;
 #           restart re-publishes ACTIVE with a new started_at)
-#      L5   own-slot corruption self-heals: the next ACTIVE publish
-#           overwrites the torn slot (owner repairs its own slot)
+#      L5   own-slot corruption -> startup FATAL 53RA2; restoring the
+#           exact registry image recovers
 #      L6   header corruption -> startup FATAL 53RA2 (never rebuilt
 #           automatically); restoring the header recovers
 #      L7   chmod-based publish failure -> startup FATAL 53RA2 (the
 #           registered injection point cannot be armed before first
 #           boot; same real-fault pattern as t/242 L11)
-#      L8   foreign/corrupt NEIGHBOUR slots never block this node and
-#           surface as their own slots only (no cross-slot bleed)
+#      L8   corrupt NEIGHBOUR slot -> full-registry startup FATAL
+#           53RA2; restoring the exact registry image recovers
 #      L9   wal_threads_dir unset -> registry_ready=f, no file
 #      L9b  startup failure before recovery does not publish ACTIVE: a
 #           mis-linked pg_wal FATALs in the spec-4.1 claim validation
@@ -249,14 +249,16 @@ $node->start;
 }
 
 # ============================================================
-# L5: own-slot corruption self-heals on the next publish.
+# L5: own-slot corruption fails full-registry startup validation.
 # ============================================================
 $node->stop;
+my $own_corrupt_image = read_file_raw($regfile);
 # slot 4 starts at 512 + (4-1)*512 = 2048; flip one body byte -> bad CRC
 patch_byte($regfile, 2048 + 41);
+is($node->start(fail_ok => 1), 0,
+	'L5 start refused on corrupt own slot');
+write_file_raw($regfile, $own_corrupt_image);
 $node->start;
-is(dumpkey($node, 'registry_slot_state'), 'active',
-	'L5 corrupt own slot overwritten by the ACTIVE publish (owner self-heal)');
 
 # ============================================================
 # L6: header corruption -> FATAL 53RA2, never auto-rebuilt.
@@ -296,13 +298,15 @@ chmod(0644, $regfile) or die "chmod: $!";
 $node->start;
 
 # ============================================================
-# L8: corrupt neighbour slots never block this node.
+# L8: corrupt neighbour slot fails full-registry startup validation.
 # ============================================================
 $node->stop;
+my $neighbour_corrupt_image = read_file_raw($regfile);
 patch_byte($regfile, 512 + (9 - 1) * 512 + 4);    # slot 9 garbage
+is($node->start(fail_ok => 1), 0,
+	'L8 start refused on corrupt neighbour slot');
+write_file_raw($regfile, $neighbour_corrupt_image);
 $node->start;
-is(dumpkey($node, 'registry_slot_state'), 'active',
-	'L8 own slot unaffected by a corrupt neighbour slot');
 
 # ============================================================
 # L9: no wal_threads_dir -> no registry.
@@ -361,7 +365,7 @@ is(read_slot_raw($regfile, 4)->{node_id}, 7, 'L11 crafted slot says node 7');
 $log_off = -s $node->logfile;
 is($node->start(fail_ok => 1), 0, 'L11 start refused: own slot owned by another node');
 $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_off);
-like($log, qr/slot 4 is owned by node 7, but this node is 3/,
+like($log, qr/own slot 4 failed validation.*node_id mismatch.*expected 3, found 7/s,
 	'L11 FATAL names the foreign owner (53RA2)');
 is(read_slot_raw($regfile, 4)->{node_id}, 7,
 	'L11 foreign slot left untouched (evidence preserved)');
@@ -380,7 +384,7 @@ truncate($regfile, 512) or die "truncate: $!";
 $log_off = -s $node->logfile;
 is($node->start(fail_ok => 1), 0, 'L12 start refused on truncated registry');
 $log = PostgreSQL::Test::Utils::slurp_file($node->logfile, $log_off);
-like($log, qr/unexpected size 512, expected 66048/,
+like($log, qr/not a regular exact-size file.*size 512, expected 66048/s,
 	'L12 FATAL names the size mismatch (53RA2)');
 is(-s $regfile, 512, 'L12 registry never auto-resized');
 {
