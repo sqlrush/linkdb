@@ -18,12 +18,49 @@
 #include "postgres.h"
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_tx_resolve.h"
 
 #undef printf
 
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+static ClusterTxResolution
+verdict_resolution(ClusterTxOutcome outcome, ClusterTxProofKind proof_kind)
+{
+	ClusterTxResolution resolution;
+
+	memset(&resolution, 0, sizeof(resolution));
+	resolution.locator_echo.uba.raw[0] = UINT64_C(0x0102030405060708);
+	resolution.locator_echo.uba.raw[1] = UINT64_C(0x1112131415161718);
+	resolution.locator_echo.xid = (TransactionId)798;
+	resolution.locator_echo.tt_wrap = 7;
+	resolution.locator_echo.itl_kind = ITL_FLAG_ACTIVE;
+	resolution.locator_echo.itl_slot_index = 3;
+	resolution.top_xid = (TransactionId)700;
+	resolution.outcome = outcome;
+	resolution.proof_kind = proof_kind;
+	resolution.commit_scn = outcome == CLUSTER_TX_COMMITTED ? (SCN)0x2122232425262728 : InvalidScn;
+	resolution.horizon_scn = proof_kind == CLUSTER_TX_PROOF_RECYCLED_BELOW_HORIZON
+							 ? (SCN)0x3132333435363738
+							 : InvalidScn;
+	resolution.authority.origin_epoch = 0;
+	resolution.authority.live_hwm_lsn = (XLogRecPtr)0x4142434445464748;
+	resolution.authority.tt_generation = UINT64_C(0x5152535455565758);
+	resolution.authority.authority_scn = (SCN)0x6162636465666768;
+	return resolution;
+}
+
+static bool
+bytes_are_zero(const uint8 *bytes, size_t size)
+{
+	for (size_t i = 0; i < size; i++) {
+		if (bytes[i] != 0)
+			return false;
+	}
+	return true;
+}
 
 static void
 run_wire_vector(int vector)
@@ -34,11 +71,17 @@ run_wire_vector(int vector)
 	uint64 transition_count = 0;
 	SCN scn = InvalidScn;
 	uint8 bytes[8];
+	uint8 page[BLCKSZ];
 	uint64 value;
+	ClusterTxResolution input;
+	ClusterTxResolution output;
 
 	memset(&request, 0, sizeof(request));
 	memset(&forward, 0, sizeof(forward));
 	memset(bytes, 0, sizeof(bytes));
+	memset(page, 0, sizeof(page));
+	memset(&input, 0, sizeof(input));
+	memset(&output, 0, sizeof(output));
 
 	switch (vector) {
 		case 0:
@@ -190,7 +233,171 @@ run_wire_vector(int vector)
 			ClusterR4ForwardExtensionSetCrProof(&forward, (UINT64_C(0xffffffff) << 32) | 1, 1,
 											 InvalidScn);
 			UT_ASSERT(ClusterR4ForwardExtensionGetCrProof(&forward, UINT64_MAX,
-														  &master_generation, &transition_count, &scn));
+												  &master_generation, &transition_count, &scn));
+			break;
+		case 64:
+			UT_ASSERT_EQ(CLUSTER_R4_TX_VERDICT_VERSION, 3);
+			UT_ASSERT_EQ(CLUSTER_R4_TX_VERDICT_HEADER_LEN, 80);
+			break;
+		case 65:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			UT_ASSERT_EQ(output.outcome, input.outcome);
+			UT_ASSERT_EQ(output.proof_kind, input.proof_kind);
+			UT_ASSERT_EQ((uint64)output.commit_scn, (uint64)input.commit_scn);
+			break;
+		case 66:
+			input = verdict_resolution(CLUSTER_TX_ABORTED, CLUSTER_TX_PROOF_ITL_CLEANOUT);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			UT_ASSERT_EQ(output.outcome, CLUSTER_TX_ABORTED);
+			break;
+		case 67:
+			input = verdict_resolution(CLUSTER_TX_IN_PROGRESS,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			UT_ASSERT_EQ(output.outcome, CLUSTER_TX_IN_PROGRESS);
+			break;
+		case 68:
+			input = verdict_resolution(CLUSTER_TX_PREPARED, CLUSTER_TX_PROOF_ORIGIN_TWOPHASE);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			UT_ASSERT_EQ(output.outcome, CLUSTER_TX_PREPARED);
+			break;
+		case 69:
+			input = verdict_resolution(CLUSTER_TX_UNKNOWN, CLUSTER_TX_PROOF_NONE);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			UT_ASSERT_EQ(output.outcome, CLUSTER_TX_UNKNOWN);
+			break;
+		case 70:
+			input = verdict_resolution(CLUSTER_TX_UNKNOWN,
+								   CLUSTER_TX_PROOF_RECYCLED_BELOW_HORIZON);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			UT_ASSERT_EQ((uint64)output.horizon_scn, (uint64)input.horizon_scn);
+			break;
+		case 71:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_RECOVERY_MATERIALIZED);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			UT_ASSERT_EQ(output.authority.origin_epoch, 0);
+			break;
+		case 72:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT_EQ(ClusterR4WireReadU64(&page[12]), input.locator_echo.uba.raw[0]);
+			UT_ASSERT_EQ(ClusterR4WireReadU64(&page[20]), input.locator_echo.uba.raw[1]);
+			break;
+		case 73:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT_EQ(page[28], (uint8)(input.locator_echo.xid & 0xff));
+			UT_ASSERT_EQ(page[32], 7);
+			break;
+		case 74:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT_EQ((uint32)ClusterR4WireReadU32(&page[36]), (uint32)input.top_xid);
+			UT_ASSERT_EQ(ClusterR4WireReadU64(&page[40]), (uint64)input.commit_scn);
+			break;
+		case 75:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(bytes_are_zero(page + CLUSTER_R4_TX_VERDICT_HEADER_LEN,
+									 BLCKSZ - CLUSTER_R4_TX_VERDICT_HEADER_LEN));
+			break;
+		case 76:
+			input = verdict_resolution(CLUSTER_TX_PREPARED, CLUSTER_TX_PROOF_ITL_CLEANOUT);
+			memset(page, 0xa5, sizeof(page));
+			UT_ASSERT(!ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(bytes_are_zero(page, sizeof(page)));
+			break;
+		case 77:
+			UT_ASSERT(!ClusterR4TxVerdictPageEncode(page, NULL));
+			UT_ASSERT(!ClusterR4TxVerdictPageEncode(NULL, &input));
+			break;
+		case 78:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			page[0] ^= 1;
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			break;
+		case 79:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			page[4]++;
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			break;
+		case 80:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			page[6]++;
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			break;
+		case 81:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			page[10] = 1;
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			break;
+		case 82:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			page[BLCKSZ - 1] = 1;
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			break;
+		case 83:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			input.locator_echo.xid++;
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			break;
+		case 84:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			page[8] = CLUSTER_TX_PREPARED;
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			break;
+		case 85:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			memset(&output, 0xa5, sizeof(output));
+			page[9] = 0xff;
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, &output));
+			UT_ASSERT(bytes_are_zero((const uint8 *)&output, sizeof(output)));
+			break;
+		case 86:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			UT_ASSERT_EQ(ClusterR4WireReadU64(&page[56]), input.authority.origin_epoch);
+			UT_ASSERT_EQ(ClusterR4WireReadU64(&page[64]), input.authority.tt_generation);
+			UT_ASSERT_EQ(ClusterR4WireReadU64(&page[72]), (uint64)input.authority.authority_scn);
+			break;
+		case 87:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			ClusterR4TxVerdictPageEncode(page, &input);
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(NULL, &input.locator_echo, &output));
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, NULL, &output));
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, NULL));
 			break;
 		default:
 			value = UINT64_C(0x0102030405060708) ^ ((uint64)vector << 33)
@@ -268,13 +475,37 @@ DEFINE_WIRE_TEST(60)
 DEFINE_WIRE_TEST(61)
 DEFINE_WIRE_TEST(62)
 DEFINE_WIRE_TEST(63)
+DEFINE_WIRE_TEST(64)
+DEFINE_WIRE_TEST(65)
+DEFINE_WIRE_TEST(66)
+DEFINE_WIRE_TEST(67)
+DEFINE_WIRE_TEST(68)
+DEFINE_WIRE_TEST(69)
+DEFINE_WIRE_TEST(70)
+DEFINE_WIRE_TEST(71)
+DEFINE_WIRE_TEST(72)
+DEFINE_WIRE_TEST(73)
+DEFINE_WIRE_TEST(74)
+DEFINE_WIRE_TEST(75)
+DEFINE_WIRE_TEST(76)
+DEFINE_WIRE_TEST(77)
+DEFINE_WIRE_TEST(78)
+DEFINE_WIRE_TEST(79)
+DEFINE_WIRE_TEST(80)
+DEFINE_WIRE_TEST(81)
+DEFINE_WIRE_TEST(82)
+DEFINE_WIRE_TEST(83)
+DEFINE_WIRE_TEST(84)
+DEFINE_WIRE_TEST(85)
+DEFINE_WIRE_TEST(86)
+DEFINE_WIRE_TEST(87)
 
 #define RUN_WIRE_TEST(n) UT_RUN(test_wire_vector_##n)
 
 int
 main(void)
 {
-	UT_PLAN(64);
+	UT_PLAN(88);
 	RUN_WIRE_TEST(0);
 	RUN_WIRE_TEST(1);
 	RUN_WIRE_TEST(2);
@@ -339,6 +570,30 @@ main(void)
 	RUN_WIRE_TEST(61);
 	RUN_WIRE_TEST(62);
 	RUN_WIRE_TEST(63);
+	RUN_WIRE_TEST(64);
+	RUN_WIRE_TEST(65);
+	RUN_WIRE_TEST(66);
+	RUN_WIRE_TEST(67);
+	RUN_WIRE_TEST(68);
+	RUN_WIRE_TEST(69);
+	RUN_WIRE_TEST(70);
+	RUN_WIRE_TEST(71);
+	RUN_WIRE_TEST(72);
+	RUN_WIRE_TEST(73);
+	RUN_WIRE_TEST(74);
+	RUN_WIRE_TEST(75);
+	RUN_WIRE_TEST(76);
+	RUN_WIRE_TEST(77);
+	RUN_WIRE_TEST(78);
+	RUN_WIRE_TEST(79);
+	RUN_WIRE_TEST(80);
+	RUN_WIRE_TEST(81);
+	RUN_WIRE_TEST(82);
+	RUN_WIRE_TEST(83);
+	RUN_WIRE_TEST(84);
+	RUN_WIRE_TEST(85);
+	RUN_WIRE_TEST(86);
+	RUN_WIRE_TEST(87);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
