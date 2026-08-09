@@ -158,10 +158,27 @@ cluster_scn_current(void)
 	return 400;
 }
 
-bool
-cluster_injection_should_skip(const char *name pg_attribute_unused())
+int cluster_injection_armed_count = 0;
+static bool stub_injection_skip_pending = false;
+static int stub_injection_dispatch_count = 0;
+
+void
+cluster_injection_run(const char *name)
 {
-	return false;
+	UT_ASSERT(strcmp(name, "cluster-wal-state-write-fail") == 0);
+	stub_injection_dispatch_count++;
+	stub_injection_skip_pending = true;
+}
+
+bool
+cluster_injection_should_skip(const char *name)
+{
+	bool should_skip;
+
+	UT_ASSERT(strcmp(name, "cluster-wal-state-write-fail") == 0);
+	should_skip = stub_injection_skip_pending;
+	stub_injection_skip_pending = false;
+	return should_skip;
 }
 
 uint64
@@ -403,6 +420,9 @@ fixture_reset(void)
 	first_slot_read_buffer = NULL;
 	second_slot_read_buffer = NULL;
 	memset(&last_pwrite_image, 0, sizeof(last_pwrite_image));
+	cluster_injection_armed_count = 0;
+	stub_injection_skip_pending = false;
+	stub_injection_dispatch_count = 0;
 }
 
 static ClusterWalStateUpdate
@@ -650,10 +670,26 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
 }
 
+UT_TEST(test_a1_armed_write_fail_dispatches_before_live_rmw_write)
+{
+	ClusterWalStateUpdate update = telemetry_update();
+
+	fixture_reset();
+	cluster_injection_armed_count = 1;
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
+					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+				 (int)CLUSTER_WAL_STATE_UPDATE_IO_ERROR);
+	UT_ASSERT_EQ(stub_injection_dispatch_count, 1);
+	UT_ASSERT_EQ(slot_pread_count, 1);
+	UT_ASSERT_EQ(pwrite_count, 0);
+	UT_ASSERT_EQ(fsync_count, 0);
+	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
+}
+
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 
 	UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
 	UT_RUN(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread);
@@ -661,6 +697,7 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_a1_postread_mismatch_fails_without_compensation);
 	UT_RUN(test_a1_borrow_verified_cf_does_not_reenter_or_unlock);
 	UT_RUN(test_a1_fresh_header_slot_typed_rejections);
+	UT_RUN(test_a1_armed_write_fail_dispatches_before_live_rmw_write);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
