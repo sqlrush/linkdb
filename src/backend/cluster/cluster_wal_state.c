@@ -474,7 +474,8 @@ fill_own_slot(ClusterWalStateSlot *slot, uint32 state, int64 started_at)
  *	56..503) from `prev` into a freshly filled `slot` and recompute the
  *	CRC.  fill memsets the whole slot, so without this every owner write
  *	(publish/refresh/stopped) would zero checkpoint_redo_lsn /
- *	fpw_was_off / merge_recovered_lsn / refresh_interval_ms every tick
+ *	fpw_was_off / the retained merge_recovered_lsn compatibility bytes /
+ *	refresh_interval_ms every tick
  *	(§3.3d.4, round-5 P0-2).  prev must be an OK read-back; on EMPTY/
  *	CORRUPT the region stays zero (the fill default), which classifies
  *	as "unknown" and is fail-closed at the merge gate.
@@ -539,10 +540,10 @@ cluster_wal_state_publish_active(void)
 
 	fill_own_slot(&slot, CLUSTER_WAL_SLOT_STATE_ACTIVE, (int64)GetCurrentTimestamp());
 	/*
-	 * Preserve the 4.5 extension region from the prior incarnation, but
-	 * CLEAR merge_recovered_lsn: reaching RUNNING means this node has
-	 * finished its own recovery, so any coordinator-set authority bound
-	 * is spent (§3.3c).  checkpoint_redo_lsn / fpw_was_off survive.
+	 * Preserve the 4.5 extension region from the prior incarnation, but clear
+	 * the retained merge_recovered_lsn compatibility bytes.  Recovery readers
+	 * already treat them as semantic zero; checkpoint_redo_lsn / fpw_was_off
+	 * survive.
 	 */
 	if (cluster_wal_state_read_slot(cluster_wal_thread_id(), &cur) == CLUSTER_WAL_SLOT_OK)
 		preserve_ext_region(&slot, &cur);
@@ -722,32 +723,6 @@ cluster_wal_state_mark_fpw_off(void)
 				 errmsg("could not record full_page_writes=off in the WAL state registry: %m"),
 				 errhint("Merged recovery treats an unrecorded fpw history "
 						 "conservatively.")));
-}
-
-/*
- * cluster_wal_state_publish_merge_recovered -- §3.3c authority write.
- *	Cross-owner exception: the merge coordinator records recovered_lsn
- *	in a CRASHED peer's slot (the peer is down, so there is no racing
- *	owner write).  Read-modify-preserve so the rest of the peer's slot
- *	is untouched.
- */
-void
-cluster_wal_state_publish_merge_recovered(uint16 thread_id, uint64 recovered_lsn)
-{
-	char path[MAXPGPATH];
-	ClusterWalStateSlot slot;
-
-	if (!registry_configured())
-		return;
-	if (cluster_wal_state_read_slot(thread_id, &slot) != CLUSTER_WAL_SLOT_OK)
-		return;
-	slot.merge_recovered_lsn = recovered_lsn;
-	slot.crc = cluster_wal_state_block_crc(&slot);
-	registry_path(path, sizeof(path));
-	if (!write_block(path, CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id), &slot))
-		ereport(WARNING, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						  errmsg("could not record merged-recovery progress for thread %u: %m",
-								 (unsigned)thread_id)));
 }
 
 /*
