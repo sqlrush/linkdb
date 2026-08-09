@@ -25,10 +25,9 @@
  *	       survivor's checkpointer) and flush the per-origin outcome store BEFORE
  *	       publishing any authority, or a published "recovered" authority could
  *	       outlive un-fsync'd pages.
- *	    5. 3-way authority (Q4) -- only after a full DONE + durable barrier:
- *	       registry merge_recovered_lsn (the dead origin's own-bound skip) then
- *	       the node-local merged.authority (the reader/serving gate, written
- *	       LAST).  partial-apply (v0.3 P2): any failure before that LAST write
+ *	    5. reader authority (Q4) -- only after a full DONE + durable barrier:
+ *	       publish the node-local merged.authority reader/serving gate LAST.
+ *	       partial-apply (v0.3 P2): any failure before that LAST write
  *	       publishes no serving authority, so the thread stays frozen and never
  *	       serves a stale page (8.A).
  *
@@ -78,7 +77,7 @@
 #include "cluster/cluster_recovery_plan.h"	   /* ClusterThreadReplaySlot + slot accessor     */
 #include "cluster/cluster_remote_xact.h"	   /* per-origin outcome store flush              */
 #include "cluster/cluster_thread_recovery.h"   /* engine / driver / pure gates                */
-#include "cluster/cluster_wal_state.h"		   /* slot read + registry skip-bound publish     */
+#include "cluster/cluster_wal_state.h"		   /* replay-window slot read                     */
 #include "cluster/cluster_write_fence.h"	   /* spec-4.12 D6 durable authority verify        */
 #include "cluster/storage/cluster_shared_fs.h" /* CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS         */
 
@@ -280,7 +279,8 @@ cluster_thread_recovery_capability_gate(ClusterThreadRecScope scope)
  *		EXPLICIT (spec-4.11 3b-2).  Online-recover ONE dead thread over
  *		[scan_lower, scan_upper]: drive the combined data + visibility pass under
  *		the R13 harness + episode-fenced online-writer scope; on DONE, issue the
- *		durability barrier and publish the 3-way authority; on BLOCKED, publish
+ *		durability barrier and publish node-local reader authority; on BLOCKED,
+ *		publish
  *		NOTHING and apply the on_unrecoverable policy.  This is what the public
  *		replay_one calls after deriving the window, and the TEST entry (the SRF
  *		drives it with a deterministic window on one machine).
@@ -348,13 +348,13 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 
 		/*
 		 * DONE: data + visibility are applied to shared storage (write-back).
-		 * Durability barrier + 3-way authority publish, under a guard so an I/O
+		 * Durability barrier + node-local authority publish, under a guard so an I/O
 		 * failure demotes to BLOCKED (keep_frozen) instead of crashing the
 		 * survivor (R13).  Order mirrors the cold path (xlogrecovery.c): barrier
-		 * -> registry skip-bound -> node-local reader authority LAST, so a
+		 * -> node-local reader authority LAST, so a
 		 * failure before the reader authority leaves the dead thread un-servable
 		 * (frozen) -- never a stale-page serve.  published stays false unless
-		 * ALL of the barrier + both authority writes succeed.
+		 * the barrier and authority write both succeed.
 		 */
 		PG_TRY();
 		{
@@ -397,11 +397,8 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 			 */
 			cluster_remote_xact_flush();
 
-			/* 3a. registry skip-bound for the dead origin's own self-recovery. */
-			cluster_wal_state_publish_merge_recovered(dead_tid, through);
-
 			/*
-			 * 3b. node-local reader authority LAST (the serving gate the D3
+			 * 3. node-local reader authority LAST (the serving gate the D3
 			 * unfreeze check reads).  Online variant: a failure raises a
 			 * catchable ERROR caught below -> BLOCKED, no serving authority.
 			 */
@@ -597,11 +594,11 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
  * cluster_thread_recovery_local_complete -- the D3 unfreeze precondition
  * (spec-4.11 3b-3): is dead_tid's WAL data online-recovered on THIS node?
  *
- *	Reads the NODE-LOCAL merged materialization authority (Q4 3-way authority,
+ *	Reads the NODE-LOCAL merged materialization authority (Q4 reader authority,
  *	R11): cluster_merged_instance_is_materialized() is the reader gate the
  *	orchestrator publishes to on DONE (cluster_merged_authority_publish_online),
- *	NOT the cluster-wide registry (which is a skip-bound, not a serve gate, and
- *	mixing them would let a peer's self-recovery cut this node's authority).
+ *	NOT the cluster-wide registry.  The retained merge_recovered_lsn bytes in
+ *	that registry are diagnostic-only and cannot grant or cut reader authority.
  *
  *	required_lsn == InvalidXLogRecPtr asks only "materialized at all" (the
  *	node-level question the reconfig FSM uses); a real required_lsn additionally

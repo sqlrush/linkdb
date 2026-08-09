@@ -103,17 +103,12 @@
  *	Modified by: SqlRush <sqlrush@gmail.com>
  *
  *	What changed:  1. The merged-loop §3.3e classification is extracted
- *	               into cluster_record_apply_class (shared with the new
- *	               §3.3c gate).  2. ApplyWalRecord skips rm_redo (and the
- *	               consistency check) for this node's OWN shared-block
- *	               records at or below merge_recovered_lsn -- a peer's
- *	               merged replay already drove those pages in global SCN
- *	               order; re-applying would regress them.  3. The merged
+ *	               into cluster_record_apply_class.  2. The merged
  *	               foreign path applies MATERIALIZE_LOCAL records
  *	               (RM_CLUSTER_UNDO) so a peer's undo materializes into
  *	               the local pg_undo/instance_<owner> tree.
  *	Why:           spec-4.5a-shared-storage-data-backend.md §0 G2 +
- *	               §3.3a/§3.3c (P0-3).
+ *	               §3.3a (P0-3).
  *
  * PGRAC MODIFICATIONS (spec-6.14 D9 amend, INV-D9-R)
  *	Modified by: SqlRush <sqlrush@gmail.com>
@@ -518,13 +513,8 @@ static bool recoveryStopAfter;
 /* prototypes for local functions */
 static void ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *replayTLI);
 #ifdef USE_PGRAC_CLUSTER
-/* PGRAC: spec-4.5a -- shared §3.3e classification (merged loop + §3.3c). */
+/* PGRAC: spec-4.5a -- shared §3.3e classification for the merged loop. */
 static ClusterRecoveryRecordClass cluster_record_apply_class(XLogReaderState *r);
-/* PGRAC: spec-4.5a §3.3c -- own-LSN bound: this node's stream was already
- * merged-recovered by a peer through this LSN; own shared-block records at
- * or below it must NOT be re-applied (they would regress shared pages that
- * carry NEWER cross-thread state).  0 = never merged / not configured. */
-static uint64 cluster_recovery_own_merge_bound = 0;
 /* PGRAC: spec-6.4 INV-ADG5 -- the apply-master term this startup process has
  * already applied records under.  0 = nothing applied yet.  Once set, losing
  * the lease or seeing a different term is a FATAL fail-stop (P0-1): cached
@@ -2449,27 +2439,25 @@ PerformWalRecovery(void)
 								(int) cluster_engage)));
 
 	/*
-	 * PGRAC: spec-4.5a §3.3c -- read this node's own merge_recovered_lsn
-	 * once.  Non-zero means a peer's merged replay already recovered this
-	 * stream's shared blocks; ApplyWalRecord skips own SHARED-class
-	 * records at or below the bound (G/L records still apply: the peer
-	 * diverted our XACT/CLOG away from its own pg_xact and skipped our
-	 * node-local records, so those are still ours to replay).
+	 * RF A1 W6: merge_recovered_lsn is a retained on-disk compatibility
+	 * field, not replay authority.  Surface a historical raw value for
+	 * diagnosis, but never derive a skip bound from it: this node always
+	 * replays its retained own WAL.
 	 */
-	cluster_recovery_own_merge_bound = 0;
 	if (cluster_wal_threads_dir != NULL && cluster_wal_threads_dir[0] != '\0') {
 		uint16		own_tid = cluster_wal_thread_id();
 		ClusterWalStateSlot own_slot;
 
 		if (own_tid != XLP_THREAD_ID_LEGACY
 			&& cluster_wal_state_read_slot(own_tid, &own_slot) == CLUSTER_WAL_SLOT_OK)
-			cluster_recovery_own_merge_bound = own_slot.merge_recovered_lsn;
+		{
+			if (own_slot.merge_recovered_lsn > 0)
+				ereport(LOG,
+						(errmsg("cluster recovery: historical merge_recovered_lsn %X/%X "
+								"is raw_ignored; retained own WAL will be replayed",
+								LSN_FORMAT_ARGS((XLogRecPtr) own_slot.merge_recovered_lsn))));
+		}
 	}
-	if (cluster_recovery_own_merge_bound > 0)
-		ereport(LOG,
-				(errmsg("cluster recovery: own stream was merged-recovered through %X/%X; "
-						"own shared-block records at or below that point will be skipped",
-						LSN_FORMAT_ARGS((XLogRecPtr) cluster_recovery_own_merge_bound))));
 
 	/*
 	 * PGRAC (spec-5.7 D3 §3.1b R3/R6): load this node's HW relation-extend
@@ -2794,8 +2782,9 @@ cluster_merged_redo_done:;
  *	recovery-progress globals track the OWN thread only -- foreign
  *	streams are applied but do not extend this node's WAL (the gate
  *	already excludes archive/standby, the single-LSN-space consumers).
- *	Per candidate, merge_recovered_lsn is published for its later
- *	self-recovery (§3.3c).
+ *	Per-candidate serving authority is node-local; the registry's retained
+ *	merge_recovered_lsn compatibility bytes are never read or written as
+ *	recovery authority.
  */
 static XLogRecPtr
 cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
@@ -2909,20 +2898,16 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 	cluster_remote_xact_flush();
 
 	/*
-	 * §3.3c: record how far each candidate was replayed.  The live-crash
-	 * registry bound feeds the candidate's own-bound skip (it clears it on
-	 * reaching RUNNING), so restore-mode must not publish it.  The node-local
-	 * reader-authority marker is different: it proves THIS restored pgdata
-	 * materialized the peer's undo + outcome store, so restore-mode needs it
-	 * just like crash merged recovery or post-open reads fail closed.
+	 * Publish the node-local reader-authority marker.  It proves THIS restored
+	 * pgdata materialized the peer's undo + outcome store, so restore-mode needs
+	 * it just like crash merged recovery or post-open reads fail closed.  The
+	 * registry merge_recovered_lsn compatibility field is deliberately untouched.
 	 */
 	for (t = 1; t <= CLUSTER_WAL_STATE_SLOT_COUNT; t++) {
 		if (t == own_thread)
 			continue;
 		if ((bitmap[(t - 1) / 64] & ((uint64)1 << ((t - 1) % 64))) == 0)
 			continue;
-		if (!restore_mode)
-			cluster_wal_state_publish_merge_recovered(t, max_recovered[t]);
 		if (max_recovered[t] > 0)
 			cluster_merged_authority_publish((int)t - 1, max_recovered[t]);
 	}
@@ -3158,7 +3143,7 @@ cluster_adg_streaming_replay(XLogPrefetcher *xlogprefetcher, XLogReaderState *xl
 #ifdef USE_PGRAC_CLUSTER
 /*
  * cluster_record_apply_class -- §3.3e classification of the decoded record
- *	(spec-4.5 merged loop + spec-4.5a §3.3c own-bound skip share this).
+ *	for the spec-4.5 merged loop.
  *
  *	Walks the record's block refs through the smgr routing predicate:
  *	a mixed shared/local set is UNCLASSIFIABLE; otherwise the class is
@@ -3371,43 +3356,16 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 	if (record->xl_rmid == RM_XLOG_ID)
 		xlogrecovery_redo(xlogreader, *replayTLI);
 
-	/* Now apply the WAL record itself */
-	{
-		bool		cluster_skip_redo = false;
+	/* Now apply the WAL record itself. */
+	GetRmgr(record->xl_rmid).rm_redo(xlogreader);
 
-#ifdef USE_PGRAC_CLUSTER
-		/*
-		 * PGRAC: spec-4.5a §3.3c -- own-LSN-bound shared-block skip.  A
-		 * peer's merged replay already drove this stream's SHARED blocks
-		 * (in cross-thread SCN order) through merge_recovered_lsn;
-		 * re-applying our own copies would regress those pages.  G/L
-		 * records still apply.  The consistency check is skipped with the
-		 * redo: the backup image predates the merged state by design.
-		 */
-		if (cluster_recovery_own_merge_bound > 0
-			&& xlogreader->EndRecPtr <= (XLogRecPtr) cluster_recovery_own_merge_bound
-			&& cluster_record_apply_class(xlogreader) == CLUSTER_RECMERGE_SHARED)
-		{
-			cluster_skip_redo = true;
-			cluster_vis_bump_merged_own_bound_skips(); /* D11 */
-			elog(DEBUG2, "cluster recovery: skipping merged-recovered shared record at %X/%X",
-				 LSN_FORMAT_ARGS(xlogreader->ReadRecPtr));
-		}
-#endif
-
-		if (!cluster_skip_redo)
-		{
-			GetRmgr(record->xl_rmid).rm_redo(xlogreader);
-
-			/*
-			 * After redo, check whether the backup pages associated with the
-			 * WAL record are consistent with the existing pages. This check
-			 * is done only if consistency check is enabled for this record.
-			 */
-			if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
-				verifyBackupPageConsistency(xlogreader);
-		}
-	}
+	/*
+	 * After redo, check whether the backup pages associated with the
+	 * WAL record are consistent with the existing pages. This check
+	 * is done only if consistency check is enabled for this record.
+	 */
+	if ((record->xl_info & XLR_CHECK_CONSISTENCY) != 0)
+		verifyBackupPageConsistency(xlogreader);
 
 	/* Pop the error context stack */
 	error_context_stack = errcallback.previous;

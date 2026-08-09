@@ -124,10 +124,9 @@ typedef struct ClusterWalStateSlot {
 								 * full_page_writes on->off path; never auto
 								 * cleared.  Any merge-set thread set -> 53RA3
 								 * (§3.3d.3). */
-	uint64 merge_recovered_lsn; /* 72: recovery authority (§3.3c) -- own-LSN
-								 * skip bound for the candidate's later self
-								 * recovery.  Writer: coordinator; owner
-								 * clears at RUNNING publish. */
+	uint64 merge_recovered_lsn; /* 72: retained on-disk compatibility bytes;
+								 * historical nonzero values are diagnostic-only
+								 * and semantic zero to recovery readers. */
 	char _reserved[424];		/* 80: remaining headroom */
 	uint32 crc;					/* crc32c over bytes [0, 504) */
 	char _pad_508[4];
@@ -518,12 +517,6 @@ extern void cluster_wal_state_publish_stopped(void);
  * Both best-effort: failure WARNs, never blocks. */
 extern void cluster_wal_state_publish_checkpoint_redo(uint64 redo_lsn, uint64 flushed_lsn);
 extern void cluster_wal_state_mark_fpw_off(void);
-
-/* spec-4.5 §3.3c: coordinator records how far it replayed a crashed
- * peer's stream, so the peer's later self-recovery enters post-merged
- * mode (own-LSN-bound skip).  The only legitimate cross-owner write,
- * confined to the merged-recovery window. */
-extern void cluster_wal_state_publish_merge_recovered(uint16 thread_id, uint64 recovered_lsn);
 
 /* cluster_stats periodic refresh (best-effort: LOG-once + counter on
  * failure, never FATAL). */
