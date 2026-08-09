@@ -1,1 +1,4 @@
 proof_id	symbol	defining_object	allowed_reference_objects
+JIT-T3-PAGEVERSION-EQUAL-OWNER	rf_page_version_equal_v1	src/bin/pg_waldump/xlogreader.o	src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o
+JIT-T3-EDGE-ENCODER-OWNER	XLogEncodePageVersionEdgeV1	src/backend/access/transam/xloginsert.o	src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o
+JIT-T3-SPACE-IDENTITY-OWNER	cluster_space_identity_equal	src/backend/cluster/cluster_space_codec.o	src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o

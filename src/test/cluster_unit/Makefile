@@ -261,7 +261,7 @@ $(JIT_T3_SPACE_CODEC_O):
 	$(MAKE) -C $(top_builddir)/src/backend/cluster cluster_space_codec.o
 
 test_cluster_jit_t3_interface_capability: \
-		test_cluster_jit_t3_interface_capability.c $(JIT_T3_INTERFACE_OBJS)
+		test_cluster_jit_t3_interface_capability.o $(JIT_T3_INTERFACE_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(JIT_T3_INTERFACE_OBJS) \
 		$(LDFLAGS) $(LDFLAGS_EX) -Wl,-dead_strip $(LIBS) -o $@
