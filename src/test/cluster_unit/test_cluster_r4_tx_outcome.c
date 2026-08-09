@@ -583,9 +583,35 @@ UT_TEST(test_exact_origin_prepared_finish_abort_terminal_wins)
 	UT_ASSERT_EQ(test_twophase_calls, 1);
 }
 
-UT_TEST(test_exact_origin_nested_subcommitted_uses_revalidated_top_commit)
+UT_TEST(test_exact_origin_prepared_finish_commit_without_exact_scn_fails_closed)
 {
 	ClusterTxResolution resolution;
+	ClusterTxResolution zero = {0};
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_IN_PROGRESS);
+	set_native_status_sample(1, TEST_ORIGIN_XID, TRANSACTION_STATUS_COMMITTED);
+	test_twophase_prepared = true;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_COVERAGE_GAP);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_native_status_calls, 2);
+	UT_ASSERT_EQ(test_twophase_calls, 1);
+}
+
+UT_TEST(test_exact_origin_nested_subcommitted_top_commit_without_locator_fails_closed)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = {0};
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 	TransactionId parent = TEST_ORIGIN_XID - 1;
 	TransactionId top = TEST_ORIGIN_XID - 2;
@@ -600,13 +626,73 @@ UT_TEST(test_exact_origin_nested_subcommitted_uses_revalidated_top_commit)
 	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
 					 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, test_formation_epoch,
 					 &resolution, &reason),
-				 CLUSTER_TX_COMMITTED);
-	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
-	UT_ASSERT_EQ((int)resolution.top_xid, (int)top);
-	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP);
-	UT_ASSERT_EQ(resolution.commit_scn, test_commit_scn);
+				 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_COVERAGE_GAP);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
 	UT_ASSERT_EQ(test_subtrans_parent_calls, 6);
 	UT_ASSERT_EQ(test_twophase_calls, 0);
+}
+
+UT_TEST(test_exact_origin_subcommitted_top_aborted_is_terminal)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	TransactionId top = TEST_ORIGIN_XID - 1;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_subtrans_chain[0] = TEST_ORIGIN_XID;
+	test_subtrans_chain[1] = top;
+	test_subtrans_chain_count = 2;
+	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_SUB_COMMITTED);
+	set_native_status_sample(1, top, TRANSACTION_STATUS_ABORTED);
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ((int)resolution.top_xid, (int)top);
+	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP);
+	UT_ASSERT_EQ(resolution.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(test_native_status_calls, 2);
+	UT_ASSERT_EQ(test_subtrans_parent_calls, 4);
+	UT_ASSERT_EQ(test_twophase_calls, 0);
+}
+
+UT_TEST(test_exact_origin_subcommitted_top_in_progress_stays_live)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	TransactionId top = TEST_ORIGIN_XID - 1;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_subtrans_chain[0] = TEST_ORIGIN_XID;
+	test_subtrans_chain[1] = top;
+	test_subtrans_chain_count = 2;
+	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_SUB_COMMITTED);
+	set_native_status_sample(1, top, TRANSACTION_STATUS_IN_PROGRESS);
+	set_native_status_sample(2, top, TRANSACTION_STATUS_IN_PROGRESS);
+	test_twophase_xid = top;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_IN_PROGRESS);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ((int)resolution.top_xid, (int)top);
+	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_IN_PROGRESS);
+	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP);
+	UT_ASSERT_EQ(resolution.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(test_native_status_calls, 3);
+	UT_ASSERT_EQ(test_subtrans_parent_calls, 4);
+	UT_ASSERT_EQ(test_twophase_calls, 1);
 }
 
 UT_TEST(test_exact_origin_subcommitted_top_prepared_stays_live)
@@ -689,6 +775,30 @@ UT_TEST(test_exact_origin_subtrans_cycle_fails_closed)
 	UT_ASSERT_EQ(test_twophase_calls, 0);
 }
 
+UT_TEST(test_exact_origin_subcommitted_before_transaction_xmin_fails_closed)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = {0};
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	TransactionXmin = TEST_ORIGIN_XID + 1;
+	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_SUB_COMMITTED);
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_COVERAGE_GAP);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_native_status_calls, 1);
+	UT_ASSERT_EQ(test_subtrans_parent_calls, 0);
+	UT_ASSERT_EQ(test_twophase_calls, 0);
+}
+
 UT_TEST(test_exact_origin_subtrans_depth_fails_closed)
 {
 	ClusterTxResolution resolution;
@@ -718,7 +828,7 @@ UT_TEST(test_exact_origin_subtrans_depth_fails_closed)
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(57);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -767,10 +877,14 @@ main(void)
 	UT_RUN(test_exact_origin_active_and_native_in_progress_stays_live);
 	UT_RUN(test_exact_origin_prepared_is_distinct_live_outcome);
 	UT_RUN(test_exact_origin_prepared_finish_abort_terminal_wins);
-	UT_RUN(test_exact_origin_nested_subcommitted_uses_revalidated_top_commit);
+	UT_RUN(test_exact_origin_prepared_finish_commit_without_exact_scn_fails_closed);
+	UT_RUN(test_exact_origin_nested_subcommitted_top_commit_without_locator_fails_closed);
+	UT_RUN(test_exact_origin_subcommitted_top_aborted_is_terminal);
+	UT_RUN(test_exact_origin_subcommitted_top_in_progress_stays_live);
 	UT_RUN(test_exact_origin_subcommitted_top_prepared_stays_live);
 	UT_RUN(test_exact_origin_subtrans_edge_change_fails_closed);
 	UT_RUN(test_exact_origin_subtrans_cycle_fails_closed);
+	UT_RUN(test_exact_origin_subcommitted_before_transaction_xmin_fails_closed);
 	UT_RUN(test_exact_origin_subtrans_depth_fails_closed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
