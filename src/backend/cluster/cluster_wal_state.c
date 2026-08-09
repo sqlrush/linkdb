@@ -495,7 +495,6 @@ write_own_slot(const ClusterWalStateSlot *slot)
 	char path[MAXPGPATH];
 
 	/* Decision-style injection (spec-4.2 D5): simulate a write failure. */
-	CLUSTER_INJECTION_POINT("cluster-wal-state-write-fail");
 	if (cluster_injection_should_skip("cluster-wal-state-write-fail"))
 		return false;
 
