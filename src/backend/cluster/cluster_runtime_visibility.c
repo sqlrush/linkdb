@@ -174,6 +174,10 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 				&& native_status == TRANSACTION_STATUS_IN_PROGRESS)) {
 			outcome = CLUSTER_TX_ABORTED;
 			commit_scn = InvalidScn;
+		} else if (exact_slot.status == TT_SLOT_ACTIVE
+				   && native_status == TRANSACTION_STATUS_IN_PROGRESS) {
+			outcome = CLUSTER_TX_IN_PROGRESS;
+			commit_scn = InvalidScn;
 		} else {
 			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 			goto unknown;
