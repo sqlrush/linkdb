@@ -46,6 +46,7 @@ static int test_epoch_pos;
 static PcmXQueueResult test_guard_result;
 static NodeId test_uba_origin;
 static bool test_wfg_accept;
+static bool test_wfg_live;
 static int test_wfg_submit_calls;
 static int test_wfg_cancel_calls;
 static ClusterLmdVertex test_wfg_waiter;
@@ -201,6 +202,8 @@ cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter,
 	test_wfg_waiter = *waiter;
 	test_wfg_blocker = *blocker;
 	UT_ASSERT_EQ(request_id, 0);
+	if (test_wfg_accept)
+		test_wfg_live = true;
 	return test_wfg_accept;
 }
 
@@ -209,6 +212,7 @@ cluster_lmd_cancel_wait_edge_real(const ClusterLmdVertex *waiter)
 {
 	test_wfg_cancel_calls++;
 	UT_ASSERT_EQ(memcmp(waiter, &test_wfg_waiter, sizeof(*waiter)), 0);
+	test_wfg_live = false;
 }
 
 void
@@ -343,6 +347,7 @@ reset_fixture(void)
 	test_guard_result = PCM_X_QUEUE_OK;
 	test_uba_origin = 0;
 	test_wfg_accept = true;
+	test_wfg_live = false;
 	test_wfg_submit_calls = 0;
 	test_wfg_cancel_calls = 0;
 	memset(&test_wfg_waiter, 0, sizeof(test_wfg_waiter));
@@ -652,7 +657,6 @@ extern void cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code, Datum 
 UT_TEST(test_backend_exit_cleans_exact_target_and_allows_procno_reuse)
 {
 	ClusterTxLocator locator = test_locator();
-	ClusterTTStatusKey source = test_source_key();
 	ClusterLmdVertex waiter;
 	ClusterLmdVertex blocker;
 	uint64 wait_seq;
@@ -668,7 +672,9 @@ UT_TEST(test_backend_exit_cleans_exact_target_and_allows_procno_reuse)
 
 	cluster_tx_enqueue_cleanup_on_backend_exit_callback(0, (Datum)0);
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 1);
+	UT_ASSERT(!test_wfg_live);
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_wait_read_result, CLUSTER_LMD_WAIT_STATE_READ_INACTIVE);
 	assert_slot_clean();
 
 	/* Re-entry after cleanup is a no-op, and the reused procno is writable. */
@@ -678,11 +684,37 @@ UT_TEST(test_backend_exit_cleans_exact_target_and_allows_procno_reuse)
 	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
 	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
 	txw_slot_clear(0);
+}
 
-	/* SOURCE belongs to the legacy waiter and must not be touched by D9. */
+UT_TEST(test_backend_exit_cleans_exact_source_and_allows_procno_reuse)
+{
+	ClusterTxLocator locator = test_locator();
+	ClusterTTStatusKey source = test_source_key();
+	ClusterLmdVertex waiter;
+	ClusterLmdVertex blocker;
+	uint64 wait_seq;
+
+	reset_fixture();
 	txw_slot_set(0, &source);
+	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait,
+										  CLUSTER_LMD_WAIT_TX, 0, TEST_EPOCH,
+										  test_local_xid);
+	txw_exact_waiter_vertex(&waiter, 0, TEST_EPOCH, test_local_xid, wait_seq);
+	memset(&blocker, 0, sizeof(blocker));
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&waiter, &blocker, 0));
+
 	cluster_tx_enqueue_cleanup_on_backend_exit_callback(0, (Datum)0);
-	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, CLUSTER_TXW_SLOT_SOURCE);
+	UT_ASSERT_EQ(test_wfg_cancel_calls, 1);
+	UT_ASSERT(!test_wfg_live);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_wait_read_result, CLUSTER_LMD_WAIT_STATE_READ_INACTIVE);
+	assert_slot_clean();
+
+	/* A duplicate callback is harmless and the procno can be reused now. */
+	cluster_tx_enqueue_cleanup_on_backend_exit_callback(0, (Datum)0);
+	UT_ASSERT_EQ(test_wfg_cancel_calls, 1);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
 	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
 	txw_slot_clear(0);
 }
@@ -690,7 +722,7 @@ UT_TEST(test_backend_exit_cleans_exact_target_and_allows_procno_reuse)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);
@@ -707,6 +739,7 @@ main(void)
 	UT_RUN(test_error_longjmp_runs_same_cleanup_funnel);
 	UT_RUN(test_hint_waker_matches_source_discriminant_only);
 	UT_RUN(test_backend_exit_cleans_exact_target_and_allows_procno_reuse);
+	UT_RUN(test_backend_exit_cleans_exact_source_and_allows_procno_reuse);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
