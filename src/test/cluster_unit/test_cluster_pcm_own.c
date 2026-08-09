@@ -22,7 +22,11 @@
 
 #include "unit_test.h"
 
+#include <errno.h>
 #include <limits.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 UT_DEFINE_GLOBALS();
 
@@ -39,6 +43,167 @@ static void assert_ordered_in_function(const char *source, const char *function_
 									   const char *function_end, const char *const *needles,
 									   int needle_count);
 static void assert_source_range_contains(const char *start, const char *end, const char *needle);
+
+static bool
+pipe_read_byte(int fd)
+{
+	char byte;
+	ssize_t nread;
+
+	do {
+		nread = read(fd, &byte, 1);
+	} while (nread < 0 && errno == EINTR);
+	return nread == 1;
+}
+
+static bool
+pipe_write_byte(int fd)
+{
+	const char byte = 'x';
+	ssize_t nwritten;
+
+	do {
+		nwritten = write(fd, &byte, 1);
+	} while (nwritten < 0 && errno == EINTR);
+	return nwritten == 1;
+}
+
+typedef struct ParallelStableCoverRace {
+	ClusterPcmOwnEntry entries[4];
+	pg_atomic_uint32 descriptor_state;
+	ClusterPcmOwnResult begin_result;
+	ClusterPcmOwnResult commit_result;
+	uint64 token;
+	uint64 committed_generation;
+} ParallelStableCoverRace;
+
+static void
+parallel_stable_cover_race_init(ParallelStableCoverRace *race)
+{
+	int i;
+
+	memset(race, 0, sizeof(*race));
+	for (i = 0; i < lengthof(race->entries); i++) {
+		pg_atomic_init_u64(&race->entries[i].generation, 0);
+		pg_atomic_init_u64(&race->entries[i].reservation_token, 0);
+		pg_atomic_init_u64(&race->entries[i].writer_activation_token, 0);
+		pg_atomic_init_u32(&race->entries[i].flags, 0);
+	}
+	pg_atomic_init_u32(&race->descriptor_state, (uint32)PCM_STATE_N);
+}
+
+static void
+parallel_stable_cover_child(ParallelStableCoverRace *race, int start_fd, int done_fd)
+{
+	if (!pipe_read_byte(start_fd))
+		_exit(10);
+	race->begin_result = cluster_pcm_own_reservation_begin_exact(
+		0, 0, PCM_OWN_FLAG_GRANT_PENDING, &race->token);
+	if (race->begin_result == CLUSTER_PCM_OWN_OK)
+		race->commit_result = cluster_pcm_own_grant_commit_exact(
+			0, 0, race->token, &race->committed_generation);
+	if (race->commit_result == CLUSTER_PCM_OWN_OK)
+		pg_atomic_write_u32(&race->descriptor_state, (uint32)PCM_STATE_S);
+	if (!pipe_write_byte(done_fd))
+		_exit(11);
+	close(start_fd);
+	close(done_fd);
+	_exit(0);
+}
+
+static ParallelStableCoverRace *
+run_parallel_stable_cover_race(void)
+{
+	ParallelStableCoverRace *race;
+	int start_pipe[2] = { -1, -1 };
+	int done_pipe[2] = { -1, -1 };
+	int status;
+	int rc;
+	pid_t child;
+
+	race = mmap(NULL, sizeof(*race), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+	UT_ASSERT(race != MAP_FAILED);
+	if (race == MAP_FAILED)
+		return NULL;
+	parallel_stable_cover_race_init(race);
+	ClusterPcmOwnArray = race->entries;
+
+	rc = pipe(start_pipe);
+	UT_ASSERT_EQ(rc, 0);
+	if (rc != 0)
+		goto fail;
+	rc = pipe(done_pipe);
+	UT_ASSERT_EQ(rc, 0);
+	if (rc != 0)
+		goto fail;
+
+	UT_ASSERT_EQ(pg_atomic_read_u32(&race->descriptor_state), (uint32)PCM_STATE_N);
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child < 0)
+		goto fail;
+	if (child == 0) {
+		close(start_pipe[1]);
+		close(done_pipe[0]);
+		parallel_stable_cover_child(race, start_pipe[0], done_pipe[1]);
+	}
+	close(start_pipe[0]);
+	close(done_pipe[1]);
+	UT_ASSERT(pipe_write_byte(start_pipe[1]));
+	close(start_pipe[1]);
+	UT_ASSERT(pipe_read_byte(done_pipe[0]));
+	close(done_pipe[0]);
+	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+	UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	return race;
+
+fail:
+	if (start_pipe[0] >= 0)
+		close(start_pipe[0]);
+	if (start_pipe[1] >= 0)
+		close(start_pipe[1]);
+	if (done_pipe[0] >= 0)
+		close(done_pipe[0]);
+	if (done_pipe[1] >= 0)
+		close(done_pipe[1]);
+	ClusterPcmOwnArray = NULL;
+	munmap(race, sizeof(*race));
+	return NULL;
+}
+
+static void
+assert_parallel_stable_cover_wiring(const char *source)
+{
+	static const char *const locked_begin_contract[]
+		= { "*out_token = 0", "LockBufHdr", "cluster_pcm_own_snapshot_locked",
+			"cluster_pcm_x_cached_cover_reverify_accepts(", "*out_covered = true",
+			"cluster_pcm_own_reservation_begin_exact", "UnlockBufHdr" };
+	static const char *const retry_cover_contract[]
+		= { "cluster_bufmgr_pcm_begin_grant_reservation_wait(", "buf, pcm_mode",
+			"&begin_covered", "if (begin_covered)",
+			"*covered_generation = base->generation",
+			"return CLUSTER_BUFMGR_PCM_RETRY_COVERED" };
+	static const char *const initial_cover_contract[]
+		= { "cluster_bufmgr_pcm_begin_grant_reservation_wait(", "buf, pcm_mode",
+			"&pcm_covered", "if (pcm_covered)",
+			"pcm_covered_gen = pcm_pending_base.generation", "goto pcm_legacy_acquire_done" };
+	static const char *const revalidate_cover_contract[]
+		= { "cluster_bufmgr_pcm_begin_grant_reservation_wait(", "buf, pcm_mode",
+			"&pcm_covered", "if (pcm_covered)",
+			"pcm_covered_gen = pcm_pending_base.generation",
+			"goto pcm_revalidate_acquire_done" };
+
+	assert_ordered_in_function(source, "\ncluster_pcm_own_begin_grant_reservation(",
+							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_begin_x_reservation(",
+							   locked_begin_contract, lengthof(locked_begin_contract));
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_retry_denied_rearm(", "\nstatic ",
+							   retry_cover_contract, lengthof(retry_cover_contract));
+	assert_ordered_in_function(source, "Legacy acquire path:", "pcm_legacy_acquire_done:",
+							   initial_cover_contract, lengthof(initial_cover_contract));
+	assert_ordered_in_function(source, "cluster_pcm_note_writer_cover_stale_detected();",
+							   "pcm_revalidate_acquire_done:", revalidate_cover_contract,
+							   lengthof(revalidate_cover_contract));
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -417,6 +582,69 @@ UT_TEST(test_s_new_fresh_token_finish_shape_stays_invalid)
 	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	UT_ASSERT_EQ(cluster_pcm_x_grant_reservation_kind(&live, &base, 6),
 				 CLUSTER_PCM_X_GRANT_RESERVATION_INVALID);
+}
+
+UT_TEST(test_parallel_s_cover_is_rechecked_before_legacy_token_mint)
+{
+	ParallelStableCoverRace *race;
+	ClusterPcmOwnSnapshot base;
+	ClusterPcmOwnSnapshot live;
+	char *source;
+	uint64 fresh_token = 0;
+
+	/* The requester performs the optimistic probe before the peer publishes
+	 * the compatible S grant for the same buffer. */
+	race = run_parallel_stable_cover_race();
+	if (race == NULL)
+		return;
+	UT_ASSERT_EQ(race->begin_result, CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(race->commit_result, CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(race->token, 1);
+	UT_ASSERT_EQ(race->committed_generation, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&race->descriptor_state), (uint32)PCM_STATE_S);
+	assert_entry(1, 1, 0);
+
+	/* This is the exact entrance-race failure shape.  If bufmgr does not
+	 * consume the stable cover under header authority, the raw begin can mint
+	 * token 2 and strict finish correctly rejects the resulting S_NEW tuple. */
+	memset(&base, 0, sizeof(base));
+	base.generation = 1;
+	base.reservation_token = 1;
+	base.pcm_state = (uint8)PCM_STATE_S;
+	UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(
+					 0, 1, PCM_OWN_FLAG_GRANT_PENDING, &fresh_token),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(fresh_token, 2);
+	assert_entry(1, 2, PCM_OWN_FLAG_GRANT_PENDING);
+	live = base;
+	live.reservation_token = fresh_token;
+	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	UT_ASSERT_EQ(cluster_pcm_x_grant_reservation_kind(&live, &base, fresh_token),
+				 CLUSTER_PCM_X_GRANT_RESERVATION_INVALID);
+
+	/* Exercise the production cover predicate directly.  S readers may accept
+	 * a stable successor generation; X writers remain generation-exact. */
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, 1, 1, (uint8)PCM_STATE_S, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, 1, 1, (uint8)PCM_STATE_S,
+		PCM_OWN_FLAG_GRANT_PENDING));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_X, 1, 1, (uint8)PCM_STATE_S, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_X, 1, 2, (uint8)PCM_STATE_X, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
+		(uint8)PCM_LOCK_MODE_S, 1, 2, (uint8)PCM_STATE_S, 0));
+
+	/* bufmgr is not standalone-linkable; keep only narrow wiring pins around
+	 * the real helper above.  All three legacy callers must propagate COVERED
+	 * to the existing content-lock revalidation path without a master call. */
+	source = read_bufmgr_source();
+	assert_parallel_stable_cover_wiring(source);
+	free(source);
+
+	ClusterPcmOwnArray = NULL;
+	UT_ASSERT_EQ(munmap(race, sizeof(*race)), 0);
 }
 
 UT_TEST(test_share_cover_reverify_accepts_stable_successor_grant)
@@ -2736,7 +2964,7 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(61);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_writer_activation_fence_blocks_revoke_until_exact_clear);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
@@ -2745,6 +2973,7 @@ main(void)
 	UT_RUN(test_s_revoke_handoff_reuses_exact_token_and_bumps_once);
 	UT_RUN(test_revoke_handoff_kinds_cover_n_s_x_with_one_lifecycle);
 	UT_RUN(test_s_new_fresh_token_finish_shape_stays_invalid);
+	UT_RUN(test_parallel_s_cover_is_rechecked_before_legacy_token_mint);
 	UT_RUN(test_share_cover_reverify_accepts_stable_successor_grant);
 	UT_RUN(test_retained_release_retag_respects_pin_contract);
 	UT_RUN(test_retained_release_and_finish_never_cover_invalid_bytes);
