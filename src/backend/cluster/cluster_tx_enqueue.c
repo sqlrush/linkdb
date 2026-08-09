@@ -225,6 +225,40 @@ txw_slot_clear(int procno)
 	LWLockRelease(&ClusterTxw->lock);
 }
 
+static uint32
+txw_slot_kind(int procno)
+{
+	uint32 kind;
+
+	LWLockAcquire(&ClusterTxw->lock, LW_SHARED);
+	kind = ClusterTxw->slots[procno].waiting;
+	LWLockRelease(&ClusterTxw->lock);
+	return kind;
+}
+
+static void
+txw_exit_slot_clear_if_same(int procno, uint32 expected_kind)
+{
+	uint32 active;
+	uint32 current_kind;
+
+	Assert(expected_kind == CLUSTER_TXW_SLOT_SOURCE
+		   || expected_kind == CLUSTER_TXW_SLOT_TARGET);
+	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
+	current_kind = ClusterTxw->slots[procno].waiting;
+	if (current_kind == expected_kind) {
+		active = pg_atomic_read_u32(&ClusterTxw->active_waiters);
+		Assert(active > 0);
+		if (active > 0) {
+			ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_FREE;
+			pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
+		}
+	}
+	else
+		Assert(current_kind == CLUSTER_TXW_SLOT_FREE);
+	LWLockRelease(&ClusterTxw->lock);
+}
+
 static void
 txw_exact_waiter_vertex(ClusterLmdVertex *waiter, int procno, uint64 formation_epoch,
 						TransactionId xid, uint64 wait_seq)
@@ -253,6 +287,57 @@ txw_exact_cleanup(int procno, bool slot_registered, bool wait_state_published,
 		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 	if (slot_registered)
 		txw_slot_clear(procno);
+}
+
+/*
+ * Stack cleanup closes normal and ERROR exits from both wait paths, but
+ * proc_exit/FATAL abandons that C stack.  InitPostgres registers this
+ * callback while shared memory and MyProc are still available.  SOURCE and
+ * TARGET are the exact ownership discriminators; FREE remains a no-op.
+ *
+ * The owning backend cannot publish another wait while its exit callbacks
+ * run, and PGPROC reuse starts only after they finish.  Therefore the stable
+ * wait-state snapshot belongs to this SOURCE or TARGET slot.  Cancellation is
+ * safe even when exit happened between wait-state publication and WFG edge
+ * insertion because cancellation of an absent exact edge is idempotent.
+ */
+void
+cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code pg_attribute_unused(),
+												  Datum arg pg_attribute_unused())
+{
+	ClusterLmdWaitStateSnapshot wait_state;
+	ClusterLmdWaitStateReadResult read_result;
+	uint32 slot_kind;
+	int procno;
+
+	if (ClusterTxw == NULL || MyProc == NULL)
+		return;
+
+	procno = MyProc->pgprocno;
+	if (procno < 0 || procno >= ClusterTxw->nslots)
+		return;
+	slot_kind = txw_slot_kind(procno);
+	if (slot_kind != CLUSTER_TXW_SLOT_SOURCE && slot_kind != CLUSTER_TXW_SLOT_TARGET)
+		return;
+
+	memset(&wait_state, 0, sizeof(wait_state));
+	read_result = cluster_lmd_wait_state_read_exact(&MyProc->cluster_lmd_wait, &wait_state);
+	Assert(read_result != CLUSTER_LMD_WAIT_STATE_READ_ACTIVE
+		   || (wait_state.active && wait_state.kind == CLUSTER_LMD_WAIT_TX
+			   && wait_state.request_id == 0 && wait_state.wait_seq != 0));
+	if (read_result == CLUSTER_LMD_WAIT_STATE_READ_ACTIVE && wait_state.active
+		&& wait_state.kind == CLUSTER_LMD_WAIT_TX && wait_state.request_id == 0
+		&& wait_state.wait_seq != 0) {
+		ClusterLmdVertex waiter;
+
+		txw_exact_waiter_vertex(&waiter, procno, wait_state.cluster_epoch,
+							  wait_state.xid, wait_state.wait_seq);
+		cluster_lmd_cancel_wait_edge_real(&waiter);
+	}
+
+	/* Required cleanup order: exact WFG edge, proc wait state, owned slot. */
+	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+	txw_exit_slot_clear_if_same(procno, slot_kind);
 }
 
 ClusterTxwResult
@@ -430,10 +515,8 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 						 : initial_reason;
 		goto done;
 	}
-	if (initial_reason != CLUSTER_TX_RESOLVE_NONE) {
-		final_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
-		goto done;
-	}
+	/* The exact resolver publishes a non-UNKNOWN outcome only with NONE. */
+	Assert(initial_reason == CLUSTER_TX_RESOLVE_NONE);
 	if (initial_outcome == CLUSTER_TX_COMMITTED || initial_outcome == CLUSTER_TX_ABORTED) {
 		result = CLUSTER_TXW_RESOLVED;
 		final_reason = CLUSTER_TX_RESOLVE_NONE;

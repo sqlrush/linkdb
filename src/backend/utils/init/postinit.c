@@ -70,6 +70,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_grd.h" /* spec-2.24 D7 cleanup_on_backend_exit_callback */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-6.14 D11 eager exit-hook registration */
+#include "cluster/cluster_tx_enqueue.h" /* spec-8.4 D9 exact wait exit cleanup */
 #endif
 
 static HeapTuple GetDatabaseTuple(const char *dbname);
@@ -850,6 +851,13 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 *	via re-exec on EXEC_BACKEND platforms is harmless.
 	 */
 	before_shmem_exit(cluster_grd_cleanup_on_backend_exit_callback, 0);
+
+	/*
+	 * spec-8.4 D9 — proc_exit/FATAL bypasses the exact-wait PG_FINALLY.
+	 * Register after GRD so LIFO exit dispatch clears this backend's exact
+	 * SOURCE/TARGET WFG edge and waiter ownership before GRD detaches state.
+	 */
+	before_shmem_exit(cluster_tx_enqueue_cleanup_on_backend_exit_callback, 0);
 
 	/*
 	 * spec-6.14 D11 — register the GCS block-dedup backend-exit hook
