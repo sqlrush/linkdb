@@ -120,6 +120,38 @@ StaticAssertDecl(sizeof(ClusterMultiXactMember) == 24,
 				 "ClusterMultiXactMember must be 24 bytes wire-stable (HC207)");
 
 /*
+ * R4 D7 native-composition identity.  The starting offset is the native
+ * members-array generation returned by GetMultiXactIdMembersWithOffset();
+ * equality is exact and ordered because member order is part of the sampled
+ * native composition.  This predicate is pure and accepts only the frozen
+ * all-member capacity domain.
+ */
+static inline bool
+cluster_multixact_native_snapshot_equal(MultiXactOffset first_generation, int first_count,
+										const MultiXactMember *first,
+										MultiXactOffset second_generation, int second_count,
+										const MultiXactMember *second)
+{
+	int i;
+
+	if (first_generation == 0 || second_generation == 0
+		|| first_generation != second_generation || first_count != second_count
+		|| first_count < 2 || first_count > 256 || first == NULL || second == NULL)
+		return false;
+
+	for (i = 0; i < first_count; i++) {
+		if (!TransactionIdIsNormal(first[i].xid) || !TransactionIdIsNormal(second[i].xid)
+			|| first[i].status < MultiXactStatusForKeyShare
+			|| first[i].status > MaxMultiXactStatus
+			|| second[i].status < MultiXactStatusForKeyShare
+			|| second[i].status > MaxMultiXactStatus || first[i].xid != second[i].xid
+			|| first[i].status != second[i].status)
+			return false;
+	}
+	return true;
+}
+
+/*
  * ClusterMultiXactMemberOverlayResult -- reader-side lookup output.
  *
  * Caller allocates buffer with capacity for at least `member_count`

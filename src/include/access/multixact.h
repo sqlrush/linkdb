@@ -114,6 +114,9 @@ extern bool MultiXactIdIsRunning(MultiXactId multi, bool isLockOnly);
 extern void MultiXactIdSetOldestMember(void);
 extern int	GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members,
 								  bool from_pgupgrade, bool isLockOnly);
+extern int	GetMultiXactIdMembersWithOffset(MultiXactId multi, MultiXactMember **members,
+											bool from_pgupgrade, bool isLockOnly,
+											MultiXactOffset *start_offset_out);
 extern bool MultiXactIdPrecedes(MultiXactId multi1, MultiXactId multi2);
 extern bool MultiXactIdPrecedesOrEquals(MultiXactId multi1,
 										MultiXactId multi2);
