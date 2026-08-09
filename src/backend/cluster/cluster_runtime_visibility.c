@@ -43,6 +43,9 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/clog.h"
+#include "access/subtrans.h"
+#include "access/transam.h"
+#include "access/twophase.h"
 #include "access/xlog.h"
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_cache.h"
@@ -65,6 +68,7 @@
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_verdict.h"	/* verdict taxonomy + entry (D3-3/D3-4) */
 #include "cluster/cluster_undo_horizon.h"	/* D5-8 read admission (spec-5.22e) */
+#include "utils/snapmgr.h"
 
 static XidStatus
 cluster_runtime_visibility_direct_xid_status(TransactionId xid)
@@ -78,6 +82,118 @@ static bool
 cluster_runtime_visibility_direct_xid_committed(TransactionId xid)
 {
 	return cluster_runtime_visibility_direct_xid_status(xid) == TRANSACTION_STATUS_COMMITTED;
+}
+
+typedef struct ClusterRuntimeSubtransSample {
+	TransactionId xids[CLUSTER_R4_SUBTRANS_MAX_DEPTH];
+	TransactionId parents[CLUSTER_R4_SUBTRANS_MAX_DEPTH];
+	int count;
+	TransactionId top_xid;
+} ClusterRuntimeSubtransSample;
+
+/*
+ * Complete the native CLOG/pg_twophase/CLOG bracket for a live xid.  A
+ * terminal second CLOG observation always wins over the prepared predicate;
+ * callers still need an exact durable TT commit SCN before publishing a
+ * COMMITTED result.
+ */
+static XidStatus
+cluster_runtime_visibility_recheck_prepared(TransactionId xid, XidStatus first_status,
+											bool *prepared_out)
+{
+	bool prepared;
+	XidStatus second_status;
+
+	Assert(prepared_out != NULL);
+	*prepared_out = false;
+	if (first_status != TRANSACTION_STATUS_IN_PROGRESS)
+		return first_status;
+
+	prepared = TwoPhaseTransactionIdIsPrepared(xid);
+	second_status = cluster_runtime_visibility_direct_xid_status(xid);
+	if (second_status == TRANSACTION_STATUS_IN_PROGRESS)
+		*prepared_out = prepared;
+	return second_status;
+}
+
+/*
+ * Sample every immediate pg_subtrans edge, including the top->Invalid edge.
+ * SubTransGetParent() owns native SLRU locking and ERROR behavior; deliberately
+ * do not wrap it in PG_TRY, so physical I/O/corruption failures propagate.
+ */
+static bool
+cluster_runtime_visibility_sample_subtrans(TransactionId child,
+										   ClusterRuntimeSubtransSample *sample,
+										   ClusterTxResolveReason *reason_out)
+{
+	TransactionId current = child;
+	int depth;
+
+	Assert(sample != NULL);
+	Assert(reason_out != NULL);
+	memset(sample, 0, sizeof(*sample));
+
+	for (depth = 0; depth < CLUSTER_R4_SUBTRANS_MAX_DEPTH; depth++) {
+		TransactionId parent;
+		int i;
+
+		if (TransactionIdPrecedes(current, TransactionXmin)) {
+			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			return false;
+		}
+
+		parent = SubTransGetParent(current);
+		sample->xids[depth] = current;
+		sample->parents[depth] = parent;
+		sample->count = depth + 1;
+
+		if (!TransactionIdIsValid(parent)) {
+			sample->top_xid = current;
+			return true;
+		}
+		if (!TransactionIdIsNormal(parent)) {
+			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			return false;
+		}
+		if (!TransactionIdPrecedes(parent, current)) {
+			*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_CYCLE;
+			return false;
+		}
+		for (i = 0; i <= depth; i++) {
+			if (TransactionIdEquals(sample->xids[i], parent)) {
+				*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_CYCLE;
+				return false;
+			}
+		}
+		current = parent;
+	}
+
+	*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_DEPTH;
+	return false;
+}
+
+static bool
+cluster_runtime_visibility_recheck_subtrans(const ClusterRuntimeSubtransSample *sample,
+											ClusterTxResolveReason *reason_out)
+{
+	int i;
+
+	Assert(sample != NULL);
+	Assert(reason_out != NULL);
+	for (i = 0; i < sample->count; i++) {
+		TransactionId parent;
+
+		if (TransactionIdPrecedes(sample->xids[i], TransactionXmin)) {
+			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			return false;
+		}
+		parent = SubTransGetParent(sample->xids[i]);
+		if (!TransactionIdEquals(parent, sample->parents[i])) {
+			*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_CHANGED;
+			return false;
+		}
+	}
+	return true;
 }
 
 /*
@@ -98,10 +214,12 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 	ClusterTxResolution candidate;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
+	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
 	ClusterLiveAuthority authority;
 	TTSlot exact_slot;
 	XidStatus native_status;
 	NodeId origin_node;
+	TransactionId top_xid;
 	size_t record_size;
 	SCN commit_scn = InvalidScn;
 	uint16 tt_slot_offset;
@@ -148,6 +266,7 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 		goto unknown;
 
 	tt_slot_offset = cluster_tt_slot_id_to_offset(record->tt_slot_id);
+	top_xid = locator->xid;
 	if (cluster_tt_slot_durable_lookup_committed_stable(
 			record->tt_slot_segment_id, tt_slot_offset, locator->xid, locator->tt_wrap,
 			cluster_runtime_visibility_direct_xid_committed, &commit_scn)
@@ -169,15 +288,68 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 			reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
 			goto unknown;
 		}
-		if (native_status == TRANSACTION_STATUS_ABORTED
-			|| (exact_slot.status == TT_SLOT_ABORTED
-				&& native_status == TRANSACTION_STATUS_IN_PROGRESS)) {
+		if (native_status == TRANSACTION_STATUS_ABORTED || exact_slot.status == TT_SLOT_ABORTED) {
 			outcome = CLUSTER_TX_ABORTED;
 			commit_scn = InvalidScn;
-		} else if (exact_slot.status == TT_SLOT_ACTIVE
-				   && native_status == TRANSACTION_STATUS_IN_PROGRESS) {
-			outcome = CLUSTER_TX_IN_PROGRESS;
+		} else if (native_status == TRANSACTION_STATUS_SUB_COMMITTED) {
+			ClusterRuntimeSubtransSample subtrans;
+			bool prepared = false;
+
+			if (!cluster_runtime_visibility_sample_subtrans(locator->xid, &subtrans, &reason))
+				goto unknown;
+			native_status = cluster_runtime_visibility_direct_xid_status(subtrans.top_xid);
+			native_status = cluster_runtime_visibility_recheck_prepared(subtrans.top_xid,
+																		native_status, &prepared);
+			if (!cluster_runtime_visibility_recheck_subtrans(&subtrans, &reason))
+				goto unknown;
+
+			top_xid = subtrans.top_xid;
+			proof_kind = CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP;
 			commit_scn = InvalidScn;
+			if (native_status == TRANSACTION_STATUS_COMMITTED) {
+				/* No exact top locator/TT commit SCN is carried in this batch. */
+				reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+				goto unknown;
+			}
+			if (native_status == TRANSACTION_STATUS_ABORTED) {
+				if (exact_slot.status == TT_SLOT_COMMITTED) {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+					goto unknown;
+				}
+				outcome = CLUSTER_TX_ABORTED;
+			} else if (native_status == TRANSACTION_STATUS_IN_PROGRESS
+					   && exact_slot.status == TT_SLOT_ACTIVE) {
+				outcome = prepared ? CLUSTER_TX_PREPARED : CLUSTER_TX_IN_PROGRESS;
+			} else {
+				reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				goto unknown;
+			}
+		} else if (native_status == TRANSACTION_STATUS_IN_PROGRESS
+				   && exact_slot.status == TT_SLOT_ACTIVE) {
+			bool prepared = false;
+
+			native_status = cluster_runtime_visibility_recheck_prepared(locator->xid, native_status,
+																		&prepared);
+			commit_scn = InvalidScn;
+			if (native_status == TRANSACTION_STATUS_COMMITTED) {
+				/* Retry will acquire a stable exact TT/CLOG/TT commit sample. */
+				reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+				goto unknown;
+			}
+			if (native_status == TRANSACTION_STATUS_ABORTED)
+				outcome = CLUSTER_TX_ABORTED;
+			else if (native_status == TRANSACTION_STATUS_IN_PROGRESS) {
+				outcome = prepared ? CLUSTER_TX_PREPARED : CLUSTER_TX_IN_PROGRESS;
+				if (prepared)
+					proof_kind = CLUSTER_TX_PROOF_ORIGIN_TWOPHASE;
+			} else {
+				reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				goto unknown;
+			}
+		} else if (native_status == TRANSACTION_STATUS_COMMITTED) {
+			/* A matching valid commit SCN was not proved by the stable helper. */
+			reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			goto unknown;
 		} else {
 			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 			goto unknown;
@@ -199,9 +371,9 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 	}
 
 	candidate.locator_echo = *locator;
-	candidate.top_xid = locator->xid;
+	candidate.top_xid = top_xid;
 	candidate.outcome = outcome;
-	candidate.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	candidate.proof_kind = proof_kind;
 	candidate.commit_scn = commit_scn;
 	candidate.authority = authority;
 	*out = candidate;

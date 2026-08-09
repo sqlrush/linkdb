@@ -168,6 +168,17 @@ TransactionIdGetStatus(TransactionId xid, XLogRecPtr *lsn)
 	return status;
 }
 
+bool
+TransactionIdPrecedes(TransactionId id1, TransactionId id2)
+{
+	int32 diff;
+
+	if (!TransactionIdIsNormal(id1) || !TransactionIdIsNormal(id2))
+		return id1 < id2;
+	diff = (int32)(id1 - id2);
+	return diff < 0;
+}
+
 TransactionId
 SubTransGetParent(TransactionId xid)
 {
@@ -804,16 +815,19 @@ UT_TEST(test_exact_origin_subtrans_depth_fails_closed)
 	ClusterTxResolution resolution;
 	ClusterTxResolution zero = {0};
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	TransactionId child = 5000;
 	int i;
 
 	reset_exact_origin_fixture();
 	test_tt_slot.status = TT_SLOT_ACTIVE;
 	test_tt_slot.commit_scn = InvalidScn;
+	test_origin_locator.xid = child;
+	test_origin_record.xid = child;
+	test_tt_slot.xid = child;
 	for (i = 0; i <= CLUSTER_R4_SUBTRANS_MAX_DEPTH; i++)
-		test_subtrans_chain[i] = (TransactionId)(5000 - i);
+		test_subtrans_chain[i] = child - i;
 	test_subtrans_chain_count = CLUSTER_R4_SUBTRANS_MAX_DEPTH + 1;
-	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_SUB_COMMITTED);
-	test_subtrans_chain[0] = TEST_ORIGIN_XID;
+	set_native_status_sample(0, child, TRANSACTION_STATUS_SUB_COMMITTED);
 	memset(&resolution, 0xa5, sizeof(resolution));
 
 	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
