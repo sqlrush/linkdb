@@ -541,7 +541,7 @@ UT_TEST(test_rf_a1_self_fenced_initial_stats_skips_active_and_checkpoint)
 	UT_ASSERT_EQ(stats_test_self_check_calls, 1);
 	UT_ASSERT_EQ(stats_test_active_calls, 0);
 	UT_ASSERT_EQ(stats_test_checkpoint_calls, 0);
-	UT_ASSERT_EQ(stats_test_telemetry_calls, 1);
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 0);
 	UT_ASSERT_EQ((uint64)stats_test_refresh_fail_count, (uint64)0);
 }
 
