@@ -47,6 +47,7 @@ static ClusterTxLocator test_origin_locator;
 static UndoRecordHeader test_origin_record;
 static int test_undo_read_calls;
 static int test_tt_exact_calls;
+static int test_tt_snapshot_calls;
 static int test_native_status_calls;
 static int test_by_xid_scan_calls;
 static uint32 test_tt_segment_seen;
@@ -54,6 +55,7 @@ static uint16 test_tt_slot_seen;
 static TransactionId test_tt_xid_seen;
 static uint16 test_tt_wrap_seen;
 static XidStatus test_native_status;
+static TTSlot test_tt_slot;
 static SCN test_commit_scn;
 static uint64 test_formation_epoch;
 static XLogRecPtr test_flush_lsn;
@@ -94,9 +96,28 @@ cluster_tt_slot_durable_lookup_committed_stable(
 	test_tt_slot_seen = slot_offset;
 	test_tt_xid_seen = xid;
 	test_tt_wrap_seen = (uint16)expected_wrap;
-	if (xid_committed == NULL || commit_scn == NULL || !xid_committed(xid))
+	if (test_tt_slot.status != TT_SLOT_COMMITTED || test_tt_slot.xid != xid
+		|| test_tt_slot.wrap != (uint16)expected_wrap || !SCN_VALID(test_tt_slot.commit_scn)
+		|| xid_committed == NULL || commit_scn == NULL || !xid_committed(xid))
 		return false;
-	*commit_scn = test_commit_scn;
+	*commit_scn = test_tt_slot.commit_scn;
+	return true;
+}
+
+bool
+cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
+											   TransactionId xid, uint16 expected_wrap,
+											   TTSlot *slot_out)
+{
+	test_tt_snapshot_calls++;
+	test_tt_segment_seen = segment_id;
+	test_tt_slot_seen = slot_offset;
+	test_tt_xid_seen = xid;
+	test_tt_wrap_seen = expected_wrap;
+	if (slot_out == NULL || test_tt_slot.status > TT_SLOT_RECYCLABLE
+		|| test_tt_slot.xid != xid || test_tt_slot.wrap != expected_wrap)
+		return false;
+	*slot_out = test_tt_slot;
 	return true;
 }
 
@@ -169,6 +190,7 @@ reset_exact_origin_fixture(void)
 
 	test_undo_read_calls = 0;
 	test_tt_exact_calls = 0;
+	test_tt_snapshot_calls = 0;
 	test_native_status_calls = 0;
 	test_by_xid_scan_calls = 0;
 	test_tt_segment_seen = 0;
@@ -177,6 +199,11 @@ reset_exact_origin_fixture(void)
 	test_tt_wrap_seen = TT_WRAP_INVALID;
 	test_native_status = TRANSACTION_STATUS_COMMITTED;
 	test_commit_scn = scn_encode(0, 80);
+	memset(&test_tt_slot, 0, sizeof(test_tt_slot));
+	test_tt_slot.status = TT_SLOT_COMMITTED;
+	test_tt_slot.xid = TEST_ORIGIN_XID;
+	test_tt_slot.wrap = TEST_ORIGIN_WRAP;
+	test_tt_slot.commit_scn = test_commit_scn;
 	test_formation_epoch = 42;
 	test_flush_lsn = (XLogRecPtr)UINT64CONST(0x12345678);
 	test_tt_generation = 9;
@@ -304,6 +331,7 @@ UT_TEST(test_exact_origin_committed_uses_canonical_tt_identity_and_direct_clog)
 	UT_ASSERT_EQ(resolution.authority.authority_scn, test_authority_scn);
 	UT_ASSERT_EQ(test_undo_read_calls, 1);
 	UT_ASSERT_EQ(test_tt_exact_calls, 1);
+	UT_ASSERT_EQ(test_tt_snapshot_calls, 0);
 	UT_ASSERT_EQ(test_native_status_calls, 1);
 	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
 	UT_ASSERT_EQ(test_tt_segment_seen, TEST_TT_SEGMENT);
@@ -330,14 +358,69 @@ UT_TEST(test_exact_origin_bad_record_wrap_fails_before_tt_or_clog)
 	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
 	UT_ASSERT_EQ(test_undo_read_calls, 1);
 	UT_ASSERT_EQ(test_tt_exact_calls, 0);
+	UT_ASSERT_EQ(test_tt_snapshot_calls, 0);
 	UT_ASSERT_EQ(test_native_status_calls, 0);
+	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
+}
+
+UT_TEST(test_exact_origin_aborted_uses_exact_tt_and_direct_clog)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_ABORTED;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+	UT_ASSERT_EQ(resolution.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(memcmp(&resolution.locator_echo, &test_origin_locator,
+							 sizeof(test_origin_locator)),
+				 0);
+	UT_ASSERT_EQ(test_undo_read_calls, 1);
+	UT_ASSERT_EQ(test_tt_exact_calls, 1);
+	UT_ASSERT_EQ(test_tt_snapshot_calls, 1);
+	UT_ASSERT_EQ(test_native_status_calls, 1);
+	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
+	UT_ASSERT_EQ(test_tt_segment_seen, TEST_TT_SEGMENT);
+	UT_ASSERT_EQ(test_tt_slot_seen, TEST_TT_OFFSET);
+}
+
+UT_TEST(test_exact_origin_conflicting_terminal_evidence_fails_closed)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = {0};
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_origin_fixture();
+	test_native_status = TRANSACTION_STATUS_ABORTED;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_undo_read_calls, 1);
+	UT_ASSERT_EQ(test_tt_exact_calls, 1);
+	UT_ASSERT_EQ(test_tt_snapshot_calls, 1);
+	UT_ASSERT_EQ(test_native_status_calls, 2);
 	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
 }
 
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(45);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -381,6 +464,8 @@ main(void)
 	UT_RUN(test_out_of_domain_values_fail_closed);
 	UT_RUN(test_exact_origin_committed_uses_canonical_tt_identity_and_direct_clog);
 	UT_RUN(test_exact_origin_bad_record_wrap_fails_before_tt_or_clog);
+	UT_RUN(test_exact_origin_aborted_uses_exact_tt_and_direct_clog);
+	UT_RUN(test_exact_origin_conflicting_terminal_evidence_fails_closed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
