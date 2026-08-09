@@ -2453,6 +2453,32 @@ UT_TEST(test_generation_max_never_wraps)
 	UT_ASSERT_EQ(next, 77);
 }
 
+static int
+format_r1_unit_machine_record(char *record, size_t record_size, const char *snapshot_id,
+							  const PcmXAcquireObservationSnapshot *snapshot)
+{
+	(void)snapshot_id;
+	(void)snapshot;
+	if (record_size > 0)
+		record[0] = '\0';
+	return 0;
+}
+
+static void
+assert_and_emit_r1_unit_machine_record(const char *snapshot_id,
+									   const PcmXAcquireObservationSnapshot *snapshot,
+									   const char *expected)
+{
+	char record[256];
+	int written;
+
+	written = format_r1_unit_machine_record(record, sizeof(record), snapshot_id, snapshot);
+	UT_ASSERT(written > 0);
+	UT_ASSERT_EQ((size_t)written, strlen(expected));
+	UT_ASSERT_STR_EQ(record, expected);
+	fputs(record, stdout);
+}
+
 /*
  * One ordinary success and one ordinary non-success exercise the real
  * acquisition-accounting API.  Removing either result increment, sampling
@@ -2472,13 +2498,21 @@ UT_TEST(test_acquire_observation_separates_success_and_non_success)
 	reset_fake_shmem();
 	cluster_pcm_x_convert_shmem_init();
 	cluster_pcm_x_acquire_observation_snapshot(&baseline);
+	assert_and_emit_r1_unit_machine_record(
+		"baseline", &baseline, "PGRAC_R1_UNIT_V2\tbaseline\t0\t0\t0\t0\t0\t0\n");
 
 	cluster_pcm_x_acquire_observation_begin(UINT64_C(100));
 	cluster_pcm_x_acquire_observation_snapshot(&after_success_begin);
+	assert_and_emit_r1_unit_machine_record(
+		"success-begin", &after_success_begin,
+		"PGRAC_R1_UNIT_V2\tsuccess-begin\t1\t1\t0\t0\t0\t0\n");
 	UT_ASSERT_EQ(after_success_begin.started_count, baseline.started_count + 1);
 	UT_ASSERT_EQ(after_success_begin.active_count, baseline.active_count + 1);
 	cluster_pcm_x_acquire_observation_finish(PCM_X_QUEUE_OK, UINT64_C(101));
 	cluster_pcm_x_acquire_observation_snapshot(&after_success);
+	assert_and_emit_r1_unit_machine_record(
+		"success-finish", &after_success,
+		"PGRAC_R1_UNIT_V2\tsuccess-finish\t1\t0\t0\t1\t0\t1\n");
 
 	UT_ASSERT_EQ(after_success.started_count, 1);
 	UT_ASSERT_EQ(after_success.active_count, 0);
@@ -2494,10 +2528,16 @@ UT_TEST(test_acquire_observation_separates_success_and_non_success)
 
 	cluster_pcm_x_acquire_observation_begin(UINT64_C(200));
 	cluster_pcm_x_acquire_observation_snapshot(&after_busy_begin);
+	assert_and_emit_r1_unit_machine_record(
+		"busy-begin", &after_busy_begin,
+		"PGRAC_R1_UNIT_V2\tbusy-begin\t2\t1\t0\t1\t0\t1\n");
 	UT_ASSERT_EQ(after_busy_begin.started_count, after_success.started_count + 1);
 	UT_ASSERT_EQ(after_busy_begin.active_count, after_success.active_count + 1);
 	cluster_pcm_x_acquire_observation_finish(PCM_X_QUEUE_BUSY, UINT64_C(250));
 	cluster_pcm_x_acquire_observation_snapshot(&after_busy);
+	assert_and_emit_r1_unit_machine_record(
+		"busy-finish", &after_busy,
+		"PGRAC_R1_UNIT_V2\tbusy-finish\t2\t0\t0\t1\t1\t1\n");
 
 	UT_ASSERT_EQ(after_busy.started_count, 2);
 	UT_ASSERT_EQ(after_busy.active_count, 0);
