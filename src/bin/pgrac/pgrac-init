@@ -621,25 +621,77 @@ fi
 # mechanism; the server validates the routing at startup
 # (cluster_wal_thread_init, FATAL 53RA0/53RA1 on mismatch).
 
-WAL_THREAD_XOPT=""
 if [ -n "$WAL_THREADS_DIR" ]; then
+    WAL_ROOT_ENTRIES=""
+
     case "$WAL_THREADS_DIR" in
         /*) ;;
         *) die "--wal-threads-dir must be an absolute path (got \"$WAL_THREADS_DIR\")" ;;
     esac
-    # Refuse an already-initialised PGDATA BEFORE touching the shared
-    # WAL root: a failing command must not leave an empty thread_N
-    # directory behind on shared storage.
-    if [ -f "$TARGET_PGDATA/PG_VERSION" ]; then
-        die "--wal-threads-dir cannot relocate an already-initialised PGDATA (move pg_wal manually, see the pgrac manual)"
+
+    # W1 owns the data, WAL-thread, and registry-root handoff to initdb.
+    # Reject direct attempts to replace those managed arguments, plus the
+    # option terminator that could hide them.  INITDB_OPTS is deliberately
+    # split exactly as it is at the invocation below.
+    # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
+    for INITDB_OPT in $INITDB_OPTS; do
+        case "$INITDB_OPT" in
+            -D*|--pgdata|--pgdata=*|-X*|--waldir|--waldir=*|\
+                --pgrac-wal-state-root|--pgrac-wal-state-root=*|--)
+                die "--initdb-options cannot override W1 managed -D/-X/--pgrac-wal-state-root arguments"
+                ;;
+        esac
+    done
+
+    # W1 read-only preflight.  Refuse a non-fresh PGDATA, a lexical or
+    # physical alias for ROOT, and a symlink component before changing the
+    # shared root.  realpath(ROOT's parent) also proves the new dirent cannot
+    # escape through an ancestor symlink.
+    if [ -e "$TARGET_PGDATA" ] || [ -L "$TARGET_PGDATA" ]; then
+        [ -d "$TARGET_PGDATA" ] \
+            || die "PGDATA \"$TARGET_PGDATA\" is not a directory; refusing to touch WAL root \"$WAL_THREADS_DIR\""
+        PGDATA_ENTRIES=$(ls -A "$TARGET_PGDATA") \
+            || die "could not inspect PGDATA \"$TARGET_PGDATA\"; refusing to touch WAL root \"$WAL_THREADS_DIR\""
+        if [ -n "$PGDATA_ENTRIES" ]; then
+            if [ -f "$TARGET_PGDATA/PG_VERSION" ]; then
+                die "--wal-threads-dir cannot relocate an already-initialised PGDATA (move pg_wal manually, see the pgrac manual)"
+            fi
+            die "PGDATA \"$TARGET_PGDATA\" is not fresh; refusing to touch WAL root \"$WAL_THREADS_DIR\""
+        fi
     fi
+
+    WAL_ROOT_PARENT=$(dirname -- "$WAL_THREADS_DIR")
+    WAL_ROOT_NAME=$(basename -- "$WAL_THREADS_DIR")
+    WAL_ROOT_CANON_PARENT=$(realpath "$WAL_ROOT_PARENT") \
+        || die "could not canonicalize WAL root parent \"$WAL_ROOT_PARENT\""
+    WAL_ROOT_CANON="$WAL_ROOT_CANON_PARENT/$WAL_ROOT_NAME"
+    [ "$WAL_THREADS_DIR" = "$WAL_ROOT_CANON" ] \
+        || die "--wal-threads-dir must be canonical and contain no symlink escape (got \"$WAL_THREADS_DIR\", canonical \"$WAL_ROOT_CANON\")"
+
+    if [ -e "$WAL_THREADS_DIR" ] || [ -L "$WAL_THREADS_DIR" ]; then
+        [ -d "$WAL_THREADS_DIR" ] && [ ! -L "$WAL_THREADS_DIR" ] \
+            || die "WAL root \"$WAL_THREADS_DIR\" is not a real directory"
+        [ "$(realpath "$WAL_THREADS_DIR")" = "$WAL_THREADS_DIR" ] \
+            || die "WAL root \"$WAL_THREADS_DIR\" is not canonical"
+        WAL_ROOT_ENTRIES=$(ls -A "$WAL_THREADS_DIR") \
+            || die "could not inspect WAL root \"$WAL_THREADS_DIR\""
+    fi
+
+    WAL_STATE_PATH="$WAL_THREADS_DIR/pgrac_wal_state"
+    if [ -e "$WAL_STATE_PATH" ] || [ -L "$WAL_STATE_PATH" ]; then
+        [ -f "$WAL_STATE_PATH" ] && [ ! -L "$WAL_STATE_PATH" ] \
+            || die "WAL state registry \"$WAL_STATE_PATH\" is not a regular file"
+    elif [ -d "$WAL_THREADS_DIR" ] && [ -n "$WAL_ROOT_ENTRIES" ]; then
+        die "WAL root \"$WAL_THREADS_DIR\" is not fresh and has no WAL state registry"
+    fi
+
+    if [ ! -d "$WAL_THREADS_DIR" ]; then
+        mkdir "$WAL_THREADS_DIR" || die "could not create \"$WAL_THREADS_DIR\""
+    fi
+
     THREAD_ID=$((NODE_ID + 1))
     THREAD_DIR="$WAL_THREADS_DIR/thread_$THREAD_ID"
-    mkdir -p "$THREAD_DIR" || die "could not create \"$THREAD_DIR\""
-    if [ -n "$(ls -A "$THREAD_DIR" 2>/dev/null)" ]; then
-        die "WAL thread directory \"$THREAD_DIR\" is not empty (another node's stream?)"
-    fi
-    WAL_THREAD_XOPT="-X $THREAD_DIR"
+    mkdir "$THREAD_DIR" || die "could not create fresh WAL thread directory \"$THREAD_DIR\""
     echo "$PROGNAME: WAL thread $THREAD_ID stream at \"$THREAD_DIR\""
 fi
 
@@ -653,8 +705,14 @@ if [ -d "$TARGET_PGDATA" ] && [ -n "$(ls -A "$TARGET_PGDATA" 2>/dev/null)" ]; th
     fi
 else
     echo "$PROGNAME: running initdb -D \"$TARGET_PGDATA\""
-    # shellcheck disable=SC2086 # INITDB_OPTS / WAL_THREAD_XOPT intentionally word-split
-    "$INITDB" -D "$TARGET_PGDATA" $WAL_THREAD_XOPT $INITDB_OPTS
+    if [ -n "$WAL_THREADS_DIR" ]; then
+        # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
+        "$INITDB" $INITDB_OPTS -D "$TARGET_PGDATA" -X "$THREAD_DIR" \
+            "--pgrac-wal-state-root=$WAL_THREADS_DIR"
+    else
+        # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
+        "$INITDB" -D "$TARGET_PGDATA" $INITDB_OPTS
+    fi
 fi
 
 PG_CONF="$TARGET_PGDATA/postgresql.conf"

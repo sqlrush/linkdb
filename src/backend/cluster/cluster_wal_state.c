@@ -8,8 +8,8 @@
  *	  backend file I/O:
  *
  *	    ensure()           postmaster startup, after the spec-4.1 claim
- *	                       validation: create-once (O_EXCL + L47 fsync
- *	                       discipline) or validate the existing header.
+ *	                       validation: read-only full-registry validation.
+ *	                       Offline initdb finalization is the sole creator.
  *	                       Fail-closed FATAL 53RA2.
  *	    publish_active()   phase4 -> CLUSTER_PHASE_RUNNING transition:
  *	                       recovery succeeded, the node is about to
@@ -332,111 +332,122 @@ out:
 /*
  * cluster_wal_state_ensure
  *
- *	Create-once or validate.  Called from cluster_wal_thread_init()
- *	(postmaster, after the claim validation, before StartupXLOG).
- *	FATAL 53RA2 on corruption or I/O failure -- never a silent
- *	fallback, never an automatic rebuild of a corrupt registry.
+ *	Validate only.  Called from cluster_wal_thread_init() (postmaster,
+ *	after the claim validation, before StartupXLOG).  initdb --check and
+ *	--boot probes are intentionally earlier than the frontend finalizer.
+ *	FATAL 53RA2 on missing, corrupt, foreign or unreadable evidence.
  */
 bool
 cluster_wal_state_ensure(void)
 {
 	char path[MAXPGPATH];
 	int fd;
-	ClusterWalStateHeader header;
-	int got;
+	unsigned char *image;
+	ClusterWalStateSlot own_slot;
+	ClusterWalSlotVerdict own_verdict;
+	uint16 bad_thread = 0;
+	uint16 own_thread;
 	const char *reason = NULL;
 	struct stat st;
+	int block;
 
-	if (!registry_configured())
+	if (IsBootstrapProcessingMode() || !registry_configured())
 		return false;
 
 	registry_path(path, sizeof(path));
+	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+						errmsg("could not open required WAL state registry \"%s\": %m", path),
+						errhint("Provision or restore a known-valid registry while the cluster is "
+								"fully offline; runtime startup never creates or repairs it.")));
+	if (fstat(fd, &st) != 0) {
+		int save_errno = errno;
 
-	fd = BasicOpenFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
-	if (fd >= 0) {
-		/* First boot of the whole registry: zero file + header. */
-		char *zeros = palloc0(CLUSTER_WAL_STATE_FILE_SIZE);
-		ssize_t nwritten;
-		bool ok;
+		(void)close(fd);
+		errno = save_errno;
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+						errmsg("could not stat open WAL state registry \"%s\": %m", path),
+						errhint("Check that the shared WAL storage is reachable.")));
+	}
+	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)CLUSTER_WAL_STATE_FILE_SIZE) {
+		long long actual_size = (long long)st.st_size;
 
-		cluster_wal_state_header_fill((ClusterWalStateHeader *)zeros, (int64)GetCurrentTimestamp());
+		(void)close(fd);
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+						errmsg("WAL state registry \"%s\" is not a regular exact-size file "
+							   "(size %lld, expected %d)",
+							   path, actual_size, CLUSTER_WAL_STATE_FILE_SIZE),
+						errhint("Restore a known-valid registry while the cluster is fully offline; "
+								"runtime startup preserves the invalid evidence.")));
+	}
 
-		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_WRITE);
-		nwritten = pg_pwrite(fd, zeros, CLUSTER_WAL_STATE_FILE_SIZE, 0);
-		ok = (nwritten == (ssize_t)CLUSTER_WAL_STATE_FILE_SIZE) && pg_fsync(fd) == 0;
-		pgstat_report_wait_end();
-		pfree(zeros);
+	image = palloc0(CLUSTER_WAL_STATE_FILE_SIZE);
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
+	for (block = 0; block <= CLUSTER_WAL_STATE_SLOT_COUNT; block++) {
+		off_t offset = (off_t)block * CLUSTER_WAL_STATE_SLOT_SIZE;
+		ssize_t nread
+			= pg_pread(fd, image + offset, CLUSTER_WAL_STATE_SLOT_SIZE, offset);
 
-		if (!ok) {
-			int save_errno = errno;
+		if (nread != CLUSTER_WAL_STATE_SLOT_SIZE) {
+			int save_errno = nread < 0 ? errno : EIO;
 
-			close(fd);
-			(void)unlink(path);
+			pgstat_report_wait_end();
+			pfree(image);
+			(void)close(fd);
 			errno = save_errno;
 			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-							errmsg("could not initialise WAL state registry \"%s\": %m", path),
-							errhint("Check that the shared WAL storage is writable.")));
+							errmsg("could not fully read WAL state registry \"%s\": %m", path),
+							errhint("Restore a known-valid registry while the cluster is fully "
+									"offline; runtime startup preserves the invalid evidence.")));
 		}
-		close(fd);
-
-		/* L47 create side: make the new dirent durable too. */
-		fd = BasicOpenFile(cluster_wal_threads_dir, O_RDONLY | PG_BINARY);
-		if (fd < 0)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					 errmsg("could not open WAL threads root \"%s\": %m", cluster_wal_threads_dir),
-					 errhint("Check that the shared WAL storage is writable.")));
-		if (pg_fsync(fd) != 0) {
-			int save_errno = errno;
-
-			close(fd);
-			errno = save_errno;
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					 errmsg("could not fsync WAL threads root \"%s\": %m", cluster_wal_threads_dir),
-					 errhint("Check that the shared WAL storage is writable.")));
-		}
-		close(fd);
-
-		ereport(LOG, (errmsg("pgrac WAL state registry created at \"%s\"", path)));
-		return true;
 	}
-	if (errno != EEXIST)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("could not open WAL state registry \"%s\": %m", path),
-						errhint("Check that the shared WAL storage is reachable.")));
+	pgstat_report_wait_end();
+	if (close(fd) != 0) {
+		int save_errno = errno;
 
-	/*
-	 * Exists (possibly created by a concurrent first boot): validate.
-	 * The layout is a fixed 66048 bytes; a valid header glued to a
-	 * truncated (or extended) slot area must not pass, and the file is
-	 * never auto-resized (spec-4.2 user codereview round 2, P1).
-	 */
-	if (stat(path, &st) != 0)
+		pfree(image);
+		errno = save_errno;
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("could not stat WAL state registry \"%s\": %m", path),
-						errhint("Check that the shared WAL storage is reachable.")));
-	if (st.st_size != (off_t)CLUSTER_WAL_STATE_FILE_SIZE)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("WAL state registry \"%s\" has unexpected size %lld, expected %d",
-							   path, (long long)st.st_size, CLUSTER_WAL_STATE_FILE_SIZE),
-						errhint("The registry is never resized in place.  After confirming the "
-								"shared storage, remove the file and restart (it is rebuilt "
-								"empty; slots repopulate as nodes start).")));
+						errmsg("could not close WAL state registry \"%s\": %m", path)));
+	}
 
-	got = read_block(path, 0, &header);
-	if (got <= 0)
+	if (!cluster_wal_state_image_validate(image, CLUSTER_WAL_STATE_FILE_SIZE, &bad_thread,
+										  &reason)) {
+		pfree(image);
+		if (bad_thread == 0)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+							errmsg("WAL state registry \"%s\" failed validation", path),
+							errdetail("Header validation failed: %s.",
+									  reason != NULL ? reason : "unknown"),
+							errhint("Restore a known-valid registry while the cluster is fully "
+										"offline; runtime startup never deletes, truncates or "
+										"rebuilds it.")));
+		else
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+							errmsg("WAL state registry \"%s\" failed validation", path),
+							errdetail("Slot %u validation failed: %s.", (unsigned)bad_thread,
+									  reason != NULL ? reason : "unknown"),
+							errhint("Restore a known-valid registry while the cluster is fully "
+										"offline; runtime startup never deletes, truncates or "
+										"rebuilds it.")));
+	}
+
+	own_thread = cluster_wal_thread_id();
+	memcpy(&own_slot, image + CLUSTER_WAL_STATE_SLOT_OFFSET(own_thread), sizeof(own_slot));
+	own_verdict
+		= cluster_wal_state_slot_classify(&own_slot, own_thread, cluster_node_id, &reason);
+	if (own_verdict != CLUSTER_WAL_SLOT_EMPTY && own_verdict != CLUSTER_WAL_SLOT_OK) {
+		pfree(image);
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("could not read WAL state registry header \"%s\": %m", path),
-						errhint("The registry is unreadable or torn.  After confirming the "
-								"shared storage, remove the file and restart (it is rebuilt "
-								"empty; slots repopulate as nodes start).")));
-	if (!cluster_wal_state_header_validate(&header, &reason))
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("WAL state registry \"%s\" failed validation", path),
-						errdetail("Header validation failed: %s.", reason ? reason : "unknown"),
-						errhint("After confirming the shared storage, remove the file and restart "
-								"(it is rebuilt empty; slots repopulate as nodes start).")));
+						errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
+							   (unsigned)own_thread),
+						errdetail("Own-slot validation failed: %s.",
+								  reason != NULL ? reason : "unknown"),
+						errhint("Restore the correct known-valid registry while the cluster is "
+								"fully offline; foreign ownership evidence is preserved.")));
+	}
+	pfree(image);
 	return true;
 }
 

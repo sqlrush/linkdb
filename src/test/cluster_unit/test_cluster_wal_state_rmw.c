@@ -8,6 +8,7 @@
 #include "postgres.h"
 
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -32,6 +33,8 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+ProcessingMode Mode = NormalProcessing;
 
 /* ---- backend globals and non-common dependencies ---- */
 bool cluster_enabled = true;
@@ -267,10 +270,25 @@ static bool force_postread_mismatch = false;
 static void *first_slot_read_buffer = NULL;
 static void *second_slot_read_buffer = NULL;
 static ClusterWalStateSlot last_pwrite_image;
+static bool test_runtime_ensure = false;
+static int mutating_open_count = 0;
+static int unlink_count = 0;
 
 int
 BasicOpenFile(const char *fileName pg_attribute_unused(), int fileFlags)
 {
+	if (test_runtime_ensure) {
+		if ((fileFlags & (O_WRONLY | O_RDWR | O_CREAT | O_EXCL | O_TRUNC)) != 0) {
+			mutating_open_count++;
+			errno = EEXIST;
+			return -1;
+		}
+		UT_ASSERT((fileFlags & O_ACCMODE) == O_RDONLY);
+		open_count++;
+		record_event(RMW_EVENT_OPEN);
+		return 42;
+	}
+
 	UT_ASSERT((fileFlags & O_RDWR) != 0);
 	UT_ASSERT((fileFlags & (O_CREAT | O_TRUNC)) == 0);
 	open_count++;
@@ -283,6 +301,7 @@ fstat(int fd, struct stat *st)
 {
 	UT_ASSERT_EQ(fd, 42);
 	memset(st, 0, sizeof(*st));
+	st->st_mode = S_IFREG | 0600;
 	st->st_size = virtual_file_size;
 	record_event(RMW_EVENT_FSTAT);
 	return 0;
@@ -292,6 +311,7 @@ int
 stat(const char *path pg_attribute_unused(), struct stat *st)
 {
 	memset(st, 0, sizeof(*st));
+	st->st_mode = S_IFREG | 0600;
 	st->st_size = virtual_file_size;
 	return 0;
 }
@@ -301,6 +321,12 @@ pread(int fd, void *buf, size_t nbyte, off_t offset)
 {
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT_EQ(nbyte, (size_t)CLUSTER_WAL_STATE_SLOT_SIZE);
+	if (test_runtime_ensure) {
+		UT_ASSERT(offset >= 0);
+		UT_ASSERT(offset + (off_t)nbyte <= virtual_file_size);
+		memcpy(buf, virtual_file + offset, nbyte);
+		return (ssize_t)nbyte;
+	}
 	if (offset == 0)
 		record_event(RMW_EVENT_PREAD_HEADER);
 	else {
@@ -361,6 +387,7 @@ close(int fd)
 int
 unlink(const char *path pg_attribute_unused())
 {
+	unlink_count++;
 	return -1;
 }
 
@@ -403,6 +430,9 @@ fixture_reset(void)
 	first_slot_read_buffer = NULL;
 	second_slot_read_buffer = NULL;
 	memset(&last_pwrite_image, 0, sizeof(last_pwrite_image));
+	test_runtime_ensure = false;
+	mutating_open_count = 0;
+	unlink_count = 0;
 }
 
 static ClusterWalStateUpdate
@@ -650,10 +680,70 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
 }
 
+UT_TEST(test_a1_w1_runtime_ensure_is_validate_only)
+{
+	fixture_reset();
+	test_runtime_ensure = true;
+
+	UT_ASSERT(cluster_wal_state_ensure());
+	UT_ASSERT_EQ(mutating_open_count, 0);
+	UT_ASSERT_EQ(pwrite_count, 0);
+	UT_ASSERT_EQ(fsync_count, 0);
+	UT_ASSERT_EQ(unlink_count, 0);
+}
+
+static bool
+runtime_ensure_child_fatals(void)
+{
+	int status;
+	pid_t pid;
+
+	fflush(stdout);
+	pid = fork();
+
+	UT_ASSERT(pid >= 0);
+	if (pid == 0) {
+		test_runtime_ensure = true;
+		(void)cluster_wal_state_ensure();
+		_exit(0);
+	}
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	return WIFSIGNALED(status);
+}
+
+UT_TEST(test_a1_w1_runtime_validates_every_slot_and_bootstrap_is_early_noop)
+{
+	ClusterWalStateSlot *slot;
+
+	fixture_reset();
+	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(97));
+	memset(slot, 0, sizeof(*slot));
+	slot->_reserved[0] = 1;
+	UT_ASSERT(runtime_ensure_child_fatals());
+
+	fixture_reset();
+	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(97));
+	cluster_wal_state_slot_fill(slot, 96, 3, CLUSTER_WAL_SLOT_STATE_ACTIVE, 1, 1, 1, 1, 1);
+	UT_ASSERT(runtime_ensure_child_fatals());
+
+	fixture_reset();
+	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
+	cluster_wal_state_slot_fill(slot, 4, 9, CLUSTER_WAL_SLOT_STATE_ACTIVE, 1, 1, 1, 1, 1);
+	UT_ASSERT(runtime_ensure_child_fatals());
+
+	fixture_reset();
+	test_runtime_ensure = true;
+	Mode = BootstrapProcessing;
+	UT_ASSERT(!cluster_wal_state_ensure());
+	UT_ASSERT_EQ(open_count, 0);
+	UT_ASSERT_EQ(mutating_open_count, 0);
+	Mode = NormalProcessing;
+}
+
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 
 	UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
 	UT_RUN(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread);
@@ -661,6 +751,8 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_a1_postread_mismatch_fails_without_compensation);
 	UT_RUN(test_a1_borrow_verified_cf_does_not_reenter_or_unlock);
 	UT_RUN(test_a1_fresh_header_slot_typed_rejections);
+	UT_RUN(test_a1_w1_runtime_ensure_is_validate_only);
+	UT_RUN(test_a1_w1_runtime_validates_every_slot_and_bootstrap_is_early_noop);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
