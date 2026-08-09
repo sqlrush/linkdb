@@ -20,6 +20,7 @@ use File::Path qw(make_path);
 use Fcntl qw(F_GETFL F_SETFL O_NONBLOCK);
 use PgracClusterNode;
 use PgracWalState qw(read_file_raw read_slot_raw);
+use POSIX ();
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
@@ -130,7 +131,7 @@ sub observe_eor_boundary
 					publish_observation($result_path,
 						join("\t", 'BOUNDARY_UNREACHABLE',
 							'phase4-start-visible-with-eor-complete'));
-					exit 0;
+					POSIX::_exit(0);
 				}
 
 				my $snapshot = owned_w5_bytes($regfile, $thread_id);
@@ -148,12 +149,12 @@ sub observe_eor_boundary
 					publish_observation($result_path,
 						join("\t", 'BOUNDARY_UNREACHABLE',
 							'phase4-start-raced-boundary-snapshot'));
-					exit 0;
+					POSIX::_exit(0);
 				}
 
 				publish_observation($result_path,
 					join("\t", 'SNAPSHOT', $eor_redo, unpack('H*', $snapshot)));
-				exit 0;
+				POSIX::_exit(0);
 			}
 		}
 
@@ -173,7 +174,7 @@ sub observe_eor_boundary
 					join("\t", 'BOUNDARY_UNREACHABLE',
 						'startup-finished-without-isolated-eor-snapshot'));
 			}
-			exit 0;
+			POSIX::_exit(0);
 		}
 
 		usleep(1_000);
@@ -227,7 +228,7 @@ if ($observer_pid == 0)
 	close($control_write);
 	observe_eor_boundary($node->logfile, $restart_cursor, $regfile,
 		$thread_id, $control_read, $result_path);
-	exit 2;
+	POSIX::_exit(2);
 }
 
 close($control_read);
