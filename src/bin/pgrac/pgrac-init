@@ -629,6 +629,20 @@ if [ -n "$WAL_THREADS_DIR" ]; then
         *) die "--wal-threads-dir must be an absolute path (got \"$WAL_THREADS_DIR\")" ;;
     esac
 
+    # W1 owns the data, WAL-thread, and registry-root handoff to initdb.
+    # Reject direct attempts to replace those managed arguments, plus the
+    # option terminator that could hide them.  INITDB_OPTS is deliberately
+    # split exactly as it is at the invocation below.
+    # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
+    for INITDB_OPT in $INITDB_OPTS; do
+        case "$INITDB_OPT" in
+            -D*|--pgdata|--pgdata=*|-X*|--waldir|--waldir=*|\
+                --pgrac-wal-state-root|--pgrac-wal-state-root=*|--)
+                die "--initdb-options cannot override W1 managed -D/-X/--pgrac-wal-state-root arguments"
+                ;;
+        esac
+    done
+
     # W1 read-only preflight.  Refuse a non-fresh PGDATA, a lexical or
     # physical alias for ROOT, and a symlink component before changing the
     # shared root.  realpath(ROOT's parent) also proves the new dirent cannot
@@ -693,8 +707,8 @@ else
     echo "$PROGNAME: running initdb -D \"$TARGET_PGDATA\""
     if [ -n "$WAL_THREADS_DIR" ]; then
         # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
-        "$INITDB" -D "$TARGET_PGDATA" -X "$THREAD_DIR" \
-            "--pgrac-wal-state-root=$WAL_THREADS_DIR" $INITDB_OPTS
+        "$INITDB" $INITDB_OPTS -D "$TARGET_PGDATA" -X "$THREAD_DIR" \
+            "--pgrac-wal-state-root=$WAL_THREADS_DIR"
     else
         # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
         "$INITDB" -D "$TARGET_PGDATA" $INITDB_OPTS

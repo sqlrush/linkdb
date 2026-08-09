@@ -3228,21 +3228,36 @@ pgrac_wal_state_test_failure(const char *point)
 static void
 pgrac_wal_state_validate_handoff(char *thread_name, size_t thread_name_size)
 {
-	char resolved_root[MAXPGPATH];
-	char resolved_xlog[MAXPGPATH];
+	char *resolved_root;
+	char *resolved_xlog;
 	char xlog_parent[MAXPGPATH];
 	char *separator;
 	unsigned int thread_id;
 	char extra;
 
-	if (realpath(pgrac_wal_state_root, resolved_root) == NULL)
+	resolved_root = realpath(pgrac_wal_state_root, NULL);
+	if (resolved_root == NULL)
 		pg_fatal("could not canonicalize pgrac WAL state root \"%s\": %m",
 				 pgrac_wal_state_root);
+	if (strlen(resolved_root) >= MAXPGPATH)
+	{
+		free(resolved_root);
+		pg_fatal("canonical pgrac WAL state root path for \"%s\" is too long",
+				 pgrac_wal_state_root);
+	}
 	if (strcmp(resolved_root, pgrac_wal_state_root) != 0)
 		pg_fatal("pgrac WAL state root \"%s\" is not canonical or contains a symlink escape",
 				 pgrac_wal_state_root);
-	if (realpath(xlog_dir, resolved_xlog) == NULL)
+	resolved_xlog = realpath(xlog_dir, NULL);
+	if (resolved_xlog == NULL)
 		pg_fatal("could not canonicalize pgrac WAL thread directory \"%s\": %m", xlog_dir);
+	if (strlen(resolved_xlog) >= MAXPGPATH)
+	{
+		free(resolved_xlog);
+		free(resolved_root);
+		pg_fatal("canonical pgrac WAL thread directory path for \"%s\" is too long",
+				 xlog_dir);
+	}
 
 	strlcpy(xlog_parent, resolved_xlog, sizeof(xlog_parent));
 	get_parent_directory(xlog_parent);
@@ -3257,6 +3272,8 @@ pgrac_wal_state_validate_handoff(char *thread_name, size_t thread_name_size)
 		pg_fatal("WAL directory \"%s\" is not an exact thread_1..thread_128 child",
 				 resolved_xlog);
 	strlcpy(thread_name, separator + 1, thread_name_size);
+	free(resolved_xlog);
+	free(resolved_root);
 }
 
 static void
