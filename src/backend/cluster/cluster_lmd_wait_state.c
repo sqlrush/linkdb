@@ -28,6 +28,7 @@
 
 #include "access/transam.h"
 #include "cluster/cluster_lmd_wait_state.h"
+#include "miscadmin.h"
 
 #define CLUSTER_LMD_WAIT_STATE_READ_RETRIES 16
 
@@ -75,9 +76,11 @@ cluster_lmd_wait_state_reset(ClusterLmdProcWaitState *ws)
 	 * publish.  wait_seq is left monotonically climbing so a stale victim
 	 * tuple recorded for the predecessor can never re-match.
 	 */
+	HOLD_INTERRUPTS();
 	odd = cluster_lmd_wait_state_write_begin(ws);
 	ws->active = 0;
 	cluster_lmd_wait_state_write_end(ws, odd);
+	RESUME_INTERRUPTS();
 }
 
 uint64
@@ -87,6 +90,7 @@ cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws, uint8 kind, uint64 r
 	uint64 seq;
 	uint32 odd;
 
+	HOLD_INTERRUPTS();
 	odd = cluster_lmd_wait_state_write_begin(ws);
 	ws->kind = kind;
 	ws->request_id = request_id;
@@ -95,6 +99,7 @@ cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws, uint8 kind, uint64 r
 	seq = pg_atomic_fetch_add_u64(&ws->wait_seq, 1) + 1;
 	ws->active = 1;
 	cluster_lmd_wait_state_write_end(ws, odd);
+	RESUME_INTERRUPTS();
 
 	return seq;
 }
@@ -107,9 +112,11 @@ cluster_lmd_wait_state_clear(ClusterLmdProcWaitState *ws)
 	/* The single funnel every wait-exit path (grant / timeout / ERROR /
 	 * cancel) calls.  Leaves the data fields and wait_seq in place; active
 	 * is the authoritative "still waiting" signal. */
+	HOLD_INTERRUPTS();
 	odd = cluster_lmd_wait_state_write_begin(ws);
 	ws->active = 0;
 	cluster_lmd_wait_state_write_end(ws, odd);
+	RESUME_INTERRUPTS();
 }
 
 ClusterLmdWaitStateReadResult

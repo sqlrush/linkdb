@@ -187,15 +187,20 @@ cluster_tx_enqueue_shmem_register(void)
  * Wait / wake.
  * ============================================================ */
 
-static void
+static bool
 txw_slot_set(int procno, const ClusterTTStatusKey *holder_key)
 {
+	bool registered = false;
+
 	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
-	if (ClusterTxw->slots[procno].waiting == CLUSTER_TXW_SLOT_FREE)
+	if (ClusterTxw->slots[procno].waiting == CLUSTER_TXW_SLOT_FREE) {
+		ClusterTxw->slots[procno].identity.source_key = *holder_key;
+		ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_SOURCE;
 		pg_atomic_fetch_add_u32(&ClusterTxw->active_waiters, 1);
-	ClusterTxw->slots[procno].identity.source_key = *holder_key;
-	ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_SOURCE;
+		registered = true;
+	}
 	LWLockRelease(&ClusterTxw->lock);
+	return registered;
 }
 
 static bool
@@ -216,12 +221,32 @@ txw_target_slot_set_if_free(int procno, const ClusterTxLocator *aligned_locator)
 }
 
 static void
-txw_slot_clear(int procno)
+txw_slot_clear(int procno, uint32 expected_kind)
 {
+	uint32 active;
+	uint32 current_kind;
+
+	Assert(expected_kind == CLUSTER_TXW_SLOT_SOURCE
+		   || expected_kind == CLUSTER_TXW_SLOT_TARGET);
 	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
-	if (ClusterTxw->slots[procno].waiting != CLUSTER_TXW_SLOT_FREE)
-		pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
+	current_kind = ClusterTxw->slots[procno].waiting;
+	if (current_kind == CLUSTER_TXW_SLOT_FREE) {
+		LWLockRelease(&ClusterTxw->lock);
+		return;
+	}
+	if (current_kind != expected_kind) {
+		LWLockRelease(&ClusterTxw->lock);
+		ereport(PANIC,
+				(errmsg("cluster TX waiter slot ownership changed during cleanup")));
+	}
+	active = pg_atomic_read_u32(&ClusterTxw->active_waiters);
+	if (active == 0) {
+		LWLockRelease(&ClusterTxw->lock);
+		ereport(PANIC,
+				(errmsg("cluster TX active waiter counter underflow during cleanup")));
+	}
 	ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_FREE;
+	pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
 	LWLockRelease(&ClusterTxw->lock);
 }
 
@@ -237,7 +262,7 @@ txw_slot_kind(int procno)
 }
 
 static void
-txw_exit_slot_clear_if_same(int procno, uint32 expected_kind)
+txw_exit_slot_prevalidate(int procno, uint32 expected_kind)
 {
 	uint32 active;
 	uint32 current_kind;
@@ -246,17 +271,30 @@ txw_exit_slot_clear_if_same(int procno, uint32 expected_kind)
 		   || expected_kind == CLUSTER_TXW_SLOT_TARGET);
 	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
 	current_kind = ClusterTxw->slots[procno].waiting;
-	if (current_kind == expected_kind) {
-		active = pg_atomic_read_u32(&ClusterTxw->active_waiters);
-		Assert(active > 0);
-		if (active > 0) {
-			ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_FREE;
-			pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
-		}
+	if (current_kind != expected_kind) {
+		LWLockRelease(&ClusterTxw->lock);
+		ereport(PANIC,
+				(errmsg("cluster TX waiter slot ownership changed during backend-exit cleanup")));
 	}
-	else
-		Assert(current_kind == CLUSTER_TXW_SLOT_FREE);
+	active = pg_atomic_read_u32(&ClusterTxw->active_waiters);
+	if (active == 0) {
+		LWLockRelease(&ClusterTxw->lock);
+		ereport(PANIC,
+				(errmsg("cluster TX active waiter counter underflow during backend-exit cleanup")));
+	}
 	LWLockRelease(&ClusterTxw->lock);
+}
+
+static void
+txw_exact_wfg_cancel(const ClusterLmdVertex *waiter)
+{
+	ClusterLmdGraphRemoveResult remove_result;
+
+	remove_result = cluster_lmd_graph_remove_edge_by_waiter_exact_result(waiter);
+	if (remove_result != CLUSTER_LMD_GRAPH_REMOVE_REMOVED
+		&& remove_result != CLUSTER_LMD_GRAPH_REMOVE_ABSENT)
+		ereport(PANIC,
+				(errmsg("cluster TX exact waiter identity became stale during cleanup")));
 }
 
 static void
@@ -273,7 +311,8 @@ txw_exact_waiter_vertex(ClusterLmdVertex *waiter, int procno, uint64 formation_e
 }
 
 static void
-txw_exact_cleanup(int procno, bool slot_registered, bool wait_state_published,
+txw_exact_cleanup(int procno, uint32 slot_kind, bool slot_registered,
+				  bool wait_state_published,
 				  bool wfg_registered, uint64 formation_epoch, TransactionId xid,
 				  uint64 wait_seq)
 {
@@ -281,12 +320,12 @@ txw_exact_cleanup(int procno, bool slot_registered, bool wait_state_published,
 		ClusterLmdVertex waiter;
 
 		txw_exact_waiter_vertex(&waiter, procno, formation_epoch, xid, wait_seq);
-		cluster_lmd_cancel_wait_edge_real(&waiter);
+		txw_exact_wfg_cancel(&waiter);
 	}
 	if (wait_state_published)
 		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 	if (slot_registered)
-		txw_slot_clear(procno);
+		txw_slot_clear(procno, slot_kind);
 }
 
 /*
@@ -317,27 +356,38 @@ cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code pg_attribute_unused
 	if (procno < 0 || procno >= ClusterTxw->nslots)
 		return;
 	slot_kind = txw_slot_kind(procno);
-	if (slot_kind != CLUSTER_TXW_SLOT_SOURCE && slot_kind != CLUSTER_TXW_SLOT_TARGET)
+	if (slot_kind == CLUSTER_TXW_SLOT_FREE)
 		return;
+	if (slot_kind != CLUSTER_TXW_SLOT_SOURCE && slot_kind != CLUSTER_TXW_SLOT_TARGET)
+		ereport(PANIC,
+				(errmsg("cluster TX waiter slot has invalid ownership discriminator during backend-exit cleanup")));
 
 	memset(&wait_state, 0, sizeof(wait_state));
 	read_result = cluster_lmd_wait_state_read_exact(&MyProc->cluster_lmd_wait, &wait_state);
-	Assert(read_result != CLUSTER_LMD_WAIT_STATE_READ_ACTIVE
-		   || (wait_state.active && wait_state.kind == CLUSTER_LMD_WAIT_TX
-			   && wait_state.request_id == 0 && wait_state.wait_seq != 0));
-	if (read_result == CLUSTER_LMD_WAIT_STATE_READ_ACTIVE && wait_state.active
-		&& wait_state.kind == CLUSTER_LMD_WAIT_TX && wait_state.request_id == 0
-		&& wait_state.wait_seq != 0) {
+	if (read_result == CLUSTER_LMD_WAIT_STATE_READ_BUSY)
+		ereport(PANIC,
+				(errmsg("cluster TX waiter state remained busy during backend-exit cleanup")));
+	if (read_result == CLUSTER_LMD_WAIT_STATE_READ_ACTIVE) {
+		if (!wait_state.active || wait_state.kind != CLUSTER_LMD_WAIT_TX
+			|| wait_state.request_id != 0 || wait_state.wait_seq == 0)
+			ereport(PANIC,
+					(errmsg("cluster TX waiter state is malformed during backend-exit cleanup")));
+	}
+	else if (read_result != CLUSTER_LMD_WAIT_STATE_READ_INACTIVE)
+		ereport(PANIC,
+				(errmsg("cluster TX waiter state has unknown read result during backend-exit cleanup")));
+	txw_exit_slot_prevalidate(procno, slot_kind);
+
+	/* ACTIVE cleanup order is exact WFG edge, proc wait state, owned slot. */
+	if (read_result == CLUSTER_LMD_WAIT_STATE_READ_ACTIVE) {
 		ClusterLmdVertex waiter;
 
 		txw_exact_waiter_vertex(&waiter, procno, wait_state.cluster_epoch,
-							  wait_state.xid, wait_state.wait_seq);
-		cluster_lmd_cancel_wait_edge_real(&waiter);
+						  wait_state.xid, wait_state.wait_seq);
+		txw_exact_wfg_cancel(&waiter);
+		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 	}
-
-	/* Required cleanup order: exact WFG edge, proc wait state, owned slot. */
-	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
-	txw_exit_slot_clear_if_same(procno, slot_kind);
+	txw_slot_clear(procno, slot_kind);
 }
 
 ClusterTxwResult
@@ -368,10 +418,11 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 		return CLUSTER_TXW_TIMEOUT;
 	}
 
-	pg_atomic_fetch_add_u64(&ClusterTxw->wait_count, 1);
 	deadline = GetCurrentTimestamp() + (TimestampTz)effective_timeout_ms * 1000;
 
-	txw_slot_set(procno, holder_key);
+	if (!txw_slot_set(procno, holder_key))
+		return CLUSTER_TXW_UNPROVABLE;
+	pg_atomic_fetch_add_u64(&ClusterTxw->wait_count, 1);
 
 	/*
 	 * spec-5.8 D1d — publish the cluster wait-state so the LMD deadlock
@@ -384,8 +435,8 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	 * xid from the TT status key); its backend procno is not carried, so the
 	 * blocker is a placeholder (CLUSTER_LMD_TX_HOLDER_PROCNO) that the
 	 * coordinator resolves by (node, xid) against the holder's own waiter
-	 * vertex (T2).  Best-effort: a full edge table only loses a detection (the
-	 * finite timeout backstops), so it never fails the wait (Rule 8.A).
+		 * vertex (T2).  A full edge table fails admission closed: waiting without
+		 * the exact graph edge would make deadlock detection incomplete.
 	 */
 	{
 		uint64 wait_epoch = cluster_epoch_get_current();
@@ -411,8 +462,12 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 		blocker.request_id = 0;
 		blocker.xid = holder_key->local_xid;
 
-		(void)cluster_lmd_submit_wait_edge_real(&tx_wfg_waiter, &blocker, 0);
-		tx_wfg_registered = true;
+		tx_wfg_registered = cluster_lmd_submit_wait_edge_real(&tx_wfg_waiter, &blocker, 0);
+	}
+	if (!tx_wfg_registered) {
+		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+		txw_slot_clear(procno, CLUSTER_TXW_SLOT_SOURCE);
+		return CLUSTER_TXW_UNPROVABLE;
 	}
 
 	/*
@@ -465,18 +520,18 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	}
 	PG_CATCH();
 	{
-		txw_slot_clear(procno);
-		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 		if (tx_wfg_registered)
-			cluster_lmd_cancel_wait_edge_real(&tx_wfg_waiter);
+			txw_exact_wfg_cancel(&tx_wfg_waiter);
+		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+		txw_slot_clear(procno, CLUSTER_TXW_SLOT_SOURCE);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	txw_slot_clear(procno);
-	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 	if (tx_wfg_registered)
-		cluster_lmd_cancel_wait_edge_real(&tx_wfg_waiter);
+		txw_exact_wfg_cancel(&tx_wfg_waiter);
+	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+	txw_slot_clear(procno, CLUSTER_TXW_SLOT_SOURCE);
 	return result;
 }
 
@@ -501,6 +556,7 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	volatile ClusterTxwResult result = CLUSTER_TXW_UNPROVABLE;
 	volatile ClusterTxResolveReason final_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
+	Assert(AmRegularBackendProcess());
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
 
@@ -670,7 +726,8 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	}
 	PG_FINALLY();
 	{
-		txw_exact_cleanup(procno, (bool)slot_registered, (bool)wait_state_published,
+		txw_exact_cleanup(procno, CLUSTER_TXW_SLOT_TARGET, (bool)slot_registered,
+						  (bool)wait_state_published,
 						  (bool)wfg_registered, formation_epoch, my_xid, (uint64)wait_seq);
 	}
 	PG_END_TRY();

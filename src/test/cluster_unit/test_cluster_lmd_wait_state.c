@@ -77,6 +77,8 @@
 
 UT_DEFINE_GLOBALS();
 
+volatile uint32 InterruptHoldoffCount;
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
