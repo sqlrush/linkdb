@@ -67,6 +67,8 @@ run_wire_vector(int vector)
 {
 	ClusterR4RequestExtension request;
 	ClusterR4ForwardExtension forward;
+	ClusterTxLocator locator;
+	ClusterTxLocator decoded_locator;
 	uint64 master_generation = 0;
 	uint64 transition_count = 0;
 	SCN scn = InvalidScn;
@@ -78,10 +80,18 @@ run_wire_vector(int vector)
 
 	memset(&request, 0, sizeof(request));
 	memset(&forward, 0, sizeof(forward));
+	memset(&locator, 0, sizeof(locator));
+	memset(&decoded_locator, 0, sizeof(decoded_locator));
 	memset(bytes, 0, sizeof(bytes));
 	memset(page, 0, sizeof(page));
 	memset(&input, 0, sizeof(input));
 	memset(&output, 0, sizeof(output));
+	locator.uba.raw[0] = UINT64_C(0x0102030405060708);
+	locator.uba.raw[1] = UINT64_C(0x1112131415161718);
+	locator.xid = (TransactionId)798;
+	locator.tt_wrap = 7;
+	locator.itl_kind = ITL_FLAG_ACTIVE;
+	locator.itl_slot_index = 1;
 
 	switch (vector) {
 		case 0:
@@ -233,7 +243,99 @@ run_wire_vector(int vector)
 			ClusterR4ForwardExtensionSetCrProof(&forward, (UINT64_C(0xffffffff) << 32) | 1, 1,
 											 InvalidScn);
 			UT_ASSERT(ClusterR4ForwardExtensionGetCrProof(&forward, UINT64_MAX,
-												  &master_generation, &transition_count, &scn));
+										  &master_generation, &transition_count, &scn));
+			break;
+		case 32:
+			UT_ASSERT(ClusterR4ForwardExtensionSetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &locator));
+			UT_ASSERT(ClusterR4ForwardExtensionGetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator));
+			UT_ASSERT_EQ(memcmp(&decoded_locator, &locator, sizeof(locator)), 0);
+			break;
+		case 33:
+			UT_ASSERT(ClusterR4ForwardExtensionSetLocator(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator));
+			UT_ASSERT(ClusterR4ForwardExtensionGetLocator(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &decoded_locator));
+			UT_ASSERT_EQ(memcmp(&decoded_locator, &locator, sizeof(locator)), 0);
+			break;
+		case 34:
+			UT_ASSERT(ClusterR4ForwardExtensionSetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &locator));
+			UT_ASSERT_EQ(ClusterR4WireReadU64(&forward.kind.locator_bytes[0]),
+						 locator.uba.raw[0]);
+			UT_ASSERT_EQ(ClusterR4WireReadU64(&forward.kind.locator_bytes[8]),
+						 locator.uba.raw[1]);
+			UT_ASSERT_EQ(ClusterR4WireReadU32(&forward.kind.locator_bytes[16]),
+						 (uint32)locator.xid);
+			UT_ASSERT_EQ(ClusterR4WireReadU16(&forward.kind.locator_bytes[20]), locator.tt_wrap);
+			UT_ASSERT_EQ(forward.kind.locator_bytes[22], locator.itl_kind);
+			UT_ASSERT_EQ(forward.kind.locator_bytes[23], locator.itl_slot_index);
+			break;
+		case 35:
+			memset(&forward, 0xa5, sizeof(forward));
+			UT_ASSERT(!ClusterR4ForwardExtensionSetLocator(
+				&forward, CLUSTER_R4_WIRE_CR_BUILD, &locator));
+			UT_ASSERT(bytes_are_zero((const uint8 *)&forward, sizeof(forward)));
+			break;
+		case 36:
+			memset(&forward, 0xa5, sizeof(forward));
+			UT_ASSERT(!ClusterR4ForwardExtensionSetLocator(
+				&forward, CLUSTER_R4_WIRE_MULTI_RESOLVE, &locator));
+			UT_ASSERT(bytes_are_zero((const uint8 *)&forward, sizeof(forward)));
+			break;
+		case 37:
+			UT_ASSERT(!ClusterR4ForwardExtensionSetLocator(
+				NULL, CLUSTER_R4_WIRE_TX_RESOLVE, &locator));
+			memset(&forward, 0xa5, sizeof(forward));
+			UT_ASSERT(!ClusterR4ForwardExtensionSetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, NULL));
+			UT_ASSERT(bytes_are_zero((const uint8 *)&forward, sizeof(forward)));
+			break;
+		case 38:
+			ClusterR4ForwardExtensionSetLocator(&forward, CLUSTER_R4_WIRE_TX_RESOLVE,
+										&locator);
+			memset(&decoded_locator, 0xa5, sizeof(decoded_locator));
+			forward.flags_le[0] = 1;
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator));
+			UT_ASSERT(bytes_are_zero((const uint8 *)&decoded_locator, sizeof(decoded_locator)));
+			break;
+		case 39:
+			ClusterR4ForwardExtensionSetLocator(&forward, CLUSTER_R4_WIRE_TX_RESOLVE,
+										&locator);
+			forward.subject_id_le[3] = 1;
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator));
+			break;
+		case 40:
+			ClusterR4ForwardExtensionSetLocator(&forward, CLUSTER_R4_WIRE_TX_RESOLVE,
+										&locator);
+			forward.r4_version++;
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator));
+			break;
+		case 41:
+			ClusterR4ForwardExtensionSetLocator(&forward, CLUSTER_R4_WIRE_TX_RESOLVE,
+										&locator);
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocator(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &decoded_locator));
+			break;
+		case 42:
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocator(
+				NULL, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator));
+			ClusterR4ForwardExtensionSetLocator(&forward, CLUSTER_R4_WIRE_TX_RESOLVE,
+										&locator);
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, NULL));
+			break;
+		case 43:
+			ClusterR4ForwardExtensionSetLocator(&forward, CLUSTER_R4_WIRE_TX_RESOLVE,
+										&locator);
+			forward.kind.locator_bytes[16] ^= 1;
+			UT_ASSERT(ClusterR4ForwardExtensionGetLocator(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator));
+			UT_ASSERT(decoded_locator.xid != locator.xid);
 			break;
 		case 64:
 			UT_ASSERT_EQ(CLUSTER_R4_TX_VERDICT_VERSION, 3);
