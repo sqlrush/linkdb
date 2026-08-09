@@ -45,6 +45,9 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_lms.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_startup_phase.h"
 
 #undef printf
@@ -57,6 +60,8 @@
 #undef vsprintf
 #undef strerror
 #undef strerror_r
+
+#include <setjmp.h>
 
 #include "unit_test.h"
 
@@ -91,21 +96,30 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
-/* ereport machinery -- never invoked by the runtime tests below. */
+/* ereport machinery; the quorum-negative test captures the expected FATAL. */
+static jmp_buf phase4_fatal_jump;
+static bool phase4_capture_fatal = false;
+static int phase4_last_elevel = 0;
+
 bool
-errstart(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart(int e, const char *d pg_attribute_unused())
 {
-	return false;
+	phase4_last_elevel = e;
+	return phase4_capture_fatal;
 }
 bool
-errstart_cold(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart_cold(int e, const char *d pg_attribute_unused())
 {
-	return false;
+	phase4_last_elevel = e;
+	return phase4_capture_fatal;
 }
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 		  const char *fn pg_attribute_unused())
-{}
+{
+	if (phase4_capture_fatal && phase4_last_elevel >= ERROR)
+		longjmp(phase4_fatal_jump, 1);
+}
 int
 errcode(int s pg_attribute_unused())
 {
@@ -147,13 +161,13 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 	return NULL;
 }
 
-/* timestamp.h stubs -- cluster_advance_phase calls GetCurrentTimestamp;
- * the runtime tests below exercise only the pure function lookups so
- * these stubs return zero. */
+/* Test clock: pg_usleep advances it without wall-clock delay. */
+static TimestampTz phase4_test_now = 0;
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 0;
+	return phase4_test_now;
 }
 void
 TimestampDifference(TimestampTz start_time pg_attribute_unused(),
@@ -174,6 +188,12 @@ const char *
 timestamptz_to_str(TimestampTz dt pg_attribute_unused())
 {
 	return "(stub)";
+}
+
+void
+pg_usleep(long microsec)
+{
+	phase4_test_now += microsec;
 }
 
 /* pg_snprintf: cluster_startup_phase.c uses snprintf (macro'd to
@@ -221,9 +241,12 @@ void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr)
 {
+	static char fake_shmem[4096];
+
+	memset(fake_shmem, 0, sizeof(fake_shmem));
 	if (foundPtr != NULL)
 		*foundPtr = false;
-	return NULL;
+	return fake_shmem;
 }
 
 int cluster_phase1_timeout = 60;
@@ -232,6 +255,9 @@ int cluster_phase3_timeout = 600;
 int cluster_phase4_timeout = 30;
 /* Spec-1.11 Sprint B: cluster_startup_phase.c references cluster_enabled */
 bool cluster_enabled = true;
+bool cluster_lms_enabled = true;
+bool cluster_controlfile_shared_authority = true;
+char *cluster_wal_threads_dir = "/rf-a1/formed";
 /* Spec-1.16 D13: cluster_finalize_startup_running references cluster_node_id
  * for SCN_NODE_ID_VALID validation.  Pin to 0 (valid) so unit test does
  * not trip the FATAL ereport path; behavioral test lives in TAP 060 L19. */
@@ -247,7 +273,7 @@ char *cluster_voting_disks = NULL;
 int
 cluster_conf_node_count(void)
 {
-	return 0; /* unit harness has no pgrac.conf — single-node default */
+	return 4;
 }
 
 #include "cluster/cluster_shmem.h"
@@ -256,11 +282,26 @@ cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unus
 {}
 
 /* spec-4.12 D6 stub: cluster_startup_phase.o references the rejoin self-fence gate. */
+static int startup_self_check_calls = 0;
 bool cluster_write_fence_startup_self_check(void);
 bool
 cluster_write_fence_startup_self_check(void)
 {
+	startup_self_check_calls++;
 	return false;
+}
+
+static char phase4_events[32];
+static int phase4_event_count = 0;
+static bool phase4_test_in_quorum = true;
+static int phase4_quorum_check_calls = 0;
+
+static void
+record_phase4_event(char event)
+{
+	UT_ASSERT(phase4_event_count < (int)sizeof(phase4_events) - 1);
+	phase4_events[phase4_event_count++] = event;
+	phase4_events[phase4_event_count] = '\0';
 }
 
 /* Spec-1.11 Sprint A stubs (cluster_startup_phase.o references). */
@@ -292,60 +333,83 @@ cluster_lck_wait_for_ready(int timeout_ms pg_attribute_unused())
 int
 cluster_diag_start(void)
 {
-	return 0;
+	record_phase4_event('D');
+	return 11;
 }
 bool
 cluster_diag_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
-	return false;
+	record_phase4_event('d');
+	return true;
 }
 
 /* Spec-1.14 stubs. */
 int
 cluster_stats_start(void)
 {
-	return 0;
+	record_phase4_event('S');
+	return 15;
 }
 bool
 cluster_stats_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
-	return false;
+	record_phase4_event('s');
+	return true;
 }
 
 /* Spec-2.5 stubs. */
 int
 cluster_cssd_start(void)
 {
-	return 0;
+	record_phase4_event('C');
+	return 12;
 }
 bool
 cluster_cssd_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
-	return false;
+	record_phase4_event('c');
+	return true;
 }
 
 /* spec-2.6 Sprint A Step 3 D7 stubs. */
 pid_t
 cluster_qvotec_start(void)
 {
-	return 0;
+	record_phase4_event('Q');
+	return 13;
 }
 bool
 cluster_qvotec_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
-	return false;
+	record_phase4_event('q');
+	return true;
+}
+bool
+cluster_qvotec_in_quorum(void)
+{
+	if (phase4_quorum_check_calls++ == 0)
+		record_phase4_event('V');
+	return phase4_test_in_quorum;
 }
 
 /* spec-2.18 Sprint A stubs. */
 int
 cluster_lms_start(void)
 {
-	return 0;
+	record_phase4_event('L');
+	return 14;
 }
 bool
 cluster_lms_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
-	return false;
+	record_phase4_event('l');
+	return true;
+}
+bool
+cluster_lms_is_ready(void)
+{
+	record_phase4_event('E');
+	return true;
 }
 
 
@@ -355,10 +419,13 @@ UT_DEFINE_GLOBALS();
 /* spec-4.2 D3 stub: cluster_startup_phase.c publishes ACTIVE to the
  * WAL-state registry at the phase->RUNNING transition; the registry
  * module is not linked here (L104). */
+static int postmaster_publish_active_calls = 0;
 void cluster_wal_state_publish_active(void);
 void
 cluster_wal_state_publish_active(void)
-{}
+{
+	postmaster_publish_active_calls++;
+}
 
 
 /* ============================================================
@@ -492,6 +559,93 @@ UT_TEST(test_phase_shmem_register_init_linkable)
 }
 
 
+UT_TEST(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready)
+{
+	phase4_event_count = 0;
+	phase4_events[0] = '\0';
+	phase4_test_now = 0;
+	phase4_test_in_quorum = true;
+	phase4_quorum_check_calls = 0;
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	cluster_phase_shmem_init();
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
+	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
+	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
+
+	cluster_run_phase4_sequence();
+
+	UT_ASSERT_STR_EQ(phase4_events, "DdCcQqVLlESs");
+}
+
+
+UT_TEST(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc)
+{
+	bool caught_fatal = false;
+
+	phase4_event_count = 0;
+	phase4_events[0] = '\0';
+	phase4_test_now = 0;
+	phase4_test_in_quorum = false;
+	phase4_quorum_check_calls = 0;
+	cluster_allow_single_node = true;
+	cluster_wal_threads_dir = "/rf-a1/formed";
+	cluster_phase_shmem_init();
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
+	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
+	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
+
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_phase4_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "DdCcQqV");
+	UT_ASSERT(phase4_quorum_check_calls > 0);
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_4_NORMAL);
+	phase4_test_in_quorum = true;
+}
+
+
+UT_TEST(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order)
+{
+	phase4_event_count = 0;
+	phase4_events[0] = '\0';
+	cluster_wal_threads_dir = NULL;
+	cluster_phase_shmem_init();
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
+	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
+	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
+
+	cluster_run_phase4_sequence();
+
+	UT_ASSERT_STR_EQ(phase4_events, "DdSsCcQq");
+	startup_self_check_calls = 0;
+	postmaster_publish_active_calls = 0;
+	cluster_finalize_startup_running();
+	UT_ASSERT_EQ(startup_self_check_calls, 1);
+	UT_ASSERT_EQ(postmaster_publish_active_calls, 0);
+	cluster_wal_threads_dir = "/rf-a1/formed";
+}
+
+
+UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
+{
+	postmaster_publish_active_calls = 0;
+	startup_self_check_calls = 0;
+	cluster_finalize_startup_running();
+
+	UT_ASSERT_EQ(postmaster_publish_active_calls, 0);
+	UT_ASSERT_EQ(startup_self_check_calls, 0);
+}
+
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -499,7 +653,7 @@ UT_TEST(test_phase_shmem_register_init_linkable)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -508,6 +662,10 @@ main(void)
 	UT_RUN(test_public_symbols_linkable);
 	UT_RUN(test_phase_shmem_state_size_under_4kb);
 	UT_RUN(test_phase_shmem_register_init_linkable);
+	UT_RUN(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready);
+	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
+	UT_RUN(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order);
+	UT_RUN(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

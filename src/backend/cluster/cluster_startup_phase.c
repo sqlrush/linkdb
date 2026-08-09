@@ -595,6 +595,124 @@ cluster_phase_remaining_budget_ms(TimestampTz deadline, int driver_buffer_ms)
 	return remaining_ms > 100 ? (int)remaining_ms : 100;
 }
 
+
+static bool
+cluster_phase4_wal_state_configured(void)
+{
+	return cluster_enabled && cluster_wal_threads_dir != NULL
+		&& cluster_wal_threads_dir[0] != '\0';
+}
+
+
+static bool
+cluster_phase4_wait_for_quorum(TimestampTz deadline)
+{
+	for (;;) {
+		if (cluster_qvotec_in_quorum())
+			return true;
+		if (GetCurrentTimestamp() >= deadline)
+			return false;
+		pg_usleep(100000L);
+	}
+}
+
+
+static void
+cluster_validate_running_configuration(void)
+{
+	if (cluster_phase4_wal_state_configured() && !cluster_controlfile_shared_authority)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("formed WAL registry requires shared control-file authority"),
+				 errhint("Set cluster.controlfile_shared_authority=on and restart all "
+						 "members on the same RF A1 binary.")));
+
+	if (cluster_enabled && !SCN_NODE_ID_VALID(cluster_node_id)) {
+		if (cluster_allow_single_node) {
+			ereport(WARNING,
+					(errcode(ERRCODE_WARNING),
+					 errmsg("cluster.node_id (%d) is outside the valid range 0..%d; "
+							"cluster SCN advance will silently skip",
+							cluster_node_id, SCN_MAX_VALID_NODE_ID),
+					 errhint("Set cluster.node_id in postgresql.conf to an integer 0..127 "
+							 "to enable SCN advance, or set cluster.enabled = off for "
+							 "vanilla PG behaviour.  Currently running in single-node "
+							 "compatibility mode (cluster.allow_single_node = on).  Set "
+							 "cluster.allow_single_node = off to enforce strict mode.")));
+		} else {
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("cluster.node_id (%d) is outside the valid range 0..%d",
+							cluster_node_id, SCN_MAX_VALID_NODE_ID),
+					 errhint("Set cluster.node_id in postgresql.conf to an integer 0..127, "
+							 "or set cluster.allow_single_node = on for single-node "
+							 "compatibility mode.")));
+		}
+	}
+
+	if (cluster_enabled && cluster_conf_node_count() > 1 && !cluster_allow_single_node) {
+		const char *vd = cluster_voting_disks;
+		bool empty = true;
+
+		if (vd != NULL) {
+			while (*vd) {
+				if (*vd != ' ' && *vd != '\t' && *vd != ',') {
+					empty = false;
+					break;
+				}
+				vd++;
+			}
+		}
+
+		if (empty)
+			ereport(FATAL,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("multi-node cluster requires cluster.voting_disks to be "
+							"configured when cluster.allow_single_node=off"),
+					 errdetail("pgrac.conf declares %d nodes but cluster.voting_disks is "
+							   "empty.  Without voting disks the cluster has no quorum "
+							   "protocol and backends would silently fail-open under partition.",
+							   cluster_conf_node_count()),
+					 errhint("Set cluster.voting_disks in postgresql.conf to a comma-"
+							 "separated list of pre-formatted voting-disk file paths "
+							 "(odd majority recommended: 1 / 3 / 5 / 7 disks across "
+							 "distinct failure domains), or set cluster.allow_single_node = on "
+							 "for single-node development mode.")));
+	}
+}
+
+
+static PhaseRunResult
+cluster_phase4_start_stats(PhaseRunFailContext *fail_ctx, TimestampTz deadline,
+						   int *stats_pid)
+{
+	int remaining_ms;
+
+	*stats_pid = cluster_stats_start();
+	if (*stats_pid <= 0) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_STATS_SPAWN_FAILED;
+		fail_ctx->errmsg = "cluster phase 4: failed to spawn Cluster Stats aux process";
+		fail_ctx->errhint = "Check postmaster log for fork() error.  Confirm OS process "
+							"limits (ulimit -u) leave room for the Cluster Stats aux "
+							"process; if the limit is exhausted, raise it via ulimit "
+							"or systemd LimitNPROC and restart postmaster.";
+		return PHASE_RUN_FATAL;
+	}
+
+	remaining_ms = cluster_phase_remaining_budget_ms(deadline, 5000);
+	if (!cluster_stats_wait_for_ready(remaining_ms)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_STATS_NOT_READY;
+		fail_ctx->errmsg = "cluster phase 4: Cluster Stats did not publish READY in time";
+		fail_ctx->errhint = "Check postmaster log for Cluster Stats-side errors.  If "
+							"Cluster Stats is slow on this hardware, raise "
+							"cluster.phase4_timeout (PGC_SIGHUP).";
+		return PHASE_RUN_FATAL;
+	}
+
+	return PHASE_RUN_OK;
+}
+
+
 static PhaseRunResult
 phase_4_handler(PhaseRunFailContext *fail_ctx)
 {
@@ -603,11 +721,13 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 	int cssd_pid;
 	int qvotec_pid;
 	int diag_remaining_ms;
-	int stats_remaining_ms;
 	int cssd_remaining_ms;
 	int qvotec_remaining_ms;
+	int lms_pid = 0;
+	int lms_remaining_ms;
 	TimestampTz phase4_start;
 	TimestampTz phase4_deadline;
+	bool registry_configured;
 
 	Assert(!IsUnderPostmaster);
 
@@ -638,6 +758,7 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 	phase4_start = GetCurrentTimestamp();
 	phase4_deadline = TimestampTzPlusMilliseconds(
 		phase4_start, cluster_phase_timeout_for(CLUSTER_PHASE_4_NORMAL) * 1000);
+	registry_configured = cluster_phase4_wal_state_configured();
 
 	/* ----------
 	 * spec-1.13 D6: DIAG spawn + sync wait ready (first phase 4 child).
@@ -663,36 +784,14 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	/* ----------
-	 * spec-1.14 D6: Cluster Stats spawn + sync wait ready (second
-	 * phase 4 child).  Remaining budget recomputed off the same
-	 * phase4_deadline (Q3 single deadline pattern).
-	 * ----------
-	 */
-	stats_pid = cluster_stats_start();
-	if (stats_pid <= 0) {
-		fail_ctx->errcode = ERRCODE_CLUSTER_STATS_SPAWN_FAILED;
-		fail_ctx->errmsg = "cluster phase 4: failed to spawn Cluster Stats aux process";
-		fail_ctx->errhint = "Check postmaster log for fork() error.  Confirm OS process "
-							"limits (ulimit -u) leave room for the Cluster Stats aux "
-							"process; if the limit is exhausted, raise it via ulimit "
-							"or systemd LimitNPROC and restart postmaster.";
+	/* A flat/unconfigured registry keeps the pre-RF child order unchanged. */
+	if (!registry_configured
+		&& cluster_phase4_start_stats(fail_ctx, phase4_deadline, &stats_pid)
+			== PHASE_RUN_FATAL)
 		return PHASE_RUN_FATAL;
-	}
-
-	stats_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
-	if (!cluster_stats_wait_for_ready(stats_remaining_ms)) {
-		fail_ctx->errcode = ERRCODE_CLUSTER_STATS_NOT_READY;
-		fail_ctx->errmsg = "cluster phase 4: Cluster Stats did not publish READY in time";
-		fail_ctx->errhint = "Check postmaster log for Cluster Stats-side errors.  If "
-							"Cluster Stats is slow on this hardware, raise "
-							"cluster.phase4_timeout (PGC_SIGHUP).";
-		return PHASE_RUN_FATAL;
-	}
 
 	/* ----------
-	 * spec-2.5 D5: CSSD spawn + sync wait ready (third phase 4 child).
-	 * Same Q3 single deadline pattern shared with DIAG + Stats.
+	 * RF A1: CSSD follows DIAG and precedes every registry writer.
 	 * Step 5 D10 lands proper SQLSTATEs (53R30 / 53R31);Step 4 reuses
 	 * Cluster Stats SQLSTATE codes as placeholders to keep the
 	 * compile-time link clean.
@@ -718,8 +817,9 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 	}
 
 	/* ----------
-	 * spec-2.6 Sprint A Step 3 D8 — QVOTEC spawn + sync wait ready.
-	 * Same Q3 single deadline pattern shared with DIAG + Stats + CSSD.
+	 * RF A1: QVOTEC follows CSSD.  In strict formed multi-node mode,
+	 * READY is only the process lifecycle gate; wait for the existing
+	 * lease-aware quorum proof under the same phase-4 deadline.
 	 * ----------
 	 */
 	qvotec_pid = cluster_qvotec_start();
@@ -741,12 +841,70 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	elog(DEBUG1,
-		 "cluster phase 4: DIAG ready (pid %d) + Cluster Stats ready (pid %d) + "
-		 "CSSD ready (pid %d) + QVOTEC ready (pid %d).  PG-native "
-		 "walwriter / bgwriter / checkpointer / autovacuum spawn unchanged.  "
-		 "Sinval Broadcaster / Recovery Coordinator deferred to Stage 2+.",
-		 diag_pid, stats_pid, cssd_pid, qvotec_pid);
+	if (registry_configured && cluster_conf_node_count() > 1
+		&& !cluster_phase4_wait_for_quorum(phase4_deadline)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_QUORUM_LOST;
+		fail_ctx->errmsg = "cluster phase 4: QVOTEC did not establish quorum in time";
+		fail_ctx->errhint = "Restore a voting-disk majority and verify the lease-aware "
+							"quorum state before retrying startup.";
+		return PHASE_RUN_FATAL;
+	}
+
+	/*
+	 * A formed registry requires an exact READY LMS.  The legacy LMS
+	 * wait helper treats DISABLED as ready-or-skip, so reject the GUC
+	 * state first and re-check the exact predicate after the wait.
+	 */
+	if (registry_configured) {
+		if (!cluster_lms_enabled) {
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 4: LMS is disabled for a formed WAL registry";
+			fail_ctx->errhint = "Set cluster.lms_enabled=on and restart all members on the "
+								"same RF A1 binary.";
+			return PHASE_RUN_FATAL;
+		}
+
+		lms_pid = cluster_lms_start();
+		if (lms_pid <= 0) {
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 4: failed to spawn LMS aux process";
+			fail_ctx->errhint = "Check postmaster log and OS process limits; a formed "
+								"registry has no PG-native LMS fallback.";
+			return PHASE_RUN_FATAL;
+		}
+		lms_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
+		if (!cluster_lms_wait_for_ready(lms_remaining_ms) || !cluster_lms_is_ready()) {
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 4: LMS did not publish exact READY in time";
+			fail_ctx->errhint = "Inspect LMS startup diagnostics; DISABLED or any non-READY "
+								"state cannot authorize a formed-registry CF update.";
+			return PHASE_RUN_FATAL;
+		}
+
+		cluster_validate_running_configuration();
+	}
+
+	/*
+	 * With a formed registry Stats is deliberately last.  Its child owns W2
+	 * and publishes READY only after ACTIVE post-read and checkpoint return.
+	 */
+	if (registry_configured
+		&& cluster_phase4_start_stats(fail_ctx, phase4_deadline, &stats_pid)
+			== PHASE_RUN_FATAL)
+		return PHASE_RUN_FATAL;
+
+	if (registry_configured)
+		elog(DEBUG1,
+			 "cluster phase 4: DIAG ready (pid %d) + CSSD ready (pid %d) + "
+			 "QVOTEC ready (pid %d) + LMS ready (pid %d) + Cluster Stats ready "
+			 "(pid %d).  PG-native processes unchanged.",
+			 diag_pid, cssd_pid, qvotec_pid, lms_pid, stats_pid);
+	else
+		elog(DEBUG1,
+			 "cluster phase 4: DIAG ready (pid %d) + Cluster Stats ready (pid %d) + "
+			 "CSSD ready (pid %d) + QVOTEC ready (pid %d).  PG-native "
+			 "processes unchanged.",
+			 diag_pid, stats_pid, cssd_pid, qvotec_pid);
 
 	return PHASE_RUN_OK;
 }
@@ -1139,125 +1297,20 @@ cluster_finalize_startup_running(void)
 	if (cluster_current_phase() == CLUSTER_PHASE_RUNNING)
 		return;
 
-	/*
-	 * Spec-1.16 v0.2 Q9 / D13: surface cluster.node_id BEFORE entering
-	 * RUNNING so admins notice misconfiguration at startup rather than
-	 * mid-transaction (per L18 startup-time validation).
-	 *
-	 * Spec-2.1 D2 (Stage 2.1 tightening, 2026-05-06): WARNING/FATAL dual
-	 * path gated on cluster.allow_single_node:
-	 *   - allow_single_node = on  (Stage 2.1 default; backward-compat):
-	 *       WARNING + single-node fallback (Stage 1.16 behavior preserved
-	 *       so frozen Stage 1 specs keep working unchanged).
-	 *   - allow_single_node = off (Stage 2 strict mode):
-	 *       FATAL -- per spec-2.0 §3 Invariant 3 "uncertainty fail-closed".
-	 *
-	 * cluster_enabled = off path skips entirely (no warning, no FATAL --
-	 * vanilla PG behaviour).
-	 */
-	if (cluster_enabled && !SCN_NODE_ID_VALID(cluster_node_id)) {
-		if (cluster_allow_single_node) {
-			/* Stage 2.1 backward-compat path: WARNING + single-node fallback */
-			ereport(WARNING, (errcode(ERRCODE_WARNING),
-							  errmsg("cluster.node_id (%d) is outside the valid range 0..%d; "
-									 "cluster SCN advance will silently skip",
-									 cluster_node_id, SCN_MAX_VALID_NODE_ID),
-							  errhint("Set cluster.node_id in postgresql.conf to an integer 0..127 "
-									  "to enable SCN advance, or set cluster.enabled = off for "
-									  "vanilla PG behaviour.  Currently running in single-node "
-									  "compatibility mode (cluster.allow_single_node = on).  Set "
-									  "cluster.allow_single_node = off to enforce strict mode.")));
-		} else {
-			/* Stage 2 strict path: FATAL */
-			ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("cluster.node_id (%d) is outside the valid range 0..%d",
-								   cluster_node_id, SCN_MAX_VALID_NODE_ID),
-							errhint("Set cluster.node_id in postgresql.conf to an integer 0..127, "
-									"or set cluster.allow_single_node = on for single-node "
-									"compatibility mode.")));
-		}
-	}
-
-	/*
-	 * spec-2.6 Q7 v0.2 validator: multi-node + cluster.voting_disks empty +
-	 * cluster.allow_single_node=off ⇒ refuse to advance to RUNNING.
-	 *
-	 * Without voting disks, qvotec has no quorum protocol to run; backends
-	 * would be forced fail-open since the xact.c gate (P1.2) keys on
-	 * cluster_voting_disks being non-empty.  In a multi-node cluster
-	 * topology that combination is silent fail-open — exactly the
-	 * production misconfiguration spec-2.6 was added to prevent.
-	 *
-	 * cluster.allow_single_node=on still allows the dev / single-node
-	 * compat path (qvotec stays alive, no I/O, backends don't enforce).
-	 *
-	 * pgrac.conf parse already ran during phase 1 (cluster_conf_load);
-	 * by the time we reach this RUNNING transition the topology is
-	 * authoritative — single-node fallback when pgrac.conf is missing
-	 * + allow_single_node=on returns node_count = 1, which we exempt.
-	 */
-	if (cluster_enabled && cluster_conf_node_count() > 1 && !cluster_allow_single_node) {
-		const char *vd = cluster_voting_disks;
-		bool empty = true;
-
-		if (vd != NULL) {
-			while (*vd) {
-				if (*vd != ' ' && *vd != '\t' && *vd != ',') {
-					empty = false;
-					break;
-				}
-				vd++;
-			}
-		}
-
-		if (empty)
-			ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							errmsg("multi-node cluster requires cluster.voting_disks to be "
-								   "configured when cluster.allow_single_node=off"),
-							errdetail("pgrac.conf declares %d nodes but cluster.voting_disks is "
-									  "empty.  Without voting disks the cluster has no quorum "
-									  "protocol and backends would silently fail-open under "
-									  "partition.",
-									  cluster_conf_node_count()),
-							errhint("Set cluster.voting_disks in postgresql.conf to a comma-"
-									"separated list of pre-formatted voting-disk file paths "
-									"(odd majority recommended: 1 / 3 / 5 / 7 disks across "
-									"distinct failure domains), or set cluster.allow_single_"
-									"node = on for single-node development mode.")));
-	}
-
-	/*
-	 * spec-4.12 D6 (Q5=C) rejoin/startup self-fence gate.  Before advertising any
-	 * serving authority, do a DIRECT durable read of the voting-disk fence marker:
-	 * if a quorum-majority marker still lists THIS node as fenced (declared dead by
-	 * a membership reconfiguration), enter a non-serving, NON-FATAL terminal --
-	 * skip publish_active (advertise no serving authority) and rely on the armed
-	 * self_fenced token (set inside the check) so D5 rejects every shared write.
-	 * Not FATAL: the node recovers via a controlled rejoin / cold-admin procedure
-	 * (Stage 4 has no online rejoin); a manual marker clear while the cluster is
-	 * live = self-unfencing = split-brain, so it is forbidden by the errhint.
-	 */
-	if (cluster_write_fence_startup_self_check())
-		ereport(WARNING,
-				(errcode(ERRCODE_CLUSTER_WRITE_FENCED),
-				 errmsg("this node is fenced by a membership reconfiguration; entering "
-						"non-serving mode"),
-				 errdetail("A durable quorum-majority voting-disk marker still lists this "
-						   "node as dead.  All shared-storage writes are rejected (53R51) "
-						   "and this node publishes no serving authority."),
-				 errhint("Recover only via the controlled rejoin / cold-admin procedure once "
-						 "the cluster confirms this node may rejoin; never clear the fence "
-						 "marker manually while the cluster is live.")));
-	else {
-		/*
-		 * spec-4.2 v0.2 P1: publish ACTIVE to the ClusterWalState registry
-		 * ONLY here -- recovery has succeeded and the node is about to
-		 * serve.  A node that dies during recovery never reaches this
-		 * point, so its slot keeps the previous content (EMPTY on a first
-		 * boot), which is exactly the raw material spec-4.3 needs for the
-		 * crashed inference.  FATAL 53RA2 inside on write failure.
-		 */
-		cluster_wal_state_publish_active();
+	/* Formed-registry startup ran these validators and self-check in Stats. */
+	if (!cluster_phase4_wal_state_configured()) {
+		cluster_validate_running_configuration();
+		if (cluster_write_fence_startup_self_check())
+			ereport(WARNING,
+					(errcode(ERRCODE_CLUSTER_WRITE_FENCED),
+					 errmsg("this node is fenced by a membership reconfiguration; "
+							"entering non-serving mode"),
+					 errdetail("A durable quorum-majority voting-disk marker still lists "
+							   "this node as dead.  All shared-storage writes are rejected "
+							   "(53R51) and this node publishes no serving authority."),
+					 errhint("Recover only via the controlled rejoin / cold-admin procedure "
+							 "once the cluster confirms this node may rejoin; never clear the "
+							 "fence marker manually while the cluster is live.")));
 	}
 
 	cluster_advance_phase(CLUSTER_PHASE_RUNNING);
