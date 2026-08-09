@@ -145,6 +145,7 @@ typedef struct ClusterTxResolution {
 } ClusterTxResolution;
 
 #define CLUSTER_R4_MAX_MULTI_MEMBERS 256
+#define CLUSTER_R4_SUBTRANS_MAX_DEPTH 1024
 
 typedef struct ClusterMultiResolutionMember {
 	SCN commit_scn;
