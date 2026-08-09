@@ -11,8 +11,8 @@
 #        with an unknown commit state, false-visible, 8.A);
 #      * a durability barrier (smgrimmedsync touched rels + flush the outcome
 #        store) BEFORE any authority is published;
-#      * a 3-way authority publish (registry skip-bound + the node-local reader
-#        authority, written LAST) on DONE only;
+#      * the node-local reader authority, written LAST, on DONE only; the legacy
+#        registry merge_recovered_lsn field is never a recovery authority;
 #      * partial-apply (v0.3 P2): any BLOCKED publishes NO authority, so the
 #        thread stays frozen and never serves a stale page (8.A);
 #      * R13: a catchable ERROR (injected, or an online unmaterializable record)
@@ -57,6 +57,7 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use PgracClusterNode;
+use PgracWalState qw(forge_slot_merge_recovered_lsn read_slot_raw);
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -192,6 +193,12 @@ my $committed0 = committed();
 # L4 SUCCESS: valid window -> done + visibility materialized + authority durable.
 # ============================================================
 {
+	my $legacy_merge_lsn = 0x23456789;
+	my $regfile = "$wroot/pgrac_wal_state";
+	forge_slot_merge_recovered_lsn($regfile, 1, $legacy_merge_lsn);
+	is(read_slot_raw($regfile, 1)->{merge_recovered_lsn}, $legacy_merge_lsn,
+		'L4 fixture: own slot has a CRC-valid historical merge_recovered_lsn');
+
 	my $r = replay_one(1, $lo, $hi);
 	is($r->{result}, 'done', 'L4 valid window -> orchestrator DONE');
 	cmp_ok($r->{records}, '>=', 1, 'L4 the combined engine read records from thread_1 WAL');
@@ -202,6 +209,8 @@ my $committed0 = committed();
 	like(materialized(), qr/(^|,)0(,|$)/,
 		'L4 authority: origin 0 is now materialized (node-local reader authority published)');
 	ok(-e $marker, 'L4 durability: the merged.authority marker is on disk');
+	is(read_slot_raw($regfile, 1)->{merge_recovered_lsn}, $legacy_merge_lsn,
+		'L4 online orchestrator does not write historical merge_recovered_lsn');
 }
 
 # ============================================================

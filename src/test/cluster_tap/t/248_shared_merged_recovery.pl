@@ -59,9 +59,10 @@
 #           is unit-locked (G4 unit suite).
 #      L11  same shared page, both writers (serialized, SCN observed
 #           across nodes): page ends with both rows after the merge
-#      L12  B restarts post-merge while A is live: own-LSN-bound skip
-#           fires (merged_own_bound_skips > 0), B's own rows intact
-#           (pages not rolled back), and B's read of A-origin rows
+#      L12  B restarts post-merge while A is live: a forged historical
+#           merge_recovered_lsn is ignored (merged_own_bound_skips = 0),
+#           B's retained own WAL replays and its own rows stay intact,
+#           while B's read of A-origin rows
 #           fails closed (A was never materialized AT B -- the gate is
 #           per-origin, not global).  L12 runs BEFORE the data-read
 #           legs: a lone survivor cannot be granted GCS keys mastered
@@ -89,7 +90,8 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use PgracClusterNode;
-use PgracWalState qw(read_file_raw write_file_raw);
+use PgracWalState qw(forge_slot_merge_recovered_lsn read_file_raw
+  read_slot_raw write_file_raw);
 use PostgreSQL::Test::ClusterPair;
 use PostgreSQL::Test::Utils;
 use Test::More;
@@ -428,6 +430,17 @@ $nb->{_pid} = undef;
 
 sleep 2;    # > recovery_stale_active_ms (both nodes now cold)
 
+# A1 compatibility fixture: model an old binary that left a CRC-valid nonzero
+# merge_recovered_lsn in B's registry slot.  Recovery readers must treat it as
+# semantic zero, and neither the cold merge nor the later online path may write
+# this field.  The exact sentinel lets this test distinguish "ignored" from
+# "silently rewritten".
+my $legacy_merge_lsn = 0x12345678;
+forge_slot_merge_recovered_lsn("$walroot/pgrac_wal_state", 2, $legacy_merge_lsn);
+is(read_slot_raw("$walroot/pgrac_wal_state", 2)->{merge_recovered_lsn},
+	$legacy_merge_lsn,
+	'L12 fixture: B has a CRC-valid historical merge_recovered_lsn');
+
 # ----------------------------------------------------------------
 # L13: corrupt B's stream at the exact LSN the merge reads from --
 # thread_2's checkpoint_redo_lsn, published in the WAL-state registry
@@ -480,6 +493,9 @@ like($log, qr/cluster merged recovery: engage decision PASSED/,
 	'L2 engage decision PASSED');
 like($log, qr/cluster merged recovery: replay complete/,
 	'L2 merged replay completed');
+is(read_slot_raw("$walroot/pgrac_wal_state", 2)->{merge_recovered_lsn},
+	$legacy_merge_lsn,
+	'L2 cold merge does not write the historical merge_recovered_lsn field');
 
 # L2: dump surface (catalog-only SQL; no shared-block reads yet).
 my $applied = query_retry($na, q{SELECT value FROM pg_cluster_state
@@ -501,17 +517,21 @@ ok(@committed > 0,
 # ----------------------------------------------------------------
 # L12: B self-recovers (single-node form too).  A's thread is ALIVE
 # in the registry, so B does not re-merge it (n_alive>0 -> not cold);
-# B replays only its own thread_2 and the own-LSN-bound skip drops
-# the shared records A already merged.  B's own-origin reads bypass
-# GCS; reading an A-origin row never materialized AT B is the
-# per-origin fail-closed path.
+# B replays only its own thread_2.  Its historical merge_recovered_lsn is
+# diagnostic-only, so retained WAL is replayed instead of skipped.  B's
+# own-origin reads bypass GCS; reading an A-origin row never materialized AT B
+# is the per-origin fail-closed path.
 # ----------------------------------------------------------------
 make_single_node($nb, 1, $pair->ic_port(1));
+$log_off = -s $nb->logfile;
 $nb->start;
+$log = PostgreSQL::Test::Utils::slurp_file($nb->logfile, $log_off);
 is(query_retry($nb, 'SELECT count(*) FROM t_b'), '100',
-	'L12 B own rows intact: merged-driven shared pages were not rolled back');
-ok(dumpkey($nb, 'merged_own_bound_skips') > 0,
-	'L12 own-LSN-bound skip fired during B self-recovery');
+	'L12 retained own WAL replay leaves B own rows intact');
+is(dumpkey($nb, 'merged_own_bound_skips'), '0',
+	'L12 historical merge_recovered_lsn creates no replay skip bound');
+like($log, qr/raw_ignored/,
+	'L12 historical merge_recovered_lsn is labelled raw_ignored');
 my $err = query_fails($nb, 'SELECT count(*) FROM t_a');
 ok(defined $err && $err =~ /cluster TT status unknown/,
 	'L12 B cannot read A-origin rows (A never materialized AT B; per-origin gate)');
