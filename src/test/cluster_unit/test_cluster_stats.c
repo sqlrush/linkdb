@@ -39,9 +39,17 @@
  */
 #include "postgres.h"
 
+#include <setjmp.h>
 #include <signal.h>
 
+#include "access/xlog.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_scn.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_stats.h"
+#include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_write_fence.h"
 
 #undef printf
 #undef fprintf
@@ -149,9 +157,12 @@ void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr)
 {
+	static char fake_shmem[4096];
+
+	memset(fake_shmem, 0, sizeof(fake_shmem));
 	if (foundPtr != NULL)
 		*foundPtr = false;
-	return NULL;
+	return fake_shmem;
 }
 
 #include "cluster/cluster_shmem.h"
@@ -163,7 +174,9 @@ cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unus
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 0;
+	static TimestampTz now = 1000;
+
+	return now++;
 }
 
 /* postmaster-owned wrapper: DIAG main never invokes the runtime path
@@ -221,10 +234,14 @@ void
 init_ps_display(const char *fixed_part pg_attribute_unused())
 {}
 
+static jmp_buf stats_main_exit;
+static int stats_main_exit_code = -1;
+
 void
-proc_exit(int code pg_attribute_unused())
+proc_exit(int code)
 {
-	abort();
+	stats_main_exit_code = code;
+	longjmp(stats_main_exit, 1);
 }
 
 #include "utils/timestamp.h"
@@ -246,6 +263,7 @@ int
 WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
 {
+	ShutdownRequestPending = true;
 	return 0;
 }
 void
@@ -255,6 +273,169 @@ ResetLatch(struct Latch *latch pg_attribute_unused())
 /* cluster_stats.c references MyBackendType (set by ClusterStatsMain). */
 #include "miscadmin.h"
 BackendType MyBackendType = B_INVALID;
+
+
+/* ---------- RF A1 W2/W4 lifecycle fixtures. ---------- */
+bool cluster_enabled = true;
+char *cluster_wal_threads_dir = "/rf-a1/formed";
+int cluster_node_id = 3;
+
+static ClusterStartupPhase stats_test_phase = CLUSTER_PHASE_4_NORMAL;
+static bool stats_test_self_fenced = false;
+static int stats_test_self_check_calls = 0;
+static int stats_test_checkpoint_calls = 0;
+static int stats_test_checkpoint_flags = 0;
+static int stats_test_slot_read_calls = 0;
+static ClusterWalSlotVerdict stats_test_slot_verdict = CLUSTER_WAL_SLOT_OK;
+static ClusterWalStateUpdateResult stats_test_active_result = CLUSTER_WAL_STATE_UPDATE_OK;
+static ClusterWalStateUpdateResult stats_test_telemetry_result = CLUSTER_WAL_STATE_UPDATE_OK;
+static int stats_test_active_calls = 0;
+static int stats_test_telemetry_calls = 0;
+static ClusterStatsStatus stats_test_active_status = CLUSTER_STATS_NOT_STARTED;
+static ClusterStatsStatus stats_test_telemetry_status = CLUSTER_STATS_NOT_STARTED;
+static ClusterWalStateUpdate stats_test_active_update;
+static ClusterWalStateUpdate stats_test_telemetry_update;
+static uint64 stats_test_refresh_fail_count = 0;
+
+ClusterStartupPhase
+cluster_current_phase(void)
+{
+	return stats_test_phase;
+}
+
+bool
+cluster_write_fence_startup_self_check(void)
+{
+	stats_test_self_check_calls++;
+	return stats_test_self_fenced;
+}
+
+void
+RequestCheckpoint(int flags)
+{
+	stats_test_checkpoint_calls++;
+	stats_test_checkpoint_flags = flags;
+}
+
+bool
+RecoveryInProgress(void)
+{
+	return false;
+}
+
+TimeLineID
+GetWALInsertionTimeLine(void)
+{
+	return 7;
+}
+
+XLogRecPtr
+GetXLogWriteRecPtr(void)
+{
+	return 300;
+}
+
+SCN
+cluster_scn_current(void)
+{
+	return 400;
+}
+
+uint16
+cluster_wal_thread_id(void)
+{
+	return 4;
+}
+
+uint64
+cluster_wal_thread_refresh_fail_fetch_add(void)
+{
+	return stats_test_refresh_fail_count++;
+}
+
+uint64
+cluster_wal_thread_refresh_fail_read(void)
+{
+	return stats_test_refresh_fail_count;
+}
+
+bool
+cluster_wal_state_registry_ready(void)
+{
+	return cluster_wal_threads_dir != NULL && cluster_wal_threads_dir[0] != '\0';
+}
+
+ClusterWalSlotVerdict
+cluster_wal_state_read_slot(uint16 thread_id, ClusterWalStateSlot *slot_out)
+{
+	stats_test_slot_read_calls++;
+	if (slot_out != NULL) {
+		memset(slot_out, 0, sizeof(*slot_out));
+		slot_out->thread_id = thread_id;
+		slot_out->node_id = cluster_node_id;
+		slot_out->state = CLUSTER_WAL_SLOT_STATE_ACTIVE;
+	}
+	return stats_test_slot_verdict;
+}
+
+ClusterWalStateUpdateResult
+cluster_wal_state_update_own(const ClusterWalStateUpdate *update,
+							 ClusterWalStateCfMode cf_mode,
+							 ClusterWalStateSlot *published_slot pg_attribute_unused())
+{
+	UT_ASSERT_EQ((int)cf_mode, (int)CLUSTER_WAL_STATE_CF_ACQUIRE_X);
+	UT_ASSERT_NOT_NULL(update);
+	if (update->kind == CLUSTER_WAL_STATE_UPDATE_ACTIVE) {
+		stats_test_active_calls++;
+		stats_test_active_status = cluster_stats_status();
+		memcpy(&stats_test_active_update, update, sizeof(*update));
+		return stats_test_active_result;
+	}
+	if (update->kind == CLUSTER_WAL_STATE_UPDATE_TELEMETRY) {
+		stats_test_telemetry_calls++;
+		stats_test_telemetry_status = cluster_stats_status();
+		memcpy(&stats_test_telemetry_update, update, sizeof(*update));
+		return stats_test_telemetry_result;
+	}
+	return CLUSTER_WAL_STATE_UPDATE_INVALID;
+}
+
+
+static void
+reset_stats_lifecycle_fixture(void)
+{
+	ConfigReloadPending = false;
+	ShutdownRequestPending = false;
+	stats_main_exit_code = -1;
+	stats_test_phase = CLUSTER_PHASE_4_NORMAL;
+	stats_test_self_fenced = false;
+	stats_test_self_check_calls = 0;
+	stats_test_checkpoint_calls = 0;
+	stats_test_checkpoint_flags = 0;
+	stats_test_slot_read_calls = 0;
+	stats_test_slot_verdict = CLUSTER_WAL_SLOT_OK;
+	stats_test_active_result = CLUSTER_WAL_STATE_UPDATE_OK;
+	stats_test_telemetry_result = CLUSTER_WAL_STATE_UPDATE_OK;
+	stats_test_active_calls = 0;
+	stats_test_telemetry_calls = 0;
+	stats_test_active_status = CLUSTER_STATS_NOT_STARTED;
+	stats_test_telemetry_status = CLUSTER_STATS_NOT_STARTED;
+	memset(&stats_test_active_update, 0, sizeof(stats_test_active_update));
+	memset(&stats_test_telemetry_update, 0, sizeof(stats_test_telemetry_update));
+	stats_test_refresh_fail_count = 0;
+	MyProcPid = 4242;
+	IsUnderPostmaster = true;
+	cluster_stats_shmem_init();
+}
+
+
+static void
+run_one_stats_incarnation(void)
+{
+	if (setjmp(stats_main_exit) == 0)
+		ClusterStatsMain();
+	UT_ASSERT_EQ(stats_main_exit_code, 0);
+}
 
 
 UT_DEFINE_GLOBALS();
@@ -328,6 +509,57 @@ UT_TEST(test_stats_public_symbols_linkable)
 }
 
 
+UT_TEST(test_rf_a1_initial_stats_owns_active_checkpoint_then_telemetry)
+{
+	reset_stats_lifecycle_fixture();
+	run_one_stats_incarnation();
+
+	UT_ASSERT_EQ(stats_test_self_check_calls, 1);
+	UT_ASSERT_EQ(stats_test_active_calls, 1);
+	UT_ASSERT_EQ((int)stats_test_active_status, (int)CLUSTER_STATS_SPAWNING);
+	UT_ASSERT_EQ((int)stats_test_active_update.kind,
+				 (int)CLUSTER_WAL_STATE_UPDATE_ACTIVE);
+	UT_ASSERT_EQ((int)stats_test_active_update.tli, 7);
+	UT_ASSERT_EQ((uint64)stats_test_active_update.highest_lsn, (uint64)300);
+	UT_ASSERT_EQ((uint64)stats_test_active_update.highest_scn, (uint64)400);
+	UT_ASSERT_EQ((int)stats_test_active_update.refresh_interval_ms, 1000);
+	UT_ASSERT_EQ(stats_test_checkpoint_calls, 1);
+	UT_ASSERT_EQ(stats_test_checkpoint_flags,
+				 CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 1);
+	UT_ASSERT_EQ((int)stats_test_telemetry_status, (int)CLUSTER_STATS_READY);
+}
+
+
+UT_TEST(test_rf_a1_self_fenced_initial_stats_skips_active_and_checkpoint)
+{
+	reset_stats_lifecycle_fixture();
+	stats_test_self_fenced = true;
+	stats_test_telemetry_result = CLUSTER_WAL_STATE_UPDATE_WRONG_STATE;
+	run_one_stats_incarnation();
+
+	UT_ASSERT_EQ(stats_test_self_check_calls, 1);
+	UT_ASSERT_EQ(stats_test_active_calls, 0);
+	UT_ASSERT_EQ(stats_test_checkpoint_calls, 0);
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 1);
+	UT_ASSERT_EQ((uint64)stats_test_refresh_fail_count, (uint64)0);
+}
+
+
+UT_TEST(test_rf_a1_running_respawn_validates_active_without_replaying_w2)
+{
+	reset_stats_lifecycle_fixture();
+	stats_test_phase = CLUSTER_PHASE_RUNNING;
+	run_one_stats_incarnation();
+
+	UT_ASSERT_EQ(stats_test_self_check_calls, 0);
+	UT_ASSERT_EQ(stats_test_slot_read_calls, 1);
+	UT_ASSERT_EQ(stats_test_active_calls, 0);
+	UT_ASSERT_EQ(stats_test_checkpoint_calls, 0);
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 1);
+}
+
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -335,12 +567,15 @@ UT_TEST(test_stats_public_symbols_linkable)
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(8);
 	UT_RUN(test_stats_status_enum_values_frozen);
 	UT_RUN(test_stats_shared_state_size_under_4kb);
 	UT_RUN(test_stats_status_to_string_lookup);
 	UT_RUN(test_stats_status_unknown_returns_unknown);
 	UT_RUN(test_stats_public_symbols_linkable);
+	UT_RUN(test_rf_a1_initial_stats_owns_active_checkpoint_then_telemetry);
+	UT_RUN(test_rf_a1_self_fenced_initial_stats_skips_active_and_checkpoint);
+	UT_RUN(test_rf_a1_running_respawn_validates_active_without_replaying_w2);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
