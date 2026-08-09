@@ -24,6 +24,8 @@ subdir = src/test/cluster_unit
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
+JIT_PROOF_PYTHON ?= python3
+
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_gcs_reqid \
@@ -244,6 +246,11 @@ SIMPLE_TESTS = $(filter-out test_cluster_ic_tier1_partial test_cluster_lms_outbo
 test_cluster_jit_abi_contract: test_cluster_jit_abi_contract.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
 		$(top_builddir)/src/port/libpgport.a -o $@
+
+check_cluster_jit_proof: check_cluster_jit_proof.py \
+		cluster_jit_symbol_owners.tsv test_cluster_jit_abi_contract.c
+	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py self-test
+	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py controls
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1097,8 +1104,8 @@ clean distclean maintainer-clean:
 install installdirs uninstall installcheck:
 	@:
 
-.PHONY: all check clean distclean maintainer-clean install installdirs \
-        uninstall installcheck
+.PHONY: all check check_cluster_jit_proof clean distclean maintainer-clean \
+        install installdirs uninstall installcheck
 
 # test_cluster_diag links cluster_diag.o standalone (spec-1.13 Sprint A).
 test_cluster_diag: test_cluster_diag.c unit_test.h \
