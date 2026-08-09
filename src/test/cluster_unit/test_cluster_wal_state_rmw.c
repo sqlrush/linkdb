@@ -288,7 +288,7 @@ static ClusterWalStateSlot last_pwrite_image;
 int
 BasicOpenFile(const char *fileName pg_attribute_unused(), int fileFlags)
 {
-	UT_ASSERT((fileFlags & O_RDWR) != 0);
+	UT_ASSERT((fileFlags & O_ACCMODE) == O_RDONLY || (fileFlags & O_ACCMODE) == O_RDWR);
 	UT_ASSERT((fileFlags & (O_CREAT | O_TRUNC)) == 0);
 	open_count++;
 	record_event(RMW_EVENT_OPEN);
@@ -686,10 +686,22 @@ UT_TEST(test_a1_armed_write_fail_dispatches_before_live_rmw_write)
 	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
 }
 
+UT_TEST(test_a1_armed_write_fail_dispatches_before_legacy_owner_write)
+{
+	fixture_reset();
+	cluster_injection_armed_count = 1;
+	cluster_wal_state_publish_checkpoint_redo(800, 900);
+	UT_ASSERT_EQ(stub_injection_dispatch_count, 1);
+	UT_ASSERT_EQ(slot_pread_count, 1);
+	UT_ASSERT_EQ(pwrite_count, 0);
+	UT_ASSERT_EQ(fsync_count, 0);
+	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
+}
+
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 
 	UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
 	UT_RUN(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread);
@@ -698,6 +710,7 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_a1_borrow_verified_cf_does_not_reenter_or_unlock);
 	UT_RUN(test_a1_fresh_header_slot_typed_rejections);
 	UT_RUN(test_a1_armed_write_fail_dispatches_before_live_rmw_write);
+	UT_RUN(test_a1_armed_write_fail_dispatches_before_legacy_owner_write);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
