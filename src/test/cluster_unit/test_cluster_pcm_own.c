@@ -1153,6 +1153,160 @@ UT_TEST(test_lockbuffer_reservation_failures_use_busy_corrupt_classifier)
 	free(source);
 }
 
+UT_TEST(test_lockbuffer_reservation_busy_barrier_is_typed_before_failure_report)
+{
+	char *source = read_bufmgr_source();
+	const char *wait_fn;
+	const char *wait_end;
+	const char *guard;
+	const char *typed;
+	const char *set_refused;
+	const char *note_unwind;
+	const char *return_busy;
+	const char *initial;
+	const char *initial_call;
+	const char *initial_call_end;
+	const char *initial_arg;
+	const char *initial_check;
+	const char *initial_goto;
+	const char *initial_report;
+	const char *rearm;
+	const char *rearm_call;
+	const char *rearm_call_end;
+	const char *rearm_arg;
+	const char *rearm_check;
+	const char *rearm_return;
+	const char *revalidate;
+	const char *revalidate_call;
+	const char *revalidate_call_end;
+	const char *revalidate_arg;
+	const char *revalidate_check;
+	const char *revalidate_skip;
+	const char *revalidate_report;
+
+	/* Regression A: if a live GRANT_PENDING/REVOKING reservation is BUSY
+	 * while the nested wait guard has closed, a barrier-aware SHARE must
+	 * preserve BARRIER_CLOSED as a typed refusal.  It must not fall through
+	 * to cluster_pcm_own_report_bump_failure(), whose BUSY mapping is the
+	 * client-visible OBJECT_IN_USE error this contract forbids. */
+	wait_fn = strstr(source, "\ncluster_bufmgr_pcm_begin_grant_reservation_wait(");
+	wait_end = wait_fn != NULL ? strstr(wait_fn + 1, "\n/*\n * PGRAC (t/400 S_NEW") : NULL;
+	UT_ASSERT_NOT_NULL(wait_fn);
+	UT_ASSERT_NOT_NULL(wait_end);
+	guard = wait_fn != NULL ? strstr(wait_fn, "cluster_pcm_x_nested_wait_guard_before_block()") : NULL;
+	typed = guard != NULL ? strstr(guard, "guard_result == PCM_X_QUEUE_BARRIER_CLOSED") : NULL;
+	set_refused = typed != NULL ? strstr(typed, "*barrier_refused = true") : NULL;
+	note_unwind = set_refused != NULL
+		? strstr(set_refused, "cluster_pcm_x_stats_note_barrier_unwind()") : NULL;
+	return_busy = note_unwind != NULL ? strstr(note_unwind, "return result") : NULL;
+	UT_ASSERT(guard != NULL && wait_end != NULL && guard < wait_end);
+	UT_ASSERT(typed != NULL && typed < wait_end);
+	UT_ASSERT(set_refused != NULL && set_refused < wait_end);
+	UT_ASSERT(note_unwind != NULL && note_unwind < wait_end);
+	UT_ASSERT(return_busy != NULL && return_busy < wait_end);
+	if (typed != NULL && set_refused != NULL && note_unwind != NULL && return_busy != NULL)
+		UT_ASSERT(typed < set_refused && set_refused < note_unwind && note_unwind < return_busy);
+
+	initial = strstr(source, "Legacy acquire path:");
+	initial_call = initial != NULL
+		? strstr(initial, "cluster_bufmgr_pcm_begin_grant_reservation_wait(") : NULL;
+	initial_call_end = initial_call != NULL ? strstr(initial_call, ");") : NULL;
+	initial_arg = initial_call != NULL ? strstr(initial_call, "pcm_barrier_refused") : NULL;
+	initial_check = initial_call_end != NULL
+		? strstr(initial_call_end, "pcm_barrier_refused != NULL && *pcm_barrier_refused") : NULL;
+	initial_goto = initial_check != NULL
+		? strstr(initial_check, "goto cluster_lockbuffer_barrier_refusal") : NULL;
+	initial_report = initial_call_end != NULL
+		? strstr(initial_call_end, "cluster_pcm_own_report_bump_failure(") : NULL;
+	UT_ASSERT(initial_call != NULL && initial_call_end != NULL);
+	UT_ASSERT(initial_arg != NULL && initial_arg < initial_call_end);
+	UT_ASSERT(initial_check != NULL && initial_goto != NULL && initial_report != NULL);
+	if (initial_check != NULL && initial_goto != NULL && initial_report != NULL)
+		UT_ASSERT(initial_check < initial_goto && initial_goto < initial_report);
+
+	rearm = strstr(source, "\ncluster_bufmgr_pcm_retry_denied_rearm(");
+	rearm_call = rearm != NULL
+		? strstr(rearm, "cluster_bufmgr_pcm_begin_grant_reservation_wait(") : NULL;
+	rearm_call_end = rearm_call != NULL ? strstr(rearm_call, ");") : NULL;
+	rearm_arg = rearm_call != NULL ? strstr(rearm_call, "barrier_refused") : NULL;
+	rearm_check = rearm_call_end != NULL
+		? strstr(rearm_call_end, "barrier_refused != NULL && *barrier_refused") : NULL;
+	rearm_return = rearm_check != NULL
+		? strstr(rearm_check, "return CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED") : NULL;
+	UT_ASSERT(rearm_call != NULL && rearm_call_end != NULL);
+	UT_ASSERT(rearm_arg != NULL && rearm_arg < rearm_call_end);
+	UT_ASSERT(rearm_check != NULL && rearm_return != NULL);
+
+	revalidate = strstr(source, "cluster_pcm_note_writer_cover_stale_detected();");
+	revalidate_call = revalidate != NULL
+		? strstr(revalidate, "cluster_bufmgr_pcm_begin_grant_reservation_wait(") : NULL;
+	revalidate_call_end = revalidate_call != NULL ? strstr(revalidate_call, ");") : NULL;
+	revalidate_arg = revalidate_call != NULL ? strstr(revalidate_call, "pcm_barrier_refused") : NULL;
+	revalidate_check = revalidate_call_end != NULL
+		? strstr(revalidate_call_end, "pcm_barrier_refused != NULL && *pcm_barrier_refused") : NULL;
+	revalidate_skip = revalidate_check != NULL
+		? strstr(revalidate_check, "goto pcm_revalidate_acquire_done") : NULL;
+	revalidate_report = revalidate_call_end != NULL
+		? strstr(revalidate_call_end, "cluster_pcm_own_report_bump_failure(") : NULL;
+	UT_ASSERT(revalidate_call != NULL && revalidate_call_end != NULL);
+	UT_ASSERT(revalidate_arg != NULL && revalidate_arg < revalidate_call_end);
+	UT_ASSERT(revalidate_check != NULL && revalidate_skip != NULL && revalidate_report != NULL);
+	if (revalidate_check != NULL && revalidate_skip != NULL && revalidate_report != NULL)
+		UT_ASSERT(revalidate_check < revalidate_skip && revalidate_skip < revalidate_report);
+	free(source);
+}
+
+UT_TEST(test_stale_share_cover_holder_barrier_skips_content_lock_to_common_unwind)
+{
+	char *source = read_bufmgr_source();
+	const char *stale;
+	const char *admit;
+	const char *admit_end;
+	const char *typed_arg;
+	const char *post_admit_guard;
+	const char *content_lock;
+	const char *reverify_done;
+	const char *activation_guard;
+	const char *holder_activate;
+	const char *post_try;
+	const char *common_goto;
+
+	/* Regression B: stale-cover revalidation must keep the existing typed
+	 * refusal channel through holder rearm.  A refusal produced inside the
+	 * call is checked again before either content-lock acquire; after PG_TRY
+	 * it reaches the sole common cleanup implementation. */
+	stale = strstr(source, "cluster_pcm_note_writer_cover_stale_detected();");
+	admit = stale != NULL
+		? strstr(stale, "pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(") : NULL;
+	admit_end = admit != NULL ? strstr(admit, ");") : NULL;
+	typed_arg = admit != NULL ? strstr(admit, "buf, pcm_mode, pcm_barrier_refused,") : NULL;
+	post_admit_guard = admit_end != NULL
+		? strstr(admit_end, "pcm_barrier_refused == NULL || !*pcm_barrier_refused") : NULL;
+	content_lock = admit_end != NULL
+		? strstr(admit_end, "LWLockAcquire(BufferDescriptorGetContentLock(buf)") : NULL;
+	reverify_done = admit_end != NULL
+		? strstr(admit_end, "cluster_pcm_note_writer_reverify_reacquire();") : NULL;
+	UT_ASSERT(admit != NULL && admit_end != NULL);
+	UT_ASSERT(typed_arg != NULL && typed_arg < admit_end);
+	UT_ASSERT(post_admit_guard != NULL && content_lock != NULL && reverify_done != NULL);
+	if (post_admit_guard != NULL && content_lock != NULL && reverify_done != NULL)
+		UT_ASSERT(post_admit_guard < content_lock && content_lock < reverify_done);
+	activation_guard = reverify_done != NULL
+		? strstr(reverify_done, "pcm_barrier_refused == NULL || !*pcm_barrier_refused") : NULL;
+	holder_activate = reverify_done != NULL
+		? strstr(reverify_done, "cluster_bufmgr_pcm_x_holder_activate(pcm_x_holder)") : NULL;
+	UT_ASSERT(activation_guard != NULL && holder_activate != NULL);
+	if (activation_guard != NULL && holder_activate != NULL)
+		UT_ASSERT(activation_guard < holder_activate);
+
+	post_try = reverify_done != NULL ? strstr(reverify_done, "\n\t\tPG_END_TRY();") : NULL;
+	common_goto = post_try != NULL
+		? strstr(post_try, "goto cluster_lockbuffer_barrier_refusal") : NULL;
+	UT_ASSERT(post_try != NULL && common_goto != NULL);
+	UT_ASSERT_EQ(count_occurrences(source, "cluster_lockbuffer_barrier_refusal:"), 1);
+	free(source);
+}
+
 UT_TEST(test_pending_x_denied_retry_leaves_master_invalidate_gap)
 {
 	static const char *const retry_contract[]
@@ -3135,7 +3289,7 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(65);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_writer_activation_fence_blocks_revoke_until_exact_clear);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
@@ -3162,6 +3316,8 @@ main(void)
 	UT_RUN(test_lockbuffer_content_error_uses_post_master_rollback_contract);
 	UT_RUN(test_bufmgr_generation_bump_failure_is_classified_under_header_lock);
 	UT_RUN(test_lockbuffer_reservation_failures_use_busy_corrupt_classifier);
+	UT_RUN(test_lockbuffer_reservation_busy_barrier_is_typed_before_failure_report);
+	UT_RUN(test_stale_share_cover_holder_barrier_skips_content_lock_to_common_unwind);
 	UT_RUN(test_pending_x_denied_retry_leaves_master_invalidate_gap);
 	UT_RUN(test_bufmgr_finish_rejects_invalid_state_and_initializes_acquire_result);
 	UT_RUN(test_bufmgr_finish_and_abort_gate_on_exact_base_state);
