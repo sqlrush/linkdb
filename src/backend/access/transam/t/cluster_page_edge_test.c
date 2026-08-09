@@ -53,7 +53,7 @@ typedef struct DecodeFixtureResult
 
 typedef union RecordFixture
 {
-	XLogRecord align;
+	XLogRecord	align;
 	uint8		bytes[512];
 } RecordFixture;
 
@@ -261,7 +261,7 @@ UT_TEST(test_decoder_rejects_edge_for_missing_block)
 	(void) build_edge_record(fixture.bytes, TEST_EDGE_ENTRY_SIZE, 0, 1);
 	/* Make the actual block reference ID disagree with the edge ID. */
 	fixture.bytes[SizeOfXLogRecord + TEST_EDGE_HEADER_SIZE +
-		TEST_EDGE_ENTRY_SIZE] = 0;
+				  TEST_EDGE_ENTRY_SIZE] = 0;
 	result = decode_fixture(fixture.bytes);
 	UT_ASSERT(!result.ok);
 	free_fixture(&result);

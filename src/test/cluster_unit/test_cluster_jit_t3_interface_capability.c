@@ -77,11 +77,11 @@ main(void)
 		else
 			printf("JIT_CONTROL:T3-PAGEVERSION-FAIL-CLOSED:PASS\n");
 		failures += observe_capability(true,
-			"T3-PAGEVERSION-EQUALITY-INTERFACE");
+									   "T3-PAGEVERSION-EQUALITY-INTERFACE");
 	}
 #else
 	failures += observe_capability(false,
-		"T3-PAGEVERSION-EQUALITY-INTERFACE");
+								   "T3-PAGEVERSION-EQUALITY-INTERFACE");
 #endif
 
 #if defined(XLOG_PAGE_VERSION_EDGE_ENCODER_V1)
@@ -103,12 +103,12 @@ main(void)
 			RF_PAGE_EDGE_FULL_COVERAGE;
 		entry.result_incarnation[0] = 1;
 		result = XLogEncodePageVersionEdgeV1(output, sizeof(output), 19,
-										 &entry, 1, &output_size);
+											 &entry, 1, &output_size);
 		if ((!result && (output_size != 73 ||
-						memcmp(output, output_before, sizeof(output)) != 0)) ||
+						 memcmp(output, output_before, sizeof(output)) != 0)) ||
 			(result && (output_size != 64 ||
-					   output[0] != XLR_BLOCK_ID_PAGE_VERSION_EDGE ||
-					   output[2] != 1)))
+						output[0] != XLR_BLOCK_ID_PAGE_VERSION_EDGE ||
+						output[2] != 1)))
 		{
 			printf("JIT_CONTROL:T3-ENCODER-FAIL-CLOSED:FAIL\n");
 			failures++;

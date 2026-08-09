@@ -19,9 +19,9 @@
 #include "access/xlogreader.h"
 #include "cluster/cluster_space.h"
 
-static int control_count = 0;
-static int control_failures = 0;
-static int semantic_failures = 0;
+static int	control_count = 0;
+static int	control_failures = 0;
+static int	semantic_failures = 0;
 
 static void
 store_u16(uint8 *dst, uint16 value)
@@ -89,7 +89,7 @@ encode_unchanged(uint64 result_token,
 	memset(output, 0xa5, sizeof(output));
 	memcpy(before, output, sizeof(output));
 	result = XLogEncodePageVersionEdgeV1(output, capacity, result_token,
-									 entries, entry_count, &output_size);
+										 entries, entry_count, &output_size);
 	return !result && output_size == 37 &&
 		memcmp(output, before, sizeof(output)) == 0;
 }
@@ -155,7 +155,7 @@ test_edge_encoder_golden(void)
 	memcpy(expected + 48, entry.result_incarnation, 16);
 
 	result = XLogEncodePageVersionEdgeV1(output, sizeof(output), result_token,
-									 &entry, 1, &output_size);
+										 &entry, 1, &output_size);
 	semantic(result && output_size == sizeof(expected) &&
 			 memcmp(output, expected, sizeof(expected)) == 0,
 			 "T3-B-EDGE-ENCODER-BEHAVIOR");
@@ -173,8 +173,8 @@ test_edge_encoder_maximum(void)
 		entries[i] = make_absent_entry((uint8) i, (uint16) i);
 	memset(output, 0, sizeof(output));
 	result = XLogEncodePageVersionEdgeV1(output, sizeof(output), 29,
-									 entries, XLR_PAGE_VERSION_EDGE_MAX_ENTRIES,
-									 &output_size);
+										 entries, XLR_PAGE_VERSION_EDGE_MAX_ENTRIES,
+										 &output_size);
 	semantic(result && output_size == XLR_PAGE_VERSION_EDGE_MAX_SIZE &&
 			 output[0] == XLR_BLOCK_ID_PAGE_VERSION_EDGE &&
 			 output[2] == XLR_PAGE_VERSION_EDGE_MAX_ENTRIES &&
@@ -201,7 +201,7 @@ test_edge_encoder_invalid_zero_mutation(void)
 	control(encode_unchanged(31, entries, 0, 64),
 			"T3-B-ENCODER-ZERO-COUNT-NO-MUTATION");
 	control(encode_unchanged(31, entries,
-			XLR_PAGE_VERSION_EDGE_MAX_ENTRIES + 1, 64),
+							 XLR_PAGE_VERSION_EDGE_MAX_ENTRIES + 1, 64),
 			"T3-B-ENCODER-OVERMAX-COUNT-NO-MUTATION");
 	control(encode_unchanged(31, entries, 1, 63),
 			"T3-B-ENCODER-CAPACITY-NO-MUTATION");
@@ -223,11 +223,11 @@ test_edge_encoder_invalid_zero_mutation(void)
 	memcpy(before, output, sizeof(output));
 	output_size = 41;
 	control(!XLogEncodePageVersionEdgeV1(NULL, sizeof(output), 31,
-									  entries, 1, &output_size) &&
+										 entries, 1, &output_size) &&
 			output_size == 41 && memcmp(output, before, sizeof(output)) == 0,
 			"T3-B-ENCODER-NULL-OUTPUT-NO-MUTATION");
 	control(!XLogEncodePageVersionEdgeV1(output, sizeof(output), 31,
-									  entries, 1, NULL) &&
+										 entries, 1, NULL) &&
 			memcmp(output, before, sizeof(output)) == 0,
 			"T3-B-ENCODER-NULL-SIZE-NO-MUTATION");
 }
