@@ -1376,6 +1376,12 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 		}
 		break;
 	}
+
+	case CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:
+		/* Multi-verdict is park-only.  A defensive inline call keeps the
+		 * pre-set DENIED result and must not enter cr_serve_slot(). */
+		old = MemoryContextSwitchTo(cr_serve_scratch_context());
+		goto inline_deny_no_serve;
 	}
 
 	old = MemoryContextSwitchTo(cr_serve_scratch_context());
@@ -1411,6 +1417,7 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 		slot.result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 		cluster_cr_server_stat_bump(CLUSTER_CR_SERVER_STAT_FENCE_REFUSED);
 	}
+inline_deny_no_serve:
 	cr_build_and_send_reply(&slot);
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(CrServeScratchCtx);

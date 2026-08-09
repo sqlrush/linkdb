@@ -1059,7 +1059,7 @@ cr_walk_chain(char *scratch_page, UBA start_uba, SCN read_scn,
 {
 	UBA uba = start_uba;
 	PGAlignedBlock record_buf;
-	ClusterXpScope xp_scope; /* PGRAC: spec-5.59 D3 profiling */
+	ClusterXpScope xp_scope = { .active = false }; /* PGRAC: spec-5.59 D3 profiling */
 
 	/* PGRAC: spec-5.59 D3 profiling -- nested breakdown under
 	 * CLXP_R_CR_CONSTRUCT; every ereport(ERROR) path below simply loses the
@@ -3075,6 +3075,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 					 errhint("the deleter's TT slot was recycled but the retention proof is "
 							 "unavailable (retention off, invalid horizon, or a read_scn older "
 							 "than the horizon); retry with a fresh snapshot.")));
+				pg_unreachable();
 
 			case CLUSTER_CR_XMAX_INVALID_OR_AMBIGUOUS:
 				cluster_cr_count_xmax_invalid_or_ambiguous();
@@ -3083,6 +3084,7 @@ cluster_cr_verdict_on_image(const char *cr_page, OffsetNumber offnum,
 									   cr_xmax),
 								errhint("delayed cleanout (commit_scn not yet stamped) or xid-wrap "
 										"residue; retry with a fresh snapshot.")));
+				pg_unreachable();
 
 			case CLUSTER_CR_XMAX_SCAN_UNAVAILABLE:
 			default:
