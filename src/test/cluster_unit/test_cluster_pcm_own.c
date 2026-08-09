@@ -1193,8 +1193,11 @@ UT_TEST(test_lockbuffer_reservation_busy_barrier_is_typed_before_failure_report)
 	wait_end = wait_fn != NULL ? strstr(wait_fn + 1, "\n/*\n * PGRAC (t/400 S_NEW") : NULL;
 	UT_ASSERT_NOT_NULL(wait_fn);
 	UT_ASSERT_NOT_NULL(wait_end);
-	guard = wait_fn != NULL ? strstr(wait_fn, "cluster_pcm_x_nested_wait_guard_before_block()") : NULL;
-	typed = guard != NULL ? strstr(guard, "guard_result == PCM_X_QUEUE_BARRIER_CLOSED") : NULL;
+	guard = wait_fn != NULL ? strstr(wait_fn, "if (guard_result != PCM_X_QUEUE_OK)") : NULL;
+	typed = guard != NULL
+		? strstr(guard,
+				 "if (barrier_refused != NULL && guard_result == PCM_X_QUEUE_BARRIER_CLOSED)")
+		: NULL;
 	set_refused = typed != NULL ? strstr(typed, "*barrier_refused = true") : NULL;
 	note_unwind = set_refused != NULL
 		? strstr(set_refused, "cluster_pcm_x_stats_note_barrier_unwind()") : NULL;
