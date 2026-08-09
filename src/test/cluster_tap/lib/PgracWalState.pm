@@ -26,7 +26,7 @@ use warnings;
 
 use Exporter 'import';
 our @EXPORT_OK = qw(crc32c slot_offset read_file_raw write_file_raw
-  read_slot_raw patch_byte forge_slot_node_id forge_slot_clone);
+  read_slot_raw patch_byte forge_slot_node_id forge_slot_fpw_sticky forge_slot_clone);
 
 sub crc32c
 {
@@ -69,7 +69,8 @@ sub write_file_raw
 }
 
 # Fixed-field peek (magic/version/thread_id/node_id/state @0..15,
-# started_at @24, highest_lsn @40, checkpoint_redo_lsn @56).
+# started_at @24, highest_lsn @40, checkpoint_redo_lsn @56,
+# fpw_was_off @68).
 sub read_slot_raw
 {
 	my ($regfile, $tid) = @_;
@@ -82,6 +83,7 @@ sub read_slot_raw
 	my ($started_at) = unpack('q', substr($buf, 24, 8));
 	my ($highest_lsn) = unpack('Q', substr($buf, 40, 8));
 	my ($checkpoint_redo_lsn) = unpack('Q', substr($buf, 56, 8));
+	my ($fpw_was_off) = unpack('L', substr($buf, 68, 4));
 	return {
 		magic => $magic,
 		thread_id => $thread_id,
@@ -90,7 +92,8 @@ sub read_slot_raw
 		tli => $tli,
 		started_at => $started_at,
 		highest_lsn => $highest_lsn,
-		checkpoint_redo_lsn => $checkpoint_redo_lsn
+		checkpoint_redo_lsn => $checkpoint_redo_lsn,
+		fpw_was_off => $fpw_was_off
 	};
 }
 
@@ -116,6 +119,22 @@ sub forge_slot_node_id
 	my $off = slot_offset($tid);
 	my $slot = substr($image, $off, 512);
 	substr($slot, 8, 4) = pack('l', $node_id);
+	substr($slot, 504, 4) = pack('L', crc32c(substr($slot, 0, 504)));
+	substr($image, $off, 512) = $slot;
+	write_file_raw($regfile, $image);
+	return;
+}
+
+# Rewrite slot $tid's FPW-off sticky and recompute a VALID crc.  This
+# exercises StartupXLOG's historical-FPW evidence gate without turning the
+# slot into generic torn/corrupt evidence first.
+sub forge_slot_fpw_sticky
+{
+	my ($regfile, $tid, $sticky) = @_;
+	my $image = read_file_raw($regfile);
+	my $off = slot_offset($tid);
+	my $slot = substr($image, $off, 512);
+	substr($slot, 68, 4) = pack('L', $sticky);
 	substr($slot, 504, 4) = pack('L', crc32c(substr($slot, 0, 504)));
 	substr($image, $off, 512) = $slot;
 	write_file_raw($regfile, $image);

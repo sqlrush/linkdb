@@ -47,7 +47,8 @@ use lib "$FindBin::RealBin/../lib";
 
 use File::Path qw(make_path);
 use PgracClusterNode;
-use PgracWalState qw(crc32c read_file_raw write_file_raw read_slot_raw patch_byte forge_slot_node_id);
+use PgracWalState qw(crc32c read_file_raw write_file_raw read_slot_raw patch_byte
+  forge_slot_node_id forge_slot_fpw_sticky);
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -57,6 +58,15 @@ sub dumpkey
 	return $node->safe_psql('postgres', qq{
 		SELECT value FROM pg_cluster_state
 		WHERE category='wal_thread' AND key='$key'});
+}
+
+sub checkpoint_redo_u64
+{
+	my ($node) = @_;
+
+	return $node->safe_psql('postgres', q{
+		SELECT pg_wal_lsn_diff(redo_lsn, '0/0')::bigint
+		  FROM pg_control_checkpoint()});
 }
 
 my $wroot = PostgreSQL::Test::Utils::tempdir();
@@ -105,6 +115,107 @@ while (time() < $deadline) {
 }
 cmp_ok($ts1, '>', $ts0, "L2 registry_last_updated advances ($ts0 -> $ts1)");
 isnt($lsn1, $lsn0, 'L2 registry_highest_lsn advances with WAL volume');
+
+# ============================================================
+# W5: SIGHUP may request FPW-off but only a non-EOR checkpoint may
+# persist the sticky and perform the safe off transition.  Both W5a
+# and W5b borrow the checkpoint's already verified CF(X).
+# ============================================================
+{
+	my $w5root = PostgreSQL::Test::Utils::tempdir();
+	my $w5reg = "$w5root/pgrac_wal_state";
+	my $w5shared = PostgreSQL::Test::Utils::tempdir();
+	make_path("$w5shared/global");
+	my $w5 = PgracClusterNode->new('wal_state_w5');
+	$w5->init(extra => [ '-X', "$w5root/thread_14" ]);
+	$w5->append_conf('postgresql.conf',
+		    "cluster.enabled = on\n"
+		  . "cluster.node_id = 13\n"
+		  . "cluster.allow_single_node = on\n"
+		  . "cluster.wal_threads_dir = '$w5root'\n"
+		  . "cluster.shared_data_dir = '$w5shared'\n"
+		  . "cluster.controlfile_shared_authority = on\n"
+		  . "cluster.cluster_stats_main_loop_interval = '500ms'\n"
+		  . "autovacuum = off\n");
+	$w5->start;
+	my $before = read_slot_raw($w5reg, 14);
+
+	is($before->{fpw_was_off}, 0, 'W5 precondition: FPW-off sticky is clear');
+	$w5->safe_psql('postgres', q{
+		ALTER SYSTEM SET full_page_writes = 'off';
+		SELECT pg_reload_conf();});
+	ok($w5->poll_query_until('postgres',
+		q{SELECT current_setting('full_page_writes') = 'off'}),
+		'W5 desired full_page_writes=off is visible after SIGHUP');
+	is(read_slot_raw($w5reg, 14)->{fpw_was_off}, 0,
+		'W5 SIGHUP alone does not initialize the sticky');
+
+	chmod(0444, $w5reg) or die "chmod: $!";
+	$w5->safe_psql('postgres', 'CHECKPOINT');
+	is($w5->safe_psql('postgres',
+		q{SELECT full_page_writes FROM pg_control_checkpoint()}),
+		't', 'W5 sticky failure keeps checkpoint FPW on and checkpoint completes');
+	my $failed = read_slot_raw($w5reg, 14);
+	is($failed->{fpw_was_off}, 0, 'W5 sticky failure emits no durable off evidence');
+	is($failed->{checkpoint_redo_lsn}, $before->{checkpoint_redo_lsn},
+		'W5 advert failure preserves the prior checkpoint redo');
+
+	chmod(0644, $w5reg) or die "chmod: $!";
+	$w5->safe_psql('postgres', 'CHECKPOINT');
+	my $retry = read_slot_raw($w5reg, 14);
+	is($retry->{fpw_was_off}, 1,
+		'W5 next non-EOR checkpoint persists sticky before FPW-off');
+	is($w5->safe_psql('postgres',
+		q{SELECT full_page_writes FROM pg_control_checkpoint()}),
+		'f', 'W5 successful sticky permits checkpoint FPW-off');
+	is($retry->{checkpoint_redo_lsn}, checkpoint_redo_u64($w5),
+		'W5 successful checkpoint advert equals durable control redo');
+
+	$w5->safe_psql('postgres', q{
+		ALTER SYSTEM SET full_page_writes = 'on';
+		SELECT pg_reload_conf();});
+	ok($w5->poll_query_until('postgres',
+		q{SELECT current_setting('full_page_writes') = 'on'}),
+		'W5 desired full_page_writes=on is visible after SIGHUP');
+
+	$w5->safe_psql('postgres',
+		q{CREATE TABLE w5_redo_advance AS SELECT generate_series(1, 1000)});
+	my $advert_before_failure = read_slot_raw($w5reg, 14)->{checkpoint_redo_lsn};
+	chmod(0444, $w5reg) or die "chmod: $!";
+	$w5->safe_psql('postgres', 'CHECKPOINT');
+	my $control_after_failure = checkpoint_redo_u64($w5);
+	cmp_ok($control_after_failure, '>', $advert_before_failure,
+		'W5 failed advert does not prevent durable checkpoint progress');
+	is(read_slot_raw($w5reg, 14)->{checkpoint_redo_lsn}, $advert_before_failure,
+		'W5 failed advert preserves old conservative redo');
+
+	chmod(0644, $w5reg) or die "chmod: $!";
+	$w5->safe_psql('postgres', 'CHECKPOINT');
+	is(read_slot_raw($w5reg, 14)->{checkpoint_redo_lsn}, checkpoint_redo_u64($w5),
+		'W5 next checkpoint retries and publishes its durable redo');
+
+	# Leave replay's latest FPW state off, then restart with the shared-CF
+	# authority disabled so the EOR test isolates W5's read-only evidence gate.
+	$w5->safe_psql('postgres', q{
+		ALTER SYSTEM SET full_page_writes = 'off';
+		SELECT pg_reload_conf();});
+	ok($w5->poll_query_until('postgres',
+		q{SELECT current_setting('full_page_writes') = 'off'}),
+		'W5 historical leg sees desired FPW-off');
+	$w5->safe_psql('postgres', 'CHECKPOINT');
+	$w5->safe_psql('postgres',
+		q{ALTER SYSTEM SET cluster.controlfile_shared_authority = 'off'});
+	$w5->stop('immediate');
+	forge_slot_fpw_sticky($w5reg, 14, 0);
+	my $historical_start = $w5->start(fail_ok => 1);
+	is($historical_start, 0,
+		'W5 historical FPW-off without sticky is Startup FATAL');
+	$w5->stop('immediate') if $historical_start;
+	forge_slot_fpw_sticky($w5reg, 14, 1);
+	ok($w5->start,
+		'W5 historical FPW-off with valid own sticky restarts');
+	$w5->stop;
+}
 
 # ============================================================
 # L3: clean stop publishes STOPPED.
