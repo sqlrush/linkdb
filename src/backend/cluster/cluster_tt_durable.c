@@ -423,7 +423,6 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
 											 owner, off, (char *)&first, sizeof(first))) {
 		cluster_tt_durable_io_wait_end();
-		cluster_tt_durable_count_lookup(false);
 		return false;
 	}
 	cluster_tt_durable_io_wait_end();
@@ -457,6 +456,60 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 
 	*commit_scn = second.commit_scn;
 	cluster_tt_durable_count_lookup(true);
+	return true;
+}
+
+bool
+cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
+										  TransactionId xid, uint16 expected_wrap,
+										  TTSlot *slot_out)
+{
+	uint8 owner;
+	uint32 off;
+	TTSlot first;
+	TTSlot second;
+
+	if (slot_out == NULL)
+		return false;
+	memset(slot_out, 0, sizeof(*slot_out));
+
+	if (segment_id == 0
+		|| segment_id
+			   > ((uint32)SCN_MAX_VALID_NODE_ID + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| expected_wrap == TT_WRAP_INVALID)
+		return false;
+
+	owner = tt_owner_instance_for_segment(segment_id);
+	off = tt_slot_file_offset(slot_offset);
+
+	cluster_tt_durable_io_wait_start();
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											 owner, off, (char *)&first, sizeof(first))) {
+		cluster_tt_durable_io_wait_end();
+		cluster_tt_durable_count_lookup(false);
+		return false;
+	}
+	cluster_tt_durable_io_wait_end();
+
+	if (first.status > (uint8)TT_SLOT_RECYCLABLE || first.xid != xid
+		|| first.wrap != expected_wrap)
+		return false;
+
+	cluster_tt_durable_io_wait_start();
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(owner), segment_id,
+											 owner, off, (char *)&second, sizeof(second))) {
+		cluster_tt_durable_io_wait_end();
+		return false;
+	}
+	cluster_tt_durable_io_wait_end();
+
+	if (memcmp(&first, &second, sizeof(first)) != 0
+		|| second.status > (uint8)TT_SLOT_RECYCLABLE || second.xid != xid
+		|| second.wrap != expected_wrap)
+		return false;
+
+	*slot_out = second;
 	return true;
 }
 
