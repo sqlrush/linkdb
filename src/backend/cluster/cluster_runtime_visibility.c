@@ -86,9 +86,7 @@ cluster_runtime_visibility_direct_xid_committed(TransactionId xid)
 
 typedef struct ClusterRuntimeSubtransSample {
 	TransactionId xids[CLUSTER_R4_SUBTRANS_MAX_DEPTH];
-	TransactionId parents[CLUSTER_R4_SUBTRANS_MAX_DEPTH];
 	int count;
-	TransactionId top_xid;
 } ClusterRuntimeSubtransSample;
 
 /*
@@ -127,6 +125,7 @@ cluster_runtime_visibility_sample_subtrans(TransactionId child,
 										   ClusterTxResolveReason *reason_out)
 {
 	TransactionId current = child;
+	uint32 previous_distance = 0;
 	int depth;
 
 	Assert(sample != NULL);
@@ -135,7 +134,7 @@ cluster_runtime_visibility_sample_subtrans(TransactionId child,
 
 	for (depth = 0; depth < CLUSTER_R4_SUBTRANS_MAX_DEPTH; depth++) {
 		TransactionId parent;
-		int i;
+		uint32 parent_distance;
 
 		if (TransactionIdPrecedes(current, TransactionXmin)) {
 			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
@@ -144,27 +143,21 @@ cluster_runtime_visibility_sample_subtrans(TransactionId child,
 
 		parent = SubTransGetParent(current);
 		sample->xids[depth] = current;
-		sample->parents[depth] = parent;
 		sample->count = depth + 1;
 
-		if (!TransactionIdIsValid(parent)) {
-			sample->top_xid = current;
+		if (!TransactionIdIsValid(parent))
 			return true;
-		}
 		if (!TransactionIdIsNormal(parent)) {
 			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
 			return false;
 		}
-		if (!TransactionIdPrecedes(parent, current)) {
+		parent_distance = (uint32)(child - parent);
+		if (parent_distance == 0 || parent_distance >= ((uint32)0x80000000U)
+			|| parent_distance <= previous_distance) {
 			*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_CYCLE;
 			return false;
 		}
-		for (i = 0; i <= depth; i++) {
-			if (TransactionIdEquals(sample->xids[i], parent)) {
-				*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_CYCLE;
-				return false;
-			}
-		}
+		previous_distance = parent_distance;
 		current = parent;
 	}
 
@@ -181,6 +174,7 @@ cluster_runtime_visibility_recheck_subtrans(const ClusterRuntimeSubtransSample *
 	Assert(sample != NULL);
 	Assert(reason_out != NULL);
 	for (i = 0; i < sample->count; i++) {
+		TransactionId expected_parent;
 		TransactionId parent;
 
 		if (TransactionIdPrecedes(sample->xids[i], TransactionXmin)) {
@@ -188,7 +182,8 @@ cluster_runtime_visibility_recheck_subtrans(const ClusterRuntimeSubtransSample *
 			return false;
 		}
 		parent = SubTransGetParent(sample->xids[i]);
-		if (!TransactionIdEquals(parent, sample->parents[i])) {
+		expected_parent = i + 1 < sample->count ? sample->xids[i + 1] : InvalidTransactionId;
+		if (!TransactionIdEquals(parent, expected_parent)) {
 			*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_CHANGED;
 			return false;
 		}
@@ -288,7 +283,7 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 			reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
 			goto unknown;
 		}
-		if (native_status == TRANSACTION_STATUS_ABORTED || exact_slot.status == TT_SLOT_ABORTED) {
+		if (native_status == TRANSACTION_STATUS_ABORTED) {
 			outcome = CLUSTER_TX_ABORTED;
 			commit_scn = InvalidScn;
 		} else if (native_status == TRANSACTION_STATUS_SUB_COMMITTED) {
@@ -297,16 +292,20 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 
 			if (!cluster_runtime_visibility_sample_subtrans(locator->xid, &subtrans, &reason))
 				goto unknown;
-			native_status = cluster_runtime_visibility_direct_xid_status(subtrans.top_xid);
-			native_status = cluster_runtime_visibility_recheck_prepared(subtrans.top_xid,
-																		native_status, &prepared);
+			top_xid = subtrans.xids[subtrans.count - 1];
+			native_status = cluster_runtime_visibility_direct_xid_status(top_xid);
+			native_status = cluster_runtime_visibility_recheck_prepared(top_xid,
+															native_status, &prepared);
 			if (!cluster_runtime_visibility_recheck_subtrans(&subtrans, &reason))
 				goto unknown;
 
-			top_xid = subtrans.top_xid;
 			proof_kind = CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP;
 			commit_scn = InvalidScn;
 			if (native_status == TRANSACTION_STATUS_COMMITTED) {
+				if (exact_slot.status == TT_SLOT_ABORTED) {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+					goto unknown;
+				}
 				/* No exact top locator/TT commit SCN is carried in this batch. */
 				reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
 				goto unknown;
@@ -317,31 +316,55 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 					goto unknown;
 				}
 				outcome = CLUSTER_TX_ABORTED;
-			} else if (native_status == TRANSACTION_STATUS_IN_PROGRESS
-					   && exact_slot.status == TT_SLOT_ACTIVE) {
-				outcome = prepared ? CLUSTER_TX_PREPARED : CLUSTER_TX_IN_PROGRESS;
+			} else if (native_status == TRANSACTION_STATUS_IN_PROGRESS) {
+				if (prepared
+					&& (exact_slot.status == TT_SLOT_ACTIVE
+						|| exact_slot.status == TT_SLOT_ABORTED))
+					outcome = CLUSTER_TX_PREPARED;
+				else if (!prepared && exact_slot.status == TT_SLOT_ACTIVE)
+					outcome = CLUSTER_TX_IN_PROGRESS;
+				else {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+					goto unknown;
+				}
 			} else {
 				reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 				goto unknown;
 			}
-		} else if (native_status == TRANSACTION_STATUS_IN_PROGRESS
-				   && exact_slot.status == TT_SLOT_ACTIVE) {
+		} else if (native_status == TRANSACTION_STATUS_IN_PROGRESS) {
 			bool prepared = false;
 
 			native_status = cluster_runtime_visibility_recheck_prepared(locator->xid, native_status,
 																		&prepared);
 			commit_scn = InvalidScn;
 			if (native_status == TRANSACTION_STATUS_COMMITTED) {
+				if (exact_slot.status == TT_SLOT_ABORTED) {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+					goto unknown;
+				}
 				/* Retry will acquire a stable exact TT/CLOG/TT commit sample. */
 				reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
 				goto unknown;
 			}
-			if (native_status == TRANSACTION_STATUS_ABORTED)
+			if (native_status == TRANSACTION_STATUS_ABORTED) {
+				if (exact_slot.status == TT_SLOT_COMMITTED) {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+					goto unknown;
+				}
 				outcome = CLUSTER_TX_ABORTED;
+			}
 			else if (native_status == TRANSACTION_STATUS_IN_PROGRESS) {
-				outcome = prepared ? CLUSTER_TX_PREPARED : CLUSTER_TX_IN_PROGRESS;
-				if (prepared)
+				if (prepared
+					&& (exact_slot.status == TT_SLOT_ACTIVE
+						|| exact_slot.status == TT_SLOT_ABORTED)) {
+					outcome = CLUSTER_TX_PREPARED;
 					proof_kind = CLUSTER_TX_PROOF_ORIGIN_TWOPHASE;
+				} else if (!prepared && exact_slot.status == TT_SLOT_ACTIVE)
+					outcome = CLUSTER_TX_IN_PROGRESS;
+				else {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+					goto unknown;
+				}
 			} else {
 				reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 				goto unknown;

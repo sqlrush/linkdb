@@ -1,7 +1,12 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_r4_multi_subx_2pc.c
- *    Stage 8 R4 native MultiXact composition, subxact and 2PC tests.
+ *    Stage 8 R4 pure MultiXact snapshot-helper tests.
+ *
+ *    The native reader declaration below is compile-time ABI coverage only;
+ *    this binary does not call the native reader, SubTrans, or two-phase
+ *    storage.  Those native lifecycle seams are covered by the dedicated
+ *    TAP loadable module test_pgrac_r4_native_tx.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -41,7 +46,7 @@ fill_members(MultiXactMember *members, int count)
 	}
 }
 
-UT_TEST(test_native_reader_signature_exists)
+UT_TEST(test_native_reader_signature_is_compile_time_only)
 {
 	UT_ASSERT(true);
 }
@@ -185,7 +190,7 @@ int
 main(void)
 {
 	UT_PLAN(16);
-	UT_RUN(test_native_reader_signature_exists);
+	UT_RUN(test_native_reader_signature_is_compile_time_only);
 	UT_RUN(test_exact_two_member_snapshot_matches);
 	UT_RUN(test_exact_256_member_snapshot_matches);
 	UT_RUN(test_generation_change_refuses);
