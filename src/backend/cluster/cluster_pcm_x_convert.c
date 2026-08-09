@@ -10626,7 +10626,6 @@ pcm_x_local_holder_register_common(const PcmXLocalHolderKey *key,
 	PcmXAllocatorResult allocator_result;
 	PcmXQueueResult result = PCM_X_QUEUE_OK;
 	uint64 committed_own_generation = 0;
-	uint64 next_holder_generation;
 	uint32 partition;
 	bool new_tag = false;
 	bool writer_authorized = false;
@@ -10791,12 +10790,11 @@ pcm_x_local_holder_register_common(const PcmXLocalHolderKey *key,
 			goto allocator_done;
 		}
 	}
-	if (!cluster_pcm_x_generation_next(tag_slot->holder_set_generation, &next_holder_generation)) {
+	if (tag_slot->holder_set_generation == UINT64_MAX) {
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto allocator_done;
 	}
-
 	allocator_result
 		= pcm_x_allocator_reserve_locked(PCM_X_ALLOC_LOCAL_HOLDER, &holder_ref, &raw_slot);
 	if (allocator_result != PCM_X_ALLOC_OK) {
@@ -10915,7 +10913,7 @@ allocator_done:
 		head->prev_index = holder_ref.slot_index;
 	}
 	tag_slot->active_holder_head_index = holder_ref.slot_index;
-	tag_slot->holder_set_generation = next_holder_generation;
+	tag_slot->holder_set_generation++;
 	pg_write_barrier();
 	pcm_x_slot_state_write(&holder->slot, PCM_XL_HOLDER_ACQUIRING);
 	if (new_tag)
@@ -17436,17 +17434,17 @@ cluster_pcm_x_local_retire_round_exact(const BufferTag *tag, uint64 cluster_epoc
 			 || tag_ref.slot_generation != cutoff->tag_slot.slot_generation)
 		result = PCM_X_QUEUE_STALE;
 	else {
-		tag_slot
+		gated_tag
 			= (PcmXLocalTagSlot *)pcm_x_slot_ref_resolve_locked(PCM_X_ALLOC_LOCAL_TAG, tag_ref);
-		if (tag_slot == NULL || pcm_x_slot_state_read(&tag_slot->slot) != PCM_X_TAG_LIVE)
+		if (gated_tag == NULL || pcm_x_slot_state_read(&gated_tag->slot) != PCM_X_TAG_LIVE)
 			result = PCM_X_QUEUE_STALE;
-		else if (!BufferTagsEqual(&tag_slot->tag, tag)
-				 || tag_slot->cluster_epoch != cluster_epoch) {
+		else if (!BufferTagsEqual(&gated_tag->tag, tag)
+				 || gated_tag->cluster_epoch != cluster_epoch) {
 			result = PCM_X_QUEUE_CORRUPT;
 			fail_closed = true;
 		} else
 			result
-				= pcm_x_local_handoff_gate_claim_locked(header, tag_slot, false, PCM_X_QUEUE_BUSY);
+				= pcm_x_local_handoff_gate_claim_locked(header, gated_tag, false, PCM_X_QUEUE_BUSY);
 	}
 	LWLockRelease(&header->allocator_lock.lock);
 	if (result != PCM_X_QUEUE_OK) {
@@ -17457,7 +17455,6 @@ cluster_pcm_x_local_retire_round_exact(const BufferTag *tag, uint64 cluster_epoc
 		return result;
 	}
 	gate_claimed = true;
-	gated_tag = tag_slot;
 
 	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(tag));
 	pcm_x_local_gate_acquire_guarded(&header->local_locks[partition].lock, LW_EXCLUSIVE, gated_tag);
