@@ -736,7 +736,7 @@ test_cluster_block_apply: test_cluster_block_apply.c unit_test.h $(CLUSTER_BLOCK
 # links no production object.  It freezes ownership and ABI requirements
 # before the first JIT product byte exists.
 test_cluster_jit_source_contract: test_cluster_jit_source_contract.c unit_test.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DJIT_SOURCE_ROOT=\"$(abs_top_srcdir)/src\" $< -o $@
 
 # spec-4.11 D1: test_cluster_thread_apply links the real online thread-recovery
 # apply wrapper object and stubs cluster_block_apply_one (its byte-for-byte
