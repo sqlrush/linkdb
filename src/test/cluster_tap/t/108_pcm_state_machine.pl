@@ -13,7 +13,7 @@
 #	  L1  default cluster.pcm_grd_max_entries=-1 → auto NBuffers + pcm
 #	       category visible in pg_cluster_state
 #	  L2  explicit cluster.pcm_grd_max_entries=0 → PCM disabled surface
-#	  L3  dump_pcm emits the exact 58-row PCM surface, including PCM-X
+#	  L3  dump_pcm emits the exact 110-row measured R1 PCM surface, including PCM-X
 #	       FIFO, ownership, and runtime gauges
 #	  L4  9 transition counter rows present + non-negative
 #	  L5  ClusterPcmTransitionApply and PcmBlockConvertWait are registered
@@ -48,8 +48,8 @@ $node_default->start;
 my $pcm_category_rows = $node_default->safe_psql(
 	'postgres',
 	"SELECT count(*) FROM pg_cluster_state WHERE category = 'pcm'");
-is($pcm_category_rows, '60',
-	'L1 pg_cluster_state pcm category has 60 rows (existing 28 + PCM-X FIFO/ownership/runtime 31 + fail-closed site)');
+is($pcm_category_rows, '110',
+	'L1 pg_cluster_state pcm category has 110 rows (measured R1 diagnostic surface)');
 
 # L3 — api_state shows "active" when GUC=-1 default
 my $api_state_default = $node_default->safe_psql(

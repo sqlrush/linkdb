@@ -4,7 +4,7 @@
 #    End-to-end regression for the PCM lock framework surface.  This
 #    started as the stage-1.7 scaffolding test, but spec-2.30 activates
 #    the local PCM state machine; the current active diagnostic surface
-#    is 58 rows after the 30-key PCM-X FIFO/ownership/runtime addition.
+#    is 110 rows in the measured R1 diagnostic surface.
 #
 #    Verifies the SQL surface backed by spec-1.7 Deliverable 4 (pcm
 #    category) + Deliverable 5 (4 PCM inject points, registry 24->28)
@@ -55,14 +55,14 @@ $node->start;
 
 
 # ----------
-# L1: pg_cluster_state.pcm category has 60 keys, including the 32-key PCM-X FIFO surface.
+# L1: pg_cluster_state.pcm category has 110 keys in the measured R1 diagnostic surface.
 # activates the state-machine diagnostics.
 # ----------
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE category='pcm'}),
-	'60',
-	'L1 pg_cluster_state.pcm category has 60 keys (existing 28 + PCM-X FIFO/ownership/runtime 31 + fail-closed site)');
+	'110',
+	'L1 pg_cluster_state.pcm category has 110 keys (measured R1 diagnostic surface)');
 
 
 # ----------
@@ -162,8 +162,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 			'postgres',
 			'SELECT count(*) FROM pg_stat_cluster_injections'),
-	   '183',
-	   'L6a pg_stat_cluster_injections has 183 entries (matches t/015 registry authority)');
+	   '184',
+	   'L6a pg_stat_cluster_injections has 184 entries (matches t/015 registry authority)');
 
 is($node->safe_psql(
 		'postgres',
