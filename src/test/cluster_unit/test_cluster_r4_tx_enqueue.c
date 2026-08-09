@@ -360,6 +360,9 @@ UT_TEST(test_exact_wait_abi_and_shmem_size_are_frozen)
 	UT_ASSERT_EQ(__alignof__(ClusterTTStatusKey), 4);
 	UT_ASSERT_EQ(sizeof(ClusterTxLocator), 24);
 	UT_ASSERT_EQ(__alignof__(ClusterTxLocator), 8);
+	UT_ASSERT_EQ(sizeof(ClusterTxwIdentity), 24);
+	UT_ASSERT_EQ(__alignof__(ClusterTxwIdentity), 4);
+	UT_ASSERT_EQ(offsetof(ClusterTxwWaitSlot, waiting), 24);
 	UT_ASSERT_EQ(sizeof(ClusterTxwWaitSlot), 28);
 	UT_ASSERT_EQ(__alignof__(ClusterTxwWaitSlot), 4);
 	UT_ASSERT_EQ(cluster_tx_enqueue_shmem_size(),
