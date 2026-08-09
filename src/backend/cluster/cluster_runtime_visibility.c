@@ -42,6 +42,8 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/clog.h"
+#include "access/xlog.h"
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_cache.h"
 #include "cluster/cluster_cr_pool.h"
@@ -53,13 +55,24 @@
 #include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_sf_dep.h" /* peer HELLO D4-capability gate (D4-6) */
+#include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_authority.h" /* dead-owner serve authority (D4-4) */
 #include "cluster/cluster_undo_gcs.h"		/* cluster_undo_block_acquire_shared (D3-2) */
 #include "cluster/cluster_undo_resid.h"		/* cluster_undo_resid_encode (D3-2) */
+#include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_verdict.h"	/* verdict taxonomy + entry (D3-3/D3-4) */
 #include "cluster/cluster_undo_horizon.h"	/* D5-8 read admission (spec-5.22e) */
+
+static bool
+cluster_runtime_visibility_direct_xid_committed(TransactionId xid)
+{
+	XLogRecPtr xid_lsn;
+
+	return TransactionIdGetStatus(xid, &xid_lsn) == TRANSACTION_STATUS_COMMITTED;
+}
 
 /*
  * R4 exact durable-origin provider boundary.  The consumer is now wired to
@@ -69,16 +82,98 @@
  * cannot prove or echo the caller-selected UBA/slot/wrap identity.
  */
 ClusterTxOutcome
-cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator pg_attribute_unused(),
-											 ClusterTxResolveMode mode pg_attribute_unused(),
-											 uint64 formation_epoch pg_attribute_unused(),
+cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
+											 ClusterTxResolveMode mode, uint64 formation_epoch,
 											 ClusterTxResolution *out,
 											 ClusterTxResolveReason *reason_out)
 {
+	PGAlignedBlock record_buf;
+	const UndoRecordHeader *record;
+	ClusterTxResolution candidate;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	ClusterLiveAuthority authority;
+	NodeId origin_node;
+	size_t record_size;
+	SCN commit_scn = InvalidScn;
+	uint16 tt_slot_offset;
+
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	memset(&candidate, 0, sizeof(candidate));
+	memset(&authority, 0, sizeof(authority));
+
+	if (locator == NULL) {
+		reason = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
+		goto unknown;
+	}
+	if (out == NULL
+		|| (unsigned int)mode > (unsigned int)CLUSTER_TX_RESOLVE_CLEANOUT_HINT) {
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto unknown;
+	}
+	if (cluster_epoch_get_current() != formation_epoch) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto unknown;
+	}
+
+	origin_node = uba_origin_node_id(locator->uba);
+	if (origin_node == InvalidNodeId) {
+		reason = CLUSTER_TX_RESOLVE_BAD_UBA;
+		goto unknown;
+	}
+	if (cluster_node_id < 0 || origin_node != (NodeId)cluster_node_id) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		goto unknown;
+	}
+
+	record_size = cluster_undo_get_record(locator->uba, record_buf.data, sizeof(record_buf.data));
+	if (record_size < sizeof(UndoRecordHeader)) {
+		reason = CLUSTER_TX_RESOLVE_IO_ERROR;
+		goto unknown;
+	}
+	record = (const UndoRecordHeader *)record_buf.data;
+	if (!cluster_undo_record_validate_identity(locator, locator->uba, record, &reason))
+		goto unknown;
+
+	tt_slot_offset = cluster_tt_slot_id_to_offset(record->tt_slot_id);
+	if (!cluster_tt_slot_durable_lookup_committed_stable(
+			record->tt_slot_segment_id, tt_slot_offset, locator->xid, locator->tt_wrap,
+			cluster_runtime_visibility_direct_xid_committed, &commit_scn)
+		|| !SCN_VALID(commit_scn)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		goto unknown;
+	}
+
+	authority.origin_epoch = cluster_epoch_get_current();
+	authority.live_hwm_lsn = GetFlushRecPtr(NULL);
+	authority.tt_generation = cluster_undo_tt_retention_rollover_count();
+	authority.authority_scn = cluster_scn_current();
+	if (authority.origin_epoch != formation_epoch
+		|| cluster_epoch_get_current() != authority.origin_epoch) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto unknown;
+	}
+	if (XLogRecPtrIsInvalid(authority.live_hwm_lsn) || !SCN_VALID(authority.authority_scn)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		goto unknown;
+	}
+
+	candidate.locator_echo = *locator;
+	candidate.top_xid = locator->xid;
+	candidate.outcome = CLUSTER_TX_COMMITTED;
+	candidate.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	candidate.commit_scn = commit_scn;
+	candidate.authority = authority;
+	*out = candidate;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return CLUSTER_TX_COMMITTED;
+
+unknown:
+	if (reason_out != NULL)
+		*reason_out = reason;
 	return CLUSTER_TX_UNKNOWN;
 }
 
