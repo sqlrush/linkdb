@@ -71,6 +71,8 @@ sub checkpoint_redo_u64
 
 my $wroot = PostgreSQL::Test::Utils::tempdir();
 my $regfile = "$wroot/pgrac_wal_state";
+my $shared = PostgreSQL::Test::Utils::tempdir();
+make_path("$shared/global");
 
 my $node = PgracClusterNode->new('wal_state_a');
 $node->init(extra => [ '-X', "$wroot/thread_4" ]);
@@ -79,6 +81,8 @@ $node->append_conf('postgresql.conf',
 	  . "cluster.node_id = 3\n"
 	  . "cluster.allow_single_node = on\n"
 	  . "cluster.wal_threads_dir = '$wroot'\n"
+	  . "cluster.shared_data_dir = '$shared'\n"
+	  . "cluster.controlfile_shared_authority = on\n"
 	  . "cluster.cluster_stats_main_loop_interval = '500ms'\n"
 	  . "autovacuum = off\n");
 $node->start;
