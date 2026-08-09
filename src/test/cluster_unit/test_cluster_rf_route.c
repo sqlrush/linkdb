@@ -10,12 +10,18 @@
  *    exercises the generated authority directly; no substitute route table
  *    or test-owned parser is provided here.
  *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *    src/test/cluster_unit/test_cluster_rf_route.c
+ *
+ * NOTES
+ *    This is a pgrac-original test.  It links the real route authority and
+ *    pg_waldump rmgr descriptors; it does not provide substitute handlers.
  *
  *-------------------------------------------------------------------------
  */
@@ -281,8 +287,7 @@ UT_TEST(test_real_identify_and_redo_manifest_census)
 			bool active;
 			const char *name;
 			uint8 raw_info = (uint8)(nibble << 4);
-			uint8 normalized_info
-				= rmid == RM_XACT_ID ? raw_info & XLOG_XACT_OPMASK : raw_info;
+			uint8 normalized_info = rmid == RM_XACT_ID ? raw_info & XLOG_XACT_OPMASK : raw_info;
 
 			if (rmgr->rm_identify(raw_info) == NULL)
 				continue;
@@ -570,7 +575,7 @@ UT_TEST(test_inactive_routed_header_rejected_without_mutation)
 	component
 		= t4_component(T4_PAGE_CLASS_ROUTED_HEADER, MAIN_FORKNUM, 1, RF_ROUTE_OWNER_SIDE_TYPED);
 	before = component;
-	printf("# JIT_SEMANTIC_RED:T4-ROUTED-HEADER-INACTIVE\n");
+	printf("# ROUTED_HEADER stays inactive until its separate gate\n");
 	UT_ASSERT_EQ((int)rf_opcode_route_validate_components_v1(&route, &component, 1),
 				 (int)RF_OPCODE_ROUTE_COMPONENT_CLASS_INVALID);
 	UT_ASSERT_EQ(memcmp(&component, &before, sizeof(component)), 0);

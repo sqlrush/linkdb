@@ -770,7 +770,7 @@ check_cluster_rf_route_drift: test_cluster_rf_route.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-include $(CURDIR)/cluster_rf_route_opcode_mutation.h \
 		-c $(top_srcdir)/src/backend/cluster/cluster_rf_route.c -o $(RF_ROUTE_MUTANT_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pg_waldump \
+	$(CC) $(CFLAGS) -Wno-unused-function $(CPPFLAGS) -I$(top_srcdir)/src/bin/pg_waldump \
 		-DT4_ROUTE_DRIFT_MUTANT test_cluster_rf_route.c \
 		$(RF_ROUTE_MUTANT_O) $(RF_ROUTE_RMGRDESC_OBJS) \
 		$(top_builddir)/src/common/libpgcommon.a \

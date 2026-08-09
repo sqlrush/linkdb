@@ -3,6 +3,8 @@
  * cluster_rf_route.h
  *    Exhaustive Stage 8 failed-origin redo route authority.
  *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>

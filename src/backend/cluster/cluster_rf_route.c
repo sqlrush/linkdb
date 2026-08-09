@@ -3,6 +3,8 @@
  * cluster_rf_route.c
  *    Exhaustive Stage 8 failed-origin redo route authority.
  *
+ * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
  * Author: SqlRush <sqlrush@gmail.com>
@@ -10,16 +12,44 @@
  * IDENTIFICATION
  *    src/backend/cluster/cluster_rf_route.c
  *
+ * NOTES
+ *    This is a pgrac-original file.  Exported symbols use the rf_opcode_
+ *    namespace and provide validation only; this file registers no caller.
+ *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include "access/brin_xlog.h"
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/generic_xlog.h"
+#include "access/ginxlog.h"
+#include "access/gistxlog.h"
+#include "access/hash_xlog.h"
+#include "access/heapam_xlog.h"
+#include "access/multixact.h"
+#include "access/nbtxlog.h"
 #include "access/rmgr.h"
+#include "access/spgxlog.h"
 #include "access/xact.h"
 #include "access/xlogrecord.h"
+#include "catalog/pg_control.h"
+#include "catalog/storage_xlog.h"
 #include "cluster/cluster_rf_route.h"
+#include "cluster/cluster_adg_xlog.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
+#include "cluster/storage/cluster_raw_xlog.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "common/relpath.h"
+#include "commands/dbcommands_xlog.h"
+#include "commands/sequence.h"
+#include "commands/tablespace.h"
+#include "replication/message.h"
+#include "replication/origin.h"
+#include "storage/standbydefs.h"
+#include "utils/relmapper.h"
 
 
 /* The manifest is invalid until the complete built-in rmgr order is exact. */
@@ -60,10 +90,27 @@ typedef struct RfOpcodeRouteManifestRowV1 {
 	const char *diagnostic_name;
 } RfOpcodeRouteManifestRowV1;
 
+#define RF_OPCODE_ROUTE_BASE(value) ((value), 1, 0, 0, 0)
+#define RF_OPCODE_ROUTE_COMBINED(base, modifier) (((base) | (modifier)), 0, 1, 0, 0)
+#define RF_OPCODE_ROUTE_GENERIC (UINT8_C(0x00), 0, 0, 1, 0)
+#define RF_OPCODE_ROUTE_INACTIVE_STOP07 (UINT8_C(0xA0), 0, 0, 0, 1)
+
+/* Binding tuples let one manifest emit runtime values and compile censuses. */
+#define RF_OPCODE_ROUTE_BIND_VALUE(binding) RF_OPCODE_ROUTE_BIND_VALUE_I binding
+#define RF_OPCODE_ROUTE_BIND_VALUE_I(value, base, combined, generic, inactive) (value)
+#define RF_OPCODE_ROUTE_BIND_BASE_COUNT(binding) RF_OPCODE_ROUTE_BIND_BASE_COUNT_I binding
+#define RF_OPCODE_ROUTE_BIND_BASE_COUNT_I(value, base, combined, generic, inactive) (base)
+#define RF_OPCODE_ROUTE_BIND_COMBINED_COUNT(binding) RF_OPCODE_ROUTE_BIND_COMBINED_COUNT_I binding
+#define RF_OPCODE_ROUTE_BIND_COMBINED_COUNT_I(value, base, combined, generic, inactive) (combined)
+#define RF_OPCODE_ROUTE_BIND_GENERIC_COUNT(binding) RF_OPCODE_ROUTE_BIND_GENERIC_COUNT_I binding
+#define RF_OPCODE_ROUTE_BIND_GENERIC_COUNT_I(value, base, combined, generic, inactive) (generic)
+#define RF_OPCODE_ROUTE_BIND_INACTIVE_COUNT(binding) RF_OPCODE_ROUTE_BIND_INACTIVE_COUNT_I binding
+#define RF_OPCODE_ROUTE_BIND_INACTIVE_COUNT_I(value, base, combined, generic, inactive) (inactive)
+
 static const RfOpcodeRouteManifestRowV1 rf_opcode_route_manifest_v1[] = {
 #define RF_OPCODE_ROUTE_ROW(rmid, info, legal_flags, owner, policy, codec, active, name)           \
-	{ { (uint8)(rmid), (uint8)(info), (uint8)(legal_flags), (uint8)(owner), (uint8)(policy),       \
-		(uint8)(codec), UINT16_C(0) },                                                             \
+	{ { (uint8)(rmid), (uint8)RF_OPCODE_ROUTE_BIND_VALUE(info), (uint8)(legal_flags),              \
+		(uint8)(owner), (uint8)(policy), (uint8)(codec), UINT16_C(0) },                            \
 	  (active) != 0,                                                                               \
 	  (name) },
 #include "cluster/cluster_rf_route_manifest.def"
@@ -84,12 +131,53 @@ enum {
 #undef RF_OPCODE_ROUTE_ROW
 };
 
+enum {
+	RF_OPCODE_ROUTE_COMPILED_BASE_COUNT_V1 = 0
+#define RF_OPCODE_ROUTE_ROW(rmid, info, legal_flags, owner, policy, codec, active, name)           \
+	+RF_OPCODE_ROUTE_BIND_BASE_COUNT(info)
+#include "cluster/cluster_rf_route_manifest.def"
+#undef RF_OPCODE_ROUTE_ROW
+};
+
+enum {
+	RF_OPCODE_ROUTE_COMPILED_COMBINED_COUNT_V1 = 0
+#define RF_OPCODE_ROUTE_ROW(rmid, info, legal_flags, owner, policy, codec, active, name)           \
+	+RF_OPCODE_ROUTE_BIND_COMBINED_COUNT(info)
+#include "cluster/cluster_rf_route_manifest.def"
+#undef RF_OPCODE_ROUTE_ROW
+};
+
+enum {
+	RF_OPCODE_ROUTE_COMPILED_GENERIC_COUNT_V1 = 0
+#define RF_OPCODE_ROUTE_ROW(rmid, info, legal_flags, owner, policy, codec, active, name)           \
+	+RF_OPCODE_ROUTE_BIND_GENERIC_COUNT(info)
+#include "cluster/cluster_rf_route_manifest.def"
+#undef RF_OPCODE_ROUTE_ROW
+};
+
+enum {
+	RF_OPCODE_ROUTE_COMPILED_INACTIVE_COUNT_V1 = 0
+#define RF_OPCODE_ROUTE_ROW(rmid, info, legal_flags, owner, policy, codec, active, name)           \
+	+RF_OPCODE_ROUTE_BIND_INACTIVE_COUNT(info)
+#include "cluster/cluster_rf_route_manifest.def"
+#undef RF_OPCODE_ROUTE_ROW
+};
+
 StaticAssertDecl(lengthof(rf_opcode_route_manifest_v1) == RF_OPCODE_ROUTE_MANIFEST_COUNT_V1,
 				 "opcode route manifest row count");
 StaticAssertDecl(RF_OPCODE_ROUTE_COMPILED_COUNT_V1 == RF_OPCODE_ROUTE_MANIFEST_COUNT_V1,
 				 "opcode route generated count");
 StaticAssertDecl(RF_OPCODE_ROUTE_COMPILED_LIVE_COUNT_V1 == RF_OPCODE_ROUTE_LIVE_COUNT_V1,
 				 "opcode route live count");
+StaticAssertDecl(RF_OPCODE_ROUTE_COMPILED_BASE_COUNT_V1 == 129, "opcode route named base count");
+StaticAssertDecl(RF_OPCODE_ROUTE_COMPILED_COMBINED_COUNT_V1 == 6,
+				 "opcode route modifier combination count");
+StaticAssertDecl(RF_OPCODE_ROUTE_COMPILED_GENERIC_COUNT_V1 == 1,
+				 "opcode route implicit Generic count");
+StaticAssertDecl(RF_OPCODE_ROUTE_COMPILED_INACTIVE_COUNT_V1 == 1,
+				 "opcode route inactive activation count");
+StaticAssertDecl(XLOG_HEAP_INIT_PAGE == 0x80, "heap init-page modifier changed");
+StaticAssertDecl(XLOG_BRIN_INIT_PAGE == 0x80, "BRIN init-page modifier changed");
 
 /* Duplicate generated keys cause a compile-time duplicate-case error. */
 static inline void
@@ -97,12 +185,27 @@ rf_opcode_route_compile_collision_check_v1(void)
 {
 	switch (0) {
 #define RF_OPCODE_ROUTE_ROW(rmid, info, legal_flags, owner, policy, codec, active, name)           \
-	case (((rmid) << 8) | (info)):                                                                 \
+	case (((rmid) << 8) | RF_OPCODE_ROUTE_BIND_VALUE(info)):                                       \
 		break;
 #include "cluster/cluster_rf_route_manifest.def"
 #undef RF_OPCODE_ROUTE_ROW
 	}
 }
+
+#undef RF_OPCODE_ROUTE_BIND_INACTIVE_COUNT_I
+#undef RF_OPCODE_ROUTE_BIND_INACTIVE_COUNT
+#undef RF_OPCODE_ROUTE_BIND_GENERIC_COUNT_I
+#undef RF_OPCODE_ROUTE_BIND_GENERIC_COUNT
+#undef RF_OPCODE_ROUTE_BIND_COMBINED_COUNT_I
+#undef RF_OPCODE_ROUTE_BIND_COMBINED_COUNT
+#undef RF_OPCODE_ROUTE_BIND_BASE_COUNT_I
+#undef RF_OPCODE_ROUTE_BIND_BASE_COUNT
+#undef RF_OPCODE_ROUTE_BIND_VALUE_I
+#undef RF_OPCODE_ROUTE_BIND_VALUE
+#undef RF_OPCODE_ROUTE_INACTIVE_STOP07
+#undef RF_OPCODE_ROUTE_GENERIC
+#undef RF_OPCODE_ROUTE_COMBINED
+#undef RF_OPCODE_ROUTE_BASE
 
 uint16
 rf_opcode_route_manifest_count_v1(void)
@@ -263,12 +366,12 @@ rf_opcode_route_validate_components_v1(const RfOpcodeRouteV1 *route,
 				return RF_OPCODE_ROUTE_COMPONENT_CLASS_INVALID;
 			expected_owner = RF_ROUTE_OWNER_PAGE_CODEC;
 			break;
-		case RF_ROUTE_PAGE_CLASS_ROUTED_HEADER_V1:
 		case RF_ROUTE_PAGE_CLASS_ROUTED_SIDE_V1:
 			expected_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 			break;
 		case RF_ROUTE_PAGE_CLASS_INVALID_V1:
 		case RF_ROUTE_PAGE_CLASS_ROUTED_SPACE_V1:
+		case RF_ROUTE_PAGE_CLASS_ROUTED_HEADER_V1:
 		case RF_ROUTE_PAGE_CLASS_TEMP_LOCAL_V1:
 		default:
 			return RF_OPCODE_ROUTE_COMPONENT_CLASS_INVALID;
