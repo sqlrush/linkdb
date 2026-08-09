@@ -311,35 +311,22 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 	return true;
 }
 
-/*
- * cluster_itl_find_lock_tt_ref_by_xmax (spec-3.4d D1 / F2):
- *
- *	Scan the page's ITL slot array for a LOCK_ONLY slot whose xid
- *	matches raw_xmax + decode UBA + fill ref.  See header for full
- *	contract.  This is the derive-not-store path that
- *	replaces v0.1's t_lock_itl_slot_idx tuple header field (rejected
- *	by F2 due to MAXALIGN tax + disk format break).
- */
-bool
-cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xmax, ClusterUndoTTSlotRef *ref)
+static bool
+cluster_itl_select_lock_slot_index(Page page, TransactionId raw_xmax, uint8 *slot_index_out)
 {
 	const ClusterItlSlotData *slots;
-	uint32 current_epoch;
-	int match_idx = -1;
+	uint8 match_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 	uint16 match_wrap = 0;
 	uint8 i;
-	int match_count = 0;
+	bool ambiguous = false;
 
-	Assert(page != NULL);
-	Assert(ref != NULL);
-
-	if (!PageHasItl(page))
+	if (page == NULL || !PageHasItl(page)
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE)
 		return false;
 	if (!TransactionIdIsValid(raw_xmax))
 		return false;
 
 	slots = ClusterPageGetItlSlots(page);
-	current_epoch = (uint32)cluster_epoch_get_current();
 
 	/* Scan all 8 slots looking for LOCK_ONLY + exact xid + valid UBA.
 	 * Pick the highest wrap (generation counter) if multiple candidates
@@ -356,72 +343,51 @@ cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xmax, ClusterU
 		if (UBA_is_invalid(slot->undo_segment_head))
 			continue;
 
-		match_count++;
-		if (match_idx < 0 || slot->wrap > match_wrap) {
-			match_idx = (int)i;
+		if (match_idx == CLUSTER_ITL_SLOT_UNALLOCATED || slot->wrap > match_wrap) {
+			match_idx = i;
 			match_wrap = slot->wrap;
+			ambiguous = false;
 		} else if (slot->wrap == match_wrap) {
-			/* Two slots with identical (xid, wrap) — true ambiguity. */
-			match_count++; /* defensive — keep going to count duplicates */
+			ambiguous = true;
 		}
 	}
 
-	if (match_idx < 0)
+	if (match_idx == CLUSTER_ITL_SLOT_UNALLOCATED || ambiguous)
 		return false;
+	*slot_index_out = match_idx;
+	return true;
+}
 
-	/* If highest-wrap duplicates remain, the caller has no authoritative
-	 * lock-only ref and must treat this as no match. */
-	if (match_count > 1) {
-		const ClusterItlSlotData *winner = &slots[match_idx];
-		int ambiguous = 0;
+bool
+cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId raw_xmax,
+										 uint8 *slot_index_out)
+{
+	if (slot_index_out == NULL)
+		return false;
+	*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
+	return cluster_itl_select_lock_slot_index(page, raw_xmax, slot_index_out);
+}
 
-		/* Re-scan to verify whether the highest-wrap slot is unique. */
-		for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
-			const ClusterItlSlotData *slot = &slots[i];
+/*
+ * cluster_itl_find_lock_tt_ref_by_xmax (spec-3.4d D1 / F2):
+ *
+ *	Use the one canonical selector, then decode the exact winning slot
+ *	through the existing ITL reader.  This preserves the derive-not-store
+ *	path while preventing selector copies in consumers.
+ */
+bool
+cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xmax, ClusterUndoTTSlotRef *ref)
+{
+	uint8 match_idx;
 
-			if (!ITL_FLAG_IS_LOCK_ONLY(slot->flags))
-				continue;
-			if (slot->xid != raw_xmax)
-				continue;
-			if (UBA_is_invalid(slot->undo_segment_head))
-				continue;
-			if (slot->wrap == winner->wrap)
-				ambiguous++;
-		}
-
-		if (ambiguous > 1)
-			return false;
-	}
-
-	{
-		const ClusterItlSlotData *slot = &slots[match_idx];
-		uint32 seg_id;
-		uint32 blk_no;
-		uint16 tt_off;
-		uint16 row_off;
-		NodeId origin;
-
-		memset(ref, 0, sizeof(*ref));
-
-		if (!uba_decode(slot->undo_segment_head, &seg_id, &blk_no, &tt_off, &row_off))
-			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
-							errmsg("malformed UBA in lock-only ITL slot %d", match_idx)));
-		origin = uba_origin_node_id(slot->undo_segment_head);
-		if (origin == InvalidNodeId)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("UBA decode: lock-only segment_id %u has no valid owner_instance",
-							seg_id)));
-
-		ref->origin_node_id = (uint16)origin;
-		ref->undo_segment_id = (uint16)seg_id;
-		ref->tt_slot_id = cluster_tt_slot_offset_to_id(tt_off);
-		ref->cluster_epoch = current_epoch;
-		ref->local_xid = slot->xid;
-		ref->cached_commit_scn = InvalidScn; /* lock-only never carries commit_scn */
-		ref->has_cached_status = false;
-	}
-
+	Assert(page != NULL);
+	Assert(ref != NULL);
+	if (!cluster_itl_find_lock_slot_index_by_xmax(page, raw_xmax, &match_idx))
+		return false;
+	if (!cluster_itl_get_tt_ref(page, match_idx, ref))
+		return false;
+	ref->cached_commit_scn = InvalidScn;
+	ref->has_cached_status = false;
 	return true;
 }
 
@@ -1215,6 +1181,16 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 	(void)page;
 	(void)itl_slot_idx;
 	(void)ref;
+	return false;
+}
+
+bool
+cluster_itl_find_lock_slot_index_by_xmax(Page page pg_attribute_unused(),
+										 TransactionId raw_xmax pg_attribute_unused(),
+										 uint8 *slot_index_out)
+{
+	if (slot_index_out != NULL)
+		*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
 	return false;
 }
 

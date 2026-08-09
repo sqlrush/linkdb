@@ -41,7 +41,7 @@
  *	    T35  spec-7.1 watch-2: marker into a FREE slot contributes nothing
  *	    T36  spec-7.1 watch-2: numeric xid/multixact-id collision must not
  *	         suppress the fold (new_xid = InvalidTransactionId)
- *	    T37-T44  spec-8.4 R4 D6: pure lock-only slot-index selection,
+ *	    T37-T46  spec-8.4 R4 D6: pure lock-only slot-index selection,
  *	         canonical failure sentinel, highest-wrap winner, equal-winning-
  *	         wrap ambiguity, and old/new reader agreement
  *
@@ -86,9 +86,6 @@
 
 
 UT_DEFINE_GLOBALS();
-
-extern bool cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId raw_xmax,
-											  uint8 *slot_index_out);
 
 
 /* ============================================================
@@ -790,6 +787,32 @@ UT_TEST(test_t44_lock_slot_index_and_old_reader_select_same_slot)
 	UT_ASSERT_EQ((int)winner->xid, 1008);
 }
 
+UT_TEST(test_t45_lock_slot_index_invalid_xid_sets_sentinel)
+{
+	Page page = build_itl_page();
+	uint8 index = 0;
+
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						page, InvalidTransactionId, &index),
+				 0);
+	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+}
+
+UT_TEST(test_t46_lock_slot_index_page_without_itl_sets_sentinel)
+{
+	PageHeaderData page;
+	uint8 index = 0;
+
+	memset(&page, 0, sizeof(page));
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						(Page)&page, (TransactionId)1009, &index),
+				 0);
+	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						(Page)&page, (TransactionId)1009, NULL),
+				 0);
+}
+
 
 /* ---------- spec-3.9 Hardening L213: pd_block_scn redo parity ----------
  *
@@ -1170,6 +1193,8 @@ main(void)
 	UT_RUN(test_t42_lock_slot_index_lower_wrap_duplicate_does_not_hide_winner);
 	UT_RUN(test_t43_lock_slot_index_ignores_data_and_invalid_uba);
 	UT_RUN(test_t44_lock_slot_index_and_old_reader_select_same_slot);
+	UT_RUN(test_t45_lock_slot_index_invalid_xid_sets_sentinel);
+	UT_RUN(test_t46_lock_slot_index_page_without_itl_sets_sentinel);
 	UT_RUN(test_t22_redo_parity_sets_pd_block_scn_on_fresh_page);
 	UT_RUN(test_t23_redo_parity_monotonic_older_write_scn_noop);
 	UT_RUN(test_t24_redo_parity_invalid_write_scn_noop);

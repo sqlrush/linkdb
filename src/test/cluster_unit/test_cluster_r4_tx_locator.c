@@ -412,6 +412,10 @@ UT_TEST(test_lock_only_active_forms_exact_locator)
 	set_slot(page, 4, ITL_FLAG_LOCK_ONLY_ACTIVE, (TransactionId)900, 2, 9, 17, 6, 1);
 	UT_ASSERT(cluster_tx_locator_from_itl(page, 4, &locator, &reason));
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(locator.uba.raw[0], slot_at(page, 4)->undo_segment_head.raw[0]);
+	UT_ASSERT_EQ(locator.uba.raw[1], slot_at(page, 4)->undo_segment_head.raw[1]);
+	UT_ASSERT_EQ(locator.xid, (TransactionId)900);
+	UT_ASSERT_EQ(locator.tt_wrap, 2);
 	UT_ASSERT_EQ(locator.itl_kind, ITL_FLAG_LOCK_ONLY_ACTIVE);
 	UT_ASSERT_EQ(locator.itl_slot_index, 4);
 }
