@@ -408,6 +408,13 @@ UT_TEST(test_live_post_registration_terminal_race_resolves)
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
 	UT_ASSERT_EQ(test_wfg_submit_calls, 1);
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 1);
+	UT_ASSERT_EQ(test_wait_epoch, TEST_EPOCH);
+	UT_ASSERT_EQ(test_wfg_waiter.node_id, cluster_node_id);
+	UT_ASSERT_EQ(test_wfg_waiter.cluster_epoch, TEST_EPOCH);
+	UT_ASSERT_EQ(test_wfg_blocker.node_id, test_uba_origin);
+	UT_ASSERT_EQ(test_wfg_blocker.procno, CLUSTER_LMD_TX_HOLDER_PROCNO);
+	UT_ASSERT_EQ(test_wfg_blocker.cluster_epoch, TEST_EPOCH);
+	UT_ASSERT_EQ((int)test_wfg_blocker.xid, (int)locator.xid);
 	UT_ASSERT_EQ(test_wait_latch_calls, 0);
 	assert_slot_clean();
 }
@@ -449,8 +456,11 @@ UT_TEST(test_formation_drift_cleans_registered_state)
 	reset_fixture();
 	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
 	test_epochs[0] = TEST_EPOCH;
-	test_epochs[1] = TEST_EPOCH + 1;
-	test_epoch_count = 2;
+	test_epochs[1] = TEST_EPOCH;
+	test_epochs[2] = TEST_EPOCH;
+	test_epochs[3] = TEST_EPOCH;
+	test_epochs[4] = TEST_EPOCH + 1;
+	test_epoch_count = 5;
 	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_UNPROVABLE);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
@@ -482,8 +492,11 @@ UT_TEST(test_zero_to_nonzero_epoch_drift_fails_closed)
 	reset_fixture();
 	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
 	test_epochs[0] = 0;
-	test_epochs[1] = 1;
-	test_epoch_count = 2;
+	test_epochs[1] = 0;
+	test_epochs[2] = 0;
+	test_epochs[3] = 0;
+	test_epochs[4] = 1;
+	test_epoch_count = 5;
 	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_UNPROVABLE);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
 	UT_ASSERT_EQ(test_wait_clear_calls, 1);
