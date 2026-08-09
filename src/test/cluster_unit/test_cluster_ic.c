@@ -34,6 +34,7 @@
 
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_rdma.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D6 stub — profiling gate */
 
 /*
@@ -555,7 +556,7 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * Bytes 8-11:   04 03 02 01            source_node_id = 0x01020304 (LE)
 	 * Bytes 12-13:  41 42                  "AB"
 	 * Bytes 14-35:  00..00                 cluster_name NUL pad
-	 * Bytes 36-39:  0E 00 00 00            capability bitmap (LE): the
+	 * Bytes 36-39:  FE 3F 00 00            capability bitmap (LE): the
 	 *                                      PROTOCOL capabilities advertised
 	 *                                      unconditionally by this binary --
 	 *                                      D4-6 authority-serve (0x2), D5-2
@@ -598,10 +599,11 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * authority flock (0x40) + ownership-gen ruling② invalidate BUSY
 	 * (0x80) + TT-lane undo-horizon idle sentinel (0x100) + PCM-X
 	 * conversion (0x200) + A' rebase V2 INSTALL_READY (0x400) + PCM-X
-	 * source-floor type49 V2 (0x800)
+	 * source-floor type49 V2 (0x800) + semantic activation (0x1000) +
+	 * R4 synchronous CR (0x2000)
 	 * (smart-fusion is off in this fixture) */
 	UT_ASSERT_EQ(wire[36], 0xFE);
-	UT_ASSERT_EQ(wire[37], 0x0F);
+	UT_ASSERT_EQ(wire[37], 0x3F);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
 	/* remaining _pad must be all zero: a CONTROL-plane HELLO with
@@ -747,11 +749,12 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
 			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+			| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1);
 	/* Keep the aggregate word byte-exact as well as symbolically composed:
 	 * parallel protocol lanes have collided while preserving the same symbolic
 	 * expectation, so the literal catches accidental bit reuse. */
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), (uint32)0x00000FFEU);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), (uint32)0x00003FFEU);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -766,7 +769,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
 			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+			| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -781,7 +785,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
 			| PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1
 			| PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1
+			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
