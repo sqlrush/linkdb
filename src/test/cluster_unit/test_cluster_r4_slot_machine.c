@@ -8,6 +8,9 @@
 #include "postgres.h"
 
 #include "cluster/cluster_gcs_block.h"
+
+#undef printf
+
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();

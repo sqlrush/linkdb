@@ -2026,44 +2026,11 @@ cluster_gcs_block_r4_route_cr(const BufferTag *tag, SCN read_scn, uint64 request
 		reason = CLUSTER_CR_BUILD_NO_HOLDER;
 		goto done;
 	}
-	if (authority.pending_x_requester_node >= 0) {
-		reason = CLUSTER_CR_BUILD_RECOVERING;
+	reason = cluster_r4_route_policy_classify(&authority, current_epoch,
+										  master_authority_generation,
+										  &current_holder_node);
+	if (reason != CLUSTER_CR_BUILD_NONE)
 		goto done;
-	}
-	if (authority.state == PCM_STATE_N) {
-		reason = CLUSTER_CR_BUILD_NO_HOLDER;
-		goto done;
-	}
-	if (authority.state != PCM_STATE_S && authority.state != PCM_STATE_X) {
-		reason = CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
-		goto done;
-	}
-	if (master_authority_generation == 0 || (uint32)master_authority_generation == 0
-		|| (uint32)(master_authority_generation >> 32) != (uint32)current_epoch
-		|| authority.transition_count == 0 || authority.transition_count == UINT64_MAX) {
-		reason = CLUSTER_CR_BUILD_GENERATION_MISMATCH;
-		goto done;
-	}
-
-	if (authority.state == PCM_STATE_X) {
-		if (authority.x_holder_node < 0
-			|| authority.x_holder_node >= PCM_X_PROTOCOL_NODE_LIMIT
-			|| authority.master_holder.node_id != (uint32)authority.x_holder_node
-			|| authority.s_holders_bitmap != 0) {
-			reason = CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
-			goto done;
-		}
-		current_holder_node = authority.x_holder_node;
-	} else {
-		uint32 holder_node = authority.master_holder.node_id;
-
-		if (holder_node >= PCM_X_PROTOCOL_NODE_LIMIT || authority.x_holder_node != -1
-			|| (authority.s_holders_bitmap & (UINT32_C(1) << holder_node)) == 0) {
-			reason = CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
-			goto done;
-		}
-		current_holder_node = (int32)holder_node;
-	}
 
 	if (!cluster_semantic_activation_recheck(&admission)) {
 		reason = CLUSTER_CR_BUILD_RF_DEFERRED;
