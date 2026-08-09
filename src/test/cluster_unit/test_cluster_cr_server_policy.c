@@ -29,6 +29,43 @@
 
 UT_DEFINE_GLOBALS();
 
+static char *
+read_cr_server_source(void)
+{
+	const char *source_file = __FILE__;
+	const char *source_suffix = "/src/test/cluster_unit/test_cluster_cr_server_policy.c";
+	const char *suffix_at = strstr(source_file, source_suffix);
+	char path[MAXPGPATH];
+	FILE *file;
+	long length;
+	char *source;
+
+	if (suffix_at != NULL)
+		snprintf(path, sizeof(path), "%.*s/src/backend/cluster/cluster_cr_server.c",
+				 (int)(suffix_at - source_file), source_file);
+	else
+		snprintf(path, sizeof(path), "../../../src/backend/cluster/cluster_cr_server.c");
+
+	file = fopen(path, "rb");
+	UT_ASSERT_NOT_NULL(file);
+	if (file == NULL)
+		return NULL;
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
+	length = ftell(file);
+	UT_ASSERT(length > 0);
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+	source = malloc((size_t)length + 1);
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) {
+		fclose(file);
+		return NULL;
+	}
+	UT_ASSERT_EQ(fread(source, 1, (size_t)length, file), (size_t)length);
+	source[length] = '\0';
+	fclose(file);
+	return source;
+}
+
 /* Assert hook stub so the cassert libpgport links standalone. */
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -133,10 +170,57 @@ UT_TEST(test_invalid_scn_not_aborted_refuses)
 				 (int)CLUSTER_CR_INVALID_SCN_REFUSE);
 }
 
+/*
+ * D11 R19: UNDO_MULTI_VERDICT remains park-only.  Freeze the defensive inline
+ * entry separately: an explicit kind case must jump over both the serve call
+ * and inline-serve accounting to the pre-set DENIED one-reply path.
+ */
+UT_TEST(test_undo_multi_verdict_inline_entry_is_denied_without_serve)
+{
+	char *source = read_cr_server_source();
+	const char *function
+		= source != NULL ? strstr(source, "\ncluster_gcs_block_forward_serve_inline(") : NULL;
+	const char *function_end = function != NULL ? strstr(function, "\n}\n\n#endif") : NULL;
+	const char *kind_switch = function != NULL ? strstr(function, "\tswitch (kind) {") : NULL;
+	const char *multi_case
+		= kind_switch != NULL
+			  ? strstr(kind_switch, "case CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT:")
+			  : NULL;
+	const char *deny_jump
+		= multi_case != NULL ? strstr(multi_case, "goto inline_deny_no_serve;") : NULL;
+	const char *serve = kind_switch != NULL ? strstr(kind_switch, "cr_serve_slot(&slot);") : NULL;
+	const char *inline_note
+		= serve != NULL ? strstr(serve, "cluster_lms_obs_note_inline_serve(") : NULL;
+	const char *deny_label
+		= inline_note != NULL ? strstr(inline_note, "\ninline_deny_no_serve:") : NULL;
+	const char *reply
+		= deny_label != NULL ? strstr(deny_label, "cr_build_and_send_reply(&slot);") : NULL;
+	const char *direct_note
+		= reply != NULL ? strstr(reply, "cluster_lms_obs_note_direct_reply();") : NULL;
+
+	UT_ASSERT_NOT_NULL(function);
+	UT_ASSERT_NOT_NULL(function_end);
+	UT_ASSERT_NOT_NULL(kind_switch);
+	UT_ASSERT_NOT_NULL(multi_case);
+	UT_ASSERT_NOT_NULL(deny_jump);
+	UT_ASSERT_NOT_NULL(serve);
+	UT_ASSERT_NOT_NULL(inline_note);
+	UT_ASSERT_NOT_NULL(deny_label);
+	UT_ASSERT_NOT_NULL(reply);
+	UT_ASSERT_NOT_NULL(direct_note);
+	if (function != NULL && function_end != NULL && kind_switch != NULL && multi_case != NULL
+		&& deny_jump != NULL && serve != NULL && inline_note != NULL && deny_label != NULL
+		&& reply != NULL && direct_note != NULL)
+		UT_ASSERT(function < kind_switch && kind_switch < multi_case && multi_case < deny_jump
+				  && deny_jump < serve && serve < inline_note && inline_note < deny_label
+				  && deny_label < reply && reply < direct_note && direct_note < function_end);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -146,6 +230,7 @@ main(void)
 	UT_RUN(test_split_malformed_is_deny);
 	UT_RUN(test_invalid_scn_aborted_is_positive);
 	UT_RUN(test_invalid_scn_not_aborted_refuses);
+	UT_RUN(test_undo_multi_verdict_inline_entry_is_denied_without_serve);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
