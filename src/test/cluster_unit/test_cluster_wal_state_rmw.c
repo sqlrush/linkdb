@@ -8,6 +8,7 @@
 #include "postgres.h"
 
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -32,6 +33,8 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+ProcessingMode Mode = NormalProcessing;
 
 /* ---- backend globals and non-common dependencies ---- */
 bool cluster_enabled = true;
@@ -681,10 +684,50 @@ UT_TEST(test_a1_w1_runtime_ensure_is_validate_only)
 	UT_ASSERT_EQ(unlink_count, 0);
 }
 
+static bool
+runtime_ensure_child_fatals(void)
+{
+	int status;
+	pid_t pid = fork();
+
+	UT_ASSERT(pid >= 0);
+	if (pid == 0) {
+		test_runtime_ensure = true;
+		(void)cluster_wal_state_ensure();
+		_exit(0);
+	}
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	return WIFSIGNALED(status);
+}
+
+UT_TEST(test_a1_w1_runtime_validates_every_slot_and_bootstrap_is_early_noop)
+{
+	ClusterWalStateSlot *slot;
+
+	fixture_reset();
+	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(97));
+	memset(slot, 0, sizeof(*slot));
+	slot->_reserved[0] = 1;
+	UT_ASSERT(runtime_ensure_child_fatals());
+
+	fixture_reset();
+	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(97));
+	cluster_wal_state_slot_fill(slot, 96, 3, CLUSTER_WAL_SLOT_STATE_ACTIVE, 1, 1, 1, 1, 1);
+	UT_ASSERT(runtime_ensure_child_fatals());
+
+	fixture_reset();
+	test_runtime_ensure = true;
+	Mode = BootstrapProcessing;
+	UT_ASSERT(!cluster_wal_state_ensure());
+	UT_ASSERT_EQ(open_count, 0);
+	UT_ASSERT_EQ(mutating_open_count, 0);
+	Mode = NormalProcessing;
+}
+
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 
 	UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
 	UT_RUN(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread);
@@ -693,6 +736,7 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_a1_borrow_verified_cf_does_not_reenter_or_unlock);
 	UT_RUN(test_a1_fresh_header_slot_typed_rejections);
 	UT_RUN(test_a1_w1_runtime_ensure_is_validate_only);
+	UT_RUN(test_a1_w1_runtime_validates_every_slot_and_bootstrap_is_early_noop);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
