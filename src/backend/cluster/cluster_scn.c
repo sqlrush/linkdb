@@ -688,7 +688,7 @@ SCN
 cluster_scn_advance_for_commit(void)
 {
 	SCN scn;
-	ClusterXpScope xps; /* PGRAC: spec-5.59 D2 profiling */
+	ClusterXpScope xps = { .active = false }; /* PGRAC: spec-5.59 D2 profiling */
 
 	if (cluster_scn_skip_hook_in_pre_running())
 		return InvalidScn;
