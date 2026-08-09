@@ -15,12 +15,23 @@
 
 #include "cluster/cluster_space.h"
 
-/* T3-I strong interface: behavior remains fail-closed until T3-B. */
 bool
 cluster_space_identity_equal(const ClusterSpaceIdentityV1 *left,
 							 const ClusterSpaceIdentityV1 *right)
 {
-	(void) left;
-	(void) right;
-	return false;
+	if (left == NULL || right == NULL ||
+		left->system_identifier != right->system_identifier ||
+		left->spc_oid != right->spc_oid ||
+		left->db_oid != right->db_oid ||
+		left->rel_number != right->rel_number ||
+		left->target_fork != right->target_fork)
+		return false;
+
+	for (int i = 0; i < 16; i++)
+	{
+		if (left->space_incarnation[i] != right->space_incarnation[i])
+			return false;
+	}
+
+	return true;
 }

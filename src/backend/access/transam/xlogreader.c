@@ -2353,14 +2353,21 @@ err:
 	return false;
 }
 
-/* T3-I strong interface: behavior remains fail-closed until T3-B. */
 bool
 rf_page_version_equal_v1(const RfPageVersionV1 *left,
 						 const RfPageVersionV1 *right)
 {
-	(void) left;
-	(void) right;
-	return false;
+	if (left == NULL || right == NULL)
+		return false;
+
+	for (int i = 0; i < 16; i++)
+	{
+		if (left->segment_incarnation[i] !=
+			right->segment_incarnation[i])
+			return false;
+	}
+
+	return left->mutation_token == right->mutation_token;
 }
 
 /*

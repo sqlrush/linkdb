@@ -62,20 +62,162 @@
 /* Buffer size required to store a compressed version of backup block image */
 #define COMPRESS_BUFSIZE	Max(Max(PGLZ_MAX_BLCKSZ, LZ4_MAX_BLCKSZ), ZSTD_MAX_BLCKSZ)
 
-/* T3-I strong interface: behavior remains fail-closed until T3-B. */
+static bool
+xlog_page_version_uuid_is_zero(const uint8 incarnation[16])
+{
+	for (int i = 0; i < 16; i++)
+	{
+		if (incarnation[i] != 0)
+			return false;
+	}
+	return true;
+}
+
+static bool
+xlog_page_version_uuid_equal(const uint8 left[16], const uint8 right[16])
+{
+	for (int i = 0; i < 16; i++)
+	{
+		if (left[i] != right[i])
+			return false;
+	}
+	return true;
+}
+
+static bool
+xlog_page_version_anchor_flags_valid(uint16 edge_flags)
+{
+	return edge_flags == (RF_PAGE_EDGE_FULL_IMAGE_APPLY |
+						  RF_PAGE_EDGE_FULL_COVERAGE) ||
+		edge_flags == (RF_PAGE_EDGE_WILL_INIT |
+					   RF_PAGE_EDGE_FULL_COVERAGE) ||
+		edge_flags == RF_PAGE_EDGE_KNOWN_MASK;
+}
+
+static bool
+xlog_page_version_entry_valid(const RfPageVersionEdgeEntryV1 *entry)
+{
+	bool		before_zero =
+		xlog_page_version_uuid_is_zero(entry->before.segment_incarnation);
+	bool		result_zero =
+		xlog_page_version_uuid_is_zero(entry->result_incarnation);
+
+	if ((entry->edge_flags & ~RF_PAGE_EDGE_KNOWN_MASK) != 0)
+		return false;
+
+	switch ((RfPageClassV1) entry->page_class)
+	{
+		case RF_PAGE_CLASS_ORDINARY:
+			if (entry->result_kind != RF_PAGE_STATE_PRESENT || result_zero)
+				return false;
+			if (entry->before_kind == RF_PAGE_STATE_PRESENT)
+			{
+				if (before_zero || entry->before.mutation_token == 0 ||
+					!xlog_page_version_uuid_equal(
+						entry->before.segment_incarnation,
+						entry->result_incarnation))
+					return false;
+				return entry->edge_flags == 0 ||
+					xlog_page_version_anchor_flags_valid(entry->edge_flags);
+			}
+			if (entry->before_kind == RF_PAGE_STATE_UNFORMATTED)
+			{
+				return !before_zero && entry->before.mutation_token == 0 &&
+					xlog_page_version_uuid_equal(
+						entry->before.segment_incarnation,
+						entry->result_incarnation) &&
+					xlog_page_version_anchor_flags_valid(entry->edge_flags);
+			}
+			if (entry->before_kind == RF_PAGE_STATE_ABSENT)
+			{
+				return before_zero && entry->before.mutation_token == 0 &&
+					xlog_page_version_anchor_flags_valid(entry->edge_flags);
+			}
+			return false;
+
+		case RF_PAGE_CLASS_REBUILDABLE_FSM:
+			return entry->before_kind == RF_PAGE_STATE_REBUILDABLE &&
+				entry->result_kind == RF_PAGE_STATE_REBUILDABLE &&
+				before_zero && entry->before.mutation_token == 0 &&
+				result_zero && entry->edge_flags == 0;
+
+		case RF_PAGE_CLASS_ROUTED_SPACE:
+		case RF_PAGE_CLASS_ROUTED_HEADER:
+		case RF_PAGE_CLASS_ROUTED_SIDE:
+			return entry->before_kind == RF_PAGE_STATE_ROUTED &&
+				entry->result_kind == RF_PAGE_STATE_ROUTED &&
+				before_zero && entry->before.mutation_token == 0 &&
+				result_zero && entry->edge_flags == 0;
+
+		case RF_PAGE_CLASS_INVALID:
+		case RF_PAGE_CLASS_TEMP_LOCAL:
+		default:
+			return false;
+	}
+}
+
 bool
 XLogEncodePageVersionEdgeV1(uint8 *output, Size output_capacity,
 							uint64 result_token,
 							const RfPageVersionEdgeEntryV1 *entries,
 							uint8 entry_count, Size *output_size)
 {
-	(void) output;
-	(void) output_capacity;
-	(void) result_token;
-	(void) entries;
-	(void) entry_count;
-	(void) output_size;
-	return false;
+	Size		required_size;
+	uint8	   *ptr;
+	uint16		zero16 = 0;
+
+	if (output == NULL || output_size == NULL || result_token == 0 ||
+		entries == NULL || entry_count == 0 ||
+		entry_count > XLR_PAGE_VERSION_EDGE_MAX_ENTRIES)
+		return false;
+
+	required_size = XLR_PAGE_VERSION_EDGE_HEADER_SIZE +
+		(Size) entry_count * XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	if (required_size > XLR_PAGE_VERSION_EDGE_MAX_SIZE ||
+		output_capacity < required_size)
+		return false;
+
+	for (int i = 0; i < entry_count; i++)
+	{
+		const RfPageVersionEdgeEntryV1 *entry = &entries[i];
+
+		if (entry->block_id > XLR_MAX_BLOCK_ID ||
+			(i > 0 && entry->block_id <= entries[i - 1].block_id) ||
+			entry->component_ordinal != i ||
+			!xlog_page_version_entry_valid(entry))
+			return false;
+	}
+
+	ptr = output;
+	ptr[0] = XLR_BLOCK_ID_PAGE_VERSION_EDGE;
+	ptr[1] = XLR_PAGE_VERSION_EDGE_FORMAT_V1;
+	ptr[2] = entry_count;
+	ptr[3] = XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	memcpy(ptr + 4, &zero16, sizeof(zero16));
+	memcpy(ptr + 6, &zero16, sizeof(zero16));
+	memcpy(ptr + 8, &result_token, sizeof(result_token));
+	ptr += XLR_PAGE_VERSION_EDGE_HEADER_SIZE;
+
+	for (int i = 0; i < entry_count; i++)
+	{
+		const RfPageVersionEdgeEntryV1 *entry = &entries[i];
+
+		ptr[0] = entry->block_id;
+		ptr[1] = entry->page_class;
+		ptr[2] = entry->before_kind;
+		ptr[3] = entry->result_kind;
+		memcpy(ptr + 4, &entry->edge_flags, sizeof(entry->edge_flags));
+		memcpy(ptr + 6, &entry->component_ordinal,
+			   sizeof(entry->component_ordinal));
+		memcpy(ptr + 8, entry->before.segment_incarnation, 16);
+		memcpy(ptr + 24, &entry->before.mutation_token,
+			   sizeof(entry->before.mutation_token));
+		memcpy(ptr + 32, entry->result_incarnation, 16);
+		ptr += XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	}
+
+	*output_size = required_size;
+	return true;
 }
 
 /*

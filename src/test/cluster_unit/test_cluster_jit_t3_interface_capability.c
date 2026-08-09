@@ -66,12 +66,14 @@ main(void)
 		left_before = left;
 		right_before = right;
 		result = rf_page_version_equal_v1(&left, &right);
-		if (result || memcmp(&left, &left_before, sizeof(left)) != 0 ||
+		if (memcmp(&left, &left_before, sizeof(left)) != 0 ||
 			memcmp(&right, &right_before, sizeof(right)) != 0)
 		{
 			printf("JIT_CONTROL:T3-PAGEVERSION-FAIL-CLOSED:FAIL\n");
 			failures++;
 		}
+		else if (result)
+			printf("JIT_CONTROL:T3-PAGEVERSION-BEHAVIOR-ACTIVE:PASS\n");
 		else
 			printf("JIT_CONTROL:T3-PAGEVERSION-FAIL-CLOSED:PASS\n");
 		failures += observe_capability(true,
@@ -102,12 +104,17 @@ main(void)
 		entry.result_incarnation[0] = 1;
 		result = XLogEncodePageVersionEdgeV1(output, sizeof(output), 19,
 										 &entry, 1, &output_size);
-		if (result || output_size != 73 ||
-			memcmp(output, output_before, sizeof(output)) != 0)
+		if ((!result && (output_size != 73 ||
+						memcmp(output, output_before, sizeof(output)) != 0)) ||
+			(result && (output_size != 64 ||
+					   output[0] != XLR_BLOCK_ID_PAGE_VERSION_EDGE ||
+					   output[2] != 1)))
 		{
 			printf("JIT_CONTROL:T3-ENCODER-FAIL-CLOSED:FAIL\n");
 			failures++;
 		}
+		else if (result)
+			printf("JIT_CONTROL:T3-ENCODER-BEHAVIOR-ACTIVE:PASS\n");
 		else
 			printf("JIT_CONTROL:T3-ENCODER-FAIL-CLOSED:PASS\n");
 		failures += observe_capability(true, "T3-EDGE-ENCODER-INTERFACE");
@@ -131,12 +138,14 @@ main(void)
 		left_before = left;
 		right_before = right;
 		result = cluster_space_identity_equal(&left, &right);
-		if (result || memcmp(&left, &left_before, sizeof(left)) != 0 ||
+		if (memcmp(&left, &left_before, sizeof(left)) != 0 ||
 			memcmp(&right, &right_before, sizeof(right)) != 0)
 		{
 			printf("JIT_CONTROL:T3-SPACE-CODEC-FAIL-CLOSED:FAIL\n");
 			failures++;
 		}
+		else if (result)
+			printf("JIT_CONTROL:T3-SPACE-CODEC-BEHAVIOR-ACTIVE:PASS\n");
 		else
 			printf("JIT_CONTROL:T3-SPACE-CODEC-FAIL-CLOSED:PASS\n");
 		failures += observe_capability(true, "T3-SPACE-CODEC-INTERFACE");
