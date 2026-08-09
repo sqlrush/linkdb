@@ -182,10 +182,68 @@ UT_TEST(test_32_transition_drift_closes_duplicate)
 											(SCN)11));
 }
 
+static const ClusterCrBuildResult reason_result[18] = {
+	[CLUSTER_CR_BUILD_NONE] = CLUSTER_CR_BUILD_FULL,
+	[CLUSTER_CR_BUILD_TARGET_DISABLED] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_RF_DEFERRED] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_WRONG_MASTER] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_NO_HOLDER] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_HOLDER_MOVED] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_RECOVERING] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_GENERATION_MISMATCH] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_CAPACITY] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_BAD_LOCATOR] = CLUSTER_CR_BUILD_FAIL_CLOSED,
+	[CLUSTER_CR_BUILD_BAD_UNDO] = CLUSTER_CR_BUILD_FAIL_CLOSED,
+	[CLUSTER_CR_BUILD_CHAIN_LIMIT] = CLUSTER_CR_BUILD_FAIL_CLOSED,
+	[CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD] = CLUSTER_CR_BUILD_FAIL_CLOSED,
+	[CLUSTER_CR_BUILD_EPOCH_MISMATCH] = CLUSTER_CR_BUILD_RETRYABLE,
+	[CLUSTER_CR_BUILD_CANCELLED] = CLUSTER_CR_BUILD_FAIL_CLOSED,
+	[CLUSTER_CR_BUILD_IO_ERROR] = CLUSTER_CR_BUILD_FAIL_CLOSED,
+	[CLUSTER_CR_BUILD_PROTOCOL] = CLUSTER_CR_BUILD_FAIL_CLOSED,
+};
+
+static void
+run_reason_polarity(int reason)
+{
+	UT_ASSERT_EQ(cluster_cr_build_result_for_reason((ClusterCrBuildReason)reason),
+				 reason_result[reason]);
+}
+
+#define DEFINE_POLARITY_TEST(n) \
+	UT_TEST(test_reason_polarity_##n) { run_reason_polarity(n); }
+
+DEFINE_POLARITY_TEST(0)
+DEFINE_POLARITY_TEST(1)
+DEFINE_POLARITY_TEST(2)
+DEFINE_POLARITY_TEST(3)
+DEFINE_POLARITY_TEST(4)
+DEFINE_POLARITY_TEST(5)
+DEFINE_POLARITY_TEST(6)
+DEFINE_POLARITY_TEST(7)
+DEFINE_POLARITY_TEST(8)
+DEFINE_POLARITY_TEST(9)
+DEFINE_POLARITY_TEST(10)
+DEFINE_POLARITY_TEST(11)
+DEFINE_POLARITY_TEST(12)
+DEFINE_POLARITY_TEST(13)
+DEFINE_POLARITY_TEST(14)
+DEFINE_POLARITY_TEST(15)
+DEFINE_POLARITY_TEST(16)
+DEFINE_POLARITY_TEST(17)
+
+UT_TEST(test_unknown_reason_fails_closed)
+{
+	UT_ASSERT_EQ(cluster_cr_build_result_for_reason((ClusterCrBuildReason)-1),
+				 CLUSTER_CR_BUILD_FAIL_CLOSED);
+	UT_ASSERT_EQ(cluster_cr_build_result_for_reason((ClusterCrBuildReason)18),
+				 CLUSTER_CR_BUILD_FAIL_CLOSED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(51);
 	UT_RUN(test_01_null_authority_is_protocol);
 	UT_RUN(test_02_null_output_is_protocol);
 	UT_RUN(test_03_canonical_n_has_no_holder);
@@ -218,6 +276,25 @@ main(void)
 	UT_RUN(test_30_exhausted_transition_count_is_rejected);
 	UT_RUN(test_31_exact_duplicate_route_matches);
 	UT_RUN(test_32_transition_drift_closes_duplicate);
+	UT_RUN(test_reason_polarity_0);
+	UT_RUN(test_reason_polarity_1);
+	UT_RUN(test_reason_polarity_2);
+	UT_RUN(test_reason_polarity_3);
+	UT_RUN(test_reason_polarity_4);
+	UT_RUN(test_reason_polarity_5);
+	UT_RUN(test_reason_polarity_6);
+	UT_RUN(test_reason_polarity_7);
+	UT_RUN(test_reason_polarity_8);
+	UT_RUN(test_reason_polarity_9);
+	UT_RUN(test_reason_polarity_10);
+	UT_RUN(test_reason_polarity_11);
+	UT_RUN(test_reason_polarity_12);
+	UT_RUN(test_reason_polarity_13);
+	UT_RUN(test_reason_polarity_14);
+	UT_RUN(test_reason_polarity_15);
+	UT_RUN(test_reason_polarity_16);
+	UT_RUN(test_reason_polarity_17);
+	UT_RUN(test_unknown_reason_fails_closed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
