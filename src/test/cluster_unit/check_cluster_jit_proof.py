@@ -376,6 +376,33 @@ def verify_ownership(
     return failures
 
 
+def verify_reference_inventory(
+        rows: Sequence[ManifestRow],
+        object_symbols: Mapping[str, Sequence[Tuple[str, str]]]) -> List[str]:
+    """Prove the manifest names the exact normal-object reference set."""
+
+    supplied_objects = set(object_symbols)
+    failures: List[str] = []
+    for row in rows:
+        expected = set(row.allowed_references)
+        missing_objects = expected - supplied_objects
+        if missing_objects:
+            raise ProofFailure(
+                ENVIRONMENT_FAILURE,
+                f"allowed reference object unavailable for {row.symbol}")
+
+        actual = set()
+        for object_path, symbols in object_symbols.items():
+            for symbol, symbol_type in symbols:
+                if symbol == row.symbol and symbol_type.upper() == "U":
+                    actual.add(object_path)
+        if actual - expected:
+            failures.append(f"{row.proof_id}:forbidden-reference")
+        elif expected - actual:
+            failures.append(f"{row.proof_id}:missing-reference")
+    return failures
+
+
 def audit_flag_delta(
         real_flags: Sequence[str]) -> Tuple[Tuple[str, ...], Tuple[str, ...]]:
     """Remove only LTO controls for the non-LTO ownership audit relink."""
@@ -818,6 +845,41 @@ def run_ownership(args) -> int:
     return PASS
 
 
+def run_references(args) -> int:
+    root = repository_root(Path(__file__))
+    manifest_path = resolve_input_path(args.manifest, root)
+    object_root = (resolve_input_path(args.object_root, root)
+                   if args.object_root else root)
+    objects = tuple(resolve_input_path(item, object_root)
+                    for item in args.object)
+    if not manifest_path.is_file():
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           f"manifest unavailable: {manifest_path}")
+    missing = [str(path) for path in objects if not path.is_file()]
+    if missing:
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           "object unavailable: " + ",".join(missing))
+
+    run_native_controls(root, args.cc, args.include_root,
+                        args.port_library, args.nm)
+    try:
+        with manifest_path.open("r", encoding="utf-8", newline="") as stream:
+            rows = resolve_manifest_rows(parse_manifest(stream), object_root)
+    except OSError as exc:
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           "reference input unreadable") from exc
+    nm_command = _tool_command(args.nm, "nm")
+    symbols = _read_object_symbols(nm_command, objects, root)
+    failures = verify_reference_inventory(rows, symbols)
+    print("JIT_CONTROL:OBJECT-REFERENCE-INVENTORY:PASS")
+    for failure in failures:
+        print(f"JIT_SEMANTIC_RED:{failure}")
+    if failures:
+        return SEMANTIC_RED
+    print("JIT_PROOF:REFERENCES:PASS")
+    return PASS
+
+
 def _compile_argv(config: BuildConfig, source: Path, output: Path,
                   extra_flags: Sequence[str] = ()) -> Tuple[str, ...]:
     return (config.compiler + config.cflags + config.cppflags +
@@ -1143,6 +1205,31 @@ class ProofProviderSelfTests(unittest.TestCase):
             verify_ownership(rows, {reference: ()}, link_map)
         self.assertEqual(exc.exception.result_class, ENVIRONMENT_FAILURE)
 
+    def test_reference_inventory_names_undeclared_real_reference(self) -> None:
+        owner = canonical_object_name("/tmp/owner.o")
+        allowed = canonical_object_name("/tmp/allowed.o")
+        foreign = canonical_object_name("/tmp/foreign.o")
+        rows = (ManifestRow("JIT-OWN-REF", "owned", owner, (allowed,)),)
+        symbols = {
+            owner: (("owned", "T"),),
+            allowed: (("owned", "U"),),
+            foreign: (("owned", "U"),),
+        }
+        self.assertEqual(
+            verify_reference_inventory(rows, symbols),
+            ["JIT-OWN-REF:forbidden-reference"])
+
+    def test_reference_inventory_accepts_exact_real_references(self) -> None:
+        owner = canonical_object_name("/tmp/owner.o")
+        reference = canonical_object_name("/tmp/reference.o")
+        rows = (ManifestRow("JIT-OWN-REF", "owned", owner,
+                            (reference,)),)
+        symbols = {
+            owner: (("owned", "T"),),
+            reference: (("owned", "U"),),
+        }
+        self.assertEqual(verify_reference_inventory(rows, symbols), [])
+
     def test_lto_audit_removes_only_lto_flags(self) -> None:
         audit, removed = audit_flag_delta((
             "-O2", "-flto=thin", "-DUSE_PGRAC_CLUSTER",
@@ -1243,6 +1330,17 @@ def argument_parser() -> argparse.ArgumentParser:
     ownership.add_argument("--port-library",
                            help="override libpgport.a path")
     ownership.add_argument("--nm", help="override object-tool command")
+    references = subparsers.add_parser(
+        "references", help="verify exact normal-object reference inventory")
+    references.add_argument("--manifest", required=True)
+    references.add_argument("--object", action="append", required=True)
+    references.add_argument("--object-root")
+    references.add_argument("--cc", help="override compiler command")
+    references.add_argument("--include-root",
+                            help="override production include root")
+    references.add_argument("--port-library",
+                            help="override libpgport.a path")
+    references.add_argument("--nm", help="override object-tool command")
     return parser
 
 
@@ -1260,6 +1358,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_controls(args)
         if args.command == "ownership":
             return run_ownership(args)
+        if args.command == "references":
+            return run_references(args)
         raise ProofFailure(PROOF_INTERNAL, "unhandled proof command")
     except ProofFailure as exc:
         labels = {

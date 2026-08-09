@@ -249,6 +249,14 @@ JIT_T3_XLOGINsert_O = $(top_builddir)/src/backend/access/transam/xloginsert.o
 JIT_T3_SPACE_CODEC_O = $(top_builddir)/src/backend/cluster/cluster_space_codec.o
 JIT_T3_INTERFACE_OBJS =
 
+ifeq ($(PORTNAME),darwin)
+JIT_T3_GC_LINK_FLAG = -Wl,-dead_strip
+JIT_T3_MAP_OPTION = -Wl,-map,$(abspath $@.map)
+else
+JIT_T3_GC_LINK_FLAG = -Wl,--gc-sections
+JIT_T3_MAP_OPTION = -Wl,-Map,$(abspath $@.map)
+endif
+
 ifneq ($(wildcard $(top_srcdir)/src/backend/cluster/cluster_space_codec.c),)
 JIT_T3_INTERFACE_OBJS = $(XLOGREADER_FRONTEND_O) $(JIT_T3_XLOGINsert_O) \
 	$(JIT_T3_SPACE_CODEC_O)
@@ -264,13 +272,15 @@ test_cluster_jit_t3_interface_capability: \
 		test_cluster_jit_t3_interface_capability.o $(JIT_T3_INTERFACE_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(JIT_T3_INTERFACE_OBJS) \
-		$(LDFLAGS) $(LDFLAGS_EX) -Wl,-dead_strip $(LIBS) -o $@
+		$(LDFLAGS) $(LDFLAGS_EX) $(JIT_T3_GC_LINK_FLAG) \
+		$(JIT_T3_MAP_OPTION) $(LIBS) -o $@
 
-test_cluster_space_metadata: test_cluster_space_metadata.c \
+test_cluster_space_metadata: test_cluster_space_metadata.o \
 		$(JIT_T3_INTERFACE_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(JIT_T3_INTERFACE_OBJS) \
-		$(LDFLAGS) $(LDFLAGS_EX) -Wl,-dead_strip $(LIBS) -o $@
+		$(LDFLAGS) $(LDFLAGS_EX) $(JIT_T3_GC_LINK_FLAG) \
+		$(JIT_T3_MAP_OPTION) $(LIBS) -o $@
 
 $(XLOGREADER_FRONTEND_O): \
 		$(top_srcdir)/src/backend/access/transam/xlogreader.c
@@ -288,9 +298,18 @@ test_cluster_jit_abi_contract: test_cluster_jit_abi_contract.c
 		$(top_builddir)/src/port/libpgport.a -o $@
 
 check_cluster_jit_proof: check_cluster_jit_proof.py \
-		cluster_jit_symbol_owners.tsv test_cluster_jit_abi_contract.c
+		cluster_jit_symbol_owners.tsv test_cluster_jit_abi_contract.c \
+		test_cluster_jit_t3_interface_capability.o \
+		test_cluster_space_metadata.o $(JIT_T3_INTERFACE_OBJS)
 	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py self-test
 	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py controls
+	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py references \
+		--manifest src/test/cluster_unit/cluster_jit_symbol_owners.tsv \
+		--object src/bin/pg_waldump/xlogreader.o \
+		--object src/backend/access/transam/xloginsert.o \
+		--object src/backend/cluster/cluster_space_codec.o \
+		--object src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o \
+		--object src/test/cluster_unit/test_cluster_space_metadata.o
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
