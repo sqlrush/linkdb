@@ -417,10 +417,40 @@ UT_TEST(test_exact_origin_conflicting_terminal_evidence_fails_closed)
 	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
 }
 
+UT_TEST(test_exact_origin_active_and_native_in_progress_stays_live)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_IN_PROGRESS);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_IN_PROGRESS);
+	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+	UT_ASSERT_EQ(resolution.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(resolution.horizon_scn, InvalidScn);
+	UT_ASSERT_EQ(memcmp(&resolution.locator_echo, &test_origin_locator,
+							 sizeof(test_origin_locator)),
+				 0);
+	UT_ASSERT_EQ(test_undo_read_calls, 1);
+	UT_ASSERT_EQ(test_tt_exact_calls, 1);
+	UT_ASSERT_EQ(test_tt_snapshot_calls, 1);
+	UT_ASSERT_EQ(test_native_status_calls, 1);
+	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(46);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -466,6 +496,7 @@ main(void)
 	UT_RUN(test_exact_origin_bad_record_wrap_fails_before_tt_or_clog);
 	UT_RUN(test_exact_origin_aborted_uses_exact_tt_and_direct_clog);
 	UT_RUN(test_exact_origin_conflicting_terminal_evidence_fails_closed);
+	UT_RUN(test_exact_origin_active_and_native_in_progress_stays_live);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
