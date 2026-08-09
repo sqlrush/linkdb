@@ -258,8 +258,6 @@ cluster_cf_unlock(LOCKMODE mode)
 static unsigned char virtual_file[CLUSTER_WAL_STATE_FILE_SIZE];
 static off_t virtual_file_size = CLUSTER_WAL_STATE_FILE_SIZE;
 static int open_count = 0;
-static int read_only_open_count = 0;
-static int mutating_open_count = 0;
 static int pwrite_count = 0;
 static int fsync_count = 0;
 static int slot_pread_count = 0;
@@ -273,13 +271,9 @@ static ClusterWalStateSlot last_pwrite_image;
 int
 BasicOpenFile(const char *fileName pg_attribute_unused(), int fileFlags)
 {
+	UT_ASSERT((fileFlags & O_RDWR) != 0);
 	UT_ASSERT((fileFlags & (O_CREAT | O_TRUNC)) == 0);
-	UT_ASSERT((fileFlags & O_RDWR) != 0 || (fileFlags & O_ACCMODE) == O_RDONLY);
 	open_count++;
-	if ((fileFlags & O_RDWR) != 0)
-		mutating_open_count++;
-	else
-		read_only_open_count++;
 	record_event(RMW_EVENT_OPEN);
 	return 42;
 }
@@ -400,8 +394,6 @@ fixture_reset(void)
 	virtual_file_size = CLUSTER_WAL_STATE_FILE_SIZE;
 	event_count = 0;
 	open_count = 0;
-	read_only_open_count = 0;
-	mutating_open_count = 0;
 	pwrite_count = 0;
 	fsync_count = 0;
 	slot_pread_count = 0;
@@ -658,110 +650,10 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
 }
 
-UT_TEST(test_a1_w5_checkpoint_publish_requires_verified_outer_cf)
-{
-	ClusterWalStateSlot before;
-	ClusterWalStateSlot *ondisk;
-
-	fixture_reset();
-	memcpy(&before, virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4), sizeof(before));
-	stub_cf_held = false;
-
-	cluster_wal_state_publish_checkpoint_redo(900, 1000);
-
-	ondisk = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
-	UT_ASSERT(memcmp(ondisk, &before, sizeof(before)) == 0);
-	UT_ASSERT_EQ(mutating_open_count, 0);
-	UT_ASSERT_EQ(pwrite_count, 0);
-	UT_ASSERT_EQ(fsync_count, 0);
-	UT_ASSERT_EQ(stub_cf_lock_count, 0);
-	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
-}
-
-UT_TEST(test_a1_w5_fpw_sticky_requires_verified_outer_cf)
-{
-	ClusterWalStateSlot before;
-	ClusterWalStateSlot *ondisk;
-
-	fixture_reset();
-	ondisk = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
-	ondisk->fpw_was_off = 0;
-	ondisk->crc = cluster_wal_state_block_crc(ondisk);
-	memcpy(&before, ondisk, sizeof(before));
-	stub_cf_held = false;
-
-	cluster_wal_state_mark_fpw_off();
-
-	UT_ASSERT(memcmp(ondisk, &before, sizeof(before)) == 0);
-	UT_ASSERT_EQ(mutating_open_count, 0);
-	UT_ASSERT_EQ(pwrite_count, 0);
-	UT_ASSERT_EQ(fsync_count, 0);
-	UT_ASSERT_EQ(stub_cf_lock_count, 0);
-	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
-}
-
-UT_TEST(test_a1_w5_checkpoint_borrows_cf_and_changes_only_redo)
-{
-	ClusterWalStateSlot before;
-	ClusterWalStateSlot expected;
-	ClusterWalStateSlot *ondisk;
-
-	fixture_reset();
-	stub_cf_held = true;
-	ondisk = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
-	memcpy(&before, ondisk, sizeof(before));
-	memcpy(&expected, &before, sizeof(expected));
-	expected.checkpoint_redo_lsn = 900;
-	expected.crc = cluster_wal_state_block_crc(&expected);
-
-	cluster_wal_state_publish_checkpoint_redo(900, 1000);
-
-	UT_ASSERT(memcmp(ondisk, &expected, sizeof(expected)) == 0);
-	UT_ASSERT_EQ(open_count, 1);
-	UT_ASSERT_EQ(read_only_open_count, 0);
-	UT_ASSERT_EQ(mutating_open_count, 1);
-	UT_ASSERT_EQ(slot_pread_count, 2);
-	UT_ASSERT(first_slot_read_buffer != second_slot_read_buffer);
-	UT_ASSERT_EQ(pwrite_count, 1);
-	UT_ASSERT_EQ(fsync_count, 1);
-	UT_ASSERT_EQ(stub_cf_lock_count, 0);
-	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
-}
-
-UT_TEST(test_a1_w5_fpw_sticky_borrows_cf_and_preserves_other_bytes)
-{
-	ClusterWalStateSlot before;
-	ClusterWalStateSlot expected;
-	ClusterWalStateSlot *ondisk;
-
-	fixture_reset();
-	stub_cf_held = true;
-	ondisk = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
-	ondisk->fpw_was_off = 0;
-	ondisk->crc = cluster_wal_state_block_crc(ondisk);
-	memcpy(&before, ondisk, sizeof(before));
-	memcpy(&expected, &before, sizeof(expected));
-	expected.fpw_was_off = 1;
-	expected.crc = cluster_wal_state_block_crc(&expected);
-
-	cluster_wal_state_mark_fpw_off();
-
-	UT_ASSERT(memcmp(ondisk, &expected, sizeof(expected)) == 0);
-	UT_ASSERT_EQ(open_count, 1);
-	UT_ASSERT_EQ(read_only_open_count, 0);
-	UT_ASSERT_EQ(mutating_open_count, 1);
-	UT_ASSERT_EQ(slot_pread_count, 2);
-	UT_ASSERT(first_slot_read_buffer != second_slot_read_buffer);
-	UT_ASSERT_EQ(pwrite_count, 1);
-	UT_ASSERT_EQ(fsync_count, 1);
-	UT_ASSERT_EQ(stub_cf_lock_count, 0);
-	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
-}
-
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(10);
+	UT_PLAN(6);
 
 	UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
 	UT_RUN(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread);
@@ -769,10 +661,6 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_a1_postread_mismatch_fails_without_compensation);
 	UT_RUN(test_a1_borrow_verified_cf_does_not_reenter_or_unlock);
 	UT_RUN(test_a1_fresh_header_slot_typed_rejections);
-	UT_RUN(test_a1_w5_checkpoint_publish_requires_verified_outer_cf);
-	UT_RUN(test_a1_w5_fpw_sticky_requires_verified_outer_cf);
-	UT_RUN(test_a1_w5_checkpoint_borrows_cf_and_changes_only_redo);
-	UT_RUN(test_a1_w5_fpw_sticky_borrows_cf_and_preserves_other_bytes);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

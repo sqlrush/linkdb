@@ -69,7 +69,8 @@ sub write_file_raw
 }
 
 # Fixed-field peek (magic/version/thread_id/node_id/state @0..15,
-# started_at @24, highest_lsn @40, checkpoint_redo_lsn @56).
+# started_at @24, highest_lsn @40, checkpoint_redo_lsn @56,
+# fpw_was_off @68).
 sub read_slot_raw
 {
 	my ($regfile, $tid) = @_;
@@ -82,6 +83,7 @@ sub read_slot_raw
 	my ($started_at) = unpack('q', substr($buf, 24, 8));
 	my ($highest_lsn) = unpack('Q', substr($buf, 40, 8));
 	my ($checkpoint_redo_lsn) = unpack('Q', substr($buf, 56, 8));
+	my ($fpw_was_off) = unpack('L', substr($buf, 68, 4));
 	return {
 		magic => $magic,
 		thread_id => $thread_id,
@@ -90,7 +92,8 @@ sub read_slot_raw
 		tli => $tli,
 		started_at => $started_at,
 		highest_lsn => $highest_lsn,
-		checkpoint_redo_lsn => $checkpoint_redo_lsn
+		checkpoint_redo_lsn => $checkpoint_redo_lsn,
+		fpw_was_off => $fpw_was_off
 	};
 }
 
