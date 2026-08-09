@@ -320,6 +320,58 @@ cluster_wal_state_slot_classify(const ClusterWalStateSlot *s, uint16 expect_thre
 	return v;
 }
 
+/*
+ * Validate one complete registry image.  W1 frontend finalization and the
+ * runtime read-only gate share this byte predicate so neither can accept a
+ * header-only image or skip a corrupt neighbour slot.
+ */
+static inline bool
+cluster_wal_state_image_validate(const void *image, size_t image_size, uint16 *bad_thread_out,
+								 const char **reason_out)
+{
+	const unsigned char *bytes = (const unsigned char *)image;
+	const char *reason = NULL;
+	uint16 bad_thread = 0;
+	ClusterWalStateHeader header;
+	size_t i;
+
+	if (image == NULL)
+		reason = "null image";
+	else if (image_size != CLUSTER_WAL_STATE_FILE_SIZE)
+		reason = "unexpected size";
+	else {
+		memcpy(&header, bytes, sizeof(header));
+		if (cluster_wal_state_header_validate(&header, &reason)) {
+			for (i = 0; i < CLUSTER_WAL_STATE_SLOT_COUNT; i++) {
+				ClusterWalStateSlot slot;
+				ClusterWalSlotVerdict verdict;
+				const char *slot_reason = NULL;
+
+				memcpy(&slot, bytes + CLUSTER_WAL_STATE_SLOT_SIZE * (i + 1), sizeof(slot));
+				verdict = cluster_wal_state_slot_classify(&slot, (uint16)(i + 1), -1,
+												 &slot_reason);
+				if (verdict != CLUSTER_WAL_SLOT_EMPTY && verdict != CLUSTER_WAL_SLOT_OK) {
+					bad_thread = (uint16)(i + 1);
+					reason = slot_reason != NULL ? slot_reason : "invalid slot";
+					break;
+				}
+				if (verdict == CLUSTER_WAL_SLOT_OK
+					&& (slot.node_id < 0 || slot.node_id >= CLUSTER_WAL_STATE_SLOT_COUNT)) {
+					bad_thread = (uint16)(i + 1);
+					reason = "node_id out of range";
+					break;
+				}
+			}
+		}
+	}
+
+	if (bad_thread_out != NULL)
+		*bad_thread_out = bad_thread;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return reason == NULL;
+}
+
 static inline ClusterWalStateUpdateResult
 cluster_wal_state_slot_verdict_to_update_result(ClusterWalSlotVerdict verdict)
 {

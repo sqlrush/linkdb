@@ -301,6 +301,7 @@ fstat(int fd, struct stat *st)
 {
 	UT_ASSERT_EQ(fd, 42);
 	memset(st, 0, sizeof(*st));
+	st->st_mode = S_IFREG | 0600;
 	st->st_size = virtual_file_size;
 	record_event(RMW_EVENT_FSTAT);
 	return 0;
@@ -310,6 +311,7 @@ int
 stat(const char *path pg_attribute_unused(), struct stat *st)
 {
 	memset(st, 0, sizeof(*st));
+	st->st_mode = S_IFREG | 0600;
 	st->st_size = virtual_file_size;
 	return 0;
 }
@@ -319,6 +321,12 @@ pread(int fd, void *buf, size_t nbyte, off_t offset)
 {
 	UT_ASSERT_EQ(fd, 42);
 	UT_ASSERT_EQ(nbyte, (size_t)CLUSTER_WAL_STATE_SLOT_SIZE);
+	if (test_runtime_ensure) {
+		UT_ASSERT(offset >= 0);
+		UT_ASSERT(offset + (off_t)nbyte <= virtual_file_size);
+		memcpy(buf, virtual_file + offset, nbyte);
+		return (ssize_t)nbyte;
+	}
 	if (offset == 0)
 		record_event(RMW_EVENT_PREAD_HEADER);
 	else {
@@ -688,7 +696,10 @@ static bool
 runtime_ensure_child_fatals(void)
 {
 	int status;
-	pid_t pid = fork();
+	pid_t pid;
+
+	fflush(stdout);
+	pid = fork();
 
 	UT_ASSERT(pid >= 0);
 	if (pid == 0) {
@@ -713,6 +724,11 @@ UT_TEST(test_a1_w1_runtime_validates_every_slot_and_bootstrap_is_early_noop)
 	fixture_reset();
 	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(97));
 	cluster_wal_state_slot_fill(slot, 96, 3, CLUSTER_WAL_SLOT_STATE_ACTIVE, 1, 1, 1, 1, 1);
+	UT_ASSERT(runtime_ensure_child_fatals());
+
+	fixture_reset();
+	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
+	cluster_wal_state_slot_fill(slot, 4, 9, CLUSTER_WAL_SLOT_STATE_ACTIVE, 1, 1, 1, 1, 1);
 	UT_ASSERT(runtime_ensure_child_fatals());
 
 	fixture_reset();

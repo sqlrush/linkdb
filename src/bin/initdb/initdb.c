@@ -72,6 +72,8 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_undo_segment.h"   /* UNDO_SEGMENT_SIZE_BYTES */
 #include "cluster/cluster_undo_segment_init.h"  /* seed segment helper */
+#include "cluster/cluster_wal_state.h"
+#include "datatype/timestamp.h"
 #endif
 #include "common/file_perm.h"
 #include "common/file_utils.h"
@@ -167,6 +169,9 @@ static bool sync_only = false;
 static bool show_setting = false;
 static bool data_checksums = false;
 static char *xlog_dir = NULL;
+#ifdef USE_PGRAC_CLUSTER
+static char *pgrac_wal_state_root = NULL;
+#endif
 static char *str_wal_segment_size_mb = NULL;
 static int	wal_segment_size_mb;
 
@@ -322,6 +327,9 @@ void		create_data_directory(void);
 void		create_xlog_or_symlink(void);
 void		warn_on_mount_point(int error);
 void		initialize_data_directory(void);
+#ifdef USE_PGRAC_CLUSTER
+static void finalize_pgrac_wal_state(void);
+#endif
 
 /*
  * macros for running pipes to postgres
@@ -2519,6 +2527,10 @@ usage(const char *progname)
 	printf(_("  -W, --pwprompt            prompt for a password for the new superuser\n"));
 	printf(_("  -X, --waldir=WALDIR       location for the write-ahead log directory\n"));
 	printf(_("      --wal-segsize=SIZE    size of WAL segments, in megabytes\n"));
+#ifdef USE_PGRAC_CLUSTER
+	printf(_("      --pgrac-wal-state-root=DIR\n"
+			 "                            pgrac-init WAL registry handoff\n"));
+#endif
 	printf(_("\nLess commonly used options:\n"));
 	printf(_("  -c, --set NAME=VALUE      override default setting for server parameter\n"));
 	printf(_("  -d, --debug               generate lots of debugging output\n"));
@@ -3198,6 +3210,318 @@ initialize_data_directory(void)
 	check_ok();
 }
 
+#ifdef USE_PGRAC_CLUSTER
+
+/*
+ * W1's only creator is this frontend finalizer.  PG_TEST_* is a focused
+ * TAP fault surface; it can only make explicit initdb provisioning fail
+ * closed and is never consulted by a running server.
+ */
+static bool
+pgrac_wal_state_test_failure(const char *point)
+{
+	const char *requested = getenv("PG_TEST_PGRAC_WAL_STATE_FAILURE");
+
+	return requested != NULL && strcmp(requested, point) == 0;
+}
+
+static void
+pgrac_wal_state_validate_handoff(char *thread_name, size_t thread_name_size)
+{
+	char resolved_root[MAXPGPATH];
+	char resolved_xlog[MAXPGPATH];
+	char xlog_parent[MAXPGPATH];
+	char *separator;
+	unsigned int thread_id;
+	char extra;
+
+	if (realpath(pgrac_wal_state_root, resolved_root) == NULL)
+		pg_fatal("could not canonicalize pgrac WAL state root \"%s\": %m",
+				 pgrac_wal_state_root);
+	if (strcmp(resolved_root, pgrac_wal_state_root) != 0)
+		pg_fatal("pgrac WAL state root \"%s\" is not canonical or contains a symlink escape",
+				 pgrac_wal_state_root);
+	if (realpath(xlog_dir, resolved_xlog) == NULL)
+		pg_fatal("could not canonicalize pgrac WAL thread directory \"%s\": %m", xlog_dir);
+
+	strlcpy(xlog_parent, resolved_xlog, sizeof(xlog_parent));
+	get_parent_directory(xlog_parent);
+	if (strcmp(xlog_parent, resolved_root) != 0)
+		pg_fatal("WAL directory \"%s\" is not a direct child of pgrac WAL state root \"%s\"",
+				 resolved_xlog, resolved_root);
+
+	separator = last_dir_separator(resolved_xlog);
+	if (separator == NULL
+		|| sscanf(separator + 1, "thread_%u%c", &thread_id, &extra) != 1
+		|| thread_id < 1 || thread_id > CLUSTER_WAL_STATE_SLOT_COUNT)
+		pg_fatal("WAL directory \"%s\" is not an exact thread_1..thread_128 child",
+				 resolved_xlog);
+	strlcpy(thread_name, separator + 1, thread_name_size);
+}
+
+static void
+pgrac_wal_state_check_root_entries(const char *thread_name, bool allow_registry)
+{
+	DIR *dir;
+	struct dirent *entry;
+	char unexpected[MAXPGPATH] = "";
+
+	dir = opendir(pgrac_wal_state_root);
+	if (dir == NULL)
+		pg_fatal("could not open pgrac WAL state root \"%s\": %m", pgrac_wal_state_root);
+
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL)
+	{
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0
+			|| strcmp(entry->d_name, thread_name) == 0
+			|| (allow_registry
+				&& strcmp(entry->d_name, CLUSTER_WAL_STATE_FILENAME) == 0))
+			continue;
+		strlcpy(unexpected, entry->d_name, sizeof(unexpected));
+		break;
+	}
+	if (unexpected[0] == '\0' && errno != 0)
+	{
+		int save_errno = errno;
+
+		(void) closedir(dir);
+		errno = save_errno;
+		pg_fatal("could not read pgrac WAL state root \"%s\": %m", pgrac_wal_state_root);
+	}
+	if (closedir(dir) != 0)
+		pg_fatal("could not close pgrac WAL state root \"%s\": %m", pgrac_wal_state_root);
+	if (unexpected[0] != '\0')
+		pg_fatal("pgrac WAL state root \"%s\" contains unexpected entry \"%s\"",
+				 pgrac_wal_state_root, unexpected);
+}
+
+static void
+pgrac_wal_state_verify(const char *path, bool inject_postread)
+{
+	struct stat path_st;
+	struct stat fd_st;
+	unsigned char *image;
+	const char *reason = NULL;
+	uint16 bad_thread = 0;
+	int fd;
+	int block;
+
+	if (lstat(path, &path_st) != 0)
+		pg_fatal("could not stat pgrac WAL state registry \"%s\": %m", path);
+	if (!S_ISREG(path_st.st_mode) || S_ISLNK(path_st.st_mode))
+		pg_fatal("pgrac WAL state registry \"%s\" is not a regular non-symlink file", path);
+
+	fd = open(path, O_RDONLY | PG_BINARY, 0);
+	if (fd < 0)
+		pg_fatal("could not open pgrac WAL state registry \"%s\": %m", path);
+	if (fstat(fd, &fd_st) != 0)
+	{
+		int save_errno = errno;
+
+		(void) close(fd);
+		errno = save_errno;
+		pg_fatal("could not stat open pgrac WAL state registry \"%s\": %m", path);
+	}
+	if (!S_ISREG(fd_st.st_mode) || path_st.st_dev != fd_st.st_dev
+		|| path_st.st_ino != fd_st.st_ino)
+	{
+		(void) close(fd);
+		pg_fatal("pgrac WAL state registry \"%s\" changed while it was opened", path);
+	}
+	if (fd_st.st_size != (off_t) CLUSTER_WAL_STATE_FILE_SIZE)
+	{
+		long long actual_size = (long long) fd_st.st_size;
+
+		(void) close(fd);
+		pg_fatal("pgrac WAL state registry \"%s\" has size %lld, expected %d",
+				 path, actual_size, CLUSTER_WAL_STATE_FILE_SIZE);
+	}
+
+	image = pg_malloc(CLUSTER_WAL_STATE_FILE_SIZE);
+	for (block = 0; block <= CLUSTER_WAL_STATE_SLOT_COUNT; block++)
+	{
+		off_t offset = (off_t) block * CLUSTER_WAL_STATE_SLOT_SIZE;
+		ssize_t nread = pg_pread(fd, image + offset, CLUSTER_WAL_STATE_SLOT_SIZE, offset);
+
+		if (nread != CLUSTER_WAL_STATE_SLOT_SIZE)
+		{
+			int save_errno = nread < 0 ? errno : EIO;
+
+			free(image);
+			(void) close(fd);
+			errno = save_errno;
+			pg_fatal("could not fully read pgrac WAL state registry \"%s\": %m", path);
+		}
+	}
+	if (close(fd) != 0)
+	{
+		int save_errno = errno;
+
+		free(image);
+		errno = save_errno;
+		pg_fatal("could not close pgrac WAL state registry \"%s\": %m", path);
+	}
+
+	if (inject_postread)
+		image[CLUSTER_WAL_STATE_FILE_SIZE - CLUSTER_WAL_STATE_SLOT_SIZE] ^= 1;
+	if (!cluster_wal_state_image_validate(image, CLUSTER_WAL_STATE_FILE_SIZE,
+										  &bad_thread, &reason))
+	{
+		free(image);
+		if (bad_thread == 0)
+			pg_fatal("pgrac WAL state registry \"%s\" failed validation: %s",
+					 path, reason != NULL ? reason : "unknown header failure");
+		pg_fatal("pgrac WAL state registry \"%s\" slot %u failed validation: %s",
+				 path, (unsigned int) bad_thread,
+				 reason != NULL ? reason : "unknown slot failure");
+	}
+	free(image);
+}
+
+static void
+finalize_pgrac_wal_state(void)
+{
+	char thread_name[64];
+	char path[MAXPGPATH];
+	struct stat path_st;
+	unsigned char *image;
+	int64 created_at;
+	int fd;
+	int path_len;
+	int root_fd;
+	size_t write_size = CLUSTER_WAL_STATE_FILE_SIZE;
+	size_t written = 0;
+
+	pgrac_wal_state_validate_handoff(thread_name, sizeof(thread_name));
+	path_len = snprintf(path, sizeof(path), "%s/%s", pgrac_wal_state_root,
+						CLUSTER_WAL_STATE_FILENAME);
+	if (path_len < 0 || path_len >= (int) sizeof(path))
+		pg_fatal("pgrac WAL state registry path is too long");
+
+	if (lstat(path, &path_st) == 0)
+	{
+		pgrac_wal_state_verify(path, false);
+		return;
+	}
+	if (errno != ENOENT)
+		pg_fatal("could not inspect pgrac WAL state registry \"%s\": %m", path);
+
+	pgrac_wal_state_check_root_entries(thread_name, false);
+	fd = open(path, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY, 0600);
+	if (fd < 0)
+	{
+		if (errno == EEXIST)
+		{
+			pgrac_wal_state_verify(path, false);
+			return;
+		}
+		pg_fatal("could not create pgrac WAL state registry \"%s\": %m", path);
+	}
+
+	/* Re-prove the serialized fresh-root shape after publishing the inode. */
+	pgrac_wal_state_check_root_entries(thread_name, true);
+	if (fchmod(fd, 0600) != 0)
+	{
+		int save_errno = errno;
+
+		(void) close(fd);
+		errno = save_errno;
+		pg_fatal("could not set owner-only mode on pgrac WAL state registry \"%s\": %m",
+				 path);
+	}
+
+	image = pg_malloc0(CLUSTER_WAL_STATE_FILE_SIZE);
+	created_at = ((int64) time(NULL)
+				  - (int64) (POSTGRES_EPOCH_JDATE - UNIX_EPOCH_JDATE) * SECS_PER_DAY)
+		* USECS_PER_SEC;
+	cluster_wal_state_header_fill((ClusterWalStateHeader *) image, created_at);
+	if (pgrac_wal_state_test_failure("short-write"))
+		write_size--;
+	while (written < write_size)
+	{
+		ssize_t nbytes = write(fd, image + written, write_size - written);
+
+		if (nbytes < 0 && errno == EINTR)
+			continue;
+		if (nbytes <= 0)
+		{
+			int save_errno = nbytes < 0 ? errno : EIO;
+
+			free(image);
+			(void) close(fd);
+			errno = save_errno;
+			pg_fatal("could not write pgrac WAL state registry \"%s\": %m", path);
+		}
+		written += nbytes;
+	}
+	free(image);
+	if (write_size != CLUSTER_WAL_STATE_FILE_SIZE)
+	{
+		(void) close(fd);
+		errno = EIO;
+		pg_fatal("could not fully write pgrac WAL state registry \"%s\": %m", path);
+	}
+
+	if (pgrac_wal_state_test_failure("file-fsync"))
+	{
+		(void) close(fd);
+		errno = EIO;
+		pg_fatal("could not fsync pgrac WAL state registry \"%s\": %m", path);
+	}
+	if (fsync(fd) != 0)
+	{
+		int save_errno = errno;
+
+		(void) close(fd);
+		errno = save_errno;
+		pg_fatal("could not fsync pgrac WAL state registry \"%s\": %m", path);
+	}
+	root_fd = open(pgrac_wal_state_root, O_RDONLY | PG_BINARY, 0);
+	if (root_fd < 0)
+	{
+		int save_errno = errno;
+
+		(void) close(fd);
+		errno = save_errno;
+		pg_fatal("could not open pgrac WAL state root \"%s\": %m",
+				 pgrac_wal_state_root);
+	}
+	if (pgrac_wal_state_test_failure("root-fsync"))
+	{
+		(void) close(root_fd);
+		(void) close(fd);
+		errno = EIO;
+		pg_fatal("could not fsync pgrac WAL state root \"%s\": %m",
+				 pgrac_wal_state_root);
+	}
+	if (fsync(root_fd) != 0)
+	{
+		int save_errno = errno;
+
+		(void) close(root_fd);
+		(void) close(fd);
+		errno = save_errno;
+		pg_fatal("could not fsync pgrac WAL state root \"%s\": %m",
+				 pgrac_wal_state_root);
+	}
+	if (close(root_fd) != 0)
+	{
+		int save_errno = errno;
+
+		(void) close(fd);
+		errno = save_errno;
+		pg_fatal("could not close pgrac WAL state root \"%s\": %m",
+				 pgrac_wal_state_root);
+	}
+	if (close(fd) != 0)
+		pg_fatal("could not close pgrac WAL state registry \"%s\": %m", path);
+
+	pgrac_wal_state_verify(path, pgrac_wal_state_test_failure("postread"));
+}
+
+#endif /* USE_PGRAC_CLUSTER */
+
 
 int
 main(int argc, char *argv[])
@@ -3239,6 +3563,9 @@ main(int argc, char *argv[])
 		{"locale-provider", required_argument, NULL, 15},
 		{"icu-locale", required_argument, NULL, 16},
 		{"icu-rules", required_argument, NULL, 17},
+#ifdef USE_PGRAC_CLUSTER
+		{"pgrac-wal-state-root", required_argument, NULL, 18},
+#endif
 		{NULL, 0, NULL, 0}
 	};
 
@@ -3418,6 +3745,11 @@ main(int argc, char *argv[])
 			case 17:
 				icu_rules = pg_strdup(optarg);
 				break;
+#ifdef USE_PGRAC_CLUSTER
+			case 18:
+				pgrac_wal_state_root = pg_strdup(optarg);
+				break;
+#endif
 			default:
 				/* getopt_long already emitted a complaint */
 				pg_log_error_hint("Try \"%s --help\" for more information.", progname);
@@ -3453,6 +3785,18 @@ main(int argc, char *argv[])
 				 "--icu-rules", "icu");
 
 	atexit(cleanup_directories_atexit);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (pgrac_wal_state_root != NULL)
+	{
+		if (sync_only)
+			pg_fatal("--pgrac-wal-state-root cannot be used with --sync-only");
+		if (xlog_dir == NULL)
+			pg_fatal("--pgrac-wal-state-root requires --waldir");
+		if (!is_absolute_path(pgrac_wal_state_root))
+			pg_fatal("--pgrac-wal-state-root must be an absolute path");
+	}
+#endif
 
 	/* If we only need to fsync, just do it and exit */
 	if (sync_only)
@@ -3537,6 +3881,11 @@ main(int argc, char *argv[])
 	printf("\n");
 
 	initialize_data_directory();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (pgrac_wal_state_root != NULL)
+		finalize_pgrac_wal_state();
+#endif
 
 	if (do_sync)
 	{
