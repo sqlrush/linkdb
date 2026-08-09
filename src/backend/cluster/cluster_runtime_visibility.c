@@ -66,12 +66,18 @@
 #include "cluster/cluster_undo_verdict.h"	/* verdict taxonomy + entry (D3-3/D3-4) */
 #include "cluster/cluster_undo_horizon.h"	/* D5-8 read admission (spec-5.22e) */
 
-static bool
-cluster_runtime_visibility_direct_xid_committed(TransactionId xid)
+static XidStatus
+cluster_runtime_visibility_direct_xid_status(TransactionId xid)
 {
 	XLogRecPtr xid_lsn;
 
-	return TransactionIdGetStatus(xid, &xid_lsn) == TRANSACTION_STATUS_COMMITTED;
+	return TransactionIdGetStatus(xid, &xid_lsn);
+}
+
+static bool
+cluster_runtime_visibility_direct_xid_committed(TransactionId xid)
+{
+	return cluster_runtime_visibility_direct_xid_status(xid) == TRANSACTION_STATUS_COMMITTED;
 }
 
 /*
@@ -91,7 +97,10 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 	const UndoRecordHeader *record;
 	ClusterTxResolution candidate;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
 	ClusterLiveAuthority authority;
+	TTSlot exact_slot;
+	XidStatus native_status;
 	NodeId origin_node;
 	size_t record_size;
 	SCN commit_scn = InvalidScn;
@@ -103,6 +112,7 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 		*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	memset(&candidate, 0, sizeof(candidate));
 	memset(&authority, 0, sizeof(authority));
+	memset(&exact_slot, 0, sizeof(exact_slot));
 
 	if (locator == NULL) {
 		reason = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
@@ -138,12 +148,36 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 		goto unknown;
 
 	tt_slot_offset = cluster_tt_slot_id_to_offset(record->tt_slot_id);
-	if (!cluster_tt_slot_durable_lookup_committed_stable(
+	if (cluster_tt_slot_durable_lookup_committed_stable(
 			record->tt_slot_segment_id, tt_slot_offset, locator->xid, locator->tt_wrap,
 			cluster_runtime_visibility_direct_xid_committed, &commit_scn)
-		|| !SCN_VALID(commit_scn)) {
-		reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-		goto unknown;
+		&& SCN_VALID(commit_scn)) {
+		outcome = CLUSTER_TX_COMMITTED;
+	} else {
+		if (!cluster_tt_slot_durable_read_exact_stable(record->tt_slot_segment_id,
+													  tt_slot_offset, locator->xid,
+													  locator->tt_wrap, &exact_slot)) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			goto unknown;
+		}
+
+		native_status = cluster_runtime_visibility_direct_xid_status(locator->xid);
+		if ((exact_slot.status == TT_SLOT_COMMITTED
+			 && native_status == TRANSACTION_STATUS_ABORTED)
+			|| (exact_slot.status == TT_SLOT_ABORTED
+				&& native_status == TRANSACTION_STATUS_COMMITTED)) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+			goto unknown;
+		}
+		if (native_status == TRANSACTION_STATUS_ABORTED
+			|| (exact_slot.status == TT_SLOT_ABORTED
+				&& native_status == TRANSACTION_STATUS_IN_PROGRESS)) {
+			outcome = CLUSTER_TX_ABORTED;
+			commit_scn = InvalidScn;
+		} else {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			goto unknown;
+		}
 	}
 
 	authority.origin_epoch = cluster_epoch_get_current();
@@ -162,14 +196,14 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 
 	candidate.locator_echo = *locator;
 	candidate.top_xid = locator->xid;
-	candidate.outcome = CLUSTER_TX_COMMITTED;
+	candidate.outcome = outcome;
 	candidate.proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
 	candidate.commit_scn = commit_scn;
 	candidate.authority = authority;
 	*out = candidate;
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_NONE;
-	return CLUSTER_TX_COMMITTED;
+	return outcome;
 
 unknown:
 	if (reason_out != NULL)
