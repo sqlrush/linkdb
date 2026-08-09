@@ -1792,7 +1792,8 @@ cluster_bufmgr_pcm_x_holder_drain_deferred(ClusterPcmXHolderLedgerEntry *entry)
 }
 
 static ClusterPcmXHolderLedgerEntry *
-cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
+cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused,
+									bool owns_pending_grant, bool *return_to_owner)
 {
 	ClusterPcmXHolderLedgerEntry *entry;
 	ClusterPcmXWriterLedgerEntry *writer_entry;
@@ -1808,6 +1809,12 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
 	LWLock *content_lock;
 	uint32 wait_index = 0;
 	bool writer_authorized = false;
+
+	if (return_to_owner == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster PCM-X holder admission requires an owner-return result")));
+	*return_to_owner = false;
 
 	cluster_bufmgr_pcm_x_holder_drain_deferred_nowait();
 	entry = cluster_bufmgr_pcm_x_holder_find(buf);
@@ -1929,6 +1936,16 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
 				&key, &writer_entry->claim, &handle, &committed_own_generation);
 		else
 			result = cluster_pcm_x_local_holder_register(&key, &handle);
+		/* A completed remote acquire has consumed its request while its exact
+		 * ownership tuple can still be pending.  Waiting for this resource's
+		 * closed revoke barrier while retaining that tuple would make revoke
+		 * progress depend on this same backend.  Return before the ordinary
+		 * holder wait so the tuple owner can abort and re-enter exactly. */
+		if (owns_pending_grant && result == PCM_X_QUEUE_BARRIER_CLOSED)
+		{
+			*return_to_owner = true;
+			return NULL;
+		}
 		current_runtime = cluster_pcm_x_runtime_snapshot();
 		action = cluster_pcm_x_holder_register_retry_action(
 			result, current_runtime.state == PCM_X_RUNTIME_ACTIVE
@@ -1959,6 +1976,56 @@ cluster_bufmgr_pcm_x_holder_prepare(BufferDesc *buf, bool *barrier_refused)
 	}
 
 	return entry;
+}
+
+/* Publish holder admission after a remote acquire without carrying an owned
+ * pending tuple into a same-resource barrier wait.  The existing retry helper
+ * performs the exact header-authority abort, the cancelable off-lock gap and
+ * either stable-cover acceptance or a fresh reservation. */
+static ClusterPcmXHolderLedgerEntry *
+cluster_bufmgr_pcm_x_holder_admit_owned_grant(
+	BufferDesc *buf, PcmLockMode pcm_mode, bool *barrier_refused,
+	ClusterPcmOwnSnapshot *pending_base, uint64 *pending_token, bool *acquired,
+	bool *pending_set, bool *covered, uint64 *covered_generation, uint32 *retry_wait_index)
+{
+	for (;;)
+	{
+		ClusterPcmXHolderLedgerEntry *holder;
+		bool		return_to_owner = false;
+
+		holder = cluster_bufmgr_pcm_x_holder_prepare(
+			buf, barrier_refused, *pending_set, &return_to_owner);
+		if (!return_to_owner)
+			return holder;
+
+		*pending_set = false;
+		*acquired = false;
+		for (;;)
+		{
+			ClusterBufmgrPcmRetryRearmResult rearm_result;
+			bool		retry_denied = false;
+
+			rearm_result = cluster_bufmgr_pcm_retry_denied_rearm(
+				buf, pcm_mode, pending_base, pending_token, *retry_wait_index,
+				barrier_refused, covered_generation);
+			if (*retry_wait_index < PG_UINT32_MAX)
+				(*retry_wait_index)++;
+			if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED)
+				return NULL;
+			if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_COVERED)
+			{
+				*covered = true;
+				break;
+			}
+
+			*pending_set = true;
+			*acquired = cluster_pcm_lock_acquire_buffer(buf, pcm_mode, &retry_denied);
+			if (!retry_denied)
+				break;
+			*pending_set = false;
+			*acquired = false;
+		}
+	}
 }
 
 static void
@@ -8750,7 +8817,10 @@ pcm_legacy_acquire_done:
 			CLUSTER_INJECTION_POINT("cluster-pcm-writer-cached-x-stall");
 		PG_TRY();
 		{
-			pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, pcm_barrier_refused);
+			pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
+				buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base, &pcm_pending_token,
+				&pcm_acquired, &pcm_pending_set, &pcm_covered, &pcm_covered_gen,
+				&pcm_retry_wait_index);
 			if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
 			{
 				/*
@@ -8889,7 +8959,10 @@ pcm_revalidate_acquire_done:
 						}
 						if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
 						{
-							pcm_x_holder = cluster_bufmgr_pcm_x_holder_prepare(buf, NULL);
+							pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
+								buf, pcm_mode, NULL, &pcm_pending_base, &pcm_pending_token,
+								&pcm_acquired, &pcm_pending_set, &pcm_covered,
+								&pcm_covered_gen, &pcm_retry_wait_index);
 							if (mode == BUFFER_LOCK_SHARE)
 								LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
 							else
