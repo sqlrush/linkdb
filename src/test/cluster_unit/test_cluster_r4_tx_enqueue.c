@@ -54,6 +54,8 @@ static int test_wait_publish_calls;
 static int test_wait_clear_calls;
 static uint8 test_wait_kind;
 static uint64 test_wait_epoch;
+static ClusterLmdWaitStateReadResult test_wait_read_result;
+static ClusterLmdWaitStateSnapshot test_wait_snapshot;
 static int test_wait_latch_calls;
 static int test_set_latch_calls[TEST_NSLOTS];
 static bool test_wait_latch_throws;
@@ -165,6 +167,13 @@ cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws pg_attribute_unused()
 	test_wait_epoch = epoch;
 	UT_ASSERT_EQ(request_id, 0);
 	UT_ASSERT_EQ((int)xid, (int)test_local_xid);
+	test_wait_read_result = CLUSTER_LMD_WAIT_STATE_READ_ACTIVE;
+	test_wait_snapshot.active = true;
+	test_wait_snapshot.kind = kind;
+	test_wait_snapshot.request_id = request_id;
+	test_wait_snapshot.cluster_epoch = epoch;
+	test_wait_snapshot.xid = xid;
+	test_wait_snapshot.wait_seq = UINT64CONST(1234);
 	return UINT64CONST(1234);
 }
 
@@ -172,6 +181,16 @@ void
 cluster_lmd_wait_state_clear(ClusterLmdProcWaitState *ws pg_attribute_unused())
 {
 	test_wait_clear_calls++;
+	test_wait_read_result = CLUSTER_LMD_WAIT_STATE_READ_INACTIVE;
+	memset(&test_wait_snapshot, 0, sizeof(test_wait_snapshot));
+}
+
+ClusterLmdWaitStateReadResult
+cluster_lmd_wait_state_read_exact(ClusterLmdProcWaitState *ws pg_attribute_unused(),
+								  ClusterLmdWaitStateSnapshot *out)
+{
+	*out = test_wait_snapshot;
+	return test_wait_read_result;
 }
 
 bool
@@ -332,6 +351,8 @@ reset_fixture(void)
 	test_wait_clear_calls = 0;
 	test_wait_kind = 0;
 	test_wait_epoch = 0;
+	test_wait_read_result = CLUSTER_LMD_WAIT_STATE_READ_INACTIVE;
+	memset(&test_wait_snapshot, 0, sizeof(test_wait_snapshot));
 	test_wait_latch_calls = 0;
 	memset(test_set_latch_calls, 0, sizeof(test_set_latch_calls));
 	test_wait_latch_throws = false;
@@ -620,10 +641,56 @@ UT_TEST(test_hint_waker_matches_source_discriminant_only)
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->wakeup_count), 1);
 }
 
+/*
+ * A backend can leave the exact wait through proc_exit/FATAL rather than the
+ * stack PG_FINALLY.  The before_shmem_exit hook must remove only this
+ * backend's exact TARGET ownership, and it must be idempotent so pgprocno
+ * reuse can immediately register a fresh wait.
+ */
+extern void cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code, Datum arg);
+
+UT_TEST(test_backend_exit_cleans_exact_target_and_allows_procno_reuse)
+{
+	ClusterTxLocator locator = test_locator();
+	ClusterTTStatusKey source = test_source_key();
+	ClusterLmdVertex waiter;
+	ClusterLmdVertex blocker;
+	uint64 wait_seq;
+
+	reset_fixture();
+	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
+	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait,
+										  CLUSTER_LMD_WAIT_TX, 0, TEST_EPOCH,
+										  test_local_xid);
+	txw_exact_waiter_vertex(&waiter, 0, TEST_EPOCH, test_local_xid, wait_seq);
+	memset(&blocker, 0, sizeof(blocker));
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&waiter, &blocker, 0));
+
+	cluster_tx_enqueue_cleanup_on_backend_exit_callback(0, (Datum)0);
+	UT_ASSERT_EQ(test_wfg_cancel_calls, 1);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	assert_slot_clean();
+
+	/* Re-entry after cleanup is a no-op, and the reused procno is writable. */
+	cluster_tx_enqueue_cleanup_on_backend_exit_callback(0, (Datum)0);
+	UT_ASSERT_EQ(test_wfg_cancel_calls, 1);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
+	txw_slot_clear(0);
+
+	/* SOURCE belongs to the legacy waiter and must not be touched by D9. */
+	txw_slot_set(0, &source);
+	cluster_tx_enqueue_cleanup_on_backend_exit_callback(0, (Datum)0);
+	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, CLUSTER_TXW_SLOT_SOURCE);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
+	txw_slot_clear(0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);
@@ -639,6 +706,7 @@ main(void)
 	UT_RUN(test_wfg_capacity_refusal_runs_full_cleanup);
 	UT_RUN(test_error_longjmp_runs_same_cleanup_funnel);
 	UT_RUN(test_hint_waker_matches_source_discriminant_only);
+	UT_RUN(test_backend_exit_cleans_exact_target_and_allows_procno_reuse);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
