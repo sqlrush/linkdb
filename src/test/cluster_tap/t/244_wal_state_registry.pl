@@ -47,7 +47,8 @@ use lib "$FindBin::RealBin/../lib";
 
 use File::Path qw(make_path);
 use PgracClusterNode;
-use PgracWalState qw(crc32c read_file_raw write_file_raw read_slot_raw patch_byte forge_slot_node_id);
+use PgracWalState qw(crc32c read_file_raw write_file_raw read_slot_raw patch_byte
+  forge_slot_node_id forge_slot_fpw_sticky);
 use PostgreSQL::Test::Utils;
 use Test::More;
 
@@ -156,6 +157,18 @@ isnt($lsn1, $lsn0, 'L2 registry_highest_lsn advances with WAL volume');
 		'f', 'W5 successful sticky permits checkpoint FPW-off');
 	is($retry->{checkpoint_redo_lsn}, checkpoint_redo_u64($node),
 		'W5 successful checkpoint advert equals durable control redo');
+
+	# Crash with the most recently replayable FPW state off.  A CRC-valid
+	# sticky=0 is missing safety evidence, not generic slot corruption.
+	$node->stop('immediate');
+	forge_slot_fpw_sticky($regfile, 4, 0);
+	my $historical_start = $node->start(fail_ok => 1);
+	is($historical_start, 0,
+		'W5 historical FPW-off without sticky is Startup FATAL');
+	$node->stop('immediate') if $historical_start;
+	forge_slot_fpw_sticky($regfile, 4, 1);
+	ok($node->start,
+		'W5 historical FPW-off with valid own sticky restarts');
 
 	$node->safe_psql('postgres', q{
 		ALTER SYSTEM SET full_page_writes = 'on';
