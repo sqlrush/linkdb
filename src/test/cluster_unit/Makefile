@@ -1672,23 +1672,15 @@ test_cluster_itl_touch: test_cluster_itl_touch.c unit_test.h \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-8.3 D11: test_cluster_active_itl_transfer pins the active-ITL
-# current-block transfer contracts.  The GCS handlers, bufmgr and the
-# terminal stamp path cannot be linked outside a backend, so these
-# execute mutation-sensitive checks against the production sources:
-# GUC-free active X-transfer admission, the single no-fetch stamp
-# acquisition route, the exact-authority stamp helper, the terminal
-# proof record fields, and the frozen 24-byte public touch handle.
-# The dynamic end-to-end proof lives in cluster_tap t/408.
+# current-block transfer contracts.  Header-inline policy checks cover the
+# GCS/bufmgr closed decisions; the real cluster_itl_touch.o runs registration,
+# dedupe/invalidation and terminal finish against narrow backend-service
+# stubs.  The dynamic end-to-end proof lives in cluster_tap t/408.
+CLUSTER_ITL_TOUCH_REAL_O = $(top_builddir)/src/backend/cluster/cluster_itl_touch.o
 test_cluster_active_itl_transfer: test_cluster_active_itl_transfer.c unit_test.h \
-		$(CLUSTER_VERSION_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) \
-		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
-		-DGCS_BLOCK_HEADER_PATH='"$(top_srcdir)/src/include/cluster/cluster_gcs_block.h"' \
-		-DITL_TOUCH_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_itl_touch.c"' \
-		-DITL_TOUCH_HEADER_PATH='"$(top_srcdir)/src/include/cluster/cluster_itl_touch.h"' \
-		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
-		$< \
-		$(CLUSTER_VERSION_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_TOUCH_REAL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_ITL_TOUCH_REAL_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
