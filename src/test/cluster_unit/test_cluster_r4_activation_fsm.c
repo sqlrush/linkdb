@@ -71,6 +71,14 @@ valid_ack(void)
 		UT_ASSERT_EQ(next, (state_value));                                                         \
 	}
 
+#define DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_name, state_value)                                  \
+	UT_TEST(test_name)                                                                             \
+	{                                                                                              \
+		SemanticActivationState next = (state_value);                                              \
+		UT_ASSERT(semantic_activation_fsm_next((state_value), false, &next));                      \
+		UT_ASSERT(next != (state_value));                                                          \
+	}
+
 #define DEFINE_FAILURE_TEST(test_name, state_value, expected_closed, expected_revert)              \
 	UT_TEST(test_name)                                                                             \
 	{                                                                                              \
@@ -278,24 +286,24 @@ DEFINE_CALLBACK_TEST(test_41_target_open_calls_open_admission,
 DEFINE_CALLBACK_TEST(test_42_source_open_has_no_transition_callback,
 					 SEMANTIC_ACTIVATION_STATE_SOURCE_OPEN, SEMANTIC_ACTIVATION_CALLBACK_NONE)
 
-DEFINE_INVALID_SELF_EDGE_TEST(test_43_source_open_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_SOURCE_OPEN)
-DEFINE_INVALID_SELF_EDGE_TEST(test_44_admission_stopped_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_SOURCE_ADMISSION_STOPPED)
-DEFINE_INVALID_SELF_EDGE_TEST(test_45_drain_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_SOURCE_DRAIN_OR_RECOVERY)
-DEFINE_INVALID_SELF_EDGE_TEST(test_46_logical_zero_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_SOURCE_LOGICAL_ZERO)
-DEFINE_INVALID_SELF_EDGE_TEST(test_47_transport_barrier_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_ORDERED_TRANSPORT_BARRIER)
-DEFINE_INVALID_SELF_EDGE_TEST(test_48_transport_zero_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_TRANSPORT_BACKED_ZERO)
-DEFINE_INVALID_SELF_EDGE_TEST(test_49_epoch_barrier_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_EPOCH_CAPABILITY_BARRIER)
-DEFINE_INVALID_SELF_EDGE_TEST(test_50_target_staged_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_TARGET_STAGED)
-DEFINE_INVALID_SELF_EDGE_TEST(test_51_committed_closed_has_no_self_edge,
-							  SEMANTIC_ACTIVATION_STATE_TARGET_COMMITTED_CLOSED)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_43_source_open_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_SOURCE_OPEN)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_44_admission_stopped_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_SOURCE_ADMISSION_STOPPED)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_45_drain_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_SOURCE_DRAIN_OR_RECOVERY)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_46_logical_zero_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_SOURCE_LOGICAL_ZERO)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_47_transport_barrier_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_ORDERED_TRANSPORT_BARRIER)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_48_transport_zero_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_TRANSPORT_BACKED_ZERO)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_49_epoch_barrier_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_EPOCH_CAPABILITY_BARRIER)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_50_target_staged_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_TARGET_STAGED)
+DEFINE_FORWARD_NOT_SELF_EDGE_TEST(test_51_committed_closed_has_no_self_edge,
+								  SEMANTIC_ACTIVATION_STATE_TARGET_COMMITTED_CLOSED)
 DEFINE_INVALID_SELF_EDGE_TEST(test_52_target_open_has_no_self_edge,
 							  SEMANTIC_ACTIVATION_STATE_TARGET_OPEN)
 
