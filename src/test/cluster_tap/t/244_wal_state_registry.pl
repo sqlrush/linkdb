@@ -69,16 +69,40 @@ sub checkpoint_redo_u64
 		  FROM pg_control_checkpoint()});
 }
 
+sub cf_x_acquire_count
+{
+	my ($node) = @_;
+
+	return $node->safe_psql('postgres', q{
+		SELECT value::bigint FROM pg_cluster_state
+		 WHERE category = 'cf' AND key = 'cf_x_acquire'});
+}
+
+sub w5_owned_bytes
+{
+	my ($regfile, $tid) = @_;
+	my $slot = substr(read_file_raw($regfile), 512 + ($tid - 1) * 512, 512);
+
+	return substr($slot, 56, 8) . substr($slot, 68, 4);
+}
+
 my $wroot = PostgreSQL::Test::Utils::tempdir();
 my $regfile = "$wroot/pgrac_wal_state";
+my $shared_root = PostgreSQL::Test::Utils::tempdir();
+make_path("$shared_root/global");
 
 my $node = PgracClusterNode->new('wal_state_a');
-$node->init(extra => [ '-X', "$wroot/thread_4" ]);
+$node->init(extra => [
+	'-X', "$wroot/thread_4", "--pgrac-wal-state-root=$wroot" ]);
 $node->append_conf('postgresql.conf',
 	    "cluster.enabled = on\n"
 	  . "cluster.node_id = 3\n"
 	  . "cluster.allow_single_node = on\n"
 	  . "cluster.wal_threads_dir = '$wroot'\n"
+	  . "cluster.shared_storage_backend = cluster_fs\n"
+	  . "cluster.shared_data_dir = '$shared_root'\n"
+	  . "cluster.smgr_user_relations = on\n"
+	  . "cluster.controlfile_shared_authority = on\n"
 	  . "cluster.cluster_stats_main_loop_interval = '500ms'\n"
 	  . "autovacuum = off\n");
 $node->start;
@@ -127,13 +151,16 @@ isnt($lsn1, $lsn0, 'L2 registry_highest_lsn advances with WAL volume');
 	my $w5shared = PostgreSQL::Test::Utils::tempdir();
 	make_path("$w5shared/global");
 	my $w5 = PgracClusterNode->new('wal_state_w5');
-	$w5->init(extra => [ '-X', "$w5root/thread_14" ]);
+	$w5->init(extra => [
+		'-X', "$w5root/thread_14", "--pgrac-wal-state-root=$w5root" ]);
 	$w5->append_conf('postgresql.conf',
 		    "cluster.enabled = on\n"
 		  . "cluster.node_id = 13\n"
 		  . "cluster.allow_single_node = on\n"
 		  . "cluster.wal_threads_dir = '$w5root'\n"
+		  . "cluster.shared_storage_backend = cluster_fs\n"
 		  . "cluster.shared_data_dir = '$w5shared'\n"
+		  . "cluster.smgr_user_relations = on\n"
 		  . "cluster.controlfile_shared_authority = on\n"
 		  . "cluster.cluster_stats_main_loop_interval = '500ms'\n"
 		  . "autovacuum = off\n");
@@ -211,9 +238,41 @@ isnt($lsn1, $lsn0, 'L2 registry_highest_lsn advances with WAL volume');
 	is($historical_start, 0,
 		'W5 historical FPW-off without sticky is Startup FATAL');
 	$w5->stop('immediate') if $historical_start;
+	$w5->adjust_conf('postgresql.auto.conf',
+		'cluster.controlfile_shared_authority', 'on');
 	forge_slot_fpw_sticky($w5reg, 14, 1);
-	ok($w5->start,
+	my $w5_before_eor = read_slot_raw($w5reg, 14);
+	my $w5_bytes_before_eor = w5_owned_bytes($w5reg, 14);
+	my $eor_log_off = -s $w5->logfile;
+	my $eor_start = $w5->start(fail_ok => 1);
+	is($eor_start, 1,
 		'W5 historical FPW-off with valid own sticky restarts');
+	if (!$eor_start)
+	{
+		my $eor_log = PostgreSQL::Test::Utils::slurp_file(
+			$w5->logfile, $eor_log_off);
+
+		like($eor_log,
+			qr/could not acquire the cluster control-file lock for a checkpoint.*checkpoint request failed/s,
+			'W5 RED reaches the Checkpointer CF(X) OWNER-to-EOR gap');
+		done_testing();
+		exit;
+	}
+
+	my $w5_after_eor = read_slot_raw($w5reg, 14);
+	is(w5_owned_bytes($w5reg, 14), $w5_bytes_before_eor,
+		'W5 EOR leaves the owned registry bytes unchanged');
+	is($w5_after_eor->{checkpoint_redo_lsn},
+		$w5_before_eor->{checkpoint_redo_lsn},
+		'W5 EOR performs no checkpoint-redo advert write');
+	is($w5_after_eor->{fpw_was_off}, $w5_before_eor->{fpw_was_off},
+		'W5 EOR performs no FPW-sticky write');
+	is(cf_x_acquire_count($w5), 0,
+		'W5 OWNER EOR restart does not acquire CF(X)');
+	my $cf_x_before = cf_x_acquire_count($w5);
+	$w5->safe_psql('postgres', 'CHECKPOINT');
+	cmp_ok(cf_x_acquire_count($w5), '>', $cf_x_before,
+		'W5 next steady checkpoint acquires real CF(X)');
 	$w5->stop;
 }
 
