@@ -193,7 +193,7 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 {
 	ClusterTTStatusKey key;
 	ClusterTTStatusResult result;
-	ClusterXpScope xp_scope; /* PGRAC: spec-5.59 D3 profiling */
+	ClusterXpScope xp_scope = { .active = false }; /* PGRAC: spec-5.59 D3 profiling */
 
 	cluster_xp_begin(&xp_scope, CLXP_R_TT_VISIBILITY_RESOLVE);
 
