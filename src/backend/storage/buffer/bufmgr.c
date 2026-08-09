@@ -1433,19 +1433,29 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
 static ClusterPcmOwnResult
 cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf, PcmLockMode requested_mode,
 												ClusterPcmOwnSnapshot *base_out,
-												uint64 *token_out, bool *covered_out)
+												uint64 *token_out, bool *covered_out,
+												bool *barrier_refused)
 {
 	ClusterPcmOwnResult result;
+	PcmXQueueResult guard_result;
 	uint32		waits = 0;
 
 	for (;;)
 	{
 		result = cluster_pcm_own_begin_grant_reservation(buf, requested_mode, base_out,
-												 token_out, covered_out);
+											 token_out, covered_out);
 		if (result != CLUSTER_PCM_OWN_BUSY)
 			return result;
-		if (cluster_pcm_x_nested_wait_guard_before_block() != PCM_X_QUEUE_OK)
+		guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+		if (guard_result != PCM_X_QUEUE_OK)
+		{
+			if (barrier_refused != NULL && guard_result == PCM_X_QUEUE_BARRIER_CLOSED)
+			{
+				*barrier_refused = true;
+				cluster_pcm_x_stats_note_barrier_unwind();
+			}
 			return result;
+		}
 		cluster_pcm_x_stats_note_own_busy();
 		CHECK_FOR_INTERRUPTS();
 		(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
@@ -1586,7 +1596,9 @@ cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 	CHECK_FOR_INTERRUPTS();
 
 	own_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
-		buf, pcm_mode, base, reservation_token, &begin_covered);
+		buf, pcm_mode, base, reservation_token, &begin_covered, barrier_refused);
+	if (barrier_refused != NULL && *barrier_refused)
+		return CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED;
 	if (own_result != CLUSTER_PCM_OWN_OK)
 		cluster_pcm_own_report_bump_failure(buf, own_result, base->generation, base->flags,
 										"pending-X retry reservation");
@@ -8901,7 +8913,10 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 				 * ACTIVE_TRANSFER/PREPARE.
 				 */
 				pcm_pending_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
-					buf, pcm_mode, &pcm_pending_base, &pcm_pending_token, &pcm_covered);
+					buf, pcm_mode, &pcm_pending_base, &pcm_pending_token, &pcm_covered,
+					pcm_barrier_refused);
+				if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+					goto cluster_lockbuffer_barrier_refusal;
 				if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
 					cluster_pcm_own_report_bump_failure(
 						buf, pcm_pending_result, pcm_pending_base.generation,
@@ -9129,7 +9144,9 @@ pcm_legacy_acquire_done:
 							 */
 							pcm_pending_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
 								buf, pcm_mode, &pcm_pending_base, &pcm_pending_token,
-								&pcm_covered);
+								&pcm_covered, pcm_barrier_refused);
+							if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+								goto pcm_revalidate_acquire_done;
 							if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
 								cluster_pcm_own_report_bump_failure(
 									buf, pcm_pending_result, pcm_pending_base.generation,
@@ -9173,20 +9190,25 @@ pcm_revalidate_acquire_done:
 						if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
 						{
 							pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
-								buf, pcm_mode, NULL, &pcm_pending_base, &pcm_pending_token,
+								buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base,
+								&pcm_pending_token,
 								&pcm_acquired, &pcm_pending_set, &pcm_covered,
 								&pcm_covered_gen, &pcm_retry_wait_index);
-							if (mode == BUFFER_LOCK_SHARE)
-								LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
-							else
-								LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
-							cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer);
-							cluster_pcm_note_writer_reverify_reacquire();
+							if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+							{
+								if (mode == BUFFER_LOCK_SHARE)
+									LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+								else
+									LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+								cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer);
+								cluster_pcm_note_writer_reverify_reacquire();
+							}
 						}
 					}
 				}
 			}
-			cluster_bufmgr_pcm_x_holder_activate(pcm_x_holder);
+			if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+				cluster_bufmgr_pcm_x_holder_activate(pcm_x_holder);
 			}
 		}
 		PG_CATCH();
