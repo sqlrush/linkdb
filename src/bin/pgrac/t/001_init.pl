@@ -395,4 +395,24 @@ for my $failure (@create_failures)
 	$failure_id++;
 }
 
+# 6k. W1 owns the complete initdb handoff.  Passthrough options must not
+# replace the already-validated PGDATA, WAL thread, or registry root.
+my $managed_override_root = "$tempdir/walroot_managed_override";
+my $alternate_override_root = "$tempdir/walroot_alternate_override";
+my $alternate_override_thread = "$alternate_override_root/thread_61";
+mkdir($alternate_override_root)
+	  or die "mkdir $alternate_override_root: $!";
+mkdir($alternate_override_thread)
+	  or die "mkdir $alternate_override_thread: $!";
+command_fails(
+	[ 'pgrac-init', '-D', "$tempdir/data_override", '--node-id=60',
+		"--wal-threads-dir=$managed_override_root",
+		'--initdb-options=--waldir=' . $alternate_override_thread
+		  . ' --pgrac-wal-state-root=' . $alternate_override_root ],
+	'W1 rejects passthrough options that override its managed handoff');
+ok(!-d $managed_override_root,
+	'W1 rejects handoff overrides before touching its managed WAL root');
+ok(!-e "$alternate_override_root/pgrac_wal_state",
+	'W1 handoff override rejection creates no alternate registry');
+
 done_testing();
