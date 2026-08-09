@@ -2098,6 +2098,65 @@ UT_TEST(test_pcm_x_invalidate_busy_routes_to_exact_ticket_backoff)
 }
 
 
+UT_TEST(test_pcm_x_direct_invalidate_refusal_diagnosis_is_deterministic)
+{
+	char *source = read_gcs_block_source();
+	const char *execute
+		= source != NULL ? strstr(source, "\ngcs_block_invalidate_execute(") : NULL;
+	const char *execute_end = execute != NULL ? strstr(execute, "\n}\n") : NULL;
+	const char *queue_default
+		= execute != NULL
+			  ? strstr(execute, "PcmXQueueResult queue_result = PCM_X_QUEUE_INVALID;")
+			  : NULL;
+	const char *invalidate
+		= execute != NULL ? strstr(execute, "switch (cluster_bufmgr_invalidate_block_for_gcs(") : NULL;
+	const char *pinned
+		= invalidate != NULL ? strstr(invalidate, "case CLUSTER_BUFMGR_GCS_DROP_PINNED:") : NULL;
+	const char *stale
+		= pinned != NULL ? strstr(pinned, "case CLUSTER_BUFMGR_GCS_DROP_STALE:") : NULL;
+	const char *diagnosis
+		= stale != NULL ? strstr(stale, "PCM-X queue INVALIDATE passive-S release refused") : NULL;
+	const char *queue_detail
+		= diagnosis != NULL ? strstr(diagnosis, "(int)queue_result") : NULL;
+	const char *busy_peer
+		= queue_detail != NULL ? strstr(queue_detail, "cluster_sf_peer_supports_gcs_inval_busy(") : NULL;
+	const char *busy_counter
+		= busy_peer != NULL ? strstr(busy_peer, "invalidate_busy_sent_count") : NULL;
+	const char *busy_status
+		= busy_counter != NULL
+			  ? strstr(busy_counter, "GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY")
+			  : NULL;
+	const char *busy_ack = busy_status != NULL ? strstr(busy_status, "goto send_ack;") : NULL;
+	const char *park = busy_ack != NULL ? strstr(busy_ack, "return false;") : NULL;
+	const char *send_ack = park != NULL ? strstr(park, "\nsend_ack:") : NULL;
+
+	UT_ASSERT_NOT_NULL(execute);
+	UT_ASSERT_NOT_NULL(execute_end);
+	UT_ASSERT_NOT_NULL(queue_default);
+	UT_ASSERT_NOT_NULL(invalidate);
+	UT_ASSERT_NOT_NULL(pinned);
+	UT_ASSERT_NOT_NULL(stale);
+	UT_ASSERT_NOT_NULL(diagnosis);
+	UT_ASSERT_NOT_NULL(queue_detail);
+	UT_ASSERT_NOT_NULL(busy_peer);
+	UT_ASSERT_NOT_NULL(busy_counter);
+	UT_ASSERT_NOT_NULL(busy_status);
+	UT_ASSERT_NOT_NULL(busy_ack);
+	UT_ASSERT_NOT_NULL(park);
+	UT_ASSERT_NOT_NULL(send_ack);
+	if (execute != NULL && execute_end != NULL && queue_default != NULL && invalidate != NULL
+		&& pinned != NULL && stale != NULL && diagnosis != NULL && queue_detail != NULL
+		&& busy_peer != NULL && busy_counter != NULL && busy_status != NULL && busy_ack != NULL
+		&& park != NULL && send_ack != NULL)
+		UT_ASSERT(execute < queue_default && queue_default < invalidate && invalidate < pinned
+				  && pinned < stale && stale < diagnosis && diagnosis < queue_detail
+				  && queue_detail < busy_peer && busy_peer < busy_counter
+				  && busy_counter < busy_status && busy_status < busy_ack && busy_ack < park
+				  && park < send_ack && send_ack < execute_end);
+	free(source);
+}
+
+
 UT_TEST(test_pcm_x_local_pending_s_denial_match_is_attempt_exact)
 {
 	BufferTag slot_tag = { 0 };
@@ -5234,7 +5293,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(104);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5295,6 +5354,7 @@ main(void)
 	UT_RUN(test_pcm_x_terminal_retry_reclaims_cancel_cleanup_after_owner_death);
 	UT_RUN(test_pcm_x_invalidate_ack_matches_only_exact_unacked_holder);
 	UT_RUN(test_pcm_x_invalidate_busy_routes_to_exact_ticket_backoff);
+	UT_RUN(test_pcm_x_direct_invalidate_refusal_diagnosis_is_deterministic);
 	UT_RUN(test_pcm_x_local_pending_s_denial_match_is_attempt_exact);
 	UT_RUN(test_pcm_x_grant_pending_invalidate_wakes_local_s_before_busy);
 	UT_RUN(test_pcm_x_grant_pending_orphan_observation_is_identity_exact);
