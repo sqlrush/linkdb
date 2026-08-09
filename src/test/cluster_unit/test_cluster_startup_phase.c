@@ -61,6 +61,8 @@
 #undef strerror
 #undef strerror_r
 
+#include <setjmp.h>
+
 #include "unit_test.h"
 
 
@@ -94,21 +96,30 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
-/* ereport machinery -- never invoked by the runtime tests below. */
+/* ereport machinery; the quorum-negative test captures the expected FATAL. */
+static jmp_buf phase4_fatal_jump;
+static bool phase4_capture_fatal = false;
+static int phase4_last_elevel = 0;
+
 bool
-errstart(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart(int e, const char *d pg_attribute_unused())
 {
-	return false;
+	phase4_last_elevel = e;
+	return phase4_capture_fatal;
 }
 bool
-errstart_cold(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart_cold(int e, const char *d pg_attribute_unused())
 {
-	return false;
+	phase4_last_elevel = e;
+	return phase4_capture_fatal;
 }
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 		  const char *fn pg_attribute_unused())
-{}
+{
+	if (phase4_capture_fatal && phase4_last_elevel >= ERROR)
+		longjmp(phase4_fatal_jump, 1);
+}
 int
 errcode(int s pg_attribute_unused())
 {
@@ -571,6 +582,8 @@ UT_TEST(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready)
 
 UT_TEST(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc)
 {
+	bool caught_fatal = false;
+
 	phase4_event_count = 0;
 	phase4_events[0] = '\0';
 	phase4_test_now = 0;
@@ -584,8 +597,14 @@ UT_TEST(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc)
 	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
 	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
 
-	cluster_run_phase4_sequence();
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_phase4_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
 
+	UT_ASSERT(caught_fatal);
 	UT_ASSERT_STR_EQ(phase4_events, "DdCcQqV");
 	UT_ASSERT(phase4_quorum_check_calls > 0);
 	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_4_NORMAL);

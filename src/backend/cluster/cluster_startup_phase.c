@@ -841,7 +841,7 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	if (registry_configured && cluster_conf_node_count() > 1 && !cluster_allow_single_node
+	if (registry_configured && cluster_conf_node_count() > 1
 		&& !cluster_phase4_wait_for_quorum(phase4_deadline)) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_QUORUM_LOST;
 		fail_ctx->errmsg = "cluster phase 4: QVOTEC did not establish quorum in time";
