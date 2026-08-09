@@ -60,9 +60,7 @@
 
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
-#include "cluster/cluster_scn.h"
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22d D4-6) */
-#include "storage/buf_internals.h"		  /* BufferTag */
 
 /* Split verdict for the server-side construction (see banner). */
 typedef enum ClusterCrServerSplit {
@@ -201,6 +199,9 @@ extern void cluster_cr_server_stat_bump(ClusterCrServerStat which);
  * failure (the LMS drain converts throws into DENIED replies). */
 extern void cluster_cr_construct_page_for_server(const char *cur_page, SCN read_scn, BufferTag tag,
 												 char *dst_page, bool *out_partial);
+extern ClusterCrBuildResult cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn,
+												char dst[BLCKSZ],
+												ClusterCrBuildReason *reason_out);
 
 /* Shmem region registration (cluster_shmem.c registry). */
 extern void cluster_cr_server_shmem_register(void);

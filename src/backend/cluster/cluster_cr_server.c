@@ -69,6 +69,7 @@
 #include "cluster/cluster_lms_shard.h"	 /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
 #include "cluster/cluster_mxid_stripe.h" /* cluster_mxid_is_mine (spec-7.1 D3-b) */
 #include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_conf.h"			 /* CLUSTER_MAX_NODES (D4-6 owner range) */
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
@@ -97,6 +98,138 @@ typedef struct ClusterCrServerShared {
 	pg_atomic_uint64 lms_latch_ptr; /* (uintptr_t) Latch*; 0 = not running */
 	ClusterLmsCrSlot slots[CLUSTER_LMS_CR_SLOTS];
 } ClusterCrServerShared;
+
+const char *
+cluster_cr_build_reason_name(ClusterCrBuildReason reason)
+{
+	switch (reason) {
+		case CLUSTER_CR_BUILD_NONE:
+			return "none";
+		case CLUSTER_CR_BUILD_TARGET_DISABLED:
+			return "target_disabled";
+		case CLUSTER_CR_BUILD_RF_DEFERRED:
+			return "rf_deferred";
+		case CLUSTER_CR_BUILD_WRONG_MASTER:
+			return "wrong_master";
+		case CLUSTER_CR_BUILD_NO_HOLDER:
+			return "no_holder";
+		case CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS:
+			return "holder_ambiguous";
+		case CLUSTER_CR_BUILD_HOLDER_MOVED:
+			return "holder_moved";
+		case CLUSTER_CR_BUILD_RECOVERING:
+			return "recovering";
+		case CLUSTER_CR_BUILD_GENERATION_MISMATCH:
+			return "generation_mismatch";
+		case CLUSTER_CR_BUILD_CAPACITY:
+			return "capacity";
+		case CLUSTER_CR_BUILD_BAD_LOCATOR:
+			return "bad_locator";
+		case CLUSTER_CR_BUILD_BAD_UNDO:
+			return "bad_undo";
+		case CLUSTER_CR_BUILD_CHAIN_LIMIT:
+			return "chain_limit";
+		case CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD:
+			return "snapshot_too_old";
+		case CLUSTER_CR_BUILD_EPOCH_MISMATCH:
+			return "epoch_mismatch";
+		case CLUSTER_CR_BUILD_CANCELLED:
+			return "cancelled";
+		case CLUSTER_CR_BUILD_IO_ERROR:
+			return "io_error";
+		case CLUSTER_CR_BUILD_PROTOCOL:
+			return "protocol";
+	}
+	return "unknown";
+}
+
+ClusterCrBuildResult
+cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn, char dst[BLCKSZ],
+							ClusterCrBuildReason *reason_out)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	ClusterBufmgrGcsCopyRefusal refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
+	PGAlignedBlock current_copy;
+	XLogRecPtr page_lsn = InvalidXLogRecPtr;
+	SCN page_scn = InvalidScn;
+	bool partial = false;
+	bool constructed = false;
+
+	if (dst != NULL)
+		memset(dst, 0, BLCKSZ);
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_CR_BUILD_NONE;
+	memset(&admission, 0, sizeof(admission));
+
+	if (dst == NULL || reason_out == NULL)
+		return CLUSTER_CR_BUILD_FAIL_CLOSED;
+
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		*reason_out = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
+						  ? CLUSTER_CR_BUILD_TARGET_DISABLED
+						  : CLUSTER_CR_BUILD_RF_DEFERRED;
+		return CLUSTER_CR_BUILD_RETRYABLE;
+	}
+
+	if (tag == NULL || !SCN_VALID(read_scn)) {
+		*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
+		cluster_semantic_activation_leave(&admission);
+		return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	}
+
+	if (!cluster_bufmgr_copy_block_for_r4_cr(*tag, InvalidScn, &page_lsn, &page_scn,
+											 current_copy.data, &refusal)) {
+		cluster_semantic_activation_leave(&admission);
+		if (refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT) {
+			*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
+			return CLUSTER_CR_BUILD_FAIL_CLOSED;
+		}
+		switch (refusal) {
+			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT:
+			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID:
+			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST:
+			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND:
+			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY:
+				*reason_out = CLUSTER_CR_BUILD_HOLDER_MOVED;
+				return CLUSTER_CR_BUILD_RETRYABLE;
+			default:
+				*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
+				return CLUSTER_CR_BUILD_FAIL_CLOSED;
+		}
+	}
+
+	PG_TRY();
+	{
+		cluster_cr_construct_page_for_server(current_copy.data, read_scn, *tag, dst, &partial);
+		constructed = true;
+	}
+	PG_CATCH();
+	{
+		constructed = false;
+		FlushErrorState();
+	}
+	PG_END_TRY();
+
+	if (!cluster_semantic_activation_recheck(&admission)) {
+		memset(dst, 0, BLCKSZ);
+		*reason_out = CLUSTER_CR_BUILD_RF_DEFERRED;
+		cluster_semantic_activation_leave(&admission);
+		return CLUSTER_CR_BUILD_RETRYABLE;
+	}
+	cluster_semantic_activation_leave(&admission);
+
+	if (!constructed || partial) {
+		memset(dst, 0, BLCKSZ);
+		*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+		return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	}
+
+	*reason_out = CLUSTER_CR_BUILD_NONE;
+	return CLUSTER_CR_BUILD_FULL;
+}
 
 static ClusterCrServerShared *CrServerShared = NULL;
 

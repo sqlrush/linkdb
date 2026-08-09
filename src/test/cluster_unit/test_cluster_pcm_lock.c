@@ -48,6 +48,7 @@
 #include "cluster/cluster_cssd.h"		 /* spec-4.7a D4 — ClusterCssdPeerState for stub */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
@@ -76,8 +77,15 @@ UT_DEFINE_GLOBALS();
 int cluster_node_id = 0;
 int NBuffers = 0;
 int cluster_injection_armed_count = 0;
+static uint64 ut_lms_master_generation = (UINT64_C(1) << 32) | UINT64_C(1);
 static uint32 ut_wait_event_info_storage = 0;
 uint32 *my_wait_event_info = &ut_wait_event_info_storage;
+
+uint64
+cluster_lms_get_shard_master_generation(void)
+{
+	return ut_lms_master_generation;
+}
 
 #define FAKE_PCM_MAX_ENTRIES 8
 #define FAKE_PCM_ENTRY_BYTES 1024
@@ -1885,6 +1893,29 @@ UT_TEST(test_pcm_authority_snapshot_is_one_entry_lock_view)
 	UT_ASSERT(snapshot.transition_count > 0);
 }
 
+UT_TEST(test_pcm_r4_route_snapshot_co_samples_master_generation_and_watermark)
+{
+	BufferTag tag = make_tag(98);
+	PcmAuthoritySnapshot snapshot;
+	uint64 master_generation = 0;
+	SCN expected_page_scn = InvalidScn;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	ut_lms_master_generation = (UINT64_C(23) << 32) | UINT64_C(7);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)0x6600,
+										 CLUSTER_PCM_WM_SRC_REDECLARE, 1, 88, 23);
+
+	UT_ASSERT(cluster_pcm_lock_r4_route_snapshot(tag, &snapshot, &master_generation,
+											 &expected_page_scn));
+	UT_ASSERT_EQ((int)snapshot.state, (int)PCM_STATE_S);
+	UT_ASSERT_EQ(snapshot.master_holder.node_id, (uint32)1);
+	UT_ASSERT(snapshot.transition_count > 0);
+	UT_ASSERT_EQ(master_generation, (UINT64_C(23) << 32) | UINT64_C(7));
+	UT_ASSERT_EQ((uint64)expected_page_scn, UINT64_C(0x6600));
+}
+
 UT_TEST(test_pcm_queue_pending_x_reservation_never_overwrites_another_node)
 {
 	BufferTag tag = make_tag(101);
@@ -2421,7 +2452,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(61);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -2471,6 +2502,7 @@ main(void)
 	UT_RUN(test_pcm_x_transfer_commit_is_exact_and_late_reply_safe);
 	UT_RUN(test_pcm_dead_node_cleanup_drops_holder_records);
 	UT_RUN(test_pcm_authority_snapshot_is_one_entry_lock_view);
+	UT_RUN(test_pcm_r4_route_snapshot_co_samples_master_generation_and_watermark);
 	UT_RUN(test_pcm_queue_pending_x_reservation_never_overwrites_another_node);
 	UT_RUN(test_pcm_pending_x_blocks_new_remote_s_holder_atomically);
 	UT_RUN(test_pcm_pending_x_blocks_new_local_s_holder_until_clear);

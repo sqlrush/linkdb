@@ -44,6 +44,7 @@
 #include "cluster/cluster_buffer_desc.h"
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/backendid.h" /* spec-6.14 D9 amend — MyBackendId stub */
@@ -72,6 +73,12 @@ int cluster_node_id = 0;
 int NBuffers = 0;
 int cluster_injection_armed_count = 0;
 bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
+
+uint64
+cluster_lms_get_shard_master_generation(void)
+{
+	return (UINT64_C(1) << 32) | UINT64_C(1);
+}
 
 /* spec-4.7a D2 — the bufmgr PCM hook reads this GUC to decide hold-until-revoked
  * (preserve buf->pcm_state on content-lock unlock).  Stubbed ON (production

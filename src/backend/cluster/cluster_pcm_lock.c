@@ -42,6 +42,7 @@
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-2.33 D7 — send_block_request_and_wait */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_cssd.h" /* PGRAC: spec-4.7a D4 — peer liveness for other-holder check */
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
@@ -604,6 +605,56 @@ cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out)
 	if (found && entry != NULL) {
 		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 		pcm_authority_snapshot_locked(entry, out);
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+
+	return found && entry != NULL;
+}
+
+/*
+ * Return the complete R4 master-route proof in one resource-entry lock
+ * window.  The three outputs deliberately remain different authority
+ * domains: the LMS/formation generation is a master routing fence, the
+ * authority snapshot contains this resource's transition count, and the
+ * watermark is the minimum current-page SCN.  No holder-local buffer
+ * generation is manufactured here.
+ *
+ * A found but unusable entry is still returned verbatim.  The route owner,
+ * not this read-only accessor, maps N/recovering/malformed holder shapes to
+ * the closed ClusterCrBuildReason domain.
+ */
+bool
+cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *authority_out,
+								   uint64 *master_authority_generation_out,
+								   SCN *expected_page_scn_out)
+{
+	struct GrdEntry *entry;
+	bool found;
+
+	if (authority_out != NULL) {
+		memset(authority_out, 0, sizeof(*authority_out));
+		authority_out->state = PCM_STATE_N;
+		authority_out->x_holder_node = -1;
+		authority_out->pending_x_requester_node = -1;
+		authority_out->master_holder.node_id = INVALID_PCM_MASTER_HOLDER_NODE;
+	}
+	if (master_authority_generation_out != NULL)
+		*master_authority_generation_out = 0;
+	if (expected_page_scn_out != NULL)
+		*expected_page_scn_out = InvalidScn;
+
+	if (authority_out == NULL || master_authority_generation_out == NULL
+		|| expected_page_scn_out == NULL || ClusterPcm == NULL || cluster_pcm_htab == NULL)
+		return false;
+
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (found && entry != NULL) {
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		pcm_authority_snapshot_locked(entry, authority_out);
+		*master_authority_generation_out = cluster_lms_get_shard_master_generation();
+		*expected_page_scn_out = entry->pi_watermark_scn;
 		LWLockRelease(&entry->entry_lock.lock);
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);

@@ -439,6 +439,9 @@ extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, b
  */
 extern PcmLockMode cluster_pcm_lock_query(BufferTag tag);
 extern bool cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out);
+extern bool cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *authority_out,
+										uint64 *master_authority_generation_out,
+										SCN *expected_page_scn_out);
 extern bool cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected);
 extern PcmXGrdHandoffResult
 cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token);

@@ -2324,6 +2324,217 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
 	return (SCN)v;
 }
 
+/* Stage 8 R4 keeps the legacy 64-byte prefixes and appends these exact
+ * byte-array extensions.  Multibyte fields are encoded explicitly little
+ * endian; no packed/native cast is a wire authority. */
+#define CLUSTER_R4_WIRE_VERSION ((uint8)1)
+#define CLUSTER_R4_FORWARD_EXTENDED ((uint8)6)
+
+typedef enum ClusterCrBuildResult {
+	CLUSTER_CR_BUILD_FULL = 0,
+	CLUSTER_CR_BUILD_RETRYABLE = 1,
+	CLUSTER_CR_BUILD_FAIL_CLOSED = 2
+} ClusterCrBuildResult;
+
+typedef enum ClusterCrBuildReason {
+	CLUSTER_CR_BUILD_NONE = 0,
+	CLUSTER_CR_BUILD_TARGET_DISABLED = 1,
+	CLUSTER_CR_BUILD_RF_DEFERRED = 2,
+	CLUSTER_CR_BUILD_WRONG_MASTER = 3,
+	CLUSTER_CR_BUILD_NO_HOLDER = 4,
+	CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS = 5,
+	CLUSTER_CR_BUILD_HOLDER_MOVED = 6,
+	CLUSTER_CR_BUILD_RECOVERING = 7,
+	CLUSTER_CR_BUILD_GENERATION_MISMATCH = 8,
+	CLUSTER_CR_BUILD_CAPACITY = 9,
+	CLUSTER_CR_BUILD_BAD_LOCATOR = 10,
+	CLUSTER_CR_BUILD_BAD_UNDO = 11,
+	CLUSTER_CR_BUILD_CHAIN_LIMIT = 12,
+	CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD = 13,
+	CLUSTER_CR_BUILD_EPOCH_MISMATCH = 14,
+	CLUSTER_CR_BUILD_CANCELLED = 15,
+	CLUSTER_CR_BUILD_IO_ERROR = 16,
+	CLUSTER_CR_BUILD_PROTOCOL = 17
+} ClusterCrBuildReason;
+
+typedef struct ClusterR4CrRouteProof {
+	BufferTag tag;
+	SCN read_scn;
+	uint64 formation_epoch;
+	uint64 activation_generation;
+	uint64 master_authority_generation;
+	uint64 master_resource_transition_count;
+	SCN expected_page_scn;
+	int32 real_master_node;
+	int32 selected_holder_node;
+} ClusterR4CrRouteProof;
+
+extern const char *cluster_cr_build_reason_name(ClusterCrBuildReason reason);
+extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(
+	const BufferTag *tag, SCN read_scn, uint64 request_id, int32 requester_backend_id,
+	ClusterR4CrRouteProof *out, ClusterCrBuildReason *reason_out);
+
+typedef enum ClusterR4WireKind {
+	CLUSTER_R4_WIRE_CR_BUILD = 1,
+	CLUSTER_R4_WIRE_TX_RESOLVE = 2,
+	CLUSTER_R4_WIRE_MULTI_RESOLVE = 3,
+	CLUSTER_R4_WIRE_UNDO_DATA_FETCH = 4
+} ClusterR4WireKind;
+
+typedef struct ClusterR4RequestExtension {
+	uint8 r4_version;
+	uint8 r4_kind;
+	uint8 flags_le[2];
+	uint8 read_scn_le[8];
+	uint8 reserved[4];
+} ClusterR4RequestExtension;
+
+typedef union ClusterR4ForwardKindUnion {
+	uint8 locator_bytes[24];
+	struct {
+		uint8 master_authority_generation_le[8];
+		uint8 master_resource_transition_count_le[8];
+		uint8 expected_page_scn_le[8];
+	} cr;
+} ClusterR4ForwardKindUnion;
+
+typedef struct ClusterR4ForwardExtension {
+	uint8 r4_version;
+	uint8 r4_kind;
+	uint8 flags_le[2];
+	ClusterR4ForwardKindUnion kind;
+	uint8 subject_id_le[4];
+} ClusterR4ForwardExtension;
+
+StaticAssertDecl(sizeof(ClusterR4RequestExtension) == 16,
+				 "R4 request extension must remain 16 bytes");
+StaticAssertDecl(sizeof(ClusterR4ForwardKindUnion) == 24,
+				 "R4 forward kind union must remain 24 bytes");
+StaticAssertDecl(sizeof(ClusterR4ForwardExtension) == 32,
+				 "R4 forward extension must remain 32 bytes");
+StaticAssertDecl(offsetof(ClusterR4ForwardExtension,
+						 kind.cr.master_resource_transition_count_le)
+					 == 12,
+				 "R4 FORWARD96 transition count must occupy absolute bytes 76..83");
+
+static inline void
+ClusterR4WireWriteU64(uint8 out[8], uint64 value)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		out[i] = (uint8)(value >> (i * 8));
+}
+
+static inline uint64
+ClusterR4WireReadU64(const uint8 in[8])
+{
+	uint64 value = 0;
+	int i;
+
+	for (i = 0; i < 8; i++)
+		value |= (uint64)in[i] << (i * 8);
+	return value;
+}
+
+static inline bool
+ClusterR4RequestExtensionSetCr(ClusterR4RequestExtension *extension, SCN read_scn)
+{
+	if (extension == NULL)
+		return false;
+	memset(extension, 0, sizeof(*extension));
+	if (!SCN_VALID(read_scn))
+		return false;
+	extension->r4_version = CLUSTER_R4_WIRE_VERSION;
+	extension->r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+	ClusterR4WireWriteU64(extension->read_scn_le, (uint64)read_scn);
+	return true;
+}
+
+static inline bool
+ClusterR4RequestExtensionGetCr(const ClusterR4RequestExtension *extension, SCN *read_scn_out)
+{
+	static const uint8 zero_flags[2] = { 0, 0 };
+	static const uint8 zero_reserved[4] = { 0, 0, 0, 0 };
+	SCN read_scn;
+
+	if (read_scn_out != NULL)
+		*read_scn_out = InvalidScn;
+	if (extension == NULL || read_scn_out == NULL
+		|| extension->r4_version != CLUSTER_R4_WIRE_VERSION
+		|| extension->r4_kind != CLUSTER_R4_WIRE_CR_BUILD
+		|| memcmp(extension->flags_le, zero_flags, sizeof(zero_flags)) != 0
+		|| memcmp(extension->reserved, zero_reserved, sizeof(zero_reserved)) != 0)
+		return false;
+
+	read_scn = (SCN)ClusterR4WireReadU64(extension->read_scn_le);
+	if (!SCN_VALID(read_scn))
+		return false;
+	*read_scn_out = read_scn;
+	return true;
+}
+
+static inline void
+ClusterR4ForwardExtensionSetCrProof(ClusterR4ForwardExtension *extension,
+									uint64 master_authority_generation,
+									uint64 master_resource_transition_count,
+									SCN expected_page_scn)
+{
+	if (extension == NULL)
+		return;
+	memset(extension, 0, sizeof(*extension));
+	extension->r4_version = CLUSTER_R4_WIRE_VERSION;
+	extension->r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+	ClusterR4WireWriteU64(extension->kind.cr.master_authority_generation_le,
+						  master_authority_generation);
+	ClusterR4WireWriteU64(extension->kind.cr.master_resource_transition_count_le,
+						  master_resource_transition_count);
+	ClusterR4WireWriteU64(extension->kind.cr.expected_page_scn_le,
+						  (uint64)expected_page_scn);
+}
+
+static inline bool
+ClusterR4ForwardExtensionGetCrProof(const ClusterR4ForwardExtension *extension,
+									uint64 formation_epoch,
+									uint64 *master_authority_generation_out,
+									uint64 *master_resource_transition_count_out,
+									SCN *expected_page_scn_out)
+{
+	static const uint8 zero_flags[2] = { 0, 0 };
+	static const uint8 zero_subject[4] = { 0, 0, 0, 0 };
+	uint64 master_generation;
+	uint64 transition_count;
+
+	if (master_authority_generation_out != NULL)
+		*master_authority_generation_out = 0;
+	if (master_resource_transition_count_out != NULL)
+		*master_resource_transition_count_out = 0;
+	if (expected_page_scn_out != NULL)
+		*expected_page_scn_out = InvalidScn;
+	if (extension == NULL || master_authority_generation_out == NULL
+		|| master_resource_transition_count_out == NULL || expected_page_scn_out == NULL
+		|| extension->r4_version != CLUSTER_R4_WIRE_VERSION
+		|| extension->r4_kind != CLUSTER_R4_WIRE_CR_BUILD
+		|| memcmp(extension->flags_le, zero_flags, sizeof(zero_flags)) != 0
+		|| memcmp(extension->subject_id_le, zero_subject, sizeof(zero_subject)) != 0)
+		return false;
+
+	master_generation
+		= ClusterR4WireReadU64(extension->kind.cr.master_authority_generation_le);
+	transition_count
+		= ClusterR4WireReadU64(extension->kind.cr.master_resource_transition_count_le);
+	if ((uint32)master_generation == 0
+		|| (uint32)(master_generation >> 32) != (uint32)formation_epoch
+		|| transition_count == 0 || transition_count == UINT64_MAX)
+		return false;
+
+	*master_authority_generation_out = master_generation;
+	*master_resource_transition_count_out = transition_count;
+	*expected_page_scn_out
+		= (SCN)ClusterR4WireReadU64(extension->kind.cr.expected_page_scn_le);
+	return true;
+}
+
 /* PGRAC: spec-2.41 D1 — pure lost-write verdict (the detector's SCN decision).
  *
  *	Compares a master's expected pi_watermark_scn(tag) against a shipped page's
@@ -3159,7 +3370,11 @@ GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
 
 extern const char *cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-											  ClusterBufmgrGcsCopyRefusal *out_refusal);
+										  ClusterBufmgrGcsCopyRefusal *out_refusal);
+extern bool cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
+										XLogRecPtr *page_lsn_out, SCN *page_scn_out,
+										char *dst,
+										ClusterBufmgrGcsCopyRefusal *refusal_out);
 extern bool cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
 														 void **out_page_addr,
 														 BufferDesc **out_buf);

@@ -10322,6 +10322,151 @@ cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal)
 }
 
 /*
+ * Stage 8 R4 D4: copy a resident S/X current image without storage fetch,
+ * WAL/storage flush, ownership mutation or an exported local generation.
+ */
+bool
+cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
+									XLogRecPtr *page_lsn_out, SCN *page_scn_out, char *dst,
+									ClusterBufmgrGcsCopyRefusal *refusal_out)
+{
+	ClusterPcmOwnSnapshot sample_a;
+	ClusterPcmOwnSnapshot sample_b;
+	uint32 hashcode;
+	LWLock *partition_lock;
+	LWLock *content_lock;
+	BufferDesc *buf;
+	Page page;
+	XLogRecPtr page_lsn_a = InvalidXLogRecPtr;
+	XLogRecPtr page_lsn_b = InvalidXLogRecPtr;
+	SCN page_scn_a = InvalidScn;
+	SCN page_scn_b = InvalidScn;
+	uint32 buf_state;
+	int buf_id;
+	bool valid_a = false;
+	bool valid_b = false;
+	bool stable = false;
+	volatile bool content_locked = false;
+	volatile bool caller_pinned = false;
+
+	if (page_lsn_out != NULL)
+		*page_lsn_out = InvalidXLogRecPtr;
+	if (page_scn_out != NULL)
+		*page_scn_out = InvalidScn;
+	if (refusal_out != NULL)
+		*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
+	if (dst != NULL)
+		memset(dst, 0, BLCKSZ);
+
+	if (page_lsn_out == NULL || page_scn_out == NULL || dst == NULL || refusal_out == NULL) {
+		if (refusal_out != NULL)
+			*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT;
+		return false;
+	}
+	if (ClusterPcmOwnArray == NULL) {
+		*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
+		return false;
+	}
+
+	hashcode = BufTableHashCode(&tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&tag, hashcode);
+	if (buf_id < 0) {
+		LWLockRelease(partition_lock);
+		*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT;
+		return false;
+	}
+
+	buf = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, &tag)) {
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT;
+		return false;
+	}
+	if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state)) {
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID;
+		return false;
+	}
+	cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+	caller_pinned = true;
+	LWLockRelease(partition_lock);
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+		cluster_bufmgr_unpin_for_gcs(buf);
+		*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST;
+		return false;
+	}
+	content_locked = true;
+	page = (Page)BufHdrGetBlock(buf);
+
+	PG_TRY();
+	{
+		buf_state = LockBufHdr(buf);
+		cluster_pcm_own_snapshot_locked(buf, &sample_a);
+		valid_a = BufferTagsEqual(&buf->tag, &tag)
+				  && cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
+				  && (sample_a.pcm_state == (uint8)PCM_STATE_S
+					  || sample_a.pcm_state == (uint8)PCM_STATE_X)
+				  && sample_a.flags == 0 && sample_a.writer_activation_token == 0;
+		if (valid_a) {
+			page_lsn_a = PageGetLSN(page);
+			page_scn_a = ((PageHeader)page)->pd_block_scn;
+			valid_a = !SCN_VALID(expected_page_scn)
+					  || (SCN_VALID(page_scn_a)
+						  && scn_local(page_scn_a) >= scn_local(expected_page_scn));
+		}
+		UnlockBufHdr(buf, buf_state);
+
+		if (valid_a)
+			memcpy(dst, page, BLCKSZ);
+
+		buf_state = LockBufHdr(buf);
+		cluster_pcm_own_snapshot_locked(buf, &sample_b);
+		valid_b = BufferTagsEqual(&buf->tag, &tag)
+				  && cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
+				  && sample_b.flags == 0 && sample_b.writer_activation_token == 0;
+		if (valid_b) {
+			page_lsn_b = PageGetLSN(page);
+			page_scn_b = ((PageHeader)page)->pd_block_scn;
+		}
+		UnlockBufHdr(buf, buf_state);
+
+		stable = valid_a && valid_b && memcmp(&sample_a, &sample_b, sizeof(sample_a)) == 0
+				 && page_lsn_a == page_lsn_b && page_scn_a == page_scn_b;
+		LWLockRelease(content_lock);
+		content_locked = false;
+	}
+	PG_CATCH();
+	{
+		if (content_locked && LWLockHeldByMe(content_lock))
+			LWLockRelease(content_lock);
+		if (caller_pinned)
+			cluster_bufmgr_unpin_for_gcs(buf);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (caller_pinned)
+		cluster_bufmgr_unpin_for_gcs(buf);
+	if (!stable) {
+		memset(dst, 0, BLCKSZ);
+		*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY;
+		return false;
+	}
+
+	*page_lsn_out = page_lsn_b;
+	*page_scn_out = page_scn_b;
+	*refusal_out = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
+	return true;
+}
+
+/*
  * Copy the 8KB block bytes for `tag` into *dst, flushing WAL up to the
  * page's LSN before reading the bytes (HC82 I-WAL-before-ship), then making
  * any dirty source current in shared storage before it may be retired.  Sets

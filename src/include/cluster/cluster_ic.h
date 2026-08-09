@@ -381,6 +381,12 @@ typedef enum ClusterICPlane {
 /* P0-20: this binary accepts the 104-byte PCM-X REVOKE V2 frame and binds its
  * trailing required_page_scn to the immutable source-image lifecycle. */
 #define PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 ((uint32)0x00000800U)
+/* Stage 8 R4: this peer implements the shared two-stage semantic-admission
+ * framework and the exact request80/FORWARD96 synchronous-CR extension.
+ * Presence is binary capability only; target traffic additionally requires
+ * the same committed OPEN generation on every admitted peer. */
+#define PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 ((uint32)0x00001000U)
+#define PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1 ((uint32)0x00002000U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).
