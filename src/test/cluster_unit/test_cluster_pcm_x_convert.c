@@ -3247,6 +3247,53 @@ UT_TEST(test_local_holder_stale_handle_cannot_unregister_reused_slot)
 	UT_ASSERT_EQ(release_active_local_holder(&second), PCM_X_QUEUE_OK);
 }
 
+UT_TEST(test_local_holder_generation_successor_and_overflow_are_prepublication_exact)
+{
+	PcmXShmemHeader *header;
+	PcmXLocalHolderKey first_key;
+	PcmXLocalHolderKey second_key;
+	PcmXLocalHolderHandle first;
+	PcmXLocalHolderHandle second;
+	PcmXLocalTagSlot *tag_slot;
+	Size holder_used;
+	Size holder_entries;
+	Size holder_head;
+
+	/* A successful publication advances the exact old token and never
+	 * publishes the reserved zero value. */
+	init_active_pcm_x(UINT64_C(72021));
+	header = ClusterPcmXConvertShmem;
+	first_key = make_local_holder_key(7591, 0, 13, UINT64_C(72011), 4);
+	second_key = make_local_holder_key(7591, 0, 14, UINT64_C(72012), 5);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_register(&first_key, &first), PCM_X_QUEUE_OK);
+	tag_slot = &local_tag_slots(header)[first.tag_slot.slot_index];
+	tag_slot->holder_set_generation = UINT64_C(41);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_register(&second_key, &second), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(tag_slot->holder_set_generation, UINT64_C(42));
+	UT_ASSERT(tag_slot->holder_set_generation != 0);
+	UT_ASSERT_EQ(tag_slot->active_holder_head_index, second.holder_slot.slot_index);
+
+	/* Exhaustion is decided before reserving or publishing the prospective
+	 * holder.  The retained gate is fail-closed evidence, not publication. */
+	init_active_pcm_x(UINT64_C(72022));
+	header = ClusterPcmXConvertShmem;
+	first_key = make_local_holder_key(7592, 0, 15, UINT64_C(72013), 4);
+	second_key = make_local_holder_key(7592, 0, 16, UINT64_C(72014), 5);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_register(&first_key, &first), PCM_X_QUEUE_OK);
+	tag_slot = &local_tag_slots(header)[first.tag_slot.slot_index];
+	tag_slot->holder_set_generation = UINT64_MAX;
+	holder_used = header->allocator[PCM_X_ALLOC_LOCAL_HOLDER].used;
+	holder_entries = directory_occupied_count(header, PCM_X_DIR_LOCAL_HOLDER);
+	holder_head = tag_slot->active_holder_head_index;
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_register(&second_key, &second), PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT_EQ(tag_slot->holder_set_generation, UINT64_MAX);
+	UT_ASSERT_EQ(tag_slot->active_holder_head_index, holder_head);
+	UT_ASSERT_EQ(header->allocator[PCM_X_ALLOC_LOCAL_HOLDER].used, holder_used);
+	UT_ASSERT_EQ(directory_occupied_count(header, PCM_X_DIR_LOCAL_HOLDER), holder_entries);
+	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_ADMISSION_GATE) != 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
 UT_TEST(test_local_holder_capacity_failure_rolls_back_holder_only_tag)
 {
 	PcmXShmemHeader *header;
@@ -12967,6 +13014,51 @@ UT_TEST(test_local_cross_lock_gate_precedes_retire_claim)
 	UT_ASSERT_EQ(header->peer_frontiers[1].local_retire_in_progress_ticket_id, 0);
 }
 
+UT_TEST(test_local_retire_round_gate_release_paths_are_claim_exact)
+{
+	PcmXLocalCutoff cutoff;
+	PcmXLocalCutoff stale_cutoff;
+	PcmXLocalHandle late;
+	PcmXLocalHandle next_leader;
+	PcmXLocalTagSlot *tag_slot;
+	uint32 state_flags;
+
+	/* Contention before this caller claims the tag must not release somebody
+	 * else's gate. */
+	tag_slot = prepare_retire_ready_round_with_holder(UINT64_C(18131), 71131, &cutoff, &late);
+	state_flags = pg_atomic_read_u32(&tag_slot->slot.state_flags);
+	pg_atomic_write_u32(&tag_slot->slot.state_flags,
+						state_flags | (PCM_X_LOCAL_TAG_F_ADMISSION_GATE << PCM_X_SLOT_FLAGS_SHIFT));
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_round_exact(
+					 &late.identity.tag, late.identity.cluster_epoch, &cutoff, &next_leader),
+				 PCM_X_QUEUE_BUSY);
+	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_ADMISSION_GATE) != 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	/* A claimed, retryable post-claim refusal releases exactly once.  A second
+	 * release would fail and promote STALE to CORRUPT, so STALE plus a clear
+	 * gate proves the exact-once boundary. */
+	tag_slot = prepare_retire_ready_round_with_holder(UINT64_C(18132), 71132, &cutoff, &late);
+	stale_cutoff = cutoff;
+	stale_cutoff.cutoff_sequence++;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_round_exact(
+					 &late.identity.tag, late.identity.cluster_epoch, &stale_cutoff, &next_leader),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_ADMISSION_GATE, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	/* Corruption after claim retains the gate as recovery evidence and closes
+	 * the runtime rather than reopening admission. */
+	tag_slot = prepare_retire_ready_round_with_holder(UINT64_C(18133), 71133, &cutoff, &late);
+	UT_ASSERT_EQ(tag_slot->active_writer_index, PCM_X_INVALID_SLOT_INDEX);
+	tag_slot->active_writer_slot_generation = UINT64_C(99);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_round_exact(
+					 &late.identity.tag, late.identity.cluster_epoch, &cutoff, &next_leader),
+				 PCM_X_QUEUE_CORRUPT);
+	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_ADMISSION_GATE) != 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
 UT_TEST(test_local_new_transfer_abort_keeps_gate_until_allocator_cleanup)
 {
 	PcmXShmemHeader *header;
@@ -16689,7 +16781,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(276);
+	UT_PLAN(278);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16727,6 +16819,7 @@ main(void)
 	UT_RUN(test_local_holder_directory_keeps_backend_identities_independent);
 	UT_RUN(test_local_holder_registry_returns_canonical_exact_snapshot);
 	UT_RUN(test_local_holder_stale_handle_cannot_unregister_reused_slot);
+	UT_RUN(test_local_holder_generation_successor_and_overflow_are_prepublication_exact);
 	UT_RUN(test_local_holder_capacity_failure_rolls_back_holder_only_tag);
 	UT_RUN(test_local_holder_snapshot_corruption_fails_closed_before_copy);
 	UT_RUN(test_local_holder_unregister_validates_before_unlinking_corrupt_tag);
@@ -16899,6 +16992,7 @@ main(void)
 	UT_RUN(test_local_retire_global_gate_rejects_orphan_and_mismatched_evidence);
 	UT_RUN(test_local_retire_marker_blocks_cross_lock_tag_handoffs);
 	UT_RUN(test_local_cross_lock_gate_precedes_retire_claim);
+	UT_RUN(test_local_retire_round_gate_release_paths_are_claim_exact);
 	UT_RUN(test_local_new_transfer_abort_keeps_gate_until_allocator_cleanup);
 	UT_RUN(test_local_retire_requires_exact_holder_and_blocker_evidence);
 	UT_RUN(test_local_blocker_allocator_corruption_retains_new_tag_gate_evidence);

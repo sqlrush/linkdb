@@ -855,14 +855,14 @@ cluster_backup_recovery_apply_target(void)
 		if (ArchiveRecoveryRequested && cluster_backup_recovery_have_manifest &&
 			cluster_backup_recovery_manifest.thread_count > 1)
 		{
-			ClusterRestorePoint selected_point;
+			ClusterRestorePoint manifest_point;
 			SCN			requested_scn = cluster_backup_recovery_manifest.scn_durable_peak;
 
-			if (!cluster_backup_recovery_select_scn(requested_scn, &selected_point))
+			if (!cluster_backup_recovery_select_scn(requested_scn, &manifest_point))
 				ereport(FATAL, (errcode(ERRCODE_CLUSTER_BACKUP_INCOMPLETE),
 								errmsg("cluster backup restore has no consistent multi-thread "
 									   "restore point")));
-			cluster_backup_recovery_target_point = selected_point;
+			cluster_backup_recovery_target_point = manifest_point;
 			cluster_backup_recovery_prepare_merge(&cluster_backup_recovery_target_point);
 		}
 		return;

@@ -524,7 +524,7 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_sl
 	uint8 i;
 	int free_idx;
 	int reusable_idx;
-	ClusterXpScope xps;
+	ClusterXpScope xps = { .active = false };
 
 	/* PGRAC: spec-5.59 D7 profiling */
 	cluster_xp_begin(&xps, CLXP_LOCAL_UNDO_ITL_WAL);
@@ -864,7 +864,7 @@ cluster_itl_stamp_active(Buffer buf, uint8 slot_idx, TransactionId xid, SCN writ
 {
 	Page page;
 	ClusterItlSlotData *slot;
-	ClusterXpScope xps;
+	ClusterXpScope xps = { .active = false };
 
 	/* PGRAC: spec-5.59 D7 profiling (probe is critical-section safe) */
 	cluster_xp_begin(&xps, CLXP_LOCAL_UNDO_ITL_WAL);

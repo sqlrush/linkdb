@@ -2447,6 +2447,38 @@ UT_TEST(test_convert_u6_self_exclusion)
 	convert_teardown();
 }
 
+/* U6b — PG permits one backend to hold several additive modes on one
+ * relation.  A convert must self-exclude every holder owned by that backend,
+ * not only the precise old-mode slot selected by the REDECLARE locator. */
+UT_TEST(test_convert_u6_multiple_self_holders_excluded)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId converted;
+	bool drain = false;
+
+	convert_reset();
+	e = convert_make_entry(2016);
+	convert_grant(e, 1, 100, 11, ShareLock);       /* precise convert source */
+	convert_grant(e, 1, 100, 12, AccessShareLock); /* additive self holder */
+
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 2);
+
+	/* The precise Share slot was upgraded/rebound; the additive self slot stays. */
+	memset(&converted, 0, sizeof(converted));
+	converted.node_id = 1;
+	converted.procno = 100;
+	converted.request_id = 77;
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &converted),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1);
+	convert_teardown();
+}
+
 /* U7 — anti-starvation: with a pending convert, a new request that
  * conflicts with the convert's target mode must be blocked (must wait);
  * one compatible with the target is not blocked. */
@@ -2478,7 +2510,7 @@ UT_TEST(test_convert_u8_drain_converts_before_waiters)
 {
 	ClusterGrdEntry *e;
 	ClusterGrdConvert req;
-	ClusterGrdHolderId h2, w3;
+	ClusterGrdHolderId converted, h2, self_additive, w3;
 	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
 	bool drain = false;
 	int n;
@@ -2518,6 +2550,55 @@ UT_TEST(test_convert_u8_drain_converts_before_waiters)
 	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
 	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
 	UT_ASSERT_EQ((int)m, (int)ExclusiveLock); /* converted in place */
+	convert_teardown();
+
+	/* A queued convert must self-exclude every additive holder of its own
+	 * backend when the remote blocker leaves, not only its precise old-mode
+	 * slot.  This specifically exercises the queued drain predicate. */
+	convert_reset();
+	e = convert_make_entry(2017);
+	convert_grant(e, 1, 100, 11, ShareLock);       /* precise convert source */
+	convert_grant(e, 1, 100, 12, AccessShareLock); /* additive self holder */
+	convert_grant(e, 2, 200, 22, ShareLock);       /* real remote blocker */
+
+	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 79);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 1);
+
+	memset(&h2, 0, sizeof(h2));
+	h2.node_id = 2;
+	h2.procno = 200;
+	h2.request_id = 22;
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &h2), (int)CLUSTER_GRD_ENTRY_OK);
+
+	n = cluster_grd_entry_drain_converts_then_waiters(e, granted, lengthof(granted));
+	UT_ASSERT_EQ(n, 1);
+	UT_ASSERT_EQ((int)granted[0].request_opcode, UT_GES_OPCODE_CONVERT);
+	UT_ASSERT_EQ((int)granted[0].holder.request_id, 79); /* rebound to R_new */
+	UT_ASSERT_EQ((int)granted[0].mode, (int)AccessExclusiveLock);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 2);
+
+	/* Remove the converted slot by R_new.  The sole remaining holder must be
+	 * the untouched additive AccessShare slot with its original request id. */
+	memset(&converted, 0, sizeof(converted));
+	converted.node_id = 1;
+	converted.procno = 100;
+	converted.request_id = 79;
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &converted),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
+	UT_ASSERT_EQ((int)m, (int)AccessShareLock);
+
+	memset(&self_additive, 0, sizeof(self_additive));
+	self_additive.node_id = 1;
+	self_additive.procno = 100;
+	self_additive.request_id = 12;
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &self_additive),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 0);
 	convert_teardown();
 }
 
@@ -4523,7 +4604,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * +1 (U17 cross-episode fence Hardening);
 	 * spec-4.6a r3-P2-2:+2 (same-epoch dead-set growth re-stamp + no-churn);
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage). */
-	UT_PLAN(84);
+	UT_PLAN(87);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -4570,6 +4651,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_convert_u4_upgrade_inplace_or_enqueue);
 	UT_RUN(test_convert_u5_lateral_and_no_holder_illegal);
 	UT_RUN(test_convert_u6_self_exclusion);
+	UT_RUN(test_convert_u6_multiple_self_holders_excluded);
 	UT_RUN(test_convert_u7_new_request_blocked_by_pending_convert);
 	UT_RUN(test_convert_u8_drain_converts_before_waiters);
 	UT_RUN(test_convert_u9_queue_full_fail_closed);

@@ -3937,8 +3937,13 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	{
 		if (vm_barrier_retries >= CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES)
 			LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
-		else if (!ClusterLockBufferExclusiveBarrierAware(vmbuffer))
+		else if (!ClusterLockBufferExclusiveBarrierAware(
+					 vmbuffer, CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM))
 		{
+			RelFileLocator refused_rlocator;
+			ForkNumber	refused_forknum;
+			BlockNumber refused_blocknum;
+
 			/*
 			 * PGRAC: vm barrier unwind (delete requalify) — this backend
 			 * holds the heap page whose tag sits under a frozen revoke
@@ -3949,6 +3954,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			 * any pre-crit ERROR.  The entry cid is restored (no
 			 * combo-of-combo) and the abandoned replica-identity copy freed.
 			 */
+			BufferGetTag(vmbuffer, &refused_rlocator, &refused_forknum,
+						 &refused_blocknum);
 			vm_barrier_retries++;
 			cid = pgrac_entry_cid;
 			iscombo = false;
@@ -3959,10 +3966,22 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				old_key_copied = false;
 			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			ClusterObserveBufferBarrierReceipt(
+				CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM,
+				CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST,
+				refused_rlocator, refused_forknum, refused_blocknum,
+				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
+				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 			cluster_heap_vm_barrier_warm(vmbuffer);
 			ReleaseBuffer(vmbuffer);
 			vmbuffer = InvalidBuffer;
 			cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+			ClusterObserveBufferBarrierReceipt(
+				CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM,
+				CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
+				refused_rlocator, refused_forknum, refused_blocknum,
+				CLUSTER_BUFFER_BARRIER_OUTCOME_REQUALIFIED,
+				CLUSTER_BUFFER_BARRIER_PROOF_REENTRY);
 			goto l1;
 		}
 		vm_locked = true;
@@ -4937,8 +4956,14 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		{
 			if (vm_barrier_retries >= CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES)
 				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
-			else if (!ClusterLockBufferExclusiveBarrierAware(vmbuffer))
+			else if (!ClusterLockBufferExclusiveBarrierAware(
+						 vmbuffer,
+						 CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM))
 			{
+				RelFileLocator refused_rlocator;
+				ForkNumber	refused_forknum;
+				BlockNumber refused_blocknum;
+
 				/*
 				 * PGRAC: vm barrier unwind (update pre-toast) — the old
 				 * tuple carries no temporary lock yet and nothing
@@ -4947,14 +4972,28 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 				 * cid: a pass-1 combo cmax must not feed requalification or
 				 * be recombined into a combo-of-combo.
 				 */
+				BufferGetTag(vmbuffer, &refused_rlocator, &refused_forknum,
+							 &refused_blocknum);
 				vm_barrier_retries++;
 				cid = pgrac_entry_cid;
 				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				ClusterObserveBufferBarrierReceipt(
+					CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM,
+					CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST,
+					refused_rlocator, refused_forknum, refused_blocknum,
+					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
+					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 				cluster_heap_vm_barrier_warm(vmbuffer);
 				ReleaseBuffer(vmbuffer);
 				vmbuffer = InvalidBuffer;
 				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+				ClusterObserveBufferBarrierReceipt(
+					CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM,
+					CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
+					refused_rlocator, refused_forknum, refused_blocknum,
+					CLUSTER_BUFFER_BARRIER_OUTCOME_REQUALIFIED,
+					CLUSTER_BUFFER_BARRIER_PROOF_REENTRY);
 				goto l2;
 			}
 			vm_locked = true;
@@ -5315,6 +5354,7 @@ l_pgrac_reacquire:
 			&& BufferIsValid(vmbuffer_new);
 		bool		barrier_aware = vm_barrier_retries < CLUSTER_HEAP_VM_BARRIER_MAX_RETRIES;
 		Buffer		refused_vm = InvalidBuffer;
+		ClusterBufferBarrierSiteId refused_site = (ClusterBufferBarrierSiteId) 0;
 
 		if (need_old && need_new && vmbuffer_new == vmbuffer)
 			need_new = false;	/* same map page: one lock covers both */
@@ -5331,16 +5371,28 @@ l_pgrac_reacquire:
 			}
 			else
 			{
-				if (ClusterLockBufferExclusiveBarrierAware(vmbuffer_new))
+				if (ClusterLockBufferExclusiveBarrierAware(
+						vmbuffer_new,
+						CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST))
 					vm_locked_new = true;
 				else
+				{
 					refused_vm = vmbuffer_new;
+					refused_site =
+						CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST;
+				}
 				if (refused_vm == InvalidBuffer)
 				{
-					if (ClusterLockBufferExclusiveBarrierAware(vmbuffer))
+					if (ClusterLockBufferExclusiveBarrierAware(
+							vmbuffer,
+							CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND))
 						vm_locked = true;
 					else
+					{
 						refused_vm = vmbuffer;
+						refused_site =
+							CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND;
+					}
 				}
 			}
 		}
@@ -5353,10 +5405,15 @@ l_pgrac_reacquire:
 					LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 					vm_locked = true;
 				}
-				else if (ClusterLockBufferExclusiveBarrierAware(vmbuffer))
+				else if (ClusterLockBufferExclusiveBarrierAware(
+							 vmbuffer,
+							 CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD))
 					vm_locked = true;
 				else
+				{
 					refused_vm = vmbuffer;
+					refused_site = CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD;
+				}
 			}
 			if (need_new && refused_vm == InvalidBuffer)
 			{
@@ -5365,15 +5422,24 @@ l_pgrac_reacquire:
 					LockBuffer(vmbuffer_new, BUFFER_LOCK_EXCLUSIVE);
 					vm_locked_new = true;
 				}
-				else if (ClusterLockBufferExclusiveBarrierAware(vmbuffer_new))
+				else if (ClusterLockBufferExclusiveBarrierAware(
+							 vmbuffer_new,
+							 CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW))
 					vm_locked_new = true;
 				else
+				{
 					refused_vm = vmbuffer_new;
+					refused_site = CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW;
+				}
 			}
 		}
 
 		if (refused_vm != InvalidBuffer)
 		{
+			RelFileLocator refused_rlocator;
+			ForkNumber	refused_forknum;
+			BlockNumber refused_blocknum;
+
 			/*
 			 * PGRAC: BARRIER_CLOSED caller-owned unwind.  This backend holds
 			 * heap content lock(s) whose tag sits under a frozen revoke
@@ -5383,6 +5449,9 @@ l_pgrac_reacquire:
 			 * conversion while holding no content lock, then re-enter a
 			 * proven point.
 			 */
+			Assert(refused_site != (ClusterBufferBarrierSiteId) 0);
+			BufferGetTag(refused_vm, &refused_rlocator, &refused_forknum,
+						 &refused_blocknum);
 			vm_barrier_retries++;
 			if (vm_locked_new)
 			{
@@ -5414,10 +5483,20 @@ l_pgrac_reacquire:
 				cid = pgrac_entry_cid;
 				iscombo = false;
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				ClusterObserveBufferBarrierReceipt(
+					refused_site, CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST,
+					refused_rlocator, refused_forknum, refused_blocknum,
+					CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
+					CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 				cluster_heap_vm_barrier_warm(refused_vm);
 				ReleaseBuffer(vmbuffer);
 				vmbuffer = InvalidBuffer;
 				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+				ClusterObserveBufferBarrierReceipt(
+					refused_site, CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
+					refused_rlocator, refused_forknum, refused_blocknum,
+					CLUSTER_BUFFER_BARRIER_OUTCOME_REQUALIFIED,
+					CLUSTER_BUFFER_BARRIER_PROOF_REENTRY);
 				goto l2;
 			}
 
@@ -5434,7 +5513,17 @@ l_pgrac_reacquire:
 				ReleaseBuffer(newbuf);
 			}
 			LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			ClusterObserveBufferBarrierReceipt(
+				refused_site, CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST,
+				refused_rlocator, refused_forknum, refused_blocknum,
+				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
+				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
 			cluster_heap_vm_barrier_warm(refused_vm);
+			ClusterObserveBufferBarrierReceipt(
+				refused_site, CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
+				refused_rlocator, refused_forknum, refused_blocknum,
+				CLUSTER_BUFFER_BARRIER_OUTCOME_REQUALIFIED,
+				CLUSTER_BUFFER_BARRIER_PROOF_REENTRY);
 			goto l_pgrac_reacquire;
 		}
 	}

@@ -2428,7 +2428,7 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 	learned = msg.source_node_id;
 	tier1_peer_fds[learned] = peer_fd;
 	if (Tier1Shmem != NULL) {
-		peer_record_error(learned, 0, "", ""); /* clear any prior */
+		peer_record_error(learned, 0, "", "%s", ""); /* clear any prior */
 		Tier1Shmem->peers[learned].state = (int32)CLUSTER_IC_PEER_CONNECTED;
 		/* PGRAC: spec-7.2 D5 — bind to THIS node's current epoch (our own
 		 * view;  see the named-peer path for the rationale). */

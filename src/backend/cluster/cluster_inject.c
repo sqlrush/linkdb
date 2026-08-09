@@ -607,6 +607,20 @@ static ClusterInjectPoint cluster_injection_points[] = {
 	{ .name = "cluster-pcm-writer-cached-x-stall" },
 	{ .name = "cluster-pcm-restore-aba-window" },
 	/*
+	 * spec-8.2 D8 — barrier-aware SHARE refusal seam.
+	 *
+	 *	cluster-pcm-share-barrier-refuse-after-acquire:
+	 *	  Consulted only in barrier-aware SHARE mode (the caller passed a
+	 *	  refusal pointer), after the legacy acquire or cover decision is
+	 *	  complete and strictly before the target content lock.  skipn:N
+	 *	  forces the same typed refusal on exactly N attempts, each of which
+	 *	  runs the one common clean-refusal epilogue, so the unique-index
+	 *	  owner's unwind / unlocked warm / root-research sequence becomes
+	 *	  deterministic in t/407.  It publishes no state and cannot fire for
+	 *	  an ordinary LockBuffer caller.
+	 */
+	{ .name = "cluster-pcm-share-barrier-refuse-after-acquire" },
+	/*
 	 * PCM-X retained-image finish FlushBuffer boundary (t/400).
 	 *
 	 * The finish path first proves its exact REVOKING lifecycle while holding

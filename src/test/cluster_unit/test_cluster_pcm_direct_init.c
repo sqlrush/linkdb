@@ -121,6 +121,20 @@ assert_ordered(const char *source, const char *const *needles, int count)
 	}
 }
 
+static int
+count_occurrences(const char *source, const char *needle)
+{
+	int			count = 0;
+	const char *cursor = source;
+
+	while ((cursor = strstr(cursor, needle)) != NULL)
+	{
+		count++;
+		cursor += strlen(needle);
+	}
+	return count;
+}
+
 static void
 expect_valid_round_trip(ClusterPcmDirectInitKind kind)
 {
@@ -436,7 +450,11 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 				"PCM_X_QUEUE_BARRIER_CLOSED && barrier_refused != NULL",
 				"cluster_bufmgr_pcm_x_writer_report_failure(result, buf, \"queue acquire\")" };
 
-		UT_ASSERT(strstr(bufmgr, "ClusterLockBufferExclusiveBarrierAware(Buffer buffer)") != NULL);
+		static const char *const wrapper_signature[]
+			= { "ClusterLockBufferExclusiveBarrierAware(Buffer buffer,",
+				"ClusterBufferBarrierSiteId site_id)" };
+
+		assert_ordered(bufmgr, wrapper_signature, lengthof(wrapper_signature));
 		assert_ordered(bufmgr, refusal_order, lengthof(refusal_order));
 		free(bufmgr);
 	}
@@ -587,10 +605,13 @@ UT_TEST(test_cross_page_heap_pair_barrier_refusal_retries_unlocked)
 	static const char *const helper_order[]
 		= { "cluster_hio_lock_buffer_pair(Buffer first, Buffer second)",
 			"LockBuffer(first, BUFFER_LOCK_EXCLUSIVE)",
-			"ClusterLockBufferExclusiveBarrierAware(second)",
+			"ClusterLockBufferExclusiveBarrierAware(second,",
+			"CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND",
 			"LockBuffer(first, BUFFER_LOCK_UNLOCK)",
+			"CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST",
 			"LockBuffer(second, BUFFER_LOCK_EXCLUSIVE)",
-			"LockBuffer(second, BUFFER_LOCK_UNLOCK)" };
+			"LockBuffer(second, BUFFER_LOCK_UNLOCK)",
+			"CLUSTER_BUFFER_BARRIER_PHASE_REENTRY" };
 
 	UT_ASSERT(hio != NULL);
 	if (hio == NULL)
@@ -629,10 +650,93 @@ UT_TEST(test_cross_page_heap_pair_barrier_refusal_retries_unlocked)
 	free(hio);
 }
 
+/* D11's public half is a single, observation-only static probe.  This source
+ * contract does not claim a real receipt: it freezes the exact seven caller
+ * identities and four event anchors that a probe-enabled external tracer
+ * must later join dynamically. */
+UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
+{
+	char *bufmgr = read_source(BUFMGR_SOURCE_PATH);
+	char *heapam = read_source(HEAPAM_SOURCE_PATH);
+	char *hio = read_source(HIO_SOURCE_PATH);
+	char *probes = read_source("../../backend/utils/probes.d");
+	const char *common;
+	const char *update;
+	static const char *const probe_payload[]
+		= { "probe r2__passive__identity__receipt(", "R2SiteId", "R2Phase",
+			"R2SpcOid", "R2DbOid", "R2RelNumber", "R2ForkNumber",
+			"R2BlockNumber", "R2Outcome", "R2ProofMask" };
+	static const char *const common_chain[]
+		= { "CLUSTER_BUFFER_BARRIER_PHASE_LOWER_REFUSED",
+			"CLUSTER_BUFFER_BARRIER_OUTCOME_BARRIER_CLOSED",
+			"CLUSTER_BUFFER_BARRIER_PROOF_LOWER_REFUSED",
+			"cluster_bufmgr_pcm_unwind_barrier_refusal(",
+			"CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY",
+			"CLUSTER_BUFFER_BARRIER_OUTCOME_EMPTY",
+			"CLUSTER_BUFFER_BARRIER_PROOF_COMMON_EMPTY" };
+	static const char *const heap_sites[]
+		= { "CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM",
+			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM",
+			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_NEW_FIRST",
+			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND",
+			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD",
+			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW" };
+	static const char *const caller_reentry[]
+		= { "CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST",
+			"CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK",
+			"CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST",
+			"cluster_heap_vm_barrier_warm(",
+			"CLUSTER_BUFFER_BARRIER_PHASE_REENTRY",
+			"CLUSTER_BUFFER_BARRIER_OUTCOME_REQUALIFIED",
+			"CLUSTER_BUFFER_BARRIER_PROOF_REENTRY" };
+
+	UT_ASSERT(bufmgr != NULL);
+	UT_ASSERT(heapam != NULL);
+	UT_ASSERT(hio != NULL);
+	UT_ASSERT(probes != NULL);
+	if (probes != NULL)
+	{
+		UT_ASSERT_EQ(count_occurrences(probes,
+									   "probe r2__passive__identity__receipt("), 1);
+		assert_ordered(probes, probe_payload, lengthof(probe_payload));
+		free(probes);
+	}
+	if (bufmgr != NULL)
+	{
+		common = strstr(bufmgr, "cluster_lockbuffer_barrier_refusal:");
+		UT_ASSERT(common != NULL);
+		if (common != NULL)
+			assert_ordered(common, common_chain, lengthof(common_chain));
+		UT_ASSERT_EQ(count_occurrences(bufmgr,
+									   "TRACE_POSTGRESQL_R2_PASSIVE_IDENTITY_RECEIPT("), 1);
+		free(bufmgr);
+	}
+	if (heapam != NULL)
+	{
+		for (int i = 0; i < lengthof(heap_sites); i++)
+			UT_ASSERT(strstr(heapam, heap_sites[i]) != NULL);
+		UT_ASSERT_EQ(count_occurrences(heapam,
+									   "ClusterLockBufferExclusiveBarrierAware("), 6);
+
+		update = strstr(heapam, "PGRAC: BARRIER_CLOSED caller-owned unwind");
+		UT_ASSERT(update != NULL);
+		if (update != NULL)
+			assert_ordered(update, caller_reentry, lengthof(caller_reentry));
+		free(heapam);
+	}
+	if (hio != NULL)
+	{
+		UT_ASSERT_EQ(count_occurrences(hio,
+									   "ClusterLockBufferExclusiveBarrierAware("), 1);
+		UT_ASSERT(strstr(hio, "CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND") != NULL);
+		free(hio);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);
@@ -653,6 +757,7 @@ main(void)
 	UT_RUN(test_precrit_vm_barrier_refusal_unwinds_to_caller);
 	UT_RUN(test_heap_update_drops_vm_pin_across_heap_pcm_wait);
 	UT_RUN(test_cross_page_heap_pair_barrier_refusal_retries_unlocked);
+	UT_RUN(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

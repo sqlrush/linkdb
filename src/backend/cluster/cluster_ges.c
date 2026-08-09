@@ -2494,7 +2494,7 @@ cluster_ges_send_convert_and_wait(const struct ClusterResId *resid, uint32 reque
 	int effective_timeout_ms;
 	uint32 reject_reason;
 	bool local_master;
-	ClusterXpScope xp_convert; /* PGRAC: spec-5.59 D2 profiling */
+	ClusterXpScope xp_convert = { .active = false }; /* PGRAC: spec-5.59 D2 profiling */
 	ClusterXpScope xp_wait;	   /* PGRAC: spec-5.59 D2 profiling */
 	/* S3 forensics step 1a — wall-clock base for the timeout-source detail. */
 	TimestampTz forens_start = GetCurrentTimestamp();

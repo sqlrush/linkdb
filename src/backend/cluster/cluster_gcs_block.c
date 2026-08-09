@@ -14488,7 +14488,7 @@ gcs_block_broadcast_invalidate_and_wait_ext(const GcsBlockRequestPayload *req, u
 	long elapsed_ms = 0;
 	/* PGRAC: spec-5.59 D2 — invalidate broadcast + ack-collection interval
 	 * (runs at the master; service-time when master != requester). */
-	ClusterXpScope xp_inv;
+	ClusterXpScope xp_inv = { .active = false };
 
 	bool send_fail = false;
 	bool round_busy = false;
@@ -15437,7 +15437,7 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 {
 	GcsBlockInvalidateAckPayload ack;
 	ClusterPcmOwnResult own_result = CLUSTER_PCM_OWN_INVALID;
-	PcmXQueueResult queue_result;
+	PcmXQueueResult queue_result = PCM_X_QUEUE_INVALID;
 	PcmLockMode pre_state;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
 	SCN page_scn = InvalidScn; /* spec-2.41 D3 — ACK SCN carrier */

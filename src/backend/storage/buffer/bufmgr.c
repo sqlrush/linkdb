@@ -87,6 +87,7 @@
 extern bool ignore_checksum_failure;
 #endif
 #include "storage/bufmgr.h"
+#include "storage/bufmgr_barrier.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lmgr.h"
@@ -2106,32 +2107,39 @@ cluster_bufmgr_pcm_x_holder_unregister(ClusterPcmXHolderLedgerEntry *entry)
 	}
 }
 
-static void
+static ClusterBufferBarrierCleanupResult
 cluster_bufmgr_pcm_x_holder_abort_acquiring(ClusterPcmXHolderLedgerEntry *entry)
 {
 	PcmXQueueResult result;
 
 	if (entry == NULL)
-		return;
+		return CLUSTER_BUFFER_BARRIER_CLEAN;
 	if (entry->content_lock == NULL)
 	{
 		cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
 		elog(LOG, "could not abort cluster PCM-X ACQUIRING holder with no content lock: buffer=%d",
 			 entry->buffer_id);
-		return;
+		return CLUSTER_BUFFER_BARRIER_FAILED;
 	}
 	if (LWLockHeldByMe(entry->content_lock))
-		return;
+		return CLUSTER_BUFFER_BARRIER_FAILED;
 	result = cluster_pcm_x_local_holder_abort_acquiring_exact(&entry->handle);
 	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_NOT_FOUND)
+	{
 		cluster_bufmgr_pcm_x_holder_clear(entry);
+		return CLUSTER_BUFFER_BARRIER_CLEAN;
+	}
 	else if (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BUSY)
+	{
 		entry->phase = PCM_X_HOLDER_LEDGER_DEFERRED;
+		return CLUSTER_BUFFER_BARRIER_DEFERRED;
+	}
 	else
 	{
 		cluster_bufmgr_pcm_x_holder_defer_fail_closed(entry);
 		elog(LOG, "could not abort exact cluster PCM-X ACQUIRING holder: buffer=%d result=%d",
 			 entry->buffer_id, (int) result);
+		return CLUSTER_BUFFER_BARRIER_FAILED;
 	}
 }
 
@@ -2616,28 +2624,36 @@ cluster_bufmgr_pcm_x_writer_release(ClusterPcmXWriterLedgerEntry *entry)
 	}
 }
 
-static void
+static ClusterBufferBarrierCleanupResult
 cluster_bufmgr_pcm_x_writer_abort_acquiring(ClusterPcmXWriterLedgerEntry *entry)
 {
 	PcmXQueueResult result;
 
-	if (entry == NULL || entry->phase != PCM_X_WRITER_LEDGER_ACQUIRING)
-		return;
+	if (entry == NULL)
+		return CLUSTER_BUFFER_BARRIER_CLEAN;
+	if (entry->phase != PCM_X_WRITER_LEDGER_ACQUIRING)
+		return CLUSTER_BUFFER_BARRIER_FAILED;
 	if (entry->content_lock == NULL || LWLockHeldByMe(entry->content_lock))
-		return;
+		return CLUSTER_BUFFER_BARRIER_FAILED;
 	result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(&entry->claim);
 	if (result == PCM_X_QUEUE_OK) {
 		entry->claim_cleanup_complete = true;
-		(void)cluster_bufmgr_pcm_x_writer_finish_claim_cleanup(
-			entry, GetBufferDescriptor(entry->buffer_id), "abort acquiring");
+		if (cluster_bufmgr_pcm_x_writer_finish_claim_cleanup(
+				entry, GetBufferDescriptor(entry->buffer_id), "abort acquiring"))
+			return CLUSTER_BUFFER_BARRIER_CLEAN;
+		return CLUSTER_BUFFER_BARRIER_FAILED;
 	}
 	else if (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BUSY)
+	{
 		entry->phase = PCM_X_WRITER_LEDGER_DEFERRED;
+		return CLUSTER_BUFFER_BARRIER_DEFERRED;
+	}
 	else {
 		entry->phase = PCM_X_WRITER_LEDGER_DEFERRED;
 		cluster_pcm_x_runtime_fail_closed();
 		elog(LOG, "could not abort exact cluster PCM-X ACQUIRING writer: buffer=%d result=%d",
 			 entry->buffer_id, (int)result);
+		return CLUSTER_BUFFER_BARRIER_FAILED;
 	}
 }
 
@@ -8587,8 +8603,179 @@ UnlockBuffers(void)
  * that owns the outer (frozen-tag) content lock.  A NULL pointer keeps the
  * historical behavior (the refusal escalates to a client ERROR).
  */
+
+#ifdef USE_PGRAC_CLUSTER
+typedef struct ClusterBufmgrBarrierUnwindContext
+{
+	BufferDesc *buf;
+	PcmLockMode pcm_mode;
+	ClusterPcmOwnSnapshot *pending_base;
+	uint64		pending_token;
+	ClusterPcmXHolderLedgerEntry **holder;
+	ClusterPcmXWriterLedgerEntry **writer;
+} ClusterBufmgrBarrierUnwindContext;
+
+static ClusterBufferBarrierCleanupResult
+cluster_bufmgr_barrier_abort_holder(void *arg)
+{
+	ClusterBufmgrBarrierUnwindContext *context = arg;
+	ClusterBufferBarrierCleanupResult result;
+
+	result = cluster_bufmgr_pcm_x_holder_abort_acquiring(*context->holder);
+	if (result == CLUSTER_BUFFER_BARRIER_CLEAN)
+		*context->holder = NULL;
+	return result;
+}
+
+static ClusterBufferBarrierCleanupResult
+cluster_bufmgr_barrier_abort_writer(void *arg)
+{
+	ClusterBufmgrBarrierUnwindContext *context = arg;
+	ClusterBufferBarrierCleanupResult result;
+
+	result = cluster_bufmgr_pcm_x_writer_abort_acquiring(*context->writer);
+	if (result == CLUSTER_BUFFER_BARRIER_CLEAN)
+		*context->writer = NULL;
+	return result;
+}
+
+static ClusterBufferBarrierCleanupResult
+cluster_bufmgr_barrier_release_master(void *arg)
+{
+	ClusterBufmgrBarrierUnwindContext *context = arg;
+
+	cluster_pcm_lock_release_buffer_for_eviction(context->buf, context->pcm_mode);
+	return CLUSTER_BUFFER_BARRIER_CLEAN;
+}
+
+static ClusterBufferBarrierCleanupResult
+cluster_bufmgr_barrier_converge_local(void *arg)
+{
+	ClusterBufmgrBarrierUnwindContext *context = arg;
+	ClusterPcmOwnResult result;
+
+	result = cluster_pcm_own_abort_grant_after_master_rollback(
+		context->buf, context->pending_base, context->pending_token);
+	return result == CLUSTER_PCM_OWN_OK ? CLUSTER_BUFFER_BARRIER_CLEAN
+		: CLUSTER_BUFFER_BARRIER_FAILED;
+}
+
+static ClusterBufferBarrierCleanupResult
+cluster_bufmgr_barrier_abort_pending(void *arg)
+{
+	ClusterBufmgrBarrierUnwindContext *context = arg;
+
+	cluster_pcm_own_abort_grant_or_error(context->buf, context->pending_base,
+										 context->pending_token,
+										 "barrier refusal unwind");
+	return CLUSTER_BUFFER_BARRIER_CLEAN;
+}
+
+static bool
+cluster_bufmgr_barrier_prove_empty(void *arg)
+{
+	ClusterBufmgrBarrierUnwindContext *context = arg;
+
+	return !LWLockHeldByMe(BufferDescriptorGetContentLock(context->buf))
+		&& cluster_bufmgr_pcm_x_holder_find(context->buf) == NULL
+		&& cluster_bufmgr_pcm_x_writer_find(context->buf) == NULL
+		&& (cluster_pcm_own_flags_get(context->buf->buf_id)
+			& PCM_OWN_FLAG_GRANT_PENDING) == 0;
+}
+
+static const ClusterBufferBarrierUnwindOps cluster_bufmgr_barrier_unwind_ops = {
+	.abort_holder = cluster_bufmgr_barrier_abort_holder,
+	.abort_writer = cluster_bufmgr_barrier_abort_writer,
+	.release_master = cluster_bufmgr_barrier_release_master,
+	.converge_local = cluster_bufmgr_barrier_converge_local,
+	.abort_pending = cluster_bufmgr_barrier_abort_pending,
+	.prove_empty = cluster_bufmgr_barrier_prove_empty
+};
+
+/*
+ * PGRAC: the one common clean-refusal epilogue for every
+ * barrier-aware LockBufferInternal exit (SHARE and EXCLUSIVE alike).
+ *
+ * Postconditions on return: this backend holds no target content lock, no
+ * ACQUIRING holder/writer ledger entry remains, no durable master grant and
+ * no exact GRANT_PENDING reservation taken by this call survives.  A cover
+ * that pre-existed the call (cached node residency) is deliberately kept.
+ *
+ * Master release failure propagates ERROR and leaves the reservation
+ * fail-closed.  Local convergence failure after a successful master release
+ * raises the existing data-corruption-class ERROR because local and master
+ * ownership can no longer be proven equal; that is cleanup failure, never a
+ * normal barrier outcome.
+ */
 static void
-LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
+cluster_bufmgr_pcm_unwind_barrier_refusal(BufferDesc *buf,
+										  PcmLockMode pcm_mode,
+										  ClusterPcmOwnSnapshot *pending_base,
+										  uint64 pending_token,
+										  bool pcm_pending_set,
+										  bool pcm_acquired,
+										  ClusterPcmXHolderLedgerEntry **holder,
+										  ClusterPcmXWriterLedgerEntry **writer)
+{
+	ClusterBufmgrBarrierUnwindContext context;
+	ClusterBufferBarrierUnwindResult result;
+
+	if (pcm_acquired && !pcm_pending_set)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot unwind a cluster PCM barrier refusal without its exact reservation"),
+				 errdetail("buffer=%d token=%llu", buf->buf_id,
+						   (unsigned long long)pending_token),
+				 errhint("Check the server log for the preceding cluster PCM ownership failure.")));
+
+	context.buf = buf;
+	context.pcm_mode = pcm_mode;
+	context.pending_base = pending_base;
+	context.pending_token = pending_token;
+	context.holder = holder;
+	context.writer = writer;
+	result = cluster_buffer_barrier_unwind_execute(
+		&cluster_bufmgr_barrier_unwind_ops, &context,
+		pcm_acquired, pcm_pending_set);
+	if (result != CLUSTER_BUFFER_BARRIER_UNWIND_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not synchronously clear cluster PCM barrier-refusal responsibility"),
+				 errdetail("buffer=%d result=%d pending=%d acquired=%d token=%llu",
+						   buf->buf_id, (int) result, pcm_pending_set ? 1 : 0,
+						   pcm_acquired ? 1 : 0, (unsigned long long)pending_token),
+				 errhint("Check the server log for the exact holder, writer, or ownership cleanup failure.")));
+}
+#endif							/* USE_PGRAC_CLUSTER */
+
+/*
+ * Copy one already-decided R2 D11 event to the static trace sink.  This void
+ * observer owns no state and cannot alter the lock, cleanup or caller path;
+ * when tracing is disabled the generated macro is a no-op.
+ */
+void
+ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_id,
+									ClusterBufferBarrierPhase phase,
+									RelFileLocator rlocator,
+									ForkNumber forknum,
+									BlockNumber blocknum,
+									ClusterBufferBarrierOutcome outcome,
+									uint64 proof_mask)
+{
+	TRACE_POSTGRESQL_R2_PASSIVE_IDENTITY_RECEIPT((unsigned int) site_id,
+												 (unsigned int) phase,
+												 rlocator.spcOid,
+												 rlocator.dbOid,
+												 rlocator.relNumber,
+												 (int) forknum,
+												 blocknum,
+												 (unsigned int) outcome,
+												 (unsigned long long) proof_mask);
+}
+
+static void
+LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
+				   const ClusterBufferBarrierSiteId *barrier_site_id)
 {
 	BufferDesc *buf;
 #ifdef USE_PGRAC_CLUSTER
@@ -8646,7 +8833,7 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 			pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,
 															   pcm_barrier_refused);
 		if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
-			return;				/* barrier-aware caller owns the unwind */
+			goto cluster_lockbuffer_barrier_refusal;	/* caller owns the unwind */
 		if (pcm_x_writer == NULL && !pcm_covered) {
 			/*
 			 * PGRAC: spec-4.7a D2 — hold-until-revoked acquire gate.
@@ -8768,7 +8955,11 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 					if (pcm_retry_wait_index < PG_UINT32_MAX)
 						pcm_retry_wait_index++;
 					if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED)
-						return;
+					{
+						/* The rearm already exact-aborted its old reservation;
+						 * the epilogue still proves nothing else is held. */
+						goto cluster_lockbuffer_barrier_refusal;
+					}
 					if (rearm_result == CLUSTER_BUFMGR_PCM_RETRY_COVERED)
 					{
 						pcm_covered = true;
@@ -8820,20 +9011,39 @@ pcm_legacy_acquire_done:
 			CLUSTER_INJECTION_POINT("cluster-pcm-writer-cached-x-stall");
 		PG_TRY();
 		{
-			pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
-				buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base, &pcm_pending_token,
-				&pcm_acquired, &pcm_pending_set, &pcm_covered, &pcm_covered_gen,
-				&pcm_retry_wait_index);
+			/* PGRAC: count-controlled test seam.  Consulted
+			 * only in barrier-aware SHARE mode, once the legacy acquire or
+			 * cover decision is complete and strictly before both the holder
+			 * gate and the target content lock: refusing here arms no holder
+			 * state at all, which is exactly the shape a real lower refusal
+			 * has.  skipn:N forces the typed refusal on exactly N attempts.
+			 * It only sets the flag — the refusal must leave through the
+			 * post-PG_END_TRY exit so the exception stack is popped once
+			 * before the common epilogue.  Ordinary callers pass NULL and
+			 * never reach this point. */
+			if (pcm_barrier_refused != NULL && !*pcm_barrier_refused
+				&& pcm_mode == PCM_LOCK_MODE_S)
+			{
+				CLUSTER_INJECTION_POINT("cluster-pcm-share-barrier-refuse-after-acquire");
+				if (cluster_injection_should_skip(
+						"cluster-pcm-share-barrier-refuse-after-acquire"))
+					*pcm_barrier_refused = true;
+			}
+			if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+				pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
+					buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base, &pcm_pending_token,
+					&pcm_acquired, &pcm_pending_set, &pcm_covered, &pcm_covered_gen,
+					&pcm_retry_wait_index);
 			if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
 			{
 				/*
-				 * PGRAC (t/400 L3 item 3, holder lane): the holder gate
-				 * refused under the frozen barrier.  Roll the granted writer
-				 * claim back exactly like the ERROR path would and take
-				 * nothing; the barrier-aware caller owns the unwind.
+				 * PGRAC (t/400 L3 item 3, holder lane): the
+				 * holder gate (or the test seam above) refused under the
+				 * frozen barrier.  Take nothing here — the one common
+				 * clean-refusal epilogue at the barrier exit below rolls
+				 * back the writer claim, any published holder entry and any
+				 * legacy grant/reservation exactly.
 				 */
-				if (pcm_x_writer != NULL)
-					cluster_bufmgr_pcm_x_writer_abort_acquiring(pcm_x_writer);
 			}
 			else
 			{
@@ -9022,10 +9232,11 @@ pcm_revalidate_acquire_done:
 		}
 		PG_END_TRY();
 
-		/* PGRAC (t/400 L3 item 3, holder lane): nothing is held and the
-		 * writer claim was rolled back — hand the refusal to the caller. */
+		/* Holder-gate refusals (with or without a durable legacy grant),
+		 * stale-cover requeue refusals and the SHARE test seam all converge
+		 * on the same epilogue before the refusal reaches the caller. */
 		if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
-			return;
+			goto cluster_lockbuffer_barrier_refusal;
 
 		/*
 		 * PGRAC ownership-generation wave (W3) — grant-finalize window.  A
@@ -9139,13 +9350,45 @@ pcm_revalidate_acquire_done:
 			cluster_pcm_own_transition(buf, (uint8)cluster_pcm_lock_query(buf->tag), 0, 0);
 		}
 	}
+	return;
+
+cluster_lockbuffer_barrier_refusal:
+
+	if (barrier_site_id != NULL)
+		ClusterObserveBufferBarrierReceipt(*barrier_site_id,
+										CLUSTER_BUFFER_BARRIER_PHASE_LOWER_REFUSED,
+										BufTagGetRelFileLocator(&buf->tag),
+										BufTagGetForkNum(&buf->tag),
+										buf->tag.blockNum,
+										CLUSTER_BUFFER_BARRIER_OUTCOME_BARRIER_CLOSED,
+										CLUSTER_BUFFER_BARRIER_PROOF_LOWER_REFUSED);
+
+	/*
+	 * PGRAC: the one common clean-refusal epilogue.  Every
+	 * barrier-aware refusal in this function jumps here instead of returning
+	 * raw, so exactly one implementation proves the postconditions: no target
+	 * content lock, no ACQUIRING holder/writer entry, no durable grant and no
+	 * exact GRANT_PENDING reservation taken by this call survive.  A second
+	 * SHARE cleanup implementation is forbidden.
+	 */
+	cluster_bufmgr_pcm_unwind_barrier_refusal(buf, pcm_mode, &pcm_pending_base,
+											  pcm_pending_token, pcm_pending_set, pcm_acquired,
+											  &pcm_x_holder, &pcm_x_writer);
+	if (barrier_site_id != NULL)
+		ClusterObserveBufferBarrierReceipt(*barrier_site_id,
+										CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY,
+										BufTagGetRelFileLocator(&buf->tag),
+										BufTagGetForkNum(&buf->tag),
+										buf->tag.blockNum,
+										CLUSTER_BUFFER_BARRIER_OUTCOME_EMPTY,
+										CLUSTER_BUFFER_BARRIER_PROOF_COMMON_EMPTY);
 #endif
 }
 
 void
 LockBuffer(Buffer buffer, int mode)
 {
-	LockBufferInternal(buffer, mode, NULL);
+	LockBufferInternal(buffer, mode, NULL, NULL);
 }
 
 /*
@@ -9162,11 +9405,31 @@ LockBuffer(Buffer buffer, int mode)
  * conversion while holding no content lock, and re-enter a requalify point.
  */
 bool
-ClusterLockBufferExclusiveBarrierAware(Buffer buffer)
+ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
+									   ClusterBufferBarrierSiteId site_id)
 {
 	bool		barrier_refused = false;
 
-	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused);
+	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused, &site_id);
+	return !barrier_refused;
+}
+
+/*
+ * PGRAC: SHARE counterpart with the same clean-refusal
+ * contract.  False means exactly one thing: the lower layer returned the
+ * process-local BARRIER_CLOSED refusal and the common epilogue proved this
+ * backend holds no target content lock and left no holder/writer acquisition
+ * or GRANT_PENDING reservation behind; caller-owned outer locks and every
+ * pin are untouched.  A pre-existing cached node residency may remain.
+ * Local buffers and cluster-disabled builds behave exactly like
+ * LockBuffer(..., BUFFER_LOCK_SHARE) and return true.
+ */
+bool
+ClusterLockBufferShareBarrierAware(Buffer buffer)
+{
+	bool		barrier_refused = false;
+
+	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused, NULL);
 	return !barrier_refused;
 }
 

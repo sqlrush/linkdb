@@ -2336,6 +2336,9 @@ grd_recovery_consume_new_event_mid_episode(void)
 	return true;
 }
 
+static void grd_recovery_appendf(char *buf, Size buflen, int *off, const char *fmt, ...)
+	pg_attribute_printf(4, 5);
+
 static void
 grd_recovery_appendf(char *buf, Size buflen, int *off, const char *fmt, ...)
 {
@@ -2990,7 +2993,7 @@ cluster_grd_recovery_lmon_tick(void)
 
 		if (GetCurrentTimestamp()
 			> (TimestampTz)pg_atomic_read_u64(&cluster_grd_state->recovery_barrier_deadline)) {
-			TimestampTz deadline;
+			TimestampTz retry_deadline;
 			char waiting_backend[256];
 			bool ges_barrier_complete = grd_recovery_barrier_complete(gen, episode_epoch);
 			bool block_scan_complete = grd_block_redeclare_scan_complete(episode_epoch);
@@ -3023,9 +3026,10 @@ cluster_grd_recovery_lmon_tick(void)
 							   grd_block_redeclare_epoch, waiting_backend),
 					 errhint("A backend has not acked the cooperative rebind within "
 							 "cluster.grd_rebuild_timeout_ms; re-broadcasting.")));
-			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-												   cluster_grd_rebuild_timeout_ms);
-			pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline, (uint64)deadline);
+			retry_deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+														 cluster_grd_rebuild_timeout_ms);
+			pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline,
+								(uint64)retry_deadline);
 			(void)grd_recovery_broadcast_redeclare();
 		}
 		return;
@@ -4981,9 +4985,9 @@ cluster_grd_entry_generation(ClusterGrdEntry *entry)
  *	the real backend convert trigger + wire/identity land in spec-5.2.
  *
  *	Holder identity for the convert locator is (node_id, procno,
- *	current_mode) — the REDECLARE convention — and the convert's own slot
- *	is self-excluded from the UPGRADE conflict scan, so a holder already
- *	in a self-conflicting mode (SUE/SRE/E/AE) can still upgrade.
+ *	current_mode) — the REDECLARE convention — and every holder belonging
+ *	to the converting backend is self-excluded from the UPGRADE conflict
+ *	scan, so PostgreSQL's legal additive same-backend holds cannot block it.
  * ============================================================ */
 
 /* Locate the holder being converted by the (node,procno,mode) locator. */
@@ -5042,11 +5046,14 @@ cluster_grd_entry_request_convert(ClusterGrdEntry *entry, const ClusterGrdConver
 	case GES_CONVERT_UPGRADE:
 		/*
 		 * requested_mode must be compatible with every OTHER holder
-		 * (self-excluded by slot) before we may mutate in place; otherwise
-		 * enqueue with strict priority over new waiters (anti-starvation).
+		 * (all {node_id,procno} self holders excluded) before we may mutate in
+		 * place; otherwise enqueue with strict priority over new waiters
+		 * (anti-starvation).
 		 */
 		for (int i = 0; i < entry->ngranted; i++) {
-			if (i == hslot)
+			if (i == hslot
+				|| (entry->holders[i].node_id == req->node_id
+					&& entry->holders[i].procno == req->procno))
 				continue;
 			if (!ges_modes_compatible(entry->holders[i].mode, req->requested_mode)) {
 				if (entry->nconverts >= PGRAC_GRD_MAX_CONVERTS) {
@@ -5189,10 +5196,10 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 
 	/*
 	 * Phase 1 — grant every pending convert now compatible with the other
-	 * holders (self-excluded), in place.  Granting a convert changes a
-	 * holder mode, which may unblock an earlier-skipped convert, so we
-	 * restart the scan after each grant.  Each grant removes one queue
-	 * entry, so the loop is bounded.
+	 * holders (all {node_id,procno} self holders excluded), in place.  Granting
+	 * a convert changes a holder mode, which may unblock an earlier-skipped
+	 * convert, so we restart the scan after each grant.  Each grant removes one
+	 * queue entry, so the loop is bounded.
 	 */
 	for (int c = 0; c < entry->nconverts && n < max_out;) {
 		ClusterGrdConvert *cv = &entry->converts[c];
@@ -5206,7 +5213,9 @@ cluster_grd_entry_drain_converts_then_waiters(ClusterGrdEntry *entry,
 			continue; /* re-check slot c (now the swapped-in entry) */
 		}
 		for (int i = 0; i < entry->ngranted; i++) {
-			if (i == hslot)
+			if (i == hslot
+				|| (entry->holders[i].node_id == cv->node_id
+					&& entry->holders[i].procno == cv->procno))
 				continue;
 			if (!ges_modes_compatible(entry->holders[i].mode, cv->requested_mode)) {
 				compatible = false;
