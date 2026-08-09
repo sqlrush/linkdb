@@ -41,6 +41,9 @@
  *	    T35  spec-7.1 watch-2: marker into a FREE slot contributes nothing
  *	    T36  spec-7.1 watch-2: numeric xid/multixact-id collision must not
  *	         suppress the fold (new_xid = InvalidTransactionId)
+ *	    T37-T44  spec-8.4 R4 D6: pure lock-only slot-index selection,
+ *	         canonical failure sentinel, highest-wrap winner, equal-winning-
+ *	         wrap ambiguity, and old/new reader agreement
  *
  *	  Spec: spec-3.4b-real-tt-allocator-uba-encoding-production-cross-node.md
  *	        (v0.3 FROZEN 2026-05-24)
@@ -83,6 +86,9 @@
 
 
 UT_DEFINE_GLOBALS();
+
+extern bool cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId raw_xmax,
+											  uint8 *slot_index_out);
 
 
 /* ============================================================
@@ -638,6 +644,152 @@ UT_TEST(test_t21_lock_scan_chooses_highest_wrap)
 	UT_ASSERT_EQ((int)ref.tt_slot_id, 10);
 }
 
+UT_TEST(test_t37_lock_slot_index_null_page_sets_sentinel)
+{
+	uint8 index = 3;
+
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						NULL, (TransactionId)1001, &index),
+				 0);
+	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+}
+
+UT_TEST(test_t38_lock_slot_index_miss_sets_sentinel)
+{
+	Page page = build_itl_page();
+	uint8 index = 3;
+
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						page, (TransactionId)1002, &index),
+				 0);
+	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+}
+
+UT_TEST(test_t39_lock_slot_index_unique_winner)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *slot = slot_at(page, 4);
+	uint8 index = CLUSTER_ITL_SLOT_UNALLOCATED;
+
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->xid = (TransactionId)1003;
+	slot->wrap = 2;
+	slot->undo_segment_head = uba_encode(257, 3, 7, 5);
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						page, (TransactionId)1003, &index),
+				 1);
+	UT_ASSERT_EQ((int)index, 4);
+}
+
+UT_TEST(test_t40_lock_slot_index_chooses_highest_wrap)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *old = slot_at(page, 2);
+	ClusterItlSlotData *newer = slot_at(page, 6);
+	uint8 index = CLUSTER_ITL_SLOT_UNALLOCATED;
+
+	old->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	old->xid = (TransactionId)1004;
+	old->wrap = 8;
+	old->undo_segment_head = uba_encode(1, 4, 8, 6);
+	newer->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	newer->xid = (TransactionId)1004;
+	newer->wrap = 9;
+	newer->undo_segment_head = uba_encode(257, 5, 9, 7);
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						page, (TransactionId)1004, &index),
+				 1);
+	UT_ASSERT_EQ((int)index, 6);
+}
+
+UT_TEST(test_t41_lock_slot_index_equal_winning_wrap_is_ambiguous)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *a = slot_at(page, 1);
+	ClusterItlSlotData *b = slot_at(page, 7);
+	uint8 index = 2;
+
+	a->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	a->xid = (TransactionId)1005;
+	a->wrap = 10;
+	a->undo_segment_head = uba_encode(1, 6, 10, 8);
+	b->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	b->xid = (TransactionId)1005;
+	b->wrap = 10;
+	b->undo_segment_head = uba_encode(257, 7, 11, 9);
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						page, (TransactionId)1005, &index),
+				 0);
+	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+}
+
+UT_TEST(test_t42_lock_slot_index_lower_wrap_duplicate_does_not_hide_winner)
+{
+	Page page = build_itl_page();
+	uint8 index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	uint8 i;
+
+	for (i = 0; i < 2; i++) {
+		ClusterItlSlotData *slot = slot_at(page, i);
+
+		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		slot->xid = (TransactionId)1006;
+		slot->wrap = 11;
+		slot->undo_segment_head = uba_encode(i == 0 ? 1 : 257, 8 + i, 12 + i, 10 + i);
+	}
+	slot_at(page, 5)->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot_at(page, 5)->xid = (TransactionId)1006;
+	slot_at(page, 5)->wrap = 12;
+	slot_at(page, 5)->undo_segment_head = uba_encode(513, 10, 14, 12);
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						page, (TransactionId)1006, &index),
+				 1);
+	UT_ASSERT_EQ((int)index, 5);
+}
+
+UT_TEST(test_t43_lock_slot_index_ignores_data_and_invalid_uba)
+{
+	Page page = build_itl_page();
+	uint8 index = 6;
+
+	slot_at(page, 0)->flags = ITL_FLAG_ACTIVE;
+	slot_at(page, 0)->xid = (TransactionId)1007;
+	slot_at(page, 0)->undo_segment_head = uba_encode(1, 11, 15, 13);
+	slot_at(page, 1)->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot_at(page, 1)->xid = (TransactionId)1007;
+	memset(&slot_at(page, 1)->undo_segment_head, 0,
+		   sizeof(slot_at(page, 1)->undo_segment_head));
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						page, (TransactionId)1007, &index),
+				 0);
+	UT_ASSERT_EQ((int)index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+}
+
+UT_TEST(test_t44_lock_slot_index_and_old_reader_select_same_slot)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *winner = slot_at(page, 3);
+	ClusterUndoTTSlotRef ref;
+	uint8 index = CLUSTER_ITL_SLOT_UNALLOCATED;
+
+	winner->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	winner->xid = (TransactionId)1008;
+	winner->wrap = 13;
+	winner->undo_segment_head = uba_encode(257, 12, 23, 14);
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_slot_index_by_xmax(
+						page, (TransactionId)1008, &index),
+				 1);
+	UT_ASSERT_EQ((int)index, 3);
+	UT_ASSERT_EQ((int)cluster_itl_find_lock_tt_ref_by_xmax(
+						page, (TransactionId)1008, &ref),
+				 1);
+	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 24);
+	UT_ASSERT_EQ((int)winner->wrap, 13);
+	UT_ASSERT_EQ((int)winner->flags, (int)ITL_FLAG_LOCK_ONLY_ACTIVE);
+	UT_ASSERT_EQ((int)winner->xid, 1008);
+}
+
 
 /* ---------- spec-3.9 Hardening L213: pd_block_scn redo parity ----------
  *
@@ -1010,6 +1162,14 @@ main(void)
 	UT_RUN(test_t19_lock_scan_ignores_data_active_same_xid);
 	UT_RUN(test_t20_lock_scan_rejects_ambiguous_same_wrap);
 	UT_RUN(test_t21_lock_scan_chooses_highest_wrap);
+	UT_RUN(test_t37_lock_slot_index_null_page_sets_sentinel);
+	UT_RUN(test_t38_lock_slot_index_miss_sets_sentinel);
+	UT_RUN(test_t39_lock_slot_index_unique_winner);
+	UT_RUN(test_t40_lock_slot_index_chooses_highest_wrap);
+	UT_RUN(test_t41_lock_slot_index_equal_winning_wrap_is_ambiguous);
+	UT_RUN(test_t42_lock_slot_index_lower_wrap_duplicate_does_not_hide_winner);
+	UT_RUN(test_t43_lock_slot_index_ignores_data_and_invalid_uba);
+	UT_RUN(test_t44_lock_slot_index_and_old_reader_select_same_slot);
 	UT_RUN(test_t22_redo_parity_sets_pd_block_scn_on_fresh_page);
 	UT_RUN(test_t23_redo_parity_monotonic_older_write_scn_noop);
 	UT_RUN(test_t24_redo_parity_invalid_write_scn_noop);
