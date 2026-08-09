@@ -61,13 +61,17 @@
 
 #include "access/xlog.h"		 /* GetXLogWriteRecPtr, GetWALInsertionTimeLine */
 #include "access/xlogrecovery.h" /* GetXLogReplayRecPtr (spec-6.4 standby stop) */
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/proc.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -152,6 +156,177 @@ write_block(const char *path, off_t off, const void *block)
 		errno = save_errno;
 	}
 	return false;
+}
+
+/*
+ * RF A1 CF_VERIFIED_X predicate.  The file itself is validated after the
+ * coordinated hold; this predicate only proves the existing coordination
+ * authority needed before a formed-registry mutation may begin.
+ */
+static bool
+wal_state_cf_prerequisites_ready(void)
+{
+	ClusterResId cf_resid;
+
+	if (!cluster_controlfile_shared_authority || !cluster_lms_enabled
+		|| !cluster_lms_is_ready() || MyProc == NULL)
+		return false;
+	cluster_cf_resid_encode(&cf_resid);
+	return cluster_grd_lookup_master(&cf_resid) >= 0;
+}
+
+/*
+ * cluster_wal_state_update_own -- RF A1 sole formed-registry RMW.
+ *
+ * ACQUIRE_X owns the verified CF(X) hold and releases it on every exit.
+ * BORROW_X proves the caller already holds that same verified lock and never
+ * re-enters or releases it.  All file decisions use one fresh header and own
+ * slot image read under that hold.  There is one write attempt and never a
+ * compensating overwrite, truncate, unlink or rename.
+ */
+ClusterWalStateUpdateResult
+cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStateCfMode cf_mode,
+							 ClusterWalStateSlot *published_slot)
+{
+	ClusterWalStateHeader header;
+	ClusterWalStateSlot fresh_before;
+	ClusterWalStateSlot expected_after;
+	ClusterWalStateSlot fresh_observed;
+	ClusterWalStateUpdateResult result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+	char path[MAXPGPATH];
+	uint16 thread_id;
+	int fd = -1;
+	bool acquired_here = false;
+	struct stat st;
+	ssize_t nbytes;
+
+	if (update == NULL
+		|| (cf_mode != CLUSTER_WAL_STATE_CF_ACQUIRE_X
+			&& cf_mode != CLUSTER_WAL_STATE_CF_BORROW_X))
+		return CLUSTER_WAL_STATE_UPDATE_INVALID;
+	if (!cluster_enabled || !registry_configured())
+		return CLUSTER_WAL_STATE_UPDATE_DISABLED;
+	if (!wal_state_cf_prerequisites_ready())
+		return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+
+	if (cf_mode == CLUSTER_WAL_STATE_CF_ACQUIRE_X) {
+		/* Do not trip cluster_cf_lock's deliberate non-reentrant Assert. */
+		if (cluster_cf_held(ExclusiveLock) || !cluster_cf_lock(ExclusiveLock))
+			return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+		acquired_here = true;
+	} else if (!cluster_cf_held(ExclusiveLock))
+		return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+
+	/* Re-prove the derived predicates together with the successful held state. */
+	if (!cluster_cf_held(ExclusiveLock) || !wal_state_cf_prerequisites_ready()) {
+		result = CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+		goto out;
+	}
+
+	thread_id = cluster_wal_thread_id();
+	if (thread_id < XLP_THREAD_ID_FIRST_REAL || thread_id > CLUSTER_WAL_THREAD_MAX) {
+		result = CLUSTER_WAL_STATE_UPDATE_INVALID;
+		goto out;
+	}
+
+	registry_path(path, sizeof(path));
+	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
+	if (fd < 0) {
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	if (fstat(fd, &st) != 0) {
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	if (st.st_size != (off_t)CLUSTER_WAL_STATE_FILE_SIZE) {
+		result = CLUSTER_WAL_STATE_UPDATE_CORRUPT;
+		goto out;
+	}
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
+	nbytes = pg_pread(fd, &header, sizeof(header), 0);
+	pgstat_report_wait_end();
+	if (nbytes != (ssize_t)sizeof(header)) {
+		if (nbytes >= 0)
+			errno = EIO;
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	if (!cluster_wal_state_header_validate(&header, NULL)) {
+		result = CLUSTER_WAL_STATE_UPDATE_CORRUPT;
+		goto out;
+	}
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
+	nbytes = pg_pread(fd, &fresh_before, sizeof(fresh_before),
+					  CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id));
+	pgstat_report_wait_end();
+	if (nbytes != (ssize_t)sizeof(fresh_before)) {
+		if (nbytes >= 0)
+			errno = EIO;
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+
+	result = cluster_wal_state_slot_prepare_update(
+		&fresh_before, thread_id, cluster_node_id, update, &expected_after);
+	if (result == CLUSTER_WAL_STATE_UPDATE_NOOP) {
+		if (published_slot != NULL)
+			memcpy(published_slot, &fresh_before, sizeof(*published_slot));
+		goto out;
+	}
+	if (result != CLUSTER_WAL_STATE_UPDATE_OK)
+		goto out;
+
+	if (cluster_injection_should_skip("cluster-wal-state-write-fail")) {
+		errno = EIO;
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_WRITE);
+	nbytes = pg_pwrite(fd, &expected_after, sizeof(expected_after),
+					   CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id));
+	if (nbytes != (ssize_t)sizeof(expected_after)) {
+		if (nbytes >= 0)
+			errno = EIO;
+		pgstat_report_wait_end();
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	if (pg_fsync(fd) != 0) {
+		pgstat_report_wait_end();
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	pgstat_report_wait_end();
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
+	nbytes = pg_pread(fd, &fresh_observed, sizeof(fresh_observed),
+					  CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id));
+	pgstat_report_wait_end();
+	if (nbytes != (ssize_t)sizeof(fresh_observed)) {
+		if (nbytes >= 0)
+			errno = EIO;
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	result = cluster_wal_state_slot_verify_postread(
+		&expected_after, &fresh_observed, thread_id, cluster_node_id);
+	if (result == CLUSTER_WAL_STATE_UPDATE_OK && published_slot != NULL)
+		memcpy(published_slot, &fresh_observed, sizeof(*published_slot));
+
+out:
+	if (fd >= 0) {
+		int save_errno = errno;
+
+		(void)close(fd);
+		errno = save_errno;
+	}
+	if (acquired_here)
+		cluster_cf_unlock(ExclusiveLock);
+	return result;
 }
 
 /*
