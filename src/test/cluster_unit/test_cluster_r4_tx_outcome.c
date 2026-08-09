@@ -668,6 +668,54 @@ UT_TEST(test_exact_origin_tt_aborted_without_direct_native_terminal_fails_closed
 	UT_ASSERT_EQ(test_twophase_calls, 1);
 }
 
+UT_TEST(test_exact_origin_tt_aborted_direct_second_clog_abort_is_terminal)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_tt_slot.commit_scn = InvalidScn;
+	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_IN_PROGRESS);
+	set_native_status_sample(1, TEST_ORIGIN_XID, TRANSACTION_STATUS_ABORTED);
+	test_twophase_prepared = true;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(test_native_status_calls, 2);
+	UT_ASSERT_EQ(test_twophase_calls, 1);
+}
+
+UT_TEST(test_exact_origin_tt_aborted_direct_second_clog_commit_conflicts)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = {0};
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_tt_slot.commit_scn = InvalidScn;
+	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_IN_PROGRESS);
+	set_native_status_sample(1, TEST_ORIGIN_XID, TRANSACTION_STATUS_COMMITTED);
+	test_twophase_xid = TEST_ORIGIN_XID;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_native_status_calls, 2);
+	UT_ASSERT_EQ(test_twophase_calls, 1);
+}
+
 UT_TEST(test_exact_origin_tt_aborted_does_not_beat_subtrans_prepared_owner)
 {
 	ClusterTxResolution resolution;
@@ -724,6 +772,67 @@ UT_TEST(test_exact_origin_tt_aborted_without_subtrans_native_terminal_fails_clos
 					 &resolution, &reason),
 				 CLUSTER_TX_UNKNOWN);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_native_status_calls, 3);
+	UT_ASSERT_EQ(test_subtrans_parent_calls, 4);
+	UT_ASSERT_EQ(test_twophase_calls, 1);
+}
+
+UT_TEST(test_exact_origin_tt_aborted_subtrans_second_clog_abort_is_terminal)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	TransactionId top = TEST_ORIGIN_XID - 1;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_subtrans_chain[0] = TEST_ORIGIN_XID;
+	test_subtrans_chain[1] = top;
+	test_subtrans_chain_count = 2;
+	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_SUB_COMMITTED);
+	set_native_status_sample(1, top, TRANSACTION_STATUS_IN_PROGRESS);
+	set_native_status_sample(2, top, TRANSACTION_STATUS_ABORTED);
+	test_twophase_prepared = true;
+	test_twophase_xid = top;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP);
+	UT_ASSERT_EQ(test_native_status_calls, 3);
+	UT_ASSERT_EQ(test_subtrans_parent_calls, 4);
+	UT_ASSERT_EQ(test_twophase_calls, 1);
+}
+
+UT_TEST(test_exact_origin_tt_aborted_subtrans_second_clog_commit_conflicts)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = {0};
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	TransactionId top = TEST_ORIGIN_XID - 1;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_subtrans_chain[0] = TEST_ORIGIN_XID;
+	test_subtrans_chain[1] = top;
+	test_subtrans_chain_count = 2;
+	set_native_status_sample(0, TEST_ORIGIN_XID, TRANSACTION_STATUS_SUB_COMMITTED);
+	set_native_status_sample(1, top, TRANSACTION_STATUS_IN_PROGRESS);
+	set_native_status_sample(2, top, TRANSACTION_STATUS_COMMITTED);
+	test_twophase_xid = top;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT);
 	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
 	UT_ASSERT_EQ(test_native_status_calls, 3);
 	UT_ASSERT_EQ(test_subtrans_parent_calls, 4);
@@ -985,7 +1094,7 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 int
 main(void)
 {
-	UT_PLAN(62);
+	UT_PLAN(66);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -1037,8 +1146,12 @@ main(void)
 	UT_RUN(test_exact_origin_prepared_finish_commit_without_exact_scn_fails_closed);
 	UT_RUN(test_exact_origin_tt_aborted_does_not_beat_direct_prepared_owner);
 	UT_RUN(test_exact_origin_tt_aborted_without_direct_native_terminal_fails_closed);
+	UT_RUN(test_exact_origin_tt_aborted_direct_second_clog_abort_is_terminal);
+	UT_RUN(test_exact_origin_tt_aborted_direct_second_clog_commit_conflicts);
 	UT_RUN(test_exact_origin_tt_aborted_does_not_beat_subtrans_prepared_owner);
 	UT_RUN(test_exact_origin_tt_aborted_without_subtrans_native_terminal_fails_closed);
+	UT_RUN(test_exact_origin_tt_aborted_subtrans_second_clog_abort_is_terminal);
+	UT_RUN(test_exact_origin_tt_aborted_subtrans_second_clog_commit_conflicts);
 	UT_RUN(test_exact_origin_nested_subcommitted_top_commit_without_locator_fails_closed);
 	UT_RUN(test_exact_origin_subcommitted_top_aborted_is_terminal);
 	UT_RUN(test_exact_origin_subcommitted_top_in_progress_stays_live);
