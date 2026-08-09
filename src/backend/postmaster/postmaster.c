@@ -556,6 +556,17 @@ static void StartAutovacuumWorker(void);
 static void MaybeStartWalReceiver(void);
 static void InitPostmasterDeathWatchHandle(void);
 
+#ifdef USE_PGRAC_CLUSTER
+extern pid_t cluster_postmaster_start_lmon(void);
+extern pid_t cluster_postmaster_start_lck(void);
+extern pid_t cluster_postmaster_start_diag(void);
+extern pid_t cluster_postmaster_start_stats(void);
+extern pid_t cluster_postmaster_start_cssd(void);
+extern pid_t cluster_postmaster_start_qvotec(void);
+extern pid_t cluster_postmaster_start_lms(void);
+extern pid_t cluster_postmaster_start_lmd(void);
+#endif
+
 /*
  * Archiver is allowed to start up at the current postmaster state?
  *

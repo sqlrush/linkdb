@@ -255,7 +255,7 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 	for (off = FirstOffsetNumber; off <= maxoff; off++) {
 		ItemId iid = PageGetItemId(page, off);
 		HeapTupleData tup;
-		int i;
+		int attr_index;
 
 		if (!ItemIdIsNormal(iid))
 			continue;
@@ -269,9 +269,9 @@ cluster_cr_test_image(PG_FUNCTION_ARGS)
 
 		out_values[0] = Int16GetDatum((int16)off);
 		out_nulls[0] = false;
-		for (i = 0; i < nrelatts; i++) {
-			out_values[i + 1] = rel_values[i];
-			out_nulls[i + 1] = rel_nulls[i];
+		for (attr_index = 0; attr_index < nrelatts; attr_index++) {
+			out_values[attr_index + 1] = rel_values[attr_index];
+			out_nulls[attr_index + 1] = rel_nulls[attr_index];
 		}
 		/* putvalues copies the data, so it survives image/rel close. */
 		tuplestore_putvalues(rsinfo->setResult, out_desc, out_values, out_nulls);

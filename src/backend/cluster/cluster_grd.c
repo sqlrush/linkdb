@@ -2336,6 +2336,9 @@ grd_recovery_consume_new_event_mid_episode(void)
 	return true;
 }
 
+static void grd_recovery_appendf(char *buf, Size buflen, int *off, const char *fmt, ...)
+	pg_attribute_printf(4, 5);
+
 static void
 grd_recovery_appendf(char *buf, Size buflen, int *off, const char *fmt, ...)
 {
@@ -2990,7 +2993,7 @@ cluster_grd_recovery_lmon_tick(void)
 
 		if (GetCurrentTimestamp()
 			> (TimestampTz)pg_atomic_read_u64(&cluster_grd_state->recovery_barrier_deadline)) {
-			TimestampTz deadline;
+			TimestampTz retry_deadline;
 			char waiting_backend[256];
 			bool ges_barrier_complete = grd_recovery_barrier_complete(gen, episode_epoch);
 			bool block_scan_complete = grd_block_redeclare_scan_complete(episode_epoch);
@@ -3023,9 +3026,10 @@ cluster_grd_recovery_lmon_tick(void)
 							   grd_block_redeclare_epoch, waiting_backend),
 					 errhint("A backend has not acked the cooperative rebind within "
 							 "cluster.grd_rebuild_timeout_ms; re-broadcasting.")));
-			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
-												   cluster_grd_rebuild_timeout_ms);
-			pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline, (uint64)deadline);
+			retry_deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+														 cluster_grd_rebuild_timeout_ms);
+			pg_atomic_write_u64(&cluster_grd_state->recovery_barrier_deadline,
+								(uint64)retry_deadline);
 			(void)grd_recovery_broadcast_redeclare();
 		}
 		return;
