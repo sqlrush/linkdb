@@ -324,10 +324,9 @@ extern bool cluster_cf_bootstrap_authority_gate(bool multi_node, ClusterCfContra
  * entry, called once from the startup process before its first authority
  * write (control-file writes during recovery happen before GES is ready).
  *
- *	A no-op when the authority is off.  For a single-node cluster (or with
- *	cluster.enabled off) this node is trivially the sole authority, so the
- *	Phase-1 storage rename probe is run and the bootstrap write window is
- *	opened.  For a multi-node cluster it defers to the gate, which
+ *	A no-op when the authority is off.  An exact one-node declaration is the
+ *	only supported OWNER and installs the boot-local EOR handoff after the
+ *	Phase-1 storage probe.  A multi-node cluster defers to the gate, which
  *	fails closed until the storage has been cross-node verified (Phase-2);
  *	a failure raises FATAL rather than risk a split-brain control-file
  *	write.  Steady-state writes after startup use CF X instead.

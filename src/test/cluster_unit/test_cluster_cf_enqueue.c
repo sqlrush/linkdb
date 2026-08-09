@@ -35,6 +35,7 @@
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_sequence.h"
+#include "miscadmin.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -45,6 +46,16 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+bool cluster_controlfile_shared_authority = false;
+static int g_node_count = 1;
+
+int
+cluster_conf_node_count(void)
+{
+	return g_node_count;
+}
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -117,6 +128,55 @@ bool
 cluster_cf_stats_get_join_readonly(void)
 {
 	return g_join_ro;
+}
+
+/* R18: model the real actor-bound shared phase while testing the enqueue-local
+ * permission and eligibility wrapper without linking cluster_cf_stats.o. */
+static ClusterCfOwnerEorPhase g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_EMPTY;
+
+ClusterCfOwnerEorPhase
+cluster_cf_owner_eor_phase_read(void)
+{
+	return g_owner_eor_phase;
+}
+
+bool
+cluster_cf_owner_eor_phase_install(void)
+{
+	if (!AmStartupProcess() || g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_EMPTY)
+		return false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_INSTALLED;
+	return true;
+}
+
+bool
+cluster_cf_owner_eor_phase_activate(void)
+{
+	if (!AmCheckpointerProcess()
+		|| g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_INSTALLED)
+		return false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_ACTIVE;
+	return true;
+}
+
+bool
+cluster_cf_owner_eor_phase_done(void)
+{
+	if (!AmCheckpointerProcess() || g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_ACTIVE)
+		return false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_DONE;
+	return true;
+}
+
+bool
+cluster_cf_owner_eor_phase_clear(void)
+{
+	if (!AmStartupProcess()
+		|| (g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_INSTALLED
+			&& g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_DONE))
+		return false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_EMPTY;
+	return true;
 }
 
 TimestampTz
@@ -214,6 +274,99 @@ UT_TEST(test_held_and_write_permitted)
 }
 
 /* ======================================================================
+ * R18 -- exact OWNER->EOR eligibility, local authority and abort boundary
+ * ====================================================================== */
+UT_TEST(test_owner_eor_handoff_gates_and_lifecycle)
+{
+	cluster_controlfile_shared_authority = true;
+	g_node_count = 1;
+	g_join_ro = false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_EMPTY;
+	cluster_cf_set_bootstrap_authority(false);
+	cluster_cf_owner_eor_abort();
+
+	/* INSTALL is Startup-only and exact-one-node only. */
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_cf_owner_eor_install());
+	MyAuxProcType = StartupProcess;
+	g_node_count = 2;
+	UT_ASSERT(!cluster_cf_owner_eor_install());
+	g_node_count = 1;
+	g_join_ro = true;
+	UT_ASSERT(!cluster_cf_owner_eor_install());
+	g_join_ro = false;
+	cluster_controlfile_shared_authority = false;
+	UT_ASSERT(!cluster_cf_owner_eor_install());
+	cluster_controlfile_shared_authority = true;
+	UT_ASSERT(cluster_cf_owner_eor_install());
+	UT_ASSERT(cluster_cf_in_bootstrap_window());
+	UT_ASSERT(cluster_cf_write_permitted());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_INSTALLED);
+
+	/* Simulate the separate checkpointer process: phase alone grants no write. */
+	cluster_cf_set_bootstrap_authority(false);
+	UT_ASSERT(!cluster_cf_write_permitted());
+
+	/* CONSUME requires actor, EOR, authority, exact role, JOIN=false and identity. */
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true)); /* still Startup */
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_cf_owner_eor_consume(false, true));
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, false));
+	cluster_controlfile_shared_authority = false;
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true));
+	cluster_controlfile_shared_authority = true;
+	g_node_count = 2;
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true));
+	g_node_count = 1;
+	g_join_ro = true;
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true));
+	g_join_ro = false;
+	UT_ASSERT(cluster_cf_owner_eor_consume(true, true));
+	UT_ASSERT(cluster_cf_owner_eor_local_active());
+	UT_ASSERT(cluster_cf_write_permitted());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_ACTIVE);
+
+	UT_ASSERT(cluster_cf_owner_eor_complete());
+	UT_ASSERT(!cluster_cf_owner_eor_local_active());
+	UT_ASSERT(!cluster_cf_write_permitted());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_DONE);
+
+	/* Original Startup permission remains local there until the final close. */
+	MyAuxProcType = StartupProcess;
+	cluster_cf_set_bootstrap_authority(true);
+	UT_ASSERT(cluster_cf_owner_eor_close());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_EMPTY);
+	UT_ASSERT(!cluster_cf_in_bootstrap_window());
+	UT_ASSERT(!cluster_cf_write_permitted());
+
+	cluster_controlfile_shared_authority = false;
+	MyAuxProcType = NotAnAuxProcess;
+}
+
+UT_TEST(test_owner_eor_abort_retains_active_and_blocks_retry)
+{
+	cluster_controlfile_shared_authority = true;
+	g_node_count = 1;
+	g_join_ro = false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_INSTALLED;
+	cluster_cf_set_bootstrap_authority(false);
+	MyAuxProcType = CheckpointerProcess;
+
+	UT_ASSERT(cluster_cf_owner_eor_consume(true, true));
+	UT_ASSERT(cluster_cf_owner_eor_local_active());
+	cluster_cf_owner_eor_abort();
+	UT_ASSERT(!cluster_cf_owner_eor_local_active());
+	UT_ASSERT(!cluster_cf_write_permitted());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_ACTIVE);
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true));
+
+	/* Test-process cleanup only; product abort/close never performs this edge. */
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_EMPTY;
+	cluster_controlfile_shared_authority = false;
+	MyAuxProcType = NotAnAuxProcess;
+}
+
+/* ======================================================================
  * Db2 -- OK_NATIVE (cluster layer inactive) registers no holder
  * ====================================================================== */
 UT_TEST(test_lock_native_no_release)
@@ -289,10 +442,12 @@ UT_TEST(test_lock_timeout_and_wait_event)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
+	UT_RUN(test_owner_eor_handoff_gates_and_lifecycle);
+	UT_RUN(test_owner_eor_abort_retains_active_and_blocks_retry);
 	UT_RUN(test_lock_native_no_release);
 	UT_RUN(test_lock_failclosed_timeout);
 	UT_RUN(test_lock_s5_fail);

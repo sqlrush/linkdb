@@ -29,6 +29,7 @@
 
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "storage/lock.h"
@@ -58,6 +59,12 @@ static CfHoldState cf_hold_s;
  * write path proceed without a held CF X during early recovery.
  */
 static bool cf_bootstrap_authority = false;
+
+/*
+ * RF-B: process-local permission for the EOR checkpointer.  It is enabled only
+ * after the shared INSTALLED -> ACTIVE CAS and is never inferred from phase.
+ */
+static bool cf_owner_eor_authority = false;
 
 /*
  * spec-5.6 increment (ii/iii): JOIN_READONLY marks an attaching (join) node
@@ -220,12 +227,13 @@ cluster_cf_set_bootstrap_authority(bool on)
 
 /*
  * cluster_cf_write_permitted -- is a shared-authority control-file write
- * currently allowed (held CF X, or the bootstrap single-node window)?
+ * currently allowed (held CF X, Startup owner, or EOR owner)?
  */
 bool
 cluster_cf_write_permitted(void)
 {
-	return cluster_cf_held(ExclusiveLock) || cf_bootstrap_authority;
+	return cluster_cf_held(ExclusiveLock) || cf_bootstrap_authority
+		|| cf_owner_eor_authority;
 }
 
 /*
@@ -235,6 +243,79 @@ bool
 cluster_cf_in_bootstrap_window(void)
 {
 	return cf_bootstrap_authority;
+}
+
+/*
+ * cluster_cf_owner_eor_install -- transport the exact one-node OWNER decision.
+ */
+bool
+cluster_cf_owner_eor_install(void)
+{
+	if (!cluster_controlfile_shared_authority
+		|| cluster_conf_node_count() != 1
+		|| cluster_cf_join_readonly()
+		|| cf_bootstrap_authority)
+		return false;
+	if (!cluster_cf_owner_eor_phase_install())
+		return false;
+
+	cf_bootstrap_authority = true;
+	return true;
+}
+
+/*
+ * cluster_cf_owner_eor_consume -- grant this EOR checkpointer local permission
+ * only after all fresh gates and the exact INSTALLED -> ACTIVE transition.
+ */
+bool
+cluster_cf_owner_eor_consume(bool end_of_recovery, bool identity_ok)
+{
+	if (!end_of_recovery || !identity_ok
+		|| !cluster_controlfile_shared_authority
+		|| cluster_conf_node_count() != 1
+		|| cluster_cf_join_readonly()
+		|| cf_owner_eor_authority)
+		return false;
+	if (!cluster_cf_owner_eor_phase_activate())
+		return false;
+
+	cf_owner_eor_authority = true;
+	return true;
+}
+
+bool
+cluster_cf_owner_eor_local_active(void)
+{
+	return cf_owner_eor_authority;
+}
+
+bool
+cluster_cf_owner_eor_complete(void)
+{
+	if (!cf_owner_eor_authority || !cluster_cf_owner_eor_phase_done())
+		return false;
+
+	cf_owner_eor_authority = false;
+	return true;
+}
+
+void
+cluster_cf_owner_eor_abort(void)
+{
+	/* No I/O, logging or shared transition: ACTIVE deliberately survives. */
+	cf_owner_eor_authority = false;
+}
+
+bool
+cluster_cf_owner_eor_close(void)
+{
+	if (!cf_bootstrap_authority)
+		return cluster_cf_owner_eor_phase_read() == CLUSTER_CF_OWNER_EOR_EMPTY;
+	if (!cluster_cf_owner_eor_phase_clear())
+		return false;
+
+	cf_bootstrap_authority = false;
+	return true;
 }
 
 /*

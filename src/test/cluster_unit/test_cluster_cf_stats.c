@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_cf_stats.h"
+#include "miscadmin.h"
 #include "port/atomics.h"
 
 #ifdef vprintf
@@ -44,9 +45,15 @@
 #include "unit_test.h"
 
 
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+
 /* ============================================================
  * PG runtime stubs.
  * ============================================================ */
+
+static pg_atomic_uint64 cf_buf[2][CLUSTER_CF_COUNTER_COUNT + 2];
+static bool cf_initialized[2];
+static int cf_buf_slot;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -65,15 +72,11 @@ void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
 	if (name != NULL && strcmp(name, "pgrac cluster cf stats") == 0) {
-		/* counters[] (uint64) + the join_readonly uint32 flag; one extra
-		 * pg_atomic_uint64 slot covers the uint32 + padding, 8-byte aligned. */
-		static pg_atomic_uint64 cf_buf[CLUSTER_CF_COUNTER_COUNT + 1];
-		static bool cf_initialized = false;
-
-		Assert(size <= sizeof(cf_buf)); /* catch shmem layout growth */
-		*foundPtr = cf_initialized;
-		cf_initialized = true;
-		return cf_buf;
+		/* counters[] plus two uint32 atomics, with one spare aligned slot. */
+		Assert(size <= sizeof(cf_buf[cf_buf_slot])); /* catch shmem layout growth */
+		*foundPtr = cf_initialized[cf_buf_slot];
+		cf_initialized[cf_buf_slot] = true;
+		return cf_buf[cf_buf_slot];
 	}
 
 	*foundPtr = true;
@@ -126,16 +129,90 @@ UT_TEST(test_cf_counters_inc_read_bounds)
 }
 
 
+/* ============================================================
+ * R18 -- exact actor-bound OWNER -> EOR phase lifecycle.
+ * ============================================================ */
+UT_TEST(test_owner_eor_phase_exact_lifecycle)
+{
+	cf_buf_slot = 0;
+	memset(cf_buf[cf_buf_slot], 0xA5, sizeof(cf_buf[cf_buf_slot]));
+	cf_initialized[cf_buf_slot] = false;
+	cluster_cf_stats_shmem_init();
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_EMPTY);
+
+	/* Only Startup may install/clear, and only the checkpointer activates/dones. */
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_cf_owner_eor_phase_install());
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_install());
+	UT_ASSERT(!cluster_cf_owner_eor_phase_install());
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_INSTALLED);
+
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(!cluster_cf_owner_eor_phase_activate());
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_activate());
+	UT_ASSERT(!cluster_cf_owner_eor_phase_activate());
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_ACTIVE);
+
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(!cluster_cf_owner_eor_phase_clear());
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_done());
+	UT_ASSERT(!cluster_cf_owner_eor_phase_done());
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_DONE);
+
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_cf_owner_eor_phase_clear());
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_clear());
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_EMPTY);
+}
+
+
+/* ============================================================
+ * R18 -- found attach preserves live phase; fresh postmaster starts EMPTY.
+ * ============================================================ */
+UT_TEST(test_owner_eor_phase_attach_and_fresh_init)
+{
+	cf_buf_slot = 0;
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_install());
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_activate());
+
+	/* found=true reattach must not overwrite ACTIVE. */
+	cluster_cf_stats_shmem_init();
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_ACTIVE);
+
+	/* A separate fresh region may contain garbage before init, but starts EMPTY. */
+	cf_buf_slot = 1;
+	memset(cf_buf[cf_buf_slot], 0x5A, sizeof(cf_buf[cf_buf_slot]));
+	cf_initialized[cf_buf_slot] = false;
+	cluster_cf_stats_shmem_init();
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_EMPTY);
+
+	/* The clean nondelegated path is the only other legal clear edge. */
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_install());
+	UT_ASSERT(cluster_cf_owner_eor_phase_clear());
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_EMPTY);
+	MyAuxProcType = NotAnAuxProcess;
+}
+
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(2);
+	UT_PLAN(4);
 
 	UT_RUN(test_cf_counters_null_safe_before_init);
 	UT_RUN(test_cf_counters_inc_read_bounds);
+	UT_RUN(test_owner_eor_phase_exact_lifecycle);
+	UT_RUN(test_owner_eor_phase_attach_and_fresh_init);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

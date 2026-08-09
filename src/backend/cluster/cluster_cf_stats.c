@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cf_stats.c
- *	  CF (control file) shared-authority observability counters (spec-5.6).
+ *	  CF (control file) shared-authority lock-free shared state (spec-5.6).
  *
  *	  Five lock-free shmem counters bumped from the CF modules (X/S acquire and
  *	  fail-closed in the enqueue path, single-node authority in the storage
@@ -29,6 +29,7 @@
 
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_shmem.h"
+#include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/shmem.h"
 
@@ -44,6 +45,8 @@ typedef struct ClusterCfStatsSharedState {
 	 * during the pre-GES bring-up window and clears it once GES is available.
 	 */
 	pg_atomic_uint32 join_readonly;
+	/* RF-B boot-local OWNER -> EOR handoff; not an authority source. */
+	pg_atomic_uint32 owner_eor_phase;
 } ClusterCfStatsSharedState;
 
 static ClusterCfStatsSharedState *cluster_cf_stats_state = NULL;
@@ -72,6 +75,8 @@ cluster_cf_stats_shmem_init(void)
 		for (i = 0; i < CLUSTER_CF_COUNTER_COUNT; i++)
 			pg_atomic_init_u64(&cluster_cf_stats_state->counters[i], 0);
 		pg_atomic_init_u32(&cluster_cf_stats_state->join_readonly, 0);
+		pg_atomic_init_u32(&cluster_cf_stats_state->owner_eor_phase,
+						   CLUSTER_CF_OWNER_EOR_EMPTY);
 	}
 }
 
@@ -130,4 +135,69 @@ cluster_cf_stats_get_join_readonly(void)
 	if (cluster_cf_stats_state == NULL)
 		return false;
 	return pg_atomic_read_u32(&cluster_cf_stats_state->join_readonly) != 0;
+}
+
+
+/* ============================================================
+ * RF-B boot-local OWNER -> EOR handoff (NULL/uninit-safe).
+ * ============================================================ */
+
+ClusterCfOwnerEorPhase
+cluster_cf_owner_eor_phase_read(void)
+{
+	if (cluster_cf_stats_state == NULL)
+		return CLUSTER_CF_OWNER_EOR_EMPTY;
+	return (ClusterCfOwnerEorPhase)
+		pg_atomic_read_u32(&cluster_cf_stats_state->owner_eor_phase);
+}
+
+static bool
+owner_eor_phase_cas(ClusterCfOwnerEorPhase old_phase,
+					ClusterCfOwnerEorPhase new_phase)
+{
+	uint32 expected = (uint32)old_phase;
+
+	if (cluster_cf_stats_state == NULL)
+		return false;
+	return pg_atomic_compare_exchange_u32(&cluster_cf_stats_state->owner_eor_phase,
+									  &expected, (uint32)new_phase);
+}
+
+bool
+cluster_cf_owner_eor_phase_install(void)
+{
+	return AmStartupProcess()
+		&& owner_eor_phase_cas(CLUSTER_CF_OWNER_EOR_EMPTY,
+							   CLUSTER_CF_OWNER_EOR_INSTALLED);
+}
+
+bool
+cluster_cf_owner_eor_phase_activate(void)
+{
+	return AmCheckpointerProcess()
+		&& owner_eor_phase_cas(CLUSTER_CF_OWNER_EOR_INSTALLED,
+							   CLUSTER_CF_OWNER_EOR_ACTIVE);
+}
+
+bool
+cluster_cf_owner_eor_phase_done(void)
+{
+	return AmCheckpointerProcess()
+		&& owner_eor_phase_cas(CLUSTER_CF_OWNER_EOR_ACTIVE,
+							   CLUSTER_CF_OWNER_EOR_DONE);
+}
+
+bool
+cluster_cf_owner_eor_phase_clear(void)
+{
+	ClusterCfOwnerEorPhase phase;
+
+	if (!AmStartupProcess())
+		return false;
+
+	phase = cluster_cf_owner_eor_phase_read();
+	if (phase != CLUSTER_CF_OWNER_EOR_INSTALLED
+		&& phase != CLUSTER_CF_OWNER_EOR_DONE)
+		return false;
+	return owner_eor_phase_cas(phase, CLUSTER_CF_OWNER_EOR_EMPTY);
 }
