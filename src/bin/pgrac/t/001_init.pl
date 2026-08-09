@@ -130,6 +130,12 @@ my $conf6b = PostgreSQL::Test::Utils::slurp_file("$tempdir/d6b/postgresql.conf")
 like($conf6b, qr/^cluster\.wal_threads_dir\s*=\s*'\Q$wroot\E'\s*$/m,
 	'cluster.wal_threads_dir written to postgresql.conf');
 
+my $wal_state_path = "$wroot/pgrac_wal_state";
+is(-s $wal_state_path, 66048,
+	'W1 pgrac-init finalizer creates the exact registry before first server start');
+is((stat($wal_state_path))[2] & 0777, 0600,
+	'W1 offline creator leaves the registry owner-only');
+
 # 6c. Non-empty thread directory is refused (another node's stream).
 command_fails(
 	[ 'pgrac-init', '-D', "$tempdir/d6c", '--node-id=3',
