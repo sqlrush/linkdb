@@ -742,12 +742,45 @@ test_cluster_block_apply: test_cluster_block_apply.c unit_test.h $(CLUSTER_BLOCK
 
 # Stage 8 JIT Task 4: exhaustive generated failed-origin route authority.
 CLUSTER_RF_ROUTE_O = $(top_builddir)/src/backend/cluster/cluster_rf_route.o
+RF_ROUTE_WALDUMP_DIR = $(top_builddir)/src/bin/pg_waldump
+RF_ROUTE_RMGRDESC_OBJS = $(addprefix $(RF_ROUTE_WALDUMP_DIR)/, \
+	brindesc.o clogdesc.o clusteradgdesc.o clusterrawdesc.o \
+	clusterundodesc.o clusterxidstripedesc.o committsdesc.o dbasedesc.o \
+	genericdesc.o gindesc.o gistdesc.o hashdesc.o heapdesc.o \
+	logicalmsgdesc.o mxactdesc.o nbtdesc.o relmapdesc.o replorigindesc.o \
+	rmgrdesc_utils.o seqdesc.o smgrdesc.o spgdesc.o standbydesc.o \
+	tblspcdesc.o xactdesc.o xlogdesc.o rmgrdesc.o compat.o xlogreader.o)
+RF_ROUTE_MUTANT_O = test_cluster_rf_route_mutant.o
+RF_ROUTE_MUTANT = test_cluster_rf_route_mutant
+
+.PHONY: submake-rf-route-rmgrdesc check_cluster_rf_route_drift
+submake-rf-route-rmgrdesc:
+	$(MAKE) -C $(RF_ROUTE_WALDUMP_DIR) pg_waldump
+
 test_cluster_rf_route: test_cluster_rf_route.c unit_test.h \
-		$(CLUSTER_RF_ROUTE_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_RF_ROUTE_O) submake-rf-route-rmgrdesc
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pg_waldump $< \
 		$(CLUSTER_RF_ROUTE_O) \
+		$(RF_ROUTE_RMGRDESC_OBJS) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport.a -o $@
+
+check_cluster_rf_route_drift: test_cluster_rf_route.c unit_test.h \
+		cluster_rf_route_opcode_mutation.h submake-rf-route-rmgrdesc
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-include $(CURDIR)/cluster_rf_route_opcode_mutation.h \
+		-c $(top_srcdir)/src/backend/cluster/cluster_rf_route.c -o $(RF_ROUTE_MUTANT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pg_waldump \
+		-DT4_ROUTE_DRIFT_MUTANT test_cluster_rf_route.c \
+		$(RF_ROUTE_MUTANT_O) $(RF_ROUTE_RMGRDESC_OBJS) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a -o $(RF_ROUTE_MUTANT)
+	@if ./$(RF_ROUTE_MUTANT); then \
+		echo "not ok - JIT_SEMANTIC_RED:T4-NAMED-OPCODE-DRIFT-SURVIVED"; \
+		exit 1; \
+	else \
+		echo "ok - named-opcode mutation rejected"; \
+	fi
 
 # spec-4.11 D1: test_cluster_thread_apply links the real online thread-recovery
 # apply wrapper object and stubs cluster_block_apply_one (its byte-for-byte
@@ -1108,7 +1141,7 @@ check: all
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) $(RF_ROUTE_MUTANT) $(RF_ROUTE_MUTANT_O)
 
 install installdirs uninstall installcheck:
 	@:

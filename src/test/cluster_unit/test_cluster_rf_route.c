@@ -35,12 +35,38 @@
 #include "unit_test.h"
 
 #ifdef HAVE_CLUSTER_RF_ROUTE
+#include "access/brin_xlog.h"
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/generic_xlog.h"
+#include "access/ginxlog.h"
+#include "access/gistxlog.h"
+#include "access/hash_xlog.h"
+#include "access/heapam_xlog.h"
+#include "access/multixact.h"
+#include "access/nbtxlog.h"
 #include "access/rmgr.h"
+#include "access/spgxlog.h"
 #include "access/xact.h"
+#include "access/xlog_internal.h"
 #include "access/xlogrecord.h"
+#include "catalog/storage_xlog.h"
 #include "common/cryptohash.h"
 #include "common/relpath.h"
 #include "common/sha2.h"
+#include "commands/dbcommands_xlog.h"
+#include "commands/sequence.h"
+#include "commands/tablespace.h"
+#include "replication/message.h"
+#include "replication/origin.h"
+#include "rmgrdesc.h"
+#include "storage/standby.h"
+#include "utils/relmapper.h"
+
+#include "cluster/cluster_adg_xlog.h"
+#include "cluster/cluster_xid_stripe_xlog.h"
+#include "cluster/storage/cluster_raw_xlog.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #endif
 
 UT_DEFINE_GLOBALS();
@@ -98,6 +124,17 @@ enum {
 	T4_PAGE_CLASS_ROUTED_SIDE = 5,
 	T4_PAGE_CLASS_TEMP_LOCAL = 6
 };
+
+/* Every built-in rmgrlist row must name a compiler-visible redo handler. */
+enum {
+	T4_REAL_REDO_DECL_COUNT = 0
+#define PG_RMGR(symname, name, redo, desc, identify, startup, cleanup, mask, decode)               \
+	+((sizeof(&(redo))) > 0 ? 1 : 0)
+#include "access/rmgrlist.h"
+#undef PG_RMGR
+};
+
+StaticAssertDecl(T4_REAL_REDO_DECL_COUNT == 26, "real built-in redo declaration census");
 
 static RfOpcodeRouteV1
 t4_route_sentinel(void)
@@ -221,6 +258,64 @@ UT_TEST(test_canonical_manifest_stream)
 	UT_ASSERT_EQ(used, T4_ROUTE_KEY_STREAM_LEN);
 	UT_ASSERT(t4_sha256_hex((const uint8 *)stream, used, digest));
 	UT_ASSERT_STR_EQ(digest, T4_ROUTE_SHA256);
+}
+
+UT_TEST(test_real_identify_and_redo_manifest_census)
+{
+	bool seen[26][16] = { { false } };
+	uint16 identified_count = 0;
+	uint16 live_manifest_count = 0;
+	uint8 rmid;
+	uint16 i;
+
+	UT_ASSERT_EQ(T4_REAL_REDO_DECL_COUNT, 26);
+	for (rmid = 0; rmid < 26; rmid++) {
+		const RmgrDescData *rmgr = GetRmgrDesc(rmid);
+		uint8 nibble_limit = rmid == RM_XACT_ID ? 8 : (rmid == RM_GENERIC_ID ? 1 : 16);
+		uint8 nibble;
+
+		UT_ASSERT_NOT_NULL(rmgr);
+		UT_ASSERT_NOT_NULL(rmgr->rm_identify);
+		for (nibble = 0; nibble < nibble_limit; nibble++) {
+			RfOpcodeRouteV1 route;
+			bool active;
+			const char *name;
+			uint8 raw_info = (uint8)(nibble << 4);
+			uint8 normalized_info
+				= rmid == RM_XACT_ID ? raw_info & XLOG_XACT_OPMASK : raw_info;
+
+			if (rmgr->rm_identify(raw_info) == NULL)
+				continue;
+			UT_ASSERT(!seen[rmid][normalized_info >> 4]);
+			seen[rmid][normalized_info >> 4] = true;
+			UT_ASSERT(t4_manifest_find(rmid, normalized_info, &route, &active, &name));
+			UT_ASSERT(active);
+			identified_count++;
+		}
+	}
+
+	for (i = 0; i < rf_opcode_route_manifest_count_v1(); i++) {
+		RfOpcodeRouteV1 route;
+		bool active;
+		const char *name;
+		const RmgrDescData *rmgr;
+
+		UT_ASSERT(rf_opcode_route_manifest_at_v1(i, &route, &active, &name));
+		rmgr = GetRmgrDesc(route.rmid);
+		UT_ASSERT_NOT_NULL(rmgr);
+		if (active) {
+			UT_ASSERT_NOT_NULL(rmgr->rm_identify(route.normalized_info));
+			UT_ASSERT(seen[route.rmid][route.normalized_info >> 4]);
+			live_manifest_count++;
+		} else {
+			UT_ASSERT_EQ(route.rmid, RM_CLUSTER_UNDO_ID);
+			UT_ASSERT_EQ(route.normalized_info, 0xA0);
+			UT_ASSERT_NULL(rmgr->rm_identify(route.normalized_info));
+		}
+	}
+
+	UT_ASSERT_EQ(identified_count, 136);
+	UT_ASSERT_EQ(live_manifest_count, 136);
 }
 
 UT_TEST(test_every_manifest_row_lookup)
@@ -464,6 +559,23 @@ UT_TEST(test_component_classes_and_unique_owners)
 				 (int)RF_OPCODE_ROUTE_COMPONENT_CLASS_INVALID);
 }
 
+UT_TEST(test_inactive_routed_header_rejected_without_mutation)
+{
+	RfOpcodeRouteV1 route;
+	RfRouteComponentV1 component;
+	RfRouteComponentV1 before;
+
+	UT_ASSERT_EQ((int)rf_opcode_route_lookup_v1(RM_HEAP_ID, XLOG_HEAP_INSERT, 1, &route),
+				 (int)RF_OPCODE_ROUTE_OK);
+	component
+		= t4_component(T4_PAGE_CLASS_ROUTED_HEADER, MAIN_FORKNUM, 1, RF_ROUTE_OWNER_SIDE_TYPED);
+	before = component;
+	printf("# JIT_SEMANTIC_RED:T4-ROUTED-HEADER-INACTIVE\n");
+	UT_ASSERT_EQ((int)rf_opcode_route_validate_components_v1(&route, &component, 1),
+				 (int)RF_OPCODE_ROUTE_COMPONENT_CLASS_INVALID);
+	UT_ASSERT_EQ(memcmp(&component, &before, sizeof(component)), 0);
+}
+
 UT_TEST(test_invalid_api_inputs_leave_outputs_untouched)
 {
 	RfOpcodeRouteV1 route = t4_route_sentinel();
@@ -490,10 +602,19 @@ int
 main(void)
 {
 #ifdef HAVE_CLUSTER_RF_ROUTE
-	UT_PLAN(12);
+#ifdef T4_ROUTE_DRIFT_MUTANT
+	UT_PLAN(3);
+#else
+	UT_PLAN(14);
+#endif
 #else
 	UT_PLAN(4);
 #endif
+#ifdef T4_ROUTE_DRIFT_MUTANT
+	UT_RUN(test_route_abi_and_counts);
+	UT_RUN(test_canonical_manifest_stream);
+	UT_RUN(test_real_identify_and_redo_manifest_census);
+#else
 	UT_RUN(test_existing_apply_boundary_control);
 #ifndef HAVE_CLUSTER_RF_ROUTE
 	UT_RUN(test_red_page_zero_block_must_not_be_noop);
@@ -502,6 +623,7 @@ main(void)
 #else
 	UT_RUN(test_route_abi_and_counts);
 	UT_RUN(test_canonical_manifest_stream);
+	UT_RUN(test_real_identify_and_redo_manifest_census);
 	UT_RUN(test_every_manifest_row_lookup);
 	UT_RUN(test_every_unused_nibble_fails_closed);
 	UT_RUN(test_xact_flags_and_init_combinations);
@@ -510,7 +632,9 @@ main(void)
 	UT_RUN(test_typed_no_ordinary_routes);
 	UT_RUN(test_stop07_row_present_but_inactive);
 	UT_RUN(test_component_classes_and_unique_owners);
+	UT_RUN(test_inactive_routed_header_rejected_without_mutation);
 	UT_RUN(test_invalid_api_inputs_leave_outputs_untouched);
+#endif
 #endif
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
