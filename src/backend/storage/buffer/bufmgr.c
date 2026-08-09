@@ -762,27 +762,42 @@ cluster_bufmgr_pcm_own_republish_grant_pending_image(BufferDesc *buf)
 }
 
 static ClusterPcmOwnResult
-cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, ClusterPcmOwnSnapshot *out_base,
-										uint64 *out_token)
+cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, PcmLockMode requested_mode,
+										ClusterPcmOwnSnapshot *out_base, uint64 *out_token,
+										bool *out_covered)
 {
 	ClusterPcmOwnResult result;
 	uint32 buf_state;
 
-	if (buf == NULL || out_base == NULL || out_token == NULL)
+	if (buf == NULL || out_base == NULL || out_token == NULL || out_covered == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
 	memset(out_base, 0, sizeof(*out_base));
 	*out_token = 0;
+	*out_covered = false;
 	if (ClusterPcmOwnArray == NULL)
 		return CLUSTER_PCM_OWN_NOT_READY;
 
 	buf_state = LockBufHdr(buf);
 	cluster_pcm_own_snapshot_locked(buf, out_base);
-	result = cluster_pcm_own_reservation_begin_exact(buf->buf_id, out_base->generation,
-													 PCM_OWN_FLAG_GRANT_PENDING, out_token);
+	/* PGRAC: close the unlocked-cover/begin TOCTOU.  Another local backend can
+	 * commit a covering S/X before this header-locked snapshot.  Hand the
+	 * stable cover to the existing content-lock reverify path instead of
+	 * minting a fresh-token S_NEW/X_NEW shape. */
+	if (cluster_gcs_block_local_cache
+		&& cluster_pcm_x_cached_cover_reverify_accepts(
+			(uint8)requested_mode, out_base->generation, out_base->generation,
+			out_base->pcm_state, out_base->flags))
+	{
+		*out_covered = true;
+		result = CLUSTER_PCM_OWN_OK;
+	}
+	else
+		result = cluster_pcm_own_reservation_begin_exact(buf->buf_id, out_base->generation,
+											 PCM_OWN_FLAG_GRANT_PENDING, out_token);
 	UnlockBufHdr(buf, buf_state);
 	/* Exact begin allocated a fresh token under header authority; a replayed
 	 * or refused begin reports BUSY/STALE and never reaches here. */
-	if (result == CLUSTER_PCM_OWN_OK)
+	if (result == CLUSTER_PCM_OWN_OK && !*out_covered)
 		cluster_pcm_x_stats_note_own_begin();
 	return result;
 }
@@ -1415,16 +1430,17 @@ cluster_bufmgr_pcm_x_holder_retry_wait(LWLock *content_lock, int32 buffer_id,
  * client-visible exhaustion error.
  */
 static ClusterPcmOwnResult
-cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf,
+cluster_bufmgr_pcm_begin_grant_reservation_wait(BufferDesc *buf, PcmLockMode requested_mode,
 												ClusterPcmOwnSnapshot *base_out,
-												uint64 *token_out)
+												uint64 *token_out, bool *covered_out)
 {
 	ClusterPcmOwnResult result;
 	uint32		waits = 0;
 
 	for (;;)
 	{
-		result = cluster_pcm_own_begin_grant_reservation(buf, base_out, token_out);
+		result = cluster_pcm_own_begin_grant_reservation(buf, requested_mode, base_out,
+												 token_out, covered_out);
 		if (result != CLUSTER_PCM_OWN_BUSY)
 			return result;
 		if (cluster_pcm_x_nested_wait_guard_before_block() != PCM_X_QUEUE_OK)
@@ -1517,6 +1533,7 @@ cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 	uint8 current_state;
 	uint32 current_flags;
 	long backoff_ms;
+	bool begin_covered;
 
 	if (buf == NULL || base == NULL || reservation_token == NULL
 		|| covered_generation == NULL)
@@ -1567,10 +1584,16 @@ cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 	ResetLatch(MyLatch);
 	CHECK_FOR_INTERRUPTS();
 
-	own_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(buf, base, reservation_token);
+	own_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
+		buf, pcm_mode, base, reservation_token, &begin_covered);
 	if (own_result != CLUSTER_PCM_OWN_OK)
 		cluster_pcm_own_report_bump_failure(buf, own_result, base->generation, base->flags,
 										"pending-X retry reservation");
+	if (begin_covered)
+	{
+		*covered_generation = base->generation;
+		return CLUSTER_BUFMGR_PCM_RETRY_COVERED;
+	}
 	cluster_bufmgr_pcm_legacy_begin_probe(buf, pcm_mode, base, "pending-X retry reservation");
 	return CLUSTER_BUFMGR_PCM_RETRY_REARMED;
 }
@@ -8621,11 +8644,18 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 				 * ACTIVE_TRANSFER/PREPARE.
 				 */
 				pcm_pending_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
-					buf, &pcm_pending_base, &pcm_pending_token);
+					buf, pcm_mode, &pcm_pending_base, &pcm_pending_token, &pcm_covered);
 				if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
 					cluster_pcm_own_report_bump_failure(
 						buf, pcm_pending_result, pcm_pending_base.generation,
 						pcm_pending_base.flags, "LockBuffer master reservation");
+				if (pcm_covered)
+				{
+					pcm_covered_gen = pcm_pending_base.generation;
+					if (pcm_mode == PCM_LOCK_MODE_S)
+						cluster_xp_note_read(false);
+					goto pcm_legacy_acquire_done;
+				}
 				cluster_bufmgr_pcm_legacy_begin_probe(buf, pcm_mode,
 													  &pcm_pending_base,
 													  "master-reservation");
@@ -8676,6 +8706,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 					}
 					pcm_pending_set = true;
 				}
+pcm_legacy_acquire_done:
+				;
 			}
 		}
 	}
@@ -8813,11 +8845,17 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 							 * acquire remains the ordered path.
 							 */
 							pcm_pending_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
-								buf, &pcm_pending_base, &pcm_pending_token);
+								buf, pcm_mode, &pcm_pending_base, &pcm_pending_token,
+								&pcm_covered);
 							if (pcm_pending_result != CLUSTER_PCM_OWN_OK)
 								cluster_pcm_own_report_bump_failure(
 									buf, pcm_pending_result, pcm_pending_base.generation,
 									pcm_pending_base.flags, "LockBuffer revalidate reservation");
+							if (pcm_covered)
+							{
+								pcm_covered_gen = pcm_pending_base.generation;
+								goto pcm_revalidate_acquire_done;
+							}
 							cluster_bufmgr_pcm_legacy_begin_probe(
 								buf, pcm_mode, &pcm_pending_base,
 								"revalidate-reservation");
@@ -8846,6 +8884,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused)
 								}
 								pcm_pending_set = true;
 							}
+pcm_revalidate_acquire_done:
+							;
 						}
 						if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
 						{
