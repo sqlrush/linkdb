@@ -303,6 +303,12 @@ cluster_current_phase(void)
 	return stats_test_phase;
 }
 
+const char *
+cluster_startup_phase_to_string(ClusterStartupPhase phase pg_attribute_unused())
+{
+	return "test_phase";
+}
+
 bool
 cluster_write_fence_startup_self_check(void)
 {
@@ -332,6 +338,14 @@ GetWALInsertionTimeLine(void)
 XLogRecPtr
 GetXLogWriteRecPtr(void)
 {
+	return 300;
+}
+
+XLogRecPtr
+GetXLogReplayRecPtr(TimeLineID *replayTLI)
+{
+	if (replayTLI != NULL)
+		*replayTLI = 7;
 	return 300;
 }
 
@@ -441,14 +455,6 @@ run_one_stats_incarnation(void)
 UT_DEFINE_GLOBALS();
 
 
-/* spec-4.2 D4 stub: cluster_stats.c refreshes the WAL-state registry
- * slot each tick; the registry module is not linked here (L104). */
-void cluster_wal_state_refresh_own_slot(void);
-void
-cluster_wal_state_refresh_own_slot(void)
-{}
-
-
 /* ============================================================
  * Compile-time anchors
  * ============================================================ */
@@ -528,6 +534,13 @@ UT_TEST(test_rf_a1_initial_stats_owns_active_checkpoint_then_telemetry)
 				 CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 	UT_ASSERT_EQ(stats_test_telemetry_calls, 1);
 	UT_ASSERT_EQ((int)stats_test_telemetry_status, (int)CLUSTER_STATS_READY);
+	UT_ASSERT_EQ((int)stats_test_telemetry_update.kind,
+				 (int)CLUSTER_WAL_STATE_UPDATE_TELEMETRY);
+	UT_ASSERT_EQ((int)stats_test_telemetry_update.tli, 7);
+	UT_ASSERT_EQ((int64)stats_test_telemetry_update.started_at, (int64)0);
+	UT_ASSERT_EQ((uint64)stats_test_telemetry_update.highest_lsn, (uint64)300);
+	UT_ASSERT_EQ((uint64)stats_test_telemetry_update.highest_scn, (uint64)400);
+	UT_ASSERT_EQ((int)stats_test_telemetry_update.refresh_interval_ms, 1000);
 }
 
 
@@ -560,6 +573,31 @@ UT_TEST(test_rf_a1_running_respawn_validates_active_without_replaying_w2)
 }
 
 
+UT_TEST(test_rf_a1_unconfigured_registry_keeps_stats_vanilla)
+{
+	reset_stats_lifecycle_fixture();
+	cluster_wal_threads_dir = NULL;
+	run_one_stats_incarnation();
+
+	UT_ASSERT_EQ(stats_test_self_check_calls, 0);
+	UT_ASSERT_EQ(stats_test_active_calls, 0);
+	UT_ASSERT_EQ(stats_test_checkpoint_calls, 0);
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 0);
+	cluster_wal_threads_dir = "/rf-a1/formed";
+}
+
+
+UT_TEST(test_rf_a1_w4_failure_increments_existing_counter)
+{
+	reset_stats_lifecycle_fixture();
+	stats_test_telemetry_result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+	run_one_stats_incarnation();
+
+	UT_ASSERT_EQ(stats_test_telemetry_calls, 1);
+	UT_ASSERT_EQ((uint64)stats_test_refresh_fail_count, (uint64)1);
+}
+
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -567,7 +605,7 @@ UT_TEST(test_rf_a1_running_respawn_validates_active_without_replaying_w2)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(10);
 	UT_RUN(test_stats_status_enum_values_frozen);
 	UT_RUN(test_stats_shared_state_size_under_4kb);
 	UT_RUN(test_stats_status_to_string_lookup);
@@ -576,6 +614,8 @@ main(void)
 	UT_RUN(test_rf_a1_initial_stats_owns_active_checkpoint_then_telemetry);
 	UT_RUN(test_rf_a1_self_fenced_initial_stats_skips_active_and_checkpoint);
 	UT_RUN(test_rf_a1_running_respawn_validates_active_without_replaying_w2);
+	UT_RUN(test_rf_a1_unconfigured_registry_keeps_stats_vanilla);
+	UT_RUN(test_rf_a1_w4_failure_increments_existing_counter);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

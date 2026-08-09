@@ -40,9 +40,12 @@
 
 #include <unistd.h>
 
+#include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/auxprocess.h"
+#include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -58,9 +61,13 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_scn.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_stats.h"
-#include "cluster/cluster_wal_state.h" /* spec-4.2 D4 registry refresh */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_write_fence.h"
 
 
 /*
@@ -413,9 +420,155 @@ stats_advance_liveness_tick(void)
 }
 
 
+static bool
+stats_wal_state_configured(void)
+{
+	return cluster_enabled && cluster_wal_threads_dir != NULL
+		&& cluster_wal_threads_dir[0] != '\0';
+}
+
+
+static void
+stats_fill_wal_state_update(ClusterWalStateUpdateKind kind, int64 started_at,
+							ClusterWalStateUpdate *update)
+{
+	TimeLineID tli;
+	XLogRecPtr write_ptr;
+
+	Assert(update != NULL);
+	memset(update, 0, sizeof(*update));
+	if (RecoveryInProgress()) {
+		tli = 0;
+		write_ptr = GetXLogReplayRecPtr(&tli);
+	} else {
+		tli = GetWALInsertionTimeLine();
+		write_ptr = GetXLogWriteRecPtr();
+	}
+	update->kind = kind;
+	update->tli = (uint32)tli;
+	update->started_at = started_at;
+	update->last_updated = (int64)GetCurrentTimestamp();
+	update->highest_lsn = (uint64)write_ptr;
+	update->highest_scn = (uint64)cluster_scn_current();
+	update->refresh_interval_ms = (uint32)cluster_cluster_stats_main_loop_interval;
+}
+
+
+/*
+ * Initial phase-4 Stats owns W2 because AuxiliaryProcessMain has already
+ * assigned its PGPROC.  A RUNNING respawn only validates the previously
+ * published ACTIVE slot; it never repeats W2 or the forced checkpoint.
+ * The return value suppresses W4 for the existing self-fenced terminal.
+ */
+static bool
+stats_prepare_incarnation(void)
+{
+	ClusterStartupPhase phase = cluster_current_phase();
+
+	if (phase == CLUSTER_PHASE_4_NORMAL) {
+		ClusterWalStateUpdate update;
+		ClusterWalStateUpdateResult result;
+		int64 started_at;
+
+		if (!stats_wal_state_configured())
+			return false;
+
+		if (cluster_write_fence_startup_self_check()) {
+			ereport(WARNING,
+					(errcode(ERRCODE_CLUSTER_WRITE_FENCED),
+					 errmsg("this node is fenced by a membership reconfiguration; "
+							"Cluster Stats is entering non-serving mode"),
+					 errdetail("The durable fence marker lists this node as dead; "
+							   "ACTIVE, the startup checkpoint, and telemetry are skipped."),
+					 errhint("Recover only through the controlled rejoin or cold-admin "
+							 "procedure; never clear a live-cluster fence marker manually.")));
+			return true;
+		}
+
+		LWLockAcquire(&cluster_stats_state->lwlock, LW_SHARED);
+		started_at = (int64)cluster_stats_state->spawned_at;
+		LWLockRelease(&cluster_stats_state->lwlock);
+		stats_fill_wal_state_update(CLUSTER_WAL_STATE_UPDATE_ACTIVE, started_at, &update);
+		result = cluster_wal_state_update_own(
+			&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+		if (result != CLUSTER_WAL_STATE_UPDATE_OK
+			&& result != CLUSTER_WAL_STATE_UPDATE_NOOP)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+					 errmsg("could not publish ACTIVE to the WAL state registry"),
+					 errdetail("The verified-CF update returned result %d.", (int)result),
+					 errhint("The node remains outside RUNNING admission; preserve and "
+							 "inspect the registry evidence before retrying.")));
+
+		ereport(LOG,
+				(errmsg("pgrac WAL thread %u published ACTIVE in the WAL state registry",
+						(unsigned)cluster_wal_thread_id())));
+		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
+		return false;
+	}
+
+	if (phase == CLUSTER_PHASE_RUNNING) {
+		ClusterWalStateSlot slot;
+		ClusterWalSlotVerdict verdict;
+
+		if (!stats_wal_state_configured())
+			return false;
+		memset(&slot, 0, sizeof(slot));
+		if (!cluster_wal_state_registry_ready())
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+					 errmsg("Cluster Stats respawn could not validate the WAL state registry"),
+					 errhint("The RUNNING respawn never recreates or repairs registry evidence.")));
+		verdict = cluster_wal_state_read_slot(cluster_wal_thread_id(), &slot);
+		if (verdict != CLUSTER_WAL_SLOT_OK || slot.node_id != cluster_node_id
+			|| slot.state != CLUSTER_WAL_SLOT_STATE_ACTIVE)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+					 errmsg("Cluster Stats respawn requires a valid own ACTIVE WAL state slot"),
+					 errdetail("Slot verdict=%d node=%d state=%u; expected node=%d ACTIVE.",
+							   (int)verdict, (int)slot.node_id, slot.state, cluster_node_id),
+					 errhint("The respawn does not replay W2 or force another checkpoint.")));
+		return false;
+	}
+
+	ereport(FATAL,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg("Cluster Stats started outside phase4_normal or running"),
+			 errdetail("Current cluster phase is %s.", cluster_startup_phase_to_string(phase))));
+	return true;
+}
+
+
+static void
+stats_refresh_wal_state(void)
+{
+	ClusterWalStateUpdate update;
+	ClusterWalStateUpdateResult result;
+
+	if (!stats_wal_state_configured())
+		return;
+	stats_fill_wal_state_update(CLUSTER_WAL_STATE_UPDATE_TELEMETRY, 0, &update);
+	result = cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+	if (result == CLUSTER_WAL_STATE_UPDATE_OK || result == CLUSTER_WAL_STATE_UPDATE_NOOP
+		|| result == CLUSTER_WAL_STATE_UPDATE_EMPTY
+		|| result == CLUSTER_WAL_STATE_UPDATE_WRONG_STATE)
+		return;
+
+	if (cluster_wal_thread_refresh_fail_fetch_add() == 0)
+		ereport(LOG,
+				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+				 errmsg("could not refresh the WAL state registry slot"),
+				 errdetail("The verified-CF update returned result %d.", (int)result),
+				 errhint("Further refresh failures are counted, not logged "
+						 "(cluster.wal_thread.wal_state_refresh_fail_count).")));
+}
+
+
 void
 ClusterStatsMain(void)
 {
+	bool suppress_wal_telemetry;
+
 	/*
 	 * HC1 reverse defense: ClusterStatsMain runs in the Cluster Stats child, so
 	 * IsUnderPostmaster MUST be true.  Catch a misconfigured
@@ -458,6 +611,7 @@ ClusterStatsMain(void)
 
 	/* Publish SPAWNING (records pid + spawned_at). */
 	stats_publish_status(CLUSTER_STATS_SPAWNING);
+	suppress_wal_telemetry = stats_prepare_incarnation();
 
 	/* Sprint B inject: ready-publish (test slow startup / phase 1 wait timeout). */
 	CLUSTER_INJECTION_POINT("cluster-stats-ready-publish");
@@ -493,13 +647,9 @@ ClusterStatsMain(void)
 
 		stats_advance_liveness_tick();
 
-		/*
-		 * spec-4.2 D4: best-effort ClusterWalState registry refresh on
-		 * the same cadence (cluster.cluster_stats_main_loop_interval).
-		 * Gated inside on the own slot reading back OK+ACTIVE, so it
-		 * is a no-op until publish_active() ran and on flat layouts.
-		 */
-		cluster_wal_state_refresh_own_slot();
+		/* RF A1 W4: one typed, verified-CF telemetry update per tick. */
+		if (!suppress_wal_telemetry)
+			stats_refresh_wal_state();
 
 		/* Sprint B inject: main-loop-iter (test mid-loop fault). */
 		CLUSTER_INJECTION_POINT("cluster-stats-main-loop-iter");

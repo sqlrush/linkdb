@@ -179,6 +179,10 @@ timestamptz_to_str(TimestampTz dt pg_attribute_unused())
 	return "(stub)";
 }
 
+void
+pg_usleep(long microsec pg_attribute_unused())
+{}
+
 /* pg_snprintf: cluster_startup_phase.c uses snprintf (macro'd to
  * pg_snprintf in PG).  Forward to libc vsnprintf in unit test. */
 #include <stdarg.h>
@@ -239,6 +243,7 @@ int cluster_phase4_timeout = 30;
 /* Spec-1.11 Sprint B: cluster_startup_phase.c references cluster_enabled */
 bool cluster_enabled = true;
 bool cluster_lms_enabled = true;
+bool cluster_controlfile_shared_authority = true;
 char *cluster_wal_threads_dir = "/rf-a1/formed";
 /* Spec-1.16 D13: cluster_finalize_startup_running references cluster_node_id
  * for SCN_NODE_ID_VALID validation.  Pin to 0 (valid) so unit test does
@@ -556,6 +561,29 @@ UT_TEST(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready)
 }
 
 
+UT_TEST(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order)
+{
+	phase4_event_count = 0;
+	phase4_events[0] = '\0';
+	cluster_wal_threads_dir = NULL;
+	cluster_phase_shmem_init();
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
+	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
+	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
+
+	cluster_run_phase4_sequence();
+
+	UT_ASSERT_STR_EQ(phase4_events, "DdSsCcQq");
+	startup_self_check_calls = 0;
+	postmaster_publish_active_calls = 0;
+	cluster_finalize_startup_running();
+	UT_ASSERT_EQ(startup_self_check_calls, 1);
+	UT_ASSERT_EQ(postmaster_publish_active_calls, 0);
+	cluster_wal_threads_dir = "/rf-a1/formed";
+}
+
+
 UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
 {
 	postmaster_publish_active_calls = 0;
@@ -574,7 +602,7 @@ UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -585,6 +613,7 @@ main(void)
 	UT_RUN(test_phase_shmem_register_init_linkable);
 	UT_RUN(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
+	UT_RUN(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
