@@ -75,6 +75,7 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_sf_dep.h" /* ClusterSfDepVec / max origins */
+#include "cluster/cluster_tx_resolve.h"
 #include "storage/block.h"			/* BLCKSZ */
 #include "storage/buf_internals.h"	/* BufferTag, BufferDesc */
 
@@ -2859,6 +2860,39 @@ StaticAssertDecl(offsetof(ClusterR4ForwardExtension,
 				 "R4 FORWARD96 transition count must occupy absolute bytes 76..83");
 
 static inline void
+ClusterR4WireWriteU16(uint8 out[2], uint16 value)
+{
+	out[0] = (uint8)value;
+	out[1] = (uint8)(value >> 8);
+}
+
+static inline uint16
+ClusterR4WireReadU16(const uint8 in[2])
+{
+	return (uint16)((uint16)in[0] | ((uint16)in[1] << 8));
+}
+
+static inline void
+ClusterR4WireWriteU32(uint8 out[4], uint32 value)
+{
+	int i;
+
+	for (i = 0; i < 4; i++)
+		out[i] = (uint8)(value >> (i * 8));
+}
+
+static inline uint32
+ClusterR4WireReadU32(const uint8 in[4])
+{
+	uint32 value = 0;
+	int i;
+
+	for (i = 0; i < 4; i++)
+		value |= (uint32)in[i] << (i * 8);
+	return value;
+}
+
+static inline void
 ClusterR4WireWriteU64(uint8 out[8], uint64 value)
 {
 	int i;
@@ -2973,6 +3007,93 @@ ClusterR4ForwardExtensionGetCrProof(const ClusterR4ForwardExtension *extension,
 	*master_resource_transition_count_out = transition_count;
 	*expected_page_scn_out
 		= (SCN)ClusterR4WireReadU64(extension->kind.cr.expected_page_scn_le);
+	return true;
+}
+
+#define CLUSTER_R4_TX_VERDICT_MAGIC UINT32_C(0x50475556)
+#define CLUSTER_R4_TX_VERDICT_VERSION UINT16_C(3)
+#define CLUSTER_R4_TX_VERDICT_HEADER_LEN UINT16_C(80)
+
+/*
+ * Exact V3 transaction-verdict payload carried at the head of a BLCKSZ reply
+ * page.  The page is encoded bytewise so compiler packing and host endian are
+ * never wire authority.  Bytes 80..BLCKSZ-1 are part of the canonical form
+ * and must remain zero.
+ */
+static inline bool
+ClusterR4TxVerdictPageEncode(uint8 page_out[BLCKSZ], const ClusterTxResolution *resolution)
+{
+	if (page_out != NULL)
+		memset(page_out, 0, BLCKSZ);
+	if (page_out == NULL || resolution == NULL
+		|| !cluster_tx_outcome_proof_is_valid(resolution->outcome, resolution->proof_kind))
+		return false;
+
+	ClusterR4WireWriteU32(&page_out[0], CLUSTER_R4_TX_VERDICT_MAGIC);
+	ClusterR4WireWriteU16(&page_out[4], CLUSTER_R4_TX_VERDICT_VERSION);
+	ClusterR4WireWriteU16(&page_out[6], CLUSTER_R4_TX_VERDICT_HEADER_LEN);
+	page_out[8] = (uint8)resolution->outcome;
+	page_out[9] = (uint8)resolution->proof_kind;
+	ClusterR4WireWriteU64(&page_out[12], resolution->locator_echo.uba.raw[0]);
+	ClusterR4WireWriteU64(&page_out[20], resolution->locator_echo.uba.raw[1]);
+	ClusterR4WireWriteU32(&page_out[28], (uint32)resolution->locator_echo.xid);
+	ClusterR4WireWriteU16(&page_out[32], resolution->locator_echo.tt_wrap);
+	page_out[34] = resolution->locator_echo.itl_kind;
+	page_out[35] = resolution->locator_echo.itl_slot_index;
+	ClusterR4WireWriteU32(&page_out[36], (uint32)resolution->top_xid);
+	ClusterR4WireWriteU64(&page_out[40], (uint64)resolution->commit_scn);
+	ClusterR4WireWriteU64(&page_out[48], (uint64)resolution->horizon_scn);
+	ClusterR4WireWriteU64(&page_out[56], resolution->authority.origin_epoch);
+	ClusterR4WireWriteU64(&page_out[64], resolution->authority.tt_generation);
+	ClusterR4WireWriteU64(&page_out[72], (uint64)resolution->authority.authority_scn);
+	return true;
+}
+
+static inline bool
+ClusterR4TxVerdictPageDecode(const uint8 page[BLCKSZ], const ClusterTxLocator *expected_locator,
+							 ClusterTxResolution *resolution_out)
+{
+	static const uint8 zero_tail[BLCKSZ - CLUSTER_R4_TX_VERDICT_HEADER_LEN] = { 0 };
+	ClusterTxResolution decoded;
+
+	if (resolution_out != NULL)
+		memset(resolution_out, 0, sizeof(*resolution_out));
+	if (page == NULL || expected_locator == NULL || resolution_out == NULL
+		|| ClusterR4WireReadU32(&page[0]) != CLUSTER_R4_TX_VERDICT_MAGIC
+		|| ClusterR4WireReadU16(&page[4]) != CLUSTER_R4_TX_VERDICT_VERSION
+		|| ClusterR4WireReadU16(&page[6]) != CLUSTER_R4_TX_VERDICT_HEADER_LEN
+		|| page[10] != 0 || page[11] != 0
+		|| memcmp(&page[CLUSTER_R4_TX_VERDICT_HEADER_LEN], zero_tail, sizeof(zero_tail)) != 0)
+		return false;
+
+	memset(&decoded, 0, sizeof(decoded));
+	decoded.outcome = (ClusterTxOutcome)page[8];
+	decoded.proof_kind = (ClusterTxProofKind)page[9];
+	if (!cluster_tx_outcome_proof_is_valid(decoded.outcome, decoded.proof_kind))
+		return false;
+
+	decoded.locator_echo.uba.raw[0] = ClusterR4WireReadU64(&page[12]);
+	decoded.locator_echo.uba.raw[1] = ClusterR4WireReadU64(&page[20]);
+	decoded.locator_echo.xid = (TransactionId)ClusterR4WireReadU32(&page[28]);
+	decoded.locator_echo.tt_wrap = ClusterR4WireReadU16(&page[32]);
+	decoded.locator_echo.itl_kind = page[34];
+	decoded.locator_echo.itl_slot_index = page[35];
+	if (decoded.locator_echo.uba.raw[0] != expected_locator->uba.raw[0]
+		|| decoded.locator_echo.uba.raw[1] != expected_locator->uba.raw[1]
+		|| decoded.locator_echo.xid != expected_locator->xid
+		|| decoded.locator_echo.tt_wrap != expected_locator->tt_wrap
+		|| decoded.locator_echo.itl_kind != expected_locator->itl_kind
+		|| decoded.locator_echo.itl_slot_index != expected_locator->itl_slot_index)
+		return false;
+
+	decoded.top_xid = (TransactionId)ClusterR4WireReadU32(&page[36]);
+	decoded.commit_scn = (SCN)ClusterR4WireReadU64(&page[40]);
+	decoded.horizon_scn = (SCN)ClusterR4WireReadU64(&page[48]);
+	decoded.authority.origin_epoch = ClusterR4WireReadU64(&page[56]);
+	decoded.authority.live_hwm_lsn = InvalidXLogRecPtr;
+	decoded.authority.tt_generation = ClusterR4WireReadU64(&page[64]);
+	decoded.authority.authority_scn = (SCN)ClusterR4WireReadU64(&page[72]);
+	*resolution_out = decoded;
 	return true;
 }
 
