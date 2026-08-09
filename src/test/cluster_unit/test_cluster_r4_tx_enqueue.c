@@ -455,6 +455,39 @@ UT_TEST(test_formation_drift_cleans_registered_state)
 	assert_slot_clean();
 }
 
+UT_TEST(test_zero_epoch_is_a_valid_stable_formation)
+{
+	ClusterTxLocator locator = test_locator();
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_fixture();
+	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+	script_resolve(1, CLUSTER_TX_ABORTED, CLUSTER_TX_RESOLVE_NONE);
+	test_epochs[0] = 0;
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_RESOLVED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(test_wait_publish_calls, 1);
+	UT_ASSERT_EQ(test_wfg_submit_calls, 1);
+	assert_slot_clean();
+}
+
+UT_TEST(test_zero_to_nonzero_epoch_drift_fails_closed)
+{
+	ClusterTxLocator locator = test_locator();
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_fixture();
+	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+	test_epochs[0] = 0;
+	test_epochs[1] = 1;
+	test_epoch_count = 2;
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_UNPROVABLE);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_wfg_cancel_calls, 1);
+	assert_slot_clean();
+}
+
 UT_TEST(test_monotonic_timeout_uses_only_timeout_counter)
 {
 	ClusterTxLocator locator = test_locator();
@@ -571,7 +604,7 @@ UT_TEST(test_hint_waker_matches_source_discriminant_only)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);
@@ -579,6 +612,8 @@ main(void)
 	UT_RUN(test_prepared_waits_and_lost_wakes_only_repoll);
 	UT_RUN(test_unknown_fails_before_registration_with_exact_reason);
 	UT_RUN(test_formation_drift_cleans_registered_state);
+	UT_RUN(test_zero_epoch_is_a_valid_stable_formation);
+	UT_RUN(test_zero_to_nonzero_epoch_drift_fails_closed);
 	UT_RUN(test_monotonic_timeout_uses_only_timeout_counter);
 	UT_RUN(test_nested_guard_retries_without_slot_mutation);
 	UT_RUN(test_reentrant_source_and_target_slots_are_not_overwritten);
