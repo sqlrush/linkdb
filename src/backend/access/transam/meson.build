@@ -32,3 +32,14 @@ xlogreader_sources = files(
 )
 
 backend_sources += xlogreader_sources
+
+cluster_page_edge_test = executable('cluster_page_edge_test',
+  files('t/cluster_page_edge_test.c') + xlogreader_sources,
+  dependencies: [frontend_code, lz4, zstd],
+  include_directories: include_directories('../../../test/cluster_unit'),
+  c_args: ['-DFRONTEND'],
+  kwargs: default_bin_args + {
+    'install': false,
+  },
+)
+test('cluster_page_edge_test', cluster_page_edge_test)
