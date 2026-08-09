@@ -3010,6 +3010,60 @@ ClusterR4ForwardExtensionGetCrProof(const ClusterR4ForwardExtension *extension,
 	return true;
 }
 
+static inline bool
+ClusterR4ForwardExtensionSetLocator(ClusterR4ForwardExtension *extension,
+									ClusterR4WireKind kind,
+									const ClusterTxLocator *locator)
+{
+	if (extension != NULL)
+		memset(extension, 0, sizeof(*extension));
+	if (extension == NULL || locator == NULL
+		|| (kind != CLUSTER_R4_WIRE_TX_RESOLVE
+			&& kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH))
+		return false;
+
+	extension->r4_version = CLUSTER_R4_WIRE_VERSION;
+	extension->r4_kind = (uint8)kind;
+	ClusterR4WireWriteU64(&extension->kind.locator_bytes[0], locator->uba.raw[0]);
+	ClusterR4WireWriteU64(&extension->kind.locator_bytes[8], locator->uba.raw[1]);
+	ClusterR4WireWriteU32(&extension->kind.locator_bytes[16], (uint32)locator->xid);
+	ClusterR4WireWriteU16(&extension->kind.locator_bytes[20], locator->tt_wrap);
+	extension->kind.locator_bytes[22] = locator->itl_kind;
+	extension->kind.locator_bytes[23] = locator->itl_slot_index;
+	return true;
+}
+
+static inline bool
+ClusterR4ForwardExtensionGetLocator(const ClusterR4ForwardExtension *extension,
+									ClusterR4WireKind expected_kind,
+									ClusterTxLocator *locator_out)
+{
+	static const uint8 zero_flags[2] = { 0, 0 };
+	static const uint8 zero_subject[4] = { 0, 0, 0, 0 };
+	ClusterTxLocator decoded;
+
+	if (locator_out != NULL)
+		memset(locator_out, 0, sizeof(*locator_out));
+	if (extension == NULL || locator_out == NULL
+		|| (expected_kind != CLUSTER_R4_WIRE_TX_RESOLVE
+			&& expected_kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH)
+		|| extension->r4_version != CLUSTER_R4_WIRE_VERSION
+		|| extension->r4_kind != (uint8)expected_kind
+		|| memcmp(extension->flags_le, zero_flags, sizeof(zero_flags)) != 0
+		|| memcmp(extension->subject_id_le, zero_subject, sizeof(zero_subject)) != 0)
+		return false;
+
+	memset(&decoded, 0, sizeof(decoded));
+	decoded.uba.raw[0] = ClusterR4WireReadU64(&extension->kind.locator_bytes[0]);
+	decoded.uba.raw[1] = ClusterR4WireReadU64(&extension->kind.locator_bytes[8]);
+	decoded.xid = (TransactionId)ClusterR4WireReadU32(&extension->kind.locator_bytes[16]);
+	decoded.tt_wrap = ClusterR4WireReadU16(&extension->kind.locator_bytes[20]);
+	decoded.itl_kind = extension->kind.locator_bytes[22];
+	decoded.itl_slot_index = extension->kind.locator_bytes[23];
+	*locator_out = decoded;
+	return true;
+}
+
 #define CLUSTER_R4_TX_VERDICT_MAGIC UINT32_C(0x50475556)
 #define CLUSTER_R4_TX_VERDICT_VERSION UINT16_C(3)
 #define CLUSTER_R4_TX_VERDICT_HEADER_LEN UINT16_C(80)
