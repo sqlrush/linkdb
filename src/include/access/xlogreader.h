@@ -468,6 +468,10 @@ extern bool DecodeXLogRecord(XLogReaderState *state,
 							 XLogRecPtr lsn,
 							 char **errormsg);
 
+#define RF_PAGE_VERSION_EQUAL_INTERFACE_V1 1
+extern bool rf_page_version_equal_v1(const RfPageVersionV1 *left,
+									 const RfPageVersionV1 *right);
+
 /*
  * Macros that provide access to parts of the record most recently returned by
  * XLogReadRecord() or XLogNextRecord().

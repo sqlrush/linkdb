@@ -264,9 +264,10 @@ test_cluster_jit_t3_interface_capability: \
 		test_cluster_jit_t3_interface_capability.c $(JIT_T3_INTERFACE_OBJS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(JIT_T3_INTERFACE_OBJS) \
-		$(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
+		$(LDFLAGS) $(LDFLAGS_EX) -Wl,-dead_strip $(LIBS) -o $@
 
-$(XLOGREADER_FRONTEND_O):
+$(XLOGREADER_FRONTEND_O): \
+		$(top_srcdir)/src/backend/access/transam/xlogreader.c
 	$(MAKE) -C $(top_builddir)/src/bin/pg_waldump xlogreader.o
 
 cluster_page_edge_test: \

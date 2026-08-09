@@ -13,6 +13,7 @@
 
 #include "access/rmgr.h"
 #include "access/xlogdefs.h"
+#include "access/xlogrecord.h"
 #include "storage/block.h"
 #include "storage/buf.h"
 #include "storage/relfilelocator.h"
@@ -51,6 +52,14 @@ extern void XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator,
 extern void XLogRegisterBufData(uint8 block_id, char *data, uint32 len);
 extern void XLogResetInsertion(void);
 extern bool XLogCheckBufferNeedsBackup(Buffer buffer);
+
+#define XLOG_PAGE_VERSION_EDGE_ENCODER_V1 1
+extern bool XLogEncodePageVersionEdgeV1(uint8 *output,
+										Size output_capacity,
+										uint64 result_token,
+										const RfPageVersionEdgeEntryV1 *entries,
+										uint8 entry_count,
+										Size *output_size);
 
 extern XLogRecPtr log_newpage(RelFileLocator *rlocator, ForkNumber forknum,
 							  BlockNumber blkno, char *page, bool page_std);

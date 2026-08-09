@@ -2353,6 +2353,16 @@ err:
 	return false;
 }
 
+/* T3-I strong interface: behavior remains fail-closed until T3-B. */
+bool
+rf_page_version_equal_v1(const RfPageVersionV1 *left,
+						 const RfPageVersionV1 *right)
+{
+	(void) left;
+	(void) right;
+	return false;
+}
+
 /*
  * Returns information about the block that a block reference refers to.
  *

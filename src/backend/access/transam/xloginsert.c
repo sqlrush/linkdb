@@ -62,6 +62,22 @@
 /* Buffer size required to store a compressed version of backup block image */
 #define COMPRESS_BUFSIZE	Max(Max(PGLZ_MAX_BLCKSZ, LZ4_MAX_BLCKSZ), ZSTD_MAX_BLCKSZ)
 
+/* T3-I strong interface: behavior remains fail-closed until T3-B. */
+bool
+XLogEncodePageVersionEdgeV1(uint8 *output, Size output_capacity,
+							uint64 result_token,
+							const RfPageVersionEdgeEntryV1 *entries,
+							uint8 entry_count, Size *output_size)
+{
+	(void) output;
+	(void) output_capacity;
+	(void) result_token;
+	(void) entries;
+	(void) entry_count;
+	(void) output_size;
+	return false;
+}
+
 /*
  * For each block reference registered with XLogRegisterBuffer, we fill in
  * a registered_buffer struct.

@@ -133,6 +133,26 @@ StaticAssertDecl(sizeof(RfPageVersionV1) == 24,
 StaticAssertDecl(offsetof(RfPageVersionV1, mutation_token) == 16,
 				 "RfPageVersionV1 token offset");
 
+/* In-process encoder input.  The wire encoder stores every field manually. */
+typedef struct RfPageVersionEdgeEntryV1
+{
+	uint8		block_id;
+	uint8		page_class;
+	uint8		before_kind;
+	uint8		result_kind;
+	uint16		edge_flags;
+	uint16		component_ordinal;
+	RfPageVersionV1 before;
+	uint8		result_incarnation[16];
+} RfPageVersionEdgeEntryV1;
+
+StaticAssertDecl(sizeof(RfPageVersionEdgeEntryV1) == 48,
+				 "RfPageVersionEdgeEntryV1 size");
+StaticAssertDecl(offsetof(RfPageVersionEdgeEntryV1, before) == 8,
+				 "RfPageVersionEdgeEntryV1 before offset");
+StaticAssertDecl(offsetof(RfPageVersionEdgeEntryV1, result_incarnation) == 32,
+				 "RfPageVersionEdgeEntryV1 result offset");
+
 typedef enum RfPageClassV1
 {
 	RF_PAGE_CLASS_INVALID = 0,
