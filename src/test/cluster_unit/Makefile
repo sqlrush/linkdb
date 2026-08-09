@@ -144,6 +144,7 @@ CLUSTER_DIAG_O = $(top_builddir)/src/backend/cluster/cluster_diag.o
 CLUSTER_STATS_O = $(top_builddir)/src/backend/cluster/cluster_stats.o
 CLUSTER_CSSD_O = $(top_builddir)/src/backend/cluster/cluster_cssd.o
 CLUSTER_QVOTEC_O = $(top_builddir)/src/backend/cluster/cluster_qvotec.o
+CLUSTER_QVOTEC_PGSA_TEST_O = cluster_qvotec_pgsa_test.o
 CLUSTER_FENCE_O = $(top_builddir)/src/backend/cluster/cluster_fence.o
 CLUSTER_RECONFIG_O = $(top_builddir)/src/backend/cluster/cluster_reconfig.o
 CLUSTER_VOTING_DISK_IO_O = $(top_builddir)/src/backend/cluster/cluster_voting_disk_io.o
@@ -1088,7 +1089,7 @@ check: all
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) $(CLUSTER_QVOTEC_PGSA_TEST_O)
 
 install installdirs uninstall installcheck:
 	@:
@@ -1120,18 +1121,28 @@ test_cluster_cssd: test_cluster_cssd.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CSSD_O) -o $@
 
-# test_cluster_qvotec links cluster_qvotec.o standalone (spec-2.6 Sprint
-# A Step 1).  cluster_qvotec.c references shmem / proc_exit /
-# GetCurrentTimestamp / WaitLatch;all stubbed in test_cluster_qvotec.c
-# since the unit test exercises ClusterVotingSlot byte-layout +
-# ClusterQvotecShmem byte-layout + lifecycle accessor surface +
-# in_quorum lease helper logic + ProcSignal flag set/clear.  Real
-# poll cycle / disk I/O / multiplexer integration tested in TAP
-# 095 + 096 (Step 5).
+# R4 pair-CAS compiles the same QVOTEC source into a test-only object.  The
+# macro exposes only the fd-parameterized wrapper; the normal product object
+# retains no test symbol or fd setter.
+$(CLUSTER_QVOTEC_PGSA_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_qvotec.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_QVOTEC_PGSA_UNIT_TEST -c $< -o $@
+
 test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_PGSA_TEST_O) \
+		$(CLUSTER_VOTING_DISK_IO_O) $(CLUSTER_UNDO_BLOCK0_O) \
+		$(top_builddir)/src/backend/cluster/cluster_semantic_activation.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_QVOTEC_PGSA_UNIT_TEST \
+		-DQVOTEC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_qvotec.c"' \
+		-DLMON_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_lmon.c"' \
+		-DSHMEM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_shmem.c"' \
+		-DSEMANTIC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_semantic_activation.c"' \
+		-DSEMANTIC_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_semantic_activation.h"' \
+		-DCLUSTER_MAKEFILE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/Makefile"' $< \
+		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_PGSA_TEST_O) \
+		$(CLUSTER_VOTING_DISK_IO_O) $(CLUSTER_UNDO_BLOCK0_O) \
+		$(top_builddir)/src/backend/cluster/cluster_semantic_activation.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-2.28 Sprint A Step 1 — cluster_fence.o standalone link.  Stubs all
 # PG runtime deps (shmem / lwlock / timestamp / errlog).  T-fence-1 verifies

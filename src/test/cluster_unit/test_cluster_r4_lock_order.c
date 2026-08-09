@@ -8,6 +8,14 @@
 #include "postgres.h"
 
 #include "cluster/cluster_semantic_activation.h"
+#include "storage/shmem.h"
+
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
+				bool *foundPtr pg_attribute_unused())
+{
+	return NULL;
+}
 
 /* Exercise the real product-local policy helpers without exporting a test API. */
 #include "../../backend/cluster/cluster_semantic_activation.c"

@@ -8,6 +8,14 @@
 #include "postgres.h"
 
 #include "cluster/cluster_semantic_activation.h"
+#include "storage/shmem.h"
+
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
+				bool *foundPtr pg_attribute_unused())
+{
+	return NULL;
+}
 
 /* Exercise the real product-local policy helpers without exporting a test API. */
 #include "../../backend/cluster/cluster_semantic_activation.c"
@@ -570,10 +578,56 @@ UT_TEST(test_96_source_token_recheck_and_leave_are_generation_scoped)
 	UT_ASSERT(!token.entered);
 }
 
+UT_TEST(test_97_old_epoch_completion_is_inert_and_requires_revalidation)
+{
+	ClusterSemanticActivationShmem shmem;
+	ClusterSemanticActivationCasRequest request;
+	ClusterSemanticActivationRecord desired_record;
+	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	SemanticActivationAckTuple expected = valid_ack();
+	SemanticActivationAckTuple observed = expected;
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint64 before_active_bits = semantic_activation_active_bits;
+	uint64 before_generation = semantic_activation_record_generation;
+	bool before_closed = semantic_activation_transition_closed;
+	uint64 seq = 0;
+
+	memset(&shmem, 0, sizeof(shmem));
+	pg_atomic_init_u64(&shmem.record_cas_request_seq, 0);
+	pg_atomic_init_u64(&shmem.record_cas_completion_seq, 0);
+	pg_atomic_init_u32(&shmem.record_cas_result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	SemanticActivationShmem = &shmem;
+
+	memset(&desired_record, 0, sizeof(desired_record));
+	desired_record.source_feature_bitmap = UINT64_C(0x11);
+	desired_record.target_feature_bitmap = UINT64_C(0x22);
+	desired_record.transition_epoch = expected.transition_epoch - 1;
+	desired_record.record_generation = 8;
+	desired_record.coordinator_node = expected.node_id;
+	desired_record.coordinator_incarnation = expected.admitted_incarnation;
+	desired_record.phase = CLUSTER_SEMANTIC_PHASE_COMMIT;
+	UT_ASSERT(cluster_semantic_activation_record_encode(&desired_record, desired));
+	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired,
+													   &seq));
+	UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_cas(&request));
+	UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_cas(
+		request.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK));
+	UT_ASSERT(semantic_activation_record_cas_mailbox_poll_completion(seq, &result));
+	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_OK);
+
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(semantic_activation_active_bits, before_active_bits);
+	UT_ASSERT_EQ(semantic_activation_record_generation, before_generation);
+	UT_ASSERT_EQ(semantic_activation_transition_closed, before_closed);
+	observed.transition_epoch = desired_record.transition_epoch;
+	UT_ASSERT(!semantic_activation_ack_matches(&observed, &expected));
+	SemanticActivationShmem = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(97);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -670,6 +724,7 @@ main(void)
 	UT_RUN(test_94_public_submit_refuses_before_prepare);
 	UT_RUN(test_95_dormant_target_enter_has_no_token);
 	UT_RUN(test_96_source_token_recheck_and_leave_are_generation_scoped);
+	UT_RUN(test_97_old_epoch_completion_is_inert_and_requires_revalidation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
