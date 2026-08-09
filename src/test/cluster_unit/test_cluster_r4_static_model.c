@@ -31,6 +31,15 @@
 #ifndef GCS_SOURCE_PATH
 #error "GCS_SOURCE_PATH must identify cluster_gcs_block.c"
 #endif
+#ifndef PCM_HEADER_PATH
+#error "PCM_HEADER_PATH must identify cluster_pcm_lock.h"
+#endif
+#ifndef PCM_SOURCE_PATH
+#error "PCM_SOURCE_PATH must identify cluster_pcm_lock.c"
+#endif
+#ifndef BUFMGR_SOURCE_PATH
+#error "BUFMGR_SOURCE_PATH must identify bufmgr.c"
+#endif
 #ifndef IC_HEADER_PATH
 #error "IC_HEADER_PATH must identify cluster_ic.h"
 #endif
@@ -77,7 +86,7 @@
 #error "SEMANTIC_SOURCE_PATH must identify the prospective semantic-activation source"
 #endif
 
-#define R4_CONTRACT_COUNT 18
+#define R4_CONTRACT_COUNT 21
 #define R4_MATRIX_STATE_COUNT 10
 #define R4_MATRIX_EVENT_COUNT 9
 #define R4_MATRIX_COUNT (R4_MATRIX_STATE_COUNT * R4_MATRIX_EVENT_COUNT)
@@ -100,6 +109,9 @@ typedef struct SourceBundle {
 	char *cr_source;
 	char *gcs_header;
 	char *gcs_source;
+	char *pcm_header;
+	char *pcm_source;
+	char *bufmgr_source;
 	char *ic_header;
 	char *itl_header;
 	char *heap_vis_source;
@@ -143,7 +155,10 @@ static const char *const contract_required[R4_CONTRACT_COUNT]
 		"RAW_PRIVATE_DESCRIPTOR_ONLY",
 		"ACTIVE_INJECTION_REFUSED_PREMUTATION",
 		"XMIN_MISMATCH_FULL_CR_ONLY",
-		"SCRATCH_ONLY_POST_FULL" };
+		"SCRATCH_ONLY_POST_FULL",
+		"FORWARD96_MASTER_TRANSITION_COUNT_ONLY",
+		"ONE_PCM_ROUTE_SNAPSHOT",
+		"NOFETCH_STABLE_COPY_LOCAL_GENERATION_PRIVATE" };
 
 static const char *const matrix_states[R4_MATRIX_STATE_COUNT]
 	= { "E", "R", "F", "B", "U", "P", "C", "T", "X", "K" };
@@ -215,6 +230,9 @@ load_sources(void)
 	sources.cr_source = read_optional_source(CR_SOURCE_PATH);
 	sources.gcs_header = read_optional_source(GCS_HEADER_PATH);
 	sources.gcs_source = read_optional_source(GCS_SOURCE_PATH);
+	sources.pcm_header = read_optional_source(PCM_HEADER_PATH);
+	sources.pcm_source = read_optional_source(PCM_SOURCE_PATH);
+	sources.bufmgr_source = read_optional_source(BUFMGR_SOURCE_PATH);
 	sources.ic_header = read_optional_source(IC_HEADER_PATH);
 	sources.itl_header = read_optional_source(ITL_HEADER_PATH);
 	sources.heap_vis_source = read_optional_source(HEAP_VIS_SOURCE_PATH);
@@ -240,6 +258,9 @@ free_sources(void)
 	free(sources.cr_source);
 	free(sources.gcs_header);
 	free(sources.gcs_source);
+	free(sources.pcm_header);
+	free(sources.pcm_source);
+	free(sources.bufmgr_source);
 	free(sources.ic_header);
 	free(sources.itl_header);
 	free(sources.heap_vis_source);
@@ -294,7 +315,8 @@ r4_sources_have(const char *needle)
 {
 	const char *const candidates[]
 		= { sources.cr_server_header,	sources.cr_server_source,  sources.cr_source,
-			sources.gcs_header,			sources.gcs_source,		   sources.ic_header,
+			sources.gcs_header,			sources.gcs_source,		   sources.pcm_header,
+			sources.pcm_source,			sources.bufmgr_source,	   sources.ic_header,
 			sources.itl_header,			sources.heap_vis_source,   sources.heapam_source,
 			sources.vis_resolve_source, sources.tx_resolve_header, sources.tx_resolve_source,
 			sources.semantic_header,	sources.semantic_source };
@@ -548,7 +570,28 @@ contract_actual(int contract_number)
 			&& source_has(sources.heapam_source, "scratch") && full_builder)
 			return contract_required[17];
 		return legacy_d6_live_page_semantics_present() ? "LIVE_PAGE_FIELDS_NO_SCRATCH_REEVALUATION"
-													   : "ABSENT";
+												   : "ABSENT";
+	case 19:
+		if (source_has(sources.gcs_header, "master_resource_transition_count")
+			&& source_has(sources.gcs_source, "master_resource_transition_count")
+			&& !r4_sources_have("selected_holder_generation"))
+			return contract_required[18];
+		return "ABSENT";
+	case 20:
+		if (source_has(sources.pcm_header, "cluster_pcm_lock_r4_route_snapshot")
+			&& source_has_definition(sources.pcm_source, "cluster_pcm_lock_r4_route_snapshot")
+			&& source_has(sources.gcs_source, "cluster_pcm_lock_r4_route_snapshot("))
+			return contract_required[19];
+		return "ABSENT";
+	case 21:
+		if (source_has(sources.gcs_header, "cluster_bufmgr_copy_block_for_r4_cr")
+			&& source_has_definition(sources.bufmgr_source,
+									 "cluster_bufmgr_copy_block_for_r4_cr")
+			&& (source_has(sources.gcs_source, "cluster_bufmgr_copy_block_for_r4_cr(")
+				|| source_has(sources.cr_server_source,
+							  "cluster_bufmgr_copy_block_for_r4_cr(")))
+			return contract_required[20];
+		return "ABSENT";
 	default:
 		return "INVALID_CONTRACT";
 	}
@@ -833,6 +876,9 @@ UT_TEST(test_real_source_observation_controls)
 	UT_ASSERT_NOT_NULL(sources.cr_source);
 	UT_ASSERT_NOT_NULL(sources.gcs_header);
 	UT_ASSERT_NOT_NULL(sources.gcs_source);
+	UT_ASSERT_NOT_NULL(sources.pcm_header);
+	UT_ASSERT_NOT_NULL(sources.pcm_source);
+	UT_ASSERT_NOT_NULL(sources.bufmgr_source);
 	UT_ASSERT_NOT_NULL(sources.itl_header);
 	UT_ASSERT_NOT_NULL(sources.heap_vis_source);
 	UT_ASSERT_NOT_NULL(sources.heapam_source);
@@ -895,7 +941,7 @@ UT_TEST(test_matrix_actions_match_required_model)
 
 UT_TEST(test_remaining_contracts_match_required_model)
 {
-	const int remaining[] = { 7, 8, 9, 10, 11, 12, 14 };
+	const int remaining[] = { 7, 8, 9, 10, 11, 12, 14, 19, 20, 21 };
 
 	for (size_t i = 0; i < lengthof(remaining); i++)
 		assert_contract_matches(remaining[i]);

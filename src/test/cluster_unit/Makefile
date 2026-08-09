@@ -1407,6 +1407,9 @@ test_cluster_r4_static_model: test_cluster_r4_static_model.c unit_test.h
 		-DCR_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_cr.c"' \
 		-DGCS_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_gcs_block.h"' \
 		-DGCS_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_pcm_lock.h"' \
+		-DPCM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_pcm_lock.c"' \
+		-DBUFMGR_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/storage/buffer/bufmgr.c"' \
 		-DIC_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_ic.h"' \
 		-DITL_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_itl.h"' \
 		-DHEAP_VIS_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/access/heap/heapam_visibility.c"' \
