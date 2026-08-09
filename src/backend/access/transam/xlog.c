@@ -191,11 +191,13 @@
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
 #include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
+#include "cluster/cluster_cf_stats.h" /* PGRAC: RF-B OWNER -> EOR phase */
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-6.14 D9 amend recovery-claim release */
 #include "cluster/cluster_relmap_arb.h" /* PGRAC: spec-6.14 D5 relmap pending arbitration */
 #include "cluster/cluster_cf_enqueue.h" /* PGRAC: spec-5.6 CF X write-permission gate */
 #include "cluster/cluster_cf_phase2.h" /* PGRAC: spec-5.6 T6 cross-node verify */
 #include "cluster/cluster_cf_storage.h" /* PGRAC: spec-5.6 bootstrap authority window */
+#include "cluster/cluster_conf.h" /* PGRAC: RF-B exact one-node gate */
 #include "cluster/cluster_gcs_block.h" /* PGRAC: spec-6.12h D-h2 PI-discard checkpoint seal */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-5.6 cluster_controlfile_shared_authority */
 #include "cluster/cluster_hw_snapshot.h" /* PGRAC: spec-5.7 D3 HW authority checkpoint snapshot */
@@ -4339,8 +4341,8 @@ UpdateControlFile(void)
 	 * of the stock in-place overwrite.  This is the single chokepoint for every
 	 * authority write, so the write-permission classification lives here:
 	 *
-	 *	- write permitted (the caller holds CF X on the GES-ready path, or is the
-	 *	  bootstrap single-node authority during owner recovery) -> write it;
+	 *	- write permitted (held CF X, Startup single-node OWNER, or the exact EOR
+	 *	  checkpointer handoff) -> write it;
 	 *	- join read-only (this attaching node recovers while a live peer owns the
 	 *	  authority) -> skip this recovery-progress write rather than clobber the
 	 *	  owner's -- a documented skip, not a silent fallback;
@@ -6237,6 +6239,20 @@ StartupXLOG(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
+	 * RF-B: the synchronous delegated EOR request must have completed the
+	 * INSTALLED -> ACTIVE -> DONE handoff before recovery ownership is released.
+	 * Promotion and standalone recovery are nondelegated and stay INSTALLED.
+	 */
+	if (performedWalRecovery && IsPostmasterEnvironment && !promoted
+		&& cluster_cf_in_bootstrap_window()
+		&& cluster_cf_owner_eor_phase_read() != CLUSTER_CF_OWNER_EOR_DONE)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("end-of-recovery control-file OWNER handoff did not complete")));
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
 	 * PGRAC spec-6.14 D5: with recovery durable, the sole merger resolves
 	 * any staged relmap-authority pending image (publish if the owner
 	 * committed, discard if it aborted, keep + fail-closed if unprovable)
@@ -6414,17 +6430,20 @@ StartupXLOG(void)
 #ifdef USE_PGRAC_CLUSTER
 
 	/*
-	 * PGRAC MODIFICATIONS (spec-5.6 increment (iv)): recovery
-	 * is complete and the startup process has performed its last shared-authority
-	 * control-file write (the RECOVERY_STATE_DONE update above; the promotion
-	 * checkpoint at hand is delegated to the checkpointer, which takes CF X).
+	 * PGRAC MODIFICATIONS (spec-5.6 increment (iv), RF-B): recovery
+	 * is complete and Startup has performed its last shared-authority write.
+	 * Close either the completed delegated handoff (DONE) or a clean
+	 * nondelegated handoff (INSTALLED) before dropping Startup permission.
 	 * Close the bootstrap single-node-authority window so every subsequent
 	 * control-file write goes through real CF X serialization -- steady-state
 	 * writes must never rely on the bootstrap flag (the latent gap was
 	 * that the window, once opened, was never cleared).  A no-op when the
 	 * authority is off or the window was never opened (a join read-only node).
 	 */
-	cluster_cf_set_bootstrap_authority(false);
+	if (!cluster_cf_owner_eor_close())
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not close the single-node control-file OWNER handoff")));
 #endif
 }
 
@@ -7118,6 +7137,29 @@ CreateCheckPoint(int flags)
 	if (RecoveryInProgress() && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 		elog(ERROR, "can't create a checkpoint during recovery");
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * RF-B CONSUME: after the EOR sanity check and before checkpoint I/O,
+	 * freshly recheck the shared authority identity.  The identity read completes
+	 * before the atomic transition, so no phase edge encloses I/O or locks.
+	 */
+	if (cluster_controlfile_shared_authority
+		&& AmCheckpointerProcess()
+		&& (flags & CHECKPOINT_END_OF_RECOVERY)
+		&& cluster_conf_node_count() == 1)
+	{
+		bool identity_ok =
+			cluster_cf_contract_identity_check(DataDir,
+									   ControlFile->system_identifier)
+			== CLUSTER_CF_IDENTITY_OK;
+
+		if (!cluster_cf_owner_eor_consume(true, identity_ok))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("could not consume the end-of-recovery control-file OWNER handoff")));
+	}
+#endif
+
 	/*
 	 * Prepare to accumulate statistics.
 	 *
@@ -7139,18 +7181,23 @@ CreateCheckPoint(int flags)
 #ifdef USE_PGRAC_CLUSTER
 
 	/*
-	 * PGRAC: spec-5.6 Dc1.  In shared-authority mode a steady-state checkpoint
-	 * (run by the checkpointer, not the startup process, so it is not covered
-	 * by the bootstrap window) serializes its control-file writes cluster-wide
+	 * PGRAC: spec-5.6 Dc1 + RF-B.  In shared-authority mode a normal
+	 * checkpointer checkpoint serializes its control-file writes cluster-wide
 	 * by holding CF X across the whole checkpoint -- taken here, BEFORE the
 	 * critical section (no GES lock inside a critical section; lock
 	 * order CF X -> ControlFileLock), released at every exit below.  Under CF
 	 * X we refresh the in-memory control file from the shared authority so this
 	 * checkpoint does not clobber a peer's concurrent update.  No-op
-	 * unless the authority is enabled; skipped during the bootstrap window
-	 * (which already permits the write and runs before GES is ready).
+	 * unless the authority is enabled.  The exact one-node EOR owner bypasses
+	 * CF X using its distinct local permission; all later checkpoints use CF X.
 	 */
-	if (cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window())
+	if (cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window()
+		&& cluster_cf_owner_eor_local_active())
+	{
+		/* OWNER EOR neither takes CF X nor inherits a stale write-skip. */
+		cluster_cf_set_write_skip(false);
+	}
+	else if (cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window())
 	{
 		/*
 		 * A multi-node node still in its JOIN_READONLY bring-up window (Phase-2

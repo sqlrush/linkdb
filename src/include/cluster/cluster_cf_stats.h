@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_cf_stats.h
- *	  CF (control file) shared-authority observability counters (spec-5.6).
+ *	  CF (control file) shared-authority lock-free shared state (spec-5.6).
  *
  *	  A small, dependency-light owner for the five CF shared-authority
  *	  counters so that every CF module (authority read, storage bootstrap,
@@ -48,6 +48,17 @@ typedef enum ClusterCfCounter {
 	CLUSTER_CF_COUNTER_COUNT = 7
 } ClusterCfCounter;
 
+/*
+ * RF-B: boot-local single-node OWNER -> EOR checkpointer handoff.  This phase
+ * transports an already-proven decision; it is never write authority itself.
+ */
+typedef enum ClusterCfOwnerEorPhase {
+	CLUSTER_CF_OWNER_EOR_EMPTY = 0,
+	CLUSTER_CF_OWNER_EOR_INSTALLED,
+	CLUSTER_CF_OWNER_EOR_ACTIVE,
+	CLUSTER_CF_OWNER_EOR_DONE
+} ClusterCfOwnerEorPhase;
+
 /* shmem region lifecycle (mirror cluster_advisory). */
 extern Size cluster_cf_stats_shmem_size(void);
 extern void cluster_cf_stats_shmem_init(void);
@@ -71,5 +82,12 @@ extern uint64 cluster_cf_counter_read(ClusterCfCounter which);
  */
 extern void cluster_cf_stats_set_join_readonly(bool on);
 extern bool cluster_cf_stats_get_join_readonly(void);
+
+/* RF-B exact actor-bound phase operations; NULL/uninit always fails closed. */
+extern ClusterCfOwnerEorPhase cluster_cf_owner_eor_phase_read(void);
+extern bool cluster_cf_owner_eor_phase_install(void);
+extern bool cluster_cf_owner_eor_phase_activate(void);
+extern bool cluster_cf_owner_eor_phase_done(void);
+extern bool cluster_cf_owner_eor_phase_clear(void);
 
 #endif /* CLUSTER_CF_STATS_H */

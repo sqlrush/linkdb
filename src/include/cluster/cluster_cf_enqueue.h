@@ -91,10 +91,9 @@ extern bool cluster_cf_held(LOCKMODE mode);
 
 /*
  * cluster_cf_write_permitted -- true if a shared-authority control-file write
- * is currently allowed: this backend holds CF X (the normal GES-ready path),
- * OR (spec-5.6) the bootstrap single-node-authority window is active
- * (sole-liveness proven and the storage rename-contract satisfied before GES
- * is ready).  Asserted in UpdateControlFile when the authority is enabled.
+ * is currently allowed by one of three process-local facts: this backend holds
+ * CF X, Startup owns the bootstrap single-node window, or the EOR checkpointer
+ * consumed that exact OWNER handoff.  Shared phase alone never grants a write.
  */
 extern bool cluster_cf_write_permitted(void);
 
@@ -114,6 +113,19 @@ extern void cluster_cf_set_bootstrap_authority(bool on);
  * recovery); steady-state writers (the checkpointer) take CF X instead.
  */
 extern bool cluster_cf_in_bootstrap_window(void);
+
+/*
+ * RF-B minimal single-node OWNER -> EOR lifecycle.  INSTALL/CLOSE are
+ * Startup-only through the actor-bound shared phase helpers; CONSUME/COMPLETE
+ * are checkpointer-only.  `identity_ok` is the fresh storage/sysid verdict
+ * obtained before the phase transition, so no transition wraps its I/O.
+ */
+extern bool cluster_cf_owner_eor_install(void);
+extern bool cluster_cf_owner_eor_consume(bool end_of_recovery, bool identity_ok);
+extern bool cluster_cf_owner_eor_local_active(void);
+extern bool cluster_cf_owner_eor_complete(void);
+extern void cluster_cf_owner_eor_abort(void);
+extern bool cluster_cf_owner_eor_close(void);
 
 /*
  * cluster_cf_set_join_readonly / cluster_cf_join_readonly -- spec-5.6 increment

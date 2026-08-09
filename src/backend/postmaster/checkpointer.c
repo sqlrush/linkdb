@@ -39,6 +39,9 @@
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_cf_enqueue.h"
+#endif
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -262,6 +265,15 @@ CheckpointerMain(void)
 		/* Prevent interrupts while cleaning up */
 		HOLD_INTERRUPTS();
 
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * RF-B ABORT: revoke only this checkpointer's local EOR permission.
+		 * ACTIVE deliberately remains shared so the failed handoff cannot be
+		 * consumed again in the same postmaster lifetime.
+		 */
+		cluster_cf_owner_eor_abort();
+#endif
+
 		/* Report the error to the server log */
 		EmitErrorReport();
 
@@ -465,6 +477,20 @@ CheckpointerMain(void)
 			 * won't hang onto smgr references to deleted files indefinitely.
 			 */
 			smgrcloseall();
+
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * RF-B COMPLETE: publish DONE only after the whole delegated EOR
+			 * checkpoint, including its smgr close, succeeded and before waking
+			 * Startup through ckpt_done.
+			 */
+			if ((flags & CHECKPOINT_END_OF_RECOVERY) != 0
+				&& cluster_cf_owner_eor_local_active()
+				&& !cluster_cf_owner_eor_complete())
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						 errmsg("could not complete the end-of-recovery control-file OWNER handoff")));
+#endif
 
 			/*
 			 * Indicate checkpoint completion to any waiting backends.
