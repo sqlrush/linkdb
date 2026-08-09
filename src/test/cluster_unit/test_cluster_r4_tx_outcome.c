@@ -950,10 +950,42 @@ UT_TEST(test_exact_origin_subtrans_depth_fails_closed)
 	UT_ASSERT_EQ(test_subtrans_parent_calls, CLUSTER_R4_SUBTRANS_MAX_DEPTH);
 }
 
+UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	TransactionId child = 5000;
+	TransactionId top;
+	int i;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_origin_locator.xid = child;
+	test_origin_record.xid = child;
+	test_tt_slot.xid = child;
+	for (i = 0; i < CLUSTER_R4_SUBTRANS_MAX_DEPTH; i++)
+		test_subtrans_chain[i] = child - i;
+	test_subtrans_chain_count = CLUSTER_R4_SUBTRANS_MAX_DEPTH;
+	top = test_subtrans_chain[CLUSTER_R4_SUBTRANS_MAX_DEPTH - 1];
+	set_native_status_sample(0, child, TRANSACTION_STATUS_SUB_COMMITTED);
+	set_native_status_sample(1, top, TRANSACTION_STATUS_ABORTED);
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin(
+					 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, test_formation_epoch,
+					 &resolution, &reason),
+				 CLUSTER_TX_ABORTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ((int)resolution.top_xid, (int)top);
+	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP);
+	UT_ASSERT_EQ(test_subtrans_parent_calls, 2 * CLUSTER_R4_SUBTRANS_MAX_DEPTH);
+}
+
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(62);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -1015,6 +1047,7 @@ main(void)
 	UT_RUN(test_exact_origin_subtrans_cycle_fails_closed);
 	UT_RUN(test_exact_origin_subcommitted_before_transaction_xmin_fails_closed);
 	UT_RUN(test_exact_origin_subtrans_depth_fails_closed);
+	UT_RUN(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
