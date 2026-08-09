@@ -81,6 +81,48 @@ typedef enum ClusterTxProofKind {
 	CLUSTER_TX_PROOF_RECYCLED_BELOW_HORIZON = 7
 } ClusterTxProofKind;
 
+/*
+ * Closed R4 outcome/proof compatibility table.  This is the common policy
+ * consumed by verdict decoders and operation-local resolution consumers;
+ * an enum-domain extension is invalid until this table is amended with it.
+ * RECYCLED_BELOW_HORIZON proves only loss of the requested historical
+ * version, never a fabricated terminal transaction outcome.
+ */
+static inline bool
+cluster_tx_outcome_proof_is_valid(ClusterTxOutcome outcome, ClusterTxProofKind proof_kind)
+{
+	static const uint8 valid_proofs[5] = {
+		[CLUSTER_TX_UNKNOWN]
+		= (uint8)((1U << CLUSTER_TX_PROOF_NONE)
+				  | (1U << CLUSTER_TX_PROOF_RECYCLED_BELOW_HORIZON)),
+		[CLUSTER_TX_IN_PROGRESS]
+		= (uint8)((1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)),
+		[CLUSTER_TX_PREPARED]
+		= (uint8)((1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_TWOPHASE)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)),
+		[CLUSTER_TX_COMMITTED]
+		= (uint8)((1U << CLUSTER_TX_PROOF_ITL_CLEANOUT)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)
+				  | (1U << CLUSTER_TX_PROOF_RECOVERY_MATERIALIZED)),
+		[CLUSTER_TX_ABORTED]
+		= (uint8)((1U << CLUSTER_TX_PROOF_ITL_CLEANOUT)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
+				  | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)
+				  | (1U << CLUSTER_TX_PROOF_RECOVERY_MATERIALIZED)),
+	};
+
+	if ((unsigned int)outcome >= lengthof(valid_proofs)
+		|| (unsigned int)proof_kind > (unsigned int)CLUSTER_TX_PROOF_RECYCLED_BELOW_HORIZON)
+		return false;
+	return (valid_proofs[outcome] & (uint8)(1U << proof_kind)) != 0;
+}
+
 typedef struct ClusterTxLocator {
 	ClusterUndoByteAddress uba;
 	TransactionId xid;
