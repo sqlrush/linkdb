@@ -1109,6 +1109,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 			ereport(ERROR, (errcode(ERRCODE_LOCK_NOT_AVAILABLE),
 							errmsg("cluster lock acquire pending (spec-2.21 Step 4 not yet wired)"),
 							errhint("This path becomes async-wait in Step 4 D4/D8.")));
+			pg_unreachable();
 		case CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE:
 			/* PGRAC: spec-5.5 D6/D8 — advisory cross-node mutual exclusion could
 			 * not be proven (LMS unavailable).  Count the fail-closed before
@@ -1120,6 +1121,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 							errmsg("cluster LMS not ready, fail-closed (spec-2.21 HC1)"),
 							errhint("Wait for cluster_lms_is_ready() == LMS_READY before acquiring "
 									"cluster-aware locks.")));
+			pg_unreachable();
 		case CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT: {
 			/* PGRAC: S3 forensics step 1 — FAIL_TIMEOUT folds nine distinct
 			 * GES-side failure sites (capacity, send-fail, retransmit budget,
@@ -1136,6 +1138,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 							   ges_td->elapsed_ms, ges_td->attempts, ges_td->conflict_holders,
 							   ges_td->timeout_ms),
 					 errhint("Consider increasing cluster.ges_request_timeout_ms.")));
+			pg_unreachable();
 		}
 		case CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING:
 			/* PGRAC: spec-4.6 D4 — shard frozen by failure-driven remaster. */
@@ -1144,12 +1147,14 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 							errhint("Retry the transaction; the shard reopens once the holder "
 									"rebuild completes (cluster.grd_remaster_wait_ms bounds the "
 									"in-line wait).")));
+			pg_unreachable();
 		case CLUSTER_LOCK_ACQUIRE_FAIL_STALE_GENERATION:
 			/* PGRAC: spec-4.6 D4 — stale routing generation / epoch. */
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_GRD_STALE_MASTER_GENERATION),
 							errmsg("cluster GES request carried a stale master generation"),
 							errhint("The GRD master moved during reconfiguration; retry to route "
 									"to the new master.")));
+			pg_unreachable();
 		case CLUSTER_LOCK_ACQUIRE_FAIL_FEATURE_NOT_SUPPORTED:
 			/* PGRAC: spec-5.1b D3 — the master rejected an unsupported
 			 * request (e.g. a cross-node down-convert, which stays
@@ -1158,6 +1163,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							errmsg("this cross-node lock operation is not supported"),
 							errhint("This GES feature is not yet available in this release.")));
+			pg_unreachable();
 		case CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT:
 			/* PGRAC: spec-5.3 D4 — the requested lock conversion is not a
 			 * valid partial-order upgrade (LATERAL / no matching holder). */
@@ -1165,6 +1171,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 							errmsg("invalid cluster lock mode conversion"),
 							errhint("The requested lock mode conversion is not a valid upgrade; "
 									"release and re-acquire the lock instead.")));
+			pg_unreachable();
 		case CLUSTER_LOCK_ACQUIRE_FAIL_DEADLOCK:
 			/* PGRAC (spec-5.8): this backend was chosen as the victim of a
 			 * confirmed cross-node deadlock by the LMD coordinator (two-round
@@ -1175,6 +1182,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 							errdetail("A cross-node deadlock was detected by the cluster deadlock "
 									  "detector and this transaction was chosen as the victim."),
 							errhint("Retry the transaction.")));
+			pg_unreachable();
 		case CLUSTER_LOCK_ACQUIRE_FAIL_LMD_WAIT_EDGE_FULL:
 			/* spec-2.22 D11 — HC12 fail-closed wait edge cap. */
 			ereport(
@@ -1185,6 +1193,7 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 					 "Increase cluster.lmd_max_wait_edges or reduce concurrency. "
 					 "Fallback to PG local deadlock_timeout is severely disallowed "
 					 "(spec-2.22 HC12) — cluster wait edges invisible to PG-native detector.")));
+			pg_unreachable();
 		case CLUSTER_LOCK_ACQUIRE_FAIL_CANCEL:
 		case CLUSTER_LOCK_ACQUIRE_FAIL_GRD_NOT_READY:
 		case CLUSTER_LOCK_ACQUIRE_FAIL_RESERVATION_FULL:
