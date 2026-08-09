@@ -169,6 +169,7 @@ UT_TEST(u20_slot_aba_or_class_change_is_rejected)
 int
 main(void)
 {
+	UT_PLAN(20);
 	UT_RUN(u1_tracked_null_claim_fails_closed);
 	UT_RUN(u2_nontracked_null_claim_is_legacy_safe);
 	UT_RUN(u3_plain_read_uses_read_image);

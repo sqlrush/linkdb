@@ -308,6 +308,7 @@ UT_TEST(test_t23_distinct_flag_values)
 int
 main(void)
 {
+	UT_PLAN(23);
 	UT_RUN(test_t1_handle_sizeof_24);
 	UT_RUN(test_t2_handle_offset_rloc);
 	UT_RUN(test_t3_handle_offset_block);
