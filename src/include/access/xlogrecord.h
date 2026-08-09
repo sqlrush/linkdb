@@ -10,9 +10,12 @@
  *	xl_info/xl_rmid/xl_crc shifted so xl_crc remains the last header
  *	field (CRC coverage of the new field is automatic).  Format break:
  *	XLOG_PAGE_MAGIC and catversion are bumped (spec-4.5 D4).
+ *	Stage 8 JIT Task3 added the bounded id=251 page-version edge wire ABI;
+ *	Modified by: SqlRush <sqlrush@gmail.com>.
  *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
  *
  * src/include/access/xlogrecord.h
  */
@@ -179,6 +182,7 @@ typedef enum RfPageStateKindV1
 #define RF_PAGE_EDGE_FULL_COVERAGE    UINT16_C(0x0004)
 #define RF_PAGE_EDGE_KNOWN_MASK       UINT16_C(0x0007)
 
+/* PGRAC MODIFICATIONS (Stage 8 JIT Task3): bounded id=251 edge wire ABI. */
 #define XLR_BLOCK_ID_PAGE_VERSION_EDGE       251
 #define XLR_PAGE_VERSION_EDGE_FORMAT_V1        1
 #define XLR_PAGE_VERSION_EDGE_HEADER_SIZE     16

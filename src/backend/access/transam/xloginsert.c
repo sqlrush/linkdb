@@ -11,8 +11,16 @@
  *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
  *
- * src/backend/access/transam/xloginsert.c
+ * IDENTIFICATION
+ *		src/backend/access/transam/xloginsert.c
+ *
+ * PGRAC MODIFICATIONS (Stage 8 JIT Task3)
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	What changed: added the sole strong production encoder for bounded
+ *	page-version edge fragments.  It validates the complete input before
+ *	writing the caller's buffer.
  *
  *-------------------------------------------------------------------------
  */
@@ -62,6 +70,7 @@
 /* Buffer size required to store a compressed version of backup block image */
 #define COMPRESS_BUFSIZE	Max(Max(PGLZ_MAX_BLCKSZ, LZ4_MAX_BLCKSZ), ZSTD_MAX_BLCKSZ)
 
+/* PGRAC Stage 8 JIT Task3: validation helpers for the edge encoder below. */
 static bool
 xlog_page_version_uuid_is_zero(const uint8 incarnation[16])
 {
@@ -156,6 +165,7 @@ xlog_page_version_entry_valid(const RfPageVersionEdgeEntryV1 *entry)
 	}
 }
 
+/* PGRAC Stage 8 JIT Task3: encode one complete id=251 fragment atomically. */
 bool
 XLogEncodePageVersionEdgeV1(uint8 *output, Size output_capacity,
 							uint64 result_token,

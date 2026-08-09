@@ -3,10 +3,17 @@
  * cluster_space_codec.c
  *	  Direct-built bounded STOP07 SPACE value codec.
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *	  src/backend/cluster/cluster_space_codec.c
+ *
+ * NOTES
+ *	  This is a pgrac-original, direct-built value-codec implementation.
  *
  *-------------------------------------------------------------------------
  */

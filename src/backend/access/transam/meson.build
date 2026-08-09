@@ -33,6 +33,7 @@ xlogreader_sources = files(
 
 backend_sources += xlogreader_sources
 
+# PGRAC Stage 8 JIT Task3: build the real frontend decoder edge test.
 cluster_page_edge_test = executable('cluster_page_edge_test',
   files('t/cluster_page_edge_test.c') + xlogreader_sources,
   dependencies: [frontend_code, lz4, zstd],

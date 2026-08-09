@@ -7,10 +7,16 @@
  * The wire builders below only construct fixtures; they do not decode them.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *	  src/backend/access/transam/t/cluster_page_edge_test.c
+ *
+ * NOTES
+ *	  This is a pgrac-original test that links the real frontend decoder.
  *
  *-------------------------------------------------------------------------
  */
@@ -49,13 +55,13 @@ typedef struct DecodeFixtureResult
 	bool		ok;
 	char		error[1000];
 	DecodedXLogRecord *decoded;
-} DecodeFixtureResult;
+}			DecodeFixtureResult;
 
 typedef union RecordFixture
 {
 	XLogRecord	align;
 	uint8		bytes[512];
-} RecordFixture;
+}			RecordFixture;
 
 static void
 store_u16(uint8 *dst, uint16 value)
@@ -186,7 +192,7 @@ decode_fixture(uint8 *record_bytes)
 }
 
 static void
-free_fixture(DecodeFixtureResult *result)
+free_fixture(DecodeFixtureResult * result)
 {
 	free(result->decoded);
 	result->decoded = NULL;

@@ -5,8 +5,15 @@
  *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
+ * Portions Copyright (c) 2026, pgrac contributors
  *
- * src/include/access/xloginsert.h
+ * IDENTIFICATION
+ *	src/include/access/xloginsert.h
+ *
+ * PGRAC MODIFICATIONS (Stage 8 JIT Task3)
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	What changed: declared the bounded page-version edge encoder owned by
+ *	xloginsert.c.
  */
 #ifndef XLOGINSERT_H
 #define XLOGINSERT_H
@@ -53,6 +60,7 @@ extern void XLogRegisterBufData(uint8 block_id, char *data, uint32 len);
 extern void XLogResetInsertion(void);
 extern bool XLogCheckBufferNeedsBackup(Buffer buffer);
 
+/* PGRAC Stage 8 JIT Task3: strong production encoder capability. */
 #define XLOG_PAGE_VERSION_EDGE_ENCODER_V1 1
 extern bool XLogEncodePageVersionEdgeV1(uint8 *output,
 										Size output_capacity,

@@ -252,9 +252,12 @@ JIT_T3_INTERFACE_OBJS =
 ifeq ($(PORTNAME),darwin)
 JIT_T3_GC_LINK_FLAG = -Wl,-dead_strip
 JIT_T3_MAP_OPTION = -Wl,-map,$(abspath $@.map)
-else
+else ifeq ($(PORTNAME),linux)
 JIT_T3_GC_LINK_FLAG = -Wl,--gc-sections
 JIT_T3_MAP_OPTION = -Wl,-Map,$(abspath $@.map)
+else
+JIT_T3_GC_LINK_FLAG = $(error JIT Task3 proof requires Darwin or GNU/Linux)
+JIT_T3_MAP_OPTION = $(error JIT Task3 proof requires Darwin or GNU/Linux)
 endif
 
 ifneq ($(wildcard $(top_srcdir)/src/backend/cluster/cluster_space_codec.c),)
@@ -300,7 +303,8 @@ test_cluster_jit_abi_contract: test_cluster_jit_abi_contract.c
 check_cluster_jit_proof: check_cluster_jit_proof.py \
 		cluster_jit_symbol_owners.tsv test_cluster_jit_abi_contract.c \
 		test_cluster_jit_t3_interface_capability.o \
-		test_cluster_space_metadata.o $(JIT_T3_INTERFACE_OBJS)
+		test_cluster_space_metadata.o $(JIT_T3_INTERFACE_OBJS) \
+		test_cluster_jit_t3_interface_capability test_cluster_space_metadata
 	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py self-test
 	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py controls
 	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py references \
@@ -310,6 +314,24 @@ check_cluster_jit_proof: check_cluster_jit_proof.py \
 		--object src/backend/cluster/cluster_space_codec.o \
 		--object src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o \
 		--object src/test/cluster_unit/test_cluster_space_metadata.o
+	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py ownership \
+		--manifest src/test/cluster_unit/cluster_jit_symbol_owners.tsv \
+		--link-map src/test/cluster_unit/test_cluster_jit_t3_interface_capability.map \
+		--map-root $(CURDIR) \
+		--object src/bin/pg_waldump/xlogreader.o \
+		--object src/backend/access/transam/xloginsert.o \
+		--object src/backend/cluster/cluster_space_codec.o \
+		--object src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o
+	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py ownership \
+		--manifest src/test/cluster_unit/cluster_jit_symbol_owners.tsv \
+		--link-map src/test/cluster_unit/test_cluster_space_metadata.map \
+		--map-root $(CURDIR) \
+		--object src/bin/pg_waldump/xlogreader.o \
+		--object src/backend/access/transam/xloginsert.o \
+		--object src/backend/cluster/cluster_space_codec.o \
+		--object src/test/cluster_unit/test_cluster_space_metadata.o
+	$(JIT_PROOF_PYTHON) ./check_cluster_jit_proof.py task3-lto \
+		--manifest src/test/cluster_unit/cluster_jit_symbol_owners.tsv
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1138,7 +1160,7 @@ test_cluster_lck: test_cluster_lck.c unit_test.h \
 # ----------
 # Run all tests sequentially
 # ----------
-check: all
+check: all check_cluster_jit_proof
 	@echo "# pgrac cluster unit tests"
 	@total=0; failed=0; \
 	for t in $(TESTS); do \
@@ -1158,7 +1180,9 @@ check: all
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f $(TESTS)
+	rm -f $(TESTS) \
+		test_cluster_jit_t3_interface_capability.map \
+		test_cluster_space_metadata.map
 
 install installdirs uninstall installcheck:
 	@:

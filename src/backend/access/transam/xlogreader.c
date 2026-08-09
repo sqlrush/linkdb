@@ -4,6 +4,7 @@
  *		Generic XLog reading facility
  *
  * Portions Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2026, pgrac contributors
  *
  * IDENTIFICATION
  *		src/backend/access/transam/xlogreader.c
@@ -52,6 +53,14 @@
  *	  reader path; we cannot rely on PG validation auto-covering the
  *	  new fields.
  *	  Spec: spec-1.19-wal-page-header-thread-id.md APPROVED v0.2 D3
+ */
+/*
+ * PGRAC MODIFICATIONS (Stage 8 JIT Task3)
+ *
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	What changed: DecodeXLogRecord() validates and retains the bounded id=251
+ *	page-version edge fragment, and rf_page_version_equal_v1() supplies the
+ *	sole strong page-version equality implementation.
  */
 #include "postgres.h"
 
@@ -1796,6 +1805,7 @@ DecodeXLogRecordRequiredSpace(size_t xl_tot_len)
 	return size;
 }
 
+/* PGRAC Stage 8 JIT Task3: id=251 decoder transition validation helpers. */
 static bool
 page_version_edge_uuid_is_zero(const uint8 incarnation[16])
 {
@@ -2353,6 +2363,7 @@ err:
 	return false;
 }
 
+/* PGRAC Stage 8 JIT Task3: strong page-version equality implementation. */
 bool
 rf_page_version_equal_v1(const RfPageVersionV1 *left,
 						 const RfPageVersionV1 *right)

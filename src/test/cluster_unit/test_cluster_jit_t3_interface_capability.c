@@ -7,10 +7,17 @@
  * symbols.  Before a production capability exists it does not reference the
  * absent symbol; after it exists the real strong owner is called directly.
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *	  src/test/cluster_unit/test_cluster_jit_t3_interface_capability.c
+ *
+ * NOTES
+ *	  This is a pgrac-original test of real, strong production owners.
  *
  *-------------------------------------------------------------------------
  */

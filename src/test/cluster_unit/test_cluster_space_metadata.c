@@ -3,25 +3,40 @@
  * test_cluster_space_metadata.c
  *	  Golden behavior vectors for the JIT Task3 strong interfaces.
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *	  src/test/cluster_unit/test_cluster_space_metadata.c
+ *
+ * NOTES
+ *	  This is a pgrac-original test of Task3 value and transition behavior.
  *
  *-------------------------------------------------------------------------
  */
 
 #include "postgres.h"
 
+#include <stdlib.h>
 #include <string.h>
 
 #include "access/xloginsert.h"
 #include "access/xlogreader.h"
 #include "cluster/cluster_space.h"
+#include "storage/relfilelocator.h"
 
 static int	control_count = 0;
 static int	control_failures = 0;
 static int	semantic_failures = 0;
+
+typedef union RecordFixture
+{
+	XLogRecord	align;
+	uint8		bytes[512];
+}			RecordFixture;
 
 static void
 store_u16(uint8 *dst, uint16 value)
@@ -78,7 +93,7 @@ make_absent_entry(uint8 block_id, uint16 component_ordinal)
 
 static bool
 encode_unchanged(uint64 result_token,
-				 const RfPageVersionEdgeEntryV1 *entries,
+				 const RfPageVersionEdgeEntryV1 * entries,
 				 uint8 entry_count, Size capacity)
 {
 	uint8		output[XLR_PAGE_VERSION_EDGE_MAX_SIZE];
@@ -159,6 +174,81 @@ test_edge_encoder_golden(void)
 	semantic(result && output_size == sizeof(expected) &&
 			 memcmp(output, expected, sizeof(expected)) == 0,
 			 "T3-B-EDGE-ENCODER-BEHAVIOR");
+}
+
+static void
+test_edge_encoder_decoder_roundtrip(void)
+{
+	RecordFixture fixture;
+	XLogRecord *record = &fixture.align;
+	RfPageVersionEdgeEntryV1 entry = make_absent_entry(0, 0);
+	RelFileLocator locator = {0};
+	BlockNumber block_number = 42;
+	XLogReaderState state;
+	DecodedXLogRecord *decoded = NULL;
+	DecodedRfPageVersionEdgeEntryV1 *decoded_entry;
+	char		error[1000] = {0};
+	char	   *errormsg = NULL;
+	uint8	   *ptr;
+	Size		edge_size = 0;
+	size_t		decoded_size;
+	uint64		result_token = UINT64CONST(0x3132333435363738);
+	bool		encoded;
+	bool		decoded_ok = false;
+	bool		matches = false;
+
+	memset(&fixture, 0, sizeof(fixture));
+	ptr = fixture.bytes + SizeOfXLogRecord;
+	encoded = XLogEncodePageVersionEdgeV1(ptr,
+										  sizeof(fixture.bytes) - SizeOfXLogRecord,
+										  result_token, &entry, 1, &edge_size);
+	if (encoded)
+	{
+		ptr += edge_size;
+		*ptr++ = entry.block_id;
+		*ptr++ = BKPBLOCK_WILL_INIT | MAIN_FORKNUM;
+		store_u16(ptr, 0);
+		ptr += sizeof(uint16);
+		memcpy(ptr, &locator, sizeof(locator));
+		ptr += sizeof(locator);
+		memcpy(ptr, &block_number, sizeof(block_number));
+		ptr += sizeof(block_number);
+		record->xl_tot_len = (uint32) (ptr - fixture.bytes);
+
+		memset(&state, 0, sizeof(state));
+		state.ReadRecPtr = UINT64CONST(0x1000);
+		state.errormsg_buf = error;
+		decoded_size = DecodeXLogRecordRequiredSpace(record->xl_tot_len);
+		decoded = (DecodedXLogRecord *) calloc(1, decoded_size);
+		if (decoded != NULL)
+			decoded_ok = DecodeXLogRecord(&state, decoded, record,
+										  UINT64CONST(0x1000), &errormsg);
+	}
+
+	if (decoded_ok && decoded->page_version_edge_count == 1 &&
+		decoded->page_version_edge_entries != NULL)
+	{
+		decoded_entry = &decoded->page_version_edge_entries[0];
+		matches = decoded->page_version_edge_result_token == result_token &&
+			decoded_entry->block_id == entry.block_id &&
+			decoded_entry->page_class == entry.page_class &&
+			decoded_entry->before_kind == entry.before_kind &&
+			decoded_entry->result_kind == entry.result_kind &&
+			decoded_entry->edge_flags == entry.edge_flags &&
+			decoded_entry->component_ordinal == entry.component_ordinal &&
+			memcmp(&decoded_entry->before, &entry.before,
+				   sizeof(entry.before)) == 0 &&
+			memcmp(decoded_entry->result_incarnation,
+				   entry.result_incarnation,
+				   sizeof(entry.result_incarnation)) == 0 &&
+			decoded->max_block_id == entry.block_id &&
+			decoded->blocks[entry.block_id].in_use &&
+			decoded->blocks[entry.block_id].forknum == MAIN_FORKNUM &&
+			decoded->blocks[entry.block_id].blkno == block_number;
+	}
+	control(encoded && decoded_ok && matches,
+			"T3-B-ENCODE-DECODE-TRANSITION-ROUNDTRIP");
+	free(decoded);
 }
 
 static void
@@ -309,6 +399,7 @@ main(void)
 	printf("JIT_CONTROL:T3-B-REAL-STRONG-INTERFACES:PASS\n");
 	test_page_version_equality();
 	test_edge_encoder_golden();
+	test_edge_encoder_decoder_roundtrip();
 	test_edge_encoder_maximum();
 	test_edge_encoder_invalid_zero_mutation();
 	test_space_identity_equality();

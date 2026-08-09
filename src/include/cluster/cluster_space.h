@@ -5,10 +5,17 @@
  *
  * This is a value-only pre-activation interface.
  *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
+ *
+ * Author: SqlRush <sqlrush@gmail.com>
  *
  * IDENTIFICATION
  *	  src/include/cluster/cluster_space.h
+ *
+ * NOTES
+ *	  This is a pgrac-original, value-only pre-activation interface.
  *
  *-------------------------------------------------------------------------
  */

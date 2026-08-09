@@ -221,6 +221,9 @@ def _parse_darwin_link_map(
     symbol_re = re.compile(
         r"^0x[0-9A-Fa-f]+\s+0x[0-9A-Fa-f]+\s+"
         r"\[\s*(\d+)\]\s+(.+?)\s*$")
+    dead_symbol_re = re.compile(
+        r"^<<dead>>\s+0x[0-9A-Fa-f]+\s+"
+        r"\[\s*(\d+)\]\s+(.+?)\s*$")
 
     for line in text.splitlines():
         if line == "# Object files:":
@@ -248,6 +251,16 @@ def _parse_darwin_link_map(
         elif section == "symbols":
             match = symbol_re.match(line)
             if not match:
+                dead_match = dead_symbol_re.match(line)
+                if dead_match:
+                    index = int(dead_match.group(1))
+                    if index not in indexes:
+                        raise ProofFailure(PROOF_INTERNAL,
+                                           f"unknown object index {index}")
+                    if not dead_match.group(2).strip():
+                        raise ProofFailure(PROOF_INTERNAL,
+                                           "empty Darwin dead symbol")
+                    continue
                 if line.startswith("#") or not line.strip():
                     continue
                 raise ProofFailure(PROOF_INTERNAL,
@@ -531,6 +544,7 @@ class BuildConfig:
     cppflags: Tuple[str, ...]
     include_root: Path
     unit_root: Path
+    common_library: Path
     port_library: Path
 
 
@@ -576,16 +590,20 @@ def load_build_config(
                     if include_override is not None else
                     (root / "src/include").resolve())
     unit_root = (root / "src/test/cluster_unit").resolve()
+    common_library = (root / "src/common/libpgcommon.a").resolve()
     port_library = (resolve_input_path(port_library_override, root)
                     if port_library_override is not None else
                     (root / "src/port/libpgport.a").resolve())
     if not include_root.is_dir() or not unit_root.is_dir():
         raise ProofFailure(ENVIRONMENT_FAILURE, "include root unavailable")
+    if not common_library.is_file():
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           f"common library unavailable: {common_library}")
     if not port_library.is_file():
         raise ProofFailure(ENVIRONMENT_FAILURE,
                            f"port library unavailable: {port_library}")
     return BuildConfig(compiler, cflags, cppflags, include_root, unit_root,
-                       port_library)
+                       common_library, port_library)
 
 
 def _object_compile_flags(
@@ -810,6 +828,8 @@ def run_ownership(args) -> int:
     link_map_path = resolve_input_path(args.link_map, root)
     object_root = (resolve_input_path(args.object_root, root)
                    if args.object_root else root)
+    map_root = (resolve_input_path(args.map_root, root)
+                if args.map_root else object_root)
     objects = tuple(resolve_input_path(item, object_root)
                     for item in args.object)
     if not manifest_path.is_file():
@@ -829,7 +849,7 @@ def run_ownership(args) -> int:
         with manifest_path.open("r", encoding="utf-8", newline="") as stream:
             rows = resolve_manifest_rows(parse_manifest(stream), object_root)
         parsed_map = parse_link_map(
-            link_map_path.read_text(encoding="utf-8"), object_root)
+            link_map_path.read_text(encoding="utf-8"), map_root)
     except OSError as exc:
         raise ProofFailure(ENVIRONMENT_FAILURE,
                            "ownership input unreadable") from exc
@@ -877,6 +897,291 @@ def run_references(args) -> int:
     if failures:
         return SEMANTIC_RED
     print("JIT_PROOF:REFERENCES:PASS")
+    return PASS
+
+
+def _task3_source_inventory(root: Path):
+    """Return the frozen production/test translation-unit ownership set."""
+
+    return (
+        ("src/backend/access/transam/xlogreader.c",
+         "src/bin/pg_waldump/xlogreader.o", ("-DFRONTEND",)),
+        ("src/backend/access/transam/xloginsert.c",
+         "src/backend/access/transam/xloginsert.o",
+         ("-ffunction-sections", "-fdata-sections")),
+        ("src/backend/cluster/cluster_space_codec.c",
+         "src/backend/cluster/cluster_space_codec.o", ()),
+        ("src/test/cluster_unit/test_cluster_jit_t3_interface_capability.c",
+         "src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o",
+         ()),
+        ("src/test/cluster_unit/test_cluster_space_metadata.c",
+         "src/test/cluster_unit/test_cluster_space_metadata.o", ()),
+    )
+
+
+def _task3_compile_flags(
+        config: BuildConfig, per_source: Sequence[str],
+        lto_flags: Sequence[str]) -> Tuple[str, ...]:
+    return (config.cflags + config.cppflags +
+            ("-I", str(config.unit_root), "-I", str(config.include_root)) +
+            tuple(per_source) + tuple(lto_flags))
+
+
+def _compile_task3_objects(
+        root: Path, config: BuildConfig, build_root: Path,
+        flag_sets: Mapping[str, Sequence[str]]) -> Mapping[str, Path]:
+    objects: Dict[str, Path] = {}
+    for source_name, object_name, _ in _task3_source_inventory(root):
+        source = root / source_name
+        output = build_root / object_name
+        if not source.is_file():
+            raise ProofFailure(ENVIRONMENT_FAILURE,
+                               f"Task3 source unavailable: {source_name}")
+        output.parent.mkdir(parents=True, exist_ok=True)
+        result = _run(config.compiler + tuple(flag_sets[object_name]) +
+                      ("-c", str(source), "-o", str(output)),
+                      config.unit_root, timeout=60)
+        if result.returncode != 0 or result.stderr:
+            raise ProofFailure(ENVIRONMENT_FAILURE,
+                               f"Task3 object compile failed: {source_name}")
+        if not output.is_file():
+            raise ProofFailure(ENVIRONMENT_FAILURE,
+                               f"Task3 compiler omitted: {object_name}")
+        objects[object_name] = output.resolve()
+    return objects
+
+
+def _task3_gc_link_flag() -> str:
+    if sys.platform == "darwin":
+        return "-Wl,-dead_strip"
+    if sys.platform.startswith("linux"):
+        return "-Wl,--gc-sections"
+    raise ProofFailure(ENVIRONMENT_FAILURE,
+                       "Task3 proof requires Darwin or GNU/Linux")
+
+
+def _validate_task3_execution(target: str, output: str) -> None:
+    lines = output.splitlines()
+    if target == "interface":
+        expected = {
+            "JIT_CAPABILITY\tT3-PAGEVERSION-EQUALITY-INTERFACE\tPASS",
+            "JIT_CAPABILITY\tT3-EDGE-ENCODER-INTERFACE\tPASS",
+            "JIT_CAPABILITY\tT3-SPACE-CODEC-INTERFACE\tPASS",
+        }
+        capability_lines = {line for line in lines
+                            if line.startswith("JIT_CAPABILITY\t")}
+        if capability_lines != expected:
+            raise ProofFailure(SEMANTIC_RED,
+                               "Task3 interface capability drift")
+    elif target == "behavior":
+        expected_summary = (
+            "JIT_SUMMARY:controls=54 control_failures=0 "
+            "semantic_failures=0")
+        if expected_summary not in lines or (
+                "JIT_CONTROL:T3-B-ENCODE-DECODE-TRANSITION-ROUNDTRIP:PASS"
+                not in lines):
+            raise ProofFailure(SEMANTIC_RED,
+                               "Task3 behavior/roundtrip drift")
+    else:
+        raise ProofFailure(PROOF_INTERNAL,
+                           f"unknown Task3 target {target}")
+    if any("JIT_SEMANTIC_RED:" in line or line.endswith(":FAIL")
+           for line in lines):
+        raise ProofFailure(SEMANTIC_RED,
+                           f"Task3 {target} emitted a failure")
+
+
+def _link_task3_target(
+        config: BuildConfig, objects: Mapping[str, Path], target: str,
+        binary: Path, link_map: Path,
+        link_flags: Sequence[str]) -> None:
+    test_object = {
+        "interface":
+            "src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o",
+        "behavior": "src/test/cluster_unit/test_cluster_space_metadata.o",
+    }[target]
+    inputs = (
+        objects["src/bin/pg_waldump/xlogreader.o"],
+        objects["src/backend/access/transam/xloginsert.o"],
+        objects["src/backend/cluster/cluster_space_codec.o"],
+        objects[test_object],
+    )
+    result = _run(config.compiler + tuple(link_flags) +
+                  tuple(str(path) for path in inputs) +
+                  (_link_map_option(link_map), str(config.common_library),
+                   str(config.port_library), "-lm", "-o", str(binary)),
+                  config.unit_root, timeout=60)
+    if result.returncode != 0 or result.stderr:
+        detail = result.stderr.strip().splitlines()
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           f"Task3 {target} link failed: " +
+                           (detail[-1] if detail else "no diagnostic"))
+    if not binary.is_file() or not link_map.is_file():
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           f"Task3 {target} linker omitted output")
+    execution = _run((str(binary),), config.unit_root, timeout=60)
+    if execution.returncode != 0 or execution.stderr:
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           f"Task3 {target} execution failed")
+    _validate_task3_execution(target, execution.stdout)
+
+
+def _task3_provenance(
+        root: Path, config: BuildConfig,
+        real_flag_sets: Mapping[str, Sequence[str]],
+        audit_flag_sets: Mapping[str, Sequence[str]],
+        real_link_flags: Sequence[str], audit_link_flags: Sequence[str],
+        compiler_version: bytes, removed_flags: Sequence[str]) \
+        -> Mapping[str, str]:
+    inventory = _task3_source_inventory(root)
+    generated_names = (
+        "src/include/pg_config.h",
+        "src/include/pg_config_ext.h",
+        "src/include/utils/errcodes.h",
+        "src/include/catalog/catversion.h",
+    )
+    generated = []
+    for name in generated_names:
+        path = root / name
+        if not path.is_file():
+            raise ProofFailure(ENVIRONMENT_FAILURE,
+                               f"Task3 generated input unavailable: {name}")
+        generated.append((name, path.read_bytes()))
+    source_hash = hash_named_inputs(
+        (source_name, (root / source_name).read_bytes())
+        for source_name, _, _ in inventory)
+    object_hash = hash_named_inputs(((
+        "object-list",
+        "\n".join(f"{source}->{obj}" for source, obj, _ in inventory)
+        .encode("utf-8")),))
+    flag_inputs = []
+    for _, object_name, _ in inventory:
+        flag_inputs.append((f"real:{object_name}",
+                            "\0".join(real_flag_sets[object_name])
+                            .encode("utf-8")))
+        flag_inputs.append((f"audit:{object_name}",
+                            "\0".join(audit_flag_sets[object_name])
+                            .encode("utf-8")))
+    flag_inputs.extend((
+        ("real-link", "\0".join(real_link_flags).encode("utf-8")),
+        ("audit-link", "\0".join(audit_link_flags).encode("utf-8")),
+    ))
+    return {
+        "compiler_sha256": hashlib.sha256(compiler_version).hexdigest(),
+        "source_set_sha256": source_hash,
+        "object_list_sha256": object_hash,
+        "generated_inputs_sha256": hash_named_inputs(generated),
+        "flag_pair_sha256": hash_named_inputs(flag_inputs),
+        "removed_flags": ",".join(removed_flags),
+    }
+
+
+def run_task3_lto(args) -> int:
+    """Run real Task3 LTO links and an exact non-LTO ownership audit."""
+
+    root = repository_root(Path(__file__))
+    manifest_path = resolve_input_path(args.manifest, root)
+    if not manifest_path.is_file():
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           f"manifest unavailable: {manifest_path}")
+    config = load_build_config(root, args.cc, args.include_root,
+                               args.port_library)
+    nm_command = _tool_command(args.nm, "nm")
+    version = _run(config.compiler + ("--version",), root)
+    if version.returncode != 0 or version.stderr or not version.stdout:
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           "compiler version control failed")
+
+    real_flag_sets: Dict[str, Tuple[str, ...]] = {}
+    audit_flag_sets: Dict[str, Tuple[str, ...]] = {}
+    removed: List[str] = []
+    for _, object_name, per_source in _task3_source_inventory(root):
+        real_flags = _task3_compile_flags(config, per_source, ("-flto",))
+        audit_flags, source_removed = audit_flag_delta(real_flags)
+        validate_audit_flag_delta(real_flags, audit_flags)
+        real_flag_sets[object_name] = real_flags
+        audit_flag_sets[object_name] = audit_flags
+        removed.extend(source_removed)
+    real_link_flags = ("-flto", _task3_gc_link_flag())
+    audit_link_flags, link_removed = audit_flag_delta(real_link_flags)
+    validate_audit_flag_delta(real_link_flags, audit_link_flags)
+    removed.extend(link_removed)
+
+    try:
+        with manifest_path.open("r", encoding="utf-8", newline="") as stream:
+            raw_rows = parse_manifest(stream)
+    except OSError as exc:
+        raise ProofFailure(ENVIRONMENT_FAILURE,
+                           "Task3 manifest unreadable") from exc
+
+    with tempfile.TemporaryDirectory(prefix="pgrac-jit-task3-") as name:
+        temporary = Path(name).resolve()
+        real_root = temporary / "real-lto"
+        audit_root = temporary / "audit"
+        real_objects = _compile_task3_objects(
+            root, config, real_root, real_flag_sets)
+        for target in ("interface", "behavior"):
+            _link_task3_target(
+                config, real_objects, target,
+                temporary / f"real-lto-{target}",
+                temporary / f"real-lto-{target}.map", real_link_flags)
+
+        audit_objects = _compile_task3_objects(
+            root, config, audit_root, audit_flag_sets)
+        audit_maps = {}
+        for target in ("interface", "behavior"):
+            map_path = temporary / f"audit-{target}.map"
+            _link_task3_target(
+                config, audit_objects, target,
+                temporary / f"audit-{target}", map_path, audit_link_flags)
+            try:
+                audit_maps[target] = parse_link_map(
+                    map_path.read_text(encoding="utf-8"), audit_root)
+            except (OSError, UnicodeError) as exc:
+                raise ProofFailure(ENVIRONMENT_FAILURE,
+                                   "Task3 audit map unreadable") from exc
+
+        all_objects = tuple(audit_objects.values())
+        symbols = _read_object_symbols(nm_command, all_objects, root)
+        resolved_rows = resolve_manifest_rows(raw_rows, audit_root)
+        failures = verify_reference_inventory(resolved_rows, symbols)
+        if failures:
+            for failure in failures:
+                print(f"JIT_SEMANTIC_RED:{failure}")
+            return SEMANTIC_RED
+        target_objects = {
+            "interface": tuple(audit_objects[name] for name in (
+                "src/bin/pg_waldump/xlogreader.o",
+                "src/backend/access/transam/xloginsert.o",
+                "src/backend/cluster/cluster_space_codec.o",
+                "src/test/cluster_unit/test_cluster_jit_t3_interface_capability.o",
+            )),
+            "behavior": tuple(audit_objects[name] for name in (
+                "src/bin/pg_waldump/xlogreader.o",
+                "src/backend/access/transam/xloginsert.o",
+                "src/backend/cluster/cluster_space_codec.o",
+                "src/test/cluster_unit/test_cluster_space_metadata.o",
+            )),
+        }
+        for target, object_paths in target_objects.items():
+            target_symbols = {str(path.resolve()): symbols[str(path.resolve())]
+                              for path in object_paths}
+            failures = verify_ownership(
+                resolved_rows, target_symbols, audit_maps[target])
+            if failures:
+                for failure in failures:
+                    print(f"JIT_SEMANTIC_RED:{failure}")
+                return SEMANTIC_RED
+
+    receipt = _task3_provenance(
+        root, config, real_flag_sets, audit_flag_sets,
+        real_link_flags, audit_link_flags,
+        version.stdout.encode("utf-8"), removed)
+    print("JIT_CONTROL:TASK3-LTO-REAL-LINK-RUN:PASS")
+    print("JIT_CONTROL:TASK3-LTO-AUDIT-RELINK:PASS")
+    print("JIT_CONTROL:TASK3-LTO-AUDIT-OWNERSHIP:PASS")
+    for key in sorted(receipt):
+        print(f"JIT_PROVENANCE:TASK3-{key.upper()}:{receipt[key]}")
     return PASS
 
 
@@ -1083,6 +1388,18 @@ class ProofProviderSelfTests(unittest.TestCase):
             "0x9 0x6 [  1] literal string: value\n")
         self.assertEqual(parsed.symbol_owner("owned"),
                          canonical_object_name("/tmp/owner.o"))
+
+    def test_map_parser_accepts_darwin_dead_symbol_row(self) -> None:
+        parsed = parse_link_map(
+            "# Object files:\n"
+            "[  1] /tmp/owner.o\n"
+            "[  2] /tmp/dead.o\n"
+            "# Symbols:\n"
+            "0x1 0x8 [  1] _owned\n"
+            "<<dead>> 0x00000020 [  2] _discarded\n")
+        self.assertEqual(parsed.symbol_owner("owned"),
+                         canonical_object_name("/tmp/owner.o"))
+        self.assertIsNone(parsed.symbol_owner("discarded"))
 
     def test_map_parser_rejects_ambiguous_object_index(self) -> None:
         fixture = (
@@ -1324,6 +1641,7 @@ def argument_parser() -> argparse.ArgumentParser:
     ownership.add_argument("--link-map", required=True)
     ownership.add_argument("--object", action="append", required=True)
     ownership.add_argument("--object-root")
+    ownership.add_argument("--map-root")
     ownership.add_argument("--cc", help="override compiler command")
     ownership.add_argument("--include-root",
                            help="override production include root")
@@ -1341,6 +1659,15 @@ def argument_parser() -> argparse.ArgumentParser:
     references.add_argument("--port-library",
                             help="override libpgport.a path")
     references.add_argument("--nm", help="override object-tool command")
+    task3_lto = subparsers.add_parser(
+        "task3-lto", help="run real Task3 LTO and ownership audit links")
+    task3_lto.add_argument("--manifest", required=True)
+    task3_lto.add_argument("--cc", help="override compiler command")
+    task3_lto.add_argument("--include-root",
+                           help="override production include root")
+    task3_lto.add_argument("--port-library",
+                           help="override libpgport.a path")
+    task3_lto.add_argument("--nm", help="override object-tool command")
     return parser
 
 
@@ -1360,6 +1687,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             return run_ownership(args)
         if args.command == "references":
             return run_references(args)
+        if args.command == "task3-lto":
+            return run_task3_lto(args)
         raise ProofFailure(PROOF_INTERNAL, "unhandled proof command")
     except ProofFailure as exc:
         labels = {

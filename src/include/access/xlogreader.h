@@ -4,6 +4,7 @@
  *		Definitions for the generic XLog reading facility
  *
  * Portions Copyright (c) 2013-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 2026, pgrac contributors
  *
  * IDENTIFICATION
  *		src/include/access/xlogreader.h
@@ -30,6 +31,12 @@
  *		record that's already constructed in memory, without reading from
  *		disk, by calling the DecodeXLogRecord() function.
  *-------------------------------------------------------------------------
+ */
+/*
+ * PGRAC MODIFICATIONS (Stage 8 JIT Task3)
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	What changed: exposed decoder-owned id=251 edge values and the strong
+ *	page-version equality capability.
  */
 #ifndef XLOGREADER_H
 #define XLOGREADER_H
@@ -459,7 +466,7 @@ extern bool WALRead(XLogReaderState *state,
 					char *buf, XLogRecPtr startptr, Size count,
 					TimeLineID tli, WALReadError *errinfo);
 
-/* Functions for decoding an XLogRecord */
+/* Functions for decoding an XLogRecord, including PGRAC Task3 id=251. */
 
 extern size_t DecodeXLogRecordRequiredSpace(size_t xl_tot_len);
 extern bool DecodeXLogRecord(XLogReaderState *state,
@@ -468,6 +475,7 @@ extern bool DecodeXLogRecord(XLogReaderState *state,
 							 XLogRecPtr lsn,
 							 char **errormsg);
 
+/* PGRAC Stage 8 JIT Task3: strong page-version equality capability. */
 #define RF_PAGE_VERSION_EQUAL_INTERFACE_V1 1
 extern bool rf_page_version_equal_v1(const RfPageVersionV1 *left,
 									 const RfPageVersionV1 *right);

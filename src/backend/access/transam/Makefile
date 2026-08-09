@@ -42,3 +42,8 @@ include $(top_srcdir)/src/backend/common.mk
 
 # ensure that version checks in xlog.c get recompiled when catversion.h changes
 xlog.o: xlog.c $(top_srcdir)/src/include/catalog/catversion.h
+
+# PGRAC Stage 8 JIT Task3: keep the encoder in its real production owner while
+# allowing standalone proof links to discard unrelated xloginsert.c routines on
+# ELF as well as Mach-O.
+xloginsert.o: CFLAGS += -ffunction-sections -fdata-sections
