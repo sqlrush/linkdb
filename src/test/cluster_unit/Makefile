@@ -740,6 +740,14 @@ test_cluster_block_apply: test_cluster_block_apply.c unit_test.h $(CLUSTER_BLOCK
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
+# Stage 8 JIT Task 4 RED: this target initially compiles and runs only
+# against the existing common record/apply decision.  Task 4 GREEN adds the
+# real generated route object to this rule after the semantic RED is frozen.
+test_cluster_rf_route: test_cluster_rf_route.c unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
 # spec-4.11 D1: test_cluster_thread_apply links the real online thread-recovery
 # apply wrapper object and stubs cluster_block_apply_one (its byte-for-byte
 # correctness is t/256's job) + the merged-recovery window externs (read by the
