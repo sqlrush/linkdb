@@ -62,12 +62,15 @@ static int test_set_latch_calls[TEST_NSLOTS];
 static bool test_wait_latch_throws;
 static bool test_wait_latch_sleeps;
 static TransactionId test_local_xid;
+static bool test_fail_stop_armed;
+static sigjmp_buf test_fail_stop_stack;
 
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
 Latch *MyLatch;
 int MaxBackends;
 ProcessingMode Mode;
+BackendType MyBackendType = B_BACKEND;
 bool cluster_enabled;
 int cluster_node_id;
 volatile sig_atomic_t InterruptPending;
@@ -79,7 +82,40 @@ void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(), int lineNumber pg_attribute_unused())
 {
+	if (test_fail_stop_armed) {
+		test_fail_stop_armed = false;
+		siglongjmp(test_fail_stop_stack, 1);
+	}
 	abort();
+}
+
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	if (elevel >= ERROR && test_fail_stop_armed) {
+		test_fail_stop_armed = false;
+		siglongjmp(test_fail_stop_stack, 1);
+	}
+	if (elevel >= ERROR)
+		abort();
+	return false;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
 }
 
 bool
@@ -363,6 +399,7 @@ reset_fixture(void)
 	test_wait_latch_throws = false;
 	test_wait_latch_sleeps = false;
 	test_local_xid = (TransactionId)700;
+	test_fail_stop_armed = false;
 	InterruptPending = false;
 	QueryCancelPending = false;
 }
@@ -372,6 +409,19 @@ assert_slot_clean(void)
 {
 	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 0);
+}
+
+static bool
+invoke_exit_callback_expect_fail_stop(void)
+{
+	if (sigsetjmp(test_fail_stop_stack, 1) == 0) {
+		test_fail_stop_armed = true;
+		cluster_tx_enqueue_cleanup_on_backend_exit_callback(0, (Datum)0);
+		test_fail_stop_armed = false;
+		return false;
+	}
+	test_fail_stop_armed = false;
+	return true;
 }
 
 UT_TEST(test_exact_wait_abi_and_shmem_size_are_frozen)
@@ -719,10 +769,66 @@ UT_TEST(test_backend_exit_cleans_exact_source_and_allows_procno_reuse)
 	txw_slot_clear(0);
 }
 
+UT_TEST(test_backend_exit_inactive_state_cleans_owned_slot_without_wfg_cancel)
+{
+	ClusterTxLocator locator = test_locator();
+
+	reset_fixture();
+	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
+	cluster_tx_enqueue_cleanup_on_backend_exit_callback(0, (Datum)0);
+	UT_ASSERT_EQ(test_wfg_cancel_calls, 0);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	assert_slot_clean();
+}
+
+UT_TEST(test_backend_exit_busy_state_fails_stop_without_releasing_owner)
+{
+	ClusterTxLocator locator = test_locator();
+
+	reset_fixture();
+	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
+	test_wait_read_result = CLUSTER_LMD_WAIT_STATE_READ_BUSY;
+	UT_ASSERT(invoke_exit_callback_expect_fail_stop());
+	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, CLUSTER_TXW_SLOT_TARGET);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
+	UT_ASSERT_EQ(test_wait_clear_calls, 0);
+	txw_slot_clear(0);
+}
+
+UT_TEST(test_backend_exit_malformed_active_state_fails_stop_without_releasing_owner)
+{
+	ClusterTxLocator locator = test_locator();
+
+	reset_fixture();
+	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
+	test_wait_read_result = CLUSTER_LMD_WAIT_STATE_READ_ACTIVE;
+	test_wait_snapshot.active = true;
+	test_wait_snapshot.kind = CLUSTER_LMD_WAIT_GES;
+	test_wait_snapshot.wait_seq = 1;
+	UT_ASSERT(invoke_exit_callback_expect_fail_stop());
+	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, CLUSTER_TXW_SLOT_TARGET);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
+	UT_ASSERT_EQ(test_wait_clear_calls, 0);
+	txw_slot_clear(0);
+}
+
+UT_TEST(test_backend_exit_counter_underflow_fails_stop_without_freeing_slot)
+{
+	ClusterTxLocator locator = test_locator();
+
+	reset_fixture();
+	memcpy(ClusterTxw->slots[0].identity.target_locator_words, &locator, sizeof(locator));
+	ClusterTxw->slots[0].waiting = CLUSTER_TXW_SLOT_TARGET;
+	UT_ASSERT(invoke_exit_callback_expect_fail_stop());
+	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, CLUSTER_TXW_SLOT_TARGET);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 0);
+	ClusterTxw->slots[0].waiting = CLUSTER_TXW_SLOT_FREE;
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(21);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);
@@ -740,6 +846,10 @@ main(void)
 	UT_RUN(test_hint_waker_matches_source_discriminant_only);
 	UT_RUN(test_backend_exit_cleans_exact_target_and_allows_procno_reuse);
 	UT_RUN(test_backend_exit_cleans_exact_source_and_allows_procno_reuse);
+	UT_RUN(test_backend_exit_inactive_state_cleans_owned_slot_without_wfg_cancel);
+	UT_RUN(test_backend_exit_busy_state_fails_stop_without_releasing_owner);
+	UT_RUN(test_backend_exit_malformed_active_state_fails_stop_without_releasing_owner);
+	UT_RUN(test_backend_exit_counter_underflow_fails_stop_without_freeing_slot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
