@@ -149,6 +149,23 @@ typedef struct
 } DecodedBkpBlock;
 
 /*
+ * Decoder-owned form of an id=251 entry.  This is deliberately independent
+ * of the producer input type: T3-D establishes the sole reader before any
+ * encoder interface exists.
+ */
+typedef struct DecodedRfPageVersionEdgeEntryV1
+{
+	uint8		block_id;
+	RfPageClassV1 page_class;
+	RfPageStateKindV1 before_kind;
+	RfPageStateKindV1 result_kind;
+	uint16		edge_flags;
+	uint16		component_ordinal;
+	RfPageVersionV1 before;
+	uint8		result_incarnation[16];
+} DecodedRfPageVersionEdgeEntryV1;
+
+/*
  * The decoded contents of a record.  This occupies a contiguous region of
  * memory, with main_data and blocks[n].data pointing to memory after the
  * members declared here.
@@ -169,6 +186,9 @@ typedef struct DecodedXLogRecord
 	char	   *main_data;		/* record's main data portion */
 	uint32		main_data_len;	/* main data portion's length */
 	int			max_block_id;	/* highest block_id in use (-1 if none) */
+	DecodedRfPageVersionEdgeEntryV1 *page_version_edge_entries;
+	uint64		page_version_edge_result_token;
+	uint8		page_version_edge_count;
 	DecodedBkpBlock blocks[FLEXIBLE_ARRAY_MEMBER];
 } DecodedXLogRecord;
 

@@ -118,6 +118,64 @@ StaticAssertDecl(offsetof(XLogRecord, xl_crc) == 28,
 #define XLR_CHECK_CONSISTENCY	0x02
 
 /*
+ * PGRAC page-version identity and generic WAL edge format.  These values are
+ * decoded before activation so every backend and frontend WAL reader rejects
+ * malformed or superseded edge bytes consistently.
+ */
+typedef struct RfPageVersionV1
+{
+	uint8		segment_incarnation[16];
+	uint64		mutation_token;
+} RfPageVersionV1;
+
+StaticAssertDecl(sizeof(RfPageVersionV1) == 24,
+				 "RfPageVersionV1 ABI drift");
+StaticAssertDecl(offsetof(RfPageVersionV1, mutation_token) == 16,
+				 "RfPageVersionV1 token offset");
+
+typedef enum RfPageClassV1
+{
+	RF_PAGE_CLASS_INVALID = 0,
+	RF_PAGE_CLASS_ORDINARY = 1,
+	RF_PAGE_CLASS_REBUILDABLE_FSM = 2,
+	RF_PAGE_CLASS_ROUTED_SPACE = 3,
+	RF_PAGE_CLASS_ROUTED_HEADER = 4,
+	RF_PAGE_CLASS_ROUTED_SIDE = 5,
+	RF_PAGE_CLASS_TEMP_LOCAL = 6
+} RfPageClassV1;
+
+typedef enum RfPageStateKindV1
+{
+	RF_PAGE_STATE_INVALID = 0,
+	RF_PAGE_STATE_PRESENT = 1,
+	RF_PAGE_STATE_UNFORMATTED = 2,
+	RF_PAGE_STATE_ABSENT = 3,
+	RF_PAGE_STATE_REBUILDABLE = 4,
+	RF_PAGE_STATE_ROUTED = 5
+} RfPageStateKindV1;
+
+#define RF_PAGE_EDGE_FULL_IMAGE_APPLY UINT16_C(0x0001)
+#define RF_PAGE_EDGE_WILL_INIT        UINT16_C(0x0002)
+#define RF_PAGE_EDGE_FULL_COVERAGE    UINT16_C(0x0004)
+#define RF_PAGE_EDGE_KNOWN_MASK       UINT16_C(0x0007)
+
+#define XLR_BLOCK_ID_PAGE_VERSION_EDGE       251
+#define XLR_PAGE_VERSION_EDGE_FORMAT_V1        1
+#define XLR_PAGE_VERSION_EDGE_HEADER_SIZE     16
+#define XLR_PAGE_VERSION_EDGE_ENTRY_SIZE      48
+#define XLR_PAGE_VERSION_EDGE_MAX_ENTRIES     33
+#define XLR_PAGE_VERSION_EDGE_MAX_SIZE      1600
+
+StaticAssertDecl(XLR_PAGE_VERSION_EDGE_MAX_SIZE ==
+				 XLR_PAGE_VERSION_EDGE_HEADER_SIZE +
+				 XLR_PAGE_VERSION_EDGE_ENTRY_SIZE *
+				 XLR_PAGE_VERSION_EDGE_MAX_ENTRIES,
+				 "page-version edge maximum size");
+
+#define PGRAC_JIT_PAGE_VERSION_EDGE_ABI_V1 1
+#define PGRAC_JIT_SCALAR_GENERATION_REMOVED_V1 1
+
+/*
  * Header info for block data appended to an XLOG record.
  *
  * 'data_length' is the length of the rmgr-specific payload data associated

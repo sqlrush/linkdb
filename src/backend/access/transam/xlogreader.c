@@ -1779,6 +1779,11 @@ DecodeXLogRecordRequiredSpace(size_t xl_tot_len)
 	size += offsetof(DecodedXLogRecord, blocks[0]);
 	/* Account for the flexible blocks array of maximum possible size. */
 	size += sizeof(DecodedBkpBlock) * (XLR_MAX_BLOCK_ID + 1);
+	/* Account for the decoder-owned copy of every possible id=251 entry. */
+	size += sizeof(DecodedRfPageVersionEdgeEntryV1) *
+		XLR_PAGE_VERSION_EDGE_MAX_ENTRIES;
+	/* We might align the decoder-owned edge array. */
+	size += (MAXIMUM_ALIGNOF - 1);
 	/* Account for all the raw main and block data. */
 	size += xl_tot_len;
 	/* We might insert padding before main_data. */
@@ -1789,6 +1794,101 @@ DecodeXLogRecordRequiredSpace(size_t xl_tot_len)
 	size += (MAXIMUM_ALIGNOF - 1);
 
 	return size;
+}
+
+static bool
+page_version_edge_uuid_is_zero(const uint8 incarnation[16])
+{
+	for (int i = 0; i < 16; i++)
+	{
+		if (incarnation[i] != 0)
+			return false;
+	}
+	return true;
+}
+
+static bool
+page_version_edge_uuid_equal(const uint8 left[16], const uint8 right[16])
+{
+	for (int i = 0; i < 16; i++)
+	{
+		if (left[i] != right[i])
+			return false;
+	}
+	return true;
+}
+
+static bool
+page_version_edge_anchor_flags_valid(uint16 edge_flags)
+{
+	return edge_flags == (RF_PAGE_EDGE_FULL_IMAGE_APPLY |
+						  RF_PAGE_EDGE_FULL_COVERAGE) ||
+		edge_flags == (RF_PAGE_EDGE_WILL_INIT |
+					   RF_PAGE_EDGE_FULL_COVERAGE) ||
+		edge_flags == RF_PAGE_EDGE_KNOWN_MASK;
+}
+
+static bool
+page_version_edge_transition_valid(
+	const DecodedRfPageVersionEdgeEntryV1 *entry)
+{
+	bool		before_zero =
+		page_version_edge_uuid_is_zero(entry->before.segment_incarnation);
+	bool		result_zero =
+		page_version_edge_uuid_is_zero(entry->result_incarnation);
+
+	if ((entry->edge_flags & ~RF_PAGE_EDGE_KNOWN_MASK) != 0)
+		return false;
+
+	switch (entry->page_class)
+	{
+		case RF_PAGE_CLASS_ORDINARY:
+			if (entry->result_kind != RF_PAGE_STATE_PRESENT || result_zero)
+				return false;
+			if (entry->before_kind == RF_PAGE_STATE_PRESENT)
+			{
+				if (before_zero || entry->before.mutation_token == 0 ||
+					!page_version_edge_uuid_equal(
+						entry->before.segment_incarnation,
+						entry->result_incarnation))
+					return false;
+				return entry->edge_flags == 0 ||
+					page_version_edge_anchor_flags_valid(entry->edge_flags);
+			}
+			if (entry->before_kind == RF_PAGE_STATE_UNFORMATTED)
+			{
+				return !before_zero && entry->before.mutation_token == 0 &&
+					page_version_edge_uuid_equal(
+						entry->before.segment_incarnation,
+						entry->result_incarnation) &&
+					page_version_edge_anchor_flags_valid(entry->edge_flags);
+			}
+			if (entry->before_kind == RF_PAGE_STATE_ABSENT)
+			{
+				return before_zero && entry->before.mutation_token == 0 &&
+					page_version_edge_anchor_flags_valid(entry->edge_flags);
+			}
+			return false;
+
+		case RF_PAGE_CLASS_REBUILDABLE_FSM:
+			return entry->before_kind == RF_PAGE_STATE_REBUILDABLE &&
+				entry->result_kind == RF_PAGE_STATE_REBUILDABLE &&
+				before_zero && entry->before.mutation_token == 0 &&
+				result_zero && entry->edge_flags == 0;
+
+		case RF_PAGE_CLASS_ROUTED_SPACE:
+		case RF_PAGE_CLASS_ROUTED_HEADER:
+		case RF_PAGE_CLASS_ROUTED_SIDE:
+			return entry->before_kind == RF_PAGE_STATE_ROUTED &&
+				entry->result_kind == RF_PAGE_STATE_ROUTED &&
+				before_zero && entry->before.mutation_token == 0 &&
+				result_zero && entry->edge_flags == 0;
+
+		case RF_PAGE_CLASS_INVALID:
+		case RF_PAGE_CLASS_TEMP_LOCAL:
+		default:
+			return false;
+	}
 }
 
 /*
@@ -1828,6 +1928,12 @@ DecodeXLogRecord(XLogReaderState *state,
 	uint32		datatotal;
 	RelFileLocator *rlocator = NULL;
 	uint8		block_id;
+	bool		saw_fragment = false;
+	bool		page_version_edge_seen = false;
+	uint8		page_version_edge_count = 0;
+	uint64		page_version_edge_result_token = 0;
+	DecodedRfPageVersionEdgeEntryV1 page_version_edge_entries[
+		XLR_PAGE_VERSION_EDGE_MAX_ENTRIES];
 
 	decoded->header = *record;
 	decoded->lsn = lsn;
@@ -1837,6 +1943,9 @@ DecodeXLogRecord(XLogReaderState *state,
 	decoded->main_data = NULL;
 	decoded->main_data_len = 0;
 	decoded->max_block_id = -1;
+	decoded->page_version_edge_entries = NULL;
+	decoded->page_version_edge_result_token = 0;
+	decoded->page_version_edge_count = 0;
 	ptr = (char *) record;
 	ptr += SizeOfXLogRecord;
 	remaining = record->xl_tot_len - SizeOfXLogRecord;
@@ -1847,7 +1956,79 @@ DecodeXLogRecord(XLogReaderState *state,
 	{
 		COPY_HEADER_FIELD(&block_id, sizeof(uint8));
 
-		if (block_id == XLR_BLOCK_ID_DATA_SHORT)
+		if (block_id == XLR_BLOCK_ID_PAGE_VERSION_EDGE)
+		{
+			uint8		format_version;
+			uint8		entry_size;
+			uint16		flags;
+			uint16		reserved;
+
+			if (saw_fragment || page_version_edge_seen)
+			{
+				report_invalid_record(state,
+								  "page-version edge is not the first and sole fragment at %X/%X",
+								  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+			saw_fragment = true;
+			page_version_edge_seen = true;
+
+			COPY_HEADER_FIELD(&format_version, sizeof(uint8));
+			COPY_HEADER_FIELD(&page_version_edge_count, sizeof(uint8));
+			COPY_HEADER_FIELD(&entry_size, sizeof(uint8));
+			COPY_HEADER_FIELD(&flags, sizeof(uint16));
+			COPY_HEADER_FIELD(&reserved, sizeof(uint16));
+			COPY_HEADER_FIELD(&page_version_edge_result_token, sizeof(uint64));
+
+			if (format_version != XLR_PAGE_VERSION_EDGE_FORMAT_V1 ||
+				entry_size != XLR_PAGE_VERSION_EDGE_ENTRY_SIZE ||
+				page_version_edge_count == 0 ||
+				page_version_edge_count > XLR_PAGE_VERSION_EDGE_MAX_ENTRIES ||
+				flags != 0 || reserved != 0 ||
+				page_version_edge_result_token == 0)
+			{
+				report_invalid_record(state,
+								  "invalid page-version edge header at %X/%X",
+								  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+
+			for (int i = 0; i < page_version_edge_count; i++)
+			{
+				DecodedRfPageVersionEdgeEntryV1 *entry =
+					&page_version_edge_entries[i];
+				uint8		page_class;
+				uint8		before_kind;
+				uint8		result_kind;
+
+				COPY_HEADER_FIELD(&entry->block_id, sizeof(uint8));
+				COPY_HEADER_FIELD(&page_class, sizeof(uint8));
+				COPY_HEADER_FIELD(&before_kind, sizeof(uint8));
+				COPY_HEADER_FIELD(&result_kind, sizeof(uint8));
+				COPY_HEADER_FIELD(&entry->edge_flags, sizeof(uint16));
+				COPY_HEADER_FIELD(&entry->component_ordinal, sizeof(uint16));
+				COPY_HEADER_FIELD(entry->before.segment_incarnation, 16);
+				COPY_HEADER_FIELD(&entry->before.mutation_token, sizeof(uint64));
+				COPY_HEADER_FIELD(entry->result_incarnation, 16);
+
+				entry->page_class = (RfPageClassV1) page_class;
+				entry->before_kind = (RfPageStateKindV1) before_kind;
+				entry->result_kind = (RfPageStateKindV1) result_kind;
+
+				if (entry->block_id > XLR_MAX_BLOCK_ID ||
+					(i > 0 && entry->block_id <=
+					 page_version_edge_entries[i - 1].block_id) ||
+					entry->component_ordinal != i ||
+					!page_version_edge_transition_valid(entry))
+				{
+					report_invalid_record(state,
+									  "invalid page-version edge entry %d at %X/%X",
+									  i, LSN_FORMAT_ARGS(state->ReadRecPtr));
+					goto err;
+				}
+			}
+		}
+		else if (block_id == XLR_BLOCK_ID_DATA_SHORT)
 		{
 			/* XLogRecordDataHeaderShort */
 			uint8		main_data_len;
@@ -2035,6 +2216,58 @@ DecodeXLogRecord(XLogReaderState *state,
 								  block_id, LSN_FORMAT_ARGS(state->ReadRecPtr));
 			goto err;
 		}
+
+		if (!saw_fragment)
+			saw_fragment = true;
+	}
+
+	if (page_version_edge_seen)
+	{
+		int			edge_index = 0;
+
+		for (int i = 0; i <= decoded->max_block_id; i++)
+		{
+			DecodedBkpBlock *blk = &decoded->blocks[i];
+			DecodedRfPageVersionEdgeEntryV1 *entry;
+			bool		full_image_apply;
+			bool		will_init;
+
+			if (!blk->in_use)
+				continue;
+			if (edge_index >= page_version_edge_count ||
+				page_version_edge_entries[edge_index].block_id != i)
+			{
+				report_invalid_record(state,
+								  "page-version edge/block set mismatch at %X/%X",
+								  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+
+			entry = &page_version_edge_entries[edge_index++];
+			if (entry->page_class != RF_PAGE_CLASS_ORDINARY)
+				continue;
+
+			full_image_apply = blk->has_image && blk->apply_image;
+			will_init = (blk->flags & BKPBLOCK_WILL_INIT) != 0;
+			if (((entry->edge_flags & RF_PAGE_EDGE_FULL_IMAGE_APPLY) != 0) !=
+				full_image_apply ||
+				((entry->edge_flags & RF_PAGE_EDGE_WILL_INIT) != 0) !=
+				will_init)
+			{
+				report_invalid_record(state,
+								  "page-version edge flags do not match block %d at %X/%X",
+								  i, LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+		}
+
+		if (edge_index != page_version_edge_count)
+		{
+			report_invalid_record(state,
+							  "page-version edge/block set mismatch at %X/%X",
+							  LSN_FORMAT_ARGS(state->ReadRecPtr));
+			goto err;
+		}
 	}
 
 	if (remaining != datatotal)
@@ -2050,6 +2283,20 @@ DecodeXLogRecord(XLogReaderState *state,
 	out = ((char *) decoded) +
 		offsetof(DecodedXLogRecord, blocks) +
 		sizeof(decoded->blocks[0]) * (decoded->max_block_id + 1);
+
+	if (page_version_edge_seen)
+	{
+		out = (char *) MAXALIGN(out);
+		decoded->page_version_edge_entries =
+			(DecodedRfPageVersionEdgeEntryV1 *) out;
+		memcpy(decoded->page_version_edge_entries,
+			   page_version_edge_entries,
+			   sizeof(page_version_edge_entries[0]) * page_version_edge_count);
+		out += sizeof(page_version_edge_entries[0]) * page_version_edge_count;
+		decoded->page_version_edge_result_token =
+			page_version_edge_result_token;
+		decoded->page_version_edge_count = page_version_edge_count;
+	}
 
 	/* block data first */
 	for (block_id = 0; block_id <= decoded->max_block_id; block_id++)
