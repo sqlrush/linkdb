@@ -2457,11 +2457,19 @@ static int
 format_r1_unit_machine_record(char *record, size_t record_size, const char *snapshot_id,
 							  const PcmXAcquireObservationSnapshot *snapshot)
 {
-	(void)snapshot_id;
-	(void)snapshot;
-	if (record_size > 0)
-		record[0] = '\0';
-	return 0;
+	uint64 success_histogram = snapshot->success_latency_overflow_count;
+	int i;
+
+	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
+		success_histogram += snapshot->success_latency_bucket[i];
+
+	return snprintf(record, record_size,
+					"PGRAC_R1_UNIT_V2\t%s\t" UINT64_FORMAT "\t" UINT64_FORMAT "\t"
+					UINT64_FORMAT "\t" UINT64_FORMAT "\t" UINT64_FORMAT "\t" UINT64_FORMAT
+					"\n",
+					snapshot_id, snapshot->started_count, snapshot->active_count,
+					snapshot->exception_count, snapshot->terminal_result_count[PCM_X_QUEUE_OK],
+					snapshot->terminal_result_count[PCM_X_QUEUE_BUSY], success_histogram);
 }
 
 static void
