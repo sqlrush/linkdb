@@ -1981,7 +1981,7 @@ cluster_gcs_block_r4_route_cr(const BufferTag *tag, SCN read_scn, uint64 request
 	int32 real_master_node;
 	int32 current_holder_node = -1;
 	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
-	ClusterCrBuildResult result = CLUSTER_CR_BUILD_RETRYABLE;
+	ClusterCrBuildResult result;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -2004,7 +2004,6 @@ cluster_gcs_block_r4_route_cr(const BufferTag *tag, SCN read_scn, uint64 request
 	if (tag == NULL || !SCN_VALID(read_scn) || request_id == 0 || requester_backend_id <= 0
 		|| requester_backend_id > MaxBackends) {
 		reason = CLUSTER_CR_BUILD_PROTOCOL;
-		result = CLUSTER_CR_BUILD_FAIL_CLOSED;
 		goto done;
 	}
 
@@ -2046,9 +2045,9 @@ cluster_gcs_block_r4_route_cr(const BufferTag *tag, SCN read_scn, uint64 request
 	out->expected_page_scn = expected_page_scn;
 	out->real_master_node = real_master_node;
 	out->selected_holder_node = current_holder_node;
-	result = CLUSTER_CR_BUILD_FULL;
 
 done:
+	result = cluster_cr_build_result_for_reason(reason);
 	cluster_semantic_activation_leave(&admission);
 	*reason_out = reason;
 	return result;

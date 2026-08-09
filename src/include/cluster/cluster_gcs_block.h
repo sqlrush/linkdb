@@ -2357,6 +2357,40 @@ typedef enum ClusterCrBuildReason {
 	CLUSTER_CR_BUILD_PROTOCOL = 17
 } ClusterCrBuildReason;
 
+/*
+ * Closed build-reason polarity.  Retryable reasons describe an operation
+ * whose durable block/transaction authority was not changed; data/protocol
+ * failures never acquire retry polarity by falling through an unknown enum.
+ */
+static inline ClusterCrBuildResult
+cluster_cr_build_result_for_reason(ClusterCrBuildReason reason)
+{
+	switch (reason) {
+		case CLUSTER_CR_BUILD_NONE:
+			return CLUSTER_CR_BUILD_FULL;
+		case CLUSTER_CR_BUILD_TARGET_DISABLED:
+		case CLUSTER_CR_BUILD_RF_DEFERRED:
+		case CLUSTER_CR_BUILD_WRONG_MASTER:
+		case CLUSTER_CR_BUILD_NO_HOLDER:
+		case CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS:
+		case CLUSTER_CR_BUILD_HOLDER_MOVED:
+		case CLUSTER_CR_BUILD_RECOVERING:
+		case CLUSTER_CR_BUILD_GENERATION_MISMATCH:
+		case CLUSTER_CR_BUILD_CAPACITY:
+		case CLUSTER_CR_BUILD_EPOCH_MISMATCH:
+			return CLUSTER_CR_BUILD_RETRYABLE;
+		case CLUSTER_CR_BUILD_BAD_LOCATOR:
+		case CLUSTER_CR_BUILD_BAD_UNDO:
+		case CLUSTER_CR_BUILD_CHAIN_LIMIT:
+		case CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD:
+		case CLUSTER_CR_BUILD_CANCELLED:
+		case CLUSTER_CR_BUILD_IO_ERROR:
+		case CLUSTER_CR_BUILD_PROTOCOL:
+			return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	}
+	return CLUSTER_CR_BUILD_FAIL_CLOSED;
+}
+
 typedef struct ClusterR4CrRouteProof {
 	BufferTag tag;
 	SCN read_scn;
