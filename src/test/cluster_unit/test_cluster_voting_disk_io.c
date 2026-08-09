@@ -12,6 +12,10 @@
  *	  T-io-6 fd<0 → NOT_TRIED defensive
  *	  T-io-8 apply lease region round-trip
  *	  T-io-9 marker regions are disjoint from voting slot _reserved1
+ *	  T-io-10 fixed-tail read-state enum and invalid-input outcomes
+ *	  T-io-11 fixed-tail CLEAN_EOF / SHORT / FULL syscall outcomes
+ *	  T-io-12 fixed-tail write lazily extends the old file by one sector
+ *	  T-io-13 fixed-tail syscall failures remain distinct from EOF/short
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -377,11 +381,130 @@ UT_TEST(test_io_9_marker_regions_are_disjoint)
 			  == (off_t)(5 * CLUSTER_MAX_NODES + 1) * CLUSTER_VOTING_SLOT_BYTES);
 }
 
+UT_TEST(test_io_10_raw_tail_state_and_invalid_inputs)
+{
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
+
+	UT_ASSERT_EQ(CLUSTER_VOTING_DISK_RAW_READ_NOT_TRIED, 0);
+	UT_ASSERT_EQ(CLUSTER_VOTING_DISK_RAW_READ_FULL, 1);
+	UT_ASSERT_EQ(CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF, 2);
+	UT_ASSERT_EQ(CLUSTER_VOTING_DISK_RAW_READ_SHORT, 3);
+	UT_ASSERT_EQ(CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED, 4);
+
+	UT_ASSERT_EQ(cluster_voting_disk_read_raw_tail_slot(-1, slot),
+				 CLUSTER_VOTING_DISK_RAW_READ_NOT_TRIED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_raw_tail_slot(-1, slot),
+				 CLUSTER_VOTING_DISK_IO_NOT_TRIED);
+}
+
+UT_TEST(test_io_11_raw_tail_read_distinguishes_eof_short_and_full)
+{
+	char *path = make_temp_path("raw_tail_read");
+	uint8 expected[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 out[CLUSTER_VOTING_SLOT_BYTES];
+	int fd;
+	uint32 i;
+
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(ftruncate(fd, CLUSTER_VOTING_FILE_BYTES_MIN), 0);
+
+	memset(out, 0xA5, sizeof(out));
+	UT_ASSERT_EQ(cluster_voting_disk_read_raw_tail_slot(fd, out),
+				 CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF);
+
+	memset(expected, 0x5A, sizeof(expected));
+	UT_ASSERT_EQ(pwrite(fd, expected, 127, CLUSTER_VOTING_FILE_BYTES_MIN), 127);
+	UT_ASSERT_EQ(cluster_voting_disk_read_raw_tail_slot(fd, out),
+				 CLUSTER_VOTING_DISK_RAW_READ_SHORT);
+
+	UT_ASSERT_EQ(ftruncate(fd, CLUSTER_VOTING_FILE_BYTES_MIN), 0);
+	UT_ASSERT_EQ(ftruncate(fd, CLUSTER_VOTING_FILE_BYTES_MIN + CLUSTER_VOTING_SLOT_BYTES), 0);
+	memset(expected, 0, sizeof(expected));
+	memset(out, 0xA5, sizeof(out));
+	UT_ASSERT_EQ(cluster_voting_disk_read_raw_tail_slot(fd, out),
+				 CLUSTER_VOTING_DISK_RAW_READ_FULL);
+	UT_ASSERT_EQ(memcmp(expected, out, sizeof(expected)), 0);
+
+	for (i = 0; i < sizeof(expected); i++)
+		expected[i] = (uint8)(i ^ 0xC3);
+	UT_ASSERT_EQ(pwrite(fd, expected, sizeof(expected), CLUSTER_VOTING_FILE_BYTES_MIN),
+				 (ssize_t)sizeof(expected));
+	memset(out, 0, sizeof(out));
+	UT_ASSERT_EQ(cluster_voting_disk_read_raw_tail_slot(fd, out),
+				 CLUSTER_VOTING_DISK_RAW_READ_FULL);
+	UT_ASSERT_EQ(memcmp(expected, out, sizeof(expected)), 0);
+
+	cluster_voting_disk_close(fd);
+	(void)unlink(path);
+	free(path);
+}
+
+UT_TEST(test_io_12_raw_tail_write_lazily_extends_old_file)
+{
+	char *path = make_temp_path("raw_tail_write");
+	uint8 prior[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 in[CLUSTER_VOTING_SLOT_BYTES];
+	uint8 out[CLUSTER_VOTING_SLOT_BYTES];
+	struct stat st;
+	int fd;
+	int setup_fd;
+	uint32 i;
+
+	setup_fd = open(path, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+	UT_ASSERT(setup_fd >= 0);
+	UT_ASSERT_EQ(ftruncate(setup_fd, CLUSTER_VOTING_FILE_BYTES_MIN), 0);
+	memset(prior, 0x6D, sizeof(prior));
+	UT_ASSERT_EQ(pwrite(setup_fd, prior, sizeof(prior), CLUSTER_VOTING_STRIPE_ACTIVATION_OFFSET),
+				 (ssize_t)sizeof(prior));
+	UT_ASSERT_EQ(fsync(setup_fd), 0);
+	(void)close(setup_fd);
+
+	fd = cluster_voting_disk_open(path, /*create*/ false);
+	UT_ASSERT(fd >= 0);
+	for (i = 0; i < sizeof(in); i++)
+		in[i] = (uint8)(i ^ 0x39);
+
+	UT_ASSERT_EQ(cluster_voting_disk_write_raw_tail_slot(fd, in), CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(fstat(fd, &st), 0);
+	UT_ASSERT_EQ(st.st_size,
+				 CLUSTER_VOTING_FILE_BYTES_MIN + (off_t)CLUSTER_VOTING_SLOT_BYTES);
+
+	memset(out, 0, sizeof(out));
+	UT_ASSERT_EQ(cluster_voting_disk_read_raw_tail_slot(fd, out),
+				 CLUSTER_VOTING_DISK_RAW_READ_FULL);
+	UT_ASSERT_EQ(memcmp(in, out, sizeof(in)), 0);
+
+	memset(out, 0, sizeof(out));
+	UT_ASSERT_EQ(pread(fd, out, sizeof(out), CLUSTER_VOTING_STRIPE_ACTIVATION_OFFSET),
+				 (ssize_t)sizeof(out));
+	UT_ASSERT_EQ(memcmp(prior, out, sizeof(prior)), 0);
+
+	cluster_voting_disk_close(fd);
+	(void)unlink(path);
+	free(path);
+}
+
+UT_TEST(test_io_13_raw_tail_syscall_errors_are_io_failed)
+{
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
+	int pipefd[2];
+
+	memset(slot, 0, sizeof(slot));
+	UT_ASSERT_EQ(pipe(pipefd), 0);
+	UT_ASSERT_EQ(cluster_voting_disk_read_raw_tail_slot(pipefd[0], slot),
+				 CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED);
+	UT_ASSERT_EQ(cluster_voting_disk_write_raw_tail_slot(pipefd[1], slot),
+				 CLUSTER_VOTING_DISK_IO_FAILED);
+	(void)close(pipefd[0]);
+	(void)close(pipefd[1]);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(13);
 	UT_RUN(test_io_1_round_trip);
 	UT_RUN(test_io_2_crc_mismatch_returns_torn);
 	UT_RUN(test_io_3_magic_mismatch_failed);
@@ -391,6 +514,10 @@ main(void)
 	UT_RUN(test_io_6_fd_negative_not_tried);
 	UT_RUN(test_io_8_apply_lease_region_round_trip);
 	UT_RUN(test_io_9_marker_regions_are_disjoint);
+	UT_RUN(test_io_10_raw_tail_state_and_invalid_inputs);
+	UT_RUN(test_io_11_raw_tail_read_distinguishes_eof_short_and_full);
+	UT_RUN(test_io_12_raw_tail_write_lazily_extends_old_file);
+	UT_RUN(test_io_13_raw_tail_syscall_errors_are_io_failed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
