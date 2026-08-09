@@ -16,7 +16,98 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tx_resolve.h"
+
+static bool
+cluster_tx_locator_is_well_formed(const ClusterTxLocator *locator,
+								  ClusterTxResolveReason *reason_out)
+{
+	uint32 segment_id;
+	uint32 block_no;
+	uint16 tt_slot_offset;
+	uint16 row_offset;
+	bool data_kind;
+
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
+	if (locator == NULL)
+		return false;
+
+	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE
+				|| locator->itl_kind == ITL_FLAG_COMMITTED
+				|| locator->itl_kind == ITL_FLAG_ABORTED
+				|| locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT;
+	if (locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| (!data_kind && !ITL_FLAG_IS_LOCK_ONLY(locator->itl_kind)))
+		return false;
+	if (!TransactionIdIsNormal(locator->xid)) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_XID_MISMATCH;
+		return false;
+	}
+	if (locator->tt_wrap == TT_WRAP_INVALID) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_WRAP_MISMATCH;
+		return false;
+	}
+	if (!uba_decode(locator->uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
+		|| block_no == 0) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_BAD_UBA;
+		return false;
+	}
+
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return true;
+}
+
+static bool
+cluster_tx_locator_equal(const ClusterTxLocator *left, const ClusterTxLocator *right)
+{
+	return left->uba.raw[0] == right->uba.raw[0] && left->uba.raw[1] == right->uba.raw[1]
+		   && left->xid == right->xid && left->tt_wrap == right->tt_wrap
+		   && left->itl_kind == right->itl_kind
+		   && left->itl_slot_index == right->itl_slot_index;
+}
+
+static bool
+cluster_tx_resolve_reason_is_known(ClusterTxResolveReason reason)
+{
+	return (unsigned int)reason <= (unsigned int)CLUSTER_TX_RESOLVE_PROTOCOL;
+}
+
+static bool
+cluster_tx_resolution_is_publishable(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+									 uint64 formation_epoch, ClusterTxOutcome returned,
+									 const ClusterTxResolution *resolution,
+									 ClusterTxResolveReason provider_reason)
+{
+	if (returned == CLUSTER_TX_UNKNOWN || returned != resolution->outcome
+		|| provider_reason != CLUSTER_TX_RESOLVE_NONE
+		|| !cluster_tx_locator_equal(locator, &resolution->locator_echo)
+		|| !TransactionIdIsNormal(resolution->top_xid)
+		|| !cluster_tx_outcome_proof_is_valid(resolution->outcome, resolution->proof_kind)
+		|| resolution->authority.origin_epoch != formation_epoch
+		|| !SCN_VALID(resolution->authority.authority_scn))
+		return false;
+
+	if (resolution->outcome == CLUSTER_TX_COMMITTED) {
+		if (!SCN_VALID(resolution->commit_scn))
+			return false;
+	} else if (SCN_VALID(resolution->commit_scn))
+		return false;
+
+	/* CLEANOUT may publish only an irreversible terminal result. */
+	if (mode == CLUSTER_TX_RESOLVE_CLEANOUT_HINT
+		&& resolution->outcome != CLUSTER_TX_COMMITTED
+		&& resolution->outcome != CLUSTER_TX_ABORTED)
+		return false;
+
+	return true;
+}
 
 bool
 cluster_tx_locator_from_itl(Page page, uint8 slot_index, ClusterTxLocator *out,
@@ -76,15 +167,73 @@ cluster_tx_locator_from_itl(Page page, uint8 slot_index, ClusterTxLocator *out,
 }
 
 ClusterTxOutcome
-cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
-						 ClusterTxResolveMode mode pg_attribute_unused(), ClusterTxResolution *out,
+cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+						 ClusterTxResolution *out,
 						 ClusterTxResolveReason *reason_out)
 {
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	ClusterTxResolution candidate;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
+	ClusterTxResolveReason provider_reason = CLUSTER_TX_RESOLVE_NONE;
+	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
+	uint64 formation_epoch;
+
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
-	return CLUSTER_TX_UNKNOWN;
+	memset(&admission, 0, sizeof(admission));
+	memset(&candidate, 0, sizeof(candidate));
+
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		reason = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
+				 ? CLUSTER_TX_RESOLVE_TARGET_DISABLED
+				 : CLUSTER_TX_RESOLVE_RF_DEFERRED;
+		goto done;
+	}
+
+	if (out == NULL || (unsigned int)mode > (unsigned int)CLUSTER_TX_RESOLVE_CLEANOUT_HINT) {
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto admitted_done;
+	}
+	if (!cluster_tx_locator_is_well_formed(locator, &reason))
+		goto admitted_done;
+
+	formation_epoch = cluster_epoch_get_current();
+	outcome = cluster_runtime_visibility_resolve_exact_origin(
+		locator, mode, formation_epoch, &candidate, &provider_reason);
+	if (outcome == CLUSTER_TX_UNKNOWN) {
+		reason = provider_reason == CLUSTER_TX_RESOLVE_NONE
+					 || !cluster_tx_resolve_reason_is_known(provider_reason)
+				 ? CLUSTER_TX_RESOLVE_PROTOCOL
+				 : provider_reason;
+		goto admitted_done;
+	}
+	if (!cluster_tx_resolution_is_publishable(locator, mode, formation_epoch, outcome, &candidate,
+										  provider_reason)) {
+		outcome = CLUSTER_TX_UNKNOWN;
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto admitted_done;
+	}
+	if (cluster_epoch_get_current() != formation_epoch
+		|| !cluster_semantic_activation_recheck(&admission)) {
+		outcome = CLUSTER_TX_UNKNOWN;
+		reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+		goto admitted_done;
+	}
+
+	*out = candidate;
+	reason = CLUSTER_TX_RESOLVE_NONE;
+
+admitted_done:
+	cluster_semantic_activation_leave(&admission);
+done:
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return outcome;
 }
 
 ClusterTxOutcome

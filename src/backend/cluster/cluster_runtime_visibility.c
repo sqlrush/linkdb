@@ -53,12 +53,34 @@
 #include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_sf_dep.h" /* peer HELLO D4-capability gate (D4-6) */
+#include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_authority.h" /* dead-owner serve authority (D4-4) */
 #include "cluster/cluster_undo_gcs.h"		/* cluster_undo_block_acquire_shared (D3-2) */
 #include "cluster/cluster_undo_resid.h"		/* cluster_undo_resid_encode (D3-2) */
 #include "cluster/cluster_undo_verdict.h"	/* verdict taxonomy + entry (D3-3/D3-4) */
 #include "cluster/cluster_undo_horizon.h"	/* D5-8 read admission (spec-5.22e) */
+
+/*
+ * R4 exact durable-origin provider boundary.  The consumer is now wired to
+ * this exact-locator surface, but target semantics remain fail-closed until
+ * the origin-side exact undo/TT/native-state producer and its V3 remote arm
+ * land.  The legacy xid-scan verdict path is intentionally not used here: it
+ * cannot prove or echo the caller-selected UBA/slot/wrap identity.
+ */
+ClusterTxOutcome
+cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator pg_attribute_unused(),
+											 ClusterTxResolveMode mode pg_attribute_unused(),
+											 uint64 formation_epoch pg_attribute_unused(),
+											 ClusterTxResolution *out,
+											 ClusterTxResolveReason *reason_out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	return CLUSTER_TX_UNKNOWN;
+}
 
 /*
  * cluster_vis_live_authority_covers

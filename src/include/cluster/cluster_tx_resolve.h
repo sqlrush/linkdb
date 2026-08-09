@@ -26,14 +26,14 @@ typedef UBA ClusterUndoByteAddress;
 
 StaticAssertDecl(sizeof(ClusterUndoByteAddress) == 16, "R4 UBA alias must remain 16 bytes");
 
-typedef enum ClusterTxResolveMode {
+enum ClusterTxResolveMode {
 	CLUSTER_TX_RESOLVE_VISIBILITY = 0,
 	CLUSTER_TX_RESOLVE_ROW_WAIT = 1,
 	CLUSTER_TX_RESOLVE_CR_BUILD = 2,
 	CLUSTER_TX_RESOLVE_CLEANOUT_HINT = 3
-} ClusterTxResolveMode;
+};
 
-typedef enum ClusterTxResolveReason {
+enum ClusterTxResolveReason {
 	CLUSTER_TX_RESOLVE_NONE = 0,
 	CLUSTER_TX_RESOLVE_TARGET_DISABLED = 1,
 	CLUSTER_TX_RESOLVE_RF_DEFERRED = 2,
@@ -60,15 +60,15 @@ typedef enum ClusterTxResolveReason {
 	CLUSTER_TX_RESOLVE_REENTRANT = 23,
 	CLUSTER_TX_RESOLVE_IO_ERROR = 24,
 	CLUSTER_TX_RESOLVE_PROTOCOL = 25
-} ClusterTxResolveReason;
+};
 
-typedef enum ClusterTxOutcome {
+enum ClusterTxOutcome {
 	CLUSTER_TX_UNKNOWN = 0,
 	CLUSTER_TX_IN_PROGRESS = 1,
 	CLUSTER_TX_PREPARED = 2,
 	CLUSTER_TX_COMMITTED = 3,
 	CLUSTER_TX_ABORTED = 4
-} ClusterTxOutcome;
+};
 
 typedef enum ClusterTxProofKind {
 	CLUSTER_TX_PROOF_NONE = 0,
@@ -123,18 +123,18 @@ cluster_tx_outcome_proof_is_valid(ClusterTxOutcome outcome, ClusterTxProofKind p
 	return (valid_proofs[outcome] & (uint8)(1U << proof_kind)) != 0;
 }
 
-typedef struct ClusterTxLocator {
+struct ClusterTxLocator {
 	ClusterUndoByteAddress uba;
 	TransactionId xid;
 	uint16 tt_wrap;
 	uint8 itl_kind;
 	uint8 itl_slot_index;
-} ClusterTxLocator;
+};
 
 StaticAssertDecl(sizeof(ClusterTxLocator) == 24,
 				 "R4 ClusterTxLocator must remain an exact 24-byte value");
 
-typedef struct ClusterTxResolution {
+struct ClusterTxResolution {
 	ClusterTxLocator locator_echo;
 	TransactionId top_xid;
 	ClusterTxOutcome outcome;
@@ -142,7 +142,7 @@ typedef struct ClusterTxResolution {
 	SCN commit_scn;
 	SCN horizon_scn;
 	ClusterLiveAuthority authority;
-} ClusterTxResolution;
+};
 
 #define CLUSTER_R4_MAX_MULTI_MEMBERS 256
 
