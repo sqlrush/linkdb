@@ -163,10 +163,6 @@ bool
 visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
-	int			mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
-	int			mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
-	uint8		mask = flags << mapOffset;
-	char	   *map;
 	bool		cleared = false;
 
 	/* Must never clear all_visible bit while leaving all_frozen bit set */
