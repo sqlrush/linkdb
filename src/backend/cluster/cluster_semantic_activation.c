@@ -630,15 +630,6 @@ cluster_semantic_activation_submit(ClusterSemanticActivationAction action,
 	return semantic_activation_preflight(action, 0, refusal, &effects);
 }
 
-void
-ExecAlterSystemRacTwoStage(AlterSystemRacTwoStageStmt *stmt)
-{
-	ClusterSemanticActivationRefusal refusal;
-
-	if (stmt != NULL)
-		(void)cluster_semantic_activation_submit(stmt->action, &refusal);
-}
-
 const ClusterSemanticActivationDescriptor *
 cluster_semantic_activation_r4_descriptor(void)
 {

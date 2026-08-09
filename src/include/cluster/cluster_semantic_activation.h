@@ -13,7 +13,7 @@
 #define CLUSTER_SEMANTIC_ACTIVATION_H
 
 #include "c.h"
-#include "nodes/nodes.h"
+#include "nodes/parsenodes.h"
 
 #define PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 UINT32_C(0x00001000)
 #define PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1 UINT32_C(0x00002000)
@@ -39,13 +39,6 @@ typedef struct ClusterSemanticAdmissionToken {
 	uint8 side;
 	bool entered;
 } ClusterSemanticAdmissionToken;
-
-typedef enum ClusterSemanticActivationAction {
-	CLUSTER_SEMANTIC_ENABLE_ALL = 0,
-	CLUSTER_SEMANTIC_DISABLE_ALL = 1,
-	CLUSTER_SEMANTIC_ROLLBACK_ALL = 2,
-	CLUSTER_SEMANTIC_ROLLBACK_ABORT = 3
-} ClusterSemanticActivationAction;
 
 typedef enum ClusterSemanticActivationPhase {
 	CLUSTER_SEMANTIC_PHASE_NONE = 0,
@@ -118,11 +111,6 @@ typedef struct ClusterSemanticActivationDescriptor {
 	ClusterSemanticStageCallback revert_source_closed;
 	ClusterSemanticStageCallback open_target_admission;
 } ClusterSemanticActivationDescriptor;
-
-typedef struct AlterSystemRacTwoStageStmt {
-	NodeTag type;
-	ClusterSemanticActivationAction action;
-} AlterSystemRacTwoStageStmt;
 
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,

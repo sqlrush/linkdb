@@ -27,6 +27,9 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_inherits.h"
 #include "catalog/toasting.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_semantic_activation.h"
+#endif
 #include "commands/alter.h"
 #include "commands/async.h"
 #include "commands/cluster.h"
@@ -87,6 +90,33 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   DestReceiver *dest,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+
+#ifdef USE_PGRAC_CLUSTER
+void
+ExecAlterSystemRacTwoStage(AlterSystemRacTwoStageStmt *stmt)
+{
+	ClusterSemanticActivationRefusal refusal;
+	ClusterSemanticActivationResult result;
+
+	if (stmt == NULL)
+		return;
+
+	memset(&refusal, 0, sizeof(refusal));
+	result = cluster_semantic_activation_submit(stmt->action, &refusal);
+	if (result == CLUSTER_SEMANTIC_ACTIVATION_OK)
+		return;
+	if (result == CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("CONDITION_NOT_YET_MET: cluster semantic activation prerequisites are not satisfied"),
+				 errdetail("RF_DEFERRED: prerequisite evidence for the requested semantic feature is unavailable.")));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("cluster semantic activation request was refused"),
+			 errdetail("activation result: %d", (int)result)));
+}
+#endif
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -224,6 +254,7 @@ ClassifyUtilityCommandAsReadOnly(Node *parsetree)
 			}
 
 		case T_AlterSystemStmt:
+		case T_AlterSystemRacTwoStageStmt:
 			{
 				/*
 				 * Surprisingly, ALTER SYSTEM meets all our definitions of
@@ -873,6 +904,21 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		case T_AlterSystemStmt:
 			PreventInTransactionBlock(isTopLevel, "ALTER SYSTEM");
 			AlterSystemSetConfigFile((AlterSystemStmt *) parsetree);
+			break;
+
+		case T_AlterSystemRacTwoStageStmt:
+#ifdef USE_PGRAC_CLUSTER
+			PreventInTransactionBlock(isTopLevel, "ALTER SYSTEM");
+			if (!superuser())
+				ereport(ERROR,
+						(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+						 errmsg("permission denied to execute ALTER SYSTEM command")));
+			ExecAlterSystemRacTwoStage((AlterSystemRacTwoStageStmt *) parsetree);
+#else
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("ALTER SYSTEM RAC TWO_STAGE requires a --enable-cluster build")));
+#endif
 			break;
 
 		case T_VariableSetStmt:
@@ -2897,6 +2943,7 @@ CreateCommandTag(Node *parsetree)
 			break;
 
 		case T_AlterSystemStmt:
+		case T_AlterSystemRacTwoStageStmt:
 			tag = CMDTAG_ALTER_SYSTEM;
 			break;
 
@@ -3548,6 +3595,7 @@ GetCommandLogLevel(Node *parsetree)
 			break;
 
 		case T_AlterSystemStmt:
+		case T_AlterSystemRacTwoStageStmt:
 			lev = LOGSTMT_DDL;
 			break;
 

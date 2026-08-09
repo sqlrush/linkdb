@@ -285,7 +285,8 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 		AlterDatabaseStmt AlterDatabaseSetStmt AlterDomainStmt AlterEnumStmt
 		AlterFdwStmt AlterForeignServerStmt AlterGroupStmt
 		AlterObjectDependsStmt AlterObjectSchemaStmt AlterOwnerStmt
-		AlterOperatorStmt AlterTypeStmt AlterSeqStmt AlterSystemStmt AlterTableStmt
+		AlterOperatorStmt AlterTypeStmt AlterSeqStmt AlterSystemStmt
+		AlterSystemRacTwoStageStmt AlterTableStmt
 		AlterTblSpcStmt AlterExtensionStmt AlterExtensionContentsStmt
 		AlterCompositeTypeStmt AlterUserMappingStmt
 		AlterRoleStmt AlterRoleSetStmt AlterPolicyStmt AlterStatsStmt
@@ -747,11 +748,11 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
 
-	QUOTE
+	QUOTE RAC
 
 	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
-	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
+	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLING ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
 
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
@@ -764,10 +765,10 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	TABLE TABLES TABLESAMPLE TABLESPACE TEMP TEMPLATE TEMPORARY TEXT_P THEN
 	TIES TIME TIMESTAMP TO TRAILING TRANSACTION TRANSFORM
 	TREAT TRIGGER TRIM TRUE_P
-	TRUNCATE TRUSTED TYPE_P TYPES_P
+	TRUNCATE TRUSTED TWO_STAGE TYPE_P TYPES_P
 
 	UESCAPE UNBOUNDED UNCOMMITTED UNENCRYPTED UNION UNIQUE UNKNOWN
-	UNLISTEN UNLOGGED UNTIL UPDATE USER USING
+	UNLISTEN UNLOGGED UNTIL UPDATE UPDATES USER USING
 
 	VACUUM VALID VALIDATE VALIDATOR VALUE_P VALUES VARCHAR VARIADIC VARYING
 	VERBOSE VERSION_P VIEW VIEWS VOLATILE
@@ -985,6 +986,7 @@ stmt:
 			| AlterPolicyStmt
 			| AlterSeqStmt
 			| AlterSystemStmt
+			| AlterSystemRacTwoStageStmt
 			| AlterTableStmt
 			| AlterTblSpcStmt
 			| AlterCompositeTypeStmt
@@ -11339,6 +11341,37 @@ AlterSystemStmt:
 				}
 		;
 
+AlterSystemRacTwoStageStmt:
+			ALTER SYSTEM_P ENABLE_P RAC TWO_STAGE ROLLING UPDATES ALL
+				{
+					AlterSystemRacTwoStageStmt *n = makeNode(AlterSystemRacTwoStageStmt);
+
+					n->action = CLUSTER_SEMANTIC_ENABLE_ALL;
+					$$ = (Node *) n;
+				}
+			| ALTER SYSTEM_P DISABLE_P RAC TWO_STAGE ROLLING UPDATES ALL
+				{
+					AlterSystemRacTwoStageStmt *n = makeNode(AlterSystemRacTwoStageStmt);
+
+					n->action = CLUSTER_SEMANTIC_DISABLE_ALL;
+					$$ = (Node *) n;
+				}
+			| ALTER SYSTEM_P ROLLBACK RAC TWO_STAGE ROLLING UPDATES ALL
+				{
+					AlterSystemRacTwoStageStmt *n = makeNode(AlterSystemRacTwoStageStmt);
+
+					n->action = CLUSTER_SEMANTIC_ROLLBACK_ALL;
+					$$ = (Node *) n;
+				}
+			| ALTER SYSTEM_P ROLLBACK RAC TWO_STAGE ROLLING UPDATES ABORT_P
+				{
+					AlterSystemRacTwoStageStmt *n = makeNode(AlterSystemRacTwoStageStmt);
+
+					n->action = CLUSTER_SEMANTIC_ROLLBACK_ABORT;
+					$$ = (Node *) n;
+				}
+		;
+
 
 /*****************************************************************************
  *
@@ -17157,6 +17190,7 @@ unreserved_keyword:
 			| PROGRAM
 			| PUBLICATION
 			| QUOTE
+			| RAC
 			| RANGE
 			| READ
 			| REASSIGN
@@ -17180,6 +17214,7 @@ unreserved_keyword:
 			| REVOKE
 			| ROLE
 			| ROLLBACK
+			| ROLLING
 			| ROLLUP
 			| ROUTINE
 			| ROUTINES
@@ -17233,6 +17268,7 @@ unreserved_keyword:
 			| TRIGGER
 			| TRUNCATE
 			| TRUSTED
+			| TWO_STAGE
 			| TYPE_P
 			| TYPES_P
 			| UESCAPE
@@ -17244,6 +17280,7 @@ unreserved_keyword:
 			| UNLOGGED
 			| UNTIL
 			| UPDATE
+			| UPDATES
 			| VACUUM
 			| VALID
 			| VALIDATE
@@ -17756,6 +17793,7 @@ bare_label_keyword:
 			| PROGRAM
 			| PUBLICATION
 			| QUOTE
+			| RAC
 			| RANGE
 			| READ
 			| REAL
@@ -17782,6 +17820,7 @@ bare_label_keyword:
 			| RIGHT
 			| ROLE
 			| ROLLBACK
+			| ROLLING
 			| ROLLUP
 			| ROUTINE
 			| ROUTINES
@@ -17853,6 +17892,7 @@ bare_label_keyword:
 			| TRUE_P
 			| TRUNCATE
 			| TRUSTED
+			| TWO_STAGE
 			| TYPE_P
 			| TYPES_P
 			| UESCAPE
@@ -17865,6 +17905,7 @@ bare_label_keyword:
 			| UNLOGGED
 			| UNTIL
 			| UPDATE
+			| UPDATES
 			| USER
 			| USING
 			| VACUUM

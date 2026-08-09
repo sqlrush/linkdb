@@ -3641,6 +3641,21 @@ typedef struct AlterSystemStmt
 	VariableSetStmt *setstmt;	/* SET subcommand */
 } AlterSystemStmt;
 
+typedef enum ClusterSemanticActivationAction
+{
+	CLUSTER_SEMANTIC_ENABLE_ALL = 0,
+	CLUSTER_SEMANTIC_DISABLE_ALL = 1,
+	CLUSTER_SEMANTIC_ROLLBACK_ALL = 2,
+	CLUSTER_SEMANTIC_ROLLBACK_ABORT = 3
+} ClusterSemanticActivationAction;
+
+typedef struct AlterSystemRacTwoStageStmt
+{
+	pg_node_attr(nodetag_number(455))
+	NodeTag		type;
+	ClusterSemanticActivationAction action;
+} AlterSystemRacTwoStageStmt;
+
 /* ----------------------
  *		Cluster Statement (support pbrown's cluster index implementation)
  * ----------------------
