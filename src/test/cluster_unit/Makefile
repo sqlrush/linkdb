@@ -1952,6 +1952,7 @@ CLUSTER_SEMANTIC_ACTIVATION_C = $(top_srcdir)/src/backend/cluster/cluster_semant
 CLUSTER_SEMANTIC_ACTIVATION_H = $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 
 test_cluster_r4_activation_record: test_cluster_r4_activation_record.c unit_test.h \
+		cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -1968,6 +1969,7 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
+		cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

@@ -16,16 +16,21 @@
  */
 #include "postgres.h"
 
+#include "miscadmin.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
+#include "storage/ipc.h"
 #include "storage/shmem.h"
 
 #define CLUSTER_SEMANTIC_RECORD_MAGIC UINT32_C(0x50475341)
 #define CLUSTER_SEMANTIC_RECORD_VERSION 1
 #define CLUSTER_SEMANTIC_RECORD_HEADER_LEN 104
 #define CLUSTER_SEMANTIC_RECORD_CRC_OFFSET 96
+#define CLUSTER_SEMANTIC_ADMISSION_SNAPSHOT_TRIES 3
+#define CLUSTER_SEMANTIC_ADMISSION_COUNTER_TRIES 16
 
 typedef struct ClusterSemanticRecordSample {
 	bool readable;
@@ -39,14 +44,37 @@ typedef struct ClusterSemanticActivationShmem {
 	uint64 record_cas_expected_generation;
 	uint64 record_cas_expected_source_feature_bitmap;
 	uint8 record_cas_desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	pg_atomic_uint64 admission_seq;
+	pg_atomic_uint64 active_bits;
+	pg_atomic_uint64 record_generation;
+	pg_atomic_uint64 formation_epoch;
+	pg_atomic_uint32 transition_closed;
+	pg_atomic_uint32 inflight[2][64];
 } ClusterSemanticActivationShmem;
 
+StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, admission_seq) == 552,
+				 "semantic admission sequence must follow the unchanged CAS mailbox");
+StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, active_bits) == 560,
+				 "semantic admission active bitmap offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, record_generation) == 568,
+				 "semantic admission record generation offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, formation_epoch) == 576,
+				 "semantic admission formation offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, transition_closed) == 584,
+				 "semantic admission closed flag offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, inflight) == 588,
+				 "semantic admission inflight offset must remain stable");
+StaticAssertDecl(sizeof(ClusterSemanticActivationShmem) == 1104,
+				 "semantic activation shared state must retain its natural layout");
+
 static ClusterSemanticActivationShmem *SemanticActivationShmem = NULL;
+static uint32 semantic_activation_local_inflight[2][64];
+static int semantic_activation_exit_hook_pid;
 
 static bool semantic_activation_record_cas_mailbox_submit(
 	uint64 expected_generation, uint64 expected_source_feature_bitmap,
-	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
-	uint64 *out_request_seq) pg_attribute_unused();
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES], uint64 *out_request_seq)
+	pg_attribute_unused();
 static bool semantic_activation_record_cas_mailbox_poll_completion(
 	uint64 request_seq, ClusterSemanticActivationResult *out_result) pg_attribute_unused();
 
@@ -129,14 +157,13 @@ typedef enum SemanticActivationEffect {
 	SEMANTIC_ACTIVATION_EFFECT_DATA_WIRE = UINT32_C(64)
 } SemanticActivationEffect;
 
-/*
- * B2 is deliberately deployed with the source semantics open and the target
- * semantics dormant.  The later shared-memory/control-plane integration owns
- * changing this snapshot; the dependency-light core only consumes it.
- */
-static uint64 semantic_activation_active_bits = 0;
-static uint64 semantic_activation_record_generation = 0;
-static bool semantic_activation_transition_closed = false;
+typedef struct SemanticActivationAdmissionSnapshot {
+	uint64 seq;
+	uint64 active_bits;
+	uint64 record_generation;
+	uint64 formation_epoch;
+	bool transition_closed;
+} SemanticActivationAdmissionSnapshot;
 
 static uint16
 semantic_activation_read_u16_le(const uint8 *bytes)
@@ -477,47 +504,270 @@ static const ClusterSemanticActivationDescriptor r4_descriptor = {
 	.open_target_admission = r4_stage_fail_closed,
 };
 
+static bool
+semantic_activation_feature_index(uint64 feature_bit, int *feature_index)
+{
+	if (feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 || feature_index == NULL)
+		return false;
+	*feature_index = 0;
+	return true;
+}
+
+static bool
+semantic_activation_snapshot(SemanticActivationAdmissionSnapshot *snapshot)
+{
+	int attempt;
+
+	if (SemanticActivationShmem == NULL || snapshot == NULL)
+		return false;
+
+	for (attempt = 0; attempt < CLUSTER_SEMANTIC_ADMISSION_SNAPSHOT_TRIES; attempt++) {
+		uint64 seq_before;
+		uint64 seq_after;
+
+		seq_before = pg_atomic_read_u64(&SemanticActivationShmem->admission_seq);
+		if ((seq_before & UINT64_C(1)) != 0)
+			continue;
+		pg_read_barrier();
+		snapshot->active_bits = pg_atomic_read_u64(&SemanticActivationShmem->active_bits);
+		snapshot->record_generation
+			= pg_atomic_read_u64(&SemanticActivationShmem->record_generation);
+		snapshot->formation_epoch = pg_atomic_read_u64(&SemanticActivationShmem->formation_epoch);
+		snapshot->transition_closed
+			= pg_atomic_read_u32(&SemanticActivationShmem->transition_closed) != 0;
+		pg_read_barrier();
+		seq_after = pg_atomic_read_u64(&SemanticActivationShmem->admission_seq);
+		if (seq_before == seq_after && (seq_after & UINT64_C(1)) == 0) {
+			snapshot->seq = seq_after;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool
+semantic_activation_counter_increment(pg_atomic_uint32 *counter)
+{
+	int attempt;
+	uint32 observed;
+
+	observed = pg_atomic_read_u32(counter);
+	for (attempt = 0; attempt < CLUSTER_SEMANTIC_ADMISSION_COUNTER_TRIES; attempt++) {
+		uint32 expected = observed;
+
+		if (observed == UINT32_MAX)
+			return false;
+		if (pg_atomic_compare_exchange_u32(counter, &expected, observed + 1))
+			return true;
+		observed = expected;
+	}
+	return false;
+}
+
+static void
+semantic_activation_counter_subtract(pg_atomic_uint32 *counter, uint32 amount)
+{
+	uint32 observed = pg_atomic_read_u32(counter);
+
+	for (;;) {
+		uint32 expected = observed;
+
+		if (amount == 0)
+			return;
+		if (observed < amount)
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("semantic activation admission debt underflow"),
+							errhint("Restart the failed process and retain the shared-memory image "
+									"for diagnosis.")));
+		if (pg_atomic_compare_exchange_u32(counter, &expected, observed - amount))
+			return;
+		observed = expected;
+	}
+}
+
+static void
+semantic_activation_exit_cleanup(int code, Datum arg)
+{
+	int side;
+	int feature_index;
+	int registered_pid = DatumGetInt32(arg);
+
+	(void)code;
+	if (registered_pid != MyProcPid || semantic_activation_exit_hook_pid != MyProcPid
+		|| SemanticActivationShmem == NULL)
+		return;
+
+	HOLD_INTERRUPTS();
+	for (side = 0; side < 2; side++) {
+		for (feature_index = 0; feature_index < 64; feature_index++) {
+			uint32 local = semantic_activation_local_inflight[side][feature_index];
+			uint32 shared;
+
+			if (local == 0)
+				continue;
+			shared = pg_atomic_read_u32(&SemanticActivationShmem->inflight[side][feature_index]);
+			if (shared < local)
+				ereport(
+					PANIC,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("semantic activation exit debt is inconsistent"),
+					 errhint("Retain the shared-memory image and restart the failed process.")));
+		}
+	}
+	for (side = 0; side < 2; side++) {
+		for (feature_index = 0; feature_index < 64; feature_index++) {
+			uint32 local = semantic_activation_local_inflight[side][feature_index];
+
+			if (local == 0)
+				continue;
+			semantic_activation_counter_subtract(
+				&SemanticActivationShmem->inflight[side][feature_index], local);
+			semantic_activation_local_inflight[side][feature_index] = 0;
+		}
+	}
+	semantic_activation_exit_hook_pid = 0;
+	RESUME_INTERRUPTS();
+}
+
+static bool
+semantic_activation_ensure_exit_hook(void)
+{
+	if (MyProcPid <= 0)
+		return false;
+	if (semantic_activation_exit_hook_pid == MyProcPid)
+		return true;
+
+	memset(semantic_activation_local_inflight, 0, sizeof(semantic_activation_local_inflight));
+	on_shmem_exit(semantic_activation_exit_cleanup, Int32GetDatum(MyProcPid));
+	semantic_activation_exit_hook_pid = MyProcPid;
+	return true;
+}
+
+static void
+semantic_activation_release_debt(ClusterSemanticAdmissionSide side, int feature_index)
+{
+	uint32 *local = &semantic_activation_local_inflight[side][feature_index];
+
+	if (*local == 0)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("semantic activation local debt is missing"),
+						errhint("Retain the process and shared-memory state for diagnosis.")));
+	semantic_activation_counter_subtract(&SemanticActivationShmem->inflight[side][feature_index],
+										 1);
+	(*local)--;
+}
+
 ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
 								  ClusterSemanticAdmissionToken *token)
 {
+	SemanticActivationAdmissionSnapshot before;
+	SemanticActivationAdmissionSnapshot after;
 	ClusterSemanticAdmissionResult result;
+	uint64 epoch_before;
+	uint64 epoch_after;
+	int feature_index;
+	bool incremented = false;
 
 	if (token != NULL)
 		memset(token, 0, sizeof(*token));
-	if (token == NULL)
+	if (token == NULL || SemanticActivationShmem == NULL
+		|| (side != CLUSTER_SEMANTIC_SOURCE_SIDE && side != CLUSTER_SEMANTIC_TARGET_SIDE)
+		|| !semantic_activation_feature_index(feature_bit, &feature_index)
+		|| !semantic_activation_ensure_exit_hook())
 		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 
+	epoch_before = cluster_epoch_get_current();
+	if (!semantic_activation_snapshot(&before))
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	if (before.formation_epoch != epoch_before)
+		return CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
 	result = semantic_activation_admission_policy(
-		feature_bit, semantic_activation_active_bits, semantic_activation_transition_closed, side,
-		semantic_activation_record_generation, semantic_activation_record_generation);
-	if (result == CLUSTER_SEMANTIC_ADMISSION_OK) {
-		token->feature_bit = feature_bit;
-		token->record_generation = semantic_activation_record_generation;
-		token->side = (uint8)side;
-		token->entered = true;
+		feature_bit, before.active_bits, before.transition_closed, side, before.record_generation,
+		before.record_generation);
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return result;
+
+	HOLD_INTERRUPTS();
+	if (semantic_activation_local_inflight[side][feature_index] != UINT32_MAX
+		&& semantic_activation_counter_increment(
+			&SemanticActivationShmem->inflight[side][feature_index])) {
+		semantic_activation_local_inflight[side][feature_index]++;
+		incremented = true;
 	}
-	return result;
+	pg_write_barrier();
+	RESUME_INTERRUPTS();
+	if (!incremented)
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+
+	epoch_after = cluster_epoch_get_current();
+	if (!semantic_activation_snapshot(&after))
+		result = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	else if (before.seq != after.seq || before.record_generation != after.record_generation
+			 || before.formation_epoch != after.formation_epoch || epoch_before != epoch_after
+			 || after.formation_epoch != epoch_after)
+		result = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+	else
+		result = semantic_activation_admission_policy(
+			feature_bit, after.active_bits, after.transition_closed, side, before.record_generation,
+			after.record_generation);
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		HOLD_INTERRUPTS();
+		semantic_activation_release_debt(side, feature_index);
+		RESUME_INTERRUPTS();
+		return result;
+	}
+
+	token->feature_bit = feature_bit;
+	token->record_generation = before.record_generation;
+	token->formation_epoch = before.formation_epoch;
+	token->side = (uint8)side;
+	token->entered = true;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 bool
 cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 {
+	SemanticActivationAdmissionSnapshot snapshot;
+	uint64 current_epoch;
+	int feature_index;
+
 	if (token == NULL || !token->entered)
+		return false;
+	if (!semantic_activation_feature_index(token->feature_bit, &feature_index)
+		|| token->side > CLUSTER_SEMANTIC_TARGET_SIDE || SemanticActivationShmem == NULL)
+		return false;
+	(void)feature_index;
+	current_epoch = cluster_epoch_get_current();
+	if (!semantic_activation_snapshot(&snapshot) || snapshot.formation_epoch != current_epoch
+		|| token->formation_epoch != current_epoch)
 		return false;
 
 	return semantic_activation_admission_policy(
-			   token->feature_bit, semantic_activation_active_bits,
-			   semantic_activation_transition_closed, (ClusterSemanticAdmissionSide)token->side,
-			   token->record_generation, semantic_activation_record_generation)
+			   token->feature_bit, snapshot.active_bits, snapshot.transition_closed,
+			   (ClusterSemanticAdmissionSide)token->side, token->record_generation,
+			   snapshot.record_generation)
 		   == CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 void
 cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 {
-	if (token != NULL)
-		token->entered = false;
+	int feature_index;
+
+	if (token == NULL || !token->entered)
+		return;
+	if (SemanticActivationShmem == NULL || token->side > CLUSTER_SEMANTIC_TARGET_SIDE
+		|| !semantic_activation_feature_index(token->feature_bit, &feature_index))
+		ereport(PANIC,
+				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("semantic activation token is invalid"),
+				 errhint("Retain the process and shared-memory state for diagnosis.")));
+
+	HOLD_INTERRUPTS();
+	semantic_activation_release_debt((ClusterSemanticAdmissionSide)token->side, feature_index);
+	memset(token, 0, sizeof(*token));
+	RESUME_INTERRUPTS();
 }
 
 Size
@@ -530,6 +780,8 @@ void
 cluster_semantic_activation_shmem_init(void)
 {
 	bool found;
+	int side;
+	int feature_index;
 
 	SemanticActivationShmem = (ClusterSemanticActivationShmem *)ShmemInitStruct(
 		"pgrac cluster semantic activation", cluster_semantic_activation_shmem_size(), &found);
@@ -544,6 +796,15 @@ cluster_semantic_activation_shmem_init(void)
 	SemanticActivationShmem->record_cas_expected_source_feature_bitmap = 0;
 	memset(SemanticActivationShmem->record_cas_desired_bytes, 0,
 		   sizeof(SemanticActivationShmem->record_cas_desired_bytes));
+	pg_atomic_init_u64(&SemanticActivationShmem->admission_seq, 0);
+	pg_atomic_init_u64(&SemanticActivationShmem->active_bits, 0);
+	pg_atomic_init_u64(&SemanticActivationShmem->record_generation, 0);
+	pg_atomic_init_u64(&SemanticActivationShmem->formation_epoch, 0);
+	pg_atomic_init_u32(&SemanticActivationShmem->transition_closed, 1);
+	for (side = 0; side < 2; side++) {
+		for (feature_index = 0; feature_index < 64; feature_index++)
+			pg_atomic_init_u32(&SemanticActivationShmem->inflight[side][feature_index], 0);
+	}
 }
 
 static bool
@@ -600,8 +861,8 @@ cluster_semantic_activation_qvotec_poll_record_cas(ClusterSemanticActivationCasR
 }
 
 bool
-cluster_semantic_activation_qvotec_complete_record_cas(
-	uint64 request_seq, ClusterSemanticActivationResult result)
+cluster_semantic_activation_qvotec_complete_record_cas(uint64 request_seq,
+													   ClusterSemanticActivationResult result)
 {
 	uint64 current_request_seq;
 	uint64 completion_seq;
@@ -609,8 +870,7 @@ cluster_semantic_activation_qvotec_complete_record_cas(
 	if (SemanticActivationShmem == NULL)
 		return false;
 
-	current_request_seq
-		= pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
+	current_request_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
 	completion_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq);
 	if (current_request_seq != request_seq || completion_seq == UINT64_MAX
 		|| completion_seq + 1 != request_seq)
@@ -623,8 +883,8 @@ cluster_semantic_activation_qvotec_complete_record_cas(
 }
 
 static bool
-semantic_activation_record_cas_mailbox_poll_completion(
-	uint64 request_seq, ClusterSemanticActivationResult *out_result)
+semantic_activation_record_cas_mailbox_poll_completion(uint64 request_seq,
+													   ClusterSemanticActivationResult *out_result)
 {
 	if (SemanticActivationShmem == NULL || out_result == NULL
 		|| pg_atomic_read_u64(&SemanticActivationShmem->record_cas_completion_seq) != request_seq)
@@ -745,7 +1005,50 @@ cluster_semantic_activation_record_decode(const uint8 bytes[512],
 
 void
 cluster_semantic_activation_lmon_tick(void)
-{}
+{
+	uint64 seq;
+	uint64 active_bits;
+	uint64 generation;
+	uint64 formation_epoch;
+
+	if (SemanticActivationShmem == NULL)
+		return;
+	seq = pg_atomic_read_u64(&SemanticActivationShmem->admission_seq);
+	if ((seq & UINT64_C(1)) != 0) {
+		if (seq == UINT64_MAX)
+			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+							errmsg("semantic activation admission sequence exhausted"),
+							errhint("Retain the shared-memory image and restart the cluster.")));
+		pg_atomic_write_u64(&SemanticActivationShmem->active_bits, 0);
+		pg_atomic_write_u64(&SemanticActivationShmem->record_generation, 0);
+		pg_atomic_write_u64(&SemanticActivationShmem->formation_epoch, cluster_epoch_get_current());
+		pg_atomic_write_u32(&SemanticActivationShmem->transition_closed, 1);
+		pg_write_barrier();
+		pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, seq + 1);
+		return;
+	}
+
+	active_bits = pg_atomic_read_u64(&SemanticActivationShmem->active_bits);
+	generation = pg_atomic_read_u64(&SemanticActivationShmem->record_generation);
+	formation_epoch = cluster_epoch_get_current();
+	if (active_bits != 0 || generation != 0
+		|| (pg_atomic_read_u32(&SemanticActivationShmem->transition_closed) == 0
+			&& pg_atomic_read_u64(&SemanticActivationShmem->formation_epoch) == formation_epoch))
+		return;
+	if (seq > UINT64_MAX - 2)
+		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("semantic activation admission sequence exhausted"),
+						errhint("Retain the shared-memory image and restart the cluster.")));
+
+	pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, seq + 1);
+	pg_write_barrier();
+	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, 0);
+	pg_atomic_write_u64(&SemanticActivationShmem->record_generation, 0);
+	pg_atomic_write_u64(&SemanticActivationShmem->formation_epoch, formation_epoch);
+	pg_atomic_write_u32(&SemanticActivationShmem->transition_closed, 0);
+	pg_write_barrier();
+	pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, seq + 2);
+}
 
 ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,

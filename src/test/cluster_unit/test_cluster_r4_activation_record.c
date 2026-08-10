@@ -15,6 +15,8 @@
 #include "port/pg_crc32c.h"
 #include "storage/shmem.h"
 
+#include "cluster_r4_activation_test_stubs.h"
+
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr pg_attribute_unused())
@@ -663,8 +665,7 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 {
 	ClusterSemanticActivationShmem shmem;
 	ClusterSemanticActivationCasRequest request;
-	ClusterSemanticActivationRecord desired_record
-		= valid_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 8);
+	ClusterSemanticActivationRecord desired_record = valid_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 8);
 	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 	uint64 seq = UINT64_MAX;
@@ -675,19 +676,16 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	pg_atomic_init_u32(&shmem.record_cas_result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	SemanticActivationShmem = NULL;
 	UT_ASSERT(encode(desired_record, desired));
-	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired,
-													&seq));
+	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
 
 	SemanticActivationShmem = &shmem;
 	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), NULL, &seq));
 	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, NULL));
-	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired,
-													   &seq));
+	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
 	UT_ASSERT_EQ(seq, 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_request_seq), 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_completion_seq), 0);
-	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(8, UINT64_C(0x22), desired,
-													&seq));
+	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(8, UINT64_C(0x22), desired, &seq));
 
 	memset(&request, 0, sizeof(request));
 	UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_cas(&request));
@@ -695,26 +693,24 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	UT_ASSERT_EQ(request.expected_generation, 7);
 	UT_ASSERT_EQ(request.expected_source_feature_bitmap, UINT64_C(0x11));
 	UT_ASSERT_EQ(memcmp(request.desired_bytes, desired, sizeof(desired)), 0);
-	UT_ASSERT(!cluster_semantic_activation_qvotec_complete_record_cas(
-		0, CLUSTER_SEMANTIC_ACTIVATION_OK));
-	UT_ASSERT(!cluster_semantic_activation_qvotec_complete_record_cas(
-		2, CLUSTER_SEMANTIC_ACTIVATION_OK));
+	UT_ASSERT(
+		!cluster_semantic_activation_qvotec_complete_record_cas(0, CLUSTER_SEMANTIC_ACTIVATION_OK));
+	UT_ASSERT(
+		!cluster_semantic_activation_qvotec_complete_record_cas(2, CLUSTER_SEMANTIC_ACTIVATION_OK));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_completion_seq), 0);
 	UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_cas(
 		1, CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT));
-	UT_ASSERT(!cluster_semantic_activation_qvotec_complete_record_cas(
-		1, CLUSTER_SEMANTIC_ACTIVATION_OK));
+	UT_ASSERT(
+		!cluster_semantic_activation_qvotec_complete_record_cas(1, CLUSTER_SEMANTIC_ACTIVATION_OK));
 	UT_ASSERT(semantic_activation_record_cas_mailbox_poll_completion(1, &result));
 	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT);
 	UT_ASSERT(!semantic_activation_record_cas_mailbox_poll_completion(2, &result));
 
-	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(8, UINT64_C(0x22), desired,
-													   &seq));
+	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(8, UINT64_C(0x22), desired, &seq));
 	UT_ASSERT_EQ(seq, 2);
 	pg_atomic_write_u64(&shmem.record_cas_request_seq, UINT64_MAX);
 	pg_atomic_write_u64(&shmem.record_cas_completion_seq, UINT64_MAX);
-	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(8, UINT64_C(0x22), desired,
-													&seq));
+	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(8, UINT64_C(0x22), desired, &seq));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_request_seq), UINT64_MAX);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_completion_seq), UINT64_MAX);
 	SemanticActivationShmem = NULL;

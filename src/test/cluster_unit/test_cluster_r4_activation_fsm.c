@@ -7,14 +7,100 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "port/atomics.h"
+#include "storage/ipc.h"
 #include "storage/shmem.h"
 
+#define TEST_SEMANTIC_SHMEM_BYTES 1104
+#define TEST_GATE_SEQ_OFFSET 552
+#define TEST_GATE_ACTIVE_BITS_OFFSET 560
+#define TEST_GATE_RECORD_GENERATION_OFFSET 568
+#define TEST_GATE_FORMATION_EPOCH_OFFSET 576
+#define TEST_GATE_CLOSED_OFFSET 584
+#define TEST_GATE_INFLIGHT_OFFSET 588
+
+typedef union TestSemanticShmemStorage {
+	pg_atomic_uint64 align;
+	uint8 bytes[TEST_SEMANTIC_SHMEM_BYTES];
+} TestSemanticShmemStorage;
+
+static TestSemanticShmemStorage test_semantic_shmem;
+static bool test_shmem_found;
+static Size test_shmem_requested_size;
+static pg_on_exit_callback test_exit_callback;
+static Datum test_exit_callback_arg;
+static int test_exit_registration_count;
+static uint64 test_current_epoch = 7;
+
+int MyProcPid = 101;
+volatile sig_atomic_t InterruptPending = false;
+volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 QueryCancelHoldoffCount = 0;
+volatile uint32 CritSectionCount = 0;
+
+void ProcessInterrupts(void);
+
 void *
-ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
-				bool *foundPtr pg_attribute_unused())
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
 {
-	return NULL;
+	test_shmem_requested_size = size;
+	*foundPtr = test_shmem_found;
+	return test_semantic_shmem.bytes;
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return test_current_epoch;
+}
+
+void
+on_shmem_exit(pg_on_exit_callback function, Datum arg)
+{
+	test_exit_callback = function;
+	test_exit_callback_arg = arg;
+	test_exit_registration_count++;
+}
+
+void
+ProcessInterrupts(void)
+{}
+
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
 }
 
 /* Exercise the real product-local policy helpers without exporting a test API. */
@@ -34,6 +120,62 @@ ExceptionalCondition(const char *condition_name pg_attribute_unused(),
 					 int line_number pg_attribute_unused())
 {
 	abort();
+}
+
+static pg_atomic_uint64 *
+test_gate_u64(Size offset)
+{
+	return (pg_atomic_uint64 *)(test_semantic_shmem.bytes + offset);
+}
+
+static pg_atomic_uint32 *
+test_gate_u32(Size offset)
+{
+	return (pg_atomic_uint32 *)(test_semantic_shmem.bytes + offset);
+}
+
+static pg_atomic_uint32 *
+test_gate_inflight(ClusterSemanticAdmissionSide side, int feature_index)
+{
+	return test_gate_u32(TEST_GATE_INFLIGHT_OFFSET
+						 + ((Size)side * 64 + (Size)feature_index) * sizeof(pg_atomic_uint32));
+}
+
+static void
+test_gate_reset(void)
+{
+	memset(&test_semantic_shmem, 0, sizeof(test_semantic_shmem));
+	test_shmem_found = false;
+	test_shmem_requested_size = 0;
+	test_exit_callback = NULL;
+	test_exit_callback_arg = (Datum)0;
+	test_exit_registration_count = 0;
+	test_current_epoch = 7;
+	MyProcPid = 101;
+	SemanticActivationShmem = NULL;
+	memset(semantic_activation_local_inflight, 0, sizeof(semantic_activation_local_inflight));
+	semantic_activation_exit_hook_pid = 0;
+	cluster_semantic_activation_shmem_init();
+}
+
+static void
+test_gate_publish(uint64 seq, uint64 active_bits, uint64 generation, uint64 formation_epoch,
+				  bool closed)
+{
+	pg_atomic_write_u64(test_gate_u64(TEST_GATE_SEQ_OFFSET), seq);
+	pg_atomic_write_u64(test_gate_u64(TEST_GATE_ACTIVE_BITS_OFFSET), active_bits);
+	pg_atomic_write_u64(test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET), generation);
+	pg_atomic_write_u64(test_gate_u64(TEST_GATE_FORMATION_EPOCH_OFFSET), formation_epoch);
+	pg_atomic_write_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET), closed ? 1 : 0);
+}
+
+static uint64
+test_token_formation_epoch(const ClusterSemanticAdmissionToken *token)
+{
+	uint64 formation_epoch;
+
+	memcpy(&formation_epoch, ((const uint8 *)token) + 16, sizeof(formation_epoch));
+	return formation_epoch;
 }
 
 static SemanticActivationAckTuple
@@ -557,6 +699,8 @@ UT_TEST(test_95_dormant_target_enter_has_no_token)
 {
 	ClusterSemanticAdmissionToken token;
 
+	test_gate_reset();
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
 	memset(&token, 0xa5, sizeof(token));
 	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												   CLUSTER_SEMANTIC_TARGET_SIDE, &token),
@@ -568,6 +712,8 @@ UT_TEST(test_96_source_token_recheck_and_leave_are_generation_scoped)
 {
 	ClusterSemanticAdmissionToken token;
 
+	test_gate_reset();
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
 	memset(&token, 0, sizeof(token));
 	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
@@ -587,16 +733,24 @@ UT_TEST(test_97_old_epoch_completion_is_inert_and_requires_revalidation)
 	SemanticActivationAckTuple expected = valid_ack();
 	SemanticActivationAckTuple observed = expected;
 	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
-	uint64 before_active_bits = semantic_activation_active_bits;
-	uint64 before_generation = semantic_activation_record_generation;
-	bool before_closed = semantic_activation_transition_closed;
+	uint64 before_active_bits;
+	uint64 before_generation;
+	bool before_closed;
 	uint64 seq = 0;
 
 	memset(&shmem, 0, sizeof(shmem));
 	pg_atomic_init_u64(&shmem.record_cas_request_seq, 0);
 	pg_atomic_init_u64(&shmem.record_cas_completion_seq, 0);
 	pg_atomic_init_u32(&shmem.record_cas_result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	pg_atomic_init_u64(&shmem.admission_seq, 0);
+	pg_atomic_init_u64(&shmem.active_bits, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	pg_atomic_init_u64(&shmem.record_generation, 7);
+	pg_atomic_init_u64(&shmem.formation_epoch, test_current_epoch);
+	pg_atomic_init_u32(&shmem.transition_closed, 1);
 	SemanticActivationShmem = &shmem;
+	before_active_bits = pg_atomic_read_u64(&shmem.active_bits);
+	before_generation = pg_atomic_read_u64(&shmem.record_generation);
+	before_closed = pg_atomic_read_u32(&shmem.transition_closed) != 0;
 
 	memset(&desired_record, 0, sizeof(desired_record));
 	desired_record.source_feature_bitmap = UINT64_C(0x11);
@@ -607,8 +761,7 @@ UT_TEST(test_97_old_epoch_completion_is_inert_and_requires_revalidation)
 	desired_record.coordinator_incarnation = expected.admitted_incarnation;
 	desired_record.phase = CLUSTER_SEMANTIC_PHASE_COMMIT;
 	UT_ASSERT(cluster_semantic_activation_record_encode(&desired_record, desired));
-	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired,
-													   &seq));
+	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
 	UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_cas(&request));
 	UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_cas(
 		request.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK));
@@ -616,18 +769,195 @@ UT_TEST(test_97_old_epoch_completion_is_inert_and_requires_revalidation)
 	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_OK);
 
 	cluster_semantic_activation_lmon_tick();
-	UT_ASSERT_EQ(semantic_activation_active_bits, before_active_bits);
-	UT_ASSERT_EQ(semantic_activation_record_generation, before_generation);
-	UT_ASSERT_EQ(semantic_activation_transition_closed, before_closed);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.active_bits), before_active_bits);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_generation), before_generation);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&shmem.transition_closed) != 0, before_closed);
 	observed.transition_epoch = desired_record.transition_epoch;
 	UT_ASSERT(!semantic_activation_ack_matches(&observed, &expected));
 	SemanticActivationShmem = NULL;
 }
 
+UT_TEST(test_98_admission_token_has_frozen_natural_layout)
+{
+	ClusterSemanticAdmissionToken token;
+
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(sizeof(token), 32);
+	UT_ASSERT_EQ((Size)((char *)&token.feature_bit - (char *)&token), 0);
+	UT_ASSERT_EQ((Size)((char *)&token.record_generation - (char *)&token), 8);
+	UT_ASSERT_EQ((Size)((char *)&token.side - (char *)&token), 24);
+	UT_ASSERT_EQ((Size)((char *)&token.entered - (char *)&token), 25);
+}
+
+UT_TEST(test_99_shared_gate_layout_and_bootstrap_are_fail_closed)
+{
+	test_gate_reset();
+	UT_ASSERT_EQ(test_shmem_requested_size, TEST_SEMANTIC_SHMEM_BYTES);
+	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_SEQ_OFFSET)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_ACTIVE_BITS_OFFSET)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_FORMATION_EPOCH_OFFSET)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+}
+
+UT_TEST(test_100_source_enter_owns_shared_debt_and_epoch_token)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 11, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(token.entered);
+	UT_ASSERT_EQ(test_token_formation_epoch(&token), test_current_epoch);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
+	UT_ASSERT_EQ(test_exit_registration_count, 1);
+}
+
+UT_TEST(test_101_active_source_refuses_before_debt)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 12, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_SOURCE_DORMANT);
+	UT_ASSERT(!token.entered);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+}
+
+UT_TEST(test_102_inactive_target_refuses_before_debt)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 13, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_TARGET_SIDE, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED);
+	UT_ASSERT(!token.entered);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_TARGET_SIDE, 0)), 0);
+}
+
+UT_TEST(test_103_epoch_drift_invalidates_recheck_without_losing_debt)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 14, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	test_current_epoch++;
+	UT_ASSERT(!cluster_semantic_activation_recheck(&token));
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
+	cluster_semantic_activation_leave(&token);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+}
+
+UT_TEST(test_104_close_invalidates_recheck_and_leave_balances_once)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 15, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	test_gate_publish(4, 0, 15, test_current_epoch, true);
+	UT_ASSERT(!cluster_semantic_activation_recheck(&token));
+	cluster_semantic_activation_leave(&token);
+	cluster_semantic_activation_leave(&token);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+}
+
+UT_TEST(test_105_pid_change_discards_inherited_local_ledger_only)
+{
+	ClusterSemanticAdmissionToken parent_token;
+	ClusterSemanticAdmissionToken child_token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 16, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &parent_token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	MyProcPid = 202;
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &child_token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(test_exit_registration_count, 2);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 2);
+	cluster_semantic_activation_leave(&child_token);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
+}
+
+UT_TEST(test_106_exit_hook_drains_both_side_ledgers)
+{
+	ClusterSemanticAdmissionToken source_token;
+	ClusterSemanticAdmissionToken target_token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 17, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &source_token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	test_gate_publish(4, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 18, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_TARGET_SIDE, &target_token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_NOT_NULL(test_exit_callback);
+	if (test_exit_callback != NULL)
+		test_exit_callback(0, test_exit_callback_arg);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_TARGET_SIDE, 0)), 0);
+}
+
+UT_TEST(test_107_odd_snapshot_is_bounded_closed_without_debt)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(3, 0, 19, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
+}
+
+UT_TEST(test_108_nonregistered_feature_is_closed_without_debt)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 20, test_current_epoch, false);
+	UT_ASSERT_EQ(
+		cluster_semantic_activation_enter(UINT64_C(1) << 7, CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
+		CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 7)), 0);
+}
+
+UT_TEST(test_109_lmon_legacy_zero_publish_opens_source_atomically)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_SEQ_OFFSET)), 2);
+	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_FORMATION_EPOCH_OFFSET)),
+				 test_current_epoch);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 0);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												   CLUSTER_SEMANTIC_SOURCE_SIDE, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	cluster_semantic_activation_leave(&token);
+}
+
 int
 main(void)
 {
-	UT_PLAN(97);
+	UT_PLAN(109);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -725,6 +1055,18 @@ main(void)
 	UT_RUN(test_95_dormant_target_enter_has_no_token);
 	UT_RUN(test_96_source_token_recheck_and_leave_are_generation_scoped);
 	UT_RUN(test_97_old_epoch_completion_is_inert_and_requires_revalidation);
+	UT_RUN(test_98_admission_token_has_frozen_natural_layout);
+	UT_RUN(test_99_shared_gate_layout_and_bootstrap_are_fail_closed);
+	UT_RUN(test_100_source_enter_owns_shared_debt_and_epoch_token);
+	UT_RUN(test_101_active_source_refuses_before_debt);
+	UT_RUN(test_102_inactive_target_refuses_before_debt);
+	UT_RUN(test_103_epoch_drift_invalidates_recheck_without_losing_debt);
+	UT_RUN(test_104_close_invalidates_recheck_and_leave_balances_once);
+	UT_RUN(test_105_pid_change_discards_inherited_local_ledger_only);
+	UT_RUN(test_106_exit_hook_drains_both_side_ledgers);
+	UT_RUN(test_107_odd_snapshot_is_bounded_closed_without_debt);
+	UT_RUN(test_108_nonregistered_feature_is_closed_without_debt);
+	UT_RUN(test_109_lmon_legacy_zero_publish_opens_source_atomically);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

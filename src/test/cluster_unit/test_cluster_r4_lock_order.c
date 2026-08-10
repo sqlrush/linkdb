@@ -10,6 +10,8 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "storage/shmem.h"
 
+#include "cluster_r4_activation_test_stubs.h"
+
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr pg_attribute_unused())
