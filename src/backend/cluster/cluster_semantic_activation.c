@@ -700,17 +700,19 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 	if (!incremented)
 		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 
-	epoch_after = cluster_epoch_get_current();
 	if (!semantic_activation_snapshot(&after))
 		result = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
-	else if (before.seq != after.seq || before.record_generation != after.record_generation
-			 || before.formation_epoch != after.formation_epoch || epoch_before != epoch_after
-			 || after.formation_epoch != epoch_after)
-		result = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
-	else
-		result = semantic_activation_admission_policy(
-			feature_bit, after.active_bits, after.transition_closed, side, before.record_generation,
-			after.record_generation);
+	else {
+		epoch_after = cluster_epoch_get_current();
+		if (before.seq != after.seq || before.record_generation != after.record_generation
+			|| before.formation_epoch != after.formation_epoch || epoch_before != epoch_after
+			|| after.formation_epoch != epoch_after)
+			result = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+		else
+			result = semantic_activation_admission_policy(
+				feature_bit, after.active_bits, after.transition_closed, side,
+				before.record_generation, after.record_generation);
+	}
 	if (result != CLUSTER_SEMANTIC_ADMISSION_OK) {
 		HOLD_INTERRUPTS();
 		semantic_activation_release_debt(side, feature_index);
@@ -739,9 +741,10 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 		|| token->side > CLUSTER_SEMANTIC_TARGET_SIDE || SemanticActivationShmem == NULL)
 		return false;
 	(void)feature_index;
+	if (!semantic_activation_snapshot(&snapshot))
+		return false;
 	current_epoch = cluster_epoch_get_current();
-	if (!semantic_activation_snapshot(&snapshot) || snapshot.formation_epoch != current_epoch
-		|| token->formation_epoch != current_epoch)
+	if (snapshot.formation_epoch != current_epoch || token->formation_epoch != current_epoch)
 		return false;
 
 	return semantic_activation_admission_policy(
@@ -1006,48 +1009,38 @@ cluster_semantic_activation_record_decode(const uint8 bytes[512],
 void
 cluster_semantic_activation_lmon_tick(void)
 {
-	uint64 seq;
-	uint64 active_bits;
-	uint64 generation;
-	uint64 formation_epoch;
+	SemanticActivationAdmissionSnapshot snapshot;
+	uint64 current_epoch;
+	uint64 expected_seq;
 
 	if (SemanticActivationShmem == NULL)
 		return;
-	seq = pg_atomic_read_u64(&SemanticActivationShmem->admission_seq);
-	if ((seq & UINT64_C(1)) != 0) {
-		if (seq == UINT64_MAX)
-			ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
-							errmsg("semantic activation admission sequence exhausted"),
-							errhint("Retain the shared-memory image and restart the cluster.")));
-		pg_atomic_write_u64(&SemanticActivationShmem->active_bits, 0);
-		pg_atomic_write_u64(&SemanticActivationShmem->record_generation, 0);
-		pg_atomic_write_u64(&SemanticActivationShmem->formation_epoch, cluster_epoch_get_current());
-		pg_atomic_write_u32(&SemanticActivationShmem->transition_closed, 1);
-		pg_write_barrier();
-		pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, seq + 1);
+	/*
+	 * D13 owns validated majority-zero/durable-OPEN publication.  Until that
+	 * proof is available, odd or unreadable state remains fail-closed.
+	 */
+	if (!semantic_activation_snapshot(&snapshot))
 		return;
-	}
 
-	active_bits = pg_atomic_read_u64(&SemanticActivationShmem->active_bits);
-	generation = pg_atomic_read_u64(&SemanticActivationShmem->record_generation);
-	formation_epoch = cluster_epoch_get_current();
-	if (active_bits != 0 || generation != 0
-		|| (pg_atomic_read_u32(&SemanticActivationShmem->transition_closed) == 0
-			&& pg_atomic_read_u64(&SemanticActivationShmem->formation_epoch) == formation_epoch))
+	current_epoch = cluster_epoch_get_current();
+	if (snapshot.formation_epoch == current_epoch)
 		return;
-	if (seq > UINT64_MAX - 2)
+	if (snapshot.seq > UINT64_MAX - 2)
 		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("semantic activation admission sequence exhausted"),
 						errhint("Retain the shared-memory image and restart the cluster.")));
 
-	pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, seq + 1);
+	expected_seq = snapshot.seq;
+	if (!pg_atomic_compare_exchange_u64(&SemanticActivationShmem->admission_seq, &expected_seq,
+									 snapshot.seq + 1))
+		return;
 	pg_write_barrier();
-	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, 0);
-	pg_atomic_write_u64(&SemanticActivationShmem->record_generation, 0);
-	pg_atomic_write_u64(&SemanticActivationShmem->formation_epoch, formation_epoch);
-	pg_atomic_write_u32(&SemanticActivationShmem->transition_closed, 0);
+	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, snapshot.active_bits);
+	pg_atomic_write_u64(&SemanticActivationShmem->record_generation, snapshot.record_generation);
+	pg_atomic_write_u64(&SemanticActivationShmem->formation_epoch, current_epoch);
+	pg_atomic_write_u32(&SemanticActivationShmem->transition_closed, 1);
 	pg_write_barrier();
-	pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, seq + 2);
+	pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, snapshot.seq + 2);
 }
 
 ClusterSemanticActivationResult

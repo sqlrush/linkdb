@@ -195,41 +195,50 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode m
 		goto done;
 	}
 
-	if (out == NULL || (unsigned int)mode > (unsigned int)CLUSTER_TX_RESOLVE_CLEANOUT_HINT) {
-		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
-		goto admitted_done;
-	}
-	if (!cluster_tx_locator_is_well_formed(locator, &reason))
-		goto admitted_done;
+	PG_TRY();
+	{
+		if (out == NULL || (unsigned int)mode > (unsigned int)CLUSTER_TX_RESOLVE_CLEANOUT_HINT) {
+			reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			goto admitted_done;
+		}
+		if (!cluster_tx_locator_is_well_formed(locator, &reason))
+			goto admitted_done;
 
-	formation_epoch = cluster_epoch_get_current();
-	outcome = cluster_runtime_visibility_resolve_exact_origin(
-		locator, mode, formation_epoch, &candidate, &provider_reason);
-	if (outcome == CLUSTER_TX_UNKNOWN) {
-		reason = provider_reason == CLUSTER_TX_RESOLVE_NONE
-					 || !cluster_tx_resolve_reason_is_known(provider_reason)
-				 ? CLUSTER_TX_RESOLVE_PROTOCOL
-				 : provider_reason;
-		goto admitted_done;
-	}
-	if (!cluster_tx_resolution_is_publishable(locator, mode, formation_epoch, outcome, &candidate,
-										  provider_reason)) {
-		outcome = CLUSTER_TX_UNKNOWN;
-		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
-		goto admitted_done;
-	}
-	if (cluster_epoch_get_current() != formation_epoch
-		|| !cluster_semantic_activation_recheck(&admission)) {
-		outcome = CLUSTER_TX_UNKNOWN;
-		reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
-		goto admitted_done;
-	}
+		formation_epoch = cluster_epoch_get_current();
+		outcome = cluster_runtime_visibility_resolve_exact_origin(
+			locator, mode, formation_epoch, &candidate, &provider_reason);
+		if (outcome == CLUSTER_TX_UNKNOWN) {
+			reason = provider_reason == CLUSTER_TX_RESOLVE_NONE
+						 || !cluster_tx_resolve_reason_is_known(provider_reason)
+					 ? CLUSTER_TX_RESOLVE_PROTOCOL
+					 : provider_reason;
+			goto admitted_done;
+		}
+		if (!cluster_tx_resolution_is_publishable(locator, mode, formation_epoch, outcome,
+										  &candidate, provider_reason)) {
+			outcome = CLUSTER_TX_UNKNOWN;
+			reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			goto admitted_done;
+		}
+		if (cluster_epoch_get_current() != formation_epoch
+			|| !cluster_semantic_activation_recheck(&admission)) {
+			outcome = CLUSTER_TX_UNKNOWN;
+			reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+			goto admitted_done;
+		}
 
-	*out = candidate;
-	reason = CLUSTER_TX_RESOLVE_NONE;
+		*out = candidate;
+		reason = CLUSTER_TX_RESOLVE_NONE;
 
 admitted_done:
-	cluster_semantic_activation_leave(&admission);
+		;
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+
 done:
 	if (reason_out != NULL)
 		*reason_out = reason;

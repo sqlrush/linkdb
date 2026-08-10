@@ -311,6 +311,72 @@ source_has_ordered(const char *source, const char *const *needles, size_t count)
 }
 
 static bool
+function_region_has_ordered(const char *source, const char *symbol, const char *next_symbol,
+							const char *const *needles, size_t count)
+{
+	char start_marker[128];
+	char end_marker[128];
+	const char *start;
+	const char *end;
+	const char *cursor;
+	int n;
+
+	n = snprintf(start_marker, sizeof(start_marker), "\n%s(", symbol);
+	if (n <= 0 || n >= (int)sizeof(start_marker) || source == NULL)
+		return false;
+	n = snprintf(end_marker, sizeof(end_marker), "\n%s(", next_symbol);
+	if (n <= 0 || n >= (int)sizeof(end_marker))
+		return false;
+	start = strstr(source, start_marker);
+	end = start != NULL ? strstr(start + strlen(start_marker), end_marker) : NULL;
+	if (start == NULL || end == NULL)
+		return false;
+
+	cursor = start;
+	for (size_t i = 0; i < count; i++) {
+		cursor = strstr(cursor, needles[i]);
+		if (cursor == NULL || cursor >= end)
+			return false;
+		cursor += strlen(needles[i]);
+	}
+	return true;
+}
+
+static bool
+function_region_has_single_finally_leave(const char *source, const char *symbol,
+									 const char *next_symbol)
+{
+	const char *const ordered[] = { "PG_FINALLY();", "cluster_semantic_activation_leave" };
+	char start_marker[128];
+	char end_marker[128];
+	const char *start;
+	const char *end;
+	const char *cursor;
+	int finally_count = 0;
+	int leave_count = 0;
+	int n;
+
+	if (!function_region_has_ordered(source, symbol, next_symbol, ordered, lengthof(ordered)))
+		return false;
+	n = snprintf(start_marker, sizeof(start_marker), "\n%s(", symbol);
+	if (n <= 0 || n >= (int)sizeof(start_marker))
+		return false;
+	n = snprintf(end_marker, sizeof(end_marker), "\n%s(", next_symbol);
+	if (n <= 0 || n >= (int)sizeof(end_marker))
+		return false;
+	start = strstr(source, start_marker);
+	end = strstr(start + strlen(start_marker), end_marker);
+	for (cursor = start; (cursor = strstr(cursor, "PG_FINALLY();")) != NULL && cursor < end;
+		 cursor += strlen("PG_FINALLY();"))
+		finally_count++;
+	for (cursor = start; (cursor = strstr(cursor, "cluster_semantic_activation_leave")) != NULL
+						 && cursor < end;
+		 cursor += strlen("cluster_semantic_activation_leave"))
+		leave_count++;
+	return finally_count == 1 && leave_count == 1;
+}
+
+static bool
 r4_sources_have(const char *needle)
 {
 	const char *const candidates[]
@@ -411,6 +477,41 @@ all_four_d10_dispatches_gate_before_body(void)
 		   && dispatch_orders_gate_before_body(sources.multixact_source,
 										  "cluster_multixact_source_dispatch",
 										  "cluster_multixact_source_dispatch_body");
+}
+
+static bool
+d10_admitted_wrappers_have_single_finally_leave(void)
+{
+	return function_region_has_single_finally_leave(
+			   sources.gcs_source, "cluster_r4_source_cr_dispatch",
+			   "cluster_gcs_block_undo_tt_fetch_and_wait")
+		   && function_region_has_single_finally_leave(
+			   sources.gcs_source, "cluster_gcs_block_r4_route_cr",
+			   "cluster_gcs_block_redo_lsn_covered")
+		   && function_region_has_single_finally_leave(
+			   sources.cr_server_source, "cluster_cr_build_on_holder",
+			   "cluster_cr_server_shmem_size")
+		   && function_region_has_single_finally_leave(
+			   sources.tx_resolve_source, "cluster_tx_resolve_exact",
+			   "cluster_tx_resolve_multixact");
+}
+
+static bool
+d10_epoch_sampling_order_is_exact(void)
+{
+	const char *const enter_order[]
+		= { "pg_write_barrier();", "semantic_activation_snapshot(&after)",
+			"epoch_after = cluster_epoch_get_current()" };
+	const char *const recheck_order[]
+		= { "semantic_activation_snapshot(&snapshot)",
+			"current_epoch = cluster_epoch_get_current()" };
+
+	return function_region_has_ordered(
+			   sources.semantic_source, "cluster_semantic_activation_enter",
+			   "cluster_semantic_activation_recheck", enter_order, lengthof(enter_order))
+		   && function_region_has_ordered(
+			   sources.semantic_source, "cluster_semantic_activation_recheck",
+			   "cluster_semantic_activation_leave", recheck_order, lengthof(recheck_order));
 }
 
 static bool
@@ -955,6 +1056,16 @@ UT_TEST(test_source_edges_match_required_model)
 	assert_contract_matches(16);
 }
 
+UT_TEST(test_d10_admitted_wrappers_have_single_finally_leave)
+{
+	UT_ASSERT(d10_admitted_wrappers_have_single_finally_leave());
+}
+
+UT_TEST(test_d10_epoch_sampling_order_is_exact)
+{
+	UT_ASSERT(d10_epoch_sampling_order_is_exact());
+}
+
 UT_TEST(test_d6_live_scratch_edges_match_required_model)
 {
 	assert_contract_matches(17);
@@ -994,7 +1105,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	model_hash_ok = digest_model_rows(model_rows, model_row_count, model_hash);
 	emitted = emit_model();
 
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(test_model_shape_and_key_order_controls);
 	UT_RUN(test_matrix_closed_keyspace_control);
 	UT_RUN(test_canonical_hash_and_mutation_controls);
@@ -1003,6 +1114,8 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_full_only_matches_required_model);
 	UT_RUN(test_locator_matches_required_model);
 	UT_RUN(test_source_edges_match_required_model);
+	UT_RUN(test_d10_admitted_wrappers_have_single_finally_leave);
+	UT_RUN(test_d10_epoch_sampling_order_is_exact);
 	UT_RUN(test_d6_live_scratch_edges_match_required_model);
 	UT_RUN(test_matrix_actions_match_required_model);
 	UT_RUN(test_remaining_contracts_match_required_model);
