@@ -4040,9 +4040,9 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
  *	         is NEVER installed as current and never flushed; it exists
  *	         only in the caller's CR destination.
  */
-bool
-cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_node, char *dst_page,
-									bool *out_partial)
+static bool
+cluster_gcs_block_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 origin_node,
+										char *dst_page, bool *out_partial)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -4150,6 +4150,47 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_no
 	gcs_block_release_slot(slot);
 
 	return fetched; /* false -> caller keeps the unchanged 53R9G refusal */
+}
+
+ClusterSemanticAdmissionResult
+cluster_r4_source_cr_dispatch(ClusterR4SourceCrOp op, const ClusterR4SourceCrRequest *request,
+							  ClusterR4SourceCrResult *result)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterSemanticAdmissionResult admission;
+	ClusterR4SourceCrResult local_result = { 0 };
+
+	if (result != NULL)
+		memset(result, 0, sizeof(*result));
+	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												  CLUSTER_SEMANTIC_SOURCE_SIDE, &token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return admission;
+
+	PG_TRY();
+	{
+		if (result == NULL || request == NULL || op != CLUSTER_R4_SOURCE_CR_FETCH
+			|| request->dst_page == NULL)
+			admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		else
+			local_result.fetched = cluster_gcs_block_cr_fetch_and_wait_raw(
+				request->tag, request->read_scn, request->origin_node, request->dst_page,
+				&local_result.partial);
+		if (admission == CLUSTER_SEMANTIC_ADMISSION_OK
+			&& !cluster_semantic_activation_recheck(&token))
+			admission = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+	}
+	PG_CATCH();
+	{
+		cluster_semantic_activation_leave(&token);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	cluster_semantic_activation_leave(&token);
+	if (admission == CLUSTER_SEMANTIC_ADMISSION_OK)
+		*result = local_result;
+	return admission;
 }
 
 
