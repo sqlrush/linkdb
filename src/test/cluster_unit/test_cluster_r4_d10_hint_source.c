@@ -152,27 +152,24 @@ cluster_epoch_get_current(void)
 	return 1;
 }
 
-bool
-cluster_multixact_member_overlay_install(
-	const ClusterMultiXactKey *key pg_attribute_unused(), uint16 member_count pg_attribute_unused(),
-	const ClusterMultiXactMember *members pg_attribute_unused())
+ClusterSemanticAdmissionResult
+cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op pg_attribute_unused(),
+								  const ClusterMultiXactSourceRequest *request pg_attribute_unused(),
+								  ClusterMultiXactSourceResult *result)
 {
-	return true;
+	memset(result, 0, sizeof(*result));
+	result->bool_value = true;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
-bool
-cluster_tt_status_install_local(const ClusterTTStatusKey *key pg_attribute_unused(),
-								ClusterTTStatus status pg_attribute_unused(),
-								SCN commit_scn pg_attribute_unused())
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
+							  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+							  ClusterTTStatusSourceResult *result)
 {
-	return true;
-}
-
-bool
-cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key pg_attribute_unused(),
-									   const ClusterTTStatusKey *parent_key pg_attribute_unused())
-{
-	return true;
+	memset(result, 0, sizeof(*result));
+	result->bool_value = true;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 void

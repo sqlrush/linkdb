@@ -78,18 +78,13 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 int cluster_tt_status_hint_outbound_capacity = 256;
 int cluster_tt_status_hint_emit_mode = CLUSTER_TT_STATUS_HINT_EMIT_ALL_STATUS;
 
-void
-cluster_tt_status_hint_emit(const ClusterTTStatusKey *key pg_attribute_unused(),
-							ClusterTTStatus status pg_attribute_unused(),
-							SCN commit_scn pg_attribute_unused())
-{}
-void
-cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env pg_attribute_unused(),
-									   const void *payload pg_attribute_unused())
-{}
-void
-cluster_tt_status_hint_drain_outbound(void)
-{}
+ClusterSemanticAdmissionResult
+cluster_tt_status_hint_source_dispatch(
+	ClusterTTStatusHintSourceOp op pg_attribute_unused(),
+	const ClusterTTStatusHintSourceRequest *request pg_attribute_unused())
+{
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+}
 void
 cluster_tt_status_hint_register_msg_type(void)
 {}
@@ -162,9 +157,10 @@ UT_TEST(test_t6_producer_mask_lmon)
 /* ===== T7: API prototypes linkable ===== */
 UT_TEST(test_t7_api_linkable)
 {
-	UT_ASSERT_NE((void *)cluster_tt_status_hint_emit, NULL);
-	UT_ASSERT_NE((void *)cluster_tt_status_hint_handle_envelope, NULL);
-	UT_ASSERT_NE((void *)cluster_tt_status_hint_drain_outbound, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_HINT_SOURCE_EMIT, 0);
+	UT_ASSERT_EQ((int)CLUSTER_TT_HINT_SOURCE_HANDLE_ENVELOPE, 3);
+	UT_ASSERT_EQ((int)CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND, 4);
+	UT_ASSERT_NE((void *)cluster_tt_status_hint_source_dispatch, NULL);
 	UT_ASSERT_NE((void *)cluster_tt_status_hint_register_msg_type, NULL);
 }
 

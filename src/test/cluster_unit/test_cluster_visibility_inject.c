@@ -7,9 +7,9 @@
  *	  16 tests covering:
  *	    T1   cluster_test_lookup_visibility_inject API linkable
  *	    T2   cluster_visibility_inject_shmem_* APIs linkable
- *	    T3   cluster_tt_status_lookup_exact API linkable
- *	    T4   cluster_tt_status_install_local API linkable
- *	    T5   cluster_tt_status_delete_exact API linkable (spec-3.4c D6 / F4)
+ *	    T3   typed TT lookup dispatch API linkable
+ *	    T4   typed TT install dispatch API linkable
+ *	    T5   typed TT delete dispatch API linkable (spec-3.4c D6 / F4)
  *	    T6   ClusterUndoTTSlotRef.cached_commit_scn at offset 16 (D9 stash sink)
  *	    T7   ClusterUndoTTSlotRef.has_cached_status at offset 24 (D9 toggle)
  *	    T8   ClusterUndoTTSlotRef sizeof 32 (regression)
@@ -97,23 +97,12 @@ void
 cluster_visibility_inject_shmem_register(void)
 {}
 
-bool
-cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key pg_attribute_unused(),
-							   ClusterTTStatusResult *res pg_attribute_unused())
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
+							  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+							  ClusterTTStatusSourceResult *result pg_attribute_unused())
 {
-	return false;
-}
-bool
-cluster_tt_status_install_local(const ClusterTTStatusKey *key pg_attribute_unused(),
-								ClusterTTStatus status pg_attribute_unused(),
-								SCN commit_scn pg_attribute_unused())
-{
-	return false;
-}
-bool
-cluster_tt_status_delete_exact(const ClusterTTStatusKey *key pg_attribute_unused())
-{
-	return false;
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }
 
 
@@ -145,17 +134,20 @@ UT_TEST(t2_inject_shmem_helpers_linkable)
 }
 UT_TEST(t3_tt_status_lookup_exact_linkable)
 {
-	UT_ASSERT_NE((void *)cluster_tt_status_lookup_exact, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_SOURCE_LOOKUP, 0);
+	UT_ASSERT_NE((void *)cluster_tt_status_source_dispatch, NULL);
 }
 UT_TEST(t4_tt_status_install_local_linkable)
 {
-	UT_ASSERT_NE((void *)cluster_tt_status_install_local, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_SOURCE_INSTALL_LOCAL, 1);
+	UT_ASSERT_NE((void *)cluster_tt_status_source_dispatch, NULL);
 }
 UT_TEST(t5_tt_status_delete_exact_linkable)
 {
 	/* spec-3.4c D6 / F4:  per-key delete companion required so D5b
 	 * clear UDF does not fake-clear via ABORTED install. */
-	UT_ASSERT_NE((void *)cluster_tt_status_delete_exact, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_SOURCE_DELETE_EXACT, 3);
+	UT_ASSERT_NE((void *)cluster_tt_status_source_dispatch, NULL);
 }
 
 

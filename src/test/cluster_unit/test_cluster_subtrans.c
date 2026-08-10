@@ -116,17 +116,21 @@ cluster_subtrans_get_xact_has_state_check_count(void)
 	return 0;
 }
 
-bool
-cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key pg_attribute_unused(),
-									   const ClusterTTStatusKey *parent_key pg_attribute_unused())
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
+							  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+							  ClusterTTStatusSourceResult *result pg_attribute_unused())
 {
-	return false;
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }
 
-void
-cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key pg_attribute_unused(),
-										 const ClusterTTStatusKey *parent_key pg_attribute_unused())
-{}
+ClusterSemanticAdmissionResult
+cluster_tt_status_hint_source_dispatch(
+	ClusterTTStatusHintSourceOp op pg_attribute_unused(),
+	const ClusterTTStatusHintSourceRequest *request pg_attribute_unused())
+{
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+}
 
 uint64
 cluster_tt_status_get_subcommitted_install_count(void)
@@ -256,15 +260,8 @@ UT_TEST(t9_cluster_subtrans_api_symbols_link)
 
 UT_TEST(t10_install_subcommitted_links)
 {
-	ClusterTTStatusKey child;
-	ClusterTTStatusKey parent;
-	bool ok;
-
-	memset(&child, 0, sizeof(child));
-	memset(&parent, 0, sizeof(parent));
-
-	ok = cluster_tt_status_install_subcommitted(&child, &parent);
-	UT_ASSERT(!ok); /* stub returns false */
+	UT_ASSERT_EQ((int)CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED, 2);
+	UT_ASSERT_NE((void *)cluster_tt_status_source_dispatch, NULL);
 }
 
 
@@ -272,14 +269,8 @@ UT_TEST(t10_install_subcommitted_links)
 
 UT_TEST(t11_hint_emit_subcommitted_links)
 {
-	ClusterTTStatusKey child;
-	ClusterTTStatusKey parent;
-
-	memset(&child, 0, sizeof(child));
-	memset(&parent, 0, sizeof(parent));
-
-	/* Stub no-op;  test passes if call links. */
-	cluster_tt_status_hint_emit_subcommitted(&child, &parent);
+	UT_ASSERT_EQ((int)CLUSTER_TT_HINT_SOURCE_EMIT_SUBCOMMITTED, 1);
+	UT_ASSERT_NE((void *)cluster_tt_status_hint_source_dispatch, NULL);
 
 	/* Counter getter also links. */
 	UT_ASSERT_EQ((uint64)cluster_tt_status_hint_get_v3_downgrade_count(), (uint64)0);

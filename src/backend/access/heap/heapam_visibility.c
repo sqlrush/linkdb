@@ -1633,17 +1633,31 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 				mx_origin = cluster_mxid_origin_slot((MultiXactId)HeapTupleHeaderGetRawXmax(tuple));
 
 			if (mx_origin < 0) {
+				ClusterMultiXactSourceResult source_result;
+
 				/* PGRAC: spec-7.1 D0 census — foreign-multi refuse leg. */
-				cluster_multixact_note_underivable_read();
+				(void)cluster_multixact_source_dispatch(
+					CLUSTER_MULTI_SOURCE_NOTE_UNDERIVABLE_READ, NULL, &source_result);
 				cluster_vis53r97_note_multi_unresolvable();
 				return -1;
 			}
 			if (mx_origin != cluster_node_id) {
-				bool mx_hit = false;
+				ClusterMultiXactSourceRequest source_request;
+				ClusterMultiXactSourceResult source_result;
+				ClusterSemanticAdmissionResult source_admission;
+				ClusterVisibilityDecision mx_decision = CLUSTER_VISIBILITY_UNKNOWN;
 
-				switch (cluster_multixact_remote_xmax_resolve(
-					(uint16)mx_origin, (MultiXactId)HeapTupleHeaderGetRawXmax(tuple), snapshot,
-					&mx_hit)) {
+				memset(&source_request, 0, sizeof(source_request));
+				source_request.origin_slot = (uint16)mx_origin;
+				source_request.mxid = (MultiXactId)HeapTupleHeaderGetRawXmax(tuple);
+				source_request.snapshot = snapshot;
+				source_admission = cluster_multixact_source_dispatch(
+					CLUSTER_MULTI_SOURCE_REMOTE_XMAX_RESOLVE, &source_request, &source_result);
+				if (source_admission == CLUSTER_SEMANTIC_ADMISSION_OK) {
+					mx_decision = source_result.visibility;
+				}
+
+				switch (mx_decision) {
 				case CLUSTER_VISIBILITY_VISIBLE:
 					return 1; /* no committed updater hides the row */
 				case CLUSTER_VISIBILITY_INVISIBLE:
@@ -2158,8 +2172,11 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 					mx_origin = cluster_mxid_origin_slot((MultiXactId)raw_xmax_multi);
 
 				if (mx_origin < 0) {
+					ClusterMultiXactSourceResult source_result;
+
 					/* D3-0 floor: origin not provable -> fail closed */
-					cluster_multixact_note_underivable_read();
+					(void)cluster_multixact_source_dispatch(
+						CLUSTER_MULTI_SOURCE_NOTE_UNDERIVABLE_READ, NULL, &source_result);
 					ereport(ERROR,
 							(errcode(ERRCODE_CLUSTER_MULTIXACT_MEMBER_OVERLAY_MISS),
 							 errmsg("cluster multixact %u cannot be attributed to an origin node",
@@ -2170,10 +2187,25 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 									 "cluster.multi_xmax_remote_resolve. Retry the transaction.")));
 				}
 				if (mx_origin != cluster_node_id) {
+					ClusterMultiXactSourceRequest source_request;
+					ClusterMultiXactSourceResult source_result;
+					ClusterSemanticAdmissionResult source_admission;
+					ClusterVisibilityDecision mx_decision = CLUSTER_VISIBILITY_UNKNOWN;
 					bool mx_hit = false;
 
-					switch (cluster_multixact_remote_xmax_resolve(
-						(uint16)mx_origin, (MultiXactId)raw_xmax_multi, snapshot, &mx_hit)) {
+					memset(&source_request, 0, sizeof(source_request));
+					source_request.origin_slot = (uint16)mx_origin;
+					source_request.mxid = (MultiXactId)raw_xmax_multi;
+					source_request.snapshot = snapshot;
+					source_admission = cluster_multixact_source_dispatch(
+						CLUSTER_MULTI_SOURCE_REMOTE_XMAX_RESOLVE, &source_request,
+						&source_result);
+					if (source_admission == CLUSTER_SEMANTIC_ADMISSION_OK) {
+						mx_decision = source_result.visibility;
+						mx_hit = source_result.overlay_hit;
+					}
+
+					switch (mx_decision) {
 					case CLUSTER_VISIBILITY_VISIBLE:
 						return true;
 					case CLUSTER_VISIBILITY_INVISIBLE:

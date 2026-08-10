@@ -329,50 +329,88 @@ r4_sources_have(const char *needle)
 }
 
 static bool
-legacy_requester_origin_edge_present(void)
+d10_requester_source_edge_present(void)
 {
 	const char *const ordered[]
 		= { "NodeId head_origin = uba_origin_node_id(chains[0].undo_segment_head);",
 			"cluster_cr_coordinator_classify_origin(head_origin)",
-			"cluster_gcs_block_cr_fetch_and_wait(tag, read_scn, (int32)head_origin",
+			"cluster_r4_source_cr_dispatch(CLUSTER_R4_SOURCE_CR_FETCH",
 			"/* PARTIAL: continue on the shipped page" };
 
 	return source_has_ordered(sources.cr_source, ordered, lengthof(ordered))
-		   && source_has_definition(sources.gcs_source, "cluster_gcs_block_cr_fetch_and_wait")
+		   && source_has_definition(sources.gcs_source, "cluster_gcs_block_cr_fetch_and_wait_raw")
+		   && source_has_definition(sources.gcs_source, "cluster_r4_source_cr_dispatch")
 		   && source_has(sources.gcs_source, "int32 origin_node");
 }
 
 static bool
-legacy_tt_overlay_edge_present(void)
+d10_tt_source_edge_present(void)
 {
 	return source_has_definition(sources.tt_status_source, "cluster_tt_status_lookup_exact")
-		   && source_has(sources.vis_resolve_source, "cluster_tt_status_lookup_exact(&key");
+		   && source_has_definition(sources.tt_status_source, "cluster_tt_status_source_dispatch")
+		   && source_has(sources.vis_resolve_source,
+					 "cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP");
 }
 
 static bool
-legacy_hint_queue_edge_present(void)
+d10_hint_source_edge_present(void)
 {
-	return source_has_definition(sources.tt_hint_source, "cluster_tt_status_hint_emit")
+	return source_has_definition(sources.tt_hint_source, "cluster_tt_status_hint_emit_raw")
 		   && source_has_definition(sources.tt_hint_source,
-									"cluster_tt_status_hint_drain_outbound");
+									"cluster_tt_status_hint_drain_outbound_raw")
+		   && source_has_definition(sources.tt_hint_source,
+									"cluster_tt_status_hint_source_dispatch");
 }
 
 static bool
-legacy_multi_overlay_edge_present(void)
+d10_multi_source_edge_present(void)
 {
 	return source_has_definition(sources.multixact_source,
-								 "cluster_multixact_member_overlay_install")
+								 "cluster_multixact_member_overlay_install_raw")
 		   && source_has_definition(sources.multixact_source,
-									"cluster_multixact_member_overlay_lookup")
+									"cluster_multixact_member_overlay_lookup_raw")
 		   && source_has(sources.multixact_source,
-						 "cluster_multixact_member_overlay_lookup(&mxkey");
+						 "cluster_multixact_source_dispatch_body(")
+		   && source_has_definition(sources.multixact_source,
+									"cluster_multixact_source_dispatch");
 }
 
 static bool
-all_four_legacy_source_edges_present(void)
+all_four_d10_source_edges_present(void)
 {
-	return legacy_requester_origin_edge_present() && legacy_tt_overlay_edge_present()
-		   && legacy_hint_queue_edge_present() && legacy_multi_overlay_edge_present();
+	return d10_requester_source_edge_present() && d10_tt_source_edge_present()
+		   && d10_hint_source_edge_present() && d10_multi_source_edge_present();
+}
+
+static bool
+dispatch_orders_gate_before_body(const char *source, const char *dispatch, const char *body)
+{
+	char marker[128];
+	const char *start;
+	const char *const ordered[] = { "cluster_semantic_activation_enter", body };
+	int n;
+
+	n = snprintf(marker, sizeof(marker), "\n%s(", dispatch);
+	if (n <= 0 || n >= (int)sizeof(marker) || source == NULL)
+		return false;
+	start = strstr(source, marker);
+	return start != NULL && source_has_ordered(start, ordered, lengthof(ordered));
+}
+
+static bool
+all_four_d10_dispatches_gate_before_body(void)
+{
+	return dispatch_orders_gate_before_body(sources.gcs_source, "cluster_r4_source_cr_dispatch",
+										"cluster_gcs_block_cr_fetch_and_wait_raw")
+		   && dispatch_orders_gate_before_body(sources.tt_status_source,
+										  "cluster_tt_status_source_dispatch",
+										  "cluster_tt_status_lookup_exact")
+		   && dispatch_orders_gate_before_body(sources.tt_hint_source,
+										  "cluster_tt_status_hint_source_dispatch",
+										  "cluster_tt_status_hint_emit_raw")
+		   && dispatch_orders_gate_before_body(sources.multixact_source,
+										  "cluster_multixact_source_dispatch",
+										  "cluster_multixact_source_dispatch_body");
 }
 
 static bool
@@ -457,7 +495,7 @@ contract_actual(int contract_number)
 		  && (source_has_definition(sources.cr_source, "cluster_cr_build_on_holder")
 			  || source_has_definition(sources.cr_server_source, "cluster_cr_build_on_holder"))
 		  && source_has_ordered(sources.gcs_source, holder_order, lengthof(holder_order));
-	bool legacy_origin_route = legacy_requester_origin_edge_present();
+	bool legacy_origin_route = d10_requester_source_edge_present();
 	bool full_builder
 		= (source_has_definition(sources.cr_source, "cluster_cr_build_on_holder")
 		   || source_has_definition(sources.cr_server_source, "cluster_cr_build_on_holder"))
@@ -489,13 +527,13 @@ contract_actual(int contract_number)
 	case 5:
 		return locator_shape_is_exact() ? contract_required[4] : "ABSENT";
 	case 6:
-		if (semantic_gate && source_has(sources.semantic_source, "r4.requester_cr_dormant_source")
-			&& source_has(sources.semantic_source, "r4.tt_overlay_dormant_source")
-			&& source_has(sources.semantic_source, "r4.hint_queue_dormant_source")
-			&& source_has(sources.semantic_source, "r4.multi_overlay_dormant_source"))
+		if (semantic_gate && all_four_d10_source_edges_present()
+			&& source_has(sources.semantic_source, "active_bits")
+			&& source_has(sources.tt_hint_source, "CLUSTER_TT_STATUS_HINT_V1")
+			&& source_has(sources.tt_hint_source, "CLUSTER_TT_STATUS_HINT_V4"))
 			return contract_required[5];
-		return all_four_legacy_source_edges_present() ? "LEGACY_ORDINARY_AND_V1_V4_REACHABLE"
-													  : "ABSENT";
+		return all_four_d10_source_edges_present() ? "FOUR_SOURCE_EDGES_WITHOUT_ACTIVE_ZERO_PROOF"
+											 : "ABSENT";
 	case 7:
 		return semantic_gate && holder_route && sources.tx_resolve_source != NULL
 				   ? contract_required[6]
@@ -532,13 +570,10 @@ contract_actual(int contract_number)
 				   ? contract_required[11]
 				   : "ABSENT";
 	case 13:
-		if (semantic_gate && all_four_legacy_source_edges_present()
-			&& source_has(sources.semantic_source, "r4.requester_cr_dormant_source")
-			&& source_has(sources.semantic_source, "r4.tt_overlay_dormant_source")
-			&& source_has(sources.semantic_source, "r4.hint_queue_dormant_source")
-			&& source_has(sources.semantic_source, "r4.multi_overlay_dormant_source"))
+		if (semantic_gate && all_four_d10_source_edges_present())
 			return contract_required[12];
-		return all_four_legacy_source_edges_present() ? "FOUR_UNGATED_RAW_SOURCES" : "ABSENT";
+		return all_four_d10_source_edges_present() ? "FOUR_SOURCE_EDGES_WITHOUT_COMMON_GATE"
+											 : "ABSENT";
 	case 14:
 		if (source_has(sources.semantic_source, "DefineCustomBoolVariable")
 			|| source_has(sources.semantic_source, "StartChildProcess")
@@ -557,7 +592,7 @@ contract_actual(int contract_number)
 			return contract_required[14];
 		return "RAW_OLD_SOURCE_LINK_VISIBLE";
 	case 16:
-		return semantic_gate && source_has(sources.semantic_source, "before mutation")
+		return semantic_gate && all_four_d10_dispatches_gate_before_body()
 				   ? contract_required[15]
 				   : "ABSENT";
 	case 17:
@@ -888,10 +923,10 @@ UT_TEST(test_real_source_observation_controls)
 	UT_ASSERT_NOT_NULL(sources.multixact_source);
 	UT_ASSERT(source_has(sources.cr_source, "NodeId head_origin"));
 	UT_ASSERT(source_has(sources.cr_source, "CLUSTER_CR_SPLIT_PARTIAL"));
-	UT_ASSERT(legacy_requester_origin_edge_present());
-	UT_ASSERT(legacy_tt_overlay_edge_present());
-	UT_ASSERT(legacy_hint_queue_edge_present());
-	UT_ASSERT(legacy_multi_overlay_edge_present());
+	UT_ASSERT(d10_requester_source_edge_present());
+	UT_ASSERT(d10_tt_source_edge_present());
+	UT_ASSERT(d10_hint_source_edge_present());
+	UT_ASSERT(d10_multi_source_edge_present());
 	UT_ASSERT(legacy_d6_xmin_route_present());
 	UT_ASSERT(legacy_d6_live_page_semantics_present());
 }

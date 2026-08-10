@@ -3218,9 +3218,21 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	 * holder (lock-only / writer).
 	 */
 	{
-		bool		tt_found = cluster_tt_status_lookup_exact(&ckey, &cres);
-		bool		tt_resolved = tt_found && cres.authoritative;
-		bool		tt_terminal = tt_resolved
+		ClusterTTStatusSourceRequest source_request;
+		ClusterTTStatusSourceResult source_result;
+		bool		tt_found;
+		bool		tt_resolved;
+		bool		tt_terminal;
+
+		memset(&source_request, 0, sizeof(source_request));
+		source_request.key = &ckey;
+		tt_found = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request,
+												   &source_result)
+			== CLUSTER_SEMANTIC_ADMISSION_OK
+			&& source_result.bool_value;
+		cres = source_result.lookup;
+		tt_resolved = tt_found && cres.authoritative;
+		tt_terminal = tt_resolved
 			&& (cres.status == CLUSTER_TT_STATUS_COMMITTED
 				|| cres.status == CLUSTER_TT_STATUS_ABORTED
 				|| cres.status == CLUSTER_TT_STATUS_CLEANED_OUT);
@@ -6677,6 +6689,8 @@ l3:
 					{
 						ClusterTTStatusKey ckey;
 						ClusterTTStatusResult cres;
+						ClusterTTStatusSourceRequest source_request;
+						ClusterTTStatusSourceResult source_result;
 						bool		tt_found;
 						bool		tt_resolved;
 						bool		tt_terminal;
@@ -6714,7 +6728,13 @@ l3:
 						 * the HOLDER node); never the generic resid encoder
 						 * which would key on the local node (G1).
 						 */
-						tt_found = cluster_tt_status_lookup_exact(&ckey, &cres);
+						memset(&source_request, 0, sizeof(source_request));
+						source_request.key = &ckey;
+						tt_found = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP,
+															   &source_request, &source_result)
+							== CLUSTER_SEMANTIC_ADMISSION_OK
+							&& source_result.bool_value;
+						cres = source_result.lookup;
 						tt_resolved = tt_found && cres.authoritative;
 						tt_terminal = tt_resolved
 							&& (cres.status == CLUSTER_TT_STATUS_COMMITTED

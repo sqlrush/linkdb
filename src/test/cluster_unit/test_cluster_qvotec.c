@@ -109,6 +109,7 @@ extern ClusterSemanticActivationResult cluster_qvotec_test_semantic_activation_r
 bool IsUnderPostmaster = false;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
+volatile uint32 InterruptHoldoffCount = 0;
 int MyProcPid = 0;
 int cluster_node_id = 0;
 

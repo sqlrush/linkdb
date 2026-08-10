@@ -2424,6 +2424,9 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 			if (cluster_itl_get_tt_ref(page, itl_idx, &ref)) {
 				ClusterTTStatusKey key;
 				ClusterTTStatusResult result;
+				ClusterTTStatusSourceRequest source_request;
+				ClusterTTStatusSourceResult source_result;
+				bool found;
 
 				memset(&key, 0, sizeof(key));
 				key.origin_node_id = ref.origin_node_id;
@@ -2432,7 +2435,14 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 				key.cluster_epoch = ref.cluster_epoch;
 				key.local_xid = cr_xmax;
 
-				if (cluster_tt_status_lookup_exact(&key, &result) && result.authoritative
+				memset(&source_request, 0, sizeof(source_request));
+				source_request.key = &key;
+				found = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request,
+														 &source_result)
+						== CLUSTER_SEMANTIC_ADMISSION_OK
+					&& source_result.bool_value;
+				result = source_result.lookup;
+				if (found && result.authoritative
 					&& (result.status == CLUSTER_TT_STATUS_COMMITTED
 						|| result.status == CLUSTER_TT_STATUS_CLEANED_OUT)
 					&& SCN_VALID(result.commit_scn)) {

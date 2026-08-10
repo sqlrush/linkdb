@@ -291,6 +291,8 @@ cluster_multixact_resolve_visibility_raw(const ClusterMultiXactMemberOverlayResu
 		{
 			ClusterTTStatusKey ttkey;
 			ClusterTTStatusResult ttres;
+			ClusterTTStatusSourceRequest tt_request;
+			ClusterTTStatusSourceResult tt_source_result;
 
 			memset(&ttkey, 0, sizeof(ttkey));
 			ttkey.origin_node_id = m->origin_node_id;
@@ -299,8 +301,14 @@ cluster_multixact_resolve_visibility_raw(const ClusterMultiXactMemberOverlayResu
 			ttkey.cluster_epoch = m->epoch;
 			ttkey.local_xid = m->xid;
 
-			if (!cluster_tt_status_lookup_exact(&ttkey, &ttres) || !ttres.authoritative)
+			memset(&tt_request, 0, sizeof(tt_request));
+			tt_request.key = &ttkey;
+			if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &tt_request,
+										  &tt_source_result)
+					!= CLUSTER_SEMANTIC_ADMISSION_OK
+				|| !tt_source_result.bool_value || !tt_source_result.lookup.authoritative)
 				return CLUSTER_VISIBILITY_UNKNOWN;
+			ttres = tt_source_result.lookup;
 
 			if (ttres.status == CLUSTER_TT_STATUS_SUBCOMMITTED && ttres.has_parent_key)
 				ttres = cluster_subtrans_lookup_parent(&ttres, cluster_subtrans_max_chain_depth);

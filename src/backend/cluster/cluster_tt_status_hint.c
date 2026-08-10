@@ -570,6 +570,9 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	/* PGRAC spec-3.5: V3 SUBCOMMITTED carries parent_key. */
 	bool is_v3_subcommitted = false;
 	ClusterTTStatusKey parent_key_local;
+	ClusterTTStatusSourceRequest tt_request;
+	ClusterTTStatusSourceResult tt_result;
+	ClusterSemanticAdmissionResult tt_admission;
 
 	memset(&parent_key_local, 0, sizeof(parent_key_local));
 
@@ -656,6 +659,8 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 		 */
 		const ClusterTTStatusHintMsgV4Header *v4hdr;
 		const ClusterMultiXactMember *v4_members;
+		ClusterMultiXactSourceRequest multi_request;
+		ClusterMultiXactSourceResult multi_result;
 		uint16 v4_member_count;
 		Size expected_len;
 
@@ -705,7 +710,14 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 			}
 		}
 
-		(void)cluster_multixact_member_overlay_install(&v4hdr->key, v4_member_count, v4_members);
+		memset(&multi_request, 0, sizeof(multi_request));
+		multi_request.key = &v4hdr->key;
+		multi_request.member_count = v4_member_count;
+		multi_request.members = v4_members;
+		if (cluster_multixact_source_dispatch(CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL, &multi_request,
+										 &multi_result)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK)
+			return;
 
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->receive_count, 1);
 		pg_atomic_fetch_add_u64(&ClusterTTHintCounters->install_count, 1);
@@ -819,10 +831,22 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	 * PGRAC spec-3.5:  V3 SUBCOMMITTED dispatches to install_subcommitted
 	 * which records parent_key for lazy reader follow.
 	 */
-	if (is_v3_subcommitted)
-		cluster_tt_status_install_subcommitted(key, &parent_key_local);
-	else {
-		cluster_tt_status_install_local(key, (ClusterTTStatus)status_raw, commit_scn);
+	memset(&tt_request, 0, sizeof(tt_request));
+	tt_request.key = key;
+	if (is_v3_subcommitted) {
+		tt_request.parent_key = &parent_key_local;
+		tt_admission = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED,
+													&tt_request, &tt_result);
+	} else {
+		tt_request.status = (ClusterTTStatus)status_raw;
+		tt_request.commit_scn = commit_scn;
+		tt_admission = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &tt_request,
+													&tt_result);
+	}
+	if (tt_admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return;
+
+	if (!is_v3_subcommitted) {
 
 		/*
 		 * spec-5.2 D6:  a remote holder just became terminal on this node's

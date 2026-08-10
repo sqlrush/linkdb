@@ -249,11 +249,13 @@ void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
 {}
 
-bool
-cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key pg_attribute_unused(),
-							   ClusterTTStatusResult *result pg_attribute_unused())
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
+							  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+							  ClusterTTStatusSourceResult *result)
 {
-	return false;
+	memset(result, 0, sizeof(*result));
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 ClusterTTStatusResult
