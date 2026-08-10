@@ -56,6 +56,7 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
+#include "portability/instr_time.h"
 #include "storage/bufpage.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -141,6 +142,9 @@ static bool dedup_pcm_x_work_pending[CLUSTER_LMS_MAX_WORKERS];
 static int64 dedup_expiry_threshold_us(void);
 static int dedup_reclaim_reclaimable_locked(ClusterGcsBlockDedupShard *shard, HTAB *htab,
 											TimestampTz now, int want);
+
+StaticAssertDecl(sizeof(instr_time) == sizeof(TimestampTz),
+				 "R4 route monotonic anchor must fit the existing 8-byte TTL slot");
 
 
 static int
@@ -575,6 +579,144 @@ dedup_pcm_x_entry_drained_valid(const GcsBlockDedupKey *key, const BufferTag *ta
 		   && dedup_pcm_x_entry_payload_valid(key, tag, entry);
 }
 
+static bool
+dedup_entry_kind_is_pcm_x(uint8 entry_kind)
+{
+	return entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
+		   || entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
+		   || entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED
+		   || entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_DRAINED;
+}
+
+static void
+dedup_pcm_x_note_wrong_kind(ClusterGcsBlockDedupShard *shard,
+							const GcsBlockDedupEntry *entry)
+{
+	if (entry == NULL || entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE)
+		dedup_pcm_x_note_failclosed(shard);
+}
+
+static bool
+dedup_r4_route_proof_equal(const ClusterR4CrRouteProof *left,
+						   const ClusterR4CrRouteProof *right)
+{
+	return left != NULL && right != NULL
+		   && memcmp(&left->tag, &right->tag, sizeof(BufferTag)) == 0
+		   && left->read_scn == right->read_scn
+		   && left->formation_epoch == right->formation_epoch
+		   && left->activation_generation == right->activation_generation
+		   && left->master_authority_generation == right->master_authority_generation
+		   && left->master_resource_transition_count
+			  == right->master_resource_transition_count
+		   && left->expected_page_scn == right->expected_page_scn
+		   && left->real_master_node == right->real_master_node
+		   && left->selected_holder_node == right->selected_holder_node;
+}
+
+static bool
+dedup_r4_route_identity_equal(const GcsBlockDedupEntry *entry,
+							  const GcsBlockR4RouteIdentity *identity,
+							  uint8 transition_id)
+{
+	const ClusterR4CrRouteProof *stored = &entry->payload_meta.r4_route.proof;
+
+	return entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE
+		   && entry->transition_id == transition_id
+		   && memcmp(&entry->tag, &identity->tag, sizeof(BufferTag)) == 0
+		   && stored->read_scn == identity->read_scn
+		   && stored->activation_generation == identity->activation_generation;
+}
+
+static bool
+dedup_r4_route_input_valid(const GcsBlockR4RouteIdentity *identity, uint8 transition_id,
+						   const ClusterR4CrRouteProof *proof)
+{
+	return identity != NULL && proof != NULL
+		   && identity->legacy_key.request_id != 0
+		   && identity->legacy_key.requester_backend_id > 0
+		   && identity->legacy_key.origin_node_id < PCM_X_PROTOCOL_NODE_LIMIT
+		   && identity->activation_generation != 0
+		   && SCN_VALID(identity->read_scn)
+		   && memcmp(&identity->tag, &proof->tag, sizeof(BufferTag)) == 0
+		   && proof->read_scn == identity->read_scn
+		   && proof->formation_epoch == identity->legacy_key.cluster_epoch
+		   && proof->activation_generation == identity->activation_generation
+		   && (uint32)proof->master_authority_generation != 0
+		   && (uint32)(proof->master_authority_generation >> 32)
+			  == (uint32)proof->formation_epoch
+		   && proof->master_resource_transition_count != 0
+		   && proof->master_resource_transition_count != UINT64_MAX
+		   && proof->real_master_node >= 0
+		   && proof->real_master_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && proof->selected_holder_node >= 0
+		   && proof->selected_holder_node < PCM_X_PROTOCOL_NODE_LIMIT;
+}
+
+static bool
+dedup_r4_route_anchor_load(const TimestampTz *slot, instr_time *anchor_out)
+{
+	Assert(slot != NULL);
+	Assert(anchor_out != NULL);
+	memcpy(anchor_out, slot, sizeof(*anchor_out));
+	return !INSTR_TIME_IS_ZERO(*anchor_out);
+}
+
+static void
+dedup_r4_route_anchor_now(TimestampTz *slot)
+{
+	instr_time now;
+
+	Assert(slot != NULL);
+	INSTR_TIME_SET_CURRENT(now);
+	memcpy(slot, &now, sizeof(now));
+}
+
+static bool
+dedup_r4_route_reclaim_safe(const GcsBlockDedupEntry *entry, const instr_time *now,
+							int64 fallback_out_of_window_us)
+{
+	const GcsBlockR4RouteRecord *record = &entry->payload_meta.r4_route;
+	const TimestampTz *anchor_slot;
+	instr_time anchor;
+	instr_time elapsed;
+	int64 deadline_us;
+
+	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE)
+		return false;
+	if (record->state == GCS_BLOCK_R4_ROUTE_ROUTING)
+		anchor_slot = &entry->registered_at_ts;
+	else if (record->state == GCS_BLOCK_R4_ROUTE_FORWARDED
+			 || record->state == GCS_BLOCK_R4_ROUTE_RETRYABLE)
+		anchor_slot = &entry->completed_at_ts;
+	else
+		return false;
+	if (now == NULL || !dedup_r4_route_anchor_load(anchor_slot, &anchor))
+		return false;
+
+	deadline_us = entry->pinned_lifetime_us > 0 ? entry->pinned_lifetime_us
+											 : fallback_out_of_window_us;
+	elapsed = *now;
+	INSTR_TIME_SUBTRACT(elapsed, anchor);
+	if (INSTR_TIME_GET_NANOSEC(elapsed) < 0)
+		return false;
+	return deadline_us > 0
+		   && INSTR_TIME_GET_MICROSEC(elapsed) > (uint64)deadline_us;
+}
+
+static bool
+dedup_entry_reclaim_safe(const GcsBlockDedupEntry *entry, TimestampTz wall_now,
+						 const instr_time *route_now,
+						 int64 fallback_out_of_window_us)
+{
+	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC)
+		return GcsBlockDedupEntryIsReclaimSafe(entry, wall_now,
+											 fallback_out_of_window_us);
+	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE)
+		return dedup_r4_route_reclaim_safe(entry, route_now,
+											 fallback_out_of_window_us);
+	return false;
+}
+
 
 /* ============================================================
  * Public API.
@@ -611,7 +753,7 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 
 	if (found) {
 		if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC) {
-			dedup_pcm_x_note_failclosed(shard);
+			dedup_pcm_x_note_wrong_kind(shard, entry);
 			LWLockRelease(&shard->lock.lock);
 			return GCS_BLOCK_DEDUP_VALIDATION_FAIL;
 		}
@@ -741,6 +883,228 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 
 	LWLockRelease(&shard->lock.lock);
 	return result;
+}
+
+GcsBlockR4RouteArmResult
+cluster_gcs_block_dedup_r4_route_arm_or_match(
+	int worker_id, const GcsBlockR4RouteIdentity *identity, uint8 transition_id,
+	const ClusterR4CrRouteProof *fresh_proof, uint32 requester_lifetime_hint_ms,
+	bool lifetime_hint_trusted, GcsBlockR4RouteRecord *record_out)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	bool found = false;
+	int64 pinned_lifetime_ms;
+	GcsBlockR4RouteArmResult result;
+
+	if (record_out != NULL)
+		memset(record_out, 0, sizeof(*record_out));
+	if (record_out == NULL
+		|| !dedup_r4_route_input_valid(identity, transition_id, fresh_proof))
+		return GCS_BLOCK_R4_ROUTE_ARM_INVALID;
+	if (lifetime_hint_trusted
+		&& (requester_lifetime_hint_ms == 0
+			|| (int64)requester_lifetime_hint_ms > GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS))
+		return GCS_BLOCK_R4_ROUTE_ARM_INVALID;
+
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_R4_ROUTE_ARM_FULL;
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key, HASH_FIND, &found);
+	if (found) {
+		if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE
+			|| !dedup_r4_route_identity_equal(entry, identity, transition_id)) {
+			result = GCS_BLOCK_R4_ROUTE_ARM_IDENTITY_COLLISION;
+			goto out;
+		}
+		*record_out = entry->payload_meta.r4_route;
+		if (!dedup_r4_route_proof_equal(&record_out->proof, fresh_proof)) {
+			if (entry->payload_meta.r4_route.state != GCS_BLOCK_R4_ROUTE_RETRYABLE) {
+				entry->payload_meta.r4_route.state = GCS_BLOCK_R4_ROUTE_RETRYABLE;
+				dedup_r4_route_anchor_now(&entry->completed_at_ts);
+			}
+			*record_out = entry->payload_meta.r4_route;
+			result = GCS_BLOCK_R4_ROUTE_ARM_HOLDER_MOVED;
+			goto out;
+		}
+		if (record_out->state == GCS_BLOCK_R4_ROUTE_RETRYABLE)
+			result = GCS_BLOCK_R4_ROUTE_ARM_RETRYABLE;
+		else if (record_out->state == GCS_BLOCK_R4_ROUTE_ROUTING
+				 || record_out->state == GCS_BLOCK_R4_ROUTE_FORWARDED)
+			result = GCS_BLOCK_R4_ROUTE_ARM_REPLAY;
+		else
+			result = GCS_BLOCK_R4_ROUTE_ARM_INVALID;
+		goto out;
+	}
+
+	if (transition_id != (uint8)PCM_TRANS_N_TO_S) {
+		result = GCS_BLOCK_R4_ROUTE_ARM_INVALID;
+		goto out;
+	}
+	entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key, HASH_ENTER_NULL,
+										&found);
+	if (entry == NULL
+		&& dedup_reclaim_reclaimable_locked(shard, htab, GetCurrentTimestamp(), 1) > 0)
+		entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key,
+											 HASH_ENTER_NULL, &found);
+	if (entry == NULL) {
+		result = GCS_BLOCK_R4_ROUTE_ARM_FULL;
+		goto out;
+	}
+	memset(((char *)entry) + sizeof(GcsBlockDedupKey), 0,
+		   sizeof(GcsBlockDedupEntry) - sizeof(GcsBlockDedupKey));
+	entry->tag = identity->tag;
+	entry->transition_id = transition_id;
+	entry->entry_kind = GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE;
+	entry->payload_meta.r4_route.proof = *fresh_proof;
+	entry->payload_meta.r4_route.state = GCS_BLOCK_R4_ROUTE_ROUTING;
+	dedup_r4_route_anchor_now(&entry->registered_at_ts);
+	pinned_lifetime_ms = lifetime_hint_trusted ? (int64)requester_lifetime_hint_ms
+										 : GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS;
+	entry->pinned_lifetime_us = pinned_lifetime_ms * 1000 * 2;
+	pg_atomic_fetch_add_u32(&shard->entry_count, 1);
+	*record_out = entry->payload_meta.r4_route;
+	result = GCS_BLOCK_R4_ROUTE_ARM_NEW;
+
+out:
+	LWLockRelease(&shard->lock.lock);
+	return result;
+}
+
+GcsBlockR4RouteSendResult
+cluster_gcs_block_dedup_r4_route_finish_send(
+	int worker_id, const GcsBlockR4RouteIdentity *identity, uint8 transition_id,
+	const ClusterR4CrRouteProof *armed_proof, bool outbound_admitted)
+{
+	ClusterGcsBlockDedupShard *shard;
+	HTAB *htab = NULL;
+	GcsBlockDedupEntry *entry;
+	bool found = false;
+	GcsBlockR4RouteSendResult result;
+
+	if (!dedup_r4_route_input_valid(identity, transition_id, armed_proof))
+		return GCS_BLOCK_R4_ROUTE_SEND_INVALID;
+	shard = cluster_gcs_block_dedup_resolve_shard(worker_id, &htab);
+	if (shard == NULL)
+		return GCS_BLOCK_R4_ROUTE_SEND_STALE;
+
+	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key, HASH_FIND, &found);
+	if (!found) {
+		result = GCS_BLOCK_R4_ROUTE_SEND_STALE;
+		goto out;
+	}
+	if (!dedup_r4_route_identity_equal(entry, identity, transition_id)
+		|| !dedup_r4_route_proof_equal(&entry->payload_meta.r4_route.proof, armed_proof)) {
+		result = GCS_BLOCK_R4_ROUTE_SEND_COLLISION;
+		goto out;
+	}
+
+	if (outbound_admitted) {
+		if (entry->payload_meta.r4_route.state != GCS_BLOCK_R4_ROUTE_FORWARDED) {
+			entry->payload_meta.r4_route.state = GCS_BLOCK_R4_ROUTE_FORWARDED;
+			dedup_r4_route_anchor_now(&entry->completed_at_ts);
+		}
+		result = GCS_BLOCK_R4_ROUTE_SEND_FORWARDED;
+	} else {
+		if (entry->payload_meta.r4_route.state != GCS_BLOCK_R4_ROUTE_FORWARDED) {
+			entry->payload_meta.r4_route.state = GCS_BLOCK_R4_ROUTE_RETRYABLE;
+			dedup_r4_route_anchor_now(&entry->completed_at_ts);
+		}
+		result = GCS_BLOCK_R4_ROUTE_SEND_RETRYABLE;
+	}
+
+out:
+	LWLockRelease(&shard->lock.lock);
+	return result;
+}
+
+static uint64
+dedup_r4_route_remove_if(bool (*predicate)(const GcsBlockDedupEntry *, uint64), uint64 arg)
+{
+	uint64 removed_total = 0;
+	int s;
+
+	if (cluster_gcs_block_dedup_shards == NULL)
+		return 0;
+	for (s = 0; s < cluster_gcs_block_dedup_n_shards; s++) {
+		ClusterGcsBlockDedupShard *shard = &cluster_gcs_block_dedup_shards[s];
+		HTAB *htab = cluster_gcs_block_dedup_htabs[s];
+		HASH_SEQ_STATUS scan;
+		GcsBlockDedupEntry *entry;
+		uint32 removed = 0;
+
+		if (htab == NULL)
+			continue;
+		LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
+		hash_seq_init(&scan, htab);
+		while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&scan)) != NULL) {
+			if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE
+				|| !predicate(entry, arg))
+				continue;
+			(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
+			removed++;
+		}
+		if (removed > 0)
+			pg_atomic_fetch_sub_u32(&shard->entry_count, removed);
+		LWLockRelease(&shard->lock.lock);
+		removed_total += removed;
+	}
+	return removed_total;
+}
+
+static bool
+dedup_r4_route_stale_epoch(const GcsBlockDedupEntry *entry, uint64 current_epoch)
+{
+	return entry->payload_meta.r4_route.proof.formation_epoch != current_epoch;
+}
+
+static bool
+dedup_r4_route_any(const GcsBlockDedupEntry *entry pg_attribute_unused(),
+				   uint64 arg pg_attribute_unused())
+{
+	return true;
+}
+
+uint64
+cluster_gcs_block_dedup_r4_route_sweep_epoch(uint64 current_epoch)
+{
+	return dedup_r4_route_remove_if(dedup_r4_route_stale_epoch, current_epoch);
+}
+
+uint64
+cluster_gcs_block_dedup_r4_route_count(void)
+{
+	uint64 total = 0;
+	int s;
+
+	if (cluster_gcs_block_dedup_shards == NULL)
+		return 0;
+	for (s = 0; s < cluster_gcs_block_dedup_n_shards; s++) {
+		ClusterGcsBlockDedupShard *shard = &cluster_gcs_block_dedup_shards[s];
+		HTAB *htab = cluster_gcs_block_dedup_htabs[s];
+		HASH_SEQ_STATUS scan;
+		GcsBlockDedupEntry *entry;
+
+		if (htab == NULL)
+			continue;
+		LWLockAcquire(&shard->lock.lock, LW_SHARED);
+		hash_seq_init(&scan, htab);
+		while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&scan)) != NULL)
+			if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE)
+				total++;
+		LWLockRelease(&shard->lock.lock);
+	}
+	return total;
+}
+
+uint64
+cluster_gcs_block_dedup_r4_route_purge_closed(void)
+{
+	return dedup_r4_route_remove_if(dedup_r4_route_any, 0);
 }
 
 static bool
@@ -889,7 +1253,7 @@ cluster_gcs_block_dedup_pending_x_deny_exact(int worker_id, const GcsBlockDedupK
 	if (!found || entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC
 		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0 || entry->transition_id != transition_id) {
 		if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
-			dedup_pcm_x_note_failclosed(shard);
+			dedup_pcm_x_note_wrong_kind(shard, entry);
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PENDING_X_DENY_INVALID;
 	}
@@ -938,7 +1302,7 @@ cluster_gcs_block_dedup_set_request_flags_exact(int worker_id, const GcsBlockDed
 			entry->request_flags = pinned_flags;
 		updated = entry->request_flags == pinned_flags;
 	} else if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
-		dedup_pcm_x_note_failclosed(shard);
+		dedup_pcm_x_note_wrong_kind(shard, entry);
 	LWLockRelease(&shard->lock.lock);
 	return updated;
 }
@@ -964,6 +1328,11 @@ cluster_gcs_block_dedup_pcm_x_reserve(int worker_id, const GcsBlockDedupKey *key
 	LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_FIND, &found);
 	if (found) {
+		if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+			dedup_pcm_x_note_wrong_kind(shard, entry);
+			LWLockRelease(&shard->lock.lock);
+			return GCS_BLOCK_PCM_X_IMAGE_STALE;
+		}
 		if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_DRAINED
 			&& !dedup_pcm_x_entry_drained_valid(key, tag, entry)) {
 			dedup_pcm_x_note_failclosed(shard);
@@ -1041,6 +1410,11 @@ cluster_gcs_block_dedup_pcm_x_materialize(int worker_id, const GcsBlockDedupKey 
 		dedup_pcm_x_note_failclosed(shard);
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
 	}
 	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
 		|| entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED) {
@@ -1132,6 +1506,11 @@ cluster_gcs_block_dedup_pcm_x_publish_ready_exact(int worker_id, const GcsBlockD
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
 	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
 	dedup_pcm_x_binding_from_entry(entry, &stored_binding);
 	if (entry->transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
@@ -1191,6 +1570,11 @@ cluster_gcs_block_dedup_pcm_x_lookup(int worker_id, const GcsBlockDedupKey *key,
 		dedup_pcm_x_note_failclosed(shard);
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
 	}
 	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_PCM_X_DRAINED) {
 		dedup_pcm_x_binding_from_entry(entry, &stored_binding);
@@ -1273,6 +1657,11 @@ cluster_gcs_block_dedup_pcm_x_drain_status_exact(int worker_id, const GcsBlockDe
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
 	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
 	dedup_pcm_x_binding_from_entry(entry, &stored_binding);
 	if (entry->transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| memcmp(&entry->tag, tag, sizeof(*tag)) != 0
@@ -1329,6 +1718,11 @@ cluster_gcs_block_dedup_pcm_x_release_exact(int worker_id, const GcsBlockDedupKe
 		dedup_pcm_x_note_failclosed(shard);
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
 	}
 	dedup_pcm_x_binding_from_entry(entry, &stored_binding);
 	if (entry->transition_id != (uint8)PCM_TRANS_N_TO_S
@@ -1470,6 +1864,11 @@ cluster_gcs_block_dedup_pcm_x_preserve_finish_error_exact(
 		dedup_pcm_x_note_failclosed(shard);
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
 	}
 	dedup_pcm_x_binding_from_entry(entry, &stored_binding);
 	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED
@@ -1665,6 +2064,11 @@ cluster_gcs_block_dedup_pcm_x_mark_staged_exact(int worker_id, const GcsBlockDed
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
 	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
 	dedup_pcm_x_binding_from_entry(entry, &stored_binding);
 	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
 		|| entry->transition_id != (uint8)PCM_TRANS_N_TO_S
@@ -1714,6 +2118,11 @@ cluster_gcs_block_dedup_pcm_x_unmark_staged_exact(int worker_id, const GcsBlockD
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
 	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
+	}
 	dedup_pcm_x_binding_from_entry(entry, &stored_binding);
 	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
 		|| entry->transition_id != (uint8)PCM_TRANS_N_TO_S
@@ -1761,6 +2170,11 @@ cluster_gcs_block_dedup_pcm_x_rearm_exact(int worker_id, const GcsBlockDedupKey 
 		dedup_pcm_x_note_failclosed(shard);
 		LWLockRelease(&shard->lock.lock);
 		return GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND;
+	}
+	if (!dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
+		dedup_pcm_x_note_wrong_kind(shard, entry);
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_PCM_X_IMAGE_STALE;
 	}
 	if ((entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED
 		 && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE
@@ -1822,7 +2236,7 @@ cluster_gcs_block_dedup_pcm_x_restart_audit(int worker_id)
 	LWLockAcquire(&shard->lock.lock, LW_SHARED);
 	hash_seq_init(&scan, htab);
 	while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&scan)) != NULL) {
-		if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC) {
+		if (dedup_entry_kind_is_pcm_x(entry->entry_kind)) {
 			evidence_found = true;
 			hash_seq_term(&scan);
 			break;
@@ -1866,9 +2280,9 @@ cluster_gcs_block_dedup_mark_done(int worker_id, const GcsBlockDedupKey *key, co
 			entry->done_at_ts = GetCurrentTimestamp();
 		stamped = true; /* duplicate DONE re-stamps nothing: idempotent */
 		pg_atomic_fetch_add_u64(&shard->done_marked_count, 1);
-	} else {
+	} else if (!found || entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE) {
 		if (found && entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
-			dedup_pcm_x_note_failclosed(shard);
+			dedup_pcm_x_note_wrong_kind(shard, entry);
 		pg_atomic_fetch_add_u64(&shard->done_mismatch_count, 1);
 	}
 	LWLockRelease(&shard->lock.lock);
@@ -1949,7 +2363,7 @@ cluster_gcs_block_dedup_install_reply_ex(int worker_id, const GcsBlockDedupKey *
 		return;
 	}
 	if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC) {
-		dedup_pcm_x_note_failclosed(shard);
+		dedup_pcm_x_note_wrong_kind(shard, entry);
 		LWLockRelease(&shard->lock.lock);
 		return;
 	}
@@ -2021,7 +2435,7 @@ cluster_gcs_block_dedup_remove(int worker_id, const GcsBlockDedupKey *key)
 		Assert(found);
 		pg_atomic_fetch_sub_u32(&shard->entry_count, 1);
 	} else if (found)
-		dedup_pcm_x_note_failclosed(shard);
+		dedup_pcm_x_note_wrong_kind(shard, entry);
 	LWLockRelease(&shard->lock.lock);
 }
 
@@ -2095,18 +2509,23 @@ dedup_reclaim_reclaimable_locked(ClusterGcsBlockDedupShard *shard, HTAB *htab, T
 {
 	HASH_SEQ_STATUS seq;
 	GcsBlockDedupEntry *entry;
+	instr_time route_now;
 	int64 out_of_window_us;
 	int reclaimed = 0;
+	int generic_reclaimed = 0;
 	int probed = 0;
 
 	if (want <= 0)
 		return 0;
 
 	out_of_window_us = dedup_expiry_threshold_us();
+	INSTR_TIME_SET_CURRENT(route_now);
 
 	hash_seq_init(&seq, htab);
 	while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&seq)) != NULL) {
-		if (GcsBlockDedupEntryIsReclaimSafe(entry, now, out_of_window_us)) {
+		if (dedup_entry_reclaim_safe(entry, now, &route_now, out_of_window_us)) {
+			if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC)
+				generic_reclaimed++;
 			(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
 			reclaimed++;
 		}
@@ -2119,7 +2538,8 @@ dedup_reclaim_reclaimable_locked(ClusterGcsBlockDedupShard *shard, HTAB *htab, T
 
 	if (reclaimed > 0) {
 		pg_atomic_fetch_sub_u32(&shard->entry_count, (uint32)reclaimed);
-		pg_atomic_fetch_add_u64(&shard->evict_count, (uint64)reclaimed);
+		if (generic_reclaimed > 0)
+			pg_atomic_fetch_add_u64(&shard->evict_count, (uint64)generic_reclaimed);
 	}
 	return reclaimed;
 }
@@ -2127,6 +2547,7 @@ dedup_reclaim_reclaimable_locked(ClusterGcsBlockDedupShard *shard, HTAB *htab, T
 void
 cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 {
+	instr_time route_now;
 	int64 threshold_us;
 	int s;
 
@@ -2134,6 +2555,7 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 		return;
 
 	threshold_us = dedup_expiry_threshold_us();
+	INSTR_TIME_SET_CURRENT(route_now);
 
 	/*
 	 * spec-7.2a D5:  saturation LOG-once.  When DENIED_DEDUP_FULL keeps
@@ -2167,6 +2589,7 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 		HASH_SEQ_STATUS seq;
 		GcsBlockDedupEntry *entry;
 		int removed = 0;
+		int generic_removed = 0;
 
 		if (htab == NULL)
 			continue;
@@ -2179,8 +2602,16 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 			int64 age_us;
 			int64 deadline_us;
 
-			if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC)
+			if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_GENERIC
+				&& entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE)
 				continue;
+			if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE) {
+				if (!dedup_r4_route_reclaim_safe(entry, &route_now, threshold_us))
+					continue;
+				(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
+				removed++;
+				continue;
+			}
 
 			/*
 			 * GCS-race round-2 RC-F: per-entry pinned deadlines.  A
@@ -2208,13 +2639,15 @@ cluster_gcs_block_dedup_sweep_expired(TimestampTz now)
 			if (age_us > deadline_us) {
 				(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
 				removed++;
+				generic_removed++;
 			}
 		}
 
 		if (removed > 0) {
 			pg_atomic_fetch_sub_u32(&shard->entry_count, (uint32)removed);
 			/* spec-7.2a D5: evict_count aggregates eager reclaim + TTL sweep. */
-			pg_atomic_fetch_add_u64(&shard->evict_count, (uint64)removed);
+			if (generic_removed > 0)
+				pg_atomic_fetch_add_u64(&shard->evict_count, (uint64)generic_removed);
 		}
 
 		LWLockRelease(&shard->lock.lock);
@@ -2242,7 +2675,8 @@ cluster_gcs_block_dedup_cleanup_on_backend_exit(uint32 origin_node_id, int32 bac
 		LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 		hash_seq_init(&seq, htab);
 		while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&seq)) != NULL) {
-			if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+			if ((entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+				 || entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE)
 				&& entry->key.origin_node_id == origin_node_id
 				&& entry->key.requester_backend_id == backend_id) {
 				(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
@@ -2276,7 +2710,8 @@ cluster_gcs_block_dedup_cleanup_on_node_dead(uint32 node_id)
 		LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 		hash_seq_init(&seq, htab);
 		while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&seq)) != NULL) {
-			if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+			if ((entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC
+				 || entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE)
 				&& entry->key.origin_node_id == node_id) {
 				(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
 				removed++;

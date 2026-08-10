@@ -193,6 +193,8 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 {
 	ClusterTTStatusKey key;
 	ClusterTTStatusResult result;
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
 	ClusterXpScope xp_scope = { .active = false }; /* PGRAC: spec-5.59 D3 profiling */
 
 	cluster_xp_begin(&xp_scope, CLXP_R_TT_VISIBILITY_RESOLVE);
@@ -254,7 +256,11 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 		}
 	}
 
-	if (!cluster_tt_status_lookup_exact(&key, &result) || !result.authoritative) {
+	memset(&source_request, 0, sizeof(source_request));
+	source_request.key = &key;
+	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request, &source_result)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !source_result.bool_value || !source_result.lookup.authoritative) {
 		/* PGRAC: spec-6.12c D0 -- lookup performed; no terminal verdict. */
 		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
 		/* PGRAC: spec-7.1a D4 -- overlay miss on a LIVE remote ref: pull the
@@ -263,6 +269,7 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;					   /* UNKNOWN -> caller 53R97 (C-V2: no PG-native fallback) */
 	}
+	result = source_result.lookup;
 
 	/*
 	 * spec-3.5: follow a SUBCOMMITTED subxact to its parent so the caller

@@ -410,8 +410,11 @@ extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type
 												   uint32 connection_generation);
 struct GcsBlockReplyHeader;
 extern bool cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
-														  const struct GcsBlockReplyHeader *header,
-														  bool direct_land);
+												  const struct GcsBlockReplyHeader *header,
+												  bool direct_land);
+extern bool cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+	int worker_id, uint32 dest_node_id, const struct GcsBlockReplyHeader *header,
+	uint32 required_capability, uint32 connection_generation);
 extern int cluster_lms_outbound_drain_send(int worker_id);
 extern uint32 cluster_lms_outbound_depth(int worker_id);
 extern void cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary,

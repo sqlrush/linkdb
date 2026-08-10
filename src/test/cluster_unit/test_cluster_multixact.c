@@ -67,38 +67,12 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 
 /* ===== Local stubs — pure-ABI binary does not link real cluster.o ===== */
 
-bool
-cluster_multixact_member_overlay_install(
-	const ClusterMultiXactKey *key pg_attribute_unused(), uint16 member_count pg_attribute_unused(),
-	const ClusterMultiXactMember *members pg_attribute_unused())
+ClusterSemanticAdmissionResult
+cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op pg_attribute_unused(),
+								  const ClusterMultiXactSourceRequest *request pg_attribute_unused(),
+								  ClusterMultiXactSourceResult *result pg_attribute_unused())
 {
-	return false;
-}
-
-bool
-cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key pg_attribute_unused(),
-										ClusterMultiXactMemberOverlayResult *out,
-										int max_members_buf pg_attribute_unused())
-{
-	if (out != NULL) {
-		out->authoritative = false;
-		out->member_count = 0;
-	}
-	return false;
-}
-
-ClusterVisibilityDecision
-cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *overlay
-										 pg_attribute_unused(),
-									 const Snapshot snap pg_attribute_unused())
-{
-	return CLUSTER_VISIBILITY_UNKNOWN;
-}
-
-uint16
-cluster_multixact_get_member_count(const ClusterMultiXactKey *key pg_attribute_unused())
-{
-	return 0;
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }
 
 void
@@ -131,11 +105,13 @@ cluster_multixact_get_resolve_visibility_count(void)
 	return 0;
 }
 
-void
-cluster_tt_status_hint_emit_multixact_overlay(
-	const ClusterMultiXactKey *key pg_attribute_unused(), uint16 member_count pg_attribute_unused(),
-	const ClusterMultiXactMember *members pg_attribute_unused())
-{}
+ClusterSemanticAdmissionResult
+cluster_tt_status_hint_source_dispatch(
+	ClusterTTStatusHintSourceOp op pg_attribute_unused(),
+	const ClusterTTStatusHintSourceRequest *request pg_attribute_unused())
+{
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+}
 
 uint64
 cluster_tt_status_hint_get_v4_drop_unknown_count(void)
@@ -204,18 +180,11 @@ UT_TEST(t5_v4_outbound_entry_sizeof)
 
 UT_TEST(t6_cluster_multixact_api_link)
 {
-	ClusterMultiXactKey key;
-	ClusterMultiXactMember member;
-	ClusterMultiXactMemberOverlayResult res;
-
-	memset(&key, 0, sizeof(key));
-	memset(&member, 0, sizeof(member));
-	memset(&res, 0, sizeof(res));
-
-	UT_ASSERT(!cluster_multixact_member_overlay_install(&key, 1, &member));
-	UT_ASSERT(!cluster_multixact_member_overlay_lookup(&key, &res, 1));
-	(void)cluster_multixact_resolve_visibility(&res, NULL);
-	UT_ASSERT_EQ((int)cluster_multixact_get_member_count(&key), 0);
+	UT_ASSERT_EQ((int)CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL, 0);
+	UT_ASSERT_EQ((int)CLUSTER_MULTI_SOURCE_OVERLAY_LOOKUP, 1);
+	UT_ASSERT_EQ((int)CLUSTER_MULTI_SOURCE_RESOLVE_VISIBILITY, 2);
+	UT_ASSERT_EQ((int)CLUSTER_MULTI_SOURCE_GET_MEMBER_COUNT, 3);
+	UT_ASSERT_NE((void *)cluster_multixact_source_dispatch, NULL);
 	cluster_multixact_purge_epoch(1);
 }
 
@@ -224,12 +193,8 @@ UT_TEST(t6_cluster_multixact_api_link)
 
 UT_TEST(t7_hint_emit_multixact_overlay_link)
 {
-	ClusterMultiXactKey key;
-	ClusterMultiXactMember member;
-
-	memset(&key, 0, sizeof(key));
-	memset(&member, 0, sizeof(member));
-	cluster_tt_status_hint_emit_multixact_overlay(&key, 1, &member);
+	UT_ASSERT_EQ((int)CLUSTER_TT_HINT_SOURCE_EMIT_MULTIXACT_OVERLAY, 2);
+	UT_ASSERT_NE((void *)cluster_tt_status_hint_source_dispatch, NULL);
 }
 
 

@@ -13,8 +13,8 @@
  *	    T5   CLUSTER_TT_STATUS_COMMITTED == 2
  *	    T6   CLUSTER_TT_STATUS_ABORTED == 3
  *	    T7   CLUSTER_TT_STATUS_CLEANED_OUT == 4
- *	    T8   public API: cluster_tt_status_lookup_exact prototype linkable
- *	    T9   public API: cluster_tt_status_install_local prototype linkable
+ *	    T8   D10 typed lookup operation + dispatch prototype linkable
+ *	    T9   D10 typed install operation + dispatch prototype linkable
  *	    T10  public API: cluster_tt_status_flush_all prototype linkable
  *	    T11  public API: cluster_tt_status_generation prototype linkable
  *	    T12  ClusterTTStatusKey field offsets locked (HC183 wire-stable)
@@ -101,26 +101,12 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 int cluster_tt_status_overlay_max_entries = 32768;
 int cluster_tt_status_overlay_ttl_ms = 30000;
 
-bool
-cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key pg_attribute_unused(),
-							   ClusterTTStatusResult *result pg_attribute_unused())
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
+							  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+							  ClusterTTStatusSourceResult *result pg_attribute_unused())
 {
-	return false;
-}
-
-bool
-cluster_tt_status_install_local(const ClusterTTStatusKey *key pg_attribute_unused(),
-								ClusterTTStatus status pg_attribute_unused(),
-								SCN commit_scn pg_attribute_unused())
-{
-	return false;
-}
-
-int
-cluster_tt_status_resolve_prepared_commit(TransactionId xid pg_attribute_unused(),
-										  SCN commit_scn pg_attribute_unused())
-{
-	return 0;
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }
 
 void
@@ -132,10 +118,6 @@ cluster_tt_status_generation(void)
 {
 	return 0;
 }
-
-void
-cluster_tt_status_bump_self_consumer_hit(void)
-{}
 
 Size
 cluster_tt_status_shmem_size(void)
@@ -227,15 +209,18 @@ UT_TEST(test_t7_enum_cleaned_out_four)
 /* ===== T8-T11: public API linkable ===== */
 UT_TEST(test_t8_lookup_exact_linkable)
 {
-	UT_ASSERT_NE((void *)cluster_tt_status_lookup_exact, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_SOURCE_LOOKUP, 0);
+	UT_ASSERT_NE((void *)cluster_tt_status_source_dispatch, NULL);
 }
 UT_TEST(test_t9_install_local_linkable)
 {
-	UT_ASSERT_NE((void *)cluster_tt_status_install_local, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_SOURCE_INSTALL_LOCAL, 1);
+	UT_ASSERT_NE((void *)cluster_tt_status_source_dispatch, NULL);
 }
 UT_TEST(test_t9b_resolve_prepared_commit_linkable)
 {
-	UT_ASSERT_NE((void *)cluster_tt_status_resolve_prepared_commit, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, 4);
+	UT_ASSERT_NE((void *)cluster_tt_status_source_dispatch, NULL);
 }
 UT_TEST(test_t10_flush_all_linkable)
 {
@@ -331,7 +316,8 @@ UT_TEST(test_t20_shmem_helpers_linkable)
 /* ===== T21: self-consumer hit bump linkable (v0.4 N7) ===== */
 UT_TEST(test_t21_self_consumer_hit_linkable)
 {
-	UT_ASSERT_NE((void *)cluster_tt_status_bump_self_consumer_hit, NULL);
+	UT_ASSERT_EQ((int)CLUSTER_TT_SOURCE_BUMP_SELF_CONSUMER_HIT, 5);
+	UT_ASSERT_NE((void *)cluster_tt_status_source_dispatch, NULL);
 }
 
 /* ===== T22: enum distinctness ===== */

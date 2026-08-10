@@ -30,12 +30,59 @@
 
 UT_DEFINE_GLOBALS();
 
+#define TEST_SF_CAP_PEER 7
+#define TEST_SF_SHMEM_BYTES 8192
+#define TEST_R4_REQUIRED_CAPS                                                                  \
+	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1)
+
+typedef union TestSfShmemStorage {
+	LWLock align;
+	uint8 bytes[TEST_SF_SHMEM_BYTES];
+} TestSfShmemStorage;
+
+static TestSfShmemStorage test_sf_shmem;
+
+ProcessingMode Mode = NormalProcessing;
+bool cluster_enabled = true;
+bool cluster_smart_fusion = false;
+int NBuffers = 0;
+int NLocBuffer = 0;
+
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
+{
+	UT_ASSERT(size <= sizeof(test_sf_shmem.bytes));
+	*foundPtr = false;
+	return test_sf_shmem.bytes;
+}
+
+void
+LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
+{}
+
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{}
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
 					 int lineNumber pg_attribute_unused())
 {
 	abort();
+}
+
+static void
+test_sf_cap_store_reset(void)
+{
+	memset(&test_sf_shmem, 0, sizeof(test_sf_shmem));
+	cluster_sf_dep_shmem_init();
 }
 
 UT_TEST(test_vec_set_union_and_clear)
@@ -331,6 +378,128 @@ UT_TEST(test_pcm_x_source_floor_capability_guard_is_generation_exact)
 		&cap, PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1, 42));
 }
 
+UT_TEST(test_r4_exported_family_sample_requires_both_bits_and_canonicalizes_outputs)
+{
+	static const struct {
+		uint32 bits;
+		uint32 noted_generation;
+		uint32 required;
+		uint32 optional;
+		bool want_supported;
+		bool want_done;
+		uint32 want_generation;
+	} cases[] = {
+		{PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1, 11, TEST_R4_REQUIRED_CAPS,
+		 PGRAC_IC_HELLO_CAP_GCS_DONE_V1, false, false, 0},
+		{PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1, 12, TEST_R4_REQUIRED_CAPS,
+		 PGRAC_IC_HELLO_CAP_GCS_DONE_V1, false, false, 0},
+		{PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 13, TEST_R4_REQUIRED_CAPS,
+		 PGRAC_IC_HELLO_CAP_GCS_DONE_V1, false, false, 0},
+		{TEST_R4_REQUIRED_CAPS, 14, TEST_R4_REQUIRED_CAPS,
+		 PGRAC_IC_HELLO_CAP_GCS_DONE_V1, true, false, 14},
+		{TEST_R4_REQUIRED_CAPS | PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 15,
+		 TEST_R4_REQUIRED_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1, true, true, 15},
+		{TEST_R4_REQUIRED_CAPS | PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 16, 0,
+		 PGRAC_IC_HELLO_CAP_GCS_DONE_V1, false, false, 0},
+		{TEST_R4_REQUIRED_CAPS | PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 17,
+		 TEST_R4_REQUIRED_CAPS, 0, true, false, 17},
+	};
+	bool done = true;
+	uint32 generation = UINT32_MAX;
+	Size i;
+
+	test_sf_cap_store_reset();
+	UT_ASSERT(!cluster_sf_peer_capability_family_sample(
+		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &done,
+		&generation));
+	UT_ASSERT(!done);
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	for (i = 0; i < lengthof(cases); i++) {
+		cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, cases[i].bits,
+												 cases[i].noted_generation);
+		done = !cases[i].want_done;
+		generation = UINT32_MAX;
+		UT_ASSERT_EQ(cluster_sf_peer_capability_family_sample(
+						 TEST_SF_CAP_PEER, cases[i].required, cases[i].optional, &done, &generation),
+					 cases[i].want_supported);
+		UT_ASSERT_EQ(done, cases[i].want_done);
+		UT_ASSERT_EQ(generation, cases[i].want_generation);
+	}
+
+	done = true;
+	generation = UINT32_MAX;
+	UT_ASSERT(!cluster_sf_peer_capability_family_sample(
+		-1, TEST_R4_REQUIRED_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &done, &generation));
+	UT_ASSERT(!done);
+	UT_ASSERT_EQ(generation, (uint32)0);
+}
+
+UT_TEST(test_r4_exported_family_sample_accepts_registered_generation_zero)
+{
+	bool done = false;
+	uint32 generation = UINT32_MAX;
+
+	test_sf_cap_store_reset();
+	cluster_sf_note_peer_hello_capabilities_gen(
+		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS | PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 0);
+	UT_ASSERT(cluster_sf_peer_capability_family_sample(
+		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &done,
+		&generation));
+	UT_ASSERT(done);
+	UT_ASSERT_EQ(generation, (uint32)0);
+	UT_ASSERT(cluster_sf_peer_capability_generation_matches(TEST_SF_CAP_PEER,
+													 TEST_R4_REQUIRED_CAPS, 0));
+}
+
+UT_TEST(test_r4_exported_family_sample_reconnect_generation_is_exact)
+{
+	bool done = false;
+	uint32 generation = UINT32_MAX;
+
+	test_sf_cap_store_reset();
+	cluster_sf_note_peer_hello_capabilities_gen(
+		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS | PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 21);
+	UT_ASSERT(cluster_sf_peer_capability_family_sample(
+		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &done,
+		&generation));
+	UT_ASSERT(done);
+	UT_ASSERT_EQ(generation, (uint32)21);
+	UT_ASSERT(cluster_sf_peer_capability_generation_matches(TEST_SF_CAP_PEER,
+													 TEST_R4_REQUIRED_CAPS, 21));
+
+	cluster_sf_note_peer_hello_capabilities_gen(
+		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS | PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 22);
+	UT_ASSERT(!cluster_sf_peer_capability_generation_matches(TEST_SF_CAP_PEER,
+													  TEST_R4_REQUIRED_CAPS, 21));
+	UT_ASSERT(cluster_sf_peer_capability_generation_matches(TEST_SF_CAP_PEER,
+													 TEST_R4_REQUIRED_CAPS, 22));
+	done = false;
+	generation = UINT32_MAX;
+	UT_ASSERT(cluster_sf_peer_capability_family_sample(
+		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &done,
+		&generation));
+	UT_ASSERT(done);
+	UT_ASSERT_EQ(generation, (uint32)22);
+
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER,
+											 PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 23);
+	done = true;
+	generation = UINT32_MAX;
+	UT_ASSERT(!cluster_sf_peer_capability_family_sample(
+		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &done,
+		&generation));
+	UT_ASSERT(!done);
+	UT_ASSERT_EQ(generation, (uint32)0);
+	UT_ASSERT(!cluster_sf_peer_capability_generation_matches(TEST_SF_CAP_PEER,
+													  TEST_R4_REQUIRED_CAPS, 23));
+
+	cluster_sf_note_peer_disconnected_gen(TEST_SF_CAP_PEER, 22);
+	UT_ASSERT(cluster_sf_peer_supports_gcs_done(TEST_SF_CAP_PEER));
+	cluster_sf_note_peer_disconnected_gen(TEST_SF_CAP_PEER, 23);
+	UT_ASSERT(!cluster_sf_peer_supports_gcs_done(TEST_SF_CAP_PEER));
+}
+
 int
 main(void)
 {
@@ -347,5 +516,8 @@ main(void)
 	UT_RUN(test_pcm_x_capability_generation_snapshot_is_exact);
 	UT_RUN(test_pcm_x_capability_family_sample_is_record_coherent);
 	UT_RUN(test_pcm_x_source_floor_capability_guard_is_generation_exact);
+	UT_RUN(test_r4_exported_family_sample_requires_both_bits_and_canonicalizes_outputs);
+	UT_RUN(test_r4_exported_family_sample_accepts_registered_generation_zero);
+	UT_RUN(test_r4_exported_family_sample_reconnect_generation_is_exact);
 	UT_DONE();
 }

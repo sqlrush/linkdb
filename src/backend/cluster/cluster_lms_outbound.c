@@ -266,24 +266,46 @@ cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type, uint32 des
 										 required_capability, connection_generation);
 }
 
-/*
- * Stage a header-only GCS denial from a CONTROL-plane producer.  The DATA
- * owner expands the ABI-mandated zero block immediately before transport
- * admission.  Keep this surface narrow: only the Shape-B pending-X denial
- * may use it, and callers must choose worker[shard(tag)] so it stays on the
- * same per-tag stream as the request it terminates.
- */
-bool
-cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
-											  const GcsBlockReplyHeader *header, bool direct_land)
+static bool
+lms_outbound_r4_refusal_header_valid(const GcsBlockReplyHeader *header)
+{
+	int i;
+
+	if (header == NULL || !GcsBlockReplyStatusIsR4Refusal((GcsBlockReplyStatus)header->status)
+		|| header->request_id == 0 || header->checksum != 0 || header->sender_node < 0
+		|| header->sender_node >= CLUSTER_MAX_NODES || header->requester_backend_id <= 0
+		|| header->transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| GcsBlockReplyHeaderGetForwardingMasterNode(header)
+			   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
+		return false;
+	for (i = 0; i < (int)sizeof(header->reserved_0); i++)
+		if (header->reserved_0[i] != 0)
+			return false;
+	if (header->status == (uint8)GCS_BLOCK_REPLY_R4_DENIED)
+		return header->page_lsn == 0;
+	/* Status 25 optionally carries WRONG_MASTER as node+1.  The encoded
+	 * value is therefore either zero or in [1, CLUSTER_MAX_NODES]. */
+	return header->page_lsn <= (uint64)CLUSTER_MAX_NODES;
+}
+
+static bool
+lms_outbound_enqueue_zero_block_reply_internal(int worker_id, uint32 dest_node_id,
+											 const GcsBlockReplyHeader *header,
+											 bool direct_land, uint32 required_capability,
+											 uint32 connection_generation)
 {
 	ClusterLmsOutboundState *ring;
 	LWLock *lock;
 	ClusterLmsOutboundSlot *slot;
+	bool r4_cap_bound = required_capability != 0;
 
 	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS || dest_node_id >= CLUSTER_MAX_NODES
-		|| header == NULL || (direct_land && (int32)dest_node_id == cluster_node_id)
-		|| header->status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X)
+		|| header == NULL || (direct_land && (int32)dest_node_id == cluster_node_id))
+		return false;
+	if (r4_cap_bound) {
+		if (direct_land || !lms_outbound_r4_refusal_header_valid(header))
+			return false;
+	} else if (header->status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X)
 		return false;
 	if (cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
 		return false;
@@ -301,8 +323,8 @@ cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id
 	slot->kind = (uint8)(direct_land ? CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY
 									 : CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY);
 	slot->payload_len = sizeof(*header);
-	slot->required_capability = 0;
-	slot->connection_generation = 0;
+	slot->required_capability = required_capability;
+	slot->connection_generation = connection_generation;
 	memcpy(slot->payload, header, sizeof(*header));
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
@@ -310,6 +332,29 @@ cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id
 
 	cluster_lms_wakeup(worker_id);
 	return true;
+}
+
+/* Stage the legacy Shape-B pending-X denial. */
+bool
+cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
+											  const GcsBlockReplyHeader *header, bool direct_land)
+{
+	return lms_outbound_enqueue_zero_block_reply_internal(
+		worker_id, dest_node_id, header, direct_land, 0, 0);
+}
+
+/* PGRAC R4 adaptation: stage a typed 25/26 refusal on the requester's exact
+ * HELLO-authenticated connection.  The existing DATA slot remains 144 bytes;
+ * only the 48-byte header is retained until drain expands the zero page. */
+bool
+cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+	int worker_id, uint32 dest_node_id, const GcsBlockReplyHeader *header,
+	uint32 required_capability, uint32 connection_generation)
+{
+	if (required_capability == 0)
+		return false;
+	return lms_outbound_enqueue_zero_block_reply_internal(
+		worker_id, dest_node_id, header, false, required_capability, connection_generation);
 }
 
 /*
@@ -405,7 +450,13 @@ cluster_lms_outbound_drain_send(int worker_id)
 			}
 			memset(&zero_reply, 0, sizeof(zero_reply));
 			memcpy(&zero_reply.header, slot.payload, sizeof(zero_reply.header));
-			if (zero_reply.header.status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X) {
+			if (slot.required_capability == 0) {
+				if (zero_reply.header.status != (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X) {
+					rc = CLUSTER_IC_SEND_HARD_ERROR;
+					goto handle_send_result;
+				}
+			} else if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY
+					   || !lms_outbound_r4_refusal_header_valid(&zero_reply.header)) {
 				rc = CLUSTER_IC_SEND_HARD_ERROR;
 				goto handle_send_result;
 			}

@@ -1363,7 +1363,8 @@ LmonMain(void)
 			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
 			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
 			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_TT_HINT, force_all_duties))
-				cluster_tt_status_hint_drain_outbound();
+				(void)cluster_tt_status_hint_source_dispatch(
+					CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND, NULL);
 			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
 				cluster_backup_lmon_tick();
 			/* spec-5.22e D5-2: publish this node's undo retention horizon
@@ -2031,7 +2032,8 @@ LmonMain(void)
 			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
 			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
 			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_TT_HINT, force_all_duties))
-				cluster_tt_status_hint_drain_outbound();
+				(void)cluster_tt_status_hint_source_dispatch(
+					CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND, NULL);
 			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
 				cluster_backup_lmon_tick();
 			/* spec-5.22e D5-2: publish this node's undo retention horizon

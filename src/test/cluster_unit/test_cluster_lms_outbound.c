@@ -269,6 +269,7 @@ typedef struct UtSentRec {
 	uint8 marker; /* first payload byte identifies the frame */
 	uint32 payload_len;
 	GcsBlockReplyHeader reply_header;
+	bool reply_block_zero;
 } UtSentRec;
 
 static UtSentRec ut_sent_log[64];
@@ -278,6 +279,7 @@ static int ut_local_dispatch_count = 0;
 static uint8 ut_local_dispatch_marker = 0;
 static int ut_direct_zero_reply_count = 0;
 static GcsBlockReplyHeader ut_direct_zero_reply_header;
+static int ut_checksum_call_count = 0;
 
 bool
 cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 source_node_id,
@@ -313,8 +315,17 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 		ut_sent_log[ut_sent_n].dest = dest_node_id;
 		ut_sent_log[ut_sent_n].marker = payload_len > 0 ? *(const uint8 *)payload : 0;
 		ut_sent_log[ut_sent_n].payload_len = payload_len;
-		if (msg_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY && payload_len >= sizeof(GcsBlockReplyHeader))
+		if (msg_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY && payload_len >= sizeof(GcsBlockReplyHeader)) {
+			const uint8 *block_data = ((const uint8 *)payload) + sizeof(GcsBlockReplyHeader);
+			uint32 i;
+
 			memcpy(&ut_sent_log[ut_sent_n].reply_header, payload, sizeof(GcsBlockReplyHeader));
+			ut_sent_log[ut_sent_n].reply_block_zero
+				= payload_len == GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+			for (i = 0; ut_sent_log[ut_sent_n].reply_block_zero && i < GCS_BLOCK_DATA_SIZE; i++)
+				if (block_data[i] != 0)
+					ut_sent_log[ut_sent_n].reply_block_zero = false;
+		}
 	}
 	ut_sent_n++;
 	UT_ASSERT(dest_node_id >= 0 && dest_node_id < CLUSTER_MAX_NODES);
@@ -325,6 +336,7 @@ uint32
 cluster_gcs_block_compute_checksum(const char *block_data)
 {
 	(void)block_data;
+	ut_checksum_call_count++;
 	return UINT32_C(0xA55A7E11);
 }
 
@@ -355,6 +367,7 @@ ut_reset_log(void)
 	ut_local_dispatch_count = 0;
 	ut_local_dispatch_marker = 0;
 	ut_direct_zero_reply_count = 0;
+	ut_checksum_call_count = 0;
 	memset(&ut_direct_zero_reply_header, 0, sizeof(ut_direct_zero_reply_header));
 	ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
 	ut_write_fence_enforcing = false;
@@ -377,6 +390,23 @@ static bool
 ut_enqueue_marker(int worker_id, int32 dest, uint8 marker)
 {
 	return ut_enqueue_typed_marker(worker_id, UT_MSG_TYPE, dest, marker);
+}
+
+static GcsBlockReplyHeader
+ut_r4_refusal_header(GcsBlockReplyStatus status, uint64 page_lsn)
+{
+	GcsBlockReplyHeader header;
+
+	memset(&header, 0, sizeof(header));
+	header.request_id = UINT64_C(0x1020304050607080);
+	header.page_lsn = page_lsn;
+	header.epoch = UINT64_C(9);
+	header.sender_node = cluster_node_id;
+	header.requester_backend_id = 17;
+	header.transition_id = PCM_TRANS_N_TO_S;
+	header.status = (uint8)status;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	return header;
 }
 
 /* ============================================================
@@ -657,12 +687,80 @@ UT_TEST(test_direct_zero_block_reply_uses_data_owner_direct_lane)
 	UT_ASSERT_EQ(ut_direct_zero_reply_header.checksum, UINT32_C(0xA55A7E11));
 }
 
+UT_TEST(test_r4_cap_bound_zero_reply_sends_only_on_exact_generation)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+					   | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1;
+	GcsBlockReplyHeader hdr
+		= ut_r4_refusal_header(GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED, 1);
+
+	ut_reset_log();
+	ut_peer_capabilities[UT_PEER_X] = cap;
+	ut_peer_cap_generation[UT_PEER_X] = 42;
+	UT_ASSERT(cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		2, UT_PEER_X, &hdr, cap, 42));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_checksum_call_count, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len, GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE);
+	UT_ASSERT(ut_sent_log[0].reply_block_zero);
+	UT_ASSERT_EQ(ut_sent_log[0].reply_header.status,
+				 GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED);
+	UT_ASSERT_EQ(ut_sent_log[0].reply_header.page_lsn, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].reply_header.checksum, UINT32_C(0xA55A7E11));
+	UT_ASSERT_EQ(GcsBlockReplyHeaderGetForwardingMasterNode(&ut_sent_log[0].reply_header),
+				 GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+}
+
+UT_TEST(test_r4_cap_bound_zero_reply_drops_drift_before_zero_expansion)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+					   | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1;
+	GcsBlockReplyHeader hdr = ut_r4_refusal_header(GCS_BLOCK_REPLY_R4_DENIED, 0);
+
+	ut_reset_log();
+	ut_peer_capabilities[UT_PEER_X] = cap;
+	ut_peer_cap_generation[UT_PEER_X] = 43;
+	UT_ASSERT(cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		2, UT_PEER_X, &hdr, cap, 42));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_checksum_call_count, 0);
+	UT_ASSERT_EQ(ut_cap_guard_drop_count, 1);
+}
+
+UT_TEST(test_zero_reply_wrappers_reject_the_other_status_domain)
+{
+	const uint32 cap = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+					   | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1;
+	GcsBlockReplyHeader legacy
+		= ut_r4_refusal_header(GCS_BLOCK_REPLY_DENIED_PENDING_X, 0);
+	GcsBlockReplyHeader retryable
+		= ut_r4_refusal_header(GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED, 0);
+	GcsBlockReplyHeader denied = ut_r4_refusal_header(GCS_BLOCK_REPLY_R4_DENIED, 1);
+
+	ut_reset_log();
+	UT_ASSERT(!cluster_lms_outbound_enqueue_zero_block_reply(0, UT_PEER_X, &retryable, false));
+	UT_ASSERT(!cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		0, UT_PEER_X, &legacy, cap, 42));
+	UT_ASSERT(!cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		0, UT_PEER_X, &denied, cap, 42));
+	retryable.reserved_0[0] = 1;
+	UT_ASSERT(!cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		0, UT_PEER_X, &retryable, cap, 42));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+}
+
 /* A producer must receive false when the selected worker ring is full.  The
  * PI durable-note drain couples this real return contract with its structural
  * false->break-before-seq-advance unit, so a full shard retains the source
  * note for the next tick instead of losing it. */
 UT_TEST(test_full_worker_ring_refuses_without_overwrite)
 {
+	const uint32 cap = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+					   | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1;
+	GcsBlockReplyHeader refusal = ut_r4_refusal_header(GCS_BLOCK_REPLY_R4_DENIED, 0);
 	int accepted = 0;
 	int sent = 0;
 
@@ -673,6 +771,8 @@ UT_TEST(test_full_worker_ring_refuses_without_overwrite)
 	UT_ASSERT(accepted < 1024);
 	UT_ASSERT_EQ((int)cluster_lms_outbound_depth(1), accepted);
 	UT_ASSERT(!ut_enqueue_marker(1, UT_PEER_X, 0xE3));
+	UT_ASSERT(!cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		1, UT_PEER_X, &refusal, cap, 42));
 	UT_ASSERT_EQ((int)cluster_lms_outbound_depth(1), accepted);
 
 	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
@@ -736,7 +836,7 @@ UT_TEST(test_cap_bound_frame_sends_on_exact_connection_capability)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(18);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
@@ -749,6 +849,9 @@ main(void)
 	UT_RUN(test_pcm_x_image_ready_and_prepare_transport_boundaries_are_observable);
 	UT_RUN(test_zero_block_reply_is_expanded_by_data_owner);
 	UT_RUN(test_direct_zero_block_reply_uses_data_owner_direct_lane);
+	UT_RUN(test_r4_cap_bound_zero_reply_sends_only_on_exact_generation);
+	UT_RUN(test_r4_cap_bound_zero_reply_drops_drift_before_zero_expansion);
+	UT_RUN(test_zero_reply_wrappers_reject_the_other_status_domain);
 	UT_RUN(test_full_worker_ring_refuses_without_overwrite);
 	UT_RUN(test_cap_bound_frame_drops_on_connection_generation_drift);
 	UT_RUN(test_cap_bound_frame_drops_on_capability_downgrade);

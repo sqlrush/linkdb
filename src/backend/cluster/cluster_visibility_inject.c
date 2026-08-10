@@ -181,8 +181,11 @@ cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
 	ClusterTTStatus install_status;
 	ClusterTTStatusKey key;
 	ClusterTTStatusResult res;
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
 	ClusterVisibilityInjectEntry *e;
 	bool found;
+	bool looked_up;
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -249,7 +252,14 @@ cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
 	key.cluster_epoch = epoch;
 	key.local_xid = xid;
 
-	installed = cluster_tt_status_install_local(&key, install_status, commit_scn);
+	memset(&source_request, 0, sizeof(source_request));
+	source_request.key = &key;
+	source_request.status = install_status;
+	source_request.commit_scn = commit_scn;
+	installed = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &source_request,
+											 &source_result)
+			== CLUSTER_SEMANTIC_ADMISSION_OK
+		&& source_result.bool_value;
 
 	/*
 	 * 3. spec-3.4c F5 + spec-3.4d D9:  install_local() is best-effort and
@@ -259,7 +269,14 @@ cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
 	 *    IN_PROGRESS + InvalidScn commit_scn (not COMMITTED + valid
 	 *    commit_scn).
 	 */
-	if (!installed || !cluster_tt_status_lookup_exact(&key, &res) || res.status != install_status
+	memset(&source_request, 0, sizeof(source_request));
+	source_request.key = &key;
+	looked_up = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request,
+											 &source_result)
+			== CLUSTER_SEMANTIC_ADMISSION_OK
+		&& source_result.bool_value;
+	res = source_result.lookup;
+	if (!installed || !looked_up || res.status != install_status
 		|| res.commit_scn != commit_scn)
 		ereport(ERROR, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						errmsg("cluster TT status overlay install verification failed"),
@@ -294,6 +311,8 @@ cluster_test_clear_visibility_injects(PG_FUNCTION_ARGS)
 	hash_seq_init(&hseq, ClusterVisibilityInjectHTAB);
 	while ((e = (ClusterVisibilityInjectEntry *)hash_seq_search(&hseq)) != NULL) {
 		ClusterTTStatusKey key;
+		ClusterTTStatusSourceRequest source_request;
+		ClusterTTStatusSourceResult source_result;
 
 		/* F4: build exact key + real delete_exact (NOT fake ABORT install). */
 		memset(&key, 0, sizeof(key));
@@ -302,7 +321,10 @@ cluster_test_clear_visibility_injects(PG_FUNCTION_ARGS)
 		key.tt_slot_id = e->ref.tt_slot_id;
 		key.cluster_epoch = e->ref.cluster_epoch;
 		key.local_xid = e->ref.local_xid;
-		(void)cluster_tt_status_delete_exact(&key);
+		memset(&source_request, 0, sizeof(source_request));
+		source_request.key = &key;
+		(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_DELETE_EXACT, &source_request,
+											&source_result);
 
 		hash_search(ClusterVisibilityInjectHTAB, &e->xid, HASH_REMOVE, NULL);
 		removed++;
@@ -340,6 +362,8 @@ cluster_test_inject_subtrans_subcommitted(PG_FUNCTION_ARGS)
 	uint32 epoch;
 	ClusterTTStatusKey child_key;
 	ClusterTTStatusKey parent_key;
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
 
 	if (!superuser())
 		ereport(ERROR, (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -367,7 +391,13 @@ cluster_test_inject_subtrans_subcommitted(PG_FUNCTION_ARGS)
 	parent_key.cluster_epoch = epoch;
 	parent_key.local_xid = parent_xid;
 
-	if (!cluster_tt_status_install_subcommitted(&child_key, &parent_key))
+	memset(&source_request, 0, sizeof(source_request));
+	source_request.key = &child_key;
+	source_request.parent_key = &parent_key;
+	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED, &source_request,
+										  &source_result)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !source_result.bool_value)
 		ereport(ERROR, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 						errmsg("cluster_test_inject_subtrans_subcommitted: install failed"),
 						errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));

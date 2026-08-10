@@ -42,6 +42,7 @@
 
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_tt_status_hint.h"
 
 #undef printf
 #undef fprintf
@@ -483,10 +484,14 @@ void
 cluster_sinval_broadcast_reset_all(void)
 {}
 
-/* spec-3.2 D6 + D1:  LMON drain hook + msg_type register. */
-void
-cluster_tt_status_hint_drain_outbound(void)
-{}
+/* spec-3.2 D6 + D1 / spec-8.4 D10: gated drain + msg_type register. */
+ClusterSemanticAdmissionResult
+cluster_tt_status_hint_source_dispatch(
+	ClusterTTStatusHintSourceOp op pg_attribute_unused(),
+	const ClusterTTStatusHintSourceRequest *request pg_attribute_unused())
+{
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
 void
 cluster_tt_status_hint_register_msg_type(void)
 {}

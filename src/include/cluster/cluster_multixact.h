@@ -56,6 +56,7 @@
 #include "c.h"
 #include "access/transam.h"
 #include "access/multixact.h" /* MultiXactId + MultiXactStatus */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tt_status.h"
 #include "utils/snapshot.h"
 
@@ -167,56 +168,49 @@ typedef struct ClusterMultiXactMemberOverlayResult {
 	ClusterMultiXactMember members[FLEXIBLE_ARRAY_MEMBER];
 } ClusterMultiXactMemberOverlayResult;
 
+typedef enum ClusterMultiXactSourceOp {
+	CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL = 0,
+	CLUSTER_MULTI_SOURCE_OVERLAY_LOOKUP = 1,
+	CLUSTER_MULTI_SOURCE_RESOLVE_VISIBILITY = 2,
+	CLUSTER_MULTI_SOURCE_GET_MEMBER_COUNT = 3,
+	CLUSTER_MULTI_SOURCE_REMOTE_XMAX_RESOLVE = 4,
+	CLUSTER_MULTI_SOURCE_NOTE_HALFSPACE_REFUSE = 5,
+	CLUSTER_MULTI_SOURCE_NOTE_UNDERIVABLE_READ = 6
+} ClusterMultiXactSourceOp;
+
+typedef struct ClusterMultiXactSourceRequest {
+	const ClusterMultiXactKey *key;
+	uint16 member_count;
+	const ClusterMultiXactMember *members;
+	ClusterMultiXactMemberOverlayResult *overlay_out;
+	int max_members_buf;
+	const ClusterMultiXactMemberOverlayResult *overlay_in;
+	Snapshot snapshot;
+	uint16 origin_slot;
+	MultiXactId mxid;
+} ClusterMultiXactSourceRequest;
+
+typedef struct ClusterMultiXactSourceResult {
+	bool bool_value;
+	uint16 member_count;
+	ClusterVisibilityDecision visibility;
+	bool overlay_hit;
+} ClusterMultiXactSourceResult;
+
 /* ------------------------------------------------------------ */
 /* Public API                                                   */
 /* ------------------------------------------------------------ */
 
 /*
- * cluster_multixact_member_overlay_install (spec-3.6 D2)
+ * cluster_multixact_source_dispatch -- admit one dormant source operation.
  *
- *   Install or overwrite an overlay entry for `key` with `member_count`
- *   members.  Caller is D5 multixact.c hook (local-all-member emit path)
- *   or D4 V4 wire receiver.  Returns true on success, false on overlay
- *   full / member_count > GUC cap (caller increments overlay_overflow_count).
+ *	The typed result is canonical-zero on refusal or generation drift.
+ *	Callers may consume overlay_out only when the return value is OK and
+ *	the operation's fixed success field is positive.
  */
-extern bool cluster_multixact_member_overlay_install(const ClusterMultiXactKey *key,
-													 uint16 member_count,
-													 const ClusterMultiXactMember *members);
-
-/*
- * cluster_multixact_member_overlay_lookup (spec-3.6 D2)
- *
- *   Look up overlay entry by exact key.  Writes result + copies members
- *   into caller buffer (up to max_members_buf entries).  Returns true on
- *   hit + authoritative=true;  false on miss + bumps overlay_miss_count.
- *   Caller raises 53R9C on miss (per L199 fail-closed).
- */
-extern bool cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key,
-													ClusterMultiXactMemberOverlayResult *out,
-													int max_members_buf);
-
-/*
- * cluster_multixact_resolve_visibility (spec-3.6 D2 core helper)
- *
- *   Given a hit overlay result + current snapshot, compute the
- *   visibility decision combining per-member MultiXactStatus
- *   (0-3 lock-only;  4-5 Update/NoKeyUpdate) with per-member commit/
- *   abort/in-progress status (via spec-3.2 cluster_tt_status_lookup_exact).
- *
- *   Truth table (per OBS-1 amend MVCC-accurate):
- *     lock-only ANY state                              → VISIBLE
- *     Update/NoKeyUpdate ABORTED                       → VISIBLE
- *     Update/NoKeyUpdate IN_PROGRESS (authoritative)   → VISIBLE
- *     Update/NoKeyUpdate COMMITTED + scn <= read_scn   → INVISIBLE
- *     Update/NoKeyUpdate COMMITTED + scn > read_scn    → VISIBLE
- *     ANY UNKNOWN / TT miss / overlay miss             → UNKNOWN
- *
- *   UNKNOWN → caller raises 53R9C (per L199 NOT PG-native fallback).
- *   Pure / no syscall / no wait (L177 hot path).
- */
-extern ClusterVisibilityDecision
-cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *overlay,
-									 const Snapshot snap);
+extern ClusterSemanticAdmissionResult cluster_multixact_source_dispatch(
+	ClusterMultiXactSourceOp op, const ClusterMultiXactSourceRequest *request,
+	ClusterMultiXactSourceResult *result);
 
 /*
  * spec-7.1 D3-b: one multixact member's origin-SERVED terminal verdict.
@@ -243,7 +237,7 @@ typedef struct ClusterMultiXactServedMember {
  *
  *   Pure combination resolver for a foreign multixact xmax whose members'
  *   terminal states were SERVED by the origin (no local TT lookup).  Mirrors
- *   cluster_multixact_resolve_visibility's decision structure verbatim, but
+ *   the local overlay resolver's decision structure verbatim, but
  *   the per-updater-member terminal comes from the served verdict instead of
  *   cluster_tt_status_lookup_exact.  8.A: any updater member without a proven
  *   terminal (verdict 0 / inadmissible below-horizon / unknown) -> UNKNOWN
@@ -255,36 +249,12 @@ cluster_multixact_resolve_visibility_served(const ClusterMultiXactServedMember *
 											uint16 member_count, SCN read_scn);
 
 /*
- * cluster_multixact_get_member_count (spec-3.6 D2)
- *
- *   Return member_count of overlay entry for `key`, or 0 on miss.
- *   Used by D6 to size lookup buffer.
- */
-extern uint16 cluster_multixact_get_member_count(const ClusterMultiXactKey *key);
-
-/*
  * cluster_multixact_purge_epoch (spec-3.6 D2)
  *
  *   Purge all overlay entries with cluster_epoch < obsolete_epoch.
  *   Called by reconfig hook (HC182 pattern from spec-3.1).
  */
 extern void cluster_multixact_purge_epoch(uint32 obsolete_epoch);
-
-/*
- * cluster_multixact_remote_xmax_resolve (spec-7.1 D3-a)
- *
- *   One-call reader helper for a DERIVED-foreign multixact xmax:
- *   builds the overlay key {origin_slot, mxid, current epoch}, looks
- *   up the member overlay and resolves visibility against snap per
- *   the OBS-1 truth table.  *overlay_hit reports whether the overlay
- *   held the entry (miss -> UNKNOWN; the member-serve wire that would
- *   answer a miss positively is a later deliverable).  UNKNOWN always
- *   means the caller must fail closed (rule 8.A).
- */
-extern ClusterVisibilityDecision cluster_multixact_remote_xmax_resolve(uint16 origin_slot,
-																	   MultiXactId mxid,
-																	   Snapshot snap,
-																	   bool *overlay_hit);
 
 /*
  * Counter getters (always linked;return 0 in disable-cluster build).
@@ -296,16 +266,6 @@ extern uint64 cluster_multixact_get_overlay_overflow_count(void);
 extern uint64 cluster_multixact_get_resolve_visibility_count(void);
 extern uint64 cluster_multixact_get_mxid_halfspace_refuse_count(void);
 extern uint64 cluster_multixact_get_mxid_underivable_read_count(void);
-
-/*
- * spec-7.1 D3-a guardrail bumps (no-op in disable-cluster build).
- * halfspace_refuse: the striped allocator refused a candidate at or
- * beyond floor + 2^31 (53RB4).  underivable_read: a reader met a
- * foreign-evidence multixact whose origin could not be derived
- * (below-floor / unlatched / beyond-half-space) and failed closed.
- */
-extern void cluster_multixact_note_halfspace_refuse(void);
-extern void cluster_multixact_note_underivable_read(void);
 
 /*
  * Shmem hooks (defined in cluster_multixact.c when USE_PGRAC_CLUSTER;

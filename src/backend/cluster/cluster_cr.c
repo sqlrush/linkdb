@@ -1540,19 +1540,27 @@ cr_construct_from_copy(char *dst_page, SCN read_scn, RelFileLocator cur_locator,
 		NodeId head_origin = uba_origin_node_id(chains[0].undo_segment_head);
 
 		if (cluster_cr_coordinator_classify_origin(head_origin) == CR_COORD_ORIGIN_RUNTIME_REMOTE) {
-			bool partial = false;
+			ClusterR4SourceCrRequest source_request;
+			ClusterR4SourceCrResult source_result;
 			BufferTag tag;
 
 			InitBufferTag(&tag, &cur_locator, cur_fork, cur_block);
-			if (!cluster_gcs_block_cr_fetch_and_wait(tag, read_scn, (int32)head_origin, dst_page,
-													 &partial)) {
+			memset(&source_request, 0, sizeof(source_request));
+			source_request.tag = tag;
+			source_request.read_scn = read_scn;
+			source_request.origin_node = (int32)head_origin;
+			source_request.dst_page = dst_page;
+			if (cluster_r4_source_cr_dispatch(CLUSTER_R4_SOURCE_CR_FETCH, &source_request,
+											  &source_result)
+					!= CLUSTER_SEMANTIC_ADMISSION_OK
+				|| !source_result.fetched) {
 				if (CRShared != NULL)
 					pg_atomic_fetch_add_u64(&CRShared->cr_remote_failed_count, 1);
 				/* Unchanged spec-5.57 refusal: 53R9G + coordinator counters. */
 				cr_coordinator_refuse_runtime_remote((int)head_origin);
 			}
 
-			if (!partial) {
+			if (!source_result.partial) {
 				/* FULL: dst holds the origin-finished CR page (it already ran
 				 * prune + walk + durable resolve there). */
 				if (CRShared != NULL) {
@@ -2416,6 +2424,9 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 			if (cluster_itl_get_tt_ref(page, itl_idx, &ref)) {
 				ClusterTTStatusKey key;
 				ClusterTTStatusResult result;
+				ClusterTTStatusSourceRequest source_request;
+				ClusterTTStatusSourceResult source_result;
+				bool found;
 
 				memset(&key, 0, sizeof(key));
 				key.origin_node_id = ref.origin_node_id;
@@ -2424,7 +2435,14 @@ cluster_cr_resolve_xmax_commit_scn(const char *cr_page, uint8 itl_idx, Transacti
 				key.cluster_epoch = ref.cluster_epoch;
 				key.local_xid = cr_xmax;
 
-				if (cluster_tt_status_lookup_exact(&key, &result) && result.authoritative
+				memset(&source_request, 0, sizeof(source_request));
+				source_request.key = &key;
+				found = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request,
+														 &source_result)
+						== CLUSTER_SEMANTIC_ADMISSION_OK
+					&& source_result.bool_value;
+				result = source_result.lookup;
+				if (found && result.authoritative
 					&& (result.status == CLUSTER_TT_STATUS_COMMITTED
 						|| result.status == CLUSTER_TT_STATUS_CLEANED_OUT)
 					&& SCN_VALID(result.commit_scn)) {

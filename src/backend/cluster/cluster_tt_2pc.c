@@ -216,8 +216,16 @@ cluster_tt_twophase_recover(TransactionId xid, uint16 info, void *recdata, uint3
 
 	for (j = 0; j < p.nsublinks; j++) {
 		const ClusterTT2PCSubLink *l = &p.sublinks[j];
+		ClusterTTStatusSourceRequest source_request;
+		ClusterTTStatusSourceResult source_result;
 
-		if (!cluster_tt_status_install_subcommitted(&l->child_key, &l->parent_key))
+		memset(&source_request, 0, sizeof(source_request));
+		source_request.key = &l->child_key;
+		source_request.parent_key = &l->parent_key;
+		if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED,
+										  &source_request, &source_result)
+				!= CLUSTER_SEMANTIC_ADMISSION_OK
+			|| !source_result.bool_value)
 			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 							errmsg("cannot rebuild SUBCOMMITTED overlay for prepared "
 								   "transaction %u (subxid %u)",
@@ -293,6 +301,8 @@ cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdat
 	for (i = 0; i < p.nbindings; i++) {
 		const ClusterTT2PCBinding *b = &p.bindings[i];
 		ClusterTTStatusKey key;
+		ClusterTTStatusSourceRequest source_request;
+		ClusterTTStatusSourceResult source_result;
 		uint16 origin_node_id;
 
 		if (!cluster_tt_2pc_binding_origin_node(b, &origin_node_id)) {
@@ -309,7 +319,14 @@ cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdat
 		key.cluster_epoch = b->cluster_epoch;
 		key.local_xid = b->xid;
 
-		if (!cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_IN_PROGRESS, InvalidScn)) {
+		memset(&source_request, 0, sizeof(source_request));
+		source_request.key = &key;
+		source_request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		source_request.commit_scn = InvalidScn;
+		if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &source_request,
+										  &source_result)
+				!= CLUSTER_SEMANTIC_ADMISSION_OK
+			|| !source_result.bool_value) {
 			/* capacity / shmem unavailable: degrade, do NOT PANIC the
 			 * standby; affected reads fail-closed 53R97 + we count it. */
 			cluster_vis_bump_recovery_overlay_rebuild_count();
@@ -323,8 +340,16 @@ cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdat
 
 	for (j = 0; j < p.nsublinks; j++) {
 		const ClusterTT2PCSubLink *l = &p.sublinks[j];
+		ClusterTTStatusSourceRequest source_request;
+		ClusterTTStatusSourceResult source_result;
 
-		if (!cluster_tt_status_install_subcommitted(&l->child_key, &l->parent_key)) {
+		memset(&source_request, 0, sizeof(source_request));
+		source_request.key = &l->child_key;
+		source_request.parent_key = &l->parent_key;
+		if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED,
+										  &source_request, &source_result)
+				!= CLUSTER_SEMANTIC_ADMISSION_OK
+			|| !source_result.bool_value) {
 			/* capacity / shmem unavailable: degrade, do NOT PANIC the
 			 * standby; affected reads fail-closed 53R97 + we count it. */
 			cluster_vis_bump_recovery_overlay_rebuild_count();
@@ -342,9 +367,20 @@ cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdat
 int
 cluster_tt_twophase_standby_commit_prepared(TransactionId xid, SCN commit_scn)
 {
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
+
 	if (!cluster_enabled || cluster_node_id < 0 || !SCN_VALID(commit_scn))
 		return 0;
-	return cluster_tt_status_resolve_prepared_commit(xid, commit_scn);
+
+	memset(&source_request, 0, sizeof(source_request));
+	source_request.xid = xid;
+	source_request.commit_scn = commit_scn;
+	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT,
+										&source_request, &source_result)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return 0;
+	return source_result.int_value;
 }
 
 
@@ -389,6 +425,9 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 	for (i = 0; i < p.nbindings; i++) {
 		const ClusterTT2PCBinding *b = &p.bindings[i];
 		ClusterTTStatusKey key;
+		ClusterTTStatusSourceRequest source_request;
+		ClusterTTStatusSourceResult source_result;
+		ClusterTTStatusHintSourceRequest hint_request;
 
 		memset(&key, 0, sizeof(key));
 		key.origin_node_id = (uint16)cluster_node_id;
@@ -401,8 +440,18 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 			cluster_tt_slot_durable_commit(b->undo_segment_id, b->slot_offset, b->xid, b->wrap,
 										   final_scn);
 			cluster_tt_slot_mark_committed(b->undo_segment_id, b->slot_offset, b->xid, final_scn);
-			(void)cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_COMMITTED, final_scn);
-			cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_COMMITTED, final_scn);
+			memset(&source_request, 0, sizeof(source_request));
+			source_request.key = &key;
+			source_request.status = CLUSTER_TT_STATUS_COMMITTED;
+			source_request.commit_scn = final_scn;
+			(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &source_request,
+													&source_result);
+			memset(&hint_request, 0, sizeof(hint_request));
+			hint_request.key = &key;
+			hint_request.status = CLUSTER_TT_STATUS_COMMITTED;
+			hint_request.commit_scn = final_scn;
+			(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
+													 &hint_request);
 		} else {
 			cluster_tt_slot_durable_abort(b->undo_segment_id, b->slot_offset, b->xid, b->wrap);
 			/*
@@ -418,8 +467,18 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 				cluster_tt_slot_durable_set_head(b->undo_segment_id, b->slot_offset, b->xid,
 												 b->wrap, p.heads[i]);
 			cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid);
-			(void)cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
-			cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+			memset(&source_request, 0, sizeof(source_request));
+			source_request.key = &key;
+			source_request.status = CLUSTER_TT_STATUS_ABORTED;
+			source_request.commit_scn = InvalidScn;
+			(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &source_request,
+													&source_result);
+			memset(&hint_request, 0, sizeof(hint_request));
+			hint_request.key = &key;
+			hint_request.status = CLUSTER_TT_STATUS_ABORTED;
+			hint_request.commit_scn = InvalidScn;
+			(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
+													 &hint_request);
 		}
 	}
 }
