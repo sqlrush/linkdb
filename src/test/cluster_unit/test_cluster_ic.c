@@ -34,6 +34,7 @@
 
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_rdma.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D6 stub — profiling gate */
 
 /*
@@ -555,7 +556,7 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * Bytes 8-11:   04 03 02 01            source_node_id = 0x01020304 (LE)
 	 * Bytes 12-13:  41 42                  "AB"
 	 * Bytes 14-35:  00..00                 cluster_name NUL pad
-	 * Bytes 36-39:  0E 00 00 00            capability bitmap (LE): the
+	 * Bytes 36-39:  FE 3F 00 00            capability bitmap (LE): the
 	 *                                      PROTOCOL capabilities advertised
 	 *                                      unconditionally by this binary --
 	 *                                      D4-6 authority-serve (0x2), D5-2
@@ -598,10 +599,11 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * authority flock (0x40) + ownership-gen ruling② invalidate BUSY
 	 * (0x80) + TT-lane undo-horizon idle sentinel (0x100) + PCM-X
 	 * conversion (0x200) + A' rebase V2 INSTALL_READY (0x400) + PCM-X
-	 * source-floor type49 V2 (0x800)
+	 * source-floor type49 V2 (0x800) + semantic activation (0x1000) +
+	 * R4 synchronous CR (0x2000)
 	 * (smart-fusion is off in this fixture) */
 	UT_ASSERT_EQ(wire[36], 0xFE);
-	UT_ASSERT_EQ(wire[37], 0x0F);
+	UT_ASSERT_EQ(wire[37], 0x3F);
 	UT_ASSERT_EQ(wire[38], 0x00);
 	UT_ASSERT_EQ(wire[39], 0x00);
 	/* remaining _pad must be all zero: a CONTROL-plane HELLO with
@@ -609,6 +611,52 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * compat pin -- plane byte 40 and epoch bytes 44-51 stay zero). */
 	for (i = 40; i < PGRAC_IC_HELLO_BYTES; i++)
 		UT_ASSERT_EQ(wire[i], 0);
+}
+
+/*
+ * R4 §2.6d: the existing HELLO V1 capability word advertises both the
+ * semantic-activation framework and the R4 synchronous-CR feature.  The
+ * literals are intentional here: this RED must not depend on declarations
+ * that have not landed yet, and the two accepted values are part of the
+ * wire contract rather than test-local aliases.
+ */
+UT_TEST(test_hello_r4_capabilities_preserve_v1_reference)
+{
+	static const uint8 reference_without_capabilities[PGRAC_IC_HELLO_BYTES] = {
+		[0] = 0x48, [1] = 0x4C, [2] = 0x4C,	 [3] = 0x4F,  [4] = 0x01, [6] = 0x01,
+		[8] = 0x04, [9] = 0x03, [10] = 0x02, [11] = 0x01, [12] = 'A', [13] = 'B',
+	};
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+	uint32 capabilities;
+	int i;
+
+	UT_ASSERT_EQ(sizeof(ClusterICHelloMsg), 64);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_BYTES, 64);
+	UT_ASSERT_EQ(offsetof(ClusterICHelloMsg, _pad), 36);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAPABILITIES_OFFSET, 36);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_PLANE_OFFSET, 40);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CONN_EPOCH_OFFSET, 44);
+
+	cluster_smart_fusion = false;
+	cluster_ic_suppress_caps_reply = false;
+	cluster_ic_suppress_gcs_done_cap = false;
+	cluster_ic_suppress_xid_flock_cap = false;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1,
+						   0x01020304, "AB", CLUSTER_IC_PLANE_CONTROL, 0);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	capabilities = cluster_ic_hello_capabilities(&parsed);
+	UT_ASSERT_EQ(capabilities & UINT32_C(0x00003000), UINT32_C(0x00003000));
+	UT_ASSERT_EQ(capabilities & ~UINT32_C(0x00003000), UINT32_C(0x00000FFE));
+
+	/* Every V1 reference byte outside the four-byte capability word is frozen. */
+	for (i = 0; i < PGRAC_IC_HELLO_BYTES; i++) {
+		if (i >= PGRAC_IC_HELLO_CAPABILITIES_OFFSET
+			&& i < PGRAC_IC_HELLO_CAPABILITIES_OFFSET + (int)sizeof(uint32))
+			continue;
+		UT_ASSERT_EQ(wire[i], reference_without_capabilities[i]);
+	}
 }
 
 /*
@@ -701,11 +749,12 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
 			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+			| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1);
 	/* Keep the aggregate word byte-exact as well as symbolically composed:
 	 * parallel protocol lanes have collided while preserving the same symbolic
 	 * expectation, so the literal catches accidental bit reuse. */
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), (uint32)0x00000FFEU);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), (uint32)0x00003FFEU);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -720,7 +769,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1 | PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2
 			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+			| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -735,7 +785,8 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_GCS_DONE_V1 | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
 			| PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2 | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1
 			| PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1
-			| PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1);
+			| PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1
+			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;
@@ -884,7 +935,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(24); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(25); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -904,6 +955,7 @@ main(void)
 	/* HELLO wire encode/decode + reference bytes (post-codex review) */
 	UT_RUN(test_hello_wire_roundtrip);
 	UT_RUN(test_hello_wire_reference_bytes);
+	UT_RUN(test_hello_r4_capabilities_preserve_v1_reference);
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);

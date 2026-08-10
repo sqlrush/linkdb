@@ -42,6 +42,11 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/clog.h"
+#include "access/subtrans.h"
+#include "access/transam.h"
+#include "access/twophase.h"
+#include "access/xlog.h"
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_cache.h"
 #include "cluster/cluster_cr_pool.h"
@@ -53,12 +58,357 @@
 #include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_sf_dep.h" /* peer HELLO D4-capability gate (D4-6) */
+#include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_authority.h" /* dead-owner serve authority (D4-4) */
 #include "cluster/cluster_undo_gcs.h"		/* cluster_undo_block_acquire_shared (D3-2) */
 #include "cluster/cluster_undo_resid.h"		/* cluster_undo_resid_encode (D3-2) */
+#include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_verdict.h"	/* verdict taxonomy + entry (D3-3/D3-4) */
 #include "cluster/cluster_undo_horizon.h"	/* D5-8 read admission (spec-5.22e) */
+#include "utils/snapmgr.h"
+
+static XidStatus
+cluster_runtime_visibility_direct_xid_status(TransactionId xid)
+{
+	XLogRecPtr xid_lsn;
+
+	return TransactionIdGetStatus(xid, &xid_lsn);
+}
+
+static bool
+cluster_runtime_visibility_direct_xid_committed(TransactionId xid)
+{
+	return cluster_runtime_visibility_direct_xid_status(xid) == TRANSACTION_STATUS_COMMITTED;
+}
+
+typedef struct ClusterRuntimeSubtransSample {
+	TransactionId xids[CLUSTER_R4_SUBTRANS_MAX_DEPTH];
+	int count;
+} ClusterRuntimeSubtransSample;
+
+/*
+ * Complete the native CLOG/pg_twophase/CLOG bracket for a live xid.  A
+ * terminal second CLOG observation always wins over the prepared predicate;
+ * callers still need an exact durable TT commit SCN before publishing a
+ * COMMITTED result.
+ */
+static XidStatus
+cluster_runtime_visibility_recheck_prepared(TransactionId xid, XidStatus first_status,
+											bool *prepared_out)
+{
+	bool prepared;
+	XidStatus second_status;
+
+	Assert(prepared_out != NULL);
+	*prepared_out = false;
+	if (first_status != TRANSACTION_STATUS_IN_PROGRESS)
+		return first_status;
+
+	prepared = TwoPhaseTransactionIdIsPrepared(xid);
+	second_status = cluster_runtime_visibility_direct_xid_status(xid);
+	if (second_status == TRANSACTION_STATUS_IN_PROGRESS)
+		*prepared_out = prepared;
+	return second_status;
+}
+
+/*
+ * Sample every immediate pg_subtrans edge, including the top->Invalid edge.
+ * SubTransGetParent() owns native SLRU locking and ERROR behavior; deliberately
+ * do not wrap it in PG_TRY, so physical I/O/corruption failures propagate.
+ */
+static bool
+cluster_runtime_visibility_sample_subtrans(TransactionId child,
+										   ClusterRuntimeSubtransSample *sample,
+										   ClusterTxResolveReason *reason_out)
+{
+	TransactionId current = child;
+	uint32 previous_distance = 0;
+	int depth;
+
+	Assert(sample != NULL);
+	Assert(reason_out != NULL);
+	memset(sample, 0, sizeof(*sample));
+
+	for (depth = 0; depth < CLUSTER_R4_SUBTRANS_MAX_DEPTH; depth++) {
+		TransactionId parent;
+		uint32 parent_distance;
+
+		if (TransactionIdPrecedes(current, TransactionXmin)) {
+			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			return false;
+		}
+
+		parent = SubTransGetParent(current);
+		sample->xids[depth] = current;
+		sample->count = depth + 1;
+
+		if (!TransactionIdIsValid(parent))
+			return true;
+		if (!TransactionIdIsNormal(parent)) {
+			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			return false;
+		}
+		parent_distance = (uint32)(child - parent);
+		if (parent_distance == 0 || parent_distance >= ((uint32)0x80000000U)
+			|| parent_distance <= previous_distance) {
+			*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_CYCLE;
+			return false;
+		}
+		previous_distance = parent_distance;
+		current = parent;
+	}
+
+	*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_DEPTH;
+	return false;
+}
+
+static bool
+cluster_runtime_visibility_recheck_subtrans(const ClusterRuntimeSubtransSample *sample,
+											ClusterTxResolveReason *reason_out)
+{
+	int i;
+
+	Assert(sample != NULL);
+	Assert(reason_out != NULL);
+	for (i = 0; i < sample->count; i++) {
+		TransactionId expected_parent;
+		TransactionId parent;
+
+		if (TransactionIdPrecedes(sample->xids[i], TransactionXmin)) {
+			*reason_out = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			return false;
+		}
+		parent = SubTransGetParent(sample->xids[i]);
+		expected_parent = i + 1 < sample->count ? sample->xids[i + 1] : InvalidTransactionId;
+		if (!TransactionIdEquals(parent, expected_parent)) {
+			*reason_out = CLUSTER_TX_RESOLVE_SUBTRANS_CHANGED;
+			return false;
+		}
+	}
+	return true;
+}
+
+/*
+ * R4 exact durable-origin provider boundary.  The consumer is now wired to
+ * this exact-locator surface, but target semantics remain fail-closed until
+ * the origin-side exact undo/TT/native-state producer and its V3 remote arm
+ * land.  The legacy xid-scan verdict path is intentionally not used here: it
+ * cannot prove or echo the caller-selected UBA/slot/wrap identity.
+ */
+ClusterTxOutcome
+cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
+											 ClusterTxResolveMode mode, uint64 formation_epoch,
+											 ClusterTxResolution *out,
+											 ClusterTxResolveReason *reason_out)
+{
+	PGAlignedBlock record_buf;
+	const UndoRecordHeader *record;
+	ClusterTxResolution candidate;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
+	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	ClusterLiveAuthority authority;
+	TTSlot exact_slot;
+	XidStatus native_status;
+	NodeId origin_node;
+	TransactionId top_xid;
+	size_t record_size;
+	SCN commit_scn = InvalidScn;
+	uint16 tt_slot_offset;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	memset(&candidate, 0, sizeof(candidate));
+	memset(&authority, 0, sizeof(authority));
+	memset(&exact_slot, 0, sizeof(exact_slot));
+
+	if (locator == NULL) {
+		reason = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
+		goto unknown;
+	}
+	if (out == NULL
+		|| (unsigned int)mode > (unsigned int)CLUSTER_TX_RESOLVE_CLEANOUT_HINT) {
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto unknown;
+	}
+	if (cluster_epoch_get_current() != formation_epoch) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto unknown;
+	}
+
+	origin_node = uba_origin_node_id(locator->uba);
+	if (origin_node == InvalidNodeId) {
+		reason = CLUSTER_TX_RESOLVE_BAD_UBA;
+		goto unknown;
+	}
+	if (cluster_node_id < 0 || origin_node != (NodeId)cluster_node_id) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		goto unknown;
+	}
+
+	record_size = cluster_undo_get_record(locator->uba, record_buf.data, sizeof(record_buf.data));
+	if (record_size < sizeof(UndoRecordHeader)) {
+		reason = CLUSTER_TX_RESOLVE_IO_ERROR;
+		goto unknown;
+	}
+	record = (const UndoRecordHeader *)record_buf.data;
+	if (!cluster_undo_record_validate_identity(locator, locator->uba, record, &reason))
+		goto unknown;
+
+	tt_slot_offset = cluster_tt_slot_id_to_offset(record->tt_slot_id);
+	top_xid = locator->xid;
+	if (cluster_tt_slot_durable_lookup_committed_stable(
+			record->tt_slot_segment_id, tt_slot_offset, locator->xid, locator->tt_wrap,
+			cluster_runtime_visibility_direct_xid_committed, &commit_scn)
+		&& SCN_VALID(commit_scn)) {
+		outcome = CLUSTER_TX_COMMITTED;
+	} else {
+		if (!cluster_tt_slot_durable_read_exact_stable(record->tt_slot_segment_id,
+													  tt_slot_offset, locator->xid,
+													  locator->tt_wrap, &exact_slot)) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			goto unknown;
+		}
+
+		native_status = cluster_runtime_visibility_direct_xid_status(locator->xid);
+		if ((exact_slot.status == TT_SLOT_COMMITTED
+			 && native_status == TRANSACTION_STATUS_ABORTED)
+			|| (exact_slot.status == TT_SLOT_ABORTED
+				&& native_status == TRANSACTION_STATUS_COMMITTED)) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+			goto unknown;
+		}
+		if (native_status == TRANSACTION_STATUS_ABORTED) {
+			outcome = CLUSTER_TX_ABORTED;
+			commit_scn = InvalidScn;
+		} else if (native_status == TRANSACTION_STATUS_SUB_COMMITTED) {
+			ClusterRuntimeSubtransSample subtrans;
+			bool prepared = false;
+
+			if (!cluster_runtime_visibility_sample_subtrans(locator->xid, &subtrans, &reason))
+				goto unknown;
+			top_xid = subtrans.xids[subtrans.count - 1];
+			native_status = cluster_runtime_visibility_direct_xid_status(top_xid);
+			native_status = cluster_runtime_visibility_recheck_prepared(top_xid,
+															native_status, &prepared);
+			if (!cluster_runtime_visibility_recheck_subtrans(&subtrans, &reason))
+				goto unknown;
+
+			proof_kind = CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP;
+			commit_scn = InvalidScn;
+			if (native_status == TRANSACTION_STATUS_COMMITTED) {
+				if (exact_slot.status == TT_SLOT_ABORTED) {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+					goto unknown;
+				}
+				/* No exact top locator/TT commit SCN is carried in this batch. */
+				reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+				goto unknown;
+			}
+			if (native_status == TRANSACTION_STATUS_ABORTED) {
+				if (exact_slot.status == TT_SLOT_COMMITTED) {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+					goto unknown;
+				}
+				outcome = CLUSTER_TX_ABORTED;
+			} else if (native_status == TRANSACTION_STATUS_IN_PROGRESS) {
+				if (prepared
+					&& (exact_slot.status == TT_SLOT_ACTIVE
+						|| exact_slot.status == TT_SLOT_ABORTED))
+					outcome = CLUSTER_TX_PREPARED;
+				else if (!prepared && exact_slot.status == TT_SLOT_ACTIVE)
+					outcome = CLUSTER_TX_IN_PROGRESS;
+				else {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+					goto unknown;
+				}
+			} else {
+				reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				goto unknown;
+			}
+		} else if (native_status == TRANSACTION_STATUS_IN_PROGRESS) {
+			bool prepared = false;
+
+			native_status = cluster_runtime_visibility_recheck_prepared(locator->xid, native_status,
+																		&prepared);
+			commit_scn = InvalidScn;
+			if (native_status == TRANSACTION_STATUS_COMMITTED) {
+				if (exact_slot.status == TT_SLOT_ABORTED) {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+					goto unknown;
+				}
+				/* Retry will acquire a stable exact TT/CLOG/TT commit sample. */
+				reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+				goto unknown;
+			}
+			if (native_status == TRANSACTION_STATUS_ABORTED) {
+				if (exact_slot.status == TT_SLOT_COMMITTED) {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_CONFLICT;
+					goto unknown;
+				}
+				outcome = CLUSTER_TX_ABORTED;
+			}
+			else if (native_status == TRANSACTION_STATUS_IN_PROGRESS) {
+				if (prepared
+					&& (exact_slot.status == TT_SLOT_ACTIVE
+						|| exact_slot.status == TT_SLOT_ABORTED)) {
+					outcome = CLUSTER_TX_PREPARED;
+					proof_kind = CLUSTER_TX_PROOF_ORIGIN_TWOPHASE;
+				} else if (!prepared && exact_slot.status == TT_SLOT_ACTIVE)
+					outcome = CLUSTER_TX_IN_PROGRESS;
+				else {
+					reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+					goto unknown;
+				}
+			} else {
+				reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				goto unknown;
+			}
+		} else if (native_status == TRANSACTION_STATUS_COMMITTED) {
+			/* A matching valid commit SCN was not proved by the stable helper. */
+			reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+			goto unknown;
+		} else {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			goto unknown;
+		}
+	}
+
+	authority.origin_epoch = cluster_epoch_get_current();
+	authority.live_hwm_lsn = GetFlushRecPtr(NULL);
+	authority.tt_generation = cluster_undo_tt_retention_rollover_count();
+	authority.authority_scn = cluster_scn_current();
+	if (authority.origin_epoch != formation_epoch
+		|| cluster_epoch_get_current() != authority.origin_epoch) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto unknown;
+	}
+	if (XLogRecPtrIsInvalid(authority.live_hwm_lsn) || !SCN_VALID(authority.authority_scn)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		goto unknown;
+	}
+
+	candidate.locator_echo = *locator;
+	candidate.top_xid = top_xid;
+	candidate.outcome = outcome;
+	candidate.proof_kind = proof_kind;
+	candidate.commit_scn = commit_scn;
+	candidate.authority = authority;
+	*out = candidate;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return outcome;
+
+unknown:
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return CLUSTER_TX_UNKNOWN;
+}
 
 /*
  * cluster_vis_live_authority_covers

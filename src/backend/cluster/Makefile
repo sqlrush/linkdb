@@ -165,6 +165,7 @@ OBJS = \
 	cluster_quorum_decision.o \
 	cluster_qvotec.o \
 	cluster_scn.o \
+	cluster_semantic_activation.o \
 	cluster_catalog_bootstrap.o \
 	cluster_catalog_migrate.o \
 	cluster_catalog_stats.o \
@@ -229,6 +230,7 @@ OBJS = \
 	cluster_tt_status.o \
 	cluster_tt_status_hint.o \
 	cluster_tx_enqueue.o \
+	cluster_tx_resolve.o \
 	cluster_subtrans.o \
 	cluster_multixact.o \
 	cluster_multixact_served.o \
@@ -255,6 +257,7 @@ OBJS = \
 	storage/cluster_pr_scsi.o \
 	storage/cluster_smgr.o \
 	storage/cluster_undo_alloc.o \
+	storage/cluster_undo_block0.o \
 	storage/cluster_undo_buf.o \
 	storage/cluster_undo_smgr.o \
 	storage/cluster_undo_xlog.o \

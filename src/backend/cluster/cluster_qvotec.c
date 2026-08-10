@@ -95,6 +95,7 @@
 #include "cluster/cluster_epoch.h"		 /* spec-4.12b D2/D5: current-epoch upper-bound Assert */
 #include "cluster/cluster_guc.h"		 /* cluster_enabled */
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_pgstat.h"			 /* cluster.qvotec.* counters */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.12b D2: applied-membership snapshot */
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b: region-5 scan + seed */
@@ -550,6 +551,138 @@ cluster_writes_currently_frozen(void)
  * ============================================================ */
 #include "cluster/cluster_voting_disk_io.h" /* fd open/close + format */
 
+static bool
+qvotec_pgsa_bytes_are_zero(const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	int i;
+
+	for (i = 0; i < CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES; i++) {
+		if (bytes[i] != 0)
+			return false;
+	}
+	return true;
+}
+
+static ClusterSemanticActivationResult
+qvotec_semantic_activation_record_cas_write_fds(
+	const int *fds, int n_disks, uint64 expected_generation,
+	uint64 expected_source_feature_bitmap,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	uint8 current_images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	bool current_valid[CLUSTER_MAX_VOTING_DISKS];
+	ClusterSemanticActivationRecord desired_record;
+	ClusterSemanticActivationRecord current_record;
+	int selected = -1;
+	int majority;
+	int i;
+
+	if (desired_bytes == NULL
+		|| !cluster_semantic_activation_record_decode(desired_bytes, &desired_record, NULL)
+		|| expected_generation == UINT64_MAX
+		|| desired_record.record_generation != expected_generation + 1)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	if (fds == NULL || n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS)
+		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+
+	memset(current_images, 0, sizeof(current_images));
+	memset(current_valid, 0, sizeof(current_valid));
+	majority = n_disks / 2 + 1;
+	for (i = 0; i < n_disks; i++) {
+		ClusterVotingDiskRawReadState read_state
+			= cluster_voting_disk_read_raw_tail_slot(fds[i], current_images[i]);
+
+		if (read_state == CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF) {
+			memset(current_images[i], 0, sizeof(current_images[i]));
+			current_valid[i] = true;
+		} else if (read_state == CLUSTER_VOTING_DISK_RAW_READ_FULL
+				   && (qvotec_pgsa_bytes_are_zero(current_images[i])
+					   || cluster_semantic_activation_record_decode(current_images[i],
+															   &current_record, NULL)))
+			current_valid[i] = true;
+	}
+
+	for (i = 0; i < n_disks; i++) {
+		int identical = 0;
+		int j;
+
+		if (!current_valid[i])
+			continue;
+		for (j = 0; j < n_disks; j++) {
+			if (current_valid[j]
+				&& memcmp(current_images[i], current_images[j],
+						  CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES)
+					   == 0)
+				identical++;
+		}
+		if (identical >= majority) {
+			selected = i;
+			break;
+		}
+	}
+	if (selected < 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+
+	if (memcmp(current_images[selected], desired_bytes,
+			   CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES)
+		== 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_OK;
+
+	memset(&current_record, 0, sizeof(current_record));
+	if (!qvotec_pgsa_bytes_are_zero(current_images[selected])
+		&& !cluster_semantic_activation_record_decode(current_images[selected], &current_record,
+														  NULL))
+		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+	if (current_record.record_generation != expected_generation
+		|| current_record.source_feature_bitmap != expected_source_feature_bitmap)
+		return CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT;
+
+	for (i = 0; i < n_disks; i++)
+		(void)cluster_voting_disk_write_raw_tail_slot(fds[i], desired_bytes);
+
+	{
+		int desired_count = 0;
+
+		for (i = 0; i < n_disks; i++) {
+			uint8 reread[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+
+			if (cluster_voting_disk_read_raw_tail_slot(fds[i], reread)
+					== CLUSTER_VOTING_DISK_RAW_READ_FULL
+				&& memcmp(reread, desired_bytes, sizeof(reread)) == 0)
+				desired_count++;
+		}
+		return desired_count >= majority ? CLUSTER_SEMANTIC_ACTIVATION_OK
+										   : CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+	}
+}
+
+ClusterSemanticActivationResult
+cluster_semantic_activation_record_cas_write(
+	uint64 expected_generation, uint64 expected_source_feature_bitmap,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	return qvotec_semantic_activation_record_cas_write_fds(
+		qvotec_fds, qvotec_n_disks, expected_generation, expected_source_feature_bitmap,
+		desired_bytes);
+}
+
+#ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
+extern ClusterSemanticActivationResult cluster_qvotec_test_semantic_activation_record_cas_write(
+	const int *fds, int n_disks, uint64 expected_generation,
+	uint64 expected_source_feature_bitmap,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES]);
+
+ClusterSemanticActivationResult
+cluster_qvotec_test_semantic_activation_record_cas_write(
+	const int *fds, int n_disks, uint64 expected_generation,
+	uint64 expected_source_feature_bitmap,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	return qvotec_semantic_activation_record_cas_write_fds(
+		fds, n_disks, expected_generation, expected_source_feature_bitmap, desired_bytes);
+}
+#endif
+
 static void
 qvotec_close_disks(void)
 {
@@ -875,6 +1008,7 @@ qvotec_apply_lease_cas(const ClusterAdgApplyMasterLease *desired, const uint8 *a
 static void
 qvotec_poll_once(void)
 {
+	ClusterSemanticActivationCasRequest semantic_record_cas_request;
 	ClusterVotingSlot self_slot;
 	ClusterVotingDiskIoState io_states[CLUSTER_MAX_VOTING_DISKS];
 	ClusterQuorumDecision decision;
@@ -901,6 +1035,17 @@ qvotec_poll_once(void)
 	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
 	uint64 durable_authority_epoch = 0; /* spec-4.12b D5/P1-1: highest durable fence */
 	bool durable_has_authority = false; /* epoch observed on disk THIS poll */
+
+	if (cluster_semantic_activation_qvotec_poll_record_cas(&semantic_record_cas_request)) {
+		ClusterSemanticActivationResult semantic_record_cas_result
+			= cluster_semantic_activation_record_cas_write(
+				semantic_record_cas_request.expected_generation,
+				semantic_record_cas_request.expected_source_feature_bitmap,
+				semantic_record_cas_request.desired_bytes);
+
+		(void)cluster_semantic_activation_qvotec_complete_record_cas(
+			semantic_record_cas_request.request_seq, semantic_record_cas_result);
+	}
 
 	now_us = (uint64)GetCurrentTimestamp();
 	next_lease_expire = now_us + (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;

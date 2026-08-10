@@ -1,0 +1,4 @@
+comment = 'Native transaction authority probes for PGRAC R4'
+default_version = '1.0'
+module_pathname = '$libdir/test_pgrac_r4_native_tx'
+relocatable = true

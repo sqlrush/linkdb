@@ -75,6 +75,7 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_sf_dep.h" /* ClusterSfDepVec / max origins */
+#include "cluster/cluster_tx_resolve.h"
 #include "storage/block.h"			/* BLCKSZ */
 #include "storage/buf_internals.h"	/* BufferTag, BufferDesc */
 
@@ -2324,6 +2325,832 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
 	return (SCN)v;
 }
 
+/* Stage 8 R4 keeps the legacy 64-byte prefixes and appends these exact
+ * byte-array extensions.  Multibyte fields are encoded explicitly little
+ * endian; no packed/native cast is a wire authority. */
+#define CLUSTER_R4_WIRE_VERSION ((uint8)1)
+#define CLUSTER_R4_FORWARD_EXTENDED ((uint8)6)
+
+typedef enum ClusterCrBuildResult {
+	CLUSTER_CR_BUILD_FULL = 0,
+	CLUSTER_CR_BUILD_RETRYABLE = 1,
+	CLUSTER_CR_BUILD_FAIL_CLOSED = 2
+} ClusterCrBuildResult;
+
+typedef enum ClusterCrBuildReason {
+	CLUSTER_CR_BUILD_NONE = 0,
+	CLUSTER_CR_BUILD_TARGET_DISABLED = 1,
+	CLUSTER_CR_BUILD_RF_DEFERRED = 2,
+	CLUSTER_CR_BUILD_WRONG_MASTER = 3,
+	CLUSTER_CR_BUILD_NO_HOLDER = 4,
+	CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS = 5,
+	CLUSTER_CR_BUILD_HOLDER_MOVED = 6,
+	CLUSTER_CR_BUILD_RECOVERING = 7,
+	CLUSTER_CR_BUILD_GENERATION_MISMATCH = 8,
+	CLUSTER_CR_BUILD_CAPACITY = 9,
+	CLUSTER_CR_BUILD_BAD_LOCATOR = 10,
+	CLUSTER_CR_BUILD_BAD_UNDO = 11,
+	CLUSTER_CR_BUILD_CHAIN_LIMIT = 12,
+	CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD = 13,
+	CLUSTER_CR_BUILD_EPOCH_MISMATCH = 14,
+	CLUSTER_CR_BUILD_CANCELLED = 15,
+	CLUSTER_CR_BUILD_IO_ERROR = 16,
+	CLUSTER_CR_BUILD_PROTOCOL = 17
+} ClusterCrBuildReason;
+
+/*
+ * Closed build-reason polarity.  Retryable reasons describe an operation
+ * whose durable block/transaction authority was not changed; data/protocol
+ * failures never acquire retry polarity by falling through an unknown enum.
+ */
+static inline ClusterCrBuildResult
+cluster_cr_build_result_for_reason(ClusterCrBuildReason reason)
+{
+	switch (reason) {
+		case CLUSTER_CR_BUILD_NONE:
+			return CLUSTER_CR_BUILD_FULL;
+		case CLUSTER_CR_BUILD_TARGET_DISABLED:
+		case CLUSTER_CR_BUILD_RF_DEFERRED:
+		case CLUSTER_CR_BUILD_WRONG_MASTER:
+		case CLUSTER_CR_BUILD_NO_HOLDER:
+		case CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS:
+		case CLUSTER_CR_BUILD_HOLDER_MOVED:
+		case CLUSTER_CR_BUILD_RECOVERING:
+		case CLUSTER_CR_BUILD_GENERATION_MISMATCH:
+		case CLUSTER_CR_BUILD_CAPACITY:
+		case CLUSTER_CR_BUILD_EPOCH_MISMATCH:
+			return CLUSTER_CR_BUILD_RETRYABLE;
+		case CLUSTER_CR_BUILD_BAD_LOCATOR:
+		case CLUSTER_CR_BUILD_BAD_UNDO:
+		case CLUSTER_CR_BUILD_CHAIN_LIMIT:
+		case CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD:
+		case CLUSTER_CR_BUILD_CANCELLED:
+		case CLUSTER_CR_BUILD_IO_ERROR:
+		case CLUSTER_CR_BUILD_PROTOCOL:
+			return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	}
+	return CLUSTER_CR_BUILD_FAIL_CLOSED;
+}
+
+typedef struct ClusterR4CrRouteProof {
+	BufferTag tag;
+	SCN read_scn;
+	uint64 formation_epoch;
+	uint64 activation_generation;
+	uint64 master_authority_generation;
+	uint64 master_resource_transition_count;
+	SCN expected_page_scn;
+	int32 real_master_node;
+	int32 selected_holder_node;
+} ClusterR4CrRouteProof;
+
+/*
+ * R4 D3 master-side policy over one coherent PCM snapshot.  NONE means one
+ * canonical current holder was selected.  This helper neither queries nor
+ * mutates authority; the production route wrapper supplies the one snapshot
+ * and consumes the typed refusal.
+ */
+static inline ClusterCrBuildReason
+cluster_r4_route_policy_classify(const PcmAuthoritySnapshot *authority, uint64 current_epoch,
+								 uint64 master_authority_generation,
+								 int32 *selected_holder_out)
+{
+	uint32 master_node;
+
+	if (selected_holder_out != NULL)
+		*selected_holder_out = -1;
+	if (authority == NULL || selected_holder_out == NULL)
+		return CLUSTER_CR_BUILD_PROTOCOL;
+	if (authority->reserved[0] != 0 || authority->reserved[1] != 0)
+		return CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
+	if (authority->pending_x_requester_node >= 0)
+		return CLUSTER_CR_BUILD_RECOVERING;
+	if (authority->pending_x_requester_node != -1 || authority->pending_x_since_lsn != 0)
+		return CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
+
+	master_node = authority->master_holder.node_id;
+	if (authority->state == PCM_STATE_N) {
+		if (authority->x_holder_node != -1 || authority->s_holders_bitmap != 0
+			|| master_node != UINT32_MAX)
+			return CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
+		return CLUSTER_CR_BUILD_NO_HOLDER;
+	}
+	if (authority->state == PCM_STATE_X) {
+		if (authority->x_holder_node < 0
+			|| authority->x_holder_node >= PCM_X_PROTOCOL_NODE_LIMIT
+			|| authority->s_holders_bitmap != 0
+			|| master_node != (uint32)authority->x_holder_node)
+			return CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
+		*selected_holder_out = authority->x_holder_node;
+	} else if (authority->state == PCM_STATE_S) {
+		if (authority->x_holder_node != -1 || authority->s_holders_bitmap == 0
+			|| master_node >= PCM_X_PROTOCOL_NODE_LIMIT
+			|| (authority->s_holders_bitmap & (UINT32_C(1) << master_node)) == 0)
+			return CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
+		*selected_holder_out = (int32)master_node;
+	} else
+		return CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
+
+	if ((uint32)master_authority_generation == 0
+		|| (uint32)(master_authority_generation >> 32) != (uint32)current_epoch
+		|| authority->transition_count == 0 || authority->transition_count == UINT64_MAX) {
+		*selected_holder_out = -1;
+		return CLUSTER_CR_BUILD_GENERATION_MISMATCH;
+	}
+	return CLUSTER_CR_BUILD_NONE;
+}
+
+/* Duplicate route work is reusable only while every master proof scalar and
+ * the selected canonical holder remain exact. */
+static inline bool
+cluster_r4_route_proof_matches(const ClusterR4CrRouteProof *armed, uint64 formation_epoch,
+							   uint64 master_authority_generation,
+							   int32 selected_holder_node,
+							   uint64 master_resource_transition_count,
+							   SCN expected_page_scn)
+{
+	return armed != NULL && selected_holder_node >= 0
+		   && selected_holder_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && armed->formation_epoch == formation_epoch
+		   && armed->master_authority_generation == master_authority_generation
+		   && armed->selected_holder_node == selected_holder_node
+		   && armed->master_resource_transition_count == master_resource_transition_count
+		   && armed->expected_page_scn == expected_page_scn;
+}
+
+/* R4 §3.8 closed operation policy.  These are process-local policy values,
+ * not wire, disk, shared-memory or SQL-visible ABI. */
+typedef enum ClusterR4OperationState {
+	CLUSTER_R4_STATE_INVALID = -1,
+	CLUSTER_R4_STATE_EMPTY = 0,
+	CLUSTER_R4_STATE_ROUTING,
+	CLUSTER_R4_STATE_FORWARDED,
+	CLUSTER_R4_STATE_BUILDING,
+	CLUSTER_R4_STATE_WAIT_UNDO,
+	CLUSTER_R4_STATE_REPLIED,
+	CLUSTER_R4_STATE_CONSUMED,
+	CLUSTER_R4_STATE_RETRYABLE,
+	CLUSTER_R4_STATE_FAIL_CLOSED,
+	CLUSTER_R4_STATE_CANCELLED,
+	CLUSTER_R4_STATE_COUNT
+} ClusterR4OperationState;
+
+typedef enum ClusterR4OperationEvent {
+	CLUSTER_R4_EVENT_VALID = 0,
+	CLUSTER_R4_EVENT_DUPLICATE,
+	CLUSTER_R4_EVENT_STALE,
+	CLUSTER_R4_EVENT_TIMEOUT,
+	CLUSTER_R4_EVENT_CANCEL,
+	CLUSTER_R4_EVENT_DEATH,
+	CLUSTER_R4_EVENT_RECONFIG,
+	CLUSTER_R4_EVENT_CAPACITY,
+	CLUSTER_R4_EVENT_MALFORMED,
+	CLUSTER_R4_EVENT_COUNT
+} ClusterR4OperationEvent;
+
+typedef enum ClusterR4TransitionOwner {
+	CLUSTER_R4_OWNER_REQUESTER = UINT32_C(1) << 0,
+	CLUSTER_R4_OWNER_REAL_MASTER = UINT32_C(1) << 1,
+	CLUSTER_R4_OWNER_HOLDER_LMON = UINT32_C(1) << 2,
+	CLUSTER_R4_OWNER_HOLDER_LMS = UINT32_C(1) << 3,
+	CLUSTER_R4_OWNER_ORIGIN = UINT32_C(1) << 4
+} ClusterR4TransitionOwner;
+
+typedef enum ClusterR4TransitionAction {
+	CLUSTER_R4_ACTION_ARM_BEFORE_SEND = 0,
+	CLUSTER_R4_ACTION_DROP,
+	CLUSTER_R4_ACTION_NO_SEND,
+	CLUSTER_R4_ACTION_RETRY,
+	CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+	CLUSTER_R4_ACTION_MASTER_FORWARD,
+	CLUSTER_R4_ACTION_REPLAY_ROUTE,
+	CLUSTER_R4_ACTION_CLOSE_ATTEMPT,
+	CLUSTER_R4_ACTION_CANCEL_ROUTE,
+	CLUSTER_R4_ACTION_STALE_ROUTE,
+	CLUSTER_R4_ACTION_HOLDER_STABLE_COPY,
+	CLUSTER_R4_ACTION_DROP_OR_REPLAY,
+	CLUSTER_R4_ACTION_CANCEL_SLOT,
+	CLUSTER_R4_ACTION_STALE_SLOT,
+	CLUSTER_R4_ACTION_REQUEST_UNDO_OR_PUBLISH,
+	CLUSTER_R4_ACTION_ABORT_SCRATCH,
+	CLUSTER_R4_ACTION_FAIL_DATA_PROTOCOL,
+	CLUSTER_R4_ACTION_EXACT_UNDO_REPLY,
+	CLUSTER_R4_ACTION_CONSUMER_CAS,
+	CLUSTER_R4_ACTION_DROP_RESULT,
+	CLUSTER_R4_ACTION_NEW_REQUEST,
+	CLUSTER_R4_ACTION_OVERALL_DEADLINE,
+	CLUSTER_R4_ACTION_CLEANUP,
+	CLUSTER_R4_ACTION_WAIT_TOPOLOGY,
+	CLUSTER_R4_ACTION_WAIT_ADMISSION,
+	CLUSTER_R4_ACTION_BACKOFF
+} ClusterR4TransitionAction;
+
+typedef struct ClusterR4TransitionCell {
+	ClusterR4OperationState next_state;
+	ClusterR4OperationState alternate_state;
+	uint32 owner_mask;
+	ClusterR4TransitionAction action;
+	const char *spec_action;
+} ClusterR4TransitionCell;
+
+#define CLUSTER_R4_ROUTE_OWNERS                                                                 \
+	(CLUSTER_R4_OWNER_REQUESTER | CLUSTER_R4_OWNER_REAL_MASTER)
+#define CLUSTER_R4_FORWARD_OWNERS                                                               \
+	(CLUSTER_R4_OWNER_REAL_MASTER | CLUSTER_R4_OWNER_HOLDER_LMON)
+#define CLUSTER_R4_UNDO_OWNERS                                                                  \
+	(CLUSTER_R4_OWNER_HOLDER_LMON | CLUSTER_R4_OWNER_HOLDER_LMS | CLUSTER_R4_OWNER_ORIGIN)
+#define CLUSTER_R4_CELL(next, alternate, owner, action, text)                                    \
+	{ (next), (alternate), (owner), (action), (text) }
+
+static inline const ClusterR4TransitionCell *
+cluster_r4_transition_lookup(ClusterR4OperationState state, ClusterR4OperationEvent event)
+{
+	static const ClusterR4TransitionCell
+		cluster_r4_transition_manifest[CLUSTER_R4_STATE_COUNT][CLUSTER_R4_EVENT_COUNT] = {
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_ARM_BEFORE_SEND,
+					"R/arm-before-send"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_NO_SEND, "K/no-send"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+					"X/FC(protocol)"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FORWARDED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_MASTER_FORWARD,
+					"F/master selects+forwards"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_REPLAY_ROUTE,
+					"R/replay same route"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_CLOSE_ATTEMPT,
+					"T/close attempt"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_CANCEL_ROUTE,
+					"K/cancel route"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_STALE_ROUTE,
+					"T/stale route"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+					"X/FC(protocol)"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_HOLDER_STABLE_COPY,
+					"B/holder stable copy"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FORWARDED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_DROP_OR_REPLAY,
+					"F/drop or replay"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_CLOSE_ATTEMPT,
+					"T/close attempt"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_CANCEL_SLOT,
+					"K/cancel slot"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_STALE_SLOT,
+					"T/stale slot"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+					"X/FC(protocol)"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_WAIT_UNDO, CLUSTER_R4_STATE_REPLIED,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_REQUEST_UNDO_OR_PUBLISH,
+					"U/request foreign undo or P/publish result"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_DROP, "B/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+					"T/abort scratch"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+					"K/abort scratch"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+					"T/abort scratch"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_FAIL_DATA_PROTOCOL,
+					"X/FC(data/protocol)"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_EXACT_UNDO_REPLY,
+					"B/exact undo reply"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_WAIT_UNDO, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_DROP, "U/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+					"T/abort scratch"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+					"K/abort scratch"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+					"T/abort scratch"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_FAIL_DATA_PROTOCOL,
+					"X/FC(data/protocol)"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CONSUMER_CAS,
+					"C/exact consumer CAS"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP_RESULT,
+					"K/drop result"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_NEW_REQUEST,
+					"R/new request id after typed close"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "T/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "T/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_OVERALL_DEADLINE,
+					"X/overall deadline"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CLEANUP, "K/cleanup"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_WAIT_TOPOLOGY,
+					"T/wait topology"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_WAIT_ADMISSION,
+					"T/wait admission"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_BACKOFF, "T/backoff"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+					"X/FC(protocol)"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CLEANUP, "X/cleanup"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+			},
+			{
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+			},
+		};
+
+	if (state < CLUSTER_R4_STATE_EMPTY || state >= CLUSTER_R4_STATE_COUNT
+		|| event < CLUSTER_R4_EVENT_VALID || event >= CLUSTER_R4_EVENT_COUNT)
+		return NULL;
+	return &cluster_r4_transition_manifest[state][event];
+}
+
+#undef CLUSTER_R4_CELL
+#undef CLUSTER_R4_UNDO_OWNERS
+#undef CLUSTER_R4_FORWARD_OWNERS
+#undef CLUSTER_R4_ROUTE_OWNERS
+
+extern const char *cluster_cr_build_reason_name(ClusterCrBuildReason reason);
+extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(
+	const BufferTag *tag, SCN read_scn, uint64 request_id, int32 requester_backend_id,
+	ClusterR4CrRouteProof *out, ClusterCrBuildReason *reason_out);
+
+typedef enum ClusterR4WireKind {
+	CLUSTER_R4_WIRE_CR_BUILD = 1,
+	CLUSTER_R4_WIRE_TX_RESOLVE = 2,
+	CLUSTER_R4_WIRE_MULTI_RESOLVE = 3,
+	CLUSTER_R4_WIRE_UNDO_DATA_FETCH = 4
+} ClusterR4WireKind;
+
+typedef struct ClusterR4RequestExtension {
+	uint8 r4_version;
+	uint8 r4_kind;
+	uint8 flags_le[2];
+	uint8 read_scn_le[8];
+	uint8 reserved[4];
+} ClusterR4RequestExtension;
+
+typedef union ClusterR4ForwardKindUnion {
+	uint8 locator_bytes[24];
+	struct {
+		uint8 master_authority_generation_le[8];
+		uint8 master_resource_transition_count_le[8];
+		uint8 expected_page_scn_le[8];
+	} cr;
+} ClusterR4ForwardKindUnion;
+
+typedef struct ClusterR4ForwardExtension {
+	uint8 r4_version;
+	uint8 r4_kind;
+	uint8 flags_le[2];
+	ClusterR4ForwardKindUnion kind;
+	uint8 subject_id_le[4];
+} ClusterR4ForwardExtension;
+
+StaticAssertDecl(sizeof(ClusterR4RequestExtension) == 16,
+				 "R4 request extension must remain 16 bytes");
+StaticAssertDecl(sizeof(ClusterR4ForwardKindUnion) == 24,
+				 "R4 forward kind union must remain 24 bytes");
+StaticAssertDecl(sizeof(ClusterR4ForwardExtension) == 32,
+				 "R4 forward extension must remain 32 bytes");
+StaticAssertDecl(offsetof(ClusterR4ForwardExtension,
+						 kind.cr.master_resource_transition_count_le)
+					 == 12,
+				 "R4 FORWARD96 transition count must occupy absolute bytes 76..83");
+
+static inline void
+ClusterR4WireWriteU16(uint8 out[2], uint16 value)
+{
+	out[0] = (uint8)value;
+	out[1] = (uint8)(value >> 8);
+}
+
+static inline uint16
+ClusterR4WireReadU16(const uint8 in[2])
+{
+	return (uint16)((uint16)in[0] | ((uint16)in[1] << 8));
+}
+
+static inline void
+ClusterR4WireWriteU32(uint8 out[4], uint32 value)
+{
+	int i;
+
+	for (i = 0; i < 4; i++)
+		out[i] = (uint8)(value >> (i * 8));
+}
+
+static inline uint32
+ClusterR4WireReadU32(const uint8 in[4])
+{
+	uint32 value = 0;
+	int i;
+
+	for (i = 0; i < 4; i++)
+		value |= (uint32)in[i] << (i * 8);
+	return value;
+}
+
+static inline void
+ClusterR4WireWriteU64(uint8 out[8], uint64 value)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		out[i] = (uint8)(value >> (i * 8));
+}
+
+static inline uint64
+ClusterR4WireReadU64(const uint8 in[8])
+{
+	uint64 value = 0;
+	int i;
+
+	for (i = 0; i < 8; i++)
+		value |= (uint64)in[i] << (i * 8);
+	return value;
+}
+
+static inline bool
+ClusterR4RequestExtensionSetCr(ClusterR4RequestExtension *extension, SCN read_scn)
+{
+	if (extension == NULL)
+		return false;
+	memset(extension, 0, sizeof(*extension));
+	if (!SCN_VALID(read_scn))
+		return false;
+	extension->r4_version = CLUSTER_R4_WIRE_VERSION;
+	extension->r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+	ClusterR4WireWriteU64(extension->read_scn_le, (uint64)read_scn);
+	return true;
+}
+
+static inline bool
+ClusterR4RequestExtensionGetCr(const ClusterR4RequestExtension *extension, SCN *read_scn_out)
+{
+	static const uint8 zero_flags[2] = { 0, 0 };
+	static const uint8 zero_reserved[4] = { 0, 0, 0, 0 };
+	SCN read_scn;
+
+	if (read_scn_out != NULL)
+		*read_scn_out = InvalidScn;
+	if (extension == NULL || read_scn_out == NULL
+		|| extension->r4_version != CLUSTER_R4_WIRE_VERSION
+		|| extension->r4_kind != CLUSTER_R4_WIRE_CR_BUILD
+		|| memcmp(extension->flags_le, zero_flags, sizeof(zero_flags)) != 0
+		|| memcmp(extension->reserved, zero_reserved, sizeof(zero_reserved)) != 0)
+		return false;
+
+	read_scn = (SCN)ClusterR4WireReadU64(extension->read_scn_le);
+	if (!SCN_VALID(read_scn))
+		return false;
+	*read_scn_out = read_scn;
+	return true;
+}
+
+static inline void
+ClusterR4ForwardExtensionSetCrProof(ClusterR4ForwardExtension *extension,
+									uint64 master_authority_generation,
+									uint64 master_resource_transition_count,
+									SCN expected_page_scn)
+{
+	if (extension == NULL)
+		return;
+	memset(extension, 0, sizeof(*extension));
+	extension->r4_version = CLUSTER_R4_WIRE_VERSION;
+	extension->r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+	ClusterR4WireWriteU64(extension->kind.cr.master_authority_generation_le,
+						  master_authority_generation);
+	ClusterR4WireWriteU64(extension->kind.cr.master_resource_transition_count_le,
+						  master_resource_transition_count);
+	ClusterR4WireWriteU64(extension->kind.cr.expected_page_scn_le,
+						  (uint64)expected_page_scn);
+}
+
+static inline bool
+ClusterR4ForwardExtensionGetCrProof(const ClusterR4ForwardExtension *extension,
+									uint64 formation_epoch,
+									uint64 *master_authority_generation_out,
+									uint64 *master_resource_transition_count_out,
+									SCN *expected_page_scn_out)
+{
+	static const uint8 zero_flags[2] = { 0, 0 };
+	static const uint8 zero_subject[4] = { 0, 0, 0, 0 };
+	uint64 master_generation;
+	uint64 transition_count;
+
+	if (master_authority_generation_out != NULL)
+		*master_authority_generation_out = 0;
+	if (master_resource_transition_count_out != NULL)
+		*master_resource_transition_count_out = 0;
+	if (expected_page_scn_out != NULL)
+		*expected_page_scn_out = InvalidScn;
+	if (extension == NULL || master_authority_generation_out == NULL
+		|| master_resource_transition_count_out == NULL || expected_page_scn_out == NULL
+		|| extension->r4_version != CLUSTER_R4_WIRE_VERSION
+		|| extension->r4_kind != CLUSTER_R4_WIRE_CR_BUILD
+		|| memcmp(extension->flags_le, zero_flags, sizeof(zero_flags)) != 0
+		|| memcmp(extension->subject_id_le, zero_subject, sizeof(zero_subject)) != 0)
+		return false;
+
+	master_generation
+		= ClusterR4WireReadU64(extension->kind.cr.master_authority_generation_le);
+	transition_count
+		= ClusterR4WireReadU64(extension->kind.cr.master_resource_transition_count_le);
+	if ((uint32)master_generation == 0
+		|| (uint32)(master_generation >> 32) != (uint32)formation_epoch
+		|| transition_count == 0 || transition_count == UINT64_MAX)
+		return false;
+
+	*master_authority_generation_out = master_generation;
+	*master_resource_transition_count_out = transition_count;
+	*expected_page_scn_out
+		= (SCN)ClusterR4WireReadU64(extension->kind.cr.expected_page_scn_le);
+	return true;
+}
+
+static inline bool
+ClusterR4ForwardExtensionSetLocator(ClusterR4ForwardExtension *extension,
+									ClusterR4WireKind kind,
+									const ClusterTxLocator *locator)
+{
+	if (extension != NULL)
+		memset(extension, 0, sizeof(*extension));
+	if (extension == NULL || locator == NULL
+		|| (kind != CLUSTER_R4_WIRE_TX_RESOLVE
+			&& kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH))
+		return false;
+
+	extension->r4_version = CLUSTER_R4_WIRE_VERSION;
+	extension->r4_kind = (uint8)kind;
+	ClusterR4WireWriteU64(&extension->kind.locator_bytes[0], locator->uba.raw[0]);
+	ClusterR4WireWriteU64(&extension->kind.locator_bytes[8], locator->uba.raw[1]);
+	ClusterR4WireWriteU32(&extension->kind.locator_bytes[16], (uint32)locator->xid);
+	ClusterR4WireWriteU16(&extension->kind.locator_bytes[20], locator->tt_wrap);
+	extension->kind.locator_bytes[22] = locator->itl_kind;
+	extension->kind.locator_bytes[23] = locator->itl_slot_index;
+	return true;
+}
+
+static inline bool
+ClusterR4ForwardExtensionGetLocator(const ClusterR4ForwardExtension *extension,
+									ClusterR4WireKind expected_kind,
+									ClusterTxLocator *locator_out)
+{
+	static const uint8 zero_flags[2] = { 0, 0 };
+	static const uint8 zero_subject[4] = { 0, 0, 0, 0 };
+	ClusterTxLocator decoded;
+
+	if (locator_out != NULL)
+		memset(locator_out, 0, sizeof(*locator_out));
+	if (extension == NULL || locator_out == NULL
+		|| (expected_kind != CLUSTER_R4_WIRE_TX_RESOLVE
+			&& expected_kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH)
+		|| extension->r4_version != CLUSTER_R4_WIRE_VERSION
+		|| extension->r4_kind != (uint8)expected_kind
+		|| memcmp(extension->flags_le, zero_flags, sizeof(zero_flags)) != 0
+		|| memcmp(extension->subject_id_le, zero_subject, sizeof(zero_subject)) != 0)
+		return false;
+
+	memset(&decoded, 0, sizeof(decoded));
+	decoded.uba.raw[0] = ClusterR4WireReadU64(&extension->kind.locator_bytes[0]);
+	decoded.uba.raw[1] = ClusterR4WireReadU64(&extension->kind.locator_bytes[8]);
+	decoded.xid = (TransactionId)ClusterR4WireReadU32(&extension->kind.locator_bytes[16]);
+	decoded.tt_wrap = ClusterR4WireReadU16(&extension->kind.locator_bytes[20]);
+	decoded.itl_kind = extension->kind.locator_bytes[22];
+	decoded.itl_slot_index = extension->kind.locator_bytes[23];
+	*locator_out = decoded;
+	return true;
+}
+
+#define CLUSTER_R4_TX_VERDICT_MAGIC UINT32_C(0x50475556)
+#define CLUSTER_R4_TX_VERDICT_VERSION UINT16_C(3)
+#define CLUSTER_R4_TX_VERDICT_HEADER_LEN UINT16_C(80)
+
+/*
+ * Exact V3 transaction-verdict payload carried at the head of a BLCKSZ reply
+ * page.  The page is encoded bytewise so compiler packing and host endian are
+ * never wire authority.  Bytes 80..BLCKSZ-1 are part of the canonical form
+ * and must remain zero.
+ */
+static inline bool
+ClusterR4TxVerdictPageEncode(uint8 page_out[BLCKSZ], const ClusterTxResolution *resolution)
+{
+	if (page_out != NULL)
+		memset(page_out, 0, BLCKSZ);
+	if (page_out == NULL || resolution == NULL
+		|| !cluster_tx_outcome_proof_is_valid(resolution->outcome, resolution->proof_kind))
+		return false;
+
+	ClusterR4WireWriteU32(&page_out[0], CLUSTER_R4_TX_VERDICT_MAGIC);
+	ClusterR4WireWriteU16(&page_out[4], CLUSTER_R4_TX_VERDICT_VERSION);
+	ClusterR4WireWriteU16(&page_out[6], CLUSTER_R4_TX_VERDICT_HEADER_LEN);
+	page_out[8] = (uint8)resolution->outcome;
+	page_out[9] = (uint8)resolution->proof_kind;
+	ClusterR4WireWriteU64(&page_out[12], resolution->locator_echo.uba.raw[0]);
+	ClusterR4WireWriteU64(&page_out[20], resolution->locator_echo.uba.raw[1]);
+	ClusterR4WireWriteU32(&page_out[28], (uint32)resolution->locator_echo.xid);
+	ClusterR4WireWriteU16(&page_out[32], resolution->locator_echo.tt_wrap);
+	page_out[34] = resolution->locator_echo.itl_kind;
+	page_out[35] = resolution->locator_echo.itl_slot_index;
+	ClusterR4WireWriteU32(&page_out[36], (uint32)resolution->top_xid);
+	ClusterR4WireWriteU64(&page_out[40], (uint64)resolution->commit_scn);
+	ClusterR4WireWriteU64(&page_out[48], (uint64)resolution->horizon_scn);
+	ClusterR4WireWriteU64(&page_out[56], resolution->authority.origin_epoch);
+	ClusterR4WireWriteU64(&page_out[64], resolution->authority.tt_generation);
+	ClusterR4WireWriteU64(&page_out[72], (uint64)resolution->authority.authority_scn);
+	return true;
+}
+
+static inline bool
+ClusterR4TxVerdictPageDecode(const uint8 page[BLCKSZ], const ClusterTxLocator *expected_locator,
+							 ClusterTxResolution *resolution_out)
+{
+	static const uint8 zero_tail[BLCKSZ - CLUSTER_R4_TX_VERDICT_HEADER_LEN] = { 0 };
+	ClusterTxResolution decoded;
+
+	if (resolution_out != NULL)
+		memset(resolution_out, 0, sizeof(*resolution_out));
+	if (page == NULL || expected_locator == NULL || resolution_out == NULL
+		|| ClusterR4WireReadU32(&page[0]) != CLUSTER_R4_TX_VERDICT_MAGIC
+		|| ClusterR4WireReadU16(&page[4]) != CLUSTER_R4_TX_VERDICT_VERSION
+		|| ClusterR4WireReadU16(&page[6]) != CLUSTER_R4_TX_VERDICT_HEADER_LEN
+		|| page[10] != 0 || page[11] != 0
+		|| memcmp(&page[CLUSTER_R4_TX_VERDICT_HEADER_LEN], zero_tail, sizeof(zero_tail)) != 0)
+		return false;
+
+	memset(&decoded, 0, sizeof(decoded));
+	decoded.outcome = (ClusterTxOutcome)page[8];
+	decoded.proof_kind = (ClusterTxProofKind)page[9];
+	if (!cluster_tx_outcome_proof_is_valid(decoded.outcome, decoded.proof_kind))
+		return false;
+
+	decoded.locator_echo.uba.raw[0] = ClusterR4WireReadU64(&page[12]);
+	decoded.locator_echo.uba.raw[1] = ClusterR4WireReadU64(&page[20]);
+	decoded.locator_echo.xid = (TransactionId)ClusterR4WireReadU32(&page[28]);
+	decoded.locator_echo.tt_wrap = ClusterR4WireReadU16(&page[32]);
+	decoded.locator_echo.itl_kind = page[34];
+	decoded.locator_echo.itl_slot_index = page[35];
+	if (decoded.locator_echo.uba.raw[0] != expected_locator->uba.raw[0]
+		|| decoded.locator_echo.uba.raw[1] != expected_locator->uba.raw[1]
+		|| decoded.locator_echo.xid != expected_locator->xid
+		|| decoded.locator_echo.tt_wrap != expected_locator->tt_wrap
+		|| decoded.locator_echo.itl_kind != expected_locator->itl_kind
+		|| decoded.locator_echo.itl_slot_index != expected_locator->itl_slot_index)
+		return false;
+
+	decoded.top_xid = (TransactionId)ClusterR4WireReadU32(&page[36]);
+	decoded.commit_scn = (SCN)ClusterR4WireReadU64(&page[40]);
+	decoded.horizon_scn = (SCN)ClusterR4WireReadU64(&page[48]);
+	decoded.authority.origin_epoch = ClusterR4WireReadU64(&page[56]);
+	decoded.authority.live_hwm_lsn = InvalidXLogRecPtr;
+	decoded.authority.tt_generation = ClusterR4WireReadU64(&page[64]);
+	decoded.authority.authority_scn = (SCN)ClusterR4WireReadU64(&page[72]);
+	*resolution_out = decoded;
+	return true;
+}
+
 /* PGRAC: spec-2.41 D1 — pure lost-write verdict (the detector's SCN decision).
  *
  *	Compares a master's expected pi_watermark_scn(tag) against a shipped page's
@@ -3159,7 +3986,11 @@ GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
 
 extern const char *cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-											  ClusterBufmgrGcsCopyRefusal *out_refusal);
+										  ClusterBufmgrGcsCopyRefusal *out_refusal);
+extern bool cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
+										XLogRecPtr *page_lsn_out, SCN *page_scn_out,
+										char *dst,
+										ClusterBufmgrGcsCopyRefusal *refusal_out);
 extern bool cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
 														 void **out_page_addr,
 														 BufferDesc **out_buf);

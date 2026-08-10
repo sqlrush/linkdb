@@ -38,6 +38,24 @@
 #include "cluster/cluster_itl_slot.h" /* UBA */
 #include "cluster/cluster_scn.h"	  /* SCN */
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Forward declarations for the R4 exact durable-origin provider.  The exact
+ * value domains and structures are defined by cluster_tx_resolve.h; keeping
+ * this provider on the runtime-visibility surface avoids making the D1
+ * consumer the durable evidence authority.
+ */
+typedef enum ClusterTxResolveMode ClusterTxResolveMode;
+typedef enum ClusterTxResolveReason ClusterTxResolveReason;
+typedef enum ClusterTxOutcome ClusterTxOutcome;
+typedef struct ClusterTxLocator ClusterTxLocator;
+typedef struct ClusterTxResolution ClusterTxResolution;
+
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode, uint64 formation_epoch,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
+#endif
+
 /*
  * Live authority triple, co-sampled by the origin LMS into the undo-block
  * reply (D-i1) so it is atomic with the undo/TT content it authorizes -- no

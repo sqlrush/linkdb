@@ -38,6 +38,7 @@
 #define CLUSTER_TX_ENQUEUE_H
 
 #include "cluster/cluster_tt_status.h" /* ClusterTTStatusKey */
+#include "cluster/cluster_tx_resolve.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -51,7 +52,9 @@ typedef enum ClusterTxwResult {
 	CLUSTER_TXW_DEAD_HOLDER,  /* holder node fenced / TT ABORTED — re-judge */
 	/* A PCM-X freeze made sleeping under another held content lock unsafe.
 	 * Process-local only: callers must retry/fail before any terminal handler. */
-	CLUSTER_TXW_RETRY
+	CLUSTER_TXW_RETRY,
+	/* Exact TARGET authority could not be proved; reason_out is non-NONE. */
+	CLUSTER_TXW_UNPROVABLE
 } ClusterTxwResult;
 
 /*
@@ -68,6 +71,15 @@ typedef enum ClusterTxwResult {
  */
 extern ClusterTxwResult cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key,
 												int effective_timeout_ms);
+
+/* R4 D9 exact TARGET wait.  The caller owns locator capture and mandatory
+ * post-wait page/tuple requalification; this layer never returns visibility. */
+extern ClusterTxwResult cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator,
+											  int effective_timeout_ms,
+											  ClusterTxResolveReason *reason_out);
+
+/* Idempotent R4 D9 SOURCE/TARGET-wait cleanup for proc_exit/FATAL paths. */
+extern void cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code, Datum arg);
 
 /*
  * cluster_txw_wake_waiters — wake every backend waiting on holder_key.

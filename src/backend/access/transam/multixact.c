@@ -1547,9 +1547,10 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
  * but passing a true means we can return quickly without checking for
  * old updates.
  */
-int
-GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members, bool from_pgupgrade,
-					  bool isLockOnly)
+static int
+GetMultiXactIdMembersInternal(MultiXactId multi, MultiXactMember **members, bool from_pgupgrade,
+						  bool isLockOnly, MultiXactOffset *start_offset_out,
+						  bool allow_cache)
 {
 	int pageno;
 	int prev_pageno;
@@ -1564,21 +1565,29 @@ GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members, bool from_pg
 	MultiXactId nextMXact;
 	MultiXactId tmpMXact;
 	MultiXactOffset nextOffset;
+	MultiXactOffset starting_offset;
 	MultiXactMember *ptr;
 
 	debug_elog3(DEBUG2, "GetMembers: asked for %u", multi);
+	if (start_offset_out != NULL)
+		*start_offset_out = 0;
 
 	if (!MultiXactIdIsValid(multi) || from_pgupgrade) {
 		*members = NULL;
 		return -1;
 	}
 
-	/* See if the MultiXactId is in the local cache */
-	length = mXactCacheGetById(multi, members);
-	if (length >= 0) {
-		debug_elog3(DEBUG2, "GetMembers: found %s in the cache",
-					mxid_to_string(multi, length, *members));
-		return length;
+	/* The ordinary API preserves its backend-local cache.  R4's generation-
+	 * bearing accessor deliberately bypasses it: a cached member array does
+	 * not carry the offsets-SLRU start offset that identifies this native
+	 * composition. */
+	if (allow_cache) {
+		length = mXactCacheGetById(multi, members);
+		if (length >= 0) {
+			debug_elog3(DEBUG2, "GetMembers: found %s in the cache",
+						mxid_to_string(multi, length, *members));
+			return length;
+		}
 	}
 
 	/* Set our OldestVisibleMXactId[] entry if we didn't already */
@@ -1665,6 +1674,7 @@ GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members, bool from_pg
 	offset = *offptr;
 
 	Assert(offset != 0);
+	starting_offset = offset;
 
 	/*
 	 * Use the same increment rule as GetNewMultiXactId(), that is, don't
@@ -1753,11 +1763,40 @@ GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members, bool from_pg
 	/*
 	 * Copy the result into the local cache.
 	 */
-	mXactCachePut(multi, truelength, ptr);
+	if (allow_cache)
+		mXactCachePut(multi, truelength, ptr);
 
 	debug_elog3(DEBUG2, "GetMembers: no cache for %s", mxid_to_string(multi, truelength, ptr));
+	if (start_offset_out != NULL)
+		*start_offset_out = starting_offset;
 	*members = ptr;
 	return truelength;
+}
+
+int
+GetMultiXactIdMembers(MultiXactId multi, MultiXactMember **members, bool from_pgupgrade,
+					  bool isLockOnly)
+{
+	return GetMultiXactIdMembersInternal(multi, members, from_pgupgrade, isLockOnly, NULL, true);
+}
+
+/*
+ * Return the native member array and its exact starting offsets-SLRU value.
+ * Unlike the ordinary API this never accepts a backend-local cache hit and
+ * does not populate that cache, so the returned generation and ordered
+ * members always originate in the same native read operation.
+ */
+int
+GetMultiXactIdMembersWithOffset(MultiXactId multi, MultiXactMember **members,
+								bool from_pgupgrade, bool isLockOnly,
+								MultiXactOffset *start_offset_out)
+{
+	if (members == NULL || start_offset_out == NULL)
+		return -1;
+	*members = NULL;
+	*start_offset_out = 0;
+	return GetMultiXactIdMembersInternal(multi, members, from_pgupgrade, isLockOnly,
+										 start_offset_out, false);
 }
 
 /*

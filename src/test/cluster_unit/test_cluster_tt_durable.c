@@ -70,6 +70,15 @@ scn_time_cmp(SCN a, SCN b)
 
 UT_DEFINE_GLOBALS();
 
+/*
+ * R4 D5 expected seam.  Keep the declaration test-local for the immutable
+ * RED: production does not acquire this API until the behavior below is
+ * frozen.
+ */
+extern bool cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
+											   TransactionId xid, uint16 expected_wrap,
+											   TTSlot *slot_out);
+
 
 /* ============================================================
  *	ereport / Assert stubs (cluster_tt_durable.c ereports on I/O fail)
@@ -122,6 +131,7 @@ static bool g_read_hdr_ok = true; /* read_header_bytes success flag */
 static TTSlot g_canned_slot_second;
 static bool g_read_hdr_second_enabled = false;
 static int g_read_hdr_calls = 0;
+static int g_read_hdr_fail_on_call = 0;
 
 static char g_canned_block[BLCKSZ];		  /* returned by read_block for segment 1 */
 static uint32 g_canned_block_segment = 1; /* which segment_id the canned block answers */
@@ -199,7 +209,9 @@ cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent pg_attribute_un
 									char *buf, uint32 len)
 {
 	g_read_hdr_calls++;
-	if (!g_read_hdr_ok || buf == NULL || len != sizeof(TTSlot))
+	if (!g_read_hdr_ok || (g_read_hdr_fail_on_call > 0
+						  && g_read_hdr_calls == g_read_hdr_fail_on_call)
+		|| buf == NULL || len != sizeof(TTSlot))
 		return false;
 	(void)offset;
 	memcpy(buf,
@@ -282,6 +294,7 @@ reset_header_read_mock(void)
 	g_read_hdr_ok = true;
 	g_read_hdr_second_enabled = false;
 	g_read_hdr_calls = 0;
+	g_read_hdr_fail_on_call = 0;
 	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
 	memset(&g_canned_slot_second, 0, sizeof(g_canned_slot_second));
 	g_commit_check_result = true;
@@ -484,6 +497,115 @@ UT_TEST(test_lookup_committed_stable_uncommitted_failclosed)
 				 0);
 	UT_ASSERT_EQ(g_read_hdr_calls, 1);
 	UT_ASSERT_EQ(g_commit_check_calls, 1);
+}
+
+/* ============================================================
+ *	R4 D5: exact durable TT identity snapshot (mocked smgr)
+ * ============================================================ */
+UT_TEST(test_read_exact_stable_accepts_known_status_and_preserves_32_bytes)
+{
+	static const uint8 known_statuses[] = {TT_SLOT_UNUSED, TT_SLOT_ACTIVE, TT_SLOT_COMMITTED,
+											 TT_SLOT_ABORTED, TT_SLOT_RECYCLABLE};
+	TTSlot got;
+	int i;
+
+	for (i = 0; i < lengthof(known_statuses); i++) {
+		reset_header_read_mock();
+		memset(&g_canned_slot, 0x5a, sizeof(g_canned_slot));
+		g_canned_slot.status = known_statuses[i];
+		g_canned_slot.xid = 100;
+		g_canned_slot.wrap = 5;
+		memset(&got, 0xa5, sizeof(got));
+
+		UT_ASSERT_EQ((int)cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 5, &got), 1);
+		UT_ASSERT_EQ(memcmp(&got, &g_canned_slot, sizeof(got)), 0);
+		UT_ASSERT_EQ(g_read_hdr_calls, 2);
+	}
+}
+UT_TEST(test_read_exact_stable_rejects_wrong_xid)
+{
+	TTSlot got;
+	TTSlot zero = {0};
+
+	reset_header_read_mock();
+	g_canned_slot.status = TT_SLOT_COMMITTED;
+	g_canned_slot.xid = 101;
+	g_canned_slot.wrap = 5;
+	memset(&got, 0xa5, sizeof(got));
+
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+}
+UT_TEST(test_read_exact_stable_rejects_wrong_wrap)
+{
+	TTSlot got;
+	TTSlot zero = {0};
+
+	reset_header_read_mock();
+	g_canned_slot.status = TT_SLOT_COMMITTED;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 6;
+	memset(&got, 0xa5, sizeof(got));
+
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+}
+UT_TEST(test_read_exact_stable_rejects_unknown_status)
+{
+	TTSlot got;
+	TTSlot zero = {0};
+
+	reset_header_read_mock();
+	g_canned_slot.status = 99;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 5;
+	memset(&got, 0xa5, sizeof(got));
+
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+}
+UT_TEST(test_read_exact_stable_rejects_torn_slot)
+{
+	TTSlot got;
+	TTSlot zero = {0};
+
+	reset_header_read_mock();
+	g_canned_slot.status = TT_SLOT_ABORTED;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 5;
+	g_canned_slot_second = g_canned_slot;
+	g_canned_slot_second.wrap = 6;
+	g_read_hdr_second_enabled = true;
+	memset(&got, 0xa5, sizeof(got));
+
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+	UT_ASSERT_EQ(g_read_hdr_calls, 2);
+}
+UT_TEST(test_read_exact_stable_rejects_either_io_failure)
+{
+	TTSlot got;
+	TTSlot zero = {0};
+
+	reset_header_read_mock();
+	g_canned_slot.status = TT_SLOT_ABORTED;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 5;
+	g_read_hdr_ok = false;
+	memset(&got, 0xa5, sizeof(got));
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+	UT_ASSERT_EQ(g_read_hdr_calls, 1);
+
+	reset_header_read_mock();
+	g_canned_slot.status = TT_SLOT_ABORTED;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 5;
+	g_read_hdr_fail_on_call = 2;
+	memset(&got, 0xa5, sizeof(got));
+	UT_ASSERT_EQ((int)cluster_tt_slot_durable_read_exact_stable(1, 0, 100, 5, &got), 0);
+	UT_ASSERT_EQ(memcmp(&got, &zero, sizeof(got)), 0);
+	UT_ASSERT_EQ(g_read_hdr_calls, 2);
 }
 
 
@@ -987,7 +1109,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(60);
+	UT_PLAN(66);
 
 	UT_RUN(test_layout_sizes);
 
@@ -1010,6 +1132,12 @@ main(int argc, char **argv)
 	UT_RUN(test_lookup_committed_stable_success);
 	UT_RUN(test_lookup_committed_stable_torn_read_failclosed);
 	UT_RUN(test_lookup_committed_stable_uncommitted_failclosed);
+	UT_RUN(test_read_exact_stable_accepts_known_status_and_preserves_32_bytes);
+	UT_RUN(test_read_exact_stable_rejects_wrong_xid);
+	UT_RUN(test_read_exact_stable_rejects_wrong_wrap);
+	UT_RUN(test_read_exact_stable_rejects_unknown_status);
+	UT_RUN(test_read_exact_stable_rejects_torn_slot);
+	UT_RUN(test_read_exact_stable_rejects_either_io_failure);
 
 	UT_RUN(test_by_xid_zero_match_miss);
 	UT_RUN(test_by_xid_one_match);

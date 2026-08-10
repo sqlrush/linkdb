@@ -59,6 +59,7 @@
 #include "cluster/cluster_qvotec.h"			 /* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_reconfig.h"		 /* QVOTEC-observed live peer incarnation */
 #include "cluster/cluster_recovery_merge.h"	 /* spec-4.7 D5 — recovered_through redo gate */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
 #include "cluster/cluster_xnode_profile.h"	 /* spec-5.59 D2/D3/D4 profiling buckets */
 #include "cluster/cluster_xnode_lever.h"	 /* spec-6.12a — downgrade counters */
@@ -1964,6 +1965,93 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 		return GCS_BLOCK_RECOVERING;
 	}
 	return GCS_BLOCK_NORMAL;
+}
+
+/* Stage 8 R4 D3: read one canonical master/current-holder route proof. */
+ClusterCrBuildResult
+cluster_gcs_block_r4_route_cr(const BufferTag *tag, SCN read_scn, uint64 request_id,
+							   int32 requester_backend_id, ClusterR4CrRouteProof *out,
+							   ClusterCrBuildReason *reason_out)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	PcmAuthoritySnapshot authority;
+	uint64 current_epoch;
+	uint64 master_authority_generation;
+	SCN expected_page_scn;
+	int32 real_master_node;
+	int32 current_holder_node = -1;
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+	ClusterCrBuildResult result;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_CR_BUILD_NONE;
+	memset(&admission, 0, sizeof(admission));
+
+	if (out == NULL || reason_out == NULL)
+		return CLUSTER_CR_BUILD_FAIL_CLOSED;
+
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		*reason_out = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
+						  ? CLUSTER_CR_BUILD_TARGET_DISABLED
+						  : CLUSTER_CR_BUILD_RF_DEFERRED;
+		return CLUSTER_CR_BUILD_RETRYABLE;
+	}
+
+	if (tag == NULL || !SCN_VALID(read_scn) || request_id == 0 || requester_backend_id <= 0
+		|| requester_backend_id > MaxBackends) {
+		reason = CLUSTER_CR_BUILD_PROTOCOL;
+		goto done;
+	}
+
+	current_epoch = cluster_epoch_get_current();
+	real_master_node = cluster_gcs_lookup_master(*tag);
+	if (real_master_node < 0 || real_master_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| cluster_node_id != real_master_node) {
+		reason = CLUSTER_CR_BUILD_WRONG_MASTER;
+		goto done;
+	}
+	if (cluster_gcs_block_phase_for_tag(*tag) == GCS_BLOCK_RECOVERING) {
+		reason = CLUSTER_CR_BUILD_RECOVERING;
+		goto done;
+	}
+
+	if (!cluster_pcm_lock_r4_route_snapshot(*tag, &authority,
+											&master_authority_generation,
+											&expected_page_scn)) {
+		reason = CLUSTER_CR_BUILD_NO_HOLDER;
+		goto done;
+	}
+	reason = cluster_r4_route_policy_classify(&authority, current_epoch,
+										  master_authority_generation,
+										  &current_holder_node);
+	if (reason != CLUSTER_CR_BUILD_NONE)
+		goto done;
+
+	if (!cluster_semantic_activation_recheck(&admission)) {
+		reason = CLUSTER_CR_BUILD_RF_DEFERRED;
+		goto done;
+	}
+
+	out->tag = *tag;
+	out->read_scn = read_scn;
+	out->formation_epoch = current_epoch;
+	out->activation_generation = admission.record_generation;
+	out->master_authority_generation = master_authority_generation;
+	out->master_resource_transition_count = authority.transition_count;
+	out->expected_page_scn = expected_page_scn;
+	out->real_master_node = real_master_node;
+	out->selected_holder_node = current_holder_node;
+
+done:
+	result = cluster_cr_build_result_for_reason(reason);
+	cluster_semantic_activation_leave(&admission);
+	*reason_out = reason;
+	return result;
 }
 
 /*

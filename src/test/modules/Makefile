@@ -26,6 +26,7 @@ SUBDIRS = \
 		  test_lfind \
 		  test_misc \
 		  test_oat_hooks \
+		  test_pgrac_r4_native_tx \
 		  test_parser \
 		  test_pg_dump \
 		  test_predtest \

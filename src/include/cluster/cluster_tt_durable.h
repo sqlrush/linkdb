@@ -38,6 +38,7 @@
 
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A set_head) */
 #include "cluster/cluster_scn.h"	  /* SCN */
+#include "cluster/cluster_tt_slot.h" /* TTSlot */
 
 /*
  * Pure decision predicates (no I/O) -- shared by the runtime lookup/redo paths
@@ -189,6 +190,18 @@ typedef bool (*ClusterTTDurableXidCommitCheck)(TransactionId xid);
 extern bool cluster_tt_slot_durable_lookup_committed_stable(
 	uint32 segment_id, uint16 slot_offset, TransactionId xid, uint32 expected_wrap,
 	ClusterTTDurableXidCommitCheck xid_committed, SCN *commit_scn);
+
+/*
+ * cluster_tt_slot_durable_read_exact_stable -- R4 D5 exact durable slot
+ * snapshot.  Reads the same 32-byte on-disk slot twice and publishes it only
+ * when both byte images are identical, the status is in the closed on-disk
+ * domain, and both images match the exact xid/wrap identity.  This API never
+ * scans by xid and never writes durable or shared state.  On every rejection,
+ * a non-NULL slot_out remains canonical zero.
+ */
+extern bool cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
+											   TransactionId xid, uint16 expected_wrap,
+											   TTSlot *slot_out);
 
 extern ClusterTTDurableResolve
 cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid,

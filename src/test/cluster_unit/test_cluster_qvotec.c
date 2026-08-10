@@ -52,11 +52,15 @@
  */
 #include "postgres.h"
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stddef.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "cluster/cluster_qvotec.h"
-#include "cluster/cluster_reconfig.h"	 /* ReconfigEvent for spec-4.12b D2 stub */
+#include "cluster/cluster_reconfig.h" /* ReconfigEvent for spec-4.12b D2 stub */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
 
 #undef printf
@@ -71,6 +75,31 @@
 #undef strerror_r
 
 #include "unit_test.h"
+
+#ifndef QVOTEC_SOURCE_PATH
+#error "QVOTEC_SOURCE_PATH must identify cluster_qvotec.c"
+#endif
+#ifndef LMON_SOURCE_PATH
+#error "LMON_SOURCE_PATH must identify cluster_lmon.c"
+#endif
+#ifndef SHMEM_SOURCE_PATH
+#error "SHMEM_SOURCE_PATH must identify cluster_shmem.c"
+#endif
+#ifndef SEMANTIC_SOURCE_PATH
+#error "SEMANTIC_SOURCE_PATH must identify cluster_semantic_activation.c"
+#endif
+#ifndef SEMANTIC_HEADER_PATH
+#error "SEMANTIC_HEADER_PATH must identify cluster_semantic_activation.h"
+#endif
+#ifndef CLUSTER_MAKEFILE_PATH
+#error "CLUSTER_MAKEFILE_PATH must identify the backend cluster Makefile"
+#endif
+
+/* Test-only linkage; deliberately absent from every product header/ABI. */
+extern ClusterSemanticActivationResult cluster_qvotec_test_semantic_activation_record_cas_write(
+	const int *fds, int n_disks, uint64 expected_generation,
+	uint64 expected_source_feature_bitmap,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES]);
 
 
 /* ============================================================
@@ -259,6 +288,7 @@ ProcessConfigFile(int context pg_attribute_unused())
 #include "cluster/cluster_adg.h"
 #include "cluster/cluster_mrp.h"
 
+#ifndef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 int
 cluster_voting_disk_open(const char *path pg_attribute_unused(),
 						 bool create_if_missing pg_attribute_unused())
@@ -311,6 +341,7 @@ cluster_voting_disk_write_apply_lease_global_slot(int fd pg_attribute_unused(),
 {
 	return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
 }
+#endif
 bool
 cluster_adg_apply_master_lease_valid(const ClusterAdgApplyMasterLease *lease pg_attribute_unused())
 {
@@ -653,8 +684,9 @@ cluster_reconfig_join_publish_proven(uint64 admitted_epoch pg_attribute_unused()
 {
 	return false;
 }
+#ifndef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 ClusterVotingDiskIoState cluster_voting_disk_read_join_slot(int fd, uint32 node_id,
-															void *out_slot512);
+																void *out_slot512);
 ClusterVotingDiskIoState
 cluster_voting_disk_read_join_slot(int fd pg_attribute_unused(),
 								   uint32 node_id pg_attribute_unused(),
@@ -662,18 +694,21 @@ cluster_voting_disk_read_join_slot(int fd pg_attribute_unused(),
 {
 	return CLUSTER_VOTING_DISK_IO_FAILED;
 }
+#endif
 uint64 cluster_epoch_get_current(void);
 uint64
 cluster_epoch_get_current(void)
 {
 	return 0;
 }
+#ifndef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 void
 cluster_voting_disk_io_install_timeout_handler(void)
 {}
 void
 cluster_voting_disk_io_set_timeout_ms(int timeout_ms pg_attribute_unused())
 {}
+#endif
 
 /* spec-2.6 Sprint A Step 3 D7 stub: postmaster spawn wrapper.
  * Real impl in postmaster.c (file-static StartChildProcess);unit
@@ -902,11 +937,509 @@ UT_TEST(test_collision_state_enum_values)
 	UT_ASSERT_EQ(CLUSTER_COLLISION_FATAL_NEWER_SELF, 2);
 }
 
+#define PGSA_TEST_DISKS 3
+
+typedef struct PgsaDiskSet {
+	int fds[PGSA_TEST_DISKS];
+	char paths[PGSA_TEST_DISKS][MAXPGPATH];
+} PgsaDiskSet;
+
+static void pgsa_disk_set_close(PgsaDiskSet *set);
+
+static bool
+pgsa_disk_set_open(PgsaDiskSet *set)
+{
+	int i;
+
+	memset(set, 0, sizeof(*set));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		set->fds[i] = -1;
+	for (i = 0; i < PGSA_TEST_DISKS; i++) {
+		int n = snprintf(set->paths[i], sizeof(set->paths[i]),
+						 "/tmp/pgrac-pgsa-%ld-%d-XXXXXX", (long)getpid(), i);
+
+		if (n < 0 || n >= (int)sizeof(set->paths[i]))
+			goto fail;
+		set->fds[i] = mkstemp(set->paths[i]);
+		if (set->fds[i] < 0
+			|| ftruncate(set->fds[i], CLUSTER_VOTING_FILE_BYTES_MIN) != 0)
+			goto fail;
+	}
+	return true;
+
+fail:
+	pgsa_disk_set_close(set);
+	return false;
+}
+
+static void
+pgsa_disk_set_close(PgsaDiskSet *set)
+{
+	int i;
+
+	for (i = 0; i < PGSA_TEST_DISKS; i++) {
+		if (set->fds[i] >= 0)
+			(void)close(set->fds[i]);
+		if (set->paths[i][0] != '\0')
+			(void)unlink(set->paths[i]);
+		set->fds[i] = -1;
+	}
+}
+
+static ClusterSemanticActivationRecord
+pgsa_record(ClusterSemanticActivationPhase phase, uint64 generation, uint64 source, uint64 target)
+{
+	ClusterSemanticActivationRecord record;
+
+	memset(&record, 0, sizeof(record));
+	record.source_feature_bitmap = source;
+	record.target_feature_bitmap = target;
+	record.transition_epoch = UINT64_C(0x101);
+	record.record_generation = generation;
+	record.admitted_members_lo = UINT64_C(0x0f);
+	record.capability_sample_digest = UINT64_C(0x202);
+	record.coordinator_incarnation = UINT64_C(0x303);
+	record.coordinator_node = 1;
+	record.phase = phase;
+	return record;
+}
+
+static bool
+pgsa_encode(ClusterSemanticActivationRecord record,
+			uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	memset(bytes, 0, CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES);
+	return cluster_semantic_activation_record_encode(&record, bytes);
+}
+
+static bool
+pgsa_write_image(int fd, const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	return cluster_voting_disk_write_raw_tail_slot(fd, bytes) == CLUSTER_VOTING_DISK_IO_OK;
+}
+
+static bool
+pgsa_read_image(int fd, uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	memset(bytes, 0, CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES);
+	return cluster_voting_disk_read_raw_tail_slot(fd, bytes)
+		   == CLUSTER_VOTING_DISK_RAW_READ_FULL;
+}
+
+static bool
+pgsa_snapshot(const PgsaDiskSet *set,
+			  uint8 images[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	int i;
+
+	for (i = 0; i < PGSA_TEST_DISKS; i++) {
+		if (!pgsa_read_image(set->fds[i], images[i]))
+			return false;
+	}
+	return true;
+}
+
+static bool
+pgsa_snapshot_matches(
+	const PgsaDiskSet *set,
+	const uint8 expected[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	uint8 actual[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_snapshot(set, actual))
+		return false;
+	for (i = 0; i < PGSA_TEST_DISKS; i++) {
+		if (memcmp(actual[i], expected[i], sizeof(actual[i])) != 0)
+			return false;
+	}
+	return true;
+}
+
+static int
+pgsa_count_image(const PgsaDiskSet *set,
+				 const uint8 expected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	uint8 actual[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int count = 0;
+	int i;
+
+	for (i = 0; i < PGSA_TEST_DISKS; i++) {
+		if (pgsa_read_image(set->fds[i], actual)
+			&& memcmp(actual, expected, sizeof(actual)) == 0)
+			count++;
+	}
+	return count;
+}
+
+static ClusterSemanticActivationResult
+pgsa_cas(const PgsaDiskSet *set, uint64 expected_generation, uint64 expected_source,
+		 const uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	return cluster_qvotec_test_semantic_activation_record_cas_write(
+		set->fds, PGSA_TEST_DISKS, expected_generation, expected_source, desired);
+}
+
+UT_TEST(test_pgsa_01_expected_majority_plus_stale_commits_desired)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 stale[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_PREPARE, 7, 0x11, 0x22),
+						  current));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 6, 0x11, 0x11), stale));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 8, 0x11, 0x22),
+						  desired));
+	UT_ASSERT(pgsa_write_image(set.fds[0], current));
+	UT_ASSERT(pgsa_write_image(set.fds[1], current));
+	UT_ASSERT(pgsa_write_image(set.fds[2], stale));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired), CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT(pgsa_count_image(&set, desired) >= 2);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_02_generation_mismatch_is_conflict_without_mutation)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 before[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 7, 0x11, 0x22),
+						  current));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 7, 0x22, 0x22), desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	UT_ASSERT(pgsa_snapshot(&set, before));
+	UT_ASSERT_EQ(pgsa_cas(&set, 6, 0x11, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT);
+	UT_ASSERT(pgsa_snapshot_matches(&set, before));
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_03_source_mismatch_is_conflict_without_mutation)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 before[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 7, 0x11, 0x22),
+						  current));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x22, 0x22), desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	UT_ASSERT(pgsa_snapshot(&set, before));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x44, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT);
+	UT_ASSERT(pgsa_snapshot_matches(&set, before));
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_04_commit_to_open_requires_explicit_prior_source)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 before[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 7, 0x11, 0x22),
+						  current));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x22, 0x22), desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	UT_ASSERT(pgsa_snapshot(&set, before));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x22, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT);
+	UT_ASSERT(pgsa_snapshot_matches(&set, before));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired), CLUSTER_SEMANTIC_ACTIVATION_OK);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_05_lost_completion_replay_is_idempotent_ok)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_PREPARE, 7, 0x11, 0x22),
+						  current));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 8, 0x11, 0x22),
+						  desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired), CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired), CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(pgsa_count_image(&set, desired), PGSA_TEST_DISKS);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_06_split_or_no_disks_holds_without_mutation)
+{
+	PgsaDiskSet set;
+	uint8 images[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 before[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	for (i = 0; i < PGSA_TEST_DISKS; i++) {
+		UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 7, 0x11,
+												 0x20 + (uint64)i),
+							  images[i]));
+		UT_ASSERT(pgsa_write_image(set.fds[i], images[i]));
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x22, 0x22), desired));
+	UT_ASSERT(pgsa_snapshot(&set, before));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	UT_ASSERT(pgsa_snapshot_matches(&set, before));
+	UT_ASSERT_EQ(cluster_qvotec_test_semantic_activation_record_cas_write(
+					 NULL, 0, 7, 0x11, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_07_postwrite_one_of_three_desired_holds)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_PREPARE, 7, 0x11, 0x22),
+						  current));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 8, 0x11, 0x22),
+						  desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	for (i = 1; i < PGSA_TEST_DISKS; i++) {
+		(void)close(set.fds[i]);
+		set.fds[i] = open(set.paths[i], O_RDONLY);
+		UT_ASSERT(set.fds[i] >= 0);
+	}
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	UT_ASSERT_EQ(pgsa_count_image(&set, desired), 1);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_08_clean_eof_zero_pair_accepts_generation_one)
+{
+	PgsaDiskSet set;
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 1, 0, 0), desired));
+	UT_ASSERT_EQ(pgsa_cas(&set, 0, 0, desired), CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(pgsa_count_image(&set, desired), PGSA_TEST_DISKS);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_09_invalid_desired_and_overflow_are_bad_state_no_mutation)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 invalid[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES] = { 0 };
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 before[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 7, 0x11, 0x11), current));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 1, 0x11, 0x11), desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	UT_ASSERT(pgsa_snapshot(&set, before));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, invalid),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(cluster_qvotec_test_semantic_activation_record_cas_write(
+					 set.fds, PGSA_TEST_DISKS, 7, 0x11, NULL),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(pgsa_cas(&set, UINT64_MAX, 0x11, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT(pgsa_snapshot_matches(&set, before));
+	pgsa_disk_set_close(&set);
+}
+
+static char *
+pgsa_read_source(const char *path)
+{
+	FILE *fp = fopen(path, "rb");
+	char *contents;
+	long length;
+
+	if (fp == NULL)
+		return NULL;
+	if (fseek(fp, 0, SEEK_END) != 0) {
+		fclose(fp);
+		return NULL;
+	}
+	length = ftell(fp);
+	if (length < 0 || fseek(fp, 0, SEEK_SET) != 0) {
+		fclose(fp);
+		return NULL;
+	}
+	contents = malloc((size_t)length + 1);
+	if (contents == NULL) {
+		fclose(fp);
+		return NULL;
+	}
+	if (fread(contents, 1, (size_t)length, fp) != (size_t)length) {
+		free(contents);
+		fclose(fp);
+		return NULL;
+	}
+	contents[length] = '\0';
+	fclose(fp);
+	return contents;
+}
+
+static int
+pgsa_count_substring(const char *source, const char *needle)
+{
+	int count = 0;
+	const char *cursor = source;
+
+	while (cursor != NULL && (cursor = strstr(cursor, needle)) != NULL) {
+		count++;
+		cursor += strlen(needle);
+	}
+	return count;
+}
+
+static bool
+pgsa_lmon_tick_order_is_exact(const char *source)
+{
+	const char *cursor = source;
+	int count = 0;
+
+	while ((cursor = strstr(cursor, "cluster_reconfig_lmon_tick();")) != NULL) {
+		const char *semantic = strstr(cursor, "cluster_semantic_activation_lmon_tick();");
+		const char *recovery = strstr(cursor, "cluster_grd_recovery_lmon_tick();");
+
+		if (semantic == NULL || (recovery != NULL && semantic > recovery))
+			return false;
+		count++;
+		cursor += strlen("cluster_reconfig_lmon_tick();");
+	}
+	return count == 2;
+}
+
+UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
+{
+	char *qvotec = pgsa_read_source(QVOTEC_SOURCE_PATH);
+	char *lmon = pgsa_read_source(LMON_SOURCE_PATH);
+	char *shmem = pgsa_read_source(SHMEM_SOURCE_PATH);
+	char *semantic = pgsa_read_source(SEMANTIC_SOURCE_PATH);
+	char *header = pgsa_read_source(SEMANTIC_HEADER_PATH);
+	char *makefile = pgsa_read_source(CLUSTER_MAKEFILE_PATH);
+	const char *submit;
+	const char *submit_end;
+
+	UT_ASSERT_NOT_NULL(qvotec);
+	UT_ASSERT_NOT_NULL(lmon);
+	UT_ASSERT_NOT_NULL(shmem);
+	UT_ASSERT_NOT_NULL(semantic);
+	UT_ASSERT_NOT_NULL(header);
+	UT_ASSERT_NOT_NULL(makefile);
+	if (qvotec != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(qvotec, "qvotec_semantic_activation_record_cas_write_fds"));
+		UT_ASSERT_NOT_NULL(strstr(qvotec, "cluster_semantic_activation_record_cas_write"));
+		UT_ASSERT_NOT_NULL(strstr(qvotec, "CLUSTER_QVOTEC_PGSA_UNIT_TEST"));
+		UT_ASSERT_NOT_NULL(
+			strstr(qvotec, "cluster_qvotec_test_semantic_activation_record_cas_write"));
+		UT_ASSERT_NOT_NULL(
+			strstr(qvotec, "cluster_semantic_activation_qvotec_poll_record_cas"));
+		UT_ASSERT_NOT_NULL(
+			strstr(qvotec, "cluster_semantic_activation_qvotec_complete_record_cas"));
+		UT_ASSERT_NULL(strstr(qvotec, "cluster_qvotec_set_semantic_activation_fds"));
+	}
+	if (lmon != NULL) {
+		UT_ASSERT_EQ(pgsa_count_substring(lmon, "cluster_semantic_activation_lmon_tick();"), 2);
+		UT_ASSERT(pgsa_lmon_tick_order_is_exact(lmon));
+	}
+	if (shmem != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(shmem, "pgrac cluster semantic activation"));
+		UT_ASSERT_NOT_NULL(strstr(shmem, ".owner_subsys = \"semantic_activation\""));
+		UT_ASSERT_NOT_NULL(strstr(shmem, "cluster_semantic_activation_shmem_size"));
+		UT_ASSERT_NOT_NULL(strstr(shmem, "cluster_semantic_activation_shmem_init"));
+	}
+	if (semantic != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(semantic, "semantic_activation_record_cas_mailbox_submit"));
+		UT_ASSERT_NOT_NULL(
+			strstr(semantic, "semantic_activation_record_cas_mailbox_poll_completion"));
+		UT_ASSERT_NOT_NULL(strstr(semantic, "pg_write_barrier();"));
+		UT_ASSERT_NOT_NULL(strstr(semantic, "pg_read_barrier();"));
+		submit = strstr(semantic, "cluster_semantic_activation_submit(");
+		submit_end = submit == NULL
+					 ? NULL
+					 : strstr(submit, "cluster_semantic_activation_r4_descriptor(");
+		UT_ASSERT_NOT_NULL(submit);
+		UT_ASSERT_NOT_NULL(submit_end);
+		if (submit != NULL && submit_end != NULL) {
+			const char *publication
+				= strstr(submit, "semantic_activation_record_cas_mailbox_submit(");
+
+			UT_ASSERT(publication == NULL || publication >= submit_end);
+		}
+	}
+	if (header != NULL)
+		UT_ASSERT_NULL(strstr(header, "cluster_qvotec_test_"));
+	if (makefile != NULL)
+		UT_ASSERT_NOT_NULL(strstr(makefile, "cluster_semantic_activation.o"));
+	free(qvotec);
+	free(lmon);
+	free(shmem);
+	free(semantic);
+	free(header);
+	free(makefile);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(24);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_shmem_size_128);
@@ -921,6 +1454,16 @@ main(void)
 	UT_RUN(test_quorum_state_enum_values);
 	UT_RUN(test_voting_disk_io_state_enum_values);
 	UT_RUN(test_collision_state_enum_values);
+	UT_RUN(test_pgsa_01_expected_majority_plus_stale_commits_desired);
+	UT_RUN(test_pgsa_02_generation_mismatch_is_conflict_without_mutation);
+	UT_RUN(test_pgsa_03_source_mismatch_is_conflict_without_mutation);
+	UT_RUN(test_pgsa_04_commit_to_open_requires_explicit_prior_source);
+	UT_RUN(test_pgsa_05_lost_completion_replay_is_idempotent_ok);
+	UT_RUN(test_pgsa_06_split_or_no_disks_holds_without_mutation);
+	UT_RUN(test_pgsa_07_postwrite_one_of_three_desired_holds);
+	UT_RUN(test_pgsa_08_clean_eof_zero_pair_accepts_generation_one);
+	UT_RUN(test_pgsa_09_invalid_desired_and_overflow_are_bad_state_no_mutation);
+	UT_RUN(test_pgsa_source_graph_and_test_linkage_are_exact);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

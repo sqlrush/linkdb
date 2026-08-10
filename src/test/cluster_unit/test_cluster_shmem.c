@@ -53,6 +53,7 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 
 /*
@@ -206,6 +207,16 @@ cluster_conf_load(void)
 {
 	/* Stub: real impl in src/backend/cluster/cluster_conf.c (stage 0.19) */
 }
+
+Size
+cluster_semantic_activation_shmem_size(void)
+{
+	return 0;
+}
+
+void
+cluster_semantic_activation_shmem_init(void)
+{}
 
 /* Forward decl to silence -Wmissing-prototypes. */
 extern void cluster_ic_init(void);

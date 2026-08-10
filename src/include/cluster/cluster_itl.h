@@ -112,6 +112,19 @@ extern bool cluster_itl_find_lock_tt_ref_by_xmax(Page page, TransactionId raw_xm
 												 ClusterUndoTTSlotRef *ref);
 
 /*
+ * Return the exact slot index selected by the canonical lock-only raw-xmax
+ * scan.  The caller holds the page content lock across this pure read.  On
+ * every failure, including malformed input or an ambiguous highest-wrap
+ * match, `*slot_index_out` is CLUSTER_ITL_SLOT_UNALLOCATED.
+ *
+ * This is the narrow owner surface used by R4 to pass the winning slot to
+ * cluster_tx_locator_from_itl() without reconstructing a locator from the
+ * reduced ClusterUndoTTSlotRef.
+ */
+extern bool cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId raw_xmax,
+												  uint8 *slot_index_out);
+
+/*
  * cluster_itl_find_multixact_origin_by_xmax (spec-3.6 v0.3 D7b NEW;OBS-2
  * buffer lock contract per L200 / spec-3.4d Hardening v1.0.1 F10 family).
  *

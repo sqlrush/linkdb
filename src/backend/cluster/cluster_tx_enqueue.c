@@ -40,6 +40,7 @@
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
@@ -61,15 +62,33 @@
 
 /*
  * A waiter slot is owned by exactly one backend (indexed by pgprocno).  The
- * owner writes holder_key first, then publishes by setting waiting = 1 with a
- * write barrier; the waker reads waiting with a read barrier before trusting
- * holder_key.  The slot LWLock serializes the scan against set/clear so the
- * key read is never torn.
+ * SOURCE owns the real TT key.  TARGET uses an opaque 24-byte, align-4 carrier
+ * and converts only through memcpy to an aligned local ClusterTxLocator.  A
+ * literal locator union would raise the slot alignment to 8 and grow every
+ * existing 28-byte slot, which is forbidden by the R4 D9 shmem ABI lock.
  */
+typedef union ClusterTxwIdentity {
+	ClusterTTStatusKey source_key;
+	uint32 target_locator_words[6];
+} ClusterTxwIdentity;
+
 typedef struct ClusterTxwWaitSlot {
-	ClusterTTStatusKey holder_key; /* full 24B exact identity (H1) */
-	uint32 waiting;				   /* 1 = owner backend is blocked */
+	ClusterTxwIdentity identity;
+	uint32 waiting; /* 0=FREE, 1=SOURCE key, 2=TARGET locator */
 } ClusterTxwWaitSlot;
+
+StaticAssertDecl(sizeof(ClusterTxwIdentity) == 24,
+				 "R4 D9 waiter identity must remain exactly 24 bytes");
+StaticAssertDecl(__alignof__(ClusterTxwIdentity) == 4,
+				 "R4 D9 waiter identity must remain align-4");
+StaticAssertDecl(sizeof(ClusterTxwWaitSlot) == 28,
+				 "R4 D9 waiter slot must remain exactly 28 bytes");
+StaticAssertDecl(__alignof__(ClusterTxwWaitSlot) == 4,
+				 "R4 D9 waiter slot must remain align-4");
+
+#define CLUSTER_TXW_SLOT_FREE 0
+#define CLUSTER_TXW_SLOT_SOURCE 1
+#define CLUSTER_TXW_SLOT_TARGET 2
 
 typedef struct ClusterTxwShmem {
 	LWLock lock; /* protects the slot scan / set / clear */
@@ -142,8 +161,8 @@ cluster_tx_enqueue_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTxw->wakeup_count, 0);
 		pg_atomic_init_u64(&ClusterTxw->timeout_count, 0);
 		for (i = 0; i < MaxBackends; i++) {
-			memset(&ClusterTxw->slots[i].holder_key, 0, sizeof(ClusterTTStatusKey));
-			ClusterTxw->slots[i].waiting = 0;
+			memset(&ClusterTxw->slots[i].identity, 0, sizeof(ClusterTxwIdentity));
+			ClusterTxw->slots[i].waiting = CLUSTER_TXW_SLOT_FREE;
 		}
 	}
 }
@@ -168,25 +187,207 @@ cluster_tx_enqueue_shmem_register(void)
  * Wait / wake.
  * ============================================================ */
 
-static void
+static bool
 txw_slot_set(int procno, const ClusterTTStatusKey *holder_key)
 {
+	bool registered = false;
+
 	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
-	if (ClusterTxw->slots[procno].waiting == 0)
+	if (ClusterTxw->slots[procno].waiting == CLUSTER_TXW_SLOT_FREE) {
+		ClusterTxw->slots[procno].identity.source_key = *holder_key;
+		ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_SOURCE;
 		pg_atomic_fetch_add_u32(&ClusterTxw->active_waiters, 1);
-	ClusterTxw->slots[procno].holder_key = *holder_key;
-	ClusterTxw->slots[procno].waiting = 1;
+		registered = true;
+	}
+	LWLockRelease(&ClusterTxw->lock);
+	return registered;
+}
+
+static bool
+txw_target_slot_set_if_free(int procno, const ClusterTxLocator *aligned_locator)
+{
+	bool registered = false;
+
+	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
+	if (ClusterTxw->slots[procno].waiting == CLUSTER_TXW_SLOT_FREE) {
+		memcpy(ClusterTxw->slots[procno].identity.target_locator_words, aligned_locator,
+			   sizeof(*aligned_locator));
+		ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_TARGET;
+		pg_atomic_fetch_add_u32(&ClusterTxw->active_waiters, 1);
+		registered = true;
+	}
+	LWLockRelease(&ClusterTxw->lock);
+	return registered;
+}
+
+static void
+txw_slot_clear(int procno, uint32 expected_kind)
+{
+	uint32 active;
+	uint32 current_kind;
+
+	Assert(expected_kind == CLUSTER_TXW_SLOT_SOURCE
+		   || expected_kind == CLUSTER_TXW_SLOT_TARGET);
+	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
+	current_kind = ClusterTxw->slots[procno].waiting;
+	if (current_kind == CLUSTER_TXW_SLOT_FREE) {
+		LWLockRelease(&ClusterTxw->lock);
+		return;
+	}
+	if (current_kind != expected_kind) {
+		LWLockRelease(&ClusterTxw->lock);
+		ereport(PANIC,
+				(errmsg("cluster TX waiter slot ownership changed during cleanup")));
+	}
+	active = pg_atomic_read_u32(&ClusterTxw->active_waiters);
+	if (active == 0) {
+		LWLockRelease(&ClusterTxw->lock);
+		ereport(PANIC,
+				(errmsg("cluster TX active waiter counter underflow during cleanup")));
+	}
+	ClusterTxw->slots[procno].waiting = CLUSTER_TXW_SLOT_FREE;
+	pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
+	LWLockRelease(&ClusterTxw->lock);
+}
+
+static uint32
+txw_slot_kind(int procno)
+{
+	uint32 kind;
+
+	LWLockAcquire(&ClusterTxw->lock, LW_SHARED);
+	kind = ClusterTxw->slots[procno].waiting;
+	LWLockRelease(&ClusterTxw->lock);
+	return kind;
+}
+
+static void
+txw_exit_slot_prevalidate(int procno, uint32 expected_kind)
+{
+	uint32 active;
+	uint32 current_kind;
+
+	Assert(expected_kind == CLUSTER_TXW_SLOT_SOURCE
+		   || expected_kind == CLUSTER_TXW_SLOT_TARGET);
+	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
+	current_kind = ClusterTxw->slots[procno].waiting;
+	if (current_kind != expected_kind) {
+		LWLockRelease(&ClusterTxw->lock);
+		ereport(PANIC,
+				(errmsg("cluster TX waiter slot ownership changed during backend-exit cleanup")));
+	}
+	active = pg_atomic_read_u32(&ClusterTxw->active_waiters);
+	if (active == 0) {
+		LWLockRelease(&ClusterTxw->lock);
+		ereport(PANIC,
+				(errmsg("cluster TX active waiter counter underflow during backend-exit cleanup")));
+	}
 	LWLockRelease(&ClusterTxw->lock);
 }
 
 static void
-txw_slot_clear(int procno)
+txw_exact_wfg_cancel(const ClusterLmdVertex *waiter)
 {
-	LWLockAcquire(&ClusterTxw->lock, LW_EXCLUSIVE);
-	if (ClusterTxw->slots[procno].waiting != 0)
-		pg_atomic_fetch_sub_u32(&ClusterTxw->active_waiters, 1);
-	ClusterTxw->slots[procno].waiting = 0;
-	LWLockRelease(&ClusterTxw->lock);
+	ClusterLmdGraphRemoveResult remove_result;
+
+	remove_result = cluster_lmd_graph_remove_edge_by_waiter_exact_result(waiter);
+	if (remove_result != CLUSTER_LMD_GRAPH_REMOVE_REMOVED
+		&& remove_result != CLUSTER_LMD_GRAPH_REMOVE_ABSENT)
+		ereport(PANIC,
+				(errmsg("cluster TX exact waiter identity became stale during cleanup")));
+}
+
+static void
+txw_exact_waiter_vertex(ClusterLmdVertex *waiter, int procno, uint64 formation_epoch,
+						TransactionId xid, uint64 wait_seq)
+{
+	memset(waiter, 0, sizeof(*waiter));
+	waiter->node_id = cluster_node_id;
+	waiter->procno = (uint32)procno;
+	waiter->cluster_epoch = formation_epoch;
+	waiter->request_id = 0;
+	waiter->xid = xid;
+	waiter->wait_seq = wait_seq;
+}
+
+static void
+txw_exact_cleanup(int procno, uint32 slot_kind, bool slot_registered,
+				  bool wait_state_published,
+				  bool wfg_registered, uint64 formation_epoch, TransactionId xid,
+				  uint64 wait_seq)
+{
+	if (wfg_registered) {
+		ClusterLmdVertex waiter;
+
+		txw_exact_waiter_vertex(&waiter, procno, formation_epoch, xid, wait_seq);
+		txw_exact_wfg_cancel(&waiter);
+	}
+	if (wait_state_published)
+		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+	if (slot_registered)
+		txw_slot_clear(procno, slot_kind);
+}
+
+/*
+ * Stack cleanup closes normal and ERROR exits from both wait paths, but
+ * proc_exit/FATAL abandons that C stack.  InitPostgres registers this
+ * callback while shared memory and MyProc are still available.  SOURCE and
+ * TARGET are the exact ownership discriminators; FREE remains a no-op.
+ *
+ * The owning backend cannot publish another wait while its exit callbacks
+ * run, and PGPROC reuse starts only after they finish.  Therefore the stable
+ * wait-state snapshot belongs to this SOURCE or TARGET slot.  Cancellation is
+ * safe even when exit happened between wait-state publication and WFG edge
+ * insertion because cancellation of an absent exact edge is idempotent.
+ */
+void
+cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code pg_attribute_unused(),
+												  Datum arg pg_attribute_unused())
+{
+	ClusterLmdWaitStateSnapshot wait_state;
+	ClusterLmdWaitStateReadResult read_result;
+	uint32 slot_kind;
+	int procno;
+
+	if (ClusterTxw == NULL || MyProc == NULL)
+		return;
+
+	procno = MyProc->pgprocno;
+	if (procno < 0 || procno >= ClusterTxw->nslots)
+		return;
+	slot_kind = txw_slot_kind(procno);
+	if (slot_kind == CLUSTER_TXW_SLOT_FREE)
+		return;
+	if (slot_kind != CLUSTER_TXW_SLOT_SOURCE && slot_kind != CLUSTER_TXW_SLOT_TARGET)
+		ereport(PANIC,
+				(errmsg("cluster TX waiter slot has invalid ownership discriminator during backend-exit cleanup")));
+
+	memset(&wait_state, 0, sizeof(wait_state));
+	read_result = cluster_lmd_wait_state_read_exact(&MyProc->cluster_lmd_wait, &wait_state);
+	if (read_result == CLUSTER_LMD_WAIT_STATE_READ_BUSY)
+		ereport(PANIC,
+				(errmsg("cluster TX waiter state remained busy during backend-exit cleanup")));
+	if (read_result == CLUSTER_LMD_WAIT_STATE_READ_ACTIVE) {
+		if (!wait_state.active || wait_state.kind != CLUSTER_LMD_WAIT_TX
+			|| wait_state.request_id != 0 || wait_state.wait_seq == 0)
+			ereport(PANIC,
+					(errmsg("cluster TX waiter state is malformed during backend-exit cleanup")));
+	}
+	else if (read_result != CLUSTER_LMD_WAIT_STATE_READ_INACTIVE)
+		ereport(PANIC,
+				(errmsg("cluster TX waiter state has unknown read result during backend-exit cleanup")));
+	txw_exit_slot_prevalidate(procno, slot_kind);
+
+	/* ACTIVE cleanup order is exact WFG edge, proc wait state, owned slot. */
+	if (read_result == CLUSTER_LMD_WAIT_STATE_READ_ACTIVE) {
+		ClusterLmdVertex waiter;
+
+		txw_exact_waiter_vertex(&waiter, procno, wait_state.cluster_epoch,
+						  wait_state.xid, wait_state.wait_seq);
+		txw_exact_wfg_cancel(&waiter);
+		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+	}
+	txw_slot_clear(procno, slot_kind);
 }
 
 ClusterTxwResult
@@ -217,10 +418,11 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 		return CLUSTER_TXW_TIMEOUT;
 	}
 
-	pg_atomic_fetch_add_u64(&ClusterTxw->wait_count, 1);
 	deadline = GetCurrentTimestamp() + (TimestampTz)effective_timeout_ms * 1000;
 
-	txw_slot_set(procno, holder_key);
+	if (!txw_slot_set(procno, holder_key))
+		return CLUSTER_TXW_UNPROVABLE;
+	pg_atomic_fetch_add_u64(&ClusterTxw->wait_count, 1);
 
 	/*
 	 * spec-5.8 D1d — publish the cluster wait-state so the LMD deadlock
@@ -233,8 +435,8 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	 * xid from the TT status key); its backend procno is not carried, so the
 	 * blocker is a placeholder (CLUSTER_LMD_TX_HOLDER_PROCNO) that the
 	 * coordinator resolves by (node, xid) against the holder's own waiter
-	 * vertex (T2).  Best-effort: a full edge table only loses a detection (the
-	 * finite timeout backstops), so it never fails the wait (Rule 8.A).
+		 * vertex (T2).  A full edge table fails admission closed: waiting without
+		 * the exact graph edge would make deadlock detection incomplete.
 	 */
 	{
 		uint64 wait_epoch = cluster_epoch_get_current();
@@ -260,8 +462,12 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 		blocker.request_id = 0;
 		blocker.xid = holder_key->local_xid;
 
-		(void)cluster_lmd_submit_wait_edge_real(&tx_wfg_waiter, &blocker, 0);
-		tx_wfg_registered = true;
+		tx_wfg_registered = cluster_lmd_submit_wait_edge_real(&tx_wfg_waiter, &blocker, 0);
+	}
+	if (!tx_wfg_registered) {
+		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+		txw_slot_clear(procno, CLUSTER_TXW_SLOT_SOURCE);
+		return CLUSTER_TXW_UNPROVABLE;
 	}
 
 	/*
@@ -314,19 +520,222 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 	}
 	PG_CATCH();
 	{
-		txw_slot_clear(procno);
-		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 		if (tx_wfg_registered)
-			cluster_lmd_cancel_wait_edge_real(&tx_wfg_waiter);
+			txw_exact_wfg_cancel(&tx_wfg_waiter);
+		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+		txw_slot_clear(procno, CLUSTER_TXW_SLOT_SOURCE);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 
-	txw_slot_clear(procno);
-	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 	if (tx_wfg_registered)
-		cluster_lmd_cancel_wait_edge_real(&tx_wfg_waiter);
+		txw_exact_wfg_cancel(&tx_wfg_waiter);
+	cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
+	txw_slot_clear(procno, CLUSTER_TXW_SLOT_SOURCE);
 	return result;
+}
+
+ClusterTxwResult
+cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_timeout_ms,
+						  ClusterTxResolveReason *reason_out)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason initial_reason = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
+	ClusterTxOutcome initial_outcome;
+	ClusterTxLocator target_locator;
+	PcmXQueueResult guard_result;
+	NodeId blocker_node;
+	TransactionId my_xid;
+	instr_time wait_started;
+	uint64 formation_epoch;
+	int procno;
+	volatile bool slot_registered = false;
+	volatile bool wait_state_published = false;
+	volatile bool wfg_registered = false;
+	volatile uint64 wait_seq = 0;
+	volatile ClusterTxwResult result = CLUSTER_TXW_UNPROVABLE;
+	volatile ClusterTxResolveReason final_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	Assert(AmRegularBackendProcess());
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
+
+	/* Admission/fixed-false ordering belongs to the exact resolver.  It must
+	 * run before this layer inspects a possibly malformed locator or shmem. */
+	memset(&resolution, 0, sizeof(resolution));
+	initial_outcome = cluster_tx_resolve_exact(locator, CLUSTER_TX_RESOLVE_ROW_WAIT, &resolution,
+										 &initial_reason);
+	if (initial_outcome == CLUSTER_TX_UNKNOWN) {
+		final_reason = initial_reason == CLUSTER_TX_RESOLVE_NONE
+						 ? CLUSTER_TX_RESOLVE_PROTOCOL
+						 : initial_reason;
+		goto done;
+	}
+	/* The exact resolver publishes a non-UNKNOWN outcome only with NONE. */
+	Assert(initial_reason == CLUSTER_TX_RESOLVE_NONE);
+	if (initial_outcome == CLUSTER_TX_COMMITTED || initial_outcome == CLUSTER_TX_ABORTED) {
+		result = CLUSTER_TXW_RESOLVED;
+		final_reason = CLUSTER_TX_RESOLVE_NONE;
+		goto done;
+	}
+	if (initial_outcome != CLUSTER_TX_IN_PROGRESS && initial_outcome != CLUSTER_TX_PREPARED) {
+		final_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto done;
+	}
+
+	if (ClusterTxw == NULL || MyProc == NULL) {
+		final_reason = CLUSTER_TX_RESOLVE_CAPACITY;
+		goto done;
+	}
+	procno = MyProc->pgprocno;
+	if (procno < 0 || procno >= ClusterTxw->nslots) {
+		final_reason = CLUSTER_TX_RESOLVE_CAPACITY;
+		goto done;
+	}
+
+	/* The first resolver proved locator well-formed before a live/prepared
+	 * result.  Copy into aligned process-local storage before using the
+	 * 24-byte opaque shmem carrier. */
+	memcpy(&target_locator, locator, sizeof(target_locator));
+	blocker_node = uba_origin_node_id(target_locator.uba);
+	if (!SCN_NODE_ID_VALID(blocker_node)) {
+		final_reason = CLUSTER_TX_RESOLVE_BAD_UBA;
+		goto done;
+	}
+
+	guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+	if (guard_result != PCM_X_QUEUE_OK) {
+		result = CLUSTER_TXW_RETRY;
+		final_reason = CLUSTER_TX_RESOLVE_NONE;
+		goto done;
+	}
+
+	if (effective_timeout_ms <= 0)
+		effective_timeout_ms = CLUSTER_TXW_DEFAULT_TIMEOUT_MS;
+	formation_epoch = cluster_epoch_get_current();
+	my_xid = GetTopTransactionIdIfAny();
+	INSTR_TIME_SET_CURRENT(wait_started);
+
+	PG_TRY();
+	{
+		do {
+			ClusterLmdVertex waiter;
+			ClusterLmdVertex blocker;
+
+			if (cluster_epoch_get_current() != formation_epoch) {
+				final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+				break;
+			}
+			if (!txw_target_slot_set_if_free(procno, &target_locator)) {
+				final_reason = CLUSTER_TX_RESOLVE_REENTRANT;
+				break;
+			}
+			slot_registered = true;
+			pg_atomic_fetch_add_u64(&ClusterTxw->wait_count, 1);
+
+			if (cluster_epoch_get_current() != formation_epoch) {
+				final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+				break;
+			}
+			wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait,
+											  CLUSTER_LMD_WAIT_TX, 0, formation_epoch, my_xid);
+			wait_state_published = true;
+			if (cluster_epoch_get_current() != formation_epoch) {
+				final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+				break;
+			}
+
+			txw_exact_waiter_vertex(&waiter, procno, formation_epoch, my_xid, (uint64)wait_seq);
+			memset(&blocker, 0, sizeof(blocker));
+			blocker.node_id = blocker_node;
+			blocker.procno = CLUSTER_LMD_TX_HOLDER_PROCNO;
+			blocker.cluster_epoch = formation_epoch;
+			blocker.request_id = 0;
+			blocker.xid = target_locator.xid;
+			if (!cluster_lmd_submit_wait_edge_real(&waiter, &blocker, 0)) {
+				final_reason = CLUSTER_TX_RESOLVE_CAPACITY;
+				break;
+			}
+			wfg_registered = true;
+			if (cluster_epoch_get_current() != formation_epoch) {
+				final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+				break;
+			}
+
+			for (;;) {
+				ClusterTxResolveReason current_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+				ClusterTxOutcome current_outcome;
+				instr_time elapsed;
+				instr_time now;
+				double elapsed_ms;
+				long wait_ms;
+
+				ResetLatch(MyLatch);
+				if (cluster_epoch_get_current() != formation_epoch) {
+					final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+					break;
+				}
+				memset(&resolution, 0, sizeof(resolution));
+				current_outcome = cluster_tx_resolve_exact(
+					&target_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, &resolution, &current_reason);
+				if (cluster_epoch_get_current() != formation_epoch) {
+					final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
+					break;
+				}
+
+				if (current_outcome == CLUSTER_TX_COMMITTED
+					|| current_outcome == CLUSTER_TX_ABORTED) {
+					result = CLUSTER_TXW_RESOLVED;
+					final_reason = CLUSTER_TX_RESOLVE_NONE;
+					break;
+				}
+				if (current_outcome == CLUSTER_TX_UNKNOWN) {
+					final_reason = current_reason == CLUSTER_TX_RESOLVE_NONE
+								 ? CLUSTER_TX_RESOLVE_PROTOCOL
+								 : current_reason;
+					break;
+				}
+				if ((current_outcome != CLUSTER_TX_IN_PROGRESS
+					 && current_outcome != CLUSTER_TX_PREPARED)
+					|| current_reason != CLUSTER_TX_RESOLVE_NONE) {
+					final_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+					break;
+				}
+
+				INSTR_TIME_SET_CURRENT(now);
+				elapsed = now;
+				INSTR_TIME_SUBTRACT(elapsed, wait_started);
+				elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+				if (elapsed_ms >= (double)effective_timeout_ms) {
+					result = CLUSTER_TXW_TIMEOUT;
+					final_reason = CLUSTER_TX_RESOLVE_TIMEOUT;
+					pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
+					break;
+				}
+
+				wait_ms = (long)((double)effective_timeout_ms - elapsed_ms);
+				if (wait_ms <= 0)
+					wait_ms = 1;
+				if (wait_ms > CLUSTER_TXW_TICK_MS)
+					wait_ms = CLUSTER_TXW_TICK_MS;
+				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								wait_ms, WAIT_EVENT_GES_TX_ENQUEUE_WAIT);
+				CHECK_FOR_INTERRUPTS();
+			}
+		} while (false);
+	}
+	PG_FINALLY();
+	{
+		txw_exact_cleanup(procno, CLUSTER_TXW_SLOT_TARGET, (bool)slot_registered,
+						  (bool)wait_state_published,
+						  (bool)wfg_registered, formation_epoch, my_xid, (uint64)wait_seq);
+	}
+	PG_END_TRY();
+
+done:
+	if (reason_out != NULL)
+		*reason_out = (ClusterTxResolveReason)final_reason;
+	return (ClusterTxwResult)result;
 }
 
 void
@@ -346,8 +755,8 @@ cluster_txw_wake_waiters(const ClusterTTStatusKey *holder_key)
 	LWLockAcquire(&ClusterTxw->lock, LW_SHARED);
 	nslots = ClusterTxw->nslots;
 	for (i = 0; i < nslots; i++) {
-		if (ClusterTxw->slots[i].waiting != 0
-			&& txw_key_equal(&ClusterTxw->slots[i].holder_key, holder_key)) {
+		if (ClusterTxw->slots[i].waiting == CLUSTER_TXW_SLOT_SOURCE
+			&& txw_key_equal(&ClusterTxw->slots[i].identity.source_key, holder_key)) {
 			pg_atomic_fetch_add_u64(&ClusterTxw->wakeup_count, 1);
 			SetLatch(&GetPGProcByNumber(i)->procLatch);
 		}

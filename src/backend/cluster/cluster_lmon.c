@@ -73,6 +73,7 @@
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h" /* cluster_hw_register_ic_msg_types (spec-5.7 D1) */
 #include "cluster/cluster_ko.h" /* cluster_ko_register_ic_msg_types (spec-5.7 D6) */
@@ -1331,6 +1332,7 @@ LmonMain(void)
 			cluster_node_remove_lmon_tick();
 
 			cluster_reconfig_lmon_tick();
+			cluster_semantic_activation_lmon_tick();
 
 			/*
 			 * spec-4.6 D1:  GRD recovery sequence (P0-P7) — consumes the
@@ -1992,6 +1994,7 @@ LmonMain(void)
 			cluster_node_remove_lmon_tick();
 
 			cluster_reconfig_lmon_tick();
+			cluster_semantic_activation_lmon_tick();
 			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
 			cluster_grd_recovery_lmon_tick();
 			cluster_gcs_block_pcm_x_formation_tick();

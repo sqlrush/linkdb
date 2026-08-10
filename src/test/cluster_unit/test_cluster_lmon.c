@@ -723,6 +723,11 @@ void
 cluster_reconfig_lmon_tick(void)
 {}
 
+void cluster_semantic_activation_lmon_tick(void);
+void
+cluster_semantic_activation_lmon_tick(void)
+{}
+
 /* spec-2.16 D8 L104 stub:  cluster_lmon.c calls cluster_grd_lmon_tick_
  * dead_sweep() each tick before reconfig_lmon_tick.  test_cluster_lmon
  * standalone doesn't link cluster_grd.o,  vacuous stub. */
