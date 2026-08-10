@@ -156,9 +156,9 @@ cluster_multixact_shmem_register(void)
 /* Public API                                                   */
 /* ------------------------------------------------------------ */
 
-bool
-cluster_multixact_member_overlay_install(const ClusterMultiXactKey *key, uint16 member_count,
-										 const ClusterMultiXactMember *members)
+static bool
+cluster_multixact_member_overlay_install_raw(const ClusterMultiXactKey *key, uint16 member_count,
+											 const ClusterMultiXactMember *members)
 {
 	ClusterMultiXactOverlayEntry *e;
 	bool found;
@@ -195,10 +195,10 @@ cluster_multixact_member_overlay_install(const ClusterMultiXactKey *key, uint16 
 	return true;
 }
 
-bool
-cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key,
-										ClusterMultiXactMemberOverlayResult *out,
-										int max_members_buf)
+static bool
+cluster_multixact_member_overlay_lookup_raw(const ClusterMultiXactKey *key,
+											ClusterMultiXactMemberOverlayResult *out,
+											int max_members_buf)
 {
 	const ClusterMultiXactOverlayEntry *e;
 	uint32 current_epoch;
@@ -260,9 +260,9 @@ cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key,
  *   exact key fields carried in ClusterMultiXactMember;  miss -> UNKNOWN
  *   per L199.
  */
-ClusterVisibilityDecision
-cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *overlay,
-									 const Snapshot snap)
+static ClusterVisibilityDecision
+cluster_multixact_resolve_visibility_raw(const ClusterMultiXactMemberOverlayResult *overlay,
+										 const Snapshot snap)
 {
 	uint16 i;
 
@@ -438,9 +438,9 @@ cluster_multixact_remote_xmax_ask_origin(uint16 origin_slot, MultiXactId mxid, S
  *	updater-multi, IN-12) the D3-b origin member-verdict ask decides.  See
  *	header; UNKNOWN always means fail closed at the caller.
  */
-ClusterVisibilityDecision
-cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snapshot snap,
-									  bool *overlay_hit)
+static ClusterVisibilityDecision
+cluster_multixact_remote_xmax_resolve_raw(uint16 origin_slot, MultiXactId mxid, Snapshot snap,
+										  bool *overlay_hit)
 {
 	ClusterMultiXactKey mxkey;
 	ClusterMultiXactMemberOverlayResult *mxres;
@@ -458,7 +458,8 @@ cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snap
 
 	mxres = (ClusterMultiXactMemberOverlayResult *)palloc0(resbuf_sz);
 
-	if (!cluster_multixact_member_overlay_lookup(&mxkey, mxres, CLUSTER_MULTIXACT_MAX_MEMBERS)) {
+	if (!cluster_multixact_member_overlay_lookup_raw(&mxkey, mxres,
+											 CLUSTER_MULTIXACT_MAX_MEMBERS)) {
 		pfree(mxres);
 		/* spec-7.1 D3-b: overlay miss -> ask the origin (banner). */
 		return cluster_multixact_remote_xmax_ask_origin(origin_slot, mxid, snap);
@@ -466,13 +467,13 @@ cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snap
 
 	if (overlay_hit)
 		*overlay_hit = true;
-	decision = cluster_multixact_resolve_visibility(mxres, snap);
+	decision = cluster_multixact_resolve_visibility_raw(mxres, snap);
 	pfree(mxres);
 	return decision;
 }
 
-uint16
-cluster_multixact_get_member_count(const ClusterMultiXactKey *key)
+static uint16
+cluster_multixact_get_member_count_raw(const ClusterMultiXactKey *key)
 {
 	const ClusterMultiXactOverlayEntry *e;
 	uint16 count = 0;
@@ -533,15 +534,15 @@ CLUSTER_MULTIXACT_GETTER(mxid_underivable_read_count)
  * legs in heapam_visibility.c (underivable read); atomics, no lock of
  * this module taken.
  */
-void
-cluster_multixact_note_halfspace_refuse(void)
+static void
+cluster_multixact_note_halfspace_refuse_raw(void)
 {
 	if (ClusterMultiXactState != NULL)
 		pg_atomic_fetch_add_u64(&ClusterMultiXactState->mxid_halfspace_refuse_count, 1);
 }
 
-void
-cluster_multixact_note_underivable_read(void)
+static void
+cluster_multixact_note_underivable_read_raw(void)
 {
 	if (ClusterMultiXactState != NULL)
 		pg_atomic_fetch_add_u64(&ClusterMultiXactState->mxid_underivable_read_count, 1);
@@ -561,9 +562,9 @@ void
 cluster_multixact_shmem_register(void)
 {}
 
-bool
-cluster_multixact_member_overlay_install(const ClusterMultiXactKey *key, uint16 member_count,
-										 const ClusterMultiXactMember *members)
+static bool
+cluster_multixact_member_overlay_install_raw(const ClusterMultiXactKey *key, uint16 member_count,
+											 const ClusterMultiXactMember *members)
 {
 	(void)key;
 	(void)member_count;
@@ -571,10 +572,10 @@ cluster_multixact_member_overlay_install(const ClusterMultiXactKey *key, uint16 
 	return false;
 }
 
-bool
-cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key,
-										ClusterMultiXactMemberOverlayResult *out,
-										int max_members_buf)
+static bool
+cluster_multixact_member_overlay_lookup_raw(const ClusterMultiXactKey *key,
+											ClusterMultiXactMemberOverlayResult *out,
+											int max_members_buf)
 {
 	(void)key;
 	(void)max_members_buf;
@@ -586,18 +587,18 @@ cluster_multixact_member_overlay_lookup(const ClusterMultiXactKey *key,
 	return false;
 }
 
-ClusterVisibilityDecision
-cluster_multixact_resolve_visibility(const ClusterMultiXactMemberOverlayResult *overlay,
-									 const Snapshot snap)
+static ClusterVisibilityDecision
+cluster_multixact_resolve_visibility_raw(const ClusterMultiXactMemberOverlayResult *overlay,
+										 const Snapshot snap)
 {
 	(void)overlay;
 	(void)snap;
 	return CLUSTER_VISIBILITY_UNKNOWN;
 }
 
-ClusterVisibilityDecision
-cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snapshot snap,
-									  bool *overlay_hit)
+static ClusterVisibilityDecision
+cluster_multixact_remote_xmax_resolve_raw(uint16 origin_slot, MultiXactId mxid, Snapshot snap,
+										  bool *overlay_hit)
 {
 	(void)origin_slot;
 	(void)mxid;
@@ -607,8 +608,8 @@ cluster_multixact_remote_xmax_resolve(uint16 origin_slot, MultiXactId mxid, Snap
 	return CLUSTER_VISIBILITY_UNKNOWN;
 }
 
-uint16
-cluster_multixact_get_member_count(const ClusterMultiXactKey *key)
+static uint16
+cluster_multixact_get_member_count_raw(const ClusterMultiXactKey *key)
 {
 	(void)key;
 	return 0;
@@ -634,12 +635,123 @@ CLUSTER_MULTIXACT_GETTER_STUB(resolve_visibility_count)
 CLUSTER_MULTIXACT_GETTER_STUB(mxid_halfspace_refuse_count)
 CLUSTER_MULTIXACT_GETTER_STUB(mxid_underivable_read_count)
 
-void
-cluster_multixact_note_halfspace_refuse(void)
+static void
+cluster_multixact_note_halfspace_refuse_raw(void)
 {}
 
-void
-cluster_multixact_note_underivable_read(void)
+static void
+cluster_multixact_note_underivable_read_raw(void)
 {}
 
 #endif /* USE_PGRAC_CLUSTER */
+
+static ClusterSemanticAdmissionResult
+cluster_multixact_source_dispatch_body(ClusterMultiXactSourceOp op,
+									   const ClusterMultiXactSourceRequest *request,
+									   ClusterMultiXactSourceResult *result)
+{
+	switch (op) {
+	case CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL:
+		if (request == NULL || request->key == NULL || request->members == NULL)
+			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		result->bool_value = cluster_multixact_member_overlay_install_raw(
+			request->key, request->member_count, request->members);
+		break;
+	case CLUSTER_MULTI_SOURCE_OVERLAY_LOOKUP:
+		if (request == NULL || request->key == NULL || request->overlay_out == NULL)
+			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		result->bool_value = cluster_multixact_member_overlay_lookup_raw(
+			request->key, request->overlay_out, request->max_members_buf);
+		if (result->bool_value)
+			result->member_count = request->overlay_out->member_count;
+		break;
+	case CLUSTER_MULTI_SOURCE_RESOLVE_VISIBILITY:
+		if (request == NULL || request->overlay_in == NULL || request->snapshot == NULL)
+			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		result->visibility
+			= cluster_multixact_resolve_visibility_raw(request->overlay_in, request->snapshot);
+		break;
+	case CLUSTER_MULTI_SOURCE_GET_MEMBER_COUNT:
+		if (request == NULL || request->key == NULL)
+			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		result->member_count = cluster_multixact_get_member_count_raw(request->key);
+		break;
+	case CLUSTER_MULTI_SOURCE_REMOTE_XMAX_RESOLVE:
+		if (request == NULL || request->snapshot == NULL)
+			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		result->visibility = cluster_multixact_remote_xmax_resolve_raw(
+			request->origin_slot, request->mxid, request->snapshot, &result->overlay_hit);
+		break;
+	case CLUSTER_MULTI_SOURCE_NOTE_HALFSPACE_REFUSE:
+		cluster_multixact_note_halfspace_refuse_raw();
+		break;
+	case CLUSTER_MULTI_SOURCE_NOTE_UNDERIVABLE_READ:
+		cluster_multixact_note_underivable_read_raw();
+		break;
+	default:
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	}
+
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+/*
+ * cluster_multixact_source_dispatch -- gate one legacy source operation.
+ *
+ * Inputs:
+ *	op: typed operation selector.
+ *	request: operation arguments; required pointers are checked after entry.
+ *	result: fixed result storage, canonical-zeroed before admission.
+ *
+ * Returns:
+ *	The semantic admission result.  OK means the fixed result is consumable.
+ *
+ * Side Effects:
+ *	On OK admission, invokes exactly one module-private source operation and
+ *	balances its admission token on normal and ERROR paths.
+ */
+ClusterSemanticAdmissionResult
+cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op,
+								  const ClusterMultiXactSourceRequest *request,
+								  ClusterMultiXactSourceResult *result)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterMultiXactSourceResult local_result;
+	ClusterSemanticAdmissionResult admission;
+	volatile bool caught_error = false;
+
+	memset(&token, 0, sizeof(token));
+	memset(&local_result, 0, sizeof(local_result));
+	if (result != NULL)
+		memset(result, 0, sizeof(*result));
+
+	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												  CLUSTER_SEMANTIC_SOURCE_SIDE, &token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return admission;
+
+	PG_TRY();
+	{
+		if (result == NULL)
+			admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		else
+			admission = cluster_multixact_source_dispatch_body(op, request, &local_result);
+
+		if (admission == CLUSTER_SEMANTIC_ADMISSION_OK) {
+			if (!cluster_semantic_activation_recheck(&token))
+				admission = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+			else
+				*result = local_result;
+		}
+	}
+	PG_CATCH();
+	{
+		caught_error = true;
+	}
+	PG_END_TRY();
+
+	cluster_semantic_activation_leave(&token);
+	if (caught_error)
+		PG_RE_THROW();
+	return admission;
+}
