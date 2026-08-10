@@ -54,6 +54,7 @@
 
 #include "c.h"
 #include "access/transam.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tt_status.h" /* ClusterTTStatus + ClusterTTStatusKey */
 
 /* Forward decl from cluster_ic_envelope.h (avoid heavy include in this
@@ -200,41 +201,6 @@ typedef ClusterTTStatusHintMsgV1 ClusterTTStatusHintMsg;
  */
 #define CLUSTER_IC_PRODUCER_TT_STATUS_HINT ((uint32)(1u << B_LMON))
 
-/*
- * Public API.
- *
- * cluster_tt_status_hint_emit:
- *	  enqueue a hint for cross-node propagation.  Caller is D4
- *	  xact.c commit/abort hook (spec-3.1 D5 install path) — caller
- *	  passes the EXACT key it just install_local'd (HC184:no raw-xid
- *	  rebuild).  Fire-and-forget;does not block commit hot path;
- *	  enqueue failure increments drop_invalid_count + WARNING.
- *
- * cluster_tt_status_hint_handle_envelope:
- *	  tier1 receiver dispatcher.  Validates per §3.2 (msg_version +
- *	  checksum + epoch + anti-spoof + reserved-zero + status range),
- *	  then install_local with msg.key directly.
- *
- * cluster_tt_status_hint_drain_outbound:
- *	  LMON drain entry point.  Iterates alive peers (3-gate) and
- *	  fanout each hint via tier1 send.  Only LMON calls this (HC185).
- */
-extern void cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status,
-										SCN commit_scn);
-
-/*
- * cluster_tt_status_hint_emit_subcommitted (spec-3.5 D3 NEW):
- *	  Emit a V3 SUBCOMMITTED hint with parent_key chain pointer.  Used by
- *	  spec-3.5 D7 xact.c CommitSubTransaction hook.  Caller MUST have
- *	  already installed local overlay via cluster_tt_status_install_subcommitted.
- *	  V3-only peers receive correctly;V1/V2 peers DROP (forward-compat).
- *	  Origin skips emit if no peer >= V3 (warn-only counter bump).
- */
-extern void cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
-													 const ClusterTTStatusKey *parent_key);
-extern void cluster_tt_status_hint_handle_envelope(const struct ClusterICEnvelope *env,
-												   const void *payload);
-extern void cluster_tt_status_hint_drain_outbound(void);
 extern void cluster_tt_status_hint_register_msg_type(void);
 
 /* Counters (spec-3.3 D9: 7 counters; +drop_v1_compat). */
@@ -298,16 +264,34 @@ StaticAssertDecl(sizeof(ClusterMultiXactHintOutboundEntry) == 6168,
 				 "V4 outbound entry = 24 + 256 × 24 (F3/F7)");
 
 /*
- * cluster_tt_status_hint_emit_multixact_overlay (spec-3.6 D4):
- *   Enqueue V4 sidecar emit for cross-node MultiXact member overlay
- *   broadcast.  Used by D5 multixact.c hook end of MultiXactIdCreate /
- *   Expand (local-all-member path).  Caller must have already installed
- *   local overlay via cluster_multixact_member_overlay_install.
- *   Sender member_count > GUC cap → fail-closed (no partial emit).
+ * ClusterTTStatusHintSourceOp -- dormant hint-source operations.
+ *
+ *	Every old hint producer and consumer enters the common semantic
+ *	activation gate through cluster_tt_status_hint_source_dispatch.
  */
-extern void cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key,
-														  uint16 member_count,
-														  const ClusterMultiXactMember *members);
+typedef enum ClusterTTStatusHintSourceOp {
+	CLUSTER_TT_HINT_SOURCE_EMIT = 0,
+	CLUSTER_TT_HINT_SOURCE_EMIT_SUBCOMMITTED = 1,
+	CLUSTER_TT_HINT_SOURCE_EMIT_MULTIXACT_OVERLAY = 2,
+	CLUSTER_TT_HINT_SOURCE_HANDLE_ENVELOPE = 3,
+	CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND = 4
+} ClusterTTStatusHintSourceOp;
+
+typedef struct ClusterTTStatusHintSourceRequest {
+	const ClusterTTStatusKey *key;
+	const ClusterTTStatusKey *parent_key;
+	ClusterTTStatus status;
+	SCN commit_scn;
+	const struct ClusterICEnvelope *env;
+	const void *payload;
+	const ClusterMultiXactKey *multi_key;
+	uint16 member_count;
+	const ClusterMultiXactMember *members;
+} ClusterTTStatusHintSourceRequest;
+
+extern ClusterSemanticAdmissionResult
+cluster_tt_status_hint_source_dispatch(ClusterTTStatusHintSourceOp op,
+									   const ClusterTTStatusHintSourceRequest *request);
 
 extern uint64 cluster_tt_status_hint_get_v4_drop_unknown_count(void);
 

@@ -57,6 +57,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tx_enqueue.h" /* spec-5.2 D6: wake TX-enqueue waiters */
 #include "cluster/cluster_tt_status.h"
@@ -118,6 +119,16 @@ typedef struct ClusterMultiXactHintOutboundRing {
 } ClusterMultiXactHintOutboundRing;
 
 static ClusterMultiXactHintOutboundRing *ClusterMultiXactHintOutbound = NULL;
+
+static void cluster_tt_status_hint_emit_raw(const ClusterTTStatusKey *key, ClusterTTStatus status,
+											SCN commit_scn);
+static void cluster_tt_status_hint_emit_subcommitted_raw(const ClusterTTStatusKey *child_key,
+														 const ClusterTTStatusKey *parent_key);
+static void cluster_tt_status_hint_emit_multixact_overlay_raw(
+	const ClusterMultiXactKey *key, uint16 member_count, const ClusterMultiXactMember *members);
+static void cluster_tt_status_hint_drain_outbound_raw(void);
+static void cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env,
+													   const void *payload);
 
 static Size
 v4_outbound_ring_size(int capacity)
@@ -217,12 +228,23 @@ cluster_tt_status_hint_shmem_register(void)
 /* IC msg type registration (HC185 producer mask)               */
 /* ------------------------------------------------------------ */
 
+static void
+cluster_tt_status_hint_handle_envelope_adapter(const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterTTStatusHintSourceRequest request;
+
+	memset(&request, 0, sizeof(request));
+	request.env = env;
+	request.payload = payload;
+	(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_HANDLE_ENVELOPE, &request);
+}
+
 static const ClusterICMsgTypeInfo cluster_tt_status_hint_msg_info = {
 	.msg_type = PGRAC_IC_MSG_TT_STATUS_HINT,
 	.name = "cluster_tt_status_hint",
 	.allowed_producer_mask = CLUSTER_IC_PRODUCER_TT_STATUS_HINT,
 	.broadcast_ok = true,
-	.handler = cluster_tt_status_hint_handle_envelope,
+	.handler = cluster_tt_status_hint_handle_envelope_adapter,
 };
 
 void
@@ -235,8 +257,9 @@ cluster_tt_status_hint_register_msg_type(void)
 /* emit path (D4 calls this from xact commit/abort hook)        */
 /* ------------------------------------------------------------ */
 
-void
-cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_scn)
+static void
+cluster_tt_status_hint_emit_raw(const ClusterTTStatusKey *key, ClusterTTStatus status,
+								SCN commit_scn)
 {
 	uint32 tail;
 	uint32 next_tail;
@@ -297,7 +320,7 @@ cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus statu
 }
 
 /*
- * cluster_tt_status_hint_emit_subcommitted (PGRAC spec-3.5 D3 NEW)
+ * cluster_tt_status_hint_emit_subcommitted_raw (PGRAC spec-3.5 D3 NEW)
  *
  *	  Enqueue a SUBCOMMITTED hint with parent_key chain pointer.  Emit
  *	  path is identical to V2 except the slot carries has_parent_key=1
@@ -305,9 +328,9 @@ cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus statu
  *	  must have installed local overlay via
  *	  cluster_tt_status_install_subcommitted() first.
  */
-void
-cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
-										 const ClusterTTStatusKey *parent_key)
+static void
+cluster_tt_status_hint_emit_subcommitted_raw(const ClusterTTStatusKey *child_key,
+											 const ClusterTTStatusKey *parent_key)
 {
 	uint32 tail;
 	uint32 next_tail;
@@ -351,16 +374,17 @@ cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
 }
 
 /*
- * cluster_tt_status_hint_emit_multixact_overlay (PGRAC spec-3.6 D4 NEW)
+ * cluster_tt_status_hint_emit_multixact_overlay_raw (PGRAC spec-3.6 D4 NEW)
  *
  *   Enqueue a V4 sidecar emit (multixact composition overlay) for LMON
  *   drain.  Sender member_count > GUC cap → fail-closed (no partial
  *   emit) + overflow counter.  Uses dedicated V4 sidecar outbound queue
  *   (does NOT pollute V2/V3 fixed ring).
  */
-void
-cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key, uint16 member_count,
-											  const ClusterMultiXactMember *members)
+static void
+cluster_tt_status_hint_emit_multixact_overlay_raw(const ClusterMultiXactKey *key,
+												  uint16 member_count,
+												  const ClusterMultiXactMember *members)
 {
 	uint32 tail;
 	uint32 next_tail;
@@ -419,8 +443,8 @@ cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key, ui
 /* LMON drain (L172 family — LMON-only HC185)                   */
 /* ------------------------------------------------------------ */
 
-void
-cluster_tt_status_hint_drain_outbound(void)
+static void
+cluster_tt_status_hint_drain_outbound_raw(void)
 {
 	if (ClusterTTHintOutbound == NULL || ClusterTTHintCounters == NULL)
 		return;
@@ -532,8 +556,8 @@ cluster_tt_status_hint_drain_outbound(void)
 /* receiver path                                                */
 /* ------------------------------------------------------------ */
 
-void
-cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void *payload)
+static void
+cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const void *payload)
 {
 	uint16 msg_version;
 	uint16 status_raw;
@@ -812,6 +836,92 @@ cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void 
 	pg_atomic_fetch_add_u64(&ClusterTTHintCounters->install_count, 1);
 }
 
+/*
+ * cluster_tt_status_hint_source_request_valid -- Validate an admitted op.
+ *
+ *	The caller has already acquired SOURCE admission.  This ordering keeps
+ *	all request reads behind the common semantic activation gate.
+ */
+static bool
+cluster_tt_status_hint_source_request_valid(ClusterTTStatusHintSourceOp op,
+											const ClusterTTStatusHintSourceRequest *request)
+{
+	switch (op) {
+	case CLUSTER_TT_HINT_SOURCE_EMIT:
+		return request != NULL && request->key != NULL;
+	case CLUSTER_TT_HINT_SOURCE_EMIT_SUBCOMMITTED:
+		return request != NULL && request->key != NULL && request->parent_key != NULL;
+	case CLUSTER_TT_HINT_SOURCE_EMIT_MULTIXACT_OVERLAY:
+		return request != NULL && request->multi_key != NULL && request->members != NULL;
+	case CLUSTER_TT_HINT_SOURCE_HANDLE_ENVELOPE:
+		return request != NULL && request->env != NULL && request->payload != NULL;
+	case CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND:
+		return true;
+	}
+	return false;
+}
+
+/*
+ * cluster_tt_status_hint_source_dispatch -- Admit one dormant hint op.
+ *
+ *	Admission precedes every request read and every queue, counter or
+ *	transport mutation.  A caught backend error is copied, admission is
+ *	released through the common funnel, and the original error is rethrown.
+ */
+ClusterSemanticAdmissionResult
+cluster_tt_status_hint_source_dispatch(ClusterTTStatusHintSourceOp op,
+									   const ClusterTTStatusHintSourceRequest *request)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult result;
+	ErrorData *volatile error_data = NULL;
+
+	result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+											   CLUSTER_SEMANTIC_SOURCE_SIDE, &admission);
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return result;
+
+	if (!cluster_tt_status_hint_source_request_valid(op, request))
+		result = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	else {
+		PG_TRY();
+		{
+			switch (op) {
+			case CLUSTER_TT_HINT_SOURCE_EMIT:
+				cluster_tt_status_hint_emit_raw(request->key, request->status, request->commit_scn);
+				break;
+			case CLUSTER_TT_HINT_SOURCE_EMIT_SUBCOMMITTED:
+				cluster_tt_status_hint_emit_subcommitted_raw(request->key, request->parent_key);
+				break;
+			case CLUSTER_TT_HINT_SOURCE_EMIT_MULTIXACT_OVERLAY:
+				cluster_tt_status_hint_emit_multixact_overlay_raw(
+					request->multi_key, request->member_count, request->members);
+				break;
+			case CLUSTER_TT_HINT_SOURCE_HANDLE_ENVELOPE:
+				cluster_tt_status_hint_handle_envelope_raw(request->env, request->payload);
+				break;
+			case CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND:
+				cluster_tt_status_hint_drain_outbound_raw();
+				break;
+			}
+		}
+		PG_CATCH();
+		{
+			error_data = CopyErrorData();
+			FlushErrorState();
+		}
+		PG_END_TRY();
+
+		if (error_data == NULL && !cluster_semantic_activation_recheck(&admission))
+			result = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+	}
+
+	cluster_semantic_activation_leave(&admission);
+	if (error_data != NULL)
+		ReThrowError((ErrorData *)error_data);
+	return result;
+}
+
 /* ------------------------------------------------------------ */
 /* counter getters                                              */
 /* ------------------------------------------------------------ */
@@ -852,31 +962,13 @@ void
 cluster_tt_status_hint_shmem_register(void)
 {}
 
-void
-cluster_tt_status_hint_emit(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_scn)
+ClusterSemanticAdmissionResult
+cluster_tt_status_hint_source_dispatch(ClusterTTStatusHintSourceOp op,
+									   const ClusterTTStatusHintSourceRequest *request)
 {
-	(void)key;
-	(void)status;
-	(void)commit_scn;
-}
-
-void
-cluster_tt_status_hint_emit_subcommitted(const ClusterTTStatusKey *child_key,
-										 const ClusterTTStatusKey *parent_key)
-{
-	(void)child_key;
-	(void)parent_key;
-}
-
-void
-cluster_tt_status_hint_drain_outbound(void)
-{}
-
-void
-cluster_tt_status_hint_handle_envelope(const ClusterICEnvelope *env, const void *payload)
-{
-	(void)env;
-	(void)payload;
+	(void)op;
+	(void)request;
+	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }
 
 #define CLUSTER_TT_HINT_GETTER_STUB(name)                                                          \
@@ -896,14 +988,5 @@ CLUSTER_TT_HINT_GETTER_STUB(drop_v1_compat_count)
 CLUSTER_TT_HINT_GETTER_STUB(v3_downgrade_count)
 /* PGRAC spec-3.6 D4 */
 CLUSTER_TT_HINT_GETTER_STUB(v4_drop_unknown_count)
-
-void
-cluster_tt_status_hint_emit_multixact_overlay(const ClusterMultiXactKey *key, uint16 member_count,
-											  const ClusterMultiXactMember *members)
-{
-	(void)key;
-	(void)member_count;
-	(void)members;
-}
 
 #endif /* USE_PGRAC_CLUSTER */
