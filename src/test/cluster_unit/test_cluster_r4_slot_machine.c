@@ -7,7 +7,9 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_lms.h"
 
 #undef printf
 
@@ -262,10 +264,72 @@ DEFINE_CELL_TEST(test_89_k_capacity, CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_EVEN
 DEFINE_CELL_TEST(test_90_k_malformed, CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_EVENT_MALFORMED,
 	CLUSTER_R4_STATE_CANCELLED, NONE, REQ, CLUSTER_R4_ACTION_DROP, "K/drop")
 
+/* Physical LMS slot ABI: legacy ordinals stay fixed; R4 is append-only. */
+UT_TEST(test_91_physical_lms_slot_abi)
+{
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_FREE, 0);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_PENDING, 1);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_BUSY, 2);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_READY, 3);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_FILLING, 4);
+	UT_ASSERT_EQ(CLUSTER_LMS_SLOT_KIND_CR, 0);
+	UT_ASSERT_EQ(CLUSTER_LMS_SLOT_KIND_UNDO_FETCH, 1);
+	UT_ASSERT_EQ(CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT, 2);
+	UT_ASSERT_EQ(CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT, 3);
+
+	UT_ASSERT_EQ(CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD, 4);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_QUEUED, 5);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_BUILDING, 6);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_NEED_UNDO, 7);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_UNDO_INFLIGHT, 8);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_UNDO_READY, 9);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_READY_FULL, 10);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_READY_RETRY, 11);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_READY_FAIL, 12);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_CANCELLED, 13);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_SHIPPING, 14);
+	UT_ASSERT_EQ(CLUSTER_LMS_CR_R4_RECLAIMING, 15);
+
+	UT_ASSERT_EQ((int)sizeof(ClusterR4CrOwnerStamp), 32);
+	UT_ASSERT_EQ((int)offsetof(ClusterR4CrSlotExtension, owner), 80);
+	UT_ASSERT_EQ((int)offsetof(ClusterR4CrSlotExtension, slot_generation), 112);
+	UT_ASSERT_EQ((int)sizeof(ClusterR4CrSlotExtension), 256);
+
+	UT_ASSERT_EQ((int)sizeof(((ClusterLmsCrSlot *)0)->result_page), BLCKSZ);
+	UT_ASSERT_EQ((int)offsetof(ClusterLmsCrSlot, r4),
+				 (int)offsetof(ClusterLmsCrSlot, result_page) + BLCKSZ);
+	UT_ASSERT_EQ((int)offsetof(ClusterLmsCrSlot, foreign_undo_page),
+				 (int)offsetof(ClusterLmsCrSlot, r4) + 256);
+	UT_ASSERT_EQ((int)sizeof(((ClusterLmsCrSlot *)0)->foreign_undo_page), BLCKSZ);
+	UT_ASSERT_EQ((int)sizeof(ClusterLmsCrSlot),
+				 (int)offsetof(ClusterLmsCrSlot, r4) + 256 + BLCKSZ);
+	UT_ASSERT_EQ((int)(sizeof(ClusterR4CrSlotExtension) + BLCKSZ), 8448);
+	UT_ASSERT_EQ((int)(CLUSTER_LMS_CR_SLOTS
+					   * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ)),
+				 33792);
+}
+
+/* D4-B exact append-only LMS incarnation/drain control ABI. */
+UT_TEST(test_92_physical_lms_r4_control_abi)
+{
+	UT_ASSERT_EQ((int)offsetof(ClusterLmsR4Controls, data_worker_incarnation), 0);
+	UT_ASSERT_EQ((int)sizeof(((ClusterLmsR4Controls *)0)->data_worker_incarnation), 64);
+	UT_ASSERT_EQ((int)offsetof(ClusterLmsR4Controls, drain_request_generation), 64);
+	UT_ASSERT_EQ((int)offsetof(ClusterLmsR4Controls, drain_ack_generation), 72);
+	UT_ASSERT_EQ((int)sizeof(ClusterLmsR4Controls), 80);
+
+	UT_ASSERT_EQ((int)offsetof(ClusterLmsSharedState, r4_controls),
+				 (int)sizeof(ClusterLmsSharedState) - 80);
+	UT_ASSERT_EQ((int)(CLUSTER_LMS_CR_SLOTS
+					   * (sizeof(ClusterR4CrSlotExtension) + BLCKSZ)
+					   + sizeof(ClusterLmsR4Controls)),
+				 33872);
+}
+
 int
 main(void)
 {
-	UT_PLAN(90);
+	UT_PLAN(92);
 	UT_RUN(test_01_e_valid);
 	UT_RUN(test_02_e_duplicate);
 	UT_RUN(test_03_e_stale);
@@ -356,6 +420,8 @@ main(void)
 	UT_RUN(test_88_k_reconfig);
 	UT_RUN(test_89_k_capacity);
 	UT_RUN(test_90_k_malformed);
+	UT_RUN(test_91_physical_lms_slot_abi);
+	UT_RUN(test_92_physical_lms_r4_control_abi);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -59,6 +59,7 @@
 #include "cluster/cluster_qvotec.h"			 /* spec-5.16 D3b — in_quorum master-side gate */
 #include "cluster/cluster_reconfig.h"		 /* QVOTEC-observed live peer incarnation */
 #include "cluster/cluster_recovery_merge.h"	 /* spec-4.7 D5 — recovered_through redo gate */
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
 #include "cluster/cluster_xnode_profile.h"	 /* spec-5.59 D2/D3/D4 profiling buckets */
@@ -120,8 +121,20 @@
  * drops the new note (fail-safe: the PI merely lingers, counted). */
 #define CLUSTER_GCS_PI_NOTE_RING_SIZE 128
 
+/* D4 keeps the legacy acquisition reply table and the R4 synchronous-CR
+ * reply table logically disjoint even though their physical 8240-byte frames
+ * share one C decoder.  The byte value is stored in existing slot padding;
+ * no shared-memory size or subsequent field offset changes. */
+typedef enum ClusterGcsBlockReplyDomain {
+	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE = 0,
+	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR = 1
+} ClusterGcsBlockReplyDomain;
+
+#define CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT (-2)
+
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
+	uint8 reply_domain;
 	uint64 request_id;
 	uint8 transition_id;
 	BufferTag tag;
@@ -164,6 +177,16 @@ typedef struct ClusterGcsBlockOutstandingSlot {
 	bool direct_target_prepared;
 	ClusterGcsBlockDirectAbortReason direct_abort_reason;
 } ClusterGcsBlockOutstandingSlot;
+
+StaticAssertDecl(CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE == 0
+					 && CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR == 1,
+				 "GCS block reply domain must remain the closed 0/1 set");
+StaticAssertDecl(offsetof(ClusterGcsBlockOutstandingSlot, reply_domain) == 1,
+				 "GCS block reply domain must consume byte-1 slot padding");
+StaticAssertDecl(offsetof(ClusterGcsBlockOutstandingSlot, request_id) == 8,
+				 "GCS block slot request_id offset must remain 8");
+StaticAssertDecl(sizeof(ClusterGcsBlockOutstandingSlot) == 8536,
+				 "GCS block outstanding slot ABI must remain 8536 bytes");
 
 typedef struct ClusterGcsBlockBackendBlock {
 	LWLockPadded lock;
@@ -657,6 +680,7 @@ cluster_gcs_block_shmem_init(void)
 				ClusterGcsBlockOutstandingSlot *slot = &blk->slots[j];
 
 				slot->in_use = false;
+				slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
 				slot->request_id = 0;
 				slot->reply_received = false;
 				slot->reply_sf_dep_valid = false;
@@ -755,6 +779,7 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 		if (!blk->slots[i].in_use) {
 			slot = &blk->slots[i];
 			slot->in_use = true;
+			slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
 			slot->reply_received = false;
 			/* PGRAC: spec-6.14a D1 — domain-tagged id.  Raw per-backend
 			 * counters all start at 1, so ids from different backends (or
@@ -825,6 +850,7 @@ gcs_block_try_reserve_exact_slot(BufferTag tag, uint8 transition_id, int32 expec
 		if (!blk->slots[i].in_use) {
 			slot = &blk->slots[i];
 			slot->in_use = true;
+			slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
 			slot->request_id = request_id;
 			slot->transition_id = transition_id;
 			slot->tag = tag;
@@ -882,6 +908,7 @@ gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot)
 		released_live_direct = true;
 	}
 	slot->in_use = false;
+	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
 	slot->reply_received = false;
 	slot->request_id = 0;
 	slot->transition_id = 0;
@@ -1976,6 +2003,8 @@ typedef struct GcsBlockR4ReplyExpectation {
 	int32 requester_backend_id;
 	uint8 transition_id;
 	int32 sender_node;
+	int32 forwarding_master_node;
+	uint8 reply_domain;
 } GcsBlockR4ReplyExpectation;
 
 static bool gcs_block_decode_r4_reply_payload(
@@ -2041,34 +2070,67 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 {
 	const GcsBlockReplyHeader *header;
 	const char *block_data;
+	const ClusterGcsUndoAuthTrailer *undo_auth = NULL;
+	GcsBlockReplyStatus status;
+	uint32 payload_size;
 	int i;
 
 	if (env == NULL || payload == NULL || expected == NULL
 		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
-		|| env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
+		|| env->payload_length < (uint32)sizeof(GcsBlockReplyHeader)
 		|| env->source_node_id != (uint32)expected->sender_node
-		|| env->dest_node_id != (uint32)cluster_node_id)
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| expected->reply_domain != CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
+		|| expected->sender_node < 0 || expected->sender_node >= CLUSTER_MAX_NODES
+		|| expected->forwarding_master_node < GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+		|| expected->forwarding_master_node >= CLUSTER_MAX_NODES)
 		return false;
 	header = (const GcsBlockReplyHeader *)payload;
 	block_data = ((const char *)payload) + sizeof(*header);
-	if (!GcsBlockReplyStatusIsR4Refusal((GcsBlockReplyStatus)header->status)
-		|| header->request_id != expected->request_id || header->epoch != expected->epoch
+	status = (GcsBlockReplyStatus)header->status;
+	switch (status) {
+		case GCS_BLOCK_REPLY_R4_CR_FULL:
+		case GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED:
+		case GCS_BLOCK_REPLY_R4_DENIED:
+			payload_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+			break;
+		case GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT:
+			payload_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
+						   + (uint32)sizeof(ClusterGcsUndoAuthTrailer);
+			break;
+		default:
+			return false;
+	}
+	if (env->payload_length != payload_size || header->request_id != expected->request_id
+		|| header->epoch != expected->epoch
 		|| header->requester_backend_id != expected->requester_backend_id
 		|| header->transition_id != expected->transition_id
 		|| expected->transition_id != (uint8)PCM_TRANS_N_TO_S
-		|| header->sender_node != expected->sender_node || expected->sender_node < 0
-		|| expected->sender_node >= CLUSTER_MAX_NODES
+		|| header->sender_node != expected->sender_node
 		|| GcsBlockReplyHeaderGetForwardingMasterNode(header)
-			   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+			   != expected->forwarding_master_node
 		|| header->checksum != gcs_block_compute_checksum(block_data))
 		return false;
 	for (i = 0; i < (int)sizeof(header->reserved_0); i++)
 		if (header->reserved_0[i] != 0)
 			return false;
+
+	if (status == GCS_BLOCK_REPLY_R4_CR_FULL)
+		return expected->forwarding_master_node != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+	if (status == GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
+		if (expected->requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+			|| expected->forwarding_master_node != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+			|| header->page_lsn == 0)
+			return false;
+		undo_auth = (const ClusterGcsUndoAuthTrailer *)(block_data + GCS_BLOCK_DATA_SIZE);
+		return ClusterGcsUndoAuthTrailerGetTtGeneration(undo_auth) != 0
+			   && ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_auth) != 0;
+	}
+
 	for (i = 0; i < GCS_BLOCK_DATA_SIZE; i++)
 		if (block_data[i] != 0)
 			return false;
-	if (header->status == (uint8)GCS_BLOCK_REPLY_R4_DENIED)
+	if (status == GCS_BLOCK_REPLY_R4_DENIED)
 		return header->page_lsn == 0;
 	return header->page_lsn <= (uint64)CLUSTER_MAX_NODES;
 }
@@ -2277,6 +2339,9 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 					 : CLUSTER_CR_BUILD_HOLDER_MOVED;
 			goto done;
 		}
+		if (arm_result == GCS_BLOCK_R4_ROUTE_ARM_NEW)
+			cluster_r4_observe(CLUSTER_R4_EVENT_CR_ROUTE_STARTED,
+						   CLUSTER_TX_RESOLVE_NONE, CLUSTER_CR_BUILD_NONE);
 
 		memset(&forward, 0, sizeof(forward));
 		forward.base.request_id = identity.legacy_key.request_id;
@@ -2438,7 +2503,8 @@ bool
 cluster_gcs_block_test_decode_r4_reply(
 	const ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
 	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
-	int32 expected_sender_node)
+	int32 expected_sender_node, int32 expected_forwarding_master_node,
+	uint8 expected_reply_domain)
 {
 	GcsBlockR4ReplyExpectation expected;
 
@@ -2448,6 +2514,8 @@ cluster_gcs_block_test_decode_r4_reply(
 	expected.requester_backend_id = expected_requester_backend_id;
 	expected.transition_id = expected_transition_id;
 	expected.sender_node = expected_sender_node;
+	expected.forwarding_master_node = expected_forwarding_master_node;
+	expected.reply_domain = expected_reply_domain;
 	return gcs_block_decode_r4_reply_payload(env, payload, &expected);
 }
 #endif
@@ -8342,6 +8410,16 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		|| env->dest_node_id != (uint32)cluster_node_id)
 		return;
 
+	/* D4 status 24 is a worker-0 internal response, never a backend-table
+	 * reply.  Until the foreign-slot FSM lands, consume it here before even
+	 * deriving a backend index so the existing authenticated 8256-byte
+	 * decoder cannot alias it onto a legacy acquisition slot. */
+	if (hdr->status == (uint8)GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
+		if (hdr->requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT)
+			return;
+		return;
+	}
+
 	/* HC80: direct index by requester_backend_id (1..MaxBackends → 0..MaxBackends-1). */
 	backend_idx = hdr->requester_backend_id - 1;
 	if (backend_idx < 0 || backend_idx >= MaxBackends)
@@ -8356,6 +8434,17 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		if (slot->in_use && slot->request_id == hdr->request_id) {
 			int32 fwd_master;
 			bool authorized = false;
+			uint8 reply_domain = GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
+								 ? CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
+								 : CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
+
+			/* Reply identity includes the closed slot domain.  Reject before
+			 * touching reply_received or any other slot-owned result byte. */
+			if (slot->reply_domain != reply_domain) {
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
+				LWLockRelease(&blk->lock.lock);
+				return;
+			}
 
 			/*
 			 * First-reply-wins (S3 RC-A).  Duplicate replies for the same

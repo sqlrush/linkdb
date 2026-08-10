@@ -222,6 +222,11 @@ extern uint64 cluster_cr_xmax_recycled_invisible_count(void);
 extern uint64 cluster_cr_xmax_invalid_or_ambiguous_count(void);
 extern uint64 cluster_cr_xmax_scan_unavail_or_no_proof_count(void);
 
+/* Stage 8 R4 D11 observation adapter carrier.  The uint32 boundary keeps the
+ * shared CR region independent of the feature enum header. */
+extern void cluster_cr_r4_event_bump(uint32 event);
+extern uint64 cluster_cr_r4_event_count(uint32 event);
+
 /* spec-6.12b: CR-server data plane counters. */
 extern uint64 cluster_cr_remote_full_count(void);
 extern uint64 cluster_cr_remote_partial_count(void);

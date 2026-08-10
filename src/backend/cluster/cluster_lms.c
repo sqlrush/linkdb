@@ -239,6 +239,42 @@ cluster_lms_shared_state(void)
 	return cluster_lms_state;
 }
 
+/*
+ * spec-8.4 D4-B — publish one fresh DATA-worker incarnation under the
+ * existing LMS proof lock.  Worker 0 must invalidate a stale close ACK
+ * before a replacement incarnation becomes visible.  Zero is reserved, and
+ * exhaustion refuses instead of wrapping to a previously used identity.
+ */
+static uint64
+lms_r4_publish_worker_incarnation(ClusterLmsSharedState *state, int worker_id)
+{
+	uint64 current;
+	uint64 next = 0;
+
+	if (state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return 0;
+
+	LWLockAcquire(&state->lwlock, LW_EXCLUSIVE);
+	if (worker_id == 0)
+		state->r4_controls.drain_ack_generation = 0;
+	current = state->r4_controls.data_worker_incarnation[worker_id];
+	if (current != UINT64_MAX) {
+		next = current + 1;
+		state->r4_controls.data_worker_incarnation[worker_id] = next;
+	}
+	LWLockRelease(&state->lwlock);
+
+	return next;
+}
+
+#ifdef USE_CLUSTER_UNIT
+uint64
+cluster_lms_test_publish_r4_worker_incarnation(ClusterLmsSharedState *state, int worker_id)
+{
+	return lms_r4_publish_worker_incarnation(state, worker_id);
+}
+#endif
+
 
 /* ============================================================
  * Internal helpers.
@@ -772,6 +808,10 @@ LmsMain(void)
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_lms shmem region not attached"),
 				 errhint("cluster_lms_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
+	if (lms_r4_publish_worker_incarnation(cluster_lms_state, 0) == 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cluster_lms DATA worker 0 incarnation exhausted")));
 
 	/* Publish STARTING + record pid / spawned_at.  spec-7.3 D4: worker 0's
 	 * pid also goes to worker_pids[0] so cluster_lms_wakeup(0) is uniform with
@@ -964,6 +1004,10 @@ LmsWorkerMain(int worker_id)
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_lms shmem region not attached"),
 				 errhint("cluster_lms_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
+	if (lms_r4_publish_worker_incarnation(cluster_lms_state, worker_id) == 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cluster_lms DATA worker %d incarnation exhausted", worker_id)));
 
 	/* Publish this worker's pid so the D4 wakeup path can find it. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);

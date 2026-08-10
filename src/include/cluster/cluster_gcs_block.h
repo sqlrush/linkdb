@@ -1601,16 +1601,18 @@ GcsBlockReplyStatusIsR4Refusal(GcsBlockReplyStatus status)
 }
 
 /* PGRAC: spec-6.12i / spec-7.1 — every undo-plane reply kind (TT-header fetch,
- * single-xid verdict, batched multi-member verdict) ships the BLCKSZ page plus
- * a co-sampled ClusterGcsUndoAuthTrailer and overrides the reply header's
- * epoch / page_lsn with the LMS-sampled live authority.  Centralised so every
- * ship/parse site treats the three identically (D-i3 authority carriage). */
+ * single-xid verdict, batched multi-member verdict, R4 undo-data result) ships
+ * the BLCKSZ page plus a co-sampled ClusterGcsUndoAuthTrailer and overrides the
+ * reply header's epoch / page_lsn with the LMS-sampled live authority.
+ * Centralised so every ship/parse site treats the four identically (D-i3
+ * authority carriage). */
 static inline bool
 GcsBlockReplyStatusCarriesUndoAuthTrailer(GcsBlockReplyStatus status)
 {
 	return status == GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
 		   || status == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
-		   || status == GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
+		   || status == GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
+		   || status == GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT;
 }
 
 static inline bool
@@ -2923,7 +2925,8 @@ extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result
 extern bool cluster_gcs_block_test_decode_r4_reply(
 	const struct ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
 	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
-	int32 expected_sender_node);
+	int32 expected_sender_node, int32 expected_forwarding_master_node,
+	uint8 expected_reply_domain);
 #endif
 
 static inline void

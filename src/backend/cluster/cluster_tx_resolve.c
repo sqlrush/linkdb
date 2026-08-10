@@ -16,7 +16,10 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/multixact.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_multixact.h"
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tx_resolve.h"
 
@@ -231,7 +234,28 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode m
 		reason = CLUSTER_TX_RESOLVE_NONE;
 
 admitted_done:
-		;
+		switch (outcome) {
+		case CLUSTER_TX_UNKNOWN:
+			cluster_r4_observe(CLUSTER_R4_EVENT_TX_UNKNOWN, reason,
+						   CLUSTER_CR_BUILD_NONE);
+			break;
+		case CLUSTER_TX_IN_PROGRESS:
+			cluster_r4_observe(CLUSTER_R4_EVENT_TX_IN_PROGRESS, reason,
+						   CLUSTER_CR_BUILD_NONE);
+			break;
+		case CLUSTER_TX_PREPARED:
+			cluster_r4_observe(CLUSTER_R4_EVENT_TX_PREPARED, reason,
+						   CLUSTER_CR_BUILD_NONE);
+			break;
+		case CLUSTER_TX_COMMITTED:
+			cluster_r4_observe(CLUSTER_R4_EVENT_TX_COMMITTED, reason,
+						   CLUSTER_CR_BUILD_NONE);
+			break;
+		case CLUSTER_TX_ABORTED:
+			cluster_r4_observe(CLUSTER_R4_EVENT_TX_ABORTED, reason,
+						   CLUSTER_CR_BUILD_NONE);
+			break;
+		}
 	}
 	PG_FINALLY();
 	{
@@ -246,13 +270,113 @@ done:
 }
 
 ClusterTxOutcome
-cluster_tx_resolve_multixact(MultiXactId mxid pg_attribute_unused(), ClusterMultiResolution *out,
+cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 							 ClusterTxResolveReason *reason_out)
 {
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
+	int attempt;
+
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
+	memset(&admission, 0, sizeof(admission));
+
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		reason = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
+				 ? CLUSTER_TX_RESOLVE_TARGET_DISABLED
+				 : CLUSTER_TX_RESOLVE_RF_DEFERRED;
+		goto done;
+	}
+
+	PG_TRY();
+	{
+		if (out == NULL) {
+			reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			goto admitted_done;
+		}
+		if (!MultiXactIdIsValid(mxid)) {
+			reason = CLUSTER_TX_RESOLVE_BAD_COMPOSITION;
+			goto admitted_done;
+		}
+
+		for (attempt = 0; attempt < 2; attempt++) {
+			MultiXactMember *first = NULL;
+			MultiXactMember *second = NULL;
+			MultiXactOffset first_start = 0;
+			MultiXactOffset second_start = 0;
+			int first_count;
+			int second_count;
+			bool first_valid;
+			bool second_valid;
+			bool stable;
+			int i;
+
+			first_count = GetMultiXactIdMembersWithOffset(mxid, &first, false, false,
+												 &first_start);
+			second_count = GetMultiXactIdMembersWithOffset(mxid, &second, false, false,
+												  &second_start);
+
+			first_valid = first_start != 0 && first_count >= 2
+						  && first_count <= CLUSTER_R4_MAX_MULTI_MEMBERS && first != NULL;
+			second_valid = second_start != 0 && second_count >= 2
+						   && second_count <= CLUSTER_R4_MAX_MULTI_MEMBERS && second != NULL;
+			if (first_valid) {
+				for (i = 0; i < first_count; i++) {
+					if (!TransactionIdIsNormal(first[i].xid)
+						|| first[i].status < MultiXactStatusForKeyShare
+						|| first[i].status > MaxMultiXactStatus) {
+						first_valid = false;
+						break;
+					}
+				}
+			}
+			if (second_valid) {
+				for (i = 0; i < second_count; i++) {
+					if (!TransactionIdIsNormal(second[i].xid)
+						|| second[i].status < MultiXactStatusForKeyShare
+						|| second[i].status > MaxMultiXactStatus) {
+						second_valid = false;
+						break;
+					}
+				}
+			}
+
+			stable = first_valid && second_valid
+					 && cluster_multixact_native_snapshot_equal(
+							first_start, first_count, first, second_start, second_count, second);
+			if (first != NULL)
+				pfree(first);
+			if (second != NULL)
+				pfree(second);
+
+			if (!first_valid || !second_valid) {
+				reason = CLUSTER_TX_RESOLVE_BAD_COMPOSITION;
+				break;
+			}
+			if (stable) {
+				reason = CLUSTER_TX_RESOLVE_COVERAGE_GAP;
+				break;
+			}
+			reason = CLUSTER_TX_RESOLVE_COMPOSITION_CHANGED;
+		}
+
+admitted_done:
+		;
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+
+done:
+	if (reason_out != NULL)
+		*reason_out = reason;
 	return CLUSTER_TX_UNKNOWN;
 }
 

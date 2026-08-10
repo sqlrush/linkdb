@@ -2433,6 +2433,11 @@ cluster_cr_xmax_scan_unavail_or_no_proof_count(void)
 {
 	return 0;
 }
+uint64
+cluster_cr_r4_event_count(uint32 event pg_attribute_unused())
+{
+	return 0;
+}
 
 /* spec-4.1 D7 + spec-4.2 D5: per-thread WAL routing / WAL-state registry
  * accessors (cluster_wal_thread.c / cluster_wal_state.c) are not linked

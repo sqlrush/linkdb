@@ -98,6 +98,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_cr_pool.h"		  /* cluster_cr_pool_* counters (spec-5.51 D9) */
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
@@ -3156,6 +3157,37 @@ dump_undo(ReturnSetInfo *rsinfo)
 static void
 dump_cr(ReturnSetInfo *rsinfo)
 {
+	/* Stage 8 R4 D11: complete frozen event surface.  Producers absent from
+	 * the current happy-path minimum remain honest monotonic zeroes. */
+	emit_row(rsinfo, "r4", "cr_route_started_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_ROUTE_STARTED)));
+	emit_row(rsinfo, "r4", "cr_holder_full_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_HOLDER_FULL)));
+	emit_row(rsinfo, "r4", "cr_holder_retry_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_HOLDER_RETRY)));
+	emit_row(rsinfo, "r4", "cr_holder_failclosed_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_HOLDER_FAIL_CLOSED)));
+	emit_row(rsinfo, "r4", "undo_data_fetch_served_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_UNDO_FETCH_SERVED)));
+	emit_row(rsinfo, "r4", "undo_data_fetch_denied_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_UNDO_FETCH_DENIED)));
+	emit_row(rsinfo, "r4", "tx_resolve_unknown_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_UNKNOWN)));
+	emit_row(rsinfo, "r4", "tx_resolve_in_progress_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_IN_PROGRESS)));
+	emit_row(rsinfo, "r4", "tx_resolve_prepared_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_PREPARED)));
+	emit_row(rsinfo, "r4", "tx_resolve_committed_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_COMMITTED)));
+	emit_row(rsinfo, "r4", "tx_resolve_aborted_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_ABORTED)));
+	emit_row(rsinfo, "r4", "multi_resolve_served_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_MULTI_SERVED)));
+	emit_row(rsinfo, "r4", "multi_resolve_unknown_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_MULTI_UNKNOWN)));
+	emit_row(rsinfo, "r4", "slot_capacity_retry_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_SLOT_CAPACITY_RETRY)));
+
 	emit_row(rsinfo, "cr", "cr_construct_count", fmt_int64((int64)cluster_cr_construct_count()));
 	emit_row(rsinfo, "cr", "cr_snapshot_too_old_count",
 			 fmt_int64((int64)cluster_cr_snapshot_too_old_count()));

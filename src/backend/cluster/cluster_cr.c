@@ -68,6 +68,7 @@
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.21: cluster_vis_cr_xmax_verdict */
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR-server data plane */
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D3: profiling probes */
@@ -300,6 +301,8 @@ typedef struct ClusterCRShared {
 	 * 8.A: positive proof only; direction of every refuse leg is unchanged.
 	 */
 	pg_atomic_uint64 vis53r97_leg_live_upgrade_hit_count;
+	/* Stage 8 R4 D11: observation-only feature counters. */
+	pg_atomic_uint64 r4_event_counts[CLUSTER_R4_OBSERVATION_EVENT_COUNT];
 } ClusterCRShared;
 
 static ClusterCRShared *CRShared = NULL;
@@ -343,6 +346,7 @@ void
 cluster_cr_shmem_init(void)
 {
 	bool found;
+	int i;
 
 	CRShared = ShmemInitStruct("ClusterCRShared", cluster_cr_shmem_size(), &found);
 
@@ -411,6 +415,8 @@ cluster_cr_shmem_init(void)
 		pg_atomic_init_u64(&CRShared->cr_xmax_recycled_invisible_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_invalid_or_ambiguous_count, 0);
 		pg_atomic_init_u64(&CRShared->cr_xmax_scan_unavail_or_no_proof_count, 0);
+		for (i = 0; i < CLUSTER_R4_OBSERVATION_EVENT_COUNT; i++)
+			pg_atomic_init_u64(&CRShared->r4_event_counts[i], 0);
 	}
 }
 
@@ -842,6 +848,21 @@ CR_COUNTER_ACCESSOR(cluster_cr_cache_hit_count, cr_cache_hit_count)
 CR_COUNTER_ACCESSOR(cluster_cr_cache_miss_count, cr_cache_miss_count)
 CR_COUNTER_ACCESSOR(cluster_cr_cache_evict_count, cr_cache_evict_count)
 CR_COUNTER_ACCESSOR(cluster_cr_cache_install_count, cr_cache_install_count)
+
+void
+cluster_cr_r4_event_bump(uint32 event)
+{
+	if (CRShared != NULL && event < CLUSTER_R4_OBSERVATION_EVENT_COUNT)
+		pg_atomic_fetch_add_u64(&CRShared->r4_event_counts[event], 1);
+}
+
+uint64
+cluster_cr_r4_event_count(uint32 event)
+{
+	if (CRShared == NULL || event >= CLUSTER_R4_OBSERVATION_EVENT_COUNT)
+		return 0;
+	return pg_atomic_read_u64(&CRShared->r4_event_counts[event]);
+}
 
 /* spec-6.12b: CR-server data plane (6 counters). */
 CR_COUNTER_ACCESSOR(cluster_cr_remote_full_count, cr_remote_full_count)

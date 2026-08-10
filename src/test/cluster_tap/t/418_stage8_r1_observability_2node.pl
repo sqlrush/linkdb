@@ -40,6 +40,14 @@ my @UNDO_KEYS = qw(
   segment_observation_status segment_allocated_count
   segment_allocated_high_water segment_effective_cap);
 my @GCS_KEYS = qw(pi_master_metadata_retire_count);
+my @R4_KEYS = qw(
+  cr_route_started_count cr_holder_full_count cr_holder_retry_count
+  cr_holder_failclosed_count undo_data_fetch_served_count
+  undo_data_fetch_denied_count tx_resolve_unknown_count
+  tx_resolve_in_progress_count tx_resolve_prepared_count
+  tx_resolve_committed_count tx_resolve_aborted_count
+  multi_resolve_served_count multi_resolve_unknown_count
+  slot_capacity_retry_count);
 my @UNDO_STATUS = qw(
   READY UNAVAILABLE_INVALID_OWNER UNAVAILABLE_IO_ERROR
   UNAVAILABLE_INVALID_HEADER);
@@ -315,7 +323,7 @@ for my $entry ([ 0, $node0 ], [ 1, $node1 ])
 		"L1 node$node_id canonical test config identity frozen");
 }
 
-# L2: all 57 exact rows exist once and numeric rows are unsigned 64-bit.
+# L2: all 71 exact rows exist once and numeric rows are unsigned 64-bit.
 for my $entry ([ 0, $node0 ], [ 1, $node1 ])
 {
 	my ($node_id, $node) = @$entry;
@@ -324,7 +332,7 @@ for my $entry ([ 0, $node0 ], [ 1, $node1 ])
 		'postgres',
 		q{SELECT category || '/' || key || chr(9) || value
 		  FROM pg_cluster_state
-		  WHERE category IN ('pcm', 'lmon', 'undo', 'gcs')});
+		  WHERE category IN ('pcm', 'lmon', 'undo', 'gcs', 'r4')});
 	for my $line (split(/\n/, $rows))
 	{
 		my ($category_key, $row_value) = split(/\t/, $line, 2);
@@ -337,7 +345,8 @@ for my $entry ([ 0, $node0 ], [ 1, $node1 ])
 		[ 'pcm', \@O2_KEYS ],
 		[ 'lmon', \@LMON_KEYS ],
 		[ 'undo', \@UNDO_KEYS ],
-		[ 'gcs', \@GCS_KEYS ])
+		[ 'gcs', \@GCS_KEYS ],
+		[ 'r4', \@R4_KEYS ])
 	{
 		my ($category, $keys) = @$group;
 		for my $key (@$keys)

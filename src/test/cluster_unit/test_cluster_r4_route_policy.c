@@ -8,6 +8,8 @@
 #include "postgres.h"
 
 #include <setjmp.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cr_server.h"
@@ -23,6 +25,7 @@
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
 #include "miscadmin.h"
@@ -47,7 +50,8 @@ extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result
 extern bool cluster_gcs_block_test_decode_r4_reply(
 	const ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
 	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
-	int32 expected_sender_node);
+	int32 expected_sender_node, int32 expected_forwarding_master_node,
+	uint8 expected_reply_domain);
 
 /* Backend globals reached by the narrow production route section. */
 sigjmp_buf *PG_exception_stack = NULL;
@@ -75,6 +79,9 @@ ClusterConf *ClusterConfShmem = NULL;
 #define UT_EXPECTED_PAGE_SCN ((SCN)UINT64_C(0x2222))
 #define UT_MASTER_GENERATION ((UT_FORMATION_EPOCH << 32) | UINT64_C(4))
 #define UT_MASTER_TRANSITION UINT64_C(7)
+#define UT_REPLY_DOMAIN_LEGACY_ACQUIRE ((uint8)0)
+#define UT_REPLY_DOMAIN_R4_CR ((uint8)1)
+#define UT_R4_INTERNAL_ENDPOINT (-2)
 #define UT_R4_REQUIRED_CAPABILITIES                                                          \
 	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1)
 
@@ -102,6 +109,10 @@ typedef struct RouteSeamCapture {
 	int finish_calls;
 	int recheck_calls;
 	int holder_submit_calls;
+	int observe_calls;
+	ClusterR4Event observed_event;
+	ClusterTxResolveReason observed_tx_reason;
+	ClusterCrBuildReason observed_cr_reason;
 
 	int sequence;
 	int snapshot_sequence;
@@ -409,6 +420,16 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 	route_seam.leave_calls++;
 	route_seam.leave_sequence = ++route_seam.sequence;
 	memset(token, 0, sizeof(*token));
+}
+
+void
+cluster_r4_observe(ClusterR4Event event, ClusterTxResolveReason tx_reason,
+				   ClusterCrBuildReason cr_reason)
+{
+	route_seam.observe_calls++;
+	route_seam.observed_event = event;
+	route_seam.observed_tx_reason = tx_reason;
+	route_seam.observed_cr_reason = cr_reason;
 }
 
 bool
@@ -887,28 +908,199 @@ UT_TEST(test_r4_refusal_decoder_requires_exact_domain_identity_and_zero_body)
 	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
 	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
 
 	reply.header.status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
 	reply.header.status = GCS_BLOCK_REPLY_R4_DENIED;
 	reply.header.page_lsn = 1;
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
 	reply.header.page_lsn = 0;
 	reply.header.reserved_0[0] = 1;
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
 	reply.header.reserved_0[0] = 0;
 	reply.block_data[0] = 1;
 	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+}
+
+/* Removing the expected R4 domain gate, accepting a status at the other
+ * physical length, or treating status 24 as an ordinary backend reply makes
+ * at least one row below fail.  The fixtures use literal 8240/8256 shapes and
+ * call the production decoder seam, not the production encoder. */
+UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
+{
+	typedef struct TestR4Reply8240 {
+		GcsBlockReplyHeader header;
+		char block_data[GCS_BLOCK_DATA_SIZE];
+	} TestR4Reply8240;
+	typedef struct TestR4Reply8256 {
+		TestR4Reply8240 base;
+		ClusterGcsUndoAuthTrailer auth;
+	} TestR4Reply8256;
+	TestR4Reply8240 reply8240;
+	TestR4Reply8256 reply8256;
+	ClusterICEnvelope env;
+
+	UT_ASSERT_EQ(sizeof(reply8240), 8240);
+	UT_ASSERT_EQ(sizeof(reply8256), 8256);
+
+	/* A holder's finished CR is an exact 8240-byte R4_CR-domain reply. */
+	memset(&reply8240, 0, sizeof(reply8240));
+	reply8240.header.request_id = UT_REQUEST_ID;
+	reply8240.header.epoch = UT_FORMATION_EPOCH;
+	reply8240.header.sender_node = UT_HOLDER_NODE;
+	reply8240.header.requester_backend_id = UT_REQUESTER_BACKEND;
+	reply8240.header.transition_id = PCM_TRANS_N_TO_S;
+	reply8240.header.status = GCS_BLOCK_REPLY_R4_CR_FULL;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&reply8240.header, UT_MASTER_NODE);
+	reply8240.block_data[0] = 0x5a;
+	reply8240.header.checksum = cluster_gcs_block_compute_checksum(reply8240.block_data);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE, cluster_node_id,
+						  sizeof(reply8240));
+	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, UT_MASTER_NODE, UT_REPLY_DOMAIN_R4_CR));
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, UT_MASTER_NODE,
+		UT_REPLY_DOMAIN_LEGACY_ACQUIRE));
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+
+	/* The same status must not alias the authenticated 8256-byte undo shape. */
+	memset(&reply8256, 0, sizeof(reply8256));
+	reply8256.base = reply8240;
+	env.payload_length = sizeof(reply8256);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, UT_MASTER_NODE, UT_REPLY_DOMAIN_R4_CR));
+
+	/* Status 24 is the endpoint -2 internal result.  Its reply supplies the
+	 * first nonzero live-HWM/TT-generation/authority-SCN co-sample. */
+	memset(&reply8256, 0, sizeof(reply8256));
+	reply8256.base.header.request_id = UT_REQUEST_ID;
+	reply8256.base.header.epoch = UT_FORMATION_EPOCH;
+	reply8256.base.header.sender_node = UT_HOLDER_NODE;
+	reply8256.base.header.requester_backend_id = UT_R4_INTERNAL_ENDPOINT;
+	reply8256.base.header.transition_id = PCM_TRANS_N_TO_S;
+	reply8256.base.header.status = GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT;
+	reply8256.base.header.page_lsn = UINT64_C(0x4000);
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		&reply8256.base.header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	reply8256.base.block_data[0] = 0xa5;
+	reply8256.base.header.checksum
+		= cluster_gcs_block_compute_checksum(reply8256.base.block_data);
+	ClusterGcsUndoAuthTrailerSetTtGeneration(&reply8256.auth, UINT64_C(3));
+	ClusterGcsUndoAuthTrailerSetAuthorityScn(&reply8256.auth, (uint64)UT_READ_SCN);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE, cluster_node_id,
+						  sizeof(reply8256));
+	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_LEGACY_ACQUIRE));
+
+	/* Neither a short frame nor an absent authority generation is status 24. */
+	env.payload_length = sizeof(reply8240);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	env.payload_length = sizeof(reply8256);
+	ClusterGcsUndoAuthTrailerSetTtGeneration(&reply8256.auth, 0);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	ClusterGcsUndoAuthTrailerSetTtGeneration(&reply8256.auth, UINT64_C(3));
+	ClusterGcsUndoAuthTrailerSetAuthorityScn(&reply8256.auth, 0);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+
+	/* The two existing typed refusal statuses retain the exact 8240 shape. */
+	memset(&reply8240, 0, sizeof(reply8240));
+	reply8240.header.request_id = UT_REQUEST_ID;
+	reply8240.header.epoch = UT_FORMATION_EPOCH;
+	reply8240.header.sender_node = UT_MASTER_NODE;
+	reply8240.header.requester_backend_id = UT_REQUESTER_BACKEND;
+	reply8240.header.transition_id = PCM_TRANS_N_TO_S;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		&reply8240.header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	reply8240.header.checksum = cluster_gcs_block_compute_checksum(reply8240.block_data);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_MASTER_NODE, cluster_node_id,
+						  sizeof(reply8240));
+	reply8240.header.status = GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_MASTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	reply8240.header.status = GCS_BLOCK_REPLY_R4_DENIED;
+	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_MASTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+}
+
+/* Put the one advertised payload byte immediately before a protected page.
+ * A decoder that samples any header field before checking the minimum header
+ * length faults here instead of returning a typed rejection. */
+UT_TEST(test_r4_reply_decoder_checks_minimum_length_before_header_read)
+{
+	long page_size = sysconf(_SC_PAGESIZE);
+	char *mapping;
+	const void *truncated_payload;
+	ClusterICEnvelope env;
+	int rc;
+
+	UT_ASSERT(page_size > 0);
+	if (page_size <= 0)
+		return;
+	mapping = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANON, -1, 0);
+	UT_ASSERT(mapping != MAP_FAILED);
+	if (mapping == MAP_FAILED)
+		return;
+	rc = mprotect(mapping + page_size, (size_t)page_size, PROT_NONE);
+	UT_ASSERT_EQ(rc, 0);
+	if (rc != 0) {
+		(void)munmap(mapping, (size_t)page_size * 2);
+		return;
+	}
+
+	truncated_payload = mapping + page_size - 1;
+	mapping[page_size - 1] = 0;
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_MASTER_NODE,
+						  cluster_node_id, 1);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, truncated_payload, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_MASTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+
+	rc = mprotect(mapping + page_size, (size_t)page_size, PROT_READ | PROT_WRITE);
+	UT_ASSERT_EQ(rc, 0);
+	rc = munmap(mapping, (size_t)page_size * 2);
+	UT_ASSERT_EQ(rc, 0);
 }
 
 /* Removing the real request80 branch, taking a second TARGET admission,
@@ -942,6 +1134,10 @@ UT_TEST(test_request80_routes_stored_proof_to_real_forward96_handler)
 	UT_ASSERT_EQ(route_seam.capability_required[1], UT_R4_REQUIRED_CAPABILITIES);
 	UT_ASSERT_EQ(route_seam.snapshot_calls, 1);
 	UT_ASSERT_EQ(route_seam.arm_calls, 1);
+	UT_ASSERT_EQ(route_seam.observe_calls, 1);
+	UT_ASSERT_EQ(route_seam.observed_event, CLUSTER_R4_EVENT_CR_ROUTE_STARTED);
+	UT_ASSERT_EQ(route_seam.observed_tx_reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(route_seam.observed_cr_reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(route_seam.armed_lifetime_hint_ms, 1000);
 	UT_ASSERT(route_seam.armed_lifetime_hint_trusted);
 	UT_ASSERT_EQ(route_seam.armed_identity.legacy_key.origin_node_id, UT_REQUESTER_NODE);
@@ -1115,6 +1311,7 @@ UT_TEST(test_request80_admission_refusals_publish_without_token)
 		UT_ASSERT_EQ(route_seam.recheck_calls, 0);
 		UT_ASSERT_EQ(route_seam.snapshot_calls, 0);
 		UT_ASSERT_EQ(route_seam.arm_calls, 0);
+		UT_ASSERT_EQ(route_seam.observe_calls, 0);
 		UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
 		UT_ASSERT_EQ(route_seam.finish_calls, 0);
 		UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
@@ -1259,6 +1456,7 @@ UT_TEST(test_request80_arm_full_stops_before_publication)
 	UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
 	UT_ASSERT_EQ(route_seam.snapshot_calls, 1);
 	UT_ASSERT_EQ(route_seam.arm_calls, 1);
+	UT_ASSERT_EQ(route_seam.observe_calls, 0);
 	UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
 	UT_ASSERT_EQ(route_seam.finish_calls, 0);
 	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
@@ -1383,7 +1581,7 @@ UT_TEST(test_forward96_proof_epoch_mismatch_is_consumed_without_holder_submit)
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(69);
 	UT_RUN(test_01_null_authority_is_protocol);
 	UT_RUN(test_02_null_output_is_protocol);
 	UT_RUN(test_03_canonical_n_has_no_holder);
@@ -1437,6 +1635,8 @@ main(void)
 	UT_RUN(test_unknown_reason_fails_closed);
 	UT_RUN(test_d3_result_reason_mapping_is_closed);
 	UT_RUN(test_r4_refusal_decoder_requires_exact_domain_identity_and_zero_body);
+	UT_RUN(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority);
+	UT_RUN(test_r4_reply_decoder_checks_minimum_length_before_header_read);
 	UT_RUN(test_request80_routes_stored_proof_to_real_forward96_handler);
 	UT_RUN(test_r4_try_handlers_consume_only_exact_extended_lengths);
 	UT_RUN(test_r4_same_open_mismatch_has_zero_route_or_holder_mutation);

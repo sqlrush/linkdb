@@ -633,10 +633,23 @@ UT_TEST(test_r4_and_legacy_reply_status_domains_are_disjoint)
 	UT_ASSERT(!GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)27));
 }
 
+UT_TEST(test_r4_undo_data_status_selects_existing_authenticated_reply_shape)
+{
+	UT_ASSERT(GcsBlockReplyStatusCarriesUndoAuthTrailer(
+		GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT));
+	UT_ASSERT_EQ(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
+				 + sizeof(ClusterGcsUndoAuthTrailer),
+			 8256);
+	UT_ASSERT(!GcsBlockReplyStatusCarriesUndoAuthTrailer(GCS_BLOCK_REPLY_R4_CR_FULL));
+	UT_ASSERT(!GcsBlockReplyStatusCarriesUndoAuthTrailer(
+		GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED));
+	UT_ASSERT(!GcsBlockReplyStatusCarriesUndoAuthTrailer(GCS_BLOCK_REPLY_R4_DENIED));
+}
+
 int
 main(void)
 {
-	UT_PLAN(90);
+	UT_PLAN(91);
 	RUN_WIRE_TEST(0);
 	RUN_WIRE_TEST(1);
 	RUN_WIRE_TEST(2);
@@ -727,6 +740,7 @@ main(void)
 	RUN_WIRE_TEST(87);
 	UT_RUN(test_r4_reply_status_abi_tail_is_exact);
 	UT_RUN(test_r4_and_legacy_reply_status_domains_are_disjoint);
+	UT_RUN(test_r4_undo_data_status_selects_existing_authenticated_reply_shape);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

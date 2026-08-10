@@ -33,7 +33,7 @@ my $required_tap =
 my @nonpublic_patterns = (
 	[ private => qr/(?<![a-z0-9])private(?![a-z0-9])/i ],
 	[ future => qr/(?<![a-z0-9])future(?![a-z0-9])/i ],
-	[ downstream_r => qr/(?<![a-z0-9])r(?:[2-9]|1[0-4])(?![a-z0-9])/i ],
+	[ downstream_r => qr/(?<![a-z0-9])r(?:[2-3]|[5-9]|1[0-4])(?![a-z0-9])/i ],
 	[ ad => qr/(?<![a-z0-9])ad(?:-[0-9]+)?(?![a-z0-9])/i ],
 	[ talk => qr/(?<![a-z0-9])talk(?![a-z0-9])/i ],
 	[ commit => qr/(?<![a-z0-9])commit(?![a-z0-9])/i ],
@@ -172,7 +172,7 @@ sub validate_manifest
 		}
 	}
 
-	push @errors, 'ROW_COUNT' unless @rows == 7;
+	push @errors, 'ROW_COUNT' unless @rows == 16;
 	return (\@errors, \@rows);
 }
 
@@ -180,7 +180,7 @@ sub fixture_text
 {
 	my @rows;
 
-	for my $number (1 .. 7)
+	for my $number (1 .. 16)
 	{
 		push @rows, [
 			'1', "fixture-$number", 'COUNTER', "fixture-event-$number",
@@ -217,8 +217,8 @@ my ($manifest_errors, $manifest_rows) = validate_manifest($manifest);
 is(scalar(@$manifest_errors), 0,
 	'L2 public manifest satisfies every structural and behavior anchor rule')
 	or diag(join(';', @$manifest_errors));
-is(scalar(@$manifest_rows), 7,
-	'L3 public manifest contains exactly seven current R1 facts');
+is(scalar(@$manifest_rows), 16,
+	'L3 public manifest contains exactly sixteen current observation facts');
 
 my $temporary = tempdir(CLEANUP => 1);
 my $valid_rows = fixture_text();

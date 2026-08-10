@@ -9,7 +9,9 @@
 
 #include "postgres.h"
 
+#include "access/multixact.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tx_resolve.h"
 
@@ -47,9 +49,27 @@ static int test_recheck_calls;
 static int test_leave_calls;
 static int test_provider_calls;
 static bool test_provider_raise;
+static uint64 test_observed[CLUSTER_R4_OBSERVATION_EVENT_COUNT];
 
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+int
+GetMultiXactIdMembersWithOffset(MultiXactId multi pg_attribute_unused(),
+								MultiXactMember **members pg_attribute_unused(),
+								bool from_pgupgrade pg_attribute_unused(),
+								bool isLockOnly pg_attribute_unused(),
+								MultiXactOffset *start_offset_out pg_attribute_unused())
+{
+	/* This fixture keeps TARGET admission closed for its dormant Multi test. */
+	abort();
+}
 
 void
 pg_re_throw(void)
@@ -90,6 +110,15 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 	test_leave_calls++;
 	UT_ASSERT(token->entered);
 	token->entered = false;
+}
+
+void
+cluster_r4_observe(ClusterR4Event event, ClusterTxResolveReason tx_reason pg_attribute_unused(),
+				   ClusterCrBuildReason cr_reason pg_attribute_unused())
+{
+	UT_ASSERT((uint32)event < CLUSTER_R4_OBSERVATION_EVENT_COUNT);
+	if ((uint32)event < CLUSTER_R4_OBSERVATION_EVENT_COUNT)
+		test_observed[event]++;
 }
 
 uint64
@@ -202,6 +231,18 @@ reset_exact_resolver_fixture(void)
 	test_leave_calls = 0;
 	test_provider_calls = 0;
 	test_provider_raise = false;
+	memset(test_observed, 0, sizeof(test_observed));
+}
+
+static uint64
+observed_total(void)
+{
+	uint64 total = 0;
+	int i;
+
+	for (i = 0; i < CLUSTER_R4_OBSERVATION_EVENT_COUNT; i++)
+		total += test_observed[i];
+	return total;
 }
 
 static ClusterItlSlotData *
@@ -275,12 +316,15 @@ UT_TEST(test_exact_resolver_is_dormant_and_zeroes_output)
 	ClusterTxResolution resolution;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
+	reset_exact_resolver_fixture();
+	test_admission_result = CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
 	memset(&resolution, 0xA5, sizeof(resolution));
 	UT_ASSERT_EQ(
 		cluster_tx_resolve_exact(NULL, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
 		CLUSTER_TX_UNKNOWN);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_TARGET_DISABLED);
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+	UT_ASSERT_EQ(observed_total(), 0);
 }
 
 UT_TEST(test_exact_resolver_binds_exact_origin_provider_and_publishes_only_after_recheck)
@@ -310,6 +354,46 @@ UT_TEST(test_exact_resolver_binds_exact_origin_provider_and_publishes_only_after
 	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_COMMITTED);
 	UT_ASSERT_EQ(resolution.proof_kind, CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
 	UT_ASSERT_EQ(resolution.commit_scn, (SCN)101);
+	UT_ASSERT_EQ(test_observed[CLUSTER_R4_EVENT_TX_COMMITTED], 1);
+	UT_ASSERT_EQ(observed_total(), 1);
+}
+
+UT_TEST(test_exact_resolver_observes_each_positive_outcome_once)
+{
+	static const struct {
+		ClusterTxOutcome outcome;
+		ClusterTxProofKind proof;
+		ClusterR4Event event;
+		SCN commit_scn;
+	} cases[] = {
+		{CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG,
+		 CLUSTER_R4_EVENT_TX_IN_PROGRESS, InvalidScn},
+		{CLUSTER_TX_PREPARED, CLUSTER_TX_PROOF_ORIGIN_TWOPHASE,
+		 CLUSTER_R4_EVENT_TX_PREPARED, InvalidScn},
+		{CLUSTER_TX_COMMITTED, CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG,
+		 CLUSTER_R4_EVENT_TX_COMMITTED, (SCN)101},
+		{CLUSTER_TX_ABORTED, CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG,
+		 CLUSTER_R4_EVENT_TX_ABORTED, InvalidScn}
+	};
+	ClusterTxLocator locator = exact_locator();
+	int i;
+
+	for (i = 0; i < lengthof(cases); i++) {
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+		reset_exact_resolver_fixture();
+		test_provider_outcome = cases[i].outcome;
+		test_provider_resolution.outcome = cases[i].outcome;
+		test_provider_resolution.proof_kind = cases[i].proof;
+		test_provider_resolution.commit_scn = cases[i].commit_scn;
+		UT_ASSERT_EQ(cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY,
+										  &resolution, &reason),
+					 cases[i].outcome);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+		UT_ASSERT_EQ(test_observed[cases[i].event], 1);
+		UT_ASSERT_EQ(observed_total(), 1);
+	}
 }
 
 UT_TEST(test_exact_resolver_rejects_mismatched_locator_echo)
@@ -329,6 +413,8 @@ UT_TEST(test_exact_resolver_rejects_mismatched_locator_echo)
 	UT_ASSERT_EQ(test_recheck_calls, 0);
 	UT_ASSERT_EQ(test_leave_calls, 1);
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+	UT_ASSERT_EQ(test_observed[CLUSTER_R4_EVENT_TX_UNKNOWN], 1);
+	UT_ASSERT_EQ(observed_total(), 1);
 }
 
 UT_TEST(test_exact_resolver_discards_provider_result_when_activation_generation_moves)
@@ -348,6 +434,8 @@ UT_TEST(test_exact_resolver_discards_provider_result_when_activation_generation_
 	UT_ASSERT_EQ(test_recheck_calls, 1);
 	UT_ASSERT_EQ(test_leave_calls, 1);
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+	UT_ASSERT_EQ(test_observed[CLUSTER_R4_EVENT_TX_UNKNOWN], 1);
+	UT_ASSERT_EQ(observed_total(), 1);
 }
 
 UT_TEST(test_exact_cleanout_consumer_rejects_live_provider_outcome)
@@ -370,6 +458,8 @@ UT_TEST(test_exact_cleanout_consumer_rejects_live_provider_outcome)
 	UT_ASSERT_EQ(test_recheck_calls, 0);
 	UT_ASSERT_EQ(test_leave_calls, 1);
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+	UT_ASSERT_EQ(test_observed[CLUSTER_R4_EVENT_TX_UNKNOWN], 1);
+	UT_ASSERT_EQ(observed_total(), 1);
 }
 
 UT_TEST(test_exact_resolver_error_releases_target_admission_once)
@@ -397,6 +487,7 @@ UT_TEST(test_exact_resolver_error_releases_target_admission_once)
 	UT_ASSERT_EQ(test_provider_calls, 1);
 	UT_ASSERT_EQ(test_recheck_calls, 0);
 	UT_ASSERT_EQ(test_leave_calls, 1);
+	UT_ASSERT_EQ(observed_total(), 0);
 }
 
 UT_TEST(test_multixact_resolver_is_dormant_and_zeroes_output)
@@ -404,6 +495,8 @@ UT_TEST(test_multixact_resolver_is_dormant_and_zeroes_output)
 	ClusterMultiResolution resolution;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
+	reset_exact_resolver_fixture();
+	test_admission_result = CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
 	memset(&resolution, 0xA5, sizeof(resolution));
 	UT_ASSERT_EQ(cluster_tx_resolve_multixact((MultiXactId)0, &resolution, &reason),
 				 CLUSTER_TX_UNKNOWN);
@@ -707,12 +800,13 @@ UT_TEST(test_epoch_is_absent_from_locator_value)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(39);
 	UT_RUN(test_frozen_identity_layout);
 	UT_RUN(test_frozen_closed_domains);
 	UT_RUN(test_reason_names_are_stable);
 	UT_RUN(test_exact_resolver_is_dormant_and_zeroes_output);
 	UT_RUN(test_exact_resolver_binds_exact_origin_provider_and_publishes_only_after_recheck);
+	UT_RUN(test_exact_resolver_observes_each_positive_outcome_once);
 	UT_RUN(test_exact_resolver_rejects_mismatched_locator_echo);
 	UT_RUN(test_exact_resolver_discards_provider_result_when_activation_generation_moves);
 	UT_RUN(test_exact_cleanout_consumer_rejects_live_provider_outcome);

@@ -231,6 +231,7 @@ OBJS = \
 	cluster_tt_status_hint.o \
 	cluster_tx_enqueue.o \
 	cluster_tx_resolve.o \
+	cluster_r4_observe.o \
 	cluster_subtrans.o \
 	cluster_multixact.o \
 	cluster_multixact_served.o \

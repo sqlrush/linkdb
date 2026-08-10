@@ -206,6 +206,24 @@ StaticAssertDecl(sizeof(ClusterLmsNativeLockProbeSlot) == 256,
 				 "ClusterLmsNativeLockProbeSlot ABI 256B lock (spec-2.27 D5 bump from 128B; "
 				 "LWLockPadded = PG_CACHE_LINE_SIZE = 128B on current build)");
 
+/* spec-8.4 D4-B — exact append-only LMS incarnation/drain controls. */
+typedef struct ClusterLmsR4Controls {
+	uint64 data_worker_incarnation[CLUSTER_LMS_MAX_WORKERS];
+	uint64 drain_request_generation;
+	uint64 drain_ack_generation;
+} ClusterLmsR4Controls;
+
+StaticAssertDecl(offsetof(ClusterLmsR4Controls, data_worker_incarnation) == 0,
+				 "ClusterLmsR4Controls data worker incarnations must start at byte 0");
+StaticAssertDecl(offsetof(ClusterLmsR4Controls, drain_request_generation) == 64,
+				 "ClusterLmsR4Controls drain request generation must start at byte 64");
+StaticAssertDecl(offsetof(ClusterLmsR4Controls, drain_ack_generation) == 72,
+				 "ClusterLmsR4Controls drain ack generation must start at byte 72");
+StaticAssertDecl(sizeof(ClusterLmsR4Controls) == 80,
+				 "ClusterLmsR4Controls ABI must remain exactly 80 bytes");
+StaticAssertDecl(33792 + sizeof(ClusterLmsR4Controls) == 33872,
+				 "spec-8.4 D4-B total shared-memory increment must remain 33872 bytes");
+
 typedef struct ClusterLmsSharedState {
 	LWLock lwlock;				/* LWTRANCHE_CLUSTER_LMS guards non-atomic fields */
 	pg_atomic_uint32 lms_state; /* ClusterLmsState atomic (HC4 single ownership field) */
@@ -324,6 +342,8 @@ typedef struct ClusterLmsSharedState {
 	/* Capability-bound wire frames consumed before send because the peer's
 	 * current HELLO record no longer matches the staged connection generation. */
 	pg_atomic_uint64 worker_outbound_cap_guard_drop_count[CLUSTER_LMS_MAX_WORKERS];
+
+	ClusterLmsR4Controls r4_controls;
 } ClusterLmsSharedState;
 
 
@@ -371,6 +391,11 @@ extern void LmsMain(void) pg_attribute_noreturn();
  * Never returns.
  */
 extern void LmsWorkerMain(int worker_id) pg_attribute_noreturn();
+
+#ifdef USE_CLUSTER_UNIT
+extern uint64 cluster_lms_test_publish_r4_worker_incarnation(ClusterLmsSharedState *state,
+													 int worker_id);
+#endif
 
 /*
  * spec-7.3 D2 — read a worker's published pid (0 = not running).  worker_id

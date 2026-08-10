@@ -25,9 +25,9 @@
  *	  converts it to a fail-closed DENIED, never a worker/LMS exit or a
  *	  wrong-order construction.
  *
- *	  The slot state word is an atomic; each transition has exactly one
- *	  writer (LMON: FREE→PENDING, READY→FREE; LMS: PENDING→BUSY→READY),
- *	  so no lock is needed beyond the CAS on FREE→PENDING.
+ *	  The slot state word is atomic.  Every reservation claim additionally
+ *	  uses the existing ClusterLmsSharedState lwlock so legacy and R4
+ *	  claimants share one proof window without adding a CR-server lock.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -56,6 +56,7 @@
 #include "access/xlog.h"	  /* GetFlushRecPtr (spec-6.12i live_hwm_lsn) */
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_elog.h" /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block_dedup.h" /* PGRAC: spec-7.3 P2-1 — note_misroute */
@@ -233,7 +234,20 @@ cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn, char dst[BLCKSZ],
 		result = CLUSTER_CR_BUILD_FULL;
 
 admitted_done:
-		;
+		switch (result) {
+		case CLUSTER_CR_BUILD_FULL:
+			cluster_r4_observe(CLUSTER_R4_EVENT_CR_HOLDER_FULL,
+						   CLUSTER_TX_RESOLVE_NONE, reason);
+			break;
+		case CLUSTER_CR_BUILD_RETRYABLE:
+			cluster_r4_observe(CLUSTER_R4_EVENT_CR_HOLDER_RETRY,
+						   CLUSTER_TX_RESOLVE_NONE, reason);
+			break;
+		case CLUSTER_CR_BUILD_FAIL_CLOSED:
+			cluster_r4_observe(CLUSTER_R4_EVENT_CR_HOLDER_FAIL_CLOSED,
+						   CLUSTER_TX_RESOLVE_NONE, reason);
+			break;
+		}
 	}
 	PG_FINALLY();
 	{
@@ -305,6 +319,47 @@ cr_server_wake_lms(void)
 }
 
 /*
+ * spec-8.4 D4-B — common proof window for every legacy reservation claim.
+ * A busy slot belongs to its current writer and must not be canonicalized by
+ * a losing legacy claimant.  A FREE winner clears only the complete R4 owner
+ * stamp, publishes that zero stamp, and performs its existing state CAS while
+ * holding the one shared LMS proof lock.
+ */
+static bool
+cr_server_reserve_legacy_slot(ClusterLmsCrSlot *slot, uint32 reserved_state)
+{
+	ClusterLmsSharedState *lms_state;
+	uint32 expected = CLUSTER_LMS_CR_FREE;
+	bool reserved = false;
+
+	if (slot == NULL
+		|| (reserved_state != CLUSTER_LMS_CR_PENDING
+			&& reserved_state != CLUSTER_LMS_CR_FILLING))
+		return false;
+	lms_state = cluster_lms_shared_state();
+	if (lms_state == NULL)
+		return false;
+
+	LWLockAcquire(&lms_state->lwlock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u32(&slot->state) == CLUSTER_LMS_CR_FREE) {
+		memset(&slot->r4.owner, 0, sizeof(slot->r4.owner));
+		pg_write_barrier();
+		reserved = pg_atomic_compare_exchange_u32(&slot->state, &expected, reserved_state);
+	}
+	LWLockRelease(&lms_state->lwlock);
+
+	return reserved;
+}
+
+#ifdef USE_CLUSTER_UNIT
+bool
+cluster_cr_server_test_reserve_legacy_slot(ClusterLmsCrSlot *slot, uint32 reserved_state)
+{
+	return cr_server_reserve_legacy_slot(slot, reserved_state);
+}
+#endif
+
+/*
  * cluster_lms_cr_submit — CONTROL-plane park.  The caller (the GCS_BLOCK_
  * FORWARD handler running in LMON when the family is on the control plane)
  * has already range-checked the transition id and knows the payload carries
@@ -321,9 +376,8 @@ cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd)
 
 	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
-		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		if (!cr_server_reserve_legacy_slot(slot, CLUSTER_LMS_CR_PENDING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -388,9 +442,8 @@ cluster_lms_undo_fetch_submit(const GcsBlockForwardPayload *fwd)
 
 	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
-		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		if (!cr_server_reserve_legacy_slot(slot, CLUSTER_LMS_CR_PENDING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -467,9 +520,8 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 
 	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
-		uint32 expected = CLUSTER_LMS_CR_FREE;
 
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_PENDING))
+		if (!cr_server_reserve_legacy_slot(slot, CLUSTER_LMS_CR_PENDING))
 			continue;
 
 		slot->tag = fwd->tag;
@@ -539,12 +591,11 @@ cluster_lms_undo_multi_verdict_submit(const GcsBlockForwardPayload *fwd)
 
 	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
-		uint32 expected = CLUSTER_LMS_CR_FREE;
 
 		/* Reserve producer-only FILLING first (spec-7.1 integration review):
 		 * landing directly on PENDING would let the LMS drain acquire the
 		 * slot before the request fields below are written. */
-		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FILLING))
+		if (!cr_server_reserve_legacy_slot(slot, CLUSTER_LMS_CR_FILLING))
 			continue;
 
 		slot->tag = fwd->tag;
