@@ -87,12 +87,14 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 
 	switch (msg_type) {
 	case PGRAC_IC_MSG_GCS_BLOCK_REQUEST:
-		if (payload_len != sizeof(GcsBlockRequestPayload))
+		if (payload_len != sizeof(GcsBlockRequestPayload)
+			&& payload_len != sizeof(ClusterR4CrRequestPayload))
 			return -1;
 		tag = &((const GcsBlockRequestPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
-		if (payload_len != sizeof(GcsBlockForwardPayload))
+		if (payload_len != sizeof(GcsBlockForwardPayload)
+			&& payload_len != sizeof(ClusterR4CrForwardPayload))
 			return -1;
 		tag = &((const GcsBlockForwardPayload *)payload)->tag;
 		break;

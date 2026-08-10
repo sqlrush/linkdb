@@ -604,10 +604,39 @@ DEFINE_WIRE_TEST(87)
 
 #define RUN_WIRE_TEST(n) UT_RUN(test_wire_vector_##n)
 
+UT_TEST(test_r4_reply_status_abi_tail_is_exact)
+{
+	UT_ASSERT_EQ(GCS_BLOCK_REPLY_R4_CR_FULL, 21);
+	UT_ASSERT_EQ(GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT, 22);
+	UT_ASSERT_EQ(GCS_BLOCK_REPLY_R4_MULTI_RESOLVE_RESULT, 23);
+	UT_ASSERT_EQ(GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT, 24);
+	UT_ASSERT_EQ(GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED, 25);
+	UT_ASSERT_EQ(GCS_BLOCK_REPLY_R4_DENIED, 26);
+}
+
+UT_TEST(test_r4_and_legacy_reply_status_domains_are_disjoint)
+{
+	int status;
+
+	for (status = 0; status <= 20; status++) {
+		UT_ASSERT(GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)status));
+		UT_ASSERT(!GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)status));
+		UT_ASSERT(!GcsBlockReplyStatusIsR4Refusal((GcsBlockReplyStatus)status));
+	}
+	for (status = 21; status <= 26; status++) {
+		UT_ASSERT(!GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)status));
+		UT_ASSERT(GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)status));
+		UT_ASSERT_EQ(GcsBlockReplyStatusIsR4Refusal((GcsBlockReplyStatus)status),
+					 status >= 25);
+	}
+	UT_ASSERT(!GcsBlockReplyStatusIsLegacy((GcsBlockReplyStatus)-1));
+	UT_ASSERT(!GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)27));
+}
+
 int
 main(void)
 {
-	UT_PLAN(88);
+	UT_PLAN(90);
 	RUN_WIRE_TEST(0);
 	RUN_WIRE_TEST(1);
 	RUN_WIRE_TEST(2);
@@ -696,6 +725,8 @@ main(void)
 	RUN_WIRE_TEST(85);
 	RUN_WIRE_TEST(86);
 	RUN_WIRE_TEST(87);
+	UT_RUN(test_r4_reply_status_abi_tail_is_exact);
+	UT_RUN(test_r4_and_legacy_reply_status_domains_are_disjoint);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

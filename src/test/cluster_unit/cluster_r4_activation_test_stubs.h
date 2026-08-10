@@ -37,6 +37,16 @@ cluster_epoch_get_current(void)
 	return 0;
 }
 
+bool cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
+											uint32 expected_generation);
+bool
+cluster_sf_peer_capability_generation_matches(int32 peer_id pg_attribute_unused(),
+											uint32 required_capabilities pg_attribute_unused(),
+											uint32 expected_generation pg_attribute_unused())
+{
+	return false;
+}
+
 void
 on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
 {}

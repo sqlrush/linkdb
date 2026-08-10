@@ -156,12 +156,56 @@ typedef enum GcsBlockDedupEntryKind {
 	GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED = 3,
 	/* Exact descriptor/byte cleanup completed after local TERMINAL_DRAINED.
 	 * Keep the binding as an ACK replay tombstone until exact RETIRE. */
-	GCS_BLOCK_DEDUP_ENTRY_PCM_X_DRAINED = 4
+	GCS_BLOCK_DEDUP_ENTRY_PCM_X_DRAINED = 4,
+	GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE = 5
 } GcsBlockDedupEntryKind;
+
+typedef enum GcsBlockR4RouteState {
+	GCS_BLOCK_R4_ROUTE_ROUTING = 1,
+	GCS_BLOCK_R4_ROUTE_FORWARDED = 2,
+	GCS_BLOCK_R4_ROUTE_RETRYABLE = 3
+} GcsBlockR4RouteState;
+
+typedef struct GcsBlockR4RouteIdentity {
+	GcsBlockDedupKey legacy_key;
+	BufferTag tag;
+	SCN read_scn;
+	uint64 activation_generation;
+} GcsBlockR4RouteIdentity;
+
+typedef struct GcsBlockR4RouteRecord {
+	ClusterR4CrRouteProof proof;
+	uint8 state;
+	uint8 reserved[47];
+} GcsBlockR4RouteRecord;
+
+typedef enum GcsBlockR4RouteArmResult {
+	GCS_BLOCK_R4_ROUTE_ARM_INVALID = -1,
+	GCS_BLOCK_R4_ROUTE_ARM_NEW = 0,
+	GCS_BLOCK_R4_ROUTE_ARM_REPLAY = 1,
+	GCS_BLOCK_R4_ROUTE_ARM_RETRYABLE = 2,
+	GCS_BLOCK_R4_ROUTE_ARM_IDENTITY_COLLISION = 3,
+	GCS_BLOCK_R4_ROUTE_ARM_HOLDER_MOVED = 4,
+	GCS_BLOCK_R4_ROUTE_ARM_FULL = 5
+} GcsBlockR4RouteArmResult;
+
+typedef enum GcsBlockR4RouteSendResult {
+	GCS_BLOCK_R4_ROUTE_SEND_INVALID = -1,
+	GCS_BLOCK_R4_ROUTE_SEND_FORWARDED = 0,
+	GCS_BLOCK_R4_ROUTE_SEND_RETRYABLE = 1,
+	GCS_BLOCK_R4_ROUTE_SEND_STALE = 2,
+	GCS_BLOCK_R4_ROUTE_SEND_COLLISION = 3
+} GcsBlockR4RouteSendResult;
+
+StaticAssertDecl(sizeof(GcsBlockR4RouteIdentity) == 64,
+				 "R4 CR route identity must remain 64 bytes");
+StaticAssertDecl(sizeof(GcsBlockR4RouteRecord) == 128,
+				 "R4 CR route record must remain 128 bytes");
 
 typedef union GcsBlockDedupPayloadMeta {
 	ClusterSfDepVec sf_dep_vec;
 	GcsBlockPcmXImageIdentity pcm_x_identity;
+	GcsBlockR4RouteRecord r4_route;
 } GcsBlockDedupPayloadMeta;
 
 StaticAssertDecl(sizeof(GcsBlockDedupPayloadMeta) == 128,
@@ -183,8 +227,8 @@ typedef struct GcsBlockDedupEntry {
 	uint8 _pad1[5];						   /*  5B — dep_vec @ 112 */
 	GcsBlockDedupPayloadMeta payload_meta; /* 128B — deps or exact PCM-X identity */
 	char block_data[GCS_BLOCK_DATA_SIZE];  /* 8192B — full page payload */
-	TimestampTz completed_at_ts;		   /*  8B — TTL sweep replied */
-	TimestampTz registered_at_ts;		   /*  8B — TTL sweep in-flight */
+	TimestampTz completed_at_ts;		   /*  8B — generic wall / R4 monotonic replied */
+	TimestampTz registered_at_ts;		   /*  8B — generic wall / R4 monotonic in-flight */
 	TimestampTz done_at_ts;				   /*  8B — round-2: DONE proof consumed */
 	int64 pinned_lifetime_us;			   /*  8B — round-2: TTL pinned at register */
 	int64 pinned_done_linger_us;		   /*  8B — round-2: quarantine pinned */
@@ -477,6 +521,17 @@ extern GcsBlockDedupResult cluster_gcs_block_dedup_lookup_or_register(
 	int worker_id, const GcsBlockDedupKey *key, BufferTag tag, uint8 transition_id,
 	uint32 requester_lifetime_hint_ms, bool requester_done_capable,
 	GcsBlockDedupEntry *cached_reply_out);
+
+extern GcsBlockR4RouteArmResult cluster_gcs_block_dedup_r4_route_arm_or_match(
+	int worker_id, const GcsBlockR4RouteIdentity *identity, uint8 transition_id,
+	const ClusterR4CrRouteProof *fresh_proof, uint32 requester_lifetime_hint_ms,
+	bool lifetime_hint_trusted, GcsBlockR4RouteRecord *record_out);
+extern GcsBlockR4RouteSendResult cluster_gcs_block_dedup_r4_route_finish_send(
+	int worker_id, const GcsBlockR4RouteIdentity *identity, uint8 transition_id,
+	const ClusterR4CrRouteProof *armed_proof, bool outbound_admitted);
+extern uint64 cluster_gcs_block_dedup_r4_route_sweep_epoch(uint64 current_epoch);
+extern uint64 cluster_gcs_block_dedup_r4_route_count(void);
+extern uint64 cluster_gcs_block_dedup_r4_route_purge_closed(void);
 
 /* Under the routed shard lock, terminate one same-tag, still-live legacy
  * N->S grant/forward identity after PCM-X publishes its queue-kind claim.

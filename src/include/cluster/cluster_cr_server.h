@@ -216,6 +216,14 @@ extern void cluster_cr_server_publish_lms_latch(struct Latch *latch);
  * data plane off (caller replies the fail-closed DENIED immediately). */
 extern bool cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd);
 
+/*
+ * R4 FORWARD96 holder-submit boundary.  D3 supplies the typed handoff only;
+ * D4 owns every positive stable-copy/slot submission path.  Until that D4
+ * integration exists, this boundary refuses without narrowing FORWARD96 to
+ * the legacy 64-byte submit ABI.
+ */
+extern bool cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward);
+
 /* LMON dispatch side (spec-6.12i D-i1): park a validated undo-TT fetch
  * request; false = wave GUC off on this node / malformed synthetic tag / no
  * capacity (caller replies the fail-closed DENIED immediately — the

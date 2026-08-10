@@ -426,6 +426,29 @@ cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
 	return supported;
 }
 
+/* Generic, record-coherent required/optional capability sample. */
+bool
+cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_capabilities,
+										 uint32 optional_capabilities,
+										 bool *optional_supported_out, uint32 *generation_out)
+{
+	bool supported;
+
+	if (optional_supported_out != NULL)
+		*optional_supported_out = false;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_family_sample(
+		&ClusterSfDep->peer_capabilities[peer_id], required_capabilities, optional_capabilities,
+		optional_supported_out, generation_out);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
 /* Drain-side exact fence for a capability-bound LMS slot. */
 bool
 cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,

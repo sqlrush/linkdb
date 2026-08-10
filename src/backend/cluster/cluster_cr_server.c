@@ -348,6 +348,23 @@ cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd)
 }
 
 /*
+ * cluster_lms_cr_submit_r4 — typed R4 FORWARD96 holder-submit boundary.
+ *
+ * D3 deliberately does not reinterpret the 96-byte route proof as the
+ * legacy 64-byte payload: that would discard the proof.  D4 owns the future
+ * stable-copy and slot-proof positive integration, so this pre-D4 boundary
+ * remains fail closed without allocating a slot or mutating shared state.
+ */
+bool
+cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward)
+{
+	if (forward == NULL)
+		return false;
+
+	return false;
+}
+
+/*
  * cluster_lms_undo_fetch_submit — CONTROL-plane park (spec-6.12i D-i1).
  *
  *	Park an undo-TT fetch request.  The caller branches on the undo-fetch

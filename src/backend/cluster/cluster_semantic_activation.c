@@ -17,8 +17,10 @@
 #include "postgres.h"
 
 #include "miscadmin.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
@@ -752,6 +754,26 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 			   (ClusterSemanticAdmissionSide)token->side, token->record_generation,
 			   snapshot.record_generation)
 		   == CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+bool
+cluster_semantic_activation_peer_open_matches(
+	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
+	uint32 required_hello_caps, uint32 sampled_capability_generation)
+{
+	if (token == NULL || !token->entered
+		|| token->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| token->side != CLUSTER_SEMANTIC_TARGET_SIDE || authenticated_peer_node_id < 0
+		|| authenticated_peer_node_id >= CLUSTER_MAX_NODES || required_hello_caps == 0)
+		return false;
+	if (!cluster_semantic_activation_recheck(token))
+		return false;
+	if (!cluster_sf_peer_capability_generation_matches(
+			authenticated_peer_node_id, required_hello_caps, sampled_capability_generation))
+		return false;
+
+	/* D13 owns positive results after installing its frozen ACK table. */
+	return false;
 }
 
 void

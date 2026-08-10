@@ -1510,8 +1510,8 @@ typedef enum GcsBlockReplyStatus {
 													 * reply instead — the requester
 													 * keeps 53R97 (Rule 8.A). */
 	,
-	GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT = 20 /* PGRAC: spec-7.1 D3-b NEW; the
-													 * origin's LMS enumerated a foreign
+	GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT = 20, /* PGRAC: spec-7.1 D3-b NEW; the
+												 * origin's LMS enumerated a foreign
 													 * multixact's members and served a
 													 * per-updater-member batch verdict
 													 * (ClusterGcsUndoMultiVerdictPage in
@@ -1520,8 +1520,14 @@ typedef enum GcsBlockReplyStatus {
 													 * statuses 18/19.  Shipped ONLY when
 													 * every updater member is proven
 													 * (status SERVED); any unprovable
-													 * multi is a DENIED reply — the
-													 * requester keeps 53R97 (Rule 8.A). */
+												 * multi is a DENIED reply — the
+												 * requester keeps 53R97 (Rule 8.A). */
+	GCS_BLOCK_REPLY_R4_CR_FULL = 21,
+	GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT = 22,
+	GCS_BLOCK_REPLY_R4_MULTI_RESOLVE_RESULT = 23,
+	GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT = 24,
+	GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED = 25,
+	GCS_BLOCK_REPLY_R4_DENIED = 26
 } GcsBlockReplyStatus;
 
 /*
@@ -1565,7 +1571,34 @@ StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT == GCS_BLOCK_REPLY_UNDO_TT_
 				 "spec-6.12i undo-verdict status must follow the undo-TT fetch status");
 StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
 					 == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT + 1,
-				 "spec-7.1 D3-b undo-multi-verdict status must be the tail enum value");
+				 "spec-7.1 D3-b undo-multi-verdict status must follow undo-verdict");
+StaticAssertDecl(GCS_BLOCK_REPLY_R4_CR_FULL == 21,
+				 "R4 reply status ABI must begin at 21");
+StaticAssertDecl(GCS_BLOCK_REPLY_R4_DENIED == 26,
+				 "R4 reply status ABI must end at 26");
+
+/* PGRAC adaptation: R4 owns one closed status suffix.  Keep the domain
+ * predicates numeric so legacy and R4 decoders cannot accept each other's
+ * frames merely because both use the 48+BLCKSZ envelope shape. */
+static inline bool
+GcsBlockReplyStatusIsLegacy(GcsBlockReplyStatus status)
+{
+	return status >= GCS_BLOCK_REPLY_GRANTED
+		   && status <= GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
+}
+
+static inline bool
+GcsBlockReplyStatusIsR4(GcsBlockReplyStatus status)
+{
+	return status >= GCS_BLOCK_REPLY_R4_CR_FULL && status <= GCS_BLOCK_REPLY_R4_DENIED;
+}
+
+static inline bool
+GcsBlockReplyStatusIsR4Refusal(GcsBlockReplyStatus status)
+{
+	return status == GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED
+		   || status == GCS_BLOCK_REPLY_R4_DENIED;
+}
 
 /* PGRAC: spec-6.12i / spec-7.1 — every undo-plane reply kind (TT-header fetch,
  * single-xid verdict, batched multi-member verdict) ships the BLCKSZ page plus
@@ -2404,6 +2437,9 @@ typedef struct ClusterR4CrRouteProof {
 	int32 selected_holder_node;
 } ClusterR4CrRouteProof;
 
+StaticAssertDecl(sizeof(ClusterR4CrRouteProof) == 80,
+				 "R4 CR route proof must remain 80 bytes");
+
 /*
  * R4 D3 master-side policy over one coherent PCM snapshot.  NONE means one
  * canonical current holder was selected.  This helper neither queries nor
@@ -2812,9 +2848,6 @@ cluster_r4_transition_lookup(ClusterR4OperationState state, ClusterR4OperationEv
 #undef CLUSTER_R4_ROUTE_OWNERS
 
 extern const char *cluster_cr_build_reason_name(ClusterCrBuildReason reason);
-extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(
-	const BufferTag *tag, SCN read_scn, uint64 request_id, int32 requester_backend_id,
-	ClusterR4CrRouteProof *out, ClusterCrBuildReason *reason_out);
 
 typedef enum ClusterR4WireKind {
 	CLUSTER_R4_WIRE_CR_BUILD = 1,
@@ -2858,6 +2891,40 @@ StaticAssertDecl(offsetof(ClusterR4ForwardExtension,
 						 kind.cr.master_resource_transition_count_le)
 					 == 12,
 				 "R4 FORWARD96 transition count must occupy absolute bytes 76..83");
+
+typedef struct ClusterR4CrRequestPayload {
+	GcsBlockRequestPayload base;
+	ClusterR4RequestExtension extension;
+} ClusterR4CrRequestPayload;
+
+typedef struct ClusterR4CrForwardPayload {
+	GcsBlockForwardPayload base;
+	ClusterR4ForwardExtension extension;
+} ClusterR4CrForwardPayload;
+
+StaticAssertDecl(sizeof(ClusterR4CrRequestPayload) == 80,
+				 "R4 CR request payload must remain 80 bytes");
+StaticAssertDecl(sizeof(ClusterR4CrForwardPayload) == 96,
+				 "R4 CR forward payload must remain 96 bytes");
+
+struct ClusterICEnvelope;
+extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(
+	const struct ClusterICEnvelope *env, const ClusterR4CrRequestPayload *request,
+	ClusterCrBuildReason *reason_out);
+#ifdef USE_CLUSTER_UNIT
+extern bool cluster_gcs_block_test_r4_request80(const struct ClusterICEnvelope *env,
+											 const void *payload);
+extern bool cluster_gcs_block_test_r4_forward96(const struct ClusterICEnvelope *env,
+											 const void *payload);
+extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result,
+											  ClusterCrBuildReason reason,
+											  bool admitted_forward,
+											  GcsBlockReplyStatus *status_out);
+extern bool cluster_gcs_block_test_decode_r4_reply(
+	const struct ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
+	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
+	int32 expected_sender_node);
+#endif
 
 static inline void
 ClusterR4WireWriteU16(uint8 out[2], uint16 value)

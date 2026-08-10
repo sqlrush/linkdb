@@ -702,6 +702,15 @@ cluster_epoch_get_current(void)
 {
 	return 0;
 }
+bool cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
+											uint32 expected_generation);
+bool
+cluster_sf_peer_capability_generation_matches(int32 peer_id pg_attribute_unused(),
+											uint32 required_capabilities pg_attribute_unused(),
+											uint32 expected_generation pg_attribute_unused())
+{
+	return false;
+}
 #ifndef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 void
 cluster_voting_disk_io_install_timeout_handler(void)

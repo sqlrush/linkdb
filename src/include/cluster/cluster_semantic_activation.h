@@ -136,6 +136,9 @@ extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
 								  ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);
+extern bool cluster_semantic_activation_peer_open_matches(
+	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
+	uint32 required_hello_caps, uint32 sampled_capability_generation);
 extern void cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token);
 extern Size cluster_semantic_activation_shmem_size(void);
 extern void cluster_semantic_activation_shmem_init(void);

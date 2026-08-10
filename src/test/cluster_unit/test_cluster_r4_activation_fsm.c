@@ -7,8 +7,10 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_sf_dep.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
@@ -35,6 +37,11 @@ static int test_exit_registration_count;
 static uint64 test_current_epoch = 7;
 static int test_read_barrier_count;
 static int test_advance_epoch_on_read_barrier;
+static bool test_peer_capability_matches;
+static int test_peer_capability_match_calls;
+static int32 test_peer_capability_match_peer;
+static uint32 test_peer_capability_match_caps;
+static uint32 test_peer_capability_match_generation;
 
 int MyProcPid = 101;
 volatile sig_atomic_t InterruptPending = false;
@@ -69,6 +76,17 @@ on_shmem_exit(pg_on_exit_callback function, Datum arg)
 void
 ProcessInterrupts(void)
 {}
+
+bool
+cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
+									  uint32 expected_generation)
+{
+	test_peer_capability_match_calls++;
+	test_peer_capability_match_peer = peer_id;
+	test_peer_capability_match_caps = required_capabilities;
+	test_peer_capability_match_generation = expected_generation;
+	return test_peer_capability_matches;
+}
 
 static void
 test_read_barrier(void)
@@ -167,6 +185,11 @@ test_gate_reset(void)
 	test_current_epoch = 7;
 	test_read_barrier_count = 0;
 	test_advance_epoch_on_read_barrier = 0;
+	test_peer_capability_matches = false;
+	test_peer_capability_match_calls = 0;
+	test_peer_capability_match_peer = -1;
+	test_peer_capability_match_caps = 0;
+	test_peer_capability_match_generation = UINT32_MAX;
 	MyProcPid = 101;
 	SemanticActivationShmem = NULL;
 	memset(semantic_activation_local_inflight, 0, sizeof(semantic_activation_local_inflight));
@@ -1036,10 +1059,78 @@ UT_TEST(test_113_recheck_samples_snapshot_before_epoch)
 	cluster_semantic_activation_leave(&token);
 }
 
+UT_TEST(test_114_peer_open_matcher_stays_closed_until_d13_ack_table)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 23, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+											   CLUSTER_SEMANTIC_TARGET_SIDE, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	test_peer_capability_matches = true;
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(
+		&token, 7, PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+					   | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1,
+		0));
+	UT_ASSERT_EQ(test_peer_capability_match_calls, 1);
+	UT_ASSERT_EQ(test_peer_capability_match_peer, 7);
+	UT_ASSERT_EQ(test_peer_capability_match_caps,
+				 PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+					 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1);
+	UT_ASSERT_EQ(test_peer_capability_match_generation, 0);
+	cluster_semantic_activation_leave(&token);
+}
+
+UT_TEST(test_115_peer_open_matcher_rejects_invalid_inputs_before_capability_match)
+{
+	ClusterSemanticAdmissionToken target_token;
+	ClusterSemanticAdmissionToken source_token;
+	ClusterSemanticAdmissionToken wrong_feature_token;
+	uint32 required_caps = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+						  | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+											   CLUSTER_SEMANTIC_SOURCE_SIDE, &source_token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(&source_token, 7, required_caps, 0));
+	UT_ASSERT_EQ(test_peer_capability_match_calls, 0);
+	cluster_semantic_activation_leave(&source_token);
+
+	test_gate_reset();
+	test_gate_publish(2, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 24, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+											   CLUSTER_SEMANTIC_TARGET_SIDE, &target_token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	wrong_feature_token = target_token;
+	wrong_feature_token.feature_bit = 0;
+	test_peer_capability_matches = true;
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(NULL, 7, required_caps, 0));
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(&(ClusterSemanticAdmissionToken){0}, 7,
+															  required_caps, 0));
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(&wrong_feature_token, 7,
+															  required_caps, 0));
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(&target_token, -1, required_caps, 0));
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(&target_token, CLUSTER_MAX_NODES,
+															  required_caps, 0));
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(&target_token, 7, 0, 0));
+	UT_ASSERT_EQ(test_peer_capability_match_calls, 0);
+	test_current_epoch++;
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(&target_token, 7, required_caps, 0));
+	UT_ASSERT_EQ(test_peer_capability_match_calls, 0);
+	test_current_epoch--;
+	test_peer_capability_matches = false;
+	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(&target_token, 7, required_caps, 0));
+	UT_ASSERT_EQ(test_peer_capability_match_calls, 1);
+	cluster_semantic_activation_leave(&target_token);
+}
+
 int
 main(void)
 {
-	UT_PLAN(113);
+	UT_PLAN(115);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -1153,6 +1244,8 @@ main(void)
 	UT_RUN(test_111_formation_change_closes_before_debt_drain);
 	UT_RUN(test_112_enter_samples_second_snapshot_before_epoch);
 	UT_RUN(test_113_recheck_samples_snapshot_before_epoch);
+	UT_RUN(test_114_peer_open_matcher_stays_closed_until_d13_ack_table);
+	UT_RUN(test_115_peer_open_matcher_rejects_invalid_inputs_before_capability_match);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

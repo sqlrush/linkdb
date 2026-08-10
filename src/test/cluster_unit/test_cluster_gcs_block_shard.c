@@ -383,6 +383,99 @@ UT_TEST(test_route_ignores_non_tag_fields)
 	}
 }
 
+/* R4 extended route frames retain the legacy offset-16 BufferTag key. */
+enum {
+	GCS_BLOCK_ROUTE_TAG_OFFSET = 16,
+	GCS_BLOCK_LEGACY_ROUTE_LEN = 64,
+	GCS_BLOCK_R4_REQUEST_ROUTE_LEN = 80,
+	GCS_BLOCK_R4_FORWARD_ROUTE_LEN = 96,
+	GCS_BLOCK_R4_ROUTE_PROBE_LEN = 97
+};
+
+static void
+make_r4_route_frame(uint8 *frame, Size frame_len, BufferTag tag, uint8 fill)
+{
+	memset(frame, fill, frame_len);
+	memcpy(frame + GCS_BLOCK_ROUTE_TAG_OFFSET, &tag, sizeof(tag));
+}
+
+/* ======================================================================
+ * U8 -- REQUEST80 and FORWARD96 use the same offset-16 tag shard as their
+ *		 legacy 64-byte forms.  Changing every byte outside the tag must not
+ *		 move either extended frame to another worker.
+ * ====================================================================== */
+UT_TEST(test_r4_extended_route_exact_lengths_and_tag_affinity)
+{
+	BufferTag tag = make_tag(1663, 5, 24002, MAIN_FORKNUM, 101);
+	GcsBlockRequestPayload legacy_req = make_request(tag);
+	GcsBlockForwardPayload legacy_fwd = make_forward(tag);
+	union {
+		uint64 align;
+		uint8 bytes[GCS_BLOCK_R4_ROUTE_PROBE_LEN];
+	} req_a, req_b, fwd_a, fwd_b;
+	int expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+
+	UT_ASSERT_EQ(sizeof(legacy_req), GCS_BLOCK_LEGACY_ROUTE_LEN);
+	UT_ASSERT_EQ(sizeof(legacy_fwd), GCS_BLOCK_LEGACY_ROUTE_LEN);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, &legacy_req,
+											 sizeof(legacy_req), CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &legacy_fwd,
+											 sizeof(legacy_fwd), CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+
+	make_r4_route_frame(req_a.bytes, GCS_BLOCK_R4_REQUEST_ROUTE_LEN, tag, 0x00);
+	make_r4_route_frame(req_b.bytes, GCS_BLOCK_R4_REQUEST_ROUTE_LEN, tag, 0xA5);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, req_a.bytes,
+											 GCS_BLOCK_R4_REQUEST_ROUTE_LEN,
+											 CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, req_b.bytes,
+											 GCS_BLOCK_R4_REQUEST_ROUTE_LEN,
+											 CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+
+	make_r4_route_frame(fwd_a.bytes, GCS_BLOCK_R4_FORWARD_ROUTE_LEN, tag, 0x00);
+	make_r4_route_frame(fwd_b.bytes, GCS_BLOCK_R4_FORWARD_ROUTE_LEN, tag, 0x5A);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, fwd_a.bytes,
+											 GCS_BLOCK_R4_FORWARD_ROUTE_LEN,
+											 CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, fwd_b.bytes,
+											 GCS_BLOCK_R4_FORWARD_ROUTE_LEN,
+											 CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+}
+
+/* ======================================================================
+ * U9 -- extended route admission is exact, not a minimum-size check:
+ *		 REQUEST accepts only 64/80 and FORWARD accepts only 64/96.  Adjacent
+ *		 lengths and the other frame kind's extended length fail closed.
+ * ====================================================================== */
+UT_TEST(test_r4_extended_route_length_mismatch_refused)
+{
+	BufferTag tag = make_tag(1663, 5, 24003, MAIN_FORKNUM, 103);
+	union {
+		uint64 align;
+		uint8 bytes[GCS_BLOCK_R4_ROUTE_PROBE_LEN];
+	} payload;
+	const uint16 request_bad_lengths[] = { 0, 63, 65, 79, 81, 95, 96, 97 };
+	const uint16 forward_bad_lengths[] = { 0, 63, 65, 79, 80, 81, 95, 97 };
+	Size i;
+
+	make_r4_route_frame(payload.bytes, sizeof(payload.bytes), tag, 0xC3);
+	for (i = 0; i < lengthof(request_bad_lengths); i++)
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
+												 payload.bytes, request_bad_lengths[i],
+												 CLUSTER_LMS_MAX_WORKERS),
+					 -1);
+	for (i = 0; i < lengthof(forward_bad_lengths); i++)
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+												 payload.bytes, forward_bad_lengths[i],
+												 CLUSTER_LMS_MAX_WORKERS),
+					 -1);
+}
+
 /* Every staged PCM-X frame is tag-affine.  RETIRE/RETIRE_ACK are the only
  * direct-send members because their compact payload intentionally has no tag. */
 UT_TEST(test_pcm_x_route_truth_table)
@@ -477,7 +570,7 @@ UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(11);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -485,6 +578,8 @@ main(void)
 	UT_RUN(test_route_length_mismatch_refused);
 	UT_RUN(test_route_n1_degenerate_zero);
 	UT_RUN(test_route_ignores_non_tag_fields);
+	UT_RUN(test_r4_extended_route_exact_lengths_and_tag_affinity);
+	UT_RUN(test_r4_extended_route_length_mismatch_refused);
 	UT_RUN(test_pcm_x_route_truth_table);
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_DONE();
