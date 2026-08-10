@@ -64,6 +64,7 @@
 
 #include "c.h"
 #include "access/transam.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_scn.h" /* SCN */
 
 /*
@@ -180,6 +181,42 @@ typedef enum ClusterVisibilityDecision {
 } ClusterVisibilityDecision;
 
 /*
+ * R4 dormant-source TT dispatch.
+ *
+ * The legacy overlay operations remain available only behind the common
+ * semantic-activation admission token.  Control-plane flush, shmem and
+ * counter-reader APIs remain outside this operation domain.
+ */
+typedef enum ClusterTTStatusSourceOp {
+	CLUSTER_TT_SOURCE_LOOKUP = 0,
+	CLUSTER_TT_SOURCE_INSTALL_LOCAL = 1,
+	CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED = 2,
+	CLUSTER_TT_SOURCE_DELETE_EXACT = 3,
+	CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT = 4,
+	CLUSTER_TT_SOURCE_BUMP_SELF_CONSUMER_HIT = 5,
+	CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW = 6
+} ClusterTTStatusSourceOp;
+
+typedef struct ClusterTTStatusSourceRequest {
+	const ClusterTTStatusKey *key;
+	const ClusterTTStatusKey *parent_key;
+	ClusterTTStatus status;
+	SCN commit_scn;
+	TransactionId xid;
+} ClusterTTStatusSourceRequest;
+
+typedef struct ClusterTTStatusSourceResult {
+	bool bool_value;
+	int int_value;
+	ClusterTTStatusResult lookup;
+} ClusterTTStatusSourceResult;
+
+extern ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
+								  const ClusterTTStatusSourceRequest *request,
+								  ClusterTTStatusSourceResult *result);
+
+/*
  * cluster_visibility_decide_by_scn -- spec-3.3 D5 inline helper.
  *
  * Decides cluster-side MVCC visibility from a remote commit_scn and the
@@ -227,11 +264,6 @@ cluster_visibility_decide_by_scn(SCN commit_scn, SCN read_scn)
  * cluster_tt_status_shmem_size / _shmem_init / _shmem_register:
  *	  shmem layout (D2).
  */
-extern bool cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key,
-										   ClusterTTStatusResult *result);
-extern bool cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
-											SCN commit_scn);
-extern int cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn);
 extern void cluster_tt_status_flush_all(uint32 new_epoch);
 
 /*
@@ -243,8 +275,6 @@ extern void cluster_tt_status_flush_all(uint32 new_epoch);
  *	  actually deleted.  Spec-3.4c F4:  required so test-only clear does
  *	  not fake-clear via writing ABORTED (semantic conflict).
  */
-extern bool cluster_tt_status_delete_exact(const ClusterTTStatusKey *key);
-
 /*
  * cluster_tt_status_flush_all_at_activation:
  *	  spec-3.4b D8 / Q4 HC (L191): code-enforced automatic flush wired
@@ -266,8 +296,6 @@ extern void cluster_tt_status_shmem_register(void);
  * ONLY by D5/D6 commit hook to record the runtime N7 self-consumer
  * lookup (spec-3.1 v0.4 N7).  Do not call from unrelated paths.
  */
-extern void cluster_tt_status_bump_self_consumer_hit(void);
-
 /*
  * Counter getters — exposed via pg_cluster_state "tt_status" category
  * (cluster_debug.c).  Always linked (return 0 in disabled-cluster
@@ -351,15 +379,11 @@ extern uint64 cluster_tt_status_get_evict_fail_count(void);
  *	  ensure parent binding exists first (cluster_subtrans_ensure_parent_binding).
  *	  Returns true on install, false if overlay full / unavailable.
  */
-extern bool cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
-												   const ClusterTTStatusKey *parent_key);
-
 /*
  * Counter getters for spec-3.5 SUBCOMMITTED path (always linked).
  */
 extern uint64 cluster_tt_status_get_subcommitted_install_count(void);
 extern uint64 cluster_tt_status_get_subcommitted_lookup_hit_count(void);
 extern uint64 cluster_tt_status_get_parent_chain_follow_count(void);
-extern void cluster_tt_status_bump_parent_chain_follow(void);
 
 #endif /* CLUSTER_TT_STATUS_H */

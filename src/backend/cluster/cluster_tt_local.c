@@ -508,7 +508,19 @@ build_local_key(TransactionId xid, ClusterTTStatusKey *out)
 static void
 install_key(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_scn)
 {
-	bool installed = cluster_tt_status_install_local(key, status, commit_scn);
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
+	ClusterTTStatusHintSourceRequest hint_request;
+	bool installed;
+
+	memset(&source_request, 0, sizeof(source_request));
+	source_request.key = key;
+	source_request.status = status;
+	source_request.commit_scn = commit_scn;
+	installed = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &source_request,
+											 &source_result)
+			== CLUSTER_SEMANTIC_ADMISSION_OK
+		&& source_result.bool_value;
 
 	if (!installed)
 		return;
@@ -516,21 +528,39 @@ install_key(const ClusterTTStatusKey *key, ClusterTTStatus status, SCN commit_sc
 #ifdef USE_ASSERT_CHECKING
 	{
 		ClusterTTStatusResult res;
+		ClusterTTStatusSourceRequest lookup_request;
+		ClusterTTStatusSourceResult lookup_result;
 		bool hit = false;
 		bool epoch_stable = ((uint32)cluster_epoch_get_current() == key->cluster_epoch);
 
 		if (epoch_stable) {
-			hit = cluster_tt_status_lookup_exact(key, &res);
+			memset(&lookup_request, 0, sizeof(lookup_request));
+			lookup_request.key = key;
+			hit = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &lookup_request,
+														 &lookup_result)
+					== CLUSTER_SEMANTIC_ADMISSION_OK
+				&& lookup_result.bool_value;
+			res = lookup_result.lookup;
 			epoch_stable = ((uint32)cluster_epoch_get_current() == key->cluster_epoch);
 		}
 		if (epoch_stable)
 			Assert(hit && res.authoritative && res.status == status);
-		if (hit && res.authoritative && res.status == status)
-			cluster_tt_status_bump_self_consumer_hit();
+		if (hit && res.authoritative && res.status == status) {
+			ClusterTTStatusSourceRequest bump_request;
+			ClusterTTStatusSourceResult bump_result;
+
+			memset(&bump_request, 0, sizeof(bump_request));
+			(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_BUMP_SELF_CONSUMER_HIT,
+													&bump_request, &bump_result);
+		}
 	}
 #endif
 
-	cluster_tt_status_hint_emit(key, status, commit_scn);
+	memset(&hint_request, 0, sizeof(hint_request));
+	hint_request.key = key;
+	hint_request.status = status;
+	hint_request.commit_scn = commit_scn;
+	(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT, &hint_request);
 }
 
 static void

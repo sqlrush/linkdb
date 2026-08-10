@@ -35,9 +35,23 @@ typedef enum ClusterSemanticAdmissionResult {
 typedef struct ClusterSemanticAdmissionToken {
 	uint64 feature_bit;
 	uint64 record_generation;
+	uint64 formation_epoch;
 	uint8 side;
 	bool entered;
 } ClusterSemanticAdmissionToken;
+
+StaticAssertDecl(offsetof(ClusterSemanticAdmissionToken, feature_bit) == 0,
+				 "semantic admission feature offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticAdmissionToken, record_generation) == 8,
+				 "semantic admission generation offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticAdmissionToken, formation_epoch) == 16,
+				 "semantic admission formation offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticAdmissionToken, side) == 24,
+				 "semantic admission side offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticAdmissionToken, entered) == 25,
+				 "semantic admission entered offset must remain stable");
+StaticAssertDecl(sizeof(ClusterSemanticAdmissionToken) == 32,
+				 "semantic admission token must remain 32 bytes");
 
 typedef enum ClusterSemanticActivationPhase {
 	CLUSTER_SEMANTIC_PHASE_NONE = 0,
@@ -130,16 +144,15 @@ cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *
 extern bool cluster_semantic_activation_record_encode(const ClusterSemanticActivationRecord *record,
 													  uint8 bytes[512]);
 extern bool cluster_semantic_activation_record_decode(const uint8 bytes[512],
-												  ClusterSemanticActivationRecord *record,
-												  ClusterSemanticActivationRefusal *refusal);
-extern ClusterSemanticActivationResult
-cluster_semantic_activation_record_cas_write(uint64 expected_generation,
-											 uint64 expected_source_feature_bitmap,
-											 const uint8 bytes[512]);
-extern bool cluster_semantic_activation_qvotec_poll_record_cas(
-	ClusterSemanticActivationCasRequest *out);
-extern bool cluster_semantic_activation_qvotec_complete_record_cas(
-	uint64 request_seq, ClusterSemanticActivationResult result);
+													  ClusterSemanticActivationRecord *record,
+													  ClusterSemanticActivationRefusal *refusal);
+extern ClusterSemanticActivationResult cluster_semantic_activation_record_cas_write(
+	uint64 expected_generation, uint64 expected_source_feature_bitmap, const uint8 bytes[512]);
+extern bool
+cluster_semantic_activation_qvotec_poll_record_cas(ClusterSemanticActivationCasRequest *out);
+extern bool
+cluster_semantic_activation_qvotec_complete_record_cas(uint64 request_seq,
+													   ClusterSemanticActivationResult result);
 extern void cluster_semantic_activation_lmon_tick(void);
 extern ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,

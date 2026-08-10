@@ -46,6 +46,18 @@ static int test_enter_calls;
 static int test_recheck_calls;
 static int test_leave_calls;
 static int test_provider_calls;
+static bool test_provider_raise;
+
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
 
 ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
@@ -94,6 +106,8 @@ cluster_runtime_visibility_resolve_exact_origin(const ClusterTxLocator *locator,
 											 ClusterTxResolveReason *reason_out)
 {
 	test_provider_calls++;
+	if (test_provider_raise)
+		siglongjmp(*PG_exception_stack, 1);
 	test_provider_locator = *locator;
 	test_provider_mode = mode;
 	test_provider_epoch = formation_epoch;
@@ -187,6 +201,7 @@ reset_exact_resolver_fixture(void)
 	test_recheck_calls = 0;
 	test_leave_calls = 0;
 	test_provider_calls = 0;
+	test_provider_raise = false;
 }
 
 static ClusterItlSlotData *
@@ -355,6 +370,33 @@ UT_TEST(test_exact_cleanout_consumer_rejects_live_provider_outcome)
 	UT_ASSERT_EQ(test_recheck_calls, 0);
 	UT_ASSERT_EQ(test_leave_calls, 1);
 	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+}
+
+UT_TEST(test_exact_resolver_error_releases_target_admission_once)
+{
+	ClusterTxLocator locator = exact_locator();
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+	volatile bool caught = false;
+
+	reset_exact_resolver_fixture();
+	test_provider_raise = true;
+	PG_TRY();
+	{
+		(void)cluster_tx_resolve_exact(&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution,
+									   &reason);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_enter_calls, 1);
+	UT_ASSERT_EQ(test_provider_calls, 1);
+	UT_ASSERT_EQ(test_recheck_calls, 0);
+	UT_ASSERT_EQ(test_leave_calls, 1);
 }
 
 UT_TEST(test_multixact_resolver_is_dormant_and_zeroes_output)
@@ -665,7 +707,7 @@ UT_TEST(test_epoch_is_absent_from_locator_value)
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(38);
 	UT_RUN(test_frozen_identity_layout);
 	UT_RUN(test_frozen_closed_domains);
 	UT_RUN(test_reason_names_are_stable);
@@ -674,6 +716,7 @@ main(void)
 	UT_RUN(test_exact_resolver_rejects_mismatched_locator_echo);
 	UT_RUN(test_exact_resolver_discards_provider_result_when_activation_generation_moves);
 	UT_RUN(test_exact_cleanout_consumer_rejects_live_provider_outcome);
+	UT_RUN(test_exact_resolver_error_releases_target_admission_once);
 	UT_RUN(test_multixact_resolver_is_dormant_and_zeroes_output);
 	UT_RUN(test_bad_locator_scaffold_fails_closed_and_zeroes_output);
 	UT_RUN(test_valid_caller_selected_data_slot_forms_exact_locator);

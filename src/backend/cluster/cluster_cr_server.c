@@ -150,6 +150,8 @@ cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn, char dst[BLCKSZ],
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
 	ClusterBufmgrGcsCopyRefusal refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+	ClusterCrBuildResult result = CLUSTER_CR_BUILD_FAIL_CLOSED;
 	PGAlignedBlock current_copy;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
 	SCN page_scn = InvalidScn;
@@ -174,61 +176,73 @@ cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn, char dst[BLCKSZ],
 		return CLUSTER_CR_BUILD_RETRYABLE;
 	}
 
-	if (tag == NULL || !SCN_VALID(read_scn)) {
-		*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
-		cluster_semantic_activation_leave(&admission);
-		return CLUSTER_CR_BUILD_FAIL_CLOSED;
-	}
-
-	if (!cluster_bufmgr_copy_block_for_r4_cr(*tag, InvalidScn, &page_lsn, &page_scn,
-											 current_copy.data, &refusal)) {
-		cluster_semantic_activation_leave(&admission);
-		if (refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT) {
-			*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
-			return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	PG_TRY();
+	{
+		if (tag == NULL || !SCN_VALID(read_scn)) {
+			reason = CLUSTER_CR_BUILD_PROTOCOL;
+			goto admitted_done;
 		}
-		switch (refusal) {
+
+		if (!cluster_bufmgr_copy_block_for_r4_cr(*tag, InvalidScn, &page_lsn, &page_scn,
+											 current_copy.data, &refusal)) {
+			if (refusal == CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT) {
+				reason = CLUSTER_CR_BUILD_PROTOCOL;
+				goto admitted_done;
+			}
+			switch (refusal) {
 			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT:
 			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID:
 			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST:
 			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND:
 			case CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY:
-				*reason_out = CLUSTER_CR_BUILD_HOLDER_MOVED;
-				return CLUSTER_CR_BUILD_RETRYABLE;
+				reason = CLUSTER_CR_BUILD_HOLDER_MOVED;
+				result = CLUSTER_CR_BUILD_RETRYABLE;
+				goto admitted_done;
 			default:
-				*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
-				return CLUSTER_CR_BUILD_FAIL_CLOSED;
+				reason = CLUSTER_CR_BUILD_PROTOCOL;
+				goto admitted_done;
+			}
 		}
-	}
 
-	PG_TRY();
-	{
-		cluster_cr_construct_page_for_server(current_copy.data, read_scn, *tag, dst, &partial);
-		constructed = true;
+		PG_TRY();
+		{
+			cluster_cr_construct_page_for_server(current_copy.data, read_scn, *tag, dst, &partial);
+			constructed = true;
+		}
+		PG_CATCH();
+		{
+			constructed = false;
+			FlushErrorState();
+		}
+		PG_END_TRY();
+
+		if (!cluster_semantic_activation_recheck(&admission)) {
+			memset(dst, 0, BLCKSZ);
+			reason = CLUSTER_CR_BUILD_RF_DEFERRED;
+			result = CLUSTER_CR_BUILD_RETRYABLE;
+			goto admitted_done;
+		}
+
+		if (!constructed || partial) {
+			memset(dst, 0, BLCKSZ);
+			reason = CLUSTER_CR_BUILD_BAD_UNDO;
+			goto admitted_done;
+		}
+
+		reason = CLUSTER_CR_BUILD_NONE;
+		result = CLUSTER_CR_BUILD_FULL;
+
+admitted_done:
+		;
 	}
-	PG_CATCH();
+	PG_FINALLY();
 	{
-		constructed = false;
-		FlushErrorState();
+		cluster_semantic_activation_leave(&admission);
 	}
 	PG_END_TRY();
 
-	if (!cluster_semantic_activation_recheck(&admission)) {
-		memset(dst, 0, BLCKSZ);
-		*reason_out = CLUSTER_CR_BUILD_RF_DEFERRED;
-		cluster_semantic_activation_leave(&admission);
-		return CLUSTER_CR_BUILD_RETRYABLE;
-	}
-	cluster_semantic_activation_leave(&admission);
-
-	if (!constructed || partial) {
-		memset(dst, 0, BLCKSZ);
-		*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
-		return CLUSTER_CR_BUILD_FAIL_CLOSED;
-	}
-
-	*reason_out = CLUSTER_CR_BUILD_NONE;
-	return CLUSTER_CR_BUILD_FULL;
+	*reason_out = reason;
+	return result;
 }
 
 static ClusterCrServerShared *CrServerShared = NULL;

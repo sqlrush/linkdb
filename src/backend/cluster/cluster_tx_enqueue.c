@@ -486,6 +486,8 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 		else
 			for (;;) {
 				ClusterTTStatusResult cres;
+				ClusterTTStatusSourceRequest source_request;
+				ClusterTTStatusSourceResult source_result;
 				bool found;
 				TimestampTz now;
 				long wait_ms;
@@ -494,7 +496,13 @@ cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key, int effective_time
 
 				/* Re-check the holder's TT status (closes the register/wake race:
 				 * a terminal status published before we slept is seen here). */
-				found = cluster_tt_status_lookup_exact(holder_key, &cres);
+				memset(&source_request, 0, sizeof(source_request));
+				source_request.key = holder_key;
+				found = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP,
+														  &source_request, &source_result)
+						== CLUSTER_SEMANTIC_ADMISSION_OK
+					&& source_result.bool_value;
+				cres = source_result.lookup;
 				if (found && cres.authoritative && txw_status_is_terminal(cres.status)) {
 					result = CLUSTER_TXW_RESOLVED;
 					break;

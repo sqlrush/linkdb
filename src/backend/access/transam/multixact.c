@@ -896,6 +896,9 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 		&& nmembers <= CLUSTER_MULTIXACT_HINT_MAX_MEMBERS) {
 		ClusterMultiXactMember c_members[CLUSTER_MULTIXACT_HINT_MAX_MEMBERS];
 		ClusterMultiXactKey c_key;
+		ClusterMultiXactSourceRequest multi_request;
+		ClusterMultiXactSourceResult multi_result;
+		ClusterTTStatusHintSourceRequest hint_request;
 		bool all_local = true;
 		int i;
 
@@ -926,8 +929,21 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 			c_key.multixact_id = multi;
 			c_key.cluster_epoch = (uint32)cluster_epoch_get_current();
 
-			if (cluster_multixact_member_overlay_install(&c_key, (uint16)nmembers, c_members))
-				cluster_tt_status_hint_emit_multixact_overlay(&c_key, (uint16)nmembers, c_members);
+			memset(&multi_request, 0, sizeof(multi_request));
+			multi_request.key = &c_key;
+			multi_request.member_count = (uint16)nmembers;
+			multi_request.members = c_members;
+			if (cluster_multixact_source_dispatch(CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL,
+											 &multi_request, &multi_result)
+					== CLUSTER_SEMANTIC_ADMISSION_OK
+				&& multi_result.bool_value) {
+				memset(&hint_request, 0, sizeof(hint_request));
+				hint_request.multi_key = &c_key;
+				hint_request.member_count = (uint16)nmembers;
+				hint_request.members = c_members;
+				(void)cluster_tt_status_hint_source_dispatch(
+					CLUSTER_TT_HINT_SOURCE_EMIT_MULTIXACT_OVERLAY, &hint_request);
+			}
 		}
 	}
 #endif
@@ -1200,7 +1216,10 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 		 */
 		if (cluster_mxid_halfspace_exceeded(result, floor_mxid)
 			|| cluster_cr_injection_armed("cluster-mxid-halfspace-hard-limit", NULL)) {
-			cluster_multixact_note_halfspace_refuse();
+			ClusterMultiXactSourceResult source_result;
+
+			(void)cluster_multixact_source_dispatch(CLUSTER_MULTI_SOURCE_NOTE_HALFSPACE_REFUSE,
+											 NULL, &source_result);
 			ereport(
 				ERROR,
 				(errcode(ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT),
@@ -1329,7 +1348,10 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 				result = floor_mxid;
 			result = cluster_mxid_next_striped(result, mxid_stripe_slot);
 			if (cluster_mxid_halfspace_exceeded(result, floor_mxid)) {
-				cluster_multixact_note_halfspace_refuse();
+				ClusterMultiXactSourceResult source_result;
+
+				(void)cluster_multixact_source_dispatch(
+					CLUSTER_MULTI_SOURCE_NOTE_HALFSPACE_REFUSE, NULL, &source_result);
 				ereport(
 					ERROR,
 					(errcode(ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT),

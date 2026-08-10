@@ -249,16 +249,21 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
 	return test_resolve_outcomes[pos];
 }
 
-bool
-cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key pg_attribute_unused(),
-							   ClusterTTStatusResult *out)
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
+							  const ClusterTTStatusSourceRequest *request,
+							  ClusterTTStatusSourceResult *result)
 {
+	UT_ASSERT_EQ((int)op, (int)CLUSTER_TT_SOURCE_LOOKUP);
+	UT_ASSERT_NOT_NULL(request);
+	UT_ASSERT_NOT_NULL(request->key);
+	memset(result, 0, sizeof(*result));
 	if (!test_legacy_tt_found)
-		return false;
-	memset(out, 0, sizeof(*out));
-	out->authoritative = true;
-	out->status = test_legacy_tt_status;
-	return true;
+		return CLUSTER_SEMANTIC_ADMISSION_OK;
+	result->bool_value = true;
+	result->lookup.authoritative = true;
+	result->lookup.status = test_legacy_tt_status;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 uint64

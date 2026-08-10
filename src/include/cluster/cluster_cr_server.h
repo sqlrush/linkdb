@@ -60,6 +60,7 @@
 
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22d D4-6) */
 
 /* Split verdict for the server-side construction (see banner). */
@@ -267,13 +268,23 @@ extern void cluster_lms_cr_ship_ready(void);
 extern void cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd,
 												   ClusterLmsCrSlotKind kind);
 
-/* Requester side (backend): fetch a CR page for (locator, fork, block) at
- * read_scn from origin_node.  On success copies the shipped page into
- * dst_page and returns true; *out_partial says whether the local
- * construction must continue on it.  false = fail-closed (caller keeps the
- * unchanged 53R9G refusal). */
-extern bool cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_node,
-												char *dst_page, bool *out_partial);
+typedef enum ClusterR4SourceCrOp { CLUSTER_R4_SOURCE_CR_FETCH = 0 } ClusterR4SourceCrOp;
+
+typedef struct ClusterR4SourceCrRequest {
+	BufferTag tag;
+	SCN read_scn;
+	int32 origin_node;
+	char *dst_page;
+} ClusterR4SourceCrRequest;
+
+typedef struct ClusterR4SourceCrResult {
+	bool fetched;
+	bool partial;
+} ClusterR4SourceCrResult;
+
+extern ClusterSemanticAdmissionResult
+cluster_r4_source_cr_dispatch(ClusterR4SourceCrOp op, const ClusterR4SourceCrRequest *request,
+							  ClusterR4SourceCrResult *result);
 
 /* Requester side (backend, spec-6.12i D-i1): fetch origin_node's TT-bearing
  * undo header block (segment_id, block_no) over the same wire, together with

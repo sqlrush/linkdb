@@ -55,6 +55,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
         test_cluster_heap_lock_tuple test_cluster_perf_gates \
         test_cluster_subtrans test_cluster_multixact test_cluster_multixact_served test_cluster_mxid_stripe \
+		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
 		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
@@ -247,6 +248,8 @@ test_cluster_backup: test_cluster_backup.c unit_test.h $(CLUSTER_VERSION_O) \
 # objects (the test files stub the PG backend symbols those
 # objects reference).
 SIMPLE_TESTS = $(filter-out test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_ir test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_pcm_x_convert test_cluster_pcm_x_image_fetch test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_undo_block0 test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_cr_walk test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order,$(TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source \
+		test_cluster_r4_d10_multi_source,$(SIMPLE_TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1913,6 +1916,25 @@ test_cluster_multixact: test_cluster_multixact.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
+# spec-8.4 R4 D10: real-module behavior tests for the three non-CR
+# typed SOURCE dispatch families.  Each fixture replaces only adjacent
+# PostgreSQL/runtime boundaries and executes its owning product object.
+CLUSTER_R4_D10_HINT_SOURCE_O = $(top_builddir)/src/backend/cluster/cluster_tt_status_hint.o
+CLUSTER_R4_D10_TT_SOURCE_O = $(top_builddir)/src/backend/cluster/cluster_tt_status.o
+CLUSTER_R4_D10_MULTI_SOURCE_O = $(top_builddir)/src/backend/cluster/cluster_multixact.o
+
+test_cluster_r4_d10_hint_source: test_cluster_r4_d10_hint_source.c unit_test.h \
+		$(CLUSTER_R4_D10_HINT_SOURCE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_R4_D10_HINT_SOURCE_O) -o $@
+
+test_cluster_r4_d10_tt_source: test_cluster_r4_d10_tt_source.c unit_test.h \
+		$(CLUSTER_R4_D10_TT_SOURCE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_R4_D10_TT_SOURCE_O) -o $@
+
+test_cluster_r4_d10_multi_source: test_cluster_r4_d10_multi_source.c unit_test.h \
+		$(CLUSTER_R4_D10_MULTI_SOURCE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_R4_D10_MULTI_SOURCE_O) -o $@
+
 # spec-3.7 D12: test_cluster_undo_format — 12 pure ABI / offsetof /
 # sizeof / magic / enum / SQLSTATE tests for Undo Record Format +
 # Allocator module + HC211-HC217 ABI lock.  Behavioural / DML emit /
@@ -1972,6 +1994,7 @@ CLUSTER_SEMANTIC_ACTIVATION_C = $(top_srcdir)/src/backend/cluster/cluster_semant
 CLUSTER_SEMANTIC_ACTIVATION_H = $(top_srcdir)/src/include/cluster/cluster_semantic_activation.h
 
 test_cluster_r4_activation_record: test_cluster_r4_activation_record.c unit_test.h \
+		cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -1988,6 +2011,7 @@ test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
+		cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

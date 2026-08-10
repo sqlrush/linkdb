@@ -176,6 +176,9 @@ bool
 cluster_subtrans_ensure_parent_binding(TransactionId parent_xid, ClusterTTStatusKey *parent_key_out)
 {
 	ClusterTTStatusKey key;
+	ClusterTTStatusSourceRequest tt_request;
+	ClusterTTStatusSourceResult tt_result;
+	ClusterTTStatusHintSourceRequest hint_request;
 
 	if (parent_key_out == NULL)
 		return false;
@@ -195,8 +198,19 @@ cluster_subtrans_ensure_parent_binding(TransactionId parent_xid, ClusterTTStatus
 	 * rather than missing through to 53R97 prematurely.  Idempotent:
 	 * install_local overwrites existing entry without bumping eviction.
 	 */
-	cluster_tt_status_install_local(&key, CLUSTER_TT_STATUS_IN_PROGRESS, InvalidScn);
-	cluster_tt_status_hint_emit(&key, CLUSTER_TT_STATUS_IN_PROGRESS, InvalidScn);
+	memset(&tt_request, 0, sizeof(tt_request));
+	tt_request.key = &key;
+	tt_request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	tt_request.commit_scn = InvalidScn;
+	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &tt_request, &tt_result)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+
+	memset(&hint_request, 0, sizeof(hint_request));
+	hint_request.key = &key;
+	hint_request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	hint_request.commit_scn = InvalidScn;
+	(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT, &hint_request);
 
 	*parent_key_out = key;
 	return true;
@@ -207,6 +221,9 @@ cluster_subtrans_emit_subcommit(TransactionId child_xid, TransactionId parent_xi
 {
 	ClusterTTStatusKey child_key;
 	ClusterTTStatusKey parent_key;
+	ClusterTTStatusSourceRequest tt_request;
+	ClusterTTStatusSourceResult tt_result;
+	ClusterTTStatusHintSourceRequest hint_request;
 
 	if (!cluster_peer_mode_enabled())
 		return false;
@@ -219,10 +236,20 @@ cluster_subtrans_emit_subcommit(TransactionId child_xid, TransactionId parent_xi
 		return false;
 
 	/* Install local SUBCOMMITTED + emit V3 hint to peers. */
-	if (!cluster_tt_status_install_subcommitted(&child_key, &parent_key))
+	memset(&tt_request, 0, sizeof(tt_request));
+	tt_request.key = &child_key;
+	tt_request.parent_key = &parent_key;
+	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED, &tt_request,
+										 &tt_result)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !tt_result.bool_value)
 		return false;
 
-	cluster_tt_status_hint_emit_subcommitted(&child_key, &parent_key);
+	memset(&hint_request, 0, sizeof(hint_request));
+	hint_request.key = &child_key;
+	hint_request.parent_key = &parent_key;
+	(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT_SUBCOMMITTED,
+										   &hint_request);
 
 	/* spec-3.15 D7: track the link for a potential PREPARE. */
 	{
@@ -244,6 +271,9 @@ bool
 cluster_subtrans_emit_subabort(TransactionId child_xid)
 {
 	ClusterTTStatusKey child_key;
+	ClusterTTStatusSourceRequest tt_request;
+	ClusterTTStatusSourceResult tt_result;
+	ClusterTTStatusHintSourceRequest hint_request;
 
 	if (!cluster_peer_mode_enabled())
 		return false;
@@ -257,8 +287,19 @@ cluster_subtrans_emit_subabort(TransactionId child_xid)
 	 * ABORTED uses the existing V2 emit path (commit_scn=InvalidScn).
 	 * install_local covers the local overlay entry.
 	 */
-	cluster_tt_status_install_local(&child_key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
-	cluster_tt_status_hint_emit(&child_key, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+	memset(&tt_request, 0, sizeof(tt_request));
+	tt_request.key = &child_key;
+	tt_request.status = CLUSTER_TT_STATUS_ABORTED;
+	tt_request.commit_scn = InvalidScn;
+	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &tt_request, &tt_result)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+
+	memset(&hint_request, 0, sizeof(hint_request));
+	hint_request.key = &child_key;
+	hint_request.status = CLUSTER_TT_STATUS_ABORTED;
+	hint_request.commit_scn = InvalidScn;
+	(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT, &hint_request);
 	return true;
 }
 
@@ -293,8 +334,17 @@ cluster_subtrans_lookup_parent(const ClusterTTStatusResult *child_result, int de
 
 	while (budget-- > 0) {
 		ClusterTTStatusResult parent_res;
+		ClusterTTStatusSourceRequest source_request;
+		ClusterTTStatusSourceResult source_result;
+		ClusterTTStatusSourceRequest bump_request;
+		ClusterTTStatusSourceResult bump_result;
 
-		if (!cluster_tt_status_lookup_exact(&next_key, &parent_res)) {
+		memset(&source_request, 0, sizeof(source_request));
+		source_request.key = &next_key;
+		if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request,
+										  &source_result)
+				!= CLUSTER_SEMANTIC_ADMISSION_OK
+			|| !source_result.bool_value) {
 			/*
 			 * parent overlay miss → caller must fail-closed (53R97 per
 			 * L199).  Return UNKNOWN authoritative=false.
@@ -304,8 +354,11 @@ cluster_subtrans_lookup_parent(const ClusterTTStatusResult *child_result, int de
 			cur.authoritative = false;
 			return cur;
 		}
+		parent_res = source_result.lookup;
 
-		cluster_tt_status_bump_parent_chain_follow();
+		memset(&bump_request, 0, sizeof(bump_request));
+		(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW,
+											&bump_request, &bump_result);
 
 		if (parent_res.status != CLUSTER_TT_STATUS_SUBCOMMITTED)
 			return parent_res;
@@ -334,6 +387,8 @@ cluster_subtrans_xact_has_state(TransactionId top_xid)
 {
 	ClusterTTStatusKey key;
 	ClusterTTStatusResult res;
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
 
 	if (!cluster_peer_mode_enabled())
 		return false;
@@ -365,8 +420,13 @@ cluster_subtrans_xact_has_state(TransactionId top_xid)
 		key.local_xid = top_xid;
 	}
 
-	if (!cluster_tt_status_lookup_exact(&key, &res))
+	memset(&source_request, 0, sizeof(source_request));
+	source_request.key = &key;
+	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request, &source_result)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !source_result.bool_value)
 		return false;
+	res = source_result.lookup;
 
 	/*
 	 * Any installed overlay state for this xid counts as "has state":

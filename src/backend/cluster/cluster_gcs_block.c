@@ -2002,54 +2002,62 @@ cluster_gcs_block_r4_route_cr(const BufferTag *tag, SCN read_scn, uint64 request
 		return CLUSTER_CR_BUILD_RETRYABLE;
 	}
 
-	if (tag == NULL || !SCN_VALID(read_scn) || request_id == 0 || requester_backend_id <= 0
-		|| requester_backend_id > MaxBackends) {
-		reason = CLUSTER_CR_BUILD_PROTOCOL;
-		goto done;
-	}
+	PG_TRY();
+	{
+		if (tag == NULL || !SCN_VALID(read_scn) || request_id == 0 || requester_backend_id <= 0
+			|| requester_backend_id > MaxBackends) {
+			reason = CLUSTER_CR_BUILD_PROTOCOL;
+			goto done;
+		}
 
-	current_epoch = cluster_epoch_get_current();
-	real_master_node = cluster_gcs_lookup_master(*tag);
-	if (real_master_node < 0 || real_master_node >= PCM_X_PROTOCOL_NODE_LIMIT
-		|| cluster_node_id != real_master_node) {
-		reason = CLUSTER_CR_BUILD_WRONG_MASTER;
-		goto done;
-	}
-	if (cluster_gcs_block_phase_for_tag(*tag) == GCS_BLOCK_RECOVERING) {
-		reason = CLUSTER_CR_BUILD_RECOVERING;
-		goto done;
-	}
+		current_epoch = cluster_epoch_get_current();
+		real_master_node = cluster_gcs_lookup_master(*tag);
+		if (real_master_node < 0 || real_master_node >= PCM_X_PROTOCOL_NODE_LIMIT
+			|| cluster_node_id != real_master_node) {
+			reason = CLUSTER_CR_BUILD_WRONG_MASTER;
+			goto done;
+		}
+		if (cluster_gcs_block_phase_for_tag(*tag) == GCS_BLOCK_RECOVERING) {
+			reason = CLUSTER_CR_BUILD_RECOVERING;
+			goto done;
+		}
 
-	if (!cluster_pcm_lock_r4_route_snapshot(*tag, &authority,
-											&master_authority_generation,
-											&expected_page_scn)) {
-		reason = CLUSTER_CR_BUILD_NO_HOLDER;
-		goto done;
-	}
-	reason = cluster_r4_route_policy_classify(&authority, current_epoch,
-										  master_authority_generation,
-										  &current_holder_node);
-	if (reason != CLUSTER_CR_BUILD_NONE)
-		goto done;
+		if (!cluster_pcm_lock_r4_route_snapshot(*tag, &authority,
+												&master_authority_generation,
+												&expected_page_scn)) {
+			reason = CLUSTER_CR_BUILD_NO_HOLDER;
+			goto done;
+		}
+		reason = cluster_r4_route_policy_classify(&authority, current_epoch,
+											  master_authority_generation,
+											  &current_holder_node);
+		if (reason != CLUSTER_CR_BUILD_NONE)
+			goto done;
 
-	if (!cluster_semantic_activation_recheck(&admission)) {
-		reason = CLUSTER_CR_BUILD_RF_DEFERRED;
-		goto done;
-	}
+		if (!cluster_semantic_activation_recheck(&admission)) {
+			reason = CLUSTER_CR_BUILD_RF_DEFERRED;
+			goto done;
+		}
 
-	out->tag = *tag;
-	out->read_scn = read_scn;
-	out->formation_epoch = current_epoch;
-	out->activation_generation = admission.record_generation;
-	out->master_authority_generation = master_authority_generation;
-	out->master_resource_transition_count = authority.transition_count;
-	out->expected_page_scn = expected_page_scn;
-	out->real_master_node = real_master_node;
-	out->selected_holder_node = current_holder_node;
+		out->tag = *tag;
+		out->read_scn = read_scn;
+		out->formation_epoch = current_epoch;
+		out->activation_generation = admission.record_generation;
+		out->master_authority_generation = master_authority_generation;
+		out->master_resource_transition_count = authority.transition_count;
+		out->expected_page_scn = expected_page_scn;
+		out->real_master_node = real_master_node;
+		out->selected_holder_node = current_holder_node;
 
 done:
-	result = cluster_cr_build_result_for_reason(reason);
-	cluster_semantic_activation_leave(&admission);
+		result = cluster_cr_build_result_for_reason(reason);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+
 	*reason_out = reason;
 	return result;
 }
@@ -4041,9 +4049,9 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
  *	         is NEVER installed as current and never flushed; it exists
  *	         only in the caller's CR destination.
  */
-bool
-cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_node, char *dst_page,
-									bool *out_partial)
+static bool
+cluster_gcs_block_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 origin_node,
+										char *dst_page, bool *out_partial)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -4151,6 +4159,45 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, int32 origin_no
 	gcs_block_release_slot(slot);
 
 	return fetched; /* false -> caller keeps the unchanged 53R9G refusal */
+}
+
+ClusterSemanticAdmissionResult
+cluster_r4_source_cr_dispatch(ClusterR4SourceCrOp op, const ClusterR4SourceCrRequest *request,
+							  ClusterR4SourceCrResult *result)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterSemanticAdmissionResult admission;
+	ClusterR4SourceCrResult local_result = { 0 };
+
+	if (result != NULL)
+		memset(result, 0, sizeof(*result));
+	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												  CLUSTER_SEMANTIC_SOURCE_SIDE, &token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return admission;
+
+	PG_TRY();
+	{
+		if (result == NULL || request == NULL || op != CLUSTER_R4_SOURCE_CR_FETCH
+			|| request->dst_page == NULL)
+			admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		else
+			local_result.fetched = cluster_gcs_block_cr_fetch_and_wait_raw(
+				request->tag, request->read_scn, request->origin_node, request->dst_page,
+				&local_result.partial);
+		if (admission == CLUSTER_SEMANTIC_ADMISSION_OK
+			&& !cluster_semantic_activation_recheck(&token))
+			admission = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&token);
+	}
+	PG_END_TRY();
+
+	if (admission == CLUSTER_SEMANTIC_ADMISSION_OK)
+		*result = local_result;
+	return admission;
 }
 
 
