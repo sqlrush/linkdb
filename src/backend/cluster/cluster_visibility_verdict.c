@@ -244,9 +244,10 @@ cluster_vis_from_undo_verdict(ClusterUndoVerdictResult v, ClusterVisResolve *out
 
 	case CLUSTER_UNDO_VERDICT_COMMITTED_BOUND:
 		/*
-		 * A below-horizon bound decides correctly ONLY against the read_scn
-		 * this resolve ran under; commit_scn_is_bound forbids stamping/caching
-		 * it as an exact commit_scn (spec-6.12i CP5 / Rule 8.A).
+		 * A snapshot may order this below-horizon bound ONLY against the
+		 * read_scn this resolve ran under; a terminal-only consumer may use
+		 * only the COMMITTED status.  commit_scn_is_bound forbids
+		 * stamping/caching it as an exact commit_scn (spec-6.12i CP5 / Rule 8.A).
 		 */
 		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 		out->status = CLUSTER_TT_STATUS_COMMITTED;

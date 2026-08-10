@@ -91,6 +91,27 @@ cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority au
 }
 
 /*
+ * cluster_vis_committed_bound_admissible
+ *
+ * S3-P0-03 pure requester gate.  COMMITTED_BELOW_HORIZON is backed by the
+ * origin's own CLOG plus the retention proof: it always proves terminal
+ * COMMITTED, but supplies only an upper bound for snapshot ordering.  Thus a
+ * terminal-state-only caller (read_scn == InvalidScn by resolver contract)
+ * may consume the status, while a snapshot caller still needs H <= read_scn.
+ * The caller keeps the is_bound/kind marker, so this never authorizes stamping
+ * or memoizing H as an exact commit SCN.
+ */
+bool
+cluster_vis_committed_bound_admissible(SCN horizon_scn, SCN read_scn)
+{
+	if (!SCN_VALID(horizon_scn))
+		return false;
+	if (!SCN_VALID(read_scn))
+		return true; /* terminal state only; no snapshot ordering claim */
+	return scn_time_cmp(horizon_scn, read_scn) <= 0;
+}
+
+/*
  * cluster_vis_tt_block_xid_scan
  *
  * spec-5.22d A1 (D4-8): the scan CORE under cluster_vis_tt_block_positive_

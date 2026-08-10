@@ -128,10 +128,10 @@ extern void cluster_visibility_resolve_tuple(Buffer buffer, HeapTupleHeader htup
  * spec-6.12i CP5: the _scn variant threads the caller's snapshot read_scn
  * down to the active-runtime resolver so a below-horizon origin verdict can
  * be judged admissible (requester leg (e)) and returned as a bound
- * (commit_scn_is_bound).  Callers without snapshot semantics use the plain
- * variant above (read_scn = InvalidScn -> bounds are never admissible;
- * exact verdicts still resolve).  Only the HeapTupleSatisfiesMVCC fork
- * sites pass a real read_scn.
+ * (commit_scn_is_bound).  Terminal-state-only callers use the plain variant
+ * above (read_scn = InvalidScn): an origin+CLOG-proven bound resolves only the
+ * COMMITTED status and remains marked non-exact (never stamp/cache).  Only
+ * the HeapTupleSatisfiesMVCC fork sites pass a real read_scn for ordering.
  */
 extern void cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup,
 												 TransactionId raw_xid, ClusterVisXidKind which,
