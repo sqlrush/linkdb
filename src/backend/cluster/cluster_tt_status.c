@@ -151,6 +151,17 @@ typedef struct ClusterTTStatusShmem {
 	pg_atomic_uint64 remote_uba_resolved;	 /* materialized remote undo reads   */
 } ClusterTTStatusShmem;
 
+static bool cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key,
+										   ClusterTTStatusResult *result);
+static bool cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
+											SCN commit_scn);
+static bool cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
+												   const ClusterTTStatusKey *parent_key);
+static bool cluster_tt_status_delete_exact(const ClusterTTStatusKey *key);
+static int cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn);
+static void cluster_tt_status_bump_self_consumer_hit(void);
+static void cluster_tt_status_bump_parent_chain_follow(void);
+
 #ifdef USE_PGRAC_CLUSTER
 
 static HTAB *ClusterTTStatusHTAB = NULL;
@@ -497,7 +508,7 @@ note_overlay_full(const char *dropped_kind)
 /* public API                                                   */
 /* ------------------------------------------------------------ */
 
-bool
+static bool
 cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusResult *result)
 {
 	const ClusterTTOverlayEntry *e;
@@ -644,7 +655,7 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	return true;
 }
 
-bool
+static bool
 cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 								SCN commit_scn)
 {
@@ -689,7 +700,7 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	return true;
 }
 
-int
+static int
 cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 {
 	HASH_SEQ_STATUS seq;
@@ -788,7 +799,7 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
  *	  MUST first ensure parent_key has its own overlay binding via
  *	  cluster_subtrans_ensure_parent_binding().
  */
-bool
+static bool
 cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
 									   const ClusterTTStatusKey *parent_key)
 {
@@ -834,7 +845,7 @@ cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
  *	  clear by writing ABORTED — semantic conflict with the real
  *	  TT status state machine.
  */
-bool
+static bool
 cluster_tt_status_delete_exact(const ClusterTTStatusKey *key)
 {
 	bool found;
@@ -949,7 +960,7 @@ cluster_tt_status_generation(void)
  * by D6 commit hook to record the runtime self-consumer lookup
  * (spec-3.1 v0.4 N7).  Only D5/D6 should call this.
  */
-void
+static void
 cluster_tt_status_bump_self_consumer_hit(void)
 {
 	if (!cluster_enabled || ClusterTTStatusState == NULL)
@@ -981,7 +992,7 @@ CLUSTER_TT_STATUS_COUNTER_GETTER(subcommitted_install_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER(subcommitted_lookup_hit_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER(parent_chain_follow_count)
 
-void
+static void
 cluster_tt_status_bump_parent_chain_follow(void)
 {
 	if (ClusterTTStatusState != NULL)
@@ -1056,7 +1067,7 @@ void
 cluster_tt_status_shmem_register(void)
 {}
 
-bool
+static bool
 cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusResult *result)
 {
 	if (result != NULL) {
@@ -1072,7 +1083,7 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 	return false;
 }
 
-bool
+static bool
 cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus status,
 								SCN commit_scn)
 {
@@ -1082,7 +1093,7 @@ cluster_tt_status_install_local(const ClusterTTStatusKey *key, ClusterTTStatus s
 	return false;
 }
 
-int
+static int
 cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 {
 	(void)xid;
@@ -1090,7 +1101,7 @@ cluster_tt_status_resolve_prepared_commit(TransactionId xid, SCN commit_scn)
 	return 0;
 }
 
-bool
+static bool
 cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
 									   const ClusterTTStatusKey *parent_key)
 {
@@ -1099,7 +1110,7 @@ cluster_tt_status_install_subcommitted(const ClusterTTStatusKey *child_key,
 	return false;
 }
 
-bool
+static bool
 cluster_tt_status_delete_exact(const ClusterTTStatusKey *key)
 {
 	(void)key;
@@ -1122,7 +1133,7 @@ cluster_tt_status_generation(void)
 	return 0;
 }
 
-void
+static void
 cluster_tt_status_bump_self_consumer_hit(void)
 {}
 
@@ -1144,9 +1155,105 @@ CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(subcommitted_install_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(subcommitted_lookup_hit_count)
 CLUSTER_TT_STATUS_COUNTER_GETTER_STUB(parent_chain_follow_count)
 
-void
+static void
 cluster_tt_status_bump_parent_chain_follow(void)
 {}
 
 
 #endif /* USE_PGRAC_CLUSTER */
+
+/*
+ * cluster_tt_status_source_dispatch -- Admit one legacy TT source operation.
+ *
+ * The caller-visible result is canonical zero unless the operation completes
+ * under one stable semantic-activation generation.  PG_FINALLY supplies the
+ * single leave funnel for both normal and ERROR paths.
+ *
+ * Spec: spec-8.4-oracle-synchronous-consistent-read.md
+ */
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
+								  const ClusterTTStatusSourceRequest *request,
+								  ClusterTTStatusSourceResult *result)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterSemanticAdmissionResult admission;
+	ClusterTTStatusSourceResult local_result;
+
+	if (result != NULL)
+		memset(result, 0, sizeof(*result));
+	memset(&local_result, 0, sizeof(local_result));
+
+	admission = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												  CLUSTER_SEMANTIC_SOURCE_SIDE, &token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return admission;
+
+	PG_TRY();
+	{
+		if (result == NULL)
+			admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		else {
+			switch (op) {
+			case CLUSTER_TT_SOURCE_LOOKUP:
+				if (request == NULL || request->key == NULL)
+					admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+				else
+					local_result.bool_value
+						= cluster_tt_status_lookup_exact(request->key, &local_result.lookup);
+				break;
+			case CLUSTER_TT_SOURCE_INSTALL_LOCAL:
+				if (request == NULL || request->key == NULL)
+					admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+				else
+					local_result.bool_value = cluster_tt_status_install_local(
+						request->key, request->status, request->commit_scn);
+				break;
+			case CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED:
+				if (request == NULL || request->key == NULL || request->parent_key == NULL)
+					admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+				else
+					local_result.bool_value
+						= cluster_tt_status_install_subcommitted(request->key, request->parent_key);
+				break;
+			case CLUSTER_TT_SOURCE_DELETE_EXACT:
+				if (request == NULL || request->key == NULL)
+					admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+				else
+					local_result.bool_value = cluster_tt_status_delete_exact(request->key);
+				break;
+			case CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT:
+				if (request == NULL)
+					admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+				else
+					local_result.int_value = cluster_tt_status_resolve_prepared_commit(
+						request->xid, request->commit_scn);
+				break;
+			case CLUSTER_TT_SOURCE_BUMP_SELF_CONSUMER_HIT:
+				cluster_tt_status_bump_self_consumer_hit();
+				break;
+			case CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW:
+				cluster_tt_status_bump_parent_chain_follow();
+				break;
+			default:
+				admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+				break;
+			}
+		}
+
+		if (admission == CLUSTER_SEMANTIC_ADMISSION_OK
+			&& !cluster_semantic_activation_recheck(&token)) {
+			memset(&local_result, 0, sizeof(local_result));
+			admission = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+		}
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&token);
+	}
+	PG_END_TRY();
+
+	if (admission == CLUSTER_SEMANTIC_ADMISSION_OK)
+		*result = local_result;
+	return admission;
+}
