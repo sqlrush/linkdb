@@ -11232,6 +11232,241 @@ prepare_local_independent_dual_terminal(BlockNumber block, uint64 master_session
 	UT_ASSERT(fixture->tag_slot->holder_terminal_drain_generation != 0);
 }
 
+/* Append a distinct-tag holder/source lane without reinitializing the shared
+ * queue.  The external ticket crosses PROBE -> blocker ACK -> REVOKE ->
+ * IMAGE_READY, but deliberately does not DRAIN, so it remains live prefix
+ * authority for every same-session RETIRE_UP_TO that covers its ticket. */
+static void
+append_local_undrained_holder_source(BlockNumber block, uint64 master_session, uint64 ticket_id,
+									 PcmXTicketRef *holder_ref_out,
+									 PcmXLocalTagSlot **tag_slot_out)
+{
+	PcmXLocalHolderSnapshot holder_snapshot;
+	PcmXLocalBlockerSnapshot blocker_snapshot;
+	PcmXTicketRef probe_ref;
+	PcmXRevokePayload revoke;
+	PcmXGrantPayload ready;
+	PcmXGrantPayload replay;
+	uint32 flags;
+
+	UT_ASSERT_NOT_NULL(holder_ref_out);
+	UT_ASSERT_NOT_NULL(tag_slot_out);
+	memset(&probe_ref, 0, sizeof(probe_ref));
+	probe_ref.identity = make_wait_identity(block, 3, 27, master_session + ticket_id);
+	probe_ref.handle.ticket_id = ticket_id;
+	probe_ref.handle.queue_generation = UINT64_C(12);
+	UT_ASSERT_EQ(cluster_pcm_x_local_probe_freeze_snapshot_exact(
+					 &probe_ref, 1, master_session, NULL, 0, &holder_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(holder_snapshot.holder_count, 0);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_snapshot_arm_exact(
+					 &probe_ref, 1, master_session, &holder_snapshot, NULL, 0, NULL, 0,
+					 &blocker_snapshot),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_blocker_ack_exact(
+					 &probe_ref, blocker_snapshot.set_generation, 1, master_session),
+				 PCM_X_QUEUE_OK);
+
+	memset(&revoke, 0, sizeof(revoke));
+	revoke.ref = probe_ref;
+	revoke.ref.grant_generation = UINT64_C(2);
+	UT_ASSERT(cluster_pcm_x_image_id_encode(1, master_session + UINT64_C(500),
+										  &revoke.image_id));
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_revoke_apply_exact(&revoke, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	memset(&ready, 0, sizeof(ready));
+	ready.ref = revoke.ref;
+	ready.image.image_id = revoke.image_id;
+	ready.image.source_own_generation = UINT64_C(71);
+	ready.image.page_scn = UINT64_C(72);
+	ready.image.page_lsn = UINT64_C(73);
+	ready.image.source_node = 0;
+	ready.image.page_checksum = UINT32_C(74);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_image_ready_arm_exact(
+					 &ready, 1, master_session, &replay),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT(memcmp(&ready, &replay, sizeof(ready)) == 0);
+
+	*holder_ref_out = revoke.ref;
+	*tag_slot_out
+		= &local_tag_slots(ClusterPcmXConvertShmem)[holder_snapshot.tag_slot.slot_index];
+	flags = test_slot_flags(&(*tag_slot_out)->slot);
+	UT_ASSERT_EQ(flags & (PCM_X_LOCAL_TAG_F_TERMINAL_MASK
+						  | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK),
+				 0);
+	UT_ASSERT((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
+	UT_ASSERT(ticket_refs_equal(&(*tag_slot_out)->holder_ref, holder_ref_out));
+	UT_ASSERT_EQ((*tag_slot_out)->holder_reliable.pending_opcode,
+				 PGRAC_IC_MSG_PCM_X_IMAGE_READY);
+}
+
+/* Append a canonical admitted writer on another tag, stopping before DRAIN.
+ * Its linked leader makes the ticket positive live-writer authority rather
+ * than a cancelled-predecessor ref tombstone. */
+static void
+append_local_undrained_writer(BlockNumber block, uint64 master_session, uint64 ticket_id,
+							  PcmXLocalHandle *writer_out, PcmXLocalTagSlot **tag_slot_out)
+{
+	PcmXLocalWriterClaim writer_claim;
+	PcmXLocalCutoff cutoff;
+	PcmXWaitIdentity identity;
+	PcmXEnqueuePayload enqueue;
+	PcmXAdmitAckPayload admit_ack;
+	PcmXLocalReliableToken token;
+
+	UT_ASSERT_NOT_NULL(writer_out);
+	UT_ASSERT_NOT_NULL(tag_slot_out);
+	identity = make_wait_identity(block, 0, 4, master_session + ticket_id);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, master_session, writer_out),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_claim_exact(writer_out, &writer_claim),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_begin_revoke_cutoff_exact(writer_out, &cutoff),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(writer_out, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	memset(&admit_ack, 0, sizeof(admit_ack));
+	admit_ack.ref.identity = identity;
+	admit_ack.ref.handle.ticket_id = ticket_id;
+	admit_ack.ref.handle.queue_generation = UINT64_C(1);
+	admit_ack.prehandle = enqueue.prehandle;
+	admit_ack.result = PCM_X_QUEUE_OK;
+	admit_ack.phase = PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE;
+	UT_ASSERT_EQ(cluster_pcm_x_local_apply_admit_ack_exact(writer_out, &admit_ack, 1,
+													 master_session),
+				 PCM_X_QUEUE_OK);
+	*tag_slot_out
+		= &local_tag_slots(ClusterPcmXConvertShmem)[writer_out->tag_slot.slot_index];
+	UT_ASSERT_EQ((*tag_slot_out)->ref.handle.ticket_id, ticket_id);
+	UT_ASSERT_EQ(test_slot_flags(&(*tag_slot_out)->slot)
+					 & (PCM_X_LOCAL_TAG_F_TERMINAL_MASK
+						| PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK),
+				 0);
+	UT_ASSERT((*tag_slot_out)->leader_index != PCM_X_INVALID_SLOT_INDEX);
+}
+
+/* Formal-exact RED for S3-P0-02 (2026-08-11): RETIRE_UP_TO is a single
+ * same-master/session prefix across tags.  A lower holder/source ticket that
+ * has reached IMAGE_READY but not DRAIN must block retirement of a newer
+ * terminal tag.  The refusal is a read-only first-pass decision: both tags,
+ * the peer frontier, the retire marker/gate and ACTIVE runtime stay exact. */
+UT_TEST(test_local_retire_waits_for_undrained_lower_holder_on_another_tag)
+{
+	TestLocalIndependentDualTerminal terminal;
+	PcmXShmemHeader *header;
+	PcmXTicketRef lower_holder_ref;
+	PcmXLocalTagSlot *lower_tag;
+	PcmXLocalTagSlot lower_before;
+	PcmXLocalTagSlot terminal_before;
+	PcmXPeerFrontier frontier_before;
+	PcmXRuntimeSnapshot runtime_before;
+	PcmXRuntimeSnapshot runtime_after;
+	PcmXRetirePayload retire;
+	uint32 retire_gate_before;
+	const uint64 master_session = UINT64_C(1836);
+
+	prepare_local_independent_dual_terminal(7131, master_session, UINT64_C(96002),
+										UINT64_C(96003), false, &terminal);
+	append_local_undrained_holder_source(7132, master_session, UINT64_C(96001),
+										 &lower_holder_ref, &lower_tag);
+	header = ClusterPcmXConvertShmem;
+	UT_ASSERT(lower_tag != terminal.tag_slot);
+	UT_ASSERT(lower_holder_ref.handle.ticket_id < terminal.holder_ref.handle.ticket_id);
+	lower_before = *lower_tag;
+	terminal_before = *terminal.tag_slot;
+	frontier_before = header->peer_frontiers[1];
+	retire_gate_before = pg_atomic_read_u32(&header->local_retire_gate);
+	runtime_before = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT_EQ(runtime_before.state, PCM_X_RUNTIME_ACTIVE);
+
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = terminal.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = terminal.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+
+	runtime_after = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT(memcmp(&lower_before, lower_tag, sizeof(lower_before)) == 0);
+	UT_ASSERT(memcmp(&terminal_before, terminal.tag_slot, sizeof(terminal_before)) == 0);
+	UT_ASSERT(memcmp(&frontier_before, &header->peer_frontiers[1], sizeof(frontier_before)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&header->local_retire_gate), retire_gate_before);
+	UT_ASSERT_EQ(runtime_after.master_session_incarnation,
+				 runtime_before.master_session_incarnation);
+	UT_ASSERT_EQ(runtime_after.gate_generation, runtime_before.gate_generation);
+	UT_ASSERT_EQ(runtime_after.state, runtime_before.state);
+	UT_ASSERT_EQ(runtime_after.rebase_wire_active, runtime_before.rebase_wire_active);
+}
+
+/* Existing 0aed8439 writer-lane contract: a canonical lower ticket is part
+ * of the same prefix and must refuse the newer terminal watermark before any
+ * tag or frontier mutation. */
+UT_TEST(test_local_retire_waits_for_undrained_lower_writer_on_another_tag)
+{
+	TestLocalIndependentDualTerminal terminal;
+	PcmXShmemHeader *header;
+	PcmXLocalHandle older_writer;
+	PcmXLocalTagSlot *older_tag;
+	PcmXLocalTagSlot older_before;
+	PcmXLocalTagSlot terminal_before;
+	PcmXPeerFrontier frontier_before;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1837);
+
+	prepare_local_independent_dual_terminal(7133, master_session, UINT64_C(96102),
+										UINT64_C(96103), false, &terminal);
+	append_local_undrained_writer(7134, master_session, UINT64_C(96101), &older_writer,
+								  &older_tag);
+	header = ClusterPcmXConvertShmem;
+	older_before = *older_tag;
+	terminal_before = *terminal.tag_slot;
+	frontier_before = header->peer_frontiers[1];
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = terminal.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = terminal.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+	UT_ASSERT(memcmp(&older_before, older_tag, sizeof(older_before)) == 0);
+	UT_ASSERT(memcmp(&terminal_before, terminal.tag_slot, sizeof(terminal_before)) == 0);
+	UT_ASSERT(memcmp(&frontier_before, &header->peer_frontiers[1], sizeof(frontier_before)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&header->local_retire_gate), 0);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
+/* A live writer newer than the requested watermark is outside the prefix.
+ * It must remain byte-exact while the covered terminal retires normally. */
+UT_TEST(test_local_retire_ignores_undrained_higher_writer_on_another_tag)
+{
+	TestLocalIndependentDualTerminal terminal;
+	PcmXLocalHandle newer_writer;
+	PcmXLocalTagSlot *newer_tag;
+	PcmXLocalTagSlot newer_before;
+	PcmXRetirePayload retire;
+	const uint64 master_session = UINT64_C(1838);
+
+	prepare_local_independent_dual_terminal(7135, master_session, UINT64_C(96201),
+										UINT64_C(96202), false, &terminal);
+	append_local_undrained_writer(7136, master_session, UINT64_C(96203), &newer_writer,
+								  &newer_tag);
+	newer_before = *newer_tag;
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = terminal.holder_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = terminal.holder_ref.handle.ticket_id;
+	retire.sender_node = 0;
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT(memcmp(&newer_before, newer_tag, sizeof(newer_before)) == 0);
+	UT_ASSERT_EQ(ClusterPcmXConvertShmem->peer_frontiers[1].local_retired_ticket_id,
+				 terminal.holder_ref.handle.ticket_id);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
 /*
  * RED for the t/400 independent dual-terminal false fuse (2026-07-19): a
  * fully DRAINED older writer terminal (T) and a fully DRAINED newer holder
@@ -16781,7 +17016,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(278);
+	UT_PLAN(281);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -16963,6 +17198,9 @@ main(void)
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
+	UT_RUN(test_local_retire_waits_for_undrained_lower_holder_on_another_tag);
+	UT_RUN(test_local_retire_waits_for_undrained_lower_writer_on_another_tag);
+	UT_RUN(test_local_retire_ignores_undrained_higher_writer_on_another_tag);
 	UT_RUN(test_local_independent_dual_terminal_retires_writer_then_holder);
 	UT_RUN(test_local_independent_dual_terminal_alias_and_malformed_lanes_fail_closed);
 	UT_RUN(test_local_independent_dual_terminal_supports_pre_joined_follower);

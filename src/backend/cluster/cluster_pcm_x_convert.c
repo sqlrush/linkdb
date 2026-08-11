@@ -20072,12 +20072,16 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 	PcmXAllocatorView view;
 	PcmXLocalTagSlot *raw;
 	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *leader;
 	const PcmXTicketRef *external_ref;
+	PcmXSlotRef leader_ref;
 	PcmXSlotRef tag_ref;
 	BufferTag tag;
 	uint64 generation_after;
 	uint32 flags;
+	uint32 holder_flags;
 	uint32 partition;
+	uint32 writer_flags;
 	PcmXQueueResult result = PCM_X_QUEUE_OK;
 	PcmXQueueResult holder_state;
 	bool cancel_same_ref_dual = false;
@@ -20115,13 +20119,58 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 		goto candidate_done;
 	}
 	flags = pcm_x_slot_flags_read(&tag_slot->slot);
-	if ((flags & (PCM_X_LOCAL_TAG_F_TERMINAL_MASK | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK)) == 0)
-		goto candidate_done;
 	if (tag_slot->master_node != authenticated_master_node)
 		goto candidate_done;
 	if (tag_slot->cluster_epoch != request->cluster_epoch
 		|| tag_slot->master_session_incarnation != authenticated_master_session) {
-		result = PCM_X_QUEUE_STALE;
+		/* Only terminal evidence is required to agree with this retirement
+		 * episode.  A live tag from an older formation is not part of the current
+		 * master-session prefix and remains recovery-owned. */
+		if ((flags & (PCM_X_LOCAL_TAG_F_TERMINAL_MASK
+					  | PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK))
+			!= 0)
+			result = PCM_X_QUEUE_STALE;
+		goto candidate_done;
+	}
+
+	/* RETIRE_UP_TO is one master-session prefix across every tag, not merely a
+	 * scan of tags that have already published terminal bits.  Positively
+	 * identify an undrained writer only through its canonical linked leader;
+	 * this excludes the legal cancelled-predecessor ref tombstone retained
+	 * beside a different live successor.  Holder/blocker refs have their own
+	 * exact lane and need no local membership.  Letting either lower/equal live
+	 * ticket pass would advance local_retired_ticket_id first; its late DRAIN
+	 * could then be skipped by duplicate RETIRE while the dedup DRAINED record
+	 * is swept, leaving a durable local terminal with no replay authority. */
+	writer_flags = flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK;
+	holder_flags = flags & PCM_X_LOCAL_TAG_F_HOLDER_TERMINAL_MASK;
+	if ((writer_flags | holder_flags) == 0) {
+		if (!pcm_x_ticket_ref_is_zero(&tag_slot->ref)
+			&& tag_slot->ref.handle.ticket_id <= request->retire_through_ticket_id
+			&& tag_slot->leader_index != PCM_X_INVALID_SLOT_INDEX
+			&& tag_slot->leader_slot_generation != 0) {
+			leader_ref.slot_index = tag_slot->leader_index;
+			leader_ref.slot_generation = tag_slot->leader_slot_generation;
+			leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+				PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &tag_slot->tag,
+				PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+			if (leader != NULL
+				&& pcm_x_wait_identity_equal(&leader->identity, &tag_slot->ref.identity)
+				&& pcm_x_ticket_handle_equal(&leader->handle, &tag_slot->ref.handle)) {
+				result = PCM_X_QUEUE_NOT_READY;
+				goto candidate_done;
+			}
+		}
+		external_ref = !pcm_x_ticket_ref_is_zero(&tag_slot->holder_ref)
+						   ? &tag_slot->holder_ref
+						   : (!pcm_x_ticket_ref_is_zero(&tag_slot->blocker_snapshot_ref)
+								  ? &tag_slot->blocker_snapshot_ref
+								  : NULL);
+		if (external_ref != NULL
+			&& external_ref->handle.ticket_id <= request->retire_through_ticket_id) {
+			result = PCM_X_QUEUE_NOT_READY;
+			goto candidate_done;
+		}
 		goto candidate_done;
 	}
 	result = pcm_x_local_same_ref_dual_retire_state(tag_slot, flags, &same_ref_dual,
