@@ -51,6 +51,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/clog.h"     /* C0 literal raw CLOG status */
 #include "access/multixact.h" /* GetMultiXactIdMembers / MultiXactMember (spec-7.1 D3-b) */
 #include "access/transam.h"	  /* TransactionIdDidCommit/DidAbort (D-i4 CLOG cross) */
 #include "access/xlog.h"	  /* GetFlushRecPtr (spec-6.12i live_hwm_lsn) */
@@ -82,6 +83,7 @@
 #include "cluster/cluster_xid_stripe.h"		 /* cluster_xid_is_mine (spec-6.15 D4) */
 #include "miscadmin.h"
 #include "storage/latch.h"
+#include "storage/lwlock.h" /* C0 XactTruncationLock arbitrary-xid gate */
 #include "storage/proc.h"
 #include "storage/procarray.h" /* TT-P013: origin-own exact live proof */
 #include "storage/shmem.h"
@@ -838,6 +840,106 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		return LMS_OWN_XID_PROVEN;
 
 	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:
+		/*
+		 * TT-P013-RULE25-C0: the committed-only scan's zero-match also
+		 * contains exact ACTIVE and ABORTED cluster-era xids.  Before the
+		 * first raw-xid reuse, the existing native-prehistory consume/disable
+		 * drain makes {origin, raw xid} an incarnation-safe key: DISABLE takes
+		 * the same lock EXCLUSIVE and cannot ACK (or open epoch allocation)
+		 * until this SHARED reader has selected its verdict.
+		 *
+		 * The full durable scan intentionally stays outside this drain.  If a
+		 * DISABLE won during/after it, the in-lock covered/disabled recheck
+		 * fails; if this reader wins, raw reuse cannot begin until it releases.
+		 * A nonzero covered_hw is only the current-boot "drain armed" witness,
+		 * NEVER a numeric xid bound (do not use native_prehistory_provable).
+		 *
+		 * Read literal raw CLOG under XactTruncationLock.  DidAbort recursively
+		 * follows SUB_COMMITTED, which C0 must keep UNKNOWN.  Only raw COMMITTED
+		 * may compose with the unchanged retention/bound branch; SUB_COMMITTED,
+		 * a gone ProcArray entry, truncation and every other sampled doubt refuse
+		 * before that branch can reinterpret the CLOG byte.
+		 */
+		if (allow_live && expected_segment_id > 0 && expected_segment_id <= UINT16_MAX
+			&& expected_tt_slot_id >= 1 && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT
+			&& cluster_cr_native_prehistory_covered_hw() != 0) {
+			volatile ClusterUndoVerdictKind c0_verdict
+				= CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+			volatile bool c0_hard_refuse = false;
+
+			PG_TRY(c0_window);
+			{
+				bool no_raw_reuse_window = false;
+				bool xid_is_mine;
+
+				cluster_cr_native_prehistory_reader_lock();
+				no_raw_reuse_window = cluster_cr_native_prehistory_covered_hw() != 0
+					  && !cluster_cr_native_prehistory_disabled();
+				xid_is_mine = no_raw_reuse_window && cluster_xid_is_mine(xid);
+
+				if (xid_is_mine) {
+					bool clog_sampled = false;
+					bool clog_is_committed = false;
+					bool clog_is_aborted = false;
+					bool clog_is_in_progress = false;
+					bool xid_is_in_progress = false;
+
+					LWLockAcquire(XactTruncationLock, LW_SHARED);
+					if (!TransactionIdPrecedes(xid, ShmemVariableCache->oldestClogXid)) {
+						XLogRecPtr clog_lsn = InvalidXLogRecPtr;
+						XidStatus raw_status = TransactionIdGetStatus(xid, &clog_lsn);
+
+						clog_sampled = true;
+						clog_is_committed = raw_status == TRANSACTION_STATUS_COMMITTED;
+						clog_is_aborted = raw_status == TRANSACTION_STATUS_ABORTED;
+						clog_is_in_progress = raw_status == TRANSACTION_STATUS_IN_PROGRESS;
+					} else {
+						/* A truncated CLOG byte is doubt, never a recursive fallback. */
+						c0_hard_refuse = true;
+					}
+					LWLockRelease(XactTruncationLock);
+
+					/* ProcArray need not retain the truncation guard; the native drain
+					 * still protects raw-xid uniqueness through verdict selection. */
+					if (clog_is_in_progress)
+						xid_is_in_progress = TransactionIdIsInProgress(xid);
+					c0_verdict = cluster_cr_server_c0_zero_match_verdict(
+						allow_live, xid_is_mine, expected_segment_id, expected_tt_slot_id,
+						no_raw_reuse_window, clog_is_committed, clog_is_aborted,
+						clog_is_in_progress, xid_is_in_progress);
+					if (clog_sampled
+						&& c0_verdict == CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED
+						&& !clog_is_committed)
+						c0_hard_refuse = true;
+				}
+				cluster_cr_native_prehistory_reader_unlock();
+			}
+			PG_CATCH(c0_window);
+			{
+				/* CLOG/ProcArray can ERROR with internal LWLocks held.  Every
+				 * C0 serve entry is lock-free, so release the complete C0 stack
+				 * before the long-lived LMS converts the error to DENIED. */
+				HOLD_INTERRUPTS();
+				LWLockReleaseAll();
+				RESUME_INTERRUPTS();
+				PG_RE_THROW();
+			}
+			PG_END_TRY(c0_window);
+
+			switch (c0_verdict) {
+			case CLUSTER_UNDO_VERDICT_ABORTED:
+				*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+				return LMS_OWN_XID_PROVEN;
+			case CLUSTER_UNDO_VERDICT_IN_PROGRESS:
+				*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS;
+				return LMS_OWN_XID_PROVEN_IN_PROGRESS;
+			case CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED:
+			default:
+				break;
+			}
+			if (c0_hard_refuse)
+				return LMS_OWN_XID_REFUSE_ZERO_MATCH;
+		}
 		if (!cluster_cr_retention_proof_origin_legs(&horizon))
 			return LMS_OWN_XID_REFUSE_OTHER;
 		horizon = cluster_tt_slot_max_recycle_horizon();
@@ -868,6 +970,35 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		return LMS_OWN_XID_REFUSE_OTHER;
 	}
 }
+
+#ifdef USE_CLUSTER_UNIT
+/* Execute the real static resolver from the focused C0 fixture. */
+ClusterUndoVerdictKind
+cluster_cr_server_test_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
+										 uint32 expected_tt_slot_id, bool authoritative)
+{
+	uint8 verdict = 0;
+	SCN commit_scn = InvalidScn;
+	SCN horizon_scn = InvalidScn;
+	uint16 wrap = 0;
+
+	(void)lms_resolve_own_xid_verdict(xid, expected_segment_id, expected_tt_slot_id,
+										authoritative, &verdict, &commit_scn, &horizon_scn,
+										&wrap);
+	switch (verdict) {
+	case CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
+		return CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	case CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON:
+		return CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+	case CLUSTER_GCS_UNDO_VERDICT_ABORTED:
+		return CLUSTER_UNDO_VERDICT_ABORTED;
+	case CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:
+		return CLUSTER_UNDO_VERDICT_IN_PROGRESS;
+	default:
+		return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	}
+}
+#endif
 
 /*
  * lms_undo_verdict_serve — LMS side of one KIND_UNDO_VERDICT slot

@@ -117,6 +117,24 @@ extern bool cluster_cr_server_live_binding_exact(bool xid_is_mine, uint32 expect
 												 bool durable_binding_stable);
 
 /*
+ * TT-P013-RULE25-C0: pure positive-proof table for a complete committed-only
+ * zero-match.  The runtime supplies raw (non-recursive) CLOG status booleans
+ * sampled under the existing no-raw-reuse drain.  COMMITTED without an exact
+ * SCN, SUB_COMMITTED (all raw booleans false), contradictory samples and every
+ * carrier/window doubt remain UNKNOWN_FAIL_CLOSED.
+ */
+extern ClusterUndoVerdictKind cluster_cr_server_c0_zero_match_verdict(
+	bool authoritative, bool xid_is_mine, uint32 expected_segment_id,
+	uint32 expected_tt_slot_id, bool no_raw_reuse_window, bool clog_is_committed,
+	bool clog_is_aborted, bool clog_is_in_progress, bool xid_is_in_progress);
+
+#ifdef USE_CLUSTER_UNIT
+extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
+	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
+	bool authoritative);
+#endif
+
+/*
  * LMS CR work slots (shmem, embedded in the cluster_lms region).
  *
  *	Slot lifecycle: FREE -(submit CAS)-> FILLING -(submit publish)->

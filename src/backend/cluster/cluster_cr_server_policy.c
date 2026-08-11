@@ -104,4 +104,32 @@ cluster_cr_server_live_binding_exact(bool xid_is_mine, uint32 expected_segment_i
 		   && durable_binding_stable;
 }
 
+ClusterUndoVerdictKind
+cluster_cr_server_c0_zero_match_verdict(bool authoritative, bool xid_is_mine,
+										uint32 expected_segment_id,
+										uint32 expected_tt_slot_id,
+										bool no_raw_reuse_window, bool clog_is_committed,
+										bool clog_is_aborted, bool clog_is_in_progress,
+										bool xid_is_in_progress)
+{
+	int raw_status_count;
+
+	if (!authoritative || !xid_is_mine || expected_segment_id == 0
+		|| expected_segment_id > UINT16_MAX || expected_tt_slot_id < 1
+		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT || !no_raw_reuse_window)
+		return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+
+	raw_status_count
+		= (clog_is_committed ? 1 : 0) + (clog_is_aborted ? 1 : 0)
+		  + (clog_is_in_progress ? 1 : 0);
+	if (raw_status_count != 1 || clog_is_committed)
+		return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	if (clog_is_aborted)
+		return xid_is_in_progress ? CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED
+								  : CLUSTER_UNDO_VERDICT_ABORTED;
+	if (clog_is_in_progress && xid_is_in_progress)
+		return CLUSTER_UNDO_VERDICT_IN_PROGRESS;
+	return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+}
+
 #endif /* USE_PGRAC_CLUSTER */

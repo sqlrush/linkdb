@@ -395,10 +395,17 @@ test_cluster_hang_acceptance: test_cluster_hang_acceptance.c unit_test.h $(CLUST
 # (the pure FULL/PARTIAL/DENY split over write_scn-DESC chain origins).  No
 # PG-backend deps: the policy is branch-only integer logic.
 CLUSTER_CR_SERVER_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_cr_server_policy.o
+CLUSTER_CR_SERVER_C0_TEST_O = test_cluster_cr_server_c0_product.o
+$(CLUSTER_CR_SERVER_C0_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_cr_server.c \
+		$(top_srcdir)/src/include/cluster/cluster_cr_server.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
+		-c $< -o $@
+
 test_cluster_cr_server_policy: test_cluster_cr_server_policy.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_CR_SERVER_POLICY_O)
+		$(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_CR_SERVER_C0_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_CR_SERVER_POLICY_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_CR_SERVER_POLICY_O) $(CLUSTER_CR_SERVER_C0_TEST_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-6.12i: test_cluster_runtime_visibility links cluster_runtime_visibility_policy.o
