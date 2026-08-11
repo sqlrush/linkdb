@@ -573,13 +573,15 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
  *	shipped horizon, the t/346 clock-skew case) self-heals: the NEXT
  *	snapshot's read_scn is at/after the observed horizon.
  *
- *	true only on a proven terminal verdict; *out_commit_scn_is_bound marks a
- *	BELOW_HORIZON commit whose scn field is the horizon BOUND (valid against
- *	THIS read_scn only — never stamp/cache it).  false = fail-closed.
+ *	true only on a proven terminal verdict or an exact fresh-ref live proof;
+ *	*out_commit_scn_is_bound marks a BELOW_HORIZON commit whose scn field is
+ *	the horizon BOUND (valid against THIS read_scn only — never stamp/cache
+ *	it).  false = fail-closed.
  */
 static bool
 rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-						 SCN demand_scn, SCN read_scn, bool authoritative, bool *out_committed,
+						 uint32 expected_tt_slot_id, SCN demand_scn, SCN read_scn,
+						 bool authoritative, bool *out_committed, bool *out_in_progress,
 						 SCN *out_commit_scn, bool *out_commit_scn_is_bound)
 {
 	ClusterGcsUndoVerdictPage verdict;
@@ -603,8 +605,9 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 	}
 
 	cluster_rtvis_verdict_note_wire();
-	if (!cluster_gcs_block_undo_verdict_fetch_and_wait((int32)origin_node, undo_segment_id, raw_xid,
-													   authoritative, &verdict, &auth)) {
+	if (!cluster_gcs_block_undo_verdict_fetch_and_wait(
+			(int32)origin_node, undo_segment_id, expected_tt_slot_id, raw_xid,
+			authoritative, &verdict, &auth)) {
 		cluster_rtvis_verdict_note_failclosed();
 		return false;
 	}
@@ -623,6 +626,23 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 	}
 
 	switch (verdict.verdict) {
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:
+		/*
+		 * S3-P0-13: positive, non-terminal origin liveness proof.  It is
+		 * usable only as REMOTE/IN_PROGRESS by the fresh-ref current-DML
+		 * consumer; there is no SCN/bound and no memo/hint side effect.
+		 */
+		if (!authoritative || expected_tt_slot_id < 1
+			|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT) {
+			cluster_rtvis_verdict_note_failclosed();
+			return false;
+		}
+		*out_in_progress = true;
+		elog(DEBUG1,
+			 "rtvis verdict: xid %u origin %d IN_PROGRESS exact segment %u slot %u",
+			 raw_xid, origin_node, undo_segment_id, expected_tt_slot_id);
+		return true;
+
 	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT:
 		*out_committed = true;
 		*out_commit_scn = (SCN)verdict.commit_scn;
@@ -672,8 +692,7 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 }
 
 /*
- * cluster_runtime_visibility_try_resolve_remote — CP3 + CP5 (D-i2/D-i4
- * wiring body).
+ * rtvis_try_resolve_remote_internal — CP3 + CP5 (D-i2/D-i4 wiring body).
  *
  *	Active-runtime terminal resolution of a RECYCLED remote ITL ref:
  *	  fetch (D-i1, block 0 of the ref's segment)  ->  covers gate (D-i2,
@@ -690,15 +709,19 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
  *	second read whose generation could diverge.  auth.tt_generation is kept
  *	for observability and any future cross-source check.
  *
- *	true only on a proven terminal verdict; every other outcome returns
- *	false so classify_ref keeps the pre-existing STALE_OR_AMBIGUOUS ->
- *	53R97 fail-closed (Rule 8.A: only "resolve when provable" is widened).
+ *	A nonzero expected_tt_slot_id lets the authoritative fresh-ref consumer
+ *	carry an exact 1-based slot binding and receive a proven IN_PROGRESS
+ *	answer through out_in_progress.  Slot 0 retains the terminal-only legacy
+ *	contract.  Every unproven outcome returns false so classify_ref keeps the
+ *	pre-existing STALE_OR_AMBIGUOUS -> 53R97 fail-closed (Rule 8.A: only
+ *	"resolve when provable" is widened).
  */
-bool
-cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
-											  TransactionId raw_xid, SCN read_scn,
-											  bool authoritative, bool *out_committed,
-											  SCN *out_commit_scn, bool *out_commit_scn_is_bound)
+static bool
+rtvis_try_resolve_remote_internal(int origin_node, uint32 undo_segment_id,
+								  uint32 expected_tt_slot_id, TransactionId raw_xid,
+								  SCN read_scn, bool authoritative, bool *out_committed,
+								  bool *out_in_progress, SCN *out_commit_scn,
+								  bool *out_commit_scn_is_bound)
 {
 	PGAlignedBlock page;
 	ClusterLiveAuthority auth;
@@ -707,6 +730,8 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 
 	if (out_committed != NULL)
 		*out_committed = false;
+	if (out_in_progress != NULL)
+		*out_in_progress = false;
 	if (out_commit_scn != NULL)
 		*out_commit_scn = InvalidScn;
 
@@ -716,7 +741,8 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 		return false;
 	if (out_commit_scn_is_bound != NULL)
 		*out_commit_scn_is_bound = false;
-	if (out_committed == NULL || out_commit_scn == NULL || out_commit_scn_is_bound == NULL)
+	if (out_committed == NULL || out_in_progress == NULL || out_commit_scn == NULL
+		|| out_commit_scn_is_bound == NULL)
 		return false;
 
 	if (!cluster_crossnode_runtime_visibility)
@@ -834,10 +860,14 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	 * fetch/covers miss proves nothing either — ask the origin for the
 	 * complete own-TT verdict instead of failing closed outright.
 	 */
-	if (rtvis_try_origin_verdict(origin_node, undo_segment_id, raw_xid, demand_scn, read_scn,
-								 authoritative, out_committed, out_commit_scn,
-								 out_commit_scn_is_bound)) {
-		if (*out_committed)
+	if (rtvis_try_origin_verdict(
+			origin_node, undo_segment_id, raw_xid, expected_tt_slot_id, demand_scn,
+			read_scn, authoritative, out_committed, out_in_progress, out_commit_scn,
+			out_commit_scn_is_bound)) {
+		if (*out_in_progress) {
+			/* Non-terminal positive proof: do not fold it into either of the
+			 * terminal committed/aborted census buckets. */
+		} else if (*out_committed)
 			cluster_rtvis_resolve_note_committed();
 		else
 			cluster_rtvis_resolve_note_aborted();
@@ -845,6 +875,30 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	}
 	cluster_rtvis_resolve_note_failclosed();
 	return false;
+}
+
+/*
+ * Legacy terminal-only entry.  It carries no physical slot binding, so even
+ * an authoritative caller cannot request the S3-P0-13 live widening.
+ */
+bool
+cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segment_id,
+											  TransactionId raw_xid, SCN read_scn,
+											  bool authoritative, bool *out_committed,
+											  SCN *out_commit_scn,
+											  bool *out_commit_scn_is_bound)
+{
+	bool in_progress = false;
+
+	if (!rtvis_try_resolve_remote_internal(
+			origin_node, undo_segment_id, 0, raw_xid, read_scn, authoritative,
+			out_committed, &in_progress, out_commit_scn, out_commit_scn_is_bound))
+		return false;
+	if (in_progress) {
+		cluster_rtvis_resolve_note_failclosed();
+		return false;
+	}
+	return true;
 }
 
 /*
@@ -952,11 +1006,12 @@ rtvis_authority_serve_block0(int origin_node, uint32 undo_segment_id, Transactio
  */
 ClusterUndoVerdictResult
 cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-							 SCN read_scn, bool authoritative)
+							 uint32 expected_tt_slot_id, SCN read_scn, bool authoritative)
 {
 	ClusterUndoVerdictResult unknown
 		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
 	bool committed = false;
+	bool in_progress = false;
 	bool is_bound = false;
 	SCN commit_scn = InvalidScn;
 
@@ -1041,10 +1096,19 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 
 	/* master!=self, owner live (or data plane unarmed): CP3 S-grant + CP5
 	 * origin verdict, byte-for-byte the pre-D4 path. */
-	if (cluster_runtime_visibility_try_resolve_remote(origin_node, undo_segment_id, raw_xid,
-													  read_scn, authoritative, &committed,
-													  &commit_scn, &is_bound))
+	if (rtvis_try_resolve_remote_internal(
+			origin_node, undo_segment_id, expected_tt_slot_id, raw_xid, read_scn,
+			authoritative, &committed, &in_progress, &commit_scn, &is_bound)) {
+		if (in_progress) {
+			ClusterUndoVerdictResult live
+				= { .kind = CLUSTER_UNDO_VERDICT_IN_PROGRESS,
+					.commit_scn = InvalidScn,
+					.wrap = 0 };
+
+			return live;
+		}
 		return cluster_undo_verdict_from_resolve(true, committed, commit_scn, is_bound);
+	}
 	return unknown;
 }
 

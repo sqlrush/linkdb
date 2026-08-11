@@ -238,11 +238,14 @@ extern ClusterVisVerdict cluster_vis_dirty_verdict(ClusterTTStatus status, bool 
  * cluster_vis_from_undo_verdict -- map a D3 cross-node verdict onto the local
  * visibility out-params.  COMMITTED_EXACT/BOUND -> REMOTE/COMMITTED (BOUND
  * sets commit_scn_is_bound so a below-horizon bound is never stamped/cached);
- * ABORTED -> REMOTE/ABORTED; UNKNOWN_FAIL_CLOSED / IN_PROGRESS (D3 never
- * produces IN_PROGRESS) / any other -> STALE_OR_AMBIGUOUS so the caller keeps
- * the 53R97 fail-closed boundary (Rule 8.A / L10).  ALL branches overwrite
- * commit_scn + commit_scn_is_bound so a non-terminal verdict never leaks a
- * residual scn.  Returns true iff a terminal (COMMITTED/ABORTED) was produced.
+ * ABORTED -> REMOTE/ABORTED; a positive origin-live IN_PROGRESS ->
+ * REMOTE/IN_PROGRESS with no SCN/bound (the current-DML caller enters the
+ * existing cluster TX wait); UNKNOWN_FAIL_CLOSED / any other ->
+ * STALE_OR_AMBIGUOUS so the caller keeps the 53R97 fail-closed boundary
+ * (Rule 8.A / L10).  ALL branches overwrite commit_scn +
+ * commit_scn_is_bound so a non-terminal verdict never leaks a residual scn.
+ * Returns true iff a usable exact status (terminal or proven-live) was
+ * produced.
  */
 extern bool cluster_vis_from_undo_verdict(ClusterUndoVerdictResult v, ClusterVisResolve *out);
 

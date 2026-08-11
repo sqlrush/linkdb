@@ -711,7 +711,8 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			 * the dedicated fresh-ref counter is the ONLY extra bump here -- an
 			 * explicit rtvis_resolve_note here would double-count. */
 			ClusterUndoVerdictResult v = cluster_undo_verdict_resolve(
-				(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid, read_scn,
+				(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid,
+				(uint32)ref->tt_slot_id, read_scn,
 				true /* fresh ref: physical-binding authority */);
 
 			if (cluster_vis_from_undo_verdict(v, out)) {

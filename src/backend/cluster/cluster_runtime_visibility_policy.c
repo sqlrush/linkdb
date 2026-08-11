@@ -286,6 +286,10 @@ cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
 	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
 		/* Terminal abort carries no scn of any kind. */
 		return !SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:
+		/* Positive live proof is canonical and non-terminal: no terminal
+		 * SCN, horizon, or wrap residue may cross this branch. */
+		return !SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn) && v->wrap == 0;
 	default:
 		return false; /* unknown kind: refuse, never guess */
 	}
@@ -330,6 +334,10 @@ cluster_undo_verdict_from_wire_page(const struct ClusterGcsUndoVerdictPage *v,
 
 	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
 		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:
+		r.kind = CLUSTER_UNDO_VERDICT_IN_PROGRESS;
 		return r;
 
 	default:

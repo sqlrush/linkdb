@@ -396,33 +396,43 @@ UT_TEST(test_undo_verdict_generation_structural_not_anti_aba)
 }
 
 /* ======================================================================
- * U10 -- IN_PROGRESS is reserved but never produced by D3 (spec-5.22c Q6,
- * §3.3).  The taxonomy keeps the value位 for a future write-path consumer,
- * but every D3 mapper folds an unproven-terminal outcome to UNKNOWN, never
- * IN_PROGRESS (cross-node has no origin-live ProcArray proof; conflating
- * "running" with "crash-lost" would breach 8.A).
+ * TT-P013-RULE25-B RED / U10 -- the origin may provide the missing positive
+ * live proof: its own ProcArray says the exact xid is still running while
+ * the durable TT already carries the pre-commit RESOLVED_SCN stamp.  The
+ * dedicated wire kind (numeric value 4, aligned with the already-reserved
+ * local taxonomy value) must preserve IN_PROGRESS end-to-end.
+ *
+ * This is deliberately narrower than "not committed": an ordinary unknown,
+ * crash-lost, malformed, or SCN-bearing IN_PROGRESS page still fails closed.
+ * No leg may infer COMMITTED or ABORTED from the pre-commit stamp.
  * ====================================================================== */
-UT_TEST(test_undo_verdict_in_progress_never_produced)
+UT_TEST(test_undo_verdict_proven_live_maps_to_in_progress_only)
 {
 	ClusterGcsUndoVerdictPage v;
+	ClusterUndoVerdictResult r;
 	TransactionId xid = 321;
+	const uint8 wire_in_progress = 4;
 
-	UT_ASSERT_EQ((int)CLUSTER_UNDO_VERDICT_IN_PROGRESS, 4); /* value位 reserved */
+	UT_ASSERT_EQ((int)CLUSTER_UNDO_VERDICT_IN_PROGRESS, (int)wire_in_progress);
 
-	/* no wire kind maps to IN_PROGRESS (wire is EXACT/BELOW_HORIZON/ABORTED) */
-	make_verdict_page(&v, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT, xid, 5000, InvalidScn, 1);
-	UT_ASSERT_NE(cluster_undo_verdict_from_wire_page(&v, xid).kind,
-				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+	/* Exact live proof: no SCN and no wrap payload. */
+	make_verdict_page(&v, wire_in_progress, xid, InvalidScn, InvalidScn, 0);
+	r = cluster_undo_verdict_from_wire_page(&v, xid);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+	UT_ASSERT_EQ((uint64)r.commit_scn, (uint64)InvalidScn);
+	UT_ASSERT_EQ(r.wrap, 0);
 
-	/* from_resolve never yields IN_PROGRESS across its whole domain */
-	UT_ASSERT_NE(cluster_undo_verdict_from_resolve(false, false, InvalidScn, false).kind,
-				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
-	UT_ASSERT_NE(cluster_undo_verdict_from_resolve(true, true, 1, false).kind,
-				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
-	UT_ASSERT_NE(cluster_undo_verdict_from_resolve(true, true, 1, true).kind,
-				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
-	UT_ASSERT_NE(cluster_undo_verdict_from_resolve(true, false, InvalidScn, false).kind,
-				 CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+	/* A live page carrying terminal residue is malformed, never a terminal
+	 * inference and never a usable IN_PROGRESS proof. */
+	make_verdict_page(&v, wire_in_progress, xid, 5000, InvalidScn, 0);
+	r = cluster_undo_verdict_from_wire_page(&v, xid);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	make_verdict_page(&v, wire_in_progress, xid, InvalidScn, 5000, 0);
+	r = cluster_undo_verdict_from_wire_page(&v, xid);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	make_verdict_page(&v, wire_in_progress, xid, InvalidScn, InvalidScn, 1);
+	r = cluster_undo_verdict_from_wire_page(&v, xid);
+	UT_ASSERT_EQ(r.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 }
 
 /* ======================================================================
@@ -461,7 +471,7 @@ main(void)
 	UT_RUN(test_undo_verdict_from_resolve_folding);
 	UT_RUN(test_undo_verdict_wire_page_malformed_fail_closed);
 	UT_RUN(test_undo_verdict_generation_structural_not_anti_aba);
-	UT_RUN(test_undo_verdict_in_progress_never_produced);
+	UT_RUN(test_undo_verdict_proven_live_maps_to_in_progress_only);
 	UT_RUN(test_undo_verdict_slot_wrap_is_the_real_anti_aba);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

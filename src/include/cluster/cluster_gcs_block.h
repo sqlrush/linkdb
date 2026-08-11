@@ -3843,7 +3843,14 @@ ClusterGcsUndoAuthTrailerGetAuthorityScn(const ClusterGcsUndoAuthTrailer *t)
 typedef enum ClusterGcsUndoVerdictKind {
 	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT = 1,
 	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON = 2,
-	CLUSTER_GCS_UNDO_VERDICT_ABORTED = 3
+	CLUSTER_GCS_UNDO_VERDICT_ABORTED = 3,
+	/*
+	 * S3-P0-13: positive NON-terminal proof.  The origin emits this only
+	 * after exact fresh-ref segment/slot identity, own-stripe, stable
+	 * RESOLVED_SCN, and ProcArray-live gates.  Canonical payload has no SCN
+	 * and no wrap; it is never memoized or hint-stamped.
+	 */
+	CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS = 4
 } ClusterGcsUndoVerdictKind;
 
 typedef struct ClusterGcsUndoVerdictPage {

@@ -98,6 +98,25 @@ typedef enum ClusterCrInvalidScnVerdict {
 extern ClusterCrInvalidScnVerdict cluster_cr_server_invalid_scn_verdict(bool clog_did_abort);
 
 /*
+ * TT-P013-RULE25-B: pure classifier for the narrow RESOLVED_SCN pre-commit
+ * window.  Positive authority precedence is COMMITTED, ABORTED, IN_PROGRESS;
+ * an unproved non-commit remains UNKNOWN_FAIL_CLOSED.  The runtime owns the
+ * exact physical-binding and origin-liveness gates.
+ */
+extern ClusterUndoVerdictKind cluster_cr_server_resolved_scn_verdict(bool clog_did_commit,
+																	 bool clog_did_abort,
+																	 bool xid_is_in_progress);
+
+/*
+ * TT-P013-RULE25-B: exact live-proof conjunction.  The fresh-ref carrier's
+ * TT slot is 1-based while the durable resolver reports a 0-based slot.
+ */
+extern bool cluster_cr_server_live_binding_exact(bool xid_is_mine, uint32 expected_segment_id,
+												 uint32 expected_tt_slot_id, uint16 matched_segment,
+												 uint16 matched_slot, bool xid_is_in_progress,
+												 bool durable_binding_stable);
+
+/*
  * LMS CR work slots (shmem, embedded in the cluster_lms region).
  *
  *	Slot lifecycle: FREE -(submit CAS)-> FILLING -(submit publish)->
@@ -483,9 +502,13 @@ extern bool cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 s
  * cluster_vis_undo_verdict_page_usable), fills *auth_out and returns true;
  * false = fail-closed (timeout / DENIED / checksum / trailer missing /
  * malformed page — caller keeps the unchanged 53R97 refusal, Rule 8.A).
+ * expected_tt_slot_id is the authoritative fresh ref's exact 1-based slot
+ * binding (0 for terminal-only callers).  It rides the existing synthetic
+ * tag block-number field and does not change the wire layout.
  * The caller MUST Lamport-observe verdict_out->horizon_scn (and any
  * commit_scn) it consumes — SCNs that crossed the wire (AD-008). */
 extern bool cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
+														  uint32 expected_tt_slot_id,
 														  TransactionId xid, bool authoritative,
 														  ClusterGcsUndoVerdictPage *verdict_out,
 														  ClusterLiveAuthority *auth_out);

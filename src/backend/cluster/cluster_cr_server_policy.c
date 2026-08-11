@@ -29,6 +29,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_tt_slot.h"
 
 ClusterCrServerSplit
 cluster_cr_server_split_classify(const int32 *chain_origins, int nchains, int32 self_node,
@@ -75,6 +76,32 @@ ClusterCrInvalidScnVerdict
 cluster_cr_server_invalid_scn_verdict(bool clog_did_abort)
 {
 	return clog_did_abort ? CLUSTER_CR_INVALID_SCN_ABORTED : CLUSTER_CR_INVALID_SCN_REFUSE;
+}
+
+ClusterUndoVerdictKind
+cluster_cr_server_resolved_scn_verdict(bool clog_did_commit, bool clog_did_abort,
+									   bool xid_is_in_progress)
+{
+	if (clog_did_commit)
+		return CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+	if (clog_did_abort)
+		return CLUSTER_UNDO_VERDICT_ABORTED;
+	if (xid_is_in_progress)
+		return CLUSTER_UNDO_VERDICT_IN_PROGRESS;
+	return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+}
+
+bool
+cluster_cr_server_live_binding_exact(bool xid_is_mine, uint32 expected_segment_id,
+									 uint32 expected_tt_slot_id, uint16 matched_segment,
+									 uint16 matched_slot, bool xid_is_in_progress,
+									 bool durable_binding_stable)
+{
+	return xid_is_mine && expected_segment_id > 0 && expected_segment_id <= UINT16_MAX
+		   && expected_segment_id == (uint32)matched_segment && expected_tt_slot_id >= 1
+		   && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT
+		   && expected_tt_slot_id == (uint32)matched_slot + 1 && xid_is_in_progress
+		   && durable_binding_stable;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

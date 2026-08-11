@@ -33,6 +33,45 @@
 
 UT_DEFINE_GLOBALS();
 
+static char *
+read_runtime_visibility_source(void)
+{
+	const char *source_file = __FILE__;
+	const char *source_suffix = "/src/test/cluster_unit/test_cluster_runtime_visibility.c";
+	const char *suffix_at = strstr(source_file, source_suffix);
+	char path[MAXPGPATH];
+	FILE *file;
+	long length;
+	char *source;
+
+	if (suffix_at != NULL)
+		snprintf(path, sizeof(path),
+				 "%.*s/src/backend/cluster/cluster_runtime_visibility.c",
+				 (int)(suffix_at - source_file), source_file);
+	else
+		snprintf(path, sizeof(path),
+				 "../../../src/backend/cluster/cluster_runtime_visibility.c");
+
+	file = fopen(path, "rb");
+	UT_ASSERT_NOT_NULL(file);
+	if (file == NULL)
+		return NULL;
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
+	length = ftell(file);
+	UT_ASSERT(length > 0);
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+	source = malloc((size_t)length + 1);
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) {
+		fclose(file);
+		return NULL;
+	}
+	UT_ASSERT_EQ(fread(source, 1, (size_t)length, file), (size_t)length);
+	source[length] = '\0';
+	fclose(file);
+	return source;
+}
+
 /* Assert hook stub so the cassert libpgport links standalone. */
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -878,10 +917,65 @@ UT_TEST(test_undo_fetch_tag_roundtrip)
 	UT_ASSERT_EQ(GcsBlockUndoFetchTagDecode(real_tag, &seg, &blk), false);
 }
 
+/*
+ * TT-P013-RULE25-B review boundary: kind4 is non-terminal.  The requester
+ * must independently require the approved authoritative exact-slot context,
+ * and the legacy terminal-only wrapper must refuse it instead of translating
+ * a successful call with committed=false into ABORTED.
+ */
+UT_TEST(test_terminal_remote_wrapper_rejects_in_progress_verdict)
+{
+	char *source = read_runtime_visibility_source();
+	const char *origin = source != NULL ? strstr(source, "\nrtvis_try_origin_verdict(") : NULL;
+	const char *origin_end
+		= origin != NULL ? strstr(origin, "\nrtvis_try_resolve_remote_internal(") : NULL;
+	const char *kind4
+		= origin != NULL
+			  ? strstr(origin, "case (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:")
+			  : NULL;
+	const char *authoritative_gate
+		= kind4 != NULL ? strstr(kind4, "if (!authoritative || expected_tt_slot_id < 1") : NULL;
+	const char *slot_ceiling
+		= authoritative_gate != NULL
+			  ? strstr(authoritative_gate,
+					   "expected_tt_slot_id > TT_SLOTS_PER_SEGMENT")
+			  : NULL;
+	const char *publish_live
+		= kind4 != NULL ? strstr(kind4, "*out_in_progress = true;") : NULL;
+	const char *wrapper
+		= source != NULL
+			  ? strstr(source, "\ncluster_runtime_visibility_try_resolve_remote(")
+			  : NULL;
+	const char *wrapper_end
+		= wrapper != NULL ? strstr(wrapper, "\n}\n\n/*\n * rtvis_resolve_own_xid") : NULL;
+	const char *guarded_call
+		= wrapper != NULL ? strstr(wrapper, "if (!rtvis_try_resolve_remote_internal(") : NULL;
+	const char *terminal_reject
+		= guarded_call != NULL ? strstr(guarded_call, "if (in_progress)") : NULL;
+
+	UT_ASSERT_NOT_NULL(origin);
+	UT_ASSERT_NOT_NULL(origin_end);
+	UT_ASSERT_NOT_NULL(kind4);
+	UT_ASSERT_NOT_NULL(authoritative_gate);
+	UT_ASSERT_NOT_NULL(slot_ceiling);
+	UT_ASSERT_NOT_NULL(publish_live);
+	UT_ASSERT_NOT_NULL(wrapper);
+	UT_ASSERT_NOT_NULL(wrapper_end);
+	UT_ASSERT_NOT_NULL(guarded_call);
+	UT_ASSERT_NOT_NULL(terminal_reject);
+	if (origin_end != NULL && kind4 != NULL && authoritative_gate != NULL
+		&& slot_ceiling != NULL && publish_live != NULL)
+		UT_ASSERT(kind4 < authoritative_gate && authoritative_gate < slot_ceiling
+				  && slot_ceiling < publish_live && publish_live < origin_end);
+	if (wrapper_end != NULL && guarded_call != NULL && terminal_reject != NULL)
+		UT_ASSERT(guarded_call < terminal_reject && terminal_reject < wrapper_end);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -906,6 +1000,7 @@ main(void)
 	UT_RUN(test_undo_authority_verdict_page_fill_roundtrip);
 	UT_RUN(test_undo_multi_verdict_page_usable);
 	UT_RUN(test_undo_fetch_tag_roundtrip);
+	UT_RUN(test_terminal_remote_wrapper_rejects_in_progress_verdict);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

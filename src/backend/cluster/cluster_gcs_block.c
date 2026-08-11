@@ -4961,6 +4961,7 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
  */
 bool
 cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
+											  uint32 expected_tt_slot_id,
 											  TransactionId xid, bool authoritative,
 											  ClusterGcsUndoVerdictPage *verdict_out,
 											  ClusterLiveAuthority *auth_out)
@@ -4977,7 +4978,14 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 
 	memset(verdict_out, 0, sizeof(*verdict_out));
 	memset(auth_out, 0, sizeof(*auth_out));
-	tag = GcsBlockUndoFetchTagMake(segment_id, 0);
+	/*
+	 * S3-P0-13: the existing synthetic tag's blockNum is unused by terminal
+	 * complete-scan verdicts.  Reuse it (no wire-layout or ABI change) for
+	 * the fresh-ref expected TT slot id.  An old origin ignores the value
+	 * and can still return only the legacy terminal kinds; a new origin
+	 * requires it before emitting the positive non-terminal kind 4.
+	 */
+	tag = GcsBlockUndoFetchTagMake(segment_id, expected_tt_slot_id);
 
 	if (!gcs_block_undo_verdict_wire_exchange(origin_node, tag, cluster_epoch_get_current(), xid,
 											  authoritative, false /* owner-served kind */, &hdr,

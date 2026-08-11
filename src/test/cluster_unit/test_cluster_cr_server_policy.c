@@ -29,6 +29,27 @@
 
 UT_DEFINE_GLOBALS();
 
+/*
+ * TT-P013-RULE25-B RED seam.  The implementation belongs in the pure
+ * CR-server policy object after the RED is accepted; keeping the prototypes
+ * test-local makes the current product fail at link time without changing a
+ * product header.
+ *
+ * Only a positive origin-live proof may produce IN_PROGRESS.  An explicit
+ * origin CLOG abort is positive ABORTED authority, while "not committed" by
+ * itself remains UNKNOWN_FAIL_CLOSED.
+ */
+extern ClusterUndoVerdictKind
+cluster_cr_server_resolved_scn_verdict(bool clog_did_commit, bool clog_did_abort,
+									   bool xid_is_in_progress);
+extern bool cluster_cr_server_live_binding_exact(bool xid_is_mine,
+												 uint32 expected_segment_id,
+												 uint32 expected_tt_slot_id,
+												 uint16 matched_segment,
+												 uint16 matched_slot,
+												 bool xid_is_in_progress,
+												 bool durable_binding_stable);
+
 static char *
 read_cr_server_source(void)
 {
@@ -171,6 +192,84 @@ UT_TEST(test_invalid_scn_not_aborted_refuses)
 }
 
 /*
+ * TT-P013-RULE25-B: split the current LMS_OWN_XID_REFUSE_OTHER bucket at the
+ * exact RESOLVED_SCN positive-proof branches.  The origin's own ProcArray is
+ * live authority, CLOG is terminal authority, and an unproved non-commit
+ * remains UNKNOWN.
+ */
+UT_TEST(test_resolved_scn_live_xid_is_in_progress_not_other)
+{
+	UT_ASSERT_EQ((int)cluster_cr_server_resolved_scn_verdict(false, false, true),
+				 (int)CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+}
+
+UT_TEST(test_resolved_scn_terminal_and_unknown_boundaries)
+{
+	UT_ASSERT_EQ((int)cluster_cr_server_resolved_scn_verdict(true, false, false),
+				 (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((int)cluster_cr_server_resolved_scn_verdict(true, true, true),
+				 (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((int)cluster_cr_server_resolved_scn_verdict(false, false, false),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+}
+
+UT_TEST(test_resolved_scn_live_requires_every_exact_binding_gate)
+{
+	/* matched_slot is allocator-internal 0-based; wire slot id is 1-based. */
+	UT_ASSERT(cluster_cr_server_live_binding_exact(true, 17, 4, 17, 3, true, true));
+	UT_ASSERT(!cluster_cr_server_live_binding_exact(false, 17, 4, 17, 3, true, true));
+	UT_ASSERT(!cluster_cr_server_live_binding_exact(true, 18, 4, 17, 3, true, true));
+	UT_ASSERT(!cluster_cr_server_live_binding_exact(true, 17, 5, 17, 3, true, true));
+	UT_ASSERT(!cluster_cr_server_live_binding_exact(true, 17, 0, 17, 3, true, true));
+	UT_ASSERT(!cluster_cr_server_live_binding_exact(true, 17, 49, 17, 3, true, true));
+	UT_ASSERT(!cluster_cr_server_live_binding_exact(true, 17, 4, 17, 3, false, true));
+	UT_ASSERT(!cluster_cr_server_live_binding_exact(true, 17, 4, 17, 3, true, false));
+}
+
+/*
+ * The durable RESOLVED_SCN stamp precedes the CLOG terminal record.  Once
+ * the exact origin binding has an explicit abort, ABORTED must win before
+ * the unproved UNKNOWN leg; crash-lost/in-doubt remains fail-closed.
+ */
+UT_TEST(test_resolved_scn_explicit_abort_after_stamp_is_positive)
+{
+	char *source = read_cr_server_source();
+	const char *resolved
+		= source != NULL ? strstr(source, "case CLUSTER_TT_DURABLE_RESOLVED_SCN:") : NULL;
+	const char *resolved_end
+		= resolved != NULL ? strstr(resolved, "if (cluster_cr_accept_resolved_scn(scn))") : NULL;
+	const char *exact_gate
+		= resolved != NULL ? strstr(resolved, "if (exact_binding)") : NULL;
+	const char *did_abort
+		= exact_gate != NULL ? strstr(exact_gate, "TransactionIdDidAbort(xid)") : NULL;
+	const char *abort_verdict
+		= did_abort != NULL ? strstr(did_abort, "CLUSTER_UNDO_VERDICT_ABORTED") : NULL;
+	const char *unknown
+		= abort_verdict != NULL
+			  ? strstr(abort_verdict, "CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED")
+			  : NULL;
+
+	UT_ASSERT_EQ((int)cluster_cr_server_resolved_scn_verdict(false, true, false),
+				 (int)CLUSTER_UNDO_VERDICT_ABORTED);
+	UT_ASSERT_EQ((int)cluster_cr_server_resolved_scn_verdict(false, false, false),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+
+	UT_ASSERT_NOT_NULL(resolved);
+	UT_ASSERT_NOT_NULL(resolved_end);
+	UT_ASSERT_NOT_NULL(exact_gate);
+	UT_ASSERT_NOT_NULL(did_abort);
+	UT_ASSERT_NOT_NULL(abort_verdict);
+	UT_ASSERT_NOT_NULL(unknown);
+	if (resolved_end != NULL) {
+		UT_ASSERT(exact_gate != NULL && exact_gate < resolved_end);
+		UT_ASSERT(did_abort != NULL && did_abort < resolved_end);
+		UT_ASSERT(abort_verdict != NULL && abort_verdict < resolved_end);
+		UT_ASSERT(unknown != NULL && unknown < resolved_end);
+	}
+	free(source);
+}
+
+/*
  * D11 R19: UNDO_MULTI_VERDICT remains park-only.  Freeze the defensive inline
  * entry separately: an explicit kind case must jump over both the serve call
  * and inline-serve accounting to the pre-set DENIED one-reply path.
@@ -220,7 +319,7 @@ UT_TEST(test_undo_multi_verdict_inline_entry_is_denied_without_serve)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(14);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -230,6 +329,10 @@ main(void)
 	UT_RUN(test_split_malformed_is_deny);
 	UT_RUN(test_invalid_scn_aborted_is_positive);
 	UT_RUN(test_invalid_scn_not_aborted_refuses);
+	UT_RUN(test_resolved_scn_live_xid_is_in_progress_not_other);
+	UT_RUN(test_resolved_scn_terminal_and_unknown_boundaries);
+	UT_RUN(test_resolved_scn_live_requires_every_exact_binding_gate);
+	UT_RUN(test_resolved_scn_explicit_abort_after_stamp_is_positive);
 	UT_RUN(test_undo_multi_verdict_inline_entry_is_denied_without_serve);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

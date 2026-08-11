@@ -228,8 +228,9 @@ cluster_vis_dirty_verdict(ClusterTTStatus status, bool is_xmax, bool is_delete)
  * cluster_vis_from_undo_verdict -- map a D3 five-value verdict onto the local
  * visibility out-params.  See the header for the truth table.  EVERY branch
  * overwrites commit_scn + commit_scn_is_bound so a non-terminal verdict never
- * leaks a residual scn (U7).  Returns true iff a terminal (COMMITTED/ABORTED)
- * outcome was produced; false keeps the caller on the 53R97 fail-closed path.
+ * leaks a residual scn (U7).  Returns true iff a usable exact status
+ * (terminal or proven-live) was produced; false keeps the caller on the
+ * 53R97 fail-closed path.
  */
 bool
 cluster_vis_from_undo_verdict(ClusterUndoVerdictResult v, ClusterVisResolve *out)
@@ -262,14 +263,24 @@ cluster_vis_from_undo_verdict(ClusterUndoVerdictResult v, ClusterVisResolve *out
 		out->commit_scn_is_bound = false;
 		return true;
 
-	case CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED:
 	case CLUSTER_UNDO_VERDICT_IN_PROGRESS:
+		/*
+		 * S3-P0-13: exact positive live proof.  This is resolved evidence,
+		 * but deliberately non-terminal: the HTSU verdict becomes
+		 * TM_BeingModified and the caller follows the existing cluster TX
+		 * wait.  No SCN is available to memoize or stamp.
+		 */
+		out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+		out->status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		out->commit_scn = InvalidScn;
+		out->commit_scn_is_bound = false;
+		return true;
+
+	case CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED:
 	default:
 		/*
 		 * Not proven terminal -> STALE_OR_AMBIGUOUS so the caller keeps 53R97
-		 * (Rule 8.A / L10: a zero / unknown verdict is never visible).  D3
-		 * folds a proven-live xid to UNKNOWN already; IN_PROGRESS is handled
-		 * here only defensively.
+		 * (Rule 8.A / L10: a zero / unknown verdict is never visible).
 		 */
 		out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
 		out->status = CLUSTER_TT_STATUS_UNKNOWN;

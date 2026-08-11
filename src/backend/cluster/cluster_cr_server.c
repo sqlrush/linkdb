@@ -83,6 +83,7 @@
 #include "miscadmin.h"
 #include "storage/latch.h"
 #include "storage/proc.h"
+#include "storage/procarray.h" /* TT-P013: origin-own exact live proof */
 #include "storage/shmem.h"
 #include "utils/elog.h"
 #include "utils/memutils.h"
@@ -707,31 +708,95 @@ lms_undo_fetch_serve(ClusterLmsCrSlot *slot)
  *	  anything else       AMBIGUOUS_WRAP / SCAN_UNAVAILABLE -> refuse.
  */
 typedef enum LmsOwnXidReason {
-	LMS_OWN_XID_PROVEN = 0,		   /* out_* holds a proven terminal */
-	LMS_OWN_XID_PROVEN_UPGRADE,	   /* proven ABORTED via the invalid_scn CLOG upgrade */
-	LMS_OWN_XID_REFUSE_OTHER,	   /* not-committed / wrap-suspect / retention-fail / ambiguous */
-	LMS_OWN_XID_REFUSE_ZERO_MATCH, /* recycled 0-match with no explicit CLOG terminal */
-	LMS_OWN_XID_REFUSE_INVALID_SCN /* delayed-cleanout, not provably aborted */
+	LMS_OWN_XID_PROVEN = 0,			/* out_* holds a proven terminal */
+	LMS_OWN_XID_PROVEN_UPGRADE,		/* proven ABORTED via the invalid_scn CLOG upgrade */
+	LMS_OWN_XID_PROVEN_IN_PROGRESS, /* exact fresh-ref binding + origin ProcArray live */
+	LMS_OWN_XID_REFUSE_OTHER,		/* not-committed / wrap-suspect / retention-fail / ambiguous */
+	LMS_OWN_XID_REFUSE_ZERO_MATCH,	/* recycled 0-match with no explicit CLOG terminal */
+	LMS_OWN_XID_REFUSE_INVALID_SCN	/* delayed-cleanout, not provably aborted */
 } LmsOwnXidReason;
 
 static LmsOwnXidReason
-lms_resolve_own_xid_verdict(TransactionId xid, uint8 *out_verdict, SCN *out_commit_scn,
-							SCN *out_horizon_scn, uint16 *out_wrap)
+lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
+							uint32 expected_tt_slot_id, bool allow_live, uint8 *out_verdict,
+							SCN *out_commit_scn, SCN *out_horizon_scn, uint16 *out_wrap)
 {
 	SCN scn = InvalidScn;
 	SCN horizon = InvalidScn;
 	uint16 wrap = 0;
+	uint16 matched_segment = 0;
+	uint16 matched_slot = 0;
+	ClusterTTDurableResolve resolve;
 
 	*out_verdict = 0;
 	*out_commit_scn = InvalidScn;
 	*out_horizon_scn = InvalidScn;
 	*out_wrap = 0;
 
-	switch (
-		cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, &scn, NULL, NULL, &wrap)) {
-	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
-		if (!TransactionIdDidCommit(xid))
-			return LMS_OWN_XID_REFUSE_OTHER; /* C1b: stamped-then-crashed is in-doubt */
+	resolve = cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, &scn,
+												 &matched_segment, &matched_slot, &wrap);
+	switch (resolve) {
+	case CLUSTER_TT_DURABLE_RESOLVED_SCN: {
+		bool did_commit = TransactionIdDidCommit(xid);
+		bool did_abort = false;
+		bool xid_is_mine = false;
+		bool xid_is_in_progress = false;
+		bool durable_binding_stable = false;
+		bool exact_binding = false;
+		bool exact_live = false;
+
+		/*
+		 * RESOLVED_SCN is stamped before the CLOG terminal record.  Only an
+		 * authoritative fresh ref carrying the exact physical segment and
+		 * 1-based slot may widen the old !commit/OTHER bucket.  DidAbort is
+		 * sampled only inside that gate; otherwise crash-lost and wrong
+		 * bindings remain fail-closed.
+		 */
+		if (!did_commit) {
+			SCN confirm_scn = InvalidScn;
+			uint16 confirm_segment = 0;
+			uint16 confirm_slot = 0;
+			uint16 confirm_wrap = 0;
+
+			xid_is_mine = allow_live && cluster_xid_is_mine(xid);
+			exact_binding
+				= xid_is_mine && expected_segment_id > 0 && expected_segment_id <= UINT16_MAX
+				  && expected_segment_id == (uint32)matched_segment && expected_tt_slot_id >= 1
+				  && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT
+				  && expected_tt_slot_id == (uint32)matched_slot + 1;
+			if (exact_binding) {
+				did_abort = TransactionIdDidAbort(xid);
+				if (!did_abort)
+					xid_is_in_progress = TransactionIdIsInProgress(xid);
+				if (xid_is_in_progress) {
+					durable_binding_stable
+						= cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY,
+																			 &confirm_scn, &confirm_segment,
+																			 &confirm_slot, &confirm_wrap)
+							  == CLUSTER_TT_DURABLE_RESOLVED_SCN
+						  && confirm_segment == matched_segment && confirm_slot == matched_slot
+						  && confirm_wrap == wrap && confirm_scn == scn;
+			}
+		}
+		exact_live = cluster_cr_server_live_binding_exact(
+			xid_is_mine, expected_segment_id, expected_tt_slot_id, matched_segment,
+			matched_slot, xid_is_in_progress, durable_binding_stable);
+		}
+
+		switch (cluster_cr_server_resolved_scn_verdict(did_commit, did_abort, exact_live)) {
+		case CLUSTER_UNDO_VERDICT_COMMITTED_EXACT:
+			break;
+		case CLUSTER_UNDO_VERDICT_ABORTED:
+			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+			return LMS_OWN_XID_PROVEN_UPGRADE;
+		case CLUSTER_UNDO_VERDICT_IN_PROGRESS:
+			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS;
+			return LMS_OWN_XID_PROVEN_IN_PROGRESS;
+		case CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED:
+		default:
+			return LMS_OWN_XID_REFUSE_OTHER;
+		}
+	}
 		if (cluster_cr_accept_resolved_scn(scn)) {
 			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
 			*out_commit_scn = scn;
@@ -889,12 +954,16 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	 * the content newer than claimed; additive and safe). */
 	slot->undo_auth.authority_scn = cluster_scn_current();
 
-	/* Resolve the terminal via the shared core; attribute the census leg. */
-	switch (lms_resolve_own_xid_verdict(xid, &verdict, &commit_scn, &horizon_scn, &wrap)) {
+	/* Resolve the terminal/live verdict via the shared core; attribute the census leg. */
+	switch (lms_resolve_own_xid_verdict(xid, slot->undo_segment_id, slot->undo_block_no,
+										slot->undo_authoritative, &verdict, &commit_scn,
+										&horizon_scn, &wrap)) {
 	case LMS_OWN_XID_PROVEN:
 		break;
 	case LMS_OWN_XID_PROVEN_UPGRADE:
 		cluster_vis53r97_note_live_upgrade_hit(); /* spec-7.1 D1 serve upgrade */
+		break;
+	case LMS_OWN_XID_PROVEN_IN_PROGRESS:
 		break;
 	case LMS_OWN_XID_REFUSE_ZERO_MATCH:
 		cluster_vis53r97_note_srv_zero_match();
@@ -1041,7 +1110,8 @@ cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
 	 * abort upgrade into lms_resolve_own_xid_verdict; this wrapper only
 	 * shapes the page.  Census attribution is the caller's (the self leg
 	 * keeps the rtvis counters; this core bumps none). */
-	switch (lms_resolve_own_xid_verdict(xid, &verdict, &commit_scn, &horizon_scn, &wrap)) {
+	switch (
+		lms_resolve_own_xid_verdict(xid, 0, 0, false, &verdict, &commit_scn, &horizon_scn, &wrap)) {
 	case LMS_OWN_XID_PROVEN:
 	case LMS_OWN_XID_PROVEN_UPGRADE:
 		break;
@@ -1145,8 +1215,8 @@ lms_undo_multi_verdict_serve(ClusterLmsCrSlot *slot)
 			pfree(members);
 			return false;
 		}
-		switch (lms_resolve_own_xid_verdict(member_xid, &out->verdict, &out->commit_scn,
-											&out->horizon_scn, &out->wrap)) {
+		switch (lms_resolve_own_xid_verdict(member_xid, 0, 0, false, &out->verdict,
+											&out->commit_scn, &out->horizon_scn, &out->wrap)) {
 		case LMS_OWN_XID_PROVEN:
 			break;
 		case LMS_OWN_XID_PROVEN_UPGRADE:
