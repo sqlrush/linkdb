@@ -20247,6 +20247,26 @@ pcm_x_local_retire_candidate_at(Size slot_index, const PcmXRetirePayload *reques
 			result = PCM_X_QUEUE_CORRUPT;
 			goto candidate_done;
 		}
+		/* Holder-terminal evidence does not retire an older live writer in the
+		 * same prefix.  Reuse the canonical linked-leader proof from the live
+		 * tag path so a retained predecessor tombstone cannot block retirement. */
+		if ((flags & PCM_X_LOCAL_TAG_F_TERMINAL_MASK) == 0
+			&& !pcm_x_ticket_ref_is_zero(&tag_slot->ref)
+			&& tag_slot->ref.handle.ticket_id <= request->retire_through_ticket_id
+			&& tag_slot->leader_index != PCM_X_INVALID_SLOT_INDEX
+			&& tag_slot->leader_slot_generation != 0) {
+			leader_ref.slot_index = tag_slot->leader_index;
+			leader_ref.slot_generation = tag_slot->leader_slot_generation;
+			leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+				PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &tag_slot->tag,
+				PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+			if (leader != NULL
+				&& pcm_x_wait_identity_equal(&leader->identity, &tag_slot->ref.identity)
+				&& pcm_x_ticket_handle_equal(&leader->handle, &tag_slot->ref.handle)) {
+				result = PCM_X_QUEUE_NOT_READY;
+				goto candidate_done;
+			}
+		}
 		if (external_ref->handle.ticket_id == request->retire_through_ticket_id)
 			*contains_watermark_out = true;
 		if (external_ref->handle.ticket_id <= request->retire_through_ticket_id) {

@@ -10799,6 +10799,80 @@ prepare_local_cross_lane_wedge(BlockNumber block, uint64 master_session, uint64 
 }
 
 /*
+ * Formal B2 RED (2026-08-11): a fully DRAINED holder terminal may share its
+ * tag with an older canonical live writer.  RETIRE_UP_TO(holder) covers that
+ * lower writer too, so it must refuse in the read-only first pass.  Holder
+ * terminal flags must not hide the writer proof installed in tag_slot->ref.
+ *
+ * This is the exact d5d shape: flags 0x31, holder 1545 over live writer 1544.
+ * The fixture uses 98002/98001 and production join/claim/revoke/enqueue/admit
+ * plus holder PROBE/blocker-ACK/DRAIN paths.  Refusal leaves all local
+ * evidence, the peer frontier, retire gate and ACTIVE runtime byte-exact.
+ */
+UT_TEST(test_local_cross_lane_holder_terminal_waits_for_canonical_lower_writer)
+{
+	TestLocalCrossLaneWedge fixture;
+	PcmXShmemHeader *header;
+	PcmXLocalTagSlot tag_before;
+	PcmXLocalMembershipSlot *writer_member;
+	PcmXLocalMembershipSlot writer_member_before;
+	PcmXPeerFrontier frontier_before;
+	PcmXRuntimeSnapshot runtime_before;
+	PcmXRuntimeSnapshot runtime_after;
+	PcmXRetirePayload retire;
+	uint32 retire_gate_before;
+	uint32 flags;
+	const uint64 master_session = UINT64_C(1839);
+
+	prepare_local_cross_lane_wedge(7137, master_session, UINT64_C(98002),
+								   UINT64_C(98001), &fixture);
+	header = ClusterPcmXConvertShmem;
+	flags = test_slot_flags(&fixture.tag_slot->slot);
+	UT_ASSERT_EQ(flags, UINT32_C(0x31));
+	UT_ASSERT(fixture.tag_slot->ref.handle.ticket_id
+			  < fixture.external_ref.handle.ticket_id);
+	writer_member
+		= &membership_slots(header)[fixture.writer.membership_slot.slot_index];
+	UT_ASSERT_EQ(fixture.tag_slot->leader_index,
+				 fixture.writer.membership_slot.slot_index);
+	UT_ASSERT(memcmp(&writer_member->identity, &fixture.tag_slot->ref.identity,
+				 sizeof(writer_member->identity))
+			  == 0);
+	UT_ASSERT(memcmp(&writer_member->handle, &fixture.tag_slot->ref.handle,
+				 sizeof(writer_member->handle))
+			  == 0);
+
+	tag_before = *fixture.tag_slot;
+	writer_member_before = *writer_member;
+	frontier_before = header->peer_frontiers[1];
+	retire_gate_before = pg_atomic_read_u32(&header->local_retire_gate);
+	runtime_before = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT_EQ(frontier_before.local_retired_ticket_id, 0);
+	UT_ASSERT_EQ(frontier_before.local_retire_in_progress_ticket_id, 0);
+	UT_ASSERT_EQ(retire_gate_before, 0);
+	UT_ASSERT_EQ(runtime_before.state, PCM_X_RUNTIME_ACTIVE);
+
+	memset(&retire, 0, sizeof(retire));
+	retire.cluster_epoch = fixture.external_ref.identity.cluster_epoch;
+	retire.master_session_incarnation = master_session;
+	retire.retire_through_ticket_id = fixture.external_ref.handle.ticket_id;
+	retire.sender_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_up_to_exact(&retire, 1, master_session),
+				 PCM_X_QUEUE_NOT_READY);
+
+	runtime_after = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT(memcmp(&tag_before, fixture.tag_slot, sizeof(tag_before)) == 0);
+	UT_ASSERT(memcmp(&writer_member_before, writer_member, sizeof(writer_member_before)) == 0);
+	UT_ASSERT(memcmp(&frontier_before, &header->peer_frontiers[1], sizeof(frontier_before)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&header->local_retire_gate), retire_gate_before);
+	UT_ASSERT_EQ(runtime_after.master_session_incarnation,
+				 runtime_before.master_session_incarnation);
+	UT_ASSERT_EQ(runtime_after.gate_generation, runtime_before.gate_generation);
+	UT_ASSERT_EQ(runtime_after.state, runtime_before.state);
+	UT_ASSERT_EQ(runtime_after.rebase_wire_active, runtime_before.rebase_wire_active);
+}
+
+/*
  * RED for the t/400 cross-lane retirement deadlock (2026-07-18): a fully
  * DRAINED external holder/blocker terminal (an older granted cohort) must be
  * able to retire its own holder lane even while a newer QUEUED writer still
@@ -17016,7 +17090,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(281);
+	UT_PLAN(282);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -17196,6 +17270,7 @@ main(void)
 	UT_RUN(test_local_transfer_prepare_commit_and_final_ack_are_exact);
 	UT_RUN(test_local_tag_only_holder_transfer_persists_until_exact_drain);
 	UT_RUN(test_local_non_source_blocker_participant_drains_and_retires_exactly);
+	UT_RUN(test_local_cross_lane_holder_terminal_waits_for_canonical_lower_writer);
 	UT_RUN(test_local_cross_lane_holder_terminal_retires_under_revoke_barrier);
 	UT_RUN(test_local_cross_lane_retire_exemption_requires_distinct_ticket);
 	UT_RUN(test_local_retire_waits_for_undrained_lower_holder_on_another_tag);
