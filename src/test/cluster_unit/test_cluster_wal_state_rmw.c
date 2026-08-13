@@ -740,10 +740,76 @@ UT_TEST(test_a1_w1_runtime_validates_every_slot_and_bootstrap_is_early_noop)
 	Mode = NormalProcessing;
 }
 
+UT_TEST(test_a1_w3_publish_stopped_uses_verified_cf_rmw)
+{
+	ClusterWalStateSlot before;
+	ClusterWalStateSlot *ondisk;
+	RmwEvent expected_events[] = {RMW_EVENT_CF_LOCK, RMW_EVENT_OPEN, RMW_EVENT_FSTAT,
+		RMW_EVENT_PREAD_HEADER, RMW_EVENT_PREAD_SLOT, RMW_EVENT_PWRITE_SLOT, RMW_EVENT_FSYNC,
+		RMW_EVENT_PREAD_SLOT, RMW_EVENT_CLOSE, RMW_EVENT_CF_UNLOCK};
+	size_t i;
+
+	fixture_reset();
+	memcpy(&before, virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4), sizeof(before));
+	cluster_wal_state_publish_stopped();
+
+	UT_ASSERT_EQ(event_count, (int)lengthof(expected_events));
+	for (i = 0; i < lengthof(expected_events); i++)
+		UT_ASSERT_EQ((int)event_log[i], (int)expected_events[i]);
+	ondisk = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
+	UT_ASSERT_EQ((int)ondisk->state, (int)CLUSTER_WAL_SLOT_STATE_STOPPED);
+	UT_ASSERT_EQ((int)ondisk->tli, 1);
+	UT_ASSERT_EQ(ondisk->last_updated, 1000);
+	UT_ASSERT_EQ(ondisk->highest_lsn, 300);
+	UT_ASSERT_EQ(ondisk->highest_scn, 400);
+	UT_ASSERT_EQ(ondisk->started_at, before.started_at);
+	UT_ASSERT_EQ(ondisk->checkpoint_redo_lsn, before.checkpoint_redo_lsn);
+	UT_ASSERT_EQ(ondisk->refresh_interval_ms, before.refresh_interval_ms);
+	UT_ASSERT_EQ(ondisk->fpw_was_off, before.fpw_was_off);
+	UT_ASSERT_EQ(ondisk->merge_recovered_lsn, before.merge_recovered_lsn);
+	UT_ASSERT_EQ(ondisk->_reserved[17], before._reserved[17]);
+}
+
+UT_TEST(test_a1_w3_publish_stopped_is_idempotent)
+{
+	ClusterWalStateSlot *slot;
+
+	fixture_reset();
+	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
+	slot->state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+	slot->crc = cluster_wal_state_block_crc(slot);
+	cluster_wal_state_publish_stopped();
+
+	UT_ASSERT_EQ(stub_cf_lock_count, 1);
+	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
+	UT_ASSERT_EQ(slot_pread_count, 1);
+	UT_ASSERT_EQ(pwrite_count, 0);
+	UT_ASSERT_EQ(fsync_count, 0);
+	UT_ASSERT_EQ((int)slot->state, (int)CLUSTER_WAL_SLOT_STATE_STOPPED);
+}
+
+UT_TEST(test_a1_w3_publish_stopped_cf_failure_preserves_active)
+{
+	ClusterWalStateSlot before;
+	ClusterWalStateSlot *ondisk;
+
+	fixture_reset();
+	memcpy(&before, virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4), sizeof(before));
+	stub_cf_lock_ok = false;
+	cluster_wal_state_publish_stopped();
+
+	UT_ASSERT_EQ(stub_cf_lock_count, 1);
+	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
+	assert_no_registry_io();
+	ondisk = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
+	UT_ASSERT(memcmp(ondisk, &before, sizeof(before)) == 0);
+	UT_ASSERT_EQ((int)ondisk->state, (int)CLUSTER_WAL_SLOT_STATE_ACTIVE);
+}
+
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 
 	UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
 	UT_RUN(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread);
@@ -753,6 +819,9 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_a1_fresh_header_slot_typed_rejections);
 	UT_RUN(test_a1_w1_runtime_ensure_is_validate_only);
 	UT_RUN(test_a1_w1_runtime_validates_every_slot_and_bootstrap_is_early_noop);
+	UT_RUN(test_a1_w3_publish_stopped_uses_verified_cf_rmw);
+	UT_RUN(test_a1_w3_publish_stopped_is_idempotent);
+	UT_RUN(test_a1_w3_publish_stopped_cf_failure_preserves_active);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;
