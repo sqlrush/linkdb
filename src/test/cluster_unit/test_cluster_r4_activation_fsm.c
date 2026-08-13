@@ -1966,6 +1966,50 @@ UT_TEST(test_93fg_admitted_basis_drift_rejects_pending_record_cas)
 	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
 }
 
+UT_TEST(test_93fh_utility_expected_generation_drift_rejects_pending_record_cas)
+{
+	ClusterSemanticActivationCasRequest request;
+	ClusterSemanticActivationCasRequest zero;
+	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_OK;
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint64 request_seq = 0;
+
+	test_gate_reset();
+	UT_ASSERT(test_submit_current_prepare_record_cas(
+		&request_seq, desired));
+	SemanticActivationUtilityMailbox->utility_expected_record_generation++;
+	memset(&request, 0xa5, sizeof(request));
+	memset(&zero, 0, sizeof(zero));
+	UT_ASSERT(!cluster_semantic_activation_qvotec_poll_record_cas(&request));
+	UT_ASSERT_EQ(memcmp(&request, &zero, sizeof(request)), 0);
+	UT_ASSERT(semantic_activation_record_cas_mailbox_poll_completion(
+		request_seq, &result));
+	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	test_gate_reset();
+}
+
+UT_TEST(test_93fi_pgsa_generation_drift_rejects_pending_record_cas)
+{
+	ClusterSemanticActivationCasRequest request;
+	ClusterSemanticActivationCasRequest zero;
+	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_OK;
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint64 request_seq = 0;
+
+	test_gate_reset();
+	UT_ASSERT(test_submit_current_prepare_record_cas(
+		&request_seq, desired));
+	test_gate_publish(2, 0, 1, test_current_epoch, false);
+	memset(&request, 0xa5, sizeof(request));
+	memset(&zero, 0, sizeof(zero));
+	UT_ASSERT(!cluster_semantic_activation_qvotec_poll_record_cas(&request));
+	UT_ASSERT_EQ(memcmp(&request, &zero, sizeof(request)), 0);
+	UT_ASSERT(semantic_activation_record_cas_mailbox_poll_completion(
+		request_seq, &result));
+	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	test_gate_reset();
+}
+
 UT_TEST(test_94_public_submit_refuses_before_prepare)
 {
 	ClusterSemanticActivationRefusal refusal;
@@ -3080,7 +3124,7 @@ UT_TEST(test_124_cold_bootstrap_zero_historical_floor_accepts_live_pgrd_binding)
 int
 main(void)
 {
-	UT_PLAN(165);
+	UT_PLAN(167);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -3207,6 +3251,8 @@ main(void)
 	UT_RUN(test_93fe_record_cas_submit_requires_pending_formation);
 	UT_RUN(test_93ff_utility_slot_drift_rejects_pending_record_cas);
 	UT_RUN(test_93fg_admitted_basis_drift_rejects_pending_record_cas);
+	UT_RUN(test_93fh_utility_expected_generation_drift_rejects_pending_record_cas);
+	UT_RUN(test_93fi_pgsa_generation_drift_rejects_pending_record_cas);
 	UT_RUN(test_94_public_submit_refuses_before_prepare);
 	UT_RUN(test_94a_public_submit_cannot_bypass_busy_lmon_mailbox);
 	UT_RUN(test_94b_utility_cannot_close_source_before_prepare_commit);
