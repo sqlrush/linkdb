@@ -2147,7 +2147,46 @@ StaticAssertDecl(sizeof(GcsBlockReplyHeader) == 48,
 				 "spec-2.33 D1 + spec-2.35 HC109 GcsBlockReplyHeader wire ABI 48B "
 				 "(request_id 8 + page_lsn 8 + epoch 8 + checksum 4 + "
 				 "sender_node 4 + requester_backend_id 4 + transition_id 1 + "
-				 "status 1 + forwarding_master_node_bytes 4 + reserved 6)");
+					 "status 1 + forwarding_master_node_bytes 4 + reserved 6)");
+
+/* Status 24 alone reuses the six-byte reply tail as
+ * {physical_generation:u32_le, reserved:u16=0}.  Generation zero is valid;
+ * UINT32_MAX is exhausted and cannot be published. */
+static inline bool
+GcsBlockReplyHeaderSetR4UndoGeneration(GcsBlockReplyHeader *header,
+									   uint32 physical_generation)
+{
+	if (header != NULL)
+		memset(header->reserved_0, 0, sizeof(header->reserved_0));
+	if (header == NULL || physical_generation == UINT32_MAX)
+		return false;
+	header->reserved_0[0] = (uint8)physical_generation;
+	header->reserved_0[1] = (uint8)(physical_generation >> 8);
+	header->reserved_0[2] = (uint8)(physical_generation >> 16);
+	header->reserved_0[3] = (uint8)(physical_generation >> 24);
+	return true;
+}
+
+static inline bool
+GcsBlockReplyHeaderGetR4UndoGeneration(const GcsBlockReplyHeader *header,
+									   uint32 *physical_generation_out)
+{
+	uint32 generation;
+
+	if (physical_generation_out != NULL)
+		*physical_generation_out = 0;
+	if (header == NULL || physical_generation_out == NULL
+		|| header->reserved_0[4] != 0 || header->reserved_0[5] != 0)
+		return false;
+	generation = (uint32)header->reserved_0[0]
+				 | ((uint32)header->reserved_0[1] << 8)
+				 | ((uint32)header->reserved_0[2] << 16)
+				 | ((uint32)header->reserved_0[3] << 24);
+	if (generation == UINT32_MAX)
+		return false;
+	*physical_generation_out = generation;
+	return true;
+}
 
 #define GCS_BLOCK_REPLY_PROTOCOL_V1 1
 #define GCS_BLOCK_REPLY_PROTOCOL_V2 2
@@ -2365,6 +2404,7 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
  * endian; no packed/native cast is a wire authority. */
 #define CLUSTER_R4_WIRE_VERSION ((uint8)1)
 #define CLUSTER_R4_FORWARD_EXTENDED ((uint8)6)
+#define CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT ((int32)-2)
 
 typedef enum ClusterCrBuildResult {
 	CLUSTER_CR_BUILD_FULL = 0,
@@ -2927,6 +2967,26 @@ extern bool cluster_gcs_block_test_decode_r4_reply(
 	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
 	int32 expected_sender_node, int32 expected_forwarding_master_node,
 	uint8 expected_reply_domain);
+extern bool cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id,
+													 uint64 request_epoch,
+													 int32 requester_backend_id,
+													 uint8 transition_id,
+													 int32 expected_master_node);
+extern bool cluster_gcs_block_test_snapshot_r4_reply_slot(
+	GcsBlockReplyHeader *header_out, char block_out[GCS_BLOCK_DATA_SIZE],
+	bool *reply_received_out, uint64 *stale_drop_count_out);
+extern bool cluster_gcs_block_test_r4_requester_arm(
+	BufferTag tag, uint64 request_epoch, int32 expected_master_node,
+	uint64 next_sequence, uint64 *request_id_out);
+extern bool cluster_gcs_block_test_snapshot_r4_requester_slot(
+	bool *in_use_out, uint8 *reply_domain_out, uint64 *request_id_out,
+	uint8 *transition_id_out, BufferTag *tag_out, uint64 *request_epoch_out,
+	int32 *expected_master_node_out, ClusterGcsBlockDirectState *direct_state_out,
+	bool *direct_target_prepared_out);
+extern bool cluster_gcs_block_test_release_r4_requester_slot(void);
+extern bool cluster_gcs_block_test_r4_fetch_and_wait(
+	BufferTag tag, SCN read_scn, int32 real_master_node,
+	char dst_page[GCS_BLOCK_DATA_SIZE]);
 #endif
 
 static inline void
@@ -3103,6 +3163,24 @@ ClusterR4ForwardExtensionSetLocator(ClusterR4ForwardExtension *extension,
 	return true;
 }
 
+/* Kind-2/kind-4 bind the locator to the physical segment generation sampled
+ * under BLOCK0_CURRENT SCUR.  Zero is a valid first generation; UINT32_MAX is
+ * exhausted and cannot be published. */
+static inline bool
+ClusterR4ForwardExtensionSetLocatorGeneration(ClusterR4ForwardExtension *extension,
+										   ClusterR4WireKind kind,
+										   const ClusterTxLocator *locator,
+										   uint32 physical_generation)
+{
+	if (extension != NULL)
+		memset(extension, 0, sizeof(*extension));
+	if (extension == NULL || locator == NULL || physical_generation == UINT32_MAX
+		|| !ClusterR4ForwardExtensionSetLocator(extension, kind, locator))
+		return false;
+	ClusterR4WireWriteU32(extension->subject_id_le, physical_generation);
+	return true;
+}
+
 static inline bool
 ClusterR4ForwardExtensionGetLocator(const ClusterR4ForwardExtension *extension,
 									ClusterR4WireKind expected_kind,
@@ -3131,6 +3209,32 @@ ClusterR4ForwardExtensionGetLocator(const ClusterR4ForwardExtension *extension,
 	decoded.itl_kind = extension->kind.locator_bytes[22];
 	decoded.itl_slot_index = extension->kind.locator_bytes[23];
 	*locator_out = decoded;
+	return true;
+}
+
+static inline bool
+ClusterR4ForwardExtensionGetLocatorGeneration(const ClusterR4ForwardExtension *extension,
+										   ClusterR4WireKind expected_kind,
+										   ClusterTxLocator *locator_out,
+										   uint32 *physical_generation_out)
+{
+	uint32 generation;
+	ClusterR4ForwardExtension copy;
+
+	if (locator_out != NULL)
+		memset(locator_out, 0, sizeof(*locator_out));
+	if (physical_generation_out != NULL)
+		*physical_generation_out = 0;
+	if (extension == NULL || locator_out == NULL || physical_generation_out == NULL)
+		return false;
+	generation = ClusterR4WireReadU32(extension->subject_id_le);
+	if (generation == UINT32_MAX)
+		return false;
+	copy = *extension;
+	memset(copy.subject_id_le, 0, sizeof(copy.subject_id_le));
+	if (!ClusterR4ForwardExtensionGetLocator(&copy, expected_kind, locator_out))
+		return false;
+	*physical_generation_out = generation;
 	return true;
 }
 

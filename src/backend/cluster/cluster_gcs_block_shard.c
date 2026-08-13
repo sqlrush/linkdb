@@ -96,6 +96,20 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		if (payload_len != sizeof(GcsBlockForwardPayload)
 			&& payload_len != sizeof(ClusterR4CrForwardPayload))
 			return -1;
+		/* Spec 8.4 D4: endpoint -2/kind-4 is the sole block-family
+		 * exception to tag sharding.  It is an internal worker-0 request /
+		 * response correlation path and must stay on the existing DATA0
+		 * connection.  Both discriminators and the exact 96-byte shape are
+		 * required; every other FORWARD retains the legacy tag shard. */
+		if (payload_len == sizeof(ClusterR4CrForwardPayload)) {
+			const ClusterR4CrForwardPayload *r4
+				= (const ClusterR4CrForwardPayload *)payload;
+
+			if (r4->base.requester_backend_id == CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+				&& r4->extension.r4_version == CLUSTER_R4_WIRE_VERSION
+				&& r4->extension.r4_kind == CLUSTER_R4_WIRE_UNDO_DATA_FETCH)
+				return n_workers > 0 ? 0 : -1;
+		}
 		tag = &((const GcsBlockForwardPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE:

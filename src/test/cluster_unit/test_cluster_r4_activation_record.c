@@ -35,6 +35,13 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 
 UT_DEFINE_GLOBALS();
 
+bool
+cluster_replacement_phase3_handoff_poll_local(
+	ClusterReplacementPhase3HandoffItem *item pg_attribute_unused())
+{
+	return false;
+}
+
 void
 ExceptionalCondition(const char *condition_name pg_attribute_unused(),
 					 const char *file_name pg_attribute_unused(),
@@ -716,10 +723,55 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	SemanticActivationShmem = NULL;
 }
 
+UT_TEST(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox)
+{
+	ClusterSemanticActivationShmem shmem;
+	ClusterUndoRootDescriptorRequest request;
+	ClusterSemanticActivationCasRequest record_request;
+	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint64 seq = 0;
+	int i;
+
+	memset(&shmem, 0, sizeof(shmem));
+	pg_atomic_init_u64(&shmem.record_cas_request_seq, 0);
+	pg_atomic_init_u64(&shmem.record_cas_completion_seq, 0);
+	pg_atomic_init_u32(&shmem.record_cas_result,
+				   CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	pg_atomic_init_u32(&shmem.record_cas_request_kind,
+				   CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE);
+	for (i = 0; i < (int)sizeof(desired); i++)
+		desired[i] = (uint8)(i ^ 0x5c);
+	SemanticActivationShmem = &shmem;
+
+	UT_ASSERT(cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
+		UINT64_C(0x0123456789abcdef), desired, &seq));
+	UT_ASSERT_EQ(seq, 1);
+	UT_ASSERT(!cluster_semantic_activation_qvotec_poll_record_cas(
+		&record_request));
+	memset(&request, 0, sizeof(request));
+	UT_ASSERT(cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
+		&request));
+	UT_ASSERT_EQ(request.request_seq, 1);
+	UT_ASSERT_EQ(request.system_identifier,
+				 UINT64_C(0x0123456789abcdef));
+	UT_ASSERT_EQ(memcmp(request.desired_bytes, desired, sizeof(desired)), 0);
+	UT_ASSERT(cluster_semantic_activation_qvotec_complete_undo_root_descriptor(
+		request.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK));
+	UT_ASSERT(cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
+		seq, &result));
+	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationShmem,
+					  record_cas_request_kind), 20);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationShmem, admission_seq), 552);
+	UT_ASSERT_EQ(sizeof(ClusterSemanticActivationShmem), 1104);
+	SemanticActivationShmem = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(50);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -769,6 +821,7 @@ main(void)
 	UT_RUN(test_47_less_than_readable_majority_holds);
 	UT_RUN(test_48_equal_generation_conflict_without_majority_is_not_legacy);
 	UT_RUN(test_49_record_cas_mailbox_exact_sequence_lifecycle);
+	UT_RUN(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

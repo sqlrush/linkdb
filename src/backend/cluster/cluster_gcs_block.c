@@ -130,8 +130,6 @@ typedef enum ClusterGcsBlockReplyDomain {
 	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR = 1
 } ClusterGcsBlockReplyDomain;
 
-#define CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT (-2)
-
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
 	uint8 reply_domain;
@@ -450,6 +448,7 @@ static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
 #ifdef USE_CLUSTER_UNIT
 void (*cluster_gcs_block_test_xlog_flush_hook)(uint64 page_lsn) = NULL;
 int (*cluster_gcs_block_test_lsn_drift_hook)(void) = NULL;
+static ClusterGcsBlockOutstandingSlot *cluster_gcs_block_test_requester_slot = NULL;
 #endif
 
 
@@ -458,8 +457,14 @@ int (*cluster_gcs_block_test_lsn_drift_hook)(void) = NULL;
  * ============================================================ */
 static ClusterGcsBlockBackendBlock *gcs_block_my_block(void);
 static ClusterGcsBlockOutstandingSlot *gcs_block_reserve_slot(BufferTag tag, uint8 transition_id,
-															  int32 master_node,
-															  uint64 *out_request_id);
+													  int32 master_node,
+													  uint64 *out_request_id);
+static ClusterGcsBlockOutstandingSlot *gcs_block_try_reserve_r4_slot(
+	BufferTag tag, uint64 request_epoch, int32 expected_master_node,
+	uint64 *out_request_id);
+static ClusterCrBuildResult gcs_block_r4_cr_fetch_and_wait_raw(
+	BufferTag tag, SCN read_scn, int32 real_master_node,
+	char dst_page[GCS_BLOCK_DATA_SIZE], ClusterCrBuildReason *reason_out);
 static ClusterGcsBlockOutstandingSlot *gcs_block_try_reserve_exact_slot(BufferTag tag,
 																		uint8 transition_id,
 																		int32 expected_source_node,
@@ -468,6 +473,8 @@ static void gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot);
 static void gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req,
 								 GcsBlockReplyStatus status, XLogRecPtr page_lsn,
 								 const char *block_data);
+static ClusterICSendResult gcs_block_send_envelope_or_loopback(
+	uint8 msg_type, int32 dest_node, const void *payload, uint32 payload_len);
 static bool gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 									 XLogRecPtr *out_page_lsn, char *copy_buf,
 									 const char **out_block_payload, uint32 *out_block_lkey,
@@ -820,6 +827,74 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
 						MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND),
 				 errhint("Reduce concurrent block-ship acquisitions; "
 						 "per-backend cap GUC may land in spec-2.34+.")));
+	return slot;
+}
+
+/* Reserve one requester slot in the disjoint R4 reply domain.  Selection,
+ * no-reuse sequence validation and identity publication share the existing
+ * per-backend lock, so capacity cannot consume an id and a wrapped sequence
+ * can never be mapped back to one by gcs_reqid_requester(). */
+static ClusterGcsBlockOutstandingSlot *
+gcs_block_try_reserve_r4_slot(BufferTag tag, uint64 request_epoch,
+							   int32 expected_master_node, uint64 *out_request_id)
+{
+	ClusterGcsBlockBackendBlock *blk;
+	ClusterGcsBlockOutstandingSlot *slot = NULL;
+	uint64 sequence;
+	int i;
+
+	if (out_request_id != NULL)
+		*out_request_id = 0;
+	if (out_request_id == NULL || MyBackendId <= 0 || MyBackendId > MaxBackends
+		|| expected_master_node < 0 || expected_master_node >= PCM_X_PROTOCOL_NODE_LIMIT)
+		return NULL;
+	blk = gcs_block_my_block();
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	for (i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++)
+		if (!blk->slots[i].in_use) {
+			slot = &blk->slots[i];
+			break;
+		}
+	sequence = blk->next_request_id;
+	if (slot == NULL || sequence == 0 || sequence > GCS_REQID_REQUESTER_SEQ_MASK) {
+		LWLockRelease(&blk->lock.lock);
+		return NULL;
+	}
+
+	blk->next_request_id++;
+	memset(&slot->reply_header, 0, sizeof(slot->reply_header));
+	memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
+	slot->in_use = true;
+	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+	slot->request_id
+		= gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1, sequence);
+	slot->transition_id = (uint8)PCM_TRANS_N_TO_S;
+	slot->tag = tag;
+	slot->master_node = expected_master_node;
+	slot->reply_received = false;
+	slot->reply_sf_dep_valid = false;
+	slot->reply_sf_flags = 0;
+	cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+	slot->reply_undo_trailer_valid = false;
+	slot->reply_undo_tt_generation = 0;
+	slot->reply_undo_authority_scn = 0;
+	slot->request_epoch = request_epoch;
+	slot->expected_master_node = expected_master_node;
+	slot->stale = false;
+	slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
+	slot->direct_expected_peer = -1;
+	slot->direct_arm_id = 0;
+	slot->direct_target_kind = GCS_BLOCK_DIRECT_TARGET_NONE;
+	slot->direct_target_buf = NULL;
+	slot->direct_target_addr = NULL;
+	slot->direct_target_lkey = 0;
+	slot->direct_target_prepared = false;
+	slot->direct_abort_reason = GCS_BLOCK_DIRECT_ABORT_NONE;
+	*out_request_id = slot->request_id;
+#ifdef USE_CLUSTER_UNIT
+	cluster_gcs_block_test_requester_slot = slot;
+#endif
+	LWLockRelease(&blk->lock.lock);
 	return slot;
 }
 
@@ -1995,7 +2070,59 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 }
 
 #define R4_CR_REQUIRED_HELLO_CAPS                                                        \
-	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1)
+	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1        \
+	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                                    \
+	 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
+
+/* A local R4 actor has no peer HELLO record.  Its compiled protocol family is
+ * fixed by this binary, while the entered TARGET token binds that capability
+ * to the locally committed OPEN/formation generation.  The final route
+ * recheck remains the operation's freshness fence. */
+static bool
+gcs_block_r4_local_compiled_capability_matches(
+	const ClusterSemanticAdmissionToken *token, uint32 required_capabilities,
+	uint32 optional_capabilities, bool *optional_supported_out)
+{
+	uint32 compiled_capabilities
+		= PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+		  | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+		  | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+		  | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1;
+
+	if (!cluster_ic_suppress_gcs_done_cap)
+		compiled_capabilities |= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	if (optional_supported_out != NULL)
+		*optional_supported_out
+			= (compiled_capabilities & optional_capabilities) == optional_capabilities;
+	return token != NULL && token->entered
+		   && token->feature_bit == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		   && token->side == CLUSTER_SEMANTIC_TARGET_SIDE
+		   && token->formation_epoch == cluster_epoch_get_current()
+		   && (compiled_capabilities & required_capabilities) == required_capabilities;
+}
+
+/* The frozen R4 slot carrier stores capability generations as uint32, while
+ * the local OPEN record generation is uint64.  Local actors have no peer
+ * HELLO generation to substitute, so admit only an exact, nonzero checked
+ * conversion under the same entered TARGET token. */
+static bool
+gcs_block_r4_local_capability_generation(
+	const ClusterSemanticAdmissionToken *token, uint32 required_capabilities,
+	uint32 optional_capabilities, bool *optional_supported_out,
+	uint32 *generation_out)
+{
+	if (generation_out == NULL)
+		return false;
+	*generation_out = 0;
+	if (!gcs_block_r4_local_compiled_capability_matches(
+			token, required_capabilities, optional_capabilities,
+			optional_supported_out)
+		|| token->record_generation == 0
+		|| token->record_generation > (uint64)PG_UINT32_MAX)
+		return false;
+	*generation_out = (uint32)token->record_generation;
+	return true;
+}
 
 typedef struct GcsBlockR4ReplyExpectation {
 	uint64 request_id;
@@ -2111,9 +2238,16 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 			   != expected->forwarding_master_node
 		|| header->checksum != gcs_block_compute_checksum(block_data))
 		return false;
-	for (i = 0; i < (int)sizeof(header->reserved_0); i++)
-		if (header->reserved_0[i] != 0)
+	if (status == GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
+		uint32 physical_generation;
+
+		if (!GcsBlockReplyHeaderGetR4UndoGeneration(header, &physical_generation))
 			return false;
+	} else {
+		for (i = 0; i < (int)sizeof(header->reserved_0); i++)
+			if (header->reserved_0[i] != 0)
+				return false;
+	}
 
 	if (status == GCS_BLOCK_REPLY_R4_CR_FULL)
 		return expected->forwarding_master_node != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
@@ -2131,6 +2265,8 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 		if (block_data[i] != 0)
 			return false;
 	if (status == GCS_BLOCK_REPLY_R4_DENIED)
+		return header->page_lsn == 0;
+	if (expected->forwarding_master_node != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
 		return header->page_lsn == 0;
 	return header->page_lsn <= (uint64)CLUSTER_MAX_NODES;
 }
@@ -2163,6 +2299,37 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 	return cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
 		worker_id, env->source_node_id, &header, R4_CR_REQUIRED_HELLO_CAPS,
 		requester_capability_generation);
+}
+
+/*
+ * A holder-produced pre-publication refusal is addressed directly to the
+ * original requester and retains the real forwarding master.  This identity
+ * is intentionally distinct from the D3 master-refusal shape above.
+ */
+static bool
+gcs_block_r4_publish_holder_refusal(int worker_id,
+								const ClusterR4CrForwardPayload *forward,
+								uint32 requester_capability_generation,
+								ClusterCrBuildResult result,
+								ClusterCrBuildReason reason)
+{
+	GcsBlockReplyHeader header;
+	GcsBlockReplyStatus status;
+
+	if (forward == NULL
+		|| !gcs_block_r4_refusal_status_for_build(result, reason, true, &status))
+		return true;
+	memset(&header, 0, sizeof(header));
+	header.request_id = forward->base.request_id;
+	header.epoch = forward->base.epoch;
+	header.sender_node = cluster_node_id;
+	header.requester_backend_id = forward->base.requester_backend_id;
+	header.transition_id = forward->base.transition_id;
+	header.status = (uint8)status;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&header, forward->base.master_node);
+	return cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		worker_id, (uint32)forward->base.original_requester_node, &header,
+		R4_CR_REQUIRED_HELLO_CAPS, requester_capability_generation);
 }
 
 static bool
@@ -2219,6 +2386,8 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 	bool outbound_admitted = false;
 	bool final_recheck_ok;
 	bool admitted_forward;
+	bool requester_is_local;
+	bool holder_is_local;
 	int32 real_master_node = -1;
 	int32 current_holder_node = -1;
 	int dedup_worker_id;
@@ -2233,8 +2402,10 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 	if (env == NULL || request == NULL || reason_out == NULL)
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
 	dedup_worker_id = cluster_ic_tier1_my_data_channel();
+	requester_is_local = (int32)env->source_node_id == cluster_node_id;
 
-	if (!cluster_sf_peer_capability_family_sample(
+	if (!requester_is_local
+		&& !cluster_sf_peer_capability_family_sample(
 			(int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS,
 			PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &requester_done_capable,
 			&requester_capability_generation)) {
@@ -2257,9 +2428,13 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 
 	PG_TRY();
 	{
-		if (!cluster_semantic_activation_peer_open_matches(
-				&admission, (int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS,
-				requester_capability_generation)) {
+		if (requester_is_local
+			? !gcs_block_r4_local_compiled_capability_matches(
+				  &admission, R4_CR_REQUIRED_HELLO_CAPS,
+				  PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &requester_done_capable)
+			: !cluster_semantic_activation_peer_open_matches(
+				  &admission, (int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS,
+				  requester_capability_generation)) {
 			reason = CLUSTER_CR_BUILD_RF_DEFERRED;
 			goto done;
 		}
@@ -2291,12 +2466,16 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 		if (reason != CLUSTER_CR_BUILD_NONE)
 			goto done;
 
-		if (!cluster_sf_peer_capability_family_sample(
-				current_holder_node, R4_CR_REQUIRED_HELLO_CAPS, 0, &holder_optional,
-				&holder_capability_generation)
-			|| !cluster_semantic_activation_peer_open_matches(
-					&admission, current_holder_node, R4_CR_REQUIRED_HELLO_CAPS,
-					holder_capability_generation)) {
+		holder_is_local = current_holder_node == cluster_node_id;
+		if (holder_is_local
+			? !gcs_block_r4_local_compiled_capability_matches(
+				  &admission, R4_CR_REQUIRED_HELLO_CAPS, 0, &holder_optional)
+			: (!cluster_sf_peer_capability_family_sample(
+				   current_holder_node, R4_CR_REQUIRED_HELLO_CAPS, 0, &holder_optional,
+				   &holder_capability_generation)
+			   || !cluster_semantic_activation_peer_open_matches(
+					   &admission, current_holder_node, R4_CR_REQUIRED_HELLO_CAPS,
+					   holder_capability_generation))) {
 			reason = CLUSTER_CR_BUILD_RF_DEFERRED;
 			goto done;
 		}
@@ -2358,10 +2537,18 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 			&forward.extension, stored_record.proof.master_authority_generation,
 			stored_record.proof.master_resource_transition_count,
 			stored_record.proof.expected_page_scn);
-		outbound_admitted = cluster_lms_outbound_enqueue_cap_bound(
-			dedup_worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-			(uint32)stored_record.proof.selected_holder_node, &forward, sizeof(forward),
-			R4_CR_REQUIRED_HELLO_CAPS, holder_capability_generation);
+		if (holder_is_local) {
+			ClusterICSendResult local_send_result;
+
+			local_send_result = gcs_block_send_envelope_or_loopback(
+				PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+				stored_record.proof.selected_holder_node, &forward, sizeof(forward));
+			outbound_admitted = local_send_result == CLUSTER_IC_SEND_DONE;
+		} else
+			outbound_admitted = cluster_lms_outbound_enqueue_cap_bound(
+				dedup_worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+				(uint32)stored_record.proof.selected_holder_node, &forward, sizeof(forward),
+				R4_CR_REQUIRED_HELLO_CAPS, holder_capability_generation);
 		send_result = cluster_gcs_block_dedup_r4_route_finish_send(
 			dedup_worker_id, &identity, (uint8)PCM_TRANS_N_TO_S, &stored_record.proof,
 			outbound_admitted);
@@ -2414,21 +2601,22 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 	const ClusterR4CrForwardPayload *forward = (const ClusterR4CrForwardPayload *)payload;
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
+	ClusterCrBuildResult submit_result = CLUSTER_CR_BUILD_FAIL_CLOSED;
+	ClusterCrBuildReason submit_reason = CLUSTER_CR_BUILD_PROTOCOL;
+	uint32 requester_capability_generation = 0;
 	uint32 master_capability_generation = 0;
 	uint64 master_authority_generation;
 	uint64 master_resource_transition_count;
 	SCN expected_page_scn;
-	bool optional_supported = false;
-	bool accepted = false;
+	int worker_id;
+	bool master_is_local;
+	bool requester_is_local;
+	bool master_optional_supported = false;
+	bool requester_optional_supported = false;
 
 	if (env == NULL || payload == NULL || env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
 		|| env->payload_length != sizeof(ClusterR4CrForwardPayload))
 		return false;
-	if (!cluster_sf_peer_capability_family_sample(
-			(int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS, 0, &optional_supported,
-			&master_capability_generation))
-		return true;
-
 	memset(&admission, 0, sizeof(admission));
 	admission_result = cluster_semantic_activation_enter(
 		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
@@ -2437,9 +2625,37 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 
 	PG_TRY();
 	{
-		if (!cluster_semantic_activation_peer_open_matches(
-				&admission, (int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS,
-				master_capability_generation))
+		master_is_local = (int32)env->source_node_id == cluster_node_id;
+		requester_is_local
+			= forward->base.original_requester_node == cluster_node_id;
+		if (master_is_local
+				? !gcs_block_r4_local_capability_generation(
+					  &admission, R4_CR_REQUIRED_HELLO_CAPS, 0,
+					  &master_optional_supported, &master_capability_generation)
+				: !cluster_sf_peer_capability_family_sample(
+					  (int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS, 0,
+					  &master_optional_supported, &master_capability_generation))
+			goto done;
+		if (requester_is_local
+				? !gcs_block_r4_local_capability_generation(
+					  &admission, R4_CR_REQUIRED_HELLO_CAPS, 0,
+					  &requester_optional_supported,
+					  &requester_capability_generation)
+				: (!cluster_sf_peer_capability_family_sample(
+					   forward->base.original_requester_node,
+					   R4_CR_REQUIRED_HELLO_CAPS, 0,
+					   &requester_optional_supported,
+					   &requester_capability_generation)))
+			goto done;
+		if ((!master_is_local
+			 && !cluster_semantic_activation_peer_open_matches(
+				 &admission, (int32)env->source_node_id,
+				 R4_CR_REQUIRED_HELLO_CAPS, master_capability_generation))
+			|| (!requester_is_local
+				&& !cluster_semantic_activation_peer_open_matches(
+					&admission, forward->base.original_requester_node,
+					R4_CR_REQUIRED_HELLO_CAPS,
+					requester_capability_generation)))
 			goto done;
 		if (env->source_node_id >= PCM_X_PROTOCOL_NODE_LIMIT
 			|| forward->base.master_node != (int32)env->source_node_id
@@ -2463,12 +2679,18 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 				&master_resource_transition_count, &expected_page_scn))
 			goto done;
 
-		accepted = cluster_lms_cr_submit_r4(forward);
+		submit_result = cluster_lms_cr_submit_r4(
+			forward, &admission, requester_capability_generation,
+			master_capability_generation, &submit_reason);
 		if (!cluster_semantic_activation_recheck(&admission))
-			accepted = false;
+			goto done;
+		worker_id = cluster_ic_tier1_my_data_channel();
+		(void)gcs_block_r4_publish_holder_refusal(
+			worker_id, forward, requester_capability_generation, submit_result,
+			submit_reason);
 
 done:
-		(void)accepted;
+		;
 	}
 	PG_FINALLY();
 	{
@@ -2517,6 +2739,128 @@ cluster_gcs_block_test_decode_r4_reply(
 	expected.forwarding_master_node = expected_forwarding_master_node;
 	expected.reply_domain = expected_reply_domain;
 	return gcs_block_decode_r4_reply_payload(env, payload, &expected);
+}
+
+/* A single-backend real-slot fixture for the registered reply handler.  The
+ * private slot layout remains owned by this translation unit; focused tests
+ * can arm and inspect it without exporting the shared-memory ABI. */
+static ClusterGcsBlockShared cluster_gcs_block_test_reply_shared;
+static ClusterGcsBlockBackendBlock cluster_gcs_block_test_reply_backend;
+
+static void
+gcs_block_test_reset_r4_reply_table(uint64 next_sequence)
+{
+	memset(&cluster_gcs_block_test_reply_shared, 0,
+		   sizeof(cluster_gcs_block_test_reply_shared));
+	memset(&cluster_gcs_block_test_reply_backend, 0,
+		   sizeof(cluster_gcs_block_test_reply_backend));
+	pg_atomic_init_u64(&cluster_gcs_block_test_reply_shared.stale_reply_drop_count, 0);
+	cluster_gcs_block_test_reply_backend.next_request_id = next_sequence;
+	ClusterGcsBlock = &cluster_gcs_block_test_reply_shared;
+	gcs_block_backend_blocks = &cluster_gcs_block_test_reply_backend;
+	cluster_gcs_block_test_requester_slot = NULL;
+}
+
+bool
+cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id, uint64 request_epoch,
+										 int32 requester_backend_id,
+										 uint8 transition_id,
+										 int32 expected_master_node)
+{
+	ClusterGcsBlockOutstandingSlot *slot;
+
+	if (requester_backend_id != 1)
+		return false;
+	gcs_block_test_reset_r4_reply_table(UINT64_C(1));
+	slot = &cluster_gcs_block_test_reply_backend.slots[0];
+	slot->in_use = true;
+	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+	slot->request_id = request_id;
+	slot->transition_id = transition_id;
+	slot->request_epoch = request_epoch;
+	slot->master_node = expected_master_node;
+	slot->expected_master_node = expected_master_node;
+	slot->direct_state = GCS_BLOCK_DIRECT_UNARMED;
+	return true;
+}
+
+bool
+cluster_gcs_block_test_r4_requester_arm(BufferTag tag, uint64 request_epoch,
+										int32 expected_master_node,
+										uint64 next_sequence, uint64 *request_id_out)
+{
+	gcs_block_test_reset_r4_reply_table(next_sequence);
+	cluster_gcs_block_test_requester_slot = gcs_block_try_reserve_r4_slot(
+		tag, request_epoch, expected_master_node, request_id_out);
+	return cluster_gcs_block_test_requester_slot != NULL;
+}
+
+bool
+cluster_gcs_block_test_snapshot_r4_requester_slot(
+	bool *in_use_out, uint8 *reply_domain_out, uint64 *request_id_out,
+	uint8 *transition_id_out, BufferTag *tag_out, uint64 *request_epoch_out,
+	int32 *expected_master_node_out, ClusterGcsBlockDirectState *direct_state_out,
+	bool *direct_target_prepared_out)
+{
+	ClusterGcsBlockOutstandingSlot *slot = cluster_gcs_block_test_requester_slot;
+
+	if (slot == NULL || in_use_out == NULL || reply_domain_out == NULL
+		|| request_id_out == NULL || transition_id_out == NULL || tag_out == NULL
+		|| request_epoch_out == NULL || expected_master_node_out == NULL
+		|| direct_state_out == NULL || direct_target_prepared_out == NULL)
+		return false;
+	*in_use_out = slot->in_use;
+	*reply_domain_out = slot->reply_domain;
+	*request_id_out = slot->request_id;
+	*transition_id_out = slot->transition_id;
+	*tag_out = slot->tag;
+	*request_epoch_out = slot->request_epoch;
+	*expected_master_node_out = slot->expected_master_node;
+	*direct_state_out = slot->direct_state;
+	*direct_target_prepared_out = slot->direct_target_prepared;
+	return true;
+}
+
+bool
+cluster_gcs_block_test_release_r4_requester_slot(void)
+{
+	if (cluster_gcs_block_test_requester_slot == NULL)
+		return false;
+	gcs_block_release_slot(cluster_gcs_block_test_requester_slot);
+	return true;
+}
+
+bool
+cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn,
+										 int32 real_master_node,
+										 char dst_page[GCS_BLOCK_DATA_SIZE])
+{
+	ClusterCrBuildReason reason;
+
+	gcs_block_test_reset_r4_reply_table(UINT64_C(1));
+	return gcs_block_r4_cr_fetch_and_wait_raw(
+			   tag, read_scn, real_master_node, dst_page, &reason)
+		   == CLUSTER_CR_BUILD_FULL;
+}
+
+bool
+cluster_gcs_block_test_snapshot_r4_reply_slot(GcsBlockReplyHeader *header_out,
+										  char block_out[GCS_BLOCK_DATA_SIZE],
+										  bool *reply_received_out,
+										  uint64 *stale_drop_count_out)
+{
+	ClusterGcsBlockOutstandingSlot *slot
+		= &cluster_gcs_block_test_reply_backend.slots[0];
+
+	if (!slot->in_use || header_out == NULL || block_out == NULL
+		|| reply_received_out == NULL || stale_drop_count_out == NULL)
+		return false;
+	*header_out = slot->reply_header;
+	memcpy(block_out, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
+	*reply_received_out = slot->reply_received;
+	*stale_drop_count_out
+		= pg_atomic_read_u64(&cluster_gcs_block_test_reply_shared.stale_reply_drop_count);
+	return true;
 }
 #endif
 
@@ -4489,6 +4833,249 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 					errhint("The X holder did not ship a current image in time; retry, or "
 							"inspect dump_gcs.cf_xheld_read_ship_count.")));
 	return true; /* unreachable */
+}
+
+
+/* Stage 8 R4 D4 requester-side remote FULL fetch.  This target-only raw
+ * helper remains separate from the still-live SOURCE dispatcher below.  It
+ * arms the disjoint R4 reply domain before staging exact REQUEST80, never
+ * prepares direct land, waits on monotonic time and copies a verified FULL
+ * page only into the caller's scratch buffer.  A transported status 25
+ * closes that attempt before a bounded fresh-id retry; status 26 closes the
+ * operation without retry or caller-page mutation. */
+static ClusterCrBuildResult
+gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn,
+									  int32 real_master_node,
+									  char dst_page[GCS_BLOCK_DATA_SIZE],
+									  ClusterCrBuildReason *reason_out)
+{
+	int max_retries;
+	int retry_attempt;
+
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
+	if (dst_page == NULL || reason_out == NULL || !SCN_VALID(read_scn)
+		|| real_master_node < 0
+		|| real_master_node >= PCM_X_PROTOCOL_NODE_LIMIT)
+		return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	max_retries = cluster_gcs_block_retransmit_max_retries;
+	if (max_retries < 0)
+		max_retries = 4;
+	if (max_retries > 30)
+		max_retries = 30;
+	cluster_gcs_block_dedup_register_backend_exit_hook();
+	for (retry_attempt = 0; retry_attempt <= max_retries; retry_attempt++) {
+		ClusterGcsBlockOutstandingSlot *slot;
+		ClusterR4CrRequestPayload request;
+		uint64 request_id = 0;
+		uint64 request_epoch = cluster_epoch_get_current();
+		volatile bool got_reply = false;
+		volatile bool fetched = false;
+		volatile uint8 reply_status = 0;
+
+		slot = gcs_block_try_reserve_r4_slot(tag, request_epoch, real_master_node,
+											  &request_id);
+		if (slot == NULL) {
+			*reason_out = CLUSTER_CR_BUILD_CAPACITY;
+			return CLUSTER_CR_BUILD_RETRYABLE;
+		}
+
+		PG_TRY();
+		{
+			bool request_admitted = false;
+
+			memset(&request, 0, sizeof(request));
+			request.base.request_id = request_id;
+			request.base.epoch = request_epoch;
+			request.base.tag = tag;
+			request.base.sender_node = cluster_node_id;
+			request.base.requester_backend_id = (int32)MyBackendId;
+			request.base.transition_id = (uint8)PCM_TRANS_N_TO_S;
+			GcsBlockRequestPayloadSetLifetimeHintMs(
+				&request.base,
+				cluster_gcs_block_dedup_lifetime_ms(
+					cluster_gcs_block_retransmit_initial_backoff_ms,
+					cluster_gcs_block_retransmit_max_retries,
+					cluster_gcs_reply_timeout_ms));
+			if (ClusterR4RequestExtensionSetCr(&request.extension, read_scn))
+				request_admitted
+					= cluster_grd_outbound_enqueue_backend_msg(
+						PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
+						(uint32)real_master_node, &request,
+						sizeof(request));
+			if (request_admitted) {
+				ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+				instr_time started;
+
+				INSTR_TIME_SET_CURRENT(started);
+				ConditionVariablePrepareToSleep(&slot->reply_cv);
+				for (;;) {
+					instr_time now;
+					instr_time elapsed;
+					double remaining_ms;
+					long timeout_ms;
+					bool have_reply;
+					bool stale;
+
+					LWLockAcquire(&blk->lock.lock, LW_SHARED);
+					have_reply = slot->in_use && slot->reply_received;
+					stale = slot->in_use && slot->stale;
+					LWLockRelease(&blk->lock.lock);
+					if (have_reply) {
+						got_reply = true;
+						break;
+					}
+					if (stale)
+						break;
+					INSTR_TIME_SET_CURRENT(now);
+					elapsed = now;
+					INSTR_TIME_SUBTRACT(elapsed, started);
+					remaining_ms = (double)cluster_gcs_reply_timeout_ms
+									   - INSTR_TIME_GET_MILLISEC(elapsed);
+					if (remaining_ms <= 0)
+						break;
+					timeout_ms = remaining_ms < 1.0 ? 1L : (long)remaining_ms;
+					(void)ConditionVariableTimedSleep(
+						&slot->reply_cv, timeout_ms, WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+				}
+				ConditionVariableCancelSleep();
+
+				if (got_reply
+					&& slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
+					&& slot->reply_header.request_id == request_id
+					&& slot->reply_header.epoch == request_epoch
+					&& slot->reply_header.requester_backend_id == (int32)MyBackendId
+					&& slot->reply_header.transition_id == (uint8)PCM_TRANS_N_TO_S) {
+					reply_status = slot->reply_header.status;
+					if (reply_status == (uint8)GCS_BLOCK_REPLY_R4_CR_FULL
+						&& slot->reply_header.checksum
+							   == gcs_block_compute_checksum(slot->reply_block_data)) {
+						memcpy(dst_page, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
+						fetched = true;
+					}
+				}
+			}
+		}
+		PG_CATCH();
+		{
+			gcs_block_release_slot(slot);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+
+		gcs_block_release_slot(slot);
+		if (fetched) {
+			*reason_out = CLUSTER_CR_BUILD_NONE;
+			return CLUSTER_CR_BUILD_FULL;
+		}
+		if (got_reply
+			&& reply_status == (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED
+			&& retry_attempt < max_retries)
+			continue;
+		if (got_reply
+			&& reply_status == (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED) {
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_exhausted_count, 1);
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED),
+					 errmsg("cluster_gcs_block: R4 CR retry budget exhausted after %d retries "
+							"for tag spc=%u db=%u relNumber=%u block=%u "
+							"(master=%d attempts=%d last_status=%u)",
+							max_retries, tag.spcOid, tag.dbOid,
+							(unsigned int)BufTagGetRelNumber(&tag),
+							(unsigned int)tag.blockNum, real_master_node,
+							retry_attempt + 1, (unsigned int)reply_status),
+					 errhint("Possible peer GCS unresponsiveness, network partition, or "
+							 "epoch reshuffle storm.  Inspect dump_gcs counters and "
+							 "consider raising cluster.gcs_block_retransmit_max_retries.")));
+			*reason_out = CLUSTER_CR_BUILD_HOLDER_MOVED;
+			return CLUSTER_CR_BUILD_RETRYABLE;
+		}
+		if (got_reply) {
+			*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
+			return CLUSTER_CR_BUILD_FAIL_CLOSED;
+		}
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("cluster_gcs_block: R4 CR request to master %d received no "
+						"terminal reply after %d attempt(s)",
+						real_master_node, retry_attempt + 1)));
+		*reason_out = CLUSTER_CR_BUILD_IO_ERROR;
+		return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	}
+	*reason_out = CLUSTER_CR_BUILD_HOLDER_MOVED;
+	return CLUSTER_CR_BUILD_RETRYABLE;
+}
+
+/* Public TARGET requester boundary.  Admission dominates validation and
+ * routing; the raw transport writes only private aligned scratch.  A caller
+ * page is published only after the same token's positive final recheck. */
+ClusterCrBuildResult
+cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
+									char dst_page[BLCKSZ],
+									ClusterCrBuildReason *reason_out)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	PGAlignedBlock scratch;
+	ClusterCrBuildReason raw_reason = CLUSTER_CR_BUILD_PROTOCOL;
+	int32 real_master_node;
+	volatile ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	volatile ClusterCrBuildResult result = CLUSTER_CR_BUILD_FAIL_CLOSED;
+
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
+	memset(&admission, 0, sizeof(admission));
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		reason = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
+					 ? CLUSTER_CR_BUILD_TARGET_DISABLED
+					 : CLUSTER_CR_BUILD_RF_DEFERRED;
+		result = CLUSTER_CR_BUILD_RETRYABLE;
+		if (reason_out != NULL)
+			*reason_out = (ClusterCrBuildReason)reason;
+		return (ClusterCrBuildResult)result;
+	}
+
+	PG_TRY();
+	{
+		if (dst_page == NULL || reason_out == NULL || !SCN_VALID(read_scn))
+			goto done;
+		real_master_node = cluster_gcs_lookup_master(tag);
+		if (real_master_node < 0
+			|| real_master_node >= PCM_X_PROTOCOL_NODE_LIMIT) {
+			reason = CLUSTER_CR_BUILD_WRONG_MASTER;
+			result = CLUSTER_CR_BUILD_RETRYABLE;
+			goto done;
+		}
+
+		result = gcs_block_r4_cr_fetch_and_wait_raw(
+			tag, read_scn, real_master_node, scratch.data, &raw_reason);
+		reason = raw_reason;
+		if (result != CLUSTER_CR_BUILD_FULL)
+			goto done;
+		if (!cluster_semantic_activation_recheck(&admission)) {
+			reason = CLUSTER_CR_BUILD_RF_DEFERRED;
+			result = CLUSTER_CR_BUILD_RETRYABLE;
+			goto done;
+		}
+		memcpy(dst_page, scratch.data, BLCKSZ);
+		reason = CLUSTER_CR_BUILD_NONE;
+		result = CLUSTER_CR_BUILD_FULL;
+
+done:
+		;
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&admission);
+	}
+	PG_END_TRY();
+
+	if (reason_out != NULL)
+		*reason_out = (ClusterCrBuildReason)reason;
+	return (ClusterCrBuildResult)result;
 }
 
 
@@ -8394,6 +8981,93 @@ gcs_block_decode_reply_payload(const ClusterICEnvelope *env, const void *payload
 	return false;
 }
 
+/* D4 R4 reply landing is selected by the closed outstanding-slot domain,
+ * not by widening the legacy 8240-byte decoder.  Return false only when the
+ * frame is not a status-21/25/26 candidate; a malformed R4 candidate is
+ * consumed and dropped so it can never alias a legacy acquisition reply. */
+static bool
+gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *payload)
+{
+	const GcsBlockReplyHeader *hdr;
+	const char *block_data;
+	GcsBlockR4ReplyExpectation expected;
+	int backend_idx;
+	ClusterGcsBlockBackendBlock *blk;
+	int i;
+
+	if (env == NULL || payload == NULL
+		|| env->payload_length < (uint32)sizeof(GcsBlockReplyHeader))
+		return false;
+	hdr = (const GcsBlockReplyHeader *)payload;
+	if (hdr->status != (uint8)GCS_BLOCK_REPLY_R4_CR_FULL
+		&& hdr->status != (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED
+		&& hdr->status != (uint8)GCS_BLOCK_REPLY_R4_DENIED)
+		return false;
+	if (env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE)
+		return true;
+
+	backend_idx = hdr->requester_backend_id - 1;
+	if (backend_idx < 0 || backend_idx >= MaxBackends
+		|| gcs_block_backend_blocks == NULL)
+		return true;
+	blk = &gcs_block_backend_blocks[backend_idx];
+
+	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	for (i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
+		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[i];
+
+		if (!slot->in_use || slot->request_id != hdr->request_id)
+			continue;
+		if (slot->reply_domain != CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
+			|| slot->reply_received
+			|| slot->direct_state == GCS_BLOCK_DIRECT_ARMED
+			|| slot->direct_state == GCS_BLOCK_DIRECT_LANDED
+			|| slot->direct_state == GCS_BLOCK_DIRECT_ABORTING) {
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
+			LWLockRelease(&blk->lock.lock);
+			return true;
+		}
+
+		memset(&expected, 0, sizeof(expected));
+		expected.request_id = slot->request_id;
+		expected.epoch = slot->request_epoch;
+		expected.requester_backend_id = backend_idx + 1;
+		expected.transition_id = slot->transition_id;
+		if (hdr->status != (uint8)GCS_BLOCK_REPLY_R4_CR_FULL
+			&& GcsBlockReplyHeaderGetForwardingMasterNode(hdr)
+				   == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
+			expected.sender_node = slot->expected_master_node;
+			expected.forwarding_master_node
+				= GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+		} else {
+			expected.sender_node = (int32)env->source_node_id;
+			expected.forwarding_master_node = slot->expected_master_node;
+		}
+		expected.reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+		if (!gcs_block_decode_r4_reply_payload(env, payload, &expected)) {
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
+			LWLockRelease(&blk->lock.lock);
+			return true;
+		}
+
+		block_data = ((const char *)payload) + sizeof(*hdr);
+		slot->reply_header = *hdr;
+		memcpy(slot->reply_block_data, block_data, GCS_BLOCK_DATA_SIZE);
+		slot->reply_sf_dep_valid = false;
+		slot->reply_sf_flags = 0;
+		cluster_sf_dep_vec_reset(&slot->reply_sf_dep_vec);
+		slot->reply_undo_trailer_valid = false;
+		slot->reply_undo_tt_generation = 0;
+		slot->reply_undo_authority_scn = 0;
+		slot->reply_received = true;
+		ConditionVariableSignal(&slot->reply_cv);
+		LWLockRelease(&blk->lock.lock);
+		return true;
+	}
+	LWLockRelease(&blk->lock.lock);
+	return true;
+}
+
 void
 cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void *payload)
 {
@@ -8407,6 +9081,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
 
+	if (gcs_block_try_land_r4_terminal_reply(env, payload))
+		return;
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	if (!gcs_block_decode_reply_payload(env, payload, &hdr, &block_data, &sf_dep_valid, &sf_flags,
 										&sf_dep_vec, &undo_trailer))
@@ -8419,12 +9095,14 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 		return;
 
 	/* D4 status 24 is a worker-0 internal response, never a backend-table
-	 * reply.  Until the foreign-slot FSM lands, consume it here before even
-	 * deriving a backend index so the existing authenticated 8256-byte
-	 * decoder cannot alias it onto a legacy acquisition slot. */
+	 * reply.  The decoder has already established its exact authenticated
+	 * 8256-byte shape; route it to the foreign-slot owner before deriving any
+	 * backend index so it cannot alias a legacy acquisition slot. */
 	if (hdr->status == (uint8)GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
 		if (hdr->requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT)
 			return;
+		(void)cluster_cr_server_r4_land_foreign_undo(
+			env, hdr, block_data, undo_trailer);
 		return;
 	}
 

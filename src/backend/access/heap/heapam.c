@@ -76,8 +76,11 @@
 #include "utils/spccache.h"
 #include "utils/syscache.h"
 
+#include "heapam_r4_private.h"
+
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC (spec-3.4a D3/D4/D5): ITL write-path activation. */
+#include "cluster/cluster_cr_server.h" /* R4 TARGET full-block CR fetch */
 #include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled / cluster_peer_mode_enabled */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
@@ -1579,6 +1582,64 @@ heap_fetch(Relation relation,
 	return false;
 }
 
+#ifdef USE_CLUSTER_UNIT
+/*
+ * Exercise the real D6 lock choreography while keeping external I/O and the
+ * scratch evaluator injectable.  The relock is a restoration obligation: it
+ * runs on both normal and ERROR exits and contributes no semantic input.
+ */
+HeapHotSearchResultKind
+cluster_heap_test_r4_hot_full_cycle(
+	BufferTag tag, ItemPointerData logical_root, SCN read_scn,
+	HeapHotSearchResult *result, ClusterR4HotLockTestHook lock_hook,
+	ClusterR4HotFetchFullTestHook fetch_full_hook,
+	ClusterR4HotScratchSearchTestHook scratch_search_hook, void *hook_arg,
+	bool *call_again, bool *all_dead)
+{
+	ClusterR4HotScratchTestContext context;
+
+	Assert(result != NULL);
+	Assert(lock_hook != NULL);
+	Assert(fetch_full_hook != NULL);
+	Assert(scratch_search_hook != NULL);
+
+	memset(result, 0, sizeof(*result));
+	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
+	if (call_again != NULL)
+		*call_again = false;
+	if (all_dead != NULL)
+		*all_dead = false;
+
+	memset(&context, 0, sizeof(context));
+	context.scratch_page = (Page) result->scratch_page;
+	context.tag = tag;
+	context.logical_root = logical_root;
+	context.read_scn = read_scn;
+	context.already_full = true;
+	context.allow_hint = false;
+	context.allow_cleanout = false;
+
+	lock_hook(hook_arg, false);
+	PG_TRY();
+	{
+		if (fetch_full_hook(hook_arg, &tag, read_scn,
+							result->scratch_page) &&
+			scratch_search_hook(hook_arg, &context, &result->tuple))
+			result->kind = HEAP_HOT_SEARCH_OWNED_SCRATCH;
+	}
+	PG_FINALLY();
+	{
+		lock_hook(hook_arg, true);
+	}
+	PG_END_TRY();
+
+	if (result->kind == HEAP_HOT_SEARCH_NOT_FOUND)
+		memset(&result->tuple, 0, sizeof(result->tuple));
+
+	return result->kind;
+}
+#endif
+
 /*
  *	heap_hot_search_buffer	- search HOT chain for tuple satisfying snapshot
  *
@@ -1747,6 +1808,504 @@ heap_hot_search_buffer(ItemPointer tid, Relation relation, Buffer buffer,
 	}
 
 	return false;
+}
+
+#ifdef USE_PGRAC_CLUSTER
+typedef enum HeapHotR4CycleOutcome
+{
+	HEAP_HOT_R4_CYCLE_DORMANT = 0,
+	HEAP_HOT_R4_CYCLE_NOT_FOUND,
+	HEAP_HOT_R4_CYCLE_FOUND,
+	HEAP_HOT_R4_CYCLE_FAILED
+} HeapHotR4CycleOutcome;
+
+static pg_attribute_noreturn() void
+heap_hot_r4_unknown(const char *reason)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+			 errmsg("R4 HOT reconstruction cannot prove the logical row: %s",
+					reason)));
+	pg_unreachable();
+}
+
+static pg_attribute_noreturn() void
+heap_hot_r4_snapshot_too_old(SCN read_scn, SCN recycle_scn)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_CR_SNAPSHOT_TOO_OLD),
+			 errmsg("R4 HOT reconstruction is older than the retained undo horizon"),
+			 errdetail("Snapshot SCN " UINT64_FORMAT
+					   " precedes page recycle SCN " UINT64_FORMAT ".",
+					   (uint64) read_scn, (uint64) recycle_scn)));
+	pg_unreachable();
+}
+
+static bool
+heap_hot_r4_scratch_page_valid(Page page)
+{
+	PageHeader	header;
+	OffsetNumber maxoff;
+
+	if (page == NULL)
+		return false;
+	header = (PageHeader) page;
+	if (PageIsNew(page) || PageGetPageSize(page) != BLCKSZ
+		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+		|| header->pd_lower < SizeOfPageHeaderData
+		|| header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special
+		|| header->pd_special > BLCKSZ
+		|| !PageHasItl(page)
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_SPECIAL_SIZE)
+		return false;
+
+	maxoff = PageGetMaxOffsetNumber(page);
+	return maxoff <= MaxHeapTuplesPerPage;
+}
+
+static bool
+heap_hot_r4_data_slot(uint8 flags)
+{
+	return flags == ITL_FLAG_ACTIVE || flags == ITL_FLAG_COMMITTED
+		|| flags == ITL_FLAG_ABORTED || flags == ITL_FLAG_NEEDS_CLEANOUT;
+}
+
+/*
+ * The current tuple header names the current DATA modifier slot.  A different
+ * raw xmin is not a creator locator: it is the approved signal to request a
+ * complete holder-built block and restart from the logical HOT root.
+ */
+static bool
+heap_hot_r4_updated_xmin_needs_full(Page page, HeapTuple tuple,
+									Snapshot snapshot)
+{
+	ClusterItlSlotData *slot;
+	ClusterUndoTTSlotRef ref;
+	TransactionId raw_xmin;
+	uint8		itl_index;
+
+	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC
+		|| snapshot->cluster_source != (uint8) SNAPSHOT_SOURCE_CLUSTER
+		|| !SCN_VALID(snapshot->read_scn) || tuple == NULL
+		|| tuple->t_data == NULL || !PageHasItl(page)
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE)
+		return false;
+
+	raw_xmin = HeapTupleHeaderGetRawXmin(tuple->t_data);
+	itl_index = tuple->t_data->t_itl_slot_idx;
+	if (!TransactionIdIsNormal(raw_xmin)
+		|| itl_index == CLUSTER_ITL_SLOT_UNALLOCATED
+		|| itl_index >= CLUSTER_ITL_INITRANS_DEFAULT)
+		return false;
+
+	slot = &ClusterPageGetItlSlots(page)[itl_index];
+	memset(&ref, 0, sizeof(ref));
+	return heap_hot_r4_data_slot(slot->flags)
+		&& cluster_itl_get_tt_ref(page, itl_index, &ref)
+		&& ref.tt_slot_id != 0
+		&& TransactionIdIsNormal(ref.local_xid)
+		&& !TransactionIdEquals(ref.local_xid, raw_xmin);
+}
+
+/* Consume one immutable FULL page.  There is deliberately no Buffer input. */
+static bool
+heap_hot_r4_search_scratch(const BufferTag *tag,
+						   const ItemPointerData *logical_root,
+						   Relation relation, Snapshot snapshot,
+						   HeapHotSearchResult *result)
+{
+	ClusterR4HotScratchTestContext context;
+	Page		page = (Page) result->scratch_page;
+	PageHeader	header;
+	bool		visited[MaxHeapTuplesPerPage + 1];
+	TransactionId prev_xmax = InvalidTransactionId;
+	BlockNumber blkno;
+	OffsetNumber offnum;
+	bool		at_chain_start = true;
+	int		depth = 0;
+
+	if (!heap_hot_r4_scratch_page_valid(page))
+		heap_hot_r4_unknown("malformed FULL page");
+
+	header = (PageHeader) page;
+	if (SCN_VALID(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn)
+		&& scn_time_cmp(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn,
+						snapshot->read_scn) > 0)
+		heap_hot_r4_snapshot_too_old(
+			snapshot->read_scn,
+			ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn);
+
+	if (!ItemPointerIsValid(logical_root))
+		heap_hot_r4_unknown("invalid logical HOT root");
+	blkno = ItemPointerGetBlockNumber(logical_root);
+	offnum = ItemPointerGetOffsetNumber(logical_root);
+	if (blkno != tag->blockNum)
+		heap_hot_r4_unknown("logical HOT root belongs to another block");
+
+	memset(visited, 0, sizeof(visited));
+	memset(&context, 0, sizeof(context));
+	context.scratch_page = page;
+	context.tag = *tag;
+	context.logical_root = *logical_root;
+	context.read_scn = snapshot->read_scn;
+	context.already_full = true;
+	context.allow_hint = false;
+	context.allow_cleanout = false;
+
+	for (;;)
+	{
+		ItemId		lp;
+		Size		item_offset;
+		Size		item_length;
+
+		if (offnum < FirstOffsetNumber
+			|| offnum > PageGetMaxOffsetNumber(page))
+			heap_hot_r4_unknown("HOT offset is absent from the FULL page");
+		if (offnum > MaxHeapTuplesPerPage || visited[offnum])
+			heap_hot_r4_unknown("HOT chain contains a cycle");
+		if (++depth > MaxHeapTuplesPerPage)
+			heap_hot_r4_unknown("HOT chain exceeds the bounded page depth");
+		visited[offnum] = true;
+
+		lp = PageGetItemId(page, offnum);
+		if (!ItemIdIsNormal(lp))
+		{
+			if (ItemIdIsRedirected(lp) && at_chain_start)
+			{
+				offnum = ItemIdGetRedirect(lp);
+				at_chain_start = false;
+				continue;
+			}
+			heap_hot_r4_unknown("HOT root or member is unused or unprovable");
+		}
+
+		item_offset = ItemIdGetOffset(lp);
+		item_length = ItemIdGetLength(lp);
+		if (item_length < SizeofHeapTupleHeader
+			|| item_offset < header->pd_upper
+			|| item_offset > header->pd_special
+			|| item_length > (Size) (header->pd_special - item_offset))
+			heap_hot_r4_unknown("HOT member lies outside the FULL page tuple area");
+
+		result->tuple.t_data = (HeapTupleHeader) ((char *) page + item_offset);
+		result->tuple.t_len = item_length;
+		result->tuple.t_tableOid = RelationGetRelid(relation);
+		ItemPointerSet(&result->tuple.t_self, blkno, offnum);
+		if (result->tuple.t_data->t_hoff < SizeofHeapTupleHeader
+			|| result->tuple.t_data->t_hoff > result->tuple.t_len)
+			heap_hot_r4_unknown("HOT member has a malformed tuple header");
+
+		if (at_chain_start && HeapTupleIsHeapOnly(&result->tuple))
+			heap_hot_r4_unknown("logical HOT root is heap-only");
+		if (TransactionIdIsValid(prev_xmax)
+			&& !TransactionIdEquals(
+				prev_xmax, HeapTupleHeaderGetXmin(result->tuple.t_data)))
+			heap_hot_r4_unknown("HOT predecessor identity does not match xmin");
+
+		if (HeapTupleSatisfiesMVCCScratch(&result->tuple, snapshot, &context))
+			return true;
+
+		if (!HeapTupleIsHotUpdated(&result->tuple))
+			return false;
+		if (!ItemPointerIsValid(&result->tuple.t_data->t_ctid)
+			|| ItemPointerGetBlockNumber(&result->tuple.t_data->t_ctid) != blkno)
+			heap_hot_r4_unknown("HOT chain crosses the reconstructed block");
+		if ((result->tuple.t_data->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
+			heap_hot_r4_unknown("scratch HOT predecessor requires MultiXact I/O");
+
+		offnum = ItemPointerGetOffsetNumber(&result->tuple.t_data->t_ctid);
+		at_chain_start = false;
+		prev_xmax = HeapTupleHeaderGetRawXmax(result->tuple.t_data);
+		if (!TransactionIdIsNormal(prev_xmax))
+			heap_hot_r4_unknown("scratch HOT predecessor has no exact xid");
+	}
+}
+
+static BufferTag
+heap_hot_r4_buffer_tag(Buffer buffer)
+{
+	BufferTag	tag;
+	RelFileLocator rlocator;
+	ForkNumber	forknum;
+	BlockNumber blocknum;
+
+	BufferGetTag(buffer, &rlocator, &forknum, &blocknum);
+	InitBufferTag(&tag, &rlocator, forknum, blocknum);
+	return tag;
+}
+
+/*
+ * Drop SHARE before the TARGET fetch and restore it in PG_FINALLY.  A FULL
+ * result is decided solely from result->scratch_page.  TARGET_DISABLED is the
+ * one dormant exception: after restoration the caller restarts the unchanged
+ * live HOT path.  Every other refusal fails closed without source fallback.
+ */
+static HeapHotR4CycleOutcome
+heap_hot_r4_full_cycle(Buffer buffer, const BufferTag *tag,
+					   const ItemPointerData *logical_root,
+					   Relation relation, Snapshot snapshot,
+					   HeapHotSearchResult *result,
+					   ClusterCrBuildResult *build_result_out,
+					   ClusterCrBuildReason *build_reason_out)
+{
+	ClusterCrBuildReason raw_reason = CLUSTER_CR_BUILD_PROTOCOL;
+	volatile ClusterCrBuildResult build_result = CLUSTER_CR_BUILD_FAIL_CLOSED;
+	volatile ClusterCrBuildReason build_reason = CLUSTER_CR_BUILD_PROTOCOL;
+
+	memset(result, 0, sizeof(*result));
+	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
+
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	PG_TRY();
+	{
+		build_result = cluster_gcs_block_cr_fetch_and_wait(
+			*tag, snapshot->read_scn, result->scratch_page,
+			&raw_reason);
+		build_reason = raw_reason;
+		if (build_result == CLUSTER_CR_BUILD_FULL
+			&& build_reason == CLUSTER_CR_BUILD_NONE)
+		{
+			if (heap_hot_r4_search_scratch(tag, logical_root, relation,
+										 snapshot, result))
+				result->kind = HEAP_HOT_SEARCH_OWNED_SCRATCH;
+		}
+	}
+	PG_FINALLY();
+	{
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	}
+	PG_END_TRY();
+	*build_result_out = (ClusterCrBuildResult) build_result;
+	*build_reason_out = (ClusterCrBuildReason) build_reason;
+
+	if (build_result == CLUSTER_CR_BUILD_RETRYABLE
+		&& build_reason == CLUSTER_CR_BUILD_TARGET_DISABLED)
+		return HEAP_HOT_R4_CYCLE_DORMANT;
+	if (build_result == CLUSTER_CR_BUILD_FULL
+		&& build_reason == CLUSTER_CR_BUILD_NONE)
+		return result->kind == HEAP_HOT_SEARCH_OWNED_SCRATCH
+			? HEAP_HOT_R4_CYCLE_FOUND : HEAP_HOT_R4_CYCLE_NOT_FOUND;
+	return HEAP_HOT_R4_CYCLE_FAILED;
+}
+
+static pg_attribute_noreturn() void
+heap_hot_r4_full_failure(SCN read_scn, ClusterCrBuildResult build_result,
+						 ClusterCrBuildReason build_reason)
+{
+	if (build_reason == CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD)
+		heap_hot_r4_snapshot_too_old(read_scn, InvalidScn);
+	ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+			 errmsg("R4 HOT full-block fetch did not return a complete page"),
+			 errdetail("Result %d, reason %s.", (int) build_result,
+					   cluster_cr_build_reason_name(
+						   build_reason))));
+	pg_unreachable();
+}
+#endif
+
+#ifdef USE_CLUSTER_UNIT
+/*
+ * The focused dormant-scaffolding receipt owns these legacy fallthrough
+ * boundaries.  Keeping them injectable prevents unrelated visibility and
+ * SSI implementations from being retained merely because the companion's
+ * FULL branch shares a function body with its dormant live fallback.
+ */
+extern bool cluster_heap_test_r4_live_visibility(HeapTuple tuple,
+	Snapshot snapshot, Buffer buffer);
+extern void cluster_heap_test_r4_conflict_out(bool visible,
+	Relation relation, HeapTuple tuple, Buffer buffer, Snapshot snapshot);
+extern bool cluster_heap_test_r4_surely_dead(HeapTuple tuple,
+	GlobalVisState *vistest);
+#define HeapHotR4LiveVisibility cluster_heap_test_r4_live_visibility
+#define HeapHotR4ConflictOut cluster_heap_test_r4_conflict_out
+#define HeapHotR4SurelyDead cluster_heap_test_r4_surely_dead
+#else
+#define HeapHotR4LiveVisibility HeapTupleSatisfiesVisibility
+#define HeapHotR4ConflictOut HeapCheckForSerializableConflictOut
+#define HeapHotR4SurelyDead HeapTupleIsSurelyDead
+#endif
+
+/*
+ * Backend-private PK IndexScan companion.  The public bool API above remains
+ * byte-for-byte compatible; this closed result domain additionally carries a
+ * request-owned FULL tuple until heapam_handler.c copies it into the slot.
+ */
+HeapHotSearchResultKind
+heap_hot_search_buffer_result(ItemPointer tid, Relation relation, Buffer buffer,
+							  Snapshot snapshot, HeapHotSearchResult *result,
+							  bool *all_dead, bool first_call)
+{
+	Page		page;
+	TransactionId prev_xmax;
+	ItemPointerData logical_root = *tid;
+	BlockNumber blkno;
+	OffsetNumber offnum;
+	bool		at_chain_start;
+	bool		valid;
+	bool		skip;
+	GlobalVisState *vistest = NULL;
+#ifdef USE_PGRAC_CLUSTER
+	bool		r4_target_dormant = false;
+#endif
+
+	Assert(result != NULL);
+	memset(result, 0, sizeof(*result));
+	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
+
+#ifdef USE_PGRAC_CLUSTER
+restart_live_search:
+#endif
+	page = BufferGetPage(buffer);
+	prev_xmax = InvalidTransactionId;
+	if (all_dead)
+		*all_dead = first_call;
+	blkno = ItemPointerGetBlockNumber(&logical_root);
+	offnum = ItemPointerGetOffsetNumber(&logical_root);
+	at_chain_start = first_call;
+	skip = !first_call;
+
+	Assert(TransactionIdIsValid(RecentXmin));
+	Assert(BufferGetBlockNumber(buffer) == blkno);
+
+	for (;;)
+	{
+		ItemId		lp;
+
+		if (offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
+			break;
+
+		lp = PageGetItemId(page, offnum);
+		if (!ItemIdIsNormal(lp))
+		{
+			if (ItemIdIsRedirected(lp) && at_chain_start)
+			{
+				offnum = ItemIdGetRedirect(lp);
+				at_chain_start = false;
+				continue;
+			}
+			break;
+		}
+
+		result->tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		result->tuple.t_len = ItemIdGetLength(lp);
+		result->tuple.t_tableOid = RelationGetRelid(relation);
+		ItemPointerSet(&result->tuple.t_self, blkno, offnum);
+
+		if (at_chain_start && HeapTupleIsHeapOnly(&result->tuple))
+			break;
+		if (TransactionIdIsValid(prev_xmax)
+			&& !TransactionIdEquals(
+				prev_xmax, HeapTupleHeaderGetXmin(result->tuple.t_data)))
+			break;
+
+		if (!skip)
+		{
+#ifdef USE_PGRAC_CLUSTER
+			if (!r4_target_dormant && first_call
+				&& cluster_storage_mode_enabled()
+				&& !RelationUsesLocalBuffers(relation)
+				&& heap_hot_r4_updated_xmin_needs_full(
+					page, &result->tuple, snapshot))
+			{
+				BufferTag	tag = heap_hot_r4_buffer_tag(buffer);
+				BufferTag	revalidated_tag;
+				ClusterCrBuildResult build_result;
+				ClusterCrBuildReason build_reason;
+				HeapHotR4CycleOutcome outcome;
+				char		stable_input[BLCKSZ] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+
+				if (IsolationIsSerializable())
+					heap_hot_r4_unknown(
+						"Serializable scratch evaluation cannot preserve SSI");
+
+				memcpy(stable_input, page, BLCKSZ);
+				outcome = heap_hot_r4_full_cycle(buffer, &tag, &logical_root,
+										 relation, snapshot, result,
+										 &build_result, &build_reason);
+				revalidated_tag = heap_hot_r4_buffer_tag(buffer);
+				page = BufferGetPage(buffer);
+				if (!BufferTagsEqual(&tag, &revalidated_tag)
+					|| memcmp(stable_input, page, BLCKSZ) != 0)
+				{
+					memset(result, 0, sizeof(*result));
+					result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
+					CHECK_FOR_INTERRUPTS();
+					goto restart_live_search;
+				}
+				if (outcome == HEAP_HOT_R4_CYCLE_FAILED)
+					heap_hot_r4_full_failure(snapshot->read_scn, build_result,
+										 build_reason);
+				if (outcome == HEAP_HOT_R4_CYCLE_FOUND)
+				{
+					*tid = result->tuple.t_self;
+					if (all_dead)
+						*all_dead = false;
+					return HEAP_HOT_SEARCH_OWNED_SCRATCH;
+				}
+				if (outcome == HEAP_HOT_R4_CYCLE_NOT_FOUND)
+				{
+					if (all_dead)
+						*all_dead = false;
+					return HEAP_HOT_SEARCH_NOT_FOUND;
+				}
+
+				/* TARGET is dormant: restart under the restored live lock. */
+				r4_target_dormant = true;
+				memset(result, 0, sizeof(*result));
+				result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
+				goto restart_live_search;
+			}
+#endif
+
+			valid = HeapHotR4LiveVisibility(&result->tuple, snapshot, buffer);
+			HeapHotR4ConflictOut(valid, relation, &result->tuple,
+								 buffer, snapshot);
+
+			if (valid)
+			{
+				ItemPointerSetOffsetNumber(tid, offnum);
+				PredicateLockTID(relation, &result->tuple.t_self, snapshot,
+								 HeapTupleHeaderGetXmin(result->tuple.t_data));
+				if (all_dead)
+					*all_dead = false;
+				result->kind = HEAP_HOT_SEARCH_BUFFER_BACKED;
+				return result->kind;
+			}
+		}
+		skip = false;
+
+		if (all_dead && *all_dead)
+		{
+			if (!vistest)
+				vistest = GlobalVisTestFor(relation);
+
+			if (
+#ifdef USE_PGRAC_CLUSTER
+				cluster_vis_prune_must_defer(cluster_storage_mode_enabled()
+										&& !RelationUsesLocalBuffers(relation),
+									 false)
+					? true :
+#endif
+				!HeapHotR4SurelyDead(&result->tuple, vistest))
+				*all_dead = false;
+		}
+
+		if (HeapTupleIsHotUpdated(&result->tuple))
+		{
+			Assert(ItemPointerGetBlockNumber(&result->tuple.t_data->t_ctid)
+				   == blkno);
+			offnum = ItemPointerGetOffsetNumber(&result->tuple.t_data->t_ctid);
+			at_chain_start = false;
+			prev_xmax = HeapTupleHeaderGetUpdateXid(result->tuple.t_data);
+		}
+		else
+			break;
+	}
+
+	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
+	return result->kind;
 }
 
 /*

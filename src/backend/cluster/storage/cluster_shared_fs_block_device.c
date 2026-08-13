@@ -38,6 +38,11 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif
+
 #include "access/xlog.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
@@ -68,6 +73,7 @@
 #define CLUSTER_RAW_DATA_START_EXTENT 3
 #define CLUSTER_RAW_BITMAP_MAX_EXTENTS (CLUSTER_RAW_EXTENT_SIZE * BITS_PER_BYTE)
 #define CLUSTER_RAW_DIR_REGION_BYTES (128 * 1024)
+#define CLUSTER_RAW_DEVICE_SECTOR_SIZE 512U
 #define CLUSTER_RAW_ENTRY_IN_USE 0x00000001U
 #define CLUSTER_RAW_SLOT_IN_USE 0x00000001U
 #define CLUSTER_RAW_INVALID_SLOT PG_UINT64_MAX
@@ -124,6 +130,15 @@ typedef struct RawLayoutLock {
 	bool coordinated;
 	ClusterLockAcquireRequest req;
 } RawLayoutLock;
+
+typedef enum RawDeviceSizeFailure {
+	RAW_DEVICE_SIZE_FAILURE_NONE = 0,
+	RAW_DEVICE_SIZE_FAILURE_STAT,
+	RAW_DEVICE_SIZE_FAILURE_UNSUPPORTED,
+	RAW_DEVICE_SIZE_FAILURE_BLOCK_QUERY,
+	RAW_DEVICE_SIZE_FAILURE_OVERFLOW,
+	RAW_DEVICE_SIZE_FAILURE_SECTOR_ALIGNMENT
+} RawDeviceSizeFailure;
 
 struct ClusterSharedFsHandle {
 	RelFileLocator rlocator;
@@ -215,13 +230,49 @@ raw_device_writeback(off_t offset, off_t nbytes)
 }
 
 static off_t
-raw_device_size(void)
+raw_device_size(RawDeviceSizeFailure *failure, uint64 *reported_capacity)
 {
 	struct stat st;
+#if defined(__linux__) || defined(USE_CLUSTER_UNIT)
+	uint64 capacity;
+#endif
 
-	if (fstat(cluster_raw_device_fd, &st) != 0)
+	*failure = RAW_DEVICE_SIZE_FAILURE_NONE;
+	*reported_capacity = 0;
+	if (fstat(cluster_raw_device_fd, &st) != 0) {
+		*failure = RAW_DEVICE_SIZE_FAILURE_STAT;
 		return -1;
-	return st.st_size;
+	}
+	if (S_ISREG(st.st_mode))
+		return st.st_size;
+	if (!S_ISBLK(st.st_mode)) {
+		*failure = RAW_DEVICE_SIZE_FAILURE_UNSUPPORTED;
+		errno = ENOTSUP;
+		return -1;
+	}
+
+#if defined(__linux__) || defined(USE_CLUSTER_UNIT)
+	if (ioctl(cluster_raw_device_fd, BLKGETSIZE64, &capacity) != 0) {
+		*failure = RAW_DEVICE_SIZE_FAILURE_BLOCK_QUERY;
+		return -1;
+	}
+	*reported_capacity = capacity;
+	if (capacity > (uint64)PG_INT64_MAX) {
+		*failure = RAW_DEVICE_SIZE_FAILURE_OVERFLOW;
+		errno = EOVERFLOW;
+		return -1;
+	}
+	if (capacity % CLUSTER_RAW_DEVICE_SECTOR_SIZE != 0) {
+		*failure = RAW_DEVICE_SIZE_FAILURE_SECTOR_ALIGNMENT;
+		errno = EINVAL;
+		return -1;
+	}
+	return (off_t)capacity;
+#else
+	*failure = RAW_DEVICE_SIZE_FAILURE_UNSUPPORTED;
+	errno = ENOTSUP;
+	return -1;
+#endif
 }
 
 static uint64
@@ -786,16 +837,52 @@ static void
 raw_ensure_layout(void)
 {
 	off_t size;
+	RawDeviceSizeFailure size_failure;
+	uint64 reported_capacity;
 	uint64 total_extents;
 	ClusterRawSuperblock super;
 	bool valid;
 	bool all_zero;
 	RawLayoutLock lock;
 
-	size = raw_device_size();
-	if (size < 0)
+	size = raw_device_size(&size_failure, &reported_capacity);
+	if (size < 0) {
+		int saved_errno = errno;
+
+		if (size_failure == RAW_DEVICE_SIZE_FAILURE_OVERFLOW)
+			ereport(FATAL,
+					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+					 errmsg("raw block device capacity exceeds the supported offset range"),
+					 errdetail("BLKGETSIZE64 reported " UINT64_FORMAT
+							   " bytes; the maximum supported capacity is " INT64_FORMAT
+							   " bytes.",
+							   reported_capacity, (int64)PG_INT64_MAX),
+					 errhint("Use a block device no larger than the reported maximum.")));
+		if (size_failure == RAW_DEVICE_SIZE_FAILURE_SECTOR_ALIGNMENT)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT),
+					 errmsg("raw block device capacity is not sector-aligned"),
+					 errdetail("BLKGETSIZE64 reported " UINT64_FORMAT
+							   " bytes; capacity must be a multiple of %u bytes.",
+							   reported_capacity, CLUSTER_RAW_DEVICE_SECTOR_SIZE),
+					 errhint("Verify that the block-device mapping exposes a whole number of "
+							 "512-byte sectors.")));
+		if (size_failure == RAW_DEVICE_SIZE_FAILURE_UNSUPPORTED)
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("could not query raw block device capacity on this platform"),
+					 errhint("Use a Linux block device that supports BLKGETSIZE64, or a "
+							 "regular-file image for development tests.")));
+		errno = saved_errno;
+		if (size_failure == RAW_DEVICE_SIZE_FAILURE_BLOCK_QUERY)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not query raw block device capacity with BLKGETSIZE64: %m"),
+					 errhint("Verify that the path is a Linux block device and that PostgreSQL "
+							 "has permission to query it.")));
 		ereport(FATAL, (errcode_for_file_access(),
 						errmsg("could not determine raw block device size: %m")));
+	}
 	if (size < (off_t)(CLUSTER_RAW_DATA_START_EXTENT * CLUSTER_RAW_EXTENT_SIZE))
 		ereport(FATAL,
 				(errcode(ERRCODE_DISK_FULL),

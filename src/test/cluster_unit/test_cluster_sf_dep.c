@@ -33,7 +33,9 @@ UT_DEFINE_GLOBALS();
 #define TEST_SF_CAP_PEER 7
 #define TEST_SF_SHMEM_BYTES 8192
 #define TEST_R4_REQUIRED_CAPS                                                                  \
-	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1)
+	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1              \
+	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                                          \
+	 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
 
 typedef union TestSfShmemStorage {
 	LWLock align;

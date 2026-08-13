@@ -72,6 +72,8 @@
 #include "utils/wait_event.h" /* spec-3.18 D7: ClusterUndoExtentClaim wait event */
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tt_local.h"		/* PGRAC: spec-4.5a G4 peek binding wrap */
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */
 #include "cluster/cluster_scn.h"
@@ -1315,10 +1317,10 @@ claim_undo_extent(ClusterUndoExtent *ext, uint8 owner_instance, uint32 ensured_s
  *	  15. Mark backend touched
  *	  16. Encode UBA and return
  */
-UBA
-cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *target,
-						  uint16 tt_slot_segment_id, uint16 tt_slot_offset, const void *payload,
-						  uint16 payload_len, UBA prev_uba)
+static UBA
+cluster_undo_record_alloc_body(uint8 record_type, const ClusterUndoRecordTarget *target,
+							   uint16 tt_slot_segment_id, uint16 tt_slot_offset,
+							   const void *payload, uint16 payload_len, UBA prev_uba)
 {
 	UBA result;
 	uint16 record_length;
@@ -1765,6 +1767,58 @@ cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *targ
 }
 
 
+static bool
+cluster_undo_record_writable_admission(void)
+{
+	ClusterJoinGateVerdict verdict = cluster_reconfig_self_join_gate_verdict();
+
+	if (verdict == CLUSTER_JOIN_GATE_BLOCK_53R61)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_JOIN_REJECTED_STALE),
+				 errmsg("cannot allocate undo: this node's cluster join was rejected"),
+				 errhint("Restart this node so it presents a fresh cluster incarnation.")));
+	return verdict == CLUSTER_JOIN_GATE_ALLOW;
+}
+
+
+UBA
+cluster_undo_record_alloc(uint8 record_type, const ClusterUndoRecordTarget *target,
+						  uint16 tt_slot_segment_id, uint16 tt_slot_offset, const void *payload,
+						  uint16 payload_len, UBA prev_uba)
+{
+	ClusterSemanticAdmissionToken modifier_token;
+	ClusterSemanticAdmissionResult admission;
+	UBA result = InvalidUba;
+
+	admission = cluster_semantic_activation_modifier_enter(
+		cluster_undo_record_writable_admission(), &modifier_token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot allocate undo: cluster reconfiguration in progress"),
+				 errhint("The write was refused before undo mutation; retry is safe.")));
+
+	PG_TRY();
+	{
+		if (!cluster_semantic_activation_modifier_recheck(
+				&modifier_token, cluster_undo_record_writable_admission()))
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("cannot allocate undo: cluster reconfiguration in progress"),
+					 errhint("The write was refused before undo mutation; retry is safe.")));
+		result = cluster_undo_record_alloc_body(record_type, target, tt_slot_segment_id,
+										   tt_slot_offset, payload, payload_len, prev_uba);
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&modifier_token);
+	}
+	PG_END_TRY();
+
+	return result;
+}
+
+
 /*
  * cluster_undo_get_record -- sanity reader, own-instance only at spec-3.7.
  */
@@ -1782,7 +1836,7 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	if (UndoRecordShared == NULL)
 		return 0;
 
-	if (!uba_decode(uba, &segment_id, &block_no, &tt_slot_offset, &row_offset))
+	if (!uba_decode_record(uba, &segment_id, &block_no, &tt_slot_offset, &row_offset))
 		return 0;
 
 	/* Map segment_id back to owner_instance.  Per spec-3.4b convention:
@@ -1836,11 +1890,12 @@ cluster_undo_get_record(UBA uba, void *out_buffer, size_t buffer_size)
 	if (blkhdr->magic != PGRAC_UNDO_BLOCK_MAGIC)
 		return 0;
 
-	if (row_offset >= blkhdr->slot_count)
+	if (!cluster_undo_record_slot_index_valid(blkhdr->slot_count, row_offset))
 		return 0;
 
 	slot = UNDO_SLOT_DIR_PTR(block_buf, row_offset);
-	if (slot->record_offset == 0 || slot->record_length == 0)
+	if (!cluster_undo_record_slot_range_valid(blkhdr->slot_count, row_offset,
+										 slot->record_offset, slot->record_length))
 		return 0;
 
 	if (buffer_size < slot->record_length)

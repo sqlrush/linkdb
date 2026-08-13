@@ -91,6 +91,14 @@ extern char *cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_n
 								  ClusterUndoBufMode mode, ClusterUndoBufPin *pin);
 
 /*
+ * Copy one already-resident DATA block without filling the pool.  This is the
+ * Spec 8.4 kind-4 origin boundary: a miss, an in-progress fill, block 0, or a
+ * disabled pool returns false without disk I/O and leaves dst unchanged.
+ */
+extern bool cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no,
+									   char dst[BLCKSZ]);
+
+/*
  * cluster_undo_buf_mark_dirty -- the EXCLUSIVE-pinned block was modified,
  *	protected by the XLOG_UNDO_BLOCK_WRITE at wal_lsn (D2).  In D1
  *	(writeback off) wal_lsn is InvalidXLogRecPtr and this performs the

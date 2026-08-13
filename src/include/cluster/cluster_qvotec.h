@@ -66,7 +66,8 @@
  *	      CollisionDetectionState)
  *	    - 512-byte ClusterVotingSlot disk-resident layout (with
  *	      generation counter + CRC32C for torn-write detection)
- *	    - 128-byte ClusterQvotecShmem (lease-protected quorum state)
+ *	    - 448-byte ClusterQvotecShmem (128-byte lease state plus the
+ *	      spec-5.15A §2.1A.4 320-byte local SPSC mailbox)
  *	    - 7 lifecycle / dump key accessors (per F11)
  *	    - cluster_qvotec_in_quorum() backend hot-path helper
  *	    - cluster_freeze_writes_set / _thaw_writes_set / _currently_frozen
@@ -140,6 +141,121 @@
  * matching the documented 1/3/5/7 recommendation.
  */
 #define CLUSTER_MAX_VOTING_DISKS 7
+
+/* spec-5.15A §2.1A.4 frozen local QVOTEC mailbox ABI. */
+#define CLUSTER_QVOTEC_SHMEM_PREFIX_BYTES 128
+#define CLUSTER_QVOTEC_MAILBOX_BYTES 320
+#define CLUSTER_QVOTEC_SHMEM_BYTES 448
+#define CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES 128
+#define CLUSTER_QVOTEC_BALLOT_BYTES 32
+#define CLUSTER_QVOTEC_CONFIGURED_DISK_MASK UINT8_C(0x7f)
+
+typedef enum ClusterQvotecMailboxOpcode {
+	CLUSTER_QVOTEC_MAILBOX_NONE = 0,
+	CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD = 1,
+	CLUSTER_QVOTEC_MAILBOX_PROPOSE_VALUE = 2
+} ClusterQvotecMailboxOpcode;
+
+typedef enum ClusterQvotecMailboxResult {
+	CLUSTER_QVOTEC_MAILBOX_RESULT_NONE = 0,
+	CLUSTER_QVOTEC_MAILBOX_CHOSEN = 1,
+	CLUSTER_QVOTEC_MAILBOX_ADOPTED_OTHER = 2,
+	CLUSTER_QVOTEC_MAILBOX_HOLD = 3
+} ClusterQvotecMailboxResult;
+
+typedef enum ClusterQvotecMailboxSubmitStatus {
+	CLUSTER_QVOTEC_MAILBOX_SUBMIT_INVALID = 0,
+	CLUSTER_QVOTEC_MAILBOX_SUBMIT_ACCEPTED = 1,
+	CLUSTER_QVOTEC_MAILBOX_SUBMIT_BUSY = 2,
+	CLUSTER_QVOTEC_MAILBOX_SUBMIT_HOLD = 3
+} ClusterQvotecMailboxSubmitStatus;
+
+typedef enum ClusterQvotecActorPhase {
+	CLUSTER_QVOTEC_ACTOR_IDLE = 0,
+	CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_A = 1,
+	CLUSTER_QVOTEC_ACTOR_RECOVER_FLUSH = 2,
+	CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B = 3,
+	CLUSTER_QVOTEC_ACTOR_P1_WRITE = 4,
+	CLUSTER_QVOTEC_ACTOR_P1_SCAN = 5,
+	CLUSTER_QVOTEC_ACTOR_P2_WRITE = 6,
+	CLUSTER_QVOTEC_ACTOR_P2_SCAN = 7,
+	CLUSTER_QVOTEC_ACTOR_SETTLE_WRITE = 8,
+	CLUSTER_QVOTEC_ACTOR_HOLD = 9
+} ClusterQvotecActorPhase;
+
+/*
+ * request_seq is the LMON-owned publication seqlock: stable values are even,
+ * and one request advances it odd -> payload -> prior even + 2.  QVOTEC owns
+ * every completion-side field and publishes completion_seq last.
+ */
+typedef struct ClusterQvotecMailbox {
+	pg_atomic_uint64 request_seq;
+	pg_atomic_uint64 completion_seq;
+	pg_atomic_uint32 request_opcode;
+	pg_atomic_uint32 completion_result;
+	uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES];
+	uint8 completion_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES];
+	uint8 completion_ballot[CLUSTER_QVOTEC_BALLOT_BYTES];
+	uint8 observed_disk_bitmap;
+	uint8 actor_phase;
+	uint16 detail;
+	uint8 reserved[4];
+} ClusterQvotecMailbox;
+
+typedef struct ClusterQvotecMailboxRequest {
+	uint64 request_seq;
+	ClusterQvotecMailboxOpcode opcode;
+	uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES];
+} ClusterQvotecMailboxRequest;
+
+/* Complete() accepts this caller-supplied actor result; it derives no quorum. */
+typedef struct ClusterQvotecMailboxCompletion {
+	uint64 request_seq;
+	ClusterQvotecMailboxResult result;
+	uint8 completion_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES];
+	uint8 completion_ballot[CLUSTER_QVOTEC_BALLOT_BYTES];
+	uint8 observed_disk_bitmap;
+	uint8 actor_phase;
+	uint16 detail;
+} ClusterQvotecMailboxCompletion;
+
+#ifdef USE_PGRAC_CLUSTER
+StaticAssertDecl(CLUSTER_QVOTEC_MAILBOX_NONE == 0
+					 && CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD == 1
+					 && CLUSTER_QVOTEC_MAILBOX_PROPOSE_VALUE == 2,
+				 "ClusterQvotecMailbox request opcode values are frozen");
+StaticAssertDecl(CLUSTER_QVOTEC_MAILBOX_RESULT_NONE == 0
+					 && CLUSTER_QVOTEC_MAILBOX_CHOSEN == 1
+					 && CLUSTER_QVOTEC_MAILBOX_ADOPTED_OTHER == 2
+					 && CLUSTER_QVOTEC_MAILBOX_HOLD == 3,
+				 "ClusterQvotecMailbox completion result values are frozen");
+StaticAssertDecl(CLUSTER_QVOTEC_ACTOR_IDLE == 0 && CLUSTER_QVOTEC_ACTOR_HOLD == 9,
+				 "ClusterQvotec actor phase endpoints are frozen");
+StaticAssertDecl(sizeof(ClusterQvotecMailbox) == CLUSTER_QVOTEC_MAILBOX_BYTES,
+				 "ClusterQvotecMailbox must be exactly 320 bytes");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, request_seq) == 0,
+				 "ClusterQvotecMailbox.request_seq offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, completion_seq) == 8,
+				 "ClusterQvotecMailbox.completion_seq offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, request_opcode) == 16,
+				 "ClusterQvotecMailbox.request_opcode offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, completion_result) == 20,
+				 "ClusterQvotecMailbox.completion_result offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, request_value) == 24,
+				 "ClusterQvotecMailbox.request_value offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, completion_value) == 152,
+				 "ClusterQvotecMailbox.completion_value offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, completion_ballot) == 280,
+				 "ClusterQvotecMailbox.completion_ballot offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, observed_disk_bitmap) == 312,
+				 "ClusterQvotecMailbox.observed_disk_bitmap offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, actor_phase) == 313,
+				 "ClusterQvotecMailbox.actor_phase offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, detail) == 314,
+				 "ClusterQvotecMailbox.detail offset");
+StaticAssertDecl(offsetof(ClusterQvotecMailbox, reserved) == 316,
+				 "ClusterQvotecMailbox.reserved offset");
+#endif
 
 
 /* ----------
@@ -276,11 +392,37 @@ StaticAssertDecl(offsetof(ClusterVotingSlot, crc32c) == 508,
  *
  *	Mirrors cluster_epoch / cluster_diag / cluster_cssd pattern;
  *	registered from cluster_shmem.c (D9).  ClusterQvotecShmem layout
- *	is private to cluster_qvotec.c (128-byte cache-line aligned).
+ *	is private to cluster_qvotec.c and exactly 448 bytes.
  * ---------- */
 extern Size cluster_qvotec_shmem_size(void);
 extern void cluster_qvotec_shmem_init(void);
 extern void cluster_qvotec_shmem_register(void);
+
+/*
+ * spec-5.15A §2.1A.4 local SPSC handoff.  LMON is the sole submit/poll-
+ * completion caller; QVOTEC is the sole poll-request/complete caller.  These
+ * helpers perform no disk I/O and never infer a chosen value or majority.
+ * restart_reset() must be called when either process starts; mailbox contents
+ * are volatile and carry no authority across a process restart.
+ */
+extern void cluster_qvotec_mailbox_restart_reset(ClusterQvotecMailbox *mailbox);
+extern ClusterQvotecMailboxSubmitStatus cluster_qvotec_mailbox_lmon_submit(
+	ClusterQvotecMailbox *mailbox, ClusterQvotecMailboxOpcode opcode,
+	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES], uint64 *request_seq_out);
+extern bool cluster_qvotec_mailbox_qvotec_poll(ClusterQvotecMailbox *mailbox,
+											ClusterQvotecMailboxRequest *request_out);
+extern bool cluster_qvotec_mailbox_qvotec_complete(
+	ClusterQvotecMailbox *mailbox, uint8 configured_disk_bitmap,
+	const ClusterQvotecMailboxCompletion *completion);
+extern bool cluster_qvotec_mailbox_lmon_poll_completion(
+	ClusterQvotecMailbox *mailbox, uint64 request_seq,
+	ClusterQvotecMailboxCompletion *completion_out);
+extern ClusterQvotecMailboxSubmitStatus cluster_qvotec_authority_lmon_submit(
+	ClusterQvotecMailboxOpcode opcode,
+	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
+	uint64 *request_seq_out);
+extern bool cluster_qvotec_authority_lmon_poll_completion(
+	uint64 request_seq, ClusterQvotecMailboxCompletion *completion_out);
 
 
 /* ----------
@@ -292,6 +434,7 @@ extern void cluster_qvotec_shmem_register(void);
  * ---------- */
 extern int cluster_qvotec_get_pid(void);
 extern const char *cluster_qvotec_get_status_name(void);
+extern int cluster_qvotec_get_status(void);
 extern const char *cluster_qvotec_get_quorum_state_name(void);
 
 /*

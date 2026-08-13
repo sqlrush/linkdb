@@ -61,6 +61,7 @@ OBJS = \
 	cluster_debug.o \
 	cluster_diag.o \
 	cluster_elog.o \
+	cluster_epoch_ballot.o \
 	cluster_epoch.o \
 	cluster_extend_gate.o \
 	cluster_fence.o \
@@ -82,6 +83,10 @@ OBJS = \
 	cluster_gcs_block_dedup.o \
 	cluster_gcs_block_shard.o \
 	cluster_reconfig.o \
+	cluster_replacement_episode.o \
+	cluster_replacement_request.o \
+	cluster_replacement_wire.o \
+	cluster_undo_root_descriptor.o \
 	cluster_recovery_plan.o \
 	cluster_recovery_worker.o \
 	cluster_recovery_merge.o \
@@ -234,6 +239,8 @@ OBJS = \
 	cluster_r4_observe.o \
 	cluster_subtrans.o \
 	cluster_multixact.o \
+	cluster_multixact_current.o \
+	cluster_multixact_current_wire.o \
 	cluster_multixact_served.o \
 	cluster_mxid_stripe.o \
 	cluster_visibility_inject.o \
@@ -259,6 +266,8 @@ OBJS = \
 	storage/cluster_smgr.o \
 	storage/cluster_undo_alloc.o \
 	storage/cluster_undo_block0.o \
+	storage/cluster_undo_block0_current.o \
+	storage/cluster_undo_block0_resident.o \
 	storage/cluster_undo_buf.o \
 	storage/cluster_undo_smgr.o \
 	storage/cluster_undo_xlog.o \

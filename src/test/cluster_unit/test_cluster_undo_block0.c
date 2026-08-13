@@ -21,9 +21,18 @@
  */
 #include "postgres.h"
 
+#include "access/xlog.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/storage/cluster_undo_block0.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "port/atomics.h"
 #include "port/pg_pthread.h"
+#include "storage/bufpage.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 
 #undef printf
 #undef fprintf
@@ -32,6 +41,298 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+/* Spec 8.4A P1 closed diagnostic/private-recovery read seam. */
+extern ClusterUndoBlock0Result cluster_undo_block0_copy_readonly(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0ResolvedRoot *read_root,
+	const ClusterUndoBlock0Generation *expected,
+	const ClusterUndoBlock0AuthorityProof *proof,
+	char private_page[BLCKSZ]);
+extern ClusterUndoBlock0Result cluster_undo_block0_provision_begin(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0ResolvedRoot *target_root,
+	const ClusterUndoBlock0AuthorityProof *proof,
+	ClusterUndoBlock0FrameToken *token,
+	ClusterUndoBlock0Pin *pin,
+	char **unpublished_page,
+	bool *creator);
+extern void cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin,
+	XLogRecPtr init_lsn);
+extern void cluster_undo_block0_provision_abort(ClusterUndoBlock0Pin *pin);
+
+/* storage/shmem.h exports checked arithmetic from the backend executable. */
+Size
+add_size(Size s1, Size s2)
+{
+	return s1 + s2;
+}
+
+Size
+mul_size(Size s1, Size s2)
+{
+	return s1 * s2;
+}
+
+/* Standalone shared-memory/content-lock harness for the real D1 object. */
+static void *block0_region = NULL;
+static Size block0_region_size = 0;
+static char smgr_image[BLCKSZ];
+static int smgr_read_calls = 0;
+static uint32 smgr_last_block = UINT32_MAX;
+static bool smgr_read_ok = true;
+static int smgr_write_calls = 0;
+static uint32 smgr_last_write_block = UINT32_MAX;
+static bool smgr_write_ok = true;
+static bool smgr_last_do_fsync = false;
+static char smgr_written_image[BLCKSZ];
+static int xlog_flush_calls = 0;
+static XLogRecPtr xlog_last_flush_lsn = InvalidXLogRecPtr;
+static int wal_io_order[8];
+static int wal_io_order_count = 0;
+static sigjmp_buf wal_error_jump;
+static bool wal_error_armed = false;
+static bool copy_during_fill = false;
+static bool abort_during_fill = false;
+static ClusterUndoBlock0Result copy_during_fill_result = CLUSTER_UNDO_BLOCK0_OK;
+static ClusterUndoBlock0LogicalKey fill_logical;
+static ClusterUndoBlock0ResolvedRoot fill_root;
+static ClusterUndoBlock0AuthorityProof fill_proof;
+static ResourceReleaseCallback resource_release_callback = NULL;
+static void *resource_release_arg = NULL;
+static int lwlock_acquire_calls = 0;
+static int lwlock_throw_on_call = 0;
+static ClusterUndoSmgrFinalState smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
+static ClusterUndoSmgrPublishResult smgr_publish_result
+	= CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED;
+static char smgr_probe_image[BLCKSZ];
+static int smgr_probe_calls = 0;
+static int smgr_temp_create_calls = 0;
+static int smgr_temp_publish_calls = 0;
+static int smgr_temp_cleanup_calls = 0;
+static bool smgr_temp_active = false;
+static ClusterR4PrerequisiteSnapshot r4_owner_snapshot = {
+	.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED,
+	.ready = false,
+	.reserved0 = {0, 0, 0},
+	.target_node_id = -1,
+};
+static bool r4_owner_publish_enabled = false;
+static bool r4_startup_fenced_owned = false;
+
+ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
+ResourceOwner CurTransactionResourceOwner = NULL;
+ResourceOwner TopTransactionResourceOwner = NULL;
+ResourceOwner AuxProcessResourceOwner = NULL;
+MemoryContext TopMemoryContext = (MemoryContext)(uintptr_t)1;
+
+/* Standalone substitute for the reconfiguration owner's lock co-sample. */
+ClusterR4PrerequisiteSnapshot
+cluster_reconfig_r4_prerequisite_snapshot(void)
+{
+	return r4_owner_snapshot;
+}
+
+bool
+cluster_reconfig_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected)
+{
+	return r4_owner_publish_enabled && expected != NULL
+		   && memcmp(expected, &r4_owner_snapshot, sizeof(*expected)) == 0;
+}
+
+bool
+cluster_undo_block0_current_startup_fenced_owned(void)
+{
+	return r4_startup_fenced_owned;
+}
+
+void *
+MemoryContextAlloc(MemoryContext context pg_attribute_unused(), Size size)
+{
+	return malloc(size);
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+void
+RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
+{
+	resource_release_callback = callback;
+	resource_release_arg = arg;
+}
+
+typedef struct TestClusterUndoBlock0Ctl {
+	LWLock frame_lock;
+	uint32 frame_count;
+	uint32 free_count;
+	uint8 reserved[104];
+} TestClusterUndoBlock0Ctl;
+
+StaticAssertDecl(sizeof(TestClusterUndoBlock0Ctl) == 128,
+				 "test block-zero control header must match the product layout");
+
+void
+LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
+{}
+
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	lwlock_acquire_calls++;
+	if (lwlock_throw_on_call > 0 && lwlock_acquire_calls == lwlock_throw_on_call) {
+		UT_ASSERT_NOT_NULL(PG_exception_stack);
+		siglongjmp(*PG_exception_stack, 1);
+	}
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{}
+
+bool
+cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
+							 uint32 segment_id pg_attribute_unused(),
+							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
+{
+	smgr_read_calls++;
+	smgr_last_block = block_no;
+	if (copy_during_fill) {
+		char private_page[BLCKSZ];
+
+		copy_during_fill = false;
+		copy_during_fill_result = cluster_undo_block0_copy_resident(
+			&fill_logical, &fill_root, NULL, &fill_proof, private_page, NULL);
+	}
+	if (abort_during_fill) {
+		abort_during_fill = false;
+		UT_ASSERT_NOT_NULL(resource_release_callback);
+		if (resource_release_callback != NULL)
+			resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									  resource_release_arg);
+		siglongjmp(wal_error_jump, 1);
+	}
+	if (!smgr_read_ok)
+		return false;
+	memcpy(buf, smgr_image, BLCKSZ);
+	return true;
+}
+
+bool
+cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused(),
+								  uint32 segment_id pg_attribute_unused(),
+								  uint8 owner_instance pg_attribute_unused(), uint32 block_no,
+								  const char *buf, bool do_fsync)
+{
+	smgr_write_calls++;
+	smgr_last_write_block = block_no;
+	smgr_last_do_fsync = do_fsync;
+	if (wal_io_order_count < (int)lengthof(wal_io_order))
+		wal_io_order[wal_io_order_count++] = 2;
+	if (buf != NULL)
+		memcpy(smgr_written_image, buf, BLCKSZ);
+	return smgr_write_ok;
+}
+
+ClusterUndoSmgrFinalState
+cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent pg_attribute_unused(),
+								uint32 segment_id pg_attribute_unused(),
+								uint8 owner_instance pg_attribute_unused(), char block0[BLCKSZ])
+{
+	smgr_probe_calls++;
+	if (smgr_probe_state == CLUSTER_UNDO_SMGR_FINAL_EXACT)
+		memcpy(block0, smgr_probe_image, BLCKSZ);
+	return smgr_probe_state;
+}
+
+bool
+cluster_undo_smgr_provision_temp_create(ClusterUndoPathIntent intent pg_attribute_unused(),
+										uint32 segment_id pg_attribute_unused(),
+										uint8 owner_instance pg_attribute_unused(),
+										char temp_path[MAXPGPATH])
+{
+	smgr_temp_create_calls++;
+	strlcpy(temp_path, "/tmp/pgrac-b0-test-temp", MAXPGPATH);
+	smgr_temp_active = true;
+	return true;
+}
+
+ClusterUndoSmgrPublishResult
+cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent pg_attribute_unused(),
+										 uint32 segment_id pg_attribute_unused(),
+										 uint8 owner_instance pg_attribute_unused(),
+										 const char *temp_path pg_attribute_unused(),
+										 const char block0[BLCKSZ] pg_attribute_unused())
+{
+	smgr_temp_publish_calls++;
+	if (smgr_publish_result != CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR)
+		smgr_temp_active = false;
+	if (smgr_publish_result == CLUSTER_UNDO_SMGR_PUBLISH_EXISTS)
+		smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
+	return smgr_publish_result;
+}
+
+bool
+cluster_undo_smgr_provision_temp_cleanup(ClusterUndoPathIntent intent pg_attribute_unused(),
+										 uint32 segment_id pg_attribute_unused(),
+										 uint8 owner_instance pg_attribute_unused(),
+										 const char *temp_path pg_attribute_unused())
+{
+	smgr_temp_cleanup_calls++;
+	smgr_temp_active = false;
+	return true;
+}
+
+void
+XLogFlush(XLogRecPtr record)
+{
+	xlog_flush_calls++;
+	xlog_last_flush_lsn = record;
+	if (wal_io_order_count < (int)lengthof(wal_io_order))
+		wal_io_order[wal_io_order_count++] = 1;
+}
+
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	return elevel >= ERROR;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	if (wal_error_armed)
+		siglongjmp(wal_error_jump, 1);
+	abort();
+}
 
 void
 ExceptionalCondition(const char *condition_name pg_attribute_unused(),
@@ -72,15 +373,103 @@ make_generation(bool known, uint32 value)
 	return generation;
 }
 
+static ClusterUndoBlock0AuthorityProof
+make_live_proof(uint8 owner_instance, uint64 cluster_epoch)
+{
+	ClusterUndoBlock0AuthorityProof proof;
+
+	memset(&proof, 0, sizeof(proof));
+	proof.kind = CLUSTER_UNDO_BLOCK0_LIVE_OWNER;
+	proof.owner_instance = owner_instance;
+	proof.cluster_epoch_present = true;
+	proof.cluster_epoch = cluster_epoch;
+	return proof;
+}
+
+static ClusterUndoBlock0AuthorityProof
+make_recovery_proof(uint8 owner_instance, uint64 cluster_epoch, uint64 recovery_generation)
+{
+	ClusterUndoBlock0AuthorityProof proof;
+
+	memset(&proof, 0, sizeof(proof));
+	proof.kind = CLUSTER_UNDO_BLOCK0_RECOVERY_OWNER;
+	proof.owner_instance = owner_instance;
+	proof.cluster_epoch_present = true;
+	proof.cluster_epoch = cluster_epoch;
+	proof.recovery_generation = recovery_generation;
+	return proof;
+}
+
+static void
+make_valid_block0(uint32 segment_id, uint8 owner_instance, uint32 generation, uint8 marker)
+{
+	PageHeader ph;
+	UndoSegmentHeaderData *hdr;
+
+	memset(smgr_image, marker, sizeof(smgr_image));
+	ph = (PageHeader)smgr_image;
+	hdr = (UndoSegmentHeaderData *)smgr_image;
+	ph->pd_flags = PD_UNDO_SEG_HEADER;
+	ph->pd_lower = SizeOfPageHeaderData;
+	ph->pd_upper = BLCKSZ;
+	ph->pd_special = BLCKSZ;
+	PageSetPageSizeAndVersion((Page)smgr_image, BLCKSZ, PG_PAGE_LAYOUT_VERSION);
+	hdr->segment_id = segment_id;
+	hdr->segment_size_bytes = UNDO_SEGMENT_SIZE_BYTES;
+	hdr->segment_state = SEGMENT_ACTIVE;
+	hdr->owner_instance = owner_instance;
+	hdr->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	hdr->wrap_count = generation;
+}
+
+static void
+fresh_block0_region(uint32 frame_count)
+{
+	if (block0_region != NULL)
+		free(block0_region);
+	block0_region_size = cluster_undo_block0_shmem_size(frame_count);
+	block0_region = malloc(block0_region_size);
+	UT_ASSERT_NOT_NULL(block0_region);
+	memset(block0_region, 0xa5, block0_region_size);
+	cluster_undo_block0_shmem_init_region(block0_region, block0_region_size, frame_count, false);
+	smgr_read_calls = 0;
+	smgr_last_block = UINT32_MAX;
+	smgr_read_ok = true;
+	smgr_write_calls = 0;
+	smgr_last_write_block = UINT32_MAX;
+	smgr_write_ok = true;
+	smgr_last_do_fsync = false;
+	memset(smgr_written_image, 0, sizeof(smgr_written_image));
+	xlog_flush_calls = 0;
+	xlog_last_flush_lsn = InvalidXLogRecPtr;
+	memset(wal_io_order, 0, sizeof(wal_io_order));
+	wal_io_order_count = 0;
+	wal_error_armed = false;
+	copy_during_fill = false;
+	abort_during_fill = false;
+	copy_during_fill_result = CLUSTER_UNDO_BLOCK0_OK;
+	lwlock_acquire_calls = 0;
+	lwlock_throw_on_call = 0;
+	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
+	smgr_publish_result = CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED;
+	memcpy(smgr_probe_image, smgr_image, BLCKSZ);
+	smgr_probe_calls = 0;
+	smgr_temp_create_calls = 0;
+	smgr_temp_publish_calls = 0;
+	smgr_temp_cleanup_calls = 0;
+	smgr_temp_active = false;
+}
+
 static bool
 r4_prerequisite_snapshot_is_fixed_false(const ClusterR4PrerequisiteSnapshot *snapshot)
 {
-	static const uint8 expected[8] = {0};
-
 	return snapshot != NULL && snapshot->status == CLUSTER_R4_PREREQUISITE_RF_DEFERRED
-		   && !snapshot->ready && snapshot->reserved[0] == 0 && snapshot->reserved[1] == 0
-		   && snapshot->reserved[2] == 0
-		   && memcmp(snapshot, expected, sizeof(expected)) == 0;
+		   && !snapshot->ready && snapshot->reserved0[0] == 0 && snapshot->reserved0[1] == 0
+		   && snapshot->reserved0[2] == 0 && snapshot->target_node_id == -1
+		   && snapshot->episode_state_generation == 0 && snapshot->jcmk_generation == 0
+		   && snapshot->request_nonce == 0 && snapshot->old_admitted_incarnation == 0
+		   && snapshot->fresh_incarnation == 0 && snapshot->committed_epoch == 0
+		   && snapshot->grammar_fingerprint == 0;
 }
 
 #define R4_PREREQUISITE_THREAD_COUNT 8
@@ -262,12 +651,1152 @@ UT_TEST(test_block0_slot_state_rejects_direct_publish_and_double_publish)
 															CLUSTER_UNDO_BLOCK0_SLOT_EMPTY));
 }
 
+UT_TEST(test_block0_checked_size_matches_frozen_default_increment)
+{
+	UT_ASSERT_EQ(cluster_undo_block0_shmem_size(2048), (Size)20979840);
+	UT_ASSERT_EQ(cluster_undo_block0_shmem_size(0), (Size)0);
+}
+
+UT_TEST(test_block0_attach_mismatch_detaches_fail_closed)
+{
+	ClusterUndoBlock0FrameToken token;
+	Size one_frame_size = cluster_undo_block0_shmem_size(1);
+
+	fresh_block0_region(2);
+	token.frame_index = 0;
+	token.owned = true;
+	UT_ASSERT(!cluster_undo_block0_shmem_init_region(block0_region, one_frame_size, 1, true));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+	UT_ASSERT(!token.owned);
+	UT_ASSERT_EQ(token.frame_index, UINT32_MAX);
+}
+
+UT_TEST(test_block0_attach_rejects_impossible_free_count)
+{
+	ClusterUndoBlock0FrameToken token;
+	TestClusterUndoBlock0Ctl *ctl;
+
+	fresh_block0_region(1);
+	ctl = (TestClusterUndoBlock0Ctl *)block0_region;
+	ctl->free_count = ctl->frame_count + 1;
+	token.frame_index = 0;
+	token.owned = true;
+	UT_ASSERT(!cluster_undo_block0_shmem_init_region(
+				 block0_region, block0_region_size, 1, true));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+	UT_ASSERT(!token.owned);
+	UT_ASSERT_EQ(token.frame_index, UINT32_MAX);
+}
+
+UT_TEST(test_block0_frame_bank_is_sparse_and_all_or_none)
+{
+	ClusterUndoBlock0FrameToken tokens[2];
+	ClusterUndoBlock0FrameToken retry;
+
+	fresh_block0_region(2);
+	memset(tokens, 0, sizeof(tokens));
+	memset(&retry, 0, sizeof(retry));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(2, tokens), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(tokens[0].owned);
+	UT_ASSERT(tokens[1].owned);
+	UT_ASSERT(tokens[0].frame_index != tokens[1].frame_index);
+	retry.frame_index = tokens[0].frame_index;
+	retry.owned = true;
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
+				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+	UT_ASSERT(!retry.owned);
+	UT_ASSERT_EQ(retry.frame_index, UINT32_MAX);
+
+	cluster_undo_block0_frame_release(&tokens[0]);
+	UT_ASSERT(!tokens[0].owned);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(retry.owned);
+	cluster_undo_block0_frame_release(&retry);
+	cluster_undo_block0_frame_release(&tokens[1]);
+}
+
+UT_TEST(test_block0_runtime_admission_preserves_generation_zero_and_exact_identity)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x1111), 7);
+	ClusterUndoBlock0ResolvedRoot read_only_root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0, UINT64CONST(0x1111), 7);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 0);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0Generation expected_zero = make_generation(true, 0);
+	ClusterUndoBlock0Generation observed = make_generation(false, 99);
+	ClusterUndoBlock0Generation sampled = make_generation(false, 88);
+	char copied[BLCKSZ];
+	char *page = NULL;
+	uint32 admitted_frame;
+
+	fresh_block0_region(2);
+	make_valid_block0(1, 1, 0, 0x4d);
+	memset(&token, 0, sizeof(token));
+	memset(&pin, 0, sizeof(pin));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	admitted_frame = token.frame_index;
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &read_only_root, &proof, &token, &pin,
+											&page), CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT(token.owned);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(!token.owned);
+	UT_ASSERT_NOT_NULL(page);
+	UT_ASSERT(pin.observed_generation.known);
+	UT_ASSERT_EQ(pin.observed_generation.value, 0);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	UT_ASSERT_EQ(smgr_last_block, 0);
+	cluster_undo_block0_unpin(&pin);
+
+	smgr_read_calls = 0;
+	UT_ASSERT_EQ(cluster_undo_block0_sample_resident_generation(&logical, &root, &proof, &sampled),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(sampled.known);
+	UT_ASSERT_EQ(sampled.value, 0);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+	memset(copied, 0xa5, sizeof(copied));
+	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &root, &expected_zero, &proof, copied,
+											&observed), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(observed.known);
+	UT_ASSERT_EQ(observed.value, 0);
+	UT_ASSERT_EQ((int)(unsigned char)copied[BLCKSZ - 1], 0x4d);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(token.frame_index != admitted_frame);
+	cluster_undo_block0_frame_release(&token);
+}
+
+UT_TEST(test_block0_runtime_admission_rejects_exhausted_generation)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x1122), 8);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 1);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, UINT32_MAX, 0x5e);
+	memset(&token, 0, sizeof(token));
+	memset(&pin, 0, sizeof(pin));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
+	UT_ASSERT(token.owned);
+	UT_ASSERT_NULL(page);
+	UT_ASSERT_EQ(pin.slot, -1);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	cluster_undo_block0_frame_release(&token);
+}
+
+UT_TEST(test_block0_copy_readonly_is_recovery_only_and_generation_exact)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x1180), 3);
+	ClusterUndoBlock0AuthorityProof recovery = make_recovery_proof(1, 7, 4);
+	ClusterUndoBlock0AuthorityProof live = make_live_proof(1, 7);
+	ClusterUndoBlock0Generation zero = make_generation(true, 0);
+	ClusterUndoBlock0Generation wrong = make_generation(true, 1);
+	char copied[BLCKSZ];
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 0, 0x60);
+	memset(copied, 0xa5, sizeof(copied));
+	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(
+				 &logical, &root, &zero, &recovery, copied),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	UT_ASSERT_EQ((int)(unsigned char)copied[BLCKSZ - 1], 0x60);
+
+	smgr_read_calls = 0;
+	memset(copied, 0xa5, sizeof(copied));
+	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(
+				 &logical, &root, &zero, &live, copied),
+				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
+
+	memset(copied, 0xa5, sizeof(copied));
+	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(
+				 &logical, &root, &wrong, &recovery, copied),
+				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
+}
+
+UT_TEST(test_block0_resident_copy_rejects_empty_generation_and_root_drift_without_io)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0LogicalKey absent = make_key(1, 2);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x2222), 3);
+	ClusterUndoBlock0ResolvedRoot drifted_root = root;
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 9);
+	ClusterUndoBlock0AuthorityProof drifted_proof = proof;
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0Generation wrong_generation = make_generation(true, 1);
+	ClusterUndoBlock0Pin reserved_pin;
+	char copied[BLCKSZ];
+	char *page = NULL;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 0, 0x61);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_unpin(&pin);
+	smgr_read_calls = 0;
+	memset(&reserved_pin, 0, sizeof(reserved_pin));
+	UT_ASSERT_EQ(cluster_undo_block0_reserve(&logical, &root, &proof, &reserved_pin),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_lock_content(&reserved_pin, &wrong_generation,
+											  CLUSTER_UNDO_BLOCK0_SHARED, &page),
+				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
+	UT_ASSERT_EQ(reserved_pin.slot, -1);
+	UT_ASSERT_NULL(page);
+
+	memset(copied, 0xa5, sizeof(copied));
+	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &root, &wrong_generation, &proof,
+											copied, NULL),
+				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
+	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
+
+	drifted_root.root_generation++;
+	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &drifted_root, NULL, &proof, copied,
+											NULL), CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
+
+	drifted_proof.cluster_epoch++;
+	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &root, NULL, &drifted_proof, copied,
+											NULL), CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
+
+	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&absent, &root, NULL, &proof, copied, NULL),
+				 CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+}
+
+UT_TEST(test_block0_pin_error_drops_reservation_before_rethrow)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x2290), 3);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 9);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0ResidentCensusItem item;
+	ClusterUndoBlock0Generation expected = make_generation(true, 0);
+	char *page = NULL;
+	volatile bool caught = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 0, 0x62);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	memset(&item, 0, sizeof(item));
+	item.logical = logical;
+	item.resolved_root = root;
+	item.generation = pin.observed_generation;
+	item.proof = proof;
+	cluster_undo_block0_unpin(&pin);
+
+	lwlock_acquire_calls = 0;
+	lwlock_throw_on_call = 2; /* reserve succeeds; content-X acquire throws */
+	PG_TRY();
+	{
+		(void)cluster_undo_block0_pin(&logical, &root, &expected,
+			CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		lwlock_throw_on_call = 0;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(pin.slot, -1);
+	UT_ASSERT(cluster_undo_block0_verify_clean_census(&item, 1));
+}
+
+UT_TEST(test_block0_filling_is_not_a_positive_resident_copy)
+{
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+
+	fresh_block0_region(1);
+	fill_logical = make_key(1, 1);
+	fill_root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3333), 1);
+	fill_proof = make_live_proof(1, 2);
+	make_valid_block0(1, 1, 0, 0x72);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	copy_during_fill = true;
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&fill_logical, &fill_root, &fill_proof, &token,
+											&pin, &page), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(copy_during_fill_result, CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_runtime_fill_abort_releases_slot_and_frame_via_resource_owner)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3380), 1);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 2);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0FrameToken retry;
+	ClusterUndoBlock0FrameToken extra;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+	bool caught = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 0, 0x73);
+	memset(&token, 0, sizeof(token));
+	memset(&retry, 0, sizeof(retry));
+	memset(&extra, 0, sizeof(extra));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	abort_during_fill = true;
+	if (sigsetjmp(wal_error_jump, 1) == 0)
+		(void)cluster_undo_block0_admit_runtime(
+			&logical, &root, &proof, &token, &pin, &page);
+	else
+		caught = true;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(retry.owned);
+	cluster_undo_block0_frame_release(&token);
+	UT_ASSERT(!token.owned);
+	UT_ASSERT_EQ(token.frame_index, UINT32_MAX);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &extra),
+				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+	cluster_undo_block0_frame_release(&retry);
+}
+
+UT_TEST(test_block0_resource_owner_cleanup_is_balanced_with_normal_release)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3390), 1);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 2);
+	ClusterUndoBlock0ResidentCensusItem item;
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0FrameToken retry;
+	ClusterUndoBlock0FrameToken extra;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 0, 0x74);
+	memset(&token, 0, sizeof(token));
+	memset(&retry, 0, sizeof(retry));
+	memset(&extra, 0, sizeof(extra));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	memset(&item, 0, sizeof(item));
+	item.logical = logical;
+	item.resolved_root = root;
+	item.generation = pin.observed_generation;
+	item.proof = proof;
+	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+								  resource_release_arg);
+	UT_ASSERT(cluster_undo_block0_verify_clean_census(&item, 1));
+
+	/* The admitted frame stays bound.  No stale tracker may return it. */
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
+				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+
+	/* Normal release removes its tracker, so a later owner callback cannot
+	 * duplicate the free-stack entry. */
+	fresh_block0_region(1);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_frame_release(&retry);
+	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+								  resource_release_arg);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &extra),
+				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+	cluster_undo_block0_frame_release(&retry);
+}
+
+UT_TEST(test_block0_provision_existing_exact_loads_without_temp_or_write)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3400), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 3);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+	bool creator = true;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 4, 0x75);
+	memcpy(smgr_probe_image, smgr_image, BLCKSZ);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
+				 &logical, &root, &proof, &token, &pin, &page, &creator),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(!creator);
+	UT_ASSERT_EQ(smgr_probe_calls, 1);
+	UT_ASSERT_EQ(smgr_temp_create_calls, 0);
+	UT_ASSERT_EQ(smgr_write_calls, 0);
+	UT_ASSERT_EQ((unsigned char)page[BLCKSZ - 1],
+				 (unsigned char)smgr_image[BLCKSZ - 1]);
+	UT_ASSERT(pin.observed_generation.known);
+	UT_ASSERT_EQ(pin.observed_generation.value, 4);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_provision_rejects_non_live_authority_before_io)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3408), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 3, 1);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0Result result;
+	char *page = NULL;
+	bool creator = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 4, 0x75);
+	memcpy(smgr_probe_image, smgr_image, BLCKSZ);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	result = cluster_undo_block0_provision_begin(
+		&logical, &root, &proof, &token, &pin, &page, &creator);
+	UT_ASSERT_EQ(result, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(smgr_probe_calls, 0);
+	UT_ASSERT_EQ(smgr_temp_create_calls, 0);
+	UT_ASSERT_NULL(page);
+	UT_ASSERT(!creator);
+	if (result == CLUSTER_UNDO_BLOCK0_OK)
+		cluster_undo_block0_unpin(&pin);
+	else
+		cluster_undo_block0_frame_release(&token);
+}
+
+UT_TEST(test_block0_provision_rejects_unknown_probe_state_without_consuming_frame)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x340c), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 3);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+	bool creator = false;
+
+	fresh_block0_region(1);
+	smgr_probe_state = (ClusterUndoSmgrFinalState)99;
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
+				 &logical, &root, &proof, &token, &pin, &page, &creator),
+				 CLUSTER_UNDO_BLOCK0_IO_ERROR);
+	UT_ASSERT_EQ(smgr_probe_calls, 1);
+	UT_ASSERT_EQ(smgr_temp_create_calls, 0);
+	UT_ASSERT(token.owned);
+	UT_ASSERT_NULL(page);
+	UT_ASSERT(!creator);
+	cluster_undo_block0_frame_release(&token);
+}
+
+UT_TEST(test_block0_provision_absent_creator_publishes_after_wal_flush)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3410), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 3);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+	bool creator = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 5, 0x76);
+	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_ABSENT;
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
+				 &logical, &root, &proof, &token, &pin, &page, &creator),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(creator);
+	UT_ASSERT(smgr_temp_active);
+	UT_ASSERT_EQ(smgr_temp_create_calls, 1);
+	memcpy(page, smgr_image, BLCKSZ);
+	cluster_undo_block0_provision_publish(&pin, (XLogRecPtr)UINT64CONST(0x120));
+	UT_ASSERT_EQ(xlog_flush_calls, 1);
+	UT_ASSERT_EQ(xlog_last_flush_lsn, (XLogRecPtr)UINT64CONST(0x120));
+	UT_ASSERT_EQ(smgr_temp_publish_calls, 1);
+	UT_ASSERT(!smgr_temp_active);
+	UT_ASSERT(pin.observed_generation.known);
+	UT_ASSERT_EQ(pin.observed_generation.value, 5);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_provision_eexist_loser_installs_exact_winner_image)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3420), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 3);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char winner[BLCKSZ];
+	char *page = NULL;
+	bool creator = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 6, 0x77);
+	memcpy(winner, smgr_image, BLCKSZ);
+	winner[BLCKSZ - 1] = (char)0xc7;
+	memcpy(smgr_probe_image, winner, BLCKSZ);
+	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_ABSENT;
+	smgr_publish_result = CLUSTER_UNDO_SMGR_PUBLISH_EXISTS;
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
+				 &logical, &root, &proof, &token, &pin, &page, &creator),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(creator);
+	memcpy(page, smgr_image, BLCKSZ);
+	page[BLCKSZ - 1] = (char)0xd7;
+	cluster_undo_block0_provision_publish(&pin, (XLogRecPtr)UINT64CONST(0x130));
+	UT_ASSERT_EQ((unsigned char)page[BLCKSZ - 1], 0xc7);
+	UT_ASSERT_EQ(smgr_probe_calls, 2);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_provision_abort_cleans_temp_and_returns_frame)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3430), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 3);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0FrameToken retry;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+	bool creator = false;
+
+	fresh_block0_region(1);
+	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_ABSENT;
+	memset(&token, 0, sizeof(token));
+	memset(&retry, 0, sizeof(retry));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
+				 &logical, &root, &proof, &token, &pin, &page, &creator),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(creator);
+	cluster_undo_block0_provision_abort(&pin);
+	UT_ASSERT_EQ(pin.slot, -1);
+	UT_ASSERT_EQ(smgr_temp_cleanup_calls, 1);
+	UT_ASSERT(!smgr_temp_active);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_frame_release(&retry);
+}
+
+UT_TEST(test_block0_provision_publish_error_resource_owner_cleans_exact_temp)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x3440), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 3);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0FrameToken retry;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+	bool creator = false;
+	bool caught = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 7, 0x78);
+	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_ABSENT;
+	smgr_publish_result = CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
+	memset(&token, 0, sizeof(token));
+	memset(&retry, 0, sizeof(retry));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
+				 &logical, &root, &proof, &token, &pin, &page, &creator),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(creator);
+	memcpy(page, smgr_image, BLCKSZ);
+
+	wal_error_armed = true;
+	if (sigsetjmp(wal_error_jump, 1) == 0)
+		cluster_undo_block0_provision_publish(&pin,
+			(XLogRecPtr)UINT64CONST(0x140));
+	else
+		caught = true;
+	wal_error_armed = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(smgr_temp_active);
+	UT_ASSERT_NOT_NULL(resource_release_callback);
+	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+								  resource_release_arg);
+	UT_ASSERT_EQ(smgr_temp_cleanup_calls, 1);
+	UT_ASSERT(!smgr_temp_active);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_frame_release(&retry);
+}
+
+UT_TEST(test_block0_recovery_private_begin_reads_without_allocating_a_frame)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x4400), 6);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 11, 4);
+	ClusterUndoBlock0FrameToken only_frame;
+	ClusterUndoBlock0RecoveryGuard guard;
+	char private_page[BLCKSZ];
+	bool exists = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 3, 0x84);
+	memset(&only_frame, 0, sizeof(only_frame));
+	memset(&guard, 0xa5, sizeof(guard));
+	memset(private_page, 0, sizeof(private_page));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &only_frame),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
+				 &logical, &root, &proof, false, &guard, private_page, &exists),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(exists);
+	UT_ASSERT(guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, 0);
+	UT_ASSERT_EQ((int)(unsigned char)private_page[BLCKSZ - 1], 0x84);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	UT_ASSERT_EQ(smgr_last_block, 0);
+	UT_ASSERT(only_frame.owned);
+
+	cluster_undo_block0_recovery_private_abort(&guard);
+	UT_ASSERT(!guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, -1);
+	cluster_undo_block0_frame_release(&only_frame);
+}
+
+UT_TEST(test_block0_recovery_private_begin_rejects_live_authority_before_io)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x4500), 1);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 13);
+	ClusterUndoBlock0RecoveryGuard guard;
+	char private_page[BLCKSZ];
+	bool exists = true;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 0, 0x45);
+	memset(&guard, 0xa5, sizeof(guard));
+	memset(private_page, 0x5a, sizeof(private_page));
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
+				 &logical, &root, &proof, false, &guard, private_page, &exists),
+				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT(!exists);
+	UT_ASSERT(!guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, -1);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+	UT_ASSERT_EQ((int)(unsigned char)private_page[0], 0x5a);
+}
+
+UT_TEST(test_block0_recovery_private_bad_identity_does_not_publish_disk_bytes)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x4580), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 13, 5);
+	ClusterUndoBlock0RecoveryGuard guard;
+	char private_page[BLCKSZ];
+	bool exists = true;
+
+	fresh_block0_region(1);
+	make_valid_block0(2, 1, 0, 0x58);
+	memset(&guard, 0xa5, sizeof(guard));
+	memset(private_page, 0x6c, sizeof(private_page));
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
+				 &logical, &root, &proof, false, &guard, private_page, &exists),
+				 CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+	UT_ASSERT(!exists);
+	UT_ASSERT(!guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, -1);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	UT_ASSERT_EQ((int)(unsigned char)private_page[0], 0x6c);
+	UT_ASSERT_EQ((int)(unsigned char)private_page[BLCKSZ - 1], 0x6c);
+}
+
+UT_TEST(test_block0_recovery_private_absence_stays_fail_closed_without_typed_smgr_result)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x4600), 2);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 14, 5);
+	ClusterUndoBlock0RecoveryGuard guard;
+	char private_page[BLCKSZ];
+	bool exists = true;
+
+	fresh_block0_region(1);
+	smgr_read_ok = false;
+	memset(&guard, 0xa5, sizeof(guard));
+	memset(private_page, 0x6b, sizeof(private_page));
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
+				 &logical, &root, &proof, true, &guard, private_page, &exists),
+				 CLUSTER_UNDO_BLOCK0_IO_ERROR);
+	UT_ASSERT(!exists);
+	UT_ASSERT(!guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, -1);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+	UT_ASSERT_EQ((int)(unsigned char)private_page[0], 0x6b);
+}
+
+UT_TEST(test_block0_recovery_private_finish_writes_fsyncs_and_releases_without_residency)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x4680), 3);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 15, 6);
+	ClusterUndoBlock0RecoveryGuard guard;
+	ClusterUndoBlock0FrameToken frame;
+	char private_page[BLCKSZ];
+	bool exists = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 6, 0x68);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
+				 &logical, &root, &proof, false, &guard, private_page, &exists),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	private_page[BLCKSZ - 1] = (char)0xa8;
+	cluster_undo_block0_recovery_private_finish(
+		&guard, private_page, (XLogRecPtr)UINT64CONST(0xb0), true, false);
+
+	UT_ASSERT_EQ(smgr_write_calls, 1);
+	UT_ASSERT_EQ(smgr_last_write_block, 0);
+	UT_ASSERT(smgr_last_do_fsync);
+	UT_ASSERT_EQ((int)(unsigned char)smgr_written_image[BLCKSZ - 1], 0xa8);
+	UT_ASSERT_EQ(xlog_flush_calls, 0);
+	UT_ASSERT(!guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, -1);
+	memset(&frame, 0, sizeof(frame));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &frame),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_frame_release(&frame);
+}
+
+UT_TEST(test_block0_recovery_private_finish_validated_noop_has_zero_io)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x4690), 4);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 16, 7);
+	ClusterUndoBlock0RecoveryGuard guard;
+	char private_page[BLCKSZ];
+	bool exists = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 7, 0x69);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
+				 &logical, &root, &proof, false, &guard, private_page, &exists),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_recovery_private_finish(
+		&guard, NULL, (XLogRecPtr)UINT64CONST(0xc0), false, true);
+	UT_ASSERT_EQ(smgr_write_calls, 0);
+	UT_ASSERT_EQ(xlog_flush_calls, 0);
+	UT_ASSERT(!guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, -1);
+}
+
+UT_TEST(test_block0_recovery_private_finish_write_failure_panics_with_guard_unpublished)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x46a0), 5);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 17, 8);
+	ClusterUndoBlock0RecoveryGuard guard;
+	char private_page[BLCKSZ];
+	bool exists = false;
+	bool caught = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 8, 0x6a);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
+				 &logical, &root, &proof, false, &guard, private_page, &exists),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	private_page[BLCKSZ - 1] = (char)0xaa;
+	smgr_write_ok = false;
+	wal_error_armed = true;
+	if (sigsetjmp(wal_error_jump, 1) == 0)
+		cluster_undo_block0_recovery_private_finish(
+			&guard, private_page, (XLogRecPtr)UINT64CONST(0xd0), true, false);
+	else
+		caught = true;
+	wal_error_armed = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(smgr_write_calls, 1);
+	UT_ASSERT(smgr_last_do_fsync);
+	UT_ASSERT(guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, 0);
+	cluster_undo_block0_recovery_private_abort(&guard);
+}
+
+UT_TEST(test_block0_recovery_private_parent_fsync_gap_panics_before_write)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x46b0), 6);
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 18, 9);
+	ClusterUndoBlock0RecoveryGuard guard;
+	char private_page[BLCKSZ];
+	bool exists = false;
+	bool caught = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 9, 0x6b);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
+				 &logical, &root, &proof, false, &guard, private_page, &exists),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	wal_error_armed = true;
+	if (sigsetjmp(wal_error_jump, 1) == 0)
+		cluster_undo_block0_recovery_private_finish(
+			&guard, private_page, (XLogRecPtr)UINT64CONST(0xe0), true, true);
+	else
+		caught = true;
+	wal_error_armed = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(smgr_write_calls, 0);
+	UT_ASSERT(guard.content_x_held);
+	UT_ASSERT_EQ(guard.slot, 0);
+	cluster_undo_block0_recovery_private_abort(&guard);
+}
+
+UT_TEST(test_block0_wal_dirty_uses_monotone_lsn_and_flushes_before_durable_data)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x4700), 3);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 15);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char successor[BLCKSZ];
+	char *page = NULL;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 2, 0x47);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	memcpy(successor, page, sizeof(successor));
+	successor[BLCKSZ - 1] = (char)0x94;
+
+	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0x80));
+	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0x70));
+	cluster_undo_block0_flush_sync(&pin, successor,
+							   (XLogRecPtr)UINT64CONST(0x75), false);
+
+	UT_ASSERT_EQ(xlog_flush_calls, 1);
+	UT_ASSERT_EQ(xlog_last_flush_lsn, (XLogRecPtr)UINT64CONST(0x80));
+	UT_ASSERT_EQ(smgr_write_calls, 1);
+	UT_ASSERT_EQ(smgr_last_write_block, 0);
+	UT_ASSERT(smgr_last_do_fsync);
+	UT_ASSERT_EQ(wal_io_order_count, 2);
+	UT_ASSERT_EQ(wal_io_order[0], 1);
+	UT_ASSERT_EQ(wal_io_order[1], 2);
+	UT_ASSERT_EQ((int)(unsigned char)smgr_written_image[BLCKSZ - 1], 0x94);
+	UT_ASSERT_EQ((int)(unsigned char)page[BLCKSZ - 1], 0x94);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_flush_publishes_successor_generation)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x4750), 3);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 15);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0Generation old_generation = make_generation(true, 2);
+	ClusterUndoBlock0Generation new_generation = make_generation(true, 3);
+	ClusterUndoBlock0Generation sampled = make_generation(false, 99);
+	char successor[BLCKSZ];
+	char copied[BLCKSZ];
+	char *page = NULL;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 2, 0x47);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	memcpy(successor, page, sizeof(successor));
+	((UndoSegmentHeaderData *)successor)->wrap_count = 3;
+	cluster_undo_block0_flush_sync(&pin, successor,
+								   InvalidXLogRecPtr, false);
+	UT_ASSERT(pin.observed_generation.known);
+	UT_ASSERT_EQ(pin.observed_generation.value, 3);
+	cluster_undo_block0_unpin(&pin);
+
+	UT_ASSERT_EQ(cluster_undo_block0_sample_resident_generation(
+				 &logical, &root, &proof, &sampled), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(sampled.known);
+	UT_ASSERT_EQ(sampled.value, 3);
+	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(
+				 &logical, &root, &old_generation, &proof, copied, NULL),
+				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
+	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(
+				 &logical, &root, &new_generation, &proof, copied, NULL),
+				 CLUSTER_UNDO_BLOCK0_OK);
+}
+
+UT_TEST(test_block0_flush_failure_preserves_resident_predecessor_and_dirty_lsn)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x4800), 4);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 16);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char successor[BLCKSZ];
+	char *page = NULL;
+	bool caught = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 4, 0x48);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	memcpy(successor, page, sizeof(successor));
+	successor[BLCKSZ - 1] = (char)0x98;
+	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0x90));
+	smgr_write_ok = false;
+
+	wal_error_armed = true;
+	if (sigsetjmp(wal_error_jump, 1) == 0)
+		cluster_undo_block0_flush_sync(&pin, successor,
+								   (XLogRecPtr)UINT64CONST(0x85), false);
+	else
+		caught = true;
+	wal_error_armed = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(xlog_flush_calls, 1);
+	UT_ASSERT_EQ(xlog_last_flush_lsn, (XLogRecPtr)UINT64CONST(0x90));
+	UT_ASSERT_EQ(smgr_write_calls, 1);
+	UT_ASSERT_EQ((int)(unsigned char)page[BLCKSZ - 1], 0x48);
+	UT_ASSERT_EQ(pin.slot, 0);
+
+	smgr_write_ok = true;
+	xlog_flush_calls = 0;
+	xlog_last_flush_lsn = InvalidXLogRecPtr;
+	smgr_write_calls = 0;
+	cluster_undo_block0_flush_sync(&pin, successor,
+							   (XLogRecPtr)UINT64CONST(0x85), false);
+	UT_ASSERT_EQ(xlog_flush_calls, 1);
+	UT_ASSERT_EQ(xlog_last_flush_lsn, (XLogRecPtr)UINT64CONST(0x90));
+	UT_ASSERT_EQ(smgr_write_calls, 1);
+	UT_ASSERT_EQ((int)(unsigned char)page[BLCKSZ - 1], 0x98);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_flush_parent_fsync_request_fails_before_wal_or_data_publication)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x4900), 5);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 17);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char successor[BLCKSZ];
+	char *page = NULL;
+	bool caught = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 5, 0x49);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	memcpy(successor, page, sizeof(successor));
+	successor[BLCKSZ - 1] = (char)0x99;
+	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0xa0));
+
+	wal_error_armed = true;
+	if (sigsetjmp(wal_error_jump, 1) == 0)
+		cluster_undo_block0_flush_sync(&pin, successor,
+								   (XLogRecPtr)UINT64CONST(0xa0), true);
+	else
+		caught = true;
+	wal_error_armed = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(xlog_flush_calls, 0);
+	UT_ASSERT_EQ(smgr_write_calls, 0);
+	UT_ASSERT_EQ((int)(unsigned char)page[BLCKSZ - 1], 0x49);
+	UT_ASSERT_EQ(pin.slot, 0);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_flush_rejects_wrong_logical_successor_before_wal_or_data)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x4a00), 6);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 18);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char successor[BLCKSZ];
+	char *page = NULL;
+	bool caught = false;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 6, 0x4a);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	memcpy(successor, page, sizeof(successor));
+	((UndoSegmentHeaderData *) successor)->segment_id = 2;
+	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr) UINT64CONST(0xb0));
+
+	wal_error_armed = true;
+	if (sigsetjmp(wal_error_jump, 1) == 0)
+		cluster_undo_block0_flush_sync(&pin, successor,
+								   (XLogRecPtr) UINT64CONST(0xb0), false);
+	else
+		caught = true;
+	wal_error_armed = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(xlog_flush_calls, 0);
+	UT_ASSERT_EQ(smgr_write_calls, 0);
+	UT_ASSERT_EQ(((UndoSegmentHeaderData *) page)->segment_id, 1);
+	UT_ASSERT_EQ(pin.slot, 0);
+	cluster_undo_block0_unpin(&pin);
+}
+
+UT_TEST(test_block0_clean_census_requires_exact_complete_unpinned_residency)
+{
+	ClusterUndoBlock0LogicalKey logical[2] = {
+		make_key(1, 1),
+		make_key(1, 2),
+	};
+	ClusterUndoBlock0ResolvedRoot root[2] = {
+		make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x5101), 8),
+		make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, UINT64CONST(0x5102), 8),
+	};
+	ClusterUndoBlock0AuthorityProof proof = make_recovery_proof(1, 23, 9);
+	ClusterUndoBlock0ResidentCensusItem items[3];
+	ClusterUndoBlock0FrameToken tokens[2];
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0Generation expected;
+	char *page = NULL;
+	int i;
+
+	fresh_block0_region(2);
+	memset(tokens, 0, sizeof(tokens));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(2, tokens),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	for (i = 0; i < 2; i++) {
+		make_valid_block0(logical[i].segment_id, logical[i].owner_instance,
+						 11 + i, (uint8)(0x51 + i));
+		UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+					 &logical[i], &root[i], &proof, &tokens[i], &pin, &page),
+					 CLUSTER_UNDO_BLOCK0_OK);
+		memset(&items[i], 0, sizeof(items[i]));
+		items[i].logical = logical[i];
+		items[i].resolved_root = root[i];
+		items[i].generation = pin.observed_generation;
+		items[i].proof = proof;
+		cluster_undo_block0_unpin(&pin);
+	}
+
+	UT_ASSERT(cluster_undo_block0_verify_clean_census(items, 2));
+	UT_ASSERT(!cluster_undo_block0_verify_clean_census(items, 1));
+	UT_ASSERT(!cluster_undo_block0_verify_clean_census(NULL, 2));
+
+	items[2] = items[1];
+	items[2].logical = make_key(1, 3);
+	items[2].generation.value = 13;
+	UT_ASSERT(!cluster_undo_block0_verify_clean_census(items, 3));
+
+	items[0].resolved_root.root_generation++;
+	UT_ASSERT(!cluster_undo_block0_verify_clean_census(items, 2));
+	items[0].resolved_root = root[0];
+	items[0].proof.recovery_generation++;
+	UT_ASSERT(!cluster_undo_block0_verify_clean_census(items, 2));
+	items[0].proof = proof;
+
+	UT_ASSERT_EQ(cluster_undo_block0_reserve(&logical[0], &root[0], &proof, &pin),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(!cluster_undo_block0_verify_clean_census(items, 2));
+	expected = items[0].generation;
+	UT_ASSERT_EQ(cluster_undo_block0_lock_content(
+				 &pin, &expected, CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0xb0));
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT(!cluster_undo_block0_verify_clean_census(items, 2));
+
+	fresh_block0_region(1);
+	UT_ASSERT(cluster_undo_block0_verify_clean_census(NULL, 0));
+}
+
 UT_TEST(test_r4_prerequisite_snapshot_is_exact_and_repeatable)
 {
 	int i;
 
-	UT_ASSERT_EQ((int)sizeof(ClusterR4PrerequisiteSnapshot), 8);
+	UT_ASSERT_EQ((int)sizeof(ClusterR4PrerequisiteSnapshot), 64);
+	UT_ASSERT_EQ((int)offsetof(ClusterR4PrerequisiteSnapshot, jcmk_generation), 16);
+	UT_ASSERT_EQ((int)offsetof(ClusterR4PrerequisiteSnapshot, grammar_fingerprint), 56);
 	UT_ASSERT_EQ((int)CLUSTER_R4_PREREQUISITE_RF_DEFERRED, 0);
+	UT_ASSERT_EQ((int)CLUSTER_R4_PREREQUISITE_R4A_READY, 1);
 	for (i = 0; i < 4096; i++) {
 		ClusterR4PrerequisiteSnapshot snapshot;
 
@@ -322,10 +1851,68 @@ UT_TEST(test_r4_prerequisite_snapshot_is_fixed_for_concurrent_callers)
 	UT_ASSERT_EQ(mismatches, 0);
 }
 
+UT_TEST(test_r4_publish_ready_remains_fail_closed_for_every_unbound_input)
+{
+	ClusterR4PrerequisiteSnapshot forged;
+	ClusterR4PrerequisiteSnapshot observed;
+
+	memset(&forged, 0, sizeof(forged));
+	UT_ASSERT(!cluster_undo_block0_r4_publish_ready(NULL));
+	UT_ASSERT(!cluster_undo_block0_r4_publish_ready(&forged));
+
+	forged.status = CLUSTER_R4_PREREQUISITE_R4A_READY;
+	forged.ready = true;
+	forged.target_node_id = 3;
+	forged.episode_state_generation = 17;
+	forged.jcmk_generation = UINT64CONST(29);
+	forged.request_nonce = UINT64CONST(0x1112131415161718);
+	forged.old_admitted_incarnation = UINT64CONST(41);
+	forged.fresh_incarnation = UINT64CONST(42);
+	forged.committed_epoch = UINT64CONST(9);
+	forged.grammar_fingerprint = UINT64CONST(0x8e0dae5b428905e4);
+	UT_ASSERT(!cluster_undo_block0_r4_publish_ready(&forged));
+	observed = cluster_undo_block0_r4_prerequisite_snapshot();
+	UT_ASSERT(r4_prerequisite_snapshot_is_fixed_false(&observed));
+}
+
+UT_TEST(test_r4_publish_ready_accepts_only_owner_cosampled_snapshot)
+{
+	ClusterR4PrerequisiteSnapshot expected;
+	ClusterR4PrerequisiteSnapshot forged;
+	ClusterR4PrerequisiteSnapshot observed;
+
+	memset(&r4_owner_snapshot, 0, sizeof(r4_owner_snapshot));
+	r4_owner_snapshot.status = CLUSTER_R4_PREREQUISITE_R4A_READY;
+	r4_owner_snapshot.ready = true;
+	r4_owner_snapshot.target_node_id = 3;
+	r4_owner_snapshot.episode_state_generation = UINT32_C(18);
+	r4_owner_snapshot.jcmk_generation = UINT64_C(29);
+	r4_owner_snapshot.request_nonce = UINT64_C(0x1112131415161718);
+	r4_owner_snapshot.old_admitted_incarnation = UINT64_C(41);
+	r4_owner_snapshot.fresh_incarnation = UINT64_C(42);
+	r4_owner_snapshot.committed_epoch = UINT64_C(9);
+	r4_owner_snapshot.grammar_fingerprint = UINT64_C(0x8e0dae5b428905e4);
+	r4_owner_publish_enabled = true;
+
+	expected = r4_owner_snapshot;
+	observed = cluster_undo_block0_r4_prerequisite_snapshot();
+	UT_ASSERT_EQ(memcmp(&observed, &expected, sizeof(expected)), 0);
+	UT_ASSERT(!cluster_undo_block0_r4_publish_ready(&expected));
+	r4_startup_fenced_owned = true;
+	UT_ASSERT(cluster_undo_block0_r4_publish_ready(&expected));
+	forged = expected;
+	forged.episode_state_generation++;
+	UT_ASSERT(!cluster_undo_block0_r4_publish_ready(&forged));
+
+	r4_owner_publish_enabled = false;
+	r4_startup_fenced_owned = false;
+	memset(&r4_owner_snapshot, 0, sizeof(r4_owner_snapshot));
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(45);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_accepts_only_declared_intents);
@@ -334,8 +1921,43 @@ main(void)
 	UT_RUN(test_block0_generation_exhaustion_never_wraps);
 	UT_RUN(test_block0_slot_state_allows_only_frozen_edges);
 	UT_RUN(test_block0_slot_state_rejects_direct_publish_and_double_publish);
+	UT_RUN(test_block0_checked_size_matches_frozen_default_increment);
+	UT_RUN(test_block0_attach_mismatch_detaches_fail_closed);
+	UT_RUN(test_block0_attach_rejects_impossible_free_count);
+	UT_RUN(test_block0_frame_bank_is_sparse_and_all_or_none);
+	UT_RUN(test_block0_runtime_admission_preserves_generation_zero_and_exact_identity);
+	UT_RUN(test_block0_runtime_admission_rejects_exhausted_generation);
+	UT_RUN(test_block0_copy_readonly_is_recovery_only_and_generation_exact);
+	UT_RUN(test_block0_resident_copy_rejects_empty_generation_and_root_drift_without_io);
+	UT_RUN(test_block0_pin_error_drops_reservation_before_rethrow);
+	UT_RUN(test_block0_filling_is_not_a_positive_resident_copy);
+	UT_RUN(test_block0_runtime_fill_abort_releases_slot_and_frame_via_resource_owner);
+	UT_RUN(test_block0_resource_owner_cleanup_is_balanced_with_normal_release);
+	UT_RUN(test_block0_provision_existing_exact_loads_without_temp_or_write);
+	UT_RUN(test_block0_provision_rejects_non_live_authority_before_io);
+	UT_RUN(test_block0_provision_rejects_unknown_probe_state_without_consuming_frame);
+	UT_RUN(test_block0_provision_absent_creator_publishes_after_wal_flush);
+	UT_RUN(test_block0_provision_eexist_loser_installs_exact_winner_image);
+	UT_RUN(test_block0_provision_abort_cleans_temp_and_returns_frame);
+	UT_RUN(test_block0_provision_publish_error_resource_owner_cleans_exact_temp);
+	UT_RUN(test_block0_recovery_private_begin_reads_without_allocating_a_frame);
+	UT_RUN(test_block0_recovery_private_begin_rejects_live_authority_before_io);
+	UT_RUN(test_block0_recovery_private_bad_identity_does_not_publish_disk_bytes);
+	UT_RUN(test_block0_recovery_private_absence_stays_fail_closed_without_typed_smgr_result);
+	UT_RUN(test_block0_recovery_private_finish_writes_fsyncs_and_releases_without_residency);
+	UT_RUN(test_block0_recovery_private_finish_validated_noop_has_zero_io);
+	UT_RUN(test_block0_recovery_private_finish_write_failure_panics_with_guard_unpublished);
+	UT_RUN(test_block0_recovery_private_parent_fsync_gap_panics_before_write);
+	UT_RUN(test_block0_wal_dirty_uses_monotone_lsn_and_flushes_before_durable_data);
+	UT_RUN(test_block0_flush_publishes_successor_generation);
+	UT_RUN(test_block0_flush_failure_preserves_resident_predecessor_and_dirty_lsn);
+	UT_RUN(test_block0_flush_parent_fsync_request_fails_before_wal_or_data_publication);
+	UT_RUN(test_block0_flush_rejects_wrong_logical_successor_before_wal_or_data);
+	UT_RUN(test_block0_clean_census_requires_exact_complete_unpinned_residency);
 	UT_RUN(test_r4_prerequisite_snapshot_is_exact_and_repeatable);
 	UT_RUN(test_r4_prerequisite_snapshot_is_fixed_for_concurrent_callers);
+	UT_RUN(test_r4_publish_ready_remains_fail_closed_for_every_unbound_input);
+	UT_RUN(test_r4_publish_ready_accepts_only_owner_cosampled_snapshot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

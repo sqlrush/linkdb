@@ -66,6 +66,10 @@
 
 UT_DEFINE_GLOBALS();
 
+#ifndef UNDO_RECORD_SOURCE_PATH
+#error "UNDO_RECORD_SOURCE_PATH must identify cluster_undo_record.c"
+#endif
+
 
 #define UNDO_TEST_SHMEM_BYTES 16384
 
@@ -98,6 +102,38 @@ int max_prepared_xacts = 0;
 uint32 *my_wait_event_info = &undo_test_wait_event_info;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+
+
+static char *
+read_undo_record_source(void)
+{
+	FILE *fp;
+	char *source;
+	long length;
+
+	fp = fopen(UNDO_RECORD_SOURCE_PATH, "rb");
+	UT_ASSERT_NOT_NULL(fp);
+	if (fp == NULL)
+		return NULL;
+	UT_ASSERT_EQ(fseek(fp, 0, SEEK_END), 0);
+	length = ftell(fp);
+	UT_ASSERT(length > 0);
+	UT_ASSERT_EQ(fseek(fp, 0, SEEK_SET), 0);
+	if (length <= 0) {
+		fclose(fp);
+		return NULL;
+	}
+	source = malloc((size_t)length + 1);
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) {
+		fclose(fp);
+		return NULL;
+	}
+	UT_ASSERT_EQ((long)fread(source, 1, (size_t)length, fp), length);
+	source[length] = '\0';
+	fclose(fp);
+	return source;
+}
 
 
 /*
@@ -756,11 +792,59 @@ UT_TEST(test_undo_effective_cap_clamps_and_never_falls_below_current)
 	undo_test_fixture_end();
 }
 
+/* Spec 8.4A I18/I19: one admission debt covers record allocation and every
+ * lifecycle/record-seal block0 mutation it can reach. */
+UT_TEST(test_record_allocator_owns_modifier_debt_outside_lifecycle_locks)
+{
+	char *source = read_undo_record_source();
+	const char *body;
+	const char *start;
+	const char *end;
+	const char *enter;
+	const char *try_block;
+	const char *recheck;
+	const char *call_body;
+	const char *finally_block;
+	const char *leave;
+
+	if (source == NULL)
+		return;
+	body = strstr(source, "\ncluster_undo_record_alloc_body(");
+	start = strstr(source, "\ncluster_undo_record_alloc(");
+	end = start == NULL ? NULL : strstr(start, "\n}\n\n\n/*\n * cluster_undo_get_record");
+	enter = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_enter(");
+	try_block = start == NULL ? NULL : strstr(start, "PG_TRY();");
+	recheck = start == NULL
+				  ? NULL
+				  : strstr(start, "cluster_semantic_activation_modifier_recheck(");
+	call_body = start == NULL ? NULL : strstr(start, "cluster_undo_record_alloc_body(");
+	finally_block = start == NULL ? NULL : strstr(start, "PG_FINALLY();");
+	leave = finally_block == NULL
+				? NULL
+				: strstr(finally_block, "cluster_semantic_activation_leave(");
+
+	UT_ASSERT_NOT_NULL(body);
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(enter);
+	UT_ASSERT_NOT_NULL(try_block);
+	UT_ASSERT_NOT_NULL(recheck);
+	UT_ASSERT_NOT_NULL(call_body);
+	UT_ASSERT_NOT_NULL(finally_block);
+	UT_ASSERT_NOT_NULL(leave);
+	if (body != NULL && start != NULL && end != NULL && enter != NULL && try_block != NULL
+		&& recheck != NULL && call_body != NULL && finally_block != NULL && leave != NULL)
+		UT_ASSERT(body < start && start < enter && enter < try_block && try_block < recheck
+				  && recheck < call_body && call_body < finally_block && finally_block < leave
+				  && leave < end);
+	free(source);
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);
@@ -781,6 +865,7 @@ main(int argc, char **argv)
 	UT_RUN(test_undo_record_failed_lazy_scan_is_attempted_once);
 	UT_RUN(test_undo_pool_create_increments_but_reuse_keeps_cardinality);
 	UT_RUN(test_undo_effective_cap_clamps_and_never_falls_below_current);
+	UT_RUN(test_record_allocator_owns_modifier_debt_outside_lifecycle_locks);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

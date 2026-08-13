@@ -46,6 +46,7 @@
 #include "postgres.h"
 #include "storage/block.h"
 
+#include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoPathIntent (D2-2) */
 
 
@@ -107,6 +108,62 @@ extern bool cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent, ui
 extern bool cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent, uint32 segment_id,
 												 uint8 owner_instance, uint32 offset,
 												 const char *buf, uint32 len);
+
+
+/*
+ * Spec 8.4A P3 first-publication seam.  A final-path probe never creates or
+ * repairs.  EXACT publishes block0 only after full-size and identity checks;
+ * all other outcomes leave the caller buffer unchanged.
+ */
+typedef enum ClusterUndoSmgrFinalState {
+	CLUSTER_UNDO_SMGR_FINAL_ABSENT = 0,
+	CLUSTER_UNDO_SMGR_FINAL_EXACT,
+	CLUSTER_UNDO_SMGR_FINAL_INVALID,
+	CLUSTER_UNDO_SMGR_FINAL_IO_ERROR
+} ClusterUndoSmgrFinalState;
+
+typedef enum ClusterUndoSmgrPublishResult {
+	CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED = 0,
+	CLUSTER_UNDO_SMGR_PUBLISH_EXISTS,
+	CLUSTER_UNDO_SMGR_PUBLISH_INVALID,
+	CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR
+} ClusterUndoSmgrPublishResult;
+
+extern ClusterUndoSmgrFinalState cluster_undo_smgr_probe_segment(
+	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+	char block0[BLCKSZ]);
+extern bool cluster_undo_smgr_provision_temp_create(
+	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+	char temp_path[MAXPGPATH]);
+extern ClusterUndoSmgrPublishResult cluster_undo_smgr_provision_temp_publish(
+	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+	const char *temp_path, const char block0[BLCKSZ]);
+extern bool cluster_undo_smgr_provision_temp_cleanup(
+	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
+	const char *temp_path);
+extern bool cluster_undo_smgr_cleanup_boot_foreign_temps(
+	ClusterUndoPathIntent intent, uint8 owner_instance);
+
+/*
+ * A-prime immutable root-descriptor applicability mirror.  root_directory is
+ * an already resolved undo root; it locates pgrac_undo_root.control but never
+ * contributes identity.  Probe publishes observed bytes only on EXACT.
+ */
+typedef enum ClusterUndoSmgrRootMirrorState {
+	CLUSTER_UNDO_SMGR_ROOT_MIRROR_ABSENT = 0,
+	CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT,
+	CLUSTER_UNDO_SMGR_ROOT_MIRROR_PUBLISHED,
+	CLUSTER_UNDO_SMGR_ROOT_MIRROR_HOLD,
+	CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR
+} ClusterUndoSmgrRootMirrorState;
+
+extern ClusterUndoSmgrRootMirrorState cluster_undo_smgr_root_descriptor_probe(
+	const char *root_directory,
+	const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
+extern ClusterUndoSmgrRootMirrorState cluster_undo_smgr_root_descriptor_publish(
+	const char *root_directory,
+	const uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
 
 
 /*

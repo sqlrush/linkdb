@@ -383,7 +383,7 @@ int cluster_cssd_dead_deadband_factor = 3;
 char *cluster_voting_disks = NULL; /* CSV path list, default empty */
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
-int cluster_voting_disk_size_bytes = 328192; /* spec-6.15: (5 × 128 + 1) × 512 */
+int cluster_voting_disk_size_bytes = 394240; /* spec-5.15A: (6 × 128 + 2) × 512 */
 
 /* spec-5.15 D7 — online declared-node join.  Default off (capability opt-in;
  * fail-closed-safe via INV-J8 — a DEAD node is never auto-readmitted when off).
@@ -2246,12 +2246,16 @@ cluster_init_guc(void)
 							NULL,			/* assign_hook */
 							NULL);			/* show_hook */
 
-	/* spec-3.18 D1: undo block buffer pool (AD-014 form restoration). */
+	/* spec-8.4A D1/P2: separate ordinary-DATA and block-zero frame banks. */
 	DefineCustomIntVariable(
-		"cluster.undo_buffers", gettext_noop("Number of cluster undo block buffer pool slots."),
-		gettext_noop("Each slot caches one 8KB undo DATA block (block 0 is "
-					 "not poolable).  0 disables the pool (direct smgr I/O).  "
-					 "Default 2048 = ~16MB per instance."),
+		"cluster.undo_buffers",
+		gettext_noop("Number of ordinary DATA frames and R4A block-zero frames."),
+		gettext_noop("Each positive value D provisions D ordinary 8KB undo DATA frames plus a "
+					 "separate B=D block-zero payload frame bank, fixed block-zero authority "
+					 "metadata, and a free-frame index.  Default D=2048 adds 20,979,840 bytes "
+					 "for block-zero authority and residency beyond the existing DATA pool.  "
+					 "Zero permits direct smgr I/O only while R4A is inactive; R4A activation "
+					 "refuses zero, and an active cluster has no direct-smgr block-zero fallback."),
 		&cluster_undo_buffers, 2048, 0, 1048576, PGC_POSTMASTER, /* shmem sized once at init */
 		0, NULL, NULL, NULL);
 
@@ -3196,8 +3200,9 @@ cluster_init_guc(void)
 	 * ADG apply-master lease marker at ((3 × CLUSTER_MAX_NODES + node_id)
 	 * × 512); region 5 = the xid stripe slot at ((4 × CLUSTER_MAX_NODES +
 	 * node_id) × 512); region 6 = ONE cluster-wide stripe activation
-	 * record at (5 × CLUSTER_MAX_NODES × 512).  Default 328192 bytes =
-	 * (5 × 128 + 1) × 512.  Range [4096, 1048576].
+	 * record at (5 × CLUSTER_MAX_NODES × 512); slot 5N+1 = PGSA; and
+	 * slots [5N+2,6N+2) are the per-proposer epoch-ballot lanes.  Default
+	 * 394240 bytes = (6 × 128 + 2) × 512.  Range [4096, 1048576].
 	 */
 	DefineCustomIntVariable("cluster.voting_disk_size_bytes",
 							gettext_noop("Voting disk file size in bytes."),
@@ -3213,9 +3218,11 @@ cluster_init_guc(void)
 										 "lease slot at ((384 + node_id) × 512), and an xid "
 										 "stripe slot at ((512 + node_id) × 512); one "
 										 "cluster-wide stripe activation record lives at "
-										 "(640 × 512).  Default 328192 = (5 × 128 + 1) × 512.  "
+										 "(640 × 512), PGSA at (641 × 512), and epoch-ballot "
+										 "lanes at [(642 × 512),(770 × 512)).  Default 394240 "
+										 "= (6 × 128 + 2) × 512.  "
 										 "Range [4096, 1048576] bytes; multiple of 512."),
-							&cluster_voting_disk_size_bytes, 328192, 4096, 1048576, PGC_POSTMASTER,
+							&cluster_voting_disk_size_bytes, 394240, 4096, 1048576, PGC_POSTMASTER,
 							GUC_UNIT_BYTE, NULL, NULL, NULL);
 
 	/* spec-5.15 D7 — online declared-node join (Q7/Q8). */

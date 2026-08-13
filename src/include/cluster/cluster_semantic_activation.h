@@ -110,6 +110,18 @@ typedef struct ClusterSemanticActivationCasRequest {
 	uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 } ClusterSemanticActivationCasRequest;
 
+typedef enum ClusterSemanticAuthorityRequestKind {
+	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE = 0,
+	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS = 1,
+	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR = 2
+} ClusterSemanticAuthorityRequestKind;
+
+typedef struct ClusterUndoRootDescriptorRequest {
+	uint64 request_seq;
+	uint64 system_identifier;
+	uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+} ClusterUndoRootDescriptorRequest;
+
 typedef ClusterSemanticActivationResult (*ClusterSemanticReadinessCallback)(
 	uint64 expected_generation, ClusterSemanticActivationRefusal *refusal);
 typedef ClusterSemanticActivationResult (*ClusterSemanticStageCallback)(uint64 generation);
@@ -140,6 +152,12 @@ extern bool cluster_semantic_activation_peer_open_matches(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 required_hello_caps, uint32 sampled_capability_generation);
 extern void cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token);
+extern ClusterSemanticAdmissionResult
+cluster_semantic_activation_modifier_enter(bool writable_admission,
+									   ClusterSemanticAdmissionToken *token);
+extern bool
+cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken *token,
+									 bool writable_admission);
 extern Size cluster_semantic_activation_shmem_size(void);
 extern void cluster_semantic_activation_shmem_init(void);
 extern void
@@ -155,7 +173,18 @@ extern bool
 cluster_semantic_activation_qvotec_poll_record_cas(ClusterSemanticActivationCasRequest *out);
 extern bool
 cluster_semantic_activation_qvotec_complete_record_cas(uint64 request_seq,
-													   ClusterSemanticActivationResult result);
+												   ClusterSemanticActivationResult result);
+extern bool cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
+	uint64 system_identifier,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
+	uint64 *out_request_seq);
+extern bool cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
+	ClusterUndoRootDescriptorRequest *out);
+extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor(
+	uint64 request_seq, ClusterSemanticActivationResult result);
+extern bool
+cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
+	uint64 request_seq, ClusterSemanticActivationResult *out_result);
 extern void cluster_semantic_activation_lmon_tick(void);
 extern ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,

@@ -158,4 +158,36 @@ cluster_undo_block_has_space(uint32 free_offset, uint16 slot_count, uint16 recor
 }
 
 
+/*
+ * Validate one decoded slot before deriving its directory pointer or copying
+ * record bytes.  Checked-width arithmetic rejects a corrupt large slot_count,
+ * an out-of-range row index, header overlap, end overflow and overlap with the
+ * complete on-page slot directory.
+ */
+static inline bool
+cluster_undo_record_slot_index_valid(uint16 slot_count, uint16 row_offset)
+{
+	uint64 directory_bytes = (uint64)slot_count * sizeof(UndoSlotDirEntry);
+
+	return slot_count > 0 && row_offset < slot_count && directory_bytes <= BLCKSZ;
+}
+
+
+static inline bool
+cluster_undo_record_slot_range_valid(uint16 slot_count, uint16 row_offset,
+									 uint32 record_offset, uint16 record_length)
+{
+	uint64 directory_bytes = (uint64)slot_count * sizeof(UndoSlotDirEntry);
+	uint64 record_end = (uint64)record_offset + (uint64)record_length;
+	uint64 directory_low;
+
+	if (!cluster_undo_record_slot_index_valid(slot_count, row_offset))
+		return false;
+	directory_low = (uint64)BLCKSZ - directory_bytes;
+	if (record_offset < sizeof(UndoBlockHeader) || record_length == 0)
+		return false;
+	return record_end <= directory_low;
+}
+
+
 #endif /* CLUSTER_UNDO_FORMAT_H */

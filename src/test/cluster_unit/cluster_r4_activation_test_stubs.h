@@ -17,6 +17,9 @@
 #ifndef CLUSTER_R4_ACTIVATION_TEST_STUBS_H
 #define CLUSTER_R4_ACTIVATION_TEST_STUBS_H
 
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "storage/ipc.h"
 
 int MyProcPid = 101;
@@ -35,6 +38,43 @@ uint64
 cluster_epoch_get_current(void)
 {
 	return 0;
+}
+
+bool
+cluster_replacement_episode_is_valid(
+	const ClusterReplacementEpisode *episode pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_snapshot_replacement_admitted(
+	ClusterReplacementEpisode *out_episode pg_attribute_unused(),
+	ClusterReplacementCommitMarkerV3 *out_marker pg_attribute_unused())
+{
+	return false;
+}
+
+ClusterR4PrerequisiteSnapshot
+cluster_reconfig_r4_prerequisite_snapshot(void)
+{
+	return (ClusterR4PrerequisiteSnapshot){
+		.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED,
+		.target_node_id = -1,
+	};
+}
+
+bool
+cluster_reconfig_r4_publish_ready(
+	const ClusterR4PrerequisiteSnapshot *expected pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_undo_block0_current_startup_fenced_owned(void)
+{
+	return false;
 }
 
 bool cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,

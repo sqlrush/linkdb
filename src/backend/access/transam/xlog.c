@@ -793,6 +793,11 @@ static XLogRecPtr XLogBytePosToRecPtr(uint64 bytepos);
 static XLogRecPtr XLogBytePosToEndRecPtr(uint64 bytepos);
 static uint64 XLogRecPtrToBytePos(XLogRecPtr ptr);
 
+#ifdef USE_CLUSTER_UNIT
+void cluster_xlog_unit_init_insert_bytepos(uint64 bytepos);
+void cluster_xlog_unit_set_insert_bytepos(uint64 bytepos);
+#endif
+
 static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
@@ -9914,6 +9919,54 @@ GetXLogInsertRecPtr(void)
 
 	return XLogBytePosToRecPtr(current_bytepos);
 }
+
+/*
+ * Get the end of the WAL reserved so far.
+ *
+ * Unlike GetXLogInsertRecPtr(), an insertion ending exactly at a WAL page or
+ * segment boundary stays at that boundary.  Callers that need a flushable
+ * record-end ceiling must use this mapping, not the next record's start after
+ * its page header.
+ */
+XLogRecPtr
+GetXLogInsertEndRecPtr(void)
+{
+	XLogCtlInsert *Insert = &XLogCtl->Insert;
+	uint64		current_bytepos;
+
+	SpinLockAcquire(&Insert->insertpos_lck);
+	current_bytepos = Insert->CurrBytePos;
+	SpinLockRelease(&Insert->insertpos_lck);
+
+	return XLogBytePosToEndRecPtr(current_bytepos);
+}
+
+#ifdef USE_CLUSTER_UNIT
+/* Exercise the production sampler/converter without exposing XLogCtlData. */
+void
+cluster_xlog_unit_init_insert_bytepos(uint64 bytepos)
+{
+	static XLogCtlData unit_xlog_ctl;
+
+	MemSet(&unit_xlog_ctl, 0, sizeof(unit_xlog_ctl));
+	SpinLockInit(&unit_xlog_ctl.Insert.insertpos_lck);
+	unit_xlog_ctl.Insert.CurrBytePos = bytepos;
+	XLogCtl = &unit_xlog_ctl;
+	UsableBytesInSegment =
+		(wal_segment_size / XLOG_BLCKSZ * UsableBytesInPage) -
+		(SizeOfXLogLongPHD - SizeOfXLogShortPHD);
+}
+
+void
+cluster_xlog_unit_set_insert_bytepos(uint64 bytepos)
+{
+	XLogCtlInsert *Insert = &XLogCtl->Insert;
+
+	SpinLockAcquire(&Insert->insertpos_lck);
+	Insert->CurrBytePos = bytepos;
+	SpinLockRelease(&Insert->insertpos_lck);
+}
+#endif
 
 /*
  * Get latest WAL write pointer

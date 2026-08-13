@@ -43,9 +43,12 @@
 #include "cluster/cluster_conf.h" /* ClusterConf type for the single-node latch stub */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "utils/memutils.h"
+#include "utils/resowner.h"
 
 #undef printf
 #undef fprintf
@@ -70,6 +73,35 @@ UT_DEFINE_GLOBALS();
  * node 0 keeps every smgr call on the RUNTIME_SHARED (own) branch.
  */
 int cluster_node_id = 0;
+
+/*
+ * cluster_undo_block0_resident.o now registers process-local ResourceOwner
+ * cleanup for every acquired frame/pin.  This standalone buffer-pool harness
+ * does not exercise abort cleanup, but it must provide the backend globals and
+ * allocation hooks used to register and retire those ownership records.
+ */
+ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
+ResourceOwner CurTransactionResourceOwner = NULL;
+ResourceOwner TopTransactionResourceOwner = NULL;
+ResourceOwner AuxProcessResourceOwner = NULL;
+MemoryContext TopMemoryContext = (MemoryContext)(uintptr_t)1;
+
+void *
+MemoryContextAlloc(MemoryContext context pg_attribute_unused(), Size size)
+{
+	return malloc(size);
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+void
+RegisterResourceReleaseCallback(ResourceReleaseCallback callback pg_attribute_unused(),
+								void *arg pg_attribute_unused())
+{}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -368,6 +400,101 @@ UT_TEST(test_undo_buf_miss_then_hit)
 }
 
 
+/* ===== Spec 8.4 D4 — origin serves only an already-resident DATA image =====
+ *
+ * The kind-4 DATA0 origin path must never turn a cache miss into shared-disk
+ * I/O.  Prime one exact image through the ordinary read-through API, then
+ * prove the resident-only copy succeeds without another smgr read.  An
+ * unseen key and block 0 both fail without changing the destination or
+ * touching smgr.
+ */
+UT_TEST(test_undo_buf_copy_resident_never_fills_on_miss)
+{
+	ClusterUndoBufPin pin;
+	char expected[BLCKSZ];
+	char copied[BLCKSZ];
+	char *img;
+
+	fresh_pool();
+	img = cluster_undo_buf_pin(7, 0, 5, CLUSTER_UNDO_BUF_EXCLUSIVE, &pin);
+	UT_ASSERT_NOT_NULL(img);
+	memset(expected, 0x5a, sizeof(expected));
+	memcpy(img, expected, sizeof(expected));
+	cluster_undo_buf_unpin(&pin);
+	UT_ASSERT_EQ(smgr_read_calls, 1);
+
+	smgr_read_calls = 0;
+	memset(copied, 0xa5, sizeof(copied));
+	UT_ASSERT(cluster_undo_buf_copy_resident(7, 0, 5, copied));
+	UT_ASSERT_EQ(memcmp(copied, expected, sizeof(copied)), 0);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+
+	memset(copied, 0xa5, sizeof(copied));
+	UT_ASSERT(!cluster_undo_buf_copy_resident(7, 0, 6, copied));
+	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+
+	UT_ASSERT(!cluster_undo_buf_copy_resident(7, 0, 0, copied));
+	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
+	UT_ASSERT_EQ(smgr_read_calls, 0);
+}
+
+
+/* ===== Spec 8.4A D1 — block0 gets B=D separate sparse frames ===== */
+UT_TEST(test_undo_buf_region_keeps_data_and_block0_frame_capacity_separate)
+{
+	ClusterUndoBufPin data_pins[4];
+	ClusterUndoBlock0FrameToken block0_tokens[4];
+	ClusterUndoBlock0FrameToken extra;
+	char *img;
+
+	cluster_undo_buffers = 4;
+	fresh_pool();
+	memset(data_pins, 0, sizeof(data_pins));
+	memset(block0_tokens, 0, sizeof(block0_tokens));
+	memset(&extra, 0, sizeof(extra));
+
+	/* Fill and retain every ordinary DATA slot. */
+	for (uint32 block = 1; block <= 4; block++) {
+		img = cluster_undo_buf_pin(1, 0, block, CLUSTER_UNDO_BUF_SHARED,
+								&data_pins[block - 1]);
+		UT_ASSERT_NOT_NULL(img);
+	}
+
+	/* The separate block0 bank still owns all B=D frames. */
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(4, block0_tokens),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &extra),
+				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+	for (int i = 0; i < 4; i++) {
+		UT_ASSERT(block0_tokens[i].owned);
+		cluster_undo_block0_frame_release(&block0_tokens[i]);
+		cluster_undo_buf_unpin(&data_pins[i]);
+	}
+}
+
+
+UT_TEST(test_undo_buf_disable_detaches_block0_frame_bank)
+{
+	ClusterUndoBlock0FrameToken token;
+
+	cluster_undo_buffers = 4;
+	fresh_pool();
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_frame_release(&token);
+
+	cluster_undo_buffers = 0;
+	fresh_pool();
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+
+	cluster_undo_buffers = 4;
+	fresh_pool();
+}
+
+
 /* ===== U4/U5 — mark_dirty write-throughs with do_fsync=false + bytes ===== */
 UT_TEST(test_undo_buf_write_through)
 {
@@ -646,6 +773,9 @@ main(void)
 	UT_RUN(test_undo_buf_invalidate_segment);
 	UT_RUN(test_undo_buf_block0_not_poolable);
 	UT_RUN(test_undo_buf_miss_then_hit);
+	UT_RUN(test_undo_buf_copy_resident_never_fills_on_miss);
+	UT_RUN(test_undo_buf_region_keeps_data_and_block0_frame_capacity_separate);
+	UT_RUN(test_undo_buf_disable_detaches_block0_frame_bank);
 	UT_RUN(test_undo_buf_write_through);
 	UT_RUN(test_undo_buf_evicts_when_full);
 	UT_RUN(test_undo_boundary_wal_before_data);

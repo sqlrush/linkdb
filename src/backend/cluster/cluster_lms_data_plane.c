@@ -163,6 +163,64 @@ cluster_lms_data_plane_enabled(void)
 	return dp_enabled;
 }
 
+/*
+ * Close one peer through the DATA-plane owner's process-local tracker.
+ * The tier1 close alone is insufficient: dp_track and the WaitEventSet
+ * rebuild fence must move with the same close.  Keep this funnel idempotent
+ * because tier1's defensive close path still advances reconnect accounting
+ * when its fd is already gone.
+ */
+static void
+dp_close_peer_now(int32 peer_id, const char *reason)
+{
+	if (!dp_enabled || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
+		|| peer_id == cluster_node_id)
+		return;
+	if (dp_track[peer_id].fd < 0
+		&& dp_track[peer_id].substate == LMS_DP_DOWN)
+		return;
+
+	cluster_ic_tier1_close_peer(peer_id, reason);
+	dp_track[peer_id].fd = -1;
+	dp_track[peer_id].substate = LMS_DP_DOWN;
+	dp_wes_dirty = true;
+}
+
+void
+cluster_lms_data_plane_close_peer_now(int32 peer_id)
+{
+	dp_close_peer_now(peer_id, "R4 undo data send hard error");
+}
+
+#ifdef USE_CLUSTER_UNIT
+void
+cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd,
+									 bool connected, bool enabled,
+									 bool wes_dirty)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return;
+	dp_enabled = enabled;
+	dp_track[peer_id].fd = fd;
+	dp_track[peer_id].substate = connected ? LMS_DP_CONNECTED : LMS_DP_DOWN;
+	dp_wes_dirty = wes_dirty;
+}
+
+bool
+cluster_lms_data_plane_test_peer_snapshot(int32 peer_id, int *fd_out,
+										 bool *down_out,
+										 bool *wes_dirty_out)
+{
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
+		|| fd_out == NULL || down_out == NULL || wes_dirty_out == NULL)
+		return false;
+	*fd_out = dp_track[peer_id].fd;
+	*down_out = dp_track[peer_id].substate == LMS_DP_DOWN;
+	*wes_dirty_out = dp_wes_dirty;
+	return true;
+}
+#endif
+
 /* Rebuild the WaitEventSet when the fd set changed. */
 static void
 dp_rebuild_wes(void)
@@ -506,10 +564,7 @@ cluster_lms_data_plane_tick(long timeout_ms)
 					 * pre-flip traffic is limited to HELLO/errors;  post-
 					 * flip this is the block-family dispatch entry. */
 					if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd)) {
-						cluster_ic_tier1_close_peer(peer, "data-plane recv failed");
-						dp_track[peer].fd = -1;
-						dp_track[peer].substate = LMS_DP_DOWN;
-						dp_wes_dirty = true;
+						dp_close_peer_now(peer, "data-plane recv failed");
 						peer_up = false;
 					}
 				}
@@ -543,10 +598,7 @@ cluster_lms_data_plane_tick(long timeout_ms)
 						dp_wes_dirty = true;
 						break;
 					case CLUSTER_IC_SEND_HARD_ERROR:
-						cluster_ic_tier1_close_peer(peer, "data-plane outbound drain hard error");
-						dp_track[peer].fd = -1;
-						dp_track[peer].substate = LMS_DP_DOWN;
-						dp_wes_dirty = true;
+						dp_close_peer_now(peer, "data-plane outbound drain hard error");
 						break;
 					}
 				}

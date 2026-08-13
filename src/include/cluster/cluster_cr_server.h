@@ -59,6 +59,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22d D4-6) */
@@ -404,8 +405,15 @@ extern void cluster_cr_server_stat_bump(ClusterCrServerStat which);
 extern void cluster_cr_construct_page_for_server(const char *cur_page, SCN read_scn, BufferTag tag,
 												 char *dst_page, bool *out_partial);
 extern ClusterCrBuildResult cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn,
-												char dst[BLCKSZ],
-												ClusterCrBuildReason *reason_out);
+										char dst[BLCKSZ],
+										ClusterCrBuildReason *reason_out);
+
+/* TARGET-only requester CR entry.  SOURCE retains its private historical
+ * bool/PARTIAL path; this ABI exposes the closed R4 result/reason domains and
+ * copies a page to dst only after a positive final TARGET recheck. */
+extern ClusterCrBuildResult cluster_gcs_block_cr_fetch_and_wait(
+	BufferTag tag, SCN read_scn, char dst[BLCKSZ],
+	ClusterCrBuildReason *reason_out);
 
 /* Shmem region registration (cluster_shmem.c registry). */
 extern void cluster_cr_server_shmem_register(void);
@@ -420,16 +428,38 @@ extern void cluster_cr_server_publish_lms_latch(struct Latch *latch);
 extern bool cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd);
 
 /*
- * R4 FORWARD96 holder-submit boundary.  D3 supplies the typed handoff only;
- * D4 owns every positive stable-copy/slot submission path.  Until that D4
- * integration exists, this boundary refuses without narrowing FORWARD96 to
- * the legacy 64-byte submit ABI.
+ * R4 FORWARD96 holder-submit boundary.  The receive worker retains ownership
+ * of receive_admission; the submitter may inspect/recheck it but must never
+ * copy, clear, transfer or leave it.  FULL/NONE means the immutable holder
+ * work was published, not that a finished CR page already exists.
  */
-extern bool cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward);
+extern ClusterCrBuildResult cluster_lms_cr_submit_r4(
+	const ClusterR4CrForwardPayload *forward,
+	const ClusterSemanticAdmissionToken *receive_admission,
+	uint32 requester_capability_generation,
+	uint32 master_capability_generation,
+	ClusterCrBuildReason *reason_out);
+
+/* Worker-0 endpoint for one already authenticated status-24 foreign undo
+ * response.  The caller retains every input; true means the exact correlated
+ * R4 slot release-published UNDO_READY. */
+extern bool cluster_cr_server_r4_land_foreign_undo(
+	const ClusterICEnvelope *env, const GcsBlockReplyHeader *header,
+	const char undo_page[BLCKSZ], const ClusterGcsUndoAuthTrailer *undo_auth);
 
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_cr_server_test_reserve_legacy_slot(ClusterLmsCrSlot *slot,
-													uint32 reserved_state);
+											uint32 reserved_state);
+extern bool cluster_cr_server_test_r4_claim_queued(uint32 slot_index);
+extern bool cluster_cr_server_test_r4_build_step(uint32 slot_index);
+extern bool cluster_cr_server_test_r4_send_foreign_undo(uint32 slot_index);
+extern bool cluster_cr_server_test_r4_freeze_foreign_generation(
+	uint32 slot_index, uint32 physical_generation);
+extern bool cluster_cr_server_test_r4_ship_terminal(uint32 slot_index);
+extern void cluster_cr_server_test_r4_reset_contexts(void);
+extern bool cluster_cr_server_test_r4_context_matches(
+	uint32 slot_index, bool expect_present, uint64 slot_generation,
+	uint64 builder_incarnation, const ClusterSemanticAdmissionToken *admission);
 #endif
 
 /* LMON dispatch side (spec-6.12i D-i1): park a validated undo-TT fetch
@@ -482,7 +512,10 @@ extern void cluster_lms_cr_ship_ready(void);
  * ships exactly one reply, so the caller does not itself reply on refusal.
  */
 extern void cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd,
-												   ClusterLmsCrSlotKind kind);
+											   ClusterLmsCrSlotKind kind);
+extern ClusterMxDescribeResult cluster_gcs_current_mx_describe_fetch_and_wait(
+	int32 origin_node, const ClusterCurrentMxKey *key, ClusterCurrentMxMemberDesc *members,
+	uint16 members_cap, uint16 *members_count, uint32 *reported_total_members);
 
 typedef enum ClusterR4SourceCrOp { CLUSTER_R4_SOURCE_CR_FETCH = 0 } ClusterR4SourceCrOp;
 

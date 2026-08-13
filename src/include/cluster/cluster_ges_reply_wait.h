@@ -114,6 +114,24 @@ typedef enum GesReplyDeliverResult {
 	GES_REPLY_DELIVER_ORPHAN		 /* tombstone GRANT -> caller auto-releases */
 } GesReplyDeliverResult;
 
+/* Complete terminal verdict copied by the cooperative poll consumer. */
+typedef struct GesReplyWaitVerdict {
+	uint32 reply_opcode;
+	uint32 reject_reason;
+} GesReplyWaitVerdict;
+
+/*
+ * Nonblocking exact-key poll outcome.  ABANDONED is distinct from MISSING:
+ * the former still owns a tombstone that must remain installed so a late
+ * GRANT can be recognized and auto-released.
+ */
+typedef enum GesReplyWaitPollResult {
+	GES_REPLY_WAIT_POLL_MISSING = 0,
+	GES_REPLY_WAIT_POLL_PENDING,
+	GES_REPLY_WAIT_POLL_DELIVERED,
+	GES_REPLY_WAIT_POLL_ABANDONED
+} GesReplyWaitPollResult;
+
 /*
  * Shmem region lifecycle (mirror cluster_lmd_graph_shmem pattern).
  */
@@ -174,6 +192,22 @@ extern void cluster_ges_reply_wait_wake(GesReplyWaitEntry *entry, uint32 reply_o
 extern GesReplyDeliverResult cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key,
 															uint32 reply_opcode,
 															uint32 reject_reason);
+
+/*
+ * Atomically inspect one exact HC17 key without sleeping on its CV.
+ *
+ *	PENDING:	entry remains installed; verdict_out is unchanged.
+ *	DELIVERED:	the complete verdict is copied and the entry is removed in
+ *				the same reply-table LWLock critical section.
+ *	ABANDONED:	tombstone remains installed for orphan-GRANT handling;
+ *				verdict_out is unchanged.
+ *	MISSING:	no matching entry; verdict_out is unchanged.
+ *
+ * No HTAB entry pointer escapes this API and it never waits on a CV.
+ */
+extern GesReplyWaitPollResult
+cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key,
+									GesReplyWaitVerdict *verdict_out);
 
 /*
  * spec-5.16 — abandon a wait entry at the bounded GES timeout instead of deleting

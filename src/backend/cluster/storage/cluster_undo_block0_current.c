@@ -1,0 +1,1069 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_undo_block0_current.c
+ *	  Cooperative Candidate-2 current guard for undo block zero.
+ *
+ * This adapter owns no durable block0 bytes.  It holds the generation-
+ * independent 0xFB current resource and delegates resident-only sampling and
+ * copying to cluster_undo_block0_resident.c.
+ *
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include "access/xact.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_ges.h"
+#include "cluster/cluster_ges_reply_wait.h"
+#include "cluster/cluster_grd.h"
+#include "cluster/cluster_grd_outbound.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_lmon.h"
+#include "cluster/cluster_lms.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_undo_resid.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
+#include "lib/ilist.h"
+#include "miscadmin.h"
+#include "storage/ipc.h"
+#include "storage/lock.h"
+#include "storage/proc.h"
+#include "utils/timestamp.h"
+
+#define CLUSTER_UNDO_BLOCK0_WALR_RESID_TYPE UINT8_C(0xFA)
+#define CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS 100
+#define CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS 1600
+#define CLUSTER_UNDO_BLOCK0_CURRENT_TOMBSTONE_MS 30000
+
+StaticAssertDecl(CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE > LOCKTAG_LAST_TYPE,
+				 "block0 current resid type must be outside the PG locktag domain");
+StaticAssertDecl(CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_UNDO_RESID_TYPE,
+				 "block0 current and old undo resid types must differ");
+StaticAssertDecl(CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_UNDO_BLOCK0_WALR_RESID_TYPE,
+				 "block0 current and WAL-retention resid types must differ");
+StaticAssertDecl(CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_SQ_RESID_TYPE
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_CF_RESID_TYPE
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_HW_RESID_TYPE
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_DL_RESID_TYPE
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_TT_RESID_TYPE
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_IR_RESID_TYPE
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_KO_RESID_TYPE
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_OID_RESID_TYPE
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != CLUSTER_RELMAP_RESID_TYPE,
+				 "block0 current resid type collides with a product namespace");
+StaticAssertDecl(CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE != UINT8_C(0xF3),
+				 "block0 current resid must avoid the known raw-layout/DL collision");
+
+static bool
+current_resid_namespace_valid(uint8 type)
+{
+	return type == UINT8_C(0xFB) && type > LOCKTAG_LAST_TYPE
+		   && type != CLUSTER_SQ_RESID_TYPE && type != CLUSTER_CF_RESID_TYPE
+		   && type != CLUSTER_HW_RESID_TYPE && type != CLUSTER_DL_RESID_TYPE
+		   && type != CLUSTER_TT_RESID_TYPE && type != CLUSTER_IR_RESID_TYPE
+		   && type != CLUSTER_KO_RESID_TYPE && type != CLUSTER_OID_RESID_TYPE
+		   && type != CLUSTER_RELMAP_RESID_TYPE && type != CLUSTER_UNDO_RESID_TYPE
+		   && type != CLUSTER_UNDO_BLOCK0_WALR_RESID_TYPE && type != UINT8_C(0xF3);
+}
+
+void
+cluster_undo_block0_current_init(void)
+{
+	if (!current_resid_namespace_valid(CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE))
+		ereport(FATAL, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("block0 current resource type namespace collision"),
+						errdetail("The frozen resource type 0xFB must remain distinct from "
+								  "PostgreSQL lock tags, product types 0xF0..0xF9, "
+								  "WAL retention type 0xFA, and the known private "
+								  "raw-layout/deadlock type 0xF3.")));
+}
+
+typedef enum ClusterUndoBlock0CurrentPhase {
+	CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED = 0,
+	CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT = 1,
+	CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD = 2,
+	CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT = 3,
+	CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP = 4,
+	CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR = 5
+} ClusterUndoBlock0CurrentPhase;
+
+typedef struct ClusterUndoBlock0CurrentGuardData {
+	/* Must remain first: exit cleanup owns a list of active guards. */
+	dlist_node active_node;
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterSemanticAdmissionToken admission;
+	TimestampTz deadline;
+	TimestampTz next_retry_at;
+	uint64 reservation_generation;
+	uint64 routing_generation;
+	int32 master_node;
+	int32 timeout_ms;
+	uint16 retry_attempt;
+	uint8 phase;
+	uint8 mode;
+	bool active_linked;
+	bool reply_installed;
+	bool remote_master;
+	bool reservation_held;
+	bool request_dispatched;
+	bool grant_observed;
+	uint8 reserved[18];
+} ClusterUndoBlock0CurrentGuardData;
+
+typedef struct ClusterUndoBlock0CurrentPinCleanup {
+	ClusterUndoBlock0CurrentGuard *guard;
+	ClusterUndoBlock0Pin *pin;
+	bool local_pin_held;
+} ClusterUndoBlock0CurrentPinCleanup;
+
+StaticAssertDecl(sizeof(ClusterUndoBlock0CurrentGuardData) == 168,
+				 "private block0 current guard must fill its exact 168-byte ABI");
+StaticAssertDecl(offsetof(ClusterUndoBlock0CurrentGuardData, active_node) == 0,
+				 "active dlist node must be the guard prefix");
+StaticAssertDecl(CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED == 0
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT == 1
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD == 2
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT == 3
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP == 4
+					 && CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR == 5,
+				 "block0 current phase values are frozen");
+
+static dlist_head current_active_guards = DLIST_STATIC_INIT(current_active_guards);
+static bool current_exit_hook_registered = false;
+
+static void current_backend_exit(int code, Datum arg);
+static void current_error_cleanup(int code, Datum arg);
+static void current_pin_error_cleanup(int code, Datum arg);
+
+static inline ClusterUndoBlock0CurrentGuardData *
+current_guard_data(ClusterUndoBlock0CurrentGuard *guard)
+{
+	return (ClusterUndoBlock0CurrentGuardData *)(void *)guard;
+}
+
+static inline bool
+current_phase_valid(uint8 phase)
+{
+	return phase <= CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR;
+}
+
+static inline void
+current_set_failure(ClusterUndoBlock0Result *failure, ClusterUndoBlock0Result result)
+{
+	if (failure != NULL)
+		*failure = result;
+}
+
+static ClusterUndoBlock0CurrentStep
+current_unused_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result result,
+					ClusterUndoBlock0Result *failure)
+{
+	if (data != NULL)
+		memset(data, 0, sizeof(*data));
+	current_set_failure(failure, result);
+	return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+}
+
+static bool
+current_resid_build(const ClusterUndoBlock0LogicalKey *logical, ClusterResId *resid)
+{
+	uint32 slot;
+
+	if (resid == NULL
+		|| cluster_undo_block0_logical_slot(logical, &slot) != CLUSTER_UNDO_BLOCK0_OK)
+		return false;
+
+	memset(resid, 0, sizeof(*resid));
+	resid->field1 = logical->segment_id;
+	resid->field2 = 0;
+	resid->field3 = 0;
+	resid->field4 = logical->owner_instance;
+	resid->type = CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE;
+	resid->lockmethodid = DEFAULT_LOCKMETHOD;
+	return true;
+}
+
+static bool
+current_resid_equal(const ClusterResId *a, const ClusterResId *b)
+{
+	return memcmp(a, b, sizeof(*a)) == 0;
+}
+
+static bool
+current_resid_already_active(const ClusterResId *resid)
+{
+	dlist_iter iter;
+
+	dlist_foreach(iter, &current_active_guards)
+	{
+		const ClusterUndoBlock0CurrentGuardData *other
+			= dlist_container(ClusterUndoBlock0CurrentGuardData, active_node, iter.cur);
+
+		if (other->active_linked && current_resid_equal(&other->resid, resid))
+			return true;
+	}
+	return false;
+}
+
+static void
+current_active_link(ClusterUndoBlock0CurrentGuardData *data)
+{
+	Assert(data != NULL && !data->active_linked);
+	dlist_node_init(&data->active_node);
+	dlist_push_tail(&current_active_guards, &data->active_node);
+	data->active_linked = true;
+}
+
+/* Register outside every PG_ENSURE block so temporary callbacks remain LIFO. */
+static void
+current_ensure_exit_hook(void)
+{
+	if (!current_exit_hook_registered) {
+		before_shmem_exit(current_backend_exit, (Datum)0);
+		current_exit_hook_registered = true;
+	}
+}
+
+static void
+current_active_unlink(ClusterUndoBlock0CurrentGuardData *data)
+{
+	if (data != NULL && data->active_linked) {
+		dlist_delete_thoroughly(&data->active_node);
+		data->active_linked = false;
+	}
+}
+
+/* Startup alone owns this local guard lane while recovery can publish R4. */
+bool
+cluster_undo_block0_current_startup_fenced_begin(
+	ClusterUndoBlock0CurrentGuard *guard)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+
+	if (guard == NULL)
+		return false;
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase)
+		|| data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED
+		|| memcmp(guard->opaque, (const uint8[168]){ 0 }, sizeof(guard->opaque)) != 0
+		|| !dlist_is_empty(&current_active_guards))
+		return false;
+
+	current_ensure_exit_hook();
+	current_active_link(data);
+	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR;
+	return true;
+}
+
+bool
+cluster_undo_block0_current_startup_fenced_end(
+	ClusterUndoBlock0CurrentGuard *guard)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+
+	if (guard == NULL)
+		return false;
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase)
+		|| data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR
+		|| !data->active_linked)
+		return false;
+
+	current_active_unlink(data);
+	memset(data, 0, sizeof(*data));
+	return true;
+}
+
+bool
+cluster_undo_block0_current_startup_fenced_owned(void)
+{
+	dlist_iter iter;
+
+	dlist_foreach(iter, &current_active_guards)
+	{
+		const ClusterUndoBlock0CurrentGuardData *data
+			= dlist_container(ClusterUndoBlock0CurrentGuardData,
+							  active_node, iter.cur);
+
+		if (data->active_linked
+			&& data->phase
+				   == CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR)
+			return true;
+	}
+	return false;
+}
+
+static void
+current_fill_reply_key(const ClusterUndoBlock0CurrentGuardData *data, uint32 opcode,
+					   GesReplyWaitKey *key)
+{
+	memset(key, 0, sizeof(*key));
+	key->request_id = data->holder.request_id;
+	key->source_node_id = (int32)data->holder.node_id;
+	key->dest_node_id = data->master_node;
+	key->request_opcode = opcode;
+	key->cluster_epoch = data->holder.cluster_epoch;
+}
+
+static void
+current_fill_request(const ClusterUndoBlock0CurrentGuardData *data, uint32 opcode,
+					 GesRequestPayload *request)
+{
+	memset(request, 0, sizeof(*request));
+	request->opcode = opcode;
+	request->lockmode = opcode == GES_REQ_OPCODE_RELEASE ? NoLock : data->mode;
+	request->holder_node_id = data->holder.node_id;
+	request->holder_procno = data->holder.procno;
+	request->holder_cluster_epoch_lo
+		= (uint32)(data->holder.cluster_epoch & UINT64_C(0xffffffff));
+	request->holder_cluster_epoch_hi = (uint32)(data->holder.cluster_epoch >> 32);
+	request->holder_request_id_lo
+		= (uint32)(data->holder.request_id & UINT64_C(0xffffffff));
+	request->holder_request_id_hi = (uint32)(data->holder.request_id >> 32);
+	memcpy(request->resid, &data->resid, sizeof(data->resid));
+	request->shard_master_generation_lo
+		= (uint32)(data->routing_generation & UINT64_C(0xffffffff));
+	request->shard_master_generation_hi = (uint32)(data->routing_generation >> 32);
+	/* Candidate-2 worker0 waits are deliberately outside the PGPROC WFG. */
+	request->waiter_xid = InvalidTransactionId;
+	request->wait_seq = 0;
+}
+
+static bool
+current_reply_install(ClusterUndoBlock0CurrentGuardData *data, uint32 opcode)
+{
+	GesReplyWaitKey key;
+
+	current_fill_reply_key(data, opcode, &key);
+	if (cluster_ges_reply_wait_insert(&key, data->deadline) == NULL)
+		return false;
+	data->reply_installed = true;
+	return true;
+}
+
+static void
+current_reply_delete(ClusterUndoBlock0CurrentGuardData *data, uint32 opcode)
+{
+	GesReplyWaitKey key;
+
+	if (data == NULL || !data->reply_installed)
+		return;
+	current_fill_reply_key(data, opcode, &key);
+	cluster_ges_reply_wait_delete(&key);
+	data->reply_installed = false;
+}
+
+static bool
+current_live_recheck(const ClusterUndoBlock0CurrentGuardData *data)
+{
+	uint64 routing_generation = 0;
+	int32 master;
+
+	if (data == NULL || !cluster_enabled || cluster_node_id < 0 || !cluster_lms_is_ready()
+		|| cluster_lmon_status() != CLUSTER_LMON_READY || !cluster_qvotec_in_quorum()
+		|| !cluster_membership_is_member(cluster_node_id)
+		|| !cluster_semantic_activation_recheck(&data->admission)
+		|| cluster_epoch_get_current() != data->holder.cluster_epoch
+		|| cluster_grd_shard_phase(cluster_grd_shard_for_resource(&data->resid))
+			   != GRD_SHARD_NORMAL)
+		return false;
+	master = cluster_grd_lookup_master_gen(&data->resid, &routing_generation);
+	return master == data->master_node && routing_generation == data->routing_generation;
+}
+
+static ClusterUndoBlock0Result
+current_failure_from_grd(ClusterGrdEntryResult result)
+{
+	if (result == CLUSTER_GRD_ENTRY_FULL)
+		return CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
+	return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+}
+
+static ClusterUndoBlock0Result
+current_failure_from_reject(uint32 reason)
+{
+	switch (reason) {
+	case GES_REJECT_REASON_WORK_QUEUE_FULL:
+		return CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
+	case GES_REJECT_REASON_EPOCH_MISMATCH:
+	case GES_REJECT_REASON_SHARD_FROZEN:
+	case GES_REJECT_REASON_FEATURE_NOT_SUPPORTED:
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	default:
+		return CLUSTER_UNDO_BLOCK0_IO_ERROR;
+	}
+}
+
+static void
+current_stage_remote_release(ClusterUndoBlock0CurrentGuardData *data)
+{
+	GesRequestPayload release;
+
+	current_fill_request(data, GES_REQ_OPCODE_RELEASE, &release);
+	cluster_grd_outbound_enqueue_cleanup_release((uint32)data->master_node, &release,
+											 sizeof(release));
+}
+
+static void
+current_stage_pending_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exiting)
+{
+	if (data->remote_master) {
+		GesReplyWaitKey key;
+		TimestampTz tombstone;
+		bool raced_grant = false;
+
+		if (data->reply_installed && data->request_dispatched) {
+			current_fill_reply_key(data, GES_REQ_OPCODE_REQUEST, &key);
+			tombstone = TimestampTzPlusMilliseconds(GetCurrentTimestamp(),
+												 CLUSTER_UNDO_BLOCK0_CURRENT_TOMBSTONE_MS);
+			raced_grant = cluster_ges_reply_wait_mark_abandoned(&key, tombstone);
+			data->reply_installed = false; /* tombstone is independently owned */
+		}
+		else if (data->reply_installed)
+			current_reply_delete(data, GES_REQ_OPCODE_REQUEST);
+		if (data->request_dispatched)
+			cluster_ges_send_cancel_wait(data->master_node, &data->resid, &data->holder, 0, 0,
+									 GES_CANCEL_WAIT_KIND_REQUEST);
+		if (raced_grant || data->grant_observed || (exiting && data->request_dispatched))
+			current_stage_remote_release(data);
+	} else {
+		current_reply_delete(data, GES_REQ_OPCODE_REQUEST);
+		if (data->request_dispatched) {
+			(void)cluster_grd_cancel_waiter_by_id_seq(&data->resid, &data->holder, 0);
+			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+		}
+	}
+	if (data->reservation_held) {
+		(void)cluster_grd_cancel_reservation_by_id(&data->resid, &data->holder);
+		data->reservation_held = false;
+	}
+}
+
+static void
+current_stage_no_wait_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exiting)
+{
+	bool admission_entered;
+
+	if (data == NULL || !current_phase_valid(data->phase))
+		return;
+	admission_entered = data->admission.entered;
+
+	switch ((ClusterUndoBlock0CurrentPhase)data->phase) {
+	case CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT:
+		current_stage_pending_cleanup(data, exiting);
+		break;
+	case CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD:
+		if (data->remote_master)
+			current_stage_remote_release(data);
+		else
+			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+		break;
+	case CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT:
+		if (data->remote_master) {
+			current_reply_delete(data, GES_REQ_OPCODE_RELEASE);
+			current_stage_remote_release(data);
+		} else
+			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+		break;
+	case CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED:
+	case CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP:
+	case CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR:
+		break;
+	}
+
+	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
+	current_active_unlink(data);
+	if (admission_entered && data->admission.entered)
+		cluster_semantic_activation_leave(&data->admission);
+}
+
+static void
+current_backend_exit(int code, Datum arg)
+{
+	dlist_mutable_iter iter;
+
+	(void)code;
+	(void)arg;
+	dlist_foreach_modify(iter, &current_active_guards)
+	{
+		ClusterUndoBlock0CurrentGuardData *data
+			= dlist_container(ClusterUndoBlock0CurrentGuardData, active_node, iter.cur);
+
+		current_stage_no_wait_cleanup(data, true);
+	}
+	current_exit_hook_registered = false;
+}
+
+static void
+current_error_cleanup(int code, Datum arg)
+{
+	ClusterUndoBlock0CurrentGuard *guard = (ClusterUndoBlock0CurrentGuard *)DatumGetPointer(arg);
+
+	(void)code;
+	if (guard != NULL)
+		current_stage_no_wait_cleanup(current_guard_data(guard), true);
+}
+
+
+static void
+current_pin_error_cleanup(int code, Datum arg)
+{
+	volatile ClusterUndoBlock0CurrentPinCleanup *cleanup
+		= (volatile ClusterUndoBlock0CurrentPinCleanup *)DatumGetPointer(arg);
+
+	if (cleanup == NULL)
+		return;
+	if (cleanup->local_pin_held) {
+		cluster_undo_block0_unpin(cleanup->pin);
+		cleanup->local_pin_held = false;
+	}
+	current_error_cleanup(code, PointerGetDatum(cleanup->guard));
+}
+
+static ClusterUndoBlock0CurrentStep
+current_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result result,
+			 ClusterUndoBlock0Result *failure)
+{
+	if (data != NULL && current_phase_valid(data->phase)
+		&& data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED
+		&& data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP)
+		current_stage_no_wait_cleanup(data, false);
+	current_set_failure(failure, result);
+	return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+}
+
+static ClusterUndoBlock0CurrentStep
+current_promote_grant(ClusterUndoBlock0CurrentGuardData *data,
+				  ClusterUndoBlock0Result *failure)
+{
+	ClusterGrdEntryResult result;
+
+	/* The master has granted; every failure from here must stage RELEASE. */
+	data->grant_observed = true;
+	if (!current_live_recheck(data)) {
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+	}
+	result = cluster_grd_revalidate_and_promote(&data->resid, &data->holder, cluster_node_id,
+											 data->reservation_generation);
+	data->reservation_held = false; /* promote or the helper's failed revalidate consumed it */
+	if (result != CLUSTER_GRD_ENTRY_OK)
+		return current_fail(data, current_failure_from_grd(result), failure);
+	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD;
+	return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
+									  ClusterUndoBlock0CurrentMode mode, int timeout_ms,
+									  ClusterUndoBlock0CurrentGuard *guard,
+									  ClusterUndoBlock0Result *failure)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	ClusterUndoBlock0CurrentStep step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	ClusterUndoBlock0Result fail = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterSemanticAdmissionResult admission_result;
+	ClusterGrdEntryResult reserve_result;
+	ClusterGrdGrantAction action;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nconflicts = 0;
+	int effective_timeout_ms;
+	uint64 epoch;
+	uint64 routing_generation = 0;
+	int32 master;
+	bool fast_path = false;
+	GesRequestPayload request;
+
+	if (guard == NULL || key == NULL || (mode != CLUSTER_UNDO_BLOCK0_SCUR
+										 && mode != CLUSTER_UNDO_BLOCK0_XCUR)) {
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	data = current_guard_data(guard);
+	/* Only the all-zero public initializer is a legal UNUSED representation. */
+	if (!current_phase_valid(data->phase) || data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED
+		|| memcmp(guard->opaque, (const uint8[168]){ 0 }, sizeof(guard->opaque)) != 0
+		|| !current_resid_build(key, &data->resid)) {
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	if (current_resid_already_active(&data->resid)) {
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+	}
+	if (!cluster_enabled || cluster_node_id < 0 || !cluster_lms_is_ready()
+		|| cluster_lmon_status() != CLUSTER_LMON_READY || !cluster_qvotec_in_quorum()
+		|| !cluster_membership_is_member(cluster_node_id)) {
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+	}
+
+	effective_timeout_ms
+		= (timeout_ms == -1
+		   || (timeout_ms == 0 && cluster_ges_request_timeout_ms == -1))
+			  ? -1
+			  : (timeout_ms > 0 ? timeout_ms : cluster_ges_request_timeout_ms);
+	if (timeout_ms < -1 || effective_timeout_ms == 0 || effective_timeout_ms < -1) {
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+	}
+	epoch = cluster_epoch_get_current();
+	master = cluster_grd_lookup_master_gen(&data->resid, &routing_generation);
+	if (master < 0 || cluster_grd_shard_phase(cluster_grd_shard_for_resource(&data->resid))
+						 != GRD_SHARD_NORMAL) {
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+	}
+
+	memset(&data->holder, 0, sizeof(data->holder));
+	data->holder.node_id = (uint32)cluster_node_id;
+	data->holder.procno = (uint32)(MyProc != NULL ? MyProc->pgprocno : 0);
+	data->holder.cluster_epoch = epoch;
+	data->holder.request_id = cluster_ges_reply_wait_next_request_id();
+	if (data->holder.request_id == 0) {
+		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
+	}
+	data->logical = *key;
+	data->routing_generation = routing_generation;
+	data->master_node = master;
+	data->timeout_ms = effective_timeout_ms;
+	data->mode = (uint8)mode;
+	data->remote_master = master != cluster_node_id;
+	data->deadline = effective_timeout_ms < 0
+						 ? 0
+						 : TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective_timeout_ms);
+	data->next_retry_at = TimestampTzPlusMilliseconds(
+		GetCurrentTimestamp(), CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS);
+
+	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+												CLUSTER_SEMANTIC_TARGET_SIDE,
+												&data->admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		memset(data, 0, sizeof(*data));
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	current_ensure_exit_hook();
+	current_active_link(data);
+	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT;
+
+	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	{
+		reserve_result
+			= cluster_grd_try_reserve(&data->resid, &data->holder, data->mode, cluster_node_id,
+									  &fast_path, &data->reservation_generation);
+		if (reserve_result != CLUSTER_GRD_ENTRY_OK) {
+			fail = current_failure_from_grd(reserve_result);
+			goto acquire_done;
+		}
+		data->reservation_held = true;
+
+		/* Correlation exists before either master can complete a grant decision. */
+		if (!current_reply_install(data, GES_REQ_OPCODE_REQUEST)) {
+			fail = CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
+			goto acquire_done;
+		}
+
+		if (!data->remote_master) {
+			action = cluster_grd_entry_enqueue_or_grant(
+				&data->resid, &data->holder, cluster_node_id, data->holder.request_id,
+				data->routing_generation, GES_REQ_OPCODE_REQUEST, data->mode, conflicts,
+				&nconflicts);
+			if (action == CLUSTER_GRD_GRANT_NOW) {
+				data->request_dispatched = true;
+				data->grant_observed = true;
+				current_reply_delete(data, GES_REQ_OPCODE_REQUEST);
+				step = current_promote_grant(data, failure);
+				goto acquire_done;
+			}
+			if (action != CLUSTER_GRD_ENQUEUED_WAITER) {
+				fail = CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
+				goto acquire_done;
+			}
+			data->request_dispatched = true;
+			if (nconflicts > 0)
+				cluster_ges_send_bast_targeted(&data->resid, data->mode, conflicts, nconflicts);
+		} else {
+			current_fill_request(data, GES_REQ_OPCODE_REQUEST, &request);
+			if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &request,
+														 sizeof(request))) {
+				fail = CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
+				goto acquire_done;
+			}
+			data->request_dispatched = true;
+		}
+		step = CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+
+acquire_done:
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+			step = current_fail(data, fail, failure);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	return step;
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
+										ClusterUndoBlock0Result *failure)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	GesReplyWaitKey key;
+	GesReplyWaitVerdict verdict;
+	GesReplyWaitPollResult poll_result;
+	TimestampTz now;
+
+	if (guard == NULL) {
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase))
+		return current_fail(NULL, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+	if (data->phase == CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD)
+		return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
+	if (data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT)
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+
+	memset(&verdict, 0, sizeof(verdict));
+	current_fill_reply_key(data, GES_REQ_OPCODE_REQUEST, &key);
+	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	{
+		poll_result = cluster_ges_reply_wait_poll_consume(&key, &verdict);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	if (poll_result == GES_REPLY_WAIT_POLL_DELIVERED) {
+		data->reply_installed = false;
+		if (verdict.reply_opcode == GES_REPLY_OPCODE_GRANT
+			&& verdict.reject_reason == GES_REJECT_REASON_NONE) {
+			data->grant_observed = true;
+			return current_promote_grant(data, failure);
+		}
+		return current_fail(data, current_failure_from_reject(verdict.reject_reason), failure);
+	}
+	if (poll_result != GES_REPLY_WAIT_POLL_PENDING)
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+	if (!current_live_recheck(data))
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+
+	now = GetCurrentTimestamp();
+	if (data->deadline != 0 && now >= data->deadline)
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+	if (data->remote_master && now >= data->next_retry_at) {
+		GesRequestPayload request;
+		int backoff_ms;
+
+		if (data->timeout_ms >= 0 && cluster_ges_retransmit_max_attempts > 0
+			&& data->retry_attempt >= (uint16)cluster_ges_retransmit_max_attempts)
+			return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		current_fill_request(data, GES_REQ_OPCODE_REQUEST, &request);
+		if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &request,
+														 sizeof(request)))
+			return current_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
+		data->retry_attempt++;
+		backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS << Min(data->retry_attempt, 4);
+		if (backoff_ms > CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS)
+			backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS;
+		data->next_retry_at = TimestampTzPlusMilliseconds(now, backoff_ms);
+	}
+	return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+}
+
+void
+cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	bool admission_entered;
+
+	if (guard == NULL)
+		return;
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase))
+		return;
+	admission_entered = data->admission.entered;
+	if (data->phase == CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT)
+		current_stage_pending_cleanup(data, false);
+	else if (data->phase == CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD
+			 || data->phase == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT)
+		current_stage_no_wait_cleanup(data, false);
+	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
+	current_active_unlink(data);
+	if (admission_entered && data->admission.entered)
+		cluster_semantic_activation_leave(&data->admission);
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
+										ClusterUndoBlock0Result *failure)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	GesRequestPayload release;
+
+	if (guard == NULL) {
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase)
+		|| data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD)
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+	if (!current_live_recheck(data))
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+
+	if (!data->remote_master) {
+		cluster_ges_release_and_drain_local(&data->resid, &data->holder);
+		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
+		current_active_unlink(data);
+		if (data->admission.entered)
+			cluster_semantic_activation_leave(&data->admission);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+	}
+
+	data->deadline = data->timeout_ms < 0
+						 ? 0
+						 : TimestampTzPlusMilliseconds(GetCurrentTimestamp(), data->timeout_ms);
+	data->next_retry_at = TimestampTzPlusMilliseconds(
+		GetCurrentTimestamp(), CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS);
+	data->retry_attempt = 0;
+	if (!current_reply_install(data, GES_REQ_OPCODE_RELEASE))
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
+	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT;
+	current_fill_request(data, GES_REQ_OPCODE_RELEASE, &release);
+	if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &release,
+													 sizeof(release))) {
+		/* Reliable queue owns delivery, while the mirror remains until ACK/cleanup. */
+		cluster_grd_outbound_enqueue_cleanup_release((uint32)data->master_node, &release,
+											 sizeof(release));
+	}
+	return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard,
+									   ClusterUndoBlock0Result *failure)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	GesReplyWaitKey key;
+	GesReplyWaitVerdict verdict;
+	GesReplyWaitPollResult poll_result;
+	TimestampTz now;
+
+	if (guard == NULL) {
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase)
+		|| data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT)
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+	memset(&verdict, 0, sizeof(verdict));
+	current_fill_reply_key(data, GES_REQ_OPCODE_RELEASE, &key);
+	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	{
+		poll_result = cluster_ges_reply_wait_poll_consume(&key, &verdict);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	if (poll_result == GES_REPLY_WAIT_POLL_DELIVERED) {
+		data->reply_installed = false;
+		if (verdict.reply_opcode != GES_REPLY_OPCODE_GRANT
+			|| verdict.reject_reason != GES_REJECT_REASON_NONE) {
+			return current_fail(data, current_failure_from_reject(verdict.reject_reason), failure);
+		}
+		(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
+		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
+		current_active_unlink(data);
+		if (data->admission.entered)
+			cluster_semantic_activation_leave(&data->admission);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
+	}
+	if (poll_result != GES_REPLY_WAIT_POLL_PENDING)
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+	now = GetCurrentTimestamp();
+	if (data->deadline != 0 && now >= data->deadline) {
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+	}
+	if (now >= data->next_retry_at) {
+		GesRequestPayload release;
+		int backoff_ms;
+
+		if (data->timeout_ms >= 0 && cluster_ges_retransmit_max_attempts > 0
+			&& data->retry_attempt >= (uint16)cluster_ges_retransmit_max_attempts) {
+			return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		}
+		current_fill_request(data, GES_REQ_OPCODE_RELEASE, &release);
+		if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &release,
+														 sizeof(release)))
+			current_stage_remote_release(data);
+		data->retry_attempt++;
+		backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS << Min(data->retry_attempt, 4);
+		if (backoff_ms > CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS)
+			backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS;
+		data->next_retry_at = TimestampTzPlusMilliseconds(now, backoff_ms);
+	}
+	return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+}
+
+static ClusterUndoBlock0Result
+current_held_scur_proof(ClusterUndoBlock0CurrentGuard *guard,
+						ClusterUndoBlock0CurrentGuardData **data_out,
+						ClusterUndoBlock0AuthorityProof *proof)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+
+	if (guard == NULL || data_out == NULL || proof == NULL)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase)
+		|| data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD
+		|| data->mode != CLUSTER_UNDO_BLOCK0_SCUR)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	if (!current_live_recheck(data))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	memset(proof, 0, sizeof(*proof));
+	proof->kind = CLUSTER_UNDO_BLOCK0_LIVE_OWNER;
+	proof->owner_instance = data->logical.owner_instance;
+	proof->cluster_epoch_present = true;
+	proof->cluster_epoch = data->holder.cluster_epoch;
+	*data_out = data;
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+
+static ClusterUndoBlock0Result
+current_held_xcur_proof(ClusterUndoBlock0CurrentGuard *guard,
+						ClusterUndoBlock0CurrentGuardData **data_out,
+						ClusterUndoBlock0AuthorityProof *proof)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+
+	if (guard == NULL || data_out == NULL || proof == NULL)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	data = current_guard_data(guard);
+	if (!current_phase_valid(data->phase)
+		|| data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD
+		|| data->mode != CLUSTER_UNDO_BLOCK0_XCUR)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	if (!current_live_recheck(data))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	memset(proof, 0, sizeof(*proof));
+	proof->kind = CLUSTER_UNDO_BLOCK0_LIVE_OWNER;
+	proof->owner_instance = data->logical.owner_instance;
+	proof->cluster_epoch_present = true;
+	proof->cluster_epoch = data->holder.cluster_epoch;
+	*data_out = data;
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+ClusterUndoBlock0Result
+cluster_undo_block0_current_sample_generation(ClusterUndoBlock0CurrentGuard *guard,
+										  const ClusterUndoBlock0ResolvedRoot *root,
+										  ClusterUndoBlock0Generation *observed)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	ClusterUndoBlock0AuthorityProof proof;
+	ClusterUndoBlock0Generation sampled;
+	ClusterUndoBlock0Result result;
+
+	if (root == NULL || observed == NULL)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	result = current_held_scur_proof(guard, &data, &proof);
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	{
+		result = cluster_undo_block0_sample_resident_generation(
+			&data->logical, root, &proof, &sampled);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	if (!sampled.known || sampled.value == UINT32_MAX)
+		return CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+	if (!current_live_recheck(data))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	*observed = sampled;
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+ClusterUndoBlock0Result
+cluster_undo_block0_current_copy_resident(ClusterUndoBlock0CurrentGuard *guard,
+									 const ClusterUndoBlock0ResolvedRoot *root,
+									 const ClusterUndoBlock0Generation *expected,
+									 char private_page[BLCKSZ])
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	ClusterUndoBlock0AuthorityProof proof;
+	ClusterUndoBlock0Generation observed;
+	ClusterUndoBlock0Result result;
+	char image[BLCKSZ];
+
+	if (root == NULL || expected == NULL || !expected->known || expected->value == UINT32_MAX
+		|| private_page == NULL)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	result = current_held_scur_proof(guard, &data, &proof);
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	{
+		result = cluster_undo_block0_copy_resident(
+			&data->logical, root, expected, &proof, image, &observed);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	if (!observed.known || observed.value == UINT32_MAX || observed.value != expected->value)
+		return CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+	if (!current_live_recheck(data))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	memcpy(private_page, image, BLCKSZ);
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+
+ClusterUndoBlock0Result
+cluster_undo_block0_current_pin_exclusive(ClusterUndoBlock0CurrentGuard *guard,
+										const ClusterUndoBlock0ResolvedRoot *root,
+										const ClusterUndoBlock0Generation *expected,
+										ClusterUndoBlock0Pin *pin, char **page)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	ClusterUndoBlock0AuthorityProof proof;
+	ClusterUndoBlock0Pin private_pin;
+	volatile ClusterUndoBlock0CurrentPinCleanup cleanup;
+	ClusterUndoBlock0Result result;
+	char *private_page = NULL;
+
+	if (root == NULL || expected == NULL || !expected->known || expected->value == UINT32_MAX
+		|| pin == NULL || page == NULL)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	result = current_held_xcur_proof(guard, &data, &proof);
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+
+	memset(&private_pin, 0, sizeof(private_pin));
+	private_pin.slot = -1;
+	cleanup.guard = guard;
+	cleanup.pin = &private_pin;
+	cleanup.local_pin_held = false;
+	PG_ENSURE_ERROR_CLEANUP(current_pin_error_cleanup,
+							PointerGetDatum((ClusterUndoBlock0CurrentPinCleanup *)&cleanup));
+	{
+		result = cluster_undo_block0_pin(&data->logical, root, expected,
+										 CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &private_pin,
+										 &private_page);
+		if (result == CLUSTER_UNDO_BLOCK0_OK) {
+			cleanup.local_pin_held = true;
+			if (!current_live_recheck(data)) {
+				cluster_undo_block0_unpin(&private_pin);
+				cleanup.local_pin_held = false;
+				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			}
+		}
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(
+		current_pin_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0CurrentPinCleanup *)&cleanup));
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	*pin = private_pin;
+	*page = private_page;
+	return CLUSTER_UNDO_BLOCK0_OK;
+}

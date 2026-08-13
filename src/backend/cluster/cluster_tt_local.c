@@ -47,7 +47,9 @@
 
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_scn.h" /* S3 forensics — floor-lag vs current SCN in errdetail */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h" /* spec-3.11 D4 durable commit */
 #include "cluster/cluster_tt_local.h"
@@ -623,10 +625,37 @@ install_status(TransactionId xid, ClusterTTStatus status, SCN commit_scn)
 /* public API                                                   */
 /* ------------------------------------------------------------ */
 
+static bool
+cluster_tt_local_writable_admission(void)
+{
+	ClusterJoinGateVerdict verdict = cluster_reconfig_self_join_gate_verdict();
+
+	if (verdict == CLUSTER_JOIN_GATE_BLOCK_53R61)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_JOIN_REJECTED_STALE),
+				 errmsg("cannot commit a transaction: this node's cluster join was rejected"),
+				 errhint("Restart this node so it presents a fresh cluster incarnation.")));
+	return verdict == CLUSTER_JOIN_GATE_ALLOW;
+}
+
+
+static void
+cluster_tt_local_modifier_recheck_or_error(const ClusterSemanticAdmissionToken *token)
+{
+	if (!cluster_semantic_activation_modifier_recheck(token,
+			cluster_tt_local_writable_admission()))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot commit a transaction: cluster reconfiguration in progress"),
+				 errhint("The transaction was refused before its commit record; retry is safe.")));
+}
+
 bool
 cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 										  xl_xact_tt_commit *out_fold)
 {
+	ClusterSemanticAdmissionToken modifier_token;
+	ClusterSemanticAdmissionResult admission;
 	uint32 segment_id;
 	uint16 slot_offset;
 	uint32 tt_slot_id;
@@ -656,30 +685,47 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 									   &wrap))
 		return false;
 
-	/*
-	 * spec-3.12 D2b: use the wrap captured at bind time, NOT a fresh
-	 * cluster_tt_slot_get_wrap() -- a peer backend may have rolled this node's
-	 * TT allocator to a new segment since this xact bound, which would make a
-	 * fresh read of the (now stale) segment ERROR.  The slot is held ACTIVE for
-	 * the whole xact, so its wrap cannot have changed.
-	 */
-	owner
-		= cluster_tt_slot_durable_commit_writeonly(segment_id, slot_offset, xid, wrap, commit_scn);
+	admission = cluster_semantic_activation_modifier_enter(
+		cluster_tt_local_writable_admission(), &modifier_token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot commit a transaction: cluster reconfiguration in progress"),
+				 errhint("The transaction was refused before its commit record; retry is safe.")));
 
-	/*
-	 * Build the fold delta (mirrors xl_undo_tt_slot_commit fields).  xid is the
-	 * committing top-xid (== slot owner for a non-prepared xact); instance is
-	 * the slot's owner instance, needed for path resolution at redo.
-	 */
-	out_fold->segment_id = segment_id;
-	out_fold->slot_offset = slot_offset;
-	out_fold->wrap = wrap;
-	out_fold->xid = xid;
-	out_fold->instance = owner;
-	out_fold->_pad[0] = 0;
-	out_fold->_pad[1] = 0;
-	out_fold->_pad[2] = 0;
-	out_fold->commit_scn = commit_scn;
+	PG_TRY();
+	{
+		/*
+		 * spec-3.12 D2b: use the wrap captured at bind time, NOT a fresh
+		 * cluster_tt_slot_get_wrap() -- a peer backend may have rolled this node's
+		 * TT allocator to a new segment since this xact bound, which would make a
+		 * fresh read of the (now stale) segment ERROR.  The slot is held ACTIVE for
+		 * the whole xact, so its wrap cannot have changed.
+		 */
+		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+		owner = cluster_tt_slot_durable_commit_writeonly(segment_id, slot_offset, xid, wrap,
+											 commit_scn);
+
+		/*
+		 * Build the fold delta (mirrors xl_undo_tt_slot_commit fields).  xid is the
+		 * committing top-xid (== slot owner for a non-prepared xact); instance is
+		 * the slot's owner instance, needed for path resolution at redo.
+		 */
+		out_fold->segment_id = segment_id;
+		out_fold->slot_offset = slot_offset;
+		out_fold->wrap = wrap;
+		out_fold->xid = xid;
+		out_fold->instance = owner;
+		out_fold->_pad[0] = 0;
+		out_fold->_pad[1] = 0;
+		out_fold->_pad[2] = 0;
+		out_fold->commit_scn = commit_scn;
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&modifier_token);
+	}
+	PG_END_TRY();
 	return true;
 }
 

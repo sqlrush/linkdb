@@ -178,10 +178,27 @@ UT_TEST(test_block_has_space)
 }
 
 
+UT_TEST(test_record_slot_range_stays_inside_data_region)
+{
+	UT_ASSERT(cluster_undo_record_slot_range_valid(1, 0,
+										 sizeof(UndoBlockHeader), 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(0, 0,
+										  sizeof(UndoBlockHeader), 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 1,
+										  sizeof(UndoBlockHeader), 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(UINT16_MAX, 0,
+										  sizeof(UndoBlockHeader), 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 0, BLCKSZ - 32, 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 0, BLCKSZ - 8, 8));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 0,
+										  sizeof(UndoBlockHeader) - 1, 64));
+}
+
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 
 	UT_RUN(test_undo_block_header);
 	UT_RUN(test_undo_slot_dir_entry);
@@ -195,6 +212,7 @@ main(int argc, char **argv)
 	UT_RUN(test_undo_record_type);
 	UT_RUN(test_sqlstate_53R9D);
 	UT_RUN(test_block_has_space);
+	UT_RUN(test_record_slot_range_stays_inside_data_region);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

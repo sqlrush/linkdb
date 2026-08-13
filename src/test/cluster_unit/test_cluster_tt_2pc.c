@@ -35,6 +35,10 @@
 
 #include "cluster/cluster_tt_2pc.h"
 
+#ifndef TT_2PC_SOURCE_PATH
+#error "TT_2PC_SOURCE_PATH must identify cluster_tt_2pc.c"
+#endif
+
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
  * stdlib printf (libpgport is linked for CRC32C only). */
 #undef printf
@@ -42,6 +46,44 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+
+static char *
+read_tt_2pc_source(void)
+{
+	FILE *fp;
+	char *source;
+	long length;
+	size_t nread;
+
+	fp = fopen(TT_2PC_SOURCE_PATH, "rb");
+	UT_ASSERT_NOT_NULL(fp);
+	if (fp == NULL)
+		return NULL;
+	UT_ASSERT_EQ(fseek(fp, 0, SEEK_END), 0);
+	length = ftell(fp);
+	UT_ASSERT(length > 0);
+	UT_ASSERT_EQ(fseek(fp, 0, SEEK_SET), 0);
+	if (length <= 0) {
+		fclose(fp);
+		return NULL;
+	}
+	source = malloc((size_t)length + 1);
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) {
+		fclose(fp);
+		return NULL;
+	}
+	nread = fread(source, 1, (size_t)length, fp);
+	fclose(fp);
+	UT_ASSERT_EQ(nread, (size_t)length);
+	if (nread != (size_t)length) {
+		free(source);
+		return NULL;
+	}
+	source[length] = '\0';
+	return source;
+}
 
 
 static ClusterTT2PCBinding
@@ -280,6 +322,81 @@ UT_TEST(test_s13_v2_null_heads_all_invalid)
 	UT_ASSERT_EQ((int)UBA_is_invalid(p.heads[0]), 1);
 }
 
+/*
+ * Spec 8.4A I18/I19: COMMIT/ROLLBACK PREPARED is an ordinary live modifier.
+ * It must own the common modifier debt before parsing or touching durable TT,
+ * recheck that admission at each binding, and release through one ERROR-safe
+ * funnel.  This source-edge test complements the pure record fixture without
+ * linking the full backend-only prefinish call graph.
+ */
+UT_TEST(test_s14_prefinish_is_modifier_gated_and_error_safe)
+{
+	char *source = read_tt_2pc_source();
+	const char *start;
+	const char *end;
+	const char *enter;
+	const char *try_block;
+	const char *parse;
+	const char *loop;
+	const char *commit_recheck;
+	const char *durable_commit;
+	const char *abort_recheck;
+	const char *durable_abort;
+	const char *head_recheck;
+	const char *durable_set_head;
+	const char *finally_block;
+	const char *leave;
+
+	if (source == NULL)
+		return;
+	start = strstr(source, "\ncluster_tt_twophase_prefinish(");
+	end = start == NULL ? NULL : strstr(start, "\n}\n\n#endif /* USE_PGRAC_CLUSTER */");
+	enter = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_enter(");
+	try_block = start == NULL ? NULL : strstr(start, "PG_TRY();");
+	parse = start == NULL ? NULL : strstr(start, "parse_or_corrupt(");
+	loop = start == NULL ? NULL : strstr(start, "for (i = 0; i < p.nbindings; i++)");
+	commit_recheck
+		= loop == NULL ? NULL : strstr(loop, "cluster_tt_twophase_modifier_recheck_or_error(");
+	durable_commit = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_commit(");
+	abort_recheck = durable_commit == NULL
+					? NULL
+					: strstr(durable_commit, "cluster_tt_twophase_modifier_recheck_or_error(");
+	durable_abort = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_abort(");
+	head_recheck = durable_abort == NULL
+				   ? NULL
+				   : strstr(durable_abort, "cluster_tt_twophase_modifier_recheck_or_error(");
+	durable_set_head = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_set_head(");
+	finally_block = start == NULL ? NULL : strstr(start, "PG_FINALLY();");
+	leave = finally_block == NULL
+				? NULL
+				: strstr(finally_block, "cluster_semantic_activation_leave(");
+
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(enter);
+	UT_ASSERT_NOT_NULL(try_block);
+	UT_ASSERT_NOT_NULL(parse);
+	UT_ASSERT_NOT_NULL(loop);
+	UT_ASSERT_NOT_NULL(commit_recheck);
+	UT_ASSERT_NOT_NULL(durable_commit);
+	UT_ASSERT_NOT_NULL(abort_recheck);
+	UT_ASSERT_NOT_NULL(durable_abort);
+	UT_ASSERT_NOT_NULL(head_recheck);
+	UT_ASSERT_NOT_NULL(durable_set_head);
+	UT_ASSERT_NOT_NULL(finally_block);
+	UT_ASSERT_NOT_NULL(leave);
+	if (start != NULL && end != NULL && enter != NULL && try_block != NULL && parse != NULL
+		&& loop != NULL && commit_recheck != NULL && durable_commit != NULL
+		&& abort_recheck != NULL && durable_abort != NULL && head_recheck != NULL
+		&& durable_set_head != NULL && finally_block != NULL && leave != NULL)
+		UT_ASSERT(start < enter && enter < try_block && try_block < parse && parse < loop
+				  && loop < commit_recheck && commit_recheck < durable_commit
+				  && durable_commit < abort_recheck && abort_recheck < durable_abort
+				  && durable_abort < head_recheck && head_recheck < durable_set_head
+				  && durable_set_head < finally_block && finally_block < leave && leave < end);
+	free(source);
+}
+
 
 int
 main(void)
@@ -297,6 +414,7 @@ main(void)
 	UT_RUN(test_s11_count_tamper_trips_length_check);
 	UT_RUN(test_s12_v2_heads_roundtrip);
 	UT_RUN(test_s13_v2_null_heads_all_invalid);
+	UT_RUN(test_s14_prefinish_is_modifier_gated_and_error_safe);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

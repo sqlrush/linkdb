@@ -413,8 +413,18 @@ extern pid_t cluster_lms_get_worker_pid(int worker_id);
  */
 extern bool cluster_lms_data_plane_startup(int worker_id, int n_workers);
 extern bool cluster_lms_data_plane_enabled(void);
+extern void cluster_lms_data_plane_close_peer_now(int32 peer_id);
 extern void cluster_lms_data_plane_tick(long timeout_ms);
 extern void cluster_lms_data_plane_shutdown(void);
+
+#ifdef USE_CLUSTER_UNIT
+extern void cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd,
+											  bool connected, bool enabled,
+											  bool wes_dirty);
+extern bool cluster_lms_data_plane_test_peer_snapshot(int32 peer_id,
+											  int *fd_out, bool *down_out,
+											  bool *wes_dirty_out);
+#endif
 
 /*
  * PGRAC: spec-7.2 D4 + spec-7.3 D4 — wake a specific DATA worker + the

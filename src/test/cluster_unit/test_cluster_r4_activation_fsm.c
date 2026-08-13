@@ -9,8 +9,14 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_epoch_ballot.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "port/atomics.h"
 #include "storage/ipc.h"
 #include "storage/shmem.h"
@@ -42,8 +48,18 @@ static int test_peer_capability_match_calls;
 static int32 test_peer_capability_match_peer;
 static uint32 test_peer_capability_match_caps;
 static uint32 test_peer_capability_match_generation;
+static int test_phase3_observe_calls;
+static ClusterReplacementPhase3HandoffItem test_phase3_observed_item;
+static int test_admitted_snapshot_calls;
+static bool test_admitted_snapshot_valid;
+static ClusterReplacementEpisode test_admitted_snapshot_episode;
+static ClusterReplacementCommitMarkerV3 test_admitted_snapshot_marker;
+static ClusterR4PrerequisiteSnapshot test_r4a_snapshot = {
+	.target_node_id = -1,
+};
 
 int MyProcPid = 101;
+int cluster_node_id = 1;
 volatile sig_atomic_t InterruptPending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
@@ -86,6 +102,56 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_cap
 	test_peer_capability_match_caps = required_capabilities;
 	test_peer_capability_match_generation = expected_generation;
 	return test_peer_capability_matches;
+}
+
+bool
+cluster_reconfig_lmon_observe_replacement_ready(
+	const ClusterReplacementPhase3HandoffItem *item)
+{
+	test_phase3_observe_calls++;
+	if (item != NULL)
+		test_phase3_observed_item = *item;
+	return item != NULL;
+}
+
+bool
+cluster_reconfig_lmon_snapshot_replacement_admitted(
+	ClusterReplacementEpisode *out_episode,
+	ClusterReplacementCommitMarkerV3 *out_marker)
+{
+	test_admitted_snapshot_calls++;
+	if (!test_admitted_snapshot_valid || out_episode == NULL || out_marker == NULL)
+		return false;
+	*out_episode = test_admitted_snapshot_episode;
+	*out_marker = test_admitted_snapshot_marker;
+	return true;
+}
+
+static ClusterR4PrerequisiteSnapshot
+test_r4a_prerequisite_snapshot(void)
+{
+	return test_r4a_snapshot;
+}
+
+/* Satisfy the independently linked block0 facade; this fixture overrides the
+ * activation module's prerequisite call with test_r4a_prerequisite_snapshot. */
+ClusterR4PrerequisiteSnapshot
+cluster_reconfig_r4_prerequisite_snapshot(void)
+{
+	return test_r4a_snapshot;
+}
+
+bool
+cluster_reconfig_r4_publish_ready(
+	const ClusterR4PrerequisiteSnapshot *expected pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_undo_block0_current_startup_fenced_owned(void)
+{
+	return false;
 }
 
 static void
@@ -136,6 +202,7 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 }
 
 /* Exercise the real product-local policy helpers without exporting a test API. */
+#define cluster_undo_block0_r4_prerequisite_snapshot test_r4a_prerequisite_snapshot
 #include "../../backend/cluster/cluster_semantic_activation.c"
 
 #undef printf
@@ -190,6 +257,16 @@ test_gate_reset(void)
 	test_peer_capability_match_peer = -1;
 	test_peer_capability_match_caps = 0;
 	test_peer_capability_match_generation = UINT32_MAX;
+	test_phase3_observe_calls = 0;
+	memset(&test_phase3_observed_item, 0, sizeof(test_phase3_observed_item));
+	test_admitted_snapshot_calls = 0;
+	test_admitted_snapshot_valid = false;
+	memset(&test_admitted_snapshot_episode, 0,
+		   sizeof(test_admitted_snapshot_episode));
+	memset(&test_admitted_snapshot_marker, 0,
+		   sizeof(test_admitted_snapshot_marker));
+	memset(&test_r4a_snapshot, 0, sizeof(test_r4a_snapshot));
+	test_r4a_snapshot.target_node_id = -1;
 	MyProcPid = 101;
 	SemanticActivationShmem = NULL;
 	memset(semantic_activation_local_inflight, 0, sizeof(semantic_activation_local_inflight));
@@ -225,7 +302,7 @@ valid_ack(void)
 		.boot_id = UINT64_C(0x101),
 		.admitted_incarnation = UINT64_C(0x202),
 		.control_connection_generation = UINT64_C(0x303),
-		.capability_word = UINT32_C(0x3000),
+		.capability_word = UINT32_C(0x00303000),
 		.capability_generation = UINT64_C(0x404),
 		.transition_epoch = UINT64_C(0x505),
 		.record_generation = UINT64_C(0x606),
@@ -288,6 +365,8 @@ UT_TEST(test_02_required_hello_caps_are_frozen)
 {
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1, UINT32_C(0x00001000));
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1, UINT32_C(0x00002000));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1, UINT32_C(0x00100000));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1, UINT32_C(0x00200000));
 }
 
 UT_TEST(test_03_action_values_are_frozen)
@@ -337,7 +416,7 @@ UT_TEST(test_08_r4_descriptor_caps_and_active_bits)
 	const ClusterSemanticActivationDescriptor *descriptor
 		= cluster_semantic_activation_r4_descriptor();
 
-	UT_ASSERT_EQ(descriptor->required_hello_caps, UINT32_C(0x00003000));
+	UT_ASSERT_EQ(descriptor->required_hello_caps, UINT32_C(0x00303000));
 	UT_ASSERT_EQ(descriptor->required_active_bits, 0);
 }
 
@@ -579,6 +658,36 @@ UT_TEST(test_75_null_expected_ack_never_matches)
 	UT_ASSERT(!semantic_activation_ack_matches(&observed, NULL));
 }
 
+UT_TEST(test_75a_d13_full_ack_table_requires_exact_member_set_and_tuples)
+{
+	SemanticActivationAckTuple expected[CLUSTER_MAX_NODES];
+	SemanticActivationAckTuple observed[CLUSTER_MAX_NODES];
+	uint64 members_lo = (UINT64_C(1) << 1) | (UINT64_C(1) << 3);
+
+	memset(expected, 0, sizeof(expected));
+	memset(observed, 0, sizeof(observed));
+	expected[1] = valid_ack();
+	expected[1].node_id = 1;
+	expected[3] = valid_ack();
+	expected[3].node_id = 3;
+	expected[3].boot_id++;
+	observed[1] = expected[1];
+	observed[3] = expected[3];
+
+	UT_ASSERT(semantic_activation_full_ack_table_matches(
+		observed, members_lo, 0, expected, members_lo, 0));
+	observed[3].capability_generation++;
+	UT_ASSERT(!semantic_activation_full_ack_table_matches(
+		observed, members_lo, 0, expected, members_lo, 0));
+	observed[3] = expected[3];
+	UT_ASSERT(!semantic_activation_full_ack_table_matches(
+		observed, members_lo & ~(UINT64_C(1) << 3), 0,
+		expected, members_lo, 0));
+	UT_ASSERT(!semantic_activation_full_ack_table_matches(
+		observed, members_lo | (UINT64_C(1) << 4), 0,
+		expected, members_lo, 0));
+}
+
 UT_TEST(test_76_inactive_feature_source_is_admitted)
 {
 	UT_ASSERT_EQ(
@@ -649,13 +758,35 @@ UT_TEST(test_85_zero_feature_is_closed)
 		CLUSTER_SEMANTIC_ADMISSION_CLOSED);
 }
 
+UT_TEST(test_85a_modifier_gate_requires_durable_source_or_target_open)
+{
+	UT_ASSERT_EQ(
+		semantic_activation_admission_policy(1, 0, true, CLUSTER_SEMANTIC_SOURCE_SIDE, 0, 0),
+		CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(!semantic_activation_modifier_policy(0, 0, true));
+	UT_ASSERT(semantic_activation_modifier_policy(0, 8, false));
+	UT_ASSERT(semantic_activation_modifier_policy(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 9, false));
+}
+
+UT_TEST(test_85b_modifier_gate_closes_replacement_until_uniform_open)
+{
+	UT_ASSERT(!semantic_activation_modifier_policy(0, 9, true));
+	UT_ASSERT(!semantic_activation_modifier_policy(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 9, true));
+	UT_ASSERT(!semantic_activation_modifier_policy(UINT64_C(1) << 63, 9, false));
+}
+
 UT_TEST(test_86_r4a_snapshot_is_fixed_false)
 {
 	ClusterR4PrerequisiteSnapshot snapshot = cluster_undo_block0_r4_prerequisite_snapshot();
 
 	UT_ASSERT(!snapshot.ready);
 	UT_ASSERT_EQ(snapshot.status, CLUSTER_R4_PREREQUISITE_RF_DEFERRED);
-	UT_ASSERT_EQ(snapshot.reserved[0] | snapshot.reserved[1] | snapshot.reserved[2], 0);
+	UT_ASSERT_EQ(snapshot.reserved0[0] | snapshot.reserved0[1] | snapshot.reserved0[2], 0);
+	UT_ASSERT_EQ(snapshot.target_node_id, -1);
+	UT_ASSERT_EQ((unsigned long long)snapshot.jcmk_generation, 0ULL);
+	UT_ASSERT_EQ((unsigned long long)snapshot.grammar_fingerprint, 0ULL);
 }
 
 UT_TEST(test_87_readiness_adapter_returns_rf_deferred)
@@ -682,6 +813,256 @@ UT_TEST(test_89_readiness_adapter_preserves_expected_generation)
 	memset(&refusal, 0, sizeof(refusal));
 	(void)r4_pre_prepare_readiness(19, &refusal);
 	UT_ASSERT_EQ(refusal.expected_generation, 19);
+}
+
+static ClusterR4PrerequisiteSnapshot
+valid_r4a_ready_snapshot(void)
+{
+	ClusterR4PrerequisiteSnapshot snapshot;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.status = CLUSTER_R4_PREREQUISITE_R4A_READY;
+	snapshot.ready = true;
+	snapshot.target_node_id = 3;
+	snapshot.episode_state_generation = UINT32_C(17);
+	snapshot.jcmk_generation = UINT64_C(41);
+	snapshot.request_nonce = UINT64_C(0x123456789abcdef0);
+	snapshot.old_admitted_incarnation = UINT64_C(9001);
+	snapshot.fresh_incarnation = UINT64_C(9002);
+	snapshot.committed_epoch = UINT64_C(71);
+	snapshot.grammar_fingerprint
+		= CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
+	return snapshot;
+}
+
+UT_TEST(test_89d_local_ready_alone_cannot_enter_prepare)
+{
+	ClusterR4PrerequisiteSnapshot snapshot = valid_r4a_ready_snapshot();
+
+	test_gate_reset();
+	test_r4a_snapshot = snapshot;
+	UT_ASSERT_EQ(r4_pre_prepare_readiness(19, NULL),
+				 CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+}
+
+UT_TEST(test_89e_malformed_local_ready_remains_typed_deferred)
+{
+	ClusterSemanticActivationRefusal refusal;
+
+	test_gate_reset();
+	test_r4a_snapshot = valid_r4a_ready_snapshot();
+	test_r4a_snapshot.reserved0[1] = 1;
+	memset(&refusal, 0, sizeof(refusal));
+	UT_ASSERT_EQ(r4_pre_prepare_readiness(19, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+}
+
+static ClusterReplacementCommitMarkerV3
+valid_d13_admitted_marker(void)
+{
+	ClusterReplacementCommitMarkerV3 marker;
+
+	memset(&marker, 0, sizeof(marker));
+	marker.magic = CLUSTER_JCMK_MAGIC;
+	marker.version = CLUSTER_JCMK_REPLACEMENT_VERSION;
+	marker.target_node_id = 3;
+	marker.phase = CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED;
+	marker.generation = 42;
+	marker.old_admitted_incarnation = UINT64_C(9001);
+	marker.fresh_incarnation = UINT64_C(9002);
+	marker.baseline_epoch = UINT64_C(70);
+	marker.reserved_or_committed_epoch = UINT64_C(71);
+	marker.request_nonce = UINT64_C(0x123456789abcdef0);
+	marker.expected_purge_survivors[0] = UINT8_C(0x05);
+	marker.grammar_fingerprint = UINT64_C(0x8e0dae5b428905e4);
+	marker.ready_state_generation = UINT32_C(17);
+	return marker;
+}
+
+static ClusterReplacementEpisode
+valid_d13_admitted_episode(void)
+{
+	ClusterReplacementEpisode episode;
+
+	memset(&episode, 0, sizeof(episode));
+	episode.request_nonce = UINT64_C(0x123456789abcdef0);
+	episode.baseline_epoch = UINT64_C(70);
+	episode.reserved_or_committed_epoch = UINT64_C(71);
+	episode.old_admitted_incarnation = UINT64_C(9001);
+	episode.fresh_incarnation = UINT64_C(9002);
+	episode.grammar_fingerprint = UINT64_C(0x8e0dae5b428905e4);
+	episode.expected_survivors[0] = UINT8_C(0x05);
+	episode.target_node_id = 3;
+	episode.coordinator_node_id = 0;
+	episode.state_generation = UINT32_C(17);
+	episode.phase = CLUSTER_REPLACEMENT_EPISODE_ADMITTED;
+	episode.readiness_flags = CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK;
+	return episode;
+}
+
+UT_TEST(test_89a_d13_prepare_basis_accepts_only_exact_admitted_ready_lineage)
+{
+	ClusterReplacementCommitMarkerV3 marker = valid_d13_admitted_marker();
+	ClusterReplacementEpisode episode = valid_d13_admitted_episode();
+
+	UT_ASSERT(semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(NULL, &episode));
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, NULL));
+}
+
+UT_TEST(test_89b_d13_prepare_basis_requires_admitted_ready_polarity)
+{
+	ClusterReplacementCommitMarkerV3 marker = valid_d13_admitted_marker();
+	ClusterReplacementEpisode episode = valid_d13_admitted_episode();
+
+	marker.phase = CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	marker = valid_d13_admitted_marker();
+	marker.ready_state_generation = 0;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	marker = valid_d13_admitted_marker();
+	episode.phase = CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.readiness_flags &= (uint8)~CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.reserved[1] = 1;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+}
+
+UT_TEST(test_89c_d13_prepare_basis_rejects_generation_or_identity_drift)
+{
+	ClusterReplacementCommitMarkerV3 marker = valid_d13_admitted_marker();
+	ClusterReplacementEpisode episode = valid_d13_admitted_episode();
+
+	episode.state_generation++;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.target_node_id++;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.request_nonce++;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.old_admitted_incarnation++;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.fresh_incarnation++;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.baseline_epoch++;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.reserved_or_committed_epoch++;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.expected_survivors[1] = UINT8_C(1);
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+	episode = valid_d13_admitted_episode();
+	episode.grammar_fingerprint++;
+	UT_ASSERT(!semantic_activation_r4_prepare_basis_matches(&marker, &episode));
+}
+
+UT_TEST(test_89f_positive_ready_stays_deferred_until_full_d13_conjunction)
+{
+	ClusterSemanticActivationRefusal refusal;
+
+	test_gate_reset();
+	test_r4a_snapshot = valid_r4a_ready_snapshot();
+	memset(&refusal, 0, sizeof(refusal));
+	UT_ASSERT_EQ(r4_pre_prepare_readiness(19, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+	test_gate_reset();
+}
+
+UT_TEST(test_89g_d13_current_coordinator_handoff_consumes_exact_admitted_basis)
+{
+	test_gate_reset();
+	test_admitted_snapshot_valid = true;
+	test_admitted_snapshot_episode = valid_d13_admitted_episode();
+	test_admitted_snapshot_marker = valid_d13_admitted_marker();
+	UT_ASSERT(semantic_activation_r4_current_admitted_basis());
+	UT_ASSERT_EQ(test_admitted_snapshot_calls, 1);
+
+	test_admitted_snapshot_marker.ready_state_generation++;
+	UT_ASSERT(!semantic_activation_r4_current_admitted_basis());
+	UT_ASSERT_EQ(test_admitted_snapshot_calls, 2);
+}
+
+UT_TEST(test_89h_pre_prepare_reaches_admitted_handoff_but_stays_fail_closed)
+{
+	ClusterSemanticActivationRefusal refusal;
+
+	test_gate_reset();
+	test_r4a_snapshot = valid_r4a_ready_snapshot();
+	test_admitted_snapshot_valid = true;
+	test_admitted_snapshot_episode = valid_d13_admitted_episode();
+	test_admitted_snapshot_marker = valid_d13_admitted_marker();
+	memset(&refusal, 0, sizeof(refusal));
+	UT_ASSERT_EQ(r4_pre_prepare_readiness(19, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+	UT_ASSERT_EQ(test_admitted_snapshot_calls, 1);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+}
+
+UT_TEST(test_89i_d13_invalidator_rescan_accepts_only_same_settled_closed_head)
+{
+	ClusterReplacementEpisode episode = valid_d13_admitted_episode();
+	ClusterReplacementCommitMarkerV3 marker = valid_d13_admitted_marker();
+	ClusterQvotecMailboxCompletion completion;
+	ClusterEpochAuthorityValue head;
+	ClusterEpochBallotId ballot;
+
+	memset(&completion, 0, sizeof(completion));
+	completion.request_seq = UINT64_C(2);
+	completion.result = CLUSTER_QVOTEC_MAILBOX_CHOSEN;
+	completion.observed_disk_bitmap = UINT8_C(0x01);
+	completion.actor_phase = CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
+
+	memset(&head, 0, sizeof(head));
+	head.value_version = CLUSTER_EPOCH_AUTHORITY_VALUE_VERSION;
+	head.transition = CLUSTER_EPOCH_AUTHORITY_COMMIT_CLOSED;
+	head.event_kind = CLUSTER_EPOCH_EVENT_SAME_NODE_REPLACEMENT;
+	head.request_origin_node = episode.target_node_id;
+	head.target_node_id = episode.target_node_id;
+	head.authority_generation = UINT64_C(103);
+	head.baseline_epoch = episode.baseline_epoch;
+	head.reserved_epoch = episode.reserved_or_committed_epoch;
+	head.old_incarnation = episode.old_admitted_incarnation;
+	head.fresh_incarnation = episode.fresh_incarnation;
+	head.request_nonce = episode.request_nonce;
+	memcpy(head.authority_member_bitmap, episode.expected_survivors,
+		   sizeof(head.authority_member_bitmap));
+	head.event_subject_bitmap[episode.target_node_id / 8]
+		= (uint8)(1u << (episode.target_node_id % 8));
+	head.grammar_fingerprint = episode.grammar_fingerprint;
+	memset(head.predecessor_digest, 0x5a, sizeof(head.predecessor_digest));
+	UT_ASSERT(cluster_epoch_authority_value_encode(
+		&head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+		completion.completion_value));
+
+	memset(&ballot, 0, sizeof(ballot));
+	ballot.counter = UINT64_C(7);
+	ballot.proposer_node_id = 1;
+	ballot.proposer_admitted_incarnation = UINT64_C(111);
+	ballot.nonce = UINT64_C(0xabcdef);
+	UT_ASSERT(cluster_epoch_ballot_id_encode(
+		&ballot, completion.completion_ballot));
+
+	UT_ASSERT(semantic_activation_r4_invalidator_rescan_matches(
+		&completion, &marker, &episode));
+	completion.result = CLUSTER_QVOTEC_MAILBOX_ADOPTED_OTHER;
+	UT_ASSERT(!semantic_activation_r4_invalidator_rescan_matches(
+		&completion, &marker, &episode));
+	completion.result = CLUSTER_QVOTEC_MAILBOX_CHOSEN;
+	head.fresh_incarnation++;
+	UT_ASSERT(cluster_epoch_authority_value_encode(
+		&head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+		completion.completion_value));
+	UT_ASSERT(!semantic_activation_r4_invalidator_rescan_matches(
+		&completion, &marker, &episode));
 }
 
 UT_TEST(test_90_descriptor_uses_the_only_r4a_adapter)
@@ -722,6 +1103,53 @@ UT_TEST(test_93_preflight_rejects_bad_action_without_effects)
 		semantic_activation_preflight((ClusterSemanticActivationAction)4, 0, &refusal, &effects),
 		CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	UT_ASSERT_EQ(effects, SEMANTIC_ACTIVATION_EFFECT_NONE);
+}
+
+UT_TEST(test_93a_activation_actor_effect_ownership_is_exact)
+{
+	UT_ASSERT(semantic_activation_actor_effect_allowed(
+		SEMANTIC_ACTIVATION_ACTOR_PROCESS_UTILITY,
+		SEMANTIC_ACTIVATION_EFFECT_REQUEST_PUBLICATION));
+	UT_ASSERT(!semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_PROCESS_UTILITY,
+										SEMANTIC_ACTIVATION_EFFECT_PGSA_WRITE));
+	UT_ASSERT(semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_LMON,
+									  SEMANTIC_ACTIVATION_EFFECT_SOURCE_CLOSE));
+	UT_ASSERT(semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_LMON,
+									  SEMANTIC_ACTIVATION_EFFECT_TARGET_OPEN));
+	UT_ASSERT(semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_LMON,
+									  SEMANTIC_ACTIVATION_EFFECT_ACK_MUTATION));
+	UT_ASSERT(semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_LMON,
+									  SEMANTIC_ACTIVATION_EFFECT_CONTROL_WIRE));
+	UT_ASSERT(!semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_LMON,
+									   SEMANTIC_ACTIVATION_EFFECT_PGSA_WRITE));
+	UT_ASSERT(semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_QVOTEC,
+									  SEMANTIC_ACTIVATION_EFFECT_PGSA_WRITE));
+	UT_ASSERT(!semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_QVOTEC,
+									   SEMANTIC_ACTIVATION_EFFECT_ACK_MUTATION));
+	UT_ASSERT(!semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_LMS,
+									   SEMANTIC_ACTIVATION_EFFECT_DATA_WIRE));
+	UT_ASSERT(!semantic_activation_actor_effect_allowed(SEMANTIC_ACTIVATION_ACTOR_DATA,
+									   SEMANTIC_ACTIVATION_EFFECT_DATA_WIRE));
+	UT_ASSERT(!semantic_activation_actor_effect_allowed(
+		SEMANTIC_ACTIVATION_ACTOR_PROCESS_UTILITY,
+		(SemanticActivationEffect)(SEMANTIC_ACTIVATION_EFFECT_REQUEST_PUBLICATION
+							   | SEMANTIC_ACTIVATION_EFFECT_PGSA_WRITE)));
+}
+
+UT_TEST(test_93b_activation_mailbox_route_has_no_owner_bypass)
+{
+	UT_ASSERT(semantic_activation_actor_edge_allowed(
+		SEMANTIC_ACTIVATION_ACTOR_PROCESS_UTILITY, SEMANTIC_ACTIVATION_ACTOR_LMON));
+	UT_ASSERT(semantic_activation_actor_edge_allowed(SEMANTIC_ACTIVATION_ACTOR_LMON,
+										SEMANTIC_ACTIVATION_ACTOR_QVOTEC));
+	UT_ASSERT(!semantic_activation_actor_edge_allowed(
+		SEMANTIC_ACTIVATION_ACTOR_PROCESS_UTILITY, SEMANTIC_ACTIVATION_ACTOR_QVOTEC));
+	UT_ASSERT(!semantic_activation_actor_edge_allowed(SEMANTIC_ACTIVATION_ACTOR_PROCESS_UTILITY,
+										 SEMANTIC_ACTIVATION_ACTOR_LMS));
+	UT_ASSERT(!semantic_activation_actor_edge_allowed(SEMANTIC_ACTIVATION_ACTOR_LMON,
+										 SEMANTIC_ACTIVATION_ACTOR_DATA));
+	UT_ASSERT(!semantic_activation_actor_edge_allowed(SEMANTIC_ACTIVATION_ACTOR_QVOTEC,
+										 SEMANTIC_ACTIVATION_ACTOR_LMON));
 }
 
 UT_TEST(test_94_public_submit_refuses_before_prepare)
@@ -852,6 +1280,32 @@ UT_TEST(test_100_source_enter_owns_shared_debt_and_epoch_token)
 	UT_ASSERT_EQ(test_token_formation_epoch(&token), test_current_epoch);
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
 	UT_ASSERT_EQ(test_exit_registration_count, 1);
+}
+
+UT_TEST(test_100a_modifier_bootstrap_source_requires_ordinary_write_gate)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 0, test_current_epoch, true);
+	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(true, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(token.entered);
+	UT_ASSERT(cluster_semantic_activation_modifier_recheck(&token, true));
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 1);
+	cluster_semantic_activation_leave(&token);
+}
+
+UT_TEST(test_100b_modifier_bootstrap_source_refuses_replacement_closed_member)
+{
+	ClusterSemanticAdmissionToken token;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 0, test_current_epoch, true);
+	UT_ASSERT_EQ(cluster_semantic_activation_modifier_enter(false, &token),
+				 CLUSTER_SEMANTIC_ADMISSION_CLOSED);
+	UT_ASSERT(!token.entered);
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
 }
 
 UT_TEST(test_101_active_source_refuses_before_debt)
@@ -1071,13 +1525,17 @@ UT_TEST(test_114_peer_open_matcher_stays_closed_until_d13_ack_table)
 	test_peer_capability_matches = true;
 	UT_ASSERT(!cluster_semantic_activation_peer_open_matches(
 		&token, 7, PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
-					   | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1,
+					   | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+					   | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+					   | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1,
 		0));
 	UT_ASSERT_EQ(test_peer_capability_match_calls, 1);
 	UT_ASSERT_EQ(test_peer_capability_match_peer, 7);
 	UT_ASSERT_EQ(test_peer_capability_match_caps,
 				 PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
-					 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1);
+					 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+					 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+					 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1);
 	UT_ASSERT_EQ(test_peer_capability_match_generation, 0);
 	cluster_semantic_activation_leave(&token);
 }
@@ -1088,7 +1546,9 @@ UT_TEST(test_115_peer_open_matcher_rejects_invalid_inputs_before_capability_matc
 	ClusterSemanticAdmissionToken source_token;
 	ClusterSemanticAdmissionToken wrong_feature_token;
 	uint32 required_caps = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
-						  | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1;
+						  | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+						  | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+						  | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1;
 
 	test_gate_reset();
 	test_gate_publish(2, 0, 24, test_current_epoch, false);
@@ -1127,10 +1587,64 @@ UT_TEST(test_115_peer_open_matcher_rejects_invalid_inputs_before_capability_matc
 	cluster_semantic_activation_leave(&target_token);
 }
 
+/* Break caught: authenticated opcode-18 phase-3 ingress must terminate at
+ * formation LMON, not remain forever in the process-local handoff.  This test
+ * exercises the real codec/ingress and asserts that one LMON tick consumes the
+ * exact item and delegates only to the reconfig observer. */
+UT_TEST(test_116_formation_lmon_consumes_phase3_handoff)
+{
+	ClusterReplacementPhase3HandoffItem ignored;
+	ClusterReplacementWireMessage message;
+	ClusterICEnvelope envelope;
+	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
+
+	while (cluster_replacement_phase3_handoff_poll_local(&ignored))
+		;
+	test_gate_reset();
+	test_peer_capability_matches = true;
+	memset(&message, 0, sizeof(message));
+	message.phase = CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY;
+	message.target_node_id = 3;
+	message.epoch = test_current_epoch - 1;
+	message.request_nonce = UINT64_C(0x1112131415161718);
+	message.identity0 = UINT64_C(9001);
+	message.identity1 = UINT64_C(9002);
+	message.body.phase3.jcmk_generation = UINT64_C(41);
+	message.body.phase3.episode_state_generation = UINT32_C(17);
+	message.grammar_fingerprint
+		= CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
+	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
+	memset(&envelope, 0, sizeof(envelope));
+	envelope.msg_type = PGRAC_IC_MSG_GES_REQUEST;
+	envelope.source_node_id = (uint32)message.target_node_id;
+	envelope.dest_node_id = 1;
+	envelope.epoch = test_current_epoch;
+	envelope.payload_length = sizeof(bytes);
+	UT_ASSERT_EQ((int)cluster_replacement_wire_phase3_ingress_local(
+					 &envelope, bytes, sizeof(bytes), message.target_node_id, 1,
+					 test_current_epoch, 9),
+				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_ENQUEUED);
+
+	cluster_semantic_activation_lmon_tick();
+
+	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending_local(), 0);
+	UT_ASSERT_EQ(test_phase3_observe_calls, 1);
+	UT_ASSERT_EQ(memcmp(&test_phase3_observed_item.message, &message,
+						 sizeof(message)),
+				 0);
+	UT_ASSERT_EQ(test_phase3_observed_item.authenticated_source_node_id, 3);
+	UT_ASSERT_EQ(test_phase3_observed_item.local_receiver_node_id, 1);
+	UT_ASSERT_EQ((int)test_phase3_observed_item.control_connection_generation, 9);
+	UT_ASSERT_EQ(test_peer_capability_match_calls, 1);
+	UT_ASSERT_EQ(test_peer_capability_match_peer, 3);
+	UT_ASSERT_EQ(test_peer_capability_match_caps, (uint32)0x00100000U);
+	UT_ASSERT_EQ(test_peer_capability_match_generation, (uint32)9);
+}
+
 int
 main(void)
 {
-	UT_PLAN(115);
+	UT_PLAN(132);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -1206,6 +1720,7 @@ main(void)
 	UT_RUN(test_73_record_generation_change_invalidates_ack);
 	UT_RUN(test_74_null_observed_ack_never_matches);
 	UT_RUN(test_75_null_expected_ack_never_matches);
+	UT_RUN(test_75a_d13_full_ack_table_requires_exact_member_set_and_tuples);
 	UT_RUN(test_76_inactive_feature_source_is_admitted);
 	UT_RUN(test_77_inactive_feature_target_is_disabled);
 	UT_RUN(test_78_active_feature_source_is_dormant);
@@ -1216,14 +1731,27 @@ main(void)
 	UT_RUN(test_83_target_generation_change_is_typed);
 	UT_RUN(test_84_unknown_side_is_closed);
 	UT_RUN(test_85_zero_feature_is_closed);
+	UT_RUN(test_85a_modifier_gate_requires_durable_source_or_target_open);
+	UT_RUN(test_85b_modifier_gate_closes_replacement_until_uniform_open);
 	UT_RUN(test_86_r4a_snapshot_is_fixed_false);
 	UT_RUN(test_87_readiness_adapter_returns_rf_deferred);
 	UT_RUN(test_88_readiness_adapter_names_r4_feature);
 	UT_RUN(test_89_readiness_adapter_preserves_expected_generation);
+	UT_RUN(test_89d_local_ready_alone_cannot_enter_prepare);
+	UT_RUN(test_89e_malformed_local_ready_remains_typed_deferred);
+	UT_RUN(test_89a_d13_prepare_basis_accepts_only_exact_admitted_ready_lineage);
+	UT_RUN(test_89b_d13_prepare_basis_requires_admitted_ready_polarity);
+	UT_RUN(test_89c_d13_prepare_basis_rejects_generation_or_identity_drift);
+	UT_RUN(test_89f_positive_ready_stays_deferred_until_full_d13_conjunction);
+	UT_RUN(test_89g_d13_current_coordinator_handoff_consumes_exact_admitted_basis);
+	UT_RUN(test_89h_pre_prepare_reaches_admitted_handoff_but_stays_fail_closed);
+	UT_RUN(test_89i_d13_invalidator_rescan_accepts_only_same_settled_closed_head);
 	UT_RUN(test_90_descriptor_uses_the_only_r4a_adapter);
 	UT_RUN(test_91_preflight_refusal_is_before_every_mutation);
 	UT_RUN(test_92_preflight_refusal_names_condition_feature);
 	UT_RUN(test_93_preflight_rejects_bad_action_without_effects);
+	UT_RUN(test_93a_activation_actor_effect_ownership_is_exact);
+	UT_RUN(test_93b_activation_mailbox_route_has_no_owner_bypass);
 	UT_RUN(test_94_public_submit_refuses_before_prepare);
 	UT_RUN(test_95_dormant_target_enter_has_no_token);
 	UT_RUN(test_96_source_token_recheck_and_leave_are_generation_scoped);
@@ -1231,6 +1759,8 @@ main(void)
 	UT_RUN(test_98_admission_token_has_frozen_natural_layout);
 	UT_RUN(test_99_shared_gate_layout_and_bootstrap_are_fail_closed);
 	UT_RUN(test_100_source_enter_owns_shared_debt_and_epoch_token);
+	UT_RUN(test_100a_modifier_bootstrap_source_requires_ordinary_write_gate);
+	UT_RUN(test_100b_modifier_bootstrap_source_refuses_replacement_closed_member);
 	UT_RUN(test_101_active_source_refuses_before_debt);
 	UT_RUN(test_102_inactive_target_refuses_before_debt);
 	UT_RUN(test_103_epoch_drift_invalidates_recheck_without_losing_debt);
@@ -1246,6 +1776,7 @@ main(void)
 	UT_RUN(test_113_recheck_samples_snapshot_before_epoch);
 	UT_RUN(test_114_peer_open_matcher_stays_closed_until_d13_ack_table);
 	UT_RUN(test_115_peer_open_matcher_rejects_invalid_inputs_before_capability_match);
+	UT_RUN(test_116_formation_lmon_consumes_phase3_handoff);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

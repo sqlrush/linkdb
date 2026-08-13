@@ -386,6 +386,48 @@ cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key, uint32 reply_opcode,
 	return result;
 }
 
+GesReplyWaitPollResult
+cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key,
+									GesReplyWaitVerdict *verdict_out)
+{
+	GesReplyWaitEntry *entry;
+	GesReplyWaitVerdict verdict;
+	GesReplyWaitPollResult result;
+
+	Assert(key != NULL);
+	Assert(verdict_out != NULL);
+	if (reply_wait_state == NULL || reply_wait_htab == NULL)
+		return GES_REPLY_WAIT_POLL_MISSING;
+
+	LWLockAcquire(&reply_wait_state->lwlock, LW_EXCLUSIVE);
+	entry = (GesReplyWaitEntry *)hash_search(reply_wait_htab, key, HASH_FIND, NULL);
+	if (entry == NULL) {
+		result = GES_REPLY_WAIT_POLL_MISSING;
+	} else if (entry->abandoned) {
+		/* Keep the tombstone so a late GRANT remains detectable as an orphan. */
+		result = GES_REPLY_WAIT_POLL_ABANDONED;
+	} else if (!entry->ready) {
+		result = GES_REPLY_WAIT_POLL_PENDING;
+	} else {
+		bool found;
+
+		/* Pair the lock-free wake writer's write barrier before copying verdict. */
+		pg_read_barrier();
+		verdict.reply_opcode = entry->reply_opcode;
+		verdict.reject_reason = entry->reject_reason;
+		(void)hash_search(reply_wait_htab, key, HASH_REMOVE, &found);
+		Assert(found);
+		if (found)
+			pg_atomic_fetch_sub_u64(&reply_wait_state->reply_wait_table_active, 1);
+		result = GES_REPLY_WAIT_POLL_DELIVERED;
+	}
+	LWLockRelease(&reply_wait_state->lwlock);
+
+	if (result == GES_REPLY_WAIT_POLL_DELIVERED)
+		*verdict_out = verdict;
+	return result;
+}
+
 bool
 cluster_ges_reply_wait_mark_abandoned(const GesReplyWaitKey *key, TimestampTz tombstone_deadline)
 {

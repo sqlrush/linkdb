@@ -94,6 +94,41 @@ cluster_qvotec_in_quorum(void)
  */
 static ClusterMembershipTable seed_tab;
 
+static uint32
+test_get_le32(const uint8 *p)
+{
+	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16)
+		   | ((uint32)p[3] << 24);
+}
+
+static uint64
+test_get_le64(const uint8 *p)
+{
+	return (uint64)test_get_le32(p) | ((uint64)test_get_le32(p + 4) << 32);
+}
+
+static void
+make_replacement_marker(ClusterReplacementCommitMarkerV3 *m, uint8 phase, uint32 ready_generation)
+{
+	int i;
+
+	memset(m, 0, sizeof(*m));
+	m->magic = CLUSTER_JCMK_MAGIC;
+	m->version = CLUSTER_JCMK_REPLACEMENT_VERSION;
+	m->target_node_id = 7;
+	m->phase = phase;
+	m->generation = UINT64CONST(0x0102030405060708);
+	m->old_admitted_incarnation = UINT64CONST(0x1112131415161718);
+	m->fresh_incarnation = UINT64CONST(0x2122232425262728);
+	m->baseline_epoch = UINT64CONST(0x3132333435363738);
+	m->reserved_or_committed_epoch = UINT64CONST(0x4142434445464748);
+	m->request_nonce = UINT64CONST(0x5152535455565758);
+	for (i = 0; i < 16; i++)
+		m->expected_purge_survivors[i] = (uint8)(0x80 + i);
+	m->grammar_fingerprint = UINT64CONST(0x6162636465666768);
+	m->ready_state_generation = ready_generation;
+}
+
 static void
 make_marker(ClusterJoinCommitMarker *m, int32 node, uint8 phase, uint64 incarnation, uint64 epoch)
 {
@@ -484,10 +519,254 @@ UT_TEST(test_marker_select_majority_groups_by_commit)
 	UT_ASSERT_EQ(cluster_join_marker_select_majority(NULL, 3, majority, NULL), -1);
 }
 
+/* ======================================================================
+ * 5.15A §2.2 -- replacement JCMK v3 is an exact 96-byte little-endian
+ * durable image.  Offset 88 carries the ADMITTED-only s_ready and offset 92
+ * carries CRC32C over the preceding bytes.
+ * ====================================================================== */
+UT_TEST(test_replacement_marker_v3_exact_codec)
+{
+	ClusterReplacementCommitMarkerV3 in;
+	ClusterReplacementCommitMarkerV3 out;
+	uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES];
+
+	make_replacement_marker(&in, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED,
+							UINT32_C(0x71727374));
+	memset(bytes, 0xA5, sizeof(bytes));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&in, bytes));
+
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 0), (int)CLUSTER_JCMK_MAGIC);
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 4),
+				 (int)CLUSTER_JCMK_REPLACEMENT_VERSION);
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 8), 7);
+	UT_ASSERT_EQ((int)bytes[12], CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
+	UT_ASSERT_EQ((int)bytes[13], 0);
+	UT_ASSERT_EQ((int)bytes[14], 0);
+	UT_ASSERT_EQ((int)bytes[15], 0);
+	UT_ASSERT(test_get_le64(bytes + 16) == in.generation);
+	UT_ASSERT(test_get_le64(bytes + 24) == in.old_admitted_incarnation);
+	UT_ASSERT(test_get_le64(bytes + 32) == in.fresh_incarnation);
+	UT_ASSERT(test_get_le64(bytes + 40) == in.baseline_epoch);
+	UT_ASSERT(test_get_le64(bytes + 48) == in.reserved_or_committed_epoch);
+	UT_ASSERT(test_get_le64(bytes + 56) == in.request_nonce);
+	UT_ASSERT(memcmp(bytes + 64, in.expected_purge_survivors, 16) == 0);
+	UT_ASSERT(test_get_le64(bytes + 80) == in.grammar_fingerprint);
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 88), (int)in.ready_state_generation);
+
+	memset(&out, 0xCC, sizeof(out));
+	UT_ASSERT(cluster_replacement_marker_v3_decode(bytes, 7, &out));
+	UT_ASSERT_EQ((int)out.target_node_id, 7);
+	UT_ASSERT_EQ((int)out.phase, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
+	UT_ASSERT(out.generation == in.generation);
+	UT_ASSERT(out.old_admitted_incarnation == in.old_admitted_incarnation);
+	UT_ASSERT(out.fresh_incarnation == in.fresh_incarnation);
+	UT_ASSERT(out.baseline_epoch == in.baseline_epoch);
+	UT_ASSERT(out.reserved_or_committed_epoch == in.reserved_or_committed_epoch);
+	UT_ASSERT(out.request_nonce == in.request_nonce);
+	UT_ASSERT(memcmp(out.expected_purge_survivors, in.expected_purge_survivors, 16) == 0);
+	UT_ASSERT(out.grammar_fingerprint == in.grammar_fingerprint);
+	UT_ASSERT_EQ((int)out.ready_state_generation, (int)in.ready_state_generation);
+	UT_ASSERT_EQ((int)out.crc32c, (int)test_get_le32(bytes + 92));
+}
+
+/* ======================================================================
+ * 5.15A §2.2 -- offset-88 is phase-specific and every malformed image is
+ * rejected without changing the caller's decoded output.
+ * ====================================================================== */
+UT_TEST(test_replacement_marker_v3_phase_and_integrity_gates)
+{
+	ClusterReplacementCommitMarkerV3 m;
+	ClusterReplacementCommitMarkerV3 out;
+	ClusterReplacementCommitMarkerV3 before;
+	uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES];
+
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE, 0);
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
+
+	memset(&out, 0x5A, sizeof(out));
+	before = out;
+	bytes[44] ^= 0x01; /* CRC-covered corruption */
+	UT_ASSERT(!cluster_replacement_marker_v3_decode(bytes, 7, &out));
+	UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+	bytes[44] ^= 0x01;
+
+	UT_ASSERT(!cluster_replacement_marker_v3_decode(bytes, 8, &out));
+	UT_ASSERT(memcmp(&out, &before, sizeof(out)) == 0);
+
+	m.ready_state_generation = 9;
+	UT_ASSERT(!cluster_replacement_marker_v3_encode(&m, bytes));
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED, 0);
+	UT_ASSERT(!cluster_replacement_marker_v3_encode(&m, bytes));
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_ABORTED_CLOSED, 0);
+	m.reserved0[1] = 1;
+	UT_ASSERT(!cluster_replacement_marker_v3_encode(&m, bytes));
+	make_replacement_marker(&m, UINT8_C(99), 0);
+	UT_ASSERT(!cluster_replacement_marker_v3_encode(&m, bytes));
+}
+
+/* ======================================================================
+ * 5.15A A1-I3 -- a replacement marker majority is a majority of one exact,
+ * valid canonical 96-byte image.  Different episodes never aggregate, and a
+ * malformed member of an otherwise matching pair contributes no vote.
+ * ====================================================================== */
+UT_TEST(test_replacement_marker_v3_same_image_majority)
+{
+	ClusterReplacementCommitMarkerV3 a;
+	ClusterReplacementCommitMarkerV3 b;
+	ClusterReplacementCommitMarkerV3 selected;
+	ClusterReplacementCommitMarkerV3 before;
+	uint8 images[3][CLUSTER_JCMK_REPLACEMENT_BYTES];
+	uint32 agree;
+	int win;
+
+	make_replacement_marker(&a, CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED, 0);
+	b = a;
+	UT_ASSERT(cluster_replacement_marker_v3_same_image(&a, &b));
+	b.request_nonce++;
+	UT_ASSERT(!cluster_replacement_marker_v3_same_image(&a, &b));
+	b = a;
+	b.phase = CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED;
+	b.ready_state_generation = 1;
+	UT_ASSERT(!cluster_replacement_marker_v3_same_image(&a, &b));
+	b.generation = 0;
+	UT_ASSERT(!cluster_replacement_marker_v3_same_image(&a, &b));
+
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&a, images[0]));
+	memcpy(images[1], images[0], sizeof(images[1]));
+	b = a;
+	b.request_nonce++;
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&b, images[2]));
+
+	memset(&selected, 0xA5, sizeof(selected));
+	before = selected;
+	agree = 77;
+	win = cluster_replacement_marker_v3_select_majority(images, 3, 2, 7, &selected, &agree);
+	UT_ASSERT(win == 0 || win == 1);
+	UT_ASSERT_EQ((int)agree, 2);
+	UT_ASSERT(selected.request_nonce == a.request_nonce);
+
+	/* Three valid but different images cannot synthesize one majority. */
+	memcpy(images[1], images[2], sizeof(images[1]));
+	b.request_nonce++;
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&b, images[2]));
+	selected = before;
+	agree = 77;
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 7, &selected,
+													&agree),
+				 -1);
+	UT_ASSERT(memcmp(&selected, &before, sizeof(selected)) == 0);
+	UT_ASSERT_EQ((int)agree, 77);
+
+	/* A CRC-bad image is invalid, not an identical vote. */
+	memcpy(images[1], images[0], sizeof(images[1]));
+	images[1][44] ^= 1;
+	selected = before;
+	agree = 77;
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 7, &selected,
+													&agree),
+				 -1);
+	UT_ASSERT(memcmp(&selected, &before, sizeof(selected)) == 0);
+	UT_ASSERT_EQ((int)agree, 77);
+
+	/* Invalid cardinalities and target mismatch preserve every output. */
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 0, 7, &selected,
+													&agree),
+				 -1);
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 1, 7, &selected,
+													&agree),
+				 -1);
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 2, 1, 7, &selected,
+													&agree),
+				 -1);
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 0, 1, 7, &selected,
+													&agree),
+				 -1);
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 4, 7, &selected,
+													&agree),
+				 -1);
+	memcpy(images[1], images[0], sizeof(images[1]));
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 8, &selected,
+													&agree),
+				 -1);
+	UT_ASSERT(memcmp(&selected, &before, sizeof(selected)) == 0);
+	UT_ASSERT_EQ((int)agree, 77);
+}
+
+/* ======================================================================
+ * 5.15A §2.2 -- the phase decides which incarnation is a durable floor.
+ * PREPARE/ABORTED_CLOSED seed old; COMMITTED_CLOSED/ADMITTED seed fresh.
+ * Only ADMITTED is the membership-publication basis and exposes s_ready.
+ * ====================================================================== */
+UT_TEST(test_replacement_marker_v3_phase_bases_and_floors)
+{
+	ClusterReplacementCommitMarkerV3 m;
+	uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES];
+	uint64 floor;
+	uint32 ready;
+
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE, 0);
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
+	floor = UINT64CONST(0xDEADBEEF);
+	UT_ASSERT(cluster_replacement_marker_v3_floor_basis(bytes, 7, &floor));
+	UT_ASSERT(floor == m.old_admitted_incarnation);
+
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_ABORTED_CLOSED, 0);
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
+	UT_ASSERT(cluster_replacement_marker_v3_floor_basis(bytes, 7, &floor));
+	UT_ASSERT(floor == m.old_admitted_incarnation);
+
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED, 0);
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
+	UT_ASSERT(cluster_replacement_marker_v3_floor_basis(bytes, 7, &floor));
+	UT_ASSERT(floor == m.fresh_incarnation);
+	UT_ASSERT(cluster_replacement_marker_v3_is_committed_closed_basis(bytes, 7, &floor));
+	UT_ASSERT(floor == m.fresh_incarnation);
+	ready = UINT32_C(0xA5A5A5A5);
+	UT_ASSERT(!cluster_replacement_marker_v3_is_admitted_basis(bytes, 7, &floor, &ready));
+	UT_ASSERT(floor == m.fresh_incarnation);
+	UT_ASSERT_EQ((int)ready, (int)UINT32_C(0xA5A5A5A5));
+
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED,
+							UINT32_C(0x71727374));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
+	UT_ASSERT(cluster_replacement_marker_v3_floor_basis(bytes, 7, &floor));
+	UT_ASSERT(floor == m.fresh_incarnation);
+	ready = 0;
+	UT_ASSERT(cluster_replacement_marker_v3_is_admitted_basis(bytes, 7, &floor, &ready));
+	UT_ASSERT(floor == m.fresh_incarnation);
+	UT_ASSERT_EQ((int)ready, (int)m.ready_state_generation);
+	floor = UINT64CONST(0xDEADBEEF);
+	UT_ASSERT(!cluster_replacement_marker_v3_is_committed_closed_basis(bytes, 7, &floor));
+	UT_ASSERT(floor == UINT64CONST(0xDEADBEEF));
+
+	/* A phase cannot seed a zero corresponding incarnation. */
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE, 0);
+	m.old_admitted_incarnation = 0;
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
+	floor = UINT64CONST(0xDEADBEEF);
+	UT_ASSERT(!cluster_replacement_marker_v3_floor_basis(bytes, 7, &floor));
+	UT_ASSERT(floor == UINT64CONST(0xDEADBEEF));
+
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED, 0);
+	m.fresh_incarnation = 0;
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
+	UT_ASSERT(!cluster_replacement_marker_v3_floor_basis(bytes, 7, &floor));
+	UT_ASSERT(!cluster_replacement_marker_v3_is_committed_closed_basis(bytes, 7, &floor));
+	UT_ASSERT(floor == UINT64CONST(0xDEADBEEF));
+
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED, 9);
+	m.fresh_incarnation = 0;
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
+	ready = UINT32_C(0xA5A5A5A5);
+	UT_ASSERT(!cluster_replacement_marker_v3_is_admitted_basis(bytes, 7, &floor, &ready));
+	UT_ASSERT(floor == UINT64CONST(0xDEADBEEF));
+	UT_ASSERT_EQ((int)ready, (int)UINT32_C(0xA5A5A5A5));
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(22);
 	UT_RUN(test_vet_fresh_above_accept);
 	UT_RUN(test_vet_equal_reject_stale);
 	UT_RUN(test_vet_below_reject_stale);
@@ -506,6 +785,10 @@ main(void)
 	UT_RUN(test_marker_version_mismatch_failclosed);
 	UT_RUN(test_vet_removed_fenced);
 	UT_RUN(test_member_count_shrink);
+	UT_RUN(test_replacement_marker_v3_exact_codec);
+	UT_RUN(test_replacement_marker_v3_phase_and_integrity_gates);
+	UT_RUN(test_replacement_marker_v3_same_image_majority);
+	UT_RUN(test_replacement_marker_v3_phase_bases_and_floors);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

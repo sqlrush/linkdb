@@ -301,6 +301,10 @@ StaticAssertDecl(offsetof(UndoSegmentHeaderData, segment_id) == 32,
 StaticAssertDecl(offsetof(UndoSegmentHeaderData, tt_slots) == 112,
 				 "spec-1.21 invariant: tt_slots embedded at byte 112 "
 				 "(C natural alignment shifts the v0.2 body table value 108 by +4)");
+StaticAssertDecl(offsetof(UndoSegmentHeaderData, tt_slots)
+						 + TT_SLOTS_PER_SEGMENT * sizeof(TTSlot)
+					 <= 4096,
+				 "spec-8.4A invariant: durable TT slots must fit in the first half page");
 StaticAssertDecl(offsetof(UndoSegmentHeaderData, free_block_bitmap) == 1656,
 				 "spec-1.21 invariant: free_block_bitmap at byte 1656 "
 				 "(C natural alignment shifts the v0.2 body table value 1652 by +4)");

@@ -111,6 +111,20 @@ my $proname_check = $node0->safe_psql('postgres',
 is($proname_check, 'cluster_undo_get_record',
 	"L3 OID 8928 proname = cluster_undo_get_record");
 
+$node0->safe_psql('postgres', 'CREATE ROLE l3_undo_reader_no_file_role NOLOGIN');
+my ($l3_acl_rc, $l3_acl_out, $l3_acl_err) = $node0->psql(
+	'postgres',
+	q{\set VERBOSITY verbose
+	  SET ROLE l3_undo_reader_no_file_role;
+	  SELECT cluster_undo_get_record(
+	    decode('00000000000000000000000000000000', 'hex'));
+	  RESET ROLE;});
+ok($l3_acl_rc != 0,
+	'L3 non-pg_read_server_files role cannot call cluster_undo_get_record');
+like($l3_acl_err, qr/42501|permission denied to read cluster undo record/,
+	'L3 permission refusal is SQLSTATE 42501 before UBA decode or I/O');
+$node0->safe_psql('postgres', 'DROP ROLE l3_undo_reader_no_file_role');
+
 
 # ----------
 # L4: InvalidUba sentinel → NULL

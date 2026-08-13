@@ -306,6 +306,27 @@ UT_TEST(test_t24_invalid_tt_slot_offset_is_0xFFFF)
 }
 
 
+UT_TEST(test_t25_record_decode_rejects_header_boundary_and_segment_alias)
+{
+	uint32 seg = UINT32_MAX;
+	uint32 blk = UINT32_MAX;
+	uint16 off = UINT16_MAX;
+	uint16 row = UINT16_MAX;
+
+	UT_ASSERT(uba_decode_record(uba_encode(32768, 8191, 47, 65535),
+								 &seg, &blk, &off, &row));
+	UT_ASSERT_EQ(seg, 32768);
+	UT_ASSERT_EQ(blk, 8191);
+	UT_ASSERT_EQ(off, 47);
+	UT_ASSERT_EQ(row, 65535);
+
+	UT_ASSERT(!uba_decode_record(uba_encode(1, 0, 0, 0), &seg, &blk, &off, &row));
+	UT_ASSERT(!uba_decode_record(uba_encode(1, 8192, 0, 0), &seg, &blk, &off, &row));
+	UT_ASSERT(!uba_decode_record(uba_encode(32769, 1, 0, 0),
+								  &seg, &blk, &off, &row));
+}
+
+
 int
 main(void)
 {
@@ -333,6 +354,7 @@ main(void)
 	UT_RUN(test_t22_itl_delta_format_v1_is_zero);
 	UT_RUN(test_t23_itl_delta_format_v2_is_one);
 	UT_RUN(test_t24_invalid_tt_slot_offset_is_0xFFFF);
+	UT_RUN(test_t25_record_decode_rejects_header_boundary_and_segment_alias);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -837,10 +837,52 @@ UT_TEST(test_undo_multi_verdict_inline_entry_is_denied_without_serve)
 	free(source);
 }
 
+/*
+ * R4 CR-build owns the separate FORWARD96 -> queued worker-0 state machine.
+ * A defensive call through the legacy inline entry must therefore take the
+ * same pre-set DENIED path without reaching the generic CR constructor.
+ */
+UT_TEST(test_r4_cr_build_inline_entry_is_denied_without_serve)
+{
+	char *source = read_cr_server_source();
+	const char *function
+		= source != NULL ? strstr(source, "\ncluster_gcs_block_forward_serve_inline(") : NULL;
+	const char *function_end = function != NULL ? strstr(function, "\n}\n\n#endif") : NULL;
+	const char *kind_switch = function != NULL ? strstr(function, "\tswitch (kind) {") : NULL;
+	const char *r4_case
+		= kind_switch != NULL
+			  ? strstr(kind_switch, "case CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD:")
+			  : NULL;
+	const char *deny_jump
+		= r4_case != NULL ? strstr(r4_case, "goto inline_deny_no_serve;") : NULL;
+	const char *serve = kind_switch != NULL ? strstr(kind_switch, "cr_serve_slot(&slot);") : NULL;
+	const char *deny_label
+		= serve != NULL ? strstr(serve, "\ninline_deny_no_serve:") : NULL;
+	const char *reply
+		= deny_label != NULL ? strstr(deny_label, "cr_build_and_send_reply(&slot);") : NULL;
+
+	UT_ASSERT_NOT_NULL(function);
+	UT_ASSERT_NOT_NULL(function_end);
+	UT_ASSERT_NOT_NULL(kind_switch);
+	UT_ASSERT_NOT_NULL(r4_case);
+	UT_ASSERT_NOT_NULL(deny_jump);
+	UT_ASSERT_NOT_NULL(serve);
+	UT_ASSERT_NOT_NULL(deny_label);
+	UT_ASSERT_NOT_NULL(reply);
+	if (function != NULL && function_end != NULL && kind_switch != NULL
+		&& r4_case != NULL && deny_jump != NULL && serve != NULL
+		&& deny_label != NULL && reply != NULL)
+		UT_ASSERT(function < kind_switch && kind_switch < r4_case
+				  && r4_case < deny_jump && deny_jump < serve
+				  && serve < deny_label && deny_label < reply
+				  && reply < function_end);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -857,6 +899,7 @@ main(void)
 	UT_RUN(test_c0_zero_match_positive_proof_table);
 	UT_RUN(test_c0_real_zero_match_abort_live_and_self_disable);
 	UT_RUN(test_undo_multi_verdict_inline_entry_is_denied_without_serve);
+	UT_RUN(test_r4_cr_build_inline_entry_is_denied_without_serve);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

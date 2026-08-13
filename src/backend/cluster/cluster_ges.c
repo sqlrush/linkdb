@@ -55,6 +55,8 @@
 #include "cluster/cluster_ic_router.h" /* spec-5.8 D8 — cluster_ic_send_envelope (REPORT send-back) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
 #include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
+#include "cluster/cluster_replacement_wire.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B — peer DEAD state */
 #include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B — SOLE reclassify */
@@ -76,6 +78,22 @@
  * ============================================================ */
 
 static ClusterGesSharedState *cluster_ges_state = NULL;
+
+#define GES_REPLACEMENT_PHASE3_REQUIRED_CAPABILITIES \
+	PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+
+/* Opcode 18 is a little-endian 72-byte overlay, never a host-order
+ * GesRequestPayload.  Prefix selection happens before the legacy cast so a
+ * malformed/non-phase-3 replacement frame cannot enter the lock work queue. */
+static bool
+ges_payload_is_replacement_episode(const void *payload, uint32 payload_length)
+{
+	const uint8 *bytes = (const uint8 *)payload;
+
+	return bytes != NULL && payload_length >= sizeof(uint32)
+		   && bytes[0] == (uint8)GES_REQ_OPCODE_REPLACEMENT_EPISODE
+		   && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
+}
 
 static inline uint64
 ges_request_holder_epoch(const GesRequestPayload *req)
@@ -281,6 +299,27 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	}
 	if (env->payload_length < sizeof(uint32)) {
 		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
+
+	/* Spec-5.15A opcode-18 phase-3 ingress.  The IC router has already
+	 * authenticated env->source_node_id on this CONTROL connection.  Sample
+	 * that connection's exact corrected-A1 capability generation, then hand
+	 * the decoded observation to the process-local formation-LMON mailbox.
+	 * This handler never applies JCMK/D13 or waits; malformed, non-phase-3,
+	 * reconnect-stale, and full-mailbox inputs are simply withheld. */
+	if (ges_payload_is_replacement_episode(payload, env->payload_length)) {
+		uint32 connection_generation = 0;
+
+		if (env->payload_length == CLUSTER_REPLACEMENT_WIRE_BYTES
+			&& cluster_sf_peer_capability_family_sample(
+				   (int32)env->source_node_id,
+				   GES_REPLACEMENT_PHASE3_REQUIRED_CAPABILITIES, 0, NULL,
+				   &connection_generation))
+			(void)cluster_replacement_wire_phase3_ingress_local(
+				env, payload, env->payload_length, (int32)env->source_node_id,
+				cluster_node_id, cluster_epoch_get_current(),
+				connection_generation);
 		return;
 	}
 

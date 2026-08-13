@@ -60,6 +60,8 @@
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_ic.h" /* spec-5.8 D8 — ClusterICSendResult for the send-envelope stub */
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_replacement_wire.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B stub — peer state */
 #include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B stub — sole-native */
 #include "cluster/cluster_inject.h"		   /* S3 forensics step 1a stub prototypes */
@@ -235,6 +237,25 @@ cluster_shmem_register_region(const void *r pg_attribute_unused())
  * ============================================================ */
 
 int cluster_node_id = 0;
+static uint64 stub_current_epoch = 0;
+
+static uint64 stub_replacement_capability_sample_count = 0;
+static uint32 stub_replacement_required_capabilities = 0;
+
+bool
+cluster_sf_peer_capability_family_sample(
+	int32 peer_id pg_attribute_unused(), uint32 required_capabilities,
+	uint32 optional_capabilities pg_attribute_unused(),
+	bool *optional_supported_out, uint32 *generation_out)
+{
+	stub_replacement_capability_sample_count++;
+	stub_replacement_required_capabilities = required_capabilities;
+	if (optional_supported_out != NULL)
+		*optional_supported_out = false;
+	if (generation_out != NULL)
+		*generation_out = 7;
+	return required_capabilities == UINT32_C(0x00100000);
+}
 
 bool
 cluster_qvotec_in_quorum(void)
@@ -264,7 +285,7 @@ cluster_extend_liveness_is_sole_native(void)
 uint64
 cluster_epoch_get_current(void)
 {
-	return 0; /* default epoch 0 — matches env_sentinel.epoch */
+	return stub_current_epoch;
 }
 
 /* cluster_conf — return non-NULL so validation step 4 declared check
@@ -1077,6 +1098,119 @@ UT_TEST(test_ges_request_valid_payload_enqueues_work)
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue + 1);
 }
 
+
+static ClusterReplacementWireMessage
+make_ges_phase3_message(uint32 phase)
+{
+	ClusterReplacementWireMessage message;
+
+	memset(&message, 0, sizeof(message));
+	message.phase = phase;
+	message.target_node_id = 3;
+	message.epoch = 0;
+	message.request_nonce = UINT64_C(101);
+	message.identity0 = UINT64_C(202);
+	message.identity1 = UINT64_C(303);
+	message.grammar_fingerprint
+		= CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
+	if (phase
+		== CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY) {
+		message.body.phase3.jcmk_generation = UINT64_C(404);
+		message.body.phase3.episode_state_generation = UINT32_C(505);
+	}
+	return message;
+}
+
+
+static void
+drain_ges_phase3_handoff(void)
+{
+	ClusterReplacementPhase3HandoffItem ignored;
+
+	while (cluster_replacement_phase3_handoff_poll_local(&ignored))
+		;
+}
+
+
+/* Break caught: opcode-18 phase 3 must fork before the legacy generic GES
+ * classifier and enqueue only an authenticated formation-LMON observation. */
+UT_TEST(test_ges_phase3_early_dispatch_enqueues_formation_handoff)
+{
+	ClusterReplacementPhase3HandoffItem item;
+	ClusterReplacementWireMessage message;
+	ClusterICEnvelope env;
+	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
+	uint64 pre_fail;
+	uint64 pre_enqueue;
+	uint64 pre_capability;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 1;
+	drain_ges_phase3_handoff();
+	message = make_ges_phase3_message(
+		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
+	memset(&env, 0, sizeof(env));
+	env.msg_type = PGRAC_IC_MSG_GES_REQUEST;
+	env.source_node_id = 3;
+	env.dest_node_id = 1;
+	stub_current_epoch = 1;
+	env.epoch = stub_current_epoch;
+	env.payload_length = sizeof(bytes);
+	pre_fail = stub_inbound_validation_fail;
+	pre_enqueue = stub_work_queue_enqueue_count;
+	pre_capability = stub_replacement_capability_sample_count;
+
+	cluster_ges_request_handler(&env, bytes);
+
+	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue);
+	UT_ASSERT_EQ(stub_replacement_capability_sample_count,
+				 pre_capability + 1);
+	UT_ASSERT_EQ(stub_replacement_required_capabilities,
+				 (uint32)0x00100000U);
+	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending_local(), 1);
+	UT_ASSERT(cluster_replacement_phase3_handoff_poll_local(&item));
+	UT_ASSERT_EQ(memcmp(&item.message, &message, sizeof(message)), 0);
+	UT_ASSERT_EQ(item.authenticated_source_node_id, 3);
+	UT_ASSERT_EQ(item.local_receiver_node_id, 1);
+	UT_ASSERT_EQ((int)item.control_connection_generation, 7);
+	stub_current_epoch = 0;
+}
+
+
+/* Break caught: another valid opcode-18 phase must be withheld, not cast as
+ * GesRequestPayload or submitted to the legacy work queue. */
+UT_TEST(test_ges_nonphase3_opcode18_never_falls_into_legacy_classifier)
+{
+	ClusterReplacementWireMessage message;
+	ClusterICEnvelope env;
+	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
+	uint64 pre_fail;
+	uint64 pre_enqueue;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 1;
+	drain_ges_phase3_handoff();
+	message = make_ges_phase3_message(
+		CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_ACK);
+	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
+	memset(&env, 0, sizeof(env));
+	env.msg_type = PGRAC_IC_MSG_GES_REQUEST;
+	env.source_node_id = 3;
+	env.dest_node_id = 1;
+	env.epoch = 0;
+	env.payload_length = sizeof(bytes);
+	pre_fail = stub_inbound_validation_fail;
+	pre_enqueue = stub_work_queue_enqueue_count;
+
+	cluster_ges_request_handler(&env, bytes);
+
+	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue);
+	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending_local(), 0);
+}
+
 UT_TEST(test_ges_reply_valid_payload_echoes_local_holder)
 {
 	ClusterICEnvelope env;
@@ -1337,7 +1471,7 @@ UT_TEST(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -1346,6 +1480,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_reply_handler_real_behavior);
 	UT_RUN(test_ges_handler_counter_monotonic_n_invocations);
 	UT_RUN(test_ges_request_valid_payload_enqueues_work);
+	UT_RUN(test_ges_phase3_early_dispatch_enqueues_formation_handoff);
+	UT_RUN(test_ges_nonphase3_opcode18_never_falls_into_legacy_classifier);
 	UT_RUN(test_ges_reply_valid_payload_echoes_local_holder);
 	UT_RUN(test_ges_lmon_drain_work_queue_symbol_linkable);
 	UT_RUN(test_ges_opcode_enum_spec_2_17_extension);

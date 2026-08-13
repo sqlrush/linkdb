@@ -83,18 +83,35 @@
  */
 #include "utils/guc.h"
 
+extern int cluster_undo_buffers;
+
+static int *undo_buffers_value_addr = NULL;
+static int undo_buffers_boot_value = -1;
+static int undo_buffers_min_value = -1;
+static int undo_buffers_max_value = -1;
+static GucContext undo_buffers_context = PGC_INTERNAL;
+static const char *undo_buffers_long_desc = NULL;
+
 void
-DefineCustomIntVariable(const char *name pg_attribute_unused(),
+DefineCustomIntVariable(const char *name,
 						const char *short_desc pg_attribute_unused(),
-						const char *long_desc pg_attribute_unused(),
-						int *valueAddr pg_attribute_unused(), int bootValue pg_attribute_unused(),
-						int minValue pg_attribute_unused(), int maxValue pg_attribute_unused(),
-						GucContext context pg_attribute_unused(), int flags pg_attribute_unused(),
+						const char *long_desc,
+						int *valueAddr, int bootValue,
+						int minValue, int maxValue,
+						GucContext context, int flags pg_attribute_unused(),
 						GucIntCheckHook check_hook pg_attribute_unused(),
 						GucIntAssignHook assign_hook pg_attribute_unused(),
 						GucShowHook show_hook pg_attribute_unused())
 {
-	/* Stub for unit-test linking; real impl lives in PG backend. */
+	/* Capture the exact R4A capacity contract; real impl lives in PG backend. */
+	if (strcmp(name, "cluster.undo_buffers") == 0) {
+		undo_buffers_value_addr = valueAddr;
+		undo_buffers_boot_value = bootValue;
+		undo_buffers_min_value = minValue;
+		undo_buffers_max_value = maxValue;
+		undo_buffers_context = context;
+		undo_buffers_long_desc = long_desc;
+	}
 }
 
 void
@@ -380,6 +397,32 @@ UT_TEST(test_cluster_adg_guc_defaults)
 }
 
 
+UT_TEST(test_undo_buffers_guc_describes_both_r4a_banks_and_inactive_zero)
+{
+	undo_buffers_value_addr = NULL;
+	undo_buffers_boot_value = -1;
+	undo_buffers_min_value = -1;
+	undo_buffers_max_value = -1;
+	undo_buffers_context = PGC_INTERNAL;
+	undo_buffers_long_desc = NULL;
+
+	cluster_init_guc();
+
+	UT_ASSERT_EQ(undo_buffers_value_addr == &cluster_undo_buffers, true);
+	UT_ASSERT_EQ(undo_buffers_boot_value, 2048);
+	UT_ASSERT_EQ(undo_buffers_min_value, 0);
+	UT_ASSERT_EQ(undo_buffers_max_value, 1048576);
+	UT_ASSERT_EQ(undo_buffers_context, PGC_POSTMASTER);
+	UT_ASSERT_NOT_NULL(undo_buffers_long_desc);
+	if (undo_buffers_long_desc != NULL) {
+		UT_ASSERT(strstr(undo_buffers_long_desc, "separate B=D block-zero") != NULL);
+		UT_ASSERT(strstr(undo_buffers_long_desc, "20,979,840") != NULL);
+		UT_ASSERT(strstr(undo_buffers_long_desc, "R4A is inactive") != NULL);
+		UT_ASSERT(strstr(undo_buffers_long_desc, "activation refuses zero") != NULL);
+	}
+}
+
+
 UT_TEST(test_smart_fusion_guc_is_guarded_failclosed)
 {
 	bool newval;
@@ -416,12 +459,13 @@ UT_TEST(test_smart_fusion_guc_is_guarded_failclosed)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);
 	UT_RUN(test_cluster_phase_remains_plain_global);
 	UT_RUN(test_cluster_adg_guc_defaults);
+	UT_RUN(test_undo_buffers_guc_describes_both_r4a_banks_and_inactive_zero);
 	UT_RUN(test_smart_fusion_guc_is_guarded_failclosed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

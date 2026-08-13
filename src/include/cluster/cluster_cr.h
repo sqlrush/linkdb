@@ -56,8 +56,44 @@
 #include "access/htup.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_status.h" /* ClusterVisibilityDecision */
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_cr_server.h" /* R4 holder-step ABI types */
+#endif
 #include "storage/bufmgr.h"
 #include "utils/snapshot.h"
+
+#ifdef USE_PGRAC_CLUSTER
+typedef enum ClusterR4CrBuildStepResult {
+	CLUSTER_R4_CR_STEP_FULL = 0,
+	CLUSTER_R4_CR_STEP_NEED_UNDO = 1,
+	CLUSTER_R4_CR_STEP_RETRY = 2,
+	CLUSTER_R4_CR_STEP_FAIL = 3
+} ClusterR4CrBuildStepResult;
+
+StaticAssertDecl(CLUSTER_R4_CR_STEP_FULL == 0, "R4 build-step FULL ordinal");
+StaticAssertDecl(CLUSTER_R4_CR_STEP_NEED_UNDO == 1, "R4 build-step NEED_UNDO ordinal");
+StaticAssertDecl(CLUSTER_R4_CR_STEP_RETRY == 2, "R4 build-step RETRY ordinal");
+StaticAssertDecl(CLUSTER_R4_CR_STEP_FAIL == 3, "R4 build-step FAIL ordinal");
+
+extern ClusterR4CrBuildStepResult cluster_cr_build_on_holder_step(
+	uint32 slot_index, uint64 slot_generation, bool foreign_undo_ready,
+	ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],
+	const char foreign_undo_page[BLCKSZ], ClusterCrBuildReason *reason_out);
+/*
+ * Extract one exact transaction member from an already-resident private DATA
+ * block.  This helper performs no I/O and touches no shared state.  On success
+ * it copies the record, publishes its length, and returns the canonical locator;
+ * TT_WRAP_INVALID may be upgraded once from record.tt_wrap_plus1.  On failure
+ * every output is left byte-for-byte unchanged.
+ */
+extern bool cluster_cr_r4_extract_resident_record(
+	const char resident_undo_page[BLCKSZ],
+	const ClusterTxLocator *request_locator, char record_out[BLCKSZ],
+	size_t *record_length_out, ClusterTxLocator *canonical_locator_out);
+extern bool cluster_cr_build_on_holder_pending_locator(
+	uint32 slot_index, uint64 slot_generation, ClusterTxLocator *locator_out);
+extern void cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_generation);
+#endif
 
 
 /*

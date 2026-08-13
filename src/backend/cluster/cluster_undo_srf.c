@@ -44,6 +44,7 @@ PG_FUNCTION_INFO_V1(cluster_undo_test_force_segment_end_srf);
 #include "varatt.h" /* VARDATA_ANY / VARSIZE_ANY_EXHDR / SET_VARSIZE */
 
 #include "cluster/cluster_itl_slot.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_record_api.h"
 
 
@@ -59,6 +60,10 @@ cluster_undo_get_record_srf(PG_FUNCTION_ARGS)
 	bytea *uba_bytea;
 	int uba_len;
 	UBA uba;
+	uint32 segment_id;
+	uint32 block_no;
+	uint16 tt_slot_offset;
+	uint16 row_offset;
 	char record_buf[BLCKSZ];
 	size_t record_len;
 	bytea *result;
@@ -80,7 +85,7 @@ cluster_undo_get_record_srf(PG_FUNCTION_ARGS)
 
 	memcpy(&uba, VARDATA_ANY(uba_bytea), sizeof(UBA));
 
-	if (UBA_is_invalid(uba))
+	if (!uba_decode_record(uba, &segment_id, &block_no, &tt_slot_offset, &row_offset))
 		PG_RETURN_NULL();
 
 	record_len = cluster_undo_get_record(uba, record_buf, sizeof(record_buf));

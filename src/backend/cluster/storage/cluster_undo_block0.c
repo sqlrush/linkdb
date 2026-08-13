@@ -5,8 +5,9 @@
  *
  *	  This dependency-light layer validates logical identities, resolved
  *	  storage roots, explicit segment generations, and resident-state edges.
- *	  It performs no I/O, shared-memory access, recovery admission, or
- *	  authority acquisition.
+ *	  It performs no I/O or shared-memory access.  The resident implementation
+ *	  lives in cluster_undo_block0_resident.c so snapshot-only consumers retain
+ *	  this object's dependency-light link contract.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -27,7 +28,9 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_reconfig.h"
 #include "cluster/storage/cluster_undo_block0.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 
 /*
  * cluster_undo_block0_logical_slot -- Validate and map a logical identity.
@@ -162,16 +165,18 @@ cluster_undo_block0_state_transition_allowed(ClusterUndoBlock0SlotState from,
 }
 
 /*
- * cluster_undo_block0_r4_prerequisite_snapshot -- Report dormant readiness.
- *
- *	The current prerequisite is immutable and carries no recovery authority.
+ * cluster_undo_block0_r4_prerequisite_snapshot -- Sample its sole owner.
  */
 ClusterR4PrerequisiteSnapshot
 cluster_undo_block0_r4_prerequisite_snapshot(void)
 {
-	return (ClusterR4PrerequisiteSnapshot){
-		.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED,
-		.ready = false,
-		.reserved = {0, 0, 0},
-	};
+	return cluster_reconfig_r4_prerequisite_snapshot();
+}
+
+bool
+cluster_undo_block0_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected)
+{
+	if (!cluster_undo_block0_current_startup_fenced_owned())
+		return false;
+	return cluster_reconfig_r4_publish_ready(expected);
 }
