@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 
+#include "access/xlog.h"
 #include "miscadmin.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
@@ -31,6 +32,7 @@
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
 #include "storage/ipc.h"
@@ -122,6 +124,10 @@ static ClusterSemanticActivationUtilityMailboxShmem
 static uint32 semantic_activation_local_inflight[2][64];
 static int semantic_activation_exit_hook_pid;
 static uint64 semantic_activation_lmon_record_read_seq;
+static uint64 semantic_activation_lmon_pgrd_request_seq;
+static uint64 semantic_activation_lmon_pgrd_utility_request_seq;
+static uint64 semantic_activation_lmon_pgrd_read_request_seq;
+static uint64 semantic_activation_lmon_pgrd_read_utility_request_seq;
 
 static bool semantic_activation_record_cas_mailbox_submit(
 	uint64 expected_generation, uint64 expected_source_feature_bitmap,
@@ -1648,7 +1654,9 @@ semantic_activation_authority_mailbox_submit(
 			&& request_kind
 				   != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR
 			&& request_kind
-				   != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ))
+				   != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ
+			&& request_kind
+				   != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ))
 		return false;
 
 	request_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
@@ -1915,6 +1923,197 @@ cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
 		request_seq, out_result);
 }
 
+static bool
+semantic_activation_undo_root_descriptor_read_mailbox_submit(
+	uint64 system_identifier, uint64 *out_request_seq)
+{
+	uint8 zero[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] = { 0 };
+
+	if (system_identifier == 0)
+		return false;
+	return semantic_activation_authority_mailbox_submit(
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ,
+		system_identifier, 0, zero, out_request_seq);
+}
+
+bool
+cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
+	ClusterUndoRootDescriptorReadRequest *out)
+{
+	uint64 request_seq;
+	uint64 completion_seq;
+
+	if (SemanticActivationShmem == NULL || out == NULL)
+		return false;
+	request_seq = pg_atomic_read_u64(
+		&SemanticActivationShmem->record_cas_request_seq);
+	completion_seq = pg_atomic_read_u64(
+		&SemanticActivationShmem->record_cas_completion_seq);
+	if (request_seq == completion_seq || completion_seq == UINT64_MAX
+		|| request_seq != completion_seq + 1)
+		return false;
+	pg_read_barrier();
+	if (pg_atomic_read_u32(
+			&SemanticActivationShmem->record_cas_request_kind)
+		!= CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ)
+		return false;
+	out->request_seq = request_seq;
+	out->system_identifier
+		= SemanticActivationShmem->record_cas_expected_generation;
+	return out->system_identifier != 0;
+}
+
+bool
+cluster_semantic_activation_qvotec_complete_undo_root_descriptor_read(
+	uint64 request_seq, ClusterUndoRootDescriptorState state,
+	const uint8 selected_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+{
+	ClusterUndoRootDescriptorV1 descriptor;
+	uint8 zero[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] = { 0 };
+	uint64 system_identifier;
+
+	if (!semantic_activation_authority_mailbox_completion_matches(
+			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ,
+			request_seq)
+		|| state < CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED
+		|| state > CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD
+		|| selected_bytes == NULL)
+		return false;
+	system_identifier
+		= SemanticActivationShmem->record_cas_expected_generation;
+	if ((state == CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED
+		 && !semantic_activation_bytes_are_zero(
+			 selected_bytes, sizeof(zero)))
+		|| (state == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+			&& (cluster_undo_root_descriptor_decode(
+					selected_bytes, system_identifier, &descriptor)
+					!= CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+				|| descriptor.descriptor_incarnation != 1
+				|| descriptor.root_kind != CLUSTER_UNDO_ROOT_KIND_SHARED
+				|| descriptor.owner_node != -1)))
+		return false;
+
+	memcpy(SemanticActivationShmem->record_cas_desired_bytes,
+		   state == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID ? selected_bytes
+													 : zero,
+		   sizeof(zero));
+	pg_write_barrier();
+	return semantic_activation_authority_mailbox_complete(
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ,
+		request_seq, (ClusterSemanticActivationResult)state);
+}
+
+static bool
+semantic_activation_undo_root_descriptor_read_mailbox_poll_completion(
+	uint64 request_seq, ClusterUndoRootDescriptorReadCompletion *out)
+{
+	uint32 state;
+
+	if (SemanticActivationShmem == NULL || out == NULL
+		|| pg_atomic_read_u64(
+			   &SemanticActivationShmem->record_cas_completion_seq)
+			   != request_seq)
+		return false;
+	pg_read_barrier();
+	if (pg_atomic_read_u32(
+			&SemanticActivationShmem->record_cas_request_kind)
+		!= CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ)
+		return false;
+	state = pg_atomic_read_u32(&SemanticActivationShmem->record_cas_result);
+	if (state > CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD)
+		return false;
+	out->state = (ClusterUndoRootDescriptorState)state;
+	memcpy(out->selected_bytes,
+		   SemanticActivationShmem->record_cas_desired_bytes,
+		   sizeof(out->selected_bytes));
+	return true;
+}
+
+static bool
+semantic_activation_lmon_submit_pgrd_candidate(
+	const uint8 candidate[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+	uint64 system_identifier,
+	uint64 *out_request_seq)
+{
+	ClusterUndoRootDescriptorV1 descriptor;
+
+	if (candidate == NULL || system_identifier == 0 || out_request_seq == NULL
+		|| cluster_undo_root_descriptor_decode(
+			   candidate, system_identifier, &descriptor)
+			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+		|| descriptor.descriptor_incarnation != 1
+		|| descriptor.root_kind != CLUSTER_UNDO_ROOT_KIND_SHARED
+		|| descriptor.owner_node != -1)
+		return false;
+
+	return cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
+		system_identifier, candidate, out_request_seq);
+}
+
+static bool
+semantic_activation_lmon_submit_pgrd_exact_retry(
+	const char *root_directory, uint64 system_identifier,
+	uint64 *out_request_seq)
+{
+	uint8 candidate[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+
+	if (cluster_undo_smgr_root_descriptor_read_candidate(
+			root_directory, candidate)
+		!= CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT)
+		return false;
+	return semantic_activation_lmon_submit_pgrd_candidate(
+		candidate, system_identifier, out_request_seq);
+}
+
+static bool
+semantic_activation_lmon_shared_pgrd_root_directory(
+	char root_directory[MAXPGPATH])
+{
+	int path_len;
+
+	if (root_directory == NULL || cluster_shared_data_dir == NULL
+		|| cluster_shared_data_dir[0] == '\0')
+		return false;
+	path_len = snprintf(root_directory, MAXPGPATH, "%s/pg_undo",
+					cluster_shared_data_dir);
+	return path_len >= 0 && path_len < MAXPGPATH;
+}
+
+static bool
+semantic_activation_lmon_publish_fresh_shared_pgrd(
+	const char *root_directory, uint64 system_identifier,
+	uint64 *out_request_seq)
+{
+	ClusterUndoRootDescriptorV1 descriptor;
+	ClusterUndoSmgrRootMirrorState publish_state;
+	uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+
+	if (root_directory == NULL || system_identifier == 0
+		|| out_request_seq == NULL)
+		return false;
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.descriptor_incarnation = 1;
+	descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
+	descriptor.owner_node = -1;
+	descriptor.root_ordinal = 0;
+	descriptor.system_identifier = system_identifier;
+	if (!cluster_undo_root_namespace_id(
+			descriptor.descriptor_incarnation, descriptor.root_ordinal,
+			&descriptor.namespace_id)
+		|| !pg_strong_random(descriptor.root_uuid,
+						 sizeof(descriptor.root_uuid))
+		|| !cluster_undo_root_descriptor_encode(&descriptor, desired))
+		return false;
+	publish_state = cluster_undo_smgr_root_descriptor_publish(
+		root_directory, desired);
+	if (publish_state != CLUSTER_UNDO_SMGR_ROOT_MIRROR_PUBLISHED
+		&& publish_state != CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT)
+		return false;
+
+	return semantic_activation_lmon_submit_pgrd_candidate(
+		desired, system_identifier, out_request_seq);
+}
+
 void
 cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor)
 {}
@@ -2081,14 +2280,109 @@ semantic_activation_lmon_consume_utility(void)
 			request.action, request.expected_record_generation, &refusal,
 			&effects);
 		if (result == CLUSTER_SEMANTIC_ACTIVATION_OK) {
+			ClusterUndoRootDescriptorReadCompletion pgrd_read_completion;
+			ClusterSemanticActivationResult pgrd_result;
+			ClusterUndoSmgrRootMirrorState mirror_state;
+			uint8 candidate[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+			char root_directory[MAXPGPATH];
+			uint64 system_identifier = GetSystemIdentifier();
+			bool have_root_directory;
+
+			if (semantic_activation_lmon_pgrd_request_seq != 0) {
+				if (semantic_activation_lmon_pgrd_utility_request_seq
+						!= request.request_seq) {
+					semantic_activation_set_refusal(
+						&refusal, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+						request.expected_record_generation);
+				} else if (!cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
+						   semantic_activation_lmon_pgrd_request_seq,
+						   &pgrd_result)) {
+					return;
+				} else {
+					semantic_activation_lmon_pgrd_request_seq = 0;
+					semantic_activation_lmon_pgrd_utility_request_seq = 0;
+					if (pgrd_result != CLUSTER_SEMANTIC_ACTIVATION_OK)
+						semantic_activation_set_refusal(
+							&refusal, pgrd_result,
+							CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+							request.expected_record_generation);
+				}
+			} else if (semantic_activation_lmon_pgrd_read_request_seq != 0) {
+				if (semantic_activation_lmon_pgrd_read_utility_request_seq
+						!= request.request_seq) {
+					semantic_activation_set_refusal(
+						&refusal, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+						request.expected_record_generation);
+				} else if (!semantic_activation_undo_root_descriptor_read_mailbox_poll_completion(
+						   semantic_activation_lmon_pgrd_read_request_seq,
+						   &pgrd_read_completion)) {
+					return;
+				} else {
+					semantic_activation_lmon_pgrd_read_request_seq = 0;
+					semantic_activation_lmon_pgrd_read_utility_request_seq = 0;
+					have_root_directory
+						= semantic_activation_lmon_shared_pgrd_root_directory(
+							root_directory);
+					if (pgrd_read_completion.state
+							!= CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED
+						|| !have_root_directory
+						|| !semantic_activation_lmon_publish_fresh_shared_pgrd(
+							root_directory, system_identifier,
+							&semantic_activation_lmon_pgrd_request_seq)) {
+						semantic_activation_set_refusal(
+							&refusal,
+							CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD,
+							CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+							request.expected_record_generation);
+					} else {
+						semantic_activation_lmon_pgrd_utility_request_seq
+							= request.request_seq;
+						return;
+					}
+				}
+			} else {
+				have_root_directory
+					= semantic_activation_lmon_shared_pgrd_root_directory(
+						root_directory);
+				if (have_root_directory) {
+					mirror_state
+						= cluster_undo_smgr_root_descriptor_read_candidate(
+							root_directory, candidate);
+					if (mirror_state == CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT
+						&& semantic_activation_lmon_submit_pgrd_candidate(
+							candidate, system_identifier,
+							&semantic_activation_lmon_pgrd_request_seq)) {
+						semantic_activation_lmon_pgrd_utility_request_seq
+							= request.request_seq;
+						return;
+					}
+					if (mirror_state == CLUSTER_UNDO_SMGR_ROOT_MIRROR_ABSENT
+						&& semantic_activation_undo_root_descriptor_read_mailbox_submit(
+							system_identifier,
+							&semantic_activation_lmon_pgrd_read_request_seq)) {
+						semantic_activation_lmon_pgrd_read_utility_request_seq
+							= request.request_seq;
+						return;
+					}
+					semantic_activation_set_refusal(
+						&refusal, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+						request.expected_record_generation);
+				}
+			}
+
 			/* ADMITTED grants entry to PREPARE only.  Source close is the
 			 * next durable-FSM edge after the PREPARE CAS, so this carrier
 			 * remains nonterminal until that state is installed. */
-			result = CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
-			semantic_activation_set_refusal(
-				&refusal, result,
-				CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-				request.expected_record_generation);
+			if (refusal.result == CLUSTER_SEMANTIC_ACTIVATION_OK) {
+				result = CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+				semantic_activation_set_refusal(
+					&refusal, result,
+					CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+					request.expected_record_generation);
+			}
 		}
 	}
 

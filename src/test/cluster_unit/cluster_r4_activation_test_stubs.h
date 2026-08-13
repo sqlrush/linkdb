@@ -17,7 +17,11 @@
 #ifndef CLUSTER_R4_ACTIVATION_TEST_STUBS_H
 #define CLUSTER_R4_ACTIVATION_TEST_STUBS_H
 
+#include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_gcs_block_dedup.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "storage/ipc.h"
@@ -55,6 +59,15 @@ cluster_reconfig_lmon_snapshot_replacement_admitted(
 	return false;
 }
 
+bool
+cluster_reconfig_lmon_snapshot_admitted_membership(
+	uint64 *out_members_lo pg_attribute_unused(),
+	uint64 *out_members_hi pg_attribute_unused(),
+	uint64 *out_formation_epoch pg_attribute_unused())
+{
+	return false;
+}
+
 ClusterR4PrerequisiteSnapshot
 cluster_reconfig_r4_prerequisite_snapshot(void)
 {
@@ -75,6 +88,51 @@ bool
 cluster_undo_block0_current_startup_fenced_owned(void)
 {
 	return false;
+}
+
+ClusterLmsSharedState *
+cluster_lms_shared_state(void)
+{
+	return NULL;
+}
+
+bool
+cluster_lms_r4_drain_request(
+	ClusterLmsSharedState *state pg_attribute_unused(),
+	uint64 generation pg_attribute_unused(),
+	uint64 *worker_incarnation pg_attribute_unused())
+{
+	return false;
+}
+
+void
+cluster_lms_wakeup(int worker_id pg_attribute_unused())
+{}
+
+bool
+cluster_cr_server_r4_lmon_reclaim_closed(
+	uint64 worker_incarnation pg_attribute_unused(),
+	uint64 generation pg_attribute_unused())
+{
+	return false;
+}
+
+uint64
+cluster_gcs_block_dedup_r4_route_purge_closed(void)
+{
+	return 0;
+}
+
+uint64
+cluster_gcs_block_dedup_r4_route_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_gcs_block_r4_requester_count(void)
+{
+	return 0;
 }
 
 bool cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,

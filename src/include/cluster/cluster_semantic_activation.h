@@ -14,6 +14,7 @@
 
 #include "c.h"
 #include "cluster/cluster_ic.h"
+#include "cluster/cluster_undo_root_descriptor.h"
 #include "nodes/parsenodes.h"
 
 #define CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 (UINT64_C(1) << 0)
@@ -124,7 +125,8 @@ typedef enum ClusterSemanticAuthorityRequestKind {
 	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE = 0,
 	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS = 1,
 	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR = 2,
-	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ = 3
+	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ = 3,
+	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ = 4
 } ClusterSemanticAuthorityRequestKind;
 
 typedef struct ClusterUndoRootDescriptorRequest {
@@ -132,6 +134,16 @@ typedef struct ClusterUndoRootDescriptorRequest {
 	uint64 system_identifier;
 	uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 } ClusterUndoRootDescriptorRequest;
+
+typedef struct ClusterUndoRootDescriptorReadRequest {
+	uint64 request_seq;
+	uint64 system_identifier;
+} ClusterUndoRootDescriptorReadRequest;
+
+typedef struct ClusterUndoRootDescriptorReadCompletion {
+	ClusterUndoRootDescriptorState state;
+	uint8 selected_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+} ClusterUndoRootDescriptorReadCompletion;
 
 typedef ClusterSemanticActivationResult (*ClusterSemanticReadinessCallback)(
 	uint64 expected_generation, ClusterSemanticActivationRefusal *refusal);
@@ -202,6 +214,11 @@ extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor(
 extern bool
 cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
 	uint64 request_seq, ClusterSemanticActivationResult *out_result);
+extern bool cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
+	ClusterUndoRootDescriptorReadRequest *out);
+extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor_read(
+	uint64 request_seq, ClusterUndoRootDescriptorState state,
+	const uint8 selected_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
 extern void cluster_semantic_activation_lmon_tick(void);
 extern ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,

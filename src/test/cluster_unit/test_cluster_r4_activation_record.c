@@ -17,6 +17,8 @@
 
 #include "cluster_r4_activation_test_stubs.h"
 
+int cluster_node_id = 0;
+
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr pg_attribute_unused())

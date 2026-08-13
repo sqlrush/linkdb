@@ -2332,6 +2332,7 @@ qvotec_poll_once(void)
 {
 	ClusterSemanticActivationCasRequest semantic_record_cas_request;
 	ClusterSemanticActivationReadRequest semantic_record_read_request;
+	ClusterUndoRootDescriptorReadRequest undo_root_descriptor_read_request;
 	ClusterUndoRootDescriptorRequest undo_root_descriptor_request;
 	ClusterVotingSlot self_slot;
 	ClusterVotingDiskIoState io_states[CLUSTER_MAX_VOTING_DISKS];
@@ -2384,6 +2385,29 @@ qvotec_poll_once(void)
 
 		(void)cluster_semantic_activation_qvotec_complete_record_cas(
 			semantic_record_cas_request.request_seq, semantic_record_cas_result);
+	} else if (cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
+				   &undo_root_descriptor_read_request)) {
+		ClusterUndoRootDescriptorV1 descriptor;
+		uint8 selected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] = { 0 };
+		uint8 observed_disk_bitmap = 0;
+		ClusterUndoRootDescriptorState state
+			= CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+
+		if (qvotec_undo_root_descriptor_formation_attested_fds(
+				qvotec_fds, qvotec_n_disks)) {
+			state = qvotec_undo_root_descriptor_read_fds(
+				qvotec_fds, qvotec_n_disks,
+				undo_root_descriptor_read_request.system_identifier,
+				CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &descriptor,
+				&observed_disk_bitmap);
+			if (state == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+				&& !cluster_undo_root_descriptor_encode(
+					&descriptor, selected))
+				state = CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+		}
+		(void)observed_disk_bitmap;
+		(void)cluster_semantic_activation_qvotec_complete_undo_root_descriptor_read(
+			undo_root_descriptor_read_request.request_seq, state, selected);
 	} else if (cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
 				   &undo_root_descriptor_request)) {
 		uint8 completed_disk_bitmap;

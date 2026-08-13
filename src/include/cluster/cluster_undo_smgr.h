@@ -161,6 +161,9 @@ extern ClusterUndoSmgrRootMirrorState cluster_undo_smgr_root_descriptor_probe(
 	const char *root_directory,
 	const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
 	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
+extern ClusterUndoSmgrRootMirrorState cluster_undo_smgr_root_descriptor_read_candidate(
+	const char *root_directory,
+	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
 extern ClusterUndoSmgrRootMirrorState cluster_undo_smgr_root_descriptor_publish(
 	const char *root_directory,
 	const uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);

@@ -716,6 +716,28 @@ UT_TEST(test_root_descriptor_mirror_eexist_is_validate_only)
     remove_if_present(final);
 }
 
+UT_TEST(test_root_descriptor_mirror_reads_exact_retry_candidate)
+{
+	char final[MAXPGPATH];
+	uint8 image[512];
+	uint8 observed[512];
+	int i;
+
+	resolve_root_descriptor(final);
+	remove_if_present(final);
+	for (i = 0; i < 512; i++)
+		image[i] = (uint8)(i ^ 0x91);
+	UT_ASSERT_EQ(cluster_undo_smgr_root_descriptor_publish(
+					 publication_dir, image),
+				 CLUSTER_UNDO_SMGR_ROOT_MIRROR_PUBLISHED);
+	memset(observed, 0, sizeof(observed));
+	UT_ASSERT_EQ(cluster_undo_smgr_root_descriptor_read_candidate(
+					 publication_dir, observed),
+				 CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT);
+	UT_ASSERT_EQ(memcmp(observed, image, sizeof(image)), 0);
+	remove_if_present(final);
+}
+
 UT_TEST(test_root_descriptor_mirror_probe_rejects_short_and_symlink)
 {
     char final[MAXPGPATH];
@@ -831,7 +853,7 @@ main(void)
 
     UT_ASSERT_NOT_NULL(mkdtemp(template));
     strlcpy(publication_dir, template, sizeof(publication_dir));
-    UT_PLAN(25);
+	UT_PLAN(26);
     UT_RUN(test_probe_distinguishes_absent_and_preserves_output);
     UT_RUN(test_probe_accepts_only_exact_full_identity);
     UT_RUN(test_probe_classifies_short_or_wrong_identity_as_invalid);
@@ -854,6 +876,7 @@ main(void)
     UT_RUN(test_temp_write_failure_closes_fd_and_removes_only_owned_temp);
     UT_RUN(test_root_descriptor_mirror_publish_is_exact_and_durable);
     UT_RUN(test_root_descriptor_mirror_eexist_is_validate_only);
+	UT_RUN(test_root_descriptor_mirror_reads_exact_retry_candidate);
     UT_RUN(test_root_descriptor_mirror_probe_rejects_short_and_symlink);
     UT_RUN(test_root_descriptor_mirror_probe_rejects_lstat_open_symlink_swap);
     UT_RUN(test_root_descriptor_mirror_write_failure_cleans_owned_temp);

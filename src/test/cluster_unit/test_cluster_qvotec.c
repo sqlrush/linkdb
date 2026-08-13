@@ -58,9 +58,14 @@
 #include <unistd.h>
 
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_gcs_block_dedup.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_reconfig.h" /* ReconfigEvent for spec-4.12b D2 stub */
 #include "cluster/cluster_replacement_request.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -151,6 +156,7 @@ volatile sig_atomic_t ShutdownRequestPending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 int MyProcPid = 0;
 int cluster_node_id = 0;
+char *cluster_shared_data_dir = NULL;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -718,6 +724,58 @@ cluster_reconfig_r4_publish_ready(
 	const ClusterR4PrerequisiteSnapshot *expected pg_attribute_unused())
 {
 	return false;
+}
+ClusterLmsSharedState *
+cluster_lms_shared_state(void)
+{
+	return NULL;
+}
+bool
+cluster_lms_r4_drain_request(
+	ClusterLmsSharedState *state pg_attribute_unused(),
+	uint64 generation pg_attribute_unused(),
+	uint64 *worker_incarnation pg_attribute_unused())
+{
+	return false;
+}
+void
+cluster_lms_wakeup(int worker_id pg_attribute_unused())
+{}
+bool
+cluster_cr_server_r4_lmon_reclaim_closed(
+	uint64 worker_incarnation pg_attribute_unused(),
+	uint64 generation pg_attribute_unused())
+{
+	return false;
+}
+uint64
+cluster_gcs_block_dedup_r4_route_purge_closed(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_block_dedup_r4_route_count(void)
+{
+	return 0;
+}
+uint64
+cluster_gcs_block_r4_requester_count(void)
+{
+	return 0;
+}
+ClusterUndoSmgrRootMirrorState
+cluster_undo_smgr_root_descriptor_read_candidate(
+	const char *root_directory pg_attribute_unused(),
+	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] pg_attribute_unused())
+{
+	return CLUSTER_UNDO_SMGR_ROOT_MIRROR_ABSENT;
+}
+ClusterUndoSmgrRootMirrorState
+cluster_undo_smgr_root_descriptor_publish(
+	const char *root_directory pg_attribute_unused(),
+	const uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] pg_attribute_unused())
+{
+	return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 }
 bool
 cluster_undo_block0_current_startup_fenced_owned(void)

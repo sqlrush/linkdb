@@ -544,8 +544,8 @@ root_descriptor_path(const char *root_directory, char final_path[MAXPGPATH])
 }
 
 
-ClusterUndoSmgrRootMirrorState
-cluster_undo_smgr_root_descriptor_probe(
+static ClusterUndoSmgrRootMirrorState
+root_descriptor_read(
 	const char *root_directory,
 	const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
 	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
@@ -559,7 +559,7 @@ cluster_undo_smgr_root_descriptor_probe(
 	int open_flags = O_RDONLY | PG_BINARY;
 	int fd;
 
-	if (expected == NULL || observed == NULL
+	if (observed == NULL
 		|| !root_descriptor_path(root_directory, final_path))
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 	if (lstat(final_path, &path_st) != 0)
@@ -603,12 +603,34 @@ cluster_undo_smgr_root_descriptor_probe(
 	}
 	if (close(fd) != 0)
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
-	if (nread != sizeof(image) || memcmp(image, expected, sizeof(image)) != 0)
+	if (nread != sizeof(image)
+		|| (expected != NULL && memcmp(image, expected, sizeof(image)) != 0))
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_HOLD;
 	if (!provision_fsync_parent(final_path))
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 	memcpy(observed, image, sizeof(image));
 	return CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT;
+}
+
+
+ClusterUndoSmgrRootMirrorState
+cluster_undo_smgr_root_descriptor_probe(
+	const char *root_directory,
+	const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+{
+	if (expected == NULL)
+		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
+	return root_descriptor_read(root_directory, expected, observed);
+}
+
+
+ClusterUndoSmgrRootMirrorState
+cluster_undo_smgr_root_descriptor_read_candidate(
+	const char *root_directory,
+	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+{
+	return root_descriptor_read(root_directory, NULL, observed);
 }
 
 
