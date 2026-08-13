@@ -2083,8 +2083,6 @@ cluster_semantic_activation_qvotec_pgrd_formation_matches(
 	current_incarnation = cluster_qvotec_get_self_incarnation();
 	if (current_epoch != formation->formation_epoch
 		|| current_incarnation != formation->coordinator_incarnation
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != formation->coordinator_incarnation
 		|| !semantic_activation_snapshot(&snapshot)
 		|| snapshot.formation_epoch != formation->formation_epoch
 		|| snapshot.record_generation
