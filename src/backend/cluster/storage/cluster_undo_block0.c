@@ -68,12 +68,13 @@ cluster_undo_block0_logical_slot(const ClusterUndoBlock0LogicalKey *logical, uin
 }
 
 /*
- * cluster_undo_block0_root_valid -- Accept only declared path intents.
+ * cluster_undo_block0_root_valid -- Accept only persistent PGRD identities
+ * and declared path intents.
  */
 bool
 cluster_undo_block0_root_valid(const ClusterUndoBlock0ResolvedRoot *root)
 {
-	if (root == NULL)
+	if (root == NULL || root->root_id == 0 || root->root_generation == 0)
 		return false;
 
 	switch (root->intent) {

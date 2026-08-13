@@ -125,10 +125,17 @@ extern bool cluster_qvotec_test_epoch_ballot_phase1_promise(
 	uint8 *out_completed_disk_bitmap);
 extern bool cluster_qvotec_test_epoch_ballot_formation_attested(
 	const int *fds, int n_disks);
+extern bool cluster_qvotec_test_undo_root_descriptor_formation_attested(
+	const int *fds, int n_disks);
 extern bool cluster_qvotec_test_undo_root_descriptor_provision(
 	const int *fds, int n_disks, uint64 system_identifier,
 	const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
 	uint8 *out_completed_disk_bitmap);
+extern ClusterUndoRootDescriptorState
+cluster_qvotec_test_undo_root_descriptor_read(
+	const int *fds, int n_disks, uint64 system_identifier,
+	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
+	uint8 *out_observed_disk_bitmap);
 extern ClusterReplacementRequestSlotState
 cluster_qvotec_test_replacement_request_preserve(
 	ClusterVotingSlot *next, const ClusterVotingSlot *prior);
@@ -1514,6 +1521,61 @@ UT_TEST(test_pgrd_local_node_127_uses_last_frozen_slot)
 	pgsa_disk_set_close(&set);
 }
 
+UT_TEST(test_pgrd_majority_read_requires_two_exact_images)
+{
+	PgsaDiskSet set;
+	ClusterUndoRootDescriptorV1 observed;
+	uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 observed_bitmap = UINT8_C(0xa5);
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgrd_test_image(CLUSTER_UNDO_ROOT_KIND_SHARED, -1, 0x91,
+						   desired));
+	UT_ASSERT_EQ(cluster_voting_disk_write_raw_slot_at(
+					 set.fds[0], CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET,
+					 desired),
+				 CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(close(set.fds[1]), 0);
+	set.fds[1] = -1;
+	UT_ASSERT_EQ(close(set.fds[2]), 0);
+	set.fds[2] = -1;
+	memset(&observed, 0, sizeof(observed));
+	UT_ASSERT_EQ(cluster_qvotec_test_undo_root_descriptor_read(
+					 set.fds, PGSA_TEST_DISKS,
+					 UINT64_C(0x0123456789abcdef),
+					 CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &observed,
+					 &observed_bitmap),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
+
+	set.fds[1] = open(set.paths[1], O_RDWR | PG_BINARY);
+	UT_ASSERT(set.fds[1] >= 0);
+	UT_ASSERT_EQ(cluster_voting_disk_write_raw_slot_at(
+					 set.fds[1], CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET,
+					 desired),
+				 CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(cluster_qvotec_test_undo_root_descriptor_read(
+					 set.fds, PGSA_TEST_DISKS,
+					 UINT64_C(0x0123456789abcdef),
+					 CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &observed,
+					 &observed_bitmap),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID);
+	UT_ASSERT_EQ(observed_bitmap, UINT8_C(0x03));
+	UT_ASSERT_EQ(observed.descriptor_incarnation, UINT64_C(1));
+	UT_ASSERT_EQ(observed.root_kind, CLUSTER_UNDO_ROOT_KIND_SHARED);
+	UT_ASSERT_EQ(observed.owner_node, -1);
+	UT_ASSERT_EQ(observed.root_ordinal, UINT32_C(0));
+	for (i = 0; i < CLUSTER_UNDO_ROOT_UUID_BYTES; i++)
+		UT_ASSERT_EQ(observed.root_uuid[i], UINT8_C(0x91));
+	UT_ASSERT_EQ(observed.namespace_id, UINT64_C(1));
+	UT_ASSERT_EQ(observed.system_identifier,
+				 UINT64_C(0x0123456789abcdef));
+	pgsa_disk_set_close(&set);
+}
+
 static ClusterSemanticActivationRecord
 pgsa_record(ClusterSemanticActivationPhase phase, uint64 generation, uint64 source, uint64 target)
 {
@@ -2261,6 +2323,23 @@ UT_TEST(test_epoch_ballot_formation_rejects_fixture_disks)
 	pgsa_disk_set_close(&set);
 }
 
+UT_TEST(test_pgrd_formation_rejects_fixture_disks)
+{
+	PgsaDiskSet set;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(!cluster_qvotec_test_undo_root_descriptor_formation_attested(
+		set.fds, PGSA_TEST_DISKS));
+	UT_ASSERT(!cluster_qvotec_test_undo_root_descriptor_formation_attested(
+		NULL, 0));
+	UT_ASSERT(!cluster_qvotec_test_undo_root_descriptor_formation_attested(
+		set.fds, 2));
+	pgsa_disk_set_close(&set);
+}
+
 static char *
 pgsa_read_source(const char *path)
 {
@@ -2399,7 +2478,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(46);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -2426,6 +2505,7 @@ main(void)
 	UT_RUN(test_pgrd_short_read_holds_despite_clean_majority);
 	UT_RUN(test_pgrd_postwrite_one_of_three_exact_does_not_commit);
 	UT_RUN(test_pgrd_local_node_127_uses_last_frozen_slot);
+	UT_RUN(test_pgrd_majority_read_requires_two_exact_images);
 	UT_RUN(test_pgsa_01_expected_majority_plus_stale_commits_desired);
 	UT_RUN(test_pgsa_02_generation_mismatch_is_conflict_without_mutation);
 	UT_RUN(test_pgsa_03_source_mismatch_is_conflict_without_mutation);
@@ -2443,6 +2523,7 @@ main(void)
 	UT_RUN(test_epoch_ballot_recover_head_requires_exact_settled_majority);
 	UT_RUN(test_epoch_ballot_phase1_preserves_history_and_observed_promise_floor);
 	UT_RUN(test_epoch_ballot_formation_rejects_fixture_disks);
+	UT_RUN(test_pgrd_formation_rejects_fixture_disks);
 	UT_RUN(test_pgsa_source_graph_and_test_linkage_are_exact);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

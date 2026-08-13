@@ -774,10 +774,27 @@ UT_TEST(test_io_21_offset_raw_slot_distinguishes_short_and_io_failure)
 }
 
 
+UT_TEST(test_io_22_pgrd_authority_rejects_fixture_file)
+{
+	char *path = make_temp_path("pgrd_attest");
+	int fd;
+
+	fd = open(path, O_CREAT | O_EXCL | O_RDWR, S_IRUSR | S_IWUSR);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(ftruncate(fd, CLUSTER_VOTING_PGRD_FILE_BYTES_MIN), 0);
+	UT_ASSERT(!cluster_voting_disk_pgrd_authority_attest(fd));
+	UT_ASSERT(!cluster_voting_disk_pgrd_authority_attest(-1));
+
+	cluster_voting_disk_close(fd);
+	(void)unlink(path);
+	free(path);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
 	UT_RUN(test_io_1_round_trip);
 	UT_RUN(test_io_2_crc_mismatch_returns_torn);
 	UT_RUN(test_io_3_magic_mismatch_failed);
@@ -799,6 +816,7 @@ main(void)
 	UT_RUN(test_io_19_offset_raw_slot_rejects_invalid_inputs);
 	UT_RUN(test_io_20_pgrd_offsets_round_trip_without_aliasing);
 	UT_RUN(test_io_21_offset_raw_slot_distinguishes_short_and_io_failure);
+	UT_RUN(test_io_22_pgrd_authority_rejects_fixture_file);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

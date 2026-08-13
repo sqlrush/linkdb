@@ -914,8 +914,8 @@ cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id,
  * payload-neutral lane I/O used by unit fixtures.  It requires an actual
  * Linux block device, an effective O_DIRECT descriptor and kernel-reported
  * capacity for the complete frozen voting map. */
-bool
-cluster_voting_disk_epoch_ballot_authority_attest(int fd)
+static bool
+voting_disk_raw_authority_attest(int fd, uint64 required_capacity)
 {
 #ifdef __linux__
 	struct stat st;
@@ -929,12 +929,27 @@ cluster_voting_disk_epoch_ballot_authority_attest(int fd)
 		return false;
 	if (ioctl(fd, BLKGETSIZE64, &capacity) != 0)
 		return false;
-	return capacity >= (uint64)CLUSTER_VOTING_FILE_BYTES_MIN
+	return capacity >= required_capacity
 		   && (capacity % CLUSTER_VOTING_SLOT_BYTES) == 0;
 #else
 	(void)fd;
+	(void)required_capacity;
 	return false;
 #endif
+}
+
+bool
+cluster_voting_disk_epoch_ballot_authority_attest(int fd)
+{
+	return voting_disk_raw_authority_attest(
+		fd, (uint64)CLUSTER_VOTING_FILE_BYTES_MIN);
+}
+
+bool
+cluster_voting_disk_pgrd_authority_attest(int fd)
+{
+	return voting_disk_raw_authority_attest(
+		fd, (uint64)CLUSTER_VOTING_PGRD_FILE_BYTES_MIN);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

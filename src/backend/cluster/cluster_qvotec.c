@@ -799,6 +799,10 @@ cluster_writes_currently_frozen(void)
  * ============================================================ */
 #include "cluster/cluster_voting_disk_io.h" /* fd open/close + format */
 
+StaticAssertDecl(CLUSTER_UNDO_ROOT_DESCRIPTOR_FILE_BYTES_MIN
+					 == CLUSTER_VOTING_PGRD_FILE_BYTES_MIN,
+				 "PGRD voting capacity bounds must match");
+
 static bool
 qvotec_pgsa_bytes_are_zero(const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
 {
@@ -811,6 +815,11 @@ qvotec_pgsa_bytes_are_zero(const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_
 	return true;
 }
 
+static ClusterUndoRootDescriptorState qvotec_undo_root_descriptor_read_fds(
+	const int *fds, int n_disks, uint64 system_identifier,
+	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
+	uint8 *out_observed_disk_bitmap);
+
 static bool
 qvotec_undo_root_descriptor_provision_fds(
 	const int *fds, int n_disks, uint64 system_identifier,
@@ -821,7 +830,8 @@ qvotec_undo_root_descriptor_provision_fds(
 	bool wrote[CLUSTER_MAX_VOTING_DISKS] = { false };
 	ClusterUndoRootDescriptorV1 descriptor;
 	uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
-	uint8 completed_bitmap = 0;
+	uint8 observed_bitmap = 0;
+	ClusterUndoRootDescriptorV1 committed;
 	off_t offset;
 	int eligible_count = 0;
 	int completed_count = 0;
@@ -888,13 +898,125 @@ qvotec_undo_root_descriptor_provision_fds(
 		if (cluster_voting_disk_read_raw_slot_at(fds[i], offset, image)
 				== CLUSTER_VOTING_DISK_RAW_READ_FULL
 			&& memcmp(image, desired, sizeof(image)) == 0) {
-			completed_bitmap |= (uint8)(UINT8_C(1) << i);
 			completed_count++;
 		}
 	}
 	if (completed_count < majority)
 		return false;
-	*out_completed_disk_bitmap = completed_bitmap;
+	if (qvotec_undo_root_descriptor_read_fds(
+			fds, n_disks, system_identifier, descriptor.root_kind,
+			descriptor.owner_node, &committed, &observed_bitmap)
+			!= CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+		|| !cluster_undo_root_descriptor_encode(&committed, image)
+		|| memcmp(image, desired, sizeof(image)) != 0)
+		return false;
+	*out_completed_disk_bitmap = observed_bitmap;
+	return true;
+}
+
+static ClusterUndoRootDescriptorState
+qvotec_undo_root_descriptor_read_fds(
+	const int *fds, int n_disks, uint64 system_identifier,
+	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
+	uint8 *out_observed_disk_bitmap)
+{
+	uint8 images[CLUSTER_MAX_VOTING_DISKS]
+		[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ClusterUndoRootDescriptorV1 descriptors[CLUSTER_MAX_VOTING_DISKS];
+	ClusterUndoRootDescriptorState states[CLUSTER_MAX_VOTING_DISKS];
+	bool valid[CLUSTER_MAX_VOTING_DISKS] = { false };
+	off_t offset;
+	int majority;
+	int selected = -1;
+	int i;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out_observed_disk_bitmap != NULL)
+		*out_observed_disk_bitmap = 0;
+	if (fds == NULL || n_disks <= 0
+		|| n_disks > CLUSTER_MAX_VOTING_DISKS || system_identifier == 0
+		|| out == NULL || out_observed_disk_bitmap == NULL)
+		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+	if (root_kind == CLUSTER_UNDO_ROOT_KIND_SHARED && owner_node == -1)
+		offset = CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET;
+	else if (root_kind == CLUSTER_UNDO_ROOT_KIND_LOCAL && owner_node >= 0
+			 && owner_node < CLUSTER_MAX_NODES)
+		offset = CLUSTER_UNDO_ROOT_DESCRIPTOR_LOCAL_OFFSET(owner_node);
+	else
+		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+
+	memset(images, 0, sizeof(images));
+	memset(descriptors, 0, sizeof(descriptors));
+	memset(states, 0, sizeof(states));
+	majority = n_disks / 2 + 1;
+	for (i = 0; i < n_disks; i++) {
+		ClusterVotingDiskRawReadState read_state;
+
+		read_state = cluster_voting_disk_read_raw_slot_at(
+			fds[i], offset, images[i]);
+		if (read_state == CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF) {
+			states[i] = CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED;
+			valid[i] = true;
+			continue;
+		}
+		if (read_state != CLUSTER_VOTING_DISK_RAW_READ_FULL)
+			continue;
+		states[i] = cluster_undo_root_descriptor_decode(
+			images[i], system_identifier, &descriptors[i]);
+		if (states[i] == CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED)
+			valid[i] = true;
+		else if (states[i] == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+				 && descriptors[i].root_kind == root_kind
+				 && descriptors[i].owner_node == owner_node)
+			valid[i] = true;
+	}
+
+	for (i = 0; i < n_disks; i++) {
+		int identical = 0;
+		int j;
+
+		if (!valid[i])
+			continue;
+		for (j = 0; j < n_disks; j++) {
+			if (valid[j]
+				&& memcmp(images[i], images[j], sizeof(images[i])) == 0)
+				identical++;
+		}
+		if (identical >= majority) {
+			selected = i;
+			break;
+		}
+	}
+	if (selected < 0)
+		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+
+	for (i = 0; i < n_disks; i++) {
+		if (valid[i]
+			&& memcmp(images[selected], images[i], sizeof(images[i])) == 0)
+			*out_observed_disk_bitmap |= (uint8)(UINT8_C(1) << i);
+	}
+	if (states[selected] == CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED)
+		return CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED;
+	*out = descriptors[selected];
+	return CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID;
+}
+
+/* Regular files remain valid codec fixtures, but the live QVOTEC writer
+ * requires the complete PGRD append region on every configured raw member. */
+static bool
+qvotec_undo_root_descriptor_formation_attested_fds(
+	const int *fds, int n_disks)
+{
+	int i;
+
+	if (fds == NULL
+		|| (n_disks != 1 && n_disks != 3 && n_disks != 5 && n_disks != 7))
+		return false;
+	for (i = 0; i < n_disks; i++) {
+		if (!cluster_voting_disk_pgrd_authority_attest(fds[i]))
+			return false;
+	}
 	return true;
 }
 
@@ -1696,10 +1818,17 @@ extern bool cluster_qvotec_test_epoch_ballot_phase1_promise(
 	uint8 *out_completed_disk_bitmap);
 extern bool cluster_qvotec_test_epoch_ballot_formation_attested(
 	const int *fds, int n_disks);
+extern bool cluster_qvotec_test_undo_root_descriptor_formation_attested(
+	const int *fds, int n_disks);
 extern bool cluster_qvotec_test_undo_root_descriptor_provision(
 	const int *fds, int n_disks, uint64 system_identifier,
 	const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
 	uint8 *out_completed_disk_bitmap);
+extern ClusterUndoRootDescriptorState
+cluster_qvotec_test_undo_root_descriptor_read(
+	const int *fds, int n_disks, uint64 system_identifier,
+	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
+	uint8 *out_observed_disk_bitmap);
 extern ClusterReplacementRequestSlotState
 cluster_qvotec_test_replacement_request_preserve(
 	ClusterVotingSlot *next, const ClusterVotingSlot *prior);
@@ -1784,6 +1913,14 @@ cluster_qvotec_test_epoch_ballot_formation_attested(
 }
 
 bool
+cluster_qvotec_test_undo_root_descriptor_formation_attested(
+	const int *fds, int n_disks)
+{
+	return qvotec_undo_root_descriptor_formation_attested_fds(
+		fds, n_disks);
+}
+
+bool
 cluster_qvotec_test_undo_root_descriptor_provision(
 	const int *fds, int n_disks, uint64 system_identifier,
 	const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
@@ -1792,6 +1929,17 @@ cluster_qvotec_test_undo_root_descriptor_provision(
 	return qvotec_undo_root_descriptor_provision_fds(
 		fds, n_disks, system_identifier, desired,
 		out_completed_disk_bitmap);
+}
+
+ClusterUndoRootDescriptorState
+cluster_qvotec_test_undo_root_descriptor_read(
+	const int *fds, int n_disks, uint64 system_identifier,
+	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
+	uint8 *out_observed_disk_bitmap)
+{
+	return qvotec_undo_root_descriptor_read_fds(
+		fds, n_disks, system_identifier, root_kind, owner_node, out,
+		out_observed_disk_bitmap);
 }
 #endif
 
@@ -2224,7 +2372,9 @@ qvotec_poll_once(void)
 				   &undo_root_descriptor_request)) {
 		uint8 completed_disk_bitmap;
 		ClusterSemanticActivationResult result
-			= qvotec_undo_root_descriptor_provision_fds(
+			= qvotec_undo_root_descriptor_formation_attested_fds(
+				  qvotec_fds, qvotec_n_disks)
+				  && qvotec_undo_root_descriptor_provision_fds(
 				  qvotec_fds, qvotec_n_disks,
 				  undo_root_descriptor_request.system_identifier,
 				  undo_root_descriptor_request.desired_bytes,

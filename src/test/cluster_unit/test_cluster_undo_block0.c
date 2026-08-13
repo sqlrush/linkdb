@@ -548,16 +548,22 @@ UT_TEST(test_block0_key_rejects_owner_segment_aliases)
 				 CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
 }
 
-UT_TEST(test_block0_root_accepts_only_declared_intents)
+UT_TEST(test_block0_root_requires_pgrd_identity_and_declared_intent)
 {
 	ClusterUndoBlock0ResolvedRoot root;
 
-	root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 0, 0);
+	root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1);
 	UT_ASSERT(cluster_undo_block0_root_valid(&root));
-	root = make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, 7, 0);
+	root = make_root(CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, 7, 1);
 	UT_ASSERT(cluster_undo_block0_root_valid(&root));
 	root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0, 9, 3);
 	UT_ASSERT(cluster_undo_block0_root_valid(&root));
+	root.root_id = 0;
+	UT_ASSERT(!cluster_undo_block0_root_valid(&root));
+	root.root_id = 9;
+	root.root_generation = 0;
+	UT_ASSERT(!cluster_undo_block0_root_valid(&root));
+	root.root_generation = 3;
 	root.intent = (ClusterUndoPathIntent)3;
 	UT_ASSERT(!cluster_undo_block0_root_valid(&root));
 	UT_ASSERT(!cluster_undo_block0_root_valid(NULL));
@@ -1939,7 +1945,7 @@ main(void)
 	UT_PLAN(46);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
-	UT_RUN(test_block0_root_accepts_only_declared_intents);
+	UT_RUN(test_block0_root_requires_pgrd_identity_and_declared_intent);
 	UT_RUN(test_block0_root_match_is_field_exact);
 	UT_RUN(test_block0_generation_keeps_zero_distinct_from_absent);
 	UT_RUN(test_block0_generation_exhaustion_never_wraps);

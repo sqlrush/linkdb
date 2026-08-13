@@ -150,6 +150,8 @@
 	((off_t)CLUSTER_EPOCH_BALLOT_SLOT(node_id) * CLUSTER_VOTING_SLOT_BYTES)
 #define CLUSTER_VOTING_FILE_BYTES_MIN                                                              \
 	((off_t)(6 * CLUSTER_MAX_NODES + 2) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_PGRD_FILE_BYTES_MIN                                                         \
+	((off_t)(7 * CLUSTER_MAX_NODES + 3) * CLUSTER_VOTING_SLOT_BYTES)
 
 /*
  * Payload-neutral read outcomes for the fixed append-only tail slot.  Unlike
@@ -360,6 +362,11 @@ cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id,
 /* Positive common-epoch ballot authority is Linux raw-block only.  Regular
  * files remain valid codec/I/O fixtures but can never pass this attestation. */
 extern bool cluster_voting_disk_epoch_ballot_authority_attest(int fd);
+
+/* PGRD live-writer authority additionally covers the append-only descriptor
+ * slots through local node 127.  The older ballot attestation's shorter
+ * capacity bound cannot authorize these writes. */
+extern bool cluster_voting_disk_pgrd_authority_attest(int fd);
 
 #endif /* USE_PGRAC_CLUSTER */
 
