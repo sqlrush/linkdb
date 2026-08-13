@@ -2642,8 +2642,8 @@ UT_TEST(test_reconfig_region3_mailbox_preserves_v2_and_canonical_v3)
 	UT_ASSERT(!ut_join_qvotec_poll_write_pending(&target, slot));
 }
 
-/* A-REUSE-WORD: the existing four-byte target slot is the exact operation /
- * target request word, and the existing 96-byte payload is a duplex VERIFY
+/* The existing four-byte target slot is the exact operation/target request
+ * word, and the existing 96-byte payload is a duplex VERIFY
  * result.  VERIFY returns no caller image to QVOTEC, while successful
  * completion publishes the canonical majority-selected COMMITTED_CLOSED image.
  * An operation mismatch must fail and clear the duplex payload. */

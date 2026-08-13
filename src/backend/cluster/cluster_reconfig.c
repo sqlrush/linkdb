@@ -5273,6 +5273,47 @@ out:
 	return valid;
 }
 
+/* Formation-LMON-only coherent projection of the admitted MEMBER SSOT. */
+bool
+cluster_reconfig_lmon_snapshot_admitted_membership(
+	uint64 *out_members_lo, uint64 *out_members_hi,
+	uint64 *out_formation_epoch)
+{
+	uint64 members_lo = 0;
+	uint64 members_hi = 0;
+	uint64 formation_epoch;
+	int node;
+
+	if (out_members_lo != NULL)
+		*out_members_lo = 0;
+	if (out_members_hi != NULL)
+		*out_members_hi = 0;
+	if (out_formation_epoch != NULL)
+		*out_formation_epoch = 0;
+	if (ReconfigShmem == NULL || out_members_lo == NULL
+		|| out_members_hi == NULL || out_formation_epoch == NULL)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	formation_epoch = cluster_epoch_get_current();
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if (!cluster_membership_is_member(node))
+			continue;
+		if (node < 64)
+			members_lo |= UINT64_C(1) << node;
+		else
+			members_hi |= UINT64_C(1) << (node - 64);
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if ((members_lo | members_hi) == 0)
+		return false;
+	*out_members_lo = members_lo;
+	*out_members_hi = members_hi;
+	*out_formation_epoch = formation_epoch;
+	return true;
+}
+
 static void
 cluster_reconfig_release_closed_stage(void)
 {
@@ -6823,6 +6864,20 @@ cluster_reconfig_lmon_snapshot_replacement_admitted(
 	ClusterReplacementEpisode *out_episode pg_attribute_unused(),
 	ClusterReplacementCommitMarkerV3 *out_marker pg_attribute_unused())
 {
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_snapshot_admitted_membership(
+	uint64 *out_members_lo, uint64 *out_members_hi,
+	uint64 *out_formation_epoch)
+{
+	if (out_members_lo != NULL)
+		*out_members_lo = 0;
+	if (out_members_hi != NULL)
+		*out_members_hi = 0;
+	if (out_formation_epoch != NULL)
+		*out_formation_epoch = 0;
 	return false;
 }
 

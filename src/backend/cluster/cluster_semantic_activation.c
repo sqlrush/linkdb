@@ -27,7 +27,6 @@
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
-#include "cluster/storage/cluster_undo_block0.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
 #include "storage/ipc.h"
@@ -39,6 +38,7 @@
 #define CLUSTER_SEMANTIC_RECORD_CRC_OFFSET 96
 #define CLUSTER_SEMANTIC_ADMISSION_SNAPSHOT_TRIES 3
 #define CLUSTER_SEMANTIC_ADMISSION_COUNTER_TRIES 16
+#define CLUSTER_SEMANTIC_UTILITY_WAIT_STEP_US 10000L
 #define CLUSTER_SEMANTIC_REPLACEMENT_REQUIRED_CAPS                                  \
 	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1     \
 	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                                 \
@@ -67,6 +67,20 @@ typedef struct ClusterSemanticActivationShmem {
 	pg_atomic_uint32 inflight[2][64];
 } ClusterSemanticActivationShmem;
 
+typedef struct ClusterSemanticActivationUtilityMailboxShmem {
+	pg_atomic_uint64 utility_request_seq;
+	pg_atomic_uint64 utility_completion_seq;
+	pg_atomic_uint32 utility_mailbox_state;
+	uint32 utility_action;
+	uint64 utility_source_feature_bitmap;
+	uint64 utility_target_feature_bitmap;
+	uint64 utility_rollback_feature_bitmap;
+	uint64 utility_expected_record_generation;
+	pg_atomic_uint32 utility_result;
+	uint64 utility_result_feature_bit;
+	uint64 utility_result_expected_generation;
+} ClusterSemanticActivationUtilityMailboxShmem;
+
 StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, record_cas_request_kind) == 20,
 				 "semantic authority request kind must occupy prior padding");
 StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, admission_seq) == 552,
@@ -82,11 +96,28 @@ StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, transition_closed) == 
 StaticAssertDecl(offsetof(ClusterSemanticActivationShmem, inflight) == 588,
 				 "semantic admission inflight offset must remain stable");
 StaticAssertDecl(sizeof(ClusterSemanticActivationShmem) == 1104,
-				 "semantic activation shared state must retain its natural layout");
+				 "semantic activation shared gate must retain its frozen layout");
+StaticAssertDecl(offsetof(ClusterSemanticActivationUtilityMailboxShmem,
+					  utility_request_seq) == 0,
+				 "semantic utility request sequence offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticActivationUtilityMailboxShmem,
+					  utility_mailbox_state) == 16,
+				 "semantic utility mailbox state offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticActivationUtilityMailboxShmem,
+					  utility_expected_record_generation) == 48,
+				 "semantic utility expected generation offset must remain stable");
+StaticAssertDecl(offsetof(ClusterSemanticActivationUtilityMailboxShmem,
+					  utility_result_feature_bit) == 64,
+				 "semantic utility refusal feature offset must remain stable");
+StaticAssertDecl(sizeof(ClusterSemanticActivationUtilityMailboxShmem) == 80,
+				 "semantic utility mailbox must retain its natural layout");
 
 static ClusterSemanticActivationShmem *SemanticActivationShmem = NULL;
+static ClusterSemanticActivationUtilityMailboxShmem
+	*SemanticActivationUtilityMailbox = NULL;
 static uint32 semantic_activation_local_inflight[2][64];
 static int semantic_activation_exit_hook_pid;
+static uint64 semantic_activation_lmon_record_read_seq;
 
 static bool semantic_activation_record_cas_mailbox_submit(
 	uint64 expected_generation, uint64 expected_source_feature_bitmap,
@@ -94,6 +125,10 @@ static bool semantic_activation_record_cas_mailbox_submit(
 	pg_attribute_unused();
 static bool semantic_activation_record_cas_mailbox_poll_completion(
 	uint64 request_seq, ClusterSemanticActivationResult *out_result) pg_attribute_unused();
+static bool semantic_activation_record_read_mailbox_submit(
+	uint64 *out_request_seq);
+static bool semantic_activation_record_read_mailbox_poll_completion(
+	uint64 request_seq, ClusterSemanticActivationReadCompletion *out);
 static bool semantic_activation_authority_mailbox_submit(
 	ClusterSemanticAuthorityRequestKind request_kind, uint64 expected_generation,
 	uint64 expected_source_feature_bitmap,
@@ -102,9 +137,42 @@ static bool semantic_activation_authority_mailbox_submit(
 static bool semantic_activation_authority_mailbox_complete(
 	ClusterSemanticAuthorityRequestKind request_kind, uint64 request_seq,
 	ClusterSemanticActivationResult result);
+static bool semantic_activation_authority_mailbox_completion_matches(
+	ClusterSemanticAuthorityRequestKind request_kind, uint64 request_seq);
 static bool semantic_activation_authority_mailbox_poll_completion(
 	ClusterSemanticAuthorityRequestKind request_kind, uint64 request_seq,
 	ClusterSemanticActivationResult *out_result);
+
+typedef enum SemanticActivationUtilityMailboxState {
+	SEMANTIC_ACTIVATION_UTILITY_MAILBOX_IDLE = 0,
+	SEMANTIC_ACTIVATION_UTILITY_MAILBOX_WRITING = 1,
+	SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING = 2,
+	SEMANTIC_ACTIVATION_UTILITY_MAILBOX_COMPLETE = 3
+} SemanticActivationUtilityMailboxState;
+
+typedef struct SemanticActivationUtilityRequest {
+	uint64 request_seq;
+	uint64 source_feature_bitmap;
+	uint64 target_feature_bitmap;
+	uint64 rollback_feature_bitmap;
+	uint64 expected_record_generation;
+	ClusterSemanticActivationAction action;
+} SemanticActivationUtilityRequest;
+
+static bool semantic_activation_utility_mailbox_submit(
+	ClusterSemanticActivationAction action, uint64 source_feature_bitmap,
+	uint64 target_feature_bitmap, uint64 rollback_feature_bitmap,
+	uint64 expected_record_generation, uint64 *out_request_seq);
+static bool semantic_activation_utility_mailbox_poll(
+	SemanticActivationUtilityRequest *out);
+static bool semantic_activation_utility_mailbox_complete(
+	uint64 request_seq, ClusterSemanticActivationResult result,
+	uint64 feature_bit, uint64 expected_generation);
+static bool semantic_activation_utility_mailbox_poll_completion(
+	uint64 request_seq, ClusterSemanticActivationRefusal *out_refusal);
+static ClusterSemanticActivationResult
+semantic_activation_utility_mailbox_wait(
+	uint64 request_seq, ClusterSemanticActivationRefusal *out_refusal);
 
 typedef enum SemanticActivationState {
 	SEMANTIC_ACTIVATION_STATE_INVALID = -1,
@@ -194,6 +262,10 @@ typedef struct SemanticActivationAdmissionSnapshot {
 } SemanticActivationAdmissionSnapshot;
 
 static bool semantic_activation_snapshot(SemanticActivationAdmissionSnapshot *snapshot);
+static bool semantic_activation_lmon_publish_gate(
+	const SemanticActivationAdmissionSnapshot *snapshot, uint64 active_bits,
+	uint64 record_generation, uint64 formation_epoch,
+	bool transition_closed);
 static bool semantic_activation_counter_increment(pg_atomic_uint32 *counter);
 static bool semantic_activation_ensure_exit_hook(void);
 static void semantic_activation_release_debt(ClusterSemanticAdmissionSide side,
@@ -777,21 +849,22 @@ semantic_activation_actor_effect_allowed(SemanticActivationActor actor,
 static ClusterSemanticActivationResult
 r4_pre_prepare_readiness(uint64 expected_generation, ClusterSemanticActivationRefusal *refusal)
 {
-	ClusterR4PrerequisiteSnapshot snapshot = cluster_undo_block0_r4_prerequisite_snapshot();
 	bool admitted_basis = semantic_activation_r4_current_admitted_basis();
+	ClusterSemanticActivationResult result
+		= admitted_basis ? CLUSTER_SEMANTIC_ACTIVATION_OK
+						 : CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
 
-	/* READY is only the Startup completion input.  D13 must additionally prove
-	 * durable ADMITTED, the accepted-invalidator rescan and the full ACK table.
-	 * Those production carriers are not complete, so even a positive local
-	 * snapshot remains fail-closed before PGSA/source/wire mutation. */
-	(void)snapshot;
-	(void)admitted_basis;
+	/* The instantaneous READY snapshot belongs exclusively to target LMON's
+	 * phase-3 serializer.  The current-coordinator handoff becomes visible
+	 * here only after the majority ADMITTED write and its post-write terminal-
+	 * head rescan have both completed; this callback grants entry to PREPARE,
+	 * not a PREPARED ACK, COMMIT ACK, target OPEN, or current write authority. */
 	if (refusal != NULL) {
-		refusal->result = CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+		refusal->result = result;
 		refusal->feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 		refusal->expected_generation = expected_generation;
 	}
-	return CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+	return result;
 }
 
 static ClusterSemanticActivationResult
@@ -799,6 +872,33 @@ r4_stage_fail_closed(uint64 generation)
 {
 	(void)generation;
 	return CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+}
+
+static ClusterSemanticActivationResult
+r4_close_source_admission(uint64 generation)
+{
+	SemanticActivationAdmissionSnapshot snapshot;
+	uint32 debt;
+
+	if (!semantic_activation_snapshot(&snapshot)
+		|| generation == 0 || snapshot.record_generation != generation
+		|| snapshot.formation_epoch != cluster_epoch_get_current()
+		|| (snapshot.active_bits
+			& CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1) != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+
+	if (!snapshot.transition_closed
+		&& !semantic_activation_lmon_publish_gate(
+			&snapshot, snapshot.active_bits, snapshot.record_generation,
+			snapshot.formation_epoch, true))
+		return CLUSTER_SEMANTIC_ACTIVATION_MEMBERSHIP_CHANGED;
+
+	pg_read_barrier();
+	debt = pg_atomic_read_u32(
+		&SemanticActivationShmem
+			 ->inflight[CLUSTER_SEMANTIC_SOURCE_SIDE][0]);
+	return debt == 0 ? CLUSTER_SEMANTIC_ACTIVATION_OK
+					 : CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
 }
 
 static ClusterSemanticActivationResult
@@ -816,7 +916,7 @@ static const ClusterSemanticActivationDescriptor r4_descriptor = {
 	.required_active_bits = 0,
 	.source_available = true,
 	.pre_prepare_readiness = r4_pre_prepare_readiness,
-	.close_source_admission = r4_stage_fail_closed,
+	.close_source_admission = r4_close_source_admission,
 	.source_logical_debt_zero = r4_zero_fail_closed,
 	.source_transport_zero = r4_zero_fail_closed,
 	.prepare_target = r4_stage_fail_closed,
@@ -1174,39 +1274,233 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 Size
 cluster_semantic_activation_shmem_size(void)
 {
-	return MAXALIGN(sizeof(ClusterSemanticActivationShmem));
+	return MAXALIGN(sizeof(ClusterSemanticActivationShmem))
+		   + MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem));
 }
 
 void
 cluster_semantic_activation_shmem_init(void)
 {
-	bool found;
+	bool gate_found;
+	bool mailbox_found;
 	int side;
 	int feature_index;
 
 	SemanticActivationShmem = (ClusterSemanticActivationShmem *)ShmemInitStruct(
-		"pgrac cluster semantic activation", cluster_semantic_activation_shmem_size(), &found);
-	if (SemanticActivationShmem == NULL || found)
+		"pgrac cluster semantic activation gate",
+		MAXALIGN(sizeof(ClusterSemanticActivationShmem)), &gate_found);
+	SemanticActivationUtilityMailbox
+		= (ClusterSemanticActivationUtilityMailboxShmem *)ShmemInitStruct(
+			"pgrac cluster semantic activation utility mailbox",
+			MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem)),
+			&mailbox_found);
+	if (SemanticActivationShmem == NULL
+		|| SemanticActivationUtilityMailbox == NULL)
 		return;
 
-	pg_atomic_init_u64(&SemanticActivationShmem->record_cas_request_seq, 0);
-	pg_atomic_init_u64(&SemanticActivationShmem->record_cas_completion_seq, 0);
-	pg_atomic_init_u32(&SemanticActivationShmem->record_cas_result,
-					   CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	pg_atomic_init_u32(&SemanticActivationShmem->record_cas_request_kind,
-					   CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE);
-	SemanticActivationShmem->record_cas_expected_generation = 0;
-	SemanticActivationShmem->record_cas_expected_source_feature_bitmap = 0;
-	memset(SemanticActivationShmem->record_cas_desired_bytes, 0,
-		   sizeof(SemanticActivationShmem->record_cas_desired_bytes));
-	pg_atomic_init_u64(&SemanticActivationShmem->admission_seq, 0);
-	pg_atomic_init_u64(&SemanticActivationShmem->active_bits, 0);
-	pg_atomic_init_u64(&SemanticActivationShmem->record_generation, 0);
-	pg_atomic_init_u64(&SemanticActivationShmem->formation_epoch, 0);
-	pg_atomic_init_u32(&SemanticActivationShmem->transition_closed, 1);
-	for (side = 0; side < 2; side++) {
-		for (feature_index = 0; feature_index < 64; feature_index++)
-			pg_atomic_init_u32(&SemanticActivationShmem->inflight[side][feature_index], 0);
+	if (!gate_found) {
+		pg_atomic_init_u64(&SemanticActivationShmem->record_cas_request_seq, 0);
+		pg_atomic_init_u64(&SemanticActivationShmem->record_cas_completion_seq, 0);
+		pg_atomic_init_u32(&SemanticActivationShmem->record_cas_result,
+						   CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+		pg_atomic_init_u32(&SemanticActivationShmem->record_cas_request_kind,
+						   CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE);
+		SemanticActivationShmem->record_cas_expected_generation = 0;
+		SemanticActivationShmem->record_cas_expected_source_feature_bitmap = 0;
+		memset(SemanticActivationShmem->record_cas_desired_bytes, 0,
+			   sizeof(SemanticActivationShmem->record_cas_desired_bytes));
+		pg_atomic_init_u64(&SemanticActivationShmem->admission_seq, 0);
+		pg_atomic_init_u64(&SemanticActivationShmem->active_bits, 0);
+		pg_atomic_init_u64(&SemanticActivationShmem->record_generation, 0);
+		pg_atomic_init_u64(&SemanticActivationShmem->formation_epoch, 0);
+		pg_atomic_init_u32(&SemanticActivationShmem->transition_closed, 1);
+		for (side = 0; side < 2; side++) {
+			for (feature_index = 0; feature_index < 64; feature_index++)
+				pg_atomic_init_u32(
+					&SemanticActivationShmem->inflight[side][feature_index], 0);
+		}
+	}
+	if (!mailbox_found) {
+		pg_atomic_init_u64(
+			&SemanticActivationUtilityMailbox->utility_request_seq, 0);
+		pg_atomic_init_u64(
+			&SemanticActivationUtilityMailbox->utility_completion_seq, 0);
+		pg_atomic_init_u32(
+			&SemanticActivationUtilityMailbox->utility_mailbox_state,
+			SEMANTIC_ACTIVATION_UTILITY_MAILBOX_IDLE);
+		SemanticActivationUtilityMailbox->utility_action
+			= CLUSTER_SEMANTIC_ENABLE_ALL;
+		SemanticActivationUtilityMailbox->utility_source_feature_bitmap = 0;
+		SemanticActivationUtilityMailbox->utility_target_feature_bitmap = 0;
+		SemanticActivationUtilityMailbox->utility_rollback_feature_bitmap = 0;
+		SemanticActivationUtilityMailbox->utility_expected_record_generation = 0;
+		pg_atomic_init_u32(&SemanticActivationUtilityMailbox->utility_result,
+						   CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+		SemanticActivationUtilityMailbox->utility_result_feature_bit = 0;
+		SemanticActivationUtilityMailbox->utility_result_expected_generation = 0;
+	}
+}
+
+/*
+ * One single-slot ProcessUtility -> formation-LMON request/result mailbox.  The
+ * state word is the publication fence: writers own WRITING, LMON alone
+ * consumes PENDING, and only the publishing backend consumes COMPLETE.
+ * This mailbox carries no PGSA bytes and cannot bypass QVOTEC.
+ */
+static bool
+semantic_activation_utility_mailbox_submit(
+	ClusterSemanticActivationAction action, uint64 source_feature_bitmap,
+	uint64 target_feature_bitmap, uint64 rollback_feature_bitmap,
+	uint64 expected_record_generation, uint64 *out_request_seq)
+{
+	uint32 expected_state = SEMANTIC_ACTIVATION_UTILITY_MAILBOX_IDLE;
+	uint64 request_seq;
+
+	if (SemanticActivationUtilityMailbox == NULL || out_request_seq == NULL
+		|| action < CLUSTER_SEMANTIC_ENABLE_ALL
+		|| action > CLUSTER_SEMANTIC_ROLLBACK_ABORT
+		|| !pg_atomic_compare_exchange_u32(
+			&SemanticActivationUtilityMailbox->utility_mailbox_state,
+			&expected_state, SEMANTIC_ACTIVATION_UTILITY_MAILBOX_WRITING))
+		return false;
+
+	request_seq = pg_atomic_read_u64(
+		&SemanticActivationUtilityMailbox->utility_request_seq);
+	if (request_seq == UINT64_MAX) {
+		pg_atomic_write_u32(&SemanticActivationUtilityMailbox->utility_mailbox_state,
+							SEMANTIC_ACTIVATION_UTILITY_MAILBOX_IDLE);
+		return false;
+	}
+
+	request_seq++;
+	SemanticActivationUtilityMailbox->utility_action = (uint32)action;
+	SemanticActivationUtilityMailbox->utility_source_feature_bitmap
+		= source_feature_bitmap;
+	SemanticActivationUtilityMailbox->utility_target_feature_bitmap
+		= target_feature_bitmap;
+	SemanticActivationUtilityMailbox->utility_rollback_feature_bitmap
+		= rollback_feature_bitmap;
+	SemanticActivationUtilityMailbox->utility_expected_record_generation
+		= expected_record_generation;
+	pg_atomic_write_u64(&SemanticActivationUtilityMailbox->utility_request_seq,
+						request_seq);
+	pg_write_barrier();
+	pg_atomic_write_u32(&SemanticActivationUtilityMailbox->utility_mailbox_state,
+						SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING);
+	*out_request_seq = request_seq;
+	return true;
+}
+
+static bool
+semantic_activation_utility_mailbox_poll(SemanticActivationUtilityRequest *out)
+{
+	uint64 request_seq;
+
+	if (SemanticActivationUtilityMailbox == NULL || out == NULL
+		|| pg_atomic_read_u32(
+			   &SemanticActivationUtilityMailbox->utility_mailbox_state)
+			   != SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING)
+		return false;
+
+	pg_read_barrier();
+	request_seq = pg_atomic_read_u64(
+		&SemanticActivationUtilityMailbox->utility_request_seq);
+	if (request_seq == 0
+		|| pg_atomic_read_u64(
+			   &SemanticActivationUtilityMailbox->utility_completion_seq)
+			   + 1 != request_seq
+		|| SemanticActivationUtilityMailbox->utility_action
+			   > CLUSTER_SEMANTIC_ROLLBACK_ABORT)
+		return false;
+
+	out->request_seq = request_seq;
+	out->action = (ClusterSemanticActivationAction)
+		SemanticActivationUtilityMailbox->utility_action;
+	out->source_feature_bitmap
+		= SemanticActivationUtilityMailbox->utility_source_feature_bitmap;
+	out->target_feature_bitmap
+		= SemanticActivationUtilityMailbox->utility_target_feature_bitmap;
+	out->rollback_feature_bitmap
+		= SemanticActivationUtilityMailbox->utility_rollback_feature_bitmap;
+	out->expected_record_generation
+		= SemanticActivationUtilityMailbox->utility_expected_record_generation;
+	return true;
+}
+
+static bool
+semantic_activation_utility_mailbox_complete(
+	uint64 request_seq, ClusterSemanticActivationResult result,
+	uint64 feature_bit, uint64 expected_generation)
+{
+	if (SemanticActivationUtilityMailbox == NULL || request_seq == 0
+		|| result < CLUSTER_SEMANTIC_ACTIVATION_OK
+		|| result > CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
+		|| pg_atomic_read_u32(
+			   &SemanticActivationUtilityMailbox->utility_mailbox_state)
+			   != SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING
+		|| pg_atomic_read_u64(
+			   &SemanticActivationUtilityMailbox->utility_request_seq)
+			   != request_seq)
+		return false;
+
+	pg_atomic_write_u32(&SemanticActivationUtilityMailbox->utility_result,
+						(uint32)result);
+	SemanticActivationUtilityMailbox->utility_result_feature_bit = feature_bit;
+	SemanticActivationUtilityMailbox->utility_result_expected_generation
+		= expected_generation;
+	pg_atomic_write_u64(&SemanticActivationUtilityMailbox->utility_completion_seq,
+						request_seq);
+	pg_write_barrier();
+	pg_atomic_write_u32(&SemanticActivationUtilityMailbox->utility_mailbox_state,
+						SEMANTIC_ACTIVATION_UTILITY_MAILBOX_COMPLETE);
+	return true;
+}
+
+static bool
+semantic_activation_utility_mailbox_poll_completion(
+	uint64 request_seq, ClusterSemanticActivationRefusal *out_refusal)
+{
+	uint32 expected_state = SEMANTIC_ACTIVATION_UTILITY_MAILBOX_COMPLETE;
+
+	if (SemanticActivationUtilityMailbox == NULL || request_seq == 0
+		|| out_refusal == NULL
+		|| pg_atomic_read_u32(
+			   &SemanticActivationUtilityMailbox->utility_mailbox_state)
+			   != SEMANTIC_ACTIVATION_UTILITY_MAILBOX_COMPLETE
+		|| pg_atomic_read_u64(
+			   &SemanticActivationUtilityMailbox->utility_completion_seq)
+			   != request_seq)
+		return false;
+
+	pg_read_barrier();
+	out_refusal->result = (ClusterSemanticActivationResult)
+		pg_atomic_read_u32(&SemanticActivationUtilityMailbox->utility_result);
+	out_refusal->feature_bit
+		= SemanticActivationUtilityMailbox->utility_result_feature_bit;
+	out_refusal->expected_generation
+		= SemanticActivationUtilityMailbox->utility_result_expected_generation;
+	return pg_atomic_compare_exchange_u32(
+		&SemanticActivationUtilityMailbox->utility_mailbox_state,
+		&expected_state,
+		SEMANTIC_ACTIVATION_UTILITY_MAILBOX_IDLE);
+}
+
+static ClusterSemanticActivationResult
+semantic_activation_utility_mailbox_wait(
+	uint64 request_seq, ClusterSemanticActivationRefusal *out_refusal)
+{
+	if (out_refusal == NULL || request_seq == 0) {
+		semantic_activation_set_refusal(
+			out_refusal, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE, 0, 0);
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	}
+
+	for (;;) {
+		if (semantic_activation_utility_mailbox_poll_completion(
+				request_seq, out_refusal))
+			return out_refusal->result;
+		CHECK_FOR_INTERRUPTS();
+		pg_usleep(CLUSTER_SEMANTIC_UTILITY_WAIT_STEP_US);
 	}
 }
 
@@ -1218,6 +1512,16 @@ semantic_activation_record_cas_mailbox_submit(
 	return semantic_activation_authority_mailbox_submit(
 		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS, expected_generation,
 		expected_source_feature_bitmap, desired_bytes, out_request_seq);
+}
+
+static bool
+semantic_activation_record_read_mailbox_submit(uint64 *out_request_seq)
+{
+	uint8 zero[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES] = { 0 };
+
+	return semantic_activation_authority_mailbox_submit(
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ, 0, 0, zero,
+		out_request_seq);
 }
 
 static bool
@@ -1234,7 +1538,9 @@ semantic_activation_authority_mailbox_submit(
 		|| out_request_seq == NULL
 		|| (request_kind != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS
 			&& request_kind
-				   != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR))
+				   != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR
+			&& request_kind
+				   != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ))
 		return false;
 
 	request_seq = pg_atomic_read_u64(&SemanticActivationShmem->record_cas_request_seq);
@@ -1292,10 +1598,67 @@ cluster_semantic_activation_qvotec_complete_record_cas(uint64 request_seq,
 		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS, request_seq, result);
 }
 
+bool
+cluster_semantic_activation_qvotec_poll_record_read(
+	ClusterSemanticActivationReadRequest *out)
+{
+	uint64 request_seq;
+	uint64 completion_seq;
+
+	if (SemanticActivationShmem == NULL || out == NULL)
+		return false;
+	request_seq = pg_atomic_read_u64(
+		&SemanticActivationShmem->record_cas_request_seq);
+	completion_seq = pg_atomic_read_u64(
+		&SemanticActivationShmem->record_cas_completion_seq);
+	if (request_seq == completion_seq || completion_seq == UINT64_MAX
+		|| request_seq != completion_seq + 1)
+		return false;
+	pg_read_barrier();
+	if (pg_atomic_read_u32(
+			&SemanticActivationShmem->record_cas_request_kind)
+		!= CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ)
+		return false;
+	out->request_seq = request_seq;
+	return true;
+}
+
+bool
+cluster_semantic_activation_qvotec_complete_record_read(
+	uint64 request_seq, ClusterSemanticActivationResult result,
+	bool implicit_open,
+	const uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
+{
+	ClusterSemanticActivationRecord decoded;
+	uint8 zero[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES] = { 0 };
+
+	if (!semantic_activation_authority_mailbox_completion_matches(
+			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ, request_seq)
+		|| result < CLUSTER_SEMANTIC_ACTIVATION_OK
+		|| result > CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
+		|| (result == CLUSTER_SEMANTIC_ACTIVATION_OK
+			&& (selected_bytes == NULL
+				|| (implicit_open
+					&& !semantic_activation_bytes_are_zero(
+						selected_bytes, sizeof(zero)))
+				|| (!implicit_open
+					&& !cluster_semantic_activation_record_decode(
+						selected_bytes, &decoded, NULL)))))
+		return false;
+
+	memcpy(SemanticActivationShmem->record_cas_desired_bytes,
+		   result == CLUSTER_SEMANTIC_ACTIVATION_OK ? selected_bytes : zero,
+		   sizeof(zero));
+	SemanticActivationShmem->record_cas_expected_source_feature_bitmap
+		= result == CLUSTER_SEMANTIC_ACTIVATION_OK && implicit_open ? 1 : 0;
+	pg_write_barrier();
+	return semantic_activation_authority_mailbox_complete(
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ, request_seq, result);
+}
+
 static bool
-semantic_activation_authority_mailbox_complete(
-	ClusterSemanticAuthorityRequestKind request_kind, uint64 request_seq,
-	ClusterSemanticActivationResult result)
+semantic_activation_authority_mailbox_completion_matches(
+	ClusterSemanticAuthorityRequestKind request_kind, uint64 request_seq)
 {
 	uint64 current_request_seq;
 	uint64 completion_seq;
@@ -1312,6 +1675,19 @@ semantic_activation_authority_mailbox_complete(
 	if (pg_atomic_read_u32(&SemanticActivationShmem->record_cas_request_kind)
 		!= request_kind)
 		return false;
+	return true;
+}
+
+static bool
+semantic_activation_authority_mailbox_complete(
+	ClusterSemanticAuthorityRequestKind request_kind, uint64 request_seq,
+	ClusterSemanticActivationResult result)
+{
+	if (result < CLUSTER_SEMANTIC_ACTIVATION_OK
+		|| result > CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
+		|| !semantic_activation_authority_mailbox_completion_matches(
+			request_kind, request_seq))
+		return false;
 
 	pg_atomic_write_u32(&SemanticActivationShmem->record_cas_result, (uint32)result);
 	pg_write_barrier();
@@ -1326,6 +1702,30 @@ semantic_activation_record_cas_mailbox_poll_completion(uint64 request_seq,
 	return semantic_activation_authority_mailbox_poll_completion(
 		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS, request_seq,
 		out_result);
+}
+
+static bool
+semantic_activation_record_read_mailbox_poll_completion(
+	uint64 request_seq, ClusterSemanticActivationReadCompletion *out)
+{
+	ClusterSemanticActivationResult result;
+
+	if (out == NULL
+		|| !semantic_activation_authority_mailbox_poll_completion(
+			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ, request_seq,
+			&result))
+		return false;
+
+	memset(out, 0, sizeof(*out));
+	out->result = result;
+	out->implicit_open
+		= SemanticActivationShmem
+		  ->record_cas_expected_source_feature_bitmap
+		  != 0;
+	memcpy(out->selected_bytes,
+		   SemanticActivationShmem->record_cas_desired_bytes,
+		   sizeof(out->selected_bytes));
+	return true;
 }
 
 static bool
@@ -1548,16 +1948,137 @@ semantic_activation_lmon_consume_phase3(void)
 	}
 }
 
+static void
+semantic_activation_lmon_consume_utility(void)
+{
+	SemanticActivationUtilityRequest request;
+	ClusterSemanticActivationRefusal refusal;
+	ClusterSemanticActivationResult result;
+	uint32 effects = SEMANTIC_ACTIVATION_EFFECT_NONE;
+
+	if (!semantic_activation_utility_mailbox_poll(&request))
+		return;
+
+	memset(&refusal, 0, sizeof(refusal));
+	if (request.action != CLUSTER_SEMANTIC_ENABLE_ALL
+		|| request.source_feature_bitmap != 0
+		|| request.target_feature_bitmap
+			   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| request.rollback_feature_bitmap != 0) {
+		semantic_activation_set_refusal(
+			&refusal, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE, 0,
+			request.expected_record_generation);
+	} else {
+		result = semantic_activation_preflight(
+			request.action, request.expected_record_generation, &refusal,
+			&effects);
+		if (result == CLUSTER_SEMANTIC_ACTIVATION_OK) {
+			/* ADMITTED grants entry to PREPARE only.  Source close is the
+			 * next durable-FSM edge after the PREPARE CAS, so this carrier
+			 * remains nonterminal until that state is installed. */
+			result = CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+			semantic_activation_set_refusal(
+				&refusal, result,
+				CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+				request.expected_record_generation);
+		}
+	}
+
+	(void)semantic_activation_utility_mailbox_complete(
+		request.request_seq, refusal.result, refusal.feature_bit,
+		refusal.expected_generation);
+}
+
+static bool
+semantic_activation_lmon_publish_gate(
+	const SemanticActivationAdmissionSnapshot *snapshot, uint64 active_bits,
+	uint64 record_generation, uint64 formation_epoch, bool transition_closed)
+{
+	uint64 expected_seq;
+
+	if (snapshot == NULL || SemanticActivationShmem == NULL
+		|| snapshot->seq > UINT64_MAX - 2)
+		return false;
+	expected_seq = snapshot->seq;
+	if (!pg_atomic_compare_exchange_u64(
+			&SemanticActivationShmem->admission_seq, &expected_seq,
+			snapshot->seq + 1))
+		return false;
+	pg_write_barrier();
+	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, active_bits);
+	pg_atomic_write_u64(&SemanticActivationShmem->record_generation,
+						record_generation);
+	pg_atomic_write_u64(&SemanticActivationShmem->formation_epoch,
+						formation_epoch);
+	pg_atomic_write_u32(&SemanticActivationShmem->transition_closed,
+						transition_closed ? 1 : 0);
+	pg_write_barrier();
+	pg_atomic_write_u64(&SemanticActivationShmem->admission_seq,
+						snapshot->seq + 2);
+	return true;
+}
+
+static void
+semantic_activation_lmon_sync_durable_record(
+	const SemanticActivationAdmissionSnapshot *snapshot, uint64 current_epoch)
+{
+	ClusterSemanticActivationReadCompletion completion;
+	uint64 request_seq;
+	uint64 members_lo;
+	uint64 members_hi;
+	uint64 membership_epoch;
+	bool local_is_member;
+
+	if (semantic_activation_lmon_record_read_seq == 0) {
+		if (semantic_activation_record_read_mailbox_submit(&request_seq))
+			semantic_activation_lmon_record_read_seq = request_seq;
+		return;
+	}
+	if (!semantic_activation_record_read_mailbox_poll_completion(
+			semantic_activation_lmon_record_read_seq, &completion))
+		return;
+	semantic_activation_lmon_record_read_seq = 0;
+
+	if (completion.result != CLUSTER_SEMANTIC_ACTIVATION_OK
+		|| !completion.implicit_open
+		|| !semantic_activation_bytes_are_zero(
+			completion.selected_bytes,
+			sizeof(completion.selected_bytes)))
+		return;
+
+	/* Majority legacy zero has no member tuple of its own.  It may open only
+	 * the legacy SOURCE gate after the current formation has a nonempty exact
+	 * membership SSOT containing this coordinator and remains on one epoch
+	 * across the sample.  Nonzero PGSA records stay closed until the full
+	 * member/capability ACK table is installed. */
+	if (!cluster_reconfig_lmon_snapshot_admitted_membership(
+			&members_lo, &members_hi, &membership_epoch)
+		|| membership_epoch != current_epoch
+		|| cluster_epoch_get_current() != current_epoch
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return;
+	local_is_member
+		= cluster_node_id < 64
+			  ? (members_lo & (UINT64_C(1) << cluster_node_id)) != 0
+			  : (members_hi
+				 & (UINT64_C(1) << (cluster_node_id - 64))) != 0;
+	if (!local_is_member)
+		return;
+
+	(void)semantic_activation_lmon_publish_gate(
+		snapshot, 0, 0, current_epoch, false);
+}
+
 void
 cluster_semantic_activation_lmon_tick(void)
 {
 	SemanticActivationAdmissionSnapshot snapshot;
 	uint64 current_epoch;
-	uint64 expected_seq;
 
 	if (SemanticActivationShmem == NULL)
 		return;
 	semantic_activation_lmon_consume_phase3();
+	semantic_activation_lmon_consume_utility();
 	/*
 	 * D13 owns validated majority-zero/durable-OPEN publication.  Until that
 	 * proof is available, odd or unreadable state remains fail-closed.
@@ -1566,33 +2087,63 @@ cluster_semantic_activation_lmon_tick(void)
 		return;
 
 	current_epoch = cluster_epoch_get_current();
-	if (snapshot.formation_epoch == current_epoch)
+	if (snapshot.formation_epoch == current_epoch) {
+		if (snapshot.transition_closed)
+			semantic_activation_lmon_sync_durable_record(
+				&snapshot, current_epoch);
 		return;
+	}
 	if (snapshot.seq > UINT64_MAX - 2)
 		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("semantic activation admission sequence exhausted"),
 						errhint("Retain the shared-memory image and restart the cluster.")));
 
-	expected_seq = snapshot.seq;
-	if (!pg_atomic_compare_exchange_u64(&SemanticActivationShmem->admission_seq, &expected_seq,
-									 snapshot.seq + 1))
-		return;
-	pg_write_barrier();
-	pg_atomic_write_u64(&SemanticActivationShmem->active_bits, snapshot.active_bits);
-	pg_atomic_write_u64(&SemanticActivationShmem->record_generation, snapshot.record_generation);
-	pg_atomic_write_u64(&SemanticActivationShmem->formation_epoch, current_epoch);
-	pg_atomic_write_u32(&SemanticActivationShmem->transition_closed, 1);
-	pg_write_barrier();
-	pg_atomic_write_u64(&SemanticActivationShmem->admission_seq, snapshot.seq + 2);
+	(void)semantic_activation_lmon_publish_gate(
+		&snapshot, snapshot.active_bits, snapshot.record_generation,
+		current_epoch, true);
 }
 
 ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,
 								   ClusterSemanticActivationRefusal *refusal)
 {
+	SemanticActivationAdmissionSnapshot snapshot;
+	ClusterSemanticActivationResult result;
+	uint64 request_seq;
 	uint32 effects;
 
-	return semantic_activation_preflight(action, 0, refusal, &effects);
+	if (!semantic_activation_snapshot(&snapshot)) {
+		semantic_activation_set_refusal(
+			refusal, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE, 0, 0);
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	}
+
+	result = semantic_activation_preflight(
+		action, snapshot.record_generation, refusal, &effects);
+	if (result != CLUSTER_SEMANTIC_ACTIVATION_OK)
+		return result;
+
+	/* The first positive carrier is the approved ENABLE happy path.  Later
+	 * actions remain typed-closed until their durable phase/floor predicates
+	 * are wired; they cannot be inferred from the local active bitmap. */
+	if (action != CLUSTER_SEMANTIC_ENABLE_ALL || snapshot.active_bits != 0) {
+		semantic_activation_set_refusal(
+			refusal, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE, 0,
+			snapshot.record_generation);
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	}
+
+	if (!semantic_activation_utility_mailbox_submit(
+			action, snapshot.active_bits,
+			CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 0,
+			snapshot.record_generation, &request_seq)) {
+		semantic_activation_set_refusal(
+			refusal, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD, 0,
+			snapshot.record_generation);
+		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+	}
+
+	return semantic_activation_utility_mailbox_wait(request_seq, refusal);
 }
 
 const ClusterSemanticActivationDescriptor *

@@ -180,3 +180,54 @@ cluster_undo_block0_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expect
 		return false;
 	return cluster_reconfig_r4_publish_ready(expected);
 }
+
+/*
+ * The opaque Startup completion API is present before its independently
+ * owned ROOT/record/PAGE/SIDE proof providers.  Until those exact owners are
+ * wired, begin refuses before allocating a context or entering the fenced
+ * current lane.  Callers cannot manufacture an empty affected-set proof.
+ */
+ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_begin(
+	int timeout_ms, ClusterR4StartupCompletionContextV1 **out)
+{
+	if (out == NULL)
+		return CLUSTER_R4_STARTUP_COMPLETION_INVALID;
+	*out = NULL;
+	if (timeout_ms <= 0)
+		return CLUSTER_R4_STARTUP_COMPLETION_INVALID;
+	return CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY;
+}
+
+ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_close_next(
+	ClusterR4StartupCompletionContextV1 *context,
+	const RfRootResourceAdmissionV1 *root,
+	const RfRecordClosureProofV1 *record,
+	const RfPageResourceProofV1 *page,
+	const RfSideResourceProofSetV1 *side)
+{
+	(void)root;
+	(void)record;
+	(void)page;
+	(void)side;
+	return context == NULL ? CLUSTER_R4_STARTUP_COMPLETION_INVALID
+						   : CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY;
+}
+
+ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_finalize(
+	ClusterR4StartupCompletionContextV1 **context)
+{
+	if (context == NULL || *context == NULL)
+		return CLUSTER_R4_STARTUP_COMPLETION_INVALID;
+	return CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY;
+}
+
+void
+cluster_undo_block0_r4_startup_abort(
+	ClusterR4StartupCompletionContextV1 **context)
+{
+	if (context != NULL)
+		*context = NULL;
+}

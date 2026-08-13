@@ -110,10 +110,21 @@ typedef struct ClusterSemanticActivationCasRequest {
 	uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 } ClusterSemanticActivationCasRequest;
 
+typedef struct ClusterSemanticActivationReadRequest {
+	uint64 request_seq;
+} ClusterSemanticActivationReadRequest;
+
+typedef struct ClusterSemanticActivationReadCompletion {
+	ClusterSemanticActivationResult result;
+	bool implicit_open;
+	uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+} ClusterSemanticActivationReadCompletion;
+
 typedef enum ClusterSemanticAuthorityRequestKind {
 	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE = 0,
 	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS = 1,
-	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR = 2
+	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR = 2,
+	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ = 3
 } ClusterSemanticAuthorityRequestKind;
 
 typedef struct ClusterUndoRootDescriptorRequest {
@@ -174,6 +185,12 @@ cluster_semantic_activation_qvotec_poll_record_cas(ClusterSemanticActivationCasR
 extern bool
 cluster_semantic_activation_qvotec_complete_record_cas(uint64 request_seq,
 												   ClusterSemanticActivationResult result);
+extern bool cluster_semantic_activation_qvotec_poll_record_read(
+	ClusterSemanticActivationReadRequest *out);
+extern bool cluster_semantic_activation_qvotec_complete_record_read(
+	uint64 request_seq, ClusterSemanticActivationResult result,
+	bool implicit_open,
+	const uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES]);
 extern bool cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
 	uint64 system_identifier,
 	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],

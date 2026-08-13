@@ -1909,10 +1909,34 @@ UT_TEST(test_r4_publish_ready_accepts_only_owner_cosampled_snapshot)
 	memset(&r4_owner_snapshot, 0, sizeof(r4_owner_snapshot));
 }
 
+UT_TEST(test_r4_startup_completion_surface_refuses_without_owner_proofs)
+{
+	ClusterR4StartupCompletionContextV1 *context
+		= (ClusterR4StartupCompletionContextV1 *)(uintptr_t)1;
+
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_OK, 0);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_RETRY, 1);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_LINEAGE, 2);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_ROOT, 3);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_RECORD, 4);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_PAGE, 5);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_SIDE, 6);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_CENSUS, 7);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_IO, 8);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DIRTY, 9);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY, 10);
+	UT_ASSERT_EQ(CLUSTER_R4_STARTUP_COMPLETION_INVALID, 11);
+	UT_ASSERT_EQ(cluster_undo_block0_r4_startup_begin(1000, &context),
+				 CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY);
+	UT_ASSERT_NULL(context);
+	cluster_undo_block0_r4_startup_abort(&context);
+	UT_ASSERT_NULL(context);
+}
+
 int
 main(void)
 {
-	UT_PLAN(45);
+	UT_PLAN(46);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_accepts_only_declared_intents);
@@ -1958,6 +1982,7 @@ main(void)
 	UT_RUN(test_r4_prerequisite_snapshot_is_fixed_for_concurrent_callers);
 	UT_RUN(test_r4_publish_ready_remains_fail_closed_for_every_unbound_input);
 	UT_RUN(test_r4_publish_ready_accepts_only_owner_cosampled_snapshot);
+	UT_RUN(test_r4_startup_completion_surface_refuses_without_owner_proofs);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

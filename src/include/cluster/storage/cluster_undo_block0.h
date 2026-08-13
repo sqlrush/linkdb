@@ -253,4 +253,43 @@ extern ClusterR4PrerequisiteSnapshot cluster_undo_block0_r4_prerequisite_snapsho
 extern bool
 cluster_undo_block0_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected);
 
+typedef struct ClusterR4StartupCompletionContextV1
+	ClusterR4StartupCompletionContextV1;
+typedef struct RfRootResourceAdmissionV1 RfRootResourceAdmissionV1;
+typedef struct RfRecordClosureProofV1 RfRecordClosureProofV1;
+typedef struct RfPageResourceProofV1 RfPageResourceProofV1;
+typedef struct RfSideResourceProofSetV1 RfSideResourceProofSetV1;
+
+typedef enum ClusterR4StartupCompletionResultV1
+{
+	CLUSTER_R4_STARTUP_COMPLETION_OK = 0,
+	CLUSTER_R4_STARTUP_COMPLETION_RETRY = 1,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_LINEAGE = 2,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_ROOT = 3,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_RECORD = 4,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_PAGE = 5,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_SIDE = 6,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_CENSUS = 7,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_IO = 8,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DIRTY = 9,
+	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY = 10,
+	CLUSTER_R4_STARTUP_COMPLETION_INVALID = 11
+} ClusterR4StartupCompletionResultV1;
+
+extern ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_begin(
+	int timeout_ms, ClusterR4StartupCompletionContextV1 **out);
+extern ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_close_next(
+	ClusterR4StartupCompletionContextV1 *context,
+	const RfRootResourceAdmissionV1 *root,
+	const RfRecordClosureProofV1 *record,
+	const RfPageResourceProofV1 *page,
+	const RfSideResourceProofSetV1 *side);
+extern ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_finalize(
+	ClusterR4StartupCompletionContextV1 **context);
+extern void cluster_undo_block0_r4_startup_abort(
+	ClusterR4StartupCompletionContextV1 **context);
+
 #endif /* CLUSTER_UNDO_BLOCK0_H */

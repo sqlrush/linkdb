@@ -791,6 +791,10 @@ extern bool cluster_reconfig_lmon_finalize_replacement_admitted(
 extern bool cluster_reconfig_lmon_snapshot_replacement_admitted(
 	ClusterReplacementEpisode *out_episode,
 	ClusterReplacementCommitMarkerV3 *out_marker);
+/* Formation-LMON-only coherent MEMBER/epoch sample for PGSA reconstruction. */
+extern bool cluster_reconfig_lmon_snapshot_admitted_membership(
+	uint64 *out_members_lo, uint64 *out_members_hi,
+	uint64 *out_formation_epoch);
 /* Target-LMON phase-3 sender.  The positive snapshot remains instantaneous;
  * this tick revalidates its exact episode/JCMK route and retransmits the
  * canonical opcode-18 image until target-side ADMITTED observation. */
