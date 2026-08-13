@@ -728,6 +728,13 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 UT_TEST(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox)
 {
 	ClusterSemanticActivationShmem shmem;
+	ClusterSemanticActivationUtilityMailboxShmem utility;
+	ClusterSemanticFormationBinding formation = {
+		.utility_request_seq = 1,
+		.formation_epoch = 0,
+		.coordinator_incarnation = 1,
+		.expected_record_generation = 0,
+	};
 	ClusterUndoRootDescriptorRequest request;
 	ClusterSemanticActivationCasRequest record_request;
 	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
@@ -742,12 +749,19 @@ UT_TEST(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox)
 				   CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	pg_atomic_init_u32(&shmem.record_cas_request_kind,
 				   CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE);
+	memset(&utility, 0, sizeof(utility));
+	pg_atomic_init_u64(&utility.utility_request_seq, 1);
+	pg_atomic_init_u64(&utility.utility_completion_seq, 0);
+	pg_atomic_init_u32(&utility.utility_mailbox_state,
+				   SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING);
 	for (i = 0; i < (int)sizeof(desired); i++)
 		desired[i] = (uint8)(i ^ 0x5c);
 	SemanticActivationShmem = &shmem;
+	SemanticActivationUtilityMailbox = &utility;
+	cluster_r4_activation_test_formation_valid = true;
 
 	UT_ASSERT(cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
-		UINT64_C(0x0123456789abcdef), desired, &seq));
+		&formation, UINT64_C(0x0123456789abcdef), desired, &seq));
 	UT_ASSERT_EQ(seq, 1);
 	UT_ASSERT(!cluster_semantic_activation_qvotec_poll_record_cas(
 		&record_request));
@@ -757,6 +771,10 @@ UT_TEST(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox)
 	UT_ASSERT_EQ(request.request_seq, 1);
 	UT_ASSERT_EQ(request.system_identifier,
 				 UINT64_C(0x0123456789abcdef));
+	UT_ASSERT_EQ(request.formation.utility_request_seq, UINT64_C(1));
+	UT_ASSERT_EQ(request.formation.formation_epoch, UINT64_C(0));
+	UT_ASSERT_EQ(request.formation.coordinator_incarnation, UINT64_C(1));
+	UT_ASSERT_EQ(request.formation.expected_record_generation, UINT64_C(0));
 	UT_ASSERT_EQ(memcmp(request.desired_bytes, desired, sizeof(desired)), 0);
 	UT_ASSERT(cluster_semantic_activation_qvotec_complete_undo_root_descriptor(
 		request.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK));
@@ -768,6 +786,8 @@ UT_TEST(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox)
 	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationShmem, admission_seq), 552);
 	UT_ASSERT_EQ(sizeof(ClusterSemanticActivationShmem), 1104);
 	SemanticActivationShmem = NULL;
+	SemanticActivationUtilityMailbox = NULL;
+	cluster_r4_activation_test_formation_valid = false;
 }
 
 int

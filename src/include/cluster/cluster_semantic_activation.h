@@ -129,15 +129,27 @@ typedef enum ClusterSemanticAuthorityRequestKind {
 	CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ = 4
 } ClusterSemanticAuthorityRequestKind;
 
+/* Volatile shared-memory mailbox authority token.  This is never persisted or
+ * sent on the wire; it binds one LMON request to the exact current formation
+ * and PGSA generation that admitted it. */
+typedef struct ClusterSemanticFormationBinding {
+	uint64 utility_request_seq;
+	uint64 formation_epoch;
+	uint64 coordinator_incarnation;
+	uint64 expected_record_generation;
+} ClusterSemanticFormationBinding;
+
 typedef struct ClusterUndoRootDescriptorRequest {
 	uint64 request_seq;
 	uint64 system_identifier;
+	ClusterSemanticFormationBinding formation;
 	uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 } ClusterUndoRootDescriptorRequest;
 
 typedef struct ClusterUndoRootDescriptorReadRequest {
 	uint64 request_seq;
 	uint64 system_identifier;
+	ClusterSemanticFormationBinding formation;
 } ClusterUndoRootDescriptorReadRequest;
 
 typedef struct ClusterUndoRootDescriptorReadCompletion {
@@ -204,9 +216,12 @@ extern bool cluster_semantic_activation_qvotec_complete_record_read(
 	bool implicit_open,
 	const uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES]);
 extern bool cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
+	const ClusterSemanticFormationBinding *formation,
 	uint64 system_identifier,
 	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
 	uint64 *out_request_seq);
+extern bool cluster_semantic_activation_qvotec_pgrd_formation_matches(
+	const ClusterSemanticFormationBinding *formation);
 extern bool cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
 	ClusterUndoRootDescriptorRequest *out);
 extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor(

@@ -23,6 +23,7 @@
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "storage/ipc.h"
 
@@ -31,6 +32,8 @@ volatile sig_atomic_t InterruptPending = false;
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;
+char *cluster_shared_data_dir;
+static bool cluster_r4_activation_test_formation_valid;
 
 void ProcessInterrupts(void);
 
@@ -46,17 +49,86 @@ cluster_epoch_get_current(void)
 
 bool
 cluster_replacement_episode_is_valid(
-	const ClusterReplacementEpisode *episode pg_attribute_unused())
+	const ClusterReplacementEpisode *episode)
 {
-	return false;
+	return cluster_r4_activation_test_formation_valid && episode != NULL;
 }
 
 bool
 cluster_reconfig_lmon_snapshot_replacement_admitted(
-	ClusterReplacementEpisode *out_episode pg_attribute_unused(),
-	ClusterReplacementCommitMarkerV3 *out_marker pg_attribute_unused())
+	ClusterReplacementEpisode *out_episode,
+	ClusterReplacementCommitMarkerV3 *out_marker)
 {
-	return false;
+	if (!cluster_r4_activation_test_formation_valid || out_episode == NULL
+		|| out_marker == NULL)
+		return false;
+
+	memset(out_episode, 0, sizeof(*out_episode));
+	out_episode->request_nonce = 1;
+	out_episode->baseline_epoch = 1;
+	out_episode->reserved_or_committed_epoch = 2;
+	out_episode->old_admitted_incarnation = 1;
+	out_episode->fresh_incarnation = 2;
+	out_episode->grammar_fingerprint = 1;
+	out_episode->target_node_id = 1;
+	out_episode->coordinator_node_id = 0;
+	out_episode->state_generation = 1;
+	out_episode->phase = CLUSTER_REPLACEMENT_EPISODE_ADMITTED;
+	out_episode->readiness_flags = CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK;
+
+	memset(out_marker, 0, sizeof(*out_marker));
+	out_marker->magic = CLUSTER_JCMK_MAGIC;
+	out_marker->version = CLUSTER_JCMK_REPLACEMENT_VERSION;
+	out_marker->target_node_id = 1;
+	out_marker->phase = CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED;
+	out_marker->old_admitted_incarnation = 1;
+	out_marker->fresh_incarnation = 2;
+	out_marker->baseline_epoch = 1;
+	out_marker->reserved_or_committed_epoch = 2;
+	out_marker->request_nonce = 1;
+	out_marker->grammar_fingerprint = 1;
+	out_marker->ready_state_generation = 1;
+	return true;
+}
+
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return true;
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return 1;
+}
+
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node_id)
+{
+	return node_id >= 0 && node_id < CLUSTER_MAX_NODES ? 1 : 0;
+}
+
+uint64
+GetSystemIdentifier(void)
+{
+	return UINT64_C(0x0123456789abcdef);
+}
+
+ClusterUndoSmgrRootMirrorState
+cluster_undo_smgr_root_descriptor_read_candidate(
+	const char *root_directory pg_attribute_unused(),
+	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] pg_attribute_unused())
+{
+	return CLUSTER_UNDO_SMGR_ROOT_MIRROR_ABSENT;
+}
+
+ClusterUndoSmgrRootMirrorState
+cluster_undo_smgr_root_descriptor_publish(
+	const char *root_directory pg_attribute_unused(),
+	const uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] pg_attribute_unused())
+{
+	return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 }
 
 bool

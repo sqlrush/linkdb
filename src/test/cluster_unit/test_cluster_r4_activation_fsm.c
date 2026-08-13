@@ -111,6 +111,8 @@ static char test_pgrd_publish_root_directory[MAXPGPATH];
 static uint8 test_pgrd_published[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static int test_strong_random_calls;
 static uint64 test_system_identifier;
+static bool test_qvotec_in_quorum = true;
+static uint64 test_qvotec_self_incarnation = UINT64_C(0x445566778899aabb);
 
 int MyProcPid = 101;
 int cluster_node_id = 1;
@@ -141,6 +143,24 @@ uint64
 cluster_epoch_get_current(void)
 {
 	return test_current_epoch;
+}
+
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return test_qvotec_in_quorum;
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return test_qvotec_self_incarnation;
+}
+
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node_id)
+{
+	return node_id == cluster_node_id ? test_qvotec_self_incarnation : 0;
 }
 
 uint64
@@ -515,6 +535,8 @@ test_gate_reset(void)
 	memset(test_pgrd_published, 0, sizeof(test_pgrd_published));
 	test_strong_random_calls = 0;
 	test_system_identifier = 0;
+	test_qvotec_in_quorum = true;
+	test_qvotec_self_incarnation = UINT64_C(0x445566778899aabb);
 	cluster_shared_data_dir = NULL;
 	MyProcPid = 101;
 	cluster_node_id = 1;
@@ -525,8 +547,12 @@ test_gate_reset(void)
 	semantic_activation_lmon_record_read_seq = 0;
 	semantic_activation_lmon_pgrd_request_seq = 0;
 	semantic_activation_lmon_pgrd_utility_request_seq = 0;
+	memset(&semantic_activation_lmon_pgrd_formation, 0,
+		   sizeof(semantic_activation_lmon_pgrd_formation));
 	semantic_activation_lmon_pgrd_read_request_seq = 0;
 	semantic_activation_lmon_pgrd_read_utility_request_seq = 0;
+	memset(&semantic_activation_lmon_pgrd_read_formation, 0,
+		   sizeof(semantic_activation_lmon_pgrd_read_formation));
 	cluster_semantic_activation_shmem_init();
 }
 
@@ -2396,19 +2422,20 @@ UT_TEST(test_116_formation_lmon_consumes_phase3_handoff)
 UT_TEST(test_117_formation_lmon_submits_exact_mirror_candidate_to_qvotec)
 {
 	const uint64 system_identifier = UINT64_C(0x1122334455667788);
-	ClusterSemanticActivationShmem shmem;
+	ClusterSemanticFormationBinding formation;
 	ClusterUndoRootDescriptorV1 descriptor;
 	ClusterUndoRootDescriptorRequest request;
 	uint64 request_seq = 0;
+	uint64 utility_request_seq = 0;
 	int i;
 
-	memset(&shmem, 0, sizeof(shmem));
-	pg_atomic_init_u64(&shmem.record_cas_request_seq, 0);
-	pg_atomic_init_u64(&shmem.record_cas_completion_seq, 0);
-	pg_atomic_init_u32(&shmem.record_cas_result,
-				   CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	pg_atomic_init_u32(&shmem.record_cas_request_kind,
-				   CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE);
+	test_gate_reset();
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	cluster_node_id = 0;
+	test_admitted_snapshot_valid = true;
+	test_admitted_snapshot_episode = valid_d13_admitted_episode();
+	test_admitted_snapshot_marker = valid_d13_admitted_marker();
+	test_system_identifier = system_identifier;
 	memset(&descriptor, 0, sizeof(descriptor));
 	descriptor.descriptor_incarnation = 1;
 	descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
@@ -2421,10 +2448,19 @@ UT_TEST(test_117_formation_lmon_submits_exact_mirror_candidate_to_qvotec)
 	UT_ASSERT(cluster_undo_root_descriptor_encode(
 		&descriptor, test_pgrd_candidate));
 	test_pgrd_candidate_state = CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT;
-	SemanticActivationShmem = &shmem;
+	UT_ASSERT(semantic_activation_utility_mailbox_submit(
+		CLUSTER_SEMANTIC_ENABLE_ALL, 0,
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 0, 0,
+		&utility_request_seq));
+	formation = (ClusterSemanticFormationBinding){
+		.utility_request_seq = utility_request_seq,
+		.formation_epoch = test_current_epoch,
+		.coordinator_incarnation = test_qvotec_self_incarnation,
+		.expected_record_generation = 0,
+	};
 
 	UT_ASSERT(semantic_activation_lmon_submit_pgrd_exact_retry(
-		"/unused/pg_undo", system_identifier, &request_seq));
+		"/unused/pg_undo", &formation, system_identifier, &request_seq));
 	UT_ASSERT_EQ(request_seq, 1);
 	memset(&request, 0, sizeof(request));
 	UT_ASSERT(cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
@@ -2433,8 +2469,7 @@ UT_TEST(test_117_formation_lmon_submits_exact_mirror_candidate_to_qvotec)
 	UT_ASSERT_EQ(memcmp(request.desired_bytes, test_pgrd_candidate,
 					  sizeof(test_pgrd_candidate)), 0);
 
-	test_pgrd_candidate_state = CLUSTER_UNDO_SMGR_ROOT_MIRROR_ABSENT;
-	SemanticActivationShmem = NULL;
+	test_gate_reset();
 }
 
 UT_TEST(test_118_formation_lmon_waits_for_pgrd_majority_before_carrier)
@@ -2661,10 +2696,159 @@ UT_TEST(test_120_authority_without_mirror_holds_before_carrier)
 	test_gate_reset();
 }
 
+UT_TEST(test_121_out_of_quorum_coordinator_cannot_submit_pgrd)
+{
+	const uint64 system_identifier = UINT64_C(0x66778899aabbccdd);
+	ClusterUndoRootDescriptorV1 descriptor;
+	ClusterUndoRootDescriptorRequest pgrd_request;
+	ClusterSemanticActivationRefusal refusal;
+	uint64 utility_request_seq = 0;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	cluster_node_id = 0;
+	test_admitted_snapshot_valid = true;
+	test_admitted_snapshot_episode = valid_d13_admitted_episode();
+	test_admitted_snapshot_marker = valid_d13_admitted_marker();
+	test_system_identifier = system_identifier;
+	cluster_shared_data_dir = "/cluster-share";
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.descriptor_incarnation = 1;
+	descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
+	descriptor.owner_node = -1;
+	descriptor.root_ordinal = 0;
+	memset(descriptor.root_uuid, 0x9a, sizeof(descriptor.root_uuid));
+	descriptor.namespace_id = 1;
+	descriptor.system_identifier = system_identifier;
+	UT_ASSERT(cluster_undo_root_descriptor_encode(
+		&descriptor, test_pgrd_candidate));
+	test_pgrd_candidate_state = CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT;
+	test_qvotec_in_quorum = false;
+	UT_ASSERT(semantic_activation_utility_mailbox_submit(
+		CLUSTER_SEMANTIC_ENABLE_ALL, 0,
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 0, 0,
+		&utility_request_seq));
+
+	cluster_semantic_activation_lmon_tick();
+	memset(&refusal, 0, sizeof(refusal));
+	UT_ASSERT(semantic_activation_utility_mailbox_poll_completion(
+		utility_request_seq, &refusal));
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	UT_ASSERT_EQ(test_pgrd_candidate_read_calls, 0);
+	memset(&pgrd_request, 0, sizeof(pgrd_request));
+	UT_ASSERT(!cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
+		&pgrd_request));
+	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_SEQ_OFFSET)),
+				 UINT64_C(2));
+	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)),
+				 0);
+	test_gate_reset();
+}
+
+UT_TEST(test_122_epoch_drift_rejects_pending_pgrd_without_mutation)
+{
+	const uint64 system_identifier = UINT64_C(0x778899aabbccddee);
+	ClusterSemanticFormationBinding formation;
+	ClusterUndoRootDescriptorV1 descriptor;
+	ClusterUndoRootDescriptorRequest pgrd_request;
+	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_OK;
+	uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint64 request_seq = 0;
+	uint64 utility_request_seq = 0;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	cluster_node_id = 0;
+	test_admitted_snapshot_valid = true;
+	test_admitted_snapshot_episode = valid_d13_admitted_episode();
+	test_admitted_snapshot_marker = valid_d13_admitted_marker();
+	test_system_identifier = system_identifier;
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.descriptor_incarnation = 1;
+	descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
+	descriptor.owner_node = -1;
+	descriptor.root_ordinal = 0;
+	memset(descriptor.root_uuid, 0x8b, sizeof(descriptor.root_uuid));
+	descriptor.namespace_id = 1;
+	descriptor.system_identifier = system_identifier;
+	UT_ASSERT(cluster_undo_root_descriptor_encode(&descriptor, desired));
+	UT_ASSERT(semantic_activation_utility_mailbox_submit(
+		CLUSTER_SEMANTIC_ENABLE_ALL, 0,
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 0, 0,
+		&utility_request_seq));
+	formation = (ClusterSemanticFormationBinding){
+		.utility_request_seq = utility_request_seq,
+		.formation_epoch = test_current_epoch,
+		.coordinator_incarnation = test_qvotec_self_incarnation,
+		.expected_record_generation = 0,
+	};
+	UT_ASSERT(cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
+		&formation, system_identifier, desired, &request_seq));
+	test_current_epoch++;
+
+	memset(&pgrd_request, 0, sizeof(pgrd_request));
+	UT_ASSERT(!cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
+		&pgrd_request));
+	UT_ASSERT(cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
+		request_seq, &result));
+	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	test_gate_reset();
+}
+
+UT_TEST(test_123_incarnation_drift_rejects_pending_pgrd_without_mutation)
+{
+	const uint64 system_identifier = UINT64_C(0x8899aabbccddeeff);
+	ClusterSemanticFormationBinding formation;
+	ClusterUndoRootDescriptorV1 descriptor;
+	ClusterUndoRootDescriptorRequest pgrd_request;
+	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_OK;
+	uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint64 request_seq = 0;
+	uint64 utility_request_seq = 0;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	cluster_node_id = 0;
+	test_admitted_snapshot_valid = true;
+	test_admitted_snapshot_episode = valid_d13_admitted_episode();
+	test_admitted_snapshot_marker = valid_d13_admitted_marker();
+	test_system_identifier = system_identifier;
+	memset(&descriptor, 0, sizeof(descriptor));
+	descriptor.descriptor_incarnation = 1;
+	descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
+	descriptor.owner_node = -1;
+	descriptor.root_ordinal = 0;
+	memset(descriptor.root_uuid, 0x7c, sizeof(descriptor.root_uuid));
+	descriptor.namespace_id = 1;
+	descriptor.system_identifier = system_identifier;
+	UT_ASSERT(cluster_undo_root_descriptor_encode(&descriptor, desired));
+	UT_ASSERT(semantic_activation_utility_mailbox_submit(
+		CLUSTER_SEMANTIC_ENABLE_ALL, 0,
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, 0, 0,
+		&utility_request_seq));
+	formation = (ClusterSemanticFormationBinding){
+		.utility_request_seq = utility_request_seq,
+		.formation_epoch = test_current_epoch,
+		.coordinator_incarnation = test_qvotec_self_incarnation,
+		.expected_record_generation = 0,
+	};
+	UT_ASSERT(cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
+		&formation, system_identifier, desired, &request_seq));
+	test_qvotec_self_incarnation++;
+
+	memset(&pgrd_request, 0, sizeof(pgrd_request));
+	UT_ASSERT(!cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
+		&pgrd_request));
+	UT_ASSERT(cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
+		request_seq, &result));
+	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	test_gate_reset();
+}
+
 int
 main(void)
 {
-	UT_PLAN(155);
+	UT_PLAN(158);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -2820,6 +3004,9 @@ main(void)
 	UT_RUN(test_118_formation_lmon_waits_for_pgrd_majority_before_carrier);
 	UT_RUN(test_119_formation_lmon_reads_zero_quorum_before_fresh_pgrd);
 	UT_RUN(test_120_authority_without_mirror_holds_before_carrier);
+	UT_RUN(test_121_out_of_quorum_coordinator_cannot_submit_pgrd);
+	UT_RUN(test_122_epoch_drift_rejects_pending_pgrd_without_mutation);
+	UT_RUN(test_123_incarnation_drift_rejects_pending_pgrd_without_mutation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
