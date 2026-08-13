@@ -154,6 +154,11 @@ static bool semantic_activation_authority_mailbox_completion_matches(
 static bool semantic_activation_authority_mailbox_poll_completion(
 	ClusterSemanticAuthorityRequestKind request_kind, uint64 request_seq,
 	ClusterSemanticActivationResult *out_result);
+static bool semantic_activation_authority_request_formation_binding(
+	ClusterSemanticAuthorityRequestKind request_kind,
+	ClusterSemanticFormationBinding *out);
+static bool semantic_activation_qvotec_formation_matches(
+	const ClusterSemanticFormationBinding *formation);
 
 typedef enum SemanticActivationUtilityMailboxState {
 	SEMANTIC_ACTIVATION_UTILITY_MAILBOX_IDLE = 0,
@@ -1625,6 +1630,35 @@ semantic_activation_record_cas_mailbox_submit(
 	uint64 expected_generation, uint64 expected_source_feature_bitmap,
 	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES], uint64 *out_request_seq)
 {
+	ClusterSemanticActivationRecord desired;
+	ClusterSemanticFormationBinding formation;
+
+	if (expected_generation == UINT64_MAX || desired_bytes == NULL
+		|| SemanticActivationUtilityMailbox == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_semantic_activation_record_decode(
+			desired_bytes, &desired, NULL)
+		|| desired.record_generation != expected_generation + 1
+		|| desired.coordinator_node != (uint32)cluster_node_id)
+		return false;
+	formation = (ClusterSemanticFormationBinding){
+		.utility_request_seq = pg_atomic_read_u64(
+			&SemanticActivationUtilityMailbox->utility_request_seq),
+		.formation_epoch = desired.transition_epoch,
+		.coordinator_incarnation = desired.coordinator_incarnation,
+		.expected_record_generation = expected_generation,
+	};
+	if (!semantic_activation_qvotec_formation_matches(&formation))
+		return false;
+
+	/* RECORD_CAS already carries epoch/incarnation in its durable desired
+	 * image.  Reuse the utility result words for the pending utility sequence
+	 * and a second incarnation copy, so utility-slot ABA and byte mutation are
+	 * rejected without widening either shared mailbox. */
+	SemanticActivationUtilityMailbox->utility_result_feature_bit
+		= formation.utility_request_seq;
+	SemanticActivationUtilityMailbox->utility_result_expected_generation
+		= formation.coordinator_incarnation;
 	return semantic_activation_authority_mailbox_submit(
 		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS, expected_generation,
 		expected_source_feature_bitmap, desired_bytes, out_request_seq);
@@ -1680,9 +1714,70 @@ semantic_activation_authority_mailbox_submit(
 	return true;
 }
 
+static bool
+semantic_activation_authority_request_formation_binding(
+	ClusterSemanticAuthorityRequestKind request_kind,
+	ClusterSemanticFormationBinding *out)
+{
+	ClusterSemanticActivationRecord desired;
+	uint64 expected_generation;
+
+	if (SemanticActivationShmem == NULL
+		|| SemanticActivationUtilityMailbox == NULL || out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	pg_read_barrier();
+	if (pg_atomic_read_u32(
+			&SemanticActivationShmem->record_cas_request_kind)
+		!= request_kind)
+		return false;
+
+	switch (request_kind) {
+	case CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS:
+		expected_generation
+			= SemanticActivationShmem->record_cas_expected_generation;
+		if (expected_generation == UINT64_MAX || cluster_node_id < 0
+			|| cluster_node_id >= CLUSTER_MAX_NODES
+			|| !cluster_semantic_activation_record_decode(
+				SemanticActivationShmem->record_cas_desired_bytes,
+				&desired, NULL)
+			|| desired.record_generation != expected_generation + 1
+			|| desired.coordinator_node != (uint32)cluster_node_id
+			|| desired.coordinator_incarnation
+				   != SemanticActivationUtilityMailbox
+					  ->utility_result_expected_generation)
+			return false;
+		out->utility_request_seq
+			= SemanticActivationUtilityMailbox->utility_result_feature_bit;
+		out->formation_epoch = desired.transition_epoch;
+		out->coordinator_incarnation = desired.coordinator_incarnation;
+		out->expected_record_generation = expected_generation;
+		return true;
+	case CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR:
+	case CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ:
+		out->utility_request_seq
+			= SemanticActivationShmem
+			  ->record_cas_expected_source_feature_bitmap;
+		out->formation_epoch
+			= SemanticActivationUtilityMailbox->utility_result_feature_bit;
+		out->coordinator_incarnation
+			= SemanticActivationUtilityMailbox
+			  ->utility_result_expected_generation;
+		out->expected_record_generation
+			= SemanticActivationUtilityMailbox
+			  ->utility_expected_record_generation;
+		return true;
+	case CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE:
+	case CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_READ:
+	default:
+		return false;
+	}
+}
+
 bool
 cluster_semantic_activation_qvotec_poll_record_cas(ClusterSemanticActivationCasRequest *out)
 {
+	ClusterSemanticFormationBinding formation;
 	uint64 request_seq;
 	uint64 completion_seq;
 
@@ -1699,6 +1794,14 @@ cluster_semantic_activation_qvotec_poll_record_cas(ClusterSemanticActivationCasR
 	if (pg_atomic_read_u32(&SemanticActivationShmem->record_cas_request_kind)
 		!= CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS)
 		return false;
+	if (!semantic_activation_authority_request_formation_binding(
+			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS, &formation)
+		|| !semantic_activation_qvotec_formation_matches(&formation)) {
+		(void)cluster_semantic_activation_qvotec_complete_record_cas(
+			request_seq, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
 	out->request_seq = request_seq;
 	out->expected_generation = SemanticActivationShmem->record_cas_expected_generation;
 	out->expected_source_feature_bitmap
@@ -1817,9 +1920,21 @@ static bool
 semantic_activation_record_cas_mailbox_poll_completion(uint64 request_seq,
 												ClusterSemanticActivationResult *out_result)
 {
-	return semantic_activation_authority_mailbox_poll_completion(
-		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS, request_seq,
-		out_result);
+	ClusterSemanticFormationBinding formation;
+	ClusterSemanticActivationResult result;
+
+	if (out_result == NULL
+		|| !semantic_activation_authority_mailbox_poll_completion(
+			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS, request_seq,
+			&result))
+		return false;
+	if (result == CLUSTER_SEMANTIC_ACTIVATION_OK
+		&& (!semantic_activation_authority_request_formation_binding(
+				CLUSTER_SEMANTIC_AUTHORITY_REQUEST_RECORD_CAS, &formation)
+			|| !semantic_activation_qvotec_formation_matches(&formation)))
+		result = CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+	*out_result = result;
+	return true;
 }
 
 static bool
@@ -1921,28 +2036,14 @@ cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
 	out->request_seq = request_seq;
 	out->system_identifier
 		= SemanticActivationShmem->record_cas_expected_generation;
-	out->formation.utility_request_seq
-		= SemanticActivationShmem->record_cas_expected_source_feature_bitmap;
-	out->formation.formation_epoch
-		= SemanticActivationUtilityMailbox == NULL
-			  ? 0
-			  : SemanticActivationUtilityMailbox->utility_result_feature_bit;
-	out->formation.coordinator_incarnation
-		= SemanticActivationUtilityMailbox == NULL
-			  ? 0
-			  : SemanticActivationUtilityMailbox
-					->utility_result_expected_generation;
-	out->formation.expected_record_generation
-		= SemanticActivationUtilityMailbox == NULL
-			  ? 0
-			  : SemanticActivationUtilityMailbox
-					->utility_expected_record_generation;
 	memcpy(out->desired_bytes,
 		   SemanticActivationShmem->record_cas_desired_bytes,
 		   sizeof(out->desired_bytes));
-	if (out->system_identifier == 0)
-		return false;
-	if (!cluster_semantic_activation_qvotec_pgrd_formation_matches(
+	if (out->system_identifier == 0
+		|| !semantic_activation_authority_request_formation_binding(
+			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR,
+			&out->formation)
+		|| !semantic_activation_qvotec_formation_matches(
 			&out->formation)) {
 		(void)cluster_semantic_activation_qvotec_complete_undo_root_descriptor(
 			request_seq, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
@@ -2027,25 +2128,11 @@ cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
 	out->request_seq = request_seq;
 	out->system_identifier
 		= SemanticActivationShmem->record_cas_expected_generation;
-	out->formation.utility_request_seq
-		= SemanticActivationShmem->record_cas_expected_source_feature_bitmap;
-	out->formation.formation_epoch
-		= SemanticActivationUtilityMailbox == NULL
-			  ? 0
-			  : SemanticActivationUtilityMailbox->utility_result_feature_bit;
-	out->formation.coordinator_incarnation
-		= SemanticActivationUtilityMailbox == NULL
-			  ? 0
-			  : SemanticActivationUtilityMailbox
-					->utility_result_expected_generation;
-	out->formation.expected_record_generation
-		= SemanticActivationUtilityMailbox == NULL
-			  ? 0
-			  : SemanticActivationUtilityMailbox
-					->utility_expected_record_generation;
-	if (out->system_identifier == 0)
-		return false;
-	if (!cluster_semantic_activation_qvotec_pgrd_formation_matches(
+	if (out->system_identifier == 0
+		|| !semantic_activation_authority_request_formation_binding(
+			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ,
+			&out->formation)
+		|| !semantic_activation_qvotec_formation_matches(
 			&out->formation)) {
 		(void)cluster_semantic_activation_qvotec_complete_undo_root_descriptor_read(
 			request_seq, CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD, zero);
@@ -2055,8 +2142,8 @@ cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
 	return true;
 }
 
-bool
-cluster_semantic_activation_qvotec_pgrd_formation_matches(
+static bool
+semantic_activation_qvotec_formation_matches(
 	const ClusterSemanticFormationBinding *formation)
 {
 	SemanticActivationAdmissionSnapshot snapshot;
@@ -2093,6 +2180,13 @@ cluster_semantic_activation_qvotec_pgrd_formation_matches(
 	return cluster_qvotec_in_quorum()
 		   && cluster_epoch_get_current() == current_epoch
 		   && cluster_qvotec_get_self_incarnation() == current_incarnation;
+}
+
+bool
+cluster_semantic_activation_qvotec_pgrd_formation_matches(
+	const ClusterSemanticFormationBinding *formation)
+{
+	return semantic_activation_qvotec_formation_matches(formation);
 }
 
 bool

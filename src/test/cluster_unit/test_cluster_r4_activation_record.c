@@ -673,16 +673,35 @@ UT_TEST(test_48_equal_generation_conflict_without_majority_is_not_legacy)
 UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 {
 	ClusterSemanticActivationShmem shmem;
+	ClusterSemanticActivationUtilityMailboxShmem utility;
 	ClusterSemanticActivationCasRequest request;
 	ClusterSemanticActivationRecord desired_record = valid_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 8);
 	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 	uint64 seq = UINT64_MAX;
 
+	desired_record.transition_epoch = 0;
+	desired_record.coordinator_node = (uint32)cluster_node_id;
+	desired_record.coordinator_incarnation = 1;
 	memset(&shmem, 0, sizeof(shmem));
 	pg_atomic_init_u64(&shmem.record_cas_request_seq, 0);
 	pg_atomic_init_u64(&shmem.record_cas_completion_seq, 0);
 	pg_atomic_init_u32(&shmem.record_cas_result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	pg_atomic_init_u32(&shmem.record_cas_request_kind,
+				   CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE);
+	pg_atomic_init_u64(&shmem.admission_seq, 0);
+	pg_atomic_init_u64(&shmem.active_bits, 0);
+	pg_atomic_init_u64(&shmem.record_generation, 7);
+	pg_atomic_init_u64(&shmem.formation_epoch, 0);
+	pg_atomic_init_u32(&shmem.transition_closed, 1);
+	memset(&utility, 0, sizeof(utility));
+	pg_atomic_init_u64(&utility.utility_request_seq, 1);
+	pg_atomic_init_u64(&utility.utility_completion_seq, 0);
+	pg_atomic_init_u32(&utility.utility_mailbox_state,
+				   SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING);
+	utility.utility_expected_record_generation = 7;
+	SemanticActivationUtilityMailbox = &utility;
+	cluster_r4_activation_test_formation_valid = true;
 	SemanticActivationShmem = NULL;
 	UT_ASSERT(encode(desired_record, desired));
 	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
@@ -715,14 +734,16 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT);
 	UT_ASSERT(!semantic_activation_record_cas_mailbox_poll_completion(2, &result));
 
-	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(8, UINT64_C(0x22), desired, &seq));
+	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
 	UT_ASSERT_EQ(seq, 2);
 	pg_atomic_write_u64(&shmem.record_cas_request_seq, UINT64_MAX);
 	pg_atomic_write_u64(&shmem.record_cas_completion_seq, UINT64_MAX);
-	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(8, UINT64_C(0x22), desired, &seq));
+	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_request_seq), UINT64_MAX);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_completion_seq), UINT64_MAX);
 	SemanticActivationShmem = NULL;
+	SemanticActivationUtilityMailbox = NULL;
+	cluster_r4_activation_test_formation_valid = false;
 }
 
 UT_TEST(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox)
