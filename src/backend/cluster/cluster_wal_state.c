@@ -439,8 +439,18 @@ cluster_wal_state_ensure(void)
 		= cluster_wal_state_slot_classify(&own_slot, own_thread, cluster_node_id, &reason);
 	if (own_verdict != CLUSTER_WAL_SLOT_EMPTY && own_verdict != CLUSTER_WAL_SLOT_OK) {
 		pfree(image);
+		if (own_verdict == CLUSTER_WAL_SLOT_FOREIGN)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+					 errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
+							(unsigned)own_thread),
+					 errdetail("Own-slot validation failed: node_id mismatch "
+							   "(expected %d, found %d).",
+							   cluster_node_id, (int)own_slot.node_id),
+					 errhint("Restore the correct known-valid registry while the cluster is "
+							 "fully offline; foreign ownership evidence is preserved.")));
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
+					errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
 							   (unsigned)own_thread),
 						errdetail("Own-slot validation failed: %s.",
 								  reason != NULL ? reason : "unknown"),
@@ -571,49 +581,46 @@ cluster_wal_state_publish_active(void)
 /*
  * cluster_wal_state_publish_stopped
  *
- *	Clean shutdown only (the postmaster exit path gates on
- *	Shutdown < ImmediateShutdown && !FatalError).  Failure must never
- *	block a shutdown: WARNING + carry on.  started_at is preserved
- *	from the slot on disk (same incarnation).
+ *	RF A1 W3, called only by the checkpointer after ShutdownXLOG returns.
+ *	The common formed-registry RMW reacquires verified CF(X), changes the
+ *	frozen STOPPED mask, fsyncs and verifies the exact after-image.  Failure
+ *	must never block shutdown: WARNING + carry on, leaving ACTIVE/evidence.
  */
 void
 cluster_wal_state_publish_stopped(void)
 {
-	ClusterWalStateSlot cur;
-	ClusterWalStateSlot slot;
-	ClusterWalSlotVerdict v;
-	int64 started_at;
+	ClusterWalStateUpdate update;
+	ClusterWalStateUpdateResult result;
+	TimeLineID tli;
+	XLogRecPtr write_ptr;
 
 	if (!registry_configured())
 		return;
 
-	v = cluster_wal_state_read_slot(cluster_wal_thread_id(), &cur);
-
-	/*
-	 * Same foreign-owner gate as publish_active(), demoted to WARNING:
-	 * shutdown is never blocked, but foreign evidence is never erased
-	 * either (spec-4.2 user codereview round 2 P1).
-	 */
-	if (v == CLUSTER_WAL_SLOT_OK && cur.node_id != cluster_node_id) {
-		ereport(WARNING,
-				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-				 errmsg("not publishing STOPPED: WAL state registry slot %u is owned by node %d, "
-						"but this node is %d",
-						(unsigned)cluster_wal_thread_id(), (int)cur.node_id, cluster_node_id),
-				 errhint("The foreign slot is left untouched as evidence.")));
-		return;
+	if (RecoveryInProgress()) {
+		write_ptr = GetXLogReplayRecPtr(&tli);
+	} else {
+		tli = GetWALInsertionTimeLine();
+		write_ptr = GetXLogWriteRecPtr();
 	}
 
-	started_at = (v == CLUSTER_WAL_SLOT_OK) ? cur.started_at : (int64)GetCurrentTimestamp();
-
-	fill_own_slot(&slot, CLUSTER_WAL_SLOT_STATE_STOPPED, started_at);
-	if (v == CLUSTER_WAL_SLOT_OK)
-		preserve_ext_region(&slot, &cur);
-	if (!write_own_slot(&slot))
+	memset(&update, 0, sizeof(update));
+	update.kind = CLUSTER_WAL_STATE_UPDATE_STOPPED;
+	update.tli = (uint32)tli;
+	update.last_updated = (int64)GetCurrentTimestamp();
+	update.highest_lsn = (uint64)write_ptr;
+	update.highest_scn = (uint64)cluster_scn_current();
+	result = cluster_wal_state_update_own(
+		&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+	if (result != CLUSTER_WAL_STATE_UPDATE_OK
+		&& result != CLUSTER_WAL_STATE_UPDATE_NOOP
+		&& result != CLUSTER_WAL_STATE_UPDATE_DISABLED)
 		ereport(WARNING, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						  errmsg("could not publish STOPPED to the WAL state registry: %m"),
-						  errhint("The slot stays ACTIVE; spec-4.3 readers treat it via the "
-								  "staleness inference.")));
+						  errmsg("could not publish STOPPED to the WAL state registry "
+								 "(update result %d)",
+								 (int)result),
+						  errhint("The slot stays ACTIVE; recovery readers treat it "
+								  "conservatively.")));
 }
 
 /*

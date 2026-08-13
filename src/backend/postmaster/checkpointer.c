@@ -41,6 +41,7 @@
 #include "access/xlogrecovery.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_wal_state.h"
 #endif
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -609,6 +610,15 @@ HandleCheckpointerInterrupts(void)
 		 */
 		PendingCheckpointerStats.requested_checkpoints++;
 		ShutdownXLOG(0, 0);
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * RF A1 W3: only a checkpointer that completed ShutdownXLOG may
+		 * publish the clean-close state.  The coordination stack is still
+		 * READY here, so the common WAL-state RMW can reacquire verified
+		 * CF(X).  Immediate and error exits never reach this call.
+		 */
+		cluster_wal_state_publish_stopped();
+#endif
 		pgstat_report_checkpointer();
 		pgstat_report_wal(true);
 

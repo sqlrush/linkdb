@@ -506,7 +506,7 @@ cluster_wal_state_slot_verify_postread(const ClusterWalStateSlot *expected_after
  * when the registry is usable. */
 extern bool cluster_wal_state_ensure(void);
 
-/* Owner-only slot publishes (FATAL 53RA2 on failure -- startup-grade). */
+/* Startup ACTIVE is FATAL on failure; clean-shutdown STOPPED only warns. */
 extern void cluster_wal_state_publish_active(void);
 extern void cluster_wal_state_publish_stopped(void);
 

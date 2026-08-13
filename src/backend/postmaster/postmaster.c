@@ -192,7 +192,6 @@
 #include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
 #include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
 #include "cluster/cluster_startup_phase.h"
-#include "cluster/cluster_wal_state.h" /* PGRAC: spec-4.2 publish_stopped on clean shutdown */
 #endif
 
 #ifdef EXEC_BACKEND
@@ -3432,6 +3431,29 @@ process_pm_child_exit(void)
 				 */
 				Assert(Shutdown > NoShutdown);
 
+#ifdef USE_PGRAC_CLUSTER
+				/*
+				 * RF A1 W3 completed before this successful checkpointer exit.
+				 * Now retire the retained coordination stack in reverse spawn
+				 * order.  PM_SHUTDOWN_2 waits for every retained PID below.
+				 */
+				{
+					int w;
+
+					for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
+						if (LmsWorkerPIDs[w] != 0)
+							signal_child(LmsWorkerPIDs[w], SIGTERM);
+				}
+				if (LmsPID != 0)
+					signal_child(LmsPID, SIGTERM);
+				if (QvotecPID != 0)
+					signal_child(QvotecPID, SIGTERM);
+				if (CssdPID != 0)
+					signal_child(CssdPID, SIGTERM);
+				if (LmonPID != 0)
+					signal_child(LmonPID, SIGTERM);
+#endif
+
 				/* Waken archiver for the last time */
 				if (PgArchPID != 0)
 					signal_child(PgArchPID, SIGUSR2);
@@ -4235,70 +4257,63 @@ PostmasterStateMachine(void)
 		if (WalWriterPID != 0)
 			signal_child(WalWriterPID, SIGTERM);
 #ifdef USE_PGRAC_CLUSTER
-		/*
-		 * PGRAC: spec-1.14 Q10 LIFO shutdown — Cluster Stats first,
-		 * DIAG second, LCK third, LMON last (reverse spawn order).
-		 * Send SIGTERM in reverse spawn order so the last-spawned
-		 * child starts its cleanup BEFORE earlier ones.  Subsequent
-		 * PM_WAIT_BACKENDS waits for all PIDs == 0 and reaps them.
-		 *
-		 * IMPORTANT: LIFO ordering must live in the actual signal_
-		 * child path (here, in pmdie SIGTERM) — placing it in
-		 * cluster_run_shutdown_sequence (which fires AFTER children
-		 * already exited) has no effect.  Q10 user-finding 2026-05-04.
-		 */
-		/* spec-2.38 LIFO: SinvalBcast first (last-spawned). */
-		if (SinvalBcastPID != 0)
-			signal_child(SinvalBcastPID, SIGTERM);
-		/* spec-6.4 LIFO: RFS stops before MRP so apply can drain known receive state. */
-		if (RfsPID != 0)
-			signal_child(RfsPID, SIGTERM);
-		/* spec-6.4 LIFO: MRP is newer than LMD/LMS and stops before lock actors. */
-		if (MrpPID != 0)
-			signal_child(MrpPID, SIGTERM);
-		/* spec-2.19 Q10 LIFO: LMD next. */
-		if (LmdPID != 0)
-			signal_child(LmdPID, SIGTERM);
-		/* PGRAC: spec-7.3 D2 LIFO — LMS DATA-plane workers before worker 0.
-		 * SIGTERM sets ShutdownRequestPending which each worker loop polls. */
 		{
-			int w;
+			bool retain_rf_a1_coordination = cluster_registry_holds_admission();
 
-			for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
-				if (LmsWorkerPIDs[w] != 0)
-					signal_child(LmsWorkerPIDs[w], SIGTERM);
+			/*
+			 * A formed RF A1 registry stops Stats first so W4 cannot race
+			 * W3, then retains exactly LMS (and workers), QVOTEC, CSSD and
+			 * LMON through the shutdown checkpoint.  An unformed registry
+			 * keeps the pre-A1 reverse-order shutdown unchanged.
+			 *
+			 * IMPORTANT: LIFO ordering must live in the actual signal_child
+			 * path.  cluster_run_shutdown_sequence runs only after children
+			 * exit and therefore cannot enforce process close order.
+			 */
+			if (retain_rf_a1_coordination && ClusterStatsPID != 0)
+				signal_child(ClusterStatsPID, SIGTERM);
+
+			/* spec-2.38 LIFO: SinvalBcast first (last-spawned). */
+			if (SinvalBcastPID != 0)
+				signal_child(SinvalBcastPID, SIGTERM);
+			/* spec-6.4 LIFO: RFS stops before MRP. */
+			if (RfsPID != 0)
+				signal_child(RfsPID, SIGTERM);
+			/* spec-6.4 LIFO: MRP stops before lock actors. */
+			if (MrpPID != 0)
+				signal_child(MrpPID, SIGTERM);
+			/* spec-2.19 Q10 LIFO: LMD next. */
+			if (LmdPID != 0)
+				signal_child(LmdPID, SIGTERM);
+
+			if (!retain_rf_a1_coordination) {
+				int w;
+
+				for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
+					if (LmsWorkerPIDs[w] != 0)
+						signal_child(LmsWorkerPIDs[w], SIGTERM);
+				if (LmsPID != 0)
+					signal_child(LmsPID, SIGTERM);
+				if (QvotecPID != 0)
+					signal_child(QvotecPID, SIGTERM);
+				if (CssdPID != 0)
+					signal_child(CssdPID, SIGTERM);
+				if (ClusterStatsPID != 0)
+					signal_child(ClusterStatsPID, SIGTERM);
+			}
+
+			/* PGRAC: spec-3.13 — same shutdown SIGTERM for Undo Cleaner. */
+			if (UndoCleanerPID != 0)
+				signal_child(UndoCleanerPID, SIGTERM);
+			/* spec-1.13 Q10 LIFO: DIAG next. */
+			if (DiagPID != 0)
+				signal_child(DiagPID, SIGTERM);
+			/* spec-1.12 Q10 LIFO: LCK next. */
+			if (LckPID != 0)
+				signal_child(LckPID, SIGTERM);
+			if (!retain_rf_a1_coordination && LmonPID != 0)
+				signal_child(LmonPID, SIGTERM);
 		}
-		/* spec-2.18 Q10 LIFO: LMS next (was last-spawned in Phase 2.C
-		 * skeleton; spawn-integration site in Step 3+).  SIGTERM sets
-		 * ShutdownRequestPending which the LMS main loop polls. */
-		if (LmsPID != 0)
-			signal_child(LmsPID, SIGTERM);
-		/* spec-2.6 Q10 LIFO: QVOTEC next (was last-spawned in phase 4
-		 * driver fourth upgrade — DIAG + Stats + CSSD + QVOTEC serial
-		 * wait, QVOTEC added last). */
-		if (QvotecPID != 0)
-			signal_child(QvotecPID, SIGTERM);
-		/* spec-2.5 Q10 LIFO: CSSD next. */
-		if (CssdPID != 0)
-			signal_child(CssdPID, SIGTERM);
-		/* spec-1.14 Q10 LIFO: Cluster Stats next. */
-		if (ClusterStatsPID != 0)
-			signal_child(ClusterStatsPID, SIGTERM);
-		/* PGRAC: spec-3.13 — same shutdown SIGTERM for Undo Cleaner. */
-		if (UndoCleanerPID != 0)
-			signal_child(UndoCleanerPID, SIGTERM);
-		/* spec-1.13 Q10 LIFO: DIAG next. */
-		if (DiagPID != 0)
-			signal_child(DiagPID, SIGTERM);
-		/* spec-1.12 Q10 LIFO: LCK next. */
-		if (LckPID != 0)
-			signal_child(LckPID, SIGTERM);
-		/* spec-1.11 Q10 LIFO: LMON last (first-spawned).  LMON main
-		 * loop polls shutdown_requested + ShutdownRequestPending; SIGTERM
-		 * sets the latter via SignalHandlerForShutdownRequest, triggering
-		 * LMON's normal-exit path (HC5). */
-		if (LmonPID != 0)
-			signal_child(LmonPID, SIGTERM);
 #endif
 		/* If we're in recovery, also stop startup and walreceiver procs */
 		if (StartupPID != 0)
@@ -4341,7 +4356,15 @@ PostmasterStateMachine(void)
 			 * WalWriter / BgWriter check above.  HC5 normal-exit path
 			 * relies on this.
 			 */
-			LmonPID == 0 &&
+			/*
+			 * RF A1 W3 clean close deliberately retains the coordination
+			 * stack until the checkpointer exits.  Abnormal/immediate paths
+			 * retain the original all-reaped requirement.
+			 */
+			((cluster_registry_holds_admission() && !FatalError && Shutdown > NoShutdown
+			  && Shutdown < ImmediateShutdown)
+			 || (LmonPID == 0 && CssdPID == 0 && QvotecPID == 0 && LmsPID == 0
+				 && LmsWorkersAllReaped())) &&
 			/* PGRAC: spec-1.12 Sprint A — same wait for LCK (codex
 			 * round 3 P2.3 preempted in 1.12). */
 			LckPID == 0 &&
@@ -4351,14 +4374,6 @@ PostmasterStateMachine(void)
 			ClusterStatsPID == 0 &&
 			/* PGRAC: spec-3.13 — same wait for Undo Cleaner. */
 			UndoCleanerPID == 0 &&
-			/* PGRAC: spec-2.5 Sprint A — same wait for CSSD. */
-			CssdPID == 0 &&
-			/* PGRAC: spec-2.6 Sprint A Step 3 D7 — same wait for QVOTEC. */
-			QvotecPID == 0 &&
-			/* PGRAC: spec-2.18 Sprint A — same wait for LMS. */
-			LmsPID == 0 &&
-			/* PGRAC: spec-7.3 D2 — same wait for every LMS DATA-plane worker. */
-			LmsWorkersAllReaped() &&
 			/* PGRAC: spec-2.19 Sprint A — same wait for LMD. */
 			LmdPID == 0 &&
 			/* PGRAC: spec-6.4 D1 — same wait for MRP. */
@@ -4407,12 +4422,11 @@ PostmasterStateMachine(void)
 					 * for checkpointer fork failure.
 					 */
 					FatalError = true;
-					pmState = PM_WAIT_DEAD_END;
-
-					/* Kill the walsenders and archiver too */
-					SignalChildren(SIGQUIT);
-					if (PgArchPID != 0)
-						signal_child(PgArchPID, SIGQUIT);
+					SetQuitSignalReason(PMQUIT_FOR_CRASH);
+					TerminateChildren(SIGQUIT);
+					if (AbortStartTime == 0)
+						AbortStartTime = time(NULL);
+					pmState = PM_WAIT_BACKENDS;
 				}
 			}
 		}
@@ -4425,7 +4439,12 @@ PostmasterStateMachine(void)
 		 * left by now anyway; what we're really waiting for is walsenders and
 		 * archiver.
 		 */
-		if (PgArchPID == 0 && CountChildren(BACKEND_TYPE_ALL) == 0) {
+		if (PgArchPID == 0 && CountChildren(BACKEND_TYPE_ALL) == 0
+#ifdef USE_PGRAC_CLUSTER
+			&& LmonPID == 0 && CssdPID == 0 && QvotecPID == 0 && LmsPID == 0
+			&& LmsWorkersAllReaped()
+#endif
+		) {
 			pmState = PM_WAIT_DEAD_END;
 		}
 	}
@@ -4492,18 +4511,6 @@ PostmasterStateMachine(void)
 			 * during smart -> fast -> immediate shutdown upgrades stay
 			 * safe.  HC1 PostmasterMain-only Assert applies.
 			 */
-			/*
-			 * PGRAC (spec-4.2): publish STOPPED to the ClusterWalState
-			 * registry on CLEAN shutdowns only.  Immediate shutdown and
-			 * crash-induced exits (FatalError) must leave the slot
-			 * ACTIVE with a stale timestamp -- recovery is required and
-			 * spec-4.3 readers infer "crashed" from exactly that.
-			 * publish_stopped() WARNs on failure; shutdown is never
-			 * blocked.
-			 */
-			if (Shutdown != NoShutdown && Shutdown < ImmediateShutdown && !FatalError)
-				cluster_wal_state_publish_stopped();
-
 			cluster_run_shutdown_sequence();
 #endif
 
