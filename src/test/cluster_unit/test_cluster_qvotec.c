@@ -1553,6 +1553,8 @@ UT_TEST(test_pgrd_majority_read_requires_two_exact_images)
 
 	set.fds[1] = open(set.paths[1], O_RDWR | PG_BINARY);
 	UT_ASSERT(set.fds[1] >= 0);
+	set.fds[2] = open(set.paths[2], O_RDWR | PG_BINARY);
+	UT_ASSERT(set.fds[2] >= 0);
 	UT_ASSERT_EQ(cluster_voting_disk_write_raw_slot_at(
 					 set.fds[1], CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET,
 					 desired),
@@ -1573,6 +1575,79 @@ UT_TEST(test_pgrd_majority_read_requires_two_exact_images)
 	UT_ASSERT_EQ(observed.namespace_id, UINT64_C(1));
 	UT_ASSERT_EQ(observed.system_identifier,
 				 UINT64_C(0x0123456789abcdef));
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgrd_majority_read_short_member_holds)
+{
+	PgsaDiskSet set;
+	ClusterUndoRootDescriptorV1 observed;
+	ClusterUndoRootDescriptorV1 zero;
+	uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 observed_bitmap = UINT8_C(0xa5);
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgrd_test_image(CLUSTER_UNDO_ROOT_KIND_SHARED, -1, 0x92,
+						   desired));
+	UT_ASSERT_EQ(cluster_voting_disk_write_raw_slot_at(
+					 set.fds[0], CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET,
+					 desired),
+				 CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(cluster_voting_disk_write_raw_slot_at(
+					 set.fds[1], CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET,
+					 desired),
+				 CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(ftruncate(
+		set.fds[2], CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET + 17), 0);
+	memset(&observed, 0xa5, sizeof(observed));
+	memset(&zero, 0, sizeof(zero));
+	UT_ASSERT_EQ(cluster_qvotec_test_undo_root_descriptor_read(
+					 set.fds, PGSA_TEST_DISKS,
+					 UINT64_C(0x0123456789abcdef),
+					 CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &observed,
+					 &observed_bitmap),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
+	UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(observed)), 0);
+	UT_ASSERT_EQ(observed_bitmap, UINT8_C(0));
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgrd_majority_read_same_incarnation_conflict_holds)
+{
+	PgsaDiskSet set;
+	ClusterUndoRootDescriptorV1 observed;
+	ClusterUndoRootDescriptorV1 zero;
+	uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 conflict[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 observed_bitmap = UINT8_C(0xa5);
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgrd_test_image(CLUSTER_UNDO_ROOT_KIND_SHARED, -1, 0x93,
+						   desired));
+	UT_ASSERT(pgrd_test_image(CLUSTER_UNDO_ROOT_KIND_SHARED, -1, 0x94,
+						   conflict));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT_EQ(cluster_voting_disk_write_raw_slot_at(
+						 set.fds[i], CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET,
+						 i == 2 ? conflict : desired),
+					 CLUSTER_VOTING_DISK_IO_OK);
+	memset(&observed, 0xa5, sizeof(observed));
+	memset(&zero, 0, sizeof(zero));
+	UT_ASSERT_EQ(cluster_qvotec_test_undo_root_descriptor_read(
+					 set.fds, PGSA_TEST_DISKS,
+					 UINT64_C(0x0123456789abcdef),
+					 CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &observed,
+					 &observed_bitmap),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
+	UT_ASSERT_EQ(memcmp(&observed, &zero, sizeof(observed)), 0);
+	UT_ASSERT_EQ(observed_bitmap, UINT8_C(0));
 	pgsa_disk_set_close(&set);
 }
 
@@ -2478,7 +2553,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(48);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -2506,6 +2581,8 @@ main(void)
 	UT_RUN(test_pgrd_postwrite_one_of_three_exact_does_not_commit);
 	UT_RUN(test_pgrd_local_node_127_uses_last_frozen_slot);
 	UT_RUN(test_pgrd_majority_read_requires_two_exact_images);
+	UT_RUN(test_pgrd_majority_read_short_member_holds);
+	UT_RUN(test_pgrd_majority_read_same_incarnation_conflict_holds);
 	UT_RUN(test_pgsa_01_expected_majority_plus_stale_commits_desired);
 	UT_RUN(test_pgsa_02_generation_mismatch_is_conflict_without_mutation);
 	UT_RUN(test_pgsa_03_source_mismatch_is_conflict_without_mutation);

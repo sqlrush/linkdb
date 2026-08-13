@@ -961,7 +961,7 @@ qvotec_undo_root_descriptor_read_fds(
 			continue;
 		}
 		if (read_state != CLUSTER_VOTING_DISK_RAW_READ_FULL)
-			continue;
+			return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 		states[i] = cluster_undo_root_descriptor_decode(
 			images[i], system_identifier, &descriptors[i]);
 		if (states[i] == CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED)
@@ -970,6 +970,22 @@ qvotec_undo_root_descriptor_read_fds(
 				 && descriptors[i].root_kind == root_kind
 				 && descriptors[i].owner_node == owner_node)
 			valid[i] = true;
+		else
+			return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+	}
+
+	for (i = 0; i < n_disks; i++) {
+		int j;
+
+		if (states[i] != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID)
+			continue;
+		for (j = i + 1; j < n_disks; j++) {
+			if (states[j] == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+				&& descriptors[i].descriptor_incarnation
+					   == descriptors[j].descriptor_incarnation
+				&& memcmp(images[i], images[j], sizeof(images[i])) != 0)
+				return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+		}
 	}
 
 	for (i = 0; i < n_disks; i++) {
