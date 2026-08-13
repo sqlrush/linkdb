@@ -20,7 +20,11 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_epoch_ballot.h"
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
@@ -902,11 +906,115 @@ r4_close_source_admission(uint64 generation)
 }
 
 static ClusterSemanticActivationResult
-r4_zero_fail_closed(uint64 generation, ClusterSemanticZeroProof *proof)
+r4_source_logical_debt_zero(uint64 generation, ClusterSemanticZeroProof *proof)
 {
-	(void)generation;
-	(void)proof;
-	return CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+	SemanticActivationAdmissionSnapshot snapshot;
+	uint32 source_debt;
+
+	if (proof == NULL)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	memset(proof, 0, sizeof(*proof));
+
+	if (generation == 0 || !semantic_activation_snapshot(&snapshot)
+		|| snapshot.record_generation != generation
+		|| snapshot.formation_epoch != cluster_epoch_get_current()
+		|| !snapshot.transition_closed
+		|| (snapshot.active_bits
+			& CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1) != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+
+	source_debt = pg_atomic_read_u32(
+		&SemanticActivationShmem
+			 ->inflight[CLUSTER_SEMANTIC_SOURCE_SIDE][0]);
+	if (source_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+
+	/* Closed admission prevents a new source owner after the zero sample;
+	 * re-sample the complete authority tuple before exposing the proof. */
+	if (!semantic_activation_snapshot(&snapshot)
+		|| snapshot.record_generation != generation
+		|| snapshot.formation_epoch != cluster_epoch_get_current()
+		|| !snapshot.transition_closed
+		|| (snapshot.active_bits
+			& CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1) != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	if (pg_atomic_read_u32(
+			&SemanticActivationShmem
+				 ->inflight[CLUSTER_SEMANTIC_SOURCE_SIDE][0])
+		!= 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+
+	proof->record_generation = generation;
+	proof->debt_count = 0;
+	proof->sample_digest = 0;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+/*
+ * D4's generation-bound transport proof is one fail-closed conjunction:
+ * closed admission and zero TARGET debt, the exact worker-0 drain ACK plus
+ * four-slot LMON reclaim, no R4 route record, and no live R4 requester slot.
+ * The callback owns no new shared state; every sample comes from the existing
+ * generation/incarnation-bound owners.
+ */
+static ClusterSemanticActivationResult
+r4_source_transport_zero(uint64 generation, ClusterSemanticZeroProof *proof)
+{
+	SemanticActivationAdmissionSnapshot snapshot;
+	ClusterLmsSharedState *lms_state;
+	uint64 worker_incarnation = 0;
+	uint32 target_debt;
+
+	if (proof == NULL)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	memset(proof, 0, sizeof(*proof));
+
+	if (generation == 0 || !semantic_activation_snapshot(&snapshot)
+		|| snapshot.record_generation != generation
+		|| snapshot.formation_epoch != cluster_epoch_get_current()
+		|| !snapshot.transition_closed)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+
+	target_debt = pg_atomic_read_u32(
+		&SemanticActivationShmem
+			 ->inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0]);
+	if (target_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+
+	lms_state = cluster_lms_shared_state();
+	if (lms_state == NULL
+		|| !cluster_lms_r4_drain_request(
+			lms_state, generation, &worker_incarnation))
+		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+	cluster_lms_wakeup(0);
+	if (!cluster_cr_server_r4_lmon_reclaim_closed(
+			worker_incarnation, generation))
+		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+
+	(void)cluster_gcs_block_dedup_r4_route_purge_closed();
+	if (cluster_gcs_block_dedup_r4_route_count() != 0
+		|| cluster_gcs_block_r4_requester_count() != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+
+	/* Bind the proof to a final coherent gate sample; no partial proof escapes
+	 * if the formation/generation/close edge moved during convergence. */
+	if (!semantic_activation_snapshot(&snapshot)
+		|| snapshot.record_generation != generation
+		|| snapshot.formation_epoch != cluster_epoch_get_current()
+		|| !snapshot.transition_closed)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	target_debt = pg_atomic_read_u32(
+		&SemanticActivationShmem
+			 ->inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0]);
+	if (target_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+
+	proof->record_generation = generation;
+	proof->debt_count = 0;
+	/* The approved contract freezes the field but no cross-node digest
+	 * formula; zero records the all-zero census without inventing authority. */
+	proof->sample_digest = 0;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
 }
 
 static const ClusterSemanticActivationDescriptor r4_descriptor = {
@@ -917,8 +1025,8 @@ static const ClusterSemanticActivationDescriptor r4_descriptor = {
 	.source_available = true,
 	.pre_prepare_readiness = r4_pre_prepare_readiness,
 	.close_source_admission = r4_close_source_admission,
-	.source_logical_debt_zero = r4_zero_fail_closed,
-	.source_transport_zero = r4_zero_fail_closed,
+	.source_logical_debt_zero = r4_source_logical_debt_zero,
+	.source_transport_zero = r4_source_transport_zero,
 	.prepare_target = r4_stage_fail_closed,
 	.apply_target_closed = r4_stage_fail_closed,
 	.revert_source_closed = r4_stage_fail_closed,

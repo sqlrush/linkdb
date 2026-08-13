@@ -192,6 +192,43 @@ typedef struct ClusterGcsBlockBackendBlock {
 	uint64 next_request_id;
 } ClusterGcsBlockBackendBlock;
 
+static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
+
+/*
+ * Count only live requester slots whose closed domain is R4_CR.  LMON uses
+ * this read-only census after admission and transport close; an unavailable
+ * table is deliberately nonzero so missing startup state cannot prove zero.
+ */
+uint64
+cluster_gcs_block_r4_requester_count(void)
+{
+	uint64 count = 0;
+	int backend_id;
+
+	if (gcs_block_backend_blocks == NULL || MaxBackends <= 0)
+		return UINT64_MAX;
+
+	for (backend_id = 0; backend_id < MaxBackends; backend_id++) {
+		ClusterGcsBlockBackendBlock *blk
+			= &gcs_block_backend_blocks[backend_id];
+		int slot_id;
+
+		LWLockAcquire(&blk->lock.lock, LW_SHARED);
+		for (slot_id = 0;
+			 slot_id < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
+			 slot_id++) {
+			const ClusterGcsBlockOutstandingSlot *slot = &blk->slots[slot_id];
+
+			if (slot->in_use
+				&& slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR)
+				count++;
+		}
+		LWLockRelease(&blk->lock.lock);
+	}
+
+	return count;
+}
+
 typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 block_request_count;
 	pg_atomic_uint64 block_reply_count;
@@ -439,7 +476,6 @@ gcs_block_ship_hist_record(TimestampTz started_at)
 		b++;
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->ship_latency_hist[b], 1);
 }
-static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
 
 
 /* ============================================================

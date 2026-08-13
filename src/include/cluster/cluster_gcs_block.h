@@ -2953,6 +2953,8 @@ struct ClusterICEnvelope;
 extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(
 	const struct ClusterICEnvelope *env, const ClusterR4CrRequestPayload *request,
 	ClusterCrBuildReason *reason_out);
+/* LMON close census: live requester slots in the exact R4_CR domain. */
+extern uint64 cluster_gcs_block_r4_requester_count(void);
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_gcs_block_test_r4_request80(const struct ClusterICEnvelope *env,
 											 const void *payload);

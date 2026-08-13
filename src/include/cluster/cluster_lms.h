@@ -392,9 +392,25 @@ extern void LmsMain(void) pg_attribute_noreturn();
  */
 extern void LmsWorkerMain(int worker_id) pg_attribute_noreturn();
 
+/* D4-B LMON/worker0 close handshake over the existing 80-byte control tail. */
+extern bool cluster_lms_r4_drain_request(ClusterLmsSharedState *state,
+									 uint64 generation,
+									 uint64 *worker_incarnation);
+
 #ifdef USE_CLUSTER_UNIT
 extern uint64 cluster_lms_test_publish_r4_worker_incarnation(ClusterLmsSharedState *state,
-													 int worker_id);
+												 int worker_id);
+extern bool cluster_lms_test_r4_drain_request(ClusterLmsSharedState *state,
+											 uint64 generation,
+											 uint64 *worker_incarnation);
+extern bool cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state,
+										 uint64 worker_incarnation,
+										 uint64 generation);
+extern bool cluster_lms_test_r4_drain_ack_matches(ClusterLmsSharedState *state,
+												 uint64 worker_incarnation,
+												 uint64 generation);
+extern bool cluster_lms_test_r4_drain_ack_tick(ClusterLmsSharedState *state,
+											 uint64 worker_incarnation);
 #endif
 
 /*

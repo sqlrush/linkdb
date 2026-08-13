@@ -447,6 +447,15 @@ extern bool cluster_cr_server_r4_land_foreign_undo(
 	const ClusterICEnvelope *env, const GcsBlockReplyHeader *header,
 	const char undo_page[BLCKSZ], const ClusterGcsUndoAuthTrailer *undo_auth);
 
+/* Worker-0 process-local half of the D4 close proof: every retained build
+ * context is canonical empty and no terminal/SHIPPING positive edge remains.
+ * Shared stale-slot recovery remains LMON-only. */
+extern bool cluster_cr_server_r4_worker0_drained(void);
+
+/* LMON-only recovery after the exact current worker0 drain ACK. */
+extern bool cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation,
+												 uint64 generation);
+
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_cr_server_test_reserve_legacy_slot(ClusterLmsCrSlot *slot,
 											uint32 reserved_state);

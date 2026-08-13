@@ -8,8 +8,12 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_epoch_ballot.h"
+#include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_gcs_block_dedup.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
@@ -76,6 +80,24 @@ static int test_wait_sleep_calls;
 static int test_complete_after_wait_sleeps;
 static uint64 test_wait_completion_request_seq;
 static bool test_wait_completion_succeeded;
+static ClusterLmsSharedState test_lms_state;
+static bool test_lms_state_available;
+static bool test_drain_request_succeeds;
+static uint64 test_drain_worker_incarnation;
+static int test_drain_request_calls;
+static uint64 test_drain_request_generation;
+static int test_lms_wakeup_calls;
+static int test_lms_wakeup_worker;
+static bool test_reclaim_succeeds;
+static int test_reclaim_calls;
+static uint64 test_reclaim_worker_incarnation;
+static uint64 test_reclaim_generation;
+static uint64 test_route_purge_result;
+static int test_route_purge_calls;
+static uint64 test_route_count;
+static int test_route_count_calls;
+static uint64 test_requester_count;
+static int test_requester_count_calls;
 
 int MyProcPid = 101;
 int cluster_node_id = 1;
@@ -214,6 +236,63 @@ cluster_reconfig_r4_publish_ready(
 	return false;
 }
 
+ClusterLmsSharedState *
+cluster_lms_shared_state(void)
+{
+	return test_lms_state_available ? &test_lms_state : NULL;
+}
+
+bool
+cluster_lms_r4_drain_request(ClusterLmsSharedState *state, uint64 generation,
+							 uint64 *worker_incarnation)
+{
+	test_drain_request_calls++;
+	test_drain_request_generation = generation;
+	if (!test_drain_request_succeeds || state != &test_lms_state
+		|| worker_incarnation == NULL)
+		return false;
+	*worker_incarnation = test_drain_worker_incarnation;
+	return true;
+}
+
+void
+cluster_lms_wakeup(int worker_id)
+{
+	test_lms_wakeup_calls++;
+	test_lms_wakeup_worker = worker_id;
+}
+
+bool
+cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation,
+										 uint64 generation)
+{
+	test_reclaim_calls++;
+	test_reclaim_worker_incarnation = worker_incarnation;
+	test_reclaim_generation = generation;
+	return test_reclaim_succeeds;
+}
+
+uint64
+cluster_gcs_block_dedup_r4_route_purge_closed(void)
+{
+	test_route_purge_calls++;
+	return test_route_purge_result;
+}
+
+uint64
+cluster_gcs_block_dedup_r4_route_count(void)
+{
+	test_route_count_calls++;
+	return test_route_count;
+}
+
+uint64
+cluster_gcs_block_r4_requester_count(void)
+{
+	test_requester_count_calls++;
+	return test_requester_count;
+}
+
 bool
 cluster_undo_block0_current_startup_fenced_owned(void)
 {
@@ -349,6 +428,24 @@ test_gate_reset(void)
 	test_complete_after_wait_sleeps = 0;
 	test_wait_completion_request_seq = 0;
 	test_wait_completion_succeeded = false;
+	memset(&test_lms_state, 0, sizeof(test_lms_state));
+	test_lms_state_available = true;
+	test_drain_request_succeeds = true;
+	test_drain_worker_incarnation = UINT64_C(8);
+	test_drain_request_calls = 0;
+	test_drain_request_generation = 0;
+	test_lms_wakeup_calls = 0;
+	test_lms_wakeup_worker = -1;
+	test_reclaim_succeeds = false;
+	test_reclaim_calls = 0;
+	test_reclaim_worker_incarnation = 0;
+	test_reclaim_generation = 0;
+	test_route_purge_result = 0;
+	test_route_purge_calls = 0;
+	test_route_count = 0;
+	test_route_count_calls = 0;
+	test_requester_count = 0;
+	test_requester_count_calls = 0;
 	MyProcPid = 101;
 	SemanticActivationShmem = NULL;
 	SemanticActivationUtilityMailbox = NULL;
@@ -1159,6 +1256,178 @@ UT_TEST(test_90_descriptor_uses_the_only_r4a_adapter)
 		= cluster_semantic_activation_r4_descriptor();
 
 	UT_ASSERT(descriptor->pre_prepare_readiness == r4_pre_prepare_readiness);
+}
+
+UT_TEST(test_90aa_r4_logical_zero_requires_exact_closed_source_gate)
+{
+	const ClusterSemanticActivationDescriptor *descriptor
+		= cluster_semantic_activation_r4_descriptor();
+	ClusterSemanticZeroProof proof = {
+		.record_generation = UINT64_MAX,
+		.debt_count = UINT64_MAX,
+		.sample_digest = UINT64_MAX,
+	};
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, false);
+	UT_ASSERT_EQ(descriptor->source_logical_debt_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(0));
+	UT_ASSERT_EQ(proof.debt_count, UINT64_C(0));
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0));
+	UT_ASSERT_EQ(descriptor->source_logical_debt_zero(24, NULL),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+}
+
+UT_TEST(test_90ab_r4_logical_zero_refuses_live_source_debt)
+{
+	const ClusterSemanticActivationDescriptor *descriptor
+		= cluster_semantic_activation_r4_descriptor();
+	ClusterSemanticZeroProof proof;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, true);
+	pg_atomic_write_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0), 1);
+	UT_ASSERT_EQ(descriptor->source_logical_debt_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(0));
+	UT_ASSERT_EQ(proof.debt_count, UINT64_C(0));
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0));
+}
+
+UT_TEST(test_90ac_r4_logical_zero_rechecks_gate_before_proof)
+{
+	const ClusterSemanticActivationDescriptor *descriptor
+		= cluster_semantic_activation_r4_descriptor();
+	ClusterSemanticZeroProof proof;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, true);
+	test_advance_epoch_on_read_barrier = 3;
+	UT_ASSERT_EQ(descriptor->source_logical_debt_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(0));
+	UT_ASSERT_EQ(proof.debt_count, UINT64_C(0));
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0));
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, true);
+	UT_ASSERT_EQ(descriptor->source_logical_debt_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(24));
+	UT_ASSERT_EQ(proof.debt_count, UINT64_C(0));
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0));
+}
+
+UT_TEST(test_90a_r4_transport_zero_requires_exact_closed_gate)
+{
+	const ClusterSemanticActivationDescriptor *descriptor
+		= cluster_semantic_activation_r4_descriptor();
+	ClusterSemanticZeroProof proof = {
+		.record_generation = UINT64_MAX,
+		.debt_count = UINT64_MAX,
+		.sample_digest = UINT64_MAX,
+	};
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, false);
+	UT_ASSERT_EQ(descriptor->source_transport_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(0));
+	UT_ASSERT_EQ(proof.debt_count, UINT64_C(0));
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0));
+	UT_ASSERT_EQ(test_drain_request_calls, 0);
+	UT_ASSERT_EQ(test_reclaim_calls, 0);
+	UT_ASSERT_EQ(test_route_purge_calls, 0);
+	UT_ASSERT_EQ(descriptor->source_transport_zero(24, NULL),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+}
+
+UT_TEST(test_90b_r4_transport_zero_refuses_target_debt_and_missing_drain)
+{
+	const ClusterSemanticActivationDescriptor *descriptor
+		= cluster_semantic_activation_r4_descriptor();
+	ClusterSemanticZeroProof proof;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, true);
+	pg_atomic_write_u32(test_gate_inflight(CLUSTER_SEMANTIC_TARGET_SIDE, 0), 1);
+	UT_ASSERT_EQ(descriptor->source_transport_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
+	UT_ASSERT_EQ(test_drain_request_calls, 0);
+
+	pg_atomic_write_u32(test_gate_inflight(CLUSTER_SEMANTIC_TARGET_SIDE, 0), 0);
+	test_drain_request_succeeds = false;
+	UT_ASSERT_EQ(descriptor->source_transport_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO);
+	UT_ASSERT_EQ(test_drain_request_calls, 1);
+	UT_ASSERT_EQ(test_drain_request_generation, UINT64_C(24));
+	UT_ASSERT_EQ(test_lms_wakeup_calls, 0);
+	UT_ASSERT_EQ(test_reclaim_calls, 0);
+}
+
+UT_TEST(test_90c_r4_transport_zero_refuses_partial_close_conjunction)
+{
+	const ClusterSemanticActivationDescriptor *descriptor
+		= cluster_semantic_activation_r4_descriptor();
+	ClusterSemanticZeroProof proof;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, true);
+	UT_ASSERT_EQ(descriptor->source_transport_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO);
+	UT_ASSERT_EQ(test_lms_wakeup_calls, 1);
+	UT_ASSERT_EQ(test_lms_wakeup_worker, 0);
+	UT_ASSERT_EQ(test_reclaim_calls, 1);
+	UT_ASSERT_EQ(test_reclaim_worker_incarnation, UINT64_C(8));
+	UT_ASSERT_EQ(test_reclaim_generation, UINT64_C(24));
+	UT_ASSERT_EQ(test_route_purge_calls, 0);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(0));
+	UT_ASSERT_EQ(proof.debt_count, UINT64_C(0));
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0));
+
+	test_reclaim_succeeds = true;
+	test_route_count = 1;
+	UT_ASSERT_EQ(descriptor->source_transport_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO);
+	UT_ASSERT_EQ(test_route_purge_calls, 1);
+	UT_ASSERT_EQ(test_route_count_calls, 1);
+	UT_ASSERT_EQ(test_requester_count_calls, 0);
+
+	test_route_count = 0;
+	test_requester_count = 1;
+	UT_ASSERT_EQ(descriptor->source_transport_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO);
+	UT_ASSERT_EQ(test_requester_count_calls, 1);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(0));
+}
+
+UT_TEST(test_90d_r4_transport_zero_publishes_only_full_zero_proof)
+{
+	const ClusterSemanticActivationDescriptor *descriptor
+		= cluster_semantic_activation_r4_descriptor();
+	ClusterSemanticZeroProof proof = {
+		.record_generation = UINT64_MAX,
+		.debt_count = UINT64_MAX,
+		.sample_digest = UINT64_MAX,
+	};
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 24, test_current_epoch, true);
+	test_reclaim_succeeds = true;
+	test_route_purge_result = 3;
+	UT_ASSERT_EQ(descriptor->source_transport_zero(24, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(test_drain_request_calls, 1);
+	UT_ASSERT_EQ(test_drain_request_generation, UINT64_C(24));
+	UT_ASSERT_EQ(test_lms_wakeup_calls, 1);
+	UT_ASSERT_EQ(test_reclaim_calls, 1);
+	UT_ASSERT_EQ(test_route_purge_calls, 1);
+	UT_ASSERT_EQ(test_route_count_calls, 1);
+	UT_ASSERT_EQ(test_requester_count_calls, 1);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(24));
+	UT_ASSERT_EQ(proof.debt_count, UINT64_C(0));
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0));
 }
 
 UT_TEST(test_91_preflight_refusal_is_before_every_mutation)
@@ -2052,7 +2321,7 @@ UT_TEST(test_116_formation_lmon_consumes_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(144);
+	UT_PLAN(151);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -2155,6 +2424,13 @@ main(void)
 	UT_RUN(test_89h_pre_prepare_consumes_durable_admitted_not_ready_getter);
 	UT_RUN(test_89i_d13_invalidator_rescan_accepts_only_same_settled_closed_head);
 	UT_RUN(test_90_descriptor_uses_the_only_r4a_adapter);
+	UT_RUN(test_90aa_r4_logical_zero_requires_exact_closed_source_gate);
+	UT_RUN(test_90ab_r4_logical_zero_refuses_live_source_debt);
+	UT_RUN(test_90ac_r4_logical_zero_rechecks_gate_before_proof);
+	UT_RUN(test_90a_r4_transport_zero_requires_exact_closed_gate);
+	UT_RUN(test_90b_r4_transport_zero_refuses_target_debt_and_missing_drain);
+	UT_RUN(test_90c_r4_transport_zero_refuses_partial_close_conjunction);
+	UT_RUN(test_90d_r4_transport_zero_publishes_only_full_zero_proof);
 	UT_RUN(test_91_preflight_refusal_is_before_every_mutation);
 	UT_RUN(test_92_preflight_refusal_names_condition_feature);
 	UT_RUN(test_93_preflight_rejects_bad_action_without_effects);

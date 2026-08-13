@@ -48,6 +48,9 @@ extern void cluster_cr_server_test_r4_reset_contexts(void);
 extern bool cluster_cr_server_test_r4_context_matches(
 	uint32 slot_index, bool expect_present, uint64 slot_generation,
 	uint64 builder_incarnation, const ClusterSemanticAdmissionToken *admission);
+extern bool cluster_cr_server_r4_worker0_drained(void);
+extern bool cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation,
+														 uint64 generation);
 extern void cluster_lms_data_plane_close_peer_now(int32 peer_id);
 extern void cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd,
 											  bool connected, bool enabled,
@@ -236,6 +239,8 @@ static uint16 ut_extract_canonical_wrap;
 static int ut_extract_calls;
 static uint32 ut_state_at_extract;
 static ClusterTxLocator ut_extract_locator;
+static bool ut_reclaim_race_on_proof;
+static bool ut_reclaim_race_injected;
 
 bool
 cluster_cr_r4_extract_resident_record(
@@ -567,6 +572,12 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (ut_reclaim_race_on_proof && !ut_reclaim_race_injected
+		&& ut_lms_state != NULL && lock == &ut_lms_state->lwlock
+		&& mode == LW_EXCLUSIVE) {
+		ut_lms_state->r4_controls.data_worker_incarnation[0]++;
+		ut_reclaim_race_injected = true;
+	}
 	ut_lock_acquire_count++;
 	ut_lock = lock;
 	ut_lock_mode = mode;
@@ -800,6 +811,8 @@ reset_submit_fixture(ClusterLmsSharedState *state)
 	ut_extract_calls = 0;
 	ut_state_at_extract = UINT32_MAX;
 	memset(&ut_extract_locator, 0, sizeof(ut_extract_locator));
+	ut_reclaim_race_on_proof = false;
+	ut_reclaim_race_injected = false;
 	cluster_cr_server_test_r4_reset_contexts();
 
 	cluster_cr_server_shmem_register();
@@ -850,6 +863,31 @@ slot_is_canonical_free_with_generation(const ClusterLmsCrSlot *slot, uint64 gene
 	pg_atomic_init_u32(&expected.state, CLUSTER_LMS_CR_FREE);
 	expected.r4.slot_generation = generation;
 	return memcmp(slot, &expected, sizeof(expected)) == 0;
+}
+
+static void
+prepare_reclaimable_r4_slot(ClusterLmsCrSlot *slot, uint32 state,
+							uint64 generation, int worker_id)
+{
+	memset(slot, 0, sizeof(*slot));
+	pg_atomic_init_u32(&slot->state, state);
+	slot->r4.slot_generation = generation;
+	slot->r4.owner.edge_owner_incarnation = UINT64_C(41) + (uint64)worker_id;
+	slot->r4.owner.edge_owner_pid = 7000 + worker_id;
+	slot->r4.owner.edge_owner_worker_id = (uint8)worker_id;
+	slot->r4.owner.edge_owner_role
+		= (uint8)(worker_id == 0 ? B_LMS : B_LMS_WORKER);
+	if (state != CLUSTER_LMS_CR_FILLING)
+		slot->req_kind = (uint8)CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD;
+}
+
+static void
+prepare_exact_drain_ack(ClusterLmsSharedState *state,
+						uint64 worker_incarnation, uint64 generation)
+{
+	state->r4_controls.data_worker_incarnation[0] = worker_incarnation;
+	state->r4_controls.drain_request_generation = generation;
+	state->r4_controls.drain_ack_generation = generation;
 }
 
 static ClusterLmsCrSlot *
@@ -1445,6 +1483,131 @@ UT_TEST(test_r4_worker0_claim_rebinds_owner_and_retains_context)
 	UT_ASSERT(ut_enter_sequence < ut_peer_open_sequence[0]);
 	UT_ASSERT(ut_peer_open_sequence[0] < ut_peer_open_sequence[1]);
 	UT_ASSERT_EQ(ut_wake_calls, 0);
+}
+
+UT_TEST(test_r4_worker0_drain_requires_exact_empty_contexts)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_claim(&state);
+
+	UT_ASSERT(cluster_cr_server_r4_worker0_drained());
+	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_BUILDING);
+	UT_ASSERT(!cluster_cr_server_r4_worker0_drained());
+
+	/* A replacement worker owns no prior process's local context.  The stale
+	 * shared slot remains LMON recovery work after the live-worker ACK. */
+	cluster_cr_server_test_r4_reset_contexts();
+	UT_ASSERT(cluster_cr_server_r4_worker0_drained());
+}
+
+UT_TEST(test_r4_worker0_drain_rejects_every_terminal_and_shipping_state)
+{
+	static const uint32 blocked_states[] = {
+		CLUSTER_LMS_CR_R4_READY_FULL,
+		CLUSTER_LMS_CR_R4_READY_RETRY,
+		CLUSTER_LMS_CR_R4_READY_FAIL,
+		CLUSTER_LMS_CR_R4_CANCELLED,
+		CLUSTER_LMS_CR_R4_SHIPPING
+	};
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot;
+	int i;
+
+	reset_submit_fixture(&state);
+	slot = &ut_cr_server_shared.slots[0];
+	UT_ASSERT(cluster_cr_server_r4_worker0_drained());
+	for (i = 0; i < lengthof(blocked_states); i++) {
+		pg_atomic_write_u32(&slot->state, blocked_states[i]);
+		UT_ASSERT(!cluster_cr_server_r4_worker0_drained());
+	}
+	pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_R4_RECLAIMING);
+	UT_ASSERT(cluster_cr_server_r4_worker0_drained());
+}
+
+UT_TEST(test_r4_lmon_reclaim_requires_exact_ack_then_canonicalizes_all_slots)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot0;
+	ClusterLmsCrSlot *slot1;
+	ClusterLmsCrSlot *slot2;
+	ClusterR4CrOwnerStamp slot0_owner;
+
+	reset_submit_fixture(&state);
+	slot0 = &ut_cr_server_shared.slots[0];
+	slot1 = &ut_cr_server_shared.slots[1];
+	slot2 = &ut_cr_server_shared.slots[2];
+	prepare_reclaimable_r4_slot(slot0, CLUSTER_LMS_CR_FILLING, 1, 2);
+	slot0_owner = slot0->r4.owner;
+	prepare_reclaimable_r4_slot(slot1, CLUSTER_LMS_CR_R4_QUEUED, 2, 3);
+	memset(slot2, 0xa5, sizeof(*slot2));
+	pg_atomic_init_u32(&slot2->state, CLUSTER_LMS_CR_R4_RECLAIMING);
+	slot2->r4.slot_generation = 3;
+	prepare_exact_drain_ack(&state, UINT64_C(8), UINT64_C(17));
+
+	UT_ASSERT(cluster_cr_server_r4_lmon_reclaim_closed(
+				  UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT_EQ(ut_lock_acquire_count, 1);
+	UT_ASSERT_EQ(ut_lock_release_count, 1);
+	UT_ASSERT(ut_lock == &state.lwlock);
+	UT_ASSERT_EQ(ut_lock_mode, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(ut_state_at_lock_release, CLUSTER_LMS_CR_R4_RECLAIMING);
+	UT_ASSERT_EQ(ut_generation_at_lock_release, UINT64_C(1));
+	UT_ASSERT_EQ(memcmp(&ut_owner_at_lock_release, &slot0_owner,
+						 sizeof(slot0_owner)), 0);
+	UT_ASSERT(slot_is_canonical_free_with_generation(slot0, 1));
+	UT_ASSERT(slot_is_canonical_free_with_generation(slot1, 2));
+	UT_ASSERT(slot_is_canonical_free_with_generation(slot2, 3));
+	UT_ASSERT(slot_is_canonical_free_with_generation(
+				  &ut_cr_server_shared.slots[3], 0));
+}
+
+UT_TEST(test_r4_lmon_reclaim_rechecks_ack_inside_exclusive_claim_window)
+{
+	ClusterLmsSharedState state;
+	UtClusterCrServerShared before;
+	ClusterLmsCrSlot *slot;
+
+	reset_submit_fixture(&state);
+	slot = &ut_cr_server_shared.slots[0];
+	prepare_reclaimable_r4_slot(slot, CLUSTER_LMS_CR_R4_QUEUED, 1, 2);
+	before = ut_cr_server_shared;
+	prepare_exact_drain_ack(&state, UINT64_C(8), UINT64_C(17));
+	ut_reclaim_race_on_proof = true;
+
+	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(
+				   UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(ut_reclaim_race_injected);
+	UT_ASSERT_EQ(state.r4_controls.data_worker_incarnation[0], UINT64_C(9));
+	UT_ASSERT_EQ(memcmp(&ut_cr_server_shared, &before, sizeof(before)), 0);
+	UT_ASSERT_EQ(ut_lock_acquire_count, 1);
+	UT_ASSERT_EQ(ut_lock_release_count, 1);
+	UT_ASSERT(ut_lock == &state.lwlock);
+	UT_ASSERT_EQ(ut_lock_mode, LW_EXCLUSIVE);
+}
+
+UT_TEST(test_r4_lmon_reclaim_refuses_unproved_or_legacy_slot_without_mutation)
+{
+	ClusterLmsSharedState state;
+	UtClusterCrServerShared before;
+	ClusterLmsCrSlot *slot;
+
+	reset_submit_fixture(&state);
+	slot = &ut_cr_server_shared.slots[0];
+	prepare_reclaimable_r4_slot(slot, CLUSTER_LMS_CR_R4_QUEUED, 1, 2);
+	before = ut_cr_server_shared;
+	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(
+				   UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(memcmp(&ut_cr_server_shared, &before, sizeof(before)) == 0);
+
+	reset_submit_fixture(&state);
+	slot = &ut_cr_server_shared.slots[0];
+	pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_FILLING);
+	before = ut_cr_server_shared;
+	prepare_exact_drain_ack(&state, UINT64_C(8), UINT64_C(17));
+	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(
+				   UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(memcmp(&ut_cr_server_shared, &before, sizeof(before)) == 0);
 }
 
 /* A queued all-local identity is re-proved from worker 0's freshly entered
@@ -2358,7 +2521,7 @@ UT_TEST(test_all_four_legacy_submitters_use_common_reserver)
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(36);
 	UT_RUN(test_free_to_pending_canonicalizes_owner_under_lms_lock);
 	UT_RUN(test_free_to_filling_uses_same_proof_window);
 	UT_RUN(test_busy_slot_preserves_winner_owner_stamp);
@@ -2370,6 +2533,11 @@ main(void)
 	UT_RUN(test_r4_submit_final_recheck_failure_canonicalizes_before_free);
 	UT_RUN(test_r4_worker0_claim_peer_refusal_preserves_queued_slot);
 	UT_RUN(test_r4_worker0_claim_rebinds_owner_and_retains_context);
+	UT_RUN(test_r4_worker0_drain_requires_exact_empty_contexts);
+	UT_RUN(test_r4_worker0_drain_rejects_every_terminal_and_shipping_state);
+	UT_RUN(test_r4_lmon_reclaim_requires_exact_ack_then_canonicalizes_all_slots);
+	UT_RUN(test_r4_lmon_reclaim_rechecks_ack_inside_exclusive_claim_window);
+	UT_RUN(test_r4_lmon_reclaim_refuses_unproved_or_legacy_slot_without_mutation);
 	UT_RUN(test_r4_worker0_claim_all_local_uses_token_without_peer_matcher);
 	UT_RUN(test_r4_worker0_build_step_publishes_ready_full);
 	UT_RUN(test_r4_worker0_build_step_publishes_one_need_undo);

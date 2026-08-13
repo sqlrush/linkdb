@@ -322,6 +322,42 @@ admitted_done:
 static ClusterCrServerShared *CrServerShared = NULL;
 static ClusterR4CrWorkerContext CrServerR4Contexts[CLUSTER_LMS_CR_SLOTS];
 
+/*
+ * This is deliberately only worker 0's process-local half of the close
+ * proof.  Stale nonterminal shared slots belong to LMON's later proved
+ * RECLAIMING/FREE edge; worker 0 merely proves that it retains no local
+ * context and has finished every terminal/SHIPPING positive edge.
+ */
+bool
+cluster_cr_server_r4_worker0_drained(void)
+{
+	ClusterR4CrWorkerContext zero;
+	int i;
+
+	if (CrServerShared == NULL)
+		return false;
+
+	memset(&zero, 0, sizeof(zero));
+	for (i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		uint32 state = pg_atomic_read_u32(&CrServerShared->slots[i].state);
+
+		if (memcmp(&CrServerR4Contexts[i], &zero, sizeof(zero)) != 0)
+			return false;
+		switch (state) {
+			case CLUSTER_LMS_CR_R4_READY_FULL:
+			case CLUSTER_LMS_CR_R4_READY_RETRY:
+			case CLUSTER_LMS_CR_R4_READY_FAIL:
+			case CLUSTER_LMS_CR_R4_CANCELLED:
+			case CLUSTER_LMS_CR_R4_SHIPPING:
+				return false;
+			default:
+				break;
+		}
+	}
+
+	return true;
+}
+
 static Size
 cluster_cr_server_shmem_size(void)
 {
@@ -724,6 +760,144 @@ cr_server_bytes_zero(const void *ptr, Size size)
 
 	for (i = 0; i < size; i++) {
 		if (bytes[i] != 0)
+			return false;
+	}
+	return true;
+}
+
+static bool
+cr_server_r4_reclaimable_slot(const ClusterLmsCrSlot *slot, uint32 state,
+							  const ClusterLmsSharedState *lms_state,
+							  bool live_close_proved)
+{
+	const ClusterR4CrOwnerStamp *owner;
+	uint64 current_incarnation;
+	uint8 expected_role;
+
+	if (slot == NULL || lms_state == NULL)
+		return false;
+	if (state == CLUSTER_LMS_CR_FREE)
+		return true;
+	if (slot->r4.slot_generation == 0)
+		return false;
+	if (state == CLUSTER_LMS_CR_R4_RECLAIMING)
+		return true;
+	if (state != CLUSTER_LMS_CR_FILLING
+		&& (state < CLUSTER_LMS_CR_R4_QUEUED
+			|| state > CLUSTER_LMS_CR_R4_SHIPPING))
+		return false;
+	if (state != CLUSTER_LMS_CR_FILLING
+		&& slot->req_kind != (uint8)CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD)
+		return false;
+
+	owner = &slot->r4.owner;
+	if (owner->edge_owner_worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return false;
+	expected_role = (uint8)(owner->edge_owner_worker_id == 0 ? B_LMS : B_LMS_WORKER);
+	if (owner->edge_owner_incarnation == 0 || owner->edge_owner_pid <= 0
+		|| owner->edge_owner_role != expected_role
+		|| !cr_server_bytes_zero(owner->reserved, sizeof(owner->reserved)))
+		return false;
+
+	current_incarnation = lms_state->r4_controls.data_worker_incarnation[
+		owner->edge_owner_worker_id];
+	if (state == CLUSTER_LMS_CR_FILLING
+		|| state == CLUSTER_LMS_CR_R4_QUEUED) {
+		if (owner->builder_incarnation != 0 || owner->builder_pid != 0)
+			return false;
+		return live_close_proved
+			   || current_incarnation != owner->edge_owner_incarnation;
+	}
+	if (owner->builder_incarnation == 0 || owner->builder_pid <= 0
+		|| owner->builder_worker_id != 0)
+		return false;
+	current_incarnation
+		= lms_state->r4_controls.data_worker_incarnation[owner->builder_worker_id];
+	return live_close_proved
+		   || current_incarnation != owner->builder_incarnation;
+}
+
+/*
+ * LMON's sole closed/dead recovery edge.  Preflight the complete four-slot
+ * image before the first mutation, then claim each R4 slot through state 15,
+ * canonicalize every reusable byte while preserving the no-reuse generation,
+ * and require four FREE publications before reporting zero.
+ */
+bool
+cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation,
+									 uint64 generation)
+{
+	ClusterLmsSharedState *lms_state;
+	bool claimed = false;
+	bool live_close_proved;
+	int i;
+
+	if (CrServerShared == NULL || worker_incarnation == 0 || generation == 0)
+		return false;
+	lms_state = cluster_lms_shared_state();
+	if (lms_state == NULL)
+		return false;
+
+	LWLockAcquire(&lms_state->lwlock, LW_EXCLUSIVE);
+	live_close_proved
+		= lms_state->r4_controls.data_worker_incarnation[0]
+			  == worker_incarnation
+		  && lms_state->r4_controls.drain_request_generation == generation
+		  && lms_state->r4_controls.drain_ack_generation == generation;
+	if (!live_close_proved)
+		goto release_proof_lock;
+
+	for (i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
+		uint32 state = pg_atomic_read_u32(&slot->state);
+
+		if (!cr_server_r4_reclaimable_slot(
+				slot, state, lms_state, live_close_proved))
+			goto release_proof_lock;
+	}
+
+	for (i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
+		uint32 state = pg_atomic_read_u32(&slot->state);
+		uint32 expected;
+
+		if (state == CLUSTER_LMS_CR_FREE
+			|| state == CLUSTER_LMS_CR_R4_RECLAIMING)
+			continue;
+		expected = state;
+		if (!pg_atomic_compare_exchange_u32(
+				&slot->state, &expected, CLUSTER_LMS_CR_R4_RECLAIMING))
+			goto release_proof_lock;
+	}
+	claimed = true;
+
+release_proof_lock:
+	LWLockRelease(&lms_state->lwlock);
+	if (!claimed)
+		return false;
+
+	for (i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
+		uint32 state = pg_atomic_read_u32(&slot->state);
+		uint32 expected;
+		uint64 slot_generation;
+
+		if (state == CLUSTER_LMS_CR_FREE)
+			continue;
+		if (state != CLUSTER_LMS_CR_R4_RECLAIMING)
+			return false;
+		slot_generation = slot->r4.slot_generation;
+		cr_server_r4_canonicalize_unpublished(slot, slot_generation);
+		pg_write_barrier();
+		expected = CLUSTER_LMS_CR_R4_RECLAIMING;
+		if (!pg_atomic_compare_exchange_u32(
+				&slot->state, &expected, CLUSTER_LMS_CR_FREE))
+			return false;
+	}
+
+	for (i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		if (pg_atomic_read_u32(&CrServerShared->slots[i].state)
+			!= CLUSTER_LMS_CR_FREE)
 			return false;
 	}
 	return true;

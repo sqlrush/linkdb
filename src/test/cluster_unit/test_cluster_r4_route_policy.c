@@ -70,6 +70,7 @@ extern bool cluster_gcs_block_test_snapshot_r4_requester_slot(
 	int32 *expected_master_node_out, ClusterGcsBlockDirectState *direct_state_out,
 	bool *direct_target_prepared_out);
 extern bool cluster_gcs_block_test_release_r4_requester_slot(void);
+extern uint64 cluster_gcs_block_r4_requester_count(void);
 extern bool cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn,
 											 int32 real_master_node,
 											 char dst_page[GCS_BLOCK_DATA_SIZE]);
@@ -1790,6 +1791,21 @@ UT_TEST(test_r4_requester_arm_selects_closed_domain_and_releases_cleanly)
 	UT_ASSERT(!direct_target_prepared);
 }
 
+UT_TEST(test_r4_requester_count_tracks_only_live_r4_domain_slots)
+{
+	BufferTag tag = route_test_tag();
+	uint64 request_id = 0;
+	int saved_max_backends = MaxBackends;
+
+	MaxBackends = 1;
+	UT_ASSERT(cluster_gcs_block_test_r4_requester_arm(
+		tag, UT_FORMATION_EPOCH, UT_MASTER_NODE, UINT64_C(1), &request_id));
+	UT_ASSERT_EQ(cluster_gcs_block_r4_requester_count(), UINT64_C(1));
+	UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+	UT_ASSERT_EQ(cluster_gcs_block_r4_requester_count(), UINT64_C(0));
+	MaxBackends = saved_max_backends;
+}
+
 /* The first executable requester leg is deliberately remote: an exact R4
  * slot is visible before REQUEST80 staging, a remote holder's status 21 is
  * consumed into scratch only, and the slot domain is cleared on return. */
@@ -3127,7 +3143,7 @@ UT_TEST(test_forward96_proof_epoch_mismatch_is_consumed_without_holder_submit)
 int
 main(void)
 {
-	UT_PLAN(85);
+	UT_PLAN(86);
 	UT_RUN(test_01_null_authority_is_protocol);
 	UT_RUN(test_02_null_output_is_protocol);
 	UT_RUN(test_03_canonical_n_has_no_holder);
@@ -3186,6 +3202,7 @@ main(void)
 	UT_RUN(test_r4_reply_decoder_checks_minimum_length_before_header_read);
 	UT_RUN(test_r4_full_reply_lands_once_in_armed_r4_slot);
 	UT_RUN(test_r4_requester_arm_selects_closed_domain_and_releases_cleanly);
+	UT_RUN(test_r4_requester_count_tracks_only_live_r4_domain_slots);
 	UT_RUN(test_r4_remote_requester_arms_request80_waits_full_and_releases);
 	UT_RUN(test_r4_requester_status25_releases_then_retries_with_fresh_id);
 	UT_RUN(test_r4_requester_status26_fails_closed_without_retry_and_cleans_slot);
