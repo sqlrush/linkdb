@@ -124,10 +124,9 @@ typedef struct ClusterWalStateSlot {
 								 * full_page_writes on->off path; never auto
 								 * cleared.  Any merge-set thread set -> 53RA3
 								 * (§3.3d.3). */
-	uint64 merge_recovered_lsn; /* 72: recovery authority (§3.3c) -- own-LSN
-								 * skip bound for the candidate's later self
-								 * recovery.  Writer: coordinator; owner
-								 * clears at RUNNING publish. */
+	uint64 merge_recovered_lsn; /* 72: retained on-disk compatibility bytes;
+								 * historical nonzero values are diagnostic-only
+								 * and semantic zero to recovery readers. */
 	char _reserved[424];		/* 80: remaining headroom */
 	uint32 crc;					/* crc32c over bytes [0, 504) */
 	char _pad_508[4];
@@ -151,6 +150,45 @@ typedef enum ClusterWalSlotVerdict {
 	CLUSTER_WAL_SLOT_CORRUPT, /* bad magic/version/crc/self-description */
 	CLUSTER_WAL_SLOT_FOREIGN, /* well-formed but unexpected node identity */
 } ClusterWalSlotVerdict;
+
+/* RF A1 frozen fresh-image update masks. */
+typedef enum ClusterWalStateUpdateKind {
+	CLUSTER_WAL_STATE_UPDATE_ACTIVE = 1,
+	CLUSTER_WAL_STATE_UPDATE_TELEMETRY,
+	CLUSTER_WAL_STATE_UPDATE_CHECKPOINT,
+	CLUSTER_WAL_STATE_UPDATE_FPW_STICKY,
+	CLUSTER_WAL_STATE_UPDATE_STOPPED,
+} ClusterWalStateUpdateKind;
+
+typedef struct ClusterWalStateUpdate {
+	ClusterWalStateUpdateKind kind;
+	uint32 tli;
+	int64 started_at;
+	int64 last_updated;
+	uint64 highest_lsn;
+	uint64 highest_scn;
+	uint64 checkpoint_redo_lsn;
+	uint32 refresh_interval_ms;
+} ClusterWalStateUpdate;
+
+typedef enum ClusterWalStateUpdateResult {
+	CLUSTER_WAL_STATE_UPDATE_OK = 0,
+	CLUSTER_WAL_STATE_UPDATE_NOOP,
+	CLUSTER_WAL_STATE_UPDATE_DISABLED,
+	CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE,
+	CLUSTER_WAL_STATE_UPDATE_INVALID,
+	CLUSTER_WAL_STATE_UPDATE_IO_ERROR,
+	CLUSTER_WAL_STATE_UPDATE_EMPTY,
+	CLUSTER_WAL_STATE_UPDATE_CORRUPT,
+	CLUSTER_WAL_STATE_UPDATE_FOREIGN,
+	CLUSTER_WAL_STATE_UPDATE_WRONG_STATE,
+	CLUSTER_WAL_STATE_UPDATE_POSTREAD_MISMATCH,
+} ClusterWalStateUpdateResult;
+
+typedef enum ClusterWalStateCfMode {
+	CLUSTER_WAL_STATE_CF_ACQUIRE_X = 0,
+	CLUSTER_WAL_STATE_CF_BORROW_X,
+} ClusterWalStateCfMode;
 
 /* ---- pure helpers (header-only; unit-testable, no backend deps) ---- */
 
@@ -281,6 +319,180 @@ cluster_wal_state_slot_classify(const ClusterWalStateSlot *s, uint16 expect_thre
 	return v;
 }
 
+/*
+ * Validate one complete registry image.  W1 frontend finalization and the
+ * runtime read-only gate share this byte predicate so neither can accept a
+ * header-only image or skip a corrupt neighbour slot.
+ */
+static inline bool
+cluster_wal_state_image_validate(const void *image, size_t image_size, uint16 *bad_thread_out,
+								 const char **reason_out)
+{
+	const unsigned char *bytes = (const unsigned char *)image;
+	const char *reason = NULL;
+	uint16 bad_thread = 0;
+	ClusterWalStateHeader header;
+	size_t i;
+
+	if (image == NULL)
+		reason = "null image";
+	else if (image_size != CLUSTER_WAL_STATE_FILE_SIZE)
+		reason = "unexpected size";
+	else {
+		memcpy(&header, bytes, sizeof(header));
+		if (cluster_wal_state_header_validate(&header, &reason)) {
+			for (i = 0; i < CLUSTER_WAL_STATE_SLOT_COUNT; i++) {
+				ClusterWalStateSlot slot;
+				ClusterWalSlotVerdict verdict;
+				const char *slot_reason = NULL;
+
+				memcpy(&slot, bytes + CLUSTER_WAL_STATE_SLOT_SIZE * (i + 1), sizeof(slot));
+				verdict = cluster_wal_state_slot_classify(&slot, (uint16)(i + 1), -1,
+												 &slot_reason);
+				if (verdict != CLUSTER_WAL_SLOT_EMPTY && verdict != CLUSTER_WAL_SLOT_OK) {
+					bad_thread = (uint16)(i + 1);
+					reason = slot_reason != NULL ? slot_reason : "invalid slot";
+					break;
+				}
+				if (verdict == CLUSTER_WAL_SLOT_OK
+					&& (slot.node_id < 0 || slot.node_id >= CLUSTER_WAL_STATE_SLOT_COUNT)) {
+					bad_thread = (uint16)(i + 1);
+					reason = "node_id out of range";
+					break;
+				}
+			}
+		}
+	}
+
+	if (bad_thread_out != NULL)
+		*bad_thread_out = bad_thread;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return reason == NULL;
+}
+
+static inline ClusterWalStateUpdateResult
+cluster_wal_state_slot_verdict_to_update_result(ClusterWalSlotVerdict verdict)
+{
+	switch (verdict) {
+	case CLUSTER_WAL_SLOT_OK:
+		return CLUSTER_WAL_STATE_UPDATE_OK;
+	case CLUSTER_WAL_SLOT_EMPTY:
+		return CLUSTER_WAL_STATE_UPDATE_EMPTY;
+	case CLUSTER_WAL_SLOT_CORRUPT:
+		return CLUSTER_WAL_STATE_UPDATE_CORRUPT;
+	case CLUSTER_WAL_SLOT_FOREIGN:
+		return CLUSTER_WAL_STATE_UPDATE_FOREIGN;
+	}
+	return CLUSTER_WAL_STATE_UPDATE_CORRUPT;
+}
+
+/*
+ * Derive the exact after-image from the fresh own slot.  ACTIVE alone may
+ * initialize EMPTY and accepts either valid prior state for a new incarnation.
+ * Other updates require ACTIVE; STOPPED is idempotent.
+ */
+static inline ClusterWalStateUpdateResult
+cluster_wal_state_slot_prepare_update(const ClusterWalStateSlot *fresh_before,
+									  uint16 expect_thread, int32 expect_node,
+									  const ClusterWalStateUpdate *update,
+									  ClusterWalStateSlot *expected_after)
+{
+	ClusterWalSlotVerdict verdict;
+
+	if (fresh_before == NULL || update == NULL || expected_after == NULL
+		|| expect_thread < XLP_THREAD_ID_FIRST_REAL || expect_thread > CLUSTER_WAL_THREAD_MAX
+		|| expect_node < 0)
+		return CLUSTER_WAL_STATE_UPDATE_INVALID;
+
+	verdict
+		= cluster_wal_state_slot_classify(fresh_before, expect_thread, expect_node, NULL);
+	if (verdict == CLUSTER_WAL_SLOT_EMPTY) {
+		if (update->kind != CLUSTER_WAL_STATE_UPDATE_ACTIVE)
+			return CLUSTER_WAL_STATE_UPDATE_EMPTY;
+		cluster_wal_state_slot_fill(expected_after, expect_thread, expect_node,
+									CLUSTER_WAL_SLOT_STATE_ACTIVE, update->tli,
+									update->started_at, update->last_updated,
+									update->highest_lsn, update->highest_scn);
+		expected_after->refresh_interval_ms = update->refresh_interval_ms;
+		expected_after->merge_recovered_lsn = 0;
+		expected_after->crc = cluster_wal_state_block_crc(expected_after);
+		return CLUSTER_WAL_STATE_UPDATE_OK;
+	}
+	if (verdict != CLUSTER_WAL_SLOT_OK)
+		return cluster_wal_state_slot_verdict_to_update_result(verdict);
+
+	memcpy(expected_after, fresh_before, sizeof(*expected_after));
+	switch (update->kind) {
+	case CLUSTER_WAL_STATE_UPDATE_ACTIVE:
+		expected_after->magic = CLUSTER_WAL_STATE_SLOT_MAGIC;
+		expected_after->version = CLUSTER_WAL_STATE_VERSION;
+		expected_after->thread_id = expect_thread;
+		expected_after->node_id = expect_node;
+		expected_after->state = CLUSTER_WAL_SLOT_STATE_ACTIVE;
+		expected_after->tli = update->tli;
+		expected_after->started_at = update->started_at;
+		expected_after->last_updated = update->last_updated;
+		expected_after->highest_lsn = update->highest_lsn;
+		expected_after->highest_scn = update->highest_scn;
+		expected_after->refresh_interval_ms = update->refresh_interval_ms;
+		expected_after->merge_recovered_lsn = 0;
+		break;
+	case CLUSTER_WAL_STATE_UPDATE_TELEMETRY:
+		if (fresh_before->state != CLUSTER_WAL_SLOT_STATE_ACTIVE)
+			return CLUSTER_WAL_STATE_UPDATE_WRONG_STATE;
+		expected_after->tli = update->tli;
+		expected_after->last_updated = update->last_updated;
+		expected_after->highest_lsn = update->highest_lsn;
+		expected_after->highest_scn = update->highest_scn;
+		expected_after->refresh_interval_ms = update->refresh_interval_ms;
+		break;
+	case CLUSTER_WAL_STATE_UPDATE_CHECKPOINT:
+		if (fresh_before->state != CLUSTER_WAL_SLOT_STATE_ACTIVE)
+			return CLUSTER_WAL_STATE_UPDATE_WRONG_STATE;
+		expected_after->checkpoint_redo_lsn = update->checkpoint_redo_lsn;
+		break;
+	case CLUSTER_WAL_STATE_UPDATE_FPW_STICKY:
+		if (fresh_before->state != CLUSTER_WAL_SLOT_STATE_ACTIVE)
+			return CLUSTER_WAL_STATE_UPDATE_WRONG_STATE;
+		if (fresh_before->fpw_was_off == 1)
+			return CLUSTER_WAL_STATE_UPDATE_NOOP;
+		expected_after->fpw_was_off = 1;
+		break;
+	case CLUSTER_WAL_STATE_UPDATE_STOPPED:
+		if (fresh_before->state == CLUSTER_WAL_SLOT_STATE_STOPPED)
+			return CLUSTER_WAL_STATE_UPDATE_NOOP;
+		expected_after->state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+		expected_after->tli = update->tli;
+		expected_after->last_updated = update->last_updated;
+		expected_after->highest_lsn = update->highest_lsn;
+		expected_after->highest_scn = update->highest_scn;
+		break;
+	default:
+		return CLUSTER_WAL_STATE_UPDATE_INVALID;
+	}
+
+	expected_after->crc = cluster_wal_state_block_crc(expected_after);
+	return CLUSTER_WAL_STATE_UPDATE_OK;
+}
+
+static inline ClusterWalStateUpdateResult
+cluster_wal_state_slot_verify_postread(const ClusterWalStateSlot *expected_after,
+									   const ClusterWalStateSlot *fresh_observed,
+									   uint16 expect_thread, int32 expect_node)
+{
+	ClusterWalSlotVerdict verdict;
+
+	if (expected_after == NULL || fresh_observed == NULL)
+		return CLUSTER_WAL_STATE_UPDATE_INVALID;
+	verdict = cluster_wal_state_slot_classify(fresh_observed, expect_thread, expect_node, NULL);
+	if (verdict != CLUSTER_WAL_SLOT_OK)
+		return cluster_wal_state_slot_verdict_to_update_result(verdict);
+	if (memcmp(expected_after, fresh_observed, sizeof(*expected_after)) != 0)
+		return CLUSTER_WAL_STATE_UPDATE_POSTREAD_MISMATCH;
+	return CLUSTER_WAL_STATE_UPDATE_OK;
+}
+
 #ifndef FRONTEND
 
 /*
@@ -306,15 +518,14 @@ extern void cluster_wal_state_publish_stopped(void);
 extern void cluster_wal_state_publish_checkpoint_redo(uint64 redo_lsn, uint64 flushed_lsn);
 extern void cluster_wal_state_mark_fpw_off(void);
 
-/* spec-4.5 §3.3c: coordinator records how far it replayed a crashed
- * peer's stream, so the peer's later self-recovery enters post-merged
- * mode (own-LSN-bound skip).  The only legitimate cross-owner write,
- * confined to the merged-recovery window. */
-extern void cluster_wal_state_publish_merge_recovered(uint16 thread_id, uint64 recovered_lsn);
-
 /* cluster_stats periodic refresh (best-effort: LOG-once + counter on
  * failure, never FATAL). */
 extern void cluster_wal_state_refresh_own_slot(void);
+
+/* RF A1 sole formed-registry mutation engine. */
+extern ClusterWalStateUpdateResult cluster_wal_state_update_own(
+	const ClusterWalStateUpdate *update, ClusterWalStateCfMode cf_mode,
+	ClusterWalStateSlot *published_slot);
 
 /* Reader: pread + classify slot `thread_id` (1..128).  Returns the
  * verdict; on OK fills *slot_out. */

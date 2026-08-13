@@ -503,15 +503,24 @@ cluster_cf_enter_bootstrap_window_or_fail(void)
 								"fsync, or turn cluster.controlfile_shared_authority off.")));
 
 	/*
-	 * A single-node cluster (or cluster.enabled off) is trivially the sole
-	 * authority: there is no peer that could concurrently write, so open the
-	 * bootstrap window without needing CSSD to prove sole-liveness.
+	 * Only an exactly one-node declaration may use the boot-local OWNER handoff.
+	 * There is no peer that could concurrently write, so this path needs no CSSD
+	 * sole-liveness proof; zero/unknown and every declared multi-node topology
+	 * remain fail-closed.
 	 */
 	multi_node = cluster_enabled && cluster_conf_node_count() > 1;
 	if (!multi_node) {
-		/* Single-node cluster: trivially the sole authority owner. */
+		if (cluster_conf_node_count() != 1)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("single-node control-file authority requires exactly one declared node")));
+
+		/* Install the boot-local transport before retaining Startup permission. */
+		if (!cluster_cf_owner_eor_install())
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("could not install the single-node control-file OWNER handoff")));
 		cluster_cf_counter_inc(CLUSTER_CF_SINGLE_NODE_AUTHORITY);
-		cluster_cf_set_bootstrap_authority(true);
 		return;
 	}
 

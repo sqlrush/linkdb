@@ -26,7 +26,8 @@ use warnings;
 
 use Exporter 'import';
 our @EXPORT_OK = qw(crc32c slot_offset read_file_raw write_file_raw
-  read_slot_raw patch_byte forge_slot_node_id forge_slot_clone);
+  read_slot_raw patch_byte forge_slot_node_id forge_slot_fpw_sticky forge_slot_clone
+  forge_slot_merge_recovered_lsn);
 
 sub crc32c
 {
@@ -69,7 +70,8 @@ sub write_file_raw
 }
 
 # Fixed-field peek (magic/version/thread_id/node_id/state @0..15,
-# started_at @24, highest_lsn @40, checkpoint_redo_lsn @56).
+# started_at @24, highest_lsn @40, checkpoint_redo_lsn @56,
+# fpw_was_off @68, merge_recovered_lsn @72).
 sub read_slot_raw
 {
 	my ($regfile, $tid) = @_;
@@ -82,6 +84,8 @@ sub read_slot_raw
 	my ($started_at) = unpack('q', substr($buf, 24, 8));
 	my ($highest_lsn) = unpack('Q', substr($buf, 40, 8));
 	my ($checkpoint_redo_lsn) = unpack('Q', substr($buf, 56, 8));
+	my ($fpw_was_off) = unpack('L', substr($buf, 68, 4));
+	my ($merge_recovered_lsn) = unpack('Q', substr($buf, 72, 8));
 	return {
 		magic => $magic,
 		thread_id => $thread_id,
@@ -90,7 +94,9 @@ sub read_slot_raw
 		tli => $tli,
 		started_at => $started_at,
 		highest_lsn => $highest_lsn,
-		checkpoint_redo_lsn => $checkpoint_redo_lsn
+		checkpoint_redo_lsn => $checkpoint_redo_lsn,
+		fpw_was_off => $fpw_was_off,
+		merge_recovered_lsn => $merge_recovered_lsn
 	};
 }
 
@@ -122,6 +128,22 @@ sub forge_slot_node_id
 	return;
 }
 
+# Rewrite slot $tid's FPW-off sticky and recompute a VALID crc.  This
+# exercises StartupXLOG's historical-FPW evidence gate without turning the
+# slot into generic torn/corrupt evidence first.
+sub forge_slot_fpw_sticky
+{
+	my ($regfile, $tid, $sticky) = @_;
+	my $image = read_file_raw($regfile);
+	my $off = slot_offset($tid);
+	my $slot = substr($image, $off, 512);
+	substr($slot, 68, 4) = pack('L', $sticky);
+	substr($slot, 504, 4) = pack('L', crc32c(substr($slot, 0, 504)));
+	substr($image, $off, 512) = $slot;
+	write_file_raw($regfile, $image);
+	return;
+}
+
 # Clone slot $src_tid's content into slot $dst_tid with the identity
 # fields rewritten (thread_id/node_id) and a recomputed VALID crc --
 # fabricates a CRC-valid foreign slot whose timestamps/watermarks are
@@ -135,6 +157,22 @@ sub forge_slot_clone
 	substr($slot, 8, 4) = pack('l', $dst_tid - 1);
 	substr($slot, 504, 4) = pack('L', crc32c(substr($slot, 0, 504)));
 	substr($image, slot_offset($dst_tid), 512) = $slot;
+	write_file_raw($regfile, $image);
+	return;
+}
+
+# Rewrite the legacy merge_recovered_lsn field and recompute a VALID crc.  This
+# models a historical on-disk value without corrupting the slot, so recovery
+# tests can prove that the field has no correctness authority.
+sub forge_slot_merge_recovered_lsn
+{
+	my ($regfile, $tid, $recovered_lsn) = @_;
+	my $image = read_file_raw($regfile);
+	my $off = slot_offset($tid);
+	my $slot = substr($image, $off, 512);
+	substr($slot, 72, 8) = pack('Q<', $recovered_lsn);
+	substr($slot, 504, 4) = pack('L', crc32c(substr($slot, 0, 504)));
+	substr($image, $off, 512) = $slot;
 	write_file_raw($regfile, $image);
 	return;
 }

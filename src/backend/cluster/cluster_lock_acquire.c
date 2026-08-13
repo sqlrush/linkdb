@@ -48,6 +48,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_advisory.h" /* spec-5.5 D8 — UL counters */
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_next_request_id (spec-5.16: node-global request_id) */
@@ -394,6 +395,10 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	 * OK_NATIVE leaves no cluster holder, so the release is native too — the
 	 * same end-state as the lock.c gate-time SOLE->native short-circuit.
 	 */
+	/* RF A1: a formed control-file authority can never fall back native. */
+	if (reject == GES_REJECT_REASON_MASTER_DEAD_NATIVE
+		&& req->resid.type == CLUSTER_CF_RESID_TYPE)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
 	if (reject == GES_REJECT_REASON_MASTER_DEAD_NATIVE)
 		return CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
 

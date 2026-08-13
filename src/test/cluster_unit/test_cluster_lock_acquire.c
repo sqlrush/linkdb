@@ -46,6 +46,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_advisory.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_ges.h" /* GES_REJECT_REASON_* for U6 */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
@@ -1039,6 +1040,30 @@ UT_TEST(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits)
 }
 
 
+/* RF A1 R2: a CF resource can never use dead-master native fallback. */
+UT_TEST(test_cf_s4_dead_master_native_is_nonaffirmative)
+{
+	ClusterLockAcquireRequest req;
+	ClusterLockAcquireResult result;
+	uint32 saved_reject = stub_ges_reject_reason;
+
+	memset(&req, 0, sizeof(req));
+	req.resid.type = CLUSTER_CF_RESID_TYPE;
+	req.lockmode = ExclusiveLock;
+	stub_ges_reject_reason = GES_REJECT_REASON_MASTER_DEAD_NATIVE;
+	result = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)result, (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+
+	/* Control: the existing dead-master native fallback remains unchanged for
+	 * a non-CF resource. */
+	req.resid.type = 0;
+	result = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)result, (int)CLUSTER_LOCK_ACQUIRE_OK_NATIVE);
+
+	stub_ges_reject_reason = saved_reject;
+}
+
+
 /*
  * spec-5.3 — native-probe PG parallel lock-group exemption helper.  Pure
  * pointer/flag logic (no shmem deref), so it is driven directly with distinct
@@ -1114,7 +1139,7 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1129,6 +1154,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_ul_session_advisory_globalize_gate);
 	UT_RUN(test_ul_try_lock_nowait_s4_reject_mapping);
 	UT_RUN(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits);
+	UT_RUN(test_cf_s4_dead_master_native_is_nonaffirmative);
 	UT_RUN(test_native_probe_same_lock_group_exempt);
 	UT_RUN(test_s5_not_found_benign_narrow);
 

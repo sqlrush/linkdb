@@ -368,6 +368,13 @@ static pid_t SinvalBcastPID = 0;
  * primitives in place.  Phase 4 driver flips this true once D8 lands.
  */
 static bool qvotec_spawn_enabled = false;
+
+static bool
+cluster_registry_holds_admission(void)
+{
+	return cluster_enabled && cluster_wal_threads_dir != NULL
+		&& cluster_wal_threads_dir[0] != '\0';
+}
 #endif
 
 /* Startup process's status */
@@ -2056,6 +2063,8 @@ ServerLoop(void)
 		 * on every node.
 		 */
 		if (cluster_enabled && cluster_lms_enabled && LmsPID == 0
+			&& (!cluster_registry_holds_admission()
+				|| cluster_current_phase() == CLUSTER_PHASE_RUNNING)
 			&& (pmState == PM_RUN || pmState == PM_HOT_STANDBY))
 			LmsPID = StartLms();
 
@@ -2067,6 +2076,8 @@ ServerLoop(void)
 		 * topology identity).
 		 */
 		if (cluster_enabled && cluster_lms_enabled
+			&& (!cluster_registry_holds_admission()
+				|| cluster_current_phase() == CLUSTER_PHASE_RUNNING)
 			&& (pmState == PM_RUN || pmState == PM_HOT_STANDBY)) {
 			int w;
 
@@ -3321,7 +3332,12 @@ process_pm_child_exit(void)
 			AbortStartTime = 0;
 			ReachedNormalRunning = true;
 			pmState = PM_RUN;
+			/* RF A1: a formed registry admits only after phase4 W2 + checkpoint. */
+#ifdef USE_PGRAC_CLUSTER
+			connsAllowed = !cluster_registry_holds_admission();
+#else
 			connsAllowed = true;
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 			/*
@@ -3343,6 +3359,7 @@ process_pm_child_exit(void)
 			 */
 			cluster_run_phase4_sequence();
 			cluster_finalize_startup_running();
+			connsAllowed = true;
 #endif
 
 			/*
@@ -5638,6 +5655,10 @@ ExitPostmaster(int status)
 static void
 process_pm_pmsignal(void)
 {
+#ifdef USE_PGRAC_CLUSTER
+	bool hold_cluster_ready = cluster_registry_holds_admission();
+#endif
+
 	pending_pm_pmsignal = false;
 
 	ereport(DEBUG2, (errmsg_internal("postmaster received pmsignal signal")));
@@ -5667,7 +5688,11 @@ process_pm_pmsignal(void)
 		 * RECOVERY_STARTED as meaning we're out of startup, and report status
 		 * accordingly.
 		 */
-		if (!EnableHotStandby) {
+		if (!EnableHotStandby
+#ifdef USE_PGRAC_CLUSTER
+			&& !hold_cluster_ready
+#endif
+		) {
 			AddToDataDirLockFile(LOCK_FILE_LINE_PM_STATUS, PM_STATUS_STANDBY);
 #ifdef USE_SYSTEMD
 			sd_notify(0, "READY=1");
@@ -5679,6 +5704,9 @@ process_pm_pmsignal(void)
 
 	if (CheckPostmasterSignal(PMSIGNAL_BEGIN_HOT_STANDBY) && pmState == PM_RECOVERY
 		&& Shutdown == NoShutdown) {
+#ifdef USE_PGRAC_CLUSTER
+		if (!hold_cluster_ready) {
+#endif
 		ereport(LOG, (errmsg("database system is ready to accept read-only connections")));
 
 		/* Report status */
@@ -5687,8 +5715,16 @@ process_pm_pmsignal(void)
 		sd_notify(0, "READY=1");
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+		}
+#endif
+
 		pmState = PM_HOT_STANDBY;
+#ifdef USE_PGRAC_CLUSTER
+		connsAllowed = !hold_cluster_ready;
+#else
 		connsAllowed = true;
+#endif
 
 		/* Some workers may be scheduled to start now */
 		StartWorkerNeeded = true;
