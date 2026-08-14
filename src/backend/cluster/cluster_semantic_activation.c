@@ -312,6 +312,10 @@ static bool semantic_activation_ack_remote_tuple(
 	uint64 current_members_lo, uint64 current_members_hi,
 	uint64 current_epoch, int32 current_coordinator_node,
 	SemanticActivationAckTuple *out) pg_attribute_unused();
+static bool semantic_activation_ack_self_tuple(
+	int32 local_node_id, uint32 local_capability_word,
+	uint64 transition_epoch, uint64 record_generation,
+	SemanticActivationAckTuple *out) pg_attribute_unused();
 
 static void
 semantic_activation_ack_ingress_init(SemanticActivationAckIngress *ingress)
@@ -525,6 +529,43 @@ semantic_activation_ack_remote_tuple(
 		= (uint64)item->sampled_capability_generation;
 	tuple.transition_epoch = message->transition_epoch;
 	tuple.record_generation = message->record_generation;
+	*out = tuple;
+	return true;
+}
+
+static bool
+semantic_activation_ack_self_tuple(
+	int32 local_node_id, uint32 local_capability_word,
+	uint64 transition_epoch, uint64 record_generation,
+	SemanticActivationAckTuple *out)
+{
+	SemanticActivationAckTuple tuple;
+	uint64 self_incarnation;
+
+	if (out == NULL || local_node_id < 0
+		|| local_node_id >= CLUSTER_MAX_NODES
+		|| record_generation == 0
+		|| (local_capability_word
+			& CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS)
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS)
+		return false;
+	self_incarnation = cluster_qvotec_get_self_incarnation();
+	if (self_incarnation == 0
+		|| cluster_membership_get_state(local_node_id)
+		   != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(local_node_id)
+		   != self_incarnation)
+		return false;
+
+	memset(&tuple, 0, sizeof(tuple));
+	tuple.node_id = (uint32)local_node_id;
+	tuple.boot_id = self_incarnation;
+	tuple.admitted_incarnation = self_incarnation;
+	tuple.control_connection_generation = self_incarnation;
+	tuple.capability_word = local_capability_word;
+	tuple.capability_generation = self_incarnation;
+	tuple.transition_epoch = transition_epoch;
+	tuple.record_generation = record_generation;
 	*out = tuple;
 	return true;
 }

@@ -38,6 +38,7 @@ static int32 cluster_r4_activation_test_membership_node = -1;
 static uint64 cluster_r4_activation_test_membership_floor;
 static ClusterMembershipState cluster_r4_activation_test_membership_state
 	= CLUSTER_MEMBER_MEMBER;
+static uint64 cluster_r4_activation_test_self_incarnation = 1;
 
 void ProcessInterrupts(void);
 
@@ -104,7 +105,7 @@ cluster_qvotec_in_quorum(void)
 uint64
 cluster_qvotec_get_self_incarnation(void)
 {
-	return 1;
+	return cluster_r4_activation_test_self_incarnation;
 }
 
 uint64

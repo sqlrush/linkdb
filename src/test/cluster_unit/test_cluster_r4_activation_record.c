@@ -1760,10 +1760,78 @@ UT_TEST(test_74_lmon_remote_ack_revalidates_every_authority_input)
 	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
 }
 
+UT_TEST(test_75_lmon_self_ack_builds_exact_local_tuple)
+{
+	SemanticActivationAckTuple output;
+	uint32 local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+
+	cluster_r4_activation_test_self_incarnation = 11;
+	cluster_r4_activation_test_membership_node = 0;
+	cluster_r4_activation_test_membership_floor = 11;
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+	memset(&output, 0xa5, sizeof(output));
+
+	UT_ASSERT(semantic_activation_ack_self_tuple(
+		0, local_capability_word, 9, 10, &output));
+	UT_ASSERT_EQ(output.node_id, 0);
+	UT_ASSERT_EQ(output.boot_id, UINT64_C(11));
+	UT_ASSERT_EQ(output.admitted_incarnation, UINT64_C(11));
+	UT_ASSERT_EQ(output.control_connection_generation, UINT64_C(11));
+	UT_ASSERT_EQ(output.capability_word, local_capability_word);
+	UT_ASSERT_EQ(output.capability_generation, UINT64_C(11));
+	UT_ASSERT_EQ(output.transition_epoch, UINT64_C(9));
+	UT_ASSERT_EQ(output.record_generation, UINT64_C(10));
+}
+
+UT_TEST(test_76_lmon_self_ack_is_fail_closed_on_local_drift)
+{
+	SemanticActivationAckTuple output;
+	SemanticActivationAckTuple before;
+	uint32 local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+
+	cluster_r4_activation_test_self_incarnation = 11;
+	cluster_r4_activation_test_membership_node = 0;
+	cluster_r4_activation_test_membership_floor = 11;
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+	memset(&output, 0xa5, sizeof(output));
+	before = output;
+
+	UT_ASSERT(!semantic_activation_ack_self_tuple(
+		-1, local_capability_word, 9, 10, &output));
+	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
+	cluster_r4_activation_test_self_incarnation = 0;
+	UT_ASSERT(!semantic_activation_ack_self_tuple(
+		0, local_capability_word, 9, 10, &output));
+	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
+	cluster_r4_activation_test_self_incarnation = 11;
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_JOINING;
+	UT_ASSERT(!semantic_activation_ack_self_tuple(
+		0, local_capability_word, 9, 10, &output));
+	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+	cluster_r4_activation_test_membership_floor = 12;
+	UT_ASSERT(!semantic_activation_ack_self_tuple(
+		0, local_capability_word, 9, 10, &output));
+	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
+	cluster_r4_activation_test_membership_floor = 11;
+	UT_ASSERT(!semantic_activation_ack_self_tuple(
+		0, local_capability_word
+		   & ~PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1,
+		9, 10, &output));
+	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
+	UT_ASSERT(!semantic_activation_ack_self_tuple(
+		0, local_capability_word, 9, 0, &output));
+	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(74);
+	UT_PLAN(76);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -1838,6 +1906,8 @@ main(void)
 	UT_RUN(test_72_ack_handler_only_enqueues_and_counts_typed_drops);
 	UT_RUN(test_73_lmon_remote_ack_builds_exact_current_tuple);
 	UT_RUN(test_74_lmon_remote_ack_revalidates_every_authority_input);
+	UT_RUN(test_75_lmon_self_ack_builds_exact_local_tuple);
+	UT_RUN(test_76_lmon_self_ack_is_fail_closed_on_local_drift);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
