@@ -1028,22 +1028,38 @@ ges_dispatch_grant_identity(const ClusterGrdGrantIdentity *g, const ClusterResId
  *	pg_advisory_lock() (or any blocking enqueue) on a key mastered here would
  *	false-timeout 53R70 — or hang when cluster.ges_request_timeout_ms = -1.
  *	release_and_drain itself removes the holder, so the caller must NOT also call
- *	release_holder_by_id on this path.
+ *	release_holder_by_id on this path.  The return value is a GES reject reason:
+ *	NONE only after the exact holder was removed under a stable local-master
+ *	routing generation; missing holder, unknown/remastered owner, and invalid
+ *	input are non-affirmative.
  */
-void
+uint32
 cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
 									const struct ClusterGrdHolderId *holder)
 {
 	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	uint64 generation_before;
+	uint64 generation_after;
+	int32 master_before;
+	int32 master_after;
 	int n_granted;
 	int i;
 
 	if (resid == NULL || holder == NULL)
-		return;
+		return GES_REJECT_REASON_TIMEOUT;
 
+	master_before = cluster_grd_lookup_master_gen(resid, &generation_before);
+	if (master_before != cluster_node_id)
+		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
 	n_granted = cluster_grd_release_and_drain(resid, holder, granted, lengthof(granted));
+	if (n_granted < 0)
+		return GES_REJECT_REASON_TIMEOUT;
+	master_after = cluster_grd_lookup_master_gen(resid, &generation_after);
+	if (master_after != cluster_node_id || generation_after != generation_before)
+		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
 	for (i = 0; i < n_granted; i++)
 		ges_dispatch_grant_identity(&granted[i], resid);
+	return GES_REJECT_REASON_NONE;
 }
 
 /*
@@ -1390,6 +1406,8 @@ cluster_ges_lmon_drain_work_queue(void)
 			int n_granted;
 
 			n_granted = cluster_grd_release_and_drain(&resid, &holder, granted, lengthof(granted));
+			if (n_granted < 0)
+				n_granted = 0;
 
 			/* Reply GRANT to the original releaser (acks the RELEASE). */
 			{

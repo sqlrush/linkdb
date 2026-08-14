@@ -102,6 +102,8 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 bool cluster_lms_enabled = true;
 bool cluster_lmd_enabled = true;
 static bool stub_lms_ready_for_test = true;
+static int32 stub_master_node = -1;
+static uint32 stub_local_release_result = GES_REJECT_REASON_NONE;
 
 bool
 cluster_lms_is_ready(void)
@@ -379,7 +381,7 @@ cluster_grd_shard_for_resource(const ClusterResId *resid pg_attribute_unused())
 int32
 cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
 {
-	return -1;
+	return stub_master_node;
 }
 
 /* spec-4.6a: the S4-reject diagnostic references the CSSD peer-state view;
@@ -535,10 +537,12 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_
 
 /* spec-5.5 P0 — local-master release drain (no-op in the standalone fixture;
  * the real drain+wake is exercised by cluster_tap t/286). */
-void
+uint32
 cluster_ges_release_and_drain_local(const struct ClusterResId *resid pg_attribute_unused(),
 									const struct ClusterGrdHolderId *holder pg_attribute_unused())
-{}
+{
+	return stub_local_release_result;
+}
 
 /* spec-5.3 — convert send + tm_convert_mode GUC (cluster_lock_acquire.c refs). */
 int cluster_tm_convert_mode = 0; /* CLUSTER_TM_CONVERT_MODE_CONVERT */
@@ -633,6 +637,25 @@ UT_TEST(test_7step_individual_steps_null_req_internal)
 				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
 	UT_ASSERT_EQ((int)cluster_lock_acquire_s7_cleanup(NULL),
 				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+}
+
+UT_TEST(test_s6_local_master_unconfirmed_release_fails_closed)
+{
+	ClusterLockAcquireRequest req;
+	int32 saved_master = stub_master_node;
+	uint32 saved_release_result = stub_local_release_result;
+
+	memset(&req, 0, sizeof(req));
+	stub_master_node = cluster_node_id;
+	stub_local_release_result = GES_REJECT_REASON_TIMEOUT;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	stub_master_node = -1;
+	stub_local_release_result = GES_REJECT_REASON_NONE;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	stub_local_release_result = saved_release_result;
+	stub_master_node = saved_master;
 }
 
 /*
@@ -1139,11 +1162,12 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
 	UT_RUN(test_7step_individual_steps_null_req_internal);
+	UT_RUN(test_s6_local_master_unconfirmed_release_fails_closed);
 	UT_RUN(test_7step_top_level_null_req_s7_cleanup_invoked);
 	UT_RUN(test_7step_top_level_monotonic_forward_no_cleanup_on_success);
 	UT_RUN(test_7step_s4_master_reject_default_deny);

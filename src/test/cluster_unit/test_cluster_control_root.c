@@ -18,6 +18,7 @@
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
@@ -49,6 +50,8 @@ int cluster_node_id = 0;
 static char test_root[MAXPGPATH];
 static char test_wal_root[MAXPGPATH];
 static ClusterCfContractState test_contract = CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
+static int test_node_count = 4;
+static bool test_local_probe = true;
 static bool test_cf_grant = true;
 static bool test_cf_clusterwide = true;
 static bool test_cf_release_confirmed = true;
@@ -140,7 +143,7 @@ GetSystemIdentifier(void)
 int
 cluster_conf_node_count(void)
 {
-	return 4;
+	return test_node_count;
 }
 
 void
@@ -159,6 +162,12 @@ bool
 cluster_cf_storage_write_allowed(ClusterCfContractState state, bool multi_node)
 {
 	return !multi_node || state == CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
+}
+
+bool
+cluster_cf_storage_probe_local(void)
+{
+	return test_local_probe;
 }
 
 bool
@@ -269,6 +278,8 @@ wipe_root_files(void)
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
 	unlink(path);
 	test_contract = CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
+	test_node_count = 4;
+	test_local_probe = true;
 	test_cf_grant = true;
 	test_cf_clusterwide = true;
 	test_cf_release_confirmed = true;
@@ -321,7 +332,9 @@ build_source_wal_state(void)
 	uint8 bytes[CLUSTER_WAL_STATE_FILE_SIZE];
 	ClusterWalStateHeader header;
 	ClusterWalStateSlot slot;
+	ClusterWalThreadClaim claim;
 	char path[MAXPGPATH];
+	char thread_dir[MAXPGPATH];
 
 	memset(bytes, 0, sizeof(bytes));
 	cluster_wal_state_header_fill(&header, INT64_C(1699999999000000));
@@ -334,11 +347,19 @@ build_source_wal_state(void)
 	memcpy(bytes + CLUSTER_WAL_STATE_SLOT_OFFSET(1), &slot, sizeof(slot));
 	snprintf(path, sizeof(path), "%s/%s", test_wal_root, CLUSTER_WAL_STATE_FILENAME);
 	write_all_or_abort(path, bytes, sizeof(bytes));
+	cluster_wal_thread_claim_fill(&claim, 1, 0, INT64_C(1699999999000001));
+	snprintf(thread_dir, sizeof(thread_dir), "%s/thread_1", test_wal_root);
+	if (mkdir(thread_dir, 0700) != 0 && errno != EEXIST)
+		abort();
+	snprintf(path, sizeof(path), "%s/%s", thread_dir,
+			 CLUSTER_WAL_THREAD_CLAIM_FILENAME);
+	write_all_or_abort(path, &claim, sizeof(claim));
 }
 
 static void
 fill_identity(ClusterControlRootIdentity *identity)
 {
+	ClusterWalThreadClaim claim;
 	int i;
 
 	memset(identity, 0, sizeof(*identity));
@@ -351,8 +372,9 @@ fill_identity(ClusterControlRootIdentity *identity)
 	identity->authority_uuid[8] = 0x8a;
 	identity->origin_thread_id = 1;
 	identity->origin_node_id = 0;
-	identity->thread_claim_created_at = INT64_C(1699999999000001);
-	identity->thread_claim_crc32c = UINT32_C(0x12345678);
+	cluster_wal_thread_claim_fill(&claim, 1, 0, INT64_C(1699999999000001));
+	identity->thread_claim_created_at = claim.created_at;
+	identity->thread_claim_crc32c = claim.crc;
 	identity->origin_owner_incarnation = UINT64_C(0x1122334455667788);
 	identity->root_lineage_seq = 1;
 }
@@ -576,6 +598,21 @@ UT_TEST(test_storage_contract_fails_before_cf_or_file_io)
 	UT_ASSERT_EQ(test_durable_rename_calls, 0);
 }
 
+UT_TEST(test_single_node_local_probe_fails_before_cf_or_file_io)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken token;
+
+	wipe_root_files();
+	test_node_count = 1;
+	test_local_probe = false;
+	UT_ASSERT_EQ(create_prepared(&image, &round, &token),
+				 CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	UT_ASSERT_EQ(test_durable_rename_calls, 0);
+}
+
 UT_TEST(test_activate_and_stale_token)
 {
 	ClusterControlRootMigrationImage image;
@@ -638,6 +675,31 @@ UT_TEST(test_activation_rejects_changed_source_wal_bytes)
 	cluster_wal_state_header_fill(&header, INT64_C(1700000000000999));
 	UT_ASSERT_EQ(pwrite(fd, &header, sizeof(header), 0), sizeof(header));
 	close(fd);
+	round_sha256(&round, round_sha);
+	memset(&active, 0xee, sizeof(active));
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &active),
+				 CLUSTER_CONTROL_ROOT_HASH_MISMATCH);
+	UT_ASSERT_EQ(active.file_txn_seq, 0);
+	build_source_wal_state();
+}
+
+UT_TEST(test_activation_rejects_same_node_thread_claim_drift)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken prepared;
+	ClusterControlRootFileToken active;
+	ClusterWalThreadClaim claim;
+	uint8 round_sha[PG_SHA256_DIGEST_LENGTH];
+	char path[MAXPGPATH];
+
+	wipe_root_files();
+	build_source_wal_state();
+	UT_ASSERT_EQ(create_prepared(&image, &round, &prepared), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	cluster_wal_thread_claim_fill(&claim, 1, 0, INT64_C(1699999999000999));
+	snprintf(path, sizeof(path), "%s/thread_1/%s", test_wal_root,
+			 CLUSTER_WAL_THREAD_CLAIM_FILENAME);
+	write_all_or_abort(path, &claim, sizeof(claim));
 	round_sha256(&round, round_sha);
 	memset(&active, 0xee, sizeof(active));
 	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &active),
@@ -795,16 +857,18 @@ main(void)
 {
 	setup_fixture();
 
-	UT_PLAN(15);
+	UT_PLAN(17);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_create_and_read_primary);
 	UT_RUN(test_bootstrap_read_never_returns_authority_token);
 	UT_RUN(test_valid_bak_blocks_corrupt_primary);
 	UT_RUN(test_storage_contract_fails_before_cf_or_file_io);
+	UT_RUN(test_single_node_local_probe_fails_before_cf_or_file_io);
 	UT_RUN(test_activate_and_stale_token);
 	UT_RUN(test_native_cf_hold_cannot_authorize_strong_read);
 	UT_RUN(test_activation_rejects_changed_source_wal_bytes);
+	UT_RUN(test_activation_rejects_same_node_thread_claim_drift);
 	UT_RUN(test_forbidden_patch_rejected_before_cf_and_file_io);
 	UT_RUN(test_lookup_and_revalidate_use_exact_primary_identity);
 	UT_RUN(test_lifecycle_publish_exact_token_cas);

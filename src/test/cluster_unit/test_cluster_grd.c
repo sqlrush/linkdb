@@ -1775,7 +1775,7 @@ UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
 	LOCKTAG src;
 	ClusterResId resid;
 	ClusterGrdEntry *entry = NULL;
-	ClusterGrdHolderId h1, h2;
+	ClusterGrdHolderId h1, h2, missing;
 	ClusterGrdGrantIdentity granted[8];
 	int i;
 
@@ -1802,6 +1802,11 @@ UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
 				 (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
 	cluster_grd_entry_release(entry);
+	missing = h1;
+	missing.request_id++;
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &missing, granted,
+									 lengthof(granted)), -1);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1); /* exact holder retained */
 	(void)cluster_grd_release_and_drain(&resid, &h1, granted, lengthof(granted));
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0); /* empty -> reclaimed */
 

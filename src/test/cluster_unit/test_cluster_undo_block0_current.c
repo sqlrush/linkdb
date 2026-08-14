@@ -376,11 +376,12 @@ cluster_grd_cancel_waiter_by_id_seq(const ClusterResId *resid,
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
-void
+uint32
 cluster_ges_release_and_drain_local(const ClusterResId *resid pg_attribute_unused(),
 									const ClusterGrdHolderId *holder pg_attribute_unused())
 {
 	local_release_calls++;
+	return GES_REJECT_REASON_NONE;
 }
 
 ClusterGrdEntryResult

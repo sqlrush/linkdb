@@ -349,11 +349,25 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 }
 
 static int32 stub_remote_master = -1;
+static uint64 stub_master_generation = 1;
+static bool stub_remaster_on_second_lookup = false;
+static int stub_master_gen_lookup_calls = 0;
+static int stub_release_and_drain_result = 0;
 
 int32
 cluster_grd_lookup_master(const struct ClusterResId *resid pg_attribute_unused())
 {
 	return stub_remote_master >= 0 ? stub_remote_master : cluster_node_id;
+}
+
+int32
+cluster_grd_lookup_master_gen(const struct ClusterResId *resid, uint64 *out_routing_generation)
+{
+	if (out_routing_generation != NULL)
+		*out_routing_generation = stub_master_generation
+			+ (stub_remaster_on_second_lookup && stub_master_gen_lookup_calls > 0 ? 1 : 0);
+	stub_master_gen_lookup_calls++;
+	return cluster_grd_lookup_master(resid);
 }
 
 void
@@ -730,7 +744,7 @@ cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unus
 							  ClusterGrdGrantIdentity *granted_out pg_attribute_unused(),
 							  int max_out pg_attribute_unused())
 {
-	return 0;
+	return stub_release_and_drain_result;
 }
 
 ClusterGrdEntryResult
@@ -1552,10 +1566,40 @@ UT_TEST(test_ges_release_cv_timeout_retransmits)
 	stub_backend_request_ready_after = 0;
 }
 
+UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	int32 saved_node = cluster_node_id;
+
+	memset(&resid, 0, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	cluster_node_id = 0;
+	stub_remote_master = -1;
+	stub_master_generation = 7;
+	stub_master_gen_lookup_calls = 0;
+	stub_remaster_on_second_lookup = false;
+	stub_release_and_drain_result = -1;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_TIMEOUT);
+
+	stub_master_gen_lookup_calls = 0;
+	stub_release_and_drain_result = 0;
+	stub_remaster_on_second_lookup = true;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_MASTER_DEAD_NATIVE);
+
+	stub_master_gen_lookup_calls = 0;
+	stub_remaster_on_second_lookup = false;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_NONE);
+	cluster_node_id = saved_node;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -1578,6 +1622,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait);
 	UT_RUN(test_ges_request_cv_timeout_retransmits);
 	UT_RUN(test_ges_release_cv_timeout_retransmits);
+	UT_RUN(test_ges_local_release_requires_exact_holder_and_stable_master);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

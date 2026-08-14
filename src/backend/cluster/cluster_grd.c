@@ -5623,7 +5623,8 @@ static bool cluster_grd_hashremove_if_still_empty(const ClusterResId *resid);
  *	single FIFO REQUEST waiter is popped.  Stale-epoch converts and waiters are
  *	dropped first (spec-4.6 P0#3 window guard: a grant reply echoing a stale
  *	tuple would be rejected and leak a zombie grant).  Returns the number of
- *	granted identities (each tagged REQUEST or CONVERT) for the caller to route.
+ *	granted identities (each tagged REQUEST or CONVERT) for the caller to route,
+ *	or -1 when the exact holder is absent and no release occurred.
  */
 int
 cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderId *holder,
@@ -5635,13 +5636,14 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 	int n;
 	ClusterGesHandoffSnapshot handoff_snap; /* spec-6.12e1 drain snapshot */
 	bool handoff_armed = false;
+	bool holder_removed = false;
 
 	Assert(resid != NULL && holder != NULL);
 	Assert(granted_out != NULL && max_out > 0);
 
 	lookup_result = cluster_grd_entry_lookup_or_create(resid, false, &entry);
 	if (lookup_result != CLUSTER_GRD_ENTRY_OK || entry == NULL)
-		return 0;
+		return -1;
 
 	SpinLockAcquire(&entry->lock);
 
@@ -5656,8 +5658,14 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 			memset(&entry->holders[entry->ngranted - 1], 0, sizeof(ClusterGrdHolder));
 			entry->ngranted--;
 			entry->generation++;
+			holder_removed = true;
 			break;
 		}
+	}
+	if (!holder_removed) {
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		return -1;
 	}
 
 	/* (2) Drop stale-epoch converts and waiters before granting. */
