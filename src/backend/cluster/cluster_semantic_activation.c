@@ -365,6 +365,8 @@ static bool semantic_activation_ack_lmon_submit_prepare(
 	const SemanticActivationUtilityRequest *request,
 	const SemanticActivationAdmissionSnapshot *snapshot)
 	pg_attribute_unused();
+static bool semantic_activation_ack_lmon_install_prepare(
+	const SemanticActivationUtilityRequest *request) pg_attribute_unused();
 static bool semantic_activation_snapshot(
 	SemanticActivationAdmissionSnapshot *snapshot);
 static SemanticActivationAckIngressResult
@@ -2184,6 +2186,104 @@ semantic_activation_ack_lmon_prepare_cas_active(
 		   != cluster_qvotec_get_self_incarnation())
 		return false;
 	return true;
+}
+
+static bool
+semantic_activation_ack_lmon_install_prepare(
+	const SemanticActivationUtilityRequest *request)
+{
+	ClusterSemanticActivationAckTableV1 before;
+	ClusterSemanticActivationAckTableV1 after;
+	ClusterSemanticActivationRecord desired;
+	SemanticActivationAdmissionSnapshot snapshot;
+	SemanticActivationAdmissionSnapshot current_snapshot;
+	ClusterSemanticActivationResult result;
+	uint64 current_members_lo;
+	uint64 current_members_hi;
+	uint64 current_epoch;
+	uint64 digest;
+	uint32 local_capability_word;
+	int32 current_coordinator_node;
+
+	if (request == NULL || !semantic_activation_snapshot(&snapshot)
+		|| !semantic_activation_ack_lmon_prepare_cas_active(
+			request, &snapshot)
+		|| !cluster_semantic_activation_record_decode(
+			SemanticActivationShmem->record_cas_desired_bytes,
+			&desired, NULL))
+		return false;
+
+	/* The successful projection is idempotent while the utility owner remains
+	 * pending.  In particular, do not rerun the generation-g preflight after
+	 * installing the durable generation-(g+1) PREPARE image. */
+	if (snapshot.transition_closed
+		&& snapshot.active_bits == desired.source_feature_bitmap
+		&& snapshot.record_generation == desired.record_generation
+		&& snapshot.formation_epoch == desired.transition_epoch)
+		return true;
+	if (snapshot.transition_closed
+		|| snapshot.active_bits != request->source_feature_bitmap
+		|| snapshot.record_generation
+		   != request->expected_record_generation
+		|| snapshot.formation_epoch != desired.transition_epoch)
+		return false;
+
+	if (!semantic_activation_record_cas_mailbox_poll_completion(
+			semantic_activation_lmon_prepare_cas_seq, &result))
+		return true;
+	if (result != CLUSTER_SEMANTIC_ACTIVATION_OK
+		|| !semantic_activation_ack_current_authority(
+			cluster_node_id, &current_members_lo, &current_members_hi,
+			&current_epoch, &current_coordinator_node)
+		|| cluster_node_id != 0 || current_coordinator_node != 0
+		|| current_members_lo != desired.admitted_members_lo
+		|| current_members_hi != desired.admitted_members_hi
+		|| current_epoch != desired.transition_epoch
+		|| !semantic_activation_ack_table_snapshot(&before)
+		|| before.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+		|| before.coordinator_node != desired.coordinator_node
+		|| before.round_nonce != request->request_seq
+		|| before.transition_epoch != desired.transition_epoch
+		|| before.record_generation != desired.record_generation
+		|| before.source_feature_bitmap != desired.source_feature_bitmap
+		|| before.target_feature_bitmap != desired.target_feature_bitmap
+		|| before.rollback_feature_bitmap != desired.rollback_feature_bitmap)
+		return false;
+
+	local_capability_word = cluster_ic_local_capability_word();
+	if (!semantic_activation_ack_complete_image_current(
+			&before, current_members_lo, current_members_hi,
+			current_epoch, current_coordinator_node, cluster_node_id,
+			local_capability_word)
+		|| !semantic_activation_ack_sample_digest(&before, &digest)
+		|| digest != desired.capability_sample_digest)
+		return false;
+
+	if (!semantic_activation_snapshot(&current_snapshot)
+		|| current_snapshot.seq != snapshot.seq
+		|| current_snapshot.active_bits != snapshot.active_bits
+		|| current_snapshot.record_generation != snapshot.record_generation
+		|| current_snapshot.formation_epoch != snapshot.formation_epoch
+		|| current_snapshot.transition_closed != snapshot.transition_closed
+		|| !semantic_activation_ack_current_authority(
+			cluster_node_id, &current_members_lo, &current_members_hi,
+			&current_epoch, &current_coordinator_node)
+		|| current_members_lo != desired.admitted_members_lo
+		|| current_members_hi != desired.admitted_members_hi
+		|| current_epoch != desired.transition_epoch
+		|| current_coordinator_node != (int32)desired.coordinator_node
+		|| cluster_ic_local_capability_word() != local_capability_word
+		|| !semantic_activation_ack_table_snapshot(&after)
+		|| memcmp(&before, &after, sizeof(before)) != 0
+		|| !semantic_activation_ack_complete_image_current(
+			&after, current_members_lo, current_members_hi,
+			current_epoch, current_coordinator_node, cluster_node_id,
+			local_capability_word))
+		return false;
+
+	return semantic_activation_lmon_publish_gate(
+		&current_snapshot, desired.source_feature_bitmap,
+		desired.record_generation, desired.transition_epoch, true);
 }
 
 static bool
@@ -4415,6 +4515,15 @@ semantic_activation_lmon_consume_utility(void)
 			&refusal, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE, 0,
 			request.expected_record_generation);
 	} else {
+		if (semantic_activation_lmon_prepare_cas_seq != 0) {
+			if (semantic_activation_ack_lmon_install_prepare(&request))
+				return;
+			semantic_activation_set_refusal(
+				&refusal, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD,
+				CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+				request.expected_record_generation);
+			goto complete;
+		}
 		result = semantic_activation_preflight(
 			request.action, request.expected_record_generation, &refusal,
 			&effects);
@@ -4580,6 +4689,7 @@ semantic_activation_lmon_consume_utility(void)
 		}
 	}
 
+complete:
 	(void)semantic_activation_utility_mailbox_complete(
 		request.request_seq, refusal.result, refusal.feature_bit,
 		refusal.expected_generation);
@@ -4685,7 +4795,8 @@ cluster_semantic_activation_lmon_tick(void)
 
 	current_epoch = cluster_epoch_get_current();
 	if (snapshot.formation_epoch == current_epoch) {
-		if (snapshot.transition_closed)
+		if (snapshot.transition_closed
+			&& semantic_activation_lmon_prepare_cas_seq == 0)
 			semantic_activation_lmon_sync_durable_record(
 				&snapshot, current_epoch);
 		return;

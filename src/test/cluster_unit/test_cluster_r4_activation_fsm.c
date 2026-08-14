@@ -2032,6 +2032,28 @@ UT_TEST(test_93db_complete_sample_submits_exact_prepare_cas)
 	UT_ASSERT_EQ(cas_request.request_seq, request_seq);
 	UT_ASSERT_EQ(pg_atomic_read_u64(
 		&SemanticActivationShmem->record_cas_request_seq), request_seq);
+	UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_cas(
+		request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK));
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(pg_atomic_read_u64(
+		test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET)), UINT64_C(8));
+	UT_ASSERT_EQ(pg_atomic_read_u64(
+		test_gate_u64(TEST_GATE_ACTIVE_BITS_OFFSET)), UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(
+		test_gate_u32(TEST_GATE_CLOSED_OFFSET)), UINT32_C(1));
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(pg_atomic_read_u64(
+		test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET)), UINT64_C(8));
+	UT_ASSERT_EQ(pg_atomic_read_u64(
+		test_gate_u64(TEST_GATE_ACTIVE_BITS_OFFSET)), UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(
+		test_gate_u32(TEST_GATE_CLOSED_OFFSET)), UINT32_C(1));
+	UT_ASSERT(semantic_activation_utility_mailbox_poll(&pending_request));
+	UT_ASSERT(!semantic_activation_utility_mailbox_poll_completion(
+		pending_request.request_seq, &refusal));
 	test_gate_reset();
 }
 
