@@ -3599,22 +3599,30 @@ dump_dl(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "dl", "release_count", fmt_int64((int64)cluster_dl_release_count()));
 }
 
-/*
- * dump_ir -- spec-5.7 §3.4 IR (instance-recovery owner) observability.
- * owner_count is the faithful proof that a survivor took the real GES-enforced
- * IR(X) recovery-owner lock before its destructive thread-recovery apply;
- * conflict_count counts the 53RA9 non-owner fail-closed path (a survivor whose
- * alive-set view diverged and lost the IR(X) claim); native_count counts the
- * single-node / no-competitor proceeds; release_count counts owner claims
- * released after the apply.
- */
+/* STOP03 §10.3 volatile observability only; none is authority. */
 static void
 dump_ir(ReturnSetInfo *rsinfo)
 {
-	emit_row(rsinfo, "ir", "owner_count", fmt_int64((int64)cluster_ir_owner_count()));
-	emit_row(rsinfo, "ir", "native_count", fmt_int64((int64)cluster_ir_native_count()));
-	emit_row(rsinfo, "ir", "conflict_count", fmt_int64((int64)cluster_ir_conflict_count()));
-	emit_row(rsinfo, "ir", "release_count", fmt_int64((int64)cluster_ir_release_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_grant_count",
+			 fmt_int64((int64)cluster_recovery_serial_grant_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_busy_count",
+			 fmt_int64((int64)cluster_recovery_serial_busy_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_retry_count",
+			 fmt_int64((int64)cluster_recovery_serial_retry_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_revalidate_reject_count",
+			 fmt_int64((int64)cluster_recovery_serial_revalidate_reject_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_node_cleanup_wait_count",
+			 fmt_int64((int64)cluster_recovery_serial_node_cleanup_wait_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_release_confirmed_count",
+			 fmt_int64((int64)cluster_recovery_serial_release_confirmed_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_release_unconfirmed_count",
+			 fmt_int64((int64)cluster_recovery_serial_release_unconfirmed_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_cold_set_grant_count",
+			 fmt_int64((int64)cluster_recovery_serial_cold_set_grant_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_capability_denied_count",
+			 fmt_int64((int64)cluster_recovery_serial_capability_denied_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_native_result_rejected_count",
+			 fmt_int64((int64)cluster_recovery_serial_native_result_rejected_count()));
 }
 
 /*

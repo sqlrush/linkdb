@@ -6,10 +6,9 @@
  *	  window, instead of waiting for the dead node's cold restart
  *	  (spec-4.11, #84 Thread recovery).
  *
- *	  Scope (spec-4.11 §1, FROZEN v0.3): 2-node only (single survivor =
- *	  single replay owner = single local materialization authority);
- *	  >2-node multi-survivor authority is FEATURE_NOT_SUPPORTED and
- *	  forwarded.  The apply path is Q10-B (D0 verdict, Impl note v0.1): a
+ *	  Scope: every positive formed survivor count is applicable; candidates
+ *	  compete through the STOP03 IR(X) serialization guard.  The apply path is
+ *	  Q10-B (D0 verdict, Impl note v0.1): a
  *	  per-rmgr apply-through matrix that mirrors spec-4.10's
  *	  recovery-context-stripped model -- ApplyWalRecord is NOT online-safe
  *	  (AdvanceNextFullTransactionIdPastXid would push the live survivor's
@@ -51,9 +50,10 @@ struct XLogReaderState;
  * (result-returning, not FATAL -- R13).
  */
 typedef enum ClusterThreadRecResult {
-	CLUSTER_THREADREC_DONE = 0,		  /* recovered_through_local published */
-	CLUSTER_THREADREC_BLOCKED,		  /* 8.A fail-closed -> keep frozen (53RA4) */
-	CLUSTER_THREADREC_NOT_APPLICABLE, /* single-node / no shared-fs / >2-node */
+	CLUSTER_THREADREC_DONE = 0,			/* recovered_through_local published */
+	CLUSTER_THREADREC_BLOCKED = 1,		/* verified semantic failure (53RA4) */
+	CLUSTER_THREADREC_NOT_APPLICABLE = 2, /* no online recovery attempt */
+	CLUSTER_THREADREC_DEFERRED = 3,		/* transient; keep REPLAYING for reap */
 } ClusterThreadRecResult;
 
 /*
@@ -79,6 +79,24 @@ typedef enum ClusterThreadRecReplayState {
 	CLUSTER_THREADREC_REPLAY_BLOCKED,
 } ClusterThreadRecReplayState;
 
+typedef enum ClusterThreadReplayMatchResult {
+	CLUSTER_THREADREC_MATCH_CHANGED = 0,
+	CLUSTER_THREADREC_MATCH_STATE_MISMATCH = 1,
+	CLUSTER_THREADREC_MATCH_STAMP_MISMATCH = 2,
+	CLUSTER_THREADREC_MATCH_INVALID = 3
+} ClusterThreadReplayMatchResult;
+
+static inline bool
+cluster_thread_recovery_replay_transition_shape_valid(
+	ClusterThreadRecReplayState expected,
+	ClusterThreadRecReplayState target)
+{
+	return expected == CLUSTER_THREADREC_REPLAY_REPLAYING
+		&& (target == CLUSTER_THREADREC_REPLAY_IDLE
+			|| target == CLUSTER_THREADREC_REPLAY_DONE
+			|| target == CLUSTER_THREADREC_REPLAY_BLOCKED);
+}
+
 /*
  * Scope / capability decision (spec-4.11 §3 behaviour contract).  Pure,
  * so it is unit-testable in isolation (L106 family: decide from facts,
@@ -89,15 +107,14 @@ typedef enum ClusterThreadRecReplayState {
  *	shared_fs_backend a genuinely shared data backend is configured
  *	                  (cluster_fs); without it online apply-through is
  *	                  not supported (mirror spec-4.5a 53RA3 capability gate)
- *	live_node_count   nodes still alive after the death (2-node scope: a
- *	                  single survivor; >2 survivors -> not supported, Q9)
+ *	live_node_count   nodes still alive after the death; every positive formed
+ *	                  survivor count competes under the STOP03 IR resource
  */
 typedef enum ClusterThreadRecScope {
 	CLUSTER_THREADREC_SCOPE_APPLICABLE = 0,	   /* attempt online recovery     */
 	CLUSTER_THREADREC_SCOPE_DISABLED,		   /* GUC off                      */
 	CLUSTER_THREADREC_SCOPE_SINGLE_NODE,	   /* no peers -> PG-native crash  */
 	CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND, /* FEATURE_NOT_SUPPORTED        */
-	CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR,	   /* >2-node, FEATURE_NOT_SUPPORTED (Q9) */
 } ClusterThreadRecScope;
 
 static inline ClusterThreadRecScope
@@ -110,9 +127,8 @@ cluster_thread_recovery_decide_scope(bool guc_on, bool has_peers, bool shared_fs
 		return CLUSTER_THREADREC_SCOPE_SINGLE_NODE;
 	if (!shared_fs_backend)
 		return CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND;
-	/* 2-node scope: exactly one survivor performs the recovery (Q9). */
-	if (live_survivor_count != 1)
-		return CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR;
+	if (live_survivor_count < 1)
+		return CLUSTER_THREADREC_SCOPE_SINGLE_NODE;
 	return CLUSTER_THREADREC_SCOPE_APPLICABLE;
 }
 
@@ -121,8 +137,7 @@ cluster_thread_recovery_decide_scope(bool guc_on, bool has_peers, bool shared_fs
  * predicate (spec-4.11 §3, §D7).  A scope is hard-UNSUPPORTED (the operator
  * asked for online thread recovery but this configuration cannot provide it ->
  * FEATURE_NOT_SUPPORTED, mirror spec-4.5a's 53RA3) when there is no genuinely
- * shared data backend (NO_SHARED_BACKEND) or the cluster has more than one
- * survivor (MULTI_SURVIVOR, >2-node, out of the v0.2 2-node scope, Q9).  DISABLED
+ * shared data backend (NO_SHARED_BACKEND).  DISABLED
  * (GUC off) and SINGLE_NODE (no peers -> PG-native crash recovery) are NOT
  * unsupported -- they are ordinary not-applicable fall-throughs, no error.  PURE
  * so the gate boundary is unit-pinned: it must NEVER raise FEATURE_NOT_SUPPORTED
@@ -132,8 +147,7 @@ cluster_thread_recovery_decide_scope(bool guc_on, bool has_peers, bool shared_fs
 static inline bool
 cluster_thread_recovery_scope_is_unsupported(ClusterThreadRecScope scope)
 {
-	return scope == CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND
-		   || scope == CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR;
+	return scope == CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND;
 }
 
 /*
@@ -228,8 +242,69 @@ typedef struct ClusterThreadReplayStats {
 
 #ifndef FRONTEND
 
+#include "cluster/cluster_control_root.h"
+#include "cluster/cluster_recovery_duty.h"
+#include "postmaster/bgworker.h"
 #include "utils/elog.h"				/* elevel constants for the R13 rethrow boundary */
 #include "storage/relfilelocator.h" /* RelFileLocator for the touched-rel collector */
+
+typedef enum ClusterThreadRecReapDecision {
+	CLUSTER_THREADREC_REAP_RETAIN = 0,
+	CLUSTER_THREADREC_REAP_RESET_IDLE = 1,
+	CLUSTER_THREADREC_REAP_KEEP_TERMINAL = 2,
+	CLUSTER_THREADREC_REAP_INVALID = 3
+} ClusterThreadRecReapDecision;
+
+static inline ClusterThreadRecReapDecision
+cluster_thread_recovery_reap_decide(
+	BgwHandleStatus handle_status, bool slot_read, uint64 owned_stamp,
+	ClusterThreadRecReplayState slot_state, uint64 slot_stamp)
+{
+	if (handle_status == BGWH_STARTED
+		|| handle_status == BGWH_NOT_YET_STARTED
+		|| handle_status == BGWH_POSTMASTER_DIED)
+		return CLUSTER_THREADREC_REAP_RETAIN;
+	if (handle_status != BGWH_STOPPED || !slot_read || owned_stamp == 0
+		|| slot_stamp != owned_stamp)
+		return CLUSTER_THREADREC_REAP_INVALID;
+	if (slot_state == CLUSTER_THREADREC_REPLAY_REPLAYING)
+		return CLUSTER_THREADREC_REAP_RESET_IDLE;
+	if (slot_state == CLUSTER_THREADREC_REPLAY_DONE
+		|| slot_state == CLUSTER_THREADREC_REPLAY_BLOCKED)
+		return CLUSTER_THREADREC_REAP_KEEP_TERMINAL;
+	return CLUSTER_THREADREC_REAP_INVALID;
+}
+
+typedef struct ClusterThreadRecLaunchEligibility {
+	uint16 origin_thread;
+	uint64 attempt_stamp;
+	ClusterRecoveryDutyKey duty;
+} ClusterThreadRecLaunchEligibility;
+
+/* The registration payload is only a one-shot carrier.  Before the worker can
+ * acquire any authority it must match the exact main argument and the live
+ * REPLAYING slot/stamp, and it must still carry a valid full duty identity. */
+static inline bool
+cluster_thread_recovery_worker_start_valid(
+	const ClusterThreadRecLaunchEligibility *eligibility, uint16 main_thread,
+	bool slot_read, ClusterThreadRecReplayState slot_state,
+	uint64 slot_stamp)
+{
+	return eligibility != NULL
+		&& main_thread >= XLP_THREAD_ID_FIRST_REAL
+		&& main_thread <= CLUSTER_WAL_THREAD_MAX
+		&& eligibility->origin_thread == main_thread
+		&& eligibility->attempt_stamp != 0 && slot_read
+		&& slot_state == CLUSTER_THREADREC_REPLAY_REPLAYING
+		&& slot_stamp == eligibility->attempt_stamp
+		&& cluster_recovery_duty_key_valid_v1(&eligibility->duty)
+		&& eligibility->duty.origin_thread_id == main_thread;
+}
+
+extern bool cluster_reconfig_thread_recovery_eligibility_consume(
+	uint16 origin_thread, ClusterThreadRecLaunchEligibility *out);
+extern void cluster_thread_recovery_lmon_tick(void);
+extern void cluster_thread_recovery_lmon_shutdown(void);
 
 /* GUC storage (defined in cluster_guc.c). */
 extern bool cluster_online_thread_recovery;
@@ -238,7 +313,7 @@ extern int cluster_thread_recovery_on_unrecoverable;
 /*
  * D7 capability gate (spec-4.11 §D7).  cluster_thread_recovery_capability_gate
  * raises FEATURE_NOT_SUPPORTED (errcode 0A000, mirror spec-4.5a's 53RA3 backend
- * gate) for a hard-unsupported scope (NO_SHARED_BACKEND / MULTI_SURVIVOR, per
+ * gate) for a hard-unsupported scope (NO_SHARED_BACKEND, per
  * scope_is_unsupported) and is a no-op for APPLICABLE / DISABLED / SINGLE_NODE.
  * It does NOT run in the live reconfig FSM (which stays a no-op fall-back to cold
  * restart for any non-applicable scope -- no crash, no regression); it is the
@@ -396,38 +471,26 @@ cluster_thread_recovery_replay_epoch_aborts(uint64 slot_epoch, uint64 current_ep
 /*
  * cluster_thread_recovery_worker_terminal_state -- map an executor worker's
  * replay_one verdict to the terminal replay-slot state (spec-4.11 3b-4b Part 2).
- * PURE so the fail-closed direction is unit-pinned: ONLY a DONE marks the slot
- * DONE; BLOCKED and the defensive NOT_APPLICABLE (an in-scope-launched worker
- * should never see it) both map to BLOCKED, so the observable slot NEVER claims
- * "done" for a recovery that did not complete.
- */
-static inline ClusterThreadRecReplayState
-cluster_thread_recovery_worker_terminal_state(ClusterThreadRecResult res)
-{
-	return (res == CLUSTER_THREADREC_DONE) ? CLUSTER_THREADREC_REPLAY_DONE
-										   : CLUSTER_THREADREC_REPLAY_BLOCKED;
-}
-
-/*
- * cluster_thread_recovery_should_launch -- the lmon launch decision (spec-4.11
- * 3b-4b Part 3): should the reconfig FSM launch an executor worker for a dead
- * origin this WAIT_CLUSTER tick?  PURE so the idempotency boundary is unit-pinned.
- * Out of scope NEVER launches (the spec-4.6/4.7 reconfig FSM is unchanged on a
- * single node / GUC off / >2-node -- no regression).  In scope, launch an IDLE
- * slot or one stamped by a DIFFERENT episode (a new reconfig retries), and SKIP a
- * slot already handling THIS episode (REPLAYING/DONE/BLOCKED at the current
- * epoch), so a per-tick re-attempt never re-registers a running/finished worker.
+ * PURE so the fail-closed direction is unit-pinned: only DONE and verified
+ * semantic BLOCKED are terminal.  DEFERRED and NOT_APPLICABLE leave the output
+ * untouched and return false, so result value 3 can never be cast/stored as the
+ * numerically-equal replay-slot BLOCKED state.
  */
 static inline bool
-cluster_thread_recovery_should_launch(ClusterThreadRecScope scope,
-									  ClusterThreadRecReplayState slot_state, uint64 slot_epoch,
-									  uint64 episode_epoch)
+cluster_thread_recovery_worker_terminal_state(ClusterThreadRecResult res,
+										   ClusterThreadRecReplayState *state)
 {
-	if (scope != CLUSTER_THREADREC_SCOPE_APPLICABLE)
+	if (state == NULL)
 		return false;
-	if (slot_state == CLUSTER_THREADREC_REPLAY_IDLE)
+	if (res == CLUSTER_THREADREC_DONE) {
+		*state = CLUSTER_THREADREC_REPLAY_DONE;
 		return true;
-	return slot_epoch != episode_epoch;
+	}
+	if (res == CLUSTER_THREADREC_BLOCKED) {
+		*state = CLUSTER_THREADREC_REPLAY_BLOCKED;
+		return true;
+	}
+	return false;
 }
 
 /*
@@ -454,10 +517,10 @@ extern bool cluster_thread_recovery_local_complete(uint16 dead_tid, XLogRecPtr r
  * Reconfig-FSM unfreeze gate (spec-4.11 D3, 3b-3).  Given the episode's
  * dead-node bitmap (GRD recovery_dead_bitmap words, LSB = node 0), returns
  * true when the survivor must STAY frozen: online thread recovery is in scope
- * (cluster.online_thread_recovery on + a shared data backend + 2-node) AND at
+ * (cluster.online_thread_recovery on + a shared data backend) AND at
  * least one dead origin's WAL data is not yet materialized here.  Returns false
- * when recovery is out of scope (GUC off by default / no shared backend /
- * >2-node) -- no gating, so the existing spec-4.6/4.7 unfreeze path is
+ * when recovery is out of scope (GUC off by default / no shared backend) -- no
+ * gating, so the existing spec-4.6/4.7 unfreeze path is
  * unchanged (no regression) -- or when every dead origin is complete (ready to
  * unfreeze).  fail-closed: NULL/empty bitmap returns false (nothing to gate);
  * a bad dead id maps to no origin and is treated as not-complete (frozen).
@@ -466,8 +529,8 @@ extern bool cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap, int
 
 /*
  * Per-thread online replay-state helpers (spec-4.11 3b-4b).  Thin wrappers over
- * the recovery-plan shmem slot (cluster_thread_recovery_replay_slot): the lmon
- * launch path stamps the launch episode and marks REPLAYING; the per-episode
+ * the recovery-plan shmem slot (cluster_thread_recovery_replay_slot): LMON
+ * stamps the attempt and marks REPLAYING; the per-attempt
  * executor worker writes the terminal DONE/BLOCKED and reads the episode for the
  * L235 staleness guard.  All return false (and leave outputs untouched) when no
  * slot is available -- no shmem attached, or a bad thread id.  This is
@@ -476,13 +539,15 @@ extern bool cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap, int
  *
  *	mark_replaying stamps episode_epoch BEFORE state, so a worker that observes
  *	REPLAYING also observes the epoch it was launched under (the L235 guard);
- *	read pairs the barrier on the way out.  set_state writes the terminal verdict
- *	(or resets to IDLE); it does NOT stamp an epoch (REPLAYING must come through
- *	mark_replaying).
+ *	read pairs the barrier on the way out.  Every later state change uses the
+ *	exact stamp plus REPLAYING CAS; no unconditional production writer remains.
  */
 extern bool cluster_thread_recovery_replay_mark_replaying(uint16 dead_tid, uint64 episode_epoch);
-extern bool cluster_thread_recovery_replay_set_state(uint16 dead_tid,
-													 ClusterThreadRecReplayState state);
+extern ClusterThreadReplayMatchResult
+cluster_thread_recovery_replay_transition_if_match(
+	uint16 dead_tid, uint64 attempt_stamp,
+	ClusterThreadRecReplayState expected,
+	ClusterThreadRecReplayState target);
 extern bool cluster_thread_recovery_replay_read(uint16 dead_tid,
 												ClusterThreadRecReplayState *state_out,
 												uint64 *epoch_out);
@@ -490,33 +555,18 @@ extern bool cluster_thread_recovery_replay_read(uint16 dead_tid,
 /*
  * Online thread-recovery executor (spec-4.11 3b-4b Part 2).
  *
- * cluster_thread_recovery_worker_run online-recovers ONE dead thread in the
- * calling process: it reads the per-thread replay slot (the lmon launch marked
- * it REPLAYING and stamped the launch episode), enforces the L235 episode
- * staleness guard against the live GRD recovery episode, drives
- * cluster_thread_recovery_replay_one, and writes the terminal slot state.  It
- * publishes NO authority itself (replay_one owns that on DONE).  Returns the
- * replay_one verdict; NOT_APPLICABLE also covers "slot is not REPLAYING / stale
- * launch epoch" (abort, keep frozen, the slot is left for the live episode).
+ * The private executor reads the per-thread replay slot (the LMON launch marked
+ * it REPLAYING and stamped the exact attempt), validates the full bgw_extra duty,
+ * and enforces the L235 episode-staleness guard.  RF-ROOT P3 then fails closed at
+ * the P4 boundary: without typed NeedSet/AdmissionSet evidence it performs no
+ * GES acquire, replay, or authority publication and returns DEFERRED.
  *
  * cluster_thread_recovery_worker_main is the dynamic-bgworker entry point the
- * lmon launch (Part 3) registers (bgw_function_name); main_arg carries the dead
- * thread id.  A thin wrapper: claim, install the abnormal-exit fail-closed
- * callback (RUNNING slot -> BLOCKED, keep frozen), unblock signals, run, log.
+ * permanent LMON tick registers (bgw_function_name); main_arg carries the dead
+ * thread id.  A thin wrapper installs authority cleanup, unblocks signals,
+ * runs, and logs.  It never writes IDLE or synthesizes BLOCKED on exit.
  */
-extern ClusterThreadRecResult cluster_thread_recovery_worker_run(uint16 dead_tid);
 extern void cluster_thread_recovery_worker_main(Datum main_arg);
-
-/*
- * cluster_thread_recovery_launch_workers -- the lmon launch side (spec-4.11
- * 3b-4b Part 3): the reconfig FSM calls this each WAIT_CLUSTER tick with the
- * episode's dead-node bitmap (LSB = node 0) and the locked episode epoch; it
- * registers one per-episode executor worker per in-scope dead origin not already
- * handled this episode.  Out of scope (the same decide_scope as replay_one) it
- * is a NO-OP, so the reconfig FSM is unchanged; idempotent per tick.
- */
-extern void cluster_thread_recovery_launch_workers(const uint64 *dead, int nwords,
-												   uint64 episode_epoch);
 
 /*
  * RMW replay engine (spec-4.11 D1 increment 3a).  Read each record of a

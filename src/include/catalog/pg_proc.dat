@@ -12735,64 +12735,6 @@
   proargnames => '{rel,forknum,blocknum,start_lsn,end_lsn,base_page}',
   prosrc => 'cluster_thread_apply_redo_test' },
 
-# spec-4.11 D1 increment 3a: drive the online thread-recovery RMW replay engine
-# over an explicit WAL window against shared storage, optionally seeding one
-# block with a known (older) page first, for the byte-for-byte differential vs
-# PG real redo + idempotence + fail-closed.  Returns a ':'-delimited summary
-# (result:records:applied:gated:out_of_scope:recovered_through).  Superuser-only.
-{ oid => '8935',
-  descr => 'TEST-ONLY: online thread-recovery RMW replay over WAL + shared storage (spec-4.11)',
-  proname => 'cluster_thread_replay_test',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'text',
-  proargtypes => 'pg_lsn pg_lsn regclass int4 int8 bytea',
-  proargnames => '{scan_lower,scan_upper,seed_rel,seed_forknum,seed_blocknum,seed_page}',
-  prosrc => 'cluster_thread_replay_test' },
-
-# spec-4.11 D1 increment 3b-1: drive the online thread-recovery DATA DRIVER over
-# a dead thread's per-thread WAL (<cluster.wal_threads_dir>/thread_<dead_tid>)
-# against shared storage, over an explicit window, under the R13 error-demotion
-# harness, publishing NO authority.  Returns a ':'-delimited summary
-# (result:records:applied:gated:out_of_scope:recovered_through).  Superuser-only.
-{ oid => '8936',
-  descr => 'TEST-ONLY: online thread-recovery data driver over a dead thread WAL (spec-4.11)',
-  proname => 'cluster_thread_drive_test',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'text',
-  proargtypes => 'int4 pg_lsn pg_lsn',
-  proargnames => '{dead_tid,scan_lower,scan_upper}',
-  prosrc => 'cluster_thread_drive_test' },
-
-# spec-4.11 D1 increment 3b-2: drive the online thread-recovery ORCHESTRATOR
-# (combined data + visibility pass + durability barrier + 3-way authority
-# publish) over an explicit, deterministic window.  Returns a ':'-delimited
-# summary (result:records:applied:gated:out_of_scope:recovered_through).
-# Superuser-only.
-{ oid => '8937',
-  descr => 'TEST-ONLY: online thread-recovery orchestrator over an explicit window (spec-4.11)',
-  proname => 'cluster_thread_replay_one_test',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'text',
-  proargtypes => 'int4 pg_lsn pg_lsn',
-  proargnames => '{dead_tid,scan_lower,scan_upper}',
-  prosrc => 'cluster_thread_replay_one_test' },
-
-# spec-4.11 D1 increment 3b-2: drive the FSM-facing replay_one (scope gate +
-# basic window derivation).  Returns not_applicable on a single node / no shared
-# data backend (the common single-machine case).  Superuser-only.
-{ oid => '8938',
-  descr => 'TEST-ONLY: online thread-recovery scope gate + basic window (spec-4.11)',
-  proname => 'cluster_thread_replay_one_auto_test',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'text',
-  proargtypes => 'int4',
-  proargnames => '{dead_tid}',
-  prosrc => 'cluster_thread_replay_one_auto_test' },
-
 # spec-4.11 D1 increment 3b-3: the D3 unfreeze gate.  local_complete reads the
 # node-local merged materialization authority; gate_unfreeze is the reconfig-FSM
 # predicate over a controlled single-dead-node bitmap.  Both superuser-only.
@@ -12827,44 +12769,6 @@
   proargnames => '{dead_tid,scan_lower,validated_min}',
   prosrc => 'cluster_thread_validated_end_test' },
 
-# spec-4.11 D1 increment 3b-4b Part 1: the per-thread online replay-state shmem
-# slot round-trip (mark REPLAYING / read / set DONE / L235 epoch guard / restore
-# IDLE).  Superuser-only.
-{ oid => '8942',
-  descr => 'TEST-ONLY: online thread-recovery 3b-4b replay-state slot round-trip (spec-4.11)',
-  proname => 'cluster_thread_replay_slot_test',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'text',
-  proargtypes => 'int4',
-  proargnames => '{dead_tid}',
-  prosrc => 'cluster_thread_replay_slot_test' },
-
-# spec-4.11 D1 increment 3b-4b Part 2: drive the executor worker's testable core
-# (slot read + L235 epoch guard + replay_one dispatch + terminal slot write).
-# Superuser-only.
-{ oid => '8943',
-  descr => 'TEST-ONLY: online thread-recovery 3b-4b executor worker run (spec-4.11)',
-  proname => 'cluster_thread_recovery_worker_run_test',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'text',
-  proargtypes => 'int4 int8 bool',
-  proargnames => '{dead_tid,epoch_offset,do_mark}',
-  prosrc => 'cluster_thread_recovery_worker_run_test' },
-
-# spec-4.11 D1 increment 3b-4b Part 3: drive the lmon launch side with a synthetic
-# dead-node bitmap (a no-op out of scope on a single node).  Superuser-only.
-{ oid => '8944',
-  descr => 'TEST-ONLY: online thread-recovery 3b-4b lmon launch (spec-4.11)',
-  proname => 'cluster_thread_recovery_launch_test',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'text',
-  proargtypes => 'int4',
-  proargnames => '{dead_node}',
-  prosrc => 'cluster_thread_recovery_launch_test' },
-
 # spec-4.11 D1 increment 3b-4b Part 4 e2e: READ-ONLY observer of a dead thread's
 # online replay-state slot (idle 0 / replaying 1 / done 2 / blocked 3; -1 noslot),
 # so a TAP can watch the FSM-launched worker drive the slot without perturbing it.
@@ -12878,20 +12782,6 @@
   proargtypes => 'int4',
   proargnames => '{dead_tid}',
   prosrc => 'cluster_thread_replay_slot_state_test' },
-
-# spec-4.11 D1 increment 3b-4b Part 4 e2e: drive a SYNTHETIC reconfig episode on
-# this node (coordinator) marking dead_node dead, so the e2e exercises the real
-# inject -> lmon GRD recovery FSM -> WAIT_CLUSTER -> launch_workers wiring without a
-# real peer death + CSSD deadband.  Superuser-only.
-{ oid => '8946',
-  descr => 'TEST-ONLY: inject a synthetic dead-node reconfig episode (spec-4.11)',
-  proname => 'cluster_reconfig_inject_dead_node_test',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'bool',
-  proargtypes => 'int4',
-  proargnames => '{dead_node}',
-  prosrc => 'cluster_reconfig_inject_dead_node_test' },
 
 { oid => '8947',
   descr => 'TEST-ONLY: drive the online thread-recovery D7 capability gate (spec-4.11)',
@@ -12929,28 +12819,6 @@
   proargtypes => 'regclass int4 int8 pg_lsn pg_lsn',
   proargnames => '{rel,forknum,blocknum,scan_lower,scan_upper}',
   prosrc => 'cluster_block_recovery_reconstruct_test' },
-
-# spec-5.7 D8: TEST-ONLY mechanism-level driver for the IR(X) recovery-owner
-# GES acquire (t/295).  acquire_probe drives the real cluster_ir_recovery_acquire
-# and raises 53RA9 on a non-owner claim, exactly as the recovery worker mutation
-# gate does; release_probe drops a held claim.  Superuser-only.
-{ oid => '8951',
-  descr => 'TEST-ONLY: drive the IR(X) recovery-owner GES acquire (spec-5.7 D8)',
-  proname => 'cluster_ir_acquire_probe',
-  proisstrict => 'f',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'text',
-  proargtypes => 'int4 int8 bool',
-  proargnames => '{dead_node,epoch_offset,do_hold}',
-  prosrc => 'cluster_ir_acquire_probe' },
-
-{ oid => '8952',
-  descr => 'TEST-ONLY: release a held IR(X) recovery-owner probe claim (spec-5.7 D8)',
-  proname => 'cluster_ir_release_probe',
-  provolatile => 'v', proparallel => 'u',
-  prorettype => 'bool',
-  proargtypes => '',
-  prosrc => 'cluster_ir_release_probe' },
 
 # spec-5.7 D5: TEST-ONLY mechanism driver for the TT (tablespace-DDL) GES
 # acquire (t/296).  acquire_probe drives the real TT(X)/TT(S) acquire and raises

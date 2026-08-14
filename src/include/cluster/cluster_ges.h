@@ -598,7 +598,8 @@ extern uint32 cluster_ges_send_request_nowait_and_wait(const struct ClusterResId
 
 extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 												const struct ClusterGrdHolderId *holder,
-												uint64 request_id);
+												uint64 request_id, int timeout_ms,
+												uint32 wait_event);
 
 /*
  * spec-5.5 P0 — local-master normal-release drain.  When the resource master is

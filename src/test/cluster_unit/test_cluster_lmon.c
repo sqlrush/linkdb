@@ -43,6 +43,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_tt_status_hint.h"
 
 #undef printf
@@ -742,6 +743,14 @@ cluster_fence_lmon_tick(void)
 void cluster_reconfig_lmon_tick(void);
 void
 cluster_reconfig_lmon_tick(void)
+{}
+
+void
+cluster_thread_recovery_lmon_tick(void)
+{}
+
+void
+cluster_thread_recovery_lmon_shutdown(void)
 {}
 
 void cluster_semantic_activation_lmon_tick(void);

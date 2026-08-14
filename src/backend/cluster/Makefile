@@ -102,7 +102,6 @@ OBJS = \
 	cluster_thread_recovery_apply.o \
 	cluster_thread_recovery_apply_srf.o \
 	cluster_thread_recovery_replay.o \
-	cluster_thread_recovery_replay_srf.o \
 	cluster_thread_recovery_driver.o \
 	cluster_thread_recovery_driver_srf.o \
 	cluster_thread_recovery_orchestrator.o \
@@ -116,7 +115,6 @@ OBJS = \
 	cluster_dl_lock.o \
 	cluster_ir.o \
 	cluster_ir_lock.o \
-	cluster_ir_srf.o \
 	cluster_ts.o \
 	cluster_ts_lock.o \
 	cluster_ts_srf.o \
@@ -287,8 +285,8 @@ else
 # it (spec-1.1 does not introduce a SRF; pg_cluster_state extension
 # lives in cluster_debug.c which is always linked).
 OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo_srf.o \
-	cluster_cr_srf.o cluster_block_apply_srf.o cluster_block_recovery_srf.o cluster_thread_recovery_apply_srf.o cluster_thread_recovery_replay_srf.o cluster_thread_recovery_driver_srf.o cluster_thread_recovery_orchestrator_srf.o cluster_pgstat.o cluster_scn.o cluster_views.o cluster_ges_mode_backend.o \
-	cluster_ir_srf.o cluster_ts_srf.o cluster_ko_srf.o cluster_pi_recovery_srf.o \
+	cluster_cr_srf.o cluster_block_apply_srf.o cluster_block_recovery_srf.o cluster_thread_recovery_apply_srf.o cluster_thread_recovery_driver_srf.o cluster_thread_recovery_orchestrator_srf.o cluster_pgstat.o cluster_scn.o cluster_views.o cluster_ges_mode_backend.o \
+	cluster_ts_srf.o cluster_ko_srf.o cluster_pi_recovery_srf.o \
 	cluster_hang_resolve.o cluster_clean_leave_views.o cluster_node_remove_views.o \
 	cluster_backup.o cluster_backup_manifest.o
 # spec-5.12: cluster_hang_resolve.o provides the pg_cluster_hang_victims /

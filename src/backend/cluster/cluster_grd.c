@@ -3068,16 +3068,6 @@ cluster_grd_recovery_lmon_tick(void)
 		grd_recovery_wait_cluster_watchdog(dead, episode_epoch);
 
 		/*
-		 * spec-4.11 D1 (3b-4b Part 3) — launch one per-episode online thread-
-		 * recovery worker for each in-scope dead origin (idempotent per tick;
-		 * a NO-OP out of scope, so the spec-4.7 path is unchanged).  The worker
-		 * online-replays the dead thread's WAL data + visibility to shared
-		 * storage and publishes the node-local materialization authority; the
-		 * D3 gate below then holds the GES shards frozen until it lands.
-		 */
-		cluster_thread_recovery_launch_workers(dead, (CLUSTER_MAX_NODES + 63) / 64, episode_epoch);
-
-		/*
 		 * spec-5.7 D3 S5d (§3.1b R4/R9) — launch one per-episode HW authority
 		 * rebuild worker for each dead origin whose shards this survivor adopted.
 		 * Independent of online_thread_recovery (the HW authority is default-on):
@@ -3151,7 +3141,7 @@ cluster_grd_recovery_lmon_tick(void)
 			 * fail-closed (the per-block cluster_gcs_block_phase_for_tag gate
 			 * keeps the same posture for individual blocks; this gate additionally
 			 * holds the GES shards frozen).  Out of scope — online_thread_recovery
-			 * off (the default) / no shared backend / >2-node — the gate is a
+			 * off (the default) / no shared backend — the gate is a
 			 * no-op, so the spec-4.7 unfreeze path is unchanged (no regression).
 			 * REDECLARE_DONE was re-announced just above, so peers stay converged
 			 * while we wait for the replay (the live executor lands in 3b-4).

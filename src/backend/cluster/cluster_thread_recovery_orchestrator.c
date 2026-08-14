@@ -102,15 +102,26 @@ cluster_thread_recovery_replay_mark_replaying(uint16 dead_tid, uint64 episode_ep
 	return true;
 }
 
-bool
-cluster_thread_recovery_replay_set_state(uint16 dead_tid, ClusterThreadRecReplayState state)
+ClusterThreadReplayMatchResult
+cluster_thread_recovery_replay_transition_if_match(
+	uint16 dead_tid, uint64 attempt_stamp,
+	ClusterThreadRecReplayState expected,
+	ClusterThreadRecReplayState target)
 {
 	ClusterThreadReplaySlot *slot = cluster_thread_recovery_replay_slot(dead_tid);
+	uint32 expected_state;
 
-	if (slot == NULL)
-		return false;
-	pg_atomic_write_u32(&slot->state, (uint32)state);
-	return true;
+	if (slot == NULL || attempt_stamp == 0
+		|| !cluster_thread_recovery_replay_transition_shape_valid(expected,
+																 target))
+		return CLUSTER_THREADREC_MATCH_INVALID;
+	if (pg_atomic_read_u64(&slot->episode_epoch) != attempt_stamp)
+		return CLUSTER_THREADREC_MATCH_STAMP_MISMATCH;
+	expected_state = (uint32)expected;
+	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected_state,
+										 (uint32)target))
+		return CLUSTER_THREADREC_MATCH_STATE_MISMATCH;
+	return CLUSTER_THREADREC_MATCH_CHANGED;
 }
 
 bool
@@ -228,7 +239,7 @@ cluster_thread_recovery_state_name(void)
 /*
  * cluster_thread_recovery_current_scope -- resolve the live-runtime D7 scope
  *	(spec-4.11 §D7): the GUC, has_peers, a genuinely shared data backend, and the
- *	2-node survivor count.  Mirrors replay_one's resolution so a capability probe
+ *	formed survivor count.  Mirrors replay_one's resolution so a capability probe
  *	sees exactly what the launch path would decide.
  */
 ClusterThreadRecScope
@@ -244,12 +255,12 @@ cluster_thread_recovery_current_scope(void)
 /*
  * cluster_thread_recovery_capability_gate -- the D7 FEATURE_NOT_SUPPORTED gate
  *	(spec-4.11 §3, §D7).  For a hard-unsupported scope (no genuinely shared data
- *	backend, or a >2-node multi-survivor cluster out of the v0.2 2-node scope)
+ *	backend)
  *	raise FEATURE_NOT_SUPPORTED (mirror spec-4.5a's 53RA3 backend gate); any other
  *	scope is a no-op -- APPLICABLE proceeds, DISABLED / SINGLE_NODE fall back to
  *	PG-native / cold recovery with no error.  This is the EXPLICIT capability
  *	surface (a probe / test consults it), NOT the live reconfig FSM: the FSM stays
- *	a no-op for every non-applicable scope so a single-node / GUC-off / >2-node
+ *	a no-op for every non-applicable scope so a single-node / GUC-off
  *	reconfig never crashes (the t/249-252 no-regression line).  scope_is_unsupported
  *	pins the branch so the gate NEVER fires for a merely not-applicable scope.
  */
@@ -266,12 +277,7 @@ cluster_thread_recovery_capability_gate(ClusterThreadRecScope scope)
 				 errhint("Set cluster.shared_storage_backend=cluster_fs, or let the dead node "
 						 "recover on cold restart.")));
 
-	/* CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR */
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("online thread recovery is not supported with more than one survivor"),
-			 errhint("Online thread recovery is limited to a 2-node cluster (a single survivor) "
-					 "in this release; the dead node recovers on cold restart.")));
+	pg_unreachable();
 }
 
 /*
@@ -517,9 +523,8 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 	shared_fs = (cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
 
 	/*
-	 * 2-node scope: a single death leaves node_count - 1 survivors.  The
-	 * FSM-precise per-reconfig survivor count lands with the live caller (3b-3);
-	 * for >2 nodes this yields >= 2 -> MULTI_SURVIVOR (FEATURE_NOT_SUPPORTED, Q9).
+	 * A single death leaves node_count - 1 contenders.  STOP03 serializes every
+	 * positive formed survivor count with the same full-duty IR identity.
 	 */
 	survivors = cluster_conf_node_count() - 1;
 
@@ -527,9 +532,9 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 												 cluster_conf_has_peers(), shared_fs, survivors);
 	if (scope != CLUSTER_THREADREC_SCOPE_APPLICABLE)
 		/*
-		 * DISABLED / SINGLE_NODE / NO_SHARED_BACKEND / MULTI_SURVIVOR: do not
+			 * DISABLED / SINGLE_NODE / NO_SHARED_BACKEND: do not
 		 * online-recover (the thread stays frozen / cold-restart handles it).
-		 * D7 (3b-4) refines NO_SHARED_BACKEND and MULTI_SURVIVOR into explicit
+			 * D7 (3b-4) refines NO_SHARED_BACKEND into explicit
 		 * FEATURE_NOT_SUPPORTED ereports; here every non-applicable scope is a
 		 * fail-closed NOT_APPLICABLE.
 		 */
@@ -637,8 +642,8 @@ cluster_thread_recovery_local_complete(uint16 dead_tid, XLogRecPtr required_lsn)
  *
  *	Scope reuses the pure cluster_thread_recovery_decide_scope() so the gate
  *	engages on EXACTLY the same conditions under which a replay would run: the
- *	GUC is on (dev=off by default), a shared data backend exists, and the
- *	cluster is 2-node (a single survivor = single replay owner).  Out of scope
+	 *	GUC is on (dev=off by default), a shared data backend exists, and at least
+	 *	one formed survivor can compete under IR.  Out of scope
  *	-> false: never freeze waiting on a recovery that will not run.
  */
 bool

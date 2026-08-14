@@ -44,6 +44,7 @@
 
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_ic.h"
@@ -4167,10 +4168,25 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
  * Main — register + run all tests.
  * ============================================================ */
 
+UT_TEST(test_thread_recovery_eligibility_pre_p4_is_closed_and_zero)
+{
+	ClusterThreadRecLaunchEligibility eligibility;
+
+	memset(&eligibility, 0xA5, sizeof(eligibility));
+	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(
+		1, &eligibility));
+	UT_ASSERT(memcmp(&eligibility,
+				 &(ClusterThreadRecLaunchEligibility){ 0 },
+				 sizeof(eligibility)) == 0);
+	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, NULL));
+}
+
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(77);
+
+	UT_RUN(test_thread_recovery_eligibility_pre_p4_is_closed_and_zero);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);

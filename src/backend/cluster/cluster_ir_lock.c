@@ -1,10 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_ir_lock.c
- *	  IR (instance-recovery owner) backend: shmem counters + GES acquire/release
- *	  for the destructive thread-recovery mutation gate (spec-5.7 §3.4 / D8).
- *	  The pure resid encoder + bootstrap predicate live in cluster_ir.c
- *	  (standalone-linkable for the unit test).
+ *	  STOP03 recovery-serialization backend: volatile counters and the typed
+ *	  IR release boundary.  The pure full-duty resid encoder lives in
+ *	  cluster_ir.c and is standalone-linkable for the unit test.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -17,18 +16,16 @@
  *
  * NOTES
  *	  This is a pgrac-original file (no derivation from PostgreSQL).
- *	  Spec: spec-5.7-misc-enqueue-classes.md (D8, §3.4)
+ *	  Spec: spec-s8-stop-03-root-serialization.md §17 (frozen)
  *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
-#include "cluster/cluster_conf.h"  /* cluster_node_id / cluster_conf_node_count */
-#include "cluster/cluster_epoch.h" /* cluster_epoch_get_current (bootstrap gate) */
-#include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h" /* cluster_ges_request_timeout_ms */
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h" /* IsUnderPostmaster */
 #include "storage/lock.h"
@@ -36,19 +33,25 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h"
 
-/* ============================================================
- * Shmem region: four observability counters.
- * ============================================================ */
+/* STOP03 §10.3: volatile observability only; reset at postmaster init. */
 
 typedef struct ClusterIrShared {
-	pg_atomic_uint64 owner_count;	 /* IR(X) granted: this node = recovery owner */
-	pg_atomic_uint64 native_count;	 /* uncoordinated / native proceed */
-	pg_atomic_uint64 conflict_count; /* 53RA9 non-owner fail-closed */
-	pg_atomic_uint64 release_count;	 /* IR(X) ownership claims released */
+	pg_atomic_uint64 grant_count;
+	pg_atomic_uint64 busy_count;
+	pg_atomic_uint64 retry_count;
+	pg_atomic_uint64 revalidate_reject_count;
+	pg_atomic_uint64 node_cleanup_wait_count;
+	pg_atomic_uint64 release_confirmed_count;
+	pg_atomic_uint64 release_unconfirmed_count;
+	pg_atomic_uint64 cold_set_grant_count;
+	pg_atomic_uint64 capability_denied_count;
+	pg_atomic_uint64 native_result_rejected_count;
 } ClusterIrShared;
 
 static ClusterIrShared *ir_state = NULL;
+static int ir_base_timeout_ms = 600000;
 
 Size
 cluster_ir_shmem_size(void)
@@ -64,10 +67,21 @@ cluster_ir_shmem_init(void)
 	ir_state = (ClusterIrShared *)ShmemInitStruct("pgrac cluster ir",
 												  MAXALIGN(sizeof(ClusterIrShared)), &found);
 	if (!IsUnderPostmaster) {
-		pg_atomic_init_u64(&ir_state->owner_count, 0);
-		pg_atomic_init_u64(&ir_state->native_count, 0);
-		pg_atomic_init_u64(&ir_state->conflict_count, 0);
-		pg_atomic_init_u64(&ir_state->release_count, 0);
+		ir_base_timeout_ms
+			= (cluster_ges_request_timeout_ms >= 1
+			   && cluster_ges_request_timeout_ms <= 600000)
+			? cluster_ges_request_timeout_ms
+			: 600000;
+		pg_atomic_init_u64(&ir_state->grant_count, 0);
+		pg_atomic_init_u64(&ir_state->busy_count, 0);
+		pg_atomic_init_u64(&ir_state->retry_count, 0);
+		pg_atomic_init_u64(&ir_state->revalidate_reject_count, 0);
+		pg_atomic_init_u64(&ir_state->node_cleanup_wait_count, 0);
+		pg_atomic_init_u64(&ir_state->release_confirmed_count, 0);
+		pg_atomic_init_u64(&ir_state->release_unconfirmed_count, 0);
+		pg_atomic_init_u64(&ir_state->cold_set_grant_count, 0);
+		pg_atomic_init_u64(&ir_state->capability_denied_count, 0);
+		pg_atomic_init_u64(&ir_state->native_result_rejected_count, 0);
 	}
 }
 
@@ -93,162 +107,366 @@ cluster_ir_shmem_register(void)
 	} while (0)
 
 uint64
-cluster_ir_owner_count(void)
+cluster_recovery_serial_grant_count(void)
 {
-	return ir_state != NULL ? pg_atomic_read_u64(&ir_state->owner_count) : 0;
+	return ir_state != NULL ? pg_atomic_read_u64(&ir_state->grant_count) : 0;
 }
 uint64
-cluster_ir_native_count(void)
+cluster_recovery_serial_busy_count(void)
 {
-	return ir_state != NULL ? pg_atomic_read_u64(&ir_state->native_count) : 0;
+	return ir_state != NULL ? pg_atomic_read_u64(&ir_state->busy_count) : 0;
 }
 uint64
-cluster_ir_conflict_count(void)
+cluster_recovery_serial_retry_count(void)
 {
-	return ir_state != NULL ? pg_atomic_read_u64(&ir_state->conflict_count) : 0;
+	return ir_state != NULL ? pg_atomic_read_u64(&ir_state->retry_count) : 0;
 }
 uint64
-cluster_ir_release_count(void)
+cluster_recovery_serial_revalidate_reject_count(void)
 {
-	return ir_state != NULL ? pg_atomic_read_u64(&ir_state->release_count) : 0;
+	return ir_state != NULL
+		? pg_atomic_read_u64(&ir_state->revalidate_reject_count)
+		: 0;
+}
+uint64
+cluster_recovery_serial_node_cleanup_wait_count(void)
+{
+	return ir_state != NULL
+		? pg_atomic_read_u64(&ir_state->node_cleanup_wait_count)
+		: 0;
+}
+uint64
+cluster_recovery_serial_release_confirmed_count(void)
+{
+	return ir_state != NULL
+		? pg_atomic_read_u64(&ir_state->release_confirmed_count)
+		: 0;
+}
+uint64
+cluster_recovery_serial_release_unconfirmed_count(void)
+{
+	return ir_state != NULL
+		? pg_atomic_read_u64(&ir_state->release_unconfirmed_count)
+		: 0;
+}
+uint64
+cluster_recovery_serial_cold_set_grant_count(void)
+{
+	return ir_state != NULL
+		? pg_atomic_read_u64(&ir_state->cold_set_grant_count)
+		: 0;
+}
+uint64
+cluster_recovery_serial_capability_denied_count(void)
+{
+	return ir_state != NULL
+		? pg_atomic_read_u64(&ir_state->capability_denied_count)
+		: 0;
+}
+uint64
+cluster_recovery_serial_native_result_rejected_count(void)
+{
+	return ir_state != NULL
+		? pg_atomic_read_u64(&ir_state->native_result_rejected_count)
+		: 0;
 }
 
-
-/* ============================================================
- * GES acquire / release over the spec-5.3 substrate.
- * ============================================================ */
-
-ClusterIrAcquireOutcome
-cluster_ir_recovery_acquire(int32 dead_node_id, uint64 episode_epoch, ClusterIrLock *lk)
+static bool
+recovery_serial_root_token_matches_duty(
+	const ClusterControlRootReadToken *token,
+	const ClusterRecoveryDutyKey *duty)
 {
-	ClusterResId resid;
-	ClusterLockAcquireRequest req;
-	ClusterLockAcquireResult r;
+	uint32 required_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 
-	Assert(lk != NULL);
-	if (lk == NULL)
-		return CLUSTER_IR_NOT_READY;
-	memset(lk, 0, sizeof(*lk));
-
-	/*
-	 * IR enforcement only matters in a live multi-node cluster: with no peers there
-	 * is no competing survivor, so the existing min(survivor)+epoch authority is
-	 * sufficient and the worker proceeds (this is the single-node / cluster-off
-	 * path, mirroring how DL/HW back off).  Returning NATIVE keeps the single-node
-	 * recovery path -- including the t/265 in-process driver -- unchanged.
-	 */
-	if (cluster_node_id < 0 || cluster_conf_node_count() <= 1) {
-		IR_BUMP(native_count);
-		return CLUSTER_IR_NATIVE;
-	}
-
-	/*
-	 * IR-M5 bootstrap precondition: the launch episode epoch must be the current
-	 * accepted epoch.  A mismatch means the reconfig advanced past this worker ->
-	 * do not acquire (the worker's L235 superseded-epoch abort is the runtime
-	 * enforcer; this is the additional IR gate).  Never block the remaster.
-	 */
-	if (!cluster_ir_bootstrap_ready(episode_epoch, cluster_epoch_get_current()))
-		return CLUSTER_IR_NOT_READY;
-
-	cluster_ir_resid_encode(dead_node_id, episode_epoch, &resid);
-
-	memset(&req, 0, sizeof(req));
-	req.resid = resid;
-	req.lockmode = ExclusiveLock;
-	req.op = CLUSTER_LOCK_OP_REQUEST; /* IR never converts (new epoch = new resid) */
-	req.current_mode = NoLock;
-	req.lockmethod_id = DEFAULT_LOCKMETHOD;
-	/*
-	 * dontwait (IR-M5): a peer that already holds IR(X) means this node is NOT the
-	 * recovery owner -- report it immediately (NOT_OWNER -> 53RA9) rather than
-	 * wait.  IR must never block, so the freeze window / remaster is never stalled.
-	 */
-	req.dontwait = true;
-	req.sessionLock = false;
-	/*
-	 * recovery_bootstrap (the fresh-epoch freeze-gate bypass): the recovery worker
-	 * runs inside the freeze window while the IR resid's GRD shard is still
-	 * REBUILDING.  A (dead_node, NEW_epoch) resid is brand new this episode -- no
-	 * holder set is being rebuilt for it -- so the requester-side shard-freeze gate
-	 * (cluster_lock_acquire.c) is skipped for it.  The normal grant/conflict path
-	 * is unchanged, so cross-survivor mutual exclusion still holds.
-	 */
-	req.recovery_bootstrap = true;
-	req.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
-	req.timeout_ms = cluster_ges_request_timeout_ms;
-	/* Per spec-5.7 Q10, IR reuses the existing GES request wait event. */
-	req.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
-
-	r = cluster_lock_acquire_seven_step(&req);
-
-	switch (r) {
-	case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
-		/*
-		 * The cluster/LMS layer resolved this to a native/local outcome (single
-		 * node / cluster coordination off): no cross-node competitor can exist, so
-		 * the existing min(survivor)+epoch authority is sufficient -- proceed.
-		 */
-		IR_BUMP(native_count);
-		return CLUSTER_IR_NATIVE;
-
-	case CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK:
-		/*
-		 * S3 reservation succeeded; IR has no PG-native heavyweight lock to take in
-		 * between (mirror DL), so promote now to register the GRD holder.  A promote
-		 * failure cannot prove sole ownership -> fail-closed NOT_READY (keep frozen).
-		 */
-		if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
-			return CLUSTER_IR_NOT_READY;
-		lk->held = true;
-		lk->coordinated = true;
-		lk->resid = resid;
-		lk->req = req;
-		IR_BUMP(owner_count);
-		return CLUSTER_IR_OWNER;
-
-	case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
-	case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
-		/*
-		 * Legacy / stub S4 path: seven_step already ran S5 internally and returned
-		 * an already-promoted holder.  Do NOT promote a second time.  Record it.
-		 */
-		lk->held = true;
-		lk->coordinated = true;
-		lk->resid = resid;
-		lk->req = req;
-		IR_BUMP(owner_count);
-		return CLUSTER_IR_OWNER;
-
-	case CLUSTER_LOCK_ACQUIRE_NOT_AVAIL:
-		/*
-		 * A peer holds IR(X) for this (dead_node, episode_epoch): this node is NOT
-		 * the recovery owner -- the destructive apply belongs to the holder.  Fail
-		 * closed (the worker maps this to 53RA9 and never mutates).
-		 */
-		IR_BUMP(conflict_count);
-		return CLUSTER_IR_NOT_OWNER;
-
-	default:
-		/*
-		 * Anything else (LMS unavailable / timeout / GRD-not-ready / shard
-		 * remastering past budget / internal): ownership cannot be proven, so do
-		 * NOT mutate -- keep the dead origin frozen (8.A) and let a later episode
-		 * retry.  Distinct from NOT_OWNER: no peer is known to own it.
-		 */
-		return CLUSTER_IR_NOT_READY;
-	}
+	return token != NULL && duty != NULL
+		&& token->origin_thread_id == duty->origin_thread_id
+		&& token->root_lineage_seq == duty->root_lineage_seq
+		&& memcmp(token->authority_uuid, duty->authority_uuid,
+				  sizeof(token->authority_uuid)) == 0
+		&& token->lifecycle
+			== CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		&& token->reserved20 == 0 && token->reserved32 == 0
+		&& token->file_txn_seq != 0 && token->root_publish_seq != 0
+		&& token->record_crc32c != 0
+		&& (token->root_flags & required_flags) == required_flags;
 }
 
-void
-cluster_ir_recovery_release(ClusterIrLock *lk)
+static bool
+recovery_serial_request_valid(const ClusterRecoverySerialRequest *request)
 {
-	if (lk == NULL || !lk->held)
-		return;
-	if (lk->coordinated) {
-		(void)cluster_lock_acquire_s6_release(&lk->req);
-		IR_BUMP(release_count);
+	return request != NULL
+		&& (request->mode == CLUSTER_RECOVERY_SERIAL_ONLINE
+			|| request->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+		&& cluster_recovery_duty_key_valid_v1(&request->duty)
+		&& recovery_serial_root_token_matches_duty(
+			&request->expected_root_token, &request->duty)
+		&& request->formation != NULL && request->fence_need_set != NULL
+		&& request->fence_admission_set != NULL
+		&& request->acquire_timeout_ms >= 1
+		&& request->acquire_timeout_ms <= 600000
+		&& request->release_timeout_ms >= 1
+		&& request->release_timeout_ms <= 600000;
+}
+
+static bool
+recovery_serial_release_guard_valid(const ClusterRecoverySerialGuard *guard)
+{
+	ClusterResId expected_resid;
+
+	if (guard == NULL || !guard->held
+		|| (guard->mode != CLUSTER_RECOVERY_SERIAL_ONLINE
+			&& guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
+		|| guard->formation == NULL || guard->fence_need_set == NULL
+		|| guard->fence_admission_set == NULL
+		|| guard->release_timeout_ms < 1
+		|| guard->release_timeout_ms > 600000
+		|| !cluster_recovery_duty_key_valid_v1(&guard->duty)
+		|| !cluster_recovery_serial_resid_encode(&guard->duty,
+											  &expected_resid)
+		|| memcmp(&guard->resid, &expected_resid, sizeof(expected_resid)) != 0
+		|| memcmp(&guard->lock_request.resid, &guard->resid,
+				  sizeof(guard->resid)) != 0
+		|| guard->lock_request.lockmode != ExclusiveLock
+		|| guard->lock_request.op != CLUSTER_LOCK_OP_REQUEST
+		|| guard->lock_request.current_mode != NoLock
+		|| guard->lock_request.lockmethod_id != DEFAULT_LOCKMETHOD
+		|| !guard->lock_request.dontwait || guard->lock_request.sessionLock
+		|| guard->lock_request.request_id == 0
+		|| guard->lock_request.holder.request_id
+			!= guard->lock_request.request_id
+		|| guard->lock_request.holder.cluster_epoch == 0
+		|| !recovery_serial_root_token_matches_duty(
+			&guard->root_read_token, &guard->duty))
+		return false;
+	return true;
+}
+
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
+								ClusterRecoverySerialGuard *guard)
+{
+	if (guard == NULL)
+		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+	memset(guard, 0, sizeof(*guard));
+	if (!recovery_serial_request_valid(request))
+		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+
+	/*
+	 * RF-ROOT P3 is installed before the external-fence provider/set phase.
+	 * Opaque non-NULL pointers are not affirmative evidence.  Keep the public
+	 * gate closed until that phase supplies its exact nowait validators; in
+	 * particular, do not issue GES or accept OK_NATIVE here.
+	 */
+	return CLUSTER_RECOVERY_SERIAL_FENCE_DENIED;
+}
+
+ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	if (guard != NULL && guard->release_uncertain) {
+		IR_BUMP(revalidate_reject_count);
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_UNCERTAIN;
 	}
-	lk->held = false;
-	lk->coordinated = false;
+	if (guard == NULL || !guard->held)
+		return CLUSTER_RECOVERY_SERIAL_NOT_HELD;
+	if (!recovery_serial_release_guard_valid(guard)) {
+		IR_BUMP(revalidate_reject_count);
+		return CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+	}
+
+	/* Positive set/provider freshness is owned by the following fence phase. */
+	IR_BUMP(revalidate_reject_count);
+	return CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+}
+
+ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire_set(
+	const ClusterRecoverySerialRequest *requests, uint16 count,
+	int overall_acquire_timeout_ms, ClusterRecoverySerialGuardSet *set,
+	uint16 *failed_index)
+{
+	instr_time started;
+	uint16 i;
+
+	if (failed_index != NULL)
+		*failed_index = CLUSTER_RECOVERY_SERIAL_SET_FAILED_NONE;
+	if (set == NULL)
+		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+	memset(set, 0, sizeof(*set));
+	if (failed_index == NULL || requests == NULL || count == 0
+		|| count > CLUSTER_RECOVERY_SERIAL_SET_MAX
+		|| overall_acquire_timeout_ms < 1
+		|| overall_acquire_timeout_ms > 600000)
+		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+	for (i = 0; i < count; i++) {
+		if (!recovery_serial_request_valid(&requests[i])
+			|| (i > 0
+				&& requests[i - 1].duty.origin_thread_id
+					>= requests[i].duty.origin_thread_id)
+			|| (i > 0
+				&& requests[i - 1].release_timeout_ms
+					!= requests[i].release_timeout_ms))
+			return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+	}
+
+	INSTR_TIME_SET_CURRENT(started);
+	for (i = 0; i < count; i++) {
+		ClusterRecoverySerialRequest bounded_request = requests[i];
+		ClusterRecoverySerialGuard guard;
+		ClusterRecoverySerialAcquireResult result;
+		instr_time now;
+		double elapsed_ms;
+		int elapsed_ms_ceil;
+		int remaining_ms;
+
+		INSTR_TIME_SET_CURRENT(now);
+		INSTR_TIME_SUBTRACT(now, started);
+		elapsed_ms = INSTR_TIME_GET_MILLISEC(now);
+		elapsed_ms_ceil = (int)elapsed_ms;
+		if ((double)elapsed_ms_ceil < elapsed_ms)
+			elapsed_ms_ceil++;
+		remaining_ms = overall_acquire_timeout_ms - elapsed_ms_ceil;
+		if (remaining_ms <= 0) {
+			result = CLUSTER_RECOVERY_SERIAL_RETRY;
+		} else {
+			bounded_request.acquire_timeout_ms
+				= Min(bounded_request.acquire_timeout_ms, remaining_ms);
+			result = cluster_recovery_serial_acquire(&bounded_request, &guard);
+		}
+		if (result != CLUSTER_RECOVERY_SERIAL_GRANTED) {
+			ClusterRecoverySerialReleaseResult rollback_result;
+
+			if (set->count == 0) {
+				memset(set, 0, sizeof(*set));
+				return result;
+			}
+			*failed_index = i;
+			rollback_result = cluster_recovery_serial_release_set(set);
+			if (rollback_result
+				!= CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+				return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+			return result;
+		}
+
+		if (set->count == 0)
+			set->release_timeout_ms = requests[0].release_timeout_ms;
+		set->guards[set->count] = guard;
+		set->count++;
+	}
+
+	return CLUSTER_RECOVERY_SERIAL_GRANTED;
+}
+
+static ClusterRecoverySerialReleaseResult
+recovery_serial_release_with_timeout(ClusterRecoverySerialGuard *guard,
+									 int timeout_ms)
+{
+	ClusterLockAcquireRequest release_request;
+	ClusterLockAcquireResult result;
+
+	if (guard == NULL)
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_INVALID;
+	if (!guard->held && !guard->release_uncertain)
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_NOT_HELD;
+	if (!recovery_serial_release_guard_valid(guard) || timeout_ms < 1
+		|| timeout_ms > 600000)
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_INVALID;
+
+	release_request = guard->lock_request;
+	release_request.timeout_ms = Min(timeout_ms, ir_base_timeout_ms);
+	result = cluster_lock_acquire_s6_release(&release_request);
+	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+		guard->release_uncertain = true;
+		IR_BUMP(release_unconfirmed_count);
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_UNCONFIRMED;
+	}
+
+	guard->held = false;
+	guard->release_uncertain = false;
+	IR_BUMP(release_confirmed_count);
+	return CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED;
+}
+
+ClusterRecoverySerialReleaseResult
+cluster_recovery_serial_release(ClusterRecoverySerialGuard *guard)
+{
+	if (guard == NULL)
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_INVALID;
+	return recovery_serial_release_with_timeout(guard,
+										guard->release_timeout_ms);
+}
+
+ClusterRecoverySerialReleaseResult
+cluster_recovery_serial_release_set(ClusterRecoverySerialGuardSet *set)
+{
+	instr_time started;
+	uint16 original_count;
+	uint16 survivors = 0;
+	uint16 i;
+	bool unconfirmed = false;
+
+	if (set == NULL)
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_INVALID;
+	if (set->count == 0)
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_NOT_HELD;
+	if (set->count > CLUSTER_RECOVERY_SERIAL_SET_MAX
+		|| set->release_timeout_ms < 1
+		|| set->release_timeout_ms > 600000)
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_INVALID;
+	for (i = 0; i < set->count; i++) {
+		if (!recovery_serial_release_guard_valid(&set->guards[i])
+			|| set->guards[i].release_timeout_ms
+				!= set->release_timeout_ms
+			|| (i > 0
+				&& set->guards[i - 1].duty.origin_thread_id
+					>= set->guards[i].duty.origin_thread_id))
+			return CLUSTER_RECOVERY_SERIAL_RELEASE_INVALID;
+	}
+
+	original_count = set->count;
+	INSTR_TIME_SET_CURRENT(started);
+	for (i = original_count; i > 0; i--) {
+		ClusterRecoverySerialGuard *guard = &set->guards[i - 1];
+		ClusterRecoverySerialReleaseResult result;
+		instr_time now;
+		double elapsed_ms;
+		int elapsed_ms_ceil;
+		int remaining_ms;
+
+		INSTR_TIME_SET_CURRENT(now);
+		INSTR_TIME_SUBTRACT(now, started);
+		elapsed_ms = INSTR_TIME_GET_MILLISEC(now);
+		elapsed_ms_ceil = (int)elapsed_ms;
+		if ((double)elapsed_ms_ceil < elapsed_ms)
+			elapsed_ms_ceil++;
+		remaining_ms = set->release_timeout_ms - elapsed_ms_ceil;
+		if (remaining_ms <= 0) {
+			guard->release_uncertain = true;
+			IR_BUMP(release_unconfirmed_count);
+			unconfirmed = true;
+			continue;
+		}
+		result = recovery_serial_release_with_timeout(guard, remaining_ms);
+		if (result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+			unconfirmed = true;
+	}
+
+	for (i = 0; i < original_count; i++) {
+		if (set->guards[i].held || set->guards[i].release_uncertain) {
+			if (survivors != i)
+				set->guards[survivors] = set->guards[i];
+			survivors++;
+		}
+	}
+	memset(&set->guards[survivors], 0,
+		   sizeof(set->guards) - sizeof(set->guards[0]) * survivors);
+	set->count = survivors;
+	if (unconfirmed || survivors != 0)
+		return CLUSTER_RECOVERY_SERIAL_RELEASE_UNCONFIRMED;
+
+	memset(set, 0, sizeof(*set));
+	return CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED;
 }

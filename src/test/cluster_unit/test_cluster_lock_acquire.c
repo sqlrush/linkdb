@@ -494,6 +494,8 @@ static uint32 stub_ges_reject_reason = 0;
 static PcmXQueueResult stub_pcm_x_nested_guard_result = PCM_X_QUEUE_OK;
 static int stub_ges_request_wait_calls;
 static int stub_ges_request_nowait_wait_calls;
+static int stub_ges_release_timeout_ms;
+static uint32 stub_ges_release_wait_event;
 static int stub_ges_convert_wait_calls;
 
 PcmXQueueResult
@@ -529,9 +531,12 @@ cluster_ges_send_request_nowait_and_wait(
 
 uint32
 cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
-								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
-								  uint64 request_id pg_attribute_unused())
+									  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+									  uint64 request_id pg_attribute_unused(),
+									  int timeout_ms, uint32 wait_event)
 {
+	stub_ges_release_timeout_ms = timeout_ms;
+	stub_ges_release_wait_event = wait_event;
 	return 0;
 }
 
@@ -654,6 +659,15 @@ UT_TEST(test_s6_local_master_unconfirmed_release_fails_closed)
 	stub_local_release_result = GES_REJECT_REASON_NONE;
 	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req),
 				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	stub_master_node = cluster_node_id + 1;
+	req.timeout_ms = 4321;
+	req.wait_event = UINT32_C(9876);
+	stub_ges_release_timeout_ms = 0;
+	stub_ges_release_wait_event = 0;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(stub_ges_release_timeout_ms, 4321);
+	UT_ASSERT_EQ(stub_ges_release_wait_event, UINT32_C(9876));
 	stub_local_release_result = saved_release_result;
 	stub_master_node = saved_master;
 }

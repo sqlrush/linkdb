@@ -602,19 +602,6 @@
  * cluster_thread_apply_redo_test (oid 8934) -- the LSN-gated online
  * thread-recovery apply matrix byte-for-byte parity + idempotence differential
  * driver.  One pg_proc row -> bump. */
-/* spec-4.11 D1 increment 3a (2026-06-14): pg_proc gains TEST-ONLY
- * cluster_thread_replay_test (oid 8935) -- drives the online thread-recovery RMW
- * replay engine over WAL + shared storage (streaming + gates + idempotence +
- * fail-closed differential).  One pg_proc row -> bump. */
-/* spec-4.11 D1 increment 3b-1 (2026-06-15): pg_proc gains TEST-ONLY
- * cluster_thread_drive_test (oid 8936) -- drives the online thread-recovery data
- * driver over a dead thread's per-thread WAL under the R13 harness.  One pg_proc
- * row -> bump. */
-/* spec-4.11 D1 increment 3b-2 (2026-06-15): pg_proc gains two TEST-ONLY entries
- * cluster_thread_replay_one_test (oid 8937) + cluster_thread_replay_one_auto_test
- * (oid 8938) -- drive the online thread-recovery orchestrator (combined data +
- * visibility pass + durability barrier + 3-way authority publish).  Two pg_proc
- * rows -> bump. */
 /* spec-4.11 D1 increment 3b-3 (2026-06-15): pg_proc gains two TEST-ONLY entries
  * cluster_thread_local_complete_test (oid 8939) + cluster_thread_gate_unfreeze_test
  * (oid 8940) -- exercise the D3 unfreeze gate (node-local merged authority +
@@ -622,28 +609,12 @@
 /* spec-4.11 D1 increment 3b-4a (2026-06-15): pg_proc gains one TEST-ONLY entry
  * cluster_thread_validated_end_test (oid 8941) -- drives the D4 validated
  * torn-tail boundary pass.  One pg_proc row -> bump. */
-/* spec-4.11 D1 increment 3b-4b Part 1 (2026-06-15): pg_proc gains one TEST-ONLY
- * entry cluster_thread_replay_slot_test (oid 8942) -- exercises the per-thread
- * online replay-state shmem slot round-trip.  One pg_proc row -> bump. */
-/* spec-4.11 D1 increment 3b-4b Part 2 (2026-06-15): pg_proc gains one TEST-ONLY
- * entry cluster_thread_recovery_worker_run_test (oid 8943) -- drives the
- * executor worker's testable core.  One pg_proc row -> bump. */
-/* spec-4.11 D1 increment 3b-4b Part 3 (2026-06-15): pg_proc gains one TEST-ONLY
- * entry cluster_thread_recovery_launch_test (oid 8944) -- drives the lmon launch
- * side (no-op out of scope).  One pg_proc row -> bump. */
-/* spec-4.11 D1 increment 3b-4b Part 4 (2026-06-15): pg_proc gains two TEST-ONLY
- * entries -- cluster_thread_replay_slot_state_test (oid 8945, read-only slot
- * observer) and cluster_reconfig_inject_dead_node_test (oid 8946, synthetic
- * reconfig inject) -- for the inject -> FSM -> launch -> fail-closed-frozen e2e.
- * Two pg_proc rows -> bump. */
+/* spec-4.11 D1 increment 3b-4b Part 4 (2026-06-15): pg_proc gains the read-only
+ * replay-slot observer (oid 8945). */
 /* spec-4.11 D1 increment 3b-4c (2026-06-15): D7 capability gate adds one
  * TEST-ONLY entry -- cluster_thread_capability_gate_test (oid 8947) -- driving
- * the FEATURE_NOT_SUPPORTED gate (no-shared-backend / >2-node) deterministically.
+ * the FEATURE_NOT_SUPPORTED no-shared-backend gate deterministically.
  * One pg_proc row -> bump. */
-/* spec-5.7 D8 (2026-06-24): IR (instance-recovery owner) adds two TEST-ONLY
- * entries -- cluster_ir_acquire_probe (oid 8951) + cluster_ir_release_probe (oid
- * 8952) -- the mechanism-level driver for the real GES IR(X) acquire + 53RA9
- * non-owner fail-closed (t/295).  Two pg_proc rows -> bump. */
 /* spec-5.7 D5 (2026-06-24): TT (tablespace-DDL) adds two TEST-ONLY entries --
  * cluster_ts_acquire_probe (oid 8953) + cluster_ts_release_probe (oid 8954) --
  * the mechanism driver for the real GES TT(X)/TT(S) acquire + 53RA8 conflict
@@ -681,9 +652,8 @@
 /* spec-5.8 D3 (2026-06-23):  pg_cluster_lmd_remove_wait_edges (oid 8956) —
  * test/diagnostic-only SRF companion to the D16 injector.  D1a's multi-edge
  * graph key removed the old redirect-to-overwrite cycle-break trick, so TAP
- * 109 needs a real waiter-edge remover.  pg_proc.dat gets one row.  (oid 8951
- * moved to 8956 on the post-5.7 rebase — 5.7's cluster_ir_acquire_probe owns
- * 8951.)  catversion bump. */
+ * 109 needs a real waiter-edge remover.  pg_proc.dat gets one row; the function
+ * moved to oid 8956 on the post-5.7 rebase.  catversion bump. */
 /* spec-5.8 rebase onto shipped 5.7 + 5.50 (2026-06-26): single combined bump
  * above 5.7's 202606250 — 5.8's GES wire / LMD shmem ABI + the relocated SRF
  * stack on top of 5.7's enqueue classes + spec-2.41 lost-write ABI. */
@@ -736,7 +706,9 @@
  * catalog surface re-bumps 202606380 -> 202606390. */
 /* spec-6.12h D-h3b: PI recovery differential catalog surface —
  * cluster_pi_apply_redo_test SRF (oid 8975).  Bump 202606390 -> 202607060. */
-#define CATALOG_VERSION_NO 202607060
+/* RF-ROOT P3 / STOP03: remove ten authority-bearing recovery mutator/probe
+ * builtins before recovery-serial activation.  Bump 202607060 -> 202608150. */
+#define CATALOG_VERSION_NO 202608150
 
 /* spec-5.13 (2026-06-27): clean-leave catalog surface — cluster_get_clean_leave_state
  * SRF (oid 8960) + pg_cluster_clean_leave_state view + pg_cluster_clean_leave_request

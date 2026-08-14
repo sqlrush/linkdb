@@ -43,7 +43,24 @@
 
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b joiner gate */
+
+/*
+ * RF-ROOT P3/P4 ordered seam.  The STOP04 async formation/fence admission
+ * producer is not installed in P3, so no opaque pointer or legacy dead bitmap
+ * may be promoted into launch eligibility.  P4 replaces this closed body with
+ * the exact one-shot canonical producer; false always leaves the output zero.
+ */
+bool
+cluster_reconfig_thread_recovery_eligibility_consume(
+	uint16 origin_thread pg_attribute_unused(),
+	ClusterThreadRecLaunchEligibility *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -4942,10 +4959,9 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 
 		/*
 		 * The async stage is process-local by design and is driven only by LMON
-		 * ticks.  Test-only backend callers, such as
-		 * cluster_reconfig_inject_dead_node_test(), would otherwise stage the marker
-		 * in their own process and return with no LMON-visible pending publish
-		 * record.  Keep those non-LMON paths on the old bounded wait: they are not
+		 * ticks.  Non-LMON backend callers would otherwise stage the marker in their
+		 * own process and return with no LMON-visible pending publish record.  Keep
+		 * those non-LMON paths on the old bounded wait: they are not
 		 * transport-liveness actors, so this does not reintroduce the BUG-C1 LMON
 		 * park.
 		 */

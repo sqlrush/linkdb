@@ -621,7 +621,8 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		 */
 		(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
 		release_result = cluster_ges_send_release_and_wait(
-			&req->resid, &req->holder, req->request_id);
+			&req->resid, &req->holder, req->request_id, req->timeout_ms,
+			req->wait_event);
 		if (release_result != GES_REJECT_REASON_NONE)
 			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}

@@ -732,31 +732,33 @@ cluster_dl_release_count(void)
 	return 0;
 }
 
-/* spec-5.7 D8 dump_ir stubs (cluster_ir_lock.c not linked in this binary). */
-uint64 cluster_ir_owner_count(void);
-uint64 cluster_ir_native_count(void);
-uint64 cluster_ir_conflict_count(void);
-uint64 cluster_ir_release_count(void);
-uint64
-cluster_ir_owner_count(void)
-{
-	return 0;
-}
-uint64
-cluster_ir_native_count(void)
-{
-	return 0;
-}
-uint64
-cluster_ir_conflict_count(void)
-{
-	return 0;
-}
-uint64
-cluster_ir_release_count(void)
-{
-	return 0;
-}
+/* STOP03 §10.3 dump_ir stubs (cluster_ir_lock.c is not linked here). */
+#define DEFINE_RECOVERY_SERIAL_COUNTER_STUB(name) \
+	uint64 name(void);                             \
+	uint64 name(void)                              \
+	{                                              \
+		return 0;                                    \
+	}
+
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_grant_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_busy_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_retry_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
+	cluster_recovery_serial_revalidate_reject_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
+	cluster_recovery_serial_node_cleanup_wait_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
+	cluster_recovery_serial_release_confirmed_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
+	cluster_recovery_serial_release_unconfirmed_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
+	cluster_recovery_serial_cold_set_grant_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
+	cluster_recovery_serial_capability_denied_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
+	cluster_recovery_serial_native_result_rejected_count)
+
+#undef DEFINE_RECOVERY_SERIAL_COUNTER_STUB
 
 /* spec-5.7 D5 dump_ts stubs (cluster_ts_lock.c not linked in this binary). */
 uint64 cluster_ts_x_count(void);

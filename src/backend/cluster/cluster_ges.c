@@ -2330,7 +2330,8 @@ cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 loc
 
 uint32
 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
-								  const struct ClusterGrdHolderId *holder, uint64 request_id)
+								  const struct ClusterGrdHolderId *holder, uint64 request_id,
+								  int timeout_ms, uint32 wait_event)
 {
 	int32 master;
 	GesReplyWaitKey key;
@@ -2388,8 +2389,12 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 	{
 		uint64 master_gen = cluster_lms_get_shard_master_generation();
 		int max_attempts = cluster_ges_retransmit_max_attempts;
-		bool perpetual = (cluster_ges_request_timeout_ms == -1);
+		bool perpetual
+			= (timeout_ms <= 0 && cluster_ges_request_timeout_ms == -1);
 		int effective_timeout_ms;
+		uint32 effective_wait_event = wait_event != 0
+			? wait_event
+			: WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 		int attempt = 0;
 		int backoff_ms = 100;
 		bool warned_starvation = false;
@@ -2399,7 +2404,11 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 			effective_timeout_ms = -1;
 			deadline = 0;
 		} else {
-			effective_timeout_ms = cluster_ges_request_timeout_ms;
+			effective_timeout_ms = timeout_ms > 0
+				? timeout_ms
+				: cluster_ges_request_timeout_ms;
+			if (effective_timeout_ms <= 0)
+				effective_timeout_ms = 600000;
 			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective_timeout_ms);
 		}
 		memset(&key, 0, sizeof(key));
@@ -2467,7 +2476,7 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 			}
 
 			if (!ConditionVariableTimedSleep(&entry->cv, sleep_ms,
-										 WAIT_EVENT_CLUSTER_GES_REPLY_WAIT))
+										 effective_wait_event))
 				continue;
 
 			attempt++;

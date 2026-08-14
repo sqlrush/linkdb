@@ -17,45 +17,6 @@
 #include "common/sha2.h"
 #include "portability/instr_time.h"
 
-static bool
-bytes_nonzero(const uint8 *bytes, size_t len)
-{
-	size_t i;
-
-	for (i = 0; i < len; i++) {
-		if (bytes[i] != 0)
-			return true;
-	}
-	return false;
-}
-
-static bool
-authority_uuid_v4(const uint8 uuid[16])
-{
-	return bytes_nonzero(uuid, 16) && (uuid[6] & UINT8_C(0xf0)) == UINT8_C(0x40)
-		   && (uuid[8] & UINT8_C(0xc0)) == UINT8_C(0x80);
-}
-
-static bool
-duty_key_valid(const ClusterRecoveryDutyKey *key)
-{
-	ClusterWalThreadClaim claim;
-
-	if (key == NULL || key->system_identifier == 0 || !bytes_nonzero(key->storage_uuid, 16)
-		|| !authority_uuid_v4(key->authority_uuid) || key->origin_thread_id == 0
-		|| key->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		|| key->origin_node_id < 0
-		|| key->origin_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		|| key->origin_thread_id != (uint16)(key->origin_node_id + 1)
-		|| key->reserved42 != 0 || key->thread_claim_created_at == 0
-		|| key->thread_claim_crc32c == 0 || key->reserved60 != 0
-		|| key->origin_owner_incarnation == 0 || key->root_lineage_seq == 0)
-		return false;
-	cluster_wal_thread_claim_fill(&claim, key->origin_thread_id, key->origin_node_id,
-								 key->thread_claim_created_at);
-	return key->thread_claim_crc32c == claim.crc;
-}
-
 static void
 write_u16_le(uint8 *dst, uint16 value)
 {
@@ -91,7 +52,7 @@ cluster_recovery_duty_key_encode_v1(
 	if (out == NULL)
 		return false;
 	memset(out, 0, CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES);
-	if (!duty_key_valid(key))
+	if (!cluster_recovery_duty_key_valid_v1(key))
 		return false;
 	write_u64_le(out, key->system_identifier);
 	memcpy(out + 8, key->storage_uuid, 16);
@@ -286,7 +247,7 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 		node_id, &identity, &snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		|| !duty_key_valid(&identity)
+		|| !cluster_recovery_duty_key_valid_v1(&identity)
 		|| cluster_recovery_duty_key_compare(&identity, &snapshot.identity)
 			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 		|| (snapshot.lifecycle

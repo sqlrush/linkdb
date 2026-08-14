@@ -1555,7 +1555,8 @@ UT_TEST(test_ges_release_cv_timeout_retransmits)
 	stub_backend_request_enqueue_count = 0;
 	stub_backend_request_ready_after = 2;
 
-	result = cluster_ges_send_release_and_wait(&resid, &holder, holder.request_id);
+	result = cluster_ges_send_release_and_wait(&resid, &holder,
+										 holder.request_id, 0, 0);
 
 	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_NONE);
 	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)2);

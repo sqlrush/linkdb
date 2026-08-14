@@ -79,6 +79,41 @@ typedef struct ClusterFormationSnapshotV1 {
 StaticAssertDecl(sizeof(ClusterRecoveryDutyDigest) == 32,
 				 "ClusterRecoveryDutyDigest ABI");
 
+/* Shared pure validity predicate for every consumer of the exact duty key.
+ * Keeping this beside the canonical encoder prevents compact resource ids
+ * from accepting an identity that the durable/root layer would reject. */
+static inline bool
+cluster_recovery_duty_key_valid_v1(const ClusterRecoveryDutyKey *key)
+{
+	ClusterWalThreadClaim claim;
+	bool storage_nonzero = false;
+	bool authority_nonzero = false;
+	int i;
+
+	if (key == NULL || key->system_identifier == 0)
+		return false;
+	for (i = 0; i < 16; i++) {
+		storage_nonzero = storage_nonzero || key->storage_uuid[i] != 0;
+		authority_nonzero = authority_nonzero || key->authority_uuid[i] != 0;
+	}
+	if (!storage_nonzero || !authority_nonzero
+		|| (key->authority_uuid[6] & UINT8_C(0xf0)) != UINT8_C(0x40)
+		|| (key->authority_uuid[8] & UINT8_C(0xc0)) != UINT8_C(0x80)
+		|| key->origin_thread_id == 0
+		|| key->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| key->origin_node_id < 0
+		|| key->origin_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| key->origin_thread_id != (uint16)(key->origin_node_id + 1)
+		|| key->reserved42 != 0 || key->thread_claim_created_at == 0
+		|| key->thread_claim_crc32c == 0 || key->reserved60 != 0
+		|| key->origin_owner_incarnation == 0 || key->root_lineage_seq == 0)
+		return false;
+	cluster_wal_thread_claim_fill(&claim, key->origin_thread_id,
+								 key->origin_node_id,
+								 key->thread_claim_created_at);
+	return key->thread_claim_crc32c == claim.crc;
+}
+
 extern bool cluster_recovery_duty_key_encode_v1(
 	const ClusterRecoveryDutyKey *key,
 	uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]);
