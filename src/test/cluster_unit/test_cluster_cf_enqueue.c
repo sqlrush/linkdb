@@ -84,6 +84,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 /* ---- GES substrate stubs (settable outcomes) ---- */
 static ClusterLockAcquireResult g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static ClusterLockAcquireResult g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+static ClusterLockAcquireResult g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static int g_s6_count = 0;
 static uint8 g_s6_last_resid_type = 0;
 /* spec-5.6 Dc4b: capture what cluster_cf_lock threaded into the request. */
@@ -118,7 +119,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
 	g_s6_count++;
 	g_s6_last_resid_type = req->resid.type;
-	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	return g_s6_result;
 }
 
 /* spec-5.6 Dc4: cluster_cf_lock bumps CF acquire/fail-closed counters;
@@ -426,6 +427,47 @@ UT_TEST(test_lock_native_no_release)
 	UT_ASSERT_EQ(g_s6_count, 0); /* uncoordinated -> no S6 */
 }
 
+UT_TEST(test_confirmed_release_requires_clusterwide_s6_success)
+{
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_s6_count = 0;
+
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
+				 CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
+	UT_ASSERT_EQ(g_s6_count, 1);
+
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
+				 CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
+				 CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
+}
+
+UT_TEST(test_native_hold_never_becomes_clusterwide_authority)
+{
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
+	g_s6_count = 0;
+
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	UT_ASSERT(cluster_cf_held(ShareLock));
+	UT_ASSERT(!cluster_cf_held_is_clusterwide(ShareLock));
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock),
+				 CLUSTER_CF_RELEASE_NOT_HELD);
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	UT_ASSERT_EQ(g_s6_count, 0);
+}
+
 /* ======================================================================
  * Db2 -- a GES failure fails closed and registers nothing
  * ====================================================================== */
@@ -488,7 +530,7 @@ UT_TEST(test_lock_timeout_and_wait_event)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -496,6 +538,8 @@ main(void)
 	UT_RUN(test_owner_eor_disabled_seed_uses_exact_declared_node);
 	UT_RUN(test_owner_eor_abort_retains_active_and_blocks_retry);
 	UT_RUN(test_lock_native_no_release);
+	UT_RUN(test_confirmed_release_requires_clusterwide_s6_success);
+	UT_RUN(test_native_hold_never_becomes_clusterwide_authority);
 	UT_RUN(test_lock_failclosed_timeout);
 	UT_RUN(test_lock_s5_fail);
 	UT_RUN(test_lock_notavail);

@@ -49,6 +49,7 @@ OBJS = \
 	cluster_backup.o \
 	cluster_backup_manifest.o \
 	cluster_cf_authority.o \
+	cluster_control_root.o \
 	cluster_cf_enqueue.o \
 	cluster_cf_phase2.o \
 	cluster_cf_stats.o \

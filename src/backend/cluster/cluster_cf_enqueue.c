@@ -211,6 +211,37 @@ cluster_cf_unlock(LOCKMODE mode)
 	slot->coordinated = false;
 }
 
+bool
+cluster_cf_held_is_clusterwide(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return slot->held && slot->coordinated;
+}
+
+ClusterCfReleaseResult
+cluster_cf_unlock_confirmed(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+	ClusterLockAcquireResult result;
+
+	if (!slot->held)
+		return CLUSTER_CF_RELEASE_NOT_HELD;
+	if (!slot->coordinated) {
+		slot->held = false;
+		slot->coordinated = false;
+		return CLUSTER_CF_RELEASE_NOT_HELD;
+	}
+
+	result = cluster_lock_acquire_s6_release(&slot->req);
+	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+		return CLUSTER_CF_RELEASE_UNCONFIRMED;
+
+	slot->held = false;
+	slot->coordinated = false;
+	return CLUSTER_CF_RELEASE_CONFIRMED;
+}
+
 /*
  * cluster_cf_held -- does this backend hold the CF lock in `mode`?
  */

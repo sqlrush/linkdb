@@ -583,6 +583,7 @@ ClusterLockAcquireResult
 cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
 	int32 master;
+	uint32 release_result;
 
 	ensure_counter_initialized();
 
@@ -619,7 +620,10 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		 * authoritative drain + wake.
 		 */
 		(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
-		(void)cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
+		release_result = cluster_ges_send_release_and_wait(
+			&req->resid, &req->holder, req->request_id);
+		if (release_result != GES_REJECT_REASON_NONE)
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 
 	pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);

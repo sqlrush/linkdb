@@ -82,6 +82,15 @@ extern void cluster_cf_resid_encode(ClusterResId *dst);
 extern bool cluster_cf_lock(LOCKMODE mode);
 extern void cluster_cf_unlock(LOCKMODE mode);
 
+typedef enum ClusterCfReleaseResult {
+	CLUSTER_CF_RELEASE_NOT_HELD = 0,
+	CLUSTER_CF_RELEASE_CONFIRMED = 1,
+	CLUSTER_CF_RELEASE_UNCONFIRMED = 2
+} ClusterCfReleaseResult;
+
+extern bool cluster_cf_held_is_clusterwide(LOCKMODE mode);
+extern ClusterCfReleaseResult cluster_cf_unlock_confirmed(LOCKMODE mode);
+
 /*
  * cluster_cf_held -- true if this backend currently holds the CF lock in the
  * given mode.  Used by the write path to Assert the caller-level CF X is held
