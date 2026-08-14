@@ -2388,10 +2388,118 @@ UT_TEST(test_88_authorized_request_drift_never_mutates_table)
 	SemanticActivationAckTable = NULL;
 }
 
+static SemanticActivationAdmissionSnapshot
+valid_source_open_snapshot(void)
+{
+	return (SemanticActivationAdmissionSnapshot){
+		.seq = 6,
+		.active_bits = 0,
+		.record_generation = 9,
+		.formation_epoch = 9,
+		.transition_closed = false,
+	};
+}
+
+static SemanticActivationAckIngressItem
+valid_current_durable_sample_request_item(void)
+{
+	SemanticActivationAckIngressItem item
+		= valid_current_sample_request_item();
+
+	item.message.source_feature_bitmap = 0;
+	item.message.target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	return item;
+}
+
+UT_TEST(test_89_current_sample_request_accepts_exact_durable_source_open)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckIngressItem item
+		= valid_current_durable_sample_request_item();
+	SemanticActivationAdmissionSnapshot snapshot
+		= valid_source_open_snapshot();
+	uint32 local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+
+	memset(&table, 0, sizeof(table));
+	pg_atomic_init_u64(&table.publication_seq, 0);
+	set_current_sample_request_dependencies();
+	SemanticActivationAckTable = &table;
+
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_accept_current_sample_request(
+		&item, &snapshot, UINT64_C(0x09), 0, 9, 0,
+		local_capability_word),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_APPLIED);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&table.publication_seq), 2);
+	UT_ASSERT_EQ(table.record_generation, UINT64_C(10));
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0x08));
+	UT_ASSERT_EQ(table.observed[3].boot_id, UINT64_C(12));
+	SemanticActivationAckTable = NULL;
+}
+
+static void
+assert_current_sample_request_not_authorized(
+	const SemanticActivationAckIngressItem *item,
+	const SemanticActivationAdmissionSnapshot *snapshot,
+	ClusterSemanticActivationAckTableV1 *table)
+{
+	ClusterSemanticActivationAckTableV1 before = *table;
+	uint32 local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_accept_current_sample_request(
+		item, snapshot, UINT64_C(0x09), 0, 9, 0,
+		local_capability_word),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED);
+	UT_ASSERT_EQ(memcmp(table, &before, sizeof(*table)), 0);
+}
+
+UT_TEST(test_90_current_sample_request_rejects_durable_stage_drift)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckIngressItem item;
+	SemanticActivationAdmissionSnapshot snapshot;
+
+	memset(&table, 0, sizeof(table));
+	pg_atomic_init_u64(&table.publication_seq, 4);
+	set_current_sample_request_dependencies();
+	SemanticActivationAckTable = &table;
+
+	item = valid_current_durable_sample_request_item();
+	snapshot = valid_source_open_snapshot();
+	snapshot.seq = 7;
+	assert_current_sample_request_not_authorized(&item, &snapshot, &table);
+	snapshot = valid_source_open_snapshot();
+	snapshot.transition_closed = true;
+	assert_current_sample_request_not_authorized(&item, &snapshot, &table);
+	snapshot = valid_source_open_snapshot();
+	snapshot.formation_epoch = 8;
+	assert_current_sample_request_not_authorized(&item, &snapshot, &table);
+	snapshot = valid_source_open_snapshot();
+	snapshot.record_generation = 8;
+	assert_current_sample_request_not_authorized(&item, &snapshot, &table);
+	snapshot = valid_source_open_snapshot();
+	snapshot.active_bits = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	item.message.source_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	assert_current_sample_request_not_authorized(&item, &snapshot, &table);
+	item = valid_current_durable_sample_request_item();
+	snapshot = valid_source_open_snapshot();
+	item.message.target_feature_bitmap = 0;
+	assert_current_sample_request_not_authorized(&item, &snapshot, &table);
+	item = valid_current_durable_sample_request_item();
+	item.message.rollback_feature_bitmap = 1;
+	assert_current_sample_request_not_authorized(&item, &snapshot, &table);
+	SemanticActivationAckTable = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(88);
+	UT_PLAN(90);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -2480,6 +2588,8 @@ main(void)
 	UT_RUN(test_86_complete_ack_image_rejects_self_remote_and_row_drift);
 	UT_RUN(test_87_authorized_request_installs_self_and_duplicate_is_inert);
 	UT_RUN(test_88_authorized_request_drift_never_mutates_table);
+	UT_RUN(test_89_current_sample_request_accepts_exact_durable_source_open);
+	UT_RUN(test_90_current_sample_request_rejects_durable_stage_drift);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -2074,6 +2074,44 @@ semantic_activation_snapshot(SemanticActivationAdmissionSnapshot *snapshot)
 	return false;
 }
 
+/*
+ * A remote member cannot inspect the coordinator's process-local utility
+ * mailbox.  It accepts the authenticated current coordinator's SAMPLE nonce
+ * only against its own stable D10 durable SOURCE-open projection.  The caller
+ * still owns current-formation sampling; this helper remains outside the raw
+ * ingress drain until ACK send/retry ownership is installed.
+ */
+static SemanticActivationAckConsumeResult
+semantic_activation_ack_lmon_accept_current_sample_request(
+	const SemanticActivationAckIngressItem *item,
+	const SemanticActivationAdmissionSnapshot *snapshot,
+	uint64 current_members_lo, uint64 current_members_hi,
+	uint64 current_epoch, int32 current_coordinator_node,
+	uint32 local_capability_word)
+{
+	const ClusterSemanticActivationAckWireV1 *message;
+
+	if (item == NULL || snapshot == NULL)
+		return SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
+	message = &item->message;
+	if ((snapshot->seq & UINT64_C(1)) != 0
+		|| snapshot->transition_closed
+		|| snapshot->formation_epoch != current_epoch
+		|| snapshot->record_generation == UINT64_MAX
+		|| message->record_generation
+		   != snapshot->record_generation + 1
+		|| snapshot->active_bits != 0
+		|| message->source_feature_bitmap != snapshot->active_bits
+		|| message->target_feature_bitmap
+		   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| message->rollback_feature_bitmap != 0)
+		return SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
+
+	return semantic_activation_ack_lmon_install_authorized_request(
+		item, current_members_lo, current_members_hi, current_epoch,
+		current_coordinator_node, local_capability_word);
+}
+
 static bool
 semantic_activation_counter_increment(pg_atomic_uint32 *counter)
 {
