@@ -2172,7 +2172,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				sleep_ms = (int)remaining_ms;
 		}
 
-		if (ConditionVariableTimedSleep(&entry->cv, sleep_ms, wait_ev)) {
+		if (!ConditionVariableTimedSleep(&entry->cv, sleep_ms, wait_ev)) {
 			/* CV signaled — re-check loop predicate. */
 			continue;
 		}
@@ -2448,8 +2448,8 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 					sleep_ms = (int)remaining_ms;
 			}
 
-			if (ConditionVariableTimedSleep(&entry->cv, sleep_ms,
-											WAIT_EVENT_CLUSTER_GES_REPLY_WAIT))
+			if (!ConditionVariableTimedSleep(&entry->cv, sleep_ms,
+										 WAIT_EVENT_CLUSTER_GES_REPLY_WAIT))
 				continue;
 
 			attempt++;

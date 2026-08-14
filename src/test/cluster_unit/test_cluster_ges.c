@@ -381,6 +381,8 @@ static uint64 stub_bast_ack = 0;
 static uint64 stub_deadlock_probe_drop = 0;
 static uint64 stub_backend_request_enqueue_count = 0;
 static GesRequestPayload stub_backend_request_last;
+static GesReplyWaitEntry stub_reply_wait_entry;
+static uint64 stub_backend_request_ready_after = 0;
 static uint64 stub_cancel_wait_enqueue_count = 0;
 static uint32 stub_cancel_wait_last_dest = 0;
 static GesCancelWaitPayload stub_cancel_wait_last;
@@ -519,6 +521,11 @@ cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(), con
 	stub_backend_request_enqueue_count++;
 	if (p != NULL && l == sizeof(GesRequestPayload))
 		memcpy(&stub_backend_request_last, p, sizeof(stub_backend_request_last));
+	if (stub_backend_request_ready_after > 0
+		&& stub_backend_request_enqueue_count >= stub_backend_request_ready_after) {
+		stub_reply_wait_entry.reject_reason = GES_REJECT_REASON_NONE;
+		stub_reply_wait_entry.ready = true;
+	}
 	return true;
 }
 
@@ -751,7 +758,6 @@ cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest, const void *p pg_attr
 
 /* cluster_ges_reply_wait API stubs (spec-2.23 D1). */
 static bool stub_reply_wait_insert_enabled = false;
-static GesReplyWaitEntry stub_reply_wait_entry;
 
 GesReplyWaitEntry *
 cluster_ges_reply_wait_insert(const GesReplyWaitKey *k pg_attribute_unused(),
@@ -950,6 +956,8 @@ DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
 
 static bool stub_clock_advances = false;
 static TimestampTz stub_now = 0;
+static bool stub_cv_timeout_expires = true;
+static TimestampTz stub_cv_now_after_sleep = 0;
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -972,10 +980,12 @@ ConditionVariableCancelSleep(void)
 }
 bool
 ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
-							long timeout pg_attribute_unused(),
-							uint32 wait_event pg_attribute_unused())
+								long timeout pg_attribute_unused(),
+								uint32 wait_event pg_attribute_unused())
 {
-	return true;
+	if (stub_cv_now_after_sleep > 0)
+		stub_now = stub_cv_now_after_sleep;
+	return stub_cv_timeout_expires;
 }
 
 
@@ -1468,10 +1478,84 @@ UT_TEST(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait)
 	stub_now = 0;
 }
 
+/*
+ * PostgreSQL's ConditionVariableTimedSleep() returns true when the timeout
+ * expires and false when the CV is signaled.  A timed-out remote GES wait must
+ * therefore enter the retransmit leg before the absolute deadline expires.
+ * The second enqueue below stands in for the retry reaching a now-ready
+ * master and delivering the grant.
+ */
+UT_TEST(test_ges_request_cv_timeout_retransmits)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint32 result;
+
+	memset(&resid, 0x4C, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 21;
+	holder.cluster_epoch = 0;
+	holder.request_id = UINT64CONST(0x0102030405060708);
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = false;
+	stub_now = 0;
+	stub_cv_timeout_expires = true;
+	stub_cv_now_after_sleep = INT64CONST(2000000);
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 2;
+
+	result = cluster_ges_send_request_and_wait(&resid, AccessExclusiveLock, &holder,
+											   holder.request_id, 1000, 0);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)2);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_cv_now_after_sleep = 0;
+	stub_backend_request_ready_after = 0;
+}
+
+UT_TEST(test_ges_release_cv_timeout_retransmits)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint32 result;
+
+	memset(&resid, 0x6D, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 22;
+	holder.cluster_epoch = 0;
+	holder.request_id = UINT64CONST(0x1112131415161718);
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = false;
+	stub_now = 0;
+	stub_cv_timeout_expires = true;
+	stub_cv_now_after_sleep = INT64CONST(61000000);
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 2;
+
+	result = cluster_ges_send_release_and_wait(&resid, &holder, holder.request_id);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)2);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_cv_now_after_sleep = 0;
+	stub_backend_request_ready_after = 0;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(19);
+	UT_PLAN(21);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -1492,6 +1576,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_native_lock_probe_request_dispatch);
 	UT_RUN(test_ges_native_lock_probe_reply_dispatch);
 	UT_RUN(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait);
+	UT_RUN(test_ges_request_cv_timeout_retransmits);
+	UT_RUN(test_ges_release_cv_timeout_retransmits);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
