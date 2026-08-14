@@ -688,7 +688,7 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	ClusterSemanticActivationShmem shmem;
 	ClusterSemanticActivationUtilityMailboxShmem utility;
 	ClusterSemanticActivationCasRequest request;
-	ClusterSemanticActivationRecord desired_record = valid_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 8);
+	ClusterSemanticActivationRecord desired_record = valid_record(CLUSTER_SEMANTIC_PHASE_PREPARE, 8);
 	ClusterSemanticActivationResult result = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 	uint64 seq = UINT64_MAX;
