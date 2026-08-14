@@ -235,6 +235,10 @@ extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
 								  ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);
+extern bool cluster_semantic_activation_resolve_shared_undo_root(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out);
 extern bool cluster_semantic_activation_peer_open_matches(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 required_hello_caps, uint32 sampled_capability_generation);
