@@ -2555,10 +2555,104 @@ UT_TEST(test_92_pending_send_retains_refusal_and_aborts_hard_error)
 	UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
 }
 
+UT_TEST(test_93_four_node_sample_request_installs_self_and_sends_positive_ack)
+{
+	ClusterSemanticActivationShmem shmem;
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckIngressItem item
+		= valid_current_durable_sample_request_item();
+	ClusterSemanticActivationAckWireV1 expected;
+	ClusterSemanticActivationAckWireV1 sent;
+	uint32 local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	int node;
+
+	memset(&shmem, 0, sizeof(shmem));
+	pg_atomic_init_u64(&shmem.admission_seq, 6);
+	pg_atomic_init_u64(&shmem.active_bits, 0);
+	pg_atomic_init_u64(&shmem.record_generation, 9);
+	pg_atomic_init_u64(&shmem.formation_epoch, 9);
+	pg_atomic_init_u32(&shmem.transition_closed, 0);
+	memset(&table, 0, sizeof(table));
+	pg_atomic_init_u64(&table.publication_seq, 0);
+	item.message.admitted_members_lo = UINT64_C(0x0f);
+
+	set_current_sample_request_dependencies();
+	cluster_r4_activation_test_admitted_snapshot_valid = true;
+	cluster_r4_activation_test_admitted_members_lo = UINT64_C(0x0f);
+	cluster_r4_activation_test_admitted_members_hi = 0;
+	cluster_r4_activation_test_admitted_epoch = 9;
+	cluster_r4_activation_test_current_epoch = 9;
+	cluster_r4_activation_test_capability_word_sample_ok = true;
+	cluster_r4_activation_test_capability_word = local_capability_word;
+	cluster_r4_activation_test_capability_generation = 7;
+	cluster_r4_activation_test_local_capability_word = local_capability_word;
+	memset(cluster_r4_activation_test_capability_sample_calls, 0,
+		sizeof(cluster_r4_activation_test_capability_sample_calls));
+	memset(cluster_r4_activation_test_send_results, 0,
+		sizeof(cluster_r4_activation_test_send_results));
+	memset(cluster_r4_activation_test_send_calls, 0,
+		sizeof(cluster_r4_activation_test_send_calls));
+	memset(cluster_r4_activation_test_send_payloads, 0,
+		sizeof(cluster_r4_activation_test_send_payloads));
+	memset(cluster_r4_activation_test_send_payload_lengths, 0,
+		sizeof(cluster_r4_activation_test_send_payload_lengths));
+	memset(cluster_r4_activation_test_send_msg_types, 0,
+		sizeof(cluster_r4_activation_test_send_msg_types));
+	memset(cluster_r4_activation_test_close_calls, 0,
+		sizeof(cluster_r4_activation_test_close_calls));
+	memset(&semantic_activation_ack_local_pending_send, 0,
+		sizeof(semantic_activation_ack_local_pending_send));
+	cluster_node_id = 3;
+	SemanticActivationShmem = &shmem;
+	SemanticActivationAckTable = &table;
+	semantic_activation_ack_ingress_init(
+		&semantic_activation_ack_local_ingress);
+	UT_ASSERT(semantic_activation_ack_ingress_push(
+		&semantic_activation_ack_local_ingress, &item));
+
+	cluster_semantic_activation_lmon_tick();
+
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
+				 &semantic_activation_ack_local_ingress), 0);
+	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0x08));
+	UT_ASSERT_EQ(table.observed[3].boot_id, UINT64_C(12));
+	UT_ASSERT_EQ(table.observed[3].capability_word,
+		local_capability_word);
+	expected = item.message;
+	expected.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	expected.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+	expected.member_node = 3;
+	expected.boot_id = 12;
+	expected.admitted_incarnation = 12;
+	expected.capability_word = local_capability_word;
+	for (node = 0; node < 3; node++) {
+		UT_ASSERT_EQ(cluster_r4_activation_test_capability_sample_calls[node], 1);
+		UT_ASSERT_EQ(cluster_r4_activation_test_send_calls[node], 1);
+		UT_ASSERT_EQ(cluster_r4_activation_test_send_msg_types[node],
+			PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1);
+		UT_ASSERT_EQ(cluster_r4_activation_test_send_payload_lengths[node],
+			CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES);
+		UT_ASSERT(cluster_semantic_activation_ack_wire_decode(
+			cluster_r4_activation_test_send_payloads[node], &sent));
+		UT_ASSERT_EQ(memcmp(&sent, &expected, sizeof(sent)), 0);
+		UT_ASSERT_EQ(cluster_r4_activation_test_close_calls[node], 0);
+	}
+	UT_ASSERT_EQ(cluster_r4_activation_test_capability_sample_calls[3], 0);
+	UT_ASSERT_EQ(cluster_r4_activation_test_send_calls[3], 0);
+	UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo, 0);
+	UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_hi, 0);
+	UT_ASSERT(!semantic_activation_ack_local_pending_send.invalidated);
+	SemanticActivationAckTable = NULL;
+	SemanticActivationShmem = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(93);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -2651,6 +2745,7 @@ main(void)
 	UT_RUN(test_90_current_sample_request_rejects_durable_stage_drift);
 	UT_RUN(test_91_pending_send_clears_done_and_admitted_would_block);
 	UT_RUN(test_92_pending_send_retains_refusal_and_aborts_hard_error);
+	UT_RUN(test_93_four_node_sample_request_installs_self_and_sends_positive_ack);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -242,6 +242,12 @@ cluster_sf_peer_capability_word_sample(int32 peer_id pg_attribute_unused(),
 	return false;
 }
 
+uint32
+cluster_ic_local_capability_word(void)
+{
+	return 0;
+}
+
 int
 cluster_membership_member_count(void)
 {

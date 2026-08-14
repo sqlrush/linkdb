@@ -21,6 +21,8 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
+#include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_undo_smgr.h"
@@ -281,6 +283,16 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id,
 static bool cluster_r4_activation_test_capability_word_sample_ok;
 static uint32 cluster_r4_activation_test_capability_word;
 static uint32 cluster_r4_activation_test_capability_generation;
+static uint32 cluster_r4_activation_test_capability_sample_calls[CLUSTER_MAX_NODES];
+static uint32 cluster_r4_activation_test_local_capability_word;
+static ClusterICSendResult
+	cluster_r4_activation_test_send_results[CLUSTER_MAX_NODES];
+static uint32 cluster_r4_activation_test_send_calls[CLUSTER_MAX_NODES];
+static uint8 cluster_r4_activation_test_send_payloads[CLUSTER_MAX_NODES]
+	[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+static uint32 cluster_r4_activation_test_send_payload_lengths[CLUSTER_MAX_NODES];
+static uint8 cluster_r4_activation_test_send_msg_types[CLUSTER_MAX_NODES];
+static uint32 cluster_r4_activation_test_close_calls[CLUSTER_MAX_NODES];
 
 bool
 cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
@@ -291,6 +303,8 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabiliti
 		*capability_word_out = 0;
 	if (generation_out != NULL)
 		*generation_out = 0;
+	if (peer_id >= 0 && peer_id < CLUSTER_MAX_NODES)
+		cluster_r4_activation_test_capability_sample_calls[peer_id]++;
 	if (!cluster_r4_activation_test_capability_word_sample_ok
 		|| peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
 		|| required_capabilities == 0
@@ -302,6 +316,35 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabiliti
 	if (generation_out != NULL)
 		*generation_out = cluster_r4_activation_test_capability_generation;
 	return true;
+}
+
+uint32
+cluster_ic_local_capability_word(void)
+{
+	return cluster_r4_activation_test_local_capability_word;
+}
+
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id,
+						 const void *payload, uint32 payload_len)
+{
+	if (dest_node_id < 0 || dest_node_id >= CLUSTER_MAX_NODES
+		|| payload == NULL
+		|| payload_len != CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES)
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	cluster_r4_activation_test_send_calls[dest_node_id]++;
+	cluster_r4_activation_test_send_msg_types[dest_node_id] = msg_type;
+	cluster_r4_activation_test_send_payload_lengths[dest_node_id] = payload_len;
+	memcpy(cluster_r4_activation_test_send_payloads[dest_node_id], payload,
+		payload_len);
+	return cluster_r4_activation_test_send_results[dest_node_id];
+}
+
+void
+cluster_ic_tier1_close_peer(int32 peer_id, const char *reason pg_attribute_unused())
+{
+	if (peer_id >= 0 && peer_id < CLUSTER_MAX_NODES)
+		cluster_r4_activation_test_close_calls[peer_id]++;
 }
 
 void
