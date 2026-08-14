@@ -34,6 +34,10 @@ volatile uint32 QueryCancelHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;
 char *cluster_shared_data_dir;
 static bool cluster_r4_activation_test_formation_valid;
+static int32 cluster_r4_activation_test_membership_node = -1;
+static uint64 cluster_r4_activation_test_membership_floor;
+static ClusterMembershipState cluster_r4_activation_test_membership_state
+	= CLUSTER_MEMBER_MEMBER;
 
 void ProcessInterrupts(void);
 
@@ -106,7 +110,25 @@ cluster_qvotec_get_self_incarnation(void)
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 node_id)
 {
+	if (node_id == cluster_r4_activation_test_membership_node)
+		return cluster_r4_activation_test_membership_floor;
 	return node_id >= 0 && node_id < CLUSTER_MAX_NODES ? 1 : 0;
+}
+
+ClusterMembershipState
+cluster_membership_get_state(int32 node_id)
+{
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_MEMBER_REMOVED;
+	if (node_id == cluster_r4_activation_test_membership_node)
+		return cluster_r4_activation_test_membership_state;
+	return CLUSTER_MEMBER_MEMBER;
+}
+
+bool
+cluster_membership_is_member(int32 node_id)
+{
+	return cluster_membership_get_state(node_id) == CLUSTER_MEMBER_MEMBER;
 }
 
 uint64
@@ -209,12 +231,21 @@ cluster_gcs_block_r4_requester_count(void)
 
 bool cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
 											uint32 expected_generation);
+static bool cluster_r4_activation_test_capability_generation_matches;
+static int32 cluster_r4_activation_test_capability_peer = -1;
+static uint32 cluster_r4_activation_test_capability_required;
+static uint32 cluster_r4_activation_test_capability_expected_generation;
 bool
-cluster_sf_peer_capability_generation_matches(int32 peer_id pg_attribute_unused(),
-											uint32 required_capabilities pg_attribute_unused(),
-											uint32 expected_generation pg_attribute_unused())
+cluster_sf_peer_capability_generation_matches(int32 peer_id,
+											uint32 required_capabilities,
+											uint32 expected_generation)
 {
-	return false;
+	return cluster_r4_activation_test_capability_generation_matches
+		   && peer_id == cluster_r4_activation_test_capability_peer
+		   && required_capabilities
+			  == cluster_r4_activation_test_capability_required
+		   && expected_generation
+			  == cluster_r4_activation_test_capability_expected_generation;
 }
 
 static bool cluster_r4_activation_test_capability_word_sample_ok;

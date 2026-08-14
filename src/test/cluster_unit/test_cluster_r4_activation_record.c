@@ -1649,10 +1649,121 @@ UT_TEST(test_72_ack_handler_only_enqueues_and_counts_typed_drops)
 				 SEMANTIC_ACTIVATION_ACK_INGRESS_FULL], UINT64_C(1));
 }
 
+static SemanticActivationAckIngressItem
+valid_positive_ack_item(void)
+{
+	SemanticActivationAckIngressItem item;
+
+	memset(&item, 0, sizeof(item));
+	item.message = valid_positive_ack();
+	item.authenticated_source_node_id = 3;
+	item.local_receiver_node_id = 0;
+	item.sampled_capability_word = item.message.capability_word;
+	item.sampled_capability_generation = 7;
+	return item;
+}
+
+static void
+assert_remote_ack_tuple_rejected(const SemanticActivationAckIngressItem *item,
+								 uint64 current_members_lo,
+								 uint64 current_members_hi,
+								 uint64 current_epoch,
+								 int32 current_coordinator)
+{
+	SemanticActivationAckTuple output;
+	SemanticActivationAckTuple before;
+
+	memset(&output, 0xa5, sizeof(output));
+	before = output;
+	UT_ASSERT(!semantic_activation_ack_remote_tuple(
+		item, current_members_lo, current_members_hi, current_epoch,
+		current_coordinator, &output));
+	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
+}
+
+UT_TEST(test_73_lmon_remote_ack_builds_exact_current_tuple)
+{
+	SemanticActivationAckIngressItem item = valid_positive_ack_item();
+	SemanticActivationAckTuple output;
+
+	cluster_r4_activation_test_membership_node = 3;
+	cluster_r4_activation_test_membership_floor = 12;
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+	cluster_r4_activation_test_capability_generation_matches = true;
+	cluster_r4_activation_test_capability_peer = 3;
+	cluster_r4_activation_test_capability_required
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	cluster_r4_activation_test_capability_expected_generation = 7;
+	memset(&output, 0xa5, sizeof(output));
+
+	UT_ASSERT(semantic_activation_ack_remote_tuple(
+		&item, UINT64_C(0x0b), 0, 9, 0, &output));
+	UT_ASSERT_EQ(output.node_id, 3);
+	UT_ASSERT_EQ(output.boot_id, UINT64_C(12));
+	UT_ASSERT_EQ(output.admitted_incarnation, UINT64_C(12));
+	UT_ASSERT_EQ(output.control_connection_generation, UINT64_C(7));
+	UT_ASSERT_EQ(output.capability_word, item.message.capability_word);
+	UT_ASSERT_EQ(output.capability_generation, UINT64_C(7));
+	UT_ASSERT_EQ(output.transition_epoch, UINT64_C(9));
+	UT_ASSERT_EQ(output.record_generation, UINT64_C(10));
+}
+
+UT_TEST(test_74_lmon_remote_ack_revalidates_every_authority_input)
+{
+	SemanticActivationAckIngressItem item = valid_positive_ack_item();
+
+	cluster_r4_activation_test_membership_node = 3;
+	cluster_r4_activation_test_membership_floor = 12;
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+	cluster_r4_activation_test_capability_generation_matches = true;
+	cluster_r4_activation_test_capability_peer = 3;
+	cluster_r4_activation_test_capability_required
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	cluster_r4_activation_test_capability_expected_generation = 7;
+
+	assert_remote_ack_tuple_rejected(NULL, UINT64_C(0x0b), 0, 9, 0);
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, -1);
+
+	item.message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	item = valid_positive_ack_item();
+	item.message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	item = valid_positive_ack_item();
+	item.message.member_node = 4;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	item = valid_positive_ack_item();
+	item.message.coordinator_node = 1;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	item = valid_positive_ack_item();
+	item.local_receiver_node_id = 1;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	item = valid_positive_ack_item();
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x07), 0, 9, 0);
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 1, 9, 0);
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 8, 0);
+
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_JOINING;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+	cluster_r4_activation_test_membership_floor = 13;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	cluster_r4_activation_test_membership_floor = 12;
+
+	item.sampled_capability_word ^= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	item = valid_positive_ack_item();
+	item.sampled_capability_generation = 0;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+	item = valid_positive_ack_item();
+	cluster_r4_activation_test_capability_generation_matches = false;
+	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(72);
+	UT_PLAN(74);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -1725,6 +1836,8 @@ main(void)
 	UT_RUN(test_70_ack_ingress_rejects_role_epoch_and_sample_drift);
 	UT_RUN(test_71_ack_ingress_accepts_request_and_refusal_roles);
 	UT_RUN(test_72_ack_handler_only_enqueues_and_counts_typed_drops);
+	UT_RUN(test_73_lmon_remote_ack_builds_exact_current_tuple);
+	UT_RUN(test_74_lmon_remote_ack_revalidates_every_authority_input);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

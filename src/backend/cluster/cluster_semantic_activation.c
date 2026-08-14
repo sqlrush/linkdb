@@ -307,6 +307,11 @@ semantic_activation_ack_ingress_receive(
 	SemanticActivationAckIngress *ingress, const ClusterICEnvelope *env,
 	const void *payload, uint32 payload_length,
 	int32 local_receiver_node_id, uint64 current_epoch) pg_attribute_unused();
+static bool semantic_activation_ack_remote_tuple(
+	const SemanticActivationAckIngressItem *item,
+	uint64 current_members_lo, uint64 current_members_hi,
+	uint64 current_epoch, int32 current_coordinator_node,
+	SemanticActivationAckTuple *out) pg_attribute_unused();
 
 static void
 semantic_activation_ack_ingress_init(SemanticActivationAckIngress *ingress)
@@ -449,6 +454,79 @@ semantic_activation_ack_ingress_receive(
 	if (!semantic_activation_ack_ingress_push(ingress, &item))
 		return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
 	return SEMANTIC_ACTIVATION_ACK_INGRESS_ENQUEUED;
+}
+
+static bool
+semantic_activation_ack_remote_tuple(
+	const SemanticActivationAckIngressItem *item,
+	uint64 current_members_lo, uint64 current_members_hi,
+	uint64 current_epoch, int32 current_coordinator_node,
+	SemanticActivationAckTuple *out)
+{
+	SemanticActivationAckTuple tuple;
+	const ClusterSemanticActivationAckWireV1 *message;
+	int32 source_node;
+	bool source_is_admitted;
+	bool coordinator_is_admitted;
+
+	if (item == NULL || out == NULL
+		|| current_coordinator_node < 0
+		|| current_coordinator_node >= CLUSTER_MAX_NODES
+		|| (current_members_lo == 0 && current_members_hi == 0))
+		return false;
+	message = &item->message;
+	source_node = item->authenticated_source_node_id;
+	if (source_node < 0 || source_node >= CLUSTER_MAX_NODES
+		|| item->local_receiver_node_id != current_coordinator_node
+		|| message->kind != CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
+		|| message->result != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
+		|| message->coordinator_node != (uint32)current_coordinator_node
+		|| message->member_node != (uint32)source_node
+		|| message->admitted_members_lo != current_members_lo
+		|| message->admitted_members_hi != current_members_hi
+		|| message->transition_epoch != current_epoch
+		|| message->boot_id == 0
+		|| message->boot_id != message->admitted_incarnation
+		|| item->sampled_capability_generation == 0
+		|| item->sampled_capability_word != message->capability_word
+		|| (item->sampled_capability_word
+			& CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS)
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS)
+		return false;
+
+	source_is_admitted
+		= source_node < 64
+			  ? (current_members_lo & (UINT64_C(1) << source_node)) != 0
+			  : (current_members_hi
+				 & (UINT64_C(1) << (source_node - 64))) != 0;
+	coordinator_is_admitted
+		= current_coordinator_node < 64
+			  ? (current_members_lo
+				 & (UINT64_C(1) << current_coordinator_node)) != 0
+			  : (current_members_hi
+				 & (UINT64_C(1) << (current_coordinator_node - 64))) != 0;
+	if (!source_is_admitted || !coordinator_is_admitted
+		|| cluster_membership_get_state(source_node) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(source_node)
+		   != message->admitted_incarnation
+		|| !cluster_sf_peer_capability_generation_matches(
+			source_node, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS,
+			item->sampled_capability_generation))
+		return false;
+
+	memset(&tuple, 0, sizeof(tuple));
+	tuple.node_id = (uint32)source_node;
+	tuple.boot_id = message->boot_id;
+	tuple.admitted_incarnation = message->admitted_incarnation;
+	tuple.control_connection_generation
+		= (uint64)item->sampled_capability_generation;
+	tuple.capability_word = item->sampled_capability_word;
+	tuple.capability_generation
+		= (uint64)item->sampled_capability_generation;
+	tuple.transition_epoch = message->transition_epoch;
+	tuple.record_generation = message->record_generation;
+	*out = tuple;
+	return true;
 }
 
 void
