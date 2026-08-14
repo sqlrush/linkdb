@@ -21,6 +21,18 @@
 int cluster_node_id = 0;
 
 void *
+palloc(Size size)
+{
+	return malloc(size);
+}
+
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
+
+void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr pg_attribute_unused())
 {
@@ -2649,10 +2661,82 @@ UT_TEST(test_93_four_node_sample_request_installs_self_and_sends_positive_ack)
 	SemanticActivationShmem = NULL;
 }
 
+static void
+init_four_member_digest_table(ClusterSemanticActivationAckTableV1 *table,
+							  bool reverse_fill)
+{
+	int index;
+
+	memset(table, 0, sizeof(*table));
+	pg_atomic_init_u64(&table->publication_seq, 0);
+	table->stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	table->flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+				   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE;
+	table->coordinator_node = 0;
+	table->round_nonce = UINT64_C(0x55);
+	table->expected_members_lo = UINT64_C(0x0f);
+	table->observed_members_lo = UINT64_C(0x0f);
+	table->transition_epoch = UINT64_C(0x0102030405060708);
+	table->record_generation = UINT64_C(0x1112131415161718);
+	table->source_feature_bitmap = UINT64_C(0);
+	table->target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	for (index = 0; index < 4; index++) {
+		SemanticActivationAckTuple tuple;
+		int node = reverse_fill ? 3 - index : index;
+
+		memset(&tuple, 0, sizeof(tuple));
+		tuple.node_id = (uint32)node;
+		tuple.boot_id = UINT64_C(0x100) + (uint64)node;
+		tuple.admitted_incarnation = tuple.boot_id;
+		tuple.control_connection_generation
+			= UINT64_C(0x200) + (uint64)node;
+		tuple.capability_word
+			= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+			  | (uint32)node;
+		tuple.capability_generation
+			= UINT64_C(0x300) + (uint64)node;
+		tuple.transition_epoch = table->transition_epoch;
+		tuple.record_generation = table->record_generation;
+		table->expected[node] = tuple;
+		table->observed[node] = tuple;
+	}
+}
+
+UT_TEST(test_94_four_member_sample_digest_is_canonical)
+{
+	ClusterSemanticActivationAckTableV1 forward;
+	ClusterSemanticActivationAckTableV1 reverse;
+	uint64 forward_digest = 0;
+	uint64 reverse_digest = 0;
+	uint64 changed_digest = 0;
+
+	init_four_member_digest_table(&forward, false);
+	init_four_member_digest_table(&reverse, true);
+	UT_ASSERT(semantic_activation_ack_sample_digest(
+		&forward, &forward_digest));
+	UT_ASSERT_EQ(forward_digest, UINT64_C(0x4e1a478a5d70e37e));
+	UT_ASSERT(semantic_activation_ack_sample_digest(
+		&reverse, &reverse_digest));
+	UT_ASSERT_EQ(reverse_digest, forward_digest);
+
+	reverse.expected[2].capability_generation ^= UINT64_C(1);
+	reverse.observed[2] = reverse.expected[2];
+	UT_ASSERT(semantic_activation_ack_sample_digest(
+		&reverse, &changed_digest));
+	UT_ASSERT(changed_digest != forward_digest);
+
+	forward.flags &= ~CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE;
+	forward_digest = UINT64_MAX;
+	UT_ASSERT(!semantic_activation_ack_sample_digest(
+		&forward, &forward_digest));
+	UT_ASSERT_EQ(forward_digest, UINT64_C(0));
+}
+
 int
 main(void)
 {
-	UT_PLAN(93);
+	UT_PLAN(94);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -2746,6 +2830,7 @@ main(void)
 	UT_RUN(test_91_pending_send_clears_done_and_admitted_would_block);
 	UT_RUN(test_92_pending_send_retains_refusal_and_aborts_hard_error);
 	UT_RUN(test_93_four_node_sample_request_installs_self_and_sends_positive_ack);
+	UT_RUN(test_94_four_member_sample_digest_is_canonical);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

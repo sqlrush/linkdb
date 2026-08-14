@@ -35,6 +35,8 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "common/cryptohash.h"
+#include "common/sha2.h"
 #include "port/atomics.h"
 #include "port/pg_crc32c.h"
 #include "storage/ipc.h"
@@ -1863,6 +1865,9 @@ semantic_activation_failure_policy(SemanticActivationState state,
 static bool semantic_activation_ack_tuple_encode(
 	const SemanticActivationAckTuple *tuple,
 	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES]) pg_attribute_unused();
+static bool semantic_activation_ack_sample_digest(
+	const ClusterSemanticActivationAckTableV1 *image,
+	uint64 *digest_out) pg_attribute_unused();
 
 static bool
 semantic_activation_ack_tuple_encode(
@@ -1885,6 +1890,93 @@ semantic_activation_ack_tuple_encode(
 	semantic_activation_write_u64_le(encoded + 56, tuple->record_generation);
 	memcpy(bytes, encoded, sizeof(encoded));
 	return true;
+}
+
+static bool
+semantic_activation_ack_sample_digest(
+	const ClusterSemanticActivationAckTableV1 *image,
+	uint64 *digest_out)
+{
+	uint8 input[72 + 4 * CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES];
+	uint8 sha256[PG_SHA256_DIGEST_LENGTH];
+	pg_cryptohash_ctx *ctx;
+	uint64 digest = 0;
+	bool success = false;
+	int node;
+	int i;
+
+	if (digest_out == NULL)
+		return false;
+	*digest_out = 0;
+	if (image == NULL
+		|| image->stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+		|| image->flags
+		   != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+			   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
+		|| image->coordinator_node != UINT32_C(0)
+		|| image->round_nonce == 0
+		|| image->expected_members_lo != UINT64_C(0x0f)
+		|| image->expected_members_hi != 0
+		|| image->observed_members_lo != UINT64_C(0x0f)
+		|| image->observed_members_hi != 0
+		|| image->record_generation == 0
+		|| image->source_feature_bitmap != 0
+		|| image->target_feature_bitmap
+		   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| image->rollback_feature_bitmap != 0
+		|| image->capability_sample_digest != 0
+		|| !semantic_activation_ack_image_structural(image)
+		|| !semantic_activation_full_ack_table_matches(
+			image->observed, image->observed_members_lo,
+			image->observed_members_hi, image->expected,
+			image->expected_members_lo, image->expected_members_hi))
+		return false;
+
+	memset(input, 0, sizeof(input));
+	semantic_activation_write_u32_le(input,
+								 CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_MAGIC);
+	semantic_activation_write_u16_le(input + 4,
+								 CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION);
+	semantic_activation_write_u16_le(
+		input + 6, CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES);
+	semantic_activation_write_u64_le(input + 8, image->transition_epoch);
+	semantic_activation_write_u64_le(input + 16, image->record_generation);
+	semantic_activation_write_u64_le(input + 24,
+								 image->expected_members_lo);
+	semantic_activation_write_u64_le(input + 32,
+								 image->expected_members_hi);
+	semantic_activation_write_u64_le(input + 40,
+								 image->source_feature_bitmap);
+	semantic_activation_write_u64_le(input + 48,
+								 image->target_feature_bitmap);
+	semantic_activation_write_u64_le(input + 56,
+								 image->rollback_feature_bitmap);
+	semantic_activation_write_u32_le(input + 64, UINT32_C(4));
+	for (node = 0; node < 4; node++) {
+		if (!semantic_activation_ack_tuple_encode(
+				&image->expected[node],
+				input + 72
+					+ node * CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES))
+			return false;
+	}
+
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return false;
+	if (pg_cryptohash_init(ctx) < 0
+		|| pg_cryptohash_update(ctx, input, sizeof(input)) < 0
+		|| pg_cryptohash_final(ctx, sha256, sizeof(sha256)) < 0)
+		goto done;
+	for (i = 0; i < 8; i++)
+		digest = (digest << 8) | sha256[i];
+	if (digest == 0)
+		goto done;
+	*digest_out = digest;
+	success = true;
+
+done:
+	pg_cryptohash_free(ctx);
+	return success;
 }
 
 static bool
