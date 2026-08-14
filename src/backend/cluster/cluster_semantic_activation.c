@@ -861,6 +861,13 @@ semantic_activation_ack_lmon_accept_current_sample_request(
 	uint64 current_members_lo, uint64 current_members_hi,
 	uint64 current_epoch, int32 current_coordinator_node,
 	uint32 local_capability_word) pg_attribute_unused();
+static SemanticActivationAckConsumeResult
+semantic_activation_ack_lmon_accept_current_barrier_request(
+	const SemanticActivationAckIngressItem *item,
+	const SemanticActivationAdmissionSnapshot *snapshot,
+	uint64 current_members_lo, uint64 current_members_hi,
+	uint64 current_epoch, int32 current_coordinator_node)
+	pg_attribute_unused();
 
 static bool
 semantic_activation_ack_table_publish(
@@ -1598,10 +1605,23 @@ semantic_activation_ack_lmon_drain(void)
 
 			if (!semantic_activation_snapshot(&snapshot))
 				continue;
-			result = semantic_activation_ack_lmon_accept_current_sample_request(
-				&item, &snapshot, current_members_lo, current_members_hi,
-				current_epoch, current_coordinator_node,
-				local_capability_word);
+			if (item.message.stage
+				== CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE)
+				result
+					= semantic_activation_ack_lmon_accept_current_sample_request(
+						&item, &snapshot, current_members_lo,
+						current_members_hi, current_epoch,
+						current_coordinator_node,
+						local_capability_word);
+			else if (item.message.stage
+					 == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER) {
+				(void)semantic_activation_ack_lmon_accept_current_barrier_request(
+					&item, &snapshot, current_members_lo,
+					current_members_hi, current_epoch,
+					current_coordinator_node);
+				continue;
+			} else
+				continue;
 			if (result != SEMANTIC_ACTIVATION_ACK_CONSUME_APPLIED)
 				continue;
 			if (!semantic_activation_ack_table_snapshot(&image)
@@ -3126,6 +3146,120 @@ semantic_activation_ack_lmon_accept_current_sample_request(
 	return semantic_activation_ack_lmon_install_authorized_request(
 		item, current_members_lo, current_members_hi, current_epoch,
 		current_coordinator_node, local_capability_word);
+}
+
+static SemanticActivationAckConsumeResult
+semantic_activation_ack_lmon_accept_current_barrier_request(
+	const SemanticActivationAckIngressItem *item,
+	const SemanticActivationAdmissionSnapshot *snapshot,
+	uint64 current_members_lo, uint64 current_members_hi,
+	uint64 current_epoch, int32 current_coordinator_node)
+{
+	ClusterSemanticActivationAckTableV1 current;
+	ClusterSemanticActivationAckTableV1 next;
+	const ClusterSemanticActivationAckWireV1 *message;
+	int32 local_node_id;
+
+	if (item == NULL || snapshot == NULL
+		|| !semantic_activation_ack_table_snapshot(&current))
+		return SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
+	message = &item->message;
+	local_node_id = item->local_receiver_node_id;
+	if (!semantic_activation_ack_wire_value_valid(message)
+		|| message->kind
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
+		|| message->stage
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER
+		|| message->result
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST
+		|| current_coordinator_node < 0
+		|| current_coordinator_node >= CLUSTER_MAX_NODES
+		|| local_node_id < 0 || local_node_id >= CLUSTER_MAX_NODES
+		|| local_node_id == current_coordinator_node
+		|| item->authenticated_source_node_id
+		   != current_coordinator_node
+		|| message->coordinator_node
+		   != (uint32)current_coordinator_node
+		|| message->member_node != (uint32)local_node_id
+		|| message->admitted_members_lo != current_members_lo
+		|| message->admitted_members_hi != current_members_hi
+		|| message->transition_epoch != current_epoch
+		|| !semantic_activation_ack_member_present(
+			current_members_lo, current_members_hi,
+			current_coordinator_node)
+		|| !semantic_activation_ack_member_present(
+			current_members_lo, current_members_hi, local_node_id)
+		|| cluster_membership_get_state(current_coordinator_node)
+		   != CLUSTER_MEMBER_MEMBER
+		|| item->sampled_capability_generation == 0
+		|| (item->sampled_capability_word
+			& CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS)
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		|| !cluster_sf_peer_capability_generation_matches(
+			current_coordinator_node,
+			CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS,
+			item->sampled_capability_generation)
+		|| (snapshot->seq & UINT64_C(1)) != 0
+		|| snapshot->transition_closed
+		|| snapshot->formation_epoch != current_epoch
+		|| snapshot->record_generation == UINT64_MAX
+		|| message->record_generation
+		   != snapshot->record_generation + 1
+		|| snapshot->active_bits != message->source_feature_bitmap
+		|| snapshot->active_bits != 0
+		|| message->target_feature_bitmap
+		   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| message->rollback_feature_bitmap != 0
+		|| current.coordinator_node != message->coordinator_node
+		|| current.round_nonce != message->round_nonce
+		|| current.expected_members_lo != message->admitted_members_lo
+		|| current.expected_members_hi != message->admitted_members_hi
+		|| current.transition_epoch != message->transition_epoch
+		|| current.record_generation != message->record_generation
+		|| current.source_feature_bitmap
+		   != message->source_feature_bitmap
+		|| current.target_feature_bitmap
+		   != message->target_feature_bitmap
+		|| current.rollback_feature_bitmap
+		   != message->rollback_feature_bitmap)
+		return SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
+
+	if (current.stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER) {
+		if (current.flags
+				!= CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+			|| current.capability_sample_digest
+			   != message->capability_sample_digest
+			|| current.observed_members_lo != 0
+			|| current.observed_members_hi != 0
+			|| !semantic_activation_bytes_are_zero(
+				(const uint8 *)current.observed,
+				sizeof(current.observed)))
+			return SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
+		return SEMANTIC_ACTIVATION_ACK_CONSUME_DUPLICATE;
+	}
+	if (current.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+		|| current.flags
+		   != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+			   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
+		|| current.capability_sample_digest != 0
+		|| current.observed_members_lo != current.expected_members_lo
+		|| current.observed_members_hi != current.expected_members_hi
+		|| !semantic_activation_full_ack_table_matches(
+			current.observed, current.observed_members_lo,
+			current.observed_members_hi, current.expected,
+			current.expected_members_lo, current.expected_members_hi))
+		return SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
+
+	memcpy(&next, &current, sizeof(next));
+	next.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER;
+	next.flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID;
+	next.observed_members_lo = 0;
+	next.observed_members_hi = 0;
+	next.capability_sample_digest = message->capability_sample_digest;
+	memset(next.observed, 0, sizeof(next.observed));
+	return semantic_activation_ack_table_publish(&next)
+			   ? SEMANTIC_ACTIVATION_ACK_CONSUME_APPLIED
+			   : SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
 }
 
 static bool

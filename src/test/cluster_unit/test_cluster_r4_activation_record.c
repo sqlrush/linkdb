@@ -2733,10 +2733,92 @@ UT_TEST(test_94_four_member_sample_digest_is_canonical)
 	UT_ASSERT_EQ(forward_digest, UINT64_C(0));
 }
 
+UT_TEST(test_95_four_node_barrier_request_retains_expected_without_ack)
+{
+	ClusterSemanticActivationShmem shmem;
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckTuple expected[CLUSTER_MAX_NODES];
+	SemanticActivationAckIngressItem item;
+	uint64 digest = 0;
+	int node;
+
+	init_four_member_digest_table(&table, false);
+	UT_ASSERT(semantic_activation_ack_sample_digest(&table, &digest));
+	memcpy(expected, table.expected, sizeof(expected));
+	memset(&item, 0, sizeof(item));
+	item.message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	item.message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER;
+	item.message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	item.message.coordinator_node = 0;
+	item.message.member_node = 3;
+	item.message.transition_epoch = table.transition_epoch;
+	item.message.record_generation = table.record_generation;
+	item.message.round_nonce = table.round_nonce;
+	item.message.source_feature_bitmap = table.source_feature_bitmap;
+	item.message.target_feature_bitmap = table.target_feature_bitmap;
+	item.message.rollback_feature_bitmap = table.rollback_feature_bitmap;
+	item.message.admitted_members_lo = table.expected_members_lo;
+	item.message.admitted_members_hi = table.expected_members_hi;
+	item.message.capability_sample_digest = digest;
+	item.authenticated_source_node_id = 0;
+	item.local_receiver_node_id = 3;
+	item.sampled_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	item.sampled_capability_generation = 7;
+
+	memset(&shmem, 0, sizeof(shmem));
+	pg_atomic_init_u64(&shmem.admission_seq, 6);
+	pg_atomic_init_u64(&shmem.active_bits, 0);
+	pg_atomic_init_u64(&shmem.record_generation,
+				   table.record_generation - 1);
+	pg_atomic_init_u64(&shmem.formation_epoch, table.transition_epoch);
+	pg_atomic_init_u32(&shmem.transition_closed, 0);
+	set_current_sample_request_dependencies();
+	cluster_r4_activation_test_admitted_snapshot_valid = true;
+	cluster_r4_activation_test_admitted_members_lo = UINT64_C(0x0f);
+	cluster_r4_activation_test_admitted_members_hi = 0;
+	cluster_r4_activation_test_admitted_epoch = table.transition_epoch;
+	cluster_r4_activation_test_current_epoch = table.transition_epoch;
+	memset(cluster_r4_activation_test_send_calls, 0,
+		sizeof(cluster_r4_activation_test_send_calls));
+	memset(&semantic_activation_ack_local_pending_send, 0,
+		sizeof(semantic_activation_ack_local_pending_send));
+	cluster_node_id = 3;
+	SemanticActivationShmem = &shmem;
+	SemanticActivationAckTable = &table;
+	semantic_activation_ack_ingress_init(
+		&semantic_activation_ack_local_ingress);
+	UT_ASSERT(semantic_activation_ack_ingress_push(
+		&semantic_activation_ack_local_ingress, &item));
+
+	cluster_semantic_activation_lmon_tick();
+
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
+				 &semantic_activation_ack_local_ingress), 0);
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	UT_ASSERT_EQ(table.flags,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID);
+	UT_ASSERT_EQ(table.capability_sample_digest, digest);
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0));
+	UT_ASSERT_EQ(table.observed_members_hi, UINT64_C(0));
+	UT_ASSERT_EQ(memcmp(table.expected, expected, sizeof(expected)), 0);
+	UT_ASSERT_EQ(memcmp(table.observed,
+				  (SemanticActivationAckTuple[CLUSTER_MAX_NODES]){{0}},
+				  sizeof(table.observed)), 0);
+	for (node = 0; node < 4; node++)
+		UT_ASSERT_EQ(cluster_r4_activation_test_send_calls[node], 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_generation),
+				 table.record_generation - 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&shmem.transition_closed), 0);
+	SemanticActivationAckTable = NULL;
+	SemanticActivationShmem = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(94);
+	UT_PLAN(95);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -2831,6 +2913,7 @@ main(void)
 	UT_RUN(test_92_pending_send_retains_refusal_and_aborts_hard_error);
 	UT_RUN(test_93_four_node_sample_request_installs_self_and_sends_positive_ack);
 	UT_RUN(test_94_four_member_sample_digest_is_canonical);
+	UT_RUN(test_95_four_node_barrier_request_retains_expected_without_ack);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
