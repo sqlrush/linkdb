@@ -140,6 +140,23 @@ cluster_vis_update_xmax_verdict(ClusterTTStatus status, bool is_delete)
 	}
 }
 
+ClusterVisVerdict
+cluster_vis_update_lock_only_xmax_verdict(ClusterTTStatus status)
+{
+	switch (status) {
+	case CLUSTER_TT_STATUS_ABORTED:
+	case CLUSTER_TT_STATUS_COMMITTED:
+	case CLUSTER_TT_STATUS_CLEANED_OUT:
+		return CVV_VISIBLE;
+	case CLUSTER_TT_STATUS_IN_PROGRESS:
+	case CLUSTER_TT_STATUS_SUBCOMMITTED:
+		return CVV_BEING_MODIFIED;
+	case CLUSTER_TT_STATUS_UNKNOWN:
+	default:
+		return CVV_FAILCLOSED_UNKNOWN;
+	}
+}
+
 /*
  * spec-3.21 §2.3: CR image xmax-side MVCC verdict (pure; mirrors OBS-1 amend
  * MVCC-accurate, the multixact-member table at cluster_visibility_resolve.c).

@@ -119,6 +119,8 @@ static bool test_pending_fatal_delivery;
 static bool test_pending_fatal_saw_odd;
 static bool test_pending_fatal_saw_holdoff;
 static int test_pending_fatal_deliveries;
+static bool test_cancel_token_pending;
+static uint64 test_current_mx_stats[CMX_STAT_COUNT];
 static sigjmp_buf test_fail_stop_stack;
 
 PGPROC *MyProc;
@@ -136,6 +138,22 @@ volatile uint32 QueryCancelHoldoffCount;
 volatile uint32 CritSectionCount;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
+
+void
+cluster_multixact_current_stats_bump(ClusterCurrentMxStatId stat)
+{
+	UT_ASSERT(stat >= 0 && stat < CMX_STAT_COUNT);
+	test_current_mx_stats[stat]++;
+}
+
+bool
+cluster_cancel_token_consume(void)
+{
+	bool consumed = test_cancel_token_pending;
+
+	test_cancel_token_pending = false;
+	return consumed;
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -480,7 +498,7 @@ prepare_owned_active_wait(uint32 slot_kind, bool insert_edge)
 	if (slot_kind == CLUSTER_TXW_SLOT_SOURCE) {
 		ClusterTTStatusKey source = test_source_key();
 
-		txw_slot_set(0, &source);
+		txw_slot_set(0, &source, false);
 	}
 	else {
 		ClusterTxLocator locator = test_locator();
@@ -564,6 +582,7 @@ reset_fixture(void)
 	memset(&test_wait_snapshot, 0, sizeof(test_wait_snapshot));
 	test_wait_latch_calls = 0;
 	memset(test_set_latch_calls, 0, sizeof(test_set_latch_calls));
+	memset(test_current_mx_stats, 0, sizeof(test_current_mx_stats));
 	test_wait_latch_throws = false;
 	test_wait_latch_sleeps = false;
 	test_local_xid = (TransactionId)700;
@@ -582,6 +601,7 @@ reset_fixture(void)
 	test_pending_fatal_saw_odd = false;
 	test_pending_fatal_saw_holdoff = false;
 	test_pending_fatal_deliveries = 0;
+	test_cancel_token_pending = false;
 	InterruptPending = false;
 	QueryCancelPending = false;
 	InterruptHoldoffCount = 0;
@@ -874,7 +894,7 @@ UT_TEST(test_reentrant_source_and_target_slots_are_not_overwritten)
 	unsigned char before[sizeof(ClusterTxwWaitSlot)];
 
 	reset_fixture();
-	txw_slot_set(0, &source);
+	txw_slot_set(0, &source, false);
 	memcpy(before, &ClusterTxw->slots[0], sizeof(before));
 	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
 	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1, &reason), CLUSTER_TXW_UNPROVABLE);
@@ -973,6 +993,34 @@ UT_TEST(test_hint_waker_matches_source_discriminant_only)
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->wakeup_count), 1);
 }
 
+UT_TEST(test_current_mx_waker_counts_only_current_source)
+{
+	ClusterTTStatusKey source = test_source_key();
+
+	reset_fixture();
+	UT_ASSERT(txw_slot_set(0, &source, true));
+	UT_ASSERT(txw_slot_set(1, &source, false));
+	cluster_txw_wake_waiters(&source);
+	UT_ASSERT_EQ(test_set_latch_calls[0], 1);
+	UT_ASSERT_EQ(test_set_latch_calls[1], 1);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->wakeup_count), 2);
+	UT_ASSERT_EQ(test_current_mx_stats[CMX_STAT_WAKEUP], 1);
+}
+
+UT_TEST(test_current_mx_source_wait_consumes_deadlock_token_after_cleanup)
+{
+	ClusterTTStatusKey source = test_source_key();
+
+	reset_fixture();
+	test_cancel_token_pending = true;
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000),
+				 CLUSTER_TXW_DEADLOCK);
+	UT_ASSERT(!test_cancel_token_pending);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	assert_slot_clean();
+}
+
 /*
  * A backend can leave the exact wait through proc_exit/FATAL rather than the
  * stack PG_FINALLY.  The before_shmem_exit hook must remove this backend's
@@ -1025,7 +1073,7 @@ UT_TEST(test_backend_exit_cleans_exact_source_and_allows_procno_reuse)
 	uint64 wait_seq;
 
 	reset_fixture();
-	txw_slot_set(0, &source);
+	txw_slot_set(0, &source, false);
 	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait,
 										  CLUSTER_LMD_WAIT_TX, 0, TEST_EPOCH,
 										  test_local_xid);
@@ -1123,7 +1171,7 @@ UT_TEST(test_backend_exit_source_slot_before_publish_cleans_slot_only)
 	ClusterTTStatusKey source = test_source_key();
 
 	reset_fixture();
-	txw_slot_set(0, &source);
+	txw_slot_set(0, &source, false);
 	UT_ASSERT(!invoke_exit_callback_expect_fail_stop());
 	UT_ASSERT_EQ(test_last_elevel, 0);
 	UT_ASSERT_EQ(test_wfg_cancel_calls, 0);
@@ -1359,14 +1407,14 @@ UT_TEST(test_backend_exit_changed_slot_kind_panics_before_any_mutation)
 	UT_ASSERT_EQ(memcmp(&MyProc->cluster_lmd_wait, &wait_before, sizeof(wait_before)), 0);
 
 	reset_fixture();
-	ClusterTxw->slots[0].waiting = 3;
+	ClusterTxw->slots[0].waiting = 4;
 	pg_atomic_write_u32(&ClusterTxw->active_waiters, 1);
 	memcpy(&wait_before, &MyProc->cluster_lmd_wait, sizeof(wait_before));
 	UT_ASSERT(invoke_exit_callback_expect_fail_stop());
 	UT_ASSERT_EQ(test_last_elevel, PANIC);
 	UT_ASSERT_EQ(test_wait_read_calls, 0);
 	UT_ASSERT_EQ(test_cleanup_event_count, 0);
-	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, 3);
+	UT_ASSERT_EQ(ClusterTxw->slots[0].waiting, 4);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), 1);
 	UT_ASSERT_EQ(memcmp(&MyProc->cluster_lmd_wait, &wait_before, sizeof(wait_before)), 0);
 }
@@ -1429,7 +1477,7 @@ UT_TEST(test_backend_exit_counter_underflow_fails_stop_without_freeing_slot)
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(38);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);
@@ -1445,6 +1493,8 @@ main(void)
 	UT_RUN(test_wfg_capacity_refusal_runs_full_cleanup);
 	UT_RUN(test_error_longjmp_runs_same_cleanup_funnel);
 	UT_RUN(test_hint_waker_matches_source_discriminant_only);
+	UT_RUN(test_current_mx_waker_counts_only_current_source);
+	UT_RUN(test_current_mx_source_wait_consumes_deadlock_token_after_cleanup);
 	UT_RUN(test_backend_exit_cleans_exact_target_and_allows_procno_reuse);
 	UT_RUN(test_backend_exit_cleans_exact_source_and_allows_procno_reuse);
 	UT_RUN(test_backend_exit_inactive_state_cleans_owned_slot_without_wfg_cancel);

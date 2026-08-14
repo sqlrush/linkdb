@@ -52,6 +52,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "storage/buf_internals.h"
 
@@ -524,6 +525,61 @@ UT_TEST(test_r4_extended_route_length_mismatch_refused)
 					 -1);
 }
 
+/* ======================================================================
+ * Current-MX describe/proof forwards preserve the request identity in the
+ * legacy 64-byte prefix but overlay its BufferTag.  Their frozen 128-byte
+ * frames therefore route by GcsBlockCurrentMxRouteTagMake(), and only the
+ * two runtime kinds are admitted at that exact length.
+ * ====================================================================== */
+UT_TEST(test_current_mx_forward128_routes_by_request_identity)
+{
+	ClusterCurrentMxDescribeForwardV2 describe;
+	ClusterCurrentMxProofForwardV2 proof;
+	BufferTag route_tag;
+	int expected;
+
+	memset(&describe, 0, sizeof(describe));
+	describe.prefix.request_id = UINT64CONST(0x1122334455667788);
+	describe.prefix.epoch = UINT64CONST(0x0102030405060708);
+	describe.prefix.original_requester_node = 2;
+	describe.prefix.requester_backend_id = 19;
+	describe.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	describe.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	describe.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+
+	route_tag = GcsBlockCurrentMxRouteTagMake(
+		describe.prefix.request_id, describe.prefix.epoch,
+		describe.prefix.original_requester_node,
+		describe.prefix.requester_backend_id);
+	expected = cluster_lms_shard_for_tag(&route_tag, CLUSTER_LMS_MAX_WORKERS);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe, sizeof(describe),
+		CLUSTER_LMS_MAX_WORKERS), expected);
+
+	memset(&proof, 0, sizeof(proof));
+	proof.prefix.request_id = describe.prefix.request_id;
+	proof.prefix.epoch = describe.prefix.epoch;
+	proof.prefix.original_requester_node = describe.prefix.original_requester_node;
+	proof.prefix.requester_backend_id = describe.prefix.requester_backend_id;
+	proof.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	proof.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	proof.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof),
+		CLUSTER_LMS_MAX_WORKERS), expected);
+
+	describe.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe, sizeof(describe),
+		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof) - 1,
+		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof) + 1,
+		CLUSTER_LMS_MAX_WORKERS), -1);
+}
+
 /* Every staged PCM-X frame is tag-affine.  RETIRE/RETIRE_ACK are the only
  * direct-send members because their compact payload intentionally has no tag. */
 UT_TEST(test_pcm_x_route_truth_table)
@@ -618,7 +674,7 @@ UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -629,6 +685,7 @@ main(void)
 	UT_RUN(test_r4_extended_route_exact_lengths_and_tag_affinity);
 	UT_RUN(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0);
 	UT_RUN(test_r4_extended_route_length_mismatch_refused);
+	UT_RUN(test_current_mx_forward128_routes_by_request_identity);
 	UT_RUN(test_pcm_x_route_truth_table);
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_DONE();

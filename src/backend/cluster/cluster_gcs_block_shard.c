@@ -31,6 +31,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "storage/buf_internals.h"
 
@@ -93,6 +94,24 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &((const GcsBlockRequestPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
+		if (payload_len == CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE) {
+			const GcsBlockForwardPayload *current_mx
+				= (const GcsBlockForwardPayload *)payload;
+			const ClusterCurrentMxDescribeForwardV2 *frame
+				= (const ClusterCurrentMxDescribeForwardV2 *)payload;
+
+			if (!GcsBlockForwardPayloadIsCurrentMxRuntime(current_mx)
+				|| frame->trailer.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+				|| frame->trailer.version != CLUSTER_CURRENT_MX_WIRE_VERSION
+				|| frame->trailer.flags != CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE)
+				return -1;
+			pcm_x_tag = GcsBlockCurrentMxRouteTagMake(
+				current_mx->request_id, current_mx->epoch,
+				current_mx->original_requester_node,
+				current_mx->requester_backend_id);
+			tag = &pcm_x_tag;
+			break;
+		}
 		if (payload_len != sizeof(GcsBlockForwardPayload)
 			&& payload_len != sizeof(ClusterR4CrForwardPayload))
 			return -1;

@@ -73,6 +73,21 @@
 extern bool cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref);
 
 /*
+ * cluster_itl_find_data_tt_ref_by_xid:
+ *
+ *	Derive a data-writer ITL ref by exact xid when t_itl_slot_idx points at
+ *	a later updater.  Heap UPDATE deliberately makes the old version's
+ *	t_itl_slot_idx name that last writer, so its original xmin authority
+ *	must be recovered from the page's bounded ITL array.
+ *
+ *	Only data states (ACTIVE / COMMITTED / ABORTED / NEEDS_CLEANOUT) with a
+ *	real UBA qualify.  The highest wrap wins; a duplicate at the highest
+ *	wrap is ambiguous and returns false.
+ */
+extern bool cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
+												ClusterUndoTTSlotRef *ref);
+
+/*
  * cluster_itl_find_lock_tt_ref_by_xmax (spec-3.4d D1 / F2 / F6):
  *
  *	Scan the ITL slot array on `page` for a LOCK_ONLY slot whose xid
@@ -131,17 +146,18 @@ extern bool cluster_itl_find_lock_slot_index_by_xmax(Page page, TransactionId ra
  *	Scans page ITL slots for a slot where:
  *	  slot->flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
  *	  slot->xid   == multixact_id
- *	On hit, populates *origin_node_id with the origin of the MultiXact
- *	composition.  Returns true on hit, false on miss (caller raises
- *	53R9C cluster_multixact_member_overlay_miss).
+ *	On hit, populates *origin_node_id with the current reader node as a
+ *	legacy local-own hint.  Returns true on hit, false on miss.  A miss is
+ *	benign: this lossy marker is optional and MUST NOT route authoritative
+ *	current-DML or raise an overlay-miss error.
  *
  *	**HC contract:  Caller MUST hold buffer content lock (LW_SHARED or
  *	stronger) covering `page` for the entire call (L200 family).  Pure /
  *	no syscall / no wait (L177 hot path).**
  *
- *	Spec-3.6 partial coverage caveat:  origin_node_id derived from
- *	current cluster_node_id (ClusterPair fixture writer = reader).  真
- *	shared-heap Stage 4+ needs marker slot 自身 encode origin.
+ *	The authoritative origin is derived from the MXID value and resolved by
+ *	on-demand describe/member proof.  This helper deliberately does not
+ *	decode or persist a marker origin.
  */
 extern bool cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId multixact_id,
 													  uint16 *origin_node_id);
@@ -179,16 +195,17 @@ extern bool cluster_itl_page_has_active_slot(Page page);
 /*
  * cluster_itl_stamp_multixact_marker (spec-3.6 v0.3 D7b NEW):
  *	Stamp ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI marker slot for `multixact_id`
- *	on the page backing `buf`.  Reuses cluster_itl_alloc_or_reuse_lock_slot
- *	allocator pattern;  marker slot can be recycled on next stamp.  Caller
- *	MUST hold buffer EXCLUSIVE content lock.  Returns slot_idx on success,
+ *	on the page backing `buf`.  Recasts an existing stale marker first, then
+ *	reuses only FREE or completed lock-only slots; as a lossy hint it never
+ *	evicts a DATA anchor still addressable by tuple.t_itl_slot_idx.  Caller
+ *	MUST hold buffer EXCLUSIVE content lock.
+ *	Returns slot_idx on success,
  *	CLUSTER_ITL_SLOT_UNALLOCATED on OVERFLOW (caller decides whether to
- *	skip / continue with V4 emit alone).
+ *	skip / continue without the page-side hint).
  *
- *	spec-7.1 watch-2: reusing a completed DATA slot folds the evicted
- *	write_scn into the page's recycle watermark (spec-3.10 §v0.5) before
- *	overwriting, exactly like a data-writer recycle -- the marker eviction
- *	drops that slot's undo anchor from the per-page CR candidate set.
+ *	The value-derived MXID origin plus on-demand describe/member proof is
+ *	authoritative, so marker overflow is safe to skip rather than corrupt a
+ *	DATA anchor.  V4 is only an optional all-local fast path.
  */
 extern uint8 cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id);
 

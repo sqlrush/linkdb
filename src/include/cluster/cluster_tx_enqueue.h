@@ -54,7 +54,10 @@ typedef enum ClusterTxwResult {
 	 * Process-local only: callers must retry/fail before any terminal handler. */
 	CLUSTER_TXW_RETRY,
 	/* Exact TARGET authority could not be proved; reason_out is non-NONE. */
-	CLUSTER_TXW_UNPROVABLE
+	CLUSTER_TXW_UNPROVABLE,
+	/* Matching LMD cancel token consumed while the exact wait remained live.
+	 * The wait function returns this only after slot/state/edge cleanup. */
+	CLUSTER_TXW_DEADLOCK
 } ClusterTxwResult;
 
 /*
@@ -65,8 +68,10 @@ typedef enum ClusterTxwResult {
  *   effective_timeout_ms:  finite wait budget; values <= 0 are clamped to a
  *     finite default (perpetual -1 is forbidden, Q6 / 5.1b clause 8).
  *
- * Returns RESOLVED / TIMEOUT / DEAD_HOLDER / RETRY.  RETRY means the caller
- * must leave the current PCM-X freeze window before attempting another wait.
+ * Returns RESOLVED / TIMEOUT / DEAD_HOLDER / RETRY / DEADLOCK.  RETRY means
+ * the caller must leave the current PCM-X freeze window before attempting
+ * another wait.  DEADLOCK means matching-token consumption and all wait
+ * cleanup have completed; the immediate caller maps it to SQLSTATE 40P01.
  * Does not change any tuple.
  */
 extern ClusterTxwResult cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder_key,
@@ -80,6 +85,14 @@ extern ClusterTxwResult cluster_tx_enqueue_wait_exact(const ClusterTxLocator *lo
 
 /* Idempotent R4 D9 SOURCE/TARGET-wait cleanup for proc_exit/FATAL paths. */
 extern void cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code, Datum arg);
+
+/*
+ * Current-DML MultiXact uses the same TX wait semantics and WFG integration,
+ * but marks its waiter slot so the exact matching SetLatch producer can feed
+ * the feature-local wakeup counter.
+ */
+extern ClusterTxwResult cluster_tx_enqueue_wait_current_mx(
+	const ClusterTTStatusKey *holder_key, int effective_timeout_ms);
 
 /*
  * cluster_txw_wake_waiters — wake every backend waiting on holder_key.

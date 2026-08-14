@@ -887,6 +887,20 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
 		ClusterVisResolve mr;
 
+		/*
+		 * spec-3.6b D4: in peer mode every nonterminal current MultiXact
+		 * (including a derived-own ID with mixed-origin members) is decided
+		 * by the heap caller's immutable-descriptor/member-proof bridge.
+		 * HTSU cannot perform that RPC while holding the content lock and
+		 * must not inspect local pg_multixact first.
+		 */
+		if (cluster_peer_mode_enabled()
+			&& !(tuple->t_infomask & HEAP_XMAX_COMMITTED)
+			&& !HEAP_LOCKED_UPGRADED(tuple->t_infomask)) {
+			*res = TM_BeingModified;
+			return true;
+		}
+
 		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_MULTI, &mr);
 		if (mr.multi_marker_is_remote) {
 			*res = TM_BeingModified; /* remote multixact -> D2b bridge 53R9H */
@@ -927,7 +941,9 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 		}
 		return false;
 	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
-		switch (cluster_vis_update_xmax_verdict(r.status, is_delete)) {
+		switch (lock_only
+				? cluster_vis_update_lock_only_xmax_verdict(r.status)
+				: cluster_vis_update_xmax_verdict(r.status, is_delete)) {
 		case CVV_VISIBLE:
 			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			*res = TM_Ok;

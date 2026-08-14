@@ -240,6 +240,7 @@ OBJS = \
 	cluster_subtrans.o \
 	cluster_multixact.o \
 	cluster_multixact_current.o \
+	cluster_multixact_current_stats.o \
 	cluster_multixact_current_wire.o \
 	cluster_multixact_served.o \
 	cluster_mxid_stripe.o \

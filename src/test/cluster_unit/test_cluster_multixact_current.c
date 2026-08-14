@@ -30,6 +30,7 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_xid_stripe.h"
@@ -51,6 +52,12 @@ MemoryContext TopMemoryContext = (MemoryContext)&test_memory_context_storage;
 MemoryContext CurrentMemoryContext = (MemoryContext)&test_memory_context_storage;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+
+pg_attribute_noreturn() void
+pg_re_throw(void)
+{
+	abort();
+}
 
 MemoryContext
 AllocSetContextCreateInternal(MemoryContext parent pg_attribute_unused(),
@@ -136,6 +143,10 @@ pfree(void *pointer)
 {
 	free(pointer);
 }
+
+void
+cluster_multixact_current_stats_bump(ClusterCurrentMxStatId stat pg_attribute_unused())
+{}
 
 bool
 cluster_gcs_block_family_on_data_plane(void)
@@ -1057,6 +1068,13 @@ UT_TEST(test_current_multixact_proof_forward_wire_binding)
 	UT_ASSERT_EQ(decoded.prefix.entry_count, 7);
 	UT_ASSERT_EQ(ClusterCurrentMxProofPrefixGetDescriptorHash(&decoded.prefix),
 				 UINT64CONST(0x8877665544332211));
+	request.prefix.epoch = 0;
+	request.prefix.mxkey.cluster_epoch = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_forward(
+					 &request, sizeof(request), 3, 5, 0, &decoded),
+				 true);
+	request.prefix.epoch = 9;
+	request.prefix.mxkey.cluster_epoch = 9;
 
 	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_forward(
 					 &request, sizeof(request) - 1, 3, 5, 9, &decoded),
@@ -1275,6 +1293,13 @@ UT_TEST(test_current_multixact_describe_wire_binding)
 					 &forward, sizeof(forward), 1, 2, 9, &decoded),
 				 true);
 	UT_ASSERT_EQ(memcmp(&decoded, &forward, sizeof(decoded)), 0);
+	forward.prefix.epoch = 0;
+	forward.prefix.mxkey.cluster_epoch = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
+					 &forward, sizeof(forward), 1, 2, 0, &decoded),
+				 true);
+	forward.prefix.epoch = 9;
+	forward.prefix.mxkey.cluster_epoch = 9;
 
 	forward.prefix.reserved_b[3] = 1;
 	memset(&decoded, 0xa5, sizeof(decoded));

@@ -190,6 +190,7 @@ extern bool cluster_vis_xmin_needs_resolution(uint16 infomask);
 extern bool cluster_vis_prune_must_defer(bool storage_mode, bool cluster_horizon_available);
 extern ClusterVisVerdict cluster_vis_update_xmin_verdict(ClusterTTStatus status);
 extern ClusterVisVerdict cluster_vis_update_xmax_verdict(ClusterTTStatus status, bool is_delete);
+extern ClusterVisVerdict cluster_vis_update_lock_only_xmax_verdict(ClusterTTStatus status);
 
 /*
  * spec-3.21 §2.3: CR image xmax-side MVCC visibility verdict.

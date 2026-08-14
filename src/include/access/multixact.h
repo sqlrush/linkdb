@@ -107,6 +107,14 @@ extern MultiXactId MultiXactIdExpand(MultiXactId multi, TransactionId xid,
 									 MultiXactStatus status);
 extern MultiXactId MultiXactIdCreateFromMembers(int nmembers,
 												MultiXactMember *members);
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Create a requester-owned replacement from a completely proven member set.
+ * This never decodes or expands an old (possibly foreign) MultiXact.
+ */
+extern MultiXactId MultiXactIdCreateFromCurrentMembers(int nmembers,
+														MultiXactMember *members);
+#endif
 
 extern MultiXactId ReadNextMultiXactId(void);
 extern void ReadMultiXactIdRange(MultiXactId *oldest, MultiXactId *next);

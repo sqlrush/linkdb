@@ -311,6 +311,61 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 	return true;
 }
 
+/*
+ * cluster_itl_find_data_tt_ref_by_xid
+ *
+ * Heap UPDATE makes the old tuple version's t_itl_slot_idx point at the
+ * updater, because that slot is the authority for xmax.  Its xmin can still
+ * name an earlier writer whose data ITL slot remains elsewhere on the same
+ * page.  Recover that exact authority by scanning the bounded eight-slot
+ * array.  Lock-only and MultiXact marker states are deliberately excluded:
+ * their xid field has a different consumer (and the marker stores an MXID).
+ */
+bool
+cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
+									ClusterUndoTTSlotRef *ref)
+{
+	const ClusterItlSlotData *slots;
+	int match_idx = -1;
+	uint16 match_wrap = 0;
+	bool highest_wrap_ambiguous = false;
+	uint8 i;
+
+	Assert(page != NULL);
+	Assert(ref != NULL);
+
+	if (!PageHasItl(page))
+		return false;
+	if (!TransactionIdIsValid(raw_xid))
+		return false;
+
+	slots = ClusterPageGetItlSlots(page);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		const ClusterItlSlotData *slot = &slots[i];
+		bool is_data_state;
+
+		is_data_state = slot->flags == ITL_FLAG_ACTIVE
+						|| slot->flags == ITL_FLAG_COMMITTED
+						|| slot->flags == ITL_FLAG_ABORTED
+						|| slot->flags == ITL_FLAG_NEEDS_CLEANOUT;
+		if (!is_data_state || slot->xid != raw_xid
+			|| UBA_is_invalid(slot->undo_segment_head))
+			continue;
+
+		if (match_idx < 0 || slot->wrap > match_wrap) {
+			match_idx = (int)i;
+			match_wrap = slot->wrap;
+			highest_wrap_ambiguous = false;
+		} else if (slot->wrap == match_wrap)
+			highest_wrap_ambiguous = true;
+	}
+
+	if (match_idx < 0 || highest_wrap_ambiguous)
+		return false;
+
+	return cluster_itl_get_tt_ref(page, (uint8)match_idx, ref);
+}
+
 static bool
 cluster_itl_select_lock_slot_index(Page page, TransactionId raw_xmax, uint8 *slot_index_out)
 {
@@ -611,15 +666,16 @@ cluster_itl_alloc_or_reuse_lock_slot(Buffer buf, TransactionId top_xid, uint8 *o
 /*
  * cluster_itl_find_multixact_origin_by_xmax (spec-3.6 v0.3 D7b NEW)
  *
- *	Helper for D6 heapam_visibility reader.  Scan page ITL for marker
- *	slot stamped by D7b (cluster_itl_stamp_multixact_marker);  return
- *	origin info on hit.
+ *	Legacy ancillary helper.  Scan page ITL for a marker stamped by D7b and
+ *	return a local-own hint on hit.  The marker is lossy/optional; callers
+ *	must derive authoritative current-DML origin from the MXID value and use
+ *	on-demand describe/member proof.
  *
  *	**Caller MUST hold buffer content lock** (L200;  validated by
  *	debug-build LWLockHeldByMe assert at caller site).
  *
- *	Spec-3.6 partial coverage:  origin_node_id derived from cluster_node_id
- *	(ClusterPair writer == reader).
+ *	origin_node_id deliberately reports the current reader node only.  It is
+ *	not the composition-origin authority and must not be used for routing.
  */
 bool
 cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId multixact_id,
@@ -645,11 +701,7 @@ cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId multixact_id,
 		if ((MultiXactId)slot->xid != multixact_id)
 			continue;
 
-		/*
-		 * Spec-3.6 partial coverage:  on ClusterPair fixture writer ==
-		 * reader, so origin is the current node.  Stage 4+ shared-heap
-		 * needs marker slot to encode origin via UBA / extra field.
-		 */
+		/* Legacy local-own hint only; never an authoritative origin. */
 		*origin_node_id = (uint16)cluster_node_id;
 		return true;
 	}
@@ -659,11 +711,16 @@ cluster_itl_find_multixact_origin_by_xmax(Page page, MultiXactId multixact_id,
 /*
  * cluster_itl_stamp_multixact_marker (spec-3.6 v0.3 D7b NEW)
  *
- *	Stamp the MultiXact xmax marker into a free/reusable ITL slot on
- *	page backing `buf`.  Caller must hold EXCLUSIVE buffer content lock.
+ *	Stamp the MultiXact xmax marker by recasting a stale marker or by using a
+ *	FREE/completed lock-only ITL slot on page backing `buf`.  A marker is a
+ *	lossy hint and MUST NOT evict a completed DATA slot: live tuples can still
+ *	address that slot through t_itl_slot_idx, and replacing it would turn the
+ *	next visibility check into a false "TT slot recycled" failure.  Caller
+ *	must hold EXCLUSIVE buffer content lock.
  *	Returns slot index on success, CLUSTER_ITL_SLOT_UNALLOCATED if
- *	page ITL is full (caller may skip emit;  V4 wire emit alone covers
- *	cluster propagation — page-side marker is a partial-coverage helper).
+ *	page ITL is full (caller may skip emit; the value-derived MXID origin plus
+ *	on-demand describe/member proof remains authoritative, while V4 is only
+ *	an optional all-local fast path).
  */
 uint8
 cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
@@ -671,8 +728,12 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 	Page page;
 	ClusterItlSlotData *slots;
 	int found_idx = -1;
+	int stale_marker_idx = -1;
+	int marker_indices[CLUSTER_ITL_INITRANS_DEFAULT];
+	int marker_count = 0;
 	int free_idx = -1;
 	int reusable_idx = -1;
+	bool cleared_extra_markers = false;
 	uint8 i;
 
 	Assert(BufferIsValid(buf));
@@ -687,23 +748,62 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 
 	slots = ClusterPageGetItlSlots(page);
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
-		if (slots[i].flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI
-			&& (MultiXactId)slots[i].xid == multixact_id) {
-			found_idx = (int)i;
-			break;
+		if (slots[i].flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI) {
+			marker_indices[marker_count++] = (int)i;
+			if ((MultiXactId)slots[i].xid == multixact_id)
+				found_idx = (int)i;
+			continue;
 		}
 		if (slots[i].flags == ITL_FLAG_FREE && free_idx < 0)
 			free_idx = (int)i;
-		else if (cluster_itl_slot_is_completed_reusable(slots[i].flags) && reusable_idx < 0
-				 && !cluster_itl_slot_is_protected_foreign(&slots[i]))
-			reusable_idx = (int)i; /* spec-4.5a G6: never reuse a pinned foreign slot */
+		else if (ITL_FLAG_IS_LOCK_ONLY_COMPLETED(slots[i].flags) && reusable_idx < 0)
+			reusable_idx = (int)i;
 	}
 
-	if (found_idx >= 0)
+	/*
+	 * Lazy upgrade repair: older binaries could leave one marker per MXID.
+	 * Keep the exact marker when present, otherwise keep the first stale one
+	 * as the recast target, and return every other lossy marker to FREE.
+	 * Preserve wrap so a pre-fix DATA anchor that was already overwritten by
+	 * the old marker bug can never ABA-match a future occupant.
+	 */
+	if (marker_count > 0) {
+		int keep_idx = (found_idx >= 0) ? found_idx : marker_indices[0];
+		int marker_no;
+
+		stale_marker_idx = keep_idx;
+		for (marker_no = 0; marker_no < marker_count; marker_no++) {
+			int idx = marker_indices[marker_no];
+			ClusterItlSlotData *slot;
+			uint16 wrap;
+
+			if (idx == keep_idx)
+				continue;
+			slot = &slots[idx];
+			wrap = slot->wrap;
+			memset(slot, 0, sizeof(*slot));
+			slot->wrap = wrap;
+			slot->flags = ITL_FLAG_FREE;
+			cleared_extra_markers = true;
+		}
+	}
+
+	if (found_idx >= 0) {
+		if (cleared_extra_markers)
+			MarkBufferDirty(buf);
 		return (uint8)found_idx; /* already stamped */
+	}
 
 	{
-		int idx = (free_idx >= 0) ? free_idx : reusable_idx;
+		/*
+		 * A marker is not registered in ITL touch cleanup, so it never turns
+		 * into a terminal lock-only state.  Recast a stale lossy marker
+		 * before consuming FREE space; otherwise one marker per successive
+		 * MXID would permanently shrink the page's fixed ITL budget.
+		 */
+		int idx = (stale_marker_idx >= 0)
+					  ? stale_marker_idx
+					  : ((free_idx >= 0) ? free_idx : reusable_idx);
 		ClusterItlSlotData *slot;
 
 		if (idx < 0)
@@ -711,18 +811,11 @@ cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixact_id)
 
 		slot = &slots[idx];
 		/*
-		 * spec-7.1 watch-2 (spec-3.10 §v0.5 parity; latent since spec-3.6):
-		 * evicting a completed DATA slot for a marker drops that slot's
-		 * undo-chain anchor from the per-page CR candidate set exactly like a
-		 * data-writer recycle, so fold its write_scn into the recycle
-		 * watermark BEFORE overwriting -- otherwise own-instance CR silently
-		 * reconstructs post-snapshot versions the dropped anchor guarded
-		 * (false-visible).  new_xid = InvalidTransactionId: the new occupant
-		 * is a MultiXactId, not a data writer, and a completed data slot
-		 * never holds InvalidTransactionId, so the helper's same-xid reuse
-		 * exemption cannot mis-fire on a numeric xid/multixact-id collision.
-		 * FREE / completed lock-only evictions contribute InvalidScn (§v0.5
-		 * B2/Q1) and stay no-ops.  Crash parity holds without a redo change:
+		 * spec-3.6b current-MX closure: idx can only name a stale marker,
+		 * FREE slot, or completed lock-only slot.  Those states contribute
+		 * InvalidScn to the recycle watermark (§v0.5 B2/Q1), so this
+		 * defensive fold is a no-op.  Crash
+		 * parity holds without a redo change:
 		 * the marker write never travels as an ITL delta (heap_lock_tuple
 		 * keeps cluster_did_lock_stamp false for the marker branch), so the
 		 * eviction and the fold move atomically with the page image --

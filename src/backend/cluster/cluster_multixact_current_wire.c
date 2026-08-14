@@ -39,7 +39,7 @@ bytes_are_zero(const void *data, Size length)
 static bool
 wire_epoch_valid(uint64 current_epoch)
 {
-	return current_epoch != 0 && current_epoch <= UINT32_MAX;
+	return current_epoch <= UINT32_MAX;
 }
 
 
