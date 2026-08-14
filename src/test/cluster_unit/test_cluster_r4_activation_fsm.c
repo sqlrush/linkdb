@@ -28,6 +28,7 @@
 
 #define TEST_SEMANTIC_GATE_SHMEM_BYTES 1104
 #define TEST_SEMANTIC_UTILITY_MAILBOX_BYTES 80
+#define TEST_SEMANTIC_ACK_TABLE_BYTES 16496
 #define TEST_GATE_SEQ_OFFSET 552
 #define TEST_GATE_ACTIVE_BITS_OFFSET 560
 #define TEST_GATE_RECORD_GENERATION_OFFSET 568
@@ -45,12 +46,20 @@ typedef union TestSemanticUtilityMailboxStorage {
 	uint8 bytes[TEST_SEMANTIC_UTILITY_MAILBOX_BYTES];
 } TestSemanticUtilityMailboxStorage;
 
+typedef union TestSemanticAckTableStorage {
+	pg_atomic_uint64 align;
+	uint8 bytes[TEST_SEMANTIC_ACK_TABLE_BYTES];
+} TestSemanticAckTableStorage;
+
 static TestSemanticShmemStorage test_semantic_shmem;
 static TestSemanticUtilityMailboxStorage test_semantic_utility_mailbox;
+static TestSemanticAckTableStorage test_semantic_ack_table;
 static bool test_shmem_found;
 static bool test_utility_mailbox_found;
+static bool test_ack_table_found;
 static Size test_shmem_requested_size;
 static Size test_utility_mailbox_requested_size;
+static Size test_ack_table_requested_size;
 static pg_on_exit_callback test_exit_callback;
 static Datum test_exit_callback_arg;
 static int test_exit_registration_count;
@@ -130,6 +139,11 @@ static bool semantic_activation_utility_mailbox_complete(
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
+	if (strcmp(name, "pgrac cluster semantic activation ACK table") == 0) {
+		test_ack_table_requested_size = size;
+		*foundPtr = test_ack_table_found;
+		return test_semantic_ack_table.bytes;
+	}
 	if (strcmp(name, "pgrac cluster semantic activation utility mailbox") == 0) {
 		test_utility_mailbox_requested_size = size;
 		*foundPtr = test_utility_mailbox_found;
@@ -473,10 +487,13 @@ test_gate_reset(void)
 	memset(&test_semantic_shmem, 0, sizeof(test_semantic_shmem));
 	memset(&test_semantic_utility_mailbox, 0,
 		   sizeof(test_semantic_utility_mailbox));
+	memset(&test_semantic_ack_table, 0xa5, sizeof(test_semantic_ack_table));
 	test_shmem_found = false;
 	test_utility_mailbox_found = false;
+	test_ack_table_found = false;
 	test_shmem_requested_size = 0;
 	test_utility_mailbox_requested_size = 0;
+	test_ack_table_requested_size = 0;
 	test_exit_callback = NULL;
 	test_exit_callback_arg = (Datum)0;
 	test_exit_registration_count = 0;
@@ -544,6 +561,7 @@ test_gate_reset(void)
 	cluster_node_id = 1;
 	SemanticActivationShmem = NULL;
 	SemanticActivationUtilityMailbox = NULL;
+	SemanticActivationAckTable = NULL;
 	memset(semantic_activation_local_inflight, 0, sizeof(semantic_activation_local_inflight));
 	semantic_activation_exit_hook_pid = 0;
 	semantic_activation_lmon_record_read_seq = 0;
@@ -2169,14 +2187,38 @@ UT_TEST(test_99_shared_gate_layout_and_bootstrap_are_fail_closed)
 	UT_ASSERT_EQ(test_shmem_requested_size, TEST_SEMANTIC_GATE_SHMEM_BYTES);
 	UT_ASSERT_EQ(test_utility_mailbox_requested_size,
 				 TEST_SEMANTIC_UTILITY_MAILBOX_BYTES);
+	UT_ASSERT_EQ(test_ack_table_requested_size,
+				 TEST_SEMANTIC_ACK_TABLE_BYTES);
 	UT_ASSERT_EQ(cluster_semantic_activation_shmem_size(),
 				 TEST_SEMANTIC_GATE_SHMEM_BYTES
-				 + TEST_SEMANTIC_UTILITY_MAILBOX_BYTES);
+				 + TEST_SEMANTIC_UTILITY_MAILBOX_BYTES
+				 + TEST_SEMANTIC_ACK_TABLE_BYTES);
+	UT_ASSERT(SemanticActivationAckTable
+			  == (ClusterSemanticActivationAckTableV1 *)test_semantic_ack_table.bytes);
+	UT_ASSERT(semantic_activation_bytes_are_zero(
+		test_semantic_ack_table.bytes, sizeof(test_semantic_ack_table.bytes)));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationAckTable->publication_seq), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_SEQ_OFFSET)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_ACTIVE_BITS_OFFSET)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u64(test_gate_u64(TEST_GATE_FORMATION_EPOCH_OFFSET)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_u32(TEST_GATE_CLOSED_OFFSET)), 1);
+}
+
+UT_TEST(test_99a_existing_ack_table_is_preserved_on_attach)
+{
+	test_gate_reset();
+	pg_atomic_write_u64(&SemanticActivationAckTable->publication_seq, 8);
+	SemanticActivationAckTable->stage
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER;
+	test_shmem_found = true;
+	test_utility_mailbox_found = true;
+	test_ack_table_found = true;
+
+	cluster_semantic_activation_shmem_init();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&SemanticActivationAckTable->publication_seq), 8);
+	UT_ASSERT_EQ(SemanticActivationAckTable->stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
 }
 
 UT_TEST(test_100_source_enter_owns_shared_debt_and_epoch_token)
@@ -3124,7 +3166,7 @@ UT_TEST(test_124_cold_bootstrap_zero_historical_floor_accepts_live_pgrd_binding)
 int
 main(void)
 {
-	UT_PLAN(167);
+	UT_PLAN(168);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -3261,6 +3303,7 @@ main(void)
 	UT_RUN(test_97_old_epoch_completion_is_inert_and_requires_revalidation);
 	UT_RUN(test_98_admission_token_has_frozen_natural_layout);
 	UT_RUN(test_99_shared_gate_layout_and_bootstrap_are_fail_closed);
+	UT_RUN(test_99a_existing_ack_table_is_preserved_on_attach);
 	UT_RUN(test_100_source_enter_owns_shared_debt_and_epoch_token);
 	UT_RUN(test_100a_modifier_bootstrap_source_requires_ordinary_write_gate);
 	UT_RUN(test_100b_modifier_bootstrap_source_refuses_replacement_closed_member);

@@ -1214,10 +1214,181 @@ UT_TEST(test_61_ack_wire_encoder_rejects_invalid_host_shape)
 	UT_ASSERT(!cluster_semantic_activation_ack_wire_encode(&message, bytes));
 }
 
+UT_TEST(test_62_ack_tuple_and_table_have_exact_frozen_layout)
+{
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES, 64);
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES, 16496);
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID,
+				 UINT32_C(1));
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE,
+				 UINT32_C(2));
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF,
+				 UINT32_C(4));
+
+	UT_ASSERT_EQ(sizeof(SemanticActivationAckTuple), 64);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, node_id), 0);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, boot_id), 8);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, admitted_incarnation), 16);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple,
+						 control_connection_generation), 24);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, capability_word), 32);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, capability_generation), 40);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, transition_epoch), 48);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckTuple, record_generation), 56);
+
+	UT_ASSERT_EQ(sizeof(ClusterSemanticActivationAckTableV1), 16496);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, publication_seq), 0);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, stage), 8);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, flags), 12);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, coordinator_node), 16);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, reserved), 20);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, round_nonce), 24);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, expected_members_lo), 32);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, expected_members_hi), 40);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, observed_members_lo), 48);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, observed_members_hi), 56);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, transition_epoch), 64);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, record_generation), 72);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1,
+						 source_feature_bitmap), 80);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1,
+						 target_feature_bitmap), 88);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1,
+						 rollback_feature_bitmap), 96);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1,
+						 capability_sample_digest), 104);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, expected), 112);
+	UT_ASSERT_EQ(offsetof(ClusterSemanticActivationAckTableV1, observed), 8304);
+}
+
+UT_TEST(test_63_ack_tuple_encoder_is_exact_and_clears_reserved_gaps)
+{
+	SemanticActivationAckTuple tuple;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES];
+
+	memset(&tuple, 0, sizeof(tuple));
+	tuple.node_id = 3;
+	tuple.boot_id = UINT64_C(0x0102030405060708);
+	tuple.admitted_incarnation = UINT64_C(0x0102030405060708);
+	tuple.control_connection_generation = UINT64_C(0x1112131415161718);
+	tuple.capability_word = UINT32_C(0x0030B000);
+	tuple.capability_generation = UINT64_C(0x2122232425262728);
+	tuple.transition_epoch = UINT64_C(0x3132333435363738);
+	tuple.record_generation = UINT64_C(0x4142434445464748);
+	memset(bytes, 0xa5, sizeof(bytes));
+
+	UT_ASSERT(semantic_activation_ack_tuple_encode(&tuple, bytes));
+	UT_ASSERT_EQ(read_u32_le(bytes), UINT32_C(3));
+	UT_ASSERT_EQ(read_u32_le(bytes + 4), UINT32_C(0));
+	UT_ASSERT_EQ(read_u64_le(bytes + 8), UINT64_C(0x0102030405060708));
+	UT_ASSERT_EQ(read_u64_le(bytes + 16), UINT64_C(0x0102030405060708));
+	UT_ASSERT_EQ(read_u64_le(bytes + 24), UINT64_C(0x1112131415161718));
+	UT_ASSERT_EQ(read_u32_le(bytes + 32), UINT32_C(0x0030B000));
+	UT_ASSERT_EQ(read_u32_le(bytes + 36), UINT32_C(0));
+	UT_ASSERT_EQ(read_u64_le(bytes + 40), UINT64_C(0x2122232425262728));
+	UT_ASSERT_EQ(read_u64_le(bytes + 48), UINT64_C(0x3132333435363738));
+	UT_ASSERT_EQ(read_u64_le(bytes + 56), UINT64_C(0x4142434445464748));
+}
+
+UT_TEST(test_64_shmem_size_includes_exact_ack_table)
+{
+	Size expected = MAXALIGN(sizeof(ClusterSemanticActivationShmem))
+					+ MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem))
+					+ MAXALIGN(CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES);
+
+	UT_ASSERT_EQ(cluster_semantic_activation_shmem_size(), expected);
+}
+
+UT_TEST(test_65_ack_table_snapshot_accepts_even_and_rejects_odd)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	ClusterSemanticActivationAckTableV1 snapshot;
+
+	memset(&table, 0, sizeof(table));
+	pg_atomic_init_u64(&table.publication_seq, 2);
+	table.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER;
+	table.flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID;
+	table.coordinator_node = 1;
+	table.round_nonce = 7;
+	table.expected_members_lo = UINT64_C(0x0f);
+	table.record_generation = 9;
+	table.expected[3].node_id = 3;
+	table.expected[3].boot_id = 11;
+	SemanticActivationAckTable = &table;
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&snapshot));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&snapshot.publication_seq), 2);
+	UT_ASSERT_EQ(snapshot.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	UT_ASSERT_EQ(snapshot.flags,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID);
+	UT_ASSERT_EQ(snapshot.coordinator_node, 1);
+	UT_ASSERT_EQ(snapshot.round_nonce, 7);
+	UT_ASSERT_EQ(snapshot.expected_members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(snapshot.record_generation, 9);
+	UT_ASSERT_EQ(snapshot.expected[3].node_id, 3);
+	UT_ASSERT_EQ(snapshot.expected[3].boot_id, 11);
+
+	pg_atomic_write_u64(&table.publication_seq, 3);
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(!semantic_activation_ack_table_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.stage, UINT32_C(0xa5a5a5a5));
+	SemanticActivationAckTable = NULL;
+}
+
+UT_TEST(test_66_ack_table_publish_advances_even_and_refuses_bad_sequence)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	ClusterSemanticActivationAckTableV1 image;
+
+	memset(&table, 0, sizeof(table));
+	memset(&image, 0, sizeof(image));
+	pg_atomic_init_u64(&table.publication_seq, 4);
+	pg_atomic_init_u64(&image.publication_seq, 100);
+	image.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER;
+	image.flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID;
+	image.coordinator_node = 1;
+	image.round_nonce = 7;
+	image.expected_members_lo = UINT64_C(0x0f);
+	image.transition_epoch = 8;
+	image.record_generation = 9;
+	image.expected[3].node_id = 3;
+	image.expected[3].boot_id = 11;
+	SemanticActivationAckTable = &table;
+
+	UT_ASSERT(semantic_activation_ack_table_publish(&image));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&table.publication_seq), 6);
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	UT_ASSERT_EQ(table.flags,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID);
+	UT_ASSERT_EQ(table.coordinator_node, 1);
+	UT_ASSERT_EQ(table.round_nonce, 7);
+	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(table.transition_epoch, 8);
+	UT_ASSERT_EQ(table.record_generation, 9);
+	UT_ASSERT_EQ(table.expected[3].node_id, 3);
+	UT_ASSERT_EQ(table.expected[3].boot_id, 11);
+
+	pg_atomic_write_u64(&table.publication_seq, 7);
+	image.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED;
+	UT_ASSERT(!semantic_activation_ack_table_publish(&image));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&table.publication_seq), 7);
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	pg_atomic_write_u64(&table.publication_seq, UINT64_MAX - 1);
+	UT_ASSERT(!semantic_activation_ack_table_publish(&image));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&table.publication_seq), UINT64_MAX - 1);
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	SemanticActivationAckTable = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(66);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -1279,6 +1450,11 @@ main(void)
 	UT_RUN(test_59_ack_wire_rejects_out_of_range_or_unadmitted_nodes);
 	UT_RUN(test_60_ack_wire_applies_digest_rule_to_ack_round_identity);
 	UT_RUN(test_61_ack_wire_encoder_rejects_invalid_host_shape);
+	UT_RUN(test_62_ack_tuple_and_table_have_exact_frozen_layout);
+	UT_RUN(test_63_ack_tuple_encoder_is_exact_and_clears_reserved_gaps);
+	UT_RUN(test_64_shmem_size_includes_exact_ack_table);
+	UT_RUN(test_65_ack_table_snapshot_accepts_even_and_rejects_odd);
+	UT_RUN(test_66_ack_table_publish_advances_even_and_refuses_bad_sequence);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

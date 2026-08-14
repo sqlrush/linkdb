@@ -234,6 +234,95 @@ typedef struct SemanticActivationAckTuple {
 	uint64 record_generation;
 } SemanticActivationAckTuple;
 
+typedef struct ClusterSemanticActivationAckTableV1 {
+	pg_atomic_uint64 publication_seq;
+	uint32 stage;
+	uint32 flags;
+	uint32 coordinator_node;
+	uint32 reserved;
+	uint64 round_nonce;
+	uint64 expected_members_lo;
+	uint64 expected_members_hi;
+	uint64 observed_members_lo;
+	uint64 observed_members_hi;
+	uint64 transition_epoch;
+	uint64 record_generation;
+	uint64 source_feature_bitmap;
+	uint64 target_feature_bitmap;
+	uint64 rollback_feature_bitmap;
+	uint64 capability_sample_digest;
+	SemanticActivationAckTuple expected[CLUSTER_MAX_NODES];
+	SemanticActivationAckTuple observed[CLUSTER_MAX_NODES];
+} ClusterSemanticActivationAckTableV1;
+
+StaticAssertDecl(sizeof(SemanticActivationAckTuple)
+				 == CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES,
+				 "semantic activation ACK tuple must remain 64 bytes");
+StaticAssertDecl(sizeof(ClusterSemanticActivationAckTableV1)
+				 == CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES,
+				 "semantic activation ACK table must remain 16496 bytes");
+
+static ClusterSemanticActivationAckTableV1 *SemanticActivationAckTable = NULL;
+
+static bool semantic_activation_ack_table_snapshot(
+	ClusterSemanticActivationAckTableV1 *out) pg_attribute_unused();
+
+static bool
+semantic_activation_ack_table_snapshot(ClusterSemanticActivationAckTableV1 *out)
+{
+	ClusterSemanticActivationAckTableV1 candidate;
+	uint64 seq_before;
+	uint64 seq_after;
+	int attempt;
+
+	if (SemanticActivationAckTable == NULL || out == NULL)
+		return false;
+	for (attempt = 0; attempt < 3; attempt++) {
+		seq_before = pg_atomic_read_u64(
+			&SemanticActivationAckTable->publication_seq);
+		if ((seq_before & UINT64_C(1)) != 0)
+			continue;
+		pg_read_barrier();
+		memcpy(&candidate, SemanticActivationAckTable, sizeof(candidate));
+		pg_read_barrier();
+		seq_after = pg_atomic_read_u64(
+			&SemanticActivationAckTable->publication_seq);
+		if (seq_before == seq_after
+			&& (seq_after & UINT64_C(1)) == 0) {
+			memcpy(out, &candidate, sizeof(candidate));
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool semantic_activation_ack_table_publish(
+	const ClusterSemanticActivationAckTableV1 *image) pg_attribute_unused();
+
+static bool
+semantic_activation_ack_table_publish(
+	const ClusterSemanticActivationAckTableV1 *image)
+{
+	const Size payload_offset
+		= offsetof(ClusterSemanticActivationAckTableV1, stage);
+	uint64 seq;
+
+	if (SemanticActivationAckTable == NULL || image == NULL)
+		return false;
+	seq = pg_atomic_read_u64(&SemanticActivationAckTable->publication_seq);
+	if ((seq & UINT64_C(1)) != 0 || seq > UINT64_MAX - 2)
+		return false;
+
+	pg_atomic_write_u64(&SemanticActivationAckTable->publication_seq, seq + 1);
+	pg_write_barrier();
+	memcpy((uint8 *)SemanticActivationAckTable + payload_offset,
+		   (const uint8 *)image + payload_offset,
+		   sizeof(*SemanticActivationAckTable) - payload_offset);
+	pg_write_barrier();
+	pg_atomic_write_u64(&SemanticActivationAckTable->publication_seq, seq + 2);
+	return true;
+}
+
 typedef enum SemanticActivationHeldLocks {
 	SEMANTIC_ACTIVATION_HELD_NONE = 0,
 	SEMANTIC_ACTIVATION_HELD_RESOURCE = UINT32_C(1),
@@ -505,6 +594,33 @@ semantic_activation_failure_policy(SemanticActivationState state,
 	policy->target = SEMANTIC_ACTIVATION_STATE_SOURCE_OPEN;
 	policy->admission_closed_until_source_open = state != SEMANTIC_ACTIVATION_STATE_SOURCE_OPEN;
 	policy->revert_source_closed = state == SEMANTIC_ACTIVATION_STATE_TARGET_COMMITTED_CLOSED;
+	return true;
+}
+
+static bool semantic_activation_ack_tuple_encode(
+	const SemanticActivationAckTuple *tuple,
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES]) pg_attribute_unused();
+
+static bool
+semantic_activation_ack_tuple_encode(
+	const SemanticActivationAckTuple *tuple,
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES])
+{
+	uint8 encoded[CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES];
+
+	if (tuple == NULL || bytes == NULL)
+		return false;
+	memset(encoded, 0, sizeof(encoded));
+	semantic_activation_write_u32_le(encoded, tuple->node_id);
+	semantic_activation_write_u64_le(encoded + 8, tuple->boot_id);
+	semantic_activation_write_u64_le(encoded + 16, tuple->admitted_incarnation);
+	semantic_activation_write_u64_le(encoded + 24,
+								 tuple->control_connection_generation);
+	semantic_activation_write_u32_le(encoded + 32, tuple->capability_word);
+	semantic_activation_write_u64_le(encoded + 40, tuple->capability_generation);
+	semantic_activation_write_u64_le(encoded + 48, tuple->transition_epoch);
+	semantic_activation_write_u64_le(encoded + 56, tuple->record_generation);
+	memcpy(bytes, encoded, sizeof(encoded));
 	return true;
 }
 
@@ -1396,7 +1512,8 @@ Size
 cluster_semantic_activation_shmem_size(void)
 {
 	return MAXALIGN(sizeof(ClusterSemanticActivationShmem))
-		   + MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem));
+		   + MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem))
+		   + MAXALIGN(sizeof(ClusterSemanticActivationAckTableV1));
 }
 
 void
@@ -1404,6 +1521,7 @@ cluster_semantic_activation_shmem_init(void)
 {
 	bool gate_found;
 	bool mailbox_found;
+	bool ack_table_found;
 	int side;
 	int feature_index;
 
@@ -1415,9 +1533,20 @@ cluster_semantic_activation_shmem_init(void)
 			"pgrac cluster semantic activation utility mailbox",
 			MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem)),
 			&mailbox_found);
+	SemanticActivationAckTable
+		= (ClusterSemanticActivationAckTableV1 *)ShmemInitStruct(
+			"pgrac cluster semantic activation ACK table",
+			MAXALIGN(sizeof(ClusterSemanticActivationAckTableV1)),
+			&ack_table_found);
 	if (SemanticActivationShmem == NULL
-		|| SemanticActivationUtilityMailbox == NULL)
+		|| SemanticActivationUtilityMailbox == NULL
+		|| SemanticActivationAckTable == NULL)
 		return;
+	if (!ack_table_found) {
+		memset(SemanticActivationAckTable, 0,
+			   sizeof(*SemanticActivationAckTable));
+		pg_atomic_init_u64(&SemanticActivationAckTable->publication_seq, 0);
+	}
 
 	if (!gate_found) {
 		pg_atomic_init_u64(&SemanticActivationShmem->record_cas_request_seq, 0);
