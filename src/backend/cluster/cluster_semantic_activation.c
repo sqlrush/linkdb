@@ -2349,6 +2349,133 @@ void
 cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor)
 {}
 
+static bool
+semantic_activation_ack_wire_value_valid(
+	const ClusterSemanticActivationAckWireV1 *message)
+{
+	if (message == NULL
+		|| message->kind < CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
+		|| message->kind > CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
+		|| message->stage < CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+		|| message->stage > CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
+		|| message->result > CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED
+		|| message->coordinator_node >= CLUSTER_MAX_NODES
+		|| message->member_node >= CLUSTER_MAX_NODES
+		|| (message->coordinator_node < 64
+			? (message->admitted_members_lo
+				   & (UINT64_C(1) << message->coordinator_node)) == 0
+			: (message->admitted_members_hi
+				   & (UINT64_C(1) << (message->coordinator_node - 64))) == 0)
+		|| (message->member_node < 64
+			? (message->admitted_members_lo
+				   & (UINT64_C(1) << message->member_node)) == 0
+			: (message->admitted_members_hi
+				   & (UINT64_C(1) << (message->member_node - 64))) == 0)
+		|| message->record_generation == 0 || message->round_nonce == 0
+		|| (message->stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+			&& message->capability_sample_digest != 0)
+		|| (message->stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+			&& message->capability_sample_digest == 0))
+		return false;
+	if (message->kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST)
+		return message->result
+				   == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST
+			&& message->reason == 0
+			&& message->boot_id == 0
+			&& message->admitted_incarnation == 0
+			&& message->capability_word == 0;
+	if (message->result == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK)
+		return message->reason == 0
+			&& message->boot_id != 0
+			&& message->admitted_incarnation != 0
+			&& message->capability_word != 0;
+	if (message->result == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED)
+		return message->reason > CLUSTER_SEMANTIC_ACTIVATION_OK
+			&& message->reason <= CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
+			&& message->boot_id == 0
+			&& message->admitted_incarnation == 0
+			&& message->capability_word == 0;
+	return false;
+}
+
+bool
+cluster_semantic_activation_ack_wire_encode(
+	const ClusterSemanticActivationAckWireV1 *message,
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES])
+{
+	uint8 encoded[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	if (bytes == NULL || !semantic_activation_ack_wire_value_valid(message))
+		return false;
+
+	memset(encoded, 0, sizeof(encoded));
+	semantic_activation_write_u32_le(encoded,
+								 CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_MAGIC);
+	semantic_activation_write_u16_le(encoded + 4,
+								 CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION);
+	encoded[6] = message->kind;
+	encoded[7] = message->stage;
+	semantic_activation_write_u32_le(encoded + 8, message->result);
+	semantic_activation_write_u32_le(encoded + 12, message->reason);
+	semantic_activation_write_u32_le(encoded + 16, message->coordinator_node);
+	semantic_activation_write_u32_le(encoded + 20, message->member_node);
+	semantic_activation_write_u64_le(encoded + 24, message->transition_epoch);
+	semantic_activation_write_u64_le(encoded + 32, message->record_generation);
+	semantic_activation_write_u64_le(encoded + 40, message->round_nonce);
+	semantic_activation_write_u64_le(encoded + 48, message->source_feature_bitmap);
+	semantic_activation_write_u64_le(encoded + 56, message->target_feature_bitmap);
+	semantic_activation_write_u64_le(encoded + 64, message->rollback_feature_bitmap);
+	semantic_activation_write_u64_le(encoded + 72, message->admitted_members_lo);
+	semantic_activation_write_u64_le(encoded + 80, message->admitted_members_hi);
+	semantic_activation_write_u64_le(encoded + 88, message->capability_sample_digest);
+	semantic_activation_write_u64_le(encoded + 96, message->boot_id);
+	semantic_activation_write_u64_le(encoded + 104, message->admitted_incarnation);
+	semantic_activation_write_u32_le(encoded + 112, message->capability_word);
+	memcpy(bytes, encoded, sizeof(encoded));
+	return true;
+}
+
+bool
+cluster_semantic_activation_ack_wire_decode(
+	const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES],
+	ClusterSemanticActivationAckWireV1 *message)
+{
+	ClusterSemanticActivationAckWireV1 decoded;
+
+	if (bytes == NULL || message == NULL)
+		return false;
+	if (semantic_activation_read_u32_le(bytes)
+			!= CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_MAGIC
+		|| semantic_activation_read_u16_le(bytes + 4)
+			!= CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION
+		|| !semantic_activation_bytes_are_zero(bytes + 116, 4))
+		return false;
+
+	memset(&decoded, 0, sizeof(decoded));
+	decoded.kind = bytes[6];
+	decoded.stage = bytes[7];
+	decoded.result = semantic_activation_read_u32_le(bytes + 8);
+	decoded.reason = semantic_activation_read_u32_le(bytes + 12);
+	decoded.coordinator_node = semantic_activation_read_u32_le(bytes + 16);
+	decoded.member_node = semantic_activation_read_u32_le(bytes + 20);
+	decoded.transition_epoch = semantic_activation_read_u64_le(bytes + 24);
+	decoded.record_generation = semantic_activation_read_u64_le(bytes + 32);
+	decoded.round_nonce = semantic_activation_read_u64_le(bytes + 40);
+	decoded.source_feature_bitmap = semantic_activation_read_u64_le(bytes + 48);
+	decoded.target_feature_bitmap = semantic_activation_read_u64_le(bytes + 56);
+	decoded.rollback_feature_bitmap = semantic_activation_read_u64_le(bytes + 64);
+	decoded.admitted_members_lo = semantic_activation_read_u64_le(bytes + 72);
+	decoded.admitted_members_hi = semantic_activation_read_u64_le(bytes + 80);
+	decoded.capability_sample_digest = semantic_activation_read_u64_le(bytes + 88);
+	decoded.boot_id = semantic_activation_read_u64_le(bytes + 96);
+	decoded.admitted_incarnation = semantic_activation_read_u64_le(bytes + 104);
+	decoded.capability_word = semantic_activation_read_u32_le(bytes + 112);
+	if (!semantic_activation_ack_wire_value_valid(&decoded))
+		return false;
+	*message = decoded;
+	return true;
+}
+
 bool
 cluster_semantic_activation_record_encode(const ClusterSemanticActivationRecord *record,
 										  uint8 bytes[512])

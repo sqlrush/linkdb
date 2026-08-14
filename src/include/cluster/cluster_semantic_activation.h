@@ -19,6 +19,52 @@
 
 #define CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 (UINT64_C(1) << 0)
 #define CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES 512
+#define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_MAGIC UINT32_C(0x314B4341)
+#define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION UINT16_C(1)
+#define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES 120
+#define CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS UINT32_C(0x0030B000)
+
+typedef enum ClusterSemanticActivationAckKind {
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_INVALID = 0,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST = 1,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK = 2
+} ClusterSemanticActivationAckKind;
+
+typedef enum ClusterSemanticActivationAckStage {
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_INVALID = 0,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE = 1,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER = 2,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED = 3,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED = 4,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED = 5
+} ClusterSemanticActivationAckStage;
+
+typedef enum ClusterSemanticActivationAckResult {
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST = 0,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK = 1,
+	CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED = 2
+} ClusterSemanticActivationAckResult;
+
+typedef struct ClusterSemanticActivationAckWireV1 {
+	uint8 kind;
+	uint8 stage;
+	uint32 result;
+	uint32 reason;
+	uint32 coordinator_node;
+	uint32 member_node;
+	uint64 transition_epoch;
+	uint64 record_generation;
+	uint64 round_nonce;
+	uint64 source_feature_bitmap;
+	uint64 target_feature_bitmap;
+	uint64 rollback_feature_bitmap;
+	uint64 admitted_members_lo;
+	uint64 admitted_members_hi;
+	uint64 capability_sample_digest;
+	uint64 boot_id;
+	uint64 admitted_incarnation;
+	uint32 capability_word;
+} ClusterSemanticActivationAckWireV1;
 
 typedef enum ClusterSemanticAdmissionSide {
 	CLUSTER_SEMANTIC_SOURCE_SIDE = 0,
@@ -198,10 +244,16 @@ extern void cluster_semantic_activation_shmem_init(void);
 extern void
 cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor);
 extern bool cluster_semantic_activation_record_encode(const ClusterSemanticActivationRecord *record,
-													  uint8 bytes[512]);
+												  uint8 bytes[512]);
 extern bool cluster_semantic_activation_record_decode(const uint8 bytes[512],
-													  ClusterSemanticActivationRecord *record,
-													  ClusterSemanticActivationRefusal *refusal);
+												  ClusterSemanticActivationRecord *record,
+												  ClusterSemanticActivationRefusal *refusal);
+extern bool cluster_semantic_activation_ack_wire_encode(
+	const ClusterSemanticActivationAckWireV1 *message,
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES]);
+extern bool cluster_semantic_activation_ack_wire_decode(
+	const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES],
+	ClusterSemanticActivationAckWireV1 *message);
 extern ClusterSemanticActivationResult cluster_semantic_activation_record_cas_write(
 	uint64 expected_generation, uint64 expected_source_feature_bitmap, const uint8 bytes[512]);
 extern bool

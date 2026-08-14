@@ -389,6 +389,7 @@ typedef enum ClusterICPlane {
 #define PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1 ((uint32)0x00002000U)
 /* Spec-5.15A corrected-A1 indivisible replacement/epoch/READY grammar.
  * 0x00004000 was a superseded standalone proposal and must stay unused. */
+#define PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1 UINT32_C(0x00008000)
 #define PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1 ((uint32)0x00100000U)
 /* Spec-8.4A A-prime: this binary preserves and validates the append-only
  * PGRD V1 root descriptor and its exact mirror applicability proof. */

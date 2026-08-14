@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "port/pg_crc32c.h"
 #include "storage/shmem.h"
@@ -811,10 +812,412 @@ UT_TEST(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox)
 	cluster_r4_activation_test_formation_valid = false;
 }
 
+UT_TEST(test_51_ack_sample_request_has_exact_wire_bytes)
+{
+	ClusterSemanticActivationAckWireV1 message;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	memset(&message, 0, sizeof(message));
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	message.coordinator_node = 1;
+	message.member_node = 3;
+	message.transition_epoch = UINT64_C(0x0102030405060708);
+	message.record_generation = UINT64_C(0x1112131415161718);
+	message.round_nonce = UINT64_C(0x2122232425262728);
+	message.source_feature_bitmap = UINT64_C(0x3132333435363738);
+	message.target_feature_bitmap = UINT64_C(0x4142434445464748);
+	message.rollback_feature_bitmap = UINT64_C(0x5152535455565758);
+	message.admitted_members_lo = UINT64_C(0x000000000000000f);
+	message.admitted_members_hi = UINT64_C(0);
+	memset(bytes, 0xa5, sizeof(bytes));
+
+	UT_ASSERT_EQ(PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1, 65);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1,
+				 UINT32_C(0x00008000));
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS,
+				 UINT32_C(0x0030B000));
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES, 120);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, bytes));
+	UT_ASSERT_EQ(bytes[0], 0x41);
+	UT_ASSERT_EQ(bytes[1], 0x43);
+	UT_ASSERT_EQ(bytes[2], 0x4b);
+	UT_ASSERT_EQ(bytes[3], 0x31);
+	UT_ASSERT_EQ(read_u16_le(bytes + 4), UINT16_C(1));
+	UT_ASSERT_EQ(bytes[6], 1);
+	UT_ASSERT_EQ(bytes[7], 1);
+	UT_ASSERT_EQ(read_u32_le(bytes + 8), UINT32_C(0));
+	UT_ASSERT_EQ(read_u32_le(bytes + 12), UINT32_C(0));
+	UT_ASSERT_EQ(read_u32_le(bytes + 16), UINT32_C(1));
+	UT_ASSERT_EQ(read_u32_le(bytes + 20), UINT32_C(3));
+	UT_ASSERT_EQ(read_u64_le(bytes + 24), UINT64_C(0x0102030405060708));
+	UT_ASSERT_EQ(read_u64_le(bytes + 32), UINT64_C(0x1112131415161718));
+	UT_ASSERT_EQ(read_u64_le(bytes + 40), UINT64_C(0x2122232425262728));
+	UT_ASSERT_EQ(read_u64_le(bytes + 48), UINT64_C(0x3132333435363738));
+	UT_ASSERT_EQ(read_u64_le(bytes + 56), UINT64_C(0x4142434445464748));
+	UT_ASSERT_EQ(read_u64_le(bytes + 64), UINT64_C(0x5152535455565758));
+	UT_ASSERT_EQ(read_u64_le(bytes + 72), UINT64_C(0x000000000000000f));
+	UT_ASSERT_EQ(read_u64_le(bytes + 80), UINT64_C(0));
+	UT_ASSERT_EQ(read_u64_le(bytes + 88), UINT64_C(0));
+	UT_ASSERT_EQ(read_u64_le(bytes + 96), UINT64_C(0));
+	UT_ASSERT_EQ(read_u64_le(bytes + 104), UINT64_C(0));
+	UT_ASSERT_EQ(read_u32_le(bytes + 112), UINT32_C(0));
+	UT_ASSERT_EQ(read_u32_le(bytes + 116), UINT32_C(0));
+}
+
+UT_TEST(test_52_ack_wire_decodes_hand_written_little_endian_bytes)
+{
+	static const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES] = {
+		0x41, 0x43, 0x4b, 0x31, 0x01, 0x00, 0x02, 0x04,
+		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+		0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+		0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+		0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
+		0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
+		0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41,
+		0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51,
+		0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61,
+		0x78, 0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71,
+		0x88, 0x87, 0x86, 0x85, 0x84, 0x83, 0x82, 0x81,
+		0x98, 0x97, 0x96, 0x95, 0x94, 0x93, 0x92, 0x91,
+		0x00, 0xb0, 0x30, 0x00, 0x00, 0x00, 0x00, 0x00
+	};
+	ClusterSemanticActivationAckWireV1 message;
+
+	memset(&message, 0xa5, sizeof(message));
+	UT_ASSERT(cluster_semantic_activation_ack_wire_decode(bytes, &message));
+	UT_ASSERT_EQ(message.kind, CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK);
+	UT_ASSERT_EQ(message.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED);
+	UT_ASSERT_EQ(message.result, CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK);
+	UT_ASSERT_EQ(message.reason, UINT32_C(0));
+	UT_ASSERT_EQ(message.coordinator_node, UINT32_C(1));
+	UT_ASSERT_EQ(message.member_node, UINT32_C(3));
+	UT_ASSERT_EQ(message.transition_epoch, UINT64_C(0x0102030405060708));
+	UT_ASSERT_EQ(message.record_generation, UINT64_C(0x1112131415161718));
+	UT_ASSERT_EQ(message.round_nonce, UINT64_C(0x2122232425262728));
+	UT_ASSERT_EQ(message.source_feature_bitmap, UINT64_C(0x3132333435363738));
+	UT_ASSERT_EQ(message.target_feature_bitmap, UINT64_C(0x4142434445464748));
+	UT_ASSERT_EQ(message.rollback_feature_bitmap, UINT64_C(0x5152535455565758));
+	UT_ASSERT_EQ(message.admitted_members_lo, UINT64_C(0x000000000000000f));
+	UT_ASSERT_EQ(message.admitted_members_hi, UINT64_C(0x6162636465666768));
+	UT_ASSERT_EQ(message.capability_sample_digest, UINT64_C(0x7172737475767778));
+	UT_ASSERT_EQ(message.boot_id, UINT64_C(0x8182838485868788));
+	UT_ASSERT_EQ(message.admitted_incarnation, UINT64_C(0x9192939495969798));
+	UT_ASSERT_EQ(message.capability_word, UINT32_C(0x0030B000));
+}
+
+UT_TEST(test_53_ack_wire_rejects_nonzero_reserved_without_output_mutation)
+{
+	ClusterSemanticActivationAckWireV1 input;
+	ClusterSemanticActivationAckWireV1 output;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+	const uint8 *output_bytes = (const uint8 *)&output;
+	int i;
+
+	memset(&input, 0, sizeof(input));
+	input.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	input.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	input.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	input.coordinator_node = 1;
+	input.member_node = 3;
+	input.transition_epoch = 1;
+	input.record_generation = 1;
+	input.round_nonce = 1;
+	input.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&input, bytes));
+	bytes[116] = 1;
+	memset(&output, 0xa5, sizeof(output));
+
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	for (i = 0; i < (int)sizeof(output); i++)
+		UT_ASSERT_EQ(output_bytes[i], 0xa5);
+}
+
+UT_TEST(test_54_ack_wire_rejects_wrong_magic_and_version)
+{
+	ClusterSemanticActivationAckWireV1 input;
+	ClusterSemanticActivationAckWireV1 output;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	memset(&input, 0, sizeof(input));
+	input.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	input.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	input.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	input.coordinator_node = 1;
+	input.member_node = 3;
+	input.transition_epoch = 1;
+	input.record_generation = 1;
+	input.round_nonce = 1;
+	input.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&input, bytes));
+
+	bytes[0] ^= 0x01;
+	memset(&output, 0xa5, sizeof(output));
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[0] ^= 0x01;
+	bytes[4] = 2;
+	memset(&output, 0xa5, sizeof(output));
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+}
+
+UT_TEST(test_55_ack_wire_rejects_unknown_kind_stage_and_result)
+{
+	ClusterSemanticActivationAckWireV1 input;
+	ClusterSemanticActivationAckWireV1 output;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	memset(&input, 0, sizeof(input));
+	input.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	input.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	input.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	input.coordinator_node = 1;
+	input.member_node = 3;
+	input.transition_epoch = 1;
+	input.record_generation = 1;
+	input.round_nonce = 1;
+	input.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&input, bytes));
+
+	bytes[6] = 0;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[6] = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	bytes[7] = 6;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[7] = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	bytes[8] = 3;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+}
+
+UT_TEST(test_56_ack_wire_rejects_invalid_request_shape)
+{
+	ClusterSemanticActivationAckWireV1 input;
+	ClusterSemanticActivationAckWireV1 output;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	memset(&input, 0, sizeof(input));
+	input.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	input.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	input.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	input.coordinator_node = 1;
+	input.member_node = 3;
+	input.transition_epoch = 1;
+	input.record_generation = 1;
+	input.round_nonce = 1;
+	input.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&input, bytes));
+
+	bytes[8] = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[8] = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	bytes[12] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[12] = 0;
+	bytes[96] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[96] = 0;
+	bytes[104] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[104] = 0;
+	bytes[112] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[112] = 0;
+	bytes[88] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[88] = 0;
+	bytes[7] = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[7] = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	memset(bytes + 32, 0, 8);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[32] = 1;
+	memset(bytes + 40, 0, 8);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+}
+
+UT_TEST(test_57_ack_wire_rejects_invalid_positive_ack_shape)
+{
+	ClusterSemanticActivationAckWireV1 input;
+	ClusterSemanticActivationAckWireV1 output;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	memset(&input, 0, sizeof(input));
+	input.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	input.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED;
+	input.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+	input.coordinator_node = 1;
+	input.member_node = 3;
+	input.transition_epoch = 1;
+	input.record_generation = 1;
+	input.round_nonce = 1;
+	input.admitted_members_lo = UINT64_C(0x0f);
+	input.capability_sample_digest = 1;
+	input.boot_id = 1;
+	input.admitted_incarnation = 1;
+	input.capability_word = CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&input, bytes));
+
+	bytes[8] = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[8] = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+	bytes[12] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[12] = 0;
+	memset(bytes + 96, 0, 8);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[96] = 1;
+	memset(bytes + 104, 0, 8);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[104] = 1;
+	memset(bytes + 112, 0, 4);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+}
+
+UT_TEST(test_58_ack_wire_rejects_invalid_refused_ack_shape)
+{
+	ClusterSemanticActivationAckWireV1 input;
+	ClusterSemanticActivationAckWireV1 output;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	memset(&input, 0, sizeof(input));
+	input.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	input.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	input.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED;
+	input.reason = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	input.coordinator_node = 1;
+	input.member_node = 3;
+	input.transition_epoch = 1;
+	input.record_generation = 1;
+	input.round_nonce = 1;
+	input.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&input, bytes));
+	UT_ASSERT(cluster_semantic_activation_ack_wire_decode(bytes, &output));
+
+	write_u32_le(bytes + 12, CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	write_u32_le(bytes + 12, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE + 1);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	write_u32_le(bytes + 12, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	bytes[96] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[96] = 0;
+	bytes[104] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[104] = 0;
+	bytes[112] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+}
+
+UT_TEST(test_59_ack_wire_rejects_out_of_range_or_unadmitted_nodes)
+{
+	ClusterSemanticActivationAckWireV1 input;
+	ClusterSemanticActivationAckWireV1 output;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	memset(&input, 0, sizeof(input));
+	input.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	input.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	input.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	input.coordinator_node = 1;
+	input.member_node = 3;
+	input.transition_epoch = 1;
+	input.record_generation = 1;
+	input.round_nonce = 1;
+	input.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&input, bytes));
+
+	write_u32_le(bytes + 16, CLUSTER_MAX_NODES);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	write_u32_le(bytes + 16, 1);
+	write_u32_le(bytes + 20, CLUSTER_MAX_NODES);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	write_u32_le(bytes + 20, 4);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	write_u32_le(bytes + 20, 3);
+	write_u32_le(bytes + 16, 4);
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+}
+
+UT_TEST(test_60_ack_wire_applies_digest_rule_to_ack_round_identity)
+{
+	ClusterSemanticActivationAckWireV1 input;
+	ClusterSemanticActivationAckWireV1 output;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	memset(&input, 0, sizeof(input));
+	input.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	input.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	input.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+	input.coordinator_node = 1;
+	input.member_node = 3;
+	input.transition_epoch = 1;
+	input.record_generation = 1;
+	input.round_nonce = 1;
+	input.admitted_members_lo = UINT64_C(0x0f);
+	input.boot_id = 1;
+	input.admitted_incarnation = 1;
+	input.capability_word = CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&input, bytes));
+	UT_ASSERT(cluster_semantic_activation_ack_wire_decode(bytes, &output));
+
+	bytes[88] = 1;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+	bytes[88] = 0;
+	bytes[7] = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_decode(bytes, &output));
+}
+
+UT_TEST(test_61_ack_wire_encoder_rejects_invalid_host_shape)
+{
+	ClusterSemanticActivationAckWireV1 message;
+	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+	int i;
+
+	memset(&message, 0, sizeof(message));
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	message.coordinator_node = 1;
+	message.member_node = 3;
+	message.transition_epoch = 1;
+	message.record_generation = 1;
+	message.round_nonce = 1;
+	message.admitted_members_lo = UINT64_C(0x0f);
+
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_INVALID;
+	memset(bytes, 0xa5, sizeof(bytes));
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_encode(&message, bytes));
+	for (i = 0; i < (int)sizeof(bytes); i++)
+		UT_ASSERT_EQ(bytes[i], 0xa5);
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	message.record_generation = 0;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_encode(&message, bytes));
+	message.record_generation = 1;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_encode(&message, bytes));
+
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	message.admitted_incarnation = 1;
+	message.capability_word = CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_encode(&message, bytes));
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED;
+	message.admitted_incarnation = 0;
+	message.capability_word = 0;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_encode(&message, bytes));
+
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	message.member_node = 4;
+	UT_ASSERT(!cluster_semantic_activation_ack_wire_encode(&message, bytes));
+}
+
 int
 main(void)
 {
-	UT_PLAN(50);
+	UT_PLAN(61);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -865,6 +1268,17 @@ main(void)
 	UT_RUN(test_48_equal_generation_conflict_without_majority_is_not_legacy);
 	UT_RUN(test_49_record_cas_mailbox_exact_sequence_lifecycle);
 	UT_RUN(test_50_pgrd_uses_distinct_kind_in_existing_512_byte_mailbox);
+	UT_RUN(test_51_ack_sample_request_has_exact_wire_bytes);
+	UT_RUN(test_52_ack_wire_decodes_hand_written_little_endian_bytes);
+	UT_RUN(test_53_ack_wire_rejects_nonzero_reserved_without_output_mutation);
+	UT_RUN(test_54_ack_wire_rejects_wrong_magic_and_version);
+	UT_RUN(test_55_ack_wire_rejects_unknown_kind_stage_and_result);
+	UT_RUN(test_56_ack_wire_rejects_invalid_request_shape);
+	UT_RUN(test_57_ack_wire_rejects_invalid_positive_ack_shape);
+	UT_RUN(test_58_ack_wire_rejects_invalid_refused_ack_shape);
+	UT_RUN(test_59_ack_wire_rejects_out_of_range_or_unadmitted_nodes);
+	UT_RUN(test_60_ack_wire_applies_digest_rule_to_ack_round_identity);
+	UT_RUN(test_61_ack_wire_encoder_rejects_invalid_host_shape);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
