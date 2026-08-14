@@ -494,6 +494,7 @@ cluster_ic_hello_n_workers(const ClusterICHelloMsg *msg)
  * MUST go via PGRAC_IC_HELLO_VERSION_V2 (new struct + dispatch on
  * hello_version field), never resize V1 in-place.
  */
+extern uint32 cluster_ic_local_capability_word(void);
 extern void cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version,
 								   uint16 envelope_version, int32 source_node_id,
 								   const char *cluster_name, ClusterICPlane plane,

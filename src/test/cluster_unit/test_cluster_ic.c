@@ -664,6 +664,27 @@ UT_TEST(test_hello_r4_capabilities_preserve_v1_reference)
 	}
 }
 
+UT_TEST(test_local_capability_word_is_hello_authority_without_ack_advertisement)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+
+	cluster_smart_fusion = false;
+	cluster_ic_suppress_caps_reply = false;
+	cluster_ic_suppress_gcs_done_cap = false;
+	cluster_ic_suppress_xid_flock_cap = false;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1,
+		PGRAC_IC_ENVELOPE_VERSION_V1, 0, "four-node-happy-path",
+		CLUSTER_IC_PLANE_CONTROL, 0);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	UT_ASSERT_EQ(cluster_ic_local_capability_word(),
+		cluster_ic_hello_capabilities(&parsed));
+	UT_ASSERT_EQ(cluster_ic_local_capability_word()
+				 & PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1,
+		0);
+}
+
 /*
  * spec-7.2 D2 — DATA-plane HELLO reference bytes:  plane byte at offset
  * 40, conn_epoch LE at 44-51, spec-7.3 worker bytes (41/42) still zero,
@@ -946,7 +967,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(25); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(26); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -967,6 +988,7 @@ main(void)
 	UT_RUN(test_hello_wire_roundtrip);
 	UT_RUN(test_hello_wire_reference_bytes);
 	UT_RUN(test_hello_r4_capabilities_preserve_v1_reference);
+	UT_RUN(test_local_capability_word_is_hello_authority_without_ack_advertisement);
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);
