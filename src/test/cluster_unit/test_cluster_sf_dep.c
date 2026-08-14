@@ -36,6 +36,8 @@ UT_DEFINE_GLOBALS();
 	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1              \
 	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                                          \
 	 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
+#define TEST_STAGE8_ACK_REQUIRED_CAPS                                                         \
+	(TEST_R4_REQUIRED_CAPS | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1)
 
 typedef union TestSfShmemStorage {
 	LWLock align;
@@ -502,6 +504,51 @@ UT_TEST(test_r4_exported_family_sample_reconnect_generation_is_exact)
 	UT_ASSERT(!cluster_sf_peer_supports_gcs_done(TEST_SF_CAP_PEER));
 }
 
+UT_TEST(test_stage8_ack_full_word_sample_is_record_coherent)
+{
+	const uint32 full_word
+		= TEST_STAGE8_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	uint32 sampled_word = UINT32_MAX;
+	uint32 generation = UINT32_MAX;
+
+	test_sf_cap_store_reset();
+	UT_ASSERT(!cluster_sf_peer_capability_word_sample(
+		TEST_SF_CAP_PEER, TEST_STAGE8_ACK_REQUIRED_CAPS,
+		&sampled_word, &generation));
+	UT_ASSERT_EQ(sampled_word, (uint32)0);
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	cluster_sf_note_peer_hello_capabilities_gen(
+		TEST_SF_CAP_PEER, full_word, 41);
+	UT_ASSERT(cluster_sf_peer_capability_word_sample(
+		TEST_SF_CAP_PEER, TEST_STAGE8_ACK_REQUIRED_CAPS,
+		&sampled_word, &generation));
+	UT_ASSERT_EQ(sampled_word, full_word);
+	UT_ASSERT_EQ(generation, (uint32)41);
+
+	cluster_sf_note_peer_hello_capabilities_gen(
+		TEST_SF_CAP_PEER,
+		TEST_STAGE8_ACK_REQUIRED_CAPS
+			& ~PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1,
+		42);
+	sampled_word = UINT32_MAX;
+	generation = UINT32_MAX;
+	UT_ASSERT(!cluster_sf_peer_capability_word_sample(
+		TEST_SF_CAP_PEER, TEST_STAGE8_ACK_REQUIRED_CAPS,
+		&sampled_word, &generation));
+	UT_ASSERT_EQ(sampled_word, (uint32)0);
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	sampled_word = UINT32_MAX;
+	generation = UINT32_MAX;
+	UT_ASSERT(!cluster_sf_peer_capability_word_sample(
+		-1, TEST_STAGE8_ACK_REQUIRED_CAPS,
+		&sampled_word, &generation));
+	UT_ASSERT_EQ(sampled_word, (uint32)0);
+	UT_ASSERT_EQ(generation, (uint32)0);
+}
+
 int
 main(void)
 {
@@ -521,5 +568,6 @@ main(void)
 	UT_RUN(test_r4_exported_family_sample_requires_both_bits_and_canonicalizes_outputs);
 	UT_RUN(test_r4_exported_family_sample_accepts_registered_generation_zero);
 	UT_RUN(test_r4_exported_family_sample_reconnect_generation_is_exact);
+	UT_RUN(test_stage8_ack_full_word_sample_is_record_coherent);
 	UT_DONE();
 }

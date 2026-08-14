@@ -23,6 +23,7 @@
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION UINT16_C(1)
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES 120
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES 64
+#define CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY 256
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES 16496
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS UINT32_C(0x0030B000)
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID UINT32_C(1)
@@ -291,6 +292,8 @@ extern bool cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
 extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor_read(
 	uint64 request_seq, ClusterUndoRootDescriptorState state,
 	const uint8 selected_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
+extern void cluster_semantic_activation_ack_handler(
+	const ClusterICEnvelope *env, const void *payload);
 extern void cluster_semantic_activation_lmon_tick(void);
 extern ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,

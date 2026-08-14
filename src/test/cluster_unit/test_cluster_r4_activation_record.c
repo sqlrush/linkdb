@@ -1385,10 +1385,274 @@ UT_TEST(test_66_ack_table_publish_advances_even_and_refuses_bad_sequence)
 	SemanticActivationAckTable = NULL;
 }
 
+UT_TEST(test_67_ack_ingress_handoff_has_exact_frozen_layout)
+{
+	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY, 256);
+	UT_ASSERT_EQ(sizeof(ClusterSemanticActivationAckWireV1), 120);
+	UT_ASSERT_EQ(sizeof(SemanticActivationAckIngressItem), 136);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem, message), 0);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem,
+						 authenticated_source_node_id), 120);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem,
+						 local_receiver_node_id), 124);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem,
+						 sampled_capability_word), 128);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngressItem,
+						 sampled_capability_generation), 132);
+	UT_ASSERT_EQ(sizeof(SemanticActivationAckIngress), 34832);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngress, producer_seq), 0);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngress, consumer_seq), 8);
+	UT_ASSERT_EQ(offsetof(SemanticActivationAckIngress, items), 16);
+}
+
+UT_TEST(test_68_ack_ingress_handoff_is_bounded_and_fail_closed)
+{
+	SemanticActivationAckIngress ingress;
+	SemanticActivationAckIngressItem item;
+	SemanticActivationAckIngressItem out;
+	uint32 i;
+
+	memset(&item, 0, sizeof(item));
+	item.message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	item.message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	item.authenticated_source_node_id = 3;
+	item.local_receiver_node_id = 1;
+	item.sampled_capability_word = CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	item.sampled_capability_generation = 7;
+	semantic_activation_ack_ingress_init(&ingress);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(&ingress), 0);
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!semantic_activation_ack_ingress_poll(&ingress, &out));
+	UT_ASSERT_EQ((uint32)out.authenticated_source_node_id,
+				 UINT32_C(0xa5a5a5a5));
+
+	for (i = 0; i < CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY; i++) {
+		item.message.member_node = i % CLUSTER_MAX_NODES;
+		UT_ASSERT(semantic_activation_ack_ingress_push(&ingress, &item));
+	}
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(&ingress), 256);
+	UT_ASSERT(!semantic_activation_ack_ingress_push(&ingress, &item));
+	UT_ASSERT_EQ(ingress.producer_seq, UINT64_C(256));
+	UT_ASSERT(semantic_activation_ack_ingress_poll(&ingress, &out));
+	UT_ASSERT_EQ(out.message.kind,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK);
+	UT_ASSERT_EQ(out.authenticated_source_node_id, 3);
+	UT_ASSERT_EQ(out.local_receiver_node_id, 1);
+	UT_ASSERT_EQ(out.sampled_capability_word,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS);
+	UT_ASSERT_EQ(out.sampled_capability_generation, 7);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(&ingress), 255);
+
+	ingress.producer_seq = CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY + 2;
+	ingress.consumer_seq = 0;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(&ingress), 0);
+	UT_ASSERT(!semantic_activation_ack_ingress_push(&ingress, &item));
+	UT_ASSERT(!semantic_activation_ack_ingress_poll(&ingress, &out));
+	UT_ASSERT_EQ((uint32)out.authenticated_source_node_id,
+				 UINT32_C(0xa5a5a5a5));
+}
+
+static ClusterSemanticActivationAckWireV1
+valid_positive_ack(void)
+{
+	ClusterSemanticActivationAckWireV1 message;
+
+	memset(&message, 0, sizeof(message));
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+	message.coordinator_node = 0;
+	message.member_node = 3;
+	message.transition_epoch = 9;
+	message.record_generation = 10;
+	message.round_nonce = 11;
+	message.source_feature_bitmap = 1;
+	message.target_feature_bitmap = 2;
+	message.admitted_members_lo = UINT64_C(0x0b);
+	message.boot_id = 12;
+	message.admitted_incarnation = 12;
+	message.capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	return message;
+}
+
+static ClusterICEnvelope
+valid_ack_envelope(uint32 source_node, uint32 dest_node)
+{
+	ClusterICEnvelope env;
+
+	memset(&env, 0, sizeof(env));
+	env.msg_type = PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1;
+	env.source_node_id = source_node;
+	env.dest_node_id = dest_node;
+	env.epoch = 9;
+	env.payload_length = CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES;
+	return env;
+}
+
+UT_TEST(test_69_ack_ingress_stamps_coherent_remote_sample)
+{
+	SemanticActivationAckIngress ingress;
+	SemanticActivationAckIngressItem out;
+	ClusterSemanticActivationAckWireV1 message = valid_positive_ack();
+	ClusterICEnvelope env = valid_ack_envelope(3, 1);
+	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	cluster_r4_activation_test_capability_word_sample_ok = true;
+	cluster_r4_activation_test_capability_word = message.capability_word;
+	cluster_r4_activation_test_capability_generation = 7;
+	semantic_activation_ack_ingress_init(&ingress);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_ENQUEUED);
+	UT_ASSERT(semantic_activation_ack_ingress_poll(&ingress, &out));
+	UT_ASSERT_EQ(memcmp(&out.message, &message, sizeof(message)), 0);
+	UT_ASSERT_EQ(out.authenticated_source_node_id, 3);
+	UT_ASSERT_EQ(out.local_receiver_node_id, 1);
+	UT_ASSERT_EQ(out.sampled_capability_word, message.capability_word);
+	UT_ASSERT_EQ(out.sampled_capability_generation, 7);
+}
+
+UT_TEST(test_70_ack_ingress_rejects_role_epoch_and_sample_drift)
+{
+	SemanticActivationAckIngress ingress;
+	ClusterSemanticActivationAckWireV1 message = valid_positive_ack();
+	ClusterICEnvelope env = valid_ack_envelope(3, 1);
+	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	cluster_r4_activation_test_capability_word_sample_ok = true;
+	cluster_r4_activation_test_capability_word = message.capability_word;
+	cluster_r4_activation_test_capability_generation = 7;
+	semantic_activation_ack_ingress_init(&ingress);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
+
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload) - 1, 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED);
+	env.dest_node_id = 2;
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED);
+	env = valid_ack_envelope(3, 1);
+	env.epoch = 8;
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED);
+	env = valid_ack_envelope(4, 1);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED);
+	env = valid_ack_envelope(3, 1);
+	cluster_r4_activation_test_capability_word_sample_ok = false;
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED);
+	cluster_r4_activation_test_capability_word_sample_ok = true;
+	cluster_r4_activation_test_capability_generation = 0;
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED);
+	cluster_r4_activation_test_capability_generation = 7;
+	cluster_r4_activation_test_capability_word ^= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED);
+	cluster_r4_activation_test_capability_word = message.capability_word;
+	message.admitted_incarnation++;
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(&ingress), 0);
+}
+
+UT_TEST(test_71_ack_ingress_accepts_request_and_refusal_roles)
+{
+	SemanticActivationAckIngress ingress;
+	ClusterSemanticActivationAckWireV1 message;
+	ClusterICEnvelope env;
+	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	cluster_r4_activation_test_capability_word_sample_ok = true;
+	cluster_r4_activation_test_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	cluster_r4_activation_test_capability_generation = 7;
+	semantic_activation_ack_ingress_init(&ingress);
+	memset(&message, 0, sizeof(message));
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	message.coordinator_node = 3;
+	message.member_node = 1;
+	message.transition_epoch = 9;
+	message.record_generation = 10;
+	message.round_nonce = 11;
+	message.admitted_members_lo = UINT64_C(0x0a);
+	env = valid_ack_envelope(3, 1);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_ENQUEUED);
+
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED;
+	message.reason = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	message.coordinator_node = 1;
+	message.member_node = 3;
+	env = valid_ack_envelope(3, 1);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_receive(
+					 &ingress, &env, payload, sizeof(payload), 1, 9),
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_ENQUEUED);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(&ingress), 2);
+}
+
+UT_TEST(test_72_ack_handler_only_enqueues_and_counts_typed_drops)
+{
+	ClusterSemanticActivationAckWireV1 message = valid_positive_ack();
+	ClusterICEnvelope env = valid_ack_envelope(3, 1);
+	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+
+	message.transition_epoch = 0;
+	env.epoch = 0;
+	cluster_node_id = 1;
+	cluster_r4_activation_test_capability_word_sample_ok = true;
+	cluster_r4_activation_test_capability_word = message.capability_word;
+	cluster_r4_activation_test_capability_generation = 7;
+	semantic_activation_ack_ingress_init(&semantic_activation_ack_local_ingress);
+	memset(semantic_activation_ack_ingress_result_count, 0,
+		   sizeof(semantic_activation_ack_ingress_result_count));
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
+
+	cluster_semantic_activation_ack_handler(&env, payload);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
+				 &semantic_activation_ack_local_ingress), 1);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_result_count[
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_ENQUEUED], UINT64_C(1));
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_result_count[
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED], UINT64_C(0));
+	payload[119] = 1;
+	cluster_semantic_activation_ack_handler(&env, payload);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_pending(
+				 &semantic_activation_ack_local_ingress), 1);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_result_count[
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED], UINT64_C(1));
+	payload[119] = 0;
+	semantic_activation_ack_local_ingress.consumer_seq = 0;
+	semantic_activation_ack_local_ingress.producer_seq
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY;
+	cluster_semantic_activation_ack_handler(&env, payload);
+	UT_ASSERT_EQ(semantic_activation_ack_ingress_result_count[
+				 SEMANTIC_ACTIVATION_ACK_INGRESS_FULL], UINT64_C(1));
+}
+
 int
 main(void)
 {
-	UT_PLAN(66);
+	UT_PLAN(72);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -1455,6 +1719,12 @@ main(void)
 	UT_RUN(test_64_shmem_size_includes_exact_ack_table);
 	UT_RUN(test_65_ack_table_snapshot_accepts_even_and_rejects_odd);
 	UT_RUN(test_66_ack_table_publish_advances_even_and_refuses_bad_sequence);
+	UT_RUN(test_67_ack_ingress_handoff_has_exact_frozen_layout);
+	UT_RUN(test_68_ack_ingress_handoff_is_bounded_and_fail_closed);
+	UT_RUN(test_69_ack_ingress_stamps_coherent_remote_sample);
+	UT_RUN(test_70_ack_ingress_rejects_role_epoch_and_sample_drift);
+	UT_RUN(test_71_ack_ingress_accepts_request_and_refusal_roles);
+	UT_RUN(test_72_ack_handler_only_enqueues_and_counts_typed_drops);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

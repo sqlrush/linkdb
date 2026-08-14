@@ -229,6 +229,19 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_cap
 	return test_peer_capability_matches;
 }
 
+bool
+cluster_sf_peer_capability_word_sample(int32 peer_id pg_attribute_unused(),
+									  uint32 required_capabilities pg_attribute_unused(),
+									  uint32 *capability_word_out,
+									  uint32 *generation_out)
+{
+	if (capability_word_out != NULL)
+		*capability_word_out = 0;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	return false;
+}
+
 int
 cluster_membership_member_count(void)
 {

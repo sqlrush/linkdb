@@ -215,6 +215,23 @@ cluster_lmon_shmem_init(void)
 		heartbeat_registered = true;
 	}
 
+	{
+		static bool semantic_activation_ack_registered = false;
+
+		if (!semantic_activation_ack_registered) {
+			const ClusterICMsgTypeInfo semantic_activation_ack_info = {
+				.msg_type = PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1,
+				.name = "semantic_activation_ack_v1",
+				.allowed_producer_mask = CLUSTER_IC_PRODUCER_LMON,
+				.broadcast_ok = false,
+				.handler = cluster_semantic_activation_ack_handler,
+			};
+
+			cluster_ic_register_msg_type(&semantic_activation_ack_info);
+			semantic_activation_ack_registered = true;
+		}
+	}
+
 	/*
 	 * spec-2.5 D12: register CSSD heartbeat msg_type=11 in postmaster
 	 * phase 1.  Per spec-2.5 v0.2 Q1 修订 (L61 process-resource-vs-shmem):

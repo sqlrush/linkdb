@@ -255,14 +255,218 @@ typedef struct ClusterSemanticActivationAckTableV1 {
 	SemanticActivationAckTuple observed[CLUSTER_MAX_NODES];
 } ClusterSemanticActivationAckTableV1;
 
+typedef struct SemanticActivationAckIngressItem {
+	ClusterSemanticActivationAckWireV1 message;
+	int32 authenticated_source_node_id;
+	int32 local_receiver_node_id;
+	uint32 sampled_capability_word;
+	uint32 sampled_capability_generation;
+} SemanticActivationAckIngressItem;
+
+typedef struct SemanticActivationAckIngress {
+	uint64 producer_seq;
+	uint64 consumer_seq;
+	SemanticActivationAckIngressItem
+		items[CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY];
+} SemanticActivationAckIngress;
+
+typedef enum SemanticActivationAckIngressResult {
+	SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED = 0,
+	SEMANTIC_ACTIVATION_ACK_INGRESS_ENQUEUED,
+	SEMANTIC_ACTIVATION_ACK_INGRESS_FULL
+} SemanticActivationAckIngressResult;
+
+static SemanticActivationAckIngress semantic_activation_ack_local_ingress;
+static uint64 semantic_activation_ack_ingress_result_count[3];
+
 StaticAssertDecl(sizeof(SemanticActivationAckTuple)
 				 == CLUSTER_SEMANTIC_ACTIVATION_ACK_TUPLE_BYTES,
 				 "semantic activation ACK tuple must remain 64 bytes");
 StaticAssertDecl(sizeof(ClusterSemanticActivationAckTableV1)
 				 == CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES,
 				 "semantic activation ACK table must remain 16496 bytes");
+StaticAssertDecl(sizeof(SemanticActivationAckIngressItem) == 136,
+				 "semantic activation ACK ingress item must remain 136 bytes");
+StaticAssertDecl(sizeof(SemanticActivationAckIngress) == 34832,
+				 "semantic activation ACK ingress must remain 34832 bytes");
 
 static ClusterSemanticActivationAckTableV1 *SemanticActivationAckTable = NULL;
+
+static void semantic_activation_ack_ingress_init(
+	SemanticActivationAckIngress *ingress) pg_attribute_unused();
+static uint32 semantic_activation_ack_ingress_pending(
+	const SemanticActivationAckIngress *ingress) pg_attribute_unused();
+static bool semantic_activation_ack_ingress_push(
+	SemanticActivationAckIngress *ingress,
+	const SemanticActivationAckIngressItem *item) pg_attribute_unused();
+static bool semantic_activation_ack_ingress_poll(
+	SemanticActivationAckIngress *ingress,
+	SemanticActivationAckIngressItem *out) pg_attribute_unused();
+static SemanticActivationAckIngressResult
+semantic_activation_ack_ingress_receive(
+	SemanticActivationAckIngress *ingress, const ClusterICEnvelope *env,
+	const void *payload, uint32 payload_length,
+	int32 local_receiver_node_id, uint64 current_epoch) pg_attribute_unused();
+
+static void
+semantic_activation_ack_ingress_init(SemanticActivationAckIngress *ingress)
+{
+	if (ingress != NULL)
+		memset(ingress, 0, sizeof(*ingress));
+}
+
+static uint32
+semantic_activation_ack_ingress_pending(
+	const SemanticActivationAckIngress *ingress)
+{
+	uint64 pending;
+
+	if (ingress == NULL)
+		return 0;
+	pending = ingress->producer_seq - ingress->consumer_seq;
+	if (pending > CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY)
+		return 0;
+	return (uint32)pending;
+}
+
+static bool
+semantic_activation_ack_ingress_push(
+	SemanticActivationAckIngress *ingress,
+	const SemanticActivationAckIngressItem *item)
+{
+	uint64 pending;
+
+	if (ingress == NULL || item == NULL)
+		return false;
+	pending = ingress->producer_seq - ingress->consumer_seq;
+	if (pending >= CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY)
+		return false;
+	ingress->items[ingress->producer_seq
+				   % CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY] = *item;
+	ingress->producer_seq++;
+	return true;
+}
+
+static bool
+semantic_activation_ack_ingress_poll(
+	SemanticActivationAckIngress *ingress,
+	SemanticActivationAckIngressItem *out)
+{
+	uint64 pending;
+
+	if (ingress == NULL || out == NULL)
+		return false;
+	pending = ingress->producer_seq - ingress->consumer_seq;
+	if (pending == 0
+		|| pending > CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY)
+		return false;
+	*out = ingress->items[ingress->consumer_seq
+				   % CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY];
+	ingress->consumer_seq++;
+	return true;
+}
+
+static SemanticActivationAckIngressResult
+semantic_activation_ack_ingress_receive(
+	SemanticActivationAckIngress *ingress, const ClusterICEnvelope *env,
+	const void *payload, uint32 payload_length,
+	int32 local_receiver_node_id, uint64 current_epoch)
+{
+	ClusterSemanticActivationAckWireV1 message;
+	SemanticActivationAckIngressItem item;
+	uint32 capability_word;
+	uint32 capability_generation;
+	uint64 pending;
+	bool local_is_admitted;
+	int32 authenticated_source_node_id;
+
+	if (ingress == NULL || env == NULL || payload == NULL
+		|| payload_length != CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES
+		|| env->payload_length != CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES
+		|| env->msg_type != PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1
+		|| local_receiver_node_id < 0
+		|| local_receiver_node_id >= CLUSTER_MAX_NODES
+		|| env->source_node_id >= CLUSTER_MAX_NODES
+		|| env->source_node_id == (uint32)local_receiver_node_id
+		|| env->dest_node_id != (uint32)local_receiver_node_id
+		|| env->epoch != current_epoch
+		|| !cluster_semantic_activation_ack_wire_decode(
+			(const uint8 *)payload, &message)
+		|| message.transition_epoch != env->epoch)
+		return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+
+	authenticated_source_node_id = (int32)env->source_node_id;
+	local_is_admitted
+		= local_receiver_node_id < 64
+			  ? (message.admitted_members_lo
+				 & (UINT64_C(1) << local_receiver_node_id)) != 0
+			  : (message.admitted_members_hi
+				 & (UINT64_C(1) << (local_receiver_node_id - 64))) != 0;
+	if (!local_is_admitted)
+		return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+
+	if (message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST) {
+		if (message.coordinator_node != env->source_node_id
+			|| message.member_node != (uint32)local_receiver_node_id)
+			return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+	} else if (message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK) {
+		if (message.member_node != env->source_node_id)
+			return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+		if (message.result == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK) {
+			if (message.boot_id != message.admitted_incarnation)
+				return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+		} else if (message.result
+				   == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED) {
+			if (message.coordinator_node != (uint32)local_receiver_node_id)
+				return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+		} else
+			return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+	} else
+		return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+
+	if (!cluster_sf_peer_capability_word_sample(
+			authenticated_source_node_id,
+			CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS,
+			&capability_word, &capability_generation)
+		|| capability_generation == 0
+		|| (message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
+			&& message.result == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
+			&& message.capability_word != capability_word))
+		return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+
+	pending = ingress->producer_seq - ingress->consumer_seq;
+	if (pending > CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY)
+		return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+	if (pending == CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY)
+		return SEMANTIC_ACTIVATION_ACK_INGRESS_FULL;
+
+	memset(&item, 0, sizeof(item));
+	item.message = message;
+	item.authenticated_source_node_id = authenticated_source_node_id;
+	item.local_receiver_node_id = local_receiver_node_id;
+	item.sampled_capability_word = capability_word;
+	item.sampled_capability_generation = capability_generation;
+	if (!semantic_activation_ack_ingress_push(ingress, &item))
+		return SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+	return SEMANTIC_ACTIVATION_ACK_INGRESS_ENQUEUED;
+}
+
+void
+cluster_semantic_activation_ack_handler(
+	const ClusterICEnvelope *env, const void *payload)
+{
+	SemanticActivationAckIngressResult result;
+	uint32 payload_length = env != NULL ? env->payload_length : 0;
+
+	result = semantic_activation_ack_ingress_receive(
+		&semantic_activation_ack_local_ingress, env, payload,
+		payload_length, cluster_node_id, cluster_epoch_get_current());
+	if (result < SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED
+		|| result > SEMANTIC_ACTIVATION_ACK_INGRESS_FULL)
+		result = SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED;
+	if (semantic_activation_ack_ingress_result_count[result] != UINT64_MAX)
+		semantic_activation_ack_ingress_result_count[result]++;
+}
 
 static bool semantic_activation_ack_table_snapshot(
 	ClusterSemanticActivationAckTableV1 *out) pg_attribute_unused();

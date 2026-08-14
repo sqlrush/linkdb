@@ -449,6 +449,44 @@ cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_capabili
 	return supported;
 }
 
+/* Exact full-word and generation sample from one locked capability record. */
+bool
+cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
+									  uint32 *capability_word_out,
+									  uint32 *generation_out)
+{
+	const ClusterSfPeerCap *cap;
+	bool supported = false;
+	uint32 capability_word = 0;
+	uint32 generation = 0;
+
+	if (capability_word_out != NULL)
+		*capability_word_out = 0;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
+		|| required_capabilities == 0)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	cap = &ClusterSfDep->peer_capabilities[peer_id];
+	if (cap->valid
+		&& (cap->bits & required_capabilities) == required_capabilities) {
+		capability_word = cap->bits;
+		generation = cap->generation;
+		supported = true;
+	}
+	LWLockRelease(&ClusterSfDep->lock);
+
+	if (!supported)
+		return false;
+	if (capability_word_out != NULL)
+		*capability_word_out = capability_word;
+	if (generation_out != NULL)
+		*generation_out = generation;
+	return true;
+}
+
 /* Drain-side exact fence for a capability-bound LMS slot. */
 bool
 cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,

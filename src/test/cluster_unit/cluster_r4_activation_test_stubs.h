@@ -217,6 +217,32 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id pg_attribute_unused(
 	return false;
 }
 
+static bool cluster_r4_activation_test_capability_word_sample_ok;
+static uint32 cluster_r4_activation_test_capability_word;
+static uint32 cluster_r4_activation_test_capability_generation;
+
+bool
+cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
+									  uint32 *capability_word_out,
+									  uint32 *generation_out)
+{
+	if (capability_word_out != NULL)
+		*capability_word_out = 0;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (!cluster_r4_activation_test_capability_word_sample_ok
+		|| peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
+		|| required_capabilities == 0
+		|| (cluster_r4_activation_test_capability_word & required_capabilities)
+			   != required_capabilities)
+		return false;
+	if (capability_word_out != NULL)
+		*capability_word_out = cluster_r4_activation_test_capability_word;
+	if (generation_out != NULL)
+		*generation_out = cluster_r4_activation_test_capability_generation;
+	return true;
+}
+
 void
 on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
 {}

@@ -42,6 +42,7 @@
 
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tt_status_hint.h"
 
 #undef printf
@@ -450,8 +451,23 @@ cluster_ic_tier1_peer_get(int32 peer_id pg_attribute_unused())
  * with cluster_ic_router.  Stub the register API so this address-only
  * link test passes without pulling in the whole router. */
 #include "cluster/cluster_ic_router.h"
+static bool test_semantic_ack_registered;
+static ClusterICMsgTypeInfo test_semantic_ack_registration;
+
 void
-cluster_ic_register_msg_type(const ClusterICMsgTypeInfo *info pg_attribute_unused())
+cluster_ic_register_msg_type(const ClusterICMsgTypeInfo *info)
+{
+	if (info != NULL
+		&& info->msg_type == PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1) {
+		test_semantic_ack_registration = *info;
+		test_semantic_ack_registered = true;
+	}
+}
+
+void
+cluster_semantic_activation_ack_handler(
+	const ClusterICEnvelope *env pg_attribute_unused(),
+	const void *payload pg_attribute_unused())
 {}
 
 /* spec-2.32 D4 stub:  cluster_lmon_shmem_init calls cluster_gcs_register_msg_types. */
@@ -936,6 +952,27 @@ UT_TEST(test_lmon_iteration_counters_null_safe)
 	cluster_lmon_marker_complete_wakeup();
 }
 
+UT_TEST(test_lmon_registers_semantic_ack_control_handler_without_broadcast)
+{
+	test_semantic_ack_registered = false;
+	memset(&test_semantic_ack_registration, 0,
+		   sizeof(test_semantic_ack_registration));
+	cluster_lmon_shmem_init();
+
+	UT_ASSERT(test_semantic_ack_registered);
+	UT_ASSERT_EQ(test_semantic_ack_registration.msg_type,
+				 PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1);
+	UT_ASSERT_STR_EQ(test_semantic_ack_registration.name,
+				 "semantic_activation_ack_v1");
+	UT_ASSERT_EQ(test_semantic_ack_registration.allowed_producer_mask,
+				 CLUSTER_IC_PRODUCER_LMON);
+	UT_ASSERT(!test_semantic_ack_registration.broadcast_ok);
+	UT_ASSERT(test_semantic_ack_registration.handler
+			  == cluster_semantic_activation_ack_handler);
+	UT_ASSERT_EQ(test_semantic_ack_registration.plane,
+				 CLUSTER_IC_PLANE_CONTROL);
+}
+
 static void
 run_one_real_lmon_duty(uint64 start_us, uint64 finish_us, bool seed_saturation)
 {
@@ -1073,13 +1110,14 @@ UT_TEST(test_lmon_duty_lazy_truth_table)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
 	UT_RUN(test_lmon_status_unknown_returns_unknown);
 	UT_RUN(test_lmon_public_symbols_linkable);
 	UT_RUN(test_lmon_iteration_counters_null_safe);
+	UT_RUN(test_lmon_registers_semantic_ack_control_handler_without_broadcast);
 	UT_RUN(test_lmon_completed_duty_records_one_exact_timed_pair);
 	UT_RUN(test_lmon_zero_elapsed_is_still_one_completed_sample);
 	UT_RUN(test_lmon_timed_pair_saturates_without_wrapping);
