@@ -1375,6 +1375,91 @@ semantic_activation_full_ack_table_matches(
 	return true;
 }
 
+static bool semantic_activation_ack_complete_image_current(
+	const ClusterSemanticActivationAckTableV1 *image,
+	uint64 current_members_lo, uint64 current_members_hi,
+	uint64 current_epoch, int32 current_coordinator_node,
+	int32 local_node_id,
+	uint32 local_capability_word) pg_attribute_unused();
+
+static bool
+semantic_activation_ack_complete_image_current(
+	const ClusterSemanticActivationAckTableV1 *image,
+	uint64 current_members_lo, uint64 current_members_hi,
+	uint64 current_epoch, int32 current_coordinator_node,
+	int32 local_node_id, uint32 local_capability_word)
+{
+	SemanticActivationAckTuple current;
+	uint32 capability_word;
+	uint32 capability_generation;
+	uint64 admitted_incarnation;
+	int node;
+
+	if (image == NULL || local_node_id < 0
+		|| local_node_id >= CLUSTER_MAX_NODES
+		|| current_coordinator_node < 0
+		|| current_coordinator_node >= CLUSTER_MAX_NODES
+		|| image->stage < CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+		|| image->stage > CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
+		|| image->round_nonce == 0 || image->record_generation == 0
+		|| image->coordinator_node != (uint32)current_coordinator_node
+		|| image->expected_members_lo != current_members_lo
+		|| image->expected_members_hi != current_members_hi
+		|| image->transition_epoch != current_epoch
+		|| !semantic_activation_ack_member_present(
+			current_members_lo, current_members_hi, local_node_id)
+		|| (image->flags
+			& (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+			   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE))
+		   != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+			   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
+		|| !semantic_activation_full_ack_table_matches(
+			image->observed, image->observed_members_lo,
+			image->observed_members_hi, image->expected,
+			image->expected_members_lo, image->expected_members_hi))
+		return false;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if (!semantic_activation_ack_member_present(
+				current_members_lo, current_members_hi, node))
+			continue;
+		if (node == local_node_id) {
+			if (!semantic_activation_ack_self_tuple(
+					local_node_id, local_capability_word, current_epoch,
+					image->record_generation, &current))
+				return false;
+		} else {
+			admitted_incarnation
+				= cluster_membership_get_last_admitted_incarnation(node);
+			if (admitted_incarnation == 0
+				|| cluster_membership_get_state(node)
+				   != CLUSTER_MEMBER_MEMBER
+				|| !cluster_sf_peer_capability_word_sample(
+					node, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS,
+					&capability_word, &capability_generation)
+				|| capability_generation == 0)
+				return false;
+			memset(&current, 0, sizeof(current));
+			current.node_id = (uint32)node;
+			current.boot_id = admitted_incarnation;
+			current.admitted_incarnation = admitted_incarnation;
+			current.control_connection_generation
+				= (uint64)capability_generation;
+			current.capability_word = capability_word;
+			current.capability_generation
+				= (uint64)capability_generation;
+			current.transition_epoch = current_epoch;
+			current.record_generation = image->record_generation;
+		}
+		if (!semantic_activation_ack_matches(
+				&image->expected[node], &current)
+			|| !semantic_activation_ack_matches(
+				&image->observed[node], &current))
+			return false;
+	}
+	return true;
+}
+
 /*
  * Match the current replacement episode to a decoded JCMK-v3 image already
  * selected by the strict-majority reader.  The ADMITTED marker, rather than

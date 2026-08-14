@@ -2155,10 +2155,83 @@ UT_TEST(test_84_semantic_lmon_idle_ack_path_takes_no_authority_snapshot)
 	SemanticActivationAckTable = NULL;
 }
 
+static void
+build_complete_current_sample_table(
+	ClusterSemanticActivationAckTableV1 *table,
+	SemanticActivationAckIngressItem *item)
+{
+	init_current_sample_table(table);
+	*item = valid_current_sample_item();
+	set_current_remote_ack_dependencies();
+	cluster_r4_activation_test_membership_node2 = 0;
+	cluster_r4_activation_test_membership_floor2 = 11;
+	cluster_r4_activation_test_membership_state2 = CLUSTER_MEMBER_MEMBER;
+	cluster_r4_activation_test_self_incarnation = 11;
+	cluster_r4_activation_test_capability_word_sample_ok = true;
+	cluster_r4_activation_test_capability_word = item->message.capability_word;
+	cluster_r4_activation_test_capability_generation = 7;
+	SemanticActivationAckTable = table;
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_apply_item(
+		item, UINT64_C(0x09), 0, 9, 0),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_APPLIED);
+	SemanticActivationAckTable = NULL;
+}
+
+UT_TEST(test_85_complete_ack_image_revalidates_every_current_tuple)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckIngressItem item;
+	uint32 local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+
+	build_complete_current_sample_table(&table, &item);
+	UT_ASSERT(semantic_activation_ack_complete_image_current(
+		&table, UINT64_C(0x09), 0, 9, 0, 0,
+		local_capability_word));
+}
+
+UT_TEST(test_86_complete_ack_image_rejects_self_remote_and_row_drift)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckIngressItem item;
+	uint32 local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+
+	build_complete_current_sample_table(&table, &item);
+	UT_ASSERT(!semantic_activation_ack_complete_image_current(
+		&table, UINT64_C(0x19), 0, 9, 0, 0,
+		local_capability_word));
+	UT_ASSERT(!semantic_activation_ack_complete_image_current(
+		&table, UINT64_C(0x09), 0, 9, 1, 0,
+		local_capability_word));
+
+	cluster_r4_activation_test_self_incarnation = 12;
+	UT_ASSERT(!semantic_activation_ack_complete_image_current(
+		&table, UINT64_C(0x09), 0, 9, 0, 0,
+		local_capability_word));
+	cluster_r4_activation_test_self_incarnation = 11;
+	cluster_r4_activation_test_membership_floor = 13;
+	UT_ASSERT(!semantic_activation_ack_complete_image_current(
+		&table, UINT64_C(0x09), 0, 9, 0, 0,
+		local_capability_word));
+	cluster_r4_activation_test_membership_floor = 12;
+	cluster_r4_activation_test_capability_generation = 8;
+	UT_ASSERT(!semantic_activation_ack_complete_image_current(
+		&table, UINT64_C(0x09), 0, 9, 0, 0,
+		local_capability_word));
+	cluster_r4_activation_test_capability_generation = 7;
+	table.observed[3].capability_word ^= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	UT_ASSERT(!semantic_activation_ack_complete_image_current(
+		&table, UINT64_C(0x09), 0, 9, 0, 0,
+		local_capability_word));
+}
+
 int
 main(void)
 {
-	UT_PLAN(84);
+	UT_PLAN(86);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -2243,6 +2316,8 @@ main(void)
 	UT_RUN(test_82_semantic_lmon_tick_drains_ack_ingress_before_other_work);
 	UT_RUN(test_83_semantic_lmon_tick_invalidates_active_ack_on_authority_loss);
 	UT_RUN(test_84_semantic_lmon_idle_ack_path_takes_no_authority_snapshot);
+	UT_RUN(test_85_complete_ack_image_revalidates_every_current_tuple);
+	UT_RUN(test_86_complete_ack_image_rejects_self_remote_and_row_drift);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

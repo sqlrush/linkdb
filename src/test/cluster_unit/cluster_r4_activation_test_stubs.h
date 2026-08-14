@@ -38,6 +38,10 @@ static int32 cluster_r4_activation_test_membership_node = -1;
 static uint64 cluster_r4_activation_test_membership_floor;
 static ClusterMembershipState cluster_r4_activation_test_membership_state
 	= CLUSTER_MEMBER_MEMBER;
+static int32 cluster_r4_activation_test_membership_node2 = -1;
+static uint64 cluster_r4_activation_test_membership_floor2;
+static ClusterMembershipState cluster_r4_activation_test_membership_state2
+	= CLUSTER_MEMBER_MEMBER;
 static uint64 cluster_r4_activation_test_self_incarnation = 1;
 static uint64 cluster_r4_activation_test_current_epoch;
 static bool cluster_r4_activation_test_in_quorum = true;
@@ -120,6 +124,8 @@ cluster_membership_get_last_admitted_incarnation(int32 node_id)
 {
 	if (node_id == cluster_r4_activation_test_membership_node)
 		return cluster_r4_activation_test_membership_floor;
+	if (node_id == cluster_r4_activation_test_membership_node2)
+		return cluster_r4_activation_test_membership_floor2;
 	return node_id >= 0 && node_id < CLUSTER_MAX_NODES ? 1 : 0;
 }
 
@@ -130,6 +136,8 @@ cluster_membership_get_state(int32 node_id)
 		return CLUSTER_MEMBER_REMOVED;
 	if (node_id == cluster_r4_activation_test_membership_node)
 		return cluster_r4_activation_test_membership_state;
+	if (node_id == cluster_r4_activation_test_membership_node2)
+		return cluster_r4_activation_test_membership_state2;
 	return CLUSTER_MEMBER_MEMBER;
 }
 
