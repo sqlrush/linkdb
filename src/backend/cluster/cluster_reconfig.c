@@ -42,6 +42,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b joiner gate */
 
 #ifdef USE_PGRAC_CLUSTER
@@ -391,6 +392,65 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 	LWLockRelease(&ReconfigShmem->lock);
 }
 
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
+											ClusterFormationSnapshotV1 *out)
+{
+	const ReconfigEvent *src;
+	int32 origin_node;
+	int i;
+
+	if (out == NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
+		|| ReconfigShmem == NULL)
+		return false;
+	origin_node = (int32)origin_thread - 1;
+	memset(out, 0, sizeof(*out));
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	src = &ReconfigShmem->last_applied;
+	out->applied.event_id = src->event_id;
+	out->applied.coordinator_node_id = src->coordinator_node_id;
+	out->applied.old_epoch = src->old_epoch;
+	out->applied.new_epoch = src->new_epoch;
+	memcpy(out->applied.dead_bitmap, src->dead_bitmap, sizeof(out->applied.dead_bitmap));
+	out->applied.applied_at = src->applied_at;
+	out->applied.observer_role = src->observer_role;
+	out->applied.event_seq = src->event_seq;
+	out->applied.cssd_dead_generation = src->cssd_dead_generation;
+	out->applied.reconfig_kind = src->reconfig_kind;
+	memcpy(out->applied.join_bitmap, src->join_bitmap, sizeof(out->applied.join_bitmap));
+	out->membership = ReconfigShmem->membership;
+	memcpy(out->pending_join_bitmap, ReconfigShmem->pending_join_bitmap,
+		   sizeof(out->pending_join_bitmap));
+	memcpy(out->clean_departed_bitmap, ReconfigShmem->clean_departed_bitmap,
+		   sizeof(out->clean_departed_bitmap));
+	memcpy(out->removed_bitmap, ReconfigShmem->removed_bitmap,
+		   sizeof(out->removed_bitmap));
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+		out->excluded_bitmap[i] = src->dead_bitmap[i] | ReconfigShmem->removed_bitmap[i];
+	out->victim_incarnation
+		= ReconfigShmem->membership.last_admitted_incarnation[origin_node];
+	out->prebump_sync_active
+		= pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active);
+	out->self_join_admitted = ReconfigShmem->self_join_admitted;
+	out->self_join_failed = ReconfigShmem->self_join_failed;
+	LWLockRelease(&ReconfigShmem->lock);
+	out->local_epoch = cluster_epoch_get_current();
+	return true;
+}
+
+static void
+cluster_reconfig_set_prebump_sync_active(uint32 value)
+{
+	uint64 cache_mutation;
+
+	if (ReconfigShmem == NULL
+		|| pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) == value)
+		return;
+	cache_mutation = cluster_write_fence_authority_cache_mutation_begin();
+	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, value);
+	cluster_write_fence_authority_cache_mutation_end(cache_mutation);
+}
+
 
 /* ============================================================
  * Internal publish helper.
@@ -417,6 +477,7 @@ cluster_reconfig_publish_event(const ReconfigEvent *evt)
 	memcpy(&published, evt, sizeof(ReconfigEvent));
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_write_fence_authority_cache_invalidate();
 	event_seq = pg_atomic_fetch_add_u64(&ReconfigShmem->apply_counter, 1) + 1;
 	published.event_seq = event_seq;
 	memcpy(&ReconfigShmem->last_applied, &published, sizeof(ReconfigEvent));
@@ -1531,6 +1592,9 @@ cluster_reconfig_record_clean_departed(int32 node_id, uint64 leave_epoch, bool r
 		return;
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id)
+		|| leave_epoch > ReconfigShmem->clean_departed_epoch[node_id])
+		cluster_write_fence_authority_cache_invalidate();
 	if (!clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id)) {
 		dead_bitmap_set_bit(ReconfigShmem->clean_departed_bitmap, node_id);
 		newly_set = true;
@@ -1564,6 +1628,9 @@ cluster_reconfig_clear_clean_departed(int32 node_id)
 		return;
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id)
+		|| ReconfigShmem->clean_departed_epoch[node_id] != 0)
+		cluster_write_fence_authority_cache_invalidate();
 	if (clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id))
 		ReconfigShmem->clean_departed_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
 	ReconfigShmem->clean_departed_epoch[node_id] = 0;
@@ -1621,6 +1688,10 @@ cluster_reconfig_record_removed(int32 node_id, uint64 remove_epoch, bool raise_e
 		return;
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap, node_id)
+		|| remove_epoch > ReconfigShmem->removed_epoch[node_id]
+		|| clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id))
+		cluster_write_fence_authority_cache_invalidate();
 	if (!clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap, node_id)) {
 		dead_bitmap_set_bit(ReconfigShmem->removed_bitmap, node_id);
 		newly_set = true;
@@ -2219,7 +2290,7 @@ cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
 	XLogRecPtr lsn;
 	ReconfigEvent evt;
 	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
-	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 remaining_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 incs[CLUSTER_MAX_NODES];
 
 	if (cluster_epoch_get_current() + 1 != expected_epoch)
@@ -2237,6 +2308,10 @@ cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
 	cluster_tt_status_flush_all((uint32)new_epoch);
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_write_fence_authority_cache_invalidate();
+	memcpy(remaining_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(remaining_dead));
+	remaining_dead[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
 	cluster_membership_set_state(node_id, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_record_admitted(node_id, admitted_incarnation);
 	ReconfigShmem->pending_join_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
@@ -2252,10 +2327,12 @@ cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
 
 	memset(&evt, 0, sizeof(evt));
 	evt.event_id = cluster_reconfig_compute_event_id_v2(
-		RECONFIG_KIND_JOIN_COMMITTED, empty_dead, jb, incs, cluster_cssd_get_dead_generation());
+		RECONFIG_KIND_JOIN_COMMITTED, remaining_dead, jb, incs,
+		cluster_cssd_get_dead_generation());
 	evt.coordinator_node_id = cluster_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
+	memcpy(evt.dead_bitmap, remaining_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	memcpy(evt.join_bitmap, jb, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
@@ -2318,6 +2395,8 @@ cluster_reconfig_poll_join_commit_stage(void)
 		|| cluster_membership_vet_joiner(join_commit_stage.node_id, admitted_incarnation,
 										 admitted_generation)
 			   != CLUSTER_JOIN_ACCEPT
+		|| !cluster_recovery_owner_rejoin_v1(join_commit_stage.node_id,
+										 join_commit_stage.admitted_incarnation)
 		|| !cluster_reconfig_publish_join_commit(join_commit_stage.node_id,
 												 join_commit_stage.admitted_incarnation,
 												 join_commit_stage.async.staged_expect_epoch)) {
@@ -3399,6 +3478,7 @@ cluster_reconfig_publish_replacement_member_closed(
 		return false;
 	}
 
+	cluster_write_fence_authority_cache_invalidate();
 	memcpy(&ReconfigShmem->replacement_episode, admitted_episode,
 		   sizeof(*admitted_episode));
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
@@ -3505,6 +3585,7 @@ cluster_reconfig_qvotec_observe_replacement_admitted(
 	if (expected == 0 || advanced < ((expected / 2u) + 1u))
 		goto out;
 
+	cluster_write_fence_authority_cache_invalidate();
 	episode->phase = CLUSTER_REPLACEMENT_EPISODE_ADMITTED;
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_record_admitted(cluster_node_id,
@@ -3540,6 +3621,7 @@ cluster_reconfig_open_replacement_admission(
 		return false;
 	}
 
+	cluster_write_fence_authority_cache_invalidate();
 	ReconfigShmem->self_join_admitted = 1;
 	ReconfigShmem->self_join_deadline_us = 0;
 	LWLockRelease(&ReconfigShmem->lock);
@@ -3635,6 +3717,7 @@ cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
 	}
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_write_fence_authority_cache_invalidate();
 	/* Close the check/use race with a concurrent replacement publisher. */
 	if (cluster_reconfig_has_replacement_episode(
 			&ReconfigShmem->replacement_episode)) {
@@ -3877,6 +3960,7 @@ cluster_reconfig_joiner_self_tick(void)
 			 * join, latch a convergence deadline (-> 53R61 on timeout). */
 			joiner_gate_decided = true;
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			cluster_write_fence_authority_cache_invalidate();
 			ReconfigShmem->self_join_admitted = 0;
 			ReconfigShmem->self_join_failed = 0;
 			ReconfigShmem->self_join_deadline_us
@@ -3921,6 +4005,7 @@ cluster_reconfig_joiner_self_tick(void)
 										cluster_node_id)));
 				}
 				LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+				cluster_write_fence_authority_cache_invalidate();
 				ReconfigShmem->self_join_admitted = 0;
 				cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
 				LWLockRelease(&ReconfigShmem->lock);
@@ -3932,6 +4017,7 @@ cluster_reconfig_joiner_self_tick(void)
 			 * epoch advance does not re-close this genuine member (INV-J14). */
 			joiner_gate_decided = true;
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			cluster_write_fence_authority_cache_invalidate();
 			ReconfigShmem->self_join_admitted = 1;
 			ReconfigShmem->self_join_failed = 0;
 			ReconfigShmem->self_join_deadline_us = 0;
@@ -3946,6 +4032,7 @@ cluster_reconfig_joiner_self_tick(void)
 			 * (fail-closed) and re-evaluate next tick — a slow qvotec waits here
 			 * rather than mis-opening as bootstrap (P1-2). */
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			cluster_write_fence_authority_cache_invalidate();
 			ReconfigShmem->self_join_admitted = 0;
 			cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
 			LWLockRelease(&ReconfigShmem->lock);
@@ -3960,6 +4047,7 @@ cluster_reconfig_joiner_self_tick(void)
 		&& ReconfigShmem->self_join_deadline_us != 0
 		&& now_us >= ReconfigShmem->self_join_deadline_us) {
 		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+		cluster_write_fence_authority_cache_invalidate();
 		ReconfigShmem->self_join_failed = 1;
 		cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_REJECTED);
 		LWLockRelease(&ReconfigShmem->lock);
@@ -4057,6 +4145,7 @@ cluster_reconfig_offpath_rejoin_tick(void)
 		cluster_grd_arm_join_pcm_fence(self_set); /* fence FIRST (8.A) */
 
 		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+		cluster_write_fence_authority_cache_invalidate();
 		ReconfigShmem->self_join_admitted = 0; /* then close the write gate */
 		LWLockRelease(&ReconfigShmem->lock);
 
@@ -4110,6 +4199,7 @@ void
 cluster_reconfig_lmon_tick(void)
 {
 	uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 new_failure_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 	uint8 alive_set[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 	int32 self_id;
 	int coordinator;
@@ -4117,6 +4207,9 @@ cluster_reconfig_lmon_tick(void)
 	uint64 event_id;
 	int i;
 	bool failstop_stage_handled = false;
+	bool failure_generation_changed = false;
+	int32 root_gated_join_node = -1;
+	uint64 root_gated_join_incarnation = 0;
 
 	/* L20: runtime feature flag check first line. */
 	if (!cluster_enabled)
@@ -4159,6 +4252,7 @@ cluster_reconfig_lmon_tick(void)
 		if (cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_DEAD)
 			dead_bitmap_set_bit(dead_bitmap, i);
 	}
+	cssd_dead_generation = cluster_cssd_get_dead_generation();
 
 	/*
 	 * spec-5.15 D5 — joiner self-tick: decide (once, in the early boot window) if
@@ -4175,6 +4269,41 @@ cluster_reconfig_lmon_tick(void)
 	 * bootstrap-vs-rejoin classification is proven.  No-op on online_join=on.
 	 */
 	cluster_reconfig_offpath_rejoin_tick();
+
+	/*
+	 * Frozen STOP-02 §17.6: survivor-side observation of a durable COMMITTED
+	 * JCMK is not by itself authority to clear an excluded origin.  Select one
+	 * exact DEAD->ALIVE candidate while holding the reconfig snapshot lock, then
+	 * perform the direct-majority JCMK + ROOT owner CAS outside that lock.  The
+	 * exclusive mutation below revalidates the exact incarnation before use.
+	 * Serializing one origin per tick also preserves the one-bit JOIN clear rule.
+	 */
+	if (ReconfigShmem != NULL && cluster_online_join) {
+		uint64 candidate_incarnation = 0;
+
+		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (i == self_id || cluster_conf_lookup_node(i) == NULL
+				|| cluster_membership_get_state(i) != CLUSTER_MEMBER_DEAD
+				|| cluster_cssd_get_peer_state(i) != CLUSTER_CSSD_PEER_ALIVE)
+				continue;
+			if (cluster_reconfig_get_observed_committed_join(
+					i, &candidate_incarnation, NULL)
+				&& candidate_incarnation
+					   > cluster_membership_get_last_admitted_incarnation(i)) {
+				root_gated_join_node = i;
+				break;
+			}
+		}
+		LWLockRelease(&ReconfigShmem->lock);
+
+		if (root_gated_join_node >= 0
+			&& cluster_recovery_owner_rejoin_v1(root_gated_join_node,
+											 candidate_incarnation))
+			root_gated_join_incarnation = candidate_incarnation;
+		else
+			root_gated_join_node = -1;
+	}
 
 	/*
 	 * spec-5.15 D1 (INV-J8): the membership-state table — NOT raw CSSD — is the
@@ -4205,9 +4334,11 @@ cluster_reconfig_lmon_tick(void)
 		 * from their durable COMMITTED join marker this tick (an observer JOIN
 		 * event is published for them after the lock is released). */
 		uint8 newly_joined[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+		uint8 join_remaining_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 		bool any_joined = false;
 
 		memset(newly_joined, 0, sizeof(newly_joined));
+		memset(join_remaining_dead, 0, sizeof(join_remaining_dead));
 
 		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 
@@ -4258,7 +4389,8 @@ cluster_reconfig_lmon_tick(void)
 				cluster_membership_set_state(i, CLUSTER_MEMBER_DEAD);
 			else if (ms == CLUSTER_MEMBER_ABSENT)
 				cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
-			else if (cluster_online_join && ms == CLUSTER_MEMBER_DEAD
+			else if (cluster_online_join && i == root_gated_join_node
+					 && ms == CLUSTER_MEMBER_DEAD
 					 && cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_ALIVE) {
 				/*
 				 * spec-5.16 (3-node join participation) — survivor-side runtime
@@ -4274,6 +4406,7 @@ cluster_reconfig_lmon_tick(void)
 				uint64 obs_epoch = 0;
 
 				if (cluster_reconfig_get_observed_committed_join(i, &obs_inc, &obs_epoch)
+					&& obs_inc == root_gated_join_incarnation
 					&& obs_inc > cluster_membership_get_last_admitted_incarnation(i)) {
 					cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
 					cluster_membership_record_admitted(i, obs_inc);
@@ -4297,9 +4430,28 @@ cluster_reconfig_lmon_tick(void)
 		 * subsequent CSSD DEAD/ALIVE never re-triggers a reconfig nor passively
 		 * re-admits it — it is no longer a member.
 		 */
-		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++) {
+			/* STOP-02 §17.6: an older excluded origin remains fenced even if
+			 * CSSD sees its restarted process ALIVE.  Only the individually
+			 * ROOT-gated JOIN above may remove its bit. */
 			dead_bitmap[b] &= (uint8) ~(ReconfigShmem->clean_departed_bitmap[b]
-										| ReconfigShmem->removed_bitmap[b]);
+										 | ReconfigShmem->removed_bitmap[b]);
+			if (dead_bitmap[b] != 0
+				&& cssd_dead_generation
+					   != ReconfigShmem->last_applied.cssd_dead_generation)
+				failure_generation_changed = true;
+			new_failure_bitmap[b]
+				= dead_bitmap[b]
+				  & (uint8) ~ReconfigShmem->last_applied.dead_bitmap[b];
+			dead_bitmap[b] |= ReconfigShmem->last_applied.dead_bitmap[b];
+			dead_bitmap[b] &= (uint8) ~newly_joined[b];
+		}
+		if (any_joined) {
+			memcpy(join_remaining_dead, ReconfigShmem->last_applied.dead_bitmap,
+				   sizeof(join_remaining_dead));
+			join_remaining_dead[root_gated_join_node / 8]
+				&= (uint8) ~(1u << (root_gated_join_node % 8));
+		}
 
 		LWLockRelease(&ReconfigShmem->lock);
 
@@ -4316,18 +4468,13 @@ cluster_reconfig_lmon_tick(void)
 		 */
 		if (any_joined) {
 			ReconfigEvent jevt;
-			uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 			uint64 incs[CLUSTER_MAX_NODES];
 			int jn;
 
-			memset(empty_dead, 0, sizeof(empty_dead));
 			memset(incs, 0, sizeof(incs));
 			for (jn = 0; jn < CLUSTER_MAX_NODES; jn++) {
 				if (dead_bitmap_test_bit(newly_joined, jn)) {
-					uint64 oi = 0;
-
-					(void)cluster_reconfig_get_observed_committed_join(jn, &oi, NULL);
-					incs[jn] = oi;
+					incs[jn] = root_gated_join_incarnation;
 					if (cluster_reconfig_is_clean_departed(jn))
 						cluster_reconfig_clear_clean_departed(jn);
 				}
@@ -4335,11 +4482,13 @@ cluster_reconfig_lmon_tick(void)
 
 			memset(&jevt, 0, sizeof(jevt));
 			jevt.event_id = cluster_reconfig_compute_event_id_v2(
-				RECONFIG_KIND_JOIN_COMMITTED, empty_dead, newly_joined, incs,
+				RECONFIG_KIND_JOIN_COMMITTED, join_remaining_dead, newly_joined, incs,
 				cluster_cssd_get_dead_generation());
 			jevt.coordinator_node_id = self_id; /* observer; informational */
 			jevt.old_epoch = cluster_epoch_get_current();
 			jevt.new_epoch = jevt.old_epoch; /* survivor observes the bump via piggyback */
+			memcpy(jevt.dead_bitmap, join_remaining_dead,
+				   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 			memcpy(jevt.join_bitmap, newly_joined, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 			jevt.applied_at = GetCurrentTimestamp();
 			jevt.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
@@ -4348,6 +4497,7 @@ cluster_reconfig_lmon_tick(void)
 			cluster_reconfig_publish_event(&jevt);
 		}
 	} else {
+		memcpy(new_failure_bitmap, dead_bitmap, sizeof(new_failure_bitmap));
 		dead_bitmap_set_bit(alive_set, self_id);
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			if (i == self_id)
@@ -4373,11 +4523,12 @@ cluster_reconfig_lmon_tick(void)
 	 * stabilizing the survivor base), THEN the join edge.  Each is an independent
 	 * ReconfigEvent; neither early-returns past the other.
 	 */
-	if (!failstop_stage_handled && !dead_bitmap_is_zero(dead_bitmap)) {
+	if (!failstop_stage_handled
+		&& (!dead_bitmap_is_zero(new_failure_bitmap)
+			|| failure_generation_changed)) {
 		CLUSTER_INJECTION_POINT("cluster-reconfig-decide-coordinator");
 
 		/* §3.2 P1.2: event_id from dead_bitmap + dead_generation snapshot. */
-		cssd_dead_generation = cluster_cssd_get_dead_generation();
 		event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);
 
 		/* Dedup against last_applied.  Same dead_bitmap within one DEAD episode →
@@ -4505,9 +4656,19 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	uint64 old_epoch, new_epoch;
 	XLogRecPtr lsn;
 	ReconfigEvent evt;
+	ReconfigEvent previous;
+	uint8 full_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int b;
 
 	if (!cluster_enabled)
 		return;
+	memcpy(full_dead, dead_bitmap, sizeof(full_dead));
+	if (ReconfigShmem != NULL) {
+		memset(&previous, 0, sizeof(previous));
+		cluster_reconfig_get_last_event(&previous);
+		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+			full_dead[b] |= previous.dead_bitmap[b];
+	}
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-epoch-bump-pre");
 
@@ -4519,7 +4680,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * fence-off paths (they either hand off to the local staged flag or publish
 	 * within this same call with no intervening tick).
 	 */
-	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 1);
+	cluster_reconfig_set_prebump_sync_active(1);
 
 	/* D18:  atomic CAS-loop increment.  Returns pre/post snapshots. */
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
@@ -4567,11 +4728,11 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	cluster_tt_status_flush_all((uint32)new_epoch);
 
 	memset(&evt, 0, sizeof(evt));
-	evt.event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);
+	evt.event_id = cluster_reconfig_compute_event_id(full_dead, cssd_dead_generation);
 	evt.coordinator_node_id = coordinator_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
-	memcpy(evt.dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	memcpy(evt.dead_bitmap, full_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
 	evt.cssd_dead_generation = cssd_dead_generation;
@@ -4602,7 +4763,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 		marker.fence_event_id = evt.event_id; /* identity only */
 		marker.fence_generation = cssd_dead_generation;
 		marker.issuer_node_id = coordinator_node_id;
-		memcpy(marker.fenced_dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+		memcpy(marker.fenced_dead_bitmap, full_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 		/*
 		 * spec-5.18 INV-LF10: when there ARE permanently-removed nodes, every
 		 * reconfig-issued fence marker must also carry them, so a later fail-stop
@@ -4638,13 +4799,13 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 									 "majority for epoch %llu; not publishing reconfig event "
 									 "(write-fenced, will retry)",
 									 (unsigned long long)new_epoch)));
-				pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+				cluster_reconfig_set_prebump_sync_active(0);
 				return;
 			}
 
 			cluster_reconfig_publish_event(&evt);
 			cluster_reconfig_log_failstop_epoch_bump(&evt);
-			pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+			cluster_reconfig_set_prebump_sync_active(0);
 			return;
 		}
 
@@ -4656,7 +4817,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 												  CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
 												  coordinator_node_id, GetCurrentTimestamp());
 		/* LMON path: the local staged flag now covers the pending window. */
-		pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+		cluster_reconfig_set_prebump_sync_active(0);
 		return; /* fail-closed until the staged marker is majority-durable */
 	}
 
@@ -4674,7 +4835,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	cluster_reconfig_log_failstop_epoch_bump(&evt);
 
 	/* spec-2.29a r2 t/274: fence-off path published within this call. */
-	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+	cluster_reconfig_set_prebump_sync_active(0);
 }
 
 
@@ -4704,6 +4865,8 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
 	uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 	uint64 cssd_dead_generation;
 	ReconfigEvent evt;
+	ReconfigEvent previous;
+	int b;
 
 	if (!cluster_enabled || ReconfigShmem == NULL)
 		return 0;
@@ -4713,6 +4876,10 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
 	/* inject points for the clean-leave path are D12 (spec-5.13 S7). */
 
 	dead_bitmap_set_bit(dead_bitmap, leaving_node_id);
+	memset(&previous, 0, sizeof(previous));
+	cluster_reconfig_get_last_event(&previous);
+	for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		dead_bitmap[b] |= previous.dead_bitmap[b];
 	cssd_dead_generation = cluster_cssd_get_dead_generation();
 
 	/*
@@ -4774,8 +4941,9 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
  *	removed_bitmap + removal_event_id (R14 — never deduped even when dead_bitmap is
  *	unchanged), then records the node removed (removed_bitmap + epoch, masking it
  *	out of effective_dead) and shrinks membership_state to REMOVED.  The published
- *	event's dead_bitmap is empty: the removed node already departed (clean-left /
- *	fail-stopped), so this is a membership change, not a new death.  Returns the
+	 *	event's dead_bitmap retains the previously applied DEAD set: the removed node
+	 *	is a membership change, but a later baseline must not release unrelated
+	 *	excluded origins.  Returns the
  *	new epoch, or 0 if the guarded advance lost (a real death intruded — the driver
  *	ABORTED_ESCALATEs, pre-SHRUNK).
  */
@@ -4786,10 +4954,12 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 {
 	uint64 old_epoch, new_epoch;
 	XLogRecPtr lsn;
-	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 current_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint8 removed_with_n[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 excluded_with_n[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 cssd_dead_generation;
 	ReconfigEvent evt;
+	int b;
 
 	/*
 	 * *out_contest distinguishes the two zero-returns for the driver (P1-A): a lost
@@ -4831,8 +5001,21 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 	/* R14: event_id folds the removed set (current removed_bitmap | {N}) + the
 	 * per-attempt removal_event_id, so a clean-left removal (dead_bitmap unchanged)
 	 * still produces a distinct, non-deduped id. */
-	cluster_reconfig_snapshot_removed_bitmap(removed_with_n);
+	/* Frozen §17.6 marker-producer rule: take the currently applied DEAD set
+	 * and durable REMOVED set from one reconfig-lock snapshot, then add this
+	 * not-yet-applied removal delta.  A NODE_REMOVED marker is an authority
+	 * image for the full excluded set, not merely the event-local delta. */
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	memcpy(current_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(current_dead));
+	memcpy(removed_with_n, ReconfigShmem->removed_bitmap,
+		   sizeof(removed_with_n));
+	for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		excluded_with_n[b] = ReconfigShmem->last_applied.dead_bitmap[b]
+							  | ReconfigShmem->removed_bitmap[b];
+	LWLockRelease(&ReconfigShmem->lock);
 	removed_with_n[removed_node_id / 8] |= (uint8)(1u << (removed_node_id % 8));
+	excluded_with_n[removed_node_id / 8] |= (uint8)(1u << (removed_node_id % 8));
 
 	/*
 	 * INV-LF2 (fence-before-shrink): arm the 4.12 write fence for the removed node
@@ -4856,16 +5039,15 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 		marker.fence_generation = cssd_dead_generation;
 		marker.issuer_node_id = cluster_node_id;
 		marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_NODE_REMOVED;
-		/* fenced set = removed (already includes N) — the removal needs only N fenced;
-		 * a concurrent dead set, if any, is carried by its own fail-stop fence. */
-		memcpy(marker.fenced_dead_bitmap, removed_with_n, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+		memcpy(marker.fenced_dead_bitmap, excluded_with_n,
+			   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 
 		node_removed_fence_stage.event.event_id
 			= cluster_reconfig_compute_removal_event_id(removed_with_n, removal_event_id);
 		node_removed_fence_stage.event.coordinator_node_id = cluster_node_id;
 		node_removed_fence_stage.event.old_epoch = old_epoch;
 		node_removed_fence_stage.event.new_epoch = new_epoch;
-		memcpy(node_removed_fence_stage.event.dead_bitmap, empty_dead,
+		memcpy(node_removed_fence_stage.event.dead_bitmap, current_dead,
 			   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 		node_removed_fence_stage.event.applied_at = GetCurrentTimestamp();
 		node_removed_fence_stage.event.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
@@ -4888,7 +5070,7 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 	evt.coordinator_node_id = cluster_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
-	memcpy(evt.dead_bitmap, empty_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	memcpy(evt.dead_bitmap, current_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
 	evt.cssd_dead_generation = cssd_dead_generation;
@@ -6148,7 +6330,7 @@ cluster_reconfig_apply_join_as_coordinator(
 	uint64 old_epoch, new_epoch;
 	XLogRecPtr lsn;
 	uint64 cssd_dead_generation;
-	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 pending_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	ReconfigEvent evt;
 	int i;
 
@@ -6170,6 +6352,9 @@ cluster_reconfig_apply_join_as_coordinator(
 
 	/* Mark joiners JOINING + pending (candidates, NOT members yet — INV-J2). */
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_write_fence_authority_cache_invalidate();
+	memcpy(pending_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(pending_dead));
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (!dead_bitmap_test_bit(join_bitmap, i))
 			continue;
@@ -6180,11 +6365,12 @@ cluster_reconfig_apply_join_as_coordinator(
 
 	memset(&evt, 0, sizeof(evt));
 	evt.event_id
-		= cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING, empty_dead, join_bitmap,
+		= cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING, pending_dead, join_bitmap,
 											   joiner_incarnations, cssd_dead_generation);
 	evt.coordinator_node_id = coordinator_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
+	memcpy(evt.dead_bitmap, pending_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	memcpy(evt.join_bitmap, join_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;

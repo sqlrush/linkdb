@@ -28,6 +28,7 @@
 
 #include "cluster/cluster_guc.h" /* cluster_node_id (spec-5.22e D5-8) */
 #include "cluster/cluster_membership.h"
+#include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_qvotec.h"		  /* cluster_qvotec_in_quorum (quorum sub-gate) */
 #include "cluster/cluster_undo_horizon.h" /* note_self_member (spec-5.22e D5-8) */
 
@@ -403,8 +404,10 @@ cluster_membership_record_admitted(int32 node_id, uint64 incarnation)
 {
 	if (!node_id_in_range(node_id))
 		return;
-	if (incarnation > MembershipTable->last_admitted_incarnation[node_id])
+	if (incarnation > MembershipTable->last_admitted_incarnation[node_id]) {
+		cluster_write_fence_authority_cache_invalidate();
 		MembershipTable->last_admitted_incarnation[node_id] = incarnation;
+	}
 }
 
 ClusterMembershipState
@@ -424,6 +427,8 @@ cluster_membership_set_state(int32 node_id, ClusterMembershipState state)
 	if (!node_id_in_range(node_id))
 		return;
 	prev = (ClusterMembershipState)MembershipTable->membership_state[node_id];
+	if (prev != state)
+		cluster_write_fence_authority_cache_invalidate();
 	MembershipTable->membership_state[node_id] = (uint8)state;
 
 	/*
@@ -481,6 +486,9 @@ cluster_membership_shrink_to_removed(int32 node_id, uint64 last_incarnation)
 {
 	if (!node_id_in_range(node_id))
 		return;
+	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id]
+		|| MembershipTable->membership_state[node_id] != CLUSTER_MEMBER_REMOVED)
+		cluster_write_fence_authority_cache_invalidate();
 	/* raise the floor first (monotone) so re-admit must exceed the removed incarnation */
 	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id])
 		MembershipTable->last_admitted_incarnation[node_id] = last_incarnation;

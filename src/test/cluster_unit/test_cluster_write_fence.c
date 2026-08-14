@@ -565,10 +565,176 @@ UT_TEST(test_grace_before_engage)
 	UT_ASSERT(!cluster_write_fence_grace_before_engage(true, true, false, true));
 }
 
+/* ----------
+ * RF-ROOT P2 / STOP-02 \u00a717.5: exact marker validation, one vote per
+ * distinct disk, and the total durable-authority result surface.
+ * ----------
+ */
+UT_TEST(test_stop02_marker_validation_is_exact)
+{
+	ClusterFenceMarker m = mk_marker(7, 3, 0x99, 1, 0x04);
+
+	UT_ASSERT(cluster_fence_marker_valid_v1(&m));
+	m.version++;
+	UT_ASSERT(!cluster_fence_marker_valid_v1(&m));
+	m.version = CLUSTER_FENCE_MARKER_VERSION;
+	m.marker_kind = 99;
+	UT_ASSERT(!cluster_fence_marker_valid_v1(&m));
+	m.marker_kind = CLUSTER_FENCE_MARKER_KIND_FENCE;
+	m._pad[10] = 1;
+	UT_ASSERT(!cluster_fence_marker_valid_v1(&m));
+
+	m = mk_marker(7, 3, 0x99, 1, 0x00);
+	UT_ASSERT(!cluster_fence_marker_valid_v1(&m)); /* a fence must exclude someone */
+	m.fenced_dead_bitmap[0] = 0x02;
+	UT_ASSERT(!cluster_fence_marker_valid_v1(&m)); /* issuer cannot fence itself */
+
+	m = mk_marker(1, 0, 0, CLUSTER_FENCE_BASELINE_INITIAL_ISSUER, 0);
+	m.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	UT_ASSERT(cluster_fence_marker_valid_v1(&m));
+}
+
+UT_TEST(test_stop02_disk_casts_one_greatest_order_vote)
+{
+	ClusterFenceMarker slots[4];
+	bool outer_crc_valid[4] = { true, true, true, false };
+	ClusterFenceMarker vote;
+
+	slots[0] = mk_marker(7, 2, 0x10, 1, 0x04);
+	slots[1] = mk_marker(8, 1, 0x20, 1, 0x04);
+	slots[2] = mk_marker(7, 9, 0x30, 1, 0x04);
+	slots[3] = mk_marker(99, 1, 0x40, 1, 0x04);
+	UT_ASSERT_EQ(cluster_fence_disk_vote_select_v1(slots, outer_crc_valid, 4, &vote),
+				 CLUSTER_FENCE_DISK_VOTE_VALID);
+	UT_ASSERT_EQ(vote.fence_epoch, 8);
+	UT_ASSERT_EQ(vote.fence_generation, 1);
+
+	/* Equal greatest (epoch,generation) with divergent identity is corruption. */
+	slots[2] = slots[1];
+	slots[2].fence_event_id++;
+	UT_ASSERT_EQ(cluster_fence_disk_vote_select_v1(slots, outer_crc_valid, 4, &vote),
+				 CLUSTER_FENCE_DISK_VOTE_CORRUPT);
+}
+
+UT_TEST(test_stop02_authority_uses_total_disk_denominator)
+{
+	ClusterFenceMarker markers[3];
+	ClusterFenceDiskVoteState states[3];
+	ClusterFenceAuthorityProof proof;
+
+	markers[0] = mk_marker(5, 2, 0xAA, 1, 0x04);
+	markers[1] = markers[0];
+	markers[2] = mk_marker(9, 1, 0xBB, 1, 0x04);
+	states[0] = CLUSTER_FENCE_DISK_VOTE_VALID;
+	states[1] = CLUSTER_FENCE_DISK_VOTE_VALID;
+	states[2] = CLUSTER_FENCE_DISK_VOTE_UNREADABLE;
+	UT_ASSERT_EQ(cluster_fence_authority_prove_v1(markers, states, 3, &proof),
+				 CLUSTER_FENCE_AUTHORITY_OK);
+	UT_ASSERT_EQ(proof.agree_disk_count, 2);
+	UT_ASSERT_EQ(proof.total_disk_count, 3);
+	UT_ASSERT_EQ(proof.marker.fence_epoch, 5);
+
+	states[1] = CLUSTER_FENCE_DISK_VOTE_UNREADABLE;
+	UT_ASSERT_EQ(cluster_fence_authority_prove_v1(markers, states, 3, &proof),
+				 CLUSTER_FENCE_AUTHORITY_IO_UNAVAILABLE);
+
+	states[0] = CLUSTER_FENCE_DISK_VOTE_VALID;
+	states[1] = CLUSTER_FENCE_DISK_VOTE_VALID;
+	states[2] = CLUSTER_FENCE_DISK_VOTE_VALID;
+	markers[1] = mk_marker(6, 1, 0xCC, 1, 0x04);
+	UT_ASSERT_EQ(cluster_fence_authority_prove_v1(markers, states, 3, &proof),
+				 CLUSTER_FENCE_AUTHORITY_NO_MAJORITY);
+}
+
+UT_TEST(test_stop02_authority_failure_preserves_output)
+{
+	ClusterFenceMarker markers[3];
+	ClusterFenceDiskVoteState states[3] = {
+		CLUSTER_FENCE_DISK_VOTE_VALID,
+		CLUSTER_FENCE_DISK_VOTE_MIXED_VERSION,
+		CLUSTER_FENCE_DISK_VOTE_UNREADABLE,
+	};
+	ClusterFenceAuthorityProof proof;
+	ClusterFenceAuthorityProof before;
+
+	markers[0] = mk_marker(5, 2, 0xAA, 1, 0x04);
+	markers[1] = markers[0];
+	markers[2] = markers[0];
+	memset(&proof, 0xA5, sizeof(proof));
+	before = proof;
+	UT_ASSERT_EQ(cluster_fence_authority_prove_v1(markers, states, 3, &proof),
+				 CLUSTER_FENCE_AUTHORITY_MIXED_VERSION);
+	UT_ASSERT(memcmp(&proof, &before, sizeof(proof)) == 0);
+
+	states[1] = CLUSTER_FENCE_DISK_VOTE_CORRUPT;
+	UT_ASSERT_EQ(cluster_fence_authority_prove_v1(markers, states, 3, &proof),
+				 CLUSTER_FENCE_AUTHORITY_CORRUPT);
+	UT_ASSERT(memcmp(&proof, &before, sizeof(proof)) == 0);
+}
+
+UT_TEST(test_stop02_cache_exact_match_stale_and_expired)
+{
+	ClusterFenceMarker expected = mk_marker(8, 2, 0xAA, 1, 0x04);
+	ClusterFenceMarker observed = expected;
+	uint64 published = UINT64_C(10000000);
+	uint64 expiry = published + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US;
+
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 2, 2, true, &observed, published, expiry, published),
+				 CLUSTER_FENCE_CACHE_MATCH);
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 2, 2, true, &observed, published, expiry, published - 1),
+				 CLUSTER_FENCE_CACHE_STALE);
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 2, 2, true, &observed, published, expiry, expiry),
+				 CLUSTER_FENCE_CACHE_EXPIRED);
+	observed.fence_event_id++;
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 2, 2, true, &observed, published, expiry, published),
+				 CLUSTER_FENCE_CACHE_STALE);
+}
+
+UT_TEST(test_stop02_cache_invalid_and_torn_are_distinct)
+{
+	ClusterFenceMarker expected = mk_marker(8, 2, 0xAA, 1, 0x04);
+	uint64 published = UINT64_C(10000000);
+	uint64 expiry = published + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US;
+
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 0, 0, false, &expected, 0, 0, published),
+				 CLUSTER_FENCE_CACHE_INVALID);
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 3, 4, true, &expected, published, expiry, published),
+				 CLUSTER_FENCE_CACHE_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 4, 6, true, &expected, published, expiry, published),
+				 CLUSTER_FENCE_CACHE_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 4, 4, false, &expected, published, expiry, published),
+				 CLUSTER_FENCE_CACHE_INVALID);
+}
+
+UT_TEST(test_stop02_cache_rejects_bad_expiry_and_semantic_kind_mismatch)
+{
+	ClusterFenceMarker expected = mk_marker(8, 2, 0xAA, 1, 0x04);
+	ClusterFenceMarker observed = expected;
+	uint64 published = UINT64_MAX - 10;
+
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 2, 2, true, &observed, published, UINT64_MAX, published),
+				 CLUSTER_FENCE_CACHE_INVALID);
+	published = UINT64_C(10000000);
+	observed.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
+				 &expected, 2, 2, true, &observed, published,
+				 published + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US, published),
+				 CLUSTER_FENCE_CACHE_STALE);
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(37);
 	UT_RUN(test_enforcement_off_is_escape_hatch);
 	UT_RUN(test_baseline_authorized_is_allowed);
 	UT_RUN(test_detached_region_fails_closed);
@@ -599,6 +765,13 @@ main(void)
 	UT_RUN(test_baseline_pristine_issuer_is_sentinel_and_uniform);
 	UT_RUN(test_lowest_live_node);
 	UT_RUN(test_grace_before_engage);
+	UT_RUN(test_stop02_marker_validation_is_exact);
+	UT_RUN(test_stop02_disk_casts_one_greatest_order_vote);
+	UT_RUN(test_stop02_authority_uses_total_disk_denominator);
+	UT_RUN(test_stop02_authority_failure_preserves_output);
+	UT_RUN(test_stop02_cache_exact_match_stale_and_expired);
+	UT_RUN(test_stop02_cache_invalid_and_torn_are_distinct);
+	UT_RUN(test_stop02_cache_rejects_bad_expiry_and_semantic_kind_mismatch);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

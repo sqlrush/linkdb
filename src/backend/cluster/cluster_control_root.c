@@ -977,6 +977,8 @@ migration_image_validate(const ClusterControlRootMigrationImage *image,
 							 image->storage_uuid, image->authority_uuid)
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return false;
+		if (snapshot->identity.root_lineage_seq != 1)
+			return false;
 		if (snapshot->lifecycle_reason != CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT)
 			return false;
 		assigned++;
@@ -1505,6 +1507,13 @@ patch_shape_valid(const ClusterControlRootPatch *patch,
 		|| !snapshot_reserved_zero(&patch->desired)
 		|| (patch->desired.root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) != 0)
 		return false;
+	if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
+		&& (patch->expected_lifecycle
+				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+			|| patch->desired.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+			|| patch->desired.identity.origin_owner_incarnation == 0
+			|| patch->desired.identity.root_lineage_seq == 0))
+		return false;
 	memset(&allowed, 0, sizeof(allowed));
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE) != 0)
 		allowed.lifecycle = patch->desired.lifecycle;
@@ -1658,6 +1667,15 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 		else if (primary->records[thread_id - 1].lifecycle != patch->expected_lifecycle
 				 || (primary->records[thread_id - 1].root_flags
 					 & patch->expected_flags_mask) != patch->expected_flags_value)
+			result = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+		else if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
+				 && (primary->records[thread_id - 1].identity.root_lineage_seq
+						 == UINT64_MAX
+					 || patch->desired.identity.root_lineage_seq
+							!= primary->records[thread_id - 1].identity.root_lineage_seq + 1
+					 || patch->desired.identity.origin_owner_incarnation
+							<= primary->records[thread_id - 1]
+								   .identity.origin_owner_incarnation))
 			result = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	}
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY

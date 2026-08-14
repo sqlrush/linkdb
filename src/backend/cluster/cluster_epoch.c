@@ -39,6 +39,7 @@
 #include "storage/shmem.h"
 
 #include "cluster/cluster_shmem.h" /* cluster_shmem_register_region */
+#include "cluster/cluster_write_fence.h"
 
 /*
  * spec-2.4 D1 / Q1 修订:
@@ -142,6 +143,7 @@ void
 cluster_epoch_advance_for_reconfig(uint64 *old_out, uint64 *new_out)
 {
 	uint64 old_val;
+	uint64 cache_mutation;
 
 	Assert(old_out != NULL && new_out != NULL);
 
@@ -152,6 +154,7 @@ cluster_epoch_advance_for_reconfig(uint64 *old_out, uint64 *new_out)
 		*new_out = CLUSTER_EPOCH_INITIAL;
 		return;
 	}
+	cache_mutation = cluster_write_fence_authority_cache_mutation_begin();
 
 	for (;;) {
 		old_val = pg_atomic_read_u64(&cluster_epoch_state->current_epoch);
@@ -163,6 +166,7 @@ cluster_epoch_advance_for_reconfig(uint64 *old_out, uint64 *new_out)
 
 	*old_out = old_val;
 	*new_out = old_val + 1;
+	cluster_write_fence_authority_cache_mutation_end(cache_mutation);
 }
 
 /*
@@ -181,6 +185,8 @@ void
 cluster_epoch_adopt_admitted(uint64 admitted_epoch)
 {
 	uint64 old_val;
+	uint64 cache_mutation = 0;
+	bool mutation_started = false;
 
 	if (cluster_epoch_state == NULL)
 		return;
@@ -189,11 +195,17 @@ cluster_epoch_adopt_admitted(uint64 admitted_epoch)
 		old_val = pg_atomic_read_u64(&cluster_epoch_state->current_epoch);
 		if (admitted_epoch <= old_val)
 			break; /* already at or above — monotonic, no change */
+		if (!mutation_started) {
+			cache_mutation = cluster_write_fence_authority_cache_mutation_begin();
+			mutation_started = true;
+		}
 		if (pg_atomic_compare_exchange_u64(&cluster_epoch_state->current_epoch, &old_val,
 										   admitted_epoch))
 			break;
 		/* CAS lost — re-read and retry */
 	}
+	if (mutation_started)
+		cluster_write_fence_authority_cache_mutation_end(cache_mutation);
 }
 
 /*
@@ -216,6 +228,8 @@ bool
 cluster_epoch_advance_for_reconfig_if_baseline(uint64 baseline, uint64 *new_out)
 {
 	uint64 expected = baseline;
+	uint64 cache_mutation;
+	bool advanced;
 
 	Assert(new_out != NULL);
 
@@ -223,9 +237,12 @@ cluster_epoch_advance_for_reconfig_if_baseline(uint64 baseline, uint64 *new_out)
 		*new_out = CLUSTER_EPOCH_INITIAL;
 		return false;
 	}
+	cache_mutation = cluster_write_fence_authority_cache_mutation_begin();
 
-	if (pg_atomic_compare_exchange_u64(&cluster_epoch_state->current_epoch, &expected,
-									   baseline + 1)) {
+	advanced = pg_atomic_compare_exchange_u64(&cluster_epoch_state->current_epoch, &expected,
+									  baseline + 1);
+	cluster_write_fence_authority_cache_mutation_end(cache_mutation);
+	if (advanced) {
 		*new_out = baseline + 1;
 		return true;
 	}
@@ -271,17 +288,28 @@ bool
 cluster_epoch_observe_remote(uint64 remote_epoch)
 {
 	uint64 cur_val;
+	uint64 cache_mutation = 0;
+	bool mutation_started = false;
 
 	if (cluster_epoch_state == NULL)
 		return false;
 
 	for (;;) {
 		cur_val = pg_atomic_read_u64(&cluster_epoch_state->current_epoch);
-		if (cur_val >= remote_epoch)
+		if (cur_val >= remote_epoch) {
+			if (mutation_started)
+				cluster_write_fence_authority_cache_mutation_end(cache_mutation);
 			return false; /* monotonic — never retreat */
+		}
+		if (!mutation_started) {
+			cache_mutation = cluster_write_fence_authority_cache_mutation_begin();
+			mutation_started = true;
+		}
 		if (pg_atomic_compare_exchange_u64(&cluster_epoch_state->current_epoch, &cur_val,
-										   remote_epoch))
+									   remote_epoch)) {
+			cluster_write_fence_authority_cache_mutation_end(cache_mutation);
 			return true;
+		}
 		/* CAS lost — re-read and retry */
 	}
 }

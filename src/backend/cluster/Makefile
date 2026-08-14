@@ -50,6 +50,7 @@ OBJS = \
 	cluster_backup_manifest.o \
 	cluster_cf_authority.o \
 	cluster_control_root.o \
+	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \
 	cluster_cf_phase2.o \
 	cluster_cf_stats.o \
@@ -66,6 +67,7 @@ OBJS = \
 	cluster_epoch.o \
 	cluster_extend_gate.o \
 	cluster_fence.o \
+	cluster_fence_authority.o \
 	cluster_write_fence.o \
 	cluster_ges.o \
 	cluster_ges_dedup.o \

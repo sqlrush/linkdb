@@ -67,6 +67,8 @@
 struct Latch; /* spec-5.15 D4 — join-marker qvotec mailbox latch (pointer only) */
 
 
+struct ClusterFormationSnapshotV1;
+
 #define CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK UINT32_C(0x0000007f)
 #define CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED UINT32_C(0x80000000)
 #define CLUSTER_JOIN_MARKER_REQUEST_RESERVED_MASK UINT32_C(0x7fffff80)
@@ -465,6 +467,8 @@ extern void cluster_reconfig_get_last_event(ReconfigEvent *out);
  * reconfig event -- the GRD recovery IDLE tick must hold its baseline instead
  * of re-capturing the post-bump epoch (else WAIT_EPOCH wedges). */
 extern bool cluster_reconfig_has_pending_prebump_stage(void);
+extern bool cluster_reconfig_capture_formation_snapshot_v1(
+	uint16 origin_thread, struct ClusterFormationSnapshotV1 *out);
 
 
 /* ============================================================

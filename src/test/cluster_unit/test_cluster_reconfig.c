@@ -43,6 +43,7 @@
 #include <string.h>
 
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_ic.h"
@@ -70,6 +71,9 @@ static ClusterReplacementEpisode ut_admitted_replacement_episode(
 	int32 target_node_id);
 static bool jb_test(const uint8 *bmp, int i);
 static void ut_join_setup(void);
+static bool ut_join_qvotec_poll_write_pending(int32 *target_node_out,
+											  void *write_slot512_out);
+static void ut_join_qvotec_complete_write(bool acked);
 
 extern bool cluster_reconfig_qvotec_lifecycle_transition(
 	ClusterQvotecMailbox *authority_mailbox,
@@ -121,6 +125,19 @@ static uint8 ut_phase3_send_bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
 static int ut_phase3_close_calls;
 static int32 ut_phase3_close_peer;
 static bool ut_candidate2_capable[CLUSTER_MAX_NODES];
+static bool ut_owner_rejoin_result = true;
+static int ut_owner_rejoin_calls;
+static int32 ut_owner_rejoin_node;
+static uint64 ut_owner_rejoin_incarnation;
+
+bool
+cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
+{
+	ut_owner_rejoin_calls++;
+	ut_owner_rejoin_node = node_id;
+	ut_owner_rejoin_incarnation = admitted_incarnation;
+	return ut_owner_rejoin_result;
+}
 
 ClusterR4PrerequisiteSnapshot
 cluster_undo_block0_r4_prerequisite_snapshot(void)
@@ -504,6 +521,17 @@ cluster_sinval_reset_all_on_reconfig(void)
  * the enforcement GUC + the submit entry.  Enforcement OFF here so the gate is a
  * no-op (reconfig behaves as pre-4.12 in this unit harness). */
 int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+void
+cluster_write_fence_authority_cache_invalidate(void)
+{}
+uint64
+cluster_write_fence_authority_cache_mutation_begin(void)
+{
+	return UINT64_C(1);
+}
+void
+cluster_write_fence_authority_cache_mutation_end(uint64 odd_sequence pg_attribute_unused())
+{}
 ClusterFenceMarkerSubmitResult cluster_write_fence_submit_marker(const ClusterFenceMarker *m);
 ClusterFenceMarkerSubmitResult
 cluster_write_fence_submit_marker(const ClusterFenceMarker *m pg_attribute_unused())
@@ -519,14 +547,20 @@ static ClusterMarkerPollResult ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_IDLE
 static uint32 ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 static int ut_fence_async_submit_calls = 0;
 static int ut_fence_async_poll_calls = 0;
+static bool ut_fence_async_marker_captured = false;
+static ClusterFenceMarker ut_fence_async_marker;
 
 bool
 cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a,
-										const ClusterFenceMarker *m pg_attribute_unused(),
+										const ClusterFenceMarker *m,
 										ClusterMarkerAsyncKind kind, int32 target_node,
 										TimestampTz now pg_attribute_unused())
 {
 	ut_fence_async_submit_calls++;
+	if (m != NULL) {
+		ut_fence_async_marker = *m;
+		ut_fence_async_marker_captured = true;
+	}
 	if (!ut_fence_async_submit_ok)
 		return false;
 	/* mirror the real wrapper's FSM effect so is_submitted() sees SUBMITTED */
@@ -677,6 +711,12 @@ ut_reset_mocks(void)
 	memset(ut_phase3_send_bytes, 0, sizeof(ut_phase3_send_bytes));
 	ut_phase3_close_calls = 0;
 	ut_phase3_close_peer = -1;
+	ut_owner_rejoin_result = true;
+	ut_owner_rejoin_calls = 0;
+	ut_owner_rejoin_node = -1;
+	ut_owner_rejoin_incarnation = 0;
+	ut_fence_async_marker_captured = false;
+	memset(&ut_fence_async_marker, 0, sizeof(ut_fence_async_marker));
 	MyBackendType = B_INVALID;
 }
 
@@ -1478,6 +1518,61 @@ UT_TEST(test_reconfig_failstop_fence_stage_bump_once_while_pending)
 	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 }
 
+UT_TEST(test_reconfig_failstop_marker_unions_prior_excluded_with_new_delta)
+{
+	ReconfigEvent prior;
+	ReconfigEvent applied;
+
+	ut_reset_mocks();
+	reconfig_init_done = false;
+	epoch_init_done = false;
+	cluster_reconfig_shmem_init();
+	cluster_epoch_shmem_init();
+
+	cluster_node_id = 0;
+	ut_in_quorum_value = true;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+	ut_declared_set[2] = true;
+	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_DEAD;
+	ut_dead_generation = UINT64_C(2);
+
+	/* Node 1 is still excluded even though its process is visible ALIVE: no
+	 * COMMITTED JCMK + ROOT gate has cleared it.  Node 2 is the new delta. */
+	memset(&prior, 0, sizeof(prior));
+	prior.event_id = UINT64_C(401);
+	prior.coordinator_node_id = 0;
+	prior.new_epoch = cluster_epoch_get_current();
+	prior.dead_bitmap[0] = UINT8_C(0x02);
+	prior.cssd_dead_generation = UINT64_C(1);
+	prior.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	cluster_reconfig_publish_event(&prior);
+
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
+	MyBackendType = B_LMON;
+	ut_fence_async_submit_ok = true;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_PENDING;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT(ut_fence_async_marker_captured);
+	UT_ASSERT_EQ(ut_fence_async_marker.fenced_dead_bitmap[0], UINT8_C(0x06));
+
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
+	cluster_reconfig_lmon_tick();
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_FAIL_STOP);
+	UT_ASSERT_EQ(applied.dead_bitmap[0], UINT8_C(0x06));
+
+	MyBackendType = B_INVALID;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+	ut_fence_async_submit_ok = false;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_IDLE;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+}
+
 
 UT_TEST(test_reconfig_node_remove_stage_no_false_contest)
 {
@@ -1540,6 +1635,107 @@ UT_TEST(test_reconfig_node_remove_stage_no_false_contest)
 	ut_fence_async_submit_ok = false;
 	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_IDLE;
 	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+}
+
+
+UT_TEST(test_reconfig_node_remove_marker_carries_full_excluded_set)
+{
+	ReconfigEvent applied;
+	uint64 baseline;
+	uint64 ret;
+	bool contest;
+
+	ut_reset_mocks();
+	reconfig_init_done = false;
+	epoch_init_done = false;
+	cluster_reconfig_shmem_init();
+	cluster_epoch_shmem_init();
+
+	cluster_node_id = 0;
+	ut_in_quorum_value = true;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+	ut_declared_set[2] = true;
+	ut_declared_set[3] = true;
+
+	/* Frozen §17.6 producer rule: removal of node 1 must retain the
+	 * current applied DEAD node 2 and the already REMOVED node 3. */
+	memset(&applied, 0, sizeof(applied));
+	applied.event_id = UINT64_C(101);
+	applied.coordinator_node_id = 0;
+	applied.old_epoch = 0;
+	applied.new_epoch = cluster_epoch_get_current();
+	applied.dead_bitmap[2 / 8] |= (uint8)(1u << (2 % 8));
+	applied.cssd_dead_generation = UINT64_C(7);
+	applied.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	cluster_reconfig_publish_event(&applied);
+	cluster_reconfig_record_removed(3, applied.new_epoch, false);
+
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
+	MyBackendType = B_LMON;
+	ut_fence_async_submit_ok = true;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_PENDING;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+
+	baseline = cluster_epoch_get_current();
+	contest = true;
+	ret = cluster_reconfig_apply_node_removed_as_coordinator(1, baseline, 42, 7, &contest);
+	UT_ASSERT_EQ((unsigned long long)ret, 0ULL);
+	UT_ASSERT(!contest);
+	UT_ASSERT(ut_fence_async_marker_captured);
+	UT_ASSERT((ut_fence_async_marker.fenced_dead_bitmap[0] & UINT8_C(0x02)) != 0);
+	UT_ASSERT((ut_fence_async_marker.fenced_dead_bitmap[0] & UINT8_C(0x04)) != 0);
+	UT_ASSERT((ut_fence_async_marker.fenced_dead_bitmap[0] & UINT8_C(0x08)) != 0);
+
+	/* After the marker ACK, the applied event must retain the pre-existing
+	 * DEAD set so the next steady-state baseline cannot release node 2. */
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
+	contest = true;
+	ret = cluster_reconfig_apply_node_removed_as_coordinator(1, baseline, 42, 7,
+												 &contest);
+	UT_ASSERT(ret > baseline);
+	UT_ASSERT(!contest);
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_NODE_REMOVED);
+	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x04)) != 0);
+
+	MyBackendType = B_INVALID;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+	ut_fence_async_submit_ok = false;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_IDLE;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+}
+
+UT_TEST(test_clean_leave_preserves_prior_excluded_set)
+{
+	ReconfigEvent prior;
+	ReconfigEvent applied;
+	uint64 baseline;
+	uint64 committed;
+
+	ut_reset_mocks();
+	reconfig_init_done = false;
+	epoch_init_done = false;
+	cluster_reconfig_shmem_init();
+	cluster_epoch_shmem_init();
+	cluster_node_id = 0;
+
+	memset(&prior, 0, sizeof(prior));
+	prior.event_id = UINT64_C(451);
+	prior.coordinator_node_id = 0;
+	prior.new_epoch = cluster_epoch_get_current();
+	prior.dead_bitmap[0] = UINT8_C(0x04); /* already-excluded node 2 */
+	prior.cssd_dead_generation = UINT64_C(1);
+	prior.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	cluster_reconfig_publish_event(&prior);
+
+	baseline = cluster_epoch_get_current();
+	committed = cluster_reconfig_apply_clean_leave_as_coordinator(1, baseline);
+	UT_ASSERT_EQ(committed, baseline + 1);
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_CLEAN_LEAVE);
+	UT_ASSERT_EQ(applied.dead_bitmap[0], UINT8_C(0x06));
 }
 
 
@@ -1735,9 +1931,18 @@ jb_test(const uint8 *bmp, int i)
 static void
 ut_join_setup(void)
 {
+	ClusterQvotecMailbox authority_mailbox;
+	pg_atomic_uint32 qvotec_status;
+
 	ut_reset_mocks();
 	reconfig_init_done = false;
 	cluster_reconfig_shmem_init(); /* memset clean + attach membership table */
+	cluster_qvotec_mailbox_restart_reset(&authority_mailbox);
+	pg_atomic_init_u32(&qvotec_status, CLUSTER_QVOTEC_READY);
+	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
+		&authority_mailbox, &qvotec_status, CLUSTER_QVOTEC_STARTING));
+	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
+		&authority_mailbox, &qvotec_status, CLUSTER_QVOTEC_READY));
 	cluster_node_id = 0;		   /* self */
 	ut_declared_set[0] = true;	   /* self declared */
 }
@@ -2549,6 +2754,194 @@ ut_join_qvotec_complete_write(bool acked)
 {
 	cluster_reconfig_join_qvotec_complete(
 		CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT, acked, NULL);
+}
+
+static void
+ut_stage_join_commit_with_prior_excluded(bool owner_gate)
+{
+	ClusterReconfigState *state;
+	ReconfigEvent applied;
+	int32 target = -1;
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
+
+	cluster_online_join = true;
+	ut_join_setup();
+	epoch_init_done = false;
+	cluster_epoch_shmem_init();
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->self_join_admitted = 1;
+	cluster_node_id = 0;
+	ut_in_quorum_value = true;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(1, CLUSTER_MEMBER_JOINING);
+	cluster_membership_record_admitted(1, UINT64_C(70));
+	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(1), 0);
+
+	memset(&applied, 0, sizeof(applied));
+	applied.event_id = UINT64_C(501);
+	applied.coordinator_node_id = 0;
+	applied.new_epoch = cluster_epoch_get_current();
+	applied.dead_bitmap[0] = UINT8_C(0x06); /* joining node 1 + unrelated node 2 */
+	applied.cssd_dead_generation = UINT64_C(9);
+	applied.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	cluster_reconfig_publish_event(&applied);
+
+	ut_owner_rejoin_result = owner_gate;
+	UT_ASSERT(!cluster_reconfig_commit_member(1, UINT64_C(77)));
+	memset(slot, 0, sizeof(slot));
+	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
+	UT_ASSERT_EQ(target, 1);
+	ut_join_qvotec_complete_write(true);
+}
+
+UT_TEST(test_join_commit_clears_only_owner_after_root_rejoin_gate)
+{
+	ReconfigEvent applied;
+
+	ut_stage_join_commit_with_prior_excluded(true);
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(ut_owner_rejoin_calls, 1);
+	UT_ASSERT_EQ(ut_owner_rejoin_node, 1);
+	UT_ASSERT_EQ(ut_owner_rejoin_incarnation, UINT64_C(77));
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
+	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x02)) == 0);
+	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x04)) != 0);
+	cluster_online_join = false;
+}
+
+UT_TEST(test_join_commit_root_gate_failure_keeps_owner_excluded)
+{
+	ReconfigEvent applied;
+
+	ut_stage_join_commit_with_prior_excluded(false);
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(ut_owner_rejoin_calls, 1);
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ(applied.event_id, UINT64_C(501));
+	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x02)) != 0);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_JOINING);
+	cluster_online_join = false;
+}
+
+UT_TEST(test_join_pending_preserves_full_prior_excluded_set)
+{
+	ClusterReconfigState *state;
+	ReconfigEvent applied;
+	uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint64 incarnations[CLUSTER_MAX_NODES] = { 0 };
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
+	int32 target = -1;
+
+	cluster_online_join = true;
+	ut_join_setup();
+	epoch_init_done = false;
+	cluster_epoch_shmem_init();
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->self_join_admitted = 1;
+	cluster_node_id = 0;
+	ut_in_quorum_value = true;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(1, CLUSTER_MEMBER_DEAD);
+
+	memset(&applied, 0, sizeof(applied));
+	applied.event_id = UINT64_C(551);
+	applied.coordinator_node_id = 0;
+	applied.new_epoch = cluster_epoch_get_current();
+	applied.dead_bitmap[0] = UINT8_C(0x06); /* joiner 1 + unrelated origin 2 */
+	applied.cssd_dead_generation = UINT64_C(9);
+	applied.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	cluster_reconfig_publish_event(&applied);
+
+	join_bitmap[0] = UINT8_C(0x02);
+	incarnations[1] = UINT64_C(77);
+	cluster_reconfig_apply_join_as_coordinator(join_bitmap, 0, incarnations);
+	memset(slot, 0, sizeof(slot));
+	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
+	UT_ASSERT_EQ(target, 1);
+	ut_join_qvotec_complete_write(true);
+	cluster_reconfig_lmon_tick();
+
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_JOIN_PENDING);
+	UT_ASSERT_EQ(applied.dead_bitmap[0], UINT8_C(0x06));
+	UT_ASSERT_EQ(ut_owner_rejoin_calls, 0);
+	cluster_online_join = false;
+}
+
+static void
+ut_stage_survivor_join_observation(bool owner_gate)
+{
+	ClusterReconfigState *state;
+	ReconfigEvent applied;
+
+	cluster_online_join = true;
+	ut_join_setup();
+	epoch_init_done = false;
+	cluster_epoch_shmem_init();
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->self_join_admitted = 1;
+	cluster_node_id = 1;
+	ut_in_quorum_value = true;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+	ut_declared_set[2] = true;
+	ut_peer_state[0] = CLUSTER_CSSD_PEER_ALIVE;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_set_state(2, CLUSTER_MEMBER_DEAD);
+	cluster_membership_record_admitted(2, UINT64_C(70));
+	cluster_reconfig_record_observed_committed_join(2, UINT64_C(77), UINT64_C(1));
+
+	memset(&applied, 0, sizeof(applied));
+	applied.event_id = UINT64_C(601);
+	applied.coordinator_node_id = 0;
+	applied.new_epoch = cluster_epoch_get_current();
+	applied.dead_bitmap[0] = UINT8_C(0x0c); /* joining node 2 + unrelated node 3 */
+	applied.cssd_dead_generation = UINT64_C(10);
+	applied.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	cluster_reconfig_publish_event(&applied);
+	ut_owner_rejoin_result = owner_gate;
+}
+
+UT_TEST(test_survivor_join_observation_requires_root_rejoin_gate)
+{
+	ReconfigEvent applied;
+
+	ut_stage_survivor_join_observation(false);
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(ut_owner_rejoin_calls, 1);
+	UT_ASSERT_EQ(ut_owner_rejoin_node, 2);
+	UT_ASSERT_EQ(ut_owner_rejoin_incarnation, UINT64_C(77));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
+				 (int)CLUSTER_MEMBER_DEAD);
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ(applied.event_id, UINT64_C(601));
+	UT_ASSERT_EQ(applied.dead_bitmap[0], UINT8_C(0x0c));
+	cluster_online_join = false;
+}
+
+UT_TEST(test_survivor_join_observation_clears_only_gated_origin)
+{
+	ReconfigEvent applied;
+
+	ut_stage_survivor_join_observation(true);
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ(ut_owner_rejoin_calls, 1);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
+				 (int)CLUSTER_MEMBER_MEMBER);
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ((int)applied.reconfig_kind,
+				 (int)RECONFIG_KIND_JOIN_COMMITTED);
+	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x04)) == 0);
+	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x08)) != 0);
+	cluster_online_join = false;
 }
 
 /* The region-3 mailbox is one raw 96-byte payload carrier.  V2 retains its
@@ -3727,7 +4120,7 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(75);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);
@@ -3759,7 +4152,10 @@ main(void)
 	UT_RUN(test_reconfig_lmon_tick_dedups_same_event_id);
 	UT_RUN(test_reconfig_lmon_tick_refires_on_dead_gen_bump);
 	UT_RUN(test_reconfig_failstop_fence_stage_bump_once_while_pending);
+	UT_RUN(test_reconfig_failstop_marker_unions_prior_excluded_with_new_delta);
 	UT_RUN(test_reconfig_node_remove_stage_no_false_contest);
+	UT_RUN(test_reconfig_node_remove_marker_carries_full_excluded_set);
+	UT_RUN(test_clean_leave_preserves_prior_excluded_set);
 
 	/* T-reconfig-4 / 4b — Q2 A'' + I2 + L20 + F11 + empty-dead-set gates. */
 	UT_RUN(test_reconfig_lmon_tick_skips_when_not_in_quorum);
@@ -3815,6 +4211,11 @@ main(void)
 	UT_RUN(test_reconfig_bootstrap_proof_valid_slot_not_cssd);
 	UT_RUN(test_reconfig_bootstrap_proof_stale_slot_failclosed);
 	UT_RUN(test_reconfig_region3_mailbox_preserves_v2_and_canonical_v3);
+	UT_RUN(test_join_commit_clears_only_owner_after_root_rejoin_gate);
+	UT_RUN(test_join_commit_root_gate_failure_keeps_owner_excluded);
+	UT_RUN(test_join_pending_preserves_full_prior_excluded_set);
+	UT_RUN(test_survivor_join_observation_requires_root_rejoin_gate);
+	UT_RUN(test_survivor_join_observation_clears_only_gated_origin);
 	UT_RUN(test_reconfig_region3_mailbox_request_word_is_exact_duplex);
 	UT_RUN(test_reconfig_qvotec_lifecycle_double_invalidates_mailboxes);
 	UT_RUN(test_reconfig_target_refuses_ready_without_startup_closure_proof);

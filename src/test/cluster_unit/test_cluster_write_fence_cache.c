@@ -1,0 +1,387 @@
+/*-------------------------------------------------------------------------
+ * STOP-02 \u00a717.7 cache publication/invalidation interleaving tests.
+ *-------------------------------------------------------------------------
+ */
+#include "postgres.h"
+
+#include <pthread.h>
+#include <stdlib.h>
+#include <unistd.h>
+
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_lmon.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_shmem.h"
+#include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_write_fence.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+#include "storage/shmem.h"
+#include "utils/elog.h"
+#include "utils/timestamp.h"
+#include "utils/wait_event.h"
+
+#undef printf
+#undef fprintf
+#undef snprintf
+#undef sprintf
+#undef vsnprintf
+#undef vfprintf
+#undef vprintf
+#undef vsprintf
+
+#include "unit_test.h"
+
+UT_DEFINE_GLOBALS();
+
+int CritSectionCount = 0;
+int cluster_node_id = 0;
+int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
+int cluster_write_fence_lease_ms = 1000;
+char *cluster_voting_disks = "mock";
+static uint32 test_wait_event_info = 0;
+uint32 *my_wait_event_info = &test_wait_event_info;
+
+static const ClusterShmemRegion *fence_region;
+static const ClusterShmemRegion *epoch_region;
+static union {
+	max_align_t align;
+	uint8 bytes[4096];
+} fence_shmem;
+static union {
+	max_align_t align;
+	uint8 bytes[4096];
+} epoch_shmem;
+static bool fence_shmem_found;
+static bool epoch_shmem_found;
+
+static pthread_mutex_t race_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t race_cv = PTHREAD_COND_INITIALIZER;
+static bool publisher_acquired;
+static bool release_publisher;
+static bool invalidator_started;
+static bool invalidator_done;
+
+void
+ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
+{
+	printf("# Assert failed: %s at %s:%d\n", conditionName, fileName, lineNumber);
+	abort();
+}
+
+void *
+ShmemInitStruct(const char *name, Size size, bool *foundPtr)
+{
+	if (size > sizeof(fence_shmem.bytes))
+		abort();
+	if (strcmp(name, "pgrac cluster write fence") == 0) {
+		*foundPtr = fence_shmem_found;
+		fence_shmem_found = true;
+		return fence_shmem.bytes;
+	}
+	if (strcmp(name, "pgrac cluster epoch") == 0) {
+		*foundPtr = epoch_shmem_found;
+		epoch_shmem_found = true;
+		return epoch_shmem.bytes;
+	}
+	abort();
+}
+
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region)
+{
+	if (strcmp(region->name, "pgrac cluster write fence") == 0)
+		fence_region = region;
+	else if (strcmp(region->name, "pgrac cluster epoch") == 0)
+		epoch_region = region;
+}
+
+void
+on_shmem_exit(pg_on_exit_callback function, Datum arg)
+{
+	(void)function;
+	(void)arg;
+}
+
+void
+SetLatch(Latch *latch)
+{
+	(void)latch;
+}
+
+void
+cluster_lmon_marker_complete_wakeup(void)
+{}
+
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return true;
+}
+
+void
+cluster_undo_horizon_note_self_member(void)
+{}
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return 100;
+}
+
+void
+pg_usleep(long microsec)
+{
+	(void)usleep((useconds_t)microsec);
+}
+
+ClusterFenceAuthorityReadResult
+cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
+{
+	(void)out;
+	return CLUSTER_FENCE_AUTHORITY_NO_MAJORITY;
+}
+
+bool
+errstart(int elevel, const char *domain)
+{
+	(void)elevel;
+	(void)domain;
+	return false;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+void
+errfinish(const char *filename, int lineno, const char *funcname)
+{
+	(void)filename;
+	(void)lineno;
+	(void)funcname;
+}
+
+int errcode(int sqlerrcode) { (void)sqlerrcode; return 0; }
+int errmsg(const char *fmt, ...) { (void)fmt; return 0; }
+int errdetail(const char *fmt, ...) { (void)fmt; return 0; }
+int errhint(const char *fmt, ...) { (void)fmt; return 0; }
+
+static ClusterFenceMarker
+cache_marker(uint64 event_id)
+{
+	ClusterFenceMarker marker;
+
+	memset(&marker, 0, sizeof(marker));
+	marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+	marker.version = CLUSTER_FENCE_MARKER_VERSION;
+	marker.fence_epoch = 8;
+	marker.fence_event_id = event_id;
+	marker.fence_generation = 2;
+	marker.issuer_node_id = 1;
+	marker.fenced_dead_bitmap[0] = 0x04;
+	return marker;
+}
+
+static void
+attach_cache(void)
+{
+	memset(&fence_shmem, 0, sizeof(fence_shmem));
+	fence_shmem_found = false;
+	fence_region = NULL;
+	cluster_write_fence_shmem_register();
+	if (fence_region == NULL)
+		abort();
+	fence_region->init_fn();
+}
+
+static void
+attach_epoch(void)
+{
+	memset(&epoch_shmem, 0, sizeof(epoch_shmem));
+	epoch_shmem_found = false;
+	epoch_region = NULL;
+	cluster_epoch_shmem_register();
+	if (epoch_region == NULL)
+		abort();
+	epoch_region->init_fn();
+}
+
+static void
+publisher_pause_hook(void)
+{
+	(void)pthread_mutex_lock(&race_lock);
+	publisher_acquired = true;
+	(void)pthread_cond_broadcast(&race_cv);
+	while (!release_publisher)
+		(void)pthread_cond_wait(&race_cv, &race_lock);
+	(void)pthread_mutex_unlock(&race_lock);
+}
+
+static void
+invalidator_start_hook(void)
+{
+	(void)pthread_mutex_lock(&race_lock);
+	invalidator_started = true;
+	(void)pthread_cond_broadcast(&race_cv);
+	(void)pthread_mutex_unlock(&race_lock);
+}
+
+static void *
+publisher_main(void *arg)
+{
+	ClusterFenceMarker *marker = (ClusterFenceMarker *)arg;
+	uint64 expected_sequence = cluster_write_fence_authority_cache_sequence();
+
+	(void)cluster_write_fence_authority_cache_publish_if_unchanged(
+		marker, UINT64_C(1000000), expected_sequence);
+	return NULL;
+}
+
+static void *
+invalidator_main(void *arg)
+{
+	(void)arg;
+	cluster_write_fence_authority_cache_invalidate();
+	(void)pthread_mutex_lock(&race_lock);
+	invalidator_done = true;
+	(void)pthread_cond_broadcast(&race_cv);
+	(void)pthread_mutex_unlock(&race_lock);
+	return NULL;
+}
+
+UT_TEST(test_cache_publish_revalidate_and_invalidate)
+{
+	ClusterFenceMarker marker = cache_marker(UINT64_C(0xAA));
+	uint64 expected_sequence;
+
+	attach_cache();
+	expected_sequence = cluster_write_fence_authority_cache_sequence();
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(
+		&marker, UINT64_C(1000000), expected_sequence));
+	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_MATCH);
+	cluster_write_fence_authority_cache_invalidate();
+	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_INVALID);
+}
+
+UT_TEST(test_invalidation_rejects_late_prechange_proof)
+{
+	ClusterFenceMarker marker = cache_marker(UINT64_C(0xAA));
+	uint64 prechange_sequence;
+
+	attach_cache();
+	prechange_sequence = cluster_write_fence_authority_cache_sequence();
+	cluster_write_fence_authority_cache_invalidate();
+	UT_ASSERT(!cluster_write_fence_authority_cache_publish_if_unchanged(
+		&marker, UINT64_C(1000000), prechange_sequence));
+	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_INVALID);
+}
+
+UT_TEST(test_mutation_guard_keeps_cache_unavailable_until_change_finishes)
+{
+	ClusterFenceMarker marker = cache_marker(UINT64_C(0xAA));
+	uint64 expected_sequence;
+	uint64 odd_sequence;
+
+	attach_cache();
+	expected_sequence = cluster_write_fence_authority_cache_sequence();
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(
+		&marker, UINT64_C(1000000), expected_sequence));
+	odd_sequence = cluster_write_fence_authority_cache_mutation_begin();
+	UT_ASSERT(odd_sequence != 0);
+	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_UNAVAILABLE);
+	cluster_write_fence_authority_cache_mutation_end(odd_sequence);
+	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_INVALID);
+}
+
+UT_TEST(test_invalidate_waits_out_preexisting_publisher)
+{
+	ClusterFenceMarker old_marker = cache_marker(UINT64_C(0xAA));
+	pthread_t publisher;
+	pthread_t invalidator;
+
+	attach_cache();
+	publisher_acquired = false;
+	release_publisher = false;
+	invalidator_started = false;
+	invalidator_done = false;
+	cluster_write_fence_cache_test_after_publish_acquire_hook = publisher_pause_hook;
+	cluster_write_fence_cache_test_before_invalidate_acquire_hook = invalidator_start_hook;
+	(void)pthread_create(&publisher, NULL, publisher_main, &old_marker);
+	(void)pthread_mutex_lock(&race_lock);
+	while (!publisher_acquired)
+		(void)pthread_cond_wait(&race_cv, &race_lock);
+	(void)pthread_mutex_unlock(&race_lock);
+	(void)pthread_create(&invalidator, NULL, invalidator_main, NULL);
+	(void)pthread_mutex_lock(&race_lock);
+	while (!invalidator_started)
+		(void)pthread_cond_wait(&race_cv, &race_lock);
+	UT_ASSERT(!invalidator_done);
+	release_publisher = true;
+	(void)pthread_cond_broadcast(&race_cv);
+	(void)pthread_mutex_unlock(&race_lock);
+	(void)pthread_join(publisher, NULL);
+	(void)pthread_join(invalidator, NULL);
+	cluster_write_fence_cache_test_after_publish_acquire_hook = NULL;
+	cluster_write_fence_cache_test_before_invalidate_acquire_hook = NULL;
+	UT_ASSERT(invalidator_done);
+	UT_ASSERT_NE(cluster_write_fence_revalidate_cached_nowait(&old_marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_MATCH);
+}
+
+UT_TEST(test_membership_mutation_invalidates_cache_before_change)
+{
+	ClusterFenceMarker marker = cache_marker(UINT64_C(0xAA));
+	uint64 expected_sequence;
+
+	attach_cache();
+	cluster_membership_attach(NULL);
+	expected_sequence = cluster_write_fence_authority_cache_sequence();
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(
+		&marker, UINT64_C(1000000), expected_sequence));
+	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_MATCH);
+	cluster_membership_set_state(3, CLUSTER_MEMBER_DEAD);
+	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_INVALID);
+}
+
+UT_TEST(test_epoch_mutation_invalidates_cache_before_change)
+{
+	ClusterFenceMarker marker = cache_marker(UINT64_C(0xAA));
+	uint64 old_epoch;
+	uint64 new_epoch;
+	uint64 expected_sequence;
+
+	attach_cache();
+	attach_epoch();
+	expected_sequence = cluster_write_fence_authority_cache_sequence();
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(
+		&marker, UINT64_C(1000000), expected_sequence));
+	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
+	UT_ASSERT_EQ(old_epoch, CLUSTER_EPOCH_INITIAL);
+	UT_ASSERT_EQ(new_epoch, CLUSTER_EPOCH_INITIAL + 1);
+	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
+				 CLUSTER_FENCE_CACHE_INVALID);
+}
+
+int
+main(void)
+{
+	UT_PLAN(6);
+	UT_RUN(test_cache_publish_revalidate_and_invalidate);
+	UT_RUN(test_invalidate_waits_out_preexisting_publisher);
+	UT_RUN(test_invalidation_rejects_late_prechange_proof);
+	UT_RUN(test_mutation_guard_keeps_cache_unavailable_until_change_finishes);
+	UT_RUN(test_membership_mutation_invalidates_cache_before_change);
+	UT_RUN(test_epoch_mutation_invalidates_cache_before_change);
+	UT_DONE();
+	return ut_failed_count == 0 ? 0 : 1;
+}
