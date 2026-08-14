@@ -31,11 +31,14 @@
  */
 #include "postgres.h"
 
+#include <unistd.h>
+
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_sequence.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -49,12 +52,26 @@ UT_DEFINE_GLOBALS();
 
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 bool cluster_controlfile_shared_authority = false;
+int cluster_node_id = 0;
+char *cluster_config_file = NULL;
 static int g_node_count = 1;
 
 int
 cluster_conf_node_count(void)
 {
 	return g_node_count;
+}
+
+FILE *
+AllocateFile(const char *name, const char *mode)
+{
+	return fopen(name, mode);
+}
+
+int
+FreeFile(FILE *file)
+{
+	return fclose(file);
 }
 
 void
@@ -343,6 +360,35 @@ UT_TEST(test_owner_eor_handoff_gates_and_lifecycle)
 	MyAuxProcType = NotAnAuxProcess;
 }
 
+UT_TEST(test_owner_eor_disabled_seed_uses_exact_declared_node)
+{
+	char path[] = "/tmp/pgrac-cf-seed-XXXXXX";
+	int fd;
+	FILE *f;
+
+	fd = mkstemp(path);
+	UT_ASSERT(fd >= 0);
+	f = fdopen(fd, "w");
+	UT_ASSERT(f != NULL);
+	UT_ASSERT(fprintf(f,
+				  "[cluster]\nname = pgrac\n\n[node.0]\n"
+				  "interconnect_addr = 127.0.0.1:6433\n") > 0);
+	UT_ASSERT_EQ(fclose(f), 0);
+
+	g_node_count = 0;
+	cluster_node_id = 0;
+	cluster_config_file = path;
+	UT_ASSERT(cluster_cf_exactly_one_declared_node());
+
+	cluster_node_id = 1;
+	UT_ASSERT(!cluster_cf_exactly_one_declared_node());
+
+	UT_ASSERT_EQ(unlink(path), 0);
+	cluster_config_file = NULL;
+	cluster_node_id = 0;
+	g_node_count = 1;
+}
+
 UT_TEST(test_owner_eor_abort_retains_active_and_blocks_retry)
 {
 	cluster_controlfile_shared_authority = true;
@@ -442,11 +488,12 @@ UT_TEST(test_lock_timeout_and_wait_event)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
 	UT_RUN(test_owner_eor_handoff_gates_and_lifecycle);
+	UT_RUN(test_owner_eor_disabled_seed_uses_exact_declared_node);
 	UT_RUN(test_owner_eor_abort_retains_active_and_blocks_retry);
 	UT_RUN(test_lock_native_no_release);
 	UT_RUN(test_lock_failclosed_timeout);

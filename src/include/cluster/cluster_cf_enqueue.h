@@ -115,6 +115,14 @@ extern void cluster_cf_set_bootstrap_authority(bool on);
 extern bool cluster_cf_in_bootstrap_window(void);
 
 /*
+ * RF-B: one authority predicate shared by Startup and the EOR checkpointer.
+ * When the normal topology has not been loaded (the native seed runs with
+ * cluster.enabled=off), this verifies the postmaster-static pgrac.conf
+ * directly and fails closed unless it declares only this node.
+ */
+extern bool cluster_cf_exactly_one_declared_node(void);
+
+/*
  * RF-B minimal single-node OWNER -> EOR lifecycle.  INSTALL/CLOSE are
  * Startup-only through the actor-bound shared phase helpers; CONSUME/COMPLETE
  * are checkpointer-only.  `identity_ok` is the fresh storage/sysid verdict

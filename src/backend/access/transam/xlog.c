@@ -7151,7 +7151,7 @@ CreateCheckPoint(int flags)
 	if (cluster_controlfile_shared_authority
 		&& AmCheckpointerProcess()
 		&& (flags & CHECKPOINT_END_OF_RECOVERY)
-		&& cluster_conf_node_count() == 1)
+		&& cluster_cf_exactly_one_declared_node())
 	{
 		bool identity_ok =
 			cluster_cf_contract_identity_check(DataDir,

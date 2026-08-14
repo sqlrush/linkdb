@@ -27,11 +27,15 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
+#include <errno.h>
+
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "storage/fd.h"
 #include "storage/lock.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -246,13 +250,83 @@ cluster_cf_in_bootstrap_window(void)
 }
 
 /*
+ * cluster_cf_exactly_one_declared_node
+ *
+ * RF-B must use the same exact-one authority fact in Startup and in the EOR
+ * checkpointer.  A normal cluster boot has already populated ClusterConfShmem.
+ * The native shared-catalog seed deliberately runs with cluster.enabled=off,
+ * so spec-2.1 forbids cluster_conf_load() and the shmem count remains zero.
+ * In that one case, inspect only the postmaster-static node declarations and
+ * fail closed on a missing, malformed, duplicate, or foreign node section.
+ */
+bool
+cluster_cf_exactly_one_declared_node(void)
+{
+	const char *path;
+	FILE *f;
+	char line[1024];
+	int loaded_count;
+	int declared_count = 0;
+	bool valid = true;
+
+	loaded_count = cluster_conf_node_count();
+	if (loaded_count != 0)
+		return loaded_count == 1;
+
+	path = (cluster_config_file != NULL && cluster_config_file[0] != '\0')
+		? cluster_config_file : "pgrac.conf";
+	f = AllocateFile(path, "r");
+	if (f == NULL)
+		return false;
+
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *p = line;
+		char *endptr;
+		long node_id;
+
+		while (*p != '\0' && isspace((unsigned char)*p))
+			p++;
+		if (strncmp(p, "[node.", 6) != 0)
+			continue;
+
+		errno = 0;
+		node_id = strtol(p + 6, &endptr, 10);
+		if (errno != 0 || endptr == p + 6 || *endptr != ']'
+			|| node_id < 0 || node_id >= CLUSTER_MAX_NODES
+			|| node_id != cluster_node_id) {
+			valid = false;
+			break;
+		}
+		endptr++;
+		while (*endptr != '\0' && isspace((unsigned char)*endptr))
+			endptr++;
+		if (*endptr != '\0' && *endptr != '#' && *endptr != ';') {
+			valid = false;
+			break;
+		}
+
+		declared_count++;
+		if (declared_count > 1) {
+			valid = false;
+			break;
+		}
+	}
+	if (ferror(f))
+		valid = false;
+	if (FreeFile(f) != 0)
+		valid = false;
+
+	return valid && declared_count == 1;
+}
+
+/*
  * cluster_cf_owner_eor_install -- transport the exact one-node OWNER decision.
  */
 bool
 cluster_cf_owner_eor_install(void)
 {
 	if (!cluster_controlfile_shared_authority
-		|| cluster_conf_node_count() != 1
+		|| !cluster_cf_exactly_one_declared_node()
 		|| cluster_cf_join_readonly()
 		|| cf_bootstrap_authority)
 		return false;
@@ -272,7 +346,7 @@ cluster_cf_owner_eor_consume(bool end_of_recovery, bool identity_ok)
 {
 	if (!end_of_recovery || !identity_ok
 		|| !cluster_controlfile_shared_authority
-		|| cluster_conf_node_count() != 1
+		|| !cluster_cf_exactly_one_declared_node()
 		|| cluster_cf_join_readonly()
 		|| cf_owner_eor_authority)
 		return false;
