@@ -1527,7 +1527,10 @@ typedef enum GcsBlockReplyStatus {
 	GCS_BLOCK_REPLY_R4_MULTI_RESOLVE_RESULT = 23,
 	GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT = 24,
 	GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED = 25,
-	GCS_BLOCK_REPLY_R4_DENIED = 26
+	GCS_BLOCK_REPLY_R4_DENIED = 26,
+	GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT = 27,
+	GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT = 28,
+	GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT = 29
 } GcsBlockReplyStatus;
 
 /*
@@ -1576,6 +1579,15 @@ StaticAssertDecl(GCS_BLOCK_REPLY_R4_CR_FULL == 21,
 				 "R4 reply status ABI must begin at 21");
 StaticAssertDecl(GCS_BLOCK_REPLY_R4_DENIED == 26,
 				 "R4 reply status ABI must end at 26");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+					 == GCS_BLOCK_REPLY_R4_DENIED + 1,
+				 "current MX describe result must follow the closed R4 domain");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+					 == GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT + 1,
+				 "current MX member-proof result must follow describe");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT
+					 == GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT + 1,
+				 "current MX stats result must remain the reserved tail status");
 
 /* PGRAC adaptation: R4 owns one closed status suffix.  Keep the domain
  * predicates numeric so legacy and R4 decoders cannot accept each other's
@@ -2404,7 +2416,58 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
  * endian; no packed/native cast is a wire authority. */
 #define CLUSTER_R4_WIRE_VERSION ((uint8)1)
 #define CLUSTER_R4_FORWARD_EXTENDED ((uint8)6)
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF ((uint8)7)
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS ((uint8)8)
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE ((uint8)9)
 #define CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT ((int32)-2)
+
+StaticAssertDecl(CLUSTER_R4_FORWARD_EXTENDED
+					 < GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF,
+				 "current MX request domain must follow the closed R4 kind");
+StaticAssertDecl(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS
+					 == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF + 1
+					 && GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE
+							== GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS + 1,
+				 "current MX request kind allocation changed");
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxMemberProof(const GcsBlockForwardPayload *payload)
+{
+	return payload != NULL
+		   && payload->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxDescribe(const GcsBlockForwardPayload *payload)
+{
+	return payload != NULL
+		   && payload->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxRuntime(const GcsBlockForwardPayload *payload)
+{
+	return GcsBlockForwardPayloadIsCurrentMxMemberProof(payload)
+		   || GcsBlockForwardPayloadIsCurrentMxDescribe(payload);
+}
+
+/* Current-MX overlays the old BufferTag.  DATA sharding therefore uses only
+ * the preserved request identity; this synthetic tag is never authority. */
+static inline BufferTag
+GcsBlockCurrentMxRouteTagMake(uint64 request_id, uint64 epoch,
+							  int32 requester_node,
+							  int32 requester_backend_id)
+{
+	BufferTag tag;
+
+	memset(&tag, 0, sizeof(tag));
+	tag.spcOid = (Oid)((epoch >> 32) ^ (uint64)(uint32)requester_node);
+	tag.dbOid = (Oid)epoch;
+	tag.relNumber = (RelFileNumber)requester_backend_id;
+	tag.forkNum = MAIN_FORKNUM;
+	tag.blockNum = (BlockNumber)(request_id ^ (request_id >> 32));
+	return tag;
+}
 
 typedef enum ClusterCrBuildResult {
 	CLUSTER_CR_BUILD_FULL = 0,
@@ -2960,6 +3023,8 @@ extern bool cluster_gcs_block_test_r4_request80(const struct ClusterICEnvelope *
 											 const void *payload);
 extern bool cluster_gcs_block_test_r4_forward96(const struct ClusterICEnvelope *env,
 											 const void *payload);
+extern bool cluster_gcs_block_test_current_mx_forward128(
+	const struct ClusterICEnvelope *env, const void *payload);
 extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result,
 											  ClusterCrBuildReason reason,
 											  bool admitted_forward,

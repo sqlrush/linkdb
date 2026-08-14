@@ -487,6 +487,27 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabiliti
 	return true;
 }
 
+/* Spec-3.6b: sample Current-MX authority and its connection generation from
+ * the same CONTROL-owned HELLO record. */
+bool
+cluster_sf_peer_multixact_current_capability_generation(
+	int32 peer_id, uint32 *generation_out)
+{
+	bool supported;
+
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (ClusterSfDep == NULL || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	supported = cluster_sf_peer_cap_generation_for_bits(
+		&ClusterSfDep->peer_capabilities[peer_id],
+		PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1, generation_out);
+	LWLockRelease(&ClusterSfDep->lock);
+	return supported;
+}
+
 /* Drain-side exact fence for a capability-bound LMS slot. */
 bool
 cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,

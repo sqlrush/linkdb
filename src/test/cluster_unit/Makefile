@@ -2168,9 +2168,11 @@ CLUSTER_MULTIXACT_CURRENT_O = $(top_builddir)/src/backend/cluster/cluster_multix
 CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
 test_cluster_multixact_current: test_cluster_multixact_current.c unit_test.h \
-		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O)
+		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PGPORT) -o $@
 

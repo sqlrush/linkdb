@@ -26,11 +26,16 @@
 
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_write_fence.h"
 #include "storage/lock.h"
+#include "utils/memutils.h"
 
 #undef printf
 #undef fprintf
@@ -40,6 +45,36 @@
 
 
 UT_DEFINE_GLOBALS();
+
+static char test_memory_context_storage;
+MemoryContext TopMemoryContext = (MemoryContext)&test_memory_context_storage;
+MemoryContext CurrentMemoryContext = (MemoryContext)&test_memory_context_storage;
+sigjmp_buf *PG_exception_stack = NULL;
+ErrorContextCallback *error_context_stack = NULL;
+
+MemoryContext
+AllocSetContextCreateInternal(MemoryContext parent pg_attribute_unused(),
+							  const char *name pg_attribute_unused(),
+							  Size min_context_size pg_attribute_unused(),
+							  Size init_block_size pg_attribute_unused(),
+							  Size max_block_size pg_attribute_unused())
+{
+	return (MemoryContext)&test_memory_context_storage;
+}
+
+void
+MemoryContextReset(MemoryContext context pg_attribute_unused())
+{}
+
+void
+FlushErrorState(void)
+{}
+
+void *
+palloc0(Size size)
+{
+	return calloc(1, size);
+}
 
 
 void
@@ -56,6 +91,8 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
  * unit binary independent of shmem, pg_multixact SLRU, and DATA transport.
  */
 int cluster_node_id = -1;
+BackendId MyBackendId = 7;
+int cluster_lms_workers = 1;
 int cluster_subtrans_max_chain_depth = 32;
 static uint64 test_runtime_epoch;
 static int test_runtime_mxid_origin = -1;
@@ -63,13 +100,119 @@ static bool test_runtime_mxid_mine;
 static int test_runtime_native_describe_calls;
 static int test_runtime_remote_describe_calls;
 static bool test_runtime_remote_describe_ok;
+static int test_runtime_proof_calls;
+static int test_runtime_proof_fail_call;
 static ClusterSemanticAdmissionResult test_runtime_tt_admission;
 static ClusterTTStatusSourceResult test_runtime_tt_source_result;
+static bool test_runtime_origin_proof_source_enabled;
+static int test_runtime_origin_proof_source_calls;
+static int test_runtime_describe_send_calls;
+static int test_runtime_describe_capability_calls;
+static int test_runtime_describe_generation_match_calls;
+static uint32 test_runtime_describe_dest;
+static uint32 test_runtime_describe_payload_len;
+static uint8 test_runtime_describe_payload[
+	sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
+
+static void test_member(ClusterCurrentMxMemberDesc *member, TransactionId xid, uint8 status);
+static void test_proof(ClusterCurrentMemberProof *proof,
+					   const ClusterCurrentMxMemberDesc *member, uint16 ordinal,
+					   ClusterCurrentMemberState state, uint16 origin, uint32 slot);
+
+extern ClusterMxDescribeResult
+cluster_cr_server_test_current_mx_build_describe_page(
+	uint16 source_node_id, uint64 request_id, const ClusterCurrentMxKey *key,
+	const MultiXactMember *native_members, int native_count,
+	ClusterCurrentMxDescribeReplyPage *page);
+extern ClusterMxResolveResult
+cluster_cr_server_test_current_mx_build_proof_page(
+	uint16 source_node_id, const ClusterCurrentMxProofForwardV2 *request,
+	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
+	ClusterCurrentMxProofReplyPage *page);
 
 void
 pfree(void *pointer)
 {
 	free(pointer);
+}
+
+bool
+cluster_gcs_block_family_on_data_plane(void)
+{
+	return true;
+}
+
+int
+cluster_ic_tier1_my_data_channel(void)
+{
+	return 0;
+}
+
+int
+cluster_lms_shard_for_tag(const BufferTag *tag pg_attribute_unused(), int n_workers)
+{
+	return n_workers > 0 ? 0 : -1;
+}
+
+bool
+cluster_write_fence_enforcing(void)
+{
+	return false;
+}
+
+bool
+cluster_write_fence_allowed(void)
+{
+	return true;
+}
+
+bool
+cluster_sf_peer_multixact_current_capability_generation(
+	int32 peer_id pg_attribute_unused(), uint32 *generation_out)
+{
+	test_runtime_describe_capability_calls++;
+	if (generation_out != NULL)
+		*generation_out = 61;
+	return generation_out != NULL;
+}
+
+bool
+cluster_sf_peer_capability_generation_matches(
+	int32 peer_id pg_attribute_unused(), uint32 required_capabilities,
+	uint32 expected_generation)
+{
+	test_runtime_describe_generation_match_calls++;
+	return required_capabilities
+			   == PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+		   && expected_generation == 61;
+}
+
+uint32
+cluster_gcs_block_compute_checksum(const char *data)
+{
+	uint32 hash = UINT32_C(2166136261);
+	int i;
+
+	for (i = 0; i < GCS_BLOCK_DATA_SIZE; i++) {
+		hash ^= (uint8)data[i];
+		hash *= UINT32_C(16777619);
+	}
+	return hash;
+}
+
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id,
+						 const void *payload, uint32 payload_len)
+{
+	test_runtime_describe_send_calls++;
+	test_runtime_describe_dest = (uint32)dest_node_id;
+	test_runtime_describe_payload_len = payload_len;
+	if (msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY || payload == NULL
+		|| payload_len > sizeof(test_runtime_describe_payload))
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	memcpy(test_runtime_describe_payload, payload, payload_len);
+	return CLUSTER_IC_SEND_DONE;
 }
 
 uint64
@@ -139,11 +282,95 @@ cluster_gcs_current_mx_describe_fetch_and_wait(
 	return CMX_DESC_OK;
 }
 
+ClusterMxResolveResult
+cluster_gcs_current_mx_member_proof_fetch_and_wait(
+	int32 origin_node, ClusterCurrentMxProofForwardV2 *request,
+	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
+	ClusterCurrentUpdaterProof *updater_proof)
+{
+	ClusterCurrentMxProofForwardV2 decoded;
+	uint8 i;
+
+	test_runtime_proof_calls++;
+	if (proof_count != NULL)
+		*proof_count = 0;
+	if (updater_proof != NULL) {
+		memset(updater_proof, 0, sizeof(*updater_proof));
+		updater_proof->verdict = CUCP_UNKNOWN;
+	}
+	if (test_runtime_proof_fail_call == test_runtime_proof_calls
+		|| !cluster_multixact_current_wire_validate_proof_forward(
+			request, sizeof(*request), request->prefix.original_requester_node, origin_node,
+			request->prefix.epoch, &decoded))
+		return CMX_RESOLVE_UNKNOWN;
+
+	if (decoded.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS) {
+		if (proofs == NULL || proof_count == NULL
+			|| proofs_cap < decoded.prefix.entry_count)
+			return CMX_RESOLVE_UNKNOWN;
+		for (i = 0; i < decoded.prefix.entry_count; i++) {
+			ClusterCurrentMxMemberDesc member;
+
+			test_member(&member, decoded.trailer.body.asks[i].xid,
+						decoded.trailer.body.asks[i].member_status);
+			test_proof(&proofs[i], &member,
+					   decoded.trailer.body.asks[i].member_ordinal, CCM_ABORTED,
+					   (uint16)origin_node, 20 + i);
+		}
+		*proof_count = decoded.prefix.entry_count;
+		return CMX_RESOLVE_OK;
+	}
+
+	if (proofs == NULL || proof_count == NULL || proofs_cap < 1 || updater_proof == NULL)
+		return CMX_RESOLVE_UNKNOWN;
+	{
+		ClusterCurrentMxMemberDesc member;
+
+		test_member(&member, decoded.trailer.body.updater.challenge.updater_xid,
+					decoded.trailer.body.updater.challenge.member_status);
+		test_proof(&proofs[0], &member,
+				   decoded.trailer.body.updater.challenge.member_ordinal, CCM_COMMITTED,
+				   (uint16)origin_node, 20);
+	}
+	*proof_count = 1;
+	updater_proof->mxkey = decoded.prefix.mxkey;
+	updater_proof->candidate_next_xmin_key
+		= decoded.trailer.body.updater.challenge.candidate_next_xmin_key;
+	updater_proof->updater_xid = decoded.trailer.body.updater.challenge.updater_xid;
+	updater_proof->member_ordinal = decoded.trailer.body.updater.challenge.member_ordinal;
+	updater_proof->verdict = CUCP_MATCH;
+	return CMX_RESOLVE_OK;
+}
+
+bool
+TransactionIdIsCurrentTransactionId(TransactionId xid pg_attribute_unused())
+{
+	return false;
+}
+
 ClusterSemanticAdmissionResult
 cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
 								  const ClusterTTStatusSourceRequest *request,
 								  ClusterTTStatusSourceResult *result)
 {
+	if (op == CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID
+		&& test_runtime_origin_proof_source_enabled) {
+		test_runtime_origin_proof_source_calls++;
+		UT_ASSERT_NOT_NULL(request);
+		UT_ASSERT_NOT_NULL(result);
+		memset(result, 0, sizeof(*result));
+		result->bool_value = true;
+		result->current_key.origin_node_id = (uint16)cluster_node_id;
+		result->current_key.undo_segment_id = 1;
+		result->current_key.tt_slot_id = 2;
+		result->current_key.local_xid = request->xid;
+		result->current_key.cluster_epoch = (uint32)test_runtime_epoch;
+		result->lookup.status = CLUSTER_TT_STATUS_ABORTED;
+		result->lookup.commit_scn = InvalidScn;
+		result->lookup.status_epoch = (uint32)test_runtime_epoch;
+		result->lookup.authoritative = true;
+		return CLUSTER_SEMANTIC_ADMISSION_OK;
+	}
 	UT_ASSERT_EQ(op, CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE);
 	UT_ASSERT_NOT_NULL(request);
 	UT_ASSERT_NOT_NULL(request->key);
@@ -276,6 +503,16 @@ StaticAssertDecl(CMDL_CONTINUE == 0 && CMDL_INVISIBLE == 1 && CMDL_SELF_MODIFIED
 					 && CMDL_LOCK_NOT_AVAILABLE == 6 && CMDL_UPDATED == 7 && CMDL_DELETED == 8
 					 && CMDL_UNKNOWN == 9,
 				 "current MX decision values changed");
+StaticAssertDecl(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF == 7
+					 && GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS == 8
+					 && GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE == 9,
+				 "current MX request kinds must occupy the approved post-R4 domain");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT == 27
+					 && GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT == 28
+					 && GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT == 29,
+				 "current MX reply statuses must occupy the approved post-R4 domain");
+StaticAssertDecl(GCS_BLOCK_REPLY_R4_DENIED < GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT,
+				 "current MX replies must not alias the closed R4 reply domain");
 
 
 UT_TEST(test_current_multixact_public_symbols_link)
@@ -290,6 +527,33 @@ UT_TEST(test_current_multixact_public_symbols_link)
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_recompose);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_forward);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_build_proof_requests);
+	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_reply);
+	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_reply_frame);
+}
+
+
+UT_TEST(test_current_multixact_router_domain_binding)
+{
+	GcsBlockForwardPayload forward;
+
+	memset(&forward, 0, sizeof(forward));
+	forward.reserved_0[6] = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	UT_ASSERT(GcsBlockForwardPayloadIsCurrentMxMemberProof(&forward));
+	UT_ASSERT(GcsBlockForwardPayloadIsCurrentMxRuntime(&forward));
+	UT_ASSERT(!GcsBlockForwardPayloadIsCurrentMxDescribe(&forward));
+
+	forward.reserved_0[6] = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	UT_ASSERT(GcsBlockForwardPayloadIsCurrentMxDescribe(&forward));
+	UT_ASSERT(GcsBlockForwardPayloadIsCurrentMxRuntime(&forward));
+	UT_ASSERT(!GcsBlockForwardPayloadIsCurrentMxMemberProof(&forward));
+
+	forward.reserved_0[6] = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
+	UT_ASSERT(!GcsBlockForwardPayloadIsCurrentMxRuntime(&forward));
+	UT_ASSERT(!GcsBlockForwardPayloadIsCurrentMxDescribe(&forward));
+	UT_ASSERT(!GcsBlockForwardPayloadIsCurrentMxMemberProof(&forward));
+
+	forward.reserved_0[6] = CLUSTER_R4_FORWARD_EXTENDED;
+	UT_ASSERT(!GcsBlockForwardPayloadIsCurrentMxRuntime(&forward));
 }
 
 static ClusterCurrentMxKey
@@ -344,7 +608,7 @@ test_proof_request(ClusterCurrentMxProofForwardV2 *request, uint8 body_kind, uin
 	request->prefix.chunk_count_minus_one = 2;
 	request->prefix.entry_count = entry_count;
 	request->prefix.body_kind = body_kind;
-	request->prefix.kind = CLUSTER_CURRENT_MX_MEMBER_PROOF_KIND_FROZEN;
+	request->prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
 	ClusterCurrentMxProofPrefixSetDescriptorHash(&request->prefix,
 											 UINT64CONST(0x8877665544332211));
 	request->trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
@@ -816,6 +1080,107 @@ UT_TEST(test_current_multixact_proof_forward_wire_binding)
 }
 
 
+UT_TEST(test_current_multixact_proof_reply_wire_binding)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterCurrentMxProofReplyPage page;
+	ClusterCurrentMemberProof out[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+	ClusterCurrentUpdaterProof updater_out;
+	ClusterMxResolveResult frame_result = CMX_RESOLVE_UNKNOWN;
+	uint16 out_count = 0;
+	uint8 i;
+
+	test_proof_request(&request, CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS, 2);
+	memset(&page, 0, sizeof(page));
+	page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	page.header.result = CMX_RESOLVE_OK;
+	page.header.source_node_id = 5;
+	page.header.request_id = request.prefix.request_id;
+	page.header.mxkey = request.prefix.mxkey;
+	page.header.descriptor_hash = ClusterCurrentMxProofPrefixGetDescriptorHash(&request.prefix);
+	page.header.total_count = request.prefix.total_count;
+	page.header.entry_count = request.prefix.entry_count;
+	page.header.chunk_ordinal = request.prefix.chunk_ordinal;
+	page.header.chunk_count_minus_one = request.prefix.chunk_count_minus_one;
+	page.header.wire_length
+		= sizeof(page.header) + page.header.entry_count * sizeof(ClusterCurrentMemberProof);
+	for (i = 0; i < page.header.entry_count; i++) {
+		ClusterCurrentMxMemberDesc member;
+
+		test_member(&member, request.trailer.body.asks[i].xid,
+					request.trailer.body.asks[i].member_status);
+		test_proof(&page.body.proofs[i], &member,
+				   request.trailer.body.asks[i].member_ordinal, CCM_ACTIVE, 5, 20 + i);
+	}
+
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply(
+					 &page, sizeof(page), 5, 9, &request, out, lengthof(out), &out_count,
+					 &updater_out),
+				 CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(out_count, 2);
+	UT_ASSERT_EQ(out[1].member_xid, request.trailer.body.asks[1].xid);
+
+	page.header.source_node_id = 4;
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply_frame(
+					 &page, sizeof(page), 5, 9, &request, &frame_result, out, lengthof(out),
+					 &out_count, &updater_out),
+				 false);
+	UT_ASSERT_EQ(out_count, 0);
+	UT_ASSERT_EQ(out[0].state, CCM_UNKNOWN);
+}
+
+
+UT_TEST(test_current_multixact_members_resolve_all_or_nothing)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc members[3];
+	ClusterCurrentMemberProof proofs[3];
+	ClusterCurrentUpdaterChallenge challenge;
+	ClusterCurrentUpdaterProof updater_proof;
+	uint64 hash;
+	uint16 i;
+
+	cluster_node_id = 3;
+	test_runtime_epoch = 9;
+	test_member(&members[0], 100, MultiXactStatusForShare);
+	test_member(&members[1], 101, MultiXactStatusNoKeyUpdate);
+	test_member(&members[2], 102, MultiXactStatusForKeyShare);
+	memset(&challenge, 0, sizeof(challenge));
+	challenge.candidate_next_xmin_key
+		= test_ttkey((uint16)cluster_xid_origin_slot(members[1].xid), members[1].xid, 50);
+	challenge.updater_xid = members[1].xid;
+	challenge.member_ordinal = 1;
+	hash = cluster_multixact_current_descriptor_hash(&key, members, lengthof(members));
+
+	test_runtime_proof_calls = 0;
+	test_runtime_proof_fail_call = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
+					 &key, members, lengthof(members), hash, &challenge, proofs,
+					 &updater_proof),
+				 CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(test_runtime_proof_calls, 3);
+	UT_ASSERT_EQ(proofs[1].state, CCM_COMMITTED);
+	UT_ASSERT_EQ(updater_proof.verdict, CUCP_MATCH);
+
+	memset(proofs, 0xa5, sizeof(proofs));
+	memset(&updater_proof, 0xa5, sizeof(updater_proof));
+	test_runtime_proof_calls = 0;
+	test_runtime_proof_fail_call = 2;
+	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
+					 &key, members, lengthof(members), hash, &challenge, proofs,
+					 &updater_proof),
+				 CMX_RESOLVE_UNKNOWN);
+	for (i = 0; i < lengthof(proofs); i++)
+		UT_ASSERT_EQ(proofs[i].state, CCM_UNKNOWN);
+	UT_ASSERT_EQ(updater_proof.verdict, CUCP_UNKNOWN);
+
+	test_runtime_proof_fail_call = 0;
+	cluster_node_id = -1;
+}
+
+
 UT_TEST(test_current_multixact_proof_request_batches_by_member_origin)
 {
 	ClusterCurrentMxKey key = test_mxkey();
@@ -903,7 +1268,7 @@ UT_TEST(test_current_multixact_describe_wire_binding)
 	forward.prefix.mxkey = key;
 	forward.prefix.original_requester_node = 1;
 	forward.prefix.requester_backend_id = 44;
-	forward.prefix.kind = CLUSTER_CURRENT_MX_DESCRIBE_KIND_FROZEN;
+	forward.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
 	forward.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
 	forward.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
 	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_forward(
@@ -925,7 +1290,7 @@ UT_TEST(test_current_multixact_describe_wire_binding)
 	memset(&page, 0, sizeof(page));
 	page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
 	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
-	page.header.kind = CLUSTER_CURRENT_MX_DESCRIBE_KIND_FROZEN;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
 	page.header.result = CMX_DESC_OK;
 	page.header.source_node_id = 2;
 	page.header.request_id = 501;
@@ -956,7 +1321,7 @@ UT_TEST(test_current_multixact_describe_wire_binding)
 	memset(&page, 0, sizeof(page));
 	page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
 	page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
-	page.header.kind = CLUSTER_CURRENT_MX_DESCRIBE_KIND_FROZEN;
+	page.header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
 	page.header.result = CMX_DESC_SUPPORTED_LIMIT;
 	page.header.source_node_id = 2;
 	page.header.request_id = 501;
@@ -1514,18 +1879,288 @@ UT_TEST(test_current_multixact_recompose_filters_before_cap_check)
 	UT_ASSERT_EQ(normalized[1].xid, 5000);
 }
 
+UT_TEST(test_current_multixact_origin_builds_strict_describe_page)
+{
+	ClusterCurrentMxKey key;
+	MultiXactMember native_members[2];
+	ClusterCurrentMxDescribeReplyPage page;
+	ClusterCurrentMxMemberDesc decoded[2];
+	uint16 decoded_count = 0;
+	uint32 reported_total = 0;
+	const uint64 request_id = UINT64_C(0x0200000000000042);
+
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = 2;
+	key.multixact_id = (MultiXactId)91;
+	key.cluster_epoch = 17;
+	memset(native_members, 0, sizeof(native_members));
+	native_members[0].xid = 501;
+	native_members[0].status = MultiXactStatusForShare;
+	native_members[1].xid = 502;
+	native_members[1].status = MultiXactStatusNoKeyUpdate;
+	memset(&page, 0xa5, sizeof(page));
+
+	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_build_describe_page(
+					 2, request_id, &key, native_members,
+					 lengthof(native_members), &page),
+			 CMX_DESC_OK);
+	UT_ASSERT_EQ(page.header.magic, CLUSTER_CURRENT_MX_WIRE_MAGIC);
+	UT_ASSERT_EQ(page.header.version, CLUSTER_CURRENT_MX_WIRE_VERSION);
+	UT_ASSERT_EQ(page.header.kind,
+				 GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE);
+	UT_ASSERT_EQ(page.header.result, CMX_DESC_OK);
+	UT_ASSERT_EQ(page.header.source_node_id, (uint32)2);
+	UT_ASSERT_EQ(page.header.request_id, request_id);
+	UT_ASSERT_EQ(page.header.total_count, (uint32)2);
+	UT_ASSERT_EQ(page.header.entry_count, (uint16)2);
+	UT_ASSERT(page.header.descriptor_hash != 0);
+	UT_ASSERT_EQ(page.header.wire_length,
+				 sizeof(page.header) + 2 * sizeof(page.members[0]));
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, 17, request_id, &key,
+					 decoded, lengthof(decoded), &decoded_count,
+					 &reported_total),
+			 CMX_DESC_OK);
+	UT_ASSERT_EQ(decoded_count, (uint16)2);
+	UT_ASSERT_EQ(reported_total, (uint32)2);
+	UT_ASSERT_EQ(decoded[0].xid, (TransactionId)501);
+	UT_ASSERT_EQ(decoded[1].xid, (TransactionId)502);
+
+	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_build_describe_page(
+					 2, request_id, &key, NULL,
+					 CLUSTER_CURRENT_MX_MAX_MEMBERS + 1, &page),
+			 CMX_DESC_SUPPORTED_LIMIT);
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 &page, sizeof(page), 2, 17, request_id, &key,
+					 decoded, lengthof(decoded), &decoded_count,
+					 &reported_total),
+			 CMX_DESC_SUPPORTED_LIMIT);
+	UT_ASSERT_EQ(reported_total,
+				 (uint32)CLUSTER_CURRENT_MX_MAX_MEMBERS + 1);
+}
+
+UT_TEST(test_current_multixact_origin_serves_describe_on_capability_bound_reply)
+{
+	ClusterCurrentMxDescribeForwardV2 request;
+	ClusterICEnvelope env;
+	const GcsBlockReplyHeader *outer;
+	const ClusterCurrentMxDescribeReplyPage *page;
+	ClusterCurrentMxMemberDesc decoded[2];
+	uint16 decoded_count = 0;
+	uint32 reported_total = 0;
+
+	test_runtime_epoch = 17;
+	test_runtime_mxid_mine = true;
+	test_runtime_native_describe_calls = 0;
+	test_runtime_describe_send_calls = 0;
+	test_runtime_describe_capability_calls = 0;
+	test_runtime_describe_generation_match_calls = 0;
+	memset(test_runtime_describe_payload, 0,
+		   sizeof(test_runtime_describe_payload));
+	memset(&request, 0, sizeof(request));
+	request.prefix.request_id = UINT64_C(0x0200000000000043);
+	request.prefix.epoch = test_runtime_epoch;
+	request.prefix.mxkey.origin_node_id = 2;
+	request.prefix.mxkey.multixact_id = (MultiXactId)92;
+	request.prefix.mxkey.cluster_epoch = (uint32)test_runtime_epoch;
+	request.prefix.original_requester_node = 3;
+	request.prefix.requester_backend_id = 7;
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	request.trailer.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
+	memset(&env, 0, sizeof(env));
+	env.magic = PGRAC_IC_ENVELOPE_MAGIC;
+	env.version = PGRAC_IC_ENVELOPE_VERSION_V1;
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+	env.source_node_id = 3;
+	env.dest_node_id = 2;
+	env.epoch = test_runtime_epoch;
+	env.payload_length = sizeof(request);
+	cluster_node_id = 2;
+
+	cluster_gcs_current_mx_describe_serve_inline(&env, &request);
+	UT_ASSERT_EQ(test_runtime_native_describe_calls, 1);
+	UT_ASSERT_EQ(test_runtime_describe_capability_calls, 1);
+	UT_ASSERT_EQ(test_runtime_describe_generation_match_calls, 1);
+	UT_ASSERT_EQ(test_runtime_describe_send_calls, 1);
+	UT_ASSERT_EQ(test_runtime_describe_dest, (uint32)3);
+	UT_ASSERT_EQ(test_runtime_describe_payload_len,
+				 sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE);
+	outer = (const GcsBlockReplyHeader *)test_runtime_describe_payload;
+	page = (const ClusterCurrentMxDescribeReplyPage *)(
+		test_runtime_describe_payload + sizeof(*outer));
+	UT_ASSERT_EQ(outer->status,
+				 GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT);
+	UT_ASSERT_EQ(outer->sender_node, 2);
+	UT_ASSERT_EQ(outer->requester_backend_id, 7);
+	UT_ASSERT_EQ(outer->request_id, request.prefix.request_id);
+	UT_ASSERT_EQ(outer->epoch, test_runtime_epoch);
+	UT_ASSERT_EQ(outer->checksum,
+				 cluster_gcs_block_compute_checksum((const char *)page));
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+					 page, sizeof(*page), 2, test_runtime_epoch,
+					 request.prefix.request_id, &request.prefix.mxkey,
+					 decoded, lengthof(decoded), &decoded_count,
+					 &reported_total),
+			 CMX_DESC_OK);
+	UT_ASSERT_EQ(decoded_count, (uint16)2);
+	UT_ASSERT_EQ(decoded[0].xid, (TransactionId)100);
+	UT_ASSERT_EQ(decoded[1].xid, (TransactionId)101);
+}
+
+UT_TEST(test_current_multixact_origin_builds_strict_member_proof_page)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterCurrentMemberProof proof;
+	ClusterCurrentMxProofReplyPage page;
+	ClusterCurrentMemberProof decoded[1];
+	ClusterCurrentUpdaterProof updater;
+	ClusterMxResolveResult decoded_result = CMX_RESOLVE_UNKNOWN;
+	uint16 decoded_count = 0;
+
+	memset(&request, 0, sizeof(request));
+	request.prefix.request_id = UINT64_C(0x0400000000000044);
+	request.prefix.epoch = 17;
+	request.prefix.mxkey.origin_node_id = 1;
+	request.prefix.mxkey.multixact_id = (MultiXactId)93;
+	request.prefix.mxkey.cluster_epoch = 17;
+	request.prefix.original_requester_node = 3;
+	request.prefix.requester_backend_id = 7;
+	request.prefix.total_count = 2;
+	ClusterCurrentMxProofPrefixSetDescriptorHash(
+		&request.prefix, UINT64_C(0x12345678));
+	request.prefix.entry_count = 1;
+	request.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS;
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	request.trailer.body.asks[0].xid = (TransactionId)501;
+	request.trailer.body.asks[0].member_ordinal = 0;
+	request.trailer.body.asks[0].member_status = MultiXactStatusForShare;
+	memset(&proof, 0, sizeof(proof));
+	proof.member_xid = request.trailer.body.asks[0].xid;
+	proof.member_ordinal = request.trailer.body.asks[0].member_ordinal;
+	proof.member_status = request.trailer.body.asks[0].member_status;
+	proof.state = CCM_ABORTED;
+	memset(&page, 0xa5, sizeof(page));
+
+	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_build_proof_page(
+					 4, &request, CMX_RESOLVE_OK, &proof, 1, NULL,
+					 &page),
+			 CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(page.header.magic, CLUSTER_CURRENT_MX_WIRE_MAGIC);
+	UT_ASSERT_EQ(page.header.version, CLUSTER_CURRENT_MX_WIRE_VERSION);
+	UT_ASSERT_EQ(page.header.kind,
+				 GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF);
+	UT_ASSERT_EQ(page.header.result, CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(page.header.source_node_id, (uint32)4);
+	UT_ASSERT_EQ(page.header.request_id, request.prefix.request_id);
+	UT_ASSERT_EQ(page.header.entry_count, (uint16)1);
+	UT_ASSERT_EQ(page.header.wire_length,
+				 sizeof(page.header) + sizeof(proof));
+	UT_ASSERT(cluster_multixact_current_wire_validate_proof_reply_frame(
+		&page, sizeof(page), 4, 17, &request, &decoded_result,
+		decoded, lengthof(decoded), &decoded_count, &updater));
+	UT_ASSERT_EQ(decoded_result, CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(decoded_count, (uint16)1);
+	UT_ASSERT_EQ(decoded[0].member_xid, (TransactionId)501);
+	UT_ASSERT_EQ(decoded[0].state, CCM_ABORTED);
+}
+
+UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_reply)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterICEnvelope env;
+	const GcsBlockReplyHeader *outer;
+	const ClusterCurrentMxProofReplyPage *page;
+	ClusterCurrentMemberProof decoded[1];
+	ClusterCurrentUpdaterProof updater;
+	ClusterMxResolveResult decoded_result = CMX_RESOLVE_UNKNOWN;
+	uint16 decoded_count = 0;
+
+	test_runtime_epoch = 17;
+	test_runtime_origin_proof_source_enabled = true;
+	test_runtime_origin_proof_source_calls = 0;
+	test_runtime_describe_send_calls = 0;
+	test_runtime_describe_capability_calls = 0;
+	test_runtime_describe_generation_match_calls = 0;
+	memset(test_runtime_describe_payload, 0,
+		   sizeof(test_runtime_describe_payload));
+	memset(&request, 0, sizeof(request));
+	request.prefix.request_id = UINT64_C(0x0400000000000045);
+	request.prefix.epoch = test_runtime_epoch;
+	request.prefix.mxkey.origin_node_id = 1;
+	request.prefix.mxkey.multixact_id = (MultiXactId)94;
+	request.prefix.mxkey.cluster_epoch = (uint32)test_runtime_epoch;
+	request.prefix.original_requester_node = 3;
+	request.prefix.requester_backend_id = 7;
+	request.prefix.total_count = 2;
+	ClusterCurrentMxProofPrefixSetDescriptorHash(
+		&request.prefix, UINT64_C(0x12345678));
+	request.prefix.entry_count = 1;
+	request.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS;
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	request.trailer.body.asks[0].xid = (TransactionId)501;
+	request.trailer.body.asks[0].member_ordinal = 0;
+	request.trailer.body.asks[0].member_status = MultiXactStatusForShare;
+	memset(&env, 0, sizeof(env));
+	env.magic = PGRAC_IC_ENVELOPE_MAGIC;
+	env.version = PGRAC_IC_ENVELOPE_VERSION_V1;
+	env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_FORWARD;
+	env.source_node_id = 3;
+	env.dest_node_id = 4;
+	env.epoch = test_runtime_epoch;
+	env.payload_length = sizeof(request);
+	cluster_node_id = 4;
+
+	cluster_gcs_current_mx_member_proof_serve_inline(&env, &request);
+	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 1);
+	UT_ASSERT_EQ(test_runtime_describe_capability_calls, 1);
+	UT_ASSERT_EQ(test_runtime_describe_generation_match_calls, 1);
+	UT_ASSERT_EQ(test_runtime_describe_send_calls, 1);
+	UT_ASSERT_EQ(test_runtime_describe_dest, (uint32)3);
+	UT_ASSERT_EQ(test_runtime_describe_payload_len,
+				 sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE);
+	outer = (const GcsBlockReplyHeader *)test_runtime_describe_payload;
+	page = (const ClusterCurrentMxProofReplyPage *)(
+		test_runtime_describe_payload + sizeof(*outer));
+	UT_ASSERT_EQ(outer->status,
+				 GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT);
+	UT_ASSERT_EQ(outer->sender_node, 4);
+	UT_ASSERT_EQ(outer->requester_backend_id, 7);
+	UT_ASSERT_EQ(outer->request_id, request.prefix.request_id);
+	UT_ASSERT_EQ(outer->epoch, test_runtime_epoch);
+	UT_ASSERT_EQ(outer->checksum,
+				 cluster_gcs_block_compute_checksum((const char *)page));
+	UT_ASSERT(cluster_multixact_current_wire_validate_proof_reply_frame(
+		page, sizeof(*page), 4, test_runtime_epoch, &request,
+		&decoded_result, decoded, lengthof(decoded), &decoded_count,
+		&updater));
+	UT_ASSERT_EQ(decoded_result, CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(decoded_count, (uint16)1);
+	UT_ASSERT_EQ(decoded[0].member_xid, (TransactionId)501);
+	UT_ASSERT_EQ(decoded[0].state, CCM_ABORTED);
+	test_runtime_origin_proof_source_enabled = false;
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(28);
 	UT_RUN(test_current_multixact_public_symbols_link);
+	UT_RUN(test_current_multixact_router_domain_binding);
 	UT_RUN(test_current_multixact_descriptor_validation);
 	UT_RUN(test_current_multixact_descriptor_accepts_cap_and_hashes_order);
 	UT_RUN(test_current_multixact_proof_binding_and_order);
 	UT_RUN(test_current_multixact_origin_member_proof_follows_exact_parent);
 	UT_RUN(test_current_multixact_updater_candidate_requires_current_exact_binding);
 	UT_RUN(test_current_multixact_proof_forward_wire_binding);
+	UT_RUN(test_current_multixact_proof_reply_wire_binding);
+	UT_RUN(test_current_multixact_members_resolve_all_or_nothing);
 	UT_RUN(test_current_multixact_proof_request_batches_by_member_origin);
 	UT_RUN(test_current_multixact_describe_wire_binding);
 	UT_RUN(test_current_multixact_describe_routes_by_mxid_authority);
@@ -1540,6 +2175,10 @@ main(void)
 	UT_RUN(test_current_multixact_recompose_upgrades_requester_member);
 	UT_RUN(test_current_multixact_recompose_fails_closed_on_incomplete_proof);
 	UT_RUN(test_current_multixact_recompose_filters_before_cap_check);
+	UT_RUN(test_current_multixact_origin_builds_strict_describe_page);
+	UT_RUN(test_current_multixact_origin_serves_describe_on_capability_bound_reply);
+	UT_RUN(test_current_multixact_origin_builds_strict_member_proof_page);
+	UT_RUN(test_current_multixact_origin_serves_member_proof_on_capability_bound_reply);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

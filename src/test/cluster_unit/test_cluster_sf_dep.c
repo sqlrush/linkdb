@@ -549,6 +549,40 @@ UT_TEST(test_stage8_ack_full_word_sample_is_record_coherent)
 	UT_ASSERT_EQ(generation, (uint32)0);
 }
 
+UT_TEST(test_current_mx_capability_generation_sample_is_connection_exact)
+{
+	uint32 generation = UINT32_MAX;
+
+	test_sf_cap_store_reset();
+	UT_ASSERT(!cluster_sf_peer_multixact_current_capability_generation(
+		TEST_SF_CAP_PEER, &generation));
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	/* The former 0x00001000 allocation belongs to semantic activation and
+	 * must not admit the migrated Current-MX transport. */
+	cluster_sf_note_peer_hello_capabilities_gen(
+		TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1, 72);
+	generation = UINT32_MAX;
+	UT_ASSERT(!cluster_sf_peer_multixact_current_capability_generation(
+		TEST_SF_CAP_PEER, &generation));
+	UT_ASSERT_EQ(generation, (uint32)0);
+
+	cluster_sf_note_peer_hello_capabilities_gen(
+		TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1, 73);
+	UT_ASSERT(cluster_sf_peer_multixact_current_capability_generation(
+		TEST_SF_CAP_PEER, &generation));
+	UT_ASSERT_EQ(generation, (uint32)73);
+
+	/* A reconnect that withdraws the bit invalidates both authority and the
+	 * previously sampled generation. */
+	cluster_sf_note_peer_hello_capabilities_gen(
+		TEST_SF_CAP_PEER, PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1, 74);
+	generation = UINT32_MAX;
+	UT_ASSERT(!cluster_sf_peer_multixact_current_capability_generation(
+		TEST_SF_CAP_PEER, &generation));
+	UT_ASSERT_EQ(generation, (uint32)0);
+}
+
 int
 main(void)
 {
@@ -569,5 +603,6 @@ main(void)
 	UT_RUN(test_r4_exported_family_sample_accepts_registered_generation_zero);
 	UT_RUN(test_r4_exported_family_sample_reconnect_generation_is_exact);
 	UT_RUN(test_stage8_ack_full_word_sample_is_record_coherent);
+	UT_RUN(test_current_mx_capability_generation_sample_is_connection_exact);
 	UT_DONE();
 }

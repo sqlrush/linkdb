@@ -82,9 +82,13 @@
 /* PGRAC (spec-3.4a D3/D4/D5): ITL write-path activation. */
 #include "cluster/cluster_cr_server.h" /* R4 TARGET full-block CR fetch */
 #include "cluster/cluster_conf.h"		/* cluster_conf_has_peers */
+#include "cluster/cluster_epoch.h"		/* current-MX operation fence */
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled / cluster_peer_mode_enabled */
 #include "cluster/cluster_guc.h"		/* cluster_enabled */
 #include "cluster/cluster_itl.h"		/* alloc_or_reuse_slot / stamp_active */
+#include "cluster/cluster_multixact_current.h" /* current-DML authority */
+#include "cluster/cluster_mxid_stripe.h" /* current-MX origin */
+#include "cluster/cluster_pcm_x_bufmgr.h" /* current-MX ABA fingerprint */
 #include "cluster/cluster_dl.h"	/* spec-5.7 DL bulk-load lease */
 #include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
 #include "cluster/cluster_tt_status.h" /* spec-3.14 D2b writer wait bridge */
@@ -94,6 +98,7 @@
 #include "cluster/cluster_xid_stripe.h" /* spec-7.1a D5 foreign-class chain floor */
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
+#include "storage/buf_internals.h"	/* GetBufferDescriptor */
 /* PGRAC (spec-3.4b D5): real UBA encode + xact-local TT binding. */
 #include "cluster/cluster_tt_local.h"	/* get_or_create_binding / peek_binding */
 #include "cluster/cluster_uba.h"		/* uba_encode */
@@ -1819,6 +1824,355 @@ typedef enum HeapHotR4CycleOutcome
 	HEAP_HOT_R4_CYCLE_FAILED
 } HeapHotR4CycleOutcome;
 
+/*
+ * The current-MX HOT consumer carries only the immutable evidence needed by
+ * the existing happy path.  Describe and proof waits occur without a content
+ * lock; exact tuple, ITL and PCM-X captures fence both unlocked windows.
+ * See spec-3.6b-multixact-current-dml.md.
+ */
+typedef struct HeapHotCurrentMxCapture
+{
+	ClusterPcmOwnSnapshot pcm;
+	XLogRecPtr	page_lsn;
+	ItemPointerData tid;
+	ItemIdData	line_pointer;
+	uint16		tuple_len;
+	uint8		tuple_header[SizeofHeapTupleHeader];
+	ClusterItlSlotData itl_slots[CLUSTER_ITL_INITRANS_DEFAULT];
+} HeapHotCurrentMxCapture;
+
+typedef struct HeapHotCurrentMxSuccessorProof
+{
+	ItemPointerData tid;
+	ClusterTTStatusKey key;
+	TransactionId updater_xid;
+	bool		valid;
+} HeapHotCurrentMxSuccessorProof;
+
+static pg_attribute_noreturn() void
+heap_hot_current_mx_fail(const char *phase, const char *detail)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+			 errmsg("cross-node current MultiXact authority is not provable: phase=%s; %s",
+					phase, detail),
+			 errhint("Retry the transaction after the current row lockers finish.")));
+	pg_unreachable();
+}
+
+static bool
+heap_hot_current_mx_capture(Buffer buffer, HeapTuple tuple,
+							HeapHotCurrentMxCapture *capture)
+{
+	Page		page;
+	OffsetNumber off;
+	ItemId		lp;
+
+	Assert(BufferIsValid(buffer));
+	Assert(tuple != NULL);
+	Assert(capture != NULL);
+
+	page = BufferGetPage(buffer);
+	off = ItemPointerGetOffsetNumber(&tuple->t_self);
+	if (!PageHasItl(page) || off < FirstOffsetNumber
+		|| off > PageGetMaxOffsetNumber(page))
+		return false;
+	lp = PageGetItemId(page, off);
+	if (!ItemIdIsNormal(lp) || ItemIdGetLength(lp) < SizeofHeapTupleHeader
+		|| (HeapTupleHeader) PageGetItem(page, lp) != tuple->t_data)
+		return false;
+
+	memset(capture, 0, sizeof(*capture));
+	if (cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1),
+										&capture->pcm) != CLUSTER_PCM_OWN_OK
+		|| capture->pcm.pcm_state != (uint8) PCM_STATE_X
+		|| capture->pcm.flags != 0)
+		return false;
+	capture->page_lsn = PageGetLSN(page);
+	capture->tid = tuple->t_self;
+	memcpy(&capture->line_pointer, lp, sizeof(capture->line_pointer));
+	capture->tuple_len = ItemIdGetLength(lp);
+	memcpy(capture->tuple_header, tuple->t_data, SizeofHeapTupleHeader);
+	memcpy(capture->itl_slots, ClusterPageGetItlSlots(page),
+		   sizeof(capture->itl_slots));
+	return true;
+}
+
+static bool
+heap_hot_current_mx_capture_equal(const HeapHotCurrentMxCapture *left,
+								  const HeapHotCurrentMxCapture *right)
+{
+	return memcmp(left, right, sizeof(*left)) == 0;
+}
+
+static bool
+heap_hot_current_mx_capture_tid(Buffer buffer, Relation relation,
+								const ItemPointerData *tid,
+								HeapHotCurrentMxCapture *capture)
+{
+	Page		page = BufferGetPage(buffer);
+	OffsetNumber off = ItemPointerGetOffsetNumber(tid);
+	ItemId		lp;
+	HeapTupleData tuple;
+
+	if (ItemPointerGetBlockNumber(tid) != BufferGetBlockNumber(buffer)
+		|| off < FirstOffsetNumber || off > PageGetMaxOffsetNumber(page))
+		return false;
+	lp = PageGetItemId(page, off);
+	if (!ItemIdIsNormal(lp))
+		return false;
+	memset(&tuple, 0, sizeof(tuple));
+	tuple.t_self = *tid;
+	tuple.t_tableOid = RelationGetRelid(relation);
+	tuple.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+	tuple.t_len = ItemIdGetLength(lp);
+	return heap_hot_current_mx_capture(buffer, &tuple, capture);
+}
+
+static bool
+heap_hot_current_mx_build_challenge(
+	Relation relation, Buffer buffer, HeapTuple root,
+	TransactionId updater_xid, uint16 updater_ordinal,
+	ClusterCurrentUpdaterChallenge *challenge,
+	HeapHotCurrentMxCapture *candidate_capture)
+{
+	Page		page = BufferGetPage(buffer);
+	ItemPointerData candidate_tid = root->t_data->t_ctid;
+	OffsetNumber off = ItemPointerGetOffsetNumber(&candidate_tid);
+	ItemId		lp;
+	HeapTupleData candidate;
+	ClusterUndoTTSlotRef ref;
+	int			updater_origin;
+
+	if (ItemPointerEquals(&root->t_self, &candidate_tid)
+		|| ItemPointerIndicatesMovedPartitions(&candidate_tid)
+		|| ItemPointerGetBlockNumber(&candidate_tid)
+			   != BufferGetBlockNumber(buffer)
+		|| off < FirstOffsetNumber || off > PageGetMaxOffsetNumber(page))
+		return false;
+	lp = PageGetItemId(page, off);
+	if (!ItemIdIsNormal(lp))
+		return false;
+
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.t_self = candidate_tid;
+	candidate.t_tableOid = RelationGetRelid(relation);
+	candidate.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+	candidate.t_len = ItemIdGetLength(lp);
+	if (!TransactionIdEquals(HeapTupleHeaderGetRawXmin(candidate.t_data),
+							 updater_xid)
+		|| candidate.t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
+		|| !cluster_itl_get_tt_ref(page, candidate.t_data->t_itl_slot_idx,
+								  &ref)
+		|| ref.tt_slot_id == 0 || ref.local_xid != updater_xid
+		|| ref.cluster_epoch != cluster_epoch_get_current())
+		return false;
+	updater_origin = cluster_xid_origin_slot(updater_xid);
+	if (updater_origin < 0 || updater_origin >= CLUSTER_MAX_NODES
+		|| ref.origin_node_id != (uint16) updater_origin
+		|| !heap_hot_current_mx_capture(buffer, &candidate,
+									   candidate_capture))
+		return false;
+
+	memset(challenge, 0, sizeof(*challenge));
+	challenge->candidate_next_xmin_key.origin_node_id = ref.origin_node_id;
+	challenge->candidate_next_xmin_key.undo_segment_id = ref.undo_segment_id;
+	challenge->candidate_next_xmin_key.tt_slot_id = ref.tt_slot_id;
+	challenge->candidate_next_xmin_key.cluster_epoch = ref.cluster_epoch;
+	challenge->candidate_next_xmin_key.local_xid = ref.local_xid;
+	challenge->updater_xid = updater_xid;
+	challenge->member_ordinal = updater_ordinal;
+	return true;
+}
+
+static bool
+heap_hot_current_mx_successor_matches(
+	Buffer buffer, HeapTuple tuple,
+	const HeapHotCurrentMxSuccessorProof *proof)
+{
+	ClusterUndoTTSlotRef ref;
+	ClusterTTStatusKey key;
+
+	if (proof == NULL || !proof->valid
+		|| !ItemPointerEquals(&tuple->t_self, (ItemPointer) &proof->tid)
+		|| !TransactionIdEquals(HeapTupleHeaderGetRawXmin(tuple->t_data),
+								proof->updater_xid)
+		|| tuple->t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
+		|| !cluster_itl_get_tt_ref(BufferGetPage(buffer),
+								  tuple->t_data->t_itl_slot_idx, &ref))
+		return false;
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = ref.origin_node_id;
+	key.undo_segment_id = ref.undo_segment_id;
+	key.tt_slot_id = ref.tt_slot_id;
+	key.cluster_epoch = ref.cluster_epoch;
+	key.local_xid = ref.local_xid;
+	return memcmp(&key, &proof->key, sizeof(key)) == 0;
+}
+
+/*
+ * Resolve an updater-bearing peer-mode MultiXact without consulting
+ * requester-local pg_multixact storage.  Caller and return contract are
+ * content EXCLUSIVE; a changed capture requests a caller restart.
+ */
+static bool
+heap_hot_current_mx_resolve_updater(
+	Relation relation, Buffer buffer, HeapTuple root,
+	TransactionId *updater_xid, bool *restart,
+	HeapHotCurrentMxSuccessorProof *successor_proof)
+{
+	HeapHotCurrentMxCapture root_before;
+	HeapHotCurrentMxCapture root_after;
+	HeapHotCurrentMxCapture candidate_before;
+	HeapHotCurrentMxCapture candidate_after;
+	ClusterCurrentMxMemberDesc members[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	ClusterCurrentMemberProof proofs[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+	ClusterCurrentUpdaterChallenge challenge;
+	ClusterCurrentUpdaterProof updater_proof;
+	ClusterCurrentMxKey key;
+	ClusterMxDescribeResult describe_result;
+	ClusterMxResolveResult resolve_result;
+	MultiXactId raw_mxid;
+	ItemPointerData candidate_tid;
+	uint64		descriptor_hash;
+	uint64		current_epoch;
+	uint32		reported_total = 0;
+	uint16		nmembers = 0;
+	uint16		i;
+	int			mx_origin;
+	int			updater_origin;
+	int			updater_ordinal = -1;
+
+	*updater_xid = InvalidTransactionId;
+	*restart = false;
+	memset(successor_proof, 0, sizeof(*successor_proof));
+	if (!(root->t_data->t_infomask & HEAP_XMAX_IS_MULTI)
+		|| HEAP_XMAX_IS_LOCKED_ONLY(root->t_data->t_infomask)
+		|| ItemPointerEquals(&root->t_self, &root->t_data->t_ctid))
+		heap_hot_current_mx_fail(
+			"HOT_PROOF",
+			"the HOT chain root is not an updater-bearing current MultiXact");
+	if (!heap_hot_current_mx_capture(buffer, root, &root_before))
+		heap_hot_current_mx_fail(
+			"DESCRIBE",
+			"the HOT chain root has no stable PCM-X/ITL fingerprint");
+
+	raw_mxid = (MultiXactId) HeapTupleHeaderGetRawXmax(root->t_data);
+	current_epoch = cluster_epoch_get_current();
+	mx_origin = cluster_mxid_origin_slot(raw_mxid);
+	if (current_epoch == 0 || current_epoch > UINT32_MAX
+		|| mx_origin < 0 || mx_origin >= CLUSTER_MAX_NODES)
+		heap_hot_current_mx_fail(
+			"DESCRIBE",
+			"the HOT chain MultiXact origin or epoch is not derivable");
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = (uint16) mx_origin;
+	key.multixact_id = raw_mxid;
+	key.cluster_epoch = (uint32) current_epoch;
+
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	describe_result = cluster_multixact_current_describe(
+		&key, members, lengthof(members), &nmembers, &reported_total);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (cluster_epoch_get_current() != current_epoch
+		|| !heap_hot_current_mx_capture(buffer, root, &root_after)
+		|| !heap_hot_current_mx_capture_equal(&root_before, &root_after))
+	{
+		*restart = true;
+		return false;
+	}
+	if (describe_result == CMX_DESC_SUPPORTED_LIMIT)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("current MultiXact %u exceeds the supported member limit",
+						raw_mxid)));
+	if (describe_result == CMX_DESC_TIMEOUT)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+				 errmsg("timed out describing current MultiXact %u", raw_mxid)));
+	if (describe_result != CMX_DESC_OK || nmembers < 2
+		|| nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS
+		|| reported_total != nmembers)
+		heap_hot_current_mx_fail(
+			"DESCRIBE",
+			"the HOT chain MultiXact descriptor was denied or incomplete");
+
+	for (i = 0; i < nmembers; i++)
+	{
+		if (!ISUPDATE_from_mxstatus(members[i].member_status))
+			continue;
+		if (updater_ordinal >= 0)
+			heap_hot_current_mx_fail(
+				"HOT_PROOF",
+				"the HOT chain descriptor contains more than one updater");
+		updater_ordinal = i;
+	}
+	if (updater_ordinal < 0)
+		heap_hot_current_mx_fail(
+			"HOT_PROOF",
+			"the HOT chain descriptor contains no updater");
+	updater_origin = cluster_xid_origin_slot(members[updater_ordinal].xid);
+	if (updater_origin < 0 || updater_origin >= CLUSTER_MAX_NODES)
+		heap_hot_current_mx_fail(
+			"HOT_PROOF",
+			"the HOT chain updater origin is not derivable");
+
+	candidate_tid = root->t_data->t_ctid;
+	if (!heap_hot_current_mx_build_challenge(
+			relation, buffer, root, members[updater_ordinal].xid,
+			(uint16) updater_ordinal, &challenge, &candidate_before))
+		heap_hot_current_mx_fail(
+			"HOT_PROOF",
+			"the HOT successor is not an exact same-page ITL/TT binding");
+	descriptor_hash
+		= cluster_multixact_current_descriptor_hash(&key, members, nmembers);
+	if (descriptor_hash == 0)
+		heap_hot_current_mx_fail(
+			"HOT_PROOF",
+			"the HOT chain descriptor identity is not derivable");
+
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	resolve_result = cluster_multixact_current_members_resolve(
+		&key, members, nmembers, descriptor_hash, &challenge,
+		proofs, &updater_proof);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (cluster_epoch_get_current() != current_epoch
+		|| !heap_hot_current_mx_capture(buffer, root, &root_after)
+		|| !heap_hot_current_mx_capture_equal(&root_before, &root_after)
+		|| !heap_hot_current_mx_capture_tid(
+			buffer, relation, &candidate_tid, &candidate_after)
+		|| !heap_hot_current_mx_capture_equal(
+			&candidate_before, &candidate_after))
+	{
+		*restart = true;
+		return false;
+	}
+	if (resolve_result == CMX_RESOLVE_SUPPORTED_LIMIT)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("current MultiXact %u exceeds the supported proof limit",
+						raw_mxid)));
+	if (resolve_result == CMX_RESOLVE_TIMEOUT)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+				 errmsg("timed out resolving current MultiXact %u members",
+						raw_mxid)));
+	if (resolve_result != CMX_RESOLVE_OK
+		|| !cluster_multixact_current_validate_updater_proof(
+			&key, members, proofs, nmembers, &challenge, &updater_proof,
+			(uint16) updater_origin))
+		heap_hot_current_mx_fail(
+			"HOT_PROOF",
+			"the full-key HOT updater proof was denied or incomplete");
+
+	*updater_xid = members[updater_ordinal].xid;
+	successor_proof->tid = candidate_tid;
+	successor_proof->key = challenge.candidate_next_xmin_key;
+	successor_proof->updater_xid = *updater_xid;
+	successor_proof->valid = true;
+	return true;
+}
+
 static pg_attribute_noreturn() void
 heap_hot_r4_unknown(const char *reason)
 {
@@ -2148,6 +2502,8 @@ heap_hot_search_buffer_result(ItemPointer tid, Relation relation, Buffer buffer,
 	GlobalVisState *vistest = NULL;
 #ifdef USE_PGRAC_CLUSTER
 	bool		r4_target_dormant = false;
+	bool		current_mx_content_exclusive = false;
+	HeapHotCurrentMxSuccessorProof current_mx_successor;
 #endif
 
 	Assert(result != NULL);
@@ -2156,6 +2512,7 @@ heap_hot_search_buffer_result(ItemPointer tid, Relation relation, Buffer buffer,
 
 #ifdef USE_PGRAC_CLUSTER
 restart_live_search:
+	memset(&current_mx_successor, 0, sizeof(current_mx_successor));
 #endif
 	page = BufferGetPage(buffer);
 	prev_xmax = InvalidTransactionId;
@@ -2192,6 +2549,18 @@ restart_live_search:
 		result->tuple.t_len = ItemIdGetLength(lp);
 		result->tuple.t_tableOid = RelationGetRelid(relation);
 		ItemPointerSet(&result->tuple.t_self, blkno, offnum);
+
+#ifdef USE_PGRAC_CLUSTER
+		if (current_mx_successor.valid)
+		{
+			if (!heap_hot_current_mx_successor_matches(
+					buffer, &result->tuple, &current_mx_successor))
+				heap_hot_current_mx_fail(
+					"ABA_FENCE",
+					"the HOT scan successor no longer matches its full-key proof");
+			memset(&current_mx_successor, 0, sizeof(current_mx_successor));
+		}
+#endif
 
 		if (at_chain_start && HeapTupleIsHeapOnly(&result->tuple))
 			break;
@@ -2298,7 +2667,40 @@ restart_live_search:
 				   == blkno);
 			offnum = ItemPointerGetOffsetNumber(&result->tuple.t_data->t_ctid);
 			at_chain_start = false;
-			prev_xmax = HeapTupleHeaderGetUpdateXid(result->tuple.t_data);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_peer_mode_enabled()
+				&& (result->tuple.t_data->t_infomask & HEAP_XMAX_IS_MULTI)
+				&& !HEAP_XMAX_IS_LOCKED_ONLY(
+					result->tuple.t_data->t_infomask))
+			{
+				bool		restart = false;
+
+				if (!current_mx_content_exclusive)
+				{
+					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+					LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+					current_mx_content_exclusive = true;
+					goto restart_live_search;
+				}
+				if (!heap_hot_current_mx_resolve_updater(
+						relation, buffer, &result->tuple, &prev_xmax,
+						&restart, &current_mx_successor))
+				{
+					Assert(restart);
+					LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+					LockBuffer(buffer, BUFFER_LOCK_SHARE);
+					current_mx_content_exclusive = false;
+					CHECK_FOR_INTERRUPTS();
+					goto restart_live_search;
+				}
+				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				LockBuffer(buffer, BUFFER_LOCK_SHARE);
+				current_mx_content_exclusive = false;
+			}
+			else
+#endif
+				prev_xmax = HeapTupleHeaderGetUpdateXid(
+					result->tuple.t_data);
 		}
 		else
 			break;

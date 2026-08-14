@@ -600,12 +600,13 @@ UT_TEST(test_hello_wire_reference_bytes)
 	 * (0x80) + TT-lane undo-horizon idle sentinel (0x100) + PCM-X
 	 * conversion (0x200) + A' rebase V2 INSTALL_READY (0x400) + PCM-X
 	 * source-floor type49 V2 (0x800) + semantic activation (0x1000) +
-	 * R4 synchronous CR (0x2000) + Candidate-2 corrected-A1 grammar
+	 * R4 synchronous CR (0x2000) + current-MultiXact describe/proof
+	 * (0x00010000) + Candidate-2 corrected-A1 grammar
 	 * (0x00100000) + PGRD V1 persistent-ABI grammar (0x00200000).
 	 * (smart-fusion is off in this fixture) */
 	UT_ASSERT_EQ(wire[36], 0xFE);
 	UT_ASSERT_EQ(wire[37], 0x3F);
-	UT_ASSERT_EQ(wire[38], 0x30);
+	UT_ASSERT_EQ(wire[38], 0x31);
 	UT_ASSERT_EQ(wire[39], 0x00);
 	/* remaining _pad must be all zero: a CONTROL-plane HELLO with
 	 * conn_epoch 0 adds nothing past the capability word (spec-7.2 D2
@@ -652,8 +653,8 @@ UT_TEST(test_hello_r4_capabilities_preserve_v1_reference)
 				 (uint32)0x00100000U);
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1,
 				 (uint32)0x00200000U);
-	UT_ASSERT_EQ(capabilities & UINT32_C(0x00303000), UINT32_C(0x00303000));
-	UT_ASSERT_EQ(capabilities & ~UINT32_C(0x00303000), UINT32_C(0x00000FFE));
+	UT_ASSERT_EQ(capabilities & UINT32_C(0x00313000), UINT32_C(0x00313000));
+	UT_ASSERT_EQ(capabilities & ~UINT32_C(0x00313000), UINT32_C(0x00000FFE));
 
 	/* Every V1 reference byte outside the four-byte capability word is frozen. */
 	for (i = 0; i < PGRAC_IC_HELLO_BYTES; i++) {
@@ -683,6 +684,27 @@ UT_TEST(test_local_capability_word_is_hello_authority_without_ack_advertisement)
 	UT_ASSERT_EQ(cluster_ic_local_capability_word()
 				 & PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1,
 		0);
+}
+
+UT_TEST(test_current_mx_capability_is_advertised_without_reserved_bit_alias)
+{
+	uint8 wire[PGRAC_IC_HELLO_BYTES];
+	ClusterICHelloMsg parsed;
+	uint32 capabilities;
+
+	cluster_smart_fusion = false;
+	cluster_ic_suppress_caps_reply = false;
+	cluster_ic_suppress_gcs_done_cap = false;
+	cluster_ic_suppress_xid_flock_cap = false;
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1,
+		PGRAC_IC_ENVELOPE_VERSION_V1, 0, "current-mx",
+		CLUSTER_IC_PLANE_CONTROL, 0);
+
+	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
+	capabilities = cluster_ic_hello_capabilities(&parsed);
+	UT_ASSERT_EQ(capabilities & UINT32_C(0x00010000),
+				 UINT32_C(0x00010000));
+	UT_ASSERT_EQ(capabilities & UINT32_C(0x00004000), 0);
 }
 
 /*
@@ -777,12 +799,13 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
 			| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+			| UINT32_C(0x00010000)
 			| PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
 			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1);
 	/* Keep the aggregate word byte-exact as well as symbolically composed:
 	 * parallel protocol lanes have collided while preserving the same symbolic
 	 * expectation, so the literal catches accidental bit reuse. */
-	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), (uint32)0x00303FFEU);
+	UT_ASSERT_EQ(cluster_ic_hello_capabilities(&parsed), (uint32)0x00313FFEU);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_2;
@@ -799,6 +822,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
 			| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+			| UINT32_C(0x00010000)
 			| PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
 			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1);
 
@@ -817,6 +841,7 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1
 			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+			| UINT32_C(0x00010000)
 			| PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
 			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1);
 
@@ -967,7 +992,7 @@ UT_TEST(test_hello_build_truncates_long_name)
 int
 main(void)
 {
-	UT_PLAN(26); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
+	UT_PLAN(27); /* spec-2.3 D3: 6 ClusterMsgHeader/msg_send/recv tests deleted */
 	UT_RUN(test_ic_send_bytes_linkable);
 	UT_RUN(test_ic_recv_bytes_linkable);
 	UT_RUN(test_ic_init_linkable);
@@ -989,6 +1014,7 @@ main(void)
 	UT_RUN(test_hello_wire_reference_bytes);
 	UT_RUN(test_hello_r4_capabilities_preserve_v1_reference);
 	UT_RUN(test_local_capability_word_is_hello_authority_without_ack_advertisement);
+	UT_RUN(test_current_mx_capability_is_advertised_without_reserved_bit_alias);
 	UT_RUN(test_hello_wire_data_plane_bytes);	/* spec-7.2 D2 */
 	UT_RUN(test_hello_worker_fields_roundtrip); /* spec-7.3 D3 */
 	UT_RUN(test_hello_smart_fusion_capability_gate);

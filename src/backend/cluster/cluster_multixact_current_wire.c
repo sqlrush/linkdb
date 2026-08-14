@@ -103,7 +103,7 @@ cluster_multixact_current_wire_validate_describe_forward(
 	valid = message.prefix.request_id != 0 && message.prefix.epoch == current_epoch
 			&& message.prefix.original_requester_node == envelope_source
 			&& message.prefix.requester_backend_id > 0
-			&& message.prefix.kind == CLUSTER_CURRENT_MX_DESCRIBE_KIND_FROZEN
+			&& message.prefix.kind == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE
 			&& wire_mxkey_valid(&message.prefix.mxkey, current_epoch)
 			&& message.prefix.mxkey.origin_node_id == (uint16)local_node
 			&& bytes_are_zero(message.prefix.reserved_a, sizeof(message.prefix.reserved_a))
@@ -141,7 +141,7 @@ cluster_multixact_current_wire_validate_proof_forward(
 	if (message.prefix.request_id == 0 || message.prefix.epoch != current_epoch
 		|| message.prefix.original_requester_node != envelope_source
 		|| message.prefix.requester_backend_id <= 0
-		|| message.prefix.kind != CLUSTER_CURRENT_MX_MEMBER_PROOF_KIND_FROZEN
+		|| message.prefix.kind != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF
 		|| !wire_mxkey_valid(&message.prefix.mxkey, current_epoch)
 		|| message.prefix.total_count < 2
 		|| message.prefix.total_count > CLUSTER_CURRENT_MX_MAX_MEMBERS
@@ -223,7 +223,7 @@ wire_init_proof_request(ClusterCurrentMxProofRequestPlan *plan, uint16 destinati
 	plan->request.prefix.total_count = total_count;
 	ClusterCurrentMxProofPrefixSetDescriptorHash(&plan->request.prefix, descriptor_hash);
 	plan->request.prefix.body_kind = body_kind;
-	plan->request.prefix.kind = CLUSTER_CURRENT_MX_MEMBER_PROOF_KIND_FROZEN;
+	plan->request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
 	plan->request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
 	plan->request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
 }
@@ -346,6 +346,230 @@ cluster_multixact_current_wire_build_proof_requests(
 }
 
 
+static void
+wire_proof_outputs_reset(ClusterCurrentMemberProof *proofs, uint16 proofs_cap,
+						 uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof)
+{
+	uint16 i;
+
+	if (proofs != NULL) {
+		memset(proofs, 0, sizeof(*proofs) * proofs_cap);
+		for (i = 0; i < proofs_cap; i++)
+			proofs[i].state = CCM_UNKNOWN;
+	}
+	if (proof_count != NULL)
+		*proof_count = 0;
+	if (updater_proof != NULL) {
+		memset(updater_proof, 0, sizeof(*updater_proof));
+		updater_proof->verdict = CUCP_UNKNOWN;
+	}
+}
+
+
+static bool
+wire_member_proof_valid(const ClusterCurrentMemberProof *proof,
+						const ClusterCurrentMxProofAskWire *ask, int32 expected_source,
+						uint64 current_epoch)
+{
+	static const ClusterTTStatusKey zero_key;
+
+	if (proof == NULL || ask == NULL || proof->member_ordinal != ask->member_ordinal
+		|| proof->member_xid != ask->xid || proof->member_status != ask->member_status
+		|| proof->state > CCM_UNKNOWN
+		|| !bytes_are_zero(proof->reserved8, sizeof(proof->reserved8)))
+		return false;
+
+	switch ((ClusterCurrentMemberState)proof->state) {
+	case CCM_ACTIVE:
+		return proof->commit_scn == InvalidScn
+			   && wire_tt_key_valid(&proof->key, current_epoch, expected_source,
+								InvalidTransactionId)
+			   && (proof->key.local_xid == ask->xid
+				   || TransactionIdPrecedes(proof->key.local_xid, ask->xid));
+	case CCM_COMMITTED:
+		return memcmp(&proof->key, &zero_key, sizeof(zero_key)) == 0
+			   && SCN_VALID(proof->commit_scn);
+	case CCM_ABORTED:
+		return memcmp(&proof->key, &zero_key, sizeof(zero_key)) == 0
+			   && proof->commit_scn == InvalidScn;
+	case CCM_SELF:
+	case CCM_UNKNOWN:
+		return false;
+	}
+
+	return false;
+}
+
+
+static bool
+wire_updater_proof_valid(const ClusterCurrentUpdaterProof *proof,
+						 const ClusterCurrentMxProofForwardV2 *request)
+{
+	const ClusterCurrentMxUpdaterChallengeWire *challenge
+		= &request->trailer.body.updater.challenge;
+
+	return proof != NULL && wire_mxkey_equal(&proof->mxkey, &request->prefix.mxkey)
+		   && memcmp(&proof->candidate_next_xmin_key, &challenge->candidate_next_xmin_key,
+					 sizeof(ClusterTTStatusKey))
+				  == 0
+		   && proof->updater_xid == challenge->updater_xid
+		   && proof->member_ordinal == challenge->member_ordinal
+		   && proof->verdict < CUCP_UNKNOWN && proof->reserved8 == 0;
+}
+
+
+ClusterMxResolveResult
+cluster_multixact_current_wire_validate_proof_reply(
+	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
+	const ClusterCurrentMxProofForwardV2 *expected_request,
+	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
+	ClusterCurrentUpdaterProof *updater_proof)
+{
+	ClusterCurrentMxProofForwardV2 decoded_request;
+	ClusterCurrentMxProofReplyPage page;
+	const ClusterCurrentMxProofReplyHeader *header;
+	ClusterMxResolveResult result;
+	Size expected_wire_length;
+	uint8 i;
+
+	wire_proof_outputs_reset(proofs, proofs_cap, proof_count, updater_proof);
+	if (payload == NULL || payload_length != sizeof(page) || expected_source < 0
+		|| expected_source >= CLUSTER_MAX_NODES || expected_request == NULL
+		|| proof_count == NULL || updater_proof == NULL
+		|| !cluster_multixact_current_wire_validate_proof_forward(
+			expected_request, sizeof(*expected_request),
+			expected_request->prefix.original_requester_node, expected_source, current_epoch,
+			&decoded_request))
+		return CMX_RESOLVE_UNKNOWN;
+
+	memcpy(&page, payload, sizeof(page));
+	header = &page.header;
+	if (header->magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+		|| header->version != CLUSTER_CURRENT_MX_WIRE_VERSION
+		|| header->kind != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF
+		|| header->flags != CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE
+		|| header->source_node_id != (uint32)expected_source
+		|| header->request_id != decoded_request.prefix.request_id
+		|| !wire_mxkey_equal(&header->mxkey, &decoded_request.prefix.mxkey)
+		|| header->descriptor_hash
+			   != ClusterCurrentMxProofPrefixGetDescriptorHash(&decoded_request.prefix)
+		|| header->total_count != decoded_request.prefix.total_count
+		|| header->chunk_ordinal != decoded_request.prefix.chunk_ordinal
+		|| header->chunk_count_minus_one != decoded_request.prefix.chunk_count_minus_one
+		|| header->result > CMX_RESOLVE_UNKNOWN || header->result == CMX_RESOLVE_TIMEOUT
+		|| header->reserved16 != 0 || header->reserved32 != 0
+		|| header->wire_length < sizeof(*header) || header->wire_length > sizeof(page))
+		return CMX_RESOLVE_UNKNOWN;
+
+	result = (ClusterMxResolveResult)header->result;
+	if (result != CMX_RESOLVE_OK) {
+		if (header->entry_count != 0 || header->wire_length != sizeof(*header)
+			|| !bytes_are_zero((const uint8 *)&page + sizeof(*header),
+							   sizeof(page) - sizeof(*header)))
+			return CMX_RESOLVE_UNKNOWN;
+		return result;
+	}
+
+	if (proofs == NULL)
+		return CMX_RESOLVE_UNKNOWN;
+	switch ((ClusterCurrentMxProofBodyKind)decoded_request.prefix.body_kind) {
+	case CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS:
+		expected_wire_length
+			= sizeof(*header)
+			  + decoded_request.prefix.entry_count * sizeof(ClusterCurrentMemberProof);
+		if (header->entry_count != decoded_request.prefix.entry_count
+			|| header->entry_count > proofs_cap || header->wire_length != expected_wire_length)
+			return CMX_RESOLVE_UNKNOWN;
+		for (i = 0; i < header->entry_count; i++)
+			if (!wire_member_proof_valid(&page.body.proofs[i],
+									 &decoded_request.trailer.body.asks[i],
+									 expected_source, current_epoch))
+				return CMX_RESOLVE_UNKNOWN;
+		memcpy(proofs, page.body.proofs, sizeof(*proofs) * header->entry_count);
+		break;
+
+	case CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE: {
+		ClusterCurrentMxProofAskWire updater_ask;
+
+		memset(&updater_ask, 0, sizeof(updater_ask));
+		updater_ask.xid = decoded_request.trailer.body.updater.challenge.updater_xid;
+		updater_ask.member_ordinal
+			= decoded_request.trailer.body.updater.challenge.member_ordinal;
+		updater_ask.member_status
+			= decoded_request.trailer.body.updater.challenge.member_status;
+		expected_wire_length = sizeof(*header) + sizeof(ClusterCurrentMemberProof)
+							   + sizeof(ClusterCurrentUpdaterProof);
+		if (header->entry_count != 1 || proofs_cap < 1
+			|| header->wire_length != expected_wire_length
+			|| !wire_member_proof_valid(&page.body.updater.member_proof, &updater_ask,
+									expected_source, current_epoch)
+			|| !wire_updater_proof_valid(&page.body.updater.updater_proof, &decoded_request))
+			return CMX_RESOLVE_UNKNOWN;
+		proofs[0] = page.body.updater.member_proof;
+		*updater_proof = page.body.updater.updater_proof;
+		break;
+	}
+
+	default:
+		return CMX_RESOLVE_UNKNOWN;
+	}
+
+	if (!bytes_are_zero((const uint8 *)&page + header->wire_length,
+						sizeof(page) - header->wire_length)) {
+		wire_proof_outputs_reset(proofs, proofs_cap, proof_count, updater_proof);
+		return CMX_RESOLVE_UNKNOWN;
+	}
+
+	*proof_count = header->entry_count;
+	return CMX_RESOLVE_OK;
+}
+
+
+bool
+cluster_multixact_current_wire_validate_proof_reply_frame(
+	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
+	const ClusterCurrentMxProofForwardV2 *expected_request, ClusterMxResolveResult *result,
+	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
+	ClusterCurrentUpdaterProof *updater_proof)
+{
+	ClusterMxResolveResult decoded_result;
+
+	if (result != NULL)
+		*result = CMX_RESOLVE_UNKNOWN;
+	if (result == NULL)
+		return false;
+	decoded_result = cluster_multixact_current_wire_validate_proof_reply(
+		payload, payload_length, expected_source, current_epoch, expected_request, proofs,
+		proofs_cap, proof_count, updater_proof);
+	if (decoded_result != CMX_RESOLVE_UNKNOWN) {
+		*result = decoded_result;
+		return true;
+	}
+
+	if (payload != NULL && payload_length == sizeof(ClusterCurrentMxProofReplyPage)) {
+		ClusterCurrentMxProofReplyPage page;
+		ClusterCurrentMemberProof scratch_proofs
+			[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+		ClusterCurrentUpdaterProof scratch_updater;
+		uint16 scratch_count = 0;
+
+		memcpy(&page, payload, sizeof(page));
+		if (page.header.result == CMX_RESOLVE_UNKNOWN) {
+			page.header.result = CMX_RESOLVE_DENIED;
+			if (cluster_multixact_current_wire_validate_proof_reply(
+					&page, sizeof(page), expected_source, current_epoch, expected_request,
+					scratch_proofs, lengthof(scratch_proofs), &scratch_count,
+					&scratch_updater)
+				== CMX_RESOLVE_DENIED) {
+				*result = CMX_RESOLVE_UNKNOWN;
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
+
 ClusterMxDescribeResult
 cluster_multixact_current_wire_validate_describe_reply(
 	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
@@ -375,7 +599,7 @@ cluster_multixact_current_wire_validate_describe_reply(
 	header = &page.header;
 	if (header->magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
 		|| header->version != CLUSTER_CURRENT_MX_WIRE_VERSION
-		|| header->kind != CLUSTER_CURRENT_MX_DESCRIBE_KIND_FROZEN
+		|| header->kind != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE
 		|| header->flags != CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE
 		|| header->source_node_id != (uint32)expected_source
 		|| header->request_id != expected_request_id

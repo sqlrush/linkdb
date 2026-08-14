@@ -69,12 +69,14 @@
 #include "cluster/cluster_lmon.h"		 /* PGRAC: spec-7.2 D1 READY-publish wakeup */
 #include "cluster/cluster_lms.h"		 /* PGRAC: spec-7.3 D8 per-worker serve counters */
 #include "cluster/cluster_lms_shard.h"	 /* PGRAC: spec-7.3 P2-1 — tag->worker shard */
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_mxid_stripe.h" /* cluster_mxid_is_mine (spec-7.1 D3-b) */
 #include "cluster/cluster_scn.h" /* cluster_scn_current (spec-7.1a authority_scn co-sample) */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_conf.h"			 /* CLUSTER_MAX_NODES (D4-6 owner range) */
 #include "cluster/cluster_tt_durable.h"		 /* resolve_by_xid (D-i4 complete scan) */
+#include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_slot.h"		 /* max_recycle_horizon (D-i4 bound) */
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_authority.h"	 /* authority lookup + block0 prove (D4-6) */
@@ -2982,6 +2984,484 @@ cr_serve_scratch_context(void)
 	return CrServeScratchCtx;
 }
 
+static ClusterMxDescribeResult
+cr_current_mx_build_describe_page(
+	uint16 source_node_id, uint64 request_id, const ClusterCurrentMxKey *key,
+	const MultiXactMember *native_members, int native_count,
+	ClusterCurrentMxDescribeReplyPage *page)
+{
+	ClusterMxDescribeResult result = CMX_DESC_DENIED;
+	int i;
+
+	if (page == NULL)
+		return CMX_DESC_UNKNOWN;
+	memset(page, 0, sizeof(*page));
+	if (key == NULL || request_id == 0 || source_node_id >= CLUSTER_MAX_NODES)
+		return CMX_DESC_UNKNOWN;
+
+	page->header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page->header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page->header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	page->header.result = (uint8)CMX_DESC_DENIED;
+	page->header.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
+	page->header.source_node_id = source_node_id;
+	page->header.request_id = request_id;
+	page->header.mxkey = *key;
+	page->header.wire_length = sizeof(page->header);
+
+	if (native_count > CLUSTER_CURRENT_MX_MAX_MEMBERS) {
+		page->header.result = (uint8)CMX_DESC_SUPPORTED_LIMIT;
+		page->header.total_count = (uint32)native_count;
+		return CMX_DESC_SUPPORTED_LIMIT;
+	}
+	if (native_members == NULL || native_count < 2)
+		return CMX_DESC_DENIED;
+
+	for (i = 0; i < native_count; i++) {
+		page->members[i].xid = native_members[i].xid;
+		page->members[i].member_status = (uint8)native_members[i].status;
+	}
+	if (cluster_multixact_current_validate_descriptor(
+			key, source_node_id, key->cluster_epoch, page->members,
+			(uint16)native_count, (uint32)native_count)
+		== CMX_DESC_OK) {
+		page->header.descriptor_hash
+			= cluster_multixact_current_descriptor_hash(
+				key, page->members, (uint16)native_count);
+		if (page->header.descriptor_hash != 0) {
+			page->header.total_count = (uint32)native_count;
+			page->header.entry_count = (uint16)native_count;
+			page->header.wire_length
+				= sizeof(page->header)
+				  + (uint16)native_count
+						* sizeof(ClusterCurrentMxMemberDesc);
+			page->header.result = (uint8)CMX_DESC_OK;
+			result = CMX_DESC_OK;
+		}
+	}
+	if (result != CMX_DESC_OK) {
+		memset(page->members, 0, sizeof(page->members));
+		page->header.descriptor_hash = 0;
+		page->header.total_count = 0;
+		page->header.entry_count = 0;
+		page->header.wire_length = sizeof(page->header);
+	}
+	return result;
+}
+
+static ClusterMxResolveResult
+cr_current_mx_build_proof_page(
+	uint16 source_node_id, const ClusterCurrentMxProofForwardV2 *request,
+	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
+	ClusterCurrentMxProofReplyPage *page)
+{
+	Size wire_length;
+
+	if (page == NULL)
+		return CMX_RESOLVE_UNKNOWN;
+	memset(page, 0, sizeof(*page));
+	if (request == NULL || request->prefix.request_id == 0
+		|| source_node_id >= CLUSTER_MAX_NODES)
+		return CMX_RESOLVE_UNKNOWN;
+
+	page->header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	page->header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	page->header.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	page->header.result = (uint8)CMX_RESOLVE_DENIED;
+	page->header.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
+	page->header.source_node_id = source_node_id;
+	page->header.request_id = request->prefix.request_id;
+	page->header.mxkey = request->prefix.mxkey;
+	page->header.descriptor_hash
+		= ClusterCurrentMxProofPrefixGetDescriptorHash(&request->prefix);
+	page->header.total_count = request->prefix.total_count;
+	page->header.chunk_ordinal = request->prefix.chunk_ordinal;
+	page->header.chunk_count_minus_one
+		= request->prefix.chunk_count_minus_one;
+	page->header.wire_length = sizeof(page->header);
+
+	if (result == CMX_RESOLVE_TIMEOUT || result > CMX_RESOLVE_UNKNOWN)
+		return CMX_RESOLVE_UNKNOWN;
+	if (result != CMX_RESOLVE_OK) {
+		page->header.result = (uint8)result;
+		return result;
+	}
+	if (proofs == NULL || proof_count != request->prefix.entry_count)
+		return CMX_RESOLVE_UNKNOWN;
+
+	switch ((ClusterCurrentMxProofBodyKind)request->prefix.body_kind) {
+	case CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS:
+		if (proof_count == 0
+			|| proof_count > CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME)
+			return CMX_RESOLVE_UNKNOWN;
+		memcpy(page->body.proofs, proofs, sizeof(*proofs) * proof_count);
+		wire_length = sizeof(page->header) + sizeof(*proofs) * proof_count;
+		break;
+	case CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE:
+		if (proof_count != 1 || updater_proof == NULL)
+			return CMX_RESOLVE_UNKNOWN;
+		page->body.updater.member_proof = proofs[0];
+		page->body.updater.updater_proof = *updater_proof;
+		wire_length = sizeof(page->header) + sizeof(proofs[0])
+					  + sizeof(*updater_proof);
+		break;
+	default:
+		return CMX_RESOLVE_UNKNOWN;
+	}
+
+	page->header.entry_count = proof_count;
+	page->header.wire_length = (uint16)wire_length;
+	page->header.result = (uint8)CMX_RESOLVE_OK;
+	return CMX_RESOLVE_OK;
+}
+
+#ifdef USE_CLUSTER_UNIT
+ClusterMxDescribeResult
+cluster_cr_server_test_current_mx_build_describe_page(
+	uint16 source_node_id, uint64 request_id, const ClusterCurrentMxKey *key,
+	const MultiXactMember *native_members, int native_count,
+	ClusterCurrentMxDescribeReplyPage *page)
+{
+	return cr_current_mx_build_describe_page(
+		source_node_id, request_id, key, native_members, native_count, page);
+}
+
+ClusterMxResolveResult
+cluster_cr_server_test_current_mx_build_proof_page(
+	uint16 source_node_id, const ClusterCurrentMxProofForwardV2 *request,
+	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
+	ClusterCurrentMxProofReplyPage *page)
+{
+	return cr_current_mx_build_proof_page(
+		source_node_id, request, result, proofs, proof_count,
+		updater_proof, page);
+}
+#endif
+
+/* Spec-3.6b: the MXID origin enumerates its own immutable member list and
+ * returns one typed page.  Every validation, fence or connection doubt is a
+ * DENIED page or a dropped send; native pg_multixact bytes never leave. */
+void
+cluster_gcs_current_mx_describe_serve_inline(
+	const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterCurrentMxDescribeForwardV2 request;
+	BufferTag route_tag;
+	MultiXactMember *native_members = NULL;
+	int native_count = -1;
+	int recv_worker;
+	int expected_worker;
+	uint32 capability_generation = 0;
+	uint32 reply_total
+		= (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+	char *reply;
+	GcsBlockReplyHeader *outer;
+	ClusterCurrentMxDescribeReplyPage *page;
+	MemoryContext old_context;
+
+	if (env == NULL || payload == NULL
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| !cluster_multixact_current_wire_validate_describe_forward(
+			payload, env->payload_length, (int32)env->source_node_id,
+			cluster_node_id, cluster_epoch_get_current(), &request))
+		return;
+	route_tag = GcsBlockCurrentMxRouteTagMake(
+		request.prefix.request_id, request.prefix.epoch,
+		request.prefix.original_requester_node,
+		request.prefix.requester_backend_id);
+	recv_worker = cluster_ic_tier1_my_data_channel();
+	expected_worker = cluster_lms_shard_for_tag(
+		&route_tag, cluster_lms_workers);
+	Assert(expected_worker == recv_worker);
+	if (expected_worker != recv_worker)
+		return;
+
+	old_context = MemoryContextSwitchTo(cr_serve_scratch_context());
+	reply = (char *)palloc0(reply_total);
+	outer = (GcsBlockReplyHeader *)reply;
+	page = (ClusterCurrentMxDescribeReplyPage *)(reply + sizeof(*outer));
+	(void)cr_current_mx_build_describe_page(
+		(uint16)cluster_node_id, request.prefix.request_id,
+		&request.prefix.mxkey, NULL, -1, page);
+
+	if ((!cluster_write_fence_enforcing() || cluster_write_fence_allowed())
+		&& cluster_mxid_is_mine(request.prefix.mxkey.multixact_id)) {
+		PG_TRY();
+		{
+			native_count = GetMultiXactIdMembers(
+				request.prefix.mxkey.multixact_id, &native_members,
+				false, false);
+			(void)cr_current_mx_build_describe_page(
+				(uint16)cluster_node_id, request.prefix.request_id,
+				&request.prefix.mxkey, native_members, native_count, page);
+			if (native_members != NULL) {
+				pfree(native_members);
+				native_members = NULL;
+			}
+		}
+		PG_CATCH();
+		{
+			MemoryContextSwitchTo(cr_serve_scratch_context());
+			FlushErrorState();
+			(void)cr_current_mx_build_describe_page(
+				(uint16)cluster_node_id, request.prefix.request_id,
+				&request.prefix.mxkey, NULL, -1, page);
+		}
+		PG_END_TRY();
+	}
+
+	/* Positive bytes sampled before an epoch/fence transition are not
+	 * publishable. */
+	if (cluster_epoch_get_current() != request.prefix.epoch
+		|| (cluster_write_fence_enforcing()
+			&& !cluster_write_fence_allowed()))
+		(void)cr_current_mx_build_describe_page(
+			(uint16)cluster_node_id, request.prefix.request_id,
+			&request.prefix.mxkey, NULL, -1, page);
+
+	outer->request_id = request.prefix.request_id;
+	outer->epoch = request.prefix.epoch;
+	outer->sender_node = cluster_node_id;
+	outer->requester_backend_id = request.prefix.requester_backend_id;
+	outer->transition_id = 0;
+	outer->status
+		= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	outer->checksum
+		= cluster_gcs_block_compute_checksum((const char *)page);
+
+	if (cluster_sf_peer_multixact_current_capability_generation(
+			request.prefix.original_requester_node,
+			&capability_generation)
+		&& cluster_sf_peer_capability_generation_matches(
+			request.prefix.original_requester_node,
+			PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+			capability_generation))
+		(void)cluster_ic_send_envelope(
+			PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+			request.prefix.original_requester_node, reply, reply_total);
+	MemoryContextSwitchTo(old_context);
+	MemoryContextReset(CrServeScratchCtx);
+}
+
+static bool
+cr_current_mx_source_exact_lookup(
+	const ClusterTTStatusKey *key, ClusterTTStatusResult *result,
+	void *arg)
+{
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
+
+	(void)arg;
+	if (key == NULL || result == NULL)
+		return false;
+	memset(&source_request, 0, sizeof(source_request));
+	memset(&source_result, 0, sizeof(source_result));
+	source_request.key = key;
+	if (cluster_tt_status_source_dispatch(
+			CLUSTER_TT_SOURCE_LOOKUP, &source_request, &source_result)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !source_result.bool_value)
+		return false;
+	*result = source_result.lookup;
+	return true;
+}
+
+static bool
+cr_current_mx_source_lookup_current_own_xid(
+	TransactionId xid, ClusterTTStatusKey *key,
+	ClusterTTStatusResult *result)
+{
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
+
+	if (key == NULL || result == NULL)
+		return false;
+	memset(&source_request, 0, sizeof(source_request));
+	memset(&source_result, 0, sizeof(source_result));
+	source_request.xid = xid;
+	if (cluster_tt_status_source_dispatch(
+			CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID,
+			&source_request, &source_result)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !source_result.bool_value)
+		return false;
+	*key = source_result.current_key;
+	*result = source_result.lookup;
+	return true;
+}
+
+/* Spec-3.6b: a member-XID origin proves only its own current TT binding.
+ * Parent following is exact-key only; every uncertainty remains a typed
+ * UNKNOWN/DENIED reply, and publication is capability-generation bound. */
+void
+cluster_gcs_current_mx_member_proof_serve_inline(
+	const ClusterICEnvelope *env, const void *payload)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterCurrentMemberProof proofs
+		[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+	ClusterCurrentUpdaterProof updater_proof;
+	ClusterMxResolveResult proof_result = CMX_RESOLVE_UNKNOWN;
+	BufferTag route_tag;
+	int recv_worker;
+	int expected_worker;
+	uint16 proof_count = 0;
+	uint32 capability_generation = 0;
+	uint32 reply_total
+		= (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+	char *reply;
+	GcsBlockReplyHeader *outer;
+	ClusterCurrentMxProofReplyPage *page;
+	MemoryContext old_context;
+
+	if (env == NULL || payload == NULL
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| !cluster_gcs_block_family_on_data_plane()
+		|| !cluster_multixact_current_wire_validate_proof_forward(
+			payload, env->payload_length, (int32)env->source_node_id,
+			cluster_node_id, cluster_epoch_get_current(), &request))
+		return;
+
+	route_tag = GcsBlockCurrentMxRouteTagMake(
+		request.prefix.request_id, request.prefix.epoch,
+		request.prefix.original_requester_node,
+		request.prefix.requester_backend_id);
+	recv_worker = cluster_ic_tier1_my_data_channel();
+	expected_worker = cluster_lms_shard_for_tag(
+		&route_tag, cluster_lms_workers);
+	Assert(expected_worker == recv_worker);
+	if (expected_worker != recv_worker)
+		return;
+
+	old_context = MemoryContextSwitchTo(cr_serve_scratch_context());
+	reply = (char *)palloc0(reply_total);
+	outer = (GcsBlockReplyHeader *)reply;
+	page = (ClusterCurrentMxProofReplyPage *)(reply + sizeof(*outer));
+	memset(proofs, 0, sizeof(proofs));
+	memset(&updater_proof, 0, sizeof(updater_proof));
+	updater_proof.verdict = CUCP_UNKNOWN;
+
+	if (!cluster_write_fence_enforcing()
+		|| cluster_write_fence_allowed()) {
+		PG_TRY();
+		{
+			uint8 i;
+
+			if (request.prefix.body_kind
+					== CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS) {
+				proof_result = CMX_RESOLVE_OK;
+				for (i = 0; i < request.prefix.entry_count; i++) {
+					const ClusterCurrentMxProofAskWire *ask
+						= &request.trailer.body.asks[i];
+					ClusterTTStatusKey initial_key;
+					ClusterTTStatusResult initial_result;
+
+					if (!cr_current_mx_source_lookup_current_own_xid(
+							ask->xid, &initial_key, &initial_result)
+						|| !cluster_multixact_current_resolve_origin_member_proof(
+							ask->xid, ask->member_status,
+							ask->member_ordinal, (uint16)cluster_node_id,
+							request.prefix.mxkey.cluster_epoch, false,
+							&initial_key, &initial_result,
+							cr_current_mx_source_exact_lookup, NULL,
+							&proofs[i])) {
+						proof_result = CMX_RESOLVE_UNKNOWN;
+						break;
+					}
+				}
+				if (proof_result == CMX_RESOLVE_OK)
+					proof_count = request.prefix.entry_count;
+			} else {
+				const ClusterCurrentMxUpdaterChallengeWire *challenge
+					= &request.trailer.body.updater.challenge;
+				ClusterTTStatusKey initial_key;
+				ClusterTTStatusResult initial_result;
+				ClusterUpdaterCandidateVerdict candidate_verdict;
+
+				candidate_verdict
+					= cluster_multixact_current_updater_candidate_verdict(
+						&challenge->candidate_next_xmin_key,
+						challenge->updater_xid,
+						(uint16)cluster_node_id,
+						request.prefix.mxkey.cluster_epoch,
+						&initial_key, &initial_result);
+				if (candidate_verdict != CUCP_UNKNOWN
+					&& cluster_multixact_current_resolve_origin_member_proof(
+						challenge->updater_xid,
+						challenge->member_status,
+						challenge->member_ordinal,
+						(uint16)cluster_node_id,
+						request.prefix.mxkey.cluster_epoch, false,
+						&initial_key, &initial_result,
+						cr_current_mx_source_exact_lookup, NULL,
+						&proofs[0])) {
+					updater_proof.mxkey = request.prefix.mxkey;
+					updater_proof.candidate_next_xmin_key
+						= challenge->candidate_next_xmin_key;
+					updater_proof.updater_xid = challenge->updater_xid;
+					updater_proof.member_ordinal
+						= challenge->member_ordinal;
+					updater_proof.verdict = candidate_verdict;
+					proof_count = 1;
+					proof_result = CMX_RESOLVE_OK;
+				}
+			}
+		}
+		PG_CATCH();
+		{
+			proof_result = CMX_RESOLVE_DENIED;
+			MemoryContextSwitchTo(cr_serve_scratch_context());
+			FlushErrorState();
+		}
+		PG_END_TRY();
+	} else
+		proof_result = CMX_RESOLVE_DENIED;
+
+	if (cluster_epoch_get_current() != request.prefix.epoch
+		|| (cluster_write_fence_enforcing()
+			&& !cluster_write_fence_allowed()))
+		proof_result = CMX_RESOLVE_DENIED;
+	if (cr_current_mx_build_proof_page(
+			(uint16)cluster_node_id, &request, proof_result, proofs,
+			proof_count, &updater_proof, page)
+		!= proof_result) {
+		proof_result = CMX_RESOLVE_UNKNOWN;
+		(void)cr_current_mx_build_proof_page(
+			(uint16)cluster_node_id, &request, proof_result, NULL, 0,
+			NULL, page);
+	}
+
+	outer->request_id = request.prefix.request_id;
+	outer->epoch = request.prefix.epoch;
+	outer->sender_node = cluster_node_id;
+	outer->requester_backend_id = request.prefix.requester_backend_id;
+	outer->transition_id = 0;
+	outer->status
+		= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	outer->checksum
+		= cluster_gcs_block_compute_checksum((const char *)page);
+
+	if (cluster_sf_peer_multixact_current_capability_generation(
+			request.prefix.original_requester_node,
+			&capability_generation)
+		&& cluster_sf_peer_capability_generation_matches(
+			request.prefix.original_requester_node,
+			PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+			capability_generation))
+		(void)cluster_ic_send_envelope(
+			PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+			request.prefix.original_requester_node, reply, reply_total);
+	MemoryContextSwitchTo(old_context);
+	MemoryContextReset(CrServeScratchCtx);
+}
+
 /*
  * cluster_gcs_block_forward_serve_inline — spec-7.3 D6 entry.  When the GCS
  * block family is on the DATA plane, the worker[shard] that received a
@@ -3188,28 +3668,6 @@ inline_deny_no_serve:
 	MemoryContextSwitchTo(old);
 	MemoryContextReset(CrServeScratchCtx);
 	cluster_lms_obs_note_direct_reply(); /* spec-7.3 D8 */
-}
-
-/*
- * Current-MultiXact descriptor transport remains closed until the frozen
- * Spec-3.6b reply values (21/22) are reconciled with R4's later reserved
- * 21..26 reply domain.  Keep the already-exported call surface link-complete,
- * but do not manufacture a wire status, route, descriptor or partial output.
- */
-ClusterMxDescribeResult
-cluster_gcs_current_mx_describe_fetch_and_wait(
-	int32 origin_node pg_attribute_unused(),
-	const ClusterCurrentMxKey *key pg_attribute_unused(),
-	ClusterCurrentMxMemberDesc *members, uint16 members_cap,
-	uint16 *members_count, uint32 *reported_total_members)
-{
-	if (members != NULL && members_cap > 0)
-		memset(members, 0, sizeof(*members) * members_cap);
-	if (members_count != NULL)
-		*members_count = 0;
-	if (reported_total_members != NULL)
-		*reported_total_members = 0;
-	return CMX_DESC_UNKNOWN;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

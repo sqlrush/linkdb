@@ -525,6 +525,33 @@ extern void cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload 
 extern ClusterMxDescribeResult cluster_gcs_current_mx_describe_fetch_and_wait(
 	int32 origin_node, const ClusterCurrentMxKey *key, ClusterCurrentMxMemberDesc *members,
 	uint16 members_cap, uint16 *members_count, uint32 *reported_total_members);
+extern void cluster_gcs_current_mx_describe_serve_inline(
+	const struct ClusterICEnvelope *env, const void *payload);
+extern void cluster_gcs_current_mx_member_proof_serve_inline(
+	const struct ClusterICEnvelope *env, const void *payload);
+#ifdef USE_CLUSTER_UNIT
+struct ClusterCurrentMxDescribeReplyPage;
+extern ClusterMxDescribeResult
+cluster_cr_server_test_current_mx_build_describe_page(
+	uint16 source_node_id, uint64 request_id, const ClusterCurrentMxKey *key,
+	const MultiXactMember *native_members, int native_count,
+	struct ClusterCurrentMxDescribeReplyPage *page);
+#endif
+struct ClusterCurrentMxProofForwardV2;
+extern ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait(
+	int32 origin_node, struct ClusterCurrentMxProofForwardV2 *request,
+	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
+	ClusterCurrentUpdaterProof *updater_proof);
+#ifdef USE_CLUSTER_UNIT
+struct ClusterCurrentMxProofReplyPage;
+extern ClusterMxResolveResult
+cluster_cr_server_test_current_mx_build_proof_page(
+	uint16 source_node_id,
+	const struct ClusterCurrentMxProofForwardV2 *request,
+	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
+	struct ClusterCurrentMxProofReplyPage *page);
+#endif
 
 typedef enum ClusterR4SourceCrOp { CLUSTER_R4_SOURCE_CR_FETCH = 0 } ClusterR4SourceCrOp;
 

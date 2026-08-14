@@ -25,14 +25,7 @@
 #define CLUSTER_CURRENT_MX_WIRE_MAGIC ((uint32)0x5047434d)
 #define CLUSTER_CURRENT_MX_WIRE_VERSION 1
 #define CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE 0
-/*
- * Historical Spec 3.6b value used only by the pure validator while the
- * discovered R4 reserved_0[6]=6 collision awaits user-approved migration.
- * No generic router may consume this constant.
- */
-#define CLUSTER_CURRENT_MX_DESCRIBE_KIND_FROZEN 6
 #define CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE 128
-#define CLUSTER_CURRENT_MX_MEMBER_PROOF_KIND_FROZEN 7
 #define CLUSTER_CURRENT_MX_PROOF_FORWARD_SIZE 128
 #define CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME 7
 
@@ -155,6 +148,51 @@ typedef struct ClusterCurrentMxDescribeReplyPage {
 	uint8 reserved[CLUSTER_CURRENT_MX_DESCRIBE_REPLY_RESERVED_SIZE];
 } ClusterCurrentMxDescribeReplyPage;
 
+typedef struct ClusterCurrentMxProofReplyHeader {
+	uint32 magic;
+	uint16 version;
+	uint8 kind;
+	uint8 result;
+	uint32 flags;
+	uint32 source_node_id;
+	uint64 request_id;
+	ClusterCurrentMxKey mxkey;
+	uint64 descriptor_hash;
+	uint32 total_count;
+	uint16 entry_count;
+	uint8 chunk_ordinal;
+	uint8 chunk_count_minus_one;
+	uint16 wire_length;
+	uint16 reserved16;
+	uint32 reserved32;
+} ClusterCurrentMxProofReplyHeader;
+
+typedef struct ClusterCurrentMxUpdaterProofReplyBodyWire {
+	ClusterCurrentMemberProof member_proof;
+	ClusterCurrentUpdaterProof updater_proof;
+	uint8 reserved[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
+					   * sizeof(ClusterCurrentMemberProof)
+				   - sizeof(ClusterCurrentMemberProof)
+				   - sizeof(ClusterCurrentUpdaterProof)];
+} ClusterCurrentMxUpdaterProofReplyBodyWire;
+
+typedef union ClusterCurrentMxProofReplyBodyWire {
+	ClusterCurrentMemberProof proofs[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+	ClusterCurrentMxUpdaterProofReplyBodyWire updater;
+	uint8 raw[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
+			  * sizeof(ClusterCurrentMemberProof)];
+} ClusterCurrentMxProofReplyBodyWire;
+
+#define CLUSTER_CURRENT_MX_PROOF_REPLY_RESERVED_SIZE                                           \
+	(BLCKSZ - sizeof(ClusterCurrentMxProofReplyHeader)                                          \
+	 - sizeof(ClusterCurrentMxProofReplyBodyWire))
+
+typedef struct ClusterCurrentMxProofReplyPage {
+	ClusterCurrentMxProofReplyHeader header;
+	ClusterCurrentMxProofReplyBodyWire body;
+	uint8 reserved[CLUSTER_CURRENT_MX_PROOF_REPLY_RESERVED_SIZE];
+} ClusterCurrentMxProofReplyPage;
+
 StaticAssertDecl(sizeof(ClusterCurrentMxDescribePrefixWire) == sizeof(GcsBlockForwardPayload),
 				 "current MX describe prefix must preserve the shipped 64-byte frame");
 StaticAssertDecl(offsetof(ClusterCurrentMxDescribePrefixWire, request_id)
@@ -213,6 +251,20 @@ StaticAssertDecl(offsetof(ClusterCurrentMxDescribeReplyPage, members) == 64,
 				 "current MX describe members must begin at byte 64");
 StaticAssertDecl(sizeof(ClusterCurrentMxDescribeReplyPage) == BLCKSZ,
 				 "current MX describe reply must fill one GCS page");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofReplyHeader) == 64,
+				 "current MX proof reply header must remain 64 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMxUpdaterProofReplyBodyWire)
+					 == CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
+							* sizeof(ClusterCurrentMemberProof),
+				 "current MX updater proof reply body size changed");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofReplyBodyWire)
+					 == CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
+							* sizeof(ClusterCurrentMemberProof),
+				 "current MX proof reply body size changed");
+StaticAssertDecl(offsetof(ClusterCurrentMxProofReplyPage, body) == 64,
+				 "current MX proof reply body must begin at byte 64");
+StaticAssertDecl(sizeof(ClusterCurrentMxProofReplyPage) == BLCKSZ,
+				 "current MX proof reply must fill one GCS page");
 
 static inline void
 ClusterCurrentMxProofPrefixSetDescriptorHash(ClusterCurrentMxProofPrefixWire *prefix, uint64 hash)
@@ -260,5 +312,15 @@ extern ClusterMxResolveResult cluster_multixact_current_wire_build_proof_request
 	const ClusterCurrentUpdaterChallenge *challenge, uint64 request_id, uint64 current_epoch,
 	int32 requester_node, int32 requester_backend_id, ClusterCurrentMxProofRequestPlan *plans,
 	uint16 plans_cap, uint16 *plan_count);
+extern ClusterMxResolveResult cluster_multixact_current_wire_validate_proof_reply(
+	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
+	const ClusterCurrentMxProofForwardV2 *expected_request,
+	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
+	ClusterCurrentUpdaterProof *updater_proof);
+extern bool cluster_multixact_current_wire_validate_proof_reply_frame(
+	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
+	const ClusterCurrentMxProofForwardV2 *expected_request, ClusterMxResolveResult *result,
+	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
+	ClusterCurrentUpdaterProof *updater_proof);
 
 #endif /* CLUSTER_MULTIXACT_CURRENT_WIRE_H */
