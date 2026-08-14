@@ -2259,9 +2259,74 @@ UT_TEST(test_93daa_member_accumulates_sample_and_closes_barrier)
 		test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET)), UINT64_C(8));
 	UT_ASSERT_EQ(pg_atomic_read_u32(
 		test_gate_u32(TEST_GATE_CLOSED_OFFSET)), UINT32_C(1));
+	UT_ASSERT(semantic_activation_lmon_record_read_seq != 0);
+	for (node = 0; node < 3; node++)
+		UT_ASSERT_EQ(test_send_calls[node], 3);
+
+	cluster_semantic_activation_lmon_tick();
+	memset(&read_request, 0, sizeof(read_request));
+	if (!cluster_semantic_activation_qvotec_poll_record_read(
+			&read_request)) {
+		UT_ASSERT(false);
+		test_gate_reset();
+		return;
+	}
+	memset(&prepare, 0, sizeof(prepare));
+	prepare.phase = CLUSTER_SEMANTIC_PHASE_COMMIT;
+	prepare.record_generation = 9;
+	prepare.transition_epoch = test_current_epoch;
+	prepare.coordinator_node = 0;
+	prepare.coordinator_incarnation
+		= table.expected[0].admitted_incarnation;
+	prepare.admitted_members_lo = UINT64_C(0x0f);
+	prepare.target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	prepare.capability_sample_digest = digest;
+	UT_ASSERT(cluster_semantic_activation_record_encode(
+		&prepare, record_bytes));
+	UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_read(
+		read_request.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK,
+		false, record_bytes));
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(pg_atomic_read_u64(
+		test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET)), UINT64_C(9));
+	UT_ASSERT_EQ(pg_atomic_read_u32(
+		test_gate_u32(TEST_GATE_CLOSED_OFFSET)), UINT32_C(1));
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED);
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0));
 	UT_ASSERT_EQ(semantic_activation_lmon_record_read_seq, UINT64_C(0));
 	for (node = 0; node < 3; node++)
 		UT_ASSERT_EQ(test_send_calls[node], 3);
+
+	/* Model only the already-separated successful apply_target_closed return;
+	 * the real descriptor remains fail-closed until its owner census exists. */
+	UT_ASSERT(semantic_activation_ack_lmon_finish_member_prepared(
+		&table, CLUSTER_SEMANTIC_ACTIVATION_OK));
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED);
+	UT_ASSERT_EQ(table.flags,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID);
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0x08));
+	UT_ASSERT(semantic_activation_ack_matches(
+		&table.observed[3], &table.expected[3]));
+	for (node = 0; node < 3; node++) {
+		ClusterSemanticActivationAckWireV1 sent;
+
+		UT_ASSERT_EQ(test_send_calls[node], 4);
+		UT_ASSERT(cluster_semantic_activation_ack_wire_decode(
+			test_send_payloads[node], &sent));
+		UT_ASSERT_EQ(sent.kind,
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK);
+		UT_ASSERT_EQ(sent.stage,
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED);
+		UT_ASSERT_EQ(sent.result,
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK);
+		UT_ASSERT_EQ(sent.member_node, UINT32_C(3));
+		UT_ASSERT_EQ(sent.record_generation, UINT64_C(9));
+	}
 	test_gate_reset();
 }
 
