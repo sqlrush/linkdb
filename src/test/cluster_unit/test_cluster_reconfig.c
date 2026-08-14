@@ -2777,7 +2777,9 @@ ut_stage_join_commit_with_prior_excluded(bool owner_gate)
 	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(1, CLUSTER_MEMBER_JOINING);
 	cluster_membership_record_admitted(1, UINT64_C(70));
+	state->pending_join_bitmap[0] = UINT8_C(0x02);
 	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(1), 0);
+	ut_dead_generation = UINT64_C(9);
 
 	memset(&applied, 0, sizeof(applied));
 	applied.event_id = UINT64_C(501);
@@ -2789,6 +2791,11 @@ ut_stage_join_commit_with_prior_excluded(bool owner_gate)
 	cluster_reconfig_publish_event(&applied);
 
 	ut_owner_rejoin_result = owner_gate;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
+	MyBackendType = B_LMON;
+	ut_fence_async_submit_ok = true;
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_PENDING;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 	UT_ASSERT(!cluster_reconfig_commit_member(1, UINT64_C(77)));
 	memset(slot, 0, sizeof(slot));
 	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
@@ -2805,10 +2812,31 @@ UT_TEST(test_join_commit_clears_only_owner_after_root_rejoin_gate)
 	UT_ASSERT_EQ(ut_owner_rejoin_calls, 1);
 	UT_ASSERT_EQ(ut_owner_rejoin_node, 1);
 	UT_ASSERT_EQ(ut_owner_rejoin_incarnation, UINT64_C(77));
+	UT_ASSERT(ut_fence_async_marker_captured);
+	UT_ASSERT(cluster_fence_marker_valid_v1(&ut_fence_async_marker));
+	UT_ASSERT_EQ((int)ut_fence_async_marker.marker_kind,
+				 (int)CLUSTER_FENCE_MARKER_KIND_BASELINE);
+	UT_ASSERT_EQ(ut_fence_async_marker.fenced_dead_bitmap[0], UINT8_C(0x04));
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ(applied.event_id, UINT64_C(501));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_JOINING);
+
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
+	cluster_reconfig_lmon_tick();
 	cluster_reconfig_get_last_event(&applied);
 	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
+	UT_ASSERT_EQ(ut_fence_async_marker.fence_epoch, applied.new_epoch);
+	UT_ASSERT_EQ(ut_fence_async_marker.fence_event_id, applied.event_id);
+	UT_ASSERT_EQ(ut_fence_async_marker.fence_generation,
+				 applied.cssd_dead_generation);
+	UT_ASSERT_EQ(ut_fence_async_marker.issuer_node_id,
+				 applied.coordinator_node_id);
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x02)) == 0);
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x04)) != 0);
+	MyBackendType = B_INVALID;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
 	cluster_online_join = false;
 }
 
@@ -2824,6 +2852,28 @@ UT_TEST(test_join_commit_root_gate_failure_keeps_owner_excluded)
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x02)) != 0);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
 				 (int)CLUSTER_MEMBER_JOINING);
+	MyBackendType = B_INVALID;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
+	cluster_online_join = false;
+}
+
+UT_TEST(test_join_commit_fence_ack_failure_keeps_owner_excluded)
+{
+	ReconfigEvent applied;
+
+	ut_stage_join_commit_with_prior_excluded(true);
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT(ut_fence_async_marker_captured);
+	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
+	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+	cluster_reconfig_lmon_tick();
+	cluster_reconfig_get_last_event(&applied);
+	UT_ASSERT_EQ(applied.event_id, UINT64_C(501));
+	UT_ASSERT_EQ(applied.dead_bitmap[0], UINT8_C(0x06));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_JOINING);
+	MyBackendType = B_INVALID;
+	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
 	cluster_online_join = false;
 }
 
@@ -4120,7 +4170,7 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
 int
 main(void)
 {
-	UT_PLAN(75);
+	UT_PLAN(76);
 
 	/* T-reconfig-1 */
 	UT_RUN(test_reconfig_dead_bitmap_bytes_eq_16);
@@ -4213,6 +4263,7 @@ main(void)
 	UT_RUN(test_reconfig_region3_mailbox_preserves_v2_and_canonical_v3);
 	UT_RUN(test_join_commit_clears_only_owner_after_root_rejoin_gate);
 	UT_RUN(test_join_commit_root_gate_failure_keeps_owner_excluded);
+	UT_RUN(test_join_commit_fence_ack_failure_keeps_owner_excluded);
 	UT_RUN(test_join_pending_preserves_full_prior_excluded_set);
 	UT_RUN(test_survivor_join_observation_requires_root_rejoin_gate);
 	UT_RUN(test_survivor_join_observation_clears_only_gated_origin);

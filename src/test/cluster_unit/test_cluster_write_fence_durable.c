@@ -275,6 +275,46 @@ UT_TEST(test_durable_majority_and_total_counts)
 	remove_three_disks(paths);
 }
 
+UT_TEST(test_join_baseline_majority_replaces_prior_failstop_tuple)
+{
+	char paths[3][MAXPGPATH];
+	char config[MAXPGPATH * 3 + 3];
+	ClusterFenceAuthorityProof proof;
+	ClusterFenceMarker prior;
+	ClusterFenceMarker joined;
+
+	reset_mock();
+	three_disk_config(config, paths);
+	prior = valid_marker(8, 8, UINT64_C(0xAA));
+	prior.issuer_node_id = 0;
+	prior.fenced_dead_bitmap[0] = UINT8_C(0x06); /* owner 1 + unrelated 2 */
+	joined = valid_marker(9, 9, UINT64_C(0xBB));
+	joined.issuer_node_id = 0;
+	joined.fenced_dead_bitmap[0] = UINT8_C(0x04); /* admit only owner 1 */
+	joined.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+
+	/* Two distinct disks carry the prospective JOIN tuple while one still
+	 * carries the prior FAIL_STOP tuple: the direct reader must choose the new
+	 * majority without losing the unrelated excluded origin. */
+	mock_slots[0][0] = joined;
+	mock_slots[1][0] = joined;
+	mock_slots[2][0] = prior;
+	mock_slot_present[0][0] = true;
+	mock_slot_present[1][0] = true;
+	mock_slot_present[2][0] = true;
+	UT_ASSERT_EQ(cluster_write_fence_read_durable_authority(&proof),
+				 CLUSTER_FENCE_AUTHORITY_OK);
+	UT_ASSERT_EQ(proof.marker.fence_epoch, UINT64_C(9));
+	UT_ASSERT_EQ(proof.marker.fence_generation, UINT64_C(9));
+	UT_ASSERT_EQ(proof.marker.fence_event_id, UINT64_C(0xBB));
+	UT_ASSERT_EQ(proof.marker.fenced_dead_bitmap[0], UINT8_C(0x04));
+	UT_ASSERT_EQ((int)proof.marker.marker_kind,
+				 (int)CLUSTER_FENCE_MARKER_KIND_BASELINE);
+	UT_ASSERT_EQ(proof.agree_disk_count, 2);
+	UT_ASSERT_EQ(proof.total_disk_count, 3);
+	remove_three_disks(paths);
+}
+
 UT_TEST(test_unreadable_disk_stays_in_denominator)
 {
 	char paths[3][MAXPGPATH];
@@ -333,10 +373,11 @@ UT_TEST(test_split_mixed_and_equal_order_divergence)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_typed_preconditions_preserve_output);
 	UT_RUN(test_strict_config_rejects_empty_and_physical_duplicate);
 	UT_RUN(test_durable_majority_and_total_counts);
+	UT_RUN(test_join_baseline_majority_replaces_prior_failstop_tuple);
 	UT_RUN(test_unreadable_disk_stays_in_denominator);
 	UT_RUN(test_split_mixed_and_equal_order_divergence);
 	UT_RUN(test_owner_import_runtime_reads_every_distinct_disk);

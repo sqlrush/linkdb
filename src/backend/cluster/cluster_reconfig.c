@@ -142,10 +142,15 @@ typedef struct ClusterReconfigJoinPrepareStage {
 
 typedef struct ClusterReconfigJoinCommitStage {
 	ClusterMarkerAsync async;
+	ClusterMarkerAsync fence_async;
 	ClusterJoinCommitMarker marker;
+	ClusterFenceMarker fence_marker;
+	ReconfigEvent event;
+	uint64 expected_last_event_id;
 	int32 node_id;
 	uint64 admitted_incarnation;
 	bool submitted;
+	bool fence_ready;
 } ClusterReconfigJoinCommitStage;
 
 static ClusterReconfigFenceStage failstop_fence_stage;
@@ -2010,8 +2015,9 @@ cluster_reconfig_release_fence_stage(ClusterReconfigFenceStage *stage)
  *	spec-4.6a section 0 shape, here triggered by the coordinator on ITSELF
  *	— even in a 2-node cluster with no IC piggyback).  While any pre-bump
  *	stage is live the GRD IDLE tick must hold its last stable (genuine
- *	pre-reconfig) baseline instead of re-capturing.  join Phase-2 COMMITTED
- *	does not pre-bump, so it is intentionally excluded.
+ *	pre-reconfig) baseline instead of re-capturing.  JOIN Phase-2 now also
+ *	keeps the shared bit set across its bump -> durable-baseline -> publish
+ *	window, so it needs no separate process-local flag here.
  */
 bool
 cluster_reconfig_has_pending_prebump_stage(void)
@@ -2275,51 +2281,76 @@ cluster_reconfig_poll_join_prepare_stage(void)
 static void
 cluster_reconfig_release_join_commit_stage(void)
 {
+	bool had_prebump = join_commit_stage.fence_ready;
+
 	cluster_marker_async_release_stage(&join_commit_stage.async);
+	cluster_marker_async_release_stage(&join_commit_stage.fence_async);
 	memset(&join_commit_stage.marker, 0, sizeof(join_commit_stage.marker));
+	memset(&join_commit_stage.fence_marker, 0,
+		   sizeof(join_commit_stage.fence_marker));
+	memset(&join_commit_stage.event, 0, sizeof(join_commit_stage.event));
+	join_commit_stage.expected_last_event_id = 0;
 	join_commit_stage.node_id = -1;
 	join_commit_stage.admitted_incarnation = 0;
 	join_commit_stage.submitted = false;
+	join_commit_stage.fence_ready = false;
+	if (had_prebump)
+		cluster_reconfig_set_prebump_sync_active(0);
 }
 
 static bool
-cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
+cluster_reconfig_prepare_join_commit(int32 node_id, uint64 admitted_incarnation,
 									 uint64 expected_epoch)
 {
 	uint64 old_epoch, new_epoch;
 	XLogRecPtr lsn;
-	ReconfigEvent evt;
 	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 	uint8 remaining_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 incs[CLUSTER_MAX_NODES];
+	uint64 cssd_dead_generation;
+	uint64 expected_last_event_id;
+	ReconfigEvent evt;
+	ClusterFenceMarker fence_marker;
+	int b;
 
 	if (cluster_epoch_get_current() + 1 != expected_epoch)
 		return false;
 
+	/* The durable JCMK and ROOT gate authorize only the still-pending owner.
+	 * Snapshot the exact predecessor before advancing the epoch; the publish
+	 * side revalidates it after the baseline marker reaches a majority. */
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	if (cluster_membership_get_state(node_id) != CLUSTER_MEMBER_JOINING
+		|| !dead_bitmap_test_bit(ReconfigShmem->pending_join_bitmap, node_id)) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	expected_last_event_id = ReconfigShmem->last_applied.event_id;
+	memcpy(remaining_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(remaining_dead));
+	memcpy(removed_bitmap, ReconfigShmem->removed_bitmap,
+		   sizeof(removed_bitmap));
+	LWLockRelease(&ReconfigShmem->lock);
+	remaining_dead[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
+	cssd_dead_generation = cluster_cssd_get_dead_generation();
+
 	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-marker-durable");
 
+	/* This is now a pre-bump staged path: keep GRD/cache readers unavailable
+	 * until the matching majority-durable baseline is either published or the
+	 * attempt fails closed. */
+	cluster_reconfig_set_prebump_sync_active(1);
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
-	if (new_epoch != expected_epoch)
+	if (new_epoch != expected_epoch) {
+		cluster_reconfig_set_prebump_sync_active(0);
 		return false;
+	}
 	lsn = GetXLogInsertRecPtr();
 	cluster_epoch_set_changed_at_lsn((uint64)lsn);
 	cluster_gcs_block_on_epoch_advance(new_epoch);
 	cluster_sinval_reset_all_on_reconfig();
 	cluster_tt_status_flush_all((uint32)new_epoch);
-
-	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-	cluster_write_fence_authority_cache_invalidate();
-	memcpy(remaining_dead, ReconfigShmem->last_applied.dead_bitmap,
-		   sizeof(remaining_dead));
-	remaining_dead[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
-	cluster_membership_set_state(node_id, CLUSTER_MEMBER_MEMBER);
-	cluster_membership_record_admitted(node_id, admitted_incarnation);
-	ReconfigShmem->pending_join_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
-	LWLockRelease(&ReconfigShmem->lock);
-
-	if (cluster_reconfig_is_clean_departed(node_id))
-		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_cleared_count, 1);
-	cluster_reconfig_clear_clean_departed(node_id);
 
 	dead_bitmap_set_bit(jb, node_id);
 	memset(incs, 0, sizeof(incs));
@@ -2328,7 +2359,7 @@ cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
 	memset(&evt, 0, sizeof(evt));
 	evt.event_id = cluster_reconfig_compute_event_id_v2(
 		RECONFIG_KIND_JOIN_COMMITTED, remaining_dead, jb, incs,
-		cluster_cssd_get_dead_generation());
+		cssd_dead_generation);
 	evt.coordinator_node_id = cluster_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
@@ -2336,11 +2367,133 @@ cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
 	memcpy(evt.join_bitmap, jb, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
-	evt.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	evt.cssd_dead_generation = cssd_dead_generation;
 	evt.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
-	cluster_reconfig_publish_event(&evt);
-	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
 
+	memset(&fence_marker, 0, sizeof(fence_marker));
+	fence_marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+	fence_marker.version = CLUSTER_FENCE_MARKER_VERSION;
+	fence_marker.fence_epoch = new_epoch;
+	fence_marker.fence_event_id = evt.event_id;
+	fence_marker.fence_generation = cssd_dead_generation;
+	fence_marker.issuer_node_id = cluster_node_id;
+	/* A JOIN shrinks the excluded set, so this is the new membership baseline,
+	 * including every still-dead and permanently removed origin.  BASELINE is
+	 * valid even when the admitted owner was the final excluded origin. */
+	fence_marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		fence_marker.fenced_dead_bitmap[b]
+			= remaining_dead[b] | removed_bitmap[b];
+
+	join_commit_stage.event = evt;
+	join_commit_stage.fence_marker = fence_marker;
+	join_commit_stage.expected_last_event_id = expected_last_event_id;
+	join_commit_stage.fence_async.has_staged_event = true;
+	join_commit_stage.fence_async.staged_expect_epoch = new_epoch;
+	join_commit_stage.fence_ready = true;
+
+	return true;
+}
+
+static bool
+cluster_reconfig_publish_prepared_join_commit(void)
+{
+	uint8 expected_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 expected_fenced[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	bool publish = false;
+	int b;
+
+	if (!join_commit_stage.fence_ready
+		|| cluster_epoch_get_current() != join_commit_stage.event.new_epoch)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	memcpy(expected_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(expected_dead));
+	expected_dead[join_commit_stage.node_id / 8]
+		&= (uint8) ~(1u << (join_commit_stage.node_id % 8));
+	for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		expected_fenced[b] = expected_dead[b] | ReconfigShmem->removed_bitmap[b];
+
+	if (cluster_membership_get_state(join_commit_stage.node_id)
+			== CLUSTER_MEMBER_JOINING
+		&& dead_bitmap_test_bit(ReconfigShmem->pending_join_bitmap,
+								join_commit_stage.node_id)
+		&& ReconfigShmem->last_applied.event_id
+			   == join_commit_stage.expected_last_event_id
+		&& memcmp(expected_dead, join_commit_stage.event.dead_bitmap,
+				  sizeof(expected_dead)) == 0
+		&& memcmp(expected_fenced,
+				  join_commit_stage.fence_marker.fenced_dead_bitmap,
+				  sizeof(expected_fenced)) == 0) {
+		cluster_write_fence_authority_cache_invalidate();
+		cluster_membership_set_state(join_commit_stage.node_id,
+								 CLUSTER_MEMBER_MEMBER);
+		cluster_membership_record_admitted(
+			join_commit_stage.node_id,
+			join_commit_stage.admitted_incarnation);
+		ReconfigShmem->pending_join_bitmap[join_commit_stage.node_id / 8]
+			&= (uint8) ~(1u << (join_commit_stage.node_id % 8));
+		publish = true;
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if (!publish)
+		return false;
+	if (cluster_reconfig_is_clean_departed(join_commit_stage.node_id))
+		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_cleared_count, 1);
+	cluster_reconfig_clear_clean_departed(join_commit_stage.node_id);
+	cluster_reconfig_publish_event(&join_commit_stage.event);
+	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
+	return true;
+}
+
+static bool
+cluster_reconfig_poll_join_fence_stage(TimestampTz now)
+{
+	uint32 result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	ClusterMarkerPollResult pr;
+
+	if (!cluster_marker_async_is_submitted(&join_commit_stage.fence_async)) {
+		if (!cluster_write_fence_submit_marker_async(
+				&join_commit_stage.fence_async,
+				&join_commit_stage.fence_marker,
+				CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+				join_commit_stage.node_id, now))
+			return true;
+		return true;
+	}
+
+	pr = cluster_write_fence_poll_marker_async(&join_commit_stage.fence_async,
+										 now, &result, &elapsed_us);
+	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+		return true;
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+										 join_commit_stage.node_id,
+										 elapsed_us);
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
+
+	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+									  join_commit_stage.node_id,
+									  elapsed_us);
+	if (result != CLUSTER_FENCE_MARKER_SUBMIT_ACK
+		|| !cluster_reconfig_publish_prepared_join_commit()) {
+		ereport(LOG,
+				(errmsg("cluster membership: JOIN baseline marker for node %d did not "
+						"reach a voting-disk majority or its predecessor changed; "
+						"not committing (will retry)",
+						join_commit_stage.node_id)));
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
+
+	cluster_reconfig_release_join_commit_stage();
 	return true;
 }
 
@@ -2358,6 +2511,8 @@ cluster_reconfig_poll_join_commit_stage(void)
 		return false;
 
 	now = GetCurrentTimestamp();
+	if (join_commit_stage.fence_ready)
+		return cluster_reconfig_poll_join_fence_stage(now);
 	if (!join_commit_stage.submitted) {
 		if (!cluster_reconfig_submit_join_marker_async(
 				&join_commit_stage.async, join_commit_stage.node_id, &join_commit_stage.marker,
@@ -2397,7 +2552,7 @@ cluster_reconfig_poll_join_commit_stage(void)
 			   != CLUSTER_JOIN_ACCEPT
 		|| !cluster_recovery_owner_rejoin_v1(join_commit_stage.node_id,
 										 join_commit_stage.admitted_incarnation)
-		|| !cluster_reconfig_publish_join_commit(join_commit_stage.node_id,
+		|| !cluster_reconfig_prepare_join_commit(join_commit_stage.node_id,
 												 join_commit_stage.admitted_incarnation,
 												 join_commit_stage.async.staged_expect_epoch)) {
 		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
@@ -2405,6 +2560,10 @@ cluster_reconfig_poll_join_commit_stage(void)
 		return true;
 	}
 
+	if (cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON)
+		return cluster_reconfig_poll_join_fence_stage(now);
+	if (!cluster_reconfig_publish_prepared_join_commit())
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
 	cluster_reconfig_release_join_commit_stage();
 	return true;
 }
@@ -6436,12 +6595,19 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 
 	if (join_commit_stage.async.has_staged_event)
 		return false;
+	cluster_marker_async_init(&join_commit_stage.async);
+	cluster_marker_async_init(&join_commit_stage.fence_async);
 	join_commit_stage.marker = m;
+	memset(&join_commit_stage.fence_marker, 0,
+		   sizeof(join_commit_stage.fence_marker));
+	memset(&join_commit_stage.event, 0, sizeof(join_commit_stage.event));
+	join_commit_stage.expected_last_event_id = 0;
 	join_commit_stage.node_id = node_id;
 	join_commit_stage.admitted_incarnation = admitted_incarnation;
 	join_commit_stage.async.has_staged_event = true;
 	join_commit_stage.async.staged_expect_epoch = m.admitted_epoch;
 	join_commit_stage.submitted = false;
+	join_commit_stage.fence_ready = false;
 	(void)cluster_reconfig_poll_join_commit_stage();
 
 	return false;
