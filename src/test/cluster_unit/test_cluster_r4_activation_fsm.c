@@ -2044,6 +2044,8 @@ UT_TEST(test_93db_complete_sample_submits_exact_prepare_cas)
 	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
 	UT_ASSERT_EQ(table.stage,
 				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+	pg_atomic_write_u32(
+		test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0), 1);
 	cluster_semantic_activation_lmon_tick();
 	UT_ASSERT_EQ(pg_atomic_read_u64(
 		test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET)), UINT64_C(8));
@@ -2051,6 +2053,44 @@ UT_TEST(test_93db_complete_sample_submits_exact_prepare_cas)
 		test_gate_u64(TEST_GATE_ACTIVE_BITS_OFFSET)), UINT64_C(0));
 	UT_ASSERT_EQ(pg_atomic_read_u32(
 		test_gate_u32(TEST_GATE_CLOSED_OFFSET)), UINT32_C(1));
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+	UT_ASSERT_EQ(test_drain_request_calls, 0);
+	pg_atomic_write_u32(
+		test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0), 0);
+	test_reclaim_succeeds = true;
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	UT_ASSERT_EQ(table.flags,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID);
+	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(1));
+	UT_ASSERT_EQ(table.observed_members_hi, UINT64_C(0));
+	UT_ASSERT_EQ(table.capability_sample_digest, digest);
+	UT_ASSERT_EQ(test_drain_request_calls, 1);
+	for (node = 1; node < 4; node++) {
+		memset(&ack, 0, sizeof(ack));
+		UT_ASSERT_EQ(test_send_calls[node], 2);
+		UT_ASSERT(cluster_semantic_activation_ack_wire_decode(
+			test_send_payloads[node], &ack));
+		UT_ASSERT_EQ(ack.kind,
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST);
+		UT_ASSERT_EQ(ack.stage,
+					 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+		UT_ASSERT_EQ(ack.member_node, (uint32)node);
+		UT_ASSERT_EQ(ack.record_generation, UINT64_C(8));
+		UT_ASSERT_EQ(ack.round_nonce, request_seq);
+		UT_ASSERT_EQ(ack.capability_sample_digest, digest);
+	}
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	for (node = 1; node < 4; node++)
+		UT_ASSERT_EQ(test_send_calls[node], 2);
 	UT_ASSERT(semantic_activation_utility_mailbox_poll(&pending_request));
 	UT_ASSERT(!semantic_activation_utility_mailbox_poll_completion(
 		pending_request.request_seq, &refusal));
