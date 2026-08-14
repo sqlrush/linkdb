@@ -44,10 +44,13 @@ UT_DEFINE_GLOBALS();
 #define UT_UNDO_SEGMENT UINT16_C(0x1234)
 #define UT_TT_SLOT UINT32_C(0x89ABCDEF)
 #define UT_CLUSTER_EPOCH UINT32_C(0x10203040)
-#define UT_RAW_XID ((TransactionId) UINT32_C(0x24681357))
-#define UT_ANCHOR_LSN ((XLogRecPtr) UINT64_C(0x0102030405060708))
-#define UT_READ_SCN ((SCN) UINT64_C(0x0011223344556677))
-#define UT_COMMIT_SCN ((SCN) UINT64_C(0x0000000200000700))
+#define UT_RAW_XID ((TransactionId)UINT32_C(0x24681357))
+#define UT_ANCHOR_LSN ((XLogRecPtr)UINT64_C(0x0102030405060708))
+#define UT_READ_SCN ((SCN)UINT64_C(0x0011223344556677))
+#define UT_COMMIT_SCN ((SCN)UINT64_C(0x0000000200000700))
+#define UT_NATIVE_XID ((TransactionId)UINT32_C(798))
+#define UT_NATIVE_HW UINT64_C(816)
+#define UT_NEXT_FULL_XID UINT64_C(4195136)
 
 /* Globals read by the retained real-resolver call graph. */
 int cluster_node_id = UT_SELF_NODE;
@@ -59,11 +62,12 @@ bool cluster_crossnode_write_write = false;
 bool cluster_cf_terminal_authority = false;
 bool cluster_xnode_profile_enabled = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
-LWLockPadded *MainLWLockArray = NULL;
-VariableCache ShmemVariableCache = NULL;
+static LWLockPadded ut_main_lwlocks[45];
+static VariableCacheData ut_variable_cache;
+LWLockPadded *MainLWLockArray = ut_main_lwlocks;
+VariableCache ShmemVariableCache = &ut_variable_cache;
 
-typedef struct ResolverReceiptCalls
-{
+typedef struct ResolverReceiptCalls {
 	int memo_probe;
 	int resolve_note;
 	int peer_stamp;
@@ -71,6 +75,13 @@ typedef struct ResolverReceiptCalls
 	int wire;
 	int clog;
 	int durable;
+	int prehistory_probe;
+	int prehistory_lock;
+	int prehistory_unlock;
+	int prehistory_status;
+	int prehistory_note;
+	int truncation_lock;
+	int truncation_unlock;
 } ResolverReceiptCalls;
 
 static ResolverReceiptCalls ut_calls;
@@ -80,6 +91,8 @@ static SCN ut_memo_scn;
 static int32 ut_stamped_node;
 static ClusterTouchKind ut_stamped_kind;
 static bool ut_memo_saw_resolve_scope;
+static bool ut_memo_hit;
+static bool ut_native_prehistory_armed;
 
 static ClusterUndoTTSlotRef
 ut_exact_peer_ref(void)
@@ -116,6 +129,10 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	cluster_cf_terminal_authority = false;
 	cluster_xnode_profile_enabled = false;
 	ClusterXnodeProfileCtl = NULL;
+	ut_memo_hit = true;
+	ut_native_prehistory_armed = false;
+	memset(&ut_variable_cache, 0, sizeof(ut_variable_cache));
+	ut_variable_cache.oldestClogXid = FirstNormalTransactionId;
 }
 
 /* Expected boundaries on the memo-hit path. */
@@ -140,7 +157,9 @@ cluster_vis_memo_probe(const ClusterTTStatusKey *key, uint8 *status_out, SCN *sc
 	ut_calls.memo_probe++;
 	ut_seen_key = *key;
 	ut_memo_saw_resolve_scope = cluster_vis_resolve_in_flight();
-	*status_out = (uint8) ut_memo_status;
+	if (!ut_memo_hit)
+		return false;
+	*status_out = (uint8)ut_memo_status;
 	*scn_out = ut_memo_scn;
 	return true;
 }
@@ -176,7 +195,7 @@ cluster_vis_memo_install(const ClusterTTStatusKey *key pg_attribute_unused(),
 
 void
 cluster_lever_c_note_tt_lookup(bool stamp_cached_present pg_attribute_unused(),
-							  bool stamp_contradicted pg_attribute_unused())
+							   bool stamp_contradicted pg_attribute_unused())
 {
 	ut_calls.overlay++;
 }
@@ -190,13 +209,12 @@ cluster_vis_bump_overlay_refresh_count(void)
 /* Runtime/wire fallbacks, including the synthetic UNKNOWN widening leg. */
 bool
 cluster_runtime_visibility_try_resolve_remote(int origin_node pg_attribute_unused(),
-										  uint32 undo_segment_id pg_attribute_unused(),
-										  TransactionId raw_xid pg_attribute_unused(),
-										  SCN read_scn pg_attribute_unused(),
-										  bool authoritative pg_attribute_unused(),
-										  bool *out_committed,
-										  SCN *out_commit_scn,
-										  bool *out_commit_scn_is_bound)
+											  uint32 undo_segment_id pg_attribute_unused(),
+											  TransactionId raw_xid pg_attribute_unused(),
+											  SCN read_scn pg_attribute_unused(),
+											  bool authoritative pg_attribute_unused(),
+											  bool *out_committed, SCN *out_commit_scn,
+											  bool *out_commit_scn_is_bound)
 {
 	ut_calls.wire++;
 	if (out_committed != NULL)
@@ -291,9 +309,11 @@ XidStatus
 TransactionIdGetStatus(TransactionId xid pg_attribute_unused(), XLogRecPtr *lsn)
 {
 	ut_calls.clog++;
+	ut_calls.prehistory_status++;
 	if (lsn != NULL)
 		*lsn = InvalidXLogRecPtr;
-	return TRANSACTION_STATUS_IN_PROGRESS;
+	return ut_native_prehistory_armed ? TRANSACTION_STATUS_COMMITTED
+									  : TRANSACTION_STATUS_IN_PROGRESS;
 }
 
 bool
@@ -308,35 +328,38 @@ FullTransactionId
 ReadNextFullTransactionId(void)
 {
 	ut_calls.clog++;
-	return FullTransactionIdFromU64(0);
+	return FullTransactionIdFromU64(UT_NEXT_FULL_XID);
 }
 
 uint64
 cluster_cr_native_prehistory_covered_hw(void)
 {
-	ut_calls.clog++;
-	return 0;
+	ut_calls.prehistory_probe++;
+	return ut_native_prehistory_armed ? UT_NATIVE_HW : 0;
 }
 
 void
 cluster_cr_native_prehistory_reader_lock(void)
 {
 	ut_calls.clog++;
+	ut_calls.prehistory_lock++;
 }
 
 void
 cluster_cr_native_prehistory_reader_unlock(void)
 {
 	ut_calls.clog++;
+	ut_calls.prehistory_unlock++;
 }
 
 bool
 cluster_xid_native_prehistory_provable_full(uint64 next_full_xid pg_attribute_unused(),
-										uint64 covered_hw_full pg_attribute_unused(),
-										TransactionId xid pg_attribute_unused())
+											uint64 covered_hw_full pg_attribute_unused(),
+											TransactionId xid pg_attribute_unused())
 {
 	ut_calls.clog++;
-	return false;
+	return ut_native_prehistory_armed && next_full_xid == UT_NEXT_FULL_XID
+		   && covered_hw_full == UT_NATIVE_HW && xid == UT_NATIVE_XID;
 }
 
 bool
@@ -350,12 +373,14 @@ void
 cluster_rtvis_note_native_prehistory_local(void)
 {
 	ut_calls.clog++;
+	ut_calls.prehistory_note++;
 }
 
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	ut_calls.clog++;
+	ut_calls.truncation_lock++;
 	return true;
 }
 
@@ -363,6 +388,7 @@ void
 LWLockRelease(LWLock *lock pg_attribute_unused())
 {
 	ut_calls.clog++;
+	ut_calls.truncation_unlock++;
 }
 
 /* Materialized/durable authority alternatives: also forbidden here. */
@@ -382,7 +408,7 @@ cluster_merged_instance_recovered_through(int origin_node pg_attribute_unused())
 
 bool
 cluster_tt_recovery_remote_authority_covers(uint64 recovered_through pg_attribute_unused(),
-										uint64 anchor_lsn pg_attribute_unused())
+											uint64 anchor_lsn pg_attribute_unused())
 {
 	ut_calls.durable++;
 	return false;
@@ -397,12 +423,12 @@ cluster_epoch_get_current(void)
 
 ClusterRemoteXactOutcome
 cluster_remote_outcome_terminal_authorized(int origin_node pg_attribute_unused(),
-									   TransactionId xid pg_attribute_unused(),
-									   uint64 observed_epoch pg_attribute_unused(),
-									   uint64 current_epoch pg_attribute_unused(),
-									   bool retention_required pg_attribute_unused(),
-									   bool retention_proven pg_attribute_unused(),
-									   SCN *out_scn pg_attribute_unused())
+										   TransactionId xid pg_attribute_unused(),
+										   uint64 observed_epoch pg_attribute_unused(),
+										   uint64 current_epoch pg_attribute_unused(),
+										   bool retention_required pg_attribute_unused(),
+										   bool retention_proven pg_attribute_unused(),
+										   SCN *out_scn pg_attribute_unused())
 {
 	ut_calls.durable++;
 	return CLUSTER_REMOTE_XACT_INDOUBT;
@@ -461,8 +487,7 @@ ut_run_memo_hit(ClusterTTStatus status, SCN memo_scn)
 	memset(&out, 0xA5, sizeof(out));
 
 	UT_ASSERT(!cluster_vis_resolve_in_flight());
-	cluster_visibility_resolve_from_ref_scn(UT_RAW_XID, &ref, UT_ANCHOR_LSN,
-										UT_READ_SCN, &out);
+	cluster_visibility_resolve_from_ref_scn(UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
 	UT_ASSERT(!cluster_vis_resolve_in_flight());
 
 	UT_ASSERT_EQ(ut_calls.peer_stamp, 1);
@@ -501,13 +526,51 @@ UT_TEST(test_peer_exact_synthetic_unknown_hit_stays_failclosed_without_wire)
 	ut_run_memo_hit(CLUSTER_TT_STATUS_UNKNOWN, InvalidScn);
 }
 
+/*
+ * Formal 4x1x3 at 0c507acf first failed on native seed xid 798: a peer
+ * acquired a still-bound (fresh) ITL ref, skipped the recycled-ref-only
+ * native-prehistory gate, then missed TT authority that cannot exist for an
+ * enabled=off seed transaction.  Verified prehistory is the local terminal
+ * authority for every provably native xid regardless of ref freshness.
+ */
+UT_TEST(test_peer_fresh_native_ref_uses_covered_prehistory_before_overlay)
+{
+	ClusterUndoTTSlotRef ref = ut_exact_peer_ref();
+	ClusterVisResolve out;
+
+	ref.local_xid = UT_NATIVE_XID;
+	ut_reset(CLUSTER_TT_STATUS_UNKNOWN, InvalidScn);
+	ut_memo_hit = false;
+	ut_native_prehistory_armed = true;
+	cluster_crossnode_runtime_visibility = true;
+	memset(&out, 0xA5, sizeof(out));
+
+	cluster_visibility_resolve_from_ref_scn(UT_NATIVE_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
+
+	UT_ASSERT_EQ(out.evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
+	UT_ASSERT_EQ(out.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(out.commit_scn, (SCN)1);
+	UT_ASSERT(out.commit_scn_is_bound);
+	UT_ASSERT_EQ(ut_calls.peer_stamp, 1);
+	UT_ASSERT(ut_calls.prehistory_probe >= 2);
+	UT_ASSERT_EQ(ut_calls.prehistory_lock, 1);
+	UT_ASSERT_EQ(ut_calls.prehistory_unlock, 1);
+	UT_ASSERT_EQ(ut_calls.prehistory_status, 1);
+	UT_ASSERT_EQ(ut_calls.prehistory_note, 1);
+	UT_ASSERT_EQ(ut_calls.truncation_lock, 1);
+	UT_ASSERT_EQ(ut_calls.truncation_unlock, 1);
+	UT_ASSERT_EQ(ut_calls.overlay, 0);
+	UT_ASSERT_EQ(ut_calls.wire, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(test_peer_exact_memo_hit_propagates_committed);
 	UT_RUN(test_peer_exact_memo_hit_propagates_aborted);
 	UT_RUN(test_peer_exact_synthetic_unknown_hit_stays_failclosed_without_wire);
+	UT_RUN(test_peer_fresh_native_ref_uses_covered_prehistory_before_overlay);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
