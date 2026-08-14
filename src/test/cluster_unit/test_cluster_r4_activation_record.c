@@ -1910,10 +1910,174 @@ UT_TEST(test_78_lmon_current_ack_authority_fails_closed_on_drift)
 	assert_current_ack_authority_rejected(-1);
 }
 
+static SemanticActivationAckIngressItem
+valid_current_sample_item(void)
+{
+	SemanticActivationAckIngressItem item = valid_positive_ack_item();
+
+	item.message.admitted_members_lo = UINT64_C(0x09);
+	item.local_receiver_node_id = 0;
+	return item;
+}
+
+static SemanticActivationAckTuple
+valid_current_self_tuple(void)
+{
+	return (SemanticActivationAckTuple){
+		.node_id = 0,
+		.boot_id = 11,
+		.admitted_incarnation = 11,
+		.control_connection_generation = 11,
+		.capability_word
+			= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+			  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1,
+		.capability_generation = 11,
+		.transition_epoch = 9,
+		.record_generation = 10,
+	};
+}
+
+static void
+init_current_sample_table(ClusterSemanticActivationAckTableV1 *table)
+{
+	memset(table, 0, sizeof(*table));
+	pg_atomic_init_u64(&table->publication_seq, 0);
+	table->stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	table->coordinator_node = 0;
+	table->round_nonce = 11;
+	table->expected_members_lo = UINT64_C(0x09);
+	table->transition_epoch = 9;
+	table->record_generation = 10;
+	table->source_feature_bitmap = 1;
+	table->target_feature_bitmap = 2;
+	table->observed_members_lo = UINT64_C(0x01);
+	table->observed[0] = valid_current_self_tuple();
+}
+
+static void
+set_current_remote_ack_dependencies(void)
+{
+	cluster_r4_activation_test_membership_node = 3;
+	cluster_r4_activation_test_membership_floor = 12;
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+	cluster_r4_activation_test_capability_generation_matches = true;
+	cluster_r4_activation_test_capability_peer = 3;
+	cluster_r4_activation_test_capability_required
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	cluster_r4_activation_test_capability_expected_generation = 7;
+}
+
+UT_TEST(test_79_lmon_sample_ack_promotes_complete_observed_image)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckIngressItem item = valid_current_sample_item();
+
+	init_current_sample_table(&table);
+	set_current_remote_ack_dependencies();
+	SemanticActivationAckTable = &table;
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_apply_item(
+		&item, UINT64_C(0x09), 0, 9, 0),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_APPLIED);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&table.publication_seq), 2);
+	UT_ASSERT_EQ(table.flags,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+				 | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE);
+	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0x09));
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0x09));
+	UT_ASSERT(semantic_activation_full_ack_table_matches(
+		table.observed, table.observed_members_lo, table.observed_members_hi,
+		table.expected, table.expected_members_lo,
+		table.expected_members_hi));
+	UT_ASSERT_EQ(table.expected[3].node_id, 3);
+	UT_ASSERT_EQ(table.expected[3].boot_id, UINT64_C(12));
+	UT_ASSERT_EQ(table.expected[3].capability_generation, UINT64_C(7));
+	SemanticActivationAckTable = NULL;
+}
+
+UT_TEST(test_80_lmon_ack_stale_drop_and_current_drift_invalidation)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	ClusterSemanticActivationAckTableV1 before;
+	SemanticActivationAckIngressItem item = valid_current_sample_item();
+
+	init_current_sample_table(&table);
+	set_current_remote_ack_dependencies();
+	SemanticActivationAckTable = &table;
+	item.message.round_nonce++;
+	before = table;
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_apply_item(
+		&item, UINT64_C(0x09), 0, 9, 0),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_STALE);
+	UT_ASSERT_EQ(memcmp(&table, &before, sizeof(table)), 0);
+
+	item = valid_current_sample_item();
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_apply_item(
+		&item, UINT64_C(0x19), 0, 9, 0),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_INVALIDATED);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&table.publication_seq), 2);
+	UT_ASSERT_EQ(table.flags, 0);
+	UT_ASSERT_EQ(table.expected_members_lo, 0);
+	UT_ASSERT_EQ(table.expected_members_hi, 0);
+	UT_ASSERT_EQ(table.observed_members_lo, 0);
+	UT_ASSERT_EQ(table.observed_members_hi, 0);
+	UT_ASSERT_EQ(memcmp(table.expected,
+					  (SemanticActivationAckTuple[CLUSTER_MAX_NODES]){{0}},
+					  sizeof(table.expected)), 0);
+	UT_ASSERT_EQ(memcmp(table.observed,
+					  (SemanticActivationAckTuple[CLUSTER_MAX_NODES]){{0}},
+					  sizeof(table.observed)), 0);
+
+	init_current_sample_table(&table);
+	item = valid_current_sample_item();
+	item.message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED;
+	item.message.reason = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	item.message.boot_id = 0;
+	item.message.admitted_incarnation = 0;
+	item.message.capability_word = 0;
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_apply_item(
+		&item, UINT64_C(0x09), 0, 9, 0),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_INVALIDATED);
+	UT_ASSERT_EQ(table.flags, 0);
+	UT_ASSERT_EQ(table.expected_members_lo, 0);
+	UT_ASSERT_EQ(table.observed_members_lo, 0);
+	SemanticActivationAckTable = NULL;
+}
+
+UT_TEST(test_81_lmon_ack_duplicate_is_idempotent_but_conflict_invalidates)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckIngressItem item = valid_current_sample_item();
+	uint64 publication_seq;
+
+	init_current_sample_table(&table);
+	set_current_remote_ack_dependencies();
+	SemanticActivationAckTable = &table;
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_apply_item(
+		&item, UINT64_C(0x09), 0, 9, 0),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_APPLIED);
+	publication_seq = pg_atomic_read_u64(&table.publication_seq);
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_apply_item(
+		&item, UINT64_C(0x09), 0, 9, 0),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_DUPLICATE);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&table.publication_seq),
+				 publication_seq);
+
+	item.message.boot_id = 13;
+	item.message.admitted_incarnation = 13;
+	cluster_r4_activation_test_membership_floor = 13;
+	UT_ASSERT_EQ(semantic_activation_ack_lmon_apply_item(
+		&item, UINT64_C(0x09), 0, 9, 0),
+		SEMANTIC_ACTIVATION_ACK_CONSUME_INVALIDATED);
+	UT_ASSERT_EQ(table.flags, 0);
+	UT_ASSERT_EQ(table.expected_members_lo, 0);
+	UT_ASSERT_EQ(table.observed_members_lo, 0);
+	SemanticActivationAckTable = NULL;
+}
+
 int
 main(void)
 {
-	UT_PLAN(78);
+	UT_PLAN(81);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -1992,6 +2156,9 @@ main(void)
 	UT_RUN(test_76_lmon_self_ack_is_fail_closed_on_local_drift);
 	UT_RUN(test_77_lmon_current_ack_authority_uses_exact_member_snapshot);
 	UT_RUN(test_78_lmon_current_ack_authority_fails_closed_on_drift);
+	UT_RUN(test_79_lmon_sample_ack_promotes_complete_observed_image);
+	UT_RUN(test_80_lmon_ack_stale_drop_and_current_drift_invalidation);
+	UT_RUN(test_81_lmon_ack_duplicate_is_idempotent_but_conflict_invalidates);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
