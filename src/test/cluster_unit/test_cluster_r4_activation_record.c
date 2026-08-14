@@ -1748,7 +1748,7 @@ UT_TEST(test_74_lmon_remote_ack_revalidates_every_authority_input)
 	item.message.coordinator_node = 1;
 	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
 	item = valid_positive_ack_item();
-	item.local_receiver_node_id = 1;
+	item.local_receiver_node_id = 2;
 	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x0b), 0, 9, 0);
 	item = valid_positive_ack_item();
 	assert_remote_ack_tuple_rejected(&item, UINT64_C(0x07), 0, 9, 0);

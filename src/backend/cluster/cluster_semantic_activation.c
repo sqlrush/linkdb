@@ -390,6 +390,8 @@ static bool semantic_activation_ack_current_authority(
 	int32 local_node_id, uint64 *out_members_lo, uint64 *out_members_hi,
 	uint64 *out_formation_epoch,
 	int32 *out_coordinator_node) pg_attribute_unused();
+static bool semantic_activation_ack_member_present(
+	uint64 members_lo, uint64 members_hi, int32 node_id);
 static bool semantic_activation_ack_wire_value_valid(
 	const ClusterSemanticActivationAckWireV1 *message);
 
@@ -631,7 +633,9 @@ semantic_activation_ack_remote_tuple(
 	message = &item->message;
 	source_node = item->authenticated_source_node_id;
 	if (source_node < 0 || source_node >= CLUSTER_MAX_NODES
-		|| item->local_receiver_node_id != current_coordinator_node
+		|| !semantic_activation_ack_member_present(
+			current_members_lo, current_members_hi,
+			item->local_receiver_node_id)
 		|| message->kind != CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
 		|| message->result != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
 		|| message->coordinator_node != (uint32)current_coordinator_node

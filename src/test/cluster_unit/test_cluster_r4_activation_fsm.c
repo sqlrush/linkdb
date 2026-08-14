@@ -1919,6 +1919,88 @@ UT_TEST(test_93da_coordinator_begins_exact_four_node_sample_round)
 	test_gate_reset();
 }
 
+UT_TEST(test_93daa_member_accumulates_exact_four_node_sample)
+{
+	ClusterSemanticActivationAckWireV1 message;
+	ClusterSemanticActivationAckTableV1 table;
+	ClusterICEnvelope envelope;
+	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+	int node;
+
+	test_gate_reset();
+	cluster_node_id = 3;
+	test_gate_publish(2, 0, 7, test_current_epoch, false);
+	test_admitted_snapshot_valid = true;
+	test_admitted_snapshot_episode = valid_d13_admitted_episode();
+	test_admitted_snapshot_marker = valid_d13_admitted_marker();
+	test_local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	test_peer_capability_word_sample_ok = true;
+	test_peer_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	test_peer_capability_generation = 19;
+	test_peer_capability_matches = true;
+	for (node = 0; node < 3; node++) {
+		test_send_results[node] = CLUSTER_IC_SEND_DONE;
+		test_remote_admitted_incarnations[node]
+			= UINT64_C(0x100) + (uint64)node;
+	}
+
+	memset(&message, 0, sizeof(message));
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	message.coordinator_node = 0;
+	message.member_node = 3;
+	message.transition_epoch = test_current_epoch;
+	message.record_generation = 8;
+	message.round_nonce = UINT64_C(77);
+	message.target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	message.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(
+		&message, payload));
+	memset(&envelope, 0, sizeof(envelope));
+	envelope.msg_type = PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1;
+	envelope.source_node_id = 0;
+	envelope.dest_node_id = 3;
+	envelope.epoch = test_current_epoch;
+	envelope.payload_length = sizeof(payload);
+	cluster_semantic_activation_ack_handler(&envelope, payload);
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0x08));
+
+	for (node = 0; node < 3; node++) {
+		message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+		message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK;
+		message.member_node = (uint32)node;
+		message.boot_id = test_remote_admitted_incarnations[node];
+		message.admitted_incarnation = message.boot_id;
+		message.capability_word = test_peer_capability_word;
+		UT_ASSERT(cluster_semantic_activation_ack_wire_encode(
+			&message, payload));
+		envelope.source_node_id = (uint32)node;
+		cluster_semantic_activation_ack_handler(&envelope, payload);
+	}
+	cluster_semantic_activation_lmon_tick();
+
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+	UT_ASSERT_EQ(table.flags,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+				 | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE);
+	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0x0f));
+	for (node = 0; node < 4; node++)
+		UT_ASSERT(semantic_activation_ack_matches(
+			&table.expected[node], &table.observed[node]));
+	test_gate_reset();
+}
+
 UT_TEST(test_93db_complete_sample_submits_exact_prepare_cas)
 {
 	ClusterSemanticActivationCasRequest cas_request;
@@ -3567,7 +3649,7 @@ UT_TEST(test_124_cold_bootstrap_zero_historical_floor_accepts_live_pgrd_binding)
 int
 main(void)
 {
-	UT_PLAN(170);
+	UT_PLAN(171);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -3685,6 +3767,7 @@ main(void)
 	UT_RUN(test_93c_utility_mailbox_preserves_exact_owner_tuple_and_completion);
 	UT_RUN(test_93d_formation_lmon_alone_consumes_utility_request);
 	UT_RUN(test_93da_coordinator_begins_exact_four_node_sample_round);
+	UT_RUN(test_93daa_member_accumulates_exact_four_node_sample);
 	UT_RUN(test_93db_complete_sample_submits_exact_prepare_cas);
 	UT_RUN(test_93e_utility_wait_returns_only_matching_terminal_result);
 	UT_RUN(test_93ea_utility_wait_does_not_synthesize_elapsed_terminal);
