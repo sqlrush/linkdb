@@ -39,6 +39,12 @@ static uint64 cluster_r4_activation_test_membership_floor;
 static ClusterMembershipState cluster_r4_activation_test_membership_state
 	= CLUSTER_MEMBER_MEMBER;
 static uint64 cluster_r4_activation_test_self_incarnation = 1;
+static uint64 cluster_r4_activation_test_current_epoch;
+static bool cluster_r4_activation_test_in_quorum = true;
+static bool cluster_r4_activation_test_admitted_snapshot_valid;
+static uint64 cluster_r4_activation_test_admitted_members_lo;
+static uint64 cluster_r4_activation_test_admitted_members_hi;
+static uint64 cluster_r4_activation_test_admitted_epoch;
 
 void ProcessInterrupts(void);
 
@@ -49,7 +55,7 @@ ProcessInterrupts(void)
 uint64
 cluster_epoch_get_current(void)
 {
-	return 0;
+	return cluster_r4_activation_test_current_epoch;
 }
 
 bool
@@ -99,7 +105,7 @@ cluster_reconfig_lmon_snapshot_replacement_admitted(
 bool
 cluster_qvotec_in_quorum(void)
 {
-	return true;
+	return cluster_r4_activation_test_in_quorum;
 }
 
 uint64
@@ -156,11 +162,24 @@ cluster_undo_smgr_root_descriptor_publish(
 
 bool
 cluster_reconfig_lmon_snapshot_admitted_membership(
-	uint64 *out_members_lo pg_attribute_unused(),
-	uint64 *out_members_hi pg_attribute_unused(),
-	uint64 *out_formation_epoch pg_attribute_unused())
+	uint64 *out_members_lo,
+	uint64 *out_members_hi,
+	uint64 *out_formation_epoch)
 {
-	return false;
+	if (out_members_lo != NULL)
+		*out_members_lo = 0;
+	if (out_members_hi != NULL)
+		*out_members_hi = 0;
+	if (out_formation_epoch != NULL)
+		*out_formation_epoch = 0;
+	if (!cluster_r4_activation_test_admitted_snapshot_valid
+		|| out_members_lo == NULL || out_members_hi == NULL
+		|| out_formation_epoch == NULL)
+		return false;
+	*out_members_lo = cluster_r4_activation_test_admitted_members_lo;
+	*out_members_hi = cluster_r4_activation_test_admitted_members_hi;
+	*out_formation_epoch = cluster_r4_activation_test_admitted_epoch;
+	return true;
 }
 
 ClusterR4PrerequisiteSnapshot

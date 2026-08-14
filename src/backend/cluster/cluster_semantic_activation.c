@@ -316,6 +316,10 @@ static bool semantic_activation_ack_self_tuple(
 	int32 local_node_id, uint32 local_capability_word,
 	uint64 transition_epoch, uint64 record_generation,
 	SemanticActivationAckTuple *out) pg_attribute_unused();
+static bool semantic_activation_ack_current_authority(
+	int32 local_node_id, uint64 *out_members_lo, uint64 *out_members_hi,
+	uint64 *out_formation_epoch,
+	int32 *out_coordinator_node) pg_attribute_unused();
 
 static void
 semantic_activation_ack_ingress_init(SemanticActivationAckIngress *ingress)
@@ -567,6 +571,69 @@ semantic_activation_ack_self_tuple(
 	tuple.transition_epoch = transition_epoch;
 	tuple.record_generation = record_generation;
 	*out = tuple;
+	return true;
+}
+
+static bool
+semantic_activation_ack_current_authority(
+	int32 local_node_id, uint64 *out_members_lo, uint64 *out_members_hi,
+	uint64 *out_formation_epoch, int32 *out_coordinator_node)
+{
+	uint64 members_lo;
+	uint64 members_hi;
+	uint64 formation_epoch;
+	uint64 current_epoch;
+	int32 coordinator_node = -1;
+	int32 node;
+	bool local_is_member;
+
+	if (out_members_lo == NULL || out_members_hi == NULL
+		|| out_formation_epoch == NULL || out_coordinator_node == NULL)
+		return false;
+	*out_members_lo = 0;
+	*out_members_hi = 0;
+	*out_formation_epoch = 0;
+	*out_coordinator_node = -1;
+	if (local_node_id < 0 || local_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_qvotec_in_quorum()
+		|| !cluster_reconfig_lmon_snapshot_admitted_membership(
+			&members_lo, &members_hi, &formation_epoch)
+		|| (members_lo == 0 && members_hi == 0))
+		return false;
+
+	current_epoch = cluster_epoch_get_current();
+	local_is_member
+		= local_node_id < 64
+			  ? (members_lo & (UINT64_C(1) << local_node_id)) != 0
+			  : (members_hi
+				 & (UINT64_C(1) << (local_node_id - 64))) != 0;
+	if (!local_is_member || formation_epoch != current_epoch
+		|| cluster_membership_get_state(local_node_id)
+		   != CLUSTER_MEMBER_MEMBER)
+		return false;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool is_member
+			= node < 64
+				  ? (members_lo & (UINT64_C(1) << node)) != 0
+				  : (members_hi & (UINT64_C(1) << (node - 64))) != 0;
+
+		if (is_member) {
+			coordinator_node = node;
+			break;
+		}
+	}
+	if (coordinator_node < 0
+		|| cluster_membership_get_state(coordinator_node)
+		   != CLUSTER_MEMBER_MEMBER
+		|| !cluster_qvotec_in_quorum()
+		|| cluster_epoch_get_current() != current_epoch)
+		return false;
+
+	*out_members_lo = members_lo;
+	*out_members_hi = members_hi;
+	*out_formation_epoch = formation_epoch;
+	*out_coordinator_node = coordinator_node;
 	return true;
 }
 

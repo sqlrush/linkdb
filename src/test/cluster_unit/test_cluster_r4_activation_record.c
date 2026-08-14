@@ -1828,10 +1828,92 @@ UT_TEST(test_76_lmon_self_ack_is_fail_closed_on_local_drift)
 	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
 }
 
+UT_TEST(test_77_lmon_current_ack_authority_uses_exact_member_snapshot)
+{
+	uint64 members_lo;
+	uint64 members_hi;
+	uint64 formation_epoch;
+	int32 coordinator;
+
+	cluster_r4_activation_test_in_quorum = true;
+	cluster_r4_activation_test_admitted_snapshot_valid = true;
+	cluster_r4_activation_test_admitted_members_lo
+		= (UINT64_C(1) << 3) | (UINT64_C(1) << 7);
+	cluster_r4_activation_test_admitted_members_hi = 0;
+	cluster_r4_activation_test_admitted_epoch = 9;
+	cluster_r4_activation_test_current_epoch = 9;
+	cluster_r4_activation_test_membership_node = 7;
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+
+	UT_ASSERT(semantic_activation_ack_current_authority(
+		7, &members_lo, &members_hi, &formation_epoch, &coordinator));
+	UT_ASSERT_EQ(members_lo,
+				 (UINT64_C(1) << 3) | (UINT64_C(1) << 7));
+	UT_ASSERT_EQ(members_hi, 0);
+	UT_ASSERT_EQ(formation_epoch, UINT64_C(9));
+	UT_ASSERT_EQ(coordinator, 3);
+
+	cluster_r4_activation_test_admitted_members_lo = 0;
+	cluster_r4_activation_test_admitted_members_hi = UINT64_C(1) << 1;
+	cluster_r4_activation_test_membership_node = 65;
+	UT_ASSERT(semantic_activation_ack_current_authority(
+		65, &members_lo, &members_hi, &formation_epoch, &coordinator));
+	UT_ASSERT_EQ(members_lo, 0);
+	UT_ASSERT_EQ(members_hi, UINT64_C(1) << 1);
+	UT_ASSERT_EQ(coordinator, 65);
+}
+
+static void
+assert_current_ack_authority_rejected(int32 local_node_id)
+{
+	uint64 members_lo = UINT64_MAX;
+	uint64 members_hi = UINT64_MAX;
+	uint64 formation_epoch = UINT64_MAX;
+	int32 coordinator = 127;
+
+	UT_ASSERT(!semantic_activation_ack_current_authority(
+		local_node_id, &members_lo, &members_hi, &formation_epoch,
+		&coordinator));
+	UT_ASSERT_EQ(members_lo, 0);
+	UT_ASSERT_EQ(members_hi, 0);
+	UT_ASSERT_EQ(formation_epoch, 0);
+	UT_ASSERT_EQ(coordinator, -1);
+}
+
+UT_TEST(test_78_lmon_current_ack_authority_fails_closed_on_drift)
+{
+	cluster_r4_activation_test_in_quorum = false;
+	cluster_r4_activation_test_admitted_snapshot_valid = true;
+	cluster_r4_activation_test_admitted_members_lo = UINT64_C(0x88);
+	cluster_r4_activation_test_admitted_members_hi = 0;
+	cluster_r4_activation_test_admitted_epoch = 9;
+	cluster_r4_activation_test_current_epoch = 9;
+	cluster_r4_activation_test_membership_node = 7;
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
+	assert_current_ack_authority_rejected(7);
+
+	cluster_r4_activation_test_in_quorum = true;
+	cluster_r4_activation_test_admitted_snapshot_valid = false;
+	assert_current_ack_authority_rejected(7);
+	cluster_r4_activation_test_admitted_snapshot_valid = true;
+	cluster_r4_activation_test_admitted_members_lo = 0;
+	assert_current_ack_authority_rejected(7);
+	cluster_r4_activation_test_admitted_members_lo = UINT64_C(0x88);
+	cluster_r4_activation_test_admitted_epoch = 8;
+	assert_current_ack_authority_rejected(7);
+	cluster_r4_activation_test_admitted_epoch = 9;
+	cluster_r4_activation_test_admitted_members_lo = UINT64_C(0x08);
+	assert_current_ack_authority_rejected(7);
+	cluster_r4_activation_test_admitted_members_lo = UINT64_C(0x88);
+	cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_JOINING;
+	assert_current_ack_authority_rejected(7);
+	assert_current_ack_authority_rejected(-1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(78);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -1908,6 +1990,8 @@ main(void)
 	UT_RUN(test_74_lmon_remote_ack_revalidates_every_authority_input);
 	UT_RUN(test_75_lmon_self_ack_builds_exact_local_tuple);
 	UT_RUN(test_76_lmon_self_ack_is_fail_closed_on_local_drift);
+	UT_RUN(test_77_lmon_current_ack_authority_uses_exact_member_snapshot);
+	UT_RUN(test_78_lmon_current_ack_authority_fails_closed_on_drift);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
