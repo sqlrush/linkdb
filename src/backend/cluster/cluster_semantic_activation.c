@@ -270,6 +270,13 @@ typedef struct SemanticActivationAckIngress {
 		items[CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY];
 } SemanticActivationAckIngress;
 
+typedef struct SemanticActivationAckPendingSend {
+	ClusterSemanticActivationAckWireV1 message;
+	uint64 pending_members_lo;
+	uint64 pending_members_hi;
+	bool invalidated;
+} SemanticActivationAckPendingSend;
+
 typedef enum SemanticActivationAckIngressResult {
 	SEMANTIC_ACTIVATION_ACK_INGRESS_REJECTED = 0,
 	SEMANTIC_ACTIVATION_ACK_INGRESS_ENQUEUED,
@@ -283,6 +290,13 @@ typedef enum SemanticActivationAckConsumeResult {
 	SEMANTIC_ACTIVATION_ACK_CONSUME_DUPLICATE,
 	SEMANTIC_ACTIVATION_ACK_CONSUME_INVALIDATED
 } SemanticActivationAckConsumeResult;
+
+typedef enum SemanticActivationAckSendResult {
+	SEMANTIC_ACTIVATION_ACK_SEND_REJECTED = 0,
+	SEMANTIC_ACTIVATION_ACK_SEND_ADMITTED,
+	SEMANTIC_ACTIVATION_ACK_SEND_RETAINED,
+	SEMANTIC_ACTIVATION_ACK_SEND_INVALIDATED
+} SemanticActivationAckSendResult;
 
 static SemanticActivationAckIngress semantic_activation_ack_local_ingress;
 static uint64 semantic_activation_ack_ingress_result_count[3];
@@ -310,6 +324,10 @@ static bool semantic_activation_ack_ingress_push(
 static bool semantic_activation_ack_ingress_poll(
 	SemanticActivationAckIngress *ingress,
 	SemanticActivationAckIngressItem *out) pg_attribute_unused();
+static SemanticActivationAckSendResult
+semantic_activation_ack_pending_send_note_result(
+	SemanticActivationAckPendingSend *pending, int32 dest_node_id,
+	ClusterICSendResult send_result) pg_attribute_unused();
 static SemanticActivationAckIngressResult
 semantic_activation_ack_ingress_receive(
 	SemanticActivationAckIngress *ingress, const ClusterICEnvelope *env,
@@ -387,6 +405,43 @@ semantic_activation_ack_ingress_poll(
 				   % CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY];
 	ingress->consumer_seq++;
 	return true;
+}
+
+static SemanticActivationAckSendResult
+semantic_activation_ack_pending_send_note_result(
+	SemanticActivationAckPendingSend *pending, int32 dest_node_id,
+	ClusterICSendResult send_result)
+{
+	uint64 member_bit;
+	uint64 *pending_members;
+
+	if (pending == NULL || pending->invalidated
+		|| dest_node_id < 0 || dest_node_id >= CLUSTER_MAX_NODES)
+		return SEMANTIC_ACTIVATION_ACK_SEND_REJECTED;
+	if (dest_node_id < 64) {
+		member_bit = UINT64_C(1) << dest_node_id;
+		pending_members = &pending->pending_members_lo;
+	} else {
+		member_bit = UINT64_C(1) << (dest_node_id - 64);
+		pending_members = &pending->pending_members_hi;
+	}
+	if ((*pending_members & member_bit) == 0)
+		return SEMANTIC_ACTIVATION_ACK_SEND_REJECTED;
+
+	switch (send_result) {
+	case CLUSTER_IC_SEND_DONE:
+	case CLUSTER_IC_SEND_WOULD_BLOCK:
+		*pending_members &= ~member_bit;
+		return SEMANTIC_ACTIVATION_ACK_SEND_ADMITTED;
+	case CLUSTER_IC_SEND_NOT_ADMITTED:
+		return SEMANTIC_ACTIVATION_ACK_SEND_RETAINED;
+	case CLUSTER_IC_SEND_HARD_ERROR:
+		pending->pending_members_lo = 0;
+		pending->pending_members_hi = 0;
+		pending->invalidated = true;
+		return SEMANTIC_ACTIVATION_ACK_SEND_INVALIDATED;
+	}
+	return SEMANTIC_ACTIVATION_ACK_SEND_REJECTED;
 }
 
 static SemanticActivationAckIngressResult

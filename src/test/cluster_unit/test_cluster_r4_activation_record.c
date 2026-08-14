@@ -2496,10 +2496,69 @@ UT_TEST(test_90_current_sample_request_rejects_durable_stage_drift)
 	SemanticActivationAckTable = NULL;
 }
 
+static SemanticActivationAckPendingSend
+valid_pending_send(uint64 pending_members_lo, uint64 pending_members_hi)
+{
+	SemanticActivationAckIngressItem item
+		= valid_current_durable_sample_request_item();
+	SemanticActivationAckPendingSend pending;
+
+	memset(&pending, 0, sizeof(pending));
+	pending.message = item.message;
+	pending.pending_members_lo = pending_members_lo;
+	pending.pending_members_hi = pending_members_hi;
+	return pending;
+}
+
+UT_TEST(test_91_pending_send_clears_done_and_admitted_would_block)
+{
+	SemanticActivationAckPendingSend pending
+		= valid_pending_send(UINT64_C(0x0c), 0);
+
+	UT_ASSERT_EQ(semantic_activation_ack_pending_send_note_result(
+		&pending, 2, CLUSTER_IC_SEND_DONE),
+		SEMANTIC_ACTIVATION_ACK_SEND_ADMITTED);
+	UT_ASSERT_EQ(pending.pending_members_lo, UINT64_C(0x08));
+	UT_ASSERT_EQ(pending.pending_members_hi, 0);
+	UT_ASSERT(!pending.invalidated);
+
+	UT_ASSERT_EQ(semantic_activation_ack_pending_send_note_result(
+		&pending, 3, CLUSTER_IC_SEND_WOULD_BLOCK),
+		SEMANTIC_ACTIVATION_ACK_SEND_ADMITTED);
+	UT_ASSERT_EQ(pending.pending_members_lo, 0);
+	UT_ASSERT_EQ(pending.pending_members_hi, 0);
+	UT_ASSERT(!pending.invalidated);
+}
+
+UT_TEST(test_92_pending_send_retains_refusal_and_aborts_hard_error)
+{
+	SemanticActivationAckPendingSend pending
+		= valid_pending_send(UINT64_C(0x04), UINT64_C(0x40));
+	SemanticActivationAckPendingSend before = pending;
+
+	UT_ASSERT_EQ(semantic_activation_ack_pending_send_note_result(
+		&pending, 2, CLUSTER_IC_SEND_NOT_ADMITTED),
+		SEMANTIC_ACTIVATION_ACK_SEND_RETAINED);
+	UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+
+	UT_ASSERT_EQ(semantic_activation_ack_pending_send_note_result(
+		&pending, 70, CLUSTER_IC_SEND_HARD_ERROR),
+		SEMANTIC_ACTIVATION_ACK_SEND_INVALIDATED);
+	UT_ASSERT_EQ(pending.pending_members_lo, 0);
+	UT_ASSERT_EQ(pending.pending_members_hi, 0);
+	UT_ASSERT(pending.invalidated);
+
+	before = pending;
+	UT_ASSERT_EQ(semantic_activation_ack_pending_send_note_result(
+		&pending, 2, CLUSTER_IC_SEND_DONE),
+		SEMANTIC_ACTIVATION_ACK_SEND_REJECTED);
+	UT_ASSERT_EQ(memcmp(&pending, &before, sizeof(pending)), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(90);
+	UT_PLAN(92);
 	UT_RUN(test_01_record_constants);
 	UT_RUN(test_02_phase_numeric_values);
 	UT_RUN(test_03_encode_rejects_null_record);
@@ -2590,6 +2649,8 @@ main(void)
 	UT_RUN(test_88_authorized_request_drift_never_mutates_table);
 	UT_RUN(test_89_current_sample_request_accepts_exact_durable_source_open);
 	UT_RUN(test_90_current_sample_request_rejects_durable_stage_drift);
+	UT_RUN(test_91_pending_send_clears_done_and_admitted_would_block);
+	UT_RUN(test_92_pending_send_retains_refusal_and_aborts_hard_error);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
