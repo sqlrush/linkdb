@@ -931,6 +931,89 @@ semantic_activation_ack_lmon_apply_item(
 			   : SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
 }
 
+static void
+semantic_activation_ack_lmon_invalidate_active(void)
+{
+	ClusterSemanticActivationAckTableV1 image;
+
+	if (!semantic_activation_ack_table_snapshot(&image)
+		|| (image.expected_members_lo == 0
+			&& image.expected_members_hi == 0))
+		return;
+	(void)semantic_activation_ack_image_invalidate(&image);
+}
+
+static void
+semantic_activation_ack_lmon_revalidate_active(
+	uint64 current_members_lo, uint64 current_members_hi,
+	uint64 current_epoch, int32 current_coordinator_node)
+{
+	ClusterSemanticActivationAckTableV1 image;
+
+	if (!semantic_activation_ack_table_snapshot(&image)
+		|| (image.expected_members_lo == 0
+			&& image.expected_members_hi == 0))
+		return;
+	if (image.expected_members_lo != current_members_lo
+		|| image.expected_members_hi != current_members_hi
+		|| image.transition_epoch != current_epoch
+		|| image.coordinator_node != (uint32)current_coordinator_node)
+		(void)semantic_activation_ack_image_invalidate(&image);
+}
+
+static void
+semantic_activation_ack_lmon_drain(void)
+{
+	SemanticActivationAckIngressItem item;
+	uint64 current_members_lo;
+	uint64 current_members_hi;
+	uint64 current_epoch;
+	uint64 publication_seq;
+	int32 current_coordinator_node;
+	uint32 consumed = 0;
+
+	if (semantic_activation_ack_ingress_pending(
+			&semantic_activation_ack_local_ingress) == 0) {
+		if (SemanticActivationAckTable == NULL)
+			return;
+		publication_seq = pg_atomic_read_u64(
+			&SemanticActivationAckTable->publication_seq);
+		if ((publication_seq & UINT64_C(1)) == 0
+			&& SemanticActivationAckTable->expected_members_lo == 0
+			&& SemanticActivationAckTable->expected_members_hi == 0)
+			return;
+	}
+	if (!semantic_activation_ack_current_authority(
+			cluster_node_id, &current_members_lo, &current_members_hi,
+			&current_epoch, &current_coordinator_node)) {
+		semantic_activation_ack_lmon_invalidate_active();
+		while (consumed < CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY
+			   && semantic_activation_ack_ingress_poll(
+				   &semantic_activation_ack_local_ingress, &item))
+			consumed++;
+		return;
+	}
+	semantic_activation_ack_lmon_revalidate_active(
+		current_members_lo, current_members_hi, current_epoch,
+		current_coordinator_node);
+
+	while (consumed < CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY
+		   && semantic_activation_ack_ingress_poll(
+			   &semantic_activation_ack_local_ingress, &item)) {
+		consumed++;
+		if (!semantic_activation_ack_current_authority(
+				cluster_node_id, &current_members_lo, &current_members_hi,
+				&current_epoch, &current_coordinator_node)) {
+			semantic_activation_ack_lmon_invalidate_active();
+			continue;
+		}
+		if (item.message.kind == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK)
+			(void)semantic_activation_ack_lmon_apply_item(
+				&item, current_members_lo, current_members_hi,
+				current_epoch, current_coordinator_node);
+	}
+}
+
 typedef enum SemanticActivationHeldLocks {
 	SEMANTIC_ACTIVATION_HELD_NONE = 0,
 	SEMANTIC_ACTIVATION_HELD_RESOURCE = UINT32_C(1),
@@ -3605,6 +3688,7 @@ cluster_semantic_activation_lmon_tick(void)
 	SemanticActivationAdmissionSnapshot snapshot;
 	uint64 current_epoch;
 
+	semantic_activation_ack_lmon_drain();
 	if (SemanticActivationShmem == NULL)
 		return;
 	semantic_activation_lmon_consume_phase3();

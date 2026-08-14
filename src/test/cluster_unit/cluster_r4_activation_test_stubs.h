@@ -45,6 +45,7 @@ static bool cluster_r4_activation_test_admitted_snapshot_valid;
 static uint64 cluster_r4_activation_test_admitted_members_lo;
 static uint64 cluster_r4_activation_test_admitted_members_hi;
 static uint64 cluster_r4_activation_test_admitted_epoch;
+static uint32 cluster_r4_activation_test_admitted_snapshot_calls;
 
 void ProcessInterrupts(void);
 
@@ -166,6 +167,7 @@ cluster_reconfig_lmon_snapshot_admitted_membership(
 	uint64 *out_members_hi,
 	uint64 *out_formation_epoch)
 {
+	cluster_r4_activation_test_admitted_snapshot_calls++;
 	if (out_members_lo != NULL)
 		*out_members_lo = 0;
 	if (out_members_hi != NULL)

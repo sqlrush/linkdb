@@ -254,6 +254,14 @@ cluster_membership_is_member(int32 node_id)
 	return node_id >= 0 && node_id < 4;
 }
 
+ClusterMembershipState
+cluster_membership_get_state(int32 node_id)
+{
+	return cluster_membership_is_member(node_id)
+			   ? CLUSTER_MEMBER_MEMBER
+			   : CLUSTER_MEMBER_REMOVED;
+}
+
 bool
 cluster_reconfig_lmon_observe_replacement_ready(
 	const ClusterReplacementPhase3HandoffItem *item)
