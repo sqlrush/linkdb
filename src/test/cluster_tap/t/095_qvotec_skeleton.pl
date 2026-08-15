@@ -24,7 +24,7 @@
 #           default empty)
 #      L2   cluster.quorum_poll_interval_ms GUC default 2000ms
 #      L3   cluster.voting_disk_io_timeout_ms GUC default 5000ms
-#      L4   cluster.voting_disk_size_bytes GUC default 328192 bytes
+#      L4   cluster.voting_disk_size_bytes GUC default 394240 bytes
 #      L5   pg_cluster_quorum_state view returns single row;
 #           in_quorum=false (Q4 v0.2 fail-closed because qvotec not
 #           running per D8 deferral)
@@ -101,12 +101,12 @@ is($io_default, '5000', 'L3 cluster.voting_disk_io_timeout_ms default 5000ms');
 
 
 # ----------
-# L4: cluster.voting_disk_size_bytes GUC default 328192 bytes (5 regions
-# + the cluster-wide stripe activation record).
+# L4: cluster.voting_disk_size_bytes GUC default 394240 bytes (PGSA plus
+# 128 per-proposer epoch-ballot lanes after the existing regions).
 # ----------
 my $size_default = $node->safe_psql('postgres',
 	q{SELECT setting FROM pg_settings WHERE name = 'cluster.voting_disk_size_bytes'});
-is($size_default, '328192', 'L4 cluster.voting_disk_size_bytes default 328192 (spec-6.15: (5 x 128 + 1) x 512 -- adds the xid stripe region + activation record)');
+is($size_default, '394240', 'L4 cluster.voting_disk_size_bytes default 394240 (spec-5.15A: (6 x 128 + 2) x 512 -- PGSA plus epoch-ballot lanes)');
 
 
 # ----------

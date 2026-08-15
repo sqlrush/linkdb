@@ -46,6 +46,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_advisory.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_ges.h" /* GES_REJECT_REASON_* for U6 */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
@@ -101,6 +102,8 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 bool cluster_lms_enabled = true;
 bool cluster_lmd_enabled = true;
 static bool stub_lms_ready_for_test = true;
+static int32 stub_master_node = -1;
+static uint32 stub_local_release_result = GES_REJECT_REASON_NONE;
 
 bool
 cluster_lms_is_ready(void)
@@ -378,7 +381,7 @@ cluster_grd_shard_for_resource(const ClusterResId *resid pg_attribute_unused())
 int32
 cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
 {
-	return -1;
+	return stub_master_node;
 }
 
 /* spec-4.6a: the S4-reject diagnostic references the CSSD peer-state view;
@@ -491,6 +494,8 @@ static uint32 stub_ges_reject_reason = 0;
 static PcmXQueueResult stub_pcm_x_nested_guard_result = PCM_X_QUEUE_OK;
 static int stub_ges_request_wait_calls;
 static int stub_ges_request_nowait_wait_calls;
+static int stub_ges_release_timeout_ms;
+static uint32 stub_ges_release_wait_event;
 static int stub_ges_convert_wait_calls;
 
 PcmXQueueResult
@@ -526,18 +531,23 @@ cluster_ges_send_request_nowait_and_wait(
 
 uint32
 cluster_ges_send_release_and_wait(const struct ClusterResId *resid pg_attribute_unused(),
-								  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
-								  uint64 request_id pg_attribute_unused())
+									  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+									  uint64 request_id pg_attribute_unused(),
+									  int timeout_ms, uint32 wait_event)
 {
+	stub_ges_release_timeout_ms = timeout_ms;
+	stub_ges_release_wait_event = wait_event;
 	return 0;
 }
 
 /* spec-5.5 P0 — local-master release drain (no-op in the standalone fixture;
  * the real drain+wake is exercised by cluster_tap t/286). */
-void
+uint32
 cluster_ges_release_and_drain_local(const struct ClusterResId *resid pg_attribute_unused(),
 									const struct ClusterGrdHolderId *holder pg_attribute_unused())
-{}
+{
+	return stub_local_release_result;
+}
 
 /* spec-5.3 — convert send + tm_convert_mode GUC (cluster_lock_acquire.c refs). */
 int cluster_tm_convert_mode = 0; /* CLUSTER_TM_CONVERT_MODE_CONVERT */
@@ -632,6 +642,34 @@ UT_TEST(test_7step_individual_steps_null_req_internal)
 				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
 	UT_ASSERT_EQ((int)cluster_lock_acquire_s7_cleanup(NULL),
 				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+}
+
+UT_TEST(test_s6_local_master_unconfirmed_release_fails_closed)
+{
+	ClusterLockAcquireRequest req;
+	int32 saved_master = stub_master_node;
+	uint32 saved_release_result = stub_local_release_result;
+
+	memset(&req, 0, sizeof(req));
+	stub_master_node = cluster_node_id;
+	stub_local_release_result = GES_REJECT_REASON_TIMEOUT;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	stub_master_node = -1;
+	stub_local_release_result = GES_REJECT_REASON_NONE;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL);
+	stub_master_node = cluster_node_id + 1;
+	req.timeout_ms = 4321;
+	req.wait_event = UINT32_C(9876);
+	stub_ges_release_timeout_ms = 0;
+	stub_ges_release_wait_event = 0;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s6_release(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT_EQ(stub_ges_release_timeout_ms, 4321);
+	UT_ASSERT_EQ(stub_ges_release_wait_event, UINT32_C(9876));
+	stub_local_release_result = saved_release_result;
+	stub_master_node = saved_master;
 }
 
 /*
@@ -1039,6 +1077,30 @@ UT_TEST(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits)
 }
 
 
+/* RF A1 R2: a CF resource can never use dead-master native fallback. */
+UT_TEST(test_cf_s4_dead_master_native_is_nonaffirmative)
+{
+	ClusterLockAcquireRequest req;
+	ClusterLockAcquireResult result;
+	uint32 saved_reject = stub_ges_reject_reason;
+
+	memset(&req, 0, sizeof(req));
+	req.resid.type = CLUSTER_CF_RESID_TYPE;
+	req.lockmode = ExclusiveLock;
+	stub_ges_reject_reason = GES_REJECT_REASON_MASTER_DEAD_NATIVE;
+	result = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)result, (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+
+	/* Control: the existing dead-master native fallback remains unchanged for
+	 * a non-CF resource. */
+	req.resid.type = 0;
+	result = cluster_lock_acquire_s4_remote_request_wait(&req);
+	UT_ASSERT_EQ((int)result, (int)CLUSTER_LOCK_ACQUIRE_OK_NATIVE);
+
+	stub_ges_reject_reason = saved_reject;
+}
+
+
 /*
  * spec-5.3 — native-probe PG parallel lock-group exemption helper.  Pure
  * pointer/flag logic (no shmem deref), so it is driven directly with distinct
@@ -1114,11 +1176,12 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(15);
+	UT_PLAN(17);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
 	UT_RUN(test_7step_individual_steps_null_req_internal);
+	UT_RUN(test_s6_local_master_unconfirmed_release_fails_closed);
 	UT_RUN(test_7step_top_level_null_req_s7_cleanup_invoked);
 	UT_RUN(test_7step_top_level_monotonic_forward_no_cleanup_on_success);
 	UT_RUN(test_7step_s4_master_reject_default_deny);
@@ -1129,6 +1192,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_ul_session_advisory_globalize_gate);
 	UT_RUN(test_ul_try_lock_nowait_s4_reject_mapping);
 	UT_RUN(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits);
+	UT_RUN(test_cf_s4_dead_master_native_is_nonaffirmative);
 	UT_RUN(test_native_probe_same_lock_group_exempt);
 	UT_RUN(test_s5_not_found_benign_narrow);
 

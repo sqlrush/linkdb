@@ -206,6 +206,24 @@ StaticAssertDecl(sizeof(ClusterLmsNativeLockProbeSlot) == 256,
 				 "ClusterLmsNativeLockProbeSlot ABI 256B lock (spec-2.27 D5 bump from 128B; "
 				 "LWLockPadded = PG_CACHE_LINE_SIZE = 128B on current build)");
 
+/* spec-8.4 D4-B — exact append-only LMS incarnation/drain controls. */
+typedef struct ClusterLmsR4Controls {
+	uint64 data_worker_incarnation[CLUSTER_LMS_MAX_WORKERS];
+	uint64 drain_request_generation;
+	uint64 drain_ack_generation;
+} ClusterLmsR4Controls;
+
+StaticAssertDecl(offsetof(ClusterLmsR4Controls, data_worker_incarnation) == 0,
+				 "ClusterLmsR4Controls data worker incarnations must start at byte 0");
+StaticAssertDecl(offsetof(ClusterLmsR4Controls, drain_request_generation) == 64,
+				 "ClusterLmsR4Controls drain request generation must start at byte 64");
+StaticAssertDecl(offsetof(ClusterLmsR4Controls, drain_ack_generation) == 72,
+				 "ClusterLmsR4Controls drain ack generation must start at byte 72");
+StaticAssertDecl(sizeof(ClusterLmsR4Controls) == 80,
+				 "ClusterLmsR4Controls ABI must remain exactly 80 bytes");
+StaticAssertDecl(33792 + sizeof(ClusterLmsR4Controls) == 33872,
+				 "spec-8.4 D4-B total shared-memory increment must remain 33872 bytes");
+
 typedef struct ClusterLmsSharedState {
 	LWLock lwlock;				/* LWTRANCHE_CLUSTER_LMS guards non-atomic fields */
 	pg_atomic_uint32 lms_state; /* ClusterLmsState atomic (HC4 single ownership field) */
@@ -324,6 +342,8 @@ typedef struct ClusterLmsSharedState {
 	/* Capability-bound wire frames consumed before send because the peer's
 	 * current HELLO record no longer matches the staged connection generation. */
 	pg_atomic_uint64 worker_outbound_cap_guard_drop_count[CLUSTER_LMS_MAX_WORKERS];
+
+	ClusterLmsR4Controls r4_controls;
 } ClusterLmsSharedState;
 
 
@@ -372,6 +392,27 @@ extern void LmsMain(void) pg_attribute_noreturn();
  */
 extern void LmsWorkerMain(int worker_id) pg_attribute_noreturn();
 
+/* D4-B LMON/worker0 close handshake over the existing 80-byte control tail. */
+extern bool cluster_lms_r4_drain_request(ClusterLmsSharedState *state,
+									 uint64 generation,
+									 uint64 *worker_incarnation);
+
+#ifdef USE_CLUSTER_UNIT
+extern uint64 cluster_lms_test_publish_r4_worker_incarnation(ClusterLmsSharedState *state,
+												 int worker_id);
+extern bool cluster_lms_test_r4_drain_request(ClusterLmsSharedState *state,
+											 uint64 generation,
+											 uint64 *worker_incarnation);
+extern bool cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state,
+										 uint64 worker_incarnation,
+										 uint64 generation);
+extern bool cluster_lms_test_r4_drain_ack_matches(ClusterLmsSharedState *state,
+												 uint64 worker_incarnation,
+												 uint64 generation);
+extern bool cluster_lms_test_r4_drain_ack_tick(ClusterLmsSharedState *state,
+											 uint64 worker_incarnation);
+#endif
+
 /*
  * spec-7.3 D2 — read a worker's published pid (0 = not running).  worker_id
  * in [0, CLUSTER_LMS_MAX_WORKERS).  Used by the D4 wakeup path + tests.
@@ -388,8 +429,18 @@ extern pid_t cluster_lms_get_worker_pid(int worker_id);
  */
 extern bool cluster_lms_data_plane_startup(int worker_id, int n_workers);
 extern bool cluster_lms_data_plane_enabled(void);
+extern void cluster_lms_data_plane_close_peer_now(int32 peer_id);
 extern void cluster_lms_data_plane_tick(long timeout_ms);
 extern void cluster_lms_data_plane_shutdown(void);
+
+#ifdef USE_CLUSTER_UNIT
+extern void cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd,
+											  bool connected, bool enabled,
+											  bool wes_dirty);
+extern bool cluster_lms_data_plane_test_peer_snapshot(int32 peer_id,
+											  int *fd_out, bool *down_out,
+											  bool *wes_dirty_out);
+#endif
 
 /*
  * PGRAC: spec-7.2 D4 + spec-7.3 D4 — wake a specific DATA worker + the

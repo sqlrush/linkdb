@@ -52,6 +52,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"			 /* spec-2.16 D8 newly-dead bitmap diff */
 #include "cluster/cluster_epoch.h"			 /* spec-4.6 D1 — accepted epoch reads */
+#include "cluster/cluster_external_fence.h" /* STOP04 rejoin cleanup cut */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — reconfig event consume */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 — unfreeze gate */
 #include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
@@ -3068,16 +3069,6 @@ cluster_grd_recovery_lmon_tick(void)
 		grd_recovery_wait_cluster_watchdog(dead, episode_epoch);
 
 		/*
-		 * spec-4.11 D1 (3b-4b Part 3) — launch one per-episode online thread-
-		 * recovery worker for each in-scope dead origin (idempotent per tick;
-		 * a NO-OP out of scope, so the spec-4.7 path is unchanged).  The worker
-		 * online-replays the dead thread's WAL data + visibility to shared
-		 * storage and publishes the node-local materialization authority; the
-		 * D3 gate below then holds the GES shards frozen until it lands.
-		 */
-		cluster_thread_recovery_launch_workers(dead, (CLUSTER_MAX_NODES + 63) / 64, episode_epoch);
-
-		/*
 		 * spec-5.7 D3 S5d (§3.1b R4/R9) — launch one per-episode HW authority
 		 * rebuild worker for each dead origin whose shards this survivor adopted.
 		 * Independent of online_thread_recovery (the HW authority is default-on):
@@ -3151,7 +3142,7 @@ cluster_grd_recovery_lmon_tick(void)
 			 * fail-closed (the per-block cluster_gcs_block_phase_for_tag gate
 			 * keeps the same posture for individual blocks; this gate additionally
 			 * holds the GES shards frozen).  Out of scope — online_thread_recovery
-			 * off (the default) / no shared backend / >2-node — the gate is a
+			 * off (the default) / no shared backend — the gate is a
 			 * no-op, so the spec-4.7 unfreeze path is unchanged (no regression).
 			 * REDECLARE_DONE was re-announced just above, so peers stay converged
 			 * while we wait for the replay (the live executor lands in 3b-4).
@@ -5623,7 +5614,8 @@ static bool cluster_grd_hashremove_if_still_empty(const ClusterResId *resid);
  *	single FIFO REQUEST waiter is popped.  Stale-epoch converts and waiters are
  *	dropped first (spec-4.6 P0#3 window guard: a grant reply echoing a stale
  *	tuple would be rejected and leak a zombie grant).  Returns the number of
- *	granted identities (each tagged REQUEST or CONVERT) for the caller to route.
+ *	granted identities (each tagged REQUEST or CONVERT) for the caller to route,
+ *	or -1 when the exact holder is absent and no release occurred.
  */
 int
 cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderId *holder,
@@ -5635,13 +5627,14 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 	int n;
 	ClusterGesHandoffSnapshot handoff_snap; /* spec-6.12e1 drain snapshot */
 	bool handoff_armed = false;
+	bool holder_removed = false;
 
 	Assert(resid != NULL && holder != NULL);
 	Assert(granted_out != NULL && max_out > 0);
 
 	lookup_result = cluster_grd_entry_lookup_or_create(resid, false, &entry);
 	if (lookup_result != CLUSTER_GRD_ENTRY_OK || entry == NULL)
-		return 0;
+		return -1;
 
 	SpinLockAcquire(&entry->lock);
 
@@ -5656,8 +5649,14 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 			memset(&entry->holders[entry->ngranted - 1], 0, sizeof(ClusterGrdHolder));
 			entry->ngranted--;
 			entry->generation++;
+			holder_removed = true;
 			break;
 		}
+	}
+	if (!holder_removed) {
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		return -1;
 	}
 
 	/* (2) Drop stale-epoch converts and waiters before granting. */
@@ -6164,6 +6163,80 @@ cluster_grd_clean_leave_verify_no_leftover(int32 leaving_node)
 	if (resids != NULL)
 		pfree(resids);
 	return ok;
+}
+
+/* STOP04 §2.4.1: expose only the exact all-survivor cleanup cut for the
+ * current FAIL_STOP lineage.  This is a read-only process-local snapshot;
+ * later GRD gates/unfreeze and daemon state are deliberately not authority. */
+bool
+cluster_grd_rejoin_clear_snapshot(
+	const ClusterReconfigRejoinFailureSnapshotV1 *failure,
+	ClusterGrdRejoinClearSnapshotV1 *out_clear)
+{
+	ClusterReconfigRejoinFailureSnapshotV1 current;
+	ClusterGrdRejoinClearSnapshotV1 clear;
+	uint64 dead_hash;
+	int survivor_count = 0;
+	int i;
+
+	if (out_clear != NULL)
+		memset(out_clear, 0, sizeof(*out_clear));
+	if (out_clear == NULL || failure == NULL || cluster_grd_state == NULL ||
+		failure->reconfig_kind != RECONFIG_KIND_FAIL_STOP ||
+		failure->reserved0 != 0 || failure->reserved68 != 0 ||
+		failure->event_id == 0 || failure->new_epoch == 0 ||
+		failure->cssd_dead_generation == 0 ||
+		failure->old_node_id < 0 ||
+		failure->old_node_id >= CLUSTER_MAX_NODES ||
+		failure->old_incarnation == 0)
+		return false;
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+	{
+		uint8 survivors = failure->survivor_bitmap[i];
+
+		if ((failure->dead_bitmap[i] & survivors) != 0)
+			return false;
+		while (survivors != 0)
+		{
+			survivor_count += survivors & 1;
+			survivors >>= 1;
+		}
+	}
+	if (survivor_count < 1 || survivor_count >= CLUSTER_MAX_NODES ||
+		(failure->dead_bitmap[failure->old_node_id / 8] &
+		 (uint8)(UINT8_C(1) << (failure->old_node_id % 8))) == 0 ||
+		(failure->survivor_bitmap[failure->old_node_id / 8] &
+		 (uint8)(UINT8_C(1) << (failure->old_node_id % 8))) != 0)
+		return false;
+
+	if (!cluster_reconfig_rejoin_failure_snapshot(failure->old_node_id,
+			failure->old_incarnation, &current) ||
+		memcmp(&current, failure, sizeof(current)) != 0)
+		return false;
+	dead_hash = cluster_grd_dead_bitmap_hash(failure->dead_bitmap);
+	if (dead_hash == 0 ||
+		cluster_grd_recovery_episode_epoch_value() != failure->new_epoch ||
+		cluster_grd_recovery_event_bitmap_hash_value() != dead_hash)
+		return false;
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+	{
+		if ((failure->survivor_bitmap[i / 8] &
+			 (uint8)(UINT8_C(1) << (i % 8))) == 0)
+			continue;
+		if (cluster_grd_recovery_done_epoch_for(i) != failure->new_epoch ||
+			cluster_grd_recovery_done_bitmap_hash_for(i) != dead_hash)
+			return false;
+	}
+	if (!cluster_grd_clean_leave_verify_no_leftover(failure->old_node_id))
+		return false;
+
+	memset(&clear, 0, sizeof(clear));
+	clear.episode_epoch = failure->new_epoch;
+	clear.dead_bitmap_hash = dead_hash;
+	memcpy(clear.survivor_bitmap, failure->survivor_bitmap,
+		   sizeof(clear.survivor_bitmap));
+	*out_clear = clear;
+	return true;
 }
 
 /*

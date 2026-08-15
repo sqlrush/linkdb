@@ -591,16 +591,48 @@ ic_le_write_uint64(uint8 *buf, uint64 v)
 		buf[i] = (uint8)((v >> (8 * i)) & 0xFF);
 }
 
+uint32
+cluster_ic_local_capability_word(void)
+{
+	uint32 capabilities
+		= PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1
+		  | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1
+		  | PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1
+		  | PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1
+		  | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
+		  | PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1
+		  | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
+		  | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1
+		  | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+		  | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+		  | PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+		  | PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1
+		  | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+		  | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1;
+
+	if (cluster_smart_fusion
+		&& cluster_interconnect_tier == cluster_smart_fusion_tier_min)
+		capabilities |= PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2;
+	if (!cluster_ic_suppress_caps_reply)
+		capabilities |= PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1;
+	if (!cluster_ic_suppress_gcs_done_cap)
+		capabilities |= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
+	if (!cluster_ic_suppress_xid_flock_cap)
+		capabilities |= PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2;
+	return capabilities;
+}
+
 void
 cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version,
 					   uint16 envelope_version, int32 source_node_id, const char *cluster_name,
 					   ClusterICPlane plane, uint64 conn_epoch)
 {
 	size_t name_len;
-	uint32 capabilities = 0;
+	uint32 capabilities;
 
 	Assert(out_buf != NULL);
 	Assert(cluster_name != NULL);
+	capabilities = cluster_ic_local_capability_word();
 
 	/*
 	 * Zero the entire buffer first so the _pad region is deterministic
@@ -622,55 +654,6 @@ cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version
 		memcpy(out_buf + 12, cluster_name, name_len);
 	/* out_buf[12 + name_len] .. out_buf[35] already zero from memset. */
 
-	if (cluster_smart_fusion && cluster_interconnect_tier == cluster_smart_fusion_tier_min)
-		capabilities |= PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2;
-	/* spec-5.22d D4-6: protocol capability, not runtime policy — this binary
-	 * understands kind-4 / version-2 regardless of any GUC, so advertise
-	 * unconditionally (the serve side's GUC gate refuses at run time). */
-	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_AUTHORITY_SERVE_V1;
-	/* spec-5.22e D5-2: same protocol-capability discipline for the undo
-	 * horizon report msg_type. */
-	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_HORIZON_V1;
-	/* spec-2.2 additive amendment (spec-5.22e D5 prereq): META capability --
-	 * "I can receive PEER_CAPS_REPLY".  Same unconditional discipline; the
-	 * test-only suppression GUC simulates an old binary (no bit on the
-	 * wire, so a new acceptor never sends this node a reply). */
-	if (!cluster_ic_suppress_caps_reply)
-		capabilities |= PGRAC_IC_HELLO_CAP_CAPS_REPLY_V1;
-	/* GCS-race round-2 review F6: completion-proof protocol capability,
-	 * same unconditional discipline (see cluster_ic.h).  The test-only
-	 * suppression GUC simulates a pre-GCS_DONE binary (no bit on the wire,
-	 * so peers pin this node's requests by the legacy protocol ceiling). */
-	if (!cluster_ic_suppress_gcs_done_cap)
-		capabilities |= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
-	/* GCS-race round-3 P0-1: xid wrap-barrier protocol capability, same
-	 * unconditional discipline (see cluster_ic.h). */
-	capabilities |= PGRAC_IC_HELLO_CAP_XID_NATIVE_DISABLE_V1;
-	/* GCS-race round-4 P0-1: authority flock/stamped-magic protocol
-	 * capability (distinct from the barrier bit above).  The test-only
-	 * suppression GUC simulates a round-3b binary: barrier-capable but
-	 * still running lock-free authority writes, so the wrap barrier must
-	 * hold its gate. */
-	if (!cluster_ic_suppress_xid_flock_cap)
-		capabilities |= PGRAC_IC_HELLO_CAP_XID_AUTHORITY_FLOCK_V2;
-	/* PGRAC ownership-generation wave (ruling ②): RETRYABLE_BUSY invalidate
-	 * negative-ACK protocol capability, same unconditional discipline (see
-	 * cluster_ic.h). */
-	capabilities |= PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1;
-	/* PGRAC TT lane (S3 idle-peer floor pin): undo-horizon idle-unconstrained
-	 * sentinel protocol capability, same unconditional discipline (see
-	 * cluster_ic.h). */
-	capabilities |= PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1;
-	/* PCM-X conversion is a protocol capability.  Every opcode has a distinct
-	 * registered DATA-plane type, so mixed-version senders gate on this bit. */
-	capabilities |= PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1;
-	/* A' rebase: V2 INSTALL_READY understanding, same unconditional protocol
-	 * discipline; activation is formation-wide (see cluster_ic.h). */
-	capabilities |= PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1;
-	/* P0-20: V2 REVOKE source-floor carrier.  Senders still gate the extended
-	 * frame on the selected peer's current verified connection. */
-	capabilities |= PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1;
-	capabilities |= PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1;
 	if (capabilities != 0)
 		ic_le_write_uint32(out_buf + PGRAC_IC_HELLO_CAPABILITIES_OFFSET, capabilities);
 

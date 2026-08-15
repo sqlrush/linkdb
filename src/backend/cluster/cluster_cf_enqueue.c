@@ -27,10 +27,15 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
+#include <errno.h>
+
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "storage/fd.h"
 #include "storage/lock.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -58,6 +63,12 @@ static CfHoldState cf_hold_s;
  * write path proceed without a held CF X during early recovery.
  */
 static bool cf_bootstrap_authority = false;
+
+/*
+ * RF-B: process-local permission for the EOR checkpointer.  It is enabled only
+ * after the shared INSTALLED -> ACTIVE CAS and is never inferred from phase.
+ */
+static bool cf_owner_eor_authority = false;
 
 /*
  * spec-5.6 increment (ii/iii): JOIN_READONLY marks an attaching (join) node
@@ -200,6 +211,37 @@ cluster_cf_unlock(LOCKMODE mode)
 	slot->coordinated = false;
 }
 
+bool
+cluster_cf_held_is_clusterwide(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return slot->held && slot->coordinated;
+}
+
+ClusterCfReleaseResult
+cluster_cf_unlock_confirmed(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+	ClusterLockAcquireResult result;
+
+	if (!slot->held)
+		return CLUSTER_CF_RELEASE_NOT_HELD;
+	if (!slot->coordinated) {
+		slot->held = false;
+		slot->coordinated = false;
+		return CLUSTER_CF_RELEASE_NOT_HELD;
+	}
+
+	result = cluster_lock_acquire_s6_release(&slot->req);
+	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+		return CLUSTER_CF_RELEASE_UNCONFIRMED;
+
+	slot->held = false;
+	slot->coordinated = false;
+	return CLUSTER_CF_RELEASE_CONFIRMED;
+}
+
 /*
  * cluster_cf_held -- does this backend hold the CF lock in `mode`?
  */
@@ -220,12 +262,13 @@ cluster_cf_set_bootstrap_authority(bool on)
 
 /*
  * cluster_cf_write_permitted -- is a shared-authority control-file write
- * currently allowed (held CF X, or the bootstrap single-node window)?
+ * currently allowed (held CF X, Startup owner, or EOR owner)?
  */
 bool
 cluster_cf_write_permitted(void)
 {
-	return cluster_cf_held(ExclusiveLock) || cf_bootstrap_authority;
+	return cluster_cf_held(ExclusiveLock) || cf_bootstrap_authority
+		|| cf_owner_eor_authority;
 }
 
 /*
@@ -235,6 +278,149 @@ bool
 cluster_cf_in_bootstrap_window(void)
 {
 	return cf_bootstrap_authority;
+}
+
+/*
+ * cluster_cf_exactly_one_declared_node
+ *
+ * RF-B must use the same exact-one authority fact in Startup and in the EOR
+ * checkpointer.  A normal cluster boot has already populated ClusterConfShmem.
+ * The native shared-catalog seed deliberately runs with cluster.enabled=off,
+ * so spec-2.1 forbids cluster_conf_load() and the shmem count remains zero.
+ * In that one case, inspect only the postmaster-static node declarations and
+ * fail closed on a missing, malformed, duplicate, or foreign node section.
+ */
+bool
+cluster_cf_exactly_one_declared_node(void)
+{
+	const char *path;
+	FILE *f;
+	char line[1024];
+	int loaded_count;
+	int declared_count = 0;
+	bool valid = true;
+
+	loaded_count = cluster_conf_node_count();
+	if (loaded_count != 0)
+		return loaded_count == 1;
+
+	path = (cluster_config_file != NULL && cluster_config_file[0] != '\0')
+		? cluster_config_file : "pgrac.conf";
+	f = AllocateFile(path, "r");
+	if (f == NULL)
+		return false;
+
+	while (fgets(line, sizeof(line), f) != NULL) {
+		char *p = line;
+		char *endptr;
+		long node_id;
+
+		while (*p != '\0' && isspace((unsigned char)*p))
+			p++;
+		if (strncmp(p, "[node.", 6) != 0)
+			continue;
+
+		errno = 0;
+		node_id = strtol(p + 6, &endptr, 10);
+		if (errno != 0 || endptr == p + 6 || *endptr != ']'
+			|| node_id < 0 || node_id >= CLUSTER_MAX_NODES
+			|| node_id != cluster_node_id) {
+			valid = false;
+			break;
+		}
+		endptr++;
+		while (*endptr != '\0' && isspace((unsigned char)*endptr))
+			endptr++;
+		if (*endptr != '\0' && *endptr != '#' && *endptr != ';') {
+			valid = false;
+			break;
+		}
+
+		declared_count++;
+		if (declared_count > 1) {
+			valid = false;
+			break;
+		}
+	}
+	if (ferror(f))
+		valid = false;
+	if (FreeFile(f) != 0)
+		valid = false;
+
+	return valid && declared_count == 1;
+}
+
+/*
+ * cluster_cf_owner_eor_install -- transport the exact one-node OWNER decision.
+ */
+bool
+cluster_cf_owner_eor_install(void)
+{
+	if (!cluster_controlfile_shared_authority
+		|| !cluster_cf_exactly_one_declared_node()
+		|| cluster_cf_join_readonly()
+		|| cf_bootstrap_authority)
+		return false;
+	if (!cluster_cf_owner_eor_phase_install())
+		return false;
+
+	cf_bootstrap_authority = true;
+	return true;
+}
+
+/*
+ * cluster_cf_owner_eor_consume -- grant this EOR checkpointer local permission
+ * only after all fresh gates and the exact INSTALLED -> ACTIVE transition.
+ */
+bool
+cluster_cf_owner_eor_consume(bool end_of_recovery, bool identity_ok)
+{
+	if (!end_of_recovery || !identity_ok
+		|| !cluster_controlfile_shared_authority
+		|| !cluster_cf_exactly_one_declared_node()
+		|| cluster_cf_join_readonly()
+		|| cf_owner_eor_authority)
+		return false;
+	if (!cluster_cf_owner_eor_phase_activate())
+		return false;
+
+	cf_owner_eor_authority = true;
+	return true;
+}
+
+bool
+cluster_cf_owner_eor_local_active(void)
+{
+	return cf_owner_eor_authority;
+}
+
+bool
+cluster_cf_owner_eor_complete(void)
+{
+	if (!cf_owner_eor_authority || !cluster_cf_owner_eor_phase_done())
+		return false;
+
+	cf_owner_eor_authority = false;
+	return true;
+}
+
+void
+cluster_cf_owner_eor_abort(void)
+{
+	/* No I/O, logging or shared transition: ACTIVE deliberately survives. */
+	cf_owner_eor_authority = false;
+}
+
+bool
+cluster_cf_owner_eor_close(void)
+{
+	if (!cf_bootstrap_authority)
+		return cluster_cf_owner_eor_phase_read() == CLUSTER_CF_OWNER_EOR_EMPTY;
+	if (!cluster_cf_owner_eor_phase_clear())
+		return false;
+
+	cf_bootstrap_authority = false;
+	return true;
 }
 
 /*

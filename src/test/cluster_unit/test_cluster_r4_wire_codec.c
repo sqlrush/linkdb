@@ -75,6 +75,7 @@ run_wire_vector(int vector)
 	uint8 bytes[8];
 	uint8 page[BLCKSZ];
 	uint64 value;
+	uint32 physical_generation = UINT32_MAX;
 	ClusterTxResolution input;
 	ClusterTxResolution output;
 
@@ -336,6 +337,60 @@ run_wire_vector(int vector)
 			UT_ASSERT(ClusterR4ForwardExtensionGetLocator(
 				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator));
 			UT_ASSERT(decoded_locator.xid != locator.xid);
+			break;
+		case 44:
+			UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator,
+				UINT32_C(0x01020304)));
+			UT_ASSERT(ClusterR4ForwardExtensionGetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &decoded_locator,
+				&physical_generation));
+			UT_ASSERT_EQ(physical_generation, UINT32_C(0x01020304));
+			UT_ASSERT_EQ(memcmp(&decoded_locator, &locator, sizeof(locator)), 0);
+			UT_ASSERT_EQ(forward.subject_id_le[0], 0x04);
+			UT_ASSERT_EQ(forward.subject_id_le[3], 0x01);
+			break;
+		case 45:
+			UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &locator, 0));
+			UT_ASSERT(ClusterR4ForwardExtensionGetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator,
+				&physical_generation));
+			UT_ASSERT_EQ(physical_generation, 0);
+			break;
+		case 46:
+			memset(&forward, 0xa5, sizeof(forward));
+			UT_ASSERT(!ClusterR4ForwardExtensionSetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator, UINT32_MAX));
+			UT_ASSERT(bytes_are_zero((const uint8 *)&forward, sizeof(forward)));
+			break;
+		case 47:
+			ClusterR4ForwardExtensionSetLocator(&forward,
+				CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator);
+			ClusterR4WireWriteU32(forward.subject_id_le, UINT32_MAX);
+			memset(&decoded_locator, 0xa5, sizeof(decoded_locator));
+			physical_generation = UINT32_C(0xa5a5a5a5);
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &decoded_locator,
+				&physical_generation));
+			UT_ASSERT(bytes_are_zero((const uint8 *)&decoded_locator,
+									 sizeof(decoded_locator)));
+			UT_ASSERT_EQ(physical_generation, 0);
+			break;
+		case 48:
+			UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator, 7));
+			forward.flags_le[0] = 1;
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &decoded_locator,
+				&physical_generation));
+			break;
+		case 49:
+			UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &locator, 9));
+			UT_ASSERT(!ClusterR4ForwardExtensionGetLocatorGeneration(
+				&forward, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &decoded_locator,
+				&physical_generation));
 			break;
 		case 64:
 			UT_ASSERT_EQ(CLUSTER_R4_TX_VERDICT_VERSION, 3);
@@ -633,10 +688,47 @@ UT_TEST(test_r4_and_legacy_reply_status_domains_are_disjoint)
 	UT_ASSERT(!GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)27));
 }
 
+UT_TEST(test_r4_undo_data_status_selects_existing_authenticated_reply_shape)
+{
+	UT_ASSERT(GcsBlockReplyStatusCarriesUndoAuthTrailer(
+		GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT));
+	UT_ASSERT_EQ(sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE
+				 + sizeof(ClusterGcsUndoAuthTrailer),
+			 8256);
+	UT_ASSERT(!GcsBlockReplyStatusCarriesUndoAuthTrailer(GCS_BLOCK_REPLY_R4_CR_FULL));
+	UT_ASSERT(!GcsBlockReplyStatusCarriesUndoAuthTrailer(
+		GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED));
+	UT_ASSERT(!GcsBlockReplyStatusCarriesUndoAuthTrailer(GCS_BLOCK_REPLY_R4_DENIED));
+}
+
+UT_TEST(test_r4_status24_physical_generation_echo_is_exact)
+{
+	GcsBlockReplyHeader header;
+	uint32 generation = UINT32_MAX;
+
+	memset(&header, 0, sizeof(header));
+	UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(&header, UINT32_C(0x01020304)));
+	UT_ASSERT(GcsBlockReplyHeaderGetR4UndoGeneration(&header, &generation));
+	UT_ASSERT_EQ(generation, UINT32_C(0x01020304));
+	UT_ASSERT_EQ(header.reserved_0[0], 0x04);
+	UT_ASSERT_EQ(header.reserved_0[3], 0x01);
+	UT_ASSERT_EQ(header.reserved_0[4], 0);
+	UT_ASSERT_EQ(header.reserved_0[5], 0);
+
+	memset(&header, 0xa5, sizeof(header));
+	UT_ASSERT(!GcsBlockReplyHeaderSetR4UndoGeneration(&header, UINT32_MAX));
+	UT_ASSERT(bytes_are_zero(header.reserved_0, sizeof(header.reserved_0)));
+
+	header.reserved_0[4] = 1;
+	generation = UINT32_C(0xa5a5a5a5);
+	UT_ASSERT(!GcsBlockReplyHeaderGetR4UndoGeneration(&header, &generation));
+	UT_ASSERT_EQ(generation, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(90);
+	UT_PLAN(92);
 	RUN_WIRE_TEST(0);
 	RUN_WIRE_TEST(1);
 	RUN_WIRE_TEST(2);
@@ -727,6 +819,8 @@ main(void)
 	RUN_WIRE_TEST(87);
 	UT_RUN(test_r4_reply_status_abi_tail_is_exact);
 	UT_RUN(test_r4_and_legacy_reply_status_domains_are_disjoint);
+	UT_RUN(test_r4_undo_data_status_selects_existing_authenticated_reply_shape);
+	UT_RUN(test_r4_status24_physical_generation_echo_is_exact);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

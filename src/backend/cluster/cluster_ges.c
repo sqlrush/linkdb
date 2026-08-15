@@ -55,6 +55,8 @@
 #include "cluster/cluster_ic_router.h" /* spec-5.8 D8 — cluster_ic_send_envelope (REPORT send-back) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
 #include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
+#include "cluster/cluster_replacement_wire.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B — peer DEAD state */
 #include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B — SOLE reclassify */
@@ -76,6 +78,22 @@
  * ============================================================ */
 
 static ClusterGesSharedState *cluster_ges_state = NULL;
+
+#define GES_REPLACEMENT_PHASE3_REQUIRED_CAPABILITIES \
+	PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+
+/* Opcode 18 is a little-endian 72-byte overlay, never a host-order
+ * GesRequestPayload.  Prefix selection happens before the legacy cast so a
+ * malformed/non-phase-3 replacement frame cannot enter the lock work queue. */
+static bool
+ges_payload_is_replacement_episode(const void *payload, uint32 payload_length)
+{
+	const uint8 *bytes = (const uint8 *)payload;
+
+	return bytes != NULL && payload_length >= sizeof(uint32)
+		   && bytes[0] == (uint8)GES_REQ_OPCODE_REPLACEMENT_EPISODE
+		   && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0;
+}
 
 static inline uint64
 ges_request_holder_epoch(const GesRequestPayload *req)
@@ -281,6 +299,27 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 	}
 	if (env->payload_length < sizeof(uint32)) {
 		cluster_grd_inc_ges_inbound_validation_fail();
+		return;
+	}
+
+	/* Spec-5.15A opcode-18 phase-3 ingress.  The IC router has already
+	 * authenticated env->source_node_id on this CONTROL connection.  Sample
+	 * that connection's exact corrected-A1 capability generation, then hand
+	 * the decoded observation to the process-local formation-LMON mailbox.
+	 * This handler never applies JCMK/D13 or waits; malformed, non-phase-3,
+	 * reconnect-stale, and full-mailbox inputs are simply withheld. */
+	if (ges_payload_is_replacement_episode(payload, env->payload_length)) {
+		uint32 connection_generation = 0;
+
+		if (env->payload_length == CLUSTER_REPLACEMENT_WIRE_BYTES
+			&& cluster_sf_peer_capability_family_sample(
+				   (int32)env->source_node_id,
+				   GES_REPLACEMENT_PHASE3_REQUIRED_CAPABILITIES, 0, NULL,
+				   &connection_generation))
+			(void)cluster_replacement_wire_phase3_ingress_local(
+				env, payload, env->payload_length, (int32)env->source_node_id,
+				cluster_node_id, cluster_epoch_get_current(),
+				connection_generation);
 		return;
 	}
 
@@ -989,22 +1028,38 @@ ges_dispatch_grant_identity(const ClusterGrdGrantIdentity *g, const ClusterResId
  *	pg_advisory_lock() (or any blocking enqueue) on a key mastered here would
  *	false-timeout 53R70 — or hang when cluster.ges_request_timeout_ms = -1.
  *	release_and_drain itself removes the holder, so the caller must NOT also call
- *	release_holder_by_id on this path.
+ *	release_holder_by_id on this path.  The return value is a GES reject reason:
+ *	NONE only after the exact holder was removed under a stable local-master
+ *	routing generation; missing holder, unknown/remastered owner, and invalid
+ *	input are non-affirmative.
  */
-void
+uint32
 cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
 									const struct ClusterGrdHolderId *holder)
 {
 	ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	uint64 generation_before;
+	uint64 generation_after;
+	int32 master_before;
+	int32 master_after;
 	int n_granted;
 	int i;
 
 	if (resid == NULL || holder == NULL)
-		return;
+		return GES_REJECT_REASON_TIMEOUT;
 
+	master_before = cluster_grd_lookup_master_gen(resid, &generation_before);
+	if (master_before != cluster_node_id)
+		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
 	n_granted = cluster_grd_release_and_drain(resid, holder, granted, lengthof(granted));
+	if (n_granted < 0)
+		return GES_REJECT_REASON_TIMEOUT;
+	master_after = cluster_grd_lookup_master_gen(resid, &generation_after);
+	if (master_after != cluster_node_id || generation_after != generation_before)
+		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
 	for (i = 0; i < n_granted; i++)
 		ges_dispatch_grant_identity(&granted[i], resid);
+	return GES_REJECT_REASON_NONE;
 }
 
 /*
@@ -1351,6 +1406,8 @@ cluster_ges_lmon_drain_work_queue(void)
 			int n_granted;
 
 			n_granted = cluster_grd_release_and_drain(&resid, &holder, granted, lengthof(granted));
+			if (n_granted < 0)
+				n_granted = 0;
 
 			/* Reply GRANT to the original releaser (acks the RELEASE). */
 			{
@@ -2133,7 +2190,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				sleep_ms = (int)remaining_ms;
 		}
 
-		if (ConditionVariableTimedSleep(&entry->cv, sleep_ms, wait_ev)) {
+		if (!ConditionVariableTimedSleep(&entry->cv, sleep_ms, wait_ev)) {
 			/* CV signaled — re-check loop predicate. */
 			continue;
 		}
@@ -2273,7 +2330,8 @@ cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 loc
 
 uint32
 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
-								  const struct ClusterGrdHolderId *holder, uint64 request_id)
+								  const struct ClusterGrdHolderId *holder, uint64 request_id,
+								  int timeout_ms, uint32 wait_event)
 {
 	int32 master;
 	GesReplyWaitKey key;
@@ -2331,8 +2389,12 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 	{
 		uint64 master_gen = cluster_lms_get_shard_master_generation();
 		int max_attempts = cluster_ges_retransmit_max_attempts;
-		bool perpetual = (cluster_ges_request_timeout_ms == -1);
+		bool perpetual
+			= (timeout_ms <= 0 && cluster_ges_request_timeout_ms == -1);
 		int effective_timeout_ms;
+		uint32 effective_wait_event = wait_event != 0
+			? wait_event
+			: WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 		int attempt = 0;
 		int backoff_ms = 100;
 		bool warned_starvation = false;
@@ -2342,7 +2404,11 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 			effective_timeout_ms = -1;
 			deadline = 0;
 		} else {
-			effective_timeout_ms = cluster_ges_request_timeout_ms;
+			effective_timeout_ms = timeout_ms > 0
+				? timeout_ms
+				: cluster_ges_request_timeout_ms;
+			if (effective_timeout_ms <= 0)
+				effective_timeout_ms = 600000;
 			deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), effective_timeout_ms);
 		}
 		memset(&key, 0, sizeof(key));
@@ -2409,8 +2475,8 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 					sleep_ms = (int)remaining_ms;
 			}
 
-			if (ConditionVariableTimedSleep(&entry->cv, sleep_ms,
-											WAIT_EVENT_CLUSTER_GES_REPLY_WAIT))
+			if (!ConditionVariableTimedSleep(&entry->cv, sleep_ms,
+										 effective_wait_event))
 				continue;
 
 			attempt++;

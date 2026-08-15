@@ -8,6 +8,8 @@
 #include "postgres.h"
 
 #include <setjmp.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cr_server.h"
@@ -16,15 +18,20 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_recovery_merge.h"
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_touched_peers.h"
 #include "miscadmin.h"
 
 #undef printf
@@ -40,6 +47,8 @@ extern bool cluster_gcs_block_test_r4_request80(const ClusterICEnvelope *env,
 											 const void *payload);
 extern bool cluster_gcs_block_test_r4_forward96(const ClusterICEnvelope *env,
 											 const void *payload);
+extern bool cluster_gcs_block_test_current_mx_forward128(
+	const ClusterICEnvelope *env, const void *payload);
 extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result,
 											  ClusterCrBuildReason reason,
 											  bool admitted_forward,
@@ -47,11 +56,39 @@ extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result
 extern bool cluster_gcs_block_test_decode_r4_reply(
 	const ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
 	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
-	int32 expected_sender_node);
+	int32 expected_sender_node, int32 expected_forwarding_master_node,
+	uint8 expected_reply_domain);
+extern bool cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id,
+													 uint64 request_epoch,
+													 int32 requester_backend_id,
+													 uint8 transition_id,
+													 int32 expected_master_node);
+extern bool cluster_gcs_block_test_snapshot_r4_reply_slot(
+	GcsBlockReplyHeader *header_out, char block_out[GCS_BLOCK_DATA_SIZE],
+	bool *reply_received_out, uint64 *stale_drop_count_out);
+extern bool cluster_gcs_block_test_r4_requester_arm(
+	BufferTag tag, uint64 request_epoch, int32 expected_master_node,
+	uint64 next_sequence, uint64 *request_id_out);
+extern bool cluster_gcs_block_test_snapshot_r4_requester_slot(
+	bool *in_use_out, uint8 *reply_domain_out, uint64 *request_id_out,
+	uint8 *transition_id_out, BufferTag *tag_out, uint64 *request_epoch_out,
+	int32 *expected_master_node_out, ClusterGcsBlockDirectState *direct_state_out,
+	bool *direct_target_prepared_out);
+extern bool cluster_gcs_block_test_release_r4_requester_slot(void);
+extern uint64 cluster_gcs_block_r4_requester_count(void);
+extern bool cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn,
+											 int32 real_master_node,
+											 char dst_page[GCS_BLOCK_DATA_SIZE]);
+extern ClusterCrBuildResult cluster_gcs_block_cr_fetch_and_wait(
+	BufferTag tag, SCN read_scn, char dst_page[BLCKSZ],
+	ClusterCrBuildReason *reason_out);
 
 /* Backend globals reached by the narrow production route section. */
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+static bool route_ereport_armed;
+static bool route_ereport_caught;
+static int route_ereport_sqlstate;
 int MaxBackends = 32;
 bool cluster_enabled = true;
 int cluster_node_id = 1;
@@ -60,12 +97,85 @@ bool cluster_recmerge_window_active = false;
 bool cluster_online_join = true;
 int cluster_lms_workers = 4;
 ClusterConf *ClusterConfShmem = NULL;
+bool cluster_smart_fusion = false;
+BackendId MyBackendId = 1;
+int cluster_gcs_reply_timeout_ms = 5000;
+int cluster_gcs_block_retransmit_max_retries = 4;
+int cluster_gcs_block_retransmit_initial_backoff_ms = 10;
+bool cluster_ic_suppress_gcs_done_cap = false;
+
+static int reply_lock_acquire_calls;
+static int reply_lock_release_calls;
+static int reply_cv_signal_calls;
+
+#define REQUESTER_REPLY_SCRIPT_CAPACITY 3
+
+static ConditionVariable *reply_cv_signaled[REQUESTER_REPLY_SCRIPT_CAPACITY];
+
+bool
+LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode)
+{
+	UT_ASSERT(mode == LW_EXCLUSIVE || mode == LW_SHARED);
+	reply_lock_acquire_calls++;
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock pg_attribute_unused())
+{
+	reply_lock_release_calls++;
+}
+
+void
+ConditionVariableSignal(ConditionVariable *cv pg_attribute_unused())
+{
+	if (reply_cv_signal_calls < REQUESTER_REPLY_SCRIPT_CAPACITY)
+		reply_cv_signaled[reply_cv_signal_calls] = cv;
+	reply_cv_signal_calls++;
+}
+
+static int reply_cv_prepare_calls;
+static int reply_cv_timed_sleep_calls;
+static int reply_cv_cancel_calls;
+static ConditionVariable *reply_cv_prepared[REQUESTER_REPLY_SCRIPT_CAPACITY];
+static TimestampTz route_test_now;
+
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
+{
+	if (reply_cv_prepare_calls < REQUESTER_REPLY_SCRIPT_CAPACITY)
+		reply_cv_prepared[reply_cv_prepare_calls] = cv;
+	reply_cv_prepare_calls++;
+}
+
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
+								long timeout pg_attribute_unused(),
+								uint32 wait_event_info pg_attribute_unused())
+{
+	reply_cv_timed_sleep_calls++;
+	return false;
+}
+
+bool
+ConditionVariableCancelSleep(void)
+{
+	reply_cv_cancel_calls++;
+	return false;
+}
+
+void
+cluster_sf_dep_note_lost_failclosed(void)
+{}
 
 #define UT_FORMATION_EPOCH UINT64_C(9)
 #define UT_ACTIVATION_GENERATION UINT64_C(12)
+#define UT_LOCAL_OPEN_GENERATION UINT64_C(0xffffffff)
+#define UT_LOCAL_OPEN_GENERATION_OVERFLOW UINT64_C(0x100000000)
 #define UT_REQUESTER_CAPABILITY_GENERATION UINT32_C(42)
 #define UT_MASTER_CAPABILITY_GENERATION UINT32_C(43)
 #define UT_HOLDER_CAPABILITY_GENERATION UINT32_C(44)
+#define UT_CURRENT_MX_CAPABILITY_GENERATION UINT32_C(77)
 #define UT_REQUESTER_NODE 2
 #define UT_MASTER_NODE 1
 #define UT_HOLDER_NODE 3
@@ -75,24 +185,40 @@ ClusterConf *ClusterConfShmem = NULL;
 #define UT_EXPECTED_PAGE_SCN ((SCN)UINT64_C(0x2222))
 #define UT_MASTER_GENERATION ((UT_FORMATION_EPOCH << 32) | UINT64_C(4))
 #define UT_MASTER_TRANSITION UINT64_C(7)
+#define UT_REPLY_DOMAIN_LEGACY_ACQUIRE ((uint8)0)
+#define UT_REPLY_DOMAIN_R4_CR ((uint8)1)
+#define UT_REPLY_DOMAIN_CURRENT_MX ((uint8)2)
+#define UT_R4_INTERNAL_ENDPOINT (-2)
 #define UT_R4_REQUIRED_CAPABILITIES                                                          \
-	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1)
+	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1            \
+	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                                        \
+	 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
 
 typedef struct RouteSeamCapture {
 	ClusterSemanticAdmissionResult admission_result;
+	uint64 activation_generation;
 	bool capability_ok;
 	bool peer_open_ok;
 	bool recheck_ok;
 	bool snapshot_ok;
+	bool local_dispatch_ok;
+	bool current_mx_capability_ok;
+	uint32 current_mx_capability_generation;
+	bool current_mx_reply_enabled;
+	ClusterMxDescribeResult current_mx_validate_result;
+	bool current_mx_proof_reply_enabled;
+	ClusterMxResolveResult current_mx_proof_validate_result;
 	GcsBlockR4RouteArmResult arm_result;
 	bool enqueue_ok;
 	bool refusal_enqueue_ok;
 	GcsBlockR4RouteSendResult finish_result;
-	bool holder_submit_ok;
+	ClusterCrBuildResult holder_submit_result;
+	ClusterCrBuildReason holder_submit_reason;
 	int lookup_master_node;
 
 	int enter_calls;
 	int leave_calls;
+	int lookup_calls;
 	int capability_calls;
 	int peer_open_calls;
 	int snapshot_calls;
@@ -102,6 +228,23 @@ typedef struct RouteSeamCapture {
 	int finish_calls;
 	int recheck_calls;
 	int holder_submit_calls;
+	int observe_calls;
+	int envelope_build_calls;
+	int local_dispatch_calls;
+	int raw_send_calls;
+	int foreign_undo_land_calls;
+	int current_mx_capability_calls;
+	int32 current_mx_capability_peer;
+	int current_mx_validate_calls;
+	int current_mx_proof_validate_calls;
+	int current_mx_describe_serve_calls;
+	int current_mx_proof_serve_calls;
+	bool current_mx_slot_armed;
+	uint8 current_mx_slot_domain;
+	bool local_request_slot_armed;
+	ClusterR4Event observed_event;
+	ClusterTxResolveReason observed_tx_reason;
+	ClusterCrBuildReason observed_cr_reason;
 
 	int sequence;
 	int snapshot_sequence;
@@ -111,6 +254,13 @@ typedef struct RouteSeamCapture {
 	int finish_sequence;
 	int recheck_sequence;
 	int leave_sequence;
+	int enter_sequence;
+	int lookup_sequence;
+	int capability_sequence[4];
+	int peer_open_sequence[4];
+	int holder_submit_sequence;
+	int envelope_build_sequence;
+	int local_dispatch_sequence;
 
 	int32 capability_peers[4];
 	uint32 capability_required[4];
@@ -143,11 +293,105 @@ typedef struct RouteSeamCapture {
 	uint32 refusal_enqueue_required_capability;
 	uint32 refusal_enqueue_connection_generation;
 	GcsBlockReplyHeader refusal_header;
+	ClusterICEnvelope local_dispatch_envelope;
+	int32 local_dispatch_peer;
+	uint32 local_dispatch_payload_len;
+	uint8 local_dispatch_payload[128];
+	ClusterICEnvelope foreign_undo_env;
+	GcsBlockReplyHeader foreign_undo_header;
+	char foreign_undo_page[BLCKSZ];
+	ClusterGcsUndoAuthTrailer foreign_undo_auth;
+	ClusterICEnvelope current_mx_describe_env;
+	ClusterCurrentMxDescribeForwardV2 current_mx_describe_request;
+	ClusterICEnvelope current_mx_proof_env;
+	ClusterCurrentMxProofForwardV2 current_mx_proof_request;
 
 	ClusterR4CrForwardPayload submitted_forward;
+	ClusterSemanticAdmissionToken submitted_admission;
+	ClusterSemanticAdmissionToken rechecked_admission;
+	ClusterSemanticAdmissionToken left_admission;
+	const ClusterSemanticAdmissionToken *submitted_admission_address;
+	const ClusterSemanticAdmissionToken *rechecked_admission_address;
+	const ClusterSemanticAdmissionToken *left_admission_address;
+	uint32 submitted_requester_capability_generation;
+	uint32 submitted_master_capability_generation;
+	bool submitted_reason_out_present;
 } RouteSeamCapture;
 
 static RouteSeamCapture route_seam;
+
+bool
+cluster_cr_server_r4_land_foreign_undo(
+	const ClusterICEnvelope *env, const GcsBlockReplyHeader *header,
+	const char undo_page[BLCKSZ], const ClusterGcsUndoAuthTrailer *undo_auth)
+{
+	route_seam.foreign_undo_land_calls++;
+	if (env == NULL || header == NULL || undo_page == NULL || undo_auth == NULL)
+		return false;
+	route_seam.foreign_undo_env = *env;
+	route_seam.foreign_undo_header = *header;
+	memcpy(route_seam.foreign_undo_page, undo_page,
+		   sizeof(route_seam.foreign_undo_page));
+	route_seam.foreign_undo_auth = *undo_auth;
+	return true;
+}
+
+void
+cluster_gcs_current_mx_describe_serve_inline(
+	const ClusterICEnvelope *env, const void *payload)
+{
+	route_seam.current_mx_describe_serve_calls++;
+	if (env != NULL)
+		route_seam.current_mx_describe_env = *env;
+	if (payload != NULL && env != NULL
+		&& env->payload_length
+			   == sizeof(route_seam.current_mx_describe_request))
+		memcpy(&route_seam.current_mx_describe_request, payload,
+			   sizeof(route_seam.current_mx_describe_request));
+}
+
+void
+cluster_gcs_current_mx_member_proof_serve_inline(
+	const ClusterICEnvelope *env, const void *payload)
+{
+	route_seam.current_mx_proof_serve_calls++;
+	if (env != NULL)
+		route_seam.current_mx_proof_env = *env;
+	if (payload != NULL && env != NULL
+		&& env->payload_length == sizeof(route_seam.current_mx_proof_request))
+		memcpy(&route_seam.current_mx_proof_request, payload,
+			   sizeof(route_seam.current_mx_proof_request));
+}
+
+typedef struct RequesterReplyStep {
+	GcsBlockReplyStatus status;
+	uint32 envelope_source_node;
+	int32 header_sender_node;
+	int32 forwarding_master_node;
+	uint64 page_lsn;
+	uint8 block_fill;
+} RequesterReplyStep;
+
+typedef struct RequesterSendCapture {
+	int calls;
+	int send_sequence;
+	uint8 msg_type;
+	uint32 dest_node;
+	uint16 payload_len;
+	ClusterR4CrRequestPayload request;
+	bool slot_armed;
+	uint8 slot_domain;
+	ClusterGcsBlockDirectState direct_state;
+	bool direct_target_prepared;
+	char reply_page[GCS_BLOCK_DATA_SIZE];
+	int reply_step_count;
+	RequesterReplyStep reply_steps[REQUESTER_REPLY_SCRIPT_CAPACITY];
+	uint64 request_ids[REQUESTER_REPLY_SCRIPT_CAPACITY];
+	bool slot_armed_by_call[REQUESTER_REPLY_SCRIPT_CAPACITY];
+	uint8 slot_domain_by_call[REQUESTER_REPLY_SCRIPT_CAPACITY];
+} RequesterSendCapture;
+
+static RequesterSendCapture requester_send;
 
 static uint32
 route_test_capability_generation(int32 peer_id)
@@ -166,16 +410,25 @@ route_seam_reset(void)
 {
 	memset(&route_seam, 0, sizeof(route_seam));
 	route_seam.admission_result = CLUSTER_SEMANTIC_ADMISSION_OK;
+	route_seam.activation_generation = UT_ACTIVATION_GENERATION;
 	route_seam.capability_ok = true;
 	route_seam.peer_open_ok = true;
 	route_seam.recheck_ok = true;
 	route_seam.snapshot_ok = true;
+	route_seam.local_dispatch_ok = true;
+	route_seam.current_mx_capability_ok = true;
+	route_seam.current_mx_capability_generation
+		= UT_CURRENT_MX_CAPABILITY_GENERATION;
+	route_seam.current_mx_validate_result = CMX_DESC_UNKNOWN;
+	route_seam.current_mx_proof_validate_result = CMX_RESOLVE_UNKNOWN;
 	route_seam.arm_result = GCS_BLOCK_R4_ROUTE_ARM_NEW;
 	route_seam.enqueue_ok = true;
 	route_seam.refusal_enqueue_ok = true;
 	route_seam.finish_result = GCS_BLOCK_R4_ROUTE_SEND_FORWARDED;
-	route_seam.holder_submit_ok = true;
+	route_seam.holder_submit_result = CLUSTER_CR_BUILD_FULL;
+	route_seam.holder_submit_reason = CLUSTER_CR_BUILD_NONE;
 	route_seam.lookup_master_node = UT_MASTER_NODE;
+	route_test_now = 0;
 }
 
 static BufferTag
@@ -206,6 +459,198 @@ route_test_envelope(uint8 msg_type, uint32 source, uint32 dest, uint32 payload_l
 	env.epoch = UT_FORMATION_EPOCH;
 	env.payload_length = payload_length;
 	return env;
+}
+
+bool
+cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type,
+						  uint32 source_node_id, uint32 dest_node_id,
+						  const void *payload, uint32 payload_length)
+{
+	route_seam.envelope_build_calls++;
+	route_seam.envelope_build_sequence = ++route_seam.sequence;
+	if (!route_seam.local_dispatch_ok || out_env == NULL || payload == NULL)
+		return false;
+	*out_env = route_test_envelope(msg_type, source_node_id, dest_node_id,
+							   payload_length);
+	return true;
+}
+
+bool
+cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload,
+						 int32 peer_id)
+{
+	typedef struct TestR4Reply8240 {
+		GcsBlockReplyHeader header;
+		char block_data[GCS_BLOCK_DATA_SIZE];
+	} TestR4Reply8240;
+	const ClusterR4CrRequestPayload *request;
+	TestR4Reply8240 reply;
+	ClusterICEnvelope reply_env;
+	BufferTag slot_tag;
+	bool in_use = false;
+	uint8 slot_domain = UINT8_MAX;
+	uint64 slot_request_id = 0;
+	uint64 slot_epoch = 0;
+	int32 slot_master = -1;
+	uint8 transition_id = 0;
+	ClusterGcsBlockDirectState direct_state = GCS_BLOCK_DIRECT_ABORTED;
+	bool direct_target_prepared = true;
+
+	route_seam.local_dispatch_calls++;
+	route_seam.local_dispatch_sequence = ++route_seam.sequence;
+	if (env != NULL)
+		route_seam.local_dispatch_envelope = *env;
+	route_seam.local_dispatch_peer = peer_id;
+	route_seam.local_dispatch_payload_len = env != NULL ? env->payload_length : 0;
+	if (payload != NULL && route_seam.local_dispatch_payload_len
+						   <= sizeof(route_seam.local_dispatch_payload))
+		memcpy(route_seam.local_dispatch_payload, payload,
+			   route_seam.local_dispatch_payload_len);
+	if (route_seam.local_dispatch_ok && env != NULL && payload != NULL
+		&& env->msg_type == PGRAC_IC_MSG_GCS_BLOCK_REQUEST
+		&& env->payload_length == sizeof(ClusterR4CrRequestPayload)) {
+		request = (const ClusterR4CrRequestPayload *)payload;
+		route_seam.local_request_slot_armed
+			= cluster_gcs_block_test_snapshot_r4_requester_slot(
+				&in_use, &slot_domain, &slot_request_id, &transition_id,
+				&slot_tag, &slot_epoch, &slot_master, &direct_state,
+				&direct_target_prepared)
+			  && in_use && slot_domain == UT_REPLY_DOMAIN_R4_CR
+			  && slot_request_id == request->base.request_id
+			  && transition_id == request->base.transition_id
+			  && memcmp(&slot_tag, &request->base.tag, sizeof(slot_tag)) == 0
+			  && slot_epoch == request->base.epoch
+			  && slot_master == (int32)env->dest_node_id
+			  && direct_state == GCS_BLOCK_DIRECT_UNARMED
+			  && !direct_target_prepared;
+		if (!route_seam.local_request_slot_armed)
+			return false;
+		memset(&reply, 0, sizeof(reply));
+		reply.header.request_id = request->base.request_id;
+		reply.header.epoch = request->base.epoch;
+		reply.header.page_lsn = UINT64_C(0xabcdef);
+		reply.header.sender_node = UT_HOLDER_NODE;
+		reply.header.requester_backend_id
+			= request->base.requester_backend_id;
+		reply.header.transition_id = request->base.transition_id;
+		reply.header.status = GCS_BLOCK_REPLY_R4_CR_FULL;
+		GcsBlockReplyHeaderSetForwardingMasterNode(
+			&reply.header, (int32)env->dest_node_id);
+		memset(reply.block_data, 0x6d, sizeof(reply.block_data));
+		reply.header.checksum
+			= cluster_gcs_block_compute_checksum(reply.block_data);
+		reply_env = route_test_envelope(
+			PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE,
+			(uint32)cluster_node_id, sizeof(reply));
+		cluster_gcs_handle_block_reply_envelope(&reply_env, &reply);
+	}
+	return route_seam.local_dispatch_ok;
+}
+
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 msg_type pg_attribute_unused(),
+					 int32 dest_node_id pg_attribute_unused(),
+					 const void *payload pg_attribute_unused(),
+					 uint32 payload_len pg_attribute_unused())
+{
+	route_seam.raw_send_calls++;
+	return CLUSTER_IC_SEND_HARD_ERROR;
+}
+
+uint32
+cluster_gcs_block_dedup_lifetime_ms(int initial_backoff_ms, int max_retries,
+									int reply_timeout_ms)
+{
+	int64 lifetime_ms;
+
+	if (initial_backoff_ms <= 0)
+		initial_backoff_ms = 100;
+	if (max_retries < 0)
+		max_retries = 4;
+	if (max_retries > 30)
+		max_retries = 30;
+	if (reply_timeout_ms <= 0)
+		reply_timeout_ms = 5000;
+	lifetime_ms = (int64)initial_backoff_ms * ((int64)((1u << max_retries) - 1))
+				  + (int64)(max_retries + 1) * reply_timeout_ms;
+	if (lifetime_ms > (int64)PG_UINT32_MAX)
+		lifetime_ms = (int64)PG_UINT32_MAX;
+	return (uint32)lifetime_ms;
+}
+
+void
+cluster_gcs_block_dedup_register_backend_exit_hook(void)
+{}
+
+bool
+cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id,
+										  const void *payload, uint16 payload_len)
+{
+	typedef struct TestR4Reply8240 {
+		GcsBlockReplyHeader header;
+		char block_data[GCS_BLOCK_DATA_SIZE];
+	} TestR4Reply8240;
+	TestR4Reply8240 reply;
+	ClusterICEnvelope env;
+	bool in_use = false;
+	uint64 slot_request_id = 0;
+	uint64 slot_epoch = 0;
+	int32 slot_master = -1;
+	uint8 transition_id = 0;
+	BufferTag slot_tag;
+	RequesterReplyStep reply_step = {
+		.status = GCS_BLOCK_REPLY_R4_CR_FULL,
+		.envelope_source_node = UT_HOLDER_NODE,
+		.header_sender_node = UT_HOLDER_NODE,
+		.forwarding_master_node = UT_MASTER_NODE,
+		.page_lsn = UINT64_C(0xabcdef),
+		.block_fill = 0x6d
+	};
+	int call_index = requester_send.calls;
+
+	requester_send.calls++;
+	requester_send.send_sequence = ++route_seam.sequence;
+	requester_send.msg_type = msg_type;
+	requester_send.dest_node = dest_node_id;
+	requester_send.payload_len = payload_len;
+	if (payload == NULL || payload_len != sizeof(requester_send.request))
+		return false;
+	memcpy(&requester_send.request, payload, sizeof(requester_send.request));
+	requester_send.slot_armed = cluster_gcs_block_test_snapshot_r4_requester_slot(
+		&in_use, &requester_send.slot_domain, &slot_request_id, &transition_id,
+		&slot_tag, &slot_epoch, &slot_master, &requester_send.direct_state,
+		&requester_send.direct_target_prepared)
+		&& in_use && slot_request_id == requester_send.request.base.request_id
+		&& transition_id == requester_send.request.base.transition_id
+		&& memcmp(&slot_tag, &requester_send.request.base.tag, sizeof(slot_tag)) == 0
+		&& slot_epoch == requester_send.request.base.epoch
+		&& slot_master == (int32)dest_node_id;
+	if (call_index >= 0 && call_index < REQUESTER_REPLY_SCRIPT_CAPACITY) {
+		requester_send.request_ids[call_index] = requester_send.request.base.request_id;
+		requester_send.slot_armed_by_call[call_index] = requester_send.slot_armed;
+		requester_send.slot_domain_by_call[call_index] = requester_send.slot_domain;
+		if (call_index < requester_send.reply_step_count)
+			reply_step = requester_send.reply_steps[call_index];
+	}
+
+	memset(&reply, 0, sizeof(reply));
+	reply.header.request_id = requester_send.request.base.request_id;
+	reply.header.epoch = requester_send.request.base.epoch;
+	reply.header.page_lsn = reply_step.page_lsn;
+	reply.header.sender_node = reply_step.header_sender_node;
+	reply.header.requester_backend_id = requester_send.request.base.requester_backend_id;
+	reply.header.transition_id = requester_send.request.base.transition_id;
+	reply.header.status = (uint8)reply_step.status;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		&reply.header, reply_step.forwarding_master_node);
+	memset(reply.block_data, reply_step.block_fill, sizeof(reply.block_data));
+	memcpy(requester_send.reply_page, reply.block_data, sizeof(reply.block_data));
+	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+						  reply_step.envelope_source_node,
+						  (uint32)cluster_node_id, sizeof(reply));
+	cluster_gcs_handle_block_reply_envelope(&env, &reply);
+	return true;
 }
 
 /* Build wire fixtures from literal bytes, independently of the production
@@ -270,7 +715,60 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
+}
+
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	return route_ereport_armed && elevel >= ERROR;
+}
+
+bool
+errstart_cold(int elevel, const char *domain pg_attribute_unused())
+{
+	return route_ereport_armed && elevel >= ERROR;
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errcode(int sqlerrcode)
+{
+	if (route_ereport_armed)
+		route_ereport_sqlstate = sqlerrcode;
+	return 0;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errhint(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
+	if (route_ereport_armed) {
+		route_ereport_caught = true;
+		UT_ASSERT_NOT_NULL(PG_exception_stack);
+		if (PG_exception_stack != NULL)
+			siglongjmp(*PG_exception_stack, 1);
+		abort();
+	}
 }
 
 uint64
@@ -279,9 +777,40 @@ cluster_epoch_get_current(void)
 	return UT_FORMATION_EPOCH;
 }
 
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	route_test_now += 2000;
+	return route_test_now;
+}
+
+bool
+cluster_touched_peers_stamp(int32 node_id pg_attribute_unused(),
+							ClusterTouchKind kind pg_attribute_unused())
+{
+	return true;
+}
+
+const ClusterICMsgTypeInfo *
+cluster_ic_get_msg_type_info(uint8 msg_type)
+{
+	static const ClusterICMsgTypeInfo data_info = {
+		.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+		.name = "test_gcs_block_reply",
+		.allowed_producer_mask = 0,
+		.broadcast_ok = false,
+		.handler = NULL,
+		.plane = CLUSTER_IC_PLANE_DATA
+	};
+
+	return msg_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY ? &data_info : NULL;
+}
+
 int
 cluster_gcs_lookup_master(BufferTag tag pg_attribute_unused())
 {
+	route_seam.lookup_calls++;
+	route_seam.lookup_sequence = ++route_seam.sequence;
 	return route_seam.lookup_master_node;
 }
 
@@ -378,6 +907,7 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 								  ClusterSemanticAdmissionToken *token)
 {
 	route_seam.enter_calls++;
+	route_seam.enter_sequence = ++route_seam.sequence;
 	if (token != NULL)
 		memset(token, 0, sizeof(*token));
 	if (route_seam.admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
@@ -386,7 +916,7 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 		|| side != CLUSTER_SEMANTIC_TARGET_SIDE || token == NULL)
 		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 	token->feature_bit = feature_bit;
-	token->record_generation = UT_ACTIVATION_GENERATION;
+	token->record_generation = route_seam.activation_generation;
 	token->formation_epoch = UT_FORMATION_EPOCH;
 	token->side = (uint8)side;
 	token->entered = true;
@@ -398,6 +928,9 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 {
 	route_seam.recheck_calls++;
 	route_seam.recheck_sequence = ++route_seam.sequence;
+	route_seam.rechecked_admission_address = token;
+	if (token != NULL)
+		route_seam.rechecked_admission = *token;
 	return route_seam.recheck_ok && token != NULL && token->entered;
 }
 
@@ -408,7 +941,19 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 		return;
 	route_seam.leave_calls++;
 	route_seam.leave_sequence = ++route_seam.sequence;
+	route_seam.left_admission_address = token;
+	route_seam.left_admission = *token;
 	memset(token, 0, sizeof(*token));
+}
+
+void
+cluster_r4_observe(ClusterR4Event event, ClusterTxResolveReason tx_reason,
+				   ClusterCrBuildReason cr_reason)
+{
+	route_seam.observe_calls++;
+	route_seam.observed_event = event;
+	route_seam.observed_tx_reason = tx_reason;
+	route_seam.observed_cr_reason = cr_reason;
 }
 
 bool
@@ -417,6 +962,7 @@ cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_bits,
 									 uint32 *generation_out)
 {
 	int slot = route_seam.capability_calls++;
+	int sequence = ++route_seam.sequence;
 
 	if (optional_out != NULL)
 		*optional_out = false;
@@ -426,6 +972,7 @@ cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_bits,
 		route_seam.capability_peers[slot] = peer_id;
 		route_seam.capability_required[slot] = required_bits;
 		route_seam.capability_optional[slot] = optional_bits;
+		route_seam.capability_sequence[slot] = sequence;
 	}
 	if (!route_seam.capability_ok || generation_out == NULL)
 		return false;
@@ -436,17 +983,33 @@ cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_bits,
 }
 
 bool
+cluster_sf_peer_multixact_current_capability_generation(
+	int32 peer_id, uint32 *generation_out)
+{
+	route_seam.current_mx_capability_calls++;
+	route_seam.current_mx_capability_peer = peer_id;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (!route_seam.current_mx_capability_ok || generation_out == NULL)
+		return false;
+	*generation_out = route_seam.current_mx_capability_generation;
+	return true;
+}
+
+bool
 cluster_semantic_activation_peer_open_matches(const ClusterSemanticAdmissionToken *token,
 										  int32 authenticated_peer,
 										  uint32 required_capabilities,
 										  uint32 sampled_generation)
 {
 	int slot = route_seam.peer_open_calls++;
+	int sequence = ++route_seam.sequence;
 
 	if (slot < lengthof(route_seam.peer_open_peers)) {
 		route_seam.peer_open_peers[slot] = authenticated_peer;
 		route_seam.peer_open_required[slot] = required_capabilities;
 		route_seam.peer_open_generation[slot] = sampled_generation;
+		route_seam.peer_open_sequence[slot] = sequence;
 	}
 	return route_seam.peer_open_ok && token != NULL && token->entered
 		   && required_capabilities == UT_R4_REQUIRED_CAPABILITIES
@@ -535,7 +1098,213 @@ cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type, uint32 des
 	route_seam.enqueue_connection_generation = connection_generation;
 	if (payload != NULL && payload_len <= sizeof(route_seam.enqueue_payload))
 		memcpy(route_seam.enqueue_payload, payload, payload_len);
+	if (payload != NULL
+		&& payload_len == sizeof(ClusterCurrentMxDescribeForwardV2)) {
+		const ClusterCurrentMxDescribeForwardV2 *request = payload;
+		typedef struct TestCurrentMxDescribeReply {
+			GcsBlockReplyHeader header;
+			ClusterCurrentMxDescribeReplyPage page;
+		} TestCurrentMxDescribeReply;
+		BufferTag slot_tag;
+		TestCurrentMxDescribeReply reply;
+		ClusterICEnvelope reply_env;
+		bool in_use = false;
+		uint64 slot_request_id = 0;
+		uint64 slot_epoch = 0;
+		int32 slot_master = -1;
+		uint8 transition_id = UINT8_MAX;
+		ClusterGcsBlockDirectState direct_state = GCS_BLOCK_DIRECT_ABORTED;
+		bool direct_target_prepared = true;
+
+		route_seam.current_mx_slot_armed
+			= cluster_gcs_block_test_snapshot_r4_requester_slot(
+				&in_use, &route_seam.current_mx_slot_domain,
+				&slot_request_id, &transition_id, &slot_tag, &slot_epoch,
+				&slot_master, &direct_state, &direct_target_prepared)
+			  && in_use
+			  && route_seam.current_mx_slot_domain
+					 == UT_REPLY_DOMAIN_CURRENT_MX
+			  && slot_request_id == request->prefix.request_id
+			  && transition_id == 0
+			  && slot_epoch == request->prefix.epoch
+			  && slot_master == (int32)dest_node_id
+			  && direct_state == GCS_BLOCK_DIRECT_UNARMED
+			  && !direct_target_prepared;
+		if (route_seam.current_mx_reply_enabled
+			&& route_seam.current_mx_slot_armed) {
+			memset(&reply, 0, sizeof(reply));
+			reply.header.request_id = request->prefix.request_id;
+			reply.header.epoch = request->prefix.epoch;
+			reply.header.sender_node = (int32)dest_node_id;
+			reply.header.requester_backend_id
+				= request->prefix.requester_backend_id;
+			reply.header.status
+				= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT;
+			GcsBlockReplyHeaderSetForwardingMasterNode(
+				&reply.header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+			reply.page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+			reply.page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+			reply.page.header.kind
+				= GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+			reply.page.header.result
+				= (uint8)route_seam.current_mx_validate_result;
+			reply.page.header.source_node_id = dest_node_id;
+			reply.page.header.request_id = request->prefix.request_id;
+			reply.page.header.mxkey = request->prefix.mxkey;
+			reply.page.header.wire_length
+				= sizeof(ClusterCurrentMxDescribeReplyHeader);
+			reply.header.checksum = cluster_gcs_block_compute_checksum(
+				(const char *)&reply.page);
+			reply_env = route_test_envelope(
+				PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node_id,
+				(uint32)cluster_node_id, sizeof(reply));
+			cluster_gcs_handle_block_reply_envelope(&reply_env, &reply);
+		}
+	}
+	if (payload != NULL
+		&& payload_len == sizeof(ClusterCurrentMxProofForwardV2)
+		&& ((const ClusterCurrentMxProofForwardV2 *)payload)->prefix.kind
+			   == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF
+		&& route_seam.current_mx_proof_reply_enabled
+		&& route_seam.current_mx_slot_armed) {
+		const ClusterCurrentMxProofForwardV2 *request = payload;
+		typedef struct TestCurrentMxProofReply {
+			GcsBlockReplyHeader header;
+			ClusterCurrentMxProofReplyPage page;
+		} TestCurrentMxProofReply;
+		TestCurrentMxProofReply reply;
+		ClusterICEnvelope reply_env;
+
+		memset(&reply, 0, sizeof(reply));
+		reply.header.request_id = request->prefix.request_id;
+		reply.header.epoch = request->prefix.epoch;
+		reply.header.sender_node = (int32)dest_node_id;
+		reply.header.requester_backend_id
+			= request->prefix.requester_backend_id;
+		reply.header.status
+			= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
+		GcsBlockReplyHeaderSetForwardingMasterNode(
+			&reply.header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+		reply.page.header.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+		reply.page.header.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+		reply.page.header.kind
+			= GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+		reply.page.header.result
+			= (uint8)route_seam.current_mx_proof_validate_result;
+		reply.page.header.source_node_id = dest_node_id;
+		reply.page.header.request_id = request->prefix.request_id;
+		reply.page.header.mxkey = request->prefix.mxkey;
+		reply.page.header.descriptor_hash
+			= ClusterCurrentMxProofPrefixGetDescriptorHash(&request->prefix);
+		reply.page.header.total_count = request->prefix.total_count;
+		reply.page.header.chunk_ordinal = request->prefix.chunk_ordinal;
+		reply.page.header.chunk_count_minus_one
+			= request->prefix.chunk_count_minus_one;
+		reply.page.header.wire_length
+			= sizeof(ClusterCurrentMxProofReplyHeader);
+		reply.header.checksum = cluster_gcs_block_compute_checksum(
+			(const char *)&reply.page);
+		reply_env = route_test_envelope(
+			PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node_id,
+			(uint32)cluster_node_id, sizeof(reply));
+		cluster_gcs_handle_block_reply_envelope(&reply_env, &reply);
+	}
 	return route_seam.enqueue_ok;
+}
+
+ClusterMxDescribeResult
+cluster_multixact_current_wire_validate_describe_reply(
+	const void *payload, uint32 payload_length, int32 expected_source,
+	uint64 current_epoch, uint64 expected_request_id,
+	const ClusterCurrentMxKey *expected_key,
+	ClusterCurrentMxMemberDesc *members pg_attribute_unused(),
+	uint16 members_cap pg_attribute_unused(),
+	uint16 *members_count, uint32 *reported_total_members)
+{
+	const ClusterCurrentMxDescribeReplyPage *page = payload;
+
+	route_seam.current_mx_validate_calls++;
+	if (members_count != NULL)
+		*members_count = 0;
+	if (reported_total_members != NULL)
+		*reported_total_members = 0;
+	if (payload == NULL || payload_length != sizeof(*page)
+		|| expected_key == NULL
+		|| page->header.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+		|| page->header.version != CLUSTER_CURRENT_MX_WIRE_VERSION
+		|| page->header.kind != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE
+		|| page->header.source_node_id != (uint32)expected_source
+		|| page->header.request_id != expected_request_id
+		|| page->header.mxkey.origin_node_id
+			   != expected_key->origin_node_id
+		|| page->header.mxkey.multixact_id != expected_key->multixact_id
+		|| page->header.mxkey.cluster_epoch != (uint32)current_epoch)
+		return CMX_DESC_UNKNOWN;
+	return route_seam.current_mx_validate_result;
+}
+
+bool
+cluster_multixact_current_wire_validate_proof_forward(
+	const void *payload, uint32 payload_length, int32 envelope_source,
+	int32 local_node pg_attribute_unused(), uint64 current_epoch,
+	ClusterCurrentMxProofForwardV2 *decoded)
+{
+	const ClusterCurrentMxProofForwardV2 *request = payload;
+
+	if (decoded != NULL)
+		memset(decoded, 0, sizeof(*decoded));
+	if (request == NULL || decoded == NULL
+		|| payload_length != sizeof(*request)
+		|| request->prefix.request_id == 0
+		|| request->prefix.epoch != current_epoch
+		|| request->prefix.original_requester_node != envelope_source
+		|| request->prefix.requester_backend_id <= 0
+		|| request->prefix.kind
+			   != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF
+		|| request->trailer.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+		|| request->trailer.version != CLUSTER_CURRENT_MX_WIRE_VERSION)
+		return false;
+	*decoded = *request;
+	return true;
+}
+
+bool
+cluster_multixact_current_wire_validate_proof_reply_frame(
+	const void *payload, uint32 payload_length, int32 expected_source,
+	uint64 current_epoch,
+	const ClusterCurrentMxProofForwardV2 *expected_request,
+	ClusterMxResolveResult *result,
+	ClusterCurrentMemberProof *proofs pg_attribute_unused(),
+	uint16 proofs_cap pg_attribute_unused(), uint16 *proof_count,
+	ClusterCurrentUpdaterProof *updater_proof)
+{
+	const ClusterCurrentMxProofReplyPage *page = payload;
+
+	route_seam.current_mx_proof_validate_calls++;
+	if (result != NULL)
+		*result = CMX_RESOLVE_UNKNOWN;
+	if (proof_count != NULL)
+		*proof_count = 0;
+	if (updater_proof != NULL) {
+		memset(updater_proof, 0, sizeof(*updater_proof));
+		updater_proof->verdict = CUCP_UNKNOWN;
+	}
+	if (payload == NULL || payload_length != sizeof(*page)
+		|| expected_request == NULL || result == NULL
+		|| page->header.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+		|| page->header.version != CLUSTER_CURRENT_MX_WIRE_VERSION
+		|| page->header.kind
+			   != GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF
+		|| page->header.source_node_id != (uint32)expected_source
+		|| page->header.request_id != expected_request->prefix.request_id
+		|| page->header.mxkey.origin_node_id
+			   != expected_request->prefix.mxkey.origin_node_id
+		|| page->header.mxkey.multixact_id
+			   != expected_request->prefix.mxkey.multixact_id
+		|| page->header.mxkey.cluster_epoch != (uint32)current_epoch)
+		return false;
+	*result = route_seam.current_mx_proof_validate_result;
+	return true;
 }
 
 bool
@@ -578,13 +1347,53 @@ route_assert_refusal(GcsBlockReplyStatus status, uint64 page_lsn)
 		UT_ASSERT_EQ(route_seam.refusal_header.reserved_0[i], 0);
 }
 
-bool
-cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward)
+static void
+route_assert_holder_refusal(GcsBlockReplyStatus status)
+{
+	int i;
+
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_calls, 1);
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_worker, 0);
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_dest, UT_REQUESTER_NODE);
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_required_capability,
+				 UT_R4_REQUIRED_CAPABILITIES);
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_connection_generation,
+				 UT_REQUESTER_CAPABILITY_GENERATION);
+	UT_ASSERT_EQ(route_seam.refusal_header.request_id, UT_REQUEST_ID);
+	UT_ASSERT_EQ(route_seam.refusal_header.epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(route_seam.refusal_header.page_lsn, 0);
+	UT_ASSERT_EQ(route_seam.refusal_header.checksum, 0);
+	UT_ASSERT_EQ(route_seam.refusal_header.sender_node, UT_HOLDER_NODE);
+	UT_ASSERT_EQ(route_seam.refusal_header.requester_backend_id, UT_REQUESTER_BACKEND);
+	UT_ASSERT_EQ(route_seam.refusal_header.transition_id, PCM_TRANS_N_TO_S);
+	UT_ASSERT_EQ(route_seam.refusal_header.status, status);
+	UT_ASSERT_EQ(GcsBlockReplyHeaderGetForwardingMasterNode(&route_seam.refusal_header),
+				 UT_MASTER_NODE);
+	for (i = 0; i < (int)sizeof(route_seam.refusal_header.reserved_0); i++)
+		UT_ASSERT_EQ(route_seam.refusal_header.reserved_0[i], 0);
+}
+
+ClusterCrBuildResult
+cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
+						 const ClusterSemanticAdmissionToken *receive_admission,
+						 uint32 requester_capability_generation,
+						 uint32 master_capability_generation,
+						 ClusterCrBuildReason *reason_out)
 {
 	route_seam.holder_submit_calls++;
+	route_seam.holder_submit_sequence = ++route_seam.sequence;
+	route_seam.submitted_admission_address = receive_admission;
 	if (forward != NULL)
 		route_seam.submitted_forward = *forward;
-	return route_seam.holder_submit_ok;
+	if (receive_admission != NULL)
+		route_seam.submitted_admission = *receive_admission;
+	route_seam.submitted_requester_capability_generation
+		= requester_capability_generation;
+	route_seam.submitted_master_capability_generation = master_capability_generation;
+	route_seam.submitted_reason_out_present = reason_out != NULL;
+	if (reason_out != NULL)
+		*reason_out = route_seam.holder_submit_reason;
+	return route_seam.holder_submit_result;
 }
 
 static PcmAuthoritySnapshot
@@ -887,28 +1696,1315 @@ UT_TEST(test_r4_refusal_decoder_requires_exact_domain_identity_and_zero_body)
 	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
 	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+
+	/* Only the D3 master-refusal role may carry WRONG_MASTER in page_lsn.
+	 * A holder refusal names the real master in forwarding_master_node and
+	 * therefore requires page_lsn=0. */
+	env.source_node_id = UT_HOLDER_NODE;
+	reply.header.sender_node = UT_HOLDER_NODE;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&reply.header, UT_MASTER_NODE);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, UT_MASTER_NODE,
+		UT_REPLY_DOMAIN_R4_CR));
+	env.source_node_id = UT_REQUESTER_NODE;
+	reply.header.sender_node = UT_REQUESTER_NODE;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		&reply.header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 
 	reply.header.status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
 	reply.header.status = GCS_BLOCK_REPLY_R4_DENIED;
 	reply.header.page_lsn = 1;
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
 	reply.header.page_lsn = 0;
 	reply.header.reserved_0[0] = 1;
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
 	reply.header.reserved_0[0] = 0;
 	reply.block_data[0] = 1;
 	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
 	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
 		&env, &reply, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
-		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE));
+		PCM_TRANS_N_TO_S, UT_REQUESTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+}
+
+/* Removing the expected R4 domain gate, accepting a status at the other
+ * physical length, or treating status 24 as an ordinary backend reply makes
+ * at least one row below fail.  The fixtures use literal 8240/8256 shapes and
+ * call the production decoder seam, not the production encoder. */
+UT_TEST(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority)
+{
+	typedef struct TestR4Reply8240 {
+		GcsBlockReplyHeader header;
+		char block_data[GCS_BLOCK_DATA_SIZE];
+	} TestR4Reply8240;
+	typedef struct TestR4Reply8256 {
+		TestR4Reply8240 base;
+		ClusterGcsUndoAuthTrailer auth;
+	} TestR4Reply8256;
+	TestR4Reply8240 reply8240;
+	TestR4Reply8256 reply8256;
+	ClusterICEnvelope env;
+
+	UT_ASSERT_EQ(sizeof(reply8240), 8240);
+	UT_ASSERT_EQ(sizeof(reply8256), 8256);
+
+	/* A holder's finished CR is an exact 8240-byte R4_CR-domain reply. */
+	memset(&reply8240, 0, sizeof(reply8240));
+	reply8240.header.request_id = UT_REQUEST_ID;
+	reply8240.header.epoch = UT_FORMATION_EPOCH;
+	reply8240.header.sender_node = UT_HOLDER_NODE;
+	reply8240.header.requester_backend_id = UT_REQUESTER_BACKEND;
+	reply8240.header.transition_id = PCM_TRANS_N_TO_S;
+	reply8240.header.status = GCS_BLOCK_REPLY_R4_CR_FULL;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&reply8240.header, UT_MASTER_NODE);
+	reply8240.block_data[0] = 0x5a;
+	reply8240.header.checksum = cluster_gcs_block_compute_checksum(reply8240.block_data);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE, cluster_node_id,
+						  sizeof(reply8240));
+	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, UT_MASTER_NODE, UT_REPLY_DOMAIN_R4_CR));
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, UT_MASTER_NODE,
+		UT_REPLY_DOMAIN_LEGACY_ACQUIRE));
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+
+	/* The same status must not alias the authenticated 8256-byte undo shape. */
+	memset(&reply8256, 0, sizeof(reply8256));
+	reply8256.base = reply8240;
+	env.payload_length = sizeof(reply8256);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, UT_MASTER_NODE, UT_REPLY_DOMAIN_R4_CR));
+
+	/* Status 24 is the endpoint -2 internal result.  Its reply supplies the
+	 * first nonzero live-HWM/TT-generation/authority-SCN co-sample. */
+	memset(&reply8256, 0, sizeof(reply8256));
+	reply8256.base.header.request_id = UT_REQUEST_ID;
+	reply8256.base.header.epoch = UT_FORMATION_EPOCH;
+	reply8256.base.header.sender_node = UT_HOLDER_NODE;
+	reply8256.base.header.requester_backend_id = UT_R4_INTERNAL_ENDPOINT;
+	reply8256.base.header.transition_id = PCM_TRANS_N_TO_S;
+	reply8256.base.header.status = GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT;
+	reply8256.base.header.page_lsn = UINT64_C(0x4000);
+	UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(
+		&reply8256.base.header, UINT32_C(0x01020304)));
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		&reply8256.base.header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	reply8256.base.block_data[0] = 0xa5;
+	reply8256.base.header.checksum
+		= cluster_gcs_block_compute_checksum(reply8256.base.block_data);
+	ClusterGcsUndoAuthTrailerSetTtGeneration(&reply8256.auth, UINT64_C(3));
+	ClusterGcsUndoAuthTrailerSetAuthorityScn(&reply8256.auth, (uint64)UT_READ_SCN);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE, cluster_node_id,
+						  sizeof(reply8256));
+	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_LEGACY_ACQUIRE));
+	reply8256.base.header.reserved_0[4] = 1;
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	reply8256.base.header.reserved_0[4] = 0;
+	UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(
+		&reply8256.base.header, UINT32_MAX) == false);
+	memset(reply8256.base.header.reserved_0, 0xff, 4);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(
+		&reply8256.base.header, UINT32_C(0x01020304)));
+
+	/* Neither a short frame nor an absent authority generation is status 24. */
+	env.payload_length = sizeof(reply8240);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	env.payload_length = sizeof(reply8256);
+	ClusterGcsUndoAuthTrailerSetTtGeneration(&reply8256.auth, 0);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	ClusterGcsUndoAuthTrailerSetTtGeneration(&reply8256.auth, UINT64_C(3));
+	ClusterGcsUndoAuthTrailerSetAuthorityScn(&reply8256.auth, 0);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8256, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_R4_INTERNAL_ENDPOINT,
+		PCM_TRANS_N_TO_S, UT_HOLDER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+
+	/* The two existing typed refusal statuses retain the exact 8240 shape. */
+	memset(&reply8240, 0, sizeof(reply8240));
+	reply8240.header.request_id = UT_REQUEST_ID;
+	reply8240.header.epoch = UT_FORMATION_EPOCH;
+	reply8240.header.sender_node = UT_MASTER_NODE;
+	reply8240.header.requester_backend_id = UT_REQUESTER_BACKEND;
+	reply8240.header.transition_id = PCM_TRANS_N_TO_S;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		&reply8240.header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	reply8240.header.checksum = cluster_gcs_block_compute_checksum(reply8240.block_data);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_MASTER_NODE, cluster_node_id,
+						  sizeof(reply8240));
+	reply8240.header.status = GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_MASTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+	reply8240.header.status = GCS_BLOCK_REPLY_R4_DENIED;
+	UT_ASSERT(cluster_gcs_block_test_decode_r4_reply(
+		&env, &reply8240, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_MASTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+}
+
+/* Removing the status-24 internal landing call, or deriving a backend index
+ * before it, makes the positive row fail.  The malformed rows prove that the
+ * handler does not widen this endpoint beyond its exact authenticated shape. */
+UT_TEST(test_r4_status24_routes_only_to_internal_foreign_undo_landing)
+{
+	typedef struct TestR4Reply8256 {
+		GcsBlockReplyHeader header;
+		char block_data[GCS_BLOCK_DATA_SIZE];
+		ClusterGcsUndoAuthTrailer auth;
+	} TestR4Reply8256;
+	TestR4Reply8256 reply;
+	ClusterICEnvelope env;
+
+	memset(&reply, 0, sizeof(reply));
+	reply.header.request_id = UT_REQUEST_ID;
+	reply.header.epoch = UT_FORMATION_EPOCH;
+	reply.header.page_lsn = UINT64_C(0x4000);
+	reply.header.sender_node = UT_HOLDER_NODE;
+	reply.header.requester_backend_id = UT_R4_INTERNAL_ENDPOINT;
+	reply.header.transition_id = PCM_TRANS_N_TO_S;
+	reply.header.status = GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		&reply.header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(
+		&reply.header, UINT32_C(0x01020304)));
+	memset(reply.block_data, 0xa5, sizeof(reply.block_data));
+	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
+	ClusterGcsUndoAuthTrailerSetTtGeneration(&reply.auth, UINT64_C(3));
+	ClusterGcsUndoAuthTrailerSetAuthorityScn(&reply.auth, (uint64)UT_READ_SCN);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE,
+						  cluster_node_id, sizeof(reply));
+
+	route_seam_reset();
+	reply_lock_acquire_calls = 0;
+	cluster_gcs_handle_block_reply_envelope(&env, &reply);
+	UT_ASSERT_EQ(route_seam.foreign_undo_land_calls, 1);
+	UT_ASSERT_EQ(reply_lock_acquire_calls, 0);
+	UT_ASSERT_EQ(memcmp(&route_seam.foreign_undo_env, &env, sizeof(env)), 0);
+	UT_ASSERT_EQ(memcmp(&route_seam.foreign_undo_header, &reply.header,
+					 sizeof(reply.header)), 0);
+	UT_ASSERT_EQ(memcmp(route_seam.foreign_undo_page, reply.block_data,
+					 sizeof(reply.block_data)), 0);
+	UT_ASSERT_EQ(memcmp(&route_seam.foreign_undo_auth, &reply.auth,
+					 sizeof(reply.auth)), 0);
+
+	route_seam_reset();
+	reply.header.requester_backend_id = UT_REQUESTER_BACKEND;
+	cluster_gcs_handle_block_reply_envelope(&env, &reply);
+	UT_ASSERT_EQ(route_seam.foreign_undo_land_calls, 0);
+
+	route_seam_reset();
+	reply.header.requester_backend_id = UT_R4_INTERNAL_ENDPOINT;
+	env.payload_length--;
+	cluster_gcs_handle_block_reply_envelope(&env, &reply);
+	UT_ASSERT_EQ(route_seam.foreign_undo_land_calls, 0);
+
+	route_seam_reset();
+	env.payload_length = sizeof(reply);
+	env.source_node_id = UT_MASTER_NODE;
+	cluster_gcs_handle_block_reply_envelope(&env, &reply);
+	UT_ASSERT_EQ(route_seam.foreign_undo_land_calls, 0);
+	UT_ASSERT_EQ(reply_lock_acquire_calls, 0);
+}
+
+/* Put the one advertised payload byte immediately before a protected page.
+ * A decoder that samples any header field before checking the minimum header
+ * length faults here instead of returning a typed rejection. */
+UT_TEST(test_r4_reply_decoder_checks_minimum_length_before_header_read)
+{
+	long page_size = sysconf(_SC_PAGESIZE);
+	char *mapping;
+	const void *truncated_payload;
+	ClusterICEnvelope env;
+	int rc;
+
+	UT_ASSERT(page_size > 0);
+	if (page_size <= 0)
+		return;
+	mapping = mmap(NULL, (size_t)page_size * 2, PROT_READ | PROT_WRITE,
+				   MAP_PRIVATE | MAP_ANON, -1, 0);
+	UT_ASSERT(mapping != MAP_FAILED);
+	if (mapping == MAP_FAILED)
+		return;
+	rc = mprotect(mapping + page_size, (size_t)page_size, PROT_NONE);
+	UT_ASSERT_EQ(rc, 0);
+	if (rc != 0) {
+		(void)munmap(mapping, (size_t)page_size * 2);
+		return;
+	}
+
+	truncated_payload = mapping + page_size - 1;
+	mapping[page_size - 1] = 0;
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_MASTER_NODE,
+						  cluster_node_id, 1);
+	UT_ASSERT(!cluster_gcs_block_test_decode_r4_reply(
+		&env, truncated_payload, UT_REQUEST_ID, UT_FORMATION_EPOCH, UT_REQUESTER_BACKEND,
+		PCM_TRANS_N_TO_S, UT_MASTER_NODE, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER,
+		UT_REPLY_DOMAIN_R4_CR));
+
+	rc = mprotect(mapping + page_size, (size_t)page_size, PROT_READ | PROT_WRITE);
+	UT_ASSERT_EQ(rc, 0);
+	rc = munmap(mapping, (size_t)page_size * 2);
+	UT_ASSERT_EQ(rc, 0);
+}
+
+/* The registered reply handler must select the R4 decoder from the armed
+ * slot domain before the legacy 8240-byte decoder rejects status 21.  Once
+ * landed, an authenticated duplicate is first-reply-wins and cannot tear the
+ * page already visible to the waiting backend. */
+UT_TEST(test_r4_full_reply_lands_once_in_armed_r4_slot)
+{
+	typedef struct TestR4Reply8240 {
+		GcsBlockReplyHeader header;
+		char block_data[GCS_BLOCK_DATA_SIZE];
+	} TestR4Reply8240;
+	TestR4Reply8240 first;
+	TestR4Reply8240 duplicate;
+	ClusterICEnvelope env;
+	GcsBlockReplyHeader landed_header;
+	char landed_block[GCS_BLOCK_DATA_SIZE];
+	bool reply_received = false;
+	uint64 stale_drop_count = 0;
+
+	memset(&first, 0, sizeof(first));
+	first.header.request_id = UT_REQUEST_ID;
+	first.header.epoch = UT_FORMATION_EPOCH;
+	first.header.page_lsn = UINT64_C(0x12345678);
+	first.header.sender_node = UT_HOLDER_NODE;
+	first.header.requester_backend_id = 1;
+	first.header.transition_id = PCM_TRANS_N_TO_S;
+	first.header.status = GCS_BLOCK_REPLY_R4_CR_FULL;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&first.header, UT_MASTER_NODE);
+	memset(first.block_data, 0x5a, sizeof(first.block_data));
+	first.header.checksum = cluster_gcs_block_compute_checksum(first.block_data);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE,
+						  cluster_node_id, sizeof(first));
+
+	reply_lock_acquire_calls = 0;
+	reply_lock_release_calls = 0;
+	reply_cv_signal_calls = 0;
+	UT_ASSERT(cluster_gcs_block_test_arm_r4_reply_slot(
+		UT_REQUEST_ID, UT_FORMATION_EPOCH, 1, PCM_TRANS_N_TO_S, UT_MASTER_NODE));
+	cluster_gcs_handle_block_reply_envelope(&env, &first);
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_reply_slot(
+		&landed_header, landed_block, &reply_received, &stale_drop_count));
+	UT_ASSERT(reply_received);
+	UT_ASSERT_EQ(memcmp(&landed_header, &first.header, sizeof(first.header)), 0);
+	UT_ASSERT_EQ(memcmp(landed_block, first.block_data, sizeof(landed_block)), 0);
+	UT_ASSERT_EQ(reply_lock_acquire_calls, 1);
+	UT_ASSERT_EQ(reply_lock_release_calls, 1);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+	UT_ASSERT_EQ(stale_drop_count, 0);
+
+	duplicate = first;
+	duplicate.header.page_lsn++;
+	memset(duplicate.block_data, 0xa5, sizeof(duplicate.block_data));
+	duplicate.header.checksum
+		= cluster_gcs_block_compute_checksum(duplicate.block_data);
+	cluster_gcs_handle_block_reply_envelope(&env, &duplicate);
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_reply_slot(
+		&landed_header, landed_block, &reply_received, &stale_drop_count));
+	UT_ASSERT(reply_received);
+	UT_ASSERT_EQ(memcmp(&landed_header, &first.header, sizeof(first.header)), 0);
+	UT_ASSERT_EQ(memcmp(landed_block, first.block_data, sizeof(landed_block)), 0);
+	UT_ASSERT_EQ(reply_lock_acquire_calls, 2);
+	UT_ASSERT_EQ(reply_lock_release_calls, 2);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+	UT_ASSERT_EQ(stale_drop_count, 1);
+}
+
+/* The requester arm consumes one exact sequence only as it publishes a free
+ * slot in the R4 domain.  It must never inherit the legacy direct-land path,
+ * and the existing slot owner must canonicalize byte 1 on release. */
+UT_TEST(test_r4_requester_arm_selects_closed_domain_and_releases_cleanly)
+{
+	BufferTag tag = route_test_tag();
+	BufferTag armed_tag;
+	uint64 request_id = 0;
+	uint64 armed_request_id = 0;
+	uint64 armed_epoch = 0;
+	int32 armed_master = -1;
+	uint8 reply_domain = UINT8_MAX;
+	uint8 transition_id = UINT8_MAX;
+	ClusterGcsBlockDirectState direct_state = GCS_BLOCK_DIRECT_ABORTED;
+	bool in_use = false;
+	bool direct_target_prepared = true;
+
+	UT_ASSERT(cluster_gcs_block_test_r4_requester_arm(
+		tag, UT_FORMATION_EPOCH, UT_MASTER_NODE, UINT64_C(1), &request_id));
+	UT_ASSERT_EQ(request_id,
+				 gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1, UINT64_C(1)));
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_requester_slot(
+		&in_use, &reply_domain, &armed_request_id, &transition_id, &armed_tag,
+		&armed_epoch, &armed_master, &direct_state, &direct_target_prepared));
+	UT_ASSERT(in_use);
+	UT_ASSERT_EQ(reply_domain, UT_REPLY_DOMAIN_R4_CR);
+	UT_ASSERT_EQ(armed_request_id, request_id);
+	UT_ASSERT_EQ(transition_id, PCM_TRANS_N_TO_S);
+	UT_ASSERT_EQ(memcmp(&armed_tag, &tag, sizeof(tag)), 0);
+	UT_ASSERT_EQ(armed_epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(armed_master, UT_MASTER_NODE);
+	UT_ASSERT_EQ(direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT(!direct_target_prepared);
+
+	UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_requester_slot(
+		&in_use, &reply_domain, &armed_request_id, &transition_id, &armed_tag,
+		&armed_epoch, &armed_master, &direct_state, &direct_target_prepared));
+	UT_ASSERT(!in_use);
+	UT_ASSERT_EQ(reply_domain, UT_REPLY_DOMAIN_LEGACY_ACQUIRE);
+	UT_ASSERT_EQ(armed_request_id, 0);
+	UT_ASSERT_EQ(armed_epoch, 0);
+	UT_ASSERT_EQ(armed_master, -1);
+	UT_ASSERT_EQ(direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT(!direct_target_prepared);
+}
+
+UT_TEST(test_current_mx_describe_requester_is_capability_bound_and_times_out_cleanly)
+{
+	ClusterCurrentMxKey key;
+	ClusterCurrentMxMemberDesc members[2];
+	const ClusterCurrentMxDescribeForwardV2 *request;
+	BufferTag reset_tag = route_test_tag();
+	BufferTag released_tag;
+	uint16 members_count = UINT16_MAX;
+	uint32 reported_total = UINT32_MAX;
+	uint64 reset_request_id = 0;
+	uint64 released_request_id = UINT64_MAX;
+	uint64 released_epoch = UINT64_MAX;
+	int32 released_master = INT32_MIN;
+	uint8 released_domain = UINT8_MAX;
+	uint8 released_transition = UINT8_MAX;
+	ClusterGcsBlockDirectState released_direct_state
+		= GCS_BLOCK_DIRECT_ABORTED;
+	bool released_in_use = true;
+	bool released_direct_target_prepared = true;
+	int saved_node_id = cluster_node_id;
+	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
+
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = UT_MASTER_NODE;
+	key.multixact_id = (MultiXactId)42;
+	key.cluster_epoch = (uint32)UT_FORMATION_EPOCH;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_reply_timeout_ms = 1;
+	route_seam_reset();
+	route_seam.current_mx_capability_ok = false;
+	memset(members, 0xa5, sizeof(members));
+	UT_ASSERT_EQ(cluster_gcs_current_mx_describe_fetch_and_wait(
+					 UT_MASTER_NODE, &key, members, lengthof(members),
+					 &members_count, &reported_total),
+			 CMX_DESC_UNKNOWN);
+	UT_ASSERT_EQ(route_seam.current_mx_capability_calls, 1);
+	UT_ASSERT_EQ(route_seam.current_mx_capability_peer, UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
+	UT_ASSERT_EQ(members_count, 0);
+	UT_ASSERT_EQ(reported_total, (uint32)0);
+	UT_ASSERT_EQ(memcmp(members,
+					  (ClusterCurrentMxMemberDesc[lengthof(members)]){{0}},
+					  sizeof(members)),
+			 0);
+
+	/* Seed the single-backend product fixture, then let the real Current-MX
+	 * requester own and release the same slot. */
+	UT_ASSERT(cluster_gcs_block_test_r4_requester_arm(
+		reset_tag, UT_FORMATION_EPOCH, UT_MASTER_NODE, UINT64_C(1),
+		&reset_request_id));
+	UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+	route_seam_reset();
+	members_count = UINT16_MAX;
+	reported_total = UINT32_MAX;
+	memset(members, 0xa5, sizeof(members));
+	UT_ASSERT_EQ(cluster_gcs_current_mx_describe_fetch_and_wait(
+					 UT_MASTER_NODE, &key, members, lengthof(members),
+					 &members_count, &reported_total),
+			 CMX_DESC_TIMEOUT);
+	UT_ASSERT_EQ(route_seam.current_mx_capability_calls, 1);
+	UT_ASSERT_EQ(route_seam.current_mx_capability_peer, UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.enqueue_calls, 1);
+	UT_ASSERT_EQ(route_seam.enqueue_msg_type, PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
+	UT_ASSERT_EQ(route_seam.enqueue_dest, (uint32)UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.enqueue_payload_len,
+				 sizeof(ClusterCurrentMxDescribeForwardV2));
+	UT_ASSERT_EQ(route_seam.enqueue_required_capability,
+				 PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1);
+	UT_ASSERT_EQ(route_seam.enqueue_connection_generation,
+				 UT_CURRENT_MX_CAPABILITY_GENERATION);
+	UT_ASSERT(route_seam.current_mx_slot_armed);
+	UT_ASSERT_EQ(route_seam.current_mx_slot_domain,
+				 UT_REPLY_DOMAIN_CURRENT_MX);
+
+	request = (const ClusterCurrentMxDescribeForwardV2 *)route_seam.enqueue_payload;
+	UT_ASSERT_EQ(request->prefix.epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(request->prefix.mxkey.origin_node_id, UT_MASTER_NODE);
+	UT_ASSERT_EQ(request->prefix.mxkey.multixact_id, (MultiXactId)42);
+	UT_ASSERT_EQ(request->prefix.original_requester_node, UT_REQUESTER_NODE);
+	UT_ASSERT_EQ(request->prefix.requester_backend_id, (int32)MyBackendId);
+	UT_ASSERT_EQ(request->prefix.kind,
+				 GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE);
+	UT_ASSERT_EQ(request->trailer.magic, CLUSTER_CURRENT_MX_WIRE_MAGIC);
+	UT_ASSERT_EQ(request->trailer.version, CLUSTER_CURRENT_MX_WIRE_VERSION);
+	UT_ASSERT_EQ(request->trailer.flags, CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE);
+	UT_ASSERT_EQ(members_count, 0);
+	UT_ASSERT_EQ(reported_total, (uint32)0);
+
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_requester_slot(
+		&released_in_use, &released_domain, &released_request_id,
+		&released_transition, &released_tag, &released_epoch,
+		&released_master, &released_direct_state,
+		&released_direct_target_prepared));
+	UT_ASSERT(!released_in_use);
+	UT_ASSERT_EQ(released_domain, UT_REPLY_DOMAIN_LEGACY_ACQUIRE);
+	UT_ASSERT_EQ(released_request_id, 0);
+	UT_ASSERT_EQ(released_epoch, 0);
+	UT_ASSERT_EQ(released_master, -1);
+	UT_ASSERT_EQ(released_direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT(!released_direct_target_prepared);
+
+	cluster_gcs_reply_timeout_ms = saved_reply_timeout_ms;
+	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_current_mx_describe_reply_lands_in_current_domain)
+{
+	ClusterCurrentMxKey key;
+	ClusterCurrentMxMemberDesc members[2];
+	BufferTag reset_tag = route_test_tag();
+	uint16 members_count = UINT16_MAX;
+	uint32 reported_total = UINT32_MAX;
+	uint64 reset_request_id = 0;
+	int saved_node_id = cluster_node_id;
+	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
+
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = UT_MASTER_NODE;
+	key.multixact_id = (MultiXactId)43;
+	key.cluster_epoch = (uint32)UT_FORMATION_EPOCH;
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_reply_timeout_ms = 1;
+	UT_ASSERT(cluster_gcs_block_test_r4_requester_arm(
+		reset_tag, UT_FORMATION_EPOCH, UT_MASTER_NODE, UINT64_C(1),
+		&reset_request_id));
+	UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+	route_seam_reset();
+	route_seam.current_mx_reply_enabled = true;
+	route_seam.current_mx_validate_result = CMX_DESC_DENIED;
+	memset(members, 0xa5, sizeof(members));
+	reply_cv_signal_calls = 0;
+	reply_cv_timed_sleep_calls = 0;
+
+	UT_ASSERT_EQ(cluster_gcs_current_mx_describe_fetch_and_wait(
+					 UT_MASTER_NODE, &key, members, lengthof(members),
+					 &members_count, &reported_total),
+			 CMX_DESC_DENIED);
+	UT_ASSERT_EQ(route_seam.enqueue_calls, 1);
+	UT_ASSERT(route_seam.current_mx_slot_armed);
+	UT_ASSERT_EQ(route_seam.current_mx_slot_domain,
+				 UT_REPLY_DOMAIN_CURRENT_MX);
+	UT_ASSERT_EQ(route_seam.current_mx_validate_calls, 2);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+	UT_ASSERT_EQ(reply_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(members_count, 0);
+	UT_ASSERT_EQ(reported_total, (uint32)0);
+
+	cluster_gcs_reply_timeout_ms = saved_reply_timeout_ms;
+	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_current_mx_describe_forward128_routes_to_origin_serve)
+{
+	ClusterCurrentMxDescribeForwardV2 request;
+	ClusterICEnvelope env;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_MASTER_NODE;
+	route_seam_reset();
+	memset(&request, 0, sizeof(request));
+	request.prefix.request_id = UT_REQUEST_ID;
+	request.prefix.epoch = UT_FORMATION_EPOCH;
+	request.prefix.mxkey.origin_node_id = UT_MASTER_NODE;
+	request.prefix.mxkey.multixact_id = (MultiXactId)44;
+	request.prefix.mxkey.cluster_epoch = (uint32)UT_FORMATION_EPOCH;
+	request.prefix.original_requester_node = UT_REQUESTER_NODE;
+	request.prefix.requester_backend_id = UT_REQUESTER_BACKEND;
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	request.trailer.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
+	env = route_test_envelope(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE,
+		UT_MASTER_NODE, sizeof(request));
+
+	UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+	UT_ASSERT_EQ(route_seam.current_mx_describe_serve_calls, 1);
+	UT_ASSERT_EQ(route_seam.current_mx_describe_env.source_node_id,
+				 (uint32)UT_REQUESTER_NODE);
+	UT_ASSERT_EQ(route_seam.current_mx_describe_env.dest_node_id,
+				 (uint32)UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.current_mx_describe_request.prefix.request_id,
+				 UT_REQUEST_ID);
+	UT_ASSERT_EQ(route_seam.current_mx_describe_request.prefix.kind,
+				 GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE);
+
+	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_current_mx_member_proof_requester_is_capability_bound_and_times_out_cleanly)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	const ClusterCurrentMxProofForwardV2 *sent_request;
+	ClusterCurrentMemberProof proofs[1];
+	ClusterCurrentUpdaterProof updater;
+	BufferTag reset_tag = route_test_tag();
+	uint16 proof_count = UINT16_MAX;
+	uint64 reset_request_id = 0;
+	int saved_node_id = cluster_node_id;
+	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_reply_timeout_ms = 1;
+	memset(&request, 0, sizeof(request));
+	request.prefix.request_id = UINT64_C(1);
+	request.prefix.epoch = UT_FORMATION_EPOCH;
+	request.prefix.mxkey.origin_node_id = 1;
+	request.prefix.mxkey.multixact_id = (MultiXactId)45;
+	request.prefix.mxkey.cluster_epoch = (uint32)UT_FORMATION_EPOCH;
+	request.prefix.original_requester_node = UT_REQUESTER_NODE;
+	request.prefix.requester_backend_id = (int32)MyBackendId;
+	request.prefix.total_count = 2;
+	ClusterCurrentMxProofPrefixSetDescriptorHash(
+		&request.prefix, UINT64_C(0x12345678));
+	request.prefix.entry_count = 1;
+	request.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS;
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	request.trailer.body.asks[0].xid = (TransactionId)501;
+	request.trailer.body.asks[0].member_ordinal = 0;
+	request.trailer.body.asks[0].member_status = MultiXactStatusForShare;
+	UT_ASSERT(cluster_gcs_block_test_r4_requester_arm(
+		reset_tag, UT_FORMATION_EPOCH, 4, UINT64_C(1),
+		&reset_request_id));
+	UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+	route_seam_reset();
+	memset(proofs, 0xa5, sizeof(proofs));
+	memset(&updater, 0xa5, sizeof(updater));
+
+	UT_ASSERT_EQ(cluster_gcs_current_mx_member_proof_fetch_and_wait(
+					 4, &request, proofs, lengthof(proofs),
+					 &proof_count, &updater),
+			 CMX_RESOLVE_TIMEOUT);
+	UT_ASSERT_EQ(route_seam.current_mx_capability_calls, 1);
+	UT_ASSERT_EQ(route_seam.current_mx_capability_peer, 4);
+	UT_ASSERT_EQ(route_seam.enqueue_calls, 1);
+	UT_ASSERT_EQ(route_seam.enqueue_msg_type,
+				 PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
+	UT_ASSERT_EQ(route_seam.enqueue_dest, (uint32)4);
+	UT_ASSERT_EQ(route_seam.enqueue_payload_len,
+				 sizeof(ClusterCurrentMxProofForwardV2));
+	UT_ASSERT_EQ(route_seam.enqueue_required_capability,
+				 PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1);
+	UT_ASSERT_EQ(route_seam.enqueue_connection_generation,
+				 UT_CURRENT_MX_CAPABILITY_GENERATION);
+	UT_ASSERT(route_seam.current_mx_slot_armed);
+	UT_ASSERT_EQ(route_seam.current_mx_slot_domain,
+				 UT_REPLY_DOMAIN_CURRENT_MX);
+	sent_request
+		= (const ClusterCurrentMxProofForwardV2 *)route_seam.enqueue_payload;
+	UT_ASSERT_EQ(sent_request->prefix.kind,
+				 GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF);
+	UT_ASSERT_EQ(sent_request->prefix.epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(sent_request->prefix.original_requester_node,
+				 UT_REQUESTER_NODE);
+	UT_ASSERT_EQ(proof_count, (uint16)0);
+	UT_ASSERT_EQ(proofs[0].state, CCM_UNKNOWN);
+	UT_ASSERT_EQ(updater.verdict, CUCP_UNKNOWN);
+
+	cluster_gcs_reply_timeout_ms = saved_reply_timeout_ms;
+	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_current_mx_member_proof_forward128_routes_to_origin_serve)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterICEnvelope env;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_MASTER_NODE;
+	route_seam_reset();
+	memset(&request, 0, sizeof(request));
+	request.prefix.request_id = UT_REQUEST_ID;
+	request.prefix.epoch = UT_FORMATION_EPOCH;
+	request.prefix.mxkey.origin_node_id = UT_MASTER_NODE;
+	request.prefix.mxkey.multixact_id = (MultiXactId)46;
+	request.prefix.mxkey.cluster_epoch = (uint32)UT_FORMATION_EPOCH;
+	request.prefix.original_requester_node = UT_REQUESTER_NODE;
+	request.prefix.requester_backend_id = UT_REQUESTER_BACKEND;
+	request.prefix.total_count = 1;
+	request.prefix.entry_count = 1;
+	request.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS;
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	request.trailer.body.asks[0].xid = (TransactionId)503;
+	request.trailer.body.asks[0].member_status = MultiXactStatusForShare;
+	env = route_test_envelope(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE,
+		UT_MASTER_NODE, sizeof(request));
+
+	UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+	UT_ASSERT_EQ(route_seam.current_mx_proof_serve_calls, 1);
+	UT_ASSERT_EQ(route_seam.current_mx_proof_env.source_node_id,
+				 (uint32)UT_REQUESTER_NODE);
+	UT_ASSERT_EQ(route_seam.current_mx_proof_env.dest_node_id,
+				 (uint32)UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.current_mx_proof_request.prefix.request_id,
+				 UT_REQUEST_ID);
+	UT_ASSERT_EQ(route_seam.current_mx_proof_request.prefix.kind,
+				 GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF);
+
+	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_current_mx_member_proof_reply_lands_in_current_domain)
+{
+	ClusterCurrentMxProofForwardV2 request;
+	ClusterCurrentMemberProof proofs[1];
+	ClusterCurrentUpdaterProof updater;
+	BufferTag reset_tag = route_test_tag();
+	uint16 proof_count = UINT16_MAX;
+	uint64 reset_request_id = 0;
+	int saved_node_id = cluster_node_id;
+	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_reply_timeout_ms = 1;
+	memset(&request, 0, sizeof(request));
+	request.prefix.request_id = UINT64_C(1);
+	request.prefix.epoch = UT_FORMATION_EPOCH;
+	request.prefix.mxkey.origin_node_id = 1;
+	request.prefix.mxkey.multixact_id = (MultiXactId)46;
+	request.prefix.mxkey.cluster_epoch = (uint32)UT_FORMATION_EPOCH;
+	request.prefix.original_requester_node = UT_REQUESTER_NODE;
+	request.prefix.requester_backend_id = (int32)MyBackendId;
+	request.prefix.total_count = 2;
+	ClusterCurrentMxProofPrefixSetDescriptorHash(
+		&request.prefix, UINT64_C(0x12345678));
+	request.prefix.entry_count = 1;
+	request.prefix.body_kind = CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS;
+	request.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	request.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	request.trailer.body.asks[0].xid = (TransactionId)502;
+	request.trailer.body.asks[0].member_ordinal = 0;
+	request.trailer.body.asks[0].member_status = MultiXactStatusForShare;
+	UT_ASSERT(cluster_gcs_block_test_r4_requester_arm(
+		reset_tag, UT_FORMATION_EPOCH, 4, UINT64_C(1),
+		&reset_request_id));
+	UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+	route_seam_reset();
+	route_seam.current_mx_proof_reply_enabled = true;
+	route_seam.current_mx_proof_validate_result = CMX_RESOLVE_DENIED;
+	memset(proofs, 0xa5, sizeof(proofs));
+	memset(&updater, 0xa5, sizeof(updater));
+	reply_cv_signal_calls = 0;
+	reply_cv_timed_sleep_calls = 0;
+
+	UT_ASSERT_EQ(cluster_gcs_current_mx_member_proof_fetch_and_wait(
+					 4, &request, proofs, lengthof(proofs),
+					 &proof_count, &updater),
+			 CMX_RESOLVE_DENIED);
+	UT_ASSERT_EQ(route_seam.enqueue_calls, 1);
+	UT_ASSERT(route_seam.current_mx_slot_armed);
+	UT_ASSERT_EQ(route_seam.current_mx_slot_domain,
+				 UT_REPLY_DOMAIN_CURRENT_MX);
+	UT_ASSERT_EQ(route_seam.current_mx_proof_validate_calls, 2);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+	UT_ASSERT_EQ(reply_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(proof_count, (uint16)0);
+	UT_ASSERT_EQ(proofs[0].state, CCM_UNKNOWN);
+	UT_ASSERT_EQ(updater.verdict, CUCP_UNKNOWN);
+
+	cluster_gcs_reply_timeout_ms = saved_reply_timeout_ms;
+	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_r4_requester_count_tracks_only_live_r4_domain_slots)
+{
+	BufferTag tag = route_test_tag();
+	uint64 request_id = 0;
+	int saved_max_backends = MaxBackends;
+
+	MaxBackends = 1;
+	UT_ASSERT(cluster_gcs_block_test_r4_requester_arm(
+		tag, UT_FORMATION_EPOCH, UT_MASTER_NODE, UINT64_C(1), &request_id));
+	UT_ASSERT_EQ(cluster_gcs_block_r4_requester_count(), UINT64_C(1));
+	UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+	UT_ASSERT_EQ(cluster_gcs_block_r4_requester_count(), UINT64_C(0));
+	MaxBackends = saved_max_backends;
+}
+
+/* The first executable requester leg is deliberately remote: an exact R4
+ * slot is visible before REQUEST80 staging, a remote holder's status 21 is
+ * consumed into scratch only, and the slot domain is cleared on return. */
+UT_TEST(test_r4_remote_requester_arms_request80_waits_full_and_releases)
+{
+	BufferTag tag = route_test_tag();
+	char dst_page[GCS_BLOCK_DATA_SIZE];
+	SCN decoded_read_scn = InvalidScn;
+	bool in_use = true;
+	uint8 reply_domain = UINT8_MAX;
+	uint64 request_id = UINT64_MAX;
+	uint64 request_epoch = UINT64_MAX;
+	int32 expected_master = INT32_MIN;
+	uint8 transition_id = UINT8_MAX;
+	BufferTag released_tag;
+	ClusterGcsBlockDirectState direct_state = GCS_BLOCK_DIRECT_ABORTED;
+	bool direct_target_prepared = true;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	memset(&requester_send, 0, sizeof(requester_send));
+	memset(dst_page, 0, sizeof(dst_page));
+	reply_cv_prepare_calls = 0;
+	reply_cv_timed_sleep_calls = 0;
+	reply_cv_cancel_calls = 0;
+	reply_cv_signal_calls = 0;
+	UT_ASSERT(cluster_gcs_block_test_r4_fetch_and_wait(
+		tag, UT_READ_SCN, UT_MASTER_NODE, dst_page));
+	UT_ASSERT_EQ(requester_send.calls, 1);
+	UT_ASSERT_EQ(requester_send.msg_type, PGRAC_IC_MSG_GCS_BLOCK_REQUEST);
+	UT_ASSERT_EQ(requester_send.dest_node, UT_MASTER_NODE);
+	UT_ASSERT_EQ(requester_send.payload_len, sizeof(ClusterR4CrRequestPayload));
+	UT_ASSERT(requester_send.slot_armed);
+	UT_ASSERT_EQ(requester_send.slot_domain, UT_REPLY_DOMAIN_R4_CR);
+	UT_ASSERT_EQ(requester_send.direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT(!requester_send.direct_target_prepared);
+	UT_ASSERT_EQ(requester_send.request.base.epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(requester_send.request.base.tag.relNumber, tag.relNumber);
+	UT_ASSERT_EQ(requester_send.request.base.tag.blockNum, tag.blockNum);
+	UT_ASSERT_EQ(requester_send.request.base.sender_node, UT_REQUESTER_NODE);
+	UT_ASSERT_EQ(requester_send.request.base.requester_backend_id, (int32)MyBackendId);
+	UT_ASSERT_EQ(requester_send.request.base.transition_id, PCM_TRANS_N_TO_S);
+	UT_ASSERT(!GcsBlockRequestPayloadIsCleanEligible(&requester_send.request.base));
+	UT_ASSERT(!GcsBlockRequestPayloadIsDirectLandArmed(&requester_send.request.base));
+	UT_ASSERT(ClusterR4RequestExtensionGetCr(
+		&requester_send.request.extension, &decoded_read_scn));
+	UT_ASSERT_EQ(decoded_read_scn, UT_READ_SCN);
+	UT_ASSERT_EQ(memcmp(dst_page, requester_send.reply_page, sizeof(dst_page)), 0);
+	UT_ASSERT_EQ(reply_cv_prepare_calls, 1);
+	UT_ASSERT_EQ(reply_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(reply_cv_cancel_calls, 1);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_requester_slot(
+		&in_use, &reply_domain, &request_id, &transition_id, &released_tag,
+		&request_epoch, &expected_master, &direct_state, &direct_target_prepared));
+	UT_ASSERT(!in_use);
+	UT_ASSERT_EQ(reply_domain, UT_REPLY_DOMAIN_LEGACY_ACQUIRE);
+	UT_ASSERT_EQ(request_id, 0);
+	UT_ASSERT_EQ(request_epoch, 0);
+	UT_ASSERT_EQ(expected_master, -1);
+	UT_ASSERT_EQ(direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT(!direct_target_prepared);
+	cluster_node_id = saved_node_id;
+}
+
+/* Status 25 is the closed RETRYABLE/HOLDER_MOVED requester outcome already
+ * pinned by the result/reason table above.  It closes the old operation: the
+ * requester must release that slot, allocate a genuinely fresh id and route
+ * the same logical read again.  The two attempts intentionally use the same
+ * physical CV, proving the first slot became reusable before the second arm. */
+UT_TEST(test_r4_requester_status25_releases_then_retries_with_fresh_id)
+{
+	BufferTag tag = route_test_tag();
+	char dst_page[GCS_BLOCK_DATA_SIZE];
+	char expected_page[GCS_BLOCK_DATA_SIZE];
+	bool in_use = true;
+	uint8 reply_domain = UINT8_MAX;
+	uint64 request_id = UINT64_MAX;
+	uint64 request_epoch = UINT64_MAX;
+	int32 expected_master = INT32_MIN;
+	uint8 transition_id = UINT8_MAX;
+	BufferTag released_tag;
+	ClusterGcsBlockDirectState direct_state = GCS_BLOCK_DIRECT_ABORTED;
+	bool direct_target_prepared = true;
+	int saved_node_id = cluster_node_id;
+	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
+	int saved_max_retries = cluster_gcs_block_retransmit_max_retries;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_reply_timeout_ms = 1;
+	cluster_gcs_block_retransmit_max_retries = 1;
+	memset(&requester_send, 0, sizeof(requester_send));
+	requester_send.reply_step_count = 2;
+	requester_send.reply_steps[0].status
+		= GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+	requester_send.reply_steps[0].envelope_source_node = UT_MASTER_NODE;
+	requester_send.reply_steps[0].header_sender_node = UT_MASTER_NODE;
+	requester_send.reply_steps[0].forwarding_master_node
+		= GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+	requester_send.reply_steps[0].page_lsn = 0;
+	requester_send.reply_steps[0].block_fill = 0;
+	requester_send.reply_steps[1].status = GCS_BLOCK_REPLY_R4_CR_FULL;
+	requester_send.reply_steps[1].envelope_source_node = UT_HOLDER_NODE;
+	requester_send.reply_steps[1].header_sender_node = UT_HOLDER_NODE;
+	requester_send.reply_steps[1].forwarding_master_node = UT_MASTER_NODE;
+	requester_send.reply_steps[1].page_lsn = UINT64_C(0xabcdef);
+	requester_send.reply_steps[1].block_fill = 0x6d;
+	memset(dst_page, 0, sizeof(dst_page));
+	memset(expected_page, 0x6d, sizeof(expected_page));
+	reply_cv_prepare_calls = 0;
+	reply_cv_timed_sleep_calls = 0;
+	reply_cv_cancel_calls = 0;
+	reply_cv_signal_calls = 0;
+	memset(reply_cv_prepared, 0, sizeof(reply_cv_prepared));
+	memset(reply_cv_signaled, 0, sizeof(reply_cv_signaled));
+
+	UT_ASSERT(cluster_gcs_block_test_r4_fetch_and_wait(
+		tag, UT_READ_SCN, UT_MASTER_NODE, dst_page));
+	UT_ASSERT_EQ(requester_send.calls, 2);
+	UT_ASSERT_EQ(requester_send.request_ids[0], UINT64_C(0x0200000000000001));
+	UT_ASSERT_EQ(requester_send.request_ids[1], UINT64_C(0x0200000000000002));
+	UT_ASSERT_NE(requester_send.request_ids[0], requester_send.request_ids[1]);
+	UT_ASSERT(requester_send.slot_armed_by_call[0]);
+	UT_ASSERT(requester_send.slot_armed_by_call[1]);
+	UT_ASSERT_EQ(requester_send.slot_domain_by_call[0], UT_REPLY_DOMAIN_R4_CR);
+	UT_ASSERT_EQ(requester_send.slot_domain_by_call[1], UT_REPLY_DOMAIN_R4_CR);
+	UT_ASSERT_EQ(memcmp(dst_page, expected_page, sizeof(dst_page)), 0);
+	UT_ASSERT_EQ(reply_cv_prepare_calls, 2);
+	UT_ASSERT_EQ(reply_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(reply_cv_cancel_calls, 2);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 2);
+	UT_ASSERT_NOT_NULL(reply_cv_prepared[0]);
+	UT_ASSERT(reply_cv_prepared[0] == reply_cv_signaled[0]);
+	UT_ASSERT(reply_cv_prepared[1] == reply_cv_signaled[1]);
+	UT_ASSERT(reply_cv_prepared[0] == reply_cv_prepared[1]);
+
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_requester_slot(
+		&in_use, &reply_domain, &request_id, &transition_id, &released_tag,
+		&request_epoch, &expected_master, &direct_state, &direct_target_prepared));
+	UT_ASSERT(!in_use);
+	UT_ASSERT_EQ(reply_domain, UT_REPLY_DOMAIN_LEGACY_ACQUIRE);
+	UT_ASSERT_EQ(request_id, 0);
+	UT_ASSERT_EQ(request_epoch, 0);
+	UT_ASSERT_EQ(expected_master, -1);
+	UT_ASSERT_EQ(direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT(!direct_target_prepared);
+
+	cluster_gcs_block_retransmit_max_retries = saved_max_retries;
+	cluster_gcs_reply_timeout_ms = saved_reply_timeout_ms;
+	cluster_node_id = saved_node_id;
+}
+
+/* Status 26 is the closed FAIL_CLOSED/PROTOCOL requester outcome.  Unlike
+ * status 25 it cannot consume retry budget or arm a fresh identity; its exact
+ * zero-body holder reply wakes once, leaves caller scratch untouched and the
+ * sole requester slot returns to the canonical legacy-zero image. */
+UT_TEST(test_r4_requester_status26_fails_closed_without_retry_and_cleans_slot)
+{
+	BufferTag tag = route_test_tag();
+	char dst_page[GCS_BLOCK_DATA_SIZE];
+	char original_page[GCS_BLOCK_DATA_SIZE];
+	bool in_use = true;
+	uint8 reply_domain = UINT8_MAX;
+	uint64 request_id = UINT64_MAX;
+	uint64 request_epoch = UINT64_MAX;
+	int32 expected_master = INT32_MIN;
+	uint8 transition_id = UINT8_MAX;
+	BufferTag released_tag;
+	ClusterGcsBlockDirectState direct_state = GCS_BLOCK_DIRECT_ABORTED;
+	bool direct_target_prepared = true;
+	int saved_node_id = cluster_node_id;
+	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
+	int saved_max_retries = cluster_gcs_block_retransmit_max_retries;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_reply_timeout_ms = 1;
+	cluster_gcs_block_retransmit_max_retries = 1;
+	memset(&requester_send, 0, sizeof(requester_send));
+	requester_send.reply_step_count = 1;
+	requester_send.reply_steps[0].status = GCS_BLOCK_REPLY_R4_DENIED;
+	requester_send.reply_steps[0].envelope_source_node = UT_HOLDER_NODE;
+	requester_send.reply_steps[0].header_sender_node = UT_HOLDER_NODE;
+	requester_send.reply_steps[0].forwarding_master_node = UT_MASTER_NODE;
+	requester_send.reply_steps[0].page_lsn = 0;
+	requester_send.reply_steps[0].block_fill = 0;
+	memset(dst_page, 0xa7, sizeof(dst_page));
+	memcpy(original_page, dst_page, sizeof(original_page));
+	reply_cv_prepare_calls = 0;
+	reply_cv_timed_sleep_calls = 0;
+	reply_cv_cancel_calls = 0;
+	reply_cv_signal_calls = 0;
+	memset(reply_cv_prepared, 0, sizeof(reply_cv_prepared));
+	memset(reply_cv_signaled, 0, sizeof(reply_cv_signaled));
+
+	UT_ASSERT(!cluster_gcs_block_test_r4_fetch_and_wait(
+		tag, UT_READ_SCN, UT_MASTER_NODE, dst_page));
+	UT_ASSERT_EQ(requester_send.calls, 1);
+	UT_ASSERT_EQ(requester_send.request_ids[0], UINT64_C(0x0200000000000001));
+	UT_ASSERT(requester_send.slot_armed_by_call[0]);
+	UT_ASSERT_EQ(requester_send.slot_domain_by_call[0], UT_REPLY_DOMAIN_R4_CR);
+	UT_ASSERT_EQ(memcmp(dst_page, original_page, sizeof(dst_page)), 0);
+	UT_ASSERT_EQ(reply_cv_prepare_calls, 1);
+	UT_ASSERT_EQ(reply_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(reply_cv_cancel_calls, 1);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+	UT_ASSERT_NOT_NULL(reply_cv_prepared[0]);
+	UT_ASSERT(reply_cv_prepared[0] == reply_cv_signaled[0]);
+
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_requester_slot(
+		&in_use, &reply_domain, &request_id, &transition_id, &released_tag,
+		&request_epoch, &expected_master, &direct_state, &direct_target_prepared));
+	UT_ASSERT(!in_use);
+	UT_ASSERT_EQ(reply_domain, UT_REPLY_DOMAIN_LEGACY_ACQUIRE);
+	UT_ASSERT_EQ(request_id, 0);
+	UT_ASSERT_EQ(request_epoch, 0);
+	UT_ASSERT_EQ(expected_master, -1);
+	UT_ASSERT_EQ(direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT(!direct_target_prepared);
+
+	cluster_gcs_block_retransmit_max_retries = saved_max_retries;
+	cluster_gcs_reply_timeout_ms = saved_reply_timeout_ms;
+	cluster_node_id = saved_node_id;
+}
+
+static void
+route_test_reset_public_target_requester(void)
+{
+	BufferTag tag = route_test_tag();
+	uint64 request_id = 0;
+	bool armed;
+
+	armed = cluster_gcs_block_test_r4_requester_arm(
+		tag, UT_FORMATION_EPOCH, UT_MASTER_NODE, UINT64_C(1), &request_id);
+	UT_ASSERT(armed);
+	if (armed)
+		UT_ASSERT(cluster_gcs_block_test_release_r4_requester_slot());
+	route_seam_reset();
+	memset(&requester_send, 0, sizeof(requester_send));
+	reply_lock_acquire_calls = 0;
+	reply_lock_release_calls = 0;
+	reply_cv_prepare_calls = 0;
+	reply_cv_timed_sleep_calls = 0;
+	reply_cv_cancel_calls = 0;
+	reply_cv_signal_calls = 0;
+}
+
+static void
+route_test_assert_public_target_slot_is_canonical(void)
+{
+	BufferTag tag;
+	bool in_use = true;
+	uint8 reply_domain = UINT8_MAX;
+	uint64 request_id = UINT64_MAX;
+	uint64 request_epoch = UINT64_MAX;
+	int32 expected_master = INT32_MIN;
+	uint8 transition_id = UINT8_MAX;
+	ClusterGcsBlockDirectState direct_state = GCS_BLOCK_DIRECT_ABORTED;
+	bool direct_target_prepared = true;
+
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_requester_slot(
+		&in_use, &reply_domain, &request_id, &transition_id, &tag,
+		&request_epoch, &expected_master, &direct_state, &direct_target_prepared));
+	UT_ASSERT(!in_use);
+	UT_ASSERT_EQ(reply_domain, UT_REPLY_DOMAIN_LEGACY_ACQUIRE);
+	UT_ASSERT_EQ(request_id, 0);
+	UT_ASSERT_EQ(transition_id, 0);
+	UT_ASSERT_EQ(request_epoch, 0);
+	UT_ASSERT_EQ(expected_master, -1);
+	UT_ASSERT_EQ(direct_state, GCS_BLOCK_DIRECT_UNARMED);
+	UT_ASSERT(!direct_target_prepared);
+}
+
+/* Two valid D3-master status25 replies consume the complete retry budget.
+ * Each reply closes its old id before a fresh arm, then the public TARGET
+ * wrapper must surface the existing 53R90 ERROR and still leave its one
+ * admission token through PG_FINALLY. */
+UT_TEST(test_target_wrapper_status25_retry_exhaustion_raises_53r90)
+{
+	BufferTag tag = route_test_tag();
+	char dst_page[BLCKSZ];
+	char original_page[BLCKSZ];
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	sigjmp_buf error_jump;
+	sigjmp_buf *saved_exception_stack = PG_exception_stack;
+	int saved_node_id = cluster_node_id;
+	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
+	int saved_max_retries = cluster_gcs_block_retransmit_max_retries;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_reply_timeout_ms = 1;
+	cluster_gcs_block_retransmit_max_retries = 1;
+	route_test_reset_public_target_requester();
+	requester_send.reply_step_count = 2;
+	requester_send.reply_steps[0].status
+		= GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+	requester_send.reply_steps[0].envelope_source_node = UT_MASTER_NODE;
+	requester_send.reply_steps[0].header_sender_node = UT_MASTER_NODE;
+	requester_send.reply_steps[0].forwarding_master_node
+		= GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+	requester_send.reply_steps[0].page_lsn = 0;
+	requester_send.reply_steps[0].block_fill = 0;
+	requester_send.reply_steps[1] = requester_send.reply_steps[0];
+	memset(dst_page, 0xa7, sizeof(dst_page));
+	memcpy(original_page, dst_page, sizeof(original_page));
+	route_ereport_armed = true;
+	route_ereport_caught = false;
+	route_ereport_sqlstate = 0;
+
+	if (sigsetjmp(error_jump, 1) == 0) {
+		PG_exception_stack = &error_jump;
+		(void)cluster_gcs_block_cr_fetch_and_wait(
+			tag, UT_READ_SCN, dst_page, &reason);
+	} else
+		PG_exception_stack = saved_exception_stack;
+	PG_exception_stack = saved_exception_stack;
+	route_ereport_armed = false;
+
+	UT_ASSERT(route_ereport_caught);
+	UT_ASSERT_EQ(route_ereport_sqlstate,
+				 ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED);
+	UT_ASSERT_EQ(requester_send.calls, 2);
+	/* The public-wrapper reset primes and releases sequence 1, so the two
+	 * transported attempts must consume the next exact fresh ids. */
+	UT_ASSERT_EQ(requester_send.request_ids[0], UINT64_C(0x0200000000000002));
+	UT_ASSERT_EQ(requester_send.request_ids[1], UINT64_C(0x0200000000000003));
+	UT_ASSERT_NE(requester_send.request_ids[0], requester_send.request_ids[1]);
+	UT_ASSERT(requester_send.slot_armed_by_call[0]);
+	UT_ASSERT(requester_send.slot_armed_by_call[1]);
+	UT_ASSERT_EQ(requester_send.slot_domain_by_call[0], UT_REPLY_DOMAIN_R4_CR);
+	UT_ASSERT_EQ(requester_send.slot_domain_by_call[1], UT_REPLY_DOMAIN_R4_CR);
+	UT_ASSERT_EQ(reply_cv_prepare_calls, 2);
+	UT_ASSERT_EQ(reply_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(reply_cv_cancel_calls, 2);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 2);
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 0);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	UT_ASSERT_EQ(memcmp(dst_page, original_page, sizeof(dst_page)), 0);
+	route_test_assert_public_target_slot_is_canonical();
+
+	cluster_gcs_block_retransmit_max_retries = saved_max_retries;
+	cluster_gcs_reply_timeout_ms = saved_reply_timeout_ms;
+	cluster_node_id = saved_node_id;
+}
+
+/* TARGET admission is the outermost gate.  Even an invalid read SCN cannot
+ * reach validation, master lookup, slot reservation or REQUEST80 staging when
+ * the feature is CLOSED, and the public ABI must preserve its typed refusal. */
+UT_TEST(test_target_wrapper_disabled_returns_typed_before_lookup_or_wire)
+{
+	BufferTag tag = route_test_tag();
+	char dst_page[BLCKSZ];
+	char original_page[BLCKSZ];
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	ClusterCrBuildResult result;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	route_test_reset_public_target_requester();
+	route_seam.admission_result = CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
+	memset(dst_page, 0xa7, sizeof(dst_page));
+	memcpy(original_page, dst_page, sizeof(original_page));
+
+	result = cluster_gcs_block_cr_fetch_and_wait(
+		tag, InvalidScn, dst_page, &reason);
+
+	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_RETRYABLE);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_TARGET_DISABLED);
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.lookup_calls, 0);
+	UT_ASSERT_EQ(requester_send.calls, 0);
+	UT_ASSERT_EQ(reply_lock_acquire_calls, 0);
+	UT_ASSERT_EQ(reply_lock_release_calls, 0);
+	UT_ASSERT_EQ(route_seam.leave_calls, 0);
+	UT_ASSERT_EQ(memcmp(dst_page, original_page, sizeof(dst_page)), 0);
+	route_test_assert_public_target_slot_is_canonical();
+	cluster_node_id = saved_node_id;
+}
+
+/* A transported status 21 is received into wrapper-private scratch.  The
+ * caller receives the verified page only after the one TARGET token passes
+ * its final recheck, and the raw requester slot is canonical before return. */
+UT_TEST(test_target_wrapper_status21_rechecks_private_scratch_then_copies_full)
+{
+	BufferTag tag = route_test_tag();
+	char dst_page[BLCKSZ];
+	char expected_page[BLCKSZ];
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	ClusterCrBuildResult result;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	route_test_reset_public_target_requester();
+	memset(dst_page, 0xa7, sizeof(dst_page));
+	memset(expected_page, 0x6d, sizeof(expected_page));
+
+	result = cluster_gcs_block_cr_fetch_and_wait(
+		tag, UT_READ_SCN, dst_page, &reason);
+
+	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(requester_send.calls, 1);
+	UT_ASSERT(requester_send.slot_armed);
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.lookup_calls, 1);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	UT_ASSERT(route_seam.enter_sequence < route_seam.lookup_sequence);
+	UT_ASSERT(route_seam.lookup_sequence < requester_send.send_sequence);
+	UT_ASSERT(requester_send.send_sequence < route_seam.recheck_sequence);
+	UT_ASSERT(route_seam.recheck_sequence < route_seam.leave_sequence);
+	UT_ASSERT(route_seam.rechecked_admission_address
+			  == route_seam.left_admission_address);
+	UT_ASSERT_EQ(memcmp(dst_page, expected_page, sizeof(dst_page)), 0);
+	route_test_assert_public_target_slot_is_canonical();
+	cluster_node_id = saved_node_id;
+}
+
+/* When this backend is the resource master, REQUEST80 must still enter the
+ * tag-owning LMS DATA ring.  A backend-side registered dispatch runs in the
+ * CONTROL process, whose production plane gate silently drops DATA frames;
+ * only the DATA worker may perform the authenticated self loopback after
+ * dequeue. */
+UT_TEST(test_target_wrapper_local_master_stages_request80_to_data_owner_and_returns_full)
+{
+	BufferTag tag = route_test_tag();
+	ClusterR4CrRequestPayload request;
+	char dst_page[BLCKSZ];
+	char expected_page[BLCKSZ];
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	ClusterCrBuildResult result;
+	SCN decoded_read_scn = InvalidScn;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_MASTER_NODE;
+	route_test_reset_public_target_requester();
+	route_seam.lookup_master_node = UT_MASTER_NODE;
+	memset(dst_page, 0xa7, sizeof(dst_page));
+	memset(expected_page, 0x6d, sizeof(expected_page));
+	memset(&request, 0, sizeof(request));
+
+	result = cluster_gcs_block_cr_fetch_and_wait(
+		tag, UT_READ_SCN, dst_page, &reason);
+	if (requester_send.payload_len == sizeof(request))
+		memcpy(&request, &requester_send.request, sizeof(request));
+
+	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FULL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(requester_send.calls, 1);
+	UT_ASSERT_EQ(requester_send.msg_type, PGRAC_IC_MSG_GCS_BLOCK_REQUEST);
+	UT_ASSERT_EQ(requester_send.dest_node, UT_MASTER_NODE);
+	UT_ASSERT_EQ(requester_send.payload_len, sizeof(request));
+	UT_ASSERT(requester_send.slot_armed);
+	UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+	UT_ASSERT_EQ(route_seam.envelope_build_calls, 0);
+	UT_ASSERT_EQ(route_seam.local_dispatch_calls, 0);
+	UT_ASSERT(!route_seam.local_request_slot_armed);
+	UT_ASSERT_EQ(request.base.epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(request.base.sender_node, UT_MASTER_NODE);
+	UT_ASSERT_EQ(request.base.requester_backend_id, (int32)MyBackendId);
+	UT_ASSERT_EQ(request.base.transition_id, PCM_TRANS_N_TO_S);
+	UT_ASSERT_EQ(memcmp(&request.base.tag, &tag, sizeof(tag)), 0);
+	UT_ASSERT(ClusterR4RequestExtensionGetCr(
+		&request.extension, &decoded_read_scn));
+	UT_ASSERT_EQ(decoded_read_scn, UT_READ_SCN);
+	UT_ASSERT_EQ(route_seam.capability_calls, 0);
+	UT_ASSERT_EQ(route_seam.peer_open_calls, 0);
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.lookup_calls, 1);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	UT_ASSERT(route_seam.enter_sequence < route_seam.lookup_sequence);
+	UT_ASSERT(route_seam.lookup_sequence < requester_send.send_sequence);
+	UT_ASSERT(requester_send.send_sequence < route_seam.recheck_sequence);
+	UT_ASSERT(route_seam.recheck_sequence < route_seam.leave_sequence);
+	UT_ASSERT_EQ(reply_cv_prepare_calls, 1);
+	UT_ASSERT_EQ(reply_cv_timed_sleep_calls, 0);
+	UT_ASSERT_EQ(reply_cv_cancel_calls, 1);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+	UT_ASSERT_EQ(memcmp(dst_page, expected_page, sizeof(dst_page)), 0);
+	route_test_assert_public_target_slot_is_canonical();
+	cluster_node_id = saved_node_id;
+}
+
+/* A FULL reply cannot escape its private scratch if TARGET drifts before the
+ * final fence.  Drift has its own typed retry reason, still releases the raw
+ * requester slot and leaves exactly the token that was rechecked. */
+UT_TEST(test_target_wrapper_recheck_drift_keeps_dst_and_canonicalizes_slot)
+{
+	BufferTag tag = route_test_tag();
+	char dst_page[BLCKSZ];
+	char original_page[BLCKSZ];
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+	ClusterCrBuildResult result;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	route_test_reset_public_target_requester();
+	route_seam.recheck_ok = false;
+	memset(dst_page, 0xa7, sizeof(dst_page));
+	memcpy(original_page, dst_page, sizeof(original_page));
+
+	result = cluster_gcs_block_cr_fetch_and_wait(
+		tag, UT_READ_SCN, dst_page, &reason);
+
+	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_RETRYABLE);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_RF_DEFERRED);
+	UT_ASSERT_EQ(requester_send.calls, 1);
+	UT_ASSERT(requester_send.slot_armed);
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.lookup_calls, 1);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	UT_ASSERT(requester_send.send_sequence < route_seam.recheck_sequence);
+	UT_ASSERT(route_seam.recheck_sequence < route_seam.leave_sequence);
+	UT_ASSERT(route_seam.rechecked_admission_address
+			  == route_seam.left_admission_address);
+	UT_ASSERT_EQ(memcmp(dst_page, original_page, sizeof(dst_page)), 0);
+	route_test_assert_public_target_slot_is_canonical();
+	cluster_node_id = saved_node_id;
 }
 
 /* Removing the real request80 branch, taking a second TARGET admission,
@@ -929,6 +3025,7 @@ UT_TEST(test_request80_routes_stored_proof_to_real_forward96_handler)
 							  sizeof(request));
 	ClusterR4CrForwardPayload forwarded;
 	ClusterICEnvelope forward_env;
+	int saved_node_id = cluster_node_id;
 
 	route_seam_reset();
 	UT_ASSERT(cluster_gcs_block_test_r4_request80(&request_env, &request));
@@ -942,6 +3039,10 @@ UT_TEST(test_request80_routes_stored_proof_to_real_forward96_handler)
 	UT_ASSERT_EQ(route_seam.capability_required[1], UT_R4_REQUIRED_CAPABILITIES);
 	UT_ASSERT_EQ(route_seam.snapshot_calls, 1);
 	UT_ASSERT_EQ(route_seam.arm_calls, 1);
+	UT_ASSERT_EQ(route_seam.observe_calls, 1);
+	UT_ASSERT_EQ(route_seam.observed_event, CLUSTER_R4_EVENT_CR_ROUTE_STARTED);
+	UT_ASSERT_EQ(route_seam.observed_tx_reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(route_seam.observed_cr_reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(route_seam.armed_lifetime_hint_ms, 1000);
 	UT_ASSERT(route_seam.armed_lifetime_hint_trusted);
 	UT_ASSERT_EQ(route_seam.armed_identity.legacy_key.origin_node_id, UT_REQUESTER_NODE);
@@ -995,19 +3096,340 @@ UT_TEST(test_request80_routes_stored_proof_to_real_forward96_handler)
 
 	forward_env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE,
 								  UT_HOLDER_NODE, sizeof(forwarded));
+	cluster_node_id = UT_HOLDER_NODE;
 	route_seam_reset();
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&forward_env, &forwarded));
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
-	UT_ASSERT_EQ(route_seam.capability_calls, 1);
-	UT_ASSERT_EQ(route_seam.peer_open_calls, 1);
+	UT_ASSERT_EQ(route_seam.capability_calls, 2);
+	UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
 	UT_ASSERT_EQ(route_seam.capability_peers[0], UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.capability_peers[1], UT_REQUESTER_NODE);
 	UT_ASSERT_EQ(route_seam.capability_required[0], UT_R4_REQUIRED_CAPABILITIES);
+	UT_ASSERT_EQ(route_seam.capability_required[1], UT_R4_REQUIRED_CAPABILITIES);
+	UT_ASSERT_EQ(route_seam.peer_open_peers[0], UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.peer_open_peers[1], UT_REQUESTER_NODE);
+	UT_ASSERT_EQ(route_seam.peer_open_generation[0], UT_MASTER_CAPABILITY_GENERATION);
+	UT_ASSERT_EQ(route_seam.peer_open_generation[1], UT_REQUESTER_CAPABILITY_GENERATION);
 	UT_ASSERT_EQ(route_seam.snapshot_calls, 0);
 	UT_ASSERT_EQ(route_seam.arm_calls, 0);
 	UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_calls, 0);
 	UT_ASSERT_EQ(route_seam.holder_submit_calls, 1);
 	UT_ASSERT_EQ(memcmp(&route_seam.submitted_forward, &forwarded, sizeof(forwarded)), 0);
+	UT_ASSERT(route_seam.submitted_admission.entered);
+	UT_ASSERT_EQ(route_seam.submitted_admission.feature_bit,
+				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	UT_ASSERT_EQ(route_seam.submitted_admission.record_generation,
+				 UT_ACTIVATION_GENERATION);
+	UT_ASSERT_EQ(route_seam.submitted_admission.formation_epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(route_seam.submitted_admission.side, CLUSTER_SEMANTIC_TARGET_SIDE);
+	UT_ASSERT_EQ(route_seam.submitted_requester_capability_generation,
+				 UT_REQUESTER_CAPABILITY_GENERATION);
+	UT_ASSERT_EQ(route_seam.submitted_master_capability_generation,
+				 UT_MASTER_CAPABILITY_GENERATION);
+	UT_ASSERT(route_seam.submitted_reason_out_present);
+	UT_ASSERT(route_seam.enter_sequence < route_seam.capability_sequence[0]);
+	UT_ASSERT(route_seam.capability_sequence[0] < route_seam.capability_sequence[1]);
+	UT_ASSERT(route_seam.capability_sequence[1] < route_seam.peer_open_sequence[0]);
+	UT_ASSERT(route_seam.peer_open_sequence[0] < route_seam.peer_open_sequence[1]);
+	UT_ASSERT(route_seam.peer_open_sequence[1] < route_seam.holder_submit_sequence);
+	UT_ASSERT(route_seam.holder_submit_sequence < route_seam.recheck_sequence);
+	UT_ASSERT(route_seam.recheck_sequence < route_seam.leave_sequence);
+	cluster_node_id = saved_node_id;
+}
+
+/* A requester that is also the real master has no peer HELLO record.  It
+ * proves the compiled R4 capability under the one entered TARGET token, then
+ * samples/binds only the selected remote holder before the cap-bound
+ * FORWARD96 enqueue. */
+UT_TEST(test_request80_local_master_uses_compiled_capability_and_routes_remote_holder)
+{
+	ClusterR4CrRequestPayload request = route_test_request80();
+	ClusterICEnvelope env;
+	ClusterR4CrForwardPayload forwarded;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_MASTER_NODE;
+	request.base.sender_node = UT_MASTER_NODE;
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, UT_MASTER_NODE,
+						  UT_MASTER_NODE, sizeof(request));
+	route_seam_reset();
+
+	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	UT_ASSERT(route_seam.capability_calls == 1
+			  && route_seam.capability_peers[0] == UT_HOLDER_NODE
+			  && route_seam.capability_required[0] == UT_R4_REQUIRED_CAPABILITIES
+			  && route_seam.peer_open_calls == 1
+			  && route_seam.peer_open_peers[0] == UT_HOLDER_NODE
+			  && route_seam.peer_open_required[0] == UT_R4_REQUIRED_CAPABILITIES
+			  && route_seam.peer_open_generation[0] == UT_HOLDER_CAPABILITY_GENERATION
+			  && route_seam.enter_sequence < route_seam.snapshot_sequence
+			  && route_seam.snapshot_sequence < route_seam.capability_sequence[0]
+			  && route_seam.capability_sequence[0] < route_seam.peer_open_sequence[0]);
+	UT_ASSERT_EQ(route_seam.snapshot_calls, 1);
+	UT_ASSERT_EQ(route_seam.arm_calls, 1);
+	UT_ASSERT_EQ(route_seam.enqueue_calls, 1);
+	UT_ASSERT_EQ(route_seam.finish_calls, 1);
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_calls, 0);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT(route_seam.finished_outbound_admitted);
+	UT_ASSERT_EQ(route_seam.armed_identity.legacy_key.origin_node_id, UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.armed_identity.activation_generation,
+				 UT_ACTIVATION_GENERATION);
+	UT_ASSERT_EQ(route_seam.armed_proof.activation_generation,
+				 UT_ACTIVATION_GENERATION);
+	UT_ASSERT_EQ(route_seam.armed_proof.real_master_node, UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.armed_proof.selected_holder_node, UT_HOLDER_NODE);
+	UT_ASSERT_EQ(route_seam.armed_lifetime_hint_ms, 1000);
+	UT_ASSERT(route_seam.armed_lifetime_hint_trusted);
+	UT_ASSERT_EQ(route_seam.enqueue_msg_type, PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
+	UT_ASSERT_EQ(route_seam.enqueue_dest, UT_HOLDER_NODE);
+	UT_ASSERT_EQ(route_seam.enqueue_payload_len, sizeof(ClusterR4CrForwardPayload));
+	UT_ASSERT_EQ(route_seam.enqueue_required_capability, UT_R4_REQUIRED_CAPABILITIES);
+	UT_ASSERT_EQ(route_seam.enqueue_connection_generation,
+				 UT_HOLDER_CAPABILITY_GENERATION);
+	memcpy(&forwarded, route_seam.enqueue_payload, sizeof(forwarded));
+	UT_ASSERT_EQ(forwarded.base.original_requester_node, UT_MASTER_NODE);
+	UT_ASSERT_EQ(forwarded.base.master_node, UT_MASTER_NODE);
+	UT_ASSERT_EQ(forwarded.base.request_id, UT_REQUEST_ID);
+	UT_ASSERT_EQ(forwarded.base.epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(memcmp(&forwarded.base.tag, &request.base.tag, sizeof(BufferTag)), 0);
+	UT_ASSERT(route_seam.arm_sequence < route_seam.enqueue_sequence);
+	UT_ASSERT(route_seam.enqueue_sequence < route_seam.finish_sequence);
+	UT_ASSERT(route_seam.finish_sequence < route_seam.recheck_sequence);
+	UT_ASSERT(route_seam.recheck_sequence < route_seam.leave_sequence);
+	cluster_node_id = saved_node_id;
+}
+
+/* With requester, real master and selected holder all local, both capability
+ * identities are compiled under the master's one TARGET token.  The stored
+ * FORWARD96 proof must enter the registered local envelope dispatcher; the
+ * peer sampler, cap-bound ring and generic IC self-send have no local edge. */
+UT_TEST(test_request80_all_local_routes_forward96_through_registered_dispatch)
+{
+	ClusterR4CrRequestPayload request = route_test_request80();
+	ClusterICEnvelope env;
+	ClusterR4CrForwardPayload forwarded;
+	uint64 master_authority_generation = 0;
+	uint64 master_resource_transition_count = 0;
+	SCN expected_page_scn = InvalidScn;
+	bool proof_ok;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_HOLDER_NODE;
+	request.base.sender_node = UT_HOLDER_NODE;
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, UT_HOLDER_NODE,
+						  UT_HOLDER_NODE, sizeof(request));
+	route_seam_reset();
+	route_seam.lookup_master_node = UT_HOLDER_NODE;
+
+	UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
+	memcpy(&forwarded, route_seam.local_dispatch_payload, sizeof(forwarded));
+	proof_ok = ClusterR4ForwardExtensionGetCrProof(
+		&forwarded.extension, UT_FORMATION_EPOCH,
+		&master_authority_generation, &master_resource_transition_count,
+		&expected_page_scn);
+
+	UT_ASSERT(route_seam.capability_calls == 0
+			  && route_seam.peer_open_calls == 0
+			  && route_seam.enqueue_calls == 0
+			  && route_seam.raw_send_calls == 0
+			  && route_seam.envelope_build_calls == 1
+			  && route_seam.local_dispatch_calls == 1
+			  && route_seam.local_dispatch_peer == UT_HOLDER_NODE
+			  && route_seam.local_dispatch_envelope.msg_type
+				 == PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+			  && route_seam.local_dispatch_envelope.source_node_id == UT_HOLDER_NODE
+			  && route_seam.local_dispatch_envelope.dest_node_id == UT_HOLDER_NODE
+			  && route_seam.local_dispatch_envelope.epoch == UT_FORMATION_EPOCH
+			  && route_seam.local_dispatch_payload_len
+				 == sizeof(ClusterR4CrForwardPayload)
+			  && forwarded.base.request_id == UT_REQUEST_ID
+			  && forwarded.base.epoch == UT_FORMATION_EPOCH
+			  && memcmp(&forwarded.base.tag, &request.base.tag, sizeof(BufferTag)) == 0
+			  && forwarded.base.original_requester_node == UT_HOLDER_NODE
+			  && forwarded.base.requester_backend_id == UT_REQUESTER_BACKEND
+			  && forwarded.base.master_node == UT_HOLDER_NODE
+			  && forwarded.base.transition_id == PCM_TRANS_N_TO_S
+			  && proof_ok
+			  && master_authority_generation == UT_MASTER_GENERATION
+			  && master_resource_transition_count == UT_MASTER_TRANSITION
+			  && expected_page_scn == UT_EXPECTED_PAGE_SCN
+			  && route_seam.enter_sequence < route_seam.snapshot_sequence
+			  && route_seam.snapshot_sequence < route_seam.arm_sequence
+			  && route_seam.arm_sequence < route_seam.envelope_build_sequence
+			  && route_seam.envelope_build_sequence < route_seam.local_dispatch_sequence
+			  && route_seam.local_dispatch_sequence < route_seam.finish_sequence);
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	UT_ASSERT_EQ(route_seam.snapshot_calls, 1);
+	UT_ASSERT_EQ(route_seam.arm_calls, 1);
+	UT_ASSERT_EQ(route_seam.finish_calls, 1);
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_calls, 0);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT(route_seam.finished_outbound_admitted);
+	UT_ASSERT_EQ(route_seam.armed_identity.legacy_key.origin_node_id, UT_HOLDER_NODE);
+	UT_ASSERT_EQ(route_seam.armed_identity.activation_generation,
+				 UT_ACTIVATION_GENERATION);
+	UT_ASSERT_EQ(route_seam.armed_proof.activation_generation,
+				 UT_ACTIVATION_GENERATION);
+	UT_ASSERT_EQ(route_seam.armed_proof.real_master_node, UT_HOLDER_NODE);
+	UT_ASSERT_EQ(route_seam.armed_proof.selected_holder_node, UT_HOLDER_NODE);
+	UT_ASSERT_EQ(memcmp(&route_seam.finished_identity, &route_seam.armed_identity,
+					 sizeof(route_seam.armed_identity)), 0);
+	UT_ASSERT_EQ(memcmp(&route_seam.finished_proof, &route_seam.armed_proof,
+					 sizeof(route_seam.armed_proof)), 0);
+	UT_ASSERT(route_seam.finish_sequence < route_seam.recheck_sequence);
+	UT_ASSERT(route_seam.recheck_sequence < route_seam.leave_sequence);
+	cluster_node_id = saved_node_id;
+}
+
+/* The all-local holder decoder has no peer HELLO identity to sample.  Both
+ * authenticated local actors prove the compiled family under the one entered
+ * TARGET token, whose checked OPEN generation is the exact uint32 carrier for
+ * both sides of the typed holder submit. */
+UT_TEST(test_forward96_all_local_uses_checked_open_generation_for_both_submit_identities)
+{
+	ClusterR4CrForwardPayload forward = route_test_forward96();
+	ClusterICEnvelope env;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_HOLDER_NODE;
+	forward.base.original_requester_node = UT_HOLDER_NODE;
+	forward.base.master_node = UT_HOLDER_NODE;
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_HOLDER_NODE,
+							  UT_HOLDER_NODE, sizeof(forward));
+	route_seam_reset();
+	route_seam.activation_generation = UT_LOCAL_OPEN_GENERATION;
+	route_seam.lookup_master_node = UT_HOLDER_NODE;
+
+	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.capability_calls, 0);
+	UT_ASSERT_EQ(route_seam.peer_open_calls, 0);
+	UT_ASSERT_EQ(route_seam.snapshot_calls, 0);
+	UT_ASSERT_EQ(route_seam.arm_calls, 0);
+	UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
+	UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+	UT_ASSERT_EQ(route_seam.holder_submit_calls, 1);
+	UT_ASSERT_EQ(route_seam.refusal_enqueue_calls, 0);
+	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	UT_ASSERT_EQ(memcmp(&route_seam.submitted_forward, &forward, sizeof(forward)), 0);
+	UT_ASSERT(route_seam.submitted_reason_out_present);
+	UT_ASSERT(route_seam.submitted_admission.entered);
+	UT_ASSERT_EQ(route_seam.submitted_admission.feature_bit,
+				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	UT_ASSERT_EQ(route_seam.submitted_admission.record_generation,
+				 UT_LOCAL_OPEN_GENERATION);
+	UT_ASSERT_EQ(route_seam.submitted_admission.formation_epoch, UT_FORMATION_EPOCH);
+	UT_ASSERT_EQ(route_seam.submitted_admission.side, CLUSTER_SEMANTIC_TARGET_SIDE);
+	UT_ASSERT_EQ(route_seam.submitted_requester_capability_generation,
+				 (uint32)UT_LOCAL_OPEN_GENERATION);
+	UT_ASSERT_EQ(route_seam.submitted_master_capability_generation,
+				 (uint32)UT_LOCAL_OPEN_GENERATION);
+	UT_ASSERT(route_seam.submitted_admission_address != NULL);
+	UT_ASSERT(route_seam.submitted_admission_address
+			  == route_seam.rechecked_admission_address);
+	UT_ASSERT(route_seam.submitted_admission_address == route_seam.left_admission_address);
+	UT_ASSERT_EQ(memcmp(&route_seam.submitted_admission,
+					 &route_seam.rechecked_admission,
+					 sizeof(route_seam.submitted_admission)), 0);
+	UT_ASSERT_EQ(memcmp(&route_seam.submitted_admission, &route_seam.left_admission,
+					 sizeof(route_seam.submitted_admission)), 0);
+	UT_ASSERT(route_seam.enter_sequence < route_seam.holder_submit_sequence);
+	UT_ASSERT(route_seam.holder_submit_sequence < route_seam.recheck_sequence);
+	UT_ASSERT(route_seam.recheck_sequence < route_seam.leave_sequence);
+	cluster_node_id = saved_node_id;
+}
+
+/* A local OPEN generation that cannot be represented by the frozen uint32
+ * slot carrier is refused without truncation before typed submit can mutate a
+ * slot.  The exact FORWARD96 frame remains consumed and the entered token is
+ * still left once by its holder decoder. */
+UT_TEST(test_forward96_all_local_refuses_open_generation_overflow_before_submit)
+{
+	ClusterR4CrForwardPayload forward = route_test_forward96();
+	ClusterICEnvelope env;
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = UT_HOLDER_NODE;
+	forward.base.original_requester_node = UT_HOLDER_NODE;
+	forward.base.master_node = UT_HOLDER_NODE;
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_HOLDER_NODE,
+							  UT_HOLDER_NODE, sizeof(forward));
+	route_seam_reset();
+	route_seam.activation_generation = UT_LOCAL_OPEN_GENERATION_OVERFLOW;
+	route_seam.lookup_master_node = UT_HOLDER_NODE;
+
+	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.capability_calls, 0);
+	UT_ASSERT_EQ(route_seam.peer_open_calls, 0);
+	UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
+	UT_ASSERT(!route_seam.submitted_reason_out_present);
+	UT_ASSERT(route_seam.submitted_admission_address == NULL);
+	UT_ASSERT_EQ(route_seam.snapshot_calls, 0);
+	UT_ASSERT_EQ(route_seam.arm_calls, 0);
+	UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	UT_ASSERT(route_seam.enter_sequence < route_seam.leave_sequence);
+	cluster_node_id = saved_node_id;
+}
+
+/* A holder-side typed failure is consumed only after the submit result and
+ * the decoder's final token recheck.  Reusing the master-side refusal shape,
+ * replying to env.source, or publishing after leave breaks this boundary. */
+UT_TEST(test_forward96_holder_submit_failure_publishes_typed_remote_refusal)
+{
+	static const struct {
+		ClusterCrBuildResult result;
+		ClusterCrBuildReason reason;
+		GcsBlockReplyStatus status;
+	} cases[] = {
+		{ CLUSTER_CR_BUILD_RETRYABLE, CLUSTER_CR_BUILD_HOLDER_MOVED,
+		  GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED },
+		{ CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL,
+		  GCS_BLOCK_REPLY_R4_DENIED },
+		/* A polarity-invalid pair must never inherit FULL or retry semantics. */
+		{ CLUSTER_CR_BUILD_FULL, CLUSTER_CR_BUILD_HOLDER_MOVED,
+		  GCS_BLOCK_REPLY_R4_DENIED }
+	};
+	ClusterR4CrForwardPayload forward = route_test_forward96();
+	ClusterICEnvelope env
+		= route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE,
+							  UT_HOLDER_NODE, sizeof(forward));
+	int saved_node_id = cluster_node_id;
+	int i;
+
+	cluster_node_id = UT_HOLDER_NODE;
+	for (i = 0; i < lengthof(cases); i++) {
+		route_seam_reset();
+		route_seam.holder_submit_result = cases[i].result;
+		route_seam.holder_submit_reason = cases[i].reason;
+
+		UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+		UT_ASSERT_EQ(route_seam.enter_calls, 1);
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+		UT_ASSERT_EQ(route_seam.capability_calls, 2);
+		UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
+		UT_ASSERT_EQ(route_seam.holder_submit_calls, 1);
+		UT_ASSERT(route_seam.submitted_reason_out_present);
+		UT_ASSERT_EQ(route_seam.submitted_requester_capability_generation,
+					 UT_REQUESTER_CAPABILITY_GENERATION);
+		UT_ASSERT_EQ(route_seam.submitted_master_capability_generation,
+					 UT_MASTER_CAPABILITY_GENERATION);
+		UT_ASSERT_EQ(route_seam.recheck_calls, 1);
+		UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
+		route_assert_holder_refusal(cases[i].status);
+		UT_ASSERT(route_seam.holder_submit_sequence < route_seam.recheck_sequence);
+		UT_ASSERT(route_seam.recheck_sequence < route_seam.refusal_enqueue_sequence);
+		UT_ASSERT(route_seam.refusal_enqueue_sequence < route_seam.leave_sequence);
+	}
+	cluster_node_id = saved_node_id;
 }
 
 /* These hooks are exact-extended-shape classifiers: an exact R4 frame is
@@ -1054,6 +3476,7 @@ UT_TEST(test_r4_same_open_mismatch_has_zero_route_or_holder_mutation)
 	ClusterICEnvelope env
 		= route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, UT_REQUESTER_NODE, UT_MASTER_NODE,
 							  sizeof(request));
+	int saved_node_id = cluster_node_id;
 
 	route_seam_reset();
 	route_seam.peer_open_ok = false;
@@ -1071,10 +3494,14 @@ UT_TEST(test_r4_same_open_mismatch_has_zero_route_or_holder_mutation)
 
 	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE, UT_HOLDER_NODE,
 						  sizeof(forward));
+	cluster_node_id = UT_HOLDER_NODE;
 	route_seam_reset();
 	route_seam.peer_open_ok = false;
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
+	UT_ASSERT_EQ(route_seam.capability_calls, 2);
+	UT_ASSERT_EQ(route_seam.capability_peers[0], UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.capability_peers[1], UT_REQUESTER_NODE);
 	UT_ASSERT_EQ(route_seam.peer_open_calls, 1);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
 	UT_ASSERT_EQ(route_seam.snapshot_calls, 0);
@@ -1084,6 +3511,7 @@ UT_TEST(test_r4_same_open_mismatch_has_zero_route_or_holder_mutation)
 	UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
 	UT_ASSERT_EQ(route_seam.recheck_calls, 0);
 	UT_ASSERT_EQ(route_seam.refusal_enqueue_calls, 0);
+	cluster_node_id = saved_node_id;
 }
 
 /* Once the requester capability generation has been sampled, admission
@@ -1115,6 +3543,7 @@ UT_TEST(test_request80_admission_refusals_publish_without_token)
 		UT_ASSERT_EQ(route_seam.recheck_calls, 0);
 		UT_ASSERT_EQ(route_seam.snapshot_calls, 0);
 		UT_ASSERT_EQ(route_seam.arm_calls, 0);
+		UT_ASSERT_EQ(route_seam.observe_calls, 0);
 		UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
 		UT_ASSERT_EQ(route_seam.finish_calls, 0);
 		UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
@@ -1259,6 +3688,7 @@ UT_TEST(test_request80_arm_full_stops_before_publication)
 	UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
 	UT_ASSERT_EQ(route_seam.snapshot_calls, 1);
 	UT_ASSERT_EQ(route_seam.arm_calls, 1);
+	UT_ASSERT_EQ(route_seam.observe_calls, 0);
 	UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
 	UT_ASSERT_EQ(route_seam.finish_calls, 0);
 	UT_ASSERT_EQ(route_seam.recheck_calls, 1);
@@ -1335,15 +3765,18 @@ UT_TEST(test_forward96_master_mismatch_is_consumed_without_holder_submit)
 	ClusterICEnvelope env
 		= route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE, UT_HOLDER_NODE,
 							  sizeof(forward));
+	int saved_node_id = cluster_node_id;
 
 	forward.base.master_node = UT_HOLDER_NODE;
+	cluster_node_id = UT_HOLDER_NODE;
 	route_seam_reset();
 	UT_ASSERT_EQ(env.payload_length, 96);
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
-	UT_ASSERT_EQ(route_seam.capability_calls, 1);
+	UT_ASSERT_EQ(route_seam.capability_calls, 2);
 	UT_ASSERT_EQ(route_seam.capability_peers[0], UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.capability_peers[1], UT_REQUESTER_NODE);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
-	UT_ASSERT_EQ(route_seam.peer_open_calls, 1);
+	UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
 	UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
 	UT_ASSERT_EQ(route_seam.recheck_calls, 0);
 	UT_ASSERT_EQ(route_seam.snapshot_calls, 0);
@@ -1351,6 +3784,7 @@ UT_TEST(test_forward96_master_mismatch_is_consumed_without_holder_submit)
 	UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
 	UT_ASSERT_EQ(route_seam.finish_calls, 0);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	cluster_node_id = saved_node_id;
 }
 
 UT_TEST(test_forward96_proof_epoch_mismatch_is_consumed_without_holder_submit)
@@ -1359,18 +3793,21 @@ UT_TEST(test_forward96_proof_epoch_mismatch_is_consumed_without_holder_submit)
 	ClusterICEnvelope env
 		= route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE, UT_HOLDER_NODE,
 							  sizeof(forward));
+	int saved_node_id = cluster_node_id;
 
 	/* Corrupt the proof's embedded formation-epoch half while keeping the base
 	 * and authenticated envelope epochs valid. */
 	forward.extension.kind.cr.master_authority_generation_le[4]
 		= (uint8)(UT_FORMATION_EPOCH + 1);
+	cluster_node_id = UT_HOLDER_NODE;
 	route_seam_reset();
 	UT_ASSERT_EQ(env.payload_length, 96);
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
-	UT_ASSERT_EQ(route_seam.capability_calls, 1);
+	UT_ASSERT_EQ(route_seam.capability_calls, 2);
 	UT_ASSERT_EQ(route_seam.capability_peers[0], UT_MASTER_NODE);
+	UT_ASSERT_EQ(route_seam.capability_peers[1], UT_REQUESTER_NODE);
 	UT_ASSERT_EQ(route_seam.enter_calls, 1);
-	UT_ASSERT_EQ(route_seam.peer_open_calls, 1);
+	UT_ASSERT_EQ(route_seam.peer_open_calls, 2);
 	UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
 	UT_ASSERT_EQ(route_seam.recheck_calls, 0);
 	UT_ASSERT_EQ(route_seam.snapshot_calls, 0);
@@ -1378,12 +3815,13 @@ UT_TEST(test_forward96_proof_epoch_mismatch_is_consumed_without_holder_submit)
 	UT_ASSERT_EQ(route_seam.enqueue_calls, 0);
 	UT_ASSERT_EQ(route_seam.finish_calls, 0);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	cluster_node_id = saved_node_id;
 }
 
 int
 main(void)
 {
-	UT_PLAN(67);
+	UT_PLAN(92);
 	UT_RUN(test_01_null_authority_is_protocol);
 	UT_RUN(test_02_null_output_is_protocol);
 	UT_RUN(test_03_canonical_n_has_no_holder);
@@ -1437,7 +3875,32 @@ main(void)
 	UT_RUN(test_unknown_reason_fails_closed);
 	UT_RUN(test_d3_result_reason_mapping_is_closed);
 	UT_RUN(test_r4_refusal_decoder_requires_exact_domain_identity_and_zero_body);
+	UT_RUN(test_r4_reply_decoder_binds_domain_status_length_and_undo_authority);
+	UT_RUN(test_r4_status24_routes_only_to_internal_foreign_undo_landing);
+	UT_RUN(test_r4_reply_decoder_checks_minimum_length_before_header_read);
+	UT_RUN(test_r4_full_reply_lands_once_in_armed_r4_slot);
+	UT_RUN(test_r4_requester_arm_selects_closed_domain_and_releases_cleanly);
+	UT_RUN(test_current_mx_describe_requester_is_capability_bound_and_times_out_cleanly);
+	UT_RUN(test_current_mx_describe_reply_lands_in_current_domain);
+	UT_RUN(test_current_mx_describe_forward128_routes_to_origin_serve);
+	UT_RUN(test_current_mx_member_proof_requester_is_capability_bound_and_times_out_cleanly);
+	UT_RUN(test_current_mx_member_proof_forward128_routes_to_origin_serve);
+	UT_RUN(test_current_mx_member_proof_reply_lands_in_current_domain);
+	UT_RUN(test_r4_requester_count_tracks_only_live_r4_domain_slots);
+	UT_RUN(test_r4_remote_requester_arms_request80_waits_full_and_releases);
+	UT_RUN(test_r4_requester_status25_releases_then_retries_with_fresh_id);
+	UT_RUN(test_r4_requester_status26_fails_closed_without_retry_and_cleans_slot);
+	UT_RUN(test_target_wrapper_status25_retry_exhaustion_raises_53r90);
+	UT_RUN(test_target_wrapper_disabled_returns_typed_before_lookup_or_wire);
+	UT_RUN(test_target_wrapper_status21_rechecks_private_scratch_then_copies_full);
+	UT_RUN(test_target_wrapper_local_master_stages_request80_to_data_owner_and_returns_full);
+	UT_RUN(test_target_wrapper_recheck_drift_keeps_dst_and_canonicalizes_slot);
 	UT_RUN(test_request80_routes_stored_proof_to_real_forward96_handler);
+	UT_RUN(test_request80_local_master_uses_compiled_capability_and_routes_remote_holder);
+	UT_RUN(test_request80_all_local_routes_forward96_through_registered_dispatch);
+	UT_RUN(test_forward96_all_local_uses_checked_open_generation_for_both_submit_identities);
+	UT_RUN(test_forward96_all_local_refuses_open_generation_overflow_before_submit);
+	UT_RUN(test_forward96_holder_submit_failure_publishes_typed_remote_refusal);
 	UT_RUN(test_r4_try_handlers_consume_only_exact_extended_lengths);
 	UT_RUN(test_r4_same_open_mismatch_has_zero_route_or_holder_mutation);
 	UT_RUN(test_request80_admission_refusals_publish_without_token);

@@ -29,6 +29,8 @@
  */
 #include "postgres.h"
 
+#include <time.h>
+
 #ifdef USE_PGRAC_CLUSTER
 
 #include "miscadmin.h"	   /* CritSectionCount */
@@ -43,7 +45,6 @@
 #include "cluster/cluster_lmon.h"			/* cluster_lmon_marker_complete_wakeup */
 #include "cluster/cluster_qvotec.h"			/* ClusterVotingSlot (marker layout asserts) */
 #include "cluster/cluster_shmem.h"			/* cluster_shmem_register_region */
-#include "cluster/cluster_voting_disk_io.h" /* D6 direct durable marker read */
 #include "cluster/cluster_write_fence.h"	/* region + judge + wrapper + marker */
 
 /*
@@ -77,6 +78,11 @@ static ClusterWriteFenceShmem *cluster_write_fence_shmem = NULL;
  */
 static uint64 qvotec_inflight_marker_seq = 0;
 static uint64 qvotec_last_processed_marker_seq = 0;
+
+#ifdef USE_ASSERT_CHECKING
+void (*cluster_write_fence_cache_test_after_publish_acquire_hook)(void) = NULL;
+void (*cluster_write_fence_cache_test_before_invalidate_acquire_hook)(void) = NULL;
+#endif
 
 static Size
 cluster_write_fence_shmem_size(void)
@@ -113,6 +119,24 @@ cluster_write_fence_shmem_init(void)
 		pg_atomic_init_u64(&cluster_write_fence_shmem->baseline_published, 0); /* D6 */
 		pg_atomic_init_u32(&cluster_write_fence_shmem->baseline_author_is_self, 0);
 		pg_atomic_init_u64(&cluster_write_fence_shmem->last_authority_refresh_us, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_admit_requested, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_write_excluded, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_rejected, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_unknown, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_unavailable, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_identity_mismatch, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_expired, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_daemon_disconnect, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_mutation_gate_blocked, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_publish_gate_blocked, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_last_journal_seq, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_last_verified_mono_ns, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->authority_cache_seq, 0);
+		pg_atomic_init_u32(&cluster_write_fence_shmem->authority_cache_valid, 0);
+		memset(&cluster_write_fence_shmem->authority_cache_marker, 0,
+			   sizeof(cluster_write_fence_shmem->authority_cache_marker));
+		cluster_write_fence_shmem->authority_cache_published_at_us = 0;
+		cluster_write_fence_shmem->authority_cache_expiry_us = 0;
 
 		/* D4 LMON->qvotec submit mailbox starts empty (request == completion). */
 		cluster_write_fence_shmem->qvotec_latch = NULL;
@@ -139,6 +163,181 @@ void
 cluster_write_fence_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_write_fence_region);
+}
+
+/* Acquire the cache's single short writer section only if no invalidation or
+ * publication has occurred since the caller began its direct F1/M/F2 proof.
+ * This generation check prevents a pre-change proof from being published
+ * after the state-changing invalidation that made it stale. */
+static bool
+cluster_write_fence_cache_write_begin_if_unchanged(uint64 expected_sequence,
+											   uint64 *odd_seq)
+{
+	uint64 expected;
+
+	if (cluster_write_fence_shmem == NULL || odd_seq == NULL)
+		return false;
+	if ((expected_sequence & UINT64_C(1)) != 0
+		|| expected_sequence >= UINT64_MAX - 1)
+		return false;
+	expected = expected_sequence;
+	if (!pg_atomic_compare_exchange_u64(&cluster_write_fence_shmem->authority_cache_seq,
+										&expected, expected_sequence + 1))
+		return false;
+	*odd_seq = expected_sequence + 1;
+	return true;
+}
+
+/* Invalidation is a state-change prerequisite, so it must linearize after every
+ * pre-existing publisher.  Waiting forever behind a crashed odd writer is the
+ * intentional fail-closed state: the caller cannot cross the membership change
+ * and readers continue to return UNAVAILABLE. */
+static bool
+cluster_write_fence_cache_invalidate_begin(uint64 *odd_seq)
+{
+	if (cluster_write_fence_shmem == NULL || odd_seq == NULL)
+		return false;
+	for (;;) {
+		uint64 seq = pg_atomic_read_u64(&cluster_write_fence_shmem->authority_cache_seq);
+		uint64 expected;
+
+		if ((seq & UINT64_C(1)) != 0) {
+			pg_usleep(1000L);
+			continue;
+		}
+		if (seq >= UINT64_MAX - 1) {
+			pg_atomic_write_u32(&cluster_write_fence_shmem->authority_cache_valid, 0);
+			pg_write_barrier();
+			return false;
+		}
+		expected = seq;
+		if (pg_atomic_compare_exchange_u64(&cluster_write_fence_shmem->authority_cache_seq,
+										   &expected, seq + 1)) {
+			*odd_seq = seq + 1;
+			return true;
+		}
+	}
+}
+
+static void
+cluster_write_fence_cache_write_end(uint64 odd_seq)
+{
+	pg_write_barrier();
+	pg_atomic_write_u64(&cluster_write_fence_shmem->authority_cache_seq, odd_seq + 1);
+}
+
+uint64
+cluster_write_fence_authority_cache_sequence(void)
+{
+	if (cluster_write_fence_shmem == NULL)
+		return UINT64_MAX;
+	return pg_atomic_read_u64(&cluster_write_fence_shmem->authority_cache_seq);
+}
+
+bool
+cluster_write_fence_authority_cache_publish_if_unchanged(const ClusterFenceMarker *marker,
+												 uint64 published_at_us,
+												 uint64 expected_sequence)
+{
+	uint64 odd_seq;
+
+	if (marker == NULL || !cluster_fence_marker_valid_v1(marker)
+		|| published_at_us > UINT64_MAX - CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US) {
+		cluster_write_fence_authority_cache_invalidate();
+		return false;
+	}
+	if (!cluster_write_fence_cache_write_begin_if_unchanged(expected_sequence, &odd_seq))
+		return false;
+#ifdef USE_ASSERT_CHECKING
+	if (cluster_write_fence_cache_test_after_publish_acquire_hook != NULL)
+		cluster_write_fence_cache_test_after_publish_acquire_hook();
+#endif
+	pg_atomic_write_u32(&cluster_write_fence_shmem->authority_cache_valid, 0);
+	pg_write_barrier();
+	cluster_write_fence_shmem->authority_cache_marker = *marker;
+	memset(cluster_write_fence_shmem->authority_cache_marker._pad, 0,
+		   sizeof(cluster_write_fence_shmem->authority_cache_marker._pad));
+	cluster_write_fence_shmem->authority_cache_published_at_us = published_at_us;
+	cluster_write_fence_shmem->authority_cache_expiry_us
+		= published_at_us + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US;
+	pg_write_barrier();
+	pg_atomic_write_u32(&cluster_write_fence_shmem->authority_cache_valid, 1);
+	cluster_write_fence_cache_write_end(odd_seq);
+	return true;
+}
+
+void
+cluster_write_fence_authority_cache_mutation_end(uint64 odd_sequence)
+{
+	if (cluster_write_fence_shmem == NULL || odd_sequence == 0)
+		return;
+	memset(&cluster_write_fence_shmem->authority_cache_marker, 0,
+		   sizeof(cluster_write_fence_shmem->authority_cache_marker));
+	cluster_write_fence_shmem->authority_cache_published_at_us = 0;
+	cluster_write_fence_shmem->authority_cache_expiry_us = 0;
+	cluster_write_fence_cache_write_end(odd_sequence);
+}
+
+uint64
+cluster_write_fence_authority_cache_mutation_begin(void)
+{
+	uint64 odd_seq;
+
+	if (!cluster_write_fence_cache_invalidate_begin(&odd_seq))
+		return 0;
+	pg_atomic_write_u32(&cluster_write_fence_shmem->authority_cache_valid, 0);
+	pg_write_barrier();
+	return odd_seq;
+}
+
+void
+cluster_write_fence_authority_cache_invalidate(void)
+{
+	uint64 odd_seq;
+
+#ifdef USE_ASSERT_CHECKING
+	if (cluster_write_fence_cache_test_before_invalidate_acquire_hook != NULL)
+		cluster_write_fence_cache_test_before_invalidate_acquire_hook();
+#endif
+	odd_seq = cluster_write_fence_authority_cache_mutation_begin();
+	cluster_write_fence_authority_cache_mutation_end(odd_seq);
+}
+
+ClusterFenceAuthorityCacheResult
+cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected, uint64 now_us)
+{
+	int attempt;
+
+	if (expected == NULL)
+		return CLUSTER_FENCE_CACHE_INVALID;
+	if (cluster_write_fence_shmem == NULL)
+		return CLUSTER_FENCE_CACHE_UNAVAILABLE;
+	for (attempt = 0; attempt < 2; attempt++) {
+		ClusterFenceMarker observed;
+		uint64 seq_before;
+		uint64 seq_after;
+		uint64 published_at_us;
+		uint64 expiry_us;
+		bool valid;
+
+		seq_before = pg_atomic_read_u64(&cluster_write_fence_shmem->authority_cache_seq);
+		if (seq_before == 0)
+			return CLUSTER_FENCE_CACHE_INVALID;
+		if ((seq_before & UINT64_C(1)) != 0)
+			continue;
+		pg_read_barrier();
+		valid = pg_atomic_read_u32(&cluster_write_fence_shmem->authority_cache_valid) != 0;
+		observed = cluster_write_fence_shmem->authority_cache_marker;
+		published_at_us = cluster_write_fence_shmem->authority_cache_published_at_us;
+		expiry_us = cluster_write_fence_shmem->authority_cache_expiry_us;
+		pg_read_barrier();
+		seq_after = pg_atomic_read_u64(&cluster_write_fence_shmem->authority_cache_seq);
+		if (seq_before == seq_after && (seq_after & UINT64_C(1)) == 0)
+			return cluster_fence_authority_cache_decide_v1(
+				expected, seq_before, seq_after, valid, &observed, published_at_us, expiry_us,
+				now_us);
+	}
+	return CLUSTER_FENCE_CACHE_UNAVAILABLE;
 }
 
 /*
@@ -217,102 +416,6 @@ cluster_write_fence_allowed(void)
 }
 
 /*
- * cluster_write_fence_read_durable_authority -- spec-4.12 D6 helper.  DIRECTLY read
- *	the voting-disk fence markers (bypassing the qvotec cache token) and decide
- *	authority over the TOTAL configured disk count.  Returns false when no voting
- *	disks are configured (caller decides what that means).  An unreadable disk stays
- *	has_marker=false and still counts toward the total, so a minority of readable
- *	disks can never fake a majority (P0a).  Reuses cluster_fence_authority_decide.
- */
-static bool
-cluster_write_fence_read_durable_authority(ClusterFenceAuthority *out)
-{
-	ClusterFenceMarker disk_markers[CLUSTER_MAX_VOTING_DISKS];
-	/* Zero-init: a disk slot never assigned (unreadable / skipped token) stays
-	 * has_marker=false, which is the correct fail-closed default and keeps the
-	 * authority quorum honest (it counts toward the configured total). */
-	bool disk_has_marker[CLUSTER_MAX_VOTING_DISKS] = { false };
-	int n_total = 0;
-	const char *p;
-
-	if (cluster_voting_disks == NULL || cluster_voting_disks[0] == '\0')
-		return false; /* no voting disks configured (no I/O -> no wait event) */
-
-	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WRITE_FENCE_VERIFY);
-	p = cluster_voting_disks;
-	while (*p && n_total < CLUSTER_MAX_VOTING_DISKS) {
-		const char *start = p;
-		const char *end;
-		char path[MAXPGPATH];
-		size_t len;
-		int fd;
-		int slot_idx = n_total;
-
-		while (*p && *p != ',')
-			p++;
-		end = p;
-		if (*p == ',')
-			p++;
-		/* Trim leading / trailing whitespace.  Explicit-break form so a static
-		 * analyzer sees the loop can exit while end > start (a non-whitespace
-		 * tail), i.e. len is not provably zero. */
-		while (start < end && (*start == ' ' || *start == '\t'))
-			start++;
-		while (end > start) {
-			char tail = end[-1];
-
-			if (tail != ' ' && tail != '\t')
-				break;
-			end--;
-		}
-		if (start >= end)
-			continue; /* empty token (trailing / double comma): skip */
-		len = (size_t)(end - start);
-		if (len >= MAXPGPATH)
-			continue; /* oversized token: skip without consuming a disk slot */
-
-		memcpy(path, start, len);
-		path[len] = '\0';
-
-		disk_has_marker[slot_idx] = false;
-		fd = cluster_voting_disk_open(path, false);
-		if (fd >= 0) {
-			uint32 node;
-			bool found = false;
-			ClusterFenceMarker best;
-
-			memset(&best, 0, sizeof(best));
-			for (node = 0; node < CLUSTER_MAX_NODES; node++) {
-				ClusterVotingSlot slot;
-				ClusterFenceMarker m;
-
-				if (cluster_voting_disk_read_slot(fd, slot_idx, node, &slot)
-					!= CLUSTER_VOTING_DISK_IO_OK)
-					continue;
-				if (!cluster_fence_marker_unpack(slot._reserved1, &m))
-					continue;
-				if (!found || m.fence_epoch > best.fence_epoch
-					|| (m.fence_epoch == best.fence_epoch
-						&& m.fence_generation > best.fence_generation)) {
-					best = m;
-					found = true;
-				}
-			}
-			cluster_voting_disk_close(fd);
-			disk_has_marker[slot_idx] = found;
-			if (found)
-				disk_markers[slot_idx] = best;
-		}
-		n_total++;
-	}
-
-	pgstat_report_wait_end();
-
-	*out = cluster_fence_authority_decide(disk_markers, disk_has_marker, n_total);
-	return true;
-}
-
-/*
  * cluster_write_fence_verify_durable -- spec-4.12 D6 (Option B, Oracle-aligned).
  *	The recovery / rejoin / startup direct durable check: true iff a quorum-majority
  *	of the CONFIGURED voting disks carry an identical marker whose fence_epoch ==
@@ -324,14 +427,14 @@ cluster_write_fence_read_durable_authority(ClusterFenceAuthority *out)
 bool
 cluster_write_fence_verify_durable(uint64 required_epoch)
 {
-	ClusterFenceAuthority authority;
+	ClusterFenceAuthorityProof authority;
 
 	if (!cluster_write_fence_enforcing())
 		return true; /* not enforced (off / dev / single-node): PG-native recovery */
 
 	/* Enforcement ON but no durable majority marker for required_epoch -> fail
 	 * closed (no authority granted): missing disks / superseded epoch / no marker. */
-	if (cluster_write_fence_read_durable_authority(&authority) && authority.has_authority
+	if (cluster_write_fence_read_durable_authority(&authority) == CLUSTER_FENCE_AUTHORITY_OK
 		&& authority.marker.fence_epoch == required_epoch)
 		return true;
 
@@ -353,12 +456,12 @@ cluster_write_fence_verify_durable(uint64 required_epoch)
 bool
 cluster_write_fence_startup_self_check(void)
 {
-	ClusterFenceAuthority authority;
+	ClusterFenceAuthorityProof authority;
 
 	if (!cluster_write_fence_enforcing())
 		return false; /* not enforced (off / dev / single-node) -> not fenced */
 
-	if (!cluster_write_fence_read_durable_authority(&authority) || !authority.has_authority)
+	if (cluster_write_fence_read_durable_authority(&authority) != CLUSTER_FENCE_AUTHORITY_OK)
 		return false; /* no durable majority marker -> not durably fenced */
 
 	if (!cluster_fence_marker_node_is_fenced(authority.marker.fenced_dead_bitmap, cluster_node_id))
@@ -716,6 +819,104 @@ cluster_write_fence_note_baseline_published(bool is_leader, bool published)
 	pg_atomic_write_u32(&cluster_write_fence_shmem->baseline_author_is_self, is_leader ? 1 : 0);
 	if (published)
 		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->baseline_published, 1);
+}
+
+/* STOP-04 \u00a73.13.  External-fence observations are deliberately kept in
+ * the existing write-fence region.  Missing shmem is an L110-safe no-op and
+ * none of these diagnostics participates in an authority decision. */
+static void
+cluster_write_fence_atomic_max(pg_atomic_uint64 *value, uint64 candidate)
+{
+	uint64 old = pg_atomic_read_u64(value);
+
+	while (candidate > old &&
+		   !pg_atomic_compare_exchange_u64(value, &old, candidate))
+		;
+}
+
+void
+cluster_write_fence_note_external_admit_requested(void)
+{
+	if (cluster_write_fence_shmem != NULL)
+		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->external_admit_requested, 1);
+}
+
+void
+cluster_write_fence_note_external_write_excluded(uint64 journal_seq,
+											 uint64 verified_mono_ns)
+{
+	if (cluster_write_fence_shmem == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->external_write_excluded, 1);
+	cluster_write_fence_atomic_max(&cluster_write_fence_shmem->external_last_journal_seq,
+									journal_seq);
+	cluster_write_fence_atomic_max(
+		&cluster_write_fence_shmem->external_last_verified_mono_ns,
+		verified_mono_ns);
+}
+
+#define DEFINE_EXTERNAL_COUNTER_NOTE(name) \
+	void cluster_write_fence_note_external_##name(void) \
+	{ \
+		if (cluster_write_fence_shmem != NULL) \
+			pg_atomic_fetch_add_u64( \
+				&cluster_write_fence_shmem->external_##name, 1); \
+	}
+
+DEFINE_EXTERNAL_COUNTER_NOTE(rejected)
+DEFINE_EXTERNAL_COUNTER_NOTE(unknown)
+DEFINE_EXTERNAL_COUNTER_NOTE(unavailable)
+DEFINE_EXTERNAL_COUNTER_NOTE(identity_mismatch)
+DEFINE_EXTERNAL_COUNTER_NOTE(expired)
+DEFINE_EXTERNAL_COUNTER_NOTE(daemon_disconnect)
+DEFINE_EXTERNAL_COUNTER_NOTE(mutation_gate_blocked)
+DEFINE_EXTERNAL_COUNTER_NOTE(publish_gate_blocked)
+
+#undef DEFINE_EXTERNAL_COUNTER_NOTE
+
+#define DEFINE_EXTERNAL_COUNTER_GETTER(name) \
+	uint64 cluster_write_fence_get_external_##name(void) \
+	{ \
+		return cluster_write_fence_shmem == NULL ? 0 : \
+			pg_atomic_read_u64(&cluster_write_fence_shmem->external_##name); \
+	}
+
+DEFINE_EXTERNAL_COUNTER_GETTER(admit_requested)
+DEFINE_EXTERNAL_COUNTER_GETTER(write_excluded)
+DEFINE_EXTERNAL_COUNTER_GETTER(rejected)
+DEFINE_EXTERNAL_COUNTER_GETTER(unknown)
+DEFINE_EXTERNAL_COUNTER_GETTER(unavailable)
+DEFINE_EXTERNAL_COUNTER_GETTER(identity_mismatch)
+DEFINE_EXTERNAL_COUNTER_GETTER(expired)
+DEFINE_EXTERNAL_COUNTER_GETTER(daemon_disconnect)
+DEFINE_EXTERNAL_COUNTER_GETTER(mutation_gate_blocked)
+DEFINE_EXTERNAL_COUNTER_GETTER(publish_gate_blocked)
+DEFINE_EXTERNAL_COUNTER_GETTER(last_journal_seq)
+
+#undef DEFINE_EXTERNAL_COUNTER_GETTER
+
+bool
+cluster_write_fence_get_external_last_proof_age_ms(uint64 *age_ms)
+{
+	struct timespec now;
+	uint64 sample;
+	uint64 now_ns;
+
+	if (age_ms == NULL)
+		return false;
+	*age_ms = 0;
+	if (cluster_write_fence_shmem == NULL)
+		return false;
+	sample = pg_atomic_read_u64(
+		&cluster_write_fence_shmem->external_last_verified_mono_ns);
+	if (sample == 0 || clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return false;
+	now_ns = (uint64) now.tv_sec * UINT64_C(1000000000) +
+		(uint64) now.tv_nsec;
+	if (now_ns < sample)
+		return false;
+	*age_ms = (now_ns - sample) / UINT64_C(1000000);
+	return true;
 }
 
 /*

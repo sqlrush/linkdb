@@ -477,6 +477,16 @@ cluster_multixact_remote_xmax_resolve_raw(uint16 origin_slot, MultiXactId mxid, 
 		*overlay_hit = true;
 	decision = cluster_multixact_resolve_visibility_raw(mxres, snap);
 	pfree(mxres);
+	/*
+	 * An overlay is immutable identity metadata, not terminal authority.
+	 * If its exact member key has no locally retained terminal (for example,
+	 * an updater binding became available early enough for proactive emit,
+	 * but its terminal hint has not arrived), ask the MXID origin just as we
+	 * do for a structural miss.  UNKNOWN remains fail-closed if the origin
+	 * cannot serve a complete authoritative list.
+	 */
+	if (decision == CLUSTER_VISIBILITY_UNKNOWN)
+		return cluster_multixact_remote_xmax_ask_origin(origin_slot, mxid, snap);
 	return decision;
 }
 

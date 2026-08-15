@@ -82,6 +82,15 @@ extern void cluster_cf_resid_encode(ClusterResId *dst);
 extern bool cluster_cf_lock(LOCKMODE mode);
 extern void cluster_cf_unlock(LOCKMODE mode);
 
+typedef enum ClusterCfReleaseResult {
+	CLUSTER_CF_RELEASE_NOT_HELD = 0,
+	CLUSTER_CF_RELEASE_CONFIRMED = 1,
+	CLUSTER_CF_RELEASE_UNCONFIRMED = 2
+} ClusterCfReleaseResult;
+
+extern bool cluster_cf_held_is_clusterwide(LOCKMODE mode);
+extern ClusterCfReleaseResult cluster_cf_unlock_confirmed(LOCKMODE mode);
+
 /*
  * cluster_cf_held -- true if this backend currently holds the CF lock in the
  * given mode.  Used by the write path to Assert the caller-level CF X is held
@@ -91,10 +100,9 @@ extern bool cluster_cf_held(LOCKMODE mode);
 
 /*
  * cluster_cf_write_permitted -- true if a shared-authority control-file write
- * is currently allowed: this backend holds CF X (the normal GES-ready path),
- * OR (spec-5.6) the bootstrap single-node-authority window is active
- * (sole-liveness proven and the storage rename-contract satisfied before GES
- * is ready).  Asserted in UpdateControlFile when the authority is enabled.
+ * is currently allowed by one of three process-local facts: this backend holds
+ * CF X, Startup owns the bootstrap single-node window, or the EOR checkpointer
+ * consumed that exact OWNER handoff.  Shared phase alone never grants a write.
  */
 extern bool cluster_cf_write_permitted(void);
 
@@ -114,6 +122,27 @@ extern void cluster_cf_set_bootstrap_authority(bool on);
  * recovery); steady-state writers (the checkpointer) take CF X instead.
  */
 extern bool cluster_cf_in_bootstrap_window(void);
+
+/*
+ * RF-B: one authority predicate shared by Startup and the EOR checkpointer.
+ * When the normal topology has not been loaded (the native seed runs with
+ * cluster.enabled=off), this verifies the postmaster-static pgrac.conf
+ * directly and fails closed unless it declares only this node.
+ */
+extern bool cluster_cf_exactly_one_declared_node(void);
+
+/*
+ * RF-B minimal single-node OWNER -> EOR lifecycle.  INSTALL/CLOSE are
+ * Startup-only through the actor-bound shared phase helpers; CONSUME/COMPLETE
+ * are checkpointer-only.  `identity_ok` is the fresh storage/sysid verdict
+ * obtained before the phase transition, so no transition wraps its I/O.
+ */
+extern bool cluster_cf_owner_eor_install(void);
+extern bool cluster_cf_owner_eor_consume(bool end_of_recovery, bool identity_ok);
+extern bool cluster_cf_owner_eor_local_active(void);
+extern bool cluster_cf_owner_eor_complete(void);
+extern void cluster_cf_owner_eor_abort(void);
+extern bool cluster_cf_owner_eor_close(void);
 
 /*
  * cluster_cf_set_join_readonly / cluster_cf_join_readonly -- spec-5.6 increment

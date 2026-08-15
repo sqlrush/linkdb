@@ -103,6 +103,8 @@
 #include "utils/combocid.h"
 #include "utils/snapmgr.h"
 
+#include "heapam_r4_private.h"
+
 #ifdef USE_PGRAC_CLUSTER
 /* spec-3.2 D5:  MVCC cluster visibility fork. */
 #include "cluster/cluster_catalog_stats.h"		/* vis_unknown counter (spec-6.14 D10b) */
@@ -885,6 +887,20 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 	if (tuple->t_infomask & HEAP_XMAX_IS_MULTI) {
 		ClusterVisResolve mr;
 
+		/*
+		 * spec-3.6b D4: in peer mode every nonterminal current MultiXact
+		 * (including a derived-own ID with mixed-origin members) is decided
+		 * by the heap caller's immutable-descriptor/member-proof bridge.
+		 * HTSU cannot perform that RPC while holding the content lock and
+		 * must not inspect local pg_multixact first.
+		 */
+		if (cluster_peer_mode_enabled()
+			&& !(tuple->t_infomask & HEAP_XMAX_COMMITTED)
+			&& !HEAP_LOCKED_UPGRADED(tuple->t_infomask)) {
+			*res = TM_BeingModified;
+			return true;
+		}
+
 		cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_MULTI, &mr);
 		if (mr.multi_marker_is_remote) {
 			*res = TM_BeingModified; /* remote multixact -> D2b bridge 53R9H */
@@ -925,7 +941,9 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 		}
 		return false;
 	case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
-		switch (cluster_vis_update_xmax_verdict(r.status, is_delete)) {
+		switch (lock_only
+				? cluster_vis_update_lock_only_xmax_verdict(r.status)
+				: cluster_vis_update_xmax_verdict(r.status, is_delete)) {
 		case CVV_VISIBLE:
 			cluster_vis_bump_xmax_resolved_count(); /* spec-7.1a D6 */
 			*res = TM_Ok;
@@ -1754,6 +1772,192 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 	return -1; /* origin unprovable -> fail closed */
 }
 #endif
+
+/*
+ * Fail closed when a FULL R4 page does not carry a complete, authoritative
+ * visibility proof.  This evaluator deliberately has no Buffer argument:
+ * after the remote FULL fetch the live page is unlocked and may be replaced.
+ */
+static pg_attribute_noreturn() void
+cluster_r4_scratch_visibility_unknown(TransactionId xid, const char *reason)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+			 errmsg("cluster TT status unknown for R4 scratch xid %u: %s",
+					xid, reason)));
+	pg_unreachable();
+}
+
+/*
+ * HeapTupleSatisfiesMVCCScratch
+ *
+ * Narrow D6 evaluator for a caller-owned, already reconstructed FULL page.
+ * It consumes only tuple/page bytes from that private page and one exact ITL
+ * ref verdict.  In particular it never enters native CLOG/ProcArray,
+ * HeapTupleSatisfiesMVCC(), CR, cleanout, hints, or SSI.
+ */
+bool
+HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
+							  const ClusterR4HotScratchTestContext *context)
+{
+#ifdef USE_PGRAC_CLUSTER
+	Page		page;
+	PageHeader	header;
+	HeapTupleHeader tuple;
+	ClusterUndoTTSlotRef ref;
+	const ClusterItlSlotData *itl_slot;
+	ClusterVisResolve resolved;
+	ClusterVisibilityDecision decision;
+	TransactionId raw_xmin;
+	TransactionId raw_xmax;
+	char	   *tuple_start;
+	char	   *page_start;
+	char	   *page_end;
+
+	if (htup == NULL || snapshot == NULL || context == NULL
+		|| context->scratch_page == NULL)
+		cluster_r4_scratch_visibility_unknown(InvalidTransactionId,
+										  "missing scratch visibility input");
+
+	page = context->scratch_page;
+	header = (PageHeader) page;
+	tuple = htup->t_data;
+	page_start = (char *) page;
+	page_end = page_start + BLCKSZ;
+	tuple_start = (char *) tuple;
+
+	if (!context->already_full || context->allow_hint || context->allow_cleanout
+		|| snapshot->snapshot_type != SNAPSHOT_MVCC
+		|| snapshot->cluster_source != (uint8) SNAPSHOT_SOURCE_CLUSTER
+		|| !SCN_VALID(snapshot->read_scn)
+		|| context->read_scn != snapshot->read_scn)
+		cluster_r4_scratch_visibility_unknown(InvalidTransactionId,
+										  "scratch visibility context is not an immutable FULL cluster snapshot");
+
+	if (tuple == NULL || htup->t_len < SizeofHeapTupleHeader
+		|| tuple_start < page_start + SizeOfPageHeaderData
+		|| tuple_start >= page_end
+		|| (Size) (page_end - tuple_start) < htup->t_len
+		|| header->pd_lower < SizeOfPageHeaderData
+		|| header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special
+		|| header->pd_special > BLCKSZ
+		|| !PageHasItl(page)
+		|| PageGetSpecialSize(page) < CLUSTER_ITL_ARRAY_SIZE
+		|| tuple_start + htup->t_len > page_start + header->pd_special
+		|| !ItemPointerIsValid(&htup->t_self)
+		|| ItemPointerGetBlockNumber(&htup->t_self) != context->tag.blockNum
+		|| ItemPointerGetBlockNumber(&context->logical_root) != context->tag.blockNum)
+		cluster_r4_scratch_visibility_unknown(InvalidTransactionId,
+										  "malformed or cross-block scratch tuple");
+
+	raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
+	if (!TransactionIdIsNormal(raw_xmin)
+		|| tuple->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
+		|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
+		cluster_r4_scratch_visibility_unknown(raw_xmin,
+										  "scratch xmin has no DATA ITL slot");
+
+	itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+	if (itl_slot->flags < ITL_FLAG_ACTIVE
+		|| itl_slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+		|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref)
+		|| ref.local_xid != raw_xmin
+		|| ref.tt_slot_id == 0)
+		cluster_r4_scratch_visibility_unknown(raw_xmin,
+										  "scratch xmin lacks an exact DATA ITL reference");
+
+	cluster_visibility_resolve_from_ref_scn(raw_xmin, &ref, PageGetLSN(page),
+										 snapshot->read_scn, &resolved);
+	if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
+		cluster_r4_scratch_visibility_unknown(raw_xmin,
+										  "scratch xmin is not backed by remote authority");
+
+	switch (resolved.status)
+	{
+		case CLUSTER_TT_STATUS_ABORTED:
+		case CLUSTER_TT_STATUS_IN_PROGRESS:
+		case CLUSTER_TT_STATUS_SUBCOMMITTED:
+			return false;
+
+		case CLUSTER_TT_STATUS_COMMITTED:
+		case CLUSTER_TT_STATUS_CLEANED_OUT:
+			decision = cluster_visibility_decide_by_scn(resolved.commit_scn,
+													 snapshot->read_scn);
+			if (decision == CLUSTER_VISIBILITY_INVISIBLE)
+				return false;
+			if (decision != CLUSTER_VISIBILITY_VISIBLE)
+				cluster_r4_scratch_visibility_unknown(raw_xmin,
+											  "scratch xmin commit SCN is not comparable to the read SCN");
+			break;
+
+		default:
+			cluster_r4_scratch_visibility_unknown(raw_xmin,
+										  "scratch xmin outcome is not terminal");
+	}
+
+	/* A reconstructed pre-update image normally has no deleting xmax. */
+	if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0)
+		return true;
+
+	/* Row locks do not delete the tuple and need no native MultiXact lookup. */
+	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
+		return true;
+
+	raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
+	if (!TransactionIdIsNormal(raw_xmax)
+		|| (tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
+		cluster_r4_scratch_visibility_unknown(raw_xmax,
+										  "scratch xmax has no single exact transaction reference");
+
+	/*
+	 * A non-locking xmax is supported only when the same scratch-owned slot
+	 * exactly binds it.  Never derive members or fall back to native CLOG.
+	 */
+	if (!cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref)
+		|| ref.local_xid != raw_xmax || ref.tt_slot_id == 0)
+		cluster_r4_scratch_visibility_unknown(raw_xmax,
+										  "scratch xmax lacks an exact DATA ITL reference");
+
+	cluster_visibility_resolve_from_ref_scn(raw_xmax, &ref, PageGetLSN(page),
+										 snapshot->read_scn, &resolved);
+	if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
+		cluster_r4_scratch_visibility_unknown(raw_xmax,
+										  "scratch xmax is not backed by remote authority");
+
+	switch (resolved.status)
+	{
+		case CLUSTER_TT_STATUS_ABORTED:
+		case CLUSTER_TT_STATUS_IN_PROGRESS:
+		case CLUSTER_TT_STATUS_SUBCOMMITTED:
+			return true;
+
+		case CLUSTER_TT_STATUS_COMMITTED:
+		case CLUSTER_TT_STATUS_CLEANED_OUT:
+			decision = cluster_visibility_decide_by_scn(resolved.commit_scn,
+													 snapshot->read_scn);
+			if (decision == CLUSTER_VISIBILITY_VISIBLE)
+				return false;
+			if (decision == CLUSTER_VISIBILITY_INVISIBLE)
+				return true;
+			break;
+
+		default:
+			break;
+	}
+
+	cluster_r4_scratch_visibility_unknown(raw_xmax,
+									  "scratch xmax outcome is not conclusive");
+#else
+	(void) htup;
+	(void) snapshot;
+	(void) context;
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("R4 scratch visibility requires a cluster build")));
+	return false;
+#endif
+}
 
 /*
  * HeapTupleSatisfiesMVCC

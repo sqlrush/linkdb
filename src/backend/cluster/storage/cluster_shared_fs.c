@@ -80,6 +80,70 @@ static const ClusterSharedFsOps *cluster_shared_fs_active_ops = NULL;
  */
 static bool cluster_shared_fs_init_in_progress = false;
 
+static int
+protected_set_hex_nibble(unsigned char ch)
+{
+	if (ch >= '0' && ch <= '9')
+		return ch - '0';
+	if (ch >= 'a' && ch <= 'f')
+		return ch - 'a' + 10;
+	return -1;
+}
+
+static bool
+protected_set_uuid_parse(const char *text, uint8 out[16])
+{
+	bool nonzero = false;
+	int i;
+
+	if (text == NULL || strlen(text) != 32)
+		return false;
+	for (i = 0; i < 16; i++)
+	{
+		int high = protected_set_hex_nibble((unsigned char) text[i * 2]);
+		int low = protected_set_hex_nibble((unsigned char) text[i * 2 + 1]);
+
+		if (high < 0 || low < 0)
+			return false;
+		out[i] = (uint8) ((high << 4) | low);
+		nonzero = nonzero || out[i] != 0;
+	}
+	return nonzero;
+}
+
+bool
+cluster_shared_fs_get_protected_set_identity(
+	ClusterProtectedSetIdentityV1 *out)
+{
+	char uuid[CLUSTER_SHARED_UUID_LEN];
+	bool available = false;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	memset(uuid, 0, sizeof(uuid));
+	switch (cluster_shared_storage_backend)
+	{
+		case CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE:
+			available = cluster_shared_fs_block_device_get_storage_uuid(
+				uuid, sizeof(uuid));
+			break;
+		case CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS:
+			cluster_shared_fs_get_storage_uuid(uuid, sizeof(uuid));
+			available = uuid[0] != '\0';
+			break;
+		default:
+			return false;
+	}
+	if (!available || !protected_set_uuid_parse(uuid, out->storage_uuid))
+	{
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	out->backend_id = (uint32) cluster_shared_storage_backend;
+	return true;
+}
+
 
 /* ----------
  * GUC -> backend id mapping.

@@ -111,7 +111,7 @@ UT_TEST(test_origin_for_tid_out_of_range_is_invalid)
 
 UT_TEST(test_gate_decide_out_of_scope_never_gates)
 {
-	/* Out of scope (GUC off / single node / no shared backend / >2-node) the
+	/* Out of scope (GUC off / single node / no shared backend) the
 	 * gate is a NO-OP regardless of the bitmaps -> false (no regression to the
 	 * existing spec-4.6/4.7 unfreeze path). */
 	uint64 dead[1] = { 0x2 };		  /* node 1 dead */
@@ -122,8 +122,6 @@ UT_TEST(test_gate_decide_out_of_scope_never_gates)
 	UT_ASSERT(!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_SINGLE_NODE, dead,
 												   materialized, 1));
 	UT_ASSERT(!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND, dead,
-												   materialized, 1));
-	UT_ASSERT(!cluster_thread_recovery_gate_decide(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR, dead,
 												   materialized, 1));
 }
 
@@ -210,80 +208,153 @@ UT_TEST(test_epoch_aborts_unstamped_slot_aborts)
  */
 UT_TEST(test_worker_terminal_state_done_only_for_done)
 {
-	UT_ASSERT_EQ((int)cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_DONE),
-				 (int)CLUSTER_THREADREC_REPLAY_DONE);
+	ClusterThreadRecReplayState state = CLUSTER_THREADREC_REPLAY_IDLE;
+
+	UT_ASSERT(cluster_thread_recovery_worker_terminal_state(
+		CLUSTER_THREADREC_DONE, &state));
+	UT_ASSERT_EQ((int)state, (int)CLUSTER_THREADREC_REPLAY_DONE);
 }
 
 UT_TEST(test_worker_terminal_state_blocked_is_blocked)
 {
-	UT_ASSERT_EQ((int)cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_BLOCKED),
-				 (int)CLUSTER_THREADREC_REPLAY_BLOCKED);
+	ClusterThreadRecReplayState state = CLUSTER_THREADREC_REPLAY_IDLE;
+
+	UT_ASSERT(cluster_thread_recovery_worker_terminal_state(
+		CLUSTER_THREADREC_BLOCKED, &state));
+	UT_ASSERT_EQ((int)state, (int)CLUSTER_THREADREC_REPLAY_BLOCKED);
 }
 
-UT_TEST(test_worker_terminal_state_not_applicable_is_blocked)
+UT_TEST(test_worker_deferred_is_numeric_three_and_nonterminal)
 {
-	/* NOT_APPLICABLE -> BLOCKED, never DONE: an out-of-scope verdict must not
-	 * present as a completed recovery (fail-closed observability). */
-	UT_ASSERT_EQ(
-		(int)cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_NOT_APPLICABLE),
-		(int)CLUSTER_THREADREC_REPLAY_BLOCKED);
+	ClusterThreadRecReplayState state = CLUSTER_THREADREC_REPLAY_BLOCKED;
+
+	/* STOP03 U12: DEFERRED is result value 3, but must never be cast/stored as
+	 * replay-slot BLOCKED (also numeric 3).  Only DONE/BLOCKED are terminal. */
+	UT_ASSERT_EQ((int)CLUSTER_THREADREC_DEFERRED, 3);
+	UT_ASSERT(!cluster_thread_recovery_worker_terminal_state(
+		CLUSTER_THREADREC_DEFERRED, &state));
+	UT_ASSERT_EQ((int)state, (int)CLUSTER_THREADREC_REPLAY_BLOCKED);
+	UT_ASSERT(!cluster_thread_recovery_worker_terminal_state(
+		CLUSTER_THREADREC_NOT_APPLICABLE, &state));
+
+	UT_ASSERT_EQ((int)CLUSTER_THREADREC_MATCH_CHANGED, 0);
+	UT_ASSERT_EQ((int)CLUSTER_THREADREC_MATCH_INVALID, 3);
+	UT_ASSERT(cluster_thread_recovery_replay_transition_shape_valid(
+		CLUSTER_THREADREC_REPLAY_REPLAYING,
+		CLUSTER_THREADREC_REPLAY_IDLE));
+	UT_ASSERT(cluster_thread_recovery_replay_transition_shape_valid(
+		CLUSTER_THREADREC_REPLAY_REPLAYING,
+		CLUSTER_THREADREC_REPLAY_DONE));
+	UT_ASSERT(cluster_thread_recovery_replay_transition_shape_valid(
+		CLUSTER_THREADREC_REPLAY_REPLAYING,
+		CLUSTER_THREADREC_REPLAY_BLOCKED));
+	UT_ASSERT(!cluster_thread_recovery_replay_transition_shape_valid(
+		CLUSTER_THREADREC_REPLAY_IDLE,
+		CLUSTER_THREADREC_REPLAY_REPLAYING));
+	UT_ASSERT(!cluster_thread_recovery_replay_transition_shape_valid(
+		CLUSTER_THREADREC_REPLAY_REPLAYING,
+		CLUSTER_THREADREC_REPLAY_REPLAYING));
 }
 
-/*
- * spec-4.11 3b-4b Part 3: the lmon launch decision -- should the FSM launch an
- * executor worker for a dead origin this tick?  PURE so the idempotency boundary
- * is unit-pinned: out of scope NEVER launches (the t/249-252 no-op guarantee);
- * in scope, launch an IDLE slot or one stamped by a DIFFERENT episode, and SKIP a
- * slot already handling THIS episode (REPLAYING/DONE/BLOCKED at the current
- * epoch) so each tick does not re-register a running/finished worker.
- */
-UT_TEST(test_should_launch_out_of_scope_never_launches)
+UT_TEST(test_a2_reap_decision_matrix)
 {
-	/* Any non-APPLICABLE scope -> false regardless of slot/epoch (no regression
-	 * to the spec-4.6/4.7 reconfig FSM on a single node / GUC off / >2-node). */
-	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_DISABLED,
-													 CLUSTER_THREADREC_REPLAY_IDLE, 0, 0));
-	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_SINGLE_NODE,
-													 CLUSTER_THREADREC_REPLAY_IDLE, 5, 9));
-	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR,
-													 CLUSTER_THREADREC_REPLAY_IDLE, 5, 9));
+	uint64 stamp = UINT64_C(77);
+
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_STARTED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		stamp), (int)CLUSTER_THREADREC_REAP_RETAIN);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_NOT_YET_STARTED, true, stamp,
+		CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
+		(int)CLUSTER_THREADREC_REAP_RETAIN);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_POSTMASTER_DIED, true, stamp,
+		CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
+		(int)CLUSTER_THREADREC_REAP_RETAIN);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		stamp), (int)CLUSTER_THREADREC_REAP_RESET_IDLE);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_DONE,
+		stamp), (int)CLUSTER_THREADREC_REAP_KEEP_TERMINAL);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_BLOCKED,
+		stamp), (int)CLUSTER_THREADREC_REAP_KEEP_TERMINAL);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_STOPPED, false, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		stamp), (int)CLUSTER_THREADREC_REAP_INVALID);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_IDLE,
+		stamp), (int)CLUSTER_THREADREC_REAP_INVALID);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		stamp + 1), (int)CLUSTER_THREADREC_REAP_INVALID);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
+		BGWH_STOPPED, true, 0, CLUSTER_THREADREC_REPLAY_REPLAYING, 0),
+		(int)CLUSTER_THREADREC_REAP_INVALID);
 }
 
-UT_TEST(test_should_launch_idle_slot_launches)
+static ClusterRecoveryDutyKey
+valid_a2_duty(uint16 origin_thread)
 {
-	/* In scope + IDLE -> launch (the slot is available). */
-	UT_ASSERT(cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
-													CLUSTER_THREADREC_REPLAY_IDLE, 0, 9));
+	ClusterRecoveryDutyKey duty;
+	ClusterWalThreadClaim claim;
+
+	memset(&duty, 0, sizeof(duty));
+	duty.system_identifier = UINT64_C(0x1234);
+	memset(duty.storage_uuid, 0x11, sizeof(duty.storage_uuid));
+	memset(duty.authority_uuid, 0x22, sizeof(duty.authority_uuid));
+	duty.authority_uuid[6] = 0x42;
+	duty.authority_uuid[8] = 0x82;
+	duty.origin_thread_id = origin_thread;
+	duty.origin_node_id = (int32)origin_thread - 1;
+	duty.thread_claim_created_at = INT64_C(77);
+	cluster_wal_thread_claim_fill(&claim, origin_thread,
+								 duty.origin_node_id,
+								 duty.thread_claim_created_at);
+	duty.thread_claim_crc32c = claim.crc;
+	duty.origin_owner_incarnation = UINT64_C(9);
+	duty.root_lineage_seq = UINT64_C(10);
+	return duty;
 }
 
-UT_TEST(test_should_launch_current_episode_is_idempotent)
+UT_TEST(test_a2_worker_payload_fresh_validation)
 {
-	/* In scope but the slot is already handling THIS episode -> do NOT relaunch
-	 * (REPLAYING/DONE/BLOCKED at the current epoch). */
-	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
-													 CLUSTER_THREADREC_REPLAY_REPLAYING, 9, 9));
-	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
-													 CLUSTER_THREADREC_REPLAY_DONE, 9, 9));
-	UT_ASSERT(!cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
-													 CLUSTER_THREADREC_REPLAY_BLOCKED, 9, 9));
-}
+	ClusterThreadRecLaunchEligibility eligibility;
+	uint16 thread = XLP_THREAD_ID_FIRST_REAL;
 
-UT_TEST(test_should_launch_stale_episode_relaunches)
-{
-	/* In scope + a slot stamped by an OLDER/different episode -> (re)launch for
-	 * the new episode, whatever its terminal state. */
-	UT_ASSERT(cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
-													CLUSTER_THREADREC_REPLAY_REPLAYING, 8, 9));
-	UT_ASSERT(cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
-													CLUSTER_THREADREC_REPLAY_DONE, 8, 9));
-	UT_ASSERT(cluster_thread_recovery_should_launch(CLUSTER_THREADREC_SCOPE_APPLICABLE,
-													CLUSTER_THREADREC_REPLAY_BLOCKED, 8, 9));
-}
+	memset(&eligibility, 0, sizeof(eligibility));
+	eligibility.origin_thread = thread;
+	eligibility.attempt_stamp = UINT64_C(77);
+	eligibility.duty = valid_a2_duty(thread);
 
+	UT_ASSERT(cluster_thread_recovery_worker_start_valid(
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		UINT64_C(77)));
+	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
+		NULL, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		UINT64_C(77)));
+	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
+		&eligibility, thread + 1, true,
+		CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));
+	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
+		&eligibility, thread, false, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		UINT64_C(77)));
+	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_IDLE,
+		UINT64_C(77)));
+	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		UINT64_C(78)));
+	eligibility.duty.root_lineage_seq = 0;
+	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
+		UINT64_C(77)));
+}
 
 /* ----------
  * spec-4.11 D7 capability gate: scope_is_unsupported pins which scopes raise
- * FEATURE_NOT_SUPPORTED (the hard-unsupported NO_SHARED_BACKEND / MULTI_SURVIVOR)
+ * FEATURE_NOT_SUPPORTED (the hard-unsupported NO_SHARED_BACKEND)
  * vs the merely not-applicable scopes that must NEVER raise (the no-regression
  * boundary -- the live FSM stays a no-op for those).
  * ----------
@@ -292,7 +363,6 @@ UT_TEST(test_scope_is_unsupported_true_for_hard_unsupported)
 {
 	UT_ASSERT(
 		cluster_thread_recovery_scope_is_unsupported(CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND));
-	UT_ASSERT(cluster_thread_recovery_scope_is_unsupported(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR));
 }
 
 UT_TEST(test_scope_is_unsupported_false_for_applicable_and_not_applicable)
@@ -308,7 +378,7 @@ UT_TEST(test_scope_is_unsupported_false_for_applicable_and_not_applicable)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(22);
 	UT_RUN(test_on_blocked_keep_frozen_default);
 	UT_RUN(test_on_blocked_panic_when_policy_panic);
 	UT_RUN(test_on_blocked_unknown_policy_is_keep_frozen);
@@ -326,11 +396,9 @@ main(void)
 	UT_RUN(test_epoch_aborts_unstamped_slot_aborts);
 	UT_RUN(test_worker_terminal_state_done_only_for_done);
 	UT_RUN(test_worker_terminal_state_blocked_is_blocked);
-	UT_RUN(test_worker_terminal_state_not_applicable_is_blocked);
-	UT_RUN(test_should_launch_out_of_scope_never_launches);
-	UT_RUN(test_should_launch_idle_slot_launches);
-	UT_RUN(test_should_launch_current_episode_is_idempotent);
-	UT_RUN(test_should_launch_stale_episode_relaunches);
+	UT_RUN(test_worker_deferred_is_numeric_three_and_nonterminal);
+	UT_RUN(test_a2_reap_decision_matrix);
+	UT_RUN(test_a2_worker_payload_fresh_validation);
 	UT_RUN(test_scope_is_unsupported_true_for_hard_unsupported);
 	UT_RUN(test_scope_is_unsupported_false_for_applicable_and_not_applicable);
 	UT_DONE();

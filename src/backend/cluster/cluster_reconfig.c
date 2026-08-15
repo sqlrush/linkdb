@@ -42,7 +42,58 @@
 #include "postgres.h"
 
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b joiner gate */
+
+/* RF-ROOT P4 online launch producer.  The carrier contains only the exact
+ * current FAIL_STOP attempt stamp and full canonical root duty.  Formation,
+ * external admissions and IR remain process-local and are rebuilt by the
+ * worker; no pointer or dead-bitmap pair crosses bgw_extra. */
+bool
+cluster_reconfig_thread_recovery_eligibility_consume(
+	uint16 origin_thread,
+	ClusterThreadRecLaunchEligibility *out)
+{
+	ReconfigEvent event;
+	ClusterControlRootIdentity identity;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult root_result;
+	int32 origin_node;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || origin_thread == 0 ||
+		origin_thread > CLUSTER_MAX_NODES)
+		return false;
+#ifndef USE_PGRAC_CLUSTER
+	return false;
+#else
+	origin_node = (int32)origin_thread - 1;
+	cluster_reconfig_get_last_event(&event);
+	if (event.reconfig_kind != RECONFIG_KIND_FAIL_STOP ||
+		event.event_id == 0 || event.new_epoch == 0 ||
+		(event.dead_bitmap[origin_node / 8] &
+		 (uint8)(UINT8_C(1) << (origin_node % 8))) == 0)
+		return false;
+	root_result = cluster_control_root_lookup_owner_by_node_runtime(
+		origin_node, &identity, &snapshot, &token);
+	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+		 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
+		!cluster_recovery_duty_key_valid_v1(&identity) ||
+		identity.origin_thread_id != origin_thread ||
+		identity.origin_node_id != origin_node ||
+		snapshot.lifecycle !=
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
+		memcmp(&snapshot.identity, &identity, sizeof(identity)) != 0)
+		return false;
+	out->origin_thread = origin_thread;
+	out->attempt_stamp = event.new_epoch;
+	out->duty = identity;
+	return true;
+#endif
+}
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -68,10 +119,15 @@
 #include "cluster/cluster_cssd.h"		 /* cluster_cssd_get_peer_state, get_dead_generation */
 #include "cluster/cluster_elog.h"		 /* cluster_node_id */
 #include "cluster/cluster_epoch.h"		 /* advance + observe + set_changed_at_lsn */
+#include "cluster/cluster_external_fence.h" /* STOP04 rejoin snapshots */
 #include "cluster/cluster_gcs_block.h"	 /* spec-2.34 D4 — eager epoch wake hook */
 #include "cluster/cluster_grd.h"		 /* spec-5.16 D3b — arm join PCM block fence */
+#include "cluster/cluster_ic.h"			 /* Candidate2 HELLO capability */
+#include "cluster/cluster_ic_router.h"	 /* phase-3 target-LMON CONTROL send */
+#include "cluster/cluster_ic_tier1.h"	 /* close peer after send HARD_ERROR */
 #include "cluster/cluster_sinval.h"		 /* spec-2.39 D14 — RESET-all reconfig hook */
 #include "cluster/cluster_tt_status.h"	 /* spec-3.1 D7 — TT status overlay flush hook */
+#include "cluster/storage/cluster_undo_block0.h" /* instantaneous R4A READY */
 #include "storage/ipc.h"				 /* on_shmem_exit (spec-5.15 D4 latch clear) */
 #include "storage/latch.h"				 /* Latch / SetLatch (spec-5.15 D4 marker mailbox) */
 #include "cluster/cluster_clean_leave.h" /* v1.0.4 — cluster_clean_leave_in_progress (serialize) */
@@ -83,6 +139,7 @@
 #include "cluster/cluster_qvotec.h"			/* cluster_qvotec_in_quorum */
 #include "cluster/cluster_shmem.h"			/* cluster_shmem_register_region */
 #include "cluster/cluster_signal.h"			/* cluster_reconfig_start_pending */
+#include "cluster/cluster_sf_dep.h"			/* current peer capability record */
 #include "cluster/cluster_touched_peers.h"	/* spec-5.14 D4 — touched ∩ dead dispatch */
 
 
@@ -136,16 +193,131 @@ typedef struct ClusterReconfigJoinPrepareStage {
 
 typedef struct ClusterReconfigJoinCommitStage {
 	ClusterMarkerAsync async;
+	ClusterMarkerAsync fence_async;
 	ClusterJoinCommitMarker marker;
+	ClusterFenceMarker fence_marker;
+	ReconfigEvent event;
+	uint64 expected_last_event_id;
 	int32 node_id;
 	uint64 admitted_incarnation;
 	bool submitted;
+	bool fence_ready;
+	bool external_rejoin_consumed;
 } ClusterReconfigJoinCommitStage;
+
+typedef enum ClusterExternalRejoinPhase {
+	CLUSTER_EXTERNAL_REJOIN_EMPTY = 0,
+	CLUSTER_EXTERNAL_REJOIN_OFFERED,
+	CLUSTER_EXTERNAL_REJOIN_WAITING_ROOT,
+	CLUSTER_EXTERNAL_REJOIN_WAITING_ON,
+	CLUSTER_EXTERNAL_REJOIN_WAITING_JOINER,
+	CLUSTER_EXTERNAL_REJOIN_WAITING_REFRESH,
+	CLUSTER_EXTERNAL_REJOIN_READY,
+	CLUSTER_EXTERNAL_REJOIN_COMMIT_READY,
+	CLUSTER_EXTERNAL_REJOIN_COMMITTING
+} ClusterExternalRejoinPhase;
+
+/* STOP04 §11.8/§11.9: one opaque, process-local slot per old node.  Neither
+ * the operation nor authority-clear object is portable across LMON exit. */
+typedef struct ClusterExternalRejoinSlot {
+	PgracExternalFenceRejoinOpV1 *op;
+	PgracExternalFenceRejoinAuthorityClearV1 *authority_clear;
+	ClusterReconfigRejoinFailureSnapshotV1 failure;
+	ClusterReconfigRejoinPendingSnapshotV1 commit_pending;
+	uint64 candidate_incarnation;
+	ClusterExternalRejoinPhase phase;
+} ClusterExternalRejoinSlot;
 
 static ClusterReconfigFenceStage failstop_fence_stage;
 static ClusterReconfigFenceStage node_removed_fence_stage;
 static ClusterReconfigJoinPrepareStage join_prepare_stage;
 static ClusterReconfigJoinCommitStage join_commit_stage;
+static ClusterExternalRejoinSlot external_rejoin_slots[CLUSTER_MAX_NODES];
+static PgracExternalFenceRejoinOpV1 *external_rejoin_claim_op;
+static bool external_rejoin_exit_registered;
+
+typedef enum ClusterReplacementAdmitStagePhase {
+	CLUSTER_REPLACEMENT_ADMIT_IDLE = 0,
+	CLUSTER_REPLACEMENT_ADMIT_PRE_HEAD_WAIT,
+	CLUSTER_REPLACEMENT_ADMIT_MARKER_SUBMIT,
+	CLUSTER_REPLACEMENT_ADMIT_MARKER_WAIT,
+	CLUSTER_REPLACEMENT_ADMIT_POST_HEAD_SUBMIT,
+	CLUSTER_REPLACEMENT_ADMIT_POST_HEAD_WAIT
+} ClusterReplacementAdmitStagePhase;
+
+typedef struct ClusterReplacementAdmitStage {
+	ClusterReplacementAdmitStagePhase phase;
+	uint64 authority_request_seq;
+	uint8 pre_head_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES];
+	uint8 pre_head_ballot[CLUSTER_QVOTEC_BALLOT_BYTES];
+	ClusterReplacementCommitMarkerV3 admitted_marker;
+	ClusterMarkerAsync marker_async;
+} ClusterReplacementAdmitStage;
+
+static ClusterReplacementAdmitStage replacement_admit_stage;
+
+typedef enum ClusterReplacementClosedStagePhase {
+	CLUSTER_REPLACEMENT_CLOSED_STAGE_IDLE = 0,
+	CLUSTER_REPLACEMENT_CLOSED_STAGE_WAIT_PAIR,
+	CLUSTER_REPLACEMENT_CLOSED_STAGE_DRAIN_AUTHORITY
+} ClusterReplacementClosedStagePhase;
+
+typedef struct ClusterReplacementClosedStage {
+	ClusterReplacementClosedStagePhase phase;
+	uint64 authority_request_seq;
+	ClusterMarkerAsync marker_async;
+	bool marker_completed;
+} ClusterReplacementClosedStage;
+
+typedef enum ClusterReplacementReadyStagePhase {
+	CLUSTER_REPLACEMENT_READY_STAGE_IDLE = 0,
+	CLUSTER_REPLACEMENT_READY_STAGE_WAIT_PAIR,
+	CLUSTER_REPLACEMENT_READY_STAGE_CACHED,
+	CLUSTER_REPLACEMENT_READY_STAGE_DRAIN_AUTHORITY
+} ClusterReplacementReadyStagePhase;
+
+typedef struct ClusterReplacementReadyStage {
+	ClusterReplacementReadyStagePhase phase;
+	uint64 authority_request_seq;
+	uint64 marker_request_seq;
+	ClusterMarkerAsync marker_async;
+	bool marker_completed;
+	ClusterR4PrerequisiteSnapshot cached_snapshot;
+	uint8 cached_image[CLUSTER_REPLACEMENT_WIRE_BYTES];
+} ClusterReplacementReadyStage;
+
+typedef enum ClusterJoinMarkerLmonPurpose {
+	CLUSTER_JOIN_MARKER_LMON_NONE = 0,
+	CLUSTER_JOIN_MARKER_LMON_CLOSED_APPLY,
+	CLUSTER_JOIN_MARKER_LMON_READY_SERIALIZE
+} ClusterJoinMarkerLmonPurpose;
+
+typedef struct ClusterJoinMarkerLmonOwner {
+	ClusterJoinMarkerLmonPurpose purpose;
+	ClusterJoinMarkerMailboxOperationV1 operation;
+	uint64 marker_request_seq;
+	bool reserved;
+} ClusterJoinMarkerLmonOwner;
+
+static ClusterReplacementClosedStage replacement_closed_stage;
+static ClusterReplacementReadyStage replacement_ready_stage;
+static ClusterJoinMarkerLmonOwner join_marker_lmon_owner;
+
+static bool cluster_reconfig_join_marker_request_word_decode(
+	uint32 word, ClusterJoinMarkerMailboxOperationV1 *operation_out,
+	int32 *target_node_out);
+static bool cluster_reconfig_stage_join_marker_locked(
+	int32 target_node, ClusterJoinMarkerMailboxOperationV1 operation,
+	uint32 version, const void *image, Size image_len);
+static bool cluster_reconfig_terminal_closed_matches_episode(
+	const ClusterEpochAuthorityValue *head,
+	const ClusterEpochBallotId *ballot,
+	const ClusterReplacementCommitMarkerV3 *marker,
+	const ClusterReplacementEpisode *episode);
+static void cluster_reconfig_release_ready_stage(void);
+static bool cluster_reconfig_lmon_submit_ready_observer_pair(TimestampTz now);
+static bool cluster_reconfig_lmon_ready_cache_current(
+	int32 *coordinator_node_id);
 
 
 /* ============================================================
@@ -236,7 +408,7 @@ cluster_reconfig_shmem_init(void)
 		pg_atomic_init_u64(&ReconfigShmem->join_marker_request_seq, 0);
 		pg_atomic_init_u64(&ReconfigShmem->join_marker_completion_seq, 0);
 		pg_atomic_init_u32(&ReconfigShmem->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
-		ReconfigShmem->join_marker_target_node_id = -1;
+		ReconfigShmem->join_marker_request_word = 0;
 		/* join_pending_marker left zeroed by memset. */
 
 		/* spec-5.15 D6 — online-join observability counters. */
@@ -303,6 +475,65 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 	LWLockRelease(&ReconfigShmem->lock);
 }
 
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
+											ClusterFormationSnapshotV1 *out)
+{
+	const ReconfigEvent *src;
+	int32 origin_node;
+	int i;
+
+	if (out == NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
+		|| ReconfigShmem == NULL)
+		return false;
+	origin_node = (int32)origin_thread - 1;
+	memset(out, 0, sizeof(*out));
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	src = &ReconfigShmem->last_applied;
+	out->applied.event_id = src->event_id;
+	out->applied.coordinator_node_id = src->coordinator_node_id;
+	out->applied.old_epoch = src->old_epoch;
+	out->applied.new_epoch = src->new_epoch;
+	memcpy(out->applied.dead_bitmap, src->dead_bitmap, sizeof(out->applied.dead_bitmap));
+	out->applied.applied_at = src->applied_at;
+	out->applied.observer_role = src->observer_role;
+	out->applied.event_seq = src->event_seq;
+	out->applied.cssd_dead_generation = src->cssd_dead_generation;
+	out->applied.reconfig_kind = src->reconfig_kind;
+	memcpy(out->applied.join_bitmap, src->join_bitmap, sizeof(out->applied.join_bitmap));
+	out->membership = ReconfigShmem->membership;
+	memcpy(out->pending_join_bitmap, ReconfigShmem->pending_join_bitmap,
+		   sizeof(out->pending_join_bitmap));
+	memcpy(out->clean_departed_bitmap, ReconfigShmem->clean_departed_bitmap,
+		   sizeof(out->clean_departed_bitmap));
+	memcpy(out->removed_bitmap, ReconfigShmem->removed_bitmap,
+		   sizeof(out->removed_bitmap));
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+		out->excluded_bitmap[i] = src->dead_bitmap[i] | ReconfigShmem->removed_bitmap[i];
+	out->victim_incarnation
+		= ReconfigShmem->membership.last_admitted_incarnation[origin_node];
+	out->prebump_sync_active
+		= pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active);
+	out->self_join_admitted = ReconfigShmem->self_join_admitted;
+	out->self_join_failed = ReconfigShmem->self_join_failed;
+	LWLockRelease(&ReconfigShmem->lock);
+	out->local_epoch = cluster_epoch_get_current();
+	return true;
+}
+
+static void
+cluster_reconfig_set_prebump_sync_active(uint32 value)
+{
+	uint64 cache_mutation;
+
+	if (ReconfigShmem == NULL
+		|| pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) == value)
+		return;
+	cache_mutation = cluster_write_fence_authority_cache_mutation_begin();
+	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, value);
+	cluster_write_fence_authority_cache_mutation_end(cache_mutation);
+}
+
 
 /* ============================================================
  * Internal publish helper.
@@ -329,6 +560,7 @@ cluster_reconfig_publish_event(const ReconfigEvent *evt)
 	memcpy(&published, evt, sizeof(ReconfigEvent));
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_write_fence_authority_cache_invalidate();
 	event_seq = pg_atomic_fetch_add_u64(&ReconfigShmem->apply_counter, 1) + 1;
 	published.event_seq = event_seq;
 	memcpy(&ReconfigShmem->last_applied, &published, sizeof(ReconfigEvent));
@@ -501,6 +733,590 @@ dead_bitmap_test_bit(const uint8 *bmp, int i)
 {
 	Assert(i >= 0 && i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES * 8);
 	return (bmp[i / 8] & (uint8)(1u << (i % 8))) != 0;
+}
+
+
+static void
+replacement_event_id_put_le32(uint8 *out, uint32 value)
+{
+	int i;
+
+	for (i = 0; i < 4; i++)
+		out[i] = (uint8)(value >> (i * 8));
+}
+
+
+static void
+replacement_event_id_put_le64(uint8 *out, uint64 value)
+{
+	int i;
+
+	for (i = 0; i < 8; i++)
+		out[i] = (uint8)(value >> (i * 8));
+}
+
+
+bool
+cluster_reconfig_build_replacement_committed_event(
+	const ClusterReplacementEpisode *episode, int32 observer_role,
+	TimestampTz applied_at, ReconfigEvent *out_event)
+{
+	uint8 hash_input[1 + 4 + 8 + 8 + 8 + 8 + 8
+					+ CLUSTER_RECONFIG_DEAD_BITMAP_BYTES + 8];
+	ReconfigEvent event;
+	Size off = 0;
+
+	if (episode == NULL || out_event == NULL
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase != CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| memcmp(episode->acknowledgements, episode->expected_survivors,
+				  sizeof(episode->acknowledgements)) != 0
+		|| (observer_role != CLUSTER_RECONFIG_OBSERVER_COORDINATOR
+			&& observer_role != CLUSTER_RECONFIG_OBSERVER_SURVIVOR))
+		return false;
+
+	/* Spec-5.15A §2.4 exact identity, encoded explicitly so identical
+	 * observers hash identical bytes independent of host padding/layout. */
+	hash_input[off++] = RECONFIG_KIND_REPLACEMENT_COMMITTED;
+	replacement_event_id_put_le32(hash_input + off,
+							  (uint32)episode->target_node_id);
+	off += 4;
+	replacement_event_id_put_le64(hash_input + off, episode->baseline_epoch);
+	off += 8;
+	replacement_event_id_put_le64(
+		hash_input + off, episode->reserved_or_committed_epoch);
+	off += 8;
+	replacement_event_id_put_le64(
+		hash_input + off, episode->old_admitted_incarnation);
+	off += 8;
+	replacement_event_id_put_le64(
+		hash_input + off, episode->fresh_incarnation);
+	off += 8;
+	replacement_event_id_put_le64(hash_input + off, episode->request_nonce);
+	off += 8;
+	memcpy(hash_input + off, episode->expected_survivors,
+		   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	off += CLUSTER_RECONFIG_DEAD_BITMAP_BYTES;
+	replacement_event_id_put_le64(
+		hash_input + off, episode->grammar_fingerprint);
+	off += 8;
+	Assert(off == sizeof(hash_input));
+
+	memset(&event, 0, sizeof(event));
+	event.event_id = hash_bytes_extended(hash_input, sizeof(hash_input), 0);
+	if (event.event_id == 0)
+		return false;
+	event.coordinator_node_id = episode->coordinator_node_id;
+	event.old_epoch = episode->baseline_epoch;
+	event.new_epoch = episode->reserved_or_committed_epoch;
+	event.applied_at = applied_at;
+	event.observer_role = observer_role;
+	event.reconfig_kind = RECONFIG_KIND_REPLACEMENT_COMMITTED;
+	dead_bitmap_set_bit(event.join_bitmap, episode->target_node_id);
+	*out_event = event;
+	return true;
+}
+
+
+bool
+cluster_reconfig_replacement_grd_basis_authorized(
+	const ReconfigEvent *event, const ClusterReplacementEpisode *episode,
+	const ClusterReplacementCommitMarkerV3 *committed_marker,
+	int32 local_node_id,
+	uint8 out_survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	uint64 *out_epoch)
+{
+	ReconfigEvent expected_event;
+	uint8 marker_image[CLUSTER_JCMK_REPLACEMENT_BYTES];
+	int32 expected_role;
+
+	if (event == NULL || episode == NULL || committed_marker == NULL
+		|| out_survivors == NULL || out_epoch == NULL
+		|| local_node_id < 0 || local_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase
+				!= CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| memcmp(episode->acknowledgements, episode->expected_survivors,
+				  sizeof(episode->acknowledgements)) != 0
+		|| local_node_id == episode->target_node_id
+		|| !dead_bitmap_test_bit(episode->expected_survivors, local_node_id)
+		|| !cluster_replacement_marker_v3_encode(
+			committed_marker, marker_image)
+		|| committed_marker->phase
+			   != CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED
+		|| committed_marker->ready_state_generation != 0
+		|| committed_marker->target_node_id != episode->target_node_id
+		|| committed_marker->old_admitted_incarnation
+			   != episode->old_admitted_incarnation
+		|| committed_marker->fresh_incarnation
+			   != episode->fresh_incarnation
+		|| committed_marker->baseline_epoch != episode->baseline_epoch
+		|| committed_marker->reserved_or_committed_epoch
+			   != episode->reserved_or_committed_epoch
+		|| committed_marker->request_nonce != episode->request_nonce
+		|| memcmp(committed_marker->expected_purge_survivors,
+				  episode->expected_survivors,
+				  sizeof(episode->expected_survivors)) != 0
+		|| committed_marker->grammar_fingerprint
+			   != episode->grammar_fingerprint)
+		return false;
+
+	expected_role = local_node_id == episode->coordinator_node_id
+					? CLUSTER_RECONFIG_OBSERVER_COORDINATOR
+					: CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+	if (event->event_seq == 0 || event->observer_role != expected_role
+		|| !cluster_reconfig_build_replacement_committed_event(
+			episode, expected_role, event->applied_at, &expected_event))
+		return false;
+	expected_event.event_seq = event->event_seq;
+	if (memcmp(event, &expected_event, sizeof(*event)) != 0)
+		return false;
+
+	memcpy(out_survivors, episode->expected_survivors,
+		   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	*out_epoch = episode->reserved_or_committed_epoch;
+	return true;
+}
+
+
+bool
+cluster_reconfig_lmon_snapshot_replacement_grd_basis(
+	uint8 out_survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	uint64 *out_epoch)
+{
+	ClusterReplacementEpisode episode;
+	ClusterReplacementCommitMarkerV3 committed;
+	ReconfigEvent event;
+	uint8 survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 epoch;
+	uint64 request_seq;
+	uint64 completion_seq;
+	bool valid = false;
+
+	if (ReconfigShmem == NULL || out_survivors == NULL || out_epoch == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	request_seq = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	completion_seq
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq);
+	if (request_seq == 0 || request_seq != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		return false;
+	pg_read_barrier();
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	episode = ReconfigShmem->replacement_episode;
+	event = ReconfigShmem->last_applied;
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		|| episode.reserved_or_committed_epoch
+			   != cluster_epoch_get_current()
+		|| !cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, episode.target_node_id,
+			&committed)
+		|| !cluster_reconfig_replacement_grd_basis_authorized(
+			&event, &episode, &committed, cluster_node_id,
+			survivors, &epoch))
+		goto out;
+	valid = true;
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	if (!valid)
+		return false;
+	memcpy(out_survivors, survivors, sizeof(survivors));
+	*out_epoch = epoch;
+	return true;
+}
+
+
+/*
+ * Snapshot the exact replacement episode, then verify the Candidate2 grammar
+ * bit on every remote participant while holding no reconfiguration lock.  A
+ * caller must exact-compare the returned snapshot after reacquiring that lock
+ * before deriving or publishing ADMITTED state.
+ */
+static bool
+cluster_reconfig_replacement_candidate2_capabilities_current(
+	ClusterReplacementEpisode *out_episode)
+{
+	ClusterReplacementEpisode snapshot;
+	int node;
+
+	if (ReconfigShmem == NULL || out_episode == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	snapshot = ReconfigShmem->replacement_episode;
+	LWLockRelease(&ReconfigShmem->lock);
+	if (!cluster_replacement_episode_is_valid(&snapshot))
+		return false;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool required
+			= node == snapshot.target_node_id
+			  || dead_bitmap_test_bit(snapshot.expected_survivors, node);
+
+		/* The running coordinator binary is its own compiled proof. */
+		if (!required || node == cluster_node_id)
+			continue;
+		if (!cluster_sf_peer_capability_family_sample(
+				node, PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1,
+				0, NULL, NULL))
+			return false;
+	}
+
+	*out_episode = snapshot;
+	return true;
+}
+
+
+/* Caller holds ReconfigShmem->lock.  Before ADMITTED, the immutable survivor
+ * bitmap is the complete live MEMBER set and the fenced target is still out. */
+static bool
+cluster_reconfig_replacement_membership_current_locked(
+	const ClusterReplacementEpisode *episode)
+{
+	int node;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool expected_member
+			= dead_bitmap_test_bit(episode->expected_survivors, node);
+
+		if (cluster_membership_is_member(node) != expected_member)
+			return false;
+	}
+	return true;
+}
+
+
+/*
+ * Spec-5.15A §2.3: validate a decoded PURGE_REQUEST against authority that
+ * the caller has already recovered from the common ballot and voting-disk
+ * marker.  This is intentionally a pre-mutation predicate: it neither treats
+ * these host-order inputs as proof of durability nor publishes the survivor
+ * fence.  The eventual ingress owner must supply the recovered objects and
+ * recheck this predicate immediately before its separately specified fence.
+ */
+bool
+cluster_reconfig_replacement_purge_request_authorized(
+	const ClusterReplacementWireMessage *request,
+	int32 authenticated_source_node_id, int32 local_receiver_node_id,
+	const ClusterEpochAuthorityValue *settled_reserve,
+	const ClusterEpochBallotId *settled_ballot,
+	const ClusterReplacementCommitMarkerV3 *durable_prepare)
+{
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	uint8 prepare_image[CLUSTER_JCMK_REPLACEMENT_BYTES];
+	uint8 subject[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 zero_acks[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	bool authorized = false;
+
+	if (ReconfigShmem == NULL || request == NULL || settled_reserve == NULL
+		|| settled_ballot == NULL || durable_prepare == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| local_receiver_node_id != cluster_node_id
+		|| authenticated_source_node_id < 0
+		|| authenticated_source_node_id >= CLUSTER_MAX_NODES
+		|| authenticated_source_node_id == local_receiver_node_id
+		|| request->phase != CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_REQUEST
+		|| request->grammar_fingerprint
+			   != CLUSTER_REPLACEMENT_EPISODE_GRAMMAR_FINGERPRINT
+		|| !cluster_epoch_authority_value_is_valid(
+			settled_reserve, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT)
+		|| settled_reserve->transition != CLUSTER_EPOCH_AUTHORITY_RESERVE
+		|| settled_reserve->event_kind
+			   != CLUSTER_EPOCH_EVENT_SAME_NODE_REPLACEMENT
+		|| !cluster_epoch_ballot_id_is_valid(settled_ballot)
+		|| settled_ballot->proposer_node_id
+			   != authenticated_source_node_id
+		|| !cluster_replacement_marker_v3_encode(
+			durable_prepare, prepare_image)
+		|| durable_prepare->phase
+			   != CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE
+		|| durable_prepare->ready_state_generation != 0)
+		return false;
+
+	if (!cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode))
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	episode = &ReconfigShmem->replacement_episode;
+	if (episode->target_node_id >= 0
+		&& episode->target_node_id < CLUSTER_MAX_NODES)
+		subject[episode->target_node_id / 8]
+			= (uint8)(1u << (episode->target_node_id % 8));
+	if (memcmp(episode, &capability_episode, sizeof(*episode)) != 0
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase
+				!= CLUSTER_REPLACEMENT_EPISODE_PREPARE_DURABLE
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_PURGING)
+		|| episode->readiness_flags != 0
+		|| memcmp(episode->acknowledgements, zero_acks,
+				  sizeof(zero_acks)) != 0
+		|| episode->coordinator_node_id
+			   != authenticated_source_node_id
+		|| !dead_bitmap_test_bit(episode->expected_survivors,
+							 authenticated_source_node_id)
+		|| !dead_bitmap_test_bit(episode->expected_survivors,
+							 local_receiver_node_id)
+		|| !cluster_reconfig_replacement_membership_current_locked(episode)
+		|| cluster_epoch_get_current() != episode->baseline_epoch
+		|| cluster_membership_get_last_admitted_incarnation(
+			   authenticated_source_node_id)
+			   != settled_ballot->proposer_admitted_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(
+			   episode->target_node_id)
+			   != episode->old_admitted_incarnation
+		|| request->target_node_id != episode->target_node_id
+		|| request->epoch != episode->baseline_epoch
+		|| request->request_nonce != episode->request_nonce
+		|| request->identity0 != episode->old_admitted_incarnation
+		|| request->identity1 != episode->fresh_incarnation
+		|| memcmp(request->body.bitmap, episode->expected_survivors,
+				  sizeof(request->body.bitmap)) != 0
+		|| request->grammar_fingerprint != episode->grammar_fingerprint
+		|| settled_reserve->request_origin_node != episode->target_node_id
+		|| settled_reserve->target_node_id != episode->target_node_id
+		|| settled_reserve->baseline_epoch != episode->baseline_epoch
+		|| settled_reserve->reserved_epoch
+			   != episode->reserved_or_committed_epoch
+		|| settled_reserve->old_incarnation
+			   != episode->old_admitted_incarnation
+		|| settled_reserve->fresh_incarnation != episode->fresh_incarnation
+		|| settled_reserve->request_nonce != episode->request_nonce
+		|| memcmp(settled_reserve->authority_member_bitmap,
+				  episode->expected_survivors,
+				  sizeof(settled_reserve->authority_member_bitmap)) != 0
+		|| memcmp(settled_reserve->event_subject_bitmap, subject,
+				  sizeof(subject)) != 0
+		|| settled_reserve->grammar_fingerprint
+			   != episode->grammar_fingerprint
+		|| durable_prepare->target_node_id != episode->target_node_id
+		|| durable_prepare->old_admitted_incarnation
+			   != episode->old_admitted_incarnation
+		|| durable_prepare->fresh_incarnation != episode->fresh_incarnation
+		|| durable_prepare->baseline_epoch != episode->baseline_epoch
+		|| durable_prepare->reserved_or_committed_epoch
+			   != episode->reserved_or_committed_epoch
+		|| durable_prepare->request_nonce != episode->request_nonce
+		|| memcmp(durable_prepare->expected_purge_survivors,
+				  episode->expected_survivors,
+				  sizeof(durable_prepare->expected_purge_survivors)) != 0
+		|| durable_prepare->grammar_fingerprint
+			   != episode->grammar_fingerprint)
+		goto out;
+
+	authorized = true;
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	return authorized;
+}
+
+
+/* Authenticated CONTROL-envelope adapter for the pure phase-1 gate above.
+ * Decode into private storage and publish the caller's observation only after
+ * every outer and inner identity check succeeds. */
+bool
+cluster_reconfig_replacement_purge_request_ingress_authorized(
+	const ClusterICEnvelope *env, const void *payload, uint32 payload_length,
+	int32 authenticated_source_node_id, int32 local_receiver_node_id,
+	const ClusterEpochAuthorityValue *settled_reserve,
+	const ClusterEpochBallotId *settled_ballot,
+	const ClusterReplacementCommitMarkerV3 *durable_prepare,
+	ClusterReplacementWireMessage *out_request)
+{
+	ClusterReplacementWireMessage request;
+
+	if (env == NULL || payload == NULL || out_request == NULL
+		|| payload_length != CLUSTER_REPLACEMENT_WIRE_BYTES
+		|| env->msg_type != PGRAC_IC_MSG_GES_REQUEST
+		|| env->payload_length != CLUSTER_REPLACEMENT_WIRE_BYTES
+		|| authenticated_source_node_id < 0
+		|| authenticated_source_node_id >= CLUSTER_MAX_NODES
+		|| local_receiver_node_id < 0
+		|| local_receiver_node_id >= CLUSTER_MAX_NODES
+		|| authenticated_source_node_id == local_receiver_node_id
+		|| env->source_node_id != (uint32)authenticated_source_node_id
+		|| env->dest_node_id != (uint32)local_receiver_node_id
+		|| env->epoch != cluster_epoch_get_current()
+		|| !cluster_replacement_wire_decode(
+			(const uint8 *)payload, &request)
+		|| request.epoch != env->epoch
+		|| !cluster_reconfig_replacement_purge_request_authorized(
+			&request, authenticated_source_node_id, local_receiver_node_id,
+			settled_reserve, settled_ballot, durable_prepare))
+		return false;
+	*out_request = request;
+	return true;
+}
+
+
+/*
+ * Phase-2 counterpart of the request gate.  The ACK node comes only from the
+ * authenticated CONTROL endpoint; body.bitmap remains episode identity and
+ * cannot self-select a bit.  This predicate deliberately accepts an already-
+ * present bit as an idempotent candidate and never mutates the episode.
+ */
+bool
+cluster_reconfig_replacement_purge_ack_authorized(
+	const ClusterReplacementWireMessage *ack,
+	int32 authenticated_source_node_id, int32 local_receiver_node_id,
+	const ClusterEpochAuthorityValue *settled_reserve,
+	const ClusterEpochBallotId *settled_ballot,
+	const ClusterReplacementCommitMarkerV3 *durable_prepare,
+	int32 *out_ack_node_id)
+{
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	uint8 prepare_image[CLUSTER_JCMK_REPLACEMENT_BYTES];
+	uint8 subject[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	bool authorized = false;
+
+	if (ReconfigShmem == NULL || ack == NULL || settled_reserve == NULL
+		|| settled_ballot == NULL || durable_prepare == NULL
+		|| out_ack_node_id == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
+		|| local_receiver_node_id != cluster_node_id
+		|| authenticated_source_node_id < 0
+		|| authenticated_source_node_id >= CLUSTER_MAX_NODES
+		|| authenticated_source_node_id == local_receiver_node_id
+		|| ack->phase != CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_ACK
+		|| ack->grammar_fingerprint
+			   != CLUSTER_REPLACEMENT_EPISODE_GRAMMAR_FINGERPRINT
+		|| !cluster_epoch_authority_value_is_valid(
+			settled_reserve, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT)
+		|| settled_reserve->transition != CLUSTER_EPOCH_AUTHORITY_RESERVE
+		|| settled_reserve->event_kind
+			   != CLUSTER_EPOCH_EVENT_SAME_NODE_REPLACEMENT
+		|| !cluster_epoch_ballot_id_is_valid(settled_ballot)
+		|| settled_ballot->proposer_node_id != local_receiver_node_id
+		|| !cluster_replacement_marker_v3_encode(
+			durable_prepare, prepare_image)
+		|| durable_prepare->phase
+			   != CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE
+		|| durable_prepare->ready_state_generation != 0)
+		return false;
+
+	if (!cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode))
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	episode = &ReconfigShmem->replacement_episode;
+	if (episode->target_node_id >= 0
+		&& episode->target_node_id < CLUSTER_MAX_NODES)
+		subject[episode->target_node_id / 8]
+			= (uint8)(1u << (episode->target_node_id % 8));
+	if (memcmp(episode, &capability_episode, sizeof(*episode)) != 0
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase != CLUSTER_REPLACEMENT_EPISODE_PURGING
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_PURGE_COMPLETE)
+		|| episode->readiness_flags != 0
+		|| episode->coordinator_node_id != local_receiver_node_id
+		|| !dead_bitmap_test_bit(episode->expected_survivors,
+							 authenticated_source_node_id)
+		|| !dead_bitmap_test_bit(episode->expected_survivors,
+							 local_receiver_node_id)
+		|| !cluster_reconfig_replacement_membership_current_locked(episode)
+		|| cluster_epoch_get_current() != episode->baseline_epoch
+		|| cluster_membership_get_last_admitted_incarnation(
+			   local_receiver_node_id)
+			   != settled_ballot->proposer_admitted_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(
+			   episode->target_node_id)
+			   != episode->old_admitted_incarnation
+		|| ack->target_node_id != episode->target_node_id
+		|| ack->epoch != episode->baseline_epoch
+		|| ack->request_nonce != episode->request_nonce
+		|| ack->identity0 != episode->old_admitted_incarnation
+		|| ack->identity1 != episode->fresh_incarnation
+		|| memcmp(ack->body.bitmap, episode->expected_survivors,
+				  sizeof(ack->body.bitmap)) != 0
+		|| ack->grammar_fingerprint != episode->grammar_fingerprint
+		|| settled_reserve->request_origin_node != episode->target_node_id
+		|| settled_reserve->target_node_id != episode->target_node_id
+		|| settled_reserve->baseline_epoch != episode->baseline_epoch
+		|| settled_reserve->reserved_epoch
+			   != episode->reserved_or_committed_epoch
+		|| settled_reserve->old_incarnation
+			   != episode->old_admitted_incarnation
+		|| settled_reserve->fresh_incarnation != episode->fresh_incarnation
+		|| settled_reserve->request_nonce != episode->request_nonce
+		|| memcmp(settled_reserve->authority_member_bitmap,
+				  episode->expected_survivors,
+				  sizeof(settled_reserve->authority_member_bitmap)) != 0
+		|| memcmp(settled_reserve->event_subject_bitmap, subject,
+				  sizeof(subject)) != 0
+		|| settled_reserve->grammar_fingerprint
+			   != episode->grammar_fingerprint
+		|| durable_prepare->target_node_id != episode->target_node_id
+		|| durable_prepare->old_admitted_incarnation
+			   != episode->old_admitted_incarnation
+		|| durable_prepare->fresh_incarnation != episode->fresh_incarnation
+		|| durable_prepare->baseline_epoch != episode->baseline_epoch
+		|| durable_prepare->reserved_or_committed_epoch
+			   != episode->reserved_or_committed_epoch
+		|| durable_prepare->request_nonce != episode->request_nonce
+		|| memcmp(durable_prepare->expected_purge_survivors,
+				  episode->expected_survivors,
+				  sizeof(durable_prepare->expected_purge_survivors)) != 0
+		|| durable_prepare->grammar_fingerprint
+			   != episode->grammar_fingerprint)
+		goto out;
+
+	authorized = true;
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	if (authorized)
+		*out_ack_node_id = authenticated_source_node_id;
+	return authorized;
+}
+
+
+/* Authenticated phase-2 envelope adapter.  The caller receives only the
+ * derived endpoint id, never a payload-selected bit. */
+bool
+cluster_reconfig_replacement_purge_ack_ingress_authorized(
+	const ClusterICEnvelope *env, const void *payload, uint32 payload_length,
+	int32 authenticated_source_node_id, int32 local_receiver_node_id,
+	const ClusterEpochAuthorityValue *settled_reserve,
+	const ClusterEpochBallotId *settled_ballot,
+	const ClusterReplacementCommitMarkerV3 *durable_prepare,
+	int32 *out_ack_node_id)
+{
+	ClusterReplacementWireMessage ack;
+
+	if (env == NULL || payload == NULL || out_ack_node_id == NULL
+		|| payload_length != CLUSTER_REPLACEMENT_WIRE_BYTES
+		|| env->msg_type != PGRAC_IC_MSG_GES_REQUEST
+		|| env->payload_length != CLUSTER_REPLACEMENT_WIRE_BYTES
+		|| authenticated_source_node_id < 0
+		|| authenticated_source_node_id >= CLUSTER_MAX_NODES
+		|| local_receiver_node_id < 0
+		|| local_receiver_node_id >= CLUSTER_MAX_NODES
+		|| authenticated_source_node_id == local_receiver_node_id
+		|| env->source_node_id != (uint32)authenticated_source_node_id
+		|| env->dest_node_id != (uint32)local_receiver_node_id
+		|| env->epoch != cluster_epoch_get_current()
+		|| !cluster_replacement_wire_decode(
+			(const uint8 *)payload, &ack)
+		|| ack.epoch != env->epoch)
+		return false;
+	return cluster_reconfig_replacement_purge_ack_authorized(
+		&ack, authenticated_source_node_id, local_receiver_node_id,
+		settled_reserve, settled_ballot, durable_prepare, out_ack_node_id);
 }
 
 
@@ -783,6 +1599,236 @@ cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation, uint64 *g
 	return gen > 0;
 }
 
+/* STOP04 §2.4.1: generation/incarnation is one coherent qvotec sample.  The
+ * generation is a torn-write counter only and must never be substituted with
+ * an incarnation, membership epoch or failure generation. */
+bool
+cluster_reconfig_get_observed_slot_coherent(
+	int32 node_id, uint64 *out_incarnation, uint64 *out_generation)
+{
+	uint64 generation_before;
+	uint64 generation_after;
+	uint64 incarnation;
+
+	if (out_incarnation != NULL)
+		*out_incarnation = 0;
+	if (out_generation != NULL)
+		*out_generation = 0;
+	if (ReconfigShmem == NULL || node_id < 0 ||
+		node_id >= CLUSTER_MAX_NODES || out_incarnation == NULL ||
+		out_generation == NULL)
+		return false;
+
+	do
+	{
+		generation_before = pg_atomic_read_u64(
+			&ReconfigShmem->observed_generation[node_id]);
+		incarnation = pg_atomic_read_u64(
+			&ReconfigShmem->observed_incarnation[node_id]);
+		generation_after = pg_atomic_read_u64(
+			&ReconfigShmem->observed_generation[node_id]);
+	} while (generation_before != generation_after);
+
+	if (generation_after == 0)
+		return false;
+	*out_incarnation = incarnation;
+	*out_generation = generation_after;
+	return true;
+}
+
+static bool
+rejoin_bitmap_shape_valid(
+	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	const uint8 survivor_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	int32 old_node_id)
+{
+	int survivor_count = 0;
+	int i;
+
+	if (old_node_id < 0 || old_node_id >= CLUSTER_MAX_NODES ||
+		!dead_bitmap_test_bit(dead_bitmap, old_node_id) ||
+		dead_bitmap_test_bit(survivor_bitmap, old_node_id))
+		return false;
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+	{
+		uint8 survivors = survivor_bitmap[i];
+
+		if ((dead_bitmap[i] & survivors) != 0)
+			return false;
+		while (survivors != 0)
+		{
+			survivor_count += survivors & 1;
+			survivors >>= 1;
+		}
+	}
+	return survivor_count >= 1 && survivor_count < CLUSTER_MAX_NODES;
+}
+
+static bool
+rejoin_failure_value_valid(
+	const ClusterReconfigRejoinFailureSnapshotV1 *failure)
+{
+	return failure != NULL &&
+		failure->reconfig_kind == RECONFIG_KIND_FAIL_STOP &&
+		failure->reserved0 == 0 && failure->reserved68 == 0 &&
+		failure->event_id != 0 && failure->new_epoch != 0 &&
+		failure->cssd_dead_generation != 0 &&
+		failure->old_incarnation != 0 &&
+		rejoin_bitmap_shape_valid(failure->dead_bitmap,
+			failure->survivor_bitmap, failure->old_node_id);
+}
+
+bool
+cluster_reconfig_rejoin_failure_snapshot(
+	int32 old_node_id, uint64 old_incarnation,
+	ClusterReconfigRejoinFailureSnapshotV1 *out_failure)
+{
+	ClusterReconfigRejoinFailureSnapshotV1 failure;
+	const ReconfigEvent *event;
+	int survivor_count = 0;
+	int i;
+
+	if (out_failure != NULL)
+		memset(out_failure, 0, sizeof(*out_failure));
+	if (out_failure == NULL || ReconfigShmem == NULL || old_node_id < 0 ||
+		old_node_id >= CLUSTER_MAX_NODES || old_incarnation == 0)
+		return false;
+
+	memset(&failure, 0, sizeof(failure));
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	event = &ReconfigShmem->last_applied;
+	if (event->reconfig_kind != RECONFIG_KIND_FAIL_STOP ||
+		event->event_id == 0 || event->new_epoch == 0 ||
+		event->cssd_dead_generation == 0 ||
+		!dead_bitmap_test_bit(event->dead_bitmap, old_node_id) ||
+		ReconfigShmem->membership.last_admitted_incarnation[old_node_id]
+			!= old_incarnation)
+		goto fail;
+
+	failure.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	failure.event_id = event->event_id;
+	failure.new_epoch = event->new_epoch;
+	failure.cssd_dead_generation = event->cssd_dead_generation;
+	memcpy(failure.dead_bitmap, event->dead_bitmap,
+		   sizeof(failure.dead_bitmap));
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+	{
+		if (ReconfigShmem->membership.membership_state[i] ==
+			(uint8) CLUSTER_MEMBER_MEMBER)
+		{
+			dead_bitmap_set_bit(failure.survivor_bitmap, i);
+			survivor_count++;
+		}
+	}
+	failure.old_node_id = old_node_id;
+	failure.old_incarnation = old_incarnation;
+	if (survivor_count < 1 || survivor_count >= CLUSTER_MAX_NODES ||
+		!rejoin_failure_value_valid(&failure))
+		goto fail;
+	LWLockRelease(&ReconfigShmem->lock);
+	*out_failure = failure;
+	return true;
+
+fail:
+	LWLockRelease(&ReconfigShmem->lock);
+	return false;
+}
+
+static bool
+rejoin_bitmap_is_exact_singleton(
+	const uint8 bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES], int32 node_id)
+{
+	int i;
+
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+	{
+		uint8 expected = (i == node_id / 8)
+			? (uint8)(UINT8_C(1) << (node_id % 8)) : 0;
+
+		if (bitmap[i] != expected)
+			return false;
+	}
+	return true;
+}
+
+bool
+cluster_reconfig_rejoin_pending_snapshot(
+	const ClusterReconfigRejoinFailureSnapshotV1 *failure,
+	uint64 candidate_incarnation,
+	ClusterReconfigRejoinPendingSnapshotV1 *out_pending)
+{
+	ClusterReconfigRejoinPendingSnapshotV1 pending;
+	uint64 incarnations[CLUSTER_MAX_NODES];
+	uint64 observed_incarnation;
+	uint64 observed_generation;
+	const ReconfigEvent *event;
+	int32 node_id;
+	int i;
+
+	if (out_pending != NULL)
+		memset(out_pending, 0, sizeof(*out_pending));
+	if (out_pending == NULL || ReconfigShmem == NULL ||
+		!rejoin_failure_value_valid(failure) ||
+		candidate_incarnation <= failure->old_incarnation)
+		return false;
+	node_id = failure->old_node_id;
+	if (!cluster_reconfig_get_observed_slot_coherent(node_id,
+			&observed_incarnation, &observed_generation) ||
+		observed_incarnation != candidate_incarnation)
+		return false;
+
+	memset(&pending, 0, sizeof(pending));
+	memset(incarnations, 0, sizeof(incarnations));
+	incarnations[node_id] = candidate_incarnation;
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	event = &ReconfigShmem->last_applied;
+	if (event->reconfig_kind != RECONFIG_KIND_JOIN_PENDING ||
+		event->event_id == 0 || event->old_epoch != failure->new_epoch ||
+		failure->new_epoch == UINT64_MAX ||
+		event->new_epoch != event->old_epoch + 1 ||
+		event->cssd_dead_generation == 0 ||
+		ReconfigShmem->membership.membership_state[node_id] !=
+			(uint8) CLUSTER_MEMBER_JOINING ||
+		ReconfigShmem->membership.last_admitted_incarnation[node_id] !=
+			failure->old_incarnation ||
+		!rejoin_bitmap_is_exact_singleton(event->join_bitmap, node_id) ||
+		!rejoin_bitmap_is_exact_singleton(
+			ReconfigShmem->pending_join_bitmap, node_id))
+		goto pending_fail;
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+	{
+		if (event->dead_bitmap[i] != 0)
+			goto pending_fail;
+	}
+	if (event->event_id != cluster_reconfig_compute_event_id_v2(
+			RECONFIG_KIND_JOIN_PENDING, event->dead_bitmap,
+			event->join_bitmap, incarnations,
+			event->cssd_dead_generation))
+		goto pending_fail;
+
+	pending.reconfig_kind = RECONFIG_KIND_JOIN_PENDING;
+	pending.event_id = event->event_id;
+	pending.old_epoch = event->old_epoch;
+	pending.new_epoch = event->new_epoch;
+	pending.cssd_dead_generation = event->cssd_dead_generation;
+	memcpy(pending.dead_bitmap, event->dead_bitmap,
+		   sizeof(pending.dead_bitmap));
+	memcpy(pending.join_bitmap, event->join_bitmap,
+		   sizeof(pending.join_bitmap));
+	pending.node_id = node_id;
+	pending.candidate_incarnation = candidate_incarnation;
+	pending.observed_slot_generation = observed_generation;
+	LWLockRelease(&ReconfigShmem->lock);
+	*out_pending = pending;
+	return true;
+
+pending_fail:
+	LWLockRelease(&ReconfigShmem->lock);
+	return false;
+}
+
 /*
  * spec-5.15 Hardening v1.3 (INV-J14 stale-slot fail-open) — publish / read the
  * per-node FRESH-ALIVE liveness qvotec derived from decide_quorum_view's
@@ -859,6 +1905,9 @@ cluster_reconfig_record_clean_departed(int32 node_id, uint64 leave_epoch, bool r
 		return;
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id)
+		|| leave_epoch > ReconfigShmem->clean_departed_epoch[node_id])
+		cluster_write_fence_authority_cache_invalidate();
 	if (!clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id)) {
 		dead_bitmap_set_bit(ReconfigShmem->clean_departed_bitmap, node_id);
 		newly_set = true;
@@ -892,6 +1941,9 @@ cluster_reconfig_clear_clean_departed(int32 node_id)
 		return;
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id)
+		|| ReconfigShmem->clean_departed_epoch[node_id] != 0)
+		cluster_write_fence_authority_cache_invalidate();
 	if (clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id))
 		ReconfigShmem->clean_departed_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
 	ReconfigShmem->clean_departed_epoch[node_id] = 0;
@@ -949,6 +2001,10 @@ cluster_reconfig_record_removed(int32 node_id, uint64 remove_epoch, bool raise_e
 		return;
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap, node_id)
+		|| remove_epoch > ReconfigShmem->removed_epoch[node_id]
+		|| clean_departed_test_bit_locked(ReconfigShmem->clean_departed_bitmap, node_id))
+		cluster_write_fence_authority_cache_invalidate();
 	if (!clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap, node_id)) {
 		dead_bitmap_set_bit(ReconfigShmem->removed_bitmap, node_id);
 		newly_set = true;
@@ -1193,6 +2249,315 @@ cluster_reconfig_join_converged(int joiner)
 	return true;
 }
 
+bool
+cluster_reconfig_rejoin_pending_ready(
+	const ClusterReconfigRejoinPendingSnapshotV1 *pending)
+{
+	uint64 observed_incarnation;
+	uint64 observed_generation;
+
+	if (pending == NULL || pending->reconfig_kind !=
+		RECONFIG_KIND_JOIN_PENDING || pending->reserved0 != 0 ||
+		pending->node_id < 0 || pending->node_id >= CLUSTER_MAX_NODES ||
+		pending->candidate_incarnation == 0 ||
+		pending->observed_slot_generation == 0 ||
+		!cluster_reconfig_get_observed_slot_coherent(pending->node_id,
+			&observed_incarnation, &observed_generation) ||
+		observed_incarnation != pending->candidate_incarnation ||
+		observed_generation != pending->observed_slot_generation ||
+		!cluster_reconfig_join_converged(pending->node_id))
+		return false;
+	return cluster_membership_vet_joiner(pending->node_id,
+		pending->candidate_incarnation, pending->observed_slot_generation) ==
+		CLUSTER_JOIN_ACCEPT;
+}
+
+static void
+cluster_reconfig_external_rejoin_release_slot(int node_id)
+{
+	ClusterExternalRejoinSlot *slot;
+
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	slot = &external_rejoin_slots[node_id];
+	cluster_external_fence_rejoin_authority_clear_release(
+		&slot->authority_clear);
+	cluster_external_fence_rejoin_release(&slot->op);
+	memset(slot, 0, sizeof(*slot));
+}
+
+static void
+cluster_reconfig_external_rejoin_release_all(void)
+{
+	int i;
+
+	cluster_external_fence_rejoin_release(&external_rejoin_claim_op);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		cluster_reconfig_external_rejoin_release_slot(i);
+}
+
+static void
+cluster_reconfig_external_rejoin_on_exit(int code pg_attribute_unused(),
+									 Datum arg pg_attribute_unused())
+{
+	cluster_reconfig_external_rejoin_release_all();
+}
+
+static bool
+cluster_reconfig_external_rejoin_has_slot(void)
+{
+	int i;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (external_rejoin_slots[i].phase != CLUSTER_EXTERNAL_REJOIN_EMPTY)
+			return true;
+	return false;
+}
+
+static bool
+cluster_reconfig_external_rejoin_terminal(
+	PgracExternalFenceRejoinStatus status)
+{
+	return status == PGRAC_EXTERNAL_FENCE_REJOIN_REJECTED ||
+		status == PGRAC_EXTERNAL_FENCE_REJOIN_UNKNOWN ||
+		status == PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE ||
+		status == PGRAC_EXTERNAL_FENCE_REJOIN_STALE ||
+		status == PGRAC_EXTERNAL_FENCE_REJOIN_CONSUMED;
+}
+
+static bool
+cluster_reconfig_external_rejoin_required(int node_id)
+{
+	return cluster_external_fence_runtime_active() && node_id >= 0 &&
+		node_id < CLUSTER_MAX_NODES &&
+		cluster_membership_get_last_admitted_incarnation(node_id) > 0 &&
+		!cluster_reconfig_is_clean_departed(node_id);
+}
+
+static bool
+cluster_reconfig_external_rejoin_authorized(int node_id,
+									uint64 candidate_incarnation)
+{
+	ClusterExternalRejoinSlot *slot;
+
+	if (!cluster_reconfig_external_rejoin_required(node_id) ||
+		candidate_incarnation == 0)
+		return false;
+	slot = &external_rejoin_slots[node_id];
+	return slot->op != NULL &&
+		slot->candidate_incarnation == candidate_incarnation &&
+		slot->failure.old_node_id == node_id &&
+		slot->phase >= CLUSTER_EXTERNAL_REJOIN_WAITING_JOINER &&
+		slot->phase <= CLUSTER_EXTERNAL_REJOIN_COMMITTING;
+}
+
+/* STOP04 §11.8: coordinator-LMON drives the opaque provider object without
+ * waits and advances at most one local phase per tick.  The current production
+ * policy never calls this path because provider 0 keeps bit24 inactive. */
+static void
+cluster_reconfig_external_rejoin_tick(void)
+{
+	PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	PgracExternalFenceRejoinStatus status;
+	int advance_node = -1;
+	int i;
+
+	if (!cluster_external_fence_runtime_active()) {
+		cluster_reconfig_external_rejoin_release_all();
+		return;
+	}
+	if (!external_rejoin_exit_registered) {
+		on_shmem_exit(cluster_reconfig_external_rejoin_on_exit, (Datum) 0);
+		external_rejoin_exit_registered = true;
+	}
+
+	/* Poll every bound operation once, in deterministic old-node order. */
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterExternalRejoinSlot *slot = &external_rejoin_slots[i];
+
+		if (slot->op == NULL ||
+			slot->phase == CLUSTER_EXTERNAL_REJOIN_COMMITTING)
+			continue;
+		status = cluster_external_fence_rejoin_poll_nowait(slot->op,
+			&reason);
+		if (cluster_reconfig_external_rejoin_terminal(status)) {
+			cluster_reconfig_external_rejoin_release_slot(i);
+			continue;
+		}
+		if (slot->phase == CLUSTER_EXTERNAL_REJOIN_WAITING_ON &&
+			status == PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_JOINER)
+			slot->phase = CLUSTER_EXTERNAL_REJOIN_WAITING_JOINER;
+		else if (slot->phase == CLUSTER_EXTERNAL_REJOIN_WAITING_REFRESH &&
+				 status == PGRAC_EXTERNAL_FENCE_REJOIN_READY)
+			slot->phase = CLUSTER_EXTERNAL_REJOIN_READY;
+	}
+
+	/* A CLAIM is unindexed until the provider returns its exact OFFER. */
+	if (external_rejoin_claim_op != NULL) {
+		const PgracExternalFenceRejoinOfferV1 *offer;
+
+		status = cluster_external_fence_rejoin_poll_nowait(
+			external_rejoin_claim_op, &reason);
+		if (status == PGRAC_EXTERNAL_FENCE_REJOIN_OFFERED) {
+			offer = cluster_external_fence_rejoin_offer(
+				external_rejoin_claim_op);
+			if (offer == NULL || offer->old_node_id < 0 ||
+				offer->old_node_id >= CLUSTER_MAX_NODES ||
+				offer->old_incarnation == 0 ||
+				offer->candidate_incarnation == 0 ||
+				external_rejoin_slots[offer->old_node_id].phase !=
+					CLUSTER_EXTERNAL_REJOIN_EMPTY)
+				cluster_external_fence_rejoin_release(
+					&external_rejoin_claim_op);
+			else {
+				ClusterExternalRejoinSlot *slot =
+					&external_rejoin_slots[offer->old_node_id];
+
+				slot->op = external_rejoin_claim_op;
+				external_rejoin_claim_op = NULL;
+				slot->candidate_incarnation =
+					offer->candidate_incarnation;
+				slot->phase = CLUSTER_EXTERNAL_REJOIN_OFFERED;
+			}
+		} else if (cluster_reconfig_external_rejoin_terminal(status))
+			cluster_external_fence_rejoin_release(
+				&external_rejoin_claim_op);
+	}
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterExternalRejoinPhase phase = external_rejoin_slots[i].phase;
+
+		if (phase == CLUSTER_EXTERNAL_REJOIN_OFFERED ||
+			phase == CLUSTER_EXTERNAL_REJOIN_WAITING_ROOT ||
+			phase == CLUSTER_EXTERNAL_REJOIN_WAITING_JOINER) {
+			advance_node = i;
+			break;
+		}
+	}
+
+	if (advance_node >= 0) {
+		ClusterExternalRejoinSlot *slot =
+			&external_rejoin_slots[advance_node];
+
+		if (slot->phase == CLUSTER_EXTERNAL_REJOIN_OFFERED) {
+			const PgracExternalFenceRejoinOfferV1 *offer =
+				cluster_external_fence_rejoin_offer(slot->op);
+			ClusterGrdRejoinClearSnapshotV1 grd_clear;
+
+			memset(&slot->failure, 0, sizeof(slot->failure));
+			memset(&grd_clear, 0, sizeof(grd_clear));
+			if (offer == NULL ||
+				!cluster_reconfig_rejoin_failure_snapshot(
+					offer->old_node_id, offer->old_incarnation,
+					&slot->failure)) {
+				cluster_reconfig_external_rejoin_release_slot(advance_node);
+				return;
+			}
+			/* G is a positive all-survivor cut.  Not-yet-DONE is a retry,
+			 * not authority to discard the still-fresh OFFER or actuate ON. */
+			if (!cluster_grd_rejoin_clear_snapshot(&slot->failure,
+					&grd_clear))
+				return;
+			status = cluster_external_fence_rejoin_authority_clear_build(
+				slot->op, &slot->failure, &grd_clear,
+				&slot->authority_clear, &reason);
+			if (status != PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT ||
+				slot->authority_clear == NULL) {
+				cluster_reconfig_external_rejoin_release_slot(advance_node);
+				return;
+			}
+			slot->phase = CLUSTER_EXTERNAL_REJOIN_WAITING_ROOT;
+		} else if (slot->phase == CLUSTER_EXTERNAL_REJOIN_WAITING_ROOT) {
+			ClusterControlRootIdentity identity;
+			ClusterControlRootSnapshot snapshot;
+			ClusterControlRootReadToken token;
+			ClusterControlRootResult root_result;
+			uint8 protected_set_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES];
+
+			memset(&identity, 0, sizeof(identity));
+			memset(&snapshot, 0, sizeof(snapshot));
+			memset(&token, 0, sizeof(token));
+			memset(protected_set_digest, 0,
+				   sizeof(protected_set_digest));
+			root_result = cluster_control_root_lookup_owner_by_node_runtime(
+				advance_node, &identity, &snapshot, &token);
+			if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+				 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
+				snapshot.lifecycle !=
+					CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE ||
+				!cluster_external_fence_rejoin_protected_set_digest(
+					protected_set_digest))
+				return;
+			status = cluster_external_fence_rejoin_authorize_on_async(
+				slot->op, &slot->authority_clear, &identity, &snapshot,
+				&token, protected_set_digest, &reason);
+			if (status == PGRAC_EXTERNAL_FENCE_REJOIN_PENDING &&
+				slot->authority_clear == NULL)
+				slot->phase = CLUSTER_EXTERNAL_REJOIN_WAITING_ON;
+			else if (status != PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT)
+				cluster_reconfig_external_rejoin_release_slot(advance_node);
+		} else {
+			ClusterReconfigRejoinPendingSnapshotV1 pending;
+
+			memset(&pending, 0, sizeof(pending));
+			if (!cluster_reconfig_rejoin_pending_snapshot(&slot->failure,
+					slot->candidate_incarnation, &pending) ||
+				!cluster_reconfig_rejoin_pending_ready(&pending))
+				return;
+			status = cluster_external_fence_rejoin_refresh_on_async(
+				slot->op, &pending, &reason);
+			if (status == PGRAC_EXTERNAL_FENCE_REJOIN_PENDING) {
+				slot->commit_pending = pending;
+				slot->phase = CLUSTER_EXTERNAL_REJOIN_WAITING_REFRESH;
+			} else if (status !=
+					   PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_JOINER)
+				cluster_reconfig_external_rejoin_release_slot(advance_node);
+		}
+	}
+
+	/* The frozen linear chain admits only one live CLAIM/OFFER at a time. */
+	if (external_rejoin_claim_op == NULL &&
+		!cluster_reconfig_external_rejoin_has_slot()) {
+		status = cluster_external_fence_rejoin_start_async(
+			PGRAC_EXTERNAL_FENCE_ACQUIRE_TIMEOUT_DEFAULT_MS,
+			&external_rejoin_claim_op);
+		if (cluster_reconfig_external_rejoin_terminal(status))
+			cluster_external_fence_rejoin_release(
+				&external_rejoin_claim_op);
+	}
+}
+
+static bool
+cluster_reconfig_external_rejoin_prepare_commit(int node_id,
+									 uint64 candidate_incarnation)
+{
+	ClusterExternalRejoinSlot *slot;
+	ClusterReconfigRejoinPendingSnapshotV1 pending;
+	ClusterControlRootSnapshot fresh_root;
+	PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+
+	if (!cluster_reconfig_external_rejoin_required(node_id))
+		return true;
+	slot = &external_rejoin_slots[node_id];
+	if (slot->op == NULL || slot->phase != CLUSTER_EXTERNAL_REJOIN_READY ||
+		slot->candidate_incarnation != candidate_incarnation)
+		return false;
+	memset(&pending, 0, sizeof(pending));
+	memset(&fresh_root, 0, sizeof(fresh_root));
+	if (!cluster_reconfig_rejoin_pending_snapshot(&slot->failure,
+			candidate_incarnation, &pending) ||
+		!cluster_reconfig_rejoin_pending_ready(&pending) ||
+		memcmp(&pending, &slot->commit_pending, sizeof(pending)) != 0 ||
+		!cluster_external_fence_rejoin_revalidate_root(slot->op,
+			&fresh_root, &reason)) {
+		cluster_reconfig_external_rejoin_release_slot(node_id);
+		return false;
+	}
+	slot->commit_pending = pending;
+	slot->phase = CLUSTER_EXTERNAL_REJOIN_COMMIT_READY;
+	return true;
+}
+
 /*
  * spec-5.15 Hardening v1.1 (HF-1 / INV-J9 strengthened) — proof that the
  * coordinator's JOIN_COMMITTED publish actually propagated to a quorum of the
@@ -1267,8 +2632,9 @@ cluster_reconfig_release_fence_stage(ClusterReconfigFenceStage *stage)
  *	spec-4.6a section 0 shape, here triggered by the coordinator on ITSELF
  *	— even in a 2-node cluster with no IC piggyback).  While any pre-bump
  *	stage is live the GRD IDLE tick must hold its last stable (genuine
- *	pre-reconfig) baseline instead of re-capturing.  join Phase-2 COMMITTED
- *	does not pre-bump, so it is intentionally excluded.
+ *	pre-reconfig) baseline instead of re-capturing.  JOIN Phase-2 now also
+ *	keeps the shared bit set across its bump -> durable-baseline -> publish
+ *	window, so it needs no separate process-local flag here.
  */
 bool
 cluster_reconfig_has_pending_prebump_stage(void)
@@ -1532,47 +2898,81 @@ cluster_reconfig_poll_join_prepare_stage(void)
 static void
 cluster_reconfig_release_join_commit_stage(void)
 {
+	bool had_prebump = join_commit_stage.fence_ready;
+	bool had_external_rejoin = join_commit_stage.external_rejoin_consumed;
+	int32 external_node_id = join_commit_stage.node_id;
+
 	cluster_marker_async_release_stage(&join_commit_stage.async);
+	cluster_marker_async_release_stage(&join_commit_stage.fence_async);
 	memset(&join_commit_stage.marker, 0, sizeof(join_commit_stage.marker));
+	memset(&join_commit_stage.fence_marker, 0,
+		   sizeof(join_commit_stage.fence_marker));
+	memset(&join_commit_stage.event, 0, sizeof(join_commit_stage.event));
+	join_commit_stage.expected_last_event_id = 0;
 	join_commit_stage.node_id = -1;
 	join_commit_stage.admitted_incarnation = 0;
 	join_commit_stage.submitted = false;
+	join_commit_stage.fence_ready = false;
+	join_commit_stage.external_rejoin_consumed = false;
+	if (had_prebump)
+		cluster_reconfig_set_prebump_sync_active(0);
+	if (had_external_rejoin)
+		cluster_reconfig_external_rejoin_release_slot(external_node_id);
 }
 
 static bool
-cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
+cluster_reconfig_prepare_join_commit(int32 node_id, uint64 admitted_incarnation,
 									 uint64 expected_epoch)
 {
 	uint64 old_epoch, new_epoch;
 	XLogRecPtr lsn;
-	ReconfigEvent evt;
 	uint8 jb[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
-	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 remaining_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 removed_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 incs[CLUSTER_MAX_NODES];
+	uint64 cssd_dead_generation;
+	uint64 expected_last_event_id;
+	ReconfigEvent evt;
+	ClusterFenceMarker fence_marker;
+	int b;
 
 	if (cluster_epoch_get_current() + 1 != expected_epoch)
 		return false;
 
+	/* The durable JCMK and ROOT gate authorize only the still-pending owner.
+	 * Snapshot the exact predecessor before advancing the epoch; the publish
+	 * side revalidates it after the baseline marker reaches a majority. */
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	if (cluster_membership_get_state(node_id) != CLUSTER_MEMBER_JOINING
+		|| !dead_bitmap_test_bit(ReconfigShmem->pending_join_bitmap, node_id)) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	expected_last_event_id = ReconfigShmem->last_applied.event_id;
+	memcpy(remaining_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(remaining_dead));
+	memcpy(removed_bitmap, ReconfigShmem->removed_bitmap,
+		   sizeof(removed_bitmap));
+	LWLockRelease(&ReconfigShmem->lock);
+	remaining_dead[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
+	cssd_dead_generation = cluster_cssd_get_dead_generation();
+
 	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-marker-durable");
 
+	/* This is now a pre-bump staged path: keep GRD/cache readers unavailable
+	 * until the matching majority-durable baseline is either published or the
+	 * attempt fails closed. */
+	cluster_reconfig_set_prebump_sync_active(1);
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
-	if (new_epoch != expected_epoch)
+	if (new_epoch != expected_epoch) {
+		cluster_reconfig_set_prebump_sync_active(0);
 		return false;
+	}
 	lsn = GetXLogInsertRecPtr();
 	cluster_epoch_set_changed_at_lsn((uint64)lsn);
 	cluster_gcs_block_on_epoch_advance(new_epoch);
 	cluster_sinval_reset_all_on_reconfig();
 	cluster_tt_status_flush_all((uint32)new_epoch);
-
-	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-	cluster_membership_set_state(node_id, CLUSTER_MEMBER_MEMBER);
-	cluster_membership_record_admitted(node_id, admitted_incarnation);
-	ReconfigShmem->pending_join_bitmap[node_id / 8] &= (uint8) ~(1u << (node_id % 8));
-	LWLockRelease(&ReconfigShmem->lock);
-
-	if (cluster_reconfig_is_clean_departed(node_id))
-		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_cleared_count, 1);
-	cluster_reconfig_clear_clean_departed(node_id);
 
 	dead_bitmap_set_bit(jb, node_id);
 	memset(incs, 0, sizeof(incs));
@@ -1580,18 +2980,142 @@ cluster_reconfig_publish_join_commit(int32 node_id, uint64 admitted_incarnation,
 
 	memset(&evt, 0, sizeof(evt));
 	evt.event_id = cluster_reconfig_compute_event_id_v2(
-		RECONFIG_KIND_JOIN_COMMITTED, empty_dead, jb, incs, cluster_cssd_get_dead_generation());
+		RECONFIG_KIND_JOIN_COMMITTED, remaining_dead, jb, incs,
+		cssd_dead_generation);
 	evt.coordinator_node_id = cluster_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
+	memcpy(evt.dead_bitmap, remaining_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	memcpy(evt.join_bitmap, jb, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
-	evt.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	evt.cssd_dead_generation = cssd_dead_generation;
 	evt.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
-	cluster_reconfig_publish_event(&evt);
-	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
 
+	memset(&fence_marker, 0, sizeof(fence_marker));
+	fence_marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+	fence_marker.version = CLUSTER_FENCE_MARKER_VERSION;
+	fence_marker.fence_epoch = new_epoch;
+	fence_marker.fence_event_id = evt.event_id;
+	fence_marker.fence_generation = cssd_dead_generation;
+	fence_marker.issuer_node_id = cluster_node_id;
+	/* A JOIN shrinks the excluded set, so this is the new membership baseline,
+	 * including every still-dead and permanently removed origin.  BASELINE is
+	 * valid even when the admitted owner was the final excluded origin. */
+	fence_marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		fence_marker.fenced_dead_bitmap[b]
+			= remaining_dead[b] | removed_bitmap[b];
+
+	join_commit_stage.event = evt;
+	join_commit_stage.fence_marker = fence_marker;
+	join_commit_stage.expected_last_event_id = expected_last_event_id;
+	join_commit_stage.fence_async.has_staged_event = true;
+	join_commit_stage.fence_async.staged_expect_epoch = new_epoch;
+	join_commit_stage.fence_ready = true;
+
+	return true;
+}
+
+static bool
+cluster_reconfig_publish_prepared_join_commit(void)
+{
+	uint8 expected_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 expected_fenced[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	bool publish = false;
+	int b;
+
+	if (!join_commit_stage.fence_ready
+		|| cluster_epoch_get_current() != join_commit_stage.event.new_epoch)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	memcpy(expected_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(expected_dead));
+	expected_dead[join_commit_stage.node_id / 8]
+		&= (uint8) ~(1u << (join_commit_stage.node_id % 8));
+	for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		expected_fenced[b] = expected_dead[b] | ReconfigShmem->removed_bitmap[b];
+
+	if (cluster_membership_get_state(join_commit_stage.node_id)
+			== CLUSTER_MEMBER_JOINING
+		&& dead_bitmap_test_bit(ReconfigShmem->pending_join_bitmap,
+								join_commit_stage.node_id)
+		&& ReconfigShmem->last_applied.event_id
+			   == join_commit_stage.expected_last_event_id
+		&& memcmp(expected_dead, join_commit_stage.event.dead_bitmap,
+				  sizeof(expected_dead)) == 0
+		&& memcmp(expected_fenced,
+				  join_commit_stage.fence_marker.fenced_dead_bitmap,
+				  sizeof(expected_fenced)) == 0) {
+		cluster_write_fence_authority_cache_invalidate();
+		cluster_membership_set_state(join_commit_stage.node_id,
+								 CLUSTER_MEMBER_MEMBER);
+		cluster_membership_record_admitted(
+			join_commit_stage.node_id,
+			join_commit_stage.admitted_incarnation);
+		ReconfigShmem->pending_join_bitmap[join_commit_stage.node_id / 8]
+			&= (uint8) ~(1u << (join_commit_stage.node_id % 8));
+		publish = true;
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if (!publish)
+		return false;
+	if (cluster_reconfig_is_clean_departed(join_commit_stage.node_id))
+		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_cleared_count, 1);
+	cluster_reconfig_clear_clean_departed(join_commit_stage.node_id);
+	cluster_reconfig_publish_event(&join_commit_stage.event);
+	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
+	return true;
+}
+
+static bool
+cluster_reconfig_poll_join_fence_stage(TimestampTz now)
+{
+	uint32 result = CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	ClusterMarkerPollResult pr;
+
+	if (!cluster_marker_async_is_submitted(&join_commit_stage.fence_async)) {
+		if (!cluster_write_fence_submit_marker_async(
+				&join_commit_stage.fence_async,
+				&join_commit_stage.fence_marker,
+				CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+				join_commit_stage.node_id, now))
+			return true;
+		return true;
+	}
+
+	pr = cluster_write_fence_poll_marker_async(&join_commit_stage.fence_async,
+										 now, &result, &elapsed_us);
+	if (pr == CLUSTER_MARKER_POLL_PENDING || pr == CLUSTER_MARKER_POLL_IDLE)
+		return true;
+	if (pr == CLUSTER_MARKER_POLL_TIMEOUT) {
+		cluster_reconfig_note_marker_timeout(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+										 join_commit_stage.node_id,
+										 elapsed_us);
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
+
+	cluster_reconfig_note_marker_slow_ack(CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+									  join_commit_stage.node_id,
+									  elapsed_us);
+	if (result != CLUSTER_FENCE_MARKER_SUBMIT_ACK
+		|| !cluster_reconfig_publish_prepared_join_commit()) {
+		ereport(LOG,
+				(errmsg("cluster membership: JOIN baseline marker for node %d did not "
+						"reach a voting-disk majority or its predecessor changed; "
+						"not committing (will retry)",
+						join_commit_stage.node_id)));
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
+
+	cluster_reconfig_release_join_commit_stage();
 	return true;
 }
 
@@ -1609,6 +3133,8 @@ cluster_reconfig_poll_join_commit_stage(void)
 		return false;
 
 	now = GetCurrentTimestamp();
+	if (join_commit_stage.fence_ready)
+		return cluster_reconfig_poll_join_fence_stage(now);
 	if (!join_commit_stage.submitted) {
 		if (!cluster_reconfig_submit_join_marker_async(
 				&join_commit_stage.async, join_commit_stage.node_id, &join_commit_stage.marker,
@@ -1639,6 +3165,14 @@ cluster_reconfig_poll_join_commit_stage(void)
 		cluster_reconfig_release_join_commit_stage();
 		return true;
 	}
+	/* STOP04 §11.7/§11.9: a consumed external rejoin can never publish MEMBER
+	 * without the mandatory durable excluded-set shrink. */
+	if (join_commit_stage.external_rejoin_consumed &&
+		cluster_write_fence_enforcement != CLUSTER_WRITE_FENCE_ENFORCE_ON) {
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
 
 	if (!cluster_reconfig_get_observed_slot(join_commit_stage.node_id, &admitted_incarnation,
 											&admitted_generation)
@@ -1646,7 +3180,11 @@ cluster_reconfig_poll_join_commit_stage(void)
 		|| cluster_membership_vet_joiner(join_commit_stage.node_id, admitted_incarnation,
 										 admitted_generation)
 			   != CLUSTER_JOIN_ACCEPT
-		|| !cluster_reconfig_publish_join_commit(join_commit_stage.node_id,
+		|| (!join_commit_stage.external_rejoin_consumed &&
+			!cluster_recovery_owner_rejoin_v1(
+				join_commit_stage.node_id,
+				join_commit_stage.admitted_incarnation))
+		|| !cluster_reconfig_prepare_join_commit(join_commit_stage.node_id,
 												 join_commit_stage.admitted_incarnation,
 												 join_commit_stage.async.staged_expect_epoch)) {
 		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
@@ -1654,6 +3192,10 @@ cluster_reconfig_poll_join_commit_stage(void)
 		return true;
 	}
 
+	if (cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON)
+		return cluster_reconfig_poll_join_fence_stage(now);
+	if (!cluster_reconfig_publish_prepared_join_commit())
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
 	cluster_reconfig_release_join_commit_stage();
 	return true;
 }
@@ -1689,12 +3231,42 @@ cluster_reconfig_drive_joins(int coordinator)
 	LWLockRelease(&state->lock);
 
 	if (n_join > 0) {
+		int external_selected = -1;
+
 		memset(joiner_incarnations, 0, sizeof(joiner_incarnations));
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			if (!dead_bitmap_test_bit(join_bitmap, i))
 				continue;
 			(void)cluster_reconfig_get_observed_slot(i, &joiner_incarnations[i], NULL);
 		}
+		/* STOP04 §11.9 F→...→P: a previously admitted/excluded origin
+		 * cannot enter JOIN_PENDING before its exact provider operation has
+		 * reached physical ON.  If present, serialize that candidate into the
+		 * required singleton P; clean first joins remain on the ordinary path. */
+		if (cluster_external_fence_runtime_active()) {
+			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+				if (!dead_bitmap_test_bit(join_bitmap, i) ||
+					!cluster_reconfig_external_rejoin_required(i))
+					continue;
+				if (external_selected < 0 &&
+					cluster_reconfig_external_rejoin_authorized(
+						i, joiner_incarnations[i]))
+					external_selected = i;
+				else
+					join_bitmap[i / 8] &=
+						(uint8) ~(1u << (i % 8));
+			}
+			if (external_selected >= 0) {
+				memset(join_bitmap, 0, sizeof(join_bitmap));
+				dead_bitmap_set_bit(join_bitmap, external_selected);
+			}
+		}
+		n_join = 0;
+		for (i = 0; i < CLUSTER_MAX_NODES; i++)
+			if (dead_bitmap_test_bit(join_bitmap, i))
+				n_join++;
+		if (n_join == 0)
+			return;
 		cluster_reconfig_apply_join_as_coordinator(join_bitmap, coordinator, joiner_incarnations);
 		return;
 	}
@@ -1719,6 +3291,9 @@ cluster_reconfig_drive_joins(int coordinator)
 			pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
 			continue;
 		}
+		if (!cluster_reconfig_external_rejoin_prepare_commit(
+				i, admitted_incarnation))
+			continue;
 		(void)cluster_reconfig_commit_member(i, admitted_incarnation);
 	}
 }
@@ -1742,12 +3317,1158 @@ cluster_reconfig_self_join_gate_verdict(void)
 	return CLUSTER_JOIN_GATE_ALLOW;
 }
 
+static bool
+cluster_reconfig_is_local_admitted_replacement(
+	const ClusterReplacementEpisode *episode)
+{
+	return cluster_replacement_episode_is_valid(episode)
+		   && episode->phase == CLUSTER_REPLACEMENT_EPISODE_ADMITTED
+		   && episode->readiness_flags == CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK
+		   && episode->target_node_id == cluster_node_id;
+}
+
+static bool
+cluster_reconfig_has_replacement_episode(
+	const ClusterReplacementEpisode *episode)
+{
+	/* Only the all-zero canonical image means the ordinary-join lane.  A torn
+	 * or otherwise invalid nonempty mirror remains replacement state and must
+	 * fail closed; validation failure is never an ordinary-open fallback. */
+	return !cluster_replacement_episode_is_empty(episode);
+}
+
+bool
+cluster_reconfig_lmon_observe_replacement_ready(
+	const ClusterReplacementPhase3HandoffItem *item)
+{
+	ClusterReplacementCommitMarkerV3 marker;
+	ClusterReplacementEpisode *episode;
+	uint64 request_seq;
+	uint64 completion_seq;
+	bool accepted = false;
+
+	if (ReconfigShmem == NULL || item == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	request_seq = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	completion_seq
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq);
+	if (request_seq == 0 || request_seq != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		return false;
+	pg_read_barrier();
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	episode = &ReconfigShmem->replacement_episode;
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		|| !cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, item->message.target_node_id,
+			&marker)
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase != CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| (episode->readiness_flags
+			& CLUSTER_REPLACEMENT_EPISODE_INTENT_CLEARED)
+			   == 0
+		|| marker.phase != CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED
+		|| marker.ready_state_generation != 0
+		|| marker.generation
+			   != item->message.body.phase3.jcmk_generation
+		|| episode->state_generation
+			   != item->message.body.phase3.episode_state_generation
+		|| episode->target_node_id != item->authenticated_source_node_id
+		|| episode->target_node_id != item->message.target_node_id
+		|| episode->coordinator_node_id != cluster_node_id
+		|| episode->coordinator_node_id != item->local_receiver_node_id
+		|| episode->baseline_epoch != item->message.epoch
+		|| episode->reserved_or_committed_epoch != cluster_epoch_get_current()
+		|| episode->request_nonce != item->message.request_nonce
+		|| episode->old_admitted_incarnation != item->message.identity0
+		|| episode->fresh_incarnation != item->message.identity1
+		|| episode->grammar_fingerprint
+			   != item->message.grammar_fingerprint
+		|| marker.target_node_id != episode->target_node_id
+		|| marker.old_admitted_incarnation
+			   != episode->old_admitted_incarnation
+		|| marker.fresh_incarnation != episode->fresh_incarnation
+		|| marker.baseline_epoch != episode->baseline_epoch
+		|| marker.reserved_or_committed_epoch
+			   != episode->reserved_or_committed_epoch
+		|| marker.request_nonce != episode->request_nonce
+		|| memcmp(marker.expected_purge_survivors,
+				  episode->expected_survivors,
+				  sizeof(marker.expected_purge_survivors))
+			   != 0
+		|| marker.grammar_fingerprint != episode->grammar_fingerprint)
+		goto out;
+
+	episode->readiness_flags
+		|= CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY;
+	accepted = true;
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	return accepted;
+}
+
+bool
+cluster_reconfig_lmon_build_replacement_admitted(
+	const ClusterEpochAuthorityValue *terminal_head,
+	ClusterReplacementCommitMarkerV3 *out_marker)
+{
+	ClusterReplacementCommitMarkerV3 committed;
+	ClusterReplacementCommitMarkerV3 candidate;
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	uint8 encoded[CLUSTER_JCMK_REPLACEMENT_BYTES];
+	uint8 subject[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint64 request_seq;
+	uint64 completion_seq;
+	bool built = false;
+
+	if (ReconfigShmem == NULL || terminal_head == NULL || out_marker == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_epoch_authority_value_is_valid(
+			terminal_head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT)
+		|| terminal_head->transition
+			   != CLUSTER_EPOCH_AUTHORITY_COMMIT_CLOSED
+		|| terminal_head->event_kind
+			   != CLUSTER_EPOCH_EVENT_SAME_NODE_REPLACEMENT)
+		return false;
+	if (!cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode))
+		return false;
+
+	request_seq = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	completion_seq
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq);
+	if (request_seq == 0 || request_seq != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		return false;
+	pg_read_barrier();
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	episode = &ReconfigShmem->replacement_episode;
+	if (episode->target_node_id >= 0
+		&& episode->target_node_id < CLUSTER_MAX_NODES)
+		subject[episode->target_node_id / 8]
+			= (uint8)(1u << (episode->target_node_id % 8));
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		|| !cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, episode->target_node_id,
+			&committed)
+		|| memcmp(episode, &capability_episode, sizeof(*episode)) != 0
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| !cluster_reconfig_replacement_membership_current_locked(episode)
+		|| (episode->phase != CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| episode->readiness_flags
+			   != CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK
+		|| episode->state_generation == 0
+		|| episode->reserved_or_committed_epoch
+			   != cluster_epoch_get_current()
+		|| committed.phase
+			   != CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED
+		|| committed.ready_state_generation != 0
+		|| committed.generation == UINT64_MAX
+		|| committed.target_node_id != episode->target_node_id
+		|| committed.old_admitted_incarnation
+			   != episode->old_admitted_incarnation
+		|| committed.fresh_incarnation != episode->fresh_incarnation
+		|| committed.baseline_epoch != episode->baseline_epoch
+		|| committed.reserved_or_committed_epoch
+			   != episode->reserved_or_committed_epoch
+		|| committed.request_nonce != episode->request_nonce
+		|| memcmp(committed.expected_purge_survivors,
+				  episode->expected_survivors,
+				  sizeof(committed.expected_purge_survivors))
+			   != 0
+		|| committed.grammar_fingerprint
+			   != episode->grammar_fingerprint
+		|| terminal_head->request_origin_node != episode->target_node_id
+		|| terminal_head->target_node_id != episode->target_node_id
+		|| terminal_head->baseline_epoch != episode->baseline_epoch
+		|| terminal_head->reserved_epoch
+			   != episode->reserved_or_committed_epoch
+		|| terminal_head->old_incarnation
+			   != episode->old_admitted_incarnation
+		|| terminal_head->fresh_incarnation != episode->fresh_incarnation
+		|| terminal_head->request_nonce != episode->request_nonce
+		|| memcmp(terminal_head->authority_member_bitmap,
+				  episode->expected_survivors,
+				  sizeof(terminal_head->authority_member_bitmap))
+			   != 0
+		|| memcmp(terminal_head->event_subject_bitmap, subject,
+				  sizeof(terminal_head->event_subject_bitmap))
+			   != 0
+		|| terminal_head->grammar_fingerprint
+			   != episode->grammar_fingerprint)
+		goto out;
+
+	candidate = committed;
+	candidate.phase = CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED;
+	candidate.generation++;
+	candidate.ready_state_generation = episode->state_generation;
+	if (!cluster_replacement_marker_v3_encode(&candidate, encoded))
+		goto out;
+	*out_marker = candidate;
+	built = true;
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	return built;
+}
+
+bool
+cluster_reconfig_lmon_finalize_replacement_admitted(
+	const ClusterEpochAuthorityValue *terminal_head,
+	const ClusterReplacementCommitMarkerV3 *admitted_marker)
+{
+	ClusterReplacementCommitMarkerV3 durable;
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	uint8 subject[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint64 request_seq;
+	uint64 completion_seq;
+	bool finalized = false;
+
+	if (ReconfigShmem == NULL || terminal_head == NULL
+		|| admitted_marker == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_epoch_authority_value_is_valid(
+			terminal_head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT)
+		|| terminal_head->transition
+			   != CLUSTER_EPOCH_AUTHORITY_COMMIT_CLOSED
+		|| terminal_head->event_kind
+			   != CLUSTER_EPOCH_EVENT_SAME_NODE_REPLACEMENT
+		|| admitted_marker->phase
+			   != CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED
+		|| admitted_marker->ready_state_generation == 0)
+		return false;
+	if (!cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode))
+		return false;
+
+	request_seq = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	completion_seq
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq);
+	if (request_seq == 0 || request_seq != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		return false;
+	pg_read_barrier();
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	episode = &ReconfigShmem->replacement_episode;
+	if (episode->target_node_id >= 0
+		&& episode->target_node_id < CLUSTER_MAX_NODES)
+		subject[episode->target_node_id / 8]
+			= (uint8)(1u << (episode->target_node_id % 8));
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		|| !cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, admitted_marker->target_node_id,
+			&durable)
+		|| !cluster_replacement_marker_v3_same_image(
+			&durable, admitted_marker)
+		|| memcmp(episode, &capability_episode, sizeof(*episode)) != 0
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| !cluster_reconfig_replacement_membership_current_locked(episode)
+		|| (episode->phase != CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| episode->readiness_flags
+			   != CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK
+		|| episode->state_generation
+			   != admitted_marker->ready_state_generation
+		|| episode->coordinator_node_id != cluster_node_id
+		|| episode->target_node_id != admitted_marker->target_node_id
+		|| episode->old_admitted_incarnation
+			   != admitted_marker->old_admitted_incarnation
+		|| episode->fresh_incarnation
+			   != admitted_marker->fresh_incarnation
+		|| episode->baseline_epoch != admitted_marker->baseline_epoch
+		|| episode->reserved_or_committed_epoch
+			   != admitted_marker->reserved_or_committed_epoch
+		|| episode->reserved_or_committed_epoch
+			   != cluster_epoch_get_current()
+		|| episode->request_nonce != admitted_marker->request_nonce
+		|| memcmp(episode->expected_survivors,
+				  admitted_marker->expected_purge_survivors,
+				  sizeof(episode->expected_survivors))
+			   != 0
+		|| episode->grammar_fingerprint
+			   != admitted_marker->grammar_fingerprint
+		|| terminal_head->request_origin_node != episode->target_node_id
+		|| terminal_head->target_node_id != episode->target_node_id
+		|| terminal_head->baseline_epoch != episode->baseline_epoch
+		|| terminal_head->reserved_epoch
+			   != episode->reserved_or_committed_epoch
+		|| terminal_head->old_incarnation
+			   != episode->old_admitted_incarnation
+		|| terminal_head->fresh_incarnation != episode->fresh_incarnation
+		|| terminal_head->request_nonce != episode->request_nonce
+		|| memcmp(terminal_head->authority_member_bitmap,
+				  episode->expected_survivors,
+				  sizeof(terminal_head->authority_member_bitmap))
+			   != 0
+		|| memcmp(terminal_head->event_subject_bitmap, subject,
+				  sizeof(terminal_head->event_subject_bitmap))
+			   != 0
+		|| terminal_head->grammar_fingerprint
+			   != episode->grammar_fingerprint)
+		goto out;
+
+	episode->phase = CLUSTER_REPLACEMENT_EPISODE_ADMITTED;
+	cluster_membership_set_state(episode->target_node_id,
+							 CLUSTER_MEMBER_MEMBER);
+	cluster_membership_record_admitted(episode->target_node_id,
+								 episode->fresh_incarnation);
+	finalized = true;
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	return finalized;
+}
+
+/*
+ * Snapshot the current-coordinator happy-path handoff into D13.  The marker
+ * mailbox ACK is the completion of the existing voting-disk majority writer;
+ * this routine performs no I/O and grants no service.  It only co-samples the
+ * exact local ADMITTED image, episode, epoch and closed MEMBER metadata under
+ * the reconfig lock.  Formation takeover still needs its own majority-read
+ * carrier and is deliberately not inferred from this process-local mailbox.
+ */
+bool
+cluster_reconfig_lmon_snapshot_replacement_admitted(
+	ClusterReplacementEpisode *out_episode,
+	ClusterReplacementCommitMarkerV3 *out_marker)
+{
+	ClusterReplacementEpisode observed_episode;
+	ClusterReplacementCommitMarkerV3 observed_marker;
+	ClusterReplacementEpisode *episode;
+	uint64 request_seq;
+	uint64 completion_seq;
+	bool valid = false;
+	int node;
+
+	if (ReconfigShmem == NULL || out_episode == NULL || out_marker == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	request_seq = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	completion_seq
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq);
+	if (request_seq == 0 || request_seq != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		return false;
+	pg_read_barrier();
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	episode = &ReconfigShmem->replacement_episode;
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| episode->phase != CLUSTER_REPLACEMENT_EPISODE_ADMITTED
+		|| episode->readiness_flags
+			   != CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK
+		|| episode->coordinator_node_id != cluster_node_id
+		|| episode->reserved_or_committed_epoch
+			   != cluster_epoch_get_current()
+		|| !cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, episode->target_node_id,
+			&observed_marker)
+		|| observed_marker.phase
+			   != CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED
+		|| observed_marker.ready_state_generation
+			   != episode->state_generation
+		|| observed_marker.target_node_id != episode->target_node_id
+		|| observed_marker.old_admitted_incarnation
+			   != episode->old_admitted_incarnation
+		|| observed_marker.fresh_incarnation != episode->fresh_incarnation
+		|| observed_marker.baseline_epoch != episode->baseline_epoch
+		|| observed_marker.reserved_or_committed_epoch
+			   != episode->reserved_or_committed_epoch
+		|| observed_marker.request_nonce != episode->request_nonce
+		|| memcmp(observed_marker.expected_purge_survivors,
+				  episode->expected_survivors,
+				  sizeof(observed_marker.expected_purge_survivors))
+			   != 0
+		|| observed_marker.grammar_fingerprint
+			   != episode->grammar_fingerprint
+		|| cluster_membership_get_last_admitted_incarnation(
+			   episode->target_node_id) != episode->fresh_incarnation)
+		goto out;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool expected_member
+			= node == episode->target_node_id
+			  || dead_bitmap_test_bit(episode->expected_survivors, node);
+
+		if (cluster_membership_is_member(node) != expected_member)
+			goto out;
+	}
+
+	observed_episode = *episode;
+	valid = true;
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	if (!valid)
+		return false;
+	*out_episode = observed_episode;
+	*out_marker = observed_marker;
+	return true;
+}
+
+void
+cluster_reconfig_lmon_replacement_ready_tick(void)
+{
+	ClusterR4PrerequisiteSnapshot snapshot;
+	ClusterICSendResult send_result;
+	int32 coordinator_node_id;
+	ClusterQvotecMailboxCompletion ignored_completion;
+	ClusterMarkerPollResult marker_poll;
+	uint32 marker_result = CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+
+	if (!cluster_enabled || MyBackendType != B_LMON
+		|| !cluster_qvotec_in_quorum() || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return;
+	if (replacement_ready_stage.phase
+		== CLUSTER_REPLACEMENT_READY_STAGE_IDLE) {
+		cluster_marker_async_init(&replacement_ready_stage.marker_async);
+		(void)cluster_reconfig_lmon_submit_ready_observer_pair(
+			GetCurrentTimestamp());
+		return;
+	}
+	if (replacement_ready_stage.phase
+		== CLUSTER_REPLACEMENT_READY_STAGE_DRAIN_AUTHORITY) {
+		/* The pair was irrevocably discarded.  Poll once only to consume a
+		 * visible completion; a pending or restart-reset authority mailbox is
+		 * handled by the next fresh submit's existing BUSY/ACCEPTED result. */
+		(void)cluster_qvotec_authority_lmon_poll_completion(
+			replacement_ready_stage.authority_request_seq,
+			&ignored_completion);
+		cluster_reconfig_release_ready_stage();
+		return;
+	}
+	if (replacement_ready_stage.phase
+		== CLUSTER_REPLACEMENT_READY_STAGE_WAIT_PAIR) {
+		if (!replacement_ready_stage.marker_completed) {
+			marker_poll = cluster_reconfig_poll_join_marker_async(
+				&replacement_ready_stage.marker_async,
+				GetCurrentTimestamp(), &marker_result, &elapsed_us);
+			if (marker_poll == CLUSTER_MARKER_POLL_PENDING
+				|| marker_poll == CLUSTER_MARKER_POLL_IDLE)
+				return;
+			if (marker_poll != CLUSTER_MARKER_POLL_ACKED
+				|| marker_result != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
+				memset(&join_marker_lmon_owner, 0,
+					   sizeof(join_marker_lmon_owner));
+				replacement_ready_stage.phase
+					= CLUSTER_REPLACEMENT_READY_STAGE_DRAIN_AUTHORITY;
+				return;
+			}
+			replacement_ready_stage.marker_completed = true;
+		}
+
+		snapshot = cluster_undo_block0_r4_prerequisite_snapshot();
+		if (snapshot.status != CLUSTER_R4_PREREQUISITE_R4A_READY
+			|| !snapshot.ready)
+			return;
+		if (!cluster_replacement_wire_encode_phase3_snapshot(
+				&snapshot, replacement_ready_stage.cached_image)) {
+			cluster_reconfig_release_ready_stage();
+			return;
+		}
+		replacement_ready_stage.cached_snapshot = snapshot;
+		replacement_ready_stage.phase
+			= CLUSTER_REPLACEMENT_READY_STAGE_CACHED;
+	}
+
+	if (!cluster_reconfig_lmon_ready_cache_current(
+			&coordinator_node_id))
+		return;
+
+	send_result = cluster_ic_send_envelope(
+		PGRAC_IC_MSG_GES_REQUEST, coordinator_node_id,
+		replacement_ready_stage.cached_image,
+		CLUSTER_REPLACEMENT_WIRE_BYTES);
+	if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+		cluster_ic_tier1_close_peer(
+			coordinator_node_id, "replacement READY send hard error");
+}
+
+ClusterR4PrerequisiteSnapshot
+cluster_reconfig_r4_prerequisite_snapshot(void)
+{
+	ClusterR4PrerequisiteSnapshot dormant = {
+		.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED,
+		.ready = false,
+		.reserved0 = {0, 0, 0},
+		.target_node_id = -1,
+	};
+	ClusterR4PrerequisiteSnapshot snapshot;
+	ClusterQvotecMailboxCompletion completion;
+	ClusterQvotecMailboxCompletion repeated_completion;
+	ClusterEpochAuthorityValue head;
+	ClusterEpochBallotId ballot;
+	ClusterReplacementCommitMarkerV3 marker;
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	ClusterJoinMarkerMailboxOperationV1 operation;
+	uint32 request_word;
+	int32 request_target;
+	bool capabilities_current;
+	bool keep_waiting = false;
+	bool valid = false;
+
+	if (ReconfigShmem == NULL || MyBackendType != B_LMON
+		|| cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return dormant;
+	capabilities_current
+		= cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode);
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!join_marker_lmon_owner.reserved
+		|| join_marker_lmon_owner.purpose
+			   != CLUSTER_JOIN_MARKER_LMON_READY_SERIALIZE
+		|| join_marker_lmon_owner.operation
+			   != CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED
+		|| join_marker_lmon_owner.marker_request_seq == 0
+		|| replacement_ready_stage.phase
+			   != CLUSTER_REPLACEMENT_READY_STAGE_WAIT_PAIR
+		|| !replacement_ready_stage.marker_completed
+		|| replacement_ready_stage.authority_request_seq == 0
+		|| replacement_ready_stage.marker_request_seq
+			   != join_marker_lmon_owner.marker_request_seq)
+		goto out;
+	if (!capabilities_current
+		|| memcmp(&ReconfigShmem->replacement_episode,
+				  &capability_episode, sizeof(capability_episode)) != 0
+		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY)
+		goto out;
+	if (!cluster_qvotec_authority_lmon_poll_completion(
+			replacement_ready_stage.authority_request_seq,
+			&completion)) {
+		keep_waiting = true;
+		goto out;
+	}
+	if (completion.result != CLUSTER_QVOTEC_MAILBOX_CHOSEN
+		|| completion.actor_phase != CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B
+		|| !cluster_epoch_authority_value_decode(
+			completion.completion_value,
+			CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, &head)
+		|| !cluster_epoch_ballot_id_decode(
+			completion.completion_ballot, &ballot))
+		goto out;
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= replacement_ready_stage.marker_request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != replacement_ready_stage.marker_request_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		goto out;
+	request_word = ReconfigShmem->join_marker_request_word;
+	if (!cluster_reconfig_join_marker_request_word_decode(
+			request_word, &operation, &request_target)
+		|| operation
+			   != CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED)
+		goto out;
+	episode = &ReconfigShmem->replacement_episode;
+	if (cluster_replacement_episode_is_valid(episode)
+		&& (episode->phase == CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			|| episode->phase == CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		&& (episode->readiness_flags
+			& CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY) != 0
+		&& episode->state_generation != 0
+		&& episode->target_node_id == cluster_node_id
+		&& episode->reserved_or_committed_epoch
+			   == cluster_epoch_get_current()
+		&& ReconfigShmem->self_join_admitted == 0
+		&& ReconfigShmem->self_join_failed == 0
+		&& cluster_reconfig_replacement_membership_current_locked(episode)
+		&& cluster_membership_get_last_admitted_incarnation(
+			   episode->target_node_id)
+			   == episode->old_admitted_incarnation
+		&& cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, request_target,
+			&marker)
+		&& marker.generation != 0
+		&& cluster_reconfig_terminal_closed_matches_episode(
+			&head, &ballot, &marker, episode)
+		&& cluster_qvotec_authority_lmon_poll_completion(
+			replacement_ready_stage.authority_request_seq,
+			&repeated_completion)
+		&& memcmp(&completion, &repeated_completion,
+				  sizeof(completion)) == 0
+		&& pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			   == replacement_ready_stage.marker_request_seq
+		&& pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   == replacement_ready_stage.marker_request_seq
+		&& pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   == CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		&& ReconfigShmem->join_marker_request_word == request_word
+		&& cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY) {
+		memset(&snapshot, 0, sizeof(snapshot));
+		snapshot.status = CLUSTER_R4_PREREQUISITE_R4A_READY;
+		snapshot.ready = true;
+		snapshot.target_node_id = episode->target_node_id;
+		snapshot.episode_state_generation = episode->state_generation;
+		snapshot.jcmk_generation = marker.generation;
+		snapshot.request_nonce = episode->request_nonce;
+		snapshot.old_admitted_incarnation
+			= episode->old_admitted_incarnation;
+		snapshot.fresh_incarnation = episode->fresh_incarnation;
+		snapshot.committed_epoch = episode->reserved_or_committed_epoch;
+		snapshot.grammar_fingerprint = episode->grammar_fingerprint;
+		valid = true;
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+	}
+
+out:
+	if (!valid && !keep_waiting)
+		cluster_reconfig_release_ready_stage();
+	LWLockRelease(&ReconfigShmem->lock);
+	return valid ? snapshot : dormant;
+}
+
+bool
+cluster_reconfig_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected)
+{
+#if 0 /* Await the frozen Startup closure-proof carrier; see active talk STOP. */
+	ClusterReplacementCommitMarkerV3 marker;
+	ClusterReplacementEpisode *episode;
+	ClusterR4PrerequisiteSnapshot candidate;
+	uint64 request_seq;
+	uint64 completion_seq;
+	uint32 next_generation;
+	bool published = false;
+
+	if (ReconfigShmem == NULL || expected == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
+		|| expected->status != CLUSTER_R4_PREREQUISITE_R4A_READY
+		|| !expected->ready || expected->reserved0[0] != 0
+		|| expected->reserved0[1] != 0 || expected->reserved0[2] != 0
+		|| expected->target_node_id != cluster_node_id
+		|| expected->episode_state_generation == 0
+		|| expected->jcmk_generation == 0
+		|| expected->request_nonce == 0
+		|| expected->old_admitted_incarnation == 0
+		|| expected->fresh_incarnation
+			   <= expected->old_admitted_incarnation
+		|| expected->committed_epoch == 0
+		|| expected->grammar_fingerprint
+			   != CLUSTER_REPLACEMENT_EPISODE_GRAMMAR_FINGERPRINT)
+		return false;
+	request_seq = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	completion_seq
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq);
+	if (request_seq == 0 || request_seq != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		return false;
+	pg_read_barrier();
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	episode = &ReconfigShmem->replacement_episode;
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase != CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| episode->readiness_flags
+			   != (CLUSTER_REPLACEMENT_EPISODE_GRD_POSTEPOCH_READY
+				   | CLUSTER_REPLACEMENT_EPISODE_INTENT_CLEARED)
+		|| episode->target_node_id != cluster_node_id
+		|| episode->reserved_or_committed_epoch
+			   != cluster_epoch_get_current()
+		|| ReconfigShmem->self_join_admitted != 0
+		|| ReconfigShmem->self_join_failed != 0
+		|| !cluster_reconfig_replacement_membership_current_locked(episode)
+		|| !cluster_replacement_episode_next_generation(
+			episode->state_generation, &next_generation)
+		|| !cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, episode->target_node_id,
+			&marker)
+		|| marker.phase
+			   != CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED
+		|| marker.ready_state_generation != 0
+		|| marker.generation == 0
+		|| marker.target_node_id != episode->target_node_id
+		|| marker.old_admitted_incarnation
+			   != episode->old_admitted_incarnation
+		|| marker.fresh_incarnation != episode->fresh_incarnation
+		|| marker.baseline_epoch != episode->baseline_epoch
+		|| marker.reserved_or_committed_epoch
+			   != episode->reserved_or_committed_epoch
+		|| marker.request_nonce != episode->request_nonce
+		|| memcmp(marker.expected_purge_survivors,
+				  episode->expected_survivors,
+				  sizeof(marker.expected_purge_survivors)) != 0
+		|| marker.grammar_fingerprint != episode->grammar_fingerprint)
+		goto out;
+
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.status = CLUSTER_R4_PREREQUISITE_R4A_READY;
+	candidate.ready = true;
+	candidate.target_node_id = episode->target_node_id;
+	candidate.episode_state_generation = next_generation;
+	candidate.jcmk_generation = marker.generation;
+	candidate.request_nonce = episode->request_nonce;
+	candidate.old_admitted_incarnation = episode->old_admitted_incarnation;
+	candidate.fresh_incarnation = episode->fresh_incarnation;
+	candidate.committed_epoch = episode->reserved_or_committed_epoch;
+	candidate.grammar_fingerprint = episode->grammar_fingerprint;
+	if (memcmp(&candidate, expected, sizeof(candidate)) != 0)
+		goto out;
+
+	episode->state_generation = next_generation;
+	episode->readiness_flags
+		|= CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY;
+	published = true;
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	return published;
+#else
+	(void)expected;
+	return false;
+#endif
+}
+
+static void
+cluster_reconfig_reset_replacement_admit_stage(void)
+{
+	memset(&replacement_admit_stage, 0, sizeof(replacement_admit_stage));
+	replacement_admit_stage.phase = CLUSTER_REPLACEMENT_ADMIT_IDLE;
+	cluster_marker_async_init(&replacement_admit_stage.marker_async);
+}
+
+static bool
+cluster_reconfig_replacement_admit_preflight(void)
+{
+	ClusterReplacementCommitMarkerV3 committed;
+	ClusterReplacementEpisode *episode;
+	uint64 request_seq;
+	uint64 completion_seq;
+	bool ready = false;
+
+	if (ReconfigShmem == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	request_seq = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	completion_seq
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq);
+	if (request_seq == 0 || request_seq != completion_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		return false;
+	pg_read_barrier();
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	episode = &ReconfigShmem->replacement_episode;
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			== request_seq
+		&& pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   == completion_seq
+		&& pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   == CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		&& cluster_replacement_episode_is_valid(episode)
+		&& (episode->phase == CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			|| episode->phase == CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		&& episode->readiness_flags
+			   == CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK
+		&& episode->coordinator_node_id == cluster_node_id
+		&& episode->reserved_or_committed_epoch
+			   == cluster_epoch_get_current()
+		&& cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, episode->target_node_id,
+			&committed)
+		&& committed.phase
+			   == CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED
+		&& committed.ready_state_generation == 0
+		&& committed.target_node_id == episode->target_node_id
+		&& committed.old_admitted_incarnation
+			   == episode->old_admitted_incarnation
+		&& committed.fresh_incarnation == episode->fresh_incarnation
+		&& committed.baseline_epoch == episode->baseline_epoch
+		&& committed.reserved_or_committed_epoch
+			   == episode->reserved_or_committed_epoch
+		&& committed.request_nonce == episode->request_nonce
+		&& memcmp(committed.expected_purge_survivors,
+				  episode->expected_survivors,
+				  sizeof(committed.expected_purge_survivors))
+			   == 0
+		&& committed.grammar_fingerprint
+			   == episode->grammar_fingerprint)
+		ready = true;
+	LWLockRelease(&ReconfigShmem->lock);
+	return ready;
+}
+
+void
+cluster_reconfig_lmon_replacement_admit_tick(void)
+{
+	static const uint8 zero_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES] = { 0 };
+	ClusterQvotecMailboxCompletion completion;
+	ClusterEpochAuthorityValue terminal_head;
+	ClusterEpochBallotId terminal_ballot;
+	ClusterQvotecMailboxSubmitStatus submit_status;
+	ClusterMarkerPollResult marker_poll;
+	uint32 marker_result = CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	TimestampTz now;
+
+	switch (replacement_admit_stage.phase) {
+	case CLUSTER_REPLACEMENT_ADMIT_IDLE:
+		if (!cluster_reconfig_replacement_admit_preflight())
+			return;
+		submit_status = cluster_qvotec_authority_lmon_submit(
+			CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD, zero_value,
+			&replacement_admit_stage.authority_request_seq);
+		if (submit_status == CLUSTER_QVOTEC_MAILBOX_SUBMIT_ACCEPTED)
+			replacement_admit_stage.phase
+				= CLUSTER_REPLACEMENT_ADMIT_PRE_HEAD_WAIT;
+		return;
+
+	case CLUSTER_REPLACEMENT_ADMIT_PRE_HEAD_WAIT:
+		if (!cluster_qvotec_authority_lmon_poll_completion(
+				replacement_admit_stage.authority_request_seq, &completion))
+			return;
+		if (completion.result != CLUSTER_QVOTEC_MAILBOX_CHOSEN
+			|| !cluster_epoch_authority_value_decode(
+				completion.completion_value,
+				CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+				&terminal_head)
+			|| !cluster_epoch_ballot_id_decode(
+				completion.completion_ballot, &terminal_ballot)
+			|| terminal_ballot.proposer_node_id != cluster_node_id
+			|| terminal_ballot.proposer_admitted_incarnation
+				   != cluster_membership_get_last_admitted_incarnation(
+					   cluster_node_id)
+			|| !cluster_reconfig_lmon_build_replacement_admitted(
+				&terminal_head, &replacement_admit_stage.admitted_marker)) {
+			cluster_reconfig_reset_replacement_admit_stage();
+			return;
+		}
+		memcpy(replacement_admit_stage.pre_head_value,
+			   completion.completion_value,
+			   sizeof(replacement_admit_stage.pre_head_value));
+		memcpy(replacement_admit_stage.pre_head_ballot,
+			   completion.completion_ballot,
+			   sizeof(replacement_admit_stage.pre_head_ballot));
+		replacement_admit_stage.phase
+			= CLUSTER_REPLACEMENT_ADMIT_MARKER_SUBMIT;
+		return;
+
+	case CLUSTER_REPLACEMENT_ADMIT_MARKER_SUBMIT:
+		{
+			ClusterReplacementCommitMarkerV3 revalidated_marker;
+
+			/* The candidate can wait one or more LMON ticks before its
+			 * majority write.  Rebuild it from the retained exact terminal
+			 * head so a capability/episode/marker drift in that window resets
+			 * the stage without writing stale ADMITTED bytes. */
+			if (!cluster_epoch_authority_value_decode(
+					replacement_admit_stage.pre_head_value,
+					CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+					&terminal_head)
+				|| !cluster_reconfig_lmon_build_replacement_admitted(
+					&terminal_head, &revalidated_marker)
+				|| !cluster_replacement_marker_v3_same_image(
+					&revalidated_marker,
+					&replacement_admit_stage.admitted_marker)) {
+				cluster_reconfig_reset_replacement_admit_stage();
+				return;
+			}
+		}
+		now = GetCurrentTimestamp();
+		if (cluster_reconfig_submit_replacement_marker_v3_async(
+				&replacement_admit_stage.marker_async,
+				replacement_admit_stage.admitted_marker.target_node_id,
+				&replacement_admit_stage.admitted_marker,
+				CLUSTER_MARKER_KIND_JOIN_COMMITTED, now))
+			replacement_admit_stage.phase
+				= CLUSTER_REPLACEMENT_ADMIT_MARKER_WAIT;
+		return;
+
+	case CLUSTER_REPLACEMENT_ADMIT_MARKER_WAIT:
+		now = GetCurrentTimestamp();
+		marker_poll = cluster_reconfig_poll_join_marker_async(
+			&replacement_admit_stage.marker_async, now, &marker_result,
+			&elapsed_us);
+		if (marker_poll == CLUSTER_MARKER_POLL_PENDING
+			|| marker_poll == CLUSTER_MARKER_POLL_IDLE)
+			return;
+		if (marker_poll != CLUSTER_MARKER_POLL_ACKED
+			|| marker_result != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
+			cluster_reconfig_reset_replacement_admit_stage();
+			return;
+		}
+		replacement_admit_stage.phase
+			= CLUSTER_REPLACEMENT_ADMIT_POST_HEAD_SUBMIT;
+		return;
+
+	case CLUSTER_REPLACEMENT_ADMIT_POST_HEAD_SUBMIT:
+		submit_status = cluster_qvotec_authority_lmon_submit(
+			CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD, zero_value,
+			&replacement_admit_stage.authority_request_seq);
+		if (submit_status == CLUSTER_QVOTEC_MAILBOX_SUBMIT_ACCEPTED)
+			replacement_admit_stage.phase
+				= CLUSTER_REPLACEMENT_ADMIT_POST_HEAD_WAIT;
+		return;
+
+	case CLUSTER_REPLACEMENT_ADMIT_POST_HEAD_WAIT:
+		if (!cluster_qvotec_authority_lmon_poll_completion(
+				replacement_admit_stage.authority_request_seq, &completion))
+			return;
+		if (completion.result == CLUSTER_QVOTEC_MAILBOX_CHOSEN
+			&& memcmp(completion.completion_value,
+					  replacement_admit_stage.pre_head_value,
+					  sizeof(completion.completion_value)) == 0
+			&& memcmp(completion.completion_ballot,
+					  replacement_admit_stage.pre_head_ballot,
+					  sizeof(completion.completion_ballot)) == 0
+			&& cluster_epoch_authority_value_decode(
+				completion.completion_value,
+				CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+				&terminal_head))
+			(void)cluster_reconfig_lmon_finalize_replacement_admitted(
+				&terminal_head, &replacement_admit_stage.admitted_marker);
+		cluster_reconfig_reset_replacement_admit_stage();
+		return;
+	}
+
+	cluster_reconfig_reset_replacement_admit_stage();
+}
+
+bool
+cluster_reconfig_publish_replacement_member_closed(
+	const ClusterReplacementEpisode *admitted_episode)
+{
+	bool current_empty;
+
+	if (ReconfigShmem == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_reconfig_is_local_admitted_replacement(admitted_episode))
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	current_empty
+		= cluster_replacement_episode_is_empty(&ReconfigShmem->replacement_episode);
+	if ((!current_empty
+		 && memcmp(&ReconfigShmem->replacement_episode, admitted_episode,
+				   sizeof(*admitted_episode)) != 0)
+		|| clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap,
+									 cluster_node_id)
+		|| cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_REMOVED) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+
+	/* A delayed duplicate after uniform OPEN must not re-close service. */
+	if (!current_empty && ReconfigShmem->self_join_admitted != 0) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+
+	cluster_write_fence_authority_cache_invalidate();
+	memcpy(&ReconfigShmem->replacement_episode, admitted_episode,
+		   sizeof(*admitted_episode));
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
+	ReconfigShmem->self_join_admitted = 0;
+	ReconfigShmem->self_join_failed = 0;
+	ReconfigShmem->self_join_deadline_us = 0;
+	LWLockRelease(&ReconfigShmem->lock);
+	return true;
+}
+
+/* Target-QVOTEC observation of the durable historical completion seal.  Disk
+ * I/O and exact-image majority selection happen before the reconfig lock; the
+ * lock then co-samples the live episode, immutable formation tuple, current
+ * epoch and publish proof before changing only MEMBER metadata. */
+bool
+cluster_reconfig_qvotec_observe_replacement_admitted(
+	const int *fds, int n_disks, uint64 live_incarnation)
+{
+	uint8 images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_JCMK_REPLACEMENT_BYTES];
+	ClusterReplacementCommitMarkerV3 admitted;
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	uint32 majority;
+	uint32 advanced = 0;
+	uint32 expected = 0;
+	int n_images = 0;
+	bool published = false;
+	int d;
+	int node;
+
+	if (ReconfigShmem == NULL || fds == NULL || n_disks <= 0
+		|| n_disks > CLUSTER_MAX_VOTING_DISKS || live_incarnation == 0
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	majority = ((uint32)n_disks / 2u) + 1u;
+	for (d = 0; d < n_disks; d++) {
+		uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
+
+		memset(slot, 0, sizeof(slot));
+		if (cluster_voting_disk_read_join_slot(
+				fds[d], (uint32)cluster_node_id, slot)
+				!= CLUSTER_VOTING_DISK_IO_OK)
+			continue;
+		memcpy(images[n_images++], slot, CLUSTER_JCMK_REPLACEMENT_BYTES);
+	}
+	if (cluster_replacement_marker_v3_select_majority(
+			images, n_images, majority, cluster_node_id, &admitted, NULL)
+		< 0
+		|| admitted.phase != CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED
+		|| admitted.fresh_incarnation != live_incarnation
+		|| admitted.ready_state_generation == 0)
+		return false;
+	if (!cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode))
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	episode = &ReconfigShmem->replacement_episode;
+	if (memcmp(episode, &capability_episode, sizeof(*episode)) != 0
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase != CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| episode->readiness_flags
+			   != CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK
+		|| episode->target_node_id != cluster_node_id
+		|| episode->state_generation != admitted.ready_state_generation
+		|| episode->old_admitted_incarnation
+			   != admitted.old_admitted_incarnation
+		|| episode->fresh_incarnation != admitted.fresh_incarnation
+		|| episode->baseline_epoch != admitted.baseline_epoch
+		|| episode->reserved_or_committed_epoch
+			   != admitted.reserved_or_committed_epoch
+		|| episode->reserved_or_committed_epoch != cluster_epoch_get_current()
+		|| episode->request_nonce != admitted.request_nonce
+		|| memcmp(episode->expected_survivors,
+				  admitted.expected_purge_survivors,
+				  sizeof(episode->expected_survivors)) != 0
+		|| episode->grammar_fingerprint != admitted.grammar_fingerprint
+		|| cluster_membership_get_state(cluster_node_id)
+			   == CLUSTER_MEMBER_REMOVED
+		|| clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap,
+									 cluster_node_id))
+		goto out;
+
+	/* Publish-proven is evaluated over the immutable pre-replacement survivor
+	 * bitmap, not caller-relative mutable membership. */
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool in_expected
+			= dead_bitmap_test_bit(episode->expected_survivors, node);
+
+		if (node == cluster_node_id)
+			continue;
+		if (in_expected) {
+			if (cluster_conf_lookup_node(node) == NULL
+				|| !cluster_membership_is_member(node))
+				goto out;
+			expected++;
+			if (cluster_reconfig_get_observed_epoch(node)
+				>= episode->reserved_or_committed_epoch)
+				advanced++;
+		} else if (cluster_membership_is_member(node))
+			goto out;
+	}
+	if (expected == 0 || advanced < ((expected / 2u) + 1u))
+		goto out;
+
+	cluster_write_fence_authority_cache_invalidate();
+	episode->phase = CLUSTER_REPLACEMENT_EPISODE_ADMITTED;
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_record_admitted(cluster_node_id,
+								 admitted.fresh_incarnation);
+	ReconfigShmem->self_join_admitted = 0;
+	ReconfigShmem->self_join_failed = 0;
+	ReconfigShmem->self_join_deadline_us = 0;
+	published = true;
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	return published;
+}
+
+bool
+cluster_reconfig_open_replacement_admission(
+	const ClusterReplacementEpisode *expected_episode,
+	uint32 expected_state_generation)
+{
+	if (ReconfigShmem == NULL || expected_state_generation == 0
+		|| !cluster_reconfig_is_local_admitted_replacement(expected_episode)
+		|| expected_episode->state_generation != expected_state_generation)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (ReconfigShmem->replacement_episode.state_generation
+			!= expected_state_generation
+		|| memcmp(&ReconfigShmem->replacement_episode, expected_episode,
+				  sizeof(*expected_episode)) != 0
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| ReconfigShmem->self_join_failed != 0) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+
+	cluster_write_fence_authority_cache_invalidate();
+	ReconfigShmem->self_join_admitted = 1;
+	ReconfigShmem->self_join_deadline_us = 0;
+	LWLockRelease(&ReconfigShmem->lock);
+	return true;
+}
+
 void
 cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
 {
+	bool replacement_admitted;
+
 	if (ReconfigShmem == NULL)
 		return;
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return;
+
+	/* The ordinary v2 callback never opens a replacement episode, including a
+	 * nonempty image that fails structural validation. */
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	replacement_admitted = cluster_reconfig_has_replacement_episode(
+		&ReconfigShmem->replacement_episode);
+	LWLockRelease(&ReconfigShmem->lock);
+	if (replacement_admitted)
 		return;
 
 	/*
@@ -1820,6 +4541,17 @@ cluster_reconfig_note_self_admitted(uint64 admitted_epoch)
 	}
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_write_fence_authority_cache_invalidate();
+	/* Close the check/use race with a concurrent replacement publisher. */
+	if (cluster_reconfig_has_replacement_episode(
+			&ReconfigShmem->replacement_episode)) {
+		ReconfigShmem->self_join_admitted = 0;
+		if (cluster_reconfig_is_local_admitted_replacement(
+				&ReconfigShmem->replacement_episode))
+			cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
+		LWLockRelease(&ReconfigShmem->lock);
+		return;
+	}
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
 	ReconfigShmem->self_join_admitted = 1;
 	ReconfigShmem->self_join_failed = 0;
@@ -1979,6 +4711,7 @@ static bool joiner_gate_decided = false;
 static void
 cluster_reconfig_joiner_self_tick(void)
 {
+	bool replacement_admitted;
 	uint64 now_us;
 
 	if (ReconfigShmem == NULL || !cluster_online_join)
@@ -1995,6 +4728,15 @@ cluster_reconfig_joiner_self_tick(void)
 	 * incarnation join (external plane, §1.3) — never by re-running this gate.
 	 */
 	if (cluster_reconfig_is_removed_unlocked(cluster_node_id))
+		return;
+
+	/* spec-5.15A: ordinary bootstrap/rejoin classification has no authority to
+	 * open or time out an exact replacement ADMITTED episode. */
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	replacement_admitted = cluster_reconfig_has_replacement_episode(
+		&ReconfigShmem->replacement_episode);
+	LWLockRelease(&ReconfigShmem->lock);
+	if (replacement_admitted)
 		return;
 
 	now_us = (uint64)GetCurrentTimestamp();
@@ -2042,6 +4784,7 @@ cluster_reconfig_joiner_self_tick(void)
 			 * join, latch a convergence deadline (-> 53R61 on timeout). */
 			joiner_gate_decided = true;
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			cluster_write_fence_authority_cache_invalidate();
 			ReconfigShmem->self_join_admitted = 0;
 			ReconfigShmem->self_join_failed = 0;
 			ReconfigShmem->self_join_deadline_us
@@ -2086,6 +4829,7 @@ cluster_reconfig_joiner_self_tick(void)
 										cluster_node_id)));
 				}
 				LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+				cluster_write_fence_authority_cache_invalidate();
 				ReconfigShmem->self_join_admitted = 0;
 				cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
 				LWLockRelease(&ReconfigShmem->lock);
@@ -2097,6 +4841,7 @@ cluster_reconfig_joiner_self_tick(void)
 			 * epoch advance does not re-close this genuine member (INV-J14). */
 			joiner_gate_decided = true;
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			cluster_write_fence_authority_cache_invalidate();
 			ReconfigShmem->self_join_admitted = 1;
 			ReconfigShmem->self_join_failed = 0;
 			ReconfigShmem->self_join_deadline_us = 0;
@@ -2111,6 +4856,7 @@ cluster_reconfig_joiner_self_tick(void)
 			 * (fail-closed) and re-evaluate next tick — a slow qvotec waits here
 			 * rather than mis-opening as bootstrap (P1-2). */
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			cluster_write_fence_authority_cache_invalidate();
 			ReconfigShmem->self_join_admitted = 0;
 			cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
 			LWLockRelease(&ReconfigShmem->lock);
@@ -2125,6 +4871,7 @@ cluster_reconfig_joiner_self_tick(void)
 		&& ReconfigShmem->self_join_deadline_us != 0
 		&& now_us >= ReconfigShmem->self_join_deadline_us) {
 		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+		cluster_write_fence_authority_cache_invalidate();
 		ReconfigShmem->self_join_failed = 1;
 		cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_REJECTED);
 		LWLockRelease(&ReconfigShmem->lock);
@@ -2222,6 +4969,7 @@ cluster_reconfig_offpath_rejoin_tick(void)
 		cluster_grd_arm_join_pcm_fence(self_set); /* fence FIRST (8.A) */
 
 		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+		cluster_write_fence_authority_cache_invalidate();
 		ReconfigShmem->self_join_admitted = 0; /* then close the write gate */
 		LWLockRelease(&ReconfigShmem->lock);
 
@@ -2275,6 +5023,7 @@ void
 cluster_reconfig_lmon_tick(void)
 {
 	uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 new_failure_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 	uint8 alive_set[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 	int32 self_id;
 	int coordinator;
@@ -2282,10 +5031,24 @@ cluster_reconfig_lmon_tick(void)
 	uint64 event_id;
 	int i;
 	bool failstop_stage_handled = false;
+	bool failure_generation_changed = false;
+	bool external_rejoin_active;
+	int32 root_gated_join_node = -1;
+	uint64 root_gated_join_incarnation = 0;
 
 	/* L20: runtime feature flag check first line. */
-	if (!cluster_enabled)
+	if (!cluster_enabled) {
+		cluster_reconfig_external_rejoin_release_all();
+		if (join_commit_stage.external_rejoin_consumed)
+			cluster_reconfig_release_join_commit_stage();
 		return;
+	}
+	external_rejoin_active = cluster_external_fence_runtime_active();
+	if (!external_rejoin_active) {
+		cluster_reconfig_external_rejoin_release_all();
+		if (join_commit_stage.external_rejoin_consumed)
+			cluster_reconfig_release_join_commit_stage();
+	}
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-tick-entry");
 
@@ -2295,12 +5058,21 @@ cluster_reconfig_lmon_tick(void)
 	 * wait_end pairing needs cleanup refactor). */
 
 	/* I2 + I8: only in_quorum nodes participate in reconfig. */
-	if (!cluster_qvotec_in_quorum())
+	if (!cluster_qvotec_in_quorum()) {
+		cluster_reconfig_external_rejoin_release_all();
+		if (join_commit_stage.external_rejoin_consumed)
+			cluster_reconfig_release_join_commit_stage();
 		return;
+	}
 
 	self_id = cluster_node_id;
-	if (self_id < 0 || self_id >= CLUSTER_MAX_NODES)
+	if (self_id < 0 || self_id >= CLUSTER_MAX_NODES) {
+		cluster_reconfig_external_rejoin_release_all();
 		return; /* defensive: bad self id, cannot participate */
+	}
+	cluster_reconfig_lmon_replacement_closed_tick();
+	cluster_reconfig_lmon_replacement_ready_tick();
+	cluster_reconfig_lmon_replacement_admit_tick();
 	failstop_stage_handled = cluster_reconfig_poll_failstop_fence_stage();
 
 	/*
@@ -2309,8 +5081,10 @@ cluster_reconfig_lmon_tick(void)
 	 * quorum).  Lock-free snapshot — the membership-state maintenance and the
 	 * survivor-set build below run under the reconfig lock.
 	 */
-	if (cluster_conf_lookup_node(self_id) == NULL)
+	if (cluster_conf_lookup_node(self_id) == NULL) {
+		cluster_reconfig_external_rejoin_release_all();
 		return; /* self un-declared — must not be coordinator */
+	}
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (i == self_id)
@@ -2321,6 +5095,7 @@ cluster_reconfig_lmon_tick(void)
 		if (cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_DEAD)
 			dead_bitmap_set_bit(dead_bitmap, i);
 	}
+	cssd_dead_generation = cluster_cssd_get_dead_generation();
 
 	/*
 	 * spec-5.15 D5 — joiner self-tick: decide (once, in the early boot window) if
@@ -2337,6 +5112,41 @@ cluster_reconfig_lmon_tick(void)
 	 * bootstrap-vs-rejoin classification is proven.  No-op on online_join=on.
 	 */
 	cluster_reconfig_offpath_rejoin_tick();
+
+	/*
+	 * Frozen STOP-02 §17.6: survivor-side observation of a durable COMMITTED
+	 * JCMK is not by itself authority to clear an excluded origin.  Select one
+	 * exact DEAD->ALIVE candidate while holding the reconfig snapshot lock, then
+	 * perform the direct-majority JCMK + ROOT owner CAS outside that lock.  The
+	 * exclusive mutation below revalidates the exact incarnation before use.
+	 * Serializing one origin per tick also preserves the one-bit JOIN clear rule.
+	 */
+	if (ReconfigShmem != NULL && cluster_online_join) {
+		uint64 candidate_incarnation = 0;
+
+		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (i == self_id || cluster_conf_lookup_node(i) == NULL
+				|| cluster_membership_get_state(i) != CLUSTER_MEMBER_DEAD
+				|| cluster_cssd_get_peer_state(i) != CLUSTER_CSSD_PEER_ALIVE)
+				continue;
+			if (cluster_reconfig_get_observed_committed_join(
+					i, &candidate_incarnation, NULL)
+				&& candidate_incarnation
+					   > cluster_membership_get_last_admitted_incarnation(i)) {
+				root_gated_join_node = i;
+				break;
+			}
+		}
+		LWLockRelease(&ReconfigShmem->lock);
+
+		if (root_gated_join_node >= 0
+			&& cluster_recovery_owner_rejoin_v1(root_gated_join_node,
+											 candidate_incarnation))
+			root_gated_join_incarnation = candidate_incarnation;
+		else
+			root_gated_join_node = -1;
+	}
 
 	/*
 	 * spec-5.15 D1 (INV-J8): the membership-state table — NOT raw CSSD — is the
@@ -2367,9 +5177,11 @@ cluster_reconfig_lmon_tick(void)
 		 * from their durable COMMITTED join marker this tick (an observer JOIN
 		 * event is published for them after the lock is released). */
 		uint8 newly_joined[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+		uint8 join_remaining_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 		bool any_joined = false;
 
 		memset(newly_joined, 0, sizeof(newly_joined));
+		memset(join_remaining_dead, 0, sizeof(join_remaining_dead));
 
 		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 
@@ -2385,8 +5197,12 @@ cluster_reconfig_lmon_tick(void)
 		if (clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap, self_id)
 			|| cluster_membership_get_state(self_id) == CLUSTER_MEMBER_REMOVED)
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_REMOVED);
-		/* self-state follows the joiner gate (D5): MEMBER when admitted / steady,
-		 * JOINING while this node is itself a joiner whose gate is closed. */
+		/* Replacement ADMITTED is a deliberate MEMBER-with-service-closed state;
+		 * do not collapse it back to ordinary JOINING merely because the shared
+		 * write byte remains zero.  Otherwise self-state follows the v2 gate. */
+		else if (cluster_reconfig_is_local_admitted_replacement(
+				 &ReconfigShmem->replacement_episode))
+			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
 		else if (ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed)
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
 		else
@@ -2416,7 +5232,8 @@ cluster_reconfig_lmon_tick(void)
 				cluster_membership_set_state(i, CLUSTER_MEMBER_DEAD);
 			else if (ms == CLUSTER_MEMBER_ABSENT)
 				cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
-			else if (cluster_online_join && ms == CLUSTER_MEMBER_DEAD
+			else if (cluster_online_join && i == root_gated_join_node
+					 && ms == CLUSTER_MEMBER_DEAD
 					 && cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_ALIVE) {
 				/*
 				 * spec-5.16 (3-node join participation) — survivor-side runtime
@@ -2432,6 +5249,7 @@ cluster_reconfig_lmon_tick(void)
 				uint64 obs_epoch = 0;
 
 				if (cluster_reconfig_get_observed_committed_join(i, &obs_inc, &obs_epoch)
+					&& obs_inc == root_gated_join_incarnation
 					&& obs_inc > cluster_membership_get_last_admitted_incarnation(i)) {
 					cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
 					cluster_membership_record_admitted(i, obs_inc);
@@ -2455,9 +5273,28 @@ cluster_reconfig_lmon_tick(void)
 		 * subsequent CSSD DEAD/ALIVE never re-triggers a reconfig nor passively
 		 * re-admits it — it is no longer a member.
 		 */
-		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++) {
+			/* STOP-02 §17.6: an older excluded origin remains fenced even if
+			 * CSSD sees its restarted process ALIVE.  Only the individually
+			 * ROOT-gated JOIN above may remove its bit. */
 			dead_bitmap[b] &= (uint8) ~(ReconfigShmem->clean_departed_bitmap[b]
-										| ReconfigShmem->removed_bitmap[b]);
+										 | ReconfigShmem->removed_bitmap[b]);
+			if (dead_bitmap[b] != 0
+				&& cssd_dead_generation
+					   != ReconfigShmem->last_applied.cssd_dead_generation)
+				failure_generation_changed = true;
+			new_failure_bitmap[b]
+				= dead_bitmap[b]
+				  & (uint8) ~ReconfigShmem->last_applied.dead_bitmap[b];
+			dead_bitmap[b] |= ReconfigShmem->last_applied.dead_bitmap[b];
+			dead_bitmap[b] &= (uint8) ~newly_joined[b];
+		}
+		if (any_joined) {
+			memcpy(join_remaining_dead, ReconfigShmem->last_applied.dead_bitmap,
+				   sizeof(join_remaining_dead));
+			join_remaining_dead[root_gated_join_node / 8]
+				&= (uint8) ~(1u << (root_gated_join_node % 8));
+		}
 
 		LWLockRelease(&ReconfigShmem->lock);
 
@@ -2474,18 +5311,13 @@ cluster_reconfig_lmon_tick(void)
 		 */
 		if (any_joined) {
 			ReconfigEvent jevt;
-			uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 			uint64 incs[CLUSTER_MAX_NODES];
 			int jn;
 
-			memset(empty_dead, 0, sizeof(empty_dead));
 			memset(incs, 0, sizeof(incs));
 			for (jn = 0; jn < CLUSTER_MAX_NODES; jn++) {
 				if (dead_bitmap_test_bit(newly_joined, jn)) {
-					uint64 oi = 0;
-
-					(void)cluster_reconfig_get_observed_committed_join(jn, &oi, NULL);
-					incs[jn] = oi;
+					incs[jn] = root_gated_join_incarnation;
 					if (cluster_reconfig_is_clean_departed(jn))
 						cluster_reconfig_clear_clean_departed(jn);
 				}
@@ -2493,11 +5325,13 @@ cluster_reconfig_lmon_tick(void)
 
 			memset(&jevt, 0, sizeof(jevt));
 			jevt.event_id = cluster_reconfig_compute_event_id_v2(
-				RECONFIG_KIND_JOIN_COMMITTED, empty_dead, newly_joined, incs,
+				RECONFIG_KIND_JOIN_COMMITTED, join_remaining_dead, newly_joined, incs,
 				cluster_cssd_get_dead_generation());
 			jevt.coordinator_node_id = self_id; /* observer; informational */
 			jevt.old_epoch = cluster_epoch_get_current();
 			jevt.new_epoch = jevt.old_epoch; /* survivor observes the bump via piggyback */
+			memcpy(jevt.dead_bitmap, join_remaining_dead,
+				   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 			memcpy(jevt.join_bitmap, newly_joined, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 			jevt.applied_at = GetCurrentTimestamp();
 			jevt.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
@@ -2506,6 +5340,7 @@ cluster_reconfig_lmon_tick(void)
 			cluster_reconfig_publish_event(&jevt);
 		}
 	} else {
+		memcpy(new_failure_bitmap, dead_bitmap, sizeof(new_failure_bitmap));
 		dead_bitmap_set_bit(alive_set, self_id);
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			if (i == self_id)
@@ -2523,19 +5358,22 @@ cluster_reconfig_lmon_tick(void)
 	 * both directions use it.
 	 */
 	coordinator = dead_bitmap_lowest_bit_set(alive_set);
-	if (coordinator < 0)
+	if (coordinator < 0) {
+		cluster_reconfig_external_rejoin_release_all();
 		return; /* total cluster failure;fail-closed already via QVOTEC */
+	}
 
 	/*
 	 * §3.5 ordering: handle the leave/death edge FIRST (it shrinks the MEMBER set,
 	 * stabilizing the survivor base), THEN the join edge.  Each is an independent
 	 * ReconfigEvent; neither early-returns past the other.
 	 */
-	if (!failstop_stage_handled && !dead_bitmap_is_zero(dead_bitmap)) {
+	if (!failstop_stage_handled
+		&& (!dead_bitmap_is_zero(new_failure_bitmap)
+			|| failure_generation_changed)) {
 		CLUSTER_INJECTION_POINT("cluster-reconfig-decide-coordinator");
 
 		/* §3.2 P1.2: event_id from dead_bitmap + dead_generation snapshot. */
-		cssd_dead_generation = cluster_cssd_get_dead_generation();
 		event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);
 
 		/* Dedup against last_applied.  Same dead_bitmap within one DEAD episode →
@@ -2597,8 +5435,16 @@ cluster_reconfig_lmon_tick(void)
 	 * retry next tick once the leave finishes; the leave side symmetrically refuses
 	 * to start while a join is pending.
 	 */
-	if (cluster_online_join && self_id == coordinator && !cluster_clean_leave_in_progress())
+	if (cluster_online_join && self_id == coordinator &&
+		!cluster_clean_leave_in_progress()) {
+		if (external_rejoin_active)
+			cluster_reconfig_external_rejoin_tick();
 		cluster_reconfig_drive_joins(coordinator);
+	} else {
+		cluster_reconfig_external_rejoin_release_all();
+		if (join_commit_stage.external_rejoin_consumed)
+			cluster_reconfig_release_join_commit_stage();
+	}
 }
 
 
@@ -2663,9 +5509,19 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	uint64 old_epoch, new_epoch;
 	XLogRecPtr lsn;
 	ReconfigEvent evt;
+	ReconfigEvent previous;
+	uint8 full_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	int b;
 
 	if (!cluster_enabled)
 		return;
+	memcpy(full_dead, dead_bitmap, sizeof(full_dead));
+	if (ReconfigShmem != NULL) {
+		memset(&previous, 0, sizeof(previous));
+		cluster_reconfig_get_last_event(&previous);
+		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+			full_dead[b] |= previous.dead_bitmap[b];
+	}
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-epoch-bump-pre");
 
@@ -2677,7 +5533,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * fence-off paths (they either hand off to the local staged flag or publish
 	 * within this same call with no intervening tick).
 	 */
-	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 1);
+	cluster_reconfig_set_prebump_sync_active(1);
 
 	/* D18:  atomic CAS-loop increment.  Returns pre/post snapshots. */
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
@@ -2725,11 +5581,11 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	cluster_tt_status_flush_all((uint32)new_epoch);
 
 	memset(&evt, 0, sizeof(evt));
-	evt.event_id = cluster_reconfig_compute_event_id(dead_bitmap, cssd_dead_generation);
+	evt.event_id = cluster_reconfig_compute_event_id(full_dead, cssd_dead_generation);
 	evt.coordinator_node_id = coordinator_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
-	memcpy(evt.dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	memcpy(evt.dead_bitmap, full_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
 	evt.cssd_dead_generation = cssd_dead_generation;
@@ -2760,7 +5616,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 		marker.fence_event_id = evt.event_id; /* identity only */
 		marker.fence_generation = cssd_dead_generation;
 		marker.issuer_node_id = coordinator_node_id;
-		memcpy(marker.fenced_dead_bitmap, dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+		memcpy(marker.fenced_dead_bitmap, full_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 		/*
 		 * spec-5.18 INV-LF10: when there ARE permanently-removed nodes, every
 		 * reconfig-issued fence marker must also carry them, so a later fail-stop
@@ -2780,10 +5636,9 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 
 		/*
 		 * The async stage is process-local by design and is driven only by LMON
-		 * ticks.  Test-only backend callers, such as
-		 * cluster_reconfig_inject_dead_node_test(), would otherwise stage the marker
-		 * in their own process and return with no LMON-visible pending publish
-		 * record.  Keep those non-LMON paths on the old bounded wait: they are not
+		 * ticks.  Non-LMON backend callers would otherwise stage the marker in their
+		 * own process and return with no LMON-visible pending publish record.  Keep
+		 * those non-LMON paths on the old bounded wait: they are not
 		 * transport-liveness actors, so this does not reintroduce the BUG-C1 LMON
 		 * park.
 		 */
@@ -2796,13 +5651,13 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 									 "majority for epoch %llu; not publishing reconfig event "
 									 "(write-fenced, will retry)",
 									 (unsigned long long)new_epoch)));
-				pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+				cluster_reconfig_set_prebump_sync_active(0);
 				return;
 			}
 
 			cluster_reconfig_publish_event(&evt);
 			cluster_reconfig_log_failstop_epoch_bump(&evt);
-			pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+			cluster_reconfig_set_prebump_sync_active(0);
 			return;
 		}
 
@@ -2814,7 +5669,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 												  CLUSTER_MARKER_KIND_FENCE_FAILSTOP,
 												  coordinator_node_id, GetCurrentTimestamp());
 		/* LMON path: the local staged flag now covers the pending window. */
-		pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+		cluster_reconfig_set_prebump_sync_active(0);
 		return; /* fail-closed until the staged marker is majority-durable */
 	}
 
@@ -2832,7 +5687,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	cluster_reconfig_log_failstop_epoch_bump(&evt);
 
 	/* spec-2.29a r2 t/274: fence-off path published within this call. */
-	pg_atomic_write_u32(&ReconfigShmem->prebump_sync_active, 0);
+	cluster_reconfig_set_prebump_sync_active(0);
 }
 
 
@@ -2862,6 +5717,8 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
 	uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
 	uint64 cssd_dead_generation;
 	ReconfigEvent evt;
+	ReconfigEvent previous;
+	int b;
 
 	if (!cluster_enabled || ReconfigShmem == NULL)
 		return 0;
@@ -2871,6 +5728,10 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
 	/* inject points for the clean-leave path are D12 (spec-5.13 S7). */
 
 	dead_bitmap_set_bit(dead_bitmap, leaving_node_id);
+	memset(&previous, 0, sizeof(previous));
+	cluster_reconfig_get_last_event(&previous);
+	for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		dead_bitmap[b] |= previous.dead_bitmap[b];
 	cssd_dead_generation = cluster_cssd_get_dead_generation();
 
 	/*
@@ -2932,8 +5793,9 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
  *	removed_bitmap + removal_event_id (R14 — never deduped even when dead_bitmap is
  *	unchanged), then records the node removed (removed_bitmap + epoch, masking it
  *	out of effective_dead) and shrinks membership_state to REMOVED.  The published
- *	event's dead_bitmap is empty: the removed node already departed (clean-left /
- *	fail-stopped), so this is a membership change, not a new death.  Returns the
+	 *	event's dead_bitmap retains the previously applied DEAD set: the removed node
+	 *	is a membership change, but a later baseline must not release unrelated
+	 *	excluded origins.  Returns the
  *	new epoch, or 0 if the guarded advance lost (a real death intruded — the driver
  *	ABORTED_ESCALATEs, pre-SHRUNK).
  */
@@ -2944,10 +5806,12 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 {
 	uint64 old_epoch, new_epoch;
 	XLogRecPtr lsn;
-	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 current_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint8 removed_with_n[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint8 excluded_with_n[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 	uint64 cssd_dead_generation;
 	ReconfigEvent evt;
+	int b;
 
 	/*
 	 * *out_contest distinguishes the two zero-returns for the driver (P1-A): a lost
@@ -2989,8 +5853,21 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 	/* R14: event_id folds the removed set (current removed_bitmap | {N}) + the
 	 * per-attempt removal_event_id, so a clean-left removal (dead_bitmap unchanged)
 	 * still produces a distinct, non-deduped id. */
-	cluster_reconfig_snapshot_removed_bitmap(removed_with_n);
+	/* Frozen §17.6 marker-producer rule: take the currently applied DEAD set
+	 * and durable REMOVED set from one reconfig-lock snapshot, then add this
+	 * not-yet-applied removal delta.  A NODE_REMOVED marker is an authority
+	 * image for the full excluded set, not merely the event-local delta. */
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	memcpy(current_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(current_dead));
+	memcpy(removed_with_n, ReconfigShmem->removed_bitmap,
+		   sizeof(removed_with_n));
+	for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
+		excluded_with_n[b] = ReconfigShmem->last_applied.dead_bitmap[b]
+							  | ReconfigShmem->removed_bitmap[b];
+	LWLockRelease(&ReconfigShmem->lock);
 	removed_with_n[removed_node_id / 8] |= (uint8)(1u << (removed_node_id % 8));
+	excluded_with_n[removed_node_id / 8] |= (uint8)(1u << (removed_node_id % 8));
 
 	/*
 	 * INV-LF2 (fence-before-shrink): arm the 4.12 write fence for the removed node
@@ -3014,16 +5891,15 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 		marker.fence_generation = cssd_dead_generation;
 		marker.issuer_node_id = cluster_node_id;
 		marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_NODE_REMOVED;
-		/* fenced set = removed (already includes N) — the removal needs only N fenced;
-		 * a concurrent dead set, if any, is carried by its own fail-stop fence. */
-		memcpy(marker.fenced_dead_bitmap, removed_with_n, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+		memcpy(marker.fenced_dead_bitmap, excluded_with_n,
+			   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 
 		node_removed_fence_stage.event.event_id
 			= cluster_reconfig_compute_removal_event_id(removed_with_n, removal_event_id);
 		node_removed_fence_stage.event.coordinator_node_id = cluster_node_id;
 		node_removed_fence_stage.event.old_epoch = old_epoch;
 		node_removed_fence_stage.event.new_epoch = new_epoch;
-		memcpy(node_removed_fence_stage.event.dead_bitmap, empty_dead,
+		memcpy(node_removed_fence_stage.event.dead_bitmap, current_dead,
 			   CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 		node_removed_fence_stage.event.applied_at = GetCurrentTimestamp();
 		node_removed_fence_stage.event.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
@@ -3046,7 +5922,7 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 	evt.coordinator_node_id = cluster_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
-	memcpy(evt.dead_bitmap, empty_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
+	memcpy(evt.dead_bitmap, current_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
 	evt.cssd_dead_generation = cssd_dead_generation;
@@ -3078,6 +5954,801 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 
 static uint64 join_qvotec_inflight_marker_seq = 0;
 static uint64 join_qvotec_last_processed_marker_seq = 0;
+static ClusterJoinMarkerMailboxOperationV1 join_qvotec_inflight_marker_operation
+	= CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT;
+static bool join_qvotec_marker_inflight = false;
+
+bool
+cluster_reconfig_qvotec_lifecycle_transition(
+	ClusterQvotecMailbox *authority_mailbox,
+	pg_atomic_uint32 *qvotec_status, ClusterQvotecStatus next_status)
+{
+	bool invalidate;
+
+	if (ReconfigShmem == NULL || authority_mailbox == NULL
+		|| qvotec_status == NULL
+		|| (next_status != CLUSTER_QVOTEC_STARTING
+			&& next_status != CLUSTER_QVOTEC_READY
+			&& next_status != CLUSTER_QVOTEC_SHUTTING_DOWN
+			&& next_status != CLUSTER_QVOTEC_DOWN))
+		return false;
+	invalidate = next_status == CLUSTER_QVOTEC_STARTING
+				 || next_status == CLUSTER_QVOTEC_SHUTTING_DOWN;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	pg_atomic_write_u32(qvotec_status, (uint32)next_status);
+	if (invalidate) {
+		cluster_qvotec_mailbox_restart_reset(authority_mailbox);
+		pg_atomic_write_u32(&ReconfigShmem->join_marker_result,
+							CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
+		pg_atomic_write_u64(&ReconfigShmem->join_marker_completion_seq, 0);
+		pg_write_barrier();
+		join_qvotec_inflight_marker_seq = 0;
+		join_qvotec_last_processed_marker_seq = 0;
+		join_qvotec_inflight_marker_operation
+			= CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT;
+		join_qvotec_marker_inflight = false;
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+	if (invalidate)
+		cluster_lmon_marker_complete_wakeup();
+	return true;
+}
+
+static bool
+cluster_reconfig_join_marker_request_word_encode(
+	ClusterJoinMarkerMailboxOperationV1 operation, int32 target_node,
+	uint32 *word_out)
+{
+	uint32 word;
+
+	if (word_out == NULL || target_node < 0 || target_node >= CLUSTER_MAX_NODES
+		|| (operation != CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT
+			&& operation
+				   != CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED))
+		return false;
+	word = (uint32)target_node;
+	if (operation == CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED)
+		word |= CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED;
+	*word_out = word;
+	return true;
+}
+
+static bool
+cluster_reconfig_join_marker_request_word_decode(
+	uint32 word, ClusterJoinMarkerMailboxOperationV1 *operation_out,
+	int32 *target_node_out)
+{
+	uint32 target;
+
+	if (operation_out == NULL || target_node_out == NULL
+		|| (word & CLUSTER_JOIN_MARKER_REQUEST_RESERVED_MASK) != 0)
+		return false;
+	target = word & CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK;
+	if (target >= CLUSTER_MAX_NODES)
+		return false;
+	*operation_out
+		= (word & CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED) != 0
+			  ? CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED
+			  : CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT;
+	*target_node_out = (int32)target;
+	return true;
+}
+
+/*
+ * Stage one already-encoded region-3 marker image.  The embedded marker
+ * version selects the only two supported exact lengths; no discriminator is
+ * added to shared memory or to the disk image.  The request-sequence publish
+ * remains the caller's commit point.
+ */
+static bool
+cluster_reconfig_stage_join_marker_locked(
+	int32 target_node, ClusterJoinMarkerMailboxOperationV1 operation,
+	uint32 version, const void *image, Size image_len)
+{
+	Size expected_len;
+	uint32 request_word;
+
+	if (ReconfigShmem == NULL
+		|| !cluster_reconfig_join_marker_request_word_encode(
+			operation, target_node, &request_word))
+		return false;
+
+	if (operation == CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED) {
+		if (image != NULL || image_len != 0 || version != 0)
+			return false;
+		ReconfigShmem->join_marker_request_word = request_word;
+		memset(ReconfigShmem->join_pending_marker, 0,
+			   sizeof(ReconfigShmem->join_pending_marker));
+		return true;
+	}
+	if (image == NULL)
+		return false;
+
+	switch (version) {
+	case CLUSTER_JCMK_VERSION:
+		expected_len = sizeof(ClusterJoinCommitMarker);
+		break;
+	case CLUSTER_JCMK_REPLACEMENT_VERSION:
+		expected_len = CLUSTER_JCMK_REPLACEMENT_BYTES;
+		break;
+	default:
+		return false;
+	}
+	if (image_len != expected_len)
+		return false;
+
+	ReconfigShmem->join_marker_request_word = request_word;
+	memset(ReconfigShmem->join_pending_marker, 0,
+		   sizeof(ReconfigShmem->join_pending_marker));
+	memcpy(ReconfigShmem->join_pending_marker, image, image_len);
+	return true;
+}
+
+static void
+cluster_reconfig_release_ready_stage(void)
+{
+	if (join_marker_lmon_owner.reserved
+		&& join_marker_lmon_owner.purpose
+			   == CLUSTER_JOIN_MARKER_LMON_READY_SERIALIZE)
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+	memset(&replacement_ready_stage, 0,
+		   sizeof(replacement_ready_stage));
+	cluster_marker_async_init(&replacement_ready_stage.marker_async);
+}
+
+static bool
+cluster_reconfig_lmon_submit_ready_observer_pair(TimestampTz now)
+{
+	static const uint8 zero_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES] = { 0 };
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	ClusterQvotecMailboxSubmitStatus authority_status;
+	struct Latch *qlatch;
+	bool marker_submitted;
+	int wait_ms;
+
+	if (!cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode))
+		return false;
+	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	episode = &ReconfigShmem->replacement_episode;
+	if (cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
+		|| memcmp(episode, &capability_episode, sizeof(*episode)) != 0
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase
+				!= CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| (episode->readiness_flags
+			& CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY) == 0
+		|| episode->state_generation == 0
+		|| episode->target_node_id != cluster_node_id
+		|| episode->reserved_or_committed_epoch
+			   != cluster_epoch_get_current()
+		|| ReconfigShmem->self_join_admitted != 0
+		|| ReconfigShmem->self_join_failed != 0
+		|| !cluster_reconfig_replacement_membership_current_locked(episode)
+		|| cluster_membership_get_last_admitted_incarnation(
+			   episode->target_node_id)
+			   != episode->old_admitted_incarnation
+		|| join_marker_lmon_owner.reserved
+		|| cluster_marker_async_mailbox_busy(
+			&ReconfigShmem->join_marker_request_seq,
+			&ReconfigShmem->join_marker_completion_seq)) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+
+	join_marker_lmon_owner.reserved = true;
+	join_marker_lmon_owner.purpose
+		= CLUSTER_JOIN_MARKER_LMON_READY_SERIALIZE;
+	join_marker_lmon_owner.operation
+		= CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED;
+	join_marker_lmon_owner.marker_request_seq = 0;
+	authority_status = cluster_qvotec_authority_lmon_submit(
+		CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD, zero_value,
+		&replacement_ready_stage.authority_request_seq);
+	if (authority_status != CLUSTER_QVOTEC_MAILBOX_SUBMIT_ACCEPTED) {
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	if (!cluster_reconfig_stage_join_marker_locked(
+			episode->target_node_id,
+			CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED,
+			0, NULL, 0)) {
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+		replacement_ready_stage.phase
+			= CLUSTER_REPLACEMENT_READY_STAGE_DRAIN_AUTHORITY;
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	marker_submitted = cluster_marker_async_submit(
+		&replacement_ready_stage.marker_async,
+		&ReconfigShmem->join_marker_request_seq,
+		&ReconfigShmem->join_marker_completion_seq, NULL, now,
+		(uint64)wait_ms * 1000ULL,
+		CLUSTER_MARKER_KIND_REPLACEMENT_VERIFY_COMMITTED_CLOSED,
+		episode->target_node_id);
+	if (!marker_submitted) {
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+		replacement_ready_stage.phase
+			= CLUSTER_REPLACEMENT_READY_STAGE_DRAIN_AUTHORITY;
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	replacement_ready_stage.marker_request_seq
+		= replacement_ready_stage.marker_async.inflight_seq;
+	join_marker_lmon_owner.marker_request_seq
+		= replacement_ready_stage.marker_request_seq;
+	replacement_ready_stage.marker_completed = false;
+	replacement_ready_stage.phase
+		= CLUSTER_REPLACEMENT_READY_STAGE_WAIT_PAIR;
+	qlatch = ReconfigShmem->join_qvotec_latch;
+	LWLockRelease(&ReconfigShmem->lock);
+	if (qlatch != NULL)
+		SetLatch(qlatch);
+	return true;
+}
+
+static bool
+cluster_reconfig_lmon_ready_cache_current(int32 *coordinator_node_id)
+{
+	ClusterQvotecMailboxCompletion completion;
+	ClusterQvotecMailboxCompletion repeated_completion;
+	ClusterEpochAuthorityValue head;
+	ClusterEpochBallotId ballot;
+	ClusterReplacementCommitMarkerV3 marker;
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	ClusterJoinMarkerMailboxOperationV1 operation;
+	uint32 request_word;
+	int32 request_target;
+	bool valid = false;
+
+	if (coordinator_node_id == NULL
+		|| replacement_ready_stage.phase
+			   != CLUSTER_REPLACEMENT_READY_STAGE_CACHED
+		|| !cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode)) {
+		cluster_reconfig_release_ready_stage();
+		return false;
+	}
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	episode = &ReconfigShmem->replacement_episode;
+	if (join_marker_lmon_owner.reserved
+		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
+		|| memcmp(episode, &capability_episode, sizeof(*episode)) != 0
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| (episode->phase
+				!= CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED
+			&& episode->phase != CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH)
+		|| (episode->readiness_flags
+			& CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY) == 0
+		|| episode->target_node_id != cluster_node_id
+		|| episode->target_node_id
+			   != replacement_ready_stage.cached_snapshot.target_node_id
+		|| episode->state_generation
+			   != replacement_ready_stage.cached_snapshot.episode_state_generation
+		|| episode->request_nonce
+			   != replacement_ready_stage.cached_snapshot.request_nonce
+		|| episode->old_admitted_incarnation
+			   != replacement_ready_stage.cached_snapshot.old_admitted_incarnation
+		|| episode->fresh_incarnation
+			   != replacement_ready_stage.cached_snapshot.fresh_incarnation
+		|| episode->reserved_or_committed_epoch
+			   != replacement_ready_stage.cached_snapshot.committed_epoch
+		|| episode->grammar_fingerprint
+			   != replacement_ready_stage.cached_snapshot.grammar_fingerprint
+		|| episode->reserved_or_committed_epoch
+			   != cluster_epoch_get_current()
+		|| ReconfigShmem->self_join_admitted != 0
+		|| ReconfigShmem->self_join_failed != 0
+		|| !cluster_reconfig_replacement_membership_current_locked(episode)
+		|| cluster_membership_get_last_admitted_incarnation(
+			   episode->target_node_id)
+			   != episode->old_admitted_incarnation
+		|| !cluster_qvotec_authority_lmon_poll_completion(
+			replacement_ready_stage.authority_request_seq,
+			&completion)
+		|| completion.result != CLUSTER_QVOTEC_MAILBOX_CHOSEN
+		|| completion.actor_phase != CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B
+		|| !cluster_epoch_authority_value_decode(
+			completion.completion_value,
+			CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, &head)
+		|| !cluster_epoch_ballot_id_decode(
+			completion.completion_ballot, &ballot)
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			   != replacement_ready_stage.marker_request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != replacement_ready_stage.marker_request_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK)
+		goto out;
+	request_word = ReconfigShmem->join_marker_request_word;
+	if (!cluster_reconfig_join_marker_request_word_decode(
+			request_word, &operation, &request_target)
+		|| operation
+			   != CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED
+		|| request_target != episode->target_node_id
+		|| !cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, request_target, &marker)
+		|| marker.generation
+			   != replacement_ready_stage.cached_snapshot.jcmk_generation
+		|| !cluster_reconfig_terminal_closed_matches_episode(
+			&head, &ballot, &marker, episode)
+		|| !cluster_qvotec_authority_lmon_poll_completion(
+			replacement_ready_stage.authority_request_seq,
+			&repeated_completion)
+		|| memcmp(&completion, &repeated_completion,
+				  sizeof(completion)) != 0
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			   != replacement_ready_stage.marker_request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != replacement_ready_stage.marker_request_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK
+		|| ReconfigShmem->join_marker_request_word != request_word
+		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY)
+		goto out;
+	*coordinator_node_id = episode->coordinator_node_id;
+	valid = true;
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	if (!valid)
+		cluster_reconfig_release_ready_stage();
+	return valid;
+}
+
+/* Formation-LMON-only coherent projection of the admitted MEMBER SSOT. */
+bool
+cluster_reconfig_lmon_snapshot_admitted_membership(
+	uint64 *out_members_lo, uint64 *out_members_hi,
+	uint64 *out_formation_epoch)
+{
+	uint64 members_lo = 0;
+	uint64 members_hi = 0;
+	uint64 formation_epoch;
+	int node;
+
+	if (out_members_lo != NULL)
+		*out_members_lo = 0;
+	if (out_members_hi != NULL)
+		*out_members_hi = 0;
+	if (out_formation_epoch != NULL)
+		*out_formation_epoch = 0;
+	if (ReconfigShmem == NULL || out_members_lo == NULL
+		|| out_members_hi == NULL || out_formation_epoch == NULL)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	formation_epoch = cluster_epoch_get_current();
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if (!cluster_membership_is_member(node))
+			continue;
+		if (node < 64)
+			members_lo |= UINT64_C(1) << node;
+		else
+			members_hi |= UINT64_C(1) << (node - 64);
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if ((members_lo | members_hi) == 0)
+		return false;
+	*out_members_lo = members_lo;
+	*out_members_hi = members_hi;
+	*out_formation_epoch = formation_epoch;
+	return true;
+}
+
+static void
+cluster_reconfig_release_closed_stage(void)
+{
+	if (join_marker_lmon_owner.reserved
+		&& join_marker_lmon_owner.purpose
+			   == CLUSTER_JOIN_MARKER_LMON_CLOSED_APPLY)
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+	memset(&replacement_closed_stage, 0,
+		   sizeof(replacement_closed_stage));
+	cluster_marker_async_init(&replacement_closed_stage.marker_async);
+}
+
+static bool
+cluster_reconfig_lmon_submit_closed_observer_pair(TimestampTz now)
+{
+	static const uint8 zero_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES] = { 0 };
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode *episode;
+	ClusterQvotecMailboxSubmitStatus authority_status;
+	struct Latch *qlatch;
+	bool marker_submitted;
+	int wait_ms;
+
+	if (!cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode))
+		return false;
+	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	episode = &ReconfigShmem->replacement_episode;
+	if (cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
+		|| memcmp(episode, &capability_episode, sizeof(*episode)) != 0
+		|| !cluster_replacement_episode_is_valid(episode)
+		|| episode->phase != CLUSTER_REPLACEMENT_EPISODE_PURGE_COMPLETE
+		|| episode->readiness_flags != 0
+		|| memcmp(episode->acknowledgements,
+				  episode->expected_survivors,
+				  sizeof(episode->acknowledgements)) != 0
+		|| (cluster_node_id != episode->target_node_id
+			&& !dead_bitmap_test_bit(
+				episode->expected_survivors, cluster_node_id))
+		|| !cluster_reconfig_replacement_membership_current_locked(episode)
+		|| cluster_membership_get_last_admitted_incarnation(
+			   episode->target_node_id)
+			   != episode->old_admitted_incarnation
+		|| cluster_epoch_get_current() != episode->baseline_epoch
+		|| join_marker_lmon_owner.reserved
+		|| cluster_marker_async_mailbox_busy(
+			&ReconfigShmem->join_marker_request_seq,
+			&ReconfigShmem->join_marker_completion_seq)) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+
+	join_marker_lmon_owner.reserved = true;
+	join_marker_lmon_owner.purpose
+		= CLUSTER_JOIN_MARKER_LMON_CLOSED_APPLY;
+	join_marker_lmon_owner.operation
+		= CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED;
+	join_marker_lmon_owner.marker_request_seq = 0;
+	authority_status = cluster_qvotec_authority_lmon_submit(
+		CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD, zero_value,
+		&replacement_closed_stage.authority_request_seq);
+	if (authority_status != CLUSTER_QVOTEC_MAILBOX_SUBMIT_ACCEPTED) {
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	if (!cluster_reconfig_stage_join_marker_locked(
+			episode->target_node_id,
+			CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED,
+			0, NULL, 0)) {
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+		replacement_closed_stage.phase
+			= CLUSTER_REPLACEMENT_CLOSED_STAGE_DRAIN_AUTHORITY;
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	marker_submitted = cluster_marker_async_submit(
+		&replacement_closed_stage.marker_async,
+		&ReconfigShmem->join_marker_request_seq,
+		&ReconfigShmem->join_marker_completion_seq, NULL, now,
+		(uint64)wait_ms * 1000ULL,
+		CLUSTER_MARKER_KIND_REPLACEMENT_VERIFY_COMMITTED_CLOSED,
+		episode->target_node_id);
+	if (!marker_submitted) {
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+		replacement_closed_stage.phase
+			= CLUSTER_REPLACEMENT_CLOSED_STAGE_DRAIN_AUTHORITY;
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	join_marker_lmon_owner.marker_request_seq
+		= replacement_closed_stage.marker_async.inflight_seq;
+	replacement_closed_stage.marker_completed = false;
+	replacement_closed_stage.phase
+		= CLUSTER_REPLACEMENT_CLOSED_STAGE_WAIT_PAIR;
+	qlatch = ReconfigShmem->join_qvotec_latch;
+	LWLockRelease(&ReconfigShmem->lock);
+	if (qlatch != NULL)
+		SetLatch(qlatch);
+	return true;
+}
+
+static bool
+cluster_reconfig_terminal_closed_matches_episode(
+	const ClusterEpochAuthorityValue *head,
+	const ClusterEpochBallotId *ballot,
+	const ClusterReplacementCommitMarkerV3 *marker,
+	const ClusterReplacementEpisode *episode)
+{
+	uint8 subject[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+
+	if (head == NULL || ballot == NULL || marker == NULL || episode == NULL)
+		return false;
+	subject[episode->target_node_id / 8]
+		= (uint8)(1u << (episode->target_node_id % 8));
+	return head->transition == CLUSTER_EPOCH_AUTHORITY_COMMIT_CLOSED
+		   && head->event_kind
+				  == CLUSTER_EPOCH_EVENT_SAME_NODE_REPLACEMENT
+		   && head->request_origin_node == episode->target_node_id
+		   && head->target_node_id == episode->target_node_id
+		   && head->baseline_epoch == episode->baseline_epoch
+		   && head->reserved_epoch
+				  == episode->reserved_or_committed_epoch
+		   && head->old_incarnation
+				  == episode->old_admitted_incarnation
+		   && head->fresh_incarnation == episode->fresh_incarnation
+		   && head->request_nonce == episode->request_nonce
+		   && memcmp(head->authority_member_bitmap,
+					 episode->expected_survivors,
+					 sizeof(head->authority_member_bitmap)) == 0
+		   && memcmp(head->event_subject_bitmap, subject,
+					 sizeof(subject)) == 0
+		   && head->grammar_fingerprint == episode->grammar_fingerprint
+		   && ballot->proposer_node_id == episode->coordinator_node_id
+		   && ballot->proposer_admitted_incarnation
+				  == cluster_membership_get_last_admitted_incarnation(
+					 episode->coordinator_node_id)
+		   && marker->phase
+				  == CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED
+		   && marker->ready_state_generation == 0
+		   && marker->target_node_id == episode->target_node_id
+		   && marker->old_admitted_incarnation
+				  == episode->old_admitted_incarnation
+		   && marker->fresh_incarnation == episode->fresh_incarnation
+		   && marker->baseline_epoch == episode->baseline_epoch
+		   && marker->reserved_or_committed_epoch
+				  == episode->reserved_or_committed_epoch
+		   && marker->request_nonce == episode->request_nonce
+		   && memcmp(marker->expected_purge_survivors,
+					 episode->expected_survivors,
+					 sizeof(marker->expected_purge_survivors)) == 0
+		   && marker->grammar_fingerprint == episode->grammar_fingerprint;
+}
+
+ClusterReplacementCommittedClosedPublishResultV1
+cluster_reconfig_lmon_publish_replacement_committed_closed(
+	uint64 authority_request_seq, uint64 marker_request_seq)
+{
+	ClusterReplacementCommittedClosedPublishResultV1 result
+		= CLUSTER_REPLACEMENT_CLOSED_RETRY;
+	ClusterQvotecMailboxCompletion completion;
+	ClusterEpochAuthorityValue head;
+	ClusterEpochBallotId ballot;
+	ClusterReplacementCommitMarkerV3 marker;
+	ClusterReplacementEpisode capability_episode;
+	ClusterReplacementEpisode candidate;
+	ClusterJoinMarkerMailboxOperationV1 operation;
+	ReconfigEvent event;
+	ReconfigEvent expected_event;
+	uint32 next_generation;
+	uint32 request_word;
+	int32 request_target;
+	int32 observer_role;
+	uint64 current_epoch;
+	bool release_owner = true;
+
+	if (ReconfigShmem == NULL || MyBackendType != B_LMON
+		|| authority_request_seq == 0
+		|| (authority_request_seq & UINT64_C(1)) != 0
+		|| marker_request_seq == 0)
+		return CLUSTER_REPLACEMENT_CLOSED_INVALID;
+	if (!cluster_reconfig_replacement_candidate2_capabilities_current(
+			&capability_episode))
+		return CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!join_marker_lmon_owner.reserved
+		|| join_marker_lmon_owner.purpose
+			   != CLUSTER_JOIN_MARKER_LMON_CLOSED_APPLY
+		|| join_marker_lmon_owner.marker_request_seq != marker_request_seq) {
+		result = CLUSTER_REPLACEMENT_CLOSED_RETRY;
+		goto out;
+	}
+	if (cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY) {
+		result = CLUSTER_REPLACEMENT_CLOSED_RETRY;
+		goto out;
+	}
+	if (!cluster_qvotec_authority_lmon_poll_completion(
+			authority_request_seq, &completion)) {
+		result = CLUSTER_REPLACEMENT_CLOSED_BLOCKED_QVOTEC;
+		release_owner = false;
+		goto out;
+	}
+	if (completion.result != CLUSTER_QVOTEC_MAILBOX_CHOSEN
+		|| !cluster_epoch_authority_value_decode(
+			completion.completion_value,
+			CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, &head)
+		|| !cluster_epoch_ballot_id_decode(
+			completion.completion_ballot, &ballot)) {
+		result = CLUSTER_REPLACEMENT_CLOSED_BLOCKED_QVOTEC;
+		goto out;
+	}
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= marker_request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != marker_request_seq
+		|| pg_atomic_read_u32(&ReconfigShmem->join_marker_result)
+			   != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
+		result = CLUSTER_REPLACEMENT_CLOSED_BLOCKED_JCMK;
+		release_owner = false;
+		goto out;
+	}
+	request_word = ReconfigShmem->join_marker_request_word;
+	if (!cluster_reconfig_join_marker_request_word_decode(
+			request_word, &operation, &request_target)
+		|| operation != join_marker_lmon_owner.operation
+		|| !((completion.actor_phase
+					 == CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B
+				 && operation
+						== CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED)
+			|| (completion.actor_phase
+						== CLUSTER_QVOTEC_ACTOR_SETTLE_WRITE
+					&& operation
+						== CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT))) {
+		result = CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+		goto out;
+	}
+	if (!cluster_replacement_marker_v3_decode(
+			ReconfigShmem->join_pending_marker, request_target, &marker)) {
+		result = CLUSTER_REPLACEMENT_CLOSED_BLOCKED_JCMK;
+		goto out;
+	}
+	if (memcmp(&ReconfigShmem->replacement_episode,
+			   &capability_episode, sizeof(capability_episode)) != 0
+		|| !cluster_replacement_episode_is_valid(
+			&ReconfigShmem->replacement_episode)
+		|| (ReconfigShmem->replacement_episode.phase
+				!= CLUSTER_REPLACEMENT_EPISODE_PURGE_COMPLETE
+			&& ReconfigShmem->replacement_episode.phase
+					   != CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED)
+		|| ReconfigShmem->replacement_episode.readiness_flags != 0
+		|| memcmp(ReconfigShmem->replacement_episode.acknowledgements,
+				  ReconfigShmem->replacement_episode.expected_survivors,
+				  sizeof(ReconfigShmem->replacement_episode.acknowledgements)) != 0
+		|| (cluster_node_id
+				!= ReconfigShmem->replacement_episode.target_node_id
+			&& !dead_bitmap_test_bit(
+				ReconfigShmem->replacement_episode.expected_survivors,
+				cluster_node_id))
+		|| !cluster_reconfig_replacement_membership_current_locked(
+			&ReconfigShmem->replacement_episode)
+		|| cluster_membership_get_last_admitted_incarnation(
+			   ReconfigShmem->replacement_episode.target_node_id)
+			   != ReconfigShmem->replacement_episode.old_admitted_incarnation
+		|| !cluster_reconfig_terminal_closed_matches_episode(
+			&head, &ballot, &marker,
+			&ReconfigShmem->replacement_episode)) {
+		result = CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+		goto out;
+	}
+
+	current_epoch = cluster_epoch_get_current();
+	if (current_epoch != ReconfigShmem->replacement_episode.baseline_epoch
+		&& current_epoch
+			   != ReconfigShmem->replacement_episode.reserved_or_committed_epoch) {
+		result = CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+		goto out;
+	}
+	observer_role
+		= cluster_node_id
+				  == ReconfigShmem->replacement_episode.coordinator_node_id
+			  ? CLUSTER_RECONFIG_OBSERVER_COORDINATOR
+			  : CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+	if (ReconfigShmem->replacement_episode.phase
+		== CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED) {
+		if (!cluster_reconfig_build_replacement_committed_event(
+				&ReconfigShmem->replacement_episode, observer_role,
+				ReconfigShmem->last_applied.applied_at, &expected_event)) {
+			result = CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+			goto out;
+		}
+		expected_event.event_seq = ReconfigShmem->last_applied.event_seq;
+		result = memcmp(&expected_event, &ReconfigShmem->last_applied,
+						sizeof(expected_event)) == 0
+				 ? CLUSTER_REPLACEMENT_CLOSED_ALREADY_CURRENT
+				 : CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+		goto out;
+	}
+
+	candidate = ReconfigShmem->replacement_episode;
+	if (!cluster_replacement_episode_next_generation(
+			candidate.state_generation, &next_generation)) {
+		result = CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+		goto out;
+	}
+	candidate.state_generation = next_generation;
+	candidate.phase = CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED;
+	if (!cluster_reconfig_build_replacement_committed_event(
+			&candidate, observer_role, GetCurrentTimestamp(), &event)) {
+		result = CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+		goto out;
+	}
+	if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			!= marker_request_seq
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq)
+			   != marker_request_seq
+		|| ReconfigShmem->join_marker_request_word != request_word) {
+		result = CLUSTER_REPLACEMENT_CLOSED_RETRY;
+		goto out;
+	}
+	if (current_epoch == candidate.baseline_epoch)
+		(void)cluster_epoch_observe_remote(
+			candidate.reserved_or_committed_epoch);
+	if (cluster_epoch_get_current()
+		!= candidate.reserved_or_committed_epoch) {
+		result = CLUSTER_REPLACEMENT_CLOSED_HOLD_IDENTITY;
+		goto out;
+	}
+	event.event_seq
+		= pg_atomic_fetch_add_u64(&ReconfigShmem->apply_counter, 1) + 1;
+	ReconfigShmem->replacement_episode = candidate;
+	ReconfigShmem->last_applied = event;
+	result = CLUSTER_REPLACEMENT_CLOSED_PUBLISHED;
+
+out:
+	if (release_owner)
+		memset(&join_marker_lmon_owner, 0,
+			   sizeof(join_marker_lmon_owner));
+	LWLockRelease(&ReconfigShmem->lock);
+	return result;
+}
+
+void
+cluster_reconfig_lmon_replacement_closed_tick(void)
+{
+	ClusterReplacementCommittedClosedPublishResultV1 publish_result;
+	ClusterQvotecMailboxCompletion ignored_completion;
+	ClusterMarkerPollResult marker_poll;
+	uint32 marker_result = CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+	uint64 elapsed_us = 0;
+	TimestampTz now;
+
+	if (!cluster_enabled || MyBackendType != B_LMON
+		|| !cluster_qvotec_in_quorum() || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return;
+	if (replacement_closed_stage.phase
+		== CLUSTER_REPLACEMENT_CLOSED_STAGE_IDLE) {
+		cluster_marker_async_init(&replacement_closed_stage.marker_async);
+		(void)cluster_reconfig_lmon_submit_closed_observer_pair(
+			GetCurrentTimestamp());
+		return;
+	}
+	if (replacement_closed_stage.phase
+		== CLUSTER_REPLACEMENT_CLOSED_STAGE_DRAIN_AUTHORITY) {
+		(void)cluster_qvotec_authority_lmon_poll_completion(
+			replacement_closed_stage.authority_request_seq,
+			&ignored_completion);
+		cluster_reconfig_release_closed_stage();
+		return;
+	}
+
+	now = GetCurrentTimestamp();
+	if (!replacement_closed_stage.marker_completed) {
+		marker_poll = cluster_reconfig_poll_join_marker_async(
+			&replacement_closed_stage.marker_async, now, &marker_result,
+			&elapsed_us);
+		if (marker_poll == CLUSTER_MARKER_POLL_PENDING
+			|| marker_poll == CLUSTER_MARKER_POLL_IDLE)
+			return;
+		if (marker_poll != CLUSTER_MARKER_POLL_ACKED
+			|| marker_result != CLUSTER_JOIN_MARKER_SUBMIT_ACK) {
+			cluster_reconfig_release_closed_stage();
+			return;
+		}
+		replacement_closed_stage.marker_completed = true;
+	}
+	publish_result
+		= cluster_reconfig_lmon_publish_replacement_committed_closed(
+			replacement_closed_stage.authority_request_seq,
+			replacement_closed_stage.marker_async.inflight_seq);
+	if (publish_result == CLUSTER_REPLACEMENT_CLOSED_BLOCKED_QVOTEC
+		|| publish_result == CLUSTER_REPLACEMENT_CLOSED_BLOCKED_JCMK)
+		return;
+	cluster_reconfig_release_closed_stage();
+}
 
 ClusterJoinMarkerSubmitResult
 cluster_reconfig_submit_join_marker(int32 target_node, const ClusterJoinCommitMarker *m)
@@ -3092,14 +6763,22 @@ cluster_reconfig_submit_join_marker(int32 target_node, const ClusterJoinCommitMa
 	if (target_node < 0 || target_node >= CLUSTER_MAX_NODES)
 		return CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
 
-	/* Stage target + marker, then publish the request (write barrier between so
-	 * qvotec never reads a half-written mailbox). */
-	ReconfigShmem->join_marker_target_node_id = target_node;
-	ReconfigShmem->join_pending_marker = *m;
+	/* Serialize staging with QVOTEC lifecycle/final receipt use. */
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (join_marker_lmon_owner.reserved
+		|| cluster_marker_async_mailbox_busy(
+			&ReconfigShmem->join_marker_request_seq,
+			&ReconfigShmem->join_marker_completion_seq)
+		|| !cluster_reconfig_stage_join_marker_locked(
+			target_node, CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT,
+			CLUSTER_JCMK_VERSION, m, sizeof(*m))) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return CLUSTER_JOIN_MARKER_SUBMIT_FAILED;
+	}
 	pg_write_barrier();
 	seq = pg_atomic_add_fetch_u64(&ReconfigShmem->join_marker_request_seq, 1);
-
 	qlatch = ReconfigShmem->join_qvotec_latch;
+	LWLockRelease(&ReconfigShmem->lock);
 	if (qlatch != NULL)
 		SetLatch(qlatch);
 
@@ -3127,6 +6806,8 @@ cluster_reconfig_submit_join_marker_async(ClusterMarkerAsync *a, int32 target_no
 										  ClusterMarkerAsyncKind kind, TimestampTz now)
 {
 	int wait_ms;
+	struct Latch *qlatch;
+	bool submitted;
 
 	if (ReconfigShmem == NULL || m == NULL || a == NULL)
 		return false;
@@ -3134,16 +6815,107 @@ cluster_reconfig_submit_join_marker_async(ClusterMarkerAsync *a, int32 target_no
 		return false;
 	if (cluster_marker_async_is_submitted(a))
 		return true;
-	if (cluster_marker_async_mailbox_busy(&ReconfigShmem->join_marker_request_seq,
-										  &ReconfigShmem->join_marker_completion_seq))
-		return false;
-
-	ReconfigShmem->join_marker_target_node_id = target_node;
-	ReconfigShmem->join_pending_marker = *m;
 	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
-	return cluster_marker_async_submit(
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (join_marker_lmon_owner.reserved
+		|| cluster_marker_async_mailbox_busy(
+			&ReconfigShmem->join_marker_request_seq,
+			&ReconfigShmem->join_marker_completion_seq)
+		|| !cluster_reconfig_stage_join_marker_locked(
+			target_node, CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT,
+			CLUSTER_JCMK_VERSION, m, sizeof(*m))) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	submitted = cluster_marker_async_submit(
 		a, &ReconfigShmem->join_marker_request_seq, &ReconfigShmem->join_marker_completion_seq,
-		ReconfigShmem->join_qvotec_latch, now, (uint64)wait_ms * 1000ULL, kind, target_node);
+		NULL, now, (uint64)wait_ms * 1000ULL, kind, target_node);
+	qlatch = ReconfigShmem->join_qvotec_latch;
+	LWLockRelease(&ReconfigShmem->lock);
+	if (submitted && qlatch != NULL)
+		SetLatch(qlatch);
+	return submitted;
+}
+
+bool
+cluster_reconfig_submit_replacement_marker_v3_async(
+	ClusterMarkerAsync *a, int32 target_node,
+	const ClusterReplacementCommitMarkerV3 *marker,
+	ClusterMarkerAsyncKind kind, TimestampTz now)
+{
+	uint8 image[CLUSTER_JCMK_REPLACEMENT_BYTES];
+	int wait_ms;
+	struct Latch *qlatch;
+	bool submitted;
+
+	if (ReconfigShmem == NULL || marker == NULL || a == NULL)
+		return false;
+	if (target_node < 0 || target_node >= CLUSTER_MAX_NODES
+		|| marker->target_node_id != target_node)
+		return false;
+	if (!cluster_replacement_marker_v3_encode(marker, image))
+		return false;
+	if (cluster_marker_async_is_submitted(a))
+		return true;
+	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (join_marker_lmon_owner.reserved
+		|| cluster_marker_async_mailbox_busy(
+			&ReconfigShmem->join_marker_request_seq,
+			&ReconfigShmem->join_marker_completion_seq)
+		|| !cluster_reconfig_stage_join_marker_locked(
+			target_node, CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT,
+			CLUSTER_JCMK_REPLACEMENT_VERSION, image, sizeof(image))) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	submitted = cluster_marker_async_submit(
+		a, &ReconfigShmem->join_marker_request_seq, &ReconfigShmem->join_marker_completion_seq,
+		NULL, now, (uint64)wait_ms * 1000ULL, kind, target_node);
+	qlatch = ReconfigShmem->join_qvotec_latch;
+	LWLockRelease(&ReconfigShmem->lock);
+	if (submitted && qlatch != NULL)
+		SetLatch(qlatch);
+	return submitted;
+}
+
+bool
+cluster_reconfig_verify_replacement_committed_closed_async(
+	ClusterMarkerAsync *a, int32 target_node, TimestampTz now)
+{
+	int wait_ms;
+	struct Latch *qlatch;
+	bool submitted;
+
+	if (ReconfigShmem == NULL || a == NULL || target_node < 0
+		|| target_node >= CLUSTER_MAX_NODES)
+		return false;
+	if (cluster_marker_async_is_submitted(a))
+		return true;
+	wait_ms = cluster_quorum_poll_interval_ms * 3 + 2000;
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (join_marker_lmon_owner.reserved
+		|| cluster_marker_async_mailbox_busy(
+			&ReconfigShmem->join_marker_request_seq,
+			&ReconfigShmem->join_marker_completion_seq)
+		|| !cluster_reconfig_stage_join_marker_locked(
+			target_node,
+			CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED,
+			0, NULL, 0)) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return false;
+	}
+	submitted = cluster_marker_async_submit(
+		a, &ReconfigShmem->join_marker_request_seq,
+		&ReconfigShmem->join_marker_completion_seq, NULL, now,
+		(uint64)wait_ms * 1000ULL,
+		CLUSTER_MARKER_KIND_REPLACEMENT_VERIFY_COMMITTED_CLOSED,
+		target_node);
+	qlatch = ReconfigShmem->join_qvotec_latch;
+	LWLockRelease(&ReconfigShmem->lock);
+	if (submitted && qlatch != NULL)
+		SetLatch(qlatch);
+	return submitted;
 }
 
 ClusterMarkerPollResult
@@ -3158,38 +6930,137 @@ cluster_reconfig_poll_join_marker_async(ClusterMarkerAsync *a, TimestampTz now, 
 }
 
 bool
-cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node, void *out_slot512)
+cluster_reconfig_join_qvotec_poll_pending(
+	ClusterJoinMarkerMailboxOperationV1 *operation_out,
+	int32 *target_node_out, void *write_slot512_out)
 {
-	uint64 req;
+	uint64 request_seq_before;
+	uint64 request_seq_after;
+	uint32 request_word;
+	ClusterJoinMarkerMailboxOperationV1 operation;
+	int32 target_node;
 
-	if (ReconfigShmem == NULL || out_slot512 == NULL || out_target_node == NULL)
+	if (ReconfigShmem == NULL || operation_out == NULL
+		|| target_node_out == NULL || write_slot512_out == NULL
+		|| join_qvotec_marker_inflight)
 		return false;
+	*operation_out = CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT;
+	*target_node_out = -1;
+	memset(write_slot512_out, 0, CLUSTER_VOTING_SLOT_BYTES);
 
-	req = pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
-	if (req == join_qvotec_last_processed_marker_seq)
+	request_seq_before
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	if (request_seq_before == 0
+		|| request_seq_before == join_qvotec_last_processed_marker_seq)
 		return false; /* nothing new */
 
 	pg_read_barrier();
-	*out_target_node = ReconfigShmem->join_marker_target_node_id;
-	memset(out_slot512, 0, CLUSTER_VOTING_SLOT_BYTES);
-	memcpy(out_slot512, &ReconfigShmem->join_pending_marker,
+	request_word = ReconfigShmem->join_marker_request_word;
+	memcpy(write_slot512_out, ReconfigShmem->join_pending_marker,
 		   sizeof(ReconfigShmem->join_pending_marker));
-	join_qvotec_inflight_marker_seq = req;
+	pg_read_barrier();
+	request_seq_after
+		= pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq);
+	if (request_seq_before != request_seq_after)
+		return false;
+	if (!cluster_reconfig_join_marker_request_word_decode(
+			request_word, &operation, &target_node)) {
+		LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+		if (pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+			== request_seq_before) {
+			memset(ReconfigShmem->join_pending_marker, 0,
+				   sizeof(ReconfigShmem->join_pending_marker));
+			pg_atomic_write_u32(&ReconfigShmem->join_marker_result,
+							CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
+			pg_write_barrier();
+			pg_atomic_write_u64(
+				&ReconfigShmem->join_marker_completion_seq,
+				request_seq_before);
+			join_qvotec_last_processed_marker_seq = request_seq_before;
+		}
+		LWLockRelease(&ReconfigShmem->lock);
+		cluster_lmon_marker_complete_wakeup();
+		memset(write_slot512_out, 0, CLUSTER_VOTING_SLOT_BYTES);
+		return false;
+	}
+	if (operation
+		== CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED)
+		memset(write_slot512_out, 0, CLUSTER_VOTING_SLOT_BYTES);
+	*operation_out = operation;
+	*target_node_out = target_node;
+	join_qvotec_inflight_marker_seq = request_seq_before;
+	join_qvotec_inflight_marker_operation = operation;
+	join_qvotec_marker_inflight = true;
 	return true;
 }
 
 void
-cluster_reconfig_join_qvotec_complete(bool acked)
+cluster_reconfig_join_qvotec_complete(
+	ClusterJoinMarkerMailboxOperationV1 operation, bool acked,
+	const uint8 *verified_image96)
 {
-	if (ReconfigShmem == NULL)
+	ClusterJoinMarkerMailboxOperationV1 request_operation;
+	ClusterReplacementCommitMarkerV3 verified_marker;
+	uint8 canonical[CLUSTER_JCMK_REPLACEMENT_BYTES];
+	int32 target_node;
+	bool call_matches;
+	bool clear_payload = false;
+
+	if (ReconfigShmem == NULL || !join_qvotec_marker_inflight)
 		return;
 
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	call_matches
+		= operation == join_qvotec_inflight_marker_operation
+		  && pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq)
+				 == join_qvotec_inflight_marker_seq
+		  && cluster_reconfig_join_marker_request_word_decode(
+				 ReconfigShmem->join_marker_request_word,
+				 &request_operation, &target_node)
+		  && request_operation == join_qvotec_inflight_marker_operation;
+	if (call_matches
+		&& operation == CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT) {
+		if (verified_image96 != NULL) {
+			call_matches = false;
+			clear_payload = true;
+		}
+	} else if (call_matches) {
+		clear_payload = true;
+		if (acked) {
+			call_matches
+				= verified_image96 != NULL
+				  && cluster_replacement_marker_v3_decode(
+						 verified_image96, target_node, &verified_marker)
+				  && verified_marker.phase
+						 == CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED
+				  && verified_marker.ready_state_generation == 0
+				  && cluster_replacement_marker_v3_encode(
+						 &verified_marker, canonical)
+				  && memcmp(canonical, verified_image96,
+							CLUSTER_JCMK_REPLACEMENT_BYTES) == 0;
+		} else if (verified_image96 != NULL)
+			call_matches = false;
+	}
+	if (!call_matches)
+		clear_payload = true;
+	if (clear_payload)
+		memset(ReconfigShmem->join_pending_marker, 0,
+			   sizeof(ReconfigShmem->join_pending_marker));
+	if (call_matches && acked
+		&& operation
+			   == CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED)
+		memcpy(ReconfigShmem->join_pending_marker, verified_image96,
+			   CLUSTER_JCMK_REPLACEMENT_BYTES);
 	pg_atomic_write_u32(&ReconfigShmem->join_marker_result,
-						acked ? CLUSTER_JOIN_MARKER_SUBMIT_ACK : CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
+						call_matches && acked
+							? CLUSTER_JOIN_MARKER_SUBMIT_ACK
+							: CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
 	pg_write_barrier();
 	pg_atomic_write_u64(&ReconfigShmem->join_marker_completion_seq,
 						join_qvotec_inflight_marker_seq);
 	join_qvotec_last_processed_marker_seq = join_qvotec_inflight_marker_seq;
+	join_qvotec_marker_inflight = false;
+	LWLockRelease(&ReconfigShmem->lock);
 	cluster_lmon_marker_complete_wakeup();
 }
 
@@ -3311,7 +7182,8 @@ cluster_reconfig_apply_join_as_coordinator(
 	uint64 old_epoch, new_epoch;
 	XLogRecPtr lsn;
 	uint64 cssd_dead_generation;
-	uint8 empty_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] = { 0 };
+	uint8 pending_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	bool external_authorized[CLUSTER_MAX_NODES];
 	ReconfigEvent evt;
 	int i;
 
@@ -3319,6 +7191,12 @@ cluster_reconfig_apply_join_as_coordinator(
 		return;
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-join-pending-pre");
+	memset(external_authorized, 0, sizeof(external_authorized));
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (dead_bitmap_test_bit(join_bitmap, i))
+			external_authorized[i] =
+				cluster_reconfig_external_rejoin_authorized(
+					i, joiner_incarnations[i]);
 
 	cssd_dead_generation = cluster_cssd_get_dead_generation();
 
@@ -3333,21 +7211,27 @@ cluster_reconfig_apply_join_as_coordinator(
 
 	/* Mark joiners JOINING + pending (candidates, NOT members yet — INV-J2). */
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	cluster_write_fence_authority_cache_invalidate();
+	memcpy(pending_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(pending_dead));
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (!dead_bitmap_test_bit(join_bitmap, i))
 			continue;
 		cluster_membership_set_state(i, CLUSTER_MEMBER_JOINING);
 		dead_bitmap_set_bit(ReconfigShmem->pending_join_bitmap, i);
+		if (external_authorized[i])
+			pending_dead[i / 8] &= (uint8) ~(1u << (i % 8));
 	}
 	LWLockRelease(&ReconfigShmem->lock);
 
 	memset(&evt, 0, sizeof(evt));
 	evt.event_id
-		= cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING, empty_dead, join_bitmap,
+		= cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING, pending_dead, join_bitmap,
 											   joiner_incarnations, cssd_dead_generation);
 	evt.coordinator_node_id = coordinator_node_id;
 	evt.old_epoch = old_epoch;
 	evt.new_epoch = new_epoch;
+	memcpy(evt.dead_bitmap, pending_dead, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	memcpy(evt.join_bitmap, join_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES);
 	evt.applied_at = GetCurrentTimestamp();
 	evt.observer_role = CLUSTER_RECONFIG_OBSERVER_COORDINATOR;
@@ -3368,6 +7252,8 @@ bool
 cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 {
 	ClusterJoinCommitMarker m;
+	bool external_required;
+	PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 
 	if (!cluster_enabled || ReconfigShmem == NULL)
 		return false;
@@ -3381,6 +7267,8 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	 * coordinator retries next tick once the leave finishes; the joiner stays JOINING.
 	 */
 	if (cluster_clean_leave_in_progress())
+		return false;
+	if (join_commit_stage.async.has_staged_event)
 		return false;
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-pre");
@@ -3411,14 +7299,44 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	m.commit_nonce = ((uint64)cluster_node_id << 56) ^ (uint64)GetCurrentTimestamp();
 	cluster_join_marker_compute_crc(&m);
 
-	if (join_commit_stage.async.has_staged_event)
-		return false;
+	/* STOP04 §11.9 C: after the fully normalized COMMITTED candidate exists,
+	 * consume the exact READY operation once and only then expose the JCMK to
+	 * qvotec.  No marker mailbox operation may precede this call. */
+	external_required =
+		cluster_reconfig_external_rejoin_required(node_id);
+	if (external_required) {
+		ClusterExternalRejoinSlot *slot = &external_rejoin_slots[node_id];
+		ClusterReconfigRejoinPendingSnapshotV1 current_pending;
+
+		memset(&current_pending, 0, sizeof(current_pending));
+		if (slot->op == NULL ||
+			slot->phase != CLUSTER_EXTERNAL_REJOIN_COMMIT_READY ||
+			slot->candidate_incarnation != admitted_incarnation ||
+			!cluster_reconfig_rejoin_pending_snapshot(&slot->failure,
+				admitted_incarnation, &current_pending) ||
+			memcmp(&current_pending, &slot->commit_pending,
+				   sizeof(current_pending)) != 0 ||
+			!cluster_external_fence_rejoin_consume_nowait(slot->op,
+				&current_pending, &m, &reason)) {
+			cluster_reconfig_external_rejoin_release_slot(node_id);
+			return false;
+		}
+		slot->phase = CLUSTER_EXTERNAL_REJOIN_COMMITTING;
+	}
+	cluster_marker_async_init(&join_commit_stage.async);
+	cluster_marker_async_init(&join_commit_stage.fence_async);
 	join_commit_stage.marker = m;
+	memset(&join_commit_stage.fence_marker, 0,
+		   sizeof(join_commit_stage.fence_marker));
+	memset(&join_commit_stage.event, 0, sizeof(join_commit_stage.event));
+	join_commit_stage.expected_last_event_id = 0;
 	join_commit_stage.node_id = node_id;
 	join_commit_stage.admitted_incarnation = admitted_incarnation;
 	join_commit_stage.async.has_staged_event = true;
 	join_commit_stage.async.staged_expect_epoch = m.admitted_epoch;
 	join_commit_stage.submitted = false;
+	join_commit_stage.fence_ready = false;
+	join_commit_stage.external_rejoin_consumed = external_required;
 	(void)cluster_reconfig_poll_join_commit_stage();
 
 	return false;
@@ -3782,6 +7700,26 @@ cluster_reconfig_lmon_tick(void)
 {}
 
 void
+cluster_reconfig_lmon_replacement_admit_tick(void)
+{}
+
+void
+cluster_reconfig_lmon_replacement_ready_tick(void)
+{}
+
+void
+cluster_reconfig_lmon_replacement_closed_tick(void)
+{}
+
+ClusterReplacementCommittedClosedPublishResultV1
+cluster_reconfig_lmon_publish_replacement_committed_closed(
+	uint64 authority_request_seq pg_attribute_unused(),
+	uint64 marker_request_seq pg_attribute_unused())
+{
+	return CLUSTER_REPLACEMENT_CLOSED_INVALID;
+}
+
+void
 cluster_reconfig_broadcast_local_procsig(void)
 {}
 
@@ -3858,17 +7796,50 @@ cluster_reconfig_submit_join_marker(int32 target_node pg_attribute_unused(),
 }
 
 bool
-cluster_reconfig_join_qvotec_poll_pending(int32 *out_target_node,
-										  void *out_slot512 pg_attribute_unused())
+cluster_reconfig_submit_replacement_marker_v3_async(
+	ClusterMarkerAsync *a pg_attribute_unused(), int32 target_node pg_attribute_unused(),
+	const ClusterReplacementCommitMarkerV3 *marker pg_attribute_unused(),
+	ClusterMarkerAsyncKind kind pg_attribute_unused(), TimestampTz now pg_attribute_unused())
 {
-	if (out_target_node != NULL)
-		*out_target_node = -1;
+	return false;
+}
+
+bool
+cluster_reconfig_verify_replacement_committed_closed_async(
+	ClusterMarkerAsync *a pg_attribute_unused(),
+	int32 target_node pg_attribute_unused(),
+	TimestampTz now pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_join_qvotec_poll_pending(
+	ClusterJoinMarkerMailboxOperationV1 *operation_out,
+	int32 *target_node_out, void *write_slot512_out pg_attribute_unused())
+{
+	if (operation_out != NULL)
+		*operation_out = CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT;
+	if (target_node_out != NULL)
+		*target_node_out = -1;
 	return false;
 }
 
 void
-cluster_reconfig_join_qvotec_complete(bool acked pg_attribute_unused())
+cluster_reconfig_join_qvotec_complete(
+	ClusterJoinMarkerMailboxOperationV1 operation pg_attribute_unused(),
+	bool acked pg_attribute_unused(),
+	const uint8 *verified_image96 pg_attribute_unused())
 {}
+
+bool
+cluster_reconfig_qvotec_lifecycle_transition(
+	ClusterQvotecMailbox *authority_mailbox pg_attribute_unused(),
+	pg_atomic_uint32 *qvotec_status pg_attribute_unused(),
+	ClusterQvotecStatus next_status pg_attribute_unused())
+{
+	return false;
+}
 
 void
 cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch pg_attribute_unused())
@@ -3902,6 +7873,112 @@ cluster_reconfig_self_join_gate_verdict(void)
 void
 cluster_reconfig_note_self_admitted(uint64 admitted_epoch pg_attribute_unused())
 {}
+
+bool
+cluster_reconfig_publish_replacement_member_closed(
+	const ClusterReplacementEpisode *admitted_episode pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_qvotec_observe_replacement_admitted(
+	const int *fds pg_attribute_unused(), int n_disks pg_attribute_unused(),
+	uint64 live_incarnation pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_open_replacement_admission(
+	const ClusterReplacementEpisode *expected_episode pg_attribute_unused(),
+	uint32 expected_state_generation pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_replacement_grd_basis_authorized(
+	const ReconfigEvent *event pg_attribute_unused(),
+	const ClusterReplacementEpisode *episode pg_attribute_unused(),
+	const ClusterReplacementCommitMarkerV3 *committed_marker pg_attribute_unused(),
+	int32 local_node_id pg_attribute_unused(),
+	uint8 out_survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] pg_attribute_unused(),
+	uint64 *out_epoch pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_snapshot_replacement_grd_basis(
+	uint8 out_survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES] pg_attribute_unused(),
+	uint64 *out_epoch pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_observe_replacement_ready(
+	const ClusterReplacementPhase3HandoffItem *item pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_build_replacement_admitted(
+	const ClusterEpochAuthorityValue *terminal_head pg_attribute_unused(),
+	ClusterReplacementCommitMarkerV3 *out_marker pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_finalize_replacement_admitted(
+	const ClusterEpochAuthorityValue *terminal_head pg_attribute_unused(),
+	const ClusterReplacementCommitMarkerV3 *admitted_marker pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_snapshot_replacement_admitted(
+	ClusterReplacementEpisode *out_episode pg_attribute_unused(),
+	ClusterReplacementCommitMarkerV3 *out_marker pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_snapshot_admitted_membership(
+	uint64 *out_members_lo, uint64 *out_members_hi,
+	uint64 *out_formation_epoch)
+{
+	if (out_members_lo != NULL)
+		*out_members_lo = 0;
+	if (out_members_hi != NULL)
+		*out_members_hi = 0;
+	if (out_formation_epoch != NULL)
+		*out_formation_epoch = 0;
+	return false;
+}
+
+ClusterR4PrerequisiteSnapshot
+cluster_reconfig_r4_prerequisite_snapshot(void)
+{
+	return (ClusterR4PrerequisiteSnapshot){
+		.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED,
+		.ready = false,
+		.reserved0 = {0, 0, 0},
+		.target_node_id = -1,
+	};
+}
+
+bool
+cluster_reconfig_r4_publish_ready(
+	const ClusterR4PrerequisiteSnapshot *expected pg_attribute_unused())
+{
+	return false;
+}
 
 bool
 cluster_reconfig_join_publish_proven(uint64 admitted_epoch pg_attribute_unused())

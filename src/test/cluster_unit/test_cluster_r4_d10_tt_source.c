@@ -31,6 +31,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_status.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -79,6 +80,7 @@ static bool fake_lock_found;
 static bool fake_hash_present;
 static bool fake_hash_raise;
 static bool fake_seq_returned;
+static int fake_xid_origin = 1;
 static TimestampTz fake_now = 1000000;
 
 static ClusterSemanticAdmissionResult fake_admission;
@@ -220,6 +222,8 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *key_ptr pg_attribute_
 	case HASH_ENTER_NULL:
 		if (found_ptr != NULL)
 			*found_ptr = fake_hash_present;
+		if (!fake_hash_present && key_ptr != NULL)
+			memcpy(fake_hash_storage, key_ptr, sizeof(ClusterTTStatusKey));
 		fake_hash_present = true;
 		return fake_hash_storage;
 	case HASH_REMOVE:
@@ -303,6 +307,12 @@ cluster_epoch_get_current(void)
 	return 7;
 }
 
+int
+cluster_xid_origin_slot(TransactionId xid pg_attribute_unused())
+{
+	return fake_xid_origin;
+}
+
 bool
 cluster_merged_instance_is_materialized(int node_id pg_attribute_unused())
 {
@@ -367,6 +377,7 @@ reset_fixture(void)
 	fake_hash_present = false;
 	fake_hash_raise = false;
 	fake_seq_returned = false;
+	fake_xid_origin = 1;
 	fake_admission = CLUSTER_SEMANTIC_ADMISSION_OK;
 	fake_recheck = true;
 	fake_enter_count = 0;
@@ -410,6 +421,8 @@ UT_TEST(test_frozen_tt_source_operation_domain)
 	UT_ASSERT_EQ(CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT, 4);
 	UT_ASSERT_EQ(CLUSTER_TT_SOURCE_BUMP_SELF_CONSUMER_HIT, 5);
 	UT_ASSERT_EQ(CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW, 6);
+	UT_ASSERT_EQ(CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID, 7);
+	UT_ASSERT_EQ(CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE, 8);
 }
 
 UT_TEST(test_active_refuses_before_request_inspection_and_mutation)
@@ -532,6 +545,66 @@ UT_TEST(test_generation_drift_discards_fixed_result)
 	UT_ASSERT_EQ(fake_leave_count, 1);
 }
 
+UT_TEST(test_current_own_candidate_is_exact_and_admission_bound)
+{
+	ClusterTTStatusKey key = make_key((TransactionId)604);
+	ClusterTTStatusKey wrong = key;
+	ClusterTTStatusSourceRequest request;
+	ClusterTTStatusSourceResult result;
+
+	reset_fixture();
+	memset(&request, 0, sizeof(request));
+	request.key = &key;
+	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	request.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+
+	request.xid = key.local_xid;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+	UT_ASSERT_EQ(memcmp(&result.current_key, &key, sizeof(key)), 0);
+	UT_ASSERT(result.lookup.authoritative);
+
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(result.current_key_verdict, CLUSTER_TT_CURRENT_KEY_MATCH);
+	UT_ASSERT_EQ(memcmp(&result.current_key, &key, sizeof(key)), 0);
+
+	wrong.tt_slot_id++;
+	request.key = &wrong;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(result.current_key_verdict, CLUSTER_TT_CURRENT_KEY_UNKNOWN);
+	UT_ASSERT_EQ(memcmp(&result.current_key, &key, sizeof(key)), 0);
+
+	fake_xid_origin = 2;
+	request.key = &key;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(!result.bool_value);
+	UT_ASSERT_EQ(result.current_key_verdict, CLUSTER_TT_CURRENT_KEY_UNKNOWN);
+
+	fake_xid_origin = 1;
+	fake_recheck = false;
+	memset(&result, 0xA5, sizeof(result));
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
+					 CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE, &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED);
+	UT_ASSERT(bytes_are_zero(&result, sizeof(result)));
+}
+
 UT_TEST(test_error_path_runs_single_leave_funnel)
 {
 	ClusterTTStatusKey key = make_key((TransactionId)603);
@@ -565,7 +638,7 @@ UT_TEST(test_error_path_runs_single_leave_funnel)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_frozen_tt_source_operation_domain);
 	UT_RUN(test_active_refuses_before_request_inspection_and_mutation);
 	UT_RUN(test_disabled_source_executes_matching_counter_arm);
@@ -573,6 +646,7 @@ main(void)
 	UT_RUN(test_missing_required_pointer_closes_after_admission);
 	UT_RUN(test_unknown_operation_closes_after_admission);
 	UT_RUN(test_generation_drift_discards_fixed_result);
+	UT_RUN(test_current_own_candidate_is_exact_and_admission_bound);
 	UT_RUN(test_error_path_runs_single_leave_funnel);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

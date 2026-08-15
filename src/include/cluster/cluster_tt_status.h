@@ -157,6 +157,17 @@ typedef struct ClusterTTStatusResult {
 } ClusterTTStatusResult;
 
 /*
+ * Verdict for a current-DML updater full-key challenge against retained
+ * current own-xid authority.  A miss or alias ambiguity is UNKNOWN, never a
+ * raw-xid-derived mismatch.
+ */
+typedef enum ClusterTTCurrentKeyVerdict {
+	CLUSTER_TT_CURRENT_KEY_MATCH = 0,
+	CLUSTER_TT_CURRENT_KEY_MISMATCH,
+	CLUSTER_TT_CURRENT_KEY_UNKNOWN
+} ClusterTTCurrentKeyVerdict;
+
+/*
  * ClusterVisibilityDecision -- 3-state visibility decision (spec-3.3 D5).
  *
  * MVCC visibility is fundamentally 3-state: yes / no / data not available.
@@ -194,7 +205,9 @@ typedef enum ClusterTTStatusSourceOp {
 	CLUSTER_TT_SOURCE_DELETE_EXACT = 3,
 	CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT = 4,
 	CLUSTER_TT_SOURCE_BUMP_SELF_CONSUMER_HIT = 5,
-	CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW = 6
+	CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW = 6,
+	CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID = 7,
+	CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE = 8
 } ClusterTTStatusSourceOp;
 
 typedef struct ClusterTTStatusSourceRequest {
@@ -209,6 +222,8 @@ typedef struct ClusterTTStatusSourceResult {
 	bool bool_value;
 	int int_value;
 	ClusterTTStatusResult lookup;
+	ClusterTTStatusKey current_key;
+	ClusterTTCurrentKeyVerdict current_key_verdict;
 } ClusterTTStatusSourceResult;
 
 extern ClusterSemanticAdmissionResult

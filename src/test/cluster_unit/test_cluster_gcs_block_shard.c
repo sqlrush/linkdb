@@ -52,6 +52,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "storage/buf_internals.h"
 
@@ -448,6 +449,54 @@ UT_TEST(test_r4_extended_route_exact_lengths_and_tag_affinity)
 }
 
 /* ======================================================================
+ * Spec 8.4 D4 -- endpoint -2 plus R4_UNDO_DATA_FETCH is the sole exception
+ * to the offset-16 tag shard: it must use the existing DATA worker 0 in both
+ * directions.  Either half alone remains ordinary tag-sharded, and adjacent
+ * lengths remain unroutable.
+ * ====================================================================== */
+UT_TEST(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0)
+{
+	ClusterR4CrForwardPayload forward;
+	BufferTag tag;
+	int ordinary_shard = 0;
+	int i;
+
+	for (i = 1; i < 10000 && ordinary_shard == 0; i++) {
+		tag = make_tag(1663, 5, 26000, MAIN_FORKNUM, (BlockNumber)i);
+		ordinary_shard = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+	}
+	UT_ASSERT(ordinary_shard > 0);
+
+	memset(&forward, 0, sizeof(forward));
+	forward.base.tag = tag;
+	forward.base.requester_backend_id = CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT;
+	forward.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
+	forward.extension.r4_kind = CLUSTER_R4_WIRE_UNDO_DATA_FETCH;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+											 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+				 0);
+
+	forward.base.requester_backend_id = 1;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+											 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+				 ordinary_shard);
+	forward.base.requester_backend_id = CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT;
+	forward.extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+											 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+				 ordinary_shard);
+	forward.extension.r4_kind = CLUSTER_R4_WIRE_UNDO_DATA_FETCH;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+											 sizeof(forward) - 1,
+											 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+											 sizeof(forward) + 1,
+											 CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+}
+
+/* ======================================================================
  * U9 -- extended route admission is exact, not a minimum-size check:
  *		 REQUEST accepts only 64/80 and FORWARD accepts only 64/96.  Adjacent
  *		 lengths and the other frame kind's extended length fail closed.
@@ -474,6 +523,61 @@ UT_TEST(test_r4_extended_route_length_mismatch_refused)
 												 payload.bytes, forward_bad_lengths[i],
 												 CLUSTER_LMS_MAX_WORKERS),
 					 -1);
+}
+
+/* ======================================================================
+ * Current-MX describe/proof forwards preserve the request identity in the
+ * legacy 64-byte prefix but overlay its BufferTag.  Their frozen 128-byte
+ * frames therefore route by GcsBlockCurrentMxRouteTagMake(), and only the
+ * two runtime kinds are admitted at that exact length.
+ * ====================================================================== */
+UT_TEST(test_current_mx_forward128_routes_by_request_identity)
+{
+	ClusterCurrentMxDescribeForwardV2 describe;
+	ClusterCurrentMxProofForwardV2 proof;
+	BufferTag route_tag;
+	int expected;
+
+	memset(&describe, 0, sizeof(describe));
+	describe.prefix.request_id = UINT64CONST(0x1122334455667788);
+	describe.prefix.epoch = UINT64CONST(0x0102030405060708);
+	describe.prefix.original_requester_node = 2;
+	describe.prefix.requester_backend_id = 19;
+	describe.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	describe.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	describe.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+
+	route_tag = GcsBlockCurrentMxRouteTagMake(
+		describe.prefix.request_id, describe.prefix.epoch,
+		describe.prefix.original_requester_node,
+		describe.prefix.requester_backend_id);
+	expected = cluster_lms_shard_for_tag(&route_tag, CLUSTER_LMS_MAX_WORKERS);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe, sizeof(describe),
+		CLUSTER_LMS_MAX_WORKERS), expected);
+
+	memset(&proof, 0, sizeof(proof));
+	proof.prefix.request_id = describe.prefix.request_id;
+	proof.prefix.epoch = describe.prefix.epoch;
+	proof.prefix.original_requester_node = describe.prefix.original_requester_node;
+	proof.prefix.requester_backend_id = describe.prefix.requester_backend_id;
+	proof.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+	proof.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
+	proof.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof),
+		CLUSTER_LMS_MAX_WORKERS), expected);
+
+	describe.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe, sizeof(describe),
+		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof) - 1,
+		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof) + 1,
+		CLUSTER_LMS_MAX_WORKERS), -1);
 }
 
 /* Every staged PCM-X frame is tag-affine.  RETIRE/RETIRE_ACK are the only
@@ -570,7 +674,7 @@ UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -579,7 +683,9 @@ main(void)
 	UT_RUN(test_route_n1_degenerate_zero);
 	UT_RUN(test_route_ignores_non_tag_fields);
 	UT_RUN(test_r4_extended_route_exact_lengths_and_tag_affinity);
+	UT_RUN(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0);
 	UT_RUN(test_r4_extended_route_length_mismatch_refused);
+	UT_RUN(test_current_mx_forward128_routes_by_request_identity);
 	UT_RUN(test_pcm_x_route_truth_table);
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_DONE();

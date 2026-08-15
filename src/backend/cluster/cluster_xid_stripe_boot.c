@@ -243,7 +243,8 @@ stripe_read_activation_one(int fd, ClusterXidStripeActivationRecord *out, uint32
 
 		/* EOF on a file that has not grown past region 4 yet is the
 		 * lazily-materialised empty state, not an I/O failure. */
-		if (fstat(fd, &st) == 0 && (off_t)st.st_size < CLUSTER_VOTING_FILE_BYTES_MIN)
+		if (fstat(fd, &st) == 0
+			&& (off_t)st.st_size < CLUSTER_VOTING_PGSA_SLOT_OFFSET)
 			return STRIPE_READ_ABSENT;
 		return STRIPE_READ_UNREADABLE;
 	}
@@ -292,7 +293,9 @@ stripe_read_slot_one(int fd, int32 node, ClusterXidStripeSlotRecord *out, bool *
 	if (rc != CLUSTER_VOTING_DISK_IO_OK) {
 		struct stat st;
 
-		if (fstat(fd, &st) == 0 && (off_t)st.st_size < CLUSTER_VOTING_FILE_BYTES_MIN)
+		if (fstat(fd, &st) == 0
+			&& (off_t)st.st_size
+				   < CLUSTER_VOTING_STRIPE_SLOT_OFFSET(node) + CLUSTER_VOTING_SLOT_BYTES)
 			return STRIPE_READ_ABSENT;
 		return STRIPE_READ_UNREADABLE;
 	}

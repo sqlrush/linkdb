@@ -31,10 +31,14 @@
  */
 #include "postgres.h"
 
+#include <unistd.h>
+
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_sequence.h"
+#include "miscadmin.h"
+#include "storage/fd.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -46,6 +50,30 @@
 
 UT_DEFINE_GLOBALS();
 
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+bool cluster_controlfile_shared_authority = false;
+int cluster_node_id = 0;
+char *cluster_config_file = NULL;
+static int g_node_count = 1;
+
+int
+cluster_conf_node_count(void)
+{
+	return g_node_count;
+}
+
+FILE *
+AllocateFile(const char *name, const char *mode)
+{
+	return fopen(name, mode);
+}
+
+int
+FreeFile(FILE *file)
+{
+	return fclose(file);
+}
+
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
@@ -56,6 +84,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 /* ---- GES substrate stubs (settable outcomes) ---- */
 static ClusterLockAcquireResult g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static ClusterLockAcquireResult g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+static ClusterLockAcquireResult g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static int g_s6_count = 0;
 static uint8 g_s6_last_resid_type = 0;
 /* spec-5.6 Dc4b: capture what cluster_cf_lock threaded into the request. */
@@ -90,7 +119,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
 	g_s6_count++;
 	g_s6_last_resid_type = req->resid.type;
-	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	return g_s6_result;
 }
 
 /* spec-5.6 Dc4: cluster_cf_lock bumps CF acquire/fail-closed counters;
@@ -117,6 +146,55 @@ bool
 cluster_cf_stats_get_join_readonly(void)
 {
 	return g_join_ro;
+}
+
+/* R18: model the real actor-bound shared phase while testing the enqueue-local
+ * permission and eligibility wrapper without linking cluster_cf_stats.o. */
+static ClusterCfOwnerEorPhase g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_EMPTY;
+
+ClusterCfOwnerEorPhase
+cluster_cf_owner_eor_phase_read(void)
+{
+	return g_owner_eor_phase;
+}
+
+bool
+cluster_cf_owner_eor_phase_install(void)
+{
+	if (!AmStartupProcess() || g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_EMPTY)
+		return false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_INSTALLED;
+	return true;
+}
+
+bool
+cluster_cf_owner_eor_phase_activate(void)
+{
+	if (!AmCheckpointerProcess()
+		|| g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_INSTALLED)
+		return false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_ACTIVE;
+	return true;
+}
+
+bool
+cluster_cf_owner_eor_phase_done(void)
+{
+	if (!AmCheckpointerProcess() || g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_ACTIVE)
+		return false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_DONE;
+	return true;
+}
+
+bool
+cluster_cf_owner_eor_phase_clear(void)
+{
+	if (!AmStartupProcess()
+		|| (g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_INSTALLED
+			&& g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_DONE))
+		return false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_EMPTY;
+	return true;
 }
 
 TimestampTz
@@ -214,6 +292,128 @@ UT_TEST(test_held_and_write_permitted)
 }
 
 /* ======================================================================
+ * R18 -- exact OWNER->EOR eligibility, local authority and abort boundary
+ * ====================================================================== */
+UT_TEST(test_owner_eor_handoff_gates_and_lifecycle)
+{
+	cluster_controlfile_shared_authority = true;
+	g_node_count = 1;
+	g_join_ro = false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_EMPTY;
+	cluster_cf_set_bootstrap_authority(false);
+	cluster_cf_owner_eor_abort();
+
+	/* INSTALL is Startup-only and exact-one-node only. */
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_cf_owner_eor_install());
+	MyAuxProcType = StartupProcess;
+	g_node_count = 2;
+	UT_ASSERT(!cluster_cf_owner_eor_install());
+	g_node_count = 1;
+	g_join_ro = true;
+	UT_ASSERT(!cluster_cf_owner_eor_install());
+	g_join_ro = false;
+	cluster_controlfile_shared_authority = false;
+	UT_ASSERT(!cluster_cf_owner_eor_install());
+	cluster_controlfile_shared_authority = true;
+	UT_ASSERT(cluster_cf_owner_eor_install());
+	UT_ASSERT(cluster_cf_in_bootstrap_window());
+	UT_ASSERT(cluster_cf_write_permitted());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_INSTALLED);
+
+	/* Simulate the separate checkpointer process: phase alone grants no write. */
+	cluster_cf_set_bootstrap_authority(false);
+	UT_ASSERT(!cluster_cf_write_permitted());
+
+	/* CONSUME requires actor, EOR, authority, exact role, JOIN=false and identity. */
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true)); /* still Startup */
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_cf_owner_eor_consume(false, true));
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, false));
+	cluster_controlfile_shared_authority = false;
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true));
+	cluster_controlfile_shared_authority = true;
+	g_node_count = 2;
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true));
+	g_node_count = 1;
+	g_join_ro = true;
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true));
+	g_join_ro = false;
+	UT_ASSERT(cluster_cf_owner_eor_consume(true, true));
+	UT_ASSERT(cluster_cf_owner_eor_local_active());
+	UT_ASSERT(cluster_cf_write_permitted());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_ACTIVE);
+
+	UT_ASSERT(cluster_cf_owner_eor_complete());
+	UT_ASSERT(!cluster_cf_owner_eor_local_active());
+	UT_ASSERT(!cluster_cf_write_permitted());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_DONE);
+
+	/* Original Startup permission remains local there until the final close. */
+	MyAuxProcType = StartupProcess;
+	cluster_cf_set_bootstrap_authority(true);
+	UT_ASSERT(cluster_cf_owner_eor_close());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_EMPTY);
+	UT_ASSERT(!cluster_cf_in_bootstrap_window());
+	UT_ASSERT(!cluster_cf_write_permitted());
+
+	cluster_controlfile_shared_authority = false;
+	MyAuxProcType = NotAnAuxProcess;
+}
+
+UT_TEST(test_owner_eor_disabled_seed_uses_exact_declared_node)
+{
+	char path[] = "/tmp/pgrac-cf-seed-XXXXXX";
+	int fd;
+	FILE *f;
+
+	fd = mkstemp(path);
+	UT_ASSERT(fd >= 0);
+	f = fdopen(fd, "w");
+	UT_ASSERT(f != NULL);
+	UT_ASSERT(fprintf(f,
+				  "[cluster]\nname = pgrac\n\n[node.0]\n"
+				  "interconnect_addr = 127.0.0.1:6433\n") > 0);
+	UT_ASSERT_EQ(fclose(f), 0);
+
+	g_node_count = 0;
+	cluster_node_id = 0;
+	cluster_config_file = path;
+	UT_ASSERT(cluster_cf_exactly_one_declared_node());
+
+	cluster_node_id = 1;
+	UT_ASSERT(!cluster_cf_exactly_one_declared_node());
+
+	UT_ASSERT_EQ(unlink(path), 0);
+	cluster_config_file = NULL;
+	cluster_node_id = 0;
+	g_node_count = 1;
+}
+
+UT_TEST(test_owner_eor_abort_retains_active_and_blocks_retry)
+{
+	cluster_controlfile_shared_authority = true;
+	g_node_count = 1;
+	g_join_ro = false;
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_INSTALLED;
+	cluster_cf_set_bootstrap_authority(false);
+	MyAuxProcType = CheckpointerProcess;
+
+	UT_ASSERT(cluster_cf_owner_eor_consume(true, true));
+	UT_ASSERT(cluster_cf_owner_eor_local_active());
+	cluster_cf_owner_eor_abort();
+	UT_ASSERT(!cluster_cf_owner_eor_local_active());
+	UT_ASSERT(!cluster_cf_write_permitted());
+	UT_ASSERT_EQ(g_owner_eor_phase, CLUSTER_CF_OWNER_EOR_ACTIVE);
+	UT_ASSERT(!cluster_cf_owner_eor_consume(true, true));
+
+	/* Test-process cleanup only; product abort/close never performs this edge. */
+	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_EMPTY;
+	cluster_controlfile_shared_authority = false;
+	MyAuxProcType = NotAnAuxProcess;
+}
+
+/* ======================================================================
  * Db2 -- OK_NATIVE (cluster layer inactive) registers no holder
  * ====================================================================== */
 UT_TEST(test_lock_native_no_release)
@@ -225,6 +425,47 @@ UT_TEST(test_lock_native_no_release)
 	cluster_cf_unlock(ShareLock);
 
 	UT_ASSERT_EQ(g_s6_count, 0); /* uncoordinated -> no S6 */
+}
+
+UT_TEST(test_confirmed_release_requires_clusterwide_s6_success)
+{
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_s6_count = 0;
+
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
+				 CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
+	UT_ASSERT_EQ(g_s6_count, 1);
+
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
+				 CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
+				 CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
+}
+
+UT_TEST(test_native_hold_never_becomes_clusterwide_authority)
+{
+	g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
+	g_s6_count = 0;
+
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	UT_ASSERT(cluster_cf_held(ShareLock));
+	UT_ASSERT(!cluster_cf_held_is_clusterwide(ShareLock));
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock),
+				 CLUSTER_CF_RELEASE_NOT_HELD);
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	UT_ASSERT_EQ(g_s6_count, 0);
 }
 
 /* ======================================================================
@@ -289,11 +530,16 @@ UT_TEST(test_lock_timeout_and_wait_event)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(13);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
+	UT_RUN(test_owner_eor_handoff_gates_and_lifecycle);
+	UT_RUN(test_owner_eor_disabled_seed_uses_exact_declared_node);
+	UT_RUN(test_owner_eor_abort_retains_active_and_blocks_retry);
 	UT_RUN(test_lock_native_no_release);
+	UT_RUN(test_confirmed_release_requires_clusterwide_s6_success);
+	UT_RUN(test_native_hold_never_becomes_clusterwide_authority);
 	UT_RUN(test_lock_failclosed_timeout);
 	UT_RUN(test_lock_s5_fail);
 	UT_RUN(test_lock_notavail);

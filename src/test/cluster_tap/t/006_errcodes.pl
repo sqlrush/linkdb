@@ -118,6 +118,8 @@ is(raise_and_get_sqlstate('cluster_storage_fence_unavailable'), '58R15',
 	"cluster_storage_fence_unavailable -> 58R15");
 is(raise_and_get_sqlstate('cluster_ic_rdma_fabric_error'), '58R16',
 	"cluster_ic_rdma_fabric_error -> 58R16");
+is(raise_and_get_sqlstate('cluster_external_fence_unavailable'), '58R17',
+	"cluster_external_fence_unavailable -> 58R17");
 
 
 # ----------

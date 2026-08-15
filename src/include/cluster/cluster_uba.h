@@ -74,6 +74,8 @@
 #include "c.h"
 #include "cluster/cluster_scn.h"	 /* NodeId, SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_tt_slot.h" /* TT_SLOTS_PER_SEGMENT + UBA typedef chain */
+#include "cluster/cluster_undo_segment.h" /* UNDO_BLOCKS_PER_SEGMENT */
+#include "cluster/storage/cluster_undo_alloc.h" /* logical segment-range constants */
 
 
 /*
@@ -147,6 +149,43 @@ uba_decode(UBA u, uint32 *segment_id, uint32 *block_no, uint16 *tt_slot_offset, 
 	*block_no = (uint32)(u.raw[0] >> 32);
 	*tt_slot_offset = off;
 	*row_offset = (uint16)((u.raw[1] >> 16) & 0xFFFFULL);
+	return true;
+}
+
+
+/*
+ * uba_decode_record -- Decode only an undo DATA-record address.
+ *
+ *	The general decoder must continue to accept the historical TT-only
+ *	block-zero UBA.  Record readers have the narrower R4A contract: block zero,
+ *	the one-past-end block and segment identities outside the exact 128 x 256
+ *	owner map are rejected before path resolution or I/O.  Outputs are assigned
+ *	only after every record-specific predicate succeeds.
+ */
+static inline bool
+uba_decode_record(UBA u, uint32 *segment_id, uint32 *block_no,
+				  uint16 *tt_slot_offset, uint16 *row_offset)
+{
+	uint32 decoded_segment;
+	uint32 decoded_block;
+	uint16 decoded_slot;
+	uint16 decoded_row;
+	const uint32 max_segment
+		= (uint32)UNDO_OWNER_INSTANCE_MAX * CLUSTER_UNDO_SEGS_PER_INSTANCE;
+
+	if (segment_id == NULL || block_no == NULL || tt_slot_offset == NULL
+		|| row_offset == NULL)
+		return false;
+	if (!uba_decode(u, &decoded_segment, &decoded_block, &decoded_slot, &decoded_row))
+		return false;
+	if (decoded_segment > max_segment || decoded_block == 0
+		|| decoded_block >= UNDO_BLOCKS_PER_SEGMENT)
+		return false;
+
+	*segment_id = decoded_segment;
+	*block_no = decoded_block;
+	*tt_slot_offset = decoded_slot;
+	*row_offset = decoded_row;
 	return true;
 }
 

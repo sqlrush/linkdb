@@ -63,6 +63,8 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"			 /* cluster_storage_mode_enabled */
+#include "cluster/cluster_reconfig.h"		 /* ordinary/replacement write gate */
+#include "cluster/cluster_semantic_activation.h" /* operation-scoped modifier gate */
 #include "cluster/cluster_undo_horizon.h"	 /* cluster floor + fence (spec-5.22e D5-3) */
 #include "cluster/cluster_undo_retention.h"	 /* horizon (C17: once per pass) */
 #include "cluster/cluster_tt_slot.h"		 /* current TT segment (exclusion) */
@@ -378,6 +380,8 @@ static bool
 undo_cleaner_run_pass(bool *out_work_remaining)
 {
 	ClusterUndoCleanerPassStats stats;
+	ClusterSemanticAdmissionToken modifier_token;
+	bool writable_admission;
 	bool floor_retry_needed = false;
 
 	*out_work_remaining = false;
@@ -385,6 +389,11 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 	if (!cluster_undo_cleaner_enabled)
 		return false;
 	if (!cluster_storage_mode_enabled())
+		return false;
+	writable_admission
+		= cluster_reconfig_self_join_gate_verdict() == CLUSTER_JOIN_GATE_ALLOW;
+	if (cluster_semantic_activation_modifier_enter(writable_admission, &modifier_token)
+		!= CLUSTER_SEMANTIC_ADMISSION_OK)
 		return false;
 
 	/*
@@ -458,7 +467,10 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 		horizon = floor.scn;
 		cluster_undo_horizon_note_floor(floor.scn);
 
-		if (!cluster_tt_slot_gc_current_pass(horizon, floor.epoch, &stats)) {
+		if (!cluster_semantic_activation_modifier_recheck(
+				&modifier_token,
+				cluster_reconfig_self_join_gate_verdict() == CLUSTER_JOIN_GATE_ALLOW)
+			|| !cluster_tt_slot_gc_current_pass(horizon, floor.epoch, &stats)) {
 			floor_retry_needed = true;
 			cluster_undo_horizon_note_pass_abort();
 			goto pass_account; /* F-D2: epoch moved mid-scan; abort the pass */
@@ -523,12 +535,24 @@ undo_cleaner_run_pass(bool *out_work_remaining)
 				 * it (the leak fix).  GUC off keeps the legacy lazy behaviour and
 				 * never gates the 8.A guard (spec §2.3).
 				 */
-				if (cluster_undo_record_segment_commit_on_rollover)
+				if (cluster_undo_record_segment_commit_on_rollover
+					&& cluster_semantic_activation_modifier_recheck(
+						&modifier_token,
+						cluster_reconfig_self_join_gate_verdict()
+							== CLUSTER_JOIN_GATE_ALLOW))
 					cluster_undo_segment_advance_committed(cur);
 
 				{
-					ClusterUndoSegTryRecycle rr
-						= cluster_undo_segment_advance_recyclable(cur, horizon, floor.epoch);
+					ClusterUndoSegTryRecycle rr;
+
+					if (!cluster_semantic_activation_modifier_recheck(
+							&modifier_token,
+							cluster_reconfig_self_join_gate_verdict()
+								== CLUSTER_JOIN_GATE_ALLOW)) {
+						fence_aborted = true;
+						break;
+					}
+					rr = cluster_undo_segment_advance_recyclable(cur, horizon, floor.epoch);
 
 					if (rr == CLUSTER_SEG_RECYCLE_EPOCH_CHANGED) {
 						/* F-D2: epoch moved inside the mutation lock; the
@@ -599,6 +623,7 @@ pass_account:
 		}
 	}
 
+	cluster_semantic_activation_leave(&modifier_token);
 	return floor_retry_needed;
 }
 

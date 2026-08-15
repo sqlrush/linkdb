@@ -55,6 +55,7 @@
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_hw.h"				 /* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
@@ -419,10 +420,27 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
  * accept + WAIT_EPOCH event-scoped witness can be unit-driven.  Default
  * zeroed = pre-existing inert behavior. */
 static ReconfigEvent ut_mock_last_event;
+static ClusterReconfigRejoinFailureSnapshotV1 ut_mock_rejoin_failure;
 void
 cluster_reconfig_get_last_event(ReconfigEvent *out)
 {
 	*out = ut_mock_last_event;
+}
+
+bool
+cluster_reconfig_rejoin_failure_snapshot(
+	int32 old_node_id, uint64 old_incarnation,
+	ClusterReconfigRejoinFailureSnapshotV1 *out_failure)
+{
+	if (out_failure != NULL)
+		memset(out_failure, 0, sizeof(*out_failure));
+	if (out_failure == NULL ||
+		old_node_id != ut_mock_rejoin_failure.old_node_id ||
+		old_incarnation != ut_mock_rejoin_failure.old_incarnation ||
+		ut_mock_rejoin_failure.event_id == 0)
+		return false;
+	*out_failure = ut_mock_rejoin_failure;
+	return true;
 }
 
 uint64
@@ -1775,7 +1793,7 @@ UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
 	LOCKTAG src;
 	ClusterResId resid;
 	ClusterGrdEntry *entry = NULL;
-	ClusterGrdHolderId h1, h2;
+	ClusterGrdHolderId h1, h2, missing;
 	ClusterGrdGrantIdentity granted[8];
 	int i;
 
@@ -1802,6 +1820,11 @@ UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
 				 (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
 	cluster_grd_entry_release(entry);
+	missing = h1;
+	missing.request_id++;
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &missing, granted,
+									 lengthof(granted)), -1);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1); /* exact holder retained */
 	(void)cluster_grd_release_and_drain(&resid, &h1, granted, lengthof(granted));
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0); /* empty -> reclaimed */
 
@@ -4591,6 +4614,72 @@ UT_TEST(test_recovery_idle_holds_baseline_during_prebump_stage)
 	cluster_enabled = false;
 }
 
+UT_TEST(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut)
+{
+	ClusterGrdRejoinClearSnapshotV1 clear;
+	ClusterGrdRejoinClearSnapshotV1 zero;
+	ClusterReconfigRejoinFailureSnapshotV1 failure;
+	uint64 dead_hash;
+
+	reset_fake_grd_htab();
+	ut_jr_setup_3node();
+	cluster_enabled = true;
+	ut_mock_now = 0;
+	ut_mock_epoch = UINT64_C(8);
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_grd_recovery_lmon_tick();
+
+	memset(&failure, 0, sizeof(failure));
+	failure.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	failure.event_id = UINT64_C(701);
+	failure.new_epoch = UINT64_C(9);
+	failure.cssd_dead_generation = UINT64_C(13);
+	failure.dead_bitmap[0] = UINT8_C(0x02);
+	failure.survivor_bitmap[0] = UINT8_C(0x05);
+	failure.old_node_id = 1;
+	failure.old_incarnation = UINT64_C(70);
+	ut_mock_rejoin_failure = failure;
+
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	ut_mock_last_event.event_id = failure.event_id;
+	ut_mock_last_event.old_epoch = UINT64_C(8);
+	ut_mock_last_event.new_epoch = failure.new_epoch;
+	ut_mock_last_event.cssd_dead_generation =
+		failure.cssd_dead_generation;
+	ut_mock_last_event.coordinator_node_id = 0;
+	ut_mock_last_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	memcpy(ut_mock_last_event.dead_bitmap, failure.dead_bitmap,
+		   sizeof(ut_mock_last_event.dead_bitmap));
+	ut_mock_epoch = failure.new_epoch;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_episode_epoch_value(),
+				 failure.new_epoch);
+	dead_hash = cluster_grd_dead_bitmap_hash(failure.dead_bitmap);
+	UT_ASSERT_EQ(cluster_grd_recovery_event_bitmap_hash_value(), dead_hash);
+
+	cluster_grd_recovery_mark_peer_done(0, failure.new_epoch, dead_hash);
+	memset(&clear, 0xa5, sizeof(clear));
+	memset(&zero, 0, sizeof(zero));
+	UT_ASSERT(!cluster_grd_rejoin_clear_snapshot(&failure, &clear));
+	UT_ASSERT(memcmp(&clear, &zero, sizeof(clear)) == 0);
+
+	cluster_grd_recovery_mark_peer_done(2, failure.new_epoch, dead_hash);
+	UT_ASSERT(cluster_grd_rejoin_clear_snapshot(&failure, &clear));
+	UT_ASSERT_EQ(clear.episode_epoch, failure.new_epoch);
+	UT_ASSERT_EQ(clear.dead_bitmap_hash, dead_hash);
+	UT_ASSERT(memcmp(clear.survivor_bitmap, failure.survivor_bitmap,
+				 sizeof(clear.survivor_bitmap)) == 0);
+
+	failure.survivor_bitmap[0] = 0;
+	memset(&clear, 0xa5, sizeof(clear));
+	UT_ASSERT(!cluster_grd_rejoin_clear_snapshot(&failure, &clear));
+	UT_ASSERT(memcmp(&clear, &zero, sizeof(clear)) == 0);
+
+	cluster_enabled = false;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	memset(&ut_mock_rejoin_failure, 0, sizeof(ut_mock_rejoin_failure));
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -4604,7 +4693,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * +1 (U17 cross-episode fence Hardening);
 	 * spec-4.6a r3-P2-2:+2 (same-epoch dead-set growth re-stamp + no-churn);
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage). */
-	UT_PLAN(87);
+	UT_PLAN(88);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -4718,6 +4807,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 
 	/* spec-4.6a nightly regression — joiner-side DONE accounting liveness. */
 	UT_RUN(test_recovery_idle_joiner_accounts_done_epoch_for_fence);
+	UT_RUN(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

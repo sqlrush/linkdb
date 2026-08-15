@@ -8,8 +8,8 @@
  *	  backend file I/O:
  *
  *	    ensure()           postmaster startup, after the spec-4.1 claim
- *	                       validation: create-once (O_EXCL + L47 fsync
- *	                       discipline) or validate the existing header.
+ *	                       validation: read-only full-registry validation.
+ *	                       Offline initdb finalization is the sole creator.
  *	                       Fail-closed FATAL 53RA2.
  *	    publish_active()   phase4 -> CLUSTER_PHASE_RUNNING transition:
  *	                       recovery succeeded, the node is about to
@@ -61,13 +61,17 @@
 
 #include "access/xlog.h"		 /* GetXLogWriteRecPtr, GetWALInsertionTimeLine */
 #include "access/xlogrecovery.h" /* GetXLogReplayRecPtr (spec-6.4 standby stop) */
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/proc.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -155,113 +159,305 @@ write_block(const char *path, off_t off, const void *block)
 }
 
 /*
+ * RF A1 CF_VERIFIED_X predicate.  The file itself is validated after the
+ * coordinated hold; this predicate only proves the existing coordination
+ * authority needed before a formed-registry mutation may begin.
+ */
+static bool
+wal_state_cf_prerequisites_ready(void)
+{
+	ClusterResId cf_resid;
+
+	if (!cluster_controlfile_shared_authority || !cluster_lms_enabled
+		|| !cluster_lms_is_ready() || MyProc == NULL)
+		return false;
+	cluster_cf_resid_encode(&cf_resid);
+	return cluster_grd_lookup_master(&cf_resid) >= 0;
+}
+
+/*
+ * cluster_wal_state_update_own -- RF A1 sole formed-registry RMW.
+ *
+ * ACQUIRE_X owns the verified CF(X) hold and releases it on every exit.
+ * BORROW_X proves the caller already holds that same verified lock and never
+ * re-enters or releases it.  All file decisions use one fresh header and own
+ * slot image read under that hold.  There is one write attempt and never a
+ * compensating overwrite, truncate, unlink or rename.
+ */
+ClusterWalStateUpdateResult
+cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStateCfMode cf_mode,
+							 ClusterWalStateSlot *published_slot)
+{
+	ClusterWalStateHeader header;
+	ClusterWalStateSlot fresh_before;
+	ClusterWalStateSlot expected_after;
+	ClusterWalStateSlot fresh_observed;
+	ClusterWalStateUpdateResult result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+	char path[MAXPGPATH];
+	uint16 thread_id;
+	int fd = -1;
+	bool acquired_here = false;
+	struct stat st;
+	ssize_t nbytes;
+
+	if (update == NULL
+		|| (cf_mode != CLUSTER_WAL_STATE_CF_ACQUIRE_X
+			&& cf_mode != CLUSTER_WAL_STATE_CF_BORROW_X))
+		return CLUSTER_WAL_STATE_UPDATE_INVALID;
+	if (!cluster_enabled || !registry_configured())
+		return CLUSTER_WAL_STATE_UPDATE_DISABLED;
+	if (!wal_state_cf_prerequisites_ready())
+		return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+
+	if (cf_mode == CLUSTER_WAL_STATE_CF_ACQUIRE_X) {
+		/* Do not trip cluster_cf_lock's deliberate non-reentrant Assert. */
+		if (cluster_cf_held(ExclusiveLock) || !cluster_cf_lock(ExclusiveLock))
+			return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+		acquired_here = true;
+	} else if (!cluster_cf_held(ExclusiveLock))
+		return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+
+	/* Re-prove the derived predicates together with the successful held state. */
+	if (!cluster_cf_held(ExclusiveLock) || !wal_state_cf_prerequisites_ready()) {
+		result = CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+		goto out;
+	}
+
+	thread_id = cluster_wal_thread_id();
+	if (thread_id < XLP_THREAD_ID_FIRST_REAL || thread_id > CLUSTER_WAL_THREAD_MAX) {
+		result = CLUSTER_WAL_STATE_UPDATE_INVALID;
+		goto out;
+	}
+
+	registry_path(path, sizeof(path));
+	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
+	if (fd < 0) {
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	if (fstat(fd, &st) != 0) {
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	if (st.st_size != (off_t)CLUSTER_WAL_STATE_FILE_SIZE) {
+		result = CLUSTER_WAL_STATE_UPDATE_CORRUPT;
+		goto out;
+	}
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
+	nbytes = pg_pread(fd, &header, sizeof(header), 0);
+	pgstat_report_wait_end();
+	if (nbytes != (ssize_t)sizeof(header)) {
+		if (nbytes >= 0)
+			errno = EIO;
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	if (!cluster_wal_state_header_validate(&header, NULL)) {
+		result = CLUSTER_WAL_STATE_UPDATE_CORRUPT;
+		goto out;
+	}
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
+	nbytes = pg_pread(fd, &fresh_before, sizeof(fresh_before),
+					  CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id));
+	pgstat_report_wait_end();
+	if (nbytes != (ssize_t)sizeof(fresh_before)) {
+		if (nbytes >= 0)
+			errno = EIO;
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+
+	result = cluster_wal_state_slot_prepare_update(
+		&fresh_before, thread_id, cluster_node_id, update, &expected_after);
+	if (result == CLUSTER_WAL_STATE_UPDATE_NOOP) {
+		if (published_slot != NULL)
+			memcpy(published_slot, &fresh_before, sizeof(*published_slot));
+		goto out;
+	}
+	if (result != CLUSTER_WAL_STATE_UPDATE_OK)
+		goto out;
+
+	if (cluster_injection_should_skip("cluster-wal-state-write-fail")) {
+		errno = EIO;
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_WRITE);
+	nbytes = pg_pwrite(fd, &expected_after, sizeof(expected_after),
+					   CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id));
+	if (nbytes != (ssize_t)sizeof(expected_after)) {
+		if (nbytes >= 0)
+			errno = EIO;
+		pgstat_report_wait_end();
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	if (pg_fsync(fd) != 0) {
+		pgstat_report_wait_end();
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	pgstat_report_wait_end();
+
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
+	nbytes = pg_pread(fd, &fresh_observed, sizeof(fresh_observed),
+					  CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id));
+	pgstat_report_wait_end();
+	if (nbytes != (ssize_t)sizeof(fresh_observed)) {
+		if (nbytes >= 0)
+			errno = EIO;
+		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
+		goto out;
+	}
+	result = cluster_wal_state_slot_verify_postread(
+		&expected_after, &fresh_observed, thread_id, cluster_node_id);
+	if (result == CLUSTER_WAL_STATE_UPDATE_OK && published_slot != NULL)
+		memcpy(published_slot, &fresh_observed, sizeof(*published_slot));
+
+out:
+	if (fd >= 0) {
+		int save_errno = errno;
+
+		(void)close(fd);
+		errno = save_errno;
+	}
+	if (acquired_here)
+		cluster_cf_unlock(ExclusiveLock);
+	return result;
+}
+
+/*
  * cluster_wal_state_ensure
  *
- *	Create-once or validate.  Called from cluster_wal_thread_init()
- *	(postmaster, after the claim validation, before StartupXLOG).
- *	FATAL 53RA2 on corruption or I/O failure -- never a silent
- *	fallback, never an automatic rebuild of a corrupt registry.
+ *	Validate only.  Called from cluster_wal_thread_init() (postmaster,
+ *	after the claim validation, before StartupXLOG).  initdb --check and
+ *	--boot probes are intentionally earlier than the frontend finalizer.
+ *	FATAL 53RA2 on missing, corrupt, foreign or unreadable evidence.
  */
 bool
 cluster_wal_state_ensure(void)
 {
 	char path[MAXPGPATH];
 	int fd;
-	ClusterWalStateHeader header;
-	int got;
+	unsigned char *image;
+	ClusterWalStateSlot own_slot;
+	ClusterWalSlotVerdict own_verdict;
+	uint16 bad_thread = 0;
+	uint16 own_thread;
 	const char *reason = NULL;
 	struct stat st;
+	int block;
 
-	if (!registry_configured())
+	if (IsBootstrapProcessingMode() || !registry_configured())
 		return false;
 
 	registry_path(path, sizeof(path));
+	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+						errmsg("could not open required WAL state registry \"%s\": %m", path),
+						errhint("Provision or restore a known-valid registry while the cluster is "
+								"fully offline; runtime startup never creates or repairs it.")));
+	if (fstat(fd, &st) != 0) {
+		int save_errno = errno;
 
-	fd = BasicOpenFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
-	if (fd >= 0) {
-		/* First boot of the whole registry: zero file + header. */
-		char *zeros = palloc0(CLUSTER_WAL_STATE_FILE_SIZE);
-		ssize_t nwritten;
-		bool ok;
+		(void)close(fd);
+		errno = save_errno;
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+						errmsg("could not stat open WAL state registry \"%s\": %m", path),
+						errhint("Check that the shared WAL storage is reachable.")));
+	}
+	if (!S_ISREG(st.st_mode) || st.st_size != (off_t)CLUSTER_WAL_STATE_FILE_SIZE) {
+		long long actual_size = (long long)st.st_size;
 
-		cluster_wal_state_header_fill((ClusterWalStateHeader *)zeros, (int64)GetCurrentTimestamp());
+		(void)close(fd);
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+						errmsg("WAL state registry \"%s\" is not a regular exact-size file "
+							   "(size %lld, expected %d)",
+							   path, actual_size, CLUSTER_WAL_STATE_FILE_SIZE),
+						errhint("Restore a known-valid registry while the cluster is fully offline; "
+								"runtime startup preserves the invalid evidence.")));
+	}
 
-		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_WRITE);
-		nwritten = pg_pwrite(fd, zeros, CLUSTER_WAL_STATE_FILE_SIZE, 0);
-		ok = (nwritten == (ssize_t)CLUSTER_WAL_STATE_FILE_SIZE) && pg_fsync(fd) == 0;
-		pgstat_report_wait_end();
-		pfree(zeros);
+	image = palloc0(CLUSTER_WAL_STATE_FILE_SIZE);
+	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
+	for (block = 0; block <= CLUSTER_WAL_STATE_SLOT_COUNT; block++) {
+		off_t offset = (off_t)block * CLUSTER_WAL_STATE_SLOT_SIZE;
+		ssize_t nread
+			= pg_pread(fd, image + offset, CLUSTER_WAL_STATE_SLOT_SIZE, offset);
 
-		if (!ok) {
-			int save_errno = errno;
+		if (nread != CLUSTER_WAL_STATE_SLOT_SIZE) {
+			int save_errno = nread < 0 ? errno : EIO;
 
-			close(fd);
-			(void)unlink(path);
+			pgstat_report_wait_end();
+			pfree(image);
+			(void)close(fd);
 			errno = save_errno;
 			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-							errmsg("could not initialise WAL state registry \"%s\": %m", path),
-							errhint("Check that the shared WAL storage is writable.")));
+							errmsg("could not fully read WAL state registry \"%s\": %m", path),
+							errhint("Restore a known-valid registry while the cluster is fully "
+									"offline; runtime startup preserves the invalid evidence.")));
 		}
-		close(fd);
-
-		/* L47 create side: make the new dirent durable too. */
-		fd = BasicOpenFile(cluster_wal_threads_dir, O_RDONLY | PG_BINARY);
-		if (fd < 0)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					 errmsg("could not open WAL threads root \"%s\": %m", cluster_wal_threads_dir),
-					 errhint("Check that the shared WAL storage is writable.")));
-		if (pg_fsync(fd) != 0) {
-			int save_errno = errno;
-
-			close(fd);
-			errno = save_errno;
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					 errmsg("could not fsync WAL threads root \"%s\": %m", cluster_wal_threads_dir),
-					 errhint("Check that the shared WAL storage is writable.")));
-		}
-		close(fd);
-
-		ereport(LOG, (errmsg("pgrac WAL state registry created at \"%s\"", path)));
-		return true;
 	}
-	if (errno != EEXIST)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("could not open WAL state registry \"%s\": %m", path),
-						errhint("Check that the shared WAL storage is reachable.")));
+	pgstat_report_wait_end();
+	if (close(fd) != 0) {
+		int save_errno = errno;
 
-	/*
-	 * Exists (possibly created by a concurrent first boot): validate.
-	 * The layout is a fixed 66048 bytes; a valid header glued to a
-	 * truncated (or extended) slot area must not pass, and the file is
-	 * never auto-resized (spec-4.2 user codereview round 2, P1).
-	 */
-	if (stat(path, &st) != 0)
+		pfree(image);
+		errno = save_errno;
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("could not stat WAL state registry \"%s\": %m", path),
-						errhint("Check that the shared WAL storage is reachable.")));
-	if (st.st_size != (off_t)CLUSTER_WAL_STATE_FILE_SIZE)
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("WAL state registry \"%s\" has unexpected size %lld, expected %d",
-							   path, (long long)st.st_size, CLUSTER_WAL_STATE_FILE_SIZE),
-						errhint("The registry is never resized in place.  After confirming the "
-								"shared storage, remove the file and restart (it is rebuilt "
-								"empty; slots repopulate as nodes start).")));
+						errmsg("could not close WAL state registry \"%s\": %m", path)));
+	}
 
-	got = read_block(path, 0, &header);
-	if (got <= 0)
+	if (!cluster_wal_state_image_validate(image, CLUSTER_WAL_STATE_FILE_SIZE, &bad_thread,
+										  &reason)) {
+		pfree(image);
+		if (bad_thread == 0)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+							errmsg("WAL state registry \"%s\" failed validation", path),
+							errdetail("Header validation failed: %s.",
+									  reason != NULL ? reason : "unknown"),
+							errhint("Restore a known-valid registry while the cluster is fully "
+										"offline; runtime startup never deletes, truncates or "
+										"rebuilds it.")));
+		else
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+							errmsg("WAL state registry \"%s\" failed validation", path),
+							errdetail("Slot %u validation failed: %s.", (unsigned)bad_thread,
+									  reason != NULL ? reason : "unknown"),
+							errhint("Restore a known-valid registry while the cluster is fully "
+										"offline; runtime startup never deletes, truncates or "
+										"rebuilds it.")));
+	}
+
+	own_thread = cluster_wal_thread_id();
+	memcpy(&own_slot, image + CLUSTER_WAL_STATE_SLOT_OFFSET(own_thread), sizeof(own_slot));
+	own_verdict
+		= cluster_wal_state_slot_classify(&own_slot, own_thread, cluster_node_id, &reason);
+	if (own_verdict != CLUSTER_WAL_SLOT_EMPTY && own_verdict != CLUSTER_WAL_SLOT_OK) {
+		pfree(image);
+		if (own_verdict == CLUSTER_WAL_SLOT_FOREIGN)
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+					 errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
+							(unsigned)own_thread),
+					 errdetail("Own-slot validation failed: node_id mismatch "
+							   "(expected %d, found %d).",
+							   cluster_node_id, (int)own_slot.node_id),
+					 errhint("Restore the correct known-valid registry while the cluster is "
+							 "fully offline; foreign ownership evidence is preserved.")));
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("could not read WAL state registry header \"%s\": %m", path),
-						errhint("The registry is unreadable or torn.  After confirming the "
-								"shared storage, remove the file and restart (it is rebuilt "
-								"empty; slots repopulate as nodes start).")));
-	if (!cluster_wal_state_header_validate(&header, &reason))
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("WAL state registry \"%s\" failed validation", path),
-						errdetail("Header validation failed: %s.", reason ? reason : "unknown"),
-						errhint("After confirming the shared storage, remove the file and restart "
-								"(it is rebuilt empty; slots repopulate as nodes start).")));
+					errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
+							   (unsigned)own_thread),
+						errdetail("Own-slot validation failed: %s.",
+								  reason != NULL ? reason : "unknown"),
+						errhint("Restore the correct known-valid registry while the cluster is "
+								"fully offline; foreign ownership evidence is preserved.")));
+	}
+	pfree(image);
 	return true;
 }
 
@@ -299,7 +495,8 @@ fill_own_slot(ClusterWalStateSlot *slot, uint32 state, int64 started_at)
  *	56..503) from `prev` into a freshly filled `slot` and recompute the
  *	CRC.  fill memsets the whole slot, so without this every owner write
  *	(publish/refresh/stopped) would zero checkpoint_redo_lsn /
- *	fpw_was_off / merge_recovered_lsn / refresh_interval_ms every tick
+ *	fpw_was_off / the retained merge_recovered_lsn compatibility bytes /
+ *	refresh_interval_ms every tick
  *	(§3.3d.4, round-5 P0-2).  prev must be an OK read-back; on EMPTY/
  *	CORRUPT the region stays zero (the fill default), which classifies
  *	as "unknown" and is fail-closed at the merge gate.
@@ -364,10 +561,10 @@ cluster_wal_state_publish_active(void)
 
 	fill_own_slot(&slot, CLUSTER_WAL_SLOT_STATE_ACTIVE, (int64)GetCurrentTimestamp());
 	/*
-	 * Preserve the 4.5 extension region from the prior incarnation, but
-	 * CLEAR merge_recovered_lsn: reaching RUNNING means this node has
-	 * finished its own recovery, so any coordinator-set authority bound
-	 * is spent (§3.3c).  checkpoint_redo_lsn / fpw_was_off survive.
+	 * Preserve the 4.5 extension region from the prior incarnation, but clear
+	 * the retained merge_recovered_lsn compatibility bytes.  Recovery readers
+	 * already treat them as semantic zero; checkpoint_redo_lsn / fpw_was_off
+	 * survive.
 	 */
 	if (cluster_wal_state_read_slot(cluster_wal_thread_id(), &cur) == CLUSTER_WAL_SLOT_OK)
 		preserve_ext_region(&slot, &cur);
@@ -384,49 +581,46 @@ cluster_wal_state_publish_active(void)
 /*
  * cluster_wal_state_publish_stopped
  *
- *	Clean shutdown only (the postmaster exit path gates on
- *	Shutdown < ImmediateShutdown && !FatalError).  Failure must never
- *	block a shutdown: WARNING + carry on.  started_at is preserved
- *	from the slot on disk (same incarnation).
+ *	RF A1 W3, called only by the checkpointer after ShutdownXLOG returns.
+ *	The common formed-registry RMW reacquires verified CF(X), changes the
+ *	frozen STOPPED mask, fsyncs and verifies the exact after-image.  Failure
+ *	must never block shutdown: WARNING + carry on, leaving ACTIVE/evidence.
  */
 void
 cluster_wal_state_publish_stopped(void)
 {
-	ClusterWalStateSlot cur;
-	ClusterWalStateSlot slot;
-	ClusterWalSlotVerdict v;
-	int64 started_at;
+	ClusterWalStateUpdate update;
+	ClusterWalStateUpdateResult result;
+	TimeLineID tli;
+	XLogRecPtr write_ptr;
 
 	if (!registry_configured())
 		return;
 
-	v = cluster_wal_state_read_slot(cluster_wal_thread_id(), &cur);
-
-	/*
-	 * Same foreign-owner gate as publish_active(), demoted to WARNING:
-	 * shutdown is never blocked, but foreign evidence is never erased
-	 * either (spec-4.2 user codereview round 2 P1).
-	 */
-	if (v == CLUSTER_WAL_SLOT_OK && cur.node_id != cluster_node_id) {
-		ereport(WARNING,
-				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-				 errmsg("not publishing STOPPED: WAL state registry slot %u is owned by node %d, "
-						"but this node is %d",
-						(unsigned)cluster_wal_thread_id(), (int)cur.node_id, cluster_node_id),
-				 errhint("The foreign slot is left untouched as evidence.")));
-		return;
+	if (RecoveryInProgress()) {
+		write_ptr = GetXLogReplayRecPtr(&tli);
+	} else {
+		tli = GetWALInsertionTimeLine();
+		write_ptr = GetXLogWriteRecPtr();
 	}
 
-	started_at = (v == CLUSTER_WAL_SLOT_OK) ? cur.started_at : (int64)GetCurrentTimestamp();
-
-	fill_own_slot(&slot, CLUSTER_WAL_SLOT_STATE_STOPPED, started_at);
-	if (v == CLUSTER_WAL_SLOT_OK)
-		preserve_ext_region(&slot, &cur);
-	if (!write_own_slot(&slot))
+	memset(&update, 0, sizeof(update));
+	update.kind = CLUSTER_WAL_STATE_UPDATE_STOPPED;
+	update.tli = (uint32)tli;
+	update.last_updated = (int64)GetCurrentTimestamp();
+	update.highest_lsn = (uint64)write_ptr;
+	update.highest_scn = (uint64)cluster_scn_current();
+	result = cluster_wal_state_update_own(
+		&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+	if (result != CLUSTER_WAL_STATE_UPDATE_OK
+		&& result != CLUSTER_WAL_STATE_UPDATE_NOOP
+		&& result != CLUSTER_WAL_STATE_UPDATE_DISABLED)
 		ereport(WARNING, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						  errmsg("could not publish STOPPED to the WAL state registry: %m"),
-						  errhint("The slot stays ACTIVE; spec-4.3 readers treat it via the "
-								  "staleness inference.")));
+						  errmsg("could not publish STOPPED to the WAL state registry "
+								 "(update result %d)",
+								 (int)result),
+						  errhint("The slot stays ACTIVE; recovery readers treat it "
+								  "conservatively.")));
 }
 
 /*
@@ -547,32 +741,6 @@ cluster_wal_state_mark_fpw_off(void)
 				 errmsg("could not record full_page_writes=off in the WAL state registry: %m"),
 				 errhint("Merged recovery treats an unrecorded fpw history "
 						 "conservatively.")));
-}
-
-/*
- * cluster_wal_state_publish_merge_recovered -- §3.3c authority write.
- *	Cross-owner exception: the merge coordinator records recovered_lsn
- *	in a CRASHED peer's slot (the peer is down, so there is no racing
- *	owner write).  Read-modify-preserve so the rest of the peer's slot
- *	is untouched.
- */
-void
-cluster_wal_state_publish_merge_recovered(uint16 thread_id, uint64 recovered_lsn)
-{
-	char path[MAXPGPATH];
-	ClusterWalStateSlot slot;
-
-	if (!registry_configured())
-		return;
-	if (cluster_wal_state_read_slot(thread_id, &slot) != CLUSTER_WAL_SLOT_OK)
-		return;
-	slot.merge_recovered_lsn = recovered_lsn;
-	slot.crc = cluster_wal_state_block_crc(&slot);
-	registry_path(path, sizeof(path));
-	if (!write_block(path, CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id), &slot))
-		ereport(WARNING, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						  errmsg("could not record merged-recovery progress for thread %u: %m",
-								 (unsigned)thread_id)));
 }
 
 /*

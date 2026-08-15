@@ -376,6 +376,55 @@ UT_TEST(test_p033_active_and_safety_boundary_matrix)
 				 (int)CVV_FAILCLOSED_UNKNOWN);
 }
 
+/* Spec 8.4A I18/I19: the normal commit-stamp is a live block0 modifier. */
+UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
+{
+	char *source = read_source(TT_LOCAL_SOURCE_PATH);
+	const char *start;
+	const char *end;
+	const char *peek;
+	const char *enter;
+	const char *try_block;
+	const char *recheck;
+	const char *durable;
+	const char *finally_block;
+	const char *leave;
+
+	if (source == NULL)
+		return;
+	start = strstr(source, "\ncluster_tt_local_precommit_durable_finish(");
+	end = start == NULL ? NULL : strstr(start, "\n}\n\nvoid\ncluster_tt_local_record_commit(");
+	peek = start == NULL ? NULL : strstr(start, "cluster_tt_local_peek_binding(");
+	enter = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_enter(");
+	try_block = start == NULL ? NULL : strstr(start, "PG_TRY();");
+	recheck = start == NULL
+				  ? NULL
+				  : strstr(start, "cluster_tt_local_modifier_recheck_or_error(");
+	durable = recheck == NULL
+				? NULL
+				: strstr(recheck, "cluster_tt_slot_durable_commit_writeonly(");
+	finally_block = start == NULL ? NULL : strstr(start, "PG_FINALLY();");
+	leave = finally_block == NULL
+				? NULL
+				: strstr(finally_block, "cluster_semantic_activation_leave(");
+
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(peek);
+	UT_ASSERT_NOT_NULL(enter);
+	UT_ASSERT_NOT_NULL(try_block);
+	UT_ASSERT_NOT_NULL(recheck);
+	UT_ASSERT_NOT_NULL(durable);
+	UT_ASSERT_NOT_NULL(finally_block);
+	UT_ASSERT_NOT_NULL(leave);
+	if (start != NULL && end != NULL && peek != NULL && enter != NULL && try_block != NULL
+		&& recheck != NULL && durable != NULL && finally_block != NULL && leave != NULL)
+		UT_ASSERT(start < peek && peek < enter && enter < try_block && try_block < recheck
+				  && recheck < durable && durable < finally_block && finally_block < leave
+				  && leave < end);
+	free(source);
+}
+
 
 int
 main(void)
@@ -394,5 +443,6 @@ main(void)
 	UT_RUN(test_t12_status_enum_5_values);
 	UT_RUN(test_p033_data_dml_publishes_active_identity);
 	UT_RUN(test_p033_active_and_safety_boundary_matrix);
+	UT_RUN(test_normal_commit_stamp_is_modifier_gated_and_error_safe);
 	UT_DONE();
 }

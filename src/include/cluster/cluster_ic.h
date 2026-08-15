@@ -387,6 +387,19 @@ typedef enum ClusterICPlane {
  * the same committed OPEN generation on every admitted peer. */
 #define PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 ((uint32)0x00001000U)
 #define PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1 ((uint32)0x00002000U)
+/* Spec-5.15A corrected-A1 indivisible replacement/epoch/READY grammar.
+ * 0x00004000 was a superseded standalone proposal and must stay unused. */
+#define PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1 UINT32_C(0x00008000)
+/* Spec-3.6b: peer accepts the current-MultiXact describe/proof family. */
+#define PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 UINT32_C(0x00010000)
+/* RF-ROOT: this binary understands the central control-root v1 format and
+ * rejects unknown active root feature bits.  This is binary capability only;
+ * it does not activate any root feature. */
+#define PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1 UINT32_C(0x00080000)
+#define PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1 ((uint32)0x00100000U)
+/* Spec-8.4A A-prime: this binary preserves and validates the append-only
+ * PGRD V1 root descriptor and its exact mirror applicability proof. */
+#define PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1 ((uint32)0x00200000U)
 /*
  * PGRAC: spec-7.2 D2 — plane + connection-epoch ride the documented-zero
  * pad region (capabilities precedent: occupy pad bytes, do not resize V1).
@@ -487,6 +500,7 @@ cluster_ic_hello_n_workers(const ClusterICHelloMsg *msg)
  * MUST go via PGRAC_IC_HELLO_VERSION_V2 (new struct + dispatch on
  * hello_version field), never resize V1 in-place.
  */
+extern uint32 cluster_ic_local_capability_word(void);
 extern void cluster_ic_build_hello(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint16 hello_version,
 								   uint16 envelope_version, int32 source_node_id,
 								   const char *cluster_name, ClusterICPlane plane,

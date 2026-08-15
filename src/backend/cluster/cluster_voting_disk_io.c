@@ -55,6 +55,10 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <linux/fs.h>
+#include <sys/ioctl.h>
+#endif
 
 /* ============================================================
  * Hardening v0.4 P1.4 — per-I/O timeout via SIGALRM + setitimer.
@@ -376,6 +380,8 @@ cluster_voting_disk_format(int fd, uint32 max_nodes, uint32 disk_index)
 
 	if (fd < 0)
 		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (max_nodes == 0 || max_nodes > CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
 
 	for (node_id = 0; node_id < max_nodes; node_id++) {
 		ClusterVotingDiskIoState rc;
@@ -394,6 +400,16 @@ cluster_voting_disk_format(int fd, uint32 max_nodes, uint32 disk_index)
 		if (rc != CLUSTER_VOTING_DISK_IO_OK)
 			return rc;
 	}
+
+	/*
+	 * The append-only map is one device ABI, not a sequence of sparse runtime
+	 * guesses.  Materialize its complete frozen capacity at format time so the
+	 * PGSA and per-proposer EPBL lanes cannot fail later merely because an old
+	 * heartbeat-only file ended early.  Payload slots remain all-zero until
+	 * their sole writers publish canonical records.
+	 */
+	if (ftruncate(fd, CLUSTER_VOTING_FILE_BYTES_MIN) != 0 || fdatasync(fd) != 0)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
 
 	/*
 	 * spec-5.13 D2/§2.5 — the clean-leave marker region (region 2, at
@@ -749,7 +765,7 @@ cluster_voting_disk_read_raw_tail_slot(int fd, void *out_slot512)
 
 	memset(aligned, 0, sizeof(aligned));
 	voting_disk_io_arm_timeout();
-	nread = pread(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_FILE_BYTES_MIN);
+	nread = pread(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_PGSA_SLOT_OFFSET);
 	voting_disk_io_disarm_timeout();
 
 	if (nread == CLUSTER_VOTING_SLOT_BYTES) {
@@ -776,7 +792,7 @@ cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512)
 
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 	voting_disk_io_arm_timeout();
-	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_FILE_BYTES_MIN);
+	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, CLUSTER_VOTING_PGSA_SLOT_OFFSET);
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -787,6 +803,153 @@ cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512)
 	}
 	voting_disk_io_disarm_timeout();
 	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+ClusterVotingDiskRawReadState
+cluster_voting_disk_read_raw_slot_at(int fd, off_t offset, void *out_slot512)
+{
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nread;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_RAW_READ_NOT_TRIED;
+	if (out_slot512 == NULL || offset < 0
+		|| offset % CLUSTER_VOTING_SLOT_BYTES != 0)
+		return CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
+
+	memset(aligned, 0, sizeof(aligned));
+	voting_disk_io_arm_timeout();
+	nread = pread(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, offset);
+	voting_disk_io_disarm_timeout();
+	if (nread == CLUSTER_VOTING_SLOT_BYTES) {
+		memcpy(out_slot512, aligned, CLUSTER_VOTING_SLOT_BYTES);
+		return CLUSTER_VOTING_DISK_RAW_READ_FULL;
+	}
+	if (nread == 0)
+		return CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF;
+	if (nread > 0)
+		return CLUSTER_VOTING_DISK_RAW_READ_SHORT;
+	return CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
+}
+
+
+ClusterVotingDiskIoState
+cluster_voting_disk_write_raw_slot_at(int fd, off_t offset,
+								  const void *in_slot512)
+{
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nwritten;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (in_slot512 == NULL || offset < 0
+		|| offset % CLUSTER_VOTING_SLOT_BYTES != 0)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
+	voting_disk_io_arm_timeout();
+	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES, offset);
+	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	if (fdatasync(fd) != 0) {
+		voting_disk_io_disarm_timeout();
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	}
+	voting_disk_io_disarm_timeout();
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+/*
+ * spec-5.15A §2.2 — authority-lane I/O is deliberately separate from the
+ * cancelable SIGALRM marker path.  A short/EINTR/error result is terminal for
+ * this attempt; the ballot actor owns retry, same-disk readback and quorum.
+ */
+ClusterVotingDiskIoState
+cluster_voting_disk_read_epoch_ballot_slot(int fd, uint32 proposer_node_id, void *out_slot512)
+{
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nread;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (out_slot512 == NULL || proposer_node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memset(aligned, 0, sizeof(aligned));
+	nread = pread(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+				  CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(proposer_node_id));
+	if (nread != CLUSTER_VOTING_SLOT_BYTES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(out_slot512, aligned, CLUSTER_VOTING_SLOT_BYTES);
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+ClusterVotingDiskIoState
+cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id,
+											const void *in_slot512)
+{
+	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
+	ssize_t nwritten;
+
+	if (fd < 0)
+		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
+	if (in_slot512 == NULL || proposer_node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
+	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+					CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(proposer_node_id));
+	if (nwritten != CLUSTER_VOTING_SLOT_BYTES)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+	if (fdatasync(fd) != 0)
+		return CLUSTER_VOTING_DISK_IO_FAILED;
+
+	return CLUSTER_VOTING_DISK_IO_OK;
+}
+
+/* spec-5.15A §2.1A.3: positive ballot authority is narrower than the
+ * payload-neutral lane I/O used by unit fixtures.  It requires an actual
+ * Linux block device, an effective O_DIRECT descriptor and kernel-reported
+ * capacity for the complete frozen voting map. */
+static bool
+voting_disk_raw_authority_attest(int fd, uint64 required_capacity)
+{
+#ifdef __linux__
+	struct stat st;
+	uint64 capacity = 0;
+	int flags;
+
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISBLK(st.st_mode))
+		return false;
+	flags = fcntl(fd, F_GETFL);
+	if (flags < 0 || (flags & O_DIRECT) == 0)
+		return false;
+	if (ioctl(fd, BLKGETSIZE64, &capacity) != 0)
+		return false;
+	return capacity >= required_capacity
+		   && (capacity % CLUSTER_VOTING_SLOT_BYTES) == 0;
+#else
+	(void)fd;
+	(void)required_capacity;
+	return false;
+#endif
+}
+
+bool
+cluster_voting_disk_epoch_ballot_authority_attest(int fd)
+{
+	return voting_disk_raw_authority_attest(
+		fd, (uint64)CLUSTER_VOTING_FILE_BYTES_MIN);
+}
+
+bool
+cluster_voting_disk_pgrd_authority_attest(int fd)
+{
+	return voting_disk_raw_authority_attest(
+		fd, (uint64)CLUSTER_VOTING_PGRD_FILE_BYTES_MIN);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

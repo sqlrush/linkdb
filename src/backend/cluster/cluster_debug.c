@@ -98,6 +98,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_cr_pool.h"		  /* cluster_cr_pool_* counters (spec-5.51 D9) */
 #include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
@@ -149,6 +150,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_tt_status.h"		 /* TT status overlay counter accessors (spec-3.1 D9) */
 #include "cluster/cluster_tt_status_hint.h"	 /* TT status hint counter accessors (spec-3.2 D8) */
 #include "cluster/cluster_tx_enqueue.h"		 /* TX enqueue wait counters (spec-5.2 D4/D6) */
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_startup_phase.h"	 /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
@@ -3156,6 +3158,37 @@ dump_undo(ReturnSetInfo *rsinfo)
 static void
 dump_cr(ReturnSetInfo *rsinfo)
 {
+	/* Stage 8 R4 D11: complete frozen event surface.  Producers absent from
+	 * the current happy-path minimum remain honest monotonic zeroes. */
+	emit_row(rsinfo, "r4", "cr_route_started_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_ROUTE_STARTED)));
+	emit_row(rsinfo, "r4", "cr_holder_full_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_HOLDER_FULL)));
+	emit_row(rsinfo, "r4", "cr_holder_retry_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_HOLDER_RETRY)));
+	emit_row(rsinfo, "r4", "cr_holder_failclosed_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_CR_HOLDER_FAIL_CLOSED)));
+	emit_row(rsinfo, "r4", "undo_data_fetch_served_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_UNDO_FETCH_SERVED)));
+	emit_row(rsinfo, "r4", "undo_data_fetch_denied_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_UNDO_FETCH_DENIED)));
+	emit_row(rsinfo, "r4", "tx_resolve_unknown_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_UNKNOWN)));
+	emit_row(rsinfo, "r4", "tx_resolve_in_progress_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_IN_PROGRESS)));
+	emit_row(rsinfo, "r4", "tx_resolve_prepared_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_PREPARED)));
+	emit_row(rsinfo, "r4", "tx_resolve_committed_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_COMMITTED)));
+	emit_row(rsinfo, "r4", "tx_resolve_aborted_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_TX_ABORTED)));
+	emit_row(rsinfo, "r4", "multi_resolve_served_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_MULTI_SERVED)));
+	emit_row(rsinfo, "r4", "multi_resolve_unknown_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_MULTI_UNKNOWN)));
+	emit_row(rsinfo, "r4", "slot_capacity_retry_count",
+			 fmt_int64((int64)cluster_cr_r4_event_count(CLUSTER_R4_EVENT_SLOT_CAPACITY_RETRY)));
+
 	emit_row(rsinfo, "cr", "cr_construct_count", fmt_int64((int64)cluster_cr_construct_count()));
 	emit_row(rsinfo, "cr", "cr_snapshot_too_old_count",
 			 fmt_int64((int64)cluster_cr_snapshot_too_old_count()));
@@ -3475,7 +3508,7 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 }
 
 /*
- * dump_write_fence -- spec-4.12 D7 + spec-4.12b D6.  Emits 8 rows under
+ * dump_write_fence -- spec-4.12 D7 + STOP-04 §3.13.  Emits 20 rows under
  *	category='write_fence': the 4 spec-4.12 cooperative write-fence counters plus the
  *	4 spec-4.12b baseline-subsystem observability fields (L110-safe -- read 0 with no
  *	region attached).
@@ -3483,6 +3516,9 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 static void
 dump_write_fence(ReturnSetInfo *rsinfo)
 {
+	uint64 proof_age_ms;
+	bool proof_age_valid;
+
 	emit_row(rsinfo, "write_fence", "hot_gate_blocked",
 			 fmt_int64((int64)cluster_write_fence_get_hot_gate_blocked()));
 	emit_row(rsinfo, "write_fence", "durable_check_blocked",
@@ -3500,6 +3536,33 @@ dump_write_fence(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)(cluster_write_fence_get_baseline_author_is_self() ? 1 : 0)));
 	emit_row(rsinfo, "write_fence", "baseline_authority_age_us",
 			 fmt_int64((int64)cluster_write_fence_get_baseline_authority_age_us()));
+	/* STOP-04 adds diagnostics only; none is an authority input. */
+	emit_row(rsinfo, "write_fence", "external_admit_requested",
+			 fmt_uint64(cluster_write_fence_get_external_admit_requested()));
+	emit_row(rsinfo, "write_fence", "external_write_excluded",
+			 fmt_uint64(cluster_write_fence_get_external_write_excluded()));
+	emit_row(rsinfo, "write_fence", "external_rejected",
+			 fmt_uint64(cluster_write_fence_get_external_rejected()));
+	emit_row(rsinfo, "write_fence", "external_unknown",
+			 fmt_uint64(cluster_write_fence_get_external_unknown()));
+	emit_row(rsinfo, "write_fence", "external_unavailable",
+			 fmt_uint64(cluster_write_fence_get_external_unavailable()));
+	emit_row(rsinfo, "write_fence", "external_identity_mismatch",
+			 fmt_uint64(cluster_write_fence_get_external_identity_mismatch()));
+	emit_row(rsinfo, "write_fence", "external_expired",
+			 fmt_uint64(cluster_write_fence_get_external_expired()));
+	emit_row(rsinfo, "write_fence", "external_daemon_disconnect",
+			 fmt_uint64(cluster_write_fence_get_external_daemon_disconnect()));
+	emit_row(rsinfo, "write_fence", "external_mutation_gate_blocked",
+			 fmt_uint64(cluster_write_fence_get_external_mutation_gate_blocked()));
+	emit_row(rsinfo, "write_fence", "external_publish_gate_blocked",
+			 fmt_uint64(cluster_write_fence_get_external_publish_gate_blocked()));
+	emit_row(rsinfo, "write_fence", "external_last_journal_seq",
+			 fmt_uint64(cluster_write_fence_get_external_last_journal_seq()));
+	proof_age_valid =
+		cluster_write_fence_get_external_last_proof_age_ms(&proof_age_ms);
+	emit_row(rsinfo, "write_fence", "external_last_proof_age_ms",
+			 proof_age_valid ? fmt_uint64(proof_age_ms) : "-");
 }
 
 /*
@@ -3566,22 +3629,30 @@ dump_dl(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "dl", "release_count", fmt_int64((int64)cluster_dl_release_count()));
 }
 
-/*
- * dump_ir -- spec-5.7 §3.4 IR (instance-recovery owner) observability.
- * owner_count is the faithful proof that a survivor took the real GES-enforced
- * IR(X) recovery-owner lock before its destructive thread-recovery apply;
- * conflict_count counts the 53RA9 non-owner fail-closed path (a survivor whose
- * alive-set view diverged and lost the IR(X) claim); native_count counts the
- * single-node / no-competitor proceeds; release_count counts owner claims
- * released after the apply.
- */
+/* STOP03 §10.3 volatile observability only; none is authority. */
 static void
 dump_ir(ReturnSetInfo *rsinfo)
 {
-	emit_row(rsinfo, "ir", "owner_count", fmt_int64((int64)cluster_ir_owner_count()));
-	emit_row(rsinfo, "ir", "native_count", fmt_int64((int64)cluster_ir_native_count()));
-	emit_row(rsinfo, "ir", "conflict_count", fmt_int64((int64)cluster_ir_conflict_count()));
-	emit_row(rsinfo, "ir", "release_count", fmt_int64((int64)cluster_ir_release_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_grant_count",
+			 fmt_int64((int64)cluster_recovery_serial_grant_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_busy_count",
+			 fmt_int64((int64)cluster_recovery_serial_busy_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_retry_count",
+			 fmt_int64((int64)cluster_recovery_serial_retry_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_revalidate_reject_count",
+			 fmt_int64((int64)cluster_recovery_serial_revalidate_reject_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_node_cleanup_wait_count",
+			 fmt_int64((int64)cluster_recovery_serial_node_cleanup_wait_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_release_confirmed_count",
+			 fmt_int64((int64)cluster_recovery_serial_release_confirmed_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_release_unconfirmed_count",
+			 fmt_int64((int64)cluster_recovery_serial_release_unconfirmed_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_cold_set_grant_count",
+			 fmt_int64((int64)cluster_recovery_serial_cold_set_grant_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_capability_denied_count",
+			 fmt_int64((int64)cluster_recovery_serial_capability_denied_count()));
+	emit_row(rsinfo, "ir", "recovery_serial_native_result_rejected_count",
+			 fmt_int64((int64)cluster_recovery_serial_native_result_rejected_count()));
 }
 
 /*
@@ -3826,6 +3897,54 @@ dump_catalog(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_catalog_stats_buf_miss_count()));
 }
 
+
+static void
+dump_multixact_current(ReturnSetInfo *rsinfo)
+{
+	static const char *const names[CMX_STAT_COUNT] = {
+		[CMX_STAT_DESCRIBE_LOCAL] = "describe_local_count",
+		[CMX_STAT_DESCRIBE_REMOTE_ASK] = "describe_remote_ask_count",
+		[CMX_STAT_DESCRIBE_REMOTE_HIT] = "describe_remote_hit_count",
+		[CMX_STAT_DESCRIBE_REMOTE_DENIED] = "describe_remote_denied_count",
+		[CMX_STAT_DESCRIBE_REMOTE_SUPPORTED_LIMIT] = "describe_remote_supported_limit_count",
+		[CMX_STAT_DESCRIBE_REMOTE_TIMEOUT] = "describe_remote_timeout_count",
+		[CMX_STAT_DESCRIBE_REMOTE_UNKNOWN] = "describe_remote_unknown_count",
+		[CMX_STAT_DESCRIBE_INVALID_REPLY] = "describe_invalid_reply_count",
+		[CMX_STAT_MEMBER_PROOF_ASK] = "member_proof_ask_count",
+		[CMX_STAT_MEMBER_PROOF_HIT] = "member_proof_hit_count",
+		[CMX_STAT_MEMBER_PROOF_UNKNOWN] = "member_proof_unknown_count",
+		[CMX_STAT_MEMBER_PROOF_DENIED] = "member_proof_denied_count",
+		[CMX_STAT_MEMBER_PROOF_SUPPORTED_LIMIT] = "member_proof_supported_limit_count",
+		[CMX_STAT_MEMBER_PROOF_TIMEOUT] = "member_proof_timeout_count",
+		[CMX_STAT_MEMBER_PROOF_INVALID_REPLY] = "member_proof_invalid_reply_count",
+		[CMX_STAT_WAIT] = "wait_count",
+		[CMX_STAT_WAIT_RESOLVED] = "wait_resolved_count",
+		[CMX_STAT_WAIT_DEAD_HOLDER] = "wait_dead_holder_count",
+		[CMX_STAT_WAIT_TIMEOUT] = "wait_timeout_count",
+		[CMX_STAT_WAIT_RETRY] = "wait_retry_count",
+		[CMX_STAT_WAIT_INTERRUPTED] = "wait_interrupted_count",
+		[CMX_STAT_DEADLOCK_VICTIM] = "deadlock_victim_count",
+		[CMX_STAT_WAKEUP] = "wakeup_count",
+		[CMX_STAT_RECOMPOSE_SUCCESS] = "recompose_success_count",
+		[CMX_STAT_RECOMPOSE_FAILCLOSED] = "recompose_failclosed_count",
+		[CMX_STAT_HOT_PROOF_HIT] = "hot_proof_hit_count",
+		[CMX_STAT_HOT_PROOF_FAILCLOSED] = "hot_proof_failclosed_count",
+		[CMX_STAT_ABA_RESTART] = "aba_restart_count",
+		[CMX_STAT_RESTART_BUCKET_0] = "restart_bucket_0_count",
+		[CMX_STAT_RESTART_BUCKET_1] = "restart_bucket_1_count",
+		[CMX_STAT_RESTART_BUCKET_2_3] = "restart_bucket_2_3_count",
+		[CMX_STAT_RESTART_BUCKET_4_7] = "restart_bucket_4_7_count",
+		[CMX_STAT_RESTART_BUCKET_8_PLUS] = "restart_bucket_8_plus_count",
+		[CMX_STAT_RESTART_MAX] = "restart_max",
+		[CMX_STAT_FOREIGN_SLRU_GUARD] = "foreign_slru_guard_count",
+	};
+	int i;
+
+	for (i = 0; i < CMX_STAT_COUNT; i++)
+		emit_row(rsinfo, "multixact_current", names[i],
+				 fmt_int64((int64)cluster_multixact_current_stats_get(i)));
+}
+
 #endif /* USE_PGRAC_CLUSTER */
 
 
@@ -3894,6 +4013,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_xnode_profile(rsinfo); /* spec-5.59 D1 */
 		dump_xnode_lever(rsinfo);	/* spec-6.12 */
 		dump_xid_stripe(rsinfo);	/* spec-6.15 D6 */
+		dump_multixact_current(rsinfo);
 		dump_catalog(rsinfo);		/* spec-6.14 D10 */
 	}
 #else

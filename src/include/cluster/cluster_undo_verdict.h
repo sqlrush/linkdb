@@ -47,10 +47,10 @@
 struct ClusterGcsUndoVerdictPage; /* cluster_gcs_block.h */
 
 /*
- * Cross-node xid -> terminal-state verdict (brief line 33 taxonomy;
+ * Cross-node xid -> transaction-outcome verdict (brief line 33 taxonomy;
  * Amendment-2 refines COMMITTED_EXACT into EXACT / BOUND -> five values).
  *
- * 0 == UNKNOWN_FAIL_CLOSED: any path that cannot PROVE a terminal outcome
+ * 0 == UNKNOWN_FAIL_CLOSED: any path that cannot PROVE a usable outcome
  * lands here so the caller keeps the 53R97 fail-closed boundary (Rule 8.A /
  * L10: the zero value is fail-closed, never defaults to visible).
  */
@@ -59,7 +59,7 @@ typedef enum ClusterUndoVerdictKind {
 	CLUSTER_UNDO_VERDICT_COMMITTED_EXACT = 1, /* true commit SCN (may stamp/cache) */
 	CLUSTER_UNDO_VERDICT_COMMITTED_BOUND = 2, /* horizon bound only (never stamp/cache) */
 	CLUSTER_UNDO_VERDICT_ABORTED = 3,		  /* proven rolled back (CLOG abort) */
-	CLUSTER_UNDO_VERDICT_IN_PROGRESS = 4	  /* proven live (Q6: D3 folds to UNKNOWN) */
+	CLUSTER_UNDO_VERDICT_IN_PROGRESS = 4	  /* exact origin-proven live binding */
 } ClusterUndoVerdictKind;
 
 /*
@@ -128,20 +128,26 @@ extern ClusterUndoVerdictResult cluster_undo_verdict_from_resolve(bool ok, bool 
  * tuple.  origin_node = the xid's owner; undo_segment_id = the ITL-ref segment
  * (CP3 block0 locator); anchor_lsn = this tuple's page LSN (version-coverage
  * gate); read_scn = the snapshot SCN (COMMITTED_BOUND admissibility), or
- * InvalidScn for callers without snapshot semantics.  master==self routes to
- * the local durable resolve; master!=self to the CP3 S-grant + CP5 verdict.
+ * InvalidScn for terminal-state-only callers without snapshot ordering (a
+ * committed bound may resolve status but remains non-exact).  master==self
+ * routes to the local durable resolve; master!=self to the CP3 S-grant + CP5
+ * verdict.
  * kind == UNKNOWN_FAIL_CLOSED => the caller keeps 53R97 (never false-visible).
  *
  * authoritative (spec-5.22f D6-7) = the origin was chosen from the tuple page's
  * PHYSICAL ITL binding (a fresh-ref consumer), not derived from the xid value.
+ * expected_tt_slot_id is that same fresh ref's exact 1-based TT slot binding;
+ * only authoritative + a valid exact binding may consume an origin-proven
+ * IN_PROGRESS result.  Derived/terminal-only callers pass 0.
  * When true the origin serves underivable own xids over its own durable-TT +
  * CLOG authority (skipping the stripe self-check that guards the derived-path
  * 6.12i P0); the positive-proof gates are unchanged.  Derived (recycled) callers
  * pass false to keep cluster_xid_is_mine.  Compiled only in --enable-cluster builds.
  */
 extern ClusterUndoVerdictResult cluster_undo_verdict_resolve(int origin_node,
-															 uint32 undo_segment_id,
-															 TransactionId raw_xid, SCN read_scn,
-															 bool authoritative);
+														 uint32 undo_segment_id,
+														 TransactionId raw_xid,
+														 uint32 expected_tt_slot_id, SCN read_scn,
+														 bool authoritative);
 
 #endif /* CLUSTER_UNDO_VERDICT_H */

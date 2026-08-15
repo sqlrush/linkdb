@@ -37,8 +37,10 @@
 #include "postgres.h"
 
 #include "utils/guc.h"
+#include "libpq/pqcomm.h"
 
 #include "cluster/cluster_block_recovery.h"		 /* spec-4.10 D1 online block recovery GUCs */
+#include "cluster/cluster_external_fence.h"	 /* STOP-04 external fence GUC defaults */
 #include "cluster/cluster_thread_recovery.h"	 /* spec-4.11 D1 online thread recovery GUCs */
 #include "cluster/cluster_write_fence.h"		 /* spec-4.12 D7 write-fence enforcement GUCs */
 #include "cluster/cluster_conf.h"				 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
@@ -383,7 +385,7 @@ int cluster_cssd_dead_deadband_factor = 3;
 char *cluster_voting_disks = NULL; /* CSV path list, default empty */
 int cluster_quorum_poll_interval_ms = 2000;
 int cluster_voting_disk_io_timeout_ms = 5000;
-int cluster_voting_disk_size_bytes = 328192; /* spec-6.15: (5 × 128 + 1) × 512 */
+int cluster_voting_disk_size_bytes = 394240; /* spec-5.15A: (6 × 128 + 2) × 512 */
 
 /* spec-5.15 D7 — online declared-node join.  Default off (capability opt-in;
  * fail-closed-safe via INV-J8 — a DEAD node is never auto-readmitted when off).
@@ -856,6 +858,12 @@ static const struct config_enum_entry cluster_thread_recovery_on_unrecoverable_o
 int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
 int cluster_write_fence_lease_ms = 6000;
 
+/* STOP-04 §3.11: the socket endpoint is postmaster-frozen while the overall
+ * acquisition deadline is sampled once per recovery attempt and may reload. */
+char *cluster_external_fence_socket_path = NULL;
+int cluster_external_fence_acquire_timeout_ms =
+	PGRAC_EXTERNAL_FENCE_ACQUIRE_TIMEOUT_DEFAULT_MS;
+
 /* spec-4.12b D4: cooperative write-fence enforcement now ships default ON.  The
  * spec-4.12b baseline-marker subsystem (D2) keeps a healthy steady-state cluster's
  * durable authority marker fresh, so the D5 hot gate no longer fails every write
@@ -1074,6 +1082,49 @@ check_cluster_block_device_path(char **newval, void **extra, GucSource source)
 {
 	if (*newval != NULL && (*newval)[0] != '\0' && !is_absolute_path(*newval)) {
 		GUC_check_errdetail("cluster.block_device_path must be an absolute path.");
+		return false;
+	}
+	return true;
+}
+
+static bool
+external_fence_path_has_parent_component(const char *path)
+{
+	const char *component = path;
+
+	while (*component != '\0') {
+		const char *end;
+
+		while (*component == '/')
+			component++;
+		end = component;
+		while (*end != '\0' && *end != '/')
+			end++;
+		if (end - component == 2 && component[0] == '.' && component[1] == '.')
+			return true;
+		component = end;
+	}
+	return false;
+}
+
+static bool
+check_cluster_external_fence_socket_path(char **newval, void **extra,
+										 GucSource source)
+{
+	if (*newval == NULL || (*newval)[0] == '\0' ||
+		!is_absolute_path(*newval)) {
+		GUC_check_errdetail(
+			"cluster.external_fence_socket_path must be a nonempty absolute path.");
+		return false;
+	}
+	if (external_fence_path_has_parent_component(*newval)) {
+		GUC_check_errdetail(
+			"cluster.external_fence_socket_path must not contain a '..' path component.");
+		return false;
+	}
+	if (strlen(*newval) >= UNIXSOCK_PATH_BUFLEN) {
+		GUC_check_errdetail(
+			"cluster.external_fence_socket_path is too long for a Unix-domain socket.");
 		return false;
 	}
 	return true;
@@ -1994,6 +2045,24 @@ cluster_init_guc(void)
 		&cluster_write_fence_lease_ms, 6000, 1000, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
 
+	DefineCustomStringVariable(
+		"cluster.external_fence_socket_path",
+		gettext_noop("External write-exclusion daemon socket path."),
+		gettext_noop("Absolute Unix-domain socket path for the configured root fencing "
+					 "provider.  Parent path components are forbidden."),
+		&cluster_external_fence_socket_path,
+		"/var/run/pgrac/pgrac-fenced.sock", PGC_POSTMASTER, 0,
+		check_cluster_external_fence_socket_path, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.external_fence_acquire_timeout_ms",
+		gettext_noop("Overall external write-exclusion acquisition deadline (milliseconds)."),
+		gettext_noop("One recovery attempt snapshots this deadline and shares it across all "
+					 "required victim admissions."),
+		&cluster_external_fence_acquire_timeout_ms,
+		PGRAC_EXTERNAL_FENCE_ACQUIRE_TIMEOUT_DEFAULT_MS, 1, 600000,
+		PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
+
 	/*
 	 * cluster.shared_data_dir -- shared data root for the cluster_fs
 	 * (shared_fs) backend (spec-4.5a D2).  The shared_fs backend resolves
@@ -2246,12 +2315,16 @@ cluster_init_guc(void)
 							NULL,			/* assign_hook */
 							NULL);			/* show_hook */
 
-	/* spec-3.18 D1: undo block buffer pool (AD-014 form restoration). */
+	/* spec-8.4A D1/P2: separate ordinary-DATA and block-zero frame banks. */
 	DefineCustomIntVariable(
-		"cluster.undo_buffers", gettext_noop("Number of cluster undo block buffer pool slots."),
-		gettext_noop("Each slot caches one 8KB undo DATA block (block 0 is "
-					 "not poolable).  0 disables the pool (direct smgr I/O).  "
-					 "Default 2048 = ~16MB per instance."),
+		"cluster.undo_buffers",
+		gettext_noop("Number of ordinary DATA frames and R4A block-zero frames."),
+		gettext_noop("Each positive value D provisions D ordinary 8KB undo DATA frames plus a "
+					 "separate B=D block-zero payload frame bank, fixed block-zero authority "
+					 "metadata, and a free-frame index.  Default D=2048 adds 20,979,840 bytes "
+					 "for block-zero authority and residency beyond the existing DATA pool.  "
+					 "Zero permits direct smgr I/O only while R4A is inactive; R4A activation "
+					 "refuses zero, and an active cluster has no direct-smgr block-zero fallback."),
 		&cluster_undo_buffers, 2048, 0, 1048576, PGC_POSTMASTER, /* shmem sized once at init */
 		0, NULL, NULL, NULL);
 
@@ -3196,8 +3269,9 @@ cluster_init_guc(void)
 	 * ADG apply-master lease marker at ((3 × CLUSTER_MAX_NODES + node_id)
 	 * × 512); region 5 = the xid stripe slot at ((4 × CLUSTER_MAX_NODES +
 	 * node_id) × 512); region 6 = ONE cluster-wide stripe activation
-	 * record at (5 × CLUSTER_MAX_NODES × 512).  Default 328192 bytes =
-	 * (5 × 128 + 1) × 512.  Range [4096, 1048576].
+	 * record at (5 × CLUSTER_MAX_NODES × 512); slot 5N+1 = PGSA; and
+	 * slots [5N+2,6N+2) are the per-proposer epoch-ballot lanes.  Default
+	 * 394240 bytes = (6 × 128 + 2) × 512.  Range [4096, 1048576].
 	 */
 	DefineCustomIntVariable("cluster.voting_disk_size_bytes",
 							gettext_noop("Voting disk file size in bytes."),
@@ -3213,9 +3287,11 @@ cluster_init_guc(void)
 										 "lease slot at ((384 + node_id) × 512), and an xid "
 										 "stripe slot at ((512 + node_id) × 512); one "
 										 "cluster-wide stripe activation record lives at "
-										 "(640 × 512).  Default 328192 = (5 × 128 + 1) × 512.  "
+										 "(640 × 512), PGSA at (641 × 512), and epoch-ballot "
+										 "lanes at [(642 × 512),(770 × 512)).  Default 394240 "
+										 "= (6 × 128 + 2) × 512.  "
 										 "Range [4096, 1048576] bytes; multiple of 512."),
-							&cluster_voting_disk_size_bytes, 328192, 4096, 1048576, PGC_POSTMASTER,
+							&cluster_voting_disk_size_bytes, 394240, 4096, 1048576, PGC_POSTMASTER,
 							GUC_UNIT_BYTE, NULL, NULL, NULL);
 
 	/* spec-5.15 D7 — online declared-node join (Q7/Q8). */

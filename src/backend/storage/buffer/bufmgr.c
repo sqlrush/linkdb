@@ -10540,7 +10540,7 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
  *
  *	A page LSN beyond the LOCAL insert position can only be a FOREIGN
  *	thread's LSN (per-thread WAL: cross-thread LSNs are not comparable;
- *	local stamps never exceed the local insert point).  This node cannot
+ *	local stamps never exceed the local reserved record end).  This node cannot
  *	flush another node's WAL -- XLogFlush(foreign_lsn) compares against the
  *	local horizon and ERRORs ("flush request is not satisfied"), killing
  *	the serve (seen: LMON's gcs_block_forward handler dropping the frame,
@@ -10551,21 +10551,21 @@ TestForOldSnapshot_impl(Snapshot snapshot, Relation relation)
  *	The foreign origin flushed its own WAL through that LSN before the
  *	image was ever shipped (HC82 holds on every ship path), so the only
  *	WAL still owed locally is this node's OWN records for modifications
- *	made after adoption -- all at or below the local insert position.
- *	Clamping the flush target to the local insert position keeps
+ *	made after adoption -- all at or below the local reserved record end.
+ *	Clamping the flush target to that record-end position keeps
  *	WAL-before-data cluster-wide (foreign half durable at the origin,
  *	local half durable here) at the cost of over-flushing local WAL.
  */
 static XLogRecPtr
 cluster_gcs_clamp_ship_flush_lsn(XLogRecPtr page_lsn)
 {
-	XLogRecPtr	local_insert;
+	XLogRecPtr	local_insert_end;
 
 	if (XLogRecPtrIsInvalid(page_lsn) || RecoveryInProgress())
 		return page_lsn;
 
-	local_insert = GetXLogInsertRecPtr();
-	return (page_lsn > local_insert) ? local_insert : page_lsn;
+	local_insert_end = GetXLogInsertEndRecPtr();
+	return (page_lsn > local_insert_end) ? local_insert_end : page_lsn;
 }
 
 /*

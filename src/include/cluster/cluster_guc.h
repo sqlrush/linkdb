@@ -84,6 +84,10 @@ extern void cluster_init_guc(void);
  */
 extern int cluster_node_id;
 
+/* STOP-04: provider-neutral external write-exclusion client settings. */
+extern char *cluster_external_fence_socket_path;
+extern int cluster_external_fence_acquire_timeout_ms;
+
 
 /*
  * cluster_interconnect_tier -- which interconnect tier vtable to bind
@@ -554,8 +558,8 @@ extern int cluster_cssd_dead_deadband_factor;
  *   cluster.voting_disks               -- CSV path list (default empty)
  *   cluster.quorum_poll_interval_ms    -- 500..30000, default 2000
  *   cluster.voting_disk_io_timeout_ms  -- 500..60000, default 5000
- *   cluster.voting_disk_size_bytes     -- 4096..1048576, default 328192
- *                                         (spec-6.15: (5 × 128 + 1) × 512)
+ *   cluster.voting_disk_size_bytes     -- 4096..1048576, default 394240
+ *                                         (spec-5.15A: (6 × 128 + 2) × 512)
  *
  * All PGC_POSTMASTER.  Per Q4 v0.2 lease semantics, backend
  * in_quorum() check uses 2 × quorum_poll_interval_ms as the lease

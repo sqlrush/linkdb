@@ -52,6 +52,7 @@
 #include "cluster/cluster_inject.h" /* spec-4.8ab D1 boundary-guard injection points */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
@@ -286,6 +287,7 @@ Size
 cluster_undo_buf_shmem_size(void)
 {
 	int n = cluster_undo_buffers;
+	Size block0_sz;
 	Size sz;
 
 	if (n <= 0)
@@ -294,6 +296,8 @@ cluster_undo_buf_shmem_size(void)
 	sz = MAXALIGN(sizeof(ClusterUndoBufPool));
 	sz = add_size(sz, mul_size(sizeof(UndoBufSlot), n));
 	sz = add_size(sz, mul_size((Size)BLCKSZ, n));
+	block0_sz = cluster_undo_block0_shmem_size((uint32)n);
+	sz = add_size(sz, block0_sz);
 	return sz;
 }
 
@@ -303,10 +307,15 @@ cluster_undo_buf_shmem_init(void)
 {
 	bool found;
 	int n = cluster_undo_buffers;
+	Size data_region_sz;
+	Size block0_sz;
 	Size sz = cluster_undo_buf_shmem_size();
 
 	if (n <= 0 || sz == 0) {
 		UndoBufPool = NULL; /* disabled — callers fall back to direct smgr */
+		UndoBufSlots = NULL;
+		UndoBufData = NULL;
+		cluster_undo_block0_shmem_detach();
 		return;
 	}
 
@@ -314,6 +323,13 @@ cluster_undo_buf_shmem_init(void)
 
 	UndoBufSlots = (UndoBufSlot *)(((char *)UndoBufPool) + MAXALIGN(sizeof(ClusterUndoBufPool)));
 	UndoBufData = ((char *)UndoBufSlots) + mul_size(sizeof(UndoBufSlot), n);
+	data_region_sz = MAXALIGN(sizeof(ClusterUndoBufPool));
+	data_region_sz = add_size(data_region_sz, mul_size(sizeof(UndoBufSlot), n));
+	data_region_sz = add_size(data_region_sz, mul_size((Size)BLCKSZ, n));
+	block0_sz = cluster_undo_block0_shmem_size((uint32)n);
+	if (!cluster_undo_block0_shmem_init_region(((char *)UndoBufPool) + data_region_sz, block0_sz,
+										  (uint32)n, found))
+		ereport(PANIC, (errmsg("could not initialize cluster undo block-zero resident region")));
 
 	if (found)
 		return; /* EXEC_BACKEND second attach — already init'd */
@@ -715,6 +731,46 @@ cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_no, ClusterUnd
 	pin->block_no = block_no;
 	pin->mode = mode;
 	return SLOT_DATA(slotno);
+}
+
+
+/*
+ * cluster_undo_buf_copy_resident -- copy an exact resident DATA image without
+ * read-through fill.  The map-lock pin closes eviction/reuse between lookup
+ * and content-lock acquisition; the content S lock then protects the BLCKSZ
+ * copy.  A filling slot is deliberately a miss: kind-4 origin service must
+ * neither wait for nor initiate I/O.
+ */
+bool
+cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no, char dst[BLCKSZ])
+{
+	int slotno = -1;
+	UndoBufSlot *slot;
+
+	if (dst == NULL || block_no < CLUSTER_UNDO_BUF_FIRST_DATA_BLOCK || UndoBufPool == NULL)
+		return false;
+
+	LWLockAcquire(&UndoBufPool->map_lock, LW_EXCLUSIVE);
+	for (int i = 0; i < UndoBufPool->nslots; i++) {
+		if (slot_matches(&UndoBufSlots[i], segment_id, owner, block_no)) {
+			slotno = i;
+			break;
+		}
+	}
+	if (slotno < 0 || UndoBufSlots[slotno].io_in_progress) {
+		LWLockRelease(&UndoBufPool->map_lock);
+		return false;
+	}
+	slot = &UndoBufSlots[slotno];
+	pg_atomic_fetch_add_u32(&slot->pincount, 1);
+	slot->clock_used = 1;
+	LWLockRelease(&UndoBufPool->map_lock);
+
+	LWLockAcquire(&slot->content_lock, LW_SHARED);
+	memcpy(dst, SLOT_DATA(slotno), BLCKSZ);
+	LWLockRelease(&slot->content_lock);
+	pg_atomic_fetch_sub_u32(&slot->pincount, 1);
+	return true;
 }
 
 

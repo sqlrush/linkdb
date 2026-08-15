@@ -39,6 +39,8 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_itl_touch.h" /* PostPrepare touch-list drop (V-2) */
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_subtrans.h"  /* sub-link export/reset (D7) */
 #include "cluster/cluster_tt_2pc.h"
 #include "cluster/cluster_tt_local.h"			/* binding export/reset */
@@ -384,6 +386,33 @@ cluster_tt_twophase_standby_commit_prepared(TransactionId xid, SCN commit_scn)
 }
 
 
+static bool
+cluster_tt_twophase_writable_admission(void)
+{
+	ClusterJoinGateVerdict verdict = cluster_reconfig_self_join_gate_verdict();
+
+	if (verdict == CLUSTER_JOIN_GATE_BLOCK_53R61)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_JOIN_REJECTED_STALE),
+				 errmsg("cannot finish a prepared transaction: this node's cluster join was rejected"),
+				 errhint("Restart this node so it presents a fresh cluster incarnation.")));
+	return verdict == CLUSTER_JOIN_GATE_ALLOW;
+}
+
+
+static void
+cluster_tt_twophase_modifier_recheck_or_error(const ClusterSemanticAdmissionToken *token)
+{
+	if (!cluster_semantic_activation_modifier_recheck(
+			token, cluster_tt_twophase_writable_admission()))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot finish a prepared transaction: cluster reconfiguration in progress"),
+				 errhint("The prepared transaction remains retryable; retry after cluster admission "
+						 "converges.")));
+}
+
+
 /*
  * cluster_tt_twophase_prefinish -- spec-3.15 D5 (C-P6 resolve-before-WAL).
  *
@@ -411,76 +440,100 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 							  uint32 len)
 {
 	ClusterTT2PCParsed p;
+	ClusterSemanticAdmissionToken modifier_token;
+	ClusterSemanticAdmissionResult admission;
 	uint16 i;
 
 	Assert(cluster_node_id >= 0);
 
-	parse_or_corrupt(xid, recdata, len, &p);
+	admission = cluster_semantic_activation_modifier_enter(
+		cluster_tt_twophase_writable_admission(), &modifier_token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot finish a prepared transaction: cluster reconfiguration in progress"),
+				 errhint("The prepared transaction remains retryable; retry after cluster admission "
+						 "converges.")));
 
-	if (is_commit)
-		cluster_vis_bump_twopc_prefinish_commits();
-	else
-		cluster_vis_bump_twopc_prefinish_aborts();
+	PG_TRY();
+	{
+		parse_or_corrupt(xid, recdata, len, &p);
 
-	for (i = 0; i < p.nbindings; i++) {
-		const ClusterTT2PCBinding *b = &p.bindings[i];
-		ClusterTTStatusKey key;
-		ClusterTTStatusSourceRequest source_request;
-		ClusterTTStatusSourceResult source_result;
-		ClusterTTStatusHintSourceRequest hint_request;
+		if (is_commit)
+			cluster_vis_bump_twopc_prefinish_commits();
+		else
+			cluster_vis_bump_twopc_prefinish_aborts();
 
-		memset(&key, 0, sizeof(key));
-		key.origin_node_id = (uint16)cluster_node_id;
-		key.undo_segment_id = (uint16)b->undo_segment_id;
-		key.tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
-		key.cluster_epoch = b->cluster_epoch;
-		key.local_xid = b->xid;
+		for (i = 0; i < p.nbindings; i++) {
+			const ClusterTT2PCBinding *b = &p.bindings[i];
+			ClusterTTStatusKey key;
+			ClusterTTStatusSourceRequest source_request;
+			ClusterTTStatusSourceResult source_result;
+			ClusterTTStatusHintSourceRequest hint_request;
 
-		if (is_commit) {
-			cluster_tt_slot_durable_commit(b->undo_segment_id, b->slot_offset, b->xid, b->wrap,
-										   final_scn);
-			cluster_tt_slot_mark_committed(b->undo_segment_id, b->slot_offset, b->xid, final_scn);
-			memset(&source_request, 0, sizeof(source_request));
-			source_request.key = &key;
-			source_request.status = CLUSTER_TT_STATUS_COMMITTED;
-			source_request.commit_scn = final_scn;
-			(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &source_request,
-													&source_result);
-			memset(&hint_request, 0, sizeof(hint_request));
-			hint_request.key = &key;
-			hint_request.status = CLUSTER_TT_STATUS_COMMITTED;
-			hint_request.commit_scn = final_scn;
-			(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
+			memset(&key, 0, sizeof(key));
+			key.origin_node_id = (uint16)cluster_node_id;
+			key.undo_segment_id = (uint16)b->undo_segment_id;
+			key.tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
+			key.cluster_epoch = b->cluster_epoch;
+			key.local_xid = b->xid;
+
+			if (is_commit) {
+				cluster_tt_twophase_modifier_recheck_or_error(&modifier_token);
+				cluster_tt_slot_durable_commit(b->undo_segment_id, b->slot_offset, b->xid, b->wrap,
+											   final_scn);
+				cluster_tt_slot_mark_committed(b->undo_segment_id, b->slot_offset, b->xid,
+											  final_scn);
+				memset(&source_request, 0, sizeof(source_request));
+				source_request.key = &key;
+				source_request.status = CLUSTER_TT_STATUS_COMMITTED;
+				source_request.commit_scn = final_scn;
+				(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
+													&source_request, &source_result);
+				memset(&hint_request, 0, sizeof(hint_request));
+				hint_request.key = &key;
+				hint_request.status = CLUSTER_TT_STATUS_COMMITTED;
+				hint_request.commit_scn = final_scn;
+				(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
 													 &hint_request);
-		} else {
-			cluster_tt_slot_durable_abort(b->undo_segment_id, b->slot_offset, b->xid, b->wrap);
-			/*
-			 * spec-4.8 D7-A: persist this binding's undo-chain head (captured
-			 * into the v2 2PC record at PREPARE) durably onto the now-ABORTED
-			 * slot, so D7 physical rollback can walk the chain after a crash-
-			 * restart.  Emit order matters: durable_abort above stamped the
-			 * slot's xid/wrap, so set_head's identity gate matches at redo.  A
-			 * v1 record / a binding with no undo (heads NULL or InvalidUba) is a
-			 * no-op -> D7 fails closed for it (MVCC invisible + vacuum, I10).
-			 */
-			if (p.heads != NULL && !UBA_is_invalid(p.heads[i]))
-				cluster_tt_slot_durable_set_head(b->undo_segment_id, b->slot_offset, b->xid,
+			} else {
+				cluster_tt_twophase_modifier_recheck_or_error(&modifier_token);
+				cluster_tt_slot_durable_abort(b->undo_segment_id, b->slot_offset, b->xid, b->wrap);
+				/*
+				 * spec-4.8 D7-A: persist this binding's undo-chain head (captured
+				 * into the v2 2PC record at PREPARE) durably onto the now-ABORTED
+				 * slot, so D7 physical rollback can walk the chain after a crash-
+				 * restart.  Emit order matters: durable_abort above stamped the
+				 * slot's xid/wrap, so set_head's identity gate matches at redo.  A
+				 * v1 record / a binding with no undo (heads NULL or InvalidUba) is a
+				 * no-op -> D7 fails closed for it (MVCC invisible + vacuum, I10).
+				 */
+				if (p.heads != NULL && !UBA_is_invalid(p.heads[i])) {
+					cluster_tt_twophase_modifier_recheck_or_error(&modifier_token);
+					cluster_tt_slot_durable_set_head(b->undo_segment_id, b->slot_offset, b->xid,
 												 b->wrap, p.heads[i]);
-			cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid);
-			memset(&source_request, 0, sizeof(source_request));
-			source_request.key = &key;
-			source_request.status = CLUSTER_TT_STATUS_ABORTED;
-			source_request.commit_scn = InvalidScn;
-			(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &source_request,
-													&source_result);
-			memset(&hint_request, 0, sizeof(hint_request));
-			hint_request.key = &key;
-			hint_request.status = CLUSTER_TT_STATUS_ABORTED;
-			hint_request.commit_scn = InvalidScn;
-			(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
+				}
+				cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid);
+				memset(&source_request, 0, sizeof(source_request));
+				source_request.key = &key;
+				source_request.status = CLUSTER_TT_STATUS_ABORTED;
+				source_request.commit_scn = InvalidScn;
+				(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
+													&source_request, &source_result);
+				memset(&hint_request, 0, sizeof(hint_request));
+				hint_request.key = &key;
+				hint_request.status = CLUSTER_TT_STATUS_ABORTED;
+				hint_request.commit_scn = InvalidScn;
+				(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
 													 &hint_request);
+			}
 		}
 	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&modifier_token);
+	}
+	PG_END_TRY();
 }
 
 #endif /* USE_PGRAC_CLUSTER */

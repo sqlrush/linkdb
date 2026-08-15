@@ -48,6 +48,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_advisory.h" /* spec-5.5 D8 — UL counters */
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_next_request_id (spec-5.16: node-global request_id) */
@@ -394,6 +395,10 @@ cluster_lock_acquire_s4_remote_request_wait(const ClusterLockAcquireRequest *req
 	 * OK_NATIVE leaves no cluster holder, so the release is native too — the
 	 * same end-state as the lock.c gate-time SOLE->native short-circuit.
 	 */
+	/* RF A1: a formed control-file authority can never fall back native. */
+	if (reject == GES_REJECT_REASON_MASTER_DEAD_NATIVE
+		&& req->resid.type == CLUSTER_CF_RESID_TYPE)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
 	if (reject == GES_REJECT_REASON_MASTER_DEAD_NATIVE)
 		return CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
 
@@ -578,6 +583,7 @@ ClusterLockAcquireResult
 cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
 	int32 master;
+	uint32 release_result;
 
 	ensure_counter_initialized();
 
@@ -586,16 +592,14 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 
 	/*
 	 * PGRAC: spec-5.5 P0 — route the release the SAME way the acquire/send path
-	 * routed the request (ges_send_request_opcode_and_wait treats
-	 * master < 0 || master == cluster_node_id as local-master).  Keeping the two
-	 * conditions identical is the invariant:  whatever acquire enqueued as a
-	 * LOCAL waiter (including the master-map-not-yet-initialized master < 0
-	 * fallback) must be drained+woken LOCALLY on release.  A bare == self check
-	 * would, under master < 0, fall to the remote branch and only delete the
-	 * holder — re-stranding the waiter (the exact bug this spec fixes).
+	 * routed the request.  A release is authority-bearing: an unknown master is
+	 * not confirmation, and the local path must return an actual exact-holder
+	 * removal verdict rather than assuming a void drain succeeded.
 	 */
 	master = cluster_grd_lookup_master(&req->resid);
-	if (master < 0 || master == cluster_node_id) {
+	if (master < 0)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	if (master == cluster_node_id) {
 		/*
 		 * Local master.  The GRD entry (holder + any queued blocking waiters)
 		 * lives on THIS node, so the release must drain + grant + WAKE the
@@ -605,7 +609,9 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		 * popping a waiter -> a cross-node blocking pg_advisory_lock() waiter
 		 * mastered here would false-timeout 53R70 / hang on -1).
 		 */
-		cluster_ges_release_and_drain_local(&req->resid, &req->holder);
+		release_result = cluster_ges_release_and_drain_local(&req->resid, &req->holder);
+		if (release_result != GES_REJECT_REASON_NONE)
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	} else {
 		/*
 		 * Remote master: the holder + waiters live on the master.  Drop the
@@ -614,7 +620,11 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		 * authoritative drain + wake.
 		 */
 		(void)cluster_grd_release_holder_by_id(&req->resid, &req->holder);
-		(void)cluster_ges_send_release_and_wait(&req->resid, &req->holder, req->request_id);
+		release_result = cluster_ges_send_release_and_wait(
+			&req->resid, &req->holder, req->request_id, req->timeout_ms,
+			req->wait_event);
+		if (release_result != GES_REJECT_REASON_NONE)
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
 
 	pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);

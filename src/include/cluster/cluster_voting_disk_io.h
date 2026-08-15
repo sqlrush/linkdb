@@ -128,8 +128,7 @@
  * are materialised lazily exactly like regions 2/3 (an unwritten slot reads
  * back EOF or zeros, which the stripe policy layer rejects as record-absent
  * -- the correct fail-closed empty state).  The voting disk file therefore
- * grows to (5 × CLUSTER_MAX_NODES + 1) × 512 bytes (cluster.voting_disk_
- * size_bytes default bumped to match).  Only stripe slots 0..15 are ever
+ * grows through slot 5 × CLUSTER_MAX_NODES.  Only stripe slots 0..15 are ever
  * used (CLUSTER_XID_STRIDE); the region is sized by CLUSTER_MAX_NODES to
  * keep the offset arithmetic uniform with regions 1-3.  Payload-agnostic:
  * this layer does aligned 512-byte raw slot I/O, the stripe layer owns the
@@ -139,8 +138,20 @@
 	((off_t)(4 * CLUSTER_MAX_NODES + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
 #define CLUSTER_VOTING_STRIPE_ACTIVATION_OFFSET                                                    \
 	((off_t)(5 * CLUSTER_MAX_NODES) * CLUSTER_VOTING_SLOT_BYTES)
-#define CLUSTER_VOTING_FILE_BYTES_MIN                                                              \
+
+/*
+ * spec-8.4 / spec-5.15A — PGSA occupies fixed slot 5N+1.  One 512-byte
+ * epoch-ballot lane follows for each proposer node in slots [5N+2, 6N+2).
+ */
+#define CLUSTER_VOTING_PGSA_SLOT_OFFSET                                                            \
 	((off_t)(5 * CLUSTER_MAX_NODES + 1) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_EPOCH_BALLOT_SLOT(node_id) (5 * CLUSTER_MAX_NODES + 2 + (node_id))
+#define CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(node_id)                                           \
+	((off_t)CLUSTER_EPOCH_BALLOT_SLOT(node_id) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_FILE_BYTES_MIN                                                              \
+	((off_t)(6 * CLUSTER_MAX_NODES + 2) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_PGRD_FILE_BYTES_MIN                                                         \
+	((off_t)(7 * CLUSTER_MAX_NODES + 3) * CLUSTER_VOTING_SLOT_BYTES)
 
 /*
  * Payload-neutral read outcomes for the fixed append-only tail slot.  Unlike
@@ -318,14 +329,44 @@ extern ClusterVotingDiskIoState cluster_voting_disk_write_stripe_activation(int 
 																			const void *in_slot512);
 
 /*
- * Fixed append-only tail boundary.  The offset is deliberately not a caller
- * parameter: it is always the old CLUSTER_VOTING_FILE_BYTES_MIN.  A full
- * all-zero page remains FULL; payload policy belongs to the caller.
+ * Fixed PGSA slot.  The offset is deliberately not a caller parameter.  A
+ * full all-zero page remains FULL; payload policy belongs to the caller.
  */
 extern ClusterVotingDiskRawReadState
 cluster_voting_disk_read_raw_tail_slot(int fd, void *out_slot512);
 extern ClusterVotingDiskIoState
 cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512);
+
+/* Payload-neutral aligned raw-sector I/O at a caller-selected frozen offset.
+ * The offset must be nonnegative and exactly 512-byte aligned.  Payload
+ * validation, fixed-slot ownership, readback comparison and quorum counting
+ * remain with the authority layer. */
+extern ClusterVotingDiskRawReadState
+cluster_voting_disk_read_raw_slot_at(int fd, off_t offset, void *out_slot512);
+extern ClusterVotingDiskIoState
+cluster_voting_disk_write_raw_slot_at(int fd, off_t offset,
+									  const void *in_slot512);
+
+/*
+ * Raw node-indexed epoch-ballot lane I/O.  This is a dedicated synchronous
+ * authority path: one aligned full-sector pread/pwrite, with fdatasync after
+ * writes, and no cancelable SIGALRM timeout.  Ballot codec and quorum policy
+ * remain outside this payload-neutral layer.
+ */
+extern ClusterVotingDiskIoState
+cluster_voting_disk_read_epoch_ballot_slot(int fd, uint32 proposer_node_id, void *out_slot512);
+extern ClusterVotingDiskIoState
+cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id,
+											 const void *in_slot512);
+
+/* Positive common-epoch ballot authority is Linux raw-block only.  Regular
+ * files remain valid codec/I/O fixtures but can never pass this attestation. */
+extern bool cluster_voting_disk_epoch_ballot_authority_attest(int fd);
+
+/* PGRD live-writer authority additionally covers the append-only descriptor
+ * slots through local node 127.  The older ballot attestation's shorter
+ * capacity bound cannot authorize these writes. */
+extern bool cluster_voting_disk_pgrd_authority_attest(int fd);
 
 #endif /* USE_PGRAC_CLUSTER */
 

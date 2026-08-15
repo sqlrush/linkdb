@@ -4,35 +4,30 @@
  *	  pgrac online thread-recovery EXECUTOR (spec-4.11 D1, increment 3b-4b
  *	  Part 2).
  *
- *	  The reconfig FSM (lmon, Part 3) launches one per-episode dynamic
- *	  background worker per in-scope dead thread; each worker online-recovers
- *	  exactly one dead thread's WAL data + visibility through to shared storage
- *	  while the survivor holds the freeze window, then exits (BGW_NEVER_RESTART).
- *	  This file is the worker:
+ *	  LMON owns one process-local dynamic-background-worker handle per in-scope
+ *	  dead thread and relaunches only after exact matching STOPPED evidence.  This
+ *	  file owns that A2 scheduler lifecycle and the executor entry point:
  *
- *	    cluster_thread_recovery_worker_run -- the testable core.  It reads the
+ *	    thread_recovery_worker_run -- the executor core.  It reads the
  *	      per-thread replay slot (the launch marked it REPLAYING and stamped the
  *	      launch episode), enforces the L235 episode-staleness guard against the
  *	      live GRD recovery episode (a superseded worker aborts and publishes
- *	      nothing -- keep frozen), drives cluster_thread_recovery_replay_one
- *	      (which owns the data + visibility pass, durability barrier, and the
- *	      3-way authority publish on DONE), and writes the terminal slot state.
+ *	      nothing -- keep frozen).  RF-ROOT P3 deliberately stops at the strong
+ *	      fail-closed seam until P4 supplies typed NeedSet/AdmissionSet evidence;
+ *	      no replay or authority publication is reachable before then.
  *	      The slot is OBSERVABILITY + episode coordination ONLY -- the
  *	      authoritative unfreeze/serve gate reads the node-local merged.authority,
  *	      NOT this slot (spec-4.11 §2.4 Q4).
  *
  *	    cluster_thread_recovery_worker_main -- the dynamic-bgworker entry point
  *	      (BGWORKER_SHMEM_ACCESS only, like the spec-4.4 recovery worker: no
- *	      database connection -- replay_one works by raw relfilelocator over the
- *	      shared smgr + per-origin SLRU, exactly as the cold startup path does).
- *	      A thin wrapper: arm the abnormal-exit fail-closed callback, unblock
- *	      signals, run, log.
+ *	      database connection).  A thin wrapper: validate the full bgw_extra duty
+ *	      against the live slot, register authority cleanup, unblock signals, run,
+ *	      and log.
  *
- *	  Exit discipline: a before_shmem_exit callback flips a still-REPLAYING slot
- *	  to BLOCKED on any abnormal exit (a FATAL / SIGTERM -> proc_exit leaves the
- *	  recovery unfinished), so the dead thread stays frozen (8.A) -- but ONLY for
- *	  the launch epoch this worker owns, so a newer episode that has already
- *	  re-stamped the slot is never clobbered.
+ *	  Exit discipline: the existing GRD cleanup callback releases this process's
+ *	  holder state.  It never writes scheduler slots; LMON owns STOPPED reaping
+ *	  and the sole matched REPLAYING->IDLE reset.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -54,72 +49,65 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "miscadmin.h"
-#include "portability/instr_time.h" /* PGRAC: spec-4.13 D5 LOG-only latency */
 #include "postmaster/bgworker.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
+#include "utils/memutils.h"
+#include "utils/timestamp.h"
+#include "utils/wait_event.h"
 
 #include "cluster/cluster_conf.h"			   /* node_count / has_peers / CLUSTER_MAX_NODES */
+#include "cluster/cluster_external_fence.h"   /* STOP04 NeedSet/AdmissionSet */
 #include "cluster/cluster_grd.h"			   /* live recovery episode epoch (L235)        */
 #include "cluster/cluster_guc.h"			   /* cluster_online_thread_recovery (scope)    */
 #include "cluster/cluster_ir.h"				   /* spec-5.7 D8 — IR(X) recovery-owner gate    */
+#include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_thread_recovery.h"   /* slot helpers + replay_one + gates          */
 #include "cluster/storage/cluster_shared_fs.h" /* shared backend (scope)                    */
 
 /*
- * The launch epoch this worker owns, captured before the run so the
- * abnormal-exit callback fail-closes ONLY our own attempt (an epoch the
- * before_shmem_exit Datum -- a single uint16 -- cannot carry).  One recovery per
- * worker process, so a file static is exact.
- */
-static uint64 worker_launch_epoch = 0;
-static bool worker_armed = false;
-
-/*
- * mark_blocked_on_exit -- before_shmem_exit callback.  Any exit that leaves the
- *	slot REPLAYING under OUR launch epoch (a FATAL / SIGTERM -> proc_exit before
- *	the normal terminal write) flips it to BLOCKED: the dead thread stays frozen
- *	(8.A), the survivor keeps running.  A newer episode that has re-stamped the
- *	slot (different epoch) is NOT clobbered.
- */
-static void
-mark_blocked_on_exit(int code, Datum arg)
-{
-	uint16 dead_tid = (uint16)DatumGetInt32(arg);
-	ClusterThreadRecReplayState state;
-	uint64 epoch;
-
-	if (!worker_armed)
-		return;
-	if (!cluster_thread_recovery_replay_read(dead_tid, &state, &epoch))
-		return;
-	if (state == CLUSTER_THREADREC_REPLAY_REPLAYING && epoch == worker_launch_epoch)
-		cluster_thread_recovery_replay_set_state(dead_tid, CLUSTER_THREADREC_REPLAY_BLOCKED);
-}
-
-/*
- * cluster_thread_recovery_worker_run -- online-recover ONE dead thread in the
- *	calling process (the testable core; the bgworker main and a TEST-ONLY SRF
- *	both call it).  Returns the replay_one verdict.  NOT_APPLICABLE also covers
+ * thread_recovery_worker_run -- online-recover ONE dead thread in the calling
+ *	process.  Returns the replay verdict.  NOT_APPLICABLE also covers
  *	"the slot is not REPLAYING / the launch epoch is stale": the worker aborts,
  *	publishes nothing, and leaves the slot for the live episode (keep frozen).
  */
-ClusterThreadRecResult
-cluster_thread_recovery_worker_run(uint16 dead_tid)
+static ClusterThreadRecResult
+thread_recovery_worker_run(
+	const ClusterThreadRecLaunchEligibility *eligibility)
 {
+	ClusterFormationWitnessV1 *formation = NULL;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	PgracExternalFenceAdmissionSetV1 *admissions = NULL;
+	ClusterControlRootSnapshot root_snapshot;
+	ClusterControlRootReadToken root_token;
+	ClusterRecoverySerialRequest serial_request;
+	ClusterRecoverySerialGuard serial_guard;
+	PgracExternalFenceDenyReason deny_reason;
+	ClusterFormationWitnessResult formation_result;
+	PgracExternalFenceNeedSetResult need_result;
+	PgracExternalFenceVerdict fence_verdict;
+	ClusterRecoverySerialAcquireResult serial_result;
+	ClusterRecoverySerialReleaseResult release_result;
+	ClusterControlRootResult root_result;
+	ClusterThreadRecResult result;
 	ClusterThreadRecReplayState state;
 	uint64 launch_epoch;
-	ClusterThreadRecResult res;
-	ClusterIrLock ir_lock;			/* spec-5.7 D8 — held IR(X) recovery-owner claim */
-	ClusterIrAcquireOutcome ir_out; /* spec-5.7 D8 — recovery-owner competition result */
-	instr_time t_total_start;		/* PGRAC: spec-4.13 D5 LOG-only total latency */
-	instr_time t_total_end;
+	uint16 dead_tid;
+	bool slot_read;
+	int fence_timeout_ms;
+
+	fence_timeout_ms = cluster_external_fence_acquire_timeout_ms;
+	if (eligibility == NULL)
+		return CLUSTER_THREADREC_DEFERRED;
+	dead_tid = eligibility->origin_thread;
 
 	/* The launch must have marked the slot REPLAYING; anything else means this
 	 * spawn raced a reset or a newer launch -> moot (do not touch the slot). */
-	if (!cluster_thread_recovery_replay_read(dead_tid, &state, &launch_epoch))
-		return CLUSTER_THREADREC_NOT_APPLICABLE;
-	if (state != CLUSTER_THREADREC_REPLAY_REPLAYING)
-		return CLUSTER_THREADREC_NOT_APPLICABLE;
+	slot_read = cluster_thread_recovery_replay_read(dead_tid, &state,
+												&launch_epoch);
+	if (!cluster_thread_recovery_worker_start_valid(
+			eligibility, dead_tid, slot_read, state, launch_epoch))
+		return CLUSTER_THREADREC_DEFERRED;
 
 	/* L235 BEFORE: a stale launch epoch means the reconfig episode advanced past
 	 * this worker.  Abort -- never run replay_one (which would publish authority)
@@ -128,76 +116,125 @@ cluster_thread_recovery_worker_run(uint16 dead_tid)
 													cluster_grd_redeclare_episode_epoch()))
 		return CLUSTER_THREADREC_NOT_APPLICABLE;
 
-	/*
-	 * spec-5.7 D8 (IR-M1/M3/M5): gate the destructive apply behind the GES-enforced
-	 * recovery-owner lock IR(X) on (dead_node, launch_epoch).  Only the IR(X) holder
-	 * mutates the dead resource; a survivor whose alive-set view diverged and that
-	 * does NOT hold IR(X) fails closed (53RA9) and never runs replay_one -- so two
-	 * survivors can never both apply the non-idempotent physical recovery of the
-	 * same dead node (8.A).  The acquire honours the bootstrap phase (epoch
-	 * accepted, fresh-epoch freeze-gate bypass) and never blocks, so it cannot stall
-	 * the remaster it depends on.  NATIVE (single node / no competitor) proceeds
-	 * under the existing min(survivor)+epoch authority.  spec-4.1: thread_id =
-	 * node_id + 1, so the dead node id is dead_tid - 1.
-	 */
-	ir_out = cluster_ir_recovery_acquire((int32)dead_tid - 1, launch_epoch, &ir_lock);
-	if (ir_out == CLUSTER_IR_NOT_OWNER)
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECOVERY_OWNER_CONFLICT),
-				 errmsg("not the instance-recovery owner for dead thread %u (episode " UINT64_FORMAT
-						")",
-						dead_tid, launch_epoch),
-				 errhint("Another survivor holds the recovery-owner lock; this node keeps the dead "
-						 "thread frozen until that survivor materializes it.")));
-	if (ir_out == CLUSTER_IR_NOT_READY)
-		/* Bootstrap unmet (epoch advanced / ownership unprovable): do not mutate
-		 * this tick; leave the slot for the live episode (keep frozen, 8.A). */
-		return CLUSTER_THREADREC_NOT_APPLICABLE;
+	/* All waitable evidence is obtained before IR.  The current provider-0
+	 * package deterministically stops at NeedSet/admit with BLOCKED and performs
+	 * zero GES/replay/publish; a future certified provider uses this same order. */
+	formation_result = cluster_formation_witness_build_wait(
+		dead_tid, false, fence_timeout_ms,
+		&formation);
+	if (formation_result != CLUSTER_FORMATION_WITNESS_READY)
+		return formation_result == CLUSTER_FORMATION_WITNESS_UNSTABLE ||
+			formation_result == CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN ||
+			formation_result == CLUSTER_FORMATION_WITNESS_IO_FAILED
+				? CLUSTER_THREADREC_DEFERRED : CLUSTER_THREADREC_BLOCKED;
 
-	/* OWNER (holds IR(X)) or NATIVE (no competitor) -> run the destructive apply.
-	 * replay_one re-throws a FATAL/PANIC (cluster_thread_recovery_should_rethrow);
-	 * release IR(X) on that path too before it propagates, so a held coordinated
-	 * lock is never abandoned (this worker is a BGWORKER_SHMEM_ACCESS process that
-	 * does NOT run InitPostgres, so the postinit.c GRD cleanup-on-exit hook is not
-	 * registered for it -- the IR resid would otherwise leak until the reconfig
-	 * stale-epoch sweep.  IR-M2 makes the leak benign -- a new episode is a new
-	 * resid -- but releasing here is the correct, leak-free discipline). */
-	INSTR_TIME_SET_CURRENT(t_total_start); /* PGRAC: spec-4.13 D5 total latency start */
-	PG_TRY();
+	need_result = cluster_external_fence_need_set_build(
+		&eligibility->duty, formation, &needs);
+	if (need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK)
 	{
-		res = cluster_thread_recovery_replay_one(dead_tid, launch_epoch);
+		cluster_formation_witness_destroy(&formation);
+		return need_result == PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE ||
+			need_result == PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE
+				? CLUSTER_THREADREC_DEFERRED : CLUSTER_THREADREC_BLOCKED;
 	}
-	PG_CATCH();
+	fence_verdict = cluster_external_fence_admit_set_wait(
+		needs, formation, fence_timeout_ms,
+		&admissions);
+	if (fence_verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED)
 	{
-		cluster_ir_recovery_release(&ir_lock);
-		PG_RE_THROW();
+		cluster_external_fence_admission_set_release(&admissions);
+		cluster_external_fence_need_set_release(&needs);
+		cluster_formation_witness_destroy(&formation);
+		return CLUSTER_THREADREC_BLOCKED;
 	}
-	PG_END_TRY();
-	INSTR_TIME_SET_CURRENT(t_total_end);
-	INSTR_TIME_SUBTRACT(t_total_end, t_total_start);
+	if (!cluster_external_fence_need_set_revalidate_nowait(
+			needs, formation, &deny_reason) ||
+		!cluster_external_fence_revalidate_set_nowait(
+			admissions, needs, formation, &deny_reason))
+	{
+		cluster_external_fence_admission_set_release(&admissions);
+		cluster_external_fence_need_set_release(&needs);
+		cluster_formation_witness_destroy(&formation);
+		return CLUSTER_THREADREC_DEFERRED;
+	}
 
-	/* The destructive apply (and replay_one's authority publish on DONE) is
-	 * complete -> release IR(X) (a no-op when the outcome was NATIVE). */
-	cluster_ir_recovery_release(&ir_lock);
+	root_result = cluster_control_root_read_canonical(
+		eligibility->duty.origin_thread_id, &eligibility->duty,
+		CLUSTER_CONTROL_ROOT_READ_STRONG, &root_snapshot, &root_token);
+	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+		 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
+		root_snapshot.lifecycle !=
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
+		memcmp(&root_snapshot.identity, &eligibility->duty,
+			   sizeof(eligibility->duty)) != 0)
+	{
+		cluster_external_fence_admission_set_release(&admissions);
+		cluster_external_fence_need_set_release(&needs);
+		cluster_formation_witness_destroy(&formation);
+		return CLUSTER_THREADREC_DEFERRED;
+	}
+	memset(&serial_request, 0, sizeof(serial_request));
+	serial_request.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+	serial_request.duty = eligibility->duty;
+	serial_request.expected_root_token = root_token;
+	serial_request.formation = formation;
+	serial_request.fence_need_set = needs;
+	serial_request.fence_admission_set = admissions;
+	serial_request.acquire_timeout_ms = fence_timeout_ms;
+	serial_request.release_timeout_ms = fence_timeout_ms;
+	serial_result = cluster_recovery_serial_acquire(
+		&serial_request, &serial_guard);
+	if (serial_result != CLUSTER_RECOVERY_SERIAL_GRANTED)
+	{
+		cluster_external_fence_admission_set_release(&admissions);
+		cluster_external_fence_need_set_release(&needs);
+		cluster_formation_witness_destroy(&formation);
+		return serial_result == CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE
+			? CLUSTER_THREADREC_BLOCKED : CLUSTER_THREADREC_DEFERRED;
+	}
+	if (cluster_recovery_serial_revalidate(&serial_guard) !=
+			CLUSTER_RECOVERY_SERIAL_CURRENT ||
+		!cluster_external_fence_need_set_revalidate_nowait(
+			needs, formation, &deny_reason) ||
+		!cluster_external_fence_revalidate_set_nowait(
+			admissions, needs, formation, &deny_reason))
+	{
+		cluster_write_fence_note_external_mutation_gate_blocked();
+		result = CLUSTER_THREADREC_DEFERRED;
+	}
+	else
+	{
+		PG_TRY();
+		{
+			result = cluster_thread_recovery_replay_one(
+				dead_tid, launch_epoch, &serial_guard);
+		}
+		PG_CATCH();
+		{
+			release_result = cluster_recovery_serial_release(&serial_guard);
+			if (release_result == CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+			{
+				cluster_external_fence_admission_set_release(&admissions);
+				cluster_external_fence_need_set_release(&needs);
+				cluster_formation_witness_destroy(&formation);
+			}
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
 
-	ereport(LOG,
-			(errmsg("cluster thread recovery: tid=%u outcome=%s total_us=" INT64_FORMAT, dead_tid,
-					res == CLUSTER_THREADREC_DONE	   ? "DONE"
-					: res == CLUSTER_THREADREC_BLOCKED ? "BLOCKED"
-													   : "NOT_APPLICABLE",
-					INSTR_TIME_GET_MICROSEC(t_total_end))));
-
-	/* L235 AFTER: if the episode advanced DURING the replay, do not write the
-	 * terminal state -- the new episode owns the slot now.  Any authority
-	 * replay_one published on DONE reflects real durable materialization and
-	 * stays valid; the new episode re-evaluates (redo is idempotent). */
-	if (cluster_thread_recovery_replay_epoch_aborts(launch_epoch,
-													cluster_grd_redeclare_episode_epoch()))
-		return res;
-
-	cluster_thread_recovery_replay_set_state(dead_tid,
-											 cluster_thread_recovery_worker_terminal_state(res));
-	return res;
+	/* IR stays held through replay_one's publish.  A stale final guard forbids
+	 * DONE even if replay completed; release still must be confirmed. */
+	if (cluster_recovery_serial_revalidate(&serial_guard) !=
+		CLUSTER_RECOVERY_SERIAL_CURRENT)
+		result = CLUSTER_THREADREC_BLOCKED;
+	release_result = cluster_recovery_serial_release(&serial_guard);
+	if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+		return CLUSTER_THREADREC_BLOCKED;
+	cluster_external_fence_admission_set_release(&admissions);
+	cluster_external_fence_need_set_release(&needs);
+	cluster_formation_witness_destroy(&formation);
+	return result;
 }
 
 /*
@@ -208,9 +245,13 @@ void
 cluster_thread_recovery_worker_main(Datum main_arg)
 {
 	int32 dead_tid = DatumGetInt32(main_arg);
-	ClusterThreadRecReplayState state;
-	uint64 launch_epoch;
+	ClusterThreadRecLaunchEligibility eligibility;
+	ClusterThreadRecReplayState state = CLUSTER_THREADREC_REPLAY_IDLE;
+	ClusterThreadRecReplayState terminal_state;
+	ClusterThreadReplayMatchResult match_result;
+	uint64 launch_epoch = 0;
 	ClusterThreadRecResult res;
+	bool slot_read;
 
 	/* Returning from a bgworker entry point is a clean exit(0); cppcheck does
 	 * not model proc_exit as noreturn, so guards use return (mirrors the
@@ -218,17 +259,20 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 	if (dead_tid < XLP_THREAD_ID_FIRST_REAL || dead_tid > CLUSTER_WAL_THREAD_MAX)
 		return;
 
-	/* The launch marked the slot REPLAYING; if not, this spawn is moot. */
-	if (!cluster_thread_recovery_replay_read((uint16)dead_tid, &state, &launch_epoch))
+	/* bgw_extra is a non-authoritative carrier.  Revalidate its full duty and
+	 * exact attempt identity against the live slot before any authority acquire. */
+	if (MyBgworkerEntry == NULL)
 		return;
-	if (state != CLUSTER_THREADREC_REPLAY_REPLAYING)
+	memcpy(&eligibility, MyBgworkerEntry->bgw_extra, sizeof(eligibility));
+	slot_read = cluster_thread_recovery_replay_read(
+		(uint16)dead_tid, &state, &launch_epoch);
+	if (!cluster_thread_recovery_worker_start_valid(
+			&eligibility, (uint16)dead_tid, slot_read, state, launch_epoch))
 		return;
 
-	/* Arm the abnormal-exit fail-closed BEFORE the run, so a FATAL inside
-	 * replay_one leaves the dead thread frozen rather than half-recovered. */
-	worker_launch_epoch = launch_epoch;
-	worker_armed = true;
-	before_shmem_exit(mark_blocked_on_exit, Int32GetDatum(dead_tid));
+	/* Cleanup authority on every controlled exit; scheduler state is reaped only
+	 * by the LMON owner after exact BGWH_STOPPED evidence. */
+	before_shmem_exit(cluster_grd_cleanup_on_backend_exit_callback, 0);
 
 	/* The bgworker framework starts the entry point with signals blocked;
 	 * unblock before any I/O so a SIGTERM during a stuck shared-storage read or
@@ -236,42 +280,68 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 	 * in the BLOCKED exit path above). */
 	BackgroundWorkerUnblockSignals();
 
-	res = cluster_thread_recovery_worker_run((uint16)dead_tid);
-
-	/*
-	 * worker_run returned NORMALLY: it already wrote the terminal slot state (DONE
-	 * / BLOCKED) or DELIBERATELY left the slot REPLAYING for a superseding episode
-	 * (a stale-epoch abort -> NOT_APPLICABLE).  Disarm the abnormal-exit callback so
-	 * the clean exit below does NOT flip a deliberately-left REPLAYING slot to
-	 * BLOCKED (that would diverge from worker_run's contract -- and from the SRF
-	 * test core -- and would mis-record a superseded abort as a fail-closed).  The
-	 * callback's sole purpose is the ABNORMAL exit (a FATAL inside worker_run, which
-	 * never returns here): fail-closed the in-flight recovery to keep frozen (8.A).
-	 */
-	worker_armed = false;
+	res = thread_recovery_worker_run(&eligibility);
+	if (cluster_thread_recovery_worker_terminal_state(res, &terminal_state)) {
+		match_result = cluster_thread_recovery_replay_transition_if_match(
+			(uint16)dead_tid, eligibility.attempt_stamp,
+			CLUSTER_THREADREC_REPLAY_REPLAYING, terminal_state);
+		if (match_result != CLUSTER_THREADREC_MATCH_CHANGED)
+			ereport(PANIC,
+					(errmsg("online thread-recovery terminal slot transition failed"),
+					 errdetail("thread=%u stamp=" UINT64_FORMAT
+							   " result=%d match=%d",
+							   (unsigned)dead_tid, eligibility.attempt_stamp,
+							   (int)res, (int)match_result)));
+	}
 
 	ereport(LOG, (errmsg("online thread recovery: dead thread %d -> %s", dead_tid,
 						 res == CLUSTER_THREADREC_DONE
 							 ? "done"
 							 : (res == CLUSTER_THREADREC_BLOCKED ? "blocked (kept frozen)"
-																 : "not applicable")),
+								: (res == CLUSTER_THREADREC_DEFERRED ? "deferred"
+															  : "not applicable"))),
 				  res == CLUSTER_THREADREC_BLOCKED
 					  ? errhint("The dead thread's resources stay frozen; check the shared WAL "
 								"storage and cluster.thread_recovery_on_unrecoverable.")
 					  : 0));
 }
 
-/*
- * register_one_worker -- register one dynamic bgworker for dead_tid (the launch
- *	side, mirroring the spec-4.4 cluster_recovery_workers_launch).  Returns false
- *	when registration fails (bgworker slots exhausted) so the caller can revert
- *	the slot and retry on a later tick.
- */
+typedef struct ClusterThreadRecOwnedWorker {
+	BackgroundWorkerHandle *handle;
+	uint64 attempt_stamp;
+	bool terminate_sent;
+} ClusterThreadRecOwnedWorker;
+
+static ClusterThreadRecOwnedWorker
+	thread_recovery_owned[CLUSTER_WAL_THREAD_MAX + 1];
+
+StaticAssertDecl(sizeof(ClusterThreadRecLaunchEligibility) <= BGW_EXTRALEN,
+				 "thread recovery eligibility must fit bgw_extra");
+
 static bool
-register_one_worker(uint16 dead_tid)
+thread_recovery_eligibility_valid(
+	const ClusterThreadRecLaunchEligibility *eligibility)
+{
+	return eligibility != NULL
+		&& cluster_thread_recovery_worker_start_valid(
+			eligibility, eligibility->origin_thread, true,
+			CLUSTER_THREADREC_REPLAY_REPLAYING,
+			eligibility->attempt_stamp);
+}
+
+static bool
+register_one_worker(const ClusterThreadRecLaunchEligibility *eligibility,
+					BackgroundWorkerHandle **handle_out)
 {
 	BackgroundWorker bgw;
-	BackgroundWorkerHandle *handle = NULL;
+	MemoryContext old_context;
+	bool registered;
+	uint16 dead_tid;
+
+	if (handle_out == NULL || !thread_recovery_eligibility_valid(eligibility))
+		return false;
+	*handle_out = NULL;
+	dead_tid = eligibility->origin_thread;
 
 	memset(&bgw, 0, sizeof(bgw));
 	/* SHMEM_ACCESS only -- no database connection (replay_one works by raw
@@ -285,81 +355,205 @@ register_one_worker(uint16 dead_tid)
 	snprintf(bgw.bgw_name, sizeof(bgw.bgw_name), "pgrac thread recovery %u", (unsigned)dead_tid);
 	strlcpy(bgw.bgw_type, "cluster thread recovery", sizeof(bgw.bgw_type));
 	bgw.bgw_main_arg = Int32GetDatum((int32)dead_tid);
+	memcpy(bgw.bgw_extra, eligibility, sizeof(*eligibility));
 	bgw.bgw_notify_pid = 0;
 
-	return RegisterDynamicBackgroundWorker(&bgw, &handle);
+	old_context = MemoryContextSwitchTo(TopMemoryContext);
+	registered = RegisterDynamicBackgroundWorker(&bgw, handle_out);
+	MemoryContextSwitchTo(old_context);
+	return registered;
 }
 
-/*
- * cluster_thread_recovery_launch_workers -- the lmon launch side (spec-4.11
- *	3b-4b Part 3).  Called each WAIT_CLUSTER tick of the reconfig FSM with the
- *	episode's dead-node bitmap (LSB = node 0) and the locked episode epoch.  For
- *	each in-scope dead origin not already handled this episode, stamp the slot
- *	REPLAYING and register a per-episode executor worker.
- *
- *	Out of scope (online_thread_recovery off by default / no shared backend /
- *	single node / >2-node) the SAME decide_scope as replay_one yields non-
- *	APPLICABLE -> a NO-OP, so the spec-4.6/4.7 reconfig FSM is unchanged (no
- *	regression -- the t/249-252 guarantee).  Idempotent: should_launch skips a
- *	slot already REPLAYING/DONE/BLOCKED at the current epoch, so a per-tick
- *	re-attempt never double-registers.
- */
+static void
+thread_recovery_reap_one(uint16 dead_tid, bool *retained_out)
+{
+	ClusterThreadRecOwnedWorker *owned = &thread_recovery_owned[dead_tid];
+	ClusterThreadRecReplayState state = CLUSTER_THREADREC_REPLAY_IDLE;
+	ClusterThreadRecReapDecision decision;
+	BgwHandleStatus status;
+	uint64 slot_stamp = 0;
+	pid_t pid = InvalidPid;
+	bool slot_read = false;
+
+	if (owned->handle == NULL)
+		return;
+	status = GetBackgroundWorkerPid(owned->handle, &pid);
+	if (status == BGWH_STOPPED)
+		slot_read = cluster_thread_recovery_replay_read(dead_tid, &state,
+															 &slot_stamp);
+	decision = cluster_thread_recovery_reap_decide(
+		status, slot_read, owned->attempt_stamp, state, slot_stamp);
+	if (decision == CLUSTER_THREADREC_REAP_RETAIN) {
+		if (retained_out != NULL)
+			*retained_out = true;
+		return;
+	}
+	if (decision == CLUSTER_THREADREC_REAP_INVALID)
+		ereport(FATAL,
+				(errmsg("invalid online thread-recovery worker/slot relation"),
+				 errdetail("thread=%u owned_stamp=" UINT64_FORMAT
+						   " status=%d slot_read=%s slot_state=%d slot_stamp=" UINT64_FORMAT,
+						   (unsigned)dead_tid, owned->attempt_stamp, (int)status,
+						   slot_read ? "true" : "false", (int)state,
+						   slot_stamp)));
+	if (decision == CLUSTER_THREADREC_REAP_RESET_IDLE) {
+		ClusterThreadReplayMatchResult match_result
+			= cluster_thread_recovery_replay_transition_if_match(
+				dead_tid, owned->attempt_stamp,
+				CLUSTER_THREADREC_REPLAY_REPLAYING,
+				CLUSTER_THREADREC_REPLAY_IDLE);
+
+		if (match_result != CLUSTER_THREADREC_MATCH_CHANGED)
+			ereport(FATAL,
+					(errmsg("online thread-recovery STOPPED reap could not reset slot"),
+					 errdetail("thread=%u stamp=" UINT64_FORMAT " match=%d",
+							   (unsigned)dead_tid, owned->attempt_stamp,
+							   (int)match_result)));
+	}
+	pfree(owned->handle);
+	memset(owned, 0, sizeof(*owned));
+}
+
+static void
+thread_recovery_launch_one(
+	const ClusterThreadRecLaunchEligibility *eligibility)
+{
+	ClusterThreadRecOwnedWorker *owned;
+	ClusterThreadRecReplayState state;
+	ClusterThreadReplayMatchResult match_result;
+	uint64 slot_stamp;
+	uint16 dead_tid = eligibility->origin_thread;
+
+	owned = &thread_recovery_owned[dead_tid];
+	if (owned->handle != NULL)
+		return;
+	if (!cluster_thread_recovery_replay_read(dead_tid, &state, &slot_stamp)
+		|| state != CLUSTER_THREADREC_REPLAY_IDLE)
+		ereport(FATAL,
+				(errmsg("invalid online thread-recovery launch slot"),
+				 errdetail("thread=%u state=%d stamp=" UINT64_FORMAT,
+						   (unsigned)dead_tid, (int)state, slot_stamp)));
+	if (!cluster_thread_recovery_replay_mark_replaying(
+			dead_tid, eligibility->attempt_stamp))
+		ereport(FATAL,
+				(errmsg("could not stamp online thread-recovery slot for dead thread %u",
+						(unsigned)dead_tid)));
+	if (register_one_worker(eligibility, &owned->handle)) {
+		owned->attempt_stamp = eligibility->attempt_stamp;
+		owned->terminate_sent = false;
+		return;
+	}
+
+	match_result = cluster_thread_recovery_replay_transition_if_match(
+		dead_tid, eligibility->attempt_stamp,
+		CLUSTER_THREADREC_REPLAY_REPLAYING,
+		CLUSTER_THREADREC_REPLAY_IDLE);
+	if (match_result != CLUSTER_THREADREC_MATCH_CHANGED)
+		ereport(FATAL,
+				(errmsg("could not reset failed online thread-recovery launch"),
+				 errdetail("thread=%u stamp=" UINT64_FORMAT " match=%d",
+						   (unsigned)dead_tid, eligibility->attempt_stamp,
+						   (int)match_result)));
+	ereport(WARNING,
+			(errmsg("could not register online thread-recovery worker for dead thread %u",
+					(unsigned)dead_tid),
+			 errhint("Background worker slots are exhausted (max_worker_processes); the "
+					 "dead thread stays frozen until recovery can run.")));
+}
+
 void
-cluster_thread_recovery_launch_workers(const uint64 *dead, int nwords, uint64 episode_epoch)
+cluster_thread_recovery_lmon_tick(void)
 {
 	ClusterThreadRecScope scope;
 	bool shared_fs;
 	int survivors;
-	int node;
-	int max_node;
+	uint16 dead_tid;
 
-	if (dead == NULL || nwords <= 0)
-		return;
+	for (dead_tid = XLP_THREAD_ID_FIRST_REAL;
+		 dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++)
+		thread_recovery_reap_one(dead_tid, NULL);
 
-	/* Same scope decision as replay_one (kept in lockstep): out of scope is a
-	 * no-op so the reconfig FSM is unchanged. */
-	shared_fs = (cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
+	shared_fs = (cluster_shared_storage_backend
+				 == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
 	survivors = cluster_conf_node_count() - 1;
-	scope = cluster_thread_recovery_decide_scope(cluster_online_thread_recovery,
-												 cluster_conf_has_peers(), shared_fs, survivors);
+	scope = cluster_thread_recovery_decide_scope(
+		cluster_online_thread_recovery, cluster_conf_has_peers(), shared_fs,
+		survivors);
 	if (scope != CLUSTER_THREADREC_SCOPE_APPLICABLE)
 		return;
 
-	max_node = nwords * 64;
-	if (max_node > CLUSTER_MAX_NODES)
-		max_node = CLUSTER_MAX_NODES;
+	for (dead_tid = XLP_THREAD_ID_FIRST_REAL;
+		 dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++) {
+		ClusterThreadRecLaunchEligibility eligibility;
+		ClusterThreadRecOwnedWorker *owned
+			= &thread_recovery_owned[dead_tid];
 
-	for (node = 0; node < max_node; node++) {
-		uint16 dead_tid;
-		ClusterThreadRecReplayState state;
-		uint64 slot_epoch;
-
-		if ((dead[node / 64] & (UINT64CONST(1) << (node % 64))) == 0)
+		memset(&eligibility, 0, sizeof(eligibility));
+		if (!cluster_reconfig_thread_recovery_eligibility_consume(
+				dead_tid, &eligibility))
 			continue;
-
-		/* spec-4.1: thread_id = node_id + 1. */
-		dead_tid = (uint16)(node + 1);
-
-		/* No slot for this id (out of the real thread range) -> nothing to do. */
-		if (!cluster_thread_recovery_replay_read(dead_tid, &state, &slot_epoch))
+		if (!thread_recovery_eligibility_valid(&eligibility)
+			|| eligibility.origin_thread != dead_tid)
+			ereport(FATAL,
+					(errmsg("invalid online thread-recovery launch eligibility"),
+					 errdetail("requested_thread=%u carrier_thread=%u stamp=" UINT64_FORMAT,
+							   (unsigned)dead_tid,
+							   (unsigned)eligibility.origin_thread,
+							   eligibility.attempt_stamp)));
+		if (owned->handle != NULL) {
+			if (owned->attempt_stamp != eligibility.attempt_stamp
+				&& !owned->terminate_sent) {
+				TerminateBackgroundWorker(owned->handle);
+				owned->terminate_sent = true;
+			}
 			continue;
-		if (!cluster_thread_recovery_should_launch(scope, state, slot_epoch, episode_epoch))
-			continue;
-
-		/* Stamp REPLAYING + the launch episode BEFORE registering, so the worker
-		 * sees a coherent slot the instant it starts (and the L235 guard has the
-		 * launch epoch).  On a registration failure revert to IDLE so a later
-		 * tick retries; the dead origin stays frozen meanwhile (the gate sees it
-		 * unmaterialized). */
-		cluster_thread_recovery_replay_mark_replaying(dead_tid, episode_epoch);
-		if (!register_one_worker(dead_tid)) {
-			cluster_thread_recovery_replay_set_state(dead_tid, CLUSTER_THREADREC_REPLAY_IDLE);
-			ereport(WARNING,
-					(errmsg("could not register online thread-recovery worker for dead thread %u",
-							(unsigned)dead_tid),
-					 errhint("Background worker slots are exhausted (max_worker_processes); the "
-							 "dead thread stays frozen until recovery can run.")));
 		}
+		thread_recovery_launch_one(&eligibility);
+	}
+}
+
+void
+cluster_thread_recovery_lmon_shutdown(void)
+{
+	TimestampTz deadline
+		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
+	uint16 dead_tid;
+
+	for (dead_tid = XLP_THREAD_ID_FIRST_REAL;
+		 dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++) {
+		ClusterThreadRecOwnedWorker *owned
+			= &thread_recovery_owned[dead_tid];
+
+		if (owned->handle != NULL && !owned->terminate_sent) {
+			TerminateBackgroundWorker(owned->handle);
+			owned->terminate_sent = true;
+		}
+	}
+	for (;;) {
+		TimestampTz now;
+		bool retained = false;
+		long wait_ms;
+		int rc;
+
+		for (dead_tid = XLP_THREAD_ID_FIRST_REAL;
+			 dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++)
+			thread_recovery_reap_one(dead_tid, &retained);
+		if (!retained)
+			return;
+		now = GetCurrentTimestamp();
+		if (now >= deadline)
+			ereport(FATAL,
+					(errmsg("timed out reaping online thread-recovery workers during LMON shutdown")));
+		wait_ms = (long)((deadline - now + INT64CONST(999)) / INT64CONST(1000));
+		if (wait_ms > 50)
+			wait_ms = 50;
+		if (wait_ms < 1)
+			wait_ms = 1;
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   wait_ms, WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);
+		if (rc & WL_LATCH_SET)
+			ResetLatch(MyLatch);
 	}
 }
 

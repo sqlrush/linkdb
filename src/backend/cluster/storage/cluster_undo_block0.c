@@ -5,8 +5,9 @@
  *
  *	  This dependency-light layer validates logical identities, resolved
  *	  storage roots, explicit segment generations, and resident-state edges.
- *	  It performs no I/O, shared-memory access, recovery admission, or
- *	  authority acquisition.
+ *	  It performs no I/O or shared-memory access.  The resident implementation
+ *	  lives in cluster_undo_block0_resident.c so snapshot-only consumers retain
+ *	  this object's dependency-light link contract.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -27,7 +28,9 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_reconfig.h"
 #include "cluster/storage/cluster_undo_block0.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 
 /*
  * cluster_undo_block0_logical_slot -- Validate and map a logical identity.
@@ -65,12 +68,13 @@ cluster_undo_block0_logical_slot(const ClusterUndoBlock0LogicalKey *logical, uin
 }
 
 /*
- * cluster_undo_block0_root_valid -- Accept only declared path intents.
+ * cluster_undo_block0_root_valid -- Accept only persistent PGRD identities
+ * and declared path intents.
  */
 bool
 cluster_undo_block0_root_valid(const ClusterUndoBlock0ResolvedRoot *root)
 {
-	if (root == NULL)
+	if (root == NULL || root->root_id == 0 || root->root_generation == 0)
 		return false;
 
 	switch (root->intent) {
@@ -162,16 +166,69 @@ cluster_undo_block0_state_transition_allowed(ClusterUndoBlock0SlotState from,
 }
 
 /*
- * cluster_undo_block0_r4_prerequisite_snapshot -- Report dormant readiness.
- *
- *	The current prerequisite is immutable and carries no recovery authority.
+ * cluster_undo_block0_r4_prerequisite_snapshot -- Sample its sole owner.
  */
 ClusterR4PrerequisiteSnapshot
 cluster_undo_block0_r4_prerequisite_snapshot(void)
 {
-	return (ClusterR4PrerequisiteSnapshot){
-		.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED,
-		.ready = false,
-		.reserved = {0, 0, 0},
-	};
+	return cluster_reconfig_r4_prerequisite_snapshot();
+}
+
+bool
+cluster_undo_block0_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected)
+{
+	if (!cluster_undo_block0_current_startup_fenced_owned())
+		return false;
+	return cluster_reconfig_r4_publish_ready(expected);
+}
+
+/*
+ * The opaque Startup completion API is present before its independently
+ * owned ROOT/record/PAGE/SIDE proof providers.  Until those exact owners are
+ * wired, begin refuses before allocating a context or entering the fenced
+ * current lane.  Callers cannot manufacture an empty affected-set proof.
+ */
+ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_begin(
+	int timeout_ms, ClusterR4StartupCompletionContextV1 **out)
+{
+	if (out == NULL)
+		return CLUSTER_R4_STARTUP_COMPLETION_INVALID;
+	*out = NULL;
+	if (timeout_ms <= 0)
+		return CLUSTER_R4_STARTUP_COMPLETION_INVALID;
+	return CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY;
+}
+
+ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_close_next(
+	ClusterR4StartupCompletionContextV1 *context,
+	const RfRootResourceAdmissionV1 *root,
+	const RfRecordClosureProofV1 *record,
+	const RfPageResourceProofV1 *page,
+	const RfSideResourceProofSetV1 *side)
+{
+	(void)root;
+	(void)record;
+	(void)page;
+	(void)side;
+	return context == NULL ? CLUSTER_R4_STARTUP_COMPLETION_INVALID
+						   : CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY;
+}
+
+ClusterR4StartupCompletionResultV1
+cluster_undo_block0_r4_startup_finalize(
+	ClusterR4StartupCompletionContextV1 **context)
+{
+	if (context == NULL || *context == NULL)
+		return CLUSTER_R4_STARTUP_COMPLETION_INVALID;
+	return CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_DEPENDENCY;
+}
+
+void
+cluster_undo_block0_r4_startup_abort(
+	ClusterR4StartupCompletionContextV1 **context)
+{
+	if (context != NULL)
+		*context = NULL;
 }

@@ -60,6 +60,8 @@
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_ic.h" /* spec-5.8 D8 — ClusterICSendResult for the send-envelope stub */
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_replacement_wire.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B stub — peer state */
 #include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B stub — sole-native */
 #include "cluster/cluster_inject.h"		   /* S3 forensics step 1a stub prototypes */
@@ -235,6 +237,25 @@ cluster_shmem_register_region(const void *r pg_attribute_unused())
  * ============================================================ */
 
 int cluster_node_id = 0;
+static uint64 stub_current_epoch = 0;
+
+static uint64 stub_replacement_capability_sample_count = 0;
+static uint32 stub_replacement_required_capabilities = 0;
+
+bool
+cluster_sf_peer_capability_family_sample(
+	int32 peer_id pg_attribute_unused(), uint32 required_capabilities,
+	uint32 optional_capabilities pg_attribute_unused(),
+	bool *optional_supported_out, uint32 *generation_out)
+{
+	stub_replacement_capability_sample_count++;
+	stub_replacement_required_capabilities = required_capabilities;
+	if (optional_supported_out != NULL)
+		*optional_supported_out = false;
+	if (generation_out != NULL)
+		*generation_out = 7;
+	return required_capabilities == UINT32_C(0x00100000);
+}
 
 bool
 cluster_qvotec_in_quorum(void)
@@ -264,7 +285,7 @@ cluster_extend_liveness_is_sole_native(void)
 uint64
 cluster_epoch_get_current(void)
 {
-	return 0; /* default epoch 0 — matches env_sentinel.epoch */
+	return stub_current_epoch;
 }
 
 /* cluster_conf — return non-NULL so validation step 4 declared check
@@ -328,11 +349,25 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 }
 
 static int32 stub_remote_master = -1;
+static uint64 stub_master_generation = 1;
+static bool stub_remaster_on_second_lookup = false;
+static int stub_master_gen_lookup_calls = 0;
+static int stub_release_and_drain_result = 0;
 
 int32
 cluster_grd_lookup_master(const struct ClusterResId *resid pg_attribute_unused())
 {
 	return stub_remote_master >= 0 ? stub_remote_master : cluster_node_id;
+}
+
+int32
+cluster_grd_lookup_master_gen(const struct ClusterResId *resid, uint64 *out_routing_generation)
+{
+	if (out_routing_generation != NULL)
+		*out_routing_generation = stub_master_generation
+			+ (stub_remaster_on_second_lookup && stub_master_gen_lookup_calls > 0 ? 1 : 0);
+	stub_master_gen_lookup_calls++;
+	return cluster_grd_lookup_master(resid);
 }
 
 void
@@ -360,6 +395,8 @@ static uint64 stub_bast_ack = 0;
 static uint64 stub_deadlock_probe_drop = 0;
 static uint64 stub_backend_request_enqueue_count = 0;
 static GesRequestPayload stub_backend_request_last;
+static GesReplyWaitEntry stub_reply_wait_entry;
+static uint64 stub_backend_request_ready_after = 0;
 static uint64 stub_cancel_wait_enqueue_count = 0;
 static uint32 stub_cancel_wait_last_dest = 0;
 static GesCancelWaitPayload stub_cancel_wait_last;
@@ -498,6 +535,11 @@ cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(), con
 	stub_backend_request_enqueue_count++;
 	if (p != NULL && l == sizeof(GesRequestPayload))
 		memcpy(&stub_backend_request_last, p, sizeof(stub_backend_request_last));
+	if (stub_backend_request_ready_after > 0
+		&& stub_backend_request_enqueue_count >= stub_backend_request_ready_after) {
+		stub_reply_wait_entry.reject_reason = GES_REJECT_REASON_NONE;
+		stub_reply_wait_entry.ready = true;
+	}
 	return true;
 }
 
@@ -702,7 +744,7 @@ cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unus
 							  ClusterGrdGrantIdentity *granted_out pg_attribute_unused(),
 							  int max_out pg_attribute_unused())
 {
-	return 0;
+	return stub_release_and_drain_result;
 }
 
 ClusterGrdEntryResult
@@ -730,7 +772,6 @@ cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest, const void *p pg_attr
 
 /* cluster_ges_reply_wait API stubs (spec-2.23 D1). */
 static bool stub_reply_wait_insert_enabled = false;
-static GesReplyWaitEntry stub_reply_wait_entry;
 
 GesReplyWaitEntry *
 cluster_ges_reply_wait_insert(const GesReplyWaitKey *k pg_attribute_unused(),
@@ -929,6 +970,8 @@ DoLockModesConflict(int a pg_attribute_unused(), int b pg_attribute_unused())
 
 static bool stub_clock_advances = false;
 static TimestampTz stub_now = 0;
+static bool stub_cv_timeout_expires = true;
+static TimestampTz stub_cv_now_after_sleep = 0;
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -951,10 +994,12 @@ ConditionVariableCancelSleep(void)
 }
 bool
 ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
-							long timeout pg_attribute_unused(),
-							uint32 wait_event pg_attribute_unused())
+								long timeout pg_attribute_unused(),
+								uint32 wait_event pg_attribute_unused())
 {
-	return true;
+	if (stub_cv_now_after_sleep > 0)
+		stub_now = stub_cv_now_after_sleep;
+	return stub_cv_timeout_expires;
 }
 
 
@@ -1075,6 +1120,119 @@ UT_TEST(test_ges_request_valid_payload_enqueues_work)
 
 	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue + 1);
+}
+
+
+static ClusterReplacementWireMessage
+make_ges_phase3_message(uint32 phase)
+{
+	ClusterReplacementWireMessage message;
+
+	memset(&message, 0, sizeof(message));
+	message.phase = phase;
+	message.target_node_id = 3;
+	message.epoch = 0;
+	message.request_nonce = UINT64_C(101);
+	message.identity0 = UINT64_C(202);
+	message.identity1 = UINT64_C(303);
+	message.grammar_fingerprint
+		= CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
+	if (phase
+		== CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY) {
+		message.body.phase3.jcmk_generation = UINT64_C(404);
+		message.body.phase3.episode_state_generation = UINT32_C(505);
+	}
+	return message;
+}
+
+
+static void
+drain_ges_phase3_handoff(void)
+{
+	ClusterReplacementPhase3HandoffItem ignored;
+
+	while (cluster_replacement_phase3_handoff_poll_local(&ignored))
+		;
+}
+
+
+/* Break caught: opcode-18 phase 3 must fork before the legacy generic GES
+ * classifier and enqueue only an authenticated formation-LMON observation. */
+UT_TEST(test_ges_phase3_early_dispatch_enqueues_formation_handoff)
+{
+	ClusterReplacementPhase3HandoffItem item;
+	ClusterReplacementWireMessage message;
+	ClusterICEnvelope env;
+	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
+	uint64 pre_fail;
+	uint64 pre_enqueue;
+	uint64 pre_capability;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 1;
+	drain_ges_phase3_handoff();
+	message = make_ges_phase3_message(
+		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
+	memset(&env, 0, sizeof(env));
+	env.msg_type = PGRAC_IC_MSG_GES_REQUEST;
+	env.source_node_id = 3;
+	env.dest_node_id = 1;
+	stub_current_epoch = 1;
+	env.epoch = stub_current_epoch;
+	env.payload_length = sizeof(bytes);
+	pre_fail = stub_inbound_validation_fail;
+	pre_enqueue = stub_work_queue_enqueue_count;
+	pre_capability = stub_replacement_capability_sample_count;
+
+	cluster_ges_request_handler(&env, bytes);
+
+	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue);
+	UT_ASSERT_EQ(stub_replacement_capability_sample_count,
+				 pre_capability + 1);
+	UT_ASSERT_EQ(stub_replacement_required_capabilities,
+				 (uint32)0x00100000U);
+	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending_local(), 1);
+	UT_ASSERT(cluster_replacement_phase3_handoff_poll_local(&item));
+	UT_ASSERT_EQ(memcmp(&item.message, &message, sizeof(message)), 0);
+	UT_ASSERT_EQ(item.authenticated_source_node_id, 3);
+	UT_ASSERT_EQ(item.local_receiver_node_id, 1);
+	UT_ASSERT_EQ((int)item.control_connection_generation, 7);
+	stub_current_epoch = 0;
+}
+
+
+/* Break caught: another valid opcode-18 phase must be withheld, not cast as
+ * GesRequestPayload or submitted to the legacy work queue. */
+UT_TEST(test_ges_nonphase3_opcode18_never_falls_into_legacy_classifier)
+{
+	ClusterReplacementWireMessage message;
+	ClusterICEnvelope env;
+	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
+	uint64 pre_fail;
+	uint64 pre_enqueue;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 1;
+	drain_ges_phase3_handoff();
+	message = make_ges_phase3_message(
+		CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_ACK);
+	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
+	memset(&env, 0, sizeof(env));
+	env.msg_type = PGRAC_IC_MSG_GES_REQUEST;
+	env.source_node_id = 3;
+	env.dest_node_id = 1;
+	env.epoch = 0;
+	env.payload_length = sizeof(bytes);
+	pre_fail = stub_inbound_validation_fail;
+	pre_enqueue = stub_work_queue_enqueue_count;
+
+	cluster_ges_request_handler(&env, bytes);
+
+	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue);
+	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending_local(), 0);
 }
 
 UT_TEST(test_ges_reply_valid_payload_echoes_local_holder)
@@ -1334,10 +1492,115 @@ UT_TEST(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait)
 	stub_now = 0;
 }
 
+/*
+ * PostgreSQL's ConditionVariableTimedSleep() returns true when the timeout
+ * expires and false when the CV is signaled.  A timed-out remote GES wait must
+ * therefore enter the retransmit leg before the absolute deadline expires.
+ * The second enqueue below stands in for the retry reaching a now-ready
+ * master and delivering the grant.
+ */
+UT_TEST(test_ges_request_cv_timeout_retransmits)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint32 result;
+
+	memset(&resid, 0x4C, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 21;
+	holder.cluster_epoch = 0;
+	holder.request_id = UINT64CONST(0x0102030405060708);
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = false;
+	stub_now = 0;
+	stub_cv_timeout_expires = true;
+	stub_cv_now_after_sleep = INT64CONST(2000000);
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 2;
+
+	result = cluster_ges_send_request_and_wait(&resid, AccessExclusiveLock, &holder,
+											   holder.request_id, 1000, 0);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)2);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_cv_now_after_sleep = 0;
+	stub_backend_request_ready_after = 0;
+}
+
+UT_TEST(test_ges_release_cv_timeout_retransmits)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint32 result;
+
+	memset(&resid, 0x6D, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 22;
+	holder.cluster_epoch = 0;
+	holder.request_id = UINT64CONST(0x1112131415161718);
+
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_clock_advances = false;
+	stub_now = 0;
+	stub_cv_timeout_expires = true;
+	stub_cv_now_after_sleep = INT64CONST(61000000);
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 2;
+
+	result = cluster_ges_send_release_and_wait(&resid, &holder,
+										 holder.request_id, 0, 0);
+
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)2);
+
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_cv_now_after_sleep = 0;
+	stub_backend_request_ready_after = 0;
+}
+
+UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	int32 saved_node = cluster_node_id;
+
+	memset(&resid, 0, sizeof(resid));
+	memset(&holder, 0, sizeof(holder));
+	cluster_node_id = 0;
+	stub_remote_master = -1;
+	stub_master_generation = 7;
+	stub_master_gen_lookup_calls = 0;
+	stub_remaster_on_second_lookup = false;
+	stub_release_and_drain_result = -1;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_TIMEOUT);
+
+	stub_master_gen_lookup_calls = 0;
+	stub_release_and_drain_result = 0;
+	stub_remaster_on_second_lookup = true;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_MASTER_DEAD_NATIVE);
+
+	stub_master_gen_lookup_calls = 0;
+	stub_remaster_on_second_lookup = false;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_NONE);
+	cluster_node_id = saved_node;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(17);
+	UT_PLAN(22);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -1346,6 +1609,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_reply_handler_real_behavior);
 	UT_RUN(test_ges_handler_counter_monotonic_n_invocations);
 	UT_RUN(test_ges_request_valid_payload_enqueues_work);
+	UT_RUN(test_ges_phase3_early_dispatch_enqueues_formation_handoff);
+	UT_RUN(test_ges_nonphase3_opcode18_never_falls_into_legacy_classifier);
 	UT_RUN(test_ges_reply_valid_payload_echoes_local_holder);
 	UT_RUN(test_ges_lmon_drain_work_queue_symbol_linkable);
 	UT_RUN(test_ges_opcode_enum_spec_2_17_extension);
@@ -1356,6 +1621,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_native_lock_probe_request_dispatch);
 	UT_RUN(test_ges_native_lock_probe_reply_dispatch);
 	UT_RUN(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait);
+	UT_RUN(test_ges_request_cv_timeout_retransmits);
+	UT_RUN(test_ges_release_cv_timeout_retransmits);
+	UT_RUN(test_ges_local_release_requires_exact_holder_and_stable_master);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

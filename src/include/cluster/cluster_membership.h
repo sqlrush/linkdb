@@ -181,6 +181,61 @@ typedef struct ClusterJoinCommitMarker {
 	uint32 crc32c;				   /* CRC32C over [magic .. commit_nonce] */
 } ClusterJoinCommitMarker;
 
+/*
+ * spec-5.15A §2.2 — same-node replacement durable episode marker.
+ *
+ * This is a decoded host-order value, not an on-disk cast target.  The codec
+ * below is the only supported bridge to the exact 96-byte little-endian JCMK
+ * v3 image.  Ordinary join continues to use the independent v2 marker above.
+ */
+#define CLUSTER_JCMK_REPLACEMENT_VERSION UINT32_C(3)
+#define CLUSTER_JCMK_REPLACEMENT_BYTES 96
+#define CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE UINT8_C(1)
+#define CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED UINT8_C(2)
+#define CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED UINT8_C(3)
+#define CLUSTER_JCMK_REPLACEMENT_PHASE_ABORTED_CLOSED UINT8_C(4)
+
+typedef struct ClusterReplacementCommitMarkerV3 {
+	uint32 magic;
+	uint32 version;
+	int32 target_node_id;
+	uint8 phase;
+	uint8 reserved0[3];
+	uint64 generation;
+	uint64 old_admitted_incarnation;
+	uint64 fresh_incarnation;
+	uint64 baseline_epoch;
+	uint64 reserved_or_committed_epoch;
+	uint64 request_nonce;
+	uint8 expected_purge_survivors[16];
+	uint64 grammar_fingerprint;
+	uint32 ready_state_generation;
+	uint32 crc32c;
+} ClusterReplacementCommitMarkerV3;
+
+extern bool cluster_replacement_marker_v3_encode(
+	const ClusterReplacementCommitMarkerV3 *marker,
+	uint8 out[CLUSTER_JCMK_REPLACEMENT_BYTES]);
+extern bool cluster_replacement_marker_v3_decode(
+	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
+	ClusterReplacementCommitMarkerV3 *out);
+
+/* Pure v3 identity, strict-majority and phase-basis decisions. */
+extern bool cluster_replacement_marker_v3_same_image(
+	const ClusterReplacementCommitMarkerV3 *a, const ClusterReplacementCommitMarkerV3 *b);
+extern int cluster_replacement_marker_v3_select_majority(
+	const uint8 images[][CLUSTER_JCMK_REPLACEMENT_BYTES], int n, uint32 majority,
+	int32 expected_target_node, ClusterReplacementCommitMarkerV3 *out_marker, uint32 *out_agree);
+extern bool cluster_replacement_marker_v3_floor_basis(
+	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
+	uint64 *out_incarnation_floor);
+extern bool cluster_replacement_marker_v3_is_committed_closed_basis(
+	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
+	uint64 *out_incarnation_floor);
+extern bool cluster_replacement_marker_v3_is_admitted_basis(
+	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
+	uint64 *out_incarnation_floor, uint32 *out_ready_state_generation);
+
 /* outcome of cluster_reconfig_submit_join_marker (mirrors the fence/leave result). */
 typedef enum ClusterJoinMarkerSubmitResult {
 	CLUSTER_JOIN_MARKER_SUBMIT_ACK = 0, /* durable on >= quorum-majority disks */

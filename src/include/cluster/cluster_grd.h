@@ -1484,7 +1484,8 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *resid, int32 node_id, u
 /*
  * GES RELEASE live path: remove the holder then drain converts + one waiter
  * (stale-epoch entries dropped first).  Returns granted identities (each
- * tagged REQUEST / CONVERT) for the caller to route via GES_REPLY GRANT.
+ * tagged REQUEST / CONVERT) for the caller to route via GES_REPLY GRANT, or
+ * -1 when the exact holder was not present and no release occurred.
  */
 extern int cluster_grd_release_and_drain(const ClusterResId *resid,
 										 const ClusterGrdHolderId *holder,

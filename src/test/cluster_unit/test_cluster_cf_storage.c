@@ -223,10 +223,20 @@ cluster_conf_node_count(void)
 {
 	return 1;
 }
+bool
+cluster_cf_exactly_one_declared_node(void)
+{
+	return true;
+}
 void
 cluster_cf_set_bootstrap_authority(bool on)
 {
 	(void)on;
+}
+bool
+cluster_cf_owner_eor_install(void)
+{
+	return true;
 }
 void
 cluster_cf_set_join_readonly(bool on)

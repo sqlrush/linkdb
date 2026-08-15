@@ -91,6 +91,27 @@ cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority au
 }
 
 /*
+ * cluster_vis_committed_bound_admissible
+ *
+ * S3-P0-03 pure requester gate.  COMMITTED_BELOW_HORIZON is backed by the
+ * origin's own CLOG plus the retention proof: it always proves terminal
+ * COMMITTED, but supplies only an upper bound for snapshot ordering.  Thus a
+ * terminal-state-only caller (read_scn == InvalidScn by resolver contract)
+ * may consume the status, while a snapshot caller still needs H <= read_scn.
+ * The caller keeps the is_bound/kind marker, so this never authorizes stamping
+ * or memoizing H as an exact commit SCN.
+ */
+bool
+cluster_vis_committed_bound_admissible(SCN horizon_scn, SCN read_scn)
+{
+	if (!SCN_VALID(horizon_scn))
+		return false;
+	if (!SCN_VALID(read_scn))
+		return true; /* terminal state only; no snapshot ordering claim */
+	return scn_time_cmp(horizon_scn, read_scn) <= 0;
+}
+
+/*
  * cluster_vis_tt_block_xid_scan
  *
  * spec-5.22d A1 (D4-8): the scan CORE under cluster_vis_tt_block_positive_
@@ -265,6 +286,10 @@ cluster_vis_undo_verdict_page_usable(const struct ClusterGcsUndoVerdictPage *v,
 	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
 		/* Terminal abort carries no scn of any kind. */
 		return !SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn);
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:
+		/* Positive live proof is canonical and non-terminal: no terminal
+		 * SCN, horizon, or wrap residue may cross this branch. */
+		return !SCN_VALID(v->commit_scn) && !SCN_VALID(v->horizon_scn) && v->wrap == 0;
 	default:
 		return false; /* unknown kind: refuse, never guess */
 	}
@@ -309,6 +334,10 @@ cluster_undo_verdict_from_wire_page(const struct ClusterGcsUndoVerdictPage *v,
 
 	case (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED:
 		r.kind = CLUSTER_UNDO_VERDICT_ABORTED;
+		return r;
+
+	case (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:
+		r.kind = CLUSTER_UNDO_VERDICT_IN_PROGRESS;
 		return r;
 
 	default:

@@ -70,6 +70,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_tier1.h" /* CLUSTER_IC_TIER1_DATA_CHANNELS (spec-7.3 D3) */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_native_lock_probe.h"
@@ -238,6 +239,181 @@ cluster_lms_shared_state(void)
 {
 	return cluster_lms_state;
 }
+
+/*
+ * spec-8.4 D4-B — publish one fresh DATA-worker incarnation under the
+ * existing LMS proof lock.  Worker 0 must invalidate a stale close ACK
+ * before a replacement incarnation becomes visible.  Zero is reserved, and
+ * exhaustion refuses instead of wrapping to a previously used identity.
+ */
+static uint64
+lms_r4_publish_worker_incarnation(ClusterLmsSharedState *state, int worker_id)
+{
+	uint64 current;
+	uint64 next = 0;
+
+	if (state == NULL || worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
+		return 0;
+
+	LWLockAcquire(&state->lwlock, LW_EXCLUSIVE);
+	if (worker_id == 0)
+		state->r4_controls.drain_ack_generation = 0;
+	current = state->r4_controls.data_worker_incarnation[worker_id];
+	if (current != UINT64_MAX) {
+		next = current + 1;
+		state->r4_controls.data_worker_incarnation[worker_id] = next;
+	}
+	LWLockRelease(&state->lwlock);
+
+	return next;
+}
+
+/*
+ * Bind a drain request to the currently published DATA worker 0
+ * incarnation.  Request and stale-ACK invalidation are published together
+ * under the existing LMS proof lock, so an observer cannot accept an ACK
+ * from a replaced worker.
+ */
+bool
+cluster_lms_r4_drain_request(ClusterLmsSharedState *state, uint64 generation,
+								 uint64 *worker_incarnation)
+{
+	uint64 current;
+	bool requested = false;
+
+	if (state == NULL || generation == 0 || worker_incarnation == NULL)
+		return false;
+
+	LWLockAcquire(&state->lwlock, LW_EXCLUSIVE);
+	current = state->r4_controls.data_worker_incarnation[0];
+	if (current != 0) {
+		/* Reissuing the same generation is an idempotent LMON tick.  Keep
+		 * its already-matching ACK; only a new request generation may
+		 * invalidate the prior proof. */
+		if (state->r4_controls.drain_request_generation != generation) {
+			state->r4_controls.drain_ack_generation = 0;
+			state->r4_controls.drain_request_generation = generation;
+		}
+		*worker_incarnation = current;
+		requested = true;
+	}
+	LWLockRelease(&state->lwlock);
+
+	return requested;
+}
+
+/* Publish only the ACK belonging to the exact live request identity. */
+static bool
+lms_r4_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation,
+				 uint64 generation)
+{
+	bool published = false;
+
+	if (state == NULL || worker_incarnation == 0 || generation == 0)
+		return false;
+
+	LWLockAcquire(&state->lwlock, LW_EXCLUSIVE);
+	if (state->r4_controls.data_worker_incarnation[0] == worker_incarnation &&
+		state->r4_controls.drain_request_generation == generation) {
+		state->r4_controls.drain_ack_generation = generation;
+		published = true;
+	}
+	LWLockRelease(&state->lwlock);
+
+	return published;
+}
+
+#ifdef USE_CLUSTER_UNIT
+/* Focused test-only observer; product reclaim co-samples this identity inside
+ * its single EXCLUSIVE claim window and exposes no separate acceptance API. */
+static bool
+cluster_lms_r4_drain_ack_matches(ClusterLmsSharedState *state,
+								 uint64 worker_incarnation, uint64 generation)
+{
+	bool matches;
+
+	if (state == NULL || worker_incarnation == 0 || generation == 0)
+		return false;
+
+	LWLockAcquire(&state->lwlock, LW_SHARED);
+	matches = state->r4_controls.data_worker_incarnation[0] == worker_incarnation &&
+		state->r4_controls.drain_request_generation == generation &&
+		state->r4_controls.drain_ack_generation == generation;
+	LWLockRelease(&state->lwlock);
+
+	return matches;
+}
+#endif
+
+/*
+ * Publish worker 0's close ACK only after its process-local D4 debt and both
+ * existing outbound transports are empty.  The first lock snapshots the
+ * requested pair; lms_r4_drain_ack() performs the final locked pair recheck.
+ */
+static bool
+lms_r4_drain_ack_tick(ClusterLmsSharedState *state, uint64 worker_incarnation)
+{
+	uint64 generation = 0;
+	int peer;
+
+	if (state == NULL || worker_incarnation == 0 || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+
+	LWLockAcquire(&state->lwlock, LW_SHARED);
+	if (state->r4_controls.data_worker_incarnation[0] == worker_incarnation)
+		generation = state->r4_controls.drain_request_generation;
+	LWLockRelease(&state->lwlock);
+	if (generation == 0 || !cluster_cr_server_r4_worker0_drained())
+		return false;
+
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		if (peer == cluster_node_id)
+			continue;
+		if (cluster_ic_tier1_pending_outbound(peer)
+			|| cluster_ic_rdma_pending_outbound(peer))
+			return false;
+	}
+
+	return lms_r4_drain_ack(state, worker_incarnation, generation);
+}
+
+#ifdef USE_CLUSTER_UNIT
+uint64
+cluster_lms_test_publish_r4_worker_incarnation(ClusterLmsSharedState *state, int worker_id)
+{
+	return lms_r4_publish_worker_incarnation(state, worker_id);
+}
+
+bool
+cluster_lms_test_r4_drain_request(ClusterLmsSharedState *state, uint64 generation,
+								  uint64 *worker_incarnation)
+{
+	return cluster_lms_r4_drain_request(state, generation, worker_incarnation);
+}
+
+bool
+cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state,
+						  uint64 worker_incarnation, uint64 generation)
+{
+	return lms_r4_drain_ack(state, worker_incarnation, generation);
+}
+
+bool
+cluster_lms_test_r4_drain_ack_matches(ClusterLmsSharedState *state,
+								  uint64 worker_incarnation,
+								  uint64 generation)
+{
+	return cluster_lms_r4_drain_ack_matches(state, worker_incarnation, generation);
+}
+
+bool
+cluster_lms_test_r4_drain_ack_tick(ClusterLmsSharedState *state,
+								   uint64 worker_incarnation)
+{
+	return lms_r4_drain_ack_tick(state, worker_incarnation);
+}
+#endif
 
 
 /* ============================================================
@@ -746,6 +922,8 @@ cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary
 void
 LmsMain(void)
 {
+	uint64 r4_worker_incarnation;
+
 	Assert(IsUnderPostmaster);
 
 	MyBackendType = B_LMS;
@@ -772,6 +950,11 @@ LmsMain(void)
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_lms shmem region not attached"),
 				 errhint("cluster_lms_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
+	r4_worker_incarnation = lms_r4_publish_worker_incarnation(cluster_lms_state, 0);
+	if (r4_worker_incarnation == 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cluster_lms DATA worker 0 incarnation exhausted")));
 
 	/* Publish STARTING + record pid / spawned_at.  spec-7.3 D4: worker 0's
 	 * pid also goes to worker_pids[0] so cluster_lms_wakeup(0) is uniform with
@@ -842,6 +1025,7 @@ LmsMain(void)
 		/* PGRAC: spec-6.12b — construct parked CR-server requests (every
 		 * failure becomes a DENIED result; LMS never exits over a serve). */
 		cluster_lms_cr_drain();
+		(void)lms_r4_drain_ack_tick(cluster_lms_state, r4_worker_incarnation);
 
 		/* PGRAC: spec-7.2 D2 — with a live DATA plane the wait moves into
 		 * the data-plane tick (WaitEventSet: DATA sockets + MyLatch, latch
@@ -964,6 +1148,10 @@ LmsWorkerMain(int worker_id)
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_lms shmem region not attached"),
 				 errhint("cluster_lms_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
+	if (lms_r4_publish_worker_incarnation(cluster_lms_state, worker_id) == 0)
+		ereport(FATAL,
+				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+				 errmsg("cluster_lms DATA worker %d incarnation exhausted", worker_id)));
 
 	/* Publish this worker's pid so the D4 wakeup path can find it. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);

@@ -35,6 +35,14 @@ my @lmon_numeric_keys =
 my @undo_numeric_keys =
 	qw(segment_allocated_count segment_allocated_high_water segment_effective_cap);
 my @gcs_numeric_keys = qw(pi_master_metadata_retire_count);
+my @r4_numeric_keys = qw(
+  cr_route_started_count cr_holder_full_count cr_holder_retry_count
+  cr_holder_failclosed_count undo_data_fetch_served_count
+  undo_data_fetch_denied_count tx_resolve_unknown_count
+  tx_resolve_in_progress_count tx_resolve_prepared_count
+  tx_resolve_committed_count tx_resolve_aborted_count
+  multi_resolve_served_count multi_resolve_unknown_count
+  slot_capacity_retry_count);
 
 my $quad;
 END
@@ -63,7 +71,7 @@ sub state_map
 		'postgres',
 		q{SELECT category || E'\t' || key || E'\t' || value
 		  FROM pg_cluster_state
-		  WHERE category IN ('pcm', 'lmon', 'undo', 'gcs')
+		  WHERE category IN ('pcm', 'lmon', 'undo', 'gcs', 'r4')
 		  ORDER BY category, key},
 		timeout => 10);
 
@@ -89,7 +97,8 @@ sub missing_numeric_keys
 		[ pcm => \@pcm_numeric_keys ],
 		[ lmon => \@lmon_numeric_keys ],
 		[ undo => \@undo_numeric_keys ],
-		[ gcs => \@gcs_numeric_keys ])
+		[ gcs => \@gcs_numeric_keys ],
+		[ r4 => \@r4_numeric_keys ])
 	{
 		my ($category, $keys) = @$entry;
 		for my $key (@$keys)

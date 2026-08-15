@@ -30,17 +30,19 @@
  *	    T19  lock-only raw_xmax scan ignores data ACTIVE slot for same xid
  *	    T20  lock-only raw_xmax scan rejects ambiguous duplicate same wrap
  *	    T21  lock-only raw_xmax scan chooses highest-wrap unique match
+ *	    T21a-c data raw_xid scan ignores lock/marker states, rejects an
+ *	         ambiguous highest wrap, and selects a unique highest wrap
  *	    T22  spec-3.9 L213 redo parity: fresh page gets pd_block_scn = write_scn
  *	    T23  spec-3.9 L213 redo parity: older write_scn is a monotonic no-op
  *	    T24  spec-3.9 L213 redo parity: InvalidScn write_scn (lock-only) no-op
  *	    T25  spec-3.9 L213 redo parity: newer write_scn advances the watermark
- *	    T33  spec-7.1 watch-2: marker reuse of a completed DATA slot folds
- *	         the evicted write_scn into the recycle watermark
+ *	    T33  spec-3.6b current-MX: a lossy marker never evicts a completed
+ *	         DATA slot still addressable by tuple.t_itl_slot_idx
  *	    T34  spec-7.1 watch-2: marker reuse of a completed lock-only slot
  *	         contributes nothing
  *	    T35  spec-7.1 watch-2: marker into a FREE slot contributes nothing
- *	    T36  spec-7.1 watch-2: numeric xid/multixact-id collision must not
- *	         suppress the fold (new_xid = InvalidTransactionId)
+ *	    T36  spec-3.6b current-MX: numeric xid/multixact-id collision still
+ *	         preserves the completed DATA anchor
  *	    T37-T46  spec-8.4 R4 D6: pure lock-only slot-index selection,
  *	         canonical failure sentinel, highest-wrap winner, equal-winning-
  *	         wrap ambiguity, and old/new reader agreement
@@ -641,6 +643,79 @@ UT_TEST(test_t21_lock_scan_chooses_highest_wrap)
 	UT_ASSERT_EQ((int)ref.tt_slot_id, 10);
 }
 
+UT_TEST(test_t21a_data_scan_ignores_lock_and_marker_same_xid)
+{
+	Page page = build_itl_page();
+	ClusterUndoTTSlotRef ref;
+	ClusterItlSlotData *data = slot_at(page, 0);
+	ClusterItlSlotData *lock = slot_at(page, 1);
+	ClusterItlSlotData *marker = slot_at(page, 2);
+
+	data->flags = ITL_FLAG_COMMITTED;
+	data->xid = (TransactionId)1001;
+	data->wrap = 1;
+	data->undo_segment_head = uba_encode(257, 0, 11, 0);
+	data->commit_scn = (SCN)7000;
+
+	lock->flags = ITL_FLAG_LOCK_ONLY_COMMITTED;
+	lock->xid = (TransactionId)1001;
+	lock->wrap = 8;
+	lock->undo_segment_head = uba_encode(1, 0, 2, 0);
+
+	marker->flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
+	marker->xid = (TransactionId)1001;
+	marker->wrap = 9;
+	marker->undo_segment_head = uba_encode(1, 0, 3, 0);
+
+	UT_ASSERT_EQ(
+		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1001, &ref), 1);
+	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 12);
+	UT_ASSERT_EQ((int)ref.has_cached_status, 1);
+}
+
+UT_TEST(test_t21b_data_scan_rejects_ambiguous_highest_wrap)
+{
+	Page page = build_itl_page();
+	ClusterUndoTTSlotRef ref;
+	ClusterItlSlotData *a = slot_at(page, 0);
+	ClusterItlSlotData *b = slot_at(page, 1);
+
+	a->flags = ITL_FLAG_COMMITTED;
+	a->xid = (TransactionId)1002;
+	a->wrap = 4;
+	a->undo_segment_head = uba_encode(1, 0, 1, 0);
+	b->flags = ITL_FLAG_ABORTED;
+	b->xid = (TransactionId)1002;
+	b->wrap = 4;
+	b->undo_segment_head = uba_encode(257, 0, 2, 0);
+
+	UT_ASSERT_EQ(
+		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1002, &ref), 0);
+}
+
+UT_TEST(test_t21c_data_scan_chooses_unique_highest_wrap)
+{
+	Page page = build_itl_page();
+	ClusterUndoTTSlotRef ref;
+	ClusterItlSlotData *old = slot_at(page, 0);
+	ClusterItlSlotData *newer = slot_at(page, 1);
+
+	old->flags = ITL_FLAG_COMMITTED;
+	old->xid = (TransactionId)1003;
+	old->wrap = 2;
+	old->undo_segment_head = uba_encode(1, 0, 1, 0);
+	newer->flags = ITL_FLAG_NEEDS_CLEANOUT;
+	newer->xid = (TransactionId)1003;
+	newer->wrap = 5;
+	newer->undo_segment_head = uba_encode(257, 0, 13, 0);
+
+	UT_ASSERT_EQ(
+		(int)cluster_itl_find_data_tt_ref_by_xid(page, (TransactionId)1003, &ref), 1);
+	UT_ASSERT_EQ((int)ref.undo_segment_id, 257);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 14);
+}
+
 UT_TEST(test_t37_lock_slot_index_null_page_sets_sentinel)
 {
 	uint8 index = 3;
@@ -1009,12 +1084,11 @@ UT_TEST(test_t32_redo_recomputes_recycle_watermark)
  * trigger.  In-progress (ACTIVE / LOCK_ONLY_ACTIVE) => true; FREE and all
  * terminal states => false. */
 /* ============================================================
- *	spec-7.1 watch-2 (spec-3.10 §v0.5 parity):  a MultiXact marker
- *	stamp that evicts a completed DATA slot drops that slot's undo
- *	anchor from the per-page CR candidate set exactly like a
- *	data-writer recycle, so it must fold the evicted write_scn into
- *	the recycle watermark (otherwise own-instance CR can silently
- *	reconstruct a post-snapshot version -- false-visible).  T33-T36
+ *	spec-3.6b current-MX authority closure: a MultiXact marker is a lossy
+ *	page-format hint and must never evict a completed DATA slot.  A live
+ *	tuple may still point at that slot through t_itl_slot_idx; replacing it
+ *	with a marker makes the next visibility check fail closed as "TT slot
+ *	recycled" before the authoritative current-MX path can run.  T33-T36
  *	drive the REAL cluster_itl_stamp_multixact_marker through the
  *	bufmgr globals (BufferBlocks -> synthetic page, Buffer 1): the
  *	static-inline BufferGetPage compiled into cluster_itl.o resolves
@@ -1029,7 +1103,7 @@ marker_buffer_for(Page page)
 	return (Buffer)1;
 }
 
-UT_TEST(test_t33_marker_reuse_completed_data_folds_watermark)
+UT_TEST(test_t33_marker_full_page_preserves_completed_data_anchor)
 {
 	Page page = build_itl_page();
 	Buffer buf = marker_buffer_for(page);
@@ -1049,12 +1123,12 @@ UT_TEST(test_t33_marker_reuse_completed_data_folds_watermark)
 	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = InvalidScn;
 
 	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
-	UT_ASSERT_EQ((int)idx, 5);
-	/* watch-2: the evicted COMMITTED writer's write_scn reached the
-	 * watermark BEFORE the marker overwrote the slot. */
-	UT_ASSERT_EQ((int)(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn == (SCN)5000), 1);
-	UT_ASSERT_EQ((int)(slot_at(page, 5)->flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI), 1);
-	UT_ASSERT_EQ((int)slot_at(page, 5)->wrap, 8);
+	UT_ASSERT_EQ((int)idx, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+	UT_ASSERT_EQ((int)(slot_at(page, 5)->flags == ITL_FLAG_COMMITTED), 1);
+	UT_ASSERT_EQ((int)slot_at(page, 5)->xid, 100);
+	UT_ASSERT_EQ((int)(slot_at(page, 5)->write_scn == (SCN)5000), 1);
+	UT_ASSERT_EQ((int)slot_at(page, 5)->wrap, 7);
+	UT_ASSERT_EQ((int)SCN_VALID(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn), 0);
 }
 
 UT_TEST(test_t34_marker_reuse_lock_only_no_fold)
@@ -1097,18 +1171,16 @@ UT_TEST(test_t35_marker_free_slot_no_fold)
 	UT_ASSERT_EQ((int)slot_at(page, 0)->wrap, 0);
 }
 
-UT_TEST(test_t36_marker_reuse_xid_mxid_collision_still_folds)
+UT_TEST(test_t36_marker_xid_mxid_collision_preserves_data_anchor)
 {
 	Page page = build_itl_page();
 	Buffer buf = marker_buffer_for(page);
 	uint8 i;
 	uint8 idx;
 
-	/* 8.A pin: the evicted COMMITTED xid numerically equals the MultiXactId
-	 * being stamped (xid and multixact-id are separate counters and can
-	 * collide in value).  The contribution helper's same-xid reuse exemption
-	 * must NOT fire -- the marker path passes InvalidTransactionId as
-	 * new_xid, never the multixact id. */
+	/* 8.A pin: the completed DATA xid numerically equals the MultiXactId
+	 * being stamped.  The separate id domains do not authorize replacing
+	 * the tuple's data anchor with a marker. */
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		slot_at(page, i)->flags = ITL_FLAG_ACTIVE;
 		slot_at(page, i)->xid = (TransactionId)(1000 + i);
@@ -1119,8 +1191,80 @@ UT_TEST(test_t36_marker_reuse_xid_mxid_collision_still_folds)
 	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = InvalidScn;
 
 	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
-	UT_ASSERT_EQ((int)idx, 2);
-	UT_ASSERT_EQ((int)(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn == (SCN)6000), 1);
+	UT_ASSERT_EQ((int)idx, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+	UT_ASSERT_EQ((int)(slot_at(page, 2)->flags == ITL_FLAG_COMMITTED), 1);
+	UT_ASSERT_EQ((int)slot_at(page, 2)->xid, 4242);
+	UT_ASSERT_EQ((int)(slot_at(page, 2)->write_scn == (SCN)6000), 1);
+	UT_ASSERT_EQ((int)SCN_VALID(ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn), 0);
+}
+
+UT_TEST(test_marker_recasts_stale_marker_before_free_slot)
+{
+	Page page = build_itl_page();
+	Buffer buf = marker_buffer_for(page);
+	uint8 idx;
+
+	/* A marker never joins ITL touch/terminal cleanup.  Recast the existing
+	 * lossy marker before consuming another slot. */
+	slot_at(page, 4)->flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
+	slot_at(page, 4)->xid = (TransactionId)4000;
+	slot_at(page, 4)->wrap = 9;
+
+	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
+	UT_ASSERT_EQ((int)idx, 4);
+	UT_ASSERT_EQ((int)slot_at(page, 4)->xid, 4242);
+	UT_ASSERT_EQ((int)(slot_at(page, 4)->flags
+					   == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI),
+				 1);
+	UT_ASSERT_EQ((int)slot_at(page, 4)->wrap, 10);
+	UT_ASSERT_EQ((int)(slot_at(page, 0)->flags == ITL_FLAG_FREE), 1);
+}
+
+UT_TEST(test_marker_same_mxid_is_idempotent)
+{
+	Page page = build_itl_page();
+	Buffer buf = marker_buffer_for(page);
+	uint8 idx;
+
+	slot_at(page, 4)->flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
+	slot_at(page, 4)->xid = (TransactionId)4242;
+	slot_at(page, 4)->wrap = 9;
+
+	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
+	UT_ASSERT_EQ((int)idx, 4);
+	UT_ASSERT_EQ((int)slot_at(page, 4)->xid, 4242);
+	UT_ASSERT_EQ((int)slot_at(page, 4)->wrap, 9);
+	UT_ASSERT_EQ((int)(slot_at(page, 0)->flags == ITL_FLAG_FREE), 1);
+}
+
+UT_TEST(test_marker_collapses_legacy_stale_accumulation)
+{
+	Page page = build_itl_page();
+	Buffer buf = marker_buffer_for(page);
+	uint8 idx;
+	uint8 i;
+	int marker_count = 0;
+
+	for (i = 1; i <= 3; i++) {
+		slot_at(page, i)->flags = ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI;
+		slot_at(page, i)->xid = (TransactionId)(4000 + i);
+		slot_at(page, i)->wrap = (uint16)(10 + i);
+	}
+
+	idx = cluster_itl_stamp_multixact_marker(buf, (MultiXactId)4242);
+	UT_ASSERT_EQ((int)idx, 1);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+		if (slot_at(page, i)->flags == ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI)
+			marker_count++;
+	UT_ASSERT_EQ(marker_count, 1);
+	UT_ASSERT_EQ((int)slot_at(page, 1)->xid, 4242);
+	UT_ASSERT_EQ((int)slot_at(page, 1)->wrap, 12);
+	UT_ASSERT_EQ((int)(slot_at(page, 2)->flags == ITL_FLAG_FREE), 1);
+	UT_ASSERT_EQ((int)slot_at(page, 2)->xid, (int)InvalidTransactionId);
+	UT_ASSERT_EQ((int)slot_at(page, 2)->wrap, 12);
+	UT_ASSERT_EQ((int)(slot_at(page, 3)->flags == ITL_FLAG_FREE), 1);
+	UT_ASSERT_EQ((int)slot_at(page, 3)->xid, (int)InvalidTransactionId);
+	UT_ASSERT_EQ((int)slot_at(page, 3)->wrap, 13);
 }
 
 UT_TEST(test_d11_page_has_active_slot_detects_active)
@@ -1185,6 +1329,9 @@ main(void)
 	UT_RUN(test_t19_lock_scan_ignores_data_active_same_xid);
 	UT_RUN(test_t20_lock_scan_rejects_ambiguous_same_wrap);
 	UT_RUN(test_t21_lock_scan_chooses_highest_wrap);
+	UT_RUN(test_t21a_data_scan_ignores_lock_and_marker_same_xid);
+	UT_RUN(test_t21b_data_scan_rejects_ambiguous_highest_wrap);
+	UT_RUN(test_t21c_data_scan_chooses_unique_highest_wrap);
 	UT_RUN(test_t37_lock_slot_index_null_page_sets_sentinel);
 	UT_RUN(test_t38_lock_slot_index_miss_sets_sentinel);
 	UT_RUN(test_t39_lock_slot_index_unique_winner);
@@ -1207,11 +1354,14 @@ main(void)
 	UT_RUN(test_t30_watermark_completed_data_contributes);
 	UT_RUN(test_t31_watermark_advance_monotone);
 	UT_RUN(test_t32_redo_recomputes_recycle_watermark);
-	/* spec-7.1 watch-2: marker reuse folds the recycle watermark. */
-	UT_RUN(test_t33_marker_reuse_completed_data_folds_watermark);
+	/* spec-3.6b: lossy markers preserve completed DATA anchors. */
+	UT_RUN(test_t33_marker_full_page_preserves_completed_data_anchor);
 	UT_RUN(test_t34_marker_reuse_lock_only_no_fold);
 	UT_RUN(test_t35_marker_free_slot_no_fold);
-	UT_RUN(test_t36_marker_reuse_xid_mxid_collision_still_folds);
+	UT_RUN(test_t36_marker_xid_mxid_collision_preserves_data_anchor);
+	UT_RUN(test_marker_recasts_stale_marker_before_free_slot);
+	UT_RUN(test_marker_same_mxid_is_idempotent);
+	UT_RUN(test_marker_collapses_legacy_stale_accumulation);
 	UT_RUN(test_d11_page_has_active_slot_detects_active);
 	UT_RUN(test_d11_page_has_active_slot_no_itl_is_false);
 

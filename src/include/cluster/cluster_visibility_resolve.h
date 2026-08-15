@@ -128,10 +128,10 @@ extern void cluster_visibility_resolve_tuple(Buffer buffer, HeapTupleHeader htup
  * spec-6.12i CP5: the _scn variant threads the caller's snapshot read_scn
  * down to the active-runtime resolver so a below-horizon origin verdict can
  * be judged admissible (requester leg (e)) and returned as a bound
- * (commit_scn_is_bound).  Callers without snapshot semantics use the plain
- * variant above (read_scn = InvalidScn -> bounds are never admissible;
- * exact verdicts still resolve).  Only the HeapTupleSatisfiesMVCC fork
- * sites pass a real read_scn.
+ * (commit_scn_is_bound).  Terminal-state-only callers use the plain variant
+ * above (read_scn = InvalidScn): an origin+CLOG-proven bound resolves only the
+ * COMMITTED status and remains marked non-exact (never stamp/cache).  Only
+ * the HeapTupleSatisfiesMVCC fork sites pass a real read_scn for ordering.
  */
 extern void cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup,
 												 TransactionId raw_xid, ClusterVisXidKind which,
@@ -190,6 +190,7 @@ extern bool cluster_vis_xmin_needs_resolution(uint16 infomask);
 extern bool cluster_vis_prune_must_defer(bool storage_mode, bool cluster_horizon_available);
 extern ClusterVisVerdict cluster_vis_update_xmin_verdict(ClusterTTStatus status);
 extern ClusterVisVerdict cluster_vis_update_xmax_verdict(ClusterTTStatus status, bool is_delete);
+extern ClusterVisVerdict cluster_vis_update_lock_only_xmax_verdict(ClusterTTStatus status);
 
 /*
  * spec-3.21 §2.3: CR image xmax-side MVCC visibility verdict.
@@ -238,11 +239,14 @@ extern ClusterVisVerdict cluster_vis_dirty_verdict(ClusterTTStatus status, bool 
  * cluster_vis_from_undo_verdict -- map a D3 cross-node verdict onto the local
  * visibility out-params.  COMMITTED_EXACT/BOUND -> REMOTE/COMMITTED (BOUND
  * sets commit_scn_is_bound so a below-horizon bound is never stamped/cached);
- * ABORTED -> REMOTE/ABORTED; UNKNOWN_FAIL_CLOSED / IN_PROGRESS (D3 never
- * produces IN_PROGRESS) / any other -> STALE_OR_AMBIGUOUS so the caller keeps
- * the 53R97 fail-closed boundary (Rule 8.A / L10).  ALL branches overwrite
- * commit_scn + commit_scn_is_bound so a non-terminal verdict never leaks a
- * residual scn.  Returns true iff a terminal (COMMITTED/ABORTED) was produced.
+ * ABORTED -> REMOTE/ABORTED; a positive origin-live IN_PROGRESS ->
+ * REMOTE/IN_PROGRESS with no SCN/bound (the current-DML caller enters the
+ * existing cluster TX wait); UNKNOWN_FAIL_CLOSED / any other ->
+ * STALE_OR_AMBIGUOUS so the caller keeps the 53R97 fail-closed boundary
+ * (Rule 8.A / L10).  ALL branches overwrite commit_scn +
+ * commit_scn_is_bound so a non-terminal verdict never leaks a residual scn.
+ * Returns true iff a usable exact status (terminal or proven-live) was
+ * produced.
  */
 extern bool cluster_vis_from_undo_verdict(ClusterUndoVerdictResult v, ClusterVisResolve *out);
 

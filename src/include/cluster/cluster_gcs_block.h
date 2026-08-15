@@ -1527,7 +1527,10 @@ typedef enum GcsBlockReplyStatus {
 	GCS_BLOCK_REPLY_R4_MULTI_RESOLVE_RESULT = 23,
 	GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT = 24,
 	GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED = 25,
-	GCS_BLOCK_REPLY_R4_DENIED = 26
+	GCS_BLOCK_REPLY_R4_DENIED = 26,
+	GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT = 27,
+	GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT = 28,
+	GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT = 29
 } GcsBlockReplyStatus;
 
 /*
@@ -1576,6 +1579,15 @@ StaticAssertDecl(GCS_BLOCK_REPLY_R4_CR_FULL == 21,
 				 "R4 reply status ABI must begin at 21");
 StaticAssertDecl(GCS_BLOCK_REPLY_R4_DENIED == 26,
 				 "R4 reply status ABI must end at 26");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+					 == GCS_BLOCK_REPLY_R4_DENIED + 1,
+				 "current MX describe result must follow the closed R4 domain");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+					 == GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT + 1,
+				 "current MX member-proof result must follow describe");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT
+					 == GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT + 1,
+				 "current MX stats result must remain the reserved tail status");
 
 /* PGRAC adaptation: R4 owns one closed status suffix.  Keep the domain
  * predicates numeric so legacy and R4 decoders cannot accept each other's
@@ -1601,16 +1613,18 @@ GcsBlockReplyStatusIsR4Refusal(GcsBlockReplyStatus status)
 }
 
 /* PGRAC: spec-6.12i / spec-7.1 — every undo-plane reply kind (TT-header fetch,
- * single-xid verdict, batched multi-member verdict) ships the BLCKSZ page plus
- * a co-sampled ClusterGcsUndoAuthTrailer and overrides the reply header's
- * epoch / page_lsn with the LMS-sampled live authority.  Centralised so every
- * ship/parse site treats the three identically (D-i3 authority carriage). */
+ * single-xid verdict, batched multi-member verdict, R4 undo-data result) ships
+ * the BLCKSZ page plus a co-sampled ClusterGcsUndoAuthTrailer and overrides the
+ * reply header's epoch / page_lsn with the LMS-sampled live authority.
+ * Centralised so every ship/parse site treats the four identically (D-i3
+ * authority carriage). */
 static inline bool
 GcsBlockReplyStatusCarriesUndoAuthTrailer(GcsBlockReplyStatus status)
 {
 	return status == GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT
 		   || status == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT
-		   || status == GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
+		   || status == GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
+		   || status == GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT;
 }
 
 static inline bool
@@ -2145,7 +2159,46 @@ StaticAssertDecl(sizeof(GcsBlockReplyHeader) == 48,
 				 "spec-2.33 D1 + spec-2.35 HC109 GcsBlockReplyHeader wire ABI 48B "
 				 "(request_id 8 + page_lsn 8 + epoch 8 + checksum 4 + "
 				 "sender_node 4 + requester_backend_id 4 + transition_id 1 + "
-				 "status 1 + forwarding_master_node_bytes 4 + reserved 6)");
+					 "status 1 + forwarding_master_node_bytes 4 + reserved 6)");
+
+/* Status 24 alone reuses the six-byte reply tail as
+ * {physical_generation:u32_le, reserved:u16=0}.  Generation zero is valid;
+ * UINT32_MAX is exhausted and cannot be published. */
+static inline bool
+GcsBlockReplyHeaderSetR4UndoGeneration(GcsBlockReplyHeader *header,
+									   uint32 physical_generation)
+{
+	if (header != NULL)
+		memset(header->reserved_0, 0, sizeof(header->reserved_0));
+	if (header == NULL || physical_generation == UINT32_MAX)
+		return false;
+	header->reserved_0[0] = (uint8)physical_generation;
+	header->reserved_0[1] = (uint8)(physical_generation >> 8);
+	header->reserved_0[2] = (uint8)(physical_generation >> 16);
+	header->reserved_0[3] = (uint8)(physical_generation >> 24);
+	return true;
+}
+
+static inline bool
+GcsBlockReplyHeaderGetR4UndoGeneration(const GcsBlockReplyHeader *header,
+									   uint32 *physical_generation_out)
+{
+	uint32 generation;
+
+	if (physical_generation_out != NULL)
+		*physical_generation_out = 0;
+	if (header == NULL || physical_generation_out == NULL
+		|| header->reserved_0[4] != 0 || header->reserved_0[5] != 0)
+		return false;
+	generation = (uint32)header->reserved_0[0]
+				 | ((uint32)header->reserved_0[1] << 8)
+				 | ((uint32)header->reserved_0[2] << 16)
+				 | ((uint32)header->reserved_0[3] << 24);
+	if (generation == UINT32_MAX)
+		return false;
+	*physical_generation_out = generation;
+	return true;
+}
 
 #define GCS_BLOCK_REPLY_PROTOCOL_V1 1
 #define GCS_BLOCK_REPLY_PROTOCOL_V2 2
@@ -2363,6 +2416,58 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
  * endian; no packed/native cast is a wire authority. */
 #define CLUSTER_R4_WIRE_VERSION ((uint8)1)
 #define CLUSTER_R4_FORWARD_EXTENDED ((uint8)6)
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF ((uint8)7)
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS ((uint8)8)
+#define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE ((uint8)9)
+#define CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT ((int32)-2)
+
+StaticAssertDecl(CLUSTER_R4_FORWARD_EXTENDED
+					 < GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF,
+				 "current MX request domain must follow the closed R4 kind");
+StaticAssertDecl(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS
+					 == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF + 1
+					 && GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE
+							== GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS + 1,
+				 "current MX request kind allocation changed");
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxMemberProof(const GcsBlockForwardPayload *payload)
+{
+	return payload != NULL
+		   && payload->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxDescribe(const GcsBlockForwardPayload *payload)
+{
+	return payload != NULL
+		   && payload->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsCurrentMxRuntime(const GcsBlockForwardPayload *payload)
+{
+	return GcsBlockForwardPayloadIsCurrentMxMemberProof(payload)
+		   || GcsBlockForwardPayloadIsCurrentMxDescribe(payload);
+}
+
+/* Current-MX overlays the old BufferTag.  DATA sharding therefore uses only
+ * the preserved request identity; this synthetic tag is never authority. */
+static inline BufferTag
+GcsBlockCurrentMxRouteTagMake(uint64 request_id, uint64 epoch,
+							  int32 requester_node,
+							  int32 requester_backend_id)
+{
+	BufferTag tag;
+
+	memset(&tag, 0, sizeof(tag));
+	tag.spcOid = (Oid)((epoch >> 32) ^ (uint64)(uint32)requester_node);
+	tag.dbOid = (Oid)epoch;
+	tag.relNumber = (RelFileNumber)requester_backend_id;
+	tag.forkNum = MAIN_FORKNUM;
+	tag.blockNum = (BlockNumber)(request_id ^ (request_id >> 32));
+	return tag;
+}
 
 typedef enum ClusterCrBuildResult {
 	CLUSTER_CR_BUILD_FULL = 0,
@@ -2911,11 +3016,15 @@ struct ClusterICEnvelope;
 extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(
 	const struct ClusterICEnvelope *env, const ClusterR4CrRequestPayload *request,
 	ClusterCrBuildReason *reason_out);
+/* LMON close census: live requester slots in the exact R4_CR domain. */
+extern uint64 cluster_gcs_block_r4_requester_count(void);
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_gcs_block_test_r4_request80(const struct ClusterICEnvelope *env,
 											 const void *payload);
 extern bool cluster_gcs_block_test_r4_forward96(const struct ClusterICEnvelope *env,
 											 const void *payload);
+extern bool cluster_gcs_block_test_current_mx_forward128(
+	const struct ClusterICEnvelope *env, const void *payload);
 extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result,
 											  ClusterCrBuildReason reason,
 											  bool admitted_forward,
@@ -2923,7 +3032,28 @@ extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result
 extern bool cluster_gcs_block_test_decode_r4_reply(
 	const struct ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
 	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
-	int32 expected_sender_node);
+	int32 expected_sender_node, int32 expected_forwarding_master_node,
+	uint8 expected_reply_domain);
+extern bool cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id,
+													 uint64 request_epoch,
+													 int32 requester_backend_id,
+													 uint8 transition_id,
+													 int32 expected_master_node);
+extern bool cluster_gcs_block_test_snapshot_r4_reply_slot(
+	GcsBlockReplyHeader *header_out, char block_out[GCS_BLOCK_DATA_SIZE],
+	bool *reply_received_out, uint64 *stale_drop_count_out);
+extern bool cluster_gcs_block_test_r4_requester_arm(
+	BufferTag tag, uint64 request_epoch, int32 expected_master_node,
+	uint64 next_sequence, uint64 *request_id_out);
+extern bool cluster_gcs_block_test_snapshot_r4_requester_slot(
+	bool *in_use_out, uint8 *reply_domain_out, uint64 *request_id_out,
+	uint8 *transition_id_out, BufferTag *tag_out, uint64 *request_epoch_out,
+	int32 *expected_master_node_out, ClusterGcsBlockDirectState *direct_state_out,
+	bool *direct_target_prepared_out);
+extern bool cluster_gcs_block_test_release_r4_requester_slot(void);
+extern bool cluster_gcs_block_test_r4_fetch_and_wait(
+	BufferTag tag, SCN read_scn, int32 real_master_node,
+	char dst_page[GCS_BLOCK_DATA_SIZE]);
 #endif
 
 static inline void
@@ -3100,6 +3230,24 @@ ClusterR4ForwardExtensionSetLocator(ClusterR4ForwardExtension *extension,
 	return true;
 }
 
+/* Kind-2/kind-4 bind the locator to the physical segment generation sampled
+ * under BLOCK0_CURRENT SCUR.  Zero is a valid first generation; UINT32_MAX is
+ * exhausted and cannot be published. */
+static inline bool
+ClusterR4ForwardExtensionSetLocatorGeneration(ClusterR4ForwardExtension *extension,
+										   ClusterR4WireKind kind,
+										   const ClusterTxLocator *locator,
+										   uint32 physical_generation)
+{
+	if (extension != NULL)
+		memset(extension, 0, sizeof(*extension));
+	if (extension == NULL || locator == NULL || physical_generation == UINT32_MAX
+		|| !ClusterR4ForwardExtensionSetLocator(extension, kind, locator))
+		return false;
+	ClusterR4WireWriteU32(extension->subject_id_le, physical_generation);
+	return true;
+}
+
 static inline bool
 ClusterR4ForwardExtensionGetLocator(const ClusterR4ForwardExtension *extension,
 									ClusterR4WireKind expected_kind,
@@ -3128,6 +3276,32 @@ ClusterR4ForwardExtensionGetLocator(const ClusterR4ForwardExtension *extension,
 	decoded.itl_kind = extension->kind.locator_bytes[22];
 	decoded.itl_slot_index = extension->kind.locator_bytes[23];
 	*locator_out = decoded;
+	return true;
+}
+
+static inline bool
+ClusterR4ForwardExtensionGetLocatorGeneration(const ClusterR4ForwardExtension *extension,
+										   ClusterR4WireKind expected_kind,
+										   ClusterTxLocator *locator_out,
+										   uint32 *physical_generation_out)
+{
+	uint32 generation;
+	ClusterR4ForwardExtension copy;
+
+	if (locator_out != NULL)
+		memset(locator_out, 0, sizeof(*locator_out));
+	if (physical_generation_out != NULL)
+		*physical_generation_out = 0;
+	if (extension == NULL || locator_out == NULL || physical_generation_out == NULL)
+		return false;
+	generation = ClusterR4WireReadU32(extension->subject_id_le);
+	if (generation == UINT32_MAX)
+		return false;
+	copy = *extension;
+	memset(copy.subject_id_le, 0, sizeof(copy.subject_id_le));
+	if (!ClusterR4ForwardExtensionGetLocator(&copy, expected_kind, locator_out))
+		return false;
+	*physical_generation_out = generation;
 	return true;
 }
 
@@ -3840,7 +4014,14 @@ ClusterGcsUndoAuthTrailerGetAuthorityScn(const ClusterGcsUndoAuthTrailer *t)
 typedef enum ClusterGcsUndoVerdictKind {
 	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT = 1,
 	CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON = 2,
-	CLUSTER_GCS_UNDO_VERDICT_ABORTED = 3
+	CLUSTER_GCS_UNDO_VERDICT_ABORTED = 3,
+	/*
+	 * S3-P0-13: positive NON-terminal proof.  The origin emits this only
+	 * after exact fresh-ref segment/slot identity, own-stripe, stable
+	 * RESOLVED_SCN, and ProcArray-live gates.  Canonical payload has no SCN
+	 * and no wrap; it is never memoized or hint-stamped.
+	 */
+	CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS = 4
 } ClusterGcsUndoVerdictKind;
 
 typedef struct ClusterGcsUndoVerdictPage {

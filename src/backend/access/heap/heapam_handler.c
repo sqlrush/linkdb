@@ -51,6 +51,8 @@
 #include "utils/builtins.h"
 #include "utils/rel.h"
 
+#include "heapam_r4_private.h"
+
 static void reform_and_rewrite_tuple(HeapTuple tuple,
 									 Relation OldHeap, Relation NewHeap,
 									 Datum *values, bool *isnull, RewriteState rwstate);
@@ -62,6 +64,114 @@ static bool SampleHeapTupleVisible(TableScanDesc scan, Buffer buffer,
 static BlockNumber heapam_scan_get_blocks_done(HeapScanDesc hscan);
 
 static const TableAmRoutine heapam_methods;
+
+static TableIndexFetchTupleResult heapam_store_hot_search_result(
+	HeapHotSearchResult *result, TupleTableSlot *slot, Buffer buffer,
+	bool *call_again, bool *all_dead) pg_attribute_unused();
+#ifdef USE_PGRAC_CLUSTER
+static TableIndexFetchTupleResult heapam_index_fetch_cluster_hot(
+	ItemPointer tid, Relation relation, Buffer buffer, Snapshot snapshot,
+	HeapHotSearchResult *result, TupleTableSlot *slot,
+	bool *call_again, bool *all_dead) pg_attribute_unused();
+#endif
+
+/*
+ * Consume the backend-private HOT result without leaking its descriptor
+ * lifetime into the executor slot.  BUFFER_BACKED remains pin-owned by the
+ * buffer slot; OWNED_SCRATCH is copied while the scratch page is alive.
+ */
+static TableIndexFetchTupleResult
+heapam_store_hot_search_result(HeapHotSearchResult *result,
+							   TupleTableSlot *slot, Buffer buffer,
+							   bool *call_again, bool *all_dead)
+{
+	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
+
+	Assert(result != NULL);
+	Assert(TTS_IS_BUFFERTUPLE(slot));
+	Assert(call_again != NULL);
+
+	*call_again = false;
+
+	switch (result->kind)
+	{
+		case HEAP_HOT_SEARCH_NOT_FOUND:
+			ExecClearTuple(slot);
+			return TABLE_INDEX_FETCH_NOT_FOUND;
+
+		case HEAP_HOT_SEARCH_BUFFER_BACKED:
+			Assert(BufferIsValid(buffer));
+			bslot->base.tupdata = result->tuple;
+			ExecStoreBufferHeapTuple(&bslot->base.tupdata, slot, buffer);
+			break;
+
+		case HEAP_HOT_SEARCH_OWNED_SCRATCH:
+			ExecForceStoreHeapTuple(&result->tuple, slot, false);
+			slot->tts_tid = result->tuple.t_self;
+			slot->tts_tableOid = result->tuple.t_tableOid;
+			break;
+
+		default:
+			Assert(false);
+			ExecClearTuple(slot);
+			return TABLE_INDEX_FETCH_NOT_FOUND;
+	}
+
+	if (all_dead != NULL)
+		*all_dead = false;
+
+	return TABLE_INDEX_FETCH_FOUND;
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Dormant post-SHARE-lock cluster-MVCC branch.  The focused Unit37 receipt
+ * enters this exact helper so it cannot replace the companion/FULL/scratch
+ * walk with a test-only choreography.  Live wiring waits for D13 to publish
+ * an episode-safe TARGET admission state.
+ */
+static TableIndexFetchTupleResult
+heapam_index_fetch_cluster_hot(ItemPointer tid, Relation relation,
+								Buffer buffer, Snapshot snapshot,
+								HeapHotSearchResult *result,
+								TupleTableSlot *slot,
+								bool *call_again, bool *all_dead)
+{
+	Assert(result != NULL);
+
+	memset(result, 0, sizeof(*result));
+	result->kind = heap_hot_search_buffer_result(tid, relation, buffer,
+											 snapshot, result, all_dead,
+											 !*call_again);
+	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	return heapam_store_hot_search_result(result, slot, buffer,
+										 call_again, all_dead);
+}
+#endif
+
+#ifdef USE_CLUSTER_UNIT
+TableIndexFetchTupleResult
+cluster_heap_test_r4_store_hot_result(HeapHotSearchResult *result,
+									 TupleTableSlot *slot, Buffer buffer,
+									 bool *call_again, bool *all_dead)
+{
+	return heapam_store_hot_search_result(result, slot, buffer,
+									 call_again, all_dead);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+TableIndexFetchTupleResult
+cluster_heap_test_r4_index_hot_result(ItemPointer tid, Relation relation,
+									 Buffer buffer, Snapshot snapshot,
+									 HeapHotSearchResult *result,
+									 TupleTableSlot *slot,
+									 bool *call_again, bool *all_dead)
+{
+	return heapam_index_fetch_cluster_hot(tid, relation, buffer, snapshot,
+										 result, slot, call_again, all_dead);
+}
+#endif
+#endif
 
 
 /* ------------------------------------------------------------------------
@@ -128,7 +238,7 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 								  bool barrier_aware)
 {
 	IndexFetchHeapData *hscan = (IndexFetchHeapData *) scan;
-	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
+	HeapHotSearchResult hot_result;
 	bool		got_heap_tuple;
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
@@ -164,32 +274,21 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 	}
 	else
 		LockBuffer(hscan->xs_cbuf, BUFFER_LOCK_SHARE);
-	got_heap_tuple = heap_hot_search_buffer(tid,
-											hscan->xs_base.rel,
-											hscan->xs_cbuf,
-											snapshot,
-											&bslot->base.tupdata,
-											all_dead,
-											!*call_again);
-	bslot->base.tupdata.t_self = *tid;
+	memset(&hot_result, 0, sizeof(hot_result));
+	hot_result.kind = heap_hot_search_buffer_result(tid,
+											 hscan->xs_base.rel,
+											 hscan->xs_cbuf,
+											 snapshot,
+											 &hot_result,
+											 all_dead,
+											 !*call_again);
 	LockBuffer(hscan->xs_cbuf, BUFFER_LOCK_UNLOCK);
-
-	if (got_heap_tuple)
-	{
-		/*
-		 * Only in a non-MVCC snapshot can more than one member of the HOT
-		 * chain be visible.
-		 */
-		*call_again = !IsMVCCSnapshot(snapshot);
-
-		slot->tts_tableOid = RelationGetRelid(scan->rel);
-		ExecStoreBufferHeapTuple(&bslot->base.tupdata, slot, hscan->xs_cbuf);
-	}
-	else
-	{
-		/* We've reached the end of the HOT chain. */
-		*call_again = false;
-	}
+	got_heap_tuple = heapam_store_hot_search_result(&hot_result, slot,
+											 hscan->xs_cbuf, call_again, all_dead)
+					 == TABLE_INDEX_FETCH_FOUND;
+	if (got_heap_tuple && !IsMVCCSnapshot(snapshot)
+		&& hot_result.kind == HEAP_HOT_SEARCH_BUFFER_BACKED)
+		*call_again = true;
 
 	return got_heap_tuple ? TABLE_INDEX_FETCH_FOUND : TABLE_INDEX_FETCH_NOT_FOUND;
 }
@@ -413,16 +512,29 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	Buffer		buffer;
 	HeapTuple	tuple = &bslot->base.tupdata;
 	bool		follow_updates;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterHeapSuccessorProof expected_successor;
+	ClusterHeapSuccessorProof next_successor;
+#endif
 
 	follow_updates = (flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0;
 	tmfd->traversed = false;
+#ifdef USE_PGRAC_CLUSTER
+	memset(&expected_successor, 0, sizeof(expected_successor));
+	memset(&next_successor, 0, sizeof(next_successor));
+#endif
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
 
 tuple_lock_retry:
 	tuple->t_self = *tid;
 	result = heap_lock_tuple(relation, tuple, cid, mode, wait_policy,
-							 follow_updates, &buffer, tmfd);
+							 follow_updates, &buffer, tmfd
+#ifdef USE_PGRAC_CLUSTER
+							 , expected_successor.valid ? &expected_successor : NULL
+							 , &next_successor
+#endif
+							 );
 
 	if (result == TM_Updated &&
 		(flags & TUPLE_LOCK_FLAG_FIND_LAST_VERSION))
@@ -436,6 +548,23 @@ tuple_lock_retry:
 		{
 			SnapshotData SnapshotDirty;
 			TransactionId priorXmax;
+
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * A current-MultiXact authority result carries the exact
+			 * successor ITL/TT proof.  Re-enter heap_lock_tuple directly and
+			 * consume that proof under the destination PCM-X; never reduce it
+			 * to tmfd.xmax/raw xmin across this unlocked handoff.
+			 */
+			if (next_successor.valid)
+			{
+				expected_successor = next_successor;
+				*tid = next_successor.tid;
+				tmfd->traversed = true;
+				goto tuple_lock_retry;
+			}
+			memset(&expected_successor, 0, sizeof(expected_successor));
+#endif
 
 			/* it was updated, so look at the updated version */
 			*tid = tmfd->ctid;

@@ -28,6 +28,7 @@
 
 #include "cluster/cluster_guc.h" /* cluster_node_id (spec-5.22e D5-8) */
 #include "cluster/cluster_membership.h"
+#include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_qvotec.h"		  /* cluster_qvotec_in_quorum (quorum sub-gate) */
 #include "cluster/cluster_undo_horizon.h" /* note_self_member (spec-5.22e D5-8) */
 
@@ -63,6 +64,255 @@ static inline bool
 node_id_in_range(int32 node_id)
 {
 	return node_id >= 0 && node_id < CLUSTER_MAX_NODES;
+}
+
+static inline uint32
+jcmk_get_le32(const uint8 *p)
+{
+	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16)
+		   | ((uint32)p[3] << 24);
+}
+
+static inline uint64
+jcmk_get_le64(const uint8 *p)
+{
+	return (uint64)jcmk_get_le32(p) | ((uint64)jcmk_get_le32(p + 4) << 32);
+}
+
+static inline void
+jcmk_put_le32(uint8 *p, uint32 v)
+{
+	p[0] = (uint8)v;
+	p[1] = (uint8)(v >> 8);
+	p[2] = (uint8)(v >> 16);
+	p[3] = (uint8)(v >> 24);
+}
+
+static inline void
+jcmk_put_le64(uint8 *p, uint64 v)
+{
+	jcmk_put_le32(p, (uint32)v);
+	jcmk_put_le32(p + 4, (uint32)(v >> 32));
+}
+
+static bool
+replacement_marker_v3_phase_valid(uint8 phase, uint32 ready_state_generation)
+{
+	switch (phase) {
+	case CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE:
+	case CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED:
+	case CLUSTER_JCMK_REPLACEMENT_PHASE_ABORTED_CLOSED:
+		return ready_state_generation == 0;
+	case CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED:
+		return ready_state_generation != 0;
+	default:
+		return false;
+	}
+}
+
+static uint32
+replacement_marker_v3_crc(const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES])
+{
+	pg_crc32c crc;
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, bytes, 92);
+	FIN_CRC32C(crc);
+	return (uint32)crc;
+}
+
+bool
+cluster_replacement_marker_v3_encode(const ClusterReplacementCommitMarkerV3 *m,
+									 uint8 out[CLUSTER_JCMK_REPLACEMENT_BYTES])
+{
+	uint8 image[CLUSTER_JCMK_REPLACEMENT_BYTES];
+
+	if (m == NULL || out == NULL)
+		return false;
+	if (m->magic != CLUSTER_JCMK_MAGIC || m->version != CLUSTER_JCMK_REPLACEMENT_VERSION
+		|| !node_id_in_range(m->target_node_id) || m->generation == 0
+		|| m->reserved0[0] != 0 || m->reserved0[1] != 0 || m->reserved0[2] != 0
+		|| !replacement_marker_v3_phase_valid(m->phase, m->ready_state_generation))
+		return false;
+
+	memset(image, 0, sizeof(image));
+	jcmk_put_le32(image + 0, m->magic);
+	jcmk_put_le32(image + 4, m->version);
+	jcmk_put_le32(image + 8, (uint32)m->target_node_id);
+	image[12] = m->phase;
+	jcmk_put_le64(image + 16, m->generation);
+	jcmk_put_le64(image + 24, m->old_admitted_incarnation);
+	jcmk_put_le64(image + 32, m->fresh_incarnation);
+	jcmk_put_le64(image + 40, m->baseline_epoch);
+	jcmk_put_le64(image + 48, m->reserved_or_committed_epoch);
+	jcmk_put_le64(image + 56, m->request_nonce);
+	memcpy(image + 64, m->expected_purge_survivors, 16);
+	jcmk_put_le64(image + 80, m->grammar_fingerprint);
+	jcmk_put_le32(image + 88, m->ready_state_generation);
+	jcmk_put_le32(image + 92, replacement_marker_v3_crc(image));
+	memcpy(out, image, sizeof(image));
+	return true;
+}
+
+bool
+cluster_replacement_marker_v3_decode(const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES],
+									 int32 expected_target_node,
+									 ClusterReplacementCommitMarkerV3 *out)
+{
+	ClusterReplacementCommitMarkerV3 decoded;
+
+	if (bytes == NULL || out == NULL || !node_id_in_range(expected_target_node))
+		return false;
+	if (jcmk_get_le32(bytes + 0) != CLUSTER_JCMK_MAGIC
+		|| jcmk_get_le32(bytes + 4) != CLUSTER_JCMK_REPLACEMENT_VERSION
+		|| (int32)jcmk_get_le32(bytes + 8) != expected_target_node || bytes[13] != 0
+		|| bytes[14] != 0 || bytes[15] != 0
+		|| jcmk_get_le64(bytes + 16) == 0
+		|| !replacement_marker_v3_phase_valid(bytes[12], jcmk_get_le32(bytes + 88))
+		|| replacement_marker_v3_crc(bytes) != jcmk_get_le32(bytes + 92))
+		return false;
+
+	memset(&decoded, 0, sizeof(decoded));
+	decoded.magic = CLUSTER_JCMK_MAGIC;
+	decoded.version = CLUSTER_JCMK_REPLACEMENT_VERSION;
+	decoded.target_node_id = expected_target_node;
+	decoded.phase = bytes[12];
+	decoded.generation = jcmk_get_le64(bytes + 16);
+	decoded.old_admitted_incarnation = jcmk_get_le64(bytes + 24);
+	decoded.fresh_incarnation = jcmk_get_le64(bytes + 32);
+	decoded.baseline_epoch = jcmk_get_le64(bytes + 40);
+	decoded.reserved_or_committed_epoch = jcmk_get_le64(bytes + 48);
+	decoded.request_nonce = jcmk_get_le64(bytes + 56);
+	memcpy(decoded.expected_purge_survivors, bytes + 64, 16);
+	decoded.grammar_fingerprint = jcmk_get_le64(bytes + 80);
+	decoded.ready_state_generation = jcmk_get_le32(bytes + 88);
+	decoded.crc32c = jcmk_get_le32(bytes + 92);
+	*out = decoded;
+	return true;
+}
+
+/*
+ * Compare decoded markers by the exact canonical 96-byte image.  Re-encoding
+ * keeps host padding and the caller-provided crc32c field outside identity.
+ */
+bool
+cluster_replacement_marker_v3_same_image(const ClusterReplacementCommitMarkerV3 *a,
+										 const ClusterReplacementCommitMarkerV3 *b)
+{
+	uint8 a_image[CLUSTER_JCMK_REPLACEMENT_BYTES];
+	uint8 b_image[CLUSTER_JCMK_REPLACEMENT_BYTES];
+
+	if (!cluster_replacement_marker_v3_encode(a, a_image)
+		|| !cluster_replacement_marker_v3_encode(b, b_image))
+		return false;
+	return memcmp(a_image, b_image, CLUSTER_JCMK_REPLACEMENT_BYTES) == 0;
+}
+
+/*
+ * Select one exact valid v3 disk image.  Counting is image-first: neither a
+ * higher generation nor fields shared across different episodes can combine
+ * minority images into a false majority.  Outputs are committed only after a
+ * winning group is found.
+ */
+int
+cluster_replacement_marker_v3_select_majority(
+	const uint8 images[][CLUSTER_JCMK_REPLACEMENT_BYTES], int n, uint32 majority,
+	int32 expected_target_node, ClusterReplacementCommitMarkerV3 *out_marker, uint32 *out_agree)
+{
+	int a;
+	int b;
+
+	if (images == NULL || n <= 0 || majority <= (uint32)n / 2 || majority > (uint32)n
+		|| !node_id_in_range(expected_target_node))
+		return -1;
+
+	for (a = 0; a < n; a++) {
+		ClusterReplacementCommitMarkerV3 candidate;
+		uint32 same = 0;
+
+		if (!cluster_replacement_marker_v3_decode(images[a], expected_target_node, &candidate))
+			continue;
+		for (b = 0; b < n; b++) {
+			if (memcmp(images[a], images[b], CLUSTER_JCMK_REPLACEMENT_BYTES) == 0)
+				same++;
+		}
+		if (same >= majority) {
+			if (out_marker != NULL)
+				*out_marker = candidate;
+			if (out_agree != NULL)
+				*out_agree = same;
+			return a;
+		}
+	}
+	return -1;
+}
+
+/*
+ * Every valid replacement phase supplies an incarnation floor, but the phase
+ * determines which incarnation is authoritative.  PREPARE/ABORTED_CLOSED keep
+ * the old admitted floor; post-COMMIT phases pin the fresh incarnation.
+ */
+bool
+cluster_replacement_marker_v3_floor_basis(
+	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
+	uint64 *out_incarnation_floor)
+{
+	ClusterReplacementCommitMarkerV3 marker;
+	uint64 floor;
+
+	if (out_incarnation_floor == NULL
+		|| !cluster_replacement_marker_v3_decode(bytes, expected_target_node, &marker))
+		return false;
+
+	switch (marker.phase) {
+	case CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE:
+	case CLUSTER_JCMK_REPLACEMENT_PHASE_ABORTED_CLOSED:
+		floor = marker.old_admitted_incarnation;
+		break;
+	case CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED:
+	case CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED:
+		floor = marker.fresh_incarnation;
+		break;
+	default:
+		return false;
+	}
+	if (floor == 0)
+		return false;
+	*out_incarnation_floor = floor;
+	return true;
+}
+
+bool
+cluster_replacement_marker_v3_is_committed_closed_basis(
+	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
+	uint64 *out_incarnation_floor)
+{
+	ClusterReplacementCommitMarkerV3 marker;
+
+	if (out_incarnation_floor == NULL
+		|| !cluster_replacement_marker_v3_decode(bytes, expected_target_node, &marker)
+		|| marker.phase != CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED
+		|| marker.fresh_incarnation == 0)
+		return false;
+	*out_incarnation_floor = marker.fresh_incarnation;
+	return true;
+}
+
+bool
+cluster_replacement_marker_v3_is_admitted_basis(
+	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
+	uint64 *out_incarnation_floor, uint32 *out_ready_state_generation)
+{
+	ClusterReplacementCommitMarkerV3 marker;
+
+	if (out_incarnation_floor == NULL || out_ready_state_generation == NULL
+		|| !cluster_replacement_marker_v3_decode(bytes, expected_target_node, &marker)
+		|| marker.phase != CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED
+		|| marker.fresh_incarnation == 0)
+		return false;
+	*out_incarnation_floor = marker.fresh_incarnation;
+	*out_ready_state_generation = marker.ready_state_generation;
+	return true;
 }
 
 /*
@@ -154,8 +404,10 @@ cluster_membership_record_admitted(int32 node_id, uint64 incarnation)
 {
 	if (!node_id_in_range(node_id))
 		return;
-	if (incarnation > MembershipTable->last_admitted_incarnation[node_id])
+	if (incarnation > MembershipTable->last_admitted_incarnation[node_id]) {
+		cluster_write_fence_authority_cache_invalidate();
 		MembershipTable->last_admitted_incarnation[node_id] = incarnation;
+	}
 }
 
 ClusterMembershipState
@@ -175,6 +427,8 @@ cluster_membership_set_state(int32 node_id, ClusterMembershipState state)
 	if (!node_id_in_range(node_id))
 		return;
 	prev = (ClusterMembershipState)MembershipTable->membership_state[node_id];
+	if (prev != state)
+		cluster_write_fence_authority_cache_invalidate();
 	MembershipTable->membership_state[node_id] = (uint8)state;
 
 	/*
@@ -232,6 +486,9 @@ cluster_membership_shrink_to_removed(int32 node_id, uint64 last_incarnation)
 {
 	if (!node_id_in_range(node_id))
 		return;
+	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id]
+		|| MembershipTable->membership_state[node_id] != CLUSTER_MEMBER_REMOVED)
+		cluster_write_fence_authority_cache_invalidate();
 	/* raise the floor first (monotone) so re-admit must exceed the removed incarnation */
 	if (last_incarnation > MembershipTable->last_admitted_incarnation[node_id])
 		MembershipTable->last_admitted_incarnation[node_id] = last_incarnation;

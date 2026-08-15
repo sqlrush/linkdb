@@ -89,6 +89,7 @@
 #include "cluster/cluster_ges_reply_wait.h" /* cluster_ges_reply_wait_sweep_timeout (spec-5.16 orphan-grant TTL backstop) */
 #include "cluster/cluster_sinval.h"
 #include "cluster/cluster_tt_status_hint.h" /* spec-3.2 D6 — drain hook + register */
+#include "cluster/cluster_thread_recovery.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP (1.11 Sprint B) */
 
@@ -213,6 +214,23 @@ cluster_lmon_shmem_init(void)
 
 		cluster_ic_register_msg_type(&heartbeat_info);
 		heartbeat_registered = true;
+	}
+
+	{
+		static bool semantic_activation_ack_registered = false;
+
+		if (!semantic_activation_ack_registered) {
+			const ClusterICMsgTypeInfo semantic_activation_ack_info = {
+				.msg_type = PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1,
+				.name = "semantic_activation_ack_v1",
+				.allowed_producer_mask = CLUSTER_IC_PRODUCER_LMON,
+				.broadcast_ok = false,
+				.handler = cluster_semantic_activation_ack_handler,
+			};
+
+			cluster_ic_register_msg_type(&semantic_activation_ack_info);
+			semantic_activation_ack_registered = true;
+		}
 	}
 
 	/*
@@ -1333,6 +1351,7 @@ LmonMain(void)
 
 			cluster_reconfig_lmon_tick();
 			cluster_semantic_activation_lmon_tick();
+			cluster_thread_recovery_lmon_tick();
 
 			/*
 			 * spec-4.6 D1:  GRD recovery sequence (P0-P7) — consumes the
@@ -1996,6 +2015,7 @@ LmonMain(void)
 
 			cluster_reconfig_lmon_tick();
 			cluster_semantic_activation_lmon_tick();
+			cluster_thread_recovery_lmon_tick();
 			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
 			cluster_grd_recovery_lmon_tick();
 			cluster_gcs_block_pcm_x_formation_tick();
@@ -2077,6 +2097,7 @@ LmonMain(void)
 
 	/* Graceful shutdown path — HC5 normal exit. */
 	lmon_publish_status(CLUSTER_LMON_SHUTTING_DOWN);
+	cluster_thread_recovery_lmon_shutdown();
 
 	/* No cleanup work in Sprint A skeleton (no interconnect / GRD / etc). */
 

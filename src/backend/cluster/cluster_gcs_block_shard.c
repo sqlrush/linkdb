@@ -31,6 +31,7 @@
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
+#include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "storage/buf_internals.h"
 
@@ -93,9 +94,41 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &((const GcsBlockRequestPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
+		if (payload_len == CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE) {
+			const GcsBlockForwardPayload *current_mx
+				= (const GcsBlockForwardPayload *)payload;
+			const ClusterCurrentMxDescribeForwardV2 *frame
+				= (const ClusterCurrentMxDescribeForwardV2 *)payload;
+
+			if (!GcsBlockForwardPayloadIsCurrentMxRuntime(current_mx)
+				|| frame->trailer.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
+				|| frame->trailer.version != CLUSTER_CURRENT_MX_WIRE_VERSION
+				|| frame->trailer.flags != CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE)
+				return -1;
+			pcm_x_tag = GcsBlockCurrentMxRouteTagMake(
+				current_mx->request_id, current_mx->epoch,
+				current_mx->original_requester_node,
+				current_mx->requester_backend_id);
+			tag = &pcm_x_tag;
+			break;
+		}
 		if (payload_len != sizeof(GcsBlockForwardPayload)
 			&& payload_len != sizeof(ClusterR4CrForwardPayload))
 			return -1;
+		/* Spec 8.4 D4: endpoint -2/kind-4 is the sole block-family
+		 * exception to tag sharding.  It is an internal worker-0 request /
+		 * response correlation path and must stay on the existing DATA0
+		 * connection.  Both discriminators and the exact 96-byte shape are
+		 * required; every other FORWARD retains the legacy tag shard. */
+		if (payload_len == sizeof(ClusterR4CrForwardPayload)) {
+			const ClusterR4CrForwardPayload *r4
+				= (const ClusterR4CrForwardPayload *)payload;
+
+			if (r4->base.requester_backend_id == CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+				&& r4->extension.r4_version == CLUSTER_R4_WIRE_VERSION
+				&& r4->extension.r4_kind == CLUSTER_R4_WIRE_UNDO_DATA_FETCH)
+				return n_workers > 0 ? 0 : -1;
+		}
 		tag = &((const GcsBlockForwardPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE:

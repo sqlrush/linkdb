@@ -169,6 +169,51 @@ typedef struct ClusterFenceMarker {
 } ClusterFenceMarker;
 
 /*
+ * RF-ROOT P2 / STOP-02 \u00a717.5 total durable-authority result.  The proof is
+ * deliberately the complete marker plus the distinct-disk numerator and
+ * denominator; callers may consume it only when the result is OK.
+ */
+typedef enum ClusterFenceAuthorityReadResult {
+	CLUSTER_FENCE_AUTHORITY_OK = 0,
+	CLUSTER_FENCE_AUTHORITY_BAD_ARGUMENT = 1,
+	CLUSTER_FENCE_AUTHORITY_ENFORCEMENT_OFF = 2,
+	CLUSTER_FENCE_AUTHORITY_NO_CONFIG = 3,
+	CLUSTER_FENCE_AUTHORITY_BAD_CONFIG = 4,
+	CLUSTER_FENCE_AUTHORITY_NO_MAJORITY = 5,
+	CLUSTER_FENCE_AUTHORITY_IO_UNAVAILABLE = 6,
+	CLUSTER_FENCE_AUTHORITY_MIXED_VERSION = 7,
+	CLUSTER_FENCE_AUTHORITY_CORRUPT = 8
+} ClusterFenceAuthorityReadResult;
+
+typedef struct ClusterFenceAuthorityProof {
+	ClusterFenceMarker marker;
+	uint32 agree_disk_count;
+	uint32 total_disk_count;
+} ClusterFenceAuthorityProof;
+
+StaticAssertDecl(sizeof(ClusterFenceAuthorityProof) == 72,
+				 "ClusterFenceAuthorityProof ABI");
+
+/* Internal one-vote-per-physical-disk input to the pure total selector. */
+typedef enum ClusterFenceDiskVoteState {
+	CLUSTER_FENCE_DISK_VOTE_EMPTY = 0,
+	CLUSTER_FENCE_DISK_VOTE_VALID = 1,
+	CLUSTER_FENCE_DISK_VOTE_UNREADABLE = 2,
+	CLUSTER_FENCE_DISK_VOTE_MIXED_VERSION = 3,
+	CLUSTER_FENCE_DISK_VOTE_CORRUPT = 4
+} ClusterFenceDiskVoteState;
+
+#define CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US UINT64_C(5000000)
+
+typedef enum ClusterFenceAuthorityCacheResult {
+	CLUSTER_FENCE_CACHE_MATCH = 0,
+	CLUSTER_FENCE_CACHE_STALE = 1,
+	CLUSTER_FENCE_CACHE_EXPIRED = 2,
+	CLUSTER_FENCE_CACHE_INVALID = 3,
+	CLUSTER_FENCE_CACHE_UNAVAILABLE = 4
+} ClusterFenceAuthorityCacheResult;
+
+/*
  * cluster_fence_marker_pack -- write a marker into a voting slot's _reserved1
  *	bytes (the first CLUSTER_FENCE_MARKER_BYTES); the remaining reserved bytes are
  *	left untouched (other future reserved uses coexist).
@@ -206,6 +251,48 @@ cluster_fence_marker_node_is_fenced(const uint8 *fenced_dead_bitmap, int node_id
 }
 
 /*
+ * STOP-02 exact V1 marker validity.  The voting-slot reader separately proves
+ * the outer CRC.  A recognized marker cannot vote unless its layout and its
+ * event-specific issuer/excluded-set relationship are canonical.
+ */
+static inline bool
+cluster_fence_marker_valid_v1(const ClusterFenceMarker *m)
+{
+	bool bitmap_nonempty = false;
+	int i;
+
+	if (m == NULL || m->magic != CLUSTER_FENCE_MARKER_MAGIC
+		|| m->version != CLUSTER_FENCE_MARKER_VERSION)
+		return false;
+	if (m->marker_kind != CLUSTER_FENCE_MARKER_KIND_FENCE
+		&& m->marker_kind != CLUSTER_FENCE_MARKER_KIND_BASELINE
+		&& m->marker_kind != CLUSTER_FENCE_MARKER_KIND_NODE_REMOVED)
+		return false;
+	for (i = 0; i < (int)sizeof(m->_pad); i++)
+		if (m->_pad[i] != 0)
+			return false;
+	for (i = 0; i < CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES; i++)
+		if (m->fenced_dead_bitmap[i] != 0) {
+			bitmap_nonempty = true;
+			break;
+		}
+
+	if (m->marker_kind == CLUSTER_FENCE_MARKER_KIND_BASELINE) {
+		if (m->issuer_node_id == CLUSTER_FENCE_BASELINE_INITIAL_ISSUER)
+			return m->fence_event_id == 0 && m->fence_generation == 0;
+		return m->issuer_node_id >= 0
+			   && m->issuer_node_id < CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES * 8
+			   && !cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap,
+													m->issuer_node_id);
+	}
+
+	return bitmap_nonempty && m->issuer_node_id >= 0
+		   && m->issuer_node_id < CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES * 8
+		   && !cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap,
+											m->issuer_node_id);
+}
+
+/*
  * cluster_fence_marker_tuple_equal -- two markers name the SAME fence iff every
  *	identity field matches (epoch + generation + event_id + issuer + dead bitmap).
  *	magic / version / pad are layout, not identity.  Used for the quorum-majority
@@ -219,6 +306,191 @@ cluster_fence_marker_tuple_equal(const ClusterFenceMarker *a, const ClusterFence
 		   && memcmp(a->fenced_dead_bitmap, b->fenced_dead_bitmap,
 					 CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES)
 				  == 0;
+}
+
+static inline int
+cluster_fence_marker_order_compare(const ClusterFenceMarker *a, const ClusterFenceMarker *b)
+{
+	if (a->fence_epoch != b->fence_epoch)
+		return a->fence_epoch > b->fence_epoch ? 1 : -1;
+	if (a->fence_generation != b->fence_generation)
+		return a->fence_generation > b->fence_generation ? 1 : -1;
+	return 0;
+}
+
+/*
+ * Select one disk's vote after its 128 outer-CRC-protected slots were read.
+ * Invalid outer CRCs do not participate.  An exact-magic unknown version is a
+ * mixed-version stop; a malformed V1 marker or equal-greatest divergent
+ * identity is corruption.  Only VALID modifies *out.
+ */
+static inline ClusterFenceDiskVoteState
+cluster_fence_disk_vote_select_v1(const ClusterFenceMarker *slot_markers,
+								  const bool *outer_crc_valid, int n_slots,
+								  ClusterFenceMarker *out)
+{
+	ClusterFenceMarker best;
+	bool found = false;
+	int i;
+
+	if (slot_markers == NULL || outer_crc_valid == NULL || out == NULL || n_slots < 0)
+		return CLUSTER_FENCE_DISK_VOTE_CORRUPT;
+	memset(&best, 0, sizeof(best));
+	for (i = 0; i < n_slots; i++) {
+		const ClusterFenceMarker *m;
+		int order;
+
+		if (!outer_crc_valid[i])
+			continue;
+		m = &slot_markers[i];
+		if (m->magic != CLUSTER_FENCE_MARKER_MAGIC)
+			continue;
+		if (m->version != CLUSTER_FENCE_MARKER_VERSION)
+			return CLUSTER_FENCE_DISK_VOTE_MIXED_VERSION;
+		if (!cluster_fence_marker_valid_v1(m))
+			return CLUSTER_FENCE_DISK_VOTE_CORRUPT;
+		if (!found) {
+			best = *m;
+			found = true;
+			continue;
+		}
+		order = cluster_fence_marker_order_compare(m, &best);
+		if (order > 0)
+			best = *m;
+		else if (order == 0 && !cluster_fence_marker_tuple_equal(m, &best))
+			return CLUSTER_FENCE_DISK_VOTE_CORRUPT;
+	}
+	if (!found)
+		return CLUSTER_FENCE_DISK_VOTE_EMPTY;
+	*out = best;
+	return CLUSTER_FENCE_DISK_VOTE_VALID;
+}
+
+/*
+ * Pure total selector used after strict configuration parsing and physical-disk
+ * deduplication.  Every array entry is one distinct configured disk, including
+ * unreadable entries, so the denominator can never silently shrink.
+ */
+static inline ClusterFenceAuthorityReadResult
+cluster_fence_authority_prove_v1(const ClusterFenceMarker *disk_markers,
+								 const ClusterFenceDiskVoteState *disk_states,
+								 int n_disks, ClusterFenceAuthorityProof *out)
+{
+	ClusterFenceAuthorityProof proof;
+	bool unreadable = false;
+	bool mixed_version = false;
+	bool corrupt = false;
+	int majority;
+	int best_i = -1;
+	int best_count = 0;
+	int majority_groups = 0;
+	int i;
+
+	if (disk_markers == NULL || disk_states == NULL || out == NULL || n_disks <= 0)
+		return CLUSTER_FENCE_AUTHORITY_BAD_ARGUMENT;
+	majority = n_disks / 2 + 1;
+	for (i = 0; i < n_disks; i++) {
+		switch (disk_states[i]) {
+			case CLUSTER_FENCE_DISK_VOTE_EMPTY:
+				break;
+			case CLUSTER_FENCE_DISK_VOTE_VALID:
+				if (!cluster_fence_marker_valid_v1(&disk_markers[i]))
+					corrupt = true;
+				break;
+			case CLUSTER_FENCE_DISK_VOTE_UNREADABLE:
+				unreadable = true;
+				break;
+			case CLUSTER_FENCE_DISK_VOTE_MIXED_VERSION:
+				mixed_version = true;
+				break;
+			case CLUSTER_FENCE_DISK_VOTE_CORRUPT:
+			default:
+				corrupt = true;
+				break;
+		}
+	}
+	if (corrupt)
+		return CLUSTER_FENCE_AUTHORITY_CORRUPT;
+	if (mixed_version)
+		return CLUSTER_FENCE_AUTHORITY_MIXED_VERSION;
+
+	for (i = 0; i < n_disks; i++) {
+		bool already_counted = false;
+		int count = 0;
+		int j;
+
+		if (disk_states[i] != CLUSTER_FENCE_DISK_VOTE_VALID)
+			continue;
+		for (j = 0; j < i; j++)
+			if (disk_states[j] == CLUSTER_FENCE_DISK_VOTE_VALID
+				&& cluster_fence_marker_tuple_equal(&disk_markers[i], &disk_markers[j])) {
+				already_counted = true;
+				break;
+			}
+		if (already_counted)
+			continue;
+		for (j = 0; j < n_disks; j++)
+			if (disk_states[j] == CLUSTER_FENCE_DISK_VOTE_VALID
+				&& cluster_fence_marker_tuple_equal(&disk_markers[i], &disk_markers[j]))
+				count++;
+		if (count < majority)
+			continue;
+		majority_groups++;
+		if (best_i < 0
+			|| cluster_fence_marker_order_compare(&disk_markers[i], &disk_markers[best_i]) > 0) {
+			best_i = i;
+			best_count = count;
+		}
+	}
+	if (majority_groups > 1)
+		return CLUSTER_FENCE_AUTHORITY_CORRUPT;
+	if (best_i < 0)
+		return unreadable ? CLUSTER_FENCE_AUTHORITY_IO_UNAVAILABLE
+						  : CLUSTER_FENCE_AUTHORITY_NO_MAJORITY;
+
+	memset(&proof, 0, sizeof(proof));
+	proof.marker = disk_markers[best_i];
+	memset(proof.marker._pad, 0, sizeof(proof.marker._pad));
+	proof.agree_disk_count = (uint32)best_count;
+	proof.total_disk_count = (uint32)n_disks;
+	*out = proof;
+	return CLUSTER_FENCE_AUTHORITY_OK;
+}
+
+static inline bool
+cluster_fence_marker_semantic_equal(const ClusterFenceMarker *a, const ClusterFenceMarker *b)
+{
+	return a->magic == b->magic && a->version == b->version
+		   && cluster_fence_marker_tuple_equal(a, b) && a->marker_kind == b->marker_kind;
+}
+
+/* Pure STOP-02 cache decision after one stable seqlock sample. */
+static inline ClusterFenceAuthorityCacheResult
+cluster_fence_authority_cache_decide_v1(const ClusterFenceMarker *expected, uint64 seq_before,
+										uint64 seq_after, bool valid,
+										const ClusterFenceMarker *observed,
+										uint64 published_at_us, uint64 expiry_us,
+										uint64 now_us)
+{
+	if (!valid)
+		return CLUSTER_FENCE_CACHE_INVALID;
+	if (seq_before == 0)
+		return CLUSTER_FENCE_CACHE_INVALID;
+	if ((seq_before & UINT64_C(1)) != 0 || seq_before != seq_after)
+		return CLUSTER_FENCE_CACHE_UNAVAILABLE;
+	if (expected == NULL || observed == NULL || !cluster_fence_marker_valid_v1(expected)
+		|| !cluster_fence_marker_valid_v1(observed))
+		return CLUSTER_FENCE_CACHE_INVALID;
+	if (published_at_us > UINT64_MAX - CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US
+		|| expiry_us != published_at_us + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US)
+		return CLUSTER_FENCE_CACHE_INVALID;
+	if (now_us < published_at_us)
+		return CLUSTER_FENCE_CACHE_STALE;
+	if (now_us >= expiry_us)
+		return CLUSTER_FENCE_CACHE_EXPIRED;
+	if (!cluster_fence_marker_semantic_equal(expected, observed))
+		return CLUSTER_FENCE_CACHE_STALE;
+	return CLUSTER_FENCE_CACHE_MATCH;
 }
 
 /*
@@ -464,7 +736,29 @@ typedef struct ClusterWriteFenceShmem {
 	pg_atomic_uint32 baseline_author_is_self;	/* spec-4.12b D6: this node is currently the
 											   * lowest-live baseline-author leader (0/1) */
 	pg_atomic_uint64 last_authority_refresh_us; /* spec-4.12b D6: wall-clock of the last
-												 * successful token refresh (authority age) */
+											 * successful token refresh (authority age) */
+
+	/* STOP-04 \u00a73.13: external-fence client observability.  These are
+	 * process-shared counters/samples only; none is authority. */
+	pg_atomic_uint64 external_admit_requested;
+	pg_atomic_uint64 external_write_excluded;
+	pg_atomic_uint64 external_rejected;
+	pg_atomic_uint64 external_unknown;
+	pg_atomic_uint64 external_unavailable;
+	pg_atomic_uint64 external_identity_mismatch;
+	pg_atomic_uint64 external_expired;
+	pg_atomic_uint64 external_daemon_disconnect;
+	pg_atomic_uint64 external_mutation_gate_blocked;
+	pg_atomic_uint64 external_publish_gate_blocked;
+	pg_atomic_uint64 external_last_journal_seq;
+	pg_atomic_uint64 external_last_verified_mono_ns;
+
+	/* STOP-02 \u00a717.7: volatile, restart-empty exact-majority freshness cache. */
+	pg_atomic_uint64 authority_cache_seq;
+	pg_atomic_uint32 authority_cache_valid;
+	ClusterFenceMarker authority_cache_marker;
+	uint64 authority_cache_published_at_us;
+	uint64 authority_cache_expiry_us;
 
 	/*
 	 * D4 LMON->qvotec fence-marker submit mailbox.  Single producer = the
@@ -539,6 +833,22 @@ extern void cluster_write_fence_qvotec_complete(bool acked);
  */
 extern bool cluster_write_fence_enforcing(void);
 
+/* STOP-02 \u00a717.5 direct, total, distinct-disk durable authority proof. */
+extern ClusterFenceAuthorityReadResult
+cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out);
+extern ClusterFenceAuthorityCacheResult cluster_write_fence_revalidate_cached_nowait(
+	const ClusterFenceMarker *expected, uint64 now_us);
+extern void cluster_write_fence_authority_cache_invalidate(void);
+extern uint64 cluster_write_fence_authority_cache_mutation_begin(void);
+extern void cluster_write_fence_authority_cache_mutation_end(uint64 odd_sequence);
+extern uint64 cluster_write_fence_authority_cache_sequence(void);
+extern bool cluster_write_fence_authority_cache_publish_if_unchanged(
+	const ClusterFenceMarker *marker, uint64 published_at_us, uint64 expected_sequence);
+#ifdef USE_ASSERT_CHECKING
+extern void (*cluster_write_fence_cache_test_after_publish_acquire_hook)(void);
+extern void (*cluster_write_fence_cache_test_before_invalidate_acquire_hook)(void);
+#endif
+
 /*
  * cluster_write_fence_allowed -- the hot-path wrapper: read the live epoch + the
  * shmem token and apply cluster_write_fence_decide.  PURE-read, no-throw,
@@ -595,6 +905,31 @@ extern uint64 cluster_write_fence_get_baseline_authority_age_us(void);
  * leader (is_leader -> baseline_author_is_self) and whether it actually authored a
  * baseline this cycle (published -> bumps baseline_published). */
 extern void cluster_write_fence_note_baseline_published(bool is_leader, bool published);
+
+/* STOP-04 \u00a73.13 external-fence producers and L110-safe readers. */
+extern void cluster_write_fence_note_external_admit_requested(void);
+extern void cluster_write_fence_note_external_write_excluded(uint64 journal_seq,
+														 uint64 verified_mono_ns);
+extern void cluster_write_fence_note_external_rejected(void);
+extern void cluster_write_fence_note_external_unknown(void);
+extern void cluster_write_fence_note_external_unavailable(void);
+extern void cluster_write_fence_note_external_identity_mismatch(void);
+extern void cluster_write_fence_note_external_expired(void);
+extern void cluster_write_fence_note_external_daemon_disconnect(void);
+extern void cluster_write_fence_note_external_mutation_gate_blocked(void);
+extern void cluster_write_fence_note_external_publish_gate_blocked(void);
+extern uint64 cluster_write_fence_get_external_admit_requested(void);
+extern uint64 cluster_write_fence_get_external_write_excluded(void);
+extern uint64 cluster_write_fence_get_external_rejected(void);
+extern uint64 cluster_write_fence_get_external_unknown(void);
+extern uint64 cluster_write_fence_get_external_unavailable(void);
+extern uint64 cluster_write_fence_get_external_identity_mismatch(void);
+extern uint64 cluster_write_fence_get_external_expired(void);
+extern uint64 cluster_write_fence_get_external_daemon_disconnect(void);
+extern uint64 cluster_write_fence_get_external_mutation_gate_blocked(void);
+extern uint64 cluster_write_fence_get_external_publish_gate_blocked(void);
+extern uint64 cluster_write_fence_get_external_last_journal_seq(void);
+extern bool cluster_write_fence_get_external_last_proof_age_ms(uint64 *age_ms);
 
 #endif /* !FRONTEND */
 

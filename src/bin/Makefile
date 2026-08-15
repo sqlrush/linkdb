@@ -45,6 +45,10 @@ SUBDIRS = \
 	psql \
 	scripts
 
+ifneq ($(PORTNAME), win32)
+SUBDIRS += pgrac_fenced
+endif
+
 ifeq ($(PORTNAME), win32)
 SUBDIRS += pgevent
 else

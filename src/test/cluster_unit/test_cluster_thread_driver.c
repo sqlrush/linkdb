@@ -118,19 +118,20 @@ UT_TEST(test_scope_no_shared_backend)
 				 (int)CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND);
 }
 
-UT_TEST(test_scope_multi_survivor_unsupported)
+UT_TEST(test_scope_multi_survivor_applicable)
 {
-	/* >2-node scope: more than one survivor -> FEATURE_NOT_SUPPORTED (Q9). */
+	/* STOP03: every positive formed survivor count competes under IR(X). */
 	UT_ASSERT_EQ((int)cluster_thread_recovery_decide_scope(true, true, true, 2),
-				 (int)CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR);
+				 (int)CLUSTER_THREADREC_SCOPE_APPLICABLE);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_decide_scope(true, true, true, 3),
+				 (int)CLUSTER_THREADREC_SCOPE_APPLICABLE);
 }
 
-UT_TEST(test_scope_zero_survivors_unsupported)
+UT_TEST(test_scope_zero_survivors_not_applicable)
 {
-	/* Exactly one survivor is the 2-node scope; zero is also not the single
-	 * applicable owner -> MULTI_SURVIVOR (live_survivor_count != 1). */
+	/* No live actor exists to run recovery. */
 	UT_ASSERT_EQ((int)cluster_thread_recovery_decide_scope(true, true, true, 0),
-				 (int)CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR);
+				 (int)CLUSTER_THREADREC_SCOPE_SINGLE_NODE);
 }
 
 UT_TEST(test_scope_applicable_2node_single_survivor)
@@ -154,8 +155,8 @@ main(void)
 	UT_RUN(test_scope_disabled_when_guc_off);
 	UT_RUN(test_scope_single_node_when_no_peers);
 	UT_RUN(test_scope_no_shared_backend);
-	UT_RUN(test_scope_multi_survivor_unsupported);
-	UT_RUN(test_scope_zero_survivors_unsupported);
+	UT_RUN(test_scope_multi_survivor_applicable);
+	UT_RUN(test_scope_zero_survivors_not_applicable);
 	UT_RUN(test_scope_applicable_2node_single_survivor);
 
 	UT_DONE();

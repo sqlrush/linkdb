@@ -235,16 +235,15 @@ UT_TEST(test_stage4_write_fence_enums_locked)
 
 UT_TEST(test_stage4_thread_recovery_scope_enum_complete)
 {
-	/* spec-4.11 D7: the capability gate routes single-node / no-shared-backend
-	 * / >2-node to FEATURE_NOT_SUPPORTED.  Pin the 5 scope values so a future
+	/* STOP03: multi-survivor is an applicable IR contender, not a separate
+	 * scope.  Pin the remaining four scope values so a future
 	 * reorder cannot silently change which scopes fail-closed. */
 	UT_ASSERT_EQ((int)CLUSTER_THREADREC_SCOPE_APPLICABLE, 0);
 	UT_ASSERT(CLUSTER_THREADREC_SCOPE_DISABLED != CLUSTER_THREADREC_SCOPE_APPLICABLE);
 	UT_ASSERT(CLUSTER_THREADREC_SCOPE_SINGLE_NODE != CLUSTER_THREADREC_SCOPE_DISABLED);
 	UT_ASSERT(CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND != CLUSTER_THREADREC_SCOPE_SINGLE_NODE);
-	UT_ASSERT(CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR != CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND);
-	/* contiguous 0..4 */
-	UT_ASSERT_EQ((int)CLUSTER_THREADREC_SCOPE_MULTI_SURVIVOR, 4);
+	/* contiguous 0..3 */
+	UT_ASSERT_EQ((int)CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND, 3);
 }
 
 

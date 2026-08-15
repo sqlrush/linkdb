@@ -44,6 +44,7 @@
 #include "cluster/cluster_guc.h"	  /* cluster_smart_fusion */
 #include "cluster/cluster_inject.h"	  /* CLUSTER_INJECTION_POINT (stage 0.30 sweep) */
 #include "cluster/cluster_shmem.h"	  /* cluster_init_shmem_module (stage 1.3) */
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
 
@@ -112,6 +113,9 @@ cluster_init(void)
 	 * Must run after cluster_init_guc and before cluster_request_shmem.
 	 */
 	cluster_init_shmem_module();
+
+	/* Spec 8.4A Candidate-2: reject any drift in the frozen 0xFB namespace. */
+	cluster_undo_block0_current_init();
 
 	/*
 	 * spec-5.1a: verify the frozen GES mode-compat matrix against the live
