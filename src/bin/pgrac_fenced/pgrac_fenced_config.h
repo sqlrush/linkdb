@@ -20,6 +20,7 @@
 #define PGRAC_FENCED_MAX_NODES 128
 #define PGRAC_FENCED_UUID_BYTES 16
 #define PGRAC_FENCED_ADAPTER_DATA_MAX_BYTES 4096
+#define PGRAC_FENCED_CONFIG_DIGEST_BYTES 32
 
 typedef enum PgracFencedConfigResult
 {
@@ -29,6 +30,15 @@ typedef enum PgracFencedConfigResult
 	PGRAC_FENCED_CONFIG_NONCANONICAL = 3,
 	PGRAC_FENCED_CONFIG_VALUE_INVALID = 4
 } PgracFencedConfigResult;
+
+typedef enum PgracFencedConfigReloadDecision
+{
+	PGRAC_FENCED_CONFIG_RELOAD_UNCHANGED = 0,
+	PGRAC_FENCED_CONFIG_RELOAD_ADVANCE = 1,
+	PGRAC_FENCED_CONFIG_RELOAD_REJECT_SAME_GENERATION_CHANGE = 2,
+	PGRAC_FENCED_CONFIG_RELOAD_REJECT_REGRESSION = 3,
+	PGRAC_FENCED_CONFIG_RELOAD_REJECT_INVALID = 4
+} PgracFencedConfigReloadDecision;
 
 typedef struct PgracFencedNodeConfigV1
 {
@@ -55,6 +65,14 @@ typedef struct PgracFencedConfigV1
 
 extern PgracFencedConfigResult pgrac_fenced_config_parse_v1(
 	const uint8 *bytes, size_t len, PgracFencedConfigV1 *out);
+extern bool pgrac_fenced_config_digest_v1(
+	const uint8 *bytes, size_t len,
+	uint8 out[PGRAC_FENCED_CONFIG_DIGEST_BYTES]);
+extern PgracFencedConfigReloadDecision pgrac_fenced_config_reload_decide_v1(
+	const PgracFencedConfigV1 *current,
+	const uint8 current_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES],
+	const PgracFencedConfigV1 *candidate,
+	const uint8 candidate_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES]);
 extern bool pgrac_fenced_config_stat_secure(const struct stat *st);
 extern int pgrac_fenced_config_open_secure(void);
 

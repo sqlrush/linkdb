@@ -167,6 +167,7 @@ break is not needed in a wider output rendering.
   &maintenance;
   &backup;
   &high-availability;
+  &pgrac-fenced;
   &monitoring;
   &diskusage;
   &wal;

@@ -25,6 +25,7 @@ use strict;
 use warnings;
 
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
 
 
@@ -108,7 +109,7 @@ sub new_pair
 	  PostgreSQL::Test::Cluster->new("${cluster_name}_node1", port => $pg_port_1);
 
 	# spec-2.6 strict-mode opt-in: pre-allocate N shared voting-disk
-	# files (zero-filled, 128 slots × 512B = 64KB each) in a tempdir
+	# files (canonically formatted complete voting-member layout) in a tempdir
 	# both postmasters can read/write.  Disks list is built once and
 	# written into both nodes' postgresql.conf so the same file paths
 	# back the same disk_index slots from both sides.
@@ -120,12 +121,7 @@ sub new_pair
 		for my $i (0 .. $opts{quorum_voting_disks} - 1)
 		{
 			my $path = "$disk_dir/disk$i";
-			open(my $fh, '>', $path) or die "open $path: $!";
-			binmode $fh;
-			# PGRAC spec-5.13: two 512-byte regions per node (voting slot +
-			# clean-leave marker), so 2 * 128 slots = 128 KiB.
-			print $fh ("\0" x (2 * 128 * 512));
-			close $fh;
+			format_voting_file($path, $i);
 			push @voting_disk_paths, $path;
 		}
 		$voting_disks_csv = join(',', @voting_disk_paths);

@@ -56,7 +56,7 @@ my $has_visibility_inject =
 # and +1 for the unconditional "pgrac cluster cr admit stats" region (spec-5.52 D9;
 # and +1 for the unconditional "pgrac cluster cr relgen" region (spec-5.56 D4;
 # full enumerated region list + count lives in t/020).
-  my $expected_region_count = $has_visibility_inject ? '84' : '83'; # spec-5.22e D5-2 +1 undo horizon; spec-5.22b D2-6 +1 undo gcs; spec-6.2 +1 smart fusion deps; spec-6.4 +1 mrp; spec-6.12 +1 xnode lever +1 hw lease +1 cr server (6.12b); full list lives in t/020 +1 pi shadow (6.12h D-h3a); spec-7.2 D4 +1 lms data outbound; ownership-gen wave +1 pgrac cluster pcm ownership
+  my $expected_region_count = $has_visibility_inject ? '86' : '85'; # full cumulative registry authority lives in t/020
 
 
 # ----------
@@ -188,8 +188,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		'SELECT count(*) FROM pg_stat_cluster_injections'),
-   '183',
-   'L11 pg_stat_cluster_injections is 183 (branch-1 +2; full breakdown in t/015)');
+   '185',
+   'L11 pg_stat_cluster_injections is 185 (branch-1 +2; full breakdown in t/015)');
 
 
 # ----------

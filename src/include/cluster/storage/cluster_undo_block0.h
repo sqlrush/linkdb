@@ -213,6 +213,10 @@ cluster_undo_block0_sample_resident_generation(
 	const ClusterUndoBlock0AuthorityProof *proof,
 	ClusterUndoBlock0Generation *observed_generation);
 extern ClusterUndoBlock0Result
+cluster_undo_block0_prove_strict_empty(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0AuthorityProof *proof);
+extern ClusterUndoBlock0Result
 cluster_undo_block0_recovery_private_begin(
 	const ClusterUndoBlock0LogicalKey *logical,
 	const ClusterUndoBlock0ResolvedRoot *redo_root,

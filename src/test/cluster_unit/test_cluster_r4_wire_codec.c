@@ -556,6 +556,34 @@ run_wire_vector(int vector)
 			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, NULL, &output));
 			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &input.locator_echo, NULL));
 			break;
+		case 88:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			locator = input.locator_echo;
+			locator.tt_wrap = TT_WRAP_INVALID;
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode(page, &locator, &output));
+			UT_ASSERT_EQ(output.locator_echo.tt_wrap, 7);
+			break;
+		case 89:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			locator = input.locator_echo;
+			locator.tt_wrap = TT_WRAP_INVALID;
+			input.locator_echo.tt_wrap = TT_WRAP_INVALID;
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			memset(&output, 0xA5, sizeof(output));
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &locator, &output));
+			UT_ASSERT(bytes_are_zero((const uint8 *)&output, sizeof(output)));
+			break;
+		case 90:
+			input = verdict_resolution(CLUSTER_TX_COMMITTED,
+								   CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+			locator = input.locator_echo;
+			locator.tt_wrap = 8;
+			UT_ASSERT(ClusterR4TxVerdictPageEncode(page, &input));
+			UT_ASSERT(!ClusterR4TxVerdictPageDecode(page, &locator, &output));
+			break;
 		default:
 			value = UINT64_C(0x0102030405060708) ^ ((uint64)vector << 33)
 					^ ((uint64)vector * UINT64_C(0x9e3779b97f4a7c15));
@@ -656,6 +684,9 @@ DEFINE_WIRE_TEST(84)
 DEFINE_WIRE_TEST(85)
 DEFINE_WIRE_TEST(86)
 DEFINE_WIRE_TEST(87)
+DEFINE_WIRE_TEST(88)
+DEFINE_WIRE_TEST(89)
+DEFINE_WIRE_TEST(90)
 
 #define RUN_WIRE_TEST(n) UT_RUN(test_wire_vector_##n)
 
@@ -728,7 +759,7 @@ UT_TEST(test_r4_status24_physical_generation_echo_is_exact)
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(95);
 	RUN_WIRE_TEST(0);
 	RUN_WIRE_TEST(1);
 	RUN_WIRE_TEST(2);
@@ -817,6 +848,9 @@ main(void)
 	RUN_WIRE_TEST(85);
 	RUN_WIRE_TEST(86);
 	RUN_WIRE_TEST(87);
+	RUN_WIRE_TEST(88);
+	RUN_WIRE_TEST(89);
+	RUN_WIRE_TEST(90);
 	UT_RUN(test_r4_reply_status_abi_tail_is_exact);
 	UT_RUN(test_r4_and_legacy_reply_status_domains_are_disjoint);
 	UT_RUN(test_r4_undo_data_status_selects_existing_authenticated_reply_shape);

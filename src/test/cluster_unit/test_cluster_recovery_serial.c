@@ -670,6 +670,26 @@ UT_TEST(test_recovery_serial_p4_revalidate_is_two_phase_fail_closed)
 				 UINT64_C(2));
 }
 
+UT_TEST(test_external_rejoin_new_epoch_invalidates_held_guard)
+{
+	ClusterRecoverySerialGuard guard;
+
+	cluster_ir_shmem_init();
+	guard = valid_held_guard();
+	stub_formation_ready = true;
+	stub_need_set_ready = true;
+	stub_admission_set_ready = true;
+	UT_ASSERT_EQ(cluster_recovery_serial_revalidate(&guard),
+		CLUSTER_RECOVERY_SERIAL_CURRENT);
+
+	/* P/new epoch invalidates the formation before any held-IR mutation. */
+	stub_formation_ready = false;
+	UT_ASSERT_EQ(cluster_recovery_serial_revalidate(&guard),
+		CLUSTER_RECOVERY_SERIAL_MEMBERSHIP_STALE);
+	UT_ASSERT_EQ(cluster_recovery_serial_revalidate_reject_count(),
+		UINT64_C(1));
+}
+
 UT_TEST(test_recovery_serial_acquire_set_zero_before_first_grant)
 {
 	ClusterRecoverySerialRequest requests[2];
@@ -716,7 +736,7 @@ UT_TEST(test_recovery_serial_acquire_set_zero_before_first_grant)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_recovery_serial_resid_encode);
 	UT_RUN(test_ir_resid_namespace_distinct);
 	UT_RUN(test_recovery_serial_resid_thread_and_lineage_distinct);
@@ -731,6 +751,7 @@ main(void)
 	UT_RUN(test_recovery_serial_release_set_invalid_sends_nothing);
 	UT_RUN(test_recovery_serial_p4_acquire_requires_fresh_fence_then_actual_grant);
 	UT_RUN(test_recovery_serial_p4_revalidate_is_two_phase_fail_closed);
+	UT_RUN(test_external_rejoin_new_epoch_invalidates_held_guard);
 	UT_RUN(test_recovery_serial_acquire_set_zero_before_first_grant);
 	UT_DONE();
 

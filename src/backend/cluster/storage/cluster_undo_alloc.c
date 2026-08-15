@@ -52,6 +52,7 @@
 #include "cluster/cluster_undo_segment_init.h" /* fresh header builder (D4 reuse) */
 #include "access/xlog.h"					   /* XLogFlush (3.13 v0.3 (1)) */
 #include "cluster/storage/cluster_undo_alloc.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_shared_fs.h" /* undo namespace on shared root (D2-2) */
 #include "cluster/storage/cluster_undo_buf.h"  /* invalidate_segment on reuse (3.18 D3.2) */
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -504,8 +505,10 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
 {
 	static int cached_node_id = -1;
 	static uint32 cached_segment_id = 0;
+	static bool cached_block0_resident = false;
 	uint32 segment_id;
 	uint8 owner_instance;
+	ClusterUndoBlock0LogicalKey logical;
 
 	if (node_id < 0 || node_id > SCN_MAX_VALID_NODE_ID)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -516,9 +519,16 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
 
 	/* per_instance_slot = 0 (spec-3.4b MVP, single active segment per node) */
 	segment_id = (uint32)node_id * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	logical.segment_id = segment_id;
+	logical.owner_instance = owner_instance;
 
-	if (cached_node_id == node_id && cached_segment_id == segment_id)
+	if (cached_node_id == node_id && cached_segment_id == segment_id) {
+		if (!cached_block0_resident
+			&& cluster_undo_block0_current_live_owner_ensure_resident(
+				&logical, 10000) == CLUSTER_UNDO_BLOCK0_OK)
+			cached_block0_resident = true;
 		return cached_segment_id;
+	}
 
 	/*
 	 * cluster_undo_segment_allocate is idempotent and cheap when the file
@@ -530,6 +540,9 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
 
 	cached_node_id = node_id;
 	cached_segment_id = segment_id;
+	cached_block0_resident
+		= cluster_undo_block0_current_live_owner_ensure_resident(
+			&logical, 10000) == CLUSTER_UNDO_BLOCK0_OK;
 
 	return segment_id;
 }

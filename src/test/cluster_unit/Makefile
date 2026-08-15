@@ -362,10 +362,14 @@ test_cluster_recovery_serial: test_cluster_recovery_serial.c unit_test.h $(CLUST
 		$(CLUSTER_DL_O) $(CLUSTER_HW_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-CLUSTER_EXTERNAL_FENCE_O = \
-	$(top_builddir)/src/backend/cluster/cluster_external_fence.o
+CLUSTER_EXTERNAL_FENCE_O = test_cluster_external_fence_product.o
 PGRAC_EXTERNAL_FENCE_PROTOCOL_O = \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol_srv.o
+$(CLUSTER_EXTERNAL_FENCE_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_external_fence.c \
+		$(top_srcdir)/src/include/cluster/cluster_external_fence.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
+		-c $(top_srcdir)/src/backend/cluster/cluster_external_fence.c -o $@
 test_cluster_external_fence: test_cluster_external_fence.c unit_test.h \
 		$(CLUSTER_EXTERNAL_FENCE_O) $(PGRAC_EXTERNAL_FENCE_PROTOCOL_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_EXTERNAL_FENCE_O) \
@@ -588,7 +592,9 @@ test_pgrac_fenced_config: test_pgrac_fenced_config.c unit_test.h \
 		$(PGRAC_FENCED_CONFIG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
-		$(PGRAC_FENCED_CONFIG_O) -o $@
+		$(PGRAC_FENCED_CONFIG_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a -o $@
 
 PGRAC_FENCED_CORE_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_core.o
@@ -1682,10 +1688,11 @@ test_cluster_r4_static_model: test_cluster_r4_static_model.c unit_test.h
 # spec-8.4 B1/D1: exact caller-selected locator and dormant normalized
 # resolver entry points.  This links the production object directly.
 CLUSTER_TX_RESOLVE_O = $(top_builddir)/src/backend/cluster/cluster_tx_resolve.o
+CLUSTER_R4_TX_LOCATOR_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
 test_cluster_r4_tx_locator: test_cluster_r4_tx_locator.c unit_test.h \
-		$(CLUSTER_TX_RESOLVE_O)
+		$(CLUSTER_TX_RESOLVE_O) $(CLUSTER_R4_TX_LOCATOR_UBA_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_TX_RESOLVE_O) \
+		$(CLUSTER_TX_RESOLVE_O) $(CLUSTER_R4_TX_LOCATOR_UBA_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-8.4 B1/D5: compile the real runtime-visibility provider into a

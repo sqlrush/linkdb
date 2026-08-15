@@ -3047,6 +3047,10 @@ cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 void
 cluster_lms_cr_drain(void)
 {
+	/* M4 Candidate-2 origin work shares this existing worker-0 tick and is
+	 * process-local, so it must progress even when the legacy CR table is
+	 * absent. */
+	cluster_gcs_block_r4_tx_resolve_drain();
 	if (CrServerShared == NULL)
 		return;
 

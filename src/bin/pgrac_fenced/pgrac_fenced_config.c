@@ -11,9 +11,16 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include "common/cryptohash.h"
 #include "pgrac_fenced_config.h"
 
 #define PGRAC_FENCED_CONFIG_MAX_LINE (8192 + 64)
+
+static const uint8 pgrac_fenced_config_digest_domain[] =
+	"PGRAC-FENCED-CONFIG-FILE-V1";
+
+StaticAssertDecl(sizeof(pgrac_fenced_config_digest_domain) == 28,
+				 "semantic config digest domain changed");
 
 typedef struct ConfigLine
 {
@@ -160,6 +167,63 @@ pgrac_fenced_config_stat_secure(const struct stat *st)
 		st->st_gid == 0 && (st->st_mode & 07777) == 0600 &&
 		st->st_size > 0 &&
 		(uint64) st->st_size <= PGRAC_FENCED_CONFIG_MAX_BYTES;
+}
+
+bool
+pgrac_fenced_config_digest_v1(
+	const uint8 *bytes, size_t len,
+	uint8 out[PGRAC_FENCED_CONFIG_DIGEST_BYTES])
+{
+	pg_cryptohash_ctx *ctx;
+	uint8 encoded_len[4];
+	bool ok;
+
+	if (bytes == NULL || out == NULL || len == 0 ||
+		len > PGRAC_FENCED_CONFIG_MAX_BYTES || len > UINT32_MAX)
+		return false;
+	encoded_len[0] = (uint8) len;
+	encoded_len[1] = (uint8) (len >> 8);
+	encoded_len[2] = (uint8) (len >> 16);
+	encoded_len[3] = (uint8) (len >> 24);
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return false;
+	ok = pg_cryptohash_init(ctx) >= 0 &&
+		pg_cryptohash_update(ctx, pgrac_fenced_config_digest_domain,
+			sizeof(pgrac_fenced_config_digest_domain)) >= 0 &&
+		pg_cryptohash_update(ctx, encoded_len, sizeof(encoded_len)) >= 0 &&
+		pg_cryptohash_update(ctx, bytes, len) >= 0 &&
+		pg_cryptohash_final(ctx, out,
+			PGRAC_FENCED_CONFIG_DIGEST_BYTES) >= 0;
+	pg_cryptohash_free(ctx);
+	if (!ok)
+		memset(out, 0, PGRAC_FENCED_CONFIG_DIGEST_BYTES);
+	return ok;
+}
+
+PgracFencedConfigReloadDecision
+pgrac_fenced_config_reload_decide_v1(
+	const PgracFencedConfigV1 *current,
+	const uint8 current_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES],
+	const PgracFencedConfigV1 *candidate,
+	const uint8 candidate_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES])
+{
+	bool digest_equal;
+
+	if (current == NULL || current_digest == NULL || candidate == NULL ||
+		candidate_digest == NULL || current->mapping_generation == 0 ||
+		candidate->mapping_generation == 0)
+		return PGRAC_FENCED_CONFIG_RELOAD_REJECT_INVALID;
+	digest_equal = memcmp(current_digest, candidate_digest,
+		PGRAC_FENCED_CONFIG_DIGEST_BYTES) == 0;
+	if (candidate->mapping_generation < current->mapping_generation)
+		return PGRAC_FENCED_CONFIG_RELOAD_REJECT_REGRESSION;
+	if (candidate->mapping_generation == current->mapping_generation)
+		return digest_equal ? PGRAC_FENCED_CONFIG_RELOAD_UNCHANGED :
+			PGRAC_FENCED_CONFIG_RELOAD_REJECT_SAME_GENERATION_CHANGE;
+	/* Canonical bytes include mapping_generation, so equality here is invalid. */
+	return digest_equal ? PGRAC_FENCED_CONFIG_RELOAD_REJECT_INVALID :
+		PGRAC_FENCED_CONFIG_RELOAD_ADVANCE;
 }
 
 static bool

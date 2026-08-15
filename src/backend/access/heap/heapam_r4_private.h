@@ -70,6 +70,7 @@ extern bool HeapTupleSatisfiesMVCCScratch(
 	const ClusterR4HotScratchTestContext *context);
 
 #ifdef USE_CLUSTER_UNIT
+extern bool cluster_heap_test_r4_target_reachable(void);
 extern HeapHotSearchResultKind cluster_heap_test_r4_hot_full_cycle(
 	BufferTag tag, ItemPointerData logical_root, SCN read_scn,
 	HeapHotSearchResult *result, ClusterR4HotLockTestHook lock_hook,
@@ -84,6 +85,11 @@ extern TableIndexFetchTupleResult cluster_heap_test_r4_index_hot_result(
 	ItemPointer tid, Relation relation, Buffer buffer, Snapshot snapshot,
 	HeapHotSearchResult *result, TupleTableSlot *slot,
 	bool *call_again, bool *all_dead);
+extern bool cluster_heap_test_itl_alloc_with_terminal_census(
+	Buffer buffer, TransactionId xid, bool lock_only, uint8 *slot_index_out);
+extern bool cluster_heap_test_itl_resolve_pair_terminal_census(
+	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer);
+extern bool cluster_heap_test_itl_update_same_page_failure_cleanup(void);
 #endif
 #endif
 

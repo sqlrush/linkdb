@@ -170,16 +170,73 @@ UT_TEST(test_config_file_metadata_is_exact_root_regular_0600)
 	UT_ASSERT(!pgrac_fenced_config_stat_secure(&st));
 }
 
+UT_TEST(test_mapping_reload_generation_rules)
+{
+	PgracFencedConfigV1 current;
+	PgracFencedConfigV1 candidate;
+	uint8 current_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES];
+	uint8 candidate_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES];
+	char changed[sizeof(valid_config)];
+	char *at;
+
+	UT_ASSERT_EQ(pgrac_fenced_config_parse_v1(
+		(const uint8 *) valid_config, sizeof(valid_config) - 1, &current),
+		PGRAC_FENCED_CONFIG_OK);
+	UT_ASSERT(pgrac_fenced_config_digest_v1(
+		(const uint8 *) valid_config, sizeof(valid_config) - 1,
+		current_digest));
+	UT_ASSERT_EQ(pgrac_fenced_config_reload_decide_v1(
+		&current, current_digest, &current, current_digest),
+		PGRAC_FENCED_CONFIG_RELOAD_UNCHANGED);
+
+	memcpy(changed, valid_config, sizeof(changed));
+	at = strstr(changed, "node.0.target_uuid=");
+	UT_ASSERT_NOT_NULL(at);
+	at[strlen("node.0.target_uuid=")] = 'e';
+	UT_ASSERT_EQ(pgrac_fenced_config_parse_v1(
+		(const uint8 *) changed, sizeof(changed) - 1, &candidate),
+		PGRAC_FENCED_CONFIG_OK);
+	UT_ASSERT(pgrac_fenced_config_digest_v1(
+		(const uint8 *) changed, sizeof(changed) - 1, candidate_digest));
+	UT_ASSERT_EQ(pgrac_fenced_config_reload_decide_v1(
+		&current, current_digest, &candidate, candidate_digest),
+		PGRAC_FENCED_CONFIG_RELOAD_REJECT_SAME_GENERATION_CHANGE);
+
+	memcpy(changed, valid_config, sizeof(changed));
+	at = strstr(changed, "mapping_generation=7");
+	UT_ASSERT_NOT_NULL(at);
+	at[strlen("mapping_generation=")] = '8';
+	UT_ASSERT_EQ(pgrac_fenced_config_parse_v1(
+		(const uint8 *) changed, sizeof(changed) - 1, &candidate),
+		PGRAC_FENCED_CONFIG_OK);
+	UT_ASSERT(pgrac_fenced_config_digest_v1(
+		(const uint8 *) changed, sizeof(changed) - 1, candidate_digest));
+	UT_ASSERT_EQ(pgrac_fenced_config_reload_decide_v1(
+		&current, current_digest, &candidate, candidate_digest),
+		PGRAC_FENCED_CONFIG_RELOAD_ADVANCE);
+
+	at[strlen("mapping_generation=")] = '6';
+	UT_ASSERT_EQ(pgrac_fenced_config_parse_v1(
+		(const uint8 *) changed, sizeof(changed) - 1, &candidate),
+		PGRAC_FENCED_CONFIG_OK);
+	UT_ASSERT(pgrac_fenced_config_digest_v1(
+		(const uint8 *) changed, sizeof(changed) - 1, candidate_digest));
+	UT_ASSERT_EQ(pgrac_fenced_config_reload_decide_v1(
+		&current, current_digest, &candidate, candidate_digest),
+		PGRAC_FENCED_CONFIG_RELOAD_REJECT_REGRESSION);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_config_accepts_exact_canonical_provider_zero);
 	UT_RUN(test_config_rejects_noncanonical_numeric_and_hex);
 	UT_RUN(test_config_rejects_reorder_unknown_blank_and_missing_lf);
 	UT_RUN(test_config_rejects_mismatched_node_and_oversize);
 	UT_RUN(test_config_rejects_duplicate_target_uuid);
 	UT_RUN(test_config_file_metadata_is_exact_root_regular_0600);
+	UT_RUN(test_mapping_reload_generation_rules);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

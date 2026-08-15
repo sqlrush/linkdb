@@ -11658,15 +11658,12 @@ cluster_bufmgr_unlock_resident_stamp(Buffer buffer)
  * PGRAC MODIFICATIONS by SqlRush — spec-8.3 (active-ITL current-block
  * transfer: exact terminal-stamp authority).
  *
- *   cluster_bufmgr_pcm_x_holder_stamp_authority(buffer, ...) — read-only
- *   projection over the process-local ACTIVE PCM-X holder ledger, called
- *   at ITL registration while the writer still holds the content lock
- *   EXCLUSIVE.  Residency alone is not ownership proof (a same-tag block
- *   can be refetched or re-owned before the terminal hook); the projection
- *   binds the exact local X round: holder entry validated, ownership tuple
- *   quiescent (state X, flags zero, activation token zero) and generation
- *   equal to the holder identity's base generation.  The acquisition epoch
- *   comes from the holder identity, never from the current epoch alone.
+ *   cluster_bufmgr_terminal_stamp_authority(buffer, ...) — read-only
+ *   projection called at ITL registration while the writer still holds the
+ *   exact content lock EXCLUSIVE.  Peer mode preserves the ACTIVE PCM-X
+ *   holder-ledger proof unchanged.  Known single-node storage mode has no
+ *   peer PCM lifecycle and may project only an exact quiescent PCM-N tuple
+ *   while recovery merge is inactive.  Residency alone is never proof.
  *
  *   cluster_bufmgr_lock_resident_for_exact_itl_stamp(record, reason) —
  *   the no-fetch commit-time acquire that replaces the residency-only
@@ -11680,24 +11677,62 @@ cluster_bufmgr_unlock_resident_stamp(Buffer buffer)
 #include "cluster/cluster_itl_touch.h"
 
 bool
-cluster_bufmgr_pcm_x_holder_stamp_authority(Buffer buffer, uint64 *own_generation,
-											uint64 *acquisition_epoch)
+cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *expected_tag,
+										uint64 *own_generation,
+										uint64 *acquisition_epoch,
+										uint8 *pcm_state)
 {
 	BufferDesc *buf;
 	ClusterPcmXHolderLedgerEntry *entry;
 	ClusterPcmOwnSnapshot own;
 	uint32		buf_state;
 	bool		header_ok;
+	int			node_count;
 
 	if (own_generation != NULL)
 		*own_generation = 0;
 	if (acquisition_epoch != NULL)
 		*acquisition_epoch = 0;
+	if (pcm_state != NULL)
+		*pcm_state = (uint8)PCM_STATE_N;
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer)
-		|| own_generation == NULL || acquisition_epoch == NULL)
+		|| expected_tag == NULL || own_generation == NULL
+		|| acquisition_epoch == NULL || pcm_state == NULL)
 		return false;
 	buf = GetBufferDescriptor(buffer - 1);
 	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
+	node_count = cluster_conf_node_count();
+
+	/*
+	 * With exactly one configured node there is no peer PCM holder ledger.
+	 * The content lock already serializes the sole instance, so capture the
+	 * exact quiescent N tuple under the buffer-header lock.  Every topology,
+	 * recovery, tag, image or ownership mismatch refuses without creating X.
+	 */
+	if (node_count == 1) {
+		buf_state = LockBufHdr(buf);
+		cluster_pcm_own_snapshot_locked(buf, &own);
+		header_ok = (buf_state & BM_VALID) != 0
+			&& !cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
+			&& BufferTagsEqual(&buf->tag, expected_tag);
+		UnlockBufHdr(buf, buf_state);
+
+		if (!header_ok || !BufferTagsEqual(&own.tag, expected_tag)
+			|| !cluster_itl_terminal_stamp_authority_admissible(
+				cluster_storage_mode_enabled(), cluster_node_id, node_count,
+				cluster_recmerge_window_active, own.pcm_state, own.flags,
+				own.writer_activation_token))
+			return false;
+
+		*own_generation = own.generation;
+		*acquisition_epoch = cluster_epoch_get_current();
+		*pcm_state = own.pcm_state;
+		return true;
+	}
+
+	/* Unknown topology cannot enter the single-node adaptation. */
+	if (node_count <= 1)
+		return false;
 
 	entry = cluster_bufmgr_pcm_x_holder_find(buf);
 	if (entry == NULL || entry->phase != PCM_X_HOLDER_LEDGER_ACTIVE
@@ -11716,10 +11751,11 @@ cluster_bufmgr_pcm_x_holder_stamp_authority(Buffer buffer, uint64 *own_generatio
 	cluster_pcm_own_snapshot_locked(buf, &own);
 	header_ok = (buf_state & BM_VALID) != 0
 		&& !cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
+		&& BufferTagsEqual(&buf->tag, expected_tag)
 		&& BufferTagsEqual(&buf->tag, &entry->handle.key.identity.tag);
 	UnlockBufHdr(buf, buf_state);
 
-	if (!header_ok
+	if (!header_ok || !BufferTagsEqual(expected_tag, &entry->handle.key.identity.tag)
 		|| !BufferTagsEqual(&own.tag, &entry->handle.key.identity.tag)
 		|| own.pcm_state != (uint8) PCM_STATE_X
 		|| own.flags != 0
@@ -11729,6 +11765,7 @@ cluster_bufmgr_pcm_x_holder_stamp_authority(Buffer buffer, uint64 *own_generatio
 
 	*own_generation = own.generation;
 	*acquisition_epoch = entry->handle.key.identity.cluster_epoch;
+	*pcm_state = own.pcm_state;
 	return true;
 }
 
@@ -11750,6 +11787,7 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 	bool		header_valid;
 	bool		header_retained;
 	bool		header_tag_ok;
+	bool		authority_admissible;
 
 	Assert(record != NULL);
 	Assert(out_reason != NULL);
@@ -11818,6 +11856,16 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 	header_tag_ok = BufferTagsEqual(&buf->tag, &tag);
 	UnlockBufHdr(buf, buf_state);
 
+	/* Peer X retains its existing exact-state contract.  Only a captured N
+	 * proof uses the stricter known-single-node topology/recovery predicate. */
+	if (proof->pcm_state == (uint8)PCM_STATE_X)
+		authority_admissible = own.pcm_state == (uint8)PCM_STATE_X;
+	else
+		authority_admissible = cluster_itl_terminal_stamp_authority_admissible(
+			cluster_storage_mode_enabled(), cluster_node_id, cluster_conf_node_count(),
+			cluster_recmerge_window_active, own.pcm_state, own.flags,
+			own.writer_activation_token);
+
 	if (!header_tag_ok)
 		reason = CLUSTER_ITL_STAMP_SKIP_TAG_CHANGED;
 	else if (!header_valid)
@@ -11826,10 +11874,10 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 		reason = CLUSTER_ITL_STAMP_SKIP_NOT_CURRENT_IMAGE;
 	else if (!cluster_itl_terminal_proof_owner_exact(
 			 proof, own.generation, cluster_epoch_get_current(),
-			 own.pcm_state == (uint8) PCM_STATE_X, own.flags,
+			 own.pcm_state, authority_admissible, own.flags,
 			 own.writer_activation_token))
 	{
-		if (own.pcm_state != (uint8) PCM_STATE_X)
+		if (!authority_admissible || own.pcm_state != proof->pcm_state)
 			reason = CLUSTER_ITL_STAMP_SKIP_NOT_LOCAL_X;
 		else if (own.flags != 0 || own.writer_activation_token != 0)
 			reason = CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_FLAGS_BUSY;

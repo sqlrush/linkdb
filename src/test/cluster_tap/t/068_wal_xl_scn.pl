@@ -60,18 +60,6 @@ $primary->append_conf('postgresql.conf', "cluster.allow_single_node = on\n");
 $primary->append_conf('postgresql.conf', "cluster.pcm_grd_max_entries = 0\n");
 $primary->append_conf('postgresql.conf', "max_prepared_transactions = 8\n");
 $primary->append_conf('postgresql.conf', "wal_level = replica\n");
-PostgreSQL::Test::Utils::append_to_file(
-	$primary->data_dir . '/pgrac.conf', <<'EOC');
-[cluster]
-name = scn_wal_xl_scn
-
-[node.7]
-interconnect_addr = 127.0.0.1:19070
-
-[node.11]
-interconnect_addr = 127.0.0.1:19071
-EOC
-
 $primary->start;
 
 # Helper: read counter from primary's pg_cluster_state
@@ -129,8 +117,10 @@ sub waldump_range
 	return $output;
 }
 
-$primary->safe_psql('postgres',
-	q{CREATE TABLE t1 (id int); INSERT INTO t1 VALUES (1);});
+$primary->safe_psql('postgres', q{
+	CREATE TABLE t1 (id int, filler text DEFAULT repeat('x', 1900));
+	INSERT INTO t1 VALUES (1);
+});
 
 
 # ----------

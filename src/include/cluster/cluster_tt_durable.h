@@ -40,6 +40,8 @@
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_tt_slot.h" /* TTSlot */
 
+typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
+
 /*
  * Pure decision predicates (no I/O) -- shared by the runtime lookup/redo paths
  * and exercised directly by cluster_unit (file I/O behavior is e2e in t/219).
@@ -139,13 +141,19 @@ extern void cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset
  *	WITHOUT the standalone XLOG_UNDO_TT_SLOT_COMMIT (0x30): the caller folds an
  *	equivalent xl_xact_tt_commit delta into the commit record, whose flush makes
  *	both durable atomically.  Returns the owner instance (1..128) for the
- *	delta's path-resolution field.  ereport(ERROR) on I/O failure.  Redo side:
+ *	delta's path-resolution field and copies the exact written successor to
+ *	`successor_out`.  The caller supplies its already-held normal modifier
+ *	admission; this function borrows it while acquiring the exact local block0
+ *	current and resident content authority.  It neither enters nor leaves the
+ *	admission.  ereport(ERROR) on authority or I/O failure.  Redo side:
  *	cluster_tt_durable_redo_stamp_slot() (cluster_undo_xlog.c), driven by
  *	xact_redo_commit instead of the 0x30 redo.
  */
 extern uint8 cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset,
-													  TransactionId xid, uint16 wrap,
-													  SCN commit_scn);
+												  TransactionId xid, uint16 wrap,
+												  SCN commit_scn,
+												  const ClusterSemanticAdmissionToken *admission,
+												  TTSlot *successor_out);
 
 /*
  * cluster_tt_slot_durable_abort -- spec-3.15 D5 (ROLLBACK PREPARED).

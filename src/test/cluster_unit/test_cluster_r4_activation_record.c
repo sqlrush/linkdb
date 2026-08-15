@@ -1306,7 +1306,8 @@ UT_TEST(test_64_shmem_size_includes_exact_ack_table)
 {
 	Size expected = MAXALIGN(sizeof(ClusterSemanticActivationShmem))
 					+ MAXALIGN(sizeof(ClusterSemanticActivationUtilityMailboxShmem))
-					+ MAXALIGN(CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES);
+					+ MAXALIGN(CLUSTER_SEMANTIC_ACTIVATION_ACK_TABLE_BYTES)
+					+ MAXALIGN(sizeof(ClusterSemanticActivationPgrdSnapshotShmem));
 
 	UT_ASSERT_EQ(cluster_semantic_activation_shmem_size(), expected);
 }

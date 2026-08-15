@@ -34,16 +34,19 @@
 #include "postgres.h"
 
 #include "access/transam.h"
+#include "miscadmin.h"
 #include "utils/elog.h"
 
 #include "cluster/cluster_guc.h"		  /* cluster_node_id */
 #include "cluster/cluster_scn.h"		  /* SCN, SCN_VALID, InvalidScn */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_cleaner.h" /* spec-3.13 D2-B scan-only pass */
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"	  /* TTSlot, TT_SLOT_COMMITTED, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData */
 #include "cluster/cluster_undo_smgr.h"	  /* header-bytes + block I/O */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_xlog.h"	/* cluster_undo_emit_tt_slot_commit */
 
 
@@ -176,7 +179,7 @@ static const UBA InvalidUbaVal = InvalidUba_init;
  */
 static void
 tt_slot_write_committed(uint32 segment_id, uint8 owner, uint16 slot_offset, TransactionId xid,
-						uint16 wrap, SCN commit_scn)
+						uint16 wrap, SCN commit_scn, TTSlot *successor_out)
 {
 	uint32 off = tt_slot_file_offset(slot_offset);
 	TTSlot slot;
@@ -207,6 +210,8 @@ tt_slot_write_committed(uint32 segment_id, uint8 owner, uint16 slot_offset, Tran
 
 	cluster_tt_durable_io_wait_end();
 	cluster_tt_durable_count_commit();
+	if (successor_out != NULL)
+		*successor_out = slot;
 }
 
 void
@@ -233,18 +238,59 @@ cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, Transactio
 	 */
 	(void)cluster_undo_emit_tt_slot_commit(owner, segment_id, slot_offset, wrap, xid, commit_scn);
 
-	tt_slot_write_committed(segment_id, owner, slot_offset, xid, wrap, commit_scn);
+	tt_slot_write_committed(segment_id, owner, slot_offset, xid, wrap, commit_scn, NULL);
 }
 
 uint8
 cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset, TransactionId xid,
-										 uint16 wrap, SCN commit_scn)
+										 uint16 wrap, SCN commit_scn,
+										 const ClusterSemanticAdmissionToken *admission,
+										 TTSlot *successor_out)
 {
 	uint8 owner = tt_owner_instance_for_segment(segment_id);
+	ClusterUndoBlock0LogicalKey key;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0Generation generation = { false, 0 };
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0CurrentStep step;
+	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	TTSlot successor;
+	char *resident_page = NULL;
+	bool root_available;
+	volatile bool current_active = false;
+	volatile bool pin_held = false;
 
 	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
 	Assert(TransactionIdIsValid(xid));
 	Assert(SCN_VALID(commit_scn));
+	if (admission == NULL || successor_out == NULL || !admission->entered
+		|| admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
+		|| cluster_node_id < 0 || owner != (uint8)(cluster_node_id + 1))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot commit a transaction without local undo block-zero authority")));
+
+	key.segment_id = segment_id;
+	key.owner_instance = owner;
+	memset(&root, 0, sizeof(root));
+	memset(&final_root, 0, sizeof(final_root));
+	memset(&pin, 0, sizeof(pin));
+	pin.slot = -1;
+	root_available
+		= cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+			admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &root);
+
+	step = cluster_undo_block0_current_acquire_begin_live_owner_source(
+		&key, cluster_ges_request_timeout_ms, admission, &guard, &current_failure);
+	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot commit a transaction: undo block-zero current authority is unavailable"),
+				 errdetail("segment=%u result=%d", segment_id, (int)current_failure)));
+	current_active = true;
 
 	/*
 	 * spec-3.18 D4.1 (normal commit): write the 32B slot WITHOUT emitting a
@@ -256,7 +302,82 @@ cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset, 
 	 * 0x30 redo.  Returns the owner instance so the caller can fill the delta's
 	 * path-resolution field.
 	 */
-	tt_slot_write_committed(segment_id, owner, slot_offset, xid, wrap, commit_scn);
+	PG_TRY();
+	{
+		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			CHECK_FOR_INTERRUPTS();
+			step = cluster_undo_block0_current_acquire_poll(&guard, &current_failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				pg_usleep(1000L);
+		}
+		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("cannot commit a transaction: undo block-zero current acquisition failed"),
+					 errdetail("segment=%u result=%d", segment_id, (int)current_failure)));
+
+		if (root_available) {
+			result = cluster_undo_block0_current_sample_generation_exclusive(
+				&guard, &root, &generation);
+			if (result == CLUSTER_UNDO_BLOCK0_OK) {
+				result = cluster_undo_block0_current_pin_exclusive(
+					&guard, &root, &generation, &pin, &resident_page);
+				if (result != CLUSTER_UNDO_BLOCK0_OK)
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							 errmsg("cannot commit a transaction: resident undo block-zero content authority is unavailable"),
+							 errdetail("segment=%u result=%d", segment_id, (int)result)));
+				pin_held = true;
+			} else if (result != CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED) {
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						 errmsg("cannot commit a transaction: resident undo block-zero generation is unavailable"),
+						 errdetail("segment=%u result=%d", segment_id, (int)result)));
+			}
+		}
+
+		if (!pin_held) {
+			result = cluster_undo_block0_current_prove_strict_empty_exclusive(&guard);
+			if (result != CLUSTER_UNDO_BLOCK0_OK)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						 errmsg("cannot commit a transaction: nonresident undo block-zero state is not strictly empty"),
+						 errdetail("segment=%u result=%d", segment_id, (int)result)));
+		} else if (!cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+					 admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id,
+					 &final_root)
+				   || !cluster_undo_block0_root_matches(&root, &final_root)) {
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("cannot commit a transaction: undo block-zero root authority drifted")));
+		}
+
+		tt_slot_write_committed(
+			segment_id, owner, slot_offset, xid, wrap, commit_scn, &successor);
+
+		/* The durable write succeeded.  Publish only its identical 32-byte
+		 * successor while the same generation remains pinned EXCLUSIVE. */
+		if (pin_held)
+			memcpy(resident_page + tt_slot_file_offset(slot_offset), &successor,
+				   sizeof(successor));
+		*successor_out = successor;
+	}
+	PG_FINALLY();
+	{
+		if (pin_held) {
+			cluster_undo_block0_unpin(&pin);
+			pin_held = false;
+		}
+		if (current_active) {
+			/* This is the existing no-wait owned-resource release path.  In
+			 * particular, after successor publication it stages reliable remote
+			 * release (or drains a local holder) without an interruptible wait
+			 * or an ordinary ERROR after the durable bytes changed. */
+			cluster_undo_block0_current_cancel(&guard);
+			current_active = false;
+		}
+	}
+	PG_END_TRY();
 	return owner;
 }
 

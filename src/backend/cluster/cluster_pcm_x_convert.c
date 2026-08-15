@@ -572,6 +572,10 @@ static PcmXSlotHeader *pcm_x_domain_slot(PcmXAllocatorKind kind, PcmXSlotRef ref
 static void pcm_x_local_gate_acquire_guarded(LWLock *lock, LWLockMode mode,
 											 PcmXLocalTagSlot *tag_slot);
 
+#ifdef USE_ASSERT_CHECKING
+PcmXDomainSlotTestHook cluster_pcm_x_domain_slot_test_between_state_reads_hook = NULL;
+#endif
+
 /* Capture each internal fail-closed arm (file:line) while keeping the many
  * zero-argument call sites in this file textually unchanged. */
 #define pcm_x_runtime_fail_closed() pcm_x_runtime_fail_closed_impl(__FILE__, __LINE__)
@@ -3292,6 +3296,25 @@ pcm_x_queue_result_from_directory(PcmXDirectoryResult result)
 }
 
 
+static bool
+pcm_x_domain_state_pair_allowed(PcmXAllocatorKind kind, uint32 state1, uint32 state2,
+								uint32 allowed_state_mask)
+{
+	if (state1 == state2)
+		return true;
+	if (kind != PCM_X_ALLOC_LOCAL_HOLDER || state1 >= 32 || state2 >= 32
+		|| (allowed_state_mask & (UINT32_C(1) << state1)) == 0
+		|| (allowed_state_mask & (UINT32_C(1) << state2)) == 0)
+		return false;
+
+	return (state1 == PCM_XL_HOLDER_ACQUIRING
+			&& (state2 == PCM_XL_HOLDER_ACTIVE
+				|| state2 == PCM_XL_HOLDER_RELEASING))
+		   || (state1 == PCM_XL_HOLDER_ACTIVE
+			   && state2 == PCM_XL_HOLDER_RELEASING);
+}
+
+
 static PcmXSlotHeader *
 pcm_x_domain_slot(PcmXAllocatorKind kind, PcmXSlotRef ref, const BufferTag *expected_tag,
 				  uint32 allowed_state_mask)
@@ -3337,11 +3360,16 @@ pcm_x_domain_slot(PcmXAllocatorKind kind, PcmXSlotRef ref, const BufferTag *expe
 		return NULL;
 	tag_snapshot = *slot_tag;
 	pg_read_barrier();
+#ifdef USE_ASSERT_CHECKING
+	if (cluster_pcm_x_domain_slot_test_between_state_reads_hook != NULL)
+		cluster_pcm_x_domain_slot_test_between_state_reads_hook(kind, ref);
+#endif
 	state2 = pcm_x_slot_state_read(slot);
 	pg_read_barrier();
 	if (!pcm_x_slot_generation_read(slot, &generation2))
 		return NULL;
-	if (state1 != state2 || generation1 != generation2
+	if (!pcm_x_domain_state_pair_allowed(kind, state1, state2, allowed_state_mask)
+		|| generation1 != generation2
 		|| !BufferTagsEqual(&tag_snapshot, expected_tag))
 		return NULL;
 	return slot;

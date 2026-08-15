@@ -71,6 +71,9 @@ extern ClusterUndoBlock0Result cluster_undo_block0_provision_begin(
 extern void cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin,
 	XLogRecPtr init_lsn);
 extern void cluster_undo_block0_provision_abort(ClusterUndoBlock0Pin *pin);
+extern ClusterUndoBlock0Result cluster_undo_block0_prove_strict_empty(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0AuthorityProof *proof);
 
 /* storage/shmem.h exports checked arithmetic from the backend executable. */
 Size
@@ -104,8 +107,11 @@ static int wal_io_order_count = 0;
 static sigjmp_buf wal_error_jump;
 static bool wal_error_armed = false;
 static bool copy_during_fill = false;
+static bool empty_probe_during_fill = false;
 static bool abort_during_fill = false;
 static ClusterUndoBlock0Result copy_during_fill_result = CLUSTER_UNDO_BLOCK0_OK;
+static ClusterUndoBlock0Result empty_probe_during_fill_result
+	= CLUSTER_UNDO_BLOCK0_OK;
 static ClusterUndoBlock0LogicalKey fill_logical;
 static ClusterUndoBlock0ResolvedRoot fill_root;
 static ClusterUndoBlock0AuthorityProof fill_proof;
@@ -218,6 +224,11 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 		copy_during_fill = false;
 		copy_during_fill_result = cluster_undo_block0_copy_resident(
 			&fill_logical, &fill_root, NULL, &fill_proof, private_page, NULL);
+	}
+	if (empty_probe_during_fill) {
+		empty_probe_during_fill = false;
+		empty_probe_during_fill_result
+			= cluster_undo_block0_prove_strict_empty(&fill_logical, &fill_proof);
 	}
 	if (abort_during_fill) {
 		abort_during_fill = false;
@@ -446,8 +457,10 @@ fresh_block0_region(uint32 frame_count)
 	wal_io_order_count = 0;
 	wal_error_armed = false;
 	copy_during_fill = false;
+	empty_probe_during_fill = false;
 	abort_during_fill = false;
 	copy_during_fill_result = CLUSTER_UNDO_BLOCK0_OK;
+	empty_probe_during_fill_result = CLUSTER_UNDO_BLOCK0_OK;
 	lwlock_acquire_calls = 0;
 	lwlock_throw_on_call = 0;
 	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
@@ -805,6 +818,41 @@ UT_TEST(test_block0_runtime_admission_rejects_exhausted_generation)
 	UT_ASSERT_EQ(pin.slot, -1);
 	UT_ASSERT_EQ(smgr_read_calls, 1);
 	cluster_undo_block0_frame_release(&token);
+}
+
+UT_TEST(test_block0_strict_empty_proof_excludes_filling_and_resident_states)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x1170), 8);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 7);
+	ClusterUndoBlock0AuthorityProof wrong = make_live_proof(2, 7);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+
+	fresh_block0_region(1);
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &proof),
+		CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &wrong),
+		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+
+	make_valid_block0(1, 1, 0, 0x5f);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+		CLUSTER_UNDO_BLOCK0_OK);
+	fill_logical = logical;
+	fill_root = root;
+	fill_proof = proof;
+	empty_probe_during_fill = true;
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+		&logical, &root, &proof, &token, &pin, &page),
+		CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(empty_probe_during_fill_result,
+		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &proof),
+		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 }
 
 UT_TEST(test_block0_copy_readonly_is_recovery_only_and_generation_exact)
@@ -1942,7 +1990,7 @@ UT_TEST(test_r4_startup_completion_surface_refuses_without_owner_proofs)
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(47);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_requires_pgrd_identity_and_declared_intent);
@@ -1957,6 +2005,7 @@ main(void)
 	UT_RUN(test_block0_frame_bank_is_sparse_and_all_or_none);
 	UT_RUN(test_block0_runtime_admission_preserves_generation_zero_and_exact_identity);
 	UT_RUN(test_block0_runtime_admission_rejects_exhausted_generation);
+	UT_RUN(test_block0_strict_empty_proof_excludes_filling_and_resident_states);
 	UT_RUN(test_block0_copy_readonly_is_recovery_only_and_generation_exact);
 	UT_RUN(test_block0_resident_copy_rejects_empty_generation_and_root_drift_without_io);
 	UT_RUN(test_block0_pin_error_drops_reservation_before_rethrow);

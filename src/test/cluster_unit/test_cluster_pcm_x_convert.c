@@ -152,6 +152,13 @@ static LWLockMode lwlock_acquire_error_mode;
 static int lwlock_acquire_error_match;
 static bool iterating_held_lwlocks;
 static int lock_acquire_during_iteration_count;
+static bool domain_holder_state_hook_armed;
+static bool domain_holder_state_hook_reverse;
+static int domain_holder_state_hook_calls;
+static PcmXSlotRef domain_holder_state_hook_ref;
+static PcmXLocalHolderHandle domain_holder_state_hook_handle;
+static PcmXLocalMembershipSlot *domain_holder_state_hook_slot;
+static PcmXQueueResult domain_holder_state_hook_result;
 
 static void maybe_publish_staged_prehandle_insert_exists(void);
 static void maybe_inject_local_rekey_insert_failure(void);
@@ -163,6 +170,29 @@ static uint32 test_slot_flags(PcmXSlotHeader *slot);
 static bool ticket_refs_equal(const PcmXTicketRef *left, const PcmXTicketRef *right);
 static void init_active_pcm_x(uint64 master_session_incarnation);
 static void bind_local_master(int32 master_node, uint64 cluster_epoch, uint64 master_session);
+
+static void
+domain_holder_state_transition_hook(PcmXAllocatorKind kind, PcmXSlotRef ref)
+{
+	uint32 packed;
+
+	if (!domain_holder_state_hook_armed || kind != PCM_X_ALLOC_LOCAL_HOLDER
+		|| ref.slot_index != domain_holder_state_hook_ref.slot_index
+		|| ref.slot_generation != domain_holder_state_hook_ref.slot_generation)
+		return;
+	domain_holder_state_hook_armed = false;
+	domain_holder_state_hook_calls++;
+	if (!domain_holder_state_hook_reverse) {
+		domain_holder_state_hook_result
+			= cluster_pcm_x_local_holder_mark_releasing_exact(
+				&domain_holder_state_hook_handle);
+		return;
+	}
+	packed = pg_atomic_read_u32(&domain_holder_state_hook_slot->slot.state_flags);
+	packed = (packed & PCM_X_SLOT_FLAGS_MASK) | PCM_XL_HOLDER_ACTIVE;
+	pg_atomic_write_u32(&domain_holder_state_hook_slot->slot.state_flags, packed);
+	domain_holder_state_hook_result = PCM_X_QUEUE_OK;
+}
 
 static void
 test_image_id_domain_is_canonical_and_bounded(void)
@@ -1577,6 +1607,12 @@ directory_occupied_count(PcmXShmemHeader *header, PcmXDirectoryKind kind)
 static void
 init_active_pcm_x(uint64 master_session_incarnation)
 {
+	cluster_pcm_x_domain_slot_test_between_state_reads_hook = NULL;
+	domain_holder_state_hook_armed = false;
+	domain_holder_state_hook_reverse = false;
+	domain_holder_state_hook_calls = 0;
+	domain_holder_state_hook_slot = NULL;
+	domain_holder_state_hook_result = PCM_X_QUEUE_INVALID;
 	reset_fake_shmem();
 	cluster_pcm_x_convert_shmem_init();
 	UT_ASSERT(cluster_pcm_x_runtime_activate(master_session_incarnation));
@@ -3364,6 +3400,62 @@ UT_TEST(test_local_holder_unregister_validates_before_unlinking_corrupt_tag)
 	UT_ASSERT_EQ(test_slot_state(&holder->slot), PCM_XL_HOLDER_RELEASING);
 	UT_ASSERT_EQ(ClusterPcmXConvertShmem->allocator[PCM_X_ALLOC_LOCAL_HOLDER].used, 1);
 	UT_ASSERT_EQ(directory_occupied_count(ClusterPcmXConvertShmem, PCM_X_DIR_LOCAL_HOLDER), 1);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
+UT_TEST(test_local_holder_unregister_accepts_adjacent_forward_state_drift)
+{
+	PcmXLocalHolderKey tail_key
+		= make_local_holder_key(7641, 0, 21, UINT64_C(74003), 5);
+	PcmXLocalHolderKey head_key
+		= make_local_holder_key(7641, 0, 22, UINT64_C(74004), 6);
+	PcmXLocalHolderHandle tail;
+	PcmXLocalHolderHandle head;
+
+	init_active_pcm_x(UINT64_C(7208));
+	UT_ASSERT_EQ(register_active_local_holder(&tail_key, &tail), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(register_active_local_holder(&head_key, &head), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_mark_releasing_exact(&head), PCM_X_QUEUE_OK);
+	domain_holder_state_hook_armed = true;
+	domain_holder_state_hook_ref = tail.holder_slot;
+	domain_holder_state_hook_handle = tail;
+	cluster_pcm_x_domain_slot_test_between_state_reads_hook
+		= domain_holder_state_transition_hook;
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_unregister_exact(&head), PCM_X_QUEUE_OK);
+	cluster_pcm_x_domain_slot_test_between_state_reads_hook = NULL;
+	UT_ASSERT(!domain_holder_state_hook_armed);
+	UT_ASSERT_EQ(domain_holder_state_hook_calls, 1);
+	UT_ASSERT_EQ(domain_holder_state_hook_result, PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_unregister_exact(&tail), PCM_X_QUEUE_OK);
+}
+
+UT_TEST(test_local_holder_unregister_rejects_adjacent_reverse_state_drift)
+{
+	PcmXLocalHolderKey tail_key
+		= make_local_holder_key(7642, 0, 23, UINT64_C(74005), 5);
+	PcmXLocalHolderKey head_key
+		= make_local_holder_key(7642, 0, 24, UINT64_C(74006), 6);
+	PcmXLocalHolderHandle tail;
+	PcmXLocalHolderHandle head;
+
+	init_active_pcm_x(UINT64_C(7209));
+	UT_ASSERT_EQ(register_active_local_holder(&tail_key, &tail), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(register_active_local_holder(&head_key, &head), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_mark_releasing_exact(&tail), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_mark_releasing_exact(&head), PCM_X_QUEUE_OK);
+	domain_holder_state_hook_armed = true;
+	domain_holder_state_hook_reverse = true;
+	domain_holder_state_hook_ref = tail.holder_slot;
+	domain_holder_state_hook_slot
+		= &membership_slots(ClusterPcmXConvertShmem)[tail.holder_slot.slot_index];
+	cluster_pcm_x_domain_slot_test_between_state_reads_hook
+		= domain_holder_state_transition_hook;
+	UT_ASSERT_EQ(cluster_pcm_x_local_holder_unregister_exact(&head), PCM_X_QUEUE_CORRUPT);
+	cluster_pcm_x_domain_slot_test_between_state_reads_hook = NULL;
+	UT_ASSERT(!domain_holder_state_hook_armed);
+	UT_ASSERT_EQ(domain_holder_state_hook_calls, 1);
+	UT_ASSERT_EQ(domain_holder_state_hook_result, PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
 }
 
@@ -17090,7 +17182,7 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(282);
+	UT_PLAN(284);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -17132,6 +17224,8 @@ main(void)
 	UT_RUN(test_local_holder_capacity_failure_rolls_back_holder_only_tag);
 	UT_RUN(test_local_holder_snapshot_corruption_fails_closed_before_copy);
 	UT_RUN(test_local_holder_unregister_validates_before_unlinking_corrupt_tag);
+	UT_RUN(test_local_holder_unregister_accepts_adjacent_forward_state_drift);
+	UT_RUN(test_local_holder_unregister_rejects_adjacent_reverse_state_drift);
 	UT_RUN(test_holder_only_tag_is_adopted_by_local_queue_without_pool_borrowing);
 	UT_RUN(test_holder_only_tag_survives_last_cancelled_waiter_detach);
 	UT_RUN(test_local_holder_register_refuses_closed_revoke_barrier);

@@ -59,18 +59,6 @@ $node->append_conf('postgresql.conf', "cluster.pcm_grd_max_entries = 0\n");
 $node->append_conf('postgresql.conf', "wal_writer_delay = 10ms\n");
 $node->append_conf('postgresql.conf', "cluster.boc_sweep_interval_ms = 1\n");
 $node->append_conf('postgresql.conf', "log_min_messages = info\n");
-PostgreSQL::Test::Utils::append_to_file(
-	$node->data_dir . '/pgrac.conf', <<'EOC');
-[cluster]
-name = scn_walwriter_boc
-
-[node.7]
-interconnect_addr = 127.0.0.1:19068
-
-[node.8]
-interconnect_addr = 127.0.0.1:19069
-EOC
-
 $node->start;
 
 
@@ -86,7 +74,10 @@ sub counter
 
 
 # Setup test table
-$node->safe_psql('postgres', q{CREATE TABLE t1 (id int); INSERT INTO t1 VALUES (1);});
+$node->safe_psql('postgres', q{
+	CREATE TABLE t1 (id int, filler text DEFAULT repeat('x', 1900));
+	INSERT INTO t1 VALUES (1);
+});
 
 
 # ----------

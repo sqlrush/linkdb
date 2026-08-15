@@ -235,7 +235,22 @@ extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
 								  ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);
+extern ClusterSemanticAdmissionResult
+cluster_semantic_activation_enter_r4_terminal_census(
+	ClusterSemanticAdmissionToken *token);
+extern bool cluster_semantic_activation_recheck_r4_terminal_census(
+	const ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_resolve_shared_undo_root(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out);
+extern bool
+cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out);
+extern bool
+cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
 	uint32 owner_instance, uint32 segment_id,
 	ClusterUndoBlock0ResolvedRoot *out);

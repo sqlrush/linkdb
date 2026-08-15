@@ -496,6 +496,47 @@ UT_TEST(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0)
 				 -1);
 }
 
+/* The M4-scoped existing kind-2 extension shares the already existing DATA0
+ * cooperative driver.  Its backend endpoint is positive (the reply lands in
+ * that backend's physical R4_CR slot), so extension kind -- not endpoint -2
+ * -- is the frozen routing discriminator. */
+UT_TEST(test_r4_kind2_terminal_census_routes_to_existing_data_worker0)
+{
+	ClusterR4CrForwardPayload forward;
+	BufferTag tag;
+	int ordinary_shard = 0;
+	int i;
+
+	for (i = 1; i < 10000 && ordinary_shard == 0; i++) {
+		tag = make_tag(GCS_BLOCK_UNDO_FETCH_TAG_MAGIC, 5, 0,
+					   MAIN_FORKNUM, (BlockNumber)i);
+		ordinary_shard
+			= cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+	}
+	UT_ASSERT(ordinary_shard > 0);
+	memset(&forward, 0, sizeof(forward));
+	forward.base.tag = tag;
+	forward.base.requester_backend_id = 1;
+	forward.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
+	forward.extension.r4_kind = CLUSTER_R4_WIRE_TX_RESOLVE;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward, sizeof(forward),
+		CLUSTER_LMS_MAX_WORKERS), 0);
+
+	forward.extension.r4_version = 0;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward, sizeof(forward),
+		CLUSTER_LMS_MAX_WORKERS), ordinary_shard);
+	forward.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
+	forward.extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward, sizeof(forward),
+		CLUSTER_LMS_MAX_WORKERS), ordinary_shard);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
+		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward, sizeof(forward) - 1,
+		CLUSTER_LMS_MAX_WORKERS), -1);
+}
+
 /* ======================================================================
  * U9 -- extended route admission is exact, not a minimum-size check:
  *		 REQUEST accepts only 64/80 and FORWARD accepts only 64/96.  Adjacent
@@ -674,7 +715,7 @@ UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -684,6 +725,7 @@ main(void)
 	UT_RUN(test_route_ignores_non_tag_fields);
 	UT_RUN(test_r4_extended_route_exact_lengths_and_tag_affinity);
 	UT_RUN(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0);
+	UT_RUN(test_r4_kind2_terminal_census_routes_to_existing_data_worker0);
 	UT_RUN(test_r4_extended_route_length_mismatch_refused);
 	UT_RUN(test_current_mx_forward128_routes_by_request_identity);
 	UT_RUN(test_pcm_x_route_truth_table);

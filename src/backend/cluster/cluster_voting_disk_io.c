@@ -948,8 +948,24 @@ cluster_voting_disk_epoch_ballot_authority_attest(int fd)
 bool
 cluster_voting_disk_pgrd_authority_attest(int fd)
 {
-	return voting_disk_raw_authority_attest(
-		fd, (uint64)CLUSTER_VOTING_PGRD_FILE_BYTES_MIN);
+	if (voting_disk_raw_authority_attest(
+			fd, (uint64)CLUSTER_VOTING_PGRD_FILE_BYTES_MIN))
+		return true;
+#ifndef __linux__
+	{
+		struct stat st;
+		int flags;
+
+		if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+			return false;
+		flags = fcntl(fd, F_GETFL);
+		return flags >= 0 && (flags & O_ACCMODE) == O_RDWR
+			   && st.st_size >= CLUSTER_VOTING_PGRD_FILE_BYTES_MIN
+			   && (st.st_size % CLUSTER_VOTING_SLOT_BYTES) == 0;
+	}
+#else
+	return false;
+#endif
 }
 
 #endif /* USE_PGRAC_CLUSTER */

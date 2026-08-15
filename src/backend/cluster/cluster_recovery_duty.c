@@ -547,6 +547,20 @@ cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *wit
 	}
 }
 
+bool
+cluster_formation_witness_copy_classification_v1(
+	const ClusterFormationWitnessV1 *witness, uint16 *origin_thread,
+	ClusterFenceAuthorityProof *authority, ClusterFormationSnapshotV1 *snapshot)
+{
+	if (witness == NULL || witness->magic != CLUSTER_FORMATION_WITNESS_MAGIC ||
+		origin_thread == NULL || authority == NULL || snapshot == NULL)
+		return false;
+	*origin_thread = witness->origin_thread;
+	*authority = witness->authority;
+	*snapshot = witness->f2;
+	return true;
+}
+
 const ClusterFenceAuthorityProof *
 cluster_formation_witness_authority(const ClusterFormationWitnessV1 *witness)
 {

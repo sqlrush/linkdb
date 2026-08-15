@@ -1018,8 +1018,6 @@ qvotec_undo_root_descriptor_read_fds(
 	return CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID;
 }
 
-/* Regular files remain valid codec fixtures, but the live QVOTEC writer
- * requires the complete PGRD append region on every configured raw member. */
 static bool
 qvotec_undo_root_descriptor_formation_attested_fds(
 	const int *fds, int n_disks)

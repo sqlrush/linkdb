@@ -61,10 +61,14 @@
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
+#include "cluster/cluster_ic.h"
+#include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_reconfig.h" /* ReconfigEvent for spec-4.12b D2 stub */
 #include "cluster/cluster_replacement_request.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/cluster_write_fence.h" /* ClusterFenceMarker for D2/D4 stubs */
@@ -279,6 +283,43 @@ pg_usleep(long microsec pg_attribute_unused())
 #include "cluster/cluster_shmem.h"
 void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{}
+
+uint32
+cluster_ic_local_capability_word(void)
+{
+	return 0;
+}
+
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 msg_type pg_attribute_unused(),
+	int32 dest_node_id pg_attribute_unused(),
+	const void *payload pg_attribute_unused(),
+	uint32 payload_len pg_attribute_unused())
+{
+	return CLUSTER_IC_SEND_NOT_ADMITTED;
+}
+
+void
+cluster_ic_tier1_close_peer(int32 peer_id pg_attribute_unused(),
+	const char *reason pg_attribute_unused())
+{}
+
+bool
+cluster_sf_peer_capability_word_sample(
+	int32 peer_id pg_attribute_unused(),
+	uint32 required_capabilities pg_attribute_unused(),
+	uint32 *capability_word_out, uint32 *generation_out)
+{
+	if (capability_word_out != NULL)
+		*capability_word_out = 0;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	return false;
+}
+
+void
+cluster_write_fence_authority_cache_invalidate(void)
 {}
 
 #include "cluster/cluster_elog.h"
@@ -2456,16 +2497,31 @@ UT_TEST(test_epoch_ballot_formation_rejects_fixture_disks)
 	pgsa_disk_set_close(&set);
 }
 
-UT_TEST(test_pgrd_formation_rejects_fixture_disks)
+UT_TEST(test_pgrd_formation_accepts_only_bounded_nonlinux_development_disks)
 {
 	PgsaDiskSet set;
+	int i;
 
 	if (!pgsa_disk_set_open(&set)) {
 		UT_ASSERT(false);
 		return;
 	}
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT_EQ(ftruncate(
+			set.fds[i], CLUSTER_UNDO_ROOT_DESCRIPTOR_FILE_BYTES_MIN), 0);
+#ifndef __linux__
+	UT_ASSERT(cluster_qvotec_test_undo_root_descriptor_formation_attested(
+		set.fds, PGSA_TEST_DISKS));
+#else
 	UT_ASSERT(!cluster_qvotec_test_undo_root_descriptor_formation_attested(
 		set.fds, PGSA_TEST_DISKS));
+#endif
+	UT_ASSERT_EQ(ftruncate(
+		set.fds[2], CLUSTER_UNDO_ROOT_DESCRIPTOR_FILE_BYTES_MIN - 1), 0);
+	UT_ASSERT(!cluster_qvotec_test_undo_root_descriptor_formation_attested(
+		set.fds, PGSA_TEST_DISKS));
+	UT_ASSERT_EQ(ftruncate(
+		set.fds[2], CLUSTER_UNDO_ROOT_DESCRIPTOR_FILE_BYTES_MIN), 0);
 	UT_ASSERT(!cluster_qvotec_test_undo_root_descriptor_formation_attested(
 		NULL, 0));
 	UT_ASSERT(!cluster_qvotec_test_undo_root_descriptor_formation_attested(
@@ -2658,7 +2714,7 @@ main(void)
 	UT_RUN(test_epoch_ballot_recover_head_requires_exact_settled_majority);
 	UT_RUN(test_epoch_ballot_phase1_preserves_history_and_observed_promise_floor);
 	UT_RUN(test_epoch_ballot_formation_rejects_fixture_disks);
-	UT_RUN(test_pgrd_formation_rejects_fixture_disks);
+	UT_RUN(test_pgrd_formation_accepts_only_bounded_nonlinux_development_disks);
 	UT_RUN(test_pgsa_source_graph_and_test_linkage_are_exact);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

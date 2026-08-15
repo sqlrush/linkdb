@@ -622,7 +622,7 @@ CreateWaitEventSet(MemoryContext cxt pg_attribute_unused(), int nevents pg_attri
 }
 int
 AddWaitEventToSet(WaitEventSet *set pg_attribute_unused(), uint32 events pg_attribute_unused(),
-				  int fd pg_attribute_unused(), void *latch pg_attribute_unused(),
+				  pgsocket fd pg_attribute_unused(), Latch *latch pg_attribute_unused(),
 				  void *user_data pg_attribute_unused())
 {
 	return -1;

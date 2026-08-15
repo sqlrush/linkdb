@@ -302,6 +302,12 @@ typedef enum PcmXAllocatorKind {
 	PCM_X_ALLOC_COUNT
 } PcmXAllocatorKind;
 
+#ifdef USE_ASSERT_CHECKING
+typedef void (*PcmXDomainSlotTestHook)(PcmXAllocatorKind kind, PcmXSlotRef ref);
+extern PGDLLIMPORT PcmXDomainSlotTestHook
+	cluster_pcm_x_domain_slot_test_between_state_reads_hook;
+#endif
+
 /* Seven bounded key spaces over the five logical pools. */
 typedef enum PcmXDirectoryKind {
 	PCM_X_DIR_MASTER_TAG = 0,

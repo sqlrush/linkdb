@@ -86,6 +86,11 @@ cluster_qvotec_in_quorum(void)
 	return test_in_quorum;
 }
 
+/* cluster_membership.c invalidates this backend-local cache after a commit. */
+void
+cluster_write_fence_authority_cache_invalidate(void)
+{}
+
 /*
  * A file-static backing table for the marker-seed tests (U10/U13/U15).  They
  * attach a fresh table to simulate a restart; it must NOT be a stack local
