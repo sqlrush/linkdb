@@ -80,6 +80,16 @@ bool cluster_merged_recovery = false; /* read by D1 startup vet (D9 amend dep) *
 char *cluster_shared_data_dir = NULL;
 char *cluster_shared_storage_uuid = NULL;
 int cluster_node_id = 0;
+static const char *stub_block_device_storage_uuid;
+
+bool
+cluster_shared_fs_block_device_get_storage_uuid(char *out, size_t outlen)
+{
+	if (out == NULL || outlen == 0 || stub_block_device_storage_uuid == NULL)
+		return false;
+	strlcpy(out, stub_block_device_storage_uuid, outlen);
+	return true;
+}
 
 /*
  * miscadmin global referenced by cluster_shared_fs_init's WARNING
@@ -757,6 +767,31 @@ UT_TEST(test_undo_shared_path_resolve)
 	cluster_shared_data_dir = NULL; /* restore stub default */
 }
 
+UT_TEST(test_external_fence_protected_set_identity_is_exact_and_closed)
+{
+	static const uint8 expected_uuid[16] = {
+		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+		0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
+	};
+	ClusterProtectedSetIdentityV1 identity;
+
+	cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE;
+	stub_block_device_storage_uuid = "00112233445566778899aabbccddeeff";
+	UT_ASSERT(cluster_shared_fs_get_protected_set_identity(&identity));
+	UT_ASSERT_EQ(identity.backend_id, CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE);
+	UT_ASSERT(memcmp(identity.storage_uuid, expected_uuid,
+				 sizeof(expected_uuid)) == 0);
+
+	stub_block_device_storage_uuid = "raw-block-device";
+	UT_ASSERT(!cluster_shared_fs_get_protected_set_identity(&identity));
+	stub_block_device_storage_uuid = "00112233445566778899AABBCCDDEEFF";
+	UT_ASSERT(!cluster_shared_fs_get_protected_set_identity(&identity));
+	cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_LOCAL;
+	UT_ASSERT(!cluster_shared_fs_get_protected_set_identity(&identity));
+	cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_STUB;
+	stub_block_device_storage_uuid = NULL;
+}
+
 
 /* ============================================================
  * Test runner
@@ -765,7 +800,7 @@ UT_TEST(test_undo_shared_path_resolve)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_shared_fs_backend_max_constant);
 	UT_RUN(test_shared_fs_backend_id_enum_frozen);
 	UT_RUN(test_shared_fs_vtable_struct_nonempty);
@@ -782,6 +817,7 @@ main(void)
 	UT_RUN(test_sharedfs_vtable_identity);
 	UT_RUN(test_sharedfs_sentinel_symbols_linkable);
 	UT_RUN(test_undo_shared_path_resolve);
+	UT_RUN(test_external_fence_protected_set_identity_is_exact_and_closed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

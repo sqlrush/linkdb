@@ -73,6 +73,7 @@
 #include "cluster/cluster_conf.h"			   /* node_count / has_peers (scope gate)        */
 #include "cluster/cluster_elog.h"			   /* ERRCODE_CLUSTER_THREAD_RECOVERY_BLOCKED     */
 #include "cluster/cluster_guc.h"			   /* GUCs: online flag + shared backend + policy */
+#include "cluster/cluster_ir.h"                /* STOP03 held serial guard */
 #include "cluster/cluster_recovery_merge.h"	   /* node-local authority publish (online)       */
 #include "cluster/cluster_recovery_plan.h"	   /* ClusterThreadReplaySlot + slot accessor     */
 #include "cluster/cluster_remote_xact.h"	   /* per-origin outcome store flush              */
@@ -296,6 +297,7 @@ cluster_thread_recovery_capability_gate(ClusterThreadRecScope scope)
 ClusterThreadRecResult
 cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower,
 										  XLogRecPtr scan_upper, uint64 episode_epoch,
+										  ClusterRecoverySerialGuard *serial_guard,
 										  ClusterThreadReplayStats *stats)
 {
 	int origin = (int)dead_tid - 1;
@@ -319,6 +321,11 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	/* dead_tid must name a real thread slot (origin in range). */
 	if (dead_tid < 1 || dead_tid > CLUSTER_WAL_STATE_SLOT_COUNT)
 		return CLUSTER_THREADREC_BLOCKED;
+	if (cluster_recovery_serial_revalidate(serial_guard) !=
+		CLUSTER_RECOVERY_SERIAL_CURRENT) {
+		cluster_write_fence_note_external_mutation_gate_blocked();
+		return CLUSTER_THREADREC_BLOCKED;
+	}
 
 	/* episode_epoch: the L235 in-memory abort-on-bump gate uses it upstream; here
 	 * spec-4.12 D6 re-checks it against the DURABLE voting-disk marker before the
@@ -402,6 +409,16 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 			 * TT-segment fsync here is an 8.A-safe forward (3b-4+).
 			 */
 			cluster_remote_xact_flush();
+
+			/* STOP04 publish gate: the same held IR/formation/NeedSet/
+			 * AdmissionSet must still be current after durability and immediately
+			 * before reader authority becomes visible. */
+			if (cluster_recovery_serial_revalidate(serial_guard) !=
+				CLUSTER_RECOVERY_SERIAL_CURRENT) {
+				cluster_write_fence_note_external_publish_gate_blocked();
+				ereport(ERROR,
+						(errmsg("thread recovery external-fence authority became stale before publish")));
+			}
 
 			/*
 			 * 3. node-local reader authority LAST (the serving gate the D3
@@ -510,7 +527,8 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
  * Author: SqlRush <sqlrush@gmail.com>
  */
 ClusterThreadRecResult
-cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
+cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
+								   ClusterRecoverySerialGuard *serial_guard)
 {
 	ClusterThreadRecScope scope;
 	ClusterWalStateSlot slot;
@@ -591,8 +609,8 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch)
 		return CLUSTER_THREADREC_BLOCKED;
 	}
 
-	return cluster_thread_recovery_replay_one_window(dead_tid, lower, scan_upper, episode_epoch,
-													 NULL);
+	return cluster_thread_recovery_replay_one_window(
+		dead_tid, lower, scan_upper, episode_epoch, serial_guard, NULL);
 }
 
 /*

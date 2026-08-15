@@ -79,6 +79,18 @@ typedef enum ClusterSharedFsBackendId {
 
 #define CLUSTER_SHARED_FS_BACKEND_MAX 16
 
+typedef struct ClusterProtectedSetIdentityV1 {
+	uint32 backend_id;
+	uint8 storage_uuid[16];
+} ClusterProtectedSetIdentityV1;
+
+StaticAssertDecl(sizeof(ClusterProtectedSetIdentityV1) == 20,
+				 "protected-set identity v1 must remain 20 bytes");
+StaticAssertDecl(offsetof(ClusterProtectedSetIdentityV1, backend_id) == 0,
+				 "protected-set backend id offset changed");
+StaticAssertDecl(offsetof(ClusterProtectedSetIdentityV1, storage_uuid) == 4,
+				 "protected-set storage uuid offset changed");
+
 
 /*
  * ClusterSharedFsHandle -- opaque per-(rlocator, forknum) handle
@@ -375,6 +387,14 @@ extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
 extern void cluster_shared_fs_sentinel_attach(void);
 extern bool cluster_shared_fs_sentinel_has_participant(int node_id);
 extern void cluster_shared_fs_get_storage_uuid(char *out, size_t outlen);
+extern bool cluster_shared_fs_get_protected_set_identity(
+	ClusterProtectedSetIdentityV1 *out);
+
+/* Backend-private identity source used by the provider-neutral dispatcher.
+ * It returns only a strict configured UUID already matched to the CRC-valid
+ * raw superblock; the legacy "raw-block-device" fallback returns false. */
+extern bool cluster_shared_fs_block_device_get_storage_uuid(
+	char *out, size_t outlen);
 
 
 #endif /* CLUSTER_SHARED_FS_H */

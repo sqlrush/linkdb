@@ -80,6 +80,10 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_dl \
         test_cluster_extend_gate \
         test_cluster_recovery_serial \
+		test_cluster_external_fence test_pgrac_external_fence_protocol \
+		test_pgrac_fenced_config test_pgrac_fenced_core \
+		test_pgrac_fenced_journal test_pgrac_fenced_provider \
+		test_pgrac_fenced_ctl \
         test_cluster_ts \
         test_cluster_ko \
         test_cluster_hw_snapshot \
@@ -272,7 +276,12 @@ SIMPLE_TESTS := $(filter-out test_cluster_multixact_current_stats \
 		test_cluster_r4_lms_controls test_cluster_r4_slot_reservation \
 		test_cluster_r4_observe test_cluster_r4_multi_subx_2pc \
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_raw_device_capacity test_cluster_replacement_wire,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_raw_device_capacity test_cluster_replacement_wire \
+		test_cluster_external_fence test_pgrac_external_fence_protocol,$(SIMPLE_TESTS))
+
+SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
+		test_pgrac_fenced_journal test_pgrac_fenced_provider \
+		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -351,6 +360,17 @@ test_cluster_recovery_serial: test_cluster_recovery_serial.c unit_test.h $(CLUST
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_IR_O) $(CLUSTER_IR_LOCK_O) \
 		$(CLUSTER_DL_O) $(CLUSTER_HW_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+CLUSTER_EXTERNAL_FENCE_O = \
+	$(top_builddir)/src/backend/cluster/cluster_external_fence.o
+PGRAC_EXTERNAL_FENCE_PROTOCOL_O = \
+	$(top_builddir)/src/common/pgrac_external_fence_protocol_srv.o
+test_cluster_external_fence: test_cluster_external_fence.c unit_test.h \
+		$(CLUSTER_EXTERNAL_FENCE_O) $(PGRAC_EXTERNAL_FENCE_PROTOCOL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_EXTERNAL_FENCE_O) \
+		$(PGRAC_EXTERNAL_FENCE_PROTOCOL_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-5.7 D5: test_cluster_ts links cluster_ts.o (pure TT resid encoders) +
@@ -551,6 +571,60 @@ test_cluster_recovery_duty: test_cluster_recovery_duty.c unit_test.h \
 test_cluster_formation_witness: test_cluster_formation_witness.c unit_test.h \
 		$(CLUSTER_RECOVERY_DUTY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RECOVERY_DUTY_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+test_pgrac_external_fence_protocol: \
+		test_pgrac_external_fence_protocol.c unit_test.h \
+		$(PGRAC_EXTERNAL_FENCE_PROTOCOL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(PGRAC_EXTERNAL_FENCE_PROTOCOL_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+PGRAC_FENCED_CONFIG_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_config.o
+test_pgrac_fenced_config: test_pgrac_fenced_config.c unit_test.h \
+		$(PGRAC_FENCED_CONFIG_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_CONFIG_O) -o $@
+
+PGRAC_FENCED_CORE_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_core.o
+test_pgrac_fenced_core: test_pgrac_fenced_core.c unit_test.h \
+		$(PGRAC_FENCED_CORE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_CORE_O) -o $@
+
+PGRAC_FENCED_JOURNAL_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal.o
+test_pgrac_fenced_journal: test_pgrac_fenced_journal.c unit_test.h \
+		$(PGRAC_FENCED_JOURNAL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_JOURNAL_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+PGRAC_FENCED_PROVIDER_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o
+test_pgrac_fenced_provider: test_pgrac_fenced_provider.c unit_test.h \
+		$(PGRAC_FENCED_PROVIDER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_PROVIDER_O) -o $@
+
+PGRAC_FENCED_CTL_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_ctl.o
+test_pgrac_fenced_ctl: test_pgrac_fenced_ctl.c unit_test.h \
+		$(PGRAC_FENCED_CTL_O) $(PGRAC_FENCED_JOURNAL_O) \
+		$(PGRAC_EXTERNAL_FENCE_PROTOCOL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_CTL_O) $(PGRAC_FENCED_JOURNAL_O) \
+		$(PGRAC_EXTERNAL_FENCE_PROTOCOL_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 

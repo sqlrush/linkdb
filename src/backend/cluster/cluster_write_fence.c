@@ -29,6 +29,8 @@
  */
 #include "postgres.h"
 
+#include <time.h>
+
 #ifdef USE_PGRAC_CLUSTER
 
 #include "miscadmin.h"	   /* CritSectionCount */
@@ -117,6 +119,18 @@ cluster_write_fence_shmem_init(void)
 		pg_atomic_init_u64(&cluster_write_fence_shmem->baseline_published, 0); /* D6 */
 		pg_atomic_init_u32(&cluster_write_fence_shmem->baseline_author_is_self, 0);
 		pg_atomic_init_u64(&cluster_write_fence_shmem->last_authority_refresh_us, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_admit_requested, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_write_excluded, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_rejected, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_unknown, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_unavailable, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_identity_mismatch, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_expired, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_daemon_disconnect, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_mutation_gate_blocked, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_publish_gate_blocked, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_last_journal_seq, 0);
+		pg_atomic_init_u64(&cluster_write_fence_shmem->external_last_verified_mono_ns, 0);
 		pg_atomic_init_u64(&cluster_write_fence_shmem->authority_cache_seq, 0);
 		pg_atomic_init_u32(&cluster_write_fence_shmem->authority_cache_valid, 0);
 		memset(&cluster_write_fence_shmem->authority_cache_marker, 0,
@@ -805,6 +819,104 @@ cluster_write_fence_note_baseline_published(bool is_leader, bool published)
 	pg_atomic_write_u32(&cluster_write_fence_shmem->baseline_author_is_self, is_leader ? 1 : 0);
 	if (published)
 		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->baseline_published, 1);
+}
+
+/* STOP-04 \u00a73.13.  External-fence observations are deliberately kept in
+ * the existing write-fence region.  Missing shmem is an L110-safe no-op and
+ * none of these diagnostics participates in an authority decision. */
+static void
+cluster_write_fence_atomic_max(pg_atomic_uint64 *value, uint64 candidate)
+{
+	uint64 old = pg_atomic_read_u64(value);
+
+	while (candidate > old &&
+		   !pg_atomic_compare_exchange_u64(value, &old, candidate))
+		;
+}
+
+void
+cluster_write_fence_note_external_admit_requested(void)
+{
+	if (cluster_write_fence_shmem != NULL)
+		pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->external_admit_requested, 1);
+}
+
+void
+cluster_write_fence_note_external_write_excluded(uint64 journal_seq,
+											 uint64 verified_mono_ns)
+{
+	if (cluster_write_fence_shmem == NULL)
+		return;
+	pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->external_write_excluded, 1);
+	cluster_write_fence_atomic_max(&cluster_write_fence_shmem->external_last_journal_seq,
+									journal_seq);
+	cluster_write_fence_atomic_max(
+		&cluster_write_fence_shmem->external_last_verified_mono_ns,
+		verified_mono_ns);
+}
+
+#define DEFINE_EXTERNAL_COUNTER_NOTE(name) \
+	void cluster_write_fence_note_external_##name(void) \
+	{ \
+		if (cluster_write_fence_shmem != NULL) \
+			pg_atomic_fetch_add_u64( \
+				&cluster_write_fence_shmem->external_##name, 1); \
+	}
+
+DEFINE_EXTERNAL_COUNTER_NOTE(rejected)
+DEFINE_EXTERNAL_COUNTER_NOTE(unknown)
+DEFINE_EXTERNAL_COUNTER_NOTE(unavailable)
+DEFINE_EXTERNAL_COUNTER_NOTE(identity_mismatch)
+DEFINE_EXTERNAL_COUNTER_NOTE(expired)
+DEFINE_EXTERNAL_COUNTER_NOTE(daemon_disconnect)
+DEFINE_EXTERNAL_COUNTER_NOTE(mutation_gate_blocked)
+DEFINE_EXTERNAL_COUNTER_NOTE(publish_gate_blocked)
+
+#undef DEFINE_EXTERNAL_COUNTER_NOTE
+
+#define DEFINE_EXTERNAL_COUNTER_GETTER(name) \
+	uint64 cluster_write_fence_get_external_##name(void) \
+	{ \
+		return cluster_write_fence_shmem == NULL ? 0 : \
+			pg_atomic_read_u64(&cluster_write_fence_shmem->external_##name); \
+	}
+
+DEFINE_EXTERNAL_COUNTER_GETTER(admit_requested)
+DEFINE_EXTERNAL_COUNTER_GETTER(write_excluded)
+DEFINE_EXTERNAL_COUNTER_GETTER(rejected)
+DEFINE_EXTERNAL_COUNTER_GETTER(unknown)
+DEFINE_EXTERNAL_COUNTER_GETTER(unavailable)
+DEFINE_EXTERNAL_COUNTER_GETTER(identity_mismatch)
+DEFINE_EXTERNAL_COUNTER_GETTER(expired)
+DEFINE_EXTERNAL_COUNTER_GETTER(daemon_disconnect)
+DEFINE_EXTERNAL_COUNTER_GETTER(mutation_gate_blocked)
+DEFINE_EXTERNAL_COUNTER_GETTER(publish_gate_blocked)
+DEFINE_EXTERNAL_COUNTER_GETTER(last_journal_seq)
+
+#undef DEFINE_EXTERNAL_COUNTER_GETTER
+
+bool
+cluster_write_fence_get_external_last_proof_age_ms(uint64 *age_ms)
+{
+	struct timespec now;
+	uint64 sample;
+	uint64 now_ns;
+
+	if (age_ms == NULL)
+		return false;
+	*age_ms = 0;
+	if (cluster_write_fence_shmem == NULL)
+		return false;
+	sample = pg_atomic_read_u64(
+		&cluster_write_fence_shmem->external_last_verified_mono_ns);
+	if (sample == 0 || clock_gettime(CLOCK_MONOTONIC, &now) != 0)
+		return false;
+	now_ns = (uint64) now.tv_sec * UINT64_C(1000000000) +
+		(uint64) now.tv_nsec;
+	if (now_ns < sample)
+		return false;
+	*age_ms = (now_ns - sample) / UINT64_C(1000000);
+	return true;
 }
 
 /*

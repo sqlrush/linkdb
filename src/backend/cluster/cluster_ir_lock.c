@@ -23,6 +23,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_guc.h" /* cluster_ges_request_timeout_ms */
+#include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -244,23 +245,152 @@ recovery_serial_release_guard_valid(const ClusterRecoverySerialGuard *guard)
 	return true;
 }
 
+static ClusterRecoverySerialReleaseResult recovery_serial_release_with_timeout(
+	ClusterRecoverySerialGuard *guard, int timeout_ms);
+
+static ClusterRecoverySerialAcquireResult
+recovery_serial_preflight(const ClusterRecoverySerialRequest *request)
+{
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult root_result;
+	PgracExternalFenceDenyReason reason;
+	uint32 required_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+		| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+
+	root_result = cluster_control_root_read_canonical(
+		request->duty.origin_thread_id, &request->duty,
+		CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
+	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+		root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE;
+	if (cluster_recovery_duty_key_compare(&snapshot.identity,
+										&request->duty) !=
+			CLUSTER_RECOVERY_DUTY_COMPARE_EXACT ||
+		snapshot.lifecycle !=
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
+		(snapshot.root_flags & required_flags) != required_flags ||
+		memcmp(&token, &request->expected_root_token, sizeof(token)) != 0)
+		return CLUSTER_RECOVERY_SERIAL_STALE;
+	if (cluster_formation_witness_revalidate_nowait(request->formation) !=
+		CLUSTER_FORMATION_WITNESS_READY)
+		return CLUSTER_RECOVERY_SERIAL_STALE;
+	if (!cluster_external_fence_need_set_revalidate_nowait(
+			request->fence_need_set, request->formation, &reason) ||
+		!cluster_external_fence_revalidate_set_nowait(
+			request->fence_admission_set, request->fence_need_set,
+			request->formation, &reason))
+		return CLUSTER_RECOVERY_SERIAL_FENCE_DENIED;
+	return CLUSTER_RECOVERY_SERIAL_GRANTED;
+}
+
 ClusterRecoverySerialAcquireResult
 cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 								ClusterRecoverySerialGuard *guard)
 {
+	ClusterRecoverySerialAcquireResult preflight;
+	ClusterLockAcquireRequest lock_request;
+	ClusterLockAcquireResult lock_result;
+	ClusterResId resid;
+	PgracExternalFenceDenyReason reason;
+	ClusterRecoverySerialRevalidateResult stale_result =
+		CLUSTER_RECOVERY_SERIAL_CURRENT;
+
 	if (guard == NULL)
 		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
 	memset(guard, 0, sizeof(*guard));
 	if (!recovery_serial_request_valid(request))
 		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+	preflight = recovery_serial_preflight(request);
+	if (preflight != CLUSTER_RECOVERY_SERIAL_GRANTED)
+	{
+		if (preflight == CLUSTER_RECOVERY_SERIAL_STALE ||
+			preflight == CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE ||
+			preflight == CLUSTER_RECOVERY_SERIAL_CAPABILITY_UNAVAILABLE)
+			IR_BUMP(capability_denied_count);
+		return preflight;
+	}
+	if (!cluster_recovery_serial_resid_encode(&request->duty, &resid))
+		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
 
-	/*
-	 * RF-ROOT P3 is installed before the external-fence provider/set phase.
-	 * Opaque non-NULL pointers are not affirmative evidence.  Keep the public
-	 * gate closed until that phase supplies its exact nowait validators; in
-	 * particular, do not issue GES or accept OK_NATIVE here.
-	 */
-	return CLUSTER_RECOVERY_SERIAL_FENCE_DENIED;
+	memset(&lock_request, 0, sizeof(lock_request));
+	lock_request.resid = resid;
+	lock_request.lockmode = ExclusiveLock;
+	lock_request.op = CLUSTER_LOCK_OP_REQUEST;
+	lock_request.current_mode = NoLock;
+	lock_request.lockmethod_id = DEFAULT_LOCKMETHOD;
+	lock_request.dontwait = true;
+	lock_request.sessionLock = false;
+	lock_request.recovery_bootstrap = true;
+	lock_request.caller_local_start_ts_ms =
+		(uint64)(GetCurrentTimestamp() / 1000);
+	lock_request.timeout_ms = Min(request->acquire_timeout_ms,
+								 ir_base_timeout_ms);
+	lock_request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
+	lock_result = cluster_lock_acquire_seven_step(&lock_request);
+
+	if (lock_result == CLUSTER_LOCK_ACQUIRE_NOT_AVAIL)
+	{
+		IR_BUMP(busy_count);
+		return CLUSTER_RECOVERY_SERIAL_BUSY;
+	}
+	if (lock_result == CLUSTER_LOCK_ACQUIRE_OK_NATIVE)
+	{
+		IR_BUMP(native_result_rejected_count);
+		IR_BUMP(retry_count);
+		return CLUSTER_RECOVERY_SERIAL_RETRY;
+	}
+	if (lock_result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
+		lock_result = cluster_lock_acquire_s5_promote(&lock_request);
+	if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED &&
+		lock_result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
+	{
+		IR_BUMP(retry_count);
+		return CLUSTER_RECOVERY_SERIAL_RETRY;
+	}
+
+	guard->held = true;
+	guard->release_uncertain = false;
+	guard->mode = request->mode;
+	guard->resid = resid;
+	guard->duty = request->duty;
+	guard->root_read_token = request->expected_root_token;
+	guard->formation = request->formation;
+	guard->fence_need_set = request->fence_need_set;
+	guard->fence_admission_set = request->fence_admission_set;
+	guard->lock_request = lock_request;
+	guard->release_timeout_ms = request->release_timeout_ms;
+
+	/* Post-grant checks are strictly no-wait: the authority holder must not
+	 * cross its first mutation gate on a proof that expired while IR was being
+	 * registered. */
+	if (cluster_formation_witness_revalidate_nowait(guard->formation) !=
+		CLUSTER_FORMATION_WITNESS_READY ||
+		!cluster_external_fence_need_set_revalidate_nowait(
+			guard->fence_need_set, guard->formation, &reason))
+		stale_result = CLUSTER_RECOVERY_SERIAL_MEMBERSHIP_STALE;
+	else if (!cluster_external_fence_revalidate_set_nowait(
+				 guard->fence_admission_set, guard->fence_need_set,
+				 guard->formation, &reason))
+		stale_result = CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+	if (stale_result != CLUSTER_RECOVERY_SERIAL_CURRENT)
+	{
+		ClusterRecoverySerialReleaseResult release_result =
+			recovery_serial_release_with_timeout(
+				guard, guard->release_timeout_ms);
+
+		IR_BUMP(revalidate_reject_count);
+		if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+			return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
+		memset(guard, 0, sizeof(*guard));
+		return stale_result == CLUSTER_RECOVERY_SERIAL_MEMBERSHIP_STALE
+			? CLUSTER_RECOVERY_SERIAL_STALE
+			: CLUSTER_RECOVERY_SERIAL_FENCE_DENIED;
+	}
+	IR_BUMP(grant_count);
+	return CLUSTER_RECOVERY_SERIAL_GRANTED;
 }
 
 ClusterRecoverySerialRevalidateResult
@@ -277,9 +407,24 @@ cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
 		return CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
 	}
 
-	/* Positive set/provider freshness is owned by the following fence phase. */
-	IR_BUMP(revalidate_reject_count);
-	return CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+	if (cluster_formation_witness_revalidate_nowait(guard->formation) !=
+		CLUSTER_FORMATION_WITNESS_READY ||
+		!cluster_external_fence_need_set_revalidate_nowait(
+			guard->fence_need_set, guard->formation,
+			&(PgracExternalFenceDenyReason){ PGRAC_EXTERNAL_FENCE_DENY_NONE }))
+	{
+		IR_BUMP(revalidate_reject_count);
+		return CLUSTER_RECOVERY_SERIAL_MEMBERSHIP_STALE;
+	}
+	if (!cluster_external_fence_revalidate_set_nowait(
+			guard->fence_admission_set, guard->fence_need_set,
+			guard->formation,
+			&(PgracExternalFenceDenyReason){ PGRAC_EXTERNAL_FENCE_DENY_NONE }))
+	{
+		IR_BUMP(revalidate_reject_count);
+		return CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
+	}
+	return CLUSTER_RECOVERY_SERIAL_CURRENT;
 }
 
 ClusterRecoverySerialAcquireResult

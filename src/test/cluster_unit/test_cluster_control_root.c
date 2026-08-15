@@ -509,7 +509,8 @@ UT_TEST(test_abi_identity_and_features)
 {
 	ClusterControlRootIdentity left;
 	ClusterControlRootIdentity right;
-	uint64 known = PGRAC_CONTROL_ROOT_FEATURE_WAL_REUSE_V1
+	uint64 known = (UINT64_C(1) << 0)
+				   | PGRAC_CONTROL_ROOT_FEATURE_WAL_REUSE_V1
 				   | PGRAC_CONTROL_ROOT_FEATURE_PAGE_STABLE_BASE_V1
 				   | PGRAC_CONTROL_ROOT_FEATURE_SPACE_METADATA_V1
 				   | PGRAC_CONTROL_ROOT_FEATURE_CONSERVATIVE_COMMIT_SCN_V1
@@ -521,6 +522,15 @@ UT_TEST(test_abi_identity_and_features)
 	UT_ASSERT_EQ(CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1, UINT64_C(0x0d));
 	UT_ASSERT_EQ(CLUSTER_CONTROL_ROOT_FLAGS_V1, UINT32_C(0x1fd));
 	UT_ASSERT_EQ(CLUSTER_CONTROL_ROOT_PATCH_ALL_V1, UINT64_C(0xfb));
+	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1,
+				 UINT64_C(0x00400000));
+	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1,
+				 UINT64_C(0x00800000));
+	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1,
+				 UINT64_C(0x01000000));
+	UT_ASSERT_EQ(PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1,
+				 UINT64_C(0x01ee0001));
+	UT_ASSERT_EQ(known, PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1);
 	fill_identity(&left);
 	right = left;
 	UT_ASSERT(cluster_control_root_identity_equal(&left, &right));
@@ -539,6 +549,24 @@ UT_TEST(test_invalid_argument_precedes_authority_io)
 	wipe_root_files();
 	build_migration(&image, &round);
 	round.reserved76 = 1;
+	memset(&token, 0xee, sizeof(token));
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &token),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	UT_ASSERT_EQ(token.file_txn_seq, 0);
+}
+
+UT_TEST(test_external_fence_bit24_activation_is_forbidden_without_provider)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken token;
+
+	wipe_root_files();
+	build_migration(&image, &round);
+	round.target_feature_bitmap |=
+		PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1 |
+		PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1;
 	memset(&token, 0xee, sizeof(token));
 	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &token),
 				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
@@ -1019,9 +1047,10 @@ main(void)
 {
 	setup_fixture();
 
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
+	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
 	UT_RUN(test_create_and_read_primary);
 	UT_RUN(test_bootstrap_read_never_returns_authority_token);
 	UT_RUN(test_valid_bak_blocks_corrupt_primary);

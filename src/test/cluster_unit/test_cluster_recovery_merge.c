@@ -492,11 +492,59 @@ UT_TEST(test_claim_classify_rejections)
 	}
 }
 
+/* RF-ROOT P4 S04-11: the cold fence plan has one authoritative bitmap
+ * producer.  The proof-origin set is exactly replay minus own, and the
+ * strictly ascending origin vector names every foreign bit once. */
+UT_TEST(test_external_fence_plan_shape_exact)
+{
+	uint64 replay[2] = {0, 0};
+	uint64 foreign[2] = {0, 0};
+	uint16 origins[2] = {2, 65};
+
+	replay[0] = UINT64_C(1) << 0; /* own thread 1 */
+	replay[0] |= UINT64_C(1) << 1; /* foreign thread 2 */
+	replay[1] = UINT64_C(1) << 0; /* foreign thread 65 */
+	foreign[0] = UINT64_C(1) << 1;
+	foreign[1] = UINT64_C(1) << 0;
+	UT_ASSERT(cluster_recovery_fence_plan_shape_valid(
+		1, replay, foreign, origins, 2));
+
+	/* A missing proof-origin bit, duplicate/out-of-order vector entry, or
+	 * replay set without own is never a partial success. */
+	foreign[1] = 0;
+	UT_ASSERT(!cluster_recovery_fence_plan_shape_valid(
+		1, replay, foreign, origins, 2));
+	foreign[1] = UINT64_C(1) << 0;
+	origins[1] = 2;
+	UT_ASSERT(!cluster_recovery_fence_plan_shape_valid(
+		1, replay, foreign, origins, 2));
+	origins[1] = 65;
+	replay[0] &= ~(UINT64_C(1) << 0);
+	UT_ASSERT(!cluster_recovery_fence_plan_shape_valid(
+		1, replay, foreign, origins, 2));
+}
+
+UT_TEST(test_external_fence_plan_native_and_restore_gate)
+{
+	uint64 bitmap[2] = {UINT64_C(1) << 2, 0}; /* own thread 3 only */
+	uint16 foreign_thread = 0;
+
+	UT_ASSERT(cluster_recovery_fence_plan_shape_valid(
+		3, bitmap, (uint64[2]){0, 0}, NULL, 0));
+	UT_ASSERT(!cluster_recovery_restore_has_foreign(bitmap, 3));
+	bitmap[0] |= UINT64_C(1) << 6;
+	UT_ASSERT(cluster_recovery_restore_has_foreign(bitmap, 3));
+	UT_ASSERT(cluster_recovery_restore_first_foreign(
+		bitmap, 3, &foreign_thread));
+	UT_ASSERT_EQ(foreign_thread, 7);
+	UT_ASSERT(cluster_recovery_restore_has_foreign(bitmap, 0));
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(28);
+	UT_PLAN(30);
 
 	UT_RUN(test_heap_scn_order);
 	UT_RUN(test_heap_scn_tie_lsn);
@@ -526,6 +574,8 @@ main(int argc, char **argv)
 	UT_RUN(test_streaming_heartbeat_equal_scn_uses_closed_frontier);
 	UT_RUN(test_claim_build_classify_round_trip);
 	UT_RUN(test_claim_classify_rejections);
+	UT_RUN(test_external_fence_plan_shape_exact);
+	UT_RUN(test_external_fence_plan_native_and_restore_gate);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

@@ -37,8 +37,10 @@
 #include "postgres.h"
 
 #include "utils/guc.h"
+#include "libpq/pqcomm.h"
 
 #include "cluster/cluster_block_recovery.h"		 /* spec-4.10 D1 online block recovery GUCs */
+#include "cluster/cluster_external_fence.h"	 /* STOP-04 external fence GUC defaults */
 #include "cluster/cluster_thread_recovery.h"	 /* spec-4.11 D1 online thread recovery GUCs */
 #include "cluster/cluster_write_fence.h"		 /* spec-4.12 D7 write-fence enforcement GUCs */
 #include "cluster/cluster_conf.h"				 /* cluster_conf_has_peers (spec-3.18 D2b latch) */
@@ -856,6 +858,12 @@ static const struct config_enum_entry cluster_thread_recovery_on_unrecoverable_o
 int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
 int cluster_write_fence_lease_ms = 6000;
 
+/* STOP-04 §3.11: the socket endpoint is postmaster-frozen while the overall
+ * acquisition deadline is sampled once per recovery attempt and may reload. */
+char *cluster_external_fence_socket_path = NULL;
+int cluster_external_fence_acquire_timeout_ms =
+	PGRAC_EXTERNAL_FENCE_ACQUIRE_TIMEOUT_DEFAULT_MS;
+
 /* spec-4.12b D4: cooperative write-fence enforcement now ships default ON.  The
  * spec-4.12b baseline-marker subsystem (D2) keeps a healthy steady-state cluster's
  * durable authority marker fresh, so the D5 hot gate no longer fails every write
@@ -1074,6 +1082,49 @@ check_cluster_block_device_path(char **newval, void **extra, GucSource source)
 {
 	if (*newval != NULL && (*newval)[0] != '\0' && !is_absolute_path(*newval)) {
 		GUC_check_errdetail("cluster.block_device_path must be an absolute path.");
+		return false;
+	}
+	return true;
+}
+
+static bool
+external_fence_path_has_parent_component(const char *path)
+{
+	const char *component = path;
+
+	while (*component != '\0') {
+		const char *end;
+
+		while (*component == '/')
+			component++;
+		end = component;
+		while (*end != '\0' && *end != '/')
+			end++;
+		if (end - component == 2 && component[0] == '.' && component[1] == '.')
+			return true;
+		component = end;
+	}
+	return false;
+}
+
+static bool
+check_cluster_external_fence_socket_path(char **newval, void **extra,
+										 GucSource source)
+{
+	if (*newval == NULL || (*newval)[0] == '\0' ||
+		!is_absolute_path(*newval)) {
+		GUC_check_errdetail(
+			"cluster.external_fence_socket_path must be a nonempty absolute path.");
+		return false;
+	}
+	if (external_fence_path_has_parent_component(*newval)) {
+		GUC_check_errdetail(
+			"cluster.external_fence_socket_path must not contain a '..' path component.");
+		return false;
+	}
+	if (strlen(*newval) >= UNIXSOCK_PATH_BUFLEN) {
+		GUC_check_errdetail(
+			"cluster.external_fence_socket_path is too long for a Unix-domain socket.");
 		return false;
 	}
 	return true;
@@ -1993,6 +2044,24 @@ cluster_init_guc(void)
 					 "local write-fence token expires and shared-storage writes fail closed."),
 		&cluster_write_fence_lease_ms, 6000, 1000, 600000, PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL,
 		NULL);
+
+	DefineCustomStringVariable(
+		"cluster.external_fence_socket_path",
+		gettext_noop("External write-exclusion daemon socket path."),
+		gettext_noop("Absolute Unix-domain socket path for the configured root fencing "
+					 "provider.  Parent path components are forbidden."),
+		&cluster_external_fence_socket_path,
+		"/var/run/pgrac/pgrac-fenced.sock", PGC_POSTMASTER, 0,
+		check_cluster_external_fence_socket_path, NULL, NULL);
+
+	DefineCustomIntVariable(
+		"cluster.external_fence_acquire_timeout_ms",
+		gettext_noop("Overall external write-exclusion acquisition deadline (milliseconds)."),
+		gettext_noop("One recovery attempt snapshots this deadline and shares it across all "
+					 "required victim admissions."),
+		&cluster_external_fence_acquire_timeout_ms,
+		PGRAC_EXTERNAL_FENCE_ACQUIRE_TIMEOUT_DEFAULT_MS, 1, 600000,
+		PGC_SIGHUP, GUC_UNIT_MS, NULL, NULL, NULL);
 
 	/*
 	 * cluster.shared_data_dir -- shared data root for the cluster_fs

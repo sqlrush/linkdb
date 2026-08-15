@@ -988,6 +988,7 @@ Section: Class 58 - System Error (pgrac extension)
 58R14    E    ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT                             cluster_storage_io_alignment
 58R15    E    ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE                        cluster_storage_fence_unavailable
 58R16    E    ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR                             cluster_ic_rdma_fabric_error
+58R17    E    ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE                        cluster_external_fence_unavailable
 
 Section: Class 72 - Snapshot Failure
 # (class borrowed from Oracle)

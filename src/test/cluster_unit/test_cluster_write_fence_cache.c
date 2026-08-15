@@ -372,16 +372,59 @@ UT_TEST(test_epoch_mutation_invalidates_cache_before_change)
 				 CLUSTER_FENCE_CACHE_INVALID);
 }
 
+UT_TEST(test_external_fence_counters_are_exact_and_restart_empty)
+{
+	struct timespec now;
+	uint64 age_ms = UINT64_MAX;
+	uint64 sample;
+
+	attach_cache();
+	UT_ASSERT_EQ(cluster_write_fence_get_external_admit_requested(), 0);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_write_excluded(), 0);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_last_journal_seq(), 0);
+	UT_ASSERT(!cluster_write_fence_get_external_last_proof_age_ms(&age_ms));
+	UT_ASSERT_EQ(age_ms, 0);
+
+	cluster_write_fence_note_external_admit_requested();
+	cluster_write_fence_note_external_rejected();
+	cluster_write_fence_note_external_unknown();
+	cluster_write_fence_note_external_unavailable();
+	cluster_write_fence_note_external_identity_mismatch();
+	cluster_write_fence_note_external_expired();
+	cluster_write_fence_note_external_daemon_disconnect();
+	cluster_write_fence_note_external_mutation_gate_blocked();
+	cluster_write_fence_note_external_publish_gate_blocked();
+	UT_ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &now), 0);
+	sample = (uint64) now.tv_sec * UINT64_C(1000000000) +
+		(uint64) now.tv_nsec;
+	cluster_write_fence_note_external_write_excluded(41, sample);
+	cluster_write_fence_note_external_write_excluded(40, sample - 1);
+
+	UT_ASSERT_EQ(cluster_write_fence_get_external_admit_requested(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_write_excluded(), 2);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_rejected(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_unknown(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_unavailable(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_identity_mismatch(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_expired(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_daemon_disconnect(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_mutation_gate_blocked(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_publish_gate_blocked(), 1);
+	UT_ASSERT_EQ(cluster_write_fence_get_external_last_journal_seq(), 41);
+	UT_ASSERT(cluster_write_fence_get_external_last_proof_age_ms(&age_ms));
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_cache_publish_revalidate_and_invalidate);
 	UT_RUN(test_invalidate_waits_out_preexisting_publisher);
 	UT_RUN(test_invalidation_rejects_late_prechange_proof);
 	UT_RUN(test_mutation_guard_keeps_cache_unavailable_until_change_finishes);
 	UT_RUN(test_membership_mutation_invalidates_cache_before_change);
 	UT_RUN(test_epoch_mutation_invalidates_cache_before_change);
+	UT_RUN(test_external_fence_counters_are_exact_and_restart_empty);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -140,6 +140,7 @@ sub mkvcbuild
 	  config_info.c controldata_utils.c d2s.c encnames.c exec.c
 	  f2s.c file_perm.c file_utils.c hashfn.c ip.c jsonapi.c
 	  keywords.c kwlookup.c link-canary.c md5_common.c percentrepl.c
+	  pgrac_external_fence_protocol.c
 	  pg_get_line.c pg_lzcompress.c pg_prng.c pgfnames.c psprintf.c relpath.c
 	  rmtree.c saslprep.c scram-common.c string.c stringinfo.c unicode_norm.c
 	  username.c wait_error.c wchar.c);

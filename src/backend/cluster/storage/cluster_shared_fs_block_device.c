@@ -92,6 +92,8 @@ static ClusterSharedFsCaps cluster_shared_fs_block_device_caps = {
 	.max_nodes = CLUSTER_MAX_NODES,
 };
 
+static char cluster_raw_protected_storage_uuid[CLUSTER_SHARED_UUID_LEN];
+
 typedef struct ClusterRawSuperblock {
 	uint32 magic;
 	uint32 layout_version;
@@ -1479,6 +1481,32 @@ cluster_shared_fs_block_device_init(void)
 						 "SCSI-3 PR-capable device is installed.")));
 
 	raw_ensure_layout();
+	{
+		ClusterRawSuperblock super;
+		bool valid;
+		bool all_zero;
+		bool exact = true;
+		int i;
+
+		memset(cluster_raw_protected_storage_uuid, 0,
+			   sizeof(cluster_raw_protected_storage_uuid));
+		raw_load_super(&super, &valid, &all_zero);
+		if (!valid || all_zero || super.storage_uuid[32] != '\0' ||
+			cluster_shared_storage_uuid == NULL ||
+			strlen(cluster_shared_storage_uuid) != 32)
+			exact = false;
+		for (i = 0; exact && i < 32; i++)
+		{
+			unsigned char ch = (unsigned char) super.storage_uuid[i];
+
+			if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) ||
+				ch != (unsigned char) cluster_shared_storage_uuid[i])
+				exact = false;
+		}
+		if (exact)
+			memcpy(cluster_raw_protected_storage_uuid, super.storage_uuid,
+				   sizeof(cluster_raw_protected_storage_uuid));
+	}
 	elog(LOG, "cluster_shared_fs: raw block_device backend attached to \"%s\"",
 		 cluster_block_device_path);
 }
@@ -1492,6 +1520,21 @@ cluster_shared_fs_block_device_shutdown(void)
 	}
 	cluster_raw_fence_capability = CLUSTER_FENCE_CAP_NONE;
 	cluster_shared_fs_block_device_caps.supports_scsi3_pr = false;
+	memset(cluster_raw_protected_storage_uuid, 0,
+		   sizeof(cluster_raw_protected_storage_uuid));
+}
+
+bool
+cluster_shared_fs_block_device_get_storage_uuid(char *out, size_t outlen)
+{
+	if (out == NULL || outlen < CLUSTER_SHARED_UUID_LEN)
+		return false;
+	out[0] = '\0';
+	if (cluster_raw_protected_storage_uuid[0] == '\0')
+		return false;
+	memcpy(out, cluster_raw_protected_storage_uuid,
+		   sizeof(cluster_raw_protected_storage_uuid));
+	return true;
 }
 
 static int

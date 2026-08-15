@@ -47,6 +47,7 @@
 #include "postgres.h"
 
 #include <stdarg.h>
+#include <sys/un.h>
 
 #include "cluster/cluster_conf.h" /* ClusterConf type for the D2b latch stub */
 #include "cluster/cluster_guc.h"
@@ -91,6 +92,17 @@ static int undo_buffers_min_value = -1;
 static int undo_buffers_max_value = -1;
 static GucContext undo_buffers_context = PGC_INTERNAL;
 static const char *undo_buffers_long_desc = NULL;
+static int *external_fence_timeout_value_addr = NULL;
+static int external_fence_timeout_boot_value = -1;
+static int external_fence_timeout_min_value = -1;
+static int external_fence_timeout_max_value = -1;
+static GucContext external_fence_timeout_context = PGC_INTERNAL;
+static int external_fence_timeout_flags = 0;
+static char **external_fence_socket_value_addr = NULL;
+static const char *external_fence_socket_boot_value = NULL;
+static GucContext external_fence_socket_context = PGC_INTERNAL;
+static int external_fence_socket_flags = 0;
+static GucStringCheckHook external_fence_socket_check_hook = NULL;
 
 void
 DefineCustomIntVariable(const char *name,
@@ -111,6 +123,14 @@ DefineCustomIntVariable(const char *name,
 		undo_buffers_max_value = maxValue;
 		undo_buffers_context = context;
 		undo_buffers_long_desc = long_desc;
+	}
+	else if (strcmp(name, "cluster.external_fence_acquire_timeout_ms") == 0) {
+		external_fence_timeout_value_addr = valueAddr;
+		external_fence_timeout_boot_value = bootValue;
+		external_fence_timeout_min_value = minValue;
+		external_fence_timeout_max_value = maxValue;
+		external_fence_timeout_context = context;
+		external_fence_timeout_flags = flags;
 	}
 }
 
@@ -145,14 +165,20 @@ DefineCustomRealVariable(
 
 void
 DefineCustomStringVariable(
-	const char *name pg_attribute_unused(), const char *short_desc pg_attribute_unused(),
+	const char *name, const char *short_desc pg_attribute_unused(),
 	const char *long_desc pg_attribute_unused(), char **valueAddr pg_attribute_unused(),
-	const char *bootValue pg_attribute_unused(), GucContext context pg_attribute_unused(),
-	int flags pg_attribute_unused(), GucStringCheckHook check_hook pg_attribute_unused(),
+	const char *bootValue, GucContext context,
+	int flags, GucStringCheckHook check_hook,
 	GucStringAssignHook assign_hook pg_attribute_unused(),
 	GucShowHook show_hook pg_attribute_unused())
 {
-	/* Stub for unit-test linking; real impl lives in PG backend. */
+	if (strcmp(name, "cluster.external_fence_socket_path") == 0) {
+		external_fence_socket_value_addr = valueAddr;
+		external_fence_socket_boot_value = bootValue;
+		external_fence_socket_context = context;
+		external_fence_socket_flags = flags;
+		external_fence_socket_check_hook = check_hook;
+	}
 }
 
 static GucBoolCheckHook smart_fusion_check_hook = NULL;
@@ -456,10 +482,58 @@ UT_TEST(test_smart_fusion_guc_is_guarded_failclosed)
 }
 
 
+UT_TEST(test_external_fence_guc_contract)
+{
+	char *valid = "/var/run/pgrac/pgrac-fenced.sock";
+	char *relative = "pgrac-fenced.sock";
+	char *parent_component = "/var/run/../pgrac-fenced.sock";
+	char *dotdot_name = "/var/run/pgrac/..hidden.sock";
+	char too_long[sizeof(((struct sockaddr_un *)0)->sun_path) + 2];
+	char *too_long_ptr = too_long;
+	void *extra = NULL;
+
+	external_fence_timeout_value_addr = NULL;
+	external_fence_socket_value_addr = NULL;
+	external_fence_socket_check_hook = NULL;
+	cluster_init_guc();
+
+	UT_ASSERT_EQ(external_fence_timeout_value_addr ==
+				 &cluster_external_fence_acquire_timeout_ms, true);
+	UT_ASSERT_EQ(cluster_external_fence_acquire_timeout_ms, 120000);
+	UT_ASSERT_EQ(external_fence_timeout_boot_value, 120000);
+	UT_ASSERT_EQ(external_fence_timeout_min_value, 1);
+	UT_ASSERT_EQ(external_fence_timeout_max_value, 600000);
+	UT_ASSERT_EQ(external_fence_timeout_context, PGC_SIGHUP);
+	UT_ASSERT_EQ(external_fence_timeout_flags, GUC_UNIT_MS);
+
+	UT_ASSERT_EQ(external_fence_socket_value_addr ==
+				 &cluster_external_fence_socket_path, true);
+	UT_ASSERT_STR_EQ(external_fence_socket_boot_value,
+				 "/var/run/pgrac/pgrac-fenced.sock");
+	UT_ASSERT_EQ(external_fence_socket_context, PGC_POSTMASTER);
+	UT_ASSERT_EQ(external_fence_socket_flags, 0);
+	UT_ASSERT_NOT_NULL(external_fence_socket_check_hook);
+	if (external_fence_socket_check_hook != NULL) {
+		UT_ASSERT(external_fence_socket_check_hook(&valid, &extra, PGC_S_TEST));
+		UT_ASSERT(!external_fence_socket_check_hook(&relative, &extra, PGC_S_TEST));
+		UT_ASSERT(!external_fence_socket_check_hook(&parent_component, &extra,
+											 PGC_S_TEST));
+		UT_ASSERT(external_fence_socket_check_hook(&dotdot_name, &extra,
+										 PGC_S_TEST));
+
+		memset(too_long, 'a', sizeof(too_long));
+		too_long[0] = '/';
+		too_long[sizeof(too_long) - 1] = '\0';
+		UT_ASSERT(!external_fence_socket_check_hook(&too_long_ptr, &extra,
+											 PGC_S_TEST));
+	}
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_cluster_node_id_default_is_minus_one);
 	UT_RUN(test_cluster_node_id_address_stable);
 	UT_RUN(test_cluster_init_guc_symbol_is_linkable);
@@ -467,6 +541,7 @@ main(void)
 	UT_RUN(test_cluster_adg_guc_defaults);
 	UT_RUN(test_undo_buffers_guc_describes_both_r4a_banks_and_inactive_zero);
 	UT_RUN(test_smart_fusion_guc_is_guarded_failclosed);
+	UT_RUN(test_external_fence_guc_contract);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

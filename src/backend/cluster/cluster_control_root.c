@@ -22,7 +22,6 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_guc.h"
-#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_shared_fs.h"
@@ -192,16 +191,7 @@ cluster_control_root_identity_equal(const ClusterControlRootIdentity *left,
 bool
 cluster_control_root_feature_bitmap_is_known(uint64 active_feature_bitmap)
 {
-	const uint64 known = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-		| PGRAC_CONTROL_ROOT_FEATURE_WAL_REUSE_V1
-		| PGRAC_CONTROL_ROOT_FEATURE_PAGE_STABLE_BASE_V1
-		| PGRAC_CONTROL_ROOT_FEATURE_SPACE_METADATA_V1
-		| PGRAC_CONTROL_ROOT_FEATURE_CONSERVATIVE_COMMIT_SCN_V1
-		| PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1
-		| PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1
-		| PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1;
-
-	return (active_feature_bitmap & ~known) == 0;
+	return (active_feature_bitmap & ~PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1) == 0;
 }
 
 static bool
@@ -934,6 +924,10 @@ encode_round(const ClusterControlRootMigrationRoundV1 *round, uint8 bytes[80])
 		|| round->reserved76 != 0
 		|| !cluster_control_root_feature_bitmap_is_known(round->source_feature_bitmap)
 		|| !cluster_control_root_feature_bitmap_is_known(round->target_feature_bitmap)
+		/* STOP04 §11.7: this package has no selected/certified production
+		 * provider, so a migration image must not activate bit24. */
+		|| (round->target_feature_bitmap &
+			PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1) != 0
 		|| (round->target_feature_bitmap
 			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0)
 		return false;

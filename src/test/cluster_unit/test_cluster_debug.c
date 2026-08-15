@@ -81,6 +81,30 @@ static int captured_formatted_value_count;
 static int captured_undo_observation_ensure_calls;
 static int captured_pi_retire_accessor_calls;
 
+/* Link-only startup/config stubs.  cluster_startup_phase.o is part of this
+ * standalone binary, while the owning GUC/LMS/qvotec objects are not. */
+bool cluster_controlfile_shared_authority = false;
+bool cluster_lms_enabled = false;
+char *cluster_wal_threads_dir = NULL;
+
+bool
+cluster_lms_is_ready(void)
+{
+	return false;
+}
+
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return false;
+}
+
+uint64
+cluster_multixact_current_stats_get(int stat pg_attribute_unused())
+{
+	return 0;
+}
+
 
 /* ----------
  * Stubs needed to link cluster_debug.o standalone.  cluster_debug.c
@@ -425,7 +449,7 @@ cluster_xid_prehistory_was_adopted(void)
 	return false;
 }
 
-/* spec-4.12 D7 + spec-4.12b D6 stubs: dump_write_fence (cluster_debug.o) reads 8
+/* spec-4.12 D7 + STOP-04 stubs: dump_write_fence (cluster_debug.o) reads 20
  * counters now, and cluster_startup_phase.o (linked here) references the rejoin
  * self-fence gate.  cluster_write_fence.o is not linked -- provide stubs returning
  * 0 / false. */
@@ -437,6 +461,18 @@ uint64 cluster_write_fence_get_baseline_stale_rejected(void);
 uint64 cluster_write_fence_get_baseline_published(void);
 bool cluster_write_fence_get_baseline_author_is_self(void);
 uint64 cluster_write_fence_get_baseline_authority_age_us(void);
+uint64 cluster_write_fence_get_external_admit_requested(void);
+uint64 cluster_write_fence_get_external_write_excluded(void);
+uint64 cluster_write_fence_get_external_rejected(void);
+uint64 cluster_write_fence_get_external_unknown(void);
+uint64 cluster_write_fence_get_external_unavailable(void);
+uint64 cluster_write_fence_get_external_identity_mismatch(void);
+uint64 cluster_write_fence_get_external_expired(void);
+uint64 cluster_write_fence_get_external_daemon_disconnect(void);
+uint64 cluster_write_fence_get_external_mutation_gate_blocked(void);
+uint64 cluster_write_fence_get_external_publish_gate_blocked(void);
+uint64 cluster_write_fence_get_external_last_journal_seq(void);
+bool cluster_write_fence_get_external_last_proof_age_ms(uint64 *age_ms);
 bool cluster_write_fence_startup_self_check(void);
 /* spec-5.51 dump_cr_pool stubs: cluster_debug.c's dump_cr_pool reads the CR pool
  * counters, but this standalone binary does not link cluster_cr_pool.o. */
@@ -869,6 +905,30 @@ uint64
 cluster_write_fence_get_baseline_authority_age_us(void)
 {
 	return 0;
+}
+#define DEFINE_EXTERNAL_FENCE_COUNTER_STUB(name) \
+	uint64 cluster_write_fence_get_external_##name(void) \
+	{ \
+		return 0; \
+	}
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(admit_requested)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(write_excluded)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(rejected)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(unknown)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(unavailable)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(identity_mismatch)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(expired)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(daemon_disconnect)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(mutation_gate_blocked)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(publish_gate_blocked)
+DEFINE_EXTERNAL_FENCE_COUNTER_STUB(last_journal_seq)
+#undef DEFINE_EXTERNAL_FENCE_COUNTER_STUB
+bool
+cluster_write_fence_get_external_last_proof_age_ms(uint64 *age_ms)
+{
+	if (age_ms != NULL)
+		*age_ms = 0;
+	return false;
 }
 bool
 cluster_write_fence_startup_self_check(void)
@@ -4455,6 +4515,20 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 		"segment_allocated_high_water",
 		"segment_effective_cap",
 	};
+	static const char *const write_fence_external_keys[] = {
+		"external_admit_requested",
+		"external_write_excluded",
+		"external_rejected",
+		"external_unknown",
+		"external_unavailable",
+		"external_identity_mismatch",
+		"external_expired",
+		"external_daemon_disconnect",
+		"external_mutation_gate_blocked",
+		"external_publish_gate_blocked",
+		"external_last_journal_seq",
+		"external_last_proof_age_ms",
+	};
 	static const char *const o1_keys[] = {
 		"remote_install_observed_count",
 		"remote_grant_after_image_count",
@@ -4493,6 +4567,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
 	UT_ASSERT_EQ(captured_dump_count("lmon", NULL), 12);
 	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 121);
+	UT_ASSERT_EQ(captured_dump_count("write_fence", NULL), 20);
 	for (i = 0; i < (int)lengthof(pcm_keys); i++)
 		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_keys[i]), 1);
 	for (i = 0; i < (int)lengthof(lmd_keys); i++)
@@ -4532,6 +4607,13 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[2]), "52");
 	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[3]), "53");
 	UT_ASSERT_EQ(captured_undo_observation_ensure_calls, 1);
+	for (i = 0; i < (int)lengthof(write_fence_external_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("write_fence",
+										write_fence_external_keys[i]), 1);
+	UT_ASSERT_STR_EQ(captured_dump_value("write_fence",
+									 "external_last_journal_seq"), "0");
+	UT_ASSERT_STR_EQ(captured_dump_value("write_fence",
+									 "external_last_proof_age_ms"), "-");
 
 	old_alias_value = captured_dump_value("gcs", "pi_watermark_retire_count");
 	new_alias_value = captured_dump_value("gcs", "pi_master_metadata_retire_count");

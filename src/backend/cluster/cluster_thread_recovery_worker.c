@@ -57,6 +57,7 @@
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_conf.h"			   /* node_count / has_peers / CLUSTER_MAX_NODES */
+#include "cluster/cluster_external_fence.h"   /* STOP04 NeedSet/AdmissionSet */
 #include "cluster/cluster_grd.h"			   /* live recovery episode epoch (L235)        */
 #include "cluster/cluster_guc.h"			   /* cluster_online_thread_recovery (scope)    */
 #include "cluster/cluster_ir.h"				   /* spec-5.7 D8 — IR(X) recovery-owner gate    */
@@ -74,11 +75,28 @@ static ClusterThreadRecResult
 thread_recovery_worker_run(
 	const ClusterThreadRecLaunchEligibility *eligibility)
 {
+	ClusterFormationWitnessV1 *formation = NULL;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	PgracExternalFenceAdmissionSetV1 *admissions = NULL;
+	ClusterControlRootSnapshot root_snapshot;
+	ClusterControlRootReadToken root_token;
+	ClusterRecoverySerialRequest serial_request;
+	ClusterRecoverySerialGuard serial_guard;
+	PgracExternalFenceDenyReason deny_reason;
+	ClusterFormationWitnessResult formation_result;
+	PgracExternalFenceNeedSetResult need_result;
+	PgracExternalFenceVerdict fence_verdict;
+	ClusterRecoverySerialAcquireResult serial_result;
+	ClusterRecoverySerialReleaseResult release_result;
+	ClusterControlRootResult root_result;
+	ClusterThreadRecResult result;
 	ClusterThreadRecReplayState state;
 	uint64 launch_epoch;
 	uint16 dead_tid;
 	bool slot_read;
+	int fence_timeout_ms;
 
+	fence_timeout_ms = cluster_external_fence_acquire_timeout_ms;
 	if (eligibility == NULL)
 		return CLUSTER_THREADREC_DEFERRED;
 	dead_tid = eligibility->origin_thread;
@@ -98,11 +116,125 @@ thread_recovery_worker_run(
 													cluster_grd_redeclare_episode_epoch()))
 		return CLUSTER_THREADREC_NOT_APPLICABLE;
 
-	/* RF-ROOT P3 precedes the P4 NeedSet/AdmissionSet producer in the binding
-	 * implementation order.  The old {dead_node,episode_epoch} IR gate is
-	 * removed; until P4 can rebuild and fresh-revalidate the full duty evidence,
-	 * this strong seam is deliberately nonaffirmative: no GES, replay or publish. */
-	return CLUSTER_THREADREC_DEFERRED;
+	/* All waitable evidence is obtained before IR.  The current provider-0
+	 * package deterministically stops at NeedSet/admit with BLOCKED and performs
+	 * zero GES/replay/publish; a future certified provider uses this same order. */
+	formation_result = cluster_formation_witness_build_wait(
+		dead_tid, false, fence_timeout_ms,
+		&formation);
+	if (formation_result != CLUSTER_FORMATION_WITNESS_READY)
+		return formation_result == CLUSTER_FORMATION_WITNESS_UNSTABLE ||
+			formation_result == CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN ||
+			formation_result == CLUSTER_FORMATION_WITNESS_IO_FAILED
+				? CLUSTER_THREADREC_DEFERRED : CLUSTER_THREADREC_BLOCKED;
+
+	need_result = cluster_external_fence_need_set_build(
+		&eligibility->duty, formation, &needs);
+	if (need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK)
+	{
+		cluster_formation_witness_destroy(&formation);
+		return need_result == PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE ||
+			need_result == PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE
+				? CLUSTER_THREADREC_DEFERRED : CLUSTER_THREADREC_BLOCKED;
+	}
+	fence_verdict = cluster_external_fence_admit_set_wait(
+		needs, formation, fence_timeout_ms,
+		&admissions);
+	if (fence_verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED)
+	{
+		cluster_external_fence_admission_set_release(&admissions);
+		cluster_external_fence_need_set_release(&needs);
+		cluster_formation_witness_destroy(&formation);
+		return CLUSTER_THREADREC_BLOCKED;
+	}
+	if (!cluster_external_fence_need_set_revalidate_nowait(
+			needs, formation, &deny_reason) ||
+		!cluster_external_fence_revalidate_set_nowait(
+			admissions, needs, formation, &deny_reason))
+	{
+		cluster_external_fence_admission_set_release(&admissions);
+		cluster_external_fence_need_set_release(&needs);
+		cluster_formation_witness_destroy(&formation);
+		return CLUSTER_THREADREC_DEFERRED;
+	}
+
+	root_result = cluster_control_root_read_canonical(
+		eligibility->duty.origin_thread_id, &eligibility->duty,
+		CLUSTER_CONTROL_ROOT_READ_STRONG, &root_snapshot, &root_token);
+	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+		 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
+		root_snapshot.lifecycle !=
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
+		memcmp(&root_snapshot.identity, &eligibility->duty,
+			   sizeof(eligibility->duty)) != 0)
+	{
+		cluster_external_fence_admission_set_release(&admissions);
+		cluster_external_fence_need_set_release(&needs);
+		cluster_formation_witness_destroy(&formation);
+		return CLUSTER_THREADREC_DEFERRED;
+	}
+	memset(&serial_request, 0, sizeof(serial_request));
+	serial_request.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+	serial_request.duty = eligibility->duty;
+	serial_request.expected_root_token = root_token;
+	serial_request.formation = formation;
+	serial_request.fence_need_set = needs;
+	serial_request.fence_admission_set = admissions;
+	serial_request.acquire_timeout_ms = fence_timeout_ms;
+	serial_request.release_timeout_ms = fence_timeout_ms;
+	serial_result = cluster_recovery_serial_acquire(
+		&serial_request, &serial_guard);
+	if (serial_result != CLUSTER_RECOVERY_SERIAL_GRANTED)
+	{
+		cluster_external_fence_admission_set_release(&admissions);
+		cluster_external_fence_need_set_release(&needs);
+		cluster_formation_witness_destroy(&formation);
+		return serial_result == CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE
+			? CLUSTER_THREADREC_BLOCKED : CLUSTER_THREADREC_DEFERRED;
+	}
+	if (cluster_recovery_serial_revalidate(&serial_guard) !=
+			CLUSTER_RECOVERY_SERIAL_CURRENT ||
+		!cluster_external_fence_need_set_revalidate_nowait(
+			needs, formation, &deny_reason) ||
+		!cluster_external_fence_revalidate_set_nowait(
+			admissions, needs, formation, &deny_reason))
+	{
+		cluster_write_fence_note_external_mutation_gate_blocked();
+		result = CLUSTER_THREADREC_DEFERRED;
+	}
+	else
+	{
+		PG_TRY();
+		{
+			result = cluster_thread_recovery_replay_one(
+				dead_tid, launch_epoch, &serial_guard);
+		}
+		PG_CATCH();
+		{
+			release_result = cluster_recovery_serial_release(&serial_guard);
+			if (release_result == CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+			{
+				cluster_external_fence_admission_set_release(&admissions);
+				cluster_external_fence_need_set_release(&needs);
+				cluster_formation_witness_destroy(&formation);
+			}
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+
+	/* IR stays held through replay_one's publish.  A stale final guard forbids
+	 * DONE even if replay completed; release still must be confirmed. */
+	if (cluster_recovery_serial_revalidate(&serial_guard) !=
+		CLUSTER_RECOVERY_SERIAL_CURRENT)
+		result = CLUSTER_THREADREC_BLOCKED;
+	release_result = cluster_recovery_serial_release(&serial_guard);
+	if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+		return CLUSTER_THREADREC_BLOCKED;
+	cluster_external_fence_admission_set_release(&admissions);
+	cluster_external_fence_need_set_release(&needs);
+	cluster_formation_witness_destroy(&formation);
+	return result;
 }
 
 /*

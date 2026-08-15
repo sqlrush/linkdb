@@ -3508,7 +3508,7 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 }
 
 /*
- * dump_write_fence -- spec-4.12 D7 + spec-4.12b D6.  Emits 8 rows under
+ * dump_write_fence -- spec-4.12 D7 + STOP-04 §3.13.  Emits 20 rows under
  *	category='write_fence': the 4 spec-4.12 cooperative write-fence counters plus the
  *	4 spec-4.12b baseline-subsystem observability fields (L110-safe -- read 0 with no
  *	region attached).
@@ -3516,6 +3516,9 @@ dump_wal_thread(ReturnSetInfo *rsinfo)
 static void
 dump_write_fence(ReturnSetInfo *rsinfo)
 {
+	uint64 proof_age_ms;
+	bool proof_age_valid;
+
 	emit_row(rsinfo, "write_fence", "hot_gate_blocked",
 			 fmt_int64((int64)cluster_write_fence_get_hot_gate_blocked()));
 	emit_row(rsinfo, "write_fence", "durable_check_blocked",
@@ -3533,6 +3536,33 @@ dump_write_fence(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)(cluster_write_fence_get_baseline_author_is_self() ? 1 : 0)));
 	emit_row(rsinfo, "write_fence", "baseline_authority_age_us",
 			 fmt_int64((int64)cluster_write_fence_get_baseline_authority_age_us()));
+	/* STOP-04 adds diagnostics only; none is an authority input. */
+	emit_row(rsinfo, "write_fence", "external_admit_requested",
+			 fmt_uint64(cluster_write_fence_get_external_admit_requested()));
+	emit_row(rsinfo, "write_fence", "external_write_excluded",
+			 fmt_uint64(cluster_write_fence_get_external_write_excluded()));
+	emit_row(rsinfo, "write_fence", "external_rejected",
+			 fmt_uint64(cluster_write_fence_get_external_rejected()));
+	emit_row(rsinfo, "write_fence", "external_unknown",
+			 fmt_uint64(cluster_write_fence_get_external_unknown()));
+	emit_row(rsinfo, "write_fence", "external_unavailable",
+			 fmt_uint64(cluster_write_fence_get_external_unavailable()));
+	emit_row(rsinfo, "write_fence", "external_identity_mismatch",
+			 fmt_uint64(cluster_write_fence_get_external_identity_mismatch()));
+	emit_row(rsinfo, "write_fence", "external_expired",
+			 fmt_uint64(cluster_write_fence_get_external_expired()));
+	emit_row(rsinfo, "write_fence", "external_daemon_disconnect",
+			 fmt_uint64(cluster_write_fence_get_external_daemon_disconnect()));
+	emit_row(rsinfo, "write_fence", "external_mutation_gate_blocked",
+			 fmt_uint64(cluster_write_fence_get_external_mutation_gate_blocked()));
+	emit_row(rsinfo, "write_fence", "external_publish_gate_blocked",
+			 fmt_uint64(cluster_write_fence_get_external_publish_gate_blocked()));
+	emit_row(rsinfo, "write_fence", "external_last_journal_seq",
+			 fmt_uint64(cluster_write_fence_get_external_last_journal_seq()));
+	proof_age_valid =
+		cluster_write_fence_get_external_last_proof_age_ms(&proof_age_ms);
+	emit_row(rsinfo, "write_fence", "external_last_proof_age_ms",
+			 proof_age_valid ? fmt_uint64(proof_age_ms) : "-");
 }
 
 /*

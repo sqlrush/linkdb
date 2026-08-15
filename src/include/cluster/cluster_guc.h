@@ -84,6 +84,10 @@ extern void cluster_init_guc(void);
  */
 extern int cluster_node_id;
 
+/* STOP-04: provider-neutral external write-exclusion client settings. */
+extern char *cluster_external_fence_socket_path;
+extern int cluster_external_fence_acquire_timeout_ms;
+
 
 /*
  * cluster_interconnect_tier -- which interconnect tier vtable to bind

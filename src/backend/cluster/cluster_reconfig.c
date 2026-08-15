@@ -46,20 +46,53 @@
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b joiner gate */
 
-/*
- * RF-ROOT P3/P4 ordered seam.  The STOP04 async formation/fence admission
- * producer is not installed in P3, so no opaque pointer or legacy dead bitmap
- * may be promoted into launch eligibility.  P4 replaces this closed body with
- * the exact one-shot canonical producer; false always leaves the output zero.
- */
+/* RF-ROOT P4 online launch producer.  The carrier contains only the exact
+ * current FAIL_STOP attempt stamp and full canonical root duty.  Formation,
+ * external admissions and IR remain process-local and are rebuilt by the
+ * worker; no pointer or dead-bitmap pair crosses bgw_extra. */
 bool
 cluster_reconfig_thread_recovery_eligibility_consume(
-	uint16 origin_thread pg_attribute_unused(),
+	uint16 origin_thread,
 	ClusterThreadRecLaunchEligibility *out)
 {
+	ReconfigEvent event;
+	ClusterControlRootIdentity identity;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult root_result;
+	int32 origin_node;
+
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
+	if (out == NULL || origin_thread == 0 ||
+		origin_thread > CLUSTER_MAX_NODES)
+		return false;
+#ifndef USE_PGRAC_CLUSTER
 	return false;
+#else
+	origin_node = (int32)origin_thread - 1;
+	cluster_reconfig_get_last_event(&event);
+	if (event.reconfig_kind != RECONFIG_KIND_FAIL_STOP ||
+		event.event_id == 0 || event.new_epoch == 0 ||
+		(event.dead_bitmap[origin_node / 8] &
+		 (uint8)(UINT8_C(1) << (origin_node % 8))) == 0)
+		return false;
+	root_result = cluster_control_root_lookup_owner_by_node_runtime(
+		origin_node, &identity, &snapshot, &token);
+	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+		 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
+		!cluster_recovery_duty_key_valid_v1(&identity) ||
+		identity.origin_thread_id != origin_thread ||
+		identity.origin_node_id != origin_node ||
+		snapshot.lifecycle !=
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
+		memcmp(&snapshot.identity, &identity, sizeof(identity)) != 0)
+		return false;
+	out->origin_thread = origin_thread;
+	out->attempt_stamp = event.new_epoch;
+	out->duty = identity;
+	return true;
+#endif
 }
 
 #ifdef USE_PGRAC_CLUSTER
@@ -86,6 +119,7 @@ cluster_reconfig_thread_recovery_eligibility_consume(
 #include "cluster/cluster_cssd.h"		 /* cluster_cssd_get_peer_state, get_dead_generation */
 #include "cluster/cluster_elog.h"		 /* cluster_node_id */
 #include "cluster/cluster_epoch.h"		 /* advance + observe + set_changed_at_lsn */
+#include "cluster/cluster_external_fence.h" /* STOP04 rejoin snapshots */
 #include "cluster/cluster_gcs_block.h"	 /* spec-2.34 D4 — eager epoch wake hook */
 #include "cluster/cluster_grd.h"		 /* spec-5.16 D3b — arm join PCM block fence */
 #include "cluster/cluster_ic.h"			 /* Candidate2 HELLO capability */
@@ -168,12 +202,39 @@ typedef struct ClusterReconfigJoinCommitStage {
 	uint64 admitted_incarnation;
 	bool submitted;
 	bool fence_ready;
+	bool external_rejoin_consumed;
 } ClusterReconfigJoinCommitStage;
+
+typedef enum ClusterExternalRejoinPhase {
+	CLUSTER_EXTERNAL_REJOIN_EMPTY = 0,
+	CLUSTER_EXTERNAL_REJOIN_OFFERED,
+	CLUSTER_EXTERNAL_REJOIN_WAITING_ROOT,
+	CLUSTER_EXTERNAL_REJOIN_WAITING_ON,
+	CLUSTER_EXTERNAL_REJOIN_WAITING_JOINER,
+	CLUSTER_EXTERNAL_REJOIN_WAITING_REFRESH,
+	CLUSTER_EXTERNAL_REJOIN_READY,
+	CLUSTER_EXTERNAL_REJOIN_COMMIT_READY,
+	CLUSTER_EXTERNAL_REJOIN_COMMITTING
+} ClusterExternalRejoinPhase;
+
+/* STOP04 §11.8/§11.9: one opaque, process-local slot per old node.  Neither
+ * the operation nor authority-clear object is portable across LMON exit. */
+typedef struct ClusterExternalRejoinSlot {
+	PgracExternalFenceRejoinOpV1 *op;
+	PgracExternalFenceRejoinAuthorityClearV1 *authority_clear;
+	ClusterReconfigRejoinFailureSnapshotV1 failure;
+	ClusterReconfigRejoinPendingSnapshotV1 commit_pending;
+	uint64 candidate_incarnation;
+	ClusterExternalRejoinPhase phase;
+} ClusterExternalRejoinSlot;
 
 static ClusterReconfigFenceStage failstop_fence_stage;
 static ClusterReconfigFenceStage node_removed_fence_stage;
 static ClusterReconfigJoinPrepareStage join_prepare_stage;
 static ClusterReconfigJoinCommitStage join_commit_stage;
+static ClusterExternalRejoinSlot external_rejoin_slots[CLUSTER_MAX_NODES];
+static PgracExternalFenceRejoinOpV1 *external_rejoin_claim_op;
+static bool external_rejoin_exit_registered;
 
 typedef enum ClusterReplacementAdmitStagePhase {
 	CLUSTER_REPLACEMENT_ADMIT_IDLE = 0,
@@ -1538,6 +1599,236 @@ cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation, uint64 *g
 	return gen > 0;
 }
 
+/* STOP04 §2.4.1: generation/incarnation is one coherent qvotec sample.  The
+ * generation is a torn-write counter only and must never be substituted with
+ * an incarnation, membership epoch or failure generation. */
+bool
+cluster_reconfig_get_observed_slot_coherent(
+	int32 node_id, uint64 *out_incarnation, uint64 *out_generation)
+{
+	uint64 generation_before;
+	uint64 generation_after;
+	uint64 incarnation;
+
+	if (out_incarnation != NULL)
+		*out_incarnation = 0;
+	if (out_generation != NULL)
+		*out_generation = 0;
+	if (ReconfigShmem == NULL || node_id < 0 ||
+		node_id >= CLUSTER_MAX_NODES || out_incarnation == NULL ||
+		out_generation == NULL)
+		return false;
+
+	do
+	{
+		generation_before = pg_atomic_read_u64(
+			&ReconfigShmem->observed_generation[node_id]);
+		incarnation = pg_atomic_read_u64(
+			&ReconfigShmem->observed_incarnation[node_id]);
+		generation_after = pg_atomic_read_u64(
+			&ReconfigShmem->observed_generation[node_id]);
+	} while (generation_before != generation_after);
+
+	if (generation_after == 0)
+		return false;
+	*out_incarnation = incarnation;
+	*out_generation = generation_after;
+	return true;
+}
+
+static bool
+rejoin_bitmap_shape_valid(
+	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	const uint8 survivor_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
+	int32 old_node_id)
+{
+	int survivor_count = 0;
+	int i;
+
+	if (old_node_id < 0 || old_node_id >= CLUSTER_MAX_NODES ||
+		!dead_bitmap_test_bit(dead_bitmap, old_node_id) ||
+		dead_bitmap_test_bit(survivor_bitmap, old_node_id))
+		return false;
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+	{
+		uint8 survivors = survivor_bitmap[i];
+
+		if ((dead_bitmap[i] & survivors) != 0)
+			return false;
+		while (survivors != 0)
+		{
+			survivor_count += survivors & 1;
+			survivors >>= 1;
+		}
+	}
+	return survivor_count >= 1 && survivor_count < CLUSTER_MAX_NODES;
+}
+
+static bool
+rejoin_failure_value_valid(
+	const ClusterReconfigRejoinFailureSnapshotV1 *failure)
+{
+	return failure != NULL &&
+		failure->reconfig_kind == RECONFIG_KIND_FAIL_STOP &&
+		failure->reserved0 == 0 && failure->reserved68 == 0 &&
+		failure->event_id != 0 && failure->new_epoch != 0 &&
+		failure->cssd_dead_generation != 0 &&
+		failure->old_incarnation != 0 &&
+		rejoin_bitmap_shape_valid(failure->dead_bitmap,
+			failure->survivor_bitmap, failure->old_node_id);
+}
+
+bool
+cluster_reconfig_rejoin_failure_snapshot(
+	int32 old_node_id, uint64 old_incarnation,
+	ClusterReconfigRejoinFailureSnapshotV1 *out_failure)
+{
+	ClusterReconfigRejoinFailureSnapshotV1 failure;
+	const ReconfigEvent *event;
+	int survivor_count = 0;
+	int i;
+
+	if (out_failure != NULL)
+		memset(out_failure, 0, sizeof(*out_failure));
+	if (out_failure == NULL || ReconfigShmem == NULL || old_node_id < 0 ||
+		old_node_id >= CLUSTER_MAX_NODES || old_incarnation == 0)
+		return false;
+
+	memset(&failure, 0, sizeof(failure));
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	event = &ReconfigShmem->last_applied;
+	if (event->reconfig_kind != RECONFIG_KIND_FAIL_STOP ||
+		event->event_id == 0 || event->new_epoch == 0 ||
+		event->cssd_dead_generation == 0 ||
+		!dead_bitmap_test_bit(event->dead_bitmap, old_node_id) ||
+		ReconfigShmem->membership.last_admitted_incarnation[old_node_id]
+			!= old_incarnation)
+		goto fail;
+
+	failure.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	failure.event_id = event->event_id;
+	failure.new_epoch = event->new_epoch;
+	failure.cssd_dead_generation = event->cssd_dead_generation;
+	memcpy(failure.dead_bitmap, event->dead_bitmap,
+		   sizeof(failure.dead_bitmap));
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+	{
+		if (ReconfigShmem->membership.membership_state[i] ==
+			(uint8) CLUSTER_MEMBER_MEMBER)
+		{
+			dead_bitmap_set_bit(failure.survivor_bitmap, i);
+			survivor_count++;
+		}
+	}
+	failure.old_node_id = old_node_id;
+	failure.old_incarnation = old_incarnation;
+	if (survivor_count < 1 || survivor_count >= CLUSTER_MAX_NODES ||
+		!rejoin_failure_value_valid(&failure))
+		goto fail;
+	LWLockRelease(&ReconfigShmem->lock);
+	*out_failure = failure;
+	return true;
+
+fail:
+	LWLockRelease(&ReconfigShmem->lock);
+	return false;
+}
+
+static bool
+rejoin_bitmap_is_exact_singleton(
+	const uint8 bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES], int32 node_id)
+{
+	int i;
+
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return false;
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+	{
+		uint8 expected = (i == node_id / 8)
+			? (uint8)(UINT8_C(1) << (node_id % 8)) : 0;
+
+		if (bitmap[i] != expected)
+			return false;
+	}
+	return true;
+}
+
+bool
+cluster_reconfig_rejoin_pending_snapshot(
+	const ClusterReconfigRejoinFailureSnapshotV1 *failure,
+	uint64 candidate_incarnation,
+	ClusterReconfigRejoinPendingSnapshotV1 *out_pending)
+{
+	ClusterReconfigRejoinPendingSnapshotV1 pending;
+	uint64 incarnations[CLUSTER_MAX_NODES];
+	uint64 observed_incarnation;
+	uint64 observed_generation;
+	const ReconfigEvent *event;
+	int32 node_id;
+	int i;
+
+	if (out_pending != NULL)
+		memset(out_pending, 0, sizeof(*out_pending));
+	if (out_pending == NULL || ReconfigShmem == NULL ||
+		!rejoin_failure_value_valid(failure) ||
+		candidate_incarnation <= failure->old_incarnation)
+		return false;
+	node_id = failure->old_node_id;
+	if (!cluster_reconfig_get_observed_slot_coherent(node_id,
+			&observed_incarnation, &observed_generation) ||
+		observed_incarnation != candidate_incarnation)
+		return false;
+
+	memset(&pending, 0, sizeof(pending));
+	memset(incarnations, 0, sizeof(incarnations));
+	incarnations[node_id] = candidate_incarnation;
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	event = &ReconfigShmem->last_applied;
+	if (event->reconfig_kind != RECONFIG_KIND_JOIN_PENDING ||
+		event->event_id == 0 || event->old_epoch != failure->new_epoch ||
+		failure->new_epoch == UINT64_MAX ||
+		event->new_epoch != event->old_epoch + 1 ||
+		event->cssd_dead_generation == 0 ||
+		ReconfigShmem->membership.membership_state[node_id] !=
+			(uint8) CLUSTER_MEMBER_JOINING ||
+		ReconfigShmem->membership.last_admitted_incarnation[node_id] !=
+			failure->old_incarnation ||
+		!rejoin_bitmap_is_exact_singleton(event->join_bitmap, node_id) ||
+		!rejoin_bitmap_is_exact_singleton(
+			ReconfigShmem->pending_join_bitmap, node_id))
+		goto pending_fail;
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+	{
+		if (event->dead_bitmap[i] != 0)
+			goto pending_fail;
+	}
+	if (event->event_id != cluster_reconfig_compute_event_id_v2(
+			RECONFIG_KIND_JOIN_PENDING, event->dead_bitmap,
+			event->join_bitmap, incarnations,
+			event->cssd_dead_generation))
+		goto pending_fail;
+
+	pending.reconfig_kind = RECONFIG_KIND_JOIN_PENDING;
+	pending.event_id = event->event_id;
+	pending.old_epoch = event->old_epoch;
+	pending.new_epoch = event->new_epoch;
+	pending.cssd_dead_generation = event->cssd_dead_generation;
+	memcpy(pending.dead_bitmap, event->dead_bitmap,
+		   sizeof(pending.dead_bitmap));
+	memcpy(pending.join_bitmap, event->join_bitmap,
+		   sizeof(pending.join_bitmap));
+	pending.node_id = node_id;
+	pending.candidate_incarnation = candidate_incarnation;
+	pending.observed_slot_generation = observed_generation;
+	LWLockRelease(&ReconfigShmem->lock);
+	*out_pending = pending;
+	return true;
+
+pending_fail:
+	LWLockRelease(&ReconfigShmem->lock);
+	return false;
+}
+
 /*
  * spec-5.15 Hardening v1.3 (INV-J14 stale-slot fail-open) — publish / read the
  * per-node FRESH-ALIVE liveness qvotec derived from decide_quorum_view's
@@ -1958,6 +2249,315 @@ cluster_reconfig_join_converged(int joiner)
 	return true;
 }
 
+bool
+cluster_reconfig_rejoin_pending_ready(
+	const ClusterReconfigRejoinPendingSnapshotV1 *pending)
+{
+	uint64 observed_incarnation;
+	uint64 observed_generation;
+
+	if (pending == NULL || pending->reconfig_kind !=
+		RECONFIG_KIND_JOIN_PENDING || pending->reserved0 != 0 ||
+		pending->node_id < 0 || pending->node_id >= CLUSTER_MAX_NODES ||
+		pending->candidate_incarnation == 0 ||
+		pending->observed_slot_generation == 0 ||
+		!cluster_reconfig_get_observed_slot_coherent(pending->node_id,
+			&observed_incarnation, &observed_generation) ||
+		observed_incarnation != pending->candidate_incarnation ||
+		observed_generation != pending->observed_slot_generation ||
+		!cluster_reconfig_join_converged(pending->node_id))
+		return false;
+	return cluster_membership_vet_joiner(pending->node_id,
+		pending->candidate_incarnation, pending->observed_slot_generation) ==
+		CLUSTER_JOIN_ACCEPT;
+}
+
+static void
+cluster_reconfig_external_rejoin_release_slot(int node_id)
+{
+	ClusterExternalRejoinSlot *slot;
+
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return;
+	slot = &external_rejoin_slots[node_id];
+	cluster_external_fence_rejoin_authority_clear_release(
+		&slot->authority_clear);
+	cluster_external_fence_rejoin_release(&slot->op);
+	memset(slot, 0, sizeof(*slot));
+}
+
+static void
+cluster_reconfig_external_rejoin_release_all(void)
+{
+	int i;
+
+	cluster_external_fence_rejoin_release(&external_rejoin_claim_op);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		cluster_reconfig_external_rejoin_release_slot(i);
+}
+
+static void
+cluster_reconfig_external_rejoin_on_exit(int code pg_attribute_unused(),
+									 Datum arg pg_attribute_unused())
+{
+	cluster_reconfig_external_rejoin_release_all();
+}
+
+static bool
+cluster_reconfig_external_rejoin_has_slot(void)
+{
+	int i;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (external_rejoin_slots[i].phase != CLUSTER_EXTERNAL_REJOIN_EMPTY)
+			return true;
+	return false;
+}
+
+static bool
+cluster_reconfig_external_rejoin_terminal(
+	PgracExternalFenceRejoinStatus status)
+{
+	return status == PGRAC_EXTERNAL_FENCE_REJOIN_REJECTED ||
+		status == PGRAC_EXTERNAL_FENCE_REJOIN_UNKNOWN ||
+		status == PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE ||
+		status == PGRAC_EXTERNAL_FENCE_REJOIN_STALE ||
+		status == PGRAC_EXTERNAL_FENCE_REJOIN_CONSUMED;
+}
+
+static bool
+cluster_reconfig_external_rejoin_required(int node_id)
+{
+	return cluster_external_fence_runtime_active() && node_id >= 0 &&
+		node_id < CLUSTER_MAX_NODES &&
+		cluster_membership_get_last_admitted_incarnation(node_id) > 0 &&
+		!cluster_reconfig_is_clean_departed(node_id);
+}
+
+static bool
+cluster_reconfig_external_rejoin_authorized(int node_id,
+									uint64 candidate_incarnation)
+{
+	ClusterExternalRejoinSlot *slot;
+
+	if (!cluster_reconfig_external_rejoin_required(node_id) ||
+		candidate_incarnation == 0)
+		return false;
+	slot = &external_rejoin_slots[node_id];
+	return slot->op != NULL &&
+		slot->candidate_incarnation == candidate_incarnation &&
+		slot->failure.old_node_id == node_id &&
+		slot->phase >= CLUSTER_EXTERNAL_REJOIN_WAITING_JOINER &&
+		slot->phase <= CLUSTER_EXTERNAL_REJOIN_COMMITTING;
+}
+
+/* STOP04 §11.8: coordinator-LMON drives the opaque provider object without
+ * waits and advances at most one local phase per tick.  The current production
+ * policy never calls this path because provider 0 keeps bit24 inactive. */
+static void
+cluster_reconfig_external_rejoin_tick(void)
+{
+	PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	PgracExternalFenceRejoinStatus status;
+	int advance_node = -1;
+	int i;
+
+	if (!cluster_external_fence_runtime_active()) {
+		cluster_reconfig_external_rejoin_release_all();
+		return;
+	}
+	if (!external_rejoin_exit_registered) {
+		on_shmem_exit(cluster_reconfig_external_rejoin_on_exit, (Datum) 0);
+		external_rejoin_exit_registered = true;
+	}
+
+	/* Poll every bound operation once, in deterministic old-node order. */
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterExternalRejoinSlot *slot = &external_rejoin_slots[i];
+
+		if (slot->op == NULL ||
+			slot->phase == CLUSTER_EXTERNAL_REJOIN_COMMITTING)
+			continue;
+		status = cluster_external_fence_rejoin_poll_nowait(slot->op,
+			&reason);
+		if (cluster_reconfig_external_rejoin_terminal(status)) {
+			cluster_reconfig_external_rejoin_release_slot(i);
+			continue;
+		}
+		if (slot->phase == CLUSTER_EXTERNAL_REJOIN_WAITING_ON &&
+			status == PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_JOINER)
+			slot->phase = CLUSTER_EXTERNAL_REJOIN_WAITING_JOINER;
+		else if (slot->phase == CLUSTER_EXTERNAL_REJOIN_WAITING_REFRESH &&
+				 status == PGRAC_EXTERNAL_FENCE_REJOIN_READY)
+			slot->phase = CLUSTER_EXTERNAL_REJOIN_READY;
+	}
+
+	/* A CLAIM is unindexed until the provider returns its exact OFFER. */
+	if (external_rejoin_claim_op != NULL) {
+		const PgracExternalFenceRejoinOfferV1 *offer;
+
+		status = cluster_external_fence_rejoin_poll_nowait(
+			external_rejoin_claim_op, &reason);
+		if (status == PGRAC_EXTERNAL_FENCE_REJOIN_OFFERED) {
+			offer = cluster_external_fence_rejoin_offer(
+				external_rejoin_claim_op);
+			if (offer == NULL || offer->old_node_id < 0 ||
+				offer->old_node_id >= CLUSTER_MAX_NODES ||
+				offer->old_incarnation == 0 ||
+				offer->candidate_incarnation == 0 ||
+				external_rejoin_slots[offer->old_node_id].phase !=
+					CLUSTER_EXTERNAL_REJOIN_EMPTY)
+				cluster_external_fence_rejoin_release(
+					&external_rejoin_claim_op);
+			else {
+				ClusterExternalRejoinSlot *slot =
+					&external_rejoin_slots[offer->old_node_id];
+
+				slot->op = external_rejoin_claim_op;
+				external_rejoin_claim_op = NULL;
+				slot->candidate_incarnation =
+					offer->candidate_incarnation;
+				slot->phase = CLUSTER_EXTERNAL_REJOIN_OFFERED;
+			}
+		} else if (cluster_reconfig_external_rejoin_terminal(status))
+			cluster_external_fence_rejoin_release(
+				&external_rejoin_claim_op);
+	}
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterExternalRejoinPhase phase = external_rejoin_slots[i].phase;
+
+		if (phase == CLUSTER_EXTERNAL_REJOIN_OFFERED ||
+			phase == CLUSTER_EXTERNAL_REJOIN_WAITING_ROOT ||
+			phase == CLUSTER_EXTERNAL_REJOIN_WAITING_JOINER) {
+			advance_node = i;
+			break;
+		}
+	}
+
+	if (advance_node >= 0) {
+		ClusterExternalRejoinSlot *slot =
+			&external_rejoin_slots[advance_node];
+
+		if (slot->phase == CLUSTER_EXTERNAL_REJOIN_OFFERED) {
+			const PgracExternalFenceRejoinOfferV1 *offer =
+				cluster_external_fence_rejoin_offer(slot->op);
+			ClusterGrdRejoinClearSnapshotV1 grd_clear;
+
+			memset(&slot->failure, 0, sizeof(slot->failure));
+			memset(&grd_clear, 0, sizeof(grd_clear));
+			if (offer == NULL ||
+				!cluster_reconfig_rejoin_failure_snapshot(
+					offer->old_node_id, offer->old_incarnation,
+					&slot->failure)) {
+				cluster_reconfig_external_rejoin_release_slot(advance_node);
+				return;
+			}
+			/* G is a positive all-survivor cut.  Not-yet-DONE is a retry,
+			 * not authority to discard the still-fresh OFFER or actuate ON. */
+			if (!cluster_grd_rejoin_clear_snapshot(&slot->failure,
+					&grd_clear))
+				return;
+			status = cluster_external_fence_rejoin_authority_clear_build(
+				slot->op, &slot->failure, &grd_clear,
+				&slot->authority_clear, &reason);
+			if (status != PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT ||
+				slot->authority_clear == NULL) {
+				cluster_reconfig_external_rejoin_release_slot(advance_node);
+				return;
+			}
+			slot->phase = CLUSTER_EXTERNAL_REJOIN_WAITING_ROOT;
+		} else if (slot->phase == CLUSTER_EXTERNAL_REJOIN_WAITING_ROOT) {
+			ClusterControlRootIdentity identity;
+			ClusterControlRootSnapshot snapshot;
+			ClusterControlRootReadToken token;
+			ClusterControlRootResult root_result;
+			uint8 protected_set_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES];
+
+			memset(&identity, 0, sizeof(identity));
+			memset(&snapshot, 0, sizeof(snapshot));
+			memset(&token, 0, sizeof(token));
+			memset(protected_set_digest, 0,
+				   sizeof(protected_set_digest));
+			root_result = cluster_control_root_lookup_owner_by_node_runtime(
+				advance_node, &identity, &snapshot, &token);
+			if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+				 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
+				snapshot.lifecycle !=
+					CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE ||
+				!cluster_external_fence_rejoin_protected_set_digest(
+					protected_set_digest))
+				return;
+			status = cluster_external_fence_rejoin_authorize_on_async(
+				slot->op, &slot->authority_clear, &identity, &snapshot,
+				&token, protected_set_digest, &reason);
+			if (status == PGRAC_EXTERNAL_FENCE_REJOIN_PENDING &&
+				slot->authority_clear == NULL)
+				slot->phase = CLUSTER_EXTERNAL_REJOIN_WAITING_ON;
+			else if (status != PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT)
+				cluster_reconfig_external_rejoin_release_slot(advance_node);
+		} else {
+			ClusterReconfigRejoinPendingSnapshotV1 pending;
+
+			memset(&pending, 0, sizeof(pending));
+			if (!cluster_reconfig_rejoin_pending_snapshot(&slot->failure,
+					slot->candidate_incarnation, &pending) ||
+				!cluster_reconfig_rejoin_pending_ready(&pending))
+				return;
+			status = cluster_external_fence_rejoin_refresh_on_async(
+				slot->op, &pending, &reason);
+			if (status == PGRAC_EXTERNAL_FENCE_REJOIN_PENDING) {
+				slot->commit_pending = pending;
+				slot->phase = CLUSTER_EXTERNAL_REJOIN_WAITING_REFRESH;
+			} else if (status !=
+					   PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_JOINER)
+				cluster_reconfig_external_rejoin_release_slot(advance_node);
+		}
+	}
+
+	/* The frozen linear chain admits only one live CLAIM/OFFER at a time. */
+	if (external_rejoin_claim_op == NULL &&
+		!cluster_reconfig_external_rejoin_has_slot()) {
+		status = cluster_external_fence_rejoin_start_async(
+			PGRAC_EXTERNAL_FENCE_ACQUIRE_TIMEOUT_DEFAULT_MS,
+			&external_rejoin_claim_op);
+		if (cluster_reconfig_external_rejoin_terminal(status))
+			cluster_external_fence_rejoin_release(
+				&external_rejoin_claim_op);
+	}
+}
+
+static bool
+cluster_reconfig_external_rejoin_prepare_commit(int node_id,
+									 uint64 candidate_incarnation)
+{
+	ClusterExternalRejoinSlot *slot;
+	ClusterReconfigRejoinPendingSnapshotV1 pending;
+	ClusterControlRootSnapshot fresh_root;
+	PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+
+	if (!cluster_reconfig_external_rejoin_required(node_id))
+		return true;
+	slot = &external_rejoin_slots[node_id];
+	if (slot->op == NULL || slot->phase != CLUSTER_EXTERNAL_REJOIN_READY ||
+		slot->candidate_incarnation != candidate_incarnation)
+		return false;
+	memset(&pending, 0, sizeof(pending));
+	memset(&fresh_root, 0, sizeof(fresh_root));
+	if (!cluster_reconfig_rejoin_pending_snapshot(&slot->failure,
+			candidate_incarnation, &pending) ||
+		!cluster_reconfig_rejoin_pending_ready(&pending) ||
+		memcmp(&pending, &slot->commit_pending, sizeof(pending)) != 0 ||
+		!cluster_external_fence_rejoin_revalidate_root(slot->op,
+			&fresh_root, &reason)) {
+		cluster_reconfig_external_rejoin_release_slot(node_id);
+		return false;
+	}
+	slot->commit_pending = pending;
+	slot->phase = CLUSTER_EXTERNAL_REJOIN_COMMIT_READY;
+	return true;
+}
+
 /*
  * spec-5.15 Hardening v1.1 (HF-1 / INV-J9 strengthened) — proof that the
  * coordinator's JOIN_COMMITTED publish actually propagated to a quorum of the
@@ -2299,6 +2899,8 @@ static void
 cluster_reconfig_release_join_commit_stage(void)
 {
 	bool had_prebump = join_commit_stage.fence_ready;
+	bool had_external_rejoin = join_commit_stage.external_rejoin_consumed;
+	int32 external_node_id = join_commit_stage.node_id;
 
 	cluster_marker_async_release_stage(&join_commit_stage.async);
 	cluster_marker_async_release_stage(&join_commit_stage.fence_async);
@@ -2311,8 +2913,11 @@ cluster_reconfig_release_join_commit_stage(void)
 	join_commit_stage.admitted_incarnation = 0;
 	join_commit_stage.submitted = false;
 	join_commit_stage.fence_ready = false;
+	join_commit_stage.external_rejoin_consumed = false;
 	if (had_prebump)
 		cluster_reconfig_set_prebump_sync_active(0);
+	if (had_external_rejoin)
+		cluster_reconfig_external_rejoin_release_slot(external_node_id);
 }
 
 static bool
@@ -2560,6 +3165,14 @@ cluster_reconfig_poll_join_commit_stage(void)
 		cluster_reconfig_release_join_commit_stage();
 		return true;
 	}
+	/* STOP04 §11.7/§11.9: a consumed external rejoin can never publish MEMBER
+	 * without the mandatory durable excluded-set shrink. */
+	if (join_commit_stage.external_rejoin_consumed &&
+		cluster_write_fence_enforcement != CLUSTER_WRITE_FENCE_ENFORCE_ON) {
+		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
+		cluster_reconfig_release_join_commit_stage();
+		return true;
+	}
 
 	if (!cluster_reconfig_get_observed_slot(join_commit_stage.node_id, &admitted_incarnation,
 											&admitted_generation)
@@ -2567,8 +3180,10 @@ cluster_reconfig_poll_join_commit_stage(void)
 		|| cluster_membership_vet_joiner(join_commit_stage.node_id, admitted_incarnation,
 										 admitted_generation)
 			   != CLUSTER_JOIN_ACCEPT
-		|| !cluster_recovery_owner_rejoin_v1(join_commit_stage.node_id,
-										 join_commit_stage.admitted_incarnation)
+		|| (!join_commit_stage.external_rejoin_consumed &&
+			!cluster_recovery_owner_rejoin_v1(
+				join_commit_stage.node_id,
+				join_commit_stage.admitted_incarnation))
 		|| !cluster_reconfig_prepare_join_commit(join_commit_stage.node_id,
 												 join_commit_stage.admitted_incarnation,
 												 join_commit_stage.async.staged_expect_epoch)) {
@@ -2616,12 +3231,42 @@ cluster_reconfig_drive_joins(int coordinator)
 	LWLockRelease(&state->lock);
 
 	if (n_join > 0) {
+		int external_selected = -1;
+
 		memset(joiner_incarnations, 0, sizeof(joiner_incarnations));
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			if (!dead_bitmap_test_bit(join_bitmap, i))
 				continue;
 			(void)cluster_reconfig_get_observed_slot(i, &joiner_incarnations[i], NULL);
 		}
+		/* STOP04 §11.9 F→...→P: a previously admitted/excluded origin
+		 * cannot enter JOIN_PENDING before its exact provider operation has
+		 * reached physical ON.  If present, serialize that candidate into the
+		 * required singleton P; clean first joins remain on the ordinary path. */
+		if (cluster_external_fence_runtime_active()) {
+			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+				if (!dead_bitmap_test_bit(join_bitmap, i) ||
+					!cluster_reconfig_external_rejoin_required(i))
+					continue;
+				if (external_selected < 0 &&
+					cluster_reconfig_external_rejoin_authorized(
+						i, joiner_incarnations[i]))
+					external_selected = i;
+				else
+					join_bitmap[i / 8] &=
+						(uint8) ~(1u << (i % 8));
+			}
+			if (external_selected >= 0) {
+				memset(join_bitmap, 0, sizeof(join_bitmap));
+				dead_bitmap_set_bit(join_bitmap, external_selected);
+			}
+		}
+		n_join = 0;
+		for (i = 0; i < CLUSTER_MAX_NODES; i++)
+			if (dead_bitmap_test_bit(join_bitmap, i))
+				n_join++;
+		if (n_join == 0)
+			return;
 		cluster_reconfig_apply_join_as_coordinator(join_bitmap, coordinator, joiner_incarnations);
 		return;
 	}
@@ -2646,6 +3291,9 @@ cluster_reconfig_drive_joins(int coordinator)
 			pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
 			continue;
 		}
+		if (!cluster_reconfig_external_rejoin_prepare_commit(
+				i, admitted_incarnation))
+			continue;
 		(void)cluster_reconfig_commit_member(i, admitted_incarnation);
 	}
 }
@@ -4384,12 +5032,23 @@ cluster_reconfig_lmon_tick(void)
 	int i;
 	bool failstop_stage_handled = false;
 	bool failure_generation_changed = false;
+	bool external_rejoin_active;
 	int32 root_gated_join_node = -1;
 	uint64 root_gated_join_incarnation = 0;
 
 	/* L20: runtime feature flag check first line. */
-	if (!cluster_enabled)
+	if (!cluster_enabled) {
+		cluster_reconfig_external_rejoin_release_all();
+		if (join_commit_stage.external_rejoin_consumed)
+			cluster_reconfig_release_join_commit_stage();
 		return;
+	}
+	external_rejoin_active = cluster_external_fence_runtime_active();
+	if (!external_rejoin_active) {
+		cluster_reconfig_external_rejoin_release_all();
+		if (join_commit_stage.external_rejoin_consumed)
+			cluster_reconfig_release_join_commit_stage();
+	}
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-tick-entry");
 
@@ -4399,12 +5058,18 @@ cluster_reconfig_lmon_tick(void)
 	 * wait_end pairing needs cleanup refactor). */
 
 	/* I2 + I8: only in_quorum nodes participate in reconfig. */
-	if (!cluster_qvotec_in_quorum())
+	if (!cluster_qvotec_in_quorum()) {
+		cluster_reconfig_external_rejoin_release_all();
+		if (join_commit_stage.external_rejoin_consumed)
+			cluster_reconfig_release_join_commit_stage();
 		return;
+	}
 
 	self_id = cluster_node_id;
-	if (self_id < 0 || self_id >= CLUSTER_MAX_NODES)
+	if (self_id < 0 || self_id >= CLUSTER_MAX_NODES) {
+		cluster_reconfig_external_rejoin_release_all();
 		return; /* defensive: bad self id, cannot participate */
+	}
 	cluster_reconfig_lmon_replacement_closed_tick();
 	cluster_reconfig_lmon_replacement_ready_tick();
 	cluster_reconfig_lmon_replacement_admit_tick();
@@ -4416,8 +5081,10 @@ cluster_reconfig_lmon_tick(void)
 	 * quorum).  Lock-free snapshot — the membership-state maintenance and the
 	 * survivor-set build below run under the reconfig lock.
 	 */
-	if (cluster_conf_lookup_node(self_id) == NULL)
+	if (cluster_conf_lookup_node(self_id) == NULL) {
+		cluster_reconfig_external_rejoin_release_all();
 		return; /* self un-declared — must not be coordinator */
+	}
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (i == self_id)
@@ -4691,8 +5358,10 @@ cluster_reconfig_lmon_tick(void)
 	 * both directions use it.
 	 */
 	coordinator = dead_bitmap_lowest_bit_set(alive_set);
-	if (coordinator < 0)
+	if (coordinator < 0) {
+		cluster_reconfig_external_rejoin_release_all();
 		return; /* total cluster failure;fail-closed already via QVOTEC */
+	}
 
 	/*
 	 * §3.5 ordering: handle the leave/death edge FIRST (it shrinks the MEMBER set,
@@ -4766,8 +5435,16 @@ cluster_reconfig_lmon_tick(void)
 	 * retry next tick once the leave finishes; the leave side symmetrically refuses
 	 * to start while a join is pending.
 	 */
-	if (cluster_online_join && self_id == coordinator && !cluster_clean_leave_in_progress())
+	if (cluster_online_join && self_id == coordinator &&
+		!cluster_clean_leave_in_progress()) {
+		if (external_rejoin_active)
+			cluster_reconfig_external_rejoin_tick();
 		cluster_reconfig_drive_joins(coordinator);
+	} else {
+		cluster_reconfig_external_rejoin_release_all();
+		if (join_commit_stage.external_rejoin_consumed)
+			cluster_reconfig_release_join_commit_stage();
+	}
 }
 
 
@@ -6506,6 +7183,7 @@ cluster_reconfig_apply_join_as_coordinator(
 	XLogRecPtr lsn;
 	uint64 cssd_dead_generation;
 	uint8 pending_dead[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	bool external_authorized[CLUSTER_MAX_NODES];
 	ReconfigEvent evt;
 	int i;
 
@@ -6513,6 +7191,12 @@ cluster_reconfig_apply_join_as_coordinator(
 		return;
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-join-pending-pre");
+	memset(external_authorized, 0, sizeof(external_authorized));
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (dead_bitmap_test_bit(join_bitmap, i))
+			external_authorized[i] =
+				cluster_reconfig_external_rejoin_authorized(
+					i, joiner_incarnations[i]);
 
 	cssd_dead_generation = cluster_cssd_get_dead_generation();
 
@@ -6535,6 +7219,8 @@ cluster_reconfig_apply_join_as_coordinator(
 			continue;
 		cluster_membership_set_state(i, CLUSTER_MEMBER_JOINING);
 		dead_bitmap_set_bit(ReconfigShmem->pending_join_bitmap, i);
+		if (external_authorized[i])
+			pending_dead[i / 8] &= (uint8) ~(1u << (i % 8));
 	}
 	LWLockRelease(&ReconfigShmem->lock);
 
@@ -6566,6 +7252,8 @@ bool
 cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 {
 	ClusterJoinCommitMarker m;
+	bool external_required;
+	PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 
 	if (!cluster_enabled || ReconfigShmem == NULL)
 		return false;
@@ -6579,6 +7267,8 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	 * coordinator retries next tick once the leave finishes; the joiner stays JOINING.
 	 */
 	if (cluster_clean_leave_in_progress())
+		return false;
+	if (join_commit_stage.async.has_staged_event)
 		return false;
 
 	CLUSTER_INJECTION_POINT("cluster-reconfig-join-commit-pre");
@@ -6609,8 +7299,30 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	m.commit_nonce = ((uint64)cluster_node_id << 56) ^ (uint64)GetCurrentTimestamp();
 	cluster_join_marker_compute_crc(&m);
 
-	if (join_commit_stage.async.has_staged_event)
-		return false;
+	/* STOP04 §11.9 C: after the fully normalized COMMITTED candidate exists,
+	 * consume the exact READY operation once and only then expose the JCMK to
+	 * qvotec.  No marker mailbox operation may precede this call. */
+	external_required =
+		cluster_reconfig_external_rejoin_required(node_id);
+	if (external_required) {
+		ClusterExternalRejoinSlot *slot = &external_rejoin_slots[node_id];
+		ClusterReconfigRejoinPendingSnapshotV1 current_pending;
+
+		memset(&current_pending, 0, sizeof(current_pending));
+		if (slot->op == NULL ||
+			slot->phase != CLUSTER_EXTERNAL_REJOIN_COMMIT_READY ||
+			slot->candidate_incarnation != admitted_incarnation ||
+			!cluster_reconfig_rejoin_pending_snapshot(&slot->failure,
+				admitted_incarnation, &current_pending) ||
+			memcmp(&current_pending, &slot->commit_pending,
+				   sizeof(current_pending)) != 0 ||
+			!cluster_external_fence_rejoin_consume_nowait(slot->op,
+				&current_pending, &m, &reason)) {
+			cluster_reconfig_external_rejoin_release_slot(node_id);
+			return false;
+		}
+		slot->phase = CLUSTER_EXTERNAL_REJOIN_COMMITTING;
+	}
 	cluster_marker_async_init(&join_commit_stage.async);
 	cluster_marker_async_init(&join_commit_stage.fence_async);
 	join_commit_stage.marker = m;
@@ -6624,6 +7336,7 @@ cluster_reconfig_commit_member(int32 node_id, uint64 admitted_incarnation)
 	join_commit_stage.async.staged_expect_epoch = m.admitted_epoch;
 	join_commit_stage.submitted = false;
 	join_commit_stage.fence_ready = false;
+	join_commit_stage.external_rejoin_consumed = external_required;
 	(void)cluster_reconfig_poll_join_commit_stage();
 
 	return false;

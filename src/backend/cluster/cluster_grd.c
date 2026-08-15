@@ -52,6 +52,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"			 /* spec-2.16 D8 newly-dead bitmap diff */
 #include "cluster/cluster_epoch.h"			 /* spec-4.6 D1 — accepted epoch reads */
+#include "cluster/cluster_external_fence.h" /* STOP04 rejoin cleanup cut */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — reconfig event consume */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 — unfreeze gate */
 #include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
@@ -6162,6 +6163,80 @@ cluster_grd_clean_leave_verify_no_leftover(int32 leaving_node)
 	if (resids != NULL)
 		pfree(resids);
 	return ok;
+}
+
+/* STOP04 §2.4.1: expose only the exact all-survivor cleanup cut for the
+ * current FAIL_STOP lineage.  This is a read-only process-local snapshot;
+ * later GRD gates/unfreeze and daemon state are deliberately not authority. */
+bool
+cluster_grd_rejoin_clear_snapshot(
+	const ClusterReconfigRejoinFailureSnapshotV1 *failure,
+	ClusterGrdRejoinClearSnapshotV1 *out_clear)
+{
+	ClusterReconfigRejoinFailureSnapshotV1 current;
+	ClusterGrdRejoinClearSnapshotV1 clear;
+	uint64 dead_hash;
+	int survivor_count = 0;
+	int i;
+
+	if (out_clear != NULL)
+		memset(out_clear, 0, sizeof(*out_clear));
+	if (out_clear == NULL || failure == NULL || cluster_grd_state == NULL ||
+		failure->reconfig_kind != RECONFIG_KIND_FAIL_STOP ||
+		failure->reserved0 != 0 || failure->reserved68 != 0 ||
+		failure->event_id == 0 || failure->new_epoch == 0 ||
+		failure->cssd_dead_generation == 0 ||
+		failure->old_node_id < 0 ||
+		failure->old_node_id >= CLUSTER_MAX_NODES ||
+		failure->old_incarnation == 0)
+		return false;
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+	{
+		uint8 survivors = failure->survivor_bitmap[i];
+
+		if ((failure->dead_bitmap[i] & survivors) != 0)
+			return false;
+		while (survivors != 0)
+		{
+			survivor_count += survivors & 1;
+			survivors >>= 1;
+		}
+	}
+	if (survivor_count < 1 || survivor_count >= CLUSTER_MAX_NODES ||
+		(failure->dead_bitmap[failure->old_node_id / 8] &
+		 (uint8)(UINT8_C(1) << (failure->old_node_id % 8))) == 0 ||
+		(failure->survivor_bitmap[failure->old_node_id / 8] &
+		 (uint8)(UINT8_C(1) << (failure->old_node_id % 8))) != 0)
+		return false;
+
+	if (!cluster_reconfig_rejoin_failure_snapshot(failure->old_node_id,
+			failure->old_incarnation, &current) ||
+		memcmp(&current, failure, sizeof(current)) != 0)
+		return false;
+	dead_hash = cluster_grd_dead_bitmap_hash(failure->dead_bitmap);
+	if (dead_hash == 0 ||
+		cluster_grd_recovery_episode_epoch_value() != failure->new_epoch ||
+		cluster_grd_recovery_event_bitmap_hash_value() != dead_hash)
+		return false;
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+	{
+		if ((failure->survivor_bitmap[i / 8] &
+			 (uint8)(UINT8_C(1) << (i % 8))) == 0)
+			continue;
+		if (cluster_grd_recovery_done_epoch_for(i) != failure->new_epoch ||
+			cluster_grd_recovery_done_bitmap_hash_for(i) != dead_hash)
+			return false;
+	}
+	if (!cluster_grd_clean_leave_verify_no_leftover(failure->old_node_id))
+		return false;
+
+	memset(&clear, 0, sizeof(clear));
+	clear.episode_epoch = failure->new_epoch;
+	clear.dead_bitmap_hash = dead_hash;
+	memcpy(clear.survivor_bitmap, failure->survivor_bitmap,
+		   sizeof(clear.survivor_bitmap));
+	*out_clear = clear;
+	return true;
 }
 
 /*

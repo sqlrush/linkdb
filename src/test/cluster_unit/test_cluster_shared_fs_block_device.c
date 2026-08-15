@@ -390,11 +390,19 @@ UT_TEST(test_block_device_roundtrip_layout_and_eof)
 	cluster_block_device_path = path;
 	cluster_block_device_use_odirect = false;
 	cluster_storage_fence_driver = CLUSTER_STORAGE_FENCE_DRIVER_AUTO;
-	cluster_shared_storage_uuid = "raw-ut-storage";
+	cluster_shared_storage_uuid = "00112233445566778899aabbccddeeff";
 
 	UT_ASSERT_NOT_NULL((void *)ops->caps);
 	UT_ASSERT_EQ(ops->caps->durability_class, CLUSTER_DURABILITY_ODIRECT_BARRIER);
 	ops->init();
+	{
+		char protected_uuid[CLUSTER_SHARED_UUID_LEN];
+
+		UT_ASSERT(cluster_shared_fs_block_device_get_storage_uuid(
+			protected_uuid, sizeof(protected_uuid)));
+		UT_ASSERT_STR_EQ(protected_uuid,
+						 "00112233445566778899aabbccddeeff");
+	}
 
 	raw_wal_emit_count = 0;
 	UT_ASSERT(!ops->exists(rl, MAIN_FORKNUM));

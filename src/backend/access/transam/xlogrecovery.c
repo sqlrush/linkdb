@@ -87,7 +87,7 @@
  *
  *	What changed:
  *	  - PerformWalRecovery(): decide whether to engage k-way merged
- *	    recovery (cluster_recovery_merge_decide) once InRecovery is
+ *	    recovery (cluster_recovery_merge_preflight_readonly) once InRecovery is
  *	    settled; on a gated cold crash it FATALs 53RA3 (no shared-data
  *	    backend yet, A-closure capability gate).  When engaged (only
  *	    reachable once roadmap 4.5a lands the shared-data backend), the
@@ -161,6 +161,7 @@
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_write_fence.h"
 #endif
 #include "access/xlogarchive.h"
 #include "access/xlogprefetcher.h"
@@ -605,7 +606,8 @@ cluster_adg_apply_gate_self_valid(void)
 static XLogRecPtr cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 												 const XLogRecPtr *stop, const char *wal_root,
 												 TimeLineID tli, uint16 own_thread,
-												 TimeLineID *replayTLI, bool restore_mode);
+												 TimeLineID *replayTLI, bool restore_mode,
+												 ClusterRecoveryFencePlan **fence_plan);
 static bool cluster_backup_recovery_have_manifest = false;
 static ClusterBackupManifest cluster_backup_recovery_manifest;
 static bool cluster_backup_recovery_target_active = false;
@@ -2363,6 +2365,7 @@ PerformWalRecovery(void)
 	ClusterMergeEngage cluster_engage = CLUSTER_MERGE_NO_DISABLED;
 	uint64		cluster_merge_bitmap[2] = {0, 0};
 	XLogRecPtr	cluster_merge_start[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
+	ClusterRecoveryFencePlan *cluster_fence_plan = NULL;
 #endif
 
 	/*
@@ -2407,31 +2410,51 @@ PerformWalRecovery(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
-	 * PGRAC spec-6.14 D9 amend (INV-D9-R): serialize the shared-regime
-	 * crash-recovery critical section BEFORE deciding how to recover.  Two
-	 * nodes passing the all-cold engage gate concurrently (the spec-5.6
-	 * Phase-2 rendezvous forces concurrent boots) would run two merged
-	 * replays over the same shared pages; and a node running plain
-	 * own-stream redo cannot be seen by a peer's registry-staleness
-	 * SKIPPED verdict (redo refreshes no watermarks), so its replay could
-	 * overlap a peer's merge of its thread.  The claim is held across the
-	 * whole recovery and released after the end-of-recovery checkpoint.
-	 * Crash recovery only: archive/standby/restore recovery is unbounded
-	 * or off-regime and must not pin the claim.
+	 * RF-ROOT P4 S04-11: the sole cold readonly producer freezes the exact
+	 * replay/proof-origin set and obtains all external admissions before the
+	 * shared merge claim.  Native own-stream recovery still takes the same
+	 * claim, but only after this readonly decision, so no foreign destructive
+	 * path can cross the claim without the P4 plan.
 	 */
 	if (!ArchiveRecoveryRequested && !StandbyMode
 		&& !cluster_backup_recovery_merge_required && !cluster_mrp_should_start())
+	{
+		memset(cluster_merge_start, 0, sizeof(cluster_merge_start));
+		cluster_engage = cluster_recovery_merge_preflight_readonly(
+			cluster_wal_thread_id(), RedoStartLSN, &cluster_fence_plan);
 		cluster_recovery_merge_claim_acquire_blocking();
+	}
+	if (cluster_engage == CLUSTER_MERGE_ENGAGE)
+	{
+		bool serial_acquired;
+		bool plan_committed = false;
 
-	/*
-	 * PGRAC spec-4.5 §3.1/§3.2: decide whether to engage k-way merged
-	 * recovery now that InRecovery is settled.  The decision FATALs
-	 * 53RA3 if it wants to engage but the (A-closure capability /
-	 * §3.2) gate fails; every NO_* reason keeps the single-stream path.
-	 */
-	memset(cluster_merge_start, 0, sizeof(cluster_merge_start));
-	cluster_engage = cluster_recovery_merge_decide(cluster_wal_thread_id(), RedoStartLSN,
-												   cluster_merge_bitmap, cluster_merge_start);
+		serial_acquired = cluster_recovery_merge_fence_plan_acquire_serial(
+			cluster_fence_plan);
+		if (serial_acquired)
+			plan_committed =
+				cluster_recovery_merge_commit_plan_nowait(cluster_fence_plan);
+		if (!serial_acquired || !plan_committed ||
+			!cluster_recovery_merge_fence_plan_copy_replay(
+				cluster_fence_plan, cluster_merge_bitmap,
+				cluster_merge_start))
+		{
+			if (serial_acquired && !plan_committed)
+				cluster_write_fence_note_external_mutation_gate_blocked();
+			if (serial_acquired &&
+				!cluster_recovery_merge_fence_plan_release_serial(
+					cluster_fence_plan))
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+						 errmsg("cold recovery serialization release was not confirmed")));
+			cluster_recovery_merge_fence_plan_destroy(&cluster_fence_plan);
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("cold recovery fence plan changed before replay"),
+					 errhint("Retry startup so the complete cold recovery plan is rebuilt; "
+							 "do not force or partially replay the plan.")));
+		}
+	}
 	if (cluster_engage == CLUSTER_MERGE_ENGAGE)
 		ereport(LOG, (errmsg("cluster merged recovery: engage decision PASSED")));
 	else
@@ -2529,15 +2552,27 @@ PerformWalRecovery(void)
 		{
 			XLogRecPtr	merged_end;
 			uint16		own_thread = cluster_wal_thread_id();
+			uint16		foreign_thread = 0;
 
 			if (own_thread == XLP_THREAD_ID_LEGACY)
 				own_thread = 1;
+			if (cluster_recovery_restore_first_foreign(
+					cluster_backup_recovery_merge_bitmap, own_thread,
+					&foreign_thread))
+				ereport(FATAL,
+						(errcode(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE),
+						 errmsg("external write exclusion is not proven for node %d incarnation "
+								UINT64_FORMAT, (int)foreign_thread - 1, (uint64) 0),
+						 errdetail("The backup manifest contains a foreign WAL thread but has no "
+								   "canonical recovery duty or uint64 victim incarnation."),
+						 errhint("Restore the configured root fencing provider and retry; do not "
+								 "disable the fence or force recovery.")));
 			merged_end = cluster_recovery_merged_replay(cluster_backup_recovery_merge_bitmap,
-														cluster_backup_recovery_merge_start,
-														cluster_backup_recovery_merge_stop,
-														cluster_backup_recovery_wal_root,
-														replayTLI, own_thread, &replayTLI,
-														true);
+													cluster_backup_recovery_merge_start,
+													cluster_backup_recovery_merge_stop,
+													cluster_backup_recovery_wal_root,
+													replayTLI, own_thread, &replayTLI,
+													true, NULL);
 			reachedRecoveryTarget = true;
 			if (cluster_backup_recovery_target_active && !reachedConsistency)
 				ereport(FATAL,
@@ -2594,9 +2629,10 @@ PerformWalRecovery(void)
 			XLogRecPtr	merged_end;
 
 			merged_end = cluster_recovery_merged_replay(cluster_merge_bitmap, cluster_merge_start,
-														NULL, NULL, replayTLI,
-														cluster_wal_thread_id(),
-														&replayTLI, false);
+													NULL, NULL, replayTLI,
+													cluster_wal_thread_id(),
+													&replayTLI, false,
+													&cluster_fence_plan);
 			RmgrCleanup();
 			ereport(LOG, (errmsg("redo done (merged) at %X/%X system usage: %s",
 								 LSN_FORMAT_ARGS(merged_end), pg_rusage_show(&ru0))));
@@ -2789,7 +2825,8 @@ cluster_merged_redo_done:;
 static XLogRecPtr
 cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 							   const XLogRecPtr *stop, const char *wal_root, TimeLineID tli,
-							   uint16 own_thread, TimeLineID *replayTLI, bool restore_mode)
+							   uint16 own_thread, TimeLineID *replayTLI, bool restore_mode,
+							   ClusterRecoveryFencePlan **fence_plan)
 {
 	XLogRecPtr own_end = InvalidXLogRecPtr;
 	XLogRecPtr own_read = InvalidXLogRecPtr;
@@ -2798,6 +2835,7 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 	uint16 thread;
 	uint64 max_recovered[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
 	uint16 t;
+	bool foreign_mutation_started = false;
 
 	memset(max_recovered, 0, sizeof(max_recovered));
 	if (restore_mode)
@@ -2826,7 +2864,22 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 									   (unsigned)thread, (unsigned)rec->xl_rmid),
 								errhint("This foreign record cannot be safely routed; resolve the "
 										"shared storage or recover single-stream "
-										"(cluster.merged_recovery=off).")));
+								 "(cluster.merged_recovery=off).")));
+			if (!foreign_mutation_started)
+			{
+				if (restore_mode || fence_plan == NULL || *fence_plan == NULL ||
+					!cluster_recovery_merge_fence_plan_revalidate_nowait(
+						*fence_plan))
+				{
+					cluster_write_fence_note_external_mutation_gate_blocked();
+					ereport(FATAL,
+							(errcode(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE),
+							 errmsg("external write exclusion became stale before cold replay"),
+								 errhint("Retry startup so every foreign origin is fenced again; "
+									 "do not force partial recovery.")));
+				}
+				foreign_mutation_started = true;
+			}
 			/* G, S or MATERIALIZE_LOCAL: apply the peer's record.
 			 * (MATERIALIZE_LOCAL = RM_CLUSTER_UNDO: its redo handler
 			 * resolves pg_undo/instance_<owner> from the record itself,
@@ -2896,6 +2949,16 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 	/* spec-4.5a G5: persist the per-origin outcomes materialized above so
 	 * backends can read them after recovery finishes. */
 	cluster_remote_xact_flush();
+	if (fence_plan != NULL && *fence_plan != NULL &&
+		!cluster_recovery_merge_fence_plan_revalidate_nowait(*fence_plan))
+	{
+		cluster_write_fence_note_external_publish_gate_blocked();
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE),
+				 errmsg("external write exclusion became stale before recovery authority publish"),
+				 errhint("Retry startup; replayed foreign state remains unpublished until the "
+						 "complete fence plan is current.")));
+	}
 
 	/*
 	 * Publish the node-local reader-authority marker.  It proves THIS restored
@@ -2910,6 +2973,14 @@ cluster_recovery_merged_replay(const uint64 *bitmap, const XLogRecPtr *start,
 			continue;
 		if (max_recovered[t] > 0)
 			cluster_merged_authority_publish((int)t - 1, max_recovered[t]);
+	}
+	if (fence_plan != NULL && *fence_plan != NULL)
+	{
+		if (!cluster_recovery_merge_fence_plan_release_serial(*fence_plan))
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("cold recovery serialization release was not confirmed")));
+		cluster_recovery_merge_fence_plan_destroy(fence_plan);
 	}
 	ereport(LOG, (errmsg("cluster %srecovery: replay complete (own thread %u)",
 						 restore_mode ? "backup restore " : "merged ",

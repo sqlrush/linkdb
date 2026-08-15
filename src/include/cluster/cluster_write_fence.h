@@ -738,6 +738,21 @@ typedef struct ClusterWriteFenceShmem {
 	pg_atomic_uint64 last_authority_refresh_us; /* spec-4.12b D6: wall-clock of the last
 											 * successful token refresh (authority age) */
 
+	/* STOP-04 \u00a73.13: external-fence client observability.  These are
+	 * process-shared counters/samples only; none is authority. */
+	pg_atomic_uint64 external_admit_requested;
+	pg_atomic_uint64 external_write_excluded;
+	pg_atomic_uint64 external_rejected;
+	pg_atomic_uint64 external_unknown;
+	pg_atomic_uint64 external_unavailable;
+	pg_atomic_uint64 external_identity_mismatch;
+	pg_atomic_uint64 external_expired;
+	pg_atomic_uint64 external_daemon_disconnect;
+	pg_atomic_uint64 external_mutation_gate_blocked;
+	pg_atomic_uint64 external_publish_gate_blocked;
+	pg_atomic_uint64 external_last_journal_seq;
+	pg_atomic_uint64 external_last_verified_mono_ns;
+
 	/* STOP-02 \u00a717.7: volatile, restart-empty exact-majority freshness cache. */
 	pg_atomic_uint64 authority_cache_seq;
 	pg_atomic_uint32 authority_cache_valid;
@@ -890,6 +905,31 @@ extern uint64 cluster_write_fence_get_baseline_authority_age_us(void);
  * leader (is_leader -> baseline_author_is_self) and whether it actually authored a
  * baseline this cycle (published -> bumps baseline_published). */
 extern void cluster_write_fence_note_baseline_published(bool is_leader, bool published);
+
+/* STOP-04 \u00a73.13 external-fence producers and L110-safe readers. */
+extern void cluster_write_fence_note_external_admit_requested(void);
+extern void cluster_write_fence_note_external_write_excluded(uint64 journal_seq,
+														 uint64 verified_mono_ns);
+extern void cluster_write_fence_note_external_rejected(void);
+extern void cluster_write_fence_note_external_unknown(void);
+extern void cluster_write_fence_note_external_unavailable(void);
+extern void cluster_write_fence_note_external_identity_mismatch(void);
+extern void cluster_write_fence_note_external_expired(void);
+extern void cluster_write_fence_note_external_daemon_disconnect(void);
+extern void cluster_write_fence_note_external_mutation_gate_blocked(void);
+extern void cluster_write_fence_note_external_publish_gate_blocked(void);
+extern uint64 cluster_write_fence_get_external_admit_requested(void);
+extern uint64 cluster_write_fence_get_external_write_excluded(void);
+extern uint64 cluster_write_fence_get_external_rejected(void);
+extern uint64 cluster_write_fence_get_external_unknown(void);
+extern uint64 cluster_write_fence_get_external_unavailable(void);
+extern uint64 cluster_write_fence_get_external_identity_mismatch(void);
+extern uint64 cluster_write_fence_get_external_expired(void);
+extern uint64 cluster_write_fence_get_external_daemon_disconnect(void);
+extern uint64 cluster_write_fence_get_external_mutation_gate_blocked(void);
+extern uint64 cluster_write_fence_get_external_publish_gate_blocked(void);
+extern uint64 cluster_write_fence_get_external_last_journal_seq(void);
+extern bool cluster_write_fence_get_external_last_proof_age_ms(uint64 *age_ms);
 
 #endif /* !FRONTEND */
 

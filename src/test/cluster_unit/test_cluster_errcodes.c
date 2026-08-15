@@ -16,7 +16,7 @@
  *	    correct values).
  *	  - All checked codes use the 'R' subclass character (pgrac namespace
  *	    discipline; design doc §2.3).
- *	  - The Class 58 pgrac block is dense from 58R01..58R16 (the
+ *	  - The Class 58 pgrac block is dense from 58R01..58R17 (the
  *	    largest pgrac sub-class, anchors the count proof).
  *
  *	  Why compile-time only:
@@ -137,7 +137,8 @@ UT_TEST(test_class_57_first_last)
 UT_TEST(test_class_58_first_last)
 {
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED, MAKE_SQLSTATE('5', '8', 'R', '0', '1'));
-	UT_ASSERT_EQ(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR, MAKE_SQLSTATE('5', '8', 'R', '1', '6'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE,
+				 MAKE_SQLSTATE('5', '8', 'R', '1', '7'));
 }
 
 UT_TEST(test_class_72_first_last)
@@ -154,8 +155,8 @@ UT_TEST(test_class_xx_first_last)
 
 
 /* ----------
- * Class 58 has the largest pgrac sub-class (16 entries).  Verify all
- * 16 are present and correctly encoded.  This anchors the per-class
+ * Class 58 has the largest pgrac sub-class (17 entries).  Verify all
+ * 17 are present and correctly encoded.  This anchors the per-class
  * dense-packing claim that the rest of the test only spot-checks.
  * ----------
  */
@@ -179,6 +180,8 @@ UT_TEST(test_class_58_complete)
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_STORAGE_IO_ALIGNMENT, MAKE_SQLSTATE('5', '8', 'R', '1', '4'));
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE, MAKE_SQLSTATE('5', '8', 'R', '1', '5'));
 	UT_ASSERT_EQ(ERRCODE_CLUSTER_IC_RDMA_FABRIC_ERROR, MAKE_SQLSTATE('5', '8', 'R', '1', '6'));
+	UT_ASSERT_EQ(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE,
+				 MAKE_SQLSTATE('5', '8', 'R', '1', '7'));
 }
 
 UT_TEST(test_class_53_rdma_band)
@@ -215,6 +218,7 @@ UT_TEST(test_all_use_r_subclass)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SHARED_STORAGE_FAILED, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_STORAGE_FENCE_UNAVAILABLE, 3), 'R');
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SNAPSHOT_TOO_OLD, 3), 'R');
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ASSERTION_FAILURE, 3), 'R');
 }
@@ -269,6 +273,8 @@ UT_TEST(test_per_class_anchors)
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_BLOCK_MISSING_TEMPORARY, 5), '6');
 	/* Class 57 keeps operator-intervention cluster codes 57R02..57R07. */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_ADG_STANDBY_UNRESOLVABLE, 5), '7');
+	/* Class 58 has 17 entries: 58R01..58R17. */
+	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE, 5), '7');
 	/* Class 72 has 2 entries: 72R01..72R02 */
 	UT_ASSERT_EQ(sqlstate_char(ERRCODE_CLUSTER_SNAPSHOT_UNAVAILABLE, 5), '2');
 	/* Class XX has 3 entries: XXR01..XXR03 */

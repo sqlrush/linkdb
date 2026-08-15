@@ -27,6 +27,7 @@
 
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_dl.h"
+#include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_sequence.h"
@@ -55,6 +56,11 @@ static union {
 static ClusterLockAcquireResult stub_acquire_result
 	= CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 static uint32 stub_acquire_calls;
+static bool stub_formation_ready;
+static bool stub_need_set_ready;
+static bool stub_admission_set_ready;
+static ClusterControlRootResult stub_root_result;
+static ClusterControlRootReadToken stub_root_token;
 static ClusterLockAcquireResult stub_release_result
 	= CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 static ClusterLockAcquireResult stub_release_results[CLUSTER_RECOVERY_SERIAL_SET_MAX];
@@ -88,10 +94,92 @@ cluster_shmem_register_region(
 
 ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(
+	const ClusterLockAcquireRequest *request)
+{
+	ClusterLockAcquireRequest *mutable_request =
+		(ClusterLockAcquireRequest *)request;
+
+	stub_acquire_calls++;
+	mutable_request->request_id = UINT64_C(9001);
+	mutable_request->holder.node_id = 0;
+	mutable_request->holder.procno = 9;
+	mutable_request->holder.cluster_epoch = UINT64_C(7);
+	mutable_request->holder.request_id = mutable_request->request_id;
+	return stub_acquire_result;
+}
+
+ClusterLockAcquireResult
+cluster_lock_acquire_s5_promote(
 	const ClusterLockAcquireRequest *request pg_attribute_unused())
 {
-	stub_acquire_calls++;
-	return stub_acquire_result;
+	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+}
+
+ClusterControlRootResult
+cluster_control_root_read_canonical(
+	uint16 origin_thread_id pg_attribute_unused(),
+	const ClusterControlRootIdentity *expected_identity,
+	ClusterControlRootReadMode mode pg_attribute_unused(),
+	ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token)
+{
+	if (out_snapshot != NULL)
+	{
+		memset(out_snapshot, 0, sizeof(*out_snapshot));
+		if (expected_identity != NULL)
+			out_snapshot->identity = *expected_identity;
+		out_snapshot->lifecycle =
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		out_snapshot->root_flags = stub_root_token.root_flags;
+	}
+	if (out_token != NULL)
+		*out_token = stub_root_token;
+	return stub_root_result;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_revalidate_nowait(
+	const ClusterFormationWitnessV1 *witness pg_attribute_unused())
+{
+	return stub_formation_ready ? CLUSTER_FORMATION_WITNESS_READY :
+		CLUSTER_FORMATION_WITNESS_UNSTABLE;
+}
+
+ClusterRecoveryDutyCompare
+cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
+								  const ClusterRecoveryDutyKey *observed)
+{
+	if (!cluster_recovery_duty_key_valid_v1(expected) ||
+		!cluster_recovery_duty_key_valid_v1(observed))
+		return CLUSTER_RECOVERY_DUTY_COMPARE_INVALID;
+	return memcmp(expected, observed, sizeof(*expected)) == 0 ?
+		CLUSTER_RECOVERY_DUTY_COMPARE_EXACT :
+		CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
+}
+
+bool
+cluster_external_fence_need_set_revalidate_nowait(
+	const PgracExternalFenceNeedSetV1 *needs pg_attribute_unused(),
+	const ClusterFormationWitnessV1 *formation pg_attribute_unused(),
+	PgracExternalFenceDenyReason *reason)
+{
+	if (reason != NULL)
+		*reason = stub_need_set_ready ? PGRAC_EXTERNAL_FENCE_DENY_NONE :
+			PGRAC_EXTERNAL_FENCE_DENY_WRITER_SET_STALE;
+	return stub_need_set_ready;
+}
+
+bool
+cluster_external_fence_revalidate_set_nowait(
+	const PgracExternalFenceAdmissionSetV1 *admissions pg_attribute_unused(),
+	const PgracExternalFenceNeedSetV1 *needs pg_attribute_unused(),
+	const ClusterFormationWitnessV1 *formation pg_attribute_unused(),
+	PgracExternalFenceDenyReason *reason)
+{
+	if (reason != NULL)
+		*reason = stub_admission_set_ready ? PGRAC_EXTERNAL_FENCE_DENY_NONE :
+			PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
+	return stub_admission_set_ready;
 }
 
 ClusterLockAcquireResult
@@ -507,19 +595,39 @@ UT_TEST(test_recovery_serial_release_set_invalid_sends_nothing)
 	UT_ASSERT_EQ(stub_release_calls, 0);
 }
 
-UT_TEST(test_recovery_serial_pre_p4_acquire_is_fail_closed)
+UT_TEST(test_recovery_serial_p4_acquire_requires_fresh_fence_then_actual_grant)
 {
 	ClusterRecoverySerialRequest request = valid_serial_request();
 	ClusterRecoverySerialGuard guard;
 
+	stub_root_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	stub_root_token = request.expected_root_token;
+	stub_formation_ready = true;
+	stub_need_set_ready = false;
+	stub_admission_set_ready = true;
 	memset(&guard, 0xA5, sizeof(guard));
-	stub_acquire_result = CLUSTER_LOCK_ACQUIRE_OK_NATIVE;
+	stub_acquire_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	stub_acquire_calls = 0;
 	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard),
 				 CLUSTER_RECOVERY_SERIAL_FENCE_DENIED);
 	UT_ASSERT(memcmp(&guard, &(ClusterRecoverySerialGuard){ 0 },
 				 sizeof(guard)) == 0);
 	UT_ASSERT_EQ(stub_acquire_calls, 0);
+
+	stub_need_set_ready = true;
+	memset(&guard, 0xA5, sizeof(guard));
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard),
+				 CLUSTER_RECOVERY_SERIAL_GRANTED);
+	UT_ASSERT(guard.held);
+	UT_ASSERT(!guard.release_uncertain);
+	UT_ASSERT_EQ(stub_acquire_calls, 1);
+	UT_ASSERT_EQ(guard.lock_request.timeout_ms, 1000);
+	UT_ASSERT_EQ(guard.duty.origin_thread_id,
+				 request.duty.origin_thread_id);
+
+	stub_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_recovery_serial_release(&guard),
+				 CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED);
 
 	memset(&guard, 0xA5, sizeof(guard));
 	request.acquire_timeout_ms = 0;
@@ -533,7 +641,7 @@ UT_TEST(test_recovery_serial_pre_p4_acquire_is_fail_closed)
 				 CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE);
 }
 
-UT_TEST(test_recovery_serial_pre_p4_revalidate_is_fail_closed)
+UT_TEST(test_recovery_serial_p4_revalidate_is_two_phase_fail_closed)
 {
 	ClusterRecoverySerialGuard guard;
 
@@ -550,6 +658,12 @@ UT_TEST(test_recovery_serial_pre_p4_revalidate_is_fail_closed)
 	UT_ASSERT_EQ(cluster_recovery_serial_revalidate(&guard),
 				 CLUSTER_RECOVERY_SERIAL_RELEASE_UNCERTAIN);
 	guard.release_uncertain = false;
+	stub_formation_ready = true;
+	stub_need_set_ready = true;
+	stub_admission_set_ready = true;
+	UT_ASSERT_EQ(cluster_recovery_serial_revalidate(&guard),
+				 CLUSTER_RECOVERY_SERIAL_CURRENT);
+	stub_admission_set_ready = false;
 	UT_ASSERT_EQ(cluster_recovery_serial_revalidate(&guard),
 				 CLUSTER_RECOVERY_SERIAL_FENCE_STALE);
 	UT_ASSERT_EQ(cluster_recovery_serial_revalidate_reject_count(),
@@ -574,6 +688,11 @@ UT_TEST(test_recovery_serial_acquire_set_zero_before_first_grant)
 		   sizeof(requests[1].expected_root_token.authority_uuid));
 
 	memset(&set, 0xA5, sizeof(set));
+	stub_root_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	stub_root_token = requests[0].expected_root_token;
+	stub_formation_ready = true;
+	stub_need_set_ready = false;
+	stub_admission_set_ready = true;
 	stub_acquire_calls = 0;
 	UT_ASSERT_EQ(cluster_recovery_serial_acquire_set(
 					 requests, 2, 5000, &set, &failed_index),
@@ -610,8 +729,8 @@ main(void)
 	UT_RUN(test_recovery_serial_release_not_held_and_invalid);
 	UT_RUN(test_recovery_serial_release_set_reverse_and_compact);
 	UT_RUN(test_recovery_serial_release_set_invalid_sends_nothing);
-	UT_RUN(test_recovery_serial_pre_p4_acquire_is_fail_closed);
-	UT_RUN(test_recovery_serial_pre_p4_revalidate_is_fail_closed);
+	UT_RUN(test_recovery_serial_p4_acquire_requires_fresh_fence_then_actual_grant);
+	UT_RUN(test_recovery_serial_p4_revalidate_is_two_phase_fail_closed);
 	UT_RUN(test_recovery_serial_acquire_set_zero_before_first_grant);
 	UT_DONE();
 

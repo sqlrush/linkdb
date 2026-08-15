@@ -347,6 +347,95 @@ typedef enum ClusterMergeClaimVerdict {
 	CLUSTER_MERGE_CLAIM_INVALID_NODE	  /* claimant id out of range */
 } ClusterMergeClaimVerdict;
 
+/* RF-ROOT P4 S04-11 pure shape gate.  Cold recovery has one producer for
+ * both the replay and proof-origin sets: foreign must be byte-exact replay
+ * minus the one own-thread bit, and the ascending vector must name every
+ * foreign bit exactly once. */
+static inline bool
+cluster_recovery_fence_plan_shape_valid(uint16 own_thread,
+										const uint64 replay[2],
+										const uint64 foreign[2],
+										const uint16 *origin_threads,
+										uint16 origin_count)
+{
+	uint64 expected_foreign[2];
+	uint16 counted = 0;
+	uint16 previous = 0;
+	uint16 i;
+
+	if (own_thread == 0 || own_thread > CLUSTER_WAL_STATE_SLOT_COUNT ||
+		replay == NULL || foreign == NULL ||
+		origin_count > CLUSTER_WAL_STATE_SLOT_COUNT ||
+		(origin_count > 0 && origin_threads == NULL))
+		return false;
+	expected_foreign[0] = replay[0];
+	expected_foreign[1] = replay[1];
+	if ((expected_foreign[(own_thread - 1) / 64] &
+		 (UINT64_C(1) << ((own_thread - 1) % 64))) == 0)
+		return false;
+	expected_foreign[(own_thread - 1) / 64] &=
+		~(UINT64_C(1) << ((own_thread - 1) % 64));
+	if (expected_foreign[0] != foreign[0] ||
+		expected_foreign[1] != foreign[1])
+		return false;
+
+	for (i = 0; i < origin_count; i++)
+	{
+		uint16 tid = origin_threads[i];
+
+		if (tid == 0 || tid > CLUSTER_WAL_STATE_SLOT_COUNT ||
+			tid == own_thread || tid <= previous ||
+			(foreign[(tid - 1) / 64] &
+			 (UINT64_C(1) << ((tid - 1) % 64))) == 0)
+			return false;
+		previous = tid;
+	}
+	for (i = 1; i <= CLUSTER_WAL_STATE_SLOT_COUNT; i++)
+	{
+		if ((foreign[(i - 1) / 64] &
+			 (UINT64_C(1) << ((i - 1) % 64))) != 0)
+			counted++;
+	}
+	return counted == origin_count;
+}
+
+/* Old backup manifests carry no canonical duty/incarnation.  Any bit other
+ * than the chosen replay owner is therefore a foreign destructive restore
+ * and must hit the 58R17 negative gate before merged replay. */
+static inline bool
+cluster_recovery_restore_first_foreign(const uint64 bitmap[2],
+									   uint16 own_thread,
+									   uint16 *foreign_thread)
+{
+	uint16 tid;
+
+	if (bitmap == NULL || own_thread == 0 ||
+		own_thread > CLUSTER_WAL_STATE_SLOT_COUNT || foreign_thread == NULL)
+		return true;
+	*foreign_thread = 0;
+	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++)
+	{
+		if (tid != own_thread &&
+			(bitmap[(tid - 1) / 64] &
+			 (UINT64_C(1) << ((tid - 1) % 64))) != 0)
+		{
+			*foreign_thread = tid;
+			return true;
+		}
+	}
+	return false;
+}
+
+static inline bool
+cluster_recovery_restore_has_foreign(const uint64 bitmap[2],
+									 uint16 own_thread)
+{
+	uint16 foreign_thread;
+
+	return cluster_recovery_restore_first_foreign(
+		bitmap, own_thread, &foreign_thread);
+}
+
 static inline void
 cluster_merge_claim_build(ClusterMergeClaimFile *f, int32 node, uint64 sysid)
 {
@@ -394,6 +483,7 @@ cluster_merge_claim_classify(const void *buf, size_t len, uint64 expected_sysid)
 
 /* Backend engine (cluster_recovery_merge.c). */
 typedef struct ClusterRecoveryMergeState ClusterRecoveryMergeState;
+typedef struct ClusterRecoveryFencePlan ClusterRecoveryFencePlan;
 
 /* Engage decision (spec-4.5 §3.1).  Computed at the top of
  * PerformWalRecovery before the redo loop.  ENGAGE means: merged
@@ -409,14 +499,26 @@ typedef enum ClusterMergeEngage {
 	CLUSTER_MERGE_ENGAGE,			 /* gate passed below; do merged replay */
 } ClusterMergeEngage;
 
-/* Decide whether to engage; out_bitmap/out_start receive the merge set
- * (candidates + own) and per-thread start LSNs when ENGAGE.  When the
- * decision is ENGAGE but the 53RA3 gate fails, this FATALs 53RA3 with
- * the blocking reasons -- it never silently downgrades to single
- * stream (spec-4.5 §3.2). */
-extern ClusterMergeEngage cluster_recovery_merge_decide(uint16 own_thread, XLogRecPtr own_redo,
-														uint64 out_bitmap[2],
-														XLogRecPtr *out_start);
+/* RF-ROOT P4 cold caller contract.  The sole readonly producer freezes the
+ * canonical replay/proof-origin sets and owns every formation/NeedSet/
+ * AdmissionSet.  The caller obtains the merge claim only after this returns
+ * ENGAGE, then acquires the STOP03 guard set and commits the unchanged plan
+ * before copying its replay inputs. */
+extern ClusterMergeEngage cluster_recovery_merge_preflight_readonly(
+	uint16 own_thread, XLogRecPtr own_redo, ClusterRecoveryFencePlan **out_plan);
+extern bool cluster_recovery_merge_fence_plan_acquire_serial(
+	ClusterRecoveryFencePlan *plan);
+extern bool cluster_recovery_merge_commit_plan_nowait(
+	ClusterRecoveryFencePlan *plan);
+extern bool cluster_recovery_merge_fence_plan_copy_replay(
+	const ClusterRecoveryFencePlan *plan, uint64 out_bitmap[2],
+	XLogRecPtr *out_start);
+extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(
+	ClusterRecoveryFencePlan *plan);
+extern bool cluster_recovery_merge_fence_plan_release_serial(
+	ClusterRecoveryFencePlan *plan);
+extern void cluster_recovery_merge_fence_plan_destroy(
+	ClusterRecoveryFencePlan **plan);
 
 /* Sole-merger claim lifecycle (spec-6.14 D9 amend; see the pure core
  * above).  acquire_blocking runs in PerformWalRecovery BEFORE the engage
