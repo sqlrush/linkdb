@@ -14,6 +14,8 @@
 #include "common/cryptohash.h"
 #include "common/sha2.h"
 
+#include "../../backend/cluster/cluster_control_root_private.h"
+
 #undef printf
 #undef fprintf
 #undef snprintf
@@ -37,6 +39,8 @@ static uint64 ut_owner_read_incarnation;
 static int ut_owner_read_calls;
 static int ut_root_publish_calls;
 static ClusterControlRootPatch ut_root_published_patch;
+static bool ut_root_publish_context_authorized;
+static bool ut_root_publish_mutate_token;
 
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(
@@ -74,10 +78,17 @@ cluster_control_root_compare_and_publish(
 	const ClusterControlRootPatch *patch, ClusterControlRootPublishReason reason,
 	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token)
 {
-	(void)expected_token;
-	(void)reason;
+	ClusterControlRootReadToken observed_token = *expected_token;
+
 	ut_root_publish_calls++;
 	ut_root_published_patch = *patch;
+	if (ut_root_publish_mutate_token)
+		observed_token.root_publish_seq++;
+	ut_root_publish_context_authorized =
+		cluster_control_root_publish_authority_current_v1(
+			&observed_token, patch, reason);
+	if (!ut_root_publish_context_authorized)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (ut_root_publish_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		*out_snapshot = ut_root_snapshot;
 		out_snapshot->lifecycle = patch->desired.lifecycle;
@@ -239,6 +250,8 @@ setup_owner_rejoin(uint64 old_incarnation, uint64 new_incarnation)
 	ut_owner_read_incarnation = new_incarnation;
 	ut_owner_read_calls = 0;
 	ut_root_publish_calls = 0;
+	ut_root_publish_context_authorized = false;
+	ut_root_publish_mutate_token = false;
 	memset(&ut_root_published_patch, 0, sizeof(ut_root_published_patch));
 }
 
@@ -251,6 +264,10 @@ UT_TEST(test_owner_rejoin_requires_jcmk_and_publishes_exact_root_cas)
 	UT_ASSERT(cluster_recovery_owner_rejoin_v1(3, new_incarnation));
 	UT_ASSERT_EQ(ut_owner_read_calls, 1);
 	UT_ASSERT_EQ(ut_root_publish_calls, 1);
+	UT_ASSERT(ut_root_publish_context_authorized);
+	UT_ASSERT(!cluster_control_root_publish_authority_current_v1(
+		&ut_root_token, &ut_root_published_patch,
+		CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN));
 	UT_ASSERT_EQ(ut_root_published_patch.mask, UINT64_C(0x3b));
 	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle,
 				 CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
@@ -261,6 +278,18 @@ UT_TEST(test_owner_rejoin_requires_jcmk_and_publishes_exact_root_cas)
 		new_incarnation);
 	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.root_lineage_seq,
 				 ut_root_identity.root_lineage_seq + 1);
+}
+
+UT_TEST(test_owner_rejoin_publication_context_rejects_token_drift)
+{
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_publish_mutate_token = true;
+	UT_ASSERT(!cluster_recovery_owner_rejoin_v1(3, UINT64_C(77)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 1);
+	UT_ASSERT(!ut_root_publish_context_authorized);
+	UT_ASSERT(!cluster_control_root_publish_authority_current_v1(
+		&ut_root_token, &ut_root_published_patch,
+		CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN));
 }
 
 UT_TEST(test_owner_rejoin_fails_closed_on_non_jcmk_drift_or_exhaustion)
@@ -670,7 +699,7 @@ UT_TEST(test_formation_pending_owner_and_full_outage_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_exact_74_byte_encoding);
 	UT_RUN(test_domain_separated_digest);
 	UT_RUN(test_full_key_compare_has_no_numeric_order);
@@ -682,6 +711,7 @@ main(void)
 	UT_RUN(test_owner_import_slot_fallback_requires_absent_jcmk_and_claim);
 	UT_RUN(test_owner_import_cannot_prove_jcmk_absence_with_unreadable_disk);
 	UT_RUN(test_owner_rejoin_requires_jcmk_and_publishes_exact_root_cas);
+	UT_RUN(test_owner_rejoin_publication_context_rejects_token_drift);
 	UT_RUN(test_owner_rejoin_fails_closed_on_non_jcmk_drift_or_exhaustion);
 	UT_RUN(test_formation_f1_majority_f2_ready);
 	UT_RUN(test_formation_snapshot_or_marker_drift_is_rejected);

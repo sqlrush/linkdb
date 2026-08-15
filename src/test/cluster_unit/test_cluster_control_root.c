@@ -25,6 +25,8 @@
 #include "storage/fd.h"
 #include "utils/timestamp.h"
 
+#include "../../backend/cluster/cluster_control_root_private.h"
+
 #undef printf
 #undef fprintf
 #undef snprintf
@@ -58,6 +60,9 @@ static bool test_cf_release_confirmed = true;
 static int test_cf_lock_calls = 0;
 static int test_durable_rename_calls = 0;
 static bool test_fail_primary_rename = false;
+static bool test_create_authorized = true;
+static bool test_activate_authorized = true;
+static bool test_publish_authorized = true;
 static TimestampTz test_now = INT64_C(1700000000000000);
 
 void *
@@ -190,6 +195,31 @@ cluster_cf_unlock_confirmed(LOCKMODE mode pg_attribute_unused())
 									 : CLUSTER_CF_RELEASE_UNCONFIRMED;
 }
 
+bool
+cluster_control_root_create_authority_current_v1(
+	const ClusterControlRootMigrationImage *image pg_attribute_unused(),
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused())
+{
+	return test_create_authorized;
+}
+
+bool
+cluster_control_root_activate_authority_current_v1(
+	const ClusterControlRootFileToken *expected_token pg_attribute_unused(),
+	const uint8 expected_round_sha256[32] pg_attribute_unused())
+{
+	return test_activate_authorized;
+}
+
+bool
+cluster_control_root_publish_authority_current_v1(
+	const ClusterControlRootReadToken *expected_token pg_attribute_unused(),
+	const ClusterControlRootPatch *patch pg_attribute_unused(),
+	ClusterControlRootPublishReason reason pg_attribute_unused())
+{
+	return test_publish_authorized;
+}
+
 static void
 put_u16_le(uint8 *dst, uint16 value)
 {
@@ -286,6 +316,9 @@ wipe_root_files(void)
 	test_cf_lock_calls = 0;
 	test_durable_rename_calls = 0;
 	test_fail_primary_rename = false;
+	test_create_authorized = true;
+	test_activate_authorized = true;
+	test_publish_authorized = true;
 }
 
 static void
@@ -712,6 +745,50 @@ UT_TEST(test_activate_and_stale_token)
 	UT_ASSERT_EQ(stale_out.file_txn_seq, 0);
 }
 
+UT_TEST(test_unbound_cutover_mutators_fail_before_cf_and_preserve_prepared_root)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken prepared;
+	ClusterControlRootFileToken active;
+	uint8 round_sha[PG_SHA256_DIGEST_LENGTH];
+	int lock_calls_before;
+	int rename_calls_before;
+
+	wipe_root_files();
+	build_migration(&image, &round);
+	memset(&prepared, 0xee, sizeof(prepared));
+	test_create_authorized = false;
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &prepared),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	UT_ASSERT_EQ(test_durable_rename_calls, 0);
+	UT_ASSERT_EQ(prepared.file_txn_seq, 0);
+
+	test_create_authorized = true;
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &prepared),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	round_sha256(&round, round_sha);
+	lock_calls_before = test_cf_lock_calls;
+	rename_calls_before = test_durable_rename_calls;
+	memset(&active, 0xee, sizeof(active));
+	test_activate_authorized = false;
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(
+				 &prepared, round_sha, &active),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(test_cf_lock_calls, lock_calls_before);
+	UT_ASSERT_EQ(test_durable_rename_calls, rename_calls_before);
+	UT_ASSERT_EQ(active.file_txn_seq, 0);
+
+	/* The refused attempt cannot consume or mutate the PREPARED image. */
+	test_activate_authorized = true;
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(
+				 &prepared, round_sha, &active),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(active.activation_state, CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE);
+	UT_ASSERT_EQ(active.file_txn_seq, prepared.file_txn_seq + 1);
+}
+
 UT_TEST(test_native_cf_hold_cannot_authorize_strong_read)
 {
 	ClusterControlRootMigrationImage image;
@@ -860,6 +937,55 @@ UT_TEST(test_lifecycle_publish_exact_token_cas)
 	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
 				 &read_token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_RETIRE,
 				 &published, &new_token), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+}
+
+UT_TEST(test_unbound_publisher_fails_before_cf_and_preserves_root)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootSnapshot before;
+	ClusterControlRootSnapshot after;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootReadToken before_token;
+	ClusterControlRootReadToken after_token;
+	ClusterControlRootReadToken published_token;
+	ClusterControlRootPatch patch;
+	int lock_calls_before_publish;
+
+	wipe_root_files();
+	test_publish_authorized = true;
+	UT_ASSERT_EQ(create_prepared(&image, &round, &file_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+				 1, &image.records[0].identity,
+				 CLUSTER_CONTROL_ROOT_READ_STRONG, &before, &before_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	memset(&patch, 0, sizeof(patch));
+	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE;
+	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED;
+	memset(&published, 0xee, sizeof(published));
+	memset(&published_token, 0xee, sizeof(published_token));
+	lock_calls_before_publish = test_cf_lock_calls;
+	test_publish_authorized = false;
+	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
+				 &before_token, &patch,
+				 CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_RETIRE,
+				 &published, &published_token),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(test_cf_lock_calls, lock_calls_before_publish);
+	UT_ASSERT_EQ(published.identity.system_identifier, 0);
+	UT_ASSERT_EQ(published_token.file_txn_seq, 0);
+
+	test_publish_authorized = true;
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+				 1, &image.records[0].identity,
+				 CLUSTER_CONTROL_ROOT_READ_STRONG, &after, &after_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(after.lifecycle, before.lifecycle);
+	UT_ASSERT_EQ(after.root_publish_seq, before.root_publish_seq);
+	UT_ASSERT_EQ(after_token.file_txn_seq, before_token.file_txn_seq);
 }
 
 UT_TEST(test_owner_rejoin_rejects_non_new_incarnation)
@@ -1047,7 +1173,7 @@ main(void)
 {
 	setup_fixture();
 
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -1057,12 +1183,14 @@ main(void)
 	UT_RUN(test_storage_contract_fails_before_cf_or_file_io);
 	UT_RUN(test_single_node_local_probe_fails_before_cf_or_file_io);
 	UT_RUN(test_activate_and_stale_token);
+	UT_RUN(test_unbound_cutover_mutators_fail_before_cf_and_preserve_prepared_root);
 	UT_RUN(test_native_cf_hold_cannot_authorize_strong_read);
 	UT_RUN(test_activation_rejects_changed_source_wal_bytes);
 	UT_RUN(test_activation_rejects_same_node_thread_claim_drift);
 	UT_RUN(test_forbidden_patch_rejected_before_cf_and_file_io);
 	UT_RUN(test_lookup_and_revalidate_use_exact_primary_identity);
 	UT_RUN(test_lifecycle_publish_exact_token_cas);
+	UT_RUN(test_unbound_publisher_fails_before_cf_and_preserves_root);
 	UT_RUN(test_owner_rejoin_rejects_non_new_incarnation);
 	UT_RUN(test_owner_rejoin_advances_exact_lineage_and_exhausts_at_max);
 	UT_RUN(test_initial_migration_requires_lineage_one);

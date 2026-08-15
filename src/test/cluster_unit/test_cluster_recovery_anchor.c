@@ -45,14 +45,19 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "catalog/pg_control.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_anchor.h"
+#include "cluster/cluster_write_fence.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "utils/elog.h"
@@ -78,6 +83,43 @@ UT_DEFINE_GLOBALS();
  */
 char *cluster_shared_data_dir = NULL;
 int cluster_node_id = 3;
+static ClusterMembershipState test_membership_state = CLUSTER_MEMBER_MEMBER;
+static uint64 test_self_incarnation = UINT64_C(77);
+static uint64 test_admitted_incarnation = UINT64_C(77);
+static bool test_owner_eor_active;
+static int test_write_fence_calls;
+static bool test_expect_panic;
+static jmp_buf test_panic_jump;
+
+ClusterMembershipState
+cluster_membership_get_state(int32 node_id pg_attribute_unused())
+{
+	return test_membership_state;
+}
+
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
+{
+	return test_admitted_incarnation;
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return test_self_incarnation;
+}
+
+void
+cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused())
+{
+	test_write_fence_calls++;
+}
+
+bool
+cluster_cf_owner_eor_local_active(void)
+{
+	return test_owner_eor_active;
+}
 
 /* ----------
  * Assert + ereport machinery.  The anchor read path never ereports (it
@@ -96,6 +138,8 @@ bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	if (elevel >= ERROR) {
+		if (test_expect_panic)
+			longjmp(test_panic_jump, 1);
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
@@ -220,6 +264,12 @@ wipe_anchor_files(void)
 	snprintf(path, sizeof(path), "%s/global/pgrac_recovery_anchor_n%d.bak", shared_root,
 			 cluster_node_id);
 	unlink(path);
+	test_membership_state = CLUSTER_MEMBER_MEMBER;
+	test_self_incarnation = UINT64_C(77);
+	test_admitted_incarnation = UINT64_C(77);
+	test_owner_eor_active = false;
+	test_write_fence_calls = 0;
+	test_expect_panic = false;
 }
 
 #define TEST_SYSID 0xABCDEF0123456789ULL
@@ -531,6 +581,63 @@ UT_TEST(test_publish_checkpoint)
 	UT_ASSERT_EQ(out.unloggedLSN, 0x0000000000009999ULL);
 }
 
+static bool
+publish_checkpoint_panics(const CheckPoint *cp)
+{
+	test_expect_panic = true;
+	if (setjmp(test_panic_jump) == 0) {
+		cluster_recovery_anchor_publish_checkpoint(
+			0x0000000398770000ULL, cp, TEST_SYSID,
+			(uint32)DB_IN_PRODUCTION, InvalidXLogRecPtr);
+		test_expect_panic = false;
+		return false;
+	}
+	test_expect_panic = false;
+	return true;
+}
+
+UT_TEST(test_checkpoint_publish_requires_current_owner_before_io)
+{
+	CheckPoint cp;
+	ClusterRecoveryAnchor out;
+	bool used_bak;
+
+	memset(&cp, 0, sizeof(cp));
+	cp.redo = 0x0000000398760000ULL;
+	cp.ThisTimeLineID = 1;
+	cp.PrevTimeLineID = 1;
+
+	wipe_anchor_files();
+	test_membership_state = CLUSTER_MEMBER_DEAD;
+	UT_ASSERT(publish_checkpoint_panics(&cp));
+	UT_ASSERT_EQ(test_write_fence_calls, 1);
+	UT_ASSERT(!cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
+
+	wipe_anchor_files();
+	test_admitted_incarnation = test_self_incarnation + 1;
+	UT_ASSERT(publish_checkpoint_panics(&cp));
+	UT_ASSERT_EQ(test_write_fence_calls, 1);
+	UT_ASSERT(!cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
+
+	wipe_anchor_files();
+	test_membership_state = CLUSTER_MEMBER_ABSENT;
+	test_self_incarnation = 0;
+	test_admitted_incarnation = 0;
+	test_owner_eor_active = true;
+	UT_ASSERT(!publish_checkpoint_panics(&cp));
+	UT_ASSERT_EQ(test_write_fence_calls, 2);
+	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
+	UT_ASSERT_EQ(out.checkPoint, 0x0000000398770000ULL);
+
+	wipe_anchor_files();
+	cluster_recovery_anchor_publish_checkpoint(
+		0x0000000398770000ULL, &cp, TEST_SYSID,
+		(uint32)DB_IN_PRODUCTION, InvalidXLogRecPtr);
+	UT_ASSERT_EQ(test_write_fence_calls, 2);
+	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
+	UT_ASSERT_EQ(out.checkPoint, 0x0000000398770000ULL);
+}
+
 /* ======================================================================
  * U12 -- refresh_state: no-op without an anchor; state-only on a valid one
  * ====================================================================== */
@@ -594,7 +701,7 @@ main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_layout);
 	UT_RUN(test_write_read_roundtrip);
 	UT_RUN(test_classify);
@@ -603,6 +710,7 @@ main(void)
 	UT_RUN(test_build_from_controlfile);
 	UT_RUN(test_state_carrier);
 	UT_RUN(test_publish_checkpoint);
+	UT_RUN(test_checkpoint_publish_requires_current_owner_before_io);
 	UT_RUN(test_refresh_state);
 	UT_RUN(test_load_adoption);
 	UT_DONE();

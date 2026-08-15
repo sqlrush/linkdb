@@ -55,9 +55,13 @@
 #include <unistd.h>
 
 #include "catalog/pg_control.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_anchor.h"
+#include "cluster/cluster_write_fence.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 
@@ -331,6 +335,25 @@ cluster_recovery_anchor_build_from_controlfile(const ControlFileData *cf,
 	out->unloggedLSN = cf->unloggedLSN;
 }
 
+static bool
+checkpoint_publisher_is_current(uint64 expected_sysid)
+{
+	uint64 self_incarnation;
+
+	if (expected_sysid == 0 || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	/* The delegated EOR checkpointer runs before steady membership admission;
+	 * its existing boot-local OWNER handoff is the sole recovery-actor arm. */
+	if (cluster_cf_owner_eor_local_active())
+		return true;
+	self_incarnation = cluster_qvotec_get_self_incarnation();
+	return self_incarnation != 0
+		&& cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_MEMBER
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			== self_incarnation;
+}
+
 /*
  * cluster_recovery_anchor_publish_checkpoint -- write hook #1 (spec-5.6a
  * D2): publish this node's just-logged checkpoint as the new anchor.  The
@@ -345,6 +368,15 @@ cluster_recovery_anchor_publish_checkpoint(XLogRecPtr checkpoint_lsn,
 {
 	ClusterRecoveryAnchor ra;
 
+	/* RF-ROOT P5: the legacy source anchor remains selected until the R4
+	 * bit22 OPEN cutover, but its checkpoint bypass may no longer publish for
+	 * a fenced, excluded, or superseded node incarnation.  CreateCheckPoint
+	 * calls this while its outer coordinated CF(X) is held. */
+	cluster_write_fence_reject_if_fenced("recovery anchor checkpoint publication");
+	if (!checkpoint_publisher_is_current(sysid))
+		ereport(PANIC,
+				(errmsg("stale cluster member cannot publish a recovery checkpoint anchor")));
+
 	memset(&ra, 0, sizeof(ra));
 	ra.magic = CLUSTER_RECOVERY_ANCHOR_MAGIC;
 	ra.version = CLUSTER_RECOVERY_ANCHOR_VERSION;
@@ -357,6 +389,13 @@ cluster_recovery_anchor_publish_checkpoint(XLogRecPtr checkpoint_lsn,
 	ra.unloggedLSN = unlogged_lsn;
 
 	cluster_recovery_anchor_write(&ra);
+
+	/* A concurrent exclusion discovered after durable publication must stop
+	 * this checkpoint before its caller can recycle WAL. */
+	cluster_write_fence_reject_if_fenced("recovery anchor checkpoint post-publication");
+	if (!checkpoint_publisher_is_current(sysid))
+		ereport(PANIC,
+				(errmsg("cluster recovery checkpoint publisher changed before WAL reuse")));
 }
 
 /*

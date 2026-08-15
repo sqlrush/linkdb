@@ -12,10 +12,86 @@
 #include "postgres.h"
 
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster_control_root_private.h"
 #include "cluster/cluster_wal_thread.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
 #include "portability/instr_time.h"
+
+typedef struct ClusterControlRootPublishAuthorityV1 {
+	bool active;
+	ClusterControlRootPublishReason reason;
+	ClusterControlRootReadToken token;
+	ClusterControlRootPatch patch;
+} ClusterControlRootPublishAuthorityV1;
+
+static ClusterControlRootPublishAuthorityV1 root_publish_authority;
+
+bool
+cluster_control_root_create_authority_current_v1(
+	const ClusterControlRootMigrationImage *image,
+	const ClusterControlRootMigrationRoundV1 *round)
+{
+	/* RF-ROOT P5 closes this public mutation edge.  The R4 OPEN cutover batch
+	 * will replace this refusal with an exact, one-shot coordinator proof. */
+	(void)image;
+	(void)round;
+	return false;
+}
+
+bool
+cluster_control_root_activate_authority_current_v1(
+	const ClusterControlRootFileToken *expected_token,
+	const uint8 expected_round_sha256[32])
+{
+	/* No current product caller owns activation authority. */
+	(void)expected_token;
+	(void)expected_round_sha256;
+	return false;
+}
+
+static bool
+cluster_control_root_publish_authority_bind_v1(
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootPatch *patch,
+	ClusterControlRootPublishReason reason)
+{
+	if (root_publish_authority.active || expected_token == NULL || patch == NULL
+		|| reason != CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN)
+		return false;
+	memset(&root_publish_authority, 0, sizeof(root_publish_authority));
+	root_publish_authority.active = true;
+	root_publish_authority.reason = reason;
+	root_publish_authority.token = *expected_token;
+	root_publish_authority.patch = *patch;
+	return true;
+}
+
+static void
+cluster_control_root_publish_authority_clear_v1(void)
+{
+	explicit_bzero(&root_publish_authority, sizeof(root_publish_authority));
+}
+
+bool
+cluster_control_root_publish_authority_current_v1(
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootPatch *patch,
+	ClusterControlRootPublishReason reason)
+{
+	bool exact = root_publish_authority.active && expected_token != NULL
+		&& patch != NULL && reason == root_publish_authority.reason
+		&& memcmp(expected_token, &root_publish_authority.token,
+				  sizeof(*expected_token)) == 0
+		&& memcmp(patch, &root_publish_authority.patch, sizeof(*patch)) == 0;
+
+	/* One exact compare-and-publish attempt consumes the authority before the
+	 * control-root layer can acquire CF or touch storage.  A failed or nested
+	 * retry must rebuild its upstream proof. */
+	if (exact)
+		cluster_control_root_publish_authority_clear_v1();
+	return exact;
+}
 
 static void
 write_u16_le(uint8 *dst, uint16 value)
@@ -305,9 +381,13 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 	patch.desired.recovered_last_record_crc32c =
 		snapshot.recovered_last_record_crc32c;
 
+	if (!cluster_control_root_publish_authority_bind_v1(
+			&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN))
+		return false;
 	root_result = cluster_control_root_compare_and_publish(
 		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
 		&published, &published_token);
+	cluster_control_root_publish_authority_clear_v1();
 	return root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		   && published.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 		   && published.identity.origin_owner_incarnation == admitted_incarnation

@@ -24,6 +24,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster_control_root_private.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
@@ -1299,6 +1300,11 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 		memset(out_token, 0, sizeof(*out_token));
 	if (!encode_round(round, round_bytes) || !migration_image_validate(image, round))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* A valid migration image describes bytes, not authority to create the
+	 * cluster root.  Until the R4 cutover owner binds its exact proof, reject
+	 * before storage-contract probing, CF acquisition, or file publication. */
+	if (!cluster_control_root_create_authority_current_v1(image, round))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = storage_contract_check(image->storage_uuid, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -1390,6 +1396,11 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 		|| expected_token->format_version != CONTROL_ROOT_FORMAT_VERSION
 		|| expected_token->record_count != CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| bytes_are_zero(expected_round_sha256, PG_SHA256_DIGEST_LENGTH))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* The PREPARED token and round hash establish freshness only.  Activation
+	 * also requires the cutover owner's separately bound authority. */
+	if (!cluster_control_root_activate_authority_current_v1(
+			expected_token, expected_round_sha256))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = storage_contract_check(NULL, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1638,6 +1649,12 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 		|| expected_token->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| expected_token->reserved20 != 0 || expected_token->reserved32 != 0
 		|| !patch_shape_valid(patch, reason))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* RF-ROOT P5: the byte-exact CAS token proves root freshness, not caller
+	 * authority.  Consume the backend-private authority bound by the owning
+	 * publisher before CF acquisition or any file I/O. */
+	if (!cluster_control_root_publish_authority_current_v1(
+			expected_token, patch, reason))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	thread_id = expected_token->origin_thread_id;
 	result = storage_contract_check(NULL, true);
