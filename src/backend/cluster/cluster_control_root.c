@@ -21,6 +21,7 @@
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
@@ -1624,6 +1625,27 @@ apply_patch(ClusterControlRootSnapshot *snapshot, const ClusterControlRootPatch 
 	return true;
 }
 
+static bool
+root_publish_requires_walr(ClusterControlRootPublishReason reason,
+						   bool *require_sealed_pin)
+{
+	*require_sealed_pin = false;
+	switch (reason) {
+		case CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN:
+		case CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE:
+		case CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_DUTY_OPEN:
+		case CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_TAIL_VALIDATED:
+		case CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN:
+		case CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE:
+			return true;
+		case CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE:
+			*require_sealed_pin = true;
+			return true;
+		default:
+			return false;
+	}
+}
+
 ClusterControlRootResult
 cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
 									 const ClusterControlRootPatch *patch,
@@ -1638,7 +1660,11 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 	ClusterControlRootReadToken token;
 	ClusterControlRootSnapshot snapshot;
 	ClusterControlRootResult result;
+	ClusterWalRootPublishGuard *walr_guard = NULL;
+	ClusterWalPinResult walr_result;
+	ClusterWalrReleaseResult walr_release_result;
 	uint16 thread_id;
+	bool require_sealed_pin;
 
 	if (out_snapshot != NULL)
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
@@ -1657,11 +1683,24 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 			expected_token, patch, reason))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	thread_id = expected_token->origin_thread_id;
+	if (root_publish_requires_walr(reason, &require_sealed_pin)) {
+		walr_result = cluster_wal_retention_root_publish_begin_exact(
+			expected_token, require_sealed_pin, &walr_guard);
+		if (walr_result == CLUSTER_WAL_PIN_INVALID)
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		if (walr_result == CLUSTER_WAL_PIN_STALE)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		if (walr_result != CLUSTER_WAL_PIN_OK)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
 	result = storage_contract_check(NULL, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		return result;
+		goto release_walr;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	{
+		result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		goto release_walr;
+	}
 	primary = palloc(sizeof(*primary));
 	bak = palloc(sizeof(*bak));
 	updated = palloc(sizeof(*updated));
@@ -1746,6 +1785,14 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 	pfree(bak);
 	pfree(primary);
 	result = release_cf(ExclusiveLock, result);
+
+release_walr:
+	if (walr_guard != NULL) {
+		walr_release_result =
+			cluster_wal_retention_root_publish_end(&walr_guard);
+		if (walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
+			result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	}
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		if (out_snapshot != NULL)
 			*out_snapshot = snapshot;

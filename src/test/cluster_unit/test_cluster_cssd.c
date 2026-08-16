@@ -43,6 +43,7 @@
 #include <signal.h>
 
 #include "cluster/cluster_cssd.h"
+#include "storage/proc.h"
 
 #undef printf
 #undef fprintf
@@ -68,6 +69,7 @@ bool IsUnderPostmaster = false;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 int MyProcPid = 0;
+PGPROC *MyProc = NULL;
 int cluster_node_id = 0;
 
 void
@@ -135,13 +137,25 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+static bool ut_lwlock_conditional_result = true;
+static int ut_lwlock_blocking_calls = 0;
+static int ut_lwlock_conditional_calls = 0;
+
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
 {}
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	ut_lwlock_blocking_calls++;
 	return true;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
+						 LWLockMode mode pg_attribute_unused())
+{
+	ut_lwlock_conditional_calls++;
+	return ut_lwlock_conditional_result;
 }
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
@@ -565,12 +579,49 @@ UT_TEST(test_t11_declared_alive_filter_L86)
 }
 
 
+UT_TEST(test_t12_no_pgproc_status_reads_never_block)
+{
+	PGPROC fake_proc;
+
+	shmem_init_done = false;
+	cluster_cssd_shmem_init();
+	MyProc = NULL;
+	ut_lwlock_conditional_result = false;
+	ut_lwlock_blocking_calls = 0;
+	ut_lwlock_conditional_calls = 0;
+
+	UT_ASSERT_EQ((int)cluster_cssd_get_status(),
+				 (int)CLUSTER_CSSD_STARTING);
+	UT_ASSERT(!cluster_cssd_wait_for_ready(250));
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+	UT_ASSERT(ut_lwlock_conditional_calls >= 2);
+
+	ut_lwlock_conditional_result = true;
+	ut_lwlock_blocking_calls = 0;
+	ut_lwlock_conditional_calls = 0;
+	UT_ASSERT_EQ((int)cluster_cssd_get_status(),
+				 (int)CLUSTER_CSSD_STARTING);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 1);
+
+	memset(&fake_proc, 0, sizeof(fake_proc));
+	MyProc = &fake_proc;
+	ut_lwlock_blocking_calls = 0;
+	ut_lwlock_conditional_calls = 0;
+	UT_ASSERT_EQ((int)cluster_cssd_get_status(),
+				 (int)CLUSTER_CSSD_STARTING);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 1);
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 0);
+	MyProc = NULL;
+}
+
+
 UT_DEFINE_GLOBALS();
 
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 
 	UT_RUN(test_t1_status_to_string_round_trip);
 	UT_RUN(test_t2_peer_state_to_string_round_trip);
@@ -583,6 +634,7 @@ main(void)
 	UT_RUN(test_t9_outbound_slot_pending_state_transitions_static_grep);
 	UT_RUN(test_t10_grace_period_field_exists_static_grep);
 	UT_RUN(test_t11_declared_alive_filter_L86);
+	UT_RUN(test_t12_no_pgproc_status_reads_never_block);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

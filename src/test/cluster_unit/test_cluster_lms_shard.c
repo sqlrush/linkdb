@@ -40,6 +40,7 @@
 
 #include "common/relpath.h" /* ForkNumber names */
 #include "storage/block.h"
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_lms_shard.h"
 
 #undef printf
@@ -347,10 +348,33 @@ UT_TEST(test_shard_golden)
 	}
 }
 
+UT_TEST(test_lms_child_exit_invalidates_shared_readiness)
+{
+	ClusterLmsSharedState state;
+
+	memset(&state, 0, sizeof(state));
+	pg_atomic_init_u32(&state.lms_state, (uint32)CLUSTER_LMS_READY);
+	pg_atomic_init_u64(&state.recovery_ready_generation, UINT64_C(7));
+	pg_atomic_init_u64(&state.serving_requested_generation, UINT64_C(7));
+	state.pid = 1234;
+	state.worker_pids[0] = 1234;
+
+	cluster_lms_shared_mark_child_exit(&state);
+
+	UT_ASSERT_EQ((int)pg_atomic_read_u32(&state.lms_state),
+				 (int)CLUSTER_LMS_STOPPED);
+	UT_ASSERT_EQ(state.pid, 0);
+	UT_ASSERT_EQ(state.worker_pids[0], 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state.recovery_ready_generation),
+				 UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state.serving_requested_generation),
+				 UINT64_C(0));
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_shard_in_range);
 	UT_RUN(test_shard_n1_degenerate_zero);
 	UT_RUN(test_shard_deterministic);
@@ -360,6 +384,7 @@ main(void)
 	UT_RUN(test_shard_distribution);
 	UT_RUN(test_shard_boundary_tags);
 	UT_RUN(test_shard_golden);
+	UT_RUN(test_lms_child_exit_invalidates_shared_readiness);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

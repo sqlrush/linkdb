@@ -138,8 +138,13 @@ extern ClusterFormationWitnessResult cluster_formation_witness_decide_v1(
 extern ClusterFormationWitnessResult cluster_formation_witness_build_wait(
 	uint16 origin_thread, bool opening_new_duty, int timeout_ms,
 	ClusterFormationWitnessV1 **out);
+extern ClusterFormationWitnessResult cluster_formation_witness_build_live_wait(
+	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out);
 extern ClusterFormationWitnessResult cluster_formation_witness_revalidate_nowait(
 	const ClusterFormationWitnessV1 *witness);
+extern ClusterFormationWitnessResult cluster_formation_classification_revalidate_nowait(
+	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
+	const ClusterFormationSnapshotV1 *snapshot);
 /* Copy the immutable classification already owned by an admitted witness.
  * This performs no current-state read; callers must separately revalidate the
  * same opaque witness before consuming the copy. */

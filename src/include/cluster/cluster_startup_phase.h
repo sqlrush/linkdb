@@ -69,9 +69,12 @@
 #ifndef CLUSTER_STARTUP_PHASE_H
 #define CLUSTER_STARTUP_PHASE_H
 
+#include "cluster/cluster_recovery_duty.h"
 #include "datatype/timestamp.h"
+#include "storage/lockdefs.h"
 #include "storage/lwlock.h"
 
+typedef struct ClusterResId ClusterResId;
 
 /*
  * ClusterStartupPhase -- single source of truth for postmaster startup
@@ -255,6 +258,15 @@ typedef struct PhaseHistoryEntry {
 	TimestampTz entered_at;
 } PhaseHistoryEntry;
 
+/* RF-ROOT P6 Scheme A: control-plane formation is not data-plane service.
+ * The values are deliberately monotone within one boot generation. */
+typedef enum ClusterAuthorityReadiness {
+	CLUSTER_AUTHORITY_OFF = 0,
+	CLUSTER_AUTHORITY_STARTING = 1,
+	CLUSTER_AUTHORITY_RECOVERY_READY = 2,
+	CLUSTER_AUTHORITY_SERVING_READY = 3
+} ClusterAuthorityReadiness;
+
 typedef struct ClusterPhaseSharedState {
 	LWLock lwlock; /* LWTRANCHE_CLUSTER_STARTUP_PHASE */
 	ClusterStartupPhase current_phase;
@@ -262,6 +274,13 @@ typedef struct ClusterPhaseSharedState {
 	PhaseHistoryEntry phase_history[CLUSTER_PHASE_HISTORY_RING_SIZE];
 	int phase_history_count; /* total entries ever written (lifetime) */
 	int phase_history_head;	 /* next slot to write (0..RING_SIZE-1) */
+	ClusterAuthorityReadiness authority_readiness;
+	bool authority_managed;
+	uint16 authority_origin_thread;
+	uint64 authority_boot_incarnation;
+	uint64 authority_lms_generation;
+	ClusterFenceAuthorityProof authority_fence;
+	ClusterFormationSnapshotV1 authority_formation;
 } ClusterPhaseSharedState;
 
 
@@ -279,6 +298,27 @@ typedef struct ClusterPhaseSharedState {
 extern Size cluster_phase_shmem_size(void);
 extern void cluster_phase_shmem_init(void);
 extern void cluster_phase_shmem_register(void);
+
+/* Scheme A readiness lifecycle.  Only the startup driver publishes forward
+ * transitions; every consumer gets a generation-revalidated predicate. */
+extern ClusterAuthorityReadiness cluster_authority_readiness_get(void);
+extern bool cluster_authority_readiness_managed(void);
+extern bool cluster_authority_readiness_begin(
+	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
+	const ClusterFormationSnapshotV1 *formation);
+extern bool cluster_authority_readiness_bind_recovery_generation(
+	uint64 lms_generation);
+extern bool cluster_authority_readiness_publish_recovery(uint64 lms_generation);
+extern bool cluster_authority_readiness_publish_serving(void);
+extern void cluster_authority_readiness_clear(void);
+extern bool cluster_recovery_transport_is_current(void);
+extern bool cluster_recovery_authority_is_current(void);
+extern bool cluster_serving_ready_is_current(void);
+extern bool cluster_authority_serving_rebind_lmon(void);
+extern bool cluster_recovery_authority_resid_mode_allowed(
+	const ClusterResId *resid, LOCKMODE mode);
+extern bool cluster_recovery_authority_request_allowed(
+	const ClusterResId *resid, LOCKMODE mode, bool startup_process);
 
 
 /* ----------

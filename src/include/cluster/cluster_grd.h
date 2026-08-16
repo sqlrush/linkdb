@@ -71,6 +71,8 @@
 #include "port/atomics.h"
 #include "storage/lock.h" /* LOCKTAG */
 
+typedef struct ClusterFormationSnapshotV1 ClusterFormationSnapshotV1;
+
 /*
  * 4096 shard fixed (Q8 user-approved).  Future amend path:
  *   - 实测 hot shard → 升 GUC cluster.grd_shard_count (spec-2.X future)
@@ -181,6 +183,26 @@ typedef struct ClusterGrdShared {
 	pg_atomic_uint32 shard_phase[PGRAC_GRD_SHARD_COUNT];
 
 	pg_atomic_uint32 master_map_initialized;	 /* 0 until LMON init */
+	/* Scheme A recovery-authority barrier.  The existing REDECLARE_DONE
+	 * epoch/hash wire converges holder truth across the exact formation.
+	 * A1 keeps every blocking step in LMON: Postmaster publishes the request
+	 * fields, then observes only generation-bound atomic terminal state. */
+	pg_atomic_uint64 recovery_authority_request_sequence;
+	pg_atomic_uint64 recovery_authority_request_generation;
+	pg_atomic_uint64 recovery_authority_cancel_generation;
+	pg_atomic_uint64 recovery_authority_terminal_generation;
+	pg_atomic_uint32 recovery_authority_terminal_result;
+	pg_atomic_uint64 recovery_authority_request_boot_incarnation;
+	pg_atomic_uint64 recovery_authority_request_lms_generation;
+	pg_atomic_uint64 recovery_authority_request_master_refresh;
+	pg_atomic_uint64 recovery_authority_boot_incarnation;
+	pg_atomic_uint64 recovery_authority_lms_generation;
+	pg_atomic_uint64 recovery_authority_master_refresh;
+	pg_atomic_uint64 recovery_authority_formation_epoch;
+	pg_atomic_uint64 recovery_authority_bitmap_hash;
+	pg_atomic_uint64 recovery_authority_members[2];
+	pg_atomic_uint64 recovery_authority_done_epoch[CLUSTER_MAX_NODES];
+	pg_atomic_uint64 recovery_authority_done_hash[CLUSTER_MAX_NODES];
 	pg_atomic_uint64 resid_encode_count;		 /* incremented per encode */
 	pg_atomic_uint64 shard_lookup_count;		 /* total lookups */
 	pg_atomic_uint64 local_master_lookup_count;	 /* lookup_master == self */
@@ -537,6 +559,15 @@ extern uint32 cluster_grd_shard_lookup(const ClusterResId *resid);
  */
 extern int32 cluster_grd_shard_master(uint32 shard_id);
 extern bool cluster_grd_is_local_master(uint32 shard_id);
+extern bool cluster_grd_recovery_authority_barrier_wait(
+	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
+	uint64 lms_generation, int timeout_ms);
+extern void cluster_grd_recovery_authority_lmon_tick(void);
+extern bool cluster_grd_recovery_authority_is_current(
+	uint64 boot_incarnation, uint64 lms_generation);
+extern bool cluster_grd_serving_authority_rebind_lmon(
+	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
+	uint64 lms_generation);
 
 /*
  * spec-4.6 D2 — failure-driven remaster (NOT affinity/DRM, NOT
@@ -687,6 +718,7 @@ extern void cluster_grd_inc_join_block_failclosed(void);
 /* Shape A (crash-rejoin re-declare barrier) — off-path boot barrier flag. */
 extern bool cluster_grd_offpath_boot_decided(void);
 extern void cluster_grd_set_offpath_boot_decided(void);
+extern bool cluster_grd_join_view_rebuilt(void);
 extern void cluster_grd_inc_offpath_crash_rejoin_fenced(void);
 extern uint64 cluster_grd_offpath_crash_rejoin_fenced_count(void);
 
@@ -1084,7 +1116,12 @@ extern ClusterGrdEntryResult cluster_grd_revalidate_and_promote(const ClusterRes
 																uint64 gen_snapshot);
 
 extern ClusterGrdEntryResult cluster_grd_release_holder_by_id(const ClusterResId *resid,
-															  const ClusterGrdHolderId *holder);
+														 const ClusterGrdHolderId *holder);
+/* Lookup an exact full-identity holder without creating an entry.  Used by
+ * recovery-mode release gates to prove the allowlisted mode before mutation. */
+extern bool cluster_grd_holder_mode_by_id(const ClusterResId *resid,
+										 const ClusterGrdHolderId *holder,
+										 LOCKMODE *out_mode);
 
 extern ClusterGrdEntryResult cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
 																  const ClusterGrdHolderId *holder);
@@ -1363,13 +1400,15 @@ StaticAssertDecl(sizeof(ClusterGrdConvert) == 88,
  *	                 fail-closed (53R74 / SQLSTATE mapping forward 5.2).
  *	QUEUE_FULL       convert queue exhausted (+ converts_full_count).
  *	NOT_READY        GRD not initialised.
+ *	CONFLICT_NOWAIT  conditional UPGRADE conflicts; no converts[] mutation.
  */
 typedef enum ClusterGrdConvertResult {
 	CLUSTER_GRD_CONVERT_GRANTED_INPLACE = 0,
 	CLUSTER_GRD_CONVERT_ENQUEUED = 1,
 	CLUSTER_GRD_CONVERT_ILLEGAL = 2,
 	CLUSTER_GRD_CONVERT_QUEUE_FULL = 3,
-	CLUSTER_GRD_CONVERT_NOT_READY = 4
+	CLUSTER_GRD_CONVERT_NOT_READY = 4,
+	CLUSTER_GRD_CONVERT_CONFLICT_NOWAIT = 5
 } ClusterGrdConvertResult;
 
 /*
@@ -1393,6 +1432,11 @@ typedef struct ClusterGrdGrantIdentity {
 extern ClusterGrdConvertResult cluster_grd_entry_request_convert(ClusterGrdEntry *entry,
 																 const ClusterGrdConvert *req,
 																 bool *out_drain_hint);
+
+/* RF-ROOT P6 S05-3H -- return a conflicting UPGRADE immediately without
+ * inserting it into converts[]. */
+extern ClusterGrdConvertResult cluster_grd_entry_request_convert_nowait(
+	ClusterGrdEntry *entry, const ClusterGrdConvert *req, bool *out_drain_hint);
 
 /*
  * D5 — convert-priority drain (caller holds entry->lock).  Grants every
@@ -1466,6 +1510,12 @@ extern ClusterGrdConvertResult cluster_grd_convert_or_enqueue_meta(
 	LOCKMODE current_mode, LOCKMODE requested_mode, uint64 convert_request_id, int32 source_node_id,
 	uint64 shard_master_generation, ClusterGrdWaiterMeta meta,
 	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
+
+/* RF-ROOT P6 S05-3H -- master-side non-enqueuing same-holder conversion. */
+extern ClusterGrdConvertResult cluster_grd_convert_nowait(
+	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
+	LOCKMODE current_mode, LOCKMODE requested_mode, uint64 convert_request_id,
+	uint64 old_request_id, int32 source_node_id, uint64 shard_master_generation);
 
 /*
  * spec-5.3 §3.5 native-probe clear path: commit a convert located by the

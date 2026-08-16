@@ -53,6 +53,8 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_native_lock_probe.h" /* spec-5.3 same-lock-group helper */
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_wal_retention.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
@@ -102,6 +104,9 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 bool cluster_lms_enabled = true;
 bool cluster_lmd_enabled = true;
 static bool stub_lms_ready_for_test = true;
+static bool stub_authority_managed_for_test = false;
+static bool stub_serving_ready_for_test = false;
+static bool stub_recovery_ready_for_test = false;
 static int32 stub_master_node = -1;
 static uint32 stub_local_release_result = GES_REJECT_REASON_NONE;
 
@@ -109,6 +114,28 @@ bool
 cluster_lms_is_ready(void)
 {
 	return stub_lms_ready_for_test;
+}
+
+bool
+cluster_authority_readiness_managed(void)
+{
+	return stub_authority_managed_for_test;
+}
+
+bool
+cluster_serving_ready_is_current(void)
+{
+	return stub_serving_ready_for_test;
+}
+
+bool
+cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE mode,
+										   bool startup_process)
+{
+	return stub_recovery_ready_for_test && startup_process && resid != NULL
+		&& ((resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock)
+			|| (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE
+				&& mode == ExclusiveLock));
 }
 
 bool
@@ -206,6 +233,7 @@ struct PGPROC {
 	int pgprocno;
 };
 struct PGPROC *MyProc = NULL;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 int cluster_node_id = 0;
 bool cluster_local_fast_path_enabled = true;
@@ -497,6 +525,10 @@ static int stub_ges_request_nowait_wait_calls;
 static int stub_ges_release_timeout_ms;
 static uint32 stub_ges_release_wait_event;
 static int stub_ges_convert_wait_calls;
+static int stub_ges_convert_nowait_wait_calls;
+static uint32 stub_convert_nowait_requested_mode;
+static uint32 stub_convert_nowait_current_mode;
+static uint64 stub_convert_nowait_old_request_id;
 
 PcmXQueueResult
 cluster_pcm_x_nested_wait_guard_before_block(void)
@@ -526,6 +558,21 @@ cluster_ges_send_request_nowait_and_wait(
 	uint32 wait_event pg_attribute_unused())
 {
 	stub_ges_request_nowait_wait_calls++;
+	return stub_ges_reject_reason;
+}
+
+uint32
+cluster_ges_send_convert_nowait_and_wait(
+	const struct ClusterResId *resid pg_attribute_unused(), uint32 requested_mode,
+	uint32 current_mode,
+	const struct ClusterGrdHolderId *holder pg_attribute_unused(),
+	uint64 convert_request_id pg_attribute_unused(), uint64 old_request_id,
+	int timeout_ms pg_attribute_unused(), uint32 wait_event pg_attribute_unused())
+{
+	stub_ges_convert_nowait_wait_calls++;
+	stub_convert_nowait_requested_mode = requested_mode;
+	stub_convert_nowait_current_mode = current_mode;
+	stub_convert_nowait_old_request_id = old_request_id;
 	return stub_ges_reject_reason;
 }
 
@@ -623,6 +670,64 @@ UT_TEST(test_7step_s1_hc1_fail_closed)
 	/* enabled=true + LMS ready → OK_GRANTED(dispatch to S2)*/
 	stub_lms_ready_for_test = true;
 	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req), (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+}
+
+UT_TEST(test_7step_s1_recovery_allowlist_and_no_native_fallback)
+{
+	ClusterLockAcquireRequest req;
+
+	memset(&req, 0, sizeof(req));
+	stub_authority_managed_for_test = true;
+	stub_serving_ready_for_test = false;
+	stub_recovery_ready_for_test = true;
+	stub_lms_ready_for_test = false;
+	cluster_lms_enabled = true;
+	MyAuxProcType = StartupProcess;
+
+	req.resid.type = CLUSTER_CF_RESID_TYPE;
+	req.lockmode = ShareLock;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	req.lockmode = ExclusiveLock;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+
+	req.resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
+	req.lockmode = ExclusiveLock;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	req.lockmode = ShareLock;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+
+	req.resid.type = CLUSTER_IR_RESID_TYPE;
+	req.lockmode = ExclusiveLock;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	MyAuxProcType = NotAnAuxProcess;
+	req.resid.type = CLUSTER_CF_RESID_TYPE;
+	req.lockmode = ShareLock;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+
+	/* A managed formed boot has no cluster.lms_enabled=off native escape. */
+	cluster_lms_enabled = false;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+
+	cluster_lms_enabled = true;
+	stub_serving_ready_for_test = true;
+	stub_lms_ready_for_test = true;
+	req.resid.type = CLUSTER_IR_RESID_TYPE;
+	req.lockmode = ExclusiveLock;
+	UT_ASSERT_EQ((int)cluster_lock_acquire_s1_entry(&req),
+				 (int)CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+
+	stub_authority_managed_for_test = false;
+	stub_serving_ready_for_test = false;
+	stub_recovery_ready_for_test = false;
+	stub_lms_ready_for_test = true;
+	MyAuxProcType = NotAnAuxProcess;
 }
 
 /*
@@ -1076,6 +1181,47 @@ UT_TEST(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits)
 	UT_ASSERT_EQ(stub_ges_convert_wait_calls, convert_calls + 1);
 }
 
+UT_TEST(test_walr_convert_nowait_routes_upgrade_only_and_maps_conflict)
+{
+	ClusterLockAcquireRequest req;
+	ClusterLockAcquireResult result;
+	int blocking_calls = stub_ges_convert_wait_calls;
+	int nowait_calls = stub_ges_convert_nowait_wait_calls;
+
+	memset(&req, 0, sizeof(req));
+	req.op = CLUSTER_LOCK_OP_CONVERT;
+	req.current_mode = ShareLock;
+	req.lockmode = ExclusiveLock;
+	req.dontwait = true;
+	req.request_id = UINT64_C(99002);
+	req.convert_old_request_id = UINT64_C(99001);
+
+	stub_pcm_x_nested_guard_result = PCM_X_QUEUE_OK;
+	stub_ges_reject_reason = GES_REJECT_REASON_NONE;
+	result = cluster_lock_acquire_s5_promote(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT_EQ(stub_ges_convert_nowait_wait_calls, nowait_calls + 1);
+	UT_ASSERT_EQ(stub_ges_convert_wait_calls, blocking_calls);
+	UT_ASSERT_EQ(stub_convert_nowait_requested_mode, ExclusiveLock);
+	UT_ASSERT_EQ(stub_convert_nowait_current_mode, ShareLock);
+	UT_ASSERT_EQ(stub_convert_nowait_old_request_id, UINT64_C(99001));
+
+	stub_ges_reject_reason = GES_REJECT_REASON_LOCK_CONFLICT;
+	result = cluster_lock_acquire_s5_promote(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_NOT_AVAIL);
+	UT_ASSERT_EQ(stub_ges_convert_nowait_wait_calls, nowait_calls + 2);
+
+	/* X->S is compatible by construction and stays on existing opcode-2
+	 * CONVERT; dontwait does not change it into the opcode-15 upgrade. */
+	req.current_mode = ExclusiveLock;
+	req.lockmode = ShareLock;
+	stub_ges_reject_reason = GES_REJECT_REASON_NONE;
+	result = cluster_lock_acquire_s5_promote(&req);
+	UT_ASSERT_EQ(result, CLUSTER_LOCK_ACQUIRE_OK_CONVERTED);
+	UT_ASSERT_EQ(stub_ges_convert_wait_calls, blocking_calls + 1);
+	UT_ASSERT_EQ(stub_ges_convert_nowait_wait_calls, nowait_calls + 2);
+}
+
 
 /* RF A1 R2: a CF resource can never use dead-master native fallback. */
 UT_TEST(test_cf_s4_dead_master_native_is_nonaffirmative)
@@ -1176,10 +1322,11 @@ UT_DEFINE_GLOBALS();
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
+	UT_RUN(test_7step_s1_recovery_allowlist_and_no_native_fallback);
 	UT_RUN(test_7step_individual_steps_null_req_internal);
 	UT_RUN(test_s6_local_master_unconfirmed_release_fails_closed);
 	UT_RUN(test_7step_top_level_null_req_s7_cleanup_invoked);
@@ -1192,6 +1339,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_ul_session_advisory_globalize_gate);
 	UT_RUN(test_ul_try_lock_nowait_s4_reject_mapping);
 	UT_RUN(test_pcm_x_nested_guard_fails_before_ges_request_and_convert_waits);
+	UT_RUN(test_walr_convert_nowait_routes_upgrade_only_and_maps_conflict);
 	UT_RUN(test_cf_s4_dead_master_native_is_nonaffirmative);
 	UT_RUN(test_native_probe_same_lock_group_exempt);
 	UT_RUN(test_s5_not_found_benign_narrow);

@@ -215,6 +215,15 @@ cluster_cssd_shmem_register(void)
 	cluster_shmem_register_region(&cluster_cssd_region);
 }
 
+static bool
+cluster_cssd_lock_acquire(LWLockMode mode)
+{
+	if (MyProc == NULL)
+		return LWLockConditionalAcquire(&CssdShmem->lwlock, mode);
+	LWLockAcquire(&CssdShmem->lwlock, mode);
+	return true;
+}
+
 
 /* ============================================================
  * Lifecycle accessors (LW_SHARED).
@@ -230,7 +239,8 @@ cluster_cssd_get_pid(void)
 
 	if (CssdShmem == NULL)
 		return 0;
-	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+	if (!cluster_cssd_lock_acquire(LW_SHARED))
+		return 0;
 	v = CssdShmem->pid;
 	LWLockRelease(&CssdShmem->lwlock);
 	return v;
@@ -243,7 +253,8 @@ cluster_cssd_get_spawned_at(void)
 
 	if (CssdShmem == NULL)
 		return 0;
-	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+	if (!cluster_cssd_lock_acquire(LW_SHARED))
+		return 0;
 	v = CssdShmem->spawned_at;
 	LWLockRelease(&CssdShmem->lwlock);
 	return v;
@@ -256,7 +267,8 @@ cluster_cssd_get_ready_at(void)
 
 	if (CssdShmem == NULL)
 		return 0;
-	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+	if (!cluster_cssd_lock_acquire(LW_SHARED))
+		return 0;
 	v = CssdShmem->ready_at;
 	LWLockRelease(&CssdShmem->lwlock);
 	return v;
@@ -269,7 +281,8 @@ cluster_cssd_get_last_liveness_tick_at(void)
 
 	if (CssdShmem == NULL)
 		return 0;
-	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+	if (!cluster_cssd_lock_acquire(LW_SHARED))
+		return 0;
 	v = CssdShmem->last_liveness_tick_at;
 	LWLockRelease(&CssdShmem->lwlock);
 	return v;
@@ -282,7 +295,8 @@ cluster_cssd_get_main_loop_iters(void)
 
 	if (CssdShmem == NULL)
 		return 0;
-	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+	if (!cluster_cssd_lock_acquire(LW_SHARED))
+		return 0;
 	v = (uint64)CssdShmem->main_loop_iters;
 	LWLockRelease(&CssdShmem->lwlock);
 	return v;
@@ -295,7 +309,8 @@ cluster_cssd_get_status(void)
 
 	if (CssdShmem == NULL)
 		return CLUSTER_CSSD_STARTING;
-	LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+	if (!cluster_cssd_lock_acquire(LW_SHARED))
+		return CLUSTER_CSSD_STARTING;
 	v = CssdShmem->status;
 	LWLockRelease(&CssdShmem->lwlock);
 	return v;
@@ -1015,7 +1030,11 @@ cluster_cssd_wait_for_ready(int timeout_ms)
 	while (waited < timeout_ms) {
 		ClusterCssdStatus s;
 
-		LWLockAcquire(&CssdShmem->lwlock, LW_SHARED);
+		if (!cluster_cssd_lock_acquire(LW_SHARED)) {
+			pg_usleep(sleep_ms * 1000L);
+			waited += sleep_ms;
+			continue;
+		}
 		s = CssdShmem->status;
 		LWLockRelease(&CssdShmem->lwlock);
 

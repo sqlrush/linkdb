@@ -276,6 +276,10 @@ typedef struct ClusterLmsSharedState {
 	 *	caller sees the fresh composite.
 	 */
 	pg_atomic_uint64 lms_restart_generation;
+	/* Scheme A boot-local readiness split.  Each value is either zero or the
+	 * exact lms_restart_generation it belongs to. */
+	pg_atomic_uint64 recovery_ready_generation;
+	pg_atomic_uint64 serving_requested_generation;
 
 	/* spec-2.27 D7 / HC54 — priority starvation observability counter.
 	 *
@@ -580,6 +584,9 @@ extern bool cluster_lms_owns_grant(void);
  *	spec-2.20 7-step S1 entry 走此 helper 实现 HC1 fail-closed。
  */
 extern bool cluster_lms_is_ready(void);
+extern bool cluster_lms_is_recovery_ready(void);
+extern bool cluster_lms_wait_for_recovery_ready(int timeout_ms);
+extern bool cluster_lms_request_serving(void);
 
 /*
  * HC3 producer wake — broadcast cv after successful work_queue enqueue.
@@ -598,5 +605,7 @@ extern void cluster_lms_shmem_request(void);
 extern void cluster_lms_shmem_init(void);
 extern void cluster_lms_shmem_register(void);
 extern ClusterLmsSharedState *cluster_lms_shared_state(void);
+extern void cluster_lms_shared_mark_child_exit(ClusterLmsSharedState *state);
+extern void cluster_lms_mark_child_exit(void);
 
 #endif /* CLUSTER_LMS_H */

@@ -45,10 +45,16 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_cssd.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_wal_retention.h"
+#include "storage/proc.h"
 
 #undef printf
 #undef fprintf
@@ -82,6 +88,7 @@ cluster_injection_run(const char *name pg_attribute_unused())
 
 /* miscadmin: HC1 Assert reads IsUnderPostmaster. */
 bool IsUnderPostmaster = false;
+PGPROC *MyProc = NULL;
 
 /* cluster_phase legacy mirror (HC2 derived).  Real backend gets it from
  * cluster_elog.o; the unit test provides a local writable storage so
@@ -222,6 +229,9 @@ pg_snprintf(char *str, size_t count, const char *fmt, ...)
  */
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+static bool phase_lwlock_conditional_result = true;
+static int phase_lwlock_blocking_calls = 0;
+static int phase_lwlock_conditional_calls = 0;
 
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
@@ -230,7 +240,16 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	phase_lwlock_blocking_calls++;
 	return true;
+}
+
+bool
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
+						 LWLockMode mode pg_attribute_unused())
+{
+	phase_lwlock_conditional_calls++;
+	return phase_lwlock_conditional_result;
 }
 
 void
@@ -295,6 +314,24 @@ static char phase4_events[32];
 static int phase4_event_count = 0;
 static bool phase4_test_in_quorum = true;
 static int phase4_quorum_check_calls = 0;
+static ClusterCssdStatus phase_test_cssd_status = CLUSTER_CSSD_DOWN;
+static ClusterQvotecStatus phase_test_qvotec_status = CLUSTER_QVOTEC_DOWN;
+static bool phase_test_cssd_spawn_ok = true;
+static bool phase_test_cssd_ready_ok = true;
+static bool phase_test_qvotec_spawn_ok = true;
+static bool phase_test_qvotec_ready_ok = true;
+static ClusterFormationWitnessResult phase_test_formation_result
+	= CLUSTER_FORMATION_WITNESS_READY;
+static int phase_test_formation_unavailable_attempts = 0;
+static int64 phase_test_formation_unavailable_advance_us = 0;
+static bool phase_test_classification_current = true;
+static bool phase_test_grd_authority_ok = true;
+static bool phase_test_lms_recovery_ready_ok = true;
+static uint64 phase_test_lms_generation = 7;
+static int phase_test_lms_start_calls = 0;
+static uint8 phase_test_formation_epoch = 1;
+static bool phase_test_expire_formation_during_lms = false;
+static bool phase_test_formation_expired = false;
 
 static void
 record_phase4_event(char event)
@@ -308,25 +345,25 @@ record_phase4_event(char event)
 int
 cluster_lmon_start(void)
 {
-	return 0;
+	return 9;
 }
 
 bool
 cluster_lmon_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
-	return false;
+	return true;
 }
 
 /* Spec-1.12 stubs. */
 int
 cluster_lck_start(void)
 {
-	return 0;
+	return 10;
 }
 bool
 cluster_lck_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
-	return false;
+	return true;
 }
 
 /* Spec-1.13 stubs. */
@@ -362,13 +399,29 @@ int
 cluster_cssd_start(void)
 {
 	record_phase4_event('C');
+	if (!phase_test_cssd_spawn_ok)
+		return 0;
+	phase_test_cssd_status = CLUSTER_CSSD_STARTING;
 	return 12;
 }
 bool
 cluster_cssd_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
 	record_phase4_event('c');
+	if (!phase_test_cssd_ready_ok)
+		return false;
+	phase_test_cssd_status = CLUSTER_CSSD_READY;
 	return true;
+}
+ClusterCssdStatus
+cluster_cssd_get_status(void)
+{
+	return phase_test_cssd_status;
+}
+pid_t
+cluster_cssd_get_pid(void)
+{
+	return phase_test_cssd_status == CLUSTER_CSSD_DOWN ? 0 : 12;
 }
 
 /* spec-2.6 Sprint A Step 3 D7 stubs. */
@@ -376,28 +429,200 @@ pid_t
 cluster_qvotec_start(void)
 {
 	record_phase4_event('Q');
+	if (!phase_test_qvotec_spawn_ok)
+		return 0;
+	phase_test_qvotec_status = CLUSTER_QVOTEC_STARTING;
 	return 13;
 }
 bool
 cluster_qvotec_wait_for_ready(int timeout_ms pg_attribute_unused())
 {
 	record_phase4_event('q');
+	if (!phase_test_qvotec_ready_ok)
+		return false;
+	phase_test_qvotec_status = CLUSTER_QVOTEC_READY;
 	return true;
+}
+int
+cluster_qvotec_get_status(void)
+{
+	return phase_test_qvotec_status;
+}
+int
+cluster_qvotec_get_pid(void)
+{
+	return phase_test_qvotec_status == CLUSTER_QVOTEC_DOWN ? 0 : 13;
 }
 bool
 cluster_qvotec_in_quorum(void)
 {
-	if (phase4_quorum_check_calls++ == 0)
+	phase4_quorum_check_calls++;
+	if (phase4_quorum_check_calls == 1)
 		record_phase4_event('V');
 	return phase4_test_in_quorum;
+}
+
+uint16
+cluster_wal_thread_id(void)
+{
+	return 1;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unused(),
+									  int timeout_ms pg_attribute_unused(),
+									  ClusterFormationWitnessV1 **out)
+{
+	record_phase4_event('F');
+	if (phase_test_formation_unavailable_attempts > 0) {
+		phase_test_formation_unavailable_attempts--;
+		phase4_test_now += phase_test_formation_unavailable_advance_us;
+		*out = NULL;
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	}
+	*out = phase_test_formation_result == CLUSTER_FORMATION_WITNESS_READY
+		? (ClusterFormationWitnessV1 *)(uintptr_t)1 : NULL;
+	return phase_test_formation_result;
+}
+
+void
+cluster_formation_witness_destroy(ClusterFormationWitnessV1 **witness)
+{
+	*witness = NULL;
+}
+
+bool
+cluster_formation_witness_copy_classification_v1(
+	const ClusterFormationWitnessV1 *witness pg_attribute_unused(),
+	uint16 *origin_thread, ClusterFenceAuthorityProof *authority,
+	ClusterFormationSnapshotV1 *snapshot)
+{
+	record_phase4_event('X');
+	memset(authority, 0, sizeof(*authority));
+	memset(snapshot, 0, sizeof(*snapshot));
+	*origin_thread = 1;
+	snapshot->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	snapshot->membership.last_admitted_incarnation[0] = 11;
+	snapshot->reserved[0] = phase_test_formation_epoch;
+	return true;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_revalidate_nowait(
+	const ClusterFormationWitnessV1 *witness pg_attribute_unused())
+{
+	return phase_test_classification_current
+		? CLUSTER_FORMATION_WITNESS_READY
+		: CLUSTER_FORMATION_WITNESS_UNSTABLE;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_classification_revalidate_nowait(
+	uint16 origin_thread pg_attribute_unused(),
+	const ClusterFenceAuthorityProof *authority pg_attribute_unused(),
+	const ClusterFormationSnapshotV1 *snapshot pg_attribute_unused())
+{
+	return phase_test_classification_current
+		&& snapshot->reserved[0] == phase_test_formation_epoch
+		? CLUSTER_FORMATION_WITNESS_READY
+		: CLUSTER_FORMATION_WITNESS_UNSTABLE;
+}
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(
+	uint16 origin_thread, ClusterFormationSnapshotV1 *snapshot)
+{
+	if (origin_thread != 1 || snapshot == NULL)
+		return false;
+	memset(snapshot, 0, sizeof(*snapshot));
+	snapshot->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	snapshot->membership.last_admitted_incarnation[0] = 11;
+	snapshot->reserved[0] = phase_test_formation_epoch;
+	return true;
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return 11;
+}
+
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
+{
+	return 11;
+}
+
+bool
+cluster_grd_recovery_authority_barrier_wait(
+	const ClusterFormationSnapshotV1 *formation pg_attribute_unused(),
+	uint64 boot_incarnation, uint64 lms_generation,
+	int timeout_ms pg_attribute_unused())
+{
+	record_phase4_event('G');
+	return phase_test_grd_authority_ok && boot_incarnation == 11
+		&& lms_generation == phase_test_lms_generation;
+}
+
+bool
+cluster_grd_recovery_authority_is_current(uint64 boot_incarnation,
+										 uint64 lms_generation)
+{
+	return phase_test_grd_authority_ok && boot_incarnation == 11
+		&& lms_generation == phase_test_lms_generation;
+}
+
+bool
+cluster_grd_serving_authority_rebind_lmon(
+	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
+	uint64 lms_generation)
+{
+	return phase_test_grd_authority_ok && formation != NULL
+		&& formation->reserved[0] == phase_test_formation_epoch
+		&& boot_incarnation == 11
+		&& lms_generation == phase_test_lms_generation;
 }
 
 /* spec-2.18 Sprint A stubs. */
 int
 cluster_lms_start(void)
 {
+	phase_test_lms_start_calls++;
 	record_phase4_event('L');
 	return 14;
+}
+bool
+cluster_lms_wait_for_recovery_ready(int timeout_ms pg_attribute_unused())
+{
+	record_phase4_event('r');
+	if (phase_test_expire_formation_during_lms
+		&& !phase_test_formation_expired) {
+		phase_test_formation_epoch++;
+		phase_test_formation_expired = true;
+	}
+	return phase_test_lms_recovery_ready_ok;
+}
+bool
+cluster_lms_is_recovery_ready(void)
+{
+	return phase_test_lms_recovery_ready_ok;
+}
+uint64
+cluster_lms_get_lms_restart_generation(void)
+{
+	return phase_test_lms_generation;
+}
+void
+cluster_lms_wakeup(int worker_id)
+{
+	UT_ASSERT_EQ(worker_id, 0);
+	record_phase4_event('W');
+}
+bool
+cluster_lms_request_serving(void)
+{
+	cluster_lms_wakeup(0);
+	return phase_test_lms_recovery_ready_ok;
 }
 bool
 cluster_lms_wait_for_ready(int timeout_ms pg_attribute_unused())
@@ -410,6 +635,36 @@ cluster_lms_is_ready(void)
 {
 	record_phase4_event('E');
 	return true;
+}
+
+static void
+reset_phase_service_fixture(bool formed_registry)
+{
+	phase4_event_count = 0;
+	phase4_events[0] = '\0';
+	phase4_test_now = 0;
+	phase4_test_in_quorum = true;
+	phase4_quorum_check_calls = 0;
+	phase_test_cssd_status = CLUSTER_CSSD_DOWN;
+	phase_test_qvotec_status = CLUSTER_QVOTEC_DOWN;
+	phase_test_cssd_spawn_ok = true;
+	phase_test_cssd_ready_ok = true;
+	phase_test_qvotec_spawn_ok = true;
+	phase_test_qvotec_ready_ok = true;
+	phase_test_formation_result = CLUSTER_FORMATION_WITNESS_READY;
+	phase_test_formation_unavailable_attempts = 0;
+	phase_test_formation_unavailable_advance_us = 0;
+	phase_test_classification_current = true;
+	phase_test_grd_authority_ok = true;
+	phase_test_lms_recovery_ready_ok = true;
+	phase_test_lms_generation = 7;
+	phase_test_lms_start_calls = 0;
+	phase_test_formation_epoch = 1;
+	phase_test_expire_formation_during_lms = false;
+	phase_test_formation_expired = false;
+	cluster_enabled = true;
+	cluster_wal_threads_dir = formed_registry ? "/rf-a1/formed" : NULL;
+	cluster_phase_shmem_init();
 }
 
 
@@ -559,43 +814,360 @@ UT_TEST(test_phase_shmem_register_init_linkable)
 }
 
 
-UT_TEST(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready)
+UT_TEST(test_rf_a1_no_pgproc_phase_reads_never_block)
 {
-	phase4_event_count = 0;
-	phase4_events[0] = '\0';
-	phase4_test_now = 0;
-	phase4_test_in_quorum = true;
-	phase4_quorum_check_calls = 0;
-	cluster_allow_single_node = false;
-	cluster_voting_disks = "disk1,disk2,disk3";
+	PGPROC fake_proc;
+
 	cluster_phase_shmem_init();
-	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
-	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
-	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
-	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
+	MyProc = NULL;
+	phase_lwlock_conditional_result = false;
+	phase_lwlock_blocking_calls = 0;
+	phase_lwlock_conditional_calls = 0;
+	UT_ASSERT_EQ((int)cluster_current_phase(),
+				 (int)CLUSTER_PHASE_PRE_INIT);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
+	UT_ASSERT(!cluster_authority_readiness_managed());
+	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 3);
 
-	cluster_run_phase4_sequence();
+	phase_lwlock_conditional_result = true;
+	phase_lwlock_blocking_calls = 0;
+	phase_lwlock_conditional_calls = 0;
+	UT_ASSERT_EQ((int)cluster_current_phase(),
+				 (int)CLUSTER_PHASE_PRE_INIT);
+	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 1);
 
-	UT_ASSERT_STR_EQ(phase4_events, "DdCcQqVLlESs");
+	memset(&fake_proc, 0, sizeof(fake_proc));
+	MyProc = &fake_proc;
+	phase_lwlock_blocking_calls = 0;
+	phase_lwlock_conditional_calls = 0;
+	UT_ASSERT_EQ((int)cluster_current_phase(),
+				 (int)CLUSTER_PHASE_PRE_INIT);
+	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 1);
+	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 0);
+	MyProc = NULL;
 }
 
 
-UT_TEST(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc)
+UT_TEST(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn)
+{
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+
+	cluster_run_startup_sequence();
+	UT_ASSERT_EQ((int)cluster_current_phase(),
+				 (int)CLUSTER_PHASE_3_RECOVERY);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrG");
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_RECOVERY_READY);
+	UT_ASSERT(cluster_recovery_authority_is_current());
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+
+	cluster_run_phase4_sequence();
+
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrGDdWlEESs");
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_SERVING_READY);
+	UT_ASSERT(cluster_serving_ready_is_current());
+}
+
+
+UT_TEST(test_rf_a2_serving_does_not_consume_recovery_duty_cache)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_run_phase4_sequence();
+
+	/* The finite IR-held recovery cache expires while the admitted
+	 * formation and sealed serving generation remain current. */
+	phase_test_classification_current = false;
+	UT_ASSERT(cluster_serving_ready_is_current());
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_SERVING_READY);
+}
+
+
+UT_TEST(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_run_phase4_sequence();
+
+	phase_test_formation_epoch++;
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_SERVING_READY);
+	UT_ASSERT(cluster_authority_serving_rebind_lmon());
+	UT_ASSERT(cluster_serving_ready_is_current());
+}
+
+UT_TEST(test_rf_a1_readiness_is_monotone_and_generation_bound)
+{
+	ClusterResId recovery_resid;
+
+	reset_phase_service_fixture(true);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
+	UT_ASSERT(!cluster_authority_readiness_publish_serving());
+
+	cluster_run_startup_sequence();
+	UT_ASSERT(cluster_recovery_authority_is_current());
+	memset(&recovery_resid, 0, sizeof(recovery_resid));
+	recovery_resid.type = CLUSTER_CF_RESID_TYPE;
+	recovery_resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	UT_ASSERT(cluster_recovery_authority_request_allowed(
+		&recovery_resid, ShareLock, true));
+	recovery_resid.field1 = 1;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(
+		&recovery_resid, ShareLock, true));
+	memset(&recovery_resid, 0, sizeof(recovery_resid));
+	recovery_resid.field1 = 1;
+	recovery_resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
+	recovery_resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	UT_ASSERT(cluster_recovery_authority_request_allowed(
+		&recovery_resid, ExclusiveLock, true));
+	recovery_resid.field1 = 0;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(
+		&recovery_resid, ExclusiveLock, true));
+	phase_test_lms_generation++;
+	UT_ASSERT(!cluster_recovery_authority_is_current());
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	/* Once this boot enters the managed readiness lifecycle, loss of its
+	 * generation must leave the boot fail-closed.  OFF is a readiness level,
+	 * not permission to fall back to the legacy one-dimensional LMS gate. */
+	UT_ASSERT(cluster_authority_readiness_managed());
+}
+
+UT_TEST(test_rf_a1_missing_authoritative_grd_stops_before_recovery)
 {
 	bool caught_fatal = false;
 
-	phase4_event_count = 0;
-	phase4_events[0] = '\0';
-	phase4_test_now = 0;
+	reset_phase_service_fixture(true);
+	phase_test_grd_authority_ok = false;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrG");
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
+}
+
+
+UT_TEST(test_rf_a1_refreshes_formation_if_proof_expires_during_lms_start)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	phase_test_expire_formation_during_lms = true;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+
+	UT_ASSERT(!caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrFXG");
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_RECOVERY_READY);
+}
+
+
+UT_TEST(test_rf_a1_phase3_quorum_cannot_be_downgraded_by_compat_guc)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
 	phase4_test_in_quorum = false;
-	phase4_quorum_check_calls = 0;
 	cluster_allow_single_node = true;
+
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqV");
+	UT_ASSERT(phase4_quorum_check_calls > 0);
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_3_RECOVERY);
+	phase4_test_in_quorum = true;
+}
+
+
+UT_TEST(test_rf_a1_phase3_service_failures_stop_before_recovery)
+{
+	bool caught_fatal;
+
+	reset_phase_service_fixture(true);
+	phase_test_cssd_spawn_ok = false;
+	caught_fatal = false;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "C");
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_3_RECOVERY);
+
+	reset_phase_service_fixture(true);
+	phase_test_cssd_ready_ok = false;
+	caught_fatal = false;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "Cc");
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_3_RECOVERY);
+
+	reset_phase_service_fixture(true);
+	phase_test_qvotec_spawn_ok = false;
+	caught_fatal = false;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQ");
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_3_RECOVERY);
+
+	reset_phase_service_fixture(true);
+	phase_test_qvotec_ready_ok = false;
+	caught_fatal = false;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQq");
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_3_RECOVERY);
+}
+
+
+UT_TEST(test_rf_a1_phase3_requires_live_formation_before_recovery)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	phase_test_formation_result = CLUSTER_FORMATION_WITNESS_CORRUPT;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVF");
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_3_RECOVERY);
+}
+
+
+UT_TEST(test_rf_a1_phase3_retries_no_pgproc_snapshot_contention)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	phase_test_formation_unavailable_attempts = 1;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+
+	UT_ASSERT(!caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFFXLrG");
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_RECOVERY_READY);
+}
+
+
+UT_TEST(test_rf_a1_phase3_snapshot_contention_expires_fail_closed)
+{
+	bool caught_fatal = false;
+	int saved_timeout = cluster_phase3_timeout;
+
+	reset_phase_service_fixture(true);
+	cluster_phase3_timeout = 1;
+	phase_test_formation_unavailable_attempts = 1;
+	phase_test_formation_unavailable_advance_us = INT64CONST(2000000);
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	cluster_phase3_timeout = saved_timeout;
+
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVF");
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
+}
+
+
+UT_TEST(test_rf_a1_cluster_disabled_keeps_phase3_and_phase4_empty)
+{
+	reset_phase_service_fixture(true);
+	cluster_enabled = false;
+
+	cluster_run_startup_sequence();
+	cluster_run_phase4_sequence();
+
+	UT_ASSERT_STR_EQ(phase4_events, "");
+	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_4_NORMAL);
+	cluster_enabled = true;
+}
+
+
+UT_TEST(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order)
+{
+	reset_phase_service_fixture(false);
+	cluster_run_startup_sequence();
+
+	cluster_run_phase4_sequence();
+
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqDdSs");
+	startup_self_check_calls = 0;
+	postmaster_publish_active_calls = 0;
+	cluster_finalize_startup_running();
+	UT_ASSERT_EQ(startup_self_check_calls, 1);
+	UT_ASSERT_EQ(postmaster_publish_active_calls, 0);
 	cluster_wal_threads_dir = "/rf-a1/formed";
-	cluster_phase_shmem_init();
-	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
-	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
-	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
-	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
+}
+
+
+UT_TEST(test_rf_a1_phase4_refuses_lost_prestartup_service_without_respawn)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	cluster_run_startup_sequence();
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrG");
+	phase_test_cssd_status = CLUSTER_CSSD_DOWN;
 
 	phase4_capture_fatal = true;
 	if (setjmp(phase4_fatal_jump) == 0)
@@ -605,33 +1177,7 @@ UT_TEST(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc)
 	phase4_capture_fatal = false;
 
 	UT_ASSERT(caught_fatal);
-	UT_ASSERT_STR_EQ(phase4_events, "DdCcQqV");
-	UT_ASSERT(phase4_quorum_check_calls > 0);
-	UT_ASSERT_EQ((int)cluster_current_phase(), (int)CLUSTER_PHASE_4_NORMAL);
-	phase4_test_in_quorum = true;
-}
-
-
-UT_TEST(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order)
-{
-	phase4_event_count = 0;
-	phase4_events[0] = '\0';
-	cluster_wal_threads_dir = NULL;
-	cluster_phase_shmem_init();
-	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
-	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
-	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
-	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
-
-	cluster_run_phase4_sequence();
-
-	UT_ASSERT_STR_EQ(phase4_events, "DdSsCcQq");
-	startup_self_check_calls = 0;
-	postmaster_publish_active_calls = 0;
-	cluster_finalize_startup_running();
-	UT_ASSERT_EQ(startup_self_check_calls, 1);
-	UT_ASSERT_EQ(postmaster_publish_active_calls, 0);
-	cluster_wal_threads_dir = "/rf-a1/formed";
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrG");
 }
 
 
@@ -653,7 +1199,7 @@ UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(24);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -662,10 +1208,22 @@ main(void)
 	UT_RUN(test_public_symbols_linkable);
 	UT_RUN(test_phase_shmem_state_size_under_4kb);
 	UT_RUN(test_phase_shmem_register_init_linkable);
-	UT_RUN(test_rf_a1_phase4_orders_stats_after_quorum_and_exact_lms_ready);
+	UT_RUN(test_rf_a1_no_pgproc_phase_reads_never_block);
+	UT_RUN(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn);
+	UT_RUN(test_rf_a2_serving_does_not_consume_recovery_duty_cache);
+	UT_RUN(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
+	UT_RUN(test_rf_a1_readiness_is_monotone_and_generation_bound);
+	UT_RUN(test_rf_a1_missing_authoritative_grd_stops_before_recovery);
+	UT_RUN(test_rf_a1_refreshes_formation_if_proof_expires_during_lms_start);
 	UT_RUN(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order);
-	UT_RUN(test_rf_a1_formed_multinode_quorum_cannot_be_downgraded_by_compat_guc);
+	UT_RUN(test_rf_a1_phase3_quorum_cannot_be_downgraded_by_compat_guc);
+	UT_RUN(test_rf_a1_phase3_service_failures_stop_before_recovery);
+	UT_RUN(test_rf_a1_phase3_requires_live_formation_before_recovery);
+	UT_RUN(test_rf_a1_phase3_retries_no_pgproc_snapshot_contention);
+	UT_RUN(test_rf_a1_phase3_snapshot_contention_expires_fail_closed);
+	UT_RUN(test_rf_a1_cluster_disabled_keeps_phase3_and_phase4_empty);
+	UT_RUN(test_rf_a1_phase4_refuses_lost_prestartup_service_without_respawn);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

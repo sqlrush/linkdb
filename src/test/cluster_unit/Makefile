@@ -89,6 +89,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_hw_snapshot \
         test_cluster_cf_authority \
 		test_cluster_control_root \
+		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
 		test_cluster_formation_witness \
 		test_cluster_write_fence_durable \
@@ -208,10 +209,11 @@ test_cluster_membership: test_cluster_membership.c unit_test.h $(CLUSTER_VERSION
 # BufferTag -> worker shard map).  Links libpgcommon_srv.a for
 # hash_bytes_extended, mirroring test_cluster_grd.
 CLUSTER_LMS_SHARD_O = $(top_builddir)/src/backend/cluster/cluster_lms_shard.o
+CLUSTER_LMS_LIFECYCLE_O = $(top_builddir)/src/backend/cluster/cluster_lms_lifecycle.o
 test_cluster_lms_shard: test_cluster_lms_shard.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_LMS_SHARD_O)
+		$(CLUSTER_LMS_SHARD_O) $(CLUSTER_LMS_LIFECYCLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_LMS_SHARD_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMS_SHARD_O) $(CLUSTER_LMS_LIFECYCLE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
@@ -277,7 +279,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_multixact_current_stats \
 		test_cluster_r4_observe test_cluster_r4_multi_subx_2pc \
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_raw_device_capacity test_cluster_replacement_wire \
-		test_cluster_external_fence test_pgrac_external_fence_protocol,$(SIMPLE_TESTS))
+		test_cluster_external_fence test_pgrac_external_fence_protocol \
+		test_cluster_wal_retention,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -563,6 +566,12 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h \
 		$(CLUSTER_CONTROL_ROOT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+CLUSTER_WAL_RETENTION_O = $(top_builddir)/src/backend/cluster/cluster_wal_retention.o
+test_cluster_wal_retention: test_cluster_wal_retention.c unit_test.h \
+		$(CLUSTER_WAL_RETENTION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_RETENTION_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 CLUSTER_RECOVERY_DUTY_O = $(top_builddir)/src/backend/cluster/cluster_recovery_duty.o

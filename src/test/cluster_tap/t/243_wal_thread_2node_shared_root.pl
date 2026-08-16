@@ -73,6 +73,7 @@ sub window_dump
 my $pair = PostgreSQL::Test::ClusterPair->new_pair('walthreads',
 	quorum_voting_disks => 3,
 	wal_threads_root => 1,
+	true_shared_sysid_cf => 1,
 	# L4 determinism: the crash-recovery leg quiesces with CHECKPOINT and
 	# must keep the redo window free of heap records (heap redo on a
 	# peer-configured node trips the pre-existing 4.7 GCS gap, see the

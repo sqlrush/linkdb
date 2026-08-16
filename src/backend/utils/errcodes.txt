@@ -910,6 +910,12 @@ Section: Class 53 - Insufficient Resources (pgrac extension)
 # ERRCODE_CLUSTER_MXID_HALFSPACE_LIMIT; do not reuse.)
 53RB5    E    ERRCODE_CLUSTER_XID_AUTHORITY_UNAVAILABLE                        cluster_xid_authority_unavailable
 
+# STOP-05: a canonical WAL retirement/reuse action could not prove its exact
+# control-root, recovery-serial, external-fence, WALR, or filesystem authority.
+# Recovery correctness callers stop before mutation instead of skipping the
+# candidate and continuing with an unsafe timeline/archive transition.
+53RBA    E    ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED                             cluster_wal_retention_blocked
+
 Section: Class 54 - Program Limit Exceeded
 
 # this is for wired-in limits, not resource exhaustion problems (class borrowed from DB2)

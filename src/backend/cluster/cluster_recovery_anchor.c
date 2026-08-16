@@ -61,6 +61,10 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_anchor.h"
+#include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_stats.h"
+#include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
@@ -336,6 +340,43 @@ cluster_recovery_anchor_build_from_controlfile(const ControlFileData *cf,
 }
 
 static bool
+checkpoint_phase4_publisher_is_current(uint64 self_incarnation)
+{
+	ClusterWalStateSlot slot;
+	ClusterWalSlotVerdict verdict;
+	TimestampTz phase4_started_at;
+	TimestampTz stats_spawned_at;
+	uint16 own_thread;
+
+	/* STOP01's initial phase4 checkpoint is deliberately before ordinary
+	 * membership admission.  Its sole boot-local proof is the exact Cluster
+	 * Stats incarnation that published this node's ACTIVE WAL slot. */
+	if (self_incarnation == 0 || cluster_current_phase() != CLUSTER_PHASE_4_NORMAL
+		|| cluster_stats_status() != CLUSTER_STATS_SPAWNING
+		|| !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return false;
+
+	own_thread = cluster_wal_thread_id();
+	if (own_thread < XLP_THREAD_ID_FIRST_REAL || own_thread > CLUSTER_WAL_THREAD_MAX
+		|| !cluster_wal_thread_dir_configured() || !cluster_wal_thread_dir_validated()
+		|| cluster_wal_thread_dump_thread_id() != own_thread
+		|| !cluster_wal_state_registry_ready())
+		return false;
+
+	phase4_started_at = cluster_phase_started_at(CLUSTER_PHASE_4_NORMAL);
+	stats_spawned_at = cluster_stats_spawned_at();
+	if (phase4_started_at == 0 || stats_spawned_at == 0
+		|| stats_spawned_at < phase4_started_at)
+		return false;
+
+	memset(&slot, 0, sizeof(slot));
+	verdict = cluster_wal_state_read_slot(own_thread, &slot);
+	return verdict == CLUSTER_WAL_SLOT_OK && slot.thread_id == own_thread
+		&& slot.node_id == cluster_node_id && slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE
+		&& slot.started_at == stats_spawned_at && slot.started_at >= phase4_started_at;
+}
+
+static bool
 checkpoint_publisher_is_current(uint64 expected_sysid)
 {
 	uint64 self_incarnation;
@@ -348,10 +389,12 @@ checkpoint_publisher_is_current(uint64 expected_sysid)
 	if (cluster_cf_owner_eor_local_active())
 		return true;
 	self_incarnation = cluster_qvotec_get_self_incarnation();
-	return self_incarnation != 0
+	if (self_incarnation != 0
 		&& cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_MEMBER
 		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			== self_incarnation;
+			== self_incarnation)
+		return true;
+	return checkpoint_phase4_publisher_is_current(self_incarnation);
 }
 
 /*

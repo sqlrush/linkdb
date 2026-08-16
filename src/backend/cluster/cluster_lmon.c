@@ -655,8 +655,12 @@ cluster_lmon_pid(void)
 
 	if (cluster_lmon_state == NULL)
 		return 0;
-
-	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	if (MyProc == NULL) {
+		if (!LWLockConditionalAcquire(&cluster_lmon_state->lwlock,
+								  LW_SHARED))
+			return 0;
+	} else
+		LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
 	result = cluster_lmon_state->pid;
 	LWLockRelease(&cluster_lmon_state->lwlock);
 	return result;
@@ -1361,6 +1365,7 @@ LmonMain(void)
 			 * sweep → unfreeze.  Must run AFTER cluster_reconfig_lmon_tick
 			 * (event/epoch source) and AFTER dead_sweep (I47, P2).
 			 */
+			cluster_grd_recovery_authority_lmon_tick();
 			cluster_grd_recovery_lmon_tick();
 			cluster_gcs_block_pcm_x_formation_tick();
 
@@ -2017,6 +2022,7 @@ LmonMain(void)
 			cluster_semantic_activation_lmon_tick();
 			cluster_thread_recovery_lmon_tick();
 			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
+			cluster_grd_recovery_authority_lmon_tick();
 			cluster_grd_recovery_lmon_tick();
 			cluster_gcs_block_pcm_x_formation_tick();
 

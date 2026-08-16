@@ -366,6 +366,16 @@ cluster_clean_leave_serve_gate_allows(bool block_from_leaving, bool leave_flushe
 	return !block_from_leaving ? true : leave_flushed_invalidated;
 }
 
+/* RF-ROOT P04 Scheme A.  A legacy/unmanaged boot retains the established
+ * clean-leave behavior.  Once the readiness lifecycle is managed, clean leave
+ * is an ordinary serving transition and cannot start or advance before OPEN. */
+bool
+cluster_clean_leave_startup_serving_allows(bool authority_managed,
+										 bool serving_ready)
+{
+	return !authority_managed || serving_ready;
+}
+
 
 /* ------------------------------------------------------------------
  * IC payload integrity (D8 / U9 / rule 15) — pure CRC + validation.

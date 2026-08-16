@@ -48,6 +48,7 @@
 #include "cluster/cluster_ic_chunk.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_ic_tier1.h" /* counter bumpers */
 
 
@@ -167,6 +168,15 @@ cluster_ic_send_envelope_chunked(uint8 inner_msg_type, int32 dest_node_id, const
 							errmsg("cluster_ic_send_envelope_chunked: inner_msg_type %u (\"%s\") "
 								   "does not allow BROADCAST destination",
 								   inner_msg_type, inner_info->name)));
+
+		if ((ClusterICPlane)inner_info->plane == CLUSTER_IC_PLANE_DATA
+			&& cluster_authority_readiness_managed()
+			&& !cluster_serving_ready_is_current()) {
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+					 errmsg("cluster IC chunked data plane is not serving-ready")));
+			return false;
+		}
 	}
 
 	max_bytes = (uint32)cluster_interconnect_payload_max_bytes;

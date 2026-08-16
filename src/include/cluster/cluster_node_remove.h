@@ -121,7 +121,9 @@ typedef enum ClusterRemoveRequestResult {
 	CLUSTER_REMOVE_REQ_ALREADY_REMOVED, /* "noop:already_removed" — ONLY when marker==REMOVED (fully complete) */
 	CLUSTER_REMOVE_REQ_RESUME, /* "resume:cleanup_pending" — SHRUNK/CLEANUP_BLOCKED-but-not-REMOVED:
 											* re-drives cleanup (accepted), NOT a noop (v0.4 P1) */
-	CLUSTER_REMOVE_REQ_IN_PROGRESS /* "rejected:removal_in_progress" — active drive in a non-blocked phase */
+	CLUSTER_REMOVE_REQ_IN_PROGRESS, /* "rejected:removal_in_progress" — active drive in a non-blocked phase */
+	CLUSTER_REMOVE_REQ_NOT_SERVING /* "rejected:not_serving" — Scheme A
+									 * readiness is managed but OPEN is not published */
 } ClusterRemoveRequestResult;
 
 /*
@@ -309,6 +311,8 @@ extern const char *cluster_node_remove_phase_str(int phase);
 
 /* canonical text for a request result (operator UDF return). */
 extern const char *cluster_node_remove_request_result_str(ClusterRemoveRequestResult r);
+extern bool cluster_node_remove_startup_serving_allows(bool authority_managed,
+													 bool serving_ready);
 
 /*
  * Precheck verdict (U10 / §3.2) — pure mapping of the live facts to a request

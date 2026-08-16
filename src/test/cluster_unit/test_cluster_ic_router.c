@@ -59,6 +59,7 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D6 stub — profiling gate */
 
 #undef printf
@@ -318,6 +319,20 @@ cluster_ic_tier1_bump_epoch_observe_advance(int32 peer_id pg_attribute_unused())
  * owner;  the plane-gate truth table is pinned in the test body). */
 static ClusterICPlane router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
 static uint64 router_test_misroute_count = 0;
+static bool router_test_authority_managed = false;
+static bool router_test_serving_ready = false;
+
+bool
+cluster_authority_readiness_managed(void)
+{
+	return router_test_authority_managed;
+}
+
+bool
+cluster_serving_ready_is_current(void)
+{
+	return router_test_serving_ready;
+}
 
 ClusterICPlane
 cluster_ic_tier1_my_plane(void)
@@ -581,6 +596,52 @@ UT_TEST(test_u22_dispatch_accepts_broadcast_when_allowed)
 	UT_ASSERT_EQ(u22_handler_call_count, 1);
 }
 
+UT_TEST(test_scheme_a_data_plane_requires_serving_ready)
+{
+	const ClusterICMsgTypeInfo info = {
+		.msg_type = 44,
+		.name = "scheme-a-data",
+		.allowed_producer_mask = (uint32)1u << B_INVALID,
+		.broadcast_ok = false,
+		.handler = u22_no_op_handler,
+		.plane = CLUSTER_IC_PLANE_DATA,
+	};
+	ClusterICEnvelope env = {
+		.magic = PGRAC_IC_ENVELOPE_MAGIC,
+		.version = PGRAC_IC_ENVELOPE_VERSION_V1,
+		.msg_type = 44,
+		.source_node_id = 1,
+		.dest_node_id = 7,
+		.payload_length = 0,
+	};
+	ClusterICSendResult send_result;
+
+	cluster_ic_register_msg_type(&info);
+	router_test_my_plane = CLUSTER_IC_PLANE_DATA;
+	router_test_authority_managed = true;
+	router_test_serving_ready = false;
+	u22_handler_call_count = 0;
+	test_send_bytes_call_count = 0;
+	MyBackendType = B_INVALID;
+
+	UT_ASSERT(cluster_ic_dispatch_envelope(&env, NULL, 1));
+	UT_ASSERT_EQ(u22_handler_call_count, 0);
+	send_result = cluster_ic_send_envelope(44, 6, NULL, 0);
+	UT_ASSERT_EQ(send_result, CLUSTER_IC_SEND_HARD_ERROR);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 0);
+
+	router_test_serving_ready = true;
+	UT_ASSERT(cluster_ic_dispatch_envelope(&env, NULL, 1));
+	UT_ASSERT_EQ(u22_handler_call_count, 1);
+	send_result = cluster_ic_send_envelope(44, 6, NULL, 0);
+	UT_ASSERT_EQ(send_result, CLUSTER_IC_SEND_DONE);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 1);
+
+	router_test_authority_managed = false;
+	router_test_serving_ready = false;
+	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
+}
+
 
 /* ============================================================
  * spec-2.5 D2.5 fanout API tests (T-fanout-1 .. T-fanout-7).
@@ -780,7 +841,7 @@ cluster_lms_obs_note_dispatch(void)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 
 	/* U6 register HEARTBEAT + count */
 	UT_RUN(test_u6_register_heartbeat_lmon_only);
@@ -799,6 +860,7 @@ main(void)
 	/* U22 spec-2.3 hardening v1.0.1 F4 inbound broadcast_ok */
 	UT_RUN(test_u22_dispatch_rejects_broadcast_when_not_allowed);
 	UT_RUN(test_u22_dispatch_accepts_broadcast_when_allowed);
+	UT_RUN(test_scheme_a_data_plane_requires_serving_ready);
 
 	/* T-fanout 1-7: spec-2.5 D2.5 fanout API */
 	UT_RUN(test_t_fanout_1_all_peers_down_writes_peer_down);

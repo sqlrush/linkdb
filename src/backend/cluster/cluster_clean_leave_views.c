@@ -157,6 +157,9 @@ pg_cluster_clean_leave_request(PG_FUNCTION_ARGS)
 	case CLUSTER_LEAVE_REQ_REJECTED_PREFLIGHT_INCOMPLETE:
 		txt = "rejected:preflight_incomplete";
 		break;
+	case CLUSTER_LEAVE_REQ_REJECTED_NOT_SERVING:
+		txt = "rejected:not_serving";
+		break;
 	default:
 		txt = "rejected:unknown";
 		break;

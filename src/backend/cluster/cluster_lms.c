@@ -75,6 +75,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_startup_phase.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/auxprocess.h"
@@ -202,6 +203,8 @@ cluster_lms_shmem_init(void)
 		 * generation is 1 bumped at LmsMain entry per HC50);  priority
 		 * starvation counter starts at 0. */
 		pg_atomic_init_u64(&cluster_lms_state->lms_restart_generation, 0);
+		pg_atomic_init_u64(&cluster_lms_state->recovery_ready_generation, 0);
+		pg_atomic_init_u64(&cluster_lms_state->serving_requested_generation, 0);
 		pg_atomic_init_u64(&cluster_lms_state->priority_starvation_observed_count, 0);
 		/* spec-7.3 D8 — per-worker observability counters + serve hist. */
 		{
@@ -238,6 +241,16 @@ ClusterLmsSharedState *
 cluster_lms_shared_state(void)
 {
 	return cluster_lms_state;
+}
+
+void
+cluster_lms_mark_child_exit(void)
+{
+	/* Postmaster-reaper context: no LWLock acquisition is legal here.  The
+	 * atomic LMS generation/state withdrawal makes every Scheme A predicate
+	 * false immediately; the next normal-process predicate check lazily clears
+	 * the stale phase binding through its existing revalidation path. */
+	cluster_lms_shared_mark_child_exit(cluster_lms_state);
 }
 
 /*
@@ -536,6 +549,61 @@ cluster_lms_wait_for_ready(int timeout_ms)
 	}
 
 	return false;
+}
+
+bool
+cluster_lms_is_recovery_ready(void)
+{
+	uint64 generation;
+	ClusterLmsState state;
+
+	if (cluster_lms_state == NULL)
+		return false;
+	generation = pg_atomic_read_u64(&cluster_lms_state->lms_restart_generation);
+	state = lms_get_state();
+	return generation != 0
+		&& pg_atomic_read_u64(&cluster_lms_state->recovery_ready_generation)
+			   == generation
+		&& (state == CLUSTER_LMS_STARTING || state == CLUSTER_LMS_READY);
+}
+
+bool
+cluster_lms_wait_for_recovery_ready(int timeout_ms)
+{
+	const int poll_interval_ms = 10;
+	int waited_ms = 0;
+
+	if (cluster_lms_state == NULL || timeout_ms <= 0)
+		return false;
+	while (waited_ms < timeout_ms) {
+		ClusterLmsState state = lms_get_state();
+
+		if (cluster_lms_is_recovery_ready())
+			return true;
+		if (state == CLUSTER_LMS_DRAINING || state == CLUSTER_LMS_STOPPED
+			|| state == CLUSTER_LMS_DISABLED)
+			return false;
+		if (IsUnderPostmaster)
+			CHECK_FOR_INTERRUPTS();
+		pg_usleep(poll_interval_ms * 1000L);
+		waited_ms += poll_interval_ms;
+	}
+	return false;
+}
+
+bool
+cluster_lms_request_serving(void)
+{
+	uint64 generation;
+
+	Assert(!IsUnderPostmaster);
+	if (!cluster_lms_is_recovery_ready())
+		return false;
+	generation = pg_atomic_read_u64(&cluster_lms_state->lms_restart_generation);
+	pg_atomic_write_u64(&cluster_lms_state->serving_requested_generation,
+					generation);
+	cluster_lms_wakeup(0);
+	return true;
 }
 
 void
@@ -923,6 +991,7 @@ void
 LmsMain(void)
 {
 	uint64 r4_worker_incarnation;
+	uint64 recovery_generation;
 
 	Assert(IsUnderPostmaster);
 
@@ -972,8 +1041,38 @@ LmsMain(void)
 	 * child) so the correct invariant is MyBackendType == B_LMS.  Bumping
 	 * before READY transition ensures any waiter seeing READY also sees
 	 * the new generation. */
+	pg_atomic_write_u64(&cluster_lms_state->recovery_ready_generation, 0);
+	pg_atomic_write_u64(&cluster_lms_state->serving_requested_generation, 0);
 	cluster_lms_bump_restart_generation_at_main_entry();
+	recovery_generation = cluster_lms_get_lms_restart_generation();
 	(void)cluster_ges_dedup_drop_stale_entries();
+
+	/* The phase-3 child first exposes only the exact recovery allowlist.  A
+	 * legacy/unmanaged boot proceeds immediately, while a formed boot waits
+	 * for the post-recovery phase-4 request on the same child generation. */
+	pg_atomic_write_u64(&cluster_lms_state->recovery_ready_generation,
+				recovery_generation);
+	while (cluster_authority_readiness_managed()
+		   && pg_atomic_read_u64(
+				  &cluster_lms_state->serving_requested_generation)
+				  != recovery_generation) {
+		int rc;
+
+		if (ShutdownRequestPending || lms_shutdown_requested())
+			break;
+		rc = WaitLatch(MyLatch,
+					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					   100L, WAIT_EVENT_PG_SLEEP);
+		ResetLatch(MyLatch);
+		if (rc & WL_EXIT_ON_PM_DEATH)
+			proc_exit(1);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (ShutdownRequestPending || lms_shutdown_requested()) {
+		pg_atomic_write_u64(&cluster_lms_state->recovery_ready_generation, 0);
+		proc_exit(0);
+	}
+
 	cluster_gcs_block_pcm_x_owner_start(0);
 
 	/* PGRAC: spec-7.2 D2 — bring up the LMS-owned DATA-plane listener +
@@ -1087,6 +1186,8 @@ LmsMain(void)
 	cluster_lms_state->stopped_at = GetCurrentTimestamp();
 	lms_set_state(CLUSTER_LMS_STOPPED);
 	LWLockRelease(&cluster_lms_state->lwlock);
+	pg_atomic_write_u64(&cluster_lms_state->recovery_ready_generation, 0);
+	pg_atomic_write_u64(&cluster_lms_state->serving_requested_generation, 0);
 
 	proc_exit(0);
 }

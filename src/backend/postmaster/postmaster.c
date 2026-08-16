@@ -188,6 +188,7 @@
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3 D2) */
+#include "cluster/cluster_lms.h" /* cluster_lms_mark_child_exit (Scheme A) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
 #include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
 #include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
@@ -3587,6 +3588,7 @@ process_pm_child_exit(void)
 		}
 		/* PGRAC (spec-2.18 Sprint A Step 1): LMS reaper. */
 		if (pid == LmsPID) {
+			cluster_lms_mark_child_exit();
 			LmsPID = 0;
 			if (!EXIT_STATUS_0(exitstatus))
 				HandleChildCrash(pid, exitstatus, _("LMS process"));

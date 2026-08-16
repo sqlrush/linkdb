@@ -484,6 +484,47 @@ cluster_formation_witness_decide_v1(const ClusterFormationSnapshotV1 *f1,
 	return CLUSTER_FORMATION_WITNESS_READY;
 }
 
+/* STOP-05 E1 needs the same durable marker plus stable membership proof for
+ * the checkpoint process's live redo thread.  It deliberately does not reuse
+ * the failed-origin predicate above: a live recycler must be an admitted,
+ * non-excluded MEMBER, while a recovery duty must be excluded DEAD/REMOVED. */
+static ClusterFormationWitnessResult
+formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
+								 const ClusterFenceAuthorityProof *authority,
+								 const ClusterFormationSnapshotV1 *f2,
+								 uint16 origin_thread)
+{
+	ClusterFenceMarker expected;
+	int32 origin_node;
+
+	if (f1 == NULL || authority == NULL || f2 == NULL || origin_thread == 0
+		|| origin_thread > CLUSTER_MAX_NODES)
+		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
+	if (memcmp(f1, f2, sizeof(*f1)) != 0)
+		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	if (f2->prebump_sync_active != 0 || !f2->self_join_admitted
+		|| f2->self_join_failed
+		|| formation_bitmap_nonempty(f2->pending_join_bitmap)
+		|| f2->applied.reconfig_kind == RECONFIG_KIND_JOIN_PENDING
+		|| f2->local_epoch != f2->applied.new_epoch)
+		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	if (authority->total_disk_count == 0
+		|| authority->agree_disk_count <= authority->total_disk_count / 2
+		|| !cluster_fence_marker_valid_v1(&authority->marker))
+		return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+	formation_expected_marker(f2, &expected);
+	if (!cluster_fence_marker_valid_v1(&expected)
+		|| !cluster_fence_marker_tuple_equal(&authority->marker, &expected))
+		return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+
+	origin_node = (int32)origin_thread - 1;
+	if (f2->membership.membership_state[origin_node] != CLUSTER_MEMBER_MEMBER
+		|| f2->membership.last_admitted_incarnation[origin_node] == 0
+		|| formation_bitmap_has_node(f2->excluded_bitmap, origin_node))
+		return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
+	return CLUSTER_FORMATION_WITNESS_READY;
+}
+
 #define CLUSTER_FORMATION_WITNESS_MAGIC UINT32_C(0x46575631) /* FWV1 */
 
 struct ClusterFormationWitnessV1 {
@@ -529,9 +570,11 @@ formation_authority_result(ClusterFenceAuthorityReadResult result)
 	}
 }
 
-ClusterFormationWitnessResult
-cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty,
-									 int timeout_ms, ClusterFormationWitnessV1 **out)
+static ClusterFormationWitnessResult
+formation_witness_build_wait_internal(uint16 origin_thread,
+									  bool opening_new_duty,
+									  bool live_origin, int timeout_ms,
+									  ClusterFormationWitnessV1 **out)
 {
 	ClusterFormationWitnessResult last = CLUSTER_FORMATION_WITNESS_UNSTABLE;
 	uint64 start_us;
@@ -565,8 +608,12 @@ cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty
 		if (last == CLUSTER_FORMATION_WITNESS_READY) {
 			if (!cluster_reconfig_capture_formation_snapshot_v1(origin_thread, &f2))
 				return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
-			last = cluster_formation_witness_decide_v1(
-				&f1, &authority, &f2, origin_thread, opening_new_duty);
+			last = live_origin
+				? formation_witness_decide_live_v1(
+					&f1, &authority, &f2, origin_thread)
+				: cluster_formation_witness_decide_v1(
+					&f1, &authority, &f2, origin_thread,
+					opening_new_duty);
 			if (last == CLUSTER_FORMATION_WITNESS_READY) {
 				ClusterFormationWitnessV1 *witness;
 
@@ -583,6 +630,7 @@ cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty
 				witness->magic = CLUSTER_FORMATION_WITNESS_MAGIC;
 				witness->origin_thread = origin_thread;
 				witness->opening_new_duty = opening_new_duty;
+				witness->reserved = live_origin ? 1 : 0;
 				witness->authority = authority;
 				witness->f1 = f1;
 				witness->f2 = f2;
@@ -600,6 +648,24 @@ cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty
 			return last;
 		pg_usleep(1000L);
 	}
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_build_wait(uint16 origin_thread,
+									 bool opening_new_duty, int timeout_ms,
+									 ClusterFormationWitnessV1 **out)
+{
+	return formation_witness_build_wait_internal(
+		origin_thread, opening_new_duty, false, timeout_ms, out);
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_build_live_wait(uint16 origin_thread,
+									  int timeout_ms,
+									  ClusterFormationWitnessV1 **out)
+{
+	return formation_witness_build_wait_internal(
+		origin_thread, false, true, timeout_ms, out);
 }
 
 ClusterFormationWitnessResult
@@ -625,6 +691,40 @@ cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *wit
 		default:
 			return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 	}
+}
+
+/* Revalidate a copied live-formation classification against both present
+ * membership bytes and the cached durable fence marker.  This is the
+ * generation-bound counterpart of copy_classification_v1(): a copied proof
+ * never becomes a timeless authority token. */
+ClusterFormationWitnessResult
+cluster_formation_classification_revalidate_nowait(
+	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
+	const ClusterFormationSnapshotV1 *snapshot)
+{
+	ClusterFormationSnapshotV1 current;
+	ClusterFenceAuthorityCacheResult cache_result;
+	uint64 now_us;
+
+	if (origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
+		|| authority == NULL || snapshot == NULL)
+		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
+	if (!cluster_reconfig_capture_formation_snapshot_v1(origin_thread, &current))
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	if (memcmp(&current, snapshot, sizeof(current)) != 0)
+		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+
+	now_us = formation_monotonic_us();
+	if (now_us == 0)
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	cache_result = cluster_write_fence_revalidate_cached_nowait(
+		&authority->marker, now_us);
+	return cache_result == CLUSTER_FENCE_CACHE_MATCH
+		? CLUSTER_FORMATION_WITNESS_READY
+		: (cache_result == CLUSTER_FENCE_CACHE_STALE
+				   || cache_result == CLUSTER_FENCE_CACHE_EXPIRED)
+			? CLUSTER_FORMATION_WITNESS_UNSTABLE
+			: CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 }
 
 bool

@@ -67,6 +67,7 @@
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5c retire-before-removal */
 #include "cluster/cluster_xid_stripe_xlog.h" /* spec-6.15 D5d RETIRE record */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_voting_disk_io.h"
 #include "cluster/cluster_write_fence.h"
 
@@ -521,6 +522,10 @@ cluster_node_remove_request(int32 node_id)
 	int32 cur_target;
 
 	CLUSTER_INJECTION_POINT("cluster-node-remove-request");
+	if (!cluster_node_remove_startup_serving_allows(
+			cluster_authority_readiness_managed(),
+			cluster_serving_ready_is_current()))
+		return CLUSTER_REMOVE_REQ_NOT_SERVING;
 
 	feature = cluster_online_node_removal;
 	is_self = (node_id == cluster_node_id);
@@ -906,6 +911,10 @@ cluster_node_remove_lmon_tick(void)
 	uint64 remove_epoch;
 
 	if (nr_state == NULL || !cluster_enabled || !cluster_online_node_removal)
+		return;
+	if (!cluster_node_remove_startup_serving_allows(
+			cluster_authority_readiness_managed(),
+			cluster_serving_ready_is_current()))
 		return;
 	if (!cluster_qvotec_in_quorum())
 		return; /* only an in-quorum survivor participates */

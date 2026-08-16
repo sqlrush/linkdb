@@ -187,6 +187,7 @@
 /* PGRAC: spec-4.1 per-thread WAL routing page-header stamp. */
 #include "cluster/cluster_scn.h" /* PGRAC: xl_scn stamp (spec-4.5) */
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
+#include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
@@ -767,7 +768,7 @@ static void RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr,
 static void RemoveXlogFile(const struct dirent *segment_de,
 						   XLogSegNo recycleSegNo, XLogSegNo *endlogSegNo,
 						   TimeLineID insertTLI);
-static void UpdateLastRemovedPtr(char *filename);
+static void UpdateLastRemovedPtr(const char *filename);
 static void ValidateXLOGDirectoryStructure(void);
 static void CleanupBackupHistory(void);
 static void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force);
@@ -779,6 +780,18 @@ static void UpdateControlFile(void);
 static void UpdateFullPageWritesInternal(bool allow_cluster_disable);
 #ifdef USE_PGRAC_CLUSTER
 static bool ClusterWalStateConfigured(void);
+static bool ClusterWalRetentionE1Cutoff(
+	ClusterWalRetentionE1Context *context, XLogRecPtr redo,
+	XLogRecPtr endptr, XLogRecPtr slotsMinReqLSN,
+	XLogSegNo *out_cutoff);
+static ClusterWalTerminalOutcome RemoveNonParentXlogFileCluster(
+	const struct dirent *segment_de, XLogSegNo recycleSegNo,
+	XLogSegNo *endlogSegNo, TimeLineID insertTLI,
+	ClusterWalReuseEntry entry,
+	ClusterWalRetentionE1Context *action_context);
+static void RemoveOldXlogFilesCluster(
+	XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
+	TimeLineID insertTLI, ClusterWalRetentionE1Context *context);
 static void ClusterWalStateValidateHistoricalFpwOff(void);
 static void UpdateFullPageWritesForCheckpoint(void);
 static void ClusterWalStatePublishCheckpointRedo(XLogRecPtr redo);
@@ -3650,7 +3663,7 @@ XLogGetLastRemovedSegno(void)
  * given XLOG file has been removed.
  */
 static void
-UpdateLastRemovedPtr(char *filename)
+UpdateLastRemovedPtr(const char *filename)
 {
 	uint32		tli;
 	XLogSegNo	segno;
@@ -3774,10 +3787,12 @@ RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
  * successfully replayed them, but from others we can't be sure.
  *
  * 'switchpoint' is the current point in WAL where we switch to new timeline,
- * and 'newTLI' is the new timeline we switch to.
+ * 'newTLI' is the new timeline we switch to, and 'timeline_switch' marks the
+ * ApplyWalRecord correctness route rather than end-of-recovery cleanup.
  */
 void
-RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
+RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI,
+						 bool timeline_switch)
 {
 	DIR		   *xldir;
 	struct dirent *xlde;
@@ -3785,14 +3800,27 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 	XLogSegNo	endLogSegNo;
 	XLogSegNo	switchLogSegNo;
 	XLogSegNo	recycleSegNo;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterWalRetentionE1Context action_context = {0};
+#endif
 
 	/*
 	 * Initialize info about where to begin the work.  This will recycle,
 	 * somewhat arbitrarily, 10 future segments.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	if (ClusterWalStateConfigured() && timeline_switch
+		&& XLogRecPtrIsInvalid(switchpoint))
+		ereport(AmStartupProcess() ? FATAL : ERROR,
+				(errcode(ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED),
+				 errmsg("cluster WAL retention blocks a zero timeline switchpoint")));
+#endif
 	XLByteToPrevSeg(switchpoint, switchLogSegNo, wal_segment_size);
 	XLByteToSeg(switchpoint, endLogSegNo, wal_segment_size);
-	recycleSegNo = endLogSegNo + 10;
+	if (endLogSegNo > UINT64_MAX - 10)
+		recycleSegNo = 0;
+	else
+		recycleSegNo = endLogSegNo + 10;
 
 	/*
 	 * Construct a filename of the last segment to be kept.
@@ -3825,11 +3853,25 @@ RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI)
 			 * - but seems safer to let them be archived and removed later.
 			 */
 			if (!XLogArchiveIsReady(xlde->d_name))
-				RemoveXlogFile(xlde, recycleSegNo, &endLogSegNo, newTLI);
+			{
+#ifdef USE_PGRAC_CLUSTER
+				if (ClusterWalStateConfigured() && timeline_switch)
+					(void)RemoveNonParentXlogFileCluster(
+						xlde, recycleSegNo, &endLogSegNo, newTLI,
+						CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH,
+						&action_context);
+				else
+#endif
+					RemoveXlogFile(
+						xlde, recycleSegNo, &endLogSegNo, newTLI);
+			}
 		}
 	}
 
 	FreeDir(xldir);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_wal_retention_action_finish(&action_context);
+#endif
 }
 
 /*
@@ -3921,6 +3963,445 @@ RemoveXlogFile(const struct dirent *segment_de,
 
 	XLogArchiveCleanup(segname);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* Compute E1's native/root minimum while the current redo thread is held in
+ * WALR-X.  A nonaffirmative result skips only slot invalidation and cleanup;
+ * callers still run preallocation and the remainder of the checkpoint. */
+static bool
+ClusterWalRetentionE1Cutoff(
+	ClusterWalRetentionE1Context *context, XLogRecPtr redo,
+	XLogRecPtr endptr, XLogRecPtr slotsMinReqLSN,
+	XLogSegNo *out_cutoff)
+{
+	ClusterWalRootFoldResult fold_result;
+	ClusterWalReuseGuardResult guard_result;
+	ClusterWalrReleaseResult release_result;
+	ClusterWalReuseDenyReason reason;
+	XLogSegNo floor;
+	XLogSegNo cluster_floor;
+	uint16 thread_id = cluster_wal_thread_id();
+
+	*out_cutoff = 0;
+	guard_result = cluster_wal_retention_e1_coarse_begin(
+		context, thread_id, &fold_result, &cluster_floor, &reason);
+	if (guard_result != CLUSTER_WAL_GUARD_OK) {
+		if (guard_result == CLUSTER_WAL_GUARD_RELEASE_UNCERTAIN)
+			ereport(FATAL,
+					(errmsg("could not confirm coarse WAL-retention lock cleanup"),
+					 errdetail("Thread %u deny reason is %d.",
+							   (unsigned)thread_id, (int)reason)));
+		return false;
+	}
+
+	XLByteToSeg(redo, floor, wal_segment_size);
+	KeepLogSeg(endptr, slotsMinReqLSN, &floor);
+	if (fold_result == CLUSTER_WAL_FOLD_BOUNDED)
+		floor = Min(floor, cluster_floor);
+	if (floor == 0)
+		goto no_cleanup;
+
+	if (InvalidateObsoleteReplicationSlots(RS_INVAL_WAL_REMOVED,
+									   floor, InvalidOid,
+									   InvalidTransactionId))
+	{
+		slotsMinReqLSN = XLogGetReplicationSlotMinimumLSN();
+		CheckPointReplicationSlots();
+		XLByteToSeg(redo, floor, wal_segment_size);
+		KeepLogSeg(endptr, slotsMinReqLSN, &floor);
+		if (fold_result == CLUSTER_WAL_FOLD_BOUNDED)
+			floor = Min(floor, cluster_floor);
+	}
+	if (floor == 0)
+		goto no_cleanup;
+	*out_cutoff = floor - 1;
+	release_result = cluster_wal_retention_e1_coarse_release(context, &reason);
+	if (release_result == CLUSTER_WALR_RELEASE_CONFIRMED)
+		return true;
+	if (release_result == CLUSTER_WALR_RELEASE_UNCONFIRMED)
+		ereport(FATAL,
+				(errmsg("could not confirm coarse WAL-retention lock release"),
+				 errdetail("Thread %u deny reason is %d.",
+						   (unsigned)thread_id, (int)reason)));
+	cluster_wal_retention_e1_finish(context);
+	return false;
+
+no_cleanup:
+	release_result = cluster_wal_retention_e1_coarse_release(context, &reason);
+	if (release_result == CLUSTER_WALR_RELEASE_UNCONFIRMED)
+		ereport(FATAL,
+				(errmsg("could not confirm coarse WAL-retention lock release"),
+				 errdetail("Thread %u deny reason is %d.",
+						   (unsigned)thread_id, (int)reason)));
+	cluster_wal_retention_e1_finish(context);
+	return false;
+}
+
+static ClusterWalTerminalOutcome
+RemoveXlogFileClusterE1(
+	const struct dirent *segment_de, XLogSegNo recycleSegNo,
+	XLogSegNo *endlogSegNo, TimeLineID insertTLI,
+	ClusterWalRetentionE1Context *context,
+	ClusterWalReuseDenyReason *out_deny_reason)
+{
+	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalFileIdentity file;
+	ClusterWalReuseGuardResult guard_result;
+	ClusterWalReuseDenyReason reason = CLUSTER_WAL_DENY_NONE;
+	ClusterWalReuseDenyReason saved_reason = CLUSTER_WAL_DENY_NONE;
+	ClusterWalTerminalOutcome outcome = CLUSTER_WAL_TERMINAL_UNCHANGED;
+	ClusterWalrReleaseResult release_result;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	PgracExternalFenceAdmissionSetV1 *admissions = NULL;
+	const char *segname = segment_de->d_name;
+	bool initialized = false;
+	bool try_recycle;
+	XLogSegNo installSegNo;
+	ClusterWalFileIdentity destination;
+
+	*out_deny_reason = CLUSTER_WAL_DENY_NONE;
+	if (!cluster_wal_file_identity_parse(
+			segname, context->thread_id, wal_segment_size, &file)) {
+		*out_deny_reason = CLUSTER_WAL_DENY_INVALID_IDENTITY;
+		return CLUSTER_WAL_TERMINAL_UNCHANGED;
+	}
+	if (cluster_wal_reuse_guard_init(&guard, &reason)
+		!= CLUSTER_WAL_GUARD_OK)
+		goto done;
+	initialized = true;
+	guard_result = cluster_wal_retention_e1_preflight(
+		context, &file, &guard, &needs, &reason);
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		goto done;
+	guard_result = cluster_wal_retention_e1_fence_wait(
+		context, &guard, needs, &admissions, &reason);
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		goto done;
+	guard_result = cluster_wal_reuse_guard_arm(
+		&guard, NULL, NULL, &reason);
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		goto done;
+
+	try_recycle = wal_recycle && file.kind == CLUSTER_WAL_FILE_NORMAL
+		&& *endlogSegNo <= recycleSegNo
+		&& XLogCtl->InstallXLogFileSegmentActive;
+	if (try_recycle)
+	{
+		installSegNo = *endlogSegNo;
+		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+		if (!XLogCtl->InstallXLogFileSegmentActive)
+		{
+			LWLockRelease(ControlFileLock);
+			goto remove_action;
+		}
+		guard_result = cluster_wal_reuse_guard_l3_begin(
+			&guard, CLUSTER_WAL_PHYSICAL_RECYCLE, &reason);
+		if (guard_result != CLUSTER_WAL_GUARD_OK)
+		{
+			LWLockRelease(ControlFileLock);
+			goto done;
+		}
+		destination = file;
+		destination.kind = CLUSTER_WAL_FILE_NORMAL;
+		destination.tli = insertTLI;
+		destination.segno = installSegNo;
+		guard_result = cluster_wal_reuse_guard_recycle(
+			&guard, &destination, &reason);
+		LWLockRelease(ControlFileLock);
+		if (guard_result == CLUSTER_WAL_GUARD_OK)
+		{
+			*endlogSegNo = installSegNo;
+			outcome = CLUSTER_WAL_TERMINAL_RECYCLED;
+			goto terminal;
+		}
+		if (guard_result != CLUSTER_WAL_GUARD_BLOCKED)
+			ereport(FATAL,
+					(errmsg("WAL recycle did not reach a safe terminal state"),
+					 errdetail("File \"%s\" deny reason is %d.",
+							   segname, (int)reason)));
+	}
+
+remove_action:
+	guard_result = cluster_wal_reuse_guard_l3_begin(
+		&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason);
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		goto done;
+	guard_result = cluster_wal_reuse_guard_remove(&guard, &reason);
+	if (guard_result == CLUSTER_WAL_GUARD_BLOCKED)
+		goto done;
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		ereport(FATAL,
+				(errmsg("WAL removal did not reach a safe terminal state"),
+				 errdetail("File \"%s\" deny reason is %d.",
+						   segname, (int)reason)));
+	outcome = CLUSTER_WAL_TERMINAL_REMOVED;
+
+terminal:
+	UpdateLastRemovedPtr(segname);
+	if (outcome == CLUSTER_WAL_TERMINAL_RECYCLED)
+	{
+		ereport(DEBUG2,
+				(errmsg_internal("recycled write-ahead log file \"%s\"",
+								 segname)));
+		CheckpointStats.ckpt_segs_recycled++;
+		(*endlogSegNo)++;
+	}
+	else
+	{
+		ereport(DEBUG2,
+				(errmsg_internal("removed write-ahead log file \"%s\"",
+								 segname)));
+		CheckpointStats.ckpt_segs_removed++;
+	}
+	XLogArchiveCleanup(segname);
+	if (cluster_wal_reuse_guard_bookkeep(&guard, &reason)
+		!= CLUSTER_WAL_GUARD_OK)
+		ereport(FATAL,
+				(errmsg("could not finish WAL cleanup bookkeeping"),
+				 errdetail("File \"%s\" deny reason is %d.",
+						   segname, (int)reason)));
+
+done:
+	saved_reason = reason;
+	if (initialized)
+	{
+		ClusterWalTerminalOutcome finish_outcome =
+			CLUSTER_WAL_TERMINAL_UNCHANGED;
+
+		release_result = cluster_wal_reuse_guard_finish(
+			&guard, &finish_outcome, &reason);
+		if (release_result == CLUSTER_WALR_RELEASE_UNCONFIRMED
+			|| release_result == CLUSTER_WALR_RELEASE_INVALID)
+			ereport(FATAL,
+					(errmsg("could not confirm per-file WAL-retention release"),
+					 errdetail("File \"%s\" deny reason is %d.",
+							   segname, (int)reason)));
+		if (outcome != CLUSTER_WAL_TERMINAL_UNCHANGED
+			&& finish_outcome != outcome)
+			ereport(FATAL,
+					(errmsg("WAL cleanup terminal outcome changed during release")));
+	}
+	cluster_external_fence_admission_set_release(&admissions);
+	cluster_external_fence_need_set_release(&needs);
+	if (outcome == CLUSTER_WAL_TERMINAL_UNCHANGED)
+		*out_deny_reason = saved_reason;
+	return outcome;
+}
+
+static void
+ClusterWalRetentionCorrectnessError(
+	ClusterWalReuseEntry entry, const ClusterWalFileIdentity *file,
+	ClusterWalReuseDenyReason reason)
+{
+	ereport(AmStartupProcess() ? FATAL : ERROR,
+			(errcode(ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED),
+			 errmsg("cluster WAL retention blocks timeline cleanup"),
+			 errdetail("Entry %d, thread %u, timeline %u, segment %llu, deny reason %d.",
+					   (int)entry, (unsigned)file->thread_id,
+					   file->tli, (unsigned long long)file->segno,
+					   (int)reason)));
+	pg_unreachable();
+}
+
+static ClusterWalTerminalOutcome
+RemoveNonParentXlogFileCluster(
+	const struct dirent *segment_de, XLogSegNo recycleSegNo,
+	XLogSegNo *endlogSegNo, TimeLineID insertTLI,
+	ClusterWalReuseEntry entry,
+	ClusterWalRetentionE1Context *action_context)
+{
+	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalFileIdentity file = {0};
+	ClusterWalFileIdentity destination;
+	ClusterWalReuseGuardResult guard_result;
+	ClusterWalReuseDenyReason reason = CLUSTER_WAL_DENY_NONE;
+	ClusterWalReuseDenyReason saved_reason;
+	ClusterWalTerminalOutcome outcome = CLUSTER_WAL_TERMINAL_UNCHANGED;
+	ClusterWalTerminalOutcome finish_outcome = CLUSTER_WAL_TERMINAL_UNCHANGED;
+	ClusterWalrReleaseResult release_result;
+	ClusterRecoverySerialGuard *serial = NULL;
+	ClusterWalRetentionPin *pin = NULL;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	PgracExternalFenceAdmissionSetV1 *admissions = NULL;
+	const char *segname = segment_de->d_name;
+	XLogSegNo installSegNo;
+	bool borrowed_active_pin;
+	bool initialized = false;
+	bool try_recycle;
+
+	file.thread_id = cluster_wal_thread_id();
+	if (entry != CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH
+		|| !cluster_wal_file_identity_parse(
+			segname, file.thread_id, wal_segment_size, &file)) {
+		reason = CLUSTER_WAL_DENY_INVALID_IDENTITY;
+		ClusterWalRetentionCorrectnessError(entry, &file, reason);
+	}
+	if (cluster_wal_reuse_guard_init(&guard, &reason)
+		!= CLUSTER_WAL_GUARD_OK)
+		goto fail;
+	initialized = true;
+	borrowed_active_pin = cluster_wal_retention_active_pin_present();
+	if (borrowed_active_pin)
+		guard_result = cluster_wal_reuse_guard_preflight_active_recovery(
+			&guard, &file, entry, &serial, &pin, &reason);
+	else
+	{
+		if (action_context == NULL)
+		{
+			reason = CLUSTER_WAL_DENY_GUARD_STATE;
+			goto fail;
+		}
+		if (action_context->magic == 0)
+		{
+			guard_result = cluster_wal_retention_action_begin(
+				action_context, file.thread_id, &reason);
+			if (guard_result != CLUSTER_WAL_GUARD_OK)
+				goto fail;
+		}
+		guard_result = cluster_wal_retention_action_preflight(
+			action_context, &file, entry, &guard, &needs, &reason);
+		if (guard_result != CLUSTER_WAL_GUARD_OK)
+			goto fail;
+		guard_result = cluster_wal_retention_e1_fence_wait(
+			action_context, &guard, needs, &admissions, &reason);
+	}
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		goto fail;
+	guard_result = cluster_wal_reuse_guard_arm(
+		&guard, serial, pin, &reason);
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		goto fail;
+
+	try_recycle = wal_recycle && recycleSegNo != 0
+		&& *endlogSegNo <= recycleSegNo
+		&& XLogCtl->InstallXLogFileSegmentActive;
+	if (try_recycle)
+	{
+		installSegNo = *endlogSegNo;
+		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+		if (!XLogCtl->InstallXLogFileSegmentActive)
+		{
+			LWLockRelease(ControlFileLock);
+			goto remove_action;
+		}
+		guard_result = cluster_wal_reuse_guard_l3_begin(
+			&guard, CLUSTER_WAL_PHYSICAL_RECYCLE, &reason);
+		if (guard_result != CLUSTER_WAL_GUARD_OK)
+		{
+			LWLockRelease(ControlFileLock);
+			goto fail;
+		}
+		destination = file;
+		destination.kind = CLUSTER_WAL_FILE_NORMAL;
+		destination.tli = insertTLI;
+		destination.segno = installSegNo;
+		guard_result = cluster_wal_reuse_guard_recycle(
+			&guard, &destination, &reason);
+		LWLockRelease(ControlFileLock);
+		if (guard_result == CLUSTER_WAL_GUARD_OK)
+		{
+			*endlogSegNo = installSegNo;
+			outcome = CLUSTER_WAL_TERMINAL_RECYCLED;
+			goto terminal;
+		}
+		if (guard_result != CLUSTER_WAL_GUARD_BLOCKED)
+			goto fail;
+	}
+
+remove_action:
+	guard_result = cluster_wal_reuse_guard_l3_begin(
+		&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason);
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		goto fail;
+	guard_result = cluster_wal_reuse_guard_remove(&guard, &reason);
+	if (guard_result != CLUSTER_WAL_GUARD_OK)
+		goto fail;
+	outcome = CLUSTER_WAL_TERMINAL_REMOVED;
+
+terminal:
+	if (outcome == CLUSTER_WAL_TERMINAL_RECYCLED)
+	{
+		CheckpointStats.ckpt_segs_recycled++;
+		(*endlogSegNo)++;
+	}
+	else
+		CheckpointStats.ckpt_segs_removed++;
+	XLogArchiveCleanup(segname);
+	if (cluster_wal_reuse_guard_bookkeep(&guard, &reason)
+		!= CLUSTER_WAL_GUARD_OK)
+		goto fail;
+	release_result = cluster_wal_reuse_guard_finish(
+		&guard, &finish_outcome, &reason);
+	cluster_external_fence_admission_set_release(&admissions);
+	cluster_external_fence_need_set_release(&needs);
+	if (release_result != CLUSTER_WALR_RELEASE_CONFIRMED
+		|| finish_outcome != outcome)
+		ClusterWalRetentionCorrectnessError(
+			entry, &file, CLUSTER_WAL_DENY_RELEASE_UNCERTAIN);
+	return outcome;
+
+fail:
+	saved_reason = reason == CLUSTER_WAL_DENY_NONE
+		? CLUSTER_WAL_DENY_GUARD_STATE : reason;
+	if (initialized)
+	{
+		release_result = cluster_wal_reuse_guard_finish(
+			&guard, &finish_outcome, &reason);
+		if (release_result == CLUSTER_WALR_RELEASE_UNCONFIRMED
+			|| release_result == CLUSTER_WALR_RELEASE_INVALID)
+			saved_reason = CLUSTER_WAL_DENY_RELEASE_UNCERTAIN;
+	}
+	cluster_external_fence_admission_set_release(&admissions);
+	cluster_external_fence_need_set_release(&needs);
+	ClusterWalRetentionCorrectnessError(entry, &file, saved_reason);
+	return CLUSTER_WAL_TERMINAL_UNCHANGED;
+}
+
+static void
+RemoveOldXlogFilesCluster(
+	XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
+	TimeLineID insertTLI, ClusterWalRetentionE1Context *context)
+{
+	DIR *xldir;
+	struct dirent *xlde;
+	char lastoff[MAXFNAMELEN];
+	XLogSegNo endlogSegNo;
+	XLogSegNo recycleSegNo;
+	bool logged[CLUSTER_WAL_DENY_RELEASE_UNCERTAIN + 1] = {false};
+
+	XLByteToSeg(endptr, endlogSegNo, wal_segment_size);
+	recycleSegNo = XLOGfileslop(lastredoptr);
+	XLogFileName(lastoff, 0, segno, wal_segment_size);
+	elog(DEBUG2, "attempting guarded removal of WAL segments older than log file %s",
+		 lastoff);
+	xldir = AllocateDir(XLOGDIR);
+	while ((xlde = ReadDir(xldir, XLOGDIR)) != NULL)
+	{
+		ClusterWalReuseDenyReason reason;
+
+		if ((!IsXLogFileName(xlde->d_name)
+			 && !IsPartialXLogFileName(xlde->d_name))
+			|| strcmp(xlde->d_name + 8, lastoff + 8) > 0
+			|| !XLogArchiveCheckDone(xlde->d_name))
+			continue;
+		if (RemoveXlogFileClusterE1(
+				xlde, recycleSegNo, &endlogSegNo, insertTLI,
+				context, &reason) == CLUSTER_WAL_TERMINAL_UNCHANGED
+			&& reason > CLUSTER_WAL_DENY_NONE
+			&& reason <= CLUSTER_WAL_DENY_RELEASE_UNCERTAIN
+			&& !logged[reason])
+		{
+			logged[reason] = true;
+			ereport(LOG,
+					(errmsg("retaining WAL file \"%s\" after guarded cleanup denial",
+							xlde->d_name),
+					 errdetail("Thread %u deny reason is %d.",
+							   (unsigned)context->thread_id, (int)reason)));
+		}
+	}
+	FreeDir(xldir);
+}
+#endif
 
 /*
  * Verify whether pg_wal and pg_wal/archive_status exist.
@@ -5186,7 +5667,7 @@ CleanupAfterArchiveRecovery(TimeLineID EndOfLogTLI, XLogRecPtr EndOfLog,
 	 * pre-allocated files containing garbage. In any case, they are not part
 	 * of the new timeline's history so we don't need them.
 	 */
-	RemoveNonParentXlogFiles(EndOfLog, newTLI);
+	RemoveNonParentXlogFiles(EndOfLog, newTLI, false);
 
 	/*
 	 * If the switch happened in the middle of a segment, what to do with the
@@ -7776,6 +8257,23 @@ CreateCheckPoint(int flags)
 	 * Delete old log files, those no longer needed for last checkpoint to
 	 * prevent the disk holding the xlog from growing full.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	if (ClusterWalStateConfigured())
+	{
+		ClusterWalRetentionE1Context context = {0};
+
+		if (ClusterWalRetentionE1Cutoff(
+				&context, RedoRecPtr, recptr, slotsMinReqLSN, &_logSegNo))
+		{
+			RemoveOldXlogFilesCluster(
+				_logSegNo, RedoRecPtr, recptr,
+				checkPoint.ThisTimeLineID, &context);
+			cluster_wal_retention_e1_finish(&context);
+		}
+	}
+	else
+#endif
+	{
 	XLByteToSeg(RedoRecPtr, _logSegNo, wal_segment_size);
 	KeepLogSeg(recptr, slotsMinReqLSN, &_logSegNo);
 	if (InvalidateObsoleteReplicationSlots(RS_INVAL_WAL_REMOVED,
@@ -7803,6 +8301,7 @@ CreateCheckPoint(int flags)
 	_logSegNo--;
 	RemoveOldXlogFiles(_logSegNo, RedoRecPtr, recptr,
 					   checkPoint.ThisTimeLineID);
+	}
 
 	/*
 	 * Make more log segments if needed.  (Do this after recycling old log
@@ -8300,15 +8799,37 @@ CreateRestartPoint(int flags)
 	 * Delete old log files, those no longer needed for last restartpoint to
 	 * prevent the disk holding the xlog from growing full.
 	 */
-	XLByteToSeg(RedoRecPtr, _logSegNo, wal_segment_size);
-
-	/*
-	 * Retreat _logSegNo using the current end of xlog replayed or received,
-	 * whichever is later.
-	 */
+	/* Use the current end of xlog replayed or received, whichever is later. */
 	receivePtr = GetWalRcvFlushRecPtr(NULL, NULL);
 	replayPtr = GetXLogReplayRecPtr(&replayTLI);
 	endptr = (receivePtr < replayPtr) ? replayPtr : receivePtr;
+
+	/*
+	 * Try to recycle segments on a useful timeline. If we've been promoted
+	 * since the beginning of this restartpoint, use the new timeline chosen
+	 * at end of recovery.  If we're still in recovery, use the timeline we're
+	 * currently replaying.
+	 */
+	if (!RecoveryInProgress())
+		replayTLI = XLogCtl->InsertTimeLineID;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (ClusterWalStateConfigured())
+	{
+		ClusterWalRetentionE1Context context = {0};
+
+		if (ClusterWalRetentionE1Cutoff(
+				&context, RedoRecPtr, endptr, slotsMinReqLSN, &_logSegNo))
+		{
+			RemoveOldXlogFilesCluster(
+				_logSegNo, RedoRecPtr, endptr, replayTLI, &context);
+			cluster_wal_retention_e1_finish(&context);
+		}
+	}
+	else
+#endif
+	{
+	XLByteToSeg(RedoRecPtr, _logSegNo, wal_segment_size);
 	KeepLogSeg(endptr, slotsMinReqLSN, &_logSegNo);
 	if (InvalidateObsoleteReplicationSlots(RS_INVAL_WAL_REMOVED,
 										   _logSegNo, InvalidOid,
@@ -8333,23 +8854,8 @@ CreateRestartPoint(int flags)
 		KeepLogSeg(endptr, slotsMinReqLSN, &_logSegNo);
 	}
 	_logSegNo--;
-
-	/*
-	 * Try to recycle segments on a useful timeline. If we've been promoted
-	 * since the beginning of this restartpoint, use the new timeline chosen
-	 * at end of recovery.  If we're still in recovery, use the timeline we're
-	 * currently replaying.
-	 *
-	 * There is no guarantee that the WAL segments will be useful on the
-	 * current timeline; if recovery proceeds to a new timeline right after
-	 * this, the pre-allocated WAL segments on this timeline will not be used,
-	 * and will go wasted until recycled on the next restartpoint. We'll live
-	 * with that.
-	 */
-	if (!RecoveryInProgress())
-		replayTLI = XLogCtl->InsertTimeLineID;
-
 	RemoveOldXlogFiles(_logSegNo, RedoRecPtr, endptr, replayTLI);
+	}
 
 	/*
 	 * Make more log segments if needed.  (Do this after recycling old log

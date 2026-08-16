@@ -252,7 +252,8 @@ extern void SetWalWriterSleeping(bool sleeping);
 /*
  * Routines used by xlogrecovery.c to call back into xlog.c during recovery.
  */
-extern void RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI);
+extern void RemoveNonParentXlogFiles(XLogRecPtr switchpoint, TimeLineID newTLI,
+									 bool timeline_switch);
 extern bool XLogCheckpointNeeded(XLogSegNo new_segno);
 extern void SwitchIntoArchiveRecovery(XLogRecPtr EndRecPtr, TimeLineID replayTLI);
 extern void ReachedEndOfBackup(XLogRecPtr EndRecPtr, TimeLineID tli);

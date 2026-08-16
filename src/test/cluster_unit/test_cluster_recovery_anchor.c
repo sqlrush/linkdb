@@ -57,6 +57,10 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_anchor.h"
+#include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_stats.h"
+#include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
@@ -88,6 +92,21 @@ static uint64 test_self_incarnation = UINT64_C(77);
 static uint64 test_admitted_incarnation = UINT64_C(77);
 static bool test_owner_eor_active;
 static int test_write_fence_calls;
+static ClusterStartupPhase test_startup_phase = CLUSTER_PHASE_RUNNING;
+static TimestampTz test_phase4_started_at = 1000;
+static ClusterStatsStatus test_stats_status = CLUSTER_STATS_READY;
+static TimestampTz test_stats_spawned_at = 2000;
+static uint16 test_wal_thread_id = 4;
+static uint16 test_dump_thread_id = 4;
+static bool test_wal_thread_dir_configured = true;
+static bool test_wal_thread_dir_validated = true;
+static bool test_wal_registry_ready = true;
+static ClusterWalSlotVerdict test_wal_slot_verdict = CLUSTER_WAL_SLOT_OK;
+static ClusterWalStateSlot test_wal_slot;
+static int test_wal_slot_read_calls;
+static uint16 test_wal_slot_last_read_thread;
+static bool test_cf_x_held = true;
+static bool test_phase4_drift_on_second_fence;
 static bool test_expect_panic;
 static jmp_buf test_panic_jump;
 
@@ -109,10 +128,82 @@ cluster_qvotec_get_self_incarnation(void)
 	return test_self_incarnation;
 }
 
+ClusterStartupPhase
+cluster_current_phase(void)
+{
+	return test_startup_phase;
+}
+
+TimestampTz
+cluster_phase_started_at(ClusterStartupPhase phase)
+{
+	return phase == CLUSTER_PHASE_4_NORMAL ? test_phase4_started_at : 0;
+}
+
+ClusterStatsStatus
+cluster_stats_status(void)
+{
+	return test_stats_status;
+}
+
+TimestampTz
+cluster_stats_spawned_at(void)
+{
+	return test_stats_spawned_at;
+}
+
+uint16
+cluster_wal_thread_id(void)
+{
+	return test_wal_thread_id;
+}
+
+uint16
+cluster_wal_thread_dump_thread_id(void)
+{
+	return test_dump_thread_id;
+}
+
+bool
+cluster_wal_thread_dir_configured(void)
+{
+	return test_wal_thread_dir_configured;
+}
+
+bool
+cluster_wal_thread_dir_validated(void)
+{
+	return test_wal_thread_dir_validated;
+}
+
+bool
+cluster_wal_state_registry_ready(void)
+{
+	return test_wal_registry_ready;
+}
+
+ClusterWalSlotVerdict
+cluster_wal_state_read_slot(uint16 thread_id, ClusterWalStateSlot *slot_out)
+{
+	test_wal_slot_read_calls++;
+	test_wal_slot_last_read_thread = thread_id;
+	if (slot_out != NULL)
+		*slot_out = test_wal_slot;
+	return test_wal_slot_verdict;
+}
+
+bool
+cluster_cf_held_is_clusterwide(LOCKMODE mode)
+{
+	return mode == ExclusiveLock && test_cf_x_held;
+}
+
 void
 cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused())
 {
 	test_write_fence_calls++;
+	if (test_phase4_drift_on_second_fence && test_write_fence_calls == 2)
+		test_wal_slot.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 }
 
 bool
@@ -269,6 +360,24 @@ wipe_anchor_files(void)
 	test_admitted_incarnation = UINT64_C(77);
 	test_owner_eor_active = false;
 	test_write_fence_calls = 0;
+	test_startup_phase = CLUSTER_PHASE_RUNNING;
+	test_phase4_started_at = 1000;
+	test_stats_status = CLUSTER_STATS_READY;
+	test_stats_spawned_at = 2000;
+	test_wal_thread_id = 4;
+	test_dump_thread_id = 4;
+	test_wal_thread_dir_configured = true;
+	test_wal_thread_dir_validated = true;
+	test_wal_registry_ready = true;
+	test_wal_slot_verdict = CLUSTER_WAL_SLOT_OK;
+	cluster_wal_state_slot_fill(&test_wal_slot, test_wal_thread_id, cluster_node_id,
+								CLUSTER_WAL_SLOT_STATE_ACTIVE, 1,
+								test_stats_spawned_at, test_stats_spawned_at + 1,
+								0x1000, 0x2000);
+	test_wal_slot_read_calls = 0;
+	test_wal_slot_last_read_thread = 0;
+	test_cf_x_held = true;
+	test_phase4_drift_on_second_fence = false;
 	test_expect_panic = false;
 }
 
@@ -596,6 +705,27 @@ publish_checkpoint_panics(const CheckPoint *cp)
 	return true;
 }
 
+static void
+configure_exact_phase4_publisher(void)
+{
+	wipe_anchor_files();
+	test_membership_state = CLUSTER_MEMBER_ABSENT;
+	test_admitted_incarnation = 0;
+	test_startup_phase = CLUSTER_PHASE_4_NORMAL;
+	test_stats_status = CLUSTER_STATS_SPAWNING;
+}
+
+static void
+assert_phase4_publish_rejected_before_io(const CheckPoint *cp)
+{
+	ClusterRecoveryAnchor out;
+	bool used_bak;
+
+	UT_ASSERT(publish_checkpoint_panics(cp));
+	UT_ASSERT_EQ(test_write_fence_calls, 1);
+	UT_ASSERT(!cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
+}
+
 UT_TEST(test_checkpoint_publish_requires_current_owner_before_io)
 {
 	CheckPoint cp;
@@ -636,6 +766,110 @@ UT_TEST(test_checkpoint_publish_requires_current_owner_before_io)
 	UT_ASSERT_EQ(test_write_fence_calls, 2);
 	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 	UT_ASSERT_EQ(out.checkPoint, 0x0000000398770000ULL);
+}
+
+/* ======================================================================
+ * RF-ROOT P6: the mandatory initial phase4 checkpoint precedes ordinary
+ * membership admission.  Its sole additional publisher proof is the exact
+ * current Cluster Stats SPAWNING incarnation, own validated WAL thread and
+ * ACTIVE slot, under a real coordinated CF(X).  Every mismatch fails before
+ * I/O, and the complete predicate is repeated after durable publication.
+ * ====================================================================== */
+UT_TEST(test_checkpoint_publish_phase4_boot_proof_is_exact)
+{
+	CheckPoint cp;
+	ClusterRecoveryAnchor out;
+	bool used_bak;
+
+	memset(&cp, 0, sizeof(cp));
+	cp.redo = 0x0000000398760000ULL;
+	cp.ThisTimeLineID = 1;
+	cp.PrevTimeLineID = 1;
+
+	configure_exact_phase4_publisher();
+	UT_ASSERT(!publish_checkpoint_panics(&cp));
+	UT_ASSERT_EQ(test_write_fence_calls, 2);
+	UT_ASSERT_EQ(test_wal_slot_read_calls, 2);
+	UT_ASSERT_EQ(test_wal_slot_last_read_thread, test_wal_thread_id);
+	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
+
+	configure_exact_phase4_publisher();
+	test_startup_phase = CLUSTER_PHASE_RUNNING;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_stats_status = CLUSTER_STATS_READY;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_self_incarnation = 0;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_thread_dir_configured = false;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_thread_dir_validated = false;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_dump_thread_id++;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_thread_id = XLP_THREAD_ID_LEGACY;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_registry_ready = false;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_slot_verdict = CLUSTER_WAL_SLOT_CORRUPT;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_slot.thread_id++;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_slot.node_id++;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_slot.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_stats_spawned_at = 0;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_phase4_started_at = 0;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_stats_spawned_at = test_phase4_started_at - 1;
+	test_wal_slot.started_at = test_stats_spawned_at;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_wal_slot.started_at++;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_phase4_publisher();
+	test_cf_x_held = false;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	/* The second fence call is between durable write and the repeated
+	 * publisher predicate.  Drift there must PANIC before WAL reuse. */
+	configure_exact_phase4_publisher();
+	test_phase4_drift_on_second_fence = true;
+	UT_ASSERT(publish_checkpoint_panics(&cp));
+	UT_ASSERT_EQ(test_write_fence_calls, 2);
+	UT_ASSERT_EQ(test_wal_slot_read_calls, 2);
+	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 }
 
 /* ======================================================================
@@ -701,7 +935,7 @@ main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_layout);
 	UT_RUN(test_write_read_roundtrip);
 	UT_RUN(test_classify);
@@ -711,6 +945,7 @@ main(void)
 	UT_RUN(test_state_carrier);
 	UT_RUN(test_publish_checkpoint);
 	UT_RUN(test_checkpoint_publish_requires_current_owner_before_io);
+	UT_RUN(test_checkpoint_publish_phase4_boot_proof_is_exact);
 	UT_RUN(test_refresh_state);
 	UT_RUN(test_load_adoption);
 	UT_DONE();

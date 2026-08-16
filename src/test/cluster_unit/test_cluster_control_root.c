@@ -17,6 +17,7 @@
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_shared_fs.h"
@@ -51,6 +52,9 @@ int cluster_node_id = 0;
 
 static char test_root[MAXPGPATH];
 static char test_wal_root[MAXPGPATH];
+static uint64 test_system_identifier = TEST_SYSID;
+static char test_storage_uuid_text[33] =
+	"00112233445566778899aabbccddeeff";
 static ClusterCfContractState test_contract = CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
 static int test_node_count = 4;
 static bool test_local_probe = true;
@@ -63,7 +67,26 @@ static bool test_fail_primary_rename = false;
 static bool test_create_authorized = true;
 static bool test_activate_authorized = true;
 static bool test_publish_authorized = true;
+static ClusterWalPinResult test_walr_begin_result = CLUSTER_WAL_PIN_OK;
+static ClusterWalrReleaseResult test_walr_end_result =
+	CLUSTER_WALR_RELEASE_CONFIRMED;
+static int test_walr_begin_calls = 0;
+static int test_walr_end_calls = 0;
+static uint16 test_walr_thread = 0;
+static int test_order_seq = 0;
+static int test_walr_begin_order = 0;
+static int test_cf_acquire_order = 0;
+static int test_cf_release_order = 0;
+static int test_last_rename_order = 0;
 static TimestampTz test_now = INT64_C(1700000000000000);
+
+typedef struct ClusterWalRootPublishGuard ClusterWalRootPublishGuard;
+
+extern ClusterWalPinResult cluster_wal_retention_root_publish_begin_exact(
+	const ClusterControlRootReadToken *expected_root, bool require_sealed_pin,
+	ClusterWalRootPublishGuard **out_guard);
+extern ClusterWalrReleaseResult cluster_wal_retention_root_publish_end(
+	ClusterWalRootPublishGuard **guard);
 
 void *
 palloc(Size size)
@@ -112,6 +135,7 @@ int
 durable_rename(const char *oldfile, const char *newfile, int elevel pg_attribute_unused())
 {
 	test_durable_rename_calls++;
+	test_last_rename_order = ++test_order_seq;
 	if (test_fail_primary_rename
 		&& strstr(newfile, CLUSTER_CONTROL_ROOT_REL_PATH) != NULL
 		&& strstr(newfile, ".bak") == NULL) {
@@ -142,7 +166,7 @@ GetCurrentTimestamp(void)
 uint64
 GetSystemIdentifier(void)
 {
-	return TEST_SYSID;
+	return test_system_identifier;
 }
 
 int
@@ -154,7 +178,7 @@ cluster_conf_node_count(void)
 void
 cluster_shared_fs_get_storage_uuid(char *out, size_t outlen)
 {
-	strlcpy(out, "00112233445566778899aabbccddeeff", outlen);
+	strlcpy(out, test_storage_uuid_text, outlen);
 }
 
 ClusterCfContractState
@@ -179,6 +203,7 @@ bool
 cluster_cf_lock(LOCKMODE mode pg_attribute_unused())
 {
 	test_cf_lock_calls++;
+	test_cf_acquire_order = ++test_order_seq;
 	return test_cf_grant;
 }
 
@@ -191,8 +216,34 @@ cluster_cf_held_is_clusterwide(LOCKMODE mode pg_attribute_unused())
 ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode pg_attribute_unused())
 {
+	test_cf_release_order = ++test_order_seq;
 	return test_cf_release_confirmed ? CLUSTER_CF_RELEASE_CONFIRMED
 									 : CLUSTER_CF_RELEASE_UNCONFIRMED;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_root_publish_begin_exact(
+	const ClusterControlRootReadToken *expected_root,
+	bool require_sealed_pin pg_attribute_unused(),
+	ClusterWalRootPublishGuard **out_guard)
+{
+	test_walr_begin_calls++;
+	test_walr_thread = expected_root->origin_thread_id;
+	test_walr_begin_order = ++test_order_seq;
+	if (test_walr_begin_result != CLUSTER_WAL_PIN_OK)
+		return test_walr_begin_result;
+	*out_guard = (ClusterWalRootPublishGuard *)(uintptr_t)0x1;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterWalrReleaseResult
+cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
+{
+	test_walr_end_calls++;
+	++test_order_seq;
+	if (test_walr_end_result == CLUSTER_WALR_RELEASE_CONFIRMED)
+		*guard = NULL;
+	return test_walr_end_result;
 }
 
 bool
@@ -319,6 +370,16 @@ wipe_root_files(void)
 	test_create_authorized = true;
 	test_activate_authorized = true;
 	test_publish_authorized = true;
+	test_walr_begin_result = CLUSTER_WAL_PIN_OK;
+	test_walr_end_result = CLUSTER_WALR_RELEASE_CONFIRMED;
+	test_walr_begin_calls = 0;
+	test_walr_end_calls = 0;
+	test_walr_thread = 0;
+	test_order_seq = 0;
+	test_walr_begin_order = 0;
+	test_cf_acquire_order = 0;
+	test_cf_release_order = 0;
+	test_last_rename_order = 0;
 }
 
 static void
@@ -455,6 +516,284 @@ build_migration(ClusterControlRootMigrationImage *image,
 	round->capability_sample_digest = UINT64_C(0x8877665544332211);
 	round->coordinator_incarnation = UINT64_C(0x7766554433221100);
 	round->coordinator_node_id = 0;
+}
+
+static bool
+parse_u64_arg(const char *text, uint64 *out)
+{
+	char *end = NULL;
+	unsigned long long value;
+
+	if (text == NULL || text[0] == '\0' || text[0] == '-')
+		return false;
+	errno = 0;
+	value = strtoull(text, &end, 10);
+	if (errno != 0 || end == text || *end != '\0')
+		return false;
+	*out = (uint64)value;
+	return true;
+}
+
+static int
+hex_digit(unsigned char ch)
+{
+	if (ch >= '0' && ch <= '9')
+		return ch - '0';
+	if (ch >= 'a' && ch <= 'f')
+		return ch - 'a' + 10;
+	if (ch >= 'A' && ch <= 'F')
+		return ch - 'A' + 10;
+	return -1;
+}
+
+static bool
+parse_uuid_hex(const char *text, uint8 out[16])
+{
+	int i;
+
+	if (text == NULL || strlen(text) != 32)
+		return false;
+	for (i = 0; i < 16; i++) {
+		int high = hex_digit((unsigned char)text[i * 2]);
+		int low = hex_digit((unsigned char)text[i * 2 + 1]);
+
+		if (high < 0 || low < 0)
+			return false;
+		out[i] = (uint8)((high << 4) | low);
+	}
+	return true;
+}
+
+static bool
+read_exact_file(const char *path, void *buf, size_t len)
+{
+	uint8 *bytes = buf;
+	struct stat st;
+	size_t done = 0;
+	int fd = open(path, O_RDONLY | PG_BINARY);
+
+	if (fd < 0 || fstat(fd, &st) != 0 || st.st_size != (off_t)len) {
+		if (fd >= 0)
+			close(fd);
+		return false;
+	}
+	while (done < len) {
+		ssize_t n = read(fd, bytes + done, len - done);
+
+		if (n <= 0) {
+			close(fd);
+			return false;
+		}
+		done += (size_t)n;
+	}
+	return close(fd) == 0;
+}
+
+static bool
+write_exact_durable(const char *path, const void *buf, size_t len)
+{
+	const uint8 *bytes = buf;
+	size_t done = 0;
+	int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | PG_BINARY, 0600);
+
+	if (fd < 0)
+		return false;
+	while (done < len) {
+		ssize_t n = write(fd, bytes + done, len - done);
+
+		if (n <= 0) {
+			close(fd);
+			return false;
+		}
+		done += (size_t)n;
+	}
+	if (fsync(fd) != 0 || close(fd) != 0)
+		return false;
+	return true;
+}
+
+static bool
+fixture_seed_source(uint32 tli, uint64 checkpoint_lsn, uint64 tail_lsn,
+					ClusterWalThreadClaim *out_claim)
+{
+	uint8 bytes[CLUSTER_WAL_STATE_FILE_SIZE];
+	ClusterWalStateSlot slot;
+	uint16 bad_thread = 0;
+	const char *reason = NULL;
+	char path[MAXPGPATH];
+	char thread_dir[MAXPGPATH];
+	int64 claim_created_at = INT64_C(1700000000000001);
+
+	if (snprintf(path, sizeof(path), "%s/%s", test_wal_root,
+				 CLUSTER_WAL_STATE_FILENAME) <= 0
+		|| !read_exact_file(path, bytes, sizeof(bytes))
+		|| !cluster_wal_state_image_validate(bytes, sizeof(bytes), &bad_thread,
+										 &reason))
+		return false;
+	if (!cluster_wal_state_slot_is_zero(
+			(ClusterWalStateSlot *)(bytes + CLUSTER_WAL_STATE_SLOT_OFFSET(1))))
+		return false;
+
+	cluster_wal_state_slot_fill(&slot, 1, 0, CLUSTER_WAL_SLOT_STATE_STOPPED,
+							tli, claim_created_at, claim_created_at + 1,
+							tail_lsn, 1);
+	slot.checkpoint_redo_lsn = checkpoint_lsn;
+	slot.crc = cluster_wal_state_block_crc(&slot);
+	memcpy(bytes + CLUSTER_WAL_STATE_SLOT_OFFSET(1), &slot, sizeof(slot));
+	if (!write_exact_durable(path, bytes, sizeof(bytes)))
+		return false;
+
+	cluster_wal_thread_claim_fill(out_claim, 1, 0, claim_created_at);
+	if (snprintf(thread_dir, sizeof(thread_dir), "%s/thread_1", test_wal_root) <= 0)
+		return false;
+	if (mkdir(thread_dir, 0700) != 0 && errno != EEXIST)
+		return false;
+	if (snprintf(path, sizeof(path), "%s/%s", thread_dir,
+				 CLUSTER_WAL_THREAD_CLAIM_FILENAME) <= 0
+		|| !write_exact_durable(path, out_claim, sizeof(*out_claim)))
+		return false;
+	return true;
+}
+
+static int
+fixture_root_main(int argc, char **argv)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken prepared;
+	ClusterControlRootFileToken active;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootIdentity expected_identity;
+	ClusterControlRootReadToken read_token;
+	ClusterWalThreadClaim claim;
+	uint8 round_sha[PG_SHA256_DIGEST_LENGTH];
+	uint64 sysid;
+	uint64 tli64;
+	uint64 checkpoint_lsn;
+	uint64 tail_lsn;
+	uint32 lifecycle;
+	int i;
+
+	if (argc != 10 || strcmp(argv[1], "--fixture-root") != 0
+		|| !parse_u64_arg(argv[4], &sysid) || sysid == 0
+		|| !parse_u64_arg(argv[7], &tli64) || tli64 == 0
+		|| tli64 > UINT32_MAX
+		|| !parse_u64_arg(argv[8], &checkpoint_lsn) || checkpoint_lsn == 0
+		|| !parse_u64_arg(argv[9], &tail_lsn) || tail_lsn < checkpoint_lsn
+		|| strlen(argv[2]) >= sizeof(test_root)
+		|| strlen(argv[3]) >= sizeof(test_wal_root)
+		|| strlen(argv[5]) != 32) {
+		fprintf(stderr, "invalid --fixture-root arguments\n");
+		return 2;
+	}
+	if (strcmp(argv[6], "OPEN") == 0)
+		lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	else if (strcmp(argv[6], "RECOVERY_REQUIRED") == 0)
+		lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	else {
+		fprintf(stderr, "unsupported fixture lifecycle\n");
+		return 2;
+	}
+
+	strlcpy(test_root, argv[2], sizeof(test_root));
+	strlcpy(test_wal_root, argv[3], sizeof(test_wal_root));
+	strlcpy(test_storage_uuid_text, argv[5], sizeof(test_storage_uuid_text));
+	test_system_identifier = sysid;
+	cluster_shared_data_dir = test_root;
+	cluster_wal_threads_dir = test_wal_root;
+	DataDir = test_root;
+	test_node_count = 1;
+	test_local_probe = true;
+	if (!fixture_seed_source((uint32)tli64, checkpoint_lsn, tail_lsn, &claim)) {
+		fprintf(stderr, "cannot seed canonical stopped WAL source\n");
+		return 1;
+	}
+
+	memset(&image, 0, sizeof(image));
+	image.system_identifier = sysid;
+	if (!parse_uuid_hex(argv[5], image.storage_uuid)) {
+		fprintf(stderr, "invalid storage UUID\n");
+		return 2;
+	}
+	for (i = 0; i < 16; i++)
+		image.authority_uuid[i] = (uint8)(0xa0 + i);
+	image.authority_uuid[6] = 0x46;
+	image.authority_uuid[8] = 0x8a;
+	image.created_at_usec = INT64_C(1700000000000002);
+	image.assigned_record_count = 1;
+
+	snapshot = (ClusterControlRootSnapshot){0};
+	snapshot.identity.system_identifier = sysid;
+	memcpy(snapshot.identity.storage_uuid, image.storage_uuid, 16);
+	memcpy(snapshot.identity.authority_uuid, image.authority_uuid, 16);
+	snapshot.identity.origin_thread_id = 1;
+	snapshot.identity.origin_node_id = 0;
+	snapshot.identity.thread_claim_created_at = claim.created_at;
+	snapshot.identity.thread_claim_crc32c = claim.crc;
+	snapshot.identity.origin_owner_incarnation = UINT64_C(0x1122334455667788);
+	snapshot.identity.root_lineage_seq = 1;
+	snapshot.lifecycle = lifecycle;
+	snapshot.root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+						  | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+						  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+	snapshot.root_publish_seq = 1;
+	snapshot.checkpoint_tli = (uint32)tli64;
+	snapshot.tail_tli = (uint32)tli64;
+	snapshot.checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
+	snapshot.tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	snapshot.checkpoint_lower_lsn = checkpoint_lsn;
+	snapshot.validated_tail_lsn_exclusive = tail_lsn;
+	snapshot.checkpoint_record_crc32c = UINT32_C(0x33445566);
+	if (tail_lsn > checkpoint_lsn) {
+		snapshot.root_flags |= CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+		snapshot.tail_last_record_lsn = tail_lsn - 1;
+		snapshot.tail_last_record_crc32c = UINT32_C(0x55667788);
+	}
+	if (lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED) {
+		snapshot.root_flags |= CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+		snapshot.recovered_tli = (uint32)tli64;
+		snapshot.recovered_through_lsn_exclusive = checkpoint_lsn;
+	}
+	snapshot.published_at_usec = image.created_at_usec;
+	snapshot.lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT;
+	image.records[0] = snapshot;
+
+	memset(&round, 0, sizeof(round));
+	memcpy(round.magic, "PCRM", 4);
+	round.version = 1;
+	round.bytes = sizeof(round);
+	round.prepare_generation = 1;
+	round.transition_epoch = 1;
+	round.target_feature_bitmap =
+		PGRAC_CONTROL_ROOT_FEATURE_WAL_REUSE_V1
+		| PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.admitted_bitmap_low = 1;
+	round.capability_sample_digest = UINT64_C(0x8877665544332211);
+	round.coordinator_incarnation = UINT64_C(0x7766554433221100);
+	round.coordinator_node_id = 0;
+
+	wipe_root_files();
+	if (cluster_control_root_create_prepared(&image, &round, &prepared)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		fprintf(stderr, "control-root prepare failed\n");
+		return 1;
+	}
+	round_sha256(&round, round_sha);
+	if (cluster_control_root_activate_prepared(&prepared, round_sha, &active)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| active.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE) {
+		fprintf(stderr, "control-root activation verification failed\n");
+		return 1;
+	}
+	expected_identity = snapshot.identity;
+	if (cluster_control_root_read_canonical(1, &expected_identity,
+										 CLUSTER_CONTROL_ROOT_READ_STRONG,
+										 &snapshot, &read_token)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		fprintf(stderr, "control-root activation verification failed\n");
+		return 1;
+	}
+	return 0;
 }
 
 static ClusterControlRootResult
@@ -937,6 +1276,89 @@ UT_TEST(test_lifecycle_publish_exact_token_cas)
 	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
 				 &read_token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_RETIRE,
 				 &published, &new_token), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(test_walr_begin_calls, 0);
+	UT_ASSERT_EQ(test_walr_end_calls, 0);
+}
+
+UT_TEST(test_retention_expanding_publish_refuses_before_cf_without_walr)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootReadToken read_token;
+	ClusterControlRootReadToken new_token;
+	ClusterControlRootPatch patch;
+
+	wipe_root_files();
+	build_migration(&image, &round);
+	image.records[0].lifecycle =
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &file_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+				 1, &image.records[0].identity,
+				 CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	build_owner_rejoin_patch(&snapshot,
+						 snapshot.identity.origin_owner_incarnation + 1,
+						 snapshot.identity.root_lineage_seq + 1, &patch);
+	test_cf_lock_calls = 0;
+	test_durable_rename_calls = 0;
+	test_walr_begin_result = CLUSTER_WAL_PIN_UNAVAILABLE;
+	memset(&published, 0xee, sizeof(published));
+	memset(&new_token, 0xee, sizeof(new_token));
+	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
+				 &read_token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
+				 &published, &new_token), CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT_EQ(test_walr_begin_calls, 1);
+	UT_ASSERT_EQ(test_walr_thread, 1);
+	UT_ASSERT_EQ(test_walr_end_calls, 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	UT_ASSERT_EQ(test_durable_rename_calls, 0);
+	UT_ASSERT_EQ(published.identity.system_identifier, 0);
+	UT_ASSERT_EQ(new_token.file_txn_seq, 0);
+}
+
+UT_TEST(test_retention_expanding_publish_holds_walr_around_cf_and_readback)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootReadToken read_token;
+	ClusterControlRootReadToken new_token;
+	ClusterControlRootPatch patch;
+
+	wipe_root_files();
+	build_migration(&image, &round);
+	image.records[0].lifecycle =
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &file_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+				 1, &image.records[0].identity,
+				 CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	build_owner_rejoin_patch(&snapshot,
+						 snapshot.identity.origin_owner_incarnation + 1,
+						 snapshot.identity.root_lineage_seq + 1, &patch);
+	test_order_seq = 0;
+	test_walr_begin_order = 0;
+	test_cf_acquire_order = 0;
+	test_cf_release_order = 0;
+	test_last_rename_order = 0;
+	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
+				 &read_token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
+				 &published, &new_token), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(test_walr_begin_calls, 1);
+	UT_ASSERT_EQ(test_walr_end_calls, 1);
+	UT_ASSERT(test_walr_begin_order < test_cf_acquire_order);
+	UT_ASSERT(test_cf_acquire_order < test_last_rename_order);
+	UT_ASSERT(test_last_rename_order < test_cf_release_order);
+	UT_ASSERT(test_cf_release_order < test_order_seq);
 }
 
 UT_TEST(test_unbound_publisher_fails_before_cf_and_preserves_root)
@@ -1169,11 +1591,13 @@ UT_TEST(test_reserved_bytes_and_symlink_fail_closed)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	if (argc > 1)
+		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(23);
+	UT_PLAN(25);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -1190,6 +1614,8 @@ main(void)
 	UT_RUN(test_forbidden_patch_rejected_before_cf_and_file_io);
 	UT_RUN(test_lookup_and_revalidate_use_exact_primary_identity);
 	UT_RUN(test_lifecycle_publish_exact_token_cas);
+	UT_RUN(test_retention_expanding_publish_refuses_before_cf_without_walr);
+	UT_RUN(test_retention_expanding_publish_holds_walr_around_cf_and_readback);
 	UT_RUN(test_unbound_publisher_fails_before_cf_and_preserves_root);
 	UT_RUN(test_owner_rejoin_rejects_non_new_incarnation);
 	UT_RUN(test_owner_rejoin_advances_exact_lineage_and_exhausts_at_max);

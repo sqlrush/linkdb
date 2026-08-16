@@ -376,6 +376,17 @@ UT_TEST(test_serve_gate)
 	UT_ASSERT(cluster_clean_leave_serve_gate_allows(true, true));
 }
 
+UT_TEST(test_startup_serving_gate)
+{
+	/* Legacy/unmanaged startup keeps the established behavior.  Once Scheme A
+	 * owns readiness, clean leave is ordinary serving work and must wait for
+	 * the generation-bound SERVING_READY publication. */
+	UT_ASSERT(cluster_clean_leave_startup_serving_allows(false, false));
+	UT_ASSERT(cluster_clean_leave_startup_serving_allows(false, true));
+	UT_ASSERT(!cluster_clean_leave_startup_serving_allows(true, false));
+	UT_ASSERT(cluster_clean_leave_startup_serving_allows(true, true));
+}
+
 
 /* ============================================================
  * U9 — IC payload magic / version / CRC / identity validation (D8)
@@ -472,7 +483,7 @@ UT_TEST(test_ic_payload_validation)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_struct_layout);
 	UT_RUN(test_phase_fsm);
 	UT_RUN(test_version_coherent);
@@ -482,6 +493,7 @@ main(void)
 	UT_RUN(test_marker_validation);
 	UT_RUN(test_should_invalidate);
 	UT_RUN(test_serve_gate);
+	UT_RUN(test_startup_serving_gate);
 	UT_RUN(test_ic_payload_validation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

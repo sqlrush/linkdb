@@ -322,6 +322,20 @@ typedef struct ClusterReconfigState {
 	uint8 pending_join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
 
 	/*
+	 * RF-ROOT P04 approved fast-rejoin slice.  A bit is set only when a
+	 * shared-control-file LMON observes a live MEMBER at a strictly newer
+	 * incarnation than its fresh-alive rollover baseline.  The bit survives an LMON restart,
+	 * authorizes only the existing FAIL_STOP -> ordinary join/redeclare path,
+	 * and is cleared at that node's JOIN_COMMITTED membership publication.
+	 * Volatile shmem only: no wire or persistent-format surface.
+	 */
+	uint8 fast_rejoin_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	/* First fresh-alive shared-CF incarnation observed for each formed peer.
+	 * Rollover evidence only: this does not mutate admitted membership and is
+	 * intentionally absent from the serving formation snapshot. */
+	uint64 fast_rejoin_incarnation[CLUSTER_MAX_NODES];
+
+	/*
 	 * spec-5.15 D5 (INV-J9) — node-local joiner write gate.  1 = this node may
 	 * write (steady-state / admitted member, the default); 0 = this node is a
 	 * joiner that has NOT yet been published MEMBER, so every backend (current AND
@@ -435,8 +449,8 @@ typedef struct ClusterReconfigState {
 	ClusterReplacementEpisode replacement_episode;
 } ClusterReconfigState;
 
-StaticAssertDecl(sizeof(ClusterReconfigState) == 9928,
-				 "corrected-A1 reconfig state must remain exactly 9,928 bytes");
+StaticAssertDecl(sizeof(ClusterReconfigState) == 10968,
+				 "P04 fast-rejoin reconfig state must remain exactly 10,968 bytes");
 
 
 /* ============================================================

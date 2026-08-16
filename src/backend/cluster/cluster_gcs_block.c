@@ -63,6 +63,7 @@
 #include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
 #include "cluster/cluster_xnode_profile.h"	 /* spec-5.59 D2/D3/D4 profiling buckets */
 #include "cluster/cluster_xnode_lever.h"	 /* spec-6.12a — downgrade counters */
@@ -3169,6 +3170,15 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_gcs_send_block_request_and_wait: NULL BufferDesc")));
+	if (cluster_authority_readiness_managed()
+		&& !cluster_serving_ready_is_current()) {
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+				 errmsg("GCS block service is not serving-ready"),
+				 errhint("Complete StartupXLOG and publish SERVING_READY before "
+						 "requesting cache-fusion data.")));
+		return false;
+	}
 
 	/*
 	 * PGRAC: spec-4.6 D4 / L12 — block-path fail-closed toward a DEAD
@@ -8002,6 +8012,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	uint8 request_flags = 0;
 
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
+	if (cluster_authority_readiness_managed()
+		&& !cluster_serving_ready_is_current())
+		return;
 	if (gcs_block_try_r4_request80(env, payload))
 		return;
 
