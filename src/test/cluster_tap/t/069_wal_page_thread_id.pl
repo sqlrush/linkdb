@@ -94,8 +94,10 @@ sub waldump_range
 }
 
 
-$node->safe_psql('postgres',
-	q{CREATE TABLE t1 (id int); INSERT INTO t1 VALUES (1);});
+$node->safe_psql('postgres', q{
+	CREATE TABLE t1 (id int, filler text DEFAULT repeat('x', 1900));
+	INSERT INTO t1 VALUES (1);
+});
 
 
 # ----------
@@ -152,7 +154,8 @@ $node2->stop;
 # (Q6 unconditional write 0; toggle does not gate placeholder.)
 # ----------
 $node->stop;
-$node->append_conf('postgresql.conf', "cluster.enabled = off\n");
+$node->append_conf('postgresql.conf',
+	"cluster.enabled = off\ncluster.relation_extend_lock_enabled = off\n");
 $node->start;
 
 # spec-4.1: records can begin on a page initialised BEFORE the off
@@ -174,6 +177,7 @@ $node->stop;
 my $conf_path = $node->data_dir . "/postgresql.conf";
 my $conf_content = slurp_file($conf_path);
 $conf_content =~ s/^cluster\.enabled\s*=\s*off\s*\n//mg;
+$conf_content =~ s/^cluster\.relation_extend_lock_enabled\s*=\s*off\s*\n//mg;
 open(my $fh, '>', $conf_path) or die "Cannot rewrite conf: $!";
 print $fh $conf_content;
 close($fh);
@@ -187,7 +191,7 @@ $node->start;
 my ($ret, $stdout, $stderr) = $node->psql('postgres', q{
 	SELECT cluster_inject_fault('cluster-wal-page-init-thread-id', 'skip', 0);
 	BEGIN;
-	  INSERT INTO t1 SELECT generate_series(1000, 1100);
+	  INSERT INTO t1(id) SELECT generate_series(1000, 1100);
 	COMMIT;
 });
 is($ret, 0, 'L5 HC5 :skip on cluster-wal-page-init-thread-id under load: no PANIC');
@@ -199,7 +203,7 @@ is($ret, 0, 'L5 HC5 :skip on cluster-wal-page-init-thread-id under load: no PANI
 ($ret, $stdout, $stderr) = $node->psql('postgres', q{
 	SELECT cluster_inject_fault('cluster-wal-page-init-thread-id', 'warning', 0);
 	BEGIN;
-	  INSERT INTO t1 SELECT generate_series(2000, 2100);
+	  INSERT INTO t1(id) SELECT generate_series(2000, 2100);
 	COMMIT;
 });
 is($ret, 0, 'L6 HC5 :warning on cluster-wal-page-init-thread-id: smoke pass');

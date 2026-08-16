@@ -161,8 +161,10 @@ itl_touch_capture_proof(const ClusterItlTouchHandle *handle, Buffer buffer, Tran
 {
 	Page page;
 	const ClusterItlSlotData *slot;
+	BufferTag expected_tag;
 	uint64 own_generation = 0;
 	uint64 acquisition_epoch = 0;
+	uint8 pcm_state = (uint8)PCM_STATE_N;
 
 	memset(proof, 0, sizeof(*proof));
 
@@ -190,11 +192,14 @@ itl_touch_capture_proof(const ClusterItlTouchHandle *handle, Buffer buffer, Tran
 	proof->slot_wrap = slot->wrap;
 	proof->slot_class = slot->flags;
 
-	if (!cluster_bufmgr_pcm_x_holder_stamp_authority(buffer, &own_generation, &acquisition_epoch))
+	InitBufferTag(&expected_tag, &handle->rloc, handle->forknum, handle->block);
+	if (!cluster_bufmgr_terminal_stamp_authority(buffer, &expected_tag, &own_generation,
+											 &acquisition_epoch, &pcm_state))
 		return;
 
 	proof->own_generation = own_generation;
 	proof->acquisition_epoch = acquisition_epoch;
+	proof->pcm_state = pcm_state;
 	proof->valid = true;
 }
 

@@ -61,7 +61,9 @@
 #include "cluster/cluster_reconfig.h"		 /* QVOTEC-observed live peer incarnation */
 #include "cluster/cluster_recovery_merge.h"	 /* spec-4.7 D5 — recovered_through redo gate */
 #include "cluster/cluster_r4_observe.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
 #include "cluster/cluster_xnode_profile.h"	 /* spec-5.59 D2/D3/D4 profiling buckets */
 #include "cluster/cluster_xnode_lever.h"	 /* spec-6.12a — downgrade counters */
@@ -80,6 +82,7 @@
 #include "cluster/cluster_pcm_x_image_fetch.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/storage/cluster_shared_fs.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 class 2 */
 #include "cluster/cluster_write_fence.h"
@@ -131,6 +134,46 @@ typedef enum ClusterGcsBlockReplyDomain {
 	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR = 1,
 	CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX = 2
 } ClusterGcsBlockReplyDomain;
+
+/* M4 Candidate-2 remote origin work is process-local and bounded.  The
+ * existing LMS DATA worker 0 advances one nonblocking phase per main-loop
+ * tick; no shared slot, actor, worker, or durable object is introduced. */
+#define GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS 4
+#define GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS                                      \
+	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1                                 \
+	 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1                                         \
+	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                            \
+	 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
+
+typedef enum GcsBlockR4TxOriginPhase {
+	GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN = 1,
+	GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_POLL,
+	GCS_BLOCK_R4_TX_ORIGIN_RESOLVE,
+	GCS_BLOCK_R4_TX_ORIGIN_RELEASE_BEGIN,
+	GCS_BLOCK_R4_TX_ORIGIN_RELEASE_POLL,
+	GCS_BLOCK_R4_TX_ORIGIN_SEND
+} GcsBlockR4TxOriginPhase;
+
+typedef struct GcsBlockR4TxOriginContext {
+	bool in_use;
+	bool guard_active;
+	GcsBlockR4TxOriginPhase phase;
+	uint32 requester_capability_generation;
+	ClusterR4CrForwardPayload forward;
+	ClusterTxLocator locator;
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0Generation expected_generation;
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard;
+	ClusterTxResolution resolution;
+	ClusterTxOutcome outcome;
+	ClusterTxResolveReason reason;
+	uint8 reply_frame[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+} GcsBlockR4TxOriginContext;
+
+static GcsBlockR4TxOriginContext
+	gcs_block_r4_tx_origin_contexts[GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS];
 
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
@@ -532,6 +575,10 @@ static void gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *
 								 const char *block_data);
 static ClusterICSendResult gcs_block_send_envelope_or_loopback(
 	uint8 msg_type, int32 dest_node, const void *payload, uint32 payload_len);
+static bool gcs_block_r4_tx_origin_try_accept(
+	const ClusterICEnvelope *env, const ClusterR4CrForwardPayload *forward);
+static void gcs_block_r4_tx_origin_context_clear(
+	GcsBlockR4TxOriginContext *context, bool cancel_guard);
 static bool gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 									 XLogRecPtr *out_page_lsn, char *copy_buf,
 									 const char **out_block_payload, uint32 *out_block_lkey,
@@ -2358,6 +2405,7 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 	status = (GcsBlockReplyStatus)header->status;
 	switch (status) {
 		case GCS_BLOCK_REPLY_R4_CR_FULL:
+		case GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT:
 		case GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED:
 		case GCS_BLOCK_REPLY_R4_DENIED:
 			payload_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
@@ -2392,6 +2440,11 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 
 	if (status == GCS_BLOCK_REPLY_R4_CR_FULL)
 		return expected->forwarding_master_node != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+	if (status == GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT)
+		return expected->forwarding_master_node
+				   == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+			   && expected->requester_backend_id > 0
+			   && header->page_lsn != 0;
 	if (status == GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
 		if (expected->requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
 			|| expected->forwarding_master_node != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
@@ -2758,6 +2811,12 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 	if (env == NULL || payload == NULL || env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
 		|| env->payload_length != sizeof(ClusterR4CrForwardPayload))
 		return false;
+	/* Candidate-2 kind-2 is the sole pre-OPEN FORWARD96 subdomain.  Classify
+	 * it before ordinary TARGET admission so malformed kind-2 frames are
+	 * consumed fail-closed and can never fall through as holder CR work. */
+	if (forward->extension.r4_version == CLUSTER_R4_WIRE_VERSION
+		&& forward->extension.r4_kind == (uint8)CLUSTER_R4_WIRE_TX_RESOLVE)
+		return gcs_block_r4_tx_origin_try_accept(env, forward);
 	memset(&admission, 0, sizeof(admission));
 	admission_result = cluster_semantic_activation_enter(
 		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
@@ -2852,6 +2911,24 @@ bool
 cluster_gcs_block_test_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 {
 	return gcs_block_try_r4_forward96(env, payload);
+}
+
+int
+cluster_gcs_block_test_r4_tx_origin_context_count(void)
+{
+	int count = 0;
+	int i;
+
+	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++)
+		if (gcs_block_r4_tx_origin_contexts[i].in_use)
+			count++;
+	return count;
+}
+
+void
+cluster_gcs_block_test_r4_tx_origin_drain(void)
+{
+	cluster_gcs_block_r4_tx_resolve_drain();
 }
 
 bool
@@ -3093,6 +3170,15 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	if (buf == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster_gcs_send_block_request_and_wait: NULL BufferDesc")));
+	if (cluster_authority_readiness_managed()
+		&& !cluster_serving_ready_is_current()) {
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+				 errmsg("GCS block service is not serving-ready"),
+				 errhint("Complete StartupXLOG and publish SERVING_READY before "
+						 "requesting cache-fusion data.")));
+		return false;
+	}
 
 	/*
 	 * PGRAC: spec-4.6 D4 / L12 — block-path fail-closed toward a DEAD
@@ -5455,6 +5541,145 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn,
 	return CLUSTER_CR_BUILD_RETRYABLE;
 }
 
+ClusterTxOutcome
+cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
+	int32 origin_node, const ClusterTxLocator *locator,
+	uint32 expected_physical_generation, uint64 formation_epoch,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
+{
+	ClusterGcsBlockOutstandingSlot *slot = NULL;
+	ClusterR4CrForwardPayload forward;
+	ClusterTxResolution decoded;
+	BufferTag tag;
+	uint64 request_id = 0;
+	uint32 segment_id;
+	uint32 block_no;
+	uint16 tt_slot_offset;
+	uint16 row_offset;
+	volatile bool got_reply = false;
+	volatile bool sent = false;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (reason_out != NULL)
+		*reason_out = reason;
+	memset(&decoded, 0, sizeof(decoded));
+	if (out == NULL || locator == NULL || reason_out == NULL
+		|| origin_node < 0 || origin_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| origin_node == cluster_node_id
+		|| expected_physical_generation == UINT32_MAX
+		|| !uba_decode(locator->uba, &segment_id, &block_no,
+					   &tt_slot_offset, &row_offset)
+		|| block_no == 0
+		|| uba_origin_node_id(locator->uba) != (NodeId)origin_node)
+		return CLUSTER_TX_UNKNOWN;
+	tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
+	slot = gcs_block_try_reserve_r4_slot(
+		tag, formation_epoch, origin_node, &request_id);
+	if (slot == NULL)
+		return CLUSTER_TX_UNKNOWN;
+
+	PG_TRY();
+	{
+		memset(&forward, 0, sizeof(forward));
+		forward.base.request_id = request_id;
+		forward.base.epoch = formation_epoch;
+		forward.base.tag = tag;
+		forward.base.original_requester_node = cluster_node_id;
+		forward.base.requester_backend_id = (int32)MyBackendId;
+		forward.base.master_node = origin_node;
+		forward.base.transition_id = (uint8)PCM_TRANS_N_TO_S;
+		if (ClusterR4ForwardExtensionSetLocatorGeneration(
+				&forward.extension, CLUSTER_R4_WIRE_TX_RESOLVE,
+				locator, expected_physical_generation))
+			sent = cluster_grd_outbound_enqueue_backend_msg(
+				PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node,
+				&forward, sizeof(forward));
+		if (sent) {
+			ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
+			instr_time started;
+
+			INSTR_TIME_SET_CURRENT(started);
+			ConditionVariablePrepareToSleep(&slot->reply_cv);
+			for (;;) {
+				instr_time now;
+				instr_time elapsed;
+				double remaining_ms;
+				long timeout_ms;
+				bool have_reply;
+				bool stale;
+
+				LWLockAcquire(&blk->lock.lock, LW_SHARED);
+				have_reply = slot->in_use && slot->reply_received;
+				stale = slot->in_use && slot->stale;
+				LWLockRelease(&blk->lock.lock);
+				if (have_reply) {
+					got_reply = true;
+					break;
+				}
+				if (stale)
+					break;
+				INSTR_TIME_SET_CURRENT(now);
+				elapsed = now;
+				INSTR_TIME_SUBTRACT(elapsed, started);
+				remaining_ms = (double)cluster_gcs_reply_timeout_ms
+							   - INSTR_TIME_GET_MILLISEC(elapsed);
+				if (remaining_ms <= 0)
+					break;
+				timeout_ms = remaining_ms < 1.0 ? 1L : (long)remaining_ms;
+				(void)ConditionVariableTimedSleep(
+					&slot->reply_cv, timeout_ms,
+					WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			}
+			ConditionVariableCancelSleep();
+		}
+
+		if (!got_reply) {
+			reason = CLUSTER_TX_RESOLVE_IO_ERROR;
+			goto tx_done;
+		}
+		if (slot->reply_header.status
+				!= (uint8)GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			goto tx_done;
+		}
+		if (!ClusterR4TxVerdictPageDecode(
+				(const uint8 *)slot->reply_block_data, locator, &decoded)
+			|| decoded.authority.origin_epoch != formation_epoch
+			|| slot->reply_header.page_lsn == 0
+			|| !SCN_VALID(decoded.authority.authority_scn)
+			|| cluster_epoch_get_current() != formation_epoch) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+			goto tx_done;
+		}
+		decoded.authority.live_hwm_lsn
+			= (XLogRecPtr)slot->reply_header.page_lsn;
+		cluster_scn_observe(decoded.commit_scn);
+		cluster_scn_observe(decoded.horizon_scn);
+		cluster_scn_observe(decoded.authority.authority_scn);
+		*out = decoded;
+		outcome = decoded.outcome;
+		reason = CLUSTER_TX_RESOLVE_NONE;
+
+tx_done:
+		;
+	}
+	PG_CATCH();
+	{
+		ConditionVariableCancelSleep();
+		gcs_block_release_slot(slot);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	gcs_block_release_slot(slot);
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return outcome;
+}
+
 /* Public TARGET requester boundary.  Admission dominates validation and
  * routing; the raw transport writes only private aligned scratch.  A caller
  * page is published only after the same token's positive final recheck. */
@@ -6847,6 +7072,350 @@ gcs_block_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void 
 			   : CLUSTER_IC_SEND_HARD_ERROR;
 }
 
+static bool
+gcs_block_r4_tx_origin_locator_kind_valid(const ClusterTxLocator *locator)
+{
+	bool data_kind;
+
+	if (locator == NULL || locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
+		|| !TransactionIdIsNormal(locator->xid)
+		|| locator->tt_wrap != TT_WRAP_INVALID)
+		return false;
+	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE
+				|| locator->itl_kind == ITL_FLAG_COMMITTED
+				|| locator->itl_kind == ITL_FLAG_ABORTED
+				|| locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT;
+	return data_kind || ITL_FLAG_IS_LOCK_ONLY(locator->itl_kind);
+}
+
+static void
+gcs_block_r4_tx_origin_context_clear(GcsBlockR4TxOriginContext *context,
+									 bool cancel_guard)
+{
+	if (context == NULL || !context->in_use)
+		return;
+	if (cancel_guard && context->guard_active)
+		cluster_undo_block0_current_cancel(&context->guard);
+	context->guard_active = false;
+	if (context->admission.entered)
+		cluster_semantic_activation_leave(&context->admission);
+	memset(context, 0, sizeof(*context));
+}
+
+static bool
+gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
+								  const ClusterR4CrForwardPayload *forward)
+{
+	static const uint8 zero_watermark[8] = { 0 };
+	ClusterTxLocator locator;
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterSemanticAdmissionToken admission;
+	BufferTag expected_tag;
+	GcsBlockR4TxOriginContext *free_context = NULL;
+	uint32 expected_generation;
+	uint32 segment_id;
+	uint32 block_no;
+	uint16 tt_slot_offset;
+	uint16 row_offset;
+	uint32 capability_generation = 0;
+	bool optional_supported = false;
+	int i;
+
+	memset(&locator, 0, sizeof(locator));
+	memset(&logical, 0, sizeof(logical));
+	memset(&root, 0, sizeof(root));
+	memset(&admission, 0, sizeof(admission));
+	if (env == NULL || forward == NULL
+		|| env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+		|| env->payload_length != sizeof(*forward)
+		|| env->source_node_id >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| forward->base.original_requester_node != (int32)env->source_node_id
+		|| forward->base.original_requester_node == cluster_node_id
+		|| forward->base.requester_backend_id <= 0
+		|| forward->base.requester_backend_id > MaxBackends
+		|| forward->base.master_node != cluster_node_id
+		|| forward->base.request_id == 0
+		|| forward->base.transition_id != (uint8)PCM_TRANS_N_TO_S
+		|| forward->base.epoch == 0 || forward->base.epoch != env->epoch
+		|| forward->base.epoch != cluster_epoch_get_current()
+		|| cluster_ic_tier1_my_data_channel() != 0
+		|| memcmp(forward->base.expected_pi_watermark_scn_bytes,
+				  zero_watermark, sizeof(zero_watermark)) != 0
+		|| forward->base.reserved_0[0] != 0
+		|| forward->base.reserved_0[1] != 0
+		|| forward->base.reserved_0[2] != 0
+		|| forward->base.reserved_0[3] != 0
+		|| forward->base.reserved_0[4] != 0
+		|| forward->base.reserved_0[5] != 0
+		|| forward->base.reserved_0[6] != 0
+		|| !ClusterR4ForwardExtensionGetLocatorGeneration(
+			&forward->extension, CLUSTER_R4_WIRE_TX_RESOLVE,
+			&locator, &expected_generation)
+		|| !gcs_block_r4_tx_origin_locator_kind_valid(&locator)
+		|| !uba_decode(locator.uba, &segment_id, &block_no,
+					   &tt_slot_offset, &row_offset)
+		|| block_no == 0
+		|| uba_origin_node_id(locator.uba) != (NodeId)cluster_node_id)
+		return true;
+	expected_tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
+	if (memcmp(&forward->base.tag, &expected_tag, sizeof(expected_tag)) != 0)
+		return true;
+	if (!cluster_sf_peer_capability_family_sample(
+			forward->base.original_requester_node,
+			GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS, 0, &optional_supported,
+			&capability_generation)
+		|| capability_generation == 0)
+		return true;
+
+	/* An exact duplicate retains the original single token/context.  A
+	 * conflicting reuse of the same authenticated request identity is
+	 * consumed without a second action or reply. */
+	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
+		GcsBlockR4TxOriginContext *context
+			= &gcs_block_r4_tx_origin_contexts[i];
+
+		if (!context->in_use) {
+			if (free_context == NULL)
+				free_context = context;
+			continue;
+		}
+		if (context->forward.base.original_requester_node
+				== forward->base.original_requester_node
+			&& context->forward.base.requester_backend_id
+				   == forward->base.requester_backend_id
+			&& context->forward.base.request_id == forward->base.request_id
+			&& context->forward.base.epoch == forward->base.epoch)
+			return true;
+	}
+	if (free_context == NULL)
+		return true;
+	if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK)
+		return true;
+	logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
+	logical.segment_id = segment_id;
+	if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+			&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+			logical.owner_instance, logical.segment_id, &root)
+		|| !cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+		cluster_semantic_activation_leave(&admission);
+		return true;
+	}
+
+	memset(free_context, 0, sizeof(*free_context));
+	free_context->in_use = true;
+	free_context->phase = GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN;
+	free_context->requester_capability_generation = capability_generation;
+	free_context->forward = *forward;
+	free_context->locator = locator;
+	free_context->logical = logical;
+	free_context->root = root;
+	free_context->expected_generation.known = true;
+	free_context->expected_generation.value = expected_generation;
+	free_context->admission = admission;
+	free_context->outcome = CLUSTER_TX_UNKNOWN;
+	free_context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	return true;
+}
+
+static bool
+gcs_block_r4_tx_origin_terminal_resolution_valid(
+	const GcsBlockR4TxOriginContext *context)
+{
+	const ClusterTxResolution *resolution;
+
+	if (context == NULL)
+		return false;
+	resolution = &context->resolution;
+	if ((context->outcome != CLUSTER_TX_COMMITTED
+		 && context->outcome != CLUSTER_TX_ABORTED)
+		|| context->outcome != resolution->outcome
+		|| context->reason != CLUSTER_TX_RESOLVE_NONE
+		|| !cluster_tx_locator_reply_matches(&context->locator,
+									 &resolution->locator_echo)
+		|| !TransactionIdIsNormal(resolution->top_xid)
+		|| !cluster_tx_outcome_proof_is_valid(resolution->outcome,
+										 resolution->proof_kind)
+		|| resolution->authority.origin_epoch
+			   != context->admission.formation_epoch
+		|| XLogRecPtrIsInvalid(resolution->authority.live_hwm_lsn)
+		|| !SCN_VALID(resolution->authority.authority_scn))
+		return false;
+	if (resolution->outcome == CLUSTER_TX_COMMITTED)
+		return SCN_VALID(resolution->commit_scn);
+	return !SCN_VALID(resolution->commit_scn);
+}
+
+static void
+gcs_block_r4_tx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
+{
+	GcsBlockReplyHeader *header;
+	uint8 *page;
+	bool publish_result;
+
+	memset(context->reply_frame, 0, sizeof(context->reply_frame));
+	header = (GcsBlockReplyHeader *)context->reply_frame;
+	page = context->reply_frame + sizeof(*header);
+	header->request_id = context->forward.base.request_id;
+	header->epoch = context->forward.base.epoch;
+	header->sender_node = cluster_node_id;
+	header->requester_backend_id
+		= context->forward.base.requester_backend_id;
+	header->transition_id = context->forward.base.transition_id;
+	GcsBlockReplyHeaderSetForwardingMasterNode(
+		header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	publish_result = gcs_block_r4_tx_origin_terminal_resolution_valid(context)
+					 && ClusterR4TxVerdictPageEncode(
+							page, &context->resolution);
+	if (publish_result) {
+		header->status = (uint8)GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT;
+		header->page_lsn
+			= (uint64)context->resolution.authority.live_hwm_lsn;
+	} else
+		header->status = (uint8)GCS_BLOCK_REPLY_R4_DENIED;
+	header->checksum = gcs_block_compute_checksum((const char *)page);
+}
+
+static void
+gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
+{
+	ClusterUndoBlock0CurrentStep step;
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_OK;
+
+	switch (context->phase) {
+		case GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN:
+			step = cluster_undo_block0_current_acquire_begin_admitted(
+				&context->logical, CLUSTER_UNDO_BLOCK0_SCUR,
+				cluster_gcs_reply_timeout_ms, &context->admission,
+				&context->guard, &failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+				context->guard_active = true;
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_RESOLVE;
+			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+				context->guard_active = true;
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_POLL;
+			} else
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			break;
+		case GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_POLL:
+			step = cluster_undo_block0_current_acquire_poll(
+				&context->guard, &failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_RESOLVE;
+			else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+				context->guard_active = false;
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			}
+			break;
+		case GCS_BLOCK_R4_TX_ORIGIN_RESOLVE:
+			context->outcome
+				= cluster_runtime_visibility_resolve_exact_origin_held(
+					&context->locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+					&context->admission, &context->expected_generation,
+					&context->guard, &context->root,
+					&context->resolution, &context->reason);
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_RELEASE_BEGIN;
+			break;
+		case GCS_BLOCK_R4_TX_ORIGIN_RELEASE_BEGIN:
+			step = cluster_undo_block0_current_release_begin(
+				&context->guard, &failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+				context->guard_active = false;
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_RELEASE_POLL;
+			else {
+				context->guard_active = false;
+				context->outcome = CLUSTER_TX_UNKNOWN;
+				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				memset(&context->resolution, 0,
+					   sizeof(context->resolution));
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			}
+			break;
+		case GCS_BLOCK_R4_TX_ORIGIN_RELEASE_POLL:
+			step = cluster_undo_block0_current_release_poll(
+				&context->guard, &failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+				context->guard_active = false;
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+				context->guard_active = false;
+				context->outcome = CLUSTER_TX_UNKNOWN;
+				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+				memset(&context->resolution, 0,
+					   sizeof(context->resolution));
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			}
+			break;
+		case GCS_BLOCK_R4_TX_ORIGIN_SEND:
+		{
+			ClusterICSendResult send_result;
+			uint32 capability_generation = 0;
+			bool optional_supported = false;
+
+			if (cluster_ic_tier1_my_data_channel() != 0
+				|| cluster_epoch_get_current()
+					   != context->forward.base.epoch
+				|| !cluster_sf_peer_capability_family_sample(
+					context->forward.base.original_requester_node,
+					GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS, 0, &optional_supported,
+					&capability_generation)
+				|| capability_generation
+					   != context->requester_capability_generation
+				|| !cluster_semantic_activation_recheck_r4_terminal_census(
+					&context->admission)) {
+				gcs_block_r4_tx_origin_context_clear(context, true);
+				break;
+			}
+			gcs_block_r4_tx_origin_prepare_reply(context);
+			send_result = gcs_block_send_envelope_or_loopback(
+				PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+				context->forward.base.original_requester_node,
+				context->reply_frame, sizeof(context->reply_frame));
+			cluster_gcs_block_note_send_outcome(
+				GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
+			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				cluster_lms_data_plane_close_peer_now(
+					context->forward.base.original_requester_node);
+			else if (ClusterGcsBlock != NULL)
+				pg_atomic_fetch_add_u64(
+					&ClusterGcsBlock->block_reply_count, 1);
+			gcs_block_r4_tx_origin_context_clear(context, true);
+			break;
+		}
+		default:
+			gcs_block_r4_tx_origin_context_clear(context, true);
+			break;
+	}
+}
+
+void
+cluster_gcs_block_r4_tx_resolve_drain(void)
+{
+	int i;
+
+	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
+		GcsBlockR4TxOriginContext *context
+			= &gcs_block_r4_tx_origin_contexts[i];
+
+		if (!context->in_use)
+			continue;
+		PG_TRY();
+		{
+			gcs_block_r4_tx_origin_step(context);
+		}
+		PG_CATCH();
+		{
+			FlushErrorState();
+			gcs_block_r4_tx_origin_context_clear(context, true);
+		}
+		PG_END_TRY();
+	}
+}
+
 static void
 gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req, GcsBlockReplyStatus status,
 					 XLogRecPtr page_lsn, const char *block_data)
@@ -7443,6 +8012,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	uint8 request_flags = 0;
 
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
+	if (cluster_authority_readiness_managed()
+		&& !cluster_serving_ready_is_current())
+		return;
 	if (gcs_block_try_r4_request80(env, payload))
 		return;
 
@@ -9549,9 +10121,9 @@ gcs_block_try_land_current_mx_reply(
 	return true;
 }
 
-/* D4 R4 reply landing is selected by the closed outstanding-slot domain,
+/* D4/M4 R4 reply landing is selected by the closed outstanding-slot domain,
  * not by widening the legacy 8240-byte decoder.  Return false only when the
- * frame is not a status-21/25/26 candidate; a malformed R4 candidate is
+ * frame is not a status-21/22/25/26 candidate; a malformed R4 candidate is
  * consumed and dropped so it can never alias a legacy acquisition reply. */
 static bool
 gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *payload)
@@ -9568,6 +10140,7 @@ gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *p
 		return false;
 	hdr = (const GcsBlockReplyHeader *)payload;
 	if (hdr->status != (uint8)GCS_BLOCK_REPLY_R4_CR_FULL
+		&& hdr->status != (uint8)GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT
 		&& hdr->status != (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED
 		&& hdr->status != (uint8)GCS_BLOCK_REPLY_R4_DENIED)
 		return false;

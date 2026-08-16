@@ -596,6 +596,14 @@ extern uint32 cluster_ges_send_request_nowait_and_wait(const struct ClusterResId
 													   uint64 request_id, int timeout_ms,
 													   uint32 wait_event);
 
+/* RF-ROOT P6 S05-3H -- opcode-15 conditional same-holder conversion.  The
+ * master either converts in place or returns LOCK_CONFLICT; it never queues a
+ * convert. */
+extern uint32 cluster_ges_send_convert_nowait_and_wait(
+	const struct ClusterResId *resid, uint32 requested_mode, uint32 current_mode,
+	const struct ClusterGrdHolderId *holder, uint64 convert_request_id,
+	uint64 old_request_id, int timeout_ms, uint32 wait_event);
+
 extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 												const struct ClusterGrdHolderId *holder,
 												uint64 request_id, int timeout_ms,

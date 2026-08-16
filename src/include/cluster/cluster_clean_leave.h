@@ -407,6 +407,8 @@ extern bool cluster_clean_leave_should_invalidate(uint64 observed_epoch, uint64 
  * closed (freeze_queue / 53R62) — never read stale storage (Rule 8.A). */
 extern bool cluster_clean_leave_serve_gate_allows(bool block_from_leaving,
 												  bool leave_flushed_invalidated);
+extern bool cluster_clean_leave_startup_serving_allows(bool authority_managed,
+													 bool serving_ready);
 
 /* IC payload integrity (D8 / U9 / rule 15) — pure CRC compute + validate.
  * *_valid checks magic + version + CRC; the announce form also rejects an
@@ -472,12 +474,14 @@ typedef enum ClusterLeaveRequestResult {
 	CLUSTER_LEAVE_REQ_REJECTED_IN_PROGRESS,	  /* a leave is already in progress */
 	CLUSTER_LEAVE_REQ_REJECTED_PEERS_NOT_ENABLED, /* mixed-mode: a survivor is disabled (preflight) */
 	CLUSTER_LEAVE_REQ_REJECTED_NOT_DURABLE, /* REQUESTED marker did not reach a disk majority */
-	CLUSTER_LEAVE_REQ_REJECTED_PREFLIGHT_INCOMPLETE /* Hardening v1.0.3 (P1): an alive survivor did
+	CLUSTER_LEAVE_REQ_REJECTED_PREFLIGHT_INCOMPLETE, /* Hardening v1.0.3 (P1): an alive survivor did
 													 * not preflight-ACK before the deadline (silent /
 													 * version-skew / IC loss) — fail-closed, NOT the
 													 * old fail-open ACCEPTED.  Distinct from
 													 * peers_not_all_enabled (a definite disabled NAK):
 													 * incomplete = handshake unfinished, retry/diagnose */
+	CLUSTER_LEAVE_REQ_REJECTED_NOT_SERVING /* managed startup has not published
+											  * generation-bound SERVING_READY */
 } ClusterLeaveRequestResult;
 
 /* leaving-node driver (runs on the LEAVING node). */

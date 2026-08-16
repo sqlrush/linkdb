@@ -38,6 +38,7 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
 use Test::More;
 use PgracClusterNode;
@@ -63,12 +64,7 @@ EOC
 # Pre-allocate 3 voting disk files (used by L2).
 my $disk_dir = PostgreSQL::Test::Utils::tempdir();
 for my $i (0 .. 2) {
-	# 64KB zero-filled — slot 0..127 each 512B; qvotec will overwrite
-	# self slot on first poll cycle.
-	open(my $fh, '>', "$disk_dir/disk$i") or die $!;
-	binmode $fh;
-	print $fh ("\0" x (128 * 512));
-	close $fh;
+	format_voting_file("$disk_dir/disk$i", $i);
 }
 
 

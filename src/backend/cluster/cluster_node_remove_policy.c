@@ -154,8 +154,17 @@ cluster_node_remove_request_result_str(ClusterRemoveRequestResult r)
 		return "resume:cleanup_pending";
 	case CLUSTER_REMOVE_REQ_IN_PROGRESS:
 		return "rejected:removal_in_progress";
+	case CLUSTER_REMOVE_REQ_NOT_SERVING:
+		return "rejected:not_serving";
 	}
 	return "rejected:unknown";
+}
+
+bool
+cluster_node_remove_startup_serving_allows(bool authority_managed,
+										 bool serving_ready)
+{
+	return !authority_managed || serving_ready;
 }
 
 

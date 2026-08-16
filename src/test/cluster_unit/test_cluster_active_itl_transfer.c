@@ -36,6 +36,12 @@ static PGAlignedBlock test_buffer_block;
 static bool test_capture_authority;
 static uint64 test_own_generation;
 static uint64 test_acquisition_epoch;
+static uint8 test_pcm_state;
+static uint32 test_own_flags;
+static uint64 test_writer_activation_token;
+static int test_node_count;
+static bool test_recovery_merge_active;
+static BufferTag test_live_tag;
 static int test_stamp_lock_calls;
 static bool test_stamp_lock_saw_valid_proof;
 static int test_generic_register_calls;
@@ -83,14 +89,22 @@ repalloc(void *pointer, Size size)
 }
 
 bool
-cluster_bufmgr_pcm_x_holder_stamp_authority(Buffer buffer, uint64 *own_generation,
-											uint64 *acquisition_epoch)
+cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *expected_tag,
+										uint64 *own_generation,
+										uint64 *acquisition_epoch,
+										uint8 *pcm_state)
 {
 	UT_ASSERT_EQ(buffer, 1);
-	if (!test_capture_authority)
+	if (!test_capture_authority || expected_tag == NULL
+		|| !BufferTagsEqual(expected_tag, &test_live_tag)
+		|| !cluster_itl_terminal_stamp_authority_admissible(
+			cluster_enabled, cluster_node_id, test_node_count,
+			test_recovery_merge_active, test_pcm_state, test_own_flags,
+			test_writer_activation_token))
 		return false;
 	*own_generation = test_own_generation;
 	*acquisition_epoch = test_acquisition_epoch;
+	*pcm_state = test_pcm_state;
 	return true;
 }
 
@@ -100,7 +114,20 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const ClusterItlTouchRecord *re
 {
 	test_stamp_lock_calls++;
 	test_stamp_lock_saw_valid_proof = record->proof.valid;
-	if (!record->proof.valid) {
+	if (!record->proof.valid
+		|| !BufferTagsEqual(&test_live_tag,
+							 &(BufferTag){ .spcOid = record->key.rloc.spcOid,
+										  .dbOid = record->key.rloc.dbOid,
+										  .relNumber = record->key.rloc.relNumber,
+										  .forkNum = record->key.forknum,
+										  .blockNum = record->key.block })
+		|| !cluster_itl_terminal_stamp_authority_admissible(
+			cluster_enabled, cluster_node_id, test_node_count,
+			test_recovery_merge_active, test_pcm_state, test_own_flags,
+			test_writer_activation_token)
+		|| !cluster_itl_terminal_proof_owner_exact(
+			&record->proof, test_own_generation, test_acquisition_epoch,
+			test_pcm_state, true, test_own_flags, test_writer_activation_token)) {
 		*out_reason = CLUSTER_ITL_STAMP_SKIP_INVALID_PROOF;
 		return InvalidBuffer;
 	}
@@ -171,6 +198,16 @@ reset_registration_fixture(TransactionId xid)
 	test_capture_authority = false;
 	test_own_generation = 41;
 	test_acquisition_epoch = 17;
+	test_pcm_state = PCM_STATE_X;
+	test_own_flags = 0;
+	test_writer_activation_token = 0;
+	test_node_count = 2;
+	test_recovery_merge_active = false;
+	test_live_tag.spcOid = 11;
+	test_live_tag.dbOid = 22;
+	test_live_tag.relNumber = 33;
+	test_live_tag.forkNum = MAIN_FORKNUM;
+	test_live_tag.blockNum = 7;
 	test_stamp_lock_calls = 0;
 	test_stamp_lock_saw_valid_proof = false;
 	test_generic_register_calls = 0;
@@ -208,6 +245,7 @@ valid_proof(void)
 	proof.acquisition_epoch = 17;
 	proof.slot_wrap = 3;
 	proof.slot_class = ITL_FLAG_ACTIVE;
+	proof.pcm_state = PCM_STATE_X;
 	proof.valid = true;
 	return proof;
 }
@@ -276,7 +314,8 @@ UT_TEST(u13_exact_owner_proof_matches)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, true, 0, 0));
+	UT_ASSERT(cluster_itl_terminal_proof_owner_exact(
+		&proof, 41, 17, PCM_STATE_X, true, 0, 0));
 }
 
 UT_TEST(u14_missing_owner_proof_is_rejected)
@@ -284,36 +323,42 @@ UT_TEST(u14_missing_owner_proof_is_rejected)
 	ClusterItlTerminalProof proof = valid_proof();
 
 	proof.valid = false;
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, true, 0, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
+		&proof, 41, 17, PCM_STATE_X, true, 0, 0));
 }
 
 UT_TEST(u15_later_x_generation_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 42, 17, true, 0, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
+		&proof, 42, 17, PCM_STATE_X, true, 0, 0));
 }
 
 UT_TEST(u16_scope_change_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 18, true, 0, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
+		&proof, 41, 18, PCM_STATE_X, true, 0, 0));
 }
 
 UT_TEST(u17_non_x_owner_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, false, 0, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
+		&proof, 41, 17, PCM_STATE_N, true, 0, 0));
 }
 
 UT_TEST(u18_busy_owner_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, true, 1, 0));
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, true, 0, 99));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
+		&proof, 41, 17, PCM_STATE_X, true, 1, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
+		&proof, 41, 17, PCM_STATE_X, true, 0, 99));
 }
 
 UT_TEST(u19_exact_slot_proof_matches)
@@ -383,10 +428,191 @@ UT_TEST(u23_invalidated_record_performs_no_terminal_page_stamp)
 	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
 }
 
+UT_TEST(u24_known_single_node_pcm_n_stamps_terminal_slot)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+
+	test_capture_authority = true;
+	test_node_count = 1;
+	test_pcm_state = PCM_STATE_N;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 1);
+
+	cluster_itl_xact_precommit_finish(xid, 99);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ(slot->commit_scn, 99);
+	UT_ASSERT_EQ(test_generic_register_calls, 1);
+	UT_ASSERT_EQ(test_generic_finish_calls, 1);
+	UT_ASSERT_EQ(test_stamp_unlock_calls, 1);
+	UT_ASSERT_EQ(test_stamp_skip_calls, 0);
+}
+
+UT_TEST(u25_peer_pcm_n_is_refused_before_registration)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+
+	(void)reset_registration_fixture(xid);
+	test_capture_authority = true;
+	test_node_count = 2;
+	test_pcm_state = PCM_STATE_N;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
+}
+
+UT_TEST(u26_unknown_topology_pcm_n_is_refused)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+
+	(void)reset_registration_fixture(xid);
+	test_capture_authority = true;
+	test_node_count = 0;
+	test_pcm_state = PCM_STATE_N;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
+}
+
+UT_TEST(u27_recovery_merge_pcm_n_is_refused)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+
+	(void)reset_registration_fixture(xid);
+	test_capture_authority = true;
+	test_node_count = 1;
+	test_pcm_state = PCM_STATE_N;
+	test_recovery_merge_active = true;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
+}
+
+UT_TEST(u28_tag_drift_preserves_active_slot)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+
+	test_capture_authority = true;
+	test_node_count = 1;
+	test_pcm_state = PCM_STATE_N;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	test_live_tag.blockNum++;
+	cluster_itl_xact_precommit_finish(xid, 99);
+
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(test_generic_register_calls, 0);
+	UT_ASSERT_EQ(test_stamp_skip_calls, 1);
+}
+
+UT_TEST(u29_generation_drift_preserves_active_slot)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+
+	test_capture_authority = true;
+	test_node_count = 1;
+	test_pcm_state = PCM_STATE_N;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	test_own_generation++;
+	cluster_itl_xact_precommit_finish(xid, 99);
+
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(test_generic_register_calls, 0);
+	UT_ASSERT_EQ(test_stamp_skip_calls, 1);
+}
+
+UT_TEST(u30_slot_drift_preserves_active_slot)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+
+	test_capture_authority = true;
+	test_node_count = 1;
+	test_pcm_state = PCM_STATE_N;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	slot->wrap++;
+	cluster_itl_xact_precommit_finish(xid, 99);
+
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(test_generic_register_calls, 0);
+	UT_ASSERT_EQ(test_stamp_unlock_calls, 1);
+	UT_ASSERT_EQ(test_stamp_skip_calls, 1);
+}
+
+UT_TEST(u31_peer_pcm_x_contract_still_stamps)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+
+	test_capture_authority = true;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	cluster_itl_xact_precommit_finish(xid, 99);
+
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ(test_generic_register_calls, 1);
+	UT_ASSERT_EQ(test_stamp_skip_calls, 0);
+}
+
+UT_TEST(u32_known_single_node_pcm_x_is_refused)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+
+	(void)reset_registration_fixture(xid);
+	test_capture_authority = true;
+	test_node_count = 1;
+	test_pcm_state = PCM_STATE_X;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
+}
+
+UT_TEST(u33_busy_pcm_n_tuple_is_refused)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+
+	(void)reset_registration_fixture(xid);
+	test_capture_authority = true;
+	test_node_count = 1;
+	test_pcm_state = PCM_STATE_N;
+	test_own_flags = 1;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
+
+	test_own_flags = 0;
+	test_writer_activation_token = 9;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
+}
+
+UT_TEST(u34_epoch_drift_preserves_active_slot)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+
+	test_capture_authority = true;
+	test_node_count = 1;
+	test_pcm_state = PCM_STATE_N;
+	cluster_itl_touch_register_exact(&handle, 1, xid);
+	test_acquisition_epoch++;
+	cluster_itl_xact_precommit_finish(xid, 99);
+
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(test_generic_register_calls, 0);
+	UT_ASSERT_EQ(test_stamp_skip_calls, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(34);
 	UT_RUN(u1_tracked_null_claim_fails_closed);
 	UT_RUN(u2_nontracked_null_claim_is_legacy_safe);
 	UT_RUN(u3_plain_read_uses_read_image);
@@ -410,5 +636,16 @@ main(void)
 	UT_RUN(u21_first_failed_capture_does_not_append);
 	UT_RUN(u22_failed_recapture_invalidates_one_existing_record);
 	UT_RUN(u23_invalidated_record_performs_no_terminal_page_stamp);
+	UT_RUN(u24_known_single_node_pcm_n_stamps_terminal_slot);
+	UT_RUN(u25_peer_pcm_n_is_refused_before_registration);
+	UT_RUN(u26_unknown_topology_pcm_n_is_refused);
+	UT_RUN(u27_recovery_merge_pcm_n_is_refused);
+	UT_RUN(u28_tag_drift_preserves_active_slot);
+	UT_RUN(u29_generation_drift_preserves_active_slot);
+	UT_RUN(u30_slot_drift_preserves_active_slot);
+	UT_RUN(u31_peer_pcm_x_contract_still_stamps);
+	UT_RUN(u32_known_single_node_pcm_x_is_refused);
+	UT_RUN(u33_busy_pcm_n_tuple_is_refused);
+	UT_RUN(u34_epoch_drift_preserves_active_slot);
 	UT_DONE();
 }

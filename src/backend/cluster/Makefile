@@ -153,6 +153,7 @@ OBJS = \
 	cluster_lmd_wait_state.o \
 	cluster_lmon.o \
 	cluster_lms.o \
+	cluster_lms_lifecycle.o \
 	cluster_lms_data_plane.o \
 	cluster_lms_outbound.o \
 	cluster_lms_shard.o \
@@ -199,6 +200,7 @@ OBJS = \
 	cluster_visibility_resolve.o \
 	cluster_visibility_verdict.o \
 	cluster_writer_chain.o \
+	cluster_wal_retention.o \
 	cluster_undo_record.o \
 	cluster_undo_resid.o \
 	cluster_undo_authority.o \

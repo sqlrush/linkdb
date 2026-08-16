@@ -31,6 +31,7 @@ use strict;
 use warnings;
 
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
 
 
@@ -94,12 +95,7 @@ sub new_triple
 		for my $i (0 .. $opts{quorum_voting_disks} - 1)
 		{
 			my $path = "$disk_dir/disk$i";
-			open(my $fh, '>', $path) or die "open $path: $!";
-			binmode $fh;
-			# PGRAC spec-5.13: two 512-byte regions per node (voting slot +
-			# clean-leave marker), so 2 * 128 slots = 128 KiB.
-			print $fh ("\0" x (2 * 128 * 512));
-			close $fh;
+			format_voting_file($path, $i);
 			push @voting_disk_paths, $path;
 		}
 		$voting_disks_csv = join(',', @voting_disk_paths);

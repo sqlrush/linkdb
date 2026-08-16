@@ -182,6 +182,15 @@ fd_cache_on_exit(int code, Datum arg)
 	fd_cache_close();
 }
 
+void
+cluster_undo_smgr_ensure_exit_hook(void)
+{
+	if (!cached_fd_exit_registered) {
+		before_shmem_exit(fd_cache_on_exit, (Datum)0);
+		cached_fd_exit_registered = true;
+	}
+}
+
 /*
  * get_segment_fd -- return a cached O_RDWR fd for (segment, owner), opening
  *	(and caching) one on a miss.  Returns -1 on open failure.  The caller MUST
@@ -210,10 +219,7 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 	cached_fd_segment = segment_id;
 	cached_fd_owner = owner_instance;
 	cached_fd_intent = intent;
-	if (!cached_fd_exit_registered) {
-		before_shmem_exit(fd_cache_on_exit, (Datum)0);
-		cached_fd_exit_registered = true;
-	}
+	cluster_undo_smgr_ensure_exit_hook();
 	return fd;
 }
 

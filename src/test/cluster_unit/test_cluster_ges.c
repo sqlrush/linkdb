@@ -52,6 +52,7 @@
 #include <string.h>
 
 #include "access/transam.h" /* spec-5.8 D1c — InvalidTransactionId for the GetTopTransactionIdIfAny stub */
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
@@ -62,6 +63,8 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_cssd.h"		   /* spec-5.7 Direction B stub — peer state */
 #include "cluster/cluster_extend_gate.h"   /* spec-5.7 Direction B stub — sole-native */
 #include "cluster/cluster_inject.h"		   /* S3 forensics step 1a stub prototypes */
@@ -93,6 +96,7 @@
  * ============================================================ */
 
 bool IsUnderPostmaster = false;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 /* S3 forensics step 1a stubs — cluster_ges.c now carries the
  * cluster-ges-master-work-queue-full injection point; this standalone
@@ -238,6 +242,10 @@ cluster_shmem_register_region(const void *r pg_attribute_unused())
 
 int cluster_node_id = 0;
 static uint64 stub_current_epoch = 0;
+static bool stub_authority_managed = false;
+static bool stub_serving_ready = false;
+static bool stub_recovery_ready = false;
+static bool stub_recovery_transport_ready = false;
 
 static uint64 stub_replacement_capability_sample_count = 0;
 static uint32 stub_replacement_required_capabilities = 0;
@@ -261,6 +269,58 @@ bool
 cluster_qvotec_in_quorum(void)
 {
 	return true; /* default in-quorum so validation step 4 passes */
+}
+
+bool
+cluster_authority_readiness_managed(void)
+{
+	return stub_authority_managed;
+}
+
+bool
+cluster_serving_ready_is_current(void)
+{
+	return stub_serving_ready;
+}
+
+bool
+cluster_recovery_authority_is_current(void)
+{
+	return stub_recovery_ready;
+}
+
+bool
+cluster_recovery_transport_is_current(void)
+{
+	return stub_recovery_transport_ready || stub_recovery_ready;
+}
+
+bool
+cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE mode,
+										   bool startup_process)
+{
+	return startup_process && stub_recovery_ready && resid != NULL
+		&& ((resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock)
+			|| (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE
+				&& mode == ExclusiveLock));
+}
+
+bool
+cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid,
+										  LOCKMODE mode)
+{
+	if (resid == NULL)
+		return false;
+	if (resid->type == CLUSTER_CF_RESID_TYPE)
+		return mode == ShareLock && resid->field1 == 0 && resid->field2 == 0
+			&& resid->field3 == 0 && resid->field4 == 0
+			&& resid->lockmethodid == DEFAULT_LOCKMETHOD;
+	if (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE)
+		return mode == ExclusiveLock && resid->field1 > 0
+			&& resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
+			&& resid->field2 == 0 && resid->field3 == 0 && resid->field4 == 0
+			&& resid->lockmethodid == DEFAULT_LOCKMETHOD;
+	return false;
 }
 
 /*
@@ -388,6 +448,10 @@ static uint64 stub_reply_deferred = 0;
 static uint64 stub_reply_dropped = 0;
 static uint64 stub_work_queue_enqueue_count = 0;
 static uint64 stub_lmon_reply_enqueue_count = 0;
+static GesReplyPayload stub_lmon_reply_last;
+static bool stub_work_queue_dequeue_pending = false;
+static ClusterGrdWorkItem stub_work_queue_dequeue_item;
+static uint64 stub_master_grant_mutation_count = 0;
 static uint64 stub_bast_received = 0;
 static uint64 stub_lmd_cancel_enqueue_count = 0;
 static uint32 stub_lmd_cancel_last_source = 0;
@@ -506,7 +570,12 @@ cluster_grd_work_queue_enqueue(uint32 src pg_attribute_unused(),
 bool
 cluster_grd_work_queue_dequeue(ClusterGrdWorkItem *out pg_attribute_unused())
 {
-	return false;
+	if (!stub_work_queue_dequeue_pending)
+		return false;
+	if (out != NULL)
+		*out = stub_work_queue_dequeue_item;
+	stub_work_queue_dequeue_pending = false;
+	return true;
 }
 
 void
@@ -515,6 +584,8 @@ cluster_grd_outbound_enqueue_lmon_reply(uint32 d pg_attribute_unused(),
 										uint16 l pg_attribute_unused())
 {
 	stub_lmon_reply_enqueue_count++;
+	if (p != NULL && l == sizeof(GesReplyPayload))
+		memcpy(&stub_lmon_reply_last, p, sizeof(stub_lmon_reply_last));
 }
 /* spec-5.16 orphan-grant auto-release uses the cleanup-release producer. */
 void
@@ -738,6 +809,18 @@ cluster_grd_convert_or_enqueue_meta(
 	return CLUSTER_GRD_CONVERT_NOT_READY;
 }
 
+ClusterGrdConvertResult
+cluster_grd_convert_nowait(
+	const struct ClusterResId *resid pg_attribute_unused(), int32 node_id pg_attribute_unused(),
+	uint32 procno pg_attribute_unused(), uint64 cluster_epoch pg_attribute_unused(),
+	int current_mode pg_attribute_unused(), int requested_mode pg_attribute_unused(),
+	uint64 convert_request_id pg_attribute_unused(), uint64 old_request_id pg_attribute_unused(),
+	int32 source_node_id pg_attribute_unused(),
+	uint64 shard_master_generation pg_attribute_unused())
+{
+	return CLUSTER_GRD_CONVERT_NOT_READY;
+}
+
 int
 cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unused(),
 							  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
@@ -867,6 +950,7 @@ cluster_grd_entry_enqueue_or_grant_meta(
 	int mode pg_attribute_unused(), struct ClusterGrdConflictHolder *out pg_attribute_unused(),
 	int *nout pg_attribute_unused())
 {
+	stub_master_grant_mutation_count++;
 	if (nout != NULL)
 		*nout = 0;
 	return CLUSTER_GRD_GRANT_NOW;
@@ -898,6 +982,21 @@ cluster_grd_release_holder_by_id(const struct ClusterResId *r pg_attribute_unuse
 								 const struct ClusterGrdHolderId *h pg_attribute_unused())
 {
 	return CLUSTER_GRD_ENTRY_OK;
+}
+
+bool
+cluster_grd_holder_mode_by_id(const struct ClusterResId *r,
+								 const struct ClusterGrdHolderId *h pg_attribute_unused(),
+								 LOCKMODE *out_mode)
+{
+	if (r == NULL)
+		return false;
+	if (out_mode != NULL)
+		*out_mode = r->type == CLUSTER_CF_RESID_TYPE
+			? ShareLock
+			: ExclusiveLock;
+	return r->type == CLUSTER_CF_RESID_TYPE
+		|| r->type == CLUSTER_WAL_RETENTION_RESID_TYPE;
 }
 
 ClusterGrdEntryResult
@@ -1120,6 +1219,184 @@ UT_TEST(test_ges_request_valid_payload_enqueues_work)
 
 	UT_ASSERT_EQ(stub_inbound_validation_fail, pre_fail);
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, pre_enqueue + 1);
+}
+
+static void
+init_valid_ges_request(ClusterICEnvelope *env, GesRequestPayload *req,
+					   GesRequestOpcode opcode, const ClusterResId *resid,
+					   LOCKMODE mode)
+{
+	memset(env, 0, sizeof(*env));
+	env->source_node_id = 1;
+	env->epoch = stub_current_epoch;
+	env->payload_length = sizeof(*req);
+	memset(req, 0, sizeof(*req));
+	req->opcode = opcode;
+	req->lockmode = mode;
+	req->holder_node_id = 1;
+	if (resid != NULL)
+		memcpy(req->resid, resid, sizeof(*resid));
+}
+
+UT_TEST(test_ges_recovery_ingress_exact_allowlist)
+{
+	ClusterICEnvelope env;
+	GesRequestPayload req;
+	ClusterResId resid;
+	uint64 enqueued;
+
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	stub_authority_managed = true;
+	stub_recovery_ready = true;
+	stub_serving_ready = false;
+	enqueued = stub_work_queue_enqueue_count;
+
+	memset(&resid, 0, sizeof(resid));
+	resid.type = CLUSTER_CF_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid,
+						   ShareLock);
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, ++enqueued);
+
+	req.lockmode = ExclusiveLock;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
+
+	memset(&resid, 0, sizeof(resid));
+	resid.field1 = 1;
+	resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid,
+						   ExclusiveLock);
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, ++enqueued);
+
+	resid.field1 = 0; /* not a canonical WAL-thread resource */
+	memcpy(req.resid, &resid, sizeof(resid));
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
+
+	memset(&resid, 0, sizeof(resid));
+	resid.type = CLUSTER_IR_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	init_valid_ges_request(&env, &req, GES_REQ_OPCODE_REQUEST, &resid,
+						   ExclusiveLock);
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
+
+	resid.type = CLUSTER_CF_RESID_TYPE;
+	memcpy(req.resid, &resid, sizeof(resid));
+	req.opcode = GES_REQ_OPCODE_CONVERT;
+	req.lockmode = ShareLock;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
+
+	stub_serving_ready = true;
+	resid.type = CLUSTER_IR_RESID_TYPE;
+	memcpy(req.resid, &resid, sizeof(resid));
+	req.opcode = GES_REQ_OPCODE_REQUEST;
+	req.lockmode = ExclusiveLock;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, ++enqueued);
+
+	stub_authority_managed = false;
+	stub_recovery_ready = false;
+	stub_serving_ready = false;
+}
+
+UT_TEST(test_ges_recovery_master_rechecks_before_mutation)
+{
+	GesRequestPayload req;
+	ClusterResId resid;
+	uint64 mutations;
+	uint64 replies;
+
+	stub_authority_managed = true;
+	stub_recovery_ready = true;
+	stub_serving_ready = false;
+	memset(&resid, 0, sizeof(resid));
+	resid.type = CLUSTER_IR_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	memset(&req, 0, sizeof(req));
+	req.opcode = GES_REQ_OPCODE_REQUEST;
+	req.lockmode = AccessExclusiveLock;
+	req.holder_node_id = 1;
+	memcpy(req.resid, &resid, sizeof(resid));
+	memset(&stub_work_queue_dequeue_item, 0,
+		   sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.source_node_id = 1;
+	stub_work_queue_dequeue_item.payload_len = sizeof(req);
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	stub_work_queue_dequeue_pending = true;
+	mutations = stub_master_grant_mutation_count;
+	replies = stub_lmon_reply_enqueue_count;
+
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(stub_master_grant_mutation_count, mutations);
+	UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, replies + 1);
+	UT_ASSERT_EQ(stub_lmon_reply_last.opcode,
+				 (uint32)GES_REPLY_OPCODE_REJECT);
+
+	memset(&resid, 0, sizeof(resid));
+	resid.type = CLUSTER_CF_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	req.lockmode = ShareLock;
+	memcpy(req.resid, &resid, sizeof(resid));
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	stub_work_queue_dequeue_pending = true;
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(stub_master_grant_mutation_count, mutations + 1);
+	UT_ASSERT_EQ(stub_lmon_reply_last.opcode,
+				 (uint32)GES_REPLY_OPCODE_GRANT);
+
+	stub_authority_managed = false;
+	stub_recovery_ready = false;
+}
+
+UT_TEST(test_ges_starting_redeclare_uses_preseal_transport_only)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint32 result;
+
+	memset(&resid, 0, sizeof(resid));
+	resid.type = CLUSTER_CF_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	memset(&holder, 0, sizeof(holder));
+	holder.node_id = 0;
+	holder.procno = 41;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = UINT64_C(0x4411);
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	stub_recovery_ready = false;
+	stub_recovery_transport_ready = true;
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 1;
+	MyAuxProcType = NotAnAuxProcess;
+
+	result = cluster_ges_send_redeclare_and_wait(
+		&resid, ShareLock, &holder, holder.request_id);
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)1);
+
+	stub_backend_request_enqueue_count = 0;
+	MyAuxProcType = StartupProcess;
+	result = cluster_ges_send_request_and_wait(
+		&resid, ShareLock, &holder, holder.request_id, 1, 0);
+	UT_ASSERT_EQ(result, (uint32)GES_REJECT_REASON_SHARD_FROZEN);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, (uint64)0);
+
+	stub_authority_managed = false;
+	stub_recovery_transport_ready = false;
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_backend_request_ready_after = 0;
+	MyAuxProcType = NotAnAuxProcess;
 }
 
 
@@ -1600,7 +1877,7 @@ UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(22);
+	UT_PLAN(25);
 
 	UT_RUN(test_ges_request_handler_linkable);
 	UT_RUN(test_ges_reply_handler_linkable);
@@ -1609,6 +1886,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_reply_handler_real_behavior);
 	UT_RUN(test_ges_handler_counter_monotonic_n_invocations);
 	UT_RUN(test_ges_request_valid_payload_enqueues_work);
+	UT_RUN(test_ges_recovery_ingress_exact_allowlist);
+	UT_RUN(test_ges_recovery_master_rechecks_before_mutation);
+	UT_RUN(test_ges_starting_redeclare_uses_preseal_transport_only);
 	UT_RUN(test_ges_phase3_early_dispatch_enqueues_formation_handoff);
 	UT_RUN(test_ges_nonphase3_opcode18_never_falls_into_legacy_classifier);
 	UT_RUN(test_ges_reply_valid_payload_echoes_local_holder);

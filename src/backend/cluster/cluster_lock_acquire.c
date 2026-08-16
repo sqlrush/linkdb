@@ -65,6 +65,7 @@
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_cancel_token.h" /* spec-5.9 D3 cluster_cancel_token_consume */
 #include "cluster/cluster_signal.h"		  /* cluster_ges_cancel_pending sig_atomic_t */
+#include "cluster/cluster_startup_phase.h"
 #include "storage/latch.h"				  /* spec-4.6 D4 — freeze-gate WaitLatch */
 #include "storage/lock.h"				  /* spec-4.6 D3 — LOCALLOCK + GetLockMethodLocalHash */
 #include "utils/hsearch.h"				  /* spec-4.6 D3 — hash_seq over LocalLockHash */
@@ -190,6 +191,24 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+
+	/* RF-ROOT P6 Scheme A: a formed boot is always fail-closed unless it
+	 * holds one of the two explicit readiness proofs.  Recovery readiness
+	 * admits only StartupProcess CF(S)/WALR(X); serving readiness retains the
+	 * ordinary exact-LMS predicate.  In particular, lms_enabled=off is not a
+	 * native escape once this lifecycle is managed. */
+	if (cluster_authority_readiness_managed()) {
+		if (!cluster_lms_enabled)
+			return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
+		if (cluster_serving_ready_is_current())
+			return cluster_lms_is_ready()
+				? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+				: CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
+		if (cluster_recovery_authority_request_allowed(
+				&req->resid, req->lockmode, AmStartupProcess()))
+			return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
+	}
 
 	/*
 	 * HC1 fail-closed:cluster.lms_enabled=on + LMS state != READY →
@@ -482,32 +501,45 @@ static ClusterLockAcquireResult
 cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 {
 	uint32 reject;
+	bool convert_nowait = req->dontwait
+		&& ges_mode_convert_class((ClusterGesMode)req->current_mode,
+								  (ClusterGesMode)req->lockmode)
+			== GES_CONVERT_UPGRADE;
 	volatile PcmXQueueResult guard_result = PCM_X_QUEUE_OK;
 	/* spec-5.8 D1d — a cross-node CONVERT (S->X upgrade) blocks and can
 	 * deadlock; publish/clear the wait-state around it like the S4 request
 	 * wait so the resolver can revalidate the victim. */
 	ClusterLmdProcWaitState *ws = (MyProc != NULL) ? &MyProc->cluster_lmd_wait : NULL;
 
-	if (ws != NULL)
+	if (ws != NULL && !convert_nowait)
 		(void)cluster_lmd_wait_state_publish(ws, CLUSTER_LMD_WAIT_GES, req->request_id,
 											 cluster_epoch_get_current(),
 											 GetTopTransactionIdIfAny());
 	PG_TRY();
 	{
 		guard_result = cluster_pcm_x_nested_wait_guard_before_block();
-		if (guard_result == PCM_X_QUEUE_OK)
-			reject = cluster_ges_send_convert_and_wait(
-				&req->resid, (uint32)req->lockmode, (uint32)req->current_mode, &req->holder,
-				req->request_id, /* timeout = GUC default */ 0);
+		if (guard_result == PCM_X_QUEUE_OK) {
+			if (convert_nowait)
+				reject = cluster_ges_send_convert_nowait_and_wait(
+					&req->resid, (uint32)req->lockmode,
+					(uint32)req->current_mode, &req->holder, req->request_id,
+					req->convert_old_request_id, req->timeout_ms,
+					req->wait_event);
+			else
+				reject = cluster_ges_send_convert_and_wait(
+					&req->resid, (uint32)req->lockmode,
+					(uint32)req->current_mode, &req->holder, req->request_id,
+					/* timeout = GUC default */ 0);
+		}
 	}
 	PG_CATCH();
 	{
-		if (ws != NULL)
+		if (ws != NULL && !convert_nowait)
 			cluster_lmd_wait_state_clear(ws);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	if (ws != NULL)
+	if (ws != NULL && !convert_nowait)
 		cluster_lmd_wait_state_clear(ws);
 	if (guard_result != PCM_X_QUEUE_OK)
 		return cluster_lock_pcm_x_nested_guard_result((PcmXQueueResult)guard_result);
@@ -518,6 +550,8 @@ cluster_lock_acquire_s5_convert(const ClusterLockAcquireRequest *req)
 	}
 
 	switch ((GesRejectReason)reject) {
+	case GES_REJECT_REASON_LOCK_CONFLICT:
+		return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
 	case GES_REJECT_REASON_ILLEGAL_CONVERT:
 		return CLUSTER_LOCK_ACQUIRE_FAIL_ILLEGAL_CONVERT;
 	case GES_REJECT_REASON_SHARD_FROZEN:

@@ -22,9 +22,12 @@
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_multixact_current.h"
+#include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_tx_resolve.h"
+#include "cluster/cluster_uba.h"
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "common/hashfn.h"
@@ -65,11 +68,11 @@ UT_DEFINE_GLOBALS();
 static char ut_memory_context_storage;
 MemoryContext CurrentMemoryContext = (MemoryContext)&ut_memory_context_storage;
 MemoryContext TopMemoryContext = (MemoryContext)&ut_memory_context_storage;
-int NBuffers = 1;
+int NBuffers = 2;
 int NLocBuffer = 0;
 char *BufferBlocks = NULL;
 Block *LocalBufferBlockPointers = NULL;
-static BufferDescPadded ut_buffer_descriptors[1];
+static BufferDescPadded ut_buffer_descriptors[2];
 BufferDescPadded *BufferDescriptors = ut_buffer_descriptors;
 TransactionId RecentXmin = FirstNormalTransactionId;
 int XactIsoLevel = XACT_READ_COMMITTED;
@@ -83,6 +86,12 @@ static ClusterConf ut_cluster_conf;
 ClusterConf *ClusterConfShmem = &ut_cluster_conf;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+
+int
+cluster_conf_node_count(void)
+{
+	return ClusterConfShmem == NULL ? 0 : ClusterConfShmem->node_count;
+}
 
 void
 pg_re_throw(void)
@@ -139,12 +148,43 @@ static ClusterUndoTTSlotRef ut_hot_live_ref;
 static int ut_hot_live_ref_calls;
 static bool ut_hot_content_lock_held;
 static bool ut_hot_production_core_active;
+static bool ut_hot_r4_target_reachable;
 static bool ut_hot_current_mx_active;
 static ClusterUndoTTSlotRef ut_hot_successor_ref;
 static int ut_hot_pcm_snapshot_calls;
+static uint8 ut_hot_last_pcm_snapshot_state;
+static bool ut_itl_census_force_pcm_n;
 static int ut_hot_current_mx_describe_calls;
 static int ut_hot_current_mx_resolve_calls;
 static int ut_hot_current_mx_validate_calls;
+static bool ut_itl_census_active;
+static bool ut_itl_census_mutate_wrap;
+static bool ut_itl_census_lock_only;
+static int ut_itl_census_alloc_calls;
+static int ut_itl_census_resolve_calls;
+static int ut_itl_census_dirty_hint_calls;
+static uint64 ut_itl_census_tt_generation;
+static uint64 ut_itl_census_origin_tt_generation;
+static bool ut_itl_census_mutate_activation;
+static const ClusterSemanticAdmissionToken *ut_itl_census_admission;
+static ClusterSemanticActivationShmem ut_itl_census_semantic;
+static ClusterTxOutcome ut_itl_census_outcomes[CLUSTER_ITL_INITRANS_DEFAULT];
+static BufferTag ut_itl_census_tag;
+static bool ut_itl_pair_active;
+static bool ut_itl_pair_content_lock_held[2];
+static Buffer ut_itl_pair_lock_buffers[4];
+static int ut_itl_pair_lock_calls;
+
+void
+cluster_multixact_current_stats_bump(
+	ClusterCurrentMxStatId stat pg_attribute_unused())
+{}
+
+bool
+cluster_heap_test_r4_target_reachable(void)
+{
+	return ut_hot_r4_target_reachable;
+}
 
 #define UT_HOT_CURRENT_EPOCH UINT32_C(9)
 #define UT_HOT_CURRENT_MX_ORIGIN UINT16_C(1)
@@ -314,15 +354,178 @@ cluster_xid_origin_slot(TransactionId xid)
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 {
-	UT_ASSERT(ut_hot_current_mx_active);
-	UT_ASSERT(ut_hot_content_lock_held);
-	UT_ASSERT(buf == &ut_buffer_descriptors[0].bufferdesc);
+	UT_ASSERT(ut_hot_current_mx_active || ut_itl_census_active);
+	if (ut_itl_pair_active)
+	{
+		int index = (int) (buf - &ut_buffer_descriptors[0].bufferdesc);
+
+		UT_ASSERT(index >= 0 && index < 2);
+		UT_ASSERT(ut_itl_pair_content_lock_held[index]);
+	}
+	else
+	{
+		UT_ASSERT(ut_hot_content_lock_held);
+		UT_ASSERT(buf == &ut_buffer_descriptors[0].bufferdesc);
+	}
 	UT_ASSERT_NOT_NULL(out);
 	ut_hot_pcm_snapshot_calls++;
 	memset(out, 0, sizeof(*out));
+	out->tag = ut_itl_census_tag;
 	out->generation = 17;
-	out->pcm_state = (uint8) PCM_STATE_X;
+	out->pcm_state = cluster_conf_has_peers() && !ut_itl_census_force_pcm_n
+		? (uint8) PCM_STATE_X : (uint8) PCM_STATE_N;
+	ut_hot_last_pcm_snapshot_state = out->pcm_state;
 	return CLUSTER_PCM_OWN_OK;
+}
+
+static bool
+ut_itl_census_alloc(Buffer buf, TransactionId xid pg_attribute_unused(),
+					bool lock_only, uint8 *slot_index_out)
+{
+	ClusterItlSlotData *slots;
+	uint8 i;
+
+	UT_ASSERT(ut_itl_census_active);
+	UT_ASSERT(ut_hot_content_lock_held);
+	UT_ASSERT_EQ(buf, (Buffer) 1);
+	UT_ASSERT_EQ(lock_only, ut_itl_census_lock_only);
+	ut_itl_census_alloc_calls++;
+	slots = ClusterPageGetItlSlots(BufferGetPage(buf));
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		if (slots[i].flags == ITL_FLAG_FREE
+			|| slots[i].flags == ITL_FLAG_COMMITTED
+			|| slots[i].flags == ITL_FLAG_ABORTED
+			|| slots[i].flags == ITL_FLAG_LOCK_ONLY_COMMITTED
+			|| slots[i].flags == ITL_FLAG_LOCK_ONLY_ABORTED)
+		{
+			*slot_index_out = i;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId xid,
+								uint8 *slot_index_out)
+{
+	return ut_itl_census_alloc(buf, xid, false, slot_index_out);
+}
+
+bool
+cluster_itl_alloc_or_reuse_lock_slot(Buffer buf, TransactionId xid,
+									 uint8 *slot_index_out)
+{
+	return ut_itl_census_alloc(buf, xid, true, slot_index_out);
+}
+
+bool
+cluster_tx_locator_from_itl(Page page, uint8 slot_index,
+							ClusterTxLocator *out,
+							ClusterTxResolveReason *reason_out)
+{
+	ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[slot_index];
+
+	memset(out, 0, sizeof(*out));
+	out->uba = slot->undo_segment_head;
+	out->xid = slot->xid;
+	out->tt_wrap = TT_WRAP_INVALID;
+	out->itl_kind = slot->flags;
+	out->itl_slot_index = slot_index;
+	*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return true;
+}
+
+bool
+cluster_tx_locator_from_itl_terminal_census(
+	Page page, uint8 slot_index, ClusterTxLocator *out,
+	ClusterTxResolveReason *reason_out)
+{
+	return cluster_tx_locator_from_itl(page, slot_index, out, reason_out);
+}
+
+ClusterTxOutcome
+cluster_tx_resolve_exact(const ClusterTxLocator *locator,
+					 ClusterTxResolveMode mode,
+					 ClusterTxResolution *out,
+					 ClusterTxResolveReason *reason_out)
+{
+	(void) locator;
+	(void) mode;
+	(void) out;
+	(void) reason_out;
+	UT_ASSERT(false);
+	return CLUSTER_TX_UNKNOWN;
+}
+
+ClusterTxOutcome
+cluster_tx_resolve_exact_admitted(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterTxOutcome outcome;
+
+	UT_ASSERT(ut_itl_census_active);
+	UT_ASSERT_NOT_NULL(admission);
+	UT_ASSERT(admission->entered);
+	UT_ASSERT_EQ(admission->record_generation, UINT64_C(73));
+	UT_ASSERT_EQ(pg_atomic_read_u32(
+		&ut_itl_census_semantic.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0]), 1);
+	UT_ASSERT_EQ(semantic_activation_local_inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][0], 1);
+	if (ut_itl_census_admission == NULL)
+		ut_itl_census_admission = admission;
+	else
+		UT_ASSERT(admission == ut_itl_census_admission);
+	if (ut_itl_pair_active)
+	{
+		UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
+		UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
+	}
+	else
+		UT_ASSERT(!ut_hot_content_lock_held);
+	UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS);
+	UT_ASSERT(locator->itl_slot_index < CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT_EQ(locator->tt_wrap, TT_WRAP_INVALID);
+	if (ut_itl_census_mutate_wrap && ut_itl_census_resolve_calls == 0)
+		ClusterPageGetItlSlots(BufferGetPage((Buffer) 1))[0].wrap++;
+	if (ut_itl_census_mutate_activation
+		&& ut_itl_census_resolve_calls == 0)
+		pg_atomic_write_u64(&ut_itl_census_semantic.record_generation,
+						 UINT64_C(74));
+	ut_itl_census_resolve_calls++;
+	outcome = ut_itl_census_outcomes[locator->itl_slot_index];
+	memset(out, 0, sizeof(*out));
+	out->locator_echo = *locator;
+	out->locator_echo.tt_wrap = 42;
+	out->top_xid = locator->xid;
+	out->outcome = outcome;
+	out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	out->commit_scn = outcome == CLUSTER_TX_COMMITTED ? (SCN) 9001 : InvalidScn;
+	out->authority.origin_epoch = UINT32_C(9);
+	out->authority.live_hwm_lsn = (XLogRecPtr) 1;
+	out->authority.tt_generation = ut_itl_census_origin_tt_generation;
+	out->authority.authority_scn = (SCN) 9002;
+	*reason_out = outcome == CLUSTER_TX_UNKNOWN
+		? CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE
+		: CLUSTER_TX_RESOLVE_NONE;
+	return outcome;
+}
+
+uint64
+cluster_undo_tt_retention_rollover_count(void)
+{
+	return ut_itl_census_tt_generation;
+}
+
+void
+MarkBufferDirtyHint(Buffer buffer, bool buffer_std pg_attribute_unused())
+{
+	UT_ASSERT_EQ(buffer, (Buffer) 1);
+	UT_ASSERT(ut_hot_content_lock_held);
+	ut_itl_census_dirty_hint_calls++;
 }
 
 uint64
@@ -823,10 +1026,24 @@ LockBuffer(Buffer buffer, int mode)
 {
 	UtR4HotProductFixture *fixture = ut_hot_product_fixture;
 
-	UT_ASSERT_EQ(buffer, UT_HOT_BUFFER);
 	UT_ASSERT_NOT_NULL(fixture);
 	if (fixture == NULL)
 		return;
+	if (ut_itl_pair_active)
+	{
+		int index;
+
+		UT_ASSERT(buffer == (Buffer) 1 || buffer == (Buffer) 2);
+		index = buffer - 1;
+		UT_ASSERT_EQ(mode, BUFFER_LOCK_UNLOCK);
+		UT_ASSERT(ut_itl_pair_content_lock_held[index]);
+		UT_ASSERT(ut_itl_pair_lock_calls
+				  < lengthof(ut_itl_pair_lock_buffers));
+		ut_itl_pair_content_lock_held[index] = false;
+		ut_itl_pair_lock_buffers[ut_itl_pair_lock_calls++] = buffer;
+		return;
+	}
+	UT_ASSERT_EQ(buffer, UT_HOT_BUFFER);
 	UT_ASSERT(fixture->lock_calls < lengthof(fixture->lock_modes));
 	if (fixture->lock_calls < lengthof(fixture->lock_modes))
 		fixture->lock_modes[fixture->lock_calls] = mode;
@@ -1034,6 +1251,7 @@ ut_r4_hot_init_product_fixture(UtR4HotProductFixture *fixture,
 	ut_hot_product_fixture = fixture;
 	ut_hot_content_lock_held = true;
 	ut_hot_production_core_active = true;
+	ut_hot_r4_target_reachable = true;
 	BufferBlocks = fixture->live_page;
 }
 
@@ -1747,10 +1965,369 @@ UT_TEST(test_39_peer_foreign_multixact_hot_chain_never_uses_native_decode)
 	BufferBlocks = NULL;
 }
 
+UT_TEST(test_40_dormant_r4_does_not_intercept_live_hot_path)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	RelationData relation;
+	FormData_pg_class relation_form;
+	SnapshotData snapshot;
+	ItemPointerData tid;
+	ClusterR4PrerequisiteSnapshot prerequisite;
+	HeapHotSearchResultKind kind;
+
+	ut_r4_hot_init_product_fixture(&fixture, &result);
+	prerequisite = cluster_undo_block0_r4_prerequisite_snapshot();
+	UT_ASSERT(!prerequisite.ready);
+	UT_ASSERT_EQ(prerequisite.status,
+				 CLUSTER_R4_PREREQUISITE_RF_DEFERRED);
+	ut_hot_r4_target_reachable = false;
+	ut_live_visibility_calls = 0;
+
+	memset(&relation, 0, sizeof(relation));
+	memset(&relation_form, 0, sizeof(relation_form));
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &relation_form;
+	relation_form.relpersistence = RELPERSISTENCE_PERMANENT;
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.read_scn = UT_HOT_READ_SCN;
+	snapshot.read_epoch = 9;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+
+	kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER,
+										&snapshot, &result, NULL, true);
+	UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_BUFFER_BACKED);
+	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&tid), UT_HOT_ROOT_OFF);
+	UT_ASSERT_EQ(fixture.fetch_calls, 0);
+	UT_ASSERT_EQ(fixture.lock_calls, 0);
+	UT_ASSERT_EQ(ut_live_visibility_calls, 1);
+	UT_ASSERT(ut_hot_content_lock_held);
+
+	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_r4_target_reachable = true;
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+}
+
+static void
+ut_itl_census_begin(UtR4HotProductFixture *fixture,
+					HeapHotSearchResult *result, bool lock_only)
+{
+	ClusterItlSlotData *slots;
+	uint8 i;
+
+	ut_r4_hot_init_product_fixture(fixture, result);
+	slots = ClusterPageGetItlSlots((Page) fixture->live_page);
+	memset(slots, 0,
+		   sizeof(ClusterItlSlotData) * CLUSTER_ITL_INITRANS_DEFAULT);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		slots[i].xid = (TransactionId) (1200 + i);
+		slots[i].wrap = (uint16) (20 + i);
+		slots[i].flags = lock_only
+			? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE;
+		slots[i].undo_segment_head = uba_encode(1, i + 1, i, 0);
+		ut_itl_census_outcomes[i] = CLUSTER_TX_UNKNOWN;
+	}
+	PageSetLSN((Page) fixture->live_page, (XLogRecPtr) UINT64_C(0x334455));
+	ut_itl_census_active = true;
+	ut_itl_census_mutate_wrap = false;
+	ut_itl_census_lock_only = lock_only;
+	ut_itl_census_alloc_calls = 0;
+	ut_itl_census_resolve_calls = 0;
+	ut_itl_census_dirty_hint_calls = 0;
+	ut_itl_census_tt_generation = UINT64_C(77);
+	ut_itl_census_origin_tt_generation = UINT64_C(77);
+	ut_itl_census_mutate_activation = false;
+	ut_itl_census_admission = NULL;
+	memset(&ut_itl_census_semantic, 0,
+		   sizeof(ut_itl_census_semantic));
+	pg_atomic_init_u64(&ut_itl_census_semantic.admission_seq, 2);
+	pg_atomic_init_u64(&ut_itl_census_semantic.active_bits, 0);
+	pg_atomic_init_u64(&ut_itl_census_semantic.record_generation, 73);
+	pg_atomic_init_u64(&ut_itl_census_semantic.formation_epoch, 9);
+	pg_atomic_init_u32(&ut_itl_census_semantic.transition_closed, 0);
+	for (i = 0; i < 2; i++)
+	{
+		int feature;
+
+		for (feature = 0; feature < 64; feature++)
+			pg_atomic_init_u32(
+				&ut_itl_census_semantic.inflight[i][feature], 0);
+	}
+	memset(semantic_activation_local_inflight, 0,
+		   sizeof(semantic_activation_local_inflight));
+	semantic_activation_exit_hook_pid = 0;
+	SemanticActivationShmem = &ut_itl_census_semantic;
+	cluster_r4_activation_test_current_epoch = 9;
+	ut_itl_census_tag = fixture->expected_tag;
+	ut_cluster_conf.node_count = 2;
+	ut_itl_pair_active = false;
+	memset(ut_itl_pair_content_lock_held, 0,
+		   sizeof(ut_itl_pair_content_lock_held));
+	memset(ut_itl_pair_lock_buffers, 0,
+		   sizeof(ut_itl_pair_lock_buffers));
+	ut_itl_pair_lock_calls = 0;
+	fixture->lock_calls = 0;
+	ut_hot_pcm_snapshot_calls = 0;
+	ut_hot_last_pcm_snapshot_state = UINT8_MAX;
+	ut_itl_census_force_pcm_n = false;
+}
+
+static void
+ut_itl_census_end(void)
+{
+	UT_ASSERT_EQ(pg_atomic_read_u32(
+		&ut_itl_census_semantic.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0]), 0);
+	UT_ASSERT_EQ(semantic_activation_local_inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
+	if (ut_itl_pair_active)
+	{
+		UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
+		UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
+		ut_itl_pair_active = false;
+		ut_hot_content_lock_held = false;
+	}
+	else
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_itl_census_active = false;
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+	SemanticActivationShmem = NULL;
+}
+
+UT_TEST(test_41_data_itl_full_census_resolves_terminal_without_content_lock)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1300, false, &slot_index));
+	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
+	UT_ASSERT_EQ(slot_index, 0);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ((uint64) slots[0].commit_scn, UINT64_C(9001));
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 2);
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls, 8);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	UT_ASSERT_EQ(fixture.lock_calls, 2);
+	UT_ASSERT_EQ(fixture.lock_modes[0], BUFFER_LOCK_UNLOCK);
+	UT_ASSERT_EQ(fixture.lock_modes[1], BUFFER_LOCK_EXCLUSIVE);
+	UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 2);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_42_lock_only_itl_full_census_recycles_exact_abort)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &result, true);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_ABORTED;
+	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1301, true, &slot_index));
+	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
+	UT_ASSERT_EQ(slot_index, 0);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_LOCK_ONLY_ABORTED);
+	UT_ASSERT_EQ((uint64) slots[0].commit_scn, (uint64) InvalidScn);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 2);
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls, 8);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_43_prepared_and_unknown_census_preserve_every_slot)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	ClusterItlSlotData before[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_PREPARED;
+	memcpy(before, ClusterPageGetItlSlots((Page) fixture.live_page),
+		   sizeof(before));
+	UT_ASSERT(!cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1302, false, &slot_index));
+	UT_ASSERT_EQ(memcmp(before,
+					ClusterPageGetItlSlots((Page) fixture.live_page),
+					sizeof(before)), 0);
+	UT_ASSERT_EQ(slot_index, CLUSTER_ITL_SLOT_UNALLOCATED);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 1);
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls, 8);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_44_post_resolution_wrap_aba_preserves_terminal_candidate)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData before;
+	ClusterItlSlotData *slot;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+	ut_itl_census_mutate_wrap = true;
+	slot = &ClusterPageGetItlSlots((Page) fixture.live_page)[0];
+	before = *slot;
+	UT_ASSERT(!cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1303, false, &slot_index));
+	UT_ASSERT_EQ(slot->wrap, (uint16) (before.wrap + 1));
+	UT_ASSERT_EQ(slot->flags, before.flags);
+	UT_ASSERT_EQ(slot->xid, before.xid);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 1);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_45_cross_page_census_resolves_below_neither_content_lock)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+	ut_itl_pair_active = true;
+	ut_itl_pair_content_lock_held[0] = true;
+	ut_itl_pair_content_lock_held[1] = true;
+	ut_hot_content_lock_held = false;
+
+	UT_ASSERT(cluster_heap_test_itl_resolve_pair_terminal_census(
+		(Buffer) 1, (Buffer) 2, (Buffer) 1));
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls,
+				 CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
+	UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
+	UT_ASSERT_EQ(ut_itl_pair_lock_calls, 2);
+	UT_ASSERT_EQ(ut_itl_pair_lock_buffers[0], (Buffer) 2);
+	UT_ASSERT_EQ(ut_itl_pair_lock_buffers[1], (Buffer) 1);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_46_activation_generation_drift_preserves_terminal_candidate)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+	ut_itl_census_mutate_activation = true;
+	UT_ASSERT(!cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1304, false, &slot_index));
+	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
+	UT_ASSERT_EQ(slot_index, CLUSTER_ITL_SLOT_UNALLOCATED);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_47_origin_tt_generation_is_not_compared_to_requester_counter)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+	ut_itl_census_origin_tt_generation = UINT64_C(991);
+	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1305, false, &slot_index));
+	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
+	UT_ASSERT_EQ(slot_index, 0);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_48_same_page_full_without_borrowed_census_never_leaves_token)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	UT_ASSERT_EQ(pg_atomic_read_u32(
+		&ut_itl_census_semantic.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0]), 0);
+	UT_ASSERT_EQ(semantic_activation_local_inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
+	UT_ASSERT(!cluster_heap_test_itl_update_same_page_failure_cleanup());
+	UT_ASSERT_EQ(pg_atomic_read_u32(
+		&ut_itl_census_semantic.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0]), 0);
+	UT_ASSERT_EQ(semantic_activation_local_inflight
+		[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_49_known_single_node_pcm_n_resolves_and_recycles)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_cluster_conf.node_count = 1;
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+	UT_ASSERT(!cluster_conf_has_peers());
+	UT_ASSERT(ut_hot_content_lock_held);
+	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1306, false, &slot_index));
+	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
+	UT_ASSERT_EQ(slot_index, 0);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ((uint64) slots[0].commit_scn, UINT64_C(9001));
+	UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 2);
+	UT_ASSERT_EQ(ut_hot_last_pcm_snapshot_state, (uint8) PCM_STATE_N);
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls, 8);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 2);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	UT_ASSERT_EQ(fixture.lock_calls, 2);
+	UT_ASSERT(ut_hot_content_lock_held);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_50_peer_pcm_n_refuses_before_resolve)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	ut_itl_census_force_pcm_n = true;
+	UT_ASSERT(cluster_conf_has_peers());
+	UT_ASSERT(!cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1307, false, &slot_index));
+	UT_ASSERT_EQ(slot_index, CLUSTER_ITL_SLOT_UNALLOCATED);
+	UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 1);
+	UT_ASSERT_EQ(ut_hot_last_pcm_snapshot_state, (uint8) PCM_STATE_N);
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_alloc_calls, 1);
+	UT_ASSERT_EQ(fixture.lock_calls, 0);
+	UT_ASSERT(ut_hot_content_lock_held);
+	ut_itl_census_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(39);
+	UT_PLAN(50);
 	UT_RUN(test_01_held_lock_bits_are_independent);
 	UT_RUN(test_02_wait_edge_values_are_closed);
 	UT_RUN(test_03_utility_to_lmon_wait_with_no_lock_is_allowed);
@@ -1790,6 +2367,17 @@ main(void)
 	UT_RUN(test_37_full_input_recheck_catches_non_target_itl_with_stable_tuple_and_lsn);
 	UT_RUN(test_38_changed_input_discards_old_fetch_failure_before_error_mapping);
 	UT_RUN(test_39_peer_foreign_multixact_hot_chain_never_uses_native_decode);
+	UT_RUN(test_40_dormant_r4_does_not_intercept_live_hot_path);
+	UT_RUN(test_41_data_itl_full_census_resolves_terminal_without_content_lock);
+	UT_RUN(test_42_lock_only_itl_full_census_recycles_exact_abort);
+	UT_RUN(test_43_prepared_and_unknown_census_preserve_every_slot);
+	UT_RUN(test_44_post_resolution_wrap_aba_preserves_terminal_candidate);
+	UT_RUN(test_45_cross_page_census_resolves_below_neither_content_lock);
+	UT_RUN(test_46_activation_generation_drift_preserves_terminal_candidate);
+	UT_RUN(test_47_origin_tt_generation_is_not_compared_to_requester_counter);
+	UT_RUN(test_48_same_page_full_without_borrowed_census_never_leaves_token);
+	UT_RUN(test_49_known_single_node_pcm_n_resolves_and_recycles);
+	UT_RUN(test_50_peer_pcm_n_refuses_before_resolve);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

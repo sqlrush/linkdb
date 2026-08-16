@@ -89,6 +89,7 @@ use lib "$FindBin::RealBin/../lib";
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::ClusterPair;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep time);
@@ -764,10 +765,7 @@ my $disk0;
 	for my $i (0 .. 2)
 	{
 		my $path = "$sdisk_dir/sdisk$i";
-		open(my $dh, '>', $path) or die "$path: $!";
-		binmode $dh;
-		print $dh ("\0" x (2 * 128 * 512));
-		close $dh;
+		format_voting_file($path, $i);
 		push @sdisks, $path;
 	}
 	$standby->append_conf('postgresql.conf',

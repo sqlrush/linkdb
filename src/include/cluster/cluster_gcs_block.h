@@ -3018,11 +3018,18 @@ extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(
 	ClusterCrBuildReason *reason_out);
 /* LMON close census: live requester slots in the exact R4_CR domain. */
 extern uint64 cluster_gcs_block_r4_requester_count(void);
+extern ClusterTxOutcome cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
+	int32 origin_node, const ClusterTxLocator *locator,
+	uint32 expected_physical_generation, uint64 formation_epoch,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
+extern void cluster_gcs_block_r4_tx_resolve_drain(void);
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_gcs_block_test_r4_request80(const struct ClusterICEnvelope *env,
 											 const void *payload);
 extern bool cluster_gcs_block_test_r4_forward96(const struct ClusterICEnvelope *env,
 											 const void *payload);
+extern int cluster_gcs_block_test_r4_tx_origin_context_count(void);
+extern void cluster_gcs_block_test_r4_tx_origin_drain(void);
 extern bool cluster_gcs_block_test_current_mx_forward128(
 	const struct ClusterICEnvelope *env, const void *payload);
 extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result,
@@ -3373,12 +3380,8 @@ ClusterR4TxVerdictPageDecode(const uint8 page[BLCKSZ], const ClusterTxLocator *e
 	decoded.locator_echo.tt_wrap = ClusterR4WireReadU16(&page[32]);
 	decoded.locator_echo.itl_kind = page[34];
 	decoded.locator_echo.itl_slot_index = page[35];
-	if (decoded.locator_echo.uba.raw[0] != expected_locator->uba.raw[0]
-		|| decoded.locator_echo.uba.raw[1] != expected_locator->uba.raw[1]
-		|| decoded.locator_echo.xid != expected_locator->xid
-		|| decoded.locator_echo.tt_wrap != expected_locator->tt_wrap
-		|| decoded.locator_echo.itl_kind != expected_locator->itl_kind
-		|| decoded.locator_echo.itl_slot_index != expected_locator->itl_slot_index)
+	if (!cluster_tx_locator_reply_matches(expected_locator,
+									   &decoded.locator_echo))
 		return false;
 
 	decoded.top_xid = (TransactionId)ClusterR4WireReadU32(&page[36]);
@@ -4298,16 +4301,18 @@ typedef enum ClusterItlStampSkipReason {
 	CLUSTER_ITL_STAMP_SKIP_ALREADY_TERMINAL
 } ClusterItlStampSkipReason;
 
-/* PGRAC: spec-8.3 — read-only projection of the process-local ACTIVE
- * PCM-X holder ledger for terminal-stamp proof capture.  Caller must hold
- * the buffer's content lock EXCLUSIVE.  Returns true and fills the
- * ownership generation and acquisition epoch iff the exact holder entry
- * validates and the BufferDesc ownership tuple samples as a quiescent
- * current local X (state X, flags zero, activation token zero, generation
- * equal to the holder identity's base generation).  Creates no authority
+/* PGRAC: spec-8.3 — read-only terminal-stamp authority projection.  Caller
+ * must hold the exact buffer's content lock EXCLUSIVE.  Peer mode preserves
+ * the process-local ACTIVE PCM-X holder-ledger contract unchanged.  Known
+ * single-node storage mode may instead project only a quiescent PCM-N tuple
+ * for the exact expected tag while recovery merge is inactive.  Returns the
+ * captured generation, acquisition epoch and PCM state; creates no authority
  * or lifecycle state. */
-extern bool cluster_bufmgr_pcm_x_holder_stamp_authority(Buffer buffer, uint64 *own_generation,
-														uint64 *acquisition_epoch);
+extern bool cluster_bufmgr_terminal_stamp_authority(Buffer buffer,
+												const BufferTag *expected_tag,
+												uint64 *own_generation,
+												uint64 *acquisition_epoch,
+												uint8 *pcm_state);
 
 /* PGRAC: spec-8.3 — no-fetch exact-proof acquire for the commit-time ITL
  * stamp.  Replaces the residency-only semantic: under mapping authority,

@@ -182,6 +182,10 @@ typedef struct ClusterLockAcquireRequest {
 	ClusterGrdHolderId holder;
 	/* spec-2.21 D1: per-acquire monotonic id; LOCALLOCK exactly-once key. */
 	uint64 request_id;
+	/* RF-ROOT P6 S05-3H: original holder reply key for the WALR-only
+	 * conditional conversion rollback.  Zero for every ordinary request and
+	 * blocking conversion. */
+	uint64 convert_old_request_id;
 	/* spec-2.21 P2.3: S3 snapshot; S5 revalidate fail → backout. */
 	uint64 master_gen_snapshot;
 	/* spec-2.17 P2.2 deterministic 4-tuple — DESC = newer = youngest victim. */

@@ -45,6 +45,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_shmem.h"
@@ -2290,6 +2291,16 @@ cluster_ic_rdma_send_envelope_sge(uint8 msg_type, int32 dest_node_id,
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("cluster_ic msg_type %u (\"%s\") not allowed from BackendType %d",
 							   msg_type, info->name, (int)MyBackendType)));
+
+	if ((ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
+		&& cluster_authority_readiness_managed()
+		&& !cluster_serving_ready_is_current()) {
+		rdma_release_sge_callbacks(payload_sge, n_sge);
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+				 errmsg("cluster IC RDMA data plane is not serving-ready")));
+		return CLUSTER_IC_SEND_HARD_ERROR;
+	}
 
 	if (dest_node_id == cluster_node_id) {
 		rdma_release_sge_callbacks(payload_sge, n_sge);

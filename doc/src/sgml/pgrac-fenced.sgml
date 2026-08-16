@@ -1,0 +1,293 @@
+<!-- doc/src/sgml/pgrac-fenced.sgml -->
+
+<chapter id="pgrac-fenced">
+ <title>PGRAC External I/O Fencing</title>
+
+ <indexterm zone="pgrac-fenced">
+  <primary>PGRAC</primary>
+  <secondary>external I/O fencing</secondary>
+ </indexterm>
+
+ <indexterm zone="pgrac-fenced">
+  <primary>pgrac-fenced</primary>
+ </indexterm>
+
+ <warning>
+  <para>
+   The external-fence provider included in this release is provider 0, an
+   unavailable test and ABI skeleton.  It is not a production fencing
+   provider, does not establish write exclusion, and does not create an
+   operational daemon socket.  Do not deploy shared-storage foreign-node
+   recovery with this provider.  Such recovery fails closed until a certified
+   provider is installed.
+  </para>
+ </warning>
+
+ <para>
+  <application>pgrac-fenced</application> is the privileged endpoint used by
+  PGRAC when recovery must prove that a foreign node can no longer write to a
+  protected shared-storage set.  The proof is required only for the affected
+  destructive foreign-recovery leg.  Native own-stream recovery, normal
+  reads and writes, and single-node <literal>stub</literal> or
+  <literal>local</literal> storage operation do not send requests to this
+  daemon.
+ </para>
+
+ <para>
+  If a required proof cannot be obtained, PGRAC stops the affected recovery
+  operation with SQLSTATE <literal>58R17</literal>
+  (<literal>cluster_external_fence_unavailable</literal>).  This is a
+  fail-closed result: restore the configured provider and retry.  Do not
+  disable the check or force recovery.
+ </para>
+
+ <sect1 id="pgrac-fenced-availability">
+  <title>Build and Deployment Modes</title>
+
+  <variablelist>
+   <varlistentry>
+    <term>Builds without PGRAC cluster support</term>
+    <listitem>
+     <para>
+      Server call sites for external fencing are not compiled in.  On
+      supported Unix platforms the frontend programs can still be built and
+      installed, but provider 0 remains unavailable.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>PGRAC with <literal>stub</literal> or single-node
+     <literal>local</literal> storage</term>
+    <listitem>
+     <para>
+      Native operation continues without a daemon request.  Installing or
+      starting provider 0 does not add fencing protection to this mode.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term>PGRAC shared storage with a foreign recovery victim</term>
+    <listitem>
+     <para>
+      The destructive recovery leg requires a fresh affirmative proof from a
+      certified provider.  With provider 0, an absent daemon, an invalid
+      response, an expired proof, or a configuration mismatch, the leg stops
+      with SQLSTATE <literal>58R17</literal> before destructive mutation or
+      publication.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+
+  <para>
+   This release contains no certified provider.  A nonzero
+   <literal>provider_id</literal> in the configuration does not register or
+   activate one in the distributed binaries.
+  </para>
+ </sect1>
+
+ <sect1 id="pgrac-fenced-configuration">
+  <title>Configuration</title>
+
+  <para>
+   The daemon reads the fixed path
+   <filename>/etc/pgrac/pgrac-fenced.conf</filename>.  The file must be a
+   regular, root-owned and root-group-owned file with mode
+   <literal>0600</literal>.  The directories <filename>/etc</filename> and
+   <filename>/etc/pgrac</filename> must be root-owned and must not be writable
+   by group or other users.  Symbolic links are rejected while the path is
+   opened.  The file must not exceed 64 KiB.
+  </para>
+
+  <para>
+   The format is canonical: one <literal>key=value</literal> entry per line,
+   in the exact order shown below, with a final newline.  Blank lines,
+   comments, surrounding whitespace, carriage returns, duplicate entries,
+   uppercase hexadecimal digits, and leading zeroes in decimal values are
+   rejected.  The current package must use <literal>provider_id=0</literal>
+   and <literal>provider_abi=1</literal>.
+  </para>
+
+<programlisting>
+format_version=1
+mapping_generation=1
+system_identifier=7621234567890123456
+storage_backend_id=3
+storage_uuid=00112233445566778899aabbccddeeff
+allowed_db_uid=999
+allowed_db_gid=999
+provider_id=0
+provider_abi=1
+node.0.target_uuid=102132435465768798a9bacbdcedfe0f
+node.0.adapter_data=
+</programlisting>
+
+  <para>
+   <literal>mapping_generation</literal> and
+   <literal>system_identifier</literal> must be nonzero.
+   <literal>storage_backend_id</literal> is <literal>2</literal> for
+   <literal>block_device</literal> and <literal>3</literal> for
+   <literal>cluster_fs</literal>.  Storage and target UUIDs are 16 nonzero
+   bytes written as 32 lowercase hexadecimal characters.  Each target UUID
+   must be unique.
+  </para>
+
+  <para>
+   Node identifiers range from 0 through 127 and must appear in increasing
+   order.  Every node has adjacent <literal>target_uuid</literal> and
+   <literal>adapter_data</literal> lines.  Adapter data is provider-specific
+   lowercase hexadecimal data and can be empty.  At least one node is
+   required.  <literal>allowed_db_uid</literal> and
+   <literal>allowed_db_gid</literal> are the decimal operating-system user and
+   group identifiers authorized for the database peer.
+  </para>
+
+  <para>
+   The standard runtime locations are:
+  </para>
+
+  <table id="pgrac-fenced-paths">
+   <title>External-fence runtime paths</title>
+   <tgroup cols="2">
+    <thead>
+     <row>
+      <entry>Purpose</entry>
+      <entry>Path</entry>
+     </row>
+    </thead>
+    <tbody>
+     <row>
+      <entry>Database socket</entry>
+      <entry><filename>/var/run/pgrac/pgrac-fenced.sock</filename></entry>
+     </row>
+     <row>
+      <entry>Administrative socket</entry>
+      <entry><filename>/var/run/pgrac/pgrac-fenced-admin.sock</filename></entry>
+     </row>
+     <row>
+      <entry>Journal directory</entry>
+      <entry><filename>/var/lib/pgrac-fenced/journal</filename></entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </table>
+
+  <para>
+   Provider 0 does not create these sockets.  Their absence is expected for
+   the binaries in this release and must not be worked around by creating
+   placeholder sockets or files.
+  </para>
+ </sect1>
+
+ <sect1 id="pgrac-fenced-server-settings">
+  <title>Server Settings</title>
+
+  <variablelist>
+   <varlistentry id="guc-cluster-external-fence-socket-path">
+    <term><varname>cluster.external_fence_socket_path</varname>
+     (<type>string</type>)</term>
+    <listitem>
+     <para>
+      Selects the database-facing Unix-domain socket.  The default is
+      <filename>/var/run/pgrac/pgrac-fenced.sock</filename>.  The value must
+      be a nonempty absolute path, must not contain a
+      <literal>..</literal> path component, and must fit in the platform Unix
+      socket path limit.  This setting can only be set when the server starts.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="guc-cluster-external-fence-acquire-timeout-ms">
+    <term><varname>cluster.external_fence_acquire_timeout_ms</varname>
+     (<type>integer</type>)</term>
+    <listitem>
+     <para>
+      Sets the overall deadline, in milliseconds, shared by all external
+      fence admissions required by one recovery attempt.  The default is
+      <literal>120000</literal>; allowed values are 1 through 600000.  The
+      setting can be changed by reloading the server configuration.  A change
+      affects later attempts, not the deadline already captured by an active
+      attempt.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+
+  <para>
+   Changing either setting does not activate provider 0 and cannot make an
+   unavailable or uncertified provider usable.
+  </para>
+ </sect1>
+
+ <sect1 id="pgrac-fenced-administration">
+  <title>Administration Commands</title>
+
+  <para>
+   <application>pgrac-fenced</application> must run as root.  With a valid
+   provider-0 configuration it prints
+   <computeroutput>pgrac-fenced has no certified production
+   provider</computeroutput> and exits with status 77.  It does not enter an
+   operational service loop.
+  </para>
+
+  <para>
+   Except for the help option, <application>pgrac-fencedctl</application>
+   commands must also run as root.  Its command forms are:
+  </para>
+
+<synopsis>
+pgrac-fencedctl status --json
+pgrac-fencedctl verify-journal <replaceable>path</replaceable>
+pgrac-fencedctl prepare-rejoin <replaceable>node</replaceable> <replaceable>old-incarnation</replaceable> <replaceable>candidate-incarnation</replaceable> [--timeout-ms <replaceable>milliseconds</replaceable>]
+</synopsis>
+
+  <variablelist>
+   <varlistentry>
+    <term><option>status --json</option></term>
+    <listitem>
+     <para>
+      Reports <literal>UNAVAILABLE</literal> with reason
+      <literal>admin_socket_unavailable</literal>, or
+      <literal>status_protocol_unavailable</literal> if a root-owned socket is
+      present but no status protocol is available.  The exit status is 77.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><option>verify-journal</option></term>
+    <listitem>
+     <para>
+      Validates a root-owned, root-group-owned mode-0600 journal segment and
+      its record chain.  A valid segment produces JSON with status
+      <literal>OK</literal> and exits with status 0; an unavailable or invalid
+      segment exits with status 77.  Journal validity is local integrity
+      evidence only.  It is not evidence that a provider is running, that a
+      device is fenced, or that write exclusion holds.
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><option>prepare-rejoin</option></term>
+    <listitem>
+     <para>
+      Requests a rejoin operation from the administrative socket.  The
+      default timeout is 120000 milliseconds.  Provider 0 has no operational
+      administrative socket, so this command exits with status 77.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+
+  <para>
+   Command exit statuses are 0 for a completed local command, 2 for invalid
+   command syntax, and 77 for unavailable service or invalid operational
+   evidence.  An exit status of 0 from <option>--help</option> or
+   <option>verify-journal</option> must never be treated as proof of external
+   I/O exclusion.
+  </para>
+ </sect1>
+</chapter>

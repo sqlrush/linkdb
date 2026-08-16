@@ -60,6 +60,7 @@
 #include "storage/buf.h"	 /* Buffer */
 #include "storage/itemptr.h" /* OffsetNumber */
 #include "storage/relfilelocator.h"
+#include "cluster/cluster_buffer_desc.h" /* PCM_STATE_N / PCM_STATE_X */
 #include "cluster/cluster_itl_slot.h" /* CLUSTER_ITL_INITRANS_DEFAULT (spec-3.4c D14) */
 #include "cluster/cluster_scn.h"	  /* SCN */
 
@@ -122,17 +123,45 @@ typedef struct ClusterItlTerminalProof {
 	uint64 acquisition_epoch;
 	uint16 slot_wrap;
 	uint8 slot_class;
+	uint8 pcm_state;
 	bool valid;
 } ClusterItlTerminalProof;
+
+/*
+ * Exact terminal-stamp ownership modes.
+ *
+ * Multi-node keeps the existing PCM-X contract.  A known single-node
+ * storage deployment has no peer PCM lifecycle, so its only admissible
+ * projection is the quiescent PCM-N tuple under the already-held page
+ * content lock EXCLUSIVE.  Unknown topology, recovery merge, invalid local
+ * identity and every busy ownership tuple fail closed.
+ */
+static inline bool
+cluster_itl_terminal_stamp_authority_admissible(bool storage_mode, int local_node_id,
+											 int node_count, bool recovery_merge_active,
+											 uint8 pcm_state, uint32 own_flags,
+											 uint64 writer_activation_token)
+{
+	if (!storage_mode || node_count <= 0 || local_node_id < 0
+		|| local_node_id >= node_count || recovery_merge_active || own_flags != 0
+		|| writer_activation_token != 0)
+		return false;
+
+	if (node_count == 1)
+		return local_node_id == 0 && pcm_state == (uint8)PCM_STATE_N;
+	return pcm_state == (uint8)PCM_STATE_X;
+}
 
 /* Exact local-owner and slot checks used by terminal hinting. */
 static inline bool
 cluster_itl_terminal_proof_owner_exact(const ClusterItlTerminalProof *proof,
 									   uint64 own_generation, uint64 acquisition_epoch,
-									   bool local_x, uint32 own_flags,
+									   uint8 pcm_state, bool authority_admissible,
+									   uint32 own_flags,
 									   uint64 writer_activation_token)
 {
-	return proof != NULL && proof->valid && local_x && own_flags == 0
+	return proof != NULL && proof->valid && authority_admissible
+		&& pcm_state == proof->pcm_state && own_flags == 0
 		&& writer_activation_token == 0 && own_generation == proof->own_generation
 		&& acquisition_epoch == proof->acquisition_epoch;
 }

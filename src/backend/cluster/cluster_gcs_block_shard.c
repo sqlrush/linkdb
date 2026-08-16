@@ -115,18 +115,21 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		if (payload_len != sizeof(GcsBlockForwardPayload)
 			&& payload_len != sizeof(ClusterR4CrForwardPayload))
 			return -1;
-		/* Spec 8.4 D4: endpoint -2/kind-4 is the sole block-family
-		 * exception to tag sharding.  It is an internal worker-0 request /
-		 * response correlation path and must stay on the existing DATA0
-		 * connection.  Both discriminators and the exact 96-byte shape are
-		 * required; every other FORWARD retains the legacy tag shard. */
+		/* Spec 8.4 D4 kind-4 and the M4-scoped existing kind-2 extension
+		 * share the cooperative worker-0 driver and must stay on DATA0.
+		 * Kind-4 additionally requires its internal endpoint; kind-2 keeps
+		 * the positive backend id of the physical R4_CR reply slot.  Every
+		 * other exact FORWARD96 retains the legacy tag shard. */
 		if (payload_len == sizeof(ClusterR4CrForwardPayload)) {
 			const ClusterR4CrForwardPayload *r4
 				= (const ClusterR4CrForwardPayload *)payload;
 
-			if (r4->base.requester_backend_id == CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
-				&& r4->extension.r4_version == CLUSTER_R4_WIRE_VERSION
-				&& r4->extension.r4_kind == CLUSTER_R4_WIRE_UNDO_DATA_FETCH)
+			if (r4->extension.r4_version == CLUSTER_R4_WIRE_VERSION
+				&& (r4->extension.r4_kind == CLUSTER_R4_WIRE_TX_RESOLVE
+					|| (r4->base.requester_backend_id
+							== CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+						&& r4->extension.r4_kind
+							   == CLUSTER_R4_WIRE_UNDO_DATA_FETCH)))
 				return n_workers > 0 ? 0 : -1;
 		}
 		tag = &((const GcsBlockForwardPayload *)payload)->tag;

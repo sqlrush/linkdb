@@ -55,7 +55,7 @@ cluster_reconfig_thread_recovery_eligibility_consume(
 	uint16 origin_thread,
 	ClusterThreadRecLaunchEligibility *out)
 {
-	ReconfigEvent event;
+	ReconfigEvent event = {0};
 	ClusterControlRootIdentity identity;
 	ClusterControlRootSnapshot snapshot;
 	ClusterControlRootReadToken token;
@@ -123,6 +123,7 @@ cluster_reconfig_thread_recovery_eligibility_consume(
 #include "cluster/cluster_gcs_block.h"	 /* spec-2.34 D4 — eager epoch wake hook */
 #include "cluster/cluster_grd.h"		 /* spec-5.16 D3b — arm join PCM block fence */
 #include "cluster/cluster_ic.h"			 /* Candidate2 HELLO capability */
+#include "cluster/cluster_startup_phase.h" /* RF-ROOT P04 serving split */
 #include "cluster/cluster_ic_router.h"	 /* phase-3 target-LMON CONTROL send */
 #include "cluster/cluster_ic_tier1.h"	 /* close peer after send HARD_ERROR */
 #include "cluster/cluster_sinval.h"		 /* spec-2.39 D14 — RESET-all reconfig hook */
@@ -133,6 +134,7 @@ cluster_reconfig_thread_recovery_eligibility_consume(
 #include "cluster/cluster_clean_leave.h" /* v1.0.4 — cluster_clean_leave_in_progress (serialize) */
 #include "cluster/cluster_guc.h"		 /* cluster_enabled, cluster_online_join */
 #include "cluster/cluster_inject.h"		 /* CLUSTER_INJECTION_POINT */
+#include "cluster/cluster_lms.h"		 /* current LMS restart generation */
 #include "cluster/cluster_lmon.h"		 /* cluster_lmon_marker_complete_wakeup */
 #include "cluster/cluster_voting_disk_io.h" /* spec-5.15 D4 — region-3 join-marker slot I/O */
 #include "cluster/cluster_write_fence.h"	/* spec-4.12 D4 — durable fence marker submit */
@@ -171,6 +173,9 @@ StaticAssertDecl(CLUSTER_RECONFIG_TOUCH_KIND_COUNT == CLUSTER_TOUCH_KIND_COUNT,
  * Shmem region (single instance;pointer set by shmem_init).
  */
 static ClusterReconfigState *ReconfigShmem = NULL;
+/* Process-local early-boot classifier. */
+static bool joiner_gate_decided = false;
+static bool offpath_fast_rejoin_active_local = false;
 
 typedef struct ClusterReconfigFenceStage {
 	ClusterMarkerAsync async;
@@ -232,6 +237,23 @@ static ClusterReconfigFenceStage failstop_fence_stage;
 static ClusterReconfigFenceStage node_removed_fence_stage;
 static ClusterReconfigJoinPrepareStage join_prepare_stage;
 static ClusterReconfigJoinCommitStage join_commit_stage;
+
+/* RF-ROOT P04 A2 Scheme B.  This capability is deliberately process-local:
+ * losing/restarting LMON invalidates it instead of reconstructing authority
+ * from old shared state.  It carries one exact shared-CF rollover episode
+ * through the existing two-phase JOIN transaction while ordinary serving is
+ * closed; it is never a serving or general reconfiguration credential. */
+typedef struct ClusterFastRejoinControlCapability {
+	bool active;
+	int32 target_node_id;
+	uint64 target_incarnation;
+	uint64 failstop_event_id;
+	uint64 failstop_epoch;
+	uint64 boot_incarnation;
+	uint64 lms_generation;
+} ClusterFastRejoinControlCapability;
+
+static ClusterFastRejoinControlCapability fast_rejoin_control;
 static ClusterExternalRejoinSlot external_rejoin_slots[CLUSTER_MAX_NODES];
 static PgracExternalFenceRejoinOpV1 *external_rejoin_claim_op;
 static bool external_rejoin_exit_registered;
@@ -488,7 +510,16 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 		return false;
 	origin_node = (int32)origin_thread - 1;
 	memset(out, 0, sizeof(*out));
-	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	/* A1: Postmaster drives phase 3 before StartupProcess exists, so it has
+	 * no PGPROC with which LWLockAcquire could queue.  Preserve blocking
+	 * snapshot semantics for ordinary processes; the no-PGPROC caller may
+	 * only take an immediately available shared lock and lets the existing
+	 * phase-3 deadline loop retry contention. */
+	if (MyProc == NULL) {
+		if (!LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED))
+			return false;
+	} else
+		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
 	src = &ReconfigShmem->last_applied;
 	out->applied.event_id = src->event_id;
 	out->applied.coordinator_node_id = src->coordinator_node_id;
@@ -1347,6 +1378,23 @@ dead_bitmap_lowest_bit_set(const uint8 *bmp)
 }
 
 
+/* Snapshot the exact shared-CF rollover episodes this LMON is authorized to
+ * drive through the pre-existing ordinary join/redeclare machinery. */
+static bool
+cluster_reconfig_fast_rejoin_actions_snapshot(void)
+{
+	bool active;
+
+	if (ReconfigShmem == NULL || cluster_online_join
+		|| !cluster_controlfile_shared_authority)
+		return false;
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	active = !dead_bitmap_is_zero(ReconfigShmem->fast_rejoin_bitmap);
+	LWLockRelease(&ReconfigShmem->lock);
+	return active;
+}
+
+
 /*
  * spec-2.29 P1.2: event_id = hash_bytes_extended(dead_bitmap[16] || cssd_dead_generation).
  *
@@ -1751,6 +1799,170 @@ rejoin_bitmap_is_exact_singleton(
 			return false;
 	}
 	return true;
+}
+
+
+static void
+cluster_reconfig_fast_rejoin_control_clear(void)
+{
+	memset(&fast_rejoin_control, 0, sizeof(fast_rejoin_control));
+	fast_rejoin_control.target_node_id = -1;
+}
+
+
+/* Arm only at the successful coordinator FAIL_STOP publication edge.  A
+ * second simultaneous rollover is outside the approved singleton P04 slice
+ * and therefore fails closed rather than selecting one implicitly. */
+static void
+cluster_reconfig_fast_rejoin_control_arm(const ReconfigEvent *event)
+{
+	uint64 boot_incarnation;
+	uint64 lms_generation;
+	uint64 target_incarnation = 0;
+	uint64 target_generation = 0;
+	uint64 prior_incarnation = 0;
+	int32 target = -1;
+	int i;
+
+	if (fast_rejoin_control.active) {
+		cluster_reconfig_fast_rejoin_control_clear();
+		return;
+	}
+	if (event == NULL || ReconfigShmem == NULL || MyBackendType != B_LMON
+		|| cluster_online_join
+		|| !cluster_controlfile_shared_authority
+		|| event->reconfig_kind != RECONFIG_KIND_FAIL_STOP
+		|| event->observer_role != CLUSTER_RECONFIG_OBSERVER_COORDINATOR
+		|| event->event_id == 0 || event->new_epoch == 0)
+		return;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (!dead_bitmap_test_bit(ReconfigShmem->fast_rejoin_bitmap, i)
+			|| !dead_bitmap_test_bit(event->dead_bitmap, i))
+			continue;
+		if (target >= 0) {
+			LWLockRelease(&ReconfigShmem->lock);
+			return;
+		}
+		target = i;
+		prior_incarnation = ReconfigShmem->fast_rejoin_incarnation[i];
+	}
+	if (target < 0
+		|| cluster_membership_get_state(target) != CLUSTER_MEMBER_DEAD) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return;
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	if (!cluster_reconfig_get_observed_slot_coherent(
+			target, &target_incarnation, &target_generation)
+		|| target_generation == 0 || target_incarnation <= prior_incarnation
+		|| !cluster_reconfig_get_observed_fresh_alive(target))
+		return;
+	boot_incarnation = cluster_qvotec_get_self_incarnation();
+	lms_generation = cluster_lms_get_lms_restart_generation();
+	if (boot_incarnation == 0 || lms_generation == 0)
+		return;
+
+	fast_rejoin_control.active = true;
+	fast_rejoin_control.target_node_id = target;
+	fast_rejoin_control.target_incarnation = target_incarnation;
+	fast_rejoin_control.failstop_event_id = event->event_id;
+	fast_rejoin_control.failstop_epoch = event->new_epoch;
+	fast_rejoin_control.boot_incarnation = boot_incarnation;
+	fast_rejoin_control.lms_generation = lms_generation;
+}
+
+
+/* Return the exact authorized target, or -1 after fail-closed invalidation.
+ * The only legal lineage is the original FAIL_STOP (including its staged
+ * singleton Phase 1) followed by the exact singleton JOIN_PENDING. */
+static int32
+cluster_reconfig_fast_rejoin_control_snapshot(uint64 *target_incarnation_out)
+{
+	ReconfigEvent event;
+	uint64 observed_incarnation = 0;
+	uint64 observed_generation = 0;
+	ClusterMembershipState membership_state = CLUSTER_MEMBER_ABSENT;
+	bool fast_bit = false;
+	bool pending_bit = false;
+	int32 target;
+
+	if (target_incarnation_out != NULL)
+		*target_incarnation_out = 0;
+	if (!fast_rejoin_control.active)
+		return -1;
+	target = fast_rejoin_control.target_node_id;
+	if (ReconfigShmem == NULL || target < 0 || target >= CLUSTER_MAX_NODES
+		|| cluster_online_join || !cluster_controlfile_shared_authority
+		|| cluster_qvotec_get_self_incarnation()
+			   != fast_rejoin_control.boot_incarnation
+		|| cluster_lms_get_lms_restart_generation()
+			   != fast_rejoin_control.lms_generation
+		|| !cluster_reconfig_get_observed_slot_coherent(
+			target, &observed_incarnation, &observed_generation)
+		|| observed_generation == 0
+		|| observed_incarnation != fast_rejoin_control.target_incarnation
+		|| !cluster_reconfig_get_observed_fresh_alive(target))
+		goto invalid;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	event = ReconfigShmem->last_applied;
+	fast_bit = dead_bitmap_test_bit(ReconfigShmem->fast_rejoin_bitmap,
+								 target);
+	pending_bit = dead_bitmap_test_bit(ReconfigShmem->pending_join_bitmap,
+									 target);
+	membership_state = cluster_membership_get_state(target);
+	LWLockRelease(&ReconfigShmem->lock);
+	if (!fast_bit || membership_state == CLUSTER_MEMBER_REMOVED)
+		goto invalid;
+
+	if (event.reconfig_kind == RECONFIG_KIND_FAIL_STOP) {
+		if (event.event_id != fast_rejoin_control.failstop_event_id
+			|| event.new_epoch != fast_rejoin_control.failstop_epoch
+			|| !dead_bitmap_test_bit(event.dead_bitmap, target))
+			goto invalid;
+		if (pending_bit) {
+			if (!join_prepare_stage.async.has_staged_event
+				|| !rejoin_bitmap_is_exact_singleton(
+					join_prepare_stage.join_bitmap, target)
+				|| join_prepare_stage.joiner_incarnations[target]
+					   != fast_rejoin_control.target_incarnation
+				|| join_prepare_stage.event.old_epoch
+					   != fast_rejoin_control.failstop_epoch
+				|| join_prepare_stage.event.new_epoch
+					   != fast_rejoin_control.failstop_epoch + 1)
+				goto invalid;
+		} else if (membership_state != CLUSTER_MEMBER_DEAD)
+			goto invalid;
+	} else if (event.reconfig_kind == RECONFIG_KIND_JOIN_PENDING) {
+		if (!pending_bit || membership_state != CLUSTER_MEMBER_JOINING
+			|| !rejoin_bitmap_is_exact_singleton(event.join_bitmap, target)
+			|| event.old_epoch != fast_rejoin_control.failstop_epoch
+			|| event.new_epoch != fast_rejoin_control.failstop_epoch + 1)
+			goto invalid;
+	} else
+		goto invalid;
+
+	if (target_incarnation_out != NULL)
+		*target_incarnation_out = fast_rejoin_control.target_incarnation;
+	return target;
+
+invalid:
+	cluster_reconfig_fast_rejoin_control_clear();
+	return -1;
+}
+
+
+static void
+cluster_reconfig_fast_rejoin_control_finish(int32 node_id,
+										 uint64 admitted_incarnation)
+{
+	if (fast_rejoin_control.active
+		&& fast_rejoin_control.target_node_id == node_id
+		&& fast_rejoin_control.target_incarnation == admitted_incarnation)
+		cluster_reconfig_fast_rejoin_control_clear();
 }
 
 bool
@@ -2696,6 +2908,8 @@ cluster_reconfig_poll_failstop_fence_stage(void)
 										  elapsed_us);
 	if (result == CLUSTER_FENCE_MARKER_SUBMIT_ACK) {
 		cluster_reconfig_publish_event(&failstop_fence_stage.event);
+		cluster_reconfig_fast_rejoin_control_arm(
+			&failstop_fence_stage.event);
 		cluster_reconfig_log_failstop_epoch_bump(&failstop_fence_stage.event);
 		cluster_reconfig_broadcast_local_procsig();
 	} else {
@@ -3054,6 +3268,10 @@ cluster_reconfig_publish_prepared_join_commit(void)
 		cluster_membership_record_admitted(
 			join_commit_stage.node_id,
 			join_commit_stage.admitted_incarnation);
+		ReconfigShmem->fast_rejoin_incarnation[join_commit_stage.node_id]
+			= join_commit_stage.admitted_incarnation;
+		ReconfigShmem->fast_rejoin_bitmap[join_commit_stage.node_id / 8]
+			&= (uint8) ~(1u << (join_commit_stage.node_id % 8));
 		ReconfigShmem->pending_join_bitmap[join_commit_stage.node_id / 8]
 			&= (uint8) ~(1u << (join_commit_stage.node_id % 8));
 		publish = true;
@@ -3066,6 +3284,9 @@ cluster_reconfig_publish_prepared_join_commit(void)
 		pg_atomic_fetch_add_u64(&ReconfigShmem->clean_departed_cleared_count, 1);
 	cluster_reconfig_clear_clean_departed(join_commit_stage.node_id);
 	cluster_reconfig_publish_event(&join_commit_stage.event);
+	cluster_reconfig_fast_rejoin_control_finish(
+		join_commit_stage.node_id,
+		join_commit_stage.admitted_incarnation);
 	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
 	return true;
 }
@@ -3185,8 +3406,8 @@ cluster_reconfig_poll_join_commit_stage(void)
 				join_commit_stage.node_id,
 				join_commit_stage.admitted_incarnation))
 		|| !cluster_reconfig_prepare_join_commit(join_commit_stage.node_id,
-												 join_commit_stage.admitted_incarnation,
-												 join_commit_stage.async.staged_expect_epoch)) {
+											 join_commit_stage.admitted_incarnation,
+											 join_commit_stage.async.staged_expect_epoch)) {
 		pg_atomic_fetch_add_u64(&ReconfigShmem->join_reject_count, 1);
 		cluster_reconfig_release_join_commit_stage();
 		return true;
@@ -3207,7 +3428,8 @@ cluster_reconfig_poll_join_commit_stage(void)
  * whose convergence is met -> re-vet (TOCTOU, INV-J1) -> commit_member.
  */
 static void
-cluster_reconfig_drive_joins(int coordinator)
+cluster_reconfig_drive_joins(int coordinator, int32 control_target,
+							   uint64 control_incarnation)
 {
 	ClusterReconfigState *state = ReconfigShmem;
 	uint8 join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
@@ -3229,6 +3451,15 @@ cluster_reconfig_drive_joins(int coordinator)
 	n_join = cluster_reconfig_compute_join_bitmap(join_bitmap);
 	memcpy(pending_snapshot, state->pending_join_bitmap, sizeof(pending_snapshot));
 	LWLockRelease(&state->lock);
+	if (control_target >= 0) {
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			if (i == control_target)
+				continue;
+			join_bitmap[i / 8] &= (uint8) ~(1u << (i % 8));
+			pending_snapshot[i / 8] &= (uint8) ~(1u << (i % 8));
+		}
+		n_join = dead_bitmap_test_bit(join_bitmap, control_target) ? 1 : 0;
+	}
 
 	if (n_join > 0) {
 		int external_selected = -1;
@@ -3239,6 +3470,9 @@ cluster_reconfig_drive_joins(int coordinator)
 				continue;
 			(void)cluster_reconfig_get_observed_slot(i, &joiner_incarnations[i], NULL);
 		}
+		if (control_target >= 0
+			&& joiner_incarnations[control_target] != control_incarnation)
+			return;
 		/* STOP04 §11.9 F→...→P: a previously admitted/excluded origin
 		 * cannot enter JOIN_PENDING before its exact provider operation has
 		 * reached physical ON.  If present, serialize that candidate into the
@@ -3284,6 +3518,10 @@ cluster_reconfig_drive_joins(int coordinator)
 			continue;
 		if (!cluster_reconfig_get_observed_slot(i, &admitted_incarnation, &admitted_generation))
 			continue; /* no valid slot now -> wait */
+		if (control_target >= 0
+			&& (i != control_target
+				|| admitted_incarnation != control_incarnation))
+			continue;
 		/* authoritative re-vet at the commit point (TOCTOU, INV-J1): stale /
 		 * not-ready / out-of-quorum -> skip (the joiner times out -> REJECT). */
 		if (cluster_membership_vet_joiner(i, admitted_incarnation, admitted_generation)
@@ -4706,7 +4944,43 @@ cluster_reconfig_self_is_stripe_seed_candidate(void)
  *	  - neither proven yet                       -> UNDECIDED: keep the gate
  *	    closed (fail-closed); a slow qvotec waits here, it never mis-opens.
  */
-static bool joiner_gate_decided = false;
+/* Caller holds ReconfigShmem->lock LW_EXCLUSIVE and sampled_incarnation was
+ * obtained before acquiring it.  The three exact samples close both sides of
+ * the monotonic floor write: a changed or zero QVOTEC formation may raise a
+ * floor, but it never publishes MEMBER until the current formation and the
+ * stored floor are byte-for-byte equal. */
+static bool
+cluster_reconfig_publish_self_current_floor_locked(int32 self_id,
+												 uint64 sampled_incarnation)
+{
+	uint64 current_incarnation;
+
+	if (sampled_incarnation == 0)
+		return false;
+	current_incarnation = cluster_qvotec_get_self_incarnation();
+	if (current_incarnation == 0
+		|| current_incarnation != sampled_incarnation)
+		return false;
+
+	/* A steady LMON tick must not destroy the live-formation proof that phase 3
+	 * just published for the recovery-authority barrier.  The membership
+	 * mutators below already invalidate on changed bytes; retain the leading
+	 * invalidation only when this compound edge will actually change its floor
+	 * or state. */
+	if (cluster_membership_get_last_admitted_incarnation(self_id)
+			!= sampled_incarnation
+		|| cluster_membership_get_state(self_id) != CLUSTER_MEMBER_MEMBER)
+		cluster_write_fence_authority_cache_invalidate();
+	cluster_membership_record_admitted(self_id, sampled_incarnation);
+	current_incarnation = cluster_qvotec_get_self_incarnation();
+	if (current_incarnation != sampled_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(self_id)
+			   != sampled_incarnation)
+		return false;
+
+	cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
+	return true;
+}
 
 static void
 cluster_reconfig_joiner_self_tick(void)
@@ -4714,7 +4988,8 @@ cluster_reconfig_joiner_self_tick(void)
 	bool replacement_admitted;
 	uint64 now_us;
 
-	if (ReconfigShmem == NULL || !cluster_online_join)
+	if (ReconfigShmem == NULL
+		|| (!cluster_online_join && !offpath_fast_rejoin_active_local))
 		return;
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
 		return;
@@ -4779,9 +5054,13 @@ cluster_reconfig_joiner_self_tick(void)
 	 * pending via cluster_reconfig_join_in_progress).
 	 */
 	if (!joiner_gate_decided && !cluster_clean_leave_in_progress()) {
-		if (cluster_reconfig_cluster_already_running()) {
+		if (offpath_fast_rejoin_active_local
+			|| cluster_reconfig_cluster_already_running()) {
 			/* REJOINER: a running cluster exists.  Close the gate, start the
-			 * join, latch a convergence deadline (-> 53R61 on timeout). */
+			 * join, latch a convergence deadline (-> 53R61 on timeout).  A
+			 * prior-unclean shared-CF classification is already positive rejoin
+			 * evidence and may never fall back to the generic epoch-0 bootstrap
+			 * proof while the survivor's eviction bump is still in flight. */
 			joiner_gate_decided = true;
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 			cluster_write_fence_authority_cache_invalidate();
@@ -4796,6 +5075,8 @@ cluster_reconfig_joiner_self_tick(void)
 							"closed (53R60) pending admission",
 							cluster_node_id)));
 		} else if (cluster_reconfig_bootstrap_quorum_at_initial()) {
+			uint64 bootstrap_incarnation;
+
 			/*
 			 * spec-6.15 D5b: boot formation additionally requires the xid-stripe
 			 * face resolved — striping-on holds until the activation record is
@@ -4836,16 +5117,28 @@ cluster_reconfig_joiner_self_tick(void)
 				return;
 			}
 
-			/* BOOTSTRAP proven: quorum of declared nodes CSSD-alive at INITIAL.
-			 * Open the gate (boot formation is not gated) and latch so a later
-			 * epoch advance does not re-close this genuine member (INV-J14). */
-			joiner_gate_decided = true;
+			/* BOOTSTRAP proven: establish the exact current-formation admitted
+			 * floor before MEMBER or the shared write byte becomes visible.  A
+			 * zero/drifting incarnation keeps this decision retryable. */
+			bootstrap_incarnation = cluster_qvotec_get_self_incarnation();
 			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-			cluster_write_fence_authority_cache_invalidate();
-			ReconfigShmem->self_join_admitted = 1;
+			if (!cluster_reconfig_publish_self_current_floor_locked(
+					cluster_node_id, bootstrap_incarnation)) {
+				cluster_write_fence_authority_cache_invalidate();
+				ReconfigShmem->self_join_admitted = 0;
+				ReconfigShmem->self_join_failed = 0;
+				ReconfigShmem->self_join_deadline_us = 0;
+				cluster_membership_set_state(cluster_node_id,
+									 CLUSTER_MEMBER_JOINING);
+				LWLockRelease(&ReconfigShmem->lock);
+				return;
+			}
 			ReconfigShmem->self_join_failed = 0;
 			ReconfigShmem->self_join_deadline_us = 0;
-			cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
+			/* MEMBER is already visible with an equal floor.  Only now may the
+			 * write gate and process-local decision latch open. */
+			ReconfigShmem->self_join_admitted = 1;
+			joiner_gate_decided = true;
 			LWLockRelease(&ReconfigShmem->lock);
 			ereport(LOG,
 					(errmsg("cluster membership: node %d cold-bootstrap membership formation — "
@@ -4924,8 +5217,23 @@ cluster_reconfig_offpath_rejoin_tick(void)
 		return; /* off path only */
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
 		return;
-	if (offpath_decided_local)
+	if (offpath_decided_local) {
+		/* The approved shared-CF fast-rejoin ends only after the durable
+		 * admission callback opened the existing gate and every survivor's
+		 * existing JOIN re-declare barrier is complete.  Until both are true,
+		 * the epoch-independent boot barrier remains the read fence. */
+		if (offpath_fast_rejoin_active_local
+			&& ReconfigShmem->self_join_admitted
+			&& cluster_grd_join_view_rebuilt()) {
+			cluster_grd_set_offpath_boot_decided();
+			offpath_fast_rejoin_active_local = false;
+			ereport(LOG,
+					(errmsg("cluster membership: node %d shared-CF fast-rejoin "
+							"admission and re-declare complete — boot fence lifted",
+							cluster_node_id)));
+		}
 		return; /* once per incarnation (LMON-local) */
+	}
 	if (cluster_reconfig_is_removed_unlocked(cluster_node_id))
 		return; /* a removed node keeps its 53R64 self-demote gate */
 
@@ -4977,6 +5285,8 @@ cluster_reconfig_offpath_rejoin_tick(void)
 		 * read fence for this incarnation.  offpath_decided_local latches the
 		 * tick so it does not re-arm / re-log every cycle. */
 		cluster_grd_inc_offpath_crash_rejoin_fenced();
+		if (cluster_controlfile_shared_authority)
+			offpath_fast_rejoin_active_local = true;
 		offpath_decided_local = true;
 
 		ereport(LOG,
@@ -5033,17 +5343,41 @@ cluster_reconfig_lmon_tick(void)
 	bool failstop_stage_handled = false;
 	bool failure_generation_changed = false;
 	bool external_rejoin_active;
+	bool ordinary_actions_allowed;
+	bool offpath_fast_rejoin_actions;
+	bool fast_rejoin_control_actions;
+	bool runtime_join_allowed;
+	bool self_floor_authority = false;
+	uint64 self_floor_incarnation = 0;
 	int32 root_gated_join_node = -1;
 	uint64 root_gated_join_incarnation = 0;
+	uint64 fast_rejoin_control_incarnation = 0;
+	int32 fast_rejoin_control_target = -1;
 
 	/* L20: runtime feature flag check first line. */
 	if (!cluster_enabled) {
+		cluster_reconfig_fast_rejoin_control_clear();
 		cluster_reconfig_external_rejoin_release_all();
 		if (join_commit_stage.external_rejoin_consumed)
 			cluster_reconfig_release_join_commit_stage();
 		return;
 	}
-	external_rejoin_active = cluster_external_fence_runtime_active();
+	/* Scheme A: membership/quorum formation and fail-stop authority recovery
+	 * remain live before OPEN, but runtime replacement/readmission is serving
+	 * work.  A cluster that entered the managed startup lifecycle may not drive
+	 * those actions from STARTING or RECOVERY_AUTHORITY_READY. */
+	ordinary_actions_allowed
+		= !cluster_authority_readiness_managed()
+		  || cluster_authority_serving_rebind_lmon();
+	offpath_fast_rejoin_actions
+		= cluster_reconfig_fast_rejoin_actions_snapshot();
+	fast_rejoin_control_target
+		= cluster_reconfig_fast_rejoin_control_snapshot(
+			&fast_rejoin_control_incarnation);
+	fast_rejoin_control_actions = fast_rejoin_control_target >= 0;
+	runtime_join_allowed = cluster_online_join || offpath_fast_rejoin_actions;
+	external_rejoin_active
+		= ordinary_actions_allowed && cluster_external_fence_runtime_active();
 	if (!external_rejoin_active) {
 		cluster_reconfig_external_rejoin_release_all();
 		if (join_commit_stage.external_rejoin_consumed)
@@ -5059,6 +5393,7 @@ cluster_reconfig_lmon_tick(void)
 
 	/* I2 + I8: only in_quorum nodes participate in reconfig. */
 	if (!cluster_qvotec_in_quorum()) {
+		cluster_reconfig_fast_rejoin_control_clear();
 		cluster_reconfig_external_rejoin_release_all();
 		if (join_commit_stage.external_rejoin_consumed)
 			cluster_reconfig_release_join_commit_stage();
@@ -5067,12 +5402,15 @@ cluster_reconfig_lmon_tick(void)
 
 	self_id = cluster_node_id;
 	if (self_id < 0 || self_id >= CLUSTER_MAX_NODES) {
+		cluster_reconfig_fast_rejoin_control_clear();
 		cluster_reconfig_external_rejoin_release_all();
 		return; /* defensive: bad self id, cannot participate */
 	}
-	cluster_reconfig_lmon_replacement_closed_tick();
-	cluster_reconfig_lmon_replacement_ready_tick();
-	cluster_reconfig_lmon_replacement_admit_tick();
+	if (ordinary_actions_allowed) {
+		cluster_reconfig_lmon_replacement_closed_tick();
+		cluster_reconfig_lmon_replacement_ready_tick();
+		cluster_reconfig_lmon_replacement_admit_tick();
+	}
 	failstop_stage_handled = cluster_reconfig_poll_failstop_fence_stage();
 
 	/*
@@ -5082,6 +5420,7 @@ cluster_reconfig_lmon_tick(void)
 	 * survivor-set build below run under the reconfig lock.
 	 */
 	if (cluster_conf_lookup_node(self_id) == NULL) {
+		cluster_reconfig_fast_rejoin_control_clear();
 		cluster_reconfig_external_rejoin_release_all();
 		return; /* self un-declared — must not be coordinator */
 	}
@@ -5113,6 +5452,16 @@ cluster_reconfig_lmon_tick(void)
 	 */
 	cluster_reconfig_offpath_rejoin_tick();
 
+	/* Sample the candidate formation before the membership lock.  Online join
+	 * reaches this choke only after its separate admission edge opened the byte;
+	 * config-off additionally needs Shape-A's positive boot decision because the
+	 * shmem default byte is not authority by itself. */
+	self_floor_authority
+		= cluster_online_join || offpath_fast_rejoin_active_local
+		  || cluster_grd_offpath_boot_decided();
+	if (self_floor_authority)
+		self_floor_incarnation = cluster_qvotec_get_self_incarnation();
+
 	/*
 	 * Frozen STOP-02 §17.6: survivor-side observation of a durable COMMITTED
 	 * JCMK is not by itself authority to clear an excluded origin.  Select one
@@ -5121,7 +5470,8 @@ cluster_reconfig_lmon_tick(void)
 	 * exclusive mutation below revalidates the exact incarnation before use.
 	 * Serializing one origin per tick also preserves the one-bit JOIN clear rule.
 	 */
-	if (ReconfigShmem != NULL && cluster_online_join) {
+	if (ordinary_actions_allowed && ReconfigShmem != NULL
+		&& runtime_join_allowed) {
 		uint64 candidate_incarnation = 0;
 
 		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
@@ -5203,13 +5553,23 @@ cluster_reconfig_lmon_tick(void)
 		else if (cluster_reconfig_is_local_admitted_replacement(
 				 &ReconfigShmem->replacement_episode))
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
-		else if (ReconfigShmem->self_join_admitted && !ReconfigShmem->self_join_failed)
-			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
+		else if (ReconfigShmem->self_join_admitted
+				 && !ReconfigShmem->self_join_failed
+				 && (cluster_online_join
+					 || (self_floor_authority
+						 && cluster_grd_offpath_boot_decided()))
+				 && cluster_reconfig_publish_self_current_floor_locked(
+					 self_id, self_floor_incarnation)) {
+			/* Exact helper already published MEMBER. */
+		}
 		else
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_JOINING);
 
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 			ClusterMembershipState ms;
+			uint64 observed_incarnation = 0;
+			uint64 observed_generation = 0;
+			uint64 prior_incarnation;
 
 			if (i == self_id)
 				continue;
@@ -5217,6 +5577,49 @@ cluster_reconfig_lmon_tick(void)
 				continue;
 
 			ms = cluster_membership_get_state(i);
+			prior_incarnation = ReconfigShmem->fast_rejoin_incarnation[i];
+			if (!cluster_online_join && cluster_controlfile_shared_authority
+				&& ms == CLUSTER_MEMBER_MEMBER
+				&& prior_incarnation == 0
+				&& cluster_reconfig_get_observed_fresh_alive(i)
+				&& cluster_reconfig_get_observed_slot(
+					i, &observed_incarnation, &observed_generation)
+				&& observed_incarnation > 0) {
+				/* A stale provisioning slot is not identity authority.  The first
+				 * fresh-alive slot seen for an already-formed peer establishes the
+				 * volatile rollover baseline; only a later larger value is a
+				 * rollover.  Do not mutate the admitted serving formation here. */
+				ReconfigShmem->fast_rejoin_incarnation[i] = observed_incarnation;
+				prior_incarnation = observed_incarnation;
+			}
+
+			/* P04 fast restart can replace a process inside CSSD's deadband, so
+			 * liveness never presents a DEAD edge.  Under verified shared-CF
+			 * authority, a CRC-checked slot incarnation strictly above an existing
+			 * MEMBER floor is the missing eviction edge: exclude the prior
+			 * incarnation first, then let the unchanged join protocol admit the
+			 * newer one.  A zero floor is bootstrap, never rollover evidence. */
+			if (!cluster_online_join && cluster_controlfile_shared_authority
+				&& ms == CLUSTER_MEMBER_MEMBER
+				&& prior_incarnation > 0
+				&& cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_ALIVE
+				&& cluster_reconfig_get_observed_fresh_alive(i)
+				&& cluster_reconfig_get_observed_slot(
+					i, &observed_incarnation, &observed_generation)
+				&& observed_incarnation > prior_incarnation) {
+				if (!dead_bitmap_test_bit(ReconfigShmem->fast_rejoin_bitmap, i))
+					ereport(LOG,
+							(errmsg("cluster membership: shared-CF fast-rejoin "
+									"evicting prior incarnation of node %d "
+									"(%llu -> %llu)",
+									i,
+									(unsigned long long)prior_incarnation,
+									(unsigned long long)observed_incarnation)));
+				dead_bitmap_set_bit(ReconfigShmem->fast_rejoin_bitmap, i);
+				dead_bitmap_set_bit(dead_bitmap, i);
+				offpath_fast_rejoin_actions = true;
+				runtime_join_allowed = true;
+			}
 			/*
 			 * spec-5.18 INV-LF1 (P0): REMOVED is TERMINAL.  This loop reads the RAW
 			 * CSSD dead set (the removed mask is applied later, below), so a
@@ -5230,9 +5633,10 @@ cluster_reconfig_lmon_tick(void)
 				continue;
 			if (dead_bitmap_test_bit(dead_bitmap, i))
 				cluster_membership_set_state(i, CLUSTER_MEMBER_DEAD);
-			else if (ms == CLUSTER_MEMBER_ABSENT)
+			else if (ms == CLUSTER_MEMBER_ABSENT) {
 				cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
-			else if (cluster_online_join && i == root_gated_join_node
+			}
+			else if (runtime_join_allowed && i == root_gated_join_node
 					 && ms == CLUSTER_MEMBER_DEAD
 					 && cluster_cssd_get_peer_state(i) == CLUSTER_CSSD_PEER_ALIVE) {
 				/*
@@ -5253,6 +5657,9 @@ cluster_reconfig_lmon_tick(void)
 					&& obs_inc > cluster_membership_get_last_admitted_incarnation(i)) {
 					cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
 					cluster_membership_record_admitted(i, obs_inc);
+					ReconfigShmem->fast_rejoin_incarnation[i] = obs_inc;
+					ReconfigShmem->fast_rejoin_bitmap[i / 8]
+						&= (uint8) ~(1u << (i % 8));
 					dead_bitmap_set_bit(newly_joined, i);
 					any_joined = true;
 				}
@@ -5435,11 +5842,19 @@ cluster_reconfig_lmon_tick(void)
 	 * retry next tick once the leave finishes; the leave side symmetrically refuses
 	 * to start while a join is pending.
 	 */
-	if (cluster_online_join && self_id == coordinator &&
-		!cluster_clean_leave_in_progress()) {
+	if (runtime_join_allowed
+		&& (ordinary_actions_allowed
+			|| fast_rejoin_control_actions)
+		&& self_id == coordinator &&
+		!cluster_clean_leave_in_progress()
+		&& (cluster_online_join
+			|| (dead_bitmap_is_zero(new_failure_bitmap)
+				&& !failure_generation_changed))) {
 		if (external_rejoin_active)
 			cluster_reconfig_external_rejoin_tick();
-		cluster_reconfig_drive_joins(coordinator);
+		cluster_reconfig_drive_joins(coordinator,
+			fast_rejoin_control_actions ? fast_rejoin_control_target : -1,
+			fast_rejoin_control_actions ? fast_rejoin_control_incarnation : 0);
 	} else {
 		cluster_reconfig_external_rejoin_release_all();
 		if (join_commit_stage.external_rejoin_consumed)
@@ -5656,6 +6071,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 			}
 
 			cluster_reconfig_publish_event(&evt);
+			cluster_reconfig_fast_rejoin_control_arm(&evt);
 			cluster_reconfig_log_failstop_epoch_bump(&evt);
 			cluster_reconfig_set_prebump_sync_active(0);
 			return;
@@ -5674,6 +6090,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	}
 
 	cluster_reconfig_publish_event(&evt);
+	cluster_reconfig_fast_rejoin_control_arm(&evt);
 
 	/*
 	 * PGRAC: spec-6.14 D9 amend (F5) — unconditional operator evidence for a

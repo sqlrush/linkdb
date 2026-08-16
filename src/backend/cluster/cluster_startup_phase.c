@@ -55,20 +55,27 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_elog.h"	/* cluster_phase legacy mirror (HC2) */
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cssd.h"	/* cluster_cssd_start / wait_for_ready (2.5 Sprint A) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_start / wait_for_ready (spec-2.6 Step 3 D8) */
 #include "cluster/cluster_diag.h"	/* cluster_diag_start / wait_for_ready (1.13 Sprint A) */
 #include "cluster/cluster_guc.h"	/* cluster_phase{1..4}_timeout (D2 F2) */
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_stats.h"	/* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT */
 #include "cluster/cluster_lck.h"	/* cluster_lck_start / wait_for_ready (1.12 Sprint A) */
 #include "cluster/cluster_lms.h"	/* cluster_lms_start / wait_for_ready (spec-2.18 Sprint A) */
 #include "cluster/cluster_lmon.h"	/* cluster_lmon_start / wait_for_ready (1.11 Sprint A) */
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_recovery_duty.h" /* live formation witness (RF-ROOT P6) */
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_scn.h"	/* SCN_NODE_ID_VALID (spec-1.16 D13) */
 #include "cluster/cluster_shmem.h"	/* cluster_shmem_register_region */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_state.h"	 /* spec-4.2 publish_active (phase->RUNNING) */
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D6 rejoin self-fence gate (Q5=C) */
+#include "storage/proc.h"
 
 
 /*
@@ -107,6 +114,24 @@ static const char *const cluster_phase_strings[] = {
  */
 static ClusterPhaseSharedState *cluster_phase_state = NULL;
 
+static bool
+cluster_phase_state_lock_acquire(LWLockMode mode)
+{
+	if (MyProc == NULL)
+		return LWLockConditionalAcquire(&cluster_phase_state->lwlock, mode);
+	LWLockAcquire(&cluster_phase_state->lwlock, mode);
+	return true;
+}
+
+typedef struct ClusterAuthorityBindingLocal {
+	ClusterAuthorityReadiness state;
+	uint16 origin_thread;
+	uint64 boot_incarnation;
+	uint64 lms_generation;
+	ClusterFenceAuthorityProof authority;
+	ClusterFormationSnapshotV1 formation;
+} ClusterAuthorityBindingLocal;
+
 
 /* ============================================================
  * Public accessors (read-only; callable from any backend)
@@ -129,10 +154,531 @@ cluster_current_phase(void)
 	if (cluster_phase_state == NULL)
 		return CLUSTER_PHASE_PRE_INIT;
 
-	LWLockAcquire(&cluster_phase_state->lwlock, LW_SHARED);
+	if (!cluster_phase_state_lock_acquire(LW_SHARED))
+		return CLUSTER_PHASE_PRE_INIT;
 	result = cluster_phase_state->current_phase;
 	LWLockRelease(&cluster_phase_state->lwlock);
 	return result;
+}
+
+ClusterAuthorityReadiness
+cluster_authority_readiness_get(void)
+{
+	ClusterAuthorityReadiness result = CLUSTER_AUTHORITY_OFF;
+
+	if (cluster_phase_state == NULL)
+		return result;
+	if (!cluster_phase_state_lock_acquire(LW_SHARED))
+		return result;
+	result = cluster_phase_state->authority_readiness;
+	LWLockRelease(&cluster_phase_state->lwlock);
+	return result;
+}
+
+bool
+cluster_authority_readiness_managed(void)
+{
+	bool managed = false;
+
+	if (cluster_phase_state == NULL)
+		return false;
+	if (!cluster_phase_state_lock_acquire(LW_SHARED))
+		return false;
+	managed = cluster_phase_state->authority_managed;
+	LWLockRelease(&cluster_phase_state->lwlock);
+	return managed;
+}
+
+static bool
+cluster_authority_binding_copy(ClusterAuthorityBindingLocal *out)
+{
+	if (cluster_phase_state == NULL || out == NULL)
+		return false;
+	if (!cluster_phase_state_lock_acquire(LW_SHARED))
+		return false;
+	if (!cluster_phase_state->authority_managed
+		|| cluster_phase_state->authority_readiness == CLUSTER_AUTHORITY_OFF) {
+		LWLockRelease(&cluster_phase_state->lwlock);
+		return false;
+	}
+	out->state = cluster_phase_state->authority_readiness;
+	out->origin_thread = cluster_phase_state->authority_origin_thread;
+	out->boot_incarnation = cluster_phase_state->authority_boot_incarnation;
+	out->lms_generation = cluster_phase_state->authority_lms_generation;
+	out->authority = cluster_phase_state->authority_fence;
+	out->formation = cluster_phase_state->authority_formation;
+	LWLockRelease(&cluster_phase_state->lwlock);
+	return true;
+}
+
+static void
+cluster_authority_clear_matching(const ClusterAuthorityBindingLocal *binding)
+{
+	if (cluster_phase_state == NULL || binding == NULL)
+		return;
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+		return;
+	if (cluster_phase_state->authority_readiness == binding->state
+		&& cluster_phase_state->authority_boot_incarnation
+			   == binding->boot_incarnation
+		&& cluster_phase_state->authority_lms_generation
+			   == binding->lms_generation) {
+		cluster_phase_state->authority_readiness = CLUSTER_AUTHORITY_OFF;
+		/* Managed is a boot-lifetime fail-closed latch.  Losing a bound
+		 * generation invalidates readiness; it must never reactivate the
+		 * legacy one-dimensional LMS/native fallback in the same postmaster. */
+		cluster_phase_state->authority_origin_thread = 0;
+		cluster_phase_state->authority_boot_incarnation = 0;
+		cluster_phase_state->authority_lms_generation = 0;
+		memset(&cluster_phase_state->authority_fence, 0,
+			   sizeof(cluster_phase_state->authority_fence));
+		memset(&cluster_phase_state->authority_formation, 0,
+			   sizeof(cluster_phase_state->authority_formation));
+	}
+	LWLockRelease(&cluster_phase_state->lwlock);
+}
+
+void
+cluster_authority_readiness_clear(void)
+{
+	if (cluster_phase_state == NULL)
+		return;
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+		return;
+	cluster_phase_state->authority_readiness = CLUSTER_AUTHORITY_OFF;
+	/* Preserve authority_managed once set; shmem reinitialization is the only
+	 * transition back to an unmanaged boot. */
+	cluster_phase_state->authority_origin_thread = 0;
+	cluster_phase_state->authority_boot_incarnation = 0;
+	cluster_phase_state->authority_lms_generation = 0;
+	memset(&cluster_phase_state->authority_fence, 0,
+		   sizeof(cluster_phase_state->authority_fence));
+	memset(&cluster_phase_state->authority_formation, 0,
+		   sizeof(cluster_phase_state->authority_formation));
+	LWLockRelease(&cluster_phase_state->lwlock);
+}
+
+static bool
+cluster_authority_binding_preseal_current(
+	const ClusterAuthorityBindingLocal *binding)
+{
+	return binding != NULL && binding->boot_incarnation != 0
+		&& binding->lms_generation != 0
+		&& cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+		&& cluster_cssd_get_status() == CLUSTER_CSSD_READY
+		&& cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY
+		&& cluster_qvotec_in_quorum()
+		&& cluster_qvotec_get_self_incarnation() == binding->boot_incarnation
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   == binding->boot_incarnation
+		&& cluster_lms_get_lms_restart_generation() == binding->lms_generation
+		&& cluster_lms_is_recovery_ready()
+		&& cluster_formation_classification_revalidate_nowait(
+			   binding->origin_thread, &binding->authority,
+			   &binding->formation) == CLUSTER_FORMATION_WITNESS_READY;
+}
+
+/* A sealed serving generation must continue to match the live formation, but
+ * must not consume the finite IR-held recovery-duty fence cache.  The GRD seal,
+ * QVOTEC incarnation and LMS generation are checked by the caller. */
+static bool
+cluster_serving_formation_current(const ClusterAuthorityBindingLocal *binding)
+{
+	ClusterFormationSnapshotV1 current;
+
+	return binding != NULL
+		&& cluster_reconfig_capture_formation_snapshot_v1(
+			   binding->origin_thread, &current)
+		&& memcmp(&current, &binding->formation, sizeof(current)) == 0;
+}
+
+/* The formation and GRD seal may be replaced only by LMON after the ordinary
+ * reconfig barrier closes.  Keep the boot/LMS binding while that recoverable
+ * mismatch is fenced, but never retain it across a real generation loss. */
+static bool
+cluster_serving_generation_current(const ClusterAuthorityBindingLocal *binding)
+{
+	ClusterStartupPhase phase = cluster_current_phase();
+
+	return binding != NULL
+		&& binding->state == CLUSTER_AUTHORITY_SERVING_READY
+		&& binding->boot_incarnation != 0
+		&& binding->lms_generation != 0
+		&& phase >= CLUSTER_PHASE_4_NORMAL && phase < CLUSTER_PHASE_SHUTDOWN
+		&& cluster_cssd_get_status() == CLUSTER_CSSD_READY
+		&& cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY
+		&& cluster_qvotec_in_quorum()
+		&& cluster_qvotec_get_self_incarnation() == binding->boot_incarnation
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   == binding->boot_incarnation
+		&& cluster_lms_get_lms_restart_generation() == binding->lms_generation
+		&& cluster_lms_is_ready();
+}
+
+static bool
+cluster_authority_binding_external_current(
+	const ClusterAuthorityBindingLocal *binding, bool serving)
+{
+	ClusterStartupPhase phase = cluster_current_phase();
+
+	if (binding == NULL || binding->boot_incarnation == 0
+		|| binding->lms_generation == 0
+		|| cluster_cssd_get_status() != CLUSTER_CSSD_READY
+		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
+		|| !cluster_qvotec_in_quorum()
+		|| cluster_qvotec_get_self_incarnation() != binding->boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   != binding->boot_incarnation
+		|| cluster_lms_get_lms_restart_generation() != binding->lms_generation
+		|| (serving
+				? !cluster_serving_formation_current(binding)
+				: cluster_formation_classification_revalidate_nowait(
+					  binding->origin_thread, &binding->authority,
+					  &binding->formation)
+					  != CLUSTER_FORMATION_WITNESS_READY)
+		|| !cluster_grd_recovery_authority_is_current(
+			   binding->boot_incarnation, binding->lms_generation))
+		return false;
+	if (serving)
+		return binding->state == CLUSTER_AUTHORITY_SERVING_READY
+			&& phase >= CLUSTER_PHASE_4_NORMAL && phase < CLUSTER_PHASE_SHUTDOWN
+			&& cluster_lms_is_ready();
+	return binding->state == CLUSTER_AUTHORITY_RECOVERY_READY
+		&& phase == CLUSTER_PHASE_3_RECOVERY
+		&& cluster_lms_is_recovery_ready();
+}
+
+bool
+cluster_authority_readiness_begin(
+	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
+	const ClusterFormationSnapshotV1 *formation)
+{
+	uint64 boot_incarnation;
+	int32 origin_node;
+
+	if (cluster_phase_state == NULL || authority == NULL || formation == NULL
+		|| origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
+		|| cluster_current_phase() != CLUSTER_PHASE_3_RECOVERY)
+		return false;
+	origin_node = (int32)origin_thread - 1;
+	boot_incarnation = cluster_qvotec_get_self_incarnation();
+	if (origin_node != cluster_node_id || boot_incarnation == 0
+		|| formation->membership.membership_state[origin_node]
+			   != CLUSTER_MEMBER_MEMBER
+		|| formation->membership.last_admitted_incarnation[origin_node]
+			   != boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(origin_node)
+			   != boot_incarnation
+		|| cluster_formation_classification_revalidate_nowait(
+			   origin_thread, authority, formation) != CLUSTER_FORMATION_WITNESS_READY)
+		return false;
+
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+		return false;
+	if (cluster_phase_state->authority_readiness != CLUSTER_AUTHORITY_OFF) {
+		LWLockRelease(&cluster_phase_state->lwlock);
+		return false;
+	}
+	cluster_phase_state->authority_managed = true;
+	cluster_phase_state->authority_readiness = CLUSTER_AUTHORITY_STARTING;
+	cluster_phase_state->authority_origin_thread = origin_thread;
+	cluster_phase_state->authority_boot_incarnation = boot_incarnation;
+	cluster_phase_state->authority_lms_generation = 0;
+	cluster_phase_state->authority_fence = *authority;
+	cluster_phase_state->authority_formation = *formation;
+	LWLockRelease(&cluster_phase_state->lwlock);
+	return true;
+}
+
+bool
+cluster_authority_readiness_bind_recovery_generation(uint64 lms_generation)
+{
+	ClusterAuthorityBindingLocal binding;
+	bool valid;
+
+	if (cluster_phase_state == NULL || lms_generation == 0)
+		return false;
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+		return false;
+	if (!cluster_phase_state->authority_managed
+		|| cluster_phase_state->authority_readiness
+			   != CLUSTER_AUTHORITY_STARTING
+		|| cluster_phase_state->current_phase != CLUSTER_PHASE_3_RECOVERY
+		|| (cluster_phase_state->authority_lms_generation != 0
+			&& cluster_phase_state->authority_lms_generation
+				   != lms_generation)) {
+		LWLockRelease(&cluster_phase_state->lwlock);
+		return false;
+	}
+	cluster_phase_state->authority_lms_generation = lms_generation;
+	LWLockRelease(&cluster_phase_state->lwlock);
+
+	if (!cluster_authority_binding_copy(&binding))
+		return false;
+	valid = binding.state == CLUSTER_AUTHORITY_STARTING
+		&& cluster_authority_binding_preseal_current(&binding);
+	if (!valid && cluster_authority_binding_copy(&binding))
+		cluster_authority_clear_matching(&binding);
+	return valid;
+}
+
+bool
+cluster_authority_readiness_publish_recovery(uint64 lms_generation)
+{
+	ClusterAuthorityBindingLocal binding;
+	bool valid;
+
+	if (cluster_phase_state == NULL || lms_generation == 0)
+		return false;
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+		return false;
+	if (!cluster_phase_state->authority_managed
+		|| cluster_phase_state->authority_readiness
+			   != CLUSTER_AUTHORITY_STARTING
+		|| cluster_phase_state->current_phase != CLUSTER_PHASE_3_RECOVERY) {
+		LWLockRelease(&cluster_phase_state->lwlock);
+		return false;
+	}
+	if (cluster_phase_state->authority_lms_generation != lms_generation) {
+		LWLockRelease(&cluster_phase_state->lwlock);
+		return false;
+	}
+	LWLockRelease(&cluster_phase_state->lwlock);
+
+	/* STARTING uses the same external proof, with the state transition checked
+	 * below instead of the steady recovery predicate. */
+	if (!cluster_authority_binding_copy(&binding))
+		return false;
+	valid = binding.state == CLUSTER_AUTHORITY_STARTING
+		&& cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+		&& cluster_cssd_get_status() == CLUSTER_CSSD_READY
+		&& cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY
+		&& cluster_qvotec_in_quorum()
+		&& cluster_qvotec_get_self_incarnation() == binding.boot_incarnation
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   == binding.boot_incarnation
+		&& cluster_lms_get_lms_restart_generation() == lms_generation
+		&& cluster_lms_is_recovery_ready()
+		&& cluster_formation_classification_revalidate_nowait(
+			   binding.origin_thread, &binding.authority,
+			   &binding.formation) == CLUSTER_FORMATION_WITNESS_READY
+		&& cluster_grd_recovery_authority_is_current(
+			   binding.boot_incarnation, lms_generation);
+	if (!valid) {
+		cluster_authority_clear_matching(&binding);
+		return false;
+	}
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+		return false;
+	if (cluster_phase_state->authority_readiness == CLUSTER_AUTHORITY_STARTING
+		&& cluster_phase_state->authority_lms_generation == lms_generation)
+		cluster_phase_state->authority_readiness
+			= CLUSTER_AUTHORITY_RECOVERY_READY;
+	else
+		valid = false;
+	LWLockRelease(&cluster_phase_state->lwlock);
+	return valid;
+}
+
+bool
+cluster_recovery_transport_is_current(void)
+{
+	ClusterAuthorityBindingLocal binding;
+	bool current;
+
+	if (!cluster_authority_binding_copy(&binding))
+		return false;
+	if (binding.state == CLUSTER_AUTHORITY_RECOVERY_READY)
+		return cluster_recovery_authority_is_current();
+	if (binding.state != CLUSTER_AUTHORITY_STARTING)
+		return false;
+	current = cluster_authority_binding_preseal_current(&binding);
+	if (!current)
+		cluster_authority_clear_matching(&binding);
+	return current;
+}
+
+bool
+cluster_recovery_authority_is_current(void)
+{
+	ClusterAuthorityBindingLocal binding;
+	bool current;
+
+	if (!cluster_authority_binding_copy(&binding))
+		return false;
+	if (binding.state != CLUSTER_AUTHORITY_RECOVERY_READY)
+		return false;
+	current = cluster_authority_binding_external_current(&binding, false);
+	if (!current)
+		cluster_authority_clear_matching(&binding);
+	return current;
+}
+
+bool
+cluster_authority_readiness_publish_serving(void)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterFormationWitnessResult formation_result;
+	bool cssd_ready;
+	bool qvotec_ready;
+	bool in_quorum;
+	bool lms_ready;
+	bool grd_current;
+	uint64 self_incarnation;
+	uint64 admitted_incarnation;
+	uint64 lms_generation;
+	bool valid;
+
+	if (!cluster_authority_binding_copy(&binding)
+		|| binding.state != CLUSTER_AUTHORITY_RECOVERY_READY
+		|| cluster_current_phase() != CLUSTER_PHASE_4_NORMAL)
+		return false;
+	/* Validate every generation component while service is still unpublished. */
+	cssd_ready = cluster_cssd_get_status() == CLUSTER_CSSD_READY;
+	qvotec_ready = cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY;
+	in_quorum = cluster_qvotec_in_quorum();
+	self_incarnation = cluster_qvotec_get_self_incarnation();
+	admitted_incarnation
+		= cluster_membership_get_last_admitted_incarnation(cluster_node_id);
+	lms_generation = cluster_lms_get_lms_restart_generation();
+	lms_ready = cluster_lms_is_ready();
+	formation_result = cluster_formation_classification_revalidate_nowait(
+		binding.origin_thread, &binding.authority, &binding.formation);
+	grd_current = cluster_grd_recovery_authority_is_current(
+		binding.boot_incarnation, binding.lms_generation);
+	valid = cssd_ready && qvotec_ready && in_quorum
+		&& self_incarnation == binding.boot_incarnation
+		&& admitted_incarnation == binding.boot_incarnation
+		&& lms_generation == binding.lms_generation && lms_ready
+		&& formation_result == CLUSTER_FORMATION_WITNESS_READY
+		&& grd_current;
+	if (!valid) {
+		ereport(LOG,
+				(errmsg("cluster phase 4: serving authority diagnostic"),
+				 errdetail("cssd_ready=%d qvotec_ready=%d in_quorum=%d "
+						   "self_incarnation=%llu/%llu admitted_incarnation=%llu "
+						   "lms_generation=%llu/%llu lms_ready=%d formation_result=%d "
+						   "grd_current=%d",
+						   cssd_ready, qvotec_ready, in_quorum,
+						   (unsigned long long)self_incarnation,
+						   (unsigned long long)binding.boot_incarnation,
+						   (unsigned long long)admitted_incarnation,
+						   (unsigned long long)lms_generation,
+						   (unsigned long long)binding.lms_generation,
+						   lms_ready, (int)formation_result, grd_current)));
+		cluster_authority_clear_matching(&binding);
+		return false;
+	}
+	LWLockAcquire(&cluster_phase_state->lwlock, LW_EXCLUSIVE);
+	if (cluster_phase_state->authority_readiness
+			== CLUSTER_AUTHORITY_RECOVERY_READY
+		&& cluster_phase_state->authority_lms_generation
+			   == binding.lms_generation)
+		cluster_phase_state->authority_readiness = CLUSTER_AUTHORITY_SERVING_READY;
+	else
+		valid = false;
+	LWLockRelease(&cluster_phase_state->lwlock);
+	return valid;
+}
+
+bool
+cluster_serving_ready_is_current(void)
+{
+	ClusterAuthorityBindingLocal binding;
+	bool current;
+
+	if (!cluster_authority_binding_copy(&binding))
+		return false;
+	if (binding.state != CLUSTER_AUTHORITY_SERVING_READY)
+		return false;
+	current = cluster_authority_binding_external_current(&binding, true);
+	/* A current boot/LMS generation whose formation moved stays unavailable,
+	 * but keeps its immutable binding so the survivor LMON can replace it only
+	 * after the existing GRD recovery/re-declare barrier closes.  Every data-
+	 * plane caller still observes false during that interval.  A same-formation
+	 * GRD loss is not a reconfig transition and remains terminal for this boot. */
+	if (!current
+		&& (!cluster_serving_generation_current(&binding)
+			|| cluster_serving_formation_current(&binding)))
+		cluster_authority_clear_matching(&binding);
+	return current;
+}
+
+bool
+cluster_authority_serving_rebind_lmon(void)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterFormationSnapshotV1 current;
+	ClusterFormationSnapshotV1 verify;
+	bool rebound = false;
+
+	if (!cluster_authority_binding_copy(&binding)
+		|| binding.state != CLUSTER_AUTHORITY_SERVING_READY)
+		return false;
+	if (cluster_authority_binding_external_current(&binding, true))
+		return true;
+	if (!cluster_serving_generation_current(&binding)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(
+			   binding.origin_thread, &current)
+		|| memcmp(&current, &binding.formation, sizeof(current)) == 0)
+		return false;
+
+	/* The GRD helper accepts only the exact event already closed by the ordinary
+	 * LMON P0-P7 recovery driver; it does not start a second barrier. */
+	if (!cluster_grd_serving_authority_rebind_lmon(
+			&current, binding.boot_incarnation, binding.lms_generation)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(
+			   binding.origin_thread, &verify)
+		|| memcmp(&current, &verify, sizeof(current)) != 0)
+		return false;
+
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+		return false;
+	if (cluster_phase_state->authority_readiness
+			== CLUSTER_AUTHORITY_SERVING_READY
+		&& cluster_phase_state->authority_origin_thread
+			   == binding.origin_thread
+		&& cluster_phase_state->authority_boot_incarnation
+			   == binding.boot_incarnation
+		&& cluster_phase_state->authority_lms_generation
+			   == binding.lms_generation
+		&& memcmp(&cluster_phase_state->authority_formation,
+				  &binding.formation, sizeof(binding.formation)) == 0) {
+		cluster_phase_state->authority_formation = current;
+		rebound = true;
+	}
+	LWLockRelease(&cluster_phase_state->lwlock);
+
+	return rebound && cluster_serving_ready_is_current();
+}
+
+bool
+cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid,
+										  LOCKMODE mode)
+{
+	if (resid == NULL)
+		return false;
+	if (resid->type == CLUSTER_CF_RESID_TYPE)
+		return mode == ShareLock && resid->field1 == 0 && resid->field2 == 0
+			&& resid->field3 == 0 && resid->field4 == 0
+			&& resid->lockmethodid == DEFAULT_LOCKMETHOD;
+	if (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE)
+		return mode == ExclusiveLock && resid->field1 > 0
+			&& resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
+			&& resid->field2 == 0 && resid->field3 == 0 && resid->field4 == 0
+			&& resid->lockmethodid == DEFAULT_LOCKMETHOD;
+	return false;
+}
+
+bool
+cluster_recovery_authority_request_allowed(const ClusterResId *resid,
+										   LOCKMODE mode,
+										   bool startup_process)
+{
+	return startup_process
+		&& cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+		&& cluster_recovery_authority_is_current()
+		&& cluster_recovery_authority_resid_mode_allowed(resid, mode);
 }
 
 
@@ -453,6 +999,11 @@ cluster_advance_phase(ClusterStartupPhase target)
 /* Forward decls used by multi-child phase handlers. */
 static int cluster_phase_timeout_for(ClusterStartupPhase phase);
 static int cluster_phase_remaining_budget_ms(TimestampTz deadline, int driver_buffer_ms);
+static bool cluster_phase4_wal_state_configured(void);
+static bool cluster_phase4_wait_for_quorum(TimestampTz deadline);
+static int phase3_cssd_pid = 0;
+static int phase3_qvotec_pid = 0;
+static int phase3_lms_pid = 0;
 
 static PhaseRunResult
 phase_1_handler(PhaseRunFailContext *fail_ctx)
@@ -557,12 +1108,241 @@ phase_2_handler(PhaseRunFailContext *fail_ctx)
 }
 
 
-static PhaseRunResult
-phase_3_handler(PhaseRunFailContext *fail_ctx pg_attribute_unused())
+static bool
+cluster_phase3_wait_for_live_formation(TimestampTz deadline,
+									   ClusterFormationWitnessResult *out_result,
+									   uint16 *out_origin_thread,
+									   ClusterFenceAuthorityProof *out_authority,
+									   ClusterFormationSnapshotV1 *out_snapshot)
 {
+	ClusterFormationWitnessResult result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	uint16 thread_id = cluster_wal_thread_id();
+
+	if (thread_id == XLP_THREAD_ID_LEGACY) {
+		if (out_result != NULL)
+			*out_result = CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
+		return false;
+	}
+
+	for (;;) {
+		ClusterFormationWitnessV1 *witness = NULL;
+		int attempt_ms;
+
+		if (GetCurrentTimestamp() >= deadline)
+			break;
+		attempt_ms = cluster_phase_remaining_budget_ms(deadline, 5000);
+		if (attempt_ms > 100)
+			attempt_ms = 100;
+		result = cluster_formation_witness_build_live_wait(
+			thread_id, attempt_ms, &witness);
+		if (result == CLUSTER_FORMATION_WITNESS_READY) {
+			if (!cluster_formation_witness_copy_classification_v1(
+					witness, out_origin_thread, out_authority, out_snapshot))
+				result = CLUSTER_FORMATION_WITNESS_CORRUPT;
+			else
+				result = cluster_formation_witness_revalidate_nowait(witness);
+			cluster_formation_witness_destroy(&witness);
+			if (result == CLUSTER_FORMATION_WITNESS_READY) {
+				if (out_result != NULL)
+					*out_result = result;
+				return true;
+			}
+		}
+		cluster_formation_witness_destroy(&witness);
+
+		/* OWNER_MISMATCH is transient here while LMON publishes the exact
+		 * admitted-incarnation floor.  CAPABILITY_UNAVAILABLE is also transient
+		 * for this Postmaster/no-PGPROC caller: A1's conditional formation-
+		 * snapshot acquisition reports lock contention through that result and
+		 * this loop retries it only under the existing phase-3 deadline.
+		 * Structural/corrupt results still fail immediately. */
+		if (result != CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH
+			&& result != CLUSTER_FORMATION_WITNESS_UNSTABLE
+			&& result != CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN
+			&& result != CLUSTER_FORMATION_WITNESS_IO_FAILED
+			&& result != CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE)
+			break;
+		pg_usleep(1000L);
+	}
+
+	if (out_result != NULL)
+		*out_result = result;
+	return false;
+}
+
+
+static PhaseRunResult
+phase_3_handler(PhaseRunFailContext *fail_ctx)
+{
+	ClusterFenceAuthorityProof formation_authority;
+	ClusterFormationSnapshotV1 formation_snapshot;
+	ClusterFormationWitnessResult formation_result;
+	uint16 formation_origin_thread = 0;
+	uint64 boot_incarnation;
+	uint64 lms_generation;
+	int lms_remaining_ms;
+	int remaining_ms;
+	TimestampTz phase3_deadline;
+
 	Assert(!IsUnderPostmaster);
-	elog(DEBUG1, "Phase 3 stub: PG-native startup process unchanged; "
-				 "Recovery Coordinator / merged recovery deferred to Stage 4 spec");
+	Assert(fail_ctx != NULL);
+
+	if (!cluster_enabled) {
+		elog(DEBUG1, "cluster phase 3: cluster.enabled=false; skipping CSSD + "
+					 "QVOTEC pre-recovery formation gate");
+		return PHASE_RUN_OK;
+	}
+
+	/*
+	 * RF-ROOT P6 E2: recovery-time WAL retirement needs the same live
+	 * formation authority as normal operation.  Establish CSSD then QVOTEC
+	 * before StartupXLOG, using one bounded phase-3 deadline for both READY
+	 * waits and the configured multi-node quorum cut.
+	 */
+	phase3_deadline = TimestampTzPlusMilliseconds(
+		GetCurrentTimestamp(),
+		cluster_phase_timeout_for(CLUSTER_PHASE_3_RECOVERY) * 1000);
+
+	phase3_cssd_pid = cluster_cssd_start();
+	if (phase3_cssd_pid <= 0) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_CSSD_SPAWN_FAILED;
+		fail_ctx->errmsg = "cluster phase 3: failed to spawn CSSD aux process";
+		fail_ctx->errhint = "Check postmaster log for fork() error and confirm OS "
+							"process limits leave room for the CSSD aux process.";
+		return PHASE_RUN_FATAL;
+	}
+
+	remaining_ms = cluster_phase_remaining_budget_ms(phase3_deadline, 5000);
+	if (!cluster_cssd_wait_for_ready(remaining_ms)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_CSSD_NOT_READY;
+		fail_ctx->errmsg = "cluster phase 3: CSSD did not publish READY in time";
+		fail_ctx->errhint = "Check postmaster log for CSSD-side errors.  If CSSD is "
+							"slow on this hardware, raise cluster.phase3_timeout.";
+		return PHASE_RUN_FATAL;
+	}
+
+	phase3_qvotec_pid = cluster_qvotec_start();
+	if (phase3_qvotec_pid <= 0) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_QVOTEC_SPAWN_FAILED;
+		fail_ctx->errmsg = "cluster phase 3: failed to spawn QVOTEC aux process";
+		fail_ctx->errhint = "Check postmaster log for fork() error and confirm OS "
+							"process limits leave room for the QVOTEC aux process.";
+		return PHASE_RUN_FATAL;
+	}
+
+	remaining_ms = cluster_phase_remaining_budget_ms(phase3_deadline, 5000);
+	if (!cluster_qvotec_wait_for_ready(remaining_ms)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_QVOTEC_NOT_READY;
+		fail_ctx->errmsg = "cluster phase 3: QVOTEC did not publish READY in time";
+		fail_ctx->errhint = "Check postmaster log for QVOTEC-side errors.  If QVOTEC "
+							"is slow on this hardware, raise cluster.phase3_timeout.";
+		return PHASE_RUN_FATAL;
+	}
+
+	if (cluster_phase4_wal_state_configured() && cluster_conf_node_count() > 1
+		&& !cluster_phase4_wait_for_quorum(phase3_deadline)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_QUORUM_LOST;
+		fail_ctx->errmsg = "cluster phase 3: QVOTEC did not establish quorum in time";
+		fail_ctx->errhint = "Restore a voting-disk majority and verify the lease-aware "
+							"quorum state before retrying startup.";
+		return PHASE_RUN_FATAL;
+	}
+
+	if (cluster_phase4_wal_state_configured()
+		&& !cluster_phase3_wait_for_live_formation(
+			phase3_deadline, &formation_result, &formation_origin_thread,
+			&formation_authority, &formation_snapshot)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED;
+		fail_ctx->errmsg = "cluster phase 3: live formation did not become ready before recovery";
+		fail_ctx->errhint = "Verify exact self MEMBER admission, the current QVOTEC "
+							"incarnation floor, and durable voting-disk authority before "
+							"retrying startup.";
+		return PHASE_RUN_FATAL;
+	}
+
+	if (cluster_phase4_wal_state_configured()) {
+		if (!cluster_lms_enabled) {
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 3: LMS is disabled for recovery authority";
+			fail_ctx->errhint = "Set cluster.lms_enabled=on; a formed WAL registry has "
+								"no PG-native recovery-authority fallback.";
+			return PHASE_RUN_FATAL;
+		}
+		if (!cluster_authority_readiness_begin(
+				formation_origin_thread, &formation_authority,
+				&formation_snapshot)) {
+			fail_ctx->errcode = ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED;
+			fail_ctx->errmsg = "cluster phase 3: live formation could not bind this boot";
+			fail_ctx->errhint = "Verify the current QVOTEC incarnation equals the admitted "
+								"membership floor and retry startup.";
+			return PHASE_RUN_FATAL;
+		}
+
+		phase3_lms_pid = cluster_lms_start();
+		if (phase3_lms_pid <= 0) {
+			cluster_authority_readiness_clear();
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 3: failed to spawn recovery LMS";
+			fail_ctx->errhint = "Check postmaster log and OS process limits.";
+			return PHASE_RUN_FATAL;
+		}
+		lms_remaining_ms = cluster_phase_remaining_budget_ms(
+			phase3_deadline, 5000);
+		if (!cluster_lms_wait_for_recovery_ready(lms_remaining_ms)) {
+			cluster_authority_readiness_clear();
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 3: LMS did not publish recovery readiness";
+			fail_ctx->errhint = "Inspect LMS startup diagnostics; ordinary service remains "
+								"closed until phase 4.";
+			return PHASE_RUN_FATAL;
+		}
+		boot_incarnation = cluster_qvotec_get_self_incarnation();
+		lms_generation = cluster_lms_get_lms_restart_generation();
+		if (!cluster_authority_readiness_bind_recovery_generation(
+				lms_generation)) {
+			/* The durable fence-proof cache can expire while the newly spawned
+			 * LMS publishes recovery readiness.  Never extend or bypass that
+			 * proof: reacquire the complete live formation under the same phase3
+			 * deadline, then rebind the unchanged LMS generation. */
+			remaining_ms = cluster_phase_remaining_budget_ms(
+				phase3_deadline, 5000);
+			if (!cluster_phase3_wait_for_live_formation(
+					phase3_deadline, &formation_result,
+					&formation_origin_thread, &formation_authority,
+					&formation_snapshot)
+				|| !cluster_authority_readiness_begin(
+					formation_origin_thread, &formation_authority,
+					&formation_snapshot)
+				|| !cluster_authority_readiness_bind_recovery_generation(
+					lms_generation)) {
+				cluster_authority_readiness_clear();
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 3: recovery LMS generation could not be bound";
+				fail_ctx->errhint = "The LMS recovery generation, live formation, and admitted "
+									"incarnation must remain exact before holder remastering.";
+				return PHASE_RUN_FATAL;
+			}
+			boot_incarnation = cluster_qvotec_get_self_incarnation();
+		}
+		lms_remaining_ms = cluster_phase_remaining_budget_ms(
+			phase3_deadline, 5000);
+		if (!cluster_grd_recovery_authority_barrier_wait(
+				&formation_snapshot, boot_incarnation, lms_generation,
+				lms_remaining_ms)
+			|| !cluster_authority_readiness_publish_recovery(lms_generation)) {
+			cluster_authority_readiness_clear();
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 3: authoritative recovery GRD is unavailable";
+			fail_ctx->errhint = "Recovery requires an explicit current-generation holder "
+								"authority seal; an empty or uninitialized GRD is insufficient.";
+			return PHASE_RUN_FATAL;
+		}
+	}
+
+	elog(DEBUG1,
+		 "cluster phase 3: CSSD ready (pid %d) + QVOTEC ready (pid %d); "
+		 "PG-native recovery starts with formation authority available",
+		 phase3_cssd_pid, phase3_qvotec_pid);
 	return PHASE_RUN_OK;
 }
 
@@ -721,8 +1501,6 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 	int cssd_pid;
 	int qvotec_pid;
 	int diag_remaining_ms;
-	int cssd_remaining_ms;
-	int qvotec_remaining_ms;
 	int lms_pid = 0;
 	int lms_remaining_ms;
 	TimestampTz phase4_start;
@@ -760,6 +1538,38 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		phase4_start, cluster_phase_timeout_for(CLUSTER_PHASE_4_NORMAL) * 1000);
 	registry_configured = cluster_phase4_wal_state_configured();
 
+	/*
+	 * CSSD and QVOTEC are phase-3 children.  Phase 4 may only reuse their
+	 * existing READY state; a lost pre-recovery authority must fail closed
+	 * rather than spawning a second child generation.
+	 */
+	cssd_pid = phase3_cssd_pid;
+	if (cluster_cssd_get_status() != CLUSTER_CSSD_READY) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_CSSD_NOT_READY;
+		fail_ctx->errmsg = "cluster phase 4: pre-recovery CSSD is no longer READY";
+		fail_ctx->errhint = "Inspect the CSSD child failure and restart after cluster "
+							"membership authority is available.";
+		return PHASE_RUN_FATAL;
+	}
+
+	qvotec_pid = phase3_qvotec_pid;
+	if (cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_QVOTEC_NOT_READY;
+		fail_ctx->errmsg = "cluster phase 4: pre-recovery QVOTEC is no longer READY";
+		fail_ctx->errhint = "Inspect the QVOTEC child failure and restart after voting "
+							"authority is available.";
+		return PHASE_RUN_FATAL;
+	}
+
+	if (registry_configured && cluster_conf_node_count() > 1
+		&& !cluster_phase4_wait_for_quorum(phase4_deadline)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_QUORUM_LOST;
+		fail_ctx->errmsg = "cluster phase 4: QVOTEC quorum was lost after recovery";
+		fail_ctx->errhint = "Restore a voting-disk majority and verify the lease-aware "
+							"quorum state before retrying startup.";
+		return PHASE_RUN_FATAL;
+	}
+
 	/* ----------
 	 * spec-1.13 D6: DIAG spawn + sync wait ready (first phase 4 child).
 	 * ----------
@@ -790,66 +1600,6 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 			== PHASE_RUN_FATAL)
 		return PHASE_RUN_FATAL;
 
-	/* ----------
-	 * RF A1: CSSD follows DIAG and precedes every registry writer.
-	 * Step 5 D10 lands proper SQLSTATEs (53R30 / 53R31);Step 4 reuses
-	 * Cluster Stats SQLSTATE codes as placeholders to keep the
-	 * compile-time link clean.
-	 * ----------
-	 */
-	cssd_pid = cluster_cssd_start();
-	if (cssd_pid <= 0) {
-		fail_ctx->errcode = ERRCODE_CLUSTER_CSSD_SPAWN_FAILED;
-		fail_ctx->errmsg = "cluster phase 4: failed to spawn CSSD aux process";
-		fail_ctx->errhint = "Check postmaster log for fork() error.  Confirm OS "
-							"process limits leave room for the CSSD aux process.";
-		return PHASE_RUN_FATAL;
-	}
-
-	cssd_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
-	if (!cluster_cssd_wait_for_ready(cssd_remaining_ms)) {
-		fail_ctx->errcode = ERRCODE_CLUSTER_CSSD_NOT_READY;
-		fail_ctx->errmsg = "cluster phase 4: CSSD did not publish READY in time";
-		fail_ctx->errhint = "Check postmaster log for CSSD-side errors.  If CSSD is "
-							"slow on this hardware, raise cluster.phase4_timeout "
-							"(PGC_SIGHUP).";
-		return PHASE_RUN_FATAL;
-	}
-
-	/* ----------
-	 * RF A1: QVOTEC follows CSSD.  In strict formed multi-node mode,
-	 * READY is only the process lifecycle gate; wait for the existing
-	 * lease-aware quorum proof under the same phase-4 deadline.
-	 * ----------
-	 */
-	qvotec_pid = cluster_qvotec_start();
-	if (qvotec_pid <= 0) {
-		fail_ctx->errcode = ERRCODE_CLUSTER_QVOTEC_SPAWN_FAILED;
-		fail_ctx->errmsg = "cluster phase 4: failed to spawn QVOTEC aux process";
-		fail_ctx->errhint = "Check postmaster log for fork() error.  Confirm OS "
-							"process limits leave room for the QVOTEC aux process.";
-		return PHASE_RUN_FATAL;
-	}
-
-	qvotec_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
-	if (!cluster_qvotec_wait_for_ready(qvotec_remaining_ms)) {
-		fail_ctx->errcode = ERRCODE_CLUSTER_QVOTEC_NOT_READY;
-		fail_ctx->errmsg = "cluster phase 4: QVOTEC did not publish READY in time";
-		fail_ctx->errhint = "Check postmaster log for QVOTEC-side errors.  If QVOTEC "
-							"is slow on this hardware, raise cluster.phase4_timeout "
-							"(PGC_SIGHUP).";
-		return PHASE_RUN_FATAL;
-	}
-
-	if (registry_configured && cluster_conf_node_count() > 1
-		&& !cluster_phase4_wait_for_quorum(phase4_deadline)) {
-		fail_ctx->errcode = ERRCODE_CLUSTER_QUORUM_LOST;
-		fail_ctx->errmsg = "cluster phase 4: QVOTEC did not establish quorum in time";
-		fail_ctx->errhint = "Restore a voting-disk majority and verify the lease-aware "
-							"quorum state before retrying startup.";
-		return PHASE_RUN_FATAL;
-	}
-
 	/*
 	 * A formed registry requires an exact READY LMS.  The legacy LMS
 	 * wait helper treats DISABLED as ready-or-skip, so reject the GUC
@@ -864,20 +1614,38 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 			return PHASE_RUN_FATAL;
 		}
 
-		lms_pid = cluster_lms_start();
-		if (lms_pid <= 0) {
+		lms_pid = phase3_lms_pid;
+		if (lms_pid <= 0
+			|| cluster_authority_readiness_get()
+				   != CLUSTER_AUTHORITY_RECOVERY_READY) {
 			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
-			fail_ctx->errmsg = "cluster phase 4: failed to spawn LMS aux process";
-			fail_ctx->errhint = "Check postmaster log and OS process limits; a formed "
-								"registry has no PG-native LMS fallback.";
+			fail_ctx->errmsg = "cluster phase 4: recovery LMS authority is unavailable";
+			fail_ctx->errhint = "Restart after the phase-3 LMS generation and authority "
+								"binding are available.";
+			return PHASE_RUN_FATAL;
+		}
+		if (!cluster_lms_request_serving()) {
+			cluster_authority_readiness_clear();
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 4: could not upgrade recovery LMS to service";
+			fail_ctx->errhint = "The exact phase-3 LMS generation must remain recovery-ready.";
 			return PHASE_RUN_FATAL;
 		}
 		lms_remaining_ms = cluster_phase_remaining_budget_ms(phase4_deadline, 5000);
 		if (!cluster_lms_wait_for_ready(lms_remaining_ms) || !cluster_lms_is_ready()) {
+			cluster_authority_readiness_clear();
 			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
 			fail_ctx->errmsg = "cluster phase 4: LMS did not publish exact READY in time";
 			fail_ctx->errhint = "Inspect LMS startup diagnostics; DISABLED or any non-READY "
 								"state cannot authorize a formed-registry CF update.";
+			return PHASE_RUN_FATAL;
+		}
+		if (!cluster_authority_readiness_publish_serving()) {
+			cluster_authority_readiness_clear();
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			fail_ctx->errmsg = "cluster phase 4: serving authority publication failed";
+			fail_ctx->errhint = "A stale formation, QVOTEC incarnation, LMS generation, or "
+								"GRD seal cannot publish ordinary GES/GCS service.";
 			return PHASE_RUN_FATAL;
 		}
 
@@ -1340,6 +2108,7 @@ cluster_run_shutdown_sequence(void)
 	if (cluster_current_phase() == CLUSTER_PHASE_SHUTDOWN)
 		return;
 
+	cluster_authority_readiness_clear();
 	cluster_advance_phase(CLUSTER_PHASE_SHUTDOWN);
 }
 

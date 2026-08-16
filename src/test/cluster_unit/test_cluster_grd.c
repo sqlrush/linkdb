@@ -51,6 +51,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_gcs.h"	   /* spec-4.7 D2 (L238) — cluster_gcs_lookup_master proto */
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 (L238) — block re-declare scan/send protos */
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_handoff.h" /* spec-6.12e1 — verifier stub types */
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
@@ -60,6 +61,7 @@
 #include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
+#include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
 #include "storage/lock.h"
@@ -290,6 +292,16 @@ cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
 	return 0; /* CLUSTER_CSSD_PEER_ALIVE */
 }
 
+int /* ClusterCssdStatus */
+cluster_cssd_get_status(void)
+{
+	return 1; /* CLUSTER_CSSD_READY */
+}
+
+void
+cluster_lmon_wakeup(void)
+{}
+
 /* spec-2.15 D11:  cluster.grd_max_entries GUC stub.  Most tests keep 0
  * → skeleton mode → lookup_or_create returns NOT_READY; the soft-cap
  * regression test sets 1 and drives a tiny fake HTAB path. */
@@ -326,6 +338,12 @@ uint64
 cluster_lms_get_shard_master_generation(void)
 {
 	return mock_lms_shard_master_generation;
+}
+
+uint64
+cluster_lms_get_lms_restart_generation(void)
+{
+	return mock_lms_shard_master_generation & UINT64_C(0xffffffff);
 }
 
 /* spec-4.6 D1 stubs:  the recovery tick (P0-P7) consumes reconfig
@@ -379,6 +397,8 @@ cluster_gcs_lookup_master_static(BufferTag tag pg_attribute_unused())
 /* ut_member_mask < 0 (default) means "all declared nodes are members";
  * otherwise a node is a member iff (ut_member_mask >> node) & 1. */
 static int ut_member_mask = -1;
+static uint64 ut_admitted_incarnation = 11;
+static bool ut_qvotec_quorum = true;
 bool
 cluster_membership_is_member(int32 node_id)
 {
@@ -387,6 +407,21 @@ cluster_membership_is_member(int32 node_id)
 	if (node_id < 0 || node_id >= 31)
 		return false;
 	return ((ut_member_mask >> node_id) & 1) != 0;
+}
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
+{
+	return ut_admitted_incarnation;
+}
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return ut_qvotec_quorum;
+}
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return ut_admitted_incarnation;
 }
 void
 cluster_gcs_block_send_redeclare(BufferTag tag pg_attribute_unused(),
@@ -528,10 +563,25 @@ SendProcSignal(int pid pg_attribute_unused(), int reason pg_attribute_unused(),
 
 /* spec-4.6a r2-P1-1: controllable clock (default 0 = pre-existing value). */
 static int64 ut_mock_now = 0;
+static bool ut_drive_authority_lmon_tick = false;
+static bool ut_in_authority_lmon_tick = false;
+static int ut_grd_blocking_lwlock_calls = 0;
+static int ut_grd_postmaster_lwlock_calls = 0;
 int64
 GetCurrentTimestamp(void)
 {
 	return ut_mock_now;
+}
+
+void
+pg_usleep(long microsec)
+{
+	ut_mock_now += microsec;
+	if (ut_drive_authority_lmon_tick) {
+		ut_in_authority_lmon_tick = true;
+		cluster_grd_recovery_authority_lmon_tick();
+		ut_in_authority_lmon_tick = false;
+	}
 }
 
 void
@@ -713,6 +763,9 @@ GetNamedLWLockTranche(const char *tranche_name pg_attribute_unused())
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	ut_grd_blocking_lwlock_calls++;
+	if (!ut_in_authority_lmon_tick)
+		ut_grd_postmaster_lwlock_calls++;
 	return true;
 }
 
@@ -2408,6 +2461,41 @@ UT_TEST(test_convert_u4_upgrade_inplace_or_enqueue)
 	convert_teardown();
 }
 
+UT_TEST(test_walr_convert_nowait_conflict_never_enqueues)
+{
+	ClusterGrdEntry *e;
+	ClusterGrdConvert req;
+	ClusterGrdHolderId other;
+	bool drain = true;
+	LOCKMODE mode = NoLock;
+
+	convert_reset();
+	e = convert_make_entry(2084);
+	convert_grant(e, 1, 100, 11, ShareLock);
+	convert_grant(e, 2, 200, 22, ShareLock);
+	req = convert_req(1, 100, ShareLock, ExclusiveLock, 77);
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert_nowait(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_CONFLICT_NOWAIT);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT_EQ((int)drain, (int)false);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &mode));
+	UT_ASSERT_EQ((int)mode, (int)ShareLock);
+
+	memset(&other, 0, sizeof(other));
+	other.node_id = 2;
+	other.procno = 200;
+	other.request_id = 22;
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &other),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert_nowait(e, &req, &drain),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
+	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &mode));
+	UT_ASSERT_EQ((int)mode, (int)ExclusiveLock);
+	convert_teardown();
+}
+
 /* U5 — LATERAL (incomparable) and missing-holder both fail closed ILLEGAL. */
 UT_TEST(test_convert_u5_lateral_and_no_holder_illegal)
 {
@@ -3153,6 +3241,33 @@ bast_holder(int32 node, uint32 procno, uint64 reqid)
 	h.procno = procno;
 	h.request_id = reqid;
 	return h;
+}
+
+UT_TEST(test_walr_convert_nowait_requires_exact_old_holder_id)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nconflict = -1;
+
+	convert_reset();
+	bast_resid(5184, &resid);
+	holder = bast_holder(1, 100, 41);
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
+					 &resid, &holder, 1, 41,
+					 (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
+					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nconflict),
+				 (int)CLUSTER_GRD_GRANT_NOW);
+
+	UT_ASSERT_EQ((int)cluster_grd_convert_nowait(
+					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 42,
+					 999, 1, 0),
+				 (int)CLUSTER_GRD_CONVERT_ILLEGAL);
+	UT_ASSERT_EQ((int)cluster_grd_convert_nowait(
+					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 42,
+					 41, 1, 0),
+				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	convert_teardown();
 }
 
 /* spec-5.1c U9a — same backend, different mode: own prior hold is NOT a
@@ -4680,6 +4795,148 @@ UT_TEST(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut)
 	memset(&ut_mock_rejoin_failure, 0, sizeof(ut_mock_rejoin_failure));
 }
 
+static void
+setup_recovery_authority_fixture(ClusterFormationSnapshotV1 *formation)
+{
+	const int32 nodes[] = { 0, 1 };
+
+	reset_fake_grd_htab();
+	cluster_grd_max_entries = 16;
+	set_mock_declared(2, nodes);
+	ut_member_mask = 0x3;
+	ut_admitted_incarnation = 11;
+	ut_qvotec_quorum = true;
+	ut_mock_epoch = 5;
+	ut_mock_now = 0;
+	mock_lms_shard_master_generation = (UINT64_C(5) << 32) | 7;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_enabled = false;
+	cluster_grd_shmem_init();
+	cluster_grd_master_map_init();
+
+	memset(formation, 0, sizeof(*formation));
+	formation->local_epoch = 5;
+	formation->applied.new_epoch = 5;
+	formation->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	formation->membership.membership_state[1] = CLUSTER_MEMBER_MEMBER;
+	formation->membership.last_admitted_incarnation[0] = 11;
+	formation->membership.last_admitted_incarnation[1] = 11;
+}
+
+static void
+setup_recovery_authority_singleton_fixture(
+	ClusterFormationSnapshotV1 *formation)
+{
+	const int32 nodes[] = { 0 };
+
+	reset_fake_grd_htab();
+	cluster_grd_max_entries = 16;
+	set_mock_declared(1, nodes);
+	ut_member_mask = 0x1;
+	ut_admitted_incarnation = 11;
+	ut_qvotec_quorum = true;
+	ut_mock_epoch = 5;
+	ut_mock_now = 0;
+	mock_lms_shard_master_generation = (UINT64_C(5) << 32) | 7;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_enabled = false;
+	cluster_grd_shmem_init();
+	cluster_grd_master_map_init();
+
+	memset(formation, 0, sizeof(*formation));
+	formation->local_epoch = 5;
+	formation->applied.new_epoch = 5;
+	formation->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	formation->membership.last_admitted_incarnation[0] = 11;
+}
+
+UT_TEST(test_recovery_authority_postmaster_cannot_execute_blocking_barrier)
+{
+	ClusterFormationSnapshotV1 formation;
+
+	setup_recovery_authority_singleton_fixture(&formation);
+	ut_grd_blocking_lwlock_calls = 0;
+	ut_grd_postmaster_lwlock_calls = 0;
+	ut_drive_authority_lmon_tick = false;
+
+	/* With no LMON tick, the coordinator may only publish and poll.  It
+	 * must time out fail-closed without running shard cleanup itself. */
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 2));
+	UT_ASSERT_EQ(ut_grd_blocking_lwlock_calls, 0);
+	UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
+
+	/* Cancellation is generation-bound: a later LMON tick must reject the
+	 * expired request without cleaning or sealing it. */
+	cluster_enabled = true;
+	cluster_grd_recovery_authority_lmon_tick();
+	cluster_enabled = false;
+	UT_ASSERT_EQ(ut_grd_blocking_lwlock_calls, 0);
+	UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
+}
+
+UT_TEST(test_recovery_authority_lmon_tick_is_sole_blocking_executor)
+{
+	ClusterFormationSnapshotV1 formation;
+
+	setup_recovery_authority_singleton_fixture(&formation);
+	ut_grd_blocking_lwlock_calls = 0;
+	ut_grd_postmaster_lwlock_calls = 0;
+	ut_drive_authority_lmon_tick = true;
+	cluster_enabled = true;
+
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 10));
+
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = false;
+	UT_ASSERT_EQ(ut_grd_postmaster_lwlock_calls, 0);
+	UT_ASSERT(ut_grd_blocking_lwlock_calls > 0);
+	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
+}
+
+UT_TEST(test_recovery_authority_initial_epoch_zero_is_valid)
+{
+	ClusterFormationSnapshotV1 formation;
+
+	setup_recovery_authority_singleton_fixture(&formation);
+	ut_mock_epoch = 0;
+	formation.local_epoch = 0;
+	formation.applied.new_epoch = 0;
+	ut_grd_blocking_lwlock_calls = 0;
+	ut_grd_postmaster_lwlock_calls = 0;
+	ut_drive_authority_lmon_tick = true;
+	cluster_enabled = true;
+
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 10));
+
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = false;
+	UT_ASSERT_EQ(ut_grd_postmaster_lwlock_calls, 0);
+	UT_ASSERT(ut_grd_blocking_lwlock_calls > 0);
+	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
+}
+
+UT_TEST(test_recovery_authority_rejects_missing_peer_or_unremastered_map)
+{
+	ClusterFormationSnapshotV1 formation;
+
+	setup_recovery_authority_fixture(&formation);
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 2));
+	UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
+
+	/* A declared shard master outside the exact MEMBER formation is not
+	 * recovered authority, even when the local GRD happens to be empty. */
+	setup_recovery_authority_fixture(&formation);
+	formation.membership.membership_state[1] = CLUSTER_MEMBER_ABSENT;
+	ut_member_mask = 0x1;
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 10));
+	UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -4693,7 +4950,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * +1 (U17 cross-episode fence Hardening);
 	 * spec-4.6a r3-P2-2:+2 (same-epoch dead-set growth re-stamp + no-churn);
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage). */
-	UT_PLAN(88);
+	UT_PLAN(94);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -4738,6 +4995,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_convert_u2_same_is_noop);
 	UT_RUN(test_convert_u3_downgrade_inplace_drain_hint);
 	UT_RUN(test_convert_u4_upgrade_inplace_or_enqueue);
+	UT_RUN(test_walr_convert_nowait_conflict_never_enqueues);
 	UT_RUN(test_convert_u5_lateral_and_no_holder_illegal);
 	UT_RUN(test_convert_u6_self_exclusion);
 	UT_RUN(test_convert_u6_multiple_self_holders_excluded);
@@ -4762,6 +5020,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_5_1c_u9b_self_plus_other_keeps_other);
 	UT_RUN(test_5_1c_u9c_different_backend_normal);
 	UT_RUN(test_ul_grant_conditional_no_waiter_enqueued);
+	UT_RUN(test_walr_convert_nowait_requires_exact_old_holder_id);
 	UT_RUN(test_ul_advisory_resid_encoding);
 	UT_RUN(test_ul_advisory_mode_matrix_conditional);
 	UT_RUN(test_5_1c_u5_bast_consume_drains);
@@ -4808,6 +5067,10 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	/* spec-4.6a nightly regression — joiner-side DONE accounting liveness. */
 	UT_RUN(test_recovery_idle_joiner_accounts_done_epoch_for_fence);
 	UT_RUN(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut);
+	UT_RUN(test_recovery_authority_rejects_missing_peer_or_unremastered_map);
+	UT_RUN(test_recovery_authority_postmaster_cannot_execute_blocking_barrier);
+	UT_RUN(test_recovery_authority_lmon_tick_is_sole_blocking_executor);
+	UT_RUN(test_recovery_authority_initial_epoch_zero_is_valid);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

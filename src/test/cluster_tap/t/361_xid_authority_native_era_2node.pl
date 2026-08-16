@@ -33,6 +33,7 @@ use lib "$FindBin::RealBin/../../perl";
 
 use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::RecursiveCopy;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(usleep);
@@ -56,10 +57,7 @@ sub make_voting_disks
 	for my $i (0 .. 2)
 	{
 		my $p = "$disk_dir/disk$i";
-		open(my $fh, '>', $p) or die "open $p: $!";
-		binmode $fh;
-		print $fh ("\0" x (128 * 512));
-		close $fh;
+		format_voting_file($p, $i);
 		push @disks, $p;
 	}
 	return join(',', @disks);

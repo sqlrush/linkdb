@@ -22,6 +22,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 typedef UBA ClusterUndoByteAddress;
 
 StaticAssertDecl(sizeof(ClusterUndoByteAddress) == 16, "R4 UBA alias must remain 16 bytes");
@@ -30,7 +31,8 @@ typedef enum ClusterTxResolveMode {
 	CLUSTER_TX_RESOLVE_VISIBILITY = 0,
 	CLUSTER_TX_RESOLVE_ROW_WAIT = 1,
 	CLUSTER_TX_RESOLVE_CR_BUILD = 2,
-	CLUSTER_TX_RESOLVE_CLEANOUT_HINT = 3
+	CLUSTER_TX_RESOLVE_CLEANOUT_HINT = 3,
+	CLUSTER_TX_RESOLVE_TERMINAL_CENSUS = 4
 } ClusterTxResolveMode;
 
 typedef enum ClusterTxResolveReason {
@@ -144,6 +146,25 @@ typedef struct ClusterTxResolution {
 	ClusterLiveAuthority authority;
 } ClusterTxResolution;
 
+/* A page-derived request carries TT_WRAP_INVALID until the origin reads the
+ * exact undo record under Candidate-2 SCUR.  Every other identity byte is
+ * immutable; a canonical request never permits a wrap substitution. */
+static inline bool
+cluster_tx_locator_reply_matches(const ClusterTxLocator *request,
+							 const ClusterTxLocator *reply)
+{
+	if (request == NULL || reply == NULL
+		|| request->uba.raw[0] != reply->uba.raw[0]
+		|| request->uba.raw[1] != reply->uba.raw[1]
+		|| request->xid != reply->xid
+		|| request->itl_kind != reply->itl_kind
+		|| request->itl_slot_index != reply->itl_slot_index)
+		return false;
+	if (request->tt_wrap == TT_WRAP_INVALID)
+		return reply->tt_wrap <= TT_WRAP_MAX;
+	return request->tt_wrap == reply->tt_wrap;
+}
+
 #define CLUSTER_R4_MAX_MULTI_MEMBERS 256
 #define CLUSTER_R4_SUBTRANS_MAX_DEPTH 1024
 
@@ -171,10 +192,17 @@ typedef struct ClusterMultiResolution {
 
 extern bool cluster_tx_locator_from_itl(Page page, uint8 slot_index, ClusterTxLocator *out,
 										ClusterTxResolveReason *reason_out);
+extern bool cluster_tx_locator_from_itl_terminal_census(
+	Page page, uint8 slot_index, ClusterTxLocator *out,
+	ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_tx_resolve_exact(const ClusterTxLocator *locator,
 												 ClusterTxResolveMode mode,
 												 ClusterTxResolution *out,
 												 ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome cluster_tx_resolve_exact_admitted(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 													 ClusterTxResolveReason *reason_out);
 extern const char *cluster_tx_resolve_reason_name(ClusterTxResolveReason reason);

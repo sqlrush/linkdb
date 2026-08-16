@@ -65,6 +65,7 @@
 #include "cluster/cluster_reconfig.h" /* apply_clean_leave + record/is_clean_departed + join_in_progress */
 #include "cluster/cluster_membership.h" /* v1.0.4 — cluster_membership_is_member (P1-2 INV-J8) */
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_voting_disk_io.h" /* leave-slot raw I/O + CLUSTER_VOTING_SLOT_BYTES */
 
 /*
@@ -1551,6 +1552,10 @@ cluster_clean_leave_request(void)
 
 	if (cl_state == NULL || !cluster_enabled || !cluster_clean_leave_enabled)
 		return CLUSTER_LEAVE_REQ_REJECTED_DISABLED;
+	if (!cluster_clean_leave_startup_serving_allows(
+			cluster_authority_readiness_managed(),
+			cluster_serving_ready_is_current()))
+		return CLUSTER_LEAVE_REQ_REJECTED_NOT_SERVING;
 
 	/* Reserve before any other work; a second concurrent caller is rejected. */
 	if (!pg_atomic_compare_exchange_u32(&cl_state->request_in_progress, &expected, 1))
@@ -1633,6 +1638,10 @@ cluster_clean_leave_drive_drain(void)
 	int i;
 
 	if (cl_state == NULL || !cluster_enabled)
+		return;
+	if (!cluster_clean_leave_startup_serving_allows(
+			cluster_authority_readiness_managed(),
+			cluster_serving_ready_is_current()))
 		return;
 	if (pg_atomic_read_u32(&cl_state->phase) != CLUSTER_LEAVE_REQUESTED)
 		return;

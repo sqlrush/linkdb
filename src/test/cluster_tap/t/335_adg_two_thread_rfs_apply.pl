@@ -33,6 +33,7 @@ use lib "$FindBin::RealBin/../../perl";
 use lib "$FindBin::RealBin/../lib";
 
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
 use PgracClusterNode;
 use Test::More;
@@ -84,10 +85,7 @@ sub make_voting_disks
 	for my $i (0 .. 2)
 	{
 		my $path = "$disk_dir/${prefix}_disk$i";
-		open(my $fh, '>', $path) or die "open $path: $!";
-		binmode $fh;
-		print $fh ("\0" x (4 * 128 * 512));
-		close $fh;
+		format_voting_file($path, $i);
 		push @disks, $path;
 	}
 	return join(',', @disks);

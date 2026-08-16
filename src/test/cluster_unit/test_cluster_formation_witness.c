@@ -238,14 +238,36 @@ UT_TEST(test_witness_revalidate_maps_stale_and_unavailable)
 	cluster_formation_witness_destroy(&witness);
 }
 
+UT_TEST(test_live_witness_requires_same_stable_member_formation)
+{
+	ClusterFormationWitnessV1 *witness = NULL;
+
+	build_ready_fixture();
+	snapshots[0].membership.last_admitted_incarnation[0] = 55;
+	snapshots[1] = snapshots[0];
+	UT_ASSERT_EQ(cluster_formation_witness_build_live_wait(1, 10, &witness),
+				 CLUSTER_FORMATION_WITNESS_READY);
+	UT_ASSERT_NOT_NULL(witness);
+	cluster_formation_witness_destroy(&witness);
+
+	build_ready_fixture();
+	snapshots[0].membership.membership_state[0] = CLUSTER_MEMBER_JOINING;
+	snapshots[0].membership.last_admitted_incarnation[0] = 55;
+	snapshots[1] = snapshots[0];
+	UT_ASSERT_EQ(cluster_formation_witness_build_live_wait(1, 10, &witness),
+				 CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH);
+	UT_ASSERT_NULL(witness);
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(test_witness_bad_arguments_leave_null);
 	UT_RUN(test_witness_ready_borrow_revalidate_destroy);
 	UT_RUN(test_witness_unstable_or_unavailable_never_installs_handle);
 	UT_RUN(test_witness_revalidate_maps_stale_and_unavailable);
+	UT_RUN(test_live_witness_requires_same_stable_member_formation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

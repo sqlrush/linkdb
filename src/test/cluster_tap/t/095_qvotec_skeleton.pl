@@ -63,6 +63,7 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
 use Test::More;
 use PgracClusterNode;
@@ -203,13 +204,9 @@ $node->stop;
 
 my $disk_dir = PostgreSQL::Test::Utils::tempdir();
 for my $i (0 .. 2) {
-	# 64KB zero-filled (qvotec writes self slot on first poll;
-	# never-written slots stay generation==0 so decide_quorum_view
-	# skips them).
-	open(my $fh, '>', "$disk_dir/disk$i") or die $!;
-	binmode $fh;
-	print $fh ("\0" x (128 * 512));
-	close $fh;
+	# Canonical generation-zero slots let qvotec preserve every durable
+	# reserved region before it writes the first heartbeat.
+	format_voting_file("$disk_dir/disk$i", $i);
 }
 
 # Re-enable cluster + add voting_disks + set node_id (FIRST write so use

@@ -50,10 +50,25 @@ typedef enum ClusterTxResolveReason ClusterTxResolveReason;
 typedef enum ClusterTxOutcome ClusterTxOutcome;
 typedef struct ClusterTxLocator ClusterTxLocator;
 typedef struct ClusterTxResolution ClusterTxResolution;
+typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
+typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
+typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
+typedef struct ClusterUndoBlock0ResolvedRoot ClusterUndoBlock0ResolvedRoot;
 
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode, uint64 formation_epoch,
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_admitted(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out);
 #endif
 
 /*

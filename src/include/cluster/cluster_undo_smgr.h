@@ -90,6 +90,9 @@ extern bool cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 s
 										  uint8 owner_instance, uint32 block_no, const char *buf,
 										  bool do_fsync);
 
+/* Register the per-backend fd-cache cleanup before temporary exit hooks. */
+extern void cluster_undo_smgr_ensure_exit_hook(void);
+
 
 /*
  * cluster_undo_smgr_read_header_bytes / _write_header_bytes (spec-3.11 D2)

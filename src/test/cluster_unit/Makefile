@@ -89,6 +89,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
         test_cluster_hw_snapshot \
         test_cluster_cf_authority \
 		test_cluster_control_root \
+		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
 		test_cluster_formation_witness \
 		test_cluster_write_fence_durable \
@@ -208,10 +209,11 @@ test_cluster_membership: test_cluster_membership.c unit_test.h $(CLUSTER_VERSION
 # BufferTag -> worker shard map).  Links libpgcommon_srv.a for
 # hash_bytes_extended, mirroring test_cluster_grd.
 CLUSTER_LMS_SHARD_O = $(top_builddir)/src/backend/cluster/cluster_lms_shard.o
+CLUSTER_LMS_LIFECYCLE_O = $(top_builddir)/src/backend/cluster/cluster_lms_lifecycle.o
 test_cluster_lms_shard: test_cluster_lms_shard.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_LMS_SHARD_O)
+		$(CLUSTER_LMS_SHARD_O) $(CLUSTER_LMS_LIFECYCLE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_LMS_SHARD_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMS_SHARD_O) $(CLUSTER_LMS_LIFECYCLE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
@@ -277,7 +279,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_multixact_current_stats \
 		test_cluster_r4_observe test_cluster_r4_multi_subx_2pc \
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_raw_device_capacity test_cluster_replacement_wire \
-		test_cluster_external_fence test_pgrac_external_fence_protocol,$(SIMPLE_TESTS))
+		test_cluster_external_fence test_pgrac_external_fence_protocol \
+		test_cluster_wal_retention,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -362,10 +365,14 @@ test_cluster_recovery_serial: test_cluster_recovery_serial.c unit_test.h $(CLUST
 		$(CLUSTER_DL_O) $(CLUSTER_HW_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-CLUSTER_EXTERNAL_FENCE_O = \
-	$(top_builddir)/src/backend/cluster/cluster_external_fence.o
+CLUSTER_EXTERNAL_FENCE_O = test_cluster_external_fence_product.o
 PGRAC_EXTERNAL_FENCE_PROTOCOL_O = \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol_srv.o
+$(CLUSTER_EXTERNAL_FENCE_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_external_fence.c \
+		$(top_srcdir)/src/include/cluster/cluster_external_fence.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
+		-c $(top_srcdir)/src/backend/cluster/cluster_external_fence.c -o $@
 test_cluster_external_fence: test_cluster_external_fence.c unit_test.h \
 		$(CLUSTER_EXTERNAL_FENCE_O) $(PGRAC_EXTERNAL_FENCE_PROTOCOL_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_EXTERNAL_FENCE_O) \
@@ -561,6 +568,12 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
+CLUSTER_WAL_RETENTION_O = $(top_builddir)/src/backend/cluster/cluster_wal_retention.o
+test_cluster_wal_retention: test_cluster_wal_retention.c unit_test.h \
+		$(CLUSTER_WAL_RETENTION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_RETENTION_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
 CLUSTER_RECOVERY_DUTY_O = $(top_builddir)/src/backend/cluster/cluster_recovery_duty.o
 test_cluster_recovery_duty: test_cluster_recovery_duty.c unit_test.h \
 		$(CLUSTER_RECOVERY_DUTY_O)
@@ -588,7 +601,9 @@ test_pgrac_fenced_config: test_pgrac_fenced_config.c unit_test.h \
 		$(PGRAC_FENCED_CONFIG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
-		$(PGRAC_FENCED_CONFIG_O) -o $@
+		$(PGRAC_FENCED_CONFIG_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a -o $@
 
 PGRAC_FENCED_CORE_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_core.o
@@ -1682,10 +1697,11 @@ test_cluster_r4_static_model: test_cluster_r4_static_model.c unit_test.h
 # spec-8.4 B1/D1: exact caller-selected locator and dormant normalized
 # resolver entry points.  This links the production object directly.
 CLUSTER_TX_RESOLVE_O = $(top_builddir)/src/backend/cluster/cluster_tx_resolve.o
+CLUSTER_R4_TX_LOCATOR_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
 test_cluster_r4_tx_locator: test_cluster_r4_tx_locator.c unit_test.h \
-		$(CLUSTER_TX_RESOLVE_O)
+		$(CLUSTER_TX_RESOLVE_O) $(CLUSTER_R4_TX_LOCATOR_UBA_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_TX_RESOLVE_O) \
+		$(CLUSTER_TX_RESOLVE_O) $(CLUSTER_R4_TX_LOCATOR_UBA_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # spec-8.4 B1/D5: compile the real runtime-visibility provider into a

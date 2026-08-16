@@ -25,6 +25,7 @@ use strict;
 use warnings;
 
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
 use PostgreSQL::Test::ClusterPair;
 use Test::More;
@@ -33,6 +34,7 @@ use Time::HiRes qw(sleep time);
 my $pgbench_seconds = $ENV{STAGE2_PGBENCH_SECONDS} // 10;
 my $workload_sleep_seconds = $ENV{STAGE2_WORKLOAD_SECONDS} // 5;
 my $workload_iterations = $ENV{STAGE2_WORKLOAD_ITERATIONS} // 5;
+my $pgrd_voting_file_bytes = (7 * 128 + 3) * 512;
 
 # Helper: extract TPS from pgbench stdout.
 sub _pgbench_tps
@@ -189,10 +191,30 @@ diag("L2 cluster_enabled=off: pgbench full TPS=$full_off_tps");
 # Now run with cluster_enabled=on (single-node;  no peer)
 my $node_on = PostgreSQL::Test::Cluster->new('stage2_perf_on');
 $node_on->init;
+my $node_on_voting_dir = PostgreSQL::Test::Utils::tempdir();
+my $node_on_shared_dir = PostgreSQL::Test::Utils::tempdir();
+mkdir "$node_on_shared_dir/pg_undo"
+	or die "mkdir $node_on_shared_dir/pg_undo: $!";
+my @node_on_voting_disks;
+for my $disk_index (0 .. 2) {
+	my $disk_path = "$node_on_voting_dir/disk$disk_index";
+	format_voting_file($disk_path, $disk_index);
+	truncate($disk_path, $pgrd_voting_file_bytes)
+		or die "extend $disk_path to PGRD minimum: $!";
+	push @node_on_voting_disks, $disk_path;
+}
 $node_on->append_conf('postgresql.conf', "shared_buffers = 128MB\n");
 $node_on->append_conf('postgresql.conf', "cluster.enabled = on\n");
 $node_on->append_conf('postgresql.conf', "cluster.node_id = 0\n");
 $node_on->append_conf('postgresql.conf', "cluster.interconnect_tier = stub\n");
+$node_on->append_conf('postgresql.conf',
+	"cluster.voting_disks = '" . join(',', @node_on_voting_disks) . "'\n");
+$node_on->append_conf('postgresql.conf',
+	"cluster.voting_disk_size_bytes = $pgrd_voting_file_bytes\n");
+$node_on->append_conf('postgresql.conf',
+	"cluster.quorum_poll_interval_ms = 500\n");
+$node_on->append_conf('postgresql.conf',
+	"cluster.shared_data_dir = '$node_on_shared_dir'\n");
 # This is a write-path perf smoke, not the CR capacity test.  Keep undo / TT /
 # durable / retention writes enabled, but leave hot-page CR reconstruction to
 # the dedicated 217/218/219/220 correctness TAPs and the spec-3.18 optimization
@@ -200,6 +222,27 @@ $node_on->append_conf('postgresql.conf', "cluster.interconnect_tier = stub\n");
 # before the perf signal is recorded.
 $node_on->append_conf('postgresql.conf', "cluster.cr_mvcc_gate = off\n");
 $node_on->start;
+$node_on->poll_query_until('postgres',
+	q{SELECT in_quorum FROM pg_cluster_quorum_state}, 't')
+	or die "pre-OPEN M4 voting-disk majority did not become current\n";
+my ($activation_rc, $activation_stdout, $activation_stderr);
+my $activation_deadline = time() + 10;
+while (time() < $activation_deadline) {
+	($activation_rc, $activation_stdout, $activation_stderr) =
+		$node_on->psql('postgres',
+			'ALTER SYSTEM ENABLE RAC TWO_STAGE ROLLING UPDATES ALL', timeout => 30);
+	last
+		if $activation_rc != 0
+		&& $activation_stderr =~ /(?:RF_DEFERRED|CONDITION_NOT_YET_MET)/
+		&& -f "$node_on_shared_dir/pg_undo/pgrac_undo_root.control";
+	sleep 0.1;
+}
+isnt($activation_rc, 0,
+	'pre-OPEN M4 authority setup remains RF_DEFERRED rather than opening TARGET');
+like($activation_stderr, qr/(?:RF_DEFERRED|CONDITION_NOT_YET_MET)/,
+	'pre-OPEN M4 authority setup reports the frozen deferred readiness');
+ok(-f "$node_on_shared_dir/pg_undo/pgrac_undo_root.control",
+	'pre-OPEN M4 authority setup publishes the exact PGRD mirror before RF_DEFERRED');
 my $node_on_init_ok = _run_pgbench_init($node_on, 'cluster_enabled=on');
 
 my $sel_on_tps = 0;

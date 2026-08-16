@@ -41,6 +41,7 @@
 #include <string.h>
 
 #include "cluster/cluster_conf.h" /* ClusterConf type for the single-node latch stub */
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
@@ -73,6 +74,71 @@ UT_DEFINE_GLOBALS();
  * node 0 keeps every smgr call on the RUNTIME_SHARED (own) branch.
  */
 int cluster_node_id = 0;
+
+ClusterR4PrerequisiteSnapshot
+cluster_reconfig_r4_prerequisite_snapshot(void)
+{
+	ClusterR4PrerequisiteSnapshot snapshot;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED;
+	snapshot.target_node_id = -1;
+	return snapshot;
+}
+
+bool
+cluster_reconfig_r4_publish_ready(
+	const ClusterR4PrerequisiteSnapshot *expected pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_undo_block0_current_startup_fenced_owned(void)
+{
+	return false;
+}
+
+ClusterUndoSmgrFinalState
+cluster_undo_smgr_probe_segment(
+	ClusterUndoPathIntent intent pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(),
+	uint8 owner_instance pg_attribute_unused(),
+	char block0[BLCKSZ] pg_attribute_unused())
+{
+	return CLUSTER_UNDO_SMGR_FINAL_ABSENT;
+}
+
+bool
+cluster_undo_smgr_provision_temp_create(
+	ClusterUndoPathIntent intent pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(),
+	uint8 owner_instance pg_attribute_unused(),
+	char temp_path[MAXPGPATH] pg_attribute_unused())
+{
+	return false;
+}
+
+ClusterUndoSmgrPublishResult
+cluster_undo_smgr_provision_temp_publish(
+	ClusterUndoPathIntent intent pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(),
+	uint8 owner_instance pg_attribute_unused(),
+	const char *temp_path pg_attribute_unused(),
+	const char block0[BLCKSZ] pg_attribute_unused())
+{
+	return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
+}
+
+bool
+cluster_undo_smgr_provision_temp_cleanup(
+	ClusterUndoPathIntent intent pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(),
+	uint8 owner_instance pg_attribute_unused(),
+	const char *temp_path pg_attribute_unused())
+{
+	return false;
+}
 
 /*
  * cluster_undo_block0_resident.o now registers process-local ResourceOwner

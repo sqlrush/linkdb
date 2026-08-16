@@ -535,11 +535,22 @@ UT_TEST(test_ic_payload_removed_incarnation)
 	UT_ASSERT(!cluster_node_remove_announce_payload_valid(&a));
 }
 
+UT_TEST(test_startup_serving_gate)
+{
+	UT_ASSERT_STR_EQ(cluster_node_remove_request_result_str(
+						 CLUSTER_REMOVE_REQ_NOT_SERVING),
+				 "rejected:not_serving");
+	UT_ASSERT(cluster_node_remove_startup_serving_allows(false, false));
+	UT_ASSERT(cluster_node_remove_startup_serving_allows(false, true));
+	UT_ASSERT(!cluster_node_remove_startup_serving_allows(true, false));
+	UT_ASSERT(cluster_node_remove_startup_serving_allows(true, true));
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_struct_layout);
 	UT_RUN(test_phase_transitions);
 	UT_RUN(test_ordering_gate);
@@ -552,6 +563,7 @@ main(void)
 	UT_RUN(test_marker_authority_decide);
 	UT_RUN(test_ic_payloads);
 	UT_RUN(test_ic_payload_removed_incarnation);
+	UT_RUN(test_startup_serving_gate);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

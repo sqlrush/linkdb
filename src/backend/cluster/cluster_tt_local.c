@@ -662,6 +662,7 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 	uint32 cluster_epoch;
 	uint16 wrap;
 	uint8 owner;
+	TTSlot successor;
 
 	/*
 	 * spec-3.11 D4 / C1: durably stamp commit_scn on this xact's TT slot in the
@@ -703,8 +704,9 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 		 * the whole xact, so its wrap cannot have changed.
 		 */
 		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
-		owner = cluster_tt_slot_durable_commit_writeonly(segment_id, slot_offset, xid, wrap,
-											 commit_scn);
+		owner = cluster_tt_slot_durable_commit_writeonly(
+			segment_id, slot_offset, xid, wrap, commit_scn, &modifier_token,
+			&successor);
 
 		/*
 		 * Build the fold delta (mirrors xl_undo_tt_slot_commit fields).  xid is the
@@ -713,13 +715,13 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 		 */
 		out_fold->segment_id = segment_id;
 		out_fold->slot_offset = slot_offset;
-		out_fold->wrap = wrap;
-		out_fold->xid = xid;
+		out_fold->wrap = successor.wrap;
+		out_fold->xid = successor.xid;
 		out_fold->instance = owner;
 		out_fold->_pad[0] = 0;
 		out_fold->_pad[1] = 0;
 		out_fold->_pad[2] = 0;
-		out_fold->commit_scn = commit_scn;
+		out_fold->commit_scn = successor.commit_scn;
 	}
 	PG_FINALLY();
 	{

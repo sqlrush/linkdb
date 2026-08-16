@@ -162,8 +162,8 @@ is($node->safe_psql(
 is($node->safe_psql(
 			'postgres',
 			'SELECT count(*) FROM pg_stat_cluster_injections'),
-	   '184',
-	   'L6a pg_stat_cluster_injections has 184 entries (matches t/015 registry authority)');
+	   '185',
+	   'L6a pg_stat_cluster_injections has 185 entries (matches t/015 registry authority)');
 
 is($node->safe_psql(
 		'postgres',
@@ -189,7 +189,7 @@ is($node->safe_psql(
 is($node->safe_psql(
 		'postgres',
 		q{SELECT count(DISTINCT category) FROM pg_cluster_state}),
-   '56',
+   '58',
    'L7b pg_cluster_state has 56 distinct categories (spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.2 adds smart_fusion; spec-6.12 adds xnode_lever; spec-6.14 adds catalog)');
 
 
@@ -209,7 +209,7 @@ is($node->safe_psql(
 my $smoke_categories = $node->safe_psql(
 	'postgres',
 	q{SELECT count(DISTINCT category) FROM pg_cluster_state});
-is($smoke_categories, '56', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion + reconfig categories (56 categories; spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.14 adds catalog)');
+is($smoke_categories, '58', 'L9 cluster_smoke surface integrates pcm + gcs + tt_status + tt_status_hint + tt_2pc + tt_recovery + undo_record + visibility + wal_thread + dl + hw + ir + ko + ts + smart_fusion + reconfig categories (58 categories; spec-2.29a adds reconfig marker telemetry; spec-6.15 adds xid_stripe; spec-6.14 adds catalog)');
 
 
 # ----------

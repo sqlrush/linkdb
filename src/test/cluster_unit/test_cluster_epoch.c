@@ -85,6 +85,17 @@ cluster_shmem_register_region(const struct ClusterShmemRegion *region pg_attribu
 	/* no-op stub */
 }
 
+uint64
+cluster_write_fence_authority_cache_mutation_begin(void)
+{
+	return UINT64_C(1);
+}
+
+void
+cluster_write_fence_authority_cache_mutation_end(
+	uint64 odd_sequence pg_attribute_unused())
+{}
+
 /*
  * elog stub (cluster_epoch.c does not currently elog, but defensive
  * for future additions).

@@ -1151,6 +1151,40 @@ cluster_undo_block0_sample_resident_generation(
 
 
 ClusterUndoBlock0Result
+cluster_undo_block0_prove_strict_empty(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0AuthorityProof *proof)
+{
+	ClusterUndoBlock0SlotData *meta;
+	ClusterUndoBlock0Result result;
+	uint32 slotno;
+
+	if (cluster_undo_block0_logical_slot(logical, &slotno)
+		!= CLUSTER_UNDO_BLOCK0_OK)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	if (!block0_authority_proof_valid(logical, proof)
+		|| proof->kind != CLUSTER_UNDO_BLOCK0_LIVE_OWNER
+		|| proof->recovery_generation != 0)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	if (Block0Ctl == NULL)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+
+	meta = &Block0Slots[slotno].data;
+	LWLockAcquire(&meta->content_lock, LW_SHARED);
+	if (pg_atomic_read_u32(&meta->state) == CLUSTER_UNDO_BLOCK0_SLOT_EMPTY
+		&& pg_atomic_read_u32(&meta->pincount) == 0
+		&& meta->frame_index == CLUSTER_UNDO_BLOCK0_FRAME_INVALID
+		&& XLogRecPtrIsInvalid(meta->last_wal_lsn))
+		result = CLUSTER_UNDO_BLOCK0_OK;
+	else
+		result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	LWLockRelease(&meta->content_lock);
+
+	return result;
+}
+
+
+ClusterUndoBlock0Result
 cluster_undo_block0_recovery_private_begin(
 	const ClusterUndoBlock0LogicalKey *logical,
 	const ClusterUndoBlock0ResolvedRoot *redo_root,

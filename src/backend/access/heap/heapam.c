@@ -92,7 +92,9 @@
 #include "cluster/cluster_pcm_x_bufmgr.h" /* tuple/PCM ABA fingerprint */
 #include "cluster/cluster_dl.h"	/* spec-5.7 DL bulk-load lease */
 #include "cluster/cluster_itl_slot.h"	/* CLUSTER_ITL_SLOT_UNALLOCATED */
+#include "cluster/cluster_semantic_activation.h" /* census-scoped admission */
 #include "cluster/cluster_tt_status.h" /* spec-3.14 D2b writer wait bridge */
+#include "cluster/cluster_tx_resolve.h" /* AD-022 exact terminal census */
 #include "cluster/cluster_tx_enqueue.h" /* spec-5.2 D4 cross-node TX enqueue wait */
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D5b surely-dead guard */
 #include "cluster/cluster_writer_chain.h" /* spec-7.1a D0 terminal-writer chaining */
@@ -135,6 +137,332 @@ cluster_itl_write_path_enabled(Relation relation)
 	 */
 	return cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation);
 }
+
+typedef struct ClusterHeapItlTerminalCensus
+{
+	ClusterSemanticAdmissionToken admission;
+	bool admission_owned;
+	ClusterPcmOwnSnapshot pcm;
+	XLogRecPtr page_lsn;
+	ClusterItlSlotData slots[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterTxLocator locators[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterTxResolution resolutions[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterTxOutcome outcomes[CLUSTER_ITL_INITRANS_DEFAULT];
+	bool locator_valid[CLUSTER_ITL_INITRANS_DEFAULT];
+} ClusterHeapItlTerminalCensus;
+
+static void
+cluster_heap_itl_finish_terminal_census(
+	ClusterHeapItlTerminalCensus *census)
+{
+	if (census != NULL && census->admission_owned)
+	{
+		cluster_semantic_activation_leave(&census->admission);
+		census->admission_owned = false;
+	}
+}
+
+static bool
+cluster_heap_itl_finish_update_census_after_alloc_failure(
+	ClusterHeapItlTerminalCensus *census, bool census_was_pending)
+{
+	if (!census_was_pending)
+		return false;
+	cluster_heap_itl_finish_terminal_census(census);
+	return true;
+}
+
+static bool
+cluster_heap_itl_begin_terminal_census(
+	ClusterHeapItlTerminalCensus *census)
+{
+	ClusterSemanticAdmissionResult admission_result;
+
+	if (census == NULL)
+		return false;
+	memset(census, 0, sizeof(*census));
+	admission_result
+		= cluster_semantic_activation_enter_r4_terminal_census(
+			&census->admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	census->admission_owned = true;
+	return true;
+}
+
+static bool
+cluster_heap_itl_alloc_once(Buffer buffer, TransactionId xid,
+							bool lock_only, uint8 *slot_index_out)
+{
+	return lock_only
+		? cluster_itl_alloc_or_reuse_lock_slot(buffer, xid, slot_index_out)
+		: cluster_itl_alloc_or_reuse_slot(buffer, xid, slot_index_out);
+}
+
+static bool
+cluster_heap_itl_terminal_census_pcm_authority(
+	const ClusterPcmOwnSnapshot *pcm)
+{
+	if (pcm == NULL || pcm->flags != 0 || cluster_recmerge_window_active)
+		return false;
+	if (cluster_peer_mode_enabled())
+		return pcm->pcm_state == (uint8) PCM_STATE_X;
+	return cluster_storage_mode_enabled()
+		&& cluster_conf_node_count() == 1
+		&& pcm->pcm_state == (uint8) PCM_STATE_N;
+}
+
+static bool
+cluster_heap_itl_capture_terminal_census(Buffer buffer,
+									 ClusterHeapItlTerminalCensus *census)
+{
+	Page page = BufferGetPage(buffer);
+	uint8 i;
+
+	Assert(census != NULL && census->admission_owned);
+	if (!cluster_semantic_activation_recheck_r4_terminal_census(
+			&census->admission)
+		|| !PageHasItl(page)
+		|| cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1),
+										&census->pcm) != CLUSTER_PCM_OWN_OK
+		|| !cluster_heap_itl_terminal_census_pcm_authority(&census->pcm))
+		return false;
+	census->page_lsn = PageGetLSN(page);
+	memcpy(census->slots, ClusterPageGetItlSlots(page),
+		   sizeof(census->slots));
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+		census->locator_valid[i] = cluster_tx_locator_from_itl_terminal_census(
+			page, i, &census->locators[i], &reason);
+		if (!census->locator_valid[i])
+			memset(&census->locators[i], 0, sizeof(census->locators[i]));
+	}
+	return cluster_semantic_activation_recheck_r4_terminal_census(
+		&census->admission);
+}
+
+static bool
+cluster_heap_itl_census_page_revalidated(
+	Buffer buffer, const ClusterHeapItlTerminalCensus *census)
+{
+	ClusterPcmOwnSnapshot live_pcm;
+	Page page = BufferGetPage(buffer);
+
+	return PageHasItl(page)
+		&& cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1),
+										   &live_pcm) == CLUSTER_PCM_OWN_OK
+		&& cluster_heap_itl_terminal_census_pcm_authority(&live_pcm)
+		&& memcmp(&live_pcm, &census->pcm, sizeof(live_pcm)) == 0
+		&& PageGetLSN(page) == census->page_lsn;
+}
+
+static bool
+cluster_heap_itl_census_stamp_terminal(
+	Buffer buffer, uint8 slot_index,
+	const ClusterHeapItlTerminalCensus *census)
+{
+	Page page = BufferGetPage(buffer);
+	ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[slot_index];
+	const ClusterItlSlotData *captured = &census->slots[slot_index];
+	const ClusterTxResolution *resolution = &census->resolutions[slot_index];
+	ClusterTxLocator live_locator;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	uint8 terminal_flags;
+
+	if (memcmp(slot, captured, sizeof(*slot)) != 0
+		|| !cluster_tx_locator_from_itl_terminal_census(
+			page, slot_index, &live_locator, &reason)
+		|| memcmp(&live_locator, &census->locators[slot_index],
+				  sizeof(live_locator)) != 0
+		|| !cluster_tx_locator_reply_matches(
+			&live_locator, &resolution->locator_echo))
+		return false;
+
+	if (captured->flags == ITL_FLAG_ACTIVE)
+		terminal_flags = census->outcomes[slot_index] == CLUSTER_TX_COMMITTED
+			? ITL_FLAG_COMMITTED : ITL_FLAG_ABORTED;
+	else if (captured->flags == ITL_FLAG_LOCK_ONLY_ACTIVE)
+		terminal_flags = census->outcomes[slot_index] == CLUSTER_TX_COMMITTED
+			? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_LOCK_ONLY_ABORTED;
+	else
+		return false;
+
+	if (census->outcomes[slot_index] == CLUSTER_TX_COMMITTED)
+	{
+		if (!SCN_VALID(resolution->commit_scn))
+			return false;
+		slot->commit_scn = resolution->commit_scn;
+	}
+	else if (census->outcomes[slot_index] == CLUSTER_TX_ABORTED)
+	{
+		if (SCN_VALID(resolution->commit_scn))
+			return false;
+		slot->commit_scn = InvalidScn;
+	}
+	else
+		return false;
+	slot->flags = terminal_flags;
+	return true;
+}
+
+static void
+cluster_heap_itl_resolve_terminal_census(
+	ClusterHeapItlTerminalCensus *census)
+{
+	uint8 i;
+
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+		if (!census->locator_valid[i])
+		{
+			census->outcomes[i] = CLUSTER_TX_UNKNOWN;
+			continue;
+		}
+		census->outcomes[i] = cluster_tx_resolve_exact_admitted(
+			&census->locators[i], CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+			&census->admission, &census->resolutions[i], &reason);
+		if (reason != CLUSTER_TX_RESOLVE_NONE
+			|| (census->outcomes[i] != CLUSTER_TX_COMMITTED
+				&& census->outcomes[i] != CLUSTER_TX_ABORTED))
+			census->outcomes[i] = CLUSTER_TX_UNKNOWN;
+	}
+}
+
+static bool
+cluster_heap_itl_apply_terminal_census(
+	Buffer buffer, const ClusterHeapItlTerminalCensus *census)
+{
+	bool recycled = false;
+	uint8 i;
+
+	if (!census->admission_owned
+		|| !cluster_semantic_activation_recheck_r4_terminal_census(
+			&census->admission)
+		|| !cluster_heap_itl_census_page_revalidated(buffer, census))
+		return false;
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		if ((census->outcomes[i] == CLUSTER_TX_COMMITTED
+			 || census->outcomes[i] == CLUSTER_TX_ABORTED)
+			&& cluster_heap_itl_census_stamp_terminal(buffer, i, census))
+			recycled = true;
+	}
+	if (recycled)
+		MarkBufferDirtyHint(buffer, true);
+	return recycled;
+}
+
+static bool
+cluster_heap_itl_unwind_pair_for_terminal_census(
+	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer,
+	ClusterHeapItlTerminalCensus *census)
+{
+	Assert(BufferIsValid(old_buffer));
+	Assert(BufferIsValid(new_buffer));
+	Assert(old_buffer != new_buffer);
+	Assert(full_buffer == old_buffer || full_buffer == new_buffer);
+	if (!cluster_heap_itl_begin_terminal_census(census))
+		return false;
+	if (!cluster_heap_itl_capture_terminal_census(full_buffer, census))
+	{
+		cluster_heap_itl_finish_terminal_census(census);
+		return false;
+	}
+
+	/* Match heap_update's existing full-unwind order.  Resolution starts
+	 * only after neither heap page content authority remains held. */
+	LockBuffer(new_buffer, BUFFER_LOCK_UNLOCK);
+	LockBuffer(old_buffer, BUFFER_LOCK_UNLOCK);
+	PG_TRY();
+	{
+		cluster_heap_itl_resolve_terminal_census(census);
+	}
+	PG_CATCH();
+	{
+		cluster_heap_itl_finish_terminal_census(census);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return true;
+}
+
+static bool
+cluster_heap_itl_alloc_with_terminal_census(Buffer buffer, TransactionId xid,
+										bool lock_only, uint8 *slot_index_out)
+{
+	ClusterHeapItlTerminalCensus census;
+	bool result = false;
+
+	Assert(BufferIsValid(buffer));
+	Assert(TransactionIdIsValid(xid));
+	Assert(slot_index_out != NULL);
+	*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
+	if (cluster_heap_itl_alloc_once(buffer, xid, lock_only, slot_index_out))
+		return true;
+	if (!cluster_heap_itl_begin_terminal_census(&census))
+		return false;
+	if (!cluster_heap_itl_capture_terminal_census(buffer, &census))
+	{
+		cluster_heap_itl_finish_terminal_census(&census);
+		return false;
+	}
+
+	PG_TRY();
+	{
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		cluster_heap_itl_resolve_terminal_census(&census);
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+		if (cluster_heap_itl_apply_terminal_census(buffer, &census))
+			result = cluster_heap_itl_alloc_once(
+				buffer, xid, lock_only, slot_index_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_heap_itl_finish_terminal_census(&census);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+#ifdef USE_CLUSTER_UNIT
+bool
+cluster_heap_test_itl_alloc_with_terminal_census(Buffer buffer,
+										 TransactionId xid, bool lock_only,
+										 uint8 *slot_index_out)
+{
+	return cluster_heap_itl_alloc_with_terminal_census(
+		buffer, xid, lock_only, slot_index_out);
+}
+
+bool
+cluster_heap_test_itl_resolve_pair_terminal_census(
+	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer)
+{
+	ClusterHeapItlTerminalCensus census;
+	bool result;
+
+	result = cluster_heap_itl_unwind_pair_for_terminal_census(
+		old_buffer, new_buffer, full_buffer, &census);
+	cluster_heap_itl_finish_terminal_census(&census);
+	return result;
+}
+
+bool
+cluster_heap_test_itl_update_same_page_failure_cleanup(void)
+{
+	ClusterHeapItlTerminalCensus census = {0};
+
+	/* Model dirty stack ownership without manufacturing a real token debt. */
+	census.admission_owned = true;
+	return cluster_heap_itl_finish_update_census_after_alloc_failure(
+		&census, false);
+}
+#endif
 
 /*
  * cluster_itl_lock_path_enabled (spec-3.4d D11):
@@ -1969,6 +2297,23 @@ typedef enum HeapHotR4CycleOutcome
 } HeapHotR4CycleOutcome;
 
 /*
+ * R4 is DORMANT_IMPLEMENTED in the current frozen batch: its fixed-false
+ * pre-prepare prerequisite cannot open TARGET admission.  Keep the product
+ * hook unreachable so the existing live/source HOT path remains unchanged.
+ * Focused unit builds alone open this seam to exercise the dormant TARGET
+ * implementation without making it reachable in a backend.
+ */
+static bool
+heap_hot_r4_target_reachable(void)
+{
+#ifdef USE_CLUSTER_UNIT
+	return cluster_heap_test_r4_target_reachable();
+#else
+	return false;
+#endif
+}
+
+/*
  * The current-MX HOT consumer carries only the immutable evidence needed by
  * the existing happy path.  Describe and proof waits occur without a content
  * lock; exact tuple, ITL and PCM-X captures fence both unlocked windows.
@@ -2716,7 +3061,8 @@ restart_live_search:
 		if (!skip)
 		{
 #ifdef USE_PGRAC_CLUSTER
-			if (!r4_target_dormant && first_call
+			if (!r4_target_dormant && heap_hot_r4_target_reachable()
+				&& first_call
 				&& cluster_storage_mode_enabled()
 				&& !RelationUsesLocalBuffers(relation)
 				&& heap_hot_r4_updated_xmin_needs_full(
@@ -3270,7 +3616,8 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		/* else: binding declined (e.g., not a normal xid); fall back to
 		 * InvalidUba — reader 3-branch (D7) will treat as legacy slot. */
 
-		if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_itl_slot))
+		if (!cluster_heap_itl_alloc_with_terminal_census(
+				buffer, xid, false, &cluster_itl_slot))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
@@ -3789,7 +4136,8 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			if (cluster_tt_local_get_or_create_binding(xid, &tt_seg, &tt_off, &tt_id_unused))
 				cluster_mi_uba = uba_encode(tt_seg, 0, tt_off, 0);
 
-			if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_mi_slot))
+			if (!cluster_heap_itl_alloc_with_terminal_census(
+					buffer, xid, false, &cluster_mi_slot))
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
@@ -6354,7 +6702,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		if (cluster_tt_local_get_or_create_binding(xid, &tt_seg, &tt_off, &tt_id_unused))
 			cluster_itl_uba = uba_encode(tt_seg, 0, tt_off, 0);
 
-		if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_itl_slot))
+		if (!cluster_heap_itl_alloc_with_terminal_census(
+				buffer, xid, false, &cluster_itl_slot))
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
@@ -6799,6 +7148,9 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	uint8		cluster_itl_new_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	bool		cluster_itl_old_active = false;
 	bool		cluster_itl_new_active = false;
+	ClusterHeapItlTerminalCensus cluster_itl_update_census = {0};
+	bool		cluster_itl_update_census_pending = false;
+	bool		cluster_itl_update_census_old_page = false;
 	/* spec-3.4b D5: single binding shared across old + new stamps (F11). */
 	UBA			cluster_itl_uba = InvalidUba_init;
 	TM_Result	cluster_writer_res = TM_Ok; /* spec-7.1a D0 chained result */
@@ -7799,28 +8151,106 @@ l_pgrac_reacquire:
 		uint32 tt_seg;
 		uint16 tt_off;
 		uint32 tt_id_unused;
+		bool census_was_pending = cluster_itl_update_census_pending;
+		bool old_allocated;
 
 		if (cluster_tt_local_get_or_create_binding(xid, &tt_seg, &tt_off, &tt_id_unused))
 			cluster_itl_uba = uba_encode(tt_seg, 0, tt_off, 0);
 
-		if (!cluster_itl_alloc_or_reuse_slot(buffer, xid, &cluster_itl_old_slot))
+		/* A cross-page full pass resolves with both content locks absent, then
+		 * re-enters through l_pgrac_reacquire.  Apply its result only to the
+		 * exact page identity selected by the new pass. */
+		if (cluster_itl_update_census_pending)
+		{
+			Buffer census_buffer = InvalidBuffer;
+
+			if (cluster_itl_update_census_old_page)
+				census_buffer = buffer;
+			else if (newbuf != buffer)
+				census_buffer = newbuf;
+			if (BufferIsValid(census_buffer))
+				(void) cluster_heap_itl_apply_terminal_census(
+					census_buffer, &cluster_itl_update_census);
+			cluster_itl_update_census_pending = false;
+		}
+
+		old_allocated = newbuf == buffer && !census_was_pending
+			? cluster_heap_itl_alloc_with_terminal_census(
+				buffer, xid, false, &cluster_itl_old_slot)
+			: cluster_heap_itl_alloc_once(
+				buffer, xid, false, &cluster_itl_old_slot);
+		if (census_was_pending
+			&& (cluster_itl_update_census_old_page || newbuf == buffer))
+			cluster_heap_itl_finish_terminal_census(
+				&cluster_itl_update_census);
+		if (!old_allocated)
+		{
+			if (newbuf != buffer && !census_was_pending
+				&& cluster_heap_itl_unwind_pair_for_terminal_census(
+					buffer, newbuf, buffer, &cluster_itl_update_census))
+			{
+				cluster_itl_update_census_pending = true;
+				cluster_itl_update_census_old_page = true;
+				if (old_key_tuple != NULL && old_key_copied)
+				{
+					heap_freetuple(old_key_tuple);
+					old_key_tuple = NULL;
+					old_key_copied = false;
+				}
+				ReleaseBuffer(newbuf);
+				goto l_pgrac_reacquire;
+			}
+			cluster_heap_itl_finish_update_census_after_alloc_failure(
+				&cluster_itl_update_census, census_was_pending);
 			ereport(ERROR,
 					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 					 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
 							CLUSTER_ITL_INITRANS_DEFAULT),
 					 errhint("Raise per-table INITRANS (spec-3.4b) or reduce write concurrency.")));
+		}
 		cluster_itl_old_active = true;
 
 		if (newbuf != buffer && PageHasItl(BufferGetPage(newbuf)))
 		{
-			if (!cluster_itl_alloc_or_reuse_slot(newbuf, xid, &cluster_itl_new_slot))
+			bool new_allocated = cluster_heap_itl_alloc_once(
+				newbuf, xid, false, &cluster_itl_new_slot);
+
+			if (census_was_pending
+				&& !cluster_itl_update_census_old_page)
+				cluster_heap_itl_finish_terminal_census(
+					&cluster_itl_update_census);
+			if (!new_allocated)
+			{
+				if (!census_was_pending
+					&& cluster_heap_itl_unwind_pair_for_terminal_census(
+						buffer, newbuf, newbuf,
+						&cluster_itl_update_census))
+				{
+					cluster_itl_update_census_pending = true;
+					cluster_itl_update_census_old_page = false;
+					if (old_key_tuple != NULL && old_key_copied)
+					{
+						heap_freetuple(old_key_tuple);
+						old_key_tuple = NULL;
+						old_key_copied = false;
+					}
+					ReleaseBuffer(newbuf);
+					goto l_pgrac_reacquire;
+				}
+				cluster_heap_itl_finish_update_census_after_alloc_failure(
+					&cluster_itl_update_census, census_was_pending);
 				ereport(ERROR,
 						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
 								CLUSTER_ITL_INITRANS_DEFAULT),
 						 errhint("Raise per-table INITRANS (spec-3.4b) or reduce write concurrency.")));
+			}
 			cluster_itl_new_active = true;
 		}
+		else if (census_was_pending
+				 && !cluster_itl_update_census_old_page)
+			cluster_heap_itl_finish_terminal_census(
+				&cluster_itl_update_census);
 
 		/*
 		 * PGRAC (spec-3.7 D6 H-4 — UPDATE undo emit):  before
@@ -10006,7 +10436,8 @@ failed:
 		}
 		else
 		{
-			if (!cluster_itl_alloc_or_reuse_lock_slot(*buffer, xid, &cluster_lock_slot_idx))
+			if (!cluster_heap_itl_alloc_with_terminal_census(
+					*buffer, xid, true, &cluster_lock_slot_idx))
 			{
 				cluster_itl_bump_overflow_lock_count();
 				ereport(ERROR,
@@ -10132,7 +10563,7 @@ failed:
 	 * PGRAC (spec-3.4d D4 — inside critical section):  stamp lock-only ITL
 	 * slot with LOCK_ONLY_ACTIVE state.  Allocation + binding happened
 	 * pre-CRIT;  here we only write the slot bytes.  No ereport allowed
-	 * (PG critical section rule);  cluster_itl_alloc_or_reuse_slot
+	 * (PG critical section rule); cluster_heap_itl_alloc_with_terminal_census
 	 * already proved the slot index valid.
 	 */
 	if (cluster_did_lock_stamp)
@@ -11115,7 +11546,8 @@ l4:
 						 errhint("MULTIXACT lock support deferred to spec-3.5+.")));
 			}
 
-			if (!cluster_itl_alloc_or_reuse_lock_slot(buf, xid, &cluster_chain_slot_idx))
+			if (!cluster_heap_itl_alloc_with_terminal_census(
+					buf, xid, true, &cluster_chain_slot_idx))
 			{
 				cluster_itl_bump_overflow_lock_count();
 				ereport(ERROR,

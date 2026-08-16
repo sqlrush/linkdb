@@ -45,6 +45,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_tt_status_hint.h"
+#include "storage/proc.h"
 
 #undef printf
 #undef fprintf
@@ -71,6 +72,7 @@ bool IsUnderPostmaster = false;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 int MyProcPid = 0;
+PGPROC *MyProc = NULL;
 
 static ClusterLmonSharedState test_lmon_state;
 static bool test_lmon_shmem_found = false;
@@ -147,13 +149,25 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+static bool test_lwlock_conditional_result = true;
+static int test_lwlock_blocking_calls = 0;
+static int test_lwlock_conditional_calls = 0;
+
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
 {}
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	test_lwlock_blocking_calls++;
 	return true;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
+						 LWLockMode mode pg_attribute_unused())
+{
+	test_lwlock_conditional_calls++;
+	return test_lwlock_conditional_result;
 }
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
@@ -622,7 +636,7 @@ CreateWaitEventSet(MemoryContext cxt pg_attribute_unused(), int nevents pg_attri
 }
 int
 AddWaitEventToSet(WaitEventSet *set pg_attribute_unused(), uint32 events pg_attribute_unused(),
-				  int fd pg_attribute_unused(), void *latch pg_attribute_unused(),
+				  pgsocket fd pg_attribute_unused(), Latch *latch pg_attribute_unused(),
 				  void *user_data pg_attribute_unused())
 {
 	return -1;
@@ -884,6 +898,10 @@ void
 cluster_grd_master_map_init(void)
 {}
 
+void
+cluster_grd_recovery_authority_lmon_tick(void)
+{}
+
 
 UT_DEFINE_GLOBALS();
 
@@ -1112,6 +1130,36 @@ UT_TEST(test_lmon_duty_lazy_truth_table)
 }
 
 
+UT_TEST(test_lmon_pid_no_pgproc_never_uses_blocking_lwlock)
+{
+	PGPROC fake_proc;
+
+	cluster_lmon_shmem_init();
+	test_lmon_state.pid = 4321;
+	MyProc = NULL;
+	test_lwlock_blocking_calls = 0;
+	test_lwlock_conditional_calls = 0;
+	test_lwlock_conditional_result = false;
+	UT_ASSERT_EQ((int)cluster_lmon_pid(), 0);
+	UT_ASSERT_EQ(test_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(test_lwlock_conditional_calls, 1);
+
+	test_lwlock_conditional_result = true;
+	UT_ASSERT_EQ((int)cluster_lmon_pid(), 4321);
+	UT_ASSERT_EQ(test_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(test_lwlock_conditional_calls, 2);
+
+	memset(&fake_proc, 0, sizeof(fake_proc));
+	MyProc = &fake_proc;
+	test_lwlock_blocking_calls = 0;
+	test_lwlock_conditional_calls = 0;
+	UT_ASSERT_EQ((int)cluster_lmon_pid(), 4321);
+	UT_ASSERT_EQ(test_lwlock_blocking_calls, 1);
+	UT_ASSERT_EQ(test_lwlock_conditional_calls, 0);
+	MyProc = NULL;
+}
+
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -1119,7 +1167,7 @@ UT_TEST(test_lmon_duty_lazy_truth_table)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -1131,6 +1179,7 @@ main(void)
 	UT_RUN(test_lmon_zero_elapsed_is_still_one_completed_sample);
 	UT_RUN(test_lmon_timed_pair_saturates_without_wrapping);
 	UT_RUN(test_lmon_duty_lazy_truth_table);
+	UT_RUN(test_lmon_pid_no_pgproc_never_uses_blocking_lwlock);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

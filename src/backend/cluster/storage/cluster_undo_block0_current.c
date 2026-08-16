@@ -24,6 +24,7 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_resid.h"
+#include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "lib/ilist.h"
 #include "miscadmin.h"
@@ -120,6 +121,17 @@ typedef struct ClusterUndoBlock0CurrentPinCleanup {
 	bool local_pin_held;
 } ClusterUndoBlock0CurrentPinCleanup;
 
+typedef struct ClusterUndoBlock0LiveOwnerCleanup {
+	ClusterSemanticAdmissionToken *admission;
+	ClusterUndoBlock0CurrentGuard *guard;
+	ClusterUndoBlock0FrameToken *frame;
+	ClusterUndoBlock0Pin *pin;
+	bool admission_held;
+	bool current_active;
+	bool pin_held;
+	bool provision_held;
+} ClusterUndoBlock0LiveOwnerCleanup;
+
 StaticAssertDecl(sizeof(ClusterUndoBlock0CurrentGuardData) == 168,
 				 "private block0 current guard must fill its exact 168-byte ABI");
 StaticAssertDecl(offsetof(ClusterUndoBlock0CurrentGuardData, active_node) == 0,
@@ -135,9 +147,15 @@ StaticAssertDecl(CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED == 0
 static dlist_head current_active_guards = DLIST_STATIC_INIT(current_active_guards);
 static bool current_exit_hook_registered = false;
 
+#define CURRENT_ADMISSION_BORROWED_INDEX 0
+#define CURRENT_ADMISSION_OWNED UINT8_C(0)
+#define CURRENT_ADMISSION_CENSUS UINT8_C(1)
+#define CURRENT_ADMISSION_LIVE_OWNER_SOURCE UINT8_C(2)
+
 static void current_backend_exit(int code, Datum arg);
 static void current_error_cleanup(int code, Datum arg);
 static void current_pin_error_cleanup(int code, Datum arg);
+static void current_live_owner_error_cleanup(int code, Datum arg);
 
 static inline ClusterUndoBlock0CurrentGuardData *
 current_guard_data(ClusterUndoBlock0CurrentGuard *guard)
@@ -149,6 +167,25 @@ static inline bool
 current_phase_valid(uint8 phase)
 {
 	return phase <= CLUSTER_UNDO_BLOCK0_CURRENT_STARTUP_FENCED_XCUR;
+}
+
+static inline bool
+current_admission_borrowed(const ClusterUndoBlock0CurrentGuardData *data)
+{
+	return data != NULL
+		   && data->reserved[CURRENT_ADMISSION_BORROWED_INDEX]
+			  != CURRENT_ADMISSION_OWNED;
+}
+
+static inline bool
+current_admission_recheck(const ClusterUndoBlock0CurrentGuardData *data)
+{
+	return data != NULL
+		   && (data->reserved[CURRENT_ADMISSION_BORROWED_INDEX]
+				   == CURRENT_ADMISSION_CENSUS
+				 ? cluster_semantic_activation_recheck_r4_terminal_census(
+					   &data->admission)
+				 : cluster_semantic_activation_recheck(&data->admission));
 }
 
 static inline void
@@ -366,7 +403,7 @@ current_live_recheck(const ClusterUndoBlock0CurrentGuardData *data)
 	if (data == NULL || !cluster_enabled || cluster_node_id < 0 || !cluster_lms_is_ready()
 		|| cluster_lmon_status() != CLUSTER_LMON_READY || !cluster_qvotec_in_quorum()
 		|| !cluster_membership_is_member(cluster_node_id)
-		|| !cluster_semantic_activation_recheck(&data->admission)
+		|| !current_admission_recheck(data)
 		|| cluster_epoch_get_current() != data->holder.cluster_epoch
 		|| cluster_grd_shard_phase(cluster_grd_shard_for_resource(&data->resid))
 			   != GRD_SHARD_NORMAL)
@@ -477,7 +514,8 @@ current_stage_no_wait_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exit
 
 	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
 	current_active_unlink(data);
-	if (admission_entered && data->admission.entered)
+	if (admission_entered && data->admission.entered
+		&& !current_admission_borrowed(data))
 		cluster_semantic_activation_leave(&data->admission);
 }
 
@@ -524,6 +562,38 @@ current_pin_error_cleanup(int code, Datum arg)
 	current_error_cleanup(code, PointerGetDatum(cleanup->guard));
 }
 
+static void
+current_live_owner_error_cleanup(int code, Datum arg)
+{
+	volatile ClusterUndoBlock0LiveOwnerCleanup *cleanup
+		= (volatile ClusterUndoBlock0LiveOwnerCleanup *)DatumGetPointer(arg);
+
+	(void)code;
+	if (cleanup == NULL)
+		return;
+	if (cleanup->provision_held) {
+		cluster_undo_block0_provision_abort(
+			(ClusterUndoBlock0Pin *)cleanup->pin);
+		cleanup->provision_held = false;
+	} else if (cleanup->pin_held) {
+		cluster_undo_block0_unpin((ClusterUndoBlock0Pin *)cleanup->pin);
+		cleanup->pin_held = false;
+	}
+	if (cleanup->frame != NULL && cleanup->frame->owned)
+		cluster_undo_block0_frame_release(
+			(ClusterUndoBlock0FrameToken *)cleanup->frame);
+	if (cleanup->current_active) {
+		cluster_undo_block0_current_cancel(
+			(ClusterUndoBlock0CurrentGuard *)cleanup->guard);
+		cleanup->current_active = false;
+	}
+	if (cleanup->admission_held) {
+		cluster_semantic_activation_leave(
+			(ClusterSemanticAdmissionToken *)cleanup->admission);
+		cleanup->admission_held = false;
+	}
+}
+
 static ClusterUndoBlock0CurrentStep
 current_fail(ClusterUndoBlock0CurrentGuardData *data, ClusterUndoBlock0Result result,
 			 ClusterUndoBlock0Result *failure)
@@ -556,11 +626,13 @@ current_promote_grant(ClusterUndoBlock0CurrentGuardData *data,
 	return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 }
 
-ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
-									  ClusterUndoBlock0CurrentMode mode, int timeout_ms,
-									  ClusterUndoBlock0CurrentGuard *guard,
-									  ClusterUndoBlock0Result *failure)
+static ClusterUndoBlock0CurrentStep
+current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
+				  ClusterUndoBlock0CurrentMode mode, int timeout_ms,
+				  const ClusterSemanticAdmissionToken *caller_admission,
+				  uint8 caller_admission_class,
+				  ClusterUndoBlock0CurrentGuard *guard,
+				  ClusterUndoBlock0Result *failure)
 {
 	ClusterUndoBlock0CurrentGuardData *data;
 	ClusterUndoBlock0CurrentStep step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
@@ -598,6 +670,24 @@ cluster_undo_block0_current_acquire_begin(const ClusterUndoBlock0LogicalKey *key
 		|| !cluster_membership_is_member(cluster_node_id)) {
 		return current_unused_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
 	}
+	if (caller_admission != NULL) {
+		bool census = caller_admission_class == CURRENT_ADMISSION_CENSUS
+			&& mode == CLUSTER_UNDO_BLOCK0_SCUR
+			&& cluster_semantic_activation_recheck_r4_terminal_census(
+				caller_admission);
+		bool live_owner_source
+			= caller_admission_class == CURRENT_ADMISSION_LIVE_OWNER_SOURCE
+			&& mode == CLUSTER_UNDO_BLOCK0_XCUR
+			&& caller_admission->side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			&& cluster_semantic_activation_recheck(caller_admission);
+
+		if (!census && !live_owner_source)
+			return current_unused_fail(
+				data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+	} else if (caller_admission_class != CURRENT_ADMISSION_OWNED) {
+		return current_unused_fail(
+			data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+	}
 
 	effective_timeout_ms
 		= (timeout_ms == -1
@@ -634,13 +724,20 @@ cluster_undo_block0_current_acquire_begin(const ClusterUndoBlock0LogicalKey *key
 	data->next_retry_at = TimestampTzPlusMilliseconds(
 		GetCurrentTimestamp(), CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS);
 
-	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-												CLUSTER_SEMANTIC_TARGET_SIDE,
-												&data->admission);
-	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
-		memset(data, 0, sizeof(*data));
-		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
-		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	if (caller_admission != NULL) {
+		data->admission = *caller_admission;
+		data->reserved[CURRENT_ADMISSION_BORROWED_INDEX]
+			= caller_admission_class;
+	} else {
+		admission_result = cluster_semantic_activation_enter(
+			CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+			CLUSTER_SEMANTIC_TARGET_SIDE, &data->admission);
+		if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+			memset(data, 0, sizeof(*data));
+			current_set_failure(failure,
+							CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+			return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+		}
 	}
 	current_ensure_exit_hook();
 	current_active_link(data);
@@ -699,6 +796,52 @@ acquire_done:
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
 	return step;
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
+									  ClusterUndoBlock0CurrentMode mode,
+									  int timeout_ms,
+									  ClusterUndoBlock0CurrentGuard *guard,
+									  ClusterUndoBlock0Result *failure)
+{
+	return current_acquire_begin(key, mode, timeout_ms, NULL,
+		CURRENT_ADMISSION_OWNED, guard, failure);
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin_admitted(
+	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode,
+	int timeout_ms, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure)
+{
+	if (admission == NULL) {
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	return current_acquire_begin(key, mode, timeout_ms, admission,
+		CURRENT_ADMISSION_CENSUS, guard, failure);
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin_live_owner_source(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure)
+{
+	uint32 logical_slot;
+
+	if (admission == NULL || admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
+		|| cluster_node_id < 0 || key == NULL
+		|| key->owner_instance != (uint8)(cluster_node_id + 1)
+		|| cluster_undo_block0_logical_slot(key, &logical_slot)
+			!= CLUSTER_UNDO_BLOCK0_OK) {
+		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	return current_acquire_begin(
+		key, CLUSTER_UNDO_BLOCK0_XCUR, timeout_ms, admission,
+		CURRENT_ADMISSION_LIVE_OWNER_SOURCE, guard, failure);
 }
 
 ClusterUndoBlock0CurrentStep
@@ -786,7 +929,8 @@ cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard)
 		current_stage_no_wait_cleanup(data, false);
 	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
 	current_active_unlink(data);
-	if (admission_entered && data->admission.entered)
+	if (admission_entered && data->admission.entered
+		&& !current_admission_borrowed(data))
 		cluster_semantic_activation_leave(&data->admission);
 }
 
@@ -812,7 +956,7 @@ cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
 		cluster_ges_release_and_drain_local(&data->resid, &data->holder);
 		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
 		current_active_unlink(data);
-		if (data->admission.entered)
+		if (data->admission.entered && !current_admission_borrowed(data))
 			cluster_semantic_activation_leave(&data->admission);
 		return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
 	}
@@ -870,7 +1014,7 @@ cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard,
 		(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
 		data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP;
 		current_active_unlink(data);
-		if (data->admission.entered)
+		if (data->admission.entered && !current_admission_borrowed(data))
 			cluster_semantic_activation_leave(&data->admission);
 		return CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED;
 	}
@@ -984,6 +1128,63 @@ cluster_undo_block0_current_sample_generation(ClusterUndoBlock0CurrentGuard *gua
 }
 
 ClusterUndoBlock0Result
+cluster_undo_block0_current_sample_generation_exclusive(
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterUndoBlock0Generation *observed)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	ClusterUndoBlock0AuthorityProof proof;
+	ClusterUndoBlock0Generation sampled;
+	ClusterUndoBlock0Result result;
+
+	if (root == NULL || observed == NULL)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	result = current_held_xcur_proof(guard, &data, &proof);
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	{
+		result = cluster_undo_block0_sample_resident_generation(
+			&data->logical, root, &proof, &sampled);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	if (!sampled.known || sampled.value == UINT32_MAX)
+		return CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+	if (!current_live_recheck(data))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	*observed = sampled;
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+ClusterUndoBlock0Result
+cluster_undo_block0_current_prove_strict_empty_exclusive(
+	ClusterUndoBlock0CurrentGuard *guard)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	ClusterUndoBlock0AuthorityProof proof;
+	ClusterUndoBlock0Result result;
+
+	result = current_held_xcur_proof(guard, &data, &proof);
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	if (data->reserved[CURRENT_ADMISSION_BORROWED_INDEX]
+		!= CURRENT_ADMISSION_LIVE_OWNER_SOURCE)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	{
+		result = cluster_undo_block0_prove_strict_empty(&data->logical, &proof);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		return result;
+	if (!current_live_recheck(data))
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+ClusterUndoBlock0Result
 cluster_undo_block0_current_copy_resident(ClusterUndoBlock0CurrentGuard *guard,
 									 const ClusterUndoBlock0ResolvedRoot *root,
 									 const ClusterUndoBlock0Generation *expected,
@@ -1026,7 +1227,7 @@ cluster_undo_block0_current_pin_exclusive(ClusterUndoBlock0CurrentGuard *guard,
 {
 	ClusterUndoBlock0CurrentGuardData *data;
 	ClusterUndoBlock0AuthorityProof proof;
-	ClusterUndoBlock0Pin private_pin;
+	ClusterUndoBlock0Pin original_pin;
 	volatile ClusterUndoBlock0CurrentPinCleanup cleanup;
 	ClusterUndoBlock0Result result;
 	char *private_page = NULL;
@@ -1038,21 +1239,20 @@ cluster_undo_block0_current_pin_exclusive(ClusterUndoBlock0CurrentGuard *guard,
 	if (result != CLUSTER_UNDO_BLOCK0_OK)
 		return result;
 
-	memset(&private_pin, 0, sizeof(private_pin));
-	private_pin.slot = -1;
+	original_pin = *pin;
 	cleanup.guard = guard;
-	cleanup.pin = &private_pin;
+	cleanup.pin = pin;
 	cleanup.local_pin_held = false;
 	PG_ENSURE_ERROR_CLEANUP(current_pin_error_cleanup,
 							PointerGetDatum((ClusterUndoBlock0CurrentPinCleanup *)&cleanup));
 	{
 		result = cluster_undo_block0_pin(&data->logical, root, expected,
-										 CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &private_pin,
-										 &private_page);
+									 CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, pin,
+									 &private_page);
 		if (result == CLUSTER_UNDO_BLOCK0_OK) {
 			cleanup.local_pin_held = true;
 			if (!current_live_recheck(data)) {
-				cluster_undo_block0_unpin(&private_pin);
+				cluster_undo_block0_unpin(pin);
 				cleanup.local_pin_held = false;
 				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 			}
@@ -1061,9 +1261,166 @@ cluster_undo_block0_current_pin_exclusive(ClusterUndoBlock0CurrentGuard *guard,
 	PG_END_ENSURE_ERROR_CLEANUP(
 		current_pin_error_cleanup,
 		PointerGetDatum((ClusterUndoBlock0CurrentPinCleanup *)&cleanup));
-	if (result != CLUSTER_UNDO_BLOCK0_OK)
+	if (result != CLUSTER_UNDO_BLOCK0_OK) {
+		*pin = original_pin;
 		return result;
-	*pin = private_pin;
+	}
 	*page = private_page;
 	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_ensure_resident(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0FrameToken frame = { UINT32_MAX, false };
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0Generation generation = { false, 0 };
+	ClusterUndoBlock0AuthorityProof proof;
+	ClusterUndoBlock0CurrentGuardData *data = NULL;
+	volatile ClusterUndoBlock0LiveOwnerCleanup cleanup;
+	ClusterUndoBlock0CurrentStep step;
+	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterSemanticAdmissionResult admission_result;
+	uint32 logical_slot;
+	char *page = NULL;
+	bool creator = false;
+
+	if (key == NULL || cluster_node_id < 0
+		|| key->owner_instance != (uint8)(cluster_node_id + 1)
+		|| cluster_undo_block0_logical_slot(key, &logical_slot)
+			!= CLUSTER_UNDO_BLOCK0_OK)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+
+	memset(&admission, 0, sizeof(admission));
+	memset(&pin, 0, sizeof(pin));
+	pin.slot = -1;
+	memset(&root, 0, sizeof(root));
+	memset(&final_root, 0, sizeof(final_root));
+	memset(&proof, 0, sizeof(proof));
+	memset((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup, 0,
+		   sizeof(cleanup));
+	cleanup.admission = &admission;
+	cleanup.guard = &guard;
+	cleanup.frame = &frame;
+	cleanup.pin = &pin;
+
+	current_ensure_exit_hook();
+	cluster_undo_smgr_ensure_exit_hook();
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		CLUSTER_SEMANTIC_SOURCE_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	cleanup.admission_held = true;
+
+	PG_ENSURE_ERROR_CLEANUP(
+		current_live_owner_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	{
+		if (!cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				key->owner_instance, key->segment_id, &root))
+			goto ensure_done;
+
+		step = cluster_undo_block0_current_acquire_begin_live_owner_source(
+			key, timeout_ms, &admission, &guard, &current_failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			result = current_failure;
+			goto ensure_done;
+		}
+		cleanup.current_active = true;
+		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			CHECK_FOR_INTERRUPTS();
+			step = cluster_undo_block0_current_acquire_poll(
+				&guard, &current_failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				pg_usleep(1000L);
+		}
+		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+			cleanup.current_active = false;
+			result = current_failure;
+			goto ensure_done;
+		}
+
+		result = current_held_xcur_proof(&guard, &data, &proof);
+		if (result != CLUSTER_UNDO_BLOCK0_OK)
+			goto ensure_done;
+		result = cluster_undo_block0_sample_resident_generation(
+			key, &root, &proof, &generation);
+		if (result == CLUSTER_UNDO_BLOCK0_OK) {
+			if (!generation.known || generation.value == UINT32_MAX)
+				result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+		} else if (result == CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED) {
+			result = cluster_undo_block0_frame_reserve_batch(1, &frame);
+			if (result != CLUSTER_UNDO_BLOCK0_OK)
+				goto ensure_done;
+			result = cluster_undo_block0_provision_begin(
+				key, &root, &proof, &frame, &pin, &page, &creator);
+			if (result != CLUSTER_UNDO_BLOCK0_OK)
+				goto ensure_done;
+			if (creator) {
+				cleanup.provision_held = true;
+				result = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+				goto ensure_done;
+			}
+			cleanup.pin_held = true;
+			generation = pin.observed_generation;
+			if (!generation.known || generation.value == UINT32_MAX) {
+				result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+				goto ensure_done;
+			}
+		} else {
+			goto ensure_done;
+		}
+		if (result != CLUSTER_UNDO_BLOCK0_OK)
+			goto ensure_done;
+
+		if (!cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				key->owner_instance, key->segment_id, &final_root)
+			|| !cluster_undo_block0_root_matches(&root, &final_root)
+			|| !current_live_recheck(data)) {
+			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			goto ensure_done;
+		}
+		result = CLUSTER_UNDO_BLOCK0_OK;
+
+ensure_done:
+		if (cleanup.provision_held) {
+			cluster_undo_block0_provision_abort(&pin);
+			cleanup.provision_held = false;
+		} else if (cleanup.pin_held) {
+			cluster_undo_block0_unpin(&pin);
+			cleanup.pin_held = false;
+		}
+		if (frame.owned)
+			cluster_undo_block0_frame_release(&frame);
+		if (cleanup.current_active) {
+			step = cluster_undo_block0_current_release_begin(
+				&guard, &current_failure);
+			while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+				CHECK_FOR_INTERRUPTS();
+				step = cluster_undo_block0_current_release_poll(
+					&guard, &current_failure);
+				if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+					pg_usleep(1000L);
+			}
+			cleanup.current_active = false;
+			if (step != CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED
+				&& result == CLUSTER_UNDO_BLOCK0_OK)
+				result = current_failure;
+		}
+		cluster_semantic_activation_leave(&admission);
+		cleanup.admission_held = false;
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(
+		current_live_owner_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	return result;
 }

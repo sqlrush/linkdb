@@ -23,6 +23,8 @@
 /* Generation is protected data and therefore never participates in this key. */
 #define CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE 0xFB
 
+typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
+
 typedef enum ClusterUndoBlock0CurrentMode {
 	CLUSTER_UNDO_BLOCK0_SCUR = ShareLock,
 	CLUSTER_UNDO_BLOCK0_XCUR = ExclusiveLock
@@ -52,6 +54,16 @@ extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin(
 	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode, int timeout_ms,
 	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
 extern ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin_admitted(
+	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode,
+	int timeout_ms, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
+extern ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin_live_owner_source(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
+extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 										ClusterUndoBlock0Result *failure);
 extern void cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard);
@@ -65,12 +77,21 @@ cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard,
 extern ClusterUndoBlock0Result cluster_undo_block0_current_sample_generation(
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
 	ClusterUndoBlock0Generation *observed);
+extern ClusterUndoBlock0Result cluster_undo_block0_current_sample_generation_exclusive(
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterUndoBlock0Generation *observed);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_prove_strict_empty_exclusive(
+	ClusterUndoBlock0CurrentGuard *guard);
 extern ClusterUndoBlock0Result cluster_undo_block0_current_copy_resident(
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
 	const ClusterUndoBlock0Generation *expected, char private_page[BLCKSZ]);
 extern ClusterUndoBlock0Result cluster_undo_block0_current_pin_exclusive(
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
 	const ClusterUndoBlock0Generation *expected, ClusterUndoBlock0Pin *pin, char **page);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_ensure_resident(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms);
 
 /* Target Startup's sole no-live-GES lane.  READY publication additionally
  * revalidates this process-local ownership through the query below. */

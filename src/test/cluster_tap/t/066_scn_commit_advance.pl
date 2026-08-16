@@ -60,18 +60,6 @@ $node->append_conf('postgresql.conf', "cluster.node_id = 7\n");
 $node->append_conf('postgresql.conf', "cluster.allow_single_node = on\n");
 $node->append_conf('postgresql.conf', "cluster.pcm_grd_max_entries = 0\n");
 $node->append_conf('postgresql.conf', "max_prepared_transactions = 8\n");
-PostgreSQL::Test::Utils::append_to_file(
-	$node->data_dir . '/pgrac.conf', <<'EOC');
-[cluster]
-name = scn_commit_advance
-
-[node.7]
-interconnect_addr = 127.0.0.1:19066
-
-[node.8]
-interconnect_addr = 127.0.0.1:19067
-EOC
-
 $node->start;
 
 # Helper: read a counter from pg_cluster_state
@@ -85,7 +73,10 @@ sub counter
 }
 
 # Setup test table for L3b / L1 / L2
-$node->safe_psql('postgres', q{CREATE TABLE t1 (id int); INSERT INTO t1 VALUES (1);});
+$node->safe_psql('postgres', q{
+	CREATE TABLE t1 (id int, filler text DEFAULT repeat('x', 1900));
+	INSERT INTO t1 VALUES (1);
+});
 
 
 # ----------

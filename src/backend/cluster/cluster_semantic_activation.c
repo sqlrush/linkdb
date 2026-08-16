@@ -188,8 +188,6 @@ static bool semantic_activation_authority_mailbox_poll_completion(
 static bool semantic_activation_authority_request_formation_binding(
 	ClusterSemanticAuthorityRequestKind request_kind,
 	ClusterSemanticFormationBinding *out);
-static bool semantic_activation_qvotec_formation_matches(
-	const ClusterSemanticFormationBinding *formation);
 static bool semantic_activation_record_cas_formation_matches(
 	const ClusterSemanticFormationBinding *formation,
 	const ClusterSemanticActivationRecord *desired);
@@ -3001,6 +2999,22 @@ semantic_activation_admission_policy(uint64 feature_bit, uint64 active_bits, boo
 	return active ? CLUSTER_SEMANTIC_ADMISSION_OK : CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
 }
 
+static ClusterSemanticAdmissionResult
+semantic_activation_r4_terminal_census_policy(
+	uint64 feature_bit, bool transition_closed,
+	ClusterSemanticAdmissionSide side, uint64 expected_generation,
+	uint64 current_generation)
+{
+	if (feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| side != CLUSTER_SEMANTIC_TARGET_SIDE)
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	if (expected_generation != current_generation)
+		return CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+	if (transition_closed)
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
 static bool
 semantic_activation_modifier_policy(uint64 active_bits, uint64 record_generation,
 									bool transition_closed)
@@ -3092,6 +3106,23 @@ semantic_activation_preflight(ClusterSemanticActivationAction action, uint64 exp
 
 	result = r4_pre_prepare_readiness(expected_generation, refusal);
 	return result;
+}
+
+/*
+ * The M4 terminal-census exception may establish only its already-frozen
+ * PGRD authority while the later RF readiness conjunction is still deferred.
+ * This does not admit TARGET or advance the PGSA FSM: the utility completes
+ * with the original RF_DEFERRED result after QVOTEC majority plus exact
+ * mirror publication.  Every other refusal remains mutation-free.
+ */
+static bool
+semantic_activation_preopen_pgrd_setup_allowed(
+	ClusterSemanticActivationAction action,
+	ClusterSemanticActivationResult preflight_result)
+{
+	return action == CLUSTER_SEMANTIC_ENABLE_ALL
+		   && (preflight_result == CLUSTER_SEMANTIC_ACTIVATION_OK
+			   || preflight_result == CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
 }
 
 static bool
@@ -4673,9 +4704,10 @@ semantic_activation_release_debt(ClusterSemanticAdmissionSide side, int feature_
 	(*local)--;
 }
 
-ClusterSemanticAdmissionResult
-cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
-								  ClusterSemanticAdmissionToken *token)
+static ClusterSemanticAdmissionResult
+semantic_activation_enter_internal(uint64 feature_bit,
+	ClusterSemanticAdmissionSide side, ClusterSemanticAdmissionToken *token,
+	bool terminal_census)
 {
 	SemanticActivationAdmissionSnapshot before;
 	SemanticActivationAdmissionSnapshot after;
@@ -4698,9 +4730,14 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 	if (before.formation_epoch != epoch_before)
 		return CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
-	result = semantic_activation_admission_policy(
-		feature_bit, before.active_bits, before.transition_closed, side, before.record_generation,
-		before.record_generation);
+	if (terminal_census)
+		result = semantic_activation_r4_terminal_census_policy(
+			feature_bit, before.transition_closed, side,
+			before.record_generation, before.record_generation);
+	else
+		result = semantic_activation_admission_policy(
+			feature_bit, before.active_bits, before.transition_closed, side,
+			before.record_generation, before.record_generation);
 	if (result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return result;
 
@@ -4724,6 +4761,10 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 			|| before.formation_epoch != after.formation_epoch || epoch_before != epoch_after
 			|| after.formation_epoch != epoch_after)
 			result = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+		else if (terminal_census)
+			result = semantic_activation_r4_terminal_census_policy(
+				feature_bit, after.transition_closed, side,
+				before.record_generation, after.record_generation);
 		else
 			result = semantic_activation_admission_policy(
 				feature_bit, after.active_bits, after.transition_closed, side,
@@ -4742,6 +4783,22 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 	token->side = (uint8)side;
 	token->entered = true;
 	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+ClusterSemanticAdmissionResult
+cluster_semantic_activation_enter(uint64 feature_bit,
+	ClusterSemanticAdmissionSide side, ClusterSemanticAdmissionToken *token)
+{
+	return semantic_activation_enter_internal(feature_bit, side, token, false);
+}
+
+ClusterSemanticAdmissionResult
+cluster_semantic_activation_enter_r4_terminal_census(
+	ClusterSemanticAdmissionToken *token)
+{
+	return semantic_activation_enter_internal(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, token, true);
 }
 
 ClusterSemanticAdmissionResult
@@ -4824,6 +4881,31 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 			   token->feature_bit, snapshot.active_bits, snapshot.transition_closed,
 			   (ClusterSemanticAdmissionSide)token->side, token->record_generation,
 			   snapshot.record_generation)
+		   == CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+bool
+cluster_semantic_activation_recheck_r4_terminal_census(
+	const ClusterSemanticAdmissionToken *token)
+{
+	SemanticActivationAdmissionSnapshot snapshot;
+	uint64 current_epoch;
+
+	if (token == NULL || !token->entered
+		|| token->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| token->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| SemanticActivationShmem == NULL
+		|| !semantic_activation_snapshot(&snapshot))
+		return false;
+	current_epoch = cluster_epoch_get_current();
+	if (snapshot.formation_epoch != current_epoch
+		|| token->formation_epoch != current_epoch)
+		return false;
+
+	return semantic_activation_r4_terminal_census_policy(
+			   token->feature_bit, snapshot.transition_closed,
+			   (ClusterSemanticAdmissionSide)token->side,
+			   token->record_generation, snapshot.record_generation)
 		   == CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
@@ -4937,8 +5019,61 @@ semantic_activation_pgrd_snapshot_copy(
 	return false;
 }
 
+static bool
+semantic_activation_resolve_shared_undo_root(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out, bool terminal_census)
+{
+	ClusterUndoBlock0ResolvedRoot resolved;
+	ClusterUndoRootDescriptorV1 descriptor;
+	uint8 descriptor_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+
+	if (token == NULL || out == NULL || !token->entered
+		|| token->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| token->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| !(terminal_census
+			 ? cluster_semantic_activation_recheck_r4_terminal_census(token)
+			 : cluster_semantic_activation_recheck(token))
+		|| !semantic_activation_pgrd_snapshot_copy(descriptor_bytes)
+		|| cluster_undo_root_descriptor_decode(
+			   descriptor_bytes, GetSystemIdentifier(), &descriptor)
+			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+		|| !cluster_undo_root_descriptor_resolve(
+			&descriptor, intent, owner_instance, segment_id, &resolved)
+		|| !(terminal_census
+			 ? cluster_semantic_activation_recheck_r4_terminal_census(token)
+			 : cluster_semantic_activation_recheck(token)))
+		return false;
+
+	*out = resolved;
+	return true;
+}
+
 bool
 cluster_semantic_activation_resolve_shared_undo_root(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out)
+{
+	return semantic_activation_resolve_shared_undo_root(
+		token, intent, owner_instance, segment_id, out, false);
+}
+
+bool
+cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out)
+{
+	if (intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED)
+		return false;
+	return semantic_activation_resolve_shared_undo_root(
+		token, intent, owner_instance, segment_id, out, true);
+}
+
+bool
+cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
 	uint32 owner_instance, uint32 segment_id,
 	ClusterUndoBlock0ResolvedRoot *out)
@@ -4949,12 +5084,15 @@ cluster_semantic_activation_resolve_shared_undo_root(
 
 	if (token == NULL || out == NULL || !token->entered
 		|| token->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-		|| token->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| token->side != CLUSTER_SEMANTIC_SOURCE_SIDE
+		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		|| cluster_node_id < 0
+		|| owner_instance != (uint32)cluster_node_id + 1
 		|| !cluster_semantic_activation_recheck(token)
 		|| !semantic_activation_pgrd_snapshot_copy(descriptor_bytes)
 		|| cluster_undo_root_descriptor_decode(
-			   descriptor_bytes, GetSystemIdentifier(), &descriptor)
-			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+			descriptor_bytes, GetSystemIdentifier(), &descriptor)
+			!= CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
 		|| !cluster_undo_root_descriptor_resolve(
 			&descriptor, intent, owner_instance, segment_id, &resolved)
 		|| !cluster_semantic_activation_recheck(token))
@@ -5693,7 +5831,7 @@ cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
 		|| !semantic_activation_authority_request_formation_binding(
 			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR,
 			&out->formation)
-		|| !semantic_activation_qvotec_formation_matches(
+		|| !cluster_semantic_activation_qvotec_pgrd_formation_matches(
 			&out->formation)) {
 		(void)cluster_semantic_activation_qvotec_complete_undo_root_descriptor(
 			request_seq, CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
@@ -5782,7 +5920,7 @@ cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
 		|| !semantic_activation_authority_request_formation_binding(
 			CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ,
 			&out->formation)
-		|| !semantic_activation_qvotec_formation_matches(
+		|| !cluster_semantic_activation_qvotec_pgrd_formation_matches(
 			&out->formation)) {
 		(void)cluster_semantic_activation_qvotec_complete_undo_root_descriptor_read(
 			request_seq, CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD, zero);
@@ -5833,15 +5971,6 @@ semantic_activation_qvotec_formation_matches_expected(
 		   && cluster_qvotec_get_self_incarnation() == current_incarnation;
 }
 
-static bool
-semantic_activation_qvotec_formation_matches(
-	const ClusterSemanticFormationBinding *formation)
-{
-	return formation != NULL
-		   && semantic_activation_qvotec_formation_matches_expected(
-			   formation, formation->expected_record_generation);
-}
-
 /* RECORD_CAS keeps the utility episode's immutable starting generation while
  * each serial durable edge binds the generation it actually compares.  The
  * approved happy path currently reaches PREPARE(g+1) and COMMIT(g+2) only. */
@@ -5887,7 +6016,46 @@ bool
 cluster_semantic_activation_qvotec_pgrd_formation_matches(
 	const ClusterSemanticFormationBinding *formation)
 {
-	return semantic_activation_qvotec_formation_matches(formation);
+	SemanticActivationAdmissionSnapshot snapshot;
+	uint64 current_epoch;
+	uint64 current_incarnation;
+
+	if (formation == NULL || formation->utility_request_seq == 0
+		|| formation->coordinator_incarnation == 0
+		|| SemanticActivationUtilityMailbox == NULL
+		|| SemanticActivationShmem == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| pg_atomic_read_u32(
+			   &SemanticActivationUtilityMailbox->utility_mailbox_state)
+			   != SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING
+		|| pg_atomic_read_u64(
+			   &SemanticActivationUtilityMailbox->utility_request_seq)
+			   != formation->utility_request_seq
+		|| SemanticActivationUtilityMailbox->utility_action
+			   != CLUSTER_SEMANTIC_ENABLE_ALL
+		|| SemanticActivationUtilityMailbox->utility_source_feature_bitmap != 0
+		|| SemanticActivationUtilityMailbox->utility_target_feature_bitmap
+			   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| SemanticActivationUtilityMailbox->utility_rollback_feature_bitmap != 0
+		|| SemanticActivationUtilityMailbox->utility_expected_record_generation
+			   != formation->expected_record_generation
+		|| !cluster_qvotec_in_quorum())
+		return false;
+
+	current_epoch = cluster_epoch_get_current();
+	current_incarnation = cluster_qvotec_get_self_incarnation();
+	if (current_epoch != formation->formation_epoch
+		|| current_incarnation != formation->coordinator_incarnation
+		|| !semantic_activation_snapshot(&snapshot)
+		|| snapshot.formation_epoch != formation->formation_epoch
+		|| snapshot.record_generation
+			   != formation->expected_record_generation
+		|| snapshot.active_bits != 0 || snapshot.transition_closed)
+		return false;
+
+	return cluster_qvotec_in_quorum()
+		   && cluster_epoch_get_current() == current_epoch
+		   && cluster_qvotec_get_self_incarnation() == current_incarnation;
 }
 
 bool
@@ -6354,7 +6522,8 @@ semantic_activation_lmon_consume_utility(void)
 		result = semantic_activation_preflight(
 			request.action, request.expected_record_generation, &refusal,
 			&effects);
-		if (result == CLUSTER_SEMANTIC_ACTIVATION_OK) {
+		if (semantic_activation_preopen_pgrd_setup_allowed(
+				request.action, result)) {
 			ClusterSemanticFormationBinding formation = {
 				.utility_request_seq = request.request_seq,
 				.formation_epoch = cluster_epoch_get_current(),
@@ -6669,6 +6838,7 @@ cluster_semantic_activation_lmon_tick(void)
 						errmsg("semantic activation admission sequence exhausted"),
 						errhint("Retain the shared-memory image and restart the cluster.")));
 
+	semantic_activation_pgrd_snapshot_clear();
 	(void)semantic_activation_lmon_publish_gate(
 		&snapshot, snapshot.active_bits, snapshot.record_generation,
 		current_epoch, true);
@@ -6691,7 +6861,7 @@ cluster_semantic_activation_submit(ClusterSemanticActivationAction action,
 
 	result = semantic_activation_preflight(
 		action, snapshot.record_generation, refusal, &effects);
-	if (result != CLUSTER_SEMANTIC_ACTIVATION_OK)
+	if (!semantic_activation_preopen_pgrd_setup_allowed(action, result))
 		return result;
 
 	/* The first positive carrier is the approved ENABLE happy path.  Later

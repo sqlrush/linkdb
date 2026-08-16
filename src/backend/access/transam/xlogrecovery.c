@@ -3520,7 +3520,7 @@ ApplyWalRecord(XLogReaderState *xlogreader, XLogRecord *record, TimeLineID *repl
 		 * Before we continue on the new timeline, clean up any (possibly
 		 * bogus) future WAL segments on the old timeline.
 		 */
-		RemoveNonParentXlogFiles(xlogreader->EndRecPtr, *replayTLI);
+		RemoveNonParentXlogFiles(xlogreader->EndRecPtr, *replayTLI, true);
 
 		/* Reset the prefetcher. */
 		XLogPrefetchReconfigure();

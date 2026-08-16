@@ -25,7 +25,44 @@ use strict;
 use warnings;
 
 use PostgreSQL::Test::Cluster;
+use PostgreSQL::Test::ClusterVotingDisk qw(format_voting_file);
 use PostgreSQL::Test::Utils;
+
+
+# Relocate an init_from_backup node's copied pg_wal into its own shared WAL
+# thread directory.  The seed keeps thread_1; the cloned member receives
+# thread_2 while retaining the seed's real system identifier.
+sub _relocate_backup_pg_wal
+{
+	my ($node, $wal_threads_root, $thread_id) = @_;
+	my $pgwal = $node->data_dir . '/pg_wal';
+	my $wal_thread = "$wal_threads_root/thread_$thread_id";
+
+	mkdir $wal_thread or die "mkdir $wal_thread: $!";
+	opendir(my $dh, $pgwal) or die "opendir $pgwal: $!";
+	for my $entry (readdir $dh)
+	{
+		next if $entry eq '.' || $entry eq '..';
+		rename("$pgwal/$entry", "$wal_thread/$entry")
+		  or die "rename $pgwal/$entry -> $wal_thread/$entry: $!";
+	}
+	closedir $dh;
+	rmdir $pgwal or die "rmdir $pgwal: $!";
+	symlink($wal_thread, $pgwal) or die "symlink $pgwal -> $wal_thread: $!";
+	return;
+}
+
+
+sub _pg_controldata_system_identifier
+{
+	my ($node) = @_;
+	my ($output, $error) = PostgreSQL::Test::Utils::run_command(
+		[ $node->installed_command('pg_controldata'), $node->data_dir ]);
+
+	return $1 if $output =~ /Database system identifier:\s+(\d+)/;
+	die "pg_controldata omitted the system identifier for " . $node->data_dir
+	  . ": $error";
+}
 
 
 #-----------------------------------------------------------------------
@@ -70,6 +107,15 @@ use PostgreSQL::Test::Utils;
 #	                           premise; production naming is feature
 #	                           #11).  Use ->shared_data_root to reach
 #	                           the root (sentinel inspection etc.).
+#	  true_shared_sysid_cf    : boolean — explicit true shared-system-id
+#	                           provisioning for a formed WAL registry.  Node1
+#	                           is initialized from a physical backup of node0,
+#	                           both use one verified shared pg_control
+#	                           authority, while their PGDATA and WAL thread
+#	                           identities remain distinct.  Requires
+#	                           wal_threads_root + quorum_voting_disks.  This is
+#	                           opt-in so legacy shared-nothing pair tests keep
+#	                           per-node control files unchanged.
 #-----------------------------------------------------------------------
 sub new_pair
 {
@@ -108,7 +154,7 @@ sub new_pair
 	  PostgreSQL::Test::Cluster->new("${cluster_name}_node1", port => $pg_port_1);
 
 	# spec-2.6 strict-mode opt-in: pre-allocate N shared voting-disk
-	# files (zero-filled, 128 slots × 512B = 64KB each) in a tempdir
+	# files (canonically formatted complete voting-member layout) in a tempdir
 	# both postmasters can read/write.  Disks list is built once and
 	# written into both nodes' postgresql.conf so the same file paths
 	# back the same disk_index slots from both sides.
@@ -120,12 +166,7 @@ sub new_pair
 		for my $i (0 .. $opts{quorum_voting_disks} - 1)
 		{
 			my $path = "$disk_dir/disk$i";
-			open(my $fh, '>', $path) or die "open $path: $!";
-			binmode $fh;
-			# PGRAC spec-5.13: two 512-byte regions per node (voting slot +
-			# clean-leave marker), so 2 * 128 slots = 128 KiB.
-			print $fh ("\0" x (2 * 128 * 512));
-			close $fh;
+			format_voting_file($path, $i);
 			push @voting_disk_paths, $path;
 		}
 		$voting_disks_csv = join(',', @voting_disk_paths);
@@ -165,21 +206,112 @@ sub new_pair
 		}
 	}
 
-	my $wal_node_index = 0;
+	my $shared_control_root;
+	my $shared_system_identifier;
+	if ($opts{true_shared_sysid_cf})
+	{
+		die "true_shared_sysid_cf requires wal_threads_root"
+		  unless defined $wal_threads_root;
+		die "true_shared_sysid_cf requires quorum_voting_disks"
+		  unless defined $voting_disks_csv;
+		die "true_shared_sysid_cf does not support cluster_name_override"
+		  if defined $opts{cluster_name_override};
+
+		$shared_control_root = PostgreSQL::Test::Utils::tempdir();
+		mkdir "$shared_control_root/global"
+		  or die "mkdir $shared_control_root/global: $!";
+
+		$node0->init(allows_streaming => 1, extra => [
+			'-X', "$wal_threads_root/thread_1",
+			"--pgrac-wal-state-root=$wal_threads_root" ]);
+
+		# A2: the seed is a legitimate one-member cluster from its first start.
+		# It publishes the shared control authority and its current-member
+		# recovery anchor before a physical backup is allowed to mint node1.
+		# The later strict two-member start therefore grows one database instead
+		# of asking a cluster-disabled seed to publish cluster-era authority.
+		$node0->append_conf('postgresql.conf', <<EOC);
+	cluster.enabled = on
+	cluster.interconnect_tier = tier1
+	cluster.lms_enabled = on
+	cluster.allow_single_node = off
+	cluster.voting_disks = '$voting_disks_csv'
+	cluster.node_id = 0
+	cluster.wal_threads_dir = '$wal_threads_root'
+	cluster.shared_storage_backend = cluster_fs
+	cluster.shared_data_dir = '$shared_control_root'
+	cluster.controlfile_shared_authority = on
+EOC
+		my $seed_pgrac_conf = <<EOC;
+[cluster]
+name = $cluster_name
+
+[node.0]
+interconnect_addr = 127.0.0.1:$ic_port_0
+data_addr = 127.0.0.1:$data_port_0
+EOC
+		PostgreSQL::Test::Utils::append_to_file(
+			$node0->data_dir . '/pgrac.conf', $seed_pgrac_conf);
+		$node0->start;
+
+		my $seed_control = $node0->data_dir . '/global/pg_control';
+		my $authority = "$shared_control_root/global/pg_control";
+		die "true shared-control seed did not create the verified authority"
+		  unless -l $seed_control && readlink($seed_control) eq $authority
+		  && -f $authority;
+
+		$node0->backup('clusterpair_true_shared_sysid');
+		$node0->stop;
+
+		$node1->init_from_backup($node0, 'clusterpair_true_shared_sysid');
+		_relocate_backup_pg_wal($node1, $wal_threads_root, 2);
+
+		my $node0_sysid = _pg_controldata_system_identifier($node0);
+		my $node1_sysid = _pg_controldata_system_identifier($node1);
+		die "true shared-system-id provisioning mismatch: node0=$node0_sysid "
+		  . "node1=$node1_sysid"
+		  unless $node0_sysid eq $node1_sysid;
+		$shared_system_identifier = $node0_sysid;
+	}
+	else
+	{
+		my $wal_node_index = 0;
+		for my $node ($node0, $node1)
+		{
+			if (defined $wal_threads_root)
+			{
+				my $thread_id = $wal_node_index + 1;
+				$node->init(extra => [
+					'-X', "$wal_threads_root/thread_$thread_id",
+					"--pgrac-wal-state-root=$wal_threads_root" ]);
+			}
+			else
+			{
+				$node->init;
+			}
+			$wal_node_index++;
+		}
+	}
+
 	for my $node ($node0, $node1)
 	{
 		if (defined $wal_threads_root)
 		{
-			my $thread_id = $wal_node_index + 1;
-			$node->init(extra => [ '-X', "$wal_threads_root/thread_$thread_id" ]);
 			$node->append_conf('postgresql.conf',
 				"cluster.wal_threads_dir = '$wal_threads_root'\n");
 		}
-		else
+
+		if (defined $shared_control_root)
 		{
-			$node->init;
+			$node->append_conf('postgresql.conf',
+				"cluster.shared_storage_backend = cluster_fs\n");
+			$node->append_conf('postgresql.conf',
+				"cluster.shared_data_dir = '$shared_control_root'\n");
+			$node->append_conf('postgresql.conf',
+				"cluster.controlfile_shared_authority = on\n");
+			$node->append_conf('postgresql.conf',
+				"cluster.lms_enabled = on\n");
 		}
-		$wal_node_index++;
 
 		if (defined $shared_data_root)
 		{
@@ -284,10 +416,29 @@ interconnect_addr = 127.0.0.1:$ic_port_1
 data_addr = 127.0.0.1:$data_port_1
 EOC
 
-	PostgreSQL::Test::Utils::append_to_file(
-		$node0->data_dir . '/pgrac.conf', $pgrac_conf_0);
-	PostgreSQL::Test::Utils::append_to_file(
-		$node1->data_dir . '/pgrac.conf', $pgrac_conf_1);
+	if (defined $shared_control_root)
+	{
+		my $node1_only = <<EOC;
+
+[node.1]
+interconnect_addr = 127.0.0.1:$ic_port_1
+data_addr = 127.0.0.1:$data_port_1
+EOC
+		PostgreSQL::Test::Utils::append_to_file(
+			$node0->data_dir . '/pgrac.conf', $node1_only);
+		# node1 inherited the seed's one-node topology from pg_basebackup.
+		# Grow that same topology instead of appending a second [cluster] and
+		# duplicate [node.0] section.
+		PostgreSQL::Test::Utils::append_to_file(
+			$node1->data_dir . '/pgrac.conf', $node1_only);
+	}
+	else
+	{
+		PostgreSQL::Test::Utils::append_to_file(
+			$node0->data_dir . '/pgrac.conf', $pgrac_conf_0);
+		PostgreSQL::Test::Utils::append_to_file(
+			$node1->data_dir . '/pgrac.conf', $pgrac_conf_1);
+	}
 
 	return bless {
 		node0       => $node0,
@@ -299,6 +450,8 @@ EOC
 		voting_disk_paths => \@voting_disk_paths,
 		wal_threads_root  => $wal_threads_root,
 		shared_data_root  => $shared_data_root,
+		shared_control_root => $shared_control_root,
+		shared_system_identifier => $shared_system_identifier,
 	}, $class;
 }
 
@@ -306,8 +459,90 @@ EOC
 sub start_pair
 {
 	my ($self, %opts) = @_;
-	$self->{node0}->start(%opts);
-	$self->{node1}->start(%opts);
+
+	# Strict-mode startup must let every declared member enter formation.
+	# A blocking node0 start cannot do that: phase3 waits for node1 while the
+	# harness has not launched node1 yet.  Launch node1 without pg_ctl's
+	# readiness wait, then use node0's normal start as the rendezvous wait.
+	if (@{ $self->{voting_disk_paths} // [] })
+	{
+		my $node0 = $self->{node0};
+		my $node1 = $self->{node1};
+		my $node1_start_rc;
+		my $requested_fail_ok = $opts{fail_ok};
+
+		{
+			local %ENV = $node1->_get_env(PGAPPNAME => undef);
+			$node1_start_rc = PostgreSQL::Test::Utils::system_log(
+				'pg_ctl', '-W', '-D', $node1->data_dir,
+				'-l', $node1->logfile, '-o',
+				'--cluster-name=' . $node1->name, 'start');
+		}
+		if ($node1_start_rc != 0)
+		{
+			print "# pg_ctl background start failed for node1; logfile:\n";
+			print PostgreSQL::Test::Utils::slurp_file($node1->logfile);
+			Test::More::BAIL_OUT("pg_ctl background start failed")
+			  unless $requested_fail_ok;
+			return 0;
+		}
+
+		my %node0_opts = (%opts, fail_ok => 1);
+		my $node0_started = $node0->start(%node0_opts);
+		$node1->_update_pid(-1);
+		if (!$node0_started)
+		{
+			Test::More::BAIL_OUT("pg_ctl start failed")
+			  unless $requested_fail_ok;
+			return 0;
+		}
+
+		my $deadline = time + 60;
+		my $node1_ready = 0;
+		while (time < $deadline)
+		{
+			my ($rc) = $node1->psql('postgres', 'SELECT 1', timeout => 2);
+			if (defined $rc && $rc == 0)
+			{
+				$node1_ready = 1;
+				last;
+			}
+			select(undef, undef, undef, 0.25);
+		}
+		if (!$node1_ready)
+		{
+			print "# background node1 did not become ready; logfile:\n";
+			print PostgreSQL::Test::Utils::slurp_file($node1->logfile);
+			$node1->_update_pid(-1);
+			Test::More::BAIL_OUT("background node1 start failed")
+			  unless $requested_fail_ok;
+			return 0;
+		}
+		$node1->_update_pid(1);
+	}
+	else
+	{
+		$self->{node0}->start(%opts);
+		$self->{node1}->start(%opts);
+	}
+
+	if (defined $self->{shared_control_root})
+	{
+		my $authority = $self->{shared_control_root} . '/global/pg_control';
+		for my $node ($self->{node0}, $self->{node1})
+		{
+			my $local_control = $node->data_dir . '/global/pg_control';
+			Test::More::BAIL_OUT(
+				"true shared-control provisioning did not bind " . $node->name)
+			  unless -l $local_control && readlink($local_control) eq $authority;
+		}
+		my $node0_sysid = _pg_controldata_system_identifier($self->{node0});
+		my $node1_sysid = _pg_controldata_system_identifier($self->{node1});
+		Test::More::BAIL_OUT(
+			"true shared-control verification changed the system identifier")
+		  unless $node0_sysid eq $self->{shared_system_identifier}
+		  && $node1_sysid eq $self->{shared_system_identifier};
+	}
 
 	# spec-2.13 Hardening v1.0.2 diagnostic instrumentation
 	# (L66-family HELLO bad magic root-cause investigation).
@@ -322,7 +557,7 @@ sub start_pair
 	Test::More::note(
 		"ClusterPair started: cluster_name='$name' "
 		. "node0=pg:$pg0/ic:$ic0 node1=pg:$pg1/ic:$ic1");
-	return;
+	return 1;
 }
 
 sub stop_pair

@@ -55,6 +55,7 @@
 #include <string.h>
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_gcs.h"	   /* spec-4.7 D2 (L238) — cluster_gcs_lookup_master proto */
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 (L238) — block re-declare scan/send protos */
 #include "cluster/cluster_ges_handoff.h" /* spec-6.12e1 — verifier stub types */
@@ -401,6 +402,17 @@ cluster_thread_recovery_launch_workers(const uint64 *dead pg_attribute_unused(),
 									   int nwords pg_attribute_unused(),
 									   uint64 episode_epoch pg_attribute_unused())
 {}
+
+bool
+cluster_reconfig_rejoin_failure_snapshot(
+	int32 old_node_id pg_attribute_unused(),
+	uint64 old_incarnation pg_attribute_unused(),
+	ClusterReconfigRejoinFailureSnapshotV1 *out_failure)
+{
+	if (out_failure != NULL)
+		memset(out_failure, 0, sizeof(*out_failure));
+	return false;
+}
 
 /* spec-5.7 D3 S5d stubs:  cluster_grd.c's WAIT_CLUSTER tick now also launches the
  * HW authority rebuild worker and consults its unfreeze gate before P7.  These

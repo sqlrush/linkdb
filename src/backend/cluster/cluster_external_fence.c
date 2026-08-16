@@ -5,12 +5,18 @@
  *
  * The current approved package deliberately has no production provider:
  * provider id 0 is UNAVAILABLE and bit 24 is not advertised.  Consequently
- * this file implements the complete public fail-closed boundary, but creates
- * no positive NeedSet or Admission.  A provider selection and certification
- * decision is required before adding a positive path.
+ * this file keeps production fail-closed.  A compile-time unit-test seam may
+ * supply an authenticated transport for the frozen protocol's positive-path
+ * witnesses; it is absent from the production object and link map.
  *
  *-------------------------------------------------------------------------
  */
+#ifdef __linux__
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
+#endif
+
 #include "postgres.h"
 
 #ifndef WIN32
@@ -18,6 +24,7 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/un.h>
 #include <time.h>
 #include <unistd.h>
@@ -34,13 +41,25 @@
 static PgracExternalFenceDenyReason external_fence_last_deny =
 	PGRAC_EXTERNAL_FENCE_DENY_NONE;
 
+#ifdef USE_CLUSTER_UNIT
+extern bool cluster_external_fence_test_runtime_active(void);
+extern int cluster_external_fence_test_connect_root_daemon(int timeout_ms);
+extern bool cluster_external_fence_test_root_peer_authenticated(int fd);
+extern int cluster_external_fence_test_admission_lease_ms(
+	const PgracExternalFenceAdmissionV1 *admission);
+#endif
+
 bool
 cluster_external_fence_runtime_active(void)
 {
+#ifdef USE_CLUSTER_UNIT
+	return cluster_external_fence_test_runtime_active();
+#else
 	/* STOP04 §11.7: provider 0 is the sole production registry outcome and
 	 * no deployment certification exists, so bit24 positive activation is
 	 * forbidden in this package. */
 	return false;
+#endif
 }
 
 bool
@@ -71,12 +90,18 @@ cluster_external_fence_rejoin_protected_set_digest(
 #define PGRAC_EXTERNAL_FENCE_MAX_FRESHNESS_NS UINT64_C(5000000000)
 #define PGRAC_EXTERNAL_FENCE_ROOT_SOURCE_PRIMARY UINT8_C(1)
 
+#ifndef WIN32
+static bool external_fence_monotonic_now(uint64 *out_now_ns);
+#endif
+
 static const uint8 external_fence_rejoin_clear_domain[] =
 	"PGRAC-REJOIN-AUTHORITY-CLEAR-V1";
 static const uint8 external_fence_rejoin_complete_domain[] =
 	"PGRAC-REJOIN-COMPLETE-V1";
 static const uint8 external_fence_rejoin_gate_domain[] =
 	"PGRAC-REJOIN-GATE-V1";
+static const uint8 external_fence_writer_set_domain[] =
+	"PGRAC-PROTECTED-WRITERS-V1";
 
 StaticAssertDecl(sizeof(external_fence_rejoin_clear_domain) == 32,
 				 "rejoin authority-clear digest domain changed");
@@ -84,6 +109,8 @@ StaticAssertDecl(sizeof(external_fence_rejoin_complete_domain) == 25,
 				 "rejoin complete digest domain changed");
 StaticAssertDecl(sizeof(external_fence_rejoin_gate_domain) == 21,
 				 "rejoin gate digest domain changed");
+StaticAssertDecl(sizeof(external_fence_writer_set_domain) == 27,
+				 "writer-set digest domain changed");
 
 /* All three objects are backend-private and process-local.  No positive
  * instance can be created while provider id 0 is the sole registry outcome,
@@ -114,6 +141,8 @@ struct PgracExternalFenceNeedSetV1
 	ClusterRecoveryDutyKey duty;
 	ClusterRecoveryDutyDigest duty_digest;
 	PgracExternalFenceWriterSetDigest writer_set_digest;
+	ClusterFenceAuthorityProof authority;
+	ClusterFormationSnapshotV1 classification;
 	const ClusterFormationWitnessV1 *formation;
 	PgracExternalFenceNeedV1 needs[CLUSTER_MAX_NODES];
 };
@@ -137,7 +166,8 @@ struct PgracExternalFenceRejoinOpV1
 	uint32 deny_reason;
 	int32 socket_fd;
 	bool connect_pending;
-	uint8 reserved21[3];
+	bool peer_authenticated;
+	uint8 reserved22[2];
 	uint64 deadline_mono_ns;
 	uint8 transport_nonce[PGRAC_EXTERNAL_FENCE_NONCE_V1_BYTES];
 	uint8 tx_frame[PGRAC_EXTERNAL_FENCE_REJOIN_V1_BYTES];
@@ -568,13 +598,68 @@ external_fence_admission_set_valid(
 		set->formation != NULL;
 }
 
+static bool
+external_fence_writer_set_digest_v1(
+	const ClusterRecoveryDutyDigest *duty_digest,
+	const uint8 protected_set_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES],
+	const PgracExternalFenceNeedV1 *needs, uint32 count,
+	PgracExternalFenceWriterSetDigest *out)
+{
+	uint8 preimage[27 + PGRAC_EXTERNAL_FENCE_DIGEST_BYTES * 2 + 4 +
+		CLUSTER_MAX_NODES * sizeof(PgracExternalFenceWriterV1)];
+	size_t offset = 0;
+	uint32 i;
+
+	if (duty_digest == NULL || protected_set_digest == NULL || needs == NULL ||
+		out == NULL || count < 1 || count > CLUSTER_MAX_NODES)
+		return false;
+	memcpy(preimage + offset, external_fence_writer_set_domain,
+		sizeof(external_fence_writer_set_domain));
+	offset += sizeof(external_fence_writer_set_domain);
+	memcpy(preimage + offset, duty_digest->bytes,
+		sizeof(duty_digest->bytes));
+	offset += sizeof(duty_digest->bytes);
+	memcpy(preimage + offset, protected_set_digest,
+		PGRAC_EXTERNAL_FENCE_DIGEST_BYTES);
+	offset += PGRAC_EXTERNAL_FENCE_DIGEST_BYTES;
+	external_fence_put_u32_le(preimage + offset, count);
+	offset += 4;
+	for (i = 0; i < count; i++)
+	{
+		external_fence_put_u32_le(preimage + offset,
+			(uint32) needs[i].victim_node_id);
+		offset += 4;
+		external_fence_put_u32_le(preimage + offset, 0);
+		offset += 4;
+		external_fence_put_u64_le(preimage + offset,
+			needs[i].victim_incarnation);
+		offset += 8;
+	}
+	if (!external_fence_sha256(preimage, offset, out->bytes))
+	{
+		explicit_bzero(preimage, sizeof(preimage));
+		return false;
+	}
+	explicit_bzero(preimage, sizeof(preimage));
+	return true;
+}
+
 PgracExternalFenceNeedSetResult
 cluster_external_fence_need_set_build(
 	const ClusterRecoveryDutyKey *duty,
 	const ClusterFormationWitnessV1 *formation,
 	PgracExternalFenceNeedSetV1 **out)
 {
+	ClusterFenceAuthorityProof authority;
+	ClusterFormationSnapshotV1 classification;
+	ClusterProtectedSetIdentityV1 protected_identity;
+	ClusterRecoveryDutyDigest duty_digest;
 	ClusterFormationWitnessResult formation_result;
+	PgracExternalFenceNeedSetV1 *set;
+	uint8 protected_set_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES];
+	uint16 formation_origin_thread;
+	uint32 count = 0;
+	int32 node_id;
 
 	if (out == NULL || *out != NULL || duty == NULL || formation == NULL)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_BAD_ARGUMENT;
@@ -586,12 +671,100 @@ cluster_external_fence_need_set_build(
 	if (formation_result != CLUSTER_FORMATION_WITNESS_READY)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE;
 
-	/* STOP04 §11.7: no concrete provider is selected, so bit24 remains
-	 * unadvertised and no positive NeedSet may escape this package. */
 	if ((cluster_ic_local_capability_word() &
-		 PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1) == 0)
+		 PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1) == 0 ||
+		!cluster_external_fence_runtime_active())
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
-	return PGRAC_EXTERNAL_FENCE_NEED_SET_CAPABILITY_UNAVAILABLE;
+	if (!cluster_formation_witness_copy_classification_v1(formation,
+			&formation_origin_thread, &authority, &classification))
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE;
+	if (formation_origin_thread != duty->origin_thread_id)
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_DUTY_INVALID;
+	if (authority.total_disk_count == 0 ||
+		authority.agree_disk_count <= authority.total_disk_count / 2 ||
+		!cluster_fence_marker_valid_v1(&authority.marker))
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE;
+	if (memcmp(authority.marker.fenced_dead_bitmap,
+			classification.excluded_bitmap,
+			sizeof(classification.excluded_bitmap)) != 0 ||
+		authority.marker.fence_epoch != classification.local_epoch)
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE;
+
+	for (node_id = 0; node_id < CLUSTER_MAX_NODES; node_id++)
+	{
+		if (!external_fence_bitmap_member(classification.excluded_bitmap,
+				node_id))
+			continue;
+		count++;
+		if (classification.membership.membership_state[node_id] !=
+				CLUSTER_MEMBER_DEAD &&
+			classification.membership.membership_state[node_id] !=
+				CLUSTER_MEMBER_REMOVED)
+			return PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE;
+		if (classification.membership.last_admitted_incarnation[node_id] == 0)
+			return PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_INCAR_UNPROVEN;
+	}
+	if (count < 1 || count > CLUSTER_MAX_NODES)
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_COUNT_INVALID;
+	if (!external_fence_bitmap_member(classification.excluded_bitmap,
+			duty->origin_node_id))
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_ORIGINAL_OWNER_MISSING;
+	if (classification.membership.last_admitted_incarnation[
+			duty->origin_node_id] != duty->origin_owner_incarnation)
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_INCAR_UNPROVEN;
+	memset(&protected_identity, 0, sizeof(protected_identity));
+	if (!cluster_shared_fs_get_protected_set_identity(&protected_identity) ||
+		(protected_identity.backend_id !=
+			CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE &&
+		 protected_identity.backend_id !=
+			CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS) ||
+		memcmp(protected_identity.storage_uuid, duty->storage_uuid,
+			sizeof(protected_identity.storage_uuid)) != 0 ||
+		!pgrac_external_fence_protected_set_digest_v1(
+			protected_identity.backend_id, protected_identity.storage_uuid,
+			protected_set_digest))
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_STORAGE_UNAVAILABLE;
+	if (!cluster_recovery_duty_digest_v1(duty, &duty_digest))
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_DUTY_INVALID;
+
+	set = palloc0(sizeof(*set));
+	set->magic = PGRAC_EXTERNAL_FENCE_NEED_SET_MAGIC;
+	set->owner_pid = external_fence_owner_pid();
+	set->count = count;
+	set->duty = *duty;
+	set->duty_digest = duty_digest;
+	set->authority = authority;
+	set->classification = classification;
+	set->formation = formation;
+	count = 0;
+	for (node_id = 0; node_id < CLUSTER_MAX_NODES; node_id++)
+	{
+		PgracExternalFenceNeedV1 *need;
+
+		if (!external_fence_bitmap_member(classification.excluded_bitmap,
+				node_id))
+			continue;
+		need = &set->needs[count++];
+		need->system_identifier = duty->system_identifier;
+		need->canonical_duty_digest = duty_digest;
+		need->victim_node_id = node_id;
+		need->victim_incarnation =
+			classification.membership.last_admitted_incarnation[node_id];
+		memcpy(need->protected_set_digest, protected_set_digest,
+			sizeof(need->protected_set_digest));
+		need->predicate_id = PGRAC_EXTERNAL_FENCE_PREDICATE_WRITE_EXCLUDED;
+		need->predicate_version = PGRAC_EXTERNAL_FENCE_PREDICATE_VERSION_V1;
+	}
+	if (!external_fence_writer_set_digest_v1(&duty_digest,
+			protected_set_digest, set->needs, set->count,
+			&set->writer_set_digest))
+	{
+		explicit_bzero(set, sizeof(*set));
+		pfree(set);
+		return PGRAC_EXTERNAL_FENCE_NEED_SET_STORAGE_UNAVAILABLE;
+	}
+	*out = set;
+	return PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 }
 
 bool
@@ -628,28 +801,494 @@ cluster_external_fence_need_set_revalidate_nowait(
 	return true;
 }
 
+static PgracExternalFenceVerdict
+external_fence_admit_result(PgracExternalFenceVerdict verdict,
+	PgracExternalFenceDenyReason reason, uint64 journal_seq,
+	uint64 verified_mono_ns)
+{
+	external_fence_last_deny = reason;
+	external_fence_record_result(verdict, reason, journal_seq,
+		verified_mono_ns);
+	return verdict;
+}
+
+static bool
+external_fence_response_verdict_valid(
+	const PgracExternalFenceProtocolResponseV1 *response)
+{
+	switch ((PgracExternalFenceVerdict) response->verdict)
+	{
+		case PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED:
+			return response->deny_reason == PGRAC_EXTERNAL_FENCE_DENY_NONE;
+		case PGRAC_EXTERNAL_FENCE_REJECTED:
+			return response->deny_reason ==
+				PGRAC_EXTERNAL_FENCE_DENY_PROVIDER_REJECTED ||
+				response->deny_reason ==
+				PGRAC_EXTERNAL_FENCE_DENY_IO_NOT_DRAINED;
+		case PGRAC_EXTERNAL_FENCE_UNKNOWN:
+			return response->deny_reason ==
+				PGRAC_EXTERNAL_FENCE_DENY_PROVIDER_UNKNOWN;
+		case PGRAC_EXTERNAL_FENCE_UNAVAILABLE:
+			return response->deny_reason != PGRAC_EXTERNAL_FENCE_DENY_NONE &&
+				response->deny_reason !=
+				PGRAC_EXTERNAL_FENCE_DENY_PROVIDER_REJECTED &&
+				response->deny_reason !=
+				PGRAC_EXTERNAL_FENCE_DENY_PROVIDER_UNKNOWN &&
+				response->deny_reason !=
+				PGRAC_EXTERNAL_FENCE_DENY_IO_NOT_DRAINED;
+	}
+	return false;
+}
+
+#ifndef WIN32
+static bool
+external_fence_wait_ready(int fd, short events, uint64 deadline_ns,
+	PgracExternalFenceDenyReason *reason)
+{
+	for (;;)
+	{
+		struct pollfd poll_fd;
+		uint64 now_ns;
+		uint64 remaining_ns;
+		uint64 remaining_ms;
+		int poll_result;
+
+		if (!external_fence_monotonic_now(&now_ns) || now_ns >= deadline_ns)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT;
+			return false;
+		}
+		remaining_ns = deadline_ns - now_ns;
+		remaining_ms = (remaining_ns + UINT64_C(999999)) /
+			UINT64_C(1000000);
+		if (remaining_ms > (uint64) INT_MAX)
+			remaining_ms = (uint64) INT_MAX;
+		poll_fd.fd = fd;
+		poll_fd.events = events;
+		poll_fd.revents = 0;
+		poll_result = poll(&poll_fd, 1, (int) remaining_ms);
+		if (poll_result < 0)
+		{
+			if (errno == EINTR)
+				continue;
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED;
+			return false;
+		}
+		if (poll_result == 0)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT;
+			return false;
+		}
+		if ((poll_fd.revents & events) != 0)
+			return true;
+		if ((poll_fd.revents & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED;
+			return false;
+		}
+	}
+}
+
+static bool
+external_fence_write_exact(int fd, const uint8 *bytes, size_t len,
+	uint64 deadline_ns, PgracExternalFenceDenyReason *reason)
+{
+	size_t sent = 0;
+	int send_flags = MSG_DONTWAIT;
+
+#ifdef MSG_NOSIGNAL
+	send_flags |= MSG_NOSIGNAL;
+#endif
+	while (sent < len)
+	{
+		ssize_t count = send(fd, bytes + sent, len - sent, send_flags);
+
+		if (count > 0)
+		{
+			sent += (size_t) count;
+			continue;
+		}
+		if (count == 0)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED;
+			return false;
+		}
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED;
+			return false;
+		}
+		if (!external_fence_wait_ready(fd, POLLOUT, deadline_ns, reason))
+			return false;
+	}
+	return true;
+}
+
+static bool
+external_fence_read_exact(int fd, uint8 *bytes, size_t len,
+	uint64 deadline_ns, PgracExternalFenceDenyReason *reason)
+{
+	size_t received = 0;
+
+	while (received < len)
+	{
+		ssize_t count = recv(fd, bytes + received, len - received,
+			MSG_DONTWAIT);
+
+		if (count > 0)
+		{
+			received += (size_t) count;
+			continue;
+		}
+		if (count == 0)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED;
+			return false;
+		}
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED;
+			return false;
+		}
+		if (!external_fence_wait_ready(fd, POLLIN, deadline_ns, reason))
+			return false;
+	}
+	return true;
+}
+
+static int
+external_fence_connect_root_daemon(int timeout_ms, uint64 deadline_ns,
+	PgracExternalFenceDenyReason *reason)
+{
+	int fd = -1;
+	int flags;
+
+#ifdef USE_CLUSTER_UNIT
+	fd = cluster_external_fence_test_connect_root_daemon(timeout_ms);
+	if (fd < 0)
+	{
+		*reason = PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE;
+		return -1;
+	}
+#else
+	struct sockaddr_un address;
+	struct stat socket_stat;
+	int connect_result;
+
+	if (cluster_external_fence_socket_path == NULL ||
+		cluster_external_fence_socket_path[0] != '/' ||
+		strlen(cluster_external_fence_socket_path) >= sizeof(address.sun_path) ||
+		lstat(cluster_external_fence_socket_path, &socket_stat) != 0 ||
+		!S_ISSOCK(socket_stat.st_mode) || socket_stat.st_uid != 0 ||
+		(socket_stat.st_mode & 0777) != 0660)
+	{
+		*reason = PGRAC_EXTERNAL_FENCE_DENY_SOCKET_CONFIG;
+		return -1;
+	}
+	fd = socket(AF_UNIX, SOCK_STREAM, 0);
+	if (fd < 0)
+	{
+		*reason = PGRAC_EXTERNAL_FENCE_DENY_SOCKET_CONFIG;
+		return -1;
+	}
+	memset(&address, 0, sizeof(address));
+	address.sun_family = AF_UNIX;
+	strlcpy(address.sun_path, cluster_external_fence_socket_path,
+		sizeof(address.sun_path));
+#endif
+
+	flags = fcntl(fd, F_GETFL, 0);
+	if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0 ||
+		fcntl(fd, F_SETFD, FD_CLOEXEC) < 0)
+	{
+		*reason = PGRAC_EXTERNAL_FENCE_DENY_SOCKET_CONFIG;
+		(void) close(fd);
+		return -1;
+	}
+#ifdef SO_NOSIGPIPE
+	{
+		int no_sigpipe = 1;
+
+		if (setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe,
+				sizeof(no_sigpipe)) != 0)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_SOCKET_CONFIG;
+			(void) close(fd);
+			return -1;
+		}
+	}
+#endif
+
+#ifndef USE_CLUSTER_UNIT
+	connect_result = connect(fd, (struct sockaddr *) &address,
+		sizeof(address));
+	if (connect_result != 0)
+	{
+		int socket_error = 0;
+		socklen_t socket_error_len = sizeof(socket_error);
+
+		if (errno != EINPROGRESS && errno != EAGAIN && errno != EWOULDBLOCK)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE;
+			(void) close(fd);
+			return -1;
+		}
+		if (!external_fence_wait_ready(fd, POLLOUT, deadline_ns, reason))
+		{
+			if (*reason == PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED)
+				*reason = PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE;
+			(void) close(fd);
+			return -1;
+		}
+		if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &socket_error,
+				&socket_error_len) != 0 || socket_error != 0)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE;
+			(void) close(fd);
+			return -1;
+		}
+	}
+#ifdef __linux__
+	{
+		struct ucred credential;
+		socklen_t credential_len = sizeof(credential);
+
+		if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential,
+				&credential_len) != 0 ||
+			credential_len != sizeof(credential) || credential.uid != 0 ||
+			credential.pid <= 0)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_PEER_AUTH;
+			(void) close(fd);
+			return -1;
+		}
+	}
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+	defined(__NetBSD__)
+	{
+		uid_t uid;
+		gid_t gid;
+
+		if (getpeereid(fd, &uid, &gid) != 0 || uid != 0)
+		{
+			*reason = PGRAC_EXTERNAL_FENCE_DENY_PEER_AUTH;
+			(void) close(fd);
+			return -1;
+		}
+	}
+#else
+	*reason = PGRAC_EXTERNAL_FENCE_DENY_PEER_AUTH;
+	(void) close(fd);
+	return -1;
+#endif
+#endif
+	return fd;
+}
+
+static bool
+external_fence_live_connection_exact(int fd,
+	PgracExternalFenceDenyReason *reason)
+{
+	struct pollfd poll_fd;
+	int poll_result;
+
+	for (;;)
+	{
+		poll_fd.fd = fd;
+		poll_fd.events = POLLIN | POLLHUP | POLLERR;
+		poll_fd.revents = 0;
+		poll_result = poll(&poll_fd, 1, 0);
+		if (poll_result < 0 && errno == EINTR)
+			continue;
+		break;
+	}
+	if (poll_result == 0)
+		return true;
+	*reason = PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED;
+	return false;
+}
+#endif
+
 PgracExternalFenceVerdict
 cluster_external_fence_admit_wait(
 	const PgracExternalFenceNeedV1 *need, int timeout_ms,
 	PgracExternalFenceAdmissionV1 **out)
 {
+	int32 cooperative_lease_ms_snapshot = cluster_write_fence_lease_ms;
+
 	if (out != NULL)
 		*out = NULL;
 	if (out == NULL || !external_fence_need_valid(need) || timeout_ms < 1 ||
-		timeout_ms > 600000)
+		timeout_ms > (int) PGRAC_EXTERNAL_FENCE_TIMEOUT_MAX_MS)
 	{
 		external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_BAD_ARGUMENT;
 		return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
 	}
 
-	/* Provider id 0 is the only current registry outcome.  Do not connect,
-	 * actuate, read a journal, or fabricate a terminal receipt. */
 	cluster_write_fence_note_external_admit_requested();
-	external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE;
-	external_fence_record_result(PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
-							 PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE,
-							 0, 0);
-	return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
+	if (!cluster_external_fence_runtime_active())
+		return external_fence_admit_result(PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+			PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE, 0, 0);
+
+#ifdef WIN32
+	return external_fence_admit_result(PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+		PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE, 0, 0);
+#else
+	{
+		PgracExternalFenceProtocolRequestV1 request;
+		PgracExternalFenceProtocolResponseV1 response;
+		PgracExternalFenceAdmissionV1 *admission;
+		PgracExternalFenceDenyReason reason =
+			PGRAC_EXTERNAL_FENCE_DENY_NONE;
+		uint8 request_frame[PGRAC_EXTERNAL_FENCE_REQUEST_V1_BYTES];
+		uint8 response_frame[PGRAC_EXTERNAL_FENCE_RESPONSE_V1_BYTES];
+		uint64 start_ns;
+		uint64 deadline_ns;
+		uint64 timeout_ns = (uint64) timeout_ms * UINT64_C(1000000);
+		uint64 now_ns;
+		int fd = -1;
+
+		if (!external_fence_monotonic_now(&start_ns) ||
+			UINT64_MAX - start_ns < timeout_ns)
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT, 0, 0);
+		deadline_ns = start_ns + timeout_ns;
+		memset(&request, 0, sizeof(request));
+		if (!pg_strong_random(request.request_nonce,
+				sizeof(request.request_nonce)) ||
+			!bytes_nonzero(request.request_nonce,
+				sizeof(request.request_nonce)))
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_PROTOCOL, 0, 0);
+		request.need.system_identifier = need->system_identifier;
+		memcpy(request.need.canonical_duty_digest,
+			need->canonical_duty_digest.bytes,
+			sizeof(request.need.canonical_duty_digest));
+		request.need.victim_node_id = need->victim_node_id;
+		request.need.victim_incarnation = need->victim_incarnation;
+		memcpy(request.need.protected_set_digest,
+			need->protected_set_digest,
+			sizeof(request.need.protected_set_digest));
+		request.need.predicate_id = need->predicate_id;
+		request.need.predicate_version = need->predicate_version;
+		request.timeout_ms = (uint32) timeout_ms;
+		if (!pgrac_external_fence_request_v1_encode(&request, request_frame))
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_PROTOCOL, 0, 0);
+
+		fd = external_fence_connect_root_daemon(timeout_ms, deadline_ns,
+			&reason);
+		if (fd < 0)
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE, reason, 0, 0);
+		if (!external_fence_write_exact(fd, request_frame,
+				sizeof(request_frame), deadline_ns, &reason) ||
+			!external_fence_read_exact(fd, response_frame,
+				sizeof(response_frame), deadline_ns, &reason))
+		{
+			(void) close(fd);
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE, reason, 0, 0);
+		}
+		if (!pgrac_external_fence_response_v1_decode(response_frame,
+				sizeof(response_frame), &response) ||
+			memcmp(request.request_nonce, response.request_nonce,
+				sizeof(request.request_nonce)) != 0 ||
+			!external_fence_response_verdict_valid(&response))
+		{
+			(void) close(fd);
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_PROTOCOL, 0, 0);
+		}
+		if (response.verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED)
+		{
+			PgracExternalFenceVerdict verdict =
+				(PgracExternalFenceVerdict) response.verdict;
+			PgracExternalFenceDenyReason deny =
+				(PgracExternalFenceDenyReason) response.deny_reason;
+
+			(void) close(fd);
+			return external_fence_admit_result(verdict, deny,
+				response.journal_seq, response.verified_mono_ns);
+		}
+		if (!pgrac_external_fence_affirmative_response_matches_request_v1(
+				&request, &response))
+		{
+			(void) close(fd);
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_BINDING_MISMATCH, 0, 0);
+		}
+		if (!external_fence_monotonic_now(&now_ns) || now_ns >= deadline_ns)
+		{
+			(void) close(fd);
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT, 0, 0);
+		}
+		if (now_ns < response.verified_mono_ns ||
+			now_ns >= response.fresh_until_mono_ns ||
+			response.fresh_until_mono_ns <= response.verified_mono_ns ||
+			response.fresh_until_mono_ns - response.verified_mono_ns >
+			PGRAC_EXTERNAL_FENCE_MAX_FRESHNESS_NS)
+		{
+			(void) close(fd);
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_EXPIRED, 0, 0);
+		}
+		if (!external_fence_live_connection_exact(fd, &reason))
+		{
+			(void) close(fd);
+			return external_fence_admit_result(
+				PGRAC_EXTERNAL_FENCE_UNAVAILABLE, reason, 0, 0);
+		}
+
+		admission = palloc0(sizeof(*admission));
+		admission->magic = PGRAC_EXTERNAL_FENCE_ADMISSION_MAGIC;
+		admission->owner_pid = external_fence_owner_pid();
+		admission->binding.system_identifier =
+			response.binding.system_identifier;
+		memcpy(admission->binding.canonical_duty_digest.bytes,
+			response.binding.canonical_duty_digest,
+			sizeof(response.binding.canonical_duty_digest));
+		admission->binding.victim_node_id = response.binding.victim_node_id;
+		admission->binding.victim_incarnation =
+			response.binding.victim_incarnation;
+		admission->binding.target_mapping_generation =
+			response.binding.target_mapping_generation;
+		memcpy(admission->binding.protected_set_digest,
+			response.binding.protected_set_digest,
+			sizeof(response.binding.protected_set_digest));
+		admission->binding.predicate_id = response.binding.predicate_id;
+		admission->binding.predicate_version =
+			response.binding.predicate_version;
+		memcpy(admission->daemon_boot_id, response.daemon_boot_id,
+			sizeof(admission->daemon_boot_id));
+		admission->journal_seq = response.journal_seq;
+		admission->proof_generation = response.proof_generation;
+		admission->verified_mono_ns = response.verified_mono_ns;
+		admission->fresh_until_mono_ns = response.fresh_until_mono_ns;
+		admission->cached_mapping_generation =
+			response.binding.target_mapping_generation;
+		admission->cooperative_lease_ms_snapshot =
+			cooperative_lease_ms_snapshot;
+		admission->socket_fd = fd;
+		*out = admission;
+		return external_fence_admit_result(
+			PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED,
+			PGRAC_EXTERNAL_FENCE_DENY_NONE, response.journal_seq,
+			response.verified_mono_ns);
+	}
+#endif
 }
 
 bool
@@ -732,7 +1371,15 @@ cluster_external_fence_admit_set_wait(
 	const ClusterFormationWitnessV1 *formation, int timeout_ms,
 	PgracExternalFenceAdmissionSetV1 **out)
 {
+	PgracExternalFenceAdmissionSetV1 *set;
 	PgracExternalFenceDenyReason reason;
+#ifndef WIN32
+	int32 cooperative_lease_ms_snapshot = cluster_write_fence_lease_ms;
+	uint64 deadline_ns;
+	uint64 now_ns;
+	uint64 timeout_ns;
+	uint32 i;
+#endif
 
 	if (out != NULL)
 		*out = NULL;
@@ -749,15 +1396,73 @@ cluster_external_fence_admit_set_wait(
 		return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
 	}
 
-	/* No production provider is selected.  In particular, do not let an
-	 * aggregate's nonempty loop or its overall deadline turn provider 0 into
-	 * a partial or zero-iteration success. */
-	cluster_write_fence_note_external_admit_requested();
+#ifdef WIN32
 	external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE;
-	external_fence_record_result(PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
-							 PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE,
-							 0, 0);
 	return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
+#else
+	if (!external_fence_monotonic_now(&now_ns))
+	{
+		external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT;
+		return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
+	}
+	timeout_ns = (uint64) timeout_ms * UINT64_C(1000000);
+	if (UINT64_MAX - now_ns < timeout_ns)
+	{
+		external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT;
+		return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
+	}
+	deadline_ns = now_ns + timeout_ns;
+	set = palloc0(sizeof(*set));
+	set->magic = PGRAC_EXTERNAL_FENCE_ADMISSION_SET_MAGIC;
+	set->owner_pid = external_fence_owner_pid();
+	set->writer_set_digest = needs->writer_set_digest;
+	set->formation = formation;
+	for (i = 0; i < needs->count; i++)
+	{
+		PgracExternalFenceVerdict verdict;
+		uint64 remaining_ns;
+		uint64 remaining_ms;
+
+		if (!external_fence_monotonic_now(&now_ns) || now_ns >= deadline_ns)
+		{
+			external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT;
+			cluster_external_fence_admission_set_release(&set);
+			return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
+		}
+		remaining_ns = deadline_ns - now_ns;
+		remaining_ms = (remaining_ns + UINT64_C(999999)) /
+			UINT64_C(1000000);
+		if (remaining_ms > PGRAC_EXTERNAL_FENCE_TIMEOUT_MAX_MS)
+			remaining_ms = PGRAC_EXTERNAL_FENCE_TIMEOUT_MAX_MS;
+		verdict = cluster_external_fence_admit_wait(&needs->needs[i],
+			(int) remaining_ms, &set->admissions[i]);
+		if (verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED ||
+			set->admissions[i] == NULL)
+		{
+			cluster_external_fence_admission_set_release(&set);
+			return verdict;
+		}
+		set->admissions[i]->cooperative_lease_ms_snapshot =
+			cooperative_lease_ms_snapshot;
+		set->count++;
+	}
+	if (!external_fence_monotonic_now(&now_ns) || now_ns >= deadline_ns)
+	{
+		external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT;
+		cluster_external_fence_admission_set_release(&set);
+		return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
+	}
+	if (!cluster_external_fence_revalidate_set_nowait(set, needs, formation,
+			&reason))
+	{
+		external_fence_last_deny = reason;
+		cluster_external_fence_admission_set_release(&set);
+		return PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
+	}
+	*out = set;
+	external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	return PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED;
+#endif
 }
 
 bool
@@ -841,6 +1546,16 @@ cluster_external_fence_admission_binding(
 	return external_fence_admission_valid(admission) ?
 		&admission->binding : NULL;
 }
+
+#ifdef USE_CLUSTER_UNIT
+int
+cluster_external_fence_test_admission_lease_ms(
+	const PgracExternalFenceAdmissionV1 *admission)
+{
+	return external_fence_admission_valid(admission) ?
+		admission->cooperative_lease_ms_snapshot : -1;
+}
+#endif
 
 void
 cluster_external_fence_admission_release(
@@ -933,6 +1648,30 @@ external_fence_monotonic_now(uint64 *out_now_ns)
 	*out_now_ns = (uint64) now.tv_sec * UINT64_C(1000000000) +
 		(uint64) now.tv_nsec;
 	return true;
+}
+
+static bool
+external_fence_root_peer_authenticated(int fd)
+{
+#ifdef USE_CLUSTER_UNIT
+	return cluster_external_fence_test_root_peer_authenticated(fd);
+#elif defined(__linux__)
+	struct ucred credential;
+	socklen_t credential_len = sizeof(credential);
+
+	return getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credential,
+			&credential_len) == 0 &&
+		credential_len == sizeof(credential) && credential.uid == 0 &&
+		credential.pid > 0;
+#elif defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || \
+	defined(__NetBSD__)
+	uid_t uid;
+	gid_t gid;
+
+	return getpeereid(fd, &uid, &gid) == 0 && uid == 0;
+#else
+	return false;
+#endif
 }
 
 static void
@@ -1292,6 +2031,14 @@ cluster_external_fence_rejoin_poll_nowait(
 				PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE,
 				PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE, reason);
 		op->connect_pending = false;
+	}
+	if (!op->peer_authenticated)
+	{
+		if (!external_fence_root_peer_authenticated(op->socket_fd))
+			return external_fence_rejoin_terminal(op,
+				PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_PEER_AUTH, reason);
+		op->peer_authenticated = true;
 	}
 
 	if (op->tx_sent < sizeof(op->tx_frame))
