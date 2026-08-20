@@ -6,6 +6,10 @@ Real Application Clusters).  This document gives a 30,000-foot
 view of the components present today and the boundary between
 cluster code and stock PostgreSQL.
 
+For a detailed Chinese guide to node membership changes, online rejoin,
+formation authority, and recovery, see
+[Oracle RAC 与 PGRAC 节点变化机制图解](rac-node-change/README.md).
+
 ## High-level component map
 
 ```
