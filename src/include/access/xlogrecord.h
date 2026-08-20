@@ -272,4 +272,68 @@ typedef struct XLogRecordDataHeaderLong
 #define XLR_BLOCK_ID_ORIGIN			253
 #define XLR_BLOCK_ID_TOPLEVEL_XID	252
 
+/* STOP-06 PageVersion edge.  This manual-codec fragment is the first
+ * fragment after the fixed record header when the format is active. */
+#define XLR_BLOCK_ID_PAGE_VERSION_EDGE		251
+#define XLR_PAGE_VERSION_EDGE_FORMAT_V1		1
+#define XLR_PAGE_VERSION_EDGE_HEADER_SIZE	16
+#define XLR_PAGE_VERSION_EDGE_ENTRY_SIZE	48
+#define XLR_PAGE_VERSION_EDGE_MAX_ENTRIES	33
+#define XLR_PAGE_VERSION_EDGE_MAX_SIZE		1600
+
+typedef struct RfPageVersionV1
+{
+	uint8 segment_incarnation[16];
+	uint64 mutation_token;
+} RfPageVersionV1;
+
+typedef enum RfPageClassV1
+{
+	RF_PAGE_CLASS_INVALID = 0,
+	RF_PAGE_CLASS_ORDINARY = 1,
+	RF_PAGE_CLASS_REBUILDABLE_FSM = 2,
+	RF_PAGE_CLASS_ROUTED_SPACE = 3,
+	RF_PAGE_CLASS_ROUTED_HEADER = 4,
+	RF_PAGE_CLASS_ROUTED_SIDE = 5,
+	RF_PAGE_CLASS_TEMP_LOCAL = 6
+} RfPageClassV1;
+
+typedef enum RfPageStateKindV1
+{
+	RF_PAGE_STATE_INVALID = 0,
+	RF_PAGE_STATE_PRESENT = 1,
+	RF_PAGE_STATE_UNFORMATTED = 2,
+	RF_PAGE_STATE_ABSENT = 3,
+	RF_PAGE_STATE_REBUILDABLE = 4,
+	RF_PAGE_STATE_ROUTED = 5
+} RfPageStateKindV1;
+
+#define RF_PAGE_EDGE_FULL_IMAGE_APPLY UINT16_C(0x0001)
+#define RF_PAGE_EDGE_WILL_INIT UINT16_C(0x0002)
+#define RF_PAGE_EDGE_FULL_COVERAGE UINT16_C(0x0004)
+#define RF_PAGE_EDGE_KNOWN_MASK UINT16_C(0x0007)
+
+typedef struct RfPageVersionEdgeEntryV1
+{
+	uint8 block_id;
+	uint8 page_class;
+	uint8 before_kind;
+	uint8 result_kind;
+	uint16 edge_flags;
+	uint16 component_ordinal;
+	RfPageVersionV1 before;
+	uint8 result_incarnation[16];
+} RfPageVersionEdgeEntryV1;
+
+StaticAssertDecl(sizeof(RfPageVersionV1) == 24,
+				 "RfPageVersionV1 ABI drift");
+StaticAssertDecl(offsetof(RfPageVersionV1, mutation_token) == 16,
+				 "RfPageVersionV1 token offset drift");
+StaticAssertDecl(sizeof(RfPageVersionEdgeEntryV1) == 48,
+				 "RfPageVersionEdgeEntryV1 ABI drift");
+StaticAssertDecl(offsetof(RfPageVersionEdgeEntryV1, before) == 8,
+				 "RfPageVersionEdgeEntryV1 before offset drift");
+StaticAssertDecl(offsetof(RfPageVersionEdgeEntryV1, result_incarnation) == 32,
+				 "RfPageVersionEdgeEntryV1 result offset drift");
+
 #endif							/* XLOGRECORD_H */

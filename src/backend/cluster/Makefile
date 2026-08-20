@@ -108,6 +108,7 @@ OBJS = \
 	cluster_replacement_wire.o \
 	cluster_undo_root_descriptor.o \
 	cluster_recovery_plan.o \
+	cluster_rf_route.o \
 	cluster_recovery_worker.o \
 	cluster_recovery_merge.o \
 	cluster_recovery_anchor.o \

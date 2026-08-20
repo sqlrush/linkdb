@@ -13,6 +13,7 @@
 
 #include "access/rmgr.h"
 #include "access/xlogdefs.h"
+#include "access/xlogrecord.h"
 #include "storage/block.h"
 #include "storage/buf.h"
 #include "storage/relfilelocator.h"
@@ -26,6 +27,8 @@
  */
 #define XLR_NORMAL_MAX_BLOCK_ID		4
 #define XLR_NORMAL_RDATAS			20
+
+#define XLOG_PAGE_VERSION_EDGE_ENCODER_V1 1
 
 /* flags for XLogRegisterBuffer */
 #define REGBUF_FORCE_IMAGE	0x01	/* force a full-page image */
@@ -44,6 +47,12 @@ extern void XLogSetRecordFlags(uint8 flags);
 extern XLogRecPtr XLogInsert(RmgrId rmid, uint8 info);
 extern void XLogEnsureRecordSpace(int max_block_id, int ndatas);
 extern void XLogRegisterData(char *data, uint32 len);
+extern bool XLogEncodePageVersionEdgeV1(uint8 *output,
+	Size output_capacity, uint64 result_token,
+	const RfPageVersionEdgeEntryV1 *entries, uint8 entry_count,
+	Size *output_size);
+extern void XLogRegisterPageVersionEdge(uint64 result_token,
+	const RfPageVersionEdgeEntryV1 *entries, uint8 entry_count);
 extern void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags);
 extern void XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator,
 							  ForkNumber forknum, BlockNumber blknum, char *page,

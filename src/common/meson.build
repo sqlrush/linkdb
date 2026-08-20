@@ -18,6 +18,7 @@ common_sources = files(
   'link-canary.c',
   'md5_common.c',
   'percentrepl.c',
+  'pgrac_external_fence_protocol.c',
   'pg_get_line.c',
   'pg_lzcompress.c',
   'pg_prng.c',

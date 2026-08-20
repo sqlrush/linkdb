@@ -41,6 +41,18 @@
 #include "access/xlogrecord.h"
 #include "storage/buf.h"
 
+#define RF_PAGE_VERSION_EQUAL_INTERFACE_V1 1
+
+extern bool rf_page_version_equal_v1(const RfPageVersionV1 *left,
+									 const RfPageVersionV1 *right);
+
+typedef struct RfPageVersionEdgeV1
+{
+	uint8 entry_count;
+	uint64 result_token;
+	RfPageVersionEdgeEntryV1 entries[XLR_PAGE_VERSION_EDGE_MAX_ENTRIES];
+} RfPageVersionEdgeV1;
+
 /* WALOpenSegment represents a WAL segment being read. */
 typedef struct WALOpenSegment
 {
@@ -131,6 +143,7 @@ typedef struct
 
 	/* copy of the fork_flags field from the XLogRecordBlockHeader */
 	uint8		flags;
+	uint16		component_ordinal; /* unified parsed-record component */
 
 	/* Information on full-page image, if any */
 	bool		has_image;		/* has image, even for consistency checking */
@@ -168,6 +181,8 @@ typedef struct DecodedXLogRecord
 	TransactionId toplevel_xid; /* XID of top-level transaction */
 	char	   *main_data;		/* record's main data portion */
 	uint32		main_data_len;	/* main data portion's length */
+	bool		has_page_version_edge;
+	RfPageVersionEdgeV1 page_version_edge;
 	int			max_block_id;	/* highest block_id in use (-1 if none) */
 	DecodedBkpBlock blocks[FLEXIBLE_ARRAY_MEMBER];
 } DecodedXLogRecord;
@@ -463,6 +478,10 @@ extern bool DecodeXLogRecord(XLogReaderState *state,
 #define XLogRecGetTopXid(decoder) ((decoder)->record->toplevel_xid)
 #define XLogRecGetData(decoder) ((decoder)->record->main_data)
 #define XLogRecGetDataLen(decoder) ((decoder)->record->main_data_len)
+#define XLogRecHasPageVersionEdge(decoder) \
+	((decoder)->record->has_page_version_edge)
+#define XLogRecGetPageVersionEdge(decoder) \
+	(&(decoder)->record->page_version_edge)
 #define XLogRecHasAnyBlockRefs(decoder) ((decoder)->record->max_block_id >= 0)
 #define XLogRecMaxBlockId(decoder) ((decoder)->record->max_block_id)
 #define XLogRecGetBlock(decoder, i) (&(decoder)->record->blocks[(i)])

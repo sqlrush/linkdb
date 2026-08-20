@@ -41,6 +41,139 @@
 #include "storage/proc.h"
 #include "utils/memutils.h"
 
+static bool
+xlog_page_incarnation_nonzero(const uint8 incarnation[16])
+{
+	uint8 any = 0;
+	int i;
+
+	for (i = 0; i < 16; i++)
+		any |= incarnation[i];
+	return any != 0;
+}
+
+static bool
+xlog_page_anchor_flags_valid(uint16 flags)
+{
+	return flags == (RF_PAGE_EDGE_FULL_IMAGE_APPLY |
+		RF_PAGE_EDGE_FULL_COVERAGE) ||
+		flags == (RF_PAGE_EDGE_WILL_INIT | RF_PAGE_EDGE_FULL_COVERAGE) ||
+		flags == (RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_WILL_INIT |
+		RF_PAGE_EDGE_FULL_COVERAGE);
+}
+
+static bool
+xlog_page_edge_entry_valid(const RfPageVersionEdgeEntryV1 *entry)
+{
+	if (entry->block_id > XLR_MAX_BLOCK_ID ||
+		(entry->edge_flags & ~RF_PAGE_EDGE_KNOWN_MASK) != 0)
+		return false;
+	if (entry->page_class == RF_PAGE_CLASS_ORDINARY)
+	{
+		if (entry->result_kind != RF_PAGE_STATE_PRESENT ||
+			!xlog_page_incarnation_nonzero(entry->result_incarnation) ||
+			(entry->edge_flags != 0 &&
+			 !xlog_page_anchor_flags_valid(entry->edge_flags)))
+			return false;
+		switch (entry->before_kind)
+		{
+			case RF_PAGE_STATE_PRESENT:
+				return xlog_page_incarnation_nonzero(
+					entry->before.segment_incarnation) &&
+					entry->before.mutation_token != 0 &&
+					memcmp(entry->before.segment_incarnation,
+						   entry->result_incarnation, 16) == 0;
+			case RF_PAGE_STATE_UNFORMATTED:
+				return xlog_page_incarnation_nonzero(
+					entry->before.segment_incarnation) &&
+					entry->before.mutation_token == 0 &&
+					memcmp(entry->before.segment_incarnation,
+						   entry->result_incarnation, 16) == 0 &&
+					xlog_page_anchor_flags_valid(entry->edge_flags);
+			case RF_PAGE_STATE_ABSENT:
+				return !xlog_page_incarnation_nonzero(
+					entry->before.segment_incarnation) &&
+					entry->before.mutation_token == 0 &&
+					xlog_page_anchor_flags_valid(entry->edge_flags);
+			default:
+				return false;
+		}
+	}
+
+	if (entry->edge_flags != 0 ||
+		xlog_page_incarnation_nonzero(entry->before.segment_incarnation) ||
+		entry->before.mutation_token != 0 ||
+		xlog_page_incarnation_nonzero(entry->result_incarnation))
+		return false;
+	if (entry->page_class == RF_PAGE_CLASS_REBUILDABLE_FSM)
+		return entry->before_kind == RF_PAGE_STATE_REBUILDABLE &&
+			entry->result_kind == RF_PAGE_STATE_REBUILDABLE;
+	if (entry->page_class == RF_PAGE_CLASS_ROUTED_SPACE ||
+		entry->page_class == RF_PAGE_CLASS_ROUTED_HEADER ||
+		entry->page_class == RF_PAGE_CLASS_ROUTED_SIDE)
+		return entry->before_kind == RF_PAGE_STATE_ROUTED &&
+			entry->result_kind == RF_PAGE_STATE_ROUTED;
+	return false;
+}
+
+bool
+XLogEncodePageVersionEdgeV1(uint8 *output, Size output_capacity,
+						   uint64 result_token,
+						   const RfPageVersionEdgeEntryV1 *entries,
+						   uint8 entry_count, Size *output_size)
+{
+	Size required;
+	int i;
+	int j;
+
+	if (output == NULL || output_size == NULL || entries == NULL ||
+		result_token == 0 || entry_count == 0 ||
+		entry_count > XLR_PAGE_VERSION_EDGE_MAX_ENTRIES)
+		return false;
+	required = XLR_PAGE_VERSION_EDGE_HEADER_SIZE +
+		(Size) entry_count * XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	if (output_capacity < required)
+		return false;
+	for (i = 0; i < entry_count; i++)
+	{
+		if (!xlog_page_edge_entry_valid(&entries[i]) ||
+			(i > 0 && entries[i - 1].block_id >= entries[i].block_id))
+			return false;
+		for (j = 0; j < i; j++)
+			if (entries[j].component_ordinal == entries[i].component_ordinal)
+				return false;
+	}
+
+	memset(output, 0, required);
+	output[0] = XLR_BLOCK_ID_PAGE_VERSION_EDGE;
+	output[1] = XLR_PAGE_VERSION_EDGE_FORMAT_V1;
+	output[2] = entry_count;
+	output[3] = XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+	memcpy(output + 8, &result_token, sizeof(result_token));
+	for (i = 0; i < entry_count; i++)
+	{
+		const RfPageVersionEdgeEntryV1 *entry = &entries[i];
+		uint8 *target = output + XLR_PAGE_VERSION_EDGE_HEADER_SIZE +
+			(Size) i * XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+
+		target[0] = entry->block_id;
+		target[1] = entry->page_class;
+		target[2] = entry->before_kind;
+		target[3] = entry->result_kind;
+		memcpy(target + 4, &entry->edge_flags, sizeof(entry->edge_flags));
+		memcpy(target + 6, &entry->component_ordinal,
+			   sizeof(entry->component_ordinal));
+		memcpy(target + 8, entry->before.segment_incarnation, 16);
+		memcpy(target + 24, &entry->before.mutation_token,
+			   sizeof(entry->before.mutation_token));
+		memcpy(target + 32, entry->result_incarnation, 16);
+	}
+	*output_size = required;
+	return true;
+}
+
+#ifndef PGRAC_XLOG_PAGE_EDGE_ENCODER_ONLY
+
 /*
  * Guess the maximum buffer size required to store a compressed version of
  * backup block image.
@@ -107,6 +240,13 @@ static uint64 mainrdata_len;	/* total # of bytes in chain */
 /* flags for the in-progress insertion */
 static uint8 curinsert_flags = 0;
 
+/* Optional STOP-06 first-fragment semantic edge for this insertion. */
+static bool page_version_edge_registered = false;
+static uint64 registered_page_version_result_token;
+static uint8 registered_page_version_entry_count;
+static RfPageVersionEdgeEntryV1
+	registered_page_version_entries[XLR_PAGE_VERSION_EDGE_MAX_ENTRIES];
+
 /*
  * These are used to hold the record header while constructing a record.
  * 'hdr_scratch' is not a plain variable, but is palloc'd at initialization,
@@ -125,7 +265,7 @@ static char *hdr_scratch = NULL;
 	(SizeOfXLogRecord + \
 	 MaxSizeOfXLogRecordBlockHeader * (XLR_MAX_BLOCK_ID + 1) + \
 	 SizeOfXLogRecordDataHeaderLong + SizeOfXlogOrigin + \
-	 SizeOfXLogTransactionId)
+	 SizeOfXLogTransactionId + XLR_PAGE_VERSION_EDGE_MAX_SIZE)
 
 /*
  * An array of XLogRecData structs, to hold registered data.
@@ -156,6 +296,7 @@ XLogBeginInsert(void)
 	Assert(max_registered_block_id == 0);
 	Assert(mainrdata_last == (XLogRecData *) &mainrdata_head);
 	Assert(mainrdata_len == 0);
+	Assert(!page_version_edge_registered);
 
 	/* cross-check on whether we should be here or not */
 	if (!XLogInsertAllowed())
@@ -165,6 +306,30 @@ XLogBeginInsert(void)
 		elog(ERROR, "XLogBeginInsert was already called");
 
 	begininsert_called = true;
+}
+
+/*
+ * Register the STOP-06 PageVersion semantic edge.  The actual FPI/APPLY and
+ * WILL_INIT flags are bound later by XLogRecordAssemble(), after it has made
+ * the authoritative backup-image decision for this assembly attempt.
+ */
+void
+XLogRegisterPageVersionEdge(uint64 result_token,
+						const RfPageVersionEdgeEntryV1 *entries,
+						uint8 entry_count)
+{
+	Assert(begininsert_called);
+
+	if (page_version_edge_registered)
+		elog(ERROR, "PageVersion edge is already registered");
+	if (result_token == 0 || entries == NULL || entry_count == 0 ||
+		entry_count > XLR_PAGE_VERSION_EDGE_MAX_ENTRIES)
+		elog(ERROR, "invalid PageVersion edge registration");
+	registered_page_version_result_token = result_token;
+	registered_page_version_entry_count = entry_count;
+	memcpy(registered_page_version_entries, entries,
+		   sizeof(entries[0]) * entry_count);
+	page_version_edge_registered = true;
 }
 
 /*
@@ -236,6 +401,9 @@ XLogResetInsertion(void)
 	mainrdata_len = 0;
 	mainrdata_last = (XLogRecData *) &mainrdata_head;
 	curinsert_flags = 0;
+	page_version_edge_registered = false;
+	registered_page_version_result_token = 0;
+	registered_page_version_entry_count = 0;
 	begininsert_called = false;
 }
 
@@ -576,6 +744,11 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	XLogRecData *rdt_datas_last;
 	XLogRecord *rechdr;
 	char	   *scratch = hdr_scratch;
+	char	   *page_edge_scratch = NULL;
+	size_t		page_edge_size = 0;
+	RfPageVersionEdgeEntryV1
+		page_edge_entries[XLR_PAGE_VERSION_EDGE_MAX_ENTRIES];
+	size_t		page_edge_ref_count = 0;
 
 	/*
 	 * Note: this function can be called multiple times for the same record.
@@ -585,6 +758,17 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 	/* The record begins with the fixed-size header */
 	rechdr = (XLogRecord *) scratch;
 	scratch += SizeOfXLogRecord;
+	if (page_version_edge_registered)
+	{
+		page_edge_size = XLR_PAGE_VERSION_EDGE_HEADER_SIZE +
+			(size_t) registered_page_version_entry_count *
+			XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+		memcpy(page_edge_entries, registered_page_version_entries,
+			   sizeof(page_edge_entries[0]) *
+			   registered_page_version_entry_count);
+		page_edge_scratch = scratch;
+		scratch += page_edge_size;
+	}
 
 	hdr_rdt.next = NULL;
 	rdt_datas_last = &hdr_rdt;
@@ -676,6 +860,30 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		 * resource manager, log a full-page write for the current block.
 		 */
 		include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
+
+		if (page_version_edge_registered)
+		{
+			RfPageVersionEdgeEntryV1 *entry;
+
+			if (page_edge_ref_count >= registered_page_version_entry_count)
+				elog(ERROR, "too many PageVersion edge block references");
+			entry = &page_edge_entries[page_edge_ref_count];
+			if (entry->block_id != block_id ||
+				entry->component_ordinal != page_edge_ref_count)
+				elog(ERROR,
+					 "PageVersion edge does not match WAL block order");
+			if (entry->page_class == RF_PAGE_CLASS_ORDINARY)
+			{
+				entry->edge_flags = 0;
+				if (needs_backup)
+					entry->edge_flags |= RF_PAGE_EDGE_FULL_IMAGE_APPLY |
+						RF_PAGE_EDGE_FULL_COVERAGE;
+				if ((regbuf->flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT)
+					entry->edge_flags |= RF_PAGE_EDGE_WILL_INIT |
+						RF_PAGE_EDGE_FULL_COVERAGE;
+			}
+			page_edge_ref_count++;
+		}
 
 		if (include_image)
 		{
@@ -871,6 +1079,20 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		}
 		memcpy(scratch, &regbuf->block, sizeof(BlockNumber));
 		scratch += sizeof(BlockNumber);
+	}
+
+	if (page_version_edge_registered)
+	{
+		Size		encoded_size;
+
+		if (page_edge_ref_count != registered_page_version_entry_count ||
+			!XLogEncodePageVersionEdgeV1((uint8 *) page_edge_scratch,
+				page_edge_size, registered_page_version_result_token,
+				page_edge_entries, registered_page_version_entry_count,
+				&encoded_size) ||
+			encoded_size != page_edge_size)
+			elog(ERROR,
+				 "PageVersion edge does not match assembled WAL block references");
 	}
 
 	/* followed by the record's origin, if any */
@@ -1426,5 +1648,7 @@ InitXLogInsert(void)
 	 */
 	if (hdr_scratch == NULL)
 		hdr_scratch = MemoryContextAllocZero(xloginsert_cxt,
-											 HEADER_SCRATCH_SIZE);
+										 HEADER_SCRATCH_SIZE);
 }
+
+#endif /* PGRAC_XLOG_PAGE_EDGE_ENCODER_ONLY */

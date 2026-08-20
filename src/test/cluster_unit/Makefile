@@ -102,6 +102,9 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_write_fence_durable \
 		test_cluster_write_fence_cache \
 		test_cluster_recovery_anchor \
+		test_cluster_page_edge \
+		test_cluster_page_edge_reader \
+		test_cluster_rf_route \
         test_cluster_cf_storage \
         test_cluster_cf_enqueue \
         test_cluster_cf_phase2 \
@@ -299,6 +302,9 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_coordinator \
 		test_pgrac_fenced_ipmi test_pgrac_fenced_ipmi_exec \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_page_edge,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -570,6 +576,38 @@ test_cluster_formation_marker: test_cluster_formation_marker.c unit_test.h \
 # (unknown/ambiguous default UNKNOWN/BLOCKED; rmgr known-set registry
 # compiled empty — PGDEL-02 owns the census).  Pure in-memory layer: no
 # backend deps beyond the Assert hook.
+XLOG_PAGE_EDGE_ENCODER_O = xloginsert_page_edge_encoder.o
+xloginsert_page_edge_encoder.o: \
+		$(top_srcdir)/src/backend/access/transam/xloginsert.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DPGRAC_XLOG_PAGE_EDGE_ENCODER_ONLY \
+		-c $< -o $@
+
+test_cluster_page_edge: test_cluster_page_edge.c unit_test.h \
+		$(XLOG_PAGE_EDGE_ENCODER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(XLOG_PAGE_EDGE_ENCODER_O) \
+		$(top_builddir)/src/port/libpgport.a -o $@
+
+test_cluster_page_edge_reader: test_cluster_page_edge_reader.c unit_test.h \
+		xlogreader_fs.o $(XLOG_PAGE_EDGE_ENCODER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< xlogreader_fs.o \
+		$(XLOG_PAGE_EDGE_ENCODER_O) $(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) \
+		-lssl -lcrypto -llz4 -lzstd -o $@
+
+CLUSTER_RF_ROUTE_O = $(top_builddir)/src/backend/cluster/cluster_rf_route.o
+
+$(CLUSTER_RF_ROUTE_O): $(top_srcdir)/src/backend/cluster/cluster_rf_route.c \
+		$(top_srcdir)/src/include/cluster/cluster_rf_route.h \
+		$(top_srcdir)/src/include/cluster/cluster_rf_route_manifest.def
+	$(MAKE) -C $(top_builddir)/src/backend/cluster cluster_rf_route.o
+
+test_cluster_rf_route: test_cluster_rf_route.c unit_test.h \
+		$(CLUSTER_RF_ROUTE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) \
+		-lssl -lcrypto -o $@
+
 CLUSTER_PAGE_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_page_version.o
 test_cluster_page_version: test_cluster_page_version.c unit_test.h \
 		$(CLUSTER_PAGE_VERSION_O)

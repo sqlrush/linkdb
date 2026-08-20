@@ -104,6 +104,188 @@ static void WALOpenSegmentInit(WALOpenSegment *seg, WALSegmentContext *segcxt,
  */
 #define DEFAULT_DECODE_BUFFER_SIZE (64 * 1024)
 
+static uint16
+page_edge_get_u16(const uint8 *source)
+{
+	uint16 value;
+
+	memcpy(&value, source, sizeof(value));
+	return value;
+}
+
+static uint64
+page_edge_get_u64(const uint8 *source)
+{
+	uint64 value;
+
+	memcpy(&value, source, sizeof(value));
+	return value;
+}
+
+static bool
+page_incarnation_nonzero(const uint8 incarnation[16])
+{
+	uint8 any = 0;
+	int i;
+
+	for (i = 0; i < 16; i++)
+		any |= incarnation[i];
+	return any != 0;
+}
+
+bool
+rf_page_version_equal_v1(const RfPageVersionV1 *left,
+						 const RfPageVersionV1 *right)
+{
+	return left != NULL && right != NULL &&
+		memcmp(left->segment_incarnation, right->segment_incarnation,
+			   sizeof(left->segment_incarnation)) == 0 &&
+		left->mutation_token == right->mutation_token;
+}
+
+static size_t
+page_edge_wire_size(uint8 entry_count)
+{
+	if (entry_count == 0 || entry_count > XLR_PAGE_VERSION_EDGE_MAX_ENTRIES)
+		return 0;
+	return XLR_PAGE_VERSION_EDGE_HEADER_SIZE +
+		(size_t) entry_count * XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+}
+
+static bool
+page_edge_anchor_flags_valid(uint16 flags)
+{
+	return flags == (RF_PAGE_EDGE_FULL_IMAGE_APPLY |
+		RF_PAGE_EDGE_FULL_COVERAGE) ||
+		flags == (RF_PAGE_EDGE_WILL_INIT | RF_PAGE_EDGE_FULL_COVERAGE) ||
+		flags == (RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_WILL_INIT |
+		RF_PAGE_EDGE_FULL_COVERAGE);
+}
+
+static bool
+page_edge_entry_valid(const RfPageVersionEdgeEntryV1 *entry,
+					  const DecodedBkpBlock *block)
+{
+	bool edge_apply;
+	bool edge_init;
+
+	if (entry->block_id > XLR_MAX_BLOCK_ID || block == NULL ||
+		!block->in_use || entry->component_ordinal != block->component_ordinal ||
+		(entry->edge_flags & ~RF_PAGE_EDGE_KNOWN_MASK) != 0)
+		return false;
+	if (entry->page_class == RF_PAGE_CLASS_ORDINARY)
+	{
+		edge_apply =
+			(entry->edge_flags & RF_PAGE_EDGE_FULL_IMAGE_APPLY) != 0;
+		edge_init = (entry->edge_flags & RF_PAGE_EDGE_WILL_INIT) != 0;
+		if (edge_apply != block->apply_image ||
+			edge_init != ((block->flags & BKPBLOCK_WILL_INIT) != 0) ||
+			entry->result_kind != RF_PAGE_STATE_PRESENT ||
+			!page_incarnation_nonzero(entry->result_incarnation) ||
+			(entry->edge_flags != 0 &&
+			 !page_edge_anchor_flags_valid(entry->edge_flags)))
+			return false;
+		switch (entry->before_kind)
+		{
+			case RF_PAGE_STATE_PRESENT:
+				return page_incarnation_nonzero(
+					entry->before.segment_incarnation) &&
+					entry->before.mutation_token != 0 &&
+					memcmp(entry->before.segment_incarnation,
+						   entry->result_incarnation, 16) == 0;
+			case RF_PAGE_STATE_UNFORMATTED:
+				return page_incarnation_nonzero(
+					entry->before.segment_incarnation) &&
+					entry->before.mutation_token == 0 &&
+					memcmp(entry->before.segment_incarnation,
+						   entry->result_incarnation, 16) == 0 &&
+					page_edge_anchor_flags_valid(entry->edge_flags);
+			case RF_PAGE_STATE_ABSENT:
+				return !page_incarnation_nonzero(
+					entry->before.segment_incarnation) &&
+					entry->before.mutation_token == 0 &&
+					page_edge_anchor_flags_valid(entry->edge_flags);
+			default:
+				return false;
+		}
+	}
+
+	if (entry->edge_flags != 0 ||
+		page_incarnation_nonzero(entry->before.segment_incarnation) ||
+		entry->before.mutation_token != 0 ||
+		page_incarnation_nonzero(entry->result_incarnation))
+		return false;
+	if (entry->page_class == RF_PAGE_CLASS_REBUILDABLE_FSM)
+		return entry->before_kind == RF_PAGE_STATE_REBUILDABLE &&
+			entry->result_kind == RF_PAGE_STATE_REBUILDABLE;
+	if (entry->page_class == RF_PAGE_CLASS_ROUTED_SPACE ||
+		entry->page_class == RF_PAGE_CLASS_ROUTED_HEADER ||
+		entry->page_class == RF_PAGE_CLASS_ROUTED_SIDE)
+		return entry->before_kind == RF_PAGE_STATE_ROUTED &&
+			entry->result_kind == RF_PAGE_STATE_ROUTED;
+	return false;
+}
+
+static bool
+decode_page_version_edge(const uint8 *wire, size_t wire_len,
+					 DecodedXLogRecord *decoded)
+{
+	RfPageVersionEdgeV1 edge;
+	uint8 entry_count;
+	size_t required;
+	size_t block_count = 0;
+	int i;
+	int j;
+
+	if (wire == NULL || decoded == NULL ||
+		wire_len < XLR_PAGE_VERSION_EDGE_HEADER_SIZE)
+		return false;
+	entry_count = wire[2];
+	required = page_edge_wire_size(entry_count);
+	if (wire[0] != XLR_BLOCK_ID_PAGE_VERSION_EDGE ||
+		wire[1] != XLR_PAGE_VERSION_EDGE_FORMAT_V1 || required == 0 ||
+		wire_len != required || wire[3] != XLR_PAGE_VERSION_EDGE_ENTRY_SIZE ||
+		page_edge_get_u16(wire + 4) != 0 ||
+		page_edge_get_u16(wire + 6) != 0)
+		return false;
+	for (i = 0; i <= decoded->max_block_id; i++)
+		if (decoded->blocks[i].in_use)
+			block_count++;
+	if (block_count != entry_count)
+		return false;
+
+	memset(&edge, 0, sizeof(edge));
+	edge.entry_count = entry_count;
+	edge.result_token = page_edge_get_u64(wire + 8);
+	if (edge.result_token == 0)
+		return false;
+	for (i = 0; i < entry_count; i++)
+	{
+		RfPageVersionEdgeEntryV1 *entry = &edge.entries[i];
+		const uint8 *source = wire + XLR_PAGE_VERSION_EDGE_HEADER_SIZE +
+			(size_t) i * XLR_PAGE_VERSION_EDGE_ENTRY_SIZE;
+
+		entry->block_id = source[0];
+		entry->page_class = source[1];
+		entry->before_kind = source[2];
+		entry->result_kind = source[3];
+		entry->edge_flags = page_edge_get_u16(source + 4);
+		entry->component_ordinal = page_edge_get_u16(source + 6);
+		memcpy(entry->before.segment_incarnation, source + 8, 16);
+		entry->before.mutation_token = page_edge_get_u64(source + 24);
+		memcpy(entry->result_incarnation, source + 32, 16);
+		if (entry->block_id > decoded->max_block_id ||
+			(i > 0 && edge.entries[i - 1].block_id >= entry->block_id) ||
+			!page_edge_entry_valid(entry, &decoded->blocks[entry->block_id]))
+			return false;
+		for (j = 0; j < i; j++)
+			if (edge.entries[j].component_ordinal == entry->component_ordinal)
+				return false;
+	}
+	decoded->page_version_edge = edge;
+	return true;
+}
+
 /*
  * Construct a string in state->errormsg_buf explaining what's wrong with
  * the current record being read.
@@ -1827,6 +2009,10 @@ DecodeXLogRecord(XLogReaderState *state,
 	uint32		remaining;
 	uint32		datatotal;
 	RelFileLocator *rlocator = NULL;
+	const uint8 *page_edge_wire = NULL;
+	size_t		page_edge_wire_len = 0;
+	uint16		next_component_ordinal = 0;
+	bool		first_fragment = true;
 	uint8		block_id;
 
 	decoded->header = *record;
@@ -1836,6 +2022,9 @@ DecodeXLogRecord(XLogReaderState *state,
 	decoded->toplevel_xid = InvalidTransactionId;
 	decoded->main_data = NULL;
 	decoded->main_data_len = 0;
+	decoded->has_page_version_edge = false;
+	memset(&decoded->page_version_edge, 0,
+		   sizeof(decoded->page_version_edge));
 	decoded->max_block_id = -1;
 	ptr = (char *) record;
 	ptr += SizeOfXLogRecord;
@@ -1847,7 +2036,38 @@ DecodeXLogRecord(XLogReaderState *state,
 	{
 		COPY_HEADER_FIELD(&block_id, sizeof(uint8));
 
-		if (block_id == XLR_BLOCK_ID_DATA_SHORT)
+		if (block_id == XLR_BLOCK_ID_PAGE_VERSION_EDGE)
+		{
+			uint8		entry_count;
+			size_t		edge_size;
+
+			if (!first_fragment || page_edge_wire != NULL)
+			{
+				report_invalid_record(state,
+								  "PageVersion edge is not the first record fragment at %X/%X",
+								  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+			if (remaining < XLR_PAGE_VERSION_EDGE_HEADER_SIZE - 1)
+				goto shortdata_err;
+			entry_count = ((const uint8 *) ptr)[1];
+			edge_size = page_edge_wire_size(entry_count);
+			if (edge_size == 0)
+			{
+				report_invalid_record(state,
+								  "invalid PageVersion edge entry count %u at %X/%X",
+								  entry_count,
+								  LSN_FORMAT_ARGS(state->ReadRecPtr));
+				goto err;
+			}
+			if (remaining < edge_size - 1)
+				goto shortdata_err;
+			page_edge_wire = (const uint8 *) ptr - 1;
+			page_edge_wire_len = edge_size;
+			ptr += edge_size - 1;
+			remaining -= edge_size - 1;
+		}
+		else if (block_id == XLR_BLOCK_ID_DATA_SHORT)
 		{
 			/* XLogRecordDataHeaderShort */
 			uint8		main_data_len;
@@ -1901,6 +2121,7 @@ DecodeXLogRecord(XLogReaderState *state,
 			blk = &decoded->blocks[block_id];
 			blk->in_use = true;
 			blk->apply_image = false;
+			blk->component_ordinal = next_component_ordinal++;
 
 			COPY_HEADER_FIELD(&fork_flags, sizeof(uint8));
 			blk->forknum = fork_flags & BKPBLOCK_FORK_MASK;
@@ -2035,6 +2256,20 @@ DecodeXLogRecord(XLogReaderState *state,
 								  block_id, LSN_FORMAT_ARGS(state->ReadRecPtr));
 			goto err;
 		}
+		first_fragment = false;
+	}
+
+	if (page_edge_wire != NULL)
+	{
+		if (!decode_page_version_edge(page_edge_wire, page_edge_wire_len,
+								  decoded))
+		{
+			report_invalid_record(state,
+							  "invalid PageVersion edge at %X/%X",
+							  LSN_FORMAT_ARGS(state->ReadRecPtr));
+			goto err;
+		}
+		decoded->has_page_version_edge = true;
 	}
 
 	if (remaining != datatotal)
