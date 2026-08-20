@@ -211,6 +211,19 @@ extern bool cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 
 											   TransactionId xid, uint16 expected_wrap,
 											   TTSlot *slot_out);
 
+/*
+ * Recovery-only typed TT mutations.  Unlike the normal transaction helpers,
+ * these emit no successor WAL: the caller has already decoded and retained
+ * the authoritative failed-origin record.  Each applied mutation fsyncs the
+ * exact undo segment before returning; a stale/newer identity is a no-op and
+ * must be detected by the caller's exact post-read.
+ */
+extern void cluster_tt_durable_redo_abort_slot(uint8 instance,
+	uint32 segment_id, uint16 slot_offset, uint16 wrap, TransactionId xid);
+extern void cluster_tt_durable_redo_set_head_slot(uint8 instance,
+	uint32 segment_id, uint16 slot_offset, uint16 wrap, TransactionId xid,
+	UBA first_undo_block);
+
 extern ClusterTTDurableResolve
 cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid,
 											  uint32 expected_wrap, SCN *commit_scn,

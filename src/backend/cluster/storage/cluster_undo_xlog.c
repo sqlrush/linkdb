@@ -46,6 +46,7 @@
 #include "cluster/cluster_guc.h"				/* cluster_undo_gcs_coherence (D2-2) */
 #include "cluster/cluster_hw.h"					/* spec-5.7 D1 HW authority apply/encode */
 #include "cluster/cluster_mode.h"				/* cluster_peer_mode_enabled (D2-2) */
+#include "cluster/cluster_side_undo.h"			/* shared cold/online decode gate */
 #include "cluster/cluster_tt_status.h"			/* spec-3.16 D5 recovery counters */
 #include "cluster/cluster_tt_durable.h"			/* spec-3.11: redo decision predicate */
 #include "cluster/cluster_undo_gcs.h"			/* shared-root decision (D2-2 裁决 A) */
@@ -871,17 +872,11 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
  * wrapper: validate the record, then delegate to the shared stamp primitive.
  */
 static void
-cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
+cluster_undo_redo_tt_slot_commit(const ClusterUndoDecoded *decoded)
 {
-	const xl_undo_tt_slot_commit *rec;
-
-	if (XLogRecGetDataLen(record) != sizeof(*rec))
-		ereport(PANIC, (errmsg("invalid XLOG_UNDO_TT_SLOT_COMMIT record length: %u",
-							   XLogRecGetDataLen(record))));
-	rec = (const xl_undo_tt_slot_commit *)XLogRecGetData(record);
-
-	cluster_tt_durable_redo_stamp_slot(rec->instance, rec->segment_id, rec->slot_offset, rec->wrap,
-									   rec->xid, rec->commit_scn);
+	cluster_tt_durable_redo_stamp_slot(decoded->instance, decoded->segment_id,
+		decoded->slot_offset, decoded->wrap, decoded->xid,
+		decoded->commit_scn);
 }
 
 
@@ -893,102 +888,10 @@ cluster_undo_redo_tt_slot_commit(XLogReaderState *record)
  *   with xid/wrap preserved and commit_scn cleared (V-2).
  */
 static void
-cluster_undo_redo_tt_slot_abort(XLogReaderState *record)
+cluster_undo_redo_tt_slot_abort(const ClusterUndoDecoded *decoded)
 {
-	xl_undo_tt_slot_abort *rec;
-	char path[MAXPGPATH];
-	int fd;
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-	TTSlot *slot;
-	ssize_t nread;
-
-	if (XLogRecGetDataLen(record) != sizeof(*rec))
-		ereport(PANIC, (errmsg("invalid XLOG_UNDO_TT_SLOT_ABORT record length: %u",
-							   XLogRecGetDataLen(record))));
-	rec = (xl_undo_tt_slot_abort *)XLogRecGetData(record);
-
-	if (rec->slot_offset >= TT_SLOTS_PER_SEGMENT)
-		ereport(PANIC, (errmsg("XLOG_UNDO_TT_SLOT_ABORT slot_offset %u out of range (max %d)",
-							   rec->slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
-
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(rec->instance), rec->instance,
-								rec->segment_id, path, sizeof(path))
-		!= 0)
-		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
-							   rec->segment_id)));
-
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
-	if (fd < 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not open undo segment file \"%s\" for TT slot abort redo: %m", path),
-				 errhint("XLOG_UNDO_SEGMENT_INIT must precede XLOG_UNDO_TT_SLOT_ABORT.")));
-
-	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
-	if (nread != BLCKSZ) {
-		int save_errno = errno;
-
-		close(fd);
-		errno = save_errno;
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not read undo segment header \"%s\": read %zd of %d bytes",
-							   path, nread, BLCKSZ)));
-	}
-
-	hdr = (UndoSegmentHeaderData *)blockbuf.data;
-	slot = &hdr->tt_slots[rec->slot_offset];
-
-	switch (
-		cluster_tt_durable_redo_decide(slot->status, slot->xid, slot->wrap, rec->xid, rec->wrap)) {
-	case CLUSTER_TT_REDO_BADSTATUS:
-		close(fd);
-		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
-						errmsg("undo segment \"%s\" TT slot %u has invalid status %u during redo",
-							   path, rec->slot_offset, slot->status)));
-		break;
-	case CLUSTER_TT_REDO_SKIP:
-		/* A newer owner is already durable. */
-		cluster_vis_bump_recovery_undo_redo_skips(); /* spec-3.16 D5 */
-		break;
-	case CLUSTER_TT_REDO_APPLY: {
-		ssize_t written;
-
-		slot->xid = rec->xid;
-		slot->wrap = rec->wrap;
-		slot->status = TT_SLOT_ABORTED;
-		slot->commit_scn = InvalidScn;
-		slot->first_undo_block
-			= InvalidUbaVal; /* spec-4.8 D7-A (P1#1): cleared; 0x90 re-attaches */
-
-		written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
-		if (written != BLCKSZ) {
-			int save_errno = errno;
-
-			close(fd);
-			errno = save_errno;
-			ereport(PANIC, (errcode_for_file_access(),
-							errmsg("could not write undo segment \"%s\" TT slot abort: "
-								   "wrote %zd of %d bytes",
-								   path, written, BLCKSZ)));
-		}
-		if (pg_fsync(fd) != 0) {
-			int save_errno = errno;
-
-			close(fd);
-			errno = save_errno;
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("could not fsync undo segment \"%s\" after TT slot abort: %m", path)));
-		}
-		cluster_vis_bump_recovery_undo_redo_applies(); /* spec-3.16 D5 */
-		break;
-	}
-	}
-
-	if (close(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close undo segment file \"%s\": %m", path)));
+	cluster_tt_durable_redo_abort_slot(decoded->instance, decoded->segment_id,
+		decoded->slot_offset, decoded->wrap, decoded->xid);
 }
 
 
@@ -1004,91 +907,11 @@ cluster_undo_redo_tt_slot_abort(XLogReaderState *record)
  *   re-applied record writes the same head.
  */
 static void
-cluster_undo_redo_tt_slot_set_head(XLogReaderState *record)
+cluster_undo_redo_tt_slot_set_head(const ClusterUndoDecoded *decoded)
 {
-	xl_undo_tt_slot_set_head *rec;
-	char path[MAXPGPATH];
-	int fd;
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-	TTSlot *slot;
-	ssize_t nread;
-
-	if (XLogRecGetDataLen(record) != sizeof(*rec))
-		ereport(PANIC, (errmsg("invalid XLOG_UNDO_TT_SLOT_SET_HEAD record length: %u",
-							   XLogRecGetDataLen(record))));
-	rec = (xl_undo_tt_slot_set_head *)XLogRecGetData(record);
-
-	if (rec->slot_offset >= TT_SLOTS_PER_SEGMENT)
-		ereport(PANIC, (errmsg("XLOG_UNDO_TT_SLOT_SET_HEAD slot_offset %u out of range (max %d)",
-							   rec->slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
-
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(rec->instance), rec->instance,
-								rec->segment_id, path, sizeof(path))
-		!= 0)
-		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u", rec->instance,
-							   rec->segment_id)));
-
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
-	if (fd < 0)
-		ereport(
-			PANIC,
-			(errcode_for_file_access(),
-			 errmsg("could not open undo segment file \"%s\" for TT slot set-head redo: %m", path),
-			 errhint("XLOG_UNDO_SEGMENT_INIT must precede XLOG_UNDO_TT_SLOT_SET_HEAD.")));
-
-	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
-	if (nread != BLCKSZ) {
-		int save_errno = errno;
-
-		close(fd);
-		errno = save_errno;
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not read undo segment header \"%s\": read %zd of %d bytes",
-							   path, nread, BLCKSZ)));
-	}
-
-	hdr = (UndoSegmentHeaderData *)blockbuf.data;
-	slot = &hdr->tt_slots[rec->slot_offset];
-
-	/*
-	 * Identity gate: only stamp the head if the slot still owns this xact's
-	 * (xid, wrap).  A mismatch means the slot was recycled to a later owner
-	 * after the abort -- skip (do not clobber a newer transaction's head).
-	 */
-	if (slot->xid == rec->xid && slot->wrap == rec->wrap) {
-		ssize_t written;
-
-		slot->first_undo_block = rec->first_undo_block;
-
-		written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
-		if (written != BLCKSZ) {
-			int save_errno = errno;
-
-			close(fd);
-			errno = save_errno;
-			ereport(PANIC, (errcode_for_file_access(),
-							errmsg("could not write undo segment \"%s\" TT slot set-head: "
-								   "wrote %zd of %d bytes",
-								   path, written, BLCKSZ)));
-		}
-		if (pg_fsync(fd) != 0) {
-			int save_errno = errno;
-
-			close(fd);
-			errno = save_errno;
-			ereport(PANIC, (errcode_for_file_access(),
-							errmsg("could not fsync undo segment \"%s\" after TT slot set-head: %m",
-								   path)));
-		}
-		cluster_vis_bump_recovery_undo_redo_applies(); /* spec-3.16 D5 */
-	} else {
-		cluster_vis_bump_recovery_undo_redo_skips(); /* recycled owner -> skip */
-	}
-
-	if (close(fd) != 0)
-		ereport(PANIC, (errcode_for_file_access(),
-						errmsg("could not close undo segment file \"%s\": %m", path)));
+	cluster_tt_durable_redo_set_head_slot(decoded->instance,
+		decoded->segment_id, decoded->slot_offset, decoded->wrap,
+		decoded->xid, decoded->first_undo_block);
 }
 
 
@@ -1611,21 +1434,37 @@ cluster_undo_redo(XLogReaderState *record)
 	 */
 
 	uint8 info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+	ClusterUndoDecoded decoded;
 
 	/* spec-3.16 D7 (C-R4): redo runs only during recovery.  Debug-only
 	 * invariant -- NOT a production guard (L218): the rmgr framework
 	 * already restricts redo to StartupXLOG. */
 	Assert(InRecovery || RecoveryInProgress());
 
+	/*
+	 * RF-SIDE U-SIDE-02/U-SIDE-04: every non-SPACE cold record crosses
+	 * the same pure shape and route gate as online recovery before any
+	 * legacy handler can mutate its target.  HWM remains the explicit
+	 * STOP-RF-SIDE-SPACE-ABI exception until STOP-07 is approved.
+	 */
+	memset(&decoded, 0, sizeof(decoded));
+	if (info != XLOG_HW_RESERVE &&
+		(!cluster_undo_decode(record, &decoded) ||
+		 decoded.opcode != info || !cluster_undo_preflight(&decoded)))
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid cluster undo record %u during shared decode preflight",
+					 info)));
+
 	switch (info) {
 	case XLOG_UNDO_SEGMENT_INIT:
 		cluster_undo_redo_segment_init(record);
 		break;
 	case XLOG_UNDO_TT_SLOT_COMMIT:
-		cluster_undo_redo_tt_slot_commit(record);
+		cluster_undo_redo_tt_slot_commit(&decoded);
 		break;
 	case XLOG_UNDO_TT_SLOT_ABORT:
-		cluster_undo_redo_tt_slot_abort(record);
+		cluster_undo_redo_tt_slot_abort(&decoded);
 		break;
 	case XLOG_UNDO_SEGMENT_RECYCLE:
 		cluster_undo_redo_segment_recycle(record);
@@ -1640,7 +1479,7 @@ cluster_undo_redo(XLogReaderState *record)
 		cluster_undo_redo_block_write_multi(record);
 		break;
 	case XLOG_UNDO_TT_SLOT_SET_HEAD:
-		cluster_undo_redo_tt_slot_set_head(record);
+		cluster_undo_redo_tt_slot_set_head(&decoded);
 		break;
 	case XLOG_HW_RESERVE:
 		cluster_hw_redo_reserve(record);

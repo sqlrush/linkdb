@@ -28,6 +28,7 @@
 #include "access/rmgr.h"
 #include "access/xlogrecord.h"
 #include "cluster/cluster_side_route.h"
+#include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h" /* TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_segment.h"
@@ -378,6 +379,118 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 			break;
 	}
 	return true;
+}
+
+ClusterUndoTargetPreflightV1
+cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
+{
+	TTSlot		slot;
+
+	if (!cluster_undo_preflight(decoded))
+		return CLUSTER_UNDO_TARGET_BLOCKED;
+	if (decoded->kind != CLUSTER_UNDO_KIND_TT_COMMIT &&
+		decoded->kind != CLUSTER_UNDO_KIND_TT_ABORT &&
+		decoded->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD)
+		return CLUSTER_UNDO_TARGET_BLOCKED;
+	if (!cluster_tt_slot_durable_read_exact_stable(decoded->segment_id,
+			decoded->slot_offset, decoded->xid, decoded->wrap, &slot))
+		return CLUSTER_UNDO_TARGET_BLOCKED;
+
+	switch (decoded->kind)
+	{
+		case CLUSTER_UNDO_KIND_TT_COMMIT:
+			if (slot.status == TT_SLOT_COMMITTED &&
+				slot.commit_scn == decoded->commit_scn &&
+				UBA_is_invalid(slot.first_undo_block))
+				return CLUSTER_UNDO_TARGET_PROVED_NOOP;
+			if (slot.status == TT_SLOT_ACTIVE &&
+				!SCN_VALID(slot.commit_scn))
+				return CLUSTER_UNDO_TARGET_APPLY;
+			break;
+		case CLUSTER_UNDO_KIND_TT_ABORT:
+			if (slot.status == TT_SLOT_ABORTED &&
+				!SCN_VALID(slot.commit_scn) &&
+				UBA_is_invalid(slot.first_undo_block))
+				return CLUSTER_UNDO_TARGET_PROVED_NOOP;
+			if (slot.status == TT_SLOT_ACTIVE &&
+				!SCN_VALID(slot.commit_scn))
+				return CLUSTER_UNDO_TARGET_APPLY;
+			break;
+		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
+			if (slot.status != TT_SLOT_ABORTED ||
+				SCN_VALID(slot.commit_scn))
+				break;
+			if (memcmp(&slot.first_undo_block, &decoded->first_undo_block,
+					sizeof(UBA)) == 0)
+				return CLUSTER_UNDO_TARGET_PROVED_NOOP;
+			if (UBA_is_invalid(slot.first_undo_block))
+				return CLUSTER_UNDO_TARGET_APPLY;
+			break;
+		default:
+			break;
+	}
+	return CLUSTER_UNDO_TARGET_BLOCKED;
+}
+
+ClusterUndoApplyResultV1
+cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
+{
+	TTSlot		post_slot;
+	ClusterUndoTargetPreflightV1 target;
+
+	target = cluster_undo_preflight_tt_target_v1(decoded);
+	if (target == CLUSTER_UNDO_TARGET_BLOCKED)
+		return CLUSTER_UNDO_APPLY_BLOCKED;
+	if (target == CLUSTER_UNDO_TARGET_PROVED_NOOP)
+		return CLUSTER_UNDO_APPLY_OK;
+	switch (decoded->kind)
+	{
+		case CLUSTER_UNDO_KIND_TT_COMMIT:
+			cluster_tt_durable_redo_stamp_slot(decoded->instance,
+				decoded->segment_id, decoded->slot_offset, decoded->wrap,
+				decoded->xid, decoded->commit_scn);
+			break;
+		case CLUSTER_UNDO_KIND_TT_ABORT:
+			cluster_tt_durable_redo_abort_slot(decoded->instance,
+				decoded->segment_id, decoded->slot_offset, decoded->wrap,
+				decoded->xid);
+			break;
+		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
+			cluster_tt_durable_redo_set_head_slot(decoded->instance,
+				decoded->segment_id, decoded->slot_offset, decoded->wrap,
+				decoded->xid, decoded->first_undo_block);
+			break;
+		default:
+			return CLUSTER_UNDO_APPLY_BLOCKED;
+	}
+	if (!cluster_tt_slot_durable_read_exact_stable(decoded->segment_id,
+			decoded->slot_offset, decoded->xid, decoded->wrap, &post_slot))
+		return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
+	switch (decoded->kind)
+	{
+		case CLUSTER_UNDO_KIND_TT_COMMIT:
+			if (post_slot.status != TT_SLOT_COMMITTED ||
+				post_slot.commit_scn != decoded->commit_scn ||
+				!UBA_is_invalid(post_slot.first_undo_block))
+				return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
+			break;
+		case CLUSTER_UNDO_KIND_TT_ABORT:
+			if (post_slot.status != TT_SLOT_ABORTED ||
+				SCN_VALID(post_slot.commit_scn) ||
+				!UBA_is_invalid(post_slot.first_undo_block))
+				return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
+			break;
+		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
+			if (post_slot.status != TT_SLOT_ABORTED ||
+				SCN_VALID(post_slot.commit_scn) ||
+				memcmp(&post_slot.first_undo_block,
+					&decoded->first_undo_block, sizeof(UBA)) != 0)
+				return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
+			break;
+		default:
+			return CLUSTER_UNDO_APPLY_BLOCKED;
+	}
+	return CLUSTER_UNDO_APPLY_OK;
 }
 
 #else							/* !USE_PGRAC_CLUSTER */

@@ -47,10 +47,17 @@ typedef bool (*RfSideOnlineApplyXactV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlineApplyUndoV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlinePreflightXactV1)(void *arg,
+	const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlinePreflightUndoV1)(void *arg,
+	const RfSideOnlineOperationV1 *operation);
 
 typedef struct RfSideOnlineApplyOpsV1
 {
 	void *arg;
+	/* Required per present kind; all preflights run before any apply. */
+	RfSideOnlinePreflightXactV1 preflight_xact;
+	RfSideOnlinePreflightUndoV1 preflight_undo;
 	RfSideOnlineApplyXactV1 apply_xact;
 	RfSideOnlineApplyUndoV1 apply_undo;
 } RfSideOnlineApplyOpsV1;

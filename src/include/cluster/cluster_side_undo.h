@@ -22,11 +22,11 @@
  *	      STOP-RF-SIDE-SPACE-ABI) + field-integrity checks (e.g. TT slot
  *	      offset bounds).  Any false means ZERO mutation.
  *
- *	  NOT DELIVERED HERE (stays RED): the apply primitive's execution —
- *	  the existing recovery writer (cluster_undo_redo) is NOT claimed
- *	  safe (spec §1.2); the mutation/durability/post-read execution of
- *	  the decoded components belongs to the RF-ROOT/RF-PAGE integration
- *	  round.  No ABI change.
+ *	  DELIVERED FOR TT RECORDS:
+ *	    - exact durable target classification before mutation;
+ *	    - the shared TT commit/abort/set-head mutation primitive;
+ *	    - exact durable post-read verification.
+ *	  Physical undo-block and segment-lifecycle apply remain fail-closed.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -106,5 +106,27 @@ extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out
  * STOP-RF-SIDE-SPACE-ABI is active.
  */
 extern bool cluster_undo_preflight(const ClusterUndoDecoded *decoded);
+
+typedef enum ClusterUndoApplyResultV1
+{
+	CLUSTER_UNDO_APPLY_OK = 0,
+	CLUSTER_UNDO_APPLY_BLOCKED = 1,
+	CLUSTER_UNDO_APPLY_POST_READ_FAILED = 2
+} ClusterUndoApplyResultV1;
+
+typedef enum ClusterUndoTargetPreflightV1
+{
+	CLUSTER_UNDO_TARGET_APPLY = 0,
+	CLUSTER_UNDO_TARGET_PROVED_NOOP = 1,
+	CLUSTER_UNDO_TARGET_BLOCKED = 2
+} ClusterUndoTargetPreflightV1;
+
+/* Classify the exact durable TT target without mutating it. */
+extern ClusterUndoTargetPreflightV1 cluster_undo_preflight_tt_target_v1(
+	const ClusterUndoDecoded *decoded);
+
+/* Apply one already-decoded TT operation and verify the exact durable slot. */
+extern ClusterUndoApplyResultV1 cluster_undo_apply_tt_v1(
+	const ClusterUndoDecoded *decoded);
 
 #endif							/* CLUSTER_SIDE_UNDO_H */

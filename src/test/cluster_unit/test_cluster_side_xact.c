@@ -268,6 +268,20 @@ capture_apply_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 		operation->owned_payload_length > 0;
 }
 
+static bool
+accept_preflight(void *arg pg_attribute_unused(),
+				 const RfSideOnlineOperationV1 *operation pg_attribute_unused())
+{
+	return true;
+}
+
+static bool
+reject_undo_preflight(void *arg pg_attribute_unused(),
+					  const RfSideOnlineOperationV1 *operation)
+{
+	return operation->kind != RF_SIDE_ONLINE_OPERATION_UNDO;
+}
+
 UT_TEST(test_commit_decodes_to_immutable_truth_operation)
 {
 	FakeXactRecord fake;
@@ -381,6 +395,7 @@ UT_TEST(test_online_plan_owns_decoded_operation_not_raw_record)
 	memset(&capture, 0, sizeof(capture));
 	memset(&apply_ops, 0, sizeof(apply_ops));
 	apply_ops.arg = &capture;
+	apply_ops.preflight_xact = accept_preflight;
 	apply_ops.apply_xact = capture_apply;
 	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
 		RF_PAGE_PROOF_DETAIL_OK);
@@ -463,6 +478,7 @@ UT_TEST(test_online_plan_owns_undo_payload_not_raw_record)
 	memset(&capture, 0, sizeof(capture));
 	memset(&apply_ops, 0, sizeof(apply_ops));
 	apply_ops.arg = &capture;
+	apply_ops.preflight_undo = accept_preflight;
 	apply_ops.apply_xact = capture_apply;
 	apply_ops.apply_undo = capture_apply_undo;
 	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
@@ -472,10 +488,72 @@ UT_TEST(test_online_plan_owns_undo_payload_not_raw_record)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_online_plan_preflights_all_targets_before_first_mutation)
+{
+	FakeXactRecord xact_fake;
+	FakeXactRecord undo_fake;
+	RfDetachedRecordPlanV1 xact_plan;
+	RfDetachedRecordPlanV1 undo_plan;
+	RfPageOnlineRecordIdentityV1 xact_identity;
+	RfPageOnlineRecordIdentityV1 undo_identity;
+	RfSideOnlinePlanRequestV1 request;
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut;
+	RfSideOnlineApplyOpsV1 apply_ops;
+	ApplyCapture capture;
+	uint8 storage_uuid[16];
+
+	memset(storage_uuid, 0x45, sizeof(storage_uuid));
+	(void) make_commit(&xact_fake, 800, UINT64_C(901),
+		INT64_C(123456), false);
+	xact_identity = make_identity(&xact_fake, storage_uuid);
+	xact_identity.record.end_rec_ptr = 150;
+	xact_fake.reader.EndRecPtr = 150;
+	xact_fake.u.decoded.next_lsn = 150;
+	xact_plan = make_record_plan(&xact_fake);
+	(void) make_undo_delta(&undo_fake);
+	undo_identity = make_identity(&undo_fake, storage_uuid);
+	undo_identity.record.read_rec_ptr = 150;
+	undo_fake.reader.ReadRecPtr = 150;
+	undo_fake.u.decoded.lsn = 150;
+	undo_plan = make_undo_record_plan(&undo_fake);
+	memset(&cut, 0, sizeof(cut));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 200;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	memset(&request, 0, sizeof(request));
+	request.system_identifier = xact_identity.record.system_identifier;
+	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(
+		plan, &xact_plan, &xact_identity), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(
+		plan, &undo_plan, &undo_identity), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	memset(&capture, 0, sizeof(capture));
+	memset(&apply_ops, 0, sizeof(apply_ops));
+	apply_ops.arg = &capture;
+	apply_ops.preflight_xact = accept_preflight;
+	apply_ops.preflight_undo = reject_undo_preflight;
+	apply_ops.apply_xact = capture_apply;
+	apply_ops.apply_undo = capture_apply_undo;
+	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
+		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(capture.count, 0);
+	UT_ASSERT_EQ(capture.undo_count, 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);
@@ -483,6 +561,7 @@ main(void)
 	UT_RUN(test_online_plan_owns_decoded_operation_not_raw_record);
 	UT_RUN(test_online_plan_denies_incomplete_physical_cut);
 	UT_RUN(test_online_plan_owns_undo_payload_not_raw_record);
+	UT_RUN(test_online_plan_preflights_all_targets_before_first_mutation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

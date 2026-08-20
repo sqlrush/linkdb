@@ -384,11 +384,31 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	for (i = 0; i < plan->operation_count; i++)
 		if ((plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT &&
-			 ops->apply_xact == NULL) ||
+			 (ops->preflight_xact == NULL || ops->apply_xact == NULL)) ||
 			(plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO &&
-			 ops->apply_undo == NULL) ||
+			 (ops->preflight_undo == NULL || ops->apply_undo == NULL)) ||
 			plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
 			return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	/*
+	 * STOP-06 section 9.2: classify every target before the first target
+	 * byte changes.  The caller keeps its protected-set certification stable
+	 * across this pass and the mutation pass below.
+	 */
+	for (i = 0; i < plan->operation_count; i++)
+	{
+		RfSideOnlineOperationV1 operation = plan->operations[i];
+		bool		accepted;
+
+		if (operation.owned_payload_length > 0)
+			operation.owned_payload = plan->owned_payload +
+				operation.owned_payload_offset;
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT)
+			accepted = ops->preflight_xact(ops->arg, &operation);
+		else
+			accepted = ops->preflight_undo(ops->arg, &operation);
+		if (!accepted)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	}
 	for (i = 0; i < plan->operation_count; i++)
 	{
 		RfSideOnlineOperationV1 operation = plan->operations[i];

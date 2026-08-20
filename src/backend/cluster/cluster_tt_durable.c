@@ -43,6 +43,7 @@
 #include "cluster/cluster_undo_cleaner.h" /* spec-3.13 D2-B scan-only pass */
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"	  /* TTSlot, TT_SLOT_COMMITTED, TT_SLOTS_PER_SEGMENT */
+#include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData */
 #include "cluster/cluster_undo_smgr.h"	  /* header-bytes + block I/O */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
@@ -632,6 +633,122 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 
 	*slot_out = second;
 	return true;
+}
+
+
+void
+cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id,
+								   uint16 slot_offset, uint16 wrap,
+								   TransactionId xid)
+{
+	uint32		off;
+	TTSlot		slot;
+	ClusterTTRedoDecision decision;
+
+	if (instance == 0 || segment_id == 0 ||
+		instance != tt_owner_instance_for_segment(segment_id) ||
+		slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid) ||
+		wrap == TT_WRAP_INVALID)
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid typed TT abort redo identity")));
+	off = tt_slot_file_offset(slot_offset);
+	cluster_tt_durable_io_wait_start();
+	if (!cluster_undo_smgr_read_header_bytes(
+			cluster_undo_intent_for_owner(instance), segment_id, instance, off,
+			(char *) &slot, sizeof(slot)))
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot read TT slot %u of undo segment %u for abort redo",
+					 slot_offset, segment_id)));
+	}
+	decision = cluster_tt_durable_redo_decide(slot.status, slot.xid,
+		slot.wrap, xid, wrap);
+	if (decision == CLUSTER_TT_REDO_BADSTATUS)
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid TT status %u in typed abort redo", slot.status)));
+	}
+	if (decision == CLUSTER_TT_REDO_SKIP)
+	{
+		cluster_tt_durable_io_wait_end();
+		cluster_vis_bump_recovery_undo_redo_skips();
+		return;
+	}
+	slot.xid = xid;
+	slot.wrap = wrap;
+	slot.status = TT_SLOT_ABORTED;
+	slot.commit_scn = InvalidScn;
+	slot.first_undo_block = InvalidUbaVal;
+	if (!cluster_undo_smgr_write_header_bytes(
+			cluster_undo_intent_for_owner(instance), segment_id, instance, off,
+			(const char *) &slot, sizeof(slot)) ||
+		!cluster_undo_smgr_fsync_segment_file(segment_id, instance))
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot durably write TT slot %u of undo segment %u for abort redo",
+					 slot_offset, segment_id)));
+	}
+	cluster_tt_durable_io_wait_end();
+	cluster_vis_bump_recovery_undo_redo_applies();
+}
+
+
+void
+cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id,
+									 uint16 slot_offset, uint16 wrap,
+									 TransactionId xid,
+									 UBA first_undo_block)
+{
+	uint32		off;
+	TTSlot		slot;
+
+	if (instance == 0 || segment_id == 0 ||
+		instance != tt_owner_instance_for_segment(segment_id) ||
+		slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid) ||
+		wrap == TT_WRAP_INVALID || UBA_is_invalid(first_undo_block))
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("invalid typed TT set-head redo identity")));
+	off = tt_slot_file_offset(slot_offset);
+	cluster_tt_durable_io_wait_start();
+	if (!cluster_undo_smgr_read_header_bytes(
+			cluster_undo_intent_for_owner(instance), segment_id, instance, off,
+			(char *) &slot, sizeof(slot)))
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot read TT slot %u of undo segment %u for set-head redo",
+					 slot_offset, segment_id)));
+	}
+	if (slot.status != TT_SLOT_ABORTED || slot.xid != xid ||
+		slot.wrap != wrap)
+	{
+		cluster_tt_durable_io_wait_end();
+		cluster_vis_bump_recovery_undo_redo_skips();
+		return;
+	}
+	slot.first_undo_block = first_undo_block;
+	if (!cluster_undo_smgr_write_header_bytes(
+			cluster_undo_intent_for_owner(instance), segment_id, instance, off,
+			(const char *) &slot, sizeof(slot)) ||
+		!cluster_undo_smgr_fsync_segment_file(segment_id, instance))
+	{
+		cluster_tt_durable_io_wait_end();
+		ereport(PANIC,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cannot durably write TT slot %u of undo segment %u for set-head redo",
+					 slot_offset, segment_id)));
+	}
+	cluster_tt_durable_io_wait_end();
+	cluster_vis_bump_recovery_undo_redo_applies();
 }
 
 

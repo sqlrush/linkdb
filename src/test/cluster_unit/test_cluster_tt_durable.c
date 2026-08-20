@@ -46,6 +46,7 @@
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_undo_cleaner.h" /* scan-pass stats (spec-3.13 D2-B) */
 
 /* spec-3.13 D2-B stub: scan pass compares commit_scn vs horizon. */
@@ -377,6 +378,12 @@ cluster_tt_durable_io_wait_start(void)
 void
 cluster_tt_durable_io_wait_end(void)
 {}
+void
+cluster_vis_bump_recovery_undo_redo_applies(void)
+{}
+void
+cluster_vis_bump_recovery_undo_redo_skips(void)
+{}
 
 /* spec-3.13 D6 stubs: scan-pass wait wrappers (no pgstat in unit). */
 void
@@ -408,6 +415,7 @@ cluster_undo_smgr_read_header_bytes(ClusterUndoPathIntent intent pg_attribute_un
 static int g_write_hdr_calls = 0;  /* spec-3.13 D2-B scan-only invariant probe */
 static TTSlot g_last_written_slot; /* spec-3.15: capture write payload */
 static bool g_write_hdr_ok = true;
+static int g_fsync_segment_calls = 0;
 
 bool
 cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_unused(),
@@ -420,6 +428,14 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_u
 	if (buf != NULL && len == sizeof(TTSlot))
 		memcpy(&g_last_written_slot, buf, sizeof(TTSlot));
 	return g_write_hdr_ok && buf != NULL && len == sizeof(TTSlot);
+}
+
+bool
+cluster_undo_smgr_fsync_segment_file(uint32 segment_id pg_attribute_unused(),
+								 uint8 owner_instance pg_attribute_unused())
+{
+	g_fsync_segment_calls++;
+	return true;
 }
 
 bool
@@ -1414,6 +1430,54 @@ UT_TEST(test_durable_abort_preserves_identity)
 	UT_ASSERT_EQ((int)SCN_VALID(g_last_written_slot.commit_scn), 0);
 }
 
+UT_TEST(test_typed_redo_abort_is_durable_and_idempotent)
+{
+	g_read_hdr_ok = true;
+	g_read_hdr_calls = 0;
+	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
+	g_canned_slot.status = TT_SLOT_ACTIVE;
+	g_canned_slot.xid = 778;
+	g_canned_slot.wrap = 5;
+	g_write_hdr_calls = 0;
+	g_fsync_segment_calls = 0;
+
+	cluster_tt_durable_redo_abort_slot(1, 1, 7, 5, 778);
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_fsync_segment_calls, 1);
+	UT_ASSERT_EQ((int) g_last_written_slot.status, (int) TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(g_last_written_slot.xid, 778);
+	UT_ASSERT_EQ(g_last_written_slot.wrap, 5);
+	UT_ASSERT(UBA_is_invalid(g_last_written_slot.first_undo_block));
+}
+
+UT_TEST(test_typed_redo_set_head_requires_aborted_identity)
+{
+	UBA head = InvalidUba_init;
+
+	head.raw[0] = UINT64_C(1) | (UINT64_C(9) << 32);
+	head.raw[1] = UINT64_C(7);
+	g_read_hdr_ok = true;
+	g_read_hdr_calls = 0;
+	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
+	g_canned_slot.status = TT_SLOT_ABORTED;
+	g_canned_slot.xid = 778;
+	g_canned_slot.wrap = 5;
+	g_write_hdr_calls = 0;
+	g_fsync_segment_calls = 0;
+	cluster_tt_durable_redo_set_head_slot(1, 1, 7, 5, 778, head);
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(g_fsync_segment_calls, 1);
+	UT_ASSERT_EQ(memcmp(&g_last_written_slot.first_undo_block, &head,
+		sizeof(head)), 0);
+
+	g_canned_slot.status = TT_SLOT_COMMITTED;
+	g_write_hdr_calls = 0;
+	g_fsync_segment_calls = 0;
+	cluster_tt_durable_redo_set_head_slot(1, 1, 7, 5, 778, head);
+	UT_ASSERT_EQ(g_write_hdr_calls, 0);
+	UT_ASSERT_EQ(g_fsync_segment_calls, 0);
+}
+
 
 /* ============================================================
  *	spec-3.16 D2 — 0x30/0x60 redo decide table idempotent + shared
@@ -1622,7 +1686,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(73);
+	UT_PLAN(75);
 
 	UT_RUN(test_layout_sizes);
 
@@ -1682,6 +1746,8 @@ main(int argc, char **argv)
 	UT_RUN(test_scan_pass_read_fail_returns_false);
 
 	UT_RUN(test_durable_abort_preserves_identity);
+	UT_RUN(test_typed_redo_abort_is_durable_and_idempotent);
+	UT_RUN(test_typed_redo_set_head_requires_aborted_identity);
 
 	UT_RUN(test_redo_decide_idempotent_replay);
 	UT_RUN(test_redo_decide_abort_shares_commit_table);

@@ -22,6 +22,7 @@
 #include "access/rmgr.h"
 #include "access/xlogrecord.h"
 #include "cluster/cluster_side_undo.h"
+#include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
@@ -38,6 +39,58 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 }
 
 #include <stdio.h>
+
+static TTSlot apply_slot;
+static int apply_read_calls;
+static int apply_fail_on_read;
+
+void
+cluster_tt_durable_redo_stamp_slot(uint8 instance pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(), uint16 slot_offset pg_attribute_unused(),
+	uint16 wrap, TransactionId xid, SCN commit_scn)
+{
+	memset(&apply_slot, 0, sizeof(apply_slot));
+	apply_slot.status = TT_SLOT_COMMITTED;
+	apply_slot.xid = xid;
+	apply_slot.wrap = wrap;
+	apply_slot.commit_scn = commit_scn;
+}
+
+void
+cluster_tt_durable_redo_abort_slot(uint8 instance pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(), uint16 slot_offset pg_attribute_unused(),
+	uint16 wrap, TransactionId xid)
+{
+	memset(&apply_slot, 0, sizeof(apply_slot));
+	apply_slot.status = TT_SLOT_ABORTED;
+	apply_slot.xid = xid;
+	apply_slot.wrap = wrap;
+}
+
+void
+cluster_tt_durable_redo_set_head_slot(uint8 instance pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(), uint16 slot_offset pg_attribute_unused(),
+	uint16 wrap, TransactionId xid, UBA first_undo_block)
+{
+	apply_slot.status = TT_SLOT_ABORTED;
+	apply_slot.xid = xid;
+	apply_slot.wrap = wrap;
+	apply_slot.first_undo_block = first_undo_block;
+}
+
+bool
+cluster_tt_slot_durable_read_exact_stable(uint32 segment_id pg_attribute_unused(),
+	uint16 slot_offset pg_attribute_unused(), TransactionId xid,
+	uint16 expected_wrap, TTSlot *slot_out)
+{
+	apply_read_calls++;
+	if ((apply_fail_on_read > 0 && apply_read_calls == apply_fail_on_read) ||
+		slot_out == NULL || apply_slot.xid != xid ||
+		apply_slot.wrap != expected_wrap)
+		return false;
+	*slot_out = apply_slot;
+	return true;
+}
 
 /* ----------
  * Record fabrication: a minimal XLogReaderState wrapping a
@@ -107,6 +160,8 @@ UT_TEST(test_decode_malformed_and_unknown_blocked)
 {
 	FakeRecord fr;
 	xl_undo_tt_slot_commit payload;
+	xl_undo_tt_slot_abort abort_payload;
+	xl_undo_tt_slot_set_head head_payload;
 	ClusterUndoDecoded out;
 	XLogReaderState *rec;
 
@@ -128,6 +183,18 @@ UT_TEST(test_decode_malformed_and_unknown_blocked)
 	/* Malformed length (too long). */
 	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT,
 					  &payload, sizeof(payload) + 1);
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
+
+	/* Cold and online share this padding gate before either may mutate. */
+	memset(&abort_payload, 0, sizeof(abort_payload));
+	abort_payload._pad[0] = 1;
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT,
+		&abort_payload, sizeof(abort_payload));
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
+	memset(&head_payload, 0, sizeof(head_payload));
+	head_payload._pad[2] = 1;
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD,
+		&head_payload, sizeof(head_payload));
 	UT_ASSERT(!cluster_undo_decode(rec, &out));
 
 	/* NULL inputs. */
@@ -279,16 +346,84 @@ UT_TEST(test_decode_set_head_and_multi_exact_shape)
 	UT_ASSERT(!cluster_undo_decode(rec, &out));
 }
 
+UT_TEST(test_typed_tt_apply_requires_exact_post_read)
+{
+	ClusterUndoDecoded operation;
+	UBA head = InvalidUba_init;
+
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = CLUSTER_UNDO_KIND_TT_COMMIT;
+	operation.opcode = XLOG_UNDO_TT_SLOT_COMMIT;
+	operation.instance = 3;
+	operation.segment_id = 513;
+	operation.slot_offset = 4;
+	operation.wrap = 7;
+	operation.xid = 801;
+	operation.commit_scn = 901;
+	apply_read_calls = 0;
+	apply_fail_on_read = 0;
+	memset(&apply_slot, 0, sizeof(apply_slot));
+	apply_slot.status = TT_SLOT_ACTIVE;
+	apply_slot.xid = operation.xid;
+	apply_slot.wrap = operation.wrap;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_APPLY);
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&operation),
+		CLUSTER_UNDO_APPLY_OK);
+	UT_ASSERT_EQ((int) apply_slot.status, (int) TT_SLOT_COMMITTED);
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_PROVED_NOOP);
+
+	operation.kind = CLUSTER_UNDO_KIND_TT_ABORT;
+	operation.opcode = XLOG_UNDO_TT_SLOT_ABORT;
+	operation.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_BLOCKED);
+	apply_slot.status = TT_SLOT_ACTIVE;
+	apply_slot.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&operation),
+		CLUSTER_UNDO_APPLY_OK);
+	UT_ASSERT_EQ((int) apply_slot.status, (int) TT_SLOT_ABORTED);
+
+	head.raw[0] = UINT64_C(513) | (UINT64_C(9) << 32);
+	head.raw[1] = UINT64_C(4);
+	operation.kind = CLUSTER_UNDO_KIND_TT_SET_HEAD;
+	operation.opcode = XLOG_UNDO_TT_SLOT_SET_HEAD;
+	operation.first_undo_block = head;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_APPLY);
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&operation),
+		CLUSTER_UNDO_APPLY_OK);
+	UT_ASSERT_EQ(memcmp(&apply_slot.first_undo_block, &head, sizeof(head)), 0);
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_PROVED_NOOP);
+	apply_slot.first_undo_block.raw[0]++;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_BLOCKED);
+	apply_slot.first_undo_block = head;
+
+	apply_slot.status = TT_SLOT_ABORTED;
+	apply_slot.commit_scn = InvalidScn;
+	memset(&apply_slot.first_undo_block, 0,
+		sizeof(apply_slot.first_undo_block));
+	apply_read_calls = 0;
+	apply_fail_on_read = 2;
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&operation),
+		CLUSTER_UNDO_APPLY_POST_READ_FAILED);
+	apply_fail_on_read = 0;
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_malformed_and_unknown_blocked);
 	UT_RUN(test_preflight_field_integrity_and_route);
 	UT_RUN(test_decode_block_write_fields);
 	UT_RUN(test_decode_set_head_and_multi_exact_shape);
+	UT_RUN(test_typed_tt_apply_requires_exact_post_read);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
