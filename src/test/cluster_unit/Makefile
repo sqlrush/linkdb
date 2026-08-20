@@ -115,6 +115,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_page_producer \
 		test_cluster_page_anchor_cache \
 		test_cluster_page_stable_base \
+		test_cluster_side_xact \
         test_cluster_cf_storage \
         test_cluster_cf_enqueue \
         test_cluster_cf_phase2 \
@@ -325,6 +326,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -885,6 +887,27 @@ test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+CLUSTER_SIDE_XACT_O = test_cluster_side_xact_product.o
+$(CLUSTER_SIDE_XACT_O): $(top_srcdir)/src/backend/cluster/cluster_side_xact.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
+$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_ONLINE_TESTING -c $< -o $@
+SIDE_XACT_XACTDESC_O = test_cluster_side_xact_xactdesc.o
+$(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+test_cluster_side_xact: test_cluster_side_xact.c unit_test.h \
+		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
+		$(SIDE_XACT_XACTDESC_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) \
+		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(SIDE_XACT_XACTDESC_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # RF-SIDE D-SIDE-03: PREPARED/in-doubt binding + RECO-style resolution
 # judgements.
