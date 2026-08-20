@@ -228,6 +228,8 @@ UT_TEST(test_ordinary_record_preflight_builds_immutable_plan)
 		RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(plan.preflight_complete);
 	UT_ASSERT_EQ(plan.component_count, 1);
+	UT_ASSERT_EQ(plan.components[0].before_kind, RF_PAGE_STATE_PRESENT);
+	UT_ASSERT_EQ(plan.components[0].result_kind, RF_PAGE_STATE_PRESENT);
 	UT_ASSERT_EQ(plan.components[0].owner,
 		RF_DETACHED_COMPONENT_PAGE_CODEC);
 	UT_ASSERT_EQ(plan.components[0].block_id, 0);

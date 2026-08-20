@@ -204,6 +204,8 @@ rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
 		component->page_class = edge->page_class;
 		component->component_ordinal = edge->component_ordinal;
 		component->edge_flags = edge->edge_flags;
+		component->before_kind = edge->before_kind;
+		component->result_kind = edge->result_kind;
 		set_component_versions(component, edge, candidate.result_token);
 
 		switch (edge->page_class)
@@ -279,6 +281,7 @@ rf_page_detached_apply_v1(const RfDetachedRecordPlanV1 *plan,
 	component = &plan->components[component_index];
 	if (component->owner != RF_DETACHED_COMPONENT_PAGE_CODEC ||
 		component->page_class != RF_PAGE_CLASS_ORDINARY ||
+		component->result_kind != RF_PAGE_STATE_PRESENT ||
 		!rf_page_version_present_v1(&component->result) ||
 		component->result.mutation_token != plan->result_token)
 		return RF_PAGE_PROOF_DETAIL_CLASS_UNKNOWN;

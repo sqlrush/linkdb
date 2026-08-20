@@ -106,6 +106,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_page_edge_reader \
 		test_cluster_rf_route \
 		test_cluster_page_detached \
+		test_cluster_page_replay_batch \
 		test_cluster_page_install \
 		test_cluster_page_producer \
 		test_cluster_page_anchor_cache \
@@ -311,6 +312,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_edge,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -621,6 +623,8 @@ test_cluster_rf_route: test_cluster_rf_route.c unit_test.h \
 CLUSTER_PAGE_DETACHED_O = \
 		$(top_builddir)/src/backend/cluster/cluster_page_detached.o
 
+CLUSTER_PAGE_INSTALL_O = cluster_page_install_test.o
+
 test_cluster_page_detached: test_cluster_page_detached.c unit_test.h \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_BLOCK_APPLY_O)
@@ -629,7 +633,19 @@ test_cluster_page_detached: test_cluster_page_detached.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
-CLUSTER_PAGE_INSTALL_O = cluster_page_install_test.o
+CLUSTER_PAGE_REPLAY_BATCH_O = cluster_page_replay_batch_test.o
+
+$(CLUSTER_PAGE_REPLAY_BATCH_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_page_replay_batch.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_replay_batch.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_page_replay_batch: test_cluster_page_replay_batch.c unit_test.h \
+		$(CLUSTER_PAGE_REPLAY_BATCH_O) $(CLUSTER_PAGE_INSTALL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PAGE_REPLAY_BATCH_O) \
+		$(CLUSTER_PAGE_INSTALL_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 $(CLUSTER_PAGE_INSTALL_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_page_install.c \

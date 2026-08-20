@@ -30,6 +30,9 @@ typedef struct RfDetachedComponentPlanV1
 	uint8		codec_id;
 	uint16	component_ordinal;
 	uint16	edge_flags;
+	uint8		before_kind;
+	uint8		result_kind;
+	uint8		reserved_zero[6];
 	RfPageVersionV1 before;
 	RfPageVersionV1 result;
 } RfDetachedComponentPlanV1;
