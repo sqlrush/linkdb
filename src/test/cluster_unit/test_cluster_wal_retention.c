@@ -1032,6 +1032,43 @@ UT_TEST(test_pin_bind_revalidate_and_seal_closed_fsm)
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
+UT_TEST(test_unbound_pin_has_pre_ir_slow_revalidation_only)
+{
+	ClusterWalRetentionInterval interval = {
+		.thread_id = 1,
+		.tli = 1,
+		.start_lsn = TEST_WAL_SEG_SIZE,
+		.end_lsn = TEST_WAL_SEG_SIZE * 2
+	};
+	ClusterWalRetentionPinThreadRequest request =
+		make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_preflight_revalidate_wait_v1(pin),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
+				 CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_preflight_revalidate_wait_v1(pin),
+				 CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
+				 CLUSTER_WAL_PIN_OK);
+	fake_root_current = false;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_preflight_revalidate_wait_v1(pin),
+				 CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT(cluster_wal_retention_pin_bind_one(pin, &serial) !=
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+}
+
 UT_TEST(test_pin_revalidation_drift_poisoned_until_release)
 {
 	ClusterWalRetentionInterval interval = {
@@ -1093,6 +1130,114 @@ UT_TEST(test_sealed_pin_root_publish_requires_whole_root_token)
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
 				 &request.root_read, true, &publisher), CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_NOT_NULL(publisher);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+}
+
+static ClusterControlRootSnapshot
+make_pin_root_snapshot(const ClusterWalRetentionPinThreadRequest *request,
+					   const ClusterWalRetentionInterval *interval)
+{
+	ClusterControlRootSnapshot root;
+
+	memset(&root, 0, sizeof(root));
+	root.identity = request->duty;
+	root.lifecycle = request->root_read.lifecycle;
+	root.root_flags = request->root_read.root_flags;
+	root.checkpoint_tli = interval->tli;
+	root.tail_tli = interval->tli;
+	root.checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
+	root.tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	root.checkpoint_lower_lsn = interval->start_lsn;
+	root.validated_tail_lsn_exclusive = interval->end_lsn;
+	root.checkpoint_record_crc32c = 11;
+	root.tail_last_record_lsn = interval->end_lsn - 64;
+	root.tail_last_record_crc32c = 12;
+	return root;
+}
+
+UT_TEST(test_sealed_pin_adopts_same_immutable_root_readback)
+{
+	ClusterWalRetentionInterval interval = {
+		.thread_id = 1,
+		.tli = 1,
+		.start_lsn = TEST_WAL_SEG_SIZE,
+		.end_lsn = TEST_WAL_SEG_SIZE * 2
+	};
+	ClusterWalRetentionPinThreadRequest request =
+		make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterControlRootSnapshot expected =
+		make_pin_root_snapshot(&request, &interval);
+	ClusterControlRootSnapshot observed = expected;
+	ClusterControlRootReadToken observed_token = request.root_read;
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin),
+				 CLUSTER_WAL_PIN_OK);
+	serial.held = false;
+	observed.root_publish_seq++;
+	observed.recovered_through_lsn_exclusive = interval.end_lsn;
+	observed_token.file_txn_seq++;
+	observed_token.root_publish_seq++;
+	observed_token.record_crc32c++;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(
+		pin, &expected, &request.root_read, &observed, &observed_token),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
+		&request.root_read, true, &publisher), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_NULL(publisher);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
+		&observed_token, true, &publisher), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+}
+
+UT_TEST(test_sealed_pin_rejects_immutable_root_drift)
+{
+	ClusterWalRetentionInterval interval = {
+		.thread_id = 1,
+		.tli = 1,
+		.start_lsn = TEST_WAL_SEG_SIZE,
+		.end_lsn = TEST_WAL_SEG_SIZE * 2
+	};
+	ClusterWalRetentionPinThreadRequest request =
+		make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterControlRootSnapshot expected =
+		make_pin_root_snapshot(&request, &interval);
+	ClusterControlRootSnapshot observed = expected;
+	ClusterControlRootReadToken observed_token = request.root_read;
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalRootPublishGuard *publisher = NULL;
+
+	reset_pin_fakes();
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin),
+				 CLUSTER_WAL_PIN_OK);
+	serial.held = false;
+	observed.checkpoint_lower_lsn++;
+	observed_token.file_txn_seq++;
+	observed_token.root_publish_seq++;
+	observed_token.record_crc32c++;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(
+		pin, &expected, &request.root_read, &observed, &observed_token),
+		CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
+		&request.root_read, true, &publisher), CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
@@ -2162,7 +2307,7 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(36);
+	UT_PLAN(39);
 	UT_RUN(test_layout_contracts);
 	UT_RUN(test_thread_directory_exact_parse);
 	UT_RUN(test_wal_basename_exact_parse);
@@ -2177,8 +2322,11 @@ main(int argc, char **argv)
 	UT_RUN(test_pin_acquire_is_sorted_all_or_none);
 	UT_RUN(test_pin_uncertain_rollback_remains_cleanup_only);
 	UT_RUN(test_pin_bind_revalidate_and_seal_closed_fsm);
+	UT_RUN(test_unbound_pin_has_pre_ir_slow_revalidation_only);
 	UT_RUN(test_pin_revalidation_drift_poisoned_until_release);
 	UT_RUN(test_sealed_pin_root_publish_requires_whole_root_token);
+	UT_RUN(test_sealed_pin_adopts_same_immutable_root_readback);
+	UT_RUN(test_sealed_pin_rejects_immutable_root_drift);
 	UT_RUN(test_pin_resource_owner_abort_releases_live_grant);
 	UT_RUN(test_pin_explicit_release_prevents_owner_double_release);
 	UT_RUN(test_recovery_guard_converts_same_pin_holder_and_poison_is_cleanup_only);

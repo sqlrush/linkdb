@@ -158,10 +158,6 @@ rf_page_storage_install_execute_v1(
 		const RfPageStorageInstallComponentV1 *component =
 			&request->components[i];
 		char	   *prepared = request->prepared_pages + (Size) i * BLCKSZ;
-		char	   *target = request->io_pages + (Size) i * BLCKSZ;
-		bool		exists;
-		bool		torn;
-		uint64		token;
 
 		if (!component_versions_valid(component) ||
 			!authority->validate_identity(authority->arg,
@@ -170,13 +166,35 @@ rf_page_storage_install_execute_v1(
 			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 		if (!canonicalize_page(storage, component, prepared))
 			return RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED;
+	}
+
+	/*
+	 * Target state is meaningful only while PAGE authority protects the
+	 * certified target set.  Keep all argument/image work before promotion,
+	 * but do not touch storage until promotion succeeds.
+	 */
+	if (!authority->promote(authority->arg))
+		return RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+
+	for (i = 0; i < request->component_count; i++)
+	{
+		const RfPageStorageInstallComponentV1 *component =
+			&request->components[i];
+		char	   *prepared = request->prepared_pages + (Size) i * BLCKSZ;
+		char	   *target = request->io_pages + (Size) i * BLCKSZ;
+		bool		exists;
+		bool		torn;
+		uint64		token;
+
 		if (!storage->read(storage->arg, i, &component->page_identity,
 				target, &exists))
-			return RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+			return release_after_failure(authority,
+				RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 		if (!exists)
 		{
 			if (component->before_kind != RF_PAGE_STATE_ABSENT)
-				return RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH;
+				return release_after_failure(authority,
+					RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
 			write_required[i] = true;
 			extend_required[i] = true;
 			continue;
@@ -193,7 +211,8 @@ rf_page_storage_install_execute_v1(
 		if (token == component->expected_result.mutation_token)
 		{
 			if (memcmp(target, prepared, BLCKSZ) != 0)
-				return RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED;
+				return release_after_failure(authority,
+					RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED);
 			continue;
 		}
 		if (component->before_kind == RF_PAGE_STATE_PRESENT &&
@@ -208,11 +227,10 @@ rf_page_storage_install_execute_v1(
 			write_required[i] = true;
 			continue;
 		}
-		return RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH;
+		return release_after_failure(authority,
+			RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
 	}
 
-	if (!authority->promote(authority->arg))
-		return RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
 	memset(&completed, 0, sizeof(completed));
 	completed.component_count = request->component_count;
 
@@ -277,12 +295,12 @@ rf_page_storage_install_execute_v1(
 
 #ifndef USE_CLUSTER_UNIT
 
-typedef struct RfPageSmgrInstallContextV1
+struct RfPageSmgrPreopenV1
 {
 	const RfPageStorageInstallRequestV1 *request;
 	SMgrRelation relations[RF_PAGE_STABLE_MAX_COMPONENTS];
 	bool		opened[RF_PAGE_STABLE_MAX_COMPONENTS];
-} RfPageSmgrInstallContextV1;
+};
 
 typedef struct RfPageSmgrAuthorityContextV1
 {
@@ -291,15 +309,11 @@ typedef struct RfPageSmgrAuthorityContextV1
 } RfPageSmgrAuthorityContextV1;
 
 static SMgrRelation
-page_smgr_relation(RfPageSmgrInstallContextV1 *context, uint32 index)
+page_smgr_relation(RfPageSmgrPreopenV1 *context, uint32 index)
 {
-	if (!context->opened[index])
-	{
-		context->relations[index] = smgropen(
-			context->request->components[index].page_identity.locator,
-			InvalidBackendId);
-		context->opened[index] = true;
-	}
+	if (context == NULL || index >= context->request->component_count ||
+		!context->opened[index])
+		return NULL;
 	return context->relations[index];
 }
 
@@ -308,11 +322,12 @@ page_smgr_read(void *arg, uint32 index,
 			   const RfPageIdentityV1 *identity, char page[BLCKSZ],
 			   bool *exists)
 {
-	RfPageSmgrInstallContextV1 *context =
-		(RfPageSmgrInstallContextV1 *) arg;
+	RfPageSmgrPreopenV1 *context = (RfPageSmgrPreopenV1 *) arg;
 	SMgrRelation relation = page_smgr_relation(context, index);
 	ForkNumber	forknum = (ForkNumber) identity->forknum;
 
+	if (relation == NULL)
+		return false;
 	*exists = smgrexists(relation, forknum) &&
 		identity->blockno < smgrnblocks(relation, forknum);
 	if (*exists)
@@ -327,12 +342,13 @@ page_smgr_write(void *arg, uint32 index,
 				const RfPageIdentityV1 *identity,
 				const char page[BLCKSZ], bool extend)
 {
-	RfPageSmgrInstallContextV1 *context =
-		(RfPageSmgrInstallContextV1 *) arg;
+	RfPageSmgrPreopenV1 *context = (RfPageSmgrPreopenV1 *) arg;
 	SMgrRelation relation = page_smgr_relation(context, index);
 	ForkNumber	forknum = (ForkNumber) identity->forknum;
 	BlockNumber nblocks;
 
+	if (relation == NULL)
+		return false;
 	if (!smgrexists(relation, forknum))
 		return false;
 	nblocks = smgrnblocks(relation, forknum);
@@ -355,8 +371,8 @@ static bool
 page_smgr_sync(void *arg, uint32 index,
 			   const RfPageIdentityV1 *identity)
 {
-	RfPageSmgrInstallContextV1 *context =
-		(RfPageSmgrInstallContextV1 *) arg;
+	RfPageSmgrPreopenV1 *context = (RfPageSmgrPreopenV1 *) arg;
+	SMgrRelation relation;
 	uint32		i;
 
 	for (i = 0; i < index; i++)
@@ -368,8 +384,10 @@ page_smgr_sync(void *arg, uint32 index,
 			prior->forknum == identity->forknum)
 			return true;
 	}
-	smgrimmedsync(page_smgr_relation(context, index),
-		(ForkNumber) identity->forknum);
+	relation = page_smgr_relation(context, index);
+	if (relation == NULL)
+		return false;
+	smgrimmedsync(relation, (ForkNumber) identity->forknum);
 	return true;
 }
 
@@ -425,30 +443,70 @@ page_smgr_authority_release(void *arg)
 }
 
 RfPageProofDetailV1
-rf_page_storage_install_smgr_v1(
+rf_page_storage_smgr_preopen_v1(
 	const RfPageStorageInstallRequestV1 *request,
+	RfPageSmgrPreopenV1 **out_preopen)
+{
+	RfPageSmgrPreopenV1 *context;
+	uint32		i;
+
+	if (out_preopen == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	*out_preopen = NULL;
+	if (request == NULL || request->components == NULL ||
+		request->component_count == 0 ||
+		request->component_count > RF_PAGE_STABLE_MAX_COMPONENTS ||
+		request->storage != NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	context = palloc0(sizeof(*context));
+	context->request = request;
+	for (i = 0; i < request->component_count; i++)
+	{
+		context->relations[i] = smgropen(
+			request->components[i].page_identity.locator,
+			InvalidBackendId);
+		context->opened[i] = true;
+	}
+	*out_preopen = context;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+void
+rf_page_storage_smgr_preopen_destroy_v1(RfPageSmgrPreopenV1 **preopen)
+{
+	if (preopen == NULL || *preopen == NULL)
+		return;
+	pfree(*preopen);
+	*preopen = NULL;
+}
+
+RfPageProofDetailV1
+rf_page_storage_install_smgr_preopened_v1(
+	const RfPageStorageInstallRequestV1 *request,
+	RfPageSmgrPreopenV1 *preopen,
 	RfPageStorageInstallProofV1 *proof)
 {
-	RfPageSmgrInstallContextV1 context;
 	RfPageSmgrAuthorityContextV1 authority_context;
 	RfPageInstallStorageOpsV1 storage;
 	RfPageInstallAuthorityOpsV1 authority;
 	RfPageStorageInstallRequestV1 smgr_request;
 	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
 
-	if (request == NULL || request->storage != NULL ||
+	if (request == NULL || request->components == NULL ||
+		request->component_count == 0 ||
+		request->component_count > RF_PAGE_STABLE_MAX_COMPONENTS ||
+		preopen == NULL || preopen->request != request ||
+		request->storage != NULL ||
 		request->authority == NULL ||
 		request->authority->validate_identity == NULL ||
 		request->authority->promote == NULL ||
 		request->authority->publish == NULL ||
 		request->authority->release == NULL)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	memset(&context, 0, sizeof(context));
-	context.request = request;
 	memset(&authority_context, 0, sizeof(authority_context));
 	authority_context.delegate = request->authority;
 	memset(&storage, 0, sizeof(storage));
-	storage.arg = &context;
+	storage.arg = preopen;
 	storage.checksums_enabled = DataChecksumsEnabled();
 	storage.read = page_smgr_read;
 	storage.write = page_smgr_write;
@@ -474,6 +532,32 @@ rf_page_storage_install_smgr_v1(
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
+	return detail;
+}
+
+RfPageProofDetailV1
+rf_page_storage_install_smgr_v1(
+	const RfPageStorageInstallRequestV1 *request,
+	RfPageStorageInstallProofV1 *proof)
+{
+	RfPageSmgrPreopenV1 *preopen = NULL;
+	RfPageProofDetailV1 detail;
+
+	detail = rf_page_storage_smgr_preopen_v1(request, &preopen);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	PG_TRY();
+	{
+		detail = rf_page_storage_install_smgr_preopened_v1(
+			request, preopen, proof);
+	}
+	PG_CATCH();
+	{
+		rf_page_storage_smgr_preopen_destroy_v1(&preopen);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	rf_page_storage_smgr_preopen_destroy_v1(&preopen);
 	return detail;
 }
 

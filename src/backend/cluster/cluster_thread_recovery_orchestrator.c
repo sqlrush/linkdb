@@ -79,6 +79,7 @@
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_remote_xact.h"	   /* per-origin outcome store flush              */
 #include "cluster/cluster_thread_recovery.h"   /* engine / driver / pure gates                */
+#include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_wal_state.h"		   /* replay-window slot read                     */
 #include "cluster/cluster_write_fence.h"	   /* spec-4.12 D6 durable authority verify        */
 #include "cluster/storage/cluster_shared_fs.h" /* CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS         */
@@ -298,7 +299,7 @@ cluster_thread_recovery_capability_gate(ClusterThreadRecScope scope)
 ClusterThreadRecResult
 cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower,
 										  XLogRecPtr scan_upper, uint64 episode_epoch,
-										  ClusterRecoverySerialGuard *serial_guard,
+										  const ClusterThreadRecoveryAuthorityV1 *authority,
 										  ClusterThreadReplayStats *stats)
 {
 	int origin = (int)dead_tid - 1;
@@ -322,8 +323,8 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	/* dead_tid must name a real thread slot (origin in range). */
 	if (dead_tid < 1 || dead_tid > CLUSTER_WAL_STATE_SLOT_COUNT)
 		return CLUSTER_THREADREC_BLOCKED;
-	if (cluster_recovery_serial_revalidate(serial_guard) !=
-		CLUSTER_RECOVERY_SERIAL_CURRENT) {
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
+			CLUSTER_THREAD_AUTHORITY_OK) {
 		cluster_write_fence_note_external_mutation_gate_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}
@@ -415,11 +416,11 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 			/* STOP04 publish gate: the same held IR/formation/NeedSet/
 			 * AdmissionSet must still be current after durability and immediately
 			 * before reader authority becomes visible. */
-			if (cluster_recovery_serial_revalidate(serial_guard) !=
-				CLUSTER_RECOVERY_SERIAL_CURRENT) {
+			if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
+					CLUSTER_THREAD_AUTHORITY_OK) {
 				cluster_write_fence_note_external_publish_gate_blocked();
 				ereport(ERROR,
-						(errmsg("thread recovery external-fence authority became stale before publish")));
+						(errmsg("thread recovery root/fence/pin authority became stale before publish")));
 			}
 
 			/*
@@ -530,7 +531,7 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
  */
 ClusterThreadRecResult
 cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
-								   ClusterRecoverySerialGuard *serial_guard)
+								   const ClusterThreadRecoveryAuthorityV1 *authority)
 {
 	ClusterThreadRecScope scope;
 	XLogRecPtr lower;
@@ -538,6 +539,13 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 	XLogRecPtr scan_upper;
 	bool shared_fs;
 	int survivors;
+
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
+			CLUSTER_THREAD_AUTHORITY_OK)
+	{
+		cluster_write_fence_note_external_mutation_gate_blocked();
+		return CLUSTER_THREADREC_BLOCKED;
+	}
 
 	shared_fs = (cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
 
@@ -588,6 +596,22 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 			cluster_thread_recovery_count_blocked();
 			return CLUSTER_THREADREC_BLOCKED;
 		}
+		if (memcmp(&pin_token, authority->root_token, sizeof(pin_token)) != 0 ||
+			pin_lifecycle != authority->root_snapshot->lifecycle ||
+			pin_tail_tli != authority->root_snapshot->tail_tli ||
+			pin_checkpoint_tli != authority->root_snapshot->checkpoint_tli ||
+			pin_checkpoint_lower !=
+				authority->root_snapshot->checkpoint_lower_lsn ||
+			pin_validated_tail !=
+				authority->root_snapshot->validated_tail_lsn_exclusive)
+		{
+			ereport(LOG,
+					(errmsg("cluster thread recovery: dead thread %u canonical projection "
+							"does not match the held root owner -> BLOCKED (kept frozen)",
+							dead_tid)));
+			cluster_thread_recovery_count_blocked();
+			return CLUSTER_THREADREC_BLOCKED;
+		}
 		if (pin_checkpoint_lower == 0 || pin_validated_tail == 0
 			|| pin_validated_tail <= pin_checkpoint_lower) {
 			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u canonical projection "
@@ -599,10 +623,6 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 			cluster_thread_recovery_count_blocked();
 			return CLUSTER_THREADREC_BLOCKED;
 		}
-		(void) pin_token;
-		(void) pin_lifecycle;
-		(void) pin_tail_tli;
-		(void) pin_checkpoint_tli;
 		lower = (XLogRecPtr) pin_checkpoint_lower;
 		validated_min = (XLogRecPtr) pin_validated_tail;
 	} else {
@@ -648,9 +668,22 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
+			CLUSTER_THREAD_AUTHORITY_OK ||
+		!cluster_thread_recovery_authority_covers_window_v1(
+			authority, dead_tid, lower, scan_upper))
+	{
+		ereport(LOG,
+				(errmsg("cluster thread recovery: dead thread %u validated window "
+						"is outside the held WAL retention authority -> BLOCKED (kept frozen)",
+						dead_tid)));
+		cluster_write_fence_note_external_mutation_gate_blocked();
+		cluster_thread_recovery_count_blocked();
+		return CLUSTER_THREADREC_BLOCKED;
+	}
 
 	return cluster_thread_recovery_replay_one_window(
-		dead_tid, lower, scan_upper, episode_epoch, serial_guard, NULL);
+		dead_tid, lower, scan_upper, episode_epoch, authority, NULL);
 }
 
 /*

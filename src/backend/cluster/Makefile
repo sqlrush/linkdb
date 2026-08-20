@@ -59,6 +59,7 @@ OBJS = \
 	cluster_page_guard.o \
 	cluster_page_authority.o \
 	cluster_page_install.o \
+	cluster_page_online_plan.o \
 	cluster_page_replay_batch.o \
 	cluster_page_recovery.o \
 	cluster_page_stable_base.o \
@@ -131,6 +132,8 @@ OBJS = \
 	cluster_thread_recovery_driver.o \
 	cluster_thread_recovery_driver_srf.o \
 	cluster_thread_recovery_orchestrator.o \
+	cluster_thread_recovery_authority.o \
+	cluster_thread_recovery_finalize.o \
 	cluster_thread_recovery_orchestrator_srf.o \
 	cluster_thread_recovery_worker.o \
 	cluster_remote_xact.o \

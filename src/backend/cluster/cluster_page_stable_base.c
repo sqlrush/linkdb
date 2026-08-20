@@ -114,10 +114,27 @@ edge_result_equal(const RfPageStableEdgeInputV1 *left,
 }
 
 static bool
+record_identity_equal(const RfPageReplayRecordIdentityV1 *left,
+					  const RfPageReplayRecordIdentityV1 *right)
+{
+	return left->system_identifier == right->system_identifier &&
+		memcmp(left->storage_uuid, right->storage_uuid, 16) == 0 &&
+		left->origin_thread == right->origin_thread &&
+		left->reserved_zero == right->reserved_zero &&
+		left->timeline_id == right->timeline_id &&
+		left->read_rec_ptr == right->read_rec_ptr &&
+		left->end_rec_ptr == right->end_rec_ptr &&
+		left->record_crc == right->record_crc &&
+		left->rmid == right->rmid && left->info == right->info &&
+		left->reserved_zero2 == right->reserved_zero2;
+}
+
+static bool
 edge_exact_equal(const RfPageStableEdgeInputV1 *left,
 				 const RfPageStableEdgeInputV1 *right)
 {
-	return left->record_identity == right->record_identity &&
+	return record_identity_equal(&left->record_identity,
+							 &right->record_identity) &&
 		left->participant_index == right->participant_index &&
 		left->component_count == right->component_count &&
 		rf_page_identity_equal_v1(&left->page_identity,
@@ -156,6 +173,9 @@ static RfPageProofDetailV1
 validate_edge(const RfPageStableGraphRequestV1 *request,
 			  const RfPageStableEdgeInputV1 *edge)
 {
+	const RfContributorVectorV1 *vector = request->contributors;
+	const RfContributorStreamCutV1 *cut;
+	const RfPageReplayRecordIdentityV1 *record = &edge->record_identity;
 	RfPageVersionV1 result;
 	bool		before_uuid;
 
@@ -169,7 +189,21 @@ validate_edge(const RfPageStableGraphRequestV1 *request,
 		return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
 	if (!edge->side_complete)
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-	if (edge->record_identity == 0 ||
+	if (edge->participant_index >= vector->participant_count)
+		return RF_PAGE_PROOF_DETAIL_PARTICIPANT_MISSING;
+	cut = &vector->cuts[edge->participant_index];
+	if (record->reserved_zero != 0 || record->reserved_zero2 != 0 ||
+		record->system_identifier != vector->system_identifier ||
+		memcmp(record->storage_uuid, vector->storage_uuid, 16) != 0 ||
+		record->origin_thread != cut->failed_thread ||
+		record->timeline_id != cut->timeline_id ||
+		record->read_rec_ptr == InvalidXLogRecPtr ||
+		record->end_rec_ptr == InvalidXLogRecPtr ||
+		record->read_rec_ptr >= record->end_rec_ptr ||
+		record->read_rec_ptr < cut->scan_begin_inclusive ||
+		record->end_rec_ptr > cut->scan_end_exclusive)
+		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+	if (
 		edge->edge.page_class != RF_PAGE_CLASS_ORDINARY ||
 		edge->edge.result_kind != RF_PAGE_STATE_PRESENT)
 		return RF_PAGE_PROOF_DETAIL_CLASS_UNKNOWN;
@@ -412,7 +446,8 @@ rf_page_stable_base_select_v1(const RfPageStableGraphRequestV1 *request,
 
 			if (edge_is_duplicate_of_prior(vector, j))
 				continue;
-			if (left->record_identity == right->record_identity &&
+			if (record_identity_equal(&left->record_identity,
+								  &right->record_identity) &&
 				!edge_exact_equal(left, right))
 			{
 				detail = RF_PAGE_PROOF_DETAIL_ANCHOR_AMBIGUOUS;
@@ -607,8 +642,9 @@ stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request)
 			request->fence_admission_set, request->fence_need_set,
 			request->formation, &fence_reason))
 		return RF_PAGE_PROOF_DETAIL_FENCE_STALE;
-	if (cluster_wal_retention_pin_revalidate(request->retention_pin) !=
-		CLUSTER_WAL_PIN_OK)
+	if (cluster_wal_retention_pin_preflight_revalidate_wait_v1(
+			request->retention_pin) !=
+			CLUSTER_WAL_PIN_OK)
 		return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }

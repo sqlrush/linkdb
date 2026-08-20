@@ -336,10 +336,19 @@ extern ClusterWalPinResult cluster_wal_retention_pin_bind_one(
 	ClusterWalRetentionPin *pin, ClusterRecoverySerialGuard *held_serial);
 extern ClusterWalPinResult cluster_wal_retention_pin_bind_set(
 	ClusterWalRetentionPin *pin, ClusterRecoverySerialGuardSet *held_set);
+extern ClusterWalPinResult
+cluster_wal_retention_pin_preflight_revalidate_wait_v1(
+	ClusterWalRetentionPin *pin);
 extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(
 	ClusterWalRetentionPin *pin);
 extern ClusterWalPinResult cluster_wal_retention_pin_seal_for_root_publish(
 	ClusterWalRetentionPin *pin);
+extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(
+	ClusterWalRetentionPin *pin,
+	const ClusterControlRootSnapshot *expected_snapshot,
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootSnapshot *observed_snapshot,
+	const ClusterControlRootReadToken *observed_token);
 extern ClusterWalrReleaseResult cluster_wal_retention_pin_release(
 	ClusterWalRetentionPin **pin);
 extern ClusterWalPinResult cluster_wal_retention_root_publish_begin_exact(

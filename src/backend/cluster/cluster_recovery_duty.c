@@ -41,6 +41,8 @@ typedef struct ClusterControlRootPublishAuthorityV1 {
 
 static ClusterControlRootPublishAuthorityV1 root_publish_authority;
 
+static void cluster_control_root_publish_authority_clear_v1(void);
+
 bool
 cluster_control_root_create_authority_current_v1(
 	const ClusterControlRootMigrationImage *image,
@@ -139,6 +141,7 @@ cluster_control_root_publish_authority_bind_v1(
 		|| (reason != CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
 			&& reason != CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
 			&& reason != CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE
+			&& reason != CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE
 			/* RF-ROOT P7 G1a: the checkpointer's per-checkpoint canonical
 			 * root advertisement (CHECKPOINT_ADVANCE, frozen 0x38 shape).
 			 * Sole publisher = the checkpointer; no cross-publisher mixing
@@ -156,6 +159,38 @@ cluster_control_root_publish_authority_bind_v1(
 	root_publish_authority.token = *expected_token;
 	root_publish_authority.patch = *patch;
 	return true;
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_complete_publish_v1(
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootPatch *patch,
+	ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token)
+{
+	ClusterControlRootResult result;
+
+	if (out_snapshot != NULL)
+		memset(out_snapshot, 0, sizeof(*out_snapshot));
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (expected_token == NULL || patch == NULL ||
+		patch->mask != (CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE |
+			CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS) ||
+		patch->expected_lifecycle !=
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
+		patch->desired.lifecycle !=
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE ||
+		!cluster_control_root_publish_authority_bind_v1(
+			expected_token, patch,
+			CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_control_root_compare_and_publish(
+		expected_token, patch,
+		CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE,
+		out_snapshot, out_token);
+	cluster_control_root_publish_authority_clear_v1();
+	return result;
 }
 
 static void

@@ -141,7 +141,8 @@ cluster_external_fence_revalidate_set_nowait(
 }
 
 ClusterWalPinResult
-cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
+cluster_wal_retention_pin_preflight_revalidate_wait_v1(
+	ClusterWalRetentionPin *pin)
 {
 	return pin == expected_pin ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
 }
@@ -218,7 +219,15 @@ set_edge(RfPageStableEdgeInputV1 *edge, const RfPageIdentityV1 *identity,
 		edge->edge.before = *before;
 	memcpy(edge->edge.result_incarnation, result->segment_incarnation, 16);
 	edge->result_token = result->mutation_token;
-	edge->record_identity = record_identity;
+	edge->record_identity.system_identifier = identity->system_identifier;
+	memcpy(edge->record_identity.storage_uuid, identity->storage_uuid, 16);
+	edge->record_identity.origin_thread = participant_index + 1;
+	edge->record_identity.timeline_id = 1;
+	edge->record_identity.read_rec_ptr = 100 + record_identity;
+	edge->record_identity.end_rec_ptr = 101 + record_identity;
+	edge->record_identity.record_crc = (uint32) record_identity;
+	edge->record_identity.rmid = RM_XLOG_ID;
+	edge->record_identity.info = (uint8) (record_identity & 0xf0);
 	edge->participant_index = participant_index;
 	edge->component_count = 1;
 	memset(edge->anchor_digest, (int) (record_identity & 0xff),
@@ -556,6 +565,18 @@ UT_TEST(test_conflicting_duplicate_record)
 		RF_PAGE_PROOF_DETAIL_ANCHOR_AMBIGUOUS);
 }
 
+UT_TEST(test_duplicate_requires_full_record_identity)
+{
+	GraphFixture fixture;
+
+	graph_init(&fixture);
+	fixture.edges[1] = fixture.edges[0];
+	fixture.edges[1].record_identity.info++;
+	graph_recount(&fixture, 1, 2);
+	UT_ASSERT_EQ(graph_select(&fixture),
+		RF_PAGE_PROOF_DETAIL_ANCHOR_AMBIGUOUS);
+}
+
 UT_TEST(test_unique_terminal)
 {
 	GraphFixture fixture;
@@ -628,7 +649,7 @@ UT_TEST(test_ambiguous_image)
 
 	graph_init(&fixture);
 	fixture.edges[1] = fixture.edges[0];
-	fixture.edges[1].record_identity = 2;
+	fixture.edges[1].record_identity.record_crc = 2;
 	memset(fixture.edges[1].anchor_digest, 0x77,
 		   sizeof(fixture.edges[1].anchor_digest));
 	graph_recount(&fixture, 1, 2);
@@ -1153,7 +1174,7 @@ UT_TEST(test_complete_release_order)
 int
 main(void)
 {
-	UT_PLAN(46);
+	UT_PLAN(47);
 	UT_RUN(test_stable_proof_binds_exact_borrowed_owners);
 	UT_RUN(test_stable_proof_rejects_duplicate_owner_scalars);
 	UT_RUN(test_stable_proof_rejects_root_cut_order_mismatch);
@@ -1168,6 +1189,7 @@ main(void)
 	UT_RUN(test_edge_cycle);
 	UT_RUN(test_duplicate_exact_record);
 	UT_RUN(test_conflicting_duplicate_record);
+	UT_RUN(test_duplicate_requires_full_record_identity);
 	UT_RUN(test_unique_terminal);
 	UT_RUN(test_multiple_terminals);
 	UT_RUN(test_nearest_anchor);

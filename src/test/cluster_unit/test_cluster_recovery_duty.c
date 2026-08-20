@@ -205,6 +205,16 @@ cluster_control_root_compare_and_publish(
 			out_snapshot->tail_last_record_crc32c =
 				patch->desired.tail_last_record_crc32c;
 		}
+		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS) != 0) {
+			out_snapshot->root_flags = patch->desired.root_flags;
+			out_snapshot->recovered_tli = patch->desired.recovered_tli;
+			out_snapshot->recovered_through_lsn_exclusive =
+				patch->desired.recovered_through_lsn_exclusive;
+			out_snapshot->recovered_last_record_lsn =
+				patch->desired.recovered_last_record_lsn;
+			out_snapshot->recovered_last_record_crc32c =
+				patch->desired.recovered_last_record_crc32c;
+		}
 		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY) != 0)
 			out_snapshot->root_flags = patch->desired.root_flags;
 		memset(out_token, 0, sizeof(*out_token));
@@ -789,6 +799,40 @@ UT_TEST(test_owner_rejoin_publication_context_rejects_token_drift)
 		CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN));
 }
 
+UT_TEST(test_recovery_complete_uses_exact_private_publish_authority)
+{
+	ClusterControlRootPatch patch;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootReadToken published_token;
+	ClusterControlRootResult result;
+
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle =
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	ut_root_token.lifecycle = ut_root_snapshot.lifecycle;
+	memset(&patch, 0, sizeof(patch));
+	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE |
+		CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
+	patch.expected_lifecycle =
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	patch.desired.lifecycle =
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	patch.desired.root_flags = ut_root_snapshot.root_flags |
+		CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	patch.desired.recovered_tli = ut_root_snapshot.tail_tli;
+	patch.desired.recovered_through_lsn_exclusive =
+		ut_root_snapshot.validated_tail_lsn_exclusive;
+	result = cluster_control_root_recovery_complete_publish_v1(
+		&ut_root_token, &patch, &published, &published_token);
+	UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(ut_root_publish_calls, 1);
+	UT_ASSERT(ut_root_publish_context_authorized);
+	UT_ASSERT_EQ(ut_root_published_reason,
+		CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE);
+	UT_ASSERT_EQ(published.lifecycle,
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+}
+
 UT_TEST(test_owner_rejoin_rejects_open_stale_owner_frozen)
 {
 	/* recovery contract (recovery path, verification): the
@@ -1304,7 +1348,7 @@ UT_TEST(test_formation_pending_owner_and_full_outage_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_exact_74_byte_encoding);
 	UT_RUN(test_domain_separated_digest);
 	UT_RUN(test_full_key_compare_has_no_numeric_order);
@@ -1325,6 +1369,7 @@ main(void)
 	UT_RUN(test_clean_close_retry_deadline_gives_up_fail_closed);
 	UT_RUN(test_owner_rejoin_closed_lifecycle_routes_to_thread_open);
 	UT_RUN(test_owner_rejoin_publication_context_rejects_token_drift);
+	UT_RUN(test_recovery_complete_uses_exact_private_publish_authority);
 	UT_RUN(test_owner_rejoin_fails_closed_on_non_jcmk_drift_or_exhaustion);
 	UT_RUN(test_formation_f1_majority_f2_ready);
 	UT_RUN(test_formation_snapshot_or_marker_drift_is_rejected);

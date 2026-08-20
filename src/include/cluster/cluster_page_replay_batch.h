@@ -19,21 +19,6 @@ typedef struct RfPageReplayStepV1
 	uint32		component_index;
 } RfPageReplayStepV1;
 
-typedef struct RfPageReplayRecordIdentityV1
-{
-	uint64		system_identifier;
-	uint8		storage_uuid[16];
-	uint16		origin_thread;
-	uint16		reserved_zero;
-	TimeLineID timeline_id;
-	XLogRecPtr read_rec_ptr;
-	XLogRecPtr end_rec_ptr;
-	uint32		record_crc;
-	uint8		rmid;
-	uint8		info;
-	uint16		reserved_zero2;
-} RfPageReplayRecordIdentityV1;
-
 typedef struct RfPageReplayRecordV1
 {
 	const RfDetachedRecordPlanV1 *record_plan;

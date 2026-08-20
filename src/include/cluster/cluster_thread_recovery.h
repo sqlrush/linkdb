@@ -43,6 +43,8 @@
 
 struct XLogReaderState;
 typedef struct ClusterRecoverySerialGuard ClusterRecoverySerialGuard;
+typedef struct ClusterThreadRecoveryAuthorityV1
+	ClusterThreadRecoveryAuthorityV1;
 
 /*
  * Result of attempting to online-recover one dead thread (spec-4.11 §2.2).
@@ -507,7 +509,7 @@ cluster_thread_recovery_worker_terminal_state(ClusterThreadRecResult res,
  */
 extern ClusterThreadRecResult cluster_thread_recovery_replay_one(uint16 dead_tid,
 																 uint64 episode_epoch,
-																 ClusterRecoverySerialGuard *serial_guard);
+																 const ClusterThreadRecoveryAuthorityV1 *authority);
 
 /*
  * Unfreeze precondition (spec-4.11 D3, 3b-3): has dead_tid been fully
@@ -700,7 +702,7 @@ extern ClusterThreadRecResult cluster_thread_recovery_validated_end(uint16 dead_
 extern ClusterThreadRecResult
 cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower,
 										  XLogRecPtr scan_upper, uint64 episode_epoch,
-										  ClusterRecoverySerialGuard *serial_guard,
+										  const ClusterThreadRecoveryAuthorityV1 *authority,
 										  ClusterThreadReplayStats *stats);
 
 /*

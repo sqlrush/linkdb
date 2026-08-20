@@ -21,5 +21,10 @@ extern bool cluster_control_root_publish_authority_current_v1(
 	const ClusterControlRootReadToken *expected_token,
 	const ClusterControlRootPatch *patch,
 	ClusterControlRootPublishReason reason);
+extern ClusterControlRootResult cluster_control_root_recovery_complete_publish_v1(
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootPatch *patch,
+	ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token);
 
 #endif /* CLUSTER_CONTROL_ROOT_PRIVATE_H */

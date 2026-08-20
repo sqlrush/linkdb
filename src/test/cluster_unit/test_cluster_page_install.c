@@ -68,6 +68,8 @@ typedef struct InstallFixture
 	int			promote_calls;
 	int			publish_calls;
 	int			release_calls;
+	int			promote_step;
+	int			first_initial_read_step;
 	int			first_write_step;
 	int			last_initial_read_step;
 	int			step;
@@ -127,7 +129,11 @@ storage_read(void *arg, uint32 index, const RfPageIdentityV1 *identity,
 	fixture->step++;
 	fixture->read_calls++;
 	if (fixture->read_calls <= (int) fixture->initial_read_count)
+	{
+		if (fixture->first_initial_read_step == 0)
+			fixture->first_initial_read_step = fixture->step;
 		fixture->last_initial_read_step = fixture->step;
+	}
 	if (!fixture->read_ok[index])
 		return false;
 	*exists = fixture->exists[index];
@@ -205,6 +211,7 @@ authority_promote(void *arg)
 
 	fixture->step++;
 	fixture->promote_calls++;
+	fixture->promote_step = fixture->step;
 	return fixture->promote_ok;
 }
 
@@ -349,7 +356,8 @@ UT_TEST(test_noncanonical_result_target_blocks_whole_batch_before_promote)
 	init_page(test_case.fixture.disk[0].data, 11, 0x7F);
 	UT_ASSERT_EQ(rf_page_storage_install_execute_v1(&test_case.request, &proof),
 		RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED);
-	UT_ASSERT_EQ(test_case.fixture.promote_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.promote_calls, 1);
+	UT_ASSERT_EQ(test_case.fixture.release_calls, 1);
 	UT_ASSERT_EQ(test_case.fixture.write_calls, 0);
 }
 
@@ -378,7 +386,8 @@ UT_TEST(test_absent_target_with_present_edge_is_zero_mutation)
 	test_case.fixture.exists[0] = false;
 	UT_ASSERT_EQ(rf_page_storage_install_execute_v1(&test_case.request, &proof),
 		RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
-	UT_ASSERT_EQ(test_case.fixture.promote_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.promote_calls, 1);
+	UT_ASSERT_EQ(test_case.fixture.release_calls, 1);
 	UT_ASSERT_EQ(test_case.fixture.write_calls, 0);
 }
 
@@ -391,7 +400,8 @@ UT_TEST(test_unrelated_valid_token_blocks_whole_batch)
 	((PageHeader) test_case.fixture.disk[1].data)->pd_block_scn = 99;
 	UT_ASSERT_EQ(rf_page_storage_install_execute_v1(&test_case.request, &proof),
 		RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
-	UT_ASSERT_EQ(test_case.fixture.promote_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.promote_calls, 1);
+	UT_ASSERT_EQ(test_case.fixture.release_calls, 1);
 	UT_ASSERT_EQ(test_case.fixture.write_calls, 0);
 }
 
@@ -463,8 +473,25 @@ UT_TEST(test_all_33_reads_precede_first_write)
 		RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(test_case.fixture.write_calls,
 		RF_PAGE_STABLE_MAX_COMPONENTS);
+	UT_ASSERT(test_case.fixture.first_initial_read_step >
+		test_case.fixture.promote_step);
 	UT_ASSERT(test_case.fixture.first_write_step >
 		test_case.fixture.last_initial_read_step);
+}
+
+UT_TEST(test_promote_failure_performs_no_target_io)
+{
+	InstallCase test_case;
+	RfPageStorageInstallProofV1 proof;
+
+	init_case(&test_case, 1);
+	test_case.fixture.promote_ok = false;
+	UT_ASSERT_EQ(rf_page_storage_install_execute_v1(&test_case.request, &proof),
+		RF_PAGE_PROOF_DETAIL_WOULD_BLOCK);
+	UT_ASSERT_EQ(test_case.fixture.promote_calls, 1);
+	UT_ASSERT_EQ(test_case.fixture.read_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.write_calls, 0);
+	UT_ASSERT_EQ(test_case.fixture.release_calls, 0);
 }
 
 UT_TEST(test_reserved_and_nonordinary_fork_are_rejected)
@@ -488,7 +515,7 @@ UT_TEST(test_reserved_and_nonordinary_fork_are_rejected)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_expected_target_write_sync_postread_publish_release);
 	UT_RUN(test_result_target_skips_write_but_proves_durability);
 	UT_RUN(test_noncanonical_result_target_blocks_whole_batch_before_promote);
@@ -500,6 +527,7 @@ main(void)
 	UT_RUN(test_sync_failure_releases_without_proof);
 	UT_RUN(test_checksum_modes_canonicalize_exactly);
 	UT_RUN(test_all_33_reads_precede_first_write);
+	UT_RUN(test_promote_failure_performs_no_target_io);
 	UT_RUN(test_reserved_and_nonordinary_fork_are_rejected);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -768,6 +768,23 @@ pin_revalidate_bound(ClusterWalRetentionPin *pin)
 }
 
 ClusterWalPinResult
+cluster_wal_retention_pin_preflight_revalidate_wait_v1(
+	ClusterWalRetentionPin *pin)
+{
+	ClusterWalPinResult result;
+
+	if (!pin_valid(pin) || pin->state !=
+			CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND)
+		return CLUSTER_WAL_PIN_INVALID;
+	if (pin->poisoned)
+		return CLUSTER_WAL_PIN_STALE;
+	result = pin_current_after_grants(pin);
+	if (result != CLUSTER_WAL_PIN_OK)
+		pin->poisoned = true;
+	return result;
+}
+
+ClusterWalPinResult
 cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
 {
 	if (!pin_valid(pin))
@@ -790,6 +807,88 @@ cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin)
 	if (result != CLUSTER_WAL_PIN_OK)
 		return result;
 	pin->state = CLUSTER_WAL_PIN_STATE_SEALED;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+static bool
+pin_root_token_matches_snapshot(const ClusterControlRootReadToken *token,
+								const ClusterControlRootSnapshot *snapshot,
+								const ClusterRecoveryDutyKey *duty)
+{
+	return token != NULL && snapshot != NULL && duty != NULL &&
+		memcmp(&snapshot->identity, duty, sizeof(*duty)) == 0 &&
+		memcmp(token->authority_uuid, duty->authority_uuid, 16) == 0 &&
+		token->origin_thread_id == duty->origin_thread_id &&
+		token->source != 0 && token->lifecycle == snapshot->lifecycle &&
+		token->root_lineage_seq == duty->root_lineage_seq &&
+		token->reserved20 == 0 && token->reserved32 == 0 &&
+		token->file_txn_seq != 0 && token->root_publish_seq != 0 &&
+		token->record_crc32c != 0 && token->root_flags == snapshot->root_flags &&
+		(token->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) == 0;
+}
+
+static bool
+pin_root_immutable_tuple_equal(const ClusterControlRootSnapshot *left,
+							   const ClusterControlRootSnapshot *right)
+{
+	return memcmp(&left->identity, &right->identity,
+				sizeof(left->identity)) == 0 &&
+		left->checkpoint_tli == right->checkpoint_tli &&
+		left->checkpoint_source_kind == right->checkpoint_source_kind &&
+		left->checkpoint_lower_lsn == right->checkpoint_lower_lsn &&
+		left->checkpoint_record_crc32c == right->checkpoint_record_crc32c &&
+		left->tail_tli == right->tail_tli &&
+		left->tail_validation_kind == right->tail_validation_kind &&
+		left->validated_tail_lsn_exclusive ==
+			right->validated_tail_lsn_exclusive &&
+		left->tail_last_record_lsn == right->tail_last_record_lsn &&
+		left->tail_last_record_crc32c == right->tail_last_record_crc32c;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_adopt_root_readback_v1(
+	ClusterWalRetentionPin *pin,
+	const ClusterControlRootSnapshot *expected_snapshot,
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootSnapshot *observed_snapshot,
+	const ClusterControlRootReadToken *observed_token)
+{
+	ClusterWalPinThread *thread;
+	const ClusterWalRetentionInterval *interval;
+
+	if (!pin_valid(pin) || expected_snapshot == NULL || expected_token == NULL ||
+		observed_snapshot == NULL || observed_token == NULL)
+		return CLUSTER_WAL_PIN_INVALID;
+	if (pin->poisoned || pin->state != CLUSTER_WAL_PIN_STATE_SEALED)
+		return CLUSTER_WAL_PIN_STALE;
+	thread = pin_find_thread(pin, expected_token->origin_thread_id);
+	if (thread == NULL || thread->serial == NULL || thread->serial->held ||
+		thread->serial->release_uncertain || thread->nintervals != 1 ||
+		memcmp(&thread->root_read, expected_token,
+			sizeof(*expected_token)) != 0 ||
+		!pin_root_token_matches_snapshot(expected_token, expected_snapshot,
+			&thread->duty) ||
+		!pin_root_token_matches_snapshot(observed_token, observed_snapshot,
+			&thread->duty))
+		return CLUSTER_WAL_PIN_STALE;
+	interval = &thread->intervals[0];
+	if (expected_snapshot->lifecycle !=
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
+		(observed_snapshot->lifecycle !=
+			 CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED &&
+		 observed_snapshot->lifecycle !=
+			 CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE) ||
+		interval->thread_id != thread->duty.origin_thread_id ||
+		interval->tli != expected_snapshot->checkpoint_tli ||
+		interval->tli != expected_snapshot->tail_tli ||
+		interval->start_lsn != expected_snapshot->checkpoint_lower_lsn ||
+		interval->end_lsn !=
+			expected_snapshot->validated_tail_lsn_exclusive ||
+		!pin_root_immutable_tuple_equal(expected_snapshot, observed_snapshot) ||
+		observed_token->file_txn_seq < expected_token->file_txn_seq ||
+		observed_token->root_publish_seq < expected_token->root_publish_seq)
+		return CLUSTER_WAL_PIN_STALE;
+	thread->root_read = *observed_token;
 	return CLUSTER_WAL_PIN_OK;
 }
 

@@ -65,6 +65,31 @@ StaticAssertDecl(offsetof(RfContributorStreamCutV1,
 						  contributor_count) == 24,
 				 "RfContributorStreamCutV1 count offset drift");
 
+/* Exact immutable identity of one decoded foreign WAL record. */
+typedef struct RfPageReplayRecordIdentityV1
+{
+	uint64		system_identifier;
+	uint8		storage_uuid[16];
+	uint16		origin_thread;
+	uint16		reserved_zero;
+	TimeLineID timeline_id;
+	XLogRecPtr read_rec_ptr;
+	XLogRecPtr end_rec_ptr;
+	uint32		record_crc;
+	uint8		rmid;
+	uint8		info;
+	uint16		reserved_zero2;
+} RfPageReplayRecordIdentityV1;
+
+StaticAssertDecl(sizeof(RfPageReplayRecordIdentityV1) == 56,
+				 "RfPageReplayRecordIdentityV1 ABI drift");
+StaticAssertDecl(offsetof(RfPageReplayRecordIdentityV1, timeline_id) == 28,
+				 "RfPageReplayRecordIdentityV1 timeline offset drift");
+StaticAssertDecl(offsetof(RfPageReplayRecordIdentityV1, read_rec_ptr) == 32,
+				 "RfPageReplayRecordIdentityV1 read LSN offset drift");
+StaticAssertDecl(offsetof(RfPageReplayRecordIdentityV1, record_crc) == 48,
+				 "RfPageReplayRecordIdentityV1 CRC offset drift");
+
 typedef enum RfPageProofDetailV1
 {
 	RF_PAGE_PROOF_DETAIL_OK = 0,
@@ -105,7 +130,7 @@ typedef struct RfPageStableEdgeInputV1
 	RfPageIdentityV1 page_identity;
 	RfPageVersionEdgeEntryV1 edge;
 	uint64		result_token;
-	uint64		record_identity;
+	RfPageReplayRecordIdentityV1 record_identity;
 	uint16		participant_index;
 	uint16		component_count;
 	uint8		anchor_digest[32];
