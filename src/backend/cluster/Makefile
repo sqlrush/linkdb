@@ -56,6 +56,8 @@ OBJS = \
 	cluster_page_producer.o \
 	cluster_page_anchor_cache.o \
 	cluster_page_detached.o \
+	cluster_page_guard.o \
+	cluster_page_authority.o \
 	cluster_page_install.o \
 	cluster_page_replay_batch.o \
 	cluster_page_recovery.o \

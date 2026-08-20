@@ -93,6 +93,7 @@
 #include "cluster/cluster_ges_dedup.h"		/* cluster_ges_dedup_shmem_register (spec-2.27 D2) */
 #include "cluster/cluster_wal_thread.h"		/* cluster_wal_thread_shmem_register (spec-4.1 D7) */
 #include "cluster/cluster_recovery_plan.h" /* cluster_recovery_plan_shmem_register (spec-4.3 D4) */
+#include "cluster/cluster_page_guard.h" /* STOP-06 no-wait PAGE protection */
 #include "cluster/cluster_block_recovery.h" /* cluster_block_recovery_shmem_register (spec-4.10 D6) */
 #include "cluster/cluster_grd_outbound.h"	/* cluster_grd_outbound_shmem_register (spec-2.16 D4) */
 #include "cluster/cluster_grd_work_queue.h" /* cluster_grd_work_queue_shmem_register (spec-2.16 D5) */
@@ -957,6 +958,7 @@ cluster_request_shmem(void)
 	 * without re-triggering RequestNamedLWLockTranche.
 	 */
 	cluster_grd_request_lwlocks();
+	rf_page_guard_request_lwlocks_v1();
 	cluster_cr_pool_request_lwlocks();		  /* spec-5.51: CR pool named LWLock tranche */
 	cluster_resolver_cache_request_lwlocks(); /* spec-5.55: resolver cache LWLock tranche */
 	cluster_ges_dedup_shmem_request();
@@ -1018,6 +1020,7 @@ cluster_init_shmem(void)
 		region.init_fn();
 		CLUSTER_INJECTION_POINT("cluster-shmem-region-init-post");
 	}
+	rf_page_guard_shmem_init_v1();
 
 	/* spec-4.5a G5: SLRU init (self-managed shmem, outside the registry). */
 	cluster_remote_xact_shmem_init();

@@ -10,7 +10,10 @@
 
 #if defined(__has_include)
 #if __has_include("cluster/cluster_page_stable_base.h")
+#include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_page_stable_base.h"
+#include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_wal_retention.h"
 #define TEST_HAVE_CLUSTER_PAGE_STABLE_BASE 1
 #endif
 #endif
@@ -79,6 +82,70 @@ main(void)
 
 #else
 
+static const ClusterControlRootReadToken *expected_root_tokens;
+static const ClusterRecoveryDutyKey *expected_duties;
+static const ClusterFormationWitnessV1 *expected_formation;
+static const PgracExternalFenceNeedSetV1 *expected_needs;
+static const PgracExternalFenceAdmissionSetV1 *expected_admissions;
+static ClusterWalRetentionPin *expected_pin;
+static bool canonical_root_current;
+
+ClusterControlRootResult
+cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
+								const ClusterControlRootIdentity *identity,
+								ClusterControlRootSnapshot *snapshot)
+{
+	if (!canonical_root_current || token != expected_root_tokens ||
+		identity != expected_duties)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (snapshot != NULL)
+	{
+		memset(snapshot, 0, sizeof(*snapshot));
+		snapshot->identity = *identity;
+		snapshot->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+		snapshot->root_flags = CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_revalidate_nowait(
+	const ClusterFormationWitnessV1 *formation)
+{
+	return formation == expected_formation ? CLUSTER_FORMATION_WITNESS_READY :
+		CLUSTER_FORMATION_WITNESS_UNSTABLE;
+}
+
+bool
+cluster_external_fence_need_set_revalidate_nowait(
+	const PgracExternalFenceNeedSetV1 *needs,
+	const ClusterFormationWitnessV1 *formation,
+	PgracExternalFenceDenyReason *reason)
+{
+	if (reason != NULL)
+		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	return needs == expected_needs && formation == expected_formation;
+}
+
+bool
+cluster_external_fence_revalidate_set_nowait(
+	const PgracExternalFenceAdmissionSetV1 *admissions,
+	const PgracExternalFenceNeedSetV1 *needs,
+	const ClusterFormationWitnessV1 *formation,
+	PgracExternalFenceDenyReason *reason)
+{
+	if (reason != NULL)
+		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	return admissions == expected_admissions && needs == expected_needs &&
+		formation == expected_formation;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
+{
+	return pin == expected_pin ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
+}
+
 typedef struct GraphFixture
 {
 	RfPageIdentityV1 identity;
@@ -87,6 +154,12 @@ typedef struct GraphFixture
 	RfContributorVectorV1 vector;
 	RfPagePinnedSourceV1 source;
 	RfPageStableGraphRequestV1 request;
+	ClusterRecoveryDutyKey duties[4];
+	ClusterControlRootReadToken root_tokens[4];
+	char		formation_object;
+	char		needs_object;
+	char		admission_object;
+	char		pin_object;
 	uint32 chain[16];
 	RfPageStableSelectionV1 selection;
 } GraphFixture;
@@ -218,6 +291,19 @@ graph_init(GraphFixture *fixture)
 	fixture->request.fence_current = true;
 	fixture->request.retention_current = true;
 	graph_recount(fixture, 1, 1);
+	memset(fixture->root_tokens, 0, sizeof(fixture->root_tokens));
+	memset(fixture->duties, 0, sizeof(fixture->duties));
+	memset(fixture->root_tokens[0].authority_uuid, 0x31,
+		   sizeof(fixture->root_tokens[0].authority_uuid));
+	fixture->root_tokens[0].origin_thread_id = 1;
+	fixture->root_tokens[0].root_lineage_seq = 9;
+	fixture->root_tokens[0].file_txn_seq = 10;
+	fixture->root_tokens[0].root_publish_seq = 11;
+	fixture->root_tokens[0].record_crc32c = 12;
+	fixture->duties[0].origin_thread_id = 1;
+	fixture->duties[0].root_lineage_seq = 9;
+	memset(fixture->duties[0].authority_uuid, 0x31,
+		   sizeof(fixture->duties[0].authority_uuid));
 }
 
 static RfPageProofDetailV1
@@ -225,6 +311,117 @@ graph_select(GraphFixture *fixture)
 {
 	return rf_page_stable_base_select_v1(&fixture->request, fixture->chain,
 		lengthof(fixture->chain), &fixture->selection);
+}
+
+static void
+proof_request(GraphFixture *fixture, RfPageStableBaseProofRequestV1 *request)
+{
+	memset(request, 0, sizeof(*request));
+	request->graph = &fixture->request;
+	request->duties = fixture->duties;
+	request->root_tokens = fixture->root_tokens;
+	request->formation =
+		(const ClusterFormationWitnessV1 *) &fixture->formation_object;
+	request->fence_need_set =
+		(const PgracExternalFenceNeedSetV1 *) &fixture->needs_object;
+	request->fence_admission_set =
+		(const PgracExternalFenceAdmissionSetV1 *) &fixture->admission_object;
+	request->retention_pin =
+		(ClusterWalRetentionPin *) &fixture->pin_object;
+	expected_root_tokens = fixture->root_tokens;
+	expected_duties = fixture->duties;
+	expected_formation = request->formation;
+	expected_needs = request->fence_need_set;
+	expected_admissions = request->fence_admission_set;
+	expected_pin = request->retention_pin;
+	canonical_root_current = true;
+}
+
+UT_TEST(test_stable_proof_binds_exact_borrowed_owners)
+{
+	GraphFixture fixture;
+	RfPageStableBaseProofRequestV1 request;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	graph_init(&fixture);
+	proof_request(&fixture, &request);
+	UT_ASSERT_EQ(rf_page_stable_base_proof_build_wait_v1(&request,
+		fixture.chain, lengthof(fixture.chain), 1000, &proof),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_page_stable_base_proof_matches_v1(proof,
+		&fixture.identity, &fixture.request.expected_result,
+		fixture.duties, fixture.root_tokens, request.formation,
+		request.fence_need_set, request.fence_admission_set,
+		request.retention_pin, &fixture.source, &fixture.vector, 1));
+	rf_page_stable_base_proof_destroy_v1(&proof);
+	UT_ASSERT(proof == NULL);
+}
+
+UT_TEST(test_stable_proof_rejects_duplicate_owner_scalars)
+{
+	GraphFixture fixture;
+	RfPageStableBaseProofRequestV1 request;
+	RfPageStableBaseProofV1 *proof = NULL;
+	ClusterControlRootReadToken copied_root[4];
+	RfContributorVectorV1 copied_vector;
+	RfPagePinnedSourceV1 copied_source;
+
+	graph_init(&fixture);
+	proof_request(&fixture, &request);
+	UT_ASSERT_EQ(rf_page_stable_base_proof_build_wait_v1(&request,
+		fixture.chain, lengthof(fixture.chain), 1000, &proof),
+		RF_PAGE_PROOF_DETAIL_OK);
+	memcpy(copied_root, fixture.root_tokens, sizeof(copied_root));
+	copied_vector = fixture.vector;
+	copied_source = fixture.source;
+	UT_ASSERT(!rf_page_stable_base_proof_matches_v1(proof,
+		&fixture.identity, &fixture.request.expected_result,
+		fixture.duties, copied_root, request.formation,
+		request.fence_need_set, request.fence_admission_set,
+		request.retention_pin,
+		&fixture.source, &fixture.vector, 1));
+	UT_ASSERT(!rf_page_stable_base_proof_matches_v1(proof,
+		&fixture.identity, &fixture.request.expected_result,
+		fixture.duties, fixture.root_tokens, request.formation,
+		request.fence_need_set, request.fence_admission_set,
+		request.retention_pin, &copied_source, &fixture.vector, 1));
+	UT_ASSERT(!rf_page_stable_base_proof_matches_v1(proof,
+		&fixture.identity, &fixture.request.expected_result,
+		fixture.duties, fixture.root_tokens, request.formation,
+		request.fence_need_set, request.fence_admission_set,
+		request.retention_pin, &fixture.source, &copied_vector, 1));
+	rf_page_stable_base_proof_destroy_v1(&proof);
+}
+
+UT_TEST(test_stable_proof_rejects_forged_root_current_boolean)
+{
+	GraphFixture fixture;
+	RfPageStableBaseProofRequestV1 request;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	graph_init(&fixture);
+	proof_request(&fixture, &request);
+	UT_ASSERT(fixture.request.root_current);
+	canonical_root_current = false;
+	UT_ASSERT_EQ(rf_page_stable_base_proof_build_wait_v1(&request,
+		fixture.chain, lengthof(fixture.chain), 1000, &proof),
+		RF_PAGE_PROOF_DETAIL_ROOT_STALE);
+	UT_ASSERT(proof == NULL);
+}
+
+UT_TEST(test_stable_proof_rejects_root_cut_order_mismatch)
+{
+	GraphFixture fixture;
+	RfPageStableBaseProofRequestV1 request;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	graph_init(&fixture);
+	proof_request(&fixture, &request);
+	fixture.root_tokens[0].origin_thread_id = 2;
+	UT_ASSERT_EQ(rf_page_stable_base_proof_build_wait_v1(&request,
+		fixture.chain, lengthof(fixture.chain), 1000, &proof),
+		RF_PAGE_PROOF_DETAIL_ROOT_STALE);
+	UT_ASSERT(proof == NULL);
 }
 
 UT_TEST(test_one_stream_chain)
@@ -956,7 +1153,11 @@ UT_TEST(test_complete_release_order)
 int
 main(void)
 {
-	UT_PLAN(42);
+	UT_PLAN(46);
+	UT_RUN(test_stable_proof_binds_exact_borrowed_owners);
+	UT_RUN(test_stable_proof_rejects_duplicate_owner_scalars);
+	UT_RUN(test_stable_proof_rejects_root_cut_order_mismatch);
+	UT_RUN(test_stable_proof_rejects_forged_root_current_boolean);
 	UT_RUN(test_one_stream_chain);
 	UT_RUN(test_two_stream_positive);
 	UT_RUN(test_explicit_empty_participant);

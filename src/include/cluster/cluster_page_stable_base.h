@@ -10,6 +10,7 @@
 
 #include "access/xlogdefs.h"
 #include "access/xlogrecord.h"
+#include "cluster/cluster_control_root.h"
 #include "storage/relfilelocator.h"
 
 #define CLUSTER_PAGE_STABLE_BASE_INTERFACE_V1 1
@@ -159,6 +160,25 @@ typedef struct RfPageStableSelectionV1
 	bool		result_already_present;
 } RfPageStableSelectionV1;
 
+typedef struct PgracExternalFenceAdmissionSetV1
+	PgracExternalFenceAdmissionSetV1;
+typedef struct PgracExternalFenceNeedSetV1 PgracExternalFenceNeedSetV1;
+typedef struct ClusterFormationWitnessV1 ClusterFormationWitnessV1;
+typedef struct ClusterWalRetentionPin ClusterWalRetentionPin;
+typedef struct RfPageStableBaseProofV1 RfPageStableBaseProofV1;
+
+typedef struct RfPageStableBaseProofRequestV1
+{
+	const RfPageStableGraphRequestV1 *graph;
+	const ClusterRecoveryDutyKey *duties;
+	const ClusterControlRootReadToken *root_tokens;
+	const ClusterFormationWitnessV1 *formation;
+	const PgracExternalFenceNeedSetV1 *fence_need_set;
+	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
+	ClusterWalRetentionPin *retention_pin;
+	uint32		flags;
+} RfPageStableBaseProofRequestV1;
+
 extern bool rf_page_identity_valid_v1(const RfPageIdentityV1 *identity);
 extern bool rf_page_identity_equal_v1(const RfPageIdentityV1 *left,
 									  const RfPageIdentityV1 *right);
@@ -173,6 +193,25 @@ extern RfPageProofDetailV1 rf_page_stable_base_select_v1(
 	const RfPageStableGraphRequestV1 *request,
 	uint32 *chain_indices, uint32 chain_capacity,
 	RfPageStableSelectionV1 *selection);
+extern RfPageProofDetailV1 rf_page_stable_base_proof_build_wait_v1(
+	const RfPageStableBaseProofRequestV1 *request,
+	uint32 *chain_indices, uint32 chain_capacity, int timeout_ms,
+	RfPageStableBaseProofV1 **out_proof);
+extern bool rf_page_stable_base_proof_matches_v1(
+	const RfPageStableBaseProofV1 *proof,
+	const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result,
+	const ClusterRecoveryDutyKey *duties,
+	const ClusterControlRootReadToken *root_tokens,
+	const ClusterFormationWitnessV1 *formation,
+	const PgracExternalFenceNeedSetV1 *fence_need_set,
+	const PgracExternalFenceAdmissionSetV1 *fence_admission_set,
+	ClusterWalRetentionPin *retention_pin,
+	const RfPagePinnedSourceV1 *source,
+	const RfContributorVectorV1 *contributors,
+	uint32 participant_count);
+extern void rf_page_stable_base_proof_destroy_v1(
+	RfPageStableBaseProofV1 **proof);
 
 #ifdef USE_CLUSTER_UNIT
 

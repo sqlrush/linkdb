@@ -9,7 +9,10 @@
 #include "postgres.h"
 
 #include "access/xlogreader.h"
+#include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_page_stable_base.h"
+#include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_wal_retention.h"
 
 #ifdef USE_CLUSTER_UNIT
 #define stable_alloc0(count_, size_) calloc((count_), (size_))
@@ -18,6 +21,25 @@
 #define stable_alloc0(count_, size_) palloc0((Size) (count_) * (size_))
 #define stable_free(pointer_) pfree((pointer_))
 #endif
+
+#define RF_PAGE_STABLE_PROOF_MAGIC UINT32_C(0x52505350)
+
+struct RfPageStableBaseProofV1
+{
+	uint32		magic;
+	uint32		participant_count;
+	RfPageIdentityV1 page_identity;
+	RfPageVersionV1 expected_result;
+	RfPageStableSelectionV1 selection;
+	const ClusterRecoveryDutyKey *duties;
+	const ClusterControlRootReadToken *root_tokens;
+	const ClusterFormationWitnessV1 *formation;
+	const PgracExternalFenceNeedSetV1 *fence_need_set;
+	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
+	ClusterWalRetentionPin *retention_pin;
+	const RfPagePinnedSourceV1 *source;
+	const RfContributorVectorV1 *contributors;
+};
 
 static bool
 bytes_nonzero(const uint8 *bytes, size_t size)
@@ -536,6 +558,158 @@ rf_page_stable_base_select_v1(const RfPageStableGraphRequestV1 *request,
 fail:
 	stable_free(reverse_chain);
 	return detail;
+}
+
+static RfPageProofDetailV1
+stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request)
+{
+	const RfPageStableGraphRequestV1 *graph = request->graph;
+	const RfContributorVectorV1 *contributors = graph->contributors;
+	PgracExternalFenceDenyReason fence_reason =
+		PGRAC_EXTERNAL_FENCE_DENY_BAD_ARGUMENT;
+	uint32		i;
+
+	if (request->duties == NULL || request->root_tokens == NULL ||
+		contributors == NULL ||
+		contributors->cuts == NULL || graph->participant_count == 0 ||
+		graph->participant_count > RF_PAGE_STABLE_MAX_PARTICIPANTS ||
+		contributors->participant_count != graph->participant_count)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	for (i = 0; i < graph->participant_count; i++)
+	{
+		const ClusterControlRootReadToken *token = &request->root_tokens[i];
+		const ClusterRecoveryDutyKey *duty = &request->duties[i];
+		ClusterControlRootSnapshot snapshot;
+		ClusterControlRootResult result;
+
+		if (!bytes_nonzero(token->authority_uuid,
+				sizeof(token->authority_uuid)) ||
+			token->origin_thread_id != contributors->cuts[i].failed_thread ||
+			token->origin_thread_id != duty->origin_thread_id ||
+			token->root_lineage_seq != duty->root_lineage_seq ||
+			memcmp(token->authority_uuid, duty->authority_uuid, 16) != 0 ||
+			token->root_lineage_seq == 0 || token->reserved20 != 0 ||
+			token->reserved32 != 0)
+			return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+		result = cluster_control_root_revalidate(token, duty, &snapshot);
+		if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
+			 result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
+			snapshot.lifecycle !=
+				CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
+			(snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0)
+			return RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+	}
+	if (cluster_formation_witness_revalidate_nowait(request->formation) !=
+		CLUSTER_FORMATION_WITNESS_READY ||
+		!cluster_external_fence_need_set_revalidate_nowait(
+			request->fence_need_set, request->formation, &fence_reason) ||
+		!cluster_external_fence_revalidate_set_nowait(
+			request->fence_admission_set, request->fence_need_set,
+			request->formation, &fence_reason))
+		return RF_PAGE_PROOF_DETAIL_FENCE_STALE;
+	if (cluster_wal_retention_pin_revalidate(request->retention_pin) !=
+		CLUSTER_WAL_PIN_OK)
+		return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_page_stable_base_proof_build_wait_v1(
+	const RfPageStableBaseProofRequestV1 *request,
+	uint32 *chain_indices, uint32 chain_capacity, int timeout_ms,
+	RfPageStableBaseProofV1 **out_proof)
+{
+	RfPageStableBaseProofV1 *proof;
+	RfPageStableSelectionV1 selection;
+	RfPageStableGraphRequestV1 verified_graph;
+	RfPageProofDetailV1 detail;
+
+	if (out_proof == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	*out_proof = NULL;
+	if (request == NULL || request->graph == NULL ||
+		request->duties == NULL || request->root_tokens == NULL ||
+		request->formation == NULL || request->fence_need_set == NULL ||
+		request->fence_admission_set == NULL ||
+		request->retention_pin == NULL || request->flags != 0 ||
+		timeout_ms < 0)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	detail = stable_owners_revalidate(request);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	verified_graph = *request->graph;
+	verified_graph.root_current = true;
+	verified_graph.duty_current = true;
+	verified_graph.fence_current = true;
+	verified_graph.retention_current = true;
+	verified_graph.retention_binding_cookie = 1;
+	verified_graph.current_retention_binding_cookie = 1;
+	detail = rf_page_stable_base_select_v1(&verified_graph, chain_indices,
+		chain_capacity, &selection);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		return detail;
+	proof = (RfPageStableBaseProofV1 *) stable_alloc0(1, sizeof(*proof));
+	if (proof == NULL)
+		return RF_PAGE_PROOF_DETAIL_OOM;
+	proof->magic = RF_PAGE_STABLE_PROOF_MAGIC;
+	proof->participant_count = request->graph->participant_count;
+	proof->page_identity = request->graph->page_identity;
+	proof->expected_result = request->graph->expected_result;
+	proof->selection = selection;
+	proof->duties = request->duties;
+	proof->root_tokens = request->root_tokens;
+	proof->formation = request->formation;
+	proof->fence_need_set = request->fence_need_set;
+	proof->fence_admission_set = request->fence_admission_set;
+	proof->retention_pin = request->retention_pin;
+	proof->source = request->graph->source;
+	proof->contributors = request->graph->contributors;
+	*out_proof = proof;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+rf_page_stable_base_proof_matches_v1(
+	const RfPageStableBaseProofV1 *proof,
+	const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result,
+	const ClusterRecoveryDutyKey *duties,
+	const ClusterControlRootReadToken *root_tokens,
+	const ClusterFormationWitnessV1 *formation,
+	const PgracExternalFenceNeedSetV1 *fence_need_set,
+	const PgracExternalFenceAdmissionSetV1 *fence_admission_set,
+	ClusterWalRetentionPin *retention_pin,
+	const RfPagePinnedSourceV1 *source,
+	const RfContributorVectorV1 *contributors,
+	uint32 participant_count)
+{
+	return proof != NULL && proof->magic == RF_PAGE_STABLE_PROOF_MAGIC &&
+		participant_count != 0 &&
+		proof->participant_count == participant_count &&
+		rf_page_identity_equal_v1(&proof->page_identity, page_identity) &&
+		rf_page_version_equal_v1(&proof->expected_result, expected_result) &&
+		rf_page_version_equal_v1(&proof->selection.terminal_version,
+			expected_result) && proof->duties == duties &&
+		proof->root_tokens == root_tokens && proof->formation == formation &&
+		proof->fence_need_set == fence_need_set &&
+		proof->fence_admission_set == fence_admission_set &&
+		proof->retention_pin == retention_pin && proof->source == source &&
+		proof->contributors == contributors;
+}
+
+void
+rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof_pointer)
+{
+	RfPageStableBaseProofV1 *proof;
+
+	if (proof_pointer == NULL || *proof_pointer == NULL)
+		return;
+	proof = *proof_pointer;
+	if (proof->magic != RF_PAGE_STABLE_PROOF_MAGIC)
+		return;
+	proof->magic = 0;
+	stable_free(proof);
+	*proof_pointer = NULL;
 }
 
 #ifdef USE_CLUSTER_UNIT
