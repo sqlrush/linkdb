@@ -1442,15 +1442,15 @@ cluster_undo_redo(XLogReaderState *record)
 	Assert(InRecovery || RecoveryInProgress());
 
 	/*
-	 * RF-SIDE U-SIDE-02/U-SIDE-04: every non-SPACE cold record crosses
+	 * RF-SIDE U-SIDE-02/U-SIDE-04: every cold record crosses
 	 * the same pure shape and route gate as online recovery before any
-	 * legacy handler can mutate its target.  HWM remains the explicit
-	 * STOP-RF-SIDE-SPACE-ABI exception until STOP-07 is approved.
+	 * legacy handler can mutate its target.  HWM is deliberately rejected
+	 * here: STOP-RF-SIDE-SPACE-ABI permits no cold or online mutation until
+	 * the separate canonical shared SPACE ABI is approved.
 	 */
 	memset(&decoded, 0, sizeof(decoded));
-	if (info != XLOG_HW_RESERVE &&
-		(!cluster_undo_decode(record, &decoded) ||
-		 decoded.opcode != info || !cluster_undo_preflight(&decoded)))
+	if (!cluster_undo_decode(record, &decoded) ||
+		 decoded.opcode != info || !cluster_undo_preflight(&decoded))
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("invalid cluster undo record %u during shared decode preflight",
