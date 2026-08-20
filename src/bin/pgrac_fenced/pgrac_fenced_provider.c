@@ -1,10 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * pgrac_fenced_provider.c
- *	  Empty production registry and exact terminal verifier.
+ *	  Production provider registry, worker isolation, and terminal verifier.
  *
- * No production provider is selected in the current approved package.  The
- * test-only id is deliberately absent from this binary's registry.
+ * The test-only id is deliberately absent from the production registry.
  *
  *-------------------------------------------------------------------------
  */
@@ -15,16 +14,35 @@
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "pgrac_fenced_ipmi.h"
 #include "pgrac_fenced_provider.h"
 
 #define PGRAC_FENCED_WORKER_MAGIC UINT32_C(0x50465731)
 #define PGRAC_FENCED_WORKER_ACTUATE UINT32_C(1)
 #define PGRAC_FENCED_WORKER_READBACK UINT32_C(2)
+#define PGRAC_FENCED_WORKER_RESOLVE UINT32_C(3)
 #define PGRAC_FENCED_WORKER_TERM_GRACE_NS UINT64_C(1000000000)
+
+typedef struct PgracFencedResolvedIdentity
+{
+	uint8 target_uuid[16];
+	int32 victim_node_id;
+	uint32 reserved0;
+	uint64 mapping_generation;
+} PgracFencedResolvedIdentity;
+
+typedef union PgracFencedWorkerPayload
+{
+	PgracFencedReadbackV1 readback;
+	PgracFencedResolvedIdentity resolved;
+} PgracFencedWorkerPayload;
 
 typedef struct PgracFencedWorkerMessage
 {
@@ -32,16 +50,27 @@ typedef struct PgracFencedWorkerMessage
 	uint32 call_type;
 	uint32 provider_result;
 	int32 native_status;
-	PgracFencedReadbackV1 readback;
+	PgracFencedWorkerPayload payload;
 } PgracFencedWorkerMessage;
 
+StaticAssertDecl(sizeof(PgracFencedResolvedIdentity) == 32,
+				 "provider resolved identity size changed");
 StaticAssertDecl(sizeof(PgracFencedWorkerMessage) == 48,
 				 "provider worker message size changed");
+
+static uint64_t callback_deadline_mono_ns;
+
+uint64_t
+pgrac_fenced_provider_callback_deadline_mono_ns(void)
+{
+	return callback_deadline_mono_ns;
+}
 
 const PgracFencedProviderOpsV1 *
 pgrac_fenced_provider_lookup(uint16 provider_id)
 {
-	(void) provider_id;
+	if (provider_id == PGRAC_FENCED_PROVIDER_ID_IPMI_LANPLUS_V1)
+		return pgrac_fenced_ipmi_provider_ops();
 	return NULL;
 }
 
@@ -193,6 +222,32 @@ target_valid(const PgracFencedTargetV1 *target)
 	return nonzero;
 }
 
+static bool
+resolved_target_exact(const PgracFencedTargetV1 *configured,
+				  const PgracFencedTargetV1 *resolved)
+{
+	return configured != NULL && resolved != NULL &&
+		memcmp(resolved->target_uuid, configured->target_uuid,
+			sizeof(configured->target_uuid)) == 0 &&
+		resolved->victim_node_id == configured->victim_node_id &&
+		resolved->reserved0 == 0 &&
+		resolved->mapping_generation == configured->mapping_generation &&
+		resolved->adapter_config == configured->adapter_config &&
+		resolved->adapter_config_len == configured->adapter_config_len;
+}
+
+static bool
+resolved_identity_exact(const PgracFencedTargetV1 *configured,
+					const PgracFencedResolvedIdentity *resolved)
+{
+	return configured != NULL && resolved != NULL &&
+		memcmp(resolved->target_uuid, configured->target_uuid,
+			sizeof(configured->target_uuid)) == 0 &&
+		resolved->victim_node_id == configured->victim_node_id &&
+		resolved->reserved0 == 0 &&
+		resolved->mapping_generation == configured->mapping_generation;
+}
+
 static int
 deadline_poll_timeout_ms(uint64_t deadline_mono_ns)
 {
@@ -209,16 +264,68 @@ deadline_poll_timeout_ms(uint64_t deadline_mono_ns)
 	return (int) milliseconds;
 }
 
+static bool
+process_group_gone(pid_t pgid)
+{
+	int rc;
+
+	do
+	{
+		rc = kill(-pgid, 0);
+	} while (rc != 0 && errno == EINTR);
+	return rc != 0 && errno == ESRCH;
+}
+
+static bool
+process_group_owner_prepare(void)
+{
+#ifdef __linux__
+	return prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) == 0;
+#else
+	return true;
+#endif
+}
+
 static void
-wait_worker_exit(pid_t pid)
+reap_process_group_children(pid_t pgid, bool *leader_reaped)
 {
 	int status;
+	pid_t waited;
+
+	if (!*leader_reaped)
+	{
+		do
+		{
+			waited = waitpid(pgid, &status, WNOHANG);
+		} while (waited < 0 && errno == EINTR);
+		if (waited == pgid)
+			*leader_reaped = true;
+	}
+	for (;;)
+	{
+		waited = waitpid(-pgid, &status, WNOHANG);
+		if (waited > 0)
+		{
+			if (waited == pgid)
+				*leader_reaped = true;
+			continue;
+		}
+		if (waited < 0 && errno == EINTR)
+			continue;
+		return;
+	}
+}
+
+static bool
+wait_worker_exit(pid_t pid, bool leader_reaped)
+{
 	uint64_t stop_deadline;
 	uint64_t now;
 	struct timespec pause = {0, 10000000};
-	pid_t waited;
 
-	if (kill(-pid, SIGTERM) != 0 && errno == ESRCH)
+	if (!process_group_gone(pid))
+		(void) kill(-pid, SIGTERM);
+	else if (!leader_reaped)
 		(void) kill(pid, SIGTERM);
 	if (!monotonic_now_ns(&now) ||
 		now > UINT64_MAX - PGRAC_FENCED_WORKER_TERM_GRACE_NS)
@@ -227,21 +334,32 @@ wait_worker_exit(pid_t pid)
 		stop_deadline = now + PGRAC_FENCED_WORKER_TERM_GRACE_NS;
 	for (;;)
 	{
-		waited = waitpid(pid, &status, WNOHANG);
-		if (waited == pid || (waited < 0 && errno == ECHILD))
-			return;
-		if (waited < 0 && errno != EINTR)
-			break;
+		reap_process_group_children(pid, &leader_reaped);
+		if (leader_reaped && process_group_gone(pid))
+			return true;
 		if (!monotonic_now_ns(&now) || now >= stop_deadline)
 			break;
 		(void) nanosleep(&pause, NULL);
 	}
-	if (kill(-pid, SIGKILL) != 0 && errno == ESRCH)
+	if (!process_group_gone(pid))
+		(void) kill(-pid, SIGKILL);
+	if (!leader_reaped && process_group_gone(pid))
 		(void) kill(pid, SIGKILL);
-	do
+	if (!monotonic_now_ns(&now) ||
+		now > UINT64_MAX - PGRAC_FENCED_WORKER_TERM_GRACE_NS)
+		stop_deadline = UINT64_MAX;
+	else
+		stop_deadline = now + PGRAC_FENCED_WORKER_TERM_GRACE_NS;
+	for (;;)
 	{
-		waited = waitpid(pid, &status, 0);
-	} while (waited < 0 && errno == EINTR);
+		(void) kill(-pid, SIGKILL);
+		reap_process_group_children(pid, &leader_reaped);
+		if (leader_reaped && process_group_gone(pid))
+			return true;
+		if (!monotonic_now_ns(&now) || now >= stop_deadline)
+			return false;
+		(void) nanosleep(&pause, NULL);
+	}
 }
 
 static PgracFencedProviderWorkerResult
@@ -256,6 +374,7 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 	int status;
 	int poll_rc;
 	ssize_t got;
+	bool group_clean;
 	pid_t pid;
 	pid_t waited;
 
@@ -266,8 +385,10 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 	if (!pgrac_fenced_provider_ops_valid(ops, allow_test_only) ||
 		!target_valid(target) ||
 		(call_type != PGRAC_FENCED_WORKER_ACTUATE &&
-		 call_type != PGRAC_FENCED_WORKER_READBACK) ||
+		 call_type != PGRAC_FENCED_WORKER_READBACK &&
+		 call_type != PGRAC_FENCED_WORKER_RESOLVE) ||
 		!monotonic_now_ns(&now) || now >= deadline_mono_ns ||
+		!process_group_owner_prepare() ||
 		pipe(pipe_fds) != 0)
 		return PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE;
 	(void) fcntl(pipe_fds[0], F_SETFD, FD_CLOEXEC);
@@ -283,13 +404,16 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 	{
 		PgracFencedWorkerMessage child_message;
 		PgracFencedProviderResult provider_result;
+		PgracFencedTargetV1 child_resolved;
 
 		(void) close(pipe_fds[0]);
 		if (setpgid(0, 0) != 0)
 			_exit(125);
 		memset(&child_message, 0, sizeof(child_message));
+		memset(&child_resolved, 0, sizeof(child_resolved));
 		child_message.magic = PGRAC_FENCED_WORKER_MAGIC;
 		child_message.call_type = call_type;
+		callback_deadline_mono_ns = deadline_mono_ns;
 		if (call_type == PGRAC_FENCED_WORKER_ACTUATE)
 		{
 			provider_result = turn_on ?
@@ -298,9 +422,28 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 				ops->actuate_off(target, deadline_mono_ns,
 							 &child_message.native_status);
 		}
-		else
+		else if (call_type == PGRAC_FENCED_WORKER_READBACK)
 			provider_result = ops->readback(target, deadline_mono_ns,
-										&child_message.readback);
+										&child_message.payload.readback);
+		else
+		{
+			provider_result = ops->resolve(target, &child_resolved,
+				&child_message.native_status);
+			if (provider_result == PGRAC_FENCED_PROVIDER_OK &&
+				!resolved_target_exact(target, &child_resolved))
+				provider_result = PGRAC_FENCED_PROVIDER_REJECTED;
+			if (provider_result == PGRAC_FENCED_PROVIDER_OK)
+			{
+				memcpy(child_message.payload.resolved.target_uuid,
+					child_resolved.target_uuid,
+					sizeof(child_message.payload.resolved.target_uuid));
+				child_message.payload.resolved.victim_node_id =
+					child_resolved.victim_node_id;
+				child_message.payload.resolved.mapping_generation =
+					child_resolved.mapping_generation;
+			}
+		}
+		callback_deadline_mono_ns = 0;
 		child_message.provider_result = (uint32) provider_result;
 		got = write(pipe_fds[1], &child_message, sizeof(child_message));
 		(void) close(pipe_fds[1]);
@@ -311,7 +454,7 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 	if (setpgid(pid, pid) != 0 && errno != EACCES && errno != ESRCH)
 	{
 		(void) close(pipe_fds[0]);
-		wait_worker_exit(pid);
+		(void) wait_worker_exit(pid, false);
 		return PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE;
 	}
 	poll_fd.fd = pipe_fds[0];
@@ -325,13 +468,13 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 	if (poll_rc == 0)
 	{
 		(void) close(pipe_fds[0]);
-		wait_worker_exit(pid);
+		(void) wait_worker_exit(pid, false);
 		return PGRAC_FENCED_PROVIDER_WORKER_TIMEOUT;
 	}
 	if (poll_rc < 0)
 	{
 		(void) close(pipe_fds[0]);
-		wait_worker_exit(pid);
+		(void) wait_worker_exit(pid, false);
 		return PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE;
 	}
 	do
@@ -343,16 +486,53 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 	{
 		waited = waitpid(pid, &status, 0);
 	} while (waited < 0 && errno == EINTR);
+	group_clean = process_group_gone(pid);
+	if (!group_clean)
+		group_clean = wait_worker_exit(pid, waited == pid);
 	if (got != sizeof(*message) || waited != pid || !WIFEXITED(status) ||
 		WEXITSTATUS(status) != 0 || message->magic != PGRAC_FENCED_WORKER_MAGIC ||
 		message->call_type != call_type ||
-		message->provider_result > PGRAC_FENCED_PROVIDER_IO_ERROR)
+		message->provider_result > PGRAC_FENCED_PROVIDER_IO_ERROR ||
+		!group_clean)
 	{
 		memset(message, 0, sizeof(*message));
 		message->provider_result = PGRAC_FENCED_PROVIDER_UNKNOWN;
 		return PGRAC_FENCED_PROVIDER_WORKER_CRASHED;
 	}
 	return PGRAC_FENCED_PROVIDER_WORKER_OK;
+}
+
+PgracFencedProviderWorkerResult
+pgrac_fenced_provider_worker_resolve(
+	const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
+	const PgracFencedTargetV1 *configured, uint64_t deadline_mono_ns,
+	PgracFencedProviderResult *result, PgracFencedTargetV1 *resolved,
+	int32 *native_status)
+{
+	PgracFencedWorkerMessage message;
+	PgracFencedProviderWorkerResult worker_result;
+
+	if (result == NULL || resolved == NULL || native_status == NULL)
+		return PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE;
+	*result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
+	memset(resolved, 0, sizeof(*resolved));
+	*native_status = 0;
+	worker_result = run_worker(ops, allow_test_only,
+		PGRAC_FENCED_WORKER_RESOLVE, false, configured, deadline_mono_ns,
+		&message);
+	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK)
+	{
+		*result = (PgracFencedProviderResult) message.provider_result;
+		*native_status = message.native_status;
+		if (*result == PGRAC_FENCED_PROVIDER_OK &&
+			resolved_identity_exact(configured, &message.payload.resolved))
+			*resolved = *configured;
+		else if (*result == PGRAC_FENCED_PROVIDER_OK)
+			*result = PGRAC_FENCED_PROVIDER_REJECTED;
+	}
+	else if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE)
+		*result = PGRAC_FENCED_PROVIDER_UNKNOWN;
+	return worker_result;
 }
 
 PgracFencedProviderWorkerResult
@@ -400,9 +580,70 @@ pgrac_fenced_provider_worker_readback(
 	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK)
 	{
 		*result = (PgracFencedProviderResult) message.provider_result;
-		*readback = message.readback;
+		*readback = message.payload.readback;
 	}
 	else if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE)
 		*result = PGRAC_FENCED_PROVIDER_UNKNOWN;
 	return worker_result;
+}
+
+static bool
+provider_readback_retryable(PgracFencedProviderWorkerResult worker_result,
+				PgracFencedProviderResult result,
+				const PgracFencedReadbackV1 *readback)
+{
+	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_CRASHED)
+		return true;
+	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
+		return false;
+	if (result == PGRAC_FENCED_PROVIDER_PENDING ||
+		result == PGRAC_FENCED_PROVIDER_UNKNOWN ||
+		result == PGRAC_FENCED_PROVIDER_IO_ERROR)
+		return true;
+	return result == PGRAC_FENCED_PROVIDER_OK && readback != NULL &&
+		(readback->state == PGRAC_FENCED_TARGET_TRANSITIONING ||
+		 readback->state == PGRAC_FENCED_TARGET_UNKNOWN);
+}
+
+PgracFencedProviderWorkerResult
+pgrac_fenced_provider_worker_readback_retry(
+	const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
+	const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
+	PgracFencedProviderResult *result, PgracFencedReadbackV1 *readback)
+{
+	PgracFencedProviderWorkerResult worker_result;
+	struct timespec delay;
+	uint64_t delay_ms = 100;
+	uint64_t delay_ns;
+	uint64_t remaining_ns;
+	uint64_t now;
+
+	if (result == NULL || readback == NULL)
+		return pgrac_fenced_provider_worker_readback(ops, allow_test_only,
+			target, deadline_mono_ns, result, readback);
+	for (;;)
+	{
+		worker_result = pgrac_fenced_provider_worker_readback(ops,
+			allow_test_only, target, deadline_mono_ns, result, readback);
+		if (!provider_readback_retryable(worker_result, *result, readback) ||
+			!monotonic_now_ns(&now) || now >= deadline_mono_ns)
+			return worker_result;
+		delay_ns = delay_ms * UINT64_C(1000000);
+		remaining_ns = deadline_mono_ns - now;
+		if (delay_ns > remaining_ns)
+			delay_ns = remaining_ns;
+		delay.tv_sec = (time_t) (delay_ns / UINT64_C(1000000000));
+		delay.tv_nsec = (long) (delay_ns % UINT64_C(1000000000));
+		while (nanosleep(&delay, &delay) != 0)
+		{
+			if (errno != EINTR)
+				return worker_result;
+		}
+		if (delay_ns == remaining_ns)
+			return worker_result;
+		if (delay_ms < 800)
+			delay_ms *= 2;
+		else
+			delay_ms = 1000;
+	}
 }

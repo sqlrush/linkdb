@@ -83,6 +83,13 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
 		test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
+		test_pgrac_fenced_operation test_pgrac_fenced_rejoin \
+		test_pgrac_fenced_rejoin_async \
+		test_pgrac_fenced_rejoin_coordinator \
+		test_pgrac_fenced_session \
+		test_pgrac_fenced_schedule test_pgrac_fenced_async \
+		test_pgrac_fenced_coordinator \
+		test_pgrac_fenced_ipmi test_pgrac_fenced_ipmi_exec \
 		test_pgrac_fenced_ctl \
         test_cluster_ts \
         test_cluster_ko \
@@ -284,6 +291,13 @@ SIMPLE_TESTS := $(filter-out test_cluster_raw_device_capacity test_cluster_repla
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
+		test_pgrac_fenced_operation test_pgrac_fenced_rejoin \
+		test_pgrac_fenced_rejoin_async \
+		test_pgrac_fenced_rejoin_coordinator \
+		test_pgrac_fenced_session \
+		test_pgrac_fenced_schedule test_pgrac_fenced_async \
+		test_pgrac_fenced_coordinator \
+		test_pgrac_fenced_ipmi test_pgrac_fenced_ipmi_exec \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
@@ -368,6 +382,9 @@ test_cluster_recovery_serial: test_cluster_recovery_serial.c unit_test.h $(CLUST
 CLUSTER_EXTERNAL_FENCE_O = test_cluster_external_fence_product.o
 PGRAC_EXTERNAL_FENCE_PROTOCOL_O = \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol_srv.o
+$(PGRAC_EXTERNAL_FENCE_PROTOCOL_O): \
+		$(top_srcdir)/src/common/pgrac_external_fence_protocol.c
+	$(MAKE) -C $(top_builddir)/src/common pgrac_external_fence_protocol_srv.o
 $(CLUSTER_EXTERNAL_FENCE_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_external_fence.c \
 		$(top_srcdir)/src/include/cluster/cluster_external_fence.h
@@ -797,23 +814,162 @@ test_pgrac_fenced_core: test_pgrac_fenced_core.c unit_test.h \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
 		$(PGRAC_FENCED_CORE_O) -o $@
 
-PGRAC_FENCED_JOURNAL_O = \
-	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal.o
-test_pgrac_fenced_journal: test_pgrac_fenced_journal.c unit_test.h \
-		$(PGRAC_FENCED_JOURNAL_O)
+PGRAC_FENCED_SCHEDULE_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_schedule.o
+test_pgrac_fenced_schedule: test_pgrac_fenced_schedule.c unit_test.h \
+		$(PGRAC_FENCED_SCHEDULE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
-		$(PGRAC_FENCED_JOURNAL_O) \
-		$(top_builddir)/src/common/libpgcommon.a \
-		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) -lssl -lcrypto -o $@
+		$(PGRAC_FENCED_SCHEDULE_O) -o $@
 
+PGRAC_FENCED_JOURNAL_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal.o
+PGRAC_FENCED_RUNTIME_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_runtime.o
+test_pgrac_fenced_journal: test_pgrac_fenced_journal.c unit_test.h \
+		$(PGRAC_FENCED_JOURNAL_O) $(PGRAC_FENCED_RUNTIME_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_JOURNAL_O) $(PGRAC_FENCED_RUNTIME_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+PGRAC_FENCED_IPMI_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_ipmi.o
 PGRAC_FENCED_PROVIDER_O = \
-	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
+	$(PGRAC_FENCED_IPMI_O)
 test_pgrac_fenced_provider: test_pgrac_fenced_provider.c unit_test.h \
 		$(PGRAC_FENCED_PROVIDER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
-		$(PGRAC_FENCED_PROVIDER_O) -o $@
+		$(PGRAC_FENCED_PROVIDER_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+PGRAC_FENCED_OPERATION_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_operation.o \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
+	$(PGRAC_FENCED_IPMI_O) \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal.o \
+	$(top_builddir)/src/common/pgrac_external_fence_protocol.o
+PGRAC_FENCED_SESSION_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_session.o
+PGRAC_FENCED_DISPATCH_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_dispatch.o
+test_pgrac_fenced_operation: test_pgrac_fenced_operation.c unit_test.h \
+		$(PGRAC_FENCED_OPERATION_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_OPERATION_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+PGRAC_FENCED_REJOIN_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_rejoin.o
+test_pgrac_fenced_rejoin: test_pgrac_fenced_rejoin.c unit_test.h \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_REJOIN_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_REJOIN_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+PGRAC_FENCED_REJOIN_ASYNC_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_rejoin_async.o
+test_pgrac_fenced_rejoin_async: test_pgrac_fenced_rejoin_async.c unit_test.h \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_REJOIN_O) \
+		$(PGRAC_FENCED_REJOIN_ASYNC_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_REJOIN_O) \
+		$(PGRAC_FENCED_REJOIN_ASYNC_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+test_pgrac_fenced_session: test_pgrac_fenced_session.c unit_test.h \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_CORE_O) \
+		$(PGRAC_FENCED_SESSION_O) $(PGRAC_FENCED_DISPATCH_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_CORE_O) \
+		$(PGRAC_FENCED_SESSION_O) $(PGRAC_FENCED_DISPATCH_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+PGRAC_FENCED_ASYNC_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_async.o
+test_pgrac_fenced_async: test_pgrac_fenced_async.c unit_test.h \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_ASYNC_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_ASYNC_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+PGRAC_FENCED_COORDINATOR_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_coordinator.o \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_schedule.o \
+	$(PGRAC_FENCED_ASYNC_O) $(PGRAC_FENCED_SESSION_O)
+test_pgrac_fenced_coordinator: test_pgrac_fenced_coordinator.c unit_test.h \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_CORE_O) \
+		$(PGRAC_FENCED_COORDINATOR_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_CORE_O) \
+		$(PGRAC_FENCED_COORDINATOR_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+PGRAC_FENCED_REJOIN_COORDINATOR_O = \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_rejoin_coordinator.o
+test_pgrac_fenced_rejoin_coordinator: \
+		test_pgrac_fenced_rejoin_coordinator.c unit_test.h \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_CORE_O) \
+		$(PGRAC_FENCED_REJOIN_O) $(PGRAC_FENCED_REJOIN_ASYNC_O) \
+		$(PGRAC_FENCED_COORDINATOR_O) $(PGRAC_FENCED_REJOIN_COORDINATOR_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_CORE_O) \
+		$(PGRAC_FENCED_REJOIN_O) $(PGRAC_FENCED_REJOIN_ASYNC_O) \
+		$(PGRAC_FENCED_COORDINATOR_O) $(PGRAC_FENCED_REJOIN_COORDINATOR_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+pgrac_fenced_live_rejoin_client: pgrac_fenced_live_rejoin_client.c \
+		$(top_builddir)/src/common/pgrac_external_fence_protocol.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(top_builddir)/src/common/pgrac_external_fence_protocol.o \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+test_pgrac_fenced_ipmi: test_pgrac_fenced_ipmi.c unit_test.h \
+		$(PGRAC_FENCED_IPMI_O) \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_IPMI_O) \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
+PGRAC_FENCED_IPMI_FEXECVE_O = pgrac_fenced_ipmi_fexecve.o
+$(PGRAC_FENCED_IPMI_FEXECVE_O): \
+		$(top_srcdir)/src/bin/pgrac_fenced/pgrac_fenced_ipmi.c \
+		$(top_srcdir)/src/bin/pgrac_fenced/pgrac_fenced_ipmi.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DHAVE_FEXECVE \
+		-I$(top_srcdir)/src/bin/pgrac_fenced -c $< -o $@
+
+test_pgrac_fenced_ipmi_exec: test_pgrac_fenced_ipmi_exec.c unit_test.h \
+		$(PGRAC_FENCED_IPMI_FEXECVE_O) \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_IPMI_FEXECVE_O) \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
 
 PGRAC_FENCED_CTL_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_ctl.o
@@ -1496,7 +1652,8 @@ check: all check_cluster_undo_segment_half_page_oversized
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f $(TESTS) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
+	rm -f $(TESTS) pgrac_fenced_live_rejoin_client \
+		$(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(CLUSTER_QVOTEC_PGSA_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_TEST_O) \
 		$(CLUSTER_XLOG_INSERT_END_TEST_O) \
 		$(CLUSTER_R4_ROUTE_DEDUP_TEST_O) $(CLUSTER_R4_HOT_HEAPAM_TEST_O) \

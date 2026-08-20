@@ -476,6 +476,166 @@ pgrac_fenced_journal_restart_action(
 	}
 }
 
+void
+pgrac_fenced_journal_reconcile_state_init(
+	PgracFencedJournalReconcileState *state)
+{
+	if (state == NULL)
+		return;
+	memset(state, 0, sizeof(*state));
+	state->available = true;
+}
+
+static int
+reconcile_find_operation(const PgracFencedJournalReconcileState *state,
+					 const uint8 operation_id[PGRAC_FENCED_JOURNAL_ID_BYTES])
+{
+	uint32 i;
+
+	for (i = 0; i < PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS; i++)
+	{
+		if (state->pending[i].used &&
+			memcmp(state->pending[i].last_record.operation_id, operation_id,
+				PGRAC_FENCED_JOURNAL_ID_BYTES) == 0)
+			return (int) i;
+	}
+	return -1;
+}
+
+static void
+reconcile_remove_operation(PgracFencedJournalReconcileState *state,
+					   const uint8 operation_id[PGRAC_FENCED_JOURNAL_ID_BYTES])
+{
+	int slot = reconcile_find_operation(state, operation_id);
+
+	if (slot < 0)
+		return;
+	memset(&state->pending[slot], 0, sizeof(state->pending[slot]));
+	state->pending_count--;
+}
+
+static bool
+reconcile_remember_operation(PgracFencedJournalReconcileState *state,
+						 const PgracFencedJournalRecordV1 *record)
+{
+	uint32 i;
+	int slot = reconcile_find_operation(state, record->operation_id);
+
+	if (slot >= 0)
+	{
+		state->pending[slot].last_record = *record;
+		return true;
+	}
+	if (state->pending_count >= PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS)
+		return false;
+	for (i = 0; i < PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS; i++)
+	{
+		if (!state->pending[i].used)
+		{
+			state->pending[i].used = true;
+			state->pending[i].last_record = *record;
+			state->pending_count++;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool
+pgrac_fenced_journal_reconcile_observe(
+	PgracFencedJournalReconcileState *state,
+	const PgracFencedJournalRecordV1 *record)
+{
+	if (state == NULL || record == NULL || !state->available ||
+		record->record_kind < PGRAC_FENCED_JOURNAL_KIND_CONFIG_LOADED ||
+		record->record_kind > PGRAC_FENCED_JOURNAL_KIND_RECONCILED)
+		return false;
+	if (record->record_kind == PGRAC_FENCED_JOURNAL_KIND_CONFIG_LOADED)
+		return true;
+	if (bytes_all_zero(record->operation_id, sizeof(record->operation_id)))
+		goto unavailable;
+	switch (record->record_kind)
+	{
+		case PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED:
+		case PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED:
+		case PGRAC_FENCED_JOURNAL_KIND_INVALIDATED:
+			reconcile_remove_operation(state, record->operation_id);
+			return true;
+		case PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED:
+		case PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT:
+		case PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT:
+		case PGRAC_FENCED_JOURNAL_KIND_REENABLE_REQUESTED:
+		case PGRAC_FENCED_JOURNAL_KIND_REENABLE_RESULT:
+			if (!reconcile_remember_operation(state, record))
+				goto unavailable;
+			return true;
+		case PGRAC_FENCED_JOURNAL_KIND_RECONCILED:
+			reconcile_remove_operation(state, record->operation_id);
+			state->fresh_readback_required = true;
+			if (record->target_state == PGRAC_FENCED_JOURNAL_TARGET_ON)
+			{
+				state->keep_write_disabled = true;
+				state->return_off_before_rejoin = true;
+			}
+			else if (record->target_state !=
+					 PGRAC_FENCED_JOURNAL_TARGET_OFF &&
+					 record->target_state !=
+					 PGRAC_FENCED_JOURNAL_TARGET_UNKNOWN)
+				goto unavailable;
+			return true;
+		case PGRAC_FENCED_JOURNAL_KIND_CONFIG_LOADED:
+			return true;
+	}
+
+unavailable:
+	state->available = false;
+	return false;
+}
+
+bool
+pgrac_fenced_journal_reconcile_finish(
+	PgracFencedJournalReconcileState *state)
+{
+	PgracFencedJournalRestartAction action;
+	uint32 i;
+
+	if (state == NULL || !state->available)
+		return false;
+	for (i = 0; i < PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS; i++)
+	{
+		if (!state->pending[i].used)
+			continue;
+		if (!pgrac_fenced_journal_restart_action(
+				&state->pending[i].last_record, &action))
+			goto unavailable;
+		switch (action)
+		{
+			case PGRAC_FENCED_JOURNAL_RESTART_FRESH_READBACK:
+				state->fresh_readback_required = true;
+				break;
+			case PGRAC_FENCED_JOURNAL_RESTART_KEEP_WRITE_DISABLED:
+				state->fresh_readback_required = true;
+				state->keep_write_disabled = true;
+				break;
+			case PGRAC_FENCED_JOURNAL_RESTART_RETURN_OFF_BEFORE_REJOIN:
+				state->fresh_readback_required = true;
+				state->keep_write_disabled = true;
+				state->return_off_before_rejoin = true;
+				break;
+			case PGRAC_FENCED_JOURNAL_RESTART_NO_OPERATION:
+			case PGRAC_FENCED_JOURNAL_RESTART_WAIT_NEW_REQUEST:
+				break;
+			case PGRAC_FENCED_JOURNAL_RESTART_UNAVAILABLE:
+				goto unavailable;
+		}
+	}
+	return true;
+
+unavailable:
+	state->available = false;
+	return false;
+}
+
 static bool
 sealed_filename(uint64 first_seq, uint64 last_seq,
 				const uint8 digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES],

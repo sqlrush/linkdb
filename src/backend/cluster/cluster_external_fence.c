@@ -1730,7 +1730,7 @@ external_fence_rejoin_offer_valid(
 		PGRAC_EXTERNAL_FENCE_MAX_FRESHNESS_NS &&
 		response->verified_mono_ns <= now_ns &&
 		now_ns < response->fresh_until_mono_ns &&
-		response->fresh_until_mono_ns <= op->deadline_mono_ns &&
+		now_ns < op->deadline_mono_ns &&
 		response->proof_generation != 0 &&
 		bytes_nonzero(response->target_state_digest,
 					  sizeof(response->target_state_digest));
@@ -1776,7 +1776,7 @@ external_fence_rejoin_on_result_valid(
 		PGRAC_EXTERNAL_FENCE_MAX_FRESHNESS_NS &&
 		response->verified_mono_ns <= now_ns &&
 		now_ns < response->fresh_until_mono_ns &&
-		response->fresh_until_mono_ns <= op->deadline_mono_ns &&
+		now_ns < op->deadline_mono_ns &&
 		bytes_nonzero(response->target_state_digest,
 					  sizeof(response->target_state_digest)) &&
 		memcmp(response->target_state_digest,
@@ -1824,7 +1824,7 @@ external_fence_rejoin_refresh_result_valid(
 		PGRAC_EXTERNAL_FENCE_MAX_FRESHNESS_NS &&
 		response->verified_mono_ns <= now_ns &&
 		now_ns < response->fresh_until_mono_ns &&
-		response->fresh_until_mono_ns <= op->deadline_mono_ns &&
+		now_ns < op->deadline_mono_ns &&
 		bytes_nonzero(response->target_state_digest,
 					  sizeof(response->target_state_digest)) &&
 		memcmp(response->target_state_digest,

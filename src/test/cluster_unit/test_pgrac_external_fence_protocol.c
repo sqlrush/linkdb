@@ -404,6 +404,56 @@ UT_TEST(test_pfrj_rejects_reserved_crc_and_unknown_opcode)
 											 &decoded));
 }
 
+UT_TEST(test_pfrj_enforces_opcode_specific_zero_and_proof_rules)
+{
+	PgracExternalFenceProtocolRejoinFrameV1 rejoin;
+	uint8 frame[PGRAC_EXTERNAL_FENCE_REJOIN_V1_BYTES];
+
+	fill_rejoin_prepare(&rejoin);
+	rejoin.system_identifier = 1;
+	UT_ASSERT(!pgrac_external_fence_rejoin_v1_encode(&rejoin, frame));
+
+	memset(&rejoin, 0, sizeof(rejoin));
+	rejoin.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CLAIM_NEXT;
+	memset(rejoin.transport_nonce, 0x71, sizeof(rejoin.transport_nonce));
+	UT_ASSERT(pgrac_external_fence_rejoin_v1_encode(&rejoin, frame));
+	rejoin.old_node_id = 1;
+	UT_ASSERT(!pgrac_external_fence_rejoin_v1_encode(&rejoin, frame));
+
+	memset(&rejoin, 0, sizeof(rejoin));
+	rejoin.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CANCEL;
+	memset(rejoin.transport_nonce, 0x72, sizeof(rejoin.transport_nonce));
+	memset(rejoin.operation_id, 0x73, sizeof(rejoin.operation_id));
+	UT_ASSERT(pgrac_external_fence_rejoin_v1_encode(&rejoin, frame));
+	rejoin.old_incarnation = 1;
+	UT_ASSERT(!pgrac_external_fence_rejoin_v1_encode(&rejoin, frame));
+
+	memset(&rejoin, 0, sizeof(rejoin));
+	rejoin.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_OFFER;
+	memset(rejoin.transport_nonce, 0x74, sizeof(rejoin.transport_nonce));
+	memset(rejoin.operation_id, 0x75, sizeof(rejoin.operation_id));
+	rejoin.system_identifier = 9001;
+	memset(rejoin.protected_set_digest, 0x76,
+		   sizeof(rejoin.protected_set_digest));
+	rejoin.old_node_id = 3;
+	rejoin.old_incarnation = 70;
+	rejoin.candidate_incarnation = 77;
+	rejoin.provider_id = 1;
+	rejoin.provider_abi_version = 1;
+	rejoin.target_mapping_generation = 17;
+	memset(rejoin.daemon_boot_id, 0x77, sizeof(rejoin.daemon_boot_id));
+	rejoin.journal_seq = 4;
+	rejoin.verified_mono_ns = 10;
+	rejoin.fresh_until_mono_ns = 20;
+	rejoin.proof_generation = 5;
+	memset(rejoin.target_state_digest, 0x78,
+		   sizeof(rejoin.target_state_digest));
+	rejoin.status = 1;
+	UT_ASSERT(pgrac_external_fence_rejoin_v1_encode(&rejoin, frame));
+	rejoin.rejoin_gate_digest[0] = 1;
+	UT_ASSERT(!pgrac_external_fence_rejoin_v1_encode(&rejoin, frame));
+}
+
 UT_TEST(test_protected_set_digest_exact_domain)
 {
 	uint8 storage_uuid[16];
@@ -539,7 +589,7 @@ UT_TEST(test_acquire_echo_binding_rejects_every_identity_mutation)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 	UT_RUN(test_pfrq_exact_golden_and_round_trip);
 	UT_RUN(test_pfrq_rejects_bad_crc_reserved_and_nonce);
 	UT_RUN(test_pfrq_rejects_wrong_length_version_and_type);
@@ -549,6 +599,7 @@ main(void)
 	UT_RUN(test_pfrs_negative_preserves_diagnostic_boot_and_journal);
 	UT_RUN(test_pfrj_prepare_exact_golden_and_round_trip);
 	UT_RUN(test_pfrj_rejects_reserved_crc_and_unknown_opcode);
+	UT_RUN(test_pfrj_enforces_opcode_specific_zero_and_proof_rules);
 	UT_RUN(test_protected_set_digest_exact_domain);
 	UT_RUN(test_target_state_digest_exact_domain_and_closed_values);
 	UT_RUN(test_binding_digest_exact_manual_encoding);

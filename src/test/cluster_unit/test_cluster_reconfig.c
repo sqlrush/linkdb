@@ -5814,7 +5814,7 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 int
 main(void)
 {
-	UT_PLAN(91);
+	UT_PLAN(96);
 
 	UT_RUN(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap);
 

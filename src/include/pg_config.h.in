@@ -178,6 +178,9 @@
 /* Define to 1 if you have the `explicit_bzero' function. */
 #undef HAVE_EXPLICIT_BZERO
 
+/* Define to 1 if you have the `fexecve' function. */
+#undef HAVE_FEXECVE
+
 /* Define to 1 if fseeko (and presumably ftello) exists and is declared. */
 #undef HAVE_FSEEKO
 

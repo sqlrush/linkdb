@@ -18,6 +18,7 @@
 #define PGRAC_FENCED_JOURNAL_MAX_SEALED UINT32_C(8)
 #define PGRAC_FENCED_JOURNAL_ACTIVE_NAME "journal.active"
 #define PGRAC_FENCED_JOURNAL_SEALED_NAME_MAX 128U
+#define PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS UINT32_C(128)
 
 typedef enum PgracFencedJournalRecordKind
 {
@@ -111,6 +112,23 @@ typedef struct PgracFencedJournalScanState
 	bool available;
 } PgracFencedJournalScanState;
 
+typedef struct PgracFencedJournalReconcileEntry
+{
+	bool used;
+	PgracFencedJournalRecordV1 last_record;
+} PgracFencedJournalReconcileEntry;
+
+typedef struct PgracFencedJournalReconcileState
+{
+	uint32 pending_count;
+	bool fresh_readback_required;
+	bool keep_write_disabled;
+	bool return_off_before_rejoin;
+	bool available;
+	PgracFencedJournalReconcileEntry
+		pending[PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS];
+} PgracFencedJournalReconcileState;
+
 extern bool pgrac_fenced_journal_record_encode(
 	const PgracFencedJournalRecordV1 *record,
 	uint8 frame[PGRAC_FENCED_JOURNAL_RECORD_BYTES]);
@@ -136,6 +154,13 @@ extern bool pgrac_fenced_journal_repair_partial_tail_fd(
 extern bool pgrac_fenced_journal_restart_action(
 	const PgracFencedJournalRecordV1 *last_record,
 	PgracFencedJournalRestartAction *action);
+extern void pgrac_fenced_journal_reconcile_state_init(
+	PgracFencedJournalReconcileState *state);
+extern bool pgrac_fenced_journal_reconcile_observe(
+	PgracFencedJournalReconcileState *state,
+	const PgracFencedJournalRecordV1 *record);
+extern bool pgrac_fenced_journal_reconcile_finish(
+	PgracFencedJournalReconcileState *state);
 extern bool pgrac_fenced_journal_rotate_at(
 	int directory_fd, int *active_fd, uint32 sealed_count,
 	PgracFencedJournalScanState *state,

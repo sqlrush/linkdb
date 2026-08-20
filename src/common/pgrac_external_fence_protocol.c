@@ -328,6 +328,55 @@ rejoin_status_valid(const PgracExternalFenceProtocolRejoinFrameV1 *rejoin)
 }
 
 static bool
+rejoin_identity_zero(const PgracExternalFenceProtocolRejoinFrameV1 *rejoin)
+{
+	return rejoin->system_identifier == 0 &&
+		bytes_all_zero(rejoin->rejoin_gate_digest,
+					   sizeof(rejoin->rejoin_gate_digest)) &&
+		bytes_all_zero(rejoin->protected_set_digest,
+					   sizeof(rejoin->protected_set_digest)) &&
+		rejoin->old_node_id == 0 && rejoin->old_incarnation == 0 &&
+		rejoin->candidate_incarnation == 0;
+}
+
+static bool
+rejoin_proof_zero(const PgracExternalFenceProtocolRejoinFrameV1 *rejoin)
+{
+	return rejoin->provider_id == 0 && rejoin->provider_abi_version == 0 &&
+		rejoin->target_mapping_generation == 0 &&
+		bytes_all_zero(rejoin->daemon_boot_id,
+					   sizeof(rejoin->daemon_boot_id)) &&
+		rejoin->journal_seq == 0 && rejoin->verified_mono_ns == 0 &&
+		rejoin->fresh_until_mono_ns == 0 && rejoin->proof_generation == 0 &&
+		bytes_all_zero(rejoin->target_state_digest,
+					   sizeof(rejoin->target_state_digest));
+}
+
+static bool
+rejoin_positive_proof_valid(
+	const PgracExternalFenceProtocolRejoinFrameV1 *rejoin)
+{
+	return rejoin->system_identifier != 0 &&
+		!bytes_all_zero(rejoin->protected_set_digest,
+						sizeof(rejoin->protected_set_digest)) &&
+		rejoin->old_node_id >= 0 && rejoin->old_node_id < 128 &&
+		rejoin->old_incarnation != 0 &&
+		rejoin->candidate_incarnation > rejoin->old_incarnation &&
+		rejoin->provider_id != 0 && rejoin->provider_id != UINT16_MAX &&
+		rejoin->provider_abi_version == 1 &&
+		rejoin->target_mapping_generation != 0 &&
+		!bytes_all_zero(rejoin->daemon_boot_id,
+						sizeof(rejoin->daemon_boot_id)) &&
+		rejoin->journal_seq != 0 && rejoin->verified_mono_ns != 0 &&
+		rejoin->fresh_until_mono_ns > rejoin->verified_mono_ns &&
+		rejoin->fresh_until_mono_ns - rejoin->verified_mono_ns <=
+		PGRAC_EXTERNAL_FENCE_MAX_FRESHNESS_NS &&
+		rejoin->proof_generation != 0 &&
+		!bytes_all_zero(rejoin->target_state_digest,
+						sizeof(rejoin->target_state_digest));
+}
+
+static bool
 rejoin_frame_semantics_valid(
 	const PgracExternalFenceProtocolRejoinFrameV1 *rejoin)
 {
@@ -361,7 +410,56 @@ rejoin_frame_semantics_valid(
 	else if (rejoin->timeout_ms != 0)
 		return false;
 
-	return true;
+	switch (rejoin->opcode)
+	{
+		case PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE:
+			return rejoin->system_identifier == 0 &&
+				bytes_all_zero(rejoin->rejoin_gate_digest,
+					sizeof(rejoin->rejoin_gate_digest)) &&
+				bytes_all_zero(rejoin->protected_set_digest,
+					sizeof(rejoin->protected_set_digest)) &&
+				rejoin_proof_zero(rejoin);
+		case PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE_RESULT:
+			return rejoin->system_identifier == 0 &&
+				bytes_all_zero(rejoin->rejoin_gate_digest,
+					sizeof(rejoin->rejoin_gate_digest)) &&
+				bytes_all_zero(rejoin->protected_set_digest,
+					sizeof(rejoin->protected_set_digest)) &&
+				rejoin_proof_zero(rejoin);
+		case PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CLAIM_NEXT:
+		case PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CANCEL:
+			return rejoin_identity_zero(rejoin) &&
+				rejoin_proof_zero(rejoin);
+		case PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON:
+		case PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON:
+			return rejoin->system_identifier != 0 &&
+				!bytes_all_zero(rejoin->rejoin_gate_digest,
+					sizeof(rejoin->rejoin_gate_digest)) &&
+				!bytes_all_zero(rejoin->protected_set_digest,
+					sizeof(rejoin->protected_set_digest)) &&
+				rejoin->old_node_id >= 0 && rejoin->old_node_id < 128 &&
+				rejoin->old_incarnation != 0 &&
+				rejoin->candidate_incarnation > rejoin->old_incarnation &&
+				rejoin_proof_zero(rejoin);
+		case PGRAC_EXTERNAL_FENCE_REJOIN_LMON_OFFER:
+			if (rejoin->status != 1)
+				return bytes_all_zero(rejoin->rejoin_gate_digest,
+					sizeof(rejoin->rejoin_gate_digest)) &&
+					rejoin_proof_zero(rejoin);
+			return bytes_all_zero(rejoin->rejoin_gate_digest,
+					sizeof(rejoin->rejoin_gate_digest)) &&
+				rejoin_positive_proof_valid(rejoin);
+		case PGRAC_EXTERNAL_FENCE_REJOIN_LMON_ON_RESULT:
+		case PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_RESULT:
+			if (rejoin->status != 3 && rejoin->status != 4)
+				return rejoin_proof_zero(rejoin);
+			return !bytes_all_zero(rejoin->rejoin_gate_digest,
+					sizeof(rejoin->rejoin_gate_digest)) &&
+				rejoin_positive_proof_valid(rejoin);
+		default:
+			return false;
+	}
+
 }
 
 bool

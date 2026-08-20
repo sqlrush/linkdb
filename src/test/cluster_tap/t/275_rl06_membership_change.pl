@@ -148,10 +148,6 @@ else
 	{
 		fail('L4 node1 restart failed for an unexpected reason');
 		diag($log1);
-		ok(1, 'L4 placeholder (unexpected failure diagnosed)');
-		is(1, 1, 'L4 placeholder');
-		ok(1, 'L4 placeholder');
-		is(1, 1, 'L4 placeholder');
 	}
 }
 

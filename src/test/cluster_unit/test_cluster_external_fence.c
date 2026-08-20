@@ -1803,7 +1803,7 @@ UT_TEST(test_external_fence_rejoin_claim_receives_exact_offer)
 	response.verified_mono_ns = (uint64) now.tv_sec * UINT64_C(1000000000)
 		+ (uint64) now.tv_nsec;
 	response.fresh_until_mono_ns = response.verified_mono_ns +
-		UINT64_C(1000000000);
+		UINT64_C(5000000000);
 	response.proof_generation = UINT64_C(5);
 	memset(response.target_state_digest, 0x44,
 		   sizeof(response.target_state_digest));
@@ -1816,6 +1816,8 @@ UT_TEST(test_external_fence_rejoin_claim_receives_exact_offer)
 	UT_ASSERT_EQ(reason, PGRAC_EXTERNAL_FENCE_DENY_NONE);
 	offer = cluster_external_fence_rejoin_offer(op);
 	UT_ASSERT(offer != NULL);
+	if (offer == NULL)
+		goto cleanup;
 	UT_ASSERT_EQ(offer->old_node_id, 1);
 	UT_ASSERT_EQ(offer->old_incarnation, UINT64_C(70));
 	UT_ASSERT_EQ(offer->candidate_incarnation, UINT64_C(77));
@@ -1932,7 +1934,7 @@ UT_TEST(test_external_fence_rejoin_claim_receives_exact_offer)
 	response.verified_mono_ns = (uint64) now.tv_sec * UINT64_C(1000000000)
 		+ (uint64) now.tv_nsec;
 	response.fresh_until_mono_ns = response.verified_mono_ns +
-		UINT64_C(1000000000);
+		UINT64_C(5000000000);
 	response.proof_generation = UINT64_C(6);
 	memset(response.target_state_digest, 0x55,
 		   sizeof(response.target_state_digest));
@@ -2001,7 +2003,7 @@ UT_TEST(test_external_fence_rejoin_claim_receives_exact_offer)
 	response.verified_mono_ns = (uint64) now.tv_sec * UINT64_C(1000000000)
 		+ (uint64) now.tv_nsec;
 	response.fresh_until_mono_ns = response.verified_mono_ns +
-		UINT64_C(1000000000);
+		UINT64_C(5000000000);
 	response.proof_generation = UINT64_C(7);
 	memset(response.target_state_digest, 0x66,
 		   sizeof(response.target_state_digest));

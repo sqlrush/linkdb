@@ -13,6 +13,7 @@
 #include <unistd.h>
 
 #include "pgrac_fenced_journal.h"
+#include "pgrac_fenced_runtime.h"
 
 #undef printf
 #undef fprintf
@@ -175,6 +176,7 @@ UT_TEST(test_append_advances_only_after_full_write_and_fsync)
 
 	fd = mkstemp(path);
 	UT_ASSERT(fd >= 0);
+	UT_ASSERT(pgrac_fenced_journal_filesystem_local(fd));
 	UT_ASSERT_EQ(fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_APPEND), 0);
 	pgrac_fenced_journal_scan_state_init(&state);
 
@@ -250,6 +252,53 @@ UT_TEST(test_reconcile_actions_cover_all_durable_record_kinds)
 	record.target_state = PGRAC_FENCED_JOURNAL_TARGET_TRANSITIONING;
 	UT_ASSERT(!pgrac_fenced_journal_restart_action(&record, &action));
 	UT_ASSERT_EQ(action, PGRAC_FENCED_JOURNAL_RESTART_UNAVAILABLE);
+}
+
+UT_TEST(test_restart_reconcile_keeps_only_last_unfinished_operations)
+{
+	PgracFencedJournalReconcileState state;
+	PgracFencedJournalRecordV1 record;
+
+	pgrac_fenced_journal_reconcile_state_init(&state);
+	make_config_record(&record, 1);
+	UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&state, &record));
+
+	/* A completed proof supersedes this operation's uncertain actuation. */
+	make_config_record(&record, 2);
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED;
+	fill_nonzero(record.operation_id, sizeof(record.operation_id), 0x31);
+	UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&state, &record));
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED;
+	UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&state, &record));
+
+	/* This actuation remains uncertain at the crash cut. */
+	make_config_record(&record, 3);
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT;
+	fill_nonzero(record.operation_id, sizeof(record.operation_id), 0x32);
+	record.target_state = PGRAC_FENCED_JOURNAL_TARGET_UNKNOWN;
+	UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&state, &record));
+
+	/* INVALIDATED supersedes a queued REQUEST_ACCEPTED. */
+	make_config_record(&record, 4);
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED;
+	fill_nonzero(record.operation_id, sizeof(record.operation_id), 0x33);
+	UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&state, &record));
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_INVALIDATED;
+	UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&state, &record));
+
+	/* ON after re-enable keeps the target write-disabled until fresh F. */
+	make_config_record(&record, 5);
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_REENABLE_RESULT;
+	fill_nonzero(record.operation_id, sizeof(record.operation_id), 0x34);
+	record.target_state = PGRAC_FENCED_JOURNAL_TARGET_ON;
+	UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&state, &record));
+
+	UT_ASSERT(pgrac_fenced_journal_reconcile_finish(&state));
+	UT_ASSERT_EQ(state.pending_count, 2);
+	UT_ASSERT(state.fresh_readback_required);
+	UT_ASSERT(state.keep_write_disabled);
+	UT_ASSERT(state.return_off_before_rejoin);
+	UT_ASSERT(state.available);
 }
 
 UT_TEST(test_rotation_seals_exact_name_and_creates_new_active)
@@ -364,10 +413,215 @@ UT_TEST(test_partial_tail_repair_truncates_and_fsyncs_active)
 	(void) unlink(path);
 }
 
+UT_TEST(test_runtime_and_journal_stat_gates_are_exact)
+{
+	struct stat st;
+
+	memset(&st, 0, sizeof(st));
+	st.st_mode = S_IFDIR | 0750;
+	st.st_uid = 0;
+	st.st_gid = 44;
+	UT_ASSERT(pgrac_fenced_runtime_dir_stat_secure(&st, 44));
+	st.st_mode = S_IFDIR | 0770;
+	UT_ASSERT(!pgrac_fenced_runtime_dir_stat_secure(&st, 44));
+	st.st_mode = S_IFDIR | 0750;
+	st.st_gid = 45;
+	UT_ASSERT(!pgrac_fenced_runtime_dir_stat_secure(&st, 44));
+
+	memset(&st, 0, sizeof(st));
+	st.st_mode = S_IFDIR | 0700;
+	st.st_uid = 0;
+	st.st_gid = 0;
+	UT_ASSERT(pgrac_fenced_journal_dir_stat_secure(&st));
+	st.st_mode = S_IFDIR | 0750;
+	UT_ASSERT(!pgrac_fenced_journal_dir_stat_secure(&st));
+
+	memset(&st, 0, sizeof(st));
+	st.st_mode = S_IFREG | 0600;
+	st.st_uid = 0;
+	st.st_gid = 0;
+	st.st_size = PGRAC_FENCED_JOURNAL_RECORD_BYTES;
+	UT_ASSERT(pgrac_fenced_journal_file_stat_secure(&st));
+	st.st_mode = S_IFREG | 0640;
+	UT_ASSERT(!pgrac_fenced_journal_file_stat_secure(&st));
+	st.st_mode = S_IFREG | 0600;
+	st.st_size = (off_t) PGRAC_FENCED_JOURNAL_SEGMENT_BYTES + 1;
+	UT_ASSERT(!pgrac_fenced_journal_file_stat_secure(&st));
+}
+
+UT_TEST(test_runtime_loads_and_repairs_only_active_partial_tail)
+{
+	PgracFencedJournalRecordV1 record;
+	PgracFencedJournalRecordV1 last;
+	PgracFencedJournalScanState append_state;
+	PgracFencedJournalScanState loaded_state;
+	char path[] = "/tmp/pgrac-fenced-runtime-journal.XXXXXX";
+	struct stat st;
+	bool have_last = false;
+	uint8 tail[13];
+	int fd;
+
+	fd = mkstemp(path);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_APPEND), 0);
+	pgrac_fenced_journal_scan_state_init(&append_state);
+	make_config_record(&record, 0);
+	UT_ASSERT_EQ(pgrac_fenced_journal_append_fd(fd, &append_state, &record),
+		PGRAC_FENCED_JOURNAL_APPEND_OK);
+	memset(tail, 0x5a, sizeof(tail));
+	UT_ASSERT_EQ(write(fd, tail, sizeof(tail)), sizeof(tail));
+	pgrac_fenced_journal_scan_state_init(&loaded_state);
+	UT_ASSERT(pgrac_fenced_journal_load_active_fd(fd, &loaded_state, &last,
+		&have_last));
+	UT_ASSERT(have_last);
+	UT_ASSERT_EQ(last.record_kind,
+		PGRAC_FENCED_JOURNAL_KIND_CONFIG_LOADED);
+	UT_ASSERT_EQ(loaded_state.next_seq, 2);
+	UT_ASSERT_EQ(fstat(fd, &st), 0);
+	UT_ASSERT_EQ(st.st_size, PGRAC_FENCED_JOURNAL_RECORD_BYTES);
+
+	UT_ASSERT_EQ(pwrite(fd, "x", 1, 0), 1);
+	UT_ASSERT_EQ(fsync(fd), 0);
+	UT_ASSERT(!pgrac_fenced_journal_load_active_fd(fd, &loaded_state, &last,
+		&have_last));
+	UT_ASSERT(!loaded_state.available);
+	(void) close(fd);
+	(void) unlink(path);
+}
+
+UT_TEST(test_runtime_loads_sealed_then_active_as_one_hash_chain)
+{
+	PgracFencedJournalRecordV1 record;
+	PgracFencedJournalRecordV1 last;
+	PgracFencedJournalScanState append_state;
+	PgracFencedJournalScanState loaded_state;
+	char sealed_path[] = "/tmp/pgrac-fenced-sealed.XXXXXX";
+	char active_path[] = "/tmp/pgrac-fenced-active.XXXXXX";
+	bool have_last = false;
+	int sealed_fd;
+	int active_fd;
+
+	sealed_fd = mkstemp(sealed_path);
+	active_fd = mkstemp(active_path);
+	UT_ASSERT(sealed_fd >= 0);
+	UT_ASSERT(active_fd >= 0);
+	UT_ASSERT_EQ(fcntl(sealed_fd, F_SETFL,
+		fcntl(sealed_fd, F_GETFL) | O_APPEND), 0);
+	UT_ASSERT_EQ(fcntl(active_fd, F_SETFL,
+		fcntl(active_fd, F_GETFL) | O_APPEND), 0);
+	pgrac_fenced_journal_scan_state_init(&append_state);
+	make_config_record(&record, 0);
+	UT_ASSERT_EQ(pgrac_fenced_journal_append_fd(sealed_fd, &append_state,
+		&record), PGRAC_FENCED_JOURNAL_APPEND_OK);
+	append_state.segment_first_seq = append_state.next_seq;
+	append_state.segment_record_count = 0;
+	append_state.valid_bytes = 0;
+	make_config_record(&record, 0);
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED;
+	fill_nonzero(record.operation_id, sizeof(record.operation_id), 0x33);
+	UT_ASSERT_EQ(pgrac_fenced_journal_append_fd(active_fd, &append_state,
+		&record), PGRAC_FENCED_JOURNAL_APPEND_OK);
+
+	pgrac_fenced_journal_scan_state_init(&loaded_state);
+	UT_ASSERT(pgrac_fenced_journal_load_sealed_fd(sealed_fd, &loaded_state,
+		&last, &have_last));
+	UT_ASSERT(have_last);
+	UT_ASSERT_EQ(last.seq, 1);
+	UT_ASSERT(pgrac_fenced_journal_load_active_fd(active_fd, &loaded_state,
+		&last, &have_last));
+	UT_ASSERT(have_last);
+	UT_ASSERT_EQ(last.seq, 2);
+	UT_ASSERT_EQ(loaded_state.next_seq, 3);
+
+	UT_ASSERT_EQ(write(sealed_fd, "x", 1), 1);
+	pgrac_fenced_journal_scan_state_init(&loaded_state);
+	UT_ASSERT(!pgrac_fenced_journal_load_sealed_fd(sealed_fd, &loaded_state,
+		&last, &have_last));
+	UT_ASSERT(!loaded_state.available);
+	(void) close(active_fd);
+	(void) close(sealed_fd);
+	(void) unlink(active_path);
+	(void) unlink(sealed_path);
+}
+
+UT_TEST(test_runtime_replays_verified_records_into_restart_reconcile)
+{
+	PgracFencedJournalReconcileState reconcile;
+	PgracFencedJournalRecordV1 record;
+	PgracFencedJournalRecordV1 last;
+	PgracFencedJournalScanState append_state;
+	PgracFencedJournalScanState loaded_state;
+	char path[] = "/tmp/pgrac-fenced-reconcile.XXXXXX";
+	bool have_last = false;
+	int fd;
+
+	fd = mkstemp(path);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(fcntl(fd, F_SETFL,
+		fcntl(fd, F_GETFL) | O_APPEND), 0);
+	pgrac_fenced_journal_scan_state_init(&append_state);
+	make_config_record(&record, 0);
+	UT_ASSERT_EQ(pgrac_fenced_journal_append_fd(fd, &append_state, &record),
+		PGRAC_FENCED_JOURNAL_APPEND_OK);
+	make_config_record(&record, 0);
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED;
+	fill_nonzero(record.operation_id, sizeof(record.operation_id), 0x45);
+	record.provider_result = PGRAC_FENCED_JOURNAL_PROVIDER_PENDING;
+	UT_ASSERT_EQ(pgrac_fenced_journal_append_fd(fd, &append_state, &record),
+		PGRAC_FENCED_JOURNAL_APPEND_OK);
+
+	pgrac_fenced_journal_scan_state_init(&loaded_state);
+	pgrac_fenced_journal_reconcile_state_init(&reconcile);
+	UT_ASSERT(pgrac_fenced_journal_load_active_reconcile_fd(fd,
+		&loaded_state, &last, &have_last, &reconcile));
+	UT_ASSERT(have_last);
+	UT_ASSERT_EQ(last.record_kind,
+		PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED);
+	UT_ASSERT(pgrac_fenced_journal_reconcile_finish(&reconcile));
+	UT_ASSERT_EQ(reconcile.pending_count, 1);
+	UT_ASSERT(reconcile.fresh_readback_required);
+	(void) close(fd);
+	(void) unlink(path);
+}
+
+UT_TEST(test_sealed_name_parser_is_canonical_and_full_segment_only)
+{
+	static const char valid[] =
+		"journal.1-262144."
+		"abababababababababababababababab"
+		"abababababababababababababababab.sealed";
+	char invalid[sizeof(valid)];
+	uint8 digest[32];
+	uint64 first;
+	uint64 last;
+
+	UT_ASSERT(pgrac_fenced_journal_sealed_name_parse(valid, &first, &last,
+		digest));
+	UT_ASSERT_EQ(first, 1);
+	UT_ASSERT_EQ(last, UINT64_C(262144));
+	UT_ASSERT_EQ(digest[0], 0xab);
+	UT_ASSERT_EQ(digest[31], 0xab);
+	strcpy(invalid, valid);
+	invalid[8] = '0';
+	UT_ASSERT(!pgrac_fenced_journal_sealed_name_parse(invalid, &first, &last,
+		digest));
+	strcpy(invalid, valid);
+	invalid[25] = 'A';
+	UT_ASSERT(!pgrac_fenced_journal_sealed_name_parse(invalid, &first, &last,
+		digest));
+	UT_ASSERT(!pgrac_fenced_journal_sealed_name_parse(
+		"journal.1-2."
+		"abababababababababababababababab"
+		"abababababababababababababababab.sealed",
+		&first, &last, digest));
+	UT_ASSERT(!pgrac_fenced_journal_sealed_name_parse(NULL, &first, &last,
+		digest));
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(17);
 	UT_RUN(test_journal_exact_codec_roundtrip);
 	UT_RUN(test_journal_rejects_crc_reserved_unknown_and_bad_proof);
 	UT_RUN(test_journal_scan_verifies_seq_and_full_record_hash_chain);
@@ -375,10 +629,16 @@ main(void)
 	UT_RUN(test_append_advances_only_after_full_write_and_fsync);
 	UT_RUN(test_append_requests_rotation_at_exact_segment_limit);
 	UT_RUN(test_reconcile_actions_cover_all_durable_record_kinds);
+	UT_RUN(test_restart_reconcile_keeps_only_last_unfinished_operations);
 	UT_RUN(test_rotation_seals_exact_name_and_creates_new_active);
 	UT_RUN(test_ninth_rotation_fails_closed_without_rename);
 	UT_RUN(test_semantic_config_digest_has_exact_domain_and_length);
 	UT_RUN(test_partial_tail_repair_truncates_and_fsyncs_active);
+	UT_RUN(test_runtime_and_journal_stat_gates_are_exact);
+	UT_RUN(test_runtime_loads_and_repairs_only_active_partial_tail);
+	UT_RUN(test_runtime_loads_sealed_then_active_as_one_hash_chain);
+	UT_RUN(test_runtime_replays_verified_records_into_restart_reconcile);
+	UT_RUN(test_sealed_name_parser_is_canonical_and_full_segment_only);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
