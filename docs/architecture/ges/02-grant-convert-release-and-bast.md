@@ -1,6 +1,6 @@
 # 02：Grant、Convert、Release 与 BAST
 
-[上一篇：架构与 GRD](01-architecture-and-grd.md) · [返回索引](README.md) · [下一篇：Deadlock 与公平性](03-deadlock-fairness-and-lifecycle.md)
+[上一篇：八种锁模式](06-eight-lock-modes.md) · [返回索引](README.md) · [下一篇：Deadlock 与公平性](03-deadlock-fairness-and-lifecycle.md)
 
 ## 结论先行
 

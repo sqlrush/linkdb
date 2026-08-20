@@ -1,6 +1,6 @@
 # 01：GES 架构、资源身份与 GRD
 
-[返回索引](README.md) · [下一篇：Grant、Convert、Release 与 BAST](02-grant-convert-release-and-bast.md)
+[返回索引](README.md) · [下一篇：八种锁模式如何进入 GES](06-eight-lock-modes.md)
 
 ## 结论先行
 
@@ -121,4 +121,5 @@ flowchart TB
 
 `pg_cluster_ges_mode_matrix()` 暴露 64 个 compatibility cell；[`t/276_ges_mode_contract.pl`](../../../src/test/cluster_tap/t/276_ges_mode_contract.pl) 验证它与 PostgreSQL 原生矩阵一致，并验证典型互斥/兼容关系。
 
-下一篇沿 entry 的三条数组走完 grant、convert、release 与 BAST。
+下一篇先逐项解释 PostgreSQL 八种 mode 哪些留在 PG-native、哪些进入 GES，
+以及强模式如何通过 native-lock probe 看见各节点的低模式锁。
