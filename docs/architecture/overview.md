@@ -11,6 +11,9 @@ formation authority, and recovery, see
 [Oracle RAC 与 PGRAC 节点变化机制图解](rac-node-change/README.md).
 For the global resource services themselves, see the Chinese deep dives for
 [GCS / Cache Fusion](gcs/README.md) and [GES / GRD](ges/README.md).
+For transaction recovery authority, PREPARED / in-doubt handling, and the
+`pg_xact_remote_v2` projection boundary, see
+[未决事务恢复：Oracle RECO 语义与 PGRAC 投影边界](transaction-recovery/pending-transaction-authority.md).
 
 ## High-level component map
 
@@ -371,6 +374,7 @@ strength and remaining boundaries are documented here:
 - [PGRAC GCS 与 Oracle RAC Cache Fusion 图解](gcs/README.md)
 - [PGRAC GES 与 Oracle RAC Global Enqueue 图解](ges/README.md)
 - [Oracle RAC 与 PGRAC 节点变化机制图解](rac-node-change/README.md)
+- [未决事务恢复：Oracle RECO 语义与 PGRAC 投影边界](transaction-recovery/pending-transaction-authority.md)
 
 Do not infer that every registered wait event or protocol enum represents an
 end-to-end production path.  Each deep dive distinguishes production wiring,
