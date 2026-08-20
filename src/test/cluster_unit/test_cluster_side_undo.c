@@ -45,12 +45,12 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
  * ---------- */
 typedef struct FakeRecord {
 	XLogReaderState st;
+	uint8		data[BLCKSZ + 128];
 	union {
 		DecodedXLogRecord dec;
 		/* cppcheck-suppress unusedStructMember */
 		char pad[sizeof(DecodedXLogRecord) + 2 * sizeof(DecodedBkpBlock)];
 	} u;
-	uint8		data[512];
 } FakeRecord;
 
 static XLogReaderState *
@@ -65,7 +65,7 @@ make_record(FakeRecord *fr, RmgrId rmid, uint8 info, const void *payload,
 	if (payload != NULL && payload_len > 0)
 	{
 		memcpy(fr->data, payload, payload_len);
-		dec->main_data = fr->data;
+		dec->main_data = (char *) fr->data;
 		dec->main_data_len = payload_len;
 	}
 	fr->st.record = dec;
@@ -149,6 +149,7 @@ UT_TEST(test_preflight_field_integrity_and_route)
 	payload.slot_offset = 3;
 	payload.wrap = 2;
 	payload.xid = 1234;
+	payload.commit_scn = 55;
 	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT,
 					  &payload, sizeof(payload));
 	UT_ASSERT(cluster_undo_decode(rec, &out));
@@ -186,7 +187,9 @@ UT_TEST(test_decode_block_write_fields)
 	xl_undo_block_write payload;
 	ClusterUndoDecoded out;
 	XLogReaderState *rec;
-	uint8		extra[32];
+	uint8		fpi[sizeof(payload) + BLCKSZ];
+	uint8		delta[sizeof(payload) + UNDO_BLOCK_HDR_PREFIX_LEN + 32 +
+				  sizeof(UndoSlotDirEntry)];
 
 	memset(&payload, 0, sizeof(payload));
 	payload.instance = 2;
@@ -195,38 +198,97 @@ UT_TEST(test_decode_block_write_fields)
 	payload.has_fpi = 1;
 	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
 					  &payload, sizeof(payload));
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
+	memcpy(fpi, &payload, sizeof(payload));
+	memset(fpi + sizeof(payload), 0x5a, BLCKSZ);
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
+					  fpi, sizeof(fpi));
 	UT_ASSERT(cluster_undo_decode(rec, &out));
 	UT_ASSERT_EQ((int) out.kind, (int) CLUSTER_UNDO_KIND_BLOCK_WRITE);
 	UT_ASSERT_EQ((unsigned) out.segment_id, 9U);
 	UT_ASSERT_EQ((unsigned) out.block_no, 5U);
-	UT_ASSERT(!out.has_payload); /* exactly the fixed header */
+	UT_ASSERT(out.has_payload);
+	UT_ASSERT(out.has_fpi);
+	UT_ASSERT_EQ(out.payload_offset, sizeof(payload));
+	UT_ASSERT_EQ(out.payload_length, BLCKSZ);
 
-	/* With a payload image after the header. */
-	memset(extra, 0x5a, sizeof(extra));
+	memset(&payload, 0, sizeof(payload));
+	payload.instance = 2;
+	payload.segment_id = 257;
+	payload.block_no = 6;
+	payload.rec_off = sizeof(UndoBlockHeader);
+	payload.rec_len = 32;
+	payload.slot_off = BLCKSZ - sizeof(UndoSlotDirEntry);
+	memcpy(delta, &payload, sizeof(payload));
+	memset(delta + sizeof(payload), 0x6b, sizeof(delta) - sizeof(payload));
 	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
-					  &extra, sizeof(extra));
-	/* payload bytes are the extra buffer; rebuild a real payload */
-	{
-		uint8		buf[sizeof(payload) + 32];
+					  delta, sizeof(delta));
+	UT_ASSERT(cluster_undo_decode(rec, &out));
+	UT_ASSERT(!out.has_fpi);
+	UT_ASSERT_EQ(out.rec_off, sizeof(UndoBlockHeader));
+	UT_ASSERT_EQ(out.rec_len, 32);
+	UT_ASSERT_EQ(out.slot_off, BLCKSZ - sizeof(UndoSlotDirEntry));
+	UT_ASSERT_EQ(out.payload_length,
+		UNDO_BLOCK_HDR_PREFIX_LEN + 32 + sizeof(UndoSlotDirEntry));
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
+					  delta, sizeof(delta) - 1);
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
+}
 
-		memcpy(buf, &payload, sizeof(payload));
-		memset(buf + sizeof(payload), 0x5a, 32);
-		rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE,
-						  buf, sizeof(buf));
-		UT_ASSERT(cluster_undo_decode(rec, &out));
-		UT_ASSERT(out.has_payload);
-	}
+UT_TEST(test_decode_set_head_and_multi_exact_shape)
+{
+	FakeRecord fr;
+	xl_undo_tt_slot_set_head set_head;
+	xl_undo_block_write_multi multi;
+	ClusterUndoDecoded out;
+	XLogReaderState *rec;
+	uint8 body[sizeof(multi) + UNDO_BLOCK_HDR_PREFIX_LEN + 24 +
+			 2 * sizeof(UndoSlotDirEntry)];
+
+	memset(&set_head, 0, sizeof(set_head));
+	set_head.instance = 3;
+	set_head.segment_id = 513;
+	set_head.slot_offset = 4;
+	set_head.wrap = 7;
+	set_head.xid = 801;
+	set_head.first_undo_block.raw[0] = UINT64_C(513) | (UINT64_C(9) << 32);
+	set_head.first_undo_block.raw[1] = UINT64_C(4);
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD,
+					  &set_head, sizeof(set_head));
+	UT_ASSERT(cluster_undo_decode(rec, &out));
+	UT_ASSERT(memcmp(&out.first_undo_block, &set_head.first_undo_block,
+		sizeof(UBA)) == 0);
+
+	memset(&multi, 0, sizeof(multi));
+	multi.instance = 3;
+	multi.segment_id = 513;
+	multi.block_no = 9;
+	multi.rec_off = sizeof(UndoBlockHeader);
+	multi.rec_len = 24;
+	multi.slot_len = 2 * sizeof(UndoSlotDirEntry);
+	multi.slot_off = BLCKSZ - multi.slot_len;
+	memcpy(body, &multi, sizeof(multi));
+	memset(body + sizeof(multi), 0x31, sizeof(body) - sizeof(multi));
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE_MULTI,
+					  body, sizeof(body));
+	UT_ASSERT(cluster_undo_decode(rec, &out));
+	UT_ASSERT_EQ((int) out.kind, (int) CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI);
+	UT_ASSERT_EQ(out.slot_len, 2 * sizeof(UndoSlotDirEntry));
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE_MULTI,
+					  body, sizeof(body) - 1);
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
 }
 
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 
 	UT_RUN(test_decode_tt_commit_fields);
 	UT_RUN(test_decode_malformed_and_unknown_blocked);
 	UT_RUN(test_preflight_field_integrity_and_route);
 	UT_RUN(test_decode_block_write_fields);
+	UT_RUN(test_decode_set_head_and_multi_exact_shape);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

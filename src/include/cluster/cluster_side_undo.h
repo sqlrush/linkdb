@@ -42,6 +42,7 @@
 
 #include "access/xlogreader.h"
 #include "cluster/cluster_scn.h" /* SCN */
+#include "cluster/cluster_itl_slot.h" /* UBA */
 #include "storage/itemptr.h" /* TransactionId */
 
 typedef enum ClusterUndoDecodedKind
@@ -76,6 +77,19 @@ typedef struct ClusterUndoDecoded
 	SCN			commit_scn;		/* TT commit SCN */
 	uint32		block_no;		/* BLOCK_WRITE target block */
 	bool		has_payload;	/* BLOCK_WRITE carries a payload image */
+	bool		has_fpi;		/* BLOCK_WRITE payload is a full page */
+	uint16		rec_off;
+	uint16		rec_len;
+	uint16		slot_off;
+	uint16		slot_len;
+	uint32		payload_offset;	/* immutable-copy range in record main data */
+	uint32		payload_length;
+	uint32		expected_generation;
+	uint32		new_generation;
+	uint8		old_state;
+	uint8		new_state;
+	uint8		reserved_zero[2];
+	UBA			first_undo_block;
 } ClusterUndoDecoded;
 
 /*

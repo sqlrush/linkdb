@@ -7,12 +7,20 @@
 #define CLUSTER_SIDE_ONLINE_PLAN_H
 
 #include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
 
 #define CLUSTER_SIDE_ONLINE_PLAN_INTERFACE_V1 1
 #define RF_SIDE_ONLINE_PLAN_MAX_BYTES (4 * 1024 * 1024)
 
 typedef struct RfSideOnlinePlanV1 RfSideOnlinePlanV1;
+
+typedef enum RfSideOnlineOperationKindV1
+{
+	RF_SIDE_ONLINE_OPERATION_INVALID = 0,
+	RF_SIDE_ONLINE_OPERATION_XACT = 1,
+	RF_SIDE_ONLINE_OPERATION_UNDO = 2
+} RfSideOnlineOperationKindV1;
 
 typedef struct RfSideOnlinePlanRequestV1
 {
@@ -27,16 +35,24 @@ typedef struct RfSideOnlineOperationV1
 {
 	RfPageOnlineRecordIdentityV1 identity;
 	RfOpcodeRouteV1 route;
+	RfSideOnlineOperationKindV1 kind;
+	uint32		owned_payload_offset;
+	uint32		owned_payload_length;
+	const uint8 *owned_payload;
 	RfSideXactOperationV1 xact;
+	ClusterUndoDecoded undo;
 } RfSideOnlineOperationV1;
 
 typedef bool (*RfSideOnlineApplyXactV1)(void *arg,
+	const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlineApplyUndoV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
 
 typedef struct RfSideOnlineApplyOpsV1
 {
 	void *arg;
 	RfSideOnlineApplyXactV1 apply_xact;
+	RfSideOnlineApplyUndoV1 apply_undo;
 } RfSideOnlineApplyOpsV1;
 
 extern RfPageProofDetailV1 rf_side_online_plan_create_v1(

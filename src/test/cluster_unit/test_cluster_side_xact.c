@@ -10,7 +10,9 @@
 #include "access/xact.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_2pc.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 
 #include "unit_test.h"
 
@@ -166,8 +168,8 @@ make_identity(FakeXactRecord *fake, uint8 storage_uuid[16])
 	identity.record.read_rec_ptr = UINT64_C(100);
 	identity.record.end_rec_ptr = UINT64_C(200);
 	identity.record.record_crc = UINT32_C(0xabc123);
-	identity.record.rmid = RM_XACT_ID;
-	identity.record.info = XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO;
+	identity.record.rmid = fake->u.decoded.header.xl_rmid;
+	identity.record.info = fake->u.decoded.header.xl_info;
 	fake->reader.system_identifier = identity.record.system_identifier;
 	fake->reader.ReadRecPtr = identity.record.read_rec_ptr;
 	fake->reader.EndRecPtr = identity.record.end_rec_ptr;
@@ -175,6 +177,47 @@ make_identity(FakeXactRecord *fake, uint8 storage_uuid[16])
 	fake->u.decoded.next_lsn = identity.record.end_rec_ptr;
 	fake->u.decoded.header.xl_crc = identity.record.record_crc;
 	return identity;
+}
+
+static XLogReaderState *
+make_undo_delta(FakeXactRecord *fake)
+{
+	xl_undo_block_write undo;
+	uint32 body_len = UNDO_BLOCK_HDR_PREFIX_LEN + 24 +
+		sizeof(UndoSlotDirEntry);
+
+	memset(fake, 0, sizeof(*fake));
+	memset(&undo, 0, sizeof(undo));
+	undo.instance = 3;
+	undo.segment_id = 513;
+	undo.block_no = 9;
+	undo.rec_off = sizeof(UndoBlockHeader);
+	undo.rec_len = 24;
+	undo.slot_off = BLCKSZ - sizeof(UndoSlotDirEntry);
+	memcpy(fake->data, &undo, sizeof(undo));
+	memset(fake->data + sizeof(undo), 0x6b, body_len);
+	fake->u.decoded.header.xl_rmid = RM_CLUSTER_UNDO_ID;
+	fake->u.decoded.header.xl_info = XLOG_UNDO_BLOCK_WRITE;
+	fake->u.decoded.main_data = (char *) fake->data;
+	fake->u.decoded.main_data_len = sizeof(undo) + body_len;
+	fake->reader.record = &fake->u.decoded;
+	return &fake->reader;
+}
+
+static RfDetachedRecordPlanV1
+make_undo_record_plan(FakeXactRecord *fake)
+{
+	RfDetachedRecordPlanV1 record_plan;
+
+	memset(&record_plan, 0, sizeof(record_plan));
+	record_plan.source_record = &fake->reader;
+	record_plan.route.rmid = RM_CLUSTER_UNDO_ID;
+	record_plan.route.normalized_info = XLOG_UNDO_BLOCK_WRITE;
+	record_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
+	record_plan.route.block_policy = RF_ROUTE_BLOCKS_FORBIDDEN;
+	record_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO;
+	record_plan.preflight_complete = true;
+	return record_plan;
 }
 
 static RfDetachedRecordPlanV1
@@ -197,8 +240,10 @@ make_record_plan(FakeXactRecord *fake)
 typedef struct ApplyCapture
 {
 	uint32 count;
+	uint32 undo_count;
 	TransactionId xid;
 	SCN scn;
+	uint8 undo_first_byte;
 } ApplyCapture;
 
 static bool
@@ -210,6 +255,17 @@ capture_apply(void *arg, const RfSideOnlineOperationV1 *operation)
 	capture->xid = operation->xact.xid;
 	capture->scn = operation->xact.terminal_scn;
 	return true;
+}
+
+static bool
+capture_apply_undo(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	ApplyCapture *capture = (ApplyCapture *) arg;
+
+	capture->undo_count++;
+	capture->undo_first_byte = operation->owned_payload[0];
+	return operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO &&
+		operation->owned_payload_length > 0;
 }
 
 UT_TEST(test_commit_decodes_to_immutable_truth_operation)
@@ -362,16 +418,71 @@ UT_TEST(test_online_plan_denies_incomplete_physical_cut)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_online_plan_owns_undo_payload_not_raw_record)
+{
+	FakeXactRecord fake;
+	RfDetachedRecordPlanV1 record_plan;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfSideOnlinePlanRequestV1 request;
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut;
+	RfSideOnlineOperationV1 operation;
+	RfSideOnlineApplyOpsV1 apply_ops;
+	ApplyCapture capture;
+	uint8 storage_uuid[16];
+
+	memset(storage_uuid, 0x44, sizeof(storage_uuid));
+	(void) make_undo_delta(&fake);
+	identity = make_identity(&fake, storage_uuid);
+	record_plan = make_undo_record_plan(&fake);
+	memset(&cut, 0, sizeof(cut));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 200;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	memset(&request, 0, sizeof(request));
+	request.system_identifier = identity.record.system_identifier;
+	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(
+		plan, &record_plan, &identity), RF_PAGE_PROOF_DETAIL_OK);
+	memset(fake.data, 0xee, sizeof(fake.data));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	UT_ASSERT_EQ(operation.kind, RF_SIDE_ONLINE_OPERATION_UNDO);
+	UT_ASSERT_EQ((int) operation.undo.kind,
+		(int) CLUSTER_UNDO_KIND_BLOCK_WRITE);
+	UT_ASSERT_EQ(operation.owned_payload_length,
+		UNDO_BLOCK_HDR_PREFIX_LEN + 24 + sizeof(UndoSlotDirEntry));
+	UT_ASSERT_EQ(operation.owned_payload[0], 0x6b);
+	memset(&capture, 0, sizeof(capture));
+	memset(&apply_ops, 0, sizeof(apply_ops));
+	apply_ops.arg = &capture;
+	apply_ops.apply_xact = capture_apply;
+	apply_ops.apply_undo = capture_apply_undo;
+	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(capture.undo_count, 1);
+	UT_ASSERT_EQ(capture.undo_first_byte, 0x6b);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);
 	UT_RUN(test_prepare_requires_bounded_aligned_gid);
 	UT_RUN(test_online_plan_owns_decoded_operation_not_raw_record);
 	UT_RUN(test_online_plan_denies_incomplete_physical_cut);
+	UT_RUN(test_online_plan_owns_undo_payload_not_raw_record);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -29,7 +29,10 @@
 #include "access/xlogrecord.h"
 #include "cluster/cluster_side_route.h"
 #include "cluster/cluster_tt_slot.h" /* TT_SLOTS_PER_SEGMENT */
+#include "cluster/cluster_uba.h"
+#include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_side_undo.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
 static ClusterUndoDecodedKind
@@ -83,82 +86,193 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	{
 		case CLUSTER_UNDO_KIND_TT_COMMIT:
 			{
-				const xl_undo_tt_slot_commit *rec;
+				xl_undo_tt_slot_commit rec;
 
-				if (XLogRecGetDataLen(record) != sizeof(*rec))
+				if (XLogRecGetDataLen(record) != sizeof(rec))
 					return false;	/* malformed: BLOCKED (U-SIDE-04) */
-				rec = (const xl_undo_tt_slot_commit *) XLogRecGetData(record);
-				out->instance = rec->instance;
-				out->segment_id = rec->segment_id;
-				out->slot_offset = rec->slot_offset;
-				out->wrap = rec->wrap;
-				out->xid = rec->xid;
-				out->commit_scn = rec->commit_scn;
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				if (rec._pad[0] != 0 || rec._pad[1] != 0 || rec._pad[2] != 0)
+					return false;
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->slot_offset = rec.slot_offset;
+				out->wrap = rec.wrap;
+				out->xid = rec.xid;
+				out->commit_scn = rec.commit_scn;
 				break;
 			}
 		case CLUSTER_UNDO_KIND_TT_ABORT:
 			{
-				const xl_undo_tt_slot_abort *rec;
+				xl_undo_tt_slot_abort rec;
 
-				if (XLogRecGetDataLen(record) != sizeof(*rec))
+				if (XLogRecGetDataLen(record) != sizeof(rec))
 					return false;
-				rec = (const xl_undo_tt_slot_abort *) XLogRecGetData(record);
-				out->instance = rec->instance;
-				out->segment_id = rec->segment_id;
-				out->slot_offset = rec->slot_offset;
-				out->wrap = rec->wrap;
-				out->xid = rec->xid;
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				if (rec._pad[0] != 0 || rec._pad[1] != 0 || rec._pad[2] != 0)
+					return false;
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->slot_offset = rec.slot_offset;
+				out->wrap = rec.wrap;
+				out->xid = rec.xid;
 				break;
 			}
 		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
 			{
-				const xl_undo_tt_slot_set_head *rec;
+				xl_undo_tt_slot_set_head rec;
 
-				if (XLogRecGetDataLen(record) != sizeof(*rec))
+				if (XLogRecGetDataLen(record) != sizeof(rec))
 					return false;
-				rec = (const xl_undo_tt_slot_set_head *) XLogRecGetData(record);
-				out->instance = rec->instance;
-				out->segment_id = rec->segment_id;
-				out->slot_offset = rec->slot_offset;
-				out->wrap = rec->wrap;
-				out->xid = rec->xid;
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				if (rec._pad[0] != 0 || rec._pad[1] != 0 || rec._pad[2] != 0)
+					return false;
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->slot_offset = rec.slot_offset;
+				out->wrap = rec.wrap;
+				out->xid = rec.xid;
+				out->first_undo_block = rec.first_undo_block;
 				break;
 			}
 		case CLUSTER_UNDO_KIND_SEGMENT_RECYCLE:
+			{
+				xl_undo_segment_recycle rec;
+
+				if (XLogRecGetDataLen(record) != sizeof(rec))
+					return false;
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				if (rec._pad != 0)
+					return false;
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->expected_generation = rec.expected_generation;
+				out->old_state = rec.old_state;
+				out->new_state = rec.new_state;
+				break;
+			}
 		case CLUSTER_UNDO_KIND_SEGMENT_REUSE:
 			{
-				const xl_undo_segment_recycle *rec;
+				xl_undo_segment_reuse rec;
 
-				if (XLogRecGetDataLen(record) != sizeof(*rec))
+				if (XLogRecGetDataLen(record) != sizeof(rec) + BLCKSZ)
 					return false;
-				rec = (const xl_undo_segment_recycle *) XLogRecGetData(record);
-				out->instance = rec->instance;
-				out->segment_id = rec->segment_id;
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				if (rec._pad[0] != 0 || rec._pad[1] != 0 || rec._pad[2] != 0)
+					return false;
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->expected_generation = rec.old_generation;
+				out->new_generation = rec.new_generation;
+				out->has_payload = true;
+				out->has_fpi = true;
+				out->payload_offset = sizeof(rec);
+				out->payload_length = BLCKSZ;
 				break;
 			}
 		case CLUSTER_UNDO_KIND_BLOCK_WRITE:
+			{
+				xl_undo_block_write rec;
+				uint32		body_len;
+				uint32		expected;
+
+				if (XLogRecGetDataLen(record) < sizeof(rec))
+					return false;
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				body_len = XLogRecGetDataLen(record) - sizeof(rec);
+				if (rec.has_fpi > 1 || rec.block_no == 0)
+					return false;
+				if (rec.has_fpi == 1)
+				{
+					if (body_len != BLCKSZ || rec.rec_off != 0 ||
+						rec.rec_len != 0 || rec.slot_off != 0)
+						return false;
+				}
+				else
+				{
+					expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len +
+						sizeof(UndoSlotDirEntry);
+					if (rec.rec_off < sizeof(UndoBlockHeader) ||
+						rec.rec_len == 0 ||
+						(uint32) rec.rec_off + rec.rec_len > BLCKSZ ||
+						rec.slot_off < sizeof(UndoBlockHeader) ||
+						(uint32) rec.slot_off + sizeof(UndoSlotDirEntry) >
+							BLCKSZ || body_len != expected)
+						return false;
+				}
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->block_no = rec.block_no;
+				out->has_payload = true;
+				out->has_fpi = rec.has_fpi == 1;
+				out->rec_off = rec.rec_off;
+				out->rec_len = rec.rec_len;
+				out->slot_off = rec.slot_off;
+				out->slot_len = sizeof(UndoSlotDirEntry);
+				out->payload_offset = sizeof(rec);
+				out->payload_length = body_len;
+				break;
+			}
 		case CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI:
 			{
-				const xl_undo_block_write *rec;
+				xl_undo_block_write_multi rec;
+				uint32		body_len;
+				uint32		expected;
 
-				if (XLogRecGetDataLen(record) < sizeof(*rec))
+				if (XLogRecGetDataLen(record) < sizeof(rec))
 					return false;
-				rec = (const xl_undo_block_write *) XLogRecGetData(record);
-				out->instance = rec->instance;
-				out->segment_id = rec->segment_id;
-				out->block_no = rec->block_no;
-				out->has_payload = XLogRecGetDataLen(record) > sizeof(*rec);
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				body_len = XLogRecGetDataLen(record) - sizeof(rec);
+				if (rec._pad != 0 || rec.has_fpi > 1 || rec.block_no == 0)
+					return false;
+				if (rec.has_fpi == 1)
+				{
+					if (body_len != BLCKSZ || rec.rec_off != 0 ||
+						rec.rec_len != 0 || rec.slot_off != 0 ||
+						rec.slot_len != 0)
+						return false;
+				}
+				else
+				{
+					expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len +
+						rec.slot_len;
+					if (rec.rec_off < sizeof(UndoBlockHeader) ||
+						rec.rec_len == 0 ||
+						(uint32) rec.rec_off + rec.rec_len > BLCKSZ ||
+						rec.slot_off < sizeof(UndoBlockHeader) ||
+						rec.slot_len == 0 || rec.slot_len %
+							sizeof(UndoSlotDirEntry) != 0 ||
+						(uint32) rec.slot_off + rec.slot_len > BLCKSZ ||
+						body_len != expected)
+						return false;
+				}
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->block_no = rec.block_no;
+				out->has_payload = true;
+				out->has_fpi = rec.has_fpi == 1;
+				out->rec_off = rec.rec_off;
+				out->rec_len = rec.rec_len;
+				out->slot_off = rec.slot_off;
+				out->slot_len = rec.slot_len;
+				out->payload_offset = sizeof(rec);
+				out->payload_length = body_len;
 				break;
 			}
 		case CLUSTER_UNDO_KIND_SEGMENT_INIT:
 			{
-				const xl_cluster_undo_segment_init *rec;
+				xl_cluster_undo_segment_init rec;
 
-				if (XLogRecGetDataLen(record) < sizeof(*rec))
+				if (XLogRecGetDataLen(record) != sizeof(rec) + BLCKSZ)
 					return false;
-				rec = (const xl_cluster_undo_segment_init *) XLogRecGetData(record);
-				out->instance = rec->instance;
-				out->segment_id = rec->segment_id;
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				if (rec._pad[0] != 0 || rec._pad2[0] != 0 || rec._pad2[1] != 0)
+					return false;
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->has_payload = true;
+				out->has_fpi = true;
+				out->payload_offset = sizeof(rec);
+				out->payload_length = BLCKSZ;
 				break;
 			}
 		case CLUSTER_UNDO_KIND_HW_RESERVE:
@@ -201,6 +315,18 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 	/* Field integrity: TT slots must be in range (mirrors the production
 	 * handler's PANIC checks as pre-mutation gates — a malformed record
 	 * is BLOCKED, never half-applied). */
+	if (decoded->kind != CLUSTER_UNDO_KIND_HW_RESERVE)
+	{
+		uint32 owner;
+
+		if (decoded->instance == 0 || decoded->instance > 128 ||
+			decoded->segment_id == 0)
+			return false;
+		owner = ((decoded->segment_id - 1) /
+			CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1;
+		if (owner != decoded->instance)
+			return false;
+	}
 	switch (decoded->kind)
 	{
 		case CLUSTER_UNDO_KIND_TT_COMMIT:
@@ -208,7 +334,44 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
 			if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT)
 				return false;
-			if (decoded->xid == InvalidTransactionId)
+			if (!TransactionIdIsNormal(decoded->xid) || decoded->wrap == 0)
+				return false;
+			if (decoded->kind == CLUSTER_UNDO_KIND_TT_COMMIT &&
+				!SCN_VALID(decoded->commit_scn))
+				return false;
+			if (decoded->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD)
+			{
+				uint32 segment_id;
+				uint32 block_no;
+				uint16 slot_offset;
+				uint16 row_offset;
+
+				if (!uba_decode_record(decoded->first_undo_block, &segment_id,
+						&block_no, &slot_offset, &row_offset) ||
+					segment_id != decoded->segment_id ||
+					slot_offset != decoded->slot_offset)
+					return false;
+			}
+			break;
+		case CLUSTER_UNDO_KIND_SEGMENT_RECYCLE:
+			if (decoded->old_state != SEGMENT_COMMITTED ||
+				decoded->new_state != SEGMENT_RECYCLABLE)
+				return false;
+			break;
+		case CLUSTER_UNDO_KIND_SEGMENT_REUSE:
+			if (decoded->new_generation !=
+					decoded->expected_generation + 1 ||
+				!decoded->has_fpi || decoded->payload_length != BLCKSZ)
+				return false;
+			break;
+		case CLUSTER_UNDO_KIND_SEGMENT_INIT:
+			if (!decoded->has_fpi || decoded->payload_length != BLCKSZ)
+				return false;
+			break;
+		case CLUSTER_UNDO_KIND_BLOCK_WRITE:
+		case CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI:
+			if (decoded->block_no == 0 || !decoded->has_payload ||
+				decoded->payload_length == 0)
 				return false;
 			break;
 		default:
