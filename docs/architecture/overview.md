@@ -9,6 +9,8 @@ cluster code and stock PostgreSQL.
 For a detailed Chinese guide to node membership changes, online rejoin,
 formation authority, and recovery, see
 [Oracle RAC 与 PGRAC 节点变化机制图解](rac-node-change/README.md).
+For the global resource services themselves, see the Chinese deep dives for
+[GCS / Cache Fusion](gcs/README.md) and [GES / GRD](ges/README.md).
 
 ## High-level component map
 
@@ -359,26 +361,21 @@ See [Configuration](../user-guide/configuration.md) for the
 `pgrac.conf` format and [System views](../reference/system-views.md)
 for the `pg_cluster_nodes` runtime projection.
 
-## What's not in the picture yet
+## Component deep dives and status
 
-Several subsystems referenced in the wait event registry
-(see [Wait events](../reference/wait-events.md)) are scaffolded
-but not active in the current release.  Operations they would
-serve return `ERRCODE_FEATURE_NOT_SUPPORTED` rather than blocking
-on a wait.
+The wait-event registry is an observability surface, not a feature-status
+registry.  GES, GRD, PCM, LMS and GCS block transfer now have production
+callers and multi-node test coverage; their exact implemented paths, test
+strength and remaining boundaries are documented here:
 
-| Subsystem | Status |
-|---|---|
-| GES (distributed lock manager) | Not active |
-| PCM (parallel cache management) | Not active |
-| Cache Fusion (cross-node block transfer) | Not active |
-| SCN propagation | Not active |
-| Reconfiguration / Heartbeat | Not active |
-| Cluster-aware recovery | Not active |
-| Cross-node sinval | Not active |
-| Cross-node undo | Not active |
-| Active Data Guard | Not active |
+- [PGRAC GCS 与 Oracle RAC Cache Fusion 图解](gcs/README.md)
+- [PGRAC GES 与 Oracle RAC Global Enqueue 图解](ges/README.md)
+- [Oracle RAC 与 PGRAC 节点变化机制图解](rac-node-change/README.md)
+
+Do not infer that every registered wait event or protocol enum represents an
+end-to-end production path.  Each deep dive distinguishes production wiring,
+real multi-node evidence, conditional test legs and current boundaries.
 
 ## Reporting issues
 
-File issues at <https://github.com/sqlrush/linkdb/issues>.
+File issues at <https://github.com/sqlrush/pgrac/issues>.
