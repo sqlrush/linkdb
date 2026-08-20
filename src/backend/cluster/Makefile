@@ -54,6 +54,7 @@ OBJS = \
 	cluster_page_version.o \
 	cluster_page_rmgr.o \
 	cluster_page_recovery.o \
+	cluster_page_stable_base.o \
 	cluster_page_source.o \
 	cluster_page_set.o \
 	cluster_page_apply.o \

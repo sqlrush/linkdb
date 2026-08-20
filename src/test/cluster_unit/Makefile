@@ -105,6 +105,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_page_edge \
 		test_cluster_page_edge_reader \
 		test_cluster_rf_route \
+		test_cluster_page_stable_base \
         test_cluster_cf_storage \
         test_cluster_cf_enqueue \
         test_cluster_cf_phase2 \
@@ -305,6 +306,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -607,6 +609,21 @@ test_cluster_rf_route: test_cluster_rf_route.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) \
 		-lssl -lcrypto -o $@
+
+CLUSTER_PAGE_STABLE_BASE_O = cluster_page_stable_base_test.o
+
+$(CLUSTER_PAGE_STABLE_BASE_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_page_stable_base.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_stable_base.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_page_stable_base: test_cluster_page_stable_base.c unit_test.h \
+		$(CLUSTER_PAGE_STABLE_BASE_O) xlogreader_fs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
+		$(CLUSTER_PAGE_STABLE_BASE_O) xlogreader_fs.o \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) \
+		-lssl -lcrypto -llz4 -lzstd -o $@
 
 CLUSTER_PAGE_VERSION_O = $(top_builddir)/src/backend/cluster/cluster_page_version.o
 test_cluster_page_version: test_cluster_page_version.c unit_test.h \
