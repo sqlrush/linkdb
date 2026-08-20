@@ -209,10 +209,27 @@ UT_TEST(test_encoder_validates_rebuildable_and_routed_entries)
 	UT_ASSERT(!encode_entries(17, &entry, 1, wire, sizeof(wire), &wire_size));
 }
 
+UT_TEST(test_explicit_anchor_force_has_total_precedence)
+{
+	uint8		force_will_init = REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT;
+
+	UT_ASSERT(XLogPageVersionImageRequiredV1(force_will_init, false,
+		InvalidXLogRecPtr, InvalidXLogRecPtr));
+	UT_ASSERT(XLogPageVersionImageRequiredV1(
+		REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE, false,
+		UINT64_C(900), UINT64_C(1)));
+	UT_ASSERT(!XLogPageVersionImageRequiredV1(REGBUF_NO_IMAGE, true,
+		UINT64_C(1), UINT64_C(900)));
+	UT_ASSERT(!XLogPageVersionImageRequiredV1(0, false,
+		UINT64_C(1), UINT64_C(900)));
+	UT_ASSERT(XLogPageVersionImageRequiredV1(0, true,
+		UINT64_C(1), UINT64_C(900)));
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_successor_literals_and_layout);
 	UT_RUN(test_encoder_writes_exact_native_endian_offsets);
 	UT_RUN(test_encoder_failure_leaves_outputs_untouched);
@@ -221,6 +238,7 @@ main(void)
 	UT_RUN(test_encoder_validates_ordinary_transitions);
 	UT_RUN(test_encoder_accepts_only_exact_anchor_masks);
 	UT_RUN(test_encoder_validates_rebuildable_and_routed_entries);
+	UT_RUN(test_explicit_anchor_force_has_total_precedence);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -40,6 +40,9 @@
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_page_anchor_cache.h"
+#endif
 
 static bool
 xlog_page_incarnation_nonzero(const uint8 incarnation[16])
@@ -114,6 +117,18 @@ xlog_page_edge_entry_valid(const RfPageVersionEdgeEntryV1 *entry)
 		return entry->before_kind == RF_PAGE_STATE_ROUTED &&
 			entry->result_kind == RF_PAGE_STATE_ROUTED;
 	return false;
+}
+
+bool
+XLogPageVersionImageRequiredV1(uint8 flags, bool do_page_writes,
+							  XLogRecPtr page_lsn, XLogRecPtr redo_lsn)
+{
+	/* STOP-06 explicit anchor force wins over NO_IMAGE, WILL_INIT and FPW. */
+	if ((flags & REGBUF_FORCE_IMAGE) != 0)
+		return true;
+	if ((flags & REGBUF_NO_IMAGE) != 0 || !do_page_writes)
+		return false;
+	return page_lsn <= redo_lsn;
 }
 
 bool
@@ -206,6 +221,9 @@ typedef struct
 #ifdef USE_PGRAC_CLUSTER
 	bool		force_fpi_applied;	/* PGRAC spec-4.5: this assemble emitted an
 									 * APPLY image for a FORCE-FPI page */
+	bool		apply_image_emitted;
+	bool		page_anchor_key_registered;
+	RfPageAnchorCacheKeyV1 page_anchor_key;
 #endif
 	RelFileLocator rlocator;	/* identifies the relation and block */
 	ForkNumber	forkno;
@@ -416,8 +434,8 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 {
 	registered_buffer *regbuf;
 
-	/* NO_IMAGE doesn't make sense with FORCE_IMAGE */
-	Assert(!((flags & REGBUF_FORCE_IMAGE) && (flags & (REGBUF_NO_IMAGE))));
+	/* STOP-06 deliberately permits FORCE_IMAGE with NO_IMAGE/WILL_INIT;
+	 * explicit anchor force has authoritative precedence during assembly. */
 	Assert(begininsert_called);
 
 	if (block_id >= max_registered_block_id)
@@ -434,6 +452,9 @@ XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags)
 	regbuf->flags = flags;
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
+#ifdef USE_PGRAC_CLUSTER
+	regbuf->page_anchor_key_registered = false;
+#endif
 
 	/*
 	 * Check that this page hasn't already been registered with some other
@@ -487,6 +508,9 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 	regbuf->flags = flags;
 	regbuf->rdata_tail = (XLogRecData *) &regbuf->rdata_head;
 	regbuf->rdata_len = 0;
+#ifdef USE_PGRAC_CLUSTER
+	regbuf->page_anchor_key_registered = false;
+#endif
 
 	/*
 	 * Check that this page hasn't already been registered with some other
@@ -512,6 +536,31 @@ XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator, ForkNumber forknum,
 
 	regbuf->in_use = true;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+void
+XLogRegisterPageVersionAnchorKey(uint8 block_id,
+								const RfPageAnchorCacheKeyV1 *key)
+{
+	registered_buffer *regbuf;
+
+	Assert(begininsert_called);
+	if (block_id >= max_registered_block_id ||
+		block_id >= max_registered_buffers ||
+		!registered_buffers[block_id].in_use)
+		elog(ERROR, "anchor key has no registered WAL block");
+	regbuf = &registered_buffers[block_id];
+	if (!rf_page_anchor_cache_block_matches_v1(key, &regbuf->rlocator,
+										   regbuf->forkno, regbuf->block))
+		elog(ERROR,
+			 "STOP-06 anchor key does not match its registered WAL block");
+	if (regbuf->page_anchor_key_registered)
+		elog(ERROR, "anchor key is already registered for WAL block %u",
+			 block_id);
+	regbuf->page_anchor_key = *key;
+	regbuf->page_anchor_key_registered = true;
+}
+#endif
 
 /*
  * Add data to the WAL record that's being constructed.
@@ -707,6 +756,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 				 * setter must clear on the ORIGINAL buffer after insert.
 				 */
 				PageClearForceFpi(rb->page);
+			if (rb->in_use && rb->page_anchor_key_registered)
+				(void) rf_page_anchor_cache_record_v1(&rb->page_anchor_key,
+					true, rb->apply_image_emitted);
 		}
 	}
 #endif
@@ -806,38 +858,29 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 
 #ifdef USE_PGRAC_CLUSTER
 		regbuf->force_fpi_applied = false;	/* recomputed below each assemble */
+		regbuf->apply_image_emitted = false;
 #endif
 
-		/* Determine if this block needs to be backed up */
-		if (regbuf->flags & REGBUF_FORCE_IMAGE)
-			needs_backup = true;
-		else if (regbuf->flags & REGBUF_NO_IMAGE)
-			needs_backup = false;
-		else if (!doPageWrites)
-			needs_backup = false;
-		else
+		/* Determine if this block needs to be backed up.  STOP-06 explicit
+		 * FORCE_IMAGE wins over NO_IMAGE/WILL_INIT and !doPageWrites. */
 		{
-			/*
-			 * We assume page LSN is first data on *every* page that can be
-			 * passed to XLogInsert, whether it has the standard page layout
-			 * or not.
-			 */
 			XLogRecPtr	page_lsn = PageGetLSN(regbuf->page);
 
-			needs_backup = (page_lsn <= RedoRecPtr);
-			if (!needs_backup)
+			needs_backup = XLogPageVersionImageRequiredV1(regbuf->flags,
+				doPageWrites, page_lsn, RedoRecPtr);
+			if ((regbuf->flags & (REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE)) == 0 &&
+				doPageWrites)
 			{
-				if (*fpw_lsn == InvalidXLogRecPtr || page_lsn < *fpw_lsn)
+				if (!needs_backup &&
+					(*fpw_lsn == InvalidXLogRecPtr || page_lsn < *fpw_lsn))
 					*fpw_lsn = page_lsn;
-			}
 #ifdef USE_PGRAC_CLUSTER
-			/* PGRAC spec-4.5 §3.3d (rule 1): a GCS-installed remote image
-			 * carries the FORCE-FPI bit; OR it in only on this lowest-
-			 * priority branch (NO_IMAGE/WILL_INIT/!doPageWrites keep
-			 * precedence). */
-			if (PageHasForceFpi(regbuf->page))
-				needs_backup = true;
+				/* The older persistent GCS force bit remains a lower-priority
+				 * source than explicit registration flags. */
+				if (PageHasForceFpi(regbuf->page))
+					needs_backup = true;
 #endif
+			}
 		}
 
 		/* Determine if the buffer data needs to included */
@@ -861,6 +904,13 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 		 */
 		include_image = needs_backup || (info & XLR_CHECK_CONSISTENCY) != 0;
 
+#ifdef USE_PGRAC_CLUSTER
+		if (regbuf->page_anchor_key_registered &&
+			!page_version_edge_registered)
+			elog(ERROR,
+				 "STOP-06 anchor key requires a PageVersion edge");
+#endif
+
 		if (page_version_edge_registered)
 		{
 			RfPageVersionEdgeEntryV1 *entry;
@@ -872,6 +922,17 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 				entry->component_ordinal != page_edge_ref_count)
 				elog(ERROR,
 					 "PageVersion edge does not match WAL block order");
+#ifdef USE_PGRAC_CLUSTER
+			if (regbuf->page_anchor_key_registered &&
+				entry->page_class != RF_PAGE_CLASS_ORDINARY)
+				elog(ERROR,
+					 "STOP-06 anchor key requires an ordinary page edge");
+			if (regbuf->page_anchor_key_registered &&
+				!rf_page_anchor_cache_incarnation_matches_v1(
+					&regbuf->page_anchor_key, entry->result_incarnation))
+				elog(ERROR,
+					 "STOP-06 anchor key incarnation does not match its PageVersion edge");
+#endif
 			if (entry->page_class == RF_PAGE_CLASS_ORDINARY)
 			{
 				entry->edge_flags = 0;
@@ -959,6 +1020,8 @@ XLogRecordAssemble(RmgrId rmid, uint8 info,
 			if (needs_backup)
 				bimg.bimg_info |= BKPIMAGE_APPLY;
 #ifdef USE_PGRAC_CLUSTER
+			if (needs_backup)
+				regbuf->apply_image_emitted = true;
 			/* spec-4.5 rule 2: only a real APPLY image earns a clear. */
 			if (needs_backup && PageHasForceFpi(regbuf->page))
 				regbuf->force_fpi_applied = true;

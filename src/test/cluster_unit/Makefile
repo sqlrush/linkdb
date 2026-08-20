@@ -106,6 +106,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_page_edge_reader \
 		test_cluster_rf_route \
 		test_cluster_page_producer \
+		test_cluster_page_anchor_cache \
 		test_cluster_page_stable_base \
         test_cluster_cf_storage \
         test_cluster_cf_enqueue \
@@ -308,6 +309,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_edge,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
@@ -624,6 +626,23 @@ test_cluster_page_producer: test_cluster_page_producer.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
 		$(CLUSTER_PAGE_PRODUCER_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+CLUSTER_PAGE_ANCHOR_CACHE_O = \
+		$(top_builddir)/src/backend/cluster/cluster_page_anchor_cache.o
+
+$(CLUSTER_PAGE_ANCHOR_CACHE_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_page_anchor_cache.c \
+		$(top_srcdir)/src/include/cluster/cluster_page_anchor_cache.h
+	$(MAKE) -C $(top_builddir)/src/backend/cluster cluster_page_anchor_cache.o
+
+test_cluster_page_anchor_cache: test_cluster_page_anchor_cache.c unit_test.h \
+		$(CLUSTER_PAGE_ANCHOR_CACHE_O) $(CLUSTER_PAGE_STABLE_BASE_O) \
+		xlogreader_fs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(CLUSTER_PAGE_ANCHOR_CACHE_O) $(CLUSTER_PAGE_STABLE_BASE_O) \
+		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport_srv.a $(LDFLAGS) \
+		-lssl -lcrypto -llz4 -lzstd -o $@
 
 CLUSTER_PAGE_STABLE_BASE_O = cluster_page_stable_base_test.o
 

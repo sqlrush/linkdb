@@ -51,8 +51,15 @@ extern bool XLogEncodePageVersionEdgeV1(uint8 *output,
 	Size output_capacity, uint64 result_token,
 	const RfPageVersionEdgeEntryV1 *entries, uint8 entry_count,
 	Size *output_size);
+extern bool XLogPageVersionImageRequiredV1(uint8 flags, bool do_page_writes,
+	XLogRecPtr page_lsn, XLogRecPtr redo_lsn);
 extern void XLogRegisterPageVersionEdge(uint64 result_token,
 	const RfPageVersionEdgeEntryV1 *entries, uint8 entry_count);
+#ifdef USE_PGRAC_CLUSTER
+struct RfPageAnchorCacheKeyV1;
+extern void XLogRegisterPageVersionAnchorKey(uint8 block_id,
+	const struct RfPageAnchorCacheKeyV1 *key);
+#endif
 extern void XLogRegisterBuffer(uint8 block_id, Buffer buffer, uint8 flags);
 extern void XLogRegisterBlock(uint8 block_id, RelFileLocator *rlocator,
 							  ForkNumber forknum, BlockNumber blknum, char *page,
