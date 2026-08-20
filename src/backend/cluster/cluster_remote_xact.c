@@ -33,9 +33,12 @@
  */
 #include "postgres.h"
 
+#include "common/cryptohash.h"
+#include "common/sha2.h"
 #include "access/slru.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
 #include "miscadmin.h"
@@ -62,24 +65,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
-/*
- * Entry layout: 16 bytes (8B SCN + 1B status + 7B reserved/zero), 512
- * entries per BLCKSZ page.  Page space: origin (7 bits, CLUSTER_MAX_NODES
- * = 128) << 23 | xid-page (2^32 xids / 512 = 2^23 pages) -- 30 bits, a
- * positive int pageno.
- */
-typedef struct ClusterRemoteXactEntry {
-	SCN commit_scn;	  /* valid iff status == COMMITTED */
-	uint8 status;	  /* ClusterRemoteXactOutcome value */
-	uint8 wrap_valid; /* spec-4.5a G6 (P1 #2): 1 iff `wrap` carries the TT slot
-					   * reuse generation from the commit record's TT delta */
-	uint16 wrap;	  /* TT wrap generation of the committing xact (D4.1 tt_commit.wrap) */
-	uint8 _zero[4];	  /* reserved; zero (entry epoch bits live here for a
-					   * future store that must span full xid wraparound) */
-} ClusterRemoteXactEntry;
-
-StaticAssertDecl(sizeof(ClusterRemoteXactEntry) == CLUSTER_REMOTE_XACT_ENTRY_BYTES,
-				 "remote-xact entry must be 16 bytes");
+#define CLUSTER_REMOTE_XACT_DIR_V2 "pg_xact_remote_v2"
 
 static SlruCtlData ClusterRemoteXactCtlData;
 #define ClusterRemoteXactCtl (&ClusterRemoteXactCtlData)
@@ -173,9 +159,10 @@ cluster_remote_xact_shmem_init(void)
 		 * the first segment write fails with ENOENT on the directory itself
 		 * (SlruInternalWritePage O_CREAT creates the FILE, not the DIR).
 		 */
-		if (MakePGDirectory("pg_xact_remote") < 0 && errno != EEXIST)
+		if (MakePGDirectory(CLUSTER_REMOTE_XACT_DIR_V2) < 0 && errno != EEXIST)
 			ereport(FATAL, (errcode_for_file_access(),
-							errmsg("could not create directory \"pg_xact_remote\": %m")));
+							errmsg("could not create directory \"%s\": %m",
+								   CLUSTER_REMOTE_XACT_DIR_V2)));
 	} else {
 		Assert(found);
 	}
@@ -183,7 +170,7 @@ cluster_remote_xact_shmem_init(void)
 
 	ClusterRemoteXactCtl->PagePrecedes = remote_xact_page_precedes;
 	SimpleLruInit(ClusterRemoteXactCtl, "ClusterRemoteXact", CLUSTER_REMOTE_XACT_BUFFERS, 0,
-				  ctl_lock, "pg_xact_remote", RemoteXactShared->buffer_tranche_id,
+				  ctl_lock, CLUSTER_REMOTE_XACT_DIR_V2, RemoteXactShared->buffer_tranche_id,
 				  SYNC_HANDLER_NONE);
 }
 
@@ -226,39 +213,216 @@ remote_xact_open_page(int origin_node, TransactionId xid, bool create)
 	return SimpleLruReadPage(ClusterRemoteXactCtl, pageno, true, xid);
 }
 
-/*
- * cluster_remote_xact_set -- record one outcome (startup process only).
- */
 static void
-cluster_remote_xact_set(int origin_node, TransactionId xid, ClusterRemoteXactOutcome outcome,
-						SCN commit_scn, bool wrap_valid, uint16 wrap)
+remote_xact_force_durable(int pageno)
 {
-	int slotno;
-	ClusterRemoteXactEntry *entry;
+	FileTag		tag;
+	char		path[MAXPGPATH];
 
 	/*
-	 * R14 (spec-4.11 3b-2): historically startup-only.  Online thread recovery
-	 * adds the recovery-apply bgworker as a legitimate writer, but ONLY inside
-	 * an episode-fenced online-writer scope -- a stray non-startup writer
-	 * outside that scope still fails closed (cluster_remote_xact_writer_allowed
-	 * pins the boundary).  !IsUnderPostmaster (bootstrap/standalone) is admitted
-	 * as before.
+	 * RF-SIDE pending/projection readiness is allowed only after stable
+	 * storage.  This SLRU deliberately uses no deferred checkpoint handler:
+	 * force the exact segment synchronously before returning to the caller.
 	 */
-	Assert(!IsUnderPostmaster
-		   || cluster_remote_xact_writer_allowed(AmStartupProcess(),
-												 remote_xact_online_writer_depth_v));
-	Assert(origin_node >= 0 && origin_node < (1 << 7));
+	SimpleLruWriteAll(ClusterRemoteXactCtl, true);
+	MemSet(&tag, 0, sizeof(tag));
+	tag.segno = (uint32) (pageno / SLRU_PAGES_PER_SEGMENT);
+	if (SlruSyncFileTag(ClusterRemoteXactCtl, &tag, path) != 0)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not synchronize remote transaction segment \"%s\": %m",
+						path)));
+	fsync_fname(CLUSTER_REMOTE_XACT_DIR_V2, true);
+}
 
+static ClusterRemoteXactMutationV2
+remote_xact_mutation_from_transition(ClusterRemoteXactEntryTransitionV2 transition)
+{
+	switch (transition)
+	{
+		case CLUSTER_REMOTE_XACT_ENTRY_WRITE:
+			return CLUSTER_REMOTE_XACT_MUTATION_STORED;
+		case CLUSTER_REMOTE_XACT_ENTRY_NOOP:
+			return CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED;
+		case CLUSTER_REMOTE_XACT_ENTRY_CONFLICT:
+			return CLUSTER_REMOTE_XACT_MUTATION_CONFLICT;
+		case CLUSTER_REMOTE_XACT_ENTRY_INVALID:
+		default:
+			return CLUSTER_REMOTE_XACT_MUTATION_INVALID;
+	}
+}
+
+bool
+cluster_remote_xact_prepare_digest_v2(
+	uint64 system_identifier, int origin_node, TransactionId xid,
+	Oid database, const char *gid,
+	uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
+{
+	static const uint8 domain[] = "PGRAC-RF-SIDE-PREPARE-V2";
+	uint8		identity[20];
+	uint8		sha256[PG_SHA256_DIGEST_LENGTH];
+	size_t		gid_len;
+	pg_cryptohash_ctx *context;
+	bool		ok;
+	int		i;
+
+	if (system_identifier == 0 || origin_node < 0 || origin_node >= (1 << 7) ||
+		!TransactionIdIsNormal(xid) || !OidIsValid(database) ||
+		gid == NULL || digest == NULL)
+		return false;
+	gid_len = strnlen(gid, GIDSIZE);
+	if (gid_len == 0 || gid_len >= GIDSIZE)
+		return false;
+
+	MemSet(identity, 0, sizeof(identity));
+	for (i = 0; i < 8; i++)
+		identity[i] = (uint8) (system_identifier >> (56 - i * 8));
+	identity[8] = (uint8) origin_node;
+	identity[9] = CLUSTER_REMOTE_XACT_ENTRY_FORMAT_V2;
+	identity[10] = (uint8) ((uint32) xid >> 24);
+	identity[11] = (uint8) ((uint32) xid >> 16);
+	identity[12] = (uint8) ((uint32) xid >> 8);
+	identity[13] = (uint8) xid;
+	identity[14] = (uint8) ((uint32) database >> 24);
+	identity[15] = (uint8) ((uint32) database >> 16);
+	identity[16] = (uint8) ((uint32) database >> 8);
+	identity[17] = (uint8) database;
+	identity[18] = (uint8) (gid_len >> 8);
+	identity[19] = (uint8) gid_len;
+
+	context = pg_cryptohash_create(PG_SHA256);
+	if (context == NULL)
+		return false;
+	ok = pg_cryptohash_init(context) >= 0 &&
+		pg_cryptohash_update(context, domain, sizeof(domain) - 1) >= 0 &&
+		pg_cryptohash_update(context, identity, sizeof(identity)) >= 0 &&
+		pg_cryptohash_update(context, (const uint8 *) gid, gid_len) >= 0 &&
+		pg_cryptohash_final(context, sha256, sizeof(sha256)) >= 0;
+	pg_cryptohash_free(context);
+	if (ok)
+		memcpy(digest, sha256, CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES);
+	return ok;
+}
+
+ClusterRemoteXactMutationV2
+cluster_remote_xact_store_prepared_v2(
+	int origin_node, TransactionId xid,
+	const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
+{
+	ClusterRemoteXactEntryV2 *entry;
+	ClusterRemoteXactEntryV2 next;
+	ClusterRemoteXactEntryTransitionV2 transition;
+	int		pageno;
+	int		slotno;
+
+	if (RemoteXactShared == NULL || origin_node < 0 || origin_node >= (1 << 7) ||
+		!TransactionIdIsNormal(xid) || digest == NULL)
+		return CLUSTER_REMOTE_XACT_MUTATION_INVALID;
+	Assert(!IsUnderPostmaster ||
+		   cluster_remote_xact_writer_allowed(AmStartupProcess(),
+										  remote_xact_online_writer_depth_v));
+	pageno = cluster_remote_xact_pageno(origin_node, xid);
 	slotno = remote_xact_open_page(origin_node, xid, true);
-	entry = (ClusterRemoteXactEntry *)(ClusterRemoteXactCtl->shared->page_buffer[slotno]
-									   + (Size)cluster_remote_xact_entryno(xid)
-											 * sizeof(ClusterRemoteXactEntry));
-	entry->commit_scn = (outcome == CLUSTER_REMOTE_XACT_COMMITTED) ? commit_scn : InvalidScn;
-	entry->status = (uint8)outcome;
-	entry->wrap_valid = (outcome == CLUSTER_REMOTE_XACT_COMMITTED && wrap_valid) ? 1 : 0;
-	entry->wrap = (uint16)((outcome == CLUSTER_REMOTE_XACT_COMMITTED && wrap_valid) ? wrap : 0);
-	ClusterRemoteXactCtl->shared->page_dirty[slotno] = true;
+	entry = (ClusterRemoteXactEntryV2 *)
+		(ClusterRemoteXactCtl->shared->page_buffer[slotno] +
+		 (Size) cluster_remote_xact_entryno(xid) * sizeof(*entry));
+	transition = cluster_remote_xact_entry_prepare_transition_v2(
+		entry, digest, &next);
+	if (transition == CLUSTER_REMOTE_XACT_ENTRY_WRITE)
+	{
+		*entry = next;
+		ClusterRemoteXactCtl->shared->page_dirty[slotno] = true;
+	}
 	LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+	if (transition == CLUSTER_REMOTE_XACT_ENTRY_WRITE ||
+		transition == CLUSTER_REMOTE_XACT_ENTRY_NOOP)
+		remote_xact_force_durable(pageno);
+	return remote_xact_mutation_from_transition(transition);
+}
+
+ClusterRemoteXactMutationV2
+cluster_remote_xact_store_terminal_v2(
+	int origin_node, TransactionId xid, bool require_prepared,
+	const uint8 expected_prepare_digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES],
+	ClusterRemoteXactOutcome outcome, SCN commit_scn,
+	TimestampTz commit_timestamp, bool wrap_valid, uint16 wrap)
+{
+	ClusterRemoteXactEntryV2 *entry;
+	ClusterRemoteXactEntryV2 candidate;
+	ClusterRemoteXactEntryV2 next;
+	ClusterRemoteXactEntryTransitionV2 transition;
+	int		pageno;
+	int		slotno;
+
+	if (RemoteXactShared == NULL || origin_node < 0 || origin_node >= (1 << 7) ||
+		!TransactionIdIsNormal(xid) ||
+		(require_prepared && expected_prepare_digest == NULL) ||
+		!cluster_remote_xact_entry_encode_terminal_v2(&candidate, outcome,
+			commit_scn, commit_timestamp, wrap_valid, wrap))
+		return CLUSTER_REMOTE_XACT_MUTATION_INVALID;
+	Assert(!IsUnderPostmaster ||
+		   cluster_remote_xact_writer_allowed(AmStartupProcess(),
+										  remote_xact_online_writer_depth_v));
+	pageno = cluster_remote_xact_pageno(origin_node, xid);
+	slotno = remote_xact_open_page(origin_node, xid, true);
+	entry = (ClusterRemoteXactEntryV2 *)
+		(ClusterRemoteXactCtl->shared->page_buffer[slotno] +
+		 (Size) cluster_remote_xact_entryno(xid) * sizeof(*entry));
+	transition = cluster_remote_xact_entry_terminal_transition_v2(
+		entry, require_prepared, expected_prepare_digest, outcome, commit_scn,
+		commit_timestamp, wrap_valid, wrap, &next);
+	if (transition == CLUSTER_REMOTE_XACT_ENTRY_WRITE)
+	{
+		*entry = next;
+		ClusterRemoteXactCtl->shared->page_dirty[slotno] = true;
+	}
+	LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+	if (transition == CLUSTER_REMOTE_XACT_ENTRY_WRITE ||
+		transition == CLUSTER_REMOTE_XACT_ENTRY_NOOP)
+		remote_xact_force_durable(pageno);
+	return remote_xact_mutation_from_transition(transition);
+}
+
+bool
+cluster_remote_xact_pending_matches_v2(
+	int origin_node, TransactionId xid,
+	const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
+{
+	const ClusterRemoteXactEntryV2 *entry;
+	bool		matches;
+	int		slotno;
+
+	if (RemoteXactShared == NULL || origin_node < 0 || origin_node >= (1 << 7) ||
+		!TransactionIdIsNormal(xid) || digest == NULL)
+		return false;
+	slotno = remote_xact_open_page(origin_node, xid, false);
+	if (slotno < 0)
+	{
+		LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+		return false;
+	}
+	entry = (const ClusterRemoteXactEntryV2 *)
+		(ClusterRemoteXactCtl->shared->page_buffer[slotno] +
+		 (Size) cluster_remote_xact_entryno(xid) * sizeof(*entry));
+	matches = cluster_remote_xact_entry_pending_matches_v2(entry, digest);
+	LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+	return matches;
+}
+
+static void
+cluster_remote_xact_require_mutation(ClusterRemoteXactMutationV2 result,
+								 int blocked_elevel, int origin_node,
+								 TransactionId xid, const char *operation)
+{
+	if (result == CLUSTER_REMOTE_XACT_MUTATION_STORED ||
+		result == CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED)
+		return;
+	ereport(blocked_elevel,
+			(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+			 errmsg("merged recovery: conflicting remote transaction %s "
+					"(origin node %d, xid %u)",
+					operation, origin_node, xid),
+			 errdetail("durable transition result=%d", (int) result)));
 }
 
 ClusterRemoteXactOutcome
@@ -437,11 +601,9 @@ cluster_remote_commit_outcome_ex(int origin_node, TransactionId xid, SCN *commit
 								 uint16 *out_wrap, bool *out_wrap_valid)
 {
 	int slotno;
-	const ClusterRemoteXactEntry *entry;
-	ClusterRemoteXactOutcome outcome;
-	SCN scn;
-	uint16 wrap;
-	bool wrap_valid;
+	const ClusterRemoteXactEntryV2 *entry;
+	ClusterRemoteXactEntryV2 stored;
+	ClusterRemoteXactEntryDecodedV2 decoded;
 
 	if (commit_scn != NULL)
 		*commit_scn = InvalidScn;
@@ -462,34 +624,65 @@ cluster_remote_commit_outcome_ex(int origin_node, TransactionId xid, SCN *commit
 		pg_atomic_fetch_add_u64(&RemoteXactShared->outcome_indoubt_count, 1);
 		return CLUSTER_REMOTE_XACT_INDOUBT;
 	}
-	entry = (const ClusterRemoteXactEntry *)(ClusterRemoteXactCtl->shared->page_buffer[slotno]
-											 + (Size)cluster_remote_xact_entryno(xid)
-												   * sizeof(ClusterRemoteXactEntry));
-	outcome = (ClusterRemoteXactOutcome)entry->status;
-	scn = entry->commit_scn;
-	wrap = entry->wrap;
-	wrap_valid = (entry->wrap_valid != 0);
+	entry = (const ClusterRemoteXactEntryV2 *)
+		(ClusterRemoteXactCtl->shared->page_buffer[slotno] +
+		 (Size) cluster_remote_xact_entryno(xid) * sizeof(*entry));
+	stored = *entry;
 	LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
 
-	if (outcome == CLUSTER_REMOTE_XACT_COMMITTED) {
-		if (!SCN_VALID(scn)) {
-			/* A committed entry without an SCN is corrupt -- fail closed. */
-			pg_atomic_fetch_add_u64(&RemoteXactShared->outcome_indoubt_count, 1);
-			return CLUSTER_REMOTE_XACT_INDOUBT;
-		}
+	if (!cluster_remote_xact_entry_decode_terminal_v2(&stored, &decoded))
+	{
+		pg_atomic_fetch_add_u64(&RemoteXactShared->outcome_indoubt_count, 1);
+		return CLUSTER_REMOTE_XACT_INDOUBT;
+	}
+	if (decoded.outcome == CLUSTER_REMOTE_XACT_COMMITTED)
+	{
 		if (commit_scn != NULL)
-			*commit_scn = scn;
+			*commit_scn = decoded.commit_scn;
 		if (out_wrap != NULL)
-			*out_wrap = wrap;
+			*out_wrap = decoded.wrap;
 		if (out_wrap_valid != NULL)
-			*out_wrap_valid = wrap_valid;
+			*out_wrap_valid = decoded.wrap_valid;
 		return CLUSTER_REMOTE_XACT_COMMITTED;
 	}
-	if (outcome == CLUSTER_REMOTE_XACT_ABORTED)
+	if (decoded.outcome == CLUSTER_REMOTE_XACT_ABORTED)
 		return CLUSTER_REMOTE_XACT_ABORTED;
 
 	pg_atomic_fetch_add_u64(&RemoteXactShared->outcome_indoubt_count, 1);
 	return CLUSTER_REMOTE_XACT_INDOUBT;
+}
+
+bool
+cluster_remote_commit_timestamp(int origin_node, TransactionId xid,
+								TimestampTz *commit_timestamp)
+{
+	const ClusterRemoteXactEntryV2 *entry;
+	ClusterRemoteXactEntryV2 stored;
+	ClusterRemoteXactEntryDecodedV2 decoded;
+	int			slotno;
+
+	if (commit_timestamp != NULL)
+		*commit_timestamp = 0;
+	if (RemoteXactShared == NULL || commit_timestamp == NULL ||
+		origin_node < 0 || origin_node >= (1 << 7) ||
+		!TransactionIdIsNormal(xid))
+		return false;
+	slotno = remote_xact_open_page(origin_node, xid, false);
+	if (slotno < 0)
+	{
+		LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+		return false;
+	}
+	entry = (const ClusterRemoteXactEntryV2 *)
+		(ClusterRemoteXactCtl->shared->page_buffer[slotno] +
+		 (Size) cluster_remote_xact_entryno(xid) * sizeof(*entry));
+	stored = *entry;
+	LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+	if (!cluster_remote_xact_entry_decode_terminal_v2(&stored, &decoded) ||
+		decoded.outcome != CLUSTER_REMOTE_XACT_COMMITTED)
+		return false;
+	*commit_timestamp = (TimestampTz) decoded.commit_timestamp;
+	return true;
 }
 
 void
@@ -693,6 +886,8 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		xl_xact_parsed_commit parsed;
 		uint16 commit_wrap = 0;
 		bool commit_wrap_valid;
+		TimestampTz commit_timestamp;
+		ClusterRemoteXactMutationV2 mutation;
 
 		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
 
@@ -755,8 +950,13 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		cluster_scn_recovery_replay_observe(parsed.scn);
 		commit_wrap_valid = cluster_remote_xact_commit_wrap_proof(
 			origin_node, xid, &parsed, blocked_elevel, false, &commit_wrap);
-		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_COMMITTED, parsed.scn,
-								commit_wrap_valid, commit_wrap);
+		commit_timestamp = (parsed.xinfo & XACT_XINFO_HAS_ORIGIN) != 0
+			? parsed.origin_timestamp : parsed.xact_time;
+		mutation = cluster_remote_xact_store_terminal_v2(
+			origin_node, xid, false, NULL, CLUSTER_REMOTE_XACT_COMMITTED,
+			parsed.scn, commit_timestamp, commit_wrap_valid, commit_wrap);
+		cluster_remote_xact_require_mutation(mutation, blocked_elevel,
+			origin_node, xid, "commit projection");
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_commit_count, 1);
 
 		/* spec-6.14 D9: execute the record's side effects (outcome first,
@@ -773,6 +973,9 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		xl_xact_parsed_commit parsed;
 		uint16 commit_wrap = 0;
 		bool commit_wrap_valid;
+		uint8 prepared_digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+		TimestampTz commit_timestamp;
+		ClusterRemoteXactMutationV2 mutation;
 
 		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
 		xid = parsed.twophase_xid;
@@ -813,12 +1016,25 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 							origin_node, xid),
 					 errhint("spec-1.18 stamps every prepared commit record; a missing SCN "
 							 "means a pre-cluster WAL stream, which cannot be merged.")));
+		if (!cluster_remote_xact_prepare_digest_v2(
+				GetSystemIdentifier(), origin_node, xid, parsed.dbId,
+				parsed.twophase_gid, prepared_digest))
+			ereport(blocked_elevel,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("merged recovery: prepared commit lacks exact pending identity "
+							"(origin node %d, xid %u)", origin_node, xid)));
 
 		cluster_scn_recovery_replay_observe(parsed.scn);
 		commit_wrap_valid = cluster_remote_xact_commit_wrap_proof(
 			origin_node, xid, &parsed, blocked_elevel, true, &commit_wrap);
-		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_COMMITTED, parsed.scn,
-								commit_wrap_valid, commit_wrap);
+		commit_timestamp = (parsed.xinfo & XACT_XINFO_HAS_ORIGIN) != 0
+			? parsed.origin_timestamp : parsed.xact_time;
+		mutation = cluster_remote_xact_store_terminal_v2(
+			origin_node, xid, true, prepared_digest,
+			CLUSTER_REMOTE_XACT_COMMITTED, parsed.scn, commit_timestamp,
+			commit_wrap_valid, commit_wrap);
+		cluster_remote_xact_require_mutation(mutation, blocked_elevel,
+			origin_node, xid, "prepared commit");
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_commit_count, 1);
 
 		/* spec-6.14 D9: see the plain-commit arm. */
@@ -832,6 +1048,7 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 	case XLOG_XACT_ABORT: {
 		xl_xact_abort *xlrec = (xl_xact_abort *)XLogRecGetData(record);
 		xl_xact_parsed_abort parsed;
+		ClusterRemoteXactMutationV2 mutation;
 
 		ParseAbortRecord(XLogRecGetInfo(record), xlrec, &parsed);
 		if (cluster_shared_catalog ? cluster_remote_xact_terminal_blocked_shared_catalog(
@@ -847,8 +1064,11 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 
 		/* Mirror xact_redo_abort's Lamport observe (see the commit arm). */
 		cluster_scn_recovery_replay_observe(parsed.scn);
-		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, false,
-								0);
+		mutation = cluster_remote_xact_store_terminal_v2(
+			origin_node, xid, false, NULL, CLUSTER_REMOTE_XACT_ABORTED,
+			InvalidScn, 0, false, 0);
+		cluster_remote_xact_require_mutation(mutation, blocked_elevel,
+			origin_node, xid, "abort projection");
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_abort_count, 1);
 
 		/* spec-6.14 D9: an aborted xact's delete-on-abort relfiles (files it
@@ -863,6 +1083,8 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 	case XLOG_XACT_ABORT_PREPARED: {
 		xl_xact_abort *xlrec = (xl_xact_abort *)XLogRecGetData(record);
 		xl_xact_parsed_abort parsed;
+		uint8 prepared_digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+		ClusterRemoteXactMutationV2 mutation;
 
 		ParseAbortRecord(XLogRecGetInfo(record), xlrec, &parsed);
 		xid = parsed.twophase_xid;
@@ -883,10 +1105,20 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 							"side effect (origin node %d, xid %u)",
 							origin_node, xid),
 					 errhint("Recover with cluster.merged_recovery=off.")));
+		if (!cluster_remote_xact_prepare_digest_v2(
+				GetSystemIdentifier(), origin_node, xid, parsed.dbId,
+				parsed.twophase_gid, prepared_digest))
+			ereport(blocked_elevel,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("merged recovery: prepared abort lacks exact pending identity "
+							"(origin node %d, xid %u)", origin_node, xid)));
 
 		cluster_scn_recovery_replay_observe(parsed.scn);
-		cluster_remote_xact_set(origin_node, xid, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, false,
-								0);
+		mutation = cluster_remote_xact_store_terminal_v2(
+			origin_node, xid, true, prepared_digest,
+			CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0);
+		cluster_remote_xact_require_mutation(mutation, blocked_elevel,
+			origin_node, xid, "prepared abort");
 		pg_atomic_fetch_add_u64(&RemoteXactShared->diverted_abort_count, 1);
 
 		/* spec-6.14 D9: see the plain-abort arm. */
@@ -899,6 +1131,8 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 	case XLOG_XACT_PREPARE: {
 		xl_xact_prepare *xlrec = (xl_xact_prepare *)XLogRecGetData(record);
 		xl_xact_parsed_prepare parsed;
+		uint8 prepared_digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+		ClusterRemoteXactMutationV2 mutation;
 
 		ParsePrepareRecord(XLogRecGetInfo(record), xlrec, &parsed);
 		xid = parsed.twophase_xid;
@@ -923,14 +1157,18 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 							 "transactions; unresolved prepares remain in-doubt until their "
 							 "COMMIT PREPARED or ABORT PREPARED record is replayed.")));
 
-		/*
-		 * Never call PrepareRedoAdd for a foreign stream: that would expose a
-		 * peer's prepared xact in this node's local pg_prepared_xacts namespace
-		 * and alias raw xids.  PREPARE is not a durable outcome, either: until a
-		 * matching COMMIT/ABORT PREPARED record is replayed, the remote xid must
-		 * remain INDOUBT so tuple visibility fails closed instead of inventing an
-		 * ABORTED verdict for an in-doubt prepared transaction.
-		 */
+		/* Never expose a peer xid through local pg_prepared_xacts. */
+		if (!cluster_remote_xact_prepare_digest_v2(
+				GetSystemIdentifier(), origin_node, xid, parsed.dbId,
+				parsed.twophase_gid, prepared_digest))
+			ereport(blocked_elevel,
+					(errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),
+					 errmsg("merged recovery: foreign prepare lacks exact durable identity "
+							"(origin node %d, xid %u)", origin_node, xid)));
+		mutation = cluster_remote_xact_store_prepared_v2(
+			origin_node, xid, prepared_digest);
+		cluster_remote_xact_require_mutation(mutation, blocked_elevel,
+			origin_node, xid, "prepare pending state");
 		break;
 	}
 	default:

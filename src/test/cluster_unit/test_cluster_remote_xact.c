@@ -66,8 +66,8 @@ UT_DEFINE_GLOBALS();
 
 UT_TEST(test_remote_xact_entry_width)
 {
-	UT_ASSERT_EQ(CLUSTER_REMOTE_XACT_ENTRY_BYTES, 16);
-	UT_ASSERT_EQ((int)CLUSTER_REMOTE_XACT_ENTRIES_PER_PAGE, BLCKSZ / 16);
+	UT_ASSERT_EQ(CLUSTER_REMOTE_XACT_ENTRY_BYTES, 32);
+	UT_ASSERT_EQ((int)CLUSTER_REMOTE_XACT_ENTRIES_PER_PAGE, BLCKSZ / 32);
 }
 
 UT_TEST(test_remote_xact_origin_partition_disjoint)
@@ -95,6 +95,101 @@ UT_TEST(test_remote_xact_origin_partition_disjoint)
 				 (int)(xid % CLUSTER_REMOTE_XACT_ENTRIES_PER_PAGE));
 }
 
+UT_TEST(test_remote_xact_pending_binding_is_byte_exact_and_fail_closed)
+{
+	ClusterRemoteXactEntryV2 entry;
+	uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+	uint8 changed[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+
+	memset(digest, 0x4d, sizeof(digest));
+	memcpy(changed, digest, sizeof(changed));
+	changed[sizeof(changed) - 1]++;
+	UT_ASSERT(cluster_remote_xact_entry_encode_pending_v2(&entry, digest));
+	UT_ASSERT_EQ(entry.status, CLUSTER_REMOTE_XACT_STORED_PREPARED);
+	UT_ASSERT(cluster_remote_xact_entry_pending_matches_v2(&entry, digest));
+	UT_ASSERT(!cluster_remote_xact_entry_pending_matches_v2(&entry, changed));
+	entry.format_version++;
+	UT_ASSERT(!cluster_remote_xact_entry_pending_matches_v2(&entry, digest));
+}
+
+UT_TEST(test_remote_xact_terminal_codec_carries_commit_ts_and_wrap)
+{
+	ClusterRemoteXactEntryV2 entry;
+	ClusterRemoteXactEntryDecodedV2 decoded;
+
+	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&entry,
+		CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(9123), INT64_C(77112233),
+		true, 17));
+	UT_ASSERT(cluster_remote_xact_entry_decode_terminal_v2(&entry, &decoded));
+	UT_ASSERT_EQ(decoded.outcome, CLUSTER_REMOTE_XACT_COMMITTED);
+	UT_ASSERT_EQ(decoded.commit_scn, UINT64_C(9123));
+	UT_ASSERT_EQ(decoded.commit_timestamp, INT64_C(77112233));
+	UT_ASSERT(decoded.wrap_valid);
+	UT_ASSERT_EQ(decoded.wrap, 17);
+
+	entry.payload[18] = 1;
+	UT_ASSERT(!cluster_remote_xact_entry_decode_terminal_v2(&entry, &decoded));
+	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&entry,
+		CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0));
+	UT_ASSERT(cluster_remote_xact_entry_decode_terminal_v2(&entry, &decoded));
+	UT_ASSERT_EQ(decoded.outcome, CLUSTER_REMOTE_XACT_ABORTED);
+	UT_ASSERT_EQ(decoded.commit_timestamp, 0);
+}
+
+UT_TEST(test_remote_xact_prepare_transition_is_idempotent_and_conflict_closed)
+{
+	ClusterRemoteXactEntryV2 current;
+	ClusterRemoteXactEntryV2 next;
+	uint8 first[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+	uint8 second[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+
+	memset(&current, 0, sizeof(current));
+	memset(first, 0x31, sizeof(first));
+	memset(second, 0x32, sizeof(second));
+	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(
+		&current, first, &next), CLUSTER_REMOTE_XACT_ENTRY_WRITE);
+	current = next;
+	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(
+		&current, first, &next), CLUSTER_REMOTE_XACT_ENTRY_NOOP);
+	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(
+		&current, second, &next), CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&current,
+		CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0));
+	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(
+		&current, first, &next), CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+}
+
+UT_TEST(test_remote_xact_prepared_terminal_requires_pending_or_exact_result)
+{
+	ClusterRemoteXactEntryV2 current;
+	ClusterRemoteXactEntryV2 next;
+	uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+	uint8 wrong_digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+
+	memset(&current, 0, sizeof(current));
+	memset(digest, 0x77, sizeof(digest));
+	memset(wrong_digest, 0x78, sizeof(wrong_digest));
+	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
+		&current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
+		INT64_C(1234), true, 7, &next),
+		CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+	UT_ASSERT(cluster_remote_xact_entry_encode_pending_v2(&current, digest));
+	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
+		&current, true, wrong_digest, CLUSTER_REMOTE_XACT_COMMITTED,
+		UINT64_C(91), INT64_C(1234), true, 7, &next),
+		CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
+		&current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
+		INT64_C(1234), true, 7, &next), CLUSTER_REMOTE_XACT_ENTRY_WRITE);
+	current = next;
+	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
+		&current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
+		INT64_C(1234), true, 7, &next), CLUSTER_REMOTE_XACT_ENTRY_NOOP);
+	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
+		&current, true, digest, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0,
+		false, 0, &next), CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+}
+
 UT_TEST(test_remote_xact_origin_no_cross_partition_overlap)
 {
 	/*
@@ -102,7 +197,7 @@ UT_TEST(test_remote_xact_origin_no_cross_partition_overlap)
 	 * page of origin N+1 -- otherwise a high xid of one origin could fall
 	 * into the next origin's partition.  Highest xid-page index is
 	 * (2^32 - 1) / ENTRIES_PER_PAGE; with ENTRIES_PER_PAGE = 512 that is
-	 * 2^23 - 1, exactly one less than the origin stride (1 << 23).
+	 * 2^24 - 1, exactly one less than the origin stride (1 << 24).
 	 */
 	int max_xid_page = (int)(0xFFFFFFFFU / CLUSTER_REMOTE_XACT_ENTRIES_PER_PAGE);
 	int origin_stride = 1 << CLUSTER_REMOTE_XACT_ORIGIN_PAGE_SHIFT;
@@ -262,10 +357,14 @@ UT_TEST(test_remote_xact_writer_denied_outside_scope)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(18);
 	UT_RUN(test_remote_xact_entry_width);
 	UT_RUN(test_remote_xact_origin_partition_disjoint);
 	UT_RUN(test_remote_xact_origin_no_cross_partition_overlap);
+	UT_RUN(test_remote_xact_pending_binding_is_byte_exact_and_fail_closed);
+	UT_RUN(test_remote_xact_terminal_codec_carries_commit_ts_and_wrap);
+	UT_RUN(test_remote_xact_prepare_transition_is_idempotent_and_conflict_closed);
+	UT_RUN(test_remote_xact_prepared_terminal_requires_pending_or_exact_result);
 	UT_RUN(test_remote_xact_pure_outcome_allowed);
 	UT_RUN(test_remote_xact_side_effects_blocked);
 	UT_RUN(test_remote_xact_prepared_commit_allows_2pc_lock_bits);
