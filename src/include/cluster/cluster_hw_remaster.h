@@ -162,6 +162,16 @@ extern ClusterHwRemasterResult cluster_hw_remaster_rebuild_origin(int dead_node_
 extern void cluster_hw_remaster_worker_main(Datum main_arg);
 
 /*
+ * cluster_hw_remaster_worker_active -- Stage 8 contract (verified implementation):
+ * true while THIS process is the hw-remaster rebuild bgworker inside its
+ * armed window.  Lets the recovery lock-admission gate admit the worker's
+ * CF(S) canonical-root STRONG read during the survivor's GRD recovery
+ * episode (serving readiness not current), without touching the frozen
+ * StartupProcess-only recovery admission for any other process.
+ */
+extern bool cluster_hw_remaster_worker_active(void);
+
+/*
  * cluster_hw_remaster_launch_workers -- the GRD reconfig FSM launch side (S5d):
  * for each dead origin this episode whose shards the HW authority must rebuild,
  * register one per-episode rebuild worker (idempotent via the launched-episode

@@ -114,6 +114,15 @@ errstart(int e, const char *d pg_attribute_unused())
 	phase4_last_elevel = e;
 	return phase4_capture_fatal;
 }
+
+/* Stage 8 contract (verified implementation): worker identity for the recovery
+ * lock-admission gate — this binary never runs inside the hw-remaster
+ * bgworker, so the worker window is always closed here. */
+bool
+cluster_hw_remaster_worker_active(void)
+{
+	return false;
+}
 bool
 errstart_cold(int e, const char *d pg_attribute_unused())
 {
@@ -260,7 +269,10 @@ void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr)
 {
-	static char fake_shmem[4096];
+	/* AD-023 A1: the phase state now embeds pg_atomic_uint32 words; the
+	 * fake region must be maximally aligned so the atomic loads/stores
+	 * never touch an under-aligned address (arm64 traps on that). */
+	static char fake_shmem[4096] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 
 	memset(fake_shmem, 0, sizeof(fake_shmem));
 	if (foundPtr != NULL)
@@ -310,7 +322,7 @@ cluster_write_fence_startup_self_check(void)
 	return false;
 }
 
-static char phase4_events[32];
+static char phase4_events[512];
 static int phase4_event_count = 0;
 static bool phase4_test_in_quorum = true;
 static int phase4_quorum_check_calls = 0;
@@ -332,6 +344,15 @@ static int phase_test_lms_start_calls = 0;
 static uint8 phase_test_formation_epoch = 1;
 static bool phase_test_expire_formation_during_lms = false;
 static bool phase_test_formation_expired = false;
+/* RF-ROOT P6 (L4/L5 wiring): steady-state defaults for the membership /
+ * reconfig / GRD accessor stubs added below. */
+static bool phase_test_membership_member = true;
+static bool phase_test_self_join_admitted = false;
+static uint64 phase_test_episode_epoch = 0;
+static bool phase_test_join_remaster = false;
+/* RF-ROOT P6 (contract-verify-early): the phase-3 handler passes DataDir to
+ * the verify stub; the pure unit harness has no data directory. */
+char *DataDir = NULL;
 
 static void
 record_phase4_event(char event)
@@ -583,6 +604,68 @@ cluster_grd_serving_authority_rebind_lmon(
 		&& lms_generation == phase_test_lms_generation;
 }
 
+/* RF-ROOT P6 (L5 leaver serving rebind): cluster_startup_phase.o references
+ * the leaver-side GRD rebind; the pure unit pins it to the same authority
+ * gate as the LMON rebind above. */
+bool
+cluster_grd_serving_authority_rebind_leaver(
+	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
+	uint64 lms_generation)
+{
+	return phase_test_grd_authority_ok && formation != NULL
+		&& formation->reserved[0] == phase_test_formation_epoch
+		&& boot_incarnation == 11
+		&& lms_generation == phase_test_lms_generation;
+}
+
+/* RF-ROOT P6 (L4/L5 wiring): unit stubs for the membership / reconfig / GRD
+ * accessors the startup-phase predicates consult.  Deterministic, mirroring
+ * the production semantics in the pure unit's single-process harness. */
+bool
+cluster_membership_is_member(int32 node_id pg_attribute_unused())
+{
+	return phase_test_membership_member;
+}
+
+bool
+cluster_reconfig_self_join_admitted(void)
+{
+	return phase_test_self_join_admitted;
+}
+
+uint64
+cluster_grd_recovery_episode_epoch_value(void)
+{
+	return phase_test_episode_epoch;
+}
+
+bool
+cluster_grd_join_remaster_in_progress(void)
+{
+	return phase_test_join_remaster;
+}
+
+/* RF-ROOT P6 (contract-verify-early + THREAD_OPEN wiring): unit stubs for the
+ * phase-3 handler's new collaborators.  Deliberate no-ops — the pure unit
+ * harness has no DataDir/control-root/epoch subsystem, and the phase4 event-
+ * sequence assertions above are exact strings. */
+void
+cluster_cf_phase2_verify_or_fail(const char *datadir pg_attribute_unused())
+{
+}
+
+bool
+cluster_control_root_thread_open_publish(uint64 boot_incarnation pg_attribute_unused())
+{
+	return false;
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return phase_test_formation_epoch;
+}
+
 /* spec-2.18 Sprint A stubs. */
 int
 cluster_lms_start(void)
@@ -828,8 +911,15 @@ UT_TEST(test_rf_a1_no_pgproc_phase_reads_never_block)
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
 				 (int)CLUSTER_AUTHORITY_OFF);
 	UT_ASSERT(!cluster_authority_readiness_managed());
+	/*
+	 * AD-023 A1 (lock-free branch): the three hot phase-state words are
+	 * read through pg_atomic and never take the LWLock at all, so a
+	 * no-PGPROC caller cannot block and cannot be starved by the
+	 * per-grant serving gates; the conditional-acquire discipline only
+	 * remains for the large binding copy.
+	 */
 	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 0);
-	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 3);
+	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 0);
 
 	phase_lwlock_conditional_result = true;
 	phase_lwlock_blocking_calls = 0;
@@ -837,7 +927,7 @@ UT_TEST(test_rf_a1_no_pgproc_phase_reads_never_block)
 	UT_ASSERT_EQ((int)cluster_current_phase(),
 				 (int)CLUSTER_PHASE_PRE_INIT);
 	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 0);
-	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 1);
+	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 0);
 
 	memset(&fake_proc, 0, sizeof(fake_proc));
 	MyProc = &fake_proc;
@@ -845,7 +935,7 @@ UT_TEST(test_rf_a1_no_pgproc_phase_reads_never_block)
 	phase_lwlock_conditional_calls = 0;
 	UT_ASSERT_EQ((int)cluster_current_phase(),
 				 (int)CLUSTER_PHASE_PRE_INIT);
-	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 1);
+	UT_ASSERT_EQ(phase_lwlock_blocking_calls, 0);
 	UT_ASSERT_EQ(phase_lwlock_conditional_calls, 0);
 	MyProc = NULL;
 }
@@ -943,21 +1033,79 @@ UT_TEST(test_rf_a1_readiness_is_monotone_and_generation_bound)
 	UT_ASSERT(cluster_authority_readiness_managed());
 }
 
+UT_TEST(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero)
+{
+	ClusterFenceAuthorityProof authority;
+	ClusterFormationSnapshotV1 formation;
+
+	reset_phase_service_fixture(true);
+	/* The preseal gates require the aux services READY (the full startup
+	 * sequence normally publishes these). */
+	phase_test_cssd_status = CLUSTER_CSSD_READY;
+	phase_test_qvotec_status = CLUSTER_QVOTEC_READY;
+	/* Strict forward transitions only (prev + 1 == target). */
+	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
+	cluster_advance_phase(CLUSTER_PHASE_1_CLUSTER);
+	cluster_advance_phase(CLUSTER_PHASE_2_LOCK);
+	cluster_advance_phase(CLUSTER_PHASE_3_RECOVERY);
+
+	/* begin(): STARTING binding with lms_generation = 0 — the postmaster's
+	 * mid-bind window (the LMS process does not exist yet, so the live
+	 * generation is bound one loop iteration later). */
+	memset(&authority, 0, sizeof(authority));
+	memset(&formation, 0, sizeof(formation));
+	formation.membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	formation.membership.last_admitted_incarnation[0] = 11;
+	formation.reserved[0] = phase_test_formation_epoch;
+	UT_ASSERT(cluster_authority_readiness_begin(1, &authority, &formation));
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_STARTING);
+
+	/* The transport check fails on the unbound generation, but the binding
+	 * is mid-bind, NOT stale: the stale-clear is gated on
+	 * lms_generation != 0 (STOP-01 contract), so a peer DONE ingress
+	 * during the window cannot destroy the STARTING binding. */
+	UT_ASSERT(!cluster_recovery_transport_is_current());
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_STARTING);
+
+	/* Once the loop binds the generation, the same check passes... */
+	UT_ASSERT(cluster_authority_readiness_bind_recovery_generation(
+		phase_test_lms_generation));
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_STARTING);
+
+	/* ... and a BOUND generation whose formation drifted from the live
+	 * formation IS stale: the transport check clears it (fail-closed). */
+	phase_test_classification_current = false;
+	UT_ASSERT(!cluster_recovery_transport_is_current());
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
+	phase_test_classification_current = true;
+}
+
 UT_TEST(test_rf_a1_missing_authoritative_grd_stops_before_recovery)
 {
 	bool caught_fatal = false;
+	int saved_phase3_timeout = cluster_phase3_timeout;
 
 	reset_phase_service_fixture(true);
 	phase_test_grd_authority_ok = false;
+	cluster_phase3_timeout = 1; /* A2 retry loop must fail closed fast */
 	phase4_capture_fatal = true;
 	if (setjmp(phase4_fatal_jump) == 0)
 		cluster_run_startup_sequence();
 	else
 		caught_fatal = true;
 	phase4_capture_fatal = false;
+	cluster_phase3_timeout = saved_phase3_timeout;
 
 	UT_ASSERT(caught_fatal);
-	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrG");
+	/* The A2 barrier retry repeats the formation re-fetch until the
+	 * deadline, so the event stream keeps the phase-3 prefix and adds
+	 * repeated witness/classification/barrier cycles before the FATAL. */
+	UT_ASSERT(strncmp(phase4_events, "CcQqVFXLrG", 10) == 0);
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
 				 (int)CLUSTER_AUTHORITY_OFF);
 }
@@ -1214,6 +1362,7 @@ main(void)
 	UT_RUN(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
 	UT_RUN(test_rf_a1_readiness_is_monotone_and_generation_bound);
+	UT_RUN(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero);
 	UT_RUN(test_rf_a1_missing_authoritative_grd_stops_before_recovery);
 	UT_RUN(test_rf_a1_refreshes_formation_if_proof_expires_during_lms_start);
 	UT_RUN(test_rf_a1_unconfigured_registry_keeps_legacy_phase4_order);

@@ -52,11 +52,14 @@
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"			 /* spec-2.16 D8 newly-dead bitmap diff */
+#include "cluster/cluster_ic_tier1.h"		 /* cluster_ic_tier1_get_peer_fd (RF-ROOT P6 diag) */
 #include "cluster/cluster_epoch.h"			 /* spec-4.6 D1 — accepted epoch reads */
 #include "cluster/cluster_external_fence.h" /* STOP04 rejoin cleanup cut */
+#include "cluster/cluster_clean_leave.h"	 /* RF-ROOT P6: leaver write-refusal gate */
 #include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — reconfig event consume */
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_startup_phase.h" /* RF-ROOT P6 diag — cluster_current_phase */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 — unfreeze gate */
 #include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
 #include "storage/procsignal.h"				 /* spec-4.6 D3 — redeclare broadcast */
@@ -1250,8 +1253,9 @@ cluster_grd_serving_authority_rebind_lmon(
 		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id)
 			   != formation->applied.event_id
 		|| pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch)
-			   != epoch)
+			   != epoch) {
 		return false;
+	}
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		bool formation_member
@@ -1284,10 +1288,26 @@ cluster_grd_serving_authority_rebind_lmon(
 		|| pg_atomic_read_u64(
 			   &cluster_grd_state->recovery_event_bitmap_hash) != bitmap_hash
 		|| !cluster_grd_authority_map_is_current(
-			refresh, members_lo, members_hi))
+			refresh, members_lo, members_hi)) {
 		return false;
+	}
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (!cluster_grd_authority_member(members_lo, members_hi, i))
+			continue;
+		/*
+		 * RF-ROOT P6 (clean-leave serving rebind):  the applied event's dead
+		 * bitmap names this episode's departed set.  A clean-departed node
+		 * stays a dormant MEMBER (§3.7: the declared set is static) yet can
+		 * never announce a re-declare DONE for the departure that removed it
+		 * — mirror the episode's own P6 skip (the all_done gate skips
+		 * dead-bitmap nodes the same way) or every post-leave serving rebind
+		 * (and with it every CF admission on the survivor) wedges forever.
+		 * CL-I2 guarantees the departed node holds zero GES/PCM references,
+		 * so its missing DONE is provably vacuous.  For FAIL_STOP the crashed
+		 * node is not an authority member, so this skip never fires and the
+		 * failure-driven path is unchanged.
+		 */
+		if ((formation->applied.dead_bitmap[i / 8] >> (i % 8)) & 1)
 			continue;
 		/* A JOIN recipient held no pre-episode grants to re-declare; the
 		 * ordinary P6 gate deliberately excludes it.  Every survivor still
@@ -1297,13 +1317,145 @@ cluster_grd_serving_authority_rebind_lmon(
 			 || pg_atomic_read_u64(
 					&cluster_grd_state->recovery_done_bitmap_hash[i])
 					!= bitmap_hash)
-			&& !join_fence_is_recipient_for(i, epoch))
+			&& !join_fence_is_recipient_for(i, epoch)) {
 			return false;
+		}
 	}
 
 	/* Publish with the validity words cleared.  Readers that race this update
 	 * can only observe false; boot/LMS become visible again after every bound
 	 * field and synthetic authority-DONE slot is complete. */
+	grd_recovery_authority_clear_seal();
+	pg_write_barrier();
+	pg_atomic_write_u64(
+		&cluster_grd_state->recovery_authority_formation_epoch, epoch);
+	pg_atomic_write_u64(
+		&cluster_grd_state->recovery_authority_bitmap_hash, bitmap_hash);
+	pg_atomic_write_u64(
+		&cluster_grd_state->recovery_authority_members[0], members_lo);
+	pg_atomic_write_u64(
+		&cluster_grd_state->recovery_authority_members[1], members_hi);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		bool member = cluster_grd_authority_member(members_lo, members_hi, i);
+
+		pg_atomic_write_u64(
+			&cluster_grd_state->recovery_authority_done_epoch[i],
+			member ? epoch : 0);
+		pg_atomic_write_u64(
+			&cluster_grd_state->recovery_authority_done_hash[i],
+			member ? bitmap_hash : 0);
+	}
+	pg_atomic_write_u64(
+		&cluster_grd_state->recovery_authority_master_refresh, refresh);
+	pg_write_barrier();
+	pg_atomic_write_u64(
+		&cluster_grd_state->recovery_authority_boot_incarnation,
+		boot_incarnation);
+	pg_atomic_write_u64(
+		&cluster_grd_state->recovery_authority_lms_generation,
+		lms_generation);
+
+	if (!cluster_grd_recovery_authority_is_current(
+			boot_incarnation, lms_generation)) {
+		grd_recovery_authority_clear_seal();
+		return false;
+	}
+	return true;
+}
+
+/*
+ * cluster_grd_serving_authority_rebind_leaver -- RF-ROOT P6 (L5 shutdown
+ * handoff): the committed LEAVER's serving rebind.
+ *
+ *	The survivor-side rebind above is gated on the ordinary P0-P7 episode
+ *	closing — but the departed node NEVER arms a recovery episode for the
+ *	departure that removed itself (its drain was cooperative and complete,
+ *	CL-I2 zero leftover, so there is nothing to rebuild or re-declare).  Its
+ *	serving binding still went stale (the CLEAN_LEAVE event moved the
+ *	formation), and the leaver's shutdown checkpoint + THREAD_CLEAN_CLOSE CF
+ *	acquires need the ordinary serving admission.  This rebind re-stamps the
+ *	authority seal from the leaver's OWN applied CLEAN_LEAVE evidence — no
+ *	episode gates, no event-hash gate (no episode ever stamped one), no peer
+ *	DONE keys (the survivors' DONE is irrelevant to a node that already
+ *	drained and is about to exit).  Fail-closed on everything that still
+ *	must hold: quorum, incarnation, LMS generation, membership/admission,
+ *	and a current, NORMAL-shard master map.
+ */
+bool
+cluster_grd_serving_authority_rebind_leaver(
+	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
+	uint64 lms_generation)
+{
+	uint64 bitmap_hash;
+	uint64 epoch;
+	uint64 members_lo = 0;
+	uint64 members_hi = 0;
+	uint64 refresh;
+	int i;
+
+	if (formation == NULL || boot_incarnation == 0 || lms_generation == 0
+		|| cluster_grd_state == NULL || cluster_grd_entry_htab == NULL
+		|| !cluster_qvotec_in_quorum()
+		|| cluster_qvotec_get_self_incarnation() != boot_incarnation
+		|| cluster_lms_get_lms_restart_generation() != lms_generation
+		|| !cluster_membership_is_member(cluster_node_id)
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   != boot_incarnation) {
+		return false;
+	}
+
+	/*
+	 * Only the committed leaver re-binds this way.  Evidence = THIS node's
+	 * own clean-leave state + the settled epoch — NOT the applied reconfig
+	 * event:  AD-023 §9.2.3 mirrors to the leaver too (a node never applies
+	 * an event whose dead bitmap contains itself), so the leaver's applied
+	 * event is empty (kind=NONE, new_epoch=0) while its local epoch already
+	 * advanced via the epoch-observe path.  The write-refusal flag is on
+	 * from REQUESTED through COMMITTED, exactly the committed shutdown
+	 * window this rebind serves.
+	 */
+	if (!cluster_clean_leave_node_refuses_writes()
+		|| formation->local_epoch == 0
+		|| formation->local_epoch != cluster_epoch_get_current()) {
+		return false;
+	}
+	epoch = formation->local_epoch;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		bool formation_member
+			= formation->membership.membership_state[i]
+			  == CLUSTER_MEMBER_MEMBER;
+
+		if (formation_member
+			&& (cluster_conf_lookup_node(i) == NULL
+				|| !cluster_membership_is_member(i)))
+			return false;
+		if (!formation_member && cluster_conf_lookup_node(i) != NULL
+			&& cluster_membership_is_member(i))
+			return false;
+		if (!formation_member)
+			continue;
+		if (i < 64)
+			members_lo |= UINT64_C(1) << i;
+		else
+			members_hi |= UINT64_C(1) << (i - 64);
+	}
+	if (!cluster_grd_authority_member(
+			members_lo, members_hi, cluster_node_id))
+		return false;
+
+	refresh = pg_atomic_read_u64(
+		&cluster_grd_state->master_map_refresh_count);
+	bitmap_hash = cluster_grd_dead_bitmap_hash(
+		formation->applied.dead_bitmap);
+	if (refresh == 0 || bitmap_hash == 0
+		|| !cluster_grd_authority_map_is_current(
+			refresh, members_lo, members_hi)) {
+		return false;
+	}
+
+	/* Publish with the validity words cleared (same discipline as the
+	 * survivor rebind above). */
 	grd_recovery_authority_clear_seal();
 	pg_write_barrier();
 	pg_atomic_write_u64(
@@ -2459,6 +2611,11 @@ grd_recovery_broadcast_done(uint64 epoch)
 }
 
 /* REDECLARE_DONE receiver (cluster_ges.c inbound handler). */
+/* Process-local once-gate for the symmetric done-key echo (回正清单 P1#4):
+ * one echo per exact {epoch, dead_bitmap_hash} composite per process. */
+static uint64 grd_recovery_done_echo_epoch = 0;
+static uint64 grd_recovery_done_echo_hash = 0;
+
 void
 cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap_hash)
 {
@@ -2536,9 +2693,74 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap
 	}
 
 	episode_bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
+
+	/*
+	 * RF-ROOT P6 / crash-rejoin (barrier done-key race, companion to the
+	 * AD-023 A2 barrier retry in cluster_startup_phase.c): the rejoining
+	 * node's phase-3 recovery-authority barrier all_done requires the
+	 * survivor's done key to arrive AFTER the joiner's request is published
+	 * (the authority-axis gate above).  The survivor only broadcasts its
+	 * done key while its own request is pending; once it terminalizes (or
+	 * its episode returns to IDLE) the broadcast stops, and a late joiner
+	 * request can never converge.  Reply symmetrically: when the peer's
+	 * done key exactly equals this node's own completed barrier — either
+	 * the FSM barrier (recovery_done_epoch / recovery_done_bitmap_hash for
+	 * self, written when the episode completed) or the authority composite
+	 * (recovery_authority_done_epoch / _hash for self, stamped by the
+	 * authority tick / serving rebind at the published request composite)
+	 * — re-broadcast the local done key.  The FSM arm alone is not enough:
+	 * a fresh-boot survivor that never ran an FSM episode (concurrent cast
+	 * reform) leaves its FSM self-done at 0, and a clean-leave episode's
+	 * dead-set hash can differ from the rejoiner's pristine composite — in
+	 * both cases the authority self-done is the composite the peer's
+	 * request actually matches (t243 run-31 cast reform: node0's request
+	 * terminaled with its last broadcast suppressed by the 1 Hz floor, then
+	 * silence; node1's same-composite request starved for 63 s).
+	 *
+	 * RF-ROOT P6 (STOP-01 contract): the echo MUST run
+	 * BEFORE the FSM episode-hash gate below — the gate returns early
+	 * whenever the local episode hash is 0 / differs (first boot, cast
+	 * reform, clean-leave legs), which are exactly the scenarios the echo
+	 * exists for; placed after it, the echo was dead code and the rejoiner
+	 * starved on the same composite forever (t243 run-42 bootstrap:
+	 * node0 terminaled at +1 tick with echo=0, node1's done0=0/0 for 70 s).
+	 *
+	 * Echo amplification guard (回正清单 P1#4): each exact {epoch, hash}
+	 * composite may trigger at most ONE echo per process.  A peer that
+	 * keeps re-broadcasting the same key therefore cannot drive an unbounded
+	 * per-frame echo storm; a NEW episode (different composite) re-arms the
+	 * echo exactly once.  This runs in the LMON dispatch context
+	 * (cluster_ges.c), where the shared outbound ring is the same path the
+	 * existing broadcasts use.
+	 */
+	{
+		uint64 fsm_epoch = pg_atomic_read_u64(
+			&cluster_grd_state->recovery_done_epoch[cluster_node_id]);
+		uint64 fsm_hash = pg_atomic_read_u64(
+			&cluster_grd_state->recovery_done_bitmap_hash[cluster_node_id]);
+		uint64 auth_epoch = pg_atomic_read_u64(
+			&cluster_grd_state->recovery_authority_done_epoch[cluster_node_id]);
+		uint64 auth_hash = pg_atomic_read_u64(
+			&cluster_grd_state->recovery_authority_done_hash[cluster_node_id]);
+
+		if ((epoch == fsm_epoch && dead_bitmap_hash == fsm_hash)
+			|| (epoch == auth_epoch && dead_bitmap_hash == auth_hash))
+		{
+			if (epoch != grd_recovery_done_echo_epoch
+				|| dead_bitmap_hash != grd_recovery_done_echo_hash)
+			{
+				grd_recovery_done_echo_epoch = epoch;
+				grd_recovery_done_echo_hash = dead_bitmap_hash;
+				grd_recovery_broadcast_done_key(epoch, dead_bitmap_hash);
+			}
+		}
+	}
+
+	/* Ordinary FSM-axis accounting (spec-4.6a R2): the peer's done key is
+	 * recorded into the episode's hash axis only when it matches THIS
+	 * node's current episode hash — the same composite gate as before. */
 	if (dead_bitmap_hash == 0 || dead_bitmap_hash != episode_bitmap_hash)
 		return;
-
 	pg_atomic_write_u64(&cluster_grd_state->recovery_done_bitmap_hash[node], dead_bitmap_hash);
 }
 
@@ -2596,24 +2818,52 @@ grd_recovery_authority_request_current(uint64 request_generation)
 		&cluster_grd_state->recovery_authority_members[0]);
 	members_hi = pg_atomic_read_u64(
 		&cluster_grd_state->recovery_authority_members[1]);
-	if (boot_incarnation == 0 || lms_generation == 0 || refresh == 0
-		|| cluster_epoch_get_current() != epoch
-		|| cluster_grd_recovery_in_progress()
-		|| cluster_cssd_get_status() != CLUSTER_CSSD_READY
-		|| !cluster_qvotec_in_quorum()
-		|| cluster_qvotec_get_self_incarnation() != boot_incarnation
-		|| cluster_lms_get_lms_restart_generation() != lms_generation
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != boot_incarnation
-		|| !cluster_grd_authority_member(
-			members_lo, members_hi, cluster_node_id)
-		|| !cluster_grd_authority_map_is_current(
-			refresh, members_lo, members_hi))
-		return false;
+	{
+		bool boot_ok = boot_incarnation != 0;
+		bool lmsgen_ok = lms_generation != 0;
+		bool refresh_ok = refresh != 0;
+		bool epoch_ok = cluster_epoch_get_current() == epoch;
+		bool progress_ok = !cluster_grd_recovery_in_progress();
+		bool cssd_ok = cluster_cssd_get_status() == CLUSTER_CSSD_READY;
+		bool quorum_ok = cluster_qvotec_in_quorum();
+		bool inc_ok = cluster_qvotec_get_self_incarnation()
+			== boot_incarnation;
+		bool lms_match_ok = cluster_lms_get_lms_restart_generation()
+			== lms_generation;
+		bool admitted_ok
+			= cluster_membership_get_last_admitted_incarnation(
+				  cluster_node_id)
+			  == boot_incarnation;
+		bool selfmember_ok = cluster_grd_authority_member(
+			members_lo, members_hi, cluster_node_id);
+		bool map_ok = cluster_grd_authority_map_is_current(
+			refresh, members_lo, members_hi);
+
+		if (!(boot_ok && lmsgen_ok && refresh_ok && epoch_ok && progress_ok
+			  && cssd_ok && quorum_ok && inc_ok && lms_match_ok
+			  && admitted_ok && selfmember_ok && map_ok))
+			return false;
+	}
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		bool request_member
 			= cluster_grd_authority_member(members_lo, members_hi, i);
-		bool current_member = cluster_membership_is_member(i);
+		/*
+		 * RF-ROOT P6 (crash-rejoin): the durable admission is the
+		 * membership proof for SELF.  The LMON self-state byte can
+		 * transiently read JOINING while the boot-decided latch is still
+		 * held (the re-declare barrier has not yet rebuilt the join
+		 * view), and requiring the live byte here makes the phase-3
+		 * recovery-authority barrier structurally un-completable on a
+		 * rejoiner:  the barrier's completion stamps the GRD authority
+		 * seal, which the transport gate needs to admit the survivor's
+		 * REDECLARE_DONE key, which the join view needs to lift the
+		 * latch.  The quorum-majority COMMITTED join marker +
+		 * publish-proof (self_join_admitted) closes that cycle.
+		 */
+		bool current_member
+			= cluster_membership_is_member(i)
+			  || (i == cluster_node_id
+				  && cluster_reconfig_self_join_admitted());
 
 		if (request_member
 			&& (cluster_conf_lookup_node(i) == NULL || !current_member))
@@ -2669,7 +2919,9 @@ cluster_grd_recovery_authority_lmon_tick(void)
 		|| pg_atomic_read_u64(
 			   &cluster_grd_state->recovery_authority_terminal_generation)
 			   >= request_generation)
+	{
 		return;
+	}
 	if (!grd_recovery_authority_request_current(request_generation)) {
 		grd_recovery_authority_publish_terminal(
 			request_generation, GRD_RECOVERY_AUTHORITY_TERMINAL_FAILED);
@@ -2708,7 +2960,31 @@ cluster_grd_recovery_authority_lmon_tick(void)
 		pg_atomic_write_u64(
 			&cluster_grd_state->recovery_authority_done_hash[cluster_node_id],
 			bitmap_hash);
-		grd_recovery_broadcast_done_key(epoch, bitmap_hash);
+		/*
+		 * RF-ROOT P6 (STOP-01 contract): 1 Hz floor on the
+		 * done-key re-announce.  The LMON main loop iterates at inbound-frame
+		 * rate (spec-7.2 D1 lazy-duty premise), and a per-iteration broadcast
+		 * combined with a peer's per-iteration reply (the clean-leave
+		 * LEAVE_COMMITTED re-send) forms a self-sustaining frame ping-pong
+		 * that starves the cssd heartbeat path (t243 L5 restore boot: 16k
+		 * frames/s each way, node0 falsely DEAD at +3s, phase-3 broken).
+		 * The local done slots above are stamped every tick (the all_done
+		 * scan reads them); only the wire re-announce is floored — the
+		 * idempotent frame just needs to arrive within the phase-3 deadline,
+		 * which is seconds, so 1 Hz is ample.
+		 */
+		{
+			static TimestampTz last_done_broadcast_at = 0;
+			TimestampTz now_ts = GetCurrentTimestamp();
+
+			if (now_ts == 0
+				|| last_done_broadcast_at == 0
+				|| now_ts - last_done_broadcast_at
+					   >= INT64CONST(1000000)) {
+				grd_recovery_broadcast_done_key(epoch, bitmap_hash);
+				last_done_broadcast_at = now_ts;
+			}
+		}
 	}
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (!cluster_grd_authority_member(members_lo, members_hi, i))
@@ -2763,6 +3039,10 @@ cluster_grd_recovery_authority_barrier_wait(
 	uint64 members_lo = 0;
 	uint64 members_hi = 0;
 	uint64 refresh;
+	uint64 prev_epoch;
+	uint64 prev_hash;
+	uint64 prev_members_lo;
+	uint64 prev_members_hi;
 	int i;
 
 	if (formation == NULL || boot_incarnation == 0 || lms_generation == 0
@@ -2773,13 +3053,29 @@ cluster_grd_recovery_authority_barrier_wait(
 		|| cluster_lms_get_lms_restart_generation() != lms_generation
 		|| !cluster_membership_is_member(cluster_node_id)
 		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != boot_incarnation)
+			   != boot_incarnation) {
 		return false;
+	}
 
 	epoch = formation->local_epoch;
-	if (epoch != formation->applied.new_epoch
+	/*
+	 * RF-ROOT P6 (crash-rejoin): same settled-epoch exception as the live-
+	 * formation witness.  A rejoiner's applied event stays empty (AD-023
+	 * §9.2.3 — the IC carries no ReconfigEvent and the JCMK has no
+	 * event_id), so local_epoch (the JCMK-adopted epoch) is permanently
+	 * above applied.new_epoch (0).  Once self-join admission is durably
+	 * proven (quorum-majority COMMITTED marker + publish-proof — the same
+	 * proof that opened self_join_admitted), the formation IS settled at
+	 * the adopted epoch and the barrier may proceed; without this arm the
+	 * recovery-authority barrier can never post a request on a rejoiner
+	 * until some UNRELATED reconfig lands.
+	 */
+	if ((epoch != formation->applied.new_epoch
+		 && !(formation->self_join_admitted
+			  && epoch > formation->applied.new_epoch))
 		|| epoch != cluster_epoch_get_current())
 		return false;
+
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		bool formation_member
 			= formation->membership.membership_state[i]
@@ -2821,6 +3117,31 @@ cluster_grd_recovery_authority_barrier_wait(
 		&cluster_grd_state->recovery_authority_request_sequence, 1);
 	if (request_generation == 0)
 		return false;
+	/*
+	 * RF-ROOT P6 (crash-rejoin, STOP-01 contract):  capture
+	 * the PREVIOUS request composite before this post overwrites it.  A
+	 * phase-3 publish failure (the postmaster's conditional formation-
+	 * snapshot capture can transiently lose the reconfig lock to the LMON's
+	 * admission finalization) clears the STARTING binding, the phase-3 loop
+	 * re-binds and re-posts the SAME barrier, and zeroing the authority done
+	 * slots on that re-post permanently starved the retry on a rejoiner:
+	 * the survivor's per-tick DONE re-announce stops once its own episode
+	 * closes and its once-per-composite echo is already consumed, so the
+	 * peer slot can never be re-stamped.  The done slots are written only by
+	 * frames whose {epoch, dead-bitmap-hash} exactly matches the current
+	 * request composite, so on an IDENTICAL composite re-post they are still
+	 * the exact convergence evidence the new generation needs and must be
+	 * retained; on a changed composite they cannot match the new request's
+	 * all_done comparison anyway, so zeroing there is pure hygiene.
+	 */
+	prev_epoch = pg_atomic_read_u64(
+		&cluster_grd_state->recovery_authority_formation_epoch);
+	prev_hash = pg_atomic_read_u64(
+		&cluster_grd_state->recovery_authority_bitmap_hash);
+	prev_members_lo = pg_atomic_read_u64(
+		&cluster_grd_state->recovery_authority_members[0]);
+	prev_members_hi = pg_atomic_read_u64(
+		&cluster_grd_state->recovery_authority_members[1]);
 	grd_recovery_authority_clear_seal();
 	pg_atomic_write_u64(
 		&cluster_grd_state->recovery_authority_request_boot_incarnation,
@@ -2839,11 +3160,14 @@ cluster_grd_recovery_authority_barrier_wait(
 		&cluster_grd_state->recovery_authority_members[0], members_lo);
 	pg_atomic_write_u64(
 		&cluster_grd_state->recovery_authority_members[1], members_hi);
-	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_epoch[i], 0);
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_hash[i], 0);
+	if (epoch != prev_epoch || bitmap_hash != prev_hash
+		|| members_lo != prev_members_lo || members_hi != prev_members_hi) {
+		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+			pg_atomic_write_u64(
+				&cluster_grd_state->recovery_authority_done_epoch[i], 0);
+			pg_atomic_write_u64(
+				&cluster_grd_state->recovery_authority_done_hash[i], 0);
+		}
 	}
 	pg_atomic_write_u32(
 		&cluster_grd_state->recovery_authority_terminal_result,
@@ -2863,10 +3187,12 @@ cluster_grd_recovery_authority_barrier_wait(
 		terminal_generation = pg_atomic_read_u64(
 			&cluster_grd_state->recovery_authority_terminal_generation);
 		if (terminal_generation == request_generation) {
+			uint32 tresult;
+
 			pg_read_barrier();
-			return pg_atomic_read_u32(
-					   &cluster_grd_state->recovery_authority_terminal_result)
-					   == GRD_RECOVERY_AUTHORITY_TERMINAL_SUCCESS
+			tresult = pg_atomic_read_u32(
+				&cluster_grd_state->recovery_authority_terminal_result);
+			return tresult == GRD_RECOVERY_AUTHORITY_TERMINAL_SUCCESS
 				&& cluster_grd_recovery_authority_is_current(
 					boot_incarnation, lms_generation);
 		}
@@ -2877,7 +3203,9 @@ cluster_grd_recovery_authority_barrier_wait(
 			|| !cluster_qvotec_in_quorum()
 			|| cluster_qvotec_get_self_incarnation() != boot_incarnation
 			|| cluster_lms_get_lms_restart_generation() != lms_generation)
+		{
 			break;
+		}
 		pg_usleep(1000L);
 	}
 	pg_atomic_write_u64(

@@ -33,8 +33,13 @@
 #define CLUSTER_UNDO_ROOT_DESCRIPTOR_LOCAL_OFFSET(node_id) \
 	((off_t)CLUSTER_UNDO_ROOT_DESCRIPTOR_LOCAL_SLOT(node_id) \
 	 * CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES)
+/*
+ * B′ P0 fix: keep in lockstep with CLUSTER_VOTING_PGRD_FILE_BYTES_MIN —
+ * the attested capacity now also covers region 7 (cold-formation marker
+ * slots [7N+3, 7N+3+N)) which follows the undo descriptors.
+ */
 #define CLUSTER_UNDO_ROOT_DESCRIPTOR_FILE_BYTES_MIN \
-	((off_t)(7 * CLUSTER_MAX_NODES + 3) \
+	((off_t)(8 * CLUSTER_MAX_NODES + 3) \
 	 * CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES)
 
 typedef enum ClusterUndoRootKind {

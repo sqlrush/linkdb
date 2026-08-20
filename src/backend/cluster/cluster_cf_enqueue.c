@@ -32,9 +32,11 @@
 
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
+#include "cluster/cluster_clean_leave.h" /* RF-ROOT P6: leaver write-refusal gate */
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "miscadmin.h"					  /* AmStartupProcess / AmCheckpointerProcess */
 #include "storage/fd.h"
 #include "storage/lock.h"
 #include "utils/timestamp.h"
@@ -120,7 +122,51 @@ cluster_cf_lock(LOCKMODE mode)
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
 
-	/* CF is not reentrant within a backend (one caller-level acquire). */
+	/*
+	 * RF-ROOT P6 (shutdown-handoff wiring, "stop new local CF requests"):
+	 * while THIS node is the leaver in a clean-leave drain
+	 * (REQUESTED..COMMITTED) no new local CF acquire may start — the
+	 * checkpointer driver is exempt, as it is the designated drain context
+	 * and acquires the CF for the shutdown checkpoint and THREAD_CLEAN_CLOSE
+	 * itself.  Fail closed (the caller surfaces CF-unavailable); the one-shot
+	 * quiesce already aborts writable backends, this gate closes the race for
+	 * a backend that slips past it.
+	 */
+	if (cluster_clean_leave_node_refuses_writes() && !AmCheckpointerProcess()) {
+		ereport(LOG,
+				(errmsg("cluster CF acquire refused: clean-leave drain in "
+						"progress on this node (mode %d)",
+						(int) mode)));
+		return false;
+	}
+
+	/*
+	 * CF is not reentrant within a backend (one caller-level acquire).
+	 *
+	 * RF-ROOT P6 hardening (AGENTS.md: required runtime safety must not
+	 * depend on Assert()):  a slot can be left marked held by a prior
+	 * UNCONFIRMED release -- cluster_cf_unlock_confirmed deliberately
+	 * keeps `held` set when the cross-node S6 release cannot be proven,
+	 * because clearing it would risk a double grant.  A later acquire in
+	 * the same process used to trip the non-reentrant Assert and crash
+	 * the process (observed: seed-member checkpointer TRAP during the
+	 * clean-close root publish, turning a clean shutdown abnormal).
+	 * Drain the stale hold with a confirmed release attempt instead; if
+	 * the drain still cannot confirm, fail closed.  An uncoordinated
+	 * (native) hold drains to NOT_HELD with the slot cleared, which is
+	 * equally safe to proceed from.
+	 */
+	if (slot->held) {
+		ClusterCfReleaseResult drain = cluster_cf_unlock_confirmed(mode);
+
+		if (drain == CLUSTER_CF_RELEASE_UNCONFIRMED) {
+			ereport(LOG,
+					(errmsg("cluster CF acquire refused: stale held slot could "
+							"not be drained (mode %d)",
+							(int) mode)));
+			return false;
+		}
+	}
 	Assert(!slot->held);
 
 	memset(&req, 0, sizeof(req));
@@ -183,6 +229,9 @@ cluster_cf_lock(LOCKMODE mode)
 			 * appropriate FATAL/ERROR (CF correctness).
 			 */
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
+		ereport(LOG,
+				(errmsg("cluster CF acquire failed (mode %d, result %d)",
+						(int) mode, (int) r)));
 		return false;
 	}
 }

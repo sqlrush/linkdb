@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_thread_recovery_worker.c
- *	  pgrac online thread-recovery EXECUTOR (spec-4.11 D1, increment 3b-4b
+ *	  pgrac online thread-recovery EXECUTOR (spec-4.11 D1, contractb
  *	  Part 2).
  *
  *	  LMON owns one process-local dynamic-background-worker handle per in-scope
@@ -62,6 +62,8 @@
 #include "cluster/cluster_guc.h"			   /* cluster_online_thread_recovery (scope)    */
 #include "cluster/cluster_ir.h"				   /* spec-5.7 D8 — IR(X) recovery-owner gate    */
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_recovery_plan.h"	   /* RF-ROOT P7 G1b: pinned projection API      */
+#include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_thread_recovery.h"   /* slot helpers + replay_one + gates          */
 #include "cluster/storage/cluster_shared_fs.h" /* shared backend (scope)                    */
 
@@ -438,6 +440,22 @@ thread_recovery_launch_one(
 		ereport(FATAL,
 				(errmsg("could not stamp online thread-recovery slot for dead thread %u",
 						(unsigned)dead_tid)));
+	/*
+	 * RF-ROOT P7 (contract §B): pin the canonical-root projection BEFORE
+	 * the worker spawns — post-bit22 only (pre-bit22 replay_one derives
+	 * its window from the registry directly under the gate idiom).  This
+	 * LMON tick runs before the GRD episode freeze (cluster_lmon.c
+	 * ordering: reconfig -> semantic -> thread_recovery -> grd) at zero
+	 * resource locks; the worker (replay_one) then consumes ONLY the
+	 * pinned fields and never re-acquires CF(S) inside the episode
+	 * (follow-up item 2).  The launch attempt stamp is the projection's
+	 * episode identity.  A pin failure leaves the projection absent ->
+	 * the worker fails closed (window derivation BLOCKED).
+	 */
+	if (cluster_r4_bit22_cutover_active()) {
+		(void) cluster_thread_recovery_pin_projection(
+			dead_tid, eligibility->attempt_stamp);
+	}
 	if (register_one_worker(eligibility, &owned->handle)) {
 		owned->attempt_stamp = eligibility->attempt_stamp;
 		owned->terminate_sent = false;

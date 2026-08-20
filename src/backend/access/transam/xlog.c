@@ -146,6 +146,7 @@
 #include "port/atomics.h"
 #include "port/pg_iovec.h"
 #include "postmaster/bgwriter.h"
+#include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
 #include "postmaster/walwriter.h"
 #include "replication/logical.h"
@@ -206,7 +207,9 @@
 #include "cluster/cluster_xid_authority.h" /* PGRAC: spec-6.15b native-era XID authority */
 #include "cluster/cluster_xid_wrap_barrier.h" /* PGRAC: GCS-race round-3 P0-1 startup mirror */
 #include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
+#include "cluster/cluster_write_fence.h" /* PGRAC: RF-ROOT P6 checkpoint fence deferral */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
+#include "cluster/cluster_recovery_duty.h" /* PGRAC: RF-ROOT P7 G1a canonical checkpoint advance */
 #endif
 
 extern uint32 bootstrap_data_checksum_version;
@@ -793,8 +796,9 @@ static void RemoveOldXlogFilesCluster(
 	XLogSegNo segno, XLogRecPtr lastredoptr, XLogRecPtr endptr,
 	TimeLineID insertTLI, ClusterWalRetentionE1Context *context);
 static void ClusterWalStateValidateHistoricalFpwOff(void);
-static void UpdateFullPageWritesForCheckpoint(void);
+static bool UpdateFullPageWritesForCheckpoint(void); /* RF-ROOT P7 G1a-2: returns FPW-off transition */
 static void ClusterWalStatePublishCheckpointRedo(XLogRecPtr redo);
+static uint32 ClusterCheckpointRecordCrc32(XLogRecPtr recptr); /* RF-ROOT P7 G1a */
 #endif
 static char *str_time(pg_time_t tnow);
 
@@ -4133,7 +4137,11 @@ remove_action:
 		ereport(FATAL,
 				(errmsg("WAL removal did not reach a safe terminal state"),
 				 errdetail("File \"%s\" deny reason is %d.",
-						   segname, (int)reason)));
+						   segname, (int)reason),
+				 errhint("guard state=%d flags=%d walr_held=%d entry=%d action=%d",
+						 (int)guard.state, (int)guard.flags,
+						 (int)guard.walr.held, (int)guard.entry,
+						 (int)guard.action)));
 	outcome = CLUSTER_WAL_TERMINAL_REMOVED;
 
 terminal:
@@ -7608,6 +7616,7 @@ CreateCheckPoint(int flags)
 	XLogRecPtr	slotsMinReqLSN;
 #ifdef USE_PGRAC_CLUSTER
 	bool		cf_x_taken = false; /* PGRAC: spec-5.6 Dc1 — held CF X to release */
+	bool		fpw_off_transition = false; /* RF-ROOT P7 G1a-2: W5b FPW-off happened this checkpoint */
 #endif
 
 	/*
@@ -7665,6 +7674,38 @@ CreateCheckPoint(int flags)
 	SyncPreCheckpoint();
 
 #ifdef USE_PGRAC_CLUSTER
+
+	/*
+	 * RF-ROOT P6 (reconfig epoch window):  the checkpoint's recovery-anchor
+	 * publication is fence-gated (spec-4.12 D5) and PANICs inside a critical
+	 * section on a stale token.  Right after a reconfig epoch advance
+	 * (JOIN_COMMITTED admission, CLEAN_LEAVE commit) the local fence token
+	 * legitimately lags the live epoch until the next qvotec poll latches the
+	 * new baseline; the phase-4 W2 FORCE|WAIT checkpoint structurally races
+	 * the join commit into that window, and the survivor's post-clean-leave
+	 * CHECKPOINT races the leave commit.  Defer the checkpoint until the
+	 * fence would allow it (bounded); on expiry the checkpoint proceeds and
+	 * the anchor gate fails closed as usual -- this wait never weakens the
+	 * fence, it only dodges the transient healthy-side lag.  The
+	 * end-of-recovery checkpoint is exempt (it runs before the first
+	 * authority and must never defer).
+	 */
+	if (cluster_write_fence_enforcing()
+		&& (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
+	{
+		TimestampTz fence_deadline
+			= GetCurrentTimestamp() + (TimestampTz)10 * 1000 * 1000; /* 10 s */
+		bool		fence_ok = cluster_write_fence_allowed();
+
+		while (!fence_ok && GetCurrentTimestamp() < fence_deadline)
+		{
+			(void) WaitLatch(MyLatch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 20, WAIT_EVENT_CHECKPOINTER_MAIN);
+			ResetLatch(MyLatch);
+			fence_ok = cluster_write_fence_allowed();
+		}
+	}
 
 	/*
 	 * PGRAC: spec-5.6 Dc1 + RF-B.  In shared-authority mode a normal
@@ -7737,6 +7778,7 @@ CreateCheckPoint(int flags)
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						 errmsg("could not acquire the cluster control-file lock for a checkpoint")));
+
 			cf_x_taken = true;
 
 			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
@@ -7761,7 +7803,7 @@ CreateCheckPoint(int flags)
 	 * section.  The helper borrows that hold and never reacquires it.
 	 */
 	if ((flags & CHECKPOINT_END_OF_RECOVERY) == 0)
-		UpdateFullPageWritesForCheckpoint();
+		fpw_off_transition = UpdateFullPageWritesForCheckpoint();
 #endif
 
 	/*
@@ -8258,6 +8300,56 @@ CreateCheckPoint(int flags)
 	 * prevent the disk holding the xlog from growing full.
 	 */
 #ifdef USE_PGRAC_CLUSTER
+	/*
+	 * RF-ROOT P6 (STOP-05 §5.4 lock order): the guarded WAL recycle performs
+	 * WALR(thread)-X GES requests and STRONG control-root reads, so it must
+	 * never run while the checkpoint holds the clusterwide CF(X).  The frozen
+	 * lock order forbids the CF -> WALR edge, and holding CF(X) here deadlocks
+	 * against the next file's STRONG root read (CF(S)) queued behind a peer's
+	 * CF(X) waiter.  The shared control-file writes and the W5a/W5b
+	 * CF-borrowing publishes have already completed in the critical section
+	 * above, so releasing the clusterwide CF before BOTH the cluster and the
+	 * native recycle is safe; the remaining steps need no CF authority.
+	 */
+	if (cf_x_taken)
+	{
+		cluster_cf_unlock(ExclusiveLock);
+		cf_x_taken = false;
+	}
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * RF-ROOT P7 G1a: advertise the durable checkpoint in the canonical
+	 * control root (CHECKPOINT_ADVANCE, frozen 0x38 shape) BEFORE the
+	 * guarded recycle removes any WAL the checkpoint needs.  The clusterwide
+	 * CF(X) is already released above (the frozen lock order forbids CF ->
+	 * WALR and a held CF(X) would deadlock the STRONG root read's own
+	 * CF(S)); the root's checkpoint_lower_lsn becomes the canonical
+	 * merged-recovery start / retention bound (G1b reader-migration
+	 * target).  The registry publish (ClusterWalStatePublishCheckpointRedo)
+	 * ran in the critical section above and stays telemetry.  Non-fatal:
+	 * any failure is retried by the next checkpoint.
+	 *
+	 * The END-OF-RECOVERY checkpoint is exempt: it runs before the first
+	 * authority (the frozen fence-deferral exemption), the root is not yet
+	 * canonical, and its WAL-read/CF interactions inside the recovery
+	 * window stall the phase-3 barrier (observed t243 bail).
+	 */
+	if (ClusterWalStateConfigured()
+		&& (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
+	{
+		uint32		ckpt_record_crc = ClusterCheckpointRecordCrc32(recptr);
+
+		if (ckpt_record_crc != 0)
+			(void) cluster_control_root_checkpoint_advance_publish(
+				checkPoint.redo, checkPoint.ThisTimeLineID, ProcLastRecPtr,
+				recptr, ckpt_record_crc);
+		/* RF-ROOT P7 G1a-2: the W5b FPW-off sticky lands in the canonical
+		 * root in the same CF-free window (the merged-recovery 53RA3 gate
+		 * reads the root's FLAG_FPW_WAS_OFF after the G1b migration). */
+		if (fpw_off_transition)
+			(void) cluster_control_root_fpw_sticky_publish();
+	}
+#endif
 	if (ClusterWalStateConfigured())
 	{
 		ClusterWalRetentionE1Context context = {0};
@@ -9255,8 +9347,11 @@ ClusterWalStateValidateHistoricalFpwOff(void)
  * The non-EOR checkpoint is the sole formed-registry FPW-off actor.  A
  * disabled registry retains ordinary PostgreSQL behavior.  Every formed
  * registry result other than a verified write/no-op leaves FPW enabled.
+ * RF-ROOT P7 G1a-2: returns true iff the FPW-off transition actually took
+ * effect this checkpoint (the caller then publishes the canonical root's
+ * FPW_WAS_OFF sticky after the CF(X) release).
  */
-static void
+static bool
 UpdateFullPageWritesForCheckpoint(void)
 {
 	ClusterWalStateUpdate update;
@@ -9264,7 +9359,7 @@ UpdateFullPageWritesForCheckpoint(void)
 	XLogCtlInsert *Insert = &XLogCtl->Insert;
 
 	if (fullPageWrites || !Insert->fullPageWrites)
-		return;
+		return false;
 
 	MemSet(&update, 0, sizeof(update));
 	update.kind = CLUSTER_WAL_STATE_UPDATE_FPW_STICKY;
@@ -9275,7 +9370,7 @@ UpdateFullPageWritesForCheckpoint(void)
 		|| result == CLUSTER_WAL_STATE_UPDATE_DISABLED)
 	{
 		UpdateFullPageWritesInternal(true);
-		return;
+		return true;
 	}
 
 	ereport(WARNING,
@@ -9283,6 +9378,7 @@ UpdateFullPageWritesForCheckpoint(void)
 			 errmsg("could not persist WAL state FPW-off evidence; full_page_writes remains enabled"),
 			 errdetail("WAL state update result was %d; the next non-EOR checkpoint will retry.",
 					   (int) result)));
+	return false;
 }
 
 static void
@@ -9304,6 +9400,38 @@ ClusterWalStatePublishCheckpointRedo(XLogRecPtr redo)
 				 errmsg("could not publish durable checkpoint redo to the WAL state registry"),
 				 errdetail("WAL state update result was %d; the next checkpoint will retry.",
 						   (int) result)));
+}
+
+/*
+ * ClusterCheckpointRecordCrc32 -- RF-ROOT P7 G1a: read back the just-written
+ * (and XLogFlush()ed) checkpoint WAL record and return its exact on-disk
+ * CRC32C (the header's xl_crc, spec-4.5 layout).  The canonical control-root
+ * CHECKPOINT_ADVANCE carries this CRC so a future E2 candidate intersection
+ * against the actual checkpoint record is exact.  Returns 0 on any read
+ * failure (fail-closed: the checkpoint advance is skipped, next checkpoint
+ * retries).  The local read is durable and cheap (one WAL page).
+ */
+static uint32
+ClusterCheckpointRecordCrc32(XLogRecPtr recptr)
+{
+	XLogReaderState *reader;
+	XLogRecord *record;
+	uint32 crc = 0;
+	char *errormsg = NULL;
+
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &read_local_xlog_page,
+										   .segment_open = &wal_segment_open,
+										   .segment_close = &wal_segment_close),
+								NULL);
+	if (reader == NULL)
+		return 0;
+	XLogBeginRead(reader, ProcLastRecPtr);
+	record = XLogReadRecord(reader, &errormsg);
+	if (record != NULL)
+		crc = record->xl_crc;
+	XLogReaderFree(reader);
+	return crc;
 }
 #endif
 

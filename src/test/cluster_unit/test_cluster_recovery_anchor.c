@@ -107,6 +107,7 @@ static int test_wal_slot_read_calls;
 static uint16 test_wal_slot_last_read_thread;
 static bool test_cf_x_held = true;
 static bool test_phase4_drift_on_second_fence;
+static bool test_write_fence_allowed = true;
 static bool test_expect_panic;
 static jmp_buf test_panic_jump;
 
@@ -201,9 +202,21 @@ cluster_cf_held_is_clusterwide(LOCKMODE mode)
 void
 cluster_write_fence_reject_if_fenced(const char *op pg_attribute_unused())
 {
+	/* RF-ROOT P7 G1b (contract): only the post-publication reject
+	 * remains (the entry pre-check skips via allowed); the drift fixture
+	 * flips the slot on that single call. */
 	test_write_fence_calls++;
-	if (test_phase4_drift_on_second_fence && test_write_fence_calls == 2)
+	if (test_phase4_drift_on_second_fence && test_write_fence_calls == 1)
 		test_wal_slot.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+}
+
+/* RF-ROOT P7 G1b (contract): the entry pre-check skips publication
+ * when fenced.  test_write_fence_allowed drives the entry gate; the
+ * post-publication reject (still PANIC-capable) governs the drift case. */
+bool
+cluster_write_fence_allowed(void)
+{
+	return test_write_fence_allowed;
 }
 
 bool
@@ -721,8 +734,12 @@ assert_phase4_publish_rejected_before_io(const CheckPoint *cp)
 	ClusterRecoveryAnchor out;
 	bool used_bak;
 
+	/* RF-ROOT P7 G1b (contract): the entry pre-check (allowed) no
+	 * longer counts a reject call; these rejections come from the
+	 * publisher-is-current predicate (PANIC, pre-write), so the fence
+	 * counter stays 0. */
 	UT_ASSERT(publish_checkpoint_panics(cp));
-	UT_ASSERT_EQ(test_write_fence_calls, 1);
+	UT_ASSERT_EQ(test_write_fence_calls, 0);
 	UT_ASSERT(!cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 }
 
@@ -740,13 +757,13 @@ UT_TEST(test_checkpoint_publish_requires_current_owner_before_io)
 	wipe_anchor_files();
 	test_membership_state = CLUSTER_MEMBER_DEAD;
 	UT_ASSERT(publish_checkpoint_panics(&cp));
-	UT_ASSERT_EQ(test_write_fence_calls, 1);
+	UT_ASSERT_EQ(test_write_fence_calls, 0);
 	UT_ASSERT(!cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 
 	wipe_anchor_files();
 	test_admitted_incarnation = test_self_incarnation + 1;
 	UT_ASSERT(publish_checkpoint_panics(&cp));
-	UT_ASSERT_EQ(test_write_fence_calls, 1);
+	UT_ASSERT_EQ(test_write_fence_calls, 0);
 	UT_ASSERT(!cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 
 	wipe_anchor_files();
@@ -755,7 +772,7 @@ UT_TEST(test_checkpoint_publish_requires_current_owner_before_io)
 	test_admitted_incarnation = 0;
 	test_owner_eor_active = true;
 	UT_ASSERT(!publish_checkpoint_panics(&cp));
-	UT_ASSERT_EQ(test_write_fence_calls, 2);
+	UT_ASSERT_EQ(test_write_fence_calls, 1);
 	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 	UT_ASSERT_EQ(out.checkPoint, 0x0000000398770000ULL);
 
@@ -763,7 +780,7 @@ UT_TEST(test_checkpoint_publish_requires_current_owner_before_io)
 	cluster_recovery_anchor_publish_checkpoint(
 		0x0000000398770000ULL, &cp, TEST_SYSID,
 		(uint32)DB_IN_PRODUCTION, InvalidXLogRecPtr);
-	UT_ASSERT_EQ(test_write_fence_calls, 2);
+	UT_ASSERT_EQ(test_write_fence_calls, 1);
 	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 	UT_ASSERT_EQ(out.checkPoint, 0x0000000398770000ULL);
 }
@@ -788,7 +805,7 @@ UT_TEST(test_checkpoint_publish_phase4_boot_proof_is_exact)
 
 	configure_exact_phase4_publisher();
 	UT_ASSERT(!publish_checkpoint_panics(&cp));
-	UT_ASSERT_EQ(test_write_fence_calls, 2);
+	UT_ASSERT_EQ(test_write_fence_calls, 1);
 	UT_ASSERT_EQ(test_wal_slot_read_calls, 2);
 	UT_ASSERT_EQ(test_wal_slot_last_read_thread, test_wal_thread_id);
 	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
@@ -867,7 +884,7 @@ UT_TEST(test_checkpoint_publish_phase4_boot_proof_is_exact)
 	configure_exact_phase4_publisher();
 	test_phase4_drift_on_second_fence = true;
 	UT_ASSERT(publish_checkpoint_panics(&cp));
-	UT_ASSERT_EQ(test_write_fence_calls, 2);
+	UT_ASSERT_EQ(test_write_fence_calls, 1);
 	UT_ASSERT_EQ(test_wal_slot_read_calls, 2);
 	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 }

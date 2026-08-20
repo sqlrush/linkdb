@@ -742,6 +742,15 @@ cluster_hw_remaster_recoverable(void)
 	return true;
 }
 
+/* Stage 8 contract (verified implementation): worker identity for the recovery
+ * lock-admission gate — this binary never runs inside the hw-remaster
+ * bgworker, so the worker window is always closed here. */
+bool
+cluster_hw_remaster_worker_active(void)
+{
+	return false;
+}
+
 /* spec-5.7 D4 dump_dl stubs (cluster_dl.c not linked in this binary). */
 uint64 cluster_dl_lease_count(void);
 uint64 cluster_dl_native_count(void);
@@ -3349,6 +3358,16 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 	return true;
 }
 
+/* RF-ROOT P4 A1: cluster_authority_readiness_get/managed use conditional
+ * LWLock reads; the debug unit never runs those paths, so the stub simply
+ * reports acquire success and never blocks. */
+bool
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
+						 LWLockMode mode pg_attribute_unused())
+{
+	return true;
+}
+
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
 {}
@@ -3372,6 +3391,202 @@ bool cluster_enabled = true;
 bool cluster_allow_single_node = true;
 /* spec-2.6 Q7 validator: cluster_startup_phase.c reads cluster_voting_disks */
 char *cluster_voting_disks = NULL;
+
+/*
+ * RF-ROOT P4 A1 link-only stubs: cluster_startup_phase.o gained the
+ * formation-witness / recovery-authority / LMS-readiness read paths and
+ * MyProc-based phase reads.  The debug unit only exercises dump/counter
+ * keys and never runs these paths, so every stub returns the neutral
+ * unavailable/false value.
+ */
+#include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_grd.h"
+#include "cluster/cluster_lms.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_wal_thread.h"
+
+PGPROC *MyProc = NULL;
+
+uint16
+cluster_wal_thread_id(void)
+{
+	return 1;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unused(),
+									  int timeout_ms pg_attribute_unused(),
+									  ClusterFormationWitnessV1 **out)
+{
+	*out = NULL;
+	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+}
+
+void
+cluster_formation_witness_destroy(ClusterFormationWitnessV1 **witness)
+{
+	*witness = NULL;
+}
+
+bool
+cluster_formation_witness_copy_classification_v1(
+	const ClusterFormationWitnessV1 *witness pg_attribute_unused(),
+	uint16 *origin_thread, ClusterFenceAuthorityProof *authority,
+	ClusterFormationSnapshotV1 *snapshot)
+{
+	memset(authority, 0, sizeof(*authority));
+	memset(snapshot, 0, sizeof(*snapshot));
+	*origin_thread = 1;
+	return false;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_revalidate_nowait(
+	const ClusterFormationWitnessV1 *witness pg_attribute_unused())
+{
+	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_classification_revalidate_nowait(
+	uint16 origin_thread pg_attribute_unused(),
+	const ClusterFenceAuthorityProof *authority pg_attribute_unused(),
+	const ClusterFormationSnapshotV1 *snapshot pg_attribute_unused())
+{
+	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+}
+
+bool
+cluster_reconfig_capture_formation_snapshot_v1(
+	uint16 origin_thread pg_attribute_unused(),
+	ClusterFormationSnapshotV1 *snapshot)
+{
+	memset(snapshot, 0, sizeof(*snapshot));
+	return false;
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return 0;
+}
+
+int
+cluster_qvotec_get_status(void)
+{
+	return 0;
+}
+
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
+{
+	return 0;
+}
+
+bool
+cluster_grd_recovery_authority_barrier_wait(
+	const ClusterFormationSnapshotV1 *formation pg_attribute_unused(),
+	uint64 boot_incarnation pg_attribute_unused(),
+	uint64 lms_generation pg_attribute_unused(),
+	int timeout_ms pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_grd_recovery_authority_is_current(
+	uint64 boot_incarnation pg_attribute_unused(),
+	uint64 lms_generation pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_grd_serving_authority_rebind_lmon(
+	const ClusterFormationSnapshotV1 *formation pg_attribute_unused(),
+	uint64 boot_incarnation pg_attribute_unused(),
+	uint64 lms_generation pg_attribute_unused())
+{
+	return false;
+}
+
+/* RF-ROOT P6 (L5 leaver rebind + L4 admission diag refs): cluster_grd.o and
+ * cluster_startup_phase.o referenced from the debug surface; pin them inert
+ * like the LMON rebind above. */
+bool
+cluster_grd_serving_authority_rebind_leaver(
+	const ClusterFormationSnapshotV1 *formation pg_attribute_unused(),
+	uint64 boot_incarnation pg_attribute_unused(),
+	uint64 lms_generation pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_grd_join_remaster_in_progress(void)
+{
+	return false;
+}
+
+/* RF-ROOT P6 (L4/L5 admission diag refs): remaining cluster_grd.o /
+ * cluster_startup_phase.o / cluster_cf_phase2.o symbols referenced by the
+ * debug surface; pin them inert. */
+uint64
+cluster_epoch_get_current(void)
+{
+	return 0;
+}
+
+bool
+cluster_membership_is_member(int32 node_id pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_self_join_admitted(void)
+{
+	return false;
+}
+
+void
+cluster_cf_phase2_verify_or_fail(const char *pgdata pg_attribute_unused())
+{
+}
+
+bool
+cluster_control_root_thread_open_publish(uint64 boot_incarnation pg_attribute_unused())
+{
+	return false;
+}
+
+char *DataDir = NULL;
+
+uint64
+cluster_lms_get_lms_restart_generation(void)
+{
+	return 0;
+}
+
+bool
+cluster_lms_is_recovery_ready(void)
+{
+	return false;
+}
+
+bool
+cluster_lms_request_serving(void)
+{
+	return false;
+}
+
+bool
+cluster_lms_wait_for_recovery_ready(int timeout_ms pg_attribute_unused())
+{
+	return false;
+}
 
 #include "cluster/cluster_shmem.h"
 void
@@ -4705,7 +4920,7 @@ UT_TEST(test_debug_links_against_inject_module)
  * cluster_lms_* accessors via cluster_debug.o; standalone test
  * harness must provide local zero-returning stubs.
  */
-int
+ClusterLmsState
 cluster_lms_get_state(void)
 {
 	return 0;
@@ -4849,7 +5064,7 @@ cluster_lms_obs_serve_hist_bound_us(int bucket)
 	return bounds[bucket];
 }
 const char *
-cluster_lms_state_to_string(int s pg_attribute_unused())
+cluster_lms_state_to_string(ClusterLmsState s pg_attribute_unused())
 {
 	return "(stub)";
 }

@@ -1692,6 +1692,12 @@ GRANT SELECT ON pg_cluster_clean_leave_state TO PUBLIC;
 -- superuser()); REVOKE EXECUTE FROM PUBLIC for defense-in-depth (L7).
 REVOKE ALL ON FUNCTION pg_cluster_clean_leave_request() FROM PUBLIC;
 
+-- RF-ROOT P7 (contract step ④e): pgrac_r4_bit22_cutover_begin() is a
+-- mutating operator entry (drives the bit22 first-open cutover round).
+-- Superuser-only (the C body also gates on superuser()); REVOKE EXECUTE
+-- FROM PUBLIC for defense-in-depth (L7 pattern).
+REVOKE ALL ON FUNCTION pgrac_r4_bit22_cutover_begin() FROM PUBLIC;
+
 -- PGRAC: pg_cluster_node_removal_state (spec-5.18 D15).
 --   Always-1-row view of permanent node-removal progress: phase (idle/requested/
 --   precheck/fence_arming/shrink_committing/cleanup/cleanup_blocked/committed/

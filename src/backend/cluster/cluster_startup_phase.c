@@ -48,6 +48,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "miscadmin.h" /* IsUnderPostmaster (HC1) */
+#include "port/atomics.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -56,9 +57,12 @@
 
 #include "cluster/cluster_elog.h"	/* cluster_phase legacy mirror (HC2) */
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_hw_remaster.h" /* contract: worker CF(S) admission */
+#include "cluster/cluster_cf_phase2.h" /* RF-ROOT P6: storage contract verify */
 #include "cluster/cluster_cssd.h"	/* cluster_cssd_start / wait_for_ready (2.5 Sprint A) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_start / wait_for_ready (spec-2.6 Step 3 D8) */
 #include "cluster/cluster_diag.h"	/* cluster_diag_start / wait_for_ready (1.13 Sprint A) */
+#include "cluster/cluster_epoch.h"	/* cluster_epoch_get_current (RF-ROOT P6 diag) */
 #include "cluster/cluster_guc.h"	/* cluster_phase{1..4}_timeout (D2 F2) */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_stats.h"	/* cluster_stats_start / wait_for_ready (1.14 Sprint A) */
@@ -149,44 +153,35 @@ cluster_startup_phase_to_string(ClusterStartupPhase phase)
 ClusterStartupPhase
 cluster_current_phase(void)
 {
-	ClusterStartupPhase result;
-
+	/* AD-023 A1: lock-free atomic read; the phase word is written only under
+	 * the phase-state lwlock, so concurrent readers never block and never see
+	 * a torn value. */
 	if (cluster_phase_state == NULL)
 		return CLUSTER_PHASE_PRE_INIT;
-
-	if (!cluster_phase_state_lock_acquire(LW_SHARED))
-		return CLUSTER_PHASE_PRE_INIT;
-	result = cluster_phase_state->current_phase;
-	LWLockRelease(&cluster_phase_state->lwlock);
-	return result;
+	return (ClusterStartupPhase)pg_atomic_read_u32(
+		&cluster_phase_state->current_phase);
 }
 
 ClusterAuthorityReadiness
 cluster_authority_readiness_get(void)
 {
-	ClusterAuthorityReadiness result = CLUSTER_AUTHORITY_OFF;
-
+	/* AD-023 A1: lock-free atomic read; the single word is written only under
+	 * the phase-state lwlock, so a concurrent reader sees either the old or
+	 * the new value, never a torn mix. */
 	if (cluster_phase_state == NULL)
-		return result;
-	if (!cluster_phase_state_lock_acquire(LW_SHARED))
-		return result;
-	result = cluster_phase_state->authority_readiness;
-	LWLockRelease(&cluster_phase_state->lwlock);
-	return result;
+		return CLUSTER_AUTHORITY_OFF;
+	return (ClusterAuthorityReadiness)pg_atomic_read_u32(
+		&cluster_phase_state->authority_readiness);
 }
 
 bool
 cluster_authority_readiness_managed(void)
 {
-	bool managed = false;
-
+	/* Same lock-free discipline: this runs on every GES grant and must not
+	 * contend on the hot phase-state lwlock. */
 	if (cluster_phase_state == NULL)
 		return false;
-	if (!cluster_phase_state_lock_acquire(LW_SHARED))
-		return false;
-	managed = cluster_phase_state->authority_managed;
-	LWLockRelease(&cluster_phase_state->lwlock);
-	return managed;
+	return pg_atomic_read_u32(&cluster_phase_state->authority_managed) != 0;
 }
 
 static bool
@@ -196,12 +191,15 @@ cluster_authority_binding_copy(ClusterAuthorityBindingLocal *out)
 		return false;
 	if (!cluster_phase_state_lock_acquire(LW_SHARED))
 		return false;
-	if (!cluster_phase_state->authority_managed
-		|| cluster_phase_state->authority_readiness == CLUSTER_AUTHORITY_OFF) {
+	if (pg_atomic_read_u32(&cluster_phase_state->authority_managed) == 0
+		|| (ClusterAuthorityReadiness)pg_atomic_read_u32(
+			   &cluster_phase_state->authority_readiness)
+			   == CLUSTER_AUTHORITY_OFF) {
 		LWLockRelease(&cluster_phase_state->lwlock);
 		return false;
 	}
-	out->state = cluster_phase_state->authority_readiness;
+	out->state = (ClusterAuthorityReadiness)pg_atomic_read_u32(
+		&cluster_phase_state->authority_readiness);
 	out->origin_thread = cluster_phase_state->authority_origin_thread;
 	out->boot_incarnation = cluster_phase_state->authority_boot_incarnation;
 	out->lms_generation = cluster_phase_state->authority_lms_generation;
@@ -212,18 +210,21 @@ cluster_authority_binding_copy(ClusterAuthorityBindingLocal *out)
 }
 
 static void
-cluster_authority_clear_matching(const ClusterAuthorityBindingLocal *binding)
+cluster_authority_clear_matching(const ClusterAuthorityBindingLocal *binding,
+								 const char *caller)
 {
 	if (cluster_phase_state == NULL || binding == NULL)
 		return;
 	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
 		return;
-	if (cluster_phase_state->authority_readiness == binding->state
+	if ((ClusterAuthorityReadiness)pg_atomic_read_u32(
+			&cluster_phase_state->authority_readiness) == binding->state
 		&& cluster_phase_state->authority_boot_incarnation
 			   == binding->boot_incarnation
 		&& cluster_phase_state->authority_lms_generation
 			   == binding->lms_generation) {
-		cluster_phase_state->authority_readiness = CLUSTER_AUTHORITY_OFF;
+		pg_atomic_write_u32(&cluster_phase_state->authority_readiness,
+							CLUSTER_AUTHORITY_OFF);
 		/* Managed is a boot-lifetime fail-closed latch.  Losing a bound
 		 * generation invalidates readiness; it must never reactivate the
 		 * legacy one-dimensional LMS/native fallback in the same postmaster. */
@@ -245,7 +246,8 @@ cluster_authority_readiness_clear(void)
 		return;
 	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
 		return;
-	cluster_phase_state->authority_readiness = CLUSTER_AUTHORITY_OFF;
+	pg_atomic_write_u32(&cluster_phase_state->authority_readiness,
+						CLUSTER_AUTHORITY_OFF);
 	/* Preserve authority_managed once set; shmem reinitialization is the only
 	 * transition back to an unmanaged boot. */
 	cluster_phase_state->authority_origin_thread = 0;
@@ -315,12 +317,16 @@ cluster_serving_generation_current(const ClusterAuthorityBindingLocal *binding)
 		&& cluster_lms_is_ready();
 }
 
+/* AD-023 §3: component drift (CSSD/QVOTEC/quorum/incarnation/formation/LMS
+ * generation/GRD) is the invalidation trigger.  The phase/state gate is
+ * deliberately NOT part of this predicate so callers can distinguish "the
+ * allowlist phase gate rejected this request" from "the binding itself is
+ * stale". */
 static bool
-cluster_authority_binding_external_current(
-	const ClusterAuthorityBindingLocal *binding, bool serving)
+cluster_authority_binding_components_current_internal(
+	const ClusterAuthorityBindingLocal *binding, bool serving, bool require_seal,
+	bool require_member)
 {
-	ClusterStartupPhase phase = cluster_current_phase();
-
 	if (binding == NULL || binding->boot_incarnation == 0
 		|| binding->lms_generation == 0
 		|| cluster_cssd_get_status() != CLUSTER_CSSD_READY
@@ -330,14 +336,35 @@ cluster_authority_binding_external_current(
 		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
 			   != binding->boot_incarnation
 		|| cluster_lms_get_lms_restart_generation() != binding->lms_generation
+		|| (require_member && !cluster_membership_is_member(cluster_node_id))
 		|| (serving
 				? !cluster_serving_formation_current(binding)
 				: cluster_formation_classification_revalidate_nowait(
 					  binding->origin_thread, &binding->authority,
 					  &binding->formation)
 					  != CLUSTER_FORMATION_WITNESS_READY)
-		|| !cluster_grd_recovery_authority_is_current(
-			   binding->boot_incarnation, binding->lms_generation))
+		|| (require_seal
+			&& !cluster_grd_recovery_authority_is_current(
+				binding->boot_incarnation, binding->lms_generation)))
+		return false;
+	return true;
+}
+
+static bool
+cluster_authority_binding_components_current(
+	const ClusterAuthorityBindingLocal *binding, bool serving)
+{
+	return cluster_authority_binding_components_current_internal(
+		binding, serving, true, true);
+}
+
+static bool
+cluster_authority_binding_external_current(
+	const ClusterAuthorityBindingLocal *binding, bool serving)
+{
+	ClusterStartupPhase phase = cluster_current_phase();
+
+	if (!cluster_authority_binding_components_current(binding, serving))
 		return false;
 	if (serving)
 		return binding->state == CLUSTER_AUTHORITY_SERVING_READY
@@ -375,12 +402,15 @@ cluster_authority_readiness_begin(
 
 	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
 		return false;
-	if (cluster_phase_state->authority_readiness != CLUSTER_AUTHORITY_OFF) {
+	if ((ClusterAuthorityReadiness)pg_atomic_read_u32(
+			&cluster_phase_state->authority_readiness)
+		!= CLUSTER_AUTHORITY_OFF) {
 		LWLockRelease(&cluster_phase_state->lwlock);
 		return false;
 	}
-	cluster_phase_state->authority_managed = true;
-	cluster_phase_state->authority_readiness = CLUSTER_AUTHORITY_STARTING;
+	pg_atomic_write_u32(&cluster_phase_state->authority_managed, 1);
+	pg_atomic_write_u32(&cluster_phase_state->authority_readiness,
+						CLUSTER_AUTHORITY_STARTING);
 	cluster_phase_state->authority_origin_thread = origin_thread;
 	cluster_phase_state->authority_boot_incarnation = boot_incarnation;
 	cluster_phase_state->authority_lms_generation = 0;
@@ -396,14 +426,19 @@ cluster_authority_readiness_bind_recovery_generation(uint64 lms_generation)
 	ClusterAuthorityBindingLocal binding;
 	bool valid;
 
-	if (cluster_phase_state == NULL || lms_generation == 0)
+	if (cluster_phase_state == NULL || lms_generation == 0) {
 		return false;
-	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+	}
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE)) {
 		return false;
-	if (!cluster_phase_state->authority_managed
-		|| cluster_phase_state->authority_readiness
+	}
+	if (pg_atomic_read_u32(&cluster_phase_state->authority_managed) == 0
+		|| (ClusterAuthorityReadiness)pg_atomic_read_u32(
+			   &cluster_phase_state->authority_readiness)
 			   != CLUSTER_AUTHORITY_STARTING
-		|| cluster_phase_state->current_phase != CLUSTER_PHASE_3_RECOVERY
+		|| (ClusterStartupPhase)pg_atomic_read_u32(
+			   &cluster_phase_state->current_phase)
+			   != CLUSTER_PHASE_3_RECOVERY
 		|| (cluster_phase_state->authority_lms_generation != 0
 			&& cluster_phase_state->authority_lms_generation
 				   != lms_generation)) {
@@ -413,12 +448,14 @@ cluster_authority_readiness_bind_recovery_generation(uint64 lms_generation)
 	cluster_phase_state->authority_lms_generation = lms_generation;
 	LWLockRelease(&cluster_phase_state->lwlock);
 
-	if (!cluster_authority_binding_copy(&binding))
+	if (!cluster_authority_binding_copy(&binding)) {
 		return false;
+	}
 	valid = binding.state == CLUSTER_AUTHORITY_STARTING
 		&& cluster_authority_binding_preseal_current(&binding);
-	if (!valid && cluster_authority_binding_copy(&binding))
-		cluster_authority_clear_matching(&binding);
+	if (!valid && cluster_authority_binding_copy(&binding)) {
+		cluster_authority_clear_matching(&binding, "bind_preseal_fail");
+	}
 	return valid;
 }
 
@@ -432,10 +469,13 @@ cluster_authority_readiness_publish_recovery(uint64 lms_generation)
 		return false;
 	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
 		return false;
-	if (!cluster_phase_state->authority_managed
-		|| cluster_phase_state->authority_readiness
+	if (pg_atomic_read_u32(&cluster_phase_state->authority_managed) == 0
+		|| (ClusterAuthorityReadiness)pg_atomic_read_u32(
+			   &cluster_phase_state->authority_readiness)
 			   != CLUSTER_AUTHORITY_STARTING
-		|| cluster_phase_state->current_phase != CLUSTER_PHASE_3_RECOVERY) {
+		|| (ClusterStartupPhase)pg_atomic_read_u32(
+			   &cluster_phase_state->current_phase)
+			   != CLUSTER_PHASE_3_RECOVERY) {
 		LWLockRelease(&cluster_phase_state->lwlock);
 		return false;
 	}
@@ -465,15 +505,17 @@ cluster_authority_readiness_publish_recovery(uint64 lms_generation)
 		&& cluster_grd_recovery_authority_is_current(
 			   binding.boot_incarnation, lms_generation);
 	if (!valid) {
-		cluster_authority_clear_matching(&binding);
+		cluster_authority_clear_matching(&binding, "publish_recovery_fail");
 		return false;
 	}
 	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
 		return false;
-	if (cluster_phase_state->authority_readiness == CLUSTER_AUTHORITY_STARTING
+	if ((ClusterAuthorityReadiness)pg_atomic_read_u32(
+			&cluster_phase_state->authority_readiness)
+			== CLUSTER_AUTHORITY_STARTING
 		&& cluster_phase_state->authority_lms_generation == lms_generation)
-		cluster_phase_state->authority_readiness
-			= CLUSTER_AUTHORITY_RECOVERY_READY;
+		pg_atomic_write_u32(&cluster_phase_state->authority_readiness,
+							CLUSTER_AUTHORITY_RECOVERY_READY);
 	else
 		valid = false;
 	LWLockRelease(&cluster_phase_state->lwlock);
@@ -493,9 +535,105 @@ cluster_recovery_transport_is_current(void)
 	if (binding.state != CLUSTER_AUTHORITY_STARTING)
 		return false;
 	current = cluster_authority_binding_preseal_current(&binding);
-	if (!current)
-		cluster_authority_clear_matching(&binding);
+	if (!current) {
+		/* Mirror the recovery_authority discipline: the STARTING preseal
+		 * carries the same phase-3 gate, and a phase-4 request must not
+		 * destroy a binding on the phase gate alone. */
+		/*
+		 * RF-ROOT P6 (STOP-01 contract): a STARTING
+		 * binding with lms_generation == 0 is the postmaster's mid-bind
+		 * window — begin() can only create the binding before the LMS
+		 * process exists (live generation still 0), and the phase-3 loop
+		 * binds the generation on its next iteration.  The preseal fails
+		 * on that window by construction (lms_generation != 0 is one of
+		 * its terms), but destroying the binding here forces a full
+		 * re-begin on every peer DONE ingress and starves the loop;
+		 * the phase-3 loop owns that binding and clears it itself on its
+		 * own failure paths (bounded by the phase-3 deadline).  Only a
+		 * bound generation that drifted from the live formation is
+		 * genuinely stale.
+		 */
+		if (cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+			&& binding.lms_generation != 0)
+			cluster_authority_clear_matching(&binding,
+											 "recovery_transport_stale");
+	}
 	return current;
+}
+
+/*
+ * cluster_recovery_transport_components_current -- RF-ROOT P6 (crash-rejoin).
+ *
+ *	The components-only transport proof:  identical to the strict
+ *	cluster_recovery_transport_is_current EXCEPT that it does not require
+ *	the GRD recovery-authority seal.  The seal is stamped only when the
+ *	phase-3 recovery-authority barrier reaches terminal SUCCESS, and the
+ *	barrier's cluster-wide convergence input is the survivor's inbound
+ *	REDECLARE_DONE key (the authority-axis done slots) — gating that
+ *	ingress on the seal is structurally circular on a rejoiner:
+ *
+ *	  boot_decided=0 -> self JOINING -> barrier request-current fails
+ *	  -> seal never stamped -> transport not current -> REDECLARE_DONE
+ *	  dropped -> join view never rebuilt -> boot_decided stays 0 ...
+ *
+ *	The REDECLARE_DONE arm of ges_readiness_allows_early_opcode is the
+ *	single consumer of this predicate;  every other opcode keeps the
+ *	strict seal requirement.  Safety:  a REDECLARE_DONE frame only
+ *	mutates the monotonic done arrays (and the authority-axis slots,
+ *	which additionally require an exact {epoch, dead-bitmap-hash} match
+ *	against the published request) — it has no serving-side effect, so
+ *	accepting it on component currency alone cannot open the serve gate.
+ */
+bool
+cluster_recovery_transport_components_current(void)
+{
+	ClusterAuthorityBindingLocal binding;
+
+	if (!cluster_authority_binding_copy(&binding))
+		return false;
+	if (binding.state == CLUSTER_AUTHORITY_RECOVERY_READY
+		|| binding.state == CLUSTER_AUTHORITY_STARTING) {
+		/*
+		 * The durable admission (self_join_admitted, set by the quorum-
+		 * majority COMMITTED marker + publish-proof) is the membership
+		 * proof for the transport:  the LMON self-state byte can
+		 * transiently read JOINING while the boot-decided latch is still
+		 * held, and dropping the barrier-building DONE ingress during
+		 * those windows re-closes the deadlock this predicate exists to
+		 * break.  The formation revalidation is deliberately NOT part of
+		 * this proof either:  the admission path invalidates the fence
+		 * cache on every real membership flip, so a revalidation would
+		 * fail exactly while the re-declare barrier is converging — the
+		 * very frames it must admit.  REDECLARE_DONE only mutates the
+		 * monotonic done arrays (and the authority-axis slots, which
+		 * additionally require an exact {epoch, dead-bitmap-hash} match
+		 * against the published request);  it has no serving-side effect,
+		 * so component currency (cssd/qvotec/quorum/incarnation/LMS
+		 * generation/admission) is the correct strength for its gate.
+		 */
+		bool boot_ok = binding.boot_incarnation != 0;
+		bool lmsgen_ok = binding.lms_generation != 0;
+		bool cssd_ok = cluster_cssd_get_status() == CLUSTER_CSSD_READY;
+		bool qvotec_ok = cluster_qvotec_get_status()
+			== CLUSTER_QVOTEC_READY;
+		bool quorum_ok = cluster_qvotec_in_quorum();
+		bool inc_ok = cluster_qvotec_get_self_incarnation()
+			== binding.boot_incarnation;
+		bool admitted_ok
+			= cluster_membership_get_last_admitted_incarnation(
+				  cluster_node_id)
+			  == binding.boot_incarnation;
+		bool lms_match_ok = cluster_lms_get_lms_restart_generation()
+			== binding.lms_generation;
+		bool lms_rcv_ok = cluster_lms_is_recovery_ready();
+		bool member_ok = cluster_membership_is_member(cluster_node_id)
+			|| cluster_reconfig_self_join_admitted();
+
+		return boot_ok && lmsgen_ok && cssd_ok && qvotec_ok && quorum_ok
+			&& inc_ok && admitted_ok && lms_match_ok && lms_rcv_ok
+			&& member_ok;
+	}
+	return false;
 }
 
 bool
@@ -509,8 +647,19 @@ cluster_recovery_authority_is_current(void)
 	if (binding.state != CLUSTER_AUTHORITY_RECOVERY_READY)
 		return false;
 	current = cluster_authority_binding_external_current(&binding, false);
-	if (!current)
-		cluster_authority_clear_matching(&binding);
+	if (!current) {
+		/* AD-023 §3: only a real component loss invalidates the binding.
+		 * The recovery allowlist additionally gates on phase == PHASE_3;
+		 * once StartupXLOG advances to phase 4 the binding is the
+		 * postmaster's pending SERVING upgrade and must survive requesters
+		 * that only fail the phase gate.  Clearing on the phase gate alone
+		 * stranded phase 4 with an OFF binding that nothing re-binds
+		 * (begin() is phase-3 gated), guaranteeing the phase4
+		 * serving-publication timeout. */
+		if (!cluster_authority_binding_components_current(&binding, false))
+			cluster_authority_clear_matching(&binding,
+											 "recovery_authority_stale");
+	}
 	return current;
 }
 
@@ -566,15 +715,17 @@ cluster_authority_readiness_publish_serving(void)
 						   (unsigned long long)lms_generation,
 						   (unsigned long long)binding.lms_generation,
 						   lms_ready, (int)formation_result, grd_current)));
-		cluster_authority_clear_matching(&binding);
+		cluster_authority_clear_matching(&binding, "publish_serving_stale");
 		return false;
 	}
 	LWLockAcquire(&cluster_phase_state->lwlock, LW_EXCLUSIVE);
-	if (cluster_phase_state->authority_readiness
+	if ((ClusterAuthorityReadiness)pg_atomic_read_u32(
+			&cluster_phase_state->authority_readiness)
 			== CLUSTER_AUTHORITY_RECOVERY_READY
 		&& cluster_phase_state->authority_lms_generation
 			   == binding.lms_generation)
-		cluster_phase_state->authority_readiness = CLUSTER_AUTHORITY_SERVING_READY;
+		pg_atomic_write_u32(&cluster_phase_state->authority_readiness,
+							CLUSTER_AUTHORITY_SERVING_READY);
 	else
 		valid = false;
 	LWLockRelease(&cluster_phase_state->lwlock);
@@ -600,12 +751,82 @@ cluster_serving_ready_is_current(void)
 	if (!current
 		&& (!cluster_serving_generation_current(&binding)
 			|| cluster_serving_formation_current(&binding)))
-		cluster_authority_clear_matching(&binding);
+		cluster_authority_clear_matching(&binding, "serving_ready_stale");
 	return current;
 }
 
 bool
 cluster_authority_serving_rebind_lmon(void)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterFormationSnapshotV1 current;
+	ClusterFormationSnapshotV1 verify;
+	bool rebound = false;
+	bool ext_cur;
+	bool gen_cur;
+	bool capture_ok;
+	bool moved;
+	bool grd_rebind_ok;
+	bool verify_ok;
+
+	if (!cluster_authority_binding_copy(&binding)
+		|| binding.state != CLUSTER_AUTHORITY_SERVING_READY)
+		return false;
+	ext_cur = cluster_authority_binding_external_current(&binding, true);
+	if (ext_cur)
+		return true;
+	gen_cur = cluster_serving_generation_current(&binding);
+	capture_ok = cluster_reconfig_capture_formation_snapshot_v1(
+		binding.origin_thread, &current);
+	moved = capture_ok
+		&& memcmp(&current, &binding.formation, sizeof(current)) != 0;
+	if (!gen_cur || !capture_ok || !moved)
+		return false;
+
+	/* The GRD helper accepts only the exact event already closed by the ordinary
+	 * LMON P0-P7 recovery driver; it does not start a second barrier. */
+	grd_rebind_ok = cluster_grd_serving_authority_rebind_lmon(
+		&current, binding.boot_incarnation, binding.lms_generation);
+	verify_ok = cluster_reconfig_capture_formation_snapshot_v1(
+					binding.origin_thread, &verify)
+		&& memcmp(&current, &verify, sizeof(current)) == 0;
+	if (!grd_rebind_ok || !verify_ok)
+		return false;
+
+	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
+		return false;
+	if ((ClusterAuthorityReadiness)pg_atomic_read_u32(
+			&cluster_phase_state->authority_readiness)
+			== CLUSTER_AUTHORITY_SERVING_READY
+		&& cluster_phase_state->authority_origin_thread
+			   == binding.origin_thread
+		&& cluster_phase_state->authority_boot_incarnation
+			   == binding.boot_incarnation
+		&& cluster_phase_state->authority_lms_generation
+			   == binding.lms_generation
+		&& memcmp(&cluster_phase_state->authority_formation,
+				  &binding.formation, sizeof(binding.formation)) == 0) {
+		cluster_phase_state->authority_formation = current;
+		rebound = true;
+	}
+	LWLockRelease(&cluster_phase_state->lwlock);
+
+	return rebound && cluster_serving_ready_is_current();
+}
+
+/*
+ * cluster_authority_serving_rebind_leaver -- RF-ROOT P6 (L5 shutdown
+ * handoff): the committed LEAVER's serving rebind.  The survivor rebind
+ * above requires the ordinary P0-P7 episode to close; the departed node
+ * never arms one for its own departure, so its serving binding would stay
+ * stale forever and its shutdown checkpoint / THREAD_CLEAN_CLOSE CF
+ * acquires would fail closed.  The GRD leaver rebind re-stamps the seal
+ * from the leaver's own applied CLEAN_LEAVE evidence; this wrapper then
+ * re-captures the binding formation under the phase-state lock, exactly
+ * like the survivor path.
+ */
+bool
+cluster_authority_serving_rebind_leaver(void)
 {
 	ClusterAuthorityBindingLocal binding;
 	ClusterFormationSnapshotV1 current;
@@ -620,21 +841,24 @@ cluster_authority_serving_rebind_lmon(void)
 	if (!cluster_serving_generation_current(&binding)
 		|| !cluster_reconfig_capture_formation_snapshot_v1(
 			   binding.origin_thread, &current)
-		|| memcmp(&current, &binding.formation, sizeof(current)) == 0)
+		|| memcmp(&current, &binding.formation, sizeof(current)) == 0) {
 		return false;
+	}
 
-	/* The GRD helper accepts only the exact event already closed by the ordinary
-	 * LMON P0-P7 recovery driver; it does not start a second barrier. */
-	if (!cluster_grd_serving_authority_rebind_lmon(
+	/* Only the committed leaver re-binds this way (the GRD helper re-checks
+	 * the applied CLEAN_LEAVE evidence + all fail-closed components). */
+	if (!cluster_grd_serving_authority_rebind_leaver(
 			&current, binding.boot_incarnation, binding.lms_generation)
 		|| !cluster_reconfig_capture_formation_snapshot_v1(
 			   binding.origin_thread, &verify)
-		|| memcmp(&current, &verify, sizeof(current)) != 0)
+		|| memcmp(&current, &verify, sizeof(current)) != 0) {
 		return false;
+	}
 
 	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
 		return false;
-	if (cluster_phase_state->authority_readiness
+	if ((ClusterAuthorityReadiness)pg_atomic_read_u32(
+			&cluster_phase_state->authority_readiness)
 			== CLUSTER_AUTHORITY_SERVING_READY
 		&& cluster_phase_state->authority_origin_thread
 			   == binding.origin_thread
@@ -675,9 +899,34 @@ cluster_recovery_authority_request_allowed(const ClusterResId *resid,
 										   LOCKMODE mode,
 										   bool startup_process)
 {
+	/*
+	 * RF-ROOT P6 (clean-reopen / THREAD_OPEN): the recovery-time lock
+	 * admission accepts the components-only transport proof too.  The
+	 * strict authority proof requires the GRD seal, which the phase-3
+	 * recovery-authority barrier only stamps AFTER it converges — and the
+	 * THREAD_OPEN root reopen that feeds the survivor's join chain (and
+	 * therefore the barrier's convergence) itself needs the phase-3
+	 * clusterwide CF share-lock first.  Only the StartupProcess during
+	 * phase 3 is ever admitted, still restricted to the frozen
+	 * CF(S)/WALR(X) allowlist below.
+	 */
+	/*
+	 * Stage 8 contract (verified implementation): the hw-remaster rebuild bgworker
+	 * runs on the survivor during its GRD recovery episode (phase 4 normal,
+	 * serving readiness not current) and must STRONG-read the dead origin's
+	 * canonical root to rebuild the adopted HWM — which needs the
+	 * clusterwide CF share lock.  It is a real backend with a normal S6
+	 * release path (AD-023 §4's ghost-holder lesson was about the
+	 * postmaster, which has no PGPROC release), so admit it to the SAME
+	 * frozen CF(S)/WALR(X) allowlist without the StartupProcess/phase-3
+	 * condition.  No other process is affected.
+	 */
+	if (cluster_hw_remaster_worker_active())
+		return cluster_recovery_authority_resid_mode_allowed(resid, mode);
 	return startup_process
 		&& cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
-		&& cluster_recovery_authority_is_current()
+		&& (cluster_recovery_transport_components_current()
+			|| cluster_recovery_authority_is_current())
 		&& cluster_recovery_authority_resid_mode_allowed(resid, mode);
 }
 
@@ -711,7 +960,8 @@ cluster_phase_elapsed_seconds(void)
 		return 0;
 
 	LWLockAcquire(&cluster_phase_state->lwlock, LW_SHARED);
-	phase = cluster_phase_state->current_phase;
+	phase = (ClusterStartupPhase)pg_atomic_read_u32(
+		&cluster_phase_state->current_phase);
 	started = cluster_phase_state->phase_start_times[(int)phase];
 	LWLockRelease(&cluster_phase_state->lwlock);
 
@@ -809,7 +1059,11 @@ cluster_phase_shmem_init(void)
 		 */
 		memset(cluster_phase_state, 0, sizeof(*cluster_phase_state));
 		LWLockInitialize(&cluster_phase_state->lwlock, LWTRANCHE_CLUSTER_STARTUP_PHASE);
-		cluster_phase_state->current_phase = CLUSTER_PHASE_PRE_INIT;
+		pg_atomic_init_u32(&cluster_phase_state->authority_readiness,
+						   CLUSTER_AUTHORITY_OFF);
+		pg_atomic_init_u32(&cluster_phase_state->authority_managed, 0);
+		pg_atomic_init_u32(&cluster_phase_state->current_phase,
+						   CLUSTER_PHASE_PRE_INIT);
 	}
 }
 
@@ -868,7 +1122,8 @@ cluster_advance_phase(ClusterStartupPhase target)
 				 errhint("cluster_phase_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
 
-	prev = cluster_phase_state->current_phase;
+	prev = (ClusterStartupPhase)pg_atomic_read_u32(
+		&cluster_phase_state->current_phase);
 
 	/*
 	 * Strict transition rules.  The only legitimate transitions are:
@@ -928,7 +1183,7 @@ cluster_advance_phase(ClusterStartupPhase target)
 
 	/* Commit the transition under LW_EXCLUSIVE (HC2 SSOT mutate). */
 	LWLockAcquire(&cluster_phase_state->lwlock, LW_EXCLUSIVE);
-	cluster_phase_state->current_phase = target;
+	pg_atomic_write_u32(&cluster_phase_state->current_phase, target);
 	cluster_phase_state->phase_start_times[(int)target] = now;
 
 	/* Append to fixed-size history ring (HC5). */
@@ -1170,7 +1425,6 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline,
 	return false;
 }
 
-
 static PhaseRunResult
 phase_3_handler(PhaseRunFailContext *fail_ctx)
 {
@@ -1182,6 +1436,8 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 	uint64 lms_generation;
 	int lms_remaining_ms;
 	int remaining_ms;
+	bool bind_failed;
+	bool barrier_failed;
 	TimestampTz phase3_deadline;
 
 	Assert(!IsUnderPostmaster);
@@ -1192,6 +1448,22 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 					 "QVOTEC pre-recovery formation gate");
 		return PHASE_RUN_OK;
 	}
+
+	/*
+	 * RF-ROOT P6 (L5/cast-leg contract wedge):  verify the phase-2
+	 * cross-node storage contract HERE, in postmaster context, BEFORE the
+	 * formation wait.  The phase-3 THREAD_OPEN root publish and the
+	 * cast-leg bootstrap CF role gate fail closed on an unverified
+	 * contract, while the StartupXLOG-side verify runs in the startup
+	 * process — which this postmaster phase machine does not fork until
+	 * phase 3 completes, so the startup verify can never precede the
+	 * formation wait.  Postmaster context has the loaded topology, so the
+	 * fresh nonce+ack rendezvous runs here; the StartupXLOG call remains
+	 * (idempotent — a second fresh rendezvous re-confirms and rewrites
+	 * the same CROSSNODE_VERIFIED state).
+	 */
+	if (cluster_phase4_wal_state_configured())
+		cluster_cf_phase2_verify_or_fail(DataDir);
 
 	/*
 	 * RF-ROOT P6 E2: recovery-time WAL retirement needs the same live
@@ -1296,45 +1568,114 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 								"closed until phase 4.";
 			return PHASE_RUN_FATAL;
 		}
-		boot_incarnation = cluster_qvotec_get_self_incarnation();
-		lms_generation = cluster_lms_get_lms_restart_generation();
-		if (!cluster_authority_readiness_bind_recovery_generation(
-				lms_generation)) {
-			/* The durable fence-proof cache can expire while the newly spawned
-			 * LMS publishes recovery readiness.  Never extend or bypass that
-			 * proof: reacquire the complete live formation under the same phase3
-			 * deadline, then rebind the unchanged LMS generation. */
-			remaining_ms = cluster_phase_remaining_budget_ms(
+		/*
+		 * Bind the recovery LMS generation, then complete the GRD
+		 * recovery-authority barrier (AD-023 A2).  Both legs share one
+		 * bounded loop: fail-closed clear paths (a transient stale
+		 * formation proof, a lost conditional phase-state read, or a
+		 * REDECLARE/REDECLARE_DONE witness re-validating the binding from
+		 * a backend) can drop the STARTING/RECOVERY_READY binding, and
+		 * begin() only accepts OFF.  Every retry therefore reacquires the
+		 * complete live formation, re-reads the current LMS generation,
+		 * and re-binds before the next barrier attempt -- a one-shot
+		 * frozen snapshot can never match the post-rejoin REDECLARE_DONE
+		 * composite key (the join advances the epoch and dead bitmap).
+		 * The whole sequence still fails closed at the phase-3 deadline.
+		 */
+		bind_failed = false;
+		barrier_failed = false;
+		for (;;)
+		{
+			lms_generation = cluster_lms_get_lms_restart_generation();
+			/*
+			 * The clean-reopen mainline (STOP-01 frozen THREAD_OPEN) is
+			 * executed by the JOIN COMMIT path:  the coordinator's commit
+			 * re-vet (cluster_recovery_owner_rejoin_v1) issues the frozen
+			 * CLOSED -> OPEN CAS under the THREAD_OPEN reason when the
+			 * root is clean-closed (Stage 8 contract, corrected
+			 * design).  The postmaster phase-3 driver has no PGPROC and
+			 * its S1 admission fails closed (r=10), and the startup
+			 * process is forked only AFTER phase-3 — running the reopen
+			 * there deadlocks the phase-3 barrier, which waits on the
+			 * survivor's join commit, which re-vets the root.  The
+			 * components-only transport proof (which the S1 recovery lock
+			 * admission uses for the clusterwide CF share-lock) reads the
+			 * bound generation, and the phase-2 cross-node storage
+			 * contract can verify late (the survivor's cssd publishes its
+			 * probe response on the heartbeat cadence).
+			 */
+			if (cluster_phase4_wal_state_configured()) {
+				(void)cluster_authority_readiness_bind_recovery_generation(
+					lms_generation);
+			}
+			if (!cluster_authority_readiness_bind_recovery_generation(
+					lms_generation)) {
+				/* begin() only accepts OFF, so drop any stale STARTING
+				 * binding before reacquiring the exact live formation. */
+				cluster_authority_readiness_clear();
+				if (GetCurrentTimestamp() >= phase3_deadline
+					|| !cluster_phase3_wait_for_live_formation(
+						phase3_deadline, &formation_result,
+						&formation_origin_thread, &formation_authority,
+						&formation_snapshot)
+					|| !cluster_authority_readiness_begin(
+						formation_origin_thread, &formation_authority,
+						&formation_snapshot)) {
+					bind_failed = true;
+					break;
+				}
+				pg_usleep(20000L);
+				continue;
+			}
+			boot_incarnation = cluster_qvotec_get_self_incarnation();
+			lms_remaining_ms = cluster_phase_remaining_budget_ms(
 				phase3_deadline, 5000);
+			if (cluster_grd_recovery_authority_barrier_wait(
+					&formation_snapshot, boot_incarnation, lms_generation,
+					lms_remaining_ms)
+				&& cluster_authority_readiness_publish_recovery(
+					lms_generation))
+				break;
+			if (GetCurrentTimestamp() >= phase3_deadline) {
+				barrier_failed = true;
+				break;
+			}
+			/* Re-fetch the live formation and re-bind before the next
+			 * barrier attempt; begin() only accepts OFF, so drop the
+			 * stale binding first. */
+			cluster_authority_readiness_clear();
 			if (!cluster_phase3_wait_for_live_formation(
 					phase3_deadline, &formation_result,
 					&formation_origin_thread, &formation_authority,
 					&formation_snapshot)
 				|| !cluster_authority_readiness_begin(
 					formation_origin_thread, &formation_authority,
-					&formation_snapshot)
-				|| !cluster_authority_readiness_bind_recovery_generation(
-					lms_generation)) {
-				cluster_authority_readiness_clear();
-				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+					&formation_snapshot)) {
+				bind_failed = true;
+				break;
+			}
+			boot_incarnation = cluster_qvotec_get_self_incarnation();
+			/* Pace the retry so a persistently unavailable barrier cannot
+			 * spin the Postmaster without yielding; the phase-3 deadline
+			 * still bounds the whole loop. */
+			pg_usleep(20000L);
+		}
+
+		if (bind_failed || barrier_failed
+			|| cluster_authority_readiness_get()
+				   != CLUSTER_AUTHORITY_RECOVERY_READY)
+		{
+			cluster_authority_readiness_clear();
+			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+			if (barrier_failed) {
+				fail_ctx->errmsg = "cluster phase 3: authoritative recovery GRD is unavailable";
+				fail_ctx->errhint = "Recovery requires an explicit current-generation holder "
+									"authority seal; an empty or uninitialized GRD is insufficient.";
+			} else {
 				fail_ctx->errmsg = "cluster phase 3: recovery LMS generation could not be bound";
 				fail_ctx->errhint = "The LMS recovery generation, live formation, and admitted "
 									"incarnation must remain exact before holder remastering.";
-				return PHASE_RUN_FATAL;
 			}
-			boot_incarnation = cluster_qvotec_get_self_incarnation();
-		}
-		lms_remaining_ms = cluster_phase_remaining_budget_ms(
-			phase3_deadline, 5000);
-		if (!cluster_grd_recovery_authority_barrier_wait(
-				&formation_snapshot, boot_incarnation, lms_generation,
-				lms_remaining_ms)
-			|| !cluster_authority_readiness_publish_recovery(lms_generation)) {
-			cluster_authority_readiness_clear();
-			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
-			fail_ctx->errmsg = "cluster phase 3: authoritative recovery GRD is unavailable";
-			fail_ctx->errhint = "Recovery requires an explicit current-generation holder "
-								"authority seal; an empty or uninitialized GRD is insufficient.";
 			return PHASE_RUN_FATAL;
 		}
 	}
@@ -1615,14 +1956,36 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		}
 
 		lms_pid = phase3_lms_pid;
-		if (lms_pid <= 0
-			|| cluster_authority_readiness_get()
-				   != CLUSTER_AUTHORITY_RECOVERY_READY) {
+		if (lms_pid <= 0)
+		{
 			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
 			fail_ctx->errmsg = "cluster phase 4: recovery LMS authority is unavailable";
 			fail_ctx->errhint = "Restart after the phase-3 LMS generation and authority "
 								"binding are available.";
 			return PHASE_RUN_FATAL;
+		}
+
+		/*
+		 * AD-023 A1 contract: every Postmaster read of the volatile phase
+		 * state is a conditional acquire that must never queue.  A transient
+		 * contention therefore shows up as an unavailable read, not a hang,
+		 * and the contract requires retrying inside the existing phase4
+		 * deadline instead of treating one miss as terminal.
+		 */
+		for (;;)
+		{
+			if (cluster_authority_readiness_get()
+				== CLUSTER_AUTHORITY_RECOVERY_READY)
+				break;
+			if (GetCurrentTimestamp() >= phase4_deadline)
+			{
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 4: recovery LMS authority is unavailable";
+				fail_ctx->errhint = "Restart after the phase-3 LMS generation and authority "
+									"binding are available.";
+				return PHASE_RUN_FATAL;
+			}
+			pg_usleep(20000L);
 		}
 		if (!cluster_lms_request_serving()) {
 			cluster_authority_readiness_clear();
@@ -1640,13 +2003,26 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 								"state cannot authorize a formed-registry CF update.";
 			return PHASE_RUN_FATAL;
 		}
-		if (!cluster_authority_readiness_publish_serving()) {
-			cluster_authority_readiness_clear();
-			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
-			fail_ctx->errmsg = "cluster phase 4: serving authority publication failed";
-			fail_ctx->errhint = "A stale formation, QVOTEC incarnation, LMS generation, or "
-								"GRD seal cannot publish ordinary GES/GCS service.";
-			return PHASE_RUN_FATAL;
+		/*
+		 * Same A1 retry discipline for the serving publication: retry the
+		 * conditional phase-state read inside the phase4 deadline, then fail
+		 * closed only when the budget is exhausted or the authoritative
+		 * predicate itself reports stale.
+		 */
+		for (;;)
+		{
+			if (cluster_authority_readiness_publish_serving())
+				break;
+			if (GetCurrentTimestamp() >= phase4_deadline)
+			{
+				cluster_authority_readiness_clear();
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 4: serving authority publication failed";
+				fail_ctx->errhint = "A stale formation, QVOTEC incarnation, LMS generation, or "
+									"GRD seal cannot publish ordinary GES/GCS service.";
+				return PHASE_RUN_FATAL;
+			}
+			pg_usleep(20000L);
 		}
 
 		cluster_validate_running_configuration();

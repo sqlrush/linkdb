@@ -298,6 +298,22 @@ cluster_cssd_get_status(void)
 	return 1; /* CLUSTER_CSSD_READY */
 }
 
+/* Link-only stubs for cluster_grd.o's spec-5.16 join-fence predicates:
+ * the durable self-join admission + the clean-leave write-refusal gate.
+ * Standalone fixture pins them positive/inert; the barrier's own gates use
+ * the dedicated mocks. */
+bool
+cluster_reconfig_self_join_admitted(void)
+{
+	return true;
+}
+
+bool
+cluster_clean_leave_node_refuses_writes(void)
+{
+	return false;
+}
+
 void
 cluster_lmon_wakeup(void)
 {}
@@ -4937,6 +4953,111 @@ UT_TEST(test_recovery_authority_rejects_missing_peer_or_unremastered_map)
 	UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
 }
 
+/*
+ * RF-ROOT P6 (STOP-01 contract): a phase-3 publish-recovery
+ * failure clears the STARTING binding and the phase-3 loop re-posts the SAME
+ * request composite.  The re-post must retain the already-proven authority
+ * done slots — the survivor's per-tick DONE re-announce stops once its own
+ * episode closes and its once-per-composite echo is consumed, so a zeroed
+ * peer slot can never be re-stamped and the retried barrier starves forever
+ * (run-29: gen=2 done0=0/0 permanent, 60s pg_ctl window bail).
+ */
+UT_TEST(test_recovery_authority_same_composite_repost_retains_done_slots)
+{
+	ClusterFormationSnapshotV1 formation;
+	uint64 bitmap_hash;
+
+	setup_recovery_authority_fixture(&formation); /* nodes {0,1}, epoch 5 */
+	ut_grd_blocking_lwlock_calls = 0;
+	ut_grd_postmaster_lwlock_calls = 0;
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = true;
+
+	bitmap_hash = cluster_grd_dead_bitmap_hash(
+		formation.applied.dead_bitmap);
+	UT_ASSERT(bitmap_hash != 0);
+
+	/* gen=1: no LMON tick and no peer DONE -> timeout fail-closed (the
+	 * request is cancelled, the composite fields stay published). */
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 2));
+
+	/* Terminalize the cancelled request so a fresh generation may post
+	 * (request-pending gate). */
+	cluster_grd_recovery_authority_lmon_tick();
+
+	/* The peer completed its re-declare at the request composite while the
+	 * request fields were still published; its DONE stamps the authority
+	 * slot (the exact evidence a same-composite re-post needs). */
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
+										bitmap_hash);
+
+	/* gen=2 re-post of the IDENTICAL composite: with the peer slot retained,
+	 * the driven LMON tick converges without any fresh peer frame. */
+	ut_drive_authority_lmon_tick = true;
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 20));
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = false;
+	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
+}
+
+/*
+ * RF-ROOT P6 (STOP-01 contract): a re-post whose composite
+ * CHANGED (epoch moved) must NOT inherit the previous request's done slots —
+ * the retained evidence is only valid for the identical composite.  The
+ * barrier must fail closed until a fresh DONE at the new composite arrives.
+ */
+UT_TEST(test_recovery_authority_composite_change_repost_requires_fresh_done)
+{
+	ClusterFormationSnapshotV1 formation;
+	uint64 bitmap_hash;
+
+	setup_recovery_authority_fixture(&formation); /* epoch 5 */
+	ut_grd_blocking_lwlock_calls = 0;
+	ut_grd_postmaster_lwlock_calls = 0;
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = true;
+
+	bitmap_hash = cluster_grd_dead_bitmap_hash(
+		formation.applied.dead_bitmap);
+	UT_ASSERT(bitmap_hash != 0);
+
+	/* Same prologue as the retention test: gen=1 cancelled, peer slot
+	 * stamped at (5, hash). */
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 2));
+	cluster_grd_recovery_authority_lmon_tick();
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
+										bitmap_hash);
+
+	/* The epoch advances (a new reconfig event): the re-post composite
+	 * CHANGES, so the old (5, hash) slots must not carry over. */
+	ut_mock_epoch = 6;
+	formation.local_epoch = 6;
+	formation.applied.new_epoch = 6;
+
+	/* gen=2 at (6, hash): the peer slot was zeroed by the composite change;
+	 * with no fresh (6, hash) DONE the barrier must fail closed. */
+	ut_drive_authority_lmon_tick = true;
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 20));
+
+	/* Terminalize the cancelled gen=2 so a fresh generation may post, then
+	 * a fresh peer DONE at the new composite lets the next same-composite
+	 * retry converge. */
+	ut_drive_authority_lmon_tick = false;
+	cluster_grd_recovery_authority_lmon_tick();
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
+										bitmap_hash);
+	ut_drive_authority_lmon_tick = true;
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 20));
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = false;
+	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -4949,8 +5070,10 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-5.16:+12 (join-remaster U1-U5/U10-U16);
 	 * +1 (U17 cross-episode fence Hardening);
 	 * spec-4.6a r3-P2-2:+2 (same-epoch dead-set growth re-stamp + no-churn);
-	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage). */
-	UT_PLAN(94);
+	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
+	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
+	 * composite-change zeroing). */
+	UT_PLAN(96);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -5071,6 +5194,10 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_authority_postmaster_cannot_execute_blocking_barrier);
 	UT_RUN(test_recovery_authority_lmon_tick_is_sole_blocking_executor);
 	UT_RUN(test_recovery_authority_initial_epoch_zero_is_valid);
+	/* RF-ROOT P6 contract — same-composite re-post retains done slots;
+	 * composite-change re-post zeroes and requires fresh evidence. */
+	UT_RUN(test_recovery_authority_same_composite_repost_retains_done_slots);
+	UT_RUN(test_recovery_authority_composite_change_repost_requires_fresh_done);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

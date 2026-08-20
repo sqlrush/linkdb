@@ -491,6 +491,26 @@ stats_prepare_incarnation(void)
 		stats_fill_wal_state_update(CLUSTER_WAL_STATE_UPDATE_ACTIVE, started_at, &update);
 		result = cluster_wal_state_update_own(
 			&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+		/*
+		 * RF-ROOT A1 retry discipline: the clusterwide CF(X) can be held by
+		 * the coordinator's formation/serving critical sections (or by this
+		 * joiner's own closed write gate until admission).  Retry inside the
+		 * phase-4 window before the spec-mandated startup FATAL; structural
+		 * results (CORRUPT/FOREIGN/IO) stay immediately terminal.
+		 */
+		if (result == CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE) {
+			int w2_retry;
+
+			for (w2_retry = 0; w2_retry < 3; w2_retry++) {
+				pg_usleep(1000000L); /* 1 s */
+				result = cluster_wal_state_update_own(
+					&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+				if (result == CLUSTER_WAL_STATE_UPDATE_OK
+					|| result == CLUSTER_WAL_STATE_UPDATE_NOOP
+					|| result != CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE)
+					break;
+			}
+		}
 		if (result != CLUSTER_WAL_STATE_UPDATE_OK
 			&& result != CLUSTER_WAL_STATE_UPDATE_NOOP)
 			ereport(FATAL,

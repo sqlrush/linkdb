@@ -110,6 +110,42 @@ static ClusterPgstatCounter cluster_pgstat_counters[] = {
 	{ .name = "cluster.fence.thaw_broadcast_count" },
 	{ .name = "cluster.fence.self_fence_initiated_count" },
 	{ .name = "cluster.fence.freeze_signal_received_count" },
+	/*
+	 * RF-PAGE PGDEL-08 (spec-rf-page-crash-safe-page-replay-journal.md
+	 * §9.1): recovery-only counters, G2-classified (EVENT/GAUGE/
+	 * TIMESTAMP) in the single vocabulary table of
+	 * cluster_page_stats_describe().  Producers are the
+	 * cluster_page_stats_* functions, fired by the PGDEL-09 wiring at
+	 * the owning proof points (source selection/invalid/missing/conflict,
+	 * skip/apply/mismatch, unknown-class blocked, authority stale, early
+	 * release, retire denial, D3′ rebuild/hit, stable-base unresolved,
+	 * contributor gauges, retained pinned bytes, last write/durability/
+	 * post-read timestamps).  Names must stay in sync with the
+	 * vocabulary table (G4′: one producer + one consumer per counter).
+	 */
+	{ .name = "cluster.page.source_selected_current" },
+	{ .name = "cluster.page.source_selected_pi" },
+	{ .name = "cluster.page.source_selected_storage" },
+	{ .name = "cluster.page.source_invalid" },
+	{ .name = "cluster.page.source_missing" },
+	{ .name = "cluster.page.source_conflict" },
+	{ .name = "cluster.page.result_skip" },
+	{ .name = "cluster.page.apply_count" },
+	{ .name = "cluster.page.version_mismatch" },
+	{ .name = "cluster.page.unknown_class_blocked" },
+	{ .name = "cluster.page.authority_stale_rejected" },
+	{ .name = "cluster.page.resource_early_release" },
+	{ .name = "cluster.page.retire_denied" },
+	{ .name = "cluster.page.d3_rebuild" },
+	{ .name = "cluster.page.d3_optimization_hit" },
+	{ .name = "cluster.page.stable_base_unresolved" },
+	{ .name = "cluster.page.contributor_records" },
+	{ .name = "cluster.page.contributor_threads" },
+	{ .name = "cluster.page.contributor_gaps" },
+	{ .name = "cluster.page.retained_pinned_bytes" },
+	{ .name = "cluster.page.last_page_write_ts" },
+	{ .name = "cluster.page.last_durability_barrier_ts" },
+	{ .name = "cluster.page.last_post_read_ts" },
 };
 
 #define CLUSTER_PGSTAT_COUNT lengthof(cluster_pgstat_counters)

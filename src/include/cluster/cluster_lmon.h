@@ -146,6 +146,11 @@ typedef struct ClusterLmonSharedState {
 	uint64 total_iter_us;			   /* same-incarnation cumulative duty time */
 	struct Latch *lmon_latch;		   /* qvotec completion wake target; LMON owns lifecycle */
 	bool shutdown_requested;		   /* postmaster sets; LMON main loop polls + exits */
+	/* RF-ROOT P6: postmaster sets during a formed-registry fast shutdown so
+	 * the RETAINED LMON keeps servicing the coordination stack (CF X for the
+	 * shutdown checkpoint) but stops publishing reconfig events.  The LMON
+	 * main loop does NOT exit on this byte. */
+	bool reconfig_suppressed;
 
 	/*
 	 * PGRAC: spec-7.2 D1 duty-chain on-demand gating.  Dirty bitmask for
@@ -264,6 +269,25 @@ extern bool cluster_lmon_wait_for_ready(int timeout_ms);
  *	cleanly when set.  Idempotent.  Asserts !IsUnderPostmaster.
  */
 extern void cluster_lmon_request_shutdown(void);
+
+/*
+ * RF-ROOT P6: read the shutdown_requested byte without exiting.  The postmaster
+ * sets it during a formed-registry fast shutdown so the retained LMON stops
+ * publishing reconfig events (fail-stop/join) for the rest of the shutdown
+ * checkpoint window, while the LMON main loop still exits through this same
+ * flag.  LW_SHARED read; safe from any backend.
+ */
+extern bool cluster_lmon_shutdown_requested_public(void);
+
+/*
+ * RF-ROOT P6: postmaster-side "stop publishing reconfig, keep serving".  Sets
+ * state->reconfig_suppressed = true under LW_EXCLUSIVE.  The LMON main loop
+ * keeps running (so CF X remains grantable through the shutdown checkpoint)
+ * but cluster_reconfig_lmon_tick() early-returns while the byte is set.
+ * Idempotent; postmaster-only (Assert !IsUnderPostmaster).
+ */
+extern void cluster_lmon_suppress_reconfig(void);
+extern bool cluster_lmon_reconfig_suppressed(void);
 
 /*
  * Read-only accessors for SQL view + diagnostics.  LW_SHARED.

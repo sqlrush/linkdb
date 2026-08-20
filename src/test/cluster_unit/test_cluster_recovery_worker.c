@@ -321,11 +321,46 @@ UT_TEST(test_target_pageaddr_contains_target)
 	UT_ASSERT(pageaddr <= hl - 1 && hl - 1 < pageaddr + XLOG_BLCKSZ);
 }
 
+/* RF-ROOT P7 G1b step 4 (site worker.c:192, follow-up P2): the canonical-root
+ * stream-precheck anchor — validated_tail==0 / tail_tli==0 / NULL snapshot
+ * are all UNREADABLE (fail-closed); a validated extent is usable. */
+UT_TEST(test_root_anchor_null_is_unusable)
+{
+	UT_ASSERT(!cluster_recovery_worker_root_anchor_valid(NULL));
+}
+
+UT_TEST(test_root_anchor_zero_tail_is_unusable)
+{
+	ClusterControlRootSnapshot snap;
+
+	memset(&snap, 0, sizeof(snap));
+	snap.tail_tli = 1;
+	UT_ASSERT(!cluster_recovery_worker_root_anchor_valid(&snap));
+}
+
+UT_TEST(test_root_anchor_zero_tli_is_unusable)
+{
+	ClusterControlRootSnapshot snap;
+
+	memset(&snap, 0, sizeof(snap));
+	snap.validated_tail_lsn_exclusive = UINT64_C(0x1000000);
+	UT_ASSERT(!cluster_recovery_worker_root_anchor_valid(&snap));
+}
+
+UT_TEST(test_root_anchor_valid_extent_is_usable)
+{
+	ClusterControlRootSnapshot snap;
+
+	memset(&snap, 0, sizeof(snap));
+	snap.validated_tail_lsn_exclusive = UINT64_C(0x1000000);
+	snap.tail_tli = 1;
+	UT_ASSERT(cluster_recovery_worker_root_anchor_valid(&snap));
+}
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(17);
+	UT_PLAN(21);
 
 	UT_RUN(test_striping_cap_ge_n);
 	UT_RUN(test_striping_cap_lt_n_roundrobin);
@@ -344,6 +379,10 @@ main(int argc, char **argv)
 	UT_RUN(test_target_page_math);
 	UT_RUN(test_target_page_zero_lsn);
 	UT_RUN(test_target_pageaddr_contains_target);
+	UT_RUN(test_root_anchor_null_is_unusable);
+	UT_RUN(test_root_anchor_zero_tail_is_unusable);
+	UT_RUN(test_root_anchor_zero_tli_is_unusable);
+	UT_RUN(test_root_anchor_valid_extent_is_usable);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

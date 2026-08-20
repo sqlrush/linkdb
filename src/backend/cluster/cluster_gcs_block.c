@@ -12525,9 +12525,46 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 		return;
 	}
 
-	/* ACTIVATING and any post-activation BLOCKED state are non-pristine. */
-	if (runtime.gate_generation != 0 || runtime.master_session_incarnation != 0)
-		return;
+	/*
+	 * ACTIVATING and any post-activation BLOCKED state are non-pristine.
+	 * A pristine runtime starts with gate generation 0 AND
+	 * master_session_incarnation 0 (RECOVERY_BLOCKED is the shmem init
+	 * state); only the pristine shape may run the founding
+	 * activate_bound path.  Everything else is either a stranded
+	 * ACTIVATING (recovery-reset territory) or a post-activation
+	 * fail-closed.
+	 */
+	if (runtime.gate_generation != 0 || runtime.master_session_incarnation != 0) {
+		/*
+		 * RF-SIDE D-SIDE-07 (t/274 L4/L5): a post-activation
+		 * RECOVERY_BLOCKED runtime is re-formed when the cluster has
+		 * genuinely reconfig'd (any fail-stop epoch bump or peer restart
+		 * with a new session freezes the activation-time binding).
+		 * Re-form requires the SAME stable formation evidence as a
+		 * pristine activation — a double-sampled, epoch-consistent
+		 * collect with every MEMBER peer authenticated — plus a real
+		 * epoch/session change (the anti-spin check lives inside
+		 * cluster_pcm_x_runtime_reform).  Without the change evidence
+		 * the runtime stays BLOCKED (fail-closed): a corruption-
+		 * triggered fail-closed must NOT be papered over by a re-form.
+		 */
+		if (runtime.state == PCM_X_RUNTIME_RECOVERY_BLOCKED) {
+			bool		formation_stable;
+
+			formation_stable =
+				gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before,
+												  &self_session_before, NULL)
+				&& gcs_block_pcm_x_collect_formation(bindings_after, &epoch_after,
+													 &self_session_after, NULL)
+				&& cluster_gcs_pcm_x_formation_samples_stable(true, bindings_before,
+															  true, bindings_after)
+				&& epoch_before == epoch_after
+				&& self_session_before == self_session_after;
+			if (formation_stable)
+				(void) cluster_pcm_x_runtime_reform(epoch_before, bindings_before);
+		}
+		return;					/* non-pristine: no founding activation */
+	}
 	if (!gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before, &self_session_before,
 										   &rebase_all))
 		return;

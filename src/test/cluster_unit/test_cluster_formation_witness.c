@@ -7,6 +7,8 @@
 #include <stdlib.h>
 
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_semantic_activation.h" /* ACK stage enum (G3 stub) */
+#include "storage/latch.h" /* recovery path retry stubs (MyLatch/WaitLatch) */
 
 #undef printf
 #undef fprintf
@@ -97,6 +99,35 @@ cluster_control_root_lookup_owner_by_node_runtime(
 	return CLUSTER_CONTROL_ROOT_ABSENT;
 }
 
+/* RF-ROOT P7 G3/G4: the create/activate coordinator proofs and the runtime
+ * census gate live in the same product object; this unit exercises only the
+ * formation-witness entry points, so keep the proofs fail-closed. */
+bool
+cluster_semantic_activation_ack_complete_matches(
+	uint64 transition_epoch pg_attribute_unused(),
+	uint64 record_generation pg_attribute_unused(),
+	uint64 expected_members_lo pg_attribute_unused(),
+	uint64 expected_members_hi pg_attribute_unused(),
+	uint64 source_feature_bitmap pg_attribute_unused(),
+	uint64 target_feature_bitmap pg_attribute_unused(),
+	uint64 capability_sample_digest pg_attribute_unused(),
+	ClusterSemanticActivationAckStage minimum_stage pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_control_root_feature_bitmap_is_known(uint64 active_feature_bitmap pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_wal_state_correctness_census_ok(void)
+{
+	return false;
+}
+
 ClusterRecoveryOwnerImportResult
 cluster_recovery_owner_import_read_v1(
 	int32 node_id, const ClusterWalThreadClaim *immutable_claim,
@@ -131,6 +162,136 @@ cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected,
 	(void)expected;
 	(void)now_us;
 	return cache_result;
+}
+
+/* RF-ROOT P6 (L4 admission / phase-3 gate diag refs): cluster_recovery_duty.o
+ * samples the live-component predicates; the pure unit pins them inert so the
+ * binary stays standalone. */
+int cluster_node_id = 0;
+
+int
+cluster_cssd_get_status(void)
+{
+	return 0;
+}
+
+int
+cluster_qvotec_get_status(void)
+{
+	return 0;
+}
+
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return false;
+}
+
+bool
+cluster_membership_is_member(int32 node_id pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_self_join_admitted(void)
+{
+	return false;
+}
+
+/* Link-only stub (RF-ROOT P6 contract): recovery_duty.o's missed
+ * clean-close repair reads the durable clean-departed evidence; this
+ * fixture never exercises the repair path. */
+bool
+cluster_reconfig_is_clean_departed(int32 node_id pg_attribute_unused())
+{
+	return false;
+}
+
+/* Link-only stubs (RF-ROOT P7 recovery path): recovery_duty.o's bounded
+ * THREAD_CLEAN_CLOSE retry (cluster_control_root_thread_clean_close_publish_retry)
+ * waits on MyLatch with a clock; this fixture never exercises the retry
+ * path, so the clock stands still and every wait times out instantly. */
+static Latch ut_retry_latch;
+Latch *MyLatch = &ut_retry_latch;
+static TimestampTz ut_retry_now_us = 1700000000000000LL;
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return ut_retry_now_us;
+}
+
+TimestampTz
+TimestampTzPlusMilliseconds(TimestampTz t, int64 ms)
+{
+	return t + (TimestampTz) ms * 1000;
+}
+
+int
+WaitLatch(Latch *latch, int wakeEvents, long timeout, uint32 wait_event_info)
+{
+	(void) latch;
+	(void) wakeEvents;
+	(void) timeout;
+	(void) wait_event_info;
+	return WL_TIMEOUT;
+}
+
+void
+ResetLatch(Latch *latch)
+{
+	(void) latch;
+}
+
+volatile sig_atomic_t InterruptPending = 0;
+
+void
+ProcessInterrupts(void)
+{
+}
+
+/* recovery path: the retry rebinds the leaver's serving authority on the success
+ * path; this fixture never reaches it. */
+bool
+cluster_authority_serving_rebind_leaver(void)
+{
+	return false;
+}
+
+bool
+cluster_lms_is_recovery_ready(void)
+{
+	return false;
+}
+
+int
+cluster_current_phase(void)
+{
+	return 0;
+}
+
+bool
+cluster_recovery_transport_components_current(void)
+{
+	return false;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
 }
 
 static void

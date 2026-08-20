@@ -281,7 +281,9 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 	uint8 raw[8];
 
 	if (!cluster_controlfile_shared_authority)
+	{
 		return;
+	}
 	if (!cluster_enabled || cluster_conf_node_count() <= 1)
 		return; /* single-node: no cross-node contract needed */
 
@@ -295,7 +297,9 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
 	 */
 	peer_id = find_peer_node();
 	if (peer_id < 0)
+	{
 		return; /* no peer configured -> gate fails closed */
+	}
 
 	if (!pg_strong_random(raw, sizeof(raw)))
 		return; /* no fresh nonce -> leave unverified */

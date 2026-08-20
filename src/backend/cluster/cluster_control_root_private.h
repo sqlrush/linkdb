@@ -15,7 +15,8 @@ extern bool cluster_control_root_create_authority_current_v1(
 	const ClusterControlRootMigrationRoundV1 *round);
 extern bool cluster_control_root_activate_authority_current_v1(
 	const ClusterControlRootFileToken *expected_token,
-	const uint8 expected_round_sha256[32]);
+	const uint8 expected_round_sha256[32],
+	const ClusterControlRootMigrationRoundV1 *round);
 extern bool cluster_control_root_publish_authority_current_v1(
 	const ClusterControlRootReadToken *expected_token,
 	const ClusterControlRootPatch *patch,

@@ -86,6 +86,7 @@
 #include "cluster/cluster_guc.h"	   /* cluster_node_id + cssd_* GUCs */
 #include "cluster/cluster_ic_router.h" /* ClusterICFanoutResult (heartbeat tick read result) */
 #include "cluster/cluster_inject.h"	   /* CLUSTER_INJECTION_POINT (spec-2.5 D11) */
+#include "cluster/cluster_lmon.h"	   /* cluster_lmon_wakeup (outbound slot publish kick) */
 #include "cluster/cluster_shmem.h"	   /* cluster_shmem_register_region */
 #include "fmgr.h"
 #include "funcapi.h"
@@ -650,6 +651,7 @@ cssd_heartbeat_broadcast_tick(void)
 	ClusterCssdHeartbeatPayload hb;
 	ClusterCssdOutboundSlot *slots;
 	int peer;
+	bool woke_any = false;
 
 	if (CssdShmem == NULL)
 		return;
@@ -707,7 +709,20 @@ cssd_heartbeat_broadcast_tick(void)
 		slots[peer].request_seq = ++cssd_request_seq;
 		memcpy(&slots[peer].payload, &hb, sizeof(hb));
 		pg_atomic_write_u32(&slots[peer].pending, 2); /* publish to LMON */
+		woke_any = true;
 	}
+
+	/* RF-ROOT P6 fix (t/243 L4 wedge): the LMON drain loop has no read-side
+	 * wake for a freshly-published outbound slot -- it only samples the slot
+	 * once per main-loop iteration, and when the iteration cadence collapses
+	 * (few peer frames, few producer kicks) the sample rate falls far below
+	 * CSSD's 1 Hz broadcast.  CSSD frames then reach peers sparsely, the
+	 * peer CSSD dead-band fires on a healthy node, and a crash-rejoin wedge
+	 * follows.  Kick LMON once per broadcast tick so the published request
+	 * is drained promptly; the kick is a hint (SIGUSR1 -> SetLatch), safe to
+	 * issue from the CSSD aux process. */
+	if (woke_any)
+		cluster_lmon_wakeup();
 }
 
 
@@ -971,6 +986,7 @@ CssdMain(void)
 						   WAIT_EVENT_CLUSTER_BGPROC_CSSD_MAIN_LOOP);
 			if (rc & WL_LATCH_SET)
 				ResetLatch(MyLatch);
+
 		}
 	}
 

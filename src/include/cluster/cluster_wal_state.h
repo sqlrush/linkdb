@@ -183,6 +183,14 @@ typedef enum ClusterWalStateUpdateResult {
 	CLUSTER_WAL_STATE_UPDATE_FOREIGN,
 	CLUSTER_WAL_STATE_UPDATE_WRONG_STATE,
 	CLUSTER_WAL_STATE_UPDATE_POSTREAD_MISMATCH,
+	/* STOP-01 §17.7 W6 (RF A1, frozen append): RELEASE_UNCERTAIN = a
+	 * coordinated CF release could not be confirmed (fail-closed: the
+	 * caller must not re-acquire or re-publish on the same token);
+	 * SOURCE_CLOSED = the W6 merge source is closed (transition-capable
+	 * binary; the cold / online wrappers return it without any pwrite —
+	 * W6 is permanently retired, not mirrored). */
+	CLUSTER_WAL_STATE_UPDATE_RELEASE_UNCERTAIN,
+	CLUSTER_WAL_STATE_UPDATE_SOURCE_CLOSED,
 } ClusterWalStateUpdateResult;
 
 typedef enum ClusterWalStateCfMode {
@@ -535,6 +543,13 @@ extern ClusterWalSlotVerdict cluster_wal_state_read_slot(uint16 thread_id,
 /* Dump accessors (cluster_debug.c category 'wal_thread'). */
 extern bool cluster_wal_state_registry_ready(void);
 extern uint64 cluster_wal_state_refresh_fail_count(void);
+
+/* RF-ROOT P7 G4: the runtime wal-state correctness census gate (bit22 open
+ * enforcement).  False while any known-deferred correctness reader/writer
+ * site is still linked (mirror of scripts/ci/check-wal-state-correctness-
+ * census.sh strict mode; the activate authority proof calls this and fails
+ * closed). */
+extern bool cluster_wal_state_correctness_census_ok(void);
 
 #endif /* !FRONTEND */
 

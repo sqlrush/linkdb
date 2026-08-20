@@ -230,6 +230,12 @@ typedef struct ClusterLeaveState {
 	pg_atomic_uint64 leave_attempt_nonce;
 	pg_atomic_uint32 preflight_pending;
 	pg_atomic_uint32 preflight_sent;
+	/* RF-ROOT P6 (shutdown-handoff wiring): 1 = the current leave attempt was
+	 * driven by the clean-shutdown mainline (checkpointer), not the operator
+	 * entry.  The LMON reads it to stamp producer_kind=SHUTDOWN on the real
+	 * announce; survivors then skip the §3.4 disabled-NAK (the shutdown
+	 * mainline is not an opt-in operator feature). */
+	pg_atomic_uint32 shutdown_driven;
 
 	/*
 	 * Hardening v1.0.3 fields.
@@ -295,14 +301,28 @@ typedef enum ClusterLeaveNakReason {
  *	preflight=1 : "are you enabled for clean leave?" probe (leave_epoch=0)
  *	preflight=0 : real "I am leaving" announce → survivor enters leave-aware
  *	              reconfig (CL-I4 fail-closed-until-drained) and replies ACK/NAK.
+ *
+ *	producer_kind (RF-ROOT P6 shutdown-handoff wiring):  distinguishes the
+ *	operator-driven leave (GUC-gated, §3.4 mixed-mode NAK applies) from the
+ *	clean-shutdown-driven handoff (the STOP-01 clean-close mainline; not
+ *	GUC-gated on either side — a disabled survivor still performs the full
+ *	membership-layer consume and ACKs, because the shutdown mainline is not
+ *	an opt-in operator feature).  Was _pad1[0] before this byte was named;
+ *	old senders transmit 0 = operator, so the wire is backward compatible.
  */
+typedef enum ClusterLeaveProducerKind {
+	CLUSTER_LEAVE_PRODUCER_OPERATOR = 0,
+	CLUSTER_LEAVE_PRODUCER_SHUTDOWN = 1
+} ClusterLeaveProducerKind;
+
 typedef struct ClusterLeaveAnnouncePayload {
 	uint32 magic;
 	uint16 version;
 	uint16 _pad0;
 	int32 leaving_node_id;
 	uint8 preflight; /* 1 = enabled-probe, 0 = real announce */
-	uint8 _pad1[3];
+	uint8 producer_kind; /* ClusterLeaveProducerKind */
+	uint8 _pad1[2];
 	uint64 leave_epoch;			 /* 0 until bound (preflight / pre-commit) */
 	uint64 cssd_dead_generation; /* version-coherence cross-check (CL-I3) */
 	uint64 leave_nonce;			 /* Hardening v1.0.2 (P2): per-attempt nonce binding every
@@ -516,6 +536,29 @@ extern void cluster_clean_leave_get_state(ClusterLeaveState *out);
 
 /* CL-I2 no-leftover proof (assertion / acceptance helper). */
 extern bool cluster_clean_leave_verify_no_leftover(int32 leaving_node_id);
+
+/*
+ * cluster_clean_leave_shutdown_drain -- RF-ROOT P6 (L5 clean-reopen mainline,
+ * the STOP-01 shutdown-handoff wiring).
+ *
+ *	Run by the CHECKPOINTER inside the clean-shutdown sequence (fast stop),
+ *	AFTER the shutdown checkpoint and the STOPPED wal-state publish (STOP-01
+ *	I7 / RF-ROOT P6 contract 1) and BEFORE THREAD_CLEAN_CLOSE.  Reuses the
+ *	frozen 5.13 cooperative remaster / holder handoff:  REQUESTED marker +
+ *	announce (producer_kind=SHUTDOWN) → survivor ACKs → GES drain +
+ *	remaster → GCS flush → barrier → survivor-coordinator two-phase commit
+ *	(CLEAN_LEAVE epoch bump + COMMITTED marker).  Blocks until the leave
+ *	COMMITTED (the node may then clean-exit) or fails closed.
+ *
+ *	Returns true iff the handoff committed (caller may publish
+ *	THREAD_CLEAN_CLOSE) or is vacuous (single-node / no alive peer to hand
+ *	off to — nothing to remaster toward, so the clean-close is still sound).
+ *	Returns false on any handoff failure (NAK, version drift, drain/flush
+ *	failure, deadline, escalation): the caller must NOT claim a clean-close
+ *	and the node falls back to the existing fail-stop reconfiguration
+ *	(no fake clean-leave completion, 8.B).
+ */
+extern bool cluster_clean_leave_shutdown_drain(void);
 
 /*
  * CL-I5 block-serve gate (S6) — called from the GCS block-serve path right

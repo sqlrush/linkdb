@@ -448,7 +448,29 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 	return 0;
 }
 int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
 errcode(int s pg_attribute_unused())
+{
+	return 0;
+}
+
+/* RF-ROOT P6 (L4/L5 diag refs): cluster_grd.o's join-fence/episode accessors
+ * and the process-context symbols the fixture does not otherwise stub. */
+bool IsUnderPostmaster = false;
+int MyProcPid = 0;
+
+bool
+cluster_grd_join_remaster_in_progress(void)
+{
+	return false;
+}
+
+uint64
+cluster_grd_recovery_episode_epoch_value(void)
 {
 	return 0;
 }

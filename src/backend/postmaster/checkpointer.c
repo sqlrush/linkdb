@@ -41,6 +41,8 @@
 #include "access/xlogrecovery.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_clean_leave.h" /* shutdown handoff drain (RF-ROOT P6) */
+#include "cluster/cluster_recovery_duty.h" /* thread clean-close publish (RF-ROOT P6) */
 #include "cluster/cluster_wal_state.h"
 #endif
 #include "libpq/pqsignal.h"
@@ -595,6 +597,10 @@ HandleCheckpointerInterrupts(void)
 	}
 	if (ShutdownRequestPending)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		bool		clean_handoff_ok;
+#endif
+
 		/*
 		 * From here on, elog(ERROR) should end with exit(1), not send control
 		 * back to the sigsetjmp block above
@@ -616,8 +622,65 @@ HandleCheckpointerInterrupts(void)
 		 * publish the clean-close state.  The coordination stack is still
 		 * READY here, so the common WAL-state RMW can reacquire verified
 		 * CF(X).  Immediate and error exits never reach this call.
+		 *
+		 * RF-ROOT P6 contract 1 (STOP-01 I7: STOPPED occurs only after the
+		 * clean shutdown checkpoint and before coordination drain):  the
+		 * shutdown checkpoint and the STOPPED wal-state publish run BEFORE
+		 * the 5.13 serving/authority handoff below.  Running the handoff
+		 * first (as an earlier iteration did) commits the survivor-side
+		 * epoch advance while this node still has to write — the committed
+		 * leaver's fence token then goes stale (and the survivor's next
+		 * baseline fences it), so the shutdown checkpoint's recovery-anchor
+		 * publication PANICs inside the write fence and the slot never
+		 * reaches STOPPED.  Checkpoint + STOPPED first keeps every
+		 * fence-gated write inside the still-valid pre-handoff authority.
 		 */
 		cluster_wal_state_publish_stopped();
+
+		/*
+		 * RF-ROOT P6 contract 1 (serving rebind / authority transition):
+		 * with the shutdown checkpoint durable and the STOPPED wal-state
+		 * published, run the 5.13 cooperative CF/GES remaster + holder
+		 * handoff while GES/LMON are still alive, so the survivors confirm
+		 * the new generation and their CF shard stays NORMAL — the
+		 * restarting owner then reopens its clean-closed thread against a
+		 * survivor-mastered CF instead of wedging on the death-driven
+		 * freeze.  Any handoff timeout, version drift or holder-validation
+		 * failure fails closed (returns false) and the node falls back to
+		 * the existing fail-stop path: the THREAD_CLEAN_CLOSE publish below
+		 * is then skipped so the survivors treat this departure as an
+		 * ordinary death (no fake clean-leave).
+		 */
+		clean_handoff_ok = cluster_clean_leave_shutdown_drain();
+
+		/*
+		 * RF-ROOT P6 (STOP-01 frozen THREAD_CLEAN_CLOSE, the Oracle
+		 * clean-close mainline):  with the shutdown checkpoint durable and
+		 * the STOPPED wal-state published, close this owner's own redo
+		 * thread (OPEN -> CLOSED, lineage unchanged).  Immediate / error
+		 * exits never reach here, so a crash never writes CLOSED and stays
+		 * on the survivor-driven failure-recovery FSM.
+		 *
+		 * The publish is gated on the 5.13 shutdown handoff above:  a
+		 * CLOSED record without the committed clean-leave would wedge the
+		 * next boot's THREAD_OPEN on the death-driven CF shard freeze, so
+		 * on a failed handoff the root stays OPEN and the restart takes
+		 * the ordinary crash-rejoin chain (fail-closed, 8.B).
+		 *
+		 * RF-ROOT P7 recovery path (recovery contract, implementation review note
+		 * 21): a transient S1 serving-stale refusal is retried with a
+		 * bounded window (re-bind the leaver serving authority, 5s
+		 * deadline, 50ms backoff) so the owner reliably lands CLOSED —
+		 * never blocking the shutdown, and never requiring a coordinator-
+		 * side repair.
+		 */
+		if (clean_handoff_ok)
+			(void)cluster_control_root_thread_clean_close_publish_retry();
+		else
+			ereport(LOG,
+					(errmsg("cluster clean-leave: shutdown handoff failed; "
+							"skipping THREAD_CLEAN_CLOSE so the survivors run "
+							"the ordinary fail-stop reconfiguration")));
 #endif
 		pgstat_report_checkpointer();
 		pgstat_report_wal(true);

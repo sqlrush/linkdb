@@ -58,6 +58,7 @@
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (spec-5.13 clean_departed_epoch) */
 #include "cluster/cluster_epoch_ballot.h"
+#include "cluster/cluster_formation_marker.h" /* cold-formation marker mailbox */
 #include "cluster/cluster_marker_async.h"
 #include "cluster/cluster_membership.h" /* ClusterMembershipTable (spec-5.15 D2 SSOT) */
 #include "cluster/cluster_qvotec.h"
@@ -408,6 +409,22 @@ typedef struct ClusterReconfigState {
 	pg_atomic_uint64 observed_fresh_alive[CLUSTER_MAX_NODES];
 
 	/*
+	 * RF-ROOT P9 verification / cold-formation ruling (2026-08-19): QVOTEC
+	 * bootstrap publication SEQLOCK + same-round in-quorum snapshot.  qvotec
+	 * publishes observed_incarnation[]/observed_generation[]/observed_epoch[]/
+	 * observed_fresh_alive[] AND bootstrap_in_quorum inside ONE seqlock window
+	 * (odd seq = writer in progress) each poll, so the founding-formation
+	 * ABSENT admission reads one coherent round through the whole-proof getter
+	 * (cluster_reconfig_bootstrap_proof_node): no "new incarnation + stale
+	 * fresh-alive" cross-window combination can ever form an admission proof.
+	 * The getter re-reads seq after sampling and retries on odd/CHANGED seq.
+	 * Other consumers (joiner_self_tick, stripe seed) keep their plain atomic
+	 * reads — the seqlock gates ONLY the founding admission path.
+	 */
+	pg_atomic_uint64 observed_bootstrap_seq;
+	pg_atomic_uint64 bootstrap_in_quorum;
+
+	/*
 	 * spec-5.16 (Hardening — 3-node join participation) — per declared node, the
 	 * COMMITTED join-marker incarnation + admitted epoch qvotec last observed on a
 	 * quorum-majority of that node's region-3 slots.  This is the durable signal a
@@ -442,6 +459,45 @@ typedef struct ClusterReconfigState {
 	uint8 join_pending_marker[CLUSTER_JCMK_REPLACEMENT_BYTES];
 
 	/*
+	 * RF-ROOT P9 verification / cold-formation cold-formation ruling — the
+	 * cold-formation-marker submit mailbox (region 7).  The arbiter LMON
+	 * stages a COMMITTED formation marker + the target co-boot member set,
+	 * bumps formation_marker_request_seq, wakes qvotec via
+	 * formation_qvotec_latch; qvotec (the sole voting-disk writer) writes
+	 * the marker into EVERY target member's region-7 slot on every disk,
+	 * requires a quorum-majority of disks per member slot, re-reads each
+	 * target slot on every disk and completes only when a strict majority
+	 * of disks carries the EXACT image (majority readback).  Single
+	 * producer (arbiter LMON) + single consumer (qvotec).
+	 */
+	struct Latch *formation_qvotec_latch;
+	pg_atomic_uint64 formation_marker_request_seq;
+	pg_atomic_uint64 formation_marker_completion_seq;
+	pg_atomic_uint32 formation_marker_result; /* bool success */
+	ClusterFormationMarkerSubmitRequest formation_marker_request;
+
+	/*
+	 * RF-ROOT P9 verification / cold-formation cold-formation ruling —
+	 * qvotec-published cold-formation observations + startup seed:
+	 *   formation_marker_max_generation — highest COMMITTED formation
+	 *     generation qvotec found across region 7 at startup (0 = none);
+	 *     the arbiter writes max+1 (monotonic takeover rule).
+	 *   observed_formation_marker_* — this node's OWN region-7 slot,
+	 *     re-read by qvotec each poll; valid=1 only when the slot carries
+	 *     a CRC-valid COMMITTED marker (generation/epoch/arbiter identity
+	 *     + the per-member incarnation table).  The cold-formation
+	 *     admission consumes it (exact incarnation -> record_admitted ->
+	 *     MEMBER).  The table is written by qvotec before valid flips to 1
+	 *     and re-read after (torn-free pairing with the generation latch).
+	 */
+	pg_atomic_uint64 formation_marker_max_generation;
+	pg_atomic_uint64 observed_formation_marker_generation; /* 0 = none */
+	pg_atomic_uint64 observed_formation_marker_epoch;
+	pg_atomic_uint64 observed_formation_marker_arbiter_node;
+	pg_atomic_uint64 observed_formation_marker_arbiter_incarnation;
+	pg_atomic_uint64 observed_formation_marker_incarnation[CLUSTER_MAX_NODES];
+
+	/*
 	 * spec-5.15A §2.4 — node-local same-node replacement mirror.  Every
 	 * read/write is covered by this state's lock.  ADMITTED means membership
 	 * metadata may be published, but it does not open self_join_admitted.
@@ -449,8 +505,11 @@ typedef struct ClusterReconfigState {
 	ClusterReplacementEpisode replacement_episode;
 } ClusterReconfigState;
 
-StaticAssertDecl(sizeof(ClusterReconfigState) == 10968,
-				 "P04 fast-rejoin reconfig state must remain exactly 10,968 bytes");
+/* RF-ROOT P9 verification (cold-formation): +16 bytes = the bootstrap
+ * publication seqlock (observed_bootstrap_seq) + the same-round in-quorum
+ * snapshot (bootstrap_in_quorum). */
+StaticAssertDecl(sizeof(ClusterReconfigState) == 12640,
+				 "cluster reconfig state must remain exactly 12,640 bytes");
 
 
 /* ============================================================
@@ -654,6 +713,22 @@ extern void cluster_reconfig_record_observed_fresh_alive(int32 node_id, bool fre
 extern bool cluster_reconfig_get_observed_fresh_alive(int32 node_id);
 
 /*
+ * RF-ROOT P9 verification / cold-formation ruling (2026-08-19): QVOTEC
+ * bootstrap-publication seqlock.  qvotec wraps its per-poll publication of
+ * observed_incarnation[]/generation[]/epoch[]/fresh_alive[] + the in-quorum
+ * snapshot between begin() and end() (seq odd while open, even when
+ * stable); the founding-formation ABSENT admission reads the whole window
+ * through cluster_reconfig_bootstrap_proof_node, which retries on an
+ * odd/CHANGED seq so a "new incarnation + stale fresh-alive" combination
+ * can never form an admission proof.
+ */
+extern void cluster_reconfig_bootstrap_publish_begin(void);
+extern void cluster_reconfig_bootstrap_publish_in_quorum(bool in_quorum);
+extern void cluster_reconfig_bootstrap_publish_end(void);
+extern bool cluster_reconfig_bootstrap_proof_node(int32 node_id,
+												  uint64 *out_incarnation);
+
+/*
  * spec-5.15 Hardening v1.1 (HF-1 / INV-J9): true iff a majority of the current
  * MEMBER survivors have advanced their durable observed epoch to >=
  * admitted_epoch — i.e. the coordinator's JOIN_COMMITTED publish actually
@@ -732,6 +807,23 @@ extern bool cluster_reconfig_qvotec_lifecycle_transition(
 	pg_atomic_uint32 *qvotec_status, ClusterQvotecStatus next_status);
 extern void cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch);
 
+/* RF-ROOT P9 verification / cold-formation cold-formation ruling —
+ * formation-marker mailbox (region 7) + qvotec observations.  The arbiter
+ * LMON submits a COMMITTED marker + target co-boot member set; qvotec
+ * writes it to every target member's slot on every disk and completes only
+ * on a majority write + majority exact readback. */
+extern bool cluster_reconfig_formation_qvotec_poll_pending(
+	ClusterFormationMarkerSubmitRequest *out);
+extern void cluster_reconfig_formation_qvotec_complete(bool success);
+extern void cluster_reconfig_formation_qvotec_note_max_generation(
+	uint64 generation);
+extern void cluster_reconfig_formation_qvotec_publish_observed(
+	const ClusterFormationCommitMarker *marker,
+	const uint64 *incarnation_by_node);
+extern void cluster_reconfig_formation_qvotec_clear_observed(void);
+extern void cluster_reconfig_publish_formation_qvotec_latch(struct Latch *latch);
+extern void cluster_reconfig_cold_formation_tick(void);
+
 extern void cluster_reconfig_note_marker_slow_ack(ClusterMarkerAsyncKind kind, int32 target_node,
 												  uint64 elapsed_us);
 extern void cluster_reconfig_note_marker_timeout(ClusterMarkerAsyncKind kind, int32 target_node,
@@ -780,6 +872,7 @@ extern bool cluster_reconfig_join_in_progress(void);
  * write gate (gate-open guard = adopt && state==MEMBER — P1-r5 half-publish).
  */
 extern void cluster_reconfig_note_self_admitted(uint64 admitted_epoch);
+extern bool cluster_reconfig_self_join_admitted(void); /* RF-ROOT P6 */
 
 /* spec-5.15A closed replacement admission.  A canonical local ADMITTED
  * episode may publish self MEMBER while keeping the ordinary write gate

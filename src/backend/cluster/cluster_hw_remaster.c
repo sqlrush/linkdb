@@ -65,11 +65,13 @@
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "cluster/cluster_control_root.h" /* implementation: two-step root read (contract §A) */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h" /* cluster_node_id, cluster_wal_threads_dir */
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_hw_remaster.h"
 #include "cluster/cluster_hw_snapshot.h"
+#include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_thread_recovery.h"   /* validated_end (torn-tail boundary) */
 #include "cluster/cluster_wal_state.h"		   /* read_slot (durable watermark) */
 #include "cluster/cluster_wal_thread.h"		   /* node id -> thread id */
@@ -79,6 +81,15 @@
 static int hw_worker_dead_node = -1;
 static uint64 hw_worker_episode = 0;
 static bool hw_worker_armed = false;
+
+/* Stage 8 contract (verified implementation): worker identity for the recovery
+ * lock-admission gate (the worker's CF(S) canonical-root STRONG read must
+ * pass while the survivor's serving readiness is not current). */
+bool
+cluster_hw_remaster_worker_active(void)
+{
+	return hw_worker_armed;
+}
 
 static uint64
 hw_remaster_next_attempt_deadline(uint32 completed_retry_attempts)
@@ -469,11 +480,69 @@ cluster_hw_remaster_rebuild_origin(int dead_node_id, uint64 episode_epoch)
 
 	/*
 	 * Step 2 (R3/R5): replay the HW_RESERVE tail from the snapshot_lsn up to the
-	 * validated complete-record boundary.  validated_min = the dead thread's
-	 * registry durable watermark (a decode that stops below it is mid-stream
+	 * validated complete-record boundary.  validated_min = the validated
+	 * complete-record boundary (a decode that stops below it is mid-stream
 	 * corruption, not a torn tail); validated_end derives the boundary and fails
 	 * closed otherwise (mirrors the spec-4.11 replay_one window contract).
+	 *
+	 * RF-ROOT P7 (contract §B S4 / follow-up, batch 4): dual-path by the
+	 * bit22 cutover latch.  Pre-bit22 (frozen §17.8) the wal-state registry
+	 * watermark stays authoritative — the hw-remaster worker's registry read
+	 * has no CF dependency, whereas a root STRONG read cannot be obtained
+	 * inside the crash-rejoin episode window (LOCK_UNAVAILABLE, observed
+	 * t243 bail; the latch is false so this branch is the frozen behavior).
+	 * Post-bit22 the canonical control root is the only source, with the
+	 * contract ABSENT binary inside the branch: never-minted (registry has no
+	 * publication record) degrades to the registry-complete path; minted-lost
+	 * (registry published but the root read fails) is a danger state that
+	 * fails stop — the worker terminates without holding the hw gate.
 	 */
+	if (cluster_r4_bit22_cutover_active()) {
+		ClusterControlRootSnapshot root_snap;
+		ClusterControlRootResult root_result;
+
+		/* Stage 8 contract (verified implementation): use the lock-free dead-origin
+		 * canonical read.  The STRONG read's CF share lock is unavailable
+		 * while the GRD recovery holds the CF shard FROZEN (the CF shard
+		 * master IS the dead node here — GES REJECT(SHARD_FROZEN) is the
+		 * necessary double-grant guard), and the remaster's completion is
+		 * itself the P7-unfreeze prerequisite — the STRONG path deadlocks.
+		 * A dead origin has no live republisher and each shard is adopted
+		 * by exactly one survivor, so the lock-free read is the final
+		 * value (the minted-lost discriminator below stays intact: ABSENT
+		 * against a registry publication is still the danger state). */
+		root_result = cluster_control_root_read_canonical_dead_origin(
+			dead_tid, &root_snap);
+		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+			/* contract discriminator: the registry publication record.  A
+			 * publication (highest_lsn != 0) means the root was expected to
+			 * be minted — its absence is the minted-lost danger state;
+			 * otherwise the root was never minted and ABSENT is expected. */
+			if (cluster_wal_state_read_slot(dead_tid, &slot) == CLUSTER_WAL_SLOT_OK
+				&& slot.highest_lsn != 0) {
+				cluster_hw_bump_failclosed();
+				ereport(LOG, (errmsg("cluster HW remaster: dead node %d canonical root "
+									 "unreadable despite a registry publication (minted-lost) "
+									 "-> fail-stop without holding the hw gate",
+									 dead_node_id)));
+				return CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL;
+			}
+			/* Never-minted: no canonical data — degrade to the registry-
+			 * complete path below (the registry slot read either succeeds
+			 * or fails closed exactly as pre-bit22). */
+		} else {
+			validated_min = (XLogRecPtr) root_snap.validated_tail_lsn_exclusive;
+			if (validated_min == 0) {
+				cluster_hw_bump_failclosed();
+				ereport(LOG, (errmsg("cluster HW remaster: dead node %d canonical root has no "
+									 "validated tail -> adopted shards stay fail-closed",
+									 dead_node_id)));
+				return CLUSTER_HW_REMASTER_BLOCKED;
+			}
+			goto window_derived;
+		}
+	}
 	if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK
 		|| slot.highest_lsn == 0) {
 		cluster_hw_bump_failclosed();
@@ -484,6 +553,7 @@ cluster_hw_remaster_rebuild_origin(int dead_node_id, uint64 episode_epoch)
 	}
 	validated_min = (XLogRecPtr)slot.highest_lsn;
 
+window_derived:
 	if (cluster_thread_recovery_validated_end(dead_tid, lower, validated_min, &upper)
 		!= CLUSTER_THREADREC_DONE) {
 		cluster_hw_bump_failclosed();

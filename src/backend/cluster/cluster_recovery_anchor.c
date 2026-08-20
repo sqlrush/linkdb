@@ -414,8 +414,23 @@ cluster_recovery_anchor_publish_checkpoint(XLogRecPtr checkpoint_lsn,
 	/* RF-ROOT P5: the legacy source anchor remains selected until the R4
 	 * bit22 OPEN cutover, but its checkpoint bypass may no longer publish for
 	 * a fenced, excluded, or superseded node incarnation.  CreateCheckPoint
-	 * calls this while its outer coordinated CF(X) is held. */
-	cluster_write_fence_reject_if_fenced("recovery anchor checkpoint publication");
+	 * calls this while its outer coordinated CF(X) is held.
+	 *
+	 * RF-ROOT P7 G1b (Stage 8 contract / follow-up): the frozen P5
+	 * intent is SKIP when fenced — not publishing the anchor is the safe
+	 * direction (publishing is what would be dangerous), and this check
+	 * runs BEFORE any write, so there is nothing half-done to roll back.
+	 * The previous reject_if_fenced PANICed inside the caller's critical
+	 * section, contradicting the comment above; a site-4 pin reordering
+	 * (pre-IR pinned projection) first exposed the contradiction at
+	 * shutdown.  Skip with a LOG instead; the restart then takes the
+	 * ordinary crash-rejoin chain (fail-closed). */
+	if (!cluster_write_fence_allowed()) {
+		ereport(LOG, (errmsg("cluster recovery anchor: checkpoint publication skipped "
+							 "(this node is write-fenced); restart takes the ordinary "
+							 "crash-rejoin chain")));
+		return;
+	}
 	if (!checkpoint_publisher_is_current(sysid))
 		ereport(PANIC,
 				(errmsg("stale cluster member cannot publish a recovery checkpoint anchor")));

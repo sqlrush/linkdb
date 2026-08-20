@@ -113,6 +113,7 @@
 #include "storage/lwlock.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "cluster/cluster_semantic_activation.h" /* record types */
 
 
 /*
@@ -523,3 +524,10 @@ extern pid_t cluster_postmaster_start_qvotec(void);
 
 
 #endif /* CLUSTER_QVOTEC_H */
+
+/* RF-ROOT P9 verification (implementation): read-only startup read of the R4
+ * semantic-activation record tail (strict majority; zero writes). */
+extern ClusterSemanticActivationResult
+cluster_qvotec_bootstrap_read_semantic_activation(
+	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
+	bool *implicit_open);

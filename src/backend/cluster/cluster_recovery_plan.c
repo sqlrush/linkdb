@@ -43,14 +43,17 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_control_root.h" /* RF-ROOT P7 G1b step 4: canonical verdict source */
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h" /* pool lives in this wrapper (spec-4.4 D5) */
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_thread_recovery.h" /* ClusterThreadRecReplayState (slot init) */
 #include "cluster/cluster_wal_thread.h"
 #include "lib/stringinfo.h"
 #include "port/atomics.h"
+#include "postmaster/bgwriter.h" /* CheckPointTimeout (liveness threshold, contract) */
 #include "storage/shmem.h"
 #include "utils/timestamp.h"
 
@@ -149,6 +152,14 @@ publish_plan(const ClusterRecoveryPlan *plan)
  *	pass runs BEFORE InRecovery is determined, so a plan generated on
  *	a clean local start must be readable as exactly that).
  */
+/*
+ * cluster_recovery_plan_generate
+ *
+ *	dbstate_at_startup / local_recovery_needed are captured by the
+ *	caller from ControlFile at the hook site (P1-3 observability: this
+ *	pass runs BEFORE InRecovery is determined, so a plan generated on
+ *	a clean local start must be readable as exactly that).
+ */
 void
 cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_needed)
 {
@@ -157,8 +168,7 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 	uint16 own_thread;
 	int64 now_us;
 	uint16 tid;
-	XLogRecPtr max_scn_lsn = 0; /* scn_recovery_cmp tie-break carriers */
-	NodeId max_scn_node = 0;
+	bool bit22_active;
 
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
 		return;
@@ -175,15 +185,29 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 	now_us = (int64)GetCurrentTimestamp();
 	plan.generated_at = now_us;
 
+	/* RF-ROOT P9 verification (contract): the bit22 latch is shmem-only and dies
+	 * with the postmaster — re-arm it from the durable root when the
+	 * cutover round completed (ACTIVE + bit22 target) before the dual-path
+	 * sample below.  Fail-closed: absent/not-ACTIVE/census-RED roots leave
+	 * the gate pre-bit22 (frozen registry authority). */
+	cluster_control_root_restore_bit22_latch_if_active();
+
+	/* RF-ROOT P7 (contract §B / follow-up): dual-path by the bit22 cutover
+	 * latch, sampled once per pass so one plan is coherent.  false =
+	 * pre-bit22 (frozen §17.8: the wal-state registry remains the selected
+	 * authority); true = post-bit22 (root-only). */
+	bit22_active = cluster_r4_bit22_cutover_active();
+
 	/*
 	 * Defensive pass-level gate.  Under today's startup ordering the
 	 * spec-4.2 ensure() FATAL gate has already validated the registry
 	 * before the startup process runs, so this branch is not reachable
 	 * in practice; it exists so a future reordering degrades to an
 	 * honest 'failed' plan instead of 128 bogus EMPTY verdicts
-	 * (read_slot maps a missing file to EMPTY).
+	 * (read_slot maps a missing file to EMPTY).  Post-bit22 the registry
+	 * is telemetry-only (§17.9), so the precondition no longer applies.
 	 */
-	if (!cluster_wal_state_registry_ready()) {
+	if (!bit22_active && !cluster_wal_state_registry_ready()) {
 		plan.failed = true;
 		plan.generated = true;
 		publish_plan(&plan);
@@ -196,31 +220,64 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 
 	initStringInfo(&candidates);
 	for (tid = 1; tid <= CLUSTER_RECOVERY_PLAN_THREADS; tid++) {
-		ClusterWalStateSlot slot;
-		ClusterWalSlotVerdict v;
 		ClusterRecoveryThreadVerdict verdict;
+		int read_verdict; /* root result or slot verdict, for the DEBUG1 line */
 
-		v = cluster_wal_state_read_slot(tid, &slot);
-		verdict = cluster_recovery_classify_slot(v, &slot, own_thread, tid, now_us,
-												 cluster_recovery_stale_active_ms);
-		plan.verdict[tid] = (uint8)verdict;
-		plan.threads_scanned++;
+		if (bit22_active) {
+			ClusterControlRootSnapshot snapshot;
+			ClusterControlRootReadToken token;
+			ClusterControlRootResult root_result;
 
-		if (v == CLUSTER_WAL_SLOT_OK) {
-			if (slot.highest_lsn > plan.max_highest_lsn)
-				plan.max_highest_lsn = slot.highest_lsn;
-			/* SCN ordering goes through the spec-1.15 recovery comparator
-			 * (raw operators are CI-gated); the three-level tie-break
-			 * (local_scn -> LSN -> node) carries the winner's lsn/node. */
-			if (scn_recovery_cmp((SCN)slot.highest_scn, (XLogRecPtr)slot.highest_lsn,
-								 (NodeId)(tid - 1), (SCN)plan.max_highest_scn, max_scn_lsn,
-								 max_scn_node)
-				> 0) {
-				plan.max_highest_scn = slot.highest_scn;
-				max_scn_lsn = (XLogRecPtr)slot.highest_lsn;
-				max_scn_node = (NodeId)(tid - 1);
+			/*
+			 * Post-bit22 (§17.8 Target OPEN): the plan's per-thread source
+			 * is the canonical control root — STRONG read via the contract
+			 * §A two-step discovered-identity pattern (the startup process
+			 * is the frozen CF(S)-capable recovery admission, AD-023 §4).
+			 */
+			root_result = cluster_control_root_read_canonical_discovered(
+				tid, &snapshot, &token);
+			read_verdict = (int)root_result;
+			verdict = cluster_recovery_classify_root_slot(
+				root_result, &snapshot, own_thread, tid, now_us, CheckPointTimeout);
+
+			if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+				/*
+				 * Observation (max_highest_lsn): the registry's highest_lsn
+				 * is a write-position watermark the root does not carry; use
+				 * the canonical checkpoint/tail bounds as the conservative
+				 * observation (Stage 8 contract).
+				 */
+				if (snapshot.validated_tail_lsn_exclusive > plan.max_highest_lsn)
+					plan.max_highest_lsn = snapshot.validated_tail_lsn_exclusive;
+				if (snapshot.checkpoint_lower_lsn > plan.max_highest_lsn)
+					plan.max_highest_lsn = snapshot.checkpoint_lower_lsn;
+				/* follow-up item 3: max_highest_scn has no consumer; the SCN
+				 * ordering dimension is removed from correctness. */
+			}
+		} else {
+			ClusterWalStateSlot slot;
+			ClusterWalSlotVerdict v;
+
+			/*
+			 * Pre-bit22 (frozen §17.8 Source R4 OPEN): the wal-state
+			 * registry remains the selected authority — the restored
+			 * pre-migration shape (29efc553b0^).  The SCN ordering removed
+			 * by follow-up item 3 stays removed (no consumer).
+			 */
+			v = cluster_wal_state_read_slot(tid, &slot);
+			read_verdict = (int)v;
+			verdict = cluster_recovery_classify_slot(v, &slot, own_thread, tid,
+													 now_us,
+													 cluster_recovery_stale_active_ms);
+			if (v == CLUSTER_WAL_SLOT_OK) {
+				if (slot.highest_lsn > plan.max_highest_lsn)
+					plan.max_highest_lsn = slot.highest_lsn;
 			}
 		}
+
+		plan.verdict[tid] = (uint8)verdict;
+		plan.threads_scanned++;
 
 		switch (verdict) {
 		case CLUSTER_RECOVERY_THREAD_CLEAN:
@@ -245,8 +302,9 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 		}
 
 		if (verdict != CLUSTER_RECOVERY_THREAD_EMPTY)
-			ereport(DEBUG1, (errmsg("recovery plan: thread %u verdict %d (slot verdict %d)",
-									(unsigned)tid, (int)verdict, (int)v)));
+			ereport(DEBUG1, (errmsg("recovery plan: thread %u verdict %d (read verdict %d, bit22=%d)",
+									(unsigned)tid, (int)verdict, read_verdict,
+									bit22_active ? 1 : 0)));
 	}
 	plan.generated = true;
 
@@ -259,7 +317,7 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 						 candidates.len > 0 ? candidates.data : "", candidates.len > 0 ? "]" : "",
 						 (unsigned)plan.n_alive, (unsigned)plan.n_unknown),
 				  plan.n_unknown > 0
-					  ? errhint("UNKNOWN slots are never treated as crashed; check the shared "
+					  ? errhint("UNKNOWN verdicts are never treated as crashed; check the shared "
 								"WAL storage if they persist.")
 					  : 0));
 	pfree(candidates.data);
@@ -291,6 +349,76 @@ cluster_thread_recovery_replay_slot(uint16 dead_tid)
 	if (dead_tid < XLP_THREAD_ID_FIRST_REAL || dead_tid > CLUSTER_WAL_THREAD_MAX)
 		return NULL;
 	return &cluster_recovery_plan_shmem->thread_replay[dead_tid];
+}
+
+/*
+ * cluster_thread_recovery_pin_projection -- RF-ROOT P7 (contract §B): pin the
+ * canonical-root projection for one dead thread BEFORE the episode freeze.
+ * Post-bit22-only: the callers gate on cluster_r4_bit22_cutover_active
+ * (pre-bit22 consumers read the registry directly, follow-up minor item).  Must
+ * be called from a zero-resource-lock point (LMON tick before grd P1 freeze /
+ * startup pre-IR); the caller holds no CF.  The contract §A two-step read
+ * (BOOTSTRAP discover + STRONG bound) replaces the inert STRONG+NULL call —
+ * the token is minted by the STRONG step, and ABSENT / any read failure
+ * fails closed (returns false; the consumer's projection_current then
+ * refuses the thread — contract's never-minted/minted-lost semantics live in
+ * the post-bit22 branch).  Then stamp the slot under the given episode_epoch;
+ * the worker consumes only this immutable projection and never re-acquires
+ * CF(S) inside the episode (follow-up item 2, STOP-02 §1.3 projection
+ * discipline).  Returns false when the root read fails (the episode then
+ * fails closed on this thread) or the slot is absent.
+ */
+bool
+cluster_thread_recovery_pin_projection(uint16 dead_tid, uint64 episode_epoch)
+{
+	ClusterThreadReplaySlot *slot;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult root_result;
+
+	slot = cluster_thread_recovery_replay_slot(dead_tid);
+	if (slot == NULL)
+		return false;
+	root_result = cluster_control_root_read_canonical_discovered(
+		dead_tid, &snapshot, &token);
+	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return false;
+
+	/*
+	 * Single-writer (LMON/startup): plain stores via the header-only fill,
+	 * then the episode_epoch stamp is the publication fence the consumer
+	 * pairs with.
+	 */
+	cluster_thread_recovery_pin_fill(slot, &snapshot, &token);
+	pg_write_barrier();
+	pg_atomic_write_u64(&slot->episode_epoch, episode_epoch);
+	return true;
+}
+
+/*
+ * cluster_thread_recovery_projection_current -- RF-ROOT P7 G1b step 4: the
+ * episode bgworker's read of the pinned projection.  Fail-closed: returns
+ * false unless the slot exists AND is stamped with exactly the current
+ * episode (the worker's own launch episode).  The caller then uses the
+ * pinned fields directly; it must NOT re-read the canonical root (no CF(S)
+ * inside the episode — follow-up item 2).
+ */
+bool
+cluster_thread_recovery_projection_current(uint16 dead_tid, uint64 episode_epoch,
+										   ClusterControlRootReadToken *token_out,
+										   uint64 *validated_tail_out,
+										   uint64 *checkpoint_lower_out,
+										   uint64 *lifecycle_out,
+										   uint32 *tail_tli_out,
+										   uint32 *checkpoint_tli_out)
+{
+	ClusterThreadReplaySlot *slot;
+
+	slot = cluster_thread_recovery_replay_slot(dead_tid);
+	return cluster_thread_recovery_projection_read(
+		slot, episode_epoch, token_out, validated_tail_out, checkpoint_lower_out,
+		lifecycle_out, tail_tli_out, checkpoint_tli_out);
 }
 
 /*

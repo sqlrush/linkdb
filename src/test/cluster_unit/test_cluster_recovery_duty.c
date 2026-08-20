@@ -10,6 +10,7 @@
 #include <stdlib.h>
 
 #include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_semantic_activation.h" /* ACK stage enum (G3) */
 #include "cluster/cluster_wal_thread.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
@@ -39,8 +40,71 @@ static uint64 ut_owner_read_incarnation;
 static int ut_owner_read_calls;
 static int ut_root_publish_calls;
 static ClusterControlRootPatch ut_root_published_patch;
+static ClusterControlRootPublishReason ut_root_published_reason;
 static bool ut_root_publish_context_authorized;
 static bool ut_root_publish_mutate_token;
+/* RF-ROOT P6 contract: the commit-time re-vet reads the durable
+ * clean-departed evidence to distinguish the missed-clean-close repair
+ * (OPEN root under the old owner, clean-departed) from a crash-rejoin
+ * commit racing the FSM (stays fail-closed). */
+static bool ut_clean_departed = false;
+/* recovery path: fail the next compare_and_publish once (transient refusal). */
+static bool ut_publish_fail_once = false;
+
+/* RF-ROOT P7 recovery path: the checkpointer's bounded THREAD_CLEAN_CLOSE retry
+ * stubs — an advancing fake clock, an immediate latch, and a controllable
+ * leaver serving rebind. */
+#include "storage/latch.h"
+static Latch ut_retry_latch;
+Latch *MyLatch = &ut_retry_latch;
+static TimestampTz ut_now_us = 1700000000000000LL;
+static int ut_waitlatch_calls = 0;
+static bool ut_serving_rebind_ok = false;
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return ut_now_us;
+}
+
+TimestampTz
+TimestampTzPlusMilliseconds(TimestampTz t, int64 ms)
+{
+	return t + (TimestampTz) ms * 1000;
+}
+
+int
+WaitLatch(Latch *latch, int wakeEvents, long timeout, uint32 wait_event_info)
+{
+	(void) latch;
+	(void) wakeEvents;
+	(void) timeout;
+	(void) wait_event_info;
+	ut_waitlatch_calls++;
+	/* Advance the fake clock 100ms per backoff so the bounded-retry
+	 * deadline tests complete quickly. */
+	ut_now_us += 100000;
+	return WL_TIMEOUT;
+}
+
+void
+ResetLatch(Latch *latch)
+{
+	(void) latch;
+}
+
+volatile sig_atomic_t InterruptPending = 0;
+
+void
+ProcessInterrupts(void)
+{
+}
+
+bool
+cluster_authority_serving_rebind_leaver(void)
+{
+	return ut_serving_rebind_ok;
+}
 
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(
@@ -81,7 +145,14 @@ cluster_control_root_compare_and_publish(
 	ClusterControlRootReadToken observed_token = *expected_token;
 
 	ut_root_publish_calls++;
+	/* recovery path retry test: fail the NEXT publish attempt once (transient S1
+	 * serving-stale refusal), then behave normally. */
+	if (ut_publish_fail_once) {
+		ut_publish_fail_once = false;
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
 	ut_root_published_patch = *patch;
+	ut_root_published_reason = reason;
 	if (ut_root_publish_mutate_token)
 		observed_token.root_publish_seq++;
 	ut_root_publish_context_authorized =
@@ -89,13 +160,53 @@ cluster_control_root_compare_and_publish(
 			&observed_token, patch, reason);
 	if (!ut_root_publish_context_authorized)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* Mirror the real CAS monotonicity (control_root.c compare_and_publish,
+	 * OWNER_REJOIN / THREAD_OPEN): desired owner must strictly exceed the
+	 * current owner and lineage must advance by exactly one.  The head gate
+	 * no longer pre-rejects the CLOSED branch (verification split), so
+	 * a stale / same-incarnation reopen must fail HERE like the real CAS. */
+	if (ut_root_publish_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
+			|| reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN)
+		&& (ut_root_snapshot.identity.root_lineage_seq == UINT64_MAX
+			|| patch->desired.identity.root_lineage_seq
+				   != ut_root_snapshot.identity.root_lineage_seq + 1
+			|| patch->desired.identity.origin_owner_incarnation
+				   <= ut_root_snapshot.identity.origin_owner_incarnation))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	if (ut_root_publish_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		*out_snapshot = ut_root_snapshot;
-		out_snapshot->lifecycle = patch->desired.lifecycle;
-		out_snapshot->identity.origin_owner_incarnation =
-			patch->desired.identity.origin_owner_incarnation;
-		out_snapshot->identity.root_lineage_seq =
-			patch->desired.identity.root_lineage_seq;
+		/* Mirror the real apply_patch: only MASKED fields change. */
+		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE) != 0)
+			out_snapshot->lifecycle = patch->desired.lifecycle;
+		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_OWNER_LINEAGE) != 0) {
+			out_snapshot->identity.origin_owner_incarnation =
+				patch->desired.identity.origin_owner_incarnation;
+			out_snapshot->identity.root_lineage_seq =
+				patch->desired.identity.root_lineage_seq;
+		}
+		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT) != 0) {
+			out_snapshot->checkpoint_tli = patch->desired.checkpoint_tli;
+			out_snapshot->checkpoint_source_kind =
+				patch->desired.checkpoint_source_kind;
+			out_snapshot->checkpoint_lower_lsn =
+				patch->desired.checkpoint_lower_lsn;
+			out_snapshot->checkpoint_record_crc32c =
+				patch->desired.checkpoint_record_crc32c;
+		}
+		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_TAIL) != 0) {
+			out_snapshot->tail_tli = patch->desired.tail_tli;
+			out_snapshot->tail_validation_kind =
+				patch->desired.tail_validation_kind;
+			out_snapshot->validated_tail_lsn_exclusive =
+				patch->desired.validated_tail_lsn_exclusive;
+			out_snapshot->tail_last_record_lsn =
+				patch->desired.tail_last_record_lsn;
+			out_snapshot->tail_last_record_crc32c =
+				patch->desired.tail_last_record_crc32c;
+		}
+		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY) != 0)
+			out_snapshot->root_flags = patch->desired.root_flags;
 		memset(out_token, 0, sizeof(*out_token));
 	}
 	return ut_root_publish_result;
@@ -159,6 +270,77 @@ cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected,
 	(void)expected;
 	(void)now_us;
 	return CLUSTER_FENCE_CACHE_INVALID;
+}
+
+/* RF-ROOT P6 (L4 admission / phase-3 gate diag refs): cluster_recovery_duty.o
+ * samples the live-component predicates; the pure unit pins them inert so the
+ * binary stays standalone (the formation-witness paths under test use the
+ * dedicated fixture mocks above). */
+int cluster_node_id = 0;
+
+bool
+cluster_cssd_get_status(void)
+{
+	return false;
+}
+
+int
+cluster_qvotec_get_status(void)
+{
+	return 0;
+}
+
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return false;
+}
+
+bool
+cluster_membership_is_member(int32 node_id pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_reconfig_self_join_admitted(void)
+{
+	return false;
+}
+
+bool
+cluster_lms_is_recovery_ready(void)
+{
+	return false;
+}
+
+int
+cluster_current_phase(void)
+{
+	return 0;
+}
+
+bool
+cluster_recovery_transport_components_current(void)
+{
+	return false;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
 }
 
 static void
@@ -252,7 +434,322 @@ setup_owner_rejoin(uint64 old_incarnation, uint64 new_incarnation)
 	ut_root_publish_calls = 0;
 	ut_root_publish_context_authorized = false;
 	ut_root_publish_mutate_token = false;
+	ut_clean_departed = false;
+	ut_publish_fail_once = false;
 	memset(&ut_root_published_patch, 0, sizeof(ut_root_published_patch));
+}
+
+/* Link-only stub for the durable clean-departed evidence read (increment
+ * 21 repair routing); the fixture sets ut_clean_departed. */
+bool
+cluster_reconfig_is_clean_departed(int32 node_id pg_attribute_unused())
+{
+	return ut_clean_departed;
+}
+
+/* RF-ROOT P7 G3: the R4 cutover coordinator proof's ACK-complete read.
+ * The fixture controls the verdict + records the round identity the proof
+ * presented and the minimum stage demanded. */
+static bool ut_ack_complete_ok = false;
+static int ut_ack_complete_calls = 0;
+static uint32 ut_ack_min_stage = 0;
+
+bool
+cluster_semantic_activation_ack_complete_matches(
+	uint64 transition_epoch, uint64 record_generation,
+	uint64 expected_members_lo, uint64 expected_members_hi,
+	uint64 source_feature_bitmap, uint64 target_feature_bitmap,
+	uint64 capability_sample_digest,
+	ClusterSemanticActivationAckStage minimum_stage)
+{
+	ut_ack_complete_calls++;
+	ut_ack_min_stage = (uint32) minimum_stage;
+	(void) transition_epoch;
+	(void) record_generation;
+	(void) expected_members_lo;
+	(void) expected_members_hi;
+	(void) source_feature_bitmap;
+	(void) target_feature_bitmap;
+	(void) capability_sample_digest;
+	return ut_ack_complete_ok;
+}
+
+/* RF-ROOT P7 G4: the runtime census stub.  contract follow-up: the census
+ * gate moved from the activate proof to the bit22 latch apply (cutover
+ * round binding), so this stub now only serves the "census must not gate
+ * activate" assertion in test_activate_authority_requires_complete_ack_round.
+ */
+static bool ut_census_ok = false;
+
+bool
+cluster_wal_state_correctness_census_ok(void)
+{
+	return ut_census_ok;
+}
+
+/* Stateless pure predicate; replicate the production whitelist so the
+ * coordinator proof's known-bit gate is exercised with real semantics. */
+bool
+cluster_control_root_feature_bitmap_is_known(uint64 active_feature_bitmap)
+{
+	return (active_feature_bitmap & ~PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1) == 0;
+}
+
+UT_TEST(test_checkpoint_advance_publishes_canonical_bound)
+{
+	/* RF-ROOT P7 G1a: the checkpointer's canonical checkpoint advertisement
+	 * (CHECKPOINT_ADVANCE, frozen 0x38 shape) advances the root's
+	 * checkpoint_lower_lsn + record CRC + the validated tail (the just
+	 * written checkpoint record is the WAL-extent validation point);
+	 * owner lineage untouched. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	UT_ASSERT(cluster_control_root_checkpoint_advance_publish(
+		UINT64_C(0x2000000), 1, UINT64_C(0x1fffff0), UINT64_C(0x2000020),
+		UINT32_C(0x44556677)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 1);
+	UT_ASSERT(ut_root_publish_context_authorized);
+	UT_ASSERT_EQ((int)ut_root_published_reason,
+				 (int)CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE);
+	UT_ASSERT_EQ(ut_root_published_patch.mask, UINT64_C(0x38));
+	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle,
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	/* The 0x38 mask has no LIFECYCLE bit: desired.lifecycle stays 0. */
+	UT_ASSERT_EQ(ut_root_published_patch.desired.lifecycle,
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.checkpoint_lower_lsn,
+				 UINT64_C(0x2000000));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.checkpoint_record_crc32c,
+				 UINT32_C(0x44556677));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.validated_tail_lsn_exclusive,
+				 UINT64_C(0x2000020));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.tail_last_record_lsn,
+				 UINT64_C(0x1fffff0));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.tail_last_record_crc32c,
+				 UINT32_C(0x44556677));
+	UT_ASSERT_EQ(
+		ut_root_published_patch.desired.identity.origin_owner_incarnation, 0);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.root_lineage_seq, 0);
+
+	/* A non-advancing redo (<= current bound) is a no-op: zero publishes. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	UT_ASSERT(!cluster_control_root_checkpoint_advance_publish(
+		UINT64_C(0x1000000), 1, UINT64_C(0xfffff0), UINT64_C(0x1000020),
+		UINT32_C(0x44556677)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 0);
+
+	/* Not OPEN (e.g. CLOSED / RECOVERY_COMPLETE) is fail-closed. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT(!cluster_control_root_checkpoint_advance_publish(
+		UINT64_C(0x2000000), 1, UINT64_C(0x1fffff0), UINT64_C(0x2000020),
+		UINT32_C(0x44556677)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 0);
+}
+
+UT_TEST(test_fpw_sticky_publishes_canonical_flag)
+{
+	/* RF-ROOT P7 G1a-2: the checkpointer's canonical FPW-off sticky
+	 * (FPW_STICKY, frozen 0x40 shape) sets the root's FLAG_FPW_WAS_OFF. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	UT_ASSERT(cluster_control_root_fpw_sticky_publish());
+	UT_ASSERT_EQ(ut_root_publish_calls, 1);
+	UT_ASSERT(ut_root_publish_context_authorized);
+	UT_ASSERT_EQ((int)ut_root_published_reason,
+				 (int)CLUSTER_CONTROL_ROOT_PUBLISH_FPW_STICKY);
+	UT_ASSERT_EQ(ut_root_published_patch.mask,
+				 CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY);
+	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle,
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT((ut_root_published_patch.desired.root_flags
+			   & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0);
+
+	/* Already sticky is a no-op (the apply_patch guard never clears it). */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	ut_root_snapshot.root_flags |= CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF;
+	UT_ASSERT(cluster_control_root_fpw_sticky_publish());
+	UT_ASSERT_EQ(ut_root_publish_calls, 0);
+
+	/* Not OPEN is fail-closed. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT(!cluster_control_root_fpw_sticky_publish());
+	UT_ASSERT_EQ(ut_root_publish_calls, 0);
+}
+
+UT_TEST(test_create_authority_requires_complete_ack_round)
+{
+	/* RF-ROOT P7 G3 (verification: ACK-consumer boundary tests):
+	 * the R4 cutover create authority is the coordinator's one-shot proof —
+	 * refused for a non-coordinator, an incomplete ACK table, or a round
+	 * without bit22; granted only when all gates hold. */
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+
+	memset(&image, 0, sizeof(image));
+	memset(&round, 0, sizeof(round));
+	memcpy(round.magic, "PCRM", 4);
+	round.version = 1;
+	round.bytes = sizeof(round);
+	round.prepare_generation = 7;
+	round.transition_epoch = 3;
+	round.source_feature_bitmap = UINT64_C(1);
+	round.target_feature_bitmap =
+		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.admitted_bitmap_low = UINT64_C(0x03);
+	round.admitted_bitmap_high = 0;
+	round.capability_sample_digest = UINT64_C(0xabcd);
+	round.coordinator_node_id = 0;
+	round.coordinator_incarnation = 99;
+	cluster_node_id = 0;
+
+	/* RF-ROOT P9 verification (contract): the bit22 cutover round's create is
+	 * EXEMPT from the SAMPLE-stage ACK precondition — granted even while
+	 * the ACK table is not COMPLETE, and no ACK read happens at create
+	 * (the W6 clause-3 CLOSED binding lives in the activate proof). */
+	ut_ack_complete_ok = false;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(cluster_control_root_create_authority_current_v1(&image, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
+
+	/* Non-coordinator -> refused BEFORE any ACK read (fail-fast). */
+	cluster_node_id = 1;
+	ut_ack_complete_ok = true;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_create_authority_current_v1(&image, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
+
+	/* Coordinator + bit22 target -> granted, still no ACK read. */
+	cluster_node_id = 0;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(cluster_control_root_create_authority_current_v1(&image, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
+
+	/* Target WITHOUT bit22 -> the frozen SAMPLE-stage precondition binds
+	 * (R4 round): incomplete ACK table refuses after exactly one read... */
+	round.target_feature_bitmap = UINT64_C(1);
+	ut_ack_complete_ok = false;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_create_authority_current_v1(&image, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
+
+	/* ...and a complete SAMPLE round still cannot lift the whitelist:
+	 * create_authority requires bit22 in the target for every round. */
+	ut_ack_complete_ok = true;
+	ut_ack_min_stage = 0;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_create_authority_current_v1(&image, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
+	UT_ASSERT_EQ((int)ut_ack_min_stage,
+				 (int)CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+
+	/* Target with an UNKNOWN feature bit + bit22 -> refused (whitelist
+	 * gate), with no ACK read (exempt round). */
+	round.target_feature_bitmap = (UINT64_C(1) << 20)
+		| PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_create_authority_current_v1(&image, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
+	round.target_feature_bitmap =
+		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+}
+
+UT_TEST(test_activate_authority_requires_complete_ack_round)
+{
+	/* RF-ROOT P7 G3 (verification + contract follow-up): the activate
+	 * proof demands coordinator identity, the PREPARED-stage all-member
+	 * COMPLETE ACK bound to the round (W6 clause 3 CLOSED binding), and
+	 * bit22 in the target.  The runtime census gate was REMOVED here in
+	 * batch 3 — the census is the post-bit22 proof and binds inside the
+	 * cutover round at the latch apply
+	 * (cluster_r4_bit22_cutover_latch_apply), not as a pre-bit22
+	 * precondition on activate.  Fail-closed on each remaining check. */
+	ClusterControlRootFileToken token;
+	ClusterControlRootMigrationRoundV1 round;
+	uint8 sha[32];
+
+	memset(&token, 0, sizeof(token));
+	memset(&round, 0, sizeof(round));
+	memcpy(round.magic, "PCRM", 4);
+	round.version = 1;
+	round.bytes = sizeof(round);
+	round.prepare_generation = 7;
+	round.transition_epoch = 3;
+	round.source_feature_bitmap = UINT64_C(1);
+	round.target_feature_bitmap =
+		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.admitted_bitmap_low = UINT64_C(0x03);
+	round.admitted_bitmap_high = 0;
+	round.capability_sample_digest = UINT64_C(0xabcd);
+	round.coordinator_node_id = 0;
+	round.coordinator_incarnation = 99;
+	cluster_node_id = 0;
+	memset(sha, 0x11, sizeof(sha));
+
+	/* implementation: the census no longer gates activate — a RED census (deferred
+	 * hw_remaster still linked) must NOT refuse the ACK-bound proof. */
+	ut_census_ok = false;
+	ut_ack_complete_ok = true;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(cluster_control_root_activate_authority_current_v1(
+		&token, sha, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
+
+	/* ACK COMPLETE + bit22 target -> granted, and the activate proof
+	 * demands the PREPARED stage (W6 clause 3). */
+	ut_census_ok = true;
+	ut_ack_min_stage = 0;
+	UT_ASSERT(cluster_control_root_activate_authority_current_v1(
+		&token, sha, &round));
+	UT_ASSERT_EQ((int)ut_ack_min_stage,
+				 (int)CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED);
+
+	/* ACK not COMPLETE -> refused. */
+	ut_ack_complete_ok = false;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
+		&token, sha, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
+	ut_ack_complete_ok = true;
+
+	/* Non-coordinator -> refused BEFORE any ACK read (fail-fast). */
+	cluster_node_id = 1;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
+		&token, sha, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
+	cluster_node_id = 0;
+
+	/* Target WITHOUT bit22 -> refused (the bit22 cutover carrier). */
+	round.target_feature_bitmap = UINT64_C(1);
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
+		&token, sha, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
+	round.target_feature_bitmap =
+		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+
+	/* Target with an UNKNOWN feature bit -> refused (whitelist gate). */
+	round.target_feature_bitmap = (UINT64_C(1) << 20)
+		| PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
+		&token, sha, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
+	round.target_feature_bitmap =
+		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+
+	/* NULL round / NULL sha -> refused before any read. */
+	ut_ack_complete_calls = 0;
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
+		&token, sha, NULL));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
+		&token, NULL, &round));
+	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
 }
 
 UT_TEST(test_owner_rejoin_requires_jcmk_and_publishes_exact_root_cas)
@@ -292,6 +789,116 @@ UT_TEST(test_owner_rejoin_publication_context_rejects_token_drift)
 		CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN));
 }
 
+UT_TEST(test_owner_rejoin_rejects_open_stale_owner_frozen)
+{
+	/* recovery contract (recovery path, verification): the
+	 * increment-21 coordinator-side missed-clean-close repair is removed —
+	 * the OWNER (checkpointer) closes its own thread with a bounded retry.
+	 * OPEN under any owner other than admitted stays fail-closed (the
+	 * frozen OWNER_REJOIN shape), clean-departed or not. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	ut_clean_departed = true;
+	UT_ASSERT(!cluster_recovery_owner_rejoin_v1(3, UINT64_C(77)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 0);
+	UT_ASSERT_EQ(ut_owner_read_calls, 0);
+
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	ut_clean_departed = false;
+	UT_ASSERT(!cluster_recovery_owner_rejoin_v1(3, UINT64_C(77)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 0);
+	ut_clean_departed = false;
+}
+
+UT_TEST(test_clean_close_retry_transient_refusal_then_success)
+{
+	/* recovery path: a transient S1 serving-stale refusal of THREAD_CLEAN_CLOSE
+	 * is retried (with the leaver serving rebind + backoff) until it lands,
+	 * bounded by the 5s deadline. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	ut_publish_fail_once = true;
+	ut_serving_rebind_ok = true;
+	ut_now_us = 1700000000000000LL;
+	ut_waitlatch_calls = 0;
+	UT_ASSERT(cluster_control_root_thread_clean_close_publish_retry());
+	UT_ASSERT_EQ(ut_root_publish_calls, 2); /* refused attempt + retry */
+	UT_ASSERT_EQ(ut_waitlatch_calls, 1);	/* one backoff between attempts */
+	ut_publish_fail_once = false;
+}
+
+UT_TEST(test_clean_close_retry_deadline_gives_up_fail_closed)
+{
+	/* recovery path: a persistent refusal expires at the bounded deadline — the
+	 * retry gives up, the root stays OPEN and the shutdown proceeds
+	 * (fail-closed).  The fake latch advances the fake clock 100ms per
+	 * wait, so the 5s window is ~50 backoffs. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	ut_root_publish_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	ut_serving_rebind_ok = true;
+	ut_now_us = 1700000000000000LL;
+	ut_waitlatch_calls = 0;
+	UT_ASSERT(!cluster_control_root_thread_clean_close_publish_retry());
+	UT_ASSERT(ut_root_publish_calls > 1);	/* multiple attempts */
+	UT_ASSERT(ut_waitlatch_calls >= 40);	/* bounded: ~50 backoffs, never unbounded */
+	ut_root_publish_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+UT_TEST(test_owner_rejoin_closed_lifecycle_routes_to_thread_open)
+{
+	/* STOP-02 §17.4 frozen shape (adjudication 2026-08-18): OWNER_REJOIN
+	 * admits ONLY the RECOVERY_COMPLETE pre-lifecycle.  A CLOSED root is
+	 * the THREAD_CLEAN_CLOSE release — its reopen is the STOP-01
+	 * THREAD_OPEN mainline (CLOSED -> OPEN, frozen shape), routed here at
+	 * the commit-time re-vet (Stage 8 contract, corrected design):
+	 * same proof set as the crash-rejoin (monotonic newer incarnation +
+	 * write-once claim CRC + durable JCMK majority). */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT(cluster_recovery_owner_rejoin_v1(3, UINT64_C(77)));
+	UT_ASSERT_EQ(ut_owner_read_calls, 1);
+	UT_ASSERT_EQ(ut_root_publish_calls, 1);
+	UT_ASSERT(ut_root_publish_context_authorized);
+	UT_ASSERT_EQ((int)ut_root_published_reason,
+				 (int)CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN);
+	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle,
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.lifecycle,
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(
+		ut_root_published_patch.desired.identity.origin_owner_incarnation,
+		UINT64_C(77));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.root_lineage_seq,
+				 ut_root_identity.root_lineage_seq + 1);
+
+	/* Stale / same-incarnation reopen on a CLOSED root still fails closed:
+	 * the head gate no longer pre-rejects the CLOSED branch (implementation review
+	 * note 18 split), so the CAS monotonicity rejects it (desired owner
+	 * must strictly exceed the current owner) — the verdict is identical,
+	 * one CAS attempt later. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(70));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT(!cluster_recovery_owner_rejoin_v1(3, UINT64_C(70)));
+	UT_ASSERT_EQ(ut_owner_read_calls, 1);
+	UT_ASSERT_EQ(ut_root_publish_calls, 1); /* CAS_CONFLICT at the publish */
+	setup_owner_rejoin(UINT64_C(77), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT(!cluster_recovery_owner_rejoin_v1(3, UINT64_C(77)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 1); /* same-incarnation CAS_CONFLICT */
+
+	/* Bootstrap / retired roots are not in the reopen allowlist. */
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED;
+	UT_ASSERT(!cluster_recovery_owner_rejoin_v1(3, UINT64_C(77)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 0);
+	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED;
+	UT_ASSERT(!cluster_recovery_owner_rejoin_v1(3, UINT64_C(77)));
+	UT_ASSERT_EQ(ut_root_publish_calls, 0);
+}
+
 UT_TEST(test_owner_rejoin_fails_closed_on_non_jcmk_drift_or_exhaustion)
 {
 	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
@@ -309,9 +916,7 @@ UT_TEST(test_owner_rejoin_fails_closed_on_non_jcmk_drift_or_exhaustion)
 	UT_ASSERT_EQ(ut_owner_read_calls, 0);
 	setup_owner_rejoin(UINT64_C(77), UINT64_C(77));
 	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
-	ut_root_identity = ut_root_snapshot.identity;
 	UT_ASSERT(cluster_recovery_owner_rejoin_v1(3, UINT64_C(77)));
-	UT_ASSERT_EQ(ut_owner_read_calls, 1);
 	UT_ASSERT_EQ(ut_root_publish_calls, 0);
 
 	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
@@ -699,7 +1304,7 @@ UT_TEST(test_formation_pending_owner_and_full_outage_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(25);
 	UT_RUN(test_exact_74_byte_encoding);
 	UT_RUN(test_domain_separated_digest);
 	UT_RUN(test_full_key_compare_has_no_numeric_order);
@@ -710,7 +1315,15 @@ main(void)
 	UT_RUN(test_owner_import_never_falls_back_from_split_jcmk);
 	UT_RUN(test_owner_import_slot_fallback_requires_absent_jcmk_and_claim);
 	UT_RUN(test_owner_import_cannot_prove_jcmk_absence_with_unreadable_disk);
+	UT_RUN(test_checkpoint_advance_publishes_canonical_bound);
+	UT_RUN(test_fpw_sticky_publishes_canonical_flag);
+	UT_RUN(test_create_authority_requires_complete_ack_round);
+	UT_RUN(test_activate_authority_requires_complete_ack_round);
 	UT_RUN(test_owner_rejoin_requires_jcmk_and_publishes_exact_root_cas);
+	UT_RUN(test_owner_rejoin_rejects_open_stale_owner_frozen);
+	UT_RUN(test_clean_close_retry_transient_refusal_then_success);
+	UT_RUN(test_clean_close_retry_deadline_gives_up_fail_closed);
+	UT_RUN(test_owner_rejoin_closed_lifecycle_routes_to_thread_open);
 	UT_RUN(test_owner_rejoin_publication_context_rejects_token_drift);
 	UT_RUN(test_owner_rejoin_fails_closed_on_non_jcmk_drift_or_exhaustion);
 	UT_RUN(test_formation_f1_majority_f2_ready);

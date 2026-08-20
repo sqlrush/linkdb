@@ -306,6 +306,11 @@ typedef enum PcmXAllocatorKind {
 typedef void (*PcmXDomainSlotTestHook)(PcmXAllocatorKind kind, PcmXSlotRef ref);
 extern PGDLLIMPORT PcmXDomainSlotTestHook
 	cluster_pcm_x_domain_slot_test_between_state_reads_hook;
+/* RF-SIDE re-form negative test hook: when set and returning true, the
+ * tag-epoch advance fails like an allocator/view failure. */
+typedef bool (*PcmXTagEpochAdvanceTestFailHook)(void);
+extern PGDLLIMPORT PcmXTagEpochAdvanceTestFailHook
+	cluster_pcm_x_tag_epoch_advance_test_fail_hook;
 #endif
 
 /* Seven bounded key spaces over the five logical pools. */
@@ -1447,6 +1452,33 @@ cluster_pcm_x_runtime_activate_bound(uint64 master_session_incarnation,
 extern PcmXQueueResult cluster_pcm_x_runtime_peer_binding_revalidate_exact(int32 peer_node,
 																		   uint64 cluster_epoch,
 																		   uint64 peer_session);
+/*
+ * RF-SIDE D-SIDE-07 (t/274 L4/L5): re-form the PCM-X runtime after a
+ * cluster reconfig permanently froze it.  A steady-state ACTIVE runtime
+ * whose formation binding (epoch + peer session) can no longer be
+ * re-proved fails closed (RECOVERY_BLOCKED) with NO recovery path — the
+ * binding is an activation-time snapshot, so ANY reconfig (fail-stop
+ * epoch bump, peer restart with a new session) froze the runtime forever.
+ *
+ * reform() re-binds the formation to the exact new collect: peer
+ * frontiers/outbound targets get the new epoch + session (a peer whose
+ * session CHANGED — a restarted process — gets its prehandle sequences
+ * reset to 1; an unchanged peer keeps its sequences so in-flight
+ * conversions of unaffected peers keep completing), the generation of
+ * every live master tag slot is advanced to the new epoch (old-epoch
+ * tickets become STALE — fail-closed suspended holders are recovered by
+ * the D3-prime path), and the runtime returns to ACTIVE under the next
+ * gate generation.  master_session_incarnation is UNCHANGED (it is the
+ * wire-visible sender identity == the node's qvotec incarnation;
+ * retire/ack ingress validates it against the sender's authenticated
+ * session, so a derived value would break the wire contract).
+ *
+ * Requires: runtime gate RECOVERY_BLOCKED; bindings non-NULL; at least
+ * one epoch/session difference vs the current binding (anti-spin);
+ * new_epoch != 0.  Returns false (no change) otherwise.
+ */
+extern bool cluster_pcm_x_runtime_reform(uint64 new_epoch,
+												 const PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT]);
 extern bool cluster_pcm_x_runtime_reset_activating(uint32 expected_gate_generation);
 extern bool cluster_pcm_x_runtime_transition(PcmXRuntimeState expected, PcmXRuntimeState desired);
 /* Cross-layer fail-closed seam for adapters that have already consumed an

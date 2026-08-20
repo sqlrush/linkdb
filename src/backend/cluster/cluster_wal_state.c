@@ -67,6 +67,7 @@
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_semantic_activation.h" /* source-close writer gate */
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "miscadmin.h"
@@ -208,6 +209,11 @@ cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStat
 		return CLUSTER_WAL_STATE_UPDATE_DISABLED;
 	if (!wal_state_cf_prerequisites_ready())
 		return CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE;
+	/* RF-ROOT P9 verification (implementation): the bit22 first-open round's BARRIER
+	 * freezes the source — a closed source refuses new writers (NOOP:
+	 * the caller treats it as a benign no-op, never a failure). */
+	if (!cluster_r4_bit22_source_writer_enter())
+		return CLUSTER_WAL_STATE_UPDATE_NOOP;
 
 	if (cf_mode == CLUSTER_WAL_STATE_CF_ACQUIRE_X) {
 		/* Do not trip cluster_cf_lock's deliberate non-reentrant Assert. */
@@ -318,14 +324,23 @@ cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStat
 		memcpy(published_slot, &fresh_observed, sizeof(*published_slot));
 
 out:
+	cluster_r4_bit22_source_writer_leave();
 	if (fd >= 0) {
 		int save_errno = errno;
 
 		(void)close(fd);
 		errno = save_errno;
 	}
-	if (acquired_here)
-		cluster_cf_unlock(ExclusiveLock);
+	if (acquired_here) {
+		/* STOP-01 §17.7 (RF A1 W1-W5, frozen): the coordinated CF(X)
+		 * release must be CONFIRMED.  An unconfirmed release is
+		 * RELEASE_UNCERTAIN — fail-closed (the caller must not re-acquire
+		 * or re-publish on the same token; the slot deliberately stays
+		 * held and the next acquire drains it — never a double grant). */
+		if (cluster_cf_unlock_confirmed(ExclusiveLock)
+			== CLUSTER_CF_RELEASE_UNCONFIRMED)
+			return CLUSTER_WAL_STATE_UPDATE_RELEASE_UNCERTAIN;
+	}
 	return result;
 }
 
@@ -514,13 +529,27 @@ static bool
 write_own_slot(const ClusterWalStateSlot *slot)
 {
 	char path[MAXPGPATH];
+	bool entered;
+
+	/* RF-ROOT P9 verification (implementation): a closed source (bit22 first-open
+	 * BARRIER) freezes the slot — benign no-op, never a failure. */
+	entered = cluster_r4_bit22_source_writer_enter();
+	if (!entered)
+		return true;
 
 	/* Decision-style injection (spec-4.2 D5): simulate a write failure. */
-	if (cluster_injection_should_skip("cluster-wal-state-write-fail"))
+	if (cluster_injection_should_skip("cluster-wal-state-write-fail")) {
+		cluster_r4_bit22_source_writer_leave();
 		return false;
+	}
 
 	registry_path(path, sizeof(path));
-	return write_block(path, CLUSTER_WAL_STATE_SLOT_OFFSET(slot->thread_id), slot);
+	if (!write_block(path, CLUSTER_WAL_STATE_SLOT_OFFSET(slot->thread_id), slot)) {
+		cluster_r4_bit22_source_writer_leave();
+		return false;
+	}
+	cluster_r4_bit22_source_writer_leave();
+	return true;
 }
 
 /*
@@ -795,6 +824,40 @@ uint64
 cluster_wal_state_refresh_fail_count(void)
 {
 	return cluster_wal_thread_refresh_fail_read();
+}
+
+/*
+ * RF-ROOT P7 G4 (bit22 open gate; follow-up): the runtime census.  The static
+ * CI census (scripts/ci/check-wal-state-correctness-census.sh, strict mode)
+ * counts every production correctness reader/writer call site of the
+ * wal-state registry; this table is its runtime mirror — every known-deferred
+ * correctness site that still exists in the binary is listed here.  The
+ * activate proof (cluster_control_root_activate_authority_current_v1) calls
+ * cluster_wal_state_correctness_census_ok() and fails closed while the table
+ * is non-empty: bit22 must NOT open until each deferred site is migrated to
+ * the canonical control root (G1b step 4), at which point the entry is
+ * removed from BOTH this table and the script's DEFERRED list in the same
+ * commit (the script cross-checks the two lists stay in lockstep).
+ *
+ * implementation / contract / follow-up (2026-08-18): the census is the POST-bit22
+ * static proof (gate modeling).  recovery_plan.c / recovery_worker.c /
+ * cluster_thread_recovery_orchestrator.c / cluster_hw_remaster.c registry
+ * reads are GATE-BOUND — legal pre-bit22 (frozen §17.8) and statically
+ * unreachable post-bit22 behind the recognized
+ * cluster_r4_bit22_cutover_active() gate idiom — so the table is EMPTY:
+ * the runtime latch apply self-check is GREEN and the static strict census
+ * holds (post-bit22 exactly-zero, gate-modeled).  The table stays as the
+ * lockstep anchor for any future ungated site (a regression re-lists it
+ * here + in the script and turns the latch apply self-check RED).
+ */
+static const char *const cluster_wal_state_census_deferred_sites[] = {
+	NULL
+};
+
+bool
+cluster_wal_state_correctness_census_ok(void)
+{
+	return cluster_wal_state_census_deferred_sites[0] == NULL;
 }
 
 #else /* !USE_PGRAC_CLUSTER */

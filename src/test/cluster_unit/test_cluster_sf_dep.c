@@ -444,6 +444,11 @@ UT_TEST(test_r4_exported_family_sample_accepts_registered_generation_zero)
 	bool done = false;
 	uint32 generation = UINT32_MAX;
 
+	/* RF-ROOT P9 verification (verified implementation): the generation is the peer's
+	 * tier1 reconnect_count, which is 0 for the FIRST verified connection;
+	 * the semantic-activation gates require a NONZERO capability generation
+	 * (0 = no verified record), so note() maps the first verified connection
+	 * (registered 0) to generation 1. */
 	test_sf_cap_store_reset();
 	cluster_sf_note_peer_hello_capabilities_gen(
 		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS | PGRAC_IC_HELLO_CAP_GCS_DONE_V1, 0);
@@ -451,9 +456,9 @@ UT_TEST(test_r4_exported_family_sample_accepts_registered_generation_zero)
 		TEST_SF_CAP_PEER, TEST_R4_REQUIRED_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &done,
 		&generation));
 	UT_ASSERT(done);
-	UT_ASSERT_EQ(generation, (uint32)0);
+	UT_ASSERT_EQ(generation, (uint32)1);
 	UT_ASSERT(cluster_sf_peer_capability_generation_matches(TEST_SF_CAP_PEER,
-													 TEST_R4_REQUIRED_CAPS, 0));
+													 TEST_R4_REQUIRED_CAPS, 1));
 }
 
 UT_TEST(test_r4_exported_family_sample_reconnect_generation_is_exact)

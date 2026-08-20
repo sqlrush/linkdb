@@ -75,8 +75,15 @@ typedef struct ClusterSfPeerCap {
 static inline void
 cluster_sf_peer_cap_note(ClusterSfPeerCap *cap, uint32 bits, uint32 generation)
 {
+	/* RF-ROOT P9 verification (implementation): the generation is the peer's tier1
+	 * reconnect_count, which starts at 0 for the FIRST verified connection
+	 * (no reconnect happened yet).  The semantic-activation gates require
+	 * a NONZERO capability generation (0 = no verified record); map the
+	 * first verified connection to generation 1 so a fresh first-open
+	 * cluster satisfies the constraint.  Reconnects keep their natural
+	 * count (>0 already). */
 	cap->bits = bits;
-	cap->generation = generation;
+	cap->generation = generation == 0 ? 1 : generation;
 	cap->valid = true;
 }
 

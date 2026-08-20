@@ -815,11 +815,15 @@ cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin)
 	return CLUSTER_WALR_RELEASE_CONFIRMED;
 }
 
-static void
+static bool
 walr_share_request_init(uint16 thread_id, ClusterLockAcquireRequest *request)
 {
 	memset(request, 0, sizeof(*request));
-	Assert(cluster_wal_retention_resid_encode(thread_id, &request->resid));
+	/* RF-ROOT P9 verification (contract / follow-up): the resid encode must not
+	 * live inside Assert — a release build would ship a zeroed resid into
+	 * the GES lock request.  Explicit fail-closed instead (AGENTS.md). */
+	if (!cluster_wal_retention_resid_encode(thread_id, &request->resid))
+		return false;
 	request->lockmode = ShareLock;
 	request->op = CLUSTER_LOCK_OP_REQUEST;
 	request->current_mode = NoLock;
@@ -830,6 +834,7 @@ walr_share_request_init(uint16 thread_id, ClusterLockAcquireRequest *request)
 		(uint64)(GetCurrentTimestamp() / 1000);
 	request->timeout_ms = 1;
 	request->wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
+	return true;
 }
 
 ClusterWalPinResult
@@ -890,7 +895,10 @@ cluster_wal_retention_root_publish_begin_exact(
 			pfree(guard);
 			return CLUSTER_WAL_PIN_STALE;
 		}
-		walr_share_request_init(thread_id, &guard->walr.request);
+		if (!walr_share_request_init(thread_id, &guard->walr.request)) {
+			pfree(guard);
+			return CLUSTER_WAL_PIN_UNAVAILABLE;
+		}
 		result = walr_request_acquire_actual(&guard->walr.request);
 		if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
 			pfree(guard);
@@ -2630,8 +2638,15 @@ cluster_wal_reuse_guard_remove(ClusterWalReuseActionGuard *guard,
 		|| active_reuse_guard != guard || !guard->walr.held
 		|| guard->walr.release_uncertain
 		|| (guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_L3) == 0
-		|| (guard->flags & (CLUSTER_WAL_GUARD_F_PRIMARY_ZERO
-							 | CLUSTER_WAL_GUARD_F_FALLBACK_ZERO)) != 0) {
+		/* STOP-05 §15.5: the single recycle-to-remove fallback is the one
+		 * legal shape where PRIMARY_ZERO may be set -- the recycle attempt
+		 * changed zero bytes/names and the caller re-armed the same guard
+		 * through the fallback L3.  A zero-mutation note on the fallback
+		 * itself (FALLBACK_ZERO) or a PRIMARY_ZERO without the fallback L3
+		 * is ambiguous and stays GUARD_STATE. */
+		|| (guard->flags & CLUSTER_WAL_GUARD_F_FALLBACK_ZERO) != 0
+		|| ((guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_ZERO) != 0
+			&& (guard->flags & CLUSTER_WAL_GUARD_F_FALLBACK_L3) == 0)) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}

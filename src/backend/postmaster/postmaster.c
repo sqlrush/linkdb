@@ -187,6 +187,7 @@
 #include "cluster/cluster_catalog_bootstrap.h" /* cluster_catalog_startup_prepare (spec-6.14 D2) */
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
+#include "cluster/cluster_lmon.h"  /* cluster_lmon_suppress_reconfig (RF-ROOT P6) */
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3 D2) */
 #include "cluster/cluster_lms.h" /* cluster_lms_mark_child_exit (Scheme A) */
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
@@ -4315,6 +4316,21 @@ PostmasterStateMachine(void)
 				signal_child(LckPID, SIGTERM);
 			if (!retain_rf_a1_coordination && LmonPID != 0)
 				signal_child(LmonPID, SIGTERM);
+
+			/*
+			 * RF-ROOT P6 (t/243 cast wedge): a formed registry retains LMON
+			 * through the shutdown checkpoint so the checkpointer can still
+			 * take CF X.  But a retained, still-ticking LMON would keep
+			 * publishing reconfig events (a peer that stopped first dies ->
+			 * FAIL_STOP), which drives the GRD into a recovery episode whose
+			 * non-current authority then rejects the shutdown-checkpoint CF X
+			 * and the checkpointer exits without the clean STOPPED slot write.
+			 * Ask the retained LMON to stop publishing (it still exits through
+			 * the same flag once its own shutdown runs).  No-op when the LMON
+			 * child is absent.
+			 */
+			if (retain_rf_a1_coordination && LmonPID != 0)
+				cluster_lmon_suppress_reconfig();
 		}
 #endif
 		/* If we're in recovery, also stop startup and walreceiver procs */
@@ -4723,38 +4739,51 @@ TerminateChildren(int signal)
 	if (PgArchPID != 0)
 		signal_child(PgArchPID, signal);
 #ifdef USE_PGRAC_CLUSTER
-	if (LmonPID != 0)
-		signal_child(LmonPID, signal);
-	if (LckPID != 0)
-		signal_child(LckPID, signal);
-	if (DiagPID != 0)
-		signal_child(DiagPID, signal);
-	if (ClusterStatsPID != 0)
-		signal_child(ClusterStatsPID, signal);
-	/* PGRAC: spec-3.13 — same TerminateChildren for Undo Cleaner. */
-	if (UndoCleanerPID != 0)
-		signal_child(UndoCleanerPID, signal);
-	if (CssdPID != 0)
-		signal_child(CssdPID, signal);
-	if (QvotecPID != 0) /* PGRAC spec-2.6 Step 3 D7 */
-		signal_child(QvotecPID, signal);
-	if (LmsPID != 0) /* PGRAC spec-2.18 Sprint A Step 1 */
-		signal_child(LmsPID, signal);
+	/*
+	 * RF-ROOT P6 (L5 shutdown handoff):  the clean-shutdown mainline must
+	 * hand its CF/GES resources over while the coordination stack is still
+	 * alive (the Oracle behavior boundary — a clean stop lets GES/LMON
+	 * finish, it does not tear them down first).  A FAST shutdown therefore
+	 * SIGTERMs only the ordinary children here; the retained coordination
+	 * stack is retired after the checkpointer exits cleanly (the
+	 * PM_SHUTDOWN_2 path).  Immediate shutdown (SIGQUIT/SIGKILL) still
+	 * kills everything at once, so the crash path is unchanged.
+	 */
+	if (signal != SIGTERM || Shutdown != FastShutdown)
 	{
-		int w; /* PGRAC: spec-7.3 D2 — broadcast to LMS DATA-plane workers */
+		if (LmonPID != 0)
+			signal_child(LmonPID, signal);
+		if (LckPID != 0)
+			signal_child(LckPID, signal);
+		if (DiagPID != 0)
+			signal_child(DiagPID, signal);
+		if (ClusterStatsPID != 0)
+			signal_child(ClusterStatsPID, signal);
+		/* PGRAC: spec-3.13 — same TerminateChildren for Undo Cleaner. */
+		if (UndoCleanerPID != 0)
+			signal_child(UndoCleanerPID, signal);
+		if (CssdPID != 0)
+			signal_child(CssdPID, signal);
+		if (QvotecPID != 0) /* PGRAC spec-2.6 Step 3 D7 */
+			signal_child(QvotecPID, signal);
+		if (LmsPID != 0) /* PGRAC spec-2.18 Sprint A Step 1 */
+			signal_child(LmsPID, signal);
+		{
+			int w; /* PGRAC: spec-7.3 D2 — broadcast to LMS DATA-plane workers */
 
-		for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
-			if (LmsWorkerPIDs[w] != 0)
-				signal_child(LmsWorkerPIDs[w], signal);
+			for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
+				if (LmsWorkerPIDs[w] != 0)
+					signal_child(LmsWorkerPIDs[w], signal);
+		}
+		if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
+			signal_child(LmdPID, signal);
+		if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
+			signal_child(MrpPID, signal);
+		if (RfsPID != 0) /* PGRAC spec-6.4 D3 */
+			signal_child(RfsPID, signal);
+		if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
+			signal_child(SinvalBcastPID, signal);
 	}
-	if (LmdPID != 0) /* PGRAC spec-2.19 Sprint A Step 1 */
-		signal_child(LmdPID, signal);
-	if (MrpPID != 0) /* PGRAC spec-6.4 D1 */
-		signal_child(MrpPID, signal);
-	if (RfsPID != 0) /* PGRAC spec-6.4 D3 */
-		signal_child(RfsPID, signal);
-	if (SinvalBcastPID != 0) /* PGRAC spec-2.38 SI Broadcaster */
-		signal_child(SinvalBcastPID, signal);
 #endif
 }
 

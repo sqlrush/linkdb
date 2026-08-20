@@ -48,6 +48,7 @@
 #include "cluster/cluster_signal.h"				 /* spec-5.8 D8 — cluster_ges_cancel_pending */
 #include "cluster/cluster_ges_dedup.h"			 /* spec-2.27 D2 / D3 — retransmit dedup */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_membership.h" /* RF-ROOT P6 diag */
 #include "cluster/cluster_native_lock_probe.h" /* spec-2.25 D5 — probe protocol handlers */
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_guc.h"		   /* cluster_node_id + cluster_ges_request_timeout_ms */
@@ -158,7 +159,23 @@ ges_readiness_allows_early_opcode(uint32 opcode)
 	if (cluster_serving_ready_is_current())
 		return true;
 	if (opcode == GES_REQ_OPCODE_REDECLARE_DONE)
-		return cluster_recovery_transport_is_current();
+	{
+		bool allowed;
+
+		/*
+		 * RF-ROOT P6 (crash-rejoin): accept the barrier-building DONE
+		 * ingress on component currency alone (no GRD authority seal).
+		 * The seal is the phase-3 recovery-authority barrier's OUTPUT,
+		 * while the survivor's REDECLARE_DONE key is a required INPUT to
+		 * that same barrier's cluster-wide convergence (authority-axis
+		 * done slots) — the strict transport check therefore deadlocks
+		 * the rejoiner (see cluster_recovery_transport_components_current).
+		 * REDECLARE_DONE only mutates monotonic done arrays; every other
+		 * early opcode keeps the strict transport requirement.
+		 */
+		allowed = cluster_recovery_transport_components_current();
+		return allowed;
+	}
 	return opcode == GES_REQ_OPCODE_REQUEST
 		|| opcode == GES_REQ_OPCODE_RELEASE
 		|| opcode == GES_REQ_OPCODE_REDECLARE;

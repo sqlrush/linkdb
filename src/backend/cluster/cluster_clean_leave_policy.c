@@ -426,6 +426,10 @@ cluster_clean_leave_announce_payload_valid(const ClusterLeaveAnnouncePayload *p)
 		return false;
 	if (p->leaving_node_id < 0 || p->leaving_node_id >= CLUSTER_CLEAN_LEAVE_MAX_NODE_ID)
 		return false;
+	/* RF-ROOT P6 (shutdown-handoff wiring): the named producer byte must be a
+	 * known kind (an unknown value fails closed like a bad version). */
+	if (p->producer_kind > CLUSTER_LEAVE_PRODUCER_SHUTDOWN)
+		return false;
 	return true;
 }
 

@@ -63,6 +63,7 @@ bool cluster_controlfile_shared_authority = false;
 int cluster_cf_enqueue_timeout_ms = 30000;
 volatile sig_atomic_t InterruptPending = 0;
 int pg_dir_create_mode = 0700;
+int MyAuxProcType = 0; /* RF-ROOT P6: phase2.o samples it */
 
 /* ---- Assert + ereport + fd.c stubs (same pattern as the storage test) ---- */
 void

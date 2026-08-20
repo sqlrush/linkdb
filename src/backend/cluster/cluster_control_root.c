@@ -4,7 +4,7 @@
  *	  Survivor-readable failed-origin control-root carrier (RF-ROOT P1).
  *
  * The carrier is the user-approved PGRAC adaptation in frozen private spec
- * spec-s8-stop-01-root-control.md section 17.  It does not claim that these
+ * Stage 8 contract section 17.  It does not claim that these
  * bytes are Oracle control-file bytes.  Oracle alignment is at the authority
  * boundary: shared durable control metadata serialized by the CF enqueue.
  *
@@ -23,6 +23,8 @@
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster_control_root_private.h"
@@ -97,6 +99,9 @@ read_u64_le(const uint8 *src)
 		value = (value << 8) | src[i];
 	return value;
 }
+
+static void make_file_token(const ControlRootImage *image,
+						   ClusterControlRootFileToken *token);
 
 static void
 write_u16_le(uint8 *dst, uint16 value)
@@ -747,6 +752,147 @@ read_canonical_pair(ControlRootImage *primary, ControlRootImage *bak)
 	return bak_result;
 }
 
+/*
+ * cluster_control_root_restore_bit22_latch_if_active -- RF-ROOT P9 verification
+ *	(contract): re-arm the bit22 cutover latch across a postmaster restart.
+ *	The shmem latch lives only as long as the postmaster; a durable ACTIVE
+ *	root whose target bitmap carries bit22 means the cutover round
+ *	completed and the dual-path gate (§17.8) must read as post-bit22 on
+ *	the next boot.  The round identity is re-bound from the root header
+ *	(migration_transition_epoch / migration_prepare_generation) through
+ *	the same 0->1 CAS the in-round apply uses — a concurrent winner or an
+ *	already-armed latch is a no-op, and a census-RED apply fails closed
+ *	(the gate then stays pre-bit22, the registry path: safe direction).
+ *	Returns whether the gate reads as post-bit22 afterwards.
+ */
+bool
+cluster_control_root_restore_bit22_latch_if_active(void)
+{
+	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	ClusterSemanticActivationRecord open;
+	ControlRootImage primary;
+	ControlRootImage bak;
+	ClusterSemanticActivationResult qv_result;
+	ClusterControlRootResult root_result;
+	bool implicit_open = false;
+
+	if (cluster_r4_bit22_cutover_active())
+		return true;
+	/* RF-ROOT P9 verification (verified implementation): the latch restores only on
+	 * the DURABLE Target OPEN proof — a strict-majority OPEN(P+2) record
+	 * on the voting disks (the cutover round's own final record), cross-
+	 * matched to the ACTIVE canonical root's round identity (root
+	 * migration_transition_epoch == OPEN.transition_epoch AND root
+	 * migration_prepare_generation + 2 == OPEN.record_generation).
+	 * Neither the root ACTIVE state alone (the all-member OPEN_APPLIED
+	 * may not have completed) nor any record lifecycle axis is used.
+	 * The apply lands at TARGET_BOOTSTRAP (recovery planning may select
+	 * TARGET_VERIFIED before ordinary serving.
+	 * R4 cutover contract (verified implementation): `implicit_open` only reports
+	 * whether the majority-selected image is the all-zero pre-R4 sentinel
+	 * — a REAL durable OPEN(P+2) record reads back nonzero, so the flag
+	 * must NOT gate the restore (a post-bit22 restart would never re-arm
+	 * the latch and the control-plane gates would stay closed). */
+	qv_result = cluster_qvotec_bootstrap_read_semantic_activation(
+		selected, &implicit_open);
+	(void) implicit_open;
+	if (qv_result != CLUSTER_SEMANTIC_ACTIVATION_OK
+		|| !cluster_semantic_activation_record_decode(
+			selected, &open, NULL)
+		|| open.phase != CLUSTER_SEMANTIC_PHASE_OPEN)
+		return false;
+	root_result = read_canonical_pair(&primary, &bak);
+	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return false;
+	if (primary.header.activation_state
+			!= CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| (primary.header.target_feature_bitmap
+			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0
+		|| primary.header.migration_transition_epoch != open.transition_epoch
+		|| primary.header.migration_prepare_generation == UINT64_MAX
+		|| primary.header.migration_prepare_generation + 2
+		   != open.record_generation)
+		return false;
+	return cluster_r4_bit22_cutover_latch_apply(
+		open.transition_epoch, open.record_generation);
+}
+
+/*
+ * cluster_control_root_bootstrap_validate_active_round -- RF-ROOT P9 verification
+ *	#2 closure (verified implementation): startup/member-side verification that the
+ *	canonical root is ACTIVE and bound to exactly this cutover round
+ *	(migration_round_sha256 == round_sha256(round)).  Full canonical
+ *	validation (storage uuid / sysid / header+body CRC / primary-bak
+ *	coherence) via read_canonical_pair.  Forms a read-only proof: it
+ *	grants no token authority beyond the returned file token.
+ */
+ClusterControlRootResult
+cluster_control_root_bootstrap_validate_active_round(
+	const ClusterControlRootMigrationRoundV1 *round,
+	ClusterControlRootFileToken *token)
+{
+	ControlRootImage primary;
+	ControlRootImage bak;
+	uint8 sha[PG_SHA256_DIGEST_LENGTH];
+	ClusterControlRootResult result;
+
+	if (round == NULL
+		|| !cluster_control_root_round_sha256(round, sha))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = read_canonical_pair(&primary, &bak);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (primary.header.activation_state
+			!= CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| memcmp(primary.header.migration_round_sha256, sha,
+				  PG_SHA256_DIGEST_LENGTH) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (token != NULL)
+		make_file_token(&primary, token);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/*
+ * cluster_control_root_bootstrap_validate_active_round_fields -- RF-ROOT
+ * P9 verification (cold-formation): member-side twin of
+ * bootstrap_validate_active_round for the bit22 cutover round.  The full
+ * round (and its sha) is coordinator-local (the seam lives in coordinator
+ * shmem, which other NODES cannot see), so a member cannot recompute
+ * round_sha256.  It binds the ACTIVE root to the round identity it DOES
+ * hold — the ACK table's transition_epoch / prepare_generation (= table
+ * generation - 1) / source+target feature bitmaps — plus the invariant
+ * that the root carries a non-zero round sha (the coordinator wrote it
+ * under the create/activate proofs; header+body CRCs and the primary/bak
+ * coherence already validated).  Full canonical validation via
+ * read_canonical_pair; read-only, grants no token authority.
+ */
+ClusterControlRootResult
+cluster_control_root_bootstrap_validate_active_round_fields(
+	uint64 transition_epoch, uint64 prepare_generation,
+	uint64 source_feature_bitmap, uint64 target_feature_bitmap)
+{
+	ControlRootImage primary;
+	ControlRootImage bak;
+	ClusterControlRootResult result;
+
+	result = read_canonical_pair(&primary, &bak);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (primary.header.activation_state
+			!= CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| primary.header.migration_transition_epoch != transition_epoch
+		|| primary.header.migration_prepare_generation != prepare_generation
+		|| primary.header.source_feature_bitmap != source_feature_bitmap
+		|| primary.header.target_feature_bitmap != target_feature_bitmap
+		|| bytes_are_zero(primary.header.migration_round_sha256,
+						  sizeof(primary.header.migration_round_sha256)))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static void
 make_read_token(const ControlRootImage *image, uint16 thread_id, uint8 source,
 				ClusterControlRootReadToken *token)
@@ -842,8 +988,14 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 		snapshot = primary->records[origin_thread_id - 1];
 		memset(&token, 0, sizeof(token));
-		if (strong)
+		if (strong) {
 			make_read_token(primary, origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY, &token);
+			/* RF-ROOT P9 verification (implementation): a STRONG read is the CF(S)-
+			 * bound phase-4 revalidation — upgrade a bootstrapped bit22
+			 * latch to TARGET_VERIFIED (the serving/admission gate).
+			 * Idempotent; a SOURCE latch is left untouched. */
+			(void) cluster_r4_bit22_cutover_latch_verify();
+		}
 	}
 	pfree(bak);
 	pfree(primary);
@@ -856,6 +1008,96 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 		if (strong && out_token != NULL)
 			*out_token = token;
 	}
+	return result;
+}
+
+/*
+ * cluster_control_root_read_canonical_discovered -- RF-ROOT P7 (Stage 8 contract
+ *	contract §A, contract follow-up): the legal no-prior-identity STRONG read.
+ *	A STRONG read requires a bound expected_identity (control_root.c arg
+ *	check: STRONG+NULL -> INVALID_ARGUMENT), so a caller that does not yet
+ *	know the record's identity performs the committed two-step pattern
+ *	(wal_retention.c precedent): BOOTSTRAP_VALIDATE discovers the identity
+ *	(validation semantics only — no CF hold, no token minted), then the
+ *	STRONG read binds that exact identity and mints the token.  A republish
+ *	between the steps lands IDENTITY_MISMATCH (fail-closed; the caller's
+ *	next pass retries).  BOOTSTRAP output never serves a correctness
+ *	decision directly.
+ */
+ClusterControlRootResult
+cluster_control_root_read_canonical_discovered(
+	uint16 origin_thread_id, ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token)
+{
+	ClusterControlRootSnapshot bootstrap;
+	ClusterControlRootIdentity discovered;
+	ClusterControlRootResult result;
+
+	/* Clear the caller's outputs up front: a failed discovery must never
+	 * leak stale caller data (fail-closed hygiene, mirrors read_canonical). */
+	if (out_snapshot != NULL)
+		memset(out_snapshot, 0, sizeof(*out_snapshot));
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	memset(&bootstrap, 0, sizeof(bootstrap));
+	result = cluster_control_root_read_canonical(
+		origin_thread_id, NULL, CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE,
+		&bootstrap, NULL);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	discovered = bootstrap.identity;
+	return cluster_control_root_read_canonical(
+		origin_thread_id, &discovered, CLUSTER_CONTROL_ROOT_READ_STRONG,
+		out_snapshot, out_token);
+}
+
+/*
+ * cluster_control_root_read_canonical_dead_origin -- Stage 8 contract
+ *	(verified implementation): lock-free canonical read for a DEAD origin's thread.
+ *
+ *	The STRONG read's clusterwide CF share lock guards against a republish
+ *	racing the identity between discovery and bind.  A dead origin has no
+ *	live writer (its only publisher was the dead postmaster) and the GRD
+ *	recovery episode adopts each shard to exactly one survivor, so no
+ *	concurrent republish exists: the lock-free read is the final value.
+ *	"BOOTSTRAP output never serves a correctness decision" targets live
+ *	contested reads; here the data is static.  Used by the post-bit22
+ *	hw-remaster path while the GRD recovery still holds the CF shard
+ *	FROZEN (CF(S) itself unavailable), breaking the
+ *	remaster -> unfreeze -> CF-shard-NORMAL deadlock.
+ */
+ClusterControlRootResult
+cluster_control_root_read_canonical_dead_origin(
+	uint16 origin_thread_id, ClusterControlRootSnapshot *out_snapshot)
+{
+	ControlRootImage *primary;
+	ControlRootImage *bak;
+	ClusterControlRootResult result;
+
+	if (out_snapshot != NULL)
+		memset(out_snapshot, 0, sizeof(*out_snapshot));
+	if (origin_thread_id == 0
+		|| origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = storage_contract_check(NULL, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+
+	primary = palloc(sizeof(*primary));
+	bak = palloc(sizeof(*bak));
+	result = read_canonical_pair(primary, bak);
+	if ((result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		 || result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		&& !primary->present[origin_thread_id - 1])
+		result = CLUSTER_CONTROL_ROOT_ABSENT;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+		if (out_snapshot != NULL)
+			*out_snapshot = primary->records[origin_thread_id - 1];
+	}
+	pfree(bak);
+	pfree(primary);
 	return result;
 }
 
@@ -1033,7 +1275,8 @@ read_thread_claim_exact(uint16 thread_id, int32 node_id,
 
 static ClusterControlRootResult
 read_source_wal_state(const ClusterControlRootSnapshot *expected_records,
-					  const uint8 *expected_hash, uint8 hash_out[PG_SHA256_DIGEST_LENGTH])
+					  const uint8 *expected_hash, uint8 hash_out[PG_SHA256_DIGEST_LENGTH],
+					  const ClusterControlRootMigrationRoundV1 *round)
 {
 	uint8 *first;
 	uint8 *second;
@@ -1109,7 +1352,13 @@ read_source_wal_state(const ClusterControlRootSnapshot *expected_records,
 			}
 			continue;
 		}
-		if (verdict != CLUSTER_WAL_SLOT_OK || slot.state != CLUSTER_WAL_SLOT_STATE_STOPPED
+		if (verdict != CLUSTER_WAL_SLOT_OK
+			|| (slot.state != CLUSTER_WAL_SLOT_STATE_STOPPED
+				&& !(slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE
+					 && round != NULL
+					 && cluster_r4_bit22_source_close_current(
+						 round->transition_epoch,
+						 round->prepare_generation)))
 			|| slot.checkpoint_redo_lsn == 0 || slot.merge_recovered_lsn != 0
 			|| expected->identity.system_identifier == 0
 			|| expected->identity.origin_node_id != slot.node_id
@@ -1195,11 +1444,11 @@ write_durable_image(const char *final_path, const uint8 *bytes)
 		done += (size_t)n;
 	}
 	if (pg_fsync(fd) != 0) {
-		(void)CloseTransientFile(fd);
+		(void)close(fd);
 		fd = -1;
 		goto cleanup_closed;
 	}
-	if (CloseTransientFile(fd) != 0) {
+	if (close(fd) != 0) {
 		fd = -1;
 		goto cleanup_closed;
 	}
@@ -1220,7 +1469,7 @@ write_durable_image(const char *final_path, const uint8 *bytes)
 	return ok;
 
 cleanup:
-	(void)CloseTransientFile(fd);
+	(void)close(fd);
 	fd = -1;
 cleanup_closed:
 	if (created && !renamed)
@@ -1283,6 +1532,397 @@ file_token_equal(const ClusterControlRootFileToken *left,
 	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
 }
 
+/*
+ * read_thread_claim_fields -- RF-ROOT P7 (contract, step ④d): read the
+ * thread claim file (40-byte v1 layout) and extract the identity fields
+ * (created_at / crc) for a migration-image record.  The claim is
+ * write-once (spec-4.1), so this is the durable origin evidence.
+ */
+static bool
+read_thread_claim_fields(uint16 thread_id, int32 node_id,
+						 ClusterControlRootIdentity *identity)
+{
+	ClusterWalThreadClaim claim;
+	char dirname[MAXPGPATH];
+	char dirpath[MAXPGPATH];
+	char path[MAXPGPATH];
+	struct stat st;
+	size_t done = 0;
+	int fd;
+
+	if (identity == NULL)
+		return false;
+	cluster_wal_thread_dir_name(thread_id, dirname, sizeof(dirname));
+	if (dirname[0] == '\0'
+		|| snprintf(dirpath, sizeof(dirpath), "%s/%s",
+					cluster_wal_threads_dir, dirname) <= 0
+		|| (size_t)snprintf(dirpath, sizeof(dirpath), "%s/%s",
+							cluster_wal_threads_dir, dirname)
+		   >= sizeof(dirpath)
+		|| lstat(dirpath, &st) != 0 || !S_ISDIR(st.st_mode))
+		return false;
+	if (snprintf(path, sizeof(path), "%s/%s", dirpath,
+				 CLUSTER_WAL_THREAD_CLAIM_FILENAME) <= 0
+		|| (size_t)snprintf(path, sizeof(path), "%s/%s", dirpath,
+							CLUSTER_WAL_THREAD_CLAIM_FILENAME)
+		   >= sizeof(path))
+		return false;
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)
+		|| st.st_size != sizeof(claim)) {
+		if (fd >= 0)
+			CloseTransientFile(fd);
+		return false;
+	}
+	while (done < sizeof(claim)) {
+		ssize_t n = read(fd, (uint8 *)&claim + done, sizeof(claim) - done);
+
+		if (n <= 0) {
+			CloseTransientFile(fd);
+			return false;
+		}
+		done += (size_t)n;
+	}
+	if (CloseTransientFile(fd) != 0
+		|| !cluster_wal_thread_claim_validate(&claim, thread_id, node_id, NULL))
+		return false;
+	identity->thread_claim_created_at = claim.created_at;
+	identity->thread_claim_crc32c = claim.crc;
+	return true;
+}
+
+/*
+ * RF-ROOT P9 verification step-2 (contract): the thread-WAL-stream reader for
+ * the migration image.  The canonical root record needs the checkpoint
+ * record's CRC and the validated tail-last record; both live in the
+ * per-thread WAL stream (cluster_wal_threads_dir/thread_N), read through
+ * XLogReader with thread-local segment callbacks (the stream is NOT the
+ * local pg_wal).
+ */
+typedef struct MigrationWalReaderPrivate {
+	char thread_dir[MAXPGPATH];
+	uint32 tli;					/* stream TLI (from the wal-state slot) */
+} MigrationWalReaderPrivate;
+
+static void
+migration_wal_segment_open(XLogReaderState *state, XLogSegNo nextSegNo,
+						   TimeLineID *tli_p)
+{
+	MigrationWalReaderPrivate *priv =
+		(MigrationWalReaderPrivate *) state->private_data;
+	char fname[MAXFNAMELEN];
+	char path[MAXPGPATH];
+	int written;
+
+	if (priv == NULL) {
+		state->seg.ws_file = -1;
+		return;
+	}
+	XLogFileName(fname, *tli_p, nextSegNo, state->segcxt.ws_segsize);
+	written = snprintf(path, sizeof(path), "%s/%s", priv->thread_dir, fname);
+	if (written <= 0 || (size_t) written >= sizeof(path)) {
+		state->seg.ws_file = -1;
+		return;
+	}
+	state->seg.ws_file = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+}
+
+static void
+migration_wal_segment_close(XLogReaderState *state)
+{
+	/* RF-ROOT P9 verification / implementation review: the segment was opened
+	 * with BasicOpenFile (a raw fd, NOT the OpenTransientFile virtual-fd
+	 * table), so CloseTransientFile here is an API pairing violation
+	 * ("fd passed to CloseTransientFile was not obtained from
+	 * OpenTransientFile") — close() directly, matching PostgreSQL's own
+	 * wal_segment_close(). */
+	if (state->seg.ws_file >= 0)
+		close(state->seg.ws_file);
+	state->seg.ws_file = -1;
+}
+
+static int
+migration_wal_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
+						int reqLen, XLogRecPtr targetRecPtr,
+						char *cur_page)
+{
+	MigrationWalReaderPrivate *priv =
+		(MigrationWalReaderPrivate *) state->private_data;
+	WALReadError errinfo;
+
+	/* WALRead drives segment_open/close and pg_pread; a short read or a
+	 * missing segment is a clean end of the stream (WOULDBLOCK), which the
+	 * reader treats as EOF. */
+	if (priv == NULL)
+		return XLREAD_FAIL;
+	if (!WALRead(state, cur_page, targetPagePtr, XLOG_BLCKSZ, priv->tli,
+				 &errinfo))
+		return XLREAD_WOULDBLOCK;
+	return XLOG_BLCKSZ;
+}
+
+/*
+ * migration_wal_scan -- read the thread stream from the checkpoint redo
+ * record up to the write position; extract the checkpoint record CRC and
+ * the last complete record below the write position (tail-last).  A
+ * missing checkpoint record or any read failure fails closed (the image
+ * then cannot pass migration_image_validate — the round stays un-begun).
+ */
+static bool
+migration_wal_scan(uint16 thread_id, uint32 tli, XLogRecPtr checkpoint_redo,
+				   XLogRecPtr write_pos, uint32 *out_ckpt_crc,
+				   XLogRecPtr *out_tail_last_lsn, uint32 *out_tail_last_crc)
+{
+	MigrationWalReaderPrivate priv;
+	XLogReaderState *reader;
+	XLogRecPtr first_valid;
+	const XLogRecord *record;
+	char *errormsg;
+	bool saw_checkpoint = false;
+
+	if (out_ckpt_crc == NULL || out_tail_last_lsn == NULL
+		|| out_tail_last_crc == NULL || tli == 0
+		|| XLogRecPtrIsInvalid(checkpoint_redo)
+		|| XLogRecPtrIsInvalid(write_pos)
+		|| write_pos < checkpoint_redo)
+		return false;
+	*out_ckpt_crc = 0;
+	*out_tail_last_lsn = 0;
+	*out_tail_last_crc = 0;
+	{
+		char dirname[MAXPGPATH];
+
+		memset(&priv, 0, sizeof(priv));
+		priv.tli = tli;
+		cluster_wal_thread_dir_name(thread_id, dirname, sizeof(dirname));
+		if (dirname[0] == '\0'
+			|| snprintf(priv.thread_dir, sizeof(priv.thread_dir), "%s/%s",
+						cluster_wal_threads_dir, dirname) <= 0
+			|| (size_t)snprintf(priv.thread_dir, sizeof(priv.thread_dir),
+								"%s/%s", cluster_wal_threads_dir, dirname)
+			   >= sizeof(priv.thread_dir))
+			return false;
+	}
+	reader = XLogReaderAllocate(wal_segment_size, NULL,
+								XL_ROUTINE(.page_read = &migration_wal_read_page,
+										   .segment_open = &migration_wal_segment_open,
+										   .segment_close = &migration_wal_segment_close),
+								&priv);
+	if (reader == NULL)
+		return false;
+	first_valid = XLogFindNextRecord(reader, checkpoint_redo);
+	if (XLogRecPtrIsInvalid(first_valid)) {
+		XLogReaderFree(reader);
+		return false;
+	}
+	for (;;) {
+		record = XLogReadRecord(reader, &errormsg);
+		if (record == NULL)
+			break;		/* clean end of stream */
+		if (!saw_checkpoint) {
+			/* The first record at the redo pointer is the checkpoint record. */
+			*out_ckpt_crc = record->xl_crc;
+			saw_checkpoint = true;
+		}
+		if (reader->ReadRecPtr >= write_pos)
+			break;
+		if (reader->EndRecPtr <= write_pos) {
+			*out_tail_last_lsn = reader->ReadRecPtr;
+			*out_tail_last_crc = record->xl_crc;
+		}
+	}
+	XLogReaderFree(reader);
+	return saw_checkpoint && *out_ckpt_crc != 0;
+}
+
+/*
+ * cluster_control_root_build_migration_image -- RF-ROOT P7 (contract, step
+ * ④d) + P9 verification (verified implementation): construct the create_prepared
+ * migration image from the live shared state: wal-state registry slots
+ * (checkpoint/tail bounds), thread claim files (origin evidence),
+ * membership incarnations (owner binding) and the local storage identity.
+ * Fail-closed: every non-empty slot must be STOPPED with a valid
+ * checkpoint and zero merge-recovered bytes — OR ACTIVE and frozen by the
+ * same round's all-member source-close BARRIER
+ * (cluster_r4_bit22_source_close_current(round)): the online first-open
+ * round freezes every member's writers first, so an ACTIVE slot is
+ * provably quiesced (no offline STOPPED requirement).  Anything else
+ * refuses the round before any file is touched.
+ */
+ClusterControlRootResult
+cluster_control_root_build_migration_image(
+	const ClusterControlRootMigrationRoundV1 *round,
+	ClusterControlRootMigrationImage *out)
+{
+	ClusterControlRootMigrationImage image;
+	uint8 current_uuid[16];
+	uint8 *first;
+	uint8 *second;
+	char path[MAXPGPATH];
+	struct stat st;
+	uint32 assigned = 0;
+	uint16 i;
+	int fd;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	/* RF-ROOT P9 verification / implementation review: the LOCAL image is
+	 * filled field-by-field; without zeroing it first the reserved fields
+	 * carry stack garbage (observed live: reserved42=1 -> snapshot_
+	 * validate BAD_RESERVED -> create_prepared INVALID_ARGUMENT on the
+	 * very first bit22 round).  Zero it with out so every reserved byte is
+	 * deterministic. */
+	memset(&image, 0, sizeof(image));
+	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0'
+		|| lstat(cluster_wal_threads_dir, &st) != 0 || !S_ISDIR(st.st_mode)
+		|| snprintf(path, sizeof(path), "%s/%s", cluster_wal_threads_dir,
+					CLUSTER_WAL_STATE_FILENAME) <= 0
+		|| !regular_or_absent_nosymlink(path, false))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	first = palloc(CLUSTER_WAL_STATE_FILE_SIZE);
+	second = palloc(CLUSTER_WAL_STATE_FILE_SIZE);
+	/* Read the registry once and validate the image (its embedded checksum
+	 * rejects a torn read — the same guarantee the double-read in
+	 * read_source_wal_state provides, without re-reading per slot). */
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
+	if (fd < 0 || fstat(fd, &st) != 0
+		|| st.st_size != CLUSTER_WAL_STATE_FILE_SIZE) {
+		if (fd >= 0)
+			CloseTransientFile(fd);
+		pfree(second);
+		pfree(first);
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	}
+	if (pg_pread(fd, first, CLUSTER_WAL_STATE_FILE_SIZE, 0)
+			!= CLUSTER_WAL_STATE_FILE_SIZE
+		|| CloseTransientFile(fd) != 0
+		|| !cluster_wal_state_image_validate(
+			first, CLUSTER_WAL_STATE_FILE_SIZE, NULL, NULL)) {
+		pfree(second);
+		pfree(first);
+		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+	}
+	memcpy(second, first, CLUSTER_WAL_STATE_FILE_SIZE);
+	image.system_identifier = GetSystemIdentifier();
+	if (!current_storage_uuid(current_uuid)) {
+		pfree(second);
+		pfree(first);
+		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+	}
+	memcpy(image.storage_uuid, current_uuid, 16);
+	if (!pg_strong_random(image.authority_uuid, 16)) {
+		pfree(second);
+		pfree(first);
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	/* RFC-4122 version-4 stamp: migration_image_validate requires
+	 * uuid_v4_valid (version 4 + RFC variant bits) on the image authority
+	 * UUID; pg_strong_random alone yields arbitrary bytes (1/64 chance of
+	 * accidentally satisfying the nibble checks), which failed the live
+	 * first-open create_prepared (INVALID_ARGUMENT) at the very first
+	 * bit22 round — the fixture cast path never hit this because it
+	 * carries an externally-minted v4 UUID. */
+	image.authority_uuid[6] = (uint8) ((image.authority_uuid[6] & UINT8_C(0x0f))
+									   | UINT8_C(0x40));
+	image.authority_uuid[8] = (uint8) ((image.authority_uuid[8] & UINT8_C(0x3f))
+									   | UINT8_C(0x80));
+	image.created_at_usec = GetCurrentTimestamp();
+	for (i = 0; i < CLUSTER_WAL_STATE_SLOT_COUNT; i++) {
+		ClusterWalStateSlot slot;
+		ClusterWalSlotVerdict verdict;
+		ClusterControlRootSnapshot *record;
+
+		memcpy(&slot, first + CLUSTER_WAL_STATE_SLOT_OFFSET(i + 1),
+			   sizeof(slot));
+		verdict = cluster_wal_state_slot_classify(&slot, (uint16)(i + 1),
+												  -1, NULL);
+		if (verdict == CLUSTER_WAL_SLOT_EMPTY)
+			continue;
+		if (verdict != CLUSTER_WAL_SLOT_OK
+			|| slot.checkpoint_redo_lsn == 0
+			|| slot.merge_recovered_lsn != 0
+			|| (slot.state != CLUSTER_WAL_SLOT_STATE_STOPPED
+				&& !(slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE
+					 && round != NULL
+					 && cluster_r4_bit22_source_close_current(
+						 round->transition_epoch,
+						 round->prepare_generation)))) {
+			pfree(second);
+			pfree(first);
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		}
+		record = &image.records[i];
+		record->identity.system_identifier = image.system_identifier;
+		memcpy(record->identity.storage_uuid, image.storage_uuid, 16);
+		memcpy(record->identity.authority_uuid, image.authority_uuid, 16);
+		record->identity.origin_thread_id = (uint16)(i + 1);
+		record->identity.origin_node_id = slot.node_id;
+		record->identity.origin_owner_incarnation
+			= cluster_membership_get_last_admitted_incarnation(slot.node_id);
+		if (record->identity.origin_owner_incarnation == 0
+			|| !read_thread_claim_fields((uint16)(i + 1), slot.node_id,
+										 &record->identity)) {
+			pfree(second);
+			pfree(first);
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		}
+		record->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		record->root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+							 | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+							 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+							 | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+		/* RF-ROOT P9 verification (contract): every snapshot_validate field
+		 * must be backed — lineage/publish/kind/tli/CRC.  The record
+		 * CRCs (checkpoint + tail-last) come from the WAL stream via
+		 * migration_wal_scan (step b-2); the fold-recovery bounds are
+		 * new-mint values (no recovery progress yet). */
+		record->identity.root_lineage_seq = 1;
+		record->root_publish_seq = 1;
+		record->checkpoint_lower_lsn = slot.checkpoint_redo_lsn;
+		record->checkpoint_tli = slot.tli;
+		record->checkpoint_source_kind
+			= CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
+		record->validated_tail_lsn_exclusive = slot.highest_lsn;
+		record->tail_tli = slot.tli;
+		record->tail_validation_kind
+			= CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+		record->recovered_through_lsn_exclusive = slot.checkpoint_redo_lsn;
+		record->recovered_tli = slot.tli;
+		if (!migration_wal_scan(
+				(uint16)(i + 1), slot.tli, slot.checkpoint_redo_lsn,
+				slot.highest_lsn,
+				&record->checkpoint_record_crc32c,
+				&record->tail_last_record_lsn,
+				&record->tail_last_record_crc32c)) {
+			pfree(second);
+			pfree(first);
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		}
+		/* RF-ROOT P9 verification redo part 3: the scan fills the tail-last
+		 * record fields; snapshot_validate requires the matching
+		 * TAIL_LAST_RECORD_VALID flag whenever a tail-last record exists
+		 * (and forbids the flag when the fields are empty — the
+		 * checkpoint-at-write-pos degenerate case, where the scan leaves
+		 * both zero).  Without the flag the live first-open image failed
+		 * migration_image_validate (RANGE_INVALID) and create_prepared
+		 * refused the round. */
+		if (record->tail_last_record_lsn != 0
+			&& record->tail_last_record_crc32c != 0)
+			record->root_flags
+				|= CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+		record->published_at_usec = image.created_at_usec;
+		record->lifecycle_reason
+			= CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT;
+		assigned++;
+	}
+	image.assigned_record_count = assigned;
+	pfree(second);
+	pfree(first);
+	*out = image;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 ClusterControlRootResult
 cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *image,
 									 const ClusterControlRootMigrationRoundV1 *round,
@@ -1333,7 +1973,8 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	else
 		result = read_source_wal_state(image->records, NULL,
-								 root->header.source_wal_state_sha256);
+								 root->header.source_wal_state_sha256,
+								 round);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		for (i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; i++) {
 			if (image->records[i].identity.system_identifier == 0)
@@ -1379,6 +2020,7 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 ClusterControlRootResult
 cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expected_token,
 									   const uint8 expected_round_sha256[32],
+									   const ClusterControlRootMigrationRoundV1 *round,
 									   ClusterControlRootFileToken *out_token)
 {
 	ControlRootImage *primary;
@@ -1391,7 +2033,7 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
-	if (expected_token == NULL || expected_round_sha256 == NULL
+	if (expected_token == NULL || expected_round_sha256 == NULL || round == NULL
 		|| expected_token->file_txn_seq == 0
 		|| expected_token->activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED
 		|| expected_token->format_version != CONTROL_ROOT_FORMAT_VERSION
@@ -1399,9 +2041,10 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 		|| bytes_are_zero(expected_round_sha256, PG_SHA256_DIGEST_LENGTH))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	/* The PREPARED token and round hash establish freshness only.  Activation
-	 * also requires the cutover owner's separately bound authority. */
+	 * also requires the cutover owner's separately bound authority (the round
+	 * carries the coordinator identity + ACK-binding fields for the proof). */
 	if (!cluster_control_root_activate_authority_current_v1(
-			expected_token, expected_round_sha256))
+			expected_token, expected_round_sha256, round))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = storage_contract_check(NULL, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1423,7 +2066,7 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 		else
 			result = read_source_wal_state(primary->records,
 								   primary->header.source_wal_state_sha256,
-								   source_hash);
+								   source_hash, round);
 	}
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
@@ -1516,6 +2159,28 @@ patch_shape_valid(const ClusterControlRootPatch *patch,
 	if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
 		&& (patch->expected_lifecycle
 				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+			|| patch->desired.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+			|| patch->desired.identity.origin_owner_incarnation == 0
+			|| patch->desired.identity.root_lineage_seq == 0))
+		return false;
+	/*
+	 * RF-ROOT P6 (STOP-01 frozen THREAD_OPEN / THREAD_CLEAN_CLOSE
+	 * transitions — Oracle clean-close/open mainline):  a clean shutdown
+	 * closes the redo thread (OPEN -> CLOSED, owner lineage unchanged) and
+	 * a normal restart reopens it (CLOSED -> OPEN with the fresh boot
+	 * incarnation and lineage+1).  Crash / immediate-stop paths never write
+	 * CLOSED and therefore never reach THREAD_OPEN (expected-lifecycle
+	 * mismatch fails the CAS);  they stay on the survivor-driven
+	 * failure-recovery FSM instead.
+	 */
+	if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE
+		&& (patch->expected_lifecycle
+				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+			|| patch->desired.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED))
+		return false;
+	if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
+		&& (patch->expected_lifecycle
+				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 			|| patch->desired.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 			|| patch->desired.identity.origin_owner_incarnation == 0
 			|| patch->desired.identity.root_lineage_seq == 0))
@@ -1718,7 +2383,8 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 				 || (primary->records[thread_id - 1].root_flags
 					 & patch->expected_flags_mask) != patch->expected_flags_value)
 			result = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
-		else if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
+		else if ((reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
+				  || reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN)
 				 && (primary->records[thread_id - 1].identity.root_lineage_seq
 						 == UINT64_MAX
 					 || patch->desired.identity.root_lineage_seq
@@ -1826,6 +2492,24 @@ cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 	if (out_snapshot != NULL)
 		*out_snapshot = snapshot;
 	return result;
+}
+
+/*
+ * cluster_control_root_round_sha256 -- RF-ROOT P7 (contract): the round
+ * wire-encoded sha256 (same bytes create_prepared stores in the root header
+ * migration_round_sha256).  The cutover driver needs it to stage the seam.
+ */
+bool
+cluster_control_root_round_sha256(
+	const ClusterControlRootMigrationRoundV1 *round,
+	uint8 out_sha[PG_SHA256_DIGEST_LENGTH])
+{
+	uint8 round_bytes[80];
+
+	if (round == NULL || out_sha == NULL
+		|| !encode_round(round, round_bytes))
+		return false;
+	return control_root_sha256(round_bytes, sizeof(round_bytes), out_sha);
 }
 
 ClusterControlRootResult

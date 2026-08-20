@@ -941,7 +941,6 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 	memset(out_bitmap, 0, sizeof(uint64) * 2);
 	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
 		bool is_candidate = cluster_recovery_plan_candidate_test(&plan, tid);
-		ClusterWalStateSlot slot;
 
 		if (!is_candidate && tid != own_thread)
 			continue;
@@ -987,18 +986,41 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 							 "%sthread %u peer (node %d) is not a shared-root participant",
 							 blockers.len ? "; " : "", (unsigned)tid, (int)tid - 1);
 
-		/* Candidate start point + fpw history from its slot. */
-		if (cluster_wal_state_read_slot(tid, &slot) != CLUSTER_WAL_SLOT_OK) {
-			appendStringInfo(&blockers, "%sthread %u slot unreadable", blockers.len ? "; " : "",
-							 (unsigned)tid);
-		} else {
-			if (slot.checkpoint_redo_lsn == 0)
-				appendStringInfo(&blockers, "%sthread %u has no checkpoint redo start",
-								 blockers.len ? "; " : "", (unsigned)tid);
-			if (slot.fpw_was_off != 0)
-				appendStringInfo(&blockers, "%sthread %u ran with full_page_writes=off",
-								 blockers.len ? "; " : "", (unsigned)tid);
-			out_start[tid] = (XLogRecPtr)slot.checkpoint_redo_lsn;
+		/* Candidate start point + fpw history from the CANONICAL control root
+		 * (RF-ROOT P7 G1b-A): the root's checkpoint_lower_lsn is refreshed
+		 * every checkpoint (CHECKPOINT_ADVANCE) and its FPW_WAS_OFF sticky
+		 * by the checkpointer (FPW_STICKY); the wal-state registry is
+		 * telemetry only.  Startup-process context (cold recovery): the
+		 * STRONG root read's CF(S) is legal here and already exercised by
+		 * the fence-plan revalidation below (:1366). */
+		{
+			ClusterControlRootIdentity root_identity;
+			ClusterControlRootSnapshot root_snapshot;
+			ClusterControlRootReadToken root_token;
+			ClusterControlRootResult root_result;
+
+			root_result = cluster_control_root_lookup_owner_by_node_runtime(
+				(int) tid - 1, &root_identity, &root_snapshot, &root_token);
+			if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+				|| !cluster_recovery_duty_key_valid_v1(&root_identity)
+				|| cluster_recovery_duty_key_compare(&root_identity,
+												   &root_snapshot.identity)
+					   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
+				appendStringInfo(&blockers,
+								 "%sthread %u canonical root unreadable (result %d)",
+								 blockers.len ? "; " : "", (unsigned) tid,
+								 (int) root_result);
+			} else {
+				if (root_snapshot.checkpoint_lower_lsn == 0)
+					appendStringInfo(&blockers, "%sthread %u has no checkpoint redo start",
+									 blockers.len ? "; " : "", (unsigned) tid);
+				if ((root_snapshot.root_flags
+					 & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0)
+					appendStringInfo(&blockers, "%sthread %u ran with full_page_writes=off",
+									 blockers.len ? "; " : "", (unsigned) tid);
+				out_start[tid] = (XLogRecPtr) root_snapshot.checkpoint_lower_lsn;
+			}
 		}
 	}
 
@@ -1615,15 +1637,34 @@ cluster_recovery_merge_begin_internal(const uint64 merge_bitmap[2], const XLogRe
 		XLogBeginRead(ms->reader, start_lsn[tid]);
 		{
 			/* spec-4.5a hard obligation 2: bound the validated end by the
-			 * candidate's registry-recorded highest_lsn (durable write end).
+			 * candidate's CANONICAL control-root validated tail (RF-ROOT
+			 * P7 G1b-A; refreshed per checkpoint via CHECKPOINT_ADVANCE).
 			 * A stream whose decode stops short of it is corrupt below the
-			 * validated end, not a torn tail -- fail-closed in the helper. */
-			ClusterWalStateSlot slot;
+			 * validated end, not a torn tail -- fail-closed in the helper.
+			 * Equivalence: the root tail is a VALIDATED bound (vs the old
+			 * registry highest_lsn = an unvalidated write position), and
+			 * the inter-checkpoint gap's records are still integrity-
+			 * checked by the scan's own record framing — the floor only
+			 * rejects a decode stopping short of a known-validated point. */
+			ClusterControlRootIdentity root_identity;
+			ClusterControlRootSnapshot root_snapshot;
+			ClusterControlRootReadToken root_token;
+			ClusterControlRootResult root_result;
 			XLogRecPtr validated_min = InvalidXLogRecPtr;
 
-			if (!restore_mode && cluster_wal_state_read_slot(tid, &slot) == CLUSTER_WAL_SLOT_OK
-				&& slot.highest_lsn > (uint64)start_lsn[tid])
-				validated_min = (XLogRecPtr)slot.highest_lsn;
+			if (!restore_mode) {
+				root_result = cluster_control_root_lookup_owner_by_node_runtime(
+					(int) tid - 1, &root_identity, &root_snapshot, &root_token);
+				if ((root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					 || root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+					&& cluster_recovery_duty_key_compare(
+						&root_identity, &root_snapshot.identity)
+						   == CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
+					&& root_snapshot.validated_tail_lsn_exclusive
+						   > (uint64) start_lsn[tid])
+					validated_min =
+						(XLogRecPtr) root_snapshot.validated_tail_lsn_exclusive;
+			}
 			ms->valid_end = merge_compute_valid_end(ms->dir, start_lsn[tid], validated_min,
 													!restore_mode && tid != own_thread, tid, tli,
 													ms->stop_lsn, restore_mode);

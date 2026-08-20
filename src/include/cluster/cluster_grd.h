@@ -568,6 +568,13 @@ extern bool cluster_grd_recovery_authority_is_current(
 extern bool cluster_grd_serving_authority_rebind_lmon(
 	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
 	uint64 lms_generation);
+/* RF-ROOT P6 (L5 shutdown handoff): the committed LEAVER's serving rebind —
+ * no episode gates (the departed node never arms one for its own departure;
+ * its drain was cooperative and complete), re-stamped from its own applied
+ * CLEAN_LEAVE evidence. */
+extern bool cluster_grd_serving_authority_rebind_leaver(
+	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
+	uint64 lms_generation);
 
 /*
  * spec-4.6 D2 — failure-driven remaster (NOT affinity/DRM, NOT

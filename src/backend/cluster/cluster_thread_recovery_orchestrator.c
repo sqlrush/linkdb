@@ -1,9 +1,9 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_thread_recovery_orchestrator.c
- *	  pgrac online thread-recovery ORCHESTRATOR (spec-4.11 D1, increment 3b-2).
+ *	  pgrac online thread-recovery ORCHESTRATOR (spec-4.11 D1, contract).
  *
- *	  Increment 3a built the RMW data engine; 3b-1 built the R13-guarded data
+ *	  contract built the RMW data engine; 3b-1 built the R13-guarded data
  *	  driver.  This layer assembles a COMPLETE online recovery of one dead thread
  *	  and is the corruption-critical core of the feature:
  *
@@ -31,7 +31,7 @@
  *	       publishes no serving authority, so the thread stays frozen and never
  *	       serves a stale page (8.A).
  *
- *	  SCOPE (increment 3b-2).  replay_one is assembled but has NO live FSM caller
+ *	  SCOPE (contract).  replay_one is assembled but has NO live FSM caller
  *	  (3b-3 wires the GRD reconfig FSM + the D3 unfreeze gate that reads the
  *	  node-local authority this publishes).  The episode_epoch is threaded through
  *	  but its L235 abort-on-bump enforcement is 3b-3 (shmem replay-state).  The
@@ -76,6 +76,7 @@
 #include "cluster/cluster_ir.h"                /* STOP03 held serial guard */
 #include "cluster/cluster_recovery_merge.h"	   /* node-local authority publish (online)       */
 #include "cluster/cluster_recovery_plan.h"	   /* ClusterThreadReplaySlot + slot accessor     */
+#include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_remote_xact.h"	   /* per-origin outcome store flush              */
 #include "cluster/cluster_thread_recovery.h"   /* engine / driver / pure gates                */
 #include "cluster/cluster_wal_state.h"		   /* replay-window slot read                     */
@@ -333,6 +334,7 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 
 	memset(&touched, 0, sizeof(touched));
 	touched.mcxt = caller_ctx; /* the items array must outlive the drive */
+	touched.origin_thread_id = dead_tid; /* D-SIDE-08: real origin identity */
 	vis.do_visibility = true;
 	vis.origin_node = origin;
 
@@ -531,7 +533,6 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 								   ClusterRecoverySerialGuard *serial_guard)
 {
 	ClusterThreadRecScope scope;
-	ClusterWalStateSlot slot;
 	XLogRecPtr lower;
 	XLogRecPtr validated_min;
 	XLogRecPtr scan_upper;
@@ -559,38 +560,77 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 		return CLUSTER_THREADREC_NOT_APPLICABLE;
 
 	/*
-	 * Window derivation: lower = the dead thread's last checkpoint redo (a sound,
-	 * redo-idempotent replay start); the registry's observational highest_lsn is
-	 * the durable-write watermark (validated_min), NOT the replay upper.  A slot
-	 * read failure or an unusable slot (missing checkpoint history / nothing
-	 * written / inverted) fails closed.  A window-derivation BLOCKED is a real
-	 * fail-closed outcome of the live FSM path (the executor worker reaches it),
-	 * so it must bump the D5 failclosed counter too -- replay_one_window's own
-	 * counting is only reached once a window is derived (otherwise the most common
-	 * live fail-closed would be invisible in thread_recovery_replay_failclosed).
+	 * Window derivation — RF-ROOT P7 (contract §B / follow-up): dual-path
+	 * by the bit22 latch.  Pre-bit22 the wal-state registry is the authority
+	 * (frozen §17.8; registry reads need no CF): lower = the dead thread's
+	 * last checkpoint redo, validated_min = the durable-write watermark
+	 * (restored pre-migration shape, bb7fda782e^).  Post-bit22 the canonical
+	 * root projection (pinned by the LMON tick before the episode freeze) is
+	 * the only source: lower = checkpoint_lower, validated_min = validated
+	 * tail.  A window-derivation BLOCKED is a real fail-closed outcome of the
+	 * live FSM path, so it bumps the D5 failclosed counter.
 	 */
-	if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK) {
-		/* spec-6.14 D9: window-derivation fail-closes were silent; a frozen
-		 * thread needs an operator trace (launches are reconfig-driven, so
-		 * these one-per-launch LOGs cannot spam). */
-		ereport(LOG, (errmsg("cluster thread recovery: dead thread %u wal-state slot unreadable "
-							 "-> BLOCKED (kept frozen)",
-							 dead_tid)));
-		cluster_thread_recovery_count_blocked();
-		return CLUSTER_THREADREC_BLOCKED;
-	}
-	if (slot.checkpoint_redo_lsn == 0 || slot.highest_lsn == 0
-		|| slot.highest_lsn <= slot.checkpoint_redo_lsn) {
-		ereport(LOG, (errmsg("cluster thread recovery: dead thread %u wal-state slot unusable "
-							 "(checkpoint_redo %X/%X, highest %X/%X) -> BLOCKED (kept frozen)",
-							 dead_tid, LSN_FORMAT_ARGS((XLogRecPtr)slot.checkpoint_redo_lsn),
-							 LSN_FORMAT_ARGS((XLogRecPtr)slot.highest_lsn))));
-		cluster_thread_recovery_count_blocked();
-		return CLUSTER_THREADREC_BLOCKED;
-	}
+	if (cluster_r4_bit22_cutover_active()) {
+		ClusterControlRootReadToken pin_token;
+		uint64 pin_validated_tail;
+		uint64 pin_checkpoint_lower;
+		uint64 pin_lifecycle;
+		uint32 pin_tail_tli;
+		uint32 pin_checkpoint_tli;
 
-	lower = (XLogRecPtr)slot.checkpoint_redo_lsn;
-	validated_min = (XLogRecPtr)slot.highest_lsn;
+		if (!cluster_thread_recovery_projection_current(
+				dead_tid, episode_epoch, &pin_token, &pin_validated_tail,
+				&pin_checkpoint_lower, &pin_lifecycle, &pin_tail_tli,
+				&pin_checkpoint_tli)) {
+			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u canonical projection "
+								 "unavailable -> BLOCKED (kept frozen)",
+								 dead_tid)));
+			cluster_thread_recovery_count_blocked();
+			return CLUSTER_THREADREC_BLOCKED;
+		}
+		if (pin_checkpoint_lower == 0 || pin_validated_tail == 0
+			|| pin_validated_tail <= pin_checkpoint_lower) {
+			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u canonical projection "
+								 "unusable (checkpoint_lower %X/%X, validated_tail %X/%X) "
+								 "-> BLOCKED (kept frozen)",
+								 dead_tid,
+								 LSN_FORMAT_ARGS((XLogRecPtr) pin_checkpoint_lower),
+								 LSN_FORMAT_ARGS((XLogRecPtr) pin_validated_tail))));
+			cluster_thread_recovery_count_blocked();
+			return CLUSTER_THREADREC_BLOCKED;
+		}
+		(void) pin_token;
+		(void) pin_lifecycle;
+		(void) pin_tail_tli;
+		(void) pin_checkpoint_tli;
+		lower = (XLogRecPtr) pin_checkpoint_lower;
+		validated_min = (XLogRecPtr) pin_validated_tail;
+	} else {
+		ClusterWalStateSlot slot;
+
+		/* Pre-bit22 (frozen §17.8): the wal-state registry is the selected
+		 * authority — the restored pre-migration shape (bb7fda782e^). */
+		if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK) {
+			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u wal-state slot unreadable "
+								 "-> BLOCKED (kept frozen)",
+								 dead_tid)));
+			cluster_thread_recovery_count_blocked();
+			return CLUSTER_THREADREC_BLOCKED;
+		}
+		if (slot.checkpoint_redo_lsn == 0 || slot.highest_lsn == 0
+			|| slot.highest_lsn <= slot.checkpoint_redo_lsn) {
+			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u wal-state slot unusable "
+								 "(checkpoint_redo %X/%X, highest %X/%X) "
+								 "-> BLOCKED (kept frozen)",
+								 dead_tid,
+								 LSN_FORMAT_ARGS((XLogRecPtr) slot.checkpoint_redo_lsn),
+								 LSN_FORMAT_ARGS((XLogRecPtr) slot.highest_lsn))));
+			cluster_thread_recovery_count_blocked();
+			return CLUSTER_THREADREC_BLOCKED;
+		}
+		lower = (XLogRecPtr) slot.checkpoint_redo_lsn;
+		validated_min = (XLogRecPtr) slot.highest_lsn;
+	}
 
 	/*
 	 * D4 (spec-4.11 3b-4a): the replay upper is the VALIDATED torn-tail boundary

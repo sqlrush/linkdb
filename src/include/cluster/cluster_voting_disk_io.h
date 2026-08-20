@@ -140,6 +140,16 @@
 	((off_t)(5 * CLUSTER_MAX_NODES) * CLUSTER_VOTING_SLOT_BYTES)
 
 /*
+ * RF-ROOT P9 verification / cold-formation cold-formation ruling —
+ * cold-formation-marker region (region 7): one 512-byte slot per node
+ * immediately after the epoch-ballot region (offset 6N+2 per node).  The
+ * arbiter writes the SAME marker image into every co-boot member's slot
+ * (JCMK coordinator-write pattern).  Payload = ClusterFormationCommitMarker
+ * (magic "PGFM"); this layer is payload-agnostic aligned raw slot I/O.
+ */
+#define CLUSTER_VOTING_FORMATION_SLOT_OFFSET(node_id) 	((off_t) (7 * CLUSTER_MAX_NODES + 3 + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
+
+/*
  * spec-8.4 / spec-5.15A — PGSA occupies fixed slot 5N+1.  One 512-byte
  * epoch-ballot lane follows for each proposer node in slots [5N+2, 6N+2).
  */
@@ -150,8 +160,14 @@
 	((off_t)CLUSTER_EPOCH_BALLOT_SLOT(node_id) * CLUSTER_VOTING_SLOT_BYTES)
 #define CLUSTER_VOTING_FILE_BYTES_MIN                                                              \
 	((off_t)(6 * CLUSTER_MAX_NODES + 2) * CLUSTER_VOTING_SLOT_BYTES)
+/*
+ * B′ P0 fix: the attested capacity must cover region 7
+ * ([7N+3, 7N+3+N) formation slots) which now follows the undo-root
+ * descriptors ([6N+2, 7N+3)); previously region 7 overlapped the undo
+ * descriptors at 6N+2+node_id.
+ */
 #define CLUSTER_VOTING_PGRD_FILE_BYTES_MIN                                                         \
-	((off_t)(7 * CLUSTER_MAX_NODES + 3) * CLUSTER_VOTING_SLOT_BYTES)
+	((off_t)(8 * CLUSTER_MAX_NODES + 3) * CLUSTER_VOTING_SLOT_BYTES)
 
 /*
  * Payload-neutral read outcomes for the fixed append-only tail slot.  Unlike
@@ -292,6 +308,23 @@ extern ClusterVotingDiskIoState cluster_voting_disk_read_join_slot(int fd, uint3
 																   void *out_slot512);
 extern ClusterVotingDiskIoState cluster_voting_disk_write_join_slot(int fd, uint32 node_id,
 																	const void *in_slot512);
+
+/*
+ * RF-ROOT P9 verification / cold-formation cold-formation ruling — raw
+ * 512-byte cold-formation-marker slot R/W in region 7 (offset
+ * CLUSTER_VOTING_FORMATION_SLOT_OFFSET(node_id), immediately after the
+ * epoch-ballot region).  The arbiter writes the SAME marker image into
+ * every co-boot member's slot (JCMK coordinator-write pattern); payload =
+ * ClusterFormationCommitMarker (magic "PGFM") owning its own
+ * magic/version/CRC.  Same per-I/O timeout discipline and fail-closed
+ * empty semantics as the join-slot path.
+ */
+extern ClusterVotingDiskIoState cluster_voting_disk_read_formation_slot(int fd,
+																	   uint32 node_id,
+																	   void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_formation_slot(int fd,
+																		uint32 node_id,
+																		const void *in_slot512);
 
 /*
  * spec-6.4 D7 — raw 512-byte ADG apply-master lease slot R/W in region 4.

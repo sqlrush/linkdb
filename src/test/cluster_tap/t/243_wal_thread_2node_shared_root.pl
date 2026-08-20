@@ -45,6 +45,7 @@ use FindBin;
 use lib "$FindBin::RealBin/../lib";
 
 use File::Copy qw(copy);
+use IPC::Run ();
 use PgracClusterNode;
 use PostgreSQL::Test::ClusterPair;
 use PostgreSQL::Test::Utils;
@@ -86,6 +87,110 @@ my $node1 = $pair->node1;
 $pair->start_pair;
 ok($pair->wait_for_pcm_x_active(30),
 	'L1 PCM-X formation is ACTIVE on both writers before DML');
+
+# ============================================================
+# RF-ROOT P6 (setup): mint node1's canonical control root.
+#
+# L4's crash-rejoin depends on node0 running
+# cluster_recovery_owner_rejoin_v1 for node 1, which STRONG-reads
+# node1's control-root record (thread 2, $shared/global/
+# pgrac_control_root).  Production never mints the root file in this
+# flow (create/activate are migration-era APIs), so without a cast the
+# rejoin gate fails closed (JOIN_PENDING -> node1 53R61).  The cast
+# calls the existing RF-ROOT fixture binary, which drives the
+# production cluster_control_root_create_prepared/activate_prepared
+# against the real shared root, wal-state registry and claim files.
+# The producer only accepts a registry whose every non-empty slot is
+# STOPPED, so both nodes are checkpointed and cleanly stopped for the
+# cast, then restarted (clean rejoin -- no incarnation change).
+# ============================================================
+my $root_dir = "$FindBin::RealBin/../../../..";
+my $unit_dir = "$root_dir/src/test/cluster_unit";
+my $root_fixture = "$unit_dir/test_cluster_control_root";
+
+my ($cast_out, $cast_err) = ('', '');
+IPC::Run::run(
+	[ 'make', '-C', $unit_dir, 'test_cluster_control_root' ],
+	'>', \$cast_out, '2>', \$cast_err)
+	or BAIL_OUT("cannot build RF-ROOT fixture helper: $cast_err");
+
+my $shared_root = $pair->{shared_control_root};
+
+# Both nodes must present a non-zero incarnation before the cast captures
+# them (the rejoin gate only requires the minted owner incarnation to be
+# strictly smaller than the future rejoin incarnation; in this strict pair
+# the survivor's last_admitted floor for the joiner stays 0, so the presented
+# incarnation is the correct capture source).
+my $admitted = $node0->poll_query_until('postgres', q{
+	SELECT count(*) = 2 FROM pg_cluster_membership
+	WHERE presented_incarnation <> 0
+}, 't', 45);
+if (!$admitted)
+{
+	my $diag = $node0->safe_psql('postgres',
+		'SELECT node_id, declared, state, presented_incarnation, '
+		. 'last_admitted_incarnation FROM pg_cluster_membership ORDER BY node_id');
+	BAIL_OUT("membership admission did not settle before the root cast; rows: $diag");
+}
+my $inc0 = $node0->safe_psql('postgres',
+	'SELECT presented_incarnation FROM pg_cluster_membership WHERE node_id = 0');
+my $inc1 = $node0->safe_psql('postgres',
+	'SELECT presented_incarnation FROM pg_cluster_membership WHERE node_id = 1');
+ok(defined($inc0) && $inc0 ne '' && $inc0 ne '0'
+	&& defined($inc1) && $inc1 ne '' && $inc1 ne '0',
+	'RF-ROOT setup: captured presented incarnations of both nodes')
+	or BAIL_OUT("incarnation capture failed: inc0='$inc0' inc1='$inc1'");
+
+# Clean-stop both nodes so the shared registry carries only STOPPED slots
+# (the producer's read_source_wal_state rejects ACTIVE slots).
+$node1->safe_psql('postgres', 'CHECKPOINT');
+$node1->stop;
+$node0->safe_psql('postgres', 'CHECKPOINT');
+$node0->stop;
+
+# Real cast values (fixture reads the rest itself from the real registry
+# slots and claim files):
+#  - storage uuid: shared-root sentinel, offset 8, 32 hex chars
+#  - sysid: pair provisioning (pg_controldata at new_pair time)
+open my $sfh, '<:raw', "$shared_root/pgrac_shared.control"
+	or BAIL_OUT("sentinel open: $!");
+sysseek($sfh, 8, 0) or BAIL_OUT("sentinel seek: $!");
+sysread($sfh, my $storage_uuid, 32) == 32 or BAIL_OUT("sentinel read: $!");
+close $sfh;
+
+my $sysid = $pair->{shared_system_identifier};
+
+# Sanity: both registry slots must be STOPPED after the clean stops (the
+# producer rejects anything else).  Slot layout: state@12, tli@16,
+# highest_lsn@40, checkpoint_redo_lsn@56.
+open my $wfh, '<:raw', "$root/pgrac_wal_state" or BAIL_OUT("wal_state open: $!");
+sysseek($wfh, 512 * 2, 0) or BAIL_OUT("wal_state seek: $!");
+sysread($wfh, my $slot2, 512) == 512 or BAIL_OUT("wal_state read: $!");
+close $wfh;
+my ($state2) = unpack('x12 L<', $slot2);   # STOPPED(2) expected
+BAIL_OUT("slot 2 not STOPPED after clean stop (state=$state2)")
+	unless $state2 == 2;
+
+my $authority = 'a0a1a2a3a4a546a78aa9aaabacadaeaf';  # v4-form (byte6/byte8)
+
+($cast_out, $cast_err) = ('', '');
+my $cast_ok = IPC::Run::run(
+	[ $root_fixture, '--fixture-root-cast', $shared_root, $root,
+	  $sysid, $storage_uuid, $authority,
+	  'RECOVERY_COMPLETE', $inc1,
+	  'OPEN', $inc0 ],
+	'>', \$cast_out, '2>', \$cast_err);
+ok($cast_ok
+	&& -f "$shared_root/global/pgrac_control_root"
+	&& -s "$shared_root/global/pgrac_control_root" == 66048
+	&& -f "$shared_root/global/pgrac_control_root.bak"
+	&& -s "$shared_root/global/pgrac_control_root.bak" == 66048,
+	'RF-ROOT setup: canonical root for node1 (thread 2) minted by the production producer')
+	or BAIL_OUT("fixture stderr: $cast_err");
+
+$pair->start_pair;    # clean rejoin of both nodes (no incarnation change)
+ok($pair->wait_for_pcm_x_active(30),
+	'RF-ROOT setup: pair reformed after the root cast');
 
 # ============================================================
 # L1: both nodes validated + claimed their thread directories.

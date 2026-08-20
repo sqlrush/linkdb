@@ -214,6 +214,15 @@ cluster_authority_serving_rebind_lmon(void)
 	return ut_serving_ready;
 }
 
+/* RF-ROOT P6 (L5 leaver serving rebind): cluster_reconfig.o references the
+ * leaver-side authority rebind wrapper; the pure unit pins it to the same
+ * serving-readiness gate as the LMON rebind above. */
+bool
+cluster_authority_serving_rebind_leaver(void)
+{
+	return ut_serving_ready;
+}
+
 uint64
 cluster_lms_get_lms_restart_generation(void)
 {
@@ -695,6 +704,22 @@ cluster_clean_leave_in_progress(void)
 	return false;
 }
 
+/* RF-ROOT P6 (L5 wiring): unit stubs for symbols cluster_reconfig.o pulls in
+ * that the pure unit harness does not link. */
+volatile sig_atomic_t ShutdownRequestPending = false;
+
+uint64
+cluster_grd_recovery_done_epoch_for(int32 node pg_attribute_unused())
+{
+	return 0;
+}
+
+bool
+cluster_lmon_reconfig_suppressed(void)
+{
+	return false;
+}
+
 /* declared-peer set:  bit i set → node i is declared in cluster.conf. */
 static bool ut_declared_set[CLUSTER_MAX_NODES];
 static ClusterNodeInfo ut_dummy_node;
@@ -849,6 +874,14 @@ cluster_write_fence_submit_marker(const ClusterFenceMarker *m pg_attribute_unuse
 {
 	return CLUSTER_FENCE_MARKER_SUBMIT_FAILED;
 }
+/* Link-only stub for the joiner-admission event helper (RF-ROOT P6); the real
+ * durable-authority reader is exercised by test_cluster_write_fence_durable. */
+ClusterFenceAuthorityReadResult
+cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out pg_attribute_unused())
+{
+	return CLUSTER_FENCE_AUTHORITY_IO_UNAVAILABLE;
+}
+
 /* spec-2.29a review r1 P1-c: controllable async-marker stubs so the tick-level
  * P1-1 invariants (bump-once while PENDING, node-remove zero-false-contest,
  * publish deferred to ACK) can be hard-asserted.  Defaults preserve the
@@ -982,6 +1015,9 @@ SetLatch(Latch *latch pg_attribute_unused())
 #include "storage/ipc.h"
 void
 on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
+{}
+void
+before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
 {}
 #include "cluster/cluster_voting_disk_io.h"
 static bool ut_join_disk_readable[CLUSTER_MAX_VOTING_DISKS];
@@ -1184,6 +1220,49 @@ UT_TEST(test_formation_snapshot_no_pgproc_never_blocks_on_reconfig_lock)
 }
 
 
+UT_TEST(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock)
+{
+	ClusterReconfigState *state;
+	PGPROC fake_proc;
+
+	reconfig_init_done = false;
+	cluster_reconfig_shmem_init();
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+
+	/* Postmaster phase 3 has no PGPROC (AD-023 A1, STOP-01 contract):
+	 * a contended reconfig lock must read not-yet-admitted without
+	 * entering LWLockQueueSelf. */
+	MyProc = NULL;
+	ut_lwlock_conditional_result = false;
+	ut_lwlock_blocking_calls = 0;
+	ut_lwlock_conditional_calls = 0;
+	UT_ASSERT(!cluster_reconfig_self_join_admitted());
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 1);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+
+	/* The same no-PGPROC caller may take an immediately available shared
+	 * lock, still without using the blocking acquisition primitive. */
+	state->self_join_admitted = 1;
+	ut_lwlock_conditional_result = true;
+	ut_lwlock_blocking_calls = 0;
+	ut_lwlock_conditional_calls = 0;
+	UT_ASSERT(cluster_reconfig_self_join_admitted());
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 1);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+	state->self_join_admitted = 0;
+
+	/* Ordinary processes retain the existing blocking read semantics. */
+	memset(&fake_proc, 0, sizeof(fake_proc));
+	MyProc = &fake_proc;
+	ut_lwlock_blocking_calls = 0;
+	ut_lwlock_conditional_calls = 0;
+	UT_ASSERT(!cluster_reconfig_self_join_admitted());
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 0);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 1);
+	MyProc = NULL;
+}
+
+
 /* spec-5.15A: the node-local replacement episode is part of the existing
  * reconfig region and starts as the exact canonical empty image.  Together
  * with the v3 mailbox widening plus P04's volatile fast-rejoin evidence this
@@ -1198,7 +1277,7 @@ UT_TEST(test_reconfig_replacement_episode_is_embedded_and_zero_initialized)
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	memset(&empty_episode, 0, sizeof(empty_episode));
 
-	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 10968);
+	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 12640);
 	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &empty_episode,
 						sizeof(empty_episode)),
 				 0);
@@ -1831,6 +1910,17 @@ UT_TEST(test_reconfig_lmon_tick_survivor_does_not_advance_epoch)
 	ut_peer_state[0] = CLUSTER_CSSD_PEER_ALIVE;
 	ut_peer_state[2] = CLUSTER_CSSD_PEER_DEAD;
 	ut_dead_generation = 1;
+	/*
+	 * RF-ROOT P9 verification / cold-formation ruling: an ABSENT declared
+	 * peer at the INITIAL epoch is admitted only by the WHOLE-round QVOTEC
+	 * bootstrap proof — its fresh co-boot slot at INITIAL + the same-round
+	 * in-quorum snapshot (never from live CSSD alone).  Mock the qvotec
+	 * publication for node 0 so its ABSENT -> MEMBER admission lands and
+	 * the survivor/coordinator math stays node-0-as-coordinator.
+	 */
+	cluster_reconfig_record_observed_slot(0, UINT64_C(77), UINT64_C(1), 0);
+	cluster_reconfig_record_observed_fresh_alive(0, true);
+	cluster_reconfig_bootstrap_publish_in_quorum(true);
 
 	epoch_before = cluster_epoch_get_current();
 	cluster_reconfig_lmon_tick();
@@ -2336,6 +2426,19 @@ ut_join_setup(void)
 	ut_reset_mocks();
 	reconfig_init_done = false;
 	cluster_reconfig_shmem_init(); /* memset clean + attach membership table */
+	/*
+	 * RF-ROOT P9 verification / cold-formation ruling: the founding
+	 * bootstrap proof (cluster_reconfig_bootstrap_quorum_at_initial) and the
+	 * cold-formation ABSENT admission now require the LOCAL epoch to still be
+	 * CLUSTER_EPOCH_INITIAL — a cold co-boot of an EXISTING cluster recovers
+	 * epoch > INITIAL from the voting disk and must never self-admit through
+	 * the founding proof (that is the exact bug B′ fixes).  The shared epoch
+	 * storage carries a stale non-INITIAL value across tests (earlier
+	 * coordinator bumps), so reset it here for a clean baseline; tests that
+	 * need a specific epoch advance it explicitly afterwards.
+	 */
+	epoch_init_done = false;
+	cluster_epoch_shmem_init();
 	cluster_qvotec_mailbox_restart_reset(&authority_mailbox);
 	pg_atomic_init_u32(&qvotec_status, CLUSTER_QVOTEC_READY);
 	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
@@ -2714,29 +2817,54 @@ UT_TEST(test_shared_cf_fast_rejoin_evicts_prior_live_incarnation)
 	ut_in_quorum_value = true;
 	ut_declared_set[1] = true;
 	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
-	/* Provisioning may leave a valid but clean/stale prior slot before the
-	 * final two-node co-boot.  It is not a MEMBER incarnation floor. */
+	/*
+	 * RF-ROOT P9 verification / cold-formation ruling: the ABSENT founding
+	 * admission is the WHOLE-round QVOTEC bootstrap proof (fresh co-boot
+	 * slot at INITIAL + same-round in-quorum snapshot + exact non-zero
+	 * incarnation).  Provisioning may leave a valid but clean/stale prior
+	 * slot before the final two-node co-boot: it is not a MEMBER
+	 * incarnation floor and — being stale — it is not identity authority
+	 * either, so the peer stays ABSENT (fail-closed) until a fresh slot
+	 * proves the co-boot.
+	 */
 	cluster_reconfig_record_observed_slot(1, UINT64_C(69), UINT64_C(1), 0);
 	cluster_reconfig_record_observed_fresh_alive(1, false);
+	cluster_reconfig_bootstrap_publish_in_quorum(true);
 
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_MEMBER);
+				 (int)CLUSTER_MEMBER_ABSENT);
 	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
 				 UINT64_C(0));
 	UT_ASSERT_EQ(state->fast_rejoin_incarnation[1], UINT64_C(0));
 	UT_ASSERT_EQ(cluster_reconfig_get_apply_counter(), UINT64_C(0));
 
-	/* The first fresh-alive slot is the founding peer identity. */
+	/* The first fresh-alive slot is the founding peer identity: the ABSENT
+	 * branch proves it through the bootstrap window and record_admitted's
+	 * the EXACT observed incarnation as the D13 floor before MEMBER. */
 	cluster_reconfig_record_observed_slot(1, UINT64_C(70), UINT64_C(2), 0);
 	cluster_reconfig_record_observed_fresh_alive(1, true);
+	cluster_reconfig_lmon_tick();
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
+				 UINT64_C(70));
+	UT_ASSERT_EQ(state->fast_rejoin_incarnation[1], UINT64_C(0));
+	UT_ASSERT_EQ(cluster_reconfig_get_apply_counter(), UINT64_C(0));
+
+	/* A steady-state tick latches the volatile rollover baseline: the
+	 * already-formed peer's fresh slot establishes fast_rejoin_incarnation
+	 * (a zero floor is bootstrap, never rollover evidence). */
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ(state->fast_rejoin_incarnation[1],
 				 UINT64_C(70));
 	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(0));
+				 UINT64_C(70));
 	UT_ASSERT_EQ(cluster_reconfig_get_apply_counter(), UINT64_C(0));
 
+	/* A later fresh slot for the same live node is an incarnation rollover,
+	 * not a second bootstrap member; evict the prior incarnation through
+	 * the ordinary FAIL_STOP path first. */
 	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(3), 0);
 	cluster_reconfig_lmon_tick();
 	cluster_reconfig_get_last_event(&event);
@@ -2847,10 +2975,16 @@ UT_TEST(test_fast_rejoin_control_episode_carries_only_bound_join_to_terminal)
 }
 
 /* The capability is bound to the exact LMS generation.  A generation change
- * invalidates it permanently; restoring the old scalar must not resurrect a
- * COMMITTED request from the still-present shared pending bitmap. */
+ * invalidates it PERMANENTLY: restoring the old scalar must not re-arm it,
+ * and an unrelated newly eligible peer must not be smuggled into the episode.
+ * (The COMMITTED marker, however, was staged while the generation still
+ * matched and is a majority-durable decision; the ungated commit drain
+ * (increments 5/16) only completes that already-authorized publication — its
+ * re-vet re-reads the joiner's current observed slot, so nothing is committed
+ * on stale evidence.) */
 UT_TEST(test_fast_rejoin_control_episode_lms_generation_loss_fails_closed)
 {
+	ClusterJoinCommitMarker marker;
 	ReconfigEvent event;
 	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
 	int32 target = -1;
@@ -2859,15 +2993,44 @@ UT_TEST(test_fast_rejoin_control_episode_lms_generation_loss_fails_closed)
 	ut_serving_ready = false;
 	ut_lms_generation = UINT64_C(2);
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT(!ut_join_qvotec_poll_write_pending(&target, slot));
-	cluster_reconfig_get_last_event(&event);
-	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_JOIN_PENDING);
+
+	/* The generation change cleared the control capability (no new arming),
+	 * but the already-staged COMMITTED marker is still pending: the staged
+	 * publication completes once the marker reaches a majority (the joiner
+	 * stays JOINING until then — nothing is published on stale evidence). */
+	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
+	UT_ASSERT_EQ(target, 1);
+	memcpy(&marker, slot, sizeof(marker));
+	UT_ASSERT_EQ((int)marker.phase, (int)CLUSTER_JCMK_PHASE_COMMITTED);
+	UT_ASSERT_EQ(marker.admitted_incarnation, UINT64_C(77));
 	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
 				 (int)CLUSTER_MEMBER_JOINING);
 
+	/* Complete the already-authorized terminal so no stage leaks to later
+	 * tests: the drain publishes JOIN_COMMITTED after the majority ACK. */
+	ut_join_qvotec_complete_write(true);
+	cluster_reconfig_lmon_tick();
+	cluster_reconfig_get_last_event(&event);
+	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_MEMBER);
+
+	/* Fail-closed half: restoring the old generation must NOT resurrect the
+	 * capability — an unrelated newly eligible peer stays out of the episode
+	 * (no new JOIN_PENDING, node 2 remains DEAD). */
+	ut_declared_set[2] = true;
+	ut_peer_state[2] = CLUSTER_CSSD_PEER_ALIVE;
+	cluster_membership_set_state(2, CLUSTER_MEMBER_DEAD);
+	cluster_reconfig_record_observed_slot(2, UINT64_C(88), UINT64_C(1), 0);
+	cluster_reconfig_record_observed_fresh_alive(2, true);
 	ut_lms_generation = UINT64_C(1);
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT(!ut_join_qvotec_poll_write_pending(&target, slot));
+	cluster_reconfig_get_last_event(&event);
+	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
+	UT_ASSERT(!jb_test(event.join_bitmap, 2));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
+				 (int)CLUSTER_MEMBER_DEAD);
+
 	ut_authority_managed = false;
 	ut_serving_ready = false;
 	cluster_controlfile_shared_authority = false;
@@ -3478,6 +3641,107 @@ UT_TEST(test_reconfig_bootstrap_quorum_epoch_proof)
 	UT_ASSERT(!cluster_reconfig_bootstrap_quorum_at_initial());
 }
 
+/* ======================================================================
+ * U19b (RF-ROOT P9 verification / cold-formation ruling) — the ABSENT
+ * founding admission reads the WHOLE-round QVOTEC bootstrap proof
+ * (cluster_reconfig_bootstrap_proof_node) under the bootstrap publication
+ * seqlock:
+ *   - an ODD seq (writer in progress) is NEVER accepted, even when every
+ *     datum is consistent — this is what makes the "new incarnation +
+ *     stale fresh-alive" intermediate state (reachable only inside an open
+ *     window) unable to form an admission proof;
+ *   - a CHANGED seq between the getter's two reads is rejected by the
+ *     same code path (the getter retries); the change can only be
+ *     observed concurrently, so the unit test proves the window contract
+ *     instead: data written between begin()/end() is visible only when
+ *     seq is even AND unchanged;
+ *   - a stable even-seq snapshot admits the target only when in-quorum +
+ *     fresh co-boot peers at INITIAL + non-zero target incarnation all
+ *     hold (every fail-closed require is covered below).
+ * ====================================================================== */
+UT_TEST(test_reconfig_bootstrap_proof_seqlock)
+{
+	ClusterReconfigState *state;
+	uint64		inc = 0;
+
+	ut_join_setup();			/* self = node 0, fresh shmem, seq 0 even */
+	ut_declared_set[1] = true;
+	ut_declared_set[2] = true;
+	state = (ClusterReconfigState *) reconfig_shmem_storage;
+
+	/* --- A. ODD seq (writer in progress) is never accepted. --- */
+	cluster_reconfig_record_observed_slot(1, 7, 1, 0);
+	cluster_reconfig_record_observed_slot(2, 7, 1, 0);
+	cluster_reconfig_record_observed_fresh_alive(1, true);
+	cluster_reconfig_record_observed_fresh_alive(2, true);
+	pg_atomic_write_u64(&state->bootstrap_in_quorum, 1);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 3); /* odd */
+	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(1, &inc));
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 4); /* even */
+
+	/* --- B. stable even snapshot + full quorum -> admitted with the
+	 *        exact target incarnation. --- */
+	UT_ASSERT(cluster_reconfig_bootstrap_proof_node(1, &inc));
+	UT_ASSERT(inc == UINT64_C(7));
+
+	/* --- C. the window contract: data written while the window is open
+	 *        (odd seq) is never read as a proof.  Simulate the publisher
+	 *        updating the incarnation for the NEXT round while the
+	 *        fresh-alive bit still reflects the CURRENT round — the mixed
+	 *        view is rejected while seq is odd.  Once the writer closes
+	 *        the window (even seq), the mixed view would be a coherent
+	 *        round in this simulation; in production the writer always
+	 *        publishes fresh for the same round inside the same window,
+	 *        so the mixed state cannot survive end(). --- */
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 5); /* begin: odd */
+	cluster_reconfig_record_observed_slot(1, 9, 2, 0);	   /* NEW incarnation */
+	/* fresh_alive(1) is still true from the OLD round — the mixed view */
+	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(1, &inc)); /* odd: reject */
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 6); /* end: even */
+	UT_ASSERT(cluster_reconfig_bootstrap_proof_node(1, &inc));
+	UT_ASSERT(inc == UINT64_C(9));
+
+	/* --- D. missing same-round in-quorum -> fail closed. --- */
+	pg_atomic_write_u64(&state->bootstrap_in_quorum, 0);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 8);
+	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(1, &inc));
+	pg_atomic_write_u64(&state->bootstrap_in_quorum, 1);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 10);
+
+	/* --- E. stale target (fresh=false) -> fail closed. --- */
+	cluster_reconfig_record_observed_fresh_alive(1, false);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 12);
+	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(1, &inc));
+	cluster_reconfig_record_observed_fresh_alive(1, true);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 14);
+
+	/* --- F. zero target incarnation -> fail closed. --- */
+	cluster_reconfig_record_observed_slot(1, 0, 1, 0);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 16);
+	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(1, &inc));
+	cluster_reconfig_record_observed_slot(1, 7, 1, 0);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 18);
+
+	/* --- G. any declared peer past INITIAL -> running cluster, NOT a
+	 *        founding bootstrap -> fail closed (this is also the guard
+	 *        that keeps a DEAD-then-restarted peer out of the founding
+	 *        branch: its observed epoch is past INITIAL). --- */
+	cluster_reconfig_record_observed_slot(2, 7, 1, 4);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 20);
+	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(1, &inc));
+	cluster_reconfig_record_observed_slot(2, 7, 1, 0);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 22);
+
+	/* --- H. no valid co-boot slot for the TARGET (gen 0) while the other
+	 *        peer is fresh: quorum holds but target_ok fails -> target 1
+	 *        fail-closes; target 2 still admits from the same snapshot. --- */
+	cluster_reconfig_record_observed_slot(1, 0, 0, 0);
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 24);
+	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(1, &inc));
+	UT_ASSERT(cluster_reconfig_bootstrap_proof_node(2, &inc));
+	UT_ASSERT(inc == UINT64_C(7));
+}
+
 
 /* ======================================================================
  * U20 (spec-5.15 Hardening v1.2 / INV-J14 self-join-gate race) -- the
@@ -3954,7 +4218,7 @@ UT_TEST(test_reconfig_region3_mailbox_request_word_is_exact_duplex)
 
 	ut_join_setup();
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
-	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 10968);
+	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 12640);
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK,
 				 UINT32_C(0x0000007f));
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_RESERVED_MASK,
@@ -5207,6 +5471,10 @@ UT_TEST(test_external_rejoin_consumes_exact_candidate_before_jcmk_submit)
 	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(1, CLUSTER_MEMBER_DEAD);
 	cluster_membership_record_admitted(1, UINT64_C(70));
+	/* implementation review (2026-08-20): the UNDECIDED preservation is a
+	 * conjunction — self must be a genuine formed member whose admitted
+	 * floor exactly equals the current self incarnation (77). */
+	cluster_membership_record_admitted(0, UINT64_C(77));
 
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
@@ -5323,6 +5591,226 @@ UT_TEST(test_external_rejoin_consumes_exact_candidate_before_jcmk_submit)
 				 sizeof(submitted)) == 0);
 }
 
+/* ======================================================================
+ * RF-ROOT P9 verification / cold-formation cold-formation — three negative
+ * legs (implementation acceptance order, after the focused formation unit + t243 +
+ * t274): the state machine is driven directly (cluster_reconfig_cold_
+ * formation_tick is the lmon_tick sub-step, extern) with qvotec's
+ * observation/mailbox publications mocked, so each failure mode is
+ * deterministic.
+ *
+ *   leg 1: marker WRITER crashes mid-write — the surviving non-arbiter
+ *          admits from the COMMITTED marker already durable in its own
+ *          region-7 slot, with zero dependence on the dead writer's
+ *          completion (takeover of the admission, not of the write).
+ *   leg 2: a LIVE SURVIVOR (fresh slot past INITIAL) refuses cold
+ *          formation — the window stays SURVIVOR, no marker is ever
+ *          submitted, self never admits through this path.
+ *   leg 3: a DIVERGENT marker (self incarnation mismatch) is rejected
+ *          by the non-arbiter, and an arbiter whose marker write FAILED
+ *          to reach quorum-majority readback never admits — it resets
+ *          and re-submits with a fresh nonce until the readback proves.
+ * ====================================================================== */
+
+extern void cluster_reconfig_test_reset_cold_formation(void);
+
+/* Both declared nodes fresh at INITIAL (A-semantics co-boot), local epoch
+ * recovered past INITIAL: the observation-window precondition. */
+static void
+ut_cold_formation_setup_coboot(void)
+{
+	ut_join_setup();		   /* self = 0, epoch reset to INITIAL */
+	cluster_node_id = 1;	   /* the higher node: never the arbiter */
+	ut_declared_set[0] = true; /* both declared: {0, 1} */
+	ut_in_quorum_value = true;
+	UT_ASSERT(cluster_epoch_observe_remote(UINT64_C(5))); /* past INITIAL */
+	cluster_reconfig_record_observed_slot(0, UINT64_C(66), UINT64_C(1), 0);
+	cluster_reconfig_record_observed_fresh_alive(0, true);
+	cluster_reconfig_test_reset_cold_formation();
+}
+
+UT_TEST(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits)
+{
+	ClusterReconfigState *state;
+	ClusterFormationCommitMarker marker;
+	uint64		incs[CLUSTER_MAX_NODES] = {0};
+	int			t;
+
+	ut_cold_formation_setup_coboot();
+	state = (ClusterReconfigState *) reconfig_shmem_storage;
+
+	/*
+	 * The arbiter (node 0, lowest co-boot node) submitted the COMMITTED
+	 * marker and its qvotec wrote it into EVERY target member's region-7
+	 * slot; then node 0 crashed BEFORE its own completion/admission.
+	 * qvotec on THIS node already read the marker back from OUR OWN slot
+	 * and published the observation (the exact marker the dead writer
+	 * built — including OUR current incarnation 77).
+	 */
+	marker.magic = CLUSTER_FORMATION_MARKER_MAGIC;
+	marker.version = CLUSTER_FORMATION_MARKER_VERSION;
+	marker.phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
+	marker.formation_generation = UINT64_C(4);
+	marker.formation_epoch = UINT64_C(5);
+	marker.arbiter_node = 0;
+	marker.arbiter_incarnation = UINT64_C(66);
+	marker.commit_nonce = UINT64_C(1);
+	marker.n_admitted = 2;
+	marker.admitted_nodes[0] = UINT8_C(0x03); /* nodes 0 and 1 */
+	incs[0] = UINT64_C(66);
+	incs[1] = UINT64_C(77); /* EXACTLY this node's current incarnation */
+	cluster_reconfig_formation_qvotec_publish_observed(&marker, incs);
+
+	/* Window warm-up (2 ticks) then pass (tick 3) — the dead writer's slot
+	 * is still fresh, so the window stays COBOOT and the marker-wait
+	 * branch is reached.  No re-write by the survivor: it was never the
+	 * arbiter and must not need to be. */
+	for (t = 0; t < 3; t++)
+		cluster_reconfig_cold_formation_tick();
+
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
+				 UINT64_C(77)); /* D13 exact floor, from the marker */
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
+				 UINT64_C(66)); /* the dead arbiter's exact incarnation */
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	/* The survivor never submitted anything (no takeover write): the
+	 * durable marker alone carried the admission. */
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq),
+				 UINT64_C(0));
+
+	/* The dead writer's slot ages out: the window goes PENDING, but the
+	 * admission is already durable — self stays MEMBER with the exact
+	 * floor across further ticks. */
+	cluster_reconfig_record_observed_fresh_alive(0, false);
+	for (t = 0; t < 5; t++)
+		cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
+				 UINT64_C(77));
+}
+
+UT_TEST(test_cold_formation_leg2_live_survivor_refuses)
+{
+	ClusterReconfigState *state;
+	int			t;
+
+	ut_join_setup();
+	cluster_node_id = 1;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+	ut_in_quorum_value = true;
+	UT_ASSERT(cluster_epoch_observe_remote(UINT64_C(5)));
+	/* node 0 is a LIVE survivor: fresh slot publishing the LIVE epoch
+	 * (A-semantics: a formed node publishes the real epoch). */
+	cluster_reconfig_record_observed_slot(0, UINT64_C(66), UINT64_C(1),
+										  UINT64_C(7));
+	cluster_reconfig_record_observed_fresh_alive(0, true);
+	cluster_reconfig_test_reset_cold_formation();
+	state = (ClusterReconfigState *) reconfig_shmem_storage;
+
+	for (t = 0; t < 12; t++)
+		cluster_reconfig_cold_formation_tick();
+
+	/* The window must fail-closed as SURVIVOR every tick: no marker was
+	 * ever staged, and this node never admitted through the cold-formation
+	 * path (a live cluster has no cold formation — the ordinary join/JCMK
+	 * chain owns this node). */
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq),
+				 UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
+				 UINT64_C(0));
+}
+
+UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
+{
+	ClusterReconfigState *state;
+	ClusterFormationCommitMarker marker;
+	uint64		incs[CLUSTER_MAX_NODES] = {0};
+	int			t;
+
+	/* ---- A. non-arbiter: a DIVERGENT marker (names an OLD incarnation
+	 * for self — a stale/divergent generation's image) is rejected; the
+	 * node keeps waiting and never admits. ---- */
+	ut_cold_formation_setup_coboot();
+	state = (ClusterReconfigState *) reconfig_shmem_storage;
+	marker.magic = CLUSTER_FORMATION_MARKER_MAGIC;
+	marker.version = CLUSTER_FORMATION_MARKER_VERSION;
+	marker.phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
+	marker.formation_generation = UINT64_C(2);
+	marker.formation_epoch = UINT64_C(5);
+	marker.arbiter_node = 0;
+	marker.arbiter_incarnation = UINT64_C(66);
+	marker.commit_nonce = UINT64_C(1);
+	marker.n_admitted = 2;
+	marker.admitted_nodes[0] = UINT8_C(0x03);
+	incs[0] = UINT64_C(66);
+	incs[1] = UINT64_C(55); /* != current self incarnation 77: divergent */
+	cluster_reconfig_formation_qvotec_publish_observed(&marker, incs);
+	for (t = 0; t < 6; t++)
+		cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
+				 UINT64_C(0));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
+				 UINT64_C(0));
+
+	/* ---- B. arbiter: the marker write did NOT reach quorum-majority
+	 * readback (qvotec completes FAILED) — no admission happens; the
+	 * arbiter resets and re-submits with a fresh nonce, and only a
+	 * later PROVEN write admits. ---- */
+	ut_join_setup();		   /* self = 0 = the LOWEST co-boot node */
+	cluster_node_id = 0;
+	ut_declared_set[0] = true;
+	ut_declared_set[1] = true;
+	ut_in_quorum_value = true;
+	UT_ASSERT(cluster_epoch_observe_remote(UINT64_C(5)));
+	cluster_reconfig_record_observed_slot(1, UINT64_C(70), UINT64_C(1), 0);
+	cluster_reconfig_record_observed_fresh_alive(1, true);
+	cluster_reconfig_test_reset_cold_formation();
+	state = (ClusterReconfigState *) reconfig_shmem_storage;
+
+	for (t = 0; t < 3; t++)
+		cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq),
+				 UINT64_C(1)); /* submitted once */
+
+	/* qvotec read back fewer than a strict majority of exact images. */
+	cluster_reconfig_formation_qvotec_complete(false);
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ((int)cluster_membership_get_state(0),
+				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
+				 UINT64_C(0));
+
+	/* The failed submission is retried (fresh nonce, same generation
+	 * lineage: max observed generation + 1 stays 1). */
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq),
+				 UINT64_C(2)); /* re-submitted */
+	UT_ASSERT_EQ((int)cluster_membership_get_state(0),
+				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
+				 UINT64_C(0));
+
+	/* The retried write proves on a majority: admission lands with the
+	 * exact per-member floors. */
+	cluster_reconfig_formation_qvotec_complete(true);
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ((int)cluster_membership_get_state(0),
+				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
+				 UINT64_C(77));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
+				 UINT64_C(70));
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+}
+
 int
 main(void)
 {
@@ -5341,6 +5829,7 @@ main(void)
 	UT_RUN(test_reconfig_shmem_size_positive);
 	UT_RUN(test_reconfig_shmem_init_idempotent);
 	UT_RUN(test_formation_snapshot_no_pgproc_never_blocks_on_reconfig_lock);
+	UT_RUN(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock);
 	UT_RUN(test_reconfig_replacement_episode_is_embedded_and_zero_initialized);
 	UT_RUN(test_reconfig_publish_increments_apply_counter);
 	UT_RUN(test_reconfig_publish_overwrites_event_seq_monotonically);
@@ -5429,6 +5918,7 @@ main(void)
 	UT_RUN(test_reconfig_join_publish_proven_member_quorum);
 	UT_RUN(test_reconfig_join_publish_proven_no_member_failclosed);
 	UT_RUN(test_reconfig_bootstrap_quorum_epoch_proof);
+	UT_RUN(test_reconfig_bootstrap_proof_seqlock);
 	UT_RUN(test_reconfig_bootstrap_proof_valid_slot_not_cssd);
 	UT_RUN(test_reconfig_bootstrap_proof_stale_slot_failclosed);
 	UT_RUN(test_reconfig_region3_mailbox_preserves_v2_and_canonical_v3);
@@ -5450,6 +5940,12 @@ main(void)
 	UT_RUN(test_reconfig_lmon_snapshots_only_exact_admitted_certificate);
 	UT_RUN(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted);
 	UT_RUN(test_external_rejoin_consumes_exact_candidate_before_jcmk_submit);
+
+	/* RF-ROOT P9 verification / cold-formation cold-formation negative
+	 * legs (run last: leg admissions latch process-local state). */
+	UT_RUN(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits);
+	UT_RUN(test_cold_formation_leg2_live_survivor_refuses);
+	UT_RUN(test_cold_formation_leg3_divergent_marker_rejected_no_majority);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

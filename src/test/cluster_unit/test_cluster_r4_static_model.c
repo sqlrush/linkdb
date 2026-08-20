@@ -85,6 +85,9 @@
 #ifndef SEMANTIC_SOURCE_PATH
 #error "SEMANTIC_SOURCE_PATH must identify the prospective semantic-activation source"
 #endif
+#ifndef QVOTEC_SOURCE_PATH
+#error "QVOTEC_SOURCE_PATH must identify cluster_qvotec.c"
+#endif
 
 #define R4_CONTRACT_COUNT 21
 #define R4_MATRIX_STATE_COUNT 10
@@ -127,6 +130,7 @@ typedef struct SourceBundle {
 	char *tx_resolve_source;
 	char *semantic_header;
 	char *semantic_source;
+	char *qvotec_source;
 } SourceBundle;
 
 static SourceBundle sources;
@@ -248,6 +252,7 @@ load_sources(void)
 	sources.tx_resolve_source = read_optional_source(TX_RESOLVE_SOURCE_PATH);
 	sources.semantic_header = read_optional_source(SEMANTIC_HEADER_PATH);
 	sources.semantic_source = read_optional_source(SEMANTIC_SOURCE_PATH);
+	sources.qvotec_source = read_optional_source(QVOTEC_SOURCE_PATH);
 }
 
 static void
@@ -276,6 +281,7 @@ free_sources(void)
 	free(sources.tx_resolve_source);
 	free(sources.semantic_header);
 	free(sources.semantic_source);
+	free(sources.qvotec_source);
 }
 
 static bool
@@ -482,12 +488,19 @@ all_four_d10_dispatches_gate_before_body(void)
 static bool
 d10_admitted_wrappers_have_single_finally_leave(void)
 {
+	/*
+	 * The region for cluster_gcs_block_r4_route_cr ends at the immediately
+	 * following function gcs_block_try_r4_request80: the two try_* test
+	 * hooks (request80/forward96) were inserted between route_cr and
+	 * cluster_gcs_block_redo_lsn_covered, and each of them legitimately
+	 * owns its own PG_FINALLY/leave pair.
+	 */
 	return function_region_has_single_finally_leave(
 			   sources.gcs_source, "cluster_r4_source_cr_dispatch",
 			   "cluster_gcs_block_undo_tt_fetch_and_wait")
 		   && function_region_has_single_finally_leave(
 			   sources.gcs_source, "cluster_gcs_block_r4_route_cr",
-			   "cluster_gcs_block_redo_lsn_covered")
+			   "gcs_block_try_r4_request80")
 		   && function_region_has_single_finally_leave(
 			   sources.cr_server_source, "cluster_cr_build_on_holder",
 			   "cluster_cr_server_shmem_size")
@@ -499,6 +512,13 @@ d10_admitted_wrappers_have_single_finally_leave(void)
 static bool
 d10_epoch_sampling_order_is_exact(void)
 {
+	/*
+	 * The admitted path was refactored into
+	 * semantic_activation_enter_internal (shared by the plain and the
+	 * r4-terminal-census variants); the public wrapper now only delegates,
+	 * so the barrier -> after-snapshot -> after-epoch sequence lives in the
+	 * internal function.
+	 */
 	const char *const enter_order[]
 		= { "pg_write_barrier();", "semantic_activation_snapshot(&after)",
 			"epoch_after = cluster_epoch_get_current()" };
@@ -507,7 +527,7 @@ d10_epoch_sampling_order_is_exact(void)
 			"current_epoch = cluster_epoch_get_current()" };
 
 	return function_region_has_ordered(
-			   sources.semantic_source, "cluster_semantic_activation_enter",
+			   sources.semantic_source, "semantic_activation_enter_internal",
 			   "cluster_semantic_activation_recheck", enter_order, lengthof(enter_order))
 		   && function_region_has_ordered(
 			   sources.semantic_source, "cluster_semantic_activation_recheck",
@@ -654,14 +674,26 @@ contract_actual(int contract_number)
 			return contract_required[8];
 		return "ABSENT";
 	case 10:
+		/* TYPED_REASONS_POLARITY_STABLE: both reason domains are typed with
+		 * a *_reason_name() mapper.  The CR-build domain lives with the
+		 * GCS-block route machinery (spec-8.4 §2.2 places
+		 * cluster_cr_build_reason_name next to the R4 route record), not in
+		 * the tx-resolve header. */
 		if (source_has(sources.tx_resolve_header, "ClusterTxResolveReason")
-			&& source_has(sources.tx_resolve_header, "ClusterCrBuildReason")
+			&& source_has(sources.gcs_header, "ClusterCrBuildReason")
 			&& source_has(sources.tx_resolve_source, "reason_name"))
 			return contract_required[9];
 		return "ABSENT";
 	case 11:
+		/* ONE_OWNER_QVOTEC_WRITER: the QVOTEC module owns the record-CAS
+		 * disk write (cluster_semantic_activation_record_cas_write lives in
+		 * cluster_qvotec.c); the semantic module owns the LMON tick and the
+		 * QVOTEC-facing mailbox poll. */
 		if (source_has(sources.semantic_source, "cluster_semantic_activation_lmon_tick")
-			&& source_has(sources.semantic_source, "cluster_semantic_activation_record_cas_write")
+			&& source_has(sources.semantic_source,
+						  "cluster_semantic_activation_qvotec_poll_record_cas")
+			&& source_has(sources.qvotec_source,
+						  "cluster_semantic_activation_record_cas_write")
 			&& source_has(sources.semantic_source, "QVOTEC"))
 			return contract_required[10];
 		return "ABSENT";
@@ -697,8 +729,20 @@ contract_actual(int contract_number)
 				   ? contract_required[15]
 				   : "ABSENT";
 	case 17:
-		if (source_has(sources.heap_vis_source, "FULL CR scratch")
-			&& source_has(sources.heap_vis_source, "cluster_gcs_block_r4_route_cr"))
+		/* XMIN_MISMATCH_FULL_CR_ONLY (spec-8.4 §2.6g / D6 row): an
+		 * updated-row XMIN/current-last-writer mismatch enters the FULL-CR
+		 * block-reconstruction route and reevaluates the native logical
+		 * row/HOT chain only in the scratch image.  The route landed in
+		 * heapam.c (heap_hot_r4_updated_xmin_needs_full ->
+		 * cluster_gcs_block_cr_fetch_and_wait ->
+		 * heap_hot_r4_search_scratch) with the scratch-only visibility
+		 * evaluator HeapTupleSatisfiesMVCCScratch in heapam_visibility.c;
+		 * the requester side never touches the live page after the fetch. */
+		if (source_has(sources.heapam_source, "heap_hot_r4_updated_xmin_needs_full")
+			&& source_has(sources.heapam_source, "cluster_gcs_block_cr_fetch_and_wait")
+			&& source_has(sources.heapam_source, "heap_hot_r4_search_scratch")
+			&& source_has(sources.heap_vis_source, "HeapTupleSatisfiesMVCCScratch")
+			&& source_has(sources.heap_vis_source, "scratch_page"))
 			return contract_required[16];
 		return legacy_d6_xmin_route_present() ? "RAW_XID_LAST_WRITER_ROUTE" : "ABSENT";
 	case 18:
@@ -1081,7 +1125,8 @@ UT_TEST(test_matrix_actions_match_required_model)
 			&& strcmp(model_rows[i].actual, model_rows[i].required) != 0)
 			mismatches++;
 	}
-	UT_ASSERT_EQ(mismatches, R4_MATRIX_COUNT);
+	/* The all-90-mismatch RED marker expired when the transition manifest
+	 * landed; the matrix is now fully implemented and must stay exact. */
 	UT_ASSERT_EQ(mismatches, 0);
 }
 

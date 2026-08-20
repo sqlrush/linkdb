@@ -50,6 +50,22 @@ OBJS = \
 	cluster_backup_manifest.o \
 	cluster_cf_authority.o \
 	cluster_control_root.o \
+	cluster_formation_marker.o \
+	cluster_page_version.o \
+	cluster_page_rmgr.o \
+	cluster_page_recovery.o \
+	cluster_page_source.o \
+	cluster_page_set.o \
+	cluster_page_apply.o \
+	cluster_page_handoff.o \
+	cluster_page_stats.o \
+	cluster_side_recovery.o \
+	cluster_side_route.o \
+	cluster_side_undo.o \
+	cluster_side_prepared.o \
+	cluster_side_projection.o \
+	cluster_side_space.o \
+	cluster_side_stats.o \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \
 	cluster_cf_phase2.o \

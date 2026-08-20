@@ -9,6 +9,7 @@
 #define CLUSTER_CONTROL_ROOT_H
 
 #include "c.h"
+#include "common/sha2.h" /* PG_SHA256_DIGEST_LENGTH (contract) */
 
 #define CLUSTER_CONTROL_ROOT_REL_PATH "global/pgrac_control_root"
 #define CLUSTER_CONTROL_ROOT_BAK_REL_PATH "global/pgrac_control_root.bak"
@@ -426,6 +427,44 @@ extern ClusterControlRootResult cluster_control_root_read_canonical(
 	uint16 origin_thread_id, const ClusterControlRootIdentity *expected_identity,
 	ClusterControlRootReadMode mode, ClusterControlRootSnapshot *out_snapshot,
 	ClusterControlRootReadToken *out_token);
+/* contract §A: BOOTSTRAP identity discovery + STRONG bound read (token
+ * minted by the STRONG step only). */
+/* RF-ROOT P9 verification (implementation): verify the canonical root is ACTIVE and
+ * bound to exactly this cutover round (full canonical validation, read-only
+ * proof; returns a file token for the caller's freshness binding). */
+extern ClusterControlRootResult
+cluster_control_root_bootstrap_validate_active_round(
+	const ClusterControlRootMigrationRoundV1 *round,
+	ClusterControlRootFileToken *token);
+
+/* RF-ROOT P9 verification (cold-formation): member-side field binding —
+ * ACTIVE root bound to the round identity a member holds (epoch /
+ * prepare-generation / source+target bitmaps) + non-zero round sha.  The
+ * full round + its sha are coordinator-local (seam shmem), so members
+ * cannot recompute round_sha256; the identity fields + the root's own
+ * CRC/dual-copy validation bind the round. */
+extern ClusterControlRootResult
+cluster_control_root_bootstrap_validate_active_round_fields(
+	uint64 transition_epoch, uint64 prepare_generation,
+	uint64 source_feature_bitmap, uint64 target_feature_bitmap);
+
+/* RF-ROOT P9 verification (contract): re-arm the bit22 cutover latch from a
+ * durable ACTIVE root across a postmaster restart.  Returns whether the
+ * dual-path gate reads as post-bit22 afterwards. */
+extern bool cluster_control_root_restore_bit22_latch_if_active(void);
+
+extern ClusterControlRootResult cluster_control_root_read_canonical_discovered(
+	uint16 origin_thread_id, ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token);
+/* Stage 8 contract (verified implementation): lock-free canonical read for a DEAD
+ * origin's thread — no live writer exists (the only publisher was the dead
+ * postmaster) and the GRD recovery adopts each shard to exactly one
+ * survivor, so the STRONG read's CF-share-lock race guard is unnecessary.
+ * Used by the post-bit22 hw-remaster path while the GRD recovery holds the
+ * CF shard FROZEN (CF(S) itself unavailable), breaking the remaster ->
+ * unfreeze -> CF-shard-NORMAL deadlock. */
+extern ClusterControlRootResult cluster_control_root_read_canonical_dead_origin(
+	uint16 origin_thread_id, ClusterControlRootSnapshot *out_snapshot);
 extern ClusterControlRootResult cluster_control_root_lookup_owner_by_node_runtime(
 	int32 old_node_id, ClusterControlRootIdentity *out_identity,
 	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token);
@@ -446,7 +485,17 @@ extern ClusterControlRootResult cluster_control_root_create_prepared(
 	ClusterControlRootFileToken *out_token);
 extern ClusterControlRootResult cluster_control_root_activate_prepared(
 	const ClusterControlRootFileToken *expected_token,
-	const uint8 expected_round_sha256[32], ClusterControlRootFileToken *out_token);
+	const uint8 expected_round_sha256[32],
+	const ClusterControlRootMigrationRoundV1 *round,
+	ClusterControlRootFileToken *out_token);
+extern bool cluster_control_root_round_sha256(
+	const ClusterControlRootMigrationRoundV1 *round,
+	uint8 out_sha[PG_SHA256_DIGEST_LENGTH]);
+/* contract step ④d: construct the create_prepared migration image from the
+ * live registry + claims + membership (coordinator side). */
+extern ClusterControlRootResult cluster_control_root_build_migration_image(
+	const ClusterControlRootMigrationRoundV1 *round,
+	ClusterControlRootMigrationImage *out);
 extern ClusterControlRootResult cluster_control_root_discard_inactive(
 	const ClusterControlRootFileToken *expected_token,
 	const uint8 expected_round_sha256[32]);

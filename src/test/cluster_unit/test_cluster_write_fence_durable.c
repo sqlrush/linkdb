@@ -41,6 +41,8 @@ static bool mock_slot_present[CLUSTER_MAX_VOTING_DISKS][CLUSTER_MAX_NODES];
 static bool mock_disk_read_failed[CLUSTER_MAX_VOTING_DISKS];
 static ClusterJoinCommitMarker mock_join_slots[CLUSTER_MAX_VOTING_DISKS];
 static uint64 mock_owner_incarnations[CLUSTER_MAX_VOTING_DISKS];
+static int mock_open_fds[CLUSTER_MAX_VOTING_DISKS];
+static int mock_open_fd_count;
 static int cache_invalidation_count;
 static int owner_selector_total;
 
@@ -64,8 +66,13 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 int
 cluster_voting_disk_open(const char *path, bool create_if_missing)
 {
+	int fd;
+
 	(void)create_if_missing;
-	return open(path, O_RDWR);
+	fd = open(path, O_RDWR);
+	if (fd >= 0 && mock_open_fd_count < CLUSTER_MAX_VOTING_DISKS)
+		mock_open_fds[mock_open_fd_count++] = fd;
+	return fd;
 }
 
 void
@@ -95,9 +102,15 @@ cluster_voting_disk_read_slot(int fd, int expected_disk_index, uint32 node_id,
 ClusterVotingDiskIoState
 cluster_voting_disk_read_join_slot(int fd, uint32 node_id, void *out_slot512)
 {
-	int disk_index = fd - 3;
+	int disk_index = -1;
+	int i;
 
 	(void)node_id;
+	for (i = 0; i < mock_open_fd_count; i++)
+		if (mock_open_fds[i] == fd) {
+			disk_index = i;
+			break;
+		}
 	if (disk_index < 0 || disk_index >= CLUSTER_MAX_VOTING_DISKS
 		|| mock_disk_read_failed[disk_index])
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -149,6 +162,8 @@ reset_mock(void)
 	memset(mock_disk_read_failed, 0, sizeof(mock_disk_read_failed));
 	memset(mock_join_slots, 0, sizeof(mock_join_slots));
 	memset(mock_owner_incarnations, 0, sizeof(mock_owner_incarnations));
+	memset(mock_open_fds, -1, sizeof(mock_open_fds));
+	mock_open_fd_count = 0;
 	cache_invalidation_count = 0;
 	owner_selector_total = 0;
 	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;

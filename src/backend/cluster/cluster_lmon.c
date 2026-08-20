@@ -625,6 +625,38 @@ cluster_lmon_request_shutdown(void)
 	LWLockRelease(&cluster_lmon_state->lwlock);
 }
 
+/*
+ * RF-ROOT P6: postmaster-only "stop publishing reconfig, keep serving".
+ * Unlike request_shutdown this does NOT make the LMON main loop exit; the
+ * retained coordination stack must stay live through the shutdown checkpoint
+ * so the checkpointer can still take CF X.
+ */
+void
+cluster_lmon_suppress_reconfig(void)
+{
+	Assert(!IsUnderPostmaster);
+
+	if (cluster_lmon_state == NULL)
+		return;
+
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_EXCLUSIVE);
+	cluster_lmon_state->reconfig_suppressed = true;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+}
+
+bool
+cluster_lmon_reconfig_suppressed(void)
+{
+	bool suppressed;
+
+	if (cluster_lmon_state == NULL)
+		return false;
+	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
+	suppressed = cluster_lmon_state->reconfig_suppressed;
+	LWLockRelease(&cluster_lmon_state->lwlock);
+	return suppressed;
+}
+
 
 ClusterLmonStatus
 cluster_lmon_status(void)
@@ -972,8 +1004,8 @@ lmon_clear_latch(int code, Datum arg)
 }
 
 
-static bool
-lmon_shutdown_requested(void)
+bool
+cluster_lmon_shutdown_requested_public(void)
 {
 	bool requested;
 
@@ -1243,8 +1275,9 @@ LmonMain(void)
 				ProcessConfigFile(PGC_SIGHUP);
 			}
 
-			if (ShutdownRequestPending || lmon_shutdown_requested())
+			if (ShutdownRequestPending || cluster_lmon_shutdown_requested_public()) {
 				break;
+			}
 
 			duty_started_at = GetCurrentTimestamp();
 			INSTR_TIME_SET_CURRENT(iter_started_at);
@@ -1638,6 +1671,13 @@ LmonMain(void)
 								/* Queued-but-admitted and refused both map
 								 * to the retryable fanout bucket. */
 								fanout_rc = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+								/* RF-ROOT P6 (tier1 audit r5): the heartbeat
+								 * arm re-registers WRITEABLE on backpressure;
+								 * this arm must too, or a tail/FIFO queued
+								 * cssd frame only drains by hitching the next
+								 * send_bytes call. */
+								if (cluster_ic_tier1_pending_outbound(cs))
+									wes_dirty = true;
 								break;
 							case CLUSTER_IC_SEND_HARD_ERROR:
 								fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
@@ -1968,8 +2008,9 @@ LmonMain(void)
 				ProcessConfigFile(PGC_SIGHUP);
 			}
 
-			if (ShutdownRequestPending || lmon_shutdown_requested())
+			if (ShutdownRequestPending || cluster_lmon_shutdown_requested_public()) {
 				break;
+			}
 
 			duty_started_at = GetCurrentTimestamp();
 			INSTR_TIME_SET_CURRENT(iter_started_at);

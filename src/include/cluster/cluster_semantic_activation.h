@@ -13,6 +13,8 @@
 #define CLUSTER_SEMANTIC_ACTIVATION_H
 
 #include "c.h"
+#include "common/sha2.h" /* PG_SHA256_DIGEST_LENGTH (contract seam) */
+#include "cluster/cluster_control_root.h" /* file token + round (contract seam) */
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_undo_root_descriptor.h"
 #include "nodes/parsenodes.h"
@@ -257,6 +259,7 @@ cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 extern bool cluster_semantic_activation_peer_open_matches(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 required_hello_caps, uint32 sampled_capability_generation);
+extern bool cluster_semantic_activation_restore_open_proof_if_active(void);
 extern void cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token);
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_modifier_enter(bool writable_admission,
@@ -266,6 +269,37 @@ cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken
 									 bool writable_admission);
 extern Size cluster_semantic_activation_shmem_size(void);
 extern void cluster_semantic_activation_shmem_init(void);
+/* RF-ROOT P7 (contract §B): the bit22 cutover reader latch — the dual-path
+ * gate idiom anchor (contract follow-up contract ②).  False = pre-bit22, the frozen
+ * §17.8 wal-state authority; true = post-bit22 root-only. */
+extern bool cluster_r4_bit22_cutover_active(void);
+/* RF-ROOT P9 verification (implementation): serving/admission gate — only the
+ * TARGET_VERIFIED state (phase-4 CF(S) strong revalidation) allows
+ * ordinary serving. */
+extern bool cluster_r4_bit22_cutover_verified(void);
+/* RF-ROOT P9 verification (implementation): source-close freeze for the bit22
+ * first-open round (wal-state registry writer gate). */
+extern bool cluster_r4_bit22_source_writer_enter(void);
+extern void cluster_r4_bit22_source_writer_leave(void);
+extern bool cluster_r4_bit22_source_close_begin(uint64 transition_epoch,
+												uint64 prepare_generation);
+extern bool cluster_r4_bit22_source_close_current(uint64 transition_epoch,
+												  uint64 prepare_generation);
+extern bool cluster_r4_bit22_cutover_latch_verify(void);
+extern bool cluster_r4_bit22_cutover_latch_apply(uint64 transition_epoch,
+												 uint64 round_generation);
+/* contract: the round driver stages the PREPARED token/sha/round here after
+ * create_prepared; the coordinator LMON consumes it at the OPEN_APPLIED
+ * advance (step ②). */
+extern bool cluster_r4_bit22_cutover_seam_store(
+	const ClusterControlRootFileToken *file_token,
+	const uint8 round_sha[PG_SHA256_DIGEST_LENGTH],
+	const ClusterControlRootMigrationRoundV1 *round);
+/* contract step ④c: the round driver entry — coordinator backend, with the
+ * constructed migration image + round. */
+extern bool cluster_r4_bit22_cutover_begin(
+	const ClusterControlRootMigrationImage *image,
+	const ClusterControlRootMigrationRoundV1 *round);
 extern void
 cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor);
 extern bool cluster_semantic_activation_record_encode(const ClusterSemanticActivationRecord *record,
@@ -314,6 +348,19 @@ extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor_rea
 extern void cluster_semantic_activation_ack_handler(
 	const ClusterICEnvelope *env, const void *payload);
 extern void cluster_semantic_activation_lmon_tick(void);
+/* RF-ROOT P7 G3: the R4 cutover coordinator proof reads the ACK table's
+ * COMPLETE state bound to the exact round identity (transition epoch,
+ * prepare generation, the expected/observed member sets, the source/target
+ * feature bitmaps and the capability sample digest).  True only when every
+ * member's ACK was observed (observed == expected) for THIS round AND the
+ * table stands at (or beyond) minimum_stage — SAMPLE for the create proof,
+ * PREPARED for the activate proof (the W6 clause 3 CLOSED binding). */
+extern bool cluster_semantic_activation_ack_complete_matches(
+	uint64 transition_epoch, uint64 record_generation,
+	uint64 expected_members_lo, uint64 expected_members_hi,
+	uint64 source_feature_bitmap, uint64 target_feature_bitmap,
+	uint64 capability_sample_digest,
+	ClusterSemanticActivationAckStage minimum_stage);
 extern ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,
 								   ClusterSemanticActivationRefusal *refusal);

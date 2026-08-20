@@ -90,6 +90,11 @@ errstart_cold(int e pg_attribute_unused(), const char *d pg_attribute_unused())
 {
 	return false;
 }
+/* RF-ROOT P6: cluster_cssd.o's outbound-slot publish wakes the LMON;
+ * the standalone fixture has no LMON. */
+void
+cluster_lmon_wakeup(void)
+{}
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 		  const char *fn pg_attribute_unused())

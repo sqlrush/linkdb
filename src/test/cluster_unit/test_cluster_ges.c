@@ -295,6 +295,35 @@ cluster_recovery_transport_is_current(void)
 	return stub_recovery_transport_ready || stub_recovery_ready;
 }
 
+/* RF-ROOT P6 (crash-rejoin): the REDECLARE_DONE ingress gate consults the
+ * components-only transport proof; the pure unit pins it to the same stub as
+ * the strict transport, and the remaining diag/self samples are inert. */
+bool
+cluster_recovery_transport_components_current(void)
+{
+	return stub_recovery_transport_ready || stub_recovery_ready;
+}
+
+bool
+cluster_lms_is_recovery_ready(void)
+{
+	return true;
+}
+
+bool
+cluster_membership_is_member(int32 node_id pg_attribute_unused())
+{
+	return true;
+}
+
+ClusterStartupPhase
+cluster_current_phase(void)
+{
+	return CLUSTER_PHASE_PRE_INIT;
+}
+
+int MyProcPid = 0;
+
 bool
 cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE mode,
 										   bool startup_process)

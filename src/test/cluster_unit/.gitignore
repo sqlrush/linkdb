@@ -4,3 +4,6 @@ test_cluster_*
 !test_cluster_*.h
 !*.dSYM
 *.dSYM/
+test_pgrac_*
+!test_pgrac_*.c
+!test_pgrac_*.h

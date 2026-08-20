@@ -192,6 +192,7 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
+
 	/* RF-ROOT P6 Scheme A: a formed boot is always fail-closed unless it
 	 * holds one of the two explicit readiness proofs.  Recovery readiness
 	 * admits only StartupProcess CF(S)/WALR(X); serving readiness retains the
@@ -200,13 +201,35 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 	if (cluster_authority_readiness_managed()) {
 		if (!cluster_lms_enabled)
 			return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
+		/*
+		 * Stage 8 contract (verified implementation): the hw-remaster rebuild
+		 * bgworker must STRONG-read the dead origin's canonical root even
+		 * while the survivor's LMS is not yet ready (GRD recovery window)
+		 * — the serving branch below would otherwise refuse it before the
+		 * recovery admission is consulted.  Still restricted to the frozen
+		 * CF(S)/WALR(X) allowlist inside
+		 * cluster_recovery_authority_request_allowed.
+		 */
+		if (cluster_recovery_authority_request_allowed(
+				&req->resid, req->lockmode,
+				AmStartupProcess()))
+			return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 		if (cluster_serving_ready_is_current())
 			return cluster_lms_is_ready()
 				? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
 				: CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
-		if (cluster_recovery_authority_request_allowed(
-				&req->resid, req->lockmode, AmStartupProcess()))
-			return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		/*
+		 * RF-ROOT P6 (reverted 2026-08-17): the recovery lock admission is
+		 * StartupProcess-only per frozen AD-023 §4 and STOP-01 I1 (the
+		 * postmaster never acquires remote/verified CF).  A brief widening
+		 * (AmStartupProcess() || !IsUnderPostmaster) let the postmaster
+		 * phase-3 driver acquire the CF(S) locally, but its S6 release was
+		 * refused (asymmetric gates) -> RELEASE_UNCERTAIN + a ghost GRD
+		 * holder that wedged every later CF(X) waiter (cast-leg pair-boot).
+		 * The phase-3 THREAD_OPEN retry therefore fails closed here (r=10);
+		 * the root reopen needs a PGPROC executor (deferred to the L5 leg
+		 * work).
+		 */
 		return CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE;
 	}
 
@@ -624,6 +647,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
+
 	/*
 	 * PGRAC: spec-5.5 P0 — route the release the SAME way the acquire/send path
 	 * routed the request.  A release is authority-bearing: an unknown master is
@@ -980,7 +1004,7 @@ cluster_relation_is_persistent_or_unlogged(Oid relid)
 		char persistence = rel->relpersistence;
 
 		/* RELPERSISTENCE_PERMANENT 'p' + RELPERSISTENCE_UNLOGGED 'u' route
-		 * through cluster;  RELPERSISTENCE_TEMP 't' skips. */
+		 * through cluster;  the temp-rel persistence 't' skips. */
 		eligible = (persistence != RELPERSISTENCE_TEMP);
 	}
 

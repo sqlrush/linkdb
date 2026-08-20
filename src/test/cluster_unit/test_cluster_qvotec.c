@@ -66,6 +66,7 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_reconfig.h" /* ReconfigEvent for spec-4.12b D2 stub */
+#include "cluster/cluster_control_root.h" /* B′ bit22 cutover references */
 #include "cluster/cluster_replacement_request.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
@@ -161,6 +162,16 @@ volatile uint32 InterruptHoldoffCount = 0;
 int MyProcPid = 0;
 int cluster_node_id = 0;
 char *cluster_shared_data_dir = NULL;
+
+/* implementation (contract §C): cluster_semantic_activation.o consults the runtime
+ * census at the latch apply; this binary does not link cluster_wal_state.o.
+ * GREEN stub — the RED refusal path is covered in
+ * test_cluster_r4_activation_fsm test_130. */
+bool
+cluster_wal_state_correctness_census_ok(void)
+{
+	return true;
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -654,6 +665,14 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 {
 	memset(out, 0, sizeof(*out)); /* pristine (event_id == 0): never applied */
 }
+/* RF-ROOT P6 (clean-departed epoch floor): cluster_qvotec.o references the
+ * clean-departed epoch for the fence baseline floor; the unit harness has no
+ * departed nodes -> floor 0 (pristine path unchanged). */
+uint64
+cluster_reconfig_get_clean_departed_epoch(int32 node_id pg_attribute_unused())
+{
+	return 0;
+}
 /* spec-5.15 D1/D4: qvotec poll publishes observed slots into the reconfig region
  * and mediates the join-commit marker handshake; stub all the reconfig symbols
  * qvotec.o now references (cluster_reconfig.o is not linked into this test). */
@@ -671,6 +690,123 @@ void
 cluster_reconfig_record_observed_fresh_alive(int32 node_id pg_attribute_unused(),
 											 bool fresh_alive pg_attribute_unused())
 {}
+/* RF-ROOT P9 verification (cold-formation): qvotec.o now also drives the
+ * cold-formation marker mailbox (region 7) and the bootstrap-observation
+ * window (per-node observed incarnation/generation/epoch + fresh-alive +
+ * same-round in-quorum snapshot inside one seqlock window).  cluster_
+ * reconfig.o is not linked into this binary — stub the B′ surfaces like
+ * the other reconfig symbols.  The formation-marker tests live in
+ * test_cluster_formation_marker / test_cluster_reconfig. */
+bool
+cluster_reconfig_formation_qvotec_poll_pending(
+	ClusterFormationMarkerSubmitRequest *out pg_attribute_unused())
+{
+	return false;
+}
+void
+cluster_reconfig_formation_qvotec_complete(bool success pg_attribute_unused())
+{}
+void
+cluster_reconfig_formation_qvotec_note_max_generation(
+	uint64 generation pg_attribute_unused())
+{}
+void
+cluster_reconfig_formation_qvotec_publish_observed(
+	const ClusterFormationCommitMarker *marker pg_attribute_unused(),
+	const uint64 *incarnation_by_node pg_attribute_unused())
+{}
+void
+cluster_reconfig_formation_qvotec_clear_observed(void)
+{}
+void
+cluster_reconfig_publish_formation_qvotec_latch(struct Latch *latch pg_attribute_unused())
+{}
+void
+cluster_reconfig_bootstrap_publish_begin(void)
+{}
+void
+cluster_reconfig_bootstrap_publish_in_quorum(bool in_quorum pg_attribute_unused())
+{}
+void
+cluster_reconfig_bootstrap_publish_end(void)
+{}
+/* RF-ROOT P9 verification (cold-formation): cluster_semantic_activation.o
+ * (linked here) references the control-root + formation-marker surfaces of
+ * the bit22 cutover chain; cluster_control_root.o / cluster_formation_
+ * marker.o are not linked into this binary.  GREEN link stubs — the
+ * cutover-chain behavior tests live in test_cluster_r4_activation_fsm /
+ * test_cluster_formation_marker / test_cluster_reconfig. */
+ClusterControlRootResult
+cluster_control_root_bootstrap_validate_active_round_fields(
+	uint64 transition_epoch pg_attribute_unused(),
+	uint64 prepare_generation pg_attribute_unused(),
+	uint64 source_feature_bitmap pg_attribute_unused(),
+	uint64 target_feature_bitmap pg_attribute_unused())
+{
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+ClusterControlRootResult
+cluster_control_root_create_prepared(
+	const ClusterControlRootMigrationImage *image pg_attribute_unused(),
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused(),
+	ClusterControlRootFileToken *out_token)
+{
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+ClusterControlRootResult
+cluster_control_root_activate_prepared(
+	const ClusterControlRootFileToken *expected_token pg_attribute_unused(),
+	const uint8 expected_round_sha256[PG_SHA256_DIGEST_LENGTH] pg_attribute_unused(),
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused(),
+	ClusterControlRootFileToken *out_token)
+{
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+bool
+cluster_control_root_round_sha256(
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused(),
+	uint8 out_sha[PG_SHA256_DIGEST_LENGTH])
+{
+	if (out_sha != NULL)
+		memset(out_sha, 0x11, PG_SHA256_DIGEST_LENGTH);
+	return true;
+}
+ClusterControlRootResult
+cluster_control_root_build_migration_image(
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused(),
+	ClusterControlRootMigrationImage *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+bool
+cluster_formation_marker_decode(
+	const uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES] pg_attribute_unused(),
+	ClusterFormationCommitMarker *marker pg_attribute_unused(),
+	uint64 *incarnation_by_node pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_formation_marker_validate(
+	const uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES] pg_attribute_unused(),
+	ClusterFormationCommitMarker *out_decoded pg_attribute_unused(),
+	uint64 *out_incarnations pg_attribute_unused())
+{
+	return false;
+}
+/* The SQL entry pgrac_r4_bit22_cutover_begin references superuser(); this
+ * binary does not link the backend superuser machinery. */
+bool
+superuser(void)
+{
+	return true;
+}
 /* spec-5.16: qvotec.o also publishes each peer's durable COMMITTED join marker and
  * supersedes a stale write-fence on self-admit; stub both for the standalone link. */
 void cluster_reconfig_record_observed_committed_join(int32 node_id, uint64 incarnation,
@@ -1607,7 +1743,13 @@ UT_TEST(test_pgrd_local_node_127_uses_last_frozen_slot)
 	UT_ASSERT_EQ(completed, UINT8_C(0x07));
 	for (i = 0; i < PGSA_TEST_DISKS; i++) {
 		UT_ASSERT_EQ(fstat(set.fds[i], &st), 0);
-		UT_ASSERT_EQ(st.st_size, CLUSTER_UNDO_ROOT_DESCRIPTOR_FILE_BYTES_MIN);
+		/* B′ P0: the attested capacity (CLUSTER_VOTING_PGRD_FILE_BYTES_MIN,
+		 * 8N+3 slots) now covers region 7, but the runtime file still
+		 * materializes regions lazily — the node-127 write extends the
+		 * base file exactly through the last descriptor slot. */
+		UT_ASSERT_EQ(st.st_size,
+					 CLUSTER_UNDO_ROOT_DESCRIPTOR_LOCAL_OFFSET(127)
+					 + CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES);
 		UT_ASSERT_EQ(cluster_voting_disk_read_raw_slot_at(
 						 set.fds[i],
 						 CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET, observed),

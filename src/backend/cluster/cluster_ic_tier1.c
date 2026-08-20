@@ -2721,6 +2721,7 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			Tier1Shmem->peers[peer_id].last_heartbeat_recv_at = GetCurrentTimestamp();
 		}
 
+
 		/*
 			 * spec-2.4 hardening v1.0.1 F1: dispatch_envelope now takes
 			 * peer_id (signature change) so msg_type=255 chunk fast path

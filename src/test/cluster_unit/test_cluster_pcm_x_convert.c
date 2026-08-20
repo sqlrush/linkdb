@@ -17179,10 +17179,193 @@ UT_TEST(test_local_retire_episode_lock_errors_fail_closed)
 }
 
 
+/* ==========================================================================
+ * RF-SIDE D-SIDE-07 (t/274 L4/L5): PCM-X runtime re-form after a reconfig
+ * permanently froze the steady-state core.
+ * ========================================================================== */
+
+UT_TEST(test_runtime_reform_rebinds_after_reconfig)
+{
+	PcmXShmemHeader *header;
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRuntimeSnapshot snap;
+
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	header = ClusterPcmXConvertShmem;
+	UT_ASSERT(cluster_pcm_x_runtime_activate(UINT64_C(77)));
+	snap = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT_EQ(snap.state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(snap.master_session_incarnation, UINT64_C(77));
+
+	/* A reconfig freezes the steady-state core exactly like a peer
+	 * restart: ACTIVE -> RECOVERY_BLOCKED, and the ordinary activate
+	 * re-entry is refused (no stranded-ACTIVATING marker). */
+	UT_ASSERT(
+		cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
+										 PCM_X_RUNTIME_RECOVERY_BLOCKED));
+	snap = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT_EQ(snap.state, PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT(!cluster_pcm_x_runtime_activate(UINT64_C(88)));
+
+	/* The stable new collect: epoch 5, self session unchanged (77), peer
+	 * 1 restarted with a NEW session (99). */
+	memset(bindings, 0, sizeof(bindings));
+	bindings[0].cluster_epoch = 5;
+	bindings[0].peer_session_incarnation = UINT64_C(77);
+	bindings[1].cluster_epoch = 5;
+	bindings[1].peer_session_incarnation = UINT64_C(99);
+
+	UT_ASSERT(cluster_pcm_x_runtime_reform(5, bindings));
+	snap = cluster_pcm_x_runtime_snapshot();
+	UT_ASSERT_EQ(snap.state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(snap.gate_generation, UINT64_C(3)); /* gen1 ACTIVE -> gen2 BLOCKED -> gen3 reform */
+	/* master_session is the wire sender identity: UNCHANGED. */
+	UT_ASSERT_EQ(snap.master_session_incarnation, UINT64_C(77));
+
+	/* Binding re-bound to the new collect. */
+	UT_ASSERT_EQ(header->peer_frontiers[1].cluster_epoch, UINT64_C(5));
+	UT_ASSERT_EQ(header->peer_frontiers[1].sender_session_incarnation,
+				 UINT64_C(99));
+	UT_ASSERT_EQ(header->outbound_targets[1].cluster_epoch, UINT64_C(5));
+	UT_ASSERT_EQ(header->outbound_targets[1].target_session_incarnation,
+				 UINT64_C(99));
+	/* Session-changed peer: sequences reset to 1 (a fresh process). */
+	UT_ASSERT_EQ(header->peer_frontiers[1].next_expected_prehandle_sequence,
+				 UINT64_C(1));
+	UT_ASSERT_EQ(header->outbound_targets[1].next_prehandle_sequence,
+				 UINT64_C(1));
+
+	/* A second reform with the SAME collect is refused (anti-spin). */
+	UT_ASSERT(!cluster_pcm_x_runtime_reform(5, bindings));
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+}
+
+UT_TEST(test_runtime_reform_advances_tag_generation)
+{
+	PcmXShmemHeader *header;
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXMasterAdmission admission;
+	PcmXMasterTagSlot *tags;
+	Size		i;
+	Size		capacity;
+
+	/* ACTIVE with a live tag created under the OLD epoch (the probe's
+	 * identity carries cluster_epoch 9). */
+	init_active_pcm_x(UINT64_C(77));
+	admit_active_probe(805, 0, 7, UINT64_C(80006), UINT64_C(8106), 1, &admission);
+
+	header = ClusterPcmXConvertShmem;
+	UT_ASSERT(
+		cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
+										 PCM_X_RUNTIME_RECOVERY_BLOCKED));
+	memset(bindings, 0, sizeof(bindings));
+	bindings[0].cluster_epoch = 5;
+	bindings[0].peer_session_incarnation = UINT64_C(77);
+	bindings[1].cluster_epoch = 5;
+	bindings[1].peer_session_incarnation = UINT64_C(99);
+	UT_ASSERT(cluster_pcm_x_runtime_reform(5, bindings));
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+
+	/* The tag generation advanced: every LIVE master tag slot now carries
+	 * the new epoch, so the old-epoch ticket (ref epoch 9) is STALE at
+	 * its next confirmation (fail-closed suspended holder). */
+	tags = master_tag_slots(header);
+	capacity = header->layout.pools[PCM_X_POOL_MASTER_TAG].capacity;
+	for (i = 0; i < capacity; i++) {
+		PcmXSlotHeader *slot = &tags[i].slot;
+
+		if (test_slot_state(slot) == PCM_X_TAG_LIVE)
+			UT_ASSERT_EQ(tags[i].cluster_epoch, UINT64_C(5));
+	}
+}
+
+UT_TEST(test_runtime_reform_fail_closed_paths)
+{
+	PcmXShmemHeader *header;
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	header = ClusterPcmXConvertShmem;
+	UT_ASSERT(cluster_pcm_x_runtime_activate(UINT64_C(77)));
+
+	memset(bindings, 0, sizeof(bindings));
+	bindings[0].cluster_epoch = 5;
+	bindings[0].peer_session_incarnation = UINT64_C(77);
+	bindings[1].cluster_epoch = 5;
+	bindings[1].peer_session_incarnation = UINT64_C(99);
+
+	/* Not BLOCKED (ACTIVE) -> refused. */
+	UT_ASSERT(!cluster_pcm_x_runtime_reform(5, bindings));
+
+	/* NULL / zero inputs. */
+	UT_ASSERT(!cluster_pcm_x_runtime_reform(0, bindings));
+	UT_ASSERT(!cluster_pcm_x_runtime_reform(5, NULL));
+
+	/* An empty collect (no peer at all) has no change evidence. */
+	UT_ASSERT(
+		cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
+										 PCM_X_RUNTIME_RECOVERY_BLOCKED));
+	memset(bindings, 0, sizeof(bindings));
+	UT_ASSERT(!cluster_pcm_x_runtime_reform(5, bindings));
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state,
+				 PCM_X_RUNTIME_RECOVERY_BLOCKED);
+}
+
+static bool
+PcmXTagEpochAdvanceTestFailHook_stub(void)
+{
+	return true;
+}
+
+/*
+ * implementation review (2026-08-20): a failed tag-epoch advance (allocator/view
+ * failure, injected via the assert-build hook) must keep the runtime
+ * RECOVERY_BLOCKED — a partially advanced generation is never published
+ * as a re-formed ACTIVE runtime.
+ */
+UT_TEST(test_runtime_reform_tag_epoch_failure_keeps_blocked)
+{
+	PcmXShmemHeader *header;
+	PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT];
+
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	header = ClusterPcmXConvertShmem;
+	UT_ASSERT(cluster_pcm_x_runtime_activate(UINT64_C(77)));
+	UT_ASSERT(
+		cluster_pcm_x_runtime_transition(PCM_X_RUNTIME_ACTIVE,
+										 PCM_X_RUNTIME_RECOVERY_BLOCKED));
+
+	memset(bindings, 0, sizeof(bindings));
+	bindings[0].cluster_epoch = 5;
+	bindings[0].peer_session_incarnation = UINT64_C(77);
+	bindings[1].cluster_epoch = 5;
+	bindings[1].peer_session_incarnation = UINT64_C(99);
+
+	/* Inject the advance failure; reform must fail and keep BLOCKED. */
+	cluster_pcm_x_tag_epoch_advance_test_fail_hook =
+		&PcmXTagEpochAdvanceTestFailHook_stub;
+	UT_ASSERT(!cluster_pcm_x_runtime_reform(5, bindings));
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state,
+				 PCM_X_RUNTIME_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().gate_generation, UINT64_C(2));
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().master_session_incarnation,
+				 UINT64_C(0));
+
+	/* Without the injected failure the same collect re-forms fine. */
+	cluster_pcm_x_tag_epoch_advance_test_fail_hook = NULL;
+	UT_ASSERT(cluster_pcm_x_runtime_reform(5, bindings));
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().state, PCM_X_RUNTIME_ACTIVE);
+	UT_ASSERT_EQ(cluster_pcm_x_runtime_snapshot().gate_generation, UINT64_C(3));
+	(void) header;
+}
+
 int
 main(void)
 {
-	UT_PLAN(284);
+	UT_PLAN(288);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -17467,6 +17650,10 @@ main(void)
 	UT_RUN(test_local_detach_lock_window_error_releases_gate_and_fails_closed);
 	UT_RUN(test_local_holder_gate_handoffs_fail_closed);
 	UT_RUN(test_local_retire_episode_lock_errors_fail_closed);
+	UT_RUN(test_runtime_reform_rebinds_after_reconfig);
+	UT_RUN(test_runtime_reform_advances_tag_generation);
+	UT_RUN(test_runtime_reform_fail_closed_paths);
+	UT_RUN(test_runtime_reform_tag_epoch_failure_keeps_blocked);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

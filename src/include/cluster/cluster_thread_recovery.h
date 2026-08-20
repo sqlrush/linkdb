@@ -175,7 +175,7 @@ cluster_thread_recovery_decide_on_blocked(int on_unrecoverable_policy)
 
 /*
  * Per-block-reference classification for the RMW replay engine (spec-4.11 D1
- * increment 3a).  PURE, so it is the unit-testable authority for the
+ * contract).  PURE, so it is the unit-testable authority for the
  * corruption-critical gate (mirrors cluster_thread_apply_decide): the .c engine
  * computes the smgr facts and calls this, the unit pins every branch.
  *
@@ -219,7 +219,7 @@ cluster_thread_replay_classify_block(int which_for, bool rel_exists, BlockNumber
 }
 
 /*
- * Streaming-replay outcome counters (spec-4.11 D1 increment 3a, observability).
+ * Streaming-replay outcome counters (spec-4.11 D1 contract, observability).
  * recovered_through is the EndRecPtr of the LAST record every block reference of
  * which was handled cleanly; it advances only after a whole record is processed
  * without a BLOCKED, so a fail-closed never leaves it claiming an unfinished
@@ -384,6 +384,11 @@ typedef struct ClusterThreadTouchedRels {
 	int n;
 	int cap;
 	MemoryContext mcxt; /* context the items array grows in (set by the caller) */
+	/* D-SIDE-08 production caller (implementation): the dead origin this
+	 * touched set was recovered for.  Set by the orchestrator from the
+	 * real dead_tid so the retention proof's failed_origin_thread is a
+	 * true identity, not a placeholder.  0 = unset (fail-closed). */
+	uint16		origin_thread_id;
 } ClusterThreadTouchedRels;
 
 /*
@@ -571,7 +576,7 @@ extern bool cluster_thread_recovery_replay_read(uint16 dead_tid,
 extern void cluster_thread_recovery_worker_main(Datum main_arg);
 
 /*
- * RMW replay engine (spec-4.11 D1 increment 3a).  Read each record of a
+ * RMW replay engine (spec-4.11 D1 contract).  Read each record of a
  * positioned WAL reader, and for every block reference to a genuinely shared
  * user-relation page: read the LIVE page from shared storage, apply the record
  * (LSN-gated, idempotent), and write the page back -- bypassing the buffer pool
@@ -629,7 +634,7 @@ extern ClusterThreadRecResult cluster_thread_recovery_replay_data(XLogRecPtr sca
 																  ClusterThreadReplayStats *stats);
 
 /*
- * DATA DRIVER (spec-4.11 D1 increment 3b-1).  Turn a dead thread id into a
+ * DATA DRIVER (spec-4.11 D1 contract).  Turn a dead thread id into a
  * driven replay: build a reader over <cluster.wal_threads_dir>/thread_<tid> and
  * drive cluster_thread_recovery_replay_stream under an R13 error-demotion
  * harness (a catchable ERROR -> BLOCKED + worker survives; a FATAL/PANIC is

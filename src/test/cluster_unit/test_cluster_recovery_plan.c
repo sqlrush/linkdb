@@ -227,6 +227,183 @@ UT_TEST(test_node_id_out_of_range_is_unknown)
 		(int)CLUSTER_RECOVERY_THREAD_UNKNOWN);
 }
 
+/* ---- RF-ROOT P7 G1b step 4 (site 1, Stage 8 contract / follow-up
+ * ---- scheme A): canonical-root classifier truth table.  Liveness is
+ * ---- checkpoint-granular with an amplified threshold
+ * ---- max(2 x checkpoint_timeout, 60s); every unclassifiable state is
+ * ---- UNKNOWN (fail-closed). */
+
+#define ROOT_TID ((uint16)9)
+#define ROOT_NODE ((int32)8)	/* tid - 1 invariant */
+#define ROOT_CKPT 300			/* 300s checkpoint_timeout -> 600s threshold */
+
+/* Fresh: well inside the 600s threshold. */
+#define ROOT_FRESH_US (NOW_US - (int64)60 * 1000000)
+/* Stale: one full threshold + 1ms beyond (threshold = 600s here). */
+#define ROOT_STALE_US (NOW_US - (int64)(600 + 1) * 1000000)
+
+static void
+fill_root_snapshot(ClusterControlRootSnapshot *snap, uint32 lifecycle, int64 published_at)
+{
+	memset(snap, 0, sizeof(*snap));
+	snap->identity.origin_thread_id = ROOT_TID;
+	snap->identity.origin_node_id = ROOT_NODE;
+	snap->lifecycle = lifecycle;
+	snap->published_at_usec = published_at;
+}
+
+UT_TEST(test_root_absent_is_empty)
+{
+	ClusterControlRootSnapshot snap;
+
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, ROOT_FRESH_US);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_ABSENT, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_EMPTY);
+}
+
+UT_TEST(test_root_closed_is_clean)
+{
+	ClusterControlRootSnapshot snap;
+
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, ROOT_STALE_US);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_CLEAN);
+}
+
+UT_TEST(test_root_open_fresh_is_alive)
+{
+	ClusterControlRootSnapshot snap;
+
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, ROOT_FRESH_US);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_ALIVE);
+}
+
+UT_TEST(test_root_open_stale_is_crashed_candidate)
+{
+	ClusterControlRootSnapshot snap;
+
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, ROOT_STALE_US);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE);
+}
+
+UT_TEST(test_root_threshold_boundary_exact_is_alive)
+{
+	ClusterControlRootSnapshot snap;
+
+	/* Exactly 600s old == threshold: ALIVE (age < threshold is ALIVE;
+	 * the boundary is included in the alive side). */
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN,
+					   NOW_US - (int64)600 * 1000000);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_ALIVE);
+
+	/* 600s + 1us: CRASHED_CANDIDATE. */
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN,
+					   NOW_US - (int64)600 * 1000000 - 1);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE);
+}
+
+UT_TEST(test_root_future_published_is_alive)
+{
+	ClusterControlRootSnapshot snap;
+
+	/* Clock skew: a future publication timestamp must err ALIVE. */
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, NOW_US + 5000000);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_ALIVE);
+}
+
+UT_TEST(test_root_non_open_lifecycle_is_unknown)
+{
+	ClusterControlRootSnapshot snap;
+	uint32 lifecycles[] = {
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED,
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE,
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED,
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED,
+	};
+	unsigned i;
+
+	for (i = 0; i < lengthof(lifecycles); i++) {
+		fill_root_snapshot(&snap, lifecycles[i], ROOT_FRESH_US);
+		UT_ASSERT_EQ(
+			(int)cluster_recovery_classify_root_slot(
+				CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+			(int)CLUSTER_RECOVERY_THREAD_UNKNOWN);
+	}
+}
+
+UT_TEST(test_root_identity_violation_is_unknown)
+{
+	ClusterControlRootSnapshot snap;
+
+	/* Node id breaks the tid-1 invariant: never ALIVE/CRASHED. */
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, ROOT_STALE_US);
+	snap.identity.origin_node_id = ROOT_NODE - 1;
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_UNKNOWN);
+}
+
+UT_TEST(test_root_read_failure_is_unknown)
+{
+	ClusterControlRootSnapshot snap;
+
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, ROOT_FRESH_US);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_IO_ERROR, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_UNKNOWN);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_BAK_BLOCKED, &snap, OWN_TID, ROOT_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_UNKNOWN);
+}
+
+UT_TEST(test_root_own_thread_priority)
+{
+	ClusterControlRootSnapshot snap;
+
+	/* Own thread wins regardless of record state. */
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, ROOT_STALE_US);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, OWN_TID, NOW_US, ROOT_CKPT),
+		(int)CLUSTER_RECOVERY_THREAD_OWN);
+}
+
+UT_TEST(test_root_floor_60s_dominates_tiny_checkpoint)
+{
+	ClusterControlRootSnapshot snap;
+
+	/* checkpoint_timeout=1s would give a 2s threshold; the 60s floor
+	 * keeps a live peer alive for at least a minute. */
+	fill_root_snapshot(&snap, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN,
+					   NOW_US - (int64)30 * 1000000);
+	UT_ASSERT_EQ(
+		(int)cluster_recovery_classify_root_slot(
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY, &snap, OWN_TID, ROOT_TID, NOW_US, 1),
+		(int)CLUSTER_RECOVERY_THREAD_ALIVE);
+}
+
 UT_TEST(test_bitmap_addressing_locks)
 {
 	ClusterRecoveryPlan plan;
@@ -377,11 +554,126 @@ UT_TEST(test_verdict_array_bounds_and_zero_slot)
 	UT_ASSERT_EQ((int)plan.verdict[OWN_TID], (int)CLUSTER_RECOVERY_THREAD_OWN);
 }
 
+/* ---- RF-ROOT P7 G1b step 4 (contract): pre-IR pinned projection
+ * ---- field-completeness + stale-episode fail-closed. */
+
+static void
+fill_pin_snapshot(ClusterControlRootSnapshot *snap)
+{
+	memset(snap, 0, sizeof(*snap));
+	snap->validated_tail_lsn_exclusive = UINT64_C(0x2000000);
+	snap->checkpoint_lower_lsn = UINT64_C(0x1000000);
+	snap->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	snap->tail_tli = 7;
+	snap->checkpoint_tli = 6;
+}
+
+UT_TEST(test_pin_fill_copies_every_field)
+{
+	ClusterThreadReplaySlot slot;
+	ClusterControlRootSnapshot snap;
+	ClusterControlRootReadToken token;
+
+	memset(&slot, 0xa5, sizeof(slot));
+	memset(&token, 0x3c, sizeof(token));
+	fill_pin_snapshot(&snap);
+	cluster_thread_recovery_pin_fill(&slot, &snap, &token);
+
+	UT_ASSERT(memcmp(&slot.pin_token, &token, sizeof(token)) == 0);
+	UT_ASSERT_EQ((long long)slot.pin_validated_tail, 0x2000000LL);
+	UT_ASSERT_EQ((long long)slot.pin_checkpoint_lower, 0x1000000LL);
+	UT_ASSERT_EQ((long long)slot.pin_lifecycle,
+				 (long long)CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ((int)slot.pin_tail_tli, 7);
+	UT_ASSERT_EQ((int)slot.pin_checkpoint_tli, 6);
+	/* The pin fill must not touch the state/episode gate fields. */
+	UT_ASSERT_EQ((int)pg_atomic_read_u32(&slot.state), (int)0xa5a5a5a5);
+}
+
+UT_TEST(test_pin_fill_zero_snapshot_is_exact)
+{
+	ClusterThreadReplaySlot slot;
+	ClusterControlRootSnapshot snap;
+	ClusterControlRootReadToken token;
+
+	memset(&slot, 0, sizeof(slot));
+	memset(&snap, 0, sizeof(snap));
+	memset(&token, 0, sizeof(token));
+	cluster_thread_recovery_pin_fill(&slot, &snap, &token);
+
+	UT_ASSERT(memcmp(&slot.pin_token, &token, sizeof(token)) == 0);
+	UT_ASSERT_EQ((long long)slot.pin_validated_tail, 0LL);
+	UT_ASSERT_EQ((long long)slot.pin_checkpoint_lower, 0LL);
+	UT_ASSERT_EQ((long long)slot.pin_lifecycle, 0LL);
+	UT_ASSERT_EQ((int)slot.pin_tail_tli, 0);
+	UT_ASSERT_EQ((int)slot.pin_checkpoint_tli, 0);
+}
+
+UT_TEST(test_projection_read_rejects_stale_episode)
+{
+	/* The shmem gate: episode_epoch must match exactly.  A slot stamped 0
+	 * vs expected 42 -> fail-closed. */
+	uint64 validated_tail = 0;
+	uint64 checkpoint_lower = 0;
+	uint64 lifecycle = 0;
+	uint32 tail_tli = 0;
+	uint32 checkpoint_tli = 0;
+	ClusterControlRootReadToken token;
+	ClusterThreadReplaySlot slot;
+
+	memset(&slot, 0, sizeof(slot));
+	pg_atomic_init_u64(&slot.episode_epoch, 0);
+	pg_atomic_init_u32(&slot.state, 0); /* CLUSTER_THREADREC_REPLAY_IDLE */
+	UT_ASSERT(!cluster_thread_recovery_projection_read(
+		&slot, 42, &token, &validated_tail, &checkpoint_lower, &lifecycle,
+		&tail_tli, &checkpoint_tli));
+
+	/* NULL slot -> fail-closed. */
+	UT_ASSERT(!cluster_thread_recovery_projection_read(
+		NULL, 42, &token, &validated_tail, &checkpoint_lower, &lifecycle,
+		&tail_tli, &checkpoint_tli));
+}
+
+UT_TEST(test_projection_read_matching_episode_returns_pinned_fields)
+{
+	uint64 validated_tail = 0;
+	uint64 checkpoint_lower = 0;
+	uint64 lifecycle = 0;
+	uint32 tail_tli = 0;
+	uint32 checkpoint_tli = 0;
+	ClusterControlRootReadToken token;
+	ClusterControlRootReadToken expected_token;
+	ClusterControlRootSnapshot snap;
+	ClusterThreadReplaySlot slot;
+
+	memset(&slot, 0, sizeof(slot));
+	memset(&expected_token, 0x5a, sizeof(expected_token));
+	fill_pin_snapshot(&snap);
+	cluster_thread_recovery_pin_fill(&slot, &snap, &expected_token);
+	pg_atomic_init_u64(&slot.episode_epoch, 42);
+	pg_atomic_init_u32(&slot.state, 0); /* CLUSTER_THREADREC_REPLAY_IDLE */
+
+	UT_ASSERT(cluster_thread_recovery_projection_read(
+		&slot, 42, &token, &validated_tail, &checkpoint_lower, &lifecycle,
+		&tail_tli, &checkpoint_tli));
+	UT_ASSERT(memcmp(&token, &expected_token, sizeof(token)) == 0);
+	UT_ASSERT_EQ((long long)validated_tail, 0x2000000LL);
+	UT_ASSERT_EQ((long long)checkpoint_lower, 0x1000000LL);
+	UT_ASSERT_EQ((long long)lifecycle, (long long)CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ((int)tail_tli, 7);
+	UT_ASSERT_EQ((int)checkpoint_tli, 6);
+
+	/* A later episode invalidates the projection (episode 43). */
+	UT_ASSERT(!cluster_thread_recovery_projection_read(
+		&slot, 43, &token, &validated_tail, &checkpoint_lower, &lifecycle,
+		&tail_tli, &checkpoint_tli));
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(16);
+	UT_PLAN(31);
 
 	UT_RUN(test_own_priority_beats_every_verdict);
 	UT_RUN(test_empty_slot);
@@ -393,12 +685,29 @@ main(int argc, char **argv)
 	UT_RUN(test_future_timestamp_is_alive);
 	UT_RUN(test_identity_invariant_violation_is_unknown);
 	UT_RUN(test_node_id_out_of_range_is_unknown);
+	/* RF-ROOT P7 G1b step 4 site 1: canonical-root classifier truth table. */
+	UT_RUN(test_root_absent_is_empty);
+	UT_RUN(test_root_closed_is_clean);
+	UT_RUN(test_root_open_fresh_is_alive);
+	UT_RUN(test_root_open_stale_is_crashed_candidate);
+	UT_RUN(test_root_threshold_boundary_exact_is_alive);
+	UT_RUN(test_root_future_published_is_alive);
+	UT_RUN(test_root_non_open_lifecycle_is_unknown);
+	UT_RUN(test_root_identity_violation_is_unknown);
+	UT_RUN(test_root_read_failure_is_unknown);
+	UT_RUN(test_root_own_thread_priority);
+	UT_RUN(test_root_floor_60s_dominates_tiny_checkpoint);
 	UT_RUN(test_bitmap_addressing_locks);
 	UT_RUN(test_bitmap_roundtrip_independence);
 	UT_RUN(test_verdict_enum_values_stable);
 	UT_RUN(test_sweep_count_conservation);
 	UT_RUN(test_sweep_bitmap_verdict_coherence);
 	UT_RUN(test_verdict_array_bounds_and_zero_slot);
+	/* RF-ROOT P7 G1b step 4 (contract): pinned projection. */
+	UT_RUN(test_pin_fill_copies_every_field);
+	UT_RUN(test_pin_fill_zero_snapshot_is_exact);
+	UT_RUN(test_projection_read_rejects_stale_episode);
+	UT_RUN(test_projection_read_matching_episode_returns_pinned_fields);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

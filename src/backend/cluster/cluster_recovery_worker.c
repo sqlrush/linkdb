@@ -55,9 +55,11 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h"
+#include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_wal_thread.h"
 #include "miscadmin.h"
 #include "postmaster/bgworker.h"
+#include "postmaster/bgwriter.h" /* CheckPointTimeout (contract liveness threshold) */
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "utils/timestamp.h"
@@ -136,6 +138,12 @@ check_written_page(const char *segpath, uint32 page_offset, uint64 expected_page
 	return cluster_recovery_stream_page_check(page, expected_pageaddr, tid);
 }
 
+/* RF-ROOT P7 (contract §B / follow-up): dual-path by the bit22 cutover
+ * latch.  Pre-bit22 (frozen §17.8: wal-state remains the selected
+ * authority) the registry-sourced validate_stream below is the revalidate
+ * path; post-bit22 the canonical-root validate_stream_from_root is the only
+ * path.  The registry variant was removed at G1b step 4 ② and is restored
+ * here under the gate idiom (the pre-bit22 branch is the frozen behavior). */
 /*
  * validate_stream -- §3.2: claim content + last-written page (from the
  *	re-read slot's highest_lsn) + segment first page.
@@ -177,21 +185,95 @@ validate_stream(uint16 tid, const ClusterWalStateSlot *slot)
 	}
 	return CLUSTER_RECOVERY_STREAM_OK;
 }
+/*
+ * validate_stream_from_root -- RF-ROOT P7 G1b step 4 (site worker.c:192,
+ * Stage 8 contract / follow-up item 4): the §3.2 stream precheck with
+ * the canonical root as the only source.  The registry's write-position
+ * watermark (highest_lsn) has no root equivalent; the target-page anchor is
+ * the canonical validated_tail_lsn_exclusive (the CHECKPOINT_ADVANCE
+ * validated extent) with its matching tail_tli.  The precheck range narrows
+ * to the checkpoint-validated extent; final stream completeness stays with
+ * the replay-side validated_end scan (fail-closed direction — a torn page
+ * after the validated boundary is caught there, never silently accepted).
+ */
+static ClusterRecoveryStreamVerdict
+validate_stream_from_root(uint16 tid, const ClusterControlRootSnapshot *snapshot)
+{
+	char fname[MAXFNAMELEN];
+	char segpath[MAXPGPATH];
+	uint64 segno;
+	uint32 page_offset;
+	uint64 pageaddr;
+	ClusterRecoveryStreamVerdict v;
+
+	if (!cluster_recovery_worker_root_anchor_valid(snapshot))
+		return CLUSTER_RECOVERY_STREAM_UNREADABLE; /* no validated bytes */
+
+	if (!validate_claim_content(tid))
+		return CLUSTER_RECOVERY_STREAM_SUSPECT;
+
+	if (!cluster_recovery_worker_target_page(snapshot->validated_tail_lsn_exclusive,
+											 wal_segment_size, &segno,
+											 &page_offset, &pageaddr))
+		return CLUSTER_RECOVERY_STREAM_UNREADABLE; /* no written bytes */
+
+	/* Segment file name is CONSTRUCTED (never a directory scan; the
+	 * claim file would sort after hex segment names -- spec-4.4 P0). */
+	XLogFileName(fname, (TimeLineID)snapshot->tail_tli, (XLogSegNo)segno, wal_segment_size);
+	snprintf(segpath, sizeof(segpath), "%s/thread_%u/%s", cluster_wal_threads_dir, (unsigned)tid,
+			 fname);
+
+	v = check_written_page(segpath, page_offset, pageaddr, tid);
+	if (v != CLUSTER_RECOVERY_STREAM_OK)
+		return v;
+
+	/* Cheap extra anchor: the segment's own first page. */
+	if (page_offset != 0) {
+		uint64 seg_start_addr = (uint64)segno * wal_segment_size;
+
+		v = check_written_page(segpath, 0, seg_start_addr, tid);
+		if (v != CLUSTER_RECOVERY_STREAM_OK)
+			return v;
+	}
+	return CLUSTER_RECOVERY_STREAM_OK;
+}
 
 /*
  * cluster_recovery_worker_revalidate -- spec-4.5 Q6 inline path.
  *	The merge coordinator calls this when the worker pool verdict is
  *	NONE/FAILED (workers did not finish in time): re-run the same
- *	validation serially in the startup process.
+ *	validation serially in the startup process.  RF-ROOT P7 (contract §B):
+ *	dual-path by the bit22 cutover latch — pre-bit22 the wal-state registry
+ *	is the authority (frozen §17.8; the startup process is the CF(S)-capable
+ *	recovery admission, AD-023 §4, but the registry read needs no CF);
+ *	post-bit22 the canonical control root is the only source (STRONG read
+ *	via the contract §A two-step discovered-identity pattern).
  */
 ClusterRecoveryStreamVerdict
 cluster_recovery_worker_revalidate(uint16 thread_id)
 {
-	ClusterWalStateSlot slot;
+	if (cluster_r4_bit22_cutover_active()) {
+		ClusterControlRootSnapshot snapshot;
+		ClusterControlRootReadToken token;
+		ClusterControlRootResult root_result;
 
-	if (cluster_wal_state_read_slot(thread_id, &slot) != CLUSTER_WAL_SLOT_OK)
-		return CLUSTER_RECOVERY_STREAM_UNREADABLE;
-	return validate_stream(thread_id, &slot);
+		root_result = cluster_control_root_read_canonical_discovered(
+			thread_id, &snapshot, &token);
+		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			return CLUSTER_RECOVERY_STREAM_UNREADABLE;
+		return validate_stream_from_root(thread_id, &snapshot);
+	}
+
+	/* Pre-bit22 (frozen §17.8): the wal-state registry is the selected
+	 * authority — the restored pre-migration shape. */
+	{
+		ClusterWalStateSlot slot;
+
+		if (cluster_wal_state_read_slot(thread_id, &slot) != CLUSTER_WAL_SLOT_OK)
+			return CLUSTER_RECOVERY_STREAM_UNREADABLE;
+		return validate_stream(thread_id, &slot);
+	}
 }
 
 /*
@@ -232,25 +314,91 @@ cluster_recovery_worker_main(Datum main_arg)
 
 	now_us = (int64)GetCurrentTimestamp();
 	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
-		ClusterWalStateSlot wal_slot;
-		ClusterWalSlotVerdict wv;
 		ClusterRecoveryStreamVerdict sv;
 
 		if ((pool->assigned_bitmap[slot][(tid - 1) / 64] & ((uint64)1 << ((tid - 1) % 64))) == 0)
 			continue;
 
 		/*
-		 * Re-read and re-classify: the plan snapshot may be stale and
-		 * the peer may be alive again -- never read a live peer's
-		 * stream (torn mid-write pages would read as false SUSPECT).
+		 * RF-ROOT P7 (contract §B / follow-up): dual-path by the bit22
+		 * latch.  Pre-bit22 the wal-state registry is the authority
+		 * (frozen §17.8; the bgworker needs no CF for registry reads);
+		 * post-bit22 the pre-IR pinned projection is consumed.
 		 */
-		wv = cluster_wal_state_read_slot(tid, &wal_slot);
-		if (cluster_recovery_classify_slot(wv, &wal_slot, own_thread, tid, now_us,
-										   cluster_recovery_stale_active_ms)
-			!= CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE) {
-			sv = CLUSTER_RECOVERY_STREAM_SKIPPED;
+		if (cluster_r4_bit22_cutover_active()) {
+			ClusterControlRootReadToken pin_token;
+			uint64 pin_validated_tail;
+			uint64 pin_checkpoint_lower;
+			uint64 pin_lifecycle;
+			uint32 pin_tail_tli;
+			uint32 pin_checkpoint_tli;
+			ClusterControlRootSnapshot pin_snapshot;
+
+			/*
+			 * RF-ROOT P7 G1b step 4 ②: consume the pre-IR pinned
+			 * projection — the startup process STRONG-read the root
+			 * before spawning, so this bgworker performs NO CF(S)
+			 * inside the episode (follow-up item 2 / §1.3).  A missing
+			 * or stale projection fails closed.
+			 */
+			if (!cluster_thread_recovery_projection_current(
+					tid, (uint64) pool->generation, &pin_token,
+					&pin_validated_tail, &pin_checkpoint_lower,
+					&pin_lifecycle, &pin_tail_tli,
+					&pin_checkpoint_tli)) {
+				sv = CLUSTER_RECOVERY_STREAM_UNREADABLE;
+			} else {
+				memset(&pin_snapshot, 0, sizeof(pin_snapshot));
+				pin_snapshot.identity.origin_thread_id = tid;
+				pin_snapshot.identity.origin_node_id = (int32) tid - 1;
+				pin_snapshot.lifecycle = (uint32) pin_lifecycle;
+				pin_snapshot.validated_tail_lsn_exclusive = pin_validated_tail;
+				pin_snapshot.checkpoint_lower_lsn = pin_checkpoint_lower;
+				pin_snapshot.tail_tli = pin_tail_tli;
+				pin_snapshot.checkpoint_tli = pin_checkpoint_tli;
+				(void) pin_token;
+				(void) pin_checkpoint_lower;
+				(void) pin_checkpoint_tli;
+
+				/*
+				 * Re-classify from the pinned lifecycle (ALIVE-biased,
+				 * contract): a peer with a recent publication is
+				 * SKIPPED.  Only CRASHED_CANDIDATE gets validated.
+				 */
+				if (cluster_recovery_classify_root_slot(
+						CLUSTER_CONTROL_ROOT_OK_PRIMARY, &pin_snapshot,
+						own_thread, tid, now_us, CheckPointTimeout)
+					!= CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE) {
+					sv = CLUSTER_RECOVERY_STREAM_SKIPPED;
+				} else {
+					sv = validate_stream_from_root(tid, &pin_snapshot);
+				}
+			}
 		} else {
-			sv = validate_stream(tid, &wal_slot);
+			ClusterWalStateSlot reg_slot;
+			ClusterWalSlotVerdict v;
+
+			/*
+			 * Pre-bit22 (frozen §17.8): the wal-state registry is the
+			 * selected authority — the restored pre-migration bgworker
+			 * shape (a9be5590d0^).  No CF dependency.
+			 */
+			v = cluster_wal_state_read_slot(tid, &reg_slot);
+			if (v != CLUSTER_WAL_SLOT_OK) {
+				sv = CLUSTER_RECOVERY_STREAM_UNREADABLE;
+			} else {
+				ClusterRecoveryThreadVerdict verdict;
+
+				verdict = cluster_recovery_classify_slot(
+					v, &reg_slot, own_thread, tid, now_us,
+					cluster_recovery_stale_active_ms);
+				if (verdict
+					!= CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE) {
+					sv = CLUSTER_RECOVERY_STREAM_SKIPPED;
+				} else {
+					sv = validate_stream(tid, &reg_slot);
+				}
+			}
 		}
 
 		pool->stream_verdict[tid] = (uint8)sv;
@@ -291,6 +439,7 @@ cluster_recovery_workers_launch(void)
 	ClusterRecoveryPlan plan;
 	int n_workers;
 	int slot;
+	uint16 tid;
 	bool warned = false;
 
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
@@ -318,6 +467,27 @@ cluster_recovery_workers_launch(void)
 														 : CLUSTER_RECOVERY_WORKER_UNUSED);
 	if (n_workers == 0)
 		return;
+
+	/*
+	 * RF-ROOT P7 (contract §B): pin the canonical-root projection for every
+	 * plan candidate BEFORE spawning — post-bit22 only (pre-bit22 the
+	 * worker_main consumes the registry directly under the gate idiom, so a
+	 * projection is never needed).  This runs in the startup process at
+	 * pre-IR (zero resource locks — the launch follows the plan pass and
+	 * precedes any episode freeze); the workers then consume ONLY the
+	 * pinned fields and never re-acquire CF(S) (follow-up item 2).  A pin
+	 * failure keeps that thread fail-closed: the worker's projection_current
+	 * will refuse it (UNREADABLE verdict).
+	 */
+	for (tid = XLP_THREAD_ID_FIRST_REAL; tid <= CLUSTER_WAL_THREAD_MAX; tid++) {
+		if ((plan.candidate_bitmap[(tid - 1) / 64]
+			 & (UINT64_C(1) << ((tid - 1) % 64))) == 0)
+			continue;
+		if (cluster_r4_bit22_cutover_active()) {
+			(void) cluster_thread_recovery_pin_projection(
+				tid, (uint64) pool->generation);
+		}
+	}
 
 	for (slot = 0; slot < n_workers; slot++) {
 		BackgroundWorker bgw;

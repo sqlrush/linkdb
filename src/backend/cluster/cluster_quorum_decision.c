@@ -116,6 +116,17 @@ decide_quorum_view(const ClusterVotingSlot *slots, const ClusterVotingDiskIoStat
 			 *
 			 * heartbeat_timeout_us == 0 disables the gate (epoch
 			 * recovery / fsck path).
+			 *
+			 * RF-ROOT P9 verification / cold-formation cold-formation
+			 * ruling: FRESH also requires the ALIVE flag.  A clean
+			 * shutdown BLANKS ALIVE but leaves the last heartbeat_ts_us
+			 * (written at stop) — for a few seconds after a cold co-boot
+			 * that leftover would otherwise read "fresh" with the OLD
+			 * epoch byte, making every clean-restarted node self-admit
+			 * as "clean reopen" (publish the live epoch) and deny the
+			 * 5.22 observation window on its co-booting peers.  A dead
+			 * process's residue must never vote alive; ALIVE is written
+			 * on every heartbeat and cleared only by the clean blank.
 			 */
 			if (heartbeat_timeout_us == 0)
 				is_fresh = true;
@@ -124,6 +135,8 @@ decide_quorum_view(const ClusterVotingSlot *slots, const ClusterVotingDiskIoStat
 			else if (now_us > s->heartbeat_ts_us
 					 && (now_us - s->heartbeat_ts_us) > heartbeat_timeout_us)
 				is_fresh = false; /* aged out */
+			else if ((s->flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE) == 0)
+				is_fresh = false; /* clean-blanked residue: not alive */
 			else
 				is_fresh = true; /* covers now_us <= heartbeat_ts_us
 								  * (small clock drift) and within window */

@@ -76,6 +76,14 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 	return 0;
 }
 
+/* RF-ROOT P6: cluster_grd_outbound.o's send-refusal requeue path logs via
+ * errmsg; the standalone fixture swallows it like the other err stubs. */
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
 static const ClusterShmemRegion *ut_region;
 static LWLockPadded ut_lock;
 

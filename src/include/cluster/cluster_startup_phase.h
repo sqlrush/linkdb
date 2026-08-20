@@ -71,6 +71,7 @@
 
 #include "cluster/cluster_recovery_duty.h"
 #include "datatype/timestamp.h"
+#include "port/atomics.h"
 #include "storage/lockdefs.h"
 #include "storage/lwlock.h"
 
@@ -269,13 +270,18 @@ typedef enum ClusterAuthorityReadiness {
 
 typedef struct ClusterPhaseSharedState {
 	LWLock lwlock; /* LWTRANCHE_CLUSTER_STARTUP_PHASE */
-	ClusterStartupPhase current_phase;
+	pg_atomic_uint32 current_phase; /* AD-023 A1: lock-free reads */
 	TimestampTz phase_start_times[CLUSTER_PHASE_LAST + 1];
 	PhaseHistoryEntry phase_history[CLUSTER_PHASE_HISTORY_RING_SIZE];
 	int phase_history_count; /* total entries ever written (lifetime) */
 	int phase_history_head;	 /* next slot to write (0..RING_SIZE-1) */
-	ClusterAuthorityReadiness authority_readiness;
-	bool authority_managed;
+	/* AD-023 A1: the two single-word authority fields are written only under
+	 * the lwlock (EXCLUSIVE) but read lock-free through pg_atomic so the
+	 * per-grant serving gates and the Postmaster's readiness polling never
+	 * contend on a hot LWLock.  The large binding fields below stay
+	 * lock-protected. */
+	pg_atomic_uint32 authority_readiness;
+	pg_atomic_uint32 authority_managed;
 	uint16 authority_origin_thread;
 	uint64 authority_boot_incarnation;
 	uint64 authority_lms_generation;
@@ -312,9 +318,14 @@ extern bool cluster_authority_readiness_publish_recovery(uint64 lms_generation);
 extern bool cluster_authority_readiness_publish_serving(void);
 extern void cluster_authority_readiness_clear(void);
 extern bool cluster_recovery_transport_is_current(void);
+extern bool cluster_recovery_transport_components_current(void); /* RF-ROOT P6 */
 extern bool cluster_recovery_authority_is_current(void);
 extern bool cluster_serving_ready_is_current(void);
 extern bool cluster_authority_serving_rebind_lmon(void);
+/* RF-ROOT P6 (L5 shutdown handoff): the committed LEAVER's serving rebind
+ * (no local episode closes for its own departure; re-stamps from its own
+ * applied CLEAN_LEAVE evidence). */
+extern bool cluster_authority_serving_rebind_leaver(void);
 extern bool cluster_recovery_authority_resid_mode_allowed(
 	const ClusterResId *resid, LOCKMODE mode);
 extern bool cluster_recovery_authority_request_allowed(

@@ -81,6 +81,59 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 	abort();
 }
 
+/* RF-ROOT P6 (L4/L5 diag refs): cluster_cf_enqueue.o samples the phase word,
+ * the clean-leave write gate, the GRD shard/master surface and the process
+ * context; the pure unit pins them inert so the binary stays standalone. */
+bool IsUnderPostmaster = false;
+int MyProcPid = 0;
+
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+bool
+cluster_clean_leave_node_refuses_writes(void)
+{
+	return false;
+}
+
+int
+cluster_current_phase(void)
+{
+	return 0;
+}
+
+uint32
+cluster_grd_shard_for_resource(const ClusterResId *resid pg_attribute_unused())
+{
+	return 0;
+}
+
+int32
+cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
+{
+	return 0;
+}
+
+ClusterGrdShardPhase
+cluster_grd_shard_phase(uint32 shard_id pg_attribute_unused())
+{
+	return GRD_SHARD_NORMAL;
+}
+
 /* ---- GES substrate stubs (settable outcomes) ---- */
 static ClusterLockAcquireResult g_seven_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static ClusterLockAcquireResult g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;

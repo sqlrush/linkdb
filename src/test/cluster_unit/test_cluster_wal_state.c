@@ -500,12 +500,43 @@ UT_TEST(test_a1_update_typed_rejection_and_postread_mismatch)
 }
 
 
+/* RF-ROOT P9 verification (implementation): source-close writer gate stubs — the
+ * unit harness never freezes the source. */
+bool
+cluster_r4_bit22_source_writer_enter(void)
+{
+	return true;
+}
+
+void
+cluster_r4_bit22_source_writer_leave(void)
+{
+}
+
+bool
+cluster_r4_bit22_source_close_begin(uint64 transition_epoch pg_attribute_unused(),
+									uint64 prepare_generation pg_attribute_unused())
+{
+	return true;
+}
+
+bool
+cluster_r4_bit22_source_close_current(uint64 transition_epoch pg_attribute_unused(),
+									  uint64 prepare_generation pg_attribute_unused())
+{
+	return false;
+}
+
+
 int
 main(int argc, char **argv)
 {
 	UT_PLAN(21);
 
-	UT_RUN(test_header_layout_locks);
+
+
+
+UT_RUN(test_header_layout_locks);
 	UT_RUN(test_slot_layout_locks);
 	UT_RUN(test_slot_offset_macro_locks);
 	UT_RUN(test_header_roundtrip);

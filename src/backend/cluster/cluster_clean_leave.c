@@ -48,6 +48,7 @@
 #include "storage/shmem.h"
 #include "storage/sinvaladt.h" /* BackendIdGetProc */
 #include "utils/timestamp.h"
+#include "utils/wait_event.h" /* RF-ROOT P6: WAIT_EVENT_RECONFIG_BARRIER_WAIT */
 
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_conf.h"
@@ -129,6 +130,8 @@ cluster_clean_leave_shmem_init(void)
 		pg_atomic_init_u64(&cl_state->leave_attempt_nonce, 0);
 		pg_atomic_init_u32(&cl_state->preflight_pending, 0);
 		pg_atomic_init_u32(&cl_state->preflight_sent, 0);
+		/* RF-ROOT P6 (shutdown-handoff wiring). */
+		pg_atomic_init_u32(&cl_state->shutdown_driven, 0);
 		/* Hardening v1.0.3 (P1 same-node serialization + preflight-incomplete reason). */
 		pg_atomic_init_u32(&cl_state->request_in_progress, 0);
 		pg_atomic_init_u32(&cl_state->abort_reason, (uint32)CLUSTER_LEAVE_ABORT_NONE);
@@ -409,8 +412,12 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 	/* Disabled survivor: fail-closed reply NAK(disabled), never silent.  Echoes
 	 * the announce nonce (P2) and is reachable on BOTH the preflight probe and the
 	 * real announce — so a disabled survivor is caught at layer-1 preflight before
-	 * any side effect (P1). */
-	if (!cluster_clean_leave_enabled) {
+	 * any side effect (P1).  RF-ROOT P6: the shutdown-driven handoff (the
+	 * STOP-01 clean-close mainline) is NOT an opt-in operator feature — a
+	 * disabled survivor still performs the full membership-layer consume and
+	 * ACKs, so the §3.4 mixed-mode NAK applies to the operator producer only. */
+	if (!cluster_clean_leave_enabled
+		&& p->producer_kind != CLUSTER_LEAVE_PRODUCER_SHUTDOWN) {
 		cluster_clean_leave_ic_send_ack(env->source_node_id, leaving, p->leave_epoch,
 										p->leave_nonce, true, (uint8)CLUSTER_LEAVE_NAK_DISABLED);
 		return;
@@ -713,6 +720,12 @@ cluster_clean_leave_ic_broadcast_announce(uint64 leave_epoch, uint64 leave_nonce
 	p.version = CLUSTER_CLEAN_LEAVE_IC_VERSION;
 	p.leaving_node_id = cluster_node_id;
 	p.preflight = preflight ? 1 : 0;
+	/* RF-ROOT P6: the shutdown-driven handoff announces as SHUTDOWN so the
+	 * survivor skips the §3.4 disabled-NAK (the clean-close mainline is not
+	 * an opt-in operator feature). */
+	p.producer_kind = (pg_atomic_read_u32(&cl_state->shutdown_driven) != 0)
+		? CLUSTER_LEAVE_PRODUCER_SHUTDOWN
+		: CLUSTER_LEAVE_PRODUCER_OPERATOR;
 	p.leave_epoch = leave_epoch;
 	p.cssd_dead_generation = cluster_cssd_get_dead_generation();
 	p.leave_nonce = leave_nonce;
@@ -873,7 +886,15 @@ cl_drive_committed_marker_stage(int32 leaving, uint64 committed_epoch)
 	ar = cl_poll_lmon_marker_stage();
 	if (ar == CL_LEAVE_ASYNC_ACKED) {
 		pg_atomic_write_u32(&cl_state->committed_marker_durable, 1);
-		cl_send_committed(leaving, committed_epoch);
+		/* RF-ROOT P6 (post-commit survivor confirmation):  LEAVE_COMMITTED
+		 * doubles as "this survivor confirmed the new generation and its
+		 * shards are NORMAL again" (the serving rebind only re-confirms after
+		 * the clean-leave GRD episode closed).  Hold the FIRST send until the
+		 * rebind confirms; the step-2a resend loop delivers it the moment it
+		 * does, so the leaver never departs into this survivor's freeze
+		 * window. */
+		if (cluster_serving_ready_is_current())
+			cl_send_committed(leaving, committed_epoch);
 		cl_release_lmon_marker_stage();
 	} else if (ar == CL_LEAVE_ASYNC_FAILED) {
 		ereport(LOG, (errmsg("cluster clean-leave: committed node %d at epoch %llu but the "
@@ -1473,6 +1494,7 @@ cl_request_body(void)
 	pg_atomic_write_u32(&cl_state->nak_received, 0);
 	pg_atomic_write_u32(&cl_state->nak_reason, (uint32)CLUSTER_LEAVE_NAK_NONE);
 	pg_atomic_write_u32(&cl_state->announce_sent, 0); /* LMON broadcasts the announce */
+	pg_atomic_write_u32(&cl_state->shutdown_driven, 0); /* operator producer */
 	pg_atomic_write_u32(&cl_state->commit_point_observed, 0);
 	pg_atomic_write_u32(&cl_state->committed_durable_confirmed, 0);
 	pg_atomic_write_u32(&cl_state->committed_marker_durable, 0);
@@ -1766,6 +1788,205 @@ cluster_clean_leave_drive_drain(void)
 #undef CL_COHERENT
 }
 
+/*
+ * cluster_clean_leave_shutdown_drain -- RF-ROOT P6 (L5 clean-reopen mainline,
+ * the STOP-01 shutdown-handoff wiring; contract in cluster_clean_leave.h).
+ *
+ *	Run by the CHECKPOINTER inside the clean-shutdown sequence (fast stop),
+ *	AFTER the shutdown checkpoint and the STOPPED wal-state publish (STOP-01
+ *	I7 / RF-ROOT P6 contract 1: STOPPED occurs only after the clean shutdown
+ *	checkpoint and before coordination drain) and BEFORE THREAD_CLEAN_CLOSE.
+ *	Reuses the frozen 5.13 cooperative remaster/holder handoff verbatim: bind
+ *	self as the leaver (no operator preflight — the SHUTDOWN producer is not
+ *	GUC-gated), durable REQUESTED marker, the ordinary drive_drain phases,
+ *	then block here until the survivor coordinator's two-phase commit reaches
+ *	COMMITTED (the survivor-confirmed new generation, with the COMMITTED
+ *	marker majority-durable — the §2.5 P1-V0.7 exit gate) or the handoff
+ *	fails closed.
+ *
+ *	The node must NOT claim a clean-close unless this returns true (a failed
+ *	handoff means the survivors treat the departure as an ordinary death and
+ *	run the existing fail-stop reconfiguration — no fake clean-leave, 8.B).
+ */
+bool
+cluster_clean_leave_shutdown_drain(void)
+{
+	ClusterLeaveIntentMarker m;
+	uint64 baseline_epoch;
+	uint64 real_nonce;
+	uint64 preflight_nonce;
+	bool have_alive_peer = false;
+	bool result = false;
+	bool bound = false;
+	uint32 expected = 0;
+	int i;
+
+	if (cl_state == NULL || !cluster_enabled)
+		return false;
+	if (!cluster_clean_leave_startup_serving_allows(
+			cluster_authority_readiness_managed(),
+			cluster_serving_ready_is_current()))
+		return false;
+	if (cl_state->leaving_node_id != -1
+		|| pg_atomic_read_u32(&cl_state->phase) != CLUSTER_LEAVE_IDLE)
+		return false;
+
+	/* Vacuous when no alive MEMBER peer exists to hand off to (single-node
+	 * boot, or the last member standing after a peer already clean-left and
+	 * its membership is DEAD): there is nothing to remaster toward and the
+	 * cluster is fully down after this node exits, so a clean-close is still
+	 * sound without a leave reconfig. */
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (i == cluster_node_id)
+			continue;
+		if (!cluster_membership_is_member(i))
+			continue;
+		if (cluster_cssd_get_peer_state(i) != CLUSTER_CSSD_PEER_DEAD) {
+			have_alive_peer = true;
+			break;
+		}
+	}
+	if (!have_alive_peer)
+		return true;
+
+	/* Reserve the whole attempt (same-node serialization, mirrors the
+	 * operator entry). */
+	if (!pg_atomic_compare_exchange_u32(&cl_state->request_in_progress,
+										&expected, 1))
+		return false;
+	pg_atomic_write_u32(&cl_state->abort_reason,
+						(uint32)CLUSTER_LEAVE_ABORT_NONE);
+
+	PG_TRY();
+	{
+		baseline_epoch = cluster_epoch_get_current();
+
+		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		if (cl_state->leaving_node_id == -1) {
+			cl_state->leaving_node_id = cluster_node_id;
+			cl_state->leave_epoch = baseline_epoch;
+			cl_state->leave_baseline_dead_gen
+				= cluster_cssd_get_dead_generation();
+			cl_others_dead_snapshot(cluster_node_id,
+									cl_state->leave_baseline_others_dead);
+			cl_state->barrier_deadline_us
+				= (uint64)GetCurrentTimestamp()
+				  + (uint64)cluster_clean_leave_drain_timeout_ms * 1000ULL;
+			preflight_nonce = pg_atomic_read_u64(
+				&cl_state->leave_attempt_nonce);
+			real_nonce = (uint64)GetCurrentTimestamp();
+			if (real_nonce == preflight_nonce)
+				real_nonce++;
+			pg_atomic_write_u64(&cl_state->leave_attempt_nonce, real_nonce);
+			memset(cl_state->ack_bitmap, 0,
+				   sizeof(cl_state->ack_bitmap));
+			pg_atomic_write_u32(&cl_state->nak_received, 0);
+			pg_atomic_write_u32(&cl_state->nak_reason,
+								(uint32)CLUSTER_LEAVE_NAK_NONE);
+			pg_atomic_write_u32(&cl_state->announce_sent, 0);
+			pg_atomic_write_u32(&cl_state->shutdown_driven, 1);
+			pg_atomic_write_u32(&cl_state->commit_point_observed, 0);
+			pg_atomic_write_u32(&cl_state->committed_durable_confirmed, 0);
+			pg_atomic_write_u32(&cl_state->committed_marker_durable, 0);
+			cl_state->committed_confirmed_epoch = 0;
+			bound = true;
+		}
+		LWLockRelease(&cl_state->lock);
+
+		if (bound) {
+			cl_set_phase(CLUSTER_LEAVE_REQUESTED);
+			cl_build_marker(&m, CLUSTER_LEAVE_MARKER_PHASE_REQUESTED,
+							cluster_node_id, baseline_epoch);
+			if (cluster_clean_leave_submit_marker(&m)
+				!= CLUSTER_LEAVE_MARKER_SUBMIT_ACK) {
+				ereport(LOG,
+						(errmsg("cluster clean-leave: shutdown handoff REQUESTED marker "
+								"did not reach a voting-disk majority; failing closed")));
+				cl_clean_abort();
+				result = false;
+			} else {
+				cluster_clean_leave_drive_drain();
+				/* Block until the LMON-driven commit latches (survivor
+				 * coordinator two-phase commit + COMMITTED marker
+				 * majority-durable) or the handoff fails closed. */
+				for (;;) {
+					ClusterLeavePhase phase
+						= (ClusterLeavePhase)pg_atomic_read_u32(
+							&cl_state->phase);
+
+					if (phase == CLUSTER_LEAVE_COMMITTED) {
+						result = true;
+						break;
+					}
+					if (phase == CLUSTER_LEAVE_ABORTED
+						|| phase == CLUSTER_LEAVE_ABORTED_ESCALATE
+						|| phase == CLUSTER_LEAVE_IDLE) {
+						result = false;
+						break;
+					}
+					if ((uint64)GetCurrentTimestamp()
+						> cl_state->barrier_deadline_us) {
+						ereport(LOG,
+								(errmsg("cluster clean-leave: shutdown handoff did not "
+										"commit before the barrier deadline; failing "
+										"closed (the departure is handled as an "
+										"ordinary death)")));
+						result = false;
+						break;
+					}
+					(void)WaitLatch(MyLatch,
+									WL_LATCH_SET | WL_TIMEOUT
+										| WL_EXIT_ON_PM_DEATH,
+									20, WAIT_EVENT_RECONFIG_BARRIER_WAIT);
+					ResetLatch(MyLatch);
+					CHECK_FOR_INTERRUPTS();
+				}
+			}
+		}
+
+		/*
+		 * RF-ROOT P6 phase 2 (post-commit, P1-V0.7: a committed leave is never
+		 * un-committed):  the clean-leave epoch advance moved this leaver's own
+		 * formation, so its serving binding is stale until the ordinary LMON
+		 * serving rebind re-confirms after the local GRD episode closes.  The
+		 * THREAD_CLEAN_CLOSE publish that follows needs CF(S) through that
+		 * binding, so wait for the rebind (bounded by the same barrier
+		 * deadline).  Past the deadline the commit is still irrevocable —
+		 * proceed with a warning rather than fake a failure (the survivors
+		 * already hold the durable clean-departed evidence either way).
+		 */
+		if (result) {
+			for (;;) {
+				if (cluster_serving_ready_is_current())
+					break;
+				if ((uint64)GetCurrentTimestamp()
+					> cl_state->barrier_deadline_us) {
+					ereport(WARNING,
+							(errmsg("cluster clean-leave: committed but the local "
+									"serving authority did not re-confirm before the "
+									"barrier deadline; proceeding with the shutdown "
+									"checkpoint")));
+					break;
+				}
+				(void)WaitLatch(MyLatch,
+								WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+								20, WAIT_EVENT_RECONFIG_BARRIER_WAIT);
+				ResetLatch(MyLatch);
+				CHECK_FOR_INTERRUPTS();
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+	return result;
+}
+
 /* leaving-node LMON: BARRIER_WAIT -> (COMMIT_READY ->) observe CLEAN_LEAVE commit
  * -> COMMITTED, or abort/escalate. */
 static void
@@ -1971,6 +2192,35 @@ cl_coordinator_commit(int32 leaving)
 	(void)cl_poll_lmon_marker_stage();
 }
 
+/* RF-ROOT P6 (STOP-01 contract): has the leaving node's OLD
+ * process provably exited?  The CSSD peer state is node-scoped, so a fast
+ * restart (heartbeats resumed inside the DEAD window) never reads DEAD; but
+ * an observed slot with a coherent, fresh-alive incarnation DIFFERENT from
+ * the incarnation the cluster last admitted for the node (which a
+ * clean-departed node keeps until it is re-admitted by a join) can only
+ * belong to a NEW process — the old one is gone. */
+static bool
+cl_leaver_reincarnated(int32 leaving)
+{
+	uint64 obs_inc = 0;
+	uint64 obs_gen = 0;
+	uint64 admitted;
+
+	if (leaving < 0 || leaving >= CLUSTER_MAX_NODES)
+		return false;
+	if (!cluster_reconfig_get_observed_slot(leaving, &obs_inc, &obs_gen))
+		return false;
+	if (!cluster_reconfig_get_observed_fresh_alive(leaving))
+		return false;
+	admitted = cluster_membership_get_last_admitted_incarnation(leaving);
+	/* verification P2: strictly-newer (monotonic) comparison.  `!=` would
+	 * also fire on an out-of-order STALE observation frame (an old
+	 * incarnation from before the admitted floor), which is not proof the
+	 * old process exited; only an incarnation ABOVE the admitted floor can
+	 * belong to a fresh process. */
+	return admitted != 0 && obs_inc != 0 && obs_inc > admitted;
+}
+
 /* survivor (incl. coordinator) side of another node's leave. */
 static void
 cl_survivor_tick(int32 leaving)
@@ -2034,9 +2284,38 @@ cl_survivor_tick(int32 leaving)
 
 		/* Re-send LEAVE_COMMITTED every tick once durable until the leaver is gone
 		 * (best-effort IC): the leaving node will not depart until it receives one,
-		 * and step 3 holds the slot until it is CSSD-dead, so delivery is assured. */
-		if (pg_atomic_read_u32(&cl_state->committed_marker_durable))
-			cl_send_committed(leaving, committed_epoch);
+		 * and step 3 holds the slot until it is CSSD-dead, so delivery is assured.
+		 *
+		 * RF-ROOT P6 (L5 shutdown handoff, post-commit survivor confirmation):
+		 * the send is additionally gated on this survivor's own serving authority
+		 * being current again — which the ordinary LMON serving rebind only
+		 * confirms AFTER the clean-leave GRD episode closed (shards unfrozen,
+		 * NORMAL, new generation bound).  The leaver treats LEAVE_COMMITTED as
+		 * "new generation confirmed AND shard=NORMAL", so its shutdown checkpoint
+		 * and THREAD_CLEAN_CLOSE CF acquires run against a survivor-mastered,
+		 * NORMAL CF shard instead of wedging on the episode freeze window.  If the
+		 * rebind never confirms, the send never happens and the leaver fails
+		 * closed at its barrier deadline (no fake clean-leave completion).
+		 *
+		 * RF-ROOT P6 (STOP-01 contract): the "every tick" re-send
+		 * is floored to 1 Hz — the LMON iteration can be driven at inbound-frame
+		 * rate, and a per-iteration re-send combined with the rejoining node's
+		 * per-iteration authority done-key broadcast forms a self-sustaining
+		 * frame ping-pong that starves the cssd heartbeat path (t243 L5 restore
+		 * boot: node0 falsely DEAD at +3s, phase-3 broken, 60s bail).  The
+		 * confirmation is idempotent and delivery-assured at 1 Hz. */
+		if (pg_atomic_read_u32(&cl_state->committed_marker_durable)
+			&& cluster_serving_ready_is_current()) {
+			static TimestampTz last_committed_send_at = 0;
+			TimestampTz now_ts = GetCurrentTimestamp();
+
+			if (now_ts == 0
+				|| last_committed_send_at == 0
+				|| now_ts - last_committed_send_at >= INT64CONST(1000000)) {
+				cl_send_committed(leaving, committed_epoch);
+				last_committed_send_at = now_ts;
+			}
+		}
 	}
 
 	/* 2b. EVERY survivor (not just the coordinator) must observe the CLEAN_LEAVE
@@ -2063,9 +2342,21 @@ cl_survivor_tick(int32 leaving)
 	 * LEAVE_COMMITTED until the leaver is gone (assured delivery, P1-1), and (b)
 	 * serializes leaves (a second leave is NAK'd until this one fully departs,
 	 * single-leave-at-a-time, P1-3).  clean_departed persists in the reconfig
-	 * region and suppresses the node's CSSD DEAD from a spurious fail-stop (CL-I13). */
+	 * region and suppresses the node's CSSD DEAD from a spurious fail-stop (CL-I13).
+	 *
+	 * RF-ROOT P6 (STOP-01 contract): CSSD peer state is
+	 * node-scoped, not process-scoped — when the leaving node restarts quickly
+	 * (heartbeats resume inside the 3 s DEAD window) the peer never reads DEAD
+	 * and the slot is held forever, which pins cluster_clean_leave_in_progress()
+	 * and the P2 join-serialization gate permanently blocks the fast-rejoin
+	 * chain on the survivor (t243 L5 restore boot: eviction fired, join-drive
+	 * blocked with clean_leave=1, rejoiner phase-3 starved the full 60 s
+	 * window).  An observed NEW incarnation is conclusive proof the old
+	 * process exited — a fresh process cannot be alive while the old one is —
+	 * so the release fires on that too. */
 	if (cluster_reconfig_is_clean_departed(leaving)
-		&& cluster_cssd_get_peer_state(leaving) == CLUSTER_CSSD_PEER_DEAD) {
+		&& (cluster_cssd_get_peer_state(leaving) == CLUSTER_CSSD_PEER_DEAD
+			|| cl_leaver_reincarnated(leaving))) {
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 		if (cl_state->leaving_node_id == leaving) {
 			cl_state->leaving_node_id = -1;

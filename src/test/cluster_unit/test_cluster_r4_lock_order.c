@@ -78,6 +78,16 @@ TransactionId RecentXmin = FirstNormalTransactionId;
 int XactIsoLevel = XACT_READ_COMMITTED;
 bool cluster_enabled = true;
 int cluster_node_id = 0;
+
+/* implementation (contract §C): cluster_semantic_activation.c now consults the
+ * runtime census at the latch apply; this binary does not link
+ * cluster_wal_state.o.  GREEN stub — the RED refusal path is covered in
+ * test_cluster_r4_activation_fsm test_130. */
+bool
+cluster_wal_state_correctness_census_ok(void)
+{
+	return true;
+}
 bool cluster_recmerge_window_active = false;
 uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;

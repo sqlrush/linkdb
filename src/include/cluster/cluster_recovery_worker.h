@@ -47,6 +47,7 @@
 #define CLUSTER_RECOVERY_WORKER_H
 
 #include "access/xlog_internal.h"
+#include "cluster/cluster_control_root.h" /* RF-ROOT P7 G1b: canonical root anchor */
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_xlog.h"
 #include "port/atomics.h"
@@ -182,6 +183,23 @@ cluster_recovery_worker_target_page(uint64 highest_lsn, int wal_segsz_bytes, uin
 				   - (XLogSegmentOffset((XLogRecPtr)target, wal_segsz_bytes) % XLOG_BLCKSZ));
 	*pageaddr_out = target - (target % XLOG_BLCKSZ);
 	return true;
+}
+
+/*
+ * cluster_recovery_worker_root_anchor_valid -- RF-ROOT P7 G1b step 4 (site
+ * worker.c:192, Stage 8 contract): the canonical-root stream precheck
+ * anchor is usable only when a validated extent exists (validated_tail) with
+ * its timeline (tail_tli).  Zero/missing -> no validated bytes -> the stream
+ * is UNREADABLE (fail-closed; the registry's write-position watermark has no
+ * root equivalent, and a checkpoint-validated extent is the conservative
+ * anchor — final completeness stays with replay-side validated_end).
+ */
+static inline bool
+cluster_recovery_worker_root_anchor_valid(const ClusterControlRootSnapshot *snapshot)
+{
+	return snapshot != NULL
+		&& snapshot->validated_tail_lsn_exclusive != 0
+		&& snapshot->tail_tli != 0;
 }
 
 #ifndef FRONTEND

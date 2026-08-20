@@ -2871,9 +2871,11 @@ dump_recovery(ReturnSetInfo *rsinfo)
 	}
 
 	/* spec-4.5a D11: merged-replay + remote-read observability (8 rows).
-	 * materialized_remote_instances derives from the persistent wal_state
-	 * registry (merge_recovered_lsn > 0), the same authority the remote
-	 * read gates consult -- no separate bookkeeping to drift. */
+	 * materialized_remote_instances derives from the NODE-LOCAL merged
+	 * materialization authority (cluster_merged_instance_is_materialized,
+	 * DataDir/pg_undo/instance_N/merged.authority) — the same authority the
+	 * remote-read gates consult.  The wal-state registry is telemetry only;
+	 * its retained merge_recovered_lsn bytes are never correctness. */
 	{
 		StringInfoData matcsv;
 		int origin;

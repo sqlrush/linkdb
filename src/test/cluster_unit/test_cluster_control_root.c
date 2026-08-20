@@ -14,6 +14,7 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_control_root.h"
@@ -41,6 +42,13 @@
 
 #include "unit_test.h"
 
+/* backend global provided by xlog.c in a real server; the cluster_unit
+ * fixture uses the default 16MiB segment size (segment 1 covers
+ * [0x1000000, 0x2000000) — the build_source_wal_state fixture's
+ * checkpoint LSN 0x1000000 therefore lives in segment 1). */
+int		wal_segment_size = XLOG_BLCKSZ * 2048;
+
+
 UT_DEFINE_GLOBALS();
 
 #define TEST_SYSID UINT64_C(0x0123456789abcdef)
@@ -65,6 +73,22 @@ static int test_cf_lock_calls = 0;
 static int test_durable_rename_calls = 0;
 static bool test_fail_primary_rename = false;
 static bool test_create_authorized = true;
+static uint16 test_own_thread = 1;
+/* RF-ROOT P9 verification (contract): stub state for the bit22 latch
+ * cross-restart restore (cluster_control_root_restore_bit22_latch_if_active
+ * links the semantic_activation entry points; the unit harness stands in
+ * for the shmem latch with plain scalars). */
+static bool test_bit22_latch_active;
+static bool test_bit22_latch_apply_ok = true;
+static uint64 test_bit22_latch_apply_epoch;
+static uint64 test_bit22_latch_apply_generation;
+static int test_bit22_latch_apply_calls;
+/* RF-ROOT P9 verification: durable-OPEN restore stub state — the harness
+ * stands in for the voting-disk majority OPEN(P+2) record. */
+static bool test_qvotec_open_present;
+static uint64 test_qvotec_open_epoch;
+static uint64 test_qvotec_open_generation;
+static int test_qvotec_bootstrap_calls;
 static bool test_activate_authorized = true;
 static bool test_publish_authorized = true;
 static ClusterWalPinResult test_walr_begin_result = CLUSTER_WAL_PIN_OK;
@@ -88,18 +112,6 @@ extern ClusterWalPinResult cluster_wal_retention_root_publish_begin_exact(
 extern ClusterWalrReleaseResult cluster_wal_retention_root_publish_end(
 	ClusterWalRootPublishGuard **guard);
 
-void *
-palloc(Size size)
-{
-	return malloc(size);
-}
-
-void
-pfree(void *pointer)
-{
-	free(pointer);
-}
-
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
@@ -111,6 +123,44 @@ int
 OpenTransientFile(const char *fileName, int fileFlags)
 {
 	return open(fileName, fileFlags, 0600);
+}
+
+/* linked by xlogreader_fs.o via libpgport_srv.a path.o (make_absolute_path
+ * error paths) — the unit harness never raises; plain open() suffices. */
+int
+BasicOpenFile(const char *file_name, int fileFlags)
+{
+	return open(file_name, fileFlags, 0);
+}
+
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{
 }
 
 int
@@ -161,6 +211,105 @@ TimestampTz
 GetCurrentTimestamp(void)
 {
 	return ++test_now;
+}
+
+static uint64 test_membership_incarnation = UINT64_C(0x1020304050607080);
+
+uint64
+cluster_membership_get_last_admitted_incarnation(int32 node_id)
+{
+	(void) node_id;
+	return test_membership_incarnation;
+}
+
+uint16
+cluster_wal_thread_id(void)
+{
+	return test_own_thread;
+}
+
+bool
+cluster_r4_bit22_cutover_active(void)
+{
+	return test_bit22_latch_active;
+}
+
+bool
+cluster_r4_bit22_source_writer_enter(void)
+{
+	return true;
+}
+
+void
+cluster_r4_bit22_source_writer_leave(void)
+{
+}
+
+bool
+cluster_r4_bit22_source_close_begin(uint64 transition_epoch pg_attribute_unused(),
+									uint64 prepare_generation pg_attribute_unused())
+{
+	return true;
+}
+
+static bool test_source_close_current_ok;
+
+bool
+cluster_r4_bit22_source_close_current(uint64 transition_epoch pg_attribute_unused(),
+									  uint64 prepare_generation pg_attribute_unused())
+{
+	return test_source_close_current_ok;
+}
+
+bool
+cluster_r4_bit22_cutover_latch_apply(uint64 transition_epoch,
+									 uint64 round_generation)
+{
+	test_bit22_latch_apply_calls++;
+	if (!test_bit22_latch_apply_ok)
+		return false;
+	test_bit22_latch_active = true;
+	test_bit22_latch_apply_epoch = transition_epoch;
+	test_bit22_latch_apply_generation = round_generation;
+	return true;
+}
+
+ClusterSemanticActivationResult
+cluster_qvotec_bootstrap_read_semantic_activation(
+	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
+	bool *implicit_open)
+{
+	test_qvotec_bootstrap_calls++;
+	if (selected != NULL)
+		memset(selected, 0, CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES);
+	if (implicit_open != NULL)
+		*implicit_open = false;
+	if (!test_qvotec_open_present)
+		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+	if (selected != NULL)
+		selected[0] = 0x5a; /* non-zero: restore decodes via the stub below */
+	if (implicit_open != NULL)
+		*implicit_open = true;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static ClusterSemanticActivationRecord test_decoded_open;
+
+bool
+cluster_semantic_activation_record_decode(
+	const uint8 bytes[512] pg_attribute_unused(),
+	ClusterSemanticActivationRecord *record pg_attribute_unused(),
+	ClusterSemanticActivationRefusal *refusal pg_attribute_unused())
+{
+	if (record != NULL)
+		*record = test_decoded_open;
+	return true;
+}
+
+bool
+cluster_r4_bit22_cutover_latch_verify(void)
+{
+	return test_bit22_latch_active;
 }
 
 uint64
@@ -257,7 +406,8 @@ cluster_control_root_create_authority_current_v1(
 bool
 cluster_control_root_activate_authority_current_v1(
 	const ClusterControlRootFileToken *expected_token pg_attribute_unused(),
-	const uint8 expected_round_sha256[32] pg_attribute_unused())
+	const uint8 expected_round_sha256[32] pg_attribute_unused(),
+	const ClusterControlRootMigrationRoundV1 *round pg_attribute_unused())
 {
 	return test_activate_authorized;
 }
@@ -420,6 +570,69 @@ read_all_or_abort(const char *path, void *buf, size_t len)
 	close(fd);
 }
 
+/*
+ * write_minimal_checkpoint_segment -- RF-ROOT P9 verification (contract): build
+ * a minimal real WAL segment for thread 1 (tli 1, seg 1 — the
+ * build_source_wal_state fixture's checkpoint_redo lives at 0x1000000,
+ * segment offset 0) containing one CheckPoint record, so the migration
+ * image scan can extract the checkpoint record CRC.  XLogRecord encoding
+ * follows the on-disk format (header + payload + CRC over everything but
+ * the xl_crc field).
+ */
+static void
+write_minimal_checkpoint_segment(const char *thread_dir)
+{
+	char path[MAXPGPATH];
+	uint8 page[XLOG_BLCKSZ];
+	XLogLongPageHeaderData longhdr;
+	XLogRecord rec;
+	pg_crc32c crc;
+	int off;
+
+	memset(page, 0, sizeof(page));
+	memset(&longhdr, 0, sizeof(longhdr));
+	/* Segment page 0 must carry the long header (offset==0 forces
+	 * XLP_LONG_HEADER in XLogReaderValidatePageHeader).  The reader's
+	 * system_identifier is 0 in the unit harness, so xlp_sysid stays 0;
+	 * segment size and block size must match the reader's. */
+	longhdr.std.xlp_magic = XLOG_PAGE_MAGIC;
+	longhdr.std.xlp_info = XLP_LONG_HEADER;
+	longhdr.std.xlp_tli = 1;
+	longhdr.std.xlp_pageaddr = UINT64_C(0x1000000);
+	longhdr.xlp_sysid = UINT64_C(0);
+	longhdr.xlp_seg_size = wal_segment_size;
+	longhdr.xlp_xlog_blcksz = XLOG_BLCKSZ;
+	memcpy(page, &longhdr, sizeof(longhdr));
+
+	off = SizeOfXLogLongPHD + SizeOfXLogRecord;
+	/* Payload follows the XLogInsert encoding for a pure main-data
+	 * record: XLogRecordDataHeaderShort (0xFF + len) + CheckPoint bytes.
+	 * The record reader parses these headers, so zeros alone would be
+	 * misread as block ids. */
+	page[off] = XLR_BLOCK_ID_DATA_SHORT;
+	page[off + 1] = (uint8) sizeof(CheckPoint);
+	memset(page + off + 2, 0, sizeof(CheckPoint));
+
+	memset(&rec, 0, sizeof(rec));
+	rec.xl_tot_len = SizeOfXLogRecord + 2 + sizeof(CheckPoint);
+	rec.xl_xid = 1;
+	rec.xl_prev = UINT64_C(0x1000000);
+	rec.xl_info = XLOG_CHECKPOINT_SHUTDOWN;
+	rec.xl_rmid = RM_XLOG_ID;
+	/* ValidXLogRecord order: payload first, then header up to (not
+	 * including) xl_crc. */
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, page + off, 2 + sizeof(CheckPoint));
+	COMP_CRC32C(crc, (uint8 *) &rec, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(crc);
+	rec.xl_crc = (uint32) crc;
+	memcpy(page + SizeOfXLogLongPHD, &rec, sizeof(rec));
+
+	snprintf(path, sizeof(path), "%s/%s", thread_dir,
+			 "000000010000000000000001");
+	write_all_or_abort(path, page, sizeof(page));
+}
+
 static void
 build_source_wal_state(void)
 {
@@ -448,6 +661,7 @@ build_source_wal_state(void)
 	snprintf(path, sizeof(path), "%s/%s", thread_dir,
 			 CLUSTER_WAL_THREAD_CLAIM_FILENAME);
 	write_all_or_abort(path, &claim, sizeof(claim));
+	write_minimal_checkpoint_segment(thread_dir);
 }
 
 static void
@@ -690,6 +904,8 @@ fixture_root_main(int argc, char **argv)
 		lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 	else if (strcmp(argv[6], "RECOVERY_REQUIRED") == 0)
 		lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	else if (strcmp(argv[6], "RECOVERY_COMPLETE") == 0)
+		lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
 	else {
 		fprintf(stderr, "unsupported fixture lifecycle\n");
 		return 2;
@@ -779,7 +995,7 @@ fixture_root_main(int argc, char **argv)
 		return 1;
 	}
 	round_sha256(&round, round_sha);
-	if (cluster_control_root_activate_prepared(&prepared, round_sha, &active)
+	if (cluster_control_root_activate_prepared(&prepared, round_sha, &round, &active)
 		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| active.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE) {
 		fprintf(stderr, "control-root activation verification failed\n");
@@ -791,6 +1007,255 @@ fixture_root_main(int argc, char **argv)
 										 &snapshot, &read_token)
 		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		fprintf(stderr, "control-root activation verification failed\n");
+		return 1;
+	}
+	return 0;
+}
+
+/*
+ * RF-ROOT P6 pair cast (t/243 setup producer).
+ *
+ * Unlike the synthetic --fixture-root mode, this mode never rewrites the
+ * wal-state registry or claim files.  It reads the REAL stopped slots for
+ * threads 1 and 2 and the REAL claim files, and mints a canonical control
+ * root whose two records mirror the whole registry:
+ *
+ *   record[0] = thread 1 / node 0, lifecycle argv[9]
+ *   record[1] = thread 2 / node 1, lifecycle argv[7]
+ *
+ * argv: --fixture-root-cast <shared_root> <wal_root> <sysid>
+ *       <storage_uuid_hex32> <authority_uuid_hex32> <lifecycle2> <inc2>
+ *       <lifecycle1> <inc1>
+ */
+static bool
+fixture_cast_load_thread(uint16 thread_id, int32 node_id, uint32 *out_tli,
+						 uint64 *out_ckpt, uint64 *out_tail,
+						 ClusterWalThreadClaim *out_claim)
+{
+	uint8 bytes[CLUSTER_WAL_STATE_FILE_SIZE];
+	ClusterWalStateSlot slot;
+	ClusterWalThreadClaim disk_claim;
+	ClusterWalThreadClaim expected_claim;
+	uint16 bad_thread = 0;
+	const char *reason = NULL;
+	char path[MAXPGPATH];
+	char thread_dir[MAXPGPATH];
+
+	if (snprintf(path, sizeof(path), "%s/%s", test_wal_root,
+				 CLUSTER_WAL_STATE_FILENAME) <= 0
+		|| !read_exact_file(path, bytes, sizeof(bytes))
+		|| !cluster_wal_state_image_validate(bytes, sizeof(bytes), &bad_thread,
+										 &reason))
+		return false;
+	memcpy(&slot, bytes + CLUSTER_WAL_STATE_SLOT_OFFSET(thread_id), sizeof(slot));
+	if (cluster_wal_state_slot_classify(&slot, thread_id, -1, NULL)
+			!= CLUSTER_WAL_SLOT_OK
+		|| slot.state != CLUSTER_WAL_SLOT_STATE_STOPPED
+		|| slot.node_id != node_id
+		|| slot.tli == 0
+		|| slot.checkpoint_redo_lsn == 0
+		|| slot.highest_lsn == 0
+		|| slot.highest_lsn < slot.checkpoint_redo_lsn
+		|| slot.merge_recovered_lsn != 0)
+		return false;
+
+	if (snprintf(thread_dir, sizeof(thread_dir), "%s/thread_%u", test_wal_root,
+				 thread_id) <= 0
+		|| snprintf(path, sizeof(path), "%s/%s", thread_dir,
+					CLUSTER_WAL_THREAD_CLAIM_FILENAME) <= 0
+		|| !read_exact_file(path, (uint8 *)&disk_claim, sizeof(disk_claim)))
+		return false;
+	cluster_wal_thread_claim_fill(&expected_claim, thread_id, node_id,
+								  disk_claim.created_at);
+	if (disk_claim.magic != expected_claim.magic
+		|| disk_claim.version != expected_claim.version
+		|| disk_claim.thread_id != thread_id
+		|| disk_claim.node_id != node_id
+		|| disk_claim.created_at == 0
+		|| disk_claim.crc != expected_claim.crc)
+		return false;
+
+	*out_tli = slot.tli;
+	*out_ckpt = slot.checkpoint_redo_lsn;
+	*out_tail = slot.highest_lsn;
+	*out_claim = expected_claim;
+	return true;
+}
+
+static void
+fixture_cast_fill_record(ClusterControlRootSnapshot *snapshot, uint64 sysid,
+						 const uint8 storage_uuid[16],
+						 const uint8 authority_uuid[16], uint16 thread_id,
+						 int32 node_id, const ClusterWalThreadClaim *claim,
+						 uint32 lifecycle, uint64 owner_incarnation, uint32 tli,
+						 uint64 ckpt, uint64 tail)
+{
+	*snapshot = (ClusterControlRootSnapshot){0};
+	snapshot->identity.system_identifier = sysid;
+	memcpy(snapshot->identity.storage_uuid, storage_uuid, 16);
+	memcpy(snapshot->identity.authority_uuid, authority_uuid, 16);
+	snapshot->identity.origin_thread_id = thread_id;
+	snapshot->identity.origin_node_id = node_id;
+	snapshot->identity.thread_claim_created_at = claim->created_at;
+	snapshot->identity.thread_claim_crc32c = claim->crc;
+	snapshot->identity.origin_owner_incarnation = owner_incarnation;
+	snapshot->identity.root_lineage_seq = 1;
+	snapshot->lifecycle = lifecycle;
+	snapshot->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT;
+	snapshot->root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+						   | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+						   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+	snapshot->root_publish_seq = 1;
+	snapshot->checkpoint_tli = tli;
+	snapshot->tail_tli = tli;
+	snapshot->checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
+	snapshot->tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	snapshot->checkpoint_lower_lsn = ckpt;
+	snapshot->validated_tail_lsn_exclusive = tail;
+	snapshot->checkpoint_record_crc32c = UINT32_C(0x33445566);
+	if (tail > ckpt) {
+		snapshot->root_flags |= CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+		snapshot->tail_last_record_lsn = tail - 1;
+		snapshot->tail_last_record_crc32c = UINT32_C(0x55667788);
+	}
+}
+
+static int
+fixture_cast_main(int argc, char **argv)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken prepared;
+	ClusterControlRootFileToken active;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootIdentity expected_identity;
+	ClusterControlRootReadToken read_token;
+	ClusterWalThreadClaim claim1;
+	ClusterWalThreadClaim claim2;
+	ClusterControlRootResult result_cast_prepare;
+	uint8 round_sha[PG_SHA256_DIGEST_LENGTH];
+	uint64 sysid;
+	uint64 inc1;
+	uint64 inc2;
+	uint32 lifecycle1;
+	uint32 lifecycle2;
+	uint32 tli1;
+	uint32 tli2;
+	uint64 ckpt1;
+	uint64 ckpt2;
+	uint64 tail1;
+	uint64 tail2;
+	uint8 storage_uuid[16];
+	uint8 authority_uuid[16];
+
+	if (argc != 11 || strcmp(argv[1], "--fixture-root-cast") != 0
+		|| !parse_u64_arg(argv[4], &sysid) || sysid == 0
+		|| strlen(argv[2]) >= sizeof(test_root)
+		|| strlen(argv[3]) >= sizeof(test_wal_root)
+		|| strlen(argv[5]) != 32 || strlen(argv[6]) != 32
+		|| !parse_uuid_hex(argv[5], storage_uuid)
+		|| !parse_uuid_hex(argv[6], authority_uuid)
+		|| (authority_uuid[6] & 0xf0) != 0x40
+		|| (authority_uuid[8] & 0xc0) != 0x80
+		|| !parse_u64_arg(argv[8], &inc2) || inc2 == 0
+		|| !parse_u64_arg(argv[10], &inc1) || inc1 == 0) {
+		fprintf(stderr, "invalid --fixture-root-cast arguments\n");
+		return 2;
+	}
+	if (strcmp(argv[7], "RECOVERY_COMPLETE") == 0)
+		lifecycle2 = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	else if (strcmp(argv[7], "OPEN") == 0)
+		lifecycle2 = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	else if (strcmp(argv[7], "RECOVERY_REQUIRED") == 0)
+		lifecycle2 = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	else {
+		fprintf(stderr, "unsupported cast lifecycle 2\n");
+		return 2;
+	}
+	if (strcmp(argv[9], "OPEN") == 0)
+		lifecycle1 = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	else if (strcmp(argv[9], "RECOVERY_COMPLETE") == 0)
+		lifecycle1 = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	else {
+		fprintf(stderr, "unsupported cast lifecycle 1\n");
+		return 2;
+	}
+
+	strlcpy(test_root, argv[2], sizeof(test_root));
+	strlcpy(test_wal_root, argv[3], sizeof(test_wal_root));
+	strlcpy(test_storage_uuid_text, argv[5], sizeof(test_storage_uuid_text));
+	test_system_identifier = sysid;
+	cluster_shared_data_dir = test_root;
+	cluster_wal_threads_dir = test_wal_root;
+	DataDir = test_root;
+	test_node_count = 2;
+	test_local_probe = true;
+
+	if (!fixture_cast_load_thread(1, 0, &tli1, &ckpt1, &tail1, &claim1)) {
+		fprintf(stderr, "cannot load real thread-1 source\n");
+		return 1;
+	}
+	if (!fixture_cast_load_thread(2, 1, &tli2, &ckpt2, &tail2, &claim2)) {
+		fprintf(stderr, "cannot load real thread-2 source\n");
+		return 1;
+	}
+
+	memset(&image, 0, sizeof(image));
+	image.system_identifier = sysid;
+	memcpy(image.storage_uuid, storage_uuid, 16);
+	memcpy(image.authority_uuid, authority_uuid, 16);
+	image.created_at_usec = INT64_C(1700000000000002);
+	image.assigned_record_count = 2;
+	fixture_cast_fill_record(&image.records[0], sysid, storage_uuid,
+							 authority_uuid, 1, 0, &claim1, lifecycle1, inc1,
+							 tli1, ckpt1, tail1);
+	fixture_cast_fill_record(&image.records[1], sysid, storage_uuid,
+							 authority_uuid, 2, 1, &claim2, lifecycle2, inc2,
+							 tli2, ckpt2, tail2);
+
+	memset(&round, 0, sizeof(round));
+	memcpy(round.magic, "PCRM", 4);
+	round.version = 1;
+	round.bytes = sizeof(round);
+	round.prepare_generation = 1;
+	round.transition_epoch = 1;
+	round.target_feature_bitmap =
+		PGRAC_CONTROL_ROOT_FEATURE_WAL_REUSE_V1
+		| PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.admitted_bitmap_low = 3;
+	round.capability_sample_digest = UINT64_C(0x8877665544332211);
+	round.coordinator_incarnation = UINT64_C(0x7766554433221100);
+	round.coordinator_node_id = 0;
+
+	wipe_root_files();
+	result_cast_prepare = cluster_control_root_create_prepared(&image, &round,
+																&prepared);
+	if (result_cast_prepare != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		fprintf(stderr, "control-root cast prepare failed (result %d)\n",
+				(int)result_cast_prepare);
+		return 1;
+	}
+	round_sha256(&round, round_sha);
+	if (cluster_control_root_activate_prepared(&prepared, round_sha, &round, &active)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| active.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE) {
+		fprintf(stderr, "control-root cast activation failed\n");
+		return 1;
+	}
+	expected_identity = image.records[0].identity;
+	if (cluster_control_root_read_canonical(1, &expected_identity,
+										 CLUSTER_CONTROL_ROOT_READ_STRONG,
+										 &snapshot, &read_token)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		fprintf(stderr, "control-root cast thread-1 readback failed\n");
+		return 1;
+	}
+	expected_identity = image.records[1].identity;
+	if (cluster_control_root_read_canonical(2, &expected_identity,
+										 CLUSTER_CONTROL_ROOT_READ_STRONG,
+										 &snapshot, &read_token)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		fprintf(stderr, "control-root cast thread-2 readback failed\n");
 		return 1;
 	}
 	return 0;
@@ -1003,6 +1468,221 @@ UT_TEST(test_bootstrap_read_never_returns_authority_token)
 	UT_ASSERT_EQ(read_token.file_txn_seq, 0);
 }
 
+/* RF-ROOT P7 (contract §A / follow-up E1): the NULL-identity bug class — a
+ * STRONG read with expected_identity == NULL must stay INVALID_ARGUMENT=23
+ * (the G1b step-4 sites' inertness signature).  The legal no-prior-identity
+ * path is the two-step discovered read below. */
+UT_TEST(test_round_sha256_is_deterministic_and_matches_create)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken token;
+	uint8 sha_a[PG_SHA256_DIGEST_LENGTH];
+	uint8 sha_b[PG_SHA256_DIGEST_LENGTH];
+
+	wipe_root_files();
+	build_migration(&image, &round);
+	UT_ASSERT(cluster_control_root_round_sha256(&round, sha_a));
+	UT_ASSERT(cluster_control_root_round_sha256(&round, sha_b));
+	UT_ASSERT(memcmp(sha_a, sha_b, sizeof(sha_a)) == 0);
+	/* create_prepared must succeed with the same round (its header stores
+	 * the same wire-encoded sha). */
+	UT_ASSERT_EQ(create_prepared(&image, &round, &token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+}
+
+UT_TEST(test_build_migration_image_maps_registry_and_claims)
+{
+	ClusterControlRootMigrationImage image;
+
+	wipe_root_files();
+	build_source_wal_state(); /* registry slot 1 STOPPED + thread_1 claim */
+	test_membership_incarnation = UINT64_C(0x1020304050607080);
+	UT_ASSERT_EQ(cluster_control_root_build_migration_image(NULL, &image),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(image.assigned_record_count, 1);
+	/* the checkpoint record CRC must come from the real WAL stream scan */
+	UT_ASSERT(image.records[0].checkpoint_record_crc32c != 0);
+	UT_ASSERT_EQ(image.records[0].identity.origin_thread_id, 1);
+	UT_ASSERT_EQ(image.records[0].identity.origin_node_id, 0);
+	UT_ASSERT_EQ(image.records[0].identity.origin_owner_incarnation,
+				 UINT64_C(0x1020304050607080));
+	UT_ASSERT_EQ(image.records[0].identity.thread_claim_created_at,
+				 INT64_C(1699999999000001));
+	UT_ASSERT_EQ(image.records[0].lifecycle,
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+	UT_ASSERT_EQ(image.records[0].checkpoint_lower_lsn,
+				 UINT64_C(0x1000000));
+	UT_ASSERT_EQ(image.records[0].validated_tail_lsn_exclusive,
+				 UINT64_C(0x1000000));
+	UT_ASSERT((image.records[0].root_flags
+			   & CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID) != 0);
+	UT_ASSERT(memcmp(image.storage_uuid, image.records[0].identity.storage_uuid,
+					 16) == 0);
+	build_source_wal_state(); /* restore the shared fixture for later tests */
+}
+
+UT_TEST(test_build_migration_image_accepts_frozen_active_slot)
+{
+	/* RF-ROOT P9 verification (implementation): the online first-open round freezes
+	 * every member's wal-state writers first; an ACTIVE slot is then
+	 * provably quiesced and acceptable as migration input. */
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	uint8 bytes[CLUSTER_WAL_STATE_FILE_SIZE];
+	ClusterWalStateSlot slot;
+
+	wipe_root_files();
+	memset(bytes, 0, sizeof(bytes));
+	cluster_wal_state_header_fill((ClusterWalStateHeader *) bytes,
+								  INT64_C(1699999999000000));
+	cluster_wal_state_slot_fill(&slot, 1, 0,
+								CLUSTER_WAL_SLOT_STATE_ACTIVE, 1,
+								INT64_C(1699999999000001),
+								INT64_C(1699999999000002),
+								UINT64_C(0x1000000), 1);
+	slot.checkpoint_redo_lsn = UINT64_C(0x1000000);
+	slot.crc = cluster_wal_state_block_crc(&slot);
+	memcpy(bytes + CLUSTER_WAL_STATE_SLOT_OFFSET(1), &slot, sizeof(slot));
+	{
+		char path[MAXPGPATH];
+
+		snprintf(path, sizeof(path), "%s/%s", test_wal_root,
+				 CLUSTER_WAL_STATE_FILENAME);
+		write_all_or_abort(path, bytes, sizeof(bytes));
+	}
+	/* claim + minimal WAL segment for the scan */
+	{
+		char thread_dir[MAXPGPATH];
+		char path[MAXPGPATH];
+		ClusterWalThreadClaim claim;
+
+		snprintf(thread_dir, sizeof(thread_dir), "%s/thread_1",
+				 test_wal_root);
+		if (mkdir(thread_dir, 0700) != 0 && errno != EEXIST)
+			abort();
+		cluster_wal_thread_claim_fill(&claim, 1, 0,
+									  INT64_C(1699999999000001));
+		snprintf(path, sizeof(path), "%s/%s", thread_dir,
+				 CLUSTER_WAL_THREAD_CLAIM_FILENAME);
+		write_all_or_abort(path, &claim, sizeof(claim));
+		write_minimal_checkpoint_segment(thread_dir);
+	}
+	test_membership_incarnation = UINT64_C(0x1020304050607080);
+	memset(&round, 0, sizeof(round));
+	round.transition_epoch = 7;
+	round.prepare_generation = 5;
+
+	/* ACTIVE without the round's freeze -> refused. */
+	test_source_close_current_ok = false;
+	UT_ASSERT_EQ(cluster_control_root_build_migration_image(&round, &image),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+
+	/* ACTIVE frozen by this exact round -> accepted. */
+	test_source_close_current_ok = true;
+	UT_ASSERT_EQ(cluster_control_root_build_migration_image(&round, &image),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(image.assigned_record_count, 1);
+	UT_ASSERT_EQ(image.records[0].identity.origin_thread_id, 1);
+	UT_ASSERT(image.records[0].checkpoint_record_crc32c != 0);
+	test_source_close_current_ok = false;
+}
+
+UT_TEST(test_build_migration_image_rejects_non_stopped_slot)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterWalStateSlot slot;
+	char path[MAXPGPATH];
+	int fd;
+
+	wipe_root_files();
+	build_source_wal_state();
+	/* flip slot 1 to ACTIVE — the W6 CLOSED precondition is violated */
+	path_for(path, sizeof(path), ""); /* reuse: write into the wal root */
+	snprintf(path, sizeof(path), "%s/%s", test_wal_root,
+			 CLUSTER_WAL_STATE_FILENAME);
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	memcpy(&slot, (void *)0, 0); /* noop to keep compiler quiet */
+	{
+		ClusterWalStateSlot s;
+
+		if (pread(fd, &s, sizeof(s), CLUSTER_WAL_STATE_SLOT_OFFSET(1))
+			!= (ssize_t) sizeof(s))
+			abort();
+		s.state = CLUSTER_WAL_SLOT_STATE_ACTIVE;
+		s.crc = cluster_wal_state_block_crc(&s);
+		if (pwrite(fd, &s, sizeof(s), CLUSTER_WAL_STATE_SLOT_OFFSET(1))
+			!= (ssize_t) sizeof(s))
+			abort();
+	}
+	close(fd);
+	UT_ASSERT_EQ(cluster_control_root_build_migration_image(NULL, &image),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	build_source_wal_state(); /* restore the STOPPED fixture */
+}
+
+UT_TEST(test_strong_read_null_identity_stays_invalid_argument)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken read_token;
+
+	wipe_root_files();
+	UT_ASSERT_EQ(create_prepared(&image, &round, &file_token), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	memset(&snapshot, 0xee, sizeof(snapshot));
+	memset(&read_token, 0xee, sizeof(read_token));
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(1, NULL,
+											  CLUSTER_CONTROL_ROOT_READ_STRONG,
+											  &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(snapshot.identity.system_identifier, 0);
+	UT_ASSERT_EQ(read_token.file_txn_seq, 0);
+}
+
+UT_TEST(test_discovered_read_binds_identity_and_mints_token)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken read_token;
+
+	wipe_root_files();
+	UT_ASSERT_EQ(create_prepared(&image, &round, &file_token), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	memset(&snapshot, 0xee, sizeof(snapshot));
+	memset(&read_token, 0xee, sizeof(read_token));
+	UT_ASSERT_EQ(cluster_control_root_read_canonical_discovered(1, &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(cluster_control_root_identity_equal(&snapshot.identity,
+											 &image.records[0].identity));
+	UT_ASSERT_EQ(snapshot.checkpoint_lower_lsn, UINT64_C(0x1000000));
+	/* The STRONG step mints the authority token (BOOTSTRAP never does). */
+	UT_ASSERT_EQ(read_token.file_txn_seq, 1);
+	UT_ASSERT_EQ(read_token.origin_thread_id, 1);
+}
+
+UT_TEST(test_discovered_read_absent_thread_fails_closed)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken read_token;
+
+	wipe_root_files();
+	UT_ASSERT_EQ(create_prepared(&image, &round, &file_token), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	memset(&snapshot, 0xee, sizeof(snapshot));
+	memset(&read_token, 0xee, sizeof(read_token));
+	/* The fixture mints record[0] only; tid 2 was never present. */
+	UT_ASSERT_EQ(cluster_control_root_read_canonical_discovered(2, &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_ABSENT);
+	UT_ASSERT_EQ(snapshot.identity.system_identifier, 0);
+	UT_ASSERT_EQ(read_token.file_txn_seq, 0);
+}
+
 UT_TEST(test_valid_bak_blocks_corrupt_primary)
 {
 	ClusterControlRootMigrationImage image;
@@ -1074,14 +1754,107 @@ UT_TEST(test_activate_and_stale_token)
 	wipe_root_files();
 	UT_ASSERT_EQ(create_prepared(&image, &round, &prepared), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	round_sha256(&round, round_sha);
-	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &active),
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &round, &active),
 				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(active.activation_state, CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE);
 	UT_ASSERT_EQ(active.file_txn_seq, 2);
 	memset(&stale_out, 0xee, sizeof(stale_out));
-	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &stale_out),
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &round, &stale_out),
 				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
 	UT_ASSERT_EQ(stale_out.file_txn_seq, 0);
+}
+
+UT_TEST(test_restore_bit22_latch_from_active_root)
+{
+	/* RF-ROOT P9 verification (implementation): the latch restores only on the
+	 * DURABLE Target OPEN proof — a strict-majority OPEN(P+2) record on
+	 * the voting disks cross-matched to the ACTIVE canonical root's round
+	 * identity (root migration_transition_epoch == OPEN.transition_epoch
+	 * AND root migration_prepare_generation + 2 == OPEN.record_generation).
+	 * No record-lifecycle axis participates.  The apply lands at
+	 * TARGET_BOOTSTRAP; a refused apply (census RED) fails closed. */
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken prepared;
+	ClusterControlRootFileToken active;
+	uint8 round_sha[PG_SHA256_DIGEST_LENGTH];
+
+	/* No durable OPEN record -> no restore. */
+	wipe_root_files();
+	test_bit22_latch_active = false;
+	test_bit22_latch_apply_calls = 0;
+	test_qvotec_open_present = false;
+	UT_ASSERT(!cluster_control_root_restore_bit22_latch_if_active());
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, 0);
+
+	/* OPEN record present but no root -> no restore. */
+	test_qvotec_open_present = true;
+	test_qvotec_open_epoch = 7;
+	test_qvotec_open_generation = 7;
+	test_decoded_open.phase = CLUSTER_SEMANTIC_PHASE_OPEN;
+	test_decoded_open.transition_epoch = 7;
+	test_decoded_open.record_generation = 7;
+	UT_ASSERT(!cluster_control_root_restore_bit22_latch_if_active());
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, 0);
+
+	/* PREPARED root (create only) -> no restore (not ACTIVE). */
+	UT_ASSERT_EQ(create_prepared(&image, &round, &prepared),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	test_bit22_latch_apply_calls = 0;
+	UT_ASSERT(!cluster_control_root_restore_bit22_latch_if_active());
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, 0);
+
+	/* ACTIVE root but the OPEN record does not cross-match the round
+	 * identity -> no restore. */
+	round_sha256(&round, round_sha);
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha,
+														&round, &active),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(active.activation_state, CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE);
+	test_decoded_open.transition_epoch = round.transition_epoch + 1;
+	test_decoded_open.record_generation
+		= round.prepare_generation + 2; /* epoch mismatch */
+	test_bit22_latch_apply_calls = 0;
+	UT_ASSERT(!cluster_control_root_restore_bit22_latch_if_active());
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, 0);
+	UT_ASSERT(!test_bit22_latch_active);
+
+	/* ACTIVE root + exact cross-match -> restored with the OPEN record's
+	 * round identity (TARGET_BOOTSTRAP). */
+	test_decoded_open.transition_epoch = round.transition_epoch;
+	test_decoded_open.record_generation
+		= round.prepare_generation + 2;
+	test_bit22_latch_apply_calls = 0;
+	UT_ASSERT(cluster_control_root_restore_bit22_latch_if_active());
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, 1);
+	UT_ASSERT_EQ(test_bit22_latch_apply_epoch, round.transition_epoch);
+	UT_ASSERT_EQ(test_bit22_latch_apply_generation,
+				 round.prepare_generation + 2);
+	UT_ASSERT(test_bit22_latch_active);
+
+	/* Already armed -> no second apply. */
+	test_bit22_latch_apply_calls = 0;
+	UT_ASSERT(cluster_control_root_restore_bit22_latch_if_active());
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, 0);
+
+	/* Refused apply (census RED stand-in) -> fail-closed, gate stays off. */
+	wipe_root_files();
+	UT_ASSERT_EQ(create_prepared(&image, &round, &prepared),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	round_sha256(&round, round_sha);
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha,
+														&round, &active),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	test_decoded_open.transition_epoch = round.transition_epoch;
+	test_decoded_open.record_generation
+		= round.prepare_generation + 2;
+	test_bit22_latch_active = false;
+	test_bit22_latch_apply_ok = false;
+	test_bit22_latch_apply_calls = 0;
+	UT_ASSERT(!cluster_control_root_restore_bit22_latch_if_active());
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, 1);
+	UT_ASSERT(!test_bit22_latch_active);
+	test_bit22_latch_apply_ok = true;
 }
 
 UT_TEST(test_unbound_cutover_mutators_fail_before_cf_and_preserve_prepared_root)
@@ -1113,7 +1886,7 @@ UT_TEST(test_unbound_cutover_mutators_fail_before_cf_and_preserve_prepared_root)
 	memset(&active, 0xee, sizeof(active));
 	test_activate_authorized = false;
 	UT_ASSERT_EQ(cluster_control_root_activate_prepared(
-				 &prepared, round_sha, &active),
+				 &prepared, round_sha, &round, &active),
 				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
 	UT_ASSERT_EQ(test_cf_lock_calls, lock_calls_before);
 	UT_ASSERT_EQ(test_durable_rename_calls, rename_calls_before);
@@ -1122,7 +1895,7 @@ UT_TEST(test_unbound_cutover_mutators_fail_before_cf_and_preserve_prepared_root)
 	/* The refused attempt cannot consume or mutate the PREPARED image. */
 	test_activate_authorized = true;
 	UT_ASSERT_EQ(cluster_control_root_activate_prepared(
-				 &prepared, round_sha, &active),
+				 &prepared, round_sha, &round, &active),
 				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(active.activation_state, CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE);
 	UT_ASSERT_EQ(active.file_txn_seq, prepared.file_txn_seq + 1);
@@ -1170,7 +1943,7 @@ UT_TEST(test_activation_rejects_changed_source_wal_bytes)
 	close(fd);
 	round_sha256(&round, round_sha);
 	memset(&active, 0xee, sizeof(active));
-	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &active),
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &round, &active),
 				 CLUSTER_CONTROL_ROOT_HASH_MISMATCH);
 	UT_ASSERT_EQ(active.file_txn_seq, 0);
 	build_source_wal_state();
@@ -1195,7 +1968,7 @@ UT_TEST(test_activation_rejects_same_node_thread_claim_drift)
 	write_all_or_abort(path, &claim, sizeof(claim));
 	round_sha256(&round, round_sha);
 	memset(&active, 0xee, sizeof(active));
-	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &active),
+	UT_ASSERT_EQ(cluster_control_root_activate_prepared(&prepared, round_sha, &round, &active),
 				 CLUSTER_CONTROL_ROOT_HASH_MISMATCH);
 	UT_ASSERT_EQ(active.file_txn_seq, 0);
 	build_source_wal_state();
@@ -1508,6 +2281,142 @@ UT_TEST(test_owner_rejoin_advances_exact_lineage_and_exhausts_at_max)
 	UT_ASSERT_EQ(new_token.file_txn_seq, 0);
 }
 
+UT_TEST(test_lifecycle_frozen_shape_matrix)
+{
+	ClusterControlRootMigrationImage image;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootIdentity identity;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootReadToken read_token;
+	ClusterControlRootReadToken new_token;
+	ClusterControlRootPatch patch;
+	uint64 new_incarnation;
+
+	/* ① OWNER_REJOIN from RECOVERY_COMPLETE -> OPEN succeeds (frozen
+	 * crash-rejoin mainline). */
+	wipe_root_files();
+	build_migration(&image, &round);
+	image.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &file_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_control_root_lookup_owner_by_node_runtime(
+				 0, &identity, &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	new_incarnation = snapshot.identity.origin_owner_incarnation + 1;
+	build_owner_rejoin_patch(&snapshot, new_incarnation,
+						 snapshot.identity.root_lineage_seq + 1, &patch);
+	memset(&published, 0xee, sizeof(published));
+	memset(&new_token, 0xee, sizeof(new_token));
+	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
+				 &read_token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
+				 &published, &new_token), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(published.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(published.identity.origin_owner_incarnation, new_incarnation);
+	UT_ASSERT_EQ(published.identity.root_lineage_seq,
+				 snapshot.identity.root_lineage_seq + 1);
+
+	/* ② OWNER_REJOIN from OPEN is rejected by patch_shape_valid BEFORE any
+	 * CF / file I/O (STOP-02 §17.4: pre-lifecycle must be
+	 * RECOVERY_COMPLETE). */
+	wipe_root_files();
+	build_migration(&image, &round);
+	image.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &file_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_control_root_lookup_owner_by_node_runtime(
+				 0, &identity, &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	build_owner_rejoin_patch(&snapshot,
+						 snapshot.identity.origin_owner_incarnation + 1,
+						 snapshot.identity.root_lineage_seq + 1, &patch);
+	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	test_cf_lock_calls = 0;
+	test_durable_rename_calls = 0;
+	memset(&published, 0xee, sizeof(published));
+	memset(&new_token, 0xee, sizeof(new_token));
+	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
+				 &read_token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
+				 &published, &new_token), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(published.identity.system_identifier, 0);
+	UT_ASSERT_EQ(new_token.file_txn_seq, 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	UT_ASSERT_EQ(test_durable_rename_calls, 0);
+
+	/* ②' OWNER_REJOIN from CLOSED is rejected the same way: the
+	 * clean-reopen mainline is THREAD_OPEN (CLOSED -> OPEN), never the
+	 * OWNER_REJOIN CAS (increment-13 allowance removed). */
+	wipe_root_files();
+	build_migration(&image, &round);
+	image.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &file_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_control_root_lookup_owner_by_node_runtime(
+				 0, &identity, &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	build_owner_rejoin_patch(&snapshot,
+						 snapshot.identity.origin_owner_incarnation + 1,
+						 snapshot.identity.root_lineage_seq + 1, &patch);
+	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	test_cf_lock_calls = 0;
+	test_durable_rename_calls = 0;
+	memset(&published, 0xee, sizeof(published));
+	memset(&new_token, 0xee, sizeof(new_token));
+	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
+				 &read_token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
+				 &published, &new_token), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(published.identity.system_identifier, 0);
+	UT_ASSERT_EQ(new_token.file_txn_seq, 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	UT_ASSERT_EQ(test_durable_rename_calls, 0);
+
+	/* ③ THREAD_OPEN CLOSED -> OPEN succeeds with owner re-stamp +
+	 * lineage+1 (the frozen clean-reopen mainline). */
+	wipe_root_files();
+	build_migration(&image, &round);
+	image.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT_EQ(cluster_control_root_create_prepared(&image, &round, &file_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(cluster_control_root_lookup_owner_by_node_runtime(
+				 0, &identity, &snapshot, &read_token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	new_incarnation = snapshot.identity.origin_owner_incarnation + 1;
+	memset(&patch, 0, sizeof(patch));
+	patch.mask = UINT64_C(0x3b);
+	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	patch.desired.identity.origin_owner_incarnation = new_incarnation;
+	patch.desired.identity.root_lineage_seq =
+		snapshot.identity.root_lineage_seq + 1;
+	patch.desired.root_flags = snapshot.root_flags;
+	patch.desired.checkpoint_tli = snapshot.checkpoint_tli;
+	patch.desired.checkpoint_source_kind = snapshot.checkpoint_source_kind;
+	patch.desired.checkpoint_lower_lsn = snapshot.checkpoint_lower_lsn;
+	patch.desired.checkpoint_record_crc32c = snapshot.checkpoint_record_crc32c;
+	patch.desired.tail_tli = snapshot.tail_tli;
+	patch.desired.tail_validation_kind = snapshot.tail_validation_kind;
+	patch.desired.validated_tail_lsn_exclusive =
+		snapshot.validated_tail_lsn_exclusive;
+	patch.desired.tail_last_record_lsn = snapshot.tail_last_record_lsn;
+	patch.desired.tail_last_record_crc32c = snapshot.tail_last_record_crc32c;
+	patch.desired.recovered_tli = snapshot.recovered_tli;
+	patch.desired.recovered_through_lsn_exclusive =
+		snapshot.recovered_through_lsn_exclusive;
+	patch.desired.recovered_last_record_lsn = snapshot.recovered_last_record_lsn;
+	patch.desired.recovered_last_record_crc32c =
+		snapshot.recovered_last_record_crc32c;
+	memset(&published, 0xee, sizeof(published));
+	memset(&new_token, 0xee, sizeof(new_token));
+	UT_ASSERT_EQ(cluster_control_root_compare_and_publish(
+				 &read_token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN,
+				 &published, &new_token), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(published.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(published.identity.origin_owner_incarnation, new_incarnation);
+	UT_ASSERT_EQ(published.identity.root_lineage_seq,
+				 snapshot.identity.root_lineage_seq + 1);
+}
+
 UT_TEST(test_initial_migration_requires_lineage_one)
 {
 	ClusterControlRootMigrationImage image;
@@ -1593,20 +2502,30 @@ UT_TEST(test_reserved_bytes_and_symlink_fail_closed)
 int
 main(int argc, char **argv)
 {
+	if (argc > 1 && strcmp(argv[1], "--fixture-root-cast") == 0)
+		return fixture_cast_main(argc, argv);
 	if (argc > 1)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(25);
+	UT_PLAN(32);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
 	UT_RUN(test_create_and_read_primary);
 	UT_RUN(test_bootstrap_read_never_returns_authority_token);
+	UT_RUN(test_round_sha256_is_deterministic_and_matches_create);
+	UT_RUN(test_build_migration_image_maps_registry_and_claims);
+	UT_RUN(test_build_migration_image_accepts_frozen_active_slot);
+	UT_RUN(test_build_migration_image_rejects_non_stopped_slot);
+	UT_RUN(test_strong_read_null_identity_stays_invalid_argument);
+	UT_RUN(test_discovered_read_binds_identity_and_mints_token);
+	UT_RUN(test_discovered_read_absent_thread_fails_closed);
 	UT_RUN(test_valid_bak_blocks_corrupt_primary);
 	UT_RUN(test_storage_contract_fails_before_cf_or_file_io);
 	UT_RUN(test_single_node_local_probe_fails_before_cf_or_file_io);
 	UT_RUN(test_activate_and_stale_token);
+	UT_RUN(test_restore_bit22_latch_from_active_root);
 	UT_RUN(test_unbound_cutover_mutators_fail_before_cf_and_preserve_prepared_root);
 	UT_RUN(test_native_cf_hold_cannot_authorize_strong_read);
 	UT_RUN(test_activation_rejects_changed_source_wal_bytes);
@@ -1619,6 +2538,7 @@ main(int argc, char **argv)
 	UT_RUN(test_unbound_publisher_fails_before_cf_and_preserves_root);
 	UT_RUN(test_owner_rejoin_rejects_non_new_incarnation);
 	UT_RUN(test_owner_rejoin_advances_exact_lineage_and_exhausts_at_max);
+	UT_RUN(test_lifecycle_frozen_shape_matrix);
 	UT_RUN(test_initial_migration_requires_lineage_one);
 	UT_RUN(test_unconfirmed_release_returns_no_authority);
 	UT_RUN(test_primary_rename_failure_is_not_success);
