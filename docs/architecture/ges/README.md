@@ -8,13 +8,15 @@ GES（Global Enqueue Service）解决的是“全局非数据块资源由谁持�
 
 ```mermaid
 flowchart LR
-    A[01 架构与 GRD<br/>资源由谁裁决] --> B[02 Grant/Convert/BAST<br/>锁如何流动]
+    A[01 架构与 GRD<br/>资源由谁裁决] --> M[06 八模式专题<br/>每种锁如何处理]
+    M --> B[02 Grant/Convert/BAST<br/>锁如何流动]
     B --> C[03 Deadlock/Fairness<br/>等待如何终止]
     C --> D[04 Recovery/Ops<br/>节点变化后如何重建]
     D --> E[05 Oracle 对比<br/>职责映射与边界]
 ```
 
 - [01：GES 架构、资源身份与 GRD](01-architecture-and-grd.md)
+- [专题：PostgreSQL 八种锁模式如何进入 GES](06-eight-lock-modes.md)
 - [02：Grant、Convert、Release 与 BAST](02-grant-convert-release-and-bast.md)
 - [03：分布式死锁、公平性与资源生命周期](03-deadlock-fairness-and-lifecycle.md)
 - [04：恢复、Remaster 与运维排障](04-recovery-remaster-and-operations.md)
