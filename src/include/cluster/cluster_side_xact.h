@@ -11,6 +11,7 @@
 #include "access/xact.h"
 #include "access/xlogreader.h"
 #include "cluster/cluster_remote_xact.h"
+#include "cluster/cluster_tt_2pc.h"
 
 #define CLUSTER_SIDE_XACT_INTERFACE_V1 1
 
@@ -38,6 +39,12 @@ typedef struct RfSideXactOperationV1
 	uint8		reserved49[7];
 	xl_xact_tt_commit tt_delta;
 	uint8		prepare_binding[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+	uint16		prepared_record_version;
+	uint16		prepared_binding_count;
+	uint32		prepared_sublink_count;
+	ClusterTT2PCBinding prepared_bindings[CLUSTER_TT_2PC_MAX_BINDINGS];
+	ClusterTT2PCSubLink prepared_sublinks[CLUSTER_TT_2PC_MAX_SUBLINKS];
+	UBA			prepared_heads[CLUSTER_TT_2PC_MAX_BINDINGS];
 } RfSideXactOperationV1;
 
 extern bool rf_side_xact_decode_v1(XLogReaderState *record,

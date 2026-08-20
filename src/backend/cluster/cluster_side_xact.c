@@ -10,11 +10,14 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/rmgr.h"
+#include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_uba.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
 #define RF_SIDE_XACT_KNOWN_XINFO \
@@ -31,6 +34,16 @@ typedef struct RfSideXactCursorV1
 	const char *position;
 	const char *end;
 } RfSideXactCursorV1;
+
+typedef struct RfSideTwoPhaseRecordOnDiskV1
+{
+	uint32		len;
+	TwoPhaseRmgrId rmid;
+	uint16		info;
+} RfSideTwoPhaseRecordOnDiskV1;
+
+StaticAssertDecl(sizeof(RfSideTwoPhaseRecordOnDiskV1) == 8,
+	"RF-SIDE two-phase record header must match PostgreSQL's 8-byte layout");
 
 static bool
 side_xact_take(RfSideXactCursorV1 *cursor, Size bytes, const char **start)
@@ -72,13 +85,18 @@ side_xact_take_aligned_array(RfSideXactCursorV1 *cursor, int32 count,
 }
 
 static bool
-side_xact_prepare_shape_valid(XLogReaderState *record)
+side_xact_prepare_shape_valid(XLogReaderState *record,
+							  RfSideXactOperationV1 *candidate)
 {
 	RfSideXactCursorV1 cursor;
 	xl_xact_prepare header;
+	ClusterTT2PCParsed parsed_tt;
 	const char *data;
 	const char *gid;
 	uint32		data_len;
+	bool		found_cluster_tt = false;
+	bool		found_end = false;
+	uint16		i;
 
 	data_len = XLogRecGetDataLen(record);
 	data = XLogRecGetData(record);
@@ -107,6 +125,67 @@ side_xact_prepare_shape_valid(XLogReaderState *record)
 		!side_xact_take_aligned_array(&cursor, header.ninvalmsgs,
 			sizeof(SharedInvalidationMessage)))
 		return false;
+	while (cursor.position < cursor.end)
+	{
+		RfSideTwoPhaseRecordOnDiskV1 disk_record;
+		const char *record_header;
+		const char *record_data;
+		Size		aligned_len;
+
+		if (!side_xact_take(&cursor, MAXALIGN(sizeof(disk_record)),
+				&record_header))
+			return false;
+		memcpy(&disk_record, record_header, sizeof(disk_record));
+		if (disk_record.rmid == TWOPHASE_RM_END_ID)
+		{
+			if (disk_record.len != 0 || disk_record.info != 0 ||
+				cursor.position != cursor.end)
+				return false;
+			found_end = true;
+			break;
+		}
+		if (disk_record.rmid > TWOPHASE_RM_MAX_ID ||
+			disk_record.len > (uint32) (cursor.end - cursor.position))
+			return false;
+		aligned_len = MAXALIGN((Size) disk_record.len);
+		if (aligned_len < disk_record.len ||
+			!side_xact_take(&cursor, aligned_len, &record_data))
+			return false;
+		if (disk_record.rmid != TWOPHASE_RM_CLUSTER_TT_ID)
+			continue;
+		if (found_cluster_tt || disk_record.info != 0 ||
+			!cluster_tt_2pc_parse_record(record_data, disk_record.len,
+				&parsed_tt) || parsed_tt.nbindings == 0)
+			return false;
+		found_cluster_tt = true;
+		candidate->prepared_record_version = parsed_tt.version;
+		candidate->prepared_binding_count = parsed_tt.nbindings;
+		candidate->prepared_sublink_count = parsed_tt.nsublinks;
+		memcpy(candidate->prepared_bindings, parsed_tt.bindings,
+			(Size) parsed_tt.nbindings * sizeof(*parsed_tt.bindings));
+		if (parsed_tt.nsublinks > 0)
+			memcpy(candidate->prepared_sublinks, parsed_tt.sublinks,
+				(Size) parsed_tt.nsublinks * sizeof(*parsed_tt.sublinks));
+		if (parsed_tt.heads != NULL)
+			memcpy(candidate->prepared_heads, parsed_tt.heads,
+				(Size) parsed_tt.nbindings * sizeof(*parsed_tt.heads));
+	}
+	if (!found_end || !found_cluster_tt)
+		return false;
+	for (i = 0; i < candidate->prepared_binding_count; i++)
+	{
+		const ClusterTT2PCBinding *binding =
+			&candidate->prepared_bindings[i];
+
+		if (binding->undo_segment_id == 0 ||
+			((binding->undo_segment_id - 1) /
+			 CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 !=
+			 candidate->origin_thread ||
+			binding->slot_offset >= TT_SLOTS_PER_SEGMENT ||
+			binding->wrap == 0 || binding->cluster_epoch == 0 ||
+			!TransactionIdIsNormal(binding->xid))
+			return false;
+	}
 	return true;
 }
 
@@ -204,6 +283,142 @@ side_xact_tt_delta_valid(const xl_xact_tt_commit *delta,
 		delta->commit_scn == scn;
 }
 
+static bool
+side_xact_key_matches_binding(const ClusterTTStatusKey *key,
+							  const ClusterTT2PCBinding *binding,
+							  uint16 origin_thread)
+{
+	return key->origin_node_id == origin_thread - 1 &&
+		key->undo_segment_id == binding->undo_segment_id &&
+		key->tt_slot_id ==
+			cluster_tt_slot_offset_to_id(binding->slot_offset) &&
+		key->cluster_epoch == binding->cluster_epoch &&
+		key->local_xid == binding->xid && key->_reserved == 0 &&
+		key->_reserved2 == 0;
+}
+
+static int
+side_xact_binding_for_key(const RfSideXactOperationV1 *operation,
+						  const ClusterTTStatusKey *key)
+{
+	uint16		i;
+
+	for (i = 0; i < operation->prepared_binding_count; i++)
+		if (side_xact_key_matches_binding(key,
+				&operation->prepared_bindings[i], operation->origin_thread))
+			return (int) i;
+	return -1;
+}
+
+static bool
+side_xact_prepared_material_valid(const RfSideXactOperationV1 *operation)
+{
+	bool		top_seen = false;
+	uint16		i;
+	uint32		j;
+
+	if ((operation->prepared_record_version !=
+		 CLUSTER_TT_2PC_VERSION_NO_HEADS &&
+		 operation->prepared_record_version != CLUSTER_TT_2PC_VERSION) ||
+		operation->prepared_binding_count == 0 ||
+		operation->prepared_binding_count > CLUSTER_TT_2PC_MAX_BINDINGS ||
+		operation->prepared_sublink_count > CLUSTER_TT_2PC_MAX_SUBLINKS)
+		return false;
+	for (i = 0; i < operation->prepared_binding_count; i++)
+	{
+		const ClusterTT2PCBinding *binding =
+			&operation->prepared_bindings[i];
+		uint32		owner;
+		uint32		head_segment;
+		uint32		head_block;
+		uint16		head_slot;
+		uint16		head_row;
+		uint16		k;
+
+		if (binding->undo_segment_id == 0)
+			return false;
+		owner = ((binding->undo_segment_id - 1) /
+			CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1;
+		if (owner != operation->origin_thread ||
+			binding->slot_offset >= TT_SLOTS_PER_SEGMENT ||
+			binding->wrap == 0 || binding->cluster_epoch == 0 ||
+			!TransactionIdIsNormal(binding->xid))
+			return false;
+		for (k = 0; k < i; k++)
+			if (operation->prepared_bindings[k].undo_segment_id ==
+					binding->undo_segment_id &&
+				operation->prepared_bindings[k].slot_offset ==
+					binding->slot_offset)
+				return false;
+		if (binding->xid == operation->xid)
+			top_seen = true;
+		if (operation->prepared_record_version ==
+				CLUSTER_TT_2PC_VERSION_NO_HEADS)
+		{
+			if (!UBA_is_invalid(operation->prepared_heads[i]))
+				return false;
+		}
+		else if (!UBA_is_invalid(operation->prepared_heads[i]) &&
+			(!uba_decode_record(operation->prepared_heads[i], &head_segment,
+				&head_block, &head_slot, &head_row) ||
+			 head_segment != binding->undo_segment_id ||
+			 head_slot != binding->slot_offset))
+			return false;
+	}
+	if (!top_seen)
+		return false;
+	for (j = 0; j < operation->prepared_sublink_count; j++)
+	{
+		const ClusterTT2PCSubLink *link = &operation->prepared_sublinks[j];
+		uint32		k;
+
+		if (side_xact_binding_for_key(operation, &link->child_key) < 0 ||
+			side_xact_binding_for_key(operation, &link->parent_key) < 0 ||
+			link->child_key.local_xid == link->parent_key.local_xid)
+			return false;
+		for (k = 0; k < j; k++)
+			if (memcmp(&operation->prepared_sublinks[k].child_key,
+					&link->child_key, sizeof(link->child_key)) == 0)
+				return false;
+	}
+	for (i = 0; i < operation->prepared_binding_count; i++)
+	{
+		ClusterTTStatusKey key;
+		uint32		depth;
+
+		if (operation->prepared_bindings[i].xid == operation->xid)
+			continue;
+		memset(&key, 0, sizeof(key));
+		key.origin_node_id = operation->origin_thread - 1;
+		key.undo_segment_id =
+			(uint16) operation->prepared_bindings[i].undo_segment_id;
+		key.tt_slot_id = cluster_tt_slot_offset_to_id(
+			operation->prepared_bindings[i].slot_offset);
+		key.cluster_epoch = operation->prepared_bindings[i].cluster_epoch;
+		key.local_xid = operation->prepared_bindings[i].xid;
+		for (depth = 0; depth <= operation->prepared_sublink_count; depth++)
+		{
+			const ClusterTT2PCSubLink *link = NULL;
+
+			for (j = 0; j < operation->prepared_sublink_count; j++)
+				if (memcmp(&operation->prepared_sublinks[j].child_key,
+						&key, sizeof(key)) == 0)
+				{
+					link = &operation->prepared_sublinks[j];
+					break;
+				}
+			if (link == NULL)
+				return false;
+			key = link->parent_key;
+			if (key.local_xid == operation->xid)
+				break;
+		}
+		if (key.local_xid != operation->xid)
+			return false;
+	}
+	return true;
+}
+
 static TimestampTz
 side_xact_commit_timestamp(const xl_xact_parsed_commit *parsed)
 {
@@ -246,7 +461,8 @@ rf_side_xact_structural_preflight_v1(
 			return OidIsValid(operation->database) &&
 				operation->terminal_scn == InvalidScn &&
 				operation->terminal_timestamp == 0 &&
-				!operation->has_tt_delta && binding_seen != 0;
+				!operation->has_tt_delta && binding_seen != 0 &&
+				side_xact_prepared_material_valid(operation);
 		case RF_SIDE_XACT_COMMIT_PREPARED:
 			return OidIsValid(operation->database) &&
 				SCN_VALID(operation->terminal_scn) &&
@@ -335,7 +551,7 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 			xl_xact_prepare *xlrec;
 			xl_xact_parsed_prepare parsed;
 
-			if (!side_xact_prepare_shape_valid(record))
+			if (!side_xact_prepare_shape_valid(record, &candidate))
 				return false;
 			xlrec = (xl_xact_prepare *) XLogRecGetData(record);
 			ParsePrepareRecord(XLogRecGetInfo(record), xlrec, &parsed);

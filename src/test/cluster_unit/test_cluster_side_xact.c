@@ -6,9 +6,11 @@
 #include "postgres.h"
 
 #include "access/rmgr.h"
+#include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/cluster_tt_2pc.h"
 
 #include "unit_test.h"
 
@@ -90,22 +92,58 @@ make_commit(FakeXactRecord *fake, TransactionId xid, SCN scn,
 }
 
 static XLogReaderState *
-make_prepare(FakeXactRecord *fake, TransactionId xid, bool truncated_gid)
+make_prepare(FakeXactRecord *fake, TransactionId xid, bool with_tt,
+			 bool truncated_gid)
 {
+	typedef struct FakeTwoPhaseRecordOnDisk
+	{
+		uint32 len;
+		TwoPhaseRmgrId rmid;
+		uint16 info;
+	} FakeTwoPhaseRecordOnDisk;
 	xl_xact_prepare prepare;
+	ClusterTT2PCBinding binding;
+	FakeTwoPhaseRecordOnDisk disk_record;
 	Size		header_size = MAXALIGN(sizeof(prepare));
-	Size		payload_size = header_size + MAXALIGN(4);
+	Size		payload_size;
+	uint32		tt_size;
+	char	   *cursor;
 
 	memset(fake, 0, sizeof(*fake));
 	memset(&prepare, 0, sizeof(prepare));
+	memset(&binding, 0, sizeof(binding));
+	memset(&disk_record, 0, sizeof(disk_record));
 	prepare.magic = UINT32_C(0x57F94534);
-	prepare.total_len = (uint32) payload_size + sizeof(uint32);
 	prepare.xid = xid;
 	prepare.database = 16384;
 	prepare.prepared_at = INT64_C(123456);
 	prepare.gidlen = 4;
+	cursor = (char *) fake->data + header_size;
+	memcpy(cursor, "gid", 4);
+	cursor += MAXALIGN(4);
+	if (with_tt)
+	{
+		binding.undo_segment_id = 513;
+		binding.slot_offset = 4;
+		binding.wrap = 7;
+		binding.cluster_epoch = 11;
+		binding.xid = xid;
+		tt_size = cluster_tt_2pc_record_size(CLUSTER_TT_2PC_VERSION, 1, 0);
+		disk_record.len = tt_size;
+		disk_record.rmid = TWOPHASE_RM_CLUSTER_TT_ID;
+		memcpy(cursor, &disk_record, sizeof(disk_record));
+		cursor += MAXALIGN(sizeof(disk_record));
+		UT_ASSERT_EQ(cluster_tt_2pc_serialize(&binding, NULL, 1, NULL, 0,
+			cursor, tt_size), tt_size);
+		cursor += MAXALIGN(tt_size);
+	}
+	memset(&disk_record, 0, sizeof(disk_record));
+	disk_record.rmid = TWOPHASE_RM_END_ID;
+	memcpy(cursor, &disk_record, sizeof(disk_record));
+	cursor += MAXALIGN(sizeof(disk_record));
+	payload_size = (Size) (cursor - (char *) fake->data);
+	prepare.total_len = (uint32) payload_size + sizeof(uint32);
 	memcpy(fake->data, &prepare, sizeof(prepare));
-	memcpy(fake->data + header_size, "gid", 4);
 	fake->u.decoded.header.xl_rmid = RM_XACT_ID;
 	fake->u.decoded.header.xl_info = XLOG_XACT_PREPARE;
 	fake->u.decoded.main_data = (char *) fake->data;
@@ -227,12 +265,20 @@ UT_TEST(test_prepare_requires_bounded_aligned_gid)
 	RfSideXactOperationV1 operation;
 
 	UT_ASSERT(rf_side_xact_decode_v1(
-		make_prepare(&fake, 801, false), UINT64_C(0x11223344), 3,
+		make_prepare(&fake, 801, true, false), UINT64_C(0x11223344), 3,
 		&operation));
 	UT_ASSERT_EQ(operation.kind, RF_SIDE_XACT_PREPARE);
 	UT_ASSERT_EQ(operation.xid, 801);
+	UT_ASSERT_EQ(operation.prepared_binding_count, 1);
+	UT_ASSERT_EQ(operation.prepared_bindings[0].undo_segment_id, 513);
+	UT_ASSERT_EQ(operation.prepared_bindings[0].slot_offset, 4);
+	UT_ASSERT_EQ(operation.prepared_bindings[0].wrap, 7);
+	UT_ASSERT_EQ(operation.prepared_bindings[0].xid, 801);
 	UT_ASSERT(!rf_side_xact_decode_v1(
-		make_prepare(&fake, 801, true), UINT64_C(0x11223344), 3,
+		make_prepare(&fake, 801, false, false), UINT64_C(0x11223344), 3,
+		&operation));
+	UT_ASSERT(!rf_side_xact_decode_v1(
+		make_prepare(&fake, 801, true, true), UINT64_C(0x11223344), 3,
 		&operation));
 	UT_ASSERT_EQ(operation.kind, RF_SIDE_XACT_INVALID);
 }

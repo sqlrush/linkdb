@@ -895,16 +895,19 @@ $(CLUSTER_SIDE_XACT_O): $(top_srcdir)/src/backend/cluster/cluster_side_xact.c \
 CLUSTER_SIDE_ONLINE_PLAN_TEST_O = test_cluster_side_online_plan.o
 $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_side_online_plan.c \
-		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DRF_SIDE_ONLINE_TESTING -c $< -o $@
 SIDE_XACT_XACTDESC_O = test_cluster_side_xact_xactdesc.o
 $(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+SIDE_XACT_TT_2PC_RECORD_O = $(top_builddir)/src/backend/cluster/cluster_tt_2pc_record.o
 test_cluster_side_xact: test_cluster_side_xact.c unit_test.h \
 		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
-		$(SIDE_XACT_XACTDESC_O)
+		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(SIDE_XACT_XACTDESC_O) \
+		$(SIDE_XACT_TT_2PC_RECORD_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@

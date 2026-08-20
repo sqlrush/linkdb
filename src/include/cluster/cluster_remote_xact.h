@@ -481,10 +481,13 @@ extern void cluster_remote_xact_shmem_init(void);
 extern void cluster_remote_xact_apply(int origin_node, struct XLogReaderState *record, bool online);
 
 /*
- * RF-SIDE durable projection/pending substrate.  Every STORED return means
+ * RF-SIDE durable non-authoritative projection.  Every STORED return means
  * the exact SLRU segment and directory entry have been forced to stable
- * storage.  A prepared terminal must supply the digest frozen by the
- * immutable SIDE plan; missing/different pending state fails closed.
+ * storage, but never that PREPARED, terminal, readiness or OPEN is granted.
+ * Those decisions additionally require the database-scoped pending state,
+ * exact identity, TT/undo and prepare/terminal redo.  A prepared terminal
+ * must supply the digest frozen by the immutable SIDE plan;
+ * missing/different projected state fails closed.
  */
 extern bool cluster_remote_xact_prepare_digest_v2(
 	uint64 system_identifier, int origin_node, TransactionId xid,
