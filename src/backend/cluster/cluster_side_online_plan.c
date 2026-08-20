@@ -281,6 +281,22 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 					&candidate.xact))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate.kind = RF_SIDE_ONLINE_OPERATION_XACT;
+			if (candidate.xact.kind == RF_SIDE_XACT_PREPARE)
+			{
+				uint32 record_length =
+					XLogRecGetDataLen(record_plan->source_record);
+
+				if (record_length == 0 || record_length !=
+						candidate.xact.prepare_payload_length ||
+					!side_ensure_operation_capacity(plan) ||
+					!side_ensure_payload_capacity(plan, record_length))
+					return RF_PAGE_PROOF_DETAIL_CAPACITY;
+				candidate.owned_payload_offset = plan->owned_payload_bytes;
+				candidate.owned_payload_length = record_length;
+				memcpy(plan->owned_payload + plan->owned_payload_bytes,
+					XLogRecGetData(record_plan->source_record), record_length);
+				plan->owned_payload_bytes += record_length;
+			}
 		}
 		else if (record_plan->route.rmid == RM_CLUSTER_UNDO_ID &&
 				 record_plan->route.codec_id ==
@@ -382,6 +398,10 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC ||
 		!plan->sealed || ops == NULL)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (plan->operation_count == 0)
+		return RF_PAGE_PROOF_DETAIL_OK;
+	if (ops->begin_protected_set == NULL || ops->end_protected_set == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	for (i = 0; i < plan->operation_count; i++)
 		if ((plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT &&
 			 (ops->preflight_xact == NULL || ops->apply_xact == NULL)) ||
@@ -389,6 +409,8 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 			 (ops->preflight_undo == NULL || ops->apply_undo == NULL)) ||
 			plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
 			return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (!ops->begin_protected_set(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	/*
 	 * STOP-06 section 9.2: classify every target before the first target
 	 * byte changes.  The caller keeps its protected-set certification stable
@@ -407,7 +429,10 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 		else
 			accepted = ops->preflight_undo(ops->arg, &operation);
 		if (!accepted)
+		{
+			ops->end_protected_set(ops->arg, false);
 			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		}
 	}
 	for (i = 0; i < plan->operation_count; i++)
 	{
@@ -422,8 +447,12 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 		else
 			applied = ops->apply_undo(ops->arg, &operation);
 		if (!applied)
+		{
+			ops->end_protected_set(ops->arg, false);
 			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		}
 	}
+	ops->end_protected_set(ops->arg, true);
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 

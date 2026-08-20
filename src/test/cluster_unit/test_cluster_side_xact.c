@@ -118,6 +118,7 @@ make_prepare(FakeXactRecord *fake, TransactionId xid, bool with_tt,
 	prepare.magic = UINT32_C(0x57F94534);
 	prepare.xid = xid;
 	prepare.database = 16384;
+	prepare.owner = 10;
 	prepare.prepared_at = INT64_C(123456);
 	prepare.gidlen = 4;
 	cursor = (char *) fake->data + header_size;
@@ -241,10 +242,31 @@ typedef struct ApplyCapture
 {
 	uint32 count;
 	uint32 undo_count;
+	uint32 begin_count;
+	uint32 end_count;
 	TransactionId xid;
 	SCN scn;
 	uint8 undo_first_byte;
+	bool end_complete;
 } ApplyCapture;
+
+static bool
+capture_begin(void *arg)
+{
+	ApplyCapture *capture = (ApplyCapture *) arg;
+
+	capture->begin_count++;
+	return true;
+}
+
+static void
+capture_end(void *arg, bool complete)
+{
+	ApplyCapture *capture = (ApplyCapture *) arg;
+
+	capture->end_count++;
+	capture->end_complete = complete;
+}
 
 static bool
 capture_apply(void *arg, const RfSideOnlineOperationV1 *operation)
@@ -339,6 +361,11 @@ UT_TEST(test_prepare_requires_bounded_aligned_gid)
 		&operation));
 	UT_ASSERT_EQ(operation.kind, RF_SIDE_XACT_PREPARE);
 	UT_ASSERT_EQ(operation.xid, 801);
+	UT_ASSERT_EQ(operation.database, 16384);
+	UT_ASSERT_EQ(operation.prepared_owner, 10);
+	UT_ASSERT_EQ(operation.prepared_at, INT64_C(123456));
+	UT_ASSERT(strcmp(operation.prepare_gid, "gid") == 0);
+	UT_ASSERT(operation.prepare_payload_length > 0);
 	UT_ASSERT_EQ(operation.prepared_binding_count, 1);
 	UT_ASSERT_EQ(operation.prepared_bindings[0].undo_segment_id, 513);
 	UT_ASSERT_EQ(operation.prepared_bindings[0].slot_offset, 4);
@@ -395,6 +422,8 @@ UT_TEST(test_online_plan_owns_decoded_operation_not_raw_record)
 	memset(&capture, 0, sizeof(capture));
 	memset(&apply_ops, 0, sizeof(apply_ops));
 	apply_ops.arg = &capture;
+	apply_ops.begin_protected_set = capture_begin;
+	apply_ops.end_protected_set = capture_end;
 	apply_ops.preflight_xact = accept_preflight;
 	apply_ops.apply_xact = capture_apply;
 	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
@@ -402,6 +431,9 @@ UT_TEST(test_online_plan_owns_decoded_operation_not_raw_record)
 	UT_ASSERT_EQ(capture.count, 1);
 	UT_ASSERT_EQ(capture.xid, 800);
 	UT_ASSERT_EQ(capture.scn, UINT64_C(901));
+	UT_ASSERT_EQ(capture.begin_count, 1);
+	UT_ASSERT_EQ(capture.end_count, 1);
+	UT_ASSERT(capture.end_complete);
 	rf_side_online_plan_destroy_v1(&plan);
 	UT_ASSERT(plan == NULL);
 }
@@ -478,6 +510,8 @@ UT_TEST(test_online_plan_owns_undo_payload_not_raw_record)
 	memset(&capture, 0, sizeof(capture));
 	memset(&apply_ops, 0, sizeof(apply_ops));
 	apply_ops.arg = &capture;
+	apply_ops.begin_protected_set = capture_begin;
+	apply_ops.end_protected_set = capture_end;
 	apply_ops.preflight_undo = accept_preflight;
 	apply_ops.apply_xact = capture_apply;
 	apply_ops.apply_undo = capture_apply_undo;
@@ -485,6 +519,55 @@ UT_TEST(test_online_plan_owns_undo_payload_not_raw_record)
 		RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(capture.undo_count, 1);
 	UT_ASSERT_EQ(capture.undo_first_byte, 0x6b);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_online_plan_owns_prepare_state_not_raw_record)
+{
+	FakeXactRecord fake;
+	RfDetachedRecordPlanV1 record_plan;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfSideOnlinePlanRequestV1 request;
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut;
+	RfSideOnlineOperationV1 operation;
+	uint8 storage_uuid[16];
+	uint32 magic;
+
+	memset(storage_uuid, 0x46, sizeof(storage_uuid));
+	(void) make_prepare(&fake, 801, true, false);
+	identity = make_identity(&fake, storage_uuid);
+	record_plan = make_record_plan(&fake);
+	memset(&cut, 0, sizeof(cut));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 200;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	memset(&request, 0, sizeof(request));
+	request.system_identifier = identity.record.system_identifier;
+	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(
+		plan, &record_plan, &identity), RF_PAGE_PROOF_DETAIL_OK);
+	memset(fake.data, 0xee, sizeof(fake.data));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	UT_ASSERT_EQ(operation.kind, RF_SIDE_ONLINE_OPERATION_XACT);
+	UT_ASSERT_EQ(operation.xact.kind, RF_SIDE_XACT_PREPARE);
+	UT_ASSERT_EQ(operation.xact.prepared_owner, 10);
+	UT_ASSERT(strcmp(operation.xact.prepare_gid, "gid") == 0);
+	UT_ASSERT_EQ(operation.owned_payload_length,
+		operation.xact.prepare_payload_length);
+	UT_ASSERT(operation.owned_payload != NULL);
+	magic = 0;
+	if (operation.owned_payload != NULL)
+		memcpy(&magic, operation.owned_payload, sizeof(magic));
+	UT_ASSERT_EQ(magic, UINT32_C(0x57F94534));
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
@@ -539,6 +622,8 @@ UT_TEST(test_online_plan_preflights_all_targets_before_first_mutation)
 	memset(&capture, 0, sizeof(capture));
 	memset(&apply_ops, 0, sizeof(apply_ops));
 	apply_ops.arg = &capture;
+	apply_ops.begin_protected_set = capture_begin;
+	apply_ops.end_protected_set = capture_end;
 	apply_ops.preflight_xact = accept_preflight;
 	apply_ops.preflight_undo = reject_undo_preflight;
 	apply_ops.apply_xact = capture_apply;
@@ -547,13 +632,16 @@ UT_TEST(test_online_plan_preflights_all_targets_before_first_mutation)
 		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 	UT_ASSERT_EQ(capture.count, 0);
 	UT_ASSERT_EQ(capture.undo_count, 0);
+	UT_ASSERT_EQ(capture.begin_count, 1);
+	UT_ASSERT_EQ(capture.end_count, 1);
+	UT_ASSERT(!capture.end_complete);
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);
@@ -561,6 +649,7 @@ main(void)
 	UT_RUN(test_online_plan_owns_decoded_operation_not_raw_record);
 	UT_RUN(test_online_plan_denies_incomplete_physical_cut);
 	UT_RUN(test_online_plan_owns_undo_payload_not_raw_record);
+	UT_RUN(test_online_plan_owns_prepare_state_not_raw_record);
 	UT_RUN(test_online_plan_preflights_all_targets_before_first_mutation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

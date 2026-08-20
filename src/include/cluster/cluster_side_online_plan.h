@@ -51,10 +51,14 @@ typedef bool (*RfSideOnlinePreflightXactV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlinePreflightUndoV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlineBeginProtectedSetV1)(void *arg);
+typedef void (*RfSideOnlineEndProtectedSetV1)(void *arg, bool complete);
 
 typedef struct RfSideOnlineApplyOpsV1
 {
 	void *arg;
+	RfSideOnlineBeginProtectedSetV1 begin_protected_set;
+	RfSideOnlineEndProtectedSetV1 end_protected_set;
 	/* Required per present kind; all preflights run before any apply. */
 	RfSideOnlinePreflightXactV1 preflight_xact;
 	RfSideOnlinePreflightUndoV1 preflight_undo;

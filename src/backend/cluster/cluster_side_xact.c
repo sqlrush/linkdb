@@ -186,6 +186,12 @@ side_xact_prepare_shape_valid(XLogReaderState *record,
 			!TransactionIdIsNormal(binding->xid))
 			return false;
 	}
+	if (!OidIsValid(header.owner))
+		return false;
+	candidate->prepared_owner = header.owner;
+	candidate->prepared_at = header.prepared_at;
+	candidate->prepare_payload_length = data_len;
+	memcpy(candidate->prepare_gid, gid, header.gidlen);
 	return true;
 }
 
@@ -431,6 +437,7 @@ rf_side_xact_structural_preflight_v1(
 	const RfSideXactOperationV1 *operation)
 {
 	uint8		binding_seen = 0;
+	const char *gid_end;
 	Size		i;
 
 	if (operation == NULL || operation->kind == RF_SIDE_XACT_INVALID ||
@@ -443,6 +450,8 @@ rf_side_xact_structural_preflight_v1(
 			return false;
 	for (i = 0; i < sizeof(operation->prepare_binding); i++)
 		binding_seen |= operation->prepare_binding[i];
+	gid_end = memchr(operation->prepare_gid, '\0',
+		sizeof(operation->prepare_gid));
 
 	switch (operation->kind)
 	{
@@ -452,24 +461,41 @@ rf_side_xact_structural_preflight_v1(
 				operation->has_tt_delta &&
 				side_xact_tt_delta_valid(&operation->tt_delta,
 					operation->origin_thread, operation->xid,
-					operation->terminal_scn) && binding_seen == 0;
+					operation->terminal_scn) && binding_seen == 0 &&
+				operation->prepared_owner == InvalidOid &&
+				operation->prepare_payload_length == 0 &&
+				operation->prepared_at == 0 && operation->prepare_gid[0] == '\0';
 		case RF_SIDE_XACT_ABORT:
 			return SCN_VALID(operation->terminal_scn) &&
 				operation->terminal_timestamp == 0 &&
-				!operation->has_tt_delta && binding_seen == 0;
+				!operation->has_tt_delta && binding_seen == 0 &&
+				operation->prepared_owner == InvalidOid &&
+				operation->prepare_payload_length == 0 &&
+				operation->prepared_at == 0 && operation->prepare_gid[0] == '\0';
 		case RF_SIDE_XACT_PREPARE:
 			return OidIsValid(operation->database) &&
+				OidIsValid(operation->prepared_owner) &&
+				operation->prepare_payload_length > 0 &&
+				gid_end != NULL && gid_end != operation->prepare_gid &&
 				operation->terminal_scn == InvalidScn &&
 				operation->terminal_timestamp == 0 &&
 				!operation->has_tt_delta && binding_seen != 0 &&
 				side_xact_prepared_material_valid(operation);
 		case RF_SIDE_XACT_COMMIT_PREPARED:
 			return OidIsValid(operation->database) &&
+				operation->prepared_owner == InvalidOid &&
+				operation->prepare_payload_length == 0 &&
+				operation->prepared_at == 0 && gid_end != NULL &&
+				gid_end != operation->prepare_gid &&
 				SCN_VALID(operation->terminal_scn) &&
 				operation->terminal_timestamp != 0 &&
 				!operation->has_tt_delta && binding_seen != 0;
 		case RF_SIDE_XACT_ABORT_PREPARED:
 			return OidIsValid(operation->database) &&
+				operation->prepared_owner == InvalidOid &&
+				operation->prepare_payload_length == 0 &&
+				operation->prepared_at == 0 && gid_end != NULL &&
+				gid_end != operation->prepare_gid &&
 				SCN_VALID(operation->terminal_scn) &&
 				operation->terminal_timestamp == 0 &&
 				!operation->has_tt_delta && binding_seen != 0;
@@ -596,6 +622,8 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 			candidate.xinfo = parsed.xinfo;
 			candidate.terminal_scn = parsed.scn;
 			candidate.terminal_timestamp = side_xact_commit_timestamp(&parsed);
+			strlcpy(candidate.prepare_gid, parsed.twophase_gid,
+				sizeof(candidate.prepare_gid));
 			break;
 		}
 		case XLOG_XACT_ABORT_PREPARED:
@@ -621,6 +649,8 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 			candidate.database = parsed.dbId;
 			candidate.xinfo = parsed.xinfo;
 			candidate.terminal_scn = parsed.scn;
+			strlcpy(candidate.prepare_gid, parsed.twophase_gid,
+				sizeof(candidate.prepare_gid));
 			break;
 		}
 		default:

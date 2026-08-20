@@ -32,13 +32,17 @@ typedef struct RfSideXactOperationV1
 	uint16		reserved_zero;
 	TransactionId xid;
 	Oid			database;
+	Oid			prepared_owner;
 	uint32		xinfo;
+	uint32		prepare_payload_length;
+	TimestampTz prepared_at;
 	SCN			terminal_scn;
 	TimestampTz terminal_timestamp;
 	bool		has_tt_delta;
 	uint8		reserved49[7];
 	xl_xact_tt_commit tt_delta;
 	uint8		prepare_binding[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+	char		prepare_gid[GIDSIZE];
 	uint16		prepared_record_version;
 	uint16		prepared_binding_count;
 	uint32		prepared_sublink_count;
