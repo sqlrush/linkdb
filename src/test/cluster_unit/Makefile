@@ -876,16 +876,17 @@ test_cluster_side_recovery: test_cluster_side_recovery.c unit_test.h \
 # RF-SIDE D-SIDE-01: total route registry (§3.2 matrix) + §2.1 verdicts.
 CLUSTER_SIDE_ROUTE_O = $(top_builddir)/src/backend/cluster/cluster_side_route.o
 test_cluster_side_route: test_cluster_side_route.c unit_test.h \
-		$(CLUSTER_SIDE_ROUTE_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # RF-SIDE D-SIDE-02: TT/undo decode + preflight primitives (single
 # parser; malformed/unknown -> BLOCKED pre-mutation).
 CLUSTER_SIDE_UNDO_O = $(top_builddir)/src/backend/cluster/cluster_side_undo.o
 test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
-		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O)
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 CLUSTER_SIDE_XACT_O = test_cluster_side_xact_product.o
@@ -910,12 +911,12 @@ test_cluster_side_xact: test_cluster_side_xact.c unit_test.h \
 		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
-		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O)
+		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(SIDE_XACT_XACTDESC_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) $(CLUSTER_SIDE_UNDO_O) \
-		$(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
@@ -948,10 +949,11 @@ test_cluster_side_space: test_cluster_side_space.c unit_test.h \
 # U-SIDE-16: counters can never change a verdict).
 CLUSTER_SIDE_STATS_O = $(top_builddir)/src/backend/cluster/cluster_side_stats.o
 test_cluster_side_stats: test_cluster_side_stats.c unit_test.h \
-		$(CLUSTER_SIDE_STATS_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_SIDE_RECOVERY_O) \
+		$(CLUSTER_SIDE_STATS_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(CLUSTER_SIDE_RECOVERY_O) \
 		$(CLUSTER_PAGE_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_STATS_O) $(CLUSTER_SIDE_ROUTE_O) \
-		$(CLUSTER_SIDE_RECOVERY_O) $(CLUSTER_PAGE_VERSION_O) \
+		$(CLUSTER_RF_ROUTE_O) $(CLUSTER_SIDE_RECOVERY_O) $(CLUSTER_PAGE_VERSION_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # RF-SIDE D-SIDE-09: fault corpus judgement face — U-SIDE-17 + L1..L20
@@ -959,7 +961,7 @@ test_cluster_side_stats: test_cluster_side_stats.c unit_test.h \
 CLUSTER_SIDE_CORPUS_LIBS = $(CLUSTER_PAGE_APPLY_O) $(CLUSTER_PAGE_SET_O) \
 		$(CLUSTER_PAGE_SOURCE_O) $(CLUSTER_PAGE_RECOVERY_O) \
 		$(CLUSTER_SIDE_PREPARED_O) $(CLUSTER_SIDE_PROJECTION_O) \
-		$(CLUSTER_SIDE_RECOVERY_O) $(CLUSTER_SIDE_ROUTE_O) \
+		$(CLUSTER_SIDE_RECOVERY_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		$(CLUSTER_SIDE_SPACE_O) $(CLUSTER_PAGE_VERSION_O) \
 		$(CLUSTER_PAGE_HANDOFF_O)
 test_cluster_side_corpus: test_cluster_side_corpus.c unit_test.h \

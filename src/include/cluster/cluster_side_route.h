@@ -22,13 +22,10 @@
  *	      same record (U-SIDE-02; the cold/online difference is process
  *	      severity only, never the route).
  *
- *	  NOT DELIVERED HERE (stays RED): the exhaustive 132/132 opcode
- *	  census mechanically generated from the exact object headers (G1 —
- *	  the registry's opcode rows below cover the matrix-named opcodes;
- *	  the full set-equality proof is the U-SIDE-01 census work), the
- *	  payload decoders (D-SIDE-02..04), the cold/online wrapper
- *	  machinery, observability (D-SIDE-10).  No catalog/page/WAL/wire
- *	  ABI is touched.
+ *	  The opcode known-set is the sole exhaustive STOP-06 generated
+ *	  manifest; SIDE adds only its domain disposition.  Payload decoders,
+ *	  production cold/online execution and observability stay with their
+ *	  owning D-SIDE layers.  No catalog/page/WAL/wire ABI is touched.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California

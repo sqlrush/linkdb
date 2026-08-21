@@ -26,144 +26,157 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
-#include "access/clog.h"
-#include "access/commit_ts.h"
-#include "access/multixact.h"
 #include "access/rmgr.h"		/* RM_* IDs */
 #include "access/xact.h"
 #include "catalog/pg_control.h" /* XLOG_* opcodes */
-#include "catalog/storage_xlog.h"	/* XLOG_SMGR_* */
-#include "cluster/cluster_adg_xlog.h"
+#include "cluster/cluster_rf_route.h"
 #include "cluster/cluster_side_route.h"
-#include "cluster/cluster_xid_stripe_xlog.h"
 #include "cluster/storage/cluster_undo_xlog.h"
-#include "commands/dbcommands_xlog.h" /* XLOG_DBASE_* (unused rows) */
-#include "replication/message.h"	/* XLOG_LOGICAL_MESSAGE */
-#include "replication/origin.h" /* XLOG_REPLORIGIN_* */
 #include "storage/standbydefs.h"	/* XLOG_STANDBY_* */
-#include "utils/relmapper.h"	/* XLOG_RELMAP_UPDATE */
 
 /*
- * §3.2 route rows.  Opcode-granular rows use the exact matrix-named
- * opcodes; rmgr-granular rows (opcode 0, mask 0) cover the whole rmgr.
- * The 132/132 opcode census mechanically generated from the exact object
- * headers is the U-SIDE-01 G1 work; the rows below are the matrix-named
- * set and every unknown combination fails closed via lookup()==false.
+ * D-SIDE-01 consumes the same exhaustive generated opcode manifest as
+ * RF-PAGE.  This file owns only the SIDE disposition of a manifest row; it
+ * never carries a second opcode list.  Therefore a source/manifest change
+ * makes the shared 137-row census RED once, instead of letting PAGE and SIDE
+ * silently drift apart.
  */
-static const ClusterSideRouteRow cluster_side_route_table[] = {
-	/* ---- RM_XLOG_ID: page / control-only no-op / BLOCKED control ---- */
-	{ RM_XLOG_ID, XLOG_FPI, 0, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_XLOG_ID, XLOG_FPI_FOR_HINT, 0, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_XLOG_ID, XLOG_NOOP, 0, CLUSTER_SIDE_ROUTE_PROVED_NOOP, "CONTROL_ONLY" },
-	{ RM_XLOG_ID, XLOG_SWITCH, 0, CLUSTER_SIDE_ROUTE_PROVED_NOOP, "CONTROL_ONLY" },
-	{ RM_XLOG_ID, XLOG_RESTORE_POINT, 0, CLUSTER_SIDE_ROUTE_PROVED_NOOP, "CONTROL_ONLY" },
-	{ RM_XLOG_ID, XLOG_BACKUP_END, 0, CLUSTER_SIDE_ROUTE_PROVED_NOOP, "CONTROL_ONLY" },
-	{ RM_XLOG_ID, XLOG_CHECKPOINT_SHUTDOWN, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_XLOG_ID, XLOG_CHECKPOINT_ONLINE, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_XLOG_ID, XLOG_NEXTOID, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_XLOG_ID, XLOG_PARAMETER_CHANGE, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_XLOG_ID, XLOG_FPW_CHANGE, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_XLOG_ID, XLOG_END_OF_RECOVERY, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_XLOG_ID, XLOG_OVERWRITE_CONTRECORD, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	/* ---- RM_XACT_ID: TT/undo truth; the HAS_INFO modifier bit rides a
-	 * mask so COMMIT and COMMIT|HAS_INFO are the same row (§3.2). ---- */
-	{ RM_XACT_ID, XLOG_XACT_COMMIT, XLOG_XACT_HAS_INFO, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_XACT_ID, XLOG_XACT_ABORT, XLOG_XACT_HAS_INFO, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_XACT_ID, XLOG_XACT_PREPARE, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_XACT_ID, XLOG_XACT_COMMIT_PREPARED, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_XACT_ID, XLOG_XACT_ABORT_PREPARED, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_XACT_ID, XLOG_XACT_ASSIGNMENT, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_XACT_ID, XLOG_XACT_INVALIDATIONS, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	/* ---- RM_SMGR_ID: canonical storage lifecycle ---- */
-	{ RM_SMGR_ID, XLOG_SMGR_CREATE, 0, CLUSTER_SIDE_ROUTE_STORAGE, NULL },
-	{ RM_SMGR_ID, XLOG_SMGR_TRUNCATE, 0, CLUSTER_SIDE_ROUTE_STORAGE, NULL },
-	/* ---- RM_CLOG_ID: derived projection ---- */
-	{ RM_CLOG_ID, CLOG_ZEROPAGE, 0, CLUSTER_SIDE_ROUTE_PROJECTION, NULL },
-	{ RM_CLOG_ID, CLOG_TRUNCATE, 0, CLUSTER_SIDE_ROUTE_PROJECTION, NULL },
-	/* ---- RM_DBASE_ID / RM_TBLSPC_ID: shared-directory authority not
-	 * owned by SIDE -> BLOCKED (no raw survivor-local apply). ---- */
-	{ RM_DBASE_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_TBLSPC_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	/* ---- RM_MULTIXACT_ID: derived projection ---- */
-	{ RM_MULTIXACT_ID, XLOG_MULTIXACT_ZERO_OFF_PAGE, 0, CLUSTER_SIDE_ROUTE_PROJECTION, NULL },
-	{ RM_MULTIXACT_ID, XLOG_MULTIXACT_ZERO_MEM_PAGE, 0, CLUSTER_SIDE_ROUTE_PROJECTION, NULL },
-	{ RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID, 0, CLUSTER_SIDE_ROUTE_PROJECTION, NULL },
-	{ RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID, 0, CLUSTER_SIDE_ROUTE_PROJECTION, NULL },
-	/* ---- RM_RELMAP_ID: existing relmap authority, not a SIDE domain
-	 * -> BLOCKED here (the canonical owner handles it). ---- */
-	{ RM_RELMAP_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	/* ---- RM_STANDBY_ID ---- */
-	{ RM_STANDBY_ID, XLOG_STANDBY_LOCK, 0, CLUSTER_SIDE_ROUTE_PROVED_NOOP,
-	  "PRIMARY_NO_STANDBY_CONSUMER" },
-	{ RM_STANDBY_ID, XLOG_RUNNING_XACTS, 0, CLUSTER_SIDE_ROUTE_PROVED_NOOP,
-	  "PRIMARY_NO_STANDBY_CONSUMER" },
-	{ RM_STANDBY_ID, XLOG_INVALIDATIONS, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	/* ---- Page-family rmgrs: route PAGE (RF-PAGE owns the mutation). ---- */
-	{ RM_HEAP2_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_HEAP_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_BTREE_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_HASH_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_GIN_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_GIST_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_SEQ_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_SPGIST_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_BRIN_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	{ RM_GENERIC_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PAGE, NULL },
-	/* ---- RM_COMMIT_TS_ID: derived projection ---- */
-	{ RM_COMMIT_TS_ID, COMMIT_TS_ZEROPAGE, 0, CLUSTER_SIDE_ROUTE_PROJECTION, NULL },
-	{ RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE, 0, CLUSTER_SIDE_ROUTE_PROJECTION, NULL },
-	/* ---- RM_REPLORIGIN_ID: origin authority not safely aliased -> BLOCKED. ---- */
-	{ RM_REPLORIGIN_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	/* ---- RM_LOGICALMSG_ID: physical-only context ---- */
-	{ RM_LOGICALMSG_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_PROVED_NOOP,
-	  "LOGICAL_MESSAGE_ONLY" },
-	/* ---- RM_CLUSTER_UNDO_ID: shared undo/TT truth; HWM stays BLOCKED
-	 * under STOP-RF-SIDE-SPACE-ABI. ---- */
-	{ RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_SET_HEAD, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_RECYCLE, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_REUSE, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_CLUSTER_UNDO_ID, XLOG_UNDO_BLOCK_WRITE_MULTI, 0, CLUSTER_SIDE_ROUTE_TT_UNDO, NULL },
-	{ RM_CLUSTER_UNDO_ID, XLOG_HW_RESERVE, 0, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	/* ---- Other PGRAC rmgrs: owners outside SIDE -> BLOCKED. ---- */
-	{ RM_CLUSTER_RAW_LAYOUT_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_CLUSTER_ADG_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-	{ RM_CLUSTER_XID_STRIPE_ID, 0, 0xFFFF, CLUSTER_SIDE_ROUTE_BLOCKED, NULL },
-};
+static bool
+side_manifest_find(uint8 rmid, uint16 opcode, RfOpcodeRouteV1 *route,
+	bool *active)
+{
+	uint8		normalized;
+	size_t		i;
+
+	if (opcode > UINT8_MAX || route == NULL || active == NULL)
+		return false;
+	if (rmid == RM_XACT_ID)
+		normalized = (uint8) opcode & XLOG_XACT_OPMASK;
+	else
+		normalized = (uint8) opcode & ~XLR_INFO_MASK;
+	for (i = 0; i < rf_opcode_route_manifest_count_v1(); i++)
+	{
+		RfOpcodeRouteV1 candidate;
+		bool		candidate_active;
+
+		if (!rf_opcode_route_manifest_entry_v1(i, &candidate,
+				&candidate_active))
+			return false;
+		if (candidate.rmid == rmid &&
+			candidate.normalized_info == normalized)
+		{
+			if (rmid == RM_XACT_ID &&
+				(((uint8) opcode & XLOG_XACT_HAS_INFO) &
+				 ~candidate.legal_info_flags) != 0)
+				return false;
+			*route = candidate;
+			*active = candidate_active;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+side_manifest_disposition(const RfOpcodeRouteV1 *route, bool active,
+	ClusterSideRouteRow *out)
+{
+	out->rmid = route->rmid;
+	out->opcode = route->normalized_info;
+	out->opcode_mask = route->legal_info_flags;
+	out->kind = CLUSTER_SIDE_ROUTE_BLOCKED;
+	if (!active)
+		return;
+	if (route->record_owner == RF_ROUTE_OWNER_PAGE_CODEC)
+	{
+		out->kind = CLUSTER_SIDE_ROUTE_PAGE;
+		return;
+	}
+	if (route->record_owner == RF_ROUTE_OWNER_LOGICAL_NOOP)
+	{
+		out->kind = CLUSTER_SIDE_ROUTE_PROVED_NOOP;
+		out->noop_reason = "LOGICAL_MESSAGE_ONLY";
+		return;
+	}
+	if (route->record_owner != RF_ROUTE_OWNER_SIDE_TYPED)
+		return;
+
+	if (route->codec_id == RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO)
+	{
+		if (route->normalized_info != XLOG_HW_RESERVE)
+			out->kind = CLUSTER_SIDE_ROUTE_TT_UNDO;
+		return;
+	}
+	if (route->codec_id != RF_ROUTE_CODEC_SIDE_STANDARD)
+		return;
+
+	switch (route->rmid)
+	{
+		case RM_XLOG_ID:
+			if (route->normalized_info == XLOG_NOOP ||
+				route->normalized_info == XLOG_SWITCH ||
+				route->normalized_info == XLOG_RESTORE_POINT ||
+				route->normalized_info == XLOG_BACKUP_END)
+			{
+				out->kind = CLUSTER_SIDE_ROUTE_PROVED_NOOP;
+				out->noop_reason = "CONTROL_ONLY";
+			}
+			break;
+		case RM_XACT_ID:
+			if (route->normalized_info != XLOG_XACT_INVALIDATIONS)
+				out->kind = CLUSTER_SIDE_ROUTE_TT_UNDO;
+			break;
+		case RM_SMGR_ID:
+			out->kind = CLUSTER_SIDE_ROUTE_STORAGE;
+			break;
+		case RM_CLOG_ID:
+		case RM_MULTIXACT_ID:
+		case RM_COMMIT_TS_ID:
+			out->kind = CLUSTER_SIDE_ROUTE_PROJECTION;
+			break;
+		case RM_STANDBY_ID:
+			if (route->normalized_info == XLOG_STANDBY_LOCK ||
+				route->normalized_info == XLOG_RUNNING_XACTS)
+			{
+				out->kind = CLUSTER_SIDE_ROUTE_PROVED_NOOP;
+				out->noop_reason = "PRIMARY_NO_STANDBY_CONSUMER";
+			}
+			break;
+		case RM_HEAP2_ID:
+			/* XLOG_HEAP2_NEW_CID: physical recovery has no logical
+			 * decoding consumer. REWRITE remains authority-blocked. */
+			if (route->normalized_info == 0x70)
+			{
+				out->kind = CLUSTER_SIDE_ROUTE_PROVED_NOOP;
+				out->noop_reason = "LOGICAL_ONLY";
+			}
+			break;
+		case RM_GIST_ID:
+			/* XLOG_GIST_ASSIGN_LSN is the rmgr-declared no-op. */
+			if (route->normalized_info == 0x70)
+			{
+				out->kind = CLUSTER_SIDE_ROUTE_PROVED_NOOP;
+				out->noop_reason = "DECLARED_RMGR_NOOP";
+			}
+			break;
+		default:
+			break;
+	}
+}
 
 bool
 cluster_side_route_lookup(uint8 rmid, uint16 opcode, ClusterSideRouteRow *out)
 {
-	int			i;
+	RfOpcodeRouteV1 route;
+	bool		active;
 
 	if (out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
-	for (i = 0; i < (int) lengthof(cluster_side_route_table); i++) {
-		const ClusterSideRouteRow *row = &cluster_side_route_table[i];
-
-		if (row->rmid != rmid)
-			continue;
-		if (row->opcode_mask != 0) {
-			/* mask = ignored bits (e.g. the XACT HAS_INFO modifier):
-			 * all OTHER bits must match exactly.  A mask of 0xFFFF is
-			 * the rmgr-granular row: every opcode of this rmgr matches. */
-			if ((opcode & ~row->opcode_mask) != (row->opcode & ~row->opcode_mask))
-				continue;
-		} else {
-			/* Exact opcode match — including opcode 0 (a real opcode,
-			 * e.g. XLOG_CHECKPOINT_SHUTDOWN): an exact row must never
-			 * fall through as a wildcard. */
-			if (row->opcode != opcode)
-				continue;
-		}
-		*out = *row;
-		return true;
-	}
-	return false;				/* unknown rmgr/opcode: BLOCKED by default */
+	if (!side_manifest_find(rmid, opcode, &route, &active))
+		return false;
+	side_manifest_disposition(&route, active, out);
+	return true;
 }
 
 ClusterSideRouteVerdict

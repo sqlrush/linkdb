@@ -25,6 +25,7 @@
 #include "access/xact.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
+#include "cluster/cluster_rf_route.h"
 #include "cluster/cluster_side_route.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "storage/standbydefs.h"
@@ -108,7 +109,7 @@ UT_TEST(test_route_unknown_default_blocked)
 	/* Unknown rmgr: no row -> caller treats it as BLOCKED. */
 	UT_ASSERT(!cluster_side_route_lookup(0xFE, 0x10, &row));
 	/* Unknown XLOG opcode (not in the matrix): no row. */
-	UT_ASSERT(!cluster_side_route_lookup(RM_XLOG_ID, 0x55, &row));
+	UT_ASSERT(!cluster_side_route_lookup(RM_XLOG_ID, 0xC0, &row));
 	/* NULL out. */
 	UT_ASSERT(!cluster_side_route_lookup(RM_XLOG_ID, XLOG_FPI, NULL));
 	/* NULL row -> BLOCKED verdict. */
@@ -140,14 +141,49 @@ UT_TEST(test_route_verdict_pure_cold_online_agree)
 				 (int) CLUSTER_SIDE_ROUTE_VERDICT_BLOCKED);
 }
 
+UT_TEST(test_route_consumes_the_exhaustive_manifest)
+{
+	ClusterSideRouteRow side;
+	RfOpcodeRouteV1 route;
+	bool		active;
+	size_t		i;
+
+	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 137);
+	for (i = 0; i < rf_opcode_route_manifest_count_v1(); i++)
+	{
+		UT_ASSERT(rf_opcode_route_manifest_entry_v1(i, &route, &active));
+		UT_ASSERT(cluster_side_route_lookup(route.rmid,
+			route.normalized_info, &side));
+		UT_ASSERT_EQ(side.rmid, route.rmid);
+		UT_ASSERT_EQ(side.opcode, route.normalized_info);
+		if (!active)
+			UT_ASSERT_EQ((int) side.kind,
+				(int) CLUSTER_SIDE_ROUTE_BLOCKED);
+	}
+
+	/* SIDE disposition must refine SIDE_STANDARD rows rather than letting
+	 * an rmgr-wide PAGE wildcard silently claim them. */
+	UT_ASSERT(cluster_side_route_lookup(RM_HEAP2_ID, 0x00, &side));
+	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_BLOCKED);
+	UT_ASSERT(cluster_side_route_lookup(RM_HEAP2_ID, 0x70, &side));
+	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_PROVED_NOOP);
+	UT_ASSERT(cluster_side_route_lookup(RM_HEAP_ID, 0x30, &side));
+	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_BLOCKED);
+	UT_ASSERT(cluster_side_route_lookup(RM_GIST_ID, 0x70, &side));
+	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_PROVED_NOOP);
+	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, 0xA0, &side));
+	UT_ASSERT_EQ((int) side.kind, (int) CLUSTER_SIDE_ROUTE_BLOCKED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(4);
 
 	UT_RUN(test_route_matrix_named_rows);
 	UT_RUN(test_route_unknown_default_blocked);
 	UT_RUN(test_route_verdict_pure_cold_online_agree);
+	UT_RUN(test_route_consumes_the_exhaustive_manifest);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
