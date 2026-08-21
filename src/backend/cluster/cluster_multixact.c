@@ -218,7 +218,8 @@ cluster_multixact_member_overlay_install_raw(const ClusterMultiXactKey *key, uin
 static bool
 cluster_multixact_member_overlay_lookup_raw(const ClusterMultiXactKey *key,
 											ClusterMultiXactMemberOverlayResult *out,
-											int max_members_buf)
+											int max_members_buf,
+											bool allow_recovery_projection)
 {
 	const ClusterMultiXactOverlayEntry *e;
 	uint32 current_epoch;
@@ -246,6 +247,19 @@ cluster_multixact_member_overlay_lookup_raw(const ClusterMultiXactKey *key,
 	e = (const ClusterMultiXactOverlayEntry *)hash_search(ClusterMultiXactHTAB, key, HASH_FIND,
 														  NULL);
 	if (e == NULL) {
+		LWLockRelease(ClusterMultiXactLock);
+		pg_atomic_fetch_add_u64(&ClusterMultiXactState->overlay_miss_count, 1);
+		return false;
+	}
+
+	/* RFSIDE-V2-A: a retained-redo recovery row is inspectable by the
+	 * immediate post-read verifier only.  Normal visibility has no fresh
+	 * retained-source carrier and therefore must not serve these bytes as an
+	 * exact composition after retirement/recycle/ABA could have occurred. */
+	if (!allow_recovery_projection &&
+		(e->source_lsn != InvalidXLogRecPtr ||
+		 e->source_end_lsn != InvalidXLogRecPtr))
+	{
 		LWLockRelease(ClusterMultiXactLock);
 		pg_atomic_fetch_add_u64(&ClusterMultiXactState->overlay_miss_count, 1);
 		return false;
@@ -495,7 +509,7 @@ cluster_multixact_remote_xmax_resolve_raw(uint16 origin_slot, MultiXactId mxid, 
 	mxres = (ClusterMultiXactMemberOverlayResult *)palloc0(resbuf_sz);
 
 	if (!cluster_multixact_member_overlay_lookup_raw(&mxkey, mxres,
-											 CLUSTER_MULTIXACT_MAX_MEMBERS)) {
+									 CLUSTER_MULTIXACT_MAX_MEMBERS, false)) {
 		pfree(mxres);
 		/* spec-7.1 D3-b: overlay miss -> ask the origin (banner). */
 		return cluster_multixact_remote_xmax_ask_origin(origin_slot, mxid, snap);
@@ -777,7 +791,7 @@ cluster_multixact_recovery_projection_verify(void *arg, int origin_slot,
 		key.cluster_epoch = cluster_epoch;
 		result = (ClusterMultiXactMemberOverlayResult *) palloc0(result_size);
 		matches = cluster_multixact_member_overlay_lookup_raw(&key, result,
-			(int) operation->member_count) && result->authoritative &&
+			(int) operation->member_count, true) && result->authoritative &&
 			result->member_count == operation->member_count &&
 			result->member_offset == operation->member_offset &&
 			result->source_lsn == source_lsn &&
@@ -906,10 +920,12 @@ cluster_multixact_member_overlay_install_raw(const ClusterMultiXactKey *key, uin
 static bool
 cluster_multixact_member_overlay_lookup_raw(const ClusterMultiXactKey *key,
 											ClusterMultiXactMemberOverlayResult *out,
-											int max_members_buf)
+											int max_members_buf,
+											bool allow_recovery_projection)
 {
 	(void)key;
 	(void)max_members_buf;
+	(void)allow_recovery_projection;
 	if (out != NULL) {
 		out->authoritative = false;
 		out->member_count = 0;
@@ -1031,7 +1047,7 @@ cluster_multixact_source_dispatch_body(ClusterMultiXactSourceOp op,
 		if (request == NULL || request->key == NULL || request->overlay_out == NULL)
 			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 		result->bool_value = cluster_multixact_member_overlay_lookup_raw(
-			request->key, request->overlay_out, request->max_members_buf);
+			request->key, request->overlay_out, request->max_members_buf, false);
 		if (result->bool_value)
 			result->member_count = request->overlay_out->member_count;
 		break;

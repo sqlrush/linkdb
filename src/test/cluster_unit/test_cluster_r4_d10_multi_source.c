@@ -664,6 +664,18 @@ UT_TEST(t10_recovery_projection_create_has_exact_postread)
 {
 	ClusterSideProjectionOperationV1 operation;
 	MultiXactMember members[2];
+	ClusterMultiXactKey key;
+	ClusterMultiXactSourceRequest request;
+	ClusterMultiXactSourceResult result;
+	union
+	{
+		uint64 align;
+		unsigned char bytes[
+			offsetof(ClusterMultiXactMemberOverlayResult, members) +
+			2 * sizeof(ClusterMultiXactMember)];
+	} output;
+	ClusterMultiXactMemberOverlayResult *overlay =
+		(ClusterMultiXactMemberOverlayResult *) output.bytes;
 
 	memset(&operation, 0, sizeof(operation));
 	operation.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
@@ -683,6 +695,24 @@ UT_TEST(t10_recovery_projection_create_has_exact_postread)
 		&operation, (const uint8 *) members, sizeof(members), 100, 200));
 	UT_ASSERT(!cluster_multixact_recovery_projection_verify(NULL, 0, 19,
 		&operation, (const uint8 *) members, sizeof(members), 100, 201));
+	/* The immediate recovery post-read may inspect the row, but ordinary
+	 * serving has no retained-source freshness carrier.  RFSIDE-V2-A keeps
+	 * this projection unserved rather than treating its bytes as truth. */
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = 0;
+	key.multixact_id = 33;
+	key.cluster_epoch = 19;
+	memset(&request, 0, sizeof(request));
+	memset(overlay, 0, sizeof(output.bytes));
+	request.key = &key;
+	request.overlay_out = overlay;
+	request.max_members_buf = 2;
+	reset_admission(CLUSTER_SEMANTIC_ADMISSION_OK, true);
+	UT_ASSERT_EQ((int) cluster_multixact_source_dispatch(
+		CLUSTER_MULTI_SOURCE_OVERLAY_LOOKUP, &request, &result),
+		(int) CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(!result.bool_value);
+	UT_ASSERT(!overlay->authoritative);
 	memset(&operation, 0, sizeof(operation));
 	operation.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
 	operation.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
