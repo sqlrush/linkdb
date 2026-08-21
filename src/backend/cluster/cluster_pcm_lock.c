@@ -44,6 +44,7 @@
 #include "cluster/cluster_cssd.h" /* PGRAC: spec-4.7a D4 — peer liveness for other-holder check */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
@@ -308,6 +309,18 @@ typedef struct ClusterPcmWmProvSlot {
 	uint64 epoch;	   /* wire epoch (0 = none) */
 } ClusterPcmWmProvSlot;
 
+/* Stable, non-authoritative index for bounded R8 traversal.  Resource-X
+ * state stays solely in the keyed GrdEntry; this registry stores only the
+ * immutable BufferTag needed to resolve one cursor slot without retaining a
+ * raw hash pointer across calls. */
+typedef struct ClusterPcmResourceXSlot {
+	BufferTag tag;
+	uint32 initialized;
+} ClusterPcmResourceXSlot;
+
+StaticAssertDecl(sizeof(ClusterPcmResourceXSlot) == 24,
+				 "ClusterPcmResourceXSlot layout must remain 24 bytes");
+
 typedef struct ClusterPcmShared {
 	LWLockPadded htab_lock;
 	pg_atomic_uint32 resource_x_gate_phase;
@@ -315,6 +328,23 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 resource_x_gate_formation;
 	pg_atomic_uint64 resource_x_freeze_generation;
 	pg_atomic_uint64 resource_x_activation_inflight_count;
+	pg_atomic_uint64 resource_x_reconfig_old_formation;
+	pg_atomic_uint64 resource_x_reconfig_new_formation;
+	pg_atomic_uint64 resource_x_reconfig_next_state_index;
+	pg_atomic_uint64 resource_x_reconfig_scan_capacity;
+	pg_atomic_uint64 resource_x_reconfig_zero_proof_generation;
+	pg_atomic_uint64 resource_x_reconfig_residual_count;
+	pg_atomic_uint64 resource_x_reconfig_freeze_count;
+	pg_atomic_uint64 resource_x_reconfig_slot_examined_count;
+	pg_atomic_uint64 resource_x_reconfig_old_detached_count;
+	pg_atomic_uint64 resource_x_reconfig_successor_count;
+	pg_atomic_uint64 resource_x_reconfig_orphan_count;
+	pg_atomic_uint64 resource_x_reconfig_sidecar_neutralized_count;
+	pg_atomic_uint64 resource_x_reconfig_sidecar_stale_count;
+	pg_atomic_uint64 resource_x_reconfig_retry_count;
+	pg_atomic_uint64 resource_x_reconfig_blocked_count;
+	pg_atomic_uint64 resource_x_reconfig_thaw_count;
+	pg_atomic_uint64 resource_x_reconfig_slot_count;
 	pg_atomic_uint64 trans_n_to_s_count;
 	pg_atomic_uint64 trans_n_to_x_count;
 	pg_atomic_uint64 trans_s_to_x_upgrade_count;
@@ -373,6 +403,7 @@ StaticAssertDecl(sizeof(ClusterPcmShared) >= sizeof(LWLockPadded) + 72,
  */
 static ClusterPcmShared *ClusterPcm = NULL;
 static HTAB *cluster_pcm_htab = NULL;
+static ClusterPcmResourceXSlot *cluster_pcm_resource_x_slots = NULL;
 /*
  * Resolved (post-HC62) entry count used by HTAB cap + accessor + errmsg.
  *	Set in cluster_pcm_grd_init from pcm_grd_effective_entries(true) ;
@@ -796,6 +827,443 @@ cluster_pcm_lock_resource_x_activation_inflight_count(void)
 	return ClusterPcm == NULL
 			   ? 0
 			   : pg_atomic_read_u64(&ClusterPcm->resource_x_activation_inflight_count);
+}
+
+static bool
+pcm_resource_x_reconfig_token_exact(const ResourceXReconfigToken *token)
+{
+	return token != NULL && token->old_formation != 0 && token->old_formation != UINT64_MAX
+		   && token->new_formation != 0 && token->new_formation != UINT64_MAX
+		   && token->new_formation != token->old_formation && token->freeze_generation != 0
+		   && token->freeze_generation != UINT64_MAX
+		   && token->old_formation
+				  == pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_old_formation)
+		   && token->new_formation
+				  == pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_new_formation)
+		   && token->freeze_generation
+				  == pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation);
+}
+
+static void
+pcm_resource_x_reconfig_block(void)
+{
+	uint32 phase;
+
+	if (ClusterPcm == NULL)
+		return;
+	phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+	while (phase != RESOURCE_X_GATE_RECOVERY_BLOCKED) {
+		if (pg_atomic_compare_exchange_u32(&ClusterPcm->resource_x_gate_phase, &phase,
+										   RESOURCE_X_GATE_RECOVERY_BLOCKED)) {
+			pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_blocked_count, 1);
+			return;
+		}
+	}
+}
+
+bool
+cluster_resource_x_reconfig_freeze_pending(uint64 old_formation, ResourceXReconfigToken *out)
+{
+	ResourceXReconfigToken live;
+	uint64 current_generation;
+	uint64 next_generation;
+	uint64 gate_formation;
+	uint32 phase;
+	uint32 expected_phase;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL || old_formation == 0
+		|| old_formation == UINT64_MAX)
+		return false;
+
+	phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+	live.old_formation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_old_formation);
+	live.new_formation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_new_formation);
+	live.freeze_generation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation);
+	if (phase == RESOURCE_X_GATE_FROZEN && live.old_formation == old_formation
+		&& live.freeze_generation != 0 && live.freeze_generation != UINT64_MAX
+		&& (live.new_formation == 0
+			|| (live.new_formation != old_formation
+				&& live.new_formation != UINT64_MAX))) {
+		*out = live;
+		return true;
+	}
+	if (phase != RESOURCE_X_GATE_OPEN) {
+		if (phase == RESOURCE_X_GATE_FROZEN)
+			pcm_resource_x_reconfig_block();
+		return false;
+	}
+
+	gate_formation = pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation);
+	if (gate_formation != old_formation)
+		return false;
+	current_generation = pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation);
+	if (!cluster_resource_x_next_freeze_generation(current_generation, &next_generation)) {
+		pcm_resource_x_reconfig_block();
+		return false;
+	}
+	expected_phase = RESOURCE_X_GATE_OPEN;
+	if (!pg_atomic_compare_exchange_u32(&ClusterPcm->resource_x_gate_phase, &expected_phase,
+										 RESOURCE_X_GATE_FROZEN)) {
+		pcm_resource_x_reconfig_block();
+		return false;
+	}
+
+	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_old_formation, old_formation);
+	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_new_formation, 0);
+	pg_atomic_write_u64(&ClusterPcm->resource_x_freeze_generation, next_generation);
+	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_next_state_index, 0);
+	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_scan_capacity,
+						 (uint64)pcm_grd_effective);
+	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_zero_proof_generation, 0);
+	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_residual_count, 0);
+	pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_freeze_count, 1);
+	out->old_formation = old_formation;
+	out->new_formation = 0;
+	out->freeze_generation = next_generation;
+	return true;
+}
+
+bool
+cluster_resource_x_reconfig_bind_new_formation_exact(ResourceXReconfigToken *token,
+											 uint64 new_formation)
+{
+	uint64 expected_formation;
+
+	if (ClusterPcm == NULL || token == NULL || token->old_formation == 0
+		|| token->old_formation == UINT64_MAX || token->freeze_generation == 0
+		|| token->freeze_generation == UINT64_MAX || new_formation == 0
+		|| new_formation == UINT64_MAX || new_formation == token->old_formation
+		|| pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_FROZEN
+		|| pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_old_formation)
+			   != token->old_formation
+		|| pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation)
+			   != token->freeze_generation)
+		return false;
+
+	expected_formation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_new_formation);
+	if ((token->new_formation == 0 || token->new_formation == new_formation)
+		&& expected_formation == new_formation) {
+		token->new_formation = new_formation;
+		return true;
+	}
+	if (token->new_formation != 0 || expected_formation != 0) {
+		pcm_resource_x_reconfig_block();
+		return false;
+	}
+	if (!pg_atomic_compare_exchange_u64(&ClusterPcm->resource_x_reconfig_new_formation,
+										&expected_formation, new_formation)) {
+		if (expected_formation == new_formation) {
+			token->new_formation = new_formation;
+			return true;
+		}
+		pcm_resource_x_reconfig_block();
+		return false;
+	}
+	token->new_formation = new_formation;
+	return true;
+}
+
+bool
+cluster_resource_x_reconfig_freeze(uint64 old_formation, uint64 new_formation,
+								   ResourceXReconfigToken *out)
+{
+	ResourceXReconfigToken live;
+	uint32 phase;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL || old_formation == 0
+		|| old_formation == UINT64_MAX || new_formation == 0 || new_formation == UINT64_MAX
+		|| old_formation == new_formation)
+		return false;
+
+	phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+	live.old_formation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_old_formation);
+	live.new_formation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_new_formation);
+	live.freeze_generation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation);
+	if (phase == RESOURCE_X_GATE_FROZEN && live.old_formation == old_formation
+		&& live.new_formation == new_formation && live.freeze_generation != 0
+		&& live.freeze_generation != UINT64_MAX) {
+		*out = live;
+		return true;
+	}
+	if (phase != RESOURCE_X_GATE_OPEN) {
+		if (phase == RESOURCE_X_GATE_FROZEN)
+			pcm_resource_x_reconfig_block();
+		return false;
+	}
+	if (!cluster_resource_x_reconfig_freeze_pending(old_formation, out))
+		return false;
+	return cluster_resource_x_reconfig_bind_new_formation_exact(out, new_formation);
+}
+
+ResourceXReconfigResult
+cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 probe_budget,
+								  ResourceXReconfigBatch *out)
+{
+	ResourceXReconfigResult result = RESOURCE_X_RECONFIG_MORE;
+	ClusterPcmResourceXSlot *slot;
+	struct GrdEntry *entry;
+	BufferTag snapshot_tag;
+	ResourceXSidecarNeutralizeResult sidecar_result;
+	uint64 capacity;
+	uint64 cursor;
+	uint64 snapshot_acquisition_generation;
+	uint64 snapshot_no_progress_generation;
+	uint32 probes;
+	uint32 progress_flags;
+	uint32 snapshot_dispatch_phase;
+	uint32 snapshot_no_progress_reason;
+	uint32 snapshot_progress_flags;
+	uint64 formation;
+	int32 snapshot_requester_node;
+	bool found;
+	bool first_orphan = false;
+
+	if (out == NULL)
+		return RESOURCE_X_RECONFIG_CORRUPT;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL || cluster_pcm_htab == NULL || probe_budget == 0 || probe_budget > 4
+		|| pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_FROZEN
+		|| !pcm_resource_x_reconfig_token_exact(token))
+		return RESOURCE_X_RECONFIG_CORRUPT;
+	if (pg_atomic_read_u64(&ClusterPcm->resource_x_activation_inflight_count) != 0)
+		return RESOURCE_X_RECONFIG_MORE;
+
+	capacity = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_scan_capacity);
+	if (capacity > (uint64)pcm_grd_effective || cluster_pcm_resource_x_slots == NULL) {
+		pcm_resource_x_reconfig_block();
+		return RESOURCE_X_RECONFIG_CORRUPT;
+	}
+
+	cursor = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_next_state_index);
+	if (cursor > capacity) {
+		pcm_resource_x_reconfig_block();
+		return RESOURCE_X_RECONFIG_CORRUPT;
+	}
+	probes = 0;
+	while (probes < probe_budget && cursor < capacity) {
+		slot = &cluster_pcm_resource_x_slots[cursor];
+		if (slot->initialized == 0) {
+			cursor++;
+			probes++;
+			out->examined_count++;
+			pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_slot_examined_count, 1);
+			continue;
+		}
+
+		LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+		entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &slot->tag, HASH_FIND, &found);
+		LWLockRelease(&ClusterPcm->htab_lock.lock);
+		if (!found || entry == NULL) {
+			pcm_resource_x_reconfig_block();
+			return RESOURCE_X_RECONFIG_CORRUPT;
+		}
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		if (!BufferTagsEqual(&entry->tag, &slot->tag)) {
+			LWLockRelease(&entry->entry_lock.lock);
+			pcm_resource_x_reconfig_block();
+			return RESOURCE_X_RECONFIG_CORRUPT;
+		}
+		formation = entry->resource_x_formation;
+		progress_flags = entry->resource_x_progress_flags;
+		if (formation == token->old_formation
+			&& entry->resource_x_acquisition_generation != 0) {
+			if (entry->resource_x_requester_node < 0
+				|| (progress_flags & ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0) {
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_resource_x_reconfig_block();
+				return RESOURCE_X_RECONFIG_CORRUPT;
+			}
+
+			/* A T2/T3-gap sidecar belongs to the buffer owner.  Snapshot the
+			 * complete Resource-X identity, drop this entry lock, and never
+			 * carry the shared entry pointer across that authority boundary. */
+			if (progress_flags
+				== (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1
+					| RESOURCE_X_PROGRESS_T2)) {
+				snapshot_tag = entry->tag;
+				snapshot_requester_node = entry->resource_x_requester_node;
+				snapshot_acquisition_generation
+					= entry->resource_x_acquisition_generation;
+				snapshot_progress_flags = progress_flags;
+				snapshot_no_progress_generation
+					= entry->resource_x_no_progress_generation;
+				snapshot_no_progress_reason = entry->resource_x_no_progress_reason;
+				snapshot_dispatch_phase = entry->resource_x_dispatch_phase;
+				LWLockRelease(&entry->entry_lock.lock);
+				entry = NULL;
+
+				sidecar_result = cluster_bufmgr_resource_x_neutralize_exact(
+					&snapshot_tag, token->old_formation,
+					snapshot_acquisition_generation);
+
+				entry = pcm_find_entry(snapshot_tag);
+				if (entry == NULL) {
+					pcm_resource_x_reconfig_block();
+					return RESOURCE_X_RECONFIG_CORRUPT;
+				}
+				LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+				if (!BufferTagsEqual(&entry->tag, &snapshot_tag)
+					|| entry->resource_x_requester_node != snapshot_requester_node
+					|| entry->resource_x_formation != token->old_formation
+					|| entry->resource_x_acquisition_generation
+						   != snapshot_acquisition_generation
+					|| entry->resource_x_progress_flags != snapshot_progress_flags
+					|| entry->resource_x_no_progress_generation
+						   != snapshot_no_progress_generation
+					|| entry->resource_x_no_progress_reason != snapshot_no_progress_reason
+					|| entry->resource_x_dispatch_phase != snapshot_dispatch_phase) {
+					LWLockRelease(&entry->entry_lock.lock);
+					out->retry_count = 1;
+					out->next_state_index = cursor;
+					pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_retry_count, 1);
+					pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_next_state_index,
+									 cursor);
+					return RESOURCE_X_RECONFIG_RETRY;
+				}
+
+				switch (sidecar_result) {
+					case RESOURCE_X_SIDECAR_NEUTRALIZED:
+						out->sidecar_neutralized_count++;
+						pg_atomic_fetch_add_u64(
+							&ClusterPcm->resource_x_reconfig_sidecar_neutralized_count, 1);
+						break;
+					case RESOURCE_X_SIDECAR_ALREADY_CLEAR:
+						break;
+					case RESOURCE_X_SIDECAR_SUCCESSOR:
+					case RESOURCE_X_SIDECAR_STALE:
+						pg_atomic_fetch_add_u64(
+							&ClusterPcm->resource_x_reconfig_sidecar_stale_count, 1);
+						break;
+					case RESOURCE_X_SIDECAR_BUSY:
+						break;
+					case RESOURCE_X_SIDECAR_CORRUPT:
+					default:
+						LWLockRelease(&entry->entry_lock.lock);
+						pcm_resource_x_reconfig_block();
+						return RESOURCE_X_RECONFIG_CORRUPT;
+				}
+			}
+			else if (progress_flags
+					 != (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1)
+					 && progress_flags
+							!= (RESOURCE_X_PROGRESS_T1 | RESOURCE_X_PROGRESS_T2
+								| RESOURCE_X_PROGRESS_T3)) {
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_resource_x_reconfig_block();
+				return RESOURCE_X_RECONFIG_CORRUPT;
+			}
+
+			if ((progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) == 0) {
+				entry->resource_x_progress_flags |= RESOURCE_X_PROGRESS_RECOVERY_BLOCKED;
+				first_orphan = true;
+			}
+			result = RESOURCE_X_RECONFIG_ORPHAN;
+		}
+		else if (formation == token->new_formation
+				 && entry->resource_x_acquisition_generation != 0) {
+			out->successor_count++;
+			pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_successor_count, 1);
+		}
+		else if (formation != 0 || entry->resource_x_acquisition_generation != 0
+				 || entry->resource_x_requester_node != -1 || progress_flags != 0) {
+			LWLockRelease(&entry->entry_lock.lock);
+			pcm_resource_x_reconfig_block();
+			return RESOURCE_X_RECONFIG_CORRUPT;
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+
+		cursor++;
+		probes++;
+		out->examined_count++;
+		pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_slot_examined_count, 1);
+		if (result == RESOURCE_X_RECONFIG_ORPHAN)
+			break;
+	}
+
+	if (result == RESOURCE_X_RECONFIG_ORPHAN) {
+		out->orphan_count = 1;
+		out->residual_count = 1;
+		pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_residual_count, 1);
+		if (first_orphan)
+			pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_orphan_count, 1);
+		pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_next_state_index, cursor);
+		out->next_state_index = cursor;
+		pcm_resource_x_reconfig_block();
+		return result;
+	}
+
+	if (cursor < capacity) {
+		pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_next_state_index, cursor);
+		out->next_state_index = cursor;
+		return RESOURCE_X_RECONFIG_MORE;
+	}
+
+	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_zero_proof_generation,
+						 token->freeze_generation);
+	pg_atomic_write_u64(&ClusterPcm->resource_x_reconfig_next_state_index, 0);
+	out->complete_wrap = 1;
+	out->zero_residual = 1;
+	return RESOURCE_X_RECONFIG_DONE;
+}
+
+bool
+cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token)
+{
+	uint32 expected_phase;
+
+	if (ClusterPcm == NULL
+		|| pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_FROZEN
+		|| !pcm_resource_x_reconfig_token_exact(token)
+		|| pg_atomic_read_u64(&ClusterPcm->resource_x_activation_inflight_count) != 0
+		|| pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_residual_count) != 0
+		|| pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_zero_proof_generation)
+			   != token->freeze_generation)
+		return false;
+
+	pg_atomic_write_u64(&ClusterPcm->resource_x_gate_formation, token->new_formation);
+	expected_phase = RESOURCE_X_GATE_FROZEN;
+	if (!pg_atomic_compare_exchange_u32(&ClusterPcm->resource_x_gate_phase, &expected_phase,
+										 RESOURCE_X_GATE_OPEN))
+		return false;
+	pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_thaw_count, 1);
+	return true;
+}
+
+void
+cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *out)
+{
+	if (out == NULL)
+		return;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL)
+		return;
+	out->freeze_count = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_freeze_count);
+	out->slot_examined_count
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_slot_examined_count);
+	out->old_detached_count
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_old_detached_count);
+	out->successor_count = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_successor_count);
+	out->orphan_count = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_orphan_count);
+	out->sidecar_neutralized_count
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_sidecar_neutralized_count);
+	out->sidecar_stale_count
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_sidecar_stale_count);
+	out->retry_count = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_retry_count);
+	out->blocked_count = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_blocked_count);
+	out->thaw_count = pg_atomic_read_u64(&ClusterPcm->resource_x_reconfig_thaw_count);
 }
 
 static bool
@@ -4119,6 +4587,7 @@ cluster_pcm_grd_shmem_size(void)
 	 * given sizeof(struct GrdEntry) entry payload.
 	 */
 	sz = MAXALIGN(sizeof(ClusterPcmShared));
+	sz = add_size(sz, mul_size((Size)eff, sizeof(ClusterPcmResourceXSlot)));
 	sz = add_size(sz, hash_estimate_size((Size)eff, sizeof(struct GrdEntry)));
 	return sz;
 }
@@ -4129,6 +4598,7 @@ cluster_pcm_grd_init(void)
 {
 	bool found;
 	HASHCTL info;
+	Size header_size;
 
 	/*
 	 * spec-2.30 D5 + HC62 — resolve effective entry count;  fatal_on_misconfig
@@ -4140,10 +4610,15 @@ cluster_pcm_grd_init(void)
 	pcm_grd_effective = pcm_grd_effective_entries(true);
 	if (pcm_grd_effective == 0)
 		return;
+	header_size = add_size(MAXALIGN(sizeof(ClusterPcmShared)),
+						   mul_size((Size)pcm_grd_effective,
+									sizeof(ClusterPcmResourceXSlot)));
 
 	pgstat_report_wait_start(WAIT_EVENT_PCM_GRD_INIT);
 	ClusterPcm = (ClusterPcmShared *)ShmemInitStruct("pgrac cluster pcm grd hdr",
-													 MAXALIGN(sizeof(ClusterPcmShared)), &found);
+													 header_size, &found);
+	cluster_pcm_resource_x_slots = (ClusterPcmResourceXSlot *)
+		((char *)ClusterPcm + MAXALIGN(sizeof(ClusterPcmShared)));
 
 	if (!found) {
 		/*
@@ -4151,12 +4626,29 @@ cluster_pcm_grd_init(void)
 		 * zeroed).  Trans-9 (s_to_x_cleanout) counter starts 0 and stays 0
 		 * by HC60 apply-fail-closed.
 		 */
-		memset(ClusterPcm, 0, sizeof(*ClusterPcm));
+		memset(ClusterPcm, 0, header_size);
 		LWLockInitialize(&ClusterPcm->htab_lock.lock, LWTRANCHE_CLUSTER_PCM);
 		pg_atomic_init_u32(&ClusterPcm->resource_x_gate_phase, RESOURCE_X_GATE_OPEN);
 		pg_atomic_init_u64(&ClusterPcm->resource_x_gate_formation, 0);
 		pg_atomic_init_u64(&ClusterPcm->resource_x_freeze_generation, 0);
 		pg_atomic_init_u64(&ClusterPcm->resource_x_activation_inflight_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_old_formation, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_new_formation, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_next_state_index, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_scan_capacity, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_zero_proof_generation, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_residual_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_freeze_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_slot_examined_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_old_detached_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_successor_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_orphan_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_sidecar_neutralized_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_sidecar_stale_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_retry_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_blocked_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_thaw_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_slot_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_n_to_s_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_n_to_x_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_upgrade_count, 0);
@@ -4207,12 +4699,42 @@ pcm_get_or_create_entry(BufferTag tag)
 {
 	struct GrdEntry *entry;
 	bool found;
+	uint64 slot_index = 0;
+	uint64 slot_probe;
+	uint64 slot_seed;
+	bool slot_found = false;
 
 	if (cluster_pcm_htab == NULL)
 		return NULL;
 
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_EXCLUSIVE);
-	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_ENTER_NULL, &found);
+	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_FIND, &found);
+	if (!found) {
+		if (pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN) {
+			LWLockRelease(&ClusterPcm->htab_lock.lock);
+			return NULL;
+		}
+		/* Pick one immutable slot in the fixed-capacity R8 registry.  Open
+		 * addressing makes unused and active slots naturally interleave while
+		 * preserving O(1) cursor resolution by index. */
+		slot_seed = (uint64)tag.spcOid;
+		slot_seed = slot_seed * UINT64_C(1315423911) + (uint64)tag.dbOid;
+		slot_seed = slot_seed * UINT64_C(1315423911) + (uint64)tag.relNumber;
+		slot_seed = slot_seed * UINT64_C(1315423911) + (uint64)(uint32)tag.forkNum;
+		slot_seed = slot_seed * UINT64_C(1315423911) + (uint64)tag.blockNum;
+		for (slot_probe = 0; slot_probe < (uint64)pcm_grd_effective; slot_probe++) {
+			slot_index = (slot_seed + slot_probe) % (uint64)pcm_grd_effective;
+			if (cluster_pcm_resource_x_slots[slot_index].initialized == 0) {
+				slot_found = true;
+				break;
+			}
+		}
+		if (!slot_found) {
+			LWLockRelease(&ClusterPcm->htab_lock.lock);
+			return NULL;
+		}
+		entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &tag, HASH_ENTER_NULL, &found);
+	}
 	if (entry == NULL) {
 		LWLockRelease(&ClusterPcm->htab_lock.lock);
 		return NULL; /* HTAB FULL — caller fail-closed */
@@ -4246,6 +4768,9 @@ pcm_get_or_create_entry(BufferTag tag)
 		entry->resource_x_no_progress_generation = 0;
 		entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_NONE;
 		entry->resource_x_dispatch_phase = 0;
+		cluster_pcm_resource_x_slots[slot_index].tag = saved_tag;
+		cluster_pcm_resource_x_slots[slot_index].initialized = 1;
+		pg_atomic_fetch_add_u64(&ClusterPcm->resource_x_reconfig_slot_count, 1);
 		ConditionVariableInit(&entry->wait_cv); /* PGRAC: spec-2.31 D1 v0.4 */
 		LWLockInitialize(&entry->entry_lock.lock, LWTRANCHE_CLUSTER_PCM);
 	}

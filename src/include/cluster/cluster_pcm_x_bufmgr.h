@@ -28,6 +28,19 @@
 #include "cluster/cluster_pcm_x_convert.h"
 #include "storage/buf_internals.h"
 
+/* Compiler-visible identities consumed by the Stage-8 closed-world AST gate.
+ * Non-Clang product builds keep identical behavior; certification itself
+ * requires a compiler that exposes annotate attributes in its AST. */
+#if __has_attribute(annotate)
+#define PGRAC_PCM_X_FENCE_TERMINAL_OWNER(kind, parameter, proof) \
+	__attribute__((annotate("pgrac_pcm_x_terminal_owner:" #kind ":" #parameter ":" #proof)))
+#define PGRAC_PCM_X_FENCE_DOMINATED(proof) \
+	__attribute__((annotate("pgrac_pcm_x_fence_dominated:" #proof)))
+#else
+#define PGRAC_PCM_X_FENCE_TERMINAL_OWNER(kind, parameter, proof)
+#define PGRAC_PCM_X_FENCE_DOMINATED(proof)
+#endif
+
 /* A retry batch is bounded and cancellable.  Registration may begin another
  * batch while the runtime remains healthy because bypassing a closed holder
  * barrier would expose untracked page bytes.  Post-content-lock unregister
@@ -171,6 +184,15 @@ typedef enum ResourceXBufferActivationResult {
 	RESOURCE_X_BUFFER_CORRUPT
 } ResourceXBufferActivationResult;
 
+typedef enum ResourceXSidecarNeutralizeResult {
+	RESOURCE_X_SIDECAR_NEUTRALIZED = 0,
+	RESOURCE_X_SIDECAR_ALREADY_CLEAR,
+	RESOURCE_X_SIDECAR_SUCCESSOR,
+	RESOURCE_X_SIDECAR_BUSY,
+	RESOURCE_X_SIDECAR_STALE,
+	RESOURCE_X_SIDECAR_CORRUPT
+} ResourceXSidecarNeutralizeResult;
+
 StaticAssertDecl(sizeof(ResourceXCurrentImage) == 32,
 				 "ResourceXCurrentImage process-local layout must remain 32 bytes");
 
@@ -194,6 +216,19 @@ cluster_pcm_x_resource_x_t3_snapshot_exact(const ResourceXAcquisitionRef *ref,
 {
 	return cluster_pcm_x_resource_x_t2_snapshot_exact(ref, live)
 		   && live->resource_x_activation_generation == ref->acquisition_generation;
+}
+
+static inline bool
+cluster_pcm_x_resource_x_r8_snapshot_exact(const BufferTag *tag, uint64 old_formation,
+										 uint64 acquisition_generation,
+										 const ClusterPcmOwnSnapshot *live)
+{
+	return tag != NULL && live != NULL && old_formation != 0 && old_formation != UINT64_MAX
+		   && acquisition_generation != 0 && acquisition_generation != UINT64_MAX
+		   && BufferTagsEqual(tag, &live->tag) && live->pcm_state == (uint8)PCM_STATE_X
+		   && live->flags == 0 && live->reservation_token != 0
+		   && live->writer_activation_token == live->reservation_token
+		   && live->resource_x_activation_generation == acquisition_generation;
 }
 
 /*
@@ -521,6 +556,8 @@ extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_activate_x_by_tag(
 extern ResourceXBufferActivationResult
 cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXBufferActivationProof *out_proof);
+extern ResourceXSidecarNeutralizeResult cluster_bufmgr_resource_x_neutralize_exact(
+	const BufferTag *tag, uint64 old_formation, uint64 acquisition_generation);
 /* Resolve one resident descriptor and snapshot its ownership tuple while the
  * mapping partition and buffer header still bind the same BufferTag.  The
  * returned buffer id is only a locator; every later lifecycle call rechecks
@@ -532,6 +569,7 @@ cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
  * LockBuffer/W1.  GRANT_PENDING image installation is permitted; a live
  * source REVOKING lifecycle or retained PI+VALID descriptor is not. */
 extern bool cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf);
+extern bool cluster_bufmgr_pcm_x_ordinary_content_write_permitted(BufferDesc *buf);
 extern void cluster_bufmgr_pcm_own_republish_grant_pending_image(BufferDesc *buf);
 /* Called only after the requester has proved the exact remote master's S->N
  * RELEASE application ACK.  Atomically normalizes the matching descriptor

@@ -211,6 +211,65 @@ StaticAssertDecl(sizeof(ResourceXBufferActivationProof) == 24,
 StaticAssertDecl(sizeof(ResourceXActivationGateToken) == 32,
 				 "ResourceXActivationGateToken layout must remain 32 bytes");
 
+typedef enum ResourceXReconfigResult {
+	RESOURCE_X_RECONFIG_DONE = 0,
+	RESOURCE_X_RECONFIG_MORE,
+	RESOURCE_X_RECONFIG_RETRY,
+	RESOURCE_X_RECONFIG_ORPHAN,
+	RESOURCE_X_RECONFIG_CORRUPT
+} ResourceXReconfigResult;
+
+typedef struct ResourceXReconfigToken {
+	uint64 old_formation;
+	uint64 new_formation;
+	uint64 freeze_generation;
+} ResourceXReconfigToken;
+
+typedef struct ResourceXReconfigBatch {
+	uint32 examined_count;
+	uint32 old_detached_count;
+	uint32 successor_count;
+	uint32 orphan_count;
+	uint32 retry_count;
+	uint32 sidecar_neutralized_count;
+	uint32 complete_wrap;
+	uint32 zero_residual;
+	uint64 next_state_index;
+	uint64 residual_count;
+} ResourceXReconfigBatch;
+
+typedef struct ResourceXReconfigStats {
+	uint64 freeze_count;
+	uint64 slot_examined_count;
+	uint64 old_detached_count;
+	uint64 successor_count;
+	uint64 orphan_count;
+	uint64 sidecar_neutralized_count;
+	uint64 sidecar_stale_count;
+	uint64 retry_count;
+	uint64 blocked_count;
+	uint64 thaw_count;
+} ResourceXReconfigStats;
+
+StaticAssertDecl(sizeof(ResourceXReconfigToken) == 24,
+				 "ResourceXReconfigToken layout must remain 24 bytes");
+StaticAssertDecl(sizeof(ResourceXReconfigBatch) == 48,
+				 "ResourceXReconfigBatch layout must remain 48 bytes");
+StaticAssertDecl(sizeof(ResourceXReconfigStats) == 80,
+				 "ResourceXReconfigStats layout must remain 80 bytes");
+
+static inline bool
+cluster_resource_x_next_freeze_generation(uint64 current, uint64 *out)
+{
+	if (out == NULL)
+		return false;
+	*out = 0;
+	if (current >= UINT64_MAX - 1)
+		return false;
+	*out = current + 1;
+	return true;
+}
+
 
 /*
  * Coherent, process-local view of one PCM authority entry.
@@ -538,6 +597,16 @@ extern bool cluster_pcm_lock_resource_x_executor_enter(
 extern void
 cluster_pcm_lock_resource_x_executor_leave(ResourceXActivationGateToken *gate);
 extern uint64 cluster_pcm_lock_resource_x_activation_inflight_count(void);
+extern bool cluster_resource_x_reconfig_freeze_pending(uint64 old_formation,
+											ResourceXReconfigToken *out);
+extern bool cluster_resource_x_reconfig_bind_new_formation_exact(
+	ResourceXReconfigToken *token, uint64 new_formation);
+extern bool cluster_resource_x_reconfig_freeze(uint64 old_formation, uint64 new_formation,
+											   ResourceXReconfigToken *out);
+extern ResourceXReconfigResult cluster_resource_x_reconfig_sweep(
+	const ResourceXReconfigToken *token, uint32 probe_budget, ResourceXReconfigBatch *out);
+extern bool cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token);
+extern void cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *out);
 extern ResourceXExecutorProbeResult cluster_pcm_lock_resource_x_executor_probe_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXExecutorSnapshot *out_snapshot);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_executor_wait_exact(

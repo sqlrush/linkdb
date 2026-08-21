@@ -72,6 +72,7 @@
 #include "utils/elog.h"
 
 #include "cluster/cluster_guc.h" /* cluster_enabled / cluster_node_id / GUC */
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_scn.h" /* spec-4.8 D5: SCN high-watermark recovery */
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"			/* TTSlot, TT_SLOT_*, TT_SLOTS_PER_SEGMENT */
@@ -305,6 +306,7 @@ typedef struct TTRevertExpect {
  *	reverted, else 0.
  */
 static int
+PGRAC_PCM_X_FENCE_DOMINATED(cluster_bufmgr_pcm_x_ordinary_content_write_permitted)
 revert_one_delete_record(const UndoRecordHeader *hdr, const TTRevertExpect *exp)
 {
 	Buffer buf;
@@ -351,6 +353,12 @@ revert_one_delete_record(const UndoRecordHeader *hdr, const TTRevertExpect *exp)
 	}
 	desc = GetBufferDescriptor(buf - 1);
 	LWLockAcquire(BufferDescriptorGetContentLock(desc), LW_EXCLUSIVE);
+	if (!cluster_bufmgr_pcm_x_ordinary_content_write_permitted(desc)) {
+		LWLockRelease(BufferDescriptorGetContentLock(desc));
+		ReleaseBuffer(buf);
+		cluster_tt_recovery_count_undo_revert_failclosed();
+		return 0;
+	}
 	page = BufferGetPage(buf);
 
 	/* Bounds: the target offset must be a normal line pointer on this page. */

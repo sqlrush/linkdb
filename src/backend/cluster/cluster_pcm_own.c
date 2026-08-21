@@ -372,6 +372,42 @@ cluster_pcm_own_resource_x_activation_clear_exact(int buf_id, uint64 expected_ge
 }
 
 ClusterPcmOwnResult
+cluster_pcm_own_resource_x_neutralize_exact(int buf_id, uint64 expected_generation,
+										uint64 reservation_token,
+										uint64 acquisition_generation,
+										uint64 *out_neutral_generation)
+{
+	ClusterPcmOwnEntry *entry;
+	uint64 next_generation;
+
+	if (out_neutral_generation == NULL)
+		return CLUSTER_PCM_OWN_INVALID;
+	*out_neutral_generation = 0;
+	if (reservation_token == 0 || acquisition_generation == 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (pg_atomic_read_u64(&entry->generation) != expected_generation
+		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
+		|| pg_atomic_read_u32(&entry->flags) != 0
+		|| pg_atomic_read_u64(&entry->writer_activation_token) != reservation_token
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation)
+			   != acquisition_generation)
+		return CLUSTER_PCM_OWN_STALE;
+	if (expected_generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_EXHAUSTED;
+
+	next_generation = expected_generation + 1;
+	/* Keep the normal T3 ordering, then invalidate every pre-neutralization
+	 * snapshot before the header lock can be released. */
+	pg_atomic_write_u64(&entry->resource_x_activation_generation, 0);
+	pg_atomic_write_u64(&entry->writer_activation_token, 0);
+	pg_atomic_write_u64(&entry->generation, next_generation);
+	*out_neutral_generation = next_generation;
+	return CLUSTER_PCM_OWN_OK;
+}
+
+ClusterPcmOwnResult
 cluster_pcm_own_revoke_commit_exact(int buf_id, uint64 expected_generation,
 									uint64 reservation_token, uint64 *out_committed_generation)
 {

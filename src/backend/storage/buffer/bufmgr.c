@@ -439,9 +439,29 @@ cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf)
 	writer_activation_token = cluster_pcm_own_writer_activation_token_get(buf->buf_id);
 	resource_x_activation_generation = cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id);
 	permitted = (flags & PCM_OWN_FLAG_REVOKING) == 0
-		&& writer_activation_token == 0 && resource_x_activation_generation == 0
+		&& cluster_pcm_x_activation_fence_open(
+			writer_activation_token, resource_x_activation_generation)
 		&& (!cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state)
 			|| flags == PCM_OWN_FLAG_GRANT_PENDING);
+	UnlockBufHdr(buf, buf_state);
+	return permitted;
+}
+
+bool
+cluster_bufmgr_pcm_x_ordinary_content_write_permitted(BufferDesc *buf)
+{
+	bool permitted;
+	uint32 buf_state;
+
+	if (buf == NULL)
+		return false;
+	buf_state = LockBufHdr(buf);
+	permitted = cluster_pcm_x_ordinary_mutation_allowed(
+		cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf),
+		cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state), buf->pcm_state,
+		cluster_pcm_own_flags_get(buf->buf_id),
+		cluster_pcm_own_writer_activation_token_get(buf->buf_id),
+		cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id));
 	UnlockBufHdr(buf, buf_state);
 	return permitted;
 }
@@ -570,6 +590,8 @@ cluster_bufmgr_pcm_own_capture_current_x_by_tag(
  * lock binds the tag to one raw-pinned descriptor; the content/header locks
  * then bind the bytes and the complete ownership tuple to the same instant.
  */
+PGRAC_PCM_X_FENCE_TERMINAL_OWNER(T2_INSTALL, ref,
+	cluster_pcm_x_resource_x_t2_snapshot_exact)
 ResourceXBufferActivationResult
 cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 										 const ResourceXCurrentImage *image,
@@ -721,6 +743,8 @@ cluster_bufmgr_pcm_own_activate_x_by_tag(const ResourceXAcquisitionRef *ref,
 /* T3 removes the Resource-X generation before the legacy writer token.  The
  * raw sidecar helper owns that store ordering; this wrapper owns descriptor,
  * byte-lock, and exact-acquisition revalidation around it. */
+PGRAC_PCM_X_FENCE_TERMINAL_OWNER(T3_CLEAR, ref,
+	cluster_pcm_x_resource_x_t3_snapshot_exact)
 ResourceXBufferActivationResult
 cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXBufferActivationProof *out_proof)
@@ -824,6 +848,85 @@ cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 
 	LWLockRelease(content_lock);
 	cluster_bufmgr_unpin_for_gcs(buf);
+	return result;
+}
+
+/* R8 reconfiguration owner for one exact T2/T3 gap.  It takes only the
+ * mapping partition and BufferDesc header lock: no content lock, pin, I/O, or
+ * Resource-X entry lock crosses this boundary.  The descriptor becomes a
+ * retained non-writable N+PI image before the Resource-X generation and then
+ * writer token are cleared. */
+PGRAC_PCM_X_FENCE_TERMINAL_OWNER(R8_NEUTRALIZE, tag,
+	cluster_pcm_x_resource_x_r8_snapshot_exact)
+ResourceXSidecarNeutralizeResult
+cluster_bufmgr_resource_x_neutralize_exact(const BufferTag *tag, uint64 old_formation,
+										   uint64 acquisition_generation)
+{
+	BufferDesc *buf;
+	BufferTag lookup_tag;
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnResult own_result;
+	LWLock *partition_lock;
+	uint64 neutral_generation = 0;
+	uint32 hashcode;
+	uint32 buf_state;
+	int buf_id;
+	ResourceXSidecarNeutralizeResult result = RESOURCE_X_SIDECAR_STALE;
+
+	if (tag == NULL || old_formation == 0 || old_formation == UINT64_MAX
+		|| acquisition_generation == 0 || acquisition_generation == UINT64_MAX)
+		return RESOURCE_X_SIDECAR_CORRUPT;
+	if (ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_SIDECAR_STALE;
+
+	lookup_tag = *tag;
+	hashcode = BufTableHashCode(&lookup_tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&lookup_tag, hashcode);
+	if (buf_id < 0) {
+		LWLockRelease(partition_lock);
+		return RESOURCE_X_SIDECAR_STALE;
+	}
+
+	buf = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	if (!BufferTagsEqual(&buf->tag, &lookup_tag) || (buf_state & BM_VALID) == 0)
+		result = RESOURCE_X_SIDECAR_STALE;
+	else if (live.resource_x_activation_generation == 0)
+		result = live.writer_activation_token == 0 ? RESOURCE_X_SIDECAR_ALREADY_CLEAR
+												 : RESOURCE_X_SIDECAR_STALE;
+	else if (live.resource_x_activation_generation != acquisition_generation)
+		result = RESOURCE_X_SIDECAR_SUCCESSOR;
+	else if (!cluster_pcm_x_resource_x_r8_snapshot_exact(
+				 tag, old_formation, acquisition_generation, &live))
+		result = live.flags != 0 ? RESOURCE_X_SIDECAR_BUSY : RESOURCE_X_SIDECAR_CORRUPT;
+	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
+		result = RESOURCE_X_SIDECAR_BUSY;
+	else if ((buf_state
+			  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR))
+			 != 0
+			 || !cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
+		result = RESOURCE_X_SIDECAR_CORRUPT;
+	else if (live.generation == UINT64_MAX)
+		result = RESOURCE_X_SIDECAR_CORRUPT;
+	else {
+		/* Quarantine first.  From this store onward an unexpected raw-sidecar
+		 * mismatch retains N+PI plus the live fences; restoring X would reopen
+		 * an acquisition the reconfiguration owner could not prove. */
+		buf->pcm_state = (uint8)PCM_STATE_N;
+		buf->buffer_type = (uint8)BUF_TYPE_PI;
+		own_result = cluster_pcm_own_resource_x_neutralize_exact(
+			buf->buf_id, live.generation, live.reservation_token,
+			acquisition_generation, &neutral_generation);
+		if (own_result == CLUSTER_PCM_OWN_OK && neutral_generation != 0)
+			result = RESOURCE_X_SIDECAR_NEUTRALIZED;
+		else
+			result = RESOURCE_X_SIDECAR_CORRUPT;
+	}
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
 	return result;
 }
 
@@ -13787,6 +13890,56 @@ cluster_bufmgr_pcm_own_abort_n_revoke(BufferDesc *buf,
 	return result;
 }
 
+/* The N and S source paths share one compiler-visible terminal-owner identity.
+ * Callers hold content EXCLUSIVE and choose the exact source bytes; this helper
+ * revalidates the same REVOKING snapshot under the header lock before the sole
+ * resident/output copy boundary. */
+static ClusterPcmOwnResult
+PGRAC_PCM_X_FENCE_TERMINAL_OWNER(NS_SOURCE_PREPARE, expected_revoking,
+	cluster_pcm_own_snapshot_matches_locked)
+cluster_bufmgr_pcm_own_copy_source_image_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
+	Page source_page, bool replace_resident, ClusterPcmOwnSnapshot *out_revoking,
+	char block_data[BLCKSZ], XLogRecPtr *out_page_lsn, uint64 *out_page_scn)
+{
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnResult result;
+	uint32 buf_state;
+
+	if (buf == NULL || expected_revoking == NULL || source_page == NULL
+		|| out_revoking == NULL || block_data == NULL || out_page_lsn == NULL
+		|| out_page_scn == NULL || expected_revoking->flags != PCM_OWN_FLAG_REVOKING
+		|| (expected_revoking->pcm_state != (uint8)PCM_STATE_N
+			&& expected_revoking->pcm_state != (uint8)PCM_STATE_S))
+		return CLUSTER_PCM_OWN_INVALID;
+	Assert(LWLockHeldByMeInMode(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE));
+
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	if (!cluster_pcm_own_snapshot_matches_locked(buf, expected_revoking)
+		|| live.flags != PCM_OWN_FLAG_REVOKING
+		|| live.pcm_state != expected_revoking->pcm_state || (buf_state & BM_VALID) == 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if ((buf_state & BM_IO_ERROR) != 0)
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((buf_state
+			  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_IN_PROGRESS)) != 0)
+		result = CLUSTER_PCM_OWN_BUSY;
+	else {
+		if (replace_resident) {
+			memcpy((char *)BufHdrGetBlock(buf), source_page, BLCKSZ);
+			buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
+		}
+		memcpy(block_data, source_page, BLCKSZ);
+		*out_page_lsn = PageGetLSN(source_page);
+		*out_page_scn = (uint64)((PageHeader)source_page)->pd_block_scn;
+		*out_revoking = live;
+		result = CLUSTER_PCM_OWN_OK;
+	}
+	UnlockBufHdr(buf, buf_state);
+	return result;
+}
+
 /*
  * Fence a clean N descriptor, refresh it from shared storage, and return one
  * immutable requester-as-source image.
@@ -13906,32 +14059,9 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 
 		if (result == CLUSTER_PCM_OWN_OK && LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
 			content_locked = true;
-			buf_state = LockBufHdr(buf);
-			if (!cluster_pcm_own_snapshot_matches_locked(buf, &live)
-				|| live.flags != PCM_OWN_FLAG_REVOKING || live.pcm_state != (uint8)PCM_STATE_N
-				|| (buf_state & BM_VALID) == 0)
-				result = CLUSTER_PCM_OWN_STALE;
-			else if ((buf_state & BM_IO_ERROR) != 0)
-				result = CLUSTER_PCM_OWN_CORRUPT;
-			else if ((buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)
-			{
-				/* PGRAC: REVOKING already blocks data writes, so dirt appearing
-				 * between the flush above and this recheck can only be an
-				 * idempotent hint-bit write.  Retry via BUSY; the next pass
-				 * flushes it and converges. */
-				result = CLUSTER_PCM_OWN_BUSY;
-			}
-			else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
-				result = CLUSTER_PCM_OWN_BUSY;
-			else {
-				memcpy((char *)BufHdrGetBlock(buf), scratch.data, BLCKSZ);
-				buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
-				memcpy(block_data, scratch.data, BLCKSZ);
-				*out_page_lsn = PageGetLSN((Page)scratch.data);
-				*out_page_scn = (uint64)((PageHeader)scratch.data)->pd_block_scn;
-				*out_revoking = live;
-			}
-			UnlockBufHdr(buf, buf_state);
+			result = cluster_bufmgr_pcm_own_copy_source_image_exact(
+				buf, &live, (Page)scratch.data, true, out_revoking, block_data,
+				out_page_lsn, out_page_scn);
 			LWLockRelease(content_lock);
 			content_locked = false;
 		} else if (result == CLUSTER_PCM_OWN_OK)
@@ -14186,6 +14316,7 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	SMgrRelation reln;
 	LWLock *content_lock;
 	Page local_page;
+	Page selected_page = NULL;
 	Page storage_page;
 	SCN local_scn;
 	SCN storage_scn;
@@ -14193,6 +14324,7 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 	uint32 observed_buf_state = 0;
 	uint8 observed_buffer_type = 0;
 	bool local_covers;
+	bool replace_resident = false;
 	bool storage_covers;
 	volatile bool content_locked = false;
 	volatile bool private_pinned = false;
@@ -14361,20 +14493,17 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 						 && (!storage_covers || !SCN_VALID(storage_scn)
 							 || (SCN_VALID(local_scn)
 								 && scn_local(local_scn) >= scn_local(storage_scn)))) {
-					memcpy(block_data, local_page, BLCKSZ);
-					*out_page_lsn = PageGetLSN(local_page);
-					*out_page_scn = (uint64)local_scn;
-					*out_revoking = live;
+					selected_page = local_page;
 				} else {
-					memcpy((char *)BufHdrGetBlock(buf), scratch.data, BLCKSZ);
-					buf->buffer_type = (uint8)BUF_TYPE_CURRENT;
-					memcpy(block_data, scratch.data, BLCKSZ);
-					*out_page_lsn = PageGetLSN(storage_page);
-					*out_page_scn = (uint64)storage_scn;
-					*out_revoking = live;
+					selected_page = storage_page;
+					replace_resident = true;
 				}
 			}
 			UnlockBufHdr(buf, buf_state);
+			if (result == CLUSTER_PCM_OWN_OK)
+				result = cluster_bufmgr_pcm_own_copy_source_image_exact(
+					buf, &live, selected_page, replace_resident, out_revoking,
+					block_data, out_page_lsn, out_page_scn);
 			LWLockRelease(content_lock);
 			content_locked = false;
 		} else if (result == CLUSTER_PCM_OWN_OK) {

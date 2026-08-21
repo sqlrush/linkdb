@@ -3656,7 +3656,12 @@ UT_TEST(test_pcm_x_requester_fetch_revalidates_queue_and_reservation_before_inst
 	UT_ASSERT_NOT_NULL(install);
 	UT_ASSERT_NOT_NULL(install_end);
 	if (install != NULL && install_end != NULL) {
+		const char *reserved_write_proof
+			= strstr(install, "gcs_block_pcm_x_reserved_image_write_exact(");
+
 		UT_ASSERT_NOT_NULL(strstr(install, "const PcmXRuntimeSnapshot *request_runtime"));
+		UT_ASSERT_NOT_NULL(reserved_write_proof);
+		UT_ASSERT_NULL(strstr(install, "cluster_bufmgr_pcm_x_content_write_permitted("));
 		install_runtime_before = strstr(install, "cluster_gcs_pcm_x_requester_runtime_exact(");
 		install_publish = strstr(install, "cluster_bufmgr_pcm_own_publish_installed_x_image(");
 		install_runtime_after
@@ -3671,6 +3676,20 @@ UT_TEST(test_pcm_x_requester_fetch_revalidates_queue_and_reservation_before_inst
 			UT_ASSERT(install_runtime_before < install_publish
 					  && install_publish < install_runtime_after
 					  && install_runtime_after < install_end);
+	}
+	{
+		const char *proof = strstr(source, "\ngcs_block_pcm_x_reserved_image_write_exact(");
+		const char *proof_end = proof != NULL ? strstr(proof, "\n}\n") : NULL;
+
+		UT_ASSERT_NOT_NULL(proof);
+		UT_ASSERT_NOT_NULL(proof_end);
+		if (proof != NULL && proof_end != NULL) {
+			UT_ASSERT_NOT_NULL(strstr(proof, "cluster_pcm_x_image_fetch_reservation_exact("));
+			UT_ASSERT_NOT_NULL(strstr(proof, "live->writer_activation_token == reservation_token"));
+			UT_ASSERT_NOT_NULL(strstr(proof, "live->resource_x_activation_generation == 0"));
+			UT_ASSERT_NOT_NULL(strstr(proof, "base->writer_activation_token == 0"));
+			UT_ASSERT_NOT_NULL(strstr(proof, "base->resource_x_activation_generation == 0"));
+		}
 	}
 	reply_handler = strstr(source, "\ncluster_gcs_handle_block_reply_envelope(");
 	UT_ASSERT_NOT_NULL(reply_handler);
@@ -5824,11 +5843,52 @@ UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
 	free(source);
 }
 
+UT_TEST(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake)
+{
+	static const char *const actor_contract[]
+		= { "claimed_epoch = pg_atomic_compare_exchange_u64(",
+			"if (!claimed_epoch && expected_epoch == new_epoch)",
+			"resource_x_reconfig_actor_active",
+			"resource_x_reconfig_completed_epoch", "return true;",
+			"runtime = cluster_pcm_x_runtime_snapshot()",
+			"cluster_resource_x_reconfig_freeze_pending(",
+			"cluster_pcm_x_runtime_fail_closed()", "gcs_block_pcm_x_collect_formation(",
+			"cluster_pcm_x_runtime_reform(", "cluster_pcm_x_runtime_snapshot()",
+			"cluster_resource_x_reconfig_bind_new_formation_exact(",
+			"cluster_resource_x_reconfig_sweep(", "CHECK_FOR_INTERRUPTS()",
+			"cluster_resource_x_reconfig_thaw_exact(",
+			"cluster_resource_x_reconfig_stats_snapshot(",
+			"resource_x_reconfig_actor_active, 0" };
+	static const char *const hook_contract[]
+		= { "gcs_block_resource_x_reconfig_epoch(new_epoch)",
+			"cluster_gcs_block_dedup_r4_route_sweep_epoch(new_epoch)",
+			"ConditionVariableBroadcast(&slot->reply_cv)" };
+	static const char *const observer_contract[]
+		= { "gcs_block_resource_x_reconfig_epoch(cluster_epoch_get_current())",
+			"runtime = cluster_pcm_x_runtime_snapshot()",
+			"cluster_pcm_lock_resource_x_gate_bind_formation_exact(runtime.gate_generation)" };
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		source, "\ngcs_block_resource_x_reconfig_epoch(",
+		"\n\n/* ============================================================\n * PGRAC: spec-2.34 D4",
+		actor_contract, lengthof(actor_contract));
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_block_on_epoch_advance(",
+		"\n\n/* ============================================================\n * PGRAC MODIFICATIONS by SqlRush — spec-5.13 D5",
+		hook_contract, lengthof(hook_contract));
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_block_pcm_x_formation_tick(",
+		"\n\n/*\n * PCM-X is an application protocol", observer_contract,
+		lengthof(observer_contract));
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(107);
+	UT_PLAN(108);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5936,6 +5996,7 @@ main(void)
 	UT_RUN(test_pi_durable_note_receive_is_observable_before_apply);
 	UT_RUN(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain);
 	UT_RUN(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return);
+	UT_RUN(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -157,6 +157,13 @@ extern ClusterPcmOwnResult cluster_pcm_own_resource_x_activation_bind_exact(
 extern ClusterPcmOwnResult cluster_pcm_own_resource_x_activation_clear_exact(
 	int buf_id, uint64 expected_generation, uint64 reservation_token,
 	uint64 acquisition_generation);
+/* R8 recovery-owner clear: unlike normal T3, this advances the descriptor
+ * ownership generation while clearing both activation fields.  The bufmgr
+ * caller changes the descriptor to a non-writable N+PI shape under the same
+ * header-lock hold. */
+extern ClusterPcmOwnResult cluster_pcm_own_resource_x_neutralize_exact(
+	int buf_id, uint64 expected_generation, uint64 reservation_token,
+	uint64 acquisition_generation, uint64 *out_neutral_generation);
 /* PCM-X retained-image revoke: commit advances the ownership generation but
  * deliberately leaves the exact REVOKING token live until DRAIN proves the
  * immutable image record is no longer needed.  Release clears only that

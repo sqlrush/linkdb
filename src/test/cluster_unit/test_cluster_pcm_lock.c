@@ -50,6 +50,7 @@
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
@@ -88,7 +89,7 @@ cluster_lms_get_shard_master_generation(void)
 	return ut_lms_master_generation;
 }
 
-#define FAKE_PCM_MAX_ENTRIES 8
+#define FAKE_PCM_MAX_ENTRIES 24
 #define FAKE_PCM_ENTRY_BYTES 1024
 
 static union {
@@ -158,6 +159,26 @@ static PcmAuthoritySnapshot fake_local_read_image_expected;
 static int fake_local_x_transfer_count = 0;
 static int fake_local_x_transfer_holder = -1;
 static PcmAuthoritySnapshot fake_local_x_transfer_expected;
+static ResourceXSidecarNeutralizeResult fake_neutralize_result
+	= RESOURCE_X_SIDECAR_NEUTRALIZED;
+static int fake_neutralize_count = 0;
+static bool fake_neutralize_without_pcm_lock = false;
+static BufferTag fake_neutralize_tag;
+static uint64 fake_neutralize_formation = 0;
+static uint64 fake_neutralize_generation = 0;
+
+ResourceXSidecarNeutralizeResult
+cluster_bufmgr_resource_x_neutralize_exact(const BufferTag *tag, uint64 old_formation,
+										   uint64 acquisition_generation)
+{
+	fake_neutralize_count++;
+	fake_neutralize_without_pcm_lock = fake_lwlock_depth == 0;
+	if (tag != NULL)
+		fake_neutralize_tag = *tag;
+	fake_neutralize_formation = old_formation;
+	fake_neutralize_generation = acquisition_generation;
+	return fake_neutralize_result;
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -232,6 +253,12 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_local_read_image_holder = -1;
 	memset(&fake_local_read_image_expected, 0, sizeof(fake_local_read_image_expected));
 	fake_local_x_upgrade_result = false;
+	fake_neutralize_result = RESOURCE_X_SIDECAR_NEUTRALIZED;
+	fake_neutralize_count = 0;
+	fake_neutralize_without_pcm_lock = false;
+	memset(&fake_neutralize_tag, 0, sizeof(fake_neutralize_tag));
+	fake_neutralize_formation = 0;
+	fake_neutralize_generation = 0;
 	cluster_node_id = 0;
 	NBuffers = max_entries;
 	cluster_pcm_grd_max_entries = max_entries;
@@ -1201,6 +1228,255 @@ UT_TEST(test_resource_x_executor_admission_is_formation_exact_and_balanced)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 0);
 	cluster_pcm_lock_resource_x_executor_leave(&gate);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 0);
+}
+
+UT_TEST(test_resource_x_reconfig_freeze_closes_activation_drains_and_thaws_empty)
+{
+	BufferTag tag = make_tag(68);
+	ResourceXAcquisitionRef old_ref;
+	ResourceXAcquisitionRef new_ref;
+	ResourceXActivationGateToken old_gate;
+	ResourceXActivationGateToken refused;
+	ResourceXActivationGateToken new_gate;
+	ResourceXReconfigToken token;
+	ResourceXReconfigToken duplicate;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigStats stats;
+
+	reset_fake_pcm_runtime(4);
+	old_ref = make_resource_x_acquisition_ref(tag, 2, 17, 41);
+	new_ref = make_resource_x_acquisition_ref(tag, 2, 18, 42);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(old_ref.formation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_executor_enter(&old_ref, &old_gate));
+
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	UT_ASSERT_EQ(token.old_formation, 17);
+	UT_ASSERT_EQ(token.new_formation, 18);
+	UT_ASSERT_EQ(token.freeze_generation, 1);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &duplicate));
+	UT_ASSERT_EQ(memcmp(&duplicate, &token, sizeof(token)), 0);
+
+	memset(&refused, 0xA5, sizeof(refused));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_executor_enter(&old_ref, &refused));
+	UT_ASSERT_EQ(refused.active, 0);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_executor_enter(&new_ref, &refused));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 1);
+	cluster_pcm_lock_resource_x_executor_leave(&old_gate);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 0);
+
+	memset(&batch, 0xA5, sizeof(batch));
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_DONE);
+	UT_ASSERT_EQ(batch.examined_count, 4);
+	UT_ASSERT_EQ(batch.complete_wrap, 1);
+	UT_ASSERT_EQ(batch.zero_residual, 1);
+	UT_ASSERT(cluster_resource_x_reconfig_thaw_exact(&token));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_executor_enter(&old_ref, &refused));
+	UT_ASSERT(cluster_pcm_lock_resource_x_executor_enter(&new_ref, &new_gate));
+	cluster_pcm_lock_resource_x_executor_leave(&new_gate);
+
+	cluster_resource_x_reconfig_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.freeze_count, 1);
+	UT_ASSERT_EQ(stats.slot_examined_count, 4);
+	UT_ASSERT_EQ(stats.blocked_count, 0);
+	UT_ASSERT_EQ(stats.thaw_count, 1);
+}
+
+UT_TEST(test_resource_x_reconfig_pending_freeze_binds_only_published_formation)
+{
+	ResourceXReconfigToken token;
+	ResourceXReconfigToken pending_copy;
+	ResourceXReconfigToken replay;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigStats stats;
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze_pending(17, &token));
+	UT_ASSERT_EQ(token.old_formation, 17);
+	UT_ASSERT_EQ(token.new_formation, 0);
+	UT_ASSERT_EQ(token.freeze_generation, 1);
+	pending_copy = token;
+	UT_ASSERT(cluster_resource_x_reconfig_bind_new_formation_exact(&token, 18));
+	UT_ASSERT_EQ(token.new_formation, 18);
+	UT_ASSERT(cluster_resource_x_reconfig_bind_new_formation_exact(&token, 18));
+	UT_ASSERT(cluster_resource_x_reconfig_bind_new_formation_exact(&pending_copy, 18));
+	UT_ASSERT_EQ(pending_copy.new_formation, 18);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze_pending(17, &replay));
+	UT_ASSERT_EQ(memcmp(&replay, &token, sizeof(token)), 0);
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_DONE);
+	UT_ASSERT(cluster_resource_x_reconfig_thaw_exact(&token));
+	cluster_resource_x_reconfig_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.freeze_count, 1);
+	UT_ASSERT_EQ(stats.thaw_count, 1);
+}
+
+UT_TEST(test_resource_x_reconfig_nested_and_generation_exhaustion_fail_closed)
+{
+	ResourceXReconfigToken token;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigStats stats;
+	uint64 next = 0;
+
+	UT_ASSERT(cluster_resource_x_next_freeze_generation(0, &next));
+	UT_ASSERT_EQ(next, 1);
+	UT_ASSERT(cluster_resource_x_next_freeze_generation(UINT64_MAX - 2, &next));
+	UT_ASSERT_EQ(next, UINT64_MAX - 1);
+	UT_ASSERT(!cluster_resource_x_next_freeze_generation(UINT64_MAX - 1, &next));
+	UT_ASSERT_EQ(next, 0);
+	UT_ASSERT(!cluster_resource_x_next_freeze_generation(UINT64_MAX, &next));
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	UT_ASSERT(!cluster_resource_x_reconfig_freeze(17, 19, &token));
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_CORRUPT);
+	UT_ASSERT(!cluster_resource_x_reconfig_thaw_exact(&token));
+	cluster_resource_x_reconfig_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.freeze_count, 1);
+	UT_ASSERT_EQ(stats.blocked_count, 1);
+	UT_ASSERT_EQ(stats.thaw_count, 0);
+}
+
+UT_TEST(test_resource_x_reconfig_cursor_covers_seventeen_slots_in_bounded_calls)
+{
+	ResourceXReconfigToken token;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigStats stats;
+	ResourceXReconfigResult result;
+	int i;
+
+	reset_fake_pcm_runtime(17);
+	for (i = 0; i < 9; i++) {
+		BufferTag tag = make_tag((uint32)(100 + i * 2));
+
+		cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+		cluster_pcm_lock_release(tag);
+	}
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	UT_ASSERT_EQ(cluster_pcm_grd_count(), 9);
+	UT_EXPECT_EREPORT(cluster_pcm_lock_acquire(make_tag(999), PCM_LOCK_MODE_S));
+	UT_ASSERT_EQ(cluster_pcm_grd_count(), 9);
+	for (i = 0; i < 5; i++) {
+		result = cluster_resource_x_reconfig_sweep(&token, 4, &batch);
+		UT_ASSERT_EQ(batch.examined_count, i < 4 ? 4 : 1);
+		UT_ASSERT_EQ(batch.next_state_index, i < 4 ? (uint64)(i + 1) * 4 : 0);
+		if (i < 4) {
+			UT_ASSERT_EQ(result, RESOURCE_X_RECONFIG_MORE);
+			UT_ASSERT_EQ(batch.complete_wrap, 0);
+			UT_ASSERT_EQ(batch.zero_residual, 0);
+		}
+		else {
+			UT_ASSERT_EQ(result, RESOURCE_X_RECONFIG_DONE);
+			UT_ASSERT_EQ(batch.complete_wrap, 1);
+			UT_ASSERT_EQ(batch.zero_residual, 1);
+		}
+	}
+	UT_ASSERT(cluster_resource_x_reconfig_thaw_exact(&token));
+	cluster_resource_x_reconfig_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.slot_examined_count, 17);
+}
+
+UT_TEST(test_resource_x_reconfig_t1_orphan_blocks_once_and_retains_evidence)
+{
+	BufferTag tag = make_tag(140);
+	ResourceXAcquisitionRef ref;
+	ResourceXReconfigToken token;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigStats stats;
+
+	reset_fake_pcm_runtime(4);
+	ref = make_resource_x_acquisition_ref(tag, 2, 17, 41);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_ORPHAN);
+	UT_ASSERT_EQ(batch.orphan_count, 1);
+	UT_ASSERT_EQ(batch.residual_count, 1);
+	UT_ASSERT(!cluster_resource_x_reconfig_thaw_exact(&token));
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_CORRUPT);
+	cluster_resource_x_reconfig_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.orphan_count, 1);
+	UT_ASSERT_EQ(stats.blocked_count, 1);
+}
+
+UT_TEST(test_resource_x_reconfig_t2_neutralizes_outside_entry_lock_then_blocks_orphan)
+{
+	BufferTag tag = make_tag(141);
+	ResourceXAcquisitionRef ref;
+	ResourceXBufferInstallProof proof;
+	ResourceXReconfigToken token;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigStats stats;
+
+	reset_fake_pcm_runtime(4);
+	ref = make_resource_x_acquisition_ref(tag, 2, 17, 41);
+	proof.ownership_generation = 7;
+	proof.writer_activation_token = 11;
+	proof.resource_x_activation_generation = 41;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(&ref, &proof),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_ORPHAN);
+	UT_ASSERT_EQ(fake_neutralize_count, 1);
+	UT_ASSERT(fake_neutralize_without_pcm_lock);
+	UT_ASSERT(BufferTagsEqual(&fake_neutralize_tag, &tag));
+	UT_ASSERT_EQ(fake_neutralize_formation, 17);
+	UT_ASSERT_EQ(fake_neutralize_generation, 41);
+	UT_ASSERT_EQ(batch.sidecar_neutralized_count, 1);
+	cluster_resource_x_reconfig_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.sidecar_neutralized_count, 1);
+	UT_ASSERT_EQ(stats.orphan_count, 1);
+	UT_ASSERT_EQ(stats.blocked_count, 1);
+}
+
+UT_TEST(test_resource_x_reconfig_t2_newer_sidecar_survives_and_blocks_orphan)
+{
+	BufferTag tag = make_tag(142);
+	ResourceXAcquisitionRef ref;
+	ResourceXBufferInstallProof proof;
+	ResourceXReconfigToken token;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigStats stats;
+
+	reset_fake_pcm_runtime(4);
+	fake_neutralize_result = RESOURCE_X_SIDECAR_SUCCESSOR;
+	ref = make_resource_x_acquisition_ref(tag, 2, 17, 42);
+	proof.ownership_generation = 8;
+	proof.writer_activation_token = 12;
+	proof.resource_x_activation_generation = 42;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(&ref, &proof),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_ORPHAN);
+	UT_ASSERT_EQ(fake_neutralize_count, 1);
+	UT_ASSERT(fake_neutralize_without_pcm_lock);
+	UT_ASSERT_EQ(batch.sidecar_neutralized_count, 0);
+	UT_ASSERT_EQ(batch.orphan_count, 1);
+	cluster_resource_x_reconfig_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.sidecar_neutralized_count, 0);
+	UT_ASSERT_EQ(stats.sidecar_stale_count, 1);
+	UT_ASSERT_EQ(stats.orphan_count, 1);
+	UT_ASSERT_EQ(stats.blocked_count, 1);
 }
 
 UT_TEST(test_pcm_grd_convert_queue_placeholder_remains_null)
@@ -2633,7 +2909,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(63);
+	UT_PLAN(70);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -2662,6 +2938,13 @@ main(void)
 	UT_RUN(test_pcm_grd_entry_abi_includes_resource_x_executor_state);
 	UT_RUN(test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress);
 	UT_RUN(test_resource_x_executor_admission_is_formation_exact_and_balanced);
+	UT_RUN(test_resource_x_reconfig_freeze_closes_activation_drains_and_thaws_empty);
+	UT_RUN(test_resource_x_reconfig_pending_freeze_binds_only_published_formation);
+	UT_RUN(test_resource_x_reconfig_nested_and_generation_exhaustion_fail_closed);
+	UT_RUN(test_resource_x_reconfig_cursor_covers_seventeen_slots_in_bounded_calls);
+	UT_RUN(test_resource_x_reconfig_t1_orphan_blocks_once_and_retains_evidence);
+	UT_RUN(test_resource_x_reconfig_t2_neutralizes_outside_entry_lock_then_blocks_orphan);
+	UT_RUN(test_resource_x_reconfig_t2_newer_sidecar_survives_and_blocks_orphan);
 	UT_RUN(test_pcm_grd_convert_queue_placeholder_remains_null);
 	UT_RUN(test_pcm_real_wait_event_call_sites_are_exercised);
 	UT_RUN(test_pcm_H1_same_node_s_refcount_increments);

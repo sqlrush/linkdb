@@ -1980,7 +1980,8 @@ test_cluster_lck: test_cluster_lck.c unit_test.h \
 # ----------
 # Run all tests sequentially
 # ----------
-check: all check_cluster_undo_segment_half_page_oversized
+check: all check_cluster_undo_segment_half_page_oversized \
+	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage
 	@echo "# pgrac cluster unit tests"
 	@total=0; failed=0; \
 	for t in $(TESTS); do \
@@ -1994,6 +1995,16 @@ check: all check_cluster_undo_segment_half_page_oversized
 	else \
 		echo "# All $$total binaries passed"; \
 	fi
+
+check_pcm_x_write_gate_ast:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/test/cluster_unit/test_pcm_x_write_gate_ast.py
+
+check_pcm_x_write_gate_coverage:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/tools/check_pcm_x_write_gate_ast.py \
+		--source-root "$(top_srcdir)" --compile-directory "$(CURDIR)" \
+		--clang "$(CC)" --cflags '$(CFLAGS)' --cppflags '$(CPPFLAGS)'
 
 
 # ----------
@@ -2012,7 +2023,8 @@ clean distclean maintainer-clean:
 install installdirs uninstall installcheck:
 	@:
 
-.PHONY: all check check_cluster_undo_segment_half_page_oversized clean distclean \
+.PHONY: all check check_cluster_undo_segment_half_page_oversized \
+	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage clean distclean \
         maintainer-clean install installdirs uninstall installcheck
 
 # Spec 8.4A U9: this deliberately oversized fixture must be rejected by the

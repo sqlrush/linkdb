@@ -309,6 +309,13 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 retransmit_send_count;
 	pg_atomic_uint64 retransmit_exhausted_count;
 	pg_atomic_uint64 epoch_invalidate_wake_count;
+	/* R8 D8-3: one exact Resource-X formation sweep per observed epoch.
+	 * in_progress retains an interrupted pre-publication episode; completed
+	 * makes duplicate epoch callbacks idempotent. */
+	pg_atomic_uint64 resource_x_reconfig_in_progress_epoch;
+	pg_atomic_uint64 resource_x_reconfig_actor_active;
+	pg_atomic_uint64 resource_x_reconfig_old_formation;
+	pg_atomic_uint64 resource_x_reconfig_completed_epoch;
 	pg_atomic_uint64 stale_reply_drop_count;
 	/* PGRAC: GCS-race round-2 RC-F — requester completion proofs emitted. */
 	pg_atomic_uint64 done_sent_count;
@@ -685,6 +692,10 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->retransmit_send_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->retransmit_exhausted_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->epoch_invalidate_wake_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_in_progress_epoch, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_actor_active, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->stale_reply_drop_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_enqueue_drop_count, 0);
@@ -1728,6 +1739,7 @@ gcs_block_compute_redeclare_checksum(const GcsBlockRedeclarePayload *p)
  * sees a monotonic LSN across nodes.
  */
 static void
+PGRAC_PCM_X_FENCE_DOMINATED(cluster_bufmgr_pcm_x_content_write_permitted)
 gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page_lsn)
 {
 	LWLock *content_lock;
@@ -1755,6 +1767,25 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
 }
 
 
+/* The network-fetch installer is the immutable-image half of the existing
+ * queue reservation, not an ordinary writer.  Its exact GRANT_PENDING token
+ * is deliberately nonzero until publish/commit; require that sole legacy
+ * owner and an entirely absent Resource-X activation before touching bytes.
+ * The later target T2 owner captures these published bytes through its own
+ * exact acquisition-generation proof. */
+static bool
+gcs_block_pcm_x_reserved_image_write_exact(const ClusterPcmOwnSnapshot *live,
+											   const ClusterPcmOwnSnapshot *base,
+											   uint64 reservation_token)
+{
+	return cluster_pcm_x_image_fetch_reservation_exact(live, base, reservation_token)
+		   && live->writer_activation_token == reservation_token
+		   && live->resource_x_activation_generation == 0
+		   && base->writer_activation_token == 0
+		   && base->resource_x_activation_generation == 0;
+}
+
+
 /*
  * Install one immutable PCM-X holder image without owning the surrounding
  * reservation lifecycle.  The queue driver began GRANT_PENDING and remains
@@ -1763,6 +1794,7 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
  * lifecycle can never turn a valid image into a write to the wrong page.
  */
 static PcmXQueueResult
+PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
 gcs_block_pcm_x_install_reserved_image_exact(BufferDesc *buf,
 											 const ClusterPcmOwnSnapshot *reservation_base,
 											 uint64 reservation_token, const char *block_data,
@@ -1783,15 +1815,16 @@ gcs_block_pcm_x_install_reserved_image_exact(BufferDesc *buf,
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK)
 		return gcs_block_pcm_x_fetch_own_result(own_result);
-	if (!cluster_pcm_x_image_fetch_reservation_exact(&live, reservation_base, reservation_token))
+	if (!gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base,
+													 reservation_token))
 		return gcs_block_pcm_x_fetch_reservation_mismatch(&live);
 
 	content_lock = BufferDescriptorGetContentLock(buf);
 	LWLockAcquire(content_lock, LW_EXCLUSIVE);
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK
-		|| !cluster_pcm_x_image_fetch_reservation_exact(&live, reservation_base,
-														reservation_token)) {
+		|| !gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base,
+															 reservation_token)) {
 		LWLockRelease(content_lock);
 		return own_result != CLUSTER_PCM_OWN_OK ? gcs_block_pcm_x_fetch_own_result(own_result)
 												: gcs_block_pcm_x_fetch_reservation_mismatch(&live);
@@ -1801,7 +1834,6 @@ gcs_block_pcm_x_install_reserved_image_exact(BufferDesc *buf,
 		LWLockRelease(content_lock);
 		return PCM_X_QUEUE_NOT_READY;
 	}
-
 	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
 	memcpy(page, block_data, GCS_BLOCK_DATA_SIZE);
 	gcs_block_note_install_copy();
@@ -1819,7 +1851,8 @@ gcs_block_pcm_x_install_reserved_image_exact(BufferDesc *buf,
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (own_result != CLUSTER_PCM_OWN_OK
-		|| !cluster_pcm_x_image_fetch_reservation_exact(&live, reservation_base, reservation_token)
+		|| !gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base,
+															 reservation_token)
 		|| !cluster_gcs_pcm_x_requester_runtime_exact(request_runtime, &runtime)) {
 		/* Bytes were copied while the reservation identity changed.  Core has
 		 * no sound rollback image for that boundary. */
@@ -12832,6 +12865,7 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 static void gcs_block_pcm_x_resource_retry_tick(
 	const PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT]);
 static void gcs_block_pcm_x_terminal_retry_tick(void);
+static bool gcs_block_resource_x_reconfig_epoch(uint64 new_epoch);
 static void gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result,
 												 int32 peer_node, Size cursor_before,
 												 Size cursor_after, const BufferTag *tag,
@@ -12860,6 +12894,13 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 	uint64 self_session_before;
 	bool rebase_all = false;
 	int i;
+
+	/* Remote epoch observers reach this same LMON-owned producer.  Reconcile
+	 * their local Resource-X formation before ordinary retry/bind work can
+	 * advance the PCM-X runtime independently. */
+	if (cluster_epoch_get_current() != CLUSTER_EPOCH_INITIAL
+		&& !gcs_block_resource_x_reconfig_epoch(cluster_epoch_get_current()))
+		return;
 
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state == PCM_X_RUNTIME_ACTIVE) {
@@ -20281,6 +20322,173 @@ cluster_gcs_get_block_dedup_pcm_x_failclosed_count(void)
 }
 
 
+/* R8 D8-3/D8-6: close the target Resource-X formation before the existing
+ * epoch wake becomes visible.  Each sweep call is fixed at four slots and a
+ * checkpoint performs at most sixteen calls (64 slots).  The coordinator may
+ * need several interruptible checkpoints, but never publishes the epoch from
+ * this callback until an exact complete wrap has thawed the new formation. */
+#define GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET 4
+#define GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT 16
+
+static bool
+gcs_block_resource_x_reconfig_epoch(uint64 new_epoch)
+{
+	PcmXPeerBinding bindings_after[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXPeerBinding bindings_before[PCM_X_PROTOCOL_NODE_LIMIT];
+	PcmXRuntimeSnapshot runtime;
+	PcmXRuntimeSnapshot runtime_after;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigResult result;
+	ResourceXReconfigStats stats;
+	ResourceXReconfigToken token;
+	TimestampTz deadline;
+	uint64 completed_epoch;
+	uint64 epoch_after;
+	uint64 epoch_before;
+	uint64 expected_actor;
+	uint64 expected_epoch;
+	uint64 self_session_after;
+	uint64 self_session_before;
+	uint32 calls;
+	bool claimed_epoch;
+
+	if (ClusterGcsBlock == NULL)
+		return true;
+	if (new_epoch == 0 || new_epoch == UINT64_MAX)
+		return false;
+	completed_epoch
+		= pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch);
+	if (new_epoch <= completed_epoch)
+		return true;
+
+	expected_epoch = 0;
+	claimed_epoch = pg_atomic_compare_exchange_u64(
+		&ClusterGcsBlock->resource_x_reconfig_in_progress_epoch, &expected_epoch,
+		new_epoch);
+	if (!claimed_epoch && expected_epoch != new_epoch)
+		return false;
+	deadline = GetCurrentTimestamp()
+			   + (TimestampTz)Max(cluster_gcs_reply_timeout_ms, 1) * (TimestampTz)1000;
+	if (!claimed_epoch && expected_epoch == new_epoch) {
+		/* The epoch is an episode identity, not an actor lease.  A prior
+		 * actor may have returned a transient no-progress result; only the
+		 * actor_active CAS below decides who may resume it. */
+	}
+	for (;;) {
+		expected_actor = 0;
+		if (pg_atomic_compare_exchange_u64(
+				&ClusterGcsBlock->resource_x_reconfig_actor_active, &expected_actor,
+				new_epoch))
+			break;
+		if (expected_actor != new_epoch)
+			return false;
+		completed_epoch
+			= pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch);
+		if (completed_epoch >= new_epoch)
+			return true;
+		if (GetCurrentTimestamp() >= deadline)
+			return false;
+		pg_usleep(1000L);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (claimed_epoch && runtime.gate_generation == 0) {
+		/* No target formation has ever opened, so there is no Resource-X
+		 * authority to sweep for this epoch. */
+		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch,
+							new_epoch);
+		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation, 0);
+		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_in_progress_epoch, 0);
+		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_actor_active, 0);
+		return true;
+	}
+	if (claimed_epoch)
+		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation,
+							(uint64)runtime.gate_generation);
+	expected_epoch
+		= pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation);
+	if (expected_epoch == 0
+		|| !cluster_resource_x_reconfig_freeze_pending(expected_epoch, &token))
+		goto actor_failed;
+
+	deadline = GetCurrentTimestamp()
+			   + (TimestampTz)Max(cluster_gcs_reply_timeout_ms, 1) * (TimestampTz)1000;
+	if (token.new_formation == 0) {
+		/* Close the old PCM-X producer while Resource-X admission is already
+		 * frozen.  Only the normal reform owner may publish the successor
+		 * formation; R8 never predicts it with arithmetic. */
+		cluster_pcm_x_runtime_fail_closed();
+		while (cluster_pcm_lock_resource_x_activation_inflight_count() != 0) {
+			if (GetCurrentTimestamp() >= deadline)
+				goto actor_failed;
+			pg_usleep(1000L);
+			CHECK_FOR_INTERRUPTS();
+		}
+		if (!gcs_block_pcm_x_collect_formation(bindings_before, &epoch_before,
+												&self_session_before, NULL)
+			|| !gcs_block_pcm_x_collect_formation(bindings_after, &epoch_after,
+												 &self_session_after, NULL)
+			|| !cluster_gcs_pcm_x_formation_samples_stable(true, bindings_before, true,
+																 bindings_after)
+			|| epoch_before != new_epoch || epoch_after != new_epoch
+			|| self_session_before != self_session_after)
+			goto actor_failed;
+		if (!cluster_pcm_x_runtime_reform(new_epoch, bindings_before))
+			goto actor_failed;
+		runtime_after = cluster_pcm_x_runtime_snapshot();
+		if (runtime_after.state != PCM_X_RUNTIME_ACTIVE
+			|| runtime_after.gate_generation == 0
+			|| (uint64)runtime_after.gate_generation == token.old_formation)
+			goto actor_failed;
+		if (!cluster_resource_x_reconfig_bind_new_formation_exact(
+				&token, (uint64)runtime_after.gate_generation))
+			goto actor_failed;
+	}
+	else if (runtime.state != PCM_X_RUNTIME_ACTIVE
+			 || (uint64)runtime.gate_generation != token.new_formation)
+		goto actor_failed;
+
+	for (;;) {
+		for (calls = 0; calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT;
+			 calls++) {
+			result = cluster_resource_x_reconfig_sweep(
+				&token, GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET, &batch);
+			if (result == RESOURCE_X_RECONFIG_DONE)
+				goto complete;
+			if (result != RESOURCE_X_RECONFIG_MORE
+				&& result != RESOURCE_X_RECONFIG_RETRY)
+				goto actor_failed;
+		}
+		if (GetCurrentTimestamp() >= deadline)
+			goto actor_failed;
+		CHECK_FOR_INTERRUPTS();
+	}
+
+complete:
+	if (!cluster_resource_x_reconfig_thaw_exact(&token))
+		goto actor_failed;
+	cluster_resource_x_reconfig_stats_snapshot(&stats);
+	elog(LOG,
+		 "Resource-X reconfiguration completed for epoch %llu, formation %llu->%llu "
+		 "(freeze=%llu examined=%llu neutralized=%llu successor=%llu thaw=%llu)",
+		 (unsigned long long)new_epoch, (unsigned long long)token.old_formation,
+		 (unsigned long long)token.new_formation, (unsigned long long)stats.freeze_count,
+		 (unsigned long long)stats.slot_examined_count,
+		 (unsigned long long)stats.sidecar_neutralized_count,
+		 (unsigned long long)stats.successor_count, (unsigned long long)stats.thaw_count);
+	pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch, new_epoch);
+	pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation, 0);
+	pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_in_progress_epoch, 0);
+	pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_actor_active, 0);
+	return true;
+
+actor_failed:
+	pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_actor_active, 0);
+	return false;
+}
+
+
 /* ============================================================
  * PGRAC: spec-2.34 D4 — eager wake on epoch advance.
  *
@@ -20302,9 +20510,24 @@ cluster_gcs_get_block_dedup_pcm_x_failclosed_count(void)
 void
 cluster_gcs_block_on_epoch_advance(uint64 new_epoch)
 {
+	ResourceXReconfigStats resource_x_stats;
 	int b;
 	int j;
 
+	if (!gcs_block_resource_x_reconfig_epoch(new_epoch)) {
+		cluster_pcm_x_runtime_fail_closed();
+		cluster_resource_x_reconfig_stats_snapshot(&resource_x_stats);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("Resource-X reconfiguration blocked epoch %llu",
+						(unsigned long long)new_epoch),
+				 errdetail("freeze=%llu examined=%llu orphan=%llu stale=%llu blocked=%llu",
+						   (unsigned long long)resource_x_stats.freeze_count,
+						   (unsigned long long)resource_x_stats.slot_examined_count,
+						   (unsigned long long)resource_x_stats.orphan_count,
+						   (unsigned long long)resource_x_stats.sidecar_stale_count,
+						   (unsigned long long)resource_x_stats.blocked_count)));
+	}
 	(void)cluster_gcs_block_dedup_r4_route_sweep_epoch(new_epoch);
 	if (gcs_block_backend_blocks == NULL || ClusterGcsBlock == NULL)
 		return; /* not initialized — nothing to invalidate */

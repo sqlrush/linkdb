@@ -250,6 +250,10 @@ my $actor_ok = poll_query_until_timeout(
 ok($actor_ok,
 	'L5 ACTOR node0 pg_cluster_reconfig_state.event_id != 0 within 15s');
 
+ok($pair->node0->log_contains(
+		qr/Resource-X reconfiguration completed for epoch \d+, formation \d+->\d+ .*thaw=1/),
+	'L5b Resource-X production actor completed exact freeze/sweep/thaw before publication');
+
 
 # ----------
 # L6: Coordinator deterministic min(survivor_set).
@@ -298,8 +302,11 @@ is($pair->node0->safe_psql('postgres',
 	't', 'L8 node0 still in_quorum=t (qvotec disks healthy)');
 
 
-# Cleanup — stop the pair (handles peers in any CSSD state).
-$pair->stop_pair;
+# Cleanup — node1 is the already-excluded target of this test.  Stop it before
+# the sole survivor so cleanup does not manufacture a second fail-stop episode
+# (that repeated-failure/recovery matrix is Stage 9, not this CURRENT slice).
+$pair->node1->stop('fast');
+$pair->node0->stop('fast');
 
 
 done_testing();
