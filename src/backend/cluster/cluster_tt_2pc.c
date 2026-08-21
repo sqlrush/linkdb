@@ -470,9 +470,15 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 			ClusterTTStatusSourceRequest source_request;
 			ClusterTTStatusSourceResult source_result;
 			ClusterTTStatusHintSourceRequest hint_request;
+			uint16 origin_node_id;
 
+			if (!cluster_tt_2pc_binding_origin_node(b, &origin_node_id))
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("invalid TT binding segment %u for prepared transaction %u",
+							b->undo_segment_id, xid)));
 			memset(&key, 0, sizeof(key));
-			key.origin_node_id = (uint16)cluster_node_id;
+			key.origin_node_id = origin_node_id;
 			key.undo_segment_id = (uint16)b->undo_segment_id;
 			key.tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
 			key.cluster_epoch = b->cluster_epoch;

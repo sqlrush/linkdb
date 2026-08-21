@@ -38,6 +38,9 @@
 #ifndef TT_2PC_SOURCE_PATH
 #error "TT_2PC_SOURCE_PATH must identify cluster_tt_2pc.c"
 #endif
+#ifndef TWOPHASE_SOURCE_PATH
+#error "TWOPHASE_SOURCE_PATH must identify twophase.c"
+#endif
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
  * stdlib printf (libpgport is linked for CRC32C only). */
@@ -49,14 +52,14 @@ UT_DEFINE_GLOBALS();
 
 
 static char *
-read_tt_2pc_source(void)
+read_source(const char *path)
 {
 	FILE *fp;
 	char *source;
 	long length;
 	size_t nread;
 
-	fp = fopen(TT_2PC_SOURCE_PATH, "rb");
+	fp = fopen(path, "rb");
 	UT_ASSERT_NOT_NULL(fp);
 	if (fp == NULL)
 		return NULL;
@@ -83,6 +86,12 @@ read_tt_2pc_source(void)
 	}
 	source[length] = '\0';
 	return source;
+}
+
+static char *
+read_tt_2pc_source(void)
+{
+	return read_source(TT_2PC_SOURCE_PATH);
 }
 
 
@@ -397,6 +406,133 @@ UT_TEST(test_s14_prefinish_is_modifier_gated_and_error_safe)
 	free(source);
 }
 
+/* RF-SIDE: a survivor resolving a failed-origin prepared transaction must
+ * preserve the binding's striped segment owner in the overlay key. */
+UT_TEST(test_s15_prefinish_preserves_binding_origin)
+{
+	char *source = read_tt_2pc_source();
+	const char *start;
+	const char *end;
+	const char *derive;
+	const char *assign;
+	const char *wrong;
+
+	if (source == NULL)
+		return;
+	start = strstr(source, "\ncluster_tt_twophase_prefinish(");
+	end = start == NULL ? NULL : strstr(start,
+		"\n}\n\n#endif /* USE_PGRAC_CLUSTER */");
+	derive = start == NULL ? NULL : strstr(start,
+		"cluster_tt_2pc_binding_origin_node(b, &origin_node_id)");
+	assign = start == NULL ? NULL : strstr(start,
+		"key.origin_node_id = origin_node_id;");
+	wrong = start == NULL ? NULL : strstr(start,
+		"key.origin_node_id = (uint16)cluster_node_id;");
+
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(derive);
+	UT_ASSERT_NOT_NULL(assign);
+	UT_ASSERT(wrong == NULL || (end != NULL && wrong > end));
+	if (start != NULL && end != NULL && derive != NULL && assign != NULL)
+	{
+		UT_ASSERT(derive < assign);
+		UT_ASSERT(assign < end);
+	}
+	free(source);
+}
+
+/* RF-SIDE RFSIDE-V2-A: the durable v2 row is only a projection.  Recovery
+ * install may report success only after the native prepared owner is fully
+ * activated; an interrupted activation stays unfinishable and unpublished. */
+UT_TEST(test_s16_recovery_pending_activates_native_owner_before_success)
+{
+	char *source = read_source(TWOPHASE_SOURCE_PATH);
+	const char *install;
+	const char *install_end;
+	const char *mark_guts;
+	const char *mark_pending;
+	const char *load_subxids;
+	const char *mark_prepared;
+	const char *recover_records;
+	const char *catch_block;
+	const char *panic_transition;
+	const char *clear_pending;
+	const char *post_prepare;
+	const char *postread;
+	const char *lock_gxact;
+	const char *lock_end;
+	const char *view;
+	const char *view_end;
+	const char *prepared_predicate;
+	const char *prepared_predicate_end;
+
+	if (source == NULL)
+		return;
+	install = strstr(source, "\nTwoPhaseRecoveryPendingInstall(");
+	install_end = install == NULL ? NULL : strstr(install,
+		"\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
+	mark_guts = install == NULL ? NULL : strstr(install, "MarkAsPreparingGuts(");
+	mark_pending = install == NULL ? NULL : strstr(install,
+		"gxact->recovery_activation_pending = true;");
+	load_subxids = install == NULL ? NULL : strstr(install, "GXactLoadSubxactData(");
+	mark_prepared = install == NULL ? NULL : strstr(install, "MarkAsPrepared(gxact, true);");
+	recover_records = install == NULL ? NULL : strstr(install,
+		"ProcessRecords(bufptr, xid, twophase_recover_callbacks);");
+	catch_block = recover_records == NULL ? NULL : strstr(recover_records, "PG_CATCH();");
+	panic_transition = catch_block == NULL ? NULL : strstr(catch_block, "ereport(PANIC");
+	clear_pending = install == NULL ? NULL : strstr(install,
+		"gxact->recovery_activation_pending = false;");
+	post_prepare = install == NULL ? NULL : strstr(install, "PostPrepare_Twophase();");
+	postread = post_prepare == NULL ? NULL : strstr(post_prepare,
+		"postread = ReadTwoPhaseFile(xid, false);");
+	lock_gxact = strstr(source, "\nLockGXact(");
+	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact, "\n}\n\n/*\n * RemoveGXact");
+	view = strstr(source, "\npg_prepared_xact(PG_FUNCTION_ARGS)");
+	view_end = view == NULL ? NULL : strstr(view, "\n}\n\n/*\n * TwoPhaseGetGXact");
+	prepared_predicate = strstr(source, "\nTwoPhaseTransactionIdIsPrepared(");
+	prepared_predicate_end = prepared_predicate == NULL ? NULL :
+		strstr(prepared_predicate, "\n}\n\n\n/* Working status");
+
+	UT_ASSERT_NOT_NULL(install);
+	UT_ASSERT_NOT_NULL(install_end);
+	UT_ASSERT_NOT_NULL(mark_guts);
+	UT_ASSERT_NOT_NULL(mark_pending);
+	UT_ASSERT_NOT_NULL(load_subxids);
+	UT_ASSERT_NOT_NULL(mark_prepared);
+	UT_ASSERT_NOT_NULL(recover_records);
+	UT_ASSERT_NOT_NULL(catch_block);
+	UT_ASSERT_NOT_NULL(panic_transition);
+	UT_ASSERT_NOT_NULL(clear_pending);
+	UT_ASSERT_NOT_NULL(post_prepare);
+	UT_ASSERT_NOT_NULL(postread);
+	UT_ASSERT_NOT_NULL(lock_gxact);
+	UT_ASSERT_NOT_NULL(lock_end);
+	UT_ASSERT_NOT_NULL(view);
+	UT_ASSERT_NOT_NULL(view_end);
+	UT_ASSERT_NOT_NULL(prepared_predicate);
+	UT_ASSERT_NOT_NULL(prepared_predicate_end);
+	if (install != NULL && install_end != NULL && mark_guts != NULL &&
+		mark_pending != NULL && load_subxids != NULL && mark_prepared != NULL &&
+		recover_records != NULL && catch_block != NULL && panic_transition != NULL &&
+		clear_pending != NULL && post_prepare != NULL &&
+		postread != NULL)
+		UT_ASSERT(install < mark_guts && mark_guts < mark_pending &&
+			mark_pending < load_subxids && load_subxids < mark_prepared &&
+			mark_prepared < recover_records && recover_records < catch_block &&
+			catch_block < panic_transition && panic_transition < clear_pending &&
+			clear_pending < post_prepare && post_prepare < postread &&
+			postread < install_end);
+	if (lock_gxact != NULL && lock_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(lock_gxact, "gxact->recovery_activation_pending"));
+	if (view != NULL && view_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(view, "gxact->recovery_activation_pending"));
+	if (prepared_predicate != NULL && prepared_predicate_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(prepared_predicate,
+			"!gxact->recovery_activation_pending"));
+	free(source);
+}
+
 
 int
 main(void)
@@ -415,6 +551,8 @@ main(void)
 	UT_RUN(test_s12_v2_heads_roundtrip);
 	UT_RUN(test_s13_v2_null_heads_all_invalid);
 	UT_RUN(test_s14_prefinish_is_modifier_gated_and_error_safe);
+	UT_RUN(test_s15_prefinish_preserves_binding_origin);
+	UT_RUN(test_s16_recovery_pending_activates_native_owner_before_success);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

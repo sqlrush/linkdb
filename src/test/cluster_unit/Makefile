@@ -1372,6 +1372,7 @@ test_cluster_tt_2pc: test_cluster_tt_2pc.c unit_test.h \
 		$(CLUSTER_TT_2PC_RECORD_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DTT_2PC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_tt_2pc.c"' \
+		-DTWOPHASE_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/access/transam/twophase.c"' \
 		$< \
 		$(CLUSTER_TT_2PC_RECORD_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

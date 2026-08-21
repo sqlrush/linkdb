@@ -222,6 +222,7 @@ typedef struct GlobalTransactionData {
 	bool valid;				   /* true if PGPROC entry is in proc array */
 	bool ondisk;			   /* true if prepare state file is on disk */
 	bool inredo;			   /* true if entry was added via xlog_redo */
+	bool recovery_activation_pending; /* native owner recovery incomplete */
 	char gid[GIDSIZE];		   /* The GID assigned to the prepared xact */
 } GlobalTransactionData;
 
@@ -527,6 +528,7 @@ MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid, const char *gid,
 	gxact->locking_backend = MyBackendId;
 	gxact->valid = false;
 	gxact->inredo = false;
+	gxact->recovery_activation_pending = false;
 	strcpy(gxact->gid, gid);
 
 	/*
@@ -609,6 +611,12 @@ LockGXact(const char *gid, Oid user)
 			continue;
 		if (strcmp(gxact->gid, gid) != 0)
 			continue;
+		if (gxact->recovery_activation_pending)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("prepared transaction with identifier \"%s\" has incomplete recovery activation",
+							gid),
+					 errhint("Restart recovery before finishing this prepared transaction.")));
 
 		/* Found it, but has someone else got it locked? */
 		if (gxact->locking_backend != InvalidBackendId)
@@ -774,7 +782,8 @@ TwoPhaseTransactionIdIsPrepared(TransactionId xid)
 	{
 		GlobalTransaction gxact = TwoPhaseState->prepXacts[i];
 
-		if (gxact->valid && TransactionIdEquals(gxact->xid, xid))
+		if (gxact->valid && !gxact->recovery_activation_pending &&
+			TransactionIdEquals(gxact->xid, xid))
 		{
 			found = true;
 			break;
@@ -853,7 +862,7 @@ pg_prepared_xact(PG_FUNCTION_ARGS)
 		HeapTuple tuple;
 		Datum result;
 
-		if (!gxact->valid)
+		if (!gxact->valid || gxact->recovery_activation_pending)
 			continue;
 
 		/*
@@ -1628,6 +1637,7 @@ TwoPhaseRecoveryPendingPreflight(TransactionId xid, Oid database, Oid owner,
 	TimestampTz prepared_at, const char *gid, const void *content, uint32 len)
 {
 	TwoPhaseRecoveryPendingResult result;
+	GlobalTransaction gxact = NULL;
 
 	if (max_prepared_xacts <= 0 || TwoPhaseState == NULL ||
 		!TwoPhaseRecoveryInputValid(xid, database, owner, prepared_at,
@@ -1635,7 +1645,10 @@ TwoPhaseRecoveryPendingPreflight(TransactionId xid, Oid database, Oid owner,
 		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
 	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
 	result = TwoPhaseRecoveryPendingClassifyLocked(xid, gid, content, len,
-		NULL, NULL);
+		&gxact, NULL);
+	if (result == TWOPHASE_RECOVERY_PENDING_OK && gxact != NULL &&
+		gxact->recovery_activation_pending)
+		result = TWOPHASE_RECOVERY_PENDING_BLOCKED;
 	LWLockRelease(TwoPhaseStateLock);
 	return result;
 }
@@ -1647,14 +1660,26 @@ TwoPhaseRecoveryPendingInstall(TransactionId xid, Oid database, Oid owner,
 	TwoPhaseRecoveryPendingResult result;
 	GlobalTransaction gxact = NULL;
 	bool		has_file = false;
+	TwoPhaseFileHeader *hdr = (TwoPhaseFileHeader *) content;
+	char	   *bufptr;
+	TransactionId *subxids;
 	char	   *postread;
 	TwoPhaseFileHeader *post_header;
 	uint32		post_len;
+	int			i;
+	MemoryContext caller_context = CurrentMemoryContext;
 
 	if (max_prepared_xacts <= 0 || TwoPhaseState == NULL ||
 		!TwoPhaseRecoveryInputValid(xid, database, owner, prepared_at,
 			gid, content, len))
 		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	if (MyLockedGxact != NULL)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	if (!twophaseExitRegistered)
+	{
+		before_shmem_exit(AtProcExit_Twophase, 0);
+		twophaseExitRegistered = true;
+	}
 
 	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
 	result = TwoPhaseRecoveryPendingClassifyLocked(xid, gid, content, len,
@@ -1667,13 +1692,87 @@ TwoPhaseRecoveryPendingInstall(TransactionId xid, Oid database, Oid owner,
 	if (!has_file)
 		TwoPhaseRecoveryWriteDurable(xid, content, len);
 	if (gxact == NULL)
+	{
 		PrepareRedoAddCommon((char *) content, InvalidXLogRecPtr,
 			InvalidXLogRecPtr, InvalidRepOriginId);
+		for (i = 0; i < TwoPhaseState->numPrepXacts; i++)
+		{
+			if (TransactionIdEquals(TwoPhaseState->prepXacts[i]->xid, xid))
+			{
+				gxact = TwoPhaseState->prepXacts[i];
+				break;
+			}
+		}
+		Assert(gxact != NULL);
+	}
 	else
 	{
 		gxact->ondisk = true;
 		gxact->prepare_start_lsn = InvalidXLogRecPtr;
 		gxact->prepare_end_lsn = InvalidXLogRecPtr;
+	}
+	if (gxact->recovery_activation_pending)
+	{
+		LWLockRelease(TwoPhaseStateLock);
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	}
+
+	if (!gxact->valid)
+	{
+		bufptr = (char *) content + MAXALIGN(sizeof(TwoPhaseFileHeader));
+		bufptr += MAXALIGN(hdr->gidlen);
+		subxids = (TransactionId *) bufptr;
+		bufptr += MAXALIGN(hdr->nsubxacts * sizeof(TransactionId));
+		bufptr += MAXALIGN(hdr->ncommitrels * sizeof(RelFileLocator));
+		bufptr += MAXALIGN(hdr->nabortrels * sizeof(RelFileLocator));
+		bufptr += MAXALIGN(hdr->ncommitstats * sizeof(xl_xact_stats_item));
+		bufptr += MAXALIGN(hdr->nabortstats * sizeof(xl_xact_stats_item));
+		bufptr += MAXALIGN(hdr->ninvalmsgs * sizeof(SharedInvalidationMessage));
+
+		MarkAsPreparingGuts(gxact, xid, gid, prepared_at, owner, database);
+		gxact->ondisk = true;
+		gxact->prepare_start_lsn = InvalidXLogRecPtr;
+		gxact->prepare_end_lsn = InvalidXLogRecPtr;
+		gxact->recovery_activation_pending = true;
+		for (i = 0; i < hdr->nsubxacts; i++)
+			SubTransSetParent(subxids[i], xid);
+		GXactLoadSubxactData(gxact, hdr->nsubxacts, subxids);
+		MarkAsPrepared(gxact, true);
+
+		LWLockRelease(TwoPhaseStateLock);
+		PG_TRY();
+		{
+			ProcessRecords(bufptr, xid, twophase_recover_callbacks);
+		}
+		PG_CATCH();
+		{
+			ErrorData  *edata;
+
+			/*
+			 * Native recover callbacks are not generally idempotent (notably
+			 * lock and predicate-lock recovery).  Once one callback has run,
+			 * an ordinary ERROR cannot safely leave this shared-memory image
+			 * available for an in-place retry.  Force the same fail-closed
+			 * transition as startup recovery: postmaster restart rebuilds the
+			 * exact owner from the durable pg_twophase file and no projection
+			 * has yet been published.
+			 */
+			MemoryContextSwitchTo(caller_context);
+			edata = CopyErrorData();
+			FlushErrorState();
+			ereport(PANIC,
+					(errmsg("could not activate recovered prepared transaction %u", xid),
+					 errdetail_internal("Native two-phase recovery callback failed: %s",
+								 edata->message)));
+		}
+		PG_END_TRY();
+		LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+		Assert(MyLockedGxact == gxact);
+		Assert(gxact->valid && gxact->recovery_activation_pending);
+		gxact->recovery_activation_pending = false;
+		LWLockRelease(TwoPhaseStateLock);
+		PostPrepare_Twophase();
+		LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
 	}
 
 	postread = ReadTwoPhaseFile(xid, false);
@@ -2936,6 +3035,7 @@ PrepareRedoAddCommon(char *buf, XLogRecPtr start_lsn, XLogRecPtr end_lsn,
 	gxact->valid = false;
 	gxact->ondisk = XLogRecPtrIsInvalid(start_lsn);
 	gxact->inredo = true; /* yes, added in redo */
+	gxact->recovery_activation_pending = false;
 	strcpy(gxact->gid, gid);
 
 	/* And insert it into the active array */
