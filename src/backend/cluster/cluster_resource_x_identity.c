@@ -90,3 +90,9 @@ resource_x_attempt_matches(const ResourceXAttemptWitness *left,
 		&& resource_x_assertion_equal(&left->assertion, &right->assertion)
 		&& left->base_authority_generation == right->base_authority_generation;
 }
+
+const char *
+resource_x_proof_readiness_status(void)
+{
+	return RESOURCE_X_PROOF_READINESS_UNAVAILABLE;
+}

@@ -15,6 +15,7 @@
 #include "storage/buf_internals.h"
 
 #define RESOURCE_X_PROTOCOL_NODE_LIMIT 32
+#define RESOURCE_X_PROOF_READINESS_UNAVAILABLE "UNAVAILABLE_PROOF_KIND"
 
 typedef struct ResourceXAssertion
 {
@@ -77,5 +78,7 @@ extern bool resource_x_assertion_equal(const ResourceXAssertion *left,
 extern uint32 resource_x_assertion_hash(const ResourceXAssertion *assertion);
 extern bool resource_x_attempt_matches(const ResourceXAttemptWitness *left,
 									   const ResourceXAttemptWitness *right);
+/* R6 readiness only: no proof enum, proof value, producer, or proof-bearing key. */
+extern const char *resource_x_proof_readiness_status(void);
 
 #endif /* CLUSTER_RESOURCE_X_IDENTITY_H */

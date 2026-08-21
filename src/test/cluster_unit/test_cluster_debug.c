@@ -4778,7 +4778,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, 14);
 	UT_ASSERT_EQ(PCM_X_ACQUIRE_HIST_BUCKETS, 32);
 	UT_ASSERT_EQ((int)lengthof(result_labels), PCM_X_QUEUE_RESULT_COUNT);
-	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 110);
+	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 111);
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
 	UT_ASSERT_EQ(captured_dump_count("lmon", NULL), 12);
 	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 121);
@@ -4799,6 +4799,9 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[1]), "12");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[2]), "13");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[3]), "999");
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_proof_readiness"), 1);
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_proof_readiness"),
+					 "UNAVAILABLE_PROOF_KIND");
 
 	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++) {
 		snprintf(key, sizeof(key), "pcm_x_acquire_result_%s_count", result_labels[i]);

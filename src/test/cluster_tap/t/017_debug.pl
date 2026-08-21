@@ -96,6 +96,11 @@ is( $node->safe_psql(
 	'0',
 	'pg_cluster_state has no NULL values (NOT NULL contract)');
 
+is(
+	$node->get_cluster_state_value('pcm', 'resource_x_proof_readiness'),
+	'UNAVAILABLE_PROOF_KIND',
+	'Resource-X proof readiness is explicitly unavailable');
+
 
 # ----------
 # Test 5: shmem.magic matches CLUSTER_SHMEM_MAGIC ("PGRC" LE = 0x50475243).

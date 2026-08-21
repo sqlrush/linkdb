@@ -615,6 +615,10 @@ for my $key (@RESULT_KEYS, @BUCKET_KEYS,
 # L15: the nine proof-kind-dependent O1 rows are absent, not registered zeroes.
 my $o1_sql = join(',', map { "'$_'" } @O1_KEYS);
 is(
+	state_val($node1, 'pcm', 'resource_x_proof_readiness'),
+	'UNAVAILABLE_PROOF_KIND',
+	'L15 proof readiness is explicitly unavailable through R6');
+is(
 	$node1->safe_psql(
 		'postgres',
 		"SELECT count(*) FROM pg_cluster_state WHERE key IN ($o1_sql)"),
@@ -655,6 +659,10 @@ my $restart_rows = $node0->safe_psql(
 my %restart = map { split(/=/, $_, 2) } split(/\n/, $restart_rows);
 is($restart{segment_observation_status}, 'READY',
 	'L11 first post-restart observation is READY');
+is(
+	state_val($node0, 'pcm', 'resource_x_proof_readiness'),
+	'UNAVAILABLE_PROOF_KIND',
+	'L11 proof readiness stays explicitly unavailable after restart');
 ok(
 	is_u64($restart{segment_allocated_count})
 	  && $restart{segment_allocated_count} >= 1,

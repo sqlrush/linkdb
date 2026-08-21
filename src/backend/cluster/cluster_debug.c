@@ -143,6 +143,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
 #include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
 #include "cluster/cluster_pcm_x_convert.h"	 /* PCM-X external FIFO observability */
+#include "cluster/cluster_resource_x_identity.h" /* Resource-X proof readiness */
 #include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
 #include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
 #include "cluster/cluster_gcs_block_dedup.h" /* per-worker dedup-shard counters (spec-7.3 D5/D9) */
@@ -1940,6 +1941,8 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	 */
 	emit_row(rsinfo, "pcm", "pcm_api_state",
 			 (cluster_pcm_grd_max_entries == 0) ? "stub" : "active");
+	emit_row(rsinfo, "pcm", "resource_x_proof_readiness",
+			 resource_x_proof_readiness_status());
 
 	/*
 	 * PGRAC: spec-2.30 D9 — 5 NEW state summary row.
