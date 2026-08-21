@@ -157,13 +157,6 @@ cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unus
 	abort();
 }
 
-void
-cluster_semantic_activation_register(
-	const ClusterSemanticActivationDescriptor *descriptor pg_attribute_unused())
-{
-	abort();
-}
-
 bool
 errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {

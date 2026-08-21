@@ -21915,8 +21915,7 @@ pcm_x_resource_x_readiness(uint64 expected_generation,
 {
 	if (refusal != NULL) {
 		refusal->result = CLUSTER_SEMANTIC_ACTIVATION_OK;
-		refusal->feature_bit
-			= CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1;
+		refusal->feature_bit = 0;
 		refusal->expected_generation = expected_generation;
 	}
 	return CLUSTER_SEMANTIC_ACTIVATION_OK;
@@ -21983,13 +21982,7 @@ pcm_x_resource_x_closed_zero(uint64 generation)
 	return CLUSTER_SEMANTIC_ACTIVATION_OK;
 }
 
-static const ClusterSemanticActivationDescriptor pcm_x_resource_x_descriptor = {
-	.name = "RESOURCE_X_LOGICAL_ID_V1",
-	.feature_bit = CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1,
-	.required_hello_caps = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
-		| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-	.required_active_bits = 0,
-	.source_available = true,
+static const ClusterSemanticActivationCallbackBundle pcm_x_resource_x_callbacks = {
 	.pre_prepare_readiness = pcm_x_resource_x_readiness,
 	.close_source_admission = pcm_x_resource_x_stage_ok,
 	.source_logical_debt_zero = pcm_x_resource_x_logical_zero,
@@ -22000,10 +21993,10 @@ static const ClusterSemanticActivationDescriptor pcm_x_resource_x_descriptor = {
 	.open_target_admission = pcm_x_resource_x_stage_ok,
 };
 
-const ClusterSemanticActivationDescriptor *
-cluster_pcm_x_resource_x_descriptor(void)
+const ClusterSemanticActivationCallbackBundle *
+cluster_pcm_x_resource_x_activation_callbacks(void)
 {
-	return &pcm_x_resource_x_descriptor;
+	return &pcm_x_resource_x_callbacks;
 }
 
 
@@ -22024,6 +22017,5 @@ cluster_pcm_x_resource_x_descriptor(void)
 void
 cluster_pcm_x_convert_shmem_register(void)
 {
-	cluster_semantic_activation_register(&pcm_x_resource_x_descriptor);
 	cluster_shmem_register_region(&pcm_x_convert_region);
 }

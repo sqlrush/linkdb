@@ -20,7 +20,6 @@
 #include "nodes/parsenodes.h"
 
 #define CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 (UINT64_C(1) << 0)
-#define CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1 (UINT64_C(1) << 1)
 #define CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES 512
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_MAGIC UINT32_C(0x314B4341)
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION UINT16_C(1)
@@ -217,6 +216,20 @@ typedef ClusterSemanticActivationResult (*ClusterSemanticReadinessCallback)(
 typedef ClusterSemanticActivationResult (*ClusterSemanticStageCallback)(uint64 generation);
 typedef ClusterSemanticActivationResult (*ClusterSemanticZeroCallback)(
 	uint64 generation, ClusterSemanticZeroProof *proof);
+
+/* A prerequisite module contributes only closed transition callbacks.  It has
+ * no feature identity and cannot register or activate itself; the terminal
+ * cutover owner composes the sole immutable descriptor. */
+typedef struct ClusterSemanticActivationCallbackBundle {
+	ClusterSemanticReadinessCallback pre_prepare_readiness;
+	ClusterSemanticStageCallback close_source_admission;
+	ClusterSemanticZeroCallback source_logical_debt_zero;
+	ClusterSemanticZeroCallback source_transport_zero;
+	ClusterSemanticStageCallback prepare_target;
+	ClusterSemanticStageCallback apply_target_closed;
+	ClusterSemanticStageCallback revert_source_closed;
+	ClusterSemanticStageCallback open_target_admission;
+} ClusterSemanticActivationCallbackBundle;
 
 typedef struct ClusterSemanticActivationDescriptor {
 	const char *name;

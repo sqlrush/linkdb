@@ -1114,29 +1114,30 @@ UT_TEST(test_10_r4_descriptor_has_every_callback)
 	UT_ASSERT_NOT_NULL(descriptor->open_target_admission);
 }
 
-UT_TEST(test_10a_compiled_registry_accepts_resource_x_descriptor)
+UT_TEST(test_10a_compiled_registry_accepts_future_bit10_descriptor)
 {
 	const ClusterSemanticActivationDescriptor *r4
 		= cluster_semantic_activation_r4_descriptor();
-	static ClusterSemanticActivationDescriptor resource_x;
+	static ClusterSemanticActivationDescriptor future_cutover;
+	const uint64 future_cutover_bit = UINT64_C(1) << 10;
 
-	resource_x = *r4;
-	resource_x.name = "RESOURCE_X_LOGICAL_ID_V1";
-	resource_x.feature_bit
-		= CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1;
-	resource_x.required_hello_caps
+	UT_ASSERT_EQ(cluster_semantic_activation_compiled_feature_bitmap(),
+				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	future_cutover = *r4;
+	future_cutover.name = "R11_RESOURCE_X_D5_CUTOVER_V1";
+	future_cutover.feature_bit = future_cutover_bit;
+	future_cutover.required_hello_caps
 		= PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
 		  | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
-	cluster_semantic_activation_register(&resource_x);
+	cluster_semantic_activation_register(&future_cutover);
 
 	UT_ASSERT_EQ(cluster_semantic_activation_descriptor(
 				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1), r4);
-	UT_ASSERT_EQ(cluster_semantic_activation_descriptor(
-				 CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1),
-				 &resource_x);
+	UT_ASSERT_EQ(cluster_semantic_activation_descriptor(future_cutover_bit),
+				 &future_cutover);
 	UT_ASSERT_EQ(cluster_semantic_activation_compiled_feature_bitmap(),
 				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-				 | CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1);
+				 | future_cutover_bit);
 }
 
 UT_TEST(test_11_source_only_is_exclusive)
@@ -5519,7 +5520,7 @@ main(void)
 	UT_RUN(test_08_r4_descriptor_caps_and_active_bits);
 	UT_RUN(test_09_r4_descriptor_retains_source);
 	UT_RUN(test_10_r4_descriptor_has_every_callback);
-	UT_RUN(test_10a_compiled_registry_accepts_resource_x_descriptor);
+	UT_RUN(test_10a_compiled_registry_accepts_future_bit10_descriptor);
 	UT_RUN(test_11_source_only_is_exclusive);
 	UT_RUN(test_12_target_only_is_exclusive);
 	UT_RUN(test_13_enable_source_open_to_admission_stopped);

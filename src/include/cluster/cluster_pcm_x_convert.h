@@ -43,7 +43,7 @@
  * cookie; the high bit is the queue-vs-legacy namespace discriminator. */
 #define PCM_X_MASTER_TICKET_ID_MAX UINT64CONST(0x7fffffffffffffff)
 
-struct ClusterSemanticActivationDescriptor;
+struct ClusterSemanticActivationCallbackBundle;
 
 /* Image ids are opaque on the wire.  Reserve high bits 110 for PCM-X so an
  * image pull carried by the legacy block request/reply transport cannot
@@ -1940,8 +1940,8 @@ cluster_pcm_x_local_holder_snapshot_revalidate(const BufferTag *tag,
 extern Size cluster_pcm_x_convert_shmem_size(void);
 extern void cluster_pcm_x_convert_shmem_init(void);
 extern void cluster_pcm_x_convert_shmem_register(void);
-extern const struct ClusterSemanticActivationDescriptor *
-cluster_pcm_x_resource_x_descriptor(void);
+extern const struct ClusterSemanticActivationCallbackBundle *
+cluster_pcm_x_resource_x_activation_callbacks(void);
 
 
 #endif /* CLUSTER_PCM_X_CONVERT_H */

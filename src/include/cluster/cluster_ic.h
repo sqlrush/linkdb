@@ -392,9 +392,9 @@ typedef enum ClusterICPlane {
 #define PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1 UINT32_C(0x00008000)
 /* Spec-3.6b: peer accepts the current-MultiXact describe/proof family. */
 #define PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 UINT32_C(0x00010000)
-/* Stage 8 R6: this binary projects the legacy PCM-X adapter onto the
- * formation-wide Resource-X logical identity.  No PCM-X payload byte changes;
- * the bit is consumed only by the shared semantic-activation barrier. */
+/* Resource-X final-cutover capability allocation.  R6 contributes identity
+ * and drain callbacks but does not advertise this bit; the final carrier
+ * owner advertises it only when the complete target decoder is installed. */
 #define PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1 UINT32_C(0x00020000)
 /* RF-ROOT: this binary understands the central control-root v1 format and
  * rejects unknown active root feature bits.  This is binary capability only;
