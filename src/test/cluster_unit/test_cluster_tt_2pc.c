@@ -471,7 +471,7 @@ UT_TEST(test_s16_recovery_pending_activates_native_owner_before_success)
 		return;
 	install = strstr(source, "\nTwoPhaseRecoveryPendingInstall(");
 	install_end = install == NULL ? NULL : strstr(install,
-		"\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
+		"\n}\n\n/* Caller holds TwoPhaseStateLock");
 	mark_guts = install == NULL ? NULL : strstr(install, "MarkAsPreparingGuts(");
 	mark_pending = install == NULL ? NULL : strstr(install,
 		"gxact->recovery_activation_pending = true;");
@@ -546,6 +546,7 @@ UT_TEST(test_s17_recovery_pending_remains_reco_owned_after_activation)
 	const char *install_end;
 	const char *mark_owned;
 	const char *clear_activation;
+	const char *remark_owned;
 	const char *lock_gxact;
 	const char *lock_end;
 
@@ -556,11 +557,13 @@ UT_TEST(test_s17_recovery_pending_remains_reco_owned_after_activation)
 		"} GlobalTransactionData;");
 	install = strstr(source, "\nTwoPhaseRecoveryPendingInstall(");
 	install_end = install == NULL ? NULL : strstr(install,
-		"\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
+		"\n}\n\n/* Caller holds TwoPhaseStateLock");
 	mark_owned = install == NULL ? NULL : strstr(install,
 		"gxact->recovery_managed = true;");
 	clear_activation = install == NULL ? NULL : strstr(install,
 		"gxact->recovery_activation_pending = false;");
+	remark_owned = clear_activation == NULL ? NULL : strstr(clear_activation,
+		"gxact->recovery_managed = true;");
 	lock_gxact = strstr(source, "\nLockGXact(");
 	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact,
 		"\n}\n\n/*\n * RemoveGXact");
@@ -571,16 +574,43 @@ UT_TEST(test_s17_recovery_pending_remains_reco_owned_after_activation)
 	UT_ASSERT_NOT_NULL(install_end);
 	UT_ASSERT_NOT_NULL(mark_owned);
 	UT_ASSERT_NOT_NULL(clear_activation);
+	UT_ASSERT_NOT_NULL(remark_owned);
 	UT_ASSERT_NOT_NULL(lock_gxact);
 	UT_ASSERT_NOT_NULL(lock_end);
 	if (definition != NULL && definition_end != NULL)
 		UT_ASSERT_NOT_NULL(strstr(definition, "bool recovery_managed;"));
 	if (install != NULL && install_end != NULL && mark_owned != NULL &&
-		clear_activation != NULL)
+		clear_activation != NULL && remark_owned != NULL)
 		UT_ASSERT(install < mark_owned && mark_owned < clear_activation &&
-			clear_activation < install_end);
+			clear_activation < remark_owned && remark_owned < install_end);
 	if (lock_gxact != NULL && lock_end != NULL)
 		UT_ASSERT_NOT_NULL(strstr(lock_gxact, "gxact->recovery_managed"));
+	free(source);
+}
+
+/* Only a fully released RF-SIDE terminal receipt may leave the unresolved
+ * prepared count.  Native finish's transient valid=false window still counts
+ * until RemoveGXact, so undo retention cannot drain ahead of callbacks. */
+UT_TEST(test_s20_prepared_count_excludes_only_terminal_cleanup_receipts)
+{
+	char *source = read_source(TWOPHASE_SOURCE_PATH);
+	const char *counter;
+	const char *counter_end;
+
+	if (source == NULL)
+		return;
+	counter = strstr(source, "\nGetNumberOfPreparedTransactions(void)");
+	counter_end = counter == NULL ? NULL : strstr(counter,
+		"\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
+	UT_ASSERT_NOT_NULL(counter);
+	UT_ASSERT_NOT_NULL(counter_end);
+	if (counter != NULL && counter_end != NULL)
+	{
+		UT_ASSERT_NOT_NULL(strstr(counter,
+			"!TwoPhaseState->prepXacts[i]->recovery_terminal_cleanup_pending"));
+		UT_ASSERT(strstr(counter, "prepXacts[i]->valid") == NULL ||
+			strstr(counter, "prepXacts[i]->valid") > counter_end);
+	}
 	free(source);
 }
 
@@ -771,6 +801,7 @@ main(void)
 	UT_RUN(test_s17_recovery_pending_remains_reco_owned_after_activation);
 	UT_RUN(test_s18_restart_finish_fence_reuses_root_and_projection);
 	UT_RUN(test_s19_recovery_terminal_resolves_native_owner_without_new_wal);
+	UT_RUN(test_s20_prepared_count_excludes_only_terminal_cleanup_receipts);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

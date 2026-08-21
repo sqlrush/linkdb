@@ -826,7 +826,7 @@ GetNumberOfPreparedTransactions(void)
 
 	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
 	for (i = 0; i < TwoPhaseState->numPrepXacts; i++)
-		if (TwoPhaseState->prepXacts[i]->valid)
+		if (!TwoPhaseState->prepXacts[i]->recovery_terminal_cleanup_pending)
 			num++;
 	LWLockRelease(TwoPhaseStateLock);
 
@@ -1855,6 +1855,7 @@ TwoPhaseRecoveryPendingInstall(TransactionId xid, Oid database, Oid owner,
 		PostPrepare_Twophase();
 		LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
 	}
+	gxact->recovery_managed = true;
 
 	postread = ReadTwoPhaseFile(xid, false);
 	post_header = (TwoPhaseFileHeader *) postread;
