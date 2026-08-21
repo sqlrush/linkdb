@@ -54,6 +54,7 @@
 #include "cluster/cluster_buffer_desc.h" /* PcmState (1.6), INVALID_NODE_ID */
 #include "cluster/cluster_conf.h"		 /* cluster_conf_has_peers */
 #include "cluster/cluster_grd.h"		 /* ClusterGrdHolderId */
+#include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_scn.h"		 /* spec-2.41 D2 — SCN dual watermark */
 #include "storage/buf_internals.h"		 /* BufferTag */
 
@@ -124,6 +125,91 @@ typedef enum PcmGcsTransitionApplyResult {
  *	convert queues without leaking layout into callers.
  */
 typedef struct GrdEntry GrdEntry;
+
+/* Stage 8 R9: one logical Resource-X acquisition is the already-frozen D6
+ * assertion plus exact formation and acquisition generation.  Transport
+ * freshness remains outside logical equality. */
+typedef struct ResourceXAcquisitionRef {
+	ResourceXAssertion assertion;
+	uint64 formation;
+	uint64 acquisition_generation;
+} ResourceXAcquisitionRef;
+
+StaticAssertDecl(sizeof(ResourceXAcquisitionRef) == 40,
+				 "ResourceXAcquisitionRef layout must remain 40 bytes");
+
+#define RESOURCE_X_PROGRESS_BOUND UINT32_C(0x00000001)
+#define RESOURCE_X_PROGRESS_T1 UINT32_C(0x00000002)
+#define RESOURCE_X_PROGRESS_T2 UINT32_C(0x00000004)
+#define RESOURCE_X_PROGRESS_T3 UINT32_C(0x00000008)
+#define RESOURCE_X_PROGRESS_RECOVERY_BLOCKED UINT32_C(0x00000010)
+#define RESOURCE_X_PROGRESS_KNOWN_MASK UINT32_C(0x0000001f)
+
+#define RESOURCE_X_GATE_OPEN UINT32_C(0)
+#define RESOURCE_X_GATE_FROZEN UINT32_C(1)
+#define RESOURCE_X_GATE_RECOVERY_BLOCKED UINT32_C(2)
+
+typedef enum ResourceXApplyResult {
+	RESOURCE_X_APPLY_APPLIED = 0,
+	RESOURCE_X_APPLY_DUPLICATE,
+	RESOURCE_X_APPLY_NOT_FOUND,
+	RESOURCE_X_APPLY_STALE,
+	RESOURCE_X_APPLY_BAD_STATE,
+	RESOURCE_X_APPLY_INVALID,
+	RESOURCE_X_APPLY_RECOVERY_BLOCKED
+} ResourceXApplyResult;
+
+typedef enum ResourceXExecutorProbeResult {
+	RESOURCE_X_EXECUTOR_READY = 0,
+	RESOURCE_X_EXECUTOR_COMPLETE,
+	RESOURCE_X_EXECUTOR_BLOCKED,
+	RESOURCE_X_EXECUTOR_CHANGED,
+	RESOURCE_X_EXECUTOR_RECOVERY_BLOCKED
+} ResourceXExecutorProbeResult;
+
+typedef enum ResourceXNoProgressReason {
+	RESOURCE_X_NO_PROGRESS_NONE = 0,
+	RESOURCE_X_NO_PROGRESS_BUFFER_BUSY,
+	RESOURCE_X_NO_PROGRESS_BUFFER_ABSENT,
+	RESOURCE_X_NO_PROGRESS_BUFFER_STALE,
+	RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT
+} ResourceXNoProgressReason;
+
+typedef struct ResourceXExecutorSnapshot {
+	ResourceXAcquisitionRef ref;
+	uint32 progress_flags;
+	uint32 no_progress_reason;
+	uint64 no_progress_generation;
+} ResourceXExecutorSnapshot;
+
+typedef struct ResourceXBufferInstallProof {
+	uint64 ownership_generation;
+	uint64 writer_activation_token;
+	uint64 resource_x_activation_generation;
+} ResourceXBufferInstallProof;
+
+typedef struct ResourceXBufferActivationProof {
+	uint64 ownership_generation;
+	uint64 writer_activation_token;
+	uint64 resource_x_activation_generation;
+} ResourceXBufferActivationProof;
+
+typedef struct ResourceXActivationGateToken {
+	uint64 formation;
+	uint64 freeze_generation;
+	uint64 acquisition_generation;
+	uint32 active;
+	uint32 reserved;
+} ResourceXActivationGateToken;
+
+StaticAssertDecl(sizeof(ResourceXExecutorSnapshot) == 56,
+				 "ResourceXExecutorSnapshot layout must remain 56 bytes");
+StaticAssertDecl(sizeof(ResourceXBufferInstallProof) == 24,
+				 "ResourceXBufferInstallProof layout must remain 24 bytes");
+StaticAssertDecl(sizeof(ResourceXBufferActivationProof) == 24,
+				 "ResourceXBufferActivationProof layout must remain 24 bytes");
+StaticAssertDecl(sizeof(ResourceXActivationGateToken) == 32,
+				 "ResourceXActivationGateToken layout must remain 32 bytes");
 
 
 /*
@@ -443,6 +529,23 @@ extern bool cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapsh
 										uint64 *master_authority_generation_out,
 										SCN *expected_page_scn_out);
 extern bool cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_t1_grant_exact(const ResourceXAcquisitionRef *ref);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
+extern bool cluster_pcm_lock_resource_x_executor_enter(
+	const ResourceXAcquisitionRef *ref, ResourceXActivationGateToken *out_gate);
+extern void
+cluster_pcm_lock_resource_x_executor_leave(ResourceXActivationGateToken *gate);
+extern uint64 cluster_pcm_lock_resource_x_activation_inflight_count(void);
+extern ResourceXExecutorProbeResult cluster_pcm_lock_resource_x_executor_probe_exact(
+	const ResourceXAcquisitionRef *ref, ResourceXExecutorSnapshot *out_snapshot);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_apply_exact(
+	const ResourceXAcquisitionRef *ref, const ResourceXBufferInstallProof *proof);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_activate_exact(
+	const ResourceXAcquisitionRef *ref, const ResourceXBufferActivationProof *proof);
+extern void cluster_pcm_lock_resource_x_publish_no_progress_exact(
+	const ResourceXAcquisitionRef *ref, ResourceXNoProgressReason reason);
 extern PcmXGrdHandoffResult
 cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token);
 extern int cluster_pcm_grd_count(void);

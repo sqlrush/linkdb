@@ -56,6 +56,7 @@ cluster_pcm_own_shmem_init(void)
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].generation, 0);
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].reservation_token, 0);
 			pg_atomic_init_u64(&ClusterPcmOwnArray[i].writer_activation_token, 0);
+			pg_atomic_init_u64(&ClusterPcmOwnArray[i].resource_x_activation_generation, 0);
 			pg_atomic_init_u32(&ClusterPcmOwnArray[i].flags, 0);
 			ClusterPcmOwnArray[i]._pad = 0;
 		}
@@ -303,9 +304,69 @@ cluster_pcm_own_writer_activation_clear_exact(int buf_id, uint64 expected_genera
 		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
 		|| pg_atomic_read_u32(&entry->flags) != 0)
 		return CLUSTER_PCM_OWN_STALE;
+	if (pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0)
+		return CLUSTER_PCM_OWN_STALE;
 	live_activation = pg_atomic_read_u64(&entry->writer_activation_token);
 	if (live_activation == 0 || live_activation != reservation_token)
 		return CLUSTER_PCM_OWN_STALE;
+	pg_atomic_write_u64(&entry->writer_activation_token, 0);
+	return CLUSTER_PCM_OWN_OK;
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_resource_x_activation_bind_exact(int buf_id, uint64 expected_generation,
+											 uint64 reservation_token,
+											 uint64 acquisition_generation)
+{
+	ClusterPcmOwnEntry *entry;
+	uint64 live_activation;
+	uint64 live_resource_x;
+
+	if (reservation_token == 0 || acquisition_generation == 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (pg_atomic_read_u64(&entry->generation) != expected_generation
+		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
+		|| pg_atomic_read_u32(&entry->flags) != 0)
+		return CLUSTER_PCM_OWN_STALE;
+
+	live_activation = pg_atomic_read_u64(&entry->writer_activation_token);
+	live_resource_x = pg_atomic_read_u64(&entry->resource_x_activation_generation);
+	if (live_activation != reservation_token)
+		return live_activation == 0 && live_resource_x != 0 ? CLUSTER_PCM_OWN_CORRUPT
+													 : CLUSTER_PCM_OWN_STALE;
+	if (live_resource_x == acquisition_generation)
+		return CLUSTER_PCM_OWN_OK;
+	if (live_resource_x != 0)
+		return CLUSTER_PCM_OWN_STALE;
+
+	pg_atomic_write_u64(&entry->resource_x_activation_generation, acquisition_generation);
+	return CLUSTER_PCM_OWN_OK;
+}
+
+ClusterPcmOwnResult
+cluster_pcm_own_resource_x_activation_clear_exact(int buf_id, uint64 expected_generation,
+											  uint64 reservation_token,
+											  uint64 acquisition_generation)
+{
+	ClusterPcmOwnEntry *entry;
+
+	if (reservation_token == 0 || acquisition_generation == 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (!cluster_pcm_own_entry_for_buf(buf_id, &entry))
+		return CLUSTER_PCM_OWN_NOT_READY;
+	if (pg_atomic_read_u64(&entry->generation) != expected_generation
+		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
+		|| pg_atomic_read_u32(&entry->flags) != 0
+		|| pg_atomic_read_u64(&entry->writer_activation_token) != reservation_token
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation)
+			   != acquisition_generation)
+		return CLUSTER_PCM_OWN_STALE;
+
+	/* T3 ordering is part of the local write fence: remove the target
+	 * acquisition binding before opening the legacy writer fence. */
+	pg_atomic_write_u64(&entry->resource_x_activation_generation, 0);
 	pg_atomic_write_u64(&entry->writer_activation_token, 0);
 	return CLUSTER_PCM_OWN_OK;
 }
@@ -445,13 +506,15 @@ cluster_pcm_own_gen_bump_checked(int buf_id, uint64 *out_generation)
 	if (out_generation != NULL)
 		*out_generation = generation;
 	if (generation == UINT64_MAX || flags != 0
-		|| pg_atomic_read_u64(&entry->writer_activation_token) != 0)
+		|| pg_atomic_read_u64(&entry->writer_activation_token) != 0
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != 0)
 		return false;
 	generation++;
 	pg_atomic_write_u64(&entry->generation, generation);
 	/* Descriptor/tag reuse and every ordinary transition start with no
 	 * activation lifecycle.  A nonzero fence was rejected above. */
 	pg_atomic_write_u64(&entry->writer_activation_token, 0);
+	pg_atomic_write_u64(&entry->resource_x_activation_generation, 0);
 	if (out_generation != NULL)
 		*out_generation = generation;
 	return true;

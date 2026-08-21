@@ -241,6 +241,15 @@ struct GrdEntry {
 	 *	The two are ORTHOGONAL (§2.8.1): detector never reads lsn, serve-gate
 	 *	never reads scn.  Both monotone-max, both cleared together on retire. */
 	SCN pi_watermark_scn;	   /*  8B [112, 120) spec-2.41 D2 §2.8 Option A */
+	/* Stage 8 R9 Resource-X executor state.  The entry's immutable tag is
+	 * the assertion resource; requester_node completes the D6 assertion. */
+	int32 resource_x_requester_node;
+	uint32 resource_x_progress_flags;
+	uint64 resource_x_formation;
+	uint64 resource_x_acquisition_generation;
+	uint64 resource_x_no_progress_generation;
+	uint32 resource_x_no_progress_reason;
+	uint32 resource_x_dispatch_phase;
 	ConditionVariable wait_cv; /* spec-2.31 D1 v0.4 incompatible state wait */
 	LWLockPadded entry_lock;   /*128B PG_CACHE_LINE_SIZE — must stay last */
 };
@@ -262,14 +271,8 @@ struct GrdEntry {
  *	expected constant on this build platform, so silent layout drift
  *	(e.g. a future struct change in a dependency) cannot slip past CI.
  */
-StaticAssertDecl(sizeof(struct GrdEntry) == 264,
-				 "spec-2.41 D2 §2.8 Option A GrdEntry size 256 → 264 (added pi_watermark_scn "
-				 "8B dual watermark for the lost-write detector; pi_watermark_lsn retained for "
-				 "the spec-4.7 D5 redo-coverage serve-gate);  spec-2.37 baseline was 256B (had "
-				 "pi_watermark_lsn 8B for HC125/HC126);  field inserted after pi_watermark_lsn "
-				 "and before wait_cv to keep entry_lock LWLockPadded must-stay-last invariant;  "
-				 "amend this constant with Hardening appendix if a different platform produces a "
-				 "different size");
+StaticAssertDecl(sizeof(struct GrdEntry) == 304,
+				 "Stage 8 R9 GrdEntry size must include the 40-byte Resource-X executor state");
 
 
 /*
@@ -307,6 +310,11 @@ typedef struct ClusterPcmWmProvSlot {
 
 typedef struct ClusterPcmShared {
 	LWLockPadded htab_lock;
+	pg_atomic_uint32 resource_x_gate_phase;
+	uint32 resource_x_gate_pad;
+	pg_atomic_uint64 resource_x_gate_formation;
+	pg_atomic_uint64 resource_x_freeze_generation;
+	pg_atomic_uint64 resource_x_activation_inflight_count;
 	pg_atomic_uint64 trans_n_to_s_count;
 	pg_atomic_uint64 trans_n_to_x_count;
 	pg_atomic_uint64 trans_s_to_x_upgrade_count;
@@ -683,6 +691,349 @@ cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *ex
 	}
 	LWLockRelease(&ClusterPcm->htab_lock.lock);
 	return matches;
+}
+
+static bool
+pcm_resource_x_ref_valid(const ResourceXAcquisitionRef *ref)
+{
+	return ref != NULL && resource_x_assertion_valid(&ref->assertion) && ref->formation != 0
+		   && ref->formation != UINT64_MAX && ref->acquisition_generation != 0
+		   && ref->acquisition_generation != UINT64_MAX;
+}
+
+static bool
+pcm_resource_x_inflight_increment(void)
+{
+	uint64 current;
+
+	if (ClusterPcm == NULL)
+		return false;
+	current = pg_atomic_read_u64(&ClusterPcm->resource_x_activation_inflight_count);
+	for (;;) {
+		if (current == UINT64_MAX)
+			return false;
+		if (pg_atomic_compare_exchange_u64(&ClusterPcm->resource_x_activation_inflight_count,
+										   &current, current + 1))
+			return true;
+	}
+}
+
+static bool
+pcm_resource_x_inflight_decrement(void)
+{
+	uint64 current;
+
+	if (ClusterPcm == NULL)
+		return false;
+	current = pg_atomic_read_u64(&ClusterPcm->resource_x_activation_inflight_count);
+	for (;;) {
+		if (current == 0)
+			return false;
+		if (pg_atomic_compare_exchange_u64(&ClusterPcm->resource_x_activation_inflight_count,
+										   &current, current - 1))
+			return true;
+	}
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation)
+{
+	uint64 current;
+
+	if (ClusterPcm == NULL || formation == 0 || formation == UINT64_MAX)
+		return RESOURCE_X_APPLY_INVALID;
+	if (pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase) != RESOURCE_X_GATE_OPEN
+		|| pg_atomic_read_u64(&ClusterPcm->resource_x_activation_inflight_count) != 0)
+		return RESOURCE_X_APPLY_BAD_STATE;
+
+	current = 0;
+	if (pg_atomic_compare_exchange_u64(&ClusterPcm->resource_x_gate_formation, &current,
+										formation))
+		return RESOURCE_X_APPLY_APPLIED;
+	return current == formation ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE;
+}
+
+bool
+cluster_pcm_lock_resource_x_executor_enter(const ResourceXAcquisitionRef *ref,
+										  ResourceXActivationGateToken *out_gate)
+{
+	uint32 phase;
+	uint64 formation;
+
+	if (out_gate == NULL)
+		return false;
+	memset(out_gate, 0, sizeof(*out_gate));
+	if (!pcm_resource_x_ref_valid(ref) || !pcm_resource_x_inflight_increment())
+		return false;
+
+	phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+	formation = pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation);
+	if (phase != RESOURCE_X_GATE_OPEN || formation != ref->formation) {
+		(void)pcm_resource_x_inflight_decrement();
+		return false;
+	}
+
+	out_gate->formation = formation;
+	out_gate->freeze_generation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation);
+	out_gate->acquisition_generation = ref->acquisition_generation;
+	out_gate->active = 1;
+	return true;
+}
+
+void
+cluster_pcm_lock_resource_x_executor_leave(ResourceXActivationGateToken *gate)
+{
+	if (gate == NULL || gate->active == 0)
+		return;
+	gate->active = 0;
+	(void)pcm_resource_x_inflight_decrement();
+}
+
+uint64
+cluster_pcm_lock_resource_x_activation_inflight_count(void)
+{
+	return ClusterPcm == NULL
+			   ? 0
+			   : pg_atomic_read_u64(&ClusterPcm->resource_x_activation_inflight_count);
+}
+
+static bool
+pcm_resource_x_entry_exact(const struct GrdEntry *entry, const ResourceXAcquisitionRef *ref)
+{
+	return BufferTagsEqual(&entry->tag, &ref->assertion.resource)
+		   && entry->resource_x_requester_node == ref->assertion.requester_node
+		   && entry->resource_x_formation == ref->formation
+		   && entry->resource_x_acquisition_generation == ref->acquisition_generation;
+}
+
+static bool
+pcm_resource_x_entry_pristine(const struct GrdEntry *entry)
+{
+	return entry->resource_x_requester_node == -1 && entry->resource_x_progress_flags == 0
+		   && entry->resource_x_formation == 0
+		   && entry->resource_x_acquisition_generation == 0
+		   && entry->resource_x_no_progress_generation == 0
+		   && entry->resource_x_no_progress_reason == RESOURCE_X_NO_PROGRESS_NONE
+		   && entry->resource_x_dispatch_phase == 0;
+}
+
+static void
+pcm_resource_x_snapshot_locked(const struct GrdEntry *entry, ResourceXExecutorSnapshot *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->ref.assertion.resource = entry->tag;
+	out->ref.assertion.requester_node = entry->resource_x_requester_node;
+	out->ref.formation = entry->resource_x_formation;
+	out->ref.acquisition_generation = entry->resource_x_acquisition_generation;
+	out->progress_flags = entry->resource_x_progress_flags;
+	out->no_progress_reason = entry->resource_x_no_progress_reason;
+	out->no_progress_generation = entry->resource_x_no_progress_generation;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_t1_grant_exact(const ResourceXAcquisitionRef *ref)
+{
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+	bool broadcast = false;
+
+	if (!pcm_resource_x_ref_valid(ref))
+		return RESOURCE_X_APPLY_INVALID;
+	entry = pcm_get_or_create_entry(ref->assertion.resource);
+	if (entry == NULL)
+		return RESOURCE_X_APPLY_NOT_FOUND;
+
+	pcm_entry_lock_exclusive(entry);
+	if (entry->resource_x_acquisition_generation != 0) {
+		if (!pcm_resource_x_entry_exact(entry, ref))
+			result = RESOURCE_X_APPLY_STALE;
+		else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+			result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_T1) != 0)
+			result = RESOURCE_X_APPLY_DUPLICATE;
+		else
+			result = RESOURCE_X_APPLY_BAD_STATE;
+		goto done;
+	}
+	if (!pcm_resource_x_entry_pristine(entry)) {
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto done;
+	}
+	if ((PcmState)pg_atomic_read_u32(&entry->master_state) != PCM_STATE_X
+		|| entry->x_holder_node != ref->assertion.requester_node
+		|| pg_atomic_read_u32(&entry->s_holders_bitmap) != 0) {
+		result = RESOURCE_X_APPLY_BAD_STATE;
+		goto done;
+	}
+
+	entry->resource_x_requester_node = ref->assertion.requester_node;
+	entry->resource_x_formation = ref->formation;
+	entry->resource_x_acquisition_generation = ref->acquisition_generation;
+	entry->resource_x_progress_flags = RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1;
+	entry->resource_x_no_progress_generation = 0;
+	entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_NONE;
+	broadcast = true;
+	result = RESOURCE_X_APPLY_APPLIED;
+
+done:
+	LWLockRelease(&entry->entry_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	return result;
+}
+
+ResourceXExecutorProbeResult
+cluster_pcm_lock_resource_x_executor_probe_exact(const ResourceXAcquisitionRef *ref,
+											 ResourceXExecutorSnapshot *out_snapshot)
+{
+	struct GrdEntry *entry;
+	ResourceXExecutorProbeResult result;
+
+	if (out_snapshot == NULL)
+		return RESOURCE_X_EXECUTOR_CHANGED;
+	memset(out_snapshot, 0, sizeof(*out_snapshot));
+	if (!pcm_resource_x_ref_valid(ref))
+		return RESOURCE_X_EXECUTOR_CHANGED;
+	entry = pcm_find_entry(ref->assertion.resource);
+	if (entry == NULL)
+		return RESOURCE_X_EXECUTOR_CHANGED;
+
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	pcm_resource_x_snapshot_locked(entry, out_snapshot);
+	if (!pcm_resource_x_entry_exact(entry, ref))
+		result = RESOURCE_X_EXECUTOR_CHANGED;
+	else if ((entry->resource_x_progress_flags & ~RESOURCE_X_PROGRESS_KNOWN_MASK) != 0
+			 || (entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+		result = RESOURCE_X_EXECUTOR_RECOVERY_BLOCKED;
+	else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_T3) != 0)
+		result = RESOURCE_X_EXECUTOR_COMPLETE;
+	else if ((entry->resource_x_progress_flags
+			  & (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1))
+			 != (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1)
+			 || (entry->resource_x_no_progress_generation == ref->acquisition_generation
+				 && entry->resource_x_no_progress_reason != RESOURCE_X_NO_PROGRESS_NONE))
+		result = RESOURCE_X_EXECUTOR_BLOCKED;
+	else
+		result = RESOURCE_X_EXECUTOR_READY;
+	LWLockRelease(&entry->entry_lock.lock);
+	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_apply_exact(const ResourceXAcquisitionRef *ref,
+										  const ResourceXBufferInstallProof *proof)
+{
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+	bool broadcast = false;
+
+	if (!pcm_resource_x_ref_valid(ref) || proof == NULL || proof->ownership_generation == 0
+		|| proof->writer_activation_token == 0)
+		return RESOURCE_X_APPLY_INVALID;
+	if (proof->resource_x_activation_generation != ref->acquisition_generation)
+		return RESOURCE_X_APPLY_STALE;
+	entry = pcm_find_entry(ref->assertion.resource);
+	if (entry == NULL)
+		return RESOURCE_X_APPLY_NOT_FOUND;
+
+	pcm_entry_lock_exclusive(entry);
+	if (!pcm_resource_x_entry_exact(entry, ref))
+		result = RESOURCE_X_APPLY_STALE;
+	else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_T2) != 0)
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	else if ((entry->resource_x_progress_flags
+			  & (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1))
+			 != (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1))
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else {
+		entry->resource_x_progress_flags |= RESOURCE_X_PROGRESS_T2;
+		entry->resource_x_no_progress_generation = 0;
+		entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_NONE;
+		broadcast = true;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_activate_exact(const ResourceXAcquisitionRef *ref,
+											 const ResourceXBufferActivationProof *proof)
+{
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+	bool broadcast = false;
+
+	if (!pcm_resource_x_ref_valid(ref) || proof == NULL || proof->ownership_generation == 0)
+		return RESOURCE_X_APPLY_INVALID;
+	if (proof->writer_activation_token != 0 || proof->resource_x_activation_generation != 0)
+		return RESOURCE_X_APPLY_STALE;
+	entry = pcm_find_entry(ref->assertion.resource);
+	if (entry == NULL)
+		return RESOURCE_X_APPLY_NOT_FOUND;
+
+	pcm_entry_lock_exclusive(entry);
+	if (!pcm_resource_x_entry_exact(entry, ref))
+		result = RESOURCE_X_APPLY_STALE;
+	else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_T3) != 0)
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	else if ((entry->resource_x_progress_flags
+			  & (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1
+				 | RESOURCE_X_PROGRESS_T2))
+			 != (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1
+				 | RESOURCE_X_PROGRESS_T2))
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else {
+		entry->resource_x_progress_flags
+			= (entry->resource_x_progress_flags | RESOURCE_X_PROGRESS_T3)
+			  & ~RESOURCE_X_PROGRESS_BOUND;
+		entry->resource_x_no_progress_generation = 0;
+		entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_NONE;
+		broadcast = true;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	return result;
+}
+
+void
+cluster_pcm_lock_resource_x_publish_no_progress_exact(const ResourceXAcquisitionRef *ref,
+												   ResourceXNoProgressReason reason)
+{
+	struct GrdEntry *entry;
+	bool broadcast = false;
+
+	if (!pcm_resource_x_ref_valid(ref) || reason <= RESOURCE_X_NO_PROGRESS_NONE
+		|| reason > RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT)
+		return;
+	entry = pcm_find_entry(ref->assertion.resource);
+	if (entry == NULL)
+		return;
+
+	pcm_entry_lock_exclusive(entry);
+	if (pcm_resource_x_entry_exact(entry, ref)
+		&& (entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_T1) != 0
+		&& (entry->resource_x_progress_flags
+			& (RESOURCE_X_PROGRESS_T3 | RESOURCE_X_PROGRESS_RECOVERY_BLOCKED))
+			== 0
+		&& (entry->resource_x_no_progress_generation != ref->acquisition_generation
+			|| entry->resource_x_no_progress_reason != (uint32)reason)) {
+		entry->resource_x_no_progress_generation = ref->acquisition_generation;
+		entry->resource_x_no_progress_reason = (uint32)reason;
+		broadcast = true;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
 }
 
 /*
@@ -3701,6 +4052,10 @@ cluster_pcm_grd_init(void)
 		 */
 		memset(ClusterPcm, 0, sizeof(*ClusterPcm));
 		LWLockInitialize(&ClusterPcm->htab_lock.lock, LWTRANCHE_CLUSTER_PCM);
+		pg_atomic_init_u32(&ClusterPcm->resource_x_gate_phase, RESOURCE_X_GATE_OPEN);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_gate_formation, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_freeze_generation, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_activation_inflight_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_n_to_s_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_n_to_x_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_upgrade_count, 0);
@@ -3783,6 +4138,13 @@ pcm_get_or_create_entry(BufferTag tag)
 		/* PGRAC: spec-2.37 D2 HC125+HC126 — PI watermark single field default 0. */
 		entry->pi_watermark_lsn = InvalidXLogRecPtr;
 		entry->pi_watermark_scn = InvalidScn;	/* spec-2.41 D2 — SCN watermark default */
+		entry->resource_x_requester_node = -1;
+		entry->resource_x_progress_flags = 0;
+		entry->resource_x_formation = 0;
+		entry->resource_x_acquisition_generation = 0;
+		entry->resource_x_no_progress_generation = 0;
+		entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_NONE;
+		entry->resource_x_dispatch_phase = 0;
 		ConditionVariableInit(&entry->wait_cv); /* PGRAC: spec-2.31 D1 v0.4 */
 		LWLockInitialize(&entry->entry_lock.lock, LWTRANCHE_CLUSTER_PCM);
 	}

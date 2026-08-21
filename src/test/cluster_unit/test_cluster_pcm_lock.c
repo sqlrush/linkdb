@@ -50,6 +50,7 @@
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h" /* BufferTag */
@@ -1016,10 +1017,141 @@ UT_TEST(test_pcm_real_summary_counts_live_entries)
 	UT_ASSERT_EQ(pi_total, 1);
 }
 
-UT_TEST(test_pcm_grd_entry_abi_remains_264_bytes)
+UT_TEST(test_pcm_grd_entry_abi_includes_resource_x_executor_state)
 {
 	reset_fake_pcm_runtime(4);
-	UT_ASSERT_EQ(fake_pcm_entrysize, 264);
+	UT_ASSERT_EQ(fake_pcm_entrysize, 304);
+}
+
+static ResourceXAcquisitionRef
+make_resource_x_acquisition_ref(BufferTag tag, int32 requester_node, uint64 formation,
+								uint64 acquisition_generation)
+{
+	ResourceXAcquisitionRef ref;
+
+	memset(&ref, 0, sizeof(ref));
+	UT_ASSERT(resource_x_assertion_init(&tag, requester_node, &ref.assertion));
+	ref.formation = formation;
+	ref.acquisition_generation = acquisition_generation;
+	return ref;
+}
+
+UT_TEST(test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress)
+{
+	BufferTag tag = make_tag(65);
+	BufferTag ungranted_tag = make_tag(66);
+	ResourceXAcquisitionRef ref;
+	ResourceXAcquisitionRef changed;
+	ResourceXAcquisitionRef ungranted;
+	ResourceXExecutorSnapshot snapshot;
+	ResourceXBufferInstallProof install;
+	ResourceXBufferActivationProof activation;
+
+	reset_fake_pcm_runtime(4);
+	ref = make_resource_x_acquisition_ref(tag, 2, 17, 41);
+	changed = ref;
+	changed.acquisition_generation++;
+	ungranted = make_resource_x_acquisition_ref(ungranted_tag, 2, 17, 42);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ungranted),
+				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_X, 2));
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&changed),
+				 RESOURCE_X_APPLY_STALE);
+	memset(&snapshot, 0, sizeof(snapshot));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &snapshot),
+				 RESOURCE_X_EXECUTOR_READY);
+	UT_ASSERT_EQ(snapshot.progress_flags, RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1);
+	UT_ASSERT(resource_x_assertion_equal(&snapshot.ref.assertion, &ref.assertion));
+	UT_ASSERT_EQ(snapshot.ref.formation, ref.formation);
+	UT_ASSERT_EQ(snapshot.ref.acquisition_generation, ref.acquisition_generation);
+
+	cluster_pcm_lock_resource_x_publish_no_progress_exact(
+		&ref, RESOURCE_X_NO_PROGRESS_BUFFER_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &snapshot),
+				 RESOURCE_X_EXECUTOR_BLOCKED);
+	UT_ASSERT_EQ(snapshot.no_progress_generation, ref.acquisition_generation);
+	UT_ASSERT_EQ(snapshot.no_progress_reason, RESOURCE_X_NO_PROGRESS_BUFFER_BUSY);
+
+	memset(&install, 0, sizeof(install));
+	install.ownership_generation = 9;
+	install.writer_activation_token = 12;
+	install.resource_x_activation_generation = changed.acquisition_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(&ref, &install),
+				 RESOURCE_X_APPLY_STALE);
+	install.resource_x_activation_generation = ref.acquisition_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(&ref, &install),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(&ref, &install),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &snapshot),
+				 RESOURCE_X_EXECUTOR_READY);
+	UT_ASSERT_EQ(snapshot.progress_flags,
+				 RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1 | RESOURCE_X_PROGRESS_T2);
+	UT_ASSERT_EQ(snapshot.no_progress_generation, 0);
+	UT_ASSERT_EQ(snapshot.no_progress_reason, RESOURCE_X_NO_PROGRESS_NONE);
+
+	memset(&activation, 0, sizeof(activation));
+	activation.ownership_generation = install.ownership_generation;
+	activation.writer_activation_token = install.writer_activation_token;
+	activation.resource_x_activation_generation = ref.acquisition_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(&ref, &activation),
+				 RESOURCE_X_APPLY_STALE);
+	activation.writer_activation_token = 0;
+	activation.resource_x_activation_generation = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(&ref, &activation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(&ref, &activation),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &snapshot),
+				 RESOURCE_X_EXECUTOR_COMPLETE);
+	UT_ASSERT_EQ(snapshot.progress_flags,
+				 RESOURCE_X_PROGRESS_T1 | RESOURCE_X_PROGRESS_T2 | RESOURCE_X_PROGRESS_T3);
+	UT_ASSERT_EQ(fake_cv_broadcast_count, 4);
+}
+
+UT_TEST(test_resource_x_executor_admission_is_formation_exact_and_balanced)
+{
+	BufferTag tag = make_tag(67);
+	ResourceXAcquisitionRef ref;
+	ResourceXAcquisitionRef changed;
+	ResourceXActivationGateToken gate;
+	ResourceXActivationGateToken refused;
+
+	reset_fake_pcm_runtime(4);
+	ref = make_resource_x_acquisition_ref(tag, 2, 17, 41);
+	changed = ref;
+	changed.formation++;
+	memset(&gate, 0xA5, sizeof(gate));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_executor_enter(&ref, &gate));
+	UT_ASSERT_EQ(gate.active, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 0);
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(ref.formation),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(ref.formation),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(changed.formation),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_executor_enter(&ref, &gate));
+	UT_ASSERT_EQ(gate.active, 1);
+	UT_ASSERT_EQ(gate.formation, ref.formation);
+	UT_ASSERT_EQ(gate.acquisition_generation, ref.acquisition_generation);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 1);
+
+	memset(&refused, 0xA5, sizeof(refused));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_executor_enter(&changed, &refused));
+	UT_ASSERT_EQ(refused.active, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 1);
+	cluster_pcm_lock_resource_x_executor_leave(&gate);
+	UT_ASSERT_EQ(gate.active, 0);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 0);
+	cluster_pcm_lock_resource_x_executor_leave(&gate);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 0);
 }
 
 UT_TEST(test_pcm_grd_convert_queue_placeholder_remains_null)
@@ -2452,7 +2584,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(61);
+	UT_PLAN(63);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -2478,7 +2610,9 @@ main(void)
 	UT_RUN(test_pcm_real_x_release_and_downgrade_require_owner);
 	UT_RUN(test_pcm_real_upgrade_requires_single_s_holder);
 	UT_RUN(test_pcm_real_summary_counts_live_entries);
-	UT_RUN(test_pcm_grd_entry_abi_remains_264_bytes);
+	UT_RUN(test_pcm_grd_entry_abi_includes_resource_x_executor_state);
+	UT_RUN(test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress);
+	UT_RUN(test_resource_x_executor_admission_is_formation_exact_and_balanced);
 	UT_RUN(test_pcm_grd_convert_queue_placeholder_remains_null);
 	UT_RUN(test_pcm_real_wait_event_call_sites_are_exercised);
 	UT_RUN(test_pcm_H1_same_node_s_refcount_increments);

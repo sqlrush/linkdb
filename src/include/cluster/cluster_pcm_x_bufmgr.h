@@ -24,6 +24,7 @@
 #include "access/transam.h"
 #include "access/xlogdefs.h"
 #include "cluster/cluster_pcm_own.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "storage/buf_internals.h"
 
@@ -145,12 +146,55 @@ typedef struct ClusterPcmOwnSnapshot {
 	 * sampled under the same BufferDesc header lock as the authoritative
 	 * ownership tuple, but is not part of snapshot matching or wire state. */
 	uint64 writer_activation_token;
+	uint64 resource_x_activation_generation;
 	uint32 flags;
 	uint8 pcm_state;
 	uint8 _reserved[3];
 } ClusterPcmOwnSnapshot;
 
-StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 56, "ClusterPcmOwnSnapshot must remain 56 bytes");
+StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 64, "ClusterPcmOwnSnapshot must remain 64 bytes");
+
+typedef struct ResourceXCurrentImage {
+	const char *page_bytes;
+	XLogRecPtr page_lsn;
+	SCN page_scn;
+	uint32 page_checksum;
+	uint32 image_length;
+} ResourceXCurrentImage;
+
+typedef enum ResourceXBufferActivationResult {
+	RESOURCE_X_BUFFER_T2_INSTALLED = 0,
+	RESOURCE_X_BUFFER_ALREADY_INSTALLED,
+	RESOURCE_X_BUFFER_BUSY,
+	RESOURCE_X_BUFFER_ABSENT,
+	RESOURCE_X_BUFFER_STALE,
+	RESOURCE_X_BUFFER_CORRUPT
+} ResourceXBufferActivationResult;
+
+StaticAssertDecl(sizeof(ResourceXCurrentImage) == 32,
+				 "ResourceXCurrentImage process-local layout must remain 32 bytes");
+
+static inline bool
+cluster_pcm_x_resource_x_t2_snapshot_exact(const ResourceXAcquisitionRef *ref,
+											 const ClusterPcmOwnSnapshot *live)
+{
+	return ref != NULL && live != NULL && ref->formation != 0
+		   && ref->acquisition_generation != 0
+		   && BufferTagsEqual(&ref->assertion.resource, &live->tag)
+		   && live->pcm_state == (uint8)PCM_STATE_X && live->flags == 0
+		   && live->reservation_token != 0
+		   && live->writer_activation_token == live->reservation_token
+		   && (live->resource_x_activation_generation == 0
+			   || live->resource_x_activation_generation == ref->acquisition_generation);
+}
+
+static inline bool
+cluster_pcm_x_resource_x_t3_snapshot_exact(const ResourceXAcquisitionRef *ref,
+											 const ClusterPcmOwnSnapshot *live)
+{
+	return cluster_pcm_x_resource_x_t2_snapshot_exact(ref, live)
+		   && live->resource_x_activation_generation == ref->acquisition_generation;
+}
 
 /*
  * Process-local evidence for a reversible finish-revoke refusal.  The DATA
@@ -219,9 +263,12 @@ cluster_pcm_x_writer_grant_snapshot_exact(const PcmXLocalWriterClaim *claim,
 				  == (claim->role == PCM_X_LOCAL_ROLE_NODE_LEADER
 						  ? granted->reservation_token
 						  : 0)
+		   && granted->resource_x_activation_generation == 0
 		   && BufferTagsEqual(&live->tag, &granted->tag) && live->generation == granted->generation
 		   && live->reservation_token == granted->reservation_token
 		   && live->writer_activation_token == granted->writer_activation_token
+		   && live->resource_x_activation_generation
+				  == granted->resource_x_activation_generation
 		   && live->flags == granted->flags
 		   && live->pcm_state == granted->pcm_state;
 }
@@ -276,11 +323,34 @@ cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captur
  * coherence domain; an active tracked page must already hold exact X.  Live
  * transition/retained evidence remains closed regardless of runtime state. */
 static inline bool
-cluster_pcm_x_conditional_lock_allowed(bool runtime_active, bool tracked, bool retained_image,
-									   uint8 pcm_state, uint32 flags)
+cluster_pcm_x_ordinary_mutation_allowed(bool runtime_active, bool tracked, bool retained_image,
+									uint8 pcm_state, uint32 flags,
+									uint64 writer_activation_token,
+									uint64 resource_x_activation_generation)
 {
 	return !retained_image && flags == 0
-		   && (!runtime_active || !tracked || pcm_state == (uint8)PCM_STATE_X);
+		   && (!runtime_active || !tracked
+			   || (pcm_state == (uint8)PCM_STATE_X && writer_activation_token == 0
+				   && resource_x_activation_generation == 0));
+}
+
+static inline bool
+cluster_pcm_x_conditional_lock_allowed(bool runtime_active, bool tracked, bool retained_image,
+									   uint8 pcm_state, uint32 flags,
+									   uint64 writer_activation_token,
+									   uint64 resource_x_activation_generation)
+{
+	return cluster_pcm_x_ordinary_mutation_allowed(
+		runtime_active, tracked, retained_image, pcm_state, flags,
+		writer_activation_token, resource_x_activation_generation);
+}
+
+static inline bool
+cluster_pcm_x_flush_fence_consistent(bool dirty, uint64 writer_activation_token,
+									 uint64 resource_x_activation_generation)
+{
+	return !dirty || (writer_activation_token == 0
+					&& resource_x_activation_generation == 0);
 }
 
 typedef ClusterPcmOwnSnapshot ClusterPcmOwnEvictionCapture;
@@ -412,11 +482,19 @@ cluster_pcm_x_grant_pending_republish_shape(uint8 pcm_state, uint32 flags, uint6
 static inline bool
 cluster_pcm_own_eviction_reuse_allowed(const ClusterPcmOwnEvictionCapture *capture)
 {
-	return capture != NULL && capture->generation != UINT64_MAX && capture->flags == 0;
+	return capture != NULL && capture->generation != UINT64_MAX && capture->flags == 0
+		   && capture->writer_activation_token == 0
+		   && capture->resource_x_activation_generation == 0;
 }
 
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf,
 														   ClusterPcmOwnSnapshot *out_snapshot);
+extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_activate_x_by_tag(
+	const ResourceXAcquisitionRef *ref, const ResourceXCurrentImage *image,
+	ResourceXBufferInstallProof *out_proof);
+extern ResourceXBufferActivationResult
+cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
+	const ResourceXAcquisitionRef *ref, ResourceXBufferActivationProof *out_proof);
 /* Resolve one resident descriptor and snapshot its ownership tuple while the
  * mapping partition and buffer header still bind the same BufferTag.  The
  * returned buffer id is only a locator; every later lifecycle call rechecks
