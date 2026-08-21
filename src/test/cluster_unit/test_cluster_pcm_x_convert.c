@@ -27,6 +27,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/buf_internals.h"
 #include "storage/proc.h"
@@ -81,6 +82,8 @@ static bool fake_shmem_found;
 static Size fake_shmem_size;
 static const ClusterShmemRegion *registered_region;
 static int registered_region_count;
+static const ClusterSemanticActivationDescriptor *registered_semantic_descriptor;
+static int registered_semantic_descriptor_count;
 
 static sigjmp_buf test_jump;
 static bool arithmetic_jump_armed;
@@ -285,6 +288,13 @@ cluster_shmem_register_region(const ClusterShmemRegion *region)
 {
 	registered_region = region;
 	registered_region_count++;
+}
+
+void
+cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor)
+{
+	registered_semantic_descriptor = descriptor;
+	registered_semantic_descriptor_count++;
 }
 
 /* Referenced by the fail-closed logging guard in cluster_pcm_x_convert.c;
@@ -629,6 +639,8 @@ reset_fake_shmem(void)
 	ClusterPcmXConvertShmem = NULL;
 	registered_region = NULL;
 	registered_region_count = 0;
+	registered_semantic_descriptor = NULL;
+	registered_semantic_descriptor_count = 0;
 	arithmetic_jump_armed = false;
 	ereport_jump_armed = false;
 	arithmetic_overflow_count = 0;
@@ -16774,6 +16786,101 @@ UT_TEST(test_registration_exposes_one_exact_region)
 	UT_ASSERT_EQ(registered_region->init_fn, cluster_pcm_x_convert_shmem_init);
 	UT_ASSERT_EQ(registered_region->lwlock_count, PCM_X_LWLOCK_COUNT);
 	UT_ASSERT_EQ(registered_region->reserved_flags, 0);
+	UT_ASSERT_EQ(registered_semantic_descriptor_count, 1);
+	UT_ASSERT_EQ(registered_semantic_descriptor,
+				 cluster_pcm_x_resource_x_descriptor());
+}
+
+UT_TEST(test_resource_x_activation_descriptor_is_exact_and_zero_ready)
+{
+	const ClusterSemanticActivationDescriptor *descriptor;
+	ClusterSemanticActivationRefusal refusal;
+	ClusterSemanticZeroProof proof;
+
+	reset_fake_shmem();
+	descriptor = cluster_pcm_x_resource_x_descriptor();
+	UT_ASSERT_NOT_NULL(descriptor);
+	UT_ASSERT_STR_EQ(descriptor->name, "RESOURCE_X_LOGICAL_ID_V1");
+	UT_ASSERT_EQ(descriptor->feature_bit,
+				 CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1);
+	UT_ASSERT_EQ(descriptor->required_hello_caps,
+				 PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+				 | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1);
+	UT_ASSERT_EQ(descriptor->required_active_bits, 0);
+	UT_ASSERT(descriptor->source_available);
+	UT_ASSERT_NOT_NULL(descriptor->pre_prepare_readiness);
+	UT_ASSERT_NOT_NULL(descriptor->close_source_admission);
+	UT_ASSERT_NOT_NULL(descriptor->source_logical_debt_zero);
+	UT_ASSERT_NOT_NULL(descriptor->source_transport_zero);
+	UT_ASSERT_NOT_NULL(descriptor->prepare_target);
+	UT_ASSERT_NOT_NULL(descriptor->apply_target_closed);
+	UT_ASSERT_NOT_NULL(descriptor->revert_source_closed);
+	UT_ASSERT_NOT_NULL(descriptor->open_target_admission);
+
+	memset(&refusal, 0xff, sizeof(refusal));
+	UT_ASSERT_EQ(descriptor->pre_prepare_readiness(7, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.feature_bit,
+				 CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1);
+	UT_ASSERT_EQ(refusal.expected_generation, 7);
+
+	cluster_pcm_x_convert_shmem_init();
+	memset(&proof, 0xff, sizeof(proof));
+	UT_ASSERT_EQ(descriptor->source_logical_debt_zero(7, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(proof.record_generation, 7);
+	UT_ASSERT_EQ(proof.debt_count, 0);
+	UT_ASSERT_EQ(proof.sample_digest, 0);
+	memset(&proof, 0xff, sizeof(proof));
+	UT_ASSERT_EQ(descriptor->source_transport_zero(7, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(proof.record_generation, 7);
+	UT_ASSERT_EQ(proof.debt_count, 0);
+	UT_ASSERT_EQ(proof.sample_digest, 0);
+}
+
+UT_TEST(test_resource_x_activation_refuses_open_local_round)
+{
+	const ClusterSemanticActivationDescriptor *descriptor;
+	ClusterSemanticZeroProof proof;
+	PcmXSlotRef tag_ref;
+
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	descriptor = cluster_pcm_x_resource_x_descriptor();
+	(void) reserve_slot(PCM_X_ALLOC_LOCAL_TAG, &tag_ref);
+
+	memset(&proof, 0xff, sizeof(proof));
+	UT_ASSERT_EQ(descriptor->source_logical_debt_zero(11, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
+	UT_ASSERT_EQ(descriptor->prepare_target(11),
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
+	UT_ASSERT_EQ(cluster_pcm_x_allocator_release_exact(
+				 PCM_X_ALLOC_LOCAL_TAG, tag_ref,
+				 PCM_X_SLOT_RESERVED_NONVISIBLE), PCM_X_ALLOC_OK);
+}
+
+UT_TEST(test_resource_x_activation_refuses_staged_local_frame)
+{
+	const ClusterSemanticActivationDescriptor *descriptor;
+	ClusterSemanticZeroProof proof;
+	PcmXSlotRef tag_ref;
+	PcmXLocalTagSlot *tag;
+
+	reset_fake_shmem();
+	cluster_pcm_x_convert_shmem_init();
+	descriptor = cluster_pcm_x_resource_x_descriptor();
+	tag = (PcmXLocalTagSlot *)reserve_slot(PCM_X_ALLOC_LOCAL_TAG, &tag_ref);
+	tag->reliable.pending_opcode = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
+
+	memset(&proof, 0xff, sizeof(proof));
+	UT_ASSERT_EQ(descriptor->source_transport_zero(13, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO);
+	tag->reliable.pending_opcode = 0;
+	UT_ASSERT_EQ(cluster_pcm_x_allocator_release_exact(
+				 PCM_X_ALLOC_LOCAL_TAG, tag_ref,
+				 PCM_X_SLOT_RESERVED_NONVISIBLE), PCM_X_ALLOC_OK);
 }
 
 
@@ -17577,7 +17684,7 @@ UT_TEST(test_runtime_reform_tag_epoch_failure_keeps_blocked)
 int
 main(void)
 {
-	UT_PLAN(291);
+	UT_PLAN(294);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -17854,6 +17961,9 @@ main(void)
 	UT_RUN(test_attach_validator_rejects_magic_capacity_and_offset_mismatch);
 	UT_RUN(test_exec_backend_init_fails_closed_on_layout_mismatch);
 	UT_RUN(test_registration_exposes_one_exact_region);
+	UT_RUN(test_resource_x_activation_descriptor_is_exact_and_zero_ready);
+	UT_RUN(test_resource_x_activation_refuses_open_local_round);
+	UT_RUN(test_resource_x_activation_refuses_staged_local_frame);
 	UT_RUN(test_stats_initialize_zero_and_narrow_note_apis_are_exact);
 	UT_RUN(test_queue_wait_count_tracks_only_linearized_requester_waits);
 	UT_RUN(test_requester_wait_preserves_late_revoke_barrier_refusal);

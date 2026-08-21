@@ -1114,6 +1114,31 @@ UT_TEST(test_10_r4_descriptor_has_every_callback)
 	UT_ASSERT_NOT_NULL(descriptor->open_target_admission);
 }
 
+UT_TEST(test_10a_compiled_registry_accepts_resource_x_descriptor)
+{
+	const ClusterSemanticActivationDescriptor *r4
+		= cluster_semantic_activation_r4_descriptor();
+	static ClusterSemanticActivationDescriptor resource_x;
+
+	resource_x = *r4;
+	resource_x.name = "RESOURCE_X_LOGICAL_ID_V1";
+	resource_x.feature_bit
+		= CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1;
+	resource_x.required_hello_caps
+		= PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+		  | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	cluster_semantic_activation_register(&resource_x);
+
+	UT_ASSERT_EQ(cluster_semantic_activation_descriptor(
+				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1), r4);
+	UT_ASSERT_EQ(cluster_semantic_activation_descriptor(
+				 CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1),
+				 &resource_x);
+	UT_ASSERT_EQ(cluster_semantic_activation_compiled_feature_bitmap(),
+				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+				 | CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1);
+}
+
 UT_TEST(test_11_source_only_is_exclusive)
 {
 	UT_ASSERT(semantic_activation_source_target_exclusive(true, false));
@@ -5483,7 +5508,7 @@ UT_TEST(test_145g_peer_open_matches_consumes_open_proof)
 int
 main(void)
 {
-	UT_PLAN(202);
+	UT_PLAN(203);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -5494,6 +5519,7 @@ main(void)
 	UT_RUN(test_08_r4_descriptor_caps_and_active_bits);
 	UT_RUN(test_09_r4_descriptor_retains_source);
 	UT_RUN(test_10_r4_descriptor_has_every_callback);
+	UT_RUN(test_10a_compiled_registry_accepts_resource_x_descriptor);
 	UT_RUN(test_11_source_only_is_exclusive);
 	UT_RUN(test_12_target_only_is_exclusive);
 	UT_RUN(test_13_enable_source_open_to_admission_stopped);

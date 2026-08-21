@@ -20,6 +20,7 @@
 #include "nodes/parsenodes.h"
 
 #define CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 (UINT64_C(1) << 0)
+#define CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1 (UINT64_C(1) << 1)
 #define CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES 512
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_MAGIC UINT32_C(0x314B4341)
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION UINT16_C(1)
@@ -302,6 +303,9 @@ extern bool cluster_r4_bit22_cutover_begin(
 	const ClusterControlRootMigrationRoundV1 *round);
 extern void
 cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor);
+extern const ClusterSemanticActivationDescriptor *
+cluster_semantic_activation_descriptor(uint64 feature_bit);
+extern uint64 cluster_semantic_activation_compiled_feature_bitmap(void);
 extern bool cluster_semantic_activation_record_encode(const ClusterSemanticActivationRecord *record,
 												  uint8 bytes[512]);
 extern bool cluster_semantic_activation_record_decode(const uint8 bytes[512],

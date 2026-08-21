@@ -40,6 +40,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_resource_x_identity.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 
 
@@ -21838,6 +21839,173 @@ static const ClusterShmemRegion pcm_x_convert_region = {
 	.reserved_flags = 0,
 };
 
+static bool
+pcm_x_resource_x_drain_snapshot(uint64 *logical_debt_out,
+								uint64 *transport_debt_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXAllocatorView ticket_view;
+	PcmXAllocatorView local_tag_view;
+	uint64 logical_debt;
+	uint64 local_tag_debt;
+	uint64 local_wait_debt;
+	uint64 transport_debt = 0;
+	bool allocator_lock_held;
+	Size index;
+
+	if (header == NULL || logical_debt_out == NULL
+		|| transport_debt_out == NULL)
+		return false;
+	allocator_lock_held = LWLockHeldByMe(&header->allocator_lock.lock);
+	if (!allocator_lock_held)
+		LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+
+	logical_debt = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TICKET].used;
+	local_tag_debt = (uint64)header->allocator[PCM_X_ALLOC_LOCAL_TAG].used;
+	local_wait_debt = (uint64)header->allocator[PCM_X_ALLOC_LOCAL_WAIT].used;
+	if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET, &ticket_view)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_TAG, &local_tag_view)) {
+		if (!allocator_lock_held)
+			LWLockRelease(&header->allocator_lock.lock);
+		return false;
+	}
+	if (UINT64_MAX - logical_debt < local_tag_debt) {
+		if (!allocator_lock_held)
+			LWLockRelease(&header->allocator_lock.lock);
+		return false;
+	}
+	logical_debt += local_tag_debt;
+	if (UINT64_MAX - logical_debt < local_wait_debt) {
+		if (!allocator_lock_held)
+			LWLockRelease(&header->allocator_lock.lock);
+		return false;
+	}
+	logical_debt += local_wait_debt;
+
+	for (index = 0; index < ticket_view.capacity; index++) {
+		PcmXMasterTicketSlot *ticket
+			= (PcmXMasterTicketSlot *)pcm_x_allocator_slot(&ticket_view, index);
+
+		if (ticket != NULL && ticket->reliable.pending_opcode != 0)
+			transport_debt++;
+	}
+	for (index = 0; index < local_tag_view.capacity; index++) {
+		PcmXLocalTagSlot *tag
+			= (PcmXLocalTagSlot *)pcm_x_allocator_slot(&local_tag_view, index);
+
+		if (tag == NULL)
+			continue;
+		if (tag->reliable.pending_opcode != 0)
+			transport_debt++;
+		if (tag->holder_reliable.pending_opcode != 0)
+			transport_debt++;
+		if (tag->blocker_snapshot_reliable.pending_opcode != 0)
+			transport_debt++;
+	}
+	if (!allocator_lock_held)
+		LWLockRelease(&header->allocator_lock.lock);
+	*logical_debt_out = logical_debt;
+	*transport_debt_out = transport_debt;
+	return true;
+}
+
+static ClusterSemanticActivationResult
+pcm_x_resource_x_readiness(uint64 expected_generation,
+							 ClusterSemanticActivationRefusal *refusal)
+{
+	if (refusal != NULL) {
+		refusal->result = CLUSTER_SEMANTIC_ACTIVATION_OK;
+		refusal->feature_bit
+			= CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1;
+		refusal->expected_generation = expected_generation;
+	}
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static ClusterSemanticActivationResult
+pcm_x_resource_x_stage_ok(uint64 generation)
+{
+	return generation == 0 ? CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
+						   : CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static ClusterSemanticActivationResult
+pcm_x_resource_x_logical_zero(uint64 generation,
+							ClusterSemanticZeroProof *proof)
+{
+	uint64 logical_debt;
+	uint64 transport_debt;
+
+	if (generation == 0 || proof == NULL)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	memset(proof, 0, sizeof(*proof));
+	if (!pcm_x_resource_x_drain_snapshot(&logical_debt, &transport_debt))
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	(void) transport_debt;
+	if (logical_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+	proof->record_generation = generation;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static ClusterSemanticActivationResult
+pcm_x_resource_x_transport_zero(uint64 generation,
+							  ClusterSemanticZeroProof *proof)
+{
+	uint64 logical_debt;
+	uint64 transport_debt;
+
+	if (generation == 0 || proof == NULL)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	memset(proof, 0, sizeof(*proof));
+	if (!pcm_x_resource_x_drain_snapshot(&logical_debt, &transport_debt))
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	(void) logical_debt;
+	if (transport_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+	proof->record_generation = generation;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static ClusterSemanticActivationResult
+pcm_x_resource_x_closed_zero(uint64 generation)
+{
+	uint64 logical_debt;
+	uint64 transport_debt;
+
+	if (generation == 0
+		|| !pcm_x_resource_x_drain_snapshot(&logical_debt, &transport_debt))
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	if (logical_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+	if (transport_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static const ClusterSemanticActivationDescriptor pcm_x_resource_x_descriptor = {
+	.name = "RESOURCE_X_LOGICAL_ID_V1",
+	.feature_bit = CLUSTER_SEMANTIC_FEATURE_RESOURCE_X_LOGICAL_ID_V1,
+	.required_hello_caps = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+		| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+	.required_active_bits = 0,
+	.source_available = true,
+	.pre_prepare_readiness = pcm_x_resource_x_readiness,
+	.close_source_admission = pcm_x_resource_x_stage_ok,
+	.source_logical_debt_zero = pcm_x_resource_x_logical_zero,
+	.source_transport_zero = pcm_x_resource_x_transport_zero,
+	.prepare_target = pcm_x_resource_x_closed_zero,
+	.apply_target_closed = pcm_x_resource_x_closed_zero,
+	.revert_source_closed = pcm_x_resource_x_closed_zero,
+	.open_target_admission = pcm_x_resource_x_stage_ok,
+};
+
+const ClusterSemanticActivationDescriptor *
+cluster_pcm_x_resource_x_descriptor(void)
+{
+	return &pcm_x_resource_x_descriptor;
+}
+
 
 /*
  * cluster_pcm_x_convert_shmem_register -- Register the one external region.
@@ -21856,5 +22024,6 @@ static const ClusterShmemRegion pcm_x_convert_region = {
 void
 cluster_pcm_x_convert_shmem_register(void)
 {
+	cluster_semantic_activation_register(&pcm_x_resource_x_descriptor);
 	cluster_shmem_register_region(&pcm_x_convert_region);
 }

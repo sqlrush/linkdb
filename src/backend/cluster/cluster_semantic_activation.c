@@ -4734,6 +4734,14 @@ static const ClusterSemanticActivationDescriptor r4_descriptor = {
 	.open_target_admission = r4_stage_fail_closed,
 };
 
+/* Immutable after postmaster module registration.  R4 occupies bit zero in
+ * every build; later feature modules register their compile-time descriptor
+ * during the same shared-memory registration window. */
+static const ClusterSemanticActivationDescriptor
+	*SemanticActivationDescriptors[64] = {
+		[0] = &r4_descriptor,
+	};
+
 /*
  * RF-ROOT P7 (contract): bit22 cutover round — member-side OPEN_APPLIED
  * stage.  The member applies the bit22 latch (one-shot, monotonic; the
@@ -5889,11 +5897,30 @@ semantic_activation_ack_lmon_begin_barrier_round(
 }
 
 static bool
+semantic_activation_feature_bit_index(uint64 feature_bit, int *feature_index)
+{
+	int index = 0;
+
+	if (feature_bit == 0 || feature_index == NULL
+		|| (feature_bit & (feature_bit - 1)) != 0)
+		return false;
+	while ((feature_bit & UINT64_C(1)) == 0) {
+		feature_bit >>= 1;
+		index++;
+	}
+	*feature_index = index;
+	return true;
+}
+
+static bool
 semantic_activation_feature_index(uint64 feature_bit, int *feature_index)
 {
-	if (feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 || feature_index == NULL)
+	int index;
+
+	if (!semantic_activation_feature_bit_index(feature_bit, &index)
+		|| SemanticActivationDescriptors[index] == NULL)
 		return false;
-	*feature_index = 0;
+	*feature_index = index;
 	return true;
 }
 
@@ -8731,7 +8758,67 @@ semantic_activation_lmon_publish_fresh_shared_pgrd(
 
 void
 cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor)
-{}
+{
+	int feature_index;
+	int index;
+
+	if (descriptor == NULL || descriptor->name == NULL
+		|| descriptor->name[0] == '\0'
+		|| !semantic_activation_feature_bit_index(
+			descriptor->feature_bit, &feature_index)
+		|| descriptor->required_hello_caps == 0
+		|| descriptor->pre_prepare_readiness == NULL
+		|| descriptor->close_source_admission == NULL
+		|| descriptor->source_logical_debt_zero == NULL
+		|| descriptor->source_transport_zero == NULL
+		|| descriptor->prepare_target == NULL
+		|| descriptor->apply_target_closed == NULL
+		|| descriptor->revert_source_closed == NULL
+		|| descriptor->open_target_admission == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("invalid semantic activation descriptor")));
+
+	if (SemanticActivationDescriptors[feature_index] != NULL) {
+		if (SemanticActivationDescriptors[feature_index] == descriptor)
+			return;
+		ereport(FATAL,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("duplicate semantic activation feature bit")));
+	}
+	for (index = 0; index < 64; index++) {
+		const ClusterSemanticActivationDescriptor *registered
+			= SemanticActivationDescriptors[index];
+
+		if (registered != NULL && strcmp(registered->name, descriptor->name) == 0)
+			ereport(FATAL,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("duplicate semantic activation feature name")));
+	}
+	SemanticActivationDescriptors[feature_index] = descriptor;
+}
+
+const ClusterSemanticActivationDescriptor *
+cluster_semantic_activation_descriptor(uint64 feature_bit)
+{
+	int feature_index;
+
+	if (!semantic_activation_feature_index(feature_bit, &feature_index))
+		return NULL;
+	return SemanticActivationDescriptors[feature_index];
+}
+
+uint64
+cluster_semantic_activation_compiled_feature_bitmap(void)
+{
+	uint64 bitmap = 0;
+	int index;
+
+	for (index = 0; index < 64; index++)
+		if (SemanticActivationDescriptors[index] != NULL)
+			bitmap |= UINT64_C(1) << index;
+	return bitmap;
+}
 
 static bool
 semantic_activation_ack_wire_value_valid(

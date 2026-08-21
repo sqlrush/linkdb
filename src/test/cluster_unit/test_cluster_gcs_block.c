@@ -75,6 +75,7 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_thread_recovery.h"
 #include "common/hashfn.h"
@@ -152,6 +153,13 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 
 void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{
+	abort();
+}
+
+void
+cluster_semantic_activation_register(
+	const ClusterSemanticActivationDescriptor *descriptor pg_attribute_unused())
 {
 	abort();
 }
