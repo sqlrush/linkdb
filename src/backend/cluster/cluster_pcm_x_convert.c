@@ -39,6 +39,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_shmem.h"
 
 
@@ -58,6 +59,8 @@ StaticAssertDecl(offsetof(PcmXLocalMembershipSlot, slot) == 0,
 				 "PCM-X local-membership slot header must be first");
 StaticAssertDecl((PCM_X_LOCK_PARTITIONS & (PCM_X_LOCK_PARTITIONS - 1)) == 0,
 				 "PCM-X lock partition count must be a power of two");
+StaticAssertDecl(PCM_X_PROTOCOL_NODE_LIMIT == RESOURCE_X_PROTOCOL_NODE_LIMIT,
+				 "legacy PCM-X and Resource-X node domains must match");
 StaticAssertDecl(PCM_X_RUNTIME_SHUTTING_DOWN < PCM_X_RUNTIME_GATE_STATE_MASK,
 				 "PCM-X runtime states must fit in the packed gate");
 
@@ -3821,6 +3824,7 @@ pcm_x_master_admit_begin_impl(const PcmXEnqueuePayload *request, PcmXMasterAdmis
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
+	ResourceXAssertion logical_assertion;
 	PcmXPeerFrontier *frontier;
 	PcmXMasterTagSlot *tag_slot = NULL;
 	PcmXMasterTicketSlot *ticket = NULL;
@@ -3847,6 +3851,8 @@ pcm_x_master_admit_begin_impl(const PcmXEnqueuePayload *request, PcmXMasterAdmis
 		pcm_x_master_admission_clear(admission_out);
 	if (header == NULL || request == NULL || admission_out == NULL
 		|| !pcm_x_wait_identity_valid(&request->identity)
+		|| !resource_x_assertion_init(&request->identity.tag,
+			request->identity.node_id, &logical_assertion)
 		|| request->prehandle.sender_session_incarnation == 0
 		|| request->prehandle.prehandle_sequence == 0)
 		return PCM_X_QUEUE_INVALID;
@@ -13939,6 +13945,7 @@ cluster_pcm_x_local_join_begin(const PcmXWaitIdentity *identity, int32 master_no
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
+	ResourceXAssertion logical_assertion;
 	PcmXPeerFrontier *frontier;
 	PcmXLocalTagSlot *tag_slot = NULL;
 	PcmXLocalMembershipSlot *member = NULL;
@@ -13962,6 +13969,8 @@ cluster_pcm_x_local_join_begin(const PcmXWaitIdentity *identity, int32 master_no
 
 	pcm_x_local_handle_clear(handle_out);
 	if (header == NULL || handle_out == NULL || !pcm_x_wait_identity_valid(identity)
+		|| !resource_x_assertion_init(&identity->tag, identity->node_id,
+			&logical_assertion)
 		|| master_node < 0 || master_node >= PCM_X_PROTOCOL_NODE_LIMIT
 		|| master_session_incarnation == 0)
 		return PCM_X_QUEUE_INVALID;

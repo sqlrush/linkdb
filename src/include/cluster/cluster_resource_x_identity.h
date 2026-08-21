@@ -1,0 +1,71 @@
+/*-------------------------------------------------------------------------
+ *
+ * cluster_resource_x_identity.h
+ *    Resource-X logical assertion identity — spec-8.6 D6-01.
+ *
+ * The global assertion is exactly (BufferTag, requester node).  Attempt and
+ * transport fields are witnesses only: neither expands logical equality nor
+ * grants queue/ownership authority.
+ *
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_RESOURCE_X_IDENTITY_H
+#define CLUSTER_RESOURCE_X_IDENTITY_H
+
+#include "storage/buf_internals.h"
+
+#define RESOURCE_X_PROTOCOL_NODE_LIMIT 32
+
+typedef struct ResourceXAssertion
+{
+	BufferTag	resource;
+	int32		requester_node;
+} ResourceXAssertion;
+
+typedef struct ResourceXAttemptWitness
+{
+	ResourceXAssertion assertion;
+	uint64		base_authority_generation;
+} ResourceXAttemptWitness;
+
+typedef struct ResourceXTransportWitness
+{
+	uint64		cluster_epoch;
+	uint64		peer_session_incarnation;
+	uint32		connection_generation;
+	uint16		lane_id;
+	uint16		flags;
+} ResourceXTransportWitness;
+
+StaticAssertDecl(sizeof(BufferTag) == 20,
+				 "Resource-X requires the frozen 20-byte BufferTag layout");
+StaticAssertDecl(sizeof(ResourceXAssertion) == 24,
+				 "Resource-X assertion layout must remain 24 bytes");
+StaticAssertDecl(offsetof(ResourceXAssertion, resource) == 0
+					 && offsetof(ResourceXAssertion, requester_node) == 20,
+				 "Resource-X assertion offsets changed");
+StaticAssertDecl(sizeof(ResourceXAttemptWitness) == 32,
+				 "Resource-X attempt witness layout must remain 32 bytes");
+StaticAssertDecl(offsetof(ResourceXAttemptWitness, assertion) == 0
+					 && offsetof(ResourceXAttemptWitness, base_authority_generation) == 24,
+				 "Resource-X attempt witness offsets changed");
+StaticAssertDecl(sizeof(ResourceXTransportWitness) == 24,
+				 "Resource-X transport witness layout must remain 24 bytes");
+StaticAssertDecl(offsetof(ResourceXTransportWitness, cluster_epoch) == 0
+					 && offsetof(ResourceXTransportWitness, peer_session_incarnation) == 8
+					 && offsetof(ResourceXTransportWitness, connection_generation) == 16
+					 && offsetof(ResourceXTransportWitness, lane_id) == 20
+					 && offsetof(ResourceXTransportWitness, flags) == 22,
+				 "Resource-X transport witness offsets changed");
+
+extern bool resource_x_assertion_init(const BufferTag *tag,
+									  int32 requester_node,
+									  ResourceXAssertion *out);
+extern bool resource_x_assertion_valid(const ResourceXAssertion *assertion);
+extern bool resource_x_assertion_equal(const ResourceXAssertion *left,
+									   const ResourceXAssertion *right);
+extern uint32 resource_x_assertion_hash(const ResourceXAssertion *assertion);
+extern bool resource_x_attempt_matches(const ResourceXAttemptWitness *left,
+									   const ResourceXAttemptWitness *right);
+
+#endif /* CLUSTER_RESOURCE_X_IDENTITY_H */
