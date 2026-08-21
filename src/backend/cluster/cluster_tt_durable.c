@@ -1010,6 +1010,77 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 	return result;
 }
 
+ClusterTTDurableLocate
+cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
+	TransactionId xid, uint16 *out_seg, uint16 *out_slot,
+	uint16 *out_wrap, uint8 *out_status)
+{
+	uint8		owner;
+	uint32		seg_lo;
+	uint32		seg_hi;
+	uint32		segment_id;
+	PGAlignedBlock blockbuf;
+	uint32		matches = 0;
+	bool		scan_complete = true;
+	uint16		matched_seg = 0;
+	uint16		matched_slot = 0;
+	uint16		matched_wrap = 0;
+	uint8		matched_status = TT_SLOT_INVALID;
+
+	if (origin_node < 0 || !TransactionIdIsNormal(xid))
+		return CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
+	owner = (uint8) (origin_node + 1);
+	seg_lo = (uint32) origin_node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
+	cluster_tt_durable_count_by_xid_scan();
+	cluster_tt_durable_io_wait_start();
+	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++)
+	{
+		const UndoSegmentHeaderData *header;
+		uint16 i;
+
+		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner),
+				segment_id, owner, 0, blockbuf.data))
+		{
+			if (cluster_undo_segment_file_exists(owner, segment_id))
+				scan_complete = false;
+			continue;
+		}
+		header = (const UndoSegmentHeaderData *) blockbuf.data;
+		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
+		{
+			const TTSlot *slot = &header->tt_slots[i];
+
+			if (slot->xid != xid ||
+				(slot->status != TT_SLOT_ACTIVE &&
+				 slot->status != TT_SLOT_COMMITTED &&
+				 slot->status != TT_SLOT_ABORTED))
+				continue;
+			matches++;
+			matched_seg = (uint16) segment_id;
+			matched_slot = i;
+			matched_wrap = slot->wrap;
+			matched_status = slot->status;
+		}
+	}
+	cluster_tt_durable_io_wait_end();
+	if (matches > 1)
+		return CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS;
+	if (!scan_complete)
+		return CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
+	if (matches == 0)
+		return CLUSTER_TT_DURABLE_LOCATE_MISSING;
+	if (out_seg != NULL)
+		*out_seg = matched_seg;
+	if (out_slot != NULL)
+		*out_slot = matched_slot;
+	if (out_wrap != NULL)
+		*out_wrap = matched_wrap;
+	if (out_status != NULL)
+		*out_status = matched_status;
+	return CLUSTER_TT_DURABLE_LOCATE_FOUND;
+}
+
 
 bool
 cluster_tt_slot_durable_lookup_by_xid(TransactionId xid, SCN *commit_scn)

@@ -229,6 +229,21 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 											  uint32 expected_wrap, SCN *commit_scn,
 											  uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap);
 
+typedef enum ClusterTTDurableLocate
+{
+	CLUSTER_TT_DURABLE_LOCATE_FOUND = 0,
+	CLUSTER_TT_DURABLE_LOCATE_MISSING,
+	CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS,
+	CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE
+} ClusterTTDurableLocate;
+
+/* Recovery projection locator: find exactly one durable ACTIVE/COMMITTED/
+ * ABORTED owner without interpreting that state as terminal authority. */
+extern ClusterTTDurableLocate
+cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
+	TransactionId xid, uint16 *out_seg, uint16 *out_slot,
+	uint16 *out_wrap, uint8 *out_status);
+
 /*
  * cluster_tt_slot_durable_lookup_by_xid -- scan the local node's undo segment
  *	headers for a COMMITTED TT slot owned by `xid`.  Used by the spec-3.10

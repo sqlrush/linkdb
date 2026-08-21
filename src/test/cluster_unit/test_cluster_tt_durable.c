@@ -1349,6 +1349,56 @@ UT_TEST(test_resolve_lookup_wrapper_maps_resolved_only)
 	UT_ASSERT_EQ((int)cluster_tt_slot_durable_lookup_by_xid(12345, &got), 0);
 }
 
+UT_TEST(test_locate_any_state_reports_active_exact_identity)
+{
+	uint16 seg = 0xffff;
+	uint16 slot = 0xffff;
+	uint16 wrap = 0xffff;
+	uint8 status = TT_SLOT_INVALID;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *) g_canned_block;
+
+	cluster_node_id = 0;
+	g_unreadable_existing_segment = 0;
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_block_slot(6, TT_SLOT_ACTIVE, 12345, InvalidScn);
+	header->tt_slots[6].wrap = 9;
+	UT_ASSERT_EQ((int) cluster_tt_slot_durable_locate_any_by_xid_origin(
+		0, 12345, &seg, &slot, &wrap, &status),
+		(int) CLUSTER_TT_DURABLE_LOCATE_FOUND);
+	UT_ASSERT_EQ(seg, 1);
+	UT_ASSERT_EQ(slot, 6);
+	UT_ASSERT_EQ(wrap, 9);
+	UT_ASSERT_EQ(status, TT_SLOT_ACTIVE);
+}
+
+UT_TEST(test_locate_any_state_distinguishes_missing_and_ambiguous)
+{
+	uint16 seg = 0xffff;
+
+	cluster_node_id = 0;
+	g_unreadable_existing_segment = 0;
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	UT_ASSERT_EQ((int) cluster_tt_slot_durable_locate_any_by_xid_origin(
+		0, 12345, &seg, NULL, NULL, NULL),
+		(int) CLUSTER_TT_DURABLE_LOCATE_MISSING);
+	UT_ASSERT_EQ(seg, 0xffff);
+	seed_block_slot(3, TT_SLOT_ACTIVE, 12345, InvalidScn);
+	seed_block_slot(9, TT_SLOT_ABORTED, 12345, InvalidScn);
+	UT_ASSERT_EQ((int) cluster_tt_slot_durable_locate_any_by_xid_origin(
+		0, 12345, NULL, NULL, NULL, NULL),
+		(int) CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS);
+}
+
+UT_TEST(test_locate_any_state_incomplete_scan_fails_closed)
+{
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	g_unreadable_existing_segment = 2;
+	UT_ASSERT_EQ((int) cluster_tt_slot_durable_locate_any_by_xid_origin(
+		0, 12345, NULL, NULL, NULL, NULL),
+		(int) CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE);
+	g_unreadable_existing_segment = 0;
+}
+
 
 /* ============================================================
  *	U6: cluster_undo_segment_tt_header_scan_pass (spec-3.13 D2-B,
@@ -1686,7 +1736,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(75);
+	UT_PLAN(78);
 
 	UT_RUN(test_layout_sizes);
 
@@ -1740,6 +1790,9 @@ main(int argc, char **argv)
 	UT_RUN(test_resolve_node_degraded_unavailable);
 	UT_RUN(test_resolve_unreadable_existing_segment_unavailable);
 	UT_RUN(test_resolve_lookup_wrapper_maps_resolved_only);
+	UT_RUN(test_locate_any_state_reports_active_exact_identity);
+	UT_RUN(test_locate_any_state_distinguishes_missing_and_ambiguous);
+	UT_RUN(test_locate_any_state_incomplete_scan_fails_closed);
 
 	UT_RUN(test_scan_pass_classifies_inventory);
 	UT_RUN(test_scan_pass_writes_nothing);
