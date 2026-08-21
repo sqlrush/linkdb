@@ -161,10 +161,16 @@ cluster_multixact_native_snapshot_equal(MultiXactOffset first_generation, int fi
  * member_count set to actual needed length.
  */
 typedef struct ClusterMultiXactMemberOverlayResult {
+	/* `authoritative` means exact composition metadata only; it is never
+	 * transaction/terminal authority. */
 	bool authoritative;
 	uint16 member_count;
 	uint16 _pad16;
 	TimestampTz generation_ts;
+	MultiXactOffset member_offset;
+	XLogRecPtr source_lsn;
+	XLogRecPtr source_end_lsn;
+	uint16 member_wraps[256]; /* recovery-local ABA proof; wire v4 stays unchanged */
 	ClusterMultiXactMember members[FLEXIBLE_ARRAY_MEMBER];
 } ClusterMultiXactMemberOverlayResult;
 
@@ -211,6 +217,22 @@ typedef struct ClusterMultiXactSourceResult {
 extern ClusterSemanticAdmissionResult cluster_multixact_source_dispatch(
 	ClusterMultiXactSourceOp op, const ClusterMultiXactSourceRequest *request,
 	ClusterMultiXactSourceResult *result);
+
+struct ClusterSideProjectionOperationV1;
+
+/* RF-SIDE retained-redo rebuild path.  These callback-shaped APIs bypass the
+ * R4 semantic-serving gate only to mutate/verify non-authoritative projection
+ * metadata; they never grant terminal state, readiness or OPEN. */
+extern bool cluster_multixact_recovery_projection_apply(void *arg,
+	int origin_slot, uint32 cluster_epoch,
+	const struct ClusterSideProjectionOperationV1 *operation,
+	const uint8 *owned_payload, uint32 owned_payload_length,
+	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
+extern bool cluster_multixact_recovery_projection_verify(void *arg,
+	int origin_slot, uint32 cluster_epoch,
+	const struct ClusterSideProjectionOperationV1 *operation,
+	const uint8 *owned_payload, uint32 owned_payload_length,
+	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
 
 /*
  * spec-7.1 D3-b: one multixact member's origin-SERVED terminal verdict.

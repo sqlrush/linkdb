@@ -725,7 +725,6 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 	ops->end_protected_set(ops->arg, true);
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
-
 void
 rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)
 {

@@ -21,7 +21,9 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_multixact.h"
 #include "cluster/cluster_remote_xact.h"
+#include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_projection.h"
 
 #define RF_SIDE_CLOG_XACTS_PER_PAGE ((uint32) BLCKSZ * 4)
@@ -71,7 +73,52 @@ cluster_side_projection_target_preflight_v1(
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	operation = input->operation;
 	if (operation->kind == CLUSTER_SIDE_PROJECTION_MULTIXACT)
-		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+	{
+		uint32 i;
+
+		if (!input->source_retained || input->cluster_epoch == 0 ||
+			input->source_lsn == InvalidXLogRecPtr ||
+			input->source_end_lsn <= input->source_lsn)
+			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+		if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_CREATE)
+		{
+			const MultiXactMember *members =
+				(const MultiXactMember *) input->owned_payload;
+
+			if (operation->normalized_info != XLOG_MULTIXACT_CREATE_ID ||
+				!MultiXactIdIsValid(operation->multixact_id) ||
+				operation->member_offset == 0 ||
+				operation->member_count == 0 ||
+				operation->member_count > 256 || members == NULL ||
+				input->owned_payload_length != operation->member_count *
+					sizeof(MultiXactMember))
+				return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+			for (i = 0; i < operation->member_count; i++)
+				if (!TransactionIdIsNormal(members[i].xid) ||
+					members[i].status < MultiXactStatusForKeyShare ||
+					members[i].status > MaxMultiXactStatus)
+					return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+		}
+		else if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE)
+		{
+			if ((operation->normalized_info != XLOG_MULTIXACT_ZERO_OFF_PAGE &&
+				 operation->normalized_info != XLOG_MULTIXACT_ZERO_MEM_PAGE) ||
+				operation->page_number < 0 || input->owned_payload_length != 0)
+				return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+		}
+		else if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE)
+		{
+			if (operation->normalized_info != XLOG_MULTIXACT_TRUNCATE_ID ||
+				!OidIsValid(operation->oldest_database) ||
+				!MultiXactIdIsValid(operation->truncate_start_multixact) ||
+				!MultiXactIdIsValid(operation->truncate_end_multixact) ||
+				input->owned_payload_length != 0)
+				return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+		}
+		else
+			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+		return CLUSTER_SIDE_PROJECTION_APPLY_OK;
+	}
 	if (operation->kind != CLUSTER_SIDE_PROJECTION_CLOG &&
 		operation->kind != CLUSTER_SIDE_PROJECTION_COMMIT_TS)
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
@@ -104,6 +151,22 @@ cluster_side_projection_apply_owned_v1(
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	operation = input->operation;
 	origin_slot = input->origin_thread - 1;
+	if (operation->kind == CLUSTER_SIDE_PROJECTION_MULTIXACT)
+	{
+		if (ops->apply_multixact_projection == NULL ||
+			ops->verify_multixact_projection == NULL ||
+			!ops->apply_multixact_projection(ops->arg, origin_slot,
+				input->cluster_epoch, operation, input->owned_payload,
+				input->owned_payload_length, input->source_lsn,
+				input->source_end_lsn))
+			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+		if (!ops->verify_multixact_projection(ops->arg, origin_slot,
+				input->cluster_epoch, operation, input->owned_payload,
+				input->owned_payload_length, input->source_lsn,
+				input->source_end_lsn))
+			return CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED;
+		return CLUSTER_SIDE_PROJECTION_APPLY_OK;
+	}
 	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE)
 	{
 		if (ops->reset_remote_xact_range == NULL ||
@@ -122,6 +185,102 @@ cluster_side_projection_apply_owned_v1(
 			operation->oldest_xid))
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	return CLUSTER_SIDE_PROJECTION_APPLY_OK;
+}
+
+static bool
+side_projection_reset_remote_xact_range(void *arg, int origin_slot,
+	TransactionId first_xid, uint32 xid_count)
+{
+	(void) arg;
+	return cluster_remote_xact_reset_range_v2(origin_slot, first_xid,
+		xid_count);
+}
+
+static bool
+side_projection_remote_xact_range_empty(void *arg, int origin_slot,
+	TransactionId first_xid, uint32 xid_count)
+{
+	(void) arg;
+	return cluster_remote_xact_range_empty_v2(origin_slot, first_xid,
+		xid_count);
+}
+
+static bool
+side_projection_truncate_remote_xact_before(void *arg, int origin_slot,
+	TransactionId oldest_xid)
+{
+	(void) arg;
+	return cluster_remote_xact_truncate_before_v2(origin_slot, oldest_xid);
+}
+
+bool
+rf_side_online_projection_owner_init_v1(
+	RfSideOnlineProjectionOwnerV1 *owner, uint32 cluster_epoch,
+	bool failed_origin_redo_retained)
+{
+	if (owner == NULL || cluster_epoch == 0)
+		return false;
+	memset(owner, 0, sizeof(*owner));
+	owner->cluster_epoch = cluster_epoch;
+	owner->failed_origin_redo_retained = failed_origin_redo_retained;
+	owner->projection_ops.reset_remote_xact_range =
+		side_projection_reset_remote_xact_range;
+	owner->projection_ops.remote_xact_range_empty =
+		side_projection_remote_xact_range_empty;
+	owner->projection_ops.truncate_remote_xact_before =
+		side_projection_truncate_remote_xact_before;
+	owner->projection_ops.apply_multixact_projection =
+		cluster_multixact_recovery_projection_apply;
+	owner->projection_ops.verify_multixact_projection =
+		cluster_multixact_recovery_projection_verify;
+	return true;
+}
+
+static bool
+side_projection_owned_input(RfSideOnlineProjectionOwnerV1 *owner,
+	const RfSideOnlineOperationV1 *operation,
+	ClusterSideProjectionApplyInputV1 *input)
+{
+	if (owner == NULL || operation == NULL || input == NULL ||
+		owner->cluster_epoch == 0 ||
+		operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
+		return false;
+	memset(input, 0, sizeof(*input));
+	input->operation = &operation->projection;
+	input->owned_payload = operation->owned_payload;
+	input->owned_payload_length = operation->owned_payload_length;
+	input->origin_thread = operation->identity.record.origin_thread;
+	input->source_retained = owner->failed_origin_redo_retained;
+	input->cluster_epoch = owner->cluster_epoch;
+	input->source_lsn = operation->identity.record.read_rec_ptr;
+	input->source_end_lsn = operation->identity.record.end_rec_ptr;
+	return true;
+}
+
+bool
+rf_side_online_projection_preflight_owned_v1(void *arg,
+	const RfSideOnlineOperationV1 *operation)
+{
+	RfSideOnlineProjectionOwnerV1 *owner =
+		(RfSideOnlineProjectionOwnerV1 *) arg;
+	ClusterSideProjectionApplyInputV1 input;
+
+	return side_projection_owned_input(owner, operation, &input) &&
+		cluster_side_projection_target_preflight_v1(&input) ==
+			CLUSTER_SIDE_PROJECTION_APPLY_OK;
+}
+
+bool
+rf_side_online_projection_apply_owned_v1(void *arg,
+	const RfSideOnlineOperationV1 *operation)
+{
+	RfSideOnlineProjectionOwnerV1 *owner =
+		(RfSideOnlineProjectionOwnerV1 *) arg;
+	ClusterSideProjectionApplyInputV1 input;
+
+	return side_projection_owned_input(owner, operation, &input) &&
+		cluster_side_projection_apply_owned_v1(&input,
+			&owner->projection_ops) == CLUSTER_SIDE_PROJECTION_APPLY_OK;
 }
 
 bool

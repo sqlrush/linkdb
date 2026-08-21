@@ -44,10 +44,15 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_multixact.h"
+#include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_side_projection.h"
 #include "cluster/cluster_subtrans.h"
+#include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_visibility_resolve.h" /* cluster_vis_cr_xmax_verdict (polarity SSOT) */
+#include "cluster/cluster_xid_stripe.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -63,6 +68,10 @@ typedef struct ClusterMultiXactOverlayEntry {
 	uint16 member_count;
 	uint16 _pad16;
 	TimestampTz generation_ts;
+	MultiXactOffset member_offset;
+	XLogRecPtr source_lsn;
+	XLogRecPtr source_end_lsn;
+	uint16 member_wraps[CLUSTER_MULTIXACT_MAX_MEMBERS];
 	ClusterMultiXactMember members[CLUSTER_MULTIXACT_MAX_MEMBERS];
 } ClusterMultiXactOverlayEntry;
 
@@ -158,7 +167,11 @@ cluster_multixact_shmem_register(void)
 
 static bool
 cluster_multixact_member_overlay_install_raw(const ClusterMultiXactKey *key, uint16 member_count,
-											 const ClusterMultiXactMember *members)
+											 const ClusterMultiXactMember *members,
+											 MultiXactOffset member_offset,
+											 XLogRecPtr source_lsn,
+											 XLogRecPtr source_end_lsn,
+											 const uint16 *member_wraps)
 {
 	ClusterMultiXactOverlayEntry *e;
 	bool found;
@@ -188,6 +201,13 @@ cluster_multixact_member_overlay_install_raw(const ClusterMultiXactKey *key, uin
 	e->member_count = member_count;
 	e->_pad16 = 0;
 	e->generation_ts = GetCurrentTimestamp();
+	e->member_offset = member_offset;
+	e->source_lsn = source_lsn;
+	e->source_end_lsn = source_end_lsn;
+	memset(e->member_wraps, 0, sizeof(e->member_wraps));
+	if (member_wraps != NULL)
+		memcpy(e->member_wraps, member_wraps,
+			member_count * sizeof(*member_wraps));
 	memcpy(e->members, members, member_count * sizeof(ClusterMultiXactMember));
 
 	LWLockRelease(ClusterMultiXactLock);
@@ -211,6 +231,10 @@ cluster_multixact_member_overlay_lookup_raw(const ClusterMultiXactKey *key,
 	out->member_count = 0;
 	out->_pad16 = 0;
 	out->generation_ts = 0;
+	out->member_offset = 0;
+	out->source_lsn = InvalidXLogRecPtr;
+	out->source_end_lsn = InvalidXLogRecPtr;
+	memset(out->member_wraps, 0, sizeof(out->member_wraps));
 
 	current_epoch = (uint32)cluster_epoch_get_current();
 	if (key->cluster_epoch != current_epoch) {
@@ -237,6 +261,10 @@ cluster_multixact_member_overlay_lookup_raw(const ClusterMultiXactKey *key,
 	out->authoritative = true;
 	out->member_count = e->member_count;
 	out->generation_ts = e->generation_ts;
+	out->member_offset = e->member_offset;
+	out->source_lsn = e->source_lsn;
+	out->source_end_lsn = e->source_end_lsn;
+	memcpy(out->member_wraps, e->member_wraps, sizeof(out->member_wraps));
 	memcpy(out->members, e->members, e->member_count * sizeof(ClusterMultiXactMember));
 
 	LWLockRelease(ClusterMultiXactLock);
@@ -508,6 +536,283 @@ cluster_multixact_get_member_count_raw(const ClusterMultiXactKey *key)
 	return count;
 }
 
+#define RF_SIDE_MULTIXACT_OFFSETS_PER_PAGE \
+	((uint32) BLCKSZ / sizeof(MultiXactOffset))
+#define RF_SIDE_MULTIXACT_MEMBERGROUP_SIZE \
+	(sizeof(TransactionId) * 4 + 4)
+#define RF_SIDE_MULTIXACT_MEMBERS_PER_PAGE \
+	(((uint32) BLCKSZ / RF_SIDE_MULTIXACT_MEMBERGROUP_SIZE) * 4)
+
+static bool
+cluster_multixact_projection_page_range(int page_number, uint32 per_page,
+	uint32 *first, uint32 *count)
+{
+	uint64 first64;
+	uint64 remaining;
+
+	if (page_number < 0 || first == NULL || count == NULL)
+		return false;
+	first64 = (uint64) (uint32) page_number * per_page;
+	if (first64 > UINT32_MAX)
+		return false;
+	remaining = (uint64) UINT32_MAX - first64 + 1;
+	*first = (uint32) first64;
+	*count = (uint32) Min((uint64) per_page, remaining);
+	return true;
+}
+
+static bool
+cluster_multixact_projection_in_range(uint32 value, uint32 start, uint32 end)
+{
+	if (start == end)
+		return false;
+	if (start < end)
+		return value >= start && value < end;
+	return value >= start || value < end;
+}
+
+static bool
+cluster_multixact_projection_member_overlap(
+	const ClusterMultiXactOverlayEntry *entry, uint32 start, uint32 end)
+{
+	uint32 i;
+
+	/* Legacy/runtime overlay lacks exact offset coverage.  It cannot prove it
+	 * lies outside an invalidated range, so recovery drops it fail-closed. */
+	if (entry->member_offset == 0)
+		return true;
+	for (i = 0; i < entry->member_count; i++)
+		if (cluster_multixact_projection_in_range(
+				entry->member_offset + i, start, end))
+			return true;
+	return false;
+}
+
+static bool
+cluster_multixact_projection_entry_selected(
+	const ClusterMultiXactOverlayEntry *entry, int origin_slot,
+	uint32 cluster_epoch, const ClusterSideProjectionOperationV1 *operation)
+{
+	uint32 first;
+	uint32 count;
+	uint32 end;
+
+	if (entry->key.origin_node_id != (uint16) origin_slot ||
+		entry->key.cluster_epoch != cluster_epoch)
+		return false;
+	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE)
+	{
+		if (operation->normalized_info == XLOG_MULTIXACT_ZERO_OFF_PAGE)
+		{
+			if (!cluster_multixact_projection_page_range(operation->page_number,
+					RF_SIDE_MULTIXACT_OFFSETS_PER_PAGE, &first, &count))
+				return false;
+			return entry->key.multixact_id >= first &&
+				(uint64) entry->key.multixact_id < (uint64) first + count;
+		}
+		if (operation->normalized_info == XLOG_MULTIXACT_ZERO_MEM_PAGE)
+		{
+			if (!cluster_multixact_projection_page_range(operation->page_number,
+					RF_SIDE_MULTIXACT_MEMBERS_PER_PAGE, &first, &count))
+				return false;
+			end = first + count;
+			return cluster_multixact_projection_member_overlap(entry, first, end);
+		}
+		return false;
+	}
+	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE)
+		return cluster_multixact_projection_in_range(entry->key.multixact_id,
+				operation->truncate_start_multixact,
+				operation->truncate_end_multixact) ||
+			cluster_multixact_projection_member_overlap(entry,
+				operation->truncate_start_member,
+				operation->truncate_end_member);
+	return false;
+}
+
+static bool
+cluster_multixact_projection_build_members(uint32 cluster_epoch,
+	const MultiXactMember *native_members, uint32 member_count,
+	ClusterMultiXactMember *members, uint16 *wraps)
+{
+	uint32 i;
+
+	if (native_members == NULL || members == NULL || wraps == NULL ||
+		member_count == 0 || member_count > CLUSTER_MULTIXACT_MAX_MEMBERS)
+		return false;
+	memset(members, 0, member_count * sizeof(*members));
+	memset(wraps, 0, member_count * sizeof(*wraps));
+	for (i = 0; i < member_count; i++)
+	{
+		int member_origin;
+		uint16 segment = 0;
+		uint16 slot = 0;
+		uint16 wrap = 0;
+		uint8 tt_status = TT_SLOT_INVALID;
+		ClusterTTDurableLocate locate;
+
+		if (!TransactionIdIsNormal(native_members[i].xid) ||
+			native_members[i].status < MultiXactStatusForKeyShare ||
+			native_members[i].status > MaxMultiXactStatus)
+			return false;
+		member_origin = cluster_xid_origin_slot(native_members[i].xid);
+		if (member_origin < 0 || member_origin >= (1 << 7))
+			return false;
+		locate = cluster_tt_slot_durable_locate_any_by_xid_origin(
+			member_origin, native_members[i].xid, &segment, &slot, &wrap,
+			&tt_status);
+		if (locate != CLUSTER_TT_DURABLE_LOCATE_FOUND)
+		{
+			/* Lock-only members never affect tuple visibility.  A complete
+			 * zero-match is exact negative TT evidence; updater members still
+			 * require a concrete owner and otherwise block the projection. */
+			if (locate != CLUSTER_TT_DURABLE_LOCATE_MISSING ||
+				native_members[i].status > MultiXactStatusForUpdate)
+				return false;
+		}
+		members[i].xid = native_members[i].xid;
+		members[i].status = (uint8) native_members[i].status;
+		members[i].origin_node_id = (uint16) member_origin;
+		members[i].epoch = cluster_epoch;
+		if (locate == CLUSTER_TT_DURABLE_LOCATE_FOUND)
+		{
+			members[i].undo_segment_id = segment;
+			members[i].tt_slot_id = cluster_tt_slot_offset_to_id(slot);
+			wraps[i] = wrap;
+		}
+	}
+	return true;
+}
+
+bool
+cluster_multixact_recovery_projection_apply(void *arg, int origin_slot,
+	uint32 cluster_epoch, const ClusterSideProjectionOperationV1 *operation,
+	const uint8 *owned_payload, uint32 owned_payload_length,
+	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	(void) arg;
+	if (ClusterMultiXactHTAB == NULL || operation == NULL || origin_slot < 0 ||
+		origin_slot >= (1 << 7) || cluster_epoch == 0 ||
+		cluster_epoch != (uint32) cluster_epoch_get_current() ||
+		source_lsn == InvalidXLogRecPtr || source_end_lsn <= source_lsn)
+		return false;
+	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_CREATE)
+	{
+		ClusterMultiXactKey key;
+		ClusterMultiXactMember members[CLUSTER_MULTIXACT_MAX_MEMBERS];
+		uint16 wraps[CLUSTER_MULTIXACT_MAX_MEMBERS];
+		const MultiXactMember *native_members =
+			(const MultiXactMember *) owned_payload;
+
+		if (cluster_mxid_origin_slot(operation->multixact_id) != origin_slot ||
+			operation->member_count == 0 ||
+			operation->member_count > CLUSTER_MULTIXACT_MAX_MEMBERS ||
+			owned_payload_length != operation->member_count *
+				sizeof(MultiXactMember) ||
+			!cluster_multixact_projection_build_members(cluster_epoch,
+				native_members, operation->member_count, members, wraps))
+			return false;
+		memset(&key, 0, sizeof(key));
+		key.origin_node_id = (uint16) origin_slot;
+		key.multixact_id = operation->multixact_id;
+		key.cluster_epoch = cluster_epoch;
+		return cluster_multixact_member_overlay_install_raw(&key,
+			(uint16) operation->member_count, members, operation->member_offset,
+			source_lsn, source_end_lsn, wraps);
+	}
+	if (owned_payload_length != 0)
+		return false;
+	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE ||
+		operation->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE)
+	{
+		HASH_SEQ_STATUS sequence;
+		ClusterMultiXactOverlayEntry *entry;
+
+		LWLockAcquire(ClusterMultiXactLock, LW_EXCLUSIVE);
+		hash_seq_init(&sequence, ClusterMultiXactHTAB);
+		while ((entry = (ClusterMultiXactOverlayEntry *)
+				hash_seq_search(&sequence)) != NULL)
+			if (cluster_multixact_projection_entry_selected(entry, origin_slot,
+					cluster_epoch, operation))
+				hash_search(ClusterMultiXactHTAB, &entry->key, HASH_REMOVE, NULL);
+		LWLockRelease(ClusterMultiXactLock);
+		return true;
+	}
+	return false;
+}
+
+bool
+cluster_multixact_recovery_projection_verify(void *arg, int origin_slot,
+	uint32 cluster_epoch, const ClusterSideProjectionOperationV1 *operation,
+	const uint8 *owned_payload, uint32 owned_payload_length,
+	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	(void) arg;
+	if (ClusterMultiXactHTAB == NULL || operation == NULL || origin_slot < 0 ||
+		origin_slot >= (1 << 7) || cluster_epoch == 0 ||
+		cluster_epoch != (uint32) cluster_epoch_get_current())
+		return false;
+	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_CREATE)
+	{
+		ClusterMultiXactKey key;
+		ClusterMultiXactMember expected[CLUSTER_MULTIXACT_MAX_MEMBERS];
+		uint16 expected_wraps[CLUSTER_MULTIXACT_MAX_MEMBERS];
+		Size result_size = offsetof(ClusterMultiXactMemberOverlayResult, members) +
+			(Size) operation->member_count * sizeof(ClusterMultiXactMember);
+		ClusterMultiXactMemberOverlayResult *result;
+		bool matches;
+
+		if (cluster_mxid_origin_slot(operation->multixact_id) != origin_slot ||
+			operation->member_count == 0 ||
+			operation->member_count > CLUSTER_MULTIXACT_MAX_MEMBERS ||
+			owned_payload_length != operation->member_count *
+				sizeof(MultiXactMember) ||
+			!cluster_multixact_projection_build_members(cluster_epoch,
+				(const MultiXactMember *) owned_payload, operation->member_count,
+				expected, expected_wraps))
+			return false;
+		memset(&key, 0, sizeof(key));
+		key.origin_node_id = (uint16) origin_slot;
+		key.multixact_id = operation->multixact_id;
+		key.cluster_epoch = cluster_epoch;
+		result = (ClusterMultiXactMemberOverlayResult *) palloc0(result_size);
+		matches = cluster_multixact_member_overlay_lookup_raw(&key, result,
+			(int) operation->member_count) && result->authoritative &&
+			result->member_count == operation->member_count &&
+			result->member_offset == operation->member_offset &&
+			result->source_lsn == source_lsn &&
+			result->source_end_lsn == source_end_lsn &&
+			memcmp(result->members, expected,
+				operation->member_count * sizeof(*expected)) == 0 &&
+			memcmp(result->member_wraps, expected_wraps,
+				operation->member_count * sizeof(*expected_wraps)) == 0;
+		pfree(result);
+		return matches;
+	}
+	if (owned_payload_length == 0 &&
+		(operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE ||
+		 operation->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE))
+	{
+		HASH_SEQ_STATUS sequence;
+		ClusterMultiXactOverlayEntry *entry;
+		bool empty = true;
+
+		LWLockAcquire(ClusterMultiXactLock, LW_SHARED);
+		hash_seq_init(&sequence, ClusterMultiXactHTAB);
+		while ((entry = (ClusterMultiXactOverlayEntry *)
+				hash_seq_search(&sequence)) != NULL)
+			if (cluster_multixact_projection_entry_selected(entry, origin_slot,
+					cluster_epoch, operation))
+			{
+				empty = false;
+				break;
+			}
+		LWLockRelease(ClusterMultiXactLock);
+		return empty;
+	}
+	return false;
+}
+
 void
 cluster_multixact_purge_epoch(uint32 obsolete_epoch)
 {
@@ -582,11 +887,19 @@ cluster_multixact_shmem_register(void)
 
 static bool
 cluster_multixact_member_overlay_install_raw(const ClusterMultiXactKey *key, uint16 member_count,
-											 const ClusterMultiXactMember *members)
+											 const ClusterMultiXactMember *members,
+											 MultiXactOffset member_offset,
+											 XLogRecPtr source_lsn,
+											 XLogRecPtr source_end_lsn,
+											 const uint16 *member_wraps)
 {
 	(void)key;
 	(void)member_count;
 	(void)members;
+	(void)member_offset;
+	(void)source_lsn;
+	(void)source_end_lsn;
+	(void)member_wraps;
 	return false;
 }
 
@@ -601,6 +914,10 @@ cluster_multixact_member_overlay_lookup_raw(const ClusterMultiXactKey *key,
 		out->authoritative = false;
 		out->member_count = 0;
 		out->generation_ts = 0;
+		out->member_offset = 0;
+		out->source_lsn = InvalidXLogRecPtr;
+		out->source_end_lsn = InvalidXLogRecPtr;
+		memset(out->member_wraps, 0, sizeof(out->member_wraps));
 	}
 	return false;
 }
@@ -639,6 +956,40 @@ cluster_multixact_purge_epoch(uint32 obsolete_epoch)
 	(void)obsolete_epoch;
 }
 
+bool
+cluster_multixact_recovery_projection_apply(void *arg, int origin_slot,
+	uint32 cluster_epoch, const ClusterSideProjectionOperationV1 *operation,
+	const uint8 *owned_payload, uint32 owned_payload_length,
+	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	(void) arg;
+	(void) origin_slot;
+	(void) cluster_epoch;
+	(void) operation;
+	(void) owned_payload;
+	(void) owned_payload_length;
+	(void) source_lsn;
+	(void) source_end_lsn;
+	return false;
+}
+
+bool
+cluster_multixact_recovery_projection_verify(void *arg, int origin_slot,
+	uint32 cluster_epoch, const ClusterSideProjectionOperationV1 *operation,
+	const uint8 *owned_payload, uint32 owned_payload_length,
+	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+{
+	(void) arg;
+	(void) origin_slot;
+	(void) cluster_epoch;
+	(void) operation;
+	(void) owned_payload;
+	(void) owned_payload_length;
+	(void) source_lsn;
+	(void) source_end_lsn;
+	return false;
+}
+
 #define CLUSTER_MULTIXACT_GETTER_STUB(name)                                                        \
 	uint64 cluster_multixact_get_##name(void)                                                      \
 	{                                                                                              \
@@ -673,7 +1024,8 @@ cluster_multixact_source_dispatch_body(ClusterMultiXactSourceOp op,
 		if (request == NULL || request->key == NULL || request->members == NULL)
 			return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 		result->bool_value = cluster_multixact_member_overlay_install_raw(
-			request->key, request->member_count, request->members);
+			request->key, request->member_count, request->members, 0,
+			InvalidXLogRecPtr, InvalidXLogRecPtr, NULL);
 		break;
 	case CLUSTER_MULTI_SOURCE_OVERLAY_LOOKUP:
 		if (request == NULL || request->key == NULL || request->overlay_out == NULL)

@@ -75,6 +75,18 @@ typedef struct RfSideOnlineApplyOpsV1
 	RfSideOnlineApplyProjectionV1 apply_projection;
 } RfSideOnlineApplyOpsV1;
 
+/* Production owner for the RF-SIDE v2 non-authoritative projections.  The
+ * retained-source certificate belongs to the immutable failed-origin replay
+ * cut; projection bytes themselves never establish PREPARED, terminal truth,
+ * readiness, or OPEN. */
+typedef struct RfSideOnlineProjectionOwnerV1
+{
+	uint32		cluster_epoch;
+	bool		failed_origin_redo_retained;
+	uint8		reserved5[3];
+	ClusterSideProjectionApplyOpsV1 projection_ops;
+} RfSideOnlineProjectionOwnerV1;
+
 extern RfPageProofDetailV1 rf_side_online_plan_create_v1(
 	const RfSideOnlinePlanRequestV1 *request, RfSideOnlinePlanV1 **out_plan);
 extern RfPageProofDetailV1 rf_side_online_plan_feed_record_v1(
@@ -88,6 +100,13 @@ extern bool rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan,
 	uint32 index, RfSideOnlineOperationV1 *out_operation);
 extern RfPageProofDetailV1 rf_side_online_plan_apply_v1(
 	const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOpsV1 *ops);
+extern bool rf_side_online_projection_owner_init_v1(
+	RfSideOnlineProjectionOwnerV1 *owner, uint32 cluster_epoch,
+	bool failed_origin_redo_retained);
+extern bool rf_side_online_projection_preflight_owned_v1(void *arg,
+	const RfSideOnlineOperationV1 *operation);
+extern bool rf_side_online_projection_apply_owned_v1(void *arg,
+	const RfSideOnlineOperationV1 *operation);
 extern void rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan);
 
 #endif

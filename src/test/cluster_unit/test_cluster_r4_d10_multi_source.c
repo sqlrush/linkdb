@@ -29,10 +29,14 @@
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_multixact.h"
+#include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_side_projection.h"
 #include "cluster/cluster_subtrans.h"
+#include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_visibility_resolve.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -68,6 +72,7 @@ static uint64 admission_feature;
 static ClusterSemanticAdmissionSide admission_side;
 
 static int fake_hash_search_count;
+static int fake_hash_seq_index;
 static bool fake_force_error;
 static bool fake_state_found;
 static bool fake_lock_found;
@@ -87,6 +92,27 @@ static union
 } fake_hash_entry;
 
 static HTAB *const fake_hash = (HTAB *)(uintptr_t)1;
+
+int
+cluster_mxid_origin_slot(MultiXactId mxid pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+cluster_xid_origin_slot(TransactionId xid pg_attribute_unused())
+{
+	return 0;
+}
+
+ClusterTTDurableLocate
+cluster_tt_slot_durable_locate_any_by_xid_origin(
+	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	uint16 *out_seg pg_attribute_unused(), uint16 *out_slot pg_attribute_unused(),
+	uint16 *out_wrap pg_attribute_unused(), uint8 *out_status pg_attribute_unused())
+{
+	return CLUSTER_TT_DURABLE_LOCATE_MISSING;
+}
 
 static void
 reset_admission(ClusterSemanticAdmissionResult result, bool recheck_ok)
@@ -209,11 +235,19 @@ hash_search(HTAB *hashp, const void *key_ptr, HASHACTION action, bool *found_ptr
 
 void
 hash_seq_init(HASH_SEQ_STATUS *status pg_attribute_unused(), HTAB *hashp pg_attribute_unused())
-{}
+{
+	fake_hash_seq_index = 0;
+}
 
 void *
 hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
 {
+	ClusterMultiXactKey zero;
+
+	memset(&zero, 0, sizeof(zero));
+	if (fake_hash_seq_index++ == 0 &&
+		memcmp(fake_hash_entry.bytes, &zero, sizeof(zero)) != 0)
+		return fake_hash_entry.bytes;
 	return NULL;
 }
 
@@ -626,6 +660,40 @@ UT_TEST(t9_null_result_is_closed_after_balanced_admission)
 	UT_ASSERT_EQ(admission_leave_count, 1);
 }
 
+UT_TEST(t10_recovery_projection_create_has_exact_postread)
+{
+	ClusterSideProjectionOperationV1 operation;
+	MultiXactMember members[2];
+
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
+	operation.action = CLUSTER_SIDE_PROJECTION_ACTION_CREATE;
+	operation.normalized_info = XLOG_MULTIXACT_CREATE_ID;
+	operation.multixact_id = 33;
+	operation.member_offset = 71;
+	operation.member_count = 2;
+	memset(members, 0, sizeof(members));
+	members[0].xid = 800;
+	members[0].status = MultiXactStatusForKeyShare;
+	members[1].xid = 816;
+	members[1].status = MultiXactStatusForShare;
+	UT_ASSERT(cluster_multixact_recovery_projection_apply(NULL, 0, 19,
+		&operation, (const uint8 *) members, sizeof(members), 100, 200));
+	UT_ASSERT(cluster_multixact_recovery_projection_verify(NULL, 0, 19,
+		&operation, (const uint8 *) members, sizeof(members), 100, 200));
+	UT_ASSERT(!cluster_multixact_recovery_projection_verify(NULL, 0, 19,
+		&operation, (const uint8 *) members, sizeof(members), 100, 201));
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
+	operation.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+	operation.normalized_info = XLOG_MULTIXACT_ZERO_OFF_PAGE;
+	operation.page_number = 0;
+	UT_ASSERT(cluster_multixact_recovery_projection_apply(NULL, 0, 19,
+		&operation, NULL, 0, 201, 202));
+	UT_ASSERT(cluster_multixact_recovery_projection_verify(NULL, 0, 19,
+		&operation, NULL, 0, 201, 202));
+}
+
 int
 main(void)
 {
@@ -634,7 +702,7 @@ main(void)
 	memset(&fake_hash_entry, 0, sizeof(fake_hash_entry));
 	cluster_multixact_shmem_init();
 
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(t1_frozen_dispatch_surface);
 	UT_RUN(t2_dormant_refuses_before_request_and_mutation);
 	UT_RUN(t3_invalid_after_admission_closes_and_leaves);
@@ -644,6 +712,7 @@ main(void)
 	UT_RUN(t7_generation_drift_keeps_fixed_result_canonical);
 	UT_RUN(t8_error_path_leaves_once_before_rethrow);
 	UT_RUN(t9_null_result_is_closed_after_balanced_admission);
+	UT_RUN(t10_recovery_projection_create_has_exact_postread);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

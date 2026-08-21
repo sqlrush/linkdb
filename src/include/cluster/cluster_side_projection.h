@@ -43,6 +43,7 @@
 
 #include "access/multixact.h"
 #include "access/transam.h"
+#include "access/xlogdefs.h"
 
 typedef enum ClusterSideProjectionKind
 {
@@ -96,6 +97,10 @@ typedef struct ClusterSideProjectionApplyInputV1
 	uint32		owned_payload_length;
 	uint16		origin_thread;
 	bool		source_retained;
+	uint8		reserved19;
+	uint32		cluster_epoch;
+	XLogRecPtr source_lsn;
+	XLogRecPtr source_end_lsn;
 } ClusterSideProjectionApplyInputV1;
 
 typedef bool (*ClusterSideProjectionResetRangeV1)(void *arg,
@@ -104,6 +109,11 @@ typedef bool (*ClusterSideProjectionRangeEmptyV1)(void *arg,
 	int origin_slot, TransactionId first_xid, uint32 xid_count);
 typedef bool (*ClusterSideProjectionTruncateBeforeV1)(void *arg,
 	int origin_slot, TransactionId oldest_xid);
+typedef bool (*ClusterSideProjectionMultiOperationV1)(void *arg,
+	int origin_slot, uint32 cluster_epoch,
+	const ClusterSideProjectionOperationV1 *operation,
+	const uint8 *owned_payload, uint32 owned_payload_length,
+	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
 
 typedef struct ClusterSideProjectionApplyOpsV1
 {
@@ -111,6 +121,8 @@ typedef struct ClusterSideProjectionApplyOpsV1
 	ClusterSideProjectionResetRangeV1 reset_remote_xact_range;
 	ClusterSideProjectionRangeEmptyV1 remote_xact_range_empty;
 	ClusterSideProjectionTruncateBeforeV1 truncate_remote_xact_before;
+	ClusterSideProjectionMultiOperationV1 apply_multixact_projection;
+	ClusterSideProjectionMultiOperationV1 verify_multixact_projection;
 } ClusterSideProjectionApplyOpsV1;
 
 extern ClusterSideProjectionApplyResultV1
