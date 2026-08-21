@@ -10331,7 +10331,9 @@ UT_TEST(test_local_transfer_prepare_commit_and_final_ack_are_exact)
 	PcmXLocalTagSlot *tag_slot;
 	PcmXLocalHandle leader;
 	PcmXLocalHandle follower;
+	PcmXLocalHandle stale_target;
 	PcmXLocalProgress progress;
+	PcmXLocalTargetActivationWork target_work;
 	PcmXLocalFollowerWfgSnapshot wfg;
 	PcmXWaitIdentity identity;
 	PcmXEnqueuePayload enqueue;
@@ -10366,6 +10368,7 @@ UT_TEST(test_local_transfer_prepare_commit_and_final_ack_are_exact)
 	uint64 committed_own_generation;
 	uint64 holder_set_generation;
 	Size holder_used;
+	Size target_cursor = 0;
 	const uint64 master_session = UINT64_C(178);
 
 	init_active_pcm_x(UINT64_C(77));
@@ -10508,6 +10511,27 @@ UT_TEST(test_local_transfer_prepare_commit_and_final_ack_are_exact)
 	UT_ASSERT_EQ(progress.last_response_opcode, PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK);
 	UT_ASSERT_EQ(progress.semantic_generation, prepare.ref.grant_generation);
 	UT_ASSERT(progress.semantic_generation != prepare.ref.handle.ticket_id);
+	UT_ASSERT_EQ(cluster_pcm_x_local_target_activation_work_next(
+					 &target_cursor, SIZE_MAX, &target_work), PCM_X_QUEUE_OK);
+	UT_ASSERT(memcmp(&target_work.handle, &leader, sizeof(leader)) == 0);
+	UT_ASSERT_EQ(target_work.progress.member_state, PCM_XL_GRANTED);
+	UT_ASSERT_EQ(target_work.progress.semantic_generation, prepare.ref.grant_generation);
+	stale_target = target_work.handle;
+	stale_target.local_sequence++;
+	UT_ASSERT_EQ(cluster_pcm_x_local_target_activation_publish_exact(
+					 &stale_target, target_work.progress.semantic_generation), PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_local_target_activation_publish_exact(
+					 &target_work.handle, target_work.progress.semantic_generation + 1),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(cluster_pcm_x_local_target_activation_publish_exact(
+					 &target_work.handle, target_work.progress.semantic_generation), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_target_activation_publish_exact(
+					 &target_work.handle, target_work.progress.semantic_generation),
+				 PCM_X_QUEUE_DUPLICATE);
+	tag_slot = &local_tag_slots(ClusterPcmXConvertShmem)[leader.tag_slot.slot_index];
+	UT_ASSERT_EQ(tag_slot->semantic_generation, prepare.ref.grant_generation);
+	UT_ASSERT_EQ(cluster_pcm_x_local_target_activation_work_next(
+					 &target_cursor, SIZE_MAX, &target_work), PCM_X_QUEUE_NOT_FOUND);
 	UT_ASSERT_EQ(cluster_pcm_x_local_reliable_snapshot_exact(&leader, &retry_token),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(retry_token.pending_opcode, PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM);

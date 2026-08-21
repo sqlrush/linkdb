@@ -12567,6 +12567,10 @@ requester_role_dispatch:
 				}
 				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			}
+			result = cluster_pcm_x_local_target_activation_publish_exact(
+				&handle, progress.semantic_generation);
+			if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			claim_out->semantic_generation = progress.semantic_generation;
 			if (progress.pending_opcode == PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM) {
 				PcmXPhasePayload final_confirm;
@@ -17111,8 +17115,12 @@ gcs_block_pcm_x_resource_retry_tick(
 	const PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT])
 {
 	static Size cursor = 0;
+	static Size target_cursor = 0;
 	PcmXRetryWorkItem work;
+	PcmXLocalTargetActivationWork target_work;
 	PcmXRuntimeSnapshot runtime;
+	ResourceXAcquisitionRef target_ref;
+	ResourceXApplyResult target_apply_result;
 	ResourceXRetryAction action;
 	ResourceXRetryDecision decision;
 	ResourceXRetryStateV1 applied;
@@ -17126,7 +17134,51 @@ gcs_block_pcm_x_resource_retry_tick(
 	uint32 connection_after;
 	uint32 connection_before;
 	bool admitted;
+	bool target_rearm = false;
 	bool transport_ready;
+
+	result = cluster_pcm_x_local_target_activation_work_next(
+		&target_cursor, PCM_X_MASTER_DRIVE_SCAN_BUDGET, &target_work);
+	if (result == PCM_X_QUEUE_OK) {
+		if (target_work.progress.semantic_generation == 0
+			|| target_work.progress.semantic_generation == UINT64_MAX
+			|| target_work.progress.identity.node_id != cluster_node_id
+			|| !resource_x_assertion_init(&target_work.progress.identity.tag,
+				target_work.progress.identity.node_id, &target_ref.assertion)) {
+			cluster_pcm_x_runtime_fail_closed();
+			return;
+		}
+		runtime = cluster_pcm_x_runtime_snapshot();
+		target_ref.formation = runtime.gate_generation;
+		target_ref.acquisition_generation = target_work.progress.semantic_generation;
+		target_apply_result = cluster_pcm_lock_resource_x_executor_rearm_exact(&target_ref);
+		if (target_apply_result != RESOURCE_X_APPLY_APPLIED
+			&& target_apply_result != RESOURCE_X_APPLY_DUPLICATE
+			&& target_apply_result != RESOURCE_X_APPLY_NOT_FOUND) {
+			cluster_pcm_x_runtime_fail_closed();
+			return;
+		}
+		result = gcs_block_pcm_x_resource_x_terminal_try(
+			&target_work.progress, &runtime, &target_rearm);
+		if (result == PCM_X_QUEUE_OK) {
+			result = cluster_pcm_x_local_target_activation_publish_exact(
+				&target_work.handle, target_work.progress.semantic_generation);
+			if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
+				gcs_block_pcm_x_wake_requester(&target_work.handle.identity);
+			else if (result != PCM_X_QUEUE_STALE && result != PCM_X_QUEUE_NOT_READY)
+				cluster_pcm_x_runtime_fail_closed();
+		} else if ((result == PCM_X_QUEUE_BUSY || result == PCM_X_QUEUE_NOT_READY)
+				   && target_rearm)
+			(void)cluster_pcm_lock_resource_x_executor_wait_exact(&target_ref, 0);
+		else if (result != PCM_X_QUEUE_STALE && result != PCM_X_QUEUE_NOT_READY)
+			cluster_pcm_x_runtime_fail_closed();
+		return;
+	}
+	if (result != PCM_X_QUEUE_NOT_FOUND) {
+		if (result != PCM_X_QUEUE_NOT_READY)
+			cluster_pcm_x_runtime_fail_closed();
+		return;
+	}
 
 	cursor_before = cursor;
 	result = cluster_pcm_x_retry_work_next(&cursor, PCM_X_MASTER_DRIVE_SCAN_BUDGET, &work);

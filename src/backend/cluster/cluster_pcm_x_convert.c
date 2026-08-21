@@ -15095,6 +15095,31 @@ pcm_x_local_refs_lookup(const PcmXLocalHandle *leader, PcmXSlotRef *tag_ref_out,
 }
 
 
+static void
+pcm_x_local_progress_copy_locked(const PcmXLocalTagSlot *tag_slot,
+								 const PcmXLocalMembershipSlot *member,
+								 uint32 member_state, PcmXLocalProgress *progress_out)
+{
+	memset(progress_out, 0, sizeof(*progress_out));
+	progress_out->identity = member->identity;
+	progress_out->ref = tag_slot->ref;
+	progress_out->image = tag_slot->image;
+	progress_out->local_sequence = member->local_sequence;
+	progress_out->reliable_state_sequence = tag_slot->reliable.state_sequence;
+	progress_out->local_round = member->admitted_round;
+	progress_out->member_state = member_state;
+	progress_out->role = member->role;
+	progress_out->pending_opcode = tag_slot->reliable.pending_opcode;
+	progress_out->last_response_opcode = tag_slot->reliable.last_response_opcode;
+	progress_out->phase = tag_slot->reliable.phase;
+	progress_out->master_session_incarnation = tag_slot->master_session_incarnation;
+	progress_out->master_node = tag_slot->master_node;
+	progress_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
+	progress_out->semantic_generation
+		= member_state == PCM_XL_GRANTED ? tag_slot->ref.grant_generation : 0;
+}
+
+
 PcmXQueueResult
 cluster_pcm_x_local_progress_exact(const PcmXLocalHandle *handle, PcmXLocalProgress *progress_out)
 {
@@ -15167,28 +15192,178 @@ cluster_pcm_x_local_progress_exact(const PcmXLocalHandle *handle, PcmXLocalProgr
 		goto progress_done;
 	}
 
-	progress_out->identity = member->identity;
-	progress_out->ref = tag_slot->ref;
-	progress_out->image = tag_slot->image;
-	progress_out->local_sequence = member->local_sequence;
-	progress_out->reliable_state_sequence = tag_slot->reliable.state_sequence;
-	progress_out->local_round = member->admitted_round;
-	progress_out->member_state = member_state;
-	progress_out->role = member->role;
-	progress_out->pending_opcode = tag_slot->reliable.pending_opcode;
-	progress_out->last_response_opcode = tag_slot->reliable.last_response_opcode;
-	progress_out->phase = tag_slot->reliable.phase;
-	progress_out->master_session_incarnation = tag_slot->master_session_incarnation;
-	progress_out->master_node = tag_slot->master_node;
-	progress_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
-	progress_out->semantic_generation
-		= member_state == PCM_XL_GRANTED ? tag_slot->ref.grant_generation : 0;
+	pcm_x_local_progress_copy_locked(tag_slot, member, member_state, progress_out);
 	result = PCM_X_QUEUE_OK;
 
 progress_done:
 	LWLockRelease(&header->local_locks[partition].lock);
 	if (result != PCM_X_QUEUE_OK)
 		memset(progress_out, 0, sizeof(*progress_out));
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_target_activation_work_next(
+	Size *cursor_io, Size scan_budget, PcmXLocalTargetActivationWork *work_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXAllocatorView view;
+	PcmXLocalTagSlot *raw;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *leader;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef leader_ref;
+	BufferTag tag;
+	Size budget;
+	Size i;
+	Size index;
+	Size start;
+	uint64 generation_after;
+	uint32 partition;
+	uint32 state;
+
+	if (work_out != NULL)
+		memset(work_out, 0, sizeof(*work_out));
+	if (header == NULL || cursor_io == NULL || scan_budget == 0 || work_out == NULL)
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	if (!pcm_x_allocator_entry_unlocked(header)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_TAG, &view) || view.capacity == 0)
+		return PCM_X_QUEUE_INVALID;
+
+	start = *cursor_io % view.capacity;
+	budget = Min(scan_budget, view.capacity);
+	for (i = 0; i < budget; i++) {
+		index = (start + i) % view.capacity;
+		*cursor_io = (index + 1) % view.capacity;
+		raw = (PcmXLocalTagSlot *)pcm_x_allocator_slot(&view, index);
+		if (raw == NULL || pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE
+			|| !pcm_x_slot_generation_read(&raw->slot, &tag_ref.slot_generation))
+			continue;
+		tag_ref.slot_index = index;
+		tag = raw->tag;
+		pg_read_barrier();
+		if (!pcm_x_slot_generation_read(&raw->slot, &generation_after)
+			|| generation_after != tag_ref.slot_generation
+			|| pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE)
+			continue;
+
+		partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&tag));
+		LWLockAcquire(&header->local_locks[partition].lock, LW_SHARED);
+		tag_slot = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_LOCAL_TAG, tag_ref, &tag, PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+		if (tag_slot == NULL
+			|| (pcm_x_slot_flags_read(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_ADMISSION_GATE) != 0
+			|| tag_slot->semantic_generation != 0
+			|| tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
+			|| tag_slot->leader_slot_generation == 0) {
+			LWLockRelease(&header->local_locks[partition].lock);
+			continue;
+		}
+		leader_ref.slot_index = tag_slot->leader_index;
+		leader_ref.slot_generation = tag_slot->leader_slot_generation;
+		leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &tag, PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+		state = leader != NULL ? pcm_x_slot_state_read(&leader->slot) : PCM_X_SLOT_FREE;
+		if (leader == NULL || state != PCM_XL_GRANTED
+			|| leader->role != PCM_X_LOCAL_ROLE_NODE_LEADER
+			|| leader->tag_slot_index != tag_ref.slot_index
+			|| leader->tag_slot_generation != tag_ref.slot_generation
+			|| tag_slot->ref.grant_generation == 0
+			|| tag_slot->ref.grant_generation == UINT64_MAX
+			|| !pcm_x_wait_identity_equal(&tag_slot->ref.identity, &leader->identity)
+			|| !resource_x_assertion_valid(&tag_slot->logical_assertion)
+			|| !BufferTagsEqual(&tag_slot->logical_assertion.resource, &tag_slot->tag)
+			|| tag_slot->logical_assertion.requester_node != leader->identity.node_id) {
+			LWLockRelease(&header->local_locks[partition].lock);
+			continue;
+		}
+		pcm_x_local_handle_from_member(&work_out->handle, leader_ref, leader,
+									   PCM_X_LOCAL_ROLE_NODE_LEADER);
+		pcm_x_local_progress_copy_locked(tag_slot, leader, state, &work_out->progress);
+		LWLockRelease(&header->local_locks[partition].lock);
+		if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+			memset(work_out, 0, sizeof(*work_out));
+			return PCM_X_QUEUE_NOT_READY;
+		}
+		return PCM_X_QUEUE_OK;
+	}
+	return pcm_x_runtime_token_exact(&runtime, 0) ? PCM_X_QUEUE_NOT_FOUND
+											 : PCM_X_QUEUE_NOT_READY;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_target_activation_publish_exact(const PcmXLocalHandle *handle,
+												 uint64 semantic_generation)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || handle == NULL || handle->flags != 0
+		|| semantic_generation == 0 || semantic_generation == UINT64_MAX
+		|| !pcm_x_wait_identity_valid(&handle->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(handle, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&handle->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	tag_slot = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_TAG, tag_ref, &handle->identity.tag, PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	member = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_WAIT, member_ref, &handle->identity.tag,
+		PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+	if (tag_slot == NULL || member == NULL || !pcm_x_local_handle_exact(
+			handle, member_ref, member, tag_slot)) {
+		result = PCM_X_QUEUE_STALE;
+		goto publish_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto publish_done;
+	}
+	if (pcm_x_slot_state_read(&member->slot) != PCM_XL_GRANTED
+		|| (member->role != PCM_X_LOCAL_ROLE_NODE_LEADER
+			&& member->role != PCM_X_LOCAL_ROLE_FOLLOWER)) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto publish_done;
+	}
+	if (tag_slot->ref.grant_generation != semantic_generation) {
+		result = PCM_X_QUEUE_STALE;
+		goto publish_done;
+	}
+	if (tag_slot->semantic_generation == semantic_generation) {
+		result = PCM_X_QUEUE_DUPLICATE;
+		goto publish_done;
+	}
+	if (tag_slot->semantic_generation != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto publish_done;
+	}
+	tag_slot->semantic_generation = semantic_generation;
+	result = PCM_X_QUEUE_OK;
+
+publish_done:
+	LWLockRelease(&header->local_locks[partition].lock);
 	if (fail_closed)
 		pcm_x_runtime_fail_closed();
 	return result;

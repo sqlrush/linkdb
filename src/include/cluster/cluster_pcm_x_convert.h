@@ -663,6 +663,13 @@ typedef struct PcmXLocalProgress {
 
 StaticAssertDecl(sizeof(PcmXLocalProgress) == 256, "PCM-X local progress ABI");
 
+/* One bounded existing-tick candidate for completing target T1/T2/T3 after
+ * the originating requester stopped driving.  Process-local only. */
+typedef struct PcmXLocalTargetActivationWork {
+	PcmXLocalHandle handle;
+	PcmXLocalProgress progress;
+} PcmXLocalTargetActivationWork;
+
 /* Read-only process-local view of the independent holder transfer lane. */
 typedef struct PcmXLocalHolderProgress {
 	PcmXTicketRef ref;
@@ -1781,7 +1788,11 @@ extern PcmXQueueResult cluster_pcm_x_local_lookup_exact(const PcmXWaitIdentity *
 extern PcmXQueueResult cluster_pcm_x_local_leader_rekey_generation_exact(
 	const PcmXLocalHandle *leader, uint64 base_own_generation, PcmXLocalHandle *rekeyed_out);
 extern PcmXQueueResult cluster_pcm_x_local_progress_exact(const PcmXLocalHandle *handle,
-														  PcmXLocalProgress *progress_out);
+												  PcmXLocalProgress *progress_out);
+extern PcmXQueueResult cluster_pcm_x_local_target_activation_work_next(
+	Size *cursor_io, Size scan_budget, PcmXLocalTargetActivationWork *work_out);
+extern PcmXQueueResult cluster_pcm_x_local_target_activation_publish_exact(
+	const PcmXLocalHandle *handle, uint64 semantic_generation);
 extern PcmXQueueResult
 cluster_pcm_x_local_follower_wfg_snapshot_exact(const PcmXLocalHandle *follower,
 												PcmXLocalFollowerWfgSnapshot *snapshot_out);

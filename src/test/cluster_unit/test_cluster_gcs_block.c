@@ -5793,6 +5793,13 @@ UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
 		= { "runtime = cluster_pcm_x_runtime_snapshot()",
 			"cluster_pcm_lock_resource_x_gate_bind_formation_exact(runtime.gate_generation)",
 			"gcs_block_pcm_x_resource_retry_tick", "gcs_block_pcm_x_terminal_retry_tick" };
+	static const char *const target_tick_contract[]
+		= { "cluster_pcm_x_local_target_activation_work_next(",
+			"cluster_pcm_lock_resource_x_executor_rearm_exact(",
+			"gcs_block_pcm_x_resource_x_terminal_try(",
+			"cluster_pcm_x_local_target_activation_publish_exact(",
+			"gcs_block_pcm_x_wake_requester(",
+			"cluster_pcm_x_retry_work_next(" };
 	char *source = read_gcs_block_source();
 
 	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_x_terminal_try(",
@@ -5811,6 +5818,9 @@ UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
 	assert_ordered_in_function(source, "\ncluster_gcs_block_pcm_x_formation_tick(",
 							   "\n\nstatic void\ngcs_block_pcm_x_resource_retry_tick(",
 							   formation_contract, lengthof(formation_contract));
+	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_retry_tick(",
+							   "\n\n#define GCS_BLOCK_PCM_X_TERMINAL_TICK_BUDGET",
+							   target_tick_contract, lengthof(target_tick_contract));
 	free(source);
 }
 
