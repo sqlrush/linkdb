@@ -185,6 +185,52 @@ resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state,
 	return true;
 }
 
+
+ResourceXRetryApplyResult
+resource_x_retry_terminalize_exact(const ResourceXRetryStateV1 *current,
+								   const ResourceXRetryStateV1 *expected,
+								   uint32 terminal_errcode,
+								   uint64 terminal_at_mono_us,
+								   ResourceXRetryStateV1 *terminal_out)
+{
+	ResourceXRetryStateV1 terminal;
+
+	resource_x_retry_state_clear(terminal_out);
+	if (current == NULL || expected == NULL || terminal_out == NULL
+		|| terminal_errcode == 0 || terminal_at_mono_us == 0
+		|| !resource_x_retry_state_valid(current)
+		|| !resource_x_retry_state_valid(expected))
+		return RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED;
+	if (current->last_phase == RESOURCE_X_RETRY_TERMINAL) {
+		if (!resource_x_attempt_matches(&current->attempt, &expected->attempt))
+			return RESOURCE_X_RETRY_APPLY_STALE;
+		if (current->terminal_errcode != terminal_errcode)
+			return RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED;
+		*terminal_out = *current;
+		return RESOURCE_X_RETRY_APPLY_DUPLICATE;
+	}
+	if (!resource_x_attempt_matches(&current->attempt, &expected->attempt)
+		|| current->state_generation != expected->state_generation
+		|| current->retry_count != expected->retry_count)
+		return RESOURCE_X_RETRY_APPLY_STALE;
+	if (current->last_phase == RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED
+		|| current->state_generation == PG_UINT32_MAX
+		|| terminal_at_mono_us < current->first_submit_mono_us)
+		return RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED;
+	if (current->last_phase == RESOURCE_X_RETRY_POST_NO_RETURN)
+		return RESOURCE_X_RETRY_APPLY_ROLL_FORWARD;
+	if (current->last_phase != RESOURCE_X_RETRY_PRE_NO_RETURN)
+		return RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED;
+	terminal = *current;
+	terminal.next_retry_due_mono_us = terminal_at_mono_us;
+	terminal.terminal_deadline_mono_us = terminal_at_mono_us;
+	terminal.terminal_errcode = terminal_errcode;
+	terminal.last_phase = RESOURCE_X_RETRY_TERMINAL;
+	terminal.state_generation++;
+	*terminal_out = terminal;
+	return RESOURCE_X_RETRY_APPLY_APPLIED;
+}
+
 ResourceXRetryDecision
 resource_x_retry_classify_exact(const ResourceXRetryStateV1 *state,
 								const ResourceXAttemptWitness *current_attempt,
@@ -199,8 +245,9 @@ resource_x_retry_classify_exact(const ResourceXRetryStateV1 *state,
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (out == NULL || !resource_x_retry_state_valid(state)
-		|| !resource_x_retry_transport_valid(fresh_transport)
 		|| !resource_x_attempt_matches(&state->attempt, current_attempt))
+		return RESOURCE_X_RETRY_RECOVERY_BLOCKED;
+	if (fresh_transport != NULL && fresh_transport->flags != 0)
 		return RESOURCE_X_RETRY_RECOVERY_BLOCKED;
 	if (state->last_phase == RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED)
 		return RESOURCE_X_RETRY_RECOVERY_BLOCKED;
@@ -218,6 +265,8 @@ resource_x_retry_classify_exact(const ResourceXRetryStateV1 *state,
 			: RESOURCE_X_RETRY_ROLL_FORWARD;
 	if (now_mono_us < state->next_retry_due_mono_us)
 		return RESOURCE_X_RETRY_NOT_DUE;
+	if (!resource_x_retry_transport_valid(fresh_transport))
+		return RESOURCE_X_RETRY_WAIT_SCHEDULER;
 
 	memset(&action, 0, sizeof(action));
 	action.attempt = state->attempt;

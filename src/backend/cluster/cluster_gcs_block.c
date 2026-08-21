@@ -16644,6 +16644,7 @@ gcs_block_pcm_x_resource_retry_tick(
 	uint32 connection_after;
 	uint32 connection_before;
 	bool admitted;
+	bool transport_ready;
 
 	cursor_before = cursor;
 	result = cluster_pcm_x_retry_work_next(&cursor, PCM_X_MASTER_DRIVE_SCAN_BUDGET, &work);
@@ -16662,49 +16663,65 @@ gcs_block_pcm_x_resource_retry_tick(
 		cluster_pcm_x_runtime_fail_closed();
 		return;
 	}
+	memset(&transport, 0, sizeof(transport));
+	connection_before = 0;
+	connection_after = 0;
+	transport_ready = false;
 	if (bindings[work.dest_node].cluster_epoch != work.cluster_epoch
 		|| bindings[work.dest_node].peer_session_incarnation == 0
 		|| bindings[work.dest_node].peer_session_incarnation
-			!= work.local_token.expected_responder_session) {
-		gcs_block_pcm_x_master_retry_observe("local-binding", PCM_X_QUEUE_NOT_READY,
-											 work.dest_node, cursor_before, cursor,
-											 &work.local_handle.identity.tag, work.cluster_epoch);
-		return;
+			!= work.local_token.expected_responder_session)
+		transport.flags = 1;
+	else {
+		transport.cluster_epoch = work.cluster_epoch;
+		transport.peer_session_incarnation
+			= bindings[work.dest_node].peer_session_incarnation;
+		transport.lane_id = CLUSTER_IC_PLANE_DATA;
+		runtime = cluster_pcm_x_runtime_snapshot();
+		if (work.dest_node == cluster_node_id) {
+			connection_before = runtime.gate_generation;
+			connection_after = runtime.gate_generation;
+		} else if (cluster_sf_peer_pcm_x_connection_generation(
+							 work.dest_node, &connection_before)) {
+			pg_read_barrier();
+			if (!cluster_sf_peer_pcm_x_connection_generation(
+							  work.dest_node, &connection_after))
+				connection_after = 0;
+		}
+		if (connection_before != 0 && connection_before == connection_after) {
+			transport.connection_generation = connection_before;
+			transport_ready = true;
+		}
 	}
-	runtime = cluster_pcm_x_runtime_snapshot();
-	if (work.dest_node == cluster_node_id) {
-		connection_before = runtime.gate_generation;
-		connection_after = runtime.gate_generation;
-	} else {
-		if (!cluster_sf_peer_pcm_x_connection_generation(work.dest_node, &connection_before))
-			return;
-		pg_read_barrier();
-		if (!cluster_sf_peer_pcm_x_connection_generation(work.dest_node, &connection_after))
-			return;
-	}
-	if (connection_before == 0 || connection_before != connection_after) {
-		gcs_block_pcm_x_master_retry_observe("local-transport", PCM_X_QUEUE_NOT_READY,
-											 work.dest_node, cursor_before, cursor,
-											 &work.local_handle.identity.tag, work.cluster_epoch);
-		return;
-	}
-	memset(&transport, 0, sizeof(transport));
-	transport.cluster_epoch = work.cluster_epoch;
-	transport.peer_session_incarnation
-		= bindings[work.dest_node].peer_session_incarnation;
-	transport.connection_generation = connection_before;
-	transport.lane_id = CLUSTER_IC_PLANE_DATA;
 	now_us = gcs_block_pcm_x_monotonic_us();
 	decision = resource_x_retry_classify_exact(&work.retry_state,
 											 &work.retry_state.attempt, &transport, now_us,
 											 &action);
 	if (decision == RESOURCE_X_RETRY_NOT_DUE)
 		return;
+	if (decision == RESOURCE_X_RETRY_WAIT_SCHEDULER) {
+		gcs_block_pcm_x_master_retry_observe("local-transport", PCM_X_QUEUE_NOT_READY,
+											 work.dest_node, cursor_before, cursor,
+											 &work.local_handle.identity.tag, work.cluster_epoch);
+		return;
+	}
 	if (decision == RESOURCE_X_RETRY_RECOVERY_BLOCKED) {
 		cluster_pcm_x_runtime_fail_closed();
 		return;
 	}
-	if (decision != RESOURCE_X_RETRY_STAGE_EXACT)
+	if (decision == RESOURCE_X_RETRY_TERMINAL_EXHAUSTED) {
+		result = cluster_pcm_x_local_retry_exhausted_exact(
+			&work.local_handle, &work.local_token, &work.retry_state, now_us, &applied);
+		cluster_pcm_x_stats_note_queue_result(result);
+		if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE
+			&& result != PCM_X_QUEUE_STALE && result != PCM_X_QUEUE_NOT_READY)
+			gcs_block_pcm_x_master_drive_fail_closed(result);
+		return;
+	}
+	if (decision != RESOURCE_X_RETRY_STAGE_EXACT
+		&& decision != RESOURCE_X_RETRY_ROLL_FORWARD)
+		return;
+	if (!transport_ready)
 		return;
 	payload_len = work.payload_len;
 	if (work.msg_type == PGRAC_IC_MSG_PCM_X_INSTALL_READY) {
@@ -16720,6 +16737,8 @@ gcs_block_pcm_x_resource_retry_tick(
 	admitted = cluster_gcs_pcm_x_stage_frame((uint8)work.msg_type, work.dest_node,
 										 work.payload, (uint16)payload_len);
 	if (!admitted)
+		return;
+	if (decision == RESOURCE_X_RETRY_ROLL_FORWARD)
 		return;
 	admitted_at_us = gcs_block_pcm_x_monotonic_us();
 	if (!resource_x_retry_next_due_exact(&work.retry_state, admitted_at_us,

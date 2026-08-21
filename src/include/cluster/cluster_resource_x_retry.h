@@ -54,6 +54,14 @@ typedef struct ResourceXRetryAction {
 	uint32 expected_retry_count;
 } ResourceXRetryAction;
 
+typedef enum ResourceXRetryApplyResult {
+	RESOURCE_X_RETRY_APPLY_APPLIED = 0,
+	RESOURCE_X_RETRY_APPLY_DUPLICATE,
+	RESOURCE_X_RETRY_APPLY_STALE,
+	RESOURCE_X_RETRY_APPLY_ROLL_FORWARD,
+	RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED
+} ResourceXRetryApplyResult;
+
 StaticAssertDecl(sizeof(ResourceXRetryStateV1) == 72,
 				 "Resource-X retry state ABI");
 StaticAssertDecl(offsetof(ResourceXRetryStateV1, attempt) == 0,
@@ -91,6 +99,11 @@ extern bool resource_x_retry_policy_exact(const ResourceXRetryStateV1 *state,
 extern bool resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state,
 	uint64 last_admitted_mono_us, uint32 admitted_retry_count,
 	uint64 *next_due_out);
+extern ResourceXRetryApplyResult resource_x_retry_terminalize_exact(
+	const ResourceXRetryStateV1 *current,
+	const ResourceXRetryStateV1 *expected,
+	uint32 terminal_errcode, uint64 terminal_at_mono_us,
+	ResourceXRetryStateV1 *terminal_out);
 extern ResourceXRetryDecision resource_x_retry_classify_exact(
 	const ResourceXRetryStateV1 *state,
 	const ResourceXAttemptWitness *current_attempt,

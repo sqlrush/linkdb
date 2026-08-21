@@ -177,12 +177,12 @@ UT_TEST(test_classifier_never_retries_successor_attempt)
 	ResourceXRetryAction action;
 	ResourceXRetryAction zero;
 
-	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 6000, 4, 10, 7,
+	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 6000, 4, 1, 7,
 										  &state));
 	MemSet(&action, 0xa5, sizeof(action));
 	MemSet(&zero, 0, sizeof(zero));
 	UT_ASSERT_EQ(resource_x_retry_classify_exact(&state, &successor, &transport,
-											 1010, &action),
+											 2000, &action),
 			 RESOURCE_X_RETRY_RECOVERY_BLOCKED);
 	UT_ASSERT(memcmp(&action, &zero, sizeof(action)) == 0);
 }
@@ -195,13 +195,13 @@ UT_TEST(test_classifier_rejects_unbound_transport_without_staging)
 	ResourceXRetryAction action;
 	ResourceXRetryAction zero;
 
-	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 6000, 4, 10, 7,
+	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 6000, 4, 1, 7,
 										  &state));
 	MemSet(&zero, 0, sizeof(zero));
 	transport.connection_generation = 0;
 	UT_ASSERT_EQ(resource_x_retry_classify_exact(&state, &attempt, &transport,
-											 1010, &action),
-			 RESOURCE_X_RETRY_RECOVERY_BLOCKED);
+											 2000, &action),
+				 RESOURCE_X_RETRY_WAIT_SCHEDULER);
 	UT_ASSERT(memcmp(&action, &zero, sizeof(action)) == 0);
 	transport = make_transport(9);
 	transport.flags = 1;
@@ -285,10 +285,48 @@ UT_TEST(test_exponential_backoff_saturates_and_clamps_to_deadline)
 	UT_ASSERT(!resource_x_retry_next_due_exact(&state, 20000, 9, &next_due));
 }
 
+UT_TEST(test_terminal_transition_is_attempt_generation_and_phase_exact)
+{
+	ResourceXAttemptWitness attempt = make_attempt(17);
+	ResourceXRetryStateV1 current;
+	ResourceXRetryStateV1 expected;
+	ResourceXRetryStateV1 terminal;
+	ResourceXRetryStateV1 before;
+	uint32 errcode = UINT32_C(0x123456);
+
+	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 6000, 0, 1, 7, &current));
+	expected = current;
+	UT_ASSERT_EQ(resource_x_retry_terminalize_exact(
+						 &current, &expected, errcode, 2000, &terminal),
+				 RESOURCE_X_RETRY_APPLY_APPLIED);
+	UT_ASSERT_EQ(terminal.last_phase, RESOURCE_X_RETRY_TERMINAL);
+	UT_ASSERT_EQ(terminal.terminal_errcode, errcode);
+	UT_ASSERT_EQ(terminal.next_retry_due_mono_us, 2000);
+	UT_ASSERT_EQ(terminal.terminal_deadline_mono_us, 2000);
+	UT_ASSERT_EQ(terminal.state_generation, 8);
+	UT_ASSERT_EQ(resource_x_retry_terminalize_exact(
+						 &terminal, &expected, errcode, 3000, &current),
+				 RESOURCE_X_RETRY_APPLY_DUPLICATE);
+	UT_ASSERT(memcmp(&current, &terminal, sizeof(current)) == 0);
+
+	current = expected;
+	current.last_phase = RESOURCE_X_RETRY_POST_NO_RETURN;
+	before = current;
+	UT_ASSERT_EQ(resource_x_retry_terminalize_exact(
+						 &current, &current, errcode, 2000, &terminal),
+				 RESOURCE_X_RETRY_APPLY_ROLL_FORWARD);
+	UT_ASSERT(memcmp(&current, &before, sizeof(current)) == 0);
+	current = expected;
+	current.state_generation = PG_UINT32_MAX;
+	UT_ASSERT_EQ(resource_x_retry_terminalize_exact(
+						 &current, &current, errcode, 2000, &terminal),
+				 RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(test_retry_state_layout_and_slot_embedding);
 	UT_RUN(test_retry_state_initialization_publishes_exact_attempt);
 	UT_RUN(test_retry_state_initialization_rejects_unpublishable_state);
@@ -299,6 +337,7 @@ main(void)
 	UT_RUN(test_retry_policy_snapshot_is_lossless_across_guc_domain);
 	UT_RUN(test_classifier_enforces_sampled_retry_budget);
 	UT_RUN(test_exponential_backoff_saturates_and_clamps_to_deadline);
+	UT_RUN(test_terminal_transition_is_attempt_generation_and_phase_exact);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

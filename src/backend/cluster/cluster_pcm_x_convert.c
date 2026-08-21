@@ -17029,6 +17029,134 @@ admitted_done:
 }
 
 
+static bool
+pcm_x_local_retry_pre_no_return_locked(const PcmXLocalTagSlot *tag_slot,
+									   const PcmXLocalMembershipSlot *member)
+{
+	uint16 opcode;
+
+	if (tag_slot == NULL || member == NULL
+		|| tag_slot->retry_state.last_phase != RESOURCE_X_RETRY_PRE_NO_RETURN
+		|| tag_slot->committed_own_generation != 0
+		|| tag_slot->grant_base_own_generation != 0
+		|| pcm_x_image_token_valid(&tag_slot->image)
+		|| !pcm_x_local_reliable_leg_valid(tag_slot, member))
+		return false;
+	opcode = tag_slot->reliable.pending_opcode;
+	return opcode == PGRAC_IC_MSG_PCM_X_ENQUEUE
+		|| opcode == PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM
+		|| opcode == PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL
+		|| opcode == PGRAC_IC_MSG_PCM_X_CANCEL;
+}
+
+
+static PcmXQueueResult
+pcm_x_local_retry_mark_post_no_return_locked(PcmXLocalTagSlot *tag_slot,
+										 PcmXLocalMembershipSlot *member)
+{
+	ResourceXAttemptWitness attempt;
+
+	if (tag_slot == NULL || member == NULL)
+		return PCM_X_QUEUE_INVALID;
+	if (resource_x_retry_state_is_clear(&tag_slot->retry_state))
+		return PCM_X_QUEUE_OK;
+	if (!pcm_x_local_retry_attempt_exact(tag_slot, member, &attempt)
+		|| !resource_x_attempt_matches(&tag_slot->retry_state.attempt, &attempt))
+		return PCM_X_QUEUE_CORRUPT;
+	if (tag_slot->retry_state.last_phase == RESOURCE_X_RETRY_POST_NO_RETURN)
+		return PCM_X_QUEUE_OK;
+	if (tag_slot->retry_state.last_phase == RESOURCE_X_RETRY_TERMINAL)
+		return PCM_X_QUEUE_BAD_STATE;
+	if (tag_slot->retry_state.last_phase == RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED)
+		return PCM_X_QUEUE_CORRUPT;
+	if (tag_slot->retry_state.last_phase != RESOURCE_X_RETRY_PRE_NO_RETURN)
+		return PCM_X_QUEUE_CORRUPT;
+	if (tag_slot->retry_state.state_generation == PG_UINT32_MAX)
+		return PCM_X_QUEUE_COUNTER_EXHAUSTED;
+	tag_slot->retry_state.last_phase = RESOURCE_X_RETRY_POST_NO_RETURN;
+	tag_slot->retry_state.state_generation++;
+	return PCM_X_QUEUE_OK;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_retry_exhausted_exact(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected_token,
+	const ResourceXRetryStateV1 *expected_state, uint64 terminal_at_mono_us,
+	ResourceXRetryStateV1 *terminal_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	ResourceXAttemptWitness attempt;
+	ResourceXRetryApplyResult apply_result;
+	ResourceXRetryStateV1 terminal;
+	uint32 partition;
+	bool fail_closed = false;
+
+	resource_x_retry_state_clear(terminal_out);
+	if (header == NULL || leader == NULL || expected_token == NULL
+		|| expected_state == NULL || terminal_out == NULL
+		|| terminal_at_mono_us == 0 || !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_reliable_slots_exact(leader, tag_ref, member_ref,
+										  &tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK)
+		goto exhausted_done;
+	if (!pcm_x_local_reliable_leg_valid(tag_slot, member)
+		|| !pcm_x_local_reliable_token_exact(expected_token, tag_slot, member)
+		|| !pcm_x_local_retry_attempt_exact(tag_slot, member, &attempt)
+		|| !resource_x_attempt_matches(&expected_state->attempt, &attempt)) {
+		result = PCM_X_QUEUE_STALE;
+		goto exhausted_done;
+	}
+	apply_result = resource_x_retry_terminalize_exact(
+		&tag_slot->retry_state, expected_state,
+		ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED,
+		terminal_at_mono_us, &terminal);
+	if (apply_result == RESOURCE_X_RETRY_APPLY_APPLIED) {
+		if (!pcm_x_local_retry_pre_no_return_locked(tag_slot, member)) {
+			result = PCM_X_QUEUE_NOT_READY;
+			goto exhausted_done;
+		}
+		tag_slot->retry_state = terminal;
+		pg_write_barrier();
+		*terminal_out = terminal;
+		result = PCM_X_QUEUE_OK;
+	} else if (apply_result == RESOURCE_X_RETRY_APPLY_DUPLICATE) {
+		*terminal_out = terminal;
+		result = PCM_X_QUEUE_DUPLICATE;
+	} else if (apply_result == RESOURCE_X_RETRY_APPLY_STALE) {
+		result = PCM_X_QUEUE_STALE;
+	} else if (apply_result == RESOURCE_X_RETRY_APPLY_ROLL_FORWARD) {
+		result = PCM_X_QUEUE_NOT_READY;
+	} else {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	}
+
+exhausted_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (result == PCM_X_QUEUE_CORRUPT)
+		fail_closed = true;
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
 static PcmXQueueResult
 pcm_x_local_retry_payload_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag_ref,
 								 PcmXLocalMembershipSlot *member,
@@ -17037,9 +17165,15 @@ pcm_x_local_retry_payload_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag_ref
 	ResourceXAttemptWitness attempt;
 
 	if (tag_slot == NULL || member == NULL || work == NULL
-		|| !pcm_x_local_reliable_leg_valid(tag_slot, member)
 		|| !pcm_x_local_retry_attempt_exact(tag_slot, member, &attempt)
 		|| !resource_x_attempt_matches(&tag_slot->retry_state.attempt, &attempt))
+		return PCM_X_QUEUE_CORRUPT;
+	/* Exact response application clears the old leg before foreground code
+	 * arms the next one.  The retry attempt remains canonical during that
+	 * legal phase window, but there is no frame for formation to produce. */
+	if (pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable))
+		return PCM_X_QUEUE_NOT_FOUND;
+	if (!pcm_x_local_reliable_leg_valid(tag_slot, member))
 		return PCM_X_QUEUE_CORRUPT;
 	work->kind = PCM_X_RETRY_WORK_LOCAL;
 	work->msg_type = tag_slot->reliable.pending_opcode;
@@ -17214,6 +17348,12 @@ cluster_pcm_x_retry_work_next(Size *cursor_io, Size scan_budget,
 			goto local_done;
 		}
 		if (resource_x_retry_state_is_clear(&tag_slot->retry_state)) {
+			result = PCM_X_QUEUE_NOT_FOUND;
+			goto local_done;
+		}
+		if (tag_slot->retry_state.last_phase == RESOURCE_X_RETRY_TERMINAL
+			|| tag_slot->retry_state.last_phase
+				== RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED) {
 			result = PCM_X_QUEUE_NOT_FOUND;
 			goto local_done;
 		}
@@ -17911,6 +18051,12 @@ pcm_x_local_transfer_arm_exact(const PcmXLocalHandle *leader, uint16 opcode,
 	if (!cluster_pcm_x_generation_next(tag_slot->reliable.state_sequence, &next_sequence)) {
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
 		fail_closed = true;
+		goto arm_done;
+	}
+	result = pcm_x_local_retry_mark_post_no_return_locked(tag_slot, member);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT
+			|| result == PCM_X_QUEUE_COUNTER_EXHAUSTED;
 		goto arm_done;
 	}
 	tag_slot->reliable.state_sequence = next_sequence;

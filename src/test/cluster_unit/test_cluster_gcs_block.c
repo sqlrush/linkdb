@@ -1502,6 +1502,11 @@ UT_TEST(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage)
 							  "PCM_X_MASTER_DRIVE_SCAN_BUDGET"));
 		UT_ASSERT_NOT_NULL(strstr(source, "resource_x_retry_classify_exact"));
 		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_local_retry_admitted_exact"));
+		UT_ASSERT_NOT_NULL(strstr(retry_tick,
+							  "RESOURCE_X_RETRY_TERMINAL_EXHAUSTED"));
+		UT_ASSERT_NOT_NULL(strstr(retry_tick,
+							  "cluster_pcm_x_local_retry_exhausted_exact"));
+		UT_ASSERT_NOT_NULL(strstr(retry_tick, "RESOURCE_X_RETRY_ROLL_FORWARD"));
 		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_stats_snapshot(&stats)"));
 		UT_ASSERT_NOT_NULL(strstr(source, "stats.live_tickets == 0"));
 

@@ -1906,6 +1906,10 @@ extern PcmXQueueResult cluster_pcm_x_local_retry_admitted_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
 	const ResourceXRetryAction *action, uint64 next_retry_due_mono_us,
 	ResourceXRetryStateV1 *state_out);
+extern PcmXQueueResult cluster_pcm_x_local_retry_exhausted_exact(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected_token,
+	const ResourceXRetryStateV1 *expected_state, uint64 terminal_at_mono_us,
+	ResourceXRetryStateV1 *terminal_out);
 extern PcmXQueueResult cluster_pcm_x_retry_work_next(Size *cursor_io,
 	Size scan_budget, PcmXRetryWorkItem *work_out);
 extern PcmXQueueResult cluster_pcm_x_local_reliable_ack_exact(
