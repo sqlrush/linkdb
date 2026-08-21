@@ -109,6 +109,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_page_guard \
 		test_cluster_page_authority \
 		test_cluster_thread_recovery_authority \
+		test_cluster_thread_recovery_fabric_plan \
 		test_cluster_page_online_plan \
 		test_cluster_page_replay_batch \
 		test_cluster_page_install \
@@ -320,6 +321,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_rf_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_detached,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_guard,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_authority,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_authority,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_online_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
@@ -693,6 +695,22 @@ test_cluster_thread_recovery_authority: \
 		$(CLUSTER_THREAD_RECOVERY_AUTHORITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
 		$(CLUSTER_THREAD_RECOVERY_AUTHORITY_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O = \
+		cluster_thread_recovery_fabric_plan_test.o
+
+$(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_fabric_plan.c \
+		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_fabric.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_thread_recovery_fabric_plan: \
+		test_cluster_thread_recovery_fabric_plan.c unit_test.h \
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
