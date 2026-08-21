@@ -86,6 +86,24 @@ typedef struct RfSideXactCommitPreparedRequirementsV1
 	RfSideXactTTCommitRequirementV1 bindings[CLUSTER_TT_2PC_MAX_BINDINGS];
 } RfSideXactCommitPreparedRequirementsV1;
 
+typedef struct RfSideXactTTAbortRequirementV1
+{
+	uint8		instance;
+	bool		requires_apply;
+	uint16		reserved_zero;
+	uint32		segment_id;
+	uint16		slot_offset;
+	uint16		wrap;
+	TransactionId xid;
+} RfSideXactTTAbortRequirementV1;
+
+typedef struct RfSideXactAbortPreparedRequirementsV1
+{
+	uint16		count;
+	uint16		reserved_zero;
+	RfSideXactTTAbortRequirementV1 bindings[CLUSTER_TT_2PC_MAX_BINDINGS];
+} RfSideXactAbortPreparedRequirementsV1;
+
 /* Apply one already-decoded operation.  This function never reads WAL. */
 extern RfSideXactApplyResultV1 rf_side_xact_apply_v1(
 	const RfSideXactOperationV1 *operation);
@@ -96,6 +114,10 @@ extern RfSideXactApplyResultV1
 rf_side_xact_commit_prepared_requirements_v1(
 	const RfSideXactOperationV1 *operation,
 	RfSideXactCommitPreparedRequirementsV1 *out_requirements);
+extern RfSideXactApplyResultV1
+rf_side_xact_abort_prepared_requirements_v1(
+	const RfSideXactOperationV1 *operation,
+	RfSideXactAbortPreparedRequirementsV1 *out_requirements);
 extern RfSideXactApplyResultV1 rf_side_xact_apply_owned_v1(
 	const RfSideXactOperationV1 *operation, const uint8 *owned_payload,
 	uint32 owned_payload_length);

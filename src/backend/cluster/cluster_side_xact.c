@@ -970,6 +970,168 @@ side_xact_apply_commit_prepared(const RfSideXactOperationV1 *operation)
 }
 
 static bool
+side_xact_prepared_abort_tt_requirements(
+	const RfSideXactOperationV1 *prepared,
+	RfSideXactAbortPreparedRequirementsV1 *requirements)
+{
+	uint16		i;
+
+	if (requirements == NULL)
+		return false;
+	memset(requirements, 0, sizeof(*requirements));
+	for (i = 0; i < prepared->prepared_binding_count; i++)
+		if (cluster_xid_origin_slot(prepared->prepared_bindings[i].xid) !=
+				(int) prepared->origin_thread - 1)
+			return false;
+	requirements->count = prepared->prepared_binding_count;
+	for (i = 0; i < prepared->prepared_binding_count; i++)
+	{
+		const ClusterTT2PCBinding *binding =
+			&prepared->prepared_bindings[i];
+		RfSideXactTTAbortRequirementV1 *requirement =
+			&requirements->bindings[i];
+		TTSlot		slot;
+
+		/*
+		 * RF-SIDE §2.3/§4: a nonempty prepared undo chain needs a
+		 * positive physical rollback-completion proof.  TT_ABORT and
+		 * SET_HEAD only preserve the work to do; neither is completion.
+		 * Until the rollback owner supplies that proof, retain the native
+		 * pending owner and fail closed before projection or lock release.
+		 * In particular, a temporarily empty TT head is not a guessed
+		 * completion because the immutable prepare payload still names work.
+		 */
+		if (!UBA_is_invalid(prepared->prepared_heads[i]))
+			return false;
+
+		requirement->instance = prepared->origin_thread;
+		requirement->segment_id = binding->undo_segment_id;
+		requirement->slot_offset = binding->slot_offset;
+		requirement->wrap = binding->wrap;
+		requirement->xid = binding->xid;
+		if (!cluster_tt_slot_durable_read_exact_stable(
+				binding->undo_segment_id, binding->slot_offset, binding->xid,
+				binding->wrap, &slot))
+			return false;
+		if (slot.status == TT_SLOT_ACTIVE && !SCN_VALID(slot.commit_scn) &&
+			UBA_is_invalid(slot.first_undo_block))
+		{
+			requirement->requires_apply = true;
+			continue;
+		}
+		if (slot.status == TT_SLOT_ABORTED && !SCN_VALID(slot.commit_scn) &&
+			UBA_is_invalid(slot.first_undo_block))
+			continue;
+		return false;
+	}
+	return true;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_abort_prepared_requirements_v1(
+	const RfSideXactOperationV1 *operation,
+	RfSideXactAbortPreparedRequirementsV1 *out_requirements)
+{
+	RfSideXactOperationV1 prepared;
+	RfSideXactApplyResultV1 result;
+	uint8	   *payload = NULL;
+	uint32		payload_length = 0;
+
+	if (out_requirements == NULL)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	memset(out_requirements, 0, sizeof(*out_requirements));
+	if (!rf_side_xact_structural_preflight_v1(operation) ||
+		operation->kind != RF_SIDE_XACT_ABORT_PREPARED ||
+		operation->system_identifier != GetSystemIdentifier() ||
+		cluster_xid_origin_slot(operation->xid) !=
+			(int) operation->origin_thread - 1)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	result = side_xact_read_prepared_material(operation, &prepared, &payload,
+		&payload_length);
+	if (result != RF_SIDE_XACT_APPLY_OK)
+		return result;
+	result = side_xact_prepared_abort_tt_requirements(&prepared,
+		out_requirements) ? RF_SIDE_XACT_APPLY_OK :
+		RF_SIDE_XACT_APPLY_BLOCKED;
+	side_xact_payload_free(payload);
+	return result;
+}
+
+static RfSideXactApplyResultV1
+side_xact_preflight_abort_prepared(
+	const RfSideXactOperationV1 *operation)
+{
+	RfSideXactAbortPreparedRequirementsV1 requirements;
+
+	return rf_side_xact_abort_prepared_requirements_v1(operation,
+		&requirements);
+}
+
+static RfSideXactApplyResultV1
+side_xact_apply_abort_prepared(const RfSideXactOperationV1 *operation)
+{
+	RfSideXactOperationV1 prepared;
+	RfSideXactApplyResultV1 result;
+	TwoPhaseRecoveryPendingResult pending;
+	ClusterRemoteXactMutationV2 mutation;
+	ClusterRemoteXactOutcome outcome;
+	uint8	   *payload = NULL;
+	uint32		payload_length = 0;
+	SCN			post_scn;
+	uint16		post_wrap;
+	bool		post_wrap_valid;
+	RfSideXactAbortPreparedRequirementsV1 requirements;
+	uint16		i;
+
+	result = side_xact_read_prepared_material(operation, &prepared, &payload,
+		&payload_length);
+	if (result != RF_SIDE_XACT_APPLY_OK)
+		return result;
+	if (!side_xact_prepared_abort_tt_requirements(&prepared, &requirements))
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	}
+	for (i = 0; i < requirements.count; i++)
+		if (requirements.bindings[i].requires_apply)
+		{
+			side_xact_payload_free(payload);
+			return RF_SIDE_XACT_APPLY_BLOCKED;
+		}
+
+	cluster_scn_recovery_replay_observe(operation->terminal_scn);
+	mutation = cluster_remote_xact_store_terminal_v2(
+		operation->origin_thread - 1, operation->xid, true,
+		operation->prepare_binding, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn,
+		0, false, 0);
+	if (mutation == CLUSTER_REMOTE_XACT_MUTATION_CONFLICT)
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_CONFLICT;
+	}
+	if (mutation != CLUSTER_REMOTE_XACT_MUTATION_STORED &&
+		mutation != CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED)
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	}
+	outcome = cluster_remote_commit_outcome_ex(operation->origin_thread - 1,
+		operation->xid, &post_scn, &post_wrap, &post_wrap_valid);
+	if (outcome != CLUSTER_REMOTE_XACT_ABORTED || SCN_VALID(post_scn) ||
+		post_wrap_valid)
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
+	}
+
+	pending = TwoPhaseRecoveryPendingResolveExact(operation->xid,
+		operation->database, operation->prepare_gid, payload, payload_length,
+		false);
+	side_xact_payload_free(payload);
+	return side_xact_map_pending_result(pending);
+}
+
+static bool
 side_xact_prepared_tt_undo_exact(const RfSideXactOperationV1 *operation)
 {
 	uint16		i;
@@ -1017,6 +1179,10 @@ rf_side_xact_target_preflight_owned_v1(
 		return owned_payload == NULL && owned_payload_length == 0
 			? side_xact_preflight_commit_prepared(operation)
 			: RF_SIDE_XACT_APPLY_BLOCKED;
+	if (operation->kind == RF_SIDE_XACT_ABORT_PREPARED)
+		return owned_payload == NULL && owned_payload_length == 0
+			? side_xact_preflight_abort_prepared(operation)
+			: RF_SIDE_XACT_APPLY_BLOCKED;
 	if (operation->kind != RF_SIDE_XACT_PREPARE || owned_payload == NULL ||
 		owned_payload_length != operation->prepare_payload_length ||
 		!side_xact_prepared_tt_undo_exact(operation))
@@ -1045,6 +1211,8 @@ rf_side_xact_apply_owned_v1(const RfSideXactOperationV1 *operation,
 		return side_xact_apply_commit_v1(operation);
 	if (operation->kind == RF_SIDE_XACT_COMMIT_PREPARED)
 		return side_xact_apply_commit_prepared(operation);
+	if (operation->kind == RF_SIDE_XACT_ABORT_PREPARED)
+		return side_xact_apply_abort_prepared(operation);
 
 	/*
 	 * The native database-scoped pending record is the authority-bearing
