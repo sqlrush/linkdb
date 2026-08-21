@@ -193,6 +193,15 @@ rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	detail = rf_side_online_plan_apply_v1(plan, &ops);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
+	if (rf_side_online_plan_operation_count_v1(plan) == 0)
+	{
+		/*
+		 * A sealed empty SIDE proof set closes without taking the online
+		 * writer barrier: there are no SIDE bytes to protect or mutate.  It
+		 * still needs a fresh authority observation at the closure point.
+		 */
+		owner->protected_set_complete = side_owner_authority_fresh(owner);
+	}
 	return owner->protected_set_complete ? RF_PAGE_PROOF_DETAIL_OK :
 		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }

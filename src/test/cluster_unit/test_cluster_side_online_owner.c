@@ -20,6 +20,7 @@ ExceptionalCondition(const char *condition_name pg_attribute_unused(),
 
 typedef struct OwnerCapture
 {
+	uint32 plan_operation_count;
 	uint32 authority_calls;
 	uint32 authority_fail_call;
 	uint32 pushes;
@@ -33,6 +34,13 @@ typedef struct OwnerCapture
 } OwnerCapture;
 
 static OwnerCapture capture;
+
+uint32
+rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
+{
+	UT_ASSERT(plan != NULL);
+	return capture.plan_operation_count;
+}
 
 static bool
 fresh_authority(void *arg)
@@ -168,6 +176,8 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 	uint32 i;
 
 	UT_ASSERT(plan != NULL);
+	if (capture.plan_operation_count == 0)
+		return RF_PAGE_PROOF_DETAIL_OK;
 	memset(operations, 0, sizeof(operations));
 	operations[0].kind = RF_SIDE_ONLINE_OPERATION_XACT;
 	operations[1].kind = RF_SIDE_ONLINE_OPERATION_UNDO;
@@ -210,6 +220,7 @@ UT_TEST(test_owner_runs_all_preflights_before_fresh_gated_mutations)
 	RfSideOnlinePlanV1 *plan = (RfSideOnlinePlanV1 *) (uintptr_t) 1;
 
 	memset(&capture, 0, sizeof(capture));
+	capture.plan_operation_count = 3;
 	UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &capture,
 		fresh_authority, 19, true));
 	UT_ASSERT_EQ(rf_side_online_production_preflight_v1(plan, &owner),
@@ -221,6 +232,7 @@ UT_TEST(test_owner_runs_all_preflights_before_fresh_gated_mutations)
 	UT_ASSERT_EQ(capture.undo_applies, 0);
 	UT_ASSERT_EQ(capture.projection_applies, 0);
 	memset(&capture, 0, sizeof(capture));
+	capture.plan_operation_count = 3;
 	UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
 		RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(capture.authority_calls, 8);
@@ -241,6 +253,7 @@ UT_TEST(test_stale_authority_before_first_mutation_closes_whole_set)
 	RfSideOnlinePlanV1 *plan = (RfSideOnlinePlanV1 *) (uintptr_t) 1;
 
 	memset(&capture, 0, sizeof(capture));
+	capture.plan_operation_count = 3;
 	capture.authority_fail_call = 5;
 	UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &capture,
 		fresh_authority, 19, true));
@@ -257,12 +270,53 @@ UT_TEST(test_stale_authority_before_first_mutation_closes_whole_set)
 	UT_ASSERT(!owner.protected_set_complete);
 }
 
+UT_TEST(test_empty_plan_closes_without_writer_barrier_or_mutation)
+{
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlinePlanV1 *plan = (RfSideOnlinePlanV1 *) (uintptr_t) 1;
+
+	memset(&capture, 0, sizeof(capture));
+	UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &capture,
+		fresh_authority, 19, true));
+	UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(capture.authority_calls, 1);
+	UT_ASSERT_EQ(capture.pushes, 0);
+	UT_ASSERT_EQ(capture.pops, 0);
+	UT_ASSERT_EQ(capture.xact_preflights, 0);
+	UT_ASSERT_EQ(capture.undo_preflights, 0);
+	UT_ASSERT_EQ(capture.projection_preflights, 0);
+	UT_ASSERT_EQ(capture.xact_applies, 0);
+	UT_ASSERT_EQ(capture.undo_applies, 0);
+	UT_ASSERT_EQ(capture.projection_applies, 0);
+	UT_ASSERT(owner.protected_set_complete);
+}
+
+UT_TEST(test_empty_plan_requires_fresh_closure_authority)
+{
+	RfSideOnlineProductionOwnerV1 owner;
+	RfSideOnlinePlanV1 *plan = (RfSideOnlinePlanV1 *) (uintptr_t) 1;
+
+	memset(&capture, 0, sizeof(capture));
+	capture.authority_fail_call = 1;
+	UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &capture,
+		fresh_authority, 19, true));
+	UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
+		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(capture.authority_calls, 1);
+	UT_ASSERT_EQ(capture.pushes, 0);
+	UT_ASSERT_EQ(capture.pops, 0);
+	UT_ASSERT(!owner.protected_set_complete);
+}
+
 int
 main(void)
 {
-	UT_PLAN(2);
+	UT_PLAN(4);
 	UT_RUN(test_owner_runs_all_preflights_before_fresh_gated_mutations);
 	UT_RUN(test_stale_authority_before_first_mutation_closes_whole_set);
+	UT_RUN(test_empty_plan_closes_without_writer_barrier_or_mutation);
+	UT_RUN(test_empty_plan_requires_fresh_closure_authority);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
