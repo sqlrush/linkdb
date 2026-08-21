@@ -1472,9 +1472,11 @@ UT_TEST(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage)
 			UT_ASSERT_NOT_NULL(strstr(formation, "\"stability\""));
 			UT_ASSERT_NOT_NULL(strstr(formation, "\"peer-revalidate\""));
 			UT_ASSERT_NOT_NULL(strstr(formation, "\"runtime-resample\""));
+			UT_ASSERT_NOT_NULL(strstr(formation,
+							  "gcs_block_pcm_x_resource_retry_tick(bindings_before)"));
 		}
 
-		retry_tick = strstr(source, "\ngcs_block_pcm_x_master_drive_retry_tick(");
+		retry_tick = strstr(source, "\ngcs_block_pcm_x_resource_retry_tick(");
 		retry_tick_end = retry_tick != NULL ? strstr(retry_tick, "\n}\n") : NULL;
 		UT_ASSERT_NOT_NULL(retry_tick);
 		UT_ASSERT_NOT_NULL(retry_tick_end);
@@ -1482,6 +1484,13 @@ UT_TEST(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage)
 			UT_ASSERT_NOT_NULL(strstr(retry_tick, "\"work-next\""));
 			UT_ASSERT_NOT_NULL(strstr(retry_tick, "cursor_before"));
 		}
+		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_retry_work_next"));
+		UT_ASSERT_NOT_NULL(strstr(source, "#define PCM_X_MASTER_DRIVE_SCAN_BUDGET 1024"));
+		UT_ASSERT_NOT_NULL(strstr(retry_tick,
+							  "cluster_pcm_x_retry_work_next(&cursor, "
+							  "PCM_X_MASTER_DRIVE_SCAN_BUDGET"));
+		UT_ASSERT_NOT_NULL(strstr(source, "resource_x_retry_classify_exact"));
+		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_local_retry_admitted_exact"));
 		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_stats_snapshot(&stats)"));
 		UT_ASSERT_NOT_NULL(strstr(source, "stats.live_tickets == 0"));
 

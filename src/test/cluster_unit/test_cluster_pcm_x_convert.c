@@ -15860,6 +15860,125 @@ UT_TEST(test_local_enqueue_arm_persists_ledger_and_mints_without_holes)
 	UT_ASSERT_EQ(header->outbound_targets[1].next_prehandle_sequence, 2);
 }
 
+UT_TEST(test_resource_x_retry_submission_is_visible_to_bounded_work_cursor)
+{
+	PcmXLocalHandle leader;
+	PcmXWaitIdentity identity;
+	PcmXEnqueuePayload enqueue;
+	PcmXLocalReliableToken token;
+	PcmXRetryWorkItem work;
+	ResourceXRetryAction action;
+	ResourceXTransportWitness transport;
+	ResourceXRetryStateV1 state;
+	Size cursor = 0;
+
+	init_active_pcm_x(UINT64_C(77));
+	identity = make_wait_identity(760, 0, 3, UINT64_C(70011));
+	identity.base_own_generation = UINT64_C(19);
+	bind_local_master(1, identity.cluster_epoch, UINT64_C(7111));
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, UINT64_C(7111), &leader),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&leader, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
+					 &leader, &token, UINT64_C(1000), UINT64_C(1010), UINT64_C(6000),
+					 &state),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(state.retry_count, 0);
+	UT_ASSERT_EQ(state.state_generation, 1);
+	UT_ASSERT_EQ(state.attempt.base_authority_generation, UINT64_C(19));
+
+	UT_ASSERT_EQ(cluster_pcm_x_retry_work_next(&cursor, SIZE_MAX, &work), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(work.kind, PCM_X_RETRY_WORK_LOCAL);
+	UT_ASSERT_EQ(work.msg_type, PGRAC_IC_MSG_PCM_X_ENQUEUE);
+	UT_ASSERT_EQ(work.dest_node, 1);
+	UT_ASSERT_EQ(work.payload_len, sizeof(PcmXEnqueuePayload));
+	UT_ASSERT(memcmp(work.payload, &enqueue, sizeof(enqueue)) == 0);
+	UT_ASSERT(memcmp(&work.local_token, &token, sizeof(token)) == 0);
+	UT_ASSERT(memcmp(&work.retry_state, &state, sizeof(state)) == 0);
+
+	MemSet(&transport, 0, sizeof(transport));
+	transport.cluster_epoch = identity.cluster_epoch;
+	transport.peer_session_incarnation = UINT64_C(7111);
+	transport.connection_generation = 9;
+	transport.lane_id = 1;
+	UT_ASSERT_EQ(resource_x_retry_classify_exact(&work.retry_state,
+											 &work.retry_state.attempt, &transport,
+											 UINT64_C(1010), &action),
+				 RESOURCE_X_RETRY_STAGE_EXACT);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_admitted_exact(
+					 &work.local_handle, &work.local_token, &action, UINT64_C(1020), &state),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(state.retry_count, 1);
+	UT_ASSERT_EQ(state.state_generation, 2);
+	UT_ASSERT_EQ(state.next_retry_due_mono_us, UINT64_C(1020));
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_admitted_exact(
+					 &work.local_handle, &work.local_token, &action, UINT64_C(1030), &state),
+				 PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(state.retry_count, 0);
+}
+
+UT_TEST(test_resource_x_retry_cursor_is_bounded_and_resumes_past_retained_entry)
+{
+	PcmXShmemHeader *header;
+	PcmXLocalHandle first;
+	PcmXLocalHandle second;
+	PcmXWaitIdentity first_identity;
+	PcmXWaitIdentity second_identity;
+	PcmXEnqueuePayload enqueue;
+	PcmXLocalReliableToken token;
+	PcmXRetryWorkItem work;
+	ResourceXRetryStateV1 state;
+	Size cursor;
+	Size first_index;
+	Size second_index;
+	Size total;
+	Size distance;
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	first_identity = make_wait_identity(761, 0, 4, UINT64_C(70012));
+	first_identity.base_own_generation = UINT64_C(20);
+	second_identity = make_wait_identity(762, 0, 5, UINT64_C(70013));
+	second_identity.base_own_generation = UINT64_C(21);
+	bind_local_master(1, first_identity.cluster_epoch, UINT64_C(7222));
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&first_identity, 1, UINT64_C(7222), &first),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&first, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
+					 &first, &token, UINT64_C(1000), UINT64_C(1010), UINT64_C(6000),
+					 &state),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&second_identity, 1, UINT64_C(7222), &second),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&second, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
+					 &second, &token, UINT64_C(1000), UINT64_C(1010), UINT64_C(6000),
+					 &state),
+				 PCM_X_QUEUE_OK);
+
+	total = header->layout.pools[PCM_X_POOL_MASTER_TAG].capacity
+		+ header->layout.pools[PCM_X_POOL_LOCAL_TAG].capacity;
+	first_index = header->layout.pools[PCM_X_POOL_MASTER_TAG].capacity
+		+ first.tag_slot.slot_index;
+	second_index = header->layout.pools[PCM_X_POOL_MASTER_TAG].capacity
+		+ second.tag_slot.slot_index;
+	cursor = first_index;
+	UT_ASSERT_EQ(cluster_pcm_x_retry_work_next(&cursor, 1, &work), PCM_X_QUEUE_OK);
+	UT_ASSERT(BufferTagsEqual(&work.local_handle.identity.tag, &first_identity.tag));
+	UT_ASSERT_EQ(cursor, (first_index + 1) % total);
+
+	/* The first due entry remains retained.  Resume after it and reach the
+	 * younger entry without restarting at the stuck head. */
+	distance = ((second_index + total - cursor) % total) + 1;
+	UT_ASSERT(distance <= 1024);
+	UT_ASSERT_EQ(cluster_pcm_x_retry_work_next(&cursor, 1024, &work), PCM_X_QUEUE_OK);
+	UT_ASSERT(BufferTagsEqual(&work.local_handle.identity.tag, &second_identity.tag));
+	UT_ASSERT_EQ(cursor, (second_index + 1) % total);
+}
+
 UT_TEST(test_local_enqueue_busy_and_counter_exhaustion_leave_no_hole)
 {
 	PcmXShmemHeader *header;
@@ -17776,7 +17895,7 @@ UT_TEST(test_runtime_reform_tag_epoch_failure_keeps_blocked)
 int
 main(void)
 {
-	UT_PLAN(296);
+	UT_PLAN(298);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -18028,6 +18147,8 @@ main(void)
 	UT_RUN(test_fifo_writer_drain_preserves_concurrent_holder_lane_until_transfer_drain);
 	UT_RUN(test_local_terminal_detach_rejects_hot_link_and_closed_count_corruption);
 	UT_RUN(test_local_enqueue_arm_persists_ledger_and_mints_without_holes);
+	UT_RUN(test_resource_x_retry_submission_is_visible_to_bounded_work_cursor);
+	UT_RUN(test_resource_x_retry_cursor_is_bounded_and_resumes_past_retained_entry);
 	UT_RUN(test_local_enqueue_busy_and_counter_exhaustion_leave_no_hole);
 	UT_RUN(test_local_admit_ack_retry_and_confirm_are_exact);
 	UT_RUN(test_local_generic_reliable_ack_requires_exact_token_and_keys);

@@ -732,6 +732,29 @@ typedef struct PcmXLocalReliableToken {
 	uint16 reserved;
 } PcmXLocalReliableToken;
 
+typedef enum PcmXRetryWorkKind {
+	PCM_X_RETRY_WORK_NONE = 0,
+	PCM_X_RETRY_WORK_MASTER,
+	PCM_X_RETRY_WORK_LOCAL
+} PcmXRetryWorkKind;
+
+/* One process-local item from the combined master/local retry inventory.
+ * The payload is an already-armed legacy adapter frame; canonical retry
+ * equality remains retry_state.attempt, never local_token or payload bytes. */
+typedef struct PcmXRetryWorkItem {
+	PcmXRetryWorkKind kind;
+	uint16 msg_type;
+	uint16 payload_len;
+	int32 dest_node;
+	uint32 reserved;
+	BufferTag master_tag;
+	uint64 cluster_epoch;
+	PcmXLocalHandle local_handle;
+	PcmXLocalReliableToken local_token;
+	ResourceXRetryStateV1 retry_state;
+	uint8 payload[sizeof(PcmXInstallReadyPayload)];
+} PcmXRetryWorkItem;
+
 /* One exact blocker-slot observation returned in canonical chunk order. */
 typedef struct PcmXMasterBlockerEntry {
 	PcmXSlotRef slot_ref;
@@ -1872,6 +1895,18 @@ cluster_pcm_x_local_reliable_snapshot_exact(const PcmXLocalHandle *leader,
 extern PcmXQueueResult cluster_pcm_x_local_reliable_retry_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected, uint64 retry_deadline_ms,
 	PcmXLocalReliableToken *token_out);
+extern PcmXQueueResult cluster_pcm_x_local_retry_state_exact(
+	const PcmXLocalHandle *leader, ResourceXRetryStateV1 *state_out);
+extern PcmXQueueResult cluster_pcm_x_local_retry_submission_admitted_exact(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
+	uint64 first_submit_mono_us, uint64 next_retry_due_mono_us,
+	uint64 terminal_deadline_mono_us, ResourceXRetryStateV1 *state_out);
+extern PcmXQueueResult cluster_pcm_x_local_retry_admitted_exact(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
+	const ResourceXRetryAction *action, uint64 next_retry_due_mono_us,
+	ResourceXRetryStateV1 *state_out);
+extern PcmXQueueResult cluster_pcm_x_retry_work_next(Size *cursor_io,
+	Size scan_budget, PcmXRetryWorkItem *work_out);
 extern PcmXQueueResult cluster_pcm_x_local_reliable_ack_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
 	const PcmXTicketRef *actual_ref, const PcmXPrehandleKey *actual_prehandle,

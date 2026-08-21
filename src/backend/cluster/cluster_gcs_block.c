@@ -11536,6 +11536,11 @@ gcs_block_pcm_x_rekey_leader_base_exact(BufferDesc *buf, PcmXLocalHandle *leader
 	return PCM_X_QUEUE_OK;
 }
 
+static bool gcs_block_pcm_x_foreground_may_stage(const PcmXLocalHandle *leader,
+											 PcmXQueueResult arm_result);
+static PcmXQueueResult gcs_block_pcm_x_note_local_submission(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *token);
+
 
 /*
  * Drive one ordinary BM_VALID N/S/X -> X request through the node FIFO.
@@ -11991,14 +11996,21 @@ requester_role_dispatch:
 				arm_result = cluster_pcm_x_local_enqueue_arm_exact(&handle, &enqueue, &token);
 				cluster_pcm_x_stats_note_queue_result(arm_result);
 				result = arm_result;
-				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE)
-					staged = cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_ENQUEUE, master_node,
-														   &enqueue, sizeof(enqueue));
-				else {
+				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE) {
+					if (gcs_block_pcm_x_foreground_may_stage(&handle, arm_result))
+						staged = cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_ENQUEUE,
+														   master_node, &enqueue, sizeof(enqueue));
+				} else {
 					retry_action = cluster_gcs_pcm_x_requester_retry_action(
 						GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT
 						&& retry_action != GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS)
+						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+				}
+				if (staged) {
+					result = gcs_block_pcm_x_note_local_submission(&handle, &token);
+					cluster_pcm_x_stats_note_queue_result(result);
+					if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE)
 						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 				}
 			} else if (progress.pending_opcode == PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM
@@ -12010,10 +12022,11 @@ requester_role_dispatch:
 				arm_result = cluster_pcm_x_local_admit_confirm_arm_exact(&handle, &confirm, &token);
 				cluster_pcm_x_stats_note_queue_result(arm_result);
 				result = arm_result;
-				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE)
-					staged = cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM,
+				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE) {
+					if (gcs_block_pcm_x_foreground_may_stage(&handle, arm_result))
+						staged = cluster_gcs_pcm_x_stage_frame(PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM,
 														   master_node, &confirm, sizeof(confirm));
-				else {
+				} else {
 					retry_action = cluster_gcs_pcm_x_requester_retry_action(
 						GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT
@@ -12123,11 +12136,12 @@ requester_role_dispatch:
 						&handle, &progress.ref, &progress.image, &install_ready, &token);
 					cluster_pcm_x_stats_note_queue_result(arm_result);
 					result = arm_result;
-					if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE)
-						staged = cluster_gcs_pcm_x_stage_frame(
-							PGRAC_IC_MSG_PCM_X_INSTALL_READY, master_node, &install_ready,
-							gcs_block_pcm_x_install_ready_wire_len(&install_ready));
-					else {
+					if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE) {
+						if (gcs_block_pcm_x_foreground_may_stage(&handle, arm_result))
+							staged = cluster_gcs_pcm_x_stage_frame(
+								PGRAC_IC_MSG_PCM_X_INSTALL_READY, master_node, &install_ready,
+								gcs_block_pcm_x_install_ready_wire_len(&install_ready));
+					} else {
 						retry_action = cluster_gcs_pcm_x_requester_retry_action(
 							GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
 						if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT
@@ -12145,11 +12159,12 @@ requester_role_dispatch:
 					&handle, &progress.ref, &progress.image, &install_ready, &token);
 				cluster_pcm_x_stats_note_queue_result(arm_result);
 				result = arm_result;
-				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE)
-					staged = cluster_gcs_pcm_x_stage_frame(
-						PGRAC_IC_MSG_PCM_X_INSTALL_READY, master_node, &install_ready,
-						gcs_block_pcm_x_install_ready_wire_len(&install_ready));
-				else {
+				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE) {
+					if (gcs_block_pcm_x_foreground_may_stage(&handle, arm_result))
+						staged = cluster_gcs_pcm_x_stage_frame(
+							PGRAC_IC_MSG_PCM_X_INSTALL_READY, master_node, &install_ready,
+							gcs_block_pcm_x_install_ready_wire_len(&install_ready));
+				} else {
 					retry_action = cluster_gcs_pcm_x_requester_retry_action(
 						GCS_BLOCK_PCM_X_RETRY_SITE_PRECOMMIT_ARM, arm_result);
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT
@@ -12181,10 +12196,12 @@ requester_role_dispatch:
 																	 &final_ack, &token);
 				cluster_pcm_x_stats_note_queue_result(arm_result);
 				result = arm_result;
-				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE)
-					staged = cluster_gcs_pcm_x_stage_frame(
-						PGRAC_IC_MSG_PCM_X_FINAL_ACK, master_node, &final_ack, sizeof(final_ack));
-				else
+				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE) {
+					if (gcs_block_pcm_x_foreground_may_stage(&handle, arm_result))
+						staged = cluster_gcs_pcm_x_stage_frame(
+							PGRAC_IC_MSG_PCM_X_FINAL_ACK, master_node, &final_ack,
+							sizeof(final_ack));
+				} else
 					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 			} else if (progress.pending_opcode == PGRAC_IC_MSG_PCM_X_FINAL_ACK) {
 				PcmXFinalAckPayload final_ack;
@@ -12194,10 +12211,12 @@ requester_role_dispatch:
 																	 &final_ack, &token);
 				cluster_pcm_x_stats_note_queue_result(arm_result);
 				result = arm_result;
-				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE)
-					staged = cluster_gcs_pcm_x_stage_frame(
-						PGRAC_IC_MSG_PCM_X_FINAL_ACK, master_node, &final_ack, sizeof(final_ack));
-				else {
+				if (arm_result == PCM_X_QUEUE_OK || arm_result == PCM_X_QUEUE_DUPLICATE) {
+					if (gcs_block_pcm_x_foreground_may_stage(&handle, arm_result))
+						staged = cluster_gcs_pcm_x_stage_frame(
+							PGRAC_IC_MSG_PCM_X_FINAL_ACK, master_node, &final_ack,
+							sizeof(final_ack));
+				} else {
 					retry_action = cluster_gcs_pcm_x_requester_retry_action(
 						GCS_BLOCK_PCM_X_RETRY_SITE_POSTCOMMIT_REPLAY_ARM, arm_result);
 					if (retry_action != GCS_BLOCK_PCM_X_RETRY_RELOAD_PROGRESS)
@@ -12462,7 +12481,8 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 
 #define PCM_X_MASTER_DRIVE_SCAN_BUDGET 1024
 
-static void gcs_block_pcm_x_master_drive_retry_tick(void);
+static void gcs_block_pcm_x_resource_retry_tick(
+	const PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT]);
 static void gcs_block_pcm_x_terminal_retry_tick(void);
 static void gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result,
 												 int32 peer_node, Size cursor_before,
@@ -12538,7 +12558,7 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 												 0, NULL, epoch_before);
 			return;
 		}
-		gcs_block_pcm_x_master_drive_retry_tick();
+		gcs_block_pcm_x_resource_retry_tick(bindings_before);
 		gcs_block_pcm_x_terminal_retry_tick();
 		return;
 	}
@@ -12927,6 +12947,83 @@ gcs_block_pcm_x_stage_frame_callback(uint8 msg_type, int32 dest_node_id, const v
 {
 	(void)callback_arg;
 	return cluster_gcs_pcm_x_stage_frame(msg_type, dest_node_id, payload, payload_len);
+}
+
+
+static uint64
+gcs_block_pcm_x_monotonic_us(void)
+{
+	instr_time now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	return (uint64)INSTR_TIME_GET_MICROSEC(now);
+}
+
+
+static uint64
+gcs_block_pcm_x_saturating_add_us(uint64 base, uint64 delta)
+{
+	return base > UINT64_MAX - delta ? UINT64_MAX : base + delta;
+}
+
+
+static uint64
+gcs_block_pcm_x_retry_delay_us(void)
+{
+	uint64 delay_ms
+		= (uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1);
+
+	return delay_ms > UINT64_MAX / UINT64_C(1000)
+		? UINT64_MAX
+		: delay_ms * UINT64_C(1000);
+}
+
+
+static uint64
+gcs_block_pcm_x_retry_timeout_us(void)
+{
+	uint64 timeout_ms = (uint64)Max(cluster_gcs_reply_timeout_ms, 1);
+
+	return timeout_ms > UINT64_MAX / UINT64_C(1000)
+		? UINT64_MAX
+		: timeout_ms * UINT64_C(1000);
+}
+
+
+/* Foreground may put a newly armed leg on the DATA ring once.  Once the
+ * canonical retry state exists, a DUPLICATE arm is owned by formation tick;
+ * the requester only waits and consumes the eventual exact response. */
+static bool
+gcs_block_pcm_x_foreground_may_stage(const PcmXLocalHandle *leader,
+									 PcmXQueueResult arm_result)
+{
+	ResourceXRetryStateV1 state;
+	PcmXQueueResult state_result;
+
+	if (arm_result == PCM_X_QUEUE_OK)
+		return true;
+	if (arm_result != PCM_X_QUEUE_DUPLICATE)
+		return false;
+	state_result = cluster_pcm_x_local_retry_state_exact(leader, &state);
+	return state_result == PCM_X_QUEUE_NOT_READY;
+}
+
+
+static PcmXQueueResult
+gcs_block_pcm_x_note_local_submission(const PcmXLocalHandle *leader,
+									const PcmXLocalReliableToken *token)
+{
+	ResourceXRetryStateV1 state;
+	uint64 now_us = gcs_block_pcm_x_monotonic_us();
+	uint64 next_due = gcs_block_pcm_x_saturating_add_us(
+		now_us, gcs_block_pcm_x_retry_delay_us());
+	uint64 deadline = gcs_block_pcm_x_saturating_add_us(
+		now_us, gcs_block_pcm_x_retry_timeout_us());
+
+	if (next_due > deadline)
+		next_due = deadline;
+	return cluster_pcm_x_local_retry_submission_admitted_exact(
+		leader, token, now_us, next_due, deadline, &state);
 }
 
 
@@ -16542,22 +16639,110 @@ cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref)
 
 
 static void
-gcs_block_pcm_x_master_drive_retry_tick(void)
+gcs_block_pcm_x_resource_retry_tick(
+	const PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT])
 {
 	static Size cursor = 0;
-	BufferTag tag;
+	PcmXRetryWorkItem work;
+	PcmXRuntimeSnapshot runtime;
+	ResourceXRetryAction action;
+	ResourceXRetryDecision decision;
+	ResourceXRetryStateV1 applied;
+	ResourceXTransportWitness transport;
 	PcmXQueueResult result;
 	Size cursor_before;
-	uint64 cluster_epoch;
+	Size payload_len;
+	uint64 next_due;
+	uint64 now_us;
+	uint32 connection_after;
+	uint32 connection_before;
+	bool admitted;
 
 	cursor_before = cursor;
-	result = cluster_pcm_x_master_drive_work_next(&cursor, PCM_X_MASTER_DRIVE_SCAN_BUDGET, &tag,
-												  &cluster_epoch);
-	if (result == PCM_X_QUEUE_OK)
-		gcs_block_pcm_x_master_drive_tag(&tag, cluster_epoch);
-	else
+	result = cluster_pcm_x_retry_work_next(&cursor, PCM_X_MASTER_DRIVE_SCAN_BUDGET, &work);
+	if (result != PCM_X_QUEUE_OK) {
 		gcs_block_pcm_x_master_retry_observe("work-next", result, -1, cursor_before, cursor, NULL,
-											 cluster_epoch);
+											 work.cluster_epoch);
+		return;
+	}
+	if (work.kind == PCM_X_RETRY_WORK_MASTER) {
+		gcs_block_pcm_x_master_drive_tag(&work.master_tag, work.cluster_epoch);
+		return;
+	}
+	if (work.kind != PCM_X_RETRY_WORK_LOCAL || bindings == NULL || work.dest_node < 0
+		|| work.dest_node >= PCM_X_PROTOCOL_NODE_LIMIT || work.payload_len == 0
+		|| work.payload_len > sizeof(work.payload)) {
+		cluster_pcm_x_runtime_fail_closed();
+		return;
+	}
+	if (bindings[work.dest_node].cluster_epoch != work.cluster_epoch
+		|| bindings[work.dest_node].peer_session_incarnation == 0
+		|| bindings[work.dest_node].peer_session_incarnation
+			!= work.local_token.expected_responder_session) {
+		gcs_block_pcm_x_master_retry_observe("local-binding", PCM_X_QUEUE_NOT_READY,
+											 work.dest_node, cursor_before, cursor,
+											 &work.local_handle.identity.tag, work.cluster_epoch);
+		return;
+	}
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (work.dest_node == cluster_node_id) {
+		connection_before = runtime.gate_generation;
+		connection_after = runtime.gate_generation;
+	} else {
+		if (!cluster_sf_peer_pcm_x_connection_generation(work.dest_node, &connection_before))
+			return;
+		pg_read_barrier();
+		if (!cluster_sf_peer_pcm_x_connection_generation(work.dest_node, &connection_after))
+			return;
+	}
+	if (connection_before == 0 || connection_before != connection_after) {
+		gcs_block_pcm_x_master_retry_observe("local-transport", PCM_X_QUEUE_NOT_READY,
+											 work.dest_node, cursor_before, cursor,
+											 &work.local_handle.identity.tag, work.cluster_epoch);
+		return;
+	}
+	memset(&transport, 0, sizeof(transport));
+	transport.cluster_epoch = work.cluster_epoch;
+	transport.peer_session_incarnation
+		= bindings[work.dest_node].peer_session_incarnation;
+	transport.connection_generation = connection_before;
+	transport.lane_id = CLUSTER_IC_PLANE_DATA;
+	now_us = gcs_block_pcm_x_monotonic_us();
+	decision = resource_x_retry_classify_exact(&work.retry_state,
+											 &work.retry_state.attempt, &transport, now_us,
+											 &action);
+	if (decision == RESOURCE_X_RETRY_NOT_DUE)
+		return;
+	if (decision == RESOURCE_X_RETRY_RECOVERY_BLOCKED) {
+		cluster_pcm_x_runtime_fail_closed();
+		return;
+	}
+	if (decision != RESOURCE_X_RETRY_STAGE_EXACT)
+		return;
+	payload_len = work.payload_len;
+	if (work.msg_type == PGRAC_IC_MSG_PCM_X_INSTALL_READY) {
+		PcmXInstallReadyPayload install_ready;
+
+		if (work.payload_len != sizeof(install_ready)) {
+			cluster_pcm_x_runtime_fail_closed();
+			return;
+		}
+		memcpy(&install_ready, work.payload, sizeof(install_ready));
+		payload_len = gcs_block_pcm_x_install_ready_wire_len(&install_ready);
+	}
+	admitted = cluster_gcs_pcm_x_stage_frame((uint8)work.msg_type, work.dest_node,
+										 work.payload, (uint16)payload_len);
+	if (!admitted)
+		return;
+	next_due = gcs_block_pcm_x_saturating_add_us(now_us, gcs_block_pcm_x_retry_delay_us());
+	if (next_due > work.retry_state.terminal_deadline_mono_us)
+		next_due = work.retry_state.terminal_deadline_mono_us;
+	result = cluster_pcm_x_local_retry_admitted_exact(
+		&work.local_handle, &work.local_token, &action, next_due, &applied);
+	cluster_pcm_x_stats_note_queue_result(result);
+	if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_STALE
+		&& result != PCM_X_QUEUE_NOT_READY)
+		gcs_block_pcm_x_master_drive_fail_closed(result);
 }
 
 
