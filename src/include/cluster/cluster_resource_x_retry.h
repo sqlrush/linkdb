@@ -72,6 +72,12 @@ typedef enum ResourceXTerminalReason {
 	RESOURCE_X_TERMINAL_REASON_LOST_WRITE
 } ResourceXTerminalReason;
 
+/* Immutable per-attempt terminal tombstone.  It retains the complete exact
+ * state so a successor cannot read a predecessor result by resource alone. */
+typedef struct ResourceXTerminalRecordV1 {
+	ResourceXRetryStateV1 state;
+} ResourceXTerminalRecordV1;
+
 StaticAssertDecl(sizeof(ResourceXRetryStateV1) == 72,
 				 "Resource-X retry state ABI");
 StaticAssertDecl(offsetof(ResourceXRetryStateV1, attempt) == 0,
@@ -94,6 +100,8 @@ StaticAssertDecl(offsetof(ResourceXRetryAction, attempt) == 0
 					 && offsetof(ResourceXRetryAction, expected_state_generation) == 56
 					 && offsetof(ResourceXRetryAction, expected_retry_count) == 60,
 				 "Resource-X retry action offsets");
+StaticAssertDecl(sizeof(ResourceXTerminalRecordV1) == 72,
+				 "Resource-X terminal record ABI");
 
 extern bool resource_x_retry_state_init(const ResourceXAttemptWitness *attempt,
 										uint64 first_submit_mono_us,
@@ -105,6 +113,12 @@ extern bool resource_x_retry_state_init(const ResourceXAttemptWitness *attempt,
 extern void resource_x_retry_state_clear(ResourceXRetryStateV1 *state);
 extern bool resource_x_retry_state_is_clear(const ResourceXRetryStateV1 *state);
 extern ResourceXTerminalReason resource_x_terminal_reason_decode(uint32 reason);
+extern void resource_x_terminal_record_clear(ResourceXTerminalRecordV1 *record);
+extern bool resource_x_terminal_record_is_clear(const ResourceXTerminalRecordV1 *record);
+extern bool resource_x_terminal_record_publish(const ResourceXRetryStateV1 *terminal,
+	ResourceXTerminalRecordV1 *record_out);
+extern bool resource_x_terminal_record_replay(const ResourceXTerminalRecordV1 *record,
+	const ResourceXAttemptWitness *attempt, ResourceXRetryStateV1 *state_out);
 extern bool resource_x_retry_policy_exact(const ResourceXRetryStateV1 *state,
 	uint32 *max_retries_out, uint32 *initial_backoff_ms_out);
 extern bool resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state,

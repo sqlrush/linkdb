@@ -1143,9 +1143,11 @@ cluster_gcs_pcm_x_cancel_ingress_valid(const PcmXPhasePayload *request, Size pay
 }
 
 static inline bool
-cluster_gcs_pcm_x_cancel_ack_ingress_valid(const PcmXPhasePayload *ack, Size payload_length,
-										   int32 authenticated_node, uint64 current_epoch,
-										   int32 tag_master, int32 local_node)
+cluster_gcs_pcm_x_cancel_ack_base_ingress_valid(const PcmXPhasePayload *ack,
+												Size payload_length,
+												int32 authenticated_node,
+												uint64 current_epoch,
+												int32 tag_master, int32 local_node)
 {
 	return ack != NULL && payload_length == sizeof(*ack) && authenticated_node >= 0
 		   && authenticated_node < PCM_X_PROTOCOL_NODE_LIMIT && local_node >= 0
@@ -1154,9 +1156,18 @@ cluster_gcs_pcm_x_cancel_ack_ingress_valid(const PcmXPhasePayload *ack, Size pay
 		   && ack->ref.identity.request_id != 0 && ack->ref.identity.wait_seq != 0
 		   && ack->ref.handle.ticket_id != 0 && ack->ref.handle.queue_generation != 0
 		   && ack->ref.grant_generation == 0
-		   && resource_x_terminal_reason_decode(ack->reason)
-			  != RESOURCE_X_TERMINAL_REASON_INVALID
 		   && ack->phase == PCM_X_LOCAL_RELIABLE_PHASE_CANCEL && ack->flags == 0;
+}
+
+static inline bool
+cluster_gcs_pcm_x_cancel_ack_ingress_valid(const PcmXPhasePayload *ack, Size payload_length,
+										   int32 authenticated_node, uint64 current_epoch,
+										   int32 tag_master, int32 local_node)
+{
+	return cluster_gcs_pcm_x_cancel_ack_base_ingress_valid(
+		ack, payload_length, authenticated_node, current_epoch, tag_master, local_node)
+		   && resource_x_terminal_reason_decode(ack->reason)
+			  != RESOURCE_X_TERMINAL_REASON_INVALID;
 }
 
 /* Terminal messages bind the final, non-sentinel grant generation as well. */

@@ -11119,6 +11119,8 @@ typedef struct GcsBlockPcmXRequesterCleanupContext {
 static GcsBlockPcmXRequesterCleanupContext gcs_block_pcm_x_requester_cleanup_context;
 static bool gcs_block_pcm_x_requester_exit_hook_registered = false;
 
+static void gcs_block_pcm_x_wake_requester(const PcmXWaitIdentity *identity);
+
 /* Source line of this backend's most recent non-OK acquire_writer_impl exit.
  * Diagnostic only: consumed by the bufmgr failure report so a client-visible
  * writer error names the exact escape arm instead of just the result code. */
@@ -11374,6 +11376,46 @@ gcs_block_pcm_x_requester_cleanup_impl(GcsBlockPcmXRequesterCleanupContext *clea
 		}
 		cleanup->claim_live = false;
 	}
+	if (cleanup->handle_live && cleanup->handle.role == PCM_X_LOCAL_ROLE_NODE_LEADER) {
+		ResourceXRetryStateV1 terminal;
+		ResourceXTerminalReason reason;
+
+		result = cluster_pcm_x_local_retry_state_exact(&cleanup->handle, &terminal);
+		cluster_pcm_x_stats_note_queue_result(result);
+		if (result == PCM_X_QUEUE_OK && terminal.last_phase == RESOURCE_X_RETRY_TERMINAL) {
+			reason = resource_x_terminal_reason_decode(terminal.terminal_errcode);
+			if (reason == RESOURCE_X_TERMINAL_REASON_INVALID
+				|| reason == RESOURCE_X_TERMINAL_REASON_LEGACY_CANCEL) {
+				cluster_pcm_x_runtime_fail_closed();
+				return PCM_X_QUEUE_CORRUPT;
+			}
+			result = cluster_pcm_x_local_retry_terminal_complete_exact(&cleanup->handle, &promoted);
+			cluster_pcm_x_stats_note_queue_result(result);
+			if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+				result = cluster_pcm_x_local_detach_terminal_exact(&cleanup->handle);
+				cluster_pcm_x_stats_note_queue_result(result);
+			}
+			if (result != PCM_X_QUEUE_OK) {
+				runtime = cluster_pcm_x_runtime_snapshot();
+				if (owner_exit
+					&& cluster_pcm_x_owner_exit_action(
+						   result, false,
+						   runtime.state == PCM_X_RUNTIME_ACTIVE
+							   && runtime.master_session_incarnation != 0)
+						   == CLUSTER_PCM_X_OWNER_EXIT_RETRY)
+					return result;
+				cluster_pcm_x_runtime_fail_closed();
+				return result;
+			}
+			gcs_block_pcm_x_wake_requester(&promoted.identity);
+			memset(cleanup, 0, sizeof(*cleanup));
+			return PCM_X_QUEUE_OK;
+		}
+		if (result == PCM_X_QUEUE_CORRUPT) {
+			cluster_pcm_x_runtime_fail_closed();
+			return result;
+		}
+	}
 	if (action == GCS_BLOCK_PCM_X_CLEANUP_PRESERVE_FAIL_CLOSED) {
 		cluster_pcm_x_runtime_fail_closed();
 		return PCM_X_QUEUE_NOT_READY;
@@ -11540,6 +11582,7 @@ static bool gcs_block_pcm_x_foreground_may_stage(const PcmXLocalHandle *leader,
 											 PcmXQueueResult arm_result);
 static PcmXQueueResult gcs_block_pcm_x_note_local_submission(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *token);
+static void gcs_block_pcm_x_raise_terminal_if_exact(const PcmXLocalHandle *leader);
 
 
 /*
@@ -11846,6 +11889,7 @@ requester_role_dispatch:
 				gcs_block_pcm_x_requester_cleanup_context.wfg_live = false;
 				gcs_block_pcm_x_requester_cleanup_context.wfg_generation = 0;
 			}
+			gcs_block_pcm_x_raise_terminal_if_exact(&handle);
 			fail_site = "follower-claim";
 			result = cluster_pcm_x_local_writer_claim_exact(&handle, claim_out);
 			cluster_pcm_x_stats_note_queue_result(result);
@@ -11973,6 +12017,7 @@ requester_role_dispatch:
 		bool staged = false;
 
 		ResetLatch(MyLatch);
+		gcs_block_pcm_x_raise_terminal_if_exact(&handle);
 		fail_site = "leader-progress";
 		result = cluster_pcm_x_local_progress_exact(&handle, &progress);
 		cluster_pcm_x_stats_note_queue_result(result);
@@ -13010,6 +13055,78 @@ gcs_block_pcm_x_note_local_submission(const PcmXLocalHandle *leader,
 		leader, token, now_us, deadline,
 		(uint32)cluster_gcs_block_retransmit_max_retries,
 		(uint32)cluster_gcs_block_retransmit_initial_backoff_ms, &state);
+}
+
+
+/* The immutable per-attempt record is the only client-visible terminal
+ * authority.  Validate its complete retry state and closed reason domain
+ * before raising the exact existing SQLSTATE; cleanup then releases the
+ * writer claim and consumes this same record before detaching the member. */
+static void
+gcs_block_pcm_x_raise_terminal_if_exact(const PcmXLocalHandle *leader)
+{
+	ResourceXRetryStateV1 terminal;
+	ResourceXTerminalReason reason;
+	PcmXQueueResult result;
+
+	result = cluster_pcm_x_local_retry_state_exact(leader, &terminal);
+	cluster_pcm_x_stats_note_queue_result(result);
+	if (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_STALE)
+		return;
+	if (result != PCM_X_QUEUE_OK) {
+		if (result == PCM_X_QUEUE_CORRUPT)
+			cluster_pcm_x_runtime_fail_closed();
+		return;
+	}
+	if (terminal.last_phase != RESOURCE_X_RETRY_TERMINAL)
+		return;
+	reason = resource_x_terminal_reason_decode(terminal.terminal_errcode);
+	if (reason == RESOURCE_X_TERMINAL_REASON_INVALID
+		|| reason == RESOURCE_X_TERMINAL_REASON_LEGACY_CANCEL) {
+		cluster_pcm_x_runtime_fail_closed();
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("cluster PCM-X terminal record has an invalid reason")));
+	}
+	result = cluster_pcm_x_local_retry_terminal_ready_exact(leader);
+	cluster_pcm_x_stats_note_queue_result(result);
+	if (result == PCM_X_QUEUE_NOT_READY) {
+		GcsBlockPcmXRequesterCleanupContext *cleanup
+			= &gcs_block_pcm_x_requester_cleanup_context;
+
+		/*
+		 * A terminal leader cannot keep the active-writer claim while its
+		 * coalesced followers consume their identical records: local cancel
+		 * is deliberately serialized after claim completion.  Release exactly
+		 * once, waking the direct FIFO follower; the leader continues polling
+		 * until no matching terminal member remains.
+		 */
+		if (leader->role == PCM_X_LOCAL_ROLE_NODE_LEADER && cleanup->active
+			&& cleanup->claim_live) {
+			result = cluster_gcs_pcm_x_writer_claim_release_and_wake_exact(&cleanup->claim);
+			cluster_pcm_x_stats_note_queue_result(result);
+			if (result != PCM_X_QUEUE_OK) {
+				cluster_pcm_x_runtime_fail_closed();
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("cluster PCM-X terminal leader could not release its writer claim")));
+			}
+			cleanup->claim_live = false;
+		}
+		return;
+	}
+	if (result == PCM_X_QUEUE_STALE)
+		return;
+	if (result != PCM_X_QUEUE_OK) {
+		if (result == PCM_X_QUEUE_CORRUPT)
+			cluster_pcm_x_runtime_fail_closed();
+		return;
+	}
+	ereport(ERROR,
+			(errcode((int)terminal.terminal_errcode),
+			 errmsg("cluster PCM-X Resource-X attempt reached a terminal result"),
+			 errdetail("retry_count=%u state_generation=%u", terminal.retry_count,
+					   terminal.state_generation)));
 }
 
 
@@ -16079,6 +16196,7 @@ cluster_gcs_handle_pcm_x_cancel_ack_envelope(const ClusterICEnvelope *env, const
 	PcmXLocalHandle leader;
 	PcmXLocalHandle new_leader;
 	PcmXQueueResult result;
+	ResourceXRetryStateV1 terminal;
 	uint64 current_epoch;
 	uint64 source_session;
 	int32 source_node;
@@ -16091,8 +16209,8 @@ cluster_gcs_handle_pcm_x_cancel_ack_envelope(const ClusterICEnvelope *env, const
 	ack = (const PcmXPhasePayload *)payload;
 	current_epoch = cluster_epoch_get_current();
 	tag_master = cluster_gcs_lookup_master(ack->ref.identity.tag);
-	if (!cluster_gcs_pcm_x_cancel_ack_ingress_valid(ack, env->payload_length, source_node,
-													current_epoch, tag_master, cluster_node_id)
+	if (!cluster_gcs_pcm_x_cancel_ack_base_ingress_valid(
+			ack, env->payload_length, source_node, current_epoch, tag_master, cluster_node_id)
 		|| !gcs_block_pcm_x_source_capable(source_node) || !cluster_qvotec_in_quorum()
 		|| !cluster_membership_is_member(cluster_node_id)
 		|| !cluster_membership_is_member(source_node)
@@ -16100,14 +16218,34 @@ cluster_gcs_handle_pcm_x_cancel_ack_envelope(const ClusterICEnvelope *env, const
 		|| !gcs_block_pcm_x_authenticated_session(source_node, current_epoch, &source_session)
 		|| !gcs_block_pcm_x_revalidate_peer_binding(source_node, current_epoch, source_session))
 		return;
+	if (resource_x_terminal_reason_decode(ack->reason)
+		== RESOURCE_X_TERMINAL_REASON_INVALID) {
+		ereport(LOG,
+				(errmsg("cluster PCM-X received an authenticated type-60 frame with an invalid reason"),
+				 errdetail("source=%d reason=%u request_id=%llu wait_seq=%llu",
+						   source_node, ack->reason,
+						   (unsigned long long) ack->ref.identity.request_id,
+						   (unsigned long long) ack->ref.identity.wait_seq)));
+		cluster_pcm_x_runtime_fail_closed();
+		return;
+	}
 	result = cluster_pcm_x_local_lookup_exact(&ack->ref.identity, &leader);
 	if (result != PCM_X_QUEUE_OK)
 		return;
-	result = cluster_pcm_x_local_cancel_ack_exact(&leader, ack, source_node, source_session,
-												  &new_leader);
+	if (ack->reason == 0)
+		result = cluster_pcm_x_local_cancel_ack_exact(&leader, ack, source_node, source_session,
+													  &new_leader);
+	else
+		result = cluster_pcm_x_local_retry_terminal_ack_exact(
+			&leader, ack, source_node, source_session,
+			gcs_block_pcm_x_monotonic_us(), &terminal);
 	cluster_pcm_x_stats_note_queue_result(result);
-	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
-		cluster_gcs_pcm_x_wake_cancel_rotation(&ack->ref.identity, &new_leader);
+	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+		if (ack->reason == 0)
+			cluster_gcs_pcm_x_wake_cancel_rotation(&ack->ref.identity, &new_leader);
+		else
+			gcs_block_pcm_x_wake_requester(&ack->ref.identity);
+	}
 }
 
 
@@ -16713,6 +16851,8 @@ gcs_block_pcm_x_resource_retry_tick(
 		result = cluster_pcm_x_local_retry_exhausted_exact(
 			&work.local_handle, &work.local_token, &work.retry_state, now_us, &applied);
 		cluster_pcm_x_stats_note_queue_result(result);
+		if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
+			gcs_block_pcm_x_wake_requester(&work.local_handle.identity);
 		if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_DUPLICATE
 			&& result != PCM_X_QUEUE_STALE && result != PCM_X_QUEUE_NOT_READY)
 			gcs_block_pcm_x_master_drive_fail_closed(result);

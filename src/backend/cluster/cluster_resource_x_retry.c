@@ -94,6 +94,58 @@ resource_x_terminal_reason_decode(uint32 reason)
 	}
 }
 
+void
+resource_x_terminal_record_clear(ResourceXTerminalRecordV1 *record)
+{
+	if (record != NULL)
+		memset(record, 0, sizeof(*record));
+}
+
+bool
+resource_x_terminal_record_is_clear(const ResourceXTerminalRecordV1 *record)
+{
+	ResourceXTerminalRecordV1 zero;
+
+	if (record == NULL)
+		return false;
+	memset(&zero, 0, sizeof(zero));
+	return memcmp(record, &zero, sizeof(zero)) == 0;
+}
+
+bool
+resource_x_terminal_record_publish(const ResourceXRetryStateV1 *terminal,
+								   ResourceXTerminalRecordV1 *record_out)
+{
+	ResourceXTerminalRecordV1 record;
+
+	if (terminal == NULL || record_out == NULL
+		|| !resource_x_retry_state_valid(terminal)
+		|| terminal->last_phase != RESOURCE_X_RETRY_TERMINAL
+		|| terminal->next_retry_due_mono_us != terminal->terminal_deadline_mono_us)
+		return false;
+	memset(&record, 0, sizeof(record));
+	record.state = *terminal;
+	*record_out = record;
+	return true;
+}
+
+bool
+resource_x_terminal_record_replay(const ResourceXTerminalRecordV1 *record,
+								  const ResourceXAttemptWitness *attempt,
+								  ResourceXRetryStateV1 *state_out)
+{
+	resource_x_retry_state_clear(state_out);
+	if (record == NULL || attempt == NULL || state_out == NULL
+		|| !resource_x_retry_state_valid(&record->state)
+		|| record->state.last_phase != RESOURCE_X_RETRY_TERMINAL
+		|| record->state.next_retry_due_mono_us
+		!= record->state.terminal_deadline_mono_us
+		|| !resource_x_attempt_matches(&record->state.attempt, attempt))
+		return false;
+	*state_out = record->state;
+	return true;
+}
+
 static bool
 resource_x_retry_transport_valid(const ResourceXTransportWitness *transport)
 {

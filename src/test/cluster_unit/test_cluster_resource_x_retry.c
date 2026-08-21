@@ -348,10 +348,36 @@ UT_TEST(test_type60_terminal_reason_codec_is_closed_and_zero_legacy)
 				 RESOURCE_X_TERMINAL_REASON_INVALID);
 }
 
+UT_TEST(test_terminal_record_replays_one_exact_attempt_byte_for_byte)
+{
+	ResourceXAttemptWitness attempt = make_attempt(17);
+	ResourceXAttemptWitness successor = make_attempt(18);
+	ResourceXRetryStateV1 current;
+	ResourceXRetryStateV1 terminal;
+	ResourceXRetryStateV1 replay;
+	ResourceXTerminalRecordV1 record;
+
+	UT_ASSERT_EQ(sizeof(ResourceXTerminalRecordV1), 72);
+	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 6000, 4, 1, 7, &current));
+	current.retry_count = 3;
+	UT_ASSERT_EQ(resource_x_retry_terminalize_exact(
+													&current, &current,
+													ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT,
+													2000, &terminal),
+				 RESOURCE_X_RETRY_APPLY_APPLIED);
+	MemSet(&record, 0xa5, sizeof(record));
+	UT_ASSERT(resource_x_terminal_record_publish(&terminal, &record));
+	UT_ASSERT(resource_x_terminal_record_replay(&record, &attempt, &replay));
+	UT_ASSERT(memcmp(&replay, &terminal, sizeof(replay)) == 0);
+	UT_ASSERT(!resource_x_terminal_record_replay(&record, &successor, &replay));
+	resource_x_terminal_record_clear(&record);
+	UT_ASSERT(resource_x_terminal_record_is_clear(&record));
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_retry_state_layout_and_slot_embedding);
 	UT_RUN(test_retry_state_initialization_publishes_exact_attempt);
 	UT_RUN(test_retry_state_initialization_rejects_unpublishable_state);
@@ -364,6 +390,7 @@ main(void)
 	UT_RUN(test_exponential_backoff_saturates_and_clamps_to_deadline);
 	UT_RUN(test_terminal_transition_is_attempt_generation_and_phase_exact);
 	UT_RUN(test_type60_terminal_reason_codec_is_closed_and_zero_legacy);
+	UT_RUN(test_terminal_record_replays_one_exact_attempt_byte_for_byte);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

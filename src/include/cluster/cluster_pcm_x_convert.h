@@ -35,7 +35,7 @@
 #define PCM_X_SHMEM_REGION_NAME "pgrac cluster pcm convert queue"
 #define PCM_X_SHMEM_MAGIC ((uint32)0x50435851) /* "PCXQ" */
 /* 16: append volatile Resource-X semantic projections to local/master slots. */
-#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)16)
+#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)17)
 #define PCM_X_INVALID_SLOT_INDEX ((Size) - 1)
 #define PCM_X_LOCK_PARTITIONS NUM_BUFFER_PARTITIONS
 #define PCM_X_LWLOCK_COUNT (1 + 2 * PCM_X_LOCK_PARTITIONS)
@@ -1107,6 +1107,12 @@ typedef struct PcmXLocalMembershipSlot {
 	uint16 role;
 	uint16 partition;
 	uint32 admitted_round;
+
+	/*
+	 * Immutable result for this exact membership attempt.  A promoted
+	 * successor owns a different slot and can never inherit this record.
+	 */
+	ResourceXTerminalRecordV1 retry_terminal;
 } PcmXLocalMembershipSlot;
 
 StaticAssertDecl(sizeof(PcmXSlotHeader) == 24, "PCM-X slot header ABI");
@@ -1170,9 +1176,11 @@ StaticAssertDecl(offsetof(PcmXLocalTagSlot, blocker_snapshot_ref) == 616,
 				 "PCM-X local blocker snapshot ticket offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, blocker_snapshot_reliable) == 704,
 				 "PCM-X local blocker snapshot reliable-leg offset");
-StaticAssertDecl(sizeof(PcmXLocalMembershipSlot) == 168, "PCM-X local membership slot ABI");
+StaticAssertDecl(sizeof(PcmXLocalMembershipSlot) == 240, "PCM-X local membership slot ABI");
 StaticAssertDecl(offsetof(PcmXLocalMembershipSlot, admitted_round) == 160,
 				 "PCM-X local admitted round offset");
+StaticAssertDecl(offsetof(PcmXLocalMembershipSlot, retry_terminal) == 168,
+				 "PCM-X local retry terminal offset");
 
 
 typedef struct PcmXPoolLayout {
@@ -1910,6 +1918,14 @@ extern PcmXQueueResult cluster_pcm_x_local_retry_exhausted_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected_token,
 	const ResourceXRetryStateV1 *expected_state, uint64 terminal_at_mono_us,
 	ResourceXRetryStateV1 *terminal_out);
+extern PcmXQueueResult cluster_pcm_x_local_retry_terminal_ack_exact(
+	const PcmXLocalHandle *leader, const PcmXPhasePayload *ack,
+	int32 authenticated_node, uint64 authenticated_session,
+	uint64 terminal_at_mono_us, ResourceXRetryStateV1 *terminal_out);
+extern PcmXQueueResult cluster_pcm_x_local_retry_terminal_ready_exact(
+	const PcmXLocalHandle *handle);
+extern PcmXQueueResult cluster_pcm_x_local_retry_terminal_complete_exact(
+	const PcmXLocalHandle *leader, PcmXLocalHandle *promoted_out);
 extern PcmXQueueResult cluster_pcm_x_retry_work_next(Size *cursor_io,
 	Size scan_budget, PcmXRetryWorkItem *work_out);
 extern PcmXQueueResult cluster_pcm_x_local_reliable_ack_exact(

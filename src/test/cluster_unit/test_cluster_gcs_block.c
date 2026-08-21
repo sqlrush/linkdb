@@ -1135,6 +1135,8 @@ UT_TEST(test_pcm_x_cancel_acks_bind_exact_master_and_canonical_payload)
 	cancel_ack.reason = ERRCODE_DATA_CORRUPTED;
 	UT_ASSERT(
 		!cluster_gcs_pcm_x_cancel_ack_ingress_valid(&cancel_ack, sizeof(cancel_ack), 2, 9, 2, 1));
+	UT_ASSERT(cluster_gcs_pcm_x_cancel_ack_base_ingress_valid(
+		&cancel_ack, sizeof(cancel_ack), 2, 9, 2, 1));
 	cancel_ack.reason = 0;
 	cancel_ack.ref.grant_generation = 1;
 	UT_ASSERT(
@@ -1540,6 +1542,186 @@ UT_TEST(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage)
 		}
 		free(source);
 	}
+}
+
+
+/* D7-08: the periodic producer may only publish an immutable terminal and
+ * wake its exact requester.  The requester validates and raises that record;
+ * ERROR cleanup releases the writer claim before completing/detaching the
+ * failed attempt, and only then wakes the promoted successor.  Type-60 zero
+ * remains the legacy cancel path while an allowlisted nonzero reason enters
+ * the same terminal record consumer. */
+UT_TEST(test_pcm_x_resource_terminal_result_replays_through_requester_cleanup)
+{
+	char	   *source = read_gcs_block_source();
+	const char *retry_tick;
+	const char *retry_end;
+	const char *exhausted;
+	const char *producer_wake;
+	const char *driver;
+	const char *driver_end;
+	const char *raise_call;
+	const char *leader_raise_call;
+	const char *follower_claim;
+	const char *progress;
+	const char *raise_helper;
+	const char *raise_end;
+	const char *state_read;
+	const char *reason_decode;
+	const char *consume_ready;
+	const char *exact_errcode;
+	const char *cleanup;
+	const char *cleanup_end;
+	const char *claim_release;
+	const char *terminal_complete;
+	const char *terminal_detach;
+	const char *successor_wake;
+	const char *cancel_ack;
+	const char *cancel_ack_end;
+	const char *base_ingress;
+	const char *auth_revalidate;
+	const char *invalid_reason;
+	const char *invalid_fail_closed;
+	const char *legacy_branch;
+	const char *terminal_ack;
+	const char *denial_wake;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+
+	retry_tick = strstr(source, "\ngcs_block_pcm_x_resource_retry_tick(");
+	retry_end = retry_tick != NULL ? strstr(retry_tick, "\n}\n") : NULL;
+	exhausted = retry_tick != NULL
+		? strstr(retry_tick, "cluster_pcm_x_local_retry_exhausted_exact(")
+		: NULL;
+	producer_wake = exhausted != NULL
+		? strstr(exhausted, "gcs_block_pcm_x_wake_requester(&work.local_handle.identity)")
+		: NULL;
+	UT_ASSERT_NOT_NULL(retry_tick);
+	UT_ASSERT_NOT_NULL(retry_end);
+	UT_ASSERT_NOT_NULL(exhausted);
+	UT_ASSERT_NOT_NULL(producer_wake);
+	if (exhausted != NULL && producer_wake != NULL && retry_end != NULL)
+		UT_ASSERT(exhausted < producer_wake && producer_wake < retry_end);
+
+	driver = strstr(source, "\ngcs_block_pcm_x_acquire_writer_impl(");
+	driver_end = driver != NULL ? strstr(driver, "\n}\n") : NULL;
+	raise_call = driver != NULL
+		? strstr(driver, "gcs_block_pcm_x_raise_terminal_if_exact(&handle)")
+		: NULL;
+	follower_claim = raise_call != NULL
+		? strstr(raise_call, "cluster_pcm_x_local_writer_claim_exact(&handle, claim_out)")
+		: NULL;
+	leader_raise_call = raise_call != NULL
+		? strstr(raise_call + 1, "gcs_block_pcm_x_raise_terminal_if_exact(&handle)")
+		: NULL;
+	progress = leader_raise_call != NULL
+		? strstr(leader_raise_call, "cluster_pcm_x_local_progress_exact(&handle, &progress)")
+		: NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(driver_end);
+	UT_ASSERT_NOT_NULL(raise_call);
+	UT_ASSERT_NOT_NULL(follower_claim);
+	UT_ASSERT_NOT_NULL(leader_raise_call);
+	UT_ASSERT_NOT_NULL(progress);
+	if (raise_call != NULL && follower_claim != NULL && leader_raise_call != NULL
+		&& progress != NULL && driver_end != NULL)
+		UT_ASSERT(raise_call < follower_claim && follower_claim < leader_raise_call
+				  && leader_raise_call < progress && progress < driver_end);
+
+	raise_helper = strstr(source, "\ngcs_block_pcm_x_raise_terminal_if_exact(");
+	raise_end = raise_helper != NULL ? strstr(raise_helper, "\n}\n") : NULL;
+	state_read = raise_helper != NULL
+		? strstr(raise_helper, "cluster_pcm_x_local_retry_state_exact")
+		: NULL;
+	reason_decode = state_read != NULL
+		? strstr(state_read, "resource_x_terminal_reason_decode")
+		: NULL;
+	consume_ready = reason_decode != NULL
+		? strstr(reason_decode, "cluster_pcm_x_local_retry_terminal_ready_exact")
+		: NULL;
+	exact_errcode = consume_ready != NULL
+		? strstr(consume_ready, "errcode((int)terminal.terminal_errcode)")
+		: NULL;
+	UT_ASSERT_NOT_NULL(raise_helper);
+	UT_ASSERT_NOT_NULL(raise_end);
+	UT_ASSERT_NOT_NULL(state_read);
+	UT_ASSERT_NOT_NULL(reason_decode);
+	UT_ASSERT_NOT_NULL(consume_ready);
+	UT_ASSERT_NOT_NULL(exact_errcode);
+	if (state_read != NULL && reason_decode != NULL && consume_ready != NULL
+		&& exact_errcode != NULL && raise_end != NULL)
+		UT_ASSERT(state_read < reason_decode && reason_decode < consume_ready
+				  && consume_ready < exact_errcode && exact_errcode < raise_end);
+
+	cleanup = strstr(source, "\ngcs_block_pcm_x_requester_cleanup_impl(");
+	cleanup_end = cleanup != NULL ? strstr(cleanup, "\n}\n") : NULL;
+	claim_release = cleanup != NULL
+		? strstr(cleanup, "cluster_gcs_pcm_x_writer_claim_release_and_wake_exact")
+		: NULL;
+	terminal_complete = claim_release != NULL
+		? strstr(claim_release, "cluster_pcm_x_local_retry_terminal_complete_exact")
+		: NULL;
+	terminal_detach = terminal_complete != NULL
+		? strstr(terminal_complete, "cluster_pcm_x_local_detach_terminal_exact")
+		: NULL;
+	successor_wake = terminal_detach != NULL
+		? strstr(terminal_detach, "gcs_block_pcm_x_wake_requester(&promoted.identity)")
+		: NULL;
+	UT_ASSERT_NOT_NULL(cleanup);
+	UT_ASSERT_NOT_NULL(cleanup_end);
+	UT_ASSERT_NOT_NULL(claim_release);
+	UT_ASSERT_NOT_NULL(terminal_complete);
+	UT_ASSERT_NOT_NULL(terminal_detach);
+	UT_ASSERT_NOT_NULL(successor_wake);
+	if (claim_release != NULL && terminal_complete != NULL && terminal_detach != NULL
+		&& successor_wake != NULL && cleanup_end != NULL)
+		UT_ASSERT(claim_release < terminal_complete && terminal_complete < terminal_detach
+				  && terminal_detach < successor_wake && successor_wake < cleanup_end);
+
+	cancel_ack = strstr(source, "\ncluster_gcs_handle_pcm_x_cancel_ack_envelope(");
+	cancel_ack_end = cancel_ack != NULL ? strstr(cancel_ack, "\n}\n") : NULL;
+	base_ingress = cancel_ack != NULL
+		? strstr(cancel_ack, "cluster_gcs_pcm_x_cancel_ack_base_ingress_valid(")
+		: NULL;
+	auth_revalidate = base_ingress != NULL
+		? strstr(base_ingress, "gcs_block_pcm_x_revalidate_peer_binding")
+		: NULL;
+	invalid_reason = auth_revalidate != NULL
+		? strstr(auth_revalidate, "resource_x_terminal_reason_decode(ack->reason)")
+		: NULL;
+	invalid_fail_closed = invalid_reason != NULL
+		? strstr(invalid_reason, "cluster_pcm_x_runtime_fail_closed()")
+		: NULL;
+	legacy_branch = invalid_fail_closed != NULL
+		? strstr(invalid_fail_closed, "if (ack->reason == 0)")
+		: NULL;
+	terminal_ack = legacy_branch != NULL
+		? strstr(legacy_branch, "cluster_pcm_x_local_retry_terminal_ack_exact(")
+		: NULL;
+	denial_wake = terminal_ack != NULL
+		? strstr(terminal_ack, "gcs_block_pcm_x_wake_requester(&ack->ref.identity)")
+		: NULL;
+	UT_ASSERT_NOT_NULL(cancel_ack);
+	UT_ASSERT_NOT_NULL(cancel_ack_end);
+	UT_ASSERT_NOT_NULL(base_ingress);
+	UT_ASSERT_NOT_NULL(auth_revalidate);
+	UT_ASSERT_NOT_NULL(invalid_reason);
+	UT_ASSERT_NOT_NULL(invalid_fail_closed);
+	UT_ASSERT_NOT_NULL(legacy_branch);
+	UT_ASSERT_NOT_NULL(terminal_ack);
+	UT_ASSERT_NOT_NULL(denial_wake);
+	if (base_ingress != NULL && auth_revalidate != NULL && invalid_reason != NULL
+		&& invalid_fail_closed != NULL && legacy_branch != NULL && terminal_ack != NULL
+		&& denial_wake != NULL
+		&& cancel_ack_end != NULL)
+		UT_ASSERT(base_ingress < auth_revalidate && auth_revalidate < invalid_reason
+				  && invalid_reason < invalid_fail_closed && invalid_fail_closed < legacy_branch
+				  && legacy_branch < terminal_ack && terminal_ack < denial_wake
+				  && denial_wake < cancel_ack_end);
+
+	free(source);
 }
 
 
@@ -5578,7 +5760,7 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 int
 main(void)
 {
-	UT_PLAN(105);
+	UT_PLAN(106);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5619,6 +5801,7 @@ main(void)
 	UT_RUN(test_pcm_x_formation_identical_complete_samples_may_revalidate);
 	UT_RUN(test_pcm_x_formation_transient_or_inconsistent_sample_is_tick_noop);
 	UT_RUN(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage);
+	UT_RUN(test_pcm_x_resource_terminal_result_replays_through_requester_cleanup);
 	UT_RUN(test_pcm_x_install_ready_v2_self_loopback_is_admissible);
 	UT_RUN(test_pcm_x_formation_samples_capability_family_atomically);
 	UT_RUN(test_pcm_x_confirm_publish_then_stale_requires_exact_graph_close);
