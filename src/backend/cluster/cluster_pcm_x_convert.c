@@ -4135,6 +4135,7 @@ node_successor_allowed:
 	ticket->transport_epoch = request->identity.cluster_epoch;
 	ticket->transport_session = request->prehandle.sender_session_incarnation;
 	ticket->semantic_generation = 0;
+	resource_x_retry_state_clear(&ticket->retry_state);
 
 	if (new_tag) {
 		directory_result = pcm_x_directory_insert_locked(
@@ -10886,6 +10887,7 @@ pcm_x_local_tag_init_common(PcmXLocalTagSlot *tag_slot, const BufferTag *tag, ui
 	tag_slot->transport_epoch = 0;
 	tag_slot->transport_session = 0;
 	tag_slot->semantic_generation = 0;
+	resource_x_retry_state_clear(&tag_slot->retry_state);
 	memset(&tag_slot->holder_ref, 0, sizeof(tag_slot->holder_ref));
 	memset(&tag_slot->holder_image, 0, sizeof(tag_slot->holder_image));
 	tag_slot->holder_required_page_scn = 0;
@@ -20206,6 +20208,7 @@ pcm_x_local_reset_holder_only_queue(PcmXLocalTagSlot *tag_slot)
 	tag_slot->transport_epoch = 0;
 	tag_slot->transport_session = 0;
 	tag_slot->semantic_generation = 0;
+	resource_x_retry_state_clear(&tag_slot->retry_state);
 }
 
 

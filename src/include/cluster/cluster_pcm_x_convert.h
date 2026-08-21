@@ -26,6 +26,7 @@
 #include "access/transam.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_resource_x_identity.h"
+#include "cluster/cluster_resource_x_retry.h"
 #include "storage/buf_internals.h"
 #include "storage/lwlock.h"
 
@@ -1001,6 +1002,7 @@ typedef struct PcmXMasterTicketSlot {
 	uint64 transport_epoch;
 	uint64 transport_session;
 	uint64 semantic_generation;
+	ResourceXRetryStateV1 retry_state;
 } PcmXMasterTicketSlot;
 
 typedef struct PcmXBlockerSlot {
@@ -1065,6 +1067,7 @@ typedef struct PcmXLocalTagSlot {
 	uint64 transport_epoch;
 	uint64 transport_session;
 	uint64 semantic_generation;
+	ResourceXRetryStateV1 retry_state;
 } PcmXLocalTagSlot;
 
 typedef struct PcmXLocalMembershipSlot {
@@ -1096,7 +1099,7 @@ StaticAssertDecl(sizeof(PcmXReliableLegState) == 56, "PCM-X reliable leg ABI");
 StaticAssertDecl(sizeof(PcmXMasterTagSlot) == 120, "PCM-X master tag slot ABI");
 StaticAssertDecl(offsetof(PcmXMasterTagSlot, outstanding_ticket_count) == 112,
 				 "PCM-X master outstanding-ticket count offset");
-StaticAssertDecl(sizeof(PcmXMasterTicketSlot) == 448, "PCM-X master ticket slot ABI");
+StaticAssertDecl(sizeof(PcmXMasterTicketSlot) == 520, "PCM-X master ticket slot ABI");
 StaticAssertDecl(offsetof(PcmXMasterTicketSlot, grant_base_own_generation) == 384,
 				 "PCM-X master ticket grant-base offset");
 StaticAssertDecl(offsetof(PcmXMasterTicketSlot, logical_assertion) == 392,
@@ -1107,8 +1110,10 @@ StaticAssertDecl(offsetof(PcmXMasterTicketSlot, transport_epoch) == 424
 					 && offsetof(PcmXMasterTicketSlot, transport_session) == 432
 					 && offsetof(PcmXMasterTicketSlot, semantic_generation) == 440,
 				 "PCM-X master semantic witness offsets");
+StaticAssertDecl(offsetof(PcmXMasterTicketSlot, retry_state) == 448,
+				 "PCM-X master retry-state offset");
 StaticAssertDecl(sizeof(PcmXBlockerSlot) == 128, "PCM-X blocker slot ABI");
-StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 824, "PCM-X local tag slot ABI");
+StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 896, "PCM-X local tag slot ABI");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, grant_base_own_generation) == 760,
 				 "PCM-X local tag grant-base offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, logical_assertion) == 768,
@@ -1119,6 +1124,8 @@ StaticAssertDecl(offsetof(PcmXLocalTagSlot, transport_epoch) == 800
 					 && offsetof(PcmXLocalTagSlot, transport_session) == 808
 					 && offsetof(PcmXLocalTagSlot, semantic_generation) == 816,
 				 "PCM-X local semantic witness offsets");
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, retry_state) == 824,
+				 "PCM-X local retry-state offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, membership_count) == 384,
 				 "PCM-X local membership count offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, closed_round_member_count) == 392,
