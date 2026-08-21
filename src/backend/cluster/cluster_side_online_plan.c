@@ -412,41 +412,6 @@ side_plan_abort_prepared_dependencies_closed(
 	return true;
 }
 
-static bool
-side_plan_bind_plain_abort_dependency(RfSideOnlinePlanV1 *plan,
-	uint16 participant_index, RfSideXactOperationV1 *abort_operation)
-{
-	const ClusterUndoDecoded *match = NULL;
-	uint32 matches = 0;
-	uint32 i;
-
-	if (plan == NULL || abort_operation == NULL ||
-		abort_operation->kind != RF_SIDE_XACT_ABORT)
-		return false;
-	for (i = 0; i < plan->operation_count; i++)
-	{
-		const RfSideOnlineOperationV1 *candidate = &plan->operations[i];
-
-		if (candidate->kind == RF_SIDE_ONLINE_OPERATION_UNDO &&
-			candidate->identity.participant_index == participant_index &&
-			candidate->undo.kind == CLUSTER_UNDO_KIND_TT_ABORT &&
-			candidate->undo.instance == abort_operation->origin_thread &&
-			TransactionIdEquals(candidate->undo.xid, abort_operation->xid))
-		{
-			match = &candidate->undo;
-			matches++;
-		}
-	}
-	if (matches != 1)
-		return false;
-	abort_operation->has_abort_tt_binding = true;
-	abort_operation->abort_tt_instance = match->instance;
-	abort_operation->abort_tt_segment_id = match->segment_id;
-	abort_operation->abort_tt_slot_offset = match->slot_offset;
-	abort_operation->abort_tt_wrap = match->wrap;
-	return true;
-}
-
 RfPageProofDetailV1
 rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 						  RfSideOnlinePlanV1 **out_plan)
@@ -537,10 +502,6 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 			if (!rf_side_xact_decode_v1(record_plan->source_record,
 					plan->system_identifier, identity->record.origin_thread,
 					&candidate.xact))
-				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-			if (candidate.xact.kind == RF_SIDE_XACT_ABORT &&
-				!side_plan_bind_plain_abort_dependency(plan,
-					identity->participant_index, &candidate.xact))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate.kind = RF_SIDE_ONLINE_OPERATION_XACT;
 			if (candidate.xact.kind == RF_SIDE_XACT_PREPARE)
