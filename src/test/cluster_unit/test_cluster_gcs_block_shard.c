@@ -54,6 +54,7 @@
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_resource_x_node_wire.h"
 #include "storage/buf_internals.h"
 
 #undef printf
@@ -712,10 +713,184 @@ UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
 	UT_ASSERT_EQ(seen_count, CLUSTER_LMS_MAX_WORKERS);
 }
 
+/* Build each legal Resource-X wire shape through the production codec.  The
+ * shard router must validate the reused message domain before it extracts the
+ * decoded assertion tag; raw offset-16 routing would accept the corrupted
+ * companion frame below. */
+static uint16
+make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
+							BufferTag tag, uint8 *bytes, uint16 capacity)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_BAD_ARGUMENT;
+	uint16 payload_len = 0;
+
+	memset(&frame, 0, sizeof(frame));
+	UT_ASSERT(resource_x_assertion_init(&tag, 3,
+										 &frame.common.logical_assertion));
+	frame.kind = kind;
+	frame.common.base_authority_generation = 11;
+	frame.common.resource_formation = 12;
+	frame.common.master_session_incarnation = 13;
+	frame.common.assertion_sequence = 14;
+	frame.common.ordered_lane = 15;
+	frame.common.action_node = 3;
+	frame.common.observed_mode = PCM_STATE_N;
+	frame.common.target_mode = PCM_STATE_X;
+	frame.common.sender_connection_generation = 16;
+	frame.common.authority_generation = 17;
+
+	if (kind == RESOURCE_X_WIRE_BLOCK_TO_N) {
+		frame.common.action_node = 7;
+		frame.common.observed_mode = PCM_STATE_X;
+		frame.common.target_mode = PCM_STATE_N;
+	} else if (kind == RESOURCE_X_WIRE_BLOCKED_TO_N) {
+		frame.common.action_node = 7;
+		frame.common.observed_mode = PCM_STATE_X;
+		frame.common.target_mode = PCM_STATE_N;
+		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+		frame.blocked_has_remote_proof = capacity == RESOURCE_X_PROOF_V1_BYTES;
+		if (frame.blocked_has_remote_proof) {
+			frame.body.blocked_to_n.source_carrier_generation = 18;
+			frame.body.blocked_to_n.requester_target_generation = 19;
+			frame.body.blocked_to_n.source_disposition
+				= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+			frame.body.blocked_to_n.proof_kind
+				= RESOURCE_X_PROOF_REMOTE_CARRIER;
+			frame.body.blocked_to_n.holder_connection_generation = 20;
+			frame.body.blocked_to_n.acting_formation
+				= frame.common.resource_formation;
+		}
+	} else if (kind == RESOURCE_X_WIRE_RELEASE_X) {
+		frame.common.observed_mode = PCM_STATE_X;
+		frame.common.target_mode = PCM_STATE_N;
+		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+	} else if (kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION) {
+		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+		frame.body.local_proof.local_holder_authority_generation = 21;
+		frame.body.local_proof.requester_target_generation = 22;
+		frame.body.local_proof.requester_connection_generation = 23;
+		frame.body.local_proof.local_proof_generation = 24;
+	} else if (kind == RESOURCE_X_WIRE_AUTHORITY_GRANT) {
+		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+		frame.body.authority_grant.final_authority_generation
+			= frame.common.authority_generation;
+		frame.body.authority_grant.requester_target_generation = 25;
+		frame.body.authority_grant.proof_kind
+			= RESOURCE_X_PROOF_DURABLE_STORAGE;
+		frame.body.authority_grant.source_disposition
+			= RESOURCE_X_DISPOSITION_DURABLE_STORAGE;
+		frame.body.authority_grant.requester_connection_generation = 26;
+	} else if (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE) {
+		frame.common.action_node = 7;
+		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+		frame.body.image_envelope.conversion_base_generation
+			= frame.common.base_authority_generation;
+		frame.body.image_envelope.source_carrier_generation = 27;
+		frame.body.image_envelope.requester_target_generation = 28;
+		frame.body.image_envelope.image_length = RESOURCE_X_PAGE_BYTES;
+		frame.body.image_envelope.source_disposition
+			= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+		frame.body.image_envelope.proof_kind
+			= RESOURCE_X_PROOF_REMOTE_CARRIER;
+	} else if (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT) {
+		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+		frame.body.install_settlement.conversion_base_generation
+			= frame.common.base_authority_generation;
+		frame.body.install_settlement.final_authority_generation
+			= frame.common.authority_generation;
+		frame.body.install_settlement.requester_connection_generation = 29;
+		frame.body.install_settlement.requester_target_generation = 30;
+		frame.body.install_settlement.installed_mode = PCM_STATE_X;
+		frame.body.install_settlement.requester_role
+			= RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+		frame.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
+		frame.body.install_settlement.terminal_state
+			= RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	}
+
+	UT_ASSERT(cluster_resource_x_wire_encode(msg_type, &frame, bytes,
+										 capacity, &payload_len, &reject));
+	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_NONE);
+	return payload_len;
+}
+
+UT_TEST(test_resource_x_reused_types_route_only_after_strict_domain_decode)
+{
+	static const struct {
+		uint8 msg_type;
+		ResourceXWireKind kind;
+		uint16 payload_len;
+	} cases[] = {
+		{ RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_ASSERT_X,
+		  RESOURCE_X_CONTROL_V1_BYTES },
+		{ RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION,
+		  RESOURCE_X_SHORT_V1_BYTES },
+		{ RESOURCE_X_MSG_BLOCK_TO_N, RESOURCE_X_WIRE_BLOCK_TO_N,
+		  RESOURCE_X_CONTROL_V1_BYTES },
+		{ RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N,
+		  RESOURCE_X_CONTROL_V1_BYTES },
+		{ RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N,
+		  RESOURCE_X_PROOF_V1_BYTES },
+		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_AUTHORITY_GRANT,
+		  RESOURCE_X_PROOF_V1_BYTES },
+		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_IMAGE_ENVELOPE,
+		  RESOURCE_X_IMAGE_V1_BYTES },
+		{ RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, RESOURCE_X_WIRE_RELEASE_X,
+		  RESOURCE_X_CONTROL_V1_BYTES },
+		{ RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+		  RESOURCE_X_WIRE_INSTALL_SETTLEMENT, RESOURCE_X_SHORT_V1_BYTES }
+	};
+	BufferTag tag = make_tag(1663, 5, 37001, FSM_FORKNUM, 771);
+	union {
+		uint64 align;
+		uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	} payload;
+	int expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+	Size i;
+
+	for (i = 0; i < lengthof(cases); i++) {
+		uint16 encoded_len = make_resource_x_route_frame(cases[i].kind,
+			cases[i].msg_type, tag, payload.bytes, cases[i].payload_len);
+
+		UT_ASSERT_EQ(encoded_len, cases[i].payload_len);
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(cases[i].msg_type,
+			payload.bytes, encoded_len, CLUSTER_LMS_MAX_WORKERS), expected);
+
+		payload.bytes[20] ^= UINT8_C(0x01);
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(cases[i].msg_type,
+			payload.bytes, encoded_len, CLUSTER_LMS_MAX_WORKERS), -1);
+		payload.bytes[20] ^= UINT8_C(0x01);
+	}
+}
+
+UT_TEST(test_resource_x_length_collisions_preserve_legacy_domains)
+{
+	BufferTag tag = make_tag(1663, 5, 37002, MAIN_FORKNUM, 772);
+	GcsBlockRequestPayload request = make_request(tag);
+	GcsBlockInvalidatePayload invalidate = make_invalidate(tag);
+	GcsBlockInvalidateAckPayload ack = { 0 };
+	GcsBlockDonePayload done = make_done(tag);
+	uint8 legacy_reply[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE] = { 0 };
+	int expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+
+	ack.tag = tag;
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
+		&request, sizeof(request), CLUSTER_LMS_MAX_WORKERS), expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
+		&invalidate, sizeof(invalidate), CLUSTER_LMS_MAX_WORKERS), expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK,
+		&ack, sizeof(ack), CLUSTER_LMS_MAX_WORKERS), expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_DONE,
+		&done, sizeof(done), CLUSTER_LMS_MAX_WORKERS), expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+		legacy_reply, sizeof(legacy_reply), CLUSTER_LMS_MAX_WORKERS), -1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -730,6 +905,8 @@ main(void)
 	UT_RUN(test_current_mx_forward128_routes_by_request_identity);
 	UT_RUN(test_pcm_x_route_truth_table);
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
+	UT_RUN(test_resource_x_reused_types_route_only_after_strict_domain_decode);
+	UT_RUN(test_resource_x_length_collisions_preserve_legacy_domains);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

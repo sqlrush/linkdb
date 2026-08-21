@@ -204,6 +204,7 @@ OBJS = \
 	cluster_pcm_x_convert.o \
 	cluster_pcm_x_image_fetch.o \
 	cluster_resource_x_identity.o \
+	cluster_resource_x_node_wire.o \
 	cluster_resource_x_retry.o \
 	cluster_pgstat.o \
 	cluster_pi_recovery_srf.o \

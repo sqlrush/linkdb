@@ -33,6 +33,7 @@
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_resource_x_node_wire.h"
 #include "storage/buf_internals.h"
 
 #ifdef USE_PGRAC_CLUSTER
@@ -75,12 +76,27 @@ StaticAssertDecl(offsetof(PcmXAdmitAckPayload, ref) == 0, "PCM-X ref carrier mus
 StaticAssertDecl(offsetof(PcmXBlockerChunkPayload, tag) == 0,
 				 "PCM-X blocker tag must lead payload");
 
+static bool
+cluster_resource_x_payload_route_tag(uint8 msg_type, const void *payload,
+									 uint16 payload_len, BufferTag *tag)
+{
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject;
+
+	if (!cluster_resource_x_wire_decode(msg_type, payload, payload_len,
+										&decoded, &reject))
+		return false;
+	*tag = decoded.common.logical_assertion.resource;
+	return true;
+}
+
 int
 cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payload_len,
 								int n_workers)
 {
 	const BufferTag *tag;
 	BufferTag pcm_x_tag;
+	BufferTag resource_x_tag;
 	uint16 pcm_x_expected_len = 0;
 
 	if (payload == NULL)
@@ -88,10 +104,27 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 
 	switch (msg_type) {
 	case PGRAC_IC_MSG_GCS_BLOCK_REQUEST:
+		if (payload_len == RESOURCE_X_CONTROL_V1_BYTES
+			|| payload_len == RESOURCE_X_SHORT_V1_BYTES) {
+			if (!cluster_resource_x_payload_route_tag(msg_type, payload,
+												  payload_len, &resource_x_tag))
+				return -1;
+			tag = &resource_x_tag;
+			break;
+		}
 		if (payload_len != sizeof(GcsBlockRequestPayload)
 			&& payload_len != sizeof(ClusterR4CrRequestPayload))
 			return -1;
 		tag = &((const GcsBlockRequestPayload *)payload)->tag;
+		break;
+	case PGRAC_IC_MSG_GCS_BLOCK_REPLY:
+		if (payload_len != RESOURCE_X_PROOF_V1_BYTES
+			&& payload_len != RESOURCE_X_IMAGE_V1_BYTES)
+			return -1;
+		if (!cluster_resource_x_payload_route_tag(msg_type, payload, payload_len,
+												  &resource_x_tag))
+			return -1;
+		tag = &resource_x_tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
 		if (payload_len == CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE) {
@@ -135,11 +168,26 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &((const GcsBlockForwardPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE:
+		if (payload_len == RESOURCE_X_CONTROL_V1_BYTES) {
+			if (!cluster_resource_x_payload_route_tag(msg_type, payload,
+												  payload_len, &resource_x_tag))
+				return -1;
+			tag = &resource_x_tag;
+			break;
+		}
 		if (payload_len != sizeof(GcsBlockInvalidatePayload))
 			return -1;
 		tag = &((const GcsBlockInvalidatePayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK:
+		if (payload_len == RESOURCE_X_CONTROL_V1_BYTES
+			|| payload_len == RESOURCE_X_PROOF_V1_BYTES) {
+			if (!cluster_resource_x_payload_route_tag(msg_type, payload,
+												  payload_len, &resource_x_tag))
+				return -1;
+			tag = &resource_x_tag;
+			break;
+		}
 		if (payload_len != sizeof(GcsBlockInvalidateAckPayload))
 			return -1;
 		tag = &((const GcsBlockInvalidateAckPayload *)payload)->tag;
@@ -150,6 +198,14 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		 * was refused (-1) at the ring and the whole RC-F chain sent
 		 * nothing.  Same shard key as the REQUEST it retires, so it lands
 		 * on the worker that owns the dedup entry. */
+		if (payload_len == RESOURCE_X_CONTROL_V1_BYTES
+			|| payload_len == RESOURCE_X_SHORT_V1_BYTES) {
+			if (!cluster_resource_x_payload_route_tag(msg_type, payload,
+												  payload_len, &resource_x_tag))
+				return -1;
+			tag = &resource_x_tag;
+			break;
+		}
 		if (payload_len != sizeof(GcsBlockDonePayload))
 			return -1;
 		tag = &((const GcsBlockDonePayload *)payload)->tag;
