@@ -13047,14 +13047,44 @@ gcs_block_pcm_x_note_local_submission(const PcmXLocalHandle *leader,
 									const PcmXLocalReliableToken *token)
 {
 	ResourceXRetryStateV1 state;
+	PcmXQueueResult result;
+	PcmXQueueResult seed_result;
+	PcmXRuntimeSnapshot runtime;
 	uint64 now_us = gcs_block_pcm_x_monotonic_us();
 	uint64 deadline = gcs_block_pcm_x_saturating_add_us(
 		now_us, gcs_block_pcm_x_retry_timeout_us());
+	uint32 connection_before = 0;
+	uint32 connection_after = 0;
 
-	return cluster_pcm_x_local_retry_submission_admitted_exact(
+	result = cluster_pcm_x_local_retry_submission_admitted_exact(
 		leader, token, now_us, deadline,
 		(uint32)cluster_gcs_block_retransmit_max_retries,
 		(uint32)cluster_gcs_block_retransmit_initial_backoff_ms, &state);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	/* Seed the physical witness only when two consecutive samples agree.
+	 * The retry state is already authoritative if a reconnect races this
+	 * observation; formation tick will install the first fresh witness then. */
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (token->expected_responder_node == cluster_node_id) {
+		connection_before = runtime.gate_generation;
+		connection_after = runtime.gate_generation;
+	} else if (cluster_sf_peer_pcm_x_connection_generation(
+					   token->expected_responder_node, &connection_before)) {
+		pg_read_barrier();
+		if (!cluster_sf_peer_pcm_x_connection_generation(
+				token->expected_responder_node, &connection_after))
+			connection_after = 0;
+	}
+	if (connection_before == 0 || connection_before != connection_after)
+		return result;
+	seed_result = cluster_pcm_x_local_retry_transport_seed_exact(
+		leader, token, connection_before);
+	if (seed_result != PCM_X_QUEUE_OK && seed_result != PCM_X_QUEUE_DUPLICATE
+		&& seed_result != PCM_X_QUEUE_STALE)
+		return seed_result;
+	return result;
 }
 
 
@@ -13511,14 +13541,14 @@ gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result, 
 	static const char *last_stage = NULL;
 	static PcmXQueueResult last_result = PCM_X_QUEUE_OK;
 	static int32 last_peer_node = -1;
-	PcmXStatsSnapshot stats;
+	uint64 live_tickets;
 	bool same;
 
 	if (stage == NULL || result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
 		last_stage = NULL;
 		return;
 	}
-	if (!cluster_pcm_x_stats_snapshot(&stats) || stats.live_tickets == 0) {
+	if (!cluster_pcm_x_live_ticket_count(&live_tickets) || live_tickets == 0) {
 		last_stage = NULL;
 		return;
 	}
@@ -16837,6 +16867,7 @@ gcs_block_pcm_x_resource_retry_tick(
 											 &action);
 	if (decision == RESOURCE_X_RETRY_NOT_DUE)
 		return;
+	cluster_pcm_x_stats_note_retry_due();
 	if (decision == RESOURCE_X_RETRY_WAIT_SCHEDULER) {
 		gcs_block_pcm_x_master_retry_observe("local-transport", PCM_X_QUEUE_NOT_READY,
 											 work.dest_node, cursor_before, cursor,
@@ -16844,7 +16875,13 @@ gcs_block_pcm_x_resource_retry_tick(
 		return;
 	}
 	if (decision == RESOURCE_X_RETRY_RECOVERY_BLOCKED) {
-		cluster_pcm_x_runtime_fail_closed();
+		result = cluster_pcm_x_local_retry_recovery_blocked_exact(
+			&work.local_handle, &work.local_token, &work.retry_state, now_us, &applied);
+		cluster_pcm_x_stats_note_queue_result(result);
+		if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
+			cluster_pcm_x_runtime_fail_closed();
+		else if (result != PCM_X_QUEUE_STALE && result != PCM_X_QUEUE_NOT_READY)
+			gcs_block_pcm_x_master_drive_fail_closed(result);
 		return;
 	}
 	if (decision == RESOURCE_X_RETRY_TERMINAL_EXHAUSTED) {
@@ -16878,6 +16915,7 @@ gcs_block_pcm_x_resource_retry_tick(
 										 work.payload, (uint16)payload_len);
 	if (!admitted)
 		return;
+	cluster_pcm_x_stats_note_retry_wire_attempt();
 	if (decision == RESOURCE_X_RETRY_ROLL_FORWARD)
 		return;
 	admitted_at_us = gcs_block_pcm_x_monotonic_us();

@@ -2019,7 +2019,7 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "pcm", "wm_prov_insert_fail_count",
 			 fmt_int64((int64)cluster_pcm_get_wm_prov_insert_fail_count()));
 
-	/* PCM-X queue core: 30 stable integer keys in the existing pcm category,
+	/* PCM-X queue core plus Resource-X retry observations in the existing pcm category,
 	 * plus one text-valued fail-closed provenance key (excluded from the
 	 * integer-only snapshot tooling in the TAP suite). */
 	{
@@ -2114,6 +2114,28 @@ dump_pcm(ReturnSetInfo *rsinfo)
 				 fmt_int64((int64)stats.own_corrupt_count));
 		emit_row(rsinfo, "pcm", "pcm_x_queue_barrier_unwind_count",
 				 fmt_int64((int64)stats.barrier_unwind_count));
+		emit_row(rsinfo, "pcm", "retry_producer_due_count",
+				 fmt_uint64(stats.retry_producer_due_count));
+		emit_row(rsinfo, "pcm", "retry_wire_attempt_count",
+				 fmt_uint64(stats.retry_wire_attempt_count));
+		emit_row(rsinfo, "pcm", "retry_transport_rebound_count",
+				 fmt_uint64(stats.retry_transport_rebound_count));
+		emit_row(rsinfo, "pcm", "retry_terminal_success_count",
+				 fmt_uint64(stats.retry_terminal_success_count));
+		emit_row(rsinfo, "pcm", "retry_terminal_denied_count",
+				 fmt_uint64(stats.retry_terminal_denied_count));
+		emit_row(rsinfo, "pcm", "retry_budget_exhausted_count",
+				 fmt_uint64(stats.retry_budget_exhausted_count));
+		emit_row(rsinfo, "pcm", "retry_recovery_blocked_count",
+				 fmt_uint64(stats.retry_recovery_blocked_count));
+		emit_row(rsinfo, "pcm", "retry_terminal_latency_us_count",
+				 fmt_uint64(stats.retry_terminal_latency_us_count));
+		emit_row(rsinfo, "pcm", "retry_terminal_latency_us_max",
+				 fmt_uint64(stats.retry_terminal_latency_us_max));
+		emit_row(rsinfo, "pcm", "master_grant_delivery_pending_count",
+				 fmt_uint64(stats.master_grant_delivery_pending_count));
+		emit_row(rsinfo, "pcm", "master_grant_delivery_oldest_age_us",
+				 fmt_uint64(stats.master_grant_delivery_oldest_age_us));
 
 		{
 			static const char *const result_keys[PCM_X_QUEUE_RESULT_COUNT] = {

@@ -1522,8 +1522,8 @@ UT_TEST(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage)
 		UT_ASSERT_NOT_NULL(strstr(retry_tick,
 							  "cluster_pcm_x_local_retry_exhausted_exact"));
 		UT_ASSERT_NOT_NULL(strstr(retry_tick, "RESOURCE_X_RETRY_ROLL_FORWARD"));
-		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_stats_snapshot(&stats)"));
-		UT_ASSERT_NOT_NULL(strstr(source, "stats.live_tickets == 0"));
+		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_live_ticket_count(&live_tickets)"));
+		UT_ASSERT_NOT_NULL(strstr(source, "live_tickets == 0"));
 
 		drive = strstr(source, "\ngcs_block_pcm_x_master_drive_tag(");
 		drive_end = drive != NULL ? strstr(drive, "\n}\n") : NULL;

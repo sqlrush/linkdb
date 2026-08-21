@@ -2269,13 +2269,13 @@ UT_TEST(test_wire_abi_offsets_are_exact)
 
 UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 {
-	UT_ASSERT_EQ(PCM_X_SHMEM_LAYOUT_VERSION, 17);
+	UT_ASSERT_EQ(PCM_X_SHMEM_LAYOUT_VERSION, 18);
 	UT_ASSERT_EQ(PCM_X_LOCK_PARTITIONS, NUM_BUFFER_PARTITIONS);
 	UT_ASSERT_EQ(PCM_X_LWLOCK_COUNT, 257);
 	UT_ASSERT_EQ(sizeof(PcmXShmemLayout), 440);
 	UT_ASSERT_EQ(sizeof(PcmXAllocatorState), 32);
-	UT_ASSERT_EQ(sizeof(PcmXStats), 184);
-	UT_ASSERT_EQ(sizeof(PcmXStatsSnapshot), 232);
+	UT_ASSERT_EQ(sizeof(PcmXStats), 256);
+	UT_ASSERT_EQ(sizeof(PcmXStatsSnapshot), 320);
 	UT_ASSERT_EQ(sizeof(PcmXSlotHeader), 24);
 	UT_ASSERT_EQ(offsetof(PcmXSlotHeader, next_free), 0);
 	UT_ASSERT_EQ(offsetof(PcmXSlotHeader, generation_change_seq), 8);
@@ -2295,7 +2295,7 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(sizeof(PcmXMasterTicketSlot), 520);
 	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, grant_base_own_generation), 384);
 	UT_ASSERT_EQ(sizeof(PcmXBlockerSlot), 128);
-	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 896);
+	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 904);
 	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, grant_base_own_generation), 760);
 	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, logical_assertion), 392);
 	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, attempt_base_generation), 416);
@@ -2309,6 +2309,7 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, transport_session), 808);
 	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, semantic_generation), 816);
 	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, retry_state), 824);
+	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, retry_connection_generation), 896);
 	UT_ASSERT_EQ(sizeof(PcmXLocalMembershipSlot), 240);
 	UT_ASSERT_EQ(sizeof(PcmXPeerFrontier), 48);
 	UT_ASSERT_EQ(sizeof(PcmXPeerBinding), 16);
@@ -2352,14 +2353,14 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, local_locks), 17280);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, peer_frontiers), 33664);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, stats), 35200);
-	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35384);
+	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35456);
 	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, (int)PCM_X_QUEUE_BARRIER_CLOSED + 1);
 	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, 14);
 	UT_ASSERT_EQ(PCM_X_ACQUIRE_HIST_BUCKETS, 32);
 	UT_ASSERT_EQ(sizeof(PcmXAcquireObservation), 400);
 	UT_ASSERT_EQ(sizeof(PcmXAcquireObservationSnapshot), 400);
-	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, acquire_observation), 36520);
-	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36920);
+	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, acquire_observation), 36592);
+	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36992);
 }
 
 UT_TEST(test_resource_x_semantic_projections_follow_master_and_local_admission)
@@ -2609,19 +2610,19 @@ UT_TEST(test_exactly_five_pools_and_bounded_directories)
 	UT_ASSERT_EQ(layout.local_holder.directory_capacity, layout.local_holder.capacity * 2);
 }
 
-UT_TEST(test_layout_v17_preserves_transfer_and_terminal_frontiers)
+UT_TEST(test_layout_v18_preserves_transfer_terminal_and_retry_observation)
 {
 	PcmXShmemLayout layout;
 
 	cluster_pcm_x_layout_compute(122, 25, 16384, 1024, &layout);
-	UT_ASSERT_EQ(layout.version, 17);
+	UT_ASSERT_EQ(layout.version, 18);
 	UT_ASSERT_EQ(layout.lock_partition_count, PCM_X_LOCK_PARTITIONS);
 	UT_ASSERT_EQ(layout.lwlock_count, PCM_X_LWLOCK_COUNT);
 	UT_ASSERT_EQ(sizeof(PcmXPeerFrontier), 48);
 	UT_ASSERT_EQ(sizeof(PcmXOutboundTargetFrontier), 32);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, peer_frontiers), 33664);
 	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, stats), 35200);
-	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35384);
+	UT_ASSERT_EQ(offsetof(PcmXShmemHeader, outbound_targets), 35456);
 }
 
 UT_TEST(test_offsets_are_aligned_ordered_and_bounded)
@@ -15879,6 +15880,7 @@ UT_TEST(test_resource_x_retry_submission_is_visible_to_bounded_work_cursor)
 	ResourceXRetryAction action;
 	ResourceXTransportWitness transport;
 	ResourceXRetryStateV1 state;
+	PcmXStatsSnapshot snapshot;
 	Size cursor = 0;
 
 	init_active_pcm_x(UINT64_C(77));
@@ -15895,6 +15897,9 @@ UT_TEST(test_resource_x_retry_submission_is_visible_to_bounded_work_cursor)
 	UT_ASSERT_EQ(state.retry_count, 0);
 	UT_ASSERT_EQ(state.state_generation, 1);
 	UT_ASSERT_EQ(state.attempt.base_authority_generation, UINT64_C(19));
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.master_grant_delivery_pending_count, 1);
+	UT_ASSERT(snapshot.master_grant_delivery_oldest_age_us > 0);
 
 	UT_ASSERT_EQ(cluster_pcm_x_retry_work_next(&cursor, SIZE_MAX, &work), PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(work.kind, PCM_X_RETRY_WORK_LOCAL);
@@ -15920,10 +15925,25 @@ UT_TEST(test_resource_x_retry_submission_is_visible_to_bounded_work_cursor)
 	UT_ASSERT_EQ(state.retry_count, 1);
 	UT_ASSERT_EQ(state.state_generation, 2);
 	UT_ASSERT_EQ(state.next_retry_due_mono_us, UINT64_C(3000));
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.retry_transport_rebound_count, 0);
+	transport.connection_generation = 10;
+	UT_ASSERT_EQ(resource_x_retry_classify_exact(&state, &state.attempt, &transport,
+											 UINT64_C(3000), &action),
+				 RESOURCE_X_RETRY_STAGE_EXACT);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_admitted_exact(
+					 &work.local_handle, &work.local_token, &action, UINT64_C(5000), &state),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(state.retry_count, 2);
+	UT_ASSERT_EQ(state.state_generation, 3);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.retry_transport_rebound_count, 1);
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_admitted_exact(
 					 &work.local_handle, &work.local_token, &action, UINT64_C(4000), &state),
 				 PCM_X_QUEUE_STALE);
 	UT_ASSERT_EQ(state.retry_count, 0);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.retry_transport_rebound_count, 1);
 }
 
 UT_TEST(test_resource_x_retry_cursor_is_bounded_and_resumes_past_retained_entry)
@@ -15998,6 +16018,8 @@ UT_TEST(test_resource_x_retry_exhaustion_is_atomic_and_post_no_return_refuses)
 	ResourceXRetryStateV1 expected;
 	ResourceXRetryStateV1 terminal;
 	ResourceXRetryStateV1 observed;
+	PcmXStatsSnapshot before;
+	PcmXStatsSnapshot after;
 	Size cursor;
 
 	init_active_pcm_x(UINT64_C(77));
@@ -16009,6 +16031,7 @@ UT_TEST(test_resource_x_retry_exhaustion_is_atomic_and_post_no_return_refuses)
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&leader, &enqueue, &token),
 				 PCM_X_QUEUE_OK);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&before));
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
 					 &leader, &token, UINT64_C(1000), UINT64_C(6000), 0, 1,
 					 &expected),
@@ -16020,6 +16043,18 @@ UT_TEST(test_resource_x_retry_exhaustion_is_atomic_and_post_no_return_refuses)
 	UT_ASSERT_EQ(terminal.terminal_errcode,
 				 ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED);
 	UT_ASSERT_EQ(terminal.state_generation, expected.state_generation + 1);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&after));
+	UT_ASSERT_EQ(after.retry_budget_exhausted_count,
+				 before.retry_budget_exhausted_count + 1);
+	UT_ASSERT_EQ(after.retry_terminal_denied_count, before.retry_terminal_denied_count);
+	UT_ASSERT_EQ(after.retry_terminal_latency_us_count,
+				 before.retry_terminal_latency_us_count + 1);
+	UT_ASSERT_EQ(after.retry_terminal_latency_us_max, UINT64_C(1000));
+	UT_ASSERT_EQ(after.master_grant_delivery_pending_count, 0);
+	UT_ASSERT_EQ(UINT64_C(1),
+				 after.retry_budget_exhausted_count - before.retry_budget_exhausted_count
+					 + after.master_grant_delivery_pending_count
+					 - before.master_grant_delivery_pending_count);
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_state_exact(&leader, &observed),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT(memcmp(&observed, &terminal, sizeof(observed)) == 0);
@@ -16031,6 +16066,11 @@ UT_TEST(test_resource_x_retry_exhaustion_is_atomic_and_post_no_return_refuses)
 					 &leader, &token, &expected, UINT64_C(3000), &observed),
 				 PCM_X_QUEUE_DUPLICATE);
 	UT_ASSERT(memcmp(&observed, &terminal, sizeof(observed)) == 0);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&after));
+	UT_ASSERT_EQ(after.retry_budget_exhausted_count,
+				 before.retry_budget_exhausted_count + 1);
+	UT_ASSERT_EQ(after.retry_terminal_latency_us_count,
+				 before.retry_terminal_latency_us_count + 1);
 
 	/* A possibly committed attempt is retained for roll-forward and cannot
 	 * be rewritten as ordinary retry exhaustion. */
@@ -16049,6 +16089,65 @@ UT_TEST(test_resource_x_retry_exhaustion_is_atomic_and_post_no_return_refuses)
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(observed.last_phase, RESOURCE_X_RETRY_POST_NO_RETURN);
 	UT_ASSERT_EQ(observed.terminal_errcode, 0);
+}
+
+UT_TEST(test_resource_x_retry_recovery_blocked_is_exact_and_idempotent)
+{
+	PcmXShmemHeader *header;
+	PcmXLocalHandle leader;
+	PcmXWaitIdentity identity;
+	PcmXEnqueuePayload enqueue;
+	PcmXLocalReliableToken token;
+	PcmXRetryWorkItem work;
+	ResourceXRetryStateV1 expected;
+	ResourceXRetryStateV1 blocked;
+	PcmXStatsSnapshot before;
+	PcmXStatsSnapshot after;
+	Size cursor;
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	identity = make_wait_identity(763, 0, 16, UINT64_C(70024));
+	identity.base_own_generation = UINT64_C(32);
+	bind_local_master(1, identity.cluster_epoch, UINT64_C(7334));
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1, UINT64_C(7334), &leader),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&leader, &enqueue, &token),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
+					 &leader, &token, UINT64_C(1000), UINT64_C(6000), 4, 1,
+					 &expected),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&before));
+	UT_ASSERT_EQ(before.master_grant_delivery_pending_count, 1);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_recovery_blocked_exact(
+					 &leader, &token, &expected, UINT64_C(2000), &blocked),
+				 PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(blocked.last_phase, RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(blocked.terminal_errcode, 0);
+	UT_ASSERT_EQ(blocked.state_generation, expected.state_generation + 1);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&after));
+	UT_ASSERT_EQ(after.retry_recovery_blocked_count,
+				 before.retry_recovery_blocked_count + 1);
+	UT_ASSERT_EQ(after.retry_terminal_latency_us_count,
+				 before.retry_terminal_latency_us_count + 1);
+	UT_ASSERT_EQ(after.master_grant_delivery_pending_count, 0);
+	UT_ASSERT_EQ(UINT64_C(0),
+				 after.retry_recovery_blocked_count - before.retry_recovery_blocked_count
+					 + after.master_grant_delivery_pending_count
+					 - before.master_grant_delivery_pending_count);
+	cursor = header->layout.pools[PCM_X_POOL_MASTER_TAG].capacity
+		+ leader.tag_slot.slot_index;
+	UT_ASSERT_EQ(cluster_pcm_x_retry_work_next(&cursor, 1, &work),
+				 PCM_X_QUEUE_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retry_recovery_blocked_exact(
+					 &leader, &token, &expected, UINT64_C(3000), &blocked),
+				 PCM_X_QUEUE_DUPLICATE);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&after));
+	UT_ASSERT_EQ(after.retry_recovery_blocked_count,
+				 before.retry_recovery_blocked_count + 1);
+	UT_ASSERT_EQ(after.retry_terminal_latency_us_count,
+				 before.retry_terminal_latency_us_count + 1);
 }
 
 UT_TEST(test_resource_x_retry_cursor_skips_legal_empty_leg_window)
@@ -16192,6 +16291,8 @@ UT_TEST(test_resource_x_specific_type60_denial_is_exact_and_idempotent)
 	PcmXLocalReliableToken token;
 	ResourceXRetryStateV1 state;
 	ResourceXRetryStateV1 terminal;
+	PcmXStatsSnapshot before;
+	PcmXStatsSnapshot after;
 	const uint64 master_session = UINT64_C(7666);
 
 	init_active_pcm_x(UINT64_C(77));
@@ -16205,6 +16306,7 @@ UT_TEST(test_resource_x_specific_type60_denial_is_exact_and_idempotent)
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
 					 &leader, &token, UINT64_C(1000), UINT64_C(6000), 4, 1, &state),
 				 PCM_X_QUEUE_OK);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&before));
 	MemSet(&admit_ack, 0, sizeof(admit_ack));
 	admit_ack.ref.identity = identity;
 	admit_ack.ref.handle.ticket_id = UINT64_C(9501);
@@ -16224,10 +16326,23 @@ UT_TEST(test_resource_x_specific_type60_denial_is_exact_and_idempotent)
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(terminal.terminal_errcode,
 				 ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&after));
+	UT_ASSERT_EQ(after.retry_terminal_denied_count,
+				 before.retry_terminal_denied_count + 1);
+	UT_ASSERT_EQ(after.retry_budget_exhausted_count, before.retry_budget_exhausted_count);
+	UT_ASSERT_EQ(after.retry_terminal_latency_us_count,
+				 before.retry_terminal_latency_us_count + 1);
+	UT_ASSERT_EQ(after.retry_terminal_latency_us_max, UINT64_C(1000));
+	UT_ASSERT_EQ(after.master_grant_delivery_pending_count, 0);
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_terminal_ack_exact(
 					 &leader, &terminal_ack, 1, master_session, UINT64_C(3000), &state),
 				 PCM_X_QUEUE_DUPLICATE);
 	UT_ASSERT(memcmp(&state, &terminal, sizeof(state)) == 0);
+	UT_ASSERT(cluster_pcm_x_stats_snapshot(&after));
+	UT_ASSERT_EQ(after.retry_terminal_denied_count,
+				 before.retry_terminal_denied_count + 1);
+	UT_ASSERT_EQ(after.retry_terminal_latency_us_count,
+				 before.retry_terminal_latency_us_count + 1);
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_terminal_complete_exact(&leader, &promoted),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_detach_terminal_exact(&leader), PCM_X_QUEUE_OK);
@@ -18235,7 +18350,7 @@ UT_TEST(test_runtime_reform_tag_epoch_failure_keeps_blocked)
 int
 main(void)
 {
-	UT_PLAN(303);
+	UT_PLAN(304);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -18247,7 +18362,7 @@ main(void)
 	UT_RUN(test_lwlock_held_limit_is_shared_200);
 	UT_RUN(test_default_capacity_formulas_are_exact);
 	UT_RUN(test_exactly_five_pools_and_bounded_directories);
-	UT_RUN(test_layout_v17_preserves_transfer_and_terminal_frontiers);
+	UT_RUN(test_layout_v18_preserves_transfer_terminal_and_retry_observation);
 	UT_RUN(test_offsets_are_aligned_ordered_and_bounded);
 	UT_RUN(test_membership_wait_and_holder_partitions_do_not_overlap);
 	UT_RUN(test_generation_zero_advances_without_being_a_sentinel);
@@ -18490,6 +18605,7 @@ main(void)
 	UT_RUN(test_resource_x_retry_submission_is_visible_to_bounded_work_cursor);
 	UT_RUN(test_resource_x_retry_cursor_is_bounded_and_resumes_past_retained_entry);
 	UT_RUN(test_resource_x_retry_exhaustion_is_atomic_and_post_no_return_refuses);
+	UT_RUN(test_resource_x_retry_recovery_blocked_is_exact_and_idempotent);
 	UT_RUN(test_resource_x_retry_cursor_skips_legal_empty_leg_window);
 	UT_RUN(test_resource_x_terminal_record_replays_and_promotes_successor);
 	UT_RUN(test_resource_x_specific_type60_denial_is_exact_and_idempotent);

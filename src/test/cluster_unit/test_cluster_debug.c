@@ -4680,6 +4680,17 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 		"pcm_x_own_abort_count",
 		"pcm_x_own_busy_count",
 		"pcm_x_own_corrupt_count",
+		"retry_producer_due_count",
+		"retry_wire_attempt_count",
+		"retry_transport_rebound_count",
+		"retry_terminal_success_count",
+		"retry_terminal_denied_count",
+		"retry_budget_exhausted_count",
+		"retry_recovery_blocked_count",
+		"retry_terminal_latency_us_count",
+		"retry_terminal_latency_us_max",
+		"master_grant_delivery_pending_count",
+		"master_grant_delivery_oldest_age_us",
 	};
 	static const char *const lmd_keys[] = {
 		"pcm_convert_wfg_replace_count",
@@ -4778,7 +4789,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, 14);
 	UT_ASSERT_EQ(PCM_X_ACQUIRE_HIST_BUCKETS, 32);
 	UT_ASSERT_EQ((int)lengthof(result_labels), PCM_X_QUEUE_RESULT_COUNT);
-	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 111);
+	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 122);
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
 	UT_ASSERT_EQ(captured_dump_count("lmon", NULL), 12);
 	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 121);

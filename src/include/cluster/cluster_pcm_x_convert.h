@@ -35,7 +35,7 @@
 #define PCM_X_SHMEM_REGION_NAME "pgrac cluster pcm convert queue"
 #define PCM_X_SHMEM_MAGIC ((uint32)0x50435851) /* "PCXQ" */
 /* 16: append volatile Resource-X semantic projections to local/master slots. */
-#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)17)
+#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)18)
 #define PCM_X_INVALID_SLOT_INDEX ((Size) - 1)
 #define PCM_X_LOCK_PARTITIONS NUM_BUFFER_PARTITIONS
 #define PCM_X_LWLOCK_COUNT (1 + 2 * PCM_X_LOCK_PARTITIONS)
@@ -1091,6 +1091,10 @@ typedef struct PcmXLocalTagSlot {
 	uint64 transport_session;
 	uint64 semantic_generation;
 	ResourceXRetryStateV1 retry_state;
+	/* Last fresh physical transport admitted for this logical retry episode.
+	 * Observation only: never part of attempt equality or wire identity. */
+	uint32 retry_connection_generation;
+	uint32 retry_connection_reserved;
 } PcmXLocalTagSlot;
 
 typedef struct PcmXLocalMembershipSlot {
@@ -1142,7 +1146,7 @@ StaticAssertDecl(offsetof(PcmXMasterTicketSlot, transport_epoch) == 424
 StaticAssertDecl(offsetof(PcmXMasterTicketSlot, retry_state) == 448,
 				 "PCM-X master retry-state offset");
 StaticAssertDecl(sizeof(PcmXBlockerSlot) == 128, "PCM-X blocker slot ABI");
-StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 896, "PCM-X local tag slot ABI");
+StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 904, "PCM-X local tag slot ABI");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, grant_base_own_generation) == 760,
 				 "PCM-X local tag grant-base offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, logical_assertion) == 768,
@@ -1155,6 +1159,8 @@ StaticAssertDecl(offsetof(PcmXLocalTagSlot, transport_epoch) == 800
 				 "PCM-X local semantic witness offsets");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, retry_state) == 824,
 				 "PCM-X local retry-state offset");
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, retry_connection_generation) == 896,
+				 "PCM-X local retry transport-observation offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, membership_count) == 384,
 				 "PCM-X local membership count offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, closed_round_member_count) == 392,
@@ -1277,6 +1283,17 @@ typedef struct PcmXStats {
 	/* t/400 L3 item 3: BARRIER_CLOSED refusals handed back to a
 	 * barrier-aware LockBuffer caller instead of escaping as ERROR. */
 	pg_atomic_uint64 barrier_unwind_count;
+	/* Resource-X R7 retry/terminal observation.  These are lifetime atomics;
+	 * only shared-memory creation resets them. */
+	pg_atomic_uint64 retry_producer_due_count;
+	pg_atomic_uint64 retry_wire_attempt_count;
+	pg_atomic_uint64 retry_transport_rebound_count;
+	pg_atomic_uint64 retry_terminal_success_count;
+	pg_atomic_uint64 retry_terminal_denied_count;
+	pg_atomic_uint64 retry_budget_exhausted_count;
+	pg_atomic_uint64 retry_recovery_blocked_count;
+	pg_atomic_uint64 retry_terminal_latency_us_count;
+	pg_atomic_uint64 retry_terminal_latency_us_max;
 } PcmXStats;
 
 /* Process-local copy used by debug views and acceptance gates. */
@@ -1313,6 +1330,18 @@ typedef struct PcmXStatsSnapshot {
 	uint64 own_busy_count;
 	uint64 own_corrupt_count;
 	uint64 barrier_unwind_count;
+	uint64 retry_producer_due_count;
+	uint64 retry_wire_attempt_count;
+	uint64 retry_transport_rebound_count;
+	uint64 retry_terminal_success_count;
+	uint64 retry_terminal_denied_count;
+	uint64 retry_budget_exhausted_count;
+	uint64 retry_recovery_blocked_count;
+	uint64 retry_terminal_latency_us_count;
+	uint64 retry_terminal_latency_us_max;
+	/* Exact cold-path gauges derived from retained nonterminal retry state. */
+	uint64 master_grant_delivery_pending_count;
+	uint64 master_grant_delivery_oldest_age_us;
 } PcmXStatsSnapshot;
 
 /* Passive writer-acquisition observation.  One episode starts when a wait
@@ -1422,8 +1451,8 @@ typedef struct PcmXShmemHeader {
 StaticAssertDecl(sizeof(PcmXShmemLayout) == 440, "PCM-X shmem layout ABI");
 StaticAssertDecl(sizeof(PcmXAllocatorState) == 32, "PCM-X allocator state ABI");
 StaticAssertDecl(sizeof(PcmXPeerFrontier) == 48, "PCM-X peer frontier ABI");
-StaticAssertDecl(sizeof(PcmXStats) == 184, "PCM-X stats ABI");
-StaticAssertDecl(sizeof(PcmXStatsSnapshot) == 232, "PCM-X stats snapshot ABI");
+StaticAssertDecl(sizeof(PcmXStats) == 256, "PCM-X stats ABI");
+StaticAssertDecl(sizeof(PcmXStatsSnapshot) == 320, "PCM-X stats snapshot ABI");
 StaticAssertDecl(sizeof(PcmXPeerBinding) == 16, "PCM-X peer binding ABI");
 StaticAssertDecl(sizeof(PcmXOutboundTargetFrontier) == 32, "PCM-X outbound target frontier ABI");
 StaticAssertDecl(offsetof(PcmXOutboundTargetFrontier, mint_gate) == 0,
@@ -1441,7 +1470,7 @@ StaticAssertDecl(offsetof(PcmXShmemHeader, local_locks) == 17280, "PCM-X local l
 StaticAssertDecl(offsetof(PcmXShmemHeader, peer_frontiers) == 33664,
 				 "PCM-X peer frontier array offset");
 StaticAssertDecl(offsetof(PcmXShmemHeader, stats) == 35200, "PCM-X stats offset");
-StaticAssertDecl(offsetof(PcmXShmemHeader, outbound_targets) == 35384,
+StaticAssertDecl(offsetof(PcmXShmemHeader, outbound_targets) == 35456,
 				 "PCM-X outbound target frontier array offset");
 StaticAssertDecl(PCM_X_QUEUE_RESULT_COUNT == PCM_X_QUEUE_BARRIER_CLOSED + 1,
 				 "PCM-X queue result count marker");
@@ -1449,9 +1478,9 @@ StaticAssertDecl(sizeof(((PcmXAcquireObservation *)0)->success_latency_bucket)
 					 == PCM_X_ACQUIRE_HIST_BUCKETS * sizeof(pg_atomic_uint64),
 				 "PCM-X acquire histogram bucket array length");
 StaticAssertDecl(sizeof(PcmXAcquireObservation) == 400, "PCM-X acquire observation ABI");
-StaticAssertDecl(offsetof(PcmXShmemHeader, acquire_observation) == 36520,
+StaticAssertDecl(offsetof(PcmXShmemHeader, acquire_observation) == 36592,
 				 "PCM-X acquire observation append offset");
-StaticAssertDecl(sizeof(PcmXShmemHeader) == 36920, "PCM-X shmem header ABI");
+StaticAssertDecl(sizeof(PcmXShmemHeader) == 36992, "PCM-X shmem header ABI");
 
 typedef enum PcmXAttachResult {
 	PCM_X_ATTACH_OK = 0,
@@ -1493,6 +1522,7 @@ extern uint32 cluster_pcm_x_tag_hash(const BufferTag *tag);
 extern uint32 cluster_pcm_x_lock_partition(uint32 tag_hash);
 extern PcmXRuntimeSnapshot cluster_pcm_x_runtime_snapshot(void);
 extern bool cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out);
+extern bool cluster_pcm_x_live_ticket_count(uint64 *count_out);
 extern void cluster_pcm_x_stats_note_enqueue(void);
 extern void cluster_pcm_x_stats_note_wait(void);
 typedef bool (*PcmXPreSleepRevalidateCallback)(void *callback_arg);
@@ -1510,6 +1540,8 @@ extern void cluster_pcm_x_stats_note_own_abort(void);
 extern void cluster_pcm_x_stats_note_own_busy(void);
 extern void cluster_pcm_x_stats_note_own_corrupt(void);
 extern void cluster_pcm_x_stats_note_barrier_unwind(void);
+extern void cluster_pcm_x_stats_note_retry_due(void);
+extern void cluster_pcm_x_stats_note_retry_wire_attempt(void);
 extern void cluster_pcm_x_acquire_observation_begin(uint64 start_us);
 extern void cluster_pcm_x_acquire_observation_finish(PcmXQueueResult result, uint64 finish_us);
 extern void cluster_pcm_x_acquire_observation_exception(void);
@@ -1910,10 +1942,17 @@ extern PcmXQueueResult cluster_pcm_x_local_retry_submission_admitted_exact(
 	uint64 first_submit_mono_us, uint64 terminal_deadline_mono_us,
 	uint32 max_retries, uint32 initial_backoff_ms,
 	ResourceXRetryStateV1 *state_out);
+extern PcmXQueueResult cluster_pcm_x_local_retry_transport_seed_exact(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
+	uint32 connection_generation);
 extern PcmXQueueResult cluster_pcm_x_local_retry_admitted_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
 	const ResourceXRetryAction *action, uint64 next_retry_due_mono_us,
 	ResourceXRetryStateV1 *state_out);
+extern PcmXQueueResult cluster_pcm_x_local_retry_recovery_blocked_exact(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected_token,
+	const ResourceXRetryStateV1 *expected_state, uint64 blocked_at_mono_us,
+	ResourceXRetryStateV1 *blocked_out);
 extern PcmXQueueResult cluster_pcm_x_local_retry_exhausted_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected_token,
 	const ResourceXRetryStateV1 *expected_state, uint64 terminal_at_mono_us,

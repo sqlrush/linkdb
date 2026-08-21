@@ -48,6 +48,13 @@ my @R4_KEYS = qw(
   tx_resolve_committed_count tx_resolve_aborted_count
   multi_resolve_served_count multi_resolve_unknown_count
   slot_capacity_retry_count);
+my @RESOURCE_X_RETRY_KEYS = qw(
+  retry_producer_due_count retry_wire_attempt_count
+  retry_transport_rebound_count retry_terminal_success_count
+  retry_terminal_denied_count retry_budget_exhausted_count
+  retry_recovery_blocked_count retry_terminal_latency_us_count
+  retry_terminal_latency_us_max master_grant_delivery_pending_count
+  master_grant_delivery_oldest_age_us);
 my @UNDO_STATUS = qw(
   READY UNAVAILABLE_INVALID_OWNER UNAVAILABLE_IO_ERROR
   UNAVAILABLE_INVALID_HEADER);
@@ -164,6 +171,15 @@ sub o2_snapshot
 	}
 	die 'O2 surface is not exactly 50 keys'
 	  unless scalar(keys %values) == scalar(@O2_KEYS);
+	return \%values;
+}
+
+sub resource_x_retry_snapshot
+{
+	my ($node) = @_;
+	my %values;
+
+	$values{$_} = state_num($node, 'pcm', $_) for @RESOURCE_X_RETRY_KEYS;
 	return \%values;
 }
 
@@ -323,7 +339,7 @@ for my $entry ([ 0, $node0 ], [ 1, $node1 ])
 		"L1 node$node_id canonical test config identity frozen");
 }
 
-# L2: all 71 exact rows exist once and numeric rows are unsigned 64-bit.
+# L2: all 82 exact rows exist once and numeric rows are unsigned 64-bit.
 for my $entry ([ 0, $node0 ], [ 1, $node1 ])
 {
 	my ($node_id, $node) = @$entry;
@@ -343,6 +359,7 @@ for my $entry ([ 0, $node0 ], [ 1, $node1 ])
 	my $bad_numeric = 0;
 	for my $group (
 		[ 'pcm', \@O2_KEYS ],
+		[ 'pcm', \@RESOURCE_X_RETRY_KEYS ],
 		[ 'lmon', \@LMON_KEYS ],
 		[ 'undo', \@UNDO_KEYS ],
 		[ 'gcs', \@GCS_KEYS ],
@@ -368,29 +385,43 @@ my $natural_baseline0 = o2_snapshot($node0);
 my $natural_baseline1 = o2_snapshot($node1);
 
 # Create a relation whose per-node catalog entries map to one shared file.
-my $table;
-for my $attempt (1 .. 16)
+# Match the established shared-data harness discipline: burn the exact lagging
+# relfilenode distance before retrying the mirrored CREATE.
+my $table = 'r1_obs';
+my $shared_identity = 0;
+for my $attempt (1 .. 8)
 {
-	my $candidate = "r1_obs_$attempt";
-	$_->safe_psql('postgres', "CREATE TABLE $candidate (id int, v bigint)")
+	$_->safe_psql('postgres', "CREATE TABLE $table (id int, v bigint)")
 	  for ($node0, $node1);
-	my $path0 =
-	  $node0->safe_psql('postgres', "SELECT pg_relation_filepath('$candidate')");
-	my $path1 =
-	  $node1->safe_psql('postgres', "SELECT pg_relation_filepath('$candidate')");
+	my $path0 = $node0->safe_psql(
+		'postgres', "SELECT pg_relation_filepath('$table')");
+	my $path1 = $node1->safe_psql(
+		'postgres', "SELECT pg_relation_filepath('$table')");
 	if ($path0 eq $path1)
 	{
-		$table = $candidate;
+		$shared_identity = 1;
 		last;
 	}
+	my ($relfilenode0) = $path0 =~ /(\d+)$/;
+	my ($relfilenode1) = $path1 =~ /(\d+)$/;
+	die 'unexpected non-numeric relfilenode path'
+	  unless defined($relfilenode0) && defined($relfilenode1);
+	my ($lagging_node, $burn) = $relfilenode0 < $relfilenode1
+	  ? ($node0, $relfilenode1 - $relfilenode0)
+	  : ($node1, $relfilenode0 - $relfilenode1);
+	$lagging_node->safe_psql(
+		'postgres',
+		"SELECT lo_unlink(lo_create(0)) FROM generate_series(1, $burn)");
+	$_->safe_psql('postgres', "DROP TABLE $table") for ($node0, $node1);
 }
 die 'could not create a relation with one shared file identity'
-  unless defined($table);
+  unless $shared_identity;
 $node0->safe_psql('postgres', "INSERT INTO $table VALUES (1, 0), (2, 0)");
 $node0->safe_psql('postgres', "UPDATE $table SET v = v + 1 WHERE id = 1");
 
 # L3: one real cross-node successful writer acquisition.
 my $before_l3 = o2_snapshot($node1);
+my $before_l17 = resource_x_retry_snapshot($node1);
 $node1->safe_psql('postgres', "UPDATE $table SET v = v + 1 WHERE id = 1");
 my $after_l3 = o2_snapshot($node1);
 is(
@@ -411,6 +442,41 @@ for my $key (@BUCKET_KEYS, 'pcm_x_acquire_success_us_overflow_count')
 	$l3_hist_delta += (0 + $after_l3->{$key}) - (0 + $before_l3->{$key});
 }
 is($l3_hist_delta, 1, 'L3 exactly one success histogram sample recorded');
+
+# L17: one real Resource-X episode closes through the unique success
+# terminal.  The exact start/end pending gauges make the bounded-window
+# conservation equation observable without a reset RPC or test-only producer.
+my $after_l17;
+ok(
+	wait_for(
+		sub {
+			$after_l17 = resource_x_retry_snapshot($node1);
+			return
+			  $after_l17->{retry_terminal_success_count}
+			    == $before_l17->{retry_terminal_success_count} + 1
+			  && $after_l17->{retry_terminal_latency_us_count}
+			    == $before_l17->{retry_terminal_latency_us_count} + 1
+			  && $after_l17->{master_grant_delivery_pending_count}
+			    == $before_l17->{master_grant_delivery_pending_count};
+		},
+		30),
+	'L17 real Resource-X success terminal closes the retained attempt once');
+$after_l17 = resource_x_retry_snapshot($node1);
+my $l17_terminal_delta =
+    $after_l17->{retry_terminal_success_count}
+  - $before_l17->{retry_terminal_success_count}
+  + $after_l17->{retry_terminal_denied_count}
+  - $before_l17->{retry_terminal_denied_count}
+  + $after_l17->{retry_budget_exhausted_count}
+  - $before_l17->{retry_budget_exhausted_count}
+  + $after_l17->{retry_recovery_blocked_count}
+  - $before_l17->{retry_recovery_blocked_count};
+is(
+	1,
+	$l17_terminal_delta
+	  + $after_l17->{master_grant_delivery_pending_count}
+	  - $before_l17->{master_grant_delivery_pending_count},
+	'L17 opened equals disjoint terminals plus exact pending gauge delta');
 
 # L4: stopping the remote LMON makes the existing GES preflight time out
 # before PCM-X publishes a wait; the complete O2 vector is unchanged.
@@ -667,6 +733,14 @@ ok(
 	is_u64($restart{segment_allocated_count})
 	  && $restart{segment_allocated_count} >= 1,
 	'L11 pre-existing undo files reconstruct before post-restart DML');
+
+# L18: all retry counters/max and exact gauges reset only with the new
+# postmaster incarnation.  No SQL reset/GUC exists or is used.
+my $restart_resource_x_retry = resource_x_retry_snapshot($node0);
+is_deeply(
+	$restart_resource_x_retry,
+	{ map { $_ => 0 } @RESOURCE_X_RETRY_KEYS },
+	'L18 Resource-X retry observations reset on postmaster incarnation only');
 
 $pair->stop_pair;
 

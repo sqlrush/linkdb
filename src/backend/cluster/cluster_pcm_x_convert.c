@@ -35,6 +35,7 @@
 
 #include "port/pg_bitutils.h"
 #include "port/pg_crc32c.h"
+#include "portability/instr_time.h"
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -105,6 +106,10 @@ static void pcm_x_init_free_list(char *base, Size slots_offset, Size slot_size,
 static void pcm_x_init_allocators(PcmXShmemHeader *header);
 static void pcm_x_init_stats(PcmXStats *stats);
 static void pcm_x_stats_increment(pg_atomic_uint64 *counter);
+static void pcm_x_retry_observation_increment(pg_atomic_uint64 *counter);
+static void pcm_x_retry_observation_terminal(PcmXShmemHeader *header,
+	pg_atomic_uint64 *class_counter, uint64 first_submit_mono_us,
+	uint64 terminal_at_mono_us);
 static bool pcm_x_stats_depth_increment(PcmXShmemHeader *header);
 static bool pcm_x_stats_depth_decrement(PcmXShmemHeader *header);
 static bool pcm_x_master_terminal_leg_is_clear(const PcmXReliableLegState *leg);
@@ -852,6 +857,15 @@ pcm_x_init_stats(PcmXStats *stats)
 	pg_atomic_init_u64(&stats->own_busy_count, 0);
 	pg_atomic_init_u64(&stats->own_corrupt_count, 0);
 	pg_atomic_init_u64(&stats->barrier_unwind_count, 0);
+	pg_atomic_init_u64(&stats->retry_producer_due_count, 0);
+	pg_atomic_init_u64(&stats->retry_wire_attempt_count, 0);
+	pg_atomic_init_u64(&stats->retry_transport_rebound_count, 0);
+	pg_atomic_init_u64(&stats->retry_terminal_success_count, 0);
+	pg_atomic_init_u64(&stats->retry_terminal_denied_count, 0);
+	pg_atomic_init_u64(&stats->retry_budget_exhausted_count, 0);
+	pg_atomic_init_u64(&stats->retry_recovery_blocked_count, 0);
+	pg_atomic_init_u64(&stats->retry_terminal_latency_us_count, 0);
+	pg_atomic_init_u64(&stats->retry_terminal_latency_us_max, 0);
 }
 
 
@@ -876,6 +890,118 @@ pcm_x_stats_increment(pg_atomic_uint64 *counter)
 {
 	if (counter != NULL)
 		(void)pg_atomic_fetch_add_u64(counter, 1);
+}
+
+
+static void
+pcm_x_retry_observation_increment(pg_atomic_uint64 *counter)
+{
+	uint64 observed;
+
+	if (counter == NULL)
+		return;
+	observed = pg_atomic_read_u64(counter);
+	while (observed != UINT64_MAX) {
+		uint64 expected = observed;
+
+		if (pg_atomic_compare_exchange_u64(counter, &expected, observed + 1))
+			return;
+		observed = expected;
+	}
+}
+
+
+static void
+pcm_x_retry_observation_terminal(PcmXShmemHeader *header,
+								 pg_atomic_uint64 *class_counter,
+								 uint64 first_submit_mono_us,
+								 uint64 terminal_at_mono_us)
+{
+	uint64 elapsed;
+	uint64 observed;
+
+	if (header == NULL || class_counter == NULL)
+		return;
+	pcm_x_retry_observation_increment(class_counter);
+	if (first_submit_mono_us == 0 || terminal_at_mono_us < first_submit_mono_us)
+		return;
+	pcm_x_retry_observation_increment(&header->stats.retry_terminal_latency_us_count);
+	elapsed = terminal_at_mono_us - first_submit_mono_us;
+	observed = pg_atomic_read_u64(&header->stats.retry_terminal_latency_us_max);
+	while (elapsed > observed) {
+		uint64 expected = observed;
+
+		if (pg_atomic_compare_exchange_u64(
+				&header->stats.retry_terminal_latency_us_max, &expected, elapsed))
+			break;
+		observed = expected;
+	}
+}
+
+
+static uint64
+pcm_x_monotonic_us(void)
+{
+	instr_time now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	return (uint64)INSTR_TIME_GET_MICROSEC(now);
+}
+
+
+static bool
+pcm_x_retry_pending_snapshot(PcmXShmemHeader *header, uint64 now_us,
+							 uint64 *pending_out, uint64 *oldest_age_out)
+{
+	PcmXAllocatorView view;
+	Size i;
+
+	if (header == NULL || pending_out == NULL || oldest_age_out == NULL
+		|| !pcm_x_allocator_entry_unlocked(header)
+		|| !pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_TAG, &view))
+		return false;
+	*pending_out = 0;
+	*oldest_age_out = 0;
+	for (i = 0; i < view.capacity; i++) {
+		PcmXLocalTagSlot *raw = (PcmXLocalTagSlot *)pcm_x_allocator_slot(&view, i);
+		PcmXLocalTagSlot *locked;
+		PcmXSlotRef tag_ref;
+		BufferTag tag;
+		uint64 first_submit;
+		uint64 age;
+		uint32 partition;
+		uint16 phase;
+
+		if (raw == NULL || pcm_x_slot_state_read(&raw->slot) != PCM_X_TAG_LIVE
+			|| !pcm_x_slot_generation_read(&raw->slot, &tag_ref.slot_generation))
+			continue;
+		tag_ref.slot_index = i;
+		tag = raw->tag;
+		pg_read_barrier();
+		partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&tag));
+		pcm_x_local_gate_acquire_guarded(&header->local_locks[partition].lock,
+									 LW_SHARED, NULL);
+		locked = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_LOCAL_TAG, tag_ref, &tag, PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+		if (locked == NULL || resource_x_retry_state_is_clear(&locked->retry_state)) {
+			LWLockRelease(&header->local_locks[partition].lock);
+			continue;
+		}
+		phase = locked->retry_state.last_phase;
+		first_submit = locked->retry_state.first_submit_mono_us;
+		if ((phase != RESOURCE_X_RETRY_PRE_NO_RETURN
+			 && phase != RESOURCE_X_RETRY_POST_NO_RETURN)
+			|| first_submit == 0) {
+			LWLockRelease(&header->local_locks[partition].lock);
+			continue;
+		}
+		age = now_us >= first_submit ? now_us - first_submit : 0;
+		(*pending_out)++;
+		if (age > *oldest_age_out)
+			*oldest_age_out = age;
+		LWLockRelease(&header->local_locks[partition].lock);
+	}
+	return true;
 }
 
 
@@ -934,7 +1060,7 @@ bool
 cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
-	bool allocator_lock_held;
+	uint64 now_us;
 	int i;
 
 	if (snapshot_out == NULL)
@@ -942,10 +1068,11 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 	memset(snapshot_out, 0, sizeof(*snapshot_out));
 	if (header == NULL)
 		return false;
+	if (!pcm_x_allocator_entry_unlocked(header))
+		return false;
 
-	allocator_lock_held = LWLockHeldByMe(&header->allocator_lock.lock);
-	if (!allocator_lock_held)
-		LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	now_us = pcm_x_monotonic_us();
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
 	snapshot_out->enqueue_count = pg_atomic_read_u64(&header->stats.enqueue_count);
 	snapshot_out->admit_count = pg_atomic_read_u64(&header->stats.admit_count);
 	snapshot_out->confirm_count = pg_atomic_read_u64(&header->stats.confirm_count);
@@ -971,6 +1098,24 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 	snapshot_out->own_busy_count = pg_atomic_read_u64(&header->stats.own_busy_count);
 	snapshot_out->own_corrupt_count = pg_atomic_read_u64(&header->stats.own_corrupt_count);
 	snapshot_out->barrier_unwind_count = pg_atomic_read_u64(&header->stats.barrier_unwind_count);
+	snapshot_out->retry_producer_due_count
+		= pg_atomic_read_u64(&header->stats.retry_producer_due_count);
+	snapshot_out->retry_wire_attempt_count
+		= pg_atomic_read_u64(&header->stats.retry_wire_attempt_count);
+	snapshot_out->retry_transport_rebound_count
+		= pg_atomic_read_u64(&header->stats.retry_transport_rebound_count);
+	snapshot_out->retry_terminal_success_count
+		= pg_atomic_read_u64(&header->stats.retry_terminal_success_count);
+	snapshot_out->retry_terminal_denied_count
+		= pg_atomic_read_u64(&header->stats.retry_terminal_denied_count);
+	snapshot_out->retry_budget_exhausted_count
+		= pg_atomic_read_u64(&header->stats.retry_budget_exhausted_count);
+	snapshot_out->retry_recovery_blocked_count
+		= pg_atomic_read_u64(&header->stats.retry_recovery_blocked_count);
+	snapshot_out->retry_terminal_latency_us_count
+		= pg_atomic_read_u64(&header->stats.retry_terminal_latency_us_count);
+	snapshot_out->retry_terminal_latency_us_max
+		= pg_atomic_read_u64(&header->stats.retry_terminal_latency_us_max);
 	snapshot_out->active_tags = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TAG].used;
 	snapshot_out->live_tickets = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TICKET].used;
 	snapshot_out->local_retire_gate = (uint64)pg_atomic_read_u32(&header->local_retire_gate);
@@ -985,8 +1130,28 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 	}
 	for (i = 0; i < PCM_X_ALLOC_COUNT; i++)
 		snapshot_out->live_slots += (uint64)header->allocator[i].used;
-	if (!allocator_lock_held)
-		LWLockRelease(&header->allocator_lock.lock);
+	LWLockRelease(&header->allocator_lock.lock);
+	return pcm_x_retry_pending_snapshot(
+		header, now_us, &snapshot_out->master_grant_delivery_pending_count,
+		&snapshot_out->master_grant_delivery_oldest_age_us);
+}
+
+
+/* Periodic retry logging needs only this O(1) occupancy predicate.  Keep it
+ * separate from the cold exact retry-gauge scan used by pg_cluster_state. */
+bool
+cluster_pcm_x_live_ticket_count(uint64 *count_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (count_out == NULL)
+		return false;
+	*count_out = 0;
+	if (header == NULL || !pcm_x_allocator_entry_unlocked(header))
+		return false;
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	*count_out = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TICKET].used;
+	LWLockRelease(&header->allocator_lock.lock);
 	return true;
 }
 
@@ -1228,6 +1393,26 @@ cluster_pcm_x_stats_note_barrier_unwind(void)
 
 	if (header != NULL)
 		pcm_x_stats_increment(&header->stats.barrier_unwind_count);
+}
+
+
+void
+cluster_pcm_x_stats_note_retry_due(void)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header != NULL)
+		pcm_x_retry_observation_increment(&header->stats.retry_producer_due_count);
+}
+
+
+void
+cluster_pcm_x_stats_note_retry_wire_attempt(void)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+
+	if (header != NULL)
+		pcm_x_retry_observation_increment(&header->stats.retry_wire_attempt_count);
 }
 
 
@@ -10888,6 +11073,8 @@ pcm_x_local_tag_init_common(PcmXLocalTagSlot *tag_slot, const BufferTag *tag, ui
 	tag_slot->transport_session = 0;
 	tag_slot->semantic_generation = 0;
 	resource_x_retry_state_clear(&tag_slot->retry_state);
+	tag_slot->retry_connection_generation = 0;
+	tag_slot->retry_connection_reserved = 0;
 	memset(&tag_slot->holder_ref, 0, sizeof(tag_slot->holder_ref));
 	memset(&tag_slot->holder_image, 0, sizeof(tag_slot->holder_image));
 	tag_slot->holder_required_page_scn = 0;
@@ -17183,6 +17370,11 @@ cluster_pcm_x_local_retry_submission_admitted_exact(
 			*state_out = tag_slot->retry_state;
 		goto submission_done;
 	}
+	if (tag_slot->retry_connection_generation != 0
+		|| tag_slot->retry_connection_reserved != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto submission_done;
+	}
 	if (!resource_x_retry_state_init(&attempt, first_submit_mono_us,
 									 terminal_deadline_mono_us, max_retries,
 									 initial_backoff_ms, 1, &state)) {
@@ -17190,11 +17382,69 @@ cluster_pcm_x_local_retry_submission_admitted_exact(
 		goto submission_done;
 	}
 	tag_slot->retry_state = state;
+	tag_slot->retry_connection_generation = 0;
 	pg_write_barrier();
 	*state_out = state;
 	result = PCM_X_QUEUE_OK;
 
 submission_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (result == PCM_X_QUEUE_CORRUPT)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_retry_transport_seed_exact(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
+	uint32 connection_generation)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	ResourceXAttemptWitness attempt;
+	uint32 partition;
+
+	if (header == NULL || leader == NULL || expected == NULL || connection_generation == 0
+		|| !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_reliable_slots_exact(leader, tag_ref, member_ref, &tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK)
+		goto seed_done;
+	if (!pcm_x_local_reliable_token_exact(expected, tag_slot, member)
+		|| !pcm_x_local_retry_attempt_exact(tag_slot, member, &attempt)
+		|| !resource_x_attempt_matches(&tag_slot->retry_state.attempt, &attempt)) {
+		result = PCM_X_QUEUE_STALE;
+		goto seed_done;
+	}
+	if (tag_slot->retry_connection_reserved != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto seed_done;
+	}
+	if (tag_slot->retry_connection_generation == connection_generation)
+		result = PCM_X_QUEUE_DUPLICATE;
+	else if (tag_slot->retry_connection_generation != 0)
+		result = PCM_X_QUEUE_STALE;
+	else {
+		tag_slot->retry_connection_generation = connection_generation;
+		pg_write_barrier();
+		result = PCM_X_QUEUE_OK;
+	}
+
+seed_done:
 	LWLockRelease(&header->local_locks[partition].lock);
 	if (result == PCM_X_QUEUE_CORRUPT)
 		pcm_x_runtime_fail_closed();
@@ -17217,6 +17467,7 @@ cluster_pcm_x_local_retry_admitted_exact(
 	PcmXQueueResult result;
 	ResourceXAttemptWitness attempt;
 	uint32 partition;
+	bool rebound = false;
 
 	resource_x_retry_state_clear(state_out);
 	if (header == NULL || leader == NULL || expected == NULL || action == NULL
@@ -17244,6 +17495,13 @@ cluster_pcm_x_local_retry_admitted_exact(
 		result = PCM_X_QUEUE_STALE;
 		goto admitted_done;
 	}
+	if (action->transport.cluster_epoch != tag_slot->transport_epoch
+		|| action->transport.peer_session_incarnation != tag_slot->transport_session
+		|| action->transport.connection_generation == 0 || action->transport.flags != 0
+		|| tag_slot->retry_connection_reserved != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto admitted_done;
+	}
 	if (next_retry_due_mono_us < tag_slot->retry_state.first_submit_mono_us
 		|| next_retry_due_mono_us > tag_slot->retry_state.terminal_deadline_mono_us) {
 		result = PCM_X_QUEUE_INVALID;
@@ -17253,19 +17511,115 @@ cluster_pcm_x_local_retry_admitted_exact(
 		|| tag_slot->retry_state.state_generation == PG_UINT32_MAX) {
 		tag_slot->retry_state.last_phase = RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED;
 		pg_write_barrier();
+		pcm_x_retry_observation_terminal(
+			header, &header->stats.retry_recovery_blocked_count,
+			tag_slot->retry_state.first_submit_mono_us, pcm_x_monotonic_us());
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
 		goto admitted_done;
 	}
+	rebound = tag_slot->retry_connection_generation != 0
+		&& tag_slot->retry_connection_generation != action->transport.connection_generation;
 	tag_slot->retry_state.retry_count++;
 	tag_slot->retry_state.state_generation++;
 	tag_slot->retry_state.next_retry_due_mono_us = next_retry_due_mono_us;
+	tag_slot->retry_connection_generation = action->transport.connection_generation;
 	pg_write_barrier();
+	if (rebound)
+		pcm_x_retry_observation_increment(&header->stats.retry_transport_rebound_count);
 	*state_out = tag_slot->retry_state;
 	result = PCM_X_QUEUE_OK;
 
 admitted_done:
 	LWLockRelease(&header->local_locks[partition].lock);
 	if (result == PCM_X_QUEUE_CORRUPT || result == PCM_X_QUEUE_COUNTER_EXHAUSTED)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/* Persist an ambiguous retry classification on the exact retained local
+ * attempt before the runtime gate closes.  The original state bytes remain
+ * available to recovery; only the phase and, where possible, its generation
+ * advance.  A repeated formation tick is an idempotent observation. */
+PcmXQueueResult
+cluster_pcm_x_local_retry_recovery_blocked_exact(
+	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected_token,
+	const ResourceXRetryStateV1 *expected_state, uint64 blocked_at_mono_us,
+	ResourceXRetryStateV1 *blocked_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool unique = false;
+
+	resource_x_retry_state_clear(blocked_out);
+	if (header == NULL || leader == NULL || expected_token == NULL
+		|| expected_state == NULL || blocked_out == NULL || blocked_at_mono_us == 0
+		|| !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_reliable_slots_exact(leader, tag_ref, member_ref,
+										  &tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK)
+		goto blocked_done;
+	if (!pcm_x_local_reliable_leg_valid(tag_slot, member)
+		|| !pcm_x_local_reliable_token_exact(expected_token, tag_slot, member)) {
+		result = PCM_X_QUEUE_STALE;
+		goto blocked_done;
+	}
+	if (resource_x_retry_state_is_clear(&tag_slot->retry_state)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto blocked_done;
+	}
+	if (memcmp(&tag_slot->retry_state, expected_state, sizeof(*expected_state)) != 0) {
+		/* A prior exact transition is replayable even though the caller still
+		 * carries the pre-transition snapshot. */
+		if (tag_slot->retry_state.last_phase
+				== RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED
+			&& resource_x_attempt_matches(&tag_slot->retry_state.attempt,
+									  &expected_state->attempt)) {
+			*blocked_out = tag_slot->retry_state;
+			result = PCM_X_QUEUE_DUPLICATE;
+		} else
+			result = PCM_X_QUEUE_STALE;
+		goto blocked_done;
+	}
+	if (tag_slot->retry_state.last_phase == RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED) {
+		*blocked_out = tag_slot->retry_state;
+		result = PCM_X_QUEUE_DUPLICATE;
+		goto blocked_done;
+	}
+	if (tag_slot->retry_state.last_phase == RESOURCE_X_RETRY_TERMINAL) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto blocked_done;
+	}
+	tag_slot->retry_state.last_phase = RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED;
+	if (tag_slot->retry_state.state_generation != PG_UINT32_MAX)
+		tag_slot->retry_state.state_generation++;
+	pg_write_barrier();
+	*blocked_out = tag_slot->retry_state;
+	unique = true;
+	result = PCM_X_QUEUE_OK;
+
+blocked_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (unique)
+		pcm_x_retry_observation_terminal(
+			header, &header->stats.retry_recovery_blocked_count,
+			blocked_out->first_submit_mono_us, blocked_at_mono_us);
+	if (result == PCM_X_QUEUE_CORRUPT)
 		pcm_x_runtime_fail_closed();
 	return result;
 }
@@ -17385,6 +17739,7 @@ pcm_x_local_retry_terminal_publish_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRe
 	ResourceXRetryStateV1 terminal;
 	ResourceXRetryStateV1 replay;
 	ResourceXTerminalRecordV1 record;
+	ResourceXTerminalReason reason;
 
 	resource_x_retry_state_clear(terminal_out);
 	if (tag_slot == NULL || member == NULL || expected_state == NULL || terminal_out == NULL
@@ -17419,7 +17774,21 @@ pcm_x_local_retry_terminal_publish_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRe
 		return PCM_X_QUEUE_CORRUPT;
 	pg_write_barrier();
 	resource_x_retry_state_clear(&tag_slot->retry_state);
+	tag_slot->retry_connection_generation = 0;
+	tag_slot->retry_connection_reserved = 0;
 	pg_write_barrier();
+	reason = resource_x_terminal_reason_decode(terminal.terminal_errcode);
+	if (reason == RESOURCE_X_TERMINAL_REASON_RETRY_EXHAUSTED)
+		pcm_x_retry_observation_terminal(
+			ClusterPcmXConvertShmem,
+			&ClusterPcmXConvertShmem->stats.retry_budget_exhausted_count,
+			terminal.first_submit_mono_us, terminal_at_mono_us);
+	else if (reason == RESOURCE_X_TERMINAL_REASON_INVALIDATE_TIMEOUT
+			 || reason == RESOURCE_X_TERMINAL_REASON_LOST_WRITE)
+		pcm_x_retry_observation_terminal(
+			ClusterPcmXConvertShmem,
+			&ClusterPcmXConvertShmem->stats.retry_terminal_denied_count,
+			terminal.first_submit_mono_us, terminal_at_mono_us);
 	*terminal_out = terminal;
 	return PCM_X_QUEUE_OK;
 }
@@ -20357,6 +20726,8 @@ cluster_pcm_x_local_retry_terminal_complete_exact(const PcmXLocalHandle *leader,
 	memset(&tag_slot->reliable, 0, sizeof(tag_slot->reliable));
 	tag_slot->reliable.state_sequence = reliable_state_sequence;
 	resource_x_retry_state_clear(&tag_slot->retry_state);
+	tag_slot->retry_connection_generation = 0;
+	tag_slot->retry_connection_reserved = 0;
 	pg_write_barrier();
 	pcm_x_slot_state_write(&member->slot, PCM_XL_CANCELLED);
 	result = PCM_X_QUEUE_OK;
@@ -21451,6 +21822,8 @@ pcm_x_local_reset_holder_only_queue(PcmXLocalTagSlot *tag_slot)
 	tag_slot->transport_session = 0;
 	tag_slot->semantic_generation = 0;
 	resource_x_retry_state_clear(&tag_slot->retry_state);
+	tag_slot->retry_connection_generation = 0;
+	tag_slot->retry_connection_reserved = 0;
 }
 
 
@@ -21535,8 +21908,10 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 	bool retry_terminal_detach = false;
 	bool same_ref_dual = false;
 	bool ready_leader_candidate = false;
+	bool retry_success_observation = false;
 	bool target_in_closed_round;
 	bool close_round = false;
+	uint64 retry_first_submit_mono_us = 0;
 
 	pcm_x_local_handle_clear(promoted_out);
 	pcm_x_local_handle_clear(&promoted);
@@ -21637,6 +22012,22 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		goto detach_local_domain_done;
 	}
 	flags = pcm_x_slot_flags_read(&tag_slot->slot);
+	if (retire_protocol && !resource_x_retry_state_is_clear(&tag_slot->retry_state)) {
+		ResourceXAttemptWitness retry_attempt;
+		uint32 member_state = pcm_x_slot_state_read(&member->slot);
+
+		if (!pcm_x_local_retry_member_attempt_exact(member, &retry_attempt)
+			|| !resource_x_attempt_matches(&tag_slot->retry_state.attempt, &retry_attempt)
+			|| (tag_slot->retry_state.last_phase != RESOURCE_X_RETRY_PRE_NO_RETURN
+				&& tag_slot->retry_state.last_phase != RESOURCE_X_RETRY_POST_NO_RETURN)
+			|| tag_slot->retry_state.first_submit_mono_us == 0
+			|| tag_slot->retry_connection_reserved != 0) {
+			result = PCM_X_QUEUE_CORRUPT;
+			goto detach_local_domain_done;
+		}
+		retry_first_submit_mono_us = tag_slot->retry_state.first_submit_mono_us;
+		retry_success_observation = member_state == PCM_XL_GRANTED;
+	}
 	/* An exact unlinked next-round CANCELLED member detaches by releasing
 	 * only its own membership even while terminal evidence occupies the tag:
 	 * it was never part of the frozen round, so the dual terminals, the
@@ -21815,6 +22206,9 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		 * a new round cannot recreate an old reliable token. */
 		memset(&tag_slot->reliable, 0, sizeof(tag_slot->reliable));
 		tag_slot->reliable.state_sequence = reliable_state_sequence;
+		resource_x_retry_state_clear(&tag_slot->retry_state);
+		tag_slot->retry_connection_generation = 0;
+		tag_slot->retry_connection_reserved = 0;
 		tag_slot->terminal_drain_generation = 0;
 		(void)pcm_x_slot_flags_fetch_and(&tag_slot->slot, ~PCM_X_LOCAL_TAG_F_TERMINAL_MASK);
 	}
@@ -21942,6 +22336,10 @@ detach_local_allocator_done:
 		pcm_x_runtime_fail_closed();
 	if (result == PCM_X_QUEUE_OK && promoted_out != NULL)
 		*promoted_out = promoted;
+	if (result == PCM_X_QUEUE_OK && retry_success_observation)
+		pcm_x_retry_observation_terminal(
+			header, &header->stats.retry_terminal_success_count,
+			retry_first_submit_mono_us, pcm_x_monotonic_us());
 	return result;
 }
 

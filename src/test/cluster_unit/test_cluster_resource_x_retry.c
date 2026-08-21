@@ -74,7 +74,8 @@ UT_TEST(test_retry_state_layout_and_slot_embedding)
 	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, retry_state), 448);
 	UT_ASSERT_EQ(sizeof(PcmXMasterTicketSlot), 520);
 	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, retry_state), 824);
-	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 896);
+	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, retry_connection_generation), 896);
+	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 904);
 }
 
 UT_TEST(test_retry_state_initialization_publishes_exact_attempt)

@@ -71,7 +71,8 @@ sub path_error
 
 sub validate_manifest
 {
-	my ($path) = @_;
+	my ($path, $expected_row_count) = @_;
+	$expected_row_count //= 16;
 	my @errors;
 	my @rows;
 	my $text = slurp($path);
@@ -172,7 +173,7 @@ sub validate_manifest
 		}
 	}
 
-	push @errors, 'ROW_COUNT' unless @rows == 16;
+	push @errors, 'ROW_COUNT' unless @rows == $expected_row_count;
 	return (\@errors, \@rows);
 }
 
@@ -213,12 +214,12 @@ sub has_error
 }
 
 ok(-f $manifest, 'L1 public observation manifest exists');
-my ($manifest_errors, $manifest_rows) = validate_manifest($manifest);
+my ($manifest_errors, $manifest_rows) = validate_manifest($manifest, 27);
 is(scalar(@$manifest_errors), 0,
 	'L2 public manifest satisfies every structural and behavior anchor rule')
 	or diag(join(';', @$manifest_errors));
-is(scalar(@$manifest_rows), 16,
-	'L3 public manifest contains exactly sixteen current observation facts');
+is(scalar(@$manifest_rows), 27,
+	'L3 public manifest contains exactly twenty-seven current observation facts');
 
 my $temporary = tempdir(CLEANUP => 1);
 my $valid_rows = fixture_text();
