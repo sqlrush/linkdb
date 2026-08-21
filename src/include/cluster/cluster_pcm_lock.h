@@ -229,6 +229,59 @@ typedef enum ResourceXIntentResult {
 	RESOURCE_X_INTENT_STALE = 4
 } ResourceXIntentResult;
 
+typedef enum ResourceXIntentProbeResult {
+	RESOURCE_X_INTENT_PROBE_IDLE = 0,
+	RESOURCE_X_INTENT_PROBE_FOUND = 1,
+	RESOURCE_X_INTENT_PROBE_MORE = 2,
+	RESOURCE_X_INTENT_PROBE_COMPLETE = 3,
+	RESOURCE_X_INTENT_PROBE_CORRUPT = 4
+} ResourceXIntentProbeResult;
+
+typedef enum ResourceXIntentState {
+	RESOURCE_X_INTENT_SLOT_EMPTY = 0,
+	RESOURCE_X_INTENT_SLOT_ARMED = 1,
+	RESOURCE_X_INTENT_SLOT_STAGED = 2
+} ResourceXIntentState;
+
+typedef enum ResourceXIntentOwnerKind {
+	RESOURCE_X_INTENT_OWNER_NONE = 0,
+	RESOURCE_X_INTENT_OWNER_MASTER_BLOCK = 1,
+	RESOURCE_X_INTENT_OWNER_MASTER_GRANT = 2,
+	RESOURCE_X_INTENT_OWNER_HOLDER_STATUS = 3,
+	RESOURCE_X_INTENT_OWNER_HOLDER_IMAGE = 4,
+	RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT = 5,
+	RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE = 6
+} ResourceXIntentOwnerKind;
+
+/* This handle is meaningful only together with its resource-scoped owner
+ * record.  It is carried by the LMS physical descriptor but is never a wire
+ * field and never authorizes a global intent lookup. */
+typedef struct ResourceXIntentBodyHandle {
+	ResourceXAssertion assertion;
+	uint64 owner_generation;
+	uint32 owner_node;
+	uint8 owner_kind;
+	uint8 owner_index;
+	uint16 reserved;
+} ResourceXIntentBodyHandle;
+
+typedef struct ResourceXIntentSlot {
+	uint64 logical_generation;
+	uint64 authority_generation;
+	uint64 first_armed_us;
+	uint64 last_attempt_us;
+	uint32 destination_node;
+	uint16 payload_bytes;
+	uint8 kind;
+	uint8 state;
+	ResourceXIntentBodyHandle body;
+} ResourceXIntentSlot;
+
+StaticAssertDecl(sizeof(ResourceXIntentBodyHandle) == 40,
+				 "ResourceXIntentBodyHandle layout must remain 40 bytes");
+StaticAssertDecl(sizeof(ResourceXIntentSlot) == 80,
+				 "ResourceXIntentSlot layout must remain 80 bytes");
+
 typedef enum ResourceXReclaimResult {
 	RESOURCE_X_RECLAIM_NONE = 1,
 	RESOURCE_X_RECLAIM_NONHEAD = 2,
@@ -719,6 +772,39 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_release_x_exact(
 extern ResourceXReclaimResult cluster_pcm_lock_resource_x_reclaim_requester_exact(
 	const BufferTag *tag, int32 dead_node, uint64 dead_formation,
 	ResourceXReclaimWitness *out);
+extern bool cluster_pcm_lock_resource_x_intent_arm_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentBodyHandle *body,
+	uint64 logical_generation, uint64 authority_generation,
+	uint64 now_us, uint32 destination_node, uint16 payload_bytes,
+	ResourceXWireKind kind);
+extern ResourceXIntentResult cluster_pcm_lock_resource_x_intent_not_admitted_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
+	uint64 now_us);
+extern ResourceXIntentResult cluster_pcm_lock_resource_x_intent_stage_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
+	uint64 now_us);
+extern ResourceXIntentResult cluster_pcm_lock_resource_x_intent_hard_rearm_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
+	uint64 now_us);
+extern bool cluster_pcm_lock_resource_x_intent_complete_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
+	void *payload_out, uint16 payload_capacity);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_grant_intent_not_admitted_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us);
+extern ResourceXIntentResult cluster_pcm_lock_resource_x_grant_intent_stage_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us);
+extern bool cluster_pcm_lock_resource_x_grant_intent_complete_exact(
+	const ResourceXIntentSlot *expected);
+extern ResourceXIntentProbeResult
+cluster_pcm_lock_resource_x_grant_intent_probe_exact(
+	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,
+	uint16 payload_capacity, uint32 *examined_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
 extern bool cluster_pcm_lock_resource_x_executor_enter(

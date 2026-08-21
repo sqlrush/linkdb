@@ -460,9 +460,14 @@ extern void cluster_lms_outbound_request_lwlocks(void);
 extern bool cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 										 const void *payload, uint16 payload_len);
 extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type,
-												   uint32 dest_node_id, const void *payload,
-												   uint16 payload_len, uint32 required_capability,
-												   uint32 connection_generation);
+											   uint32 dest_node_id, const void *payload,
+											   uint16 payload_len, uint32 required_capability,
+											   uint32 connection_generation);
+struct ResourceXIntentSlot;
+extern bool cluster_lms_outbound_enqueue_resource_x_intent(
+	int worker_id, const struct ResourceXIntentSlot *intent,
+	uint32 connection_generation, uint64 deadline_us);
+extern int cluster_lms_outbound_resource_x_intent_pump(void);
 struct GcsBlockReplyHeader;
 extern bool cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
 												  const struct GcsBlockReplyHeader *header,

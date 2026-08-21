@@ -90,6 +90,10 @@ cluster_lms_get_shard_master_generation(void)
 	return ut_lms_master_generation;
 }
 
+void
+cluster_lms_wakeup(int worker_id pg_attribute_unused())
+{}
+
 #define FAKE_PCM_MAX_ENTRIES 24
 #define FAKE_PCM_ENTRY_BYTES 1024
 
@@ -1668,9 +1672,13 @@ UT_TEST(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed)
 	BufferTag durable_tag = make_tag(145);
 	BufferTag pi_tag = make_tag(146);
 	ResourceXDecodedFrame assertion;
+	ResourceXDecodedFrame decoded_grant;
 	ResourceXDecodedFrame local_proof;
 	ResourceXDurableProof durable_proof;
+	ResourceXIntentSlot grant_intent;
 	ResourceXMasterSnapshot snapshot;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 grant_bytes[RESOURCE_X_PROOF_V1_BYTES];
 
 	reset_fake_pcm_runtime(4);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
@@ -1733,6 +1741,25 @@ UT_TEST(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed)
 				 RESOURCE_X_DISPOSITION_DURABLE_STORAGE);
 	UT_ASSERT_EQ(snapshot.requester_target_generation, 81);
 	UT_ASSERT_EQ(snapshot.final_authority_generation, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+		&assertion.common.logical_assertion, &grant_intent, grant_bytes,
+		sizeof(grant_bytes)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(grant_intent.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(grant_intent.logical_generation, 41);
+	UT_ASSERT_EQ(grant_intent.authority_generation, 2);
+	UT_ASSERT_EQ(grant_intent.destination_node, 2);
+	UT_ASSERT_EQ(grant_intent.payload_bytes, RESOURCE_X_PROOF_V1_BYTES);
+	UT_ASSERT_EQ(grant_intent.kind, RESOURCE_X_WIRE_AUTHORITY_GRANT);
+	UT_ASSERT_EQ(grant_intent.body.owner_kind,
+		RESOURCE_X_INTENT_OWNER_MASTER_GRANT);
+	UT_ASSERT(resource_x_assertion_equal(&grant_intent.body.assertion,
+		&assertion.common.logical_assertion));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		grant_bytes, sizeof(grant_bytes), &decoded_grant, &reject));
+	UT_ASSERT_EQ(decoded_grant.kind, RESOURCE_X_WIRE_AUTHORITY_GRANT);
+	UT_ASSERT_EQ(decoded_grant.common.authority_generation, 2);
+	UT_ASSERT_EQ(decoded_grant.body.authority_grant.requester_target_generation,
+		81);
 
 	/* A retained PI makes durable storage non-authoritative. */
 	reset_fake_pcm_runtime(4);
@@ -1762,7 +1789,9 @@ UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
 	ResourceXDecodedFrame settlement;
 	ResourceXDecodedFrame release;
 	ResourceXDurableProof durable;
+	ResourceXIntentSlot grant_intent;
 	ResourceXMasterSnapshot snapshot;
+	uint8 grant_bytes[RESOURCE_X_PROOF_V1_BYTES];
 
 	reset_fake_pcm_runtime(4);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
@@ -1794,6 +1823,13 @@ UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable,
 		&snapshot), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.final_authority_generation, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+		&first_assert.common.logical_assertion, &grant_intent, grant_bytes,
+		sizeof(grant_bytes)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_stage_exact(
+		&grant_intent, 101), RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_grant_intent_complete_exact(
+		&grant_intent));
 
 	settlement = make_resource_x_master_frame(
 		RESOURCE_X_WIRE_INSTALL_SETTLEMENT, tag, 1, 1);
@@ -2036,6 +2072,144 @@ UT_TEST(test_resource_x_reconfig_sweep_drives_exact_dead_requester_reclaim)
 		&successor.common.logical_assertion, &snapshot), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_PROOF);
 	UT_ASSERT(cluster_resource_x_reconfig_thaw_exact(&token));
+}
+
+UT_TEST(test_resource_x_intent_retains_logical_owner_across_physical_scarcity)
+{
+	BufferTag tag = make_tag(153);
+	ResourceXIntentBodyHandle handle;
+	ResourceXIntentSlot slot;
+	ResourceXIntentSlot snapshot;
+	ResourceXIntentSlot stale;
+
+	memset(&handle, 0, sizeof(handle));
+	memset(&slot, 0, sizeof(slot));
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &handle.assertion));
+	handle.owner_generation = 41;
+	handle.owner_node = 1;
+	handle.owner_kind = RESOURCE_X_INTENT_OWNER_MASTER_GRANT;
+
+	UT_ASSERT(!cluster_pcm_lock_resource_x_intent_arm_exact(
+		&slot, &handle, 51, 61, 71, 2, RESOURCE_X_CONTROL_V1_BYTES,
+		RESOURCE_X_WIRE_AUTHORITY_GRANT));
+	UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT(cluster_pcm_lock_resource_x_intent_arm_exact(
+		&slot, &handle, 51, 61, 71, 2, RESOURCE_X_PROOF_V1_BYTES,
+		RESOURCE_X_WIRE_AUTHORITY_GRANT));
+	UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(slot.first_armed_us, 71);
+	UT_ASSERT_EQ(slot.last_attempt_us, 0);
+	snapshot = slot;
+	UT_ASSERT(!cluster_pcm_lock_resource_x_intent_arm_exact(
+		&slot, &handle, 51, 61, 72, 3, RESOURCE_X_PROOF_V1_BYTES,
+		RESOURCE_X_WIRE_AUTHORITY_GRANT));
+	UT_ASSERT_EQ(memcmp(&slot, &snapshot, sizeof(slot)), 0);
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_intent_not_admitted_exact(
+		&slot, &snapshot, 73), RESOURCE_X_INTENT_NOT_ADMITTED);
+	UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(slot.last_attempt_us, 73);
+	stale = snapshot;
+	stale.authority_generation++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_intent_stage_exact(&slot, &stale, 74),
+		RESOURCE_X_INTENT_STALE);
+	UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_intent_stage_exact(&slot, &snapshot, 74),
+		RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_STAGED);
+	UT_ASSERT_EQ(slot.last_attempt_us, 74);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_intent_hard_rearm_exact(
+		&slot, &snapshot, 75), RESOURCE_X_INTENT_HARD_REARMED);
+	UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(slot.first_armed_us, 71);
+	UT_ASSERT_EQ(slot.last_attempt_us, 75);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_intent_stage_exact(&slot, &snapshot, 76),
+		RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_intent_complete_exact(&slot, &stale));
+	UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_intent_complete_exact(&slot, &snapshot));
+	UT_ASSERT_EQ(slot.state, RESOURCE_X_INTENT_SLOT_EMPTY);
+	UT_ASSERT_EQ(slot.logical_generation, 0);
+}
+
+UT_TEST(test_resource_x_intent_sparse_probe_rediscovers_exact_rearm)
+{
+	BufferTag tag = make_tag(154);
+	ResourceXDecodedFrame assertion;
+	ResourceXDecodedFrame decoded;
+	ResourceXDurableProof durable;
+	ResourceXIntentProbeResult probe_result = RESOURCE_X_INTENT_PROBE_IDLE;
+	ResourceXIntentSlot intent;
+	ResourceXIntentSlot staged_intent;
+	ResourceXMasterSnapshot snapshot;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+	uint32 examined = 0;
+	int calls;
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(
+		RESOURCE_X_WIRE_ASSERT_X, tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(
+		&assertion, 2, &snapshot), RESOURCE_X_APPLY_APPLIED);
+	memset(&durable, 0, sizeof(durable));
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = 1;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = 41;
+	durable.requester_target_generation = 81;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(
+		&durable, &snapshot), RESOURCE_X_APPLY_APPLIED);
+
+	for (calls = 0; calls < 8; calls++) {
+		probe_result = cluster_pcm_lock_resource_x_grant_intent_probe_exact(
+			1, &intent, payload, sizeof(payload), &examined);
+		UT_ASSERT(examined <= 1);
+		if (probe_result == RESOURCE_X_INTENT_PROBE_FOUND)
+			break;
+		UT_ASSERT_EQ(probe_result, RESOURCE_X_INTENT_PROBE_MORE);
+	}
+	UT_ASSERT_EQ(probe_result, RESOURCE_X_INTENT_PROBE_FOUND);
+	UT_ASSERT_EQ(intent.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(intent.logical_generation, 41);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, payload, sizeof(payload),
+		&decoded, &reject));
+	UT_ASSERT_EQ(decoded.kind, RESOURCE_X_WIRE_AUTHORITY_GRANT);
+	UT_ASSERT_EQ(decoded.common.authority_generation, 2);
+
+	staged_intent = intent;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_stage_exact(
+		&staged_intent, 201), RESOURCE_X_INTENT_STAGED);
+	for (calls = 0; calls < 8; calls++) {
+		probe_result = cluster_pcm_lock_resource_x_grant_intent_probe_exact(
+			1, &intent, payload, sizeof(payload), &examined);
+		UT_ASSERT(examined <= 1);
+		if (probe_result == RESOURCE_X_INTENT_PROBE_COMPLETE)
+			break;
+		UT_ASSERT_EQ(probe_result, RESOURCE_X_INTENT_PROBE_MORE);
+	}
+	UT_ASSERT_EQ(probe_result, RESOURCE_X_INTENT_PROBE_COMPLETE);
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(
+		&staged_intent, 202), RESOURCE_X_INTENT_HARD_REARMED);
+	for (calls = 0; calls < 8; calls++) {
+		probe_result = cluster_pcm_lock_resource_x_grant_intent_probe_exact(
+			1, &intent, payload, sizeof(payload), &examined);
+		UT_ASSERT(examined <= 1);
+		if (probe_result == RESOURCE_X_INTENT_PROBE_FOUND)
+			break;
+		UT_ASSERT_EQ(probe_result, RESOURCE_X_INTENT_PROBE_MORE);
+	}
+	UT_ASSERT_EQ(probe_result, RESOURCE_X_INTENT_PROBE_FOUND);
+	UT_ASSERT_EQ(intent.state, RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(intent.logical_generation, 41);
 }
 
 UT_TEST(test_pcm_grd_convert_queue_placeholder_remains_null)
@@ -3468,7 +3642,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(73);
+	UT_PLAN(79);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -3511,6 +3685,8 @@ main(void)
 	UT_RUN(test_resource_x_reclaim_safe_head_starts_exact_successor);
 	UT_RUN(test_resource_x_reclaim_post_grant_preserves_orphan_evidence);
 	UT_RUN(test_resource_x_reconfig_sweep_drives_exact_dead_requester_reclaim);
+	UT_RUN(test_resource_x_intent_retains_logical_owner_across_physical_scarcity);
+	UT_RUN(test_resource_x_intent_sparse_probe_rediscovers_exact_rearm);
 	UT_RUN(test_pcm_grd_convert_queue_placeholder_remains_null);
 	UT_RUN(test_pcm_real_wait_event_call_sites_are_exercised);
 	UT_RUN(test_pcm_H1_same_node_s_refcount_increments);

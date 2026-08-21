@@ -1158,6 +1158,10 @@ LmsMain(void)
 				cluster_gcs_block_pi_discard_drain();
 			}
 			cluster_gcs_block_pcm_x_image_pump_tick(0);
+			/* R10 C-intent: worker 0 performs the sole bounded semantic
+			 * scan and stages each found owner handle onto its tag shard's
+			 * DATA ring before the normal per-worker drain consumes it. */
+			(void)cluster_lms_outbound_resource_x_intent_pump();
 			(void)cluster_lms_outbound_drain_send(0); /* spec-7.3 D4: worker 0's ring */
 			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
 			 * directives parked by the dispatch handler (bounded, one

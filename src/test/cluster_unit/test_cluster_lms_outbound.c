@@ -66,6 +66,13 @@
 
 UT_DEFINE_GLOBALS();
 
+/* Desired R10 C-intent boundary.  The standalone ring test supplies the
+ * semantic-owner callbacks below and exercises the real ring/drain object. */
+extern bool cluster_lms_outbound_enqueue_resource_x_intent(
+	int worker_id, const ResourceXIntentSlot *intent,
+	uint32 connection_generation, uint64 deadline_us);
+extern int cluster_lms_outbound_resource_x_intent_pump(void);
+
 /* ============================================================
  * PG-runtime stubs.
  * ============================================================ */
@@ -73,6 +80,8 @@ UT_DEFINE_GLOBALS();
 ProcessingMode Mode = NormalProcessing;
 BackendType MyBackendType = B_LMS;
 int cluster_node_id = 0;
+int cluster_lms_workers = 2;
+int cluster_gcs_reply_timeout_ms = 5000;
 static PcmXRuntimeState ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
 static bool ut_write_fence_enforcing = false;
 static bool ut_write_fence_allowed = true;
@@ -80,6 +89,130 @@ static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
 static uint32 ut_peer_cap_generation[CLUSTER_MAX_NODES];
 static int ut_pcm_x_boundary_note_count = 0;
 static uint8 ut_pcm_x_boundary_msg_types[8];
+static ResourceXIntentSlot ut_resource_x_owner_slot;
+static uint8 ut_resource_x_owner_payload[RESOURCE_X_PROOF_V1_BYTES];
+static int ut_resource_x_stage_count = 0;
+static int ut_resource_x_rearm_count = 0;
+static int ut_resource_x_complete_count = 0;
+static ResourceXIntentProbeResult ut_resource_x_probe_mode
+	= RESOURCE_X_INTENT_PROBE_IDLE;
+static int ut_resource_x_probe_call_count = 0;
+static uint32 ut_resource_x_probe_max_budget = 0;
+
+static bool
+ut_resource_x_intent_identity_equal(const ResourceXIntentSlot *left,
+									const ResourceXIntentSlot *right)
+{
+	return left != NULL && right != NULL
+		&& left->logical_generation == right->logical_generation
+		&& left->authority_generation == right->authority_generation
+		&& left->first_armed_us == right->first_armed_us
+		&& left->destination_node == right->destination_node
+		&& left->payload_bytes == right->payload_bytes
+		&& left->kind == right->kind
+		&& memcmp(&left->body, &right->body, sizeof(left->body)) == 0;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
+	void *payload_out, uint16 payload_capacity)
+{
+	if (assertion == NULL || slot_out == NULL || payload_out == NULL
+		|| payload_capacity < RESOURCE_X_PROOF_V1_BYTES
+		|| ut_resource_x_owner_slot.state == RESOURCE_X_INTENT_SLOT_EMPTY)
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	if (memcmp(assertion, &ut_resource_x_owner_slot.body.assertion,
+			   sizeof(*assertion)) != 0)
+		return RESOURCE_X_APPLY_STALE;
+	*slot_out = ut_resource_x_owner_slot;
+	memcpy(payload_out, ut_resource_x_owner_payload,
+		   RESOURCE_X_PROOF_V1_BYTES);
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_grant_intent_stage_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us)
+{
+	if (now_us == 0
+		|| !ut_resource_x_intent_identity_equal(
+			expected, &ut_resource_x_owner_slot)
+		|| ut_resource_x_owner_slot.state != RESOURCE_X_INTENT_SLOT_ARMED)
+		return RESOURCE_X_INTENT_STALE;
+	ut_resource_x_owner_slot.state = RESOURCE_X_INTENT_SLOT_STAGED;
+	ut_resource_x_owner_slot.last_attempt_us = now_us;
+	ut_resource_x_stage_count++;
+	return RESOURCE_X_INTENT_STAGED;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_grant_intent_not_admitted_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us)
+{
+	if (now_us == 0
+		|| !ut_resource_x_intent_identity_equal(
+			expected, &ut_resource_x_owner_slot)
+		|| ut_resource_x_owner_slot.state != RESOURCE_X_INTENT_SLOT_ARMED)
+		return RESOURCE_X_INTENT_STALE;
+	ut_resource_x_owner_slot.last_attempt_us = now_us;
+	return RESOURCE_X_INTENT_NOT_ADMITTED;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us)
+{
+	if (now_us == 0
+		|| !ut_resource_x_intent_identity_equal(
+			expected, &ut_resource_x_owner_slot)
+		|| ut_resource_x_owner_slot.state != RESOURCE_X_INTENT_SLOT_STAGED)
+		return RESOURCE_X_INTENT_STALE;
+	ut_resource_x_owner_slot.state = RESOURCE_X_INTENT_SLOT_ARMED;
+	ut_resource_x_owner_slot.last_attempt_us = now_us;
+	ut_resource_x_rearm_count++;
+	return RESOURCE_X_INTENT_HARD_REARMED;
+}
+
+bool
+cluster_pcm_lock_resource_x_grant_intent_complete_exact(
+	const ResourceXIntentSlot *expected)
+{
+	if (!ut_resource_x_intent_identity_equal(
+			expected, &ut_resource_x_owner_slot)
+		|| ut_resource_x_owner_slot.state != RESOURCE_X_INTENT_SLOT_STAGED)
+		return false;
+	memset(&ut_resource_x_owner_slot, 0,
+		   sizeof(ut_resource_x_owner_slot));
+	ut_resource_x_complete_count++;
+	return true;
+}
+
+ResourceXIntentProbeResult
+cluster_pcm_lock_resource_x_grant_intent_probe_exact(
+	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,
+	uint16 payload_capacity, uint32 *examined_out)
+{
+	ut_resource_x_probe_call_count++;
+	if (probe_budget > ut_resource_x_probe_max_budget)
+		ut_resource_x_probe_max_budget = probe_budget;
+	if (slot_out != NULL)
+		memset(slot_out, 0, sizeof(*slot_out));
+	if (examined_out != NULL)
+		*examined_out = 0;
+	if (slot_out == NULL || payload_out == NULL || examined_out == NULL
+		|| payload_capacity < RESOURCE_X_PROOF_V1_BYTES)
+		return RESOURCE_X_INTENT_PROBE_CORRUPT;
+	if (ut_resource_x_probe_mode == RESOURCE_X_INTENT_PROBE_FOUND) {
+		*slot_out = ut_resource_x_owner_slot;
+		memcpy(payload_out, ut_resource_x_owner_payload,
+			   RESOURCE_X_PROOF_V1_BYTES);
+		*examined_out = 1;
+		ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_COMPLETE;
+		return RESOURCE_X_INTENT_PROBE_FOUND;
+	}
+	return ut_resource_x_probe_mode;
+}
 
 void
 cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary, int result,
@@ -111,6 +244,41 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_cap
 		return false;
 	return (ut_peer_capabilities[peer_id] & required_capabilities) == required_capabilities
 		   && ut_peer_cap_generation[peer_id] == expected_generation;
+}
+
+bool
+cluster_sf_peer_capability_word_sample(int32 peer_id,
+	uint32 required_capabilities, uint32 *capability_word_out,
+	uint32 *generation_out)
+{
+	if (capability_word_out != NULL)
+		*capability_word_out = 0;
+	if (generation_out != NULL)
+		*generation_out = 0;
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
+		|| required_capabilities == 0
+		|| (ut_peer_capabilities[peer_id] & required_capabilities)
+			   != required_capabilities)
+		return false;
+	if (capability_word_out != NULL)
+		*capability_word_out = ut_peer_capabilities[peer_id];
+	if (generation_out != NULL)
+		*generation_out = ut_peer_cap_generation[peer_id];
+	return true;
+}
+
+int
+cluster_lms_shard_for_tag(const BufferTag *tag, int n_workers)
+{
+	UT_ASSERT(tag != NULL);
+	UT_ASSERT(n_workers > 0 && n_workers <= CLUSTER_LMS_MAX_WORKERS);
+	return (int)(tag->blockNum % (BlockNumber)n_workers);
+}
+
+uint32
+cluster_ic_local_capability_word(void)
+{
+	return UINT32_MAX;
 }
 
 PcmXRuntimeSnapshot
@@ -378,6 +546,16 @@ ut_reset_log(void)
 	memset(ut_peer_capabilities, 0, sizeof(ut_peer_capabilities));
 	memset(ut_peer_cap_generation, 0, sizeof(ut_peer_cap_generation));
 	memset(ut_sent_log, 0, sizeof(ut_sent_log));
+	memset(&ut_resource_x_owner_slot, 0,
+		   sizeof(ut_resource_x_owner_slot));
+	memset(ut_resource_x_owner_payload, 0,
+		   sizeof(ut_resource_x_owner_payload));
+	ut_resource_x_stage_count = 0;
+	ut_resource_x_rearm_count = 0;
+	ut_resource_x_complete_count = 0;
+	ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_IDLE;
+	ut_resource_x_probe_call_count = 0;
+	ut_resource_x_probe_max_budget = 0;
 }
 
 static bool
@@ -407,6 +585,33 @@ ut_r4_refusal_header(GcsBlockReplyStatus status, uint64 page_lsn)
 	header.status = (uint8)status;
 	GcsBlockReplyHeaderSetForwardingMasterNode(&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	return header;
+}
+
+static ResourceXIntentSlot
+ut_resource_x_grant_intent(int32 destination_node)
+{
+	ResourceXIntentSlot intent;
+	BufferTag tag;
+
+	memset(&intent, 0, sizeof(intent));
+	memset(&tag, 0, sizeof(tag));
+	tag.spcOid = 11;
+	tag.dbOid = 12;
+	tag.relNumber = 13;
+	tag.blockNum = 15;
+	intent.body.assertion.resource = tag;
+	intent.body.assertion.requester_node = destination_node;
+	intent.logical_generation = 41;
+	intent.authority_generation = 42;
+	intent.first_armed_us = 43;
+	intent.destination_node = (uint32)destination_node;
+	intent.payload_bytes = RESOURCE_X_PROOF_V1_BYTES;
+	intent.kind = RESOURCE_X_WIRE_AUTHORITY_GRANT;
+	intent.state = RESOURCE_X_INTENT_SLOT_ARMED;
+	intent.body.owner_generation = 42;
+	intent.body.owner_node = 0;
+	intent.body.owner_kind = RESOURCE_X_INTENT_OWNER_MASTER_GRANT;
+	return intent;
 }
 
 /* ============================================================
@@ -833,10 +1038,145 @@ UT_TEST(test_cap_bound_frame_sends_on_exact_connection_capability)
 	UT_ASSERT_EQ(ut_cap_guard_drop_count, 0);
 }
 
+UT_TEST(test_resource_x_intent_admission_stages_and_completion_clears_owner)
+{
+	ResourceXIntentSlot intent;
+
+	ut_reset_log();
+	intent = ut_resource_x_grant_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = intent;
+	ut_resource_x_owner_payload[0] = 0xA6;
+	ut_peer_capabilities[UT_PEER_X]
+		= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 77;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+
+	UT_ASSERT(cluster_lms_outbound_enqueue_resource_x_intent(
+		0, &intent, 77, UINT64_MAX));
+	UT_ASSERT_EQ(ut_resource_x_stage_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+		RESOURCE_X_INTENT_SLOT_STAGED);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].msg_type, RESOURCE_X_MSG_IMAGE_OR_GRANT);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len, RESOURCE_X_PROOF_V1_BYTES);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xA6);
+	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+		RESOURCE_X_INTENT_SLOT_EMPTY);
+}
+
+UT_TEST(test_resource_x_intent_transport_refusal_rearms_without_ring_copy)
+{
+	ResourceXIntentSlot intent;
+
+	ut_reset_log();
+	intent = ut_resource_x_grant_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = intent;
+	ut_resource_x_owner_payload[0] = 0xA7;
+	ut_peer_capabilities[UT_PEER_X]
+		= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 78;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+
+	UT_ASSERT(cluster_lms_outbound_enqueue_resource_x_intent(
+		0, &intent, 78, UINT64_MAX));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_resource_x_rearm_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+		RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT_EQ(ut_resource_x_complete_count, 0);
+}
+
+UT_TEST(test_resource_x_intent_capability_drift_rearms_before_send)
+{
+	ResourceXIntentSlot intent;
+
+	ut_reset_log();
+	intent = ut_resource_x_grant_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = intent;
+	ut_peer_capabilities[UT_PEER_X]
+		= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 79;
+	UT_ASSERT(cluster_lms_outbound_enqueue_resource_x_intent(
+		0, &intent, 79, UINT64_MAX));
+	ut_peer_cap_generation[UT_PEER_X] = 80;
+
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_resource_x_rearm_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+		RESOURCE_X_INTENT_SLOT_ARMED);
+}
+
+UT_TEST(test_resource_x_intent_physical_deadline_rearms_before_send)
+{
+	ResourceXIntentSlot intent;
+
+	ut_reset_log();
+	intent = ut_resource_x_grant_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = intent;
+	ut_peer_capabilities[UT_PEER_X]
+		= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 81;
+	UT_ASSERT(cluster_lms_outbound_enqueue_resource_x_intent(
+		0, &intent, 81, 1));
+
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_resource_x_rearm_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+		RESOURCE_X_INTENT_SLOT_ARMED);
+}
+
+UT_TEST(test_resource_x_intent_pump_stages_found_owner_on_tag_shard)
+{
+	ResourceXIntentSlot intent;
+	int worker_id;
+
+	ut_reset_log();
+	intent = ut_resource_x_grant_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = intent;
+	ut_resource_x_owner_payload[0] = 0xA8;
+	ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_FOUND;
+	ut_peer_capabilities[UT_PEER_X]
+		= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 82;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	worker_id = cluster_lms_shard_for_tag(
+		&intent.body.assertion.resource, cluster_lms_workers);
+
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 1);
+	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 2);
+	UT_ASSERT_EQ(ut_resource_x_probe_max_budget, 4);
+	UT_ASSERT_EQ(ut_resource_x_stage_count, 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xA8);
+	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
+}
+
+UT_TEST(test_resource_x_intent_pump_is_bounded_to_sixteen_four_probes)
+{
+	ut_reset_log();
+	ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_MORE;
+
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 16);
+	UT_ASSERT_EQ(ut_resource_x_probe_max_budget, 4);
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(24);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
@@ -856,6 +1196,12 @@ main(void)
 	UT_RUN(test_cap_bound_frame_drops_on_connection_generation_drift);
 	UT_RUN(test_cap_bound_frame_drops_on_capability_downgrade);
 	UT_RUN(test_cap_bound_frame_sends_on_exact_connection_capability);
+	UT_RUN(test_resource_x_intent_admission_stages_and_completion_clears_owner);
+	UT_RUN(test_resource_x_intent_transport_refusal_rearms_without_ring_copy);
+	UT_RUN(test_resource_x_intent_capability_drift_rearms_before_send);
+	UT_RUN(test_resource_x_intent_physical_deadline_rearms_before_send);
+	UT_RUN(test_resource_x_intent_pump_stages_found_owner_on_tag_shard);
+	UT_RUN(test_resource_x_intent_pump_is_bounded_to_sixteen_four_probes);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

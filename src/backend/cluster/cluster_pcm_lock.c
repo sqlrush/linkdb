@@ -49,6 +49,7 @@
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "port/atomics.h"	   /* PGRAC: spec-2.30 D1 — pg_atomic_uint32/64 */
+#include "portability/instr_time.h"
 #include "storage/backendid.h" /* PGRAC: spec-6.14 D9 amend — no-backend-identity guard */
 #include "storage/buf_internals.h"
 #include "storage/condition_variable.h" /* PGRAC: spec-2.31 D1 — wait_cv */
@@ -355,16 +356,24 @@ typedef struct ClusterPcmResourceXMasterRequest {
 	uint8 reserved;
 } ClusterPcmResourceXMasterRequest;
 
+typedef struct ClusterPcmResourceXControlIntent {
+	ResourceXIntentSlot slot;
+	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
+} ClusterPcmResourceXControlIntent;
+
 typedef struct ClusterPcmResourceXMasterState {
 	uint64 authority_generation;
 	uint64 next_enqueue_order;
 	ClusterPcmResourceXMasterRequest requests[RESOURCE_X_PROTOCOL_NODE_LIMIT];
+	ClusterPcmResourceXControlIntent grant_intent;
 } ClusterPcmResourceXMasterState;
 
 StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 328,
 				 "Resource-X master request layout must remain 328 bytes");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 10512,
-				 "Resource-X master state layout must remain 10512 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXControlIntent) == 392,
+				 "Resource-X control intent layout must remain 392 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 10904,
+				 "Resource-X master state layout must remain 10904 bytes");
 
 typedef struct ClusterPcmShared {
 	LWLockPadded htab_lock;
@@ -395,6 +404,12 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 resource_x_reconfig_reclaim_head_count;
 	pg_atomic_uint64 resource_x_reconfig_reclaim_orphan_count;
 	pg_atomic_uint64 resource_x_reconfig_slot_count;
+	pg_atomic_uint64 resource_x_intent_arm_generation;
+	pg_atomic_uint64 resource_x_intent_scan_generation;
+	pg_atomic_uint64 resource_x_intent_completed_generation;
+	pg_atomic_uint64 resource_x_intent_next_state_index;
+	pg_atomic_uint32 resource_x_intent_generation_exhausted;
+	uint32 resource_x_intent_generation_pad;
 	pg_atomic_uint64 trans_n_to_s_count;
 	pg_atomic_uint64 trans_n_to_x_count;
 	pg_atomic_uint64 trans_s_to_x_upgrade_count;
@@ -1427,6 +1442,188 @@ cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *out)
 		&ClusterPcm->resource_x_reconfig_reclaim_head_count);
 	out->reclaim_orphan_count = pg_atomic_read_u64(
 		&ClusterPcm->resource_x_reconfig_reclaim_orphan_count);
+}
+
+static bool
+pcm_resource_x_intent_body_valid(const ResourceXIntentBodyHandle *body)
+{
+	if (body == NULL || !resource_x_assertion_valid(&body->assertion)
+		|| body->owner_generation == 0 || body->owner_generation == UINT64_MAX
+		|| body->owner_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| body->owner_kind < RESOURCE_X_INTENT_OWNER_MASTER_BLOCK
+		|| body->owner_kind > RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE
+		|| body->reserved != 0)
+		return false;
+	if (body->owner_kind == RESOURCE_X_INTENT_OWNER_MASTER_BLOCK)
+		return body->owner_index < RESOURCE_X_PROTOCOL_NODE_LIMIT;
+	return body->owner_index == 0;
+}
+
+static bool
+pcm_resource_x_intent_mark_dirty(void)
+{
+	uint64 generation;
+
+	if (ClusterPcm == NULL)
+		return false;
+	generation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_intent_arm_generation);
+	for (;;) {
+		if (generation == UINT64_MAX) {
+			pg_atomic_write_u32(
+				&ClusterPcm->resource_x_intent_generation_exhausted, 1);
+			return false;
+		}
+		if (pg_atomic_compare_exchange_u64(
+				&ClusterPcm->resource_x_intent_arm_generation,
+				&generation, generation + 1)) {
+			cluster_lms_wakeup(0);
+			return true;
+		}
+	}
+}
+
+static bool
+pcm_resource_x_intent_payload_exact(ResourceXWireKind kind,
+									uint16 payload_bytes)
+{
+	switch (kind) {
+		case RESOURCE_X_WIRE_ASSERT_X:
+		case RESOURCE_X_WIRE_BLOCK_TO_N:
+		case RESOURCE_X_WIRE_RELEASE_X:
+			return payload_bytes == RESOURCE_X_CONTROL_V1_BYTES;
+		case RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION:
+		case RESOURCE_X_WIRE_INSTALL_SETTLEMENT:
+			return payload_bytes == RESOURCE_X_SHORT_V1_BYTES;
+		case RESOURCE_X_WIRE_BLOCKED_TO_N:
+			return payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
+				|| payload_bytes == RESOURCE_X_PROOF_V1_BYTES;
+		case RESOURCE_X_WIRE_AUTHORITY_GRANT:
+			return payload_bytes == RESOURCE_X_PROOF_V1_BYTES;
+		case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
+			return payload_bytes == RESOURCE_X_IMAGE_V1_BYTES;
+	}
+	return false;
+}
+
+bool
+cluster_pcm_lock_resource_x_intent_arm_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentBodyHandle *body,
+	uint64 logical_generation, uint64 authority_generation,
+	uint64 now_us, uint32 destination_node, uint16 payload_bytes,
+	ResourceXWireKind kind)
+{
+	if (slot == NULL || !pcm_resource_x_intent_body_valid(body)
+		|| logical_generation == 0 || logical_generation == UINT64_MAX
+		|| authority_generation == 0 || authority_generation == UINT64_MAX
+		|| now_us == 0 || now_us == UINT64_MAX
+		|| destination_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| !pcm_resource_x_intent_payload_exact(kind, payload_bytes))
+		return false;
+	if (slot->state != RESOURCE_X_INTENT_SLOT_EMPTY)
+		return slot->logical_generation == logical_generation
+			&& slot->authority_generation == authority_generation
+			&& slot->destination_node == destination_node
+			&& slot->payload_bytes == payload_bytes
+			&& slot->kind == (uint8)kind
+			&& memcmp(&slot->body, body, sizeof(*body)) == 0;
+
+	memset(slot, 0, sizeof(*slot));
+	slot->logical_generation = logical_generation;
+	slot->authority_generation = authority_generation;
+	slot->first_armed_us = now_us;
+	slot->destination_node = destination_node;
+	slot->payload_bytes = payload_bytes;
+	slot->kind = (uint8)kind;
+	slot->state = RESOURCE_X_INTENT_SLOT_ARMED;
+	slot->body = *body;
+	return true;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_intent_not_admitted_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
+	uint64 now_us)
+{
+	if (slot == NULL || expected == NULL || now_us == 0
+		|| now_us == UINT64_MAX
+		|| slot->logical_generation != expected->logical_generation
+		|| slot->authority_generation != expected->authority_generation
+		|| slot->first_armed_us != expected->first_armed_us
+		|| slot->destination_node != expected->destination_node
+		|| slot->payload_bytes != expected->payload_bytes
+		|| slot->kind != expected->kind
+		|| memcmp(&slot->body, &expected->body, sizeof(slot->body)) != 0
+		|| slot->state != RESOURCE_X_INTENT_SLOT_ARMED)
+		return RESOURCE_X_INTENT_STALE;
+	slot->last_attempt_us = now_us;
+	return RESOURCE_X_INTENT_NOT_ADMITTED;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_intent_stage_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
+	uint64 now_us)
+{
+	if (slot == NULL || expected == NULL || now_us == 0
+		|| now_us == UINT64_MAX
+		|| slot->logical_generation != expected->logical_generation
+		|| slot->authority_generation != expected->authority_generation
+		|| slot->first_armed_us != expected->first_armed_us
+		|| slot->destination_node != expected->destination_node
+		|| slot->payload_bytes != expected->payload_bytes
+		|| slot->kind != expected->kind
+		|| memcmp(&slot->body, &expected->body, sizeof(slot->body)) != 0)
+		return RESOURCE_X_INTENT_STALE;
+	if (slot->state == RESOURCE_X_INTENT_SLOT_STAGED)
+		return RESOURCE_X_INTENT_STAGED;
+	if (slot->state != RESOURCE_X_INTENT_SLOT_ARMED)
+		return RESOURCE_X_INTENT_STALE;
+	slot->last_attempt_us = now_us;
+	slot->state = RESOURCE_X_INTENT_SLOT_STAGED;
+	return RESOURCE_X_INTENT_STAGED;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_intent_hard_rearm_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
+	uint64 now_us)
+{
+	if (slot == NULL || expected == NULL || now_us == 0
+		|| now_us == UINT64_MAX
+		|| slot->logical_generation != expected->logical_generation
+		|| slot->authority_generation != expected->authority_generation
+		|| slot->first_armed_us != expected->first_armed_us
+		|| slot->destination_node != expected->destination_node
+		|| slot->payload_bytes != expected->payload_bytes
+		|| slot->kind != expected->kind
+		|| memcmp(&slot->body, &expected->body, sizeof(slot->body)) != 0)
+		return RESOURCE_X_INTENT_STALE;
+	if (slot->state == RESOURCE_X_INTENT_SLOT_ARMED)
+		return RESOURCE_X_INTENT_HARD_REARMED;
+	if (slot->state != RESOURCE_X_INTENT_SLOT_STAGED)
+		return RESOURCE_X_INTENT_STALE;
+	slot->last_attempt_us = now_us;
+	slot->state = RESOURCE_X_INTENT_SLOT_ARMED;
+	return RESOURCE_X_INTENT_HARD_REARMED;
+}
+
+bool
+cluster_pcm_lock_resource_x_intent_complete_exact(
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected)
+{
+	if (slot == NULL || expected == NULL
+		|| slot->logical_generation != expected->logical_generation
+		|| slot->authority_generation != expected->authority_generation
+		|| slot->first_armed_us != expected->first_armed_us
+		|| slot->destination_node != expected->destination_node
+		|| slot->payload_bytes != expected->payload_bytes
+		|| slot->kind != expected->kind
+		|| memcmp(&slot->body, &expected->body, sizeof(slot->body)) != 0
+		|| slot->state != RESOURCE_X_INTENT_SLOT_STAGED)
+		return false;
+	memset(slot, 0, sizeof(*slot));
+	return true;
 }
 
 static bool
@@ -4825,6 +5022,11 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_reclaim_head_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_reclaim_orphan_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->resource_x_reconfig_slot_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_intent_arm_generation, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_intent_scan_generation, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_intent_completed_generation, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_intent_next_state_index, 0);
+		pg_atomic_init_u32(&ClusterPcm->resource_x_intent_generation_exhausted, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_n_to_s_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_n_to_x_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_upgrade_count, 0);
@@ -5239,12 +5441,103 @@ pcm_resource_x_remote_proof_valid(const ResourceXDecodedFrame *frame)
 	return true;
 }
 
+static uint64
+pcm_resource_x_monotonic_us(void)
+{
+	instr_time now;
+
+	INSTR_TIME_SET_CURRENT(now);
+	return (uint64)INSTR_TIME_GET_MICROSEC(now);
+}
+
+static ResourceXApplyResult
+pcm_resource_x_build_authority_grant_locked(
+	struct GrdEntry *entry, const ClusterPcmResourceXMasterRequest *request,
+	int32 requester_node, uint64 final_authority_generation,
+	ResourceXDecodedFrame *out)
+{
+	ResourceXDecodedAuthorityGrant *grant;
+	uint64 requester_connection_generation;
+
+	Assert(entry != NULL);
+	Assert(request != NULL);
+	Assert(out != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	memset(out, 0, sizeof(*out));
+	requester_connection_generation
+		= request->requester_connection_generation != 0
+		? request->requester_connection_generation
+		: (uint64)request->sender_connection_generation;
+	if (final_authority_generation == 0
+		|| request->requester_target_generation == 0
+		|| requester_connection_generation == 0
+		|| request->proof_kind < RESOURCE_X_PROOF_KIND_MIN
+		|| request->proof_kind > RESOURCE_X_PROOF_KIND_MAX
+		|| request->dependency_count > RESOURCE_X_DEPENDENCY_MAX
+		|| (request->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER
+			&& (request->source_carrier_generation == 0
+				|| request->source_disposition
+					   != RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE))
+		|| (request->proof_kind == RESOURCE_X_PROOF_LOCAL_IMAGE
+			&& request->source_disposition
+				   != RESOURCE_X_DISPOSITION_LOCAL_IMAGE)
+		|| (request->proof_kind == RESOURCE_X_PROOF_DURABLE_STORAGE
+			&& request->source_disposition
+				   != RESOURCE_X_DISPOSITION_DURABLE_STORAGE))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	out->kind = RESOURCE_X_WIRE_AUTHORITY_GRANT;
+	out->payload_bytes = RESOURCE_X_PROOF_V1_BYTES;
+	out->common.logical_assertion.resource = entry->tag;
+	out->common.logical_assertion.requester_node = requester_node;
+	out->common.base_authority_generation = request->base_authority_generation;
+	out->common.resource_formation = request->resource_formation;
+	out->common.master_session_incarnation
+		= request->master_session_incarnation;
+	out->common.assertion_sequence = request->assertion_sequence;
+	out->common.ordered_lane = request->ordered_lane;
+	out->common.action_node = requester_node;
+	out->common.observed_mode = (uint8)PCM_STATE_N;
+	out->common.target_mode = (uint8)PCM_STATE_X;
+	out->common.sender_connection_generation
+		= request->sender_connection_generation;
+	out->common.outcome = RESOURCE_X_OUTCOME_OK;
+	if (request->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER)
+		out->common.flags = RESOURCE_X_COMMON_FLAG_REMOTE_IMAGE_REQUIRED;
+	out->common.authority_generation = final_authority_generation;
+	grant = &out->body.authority_grant;
+	memcpy(grant->source_fence, request->source_fence,
+		   sizeof(grant->source_fence));
+	grant->final_authority_generation = final_authority_generation;
+	grant->source_carrier_generation = request->source_carrier_generation;
+	grant->requester_target_generation = request->requester_target_generation;
+	grant->page_scn_lsn = request->page_scn_lsn;
+	grant->dependency_count = request->dependency_count;
+	memcpy(grant->dependencies, request->dependencies,
+		   sizeof(grant->dependencies));
+	grant->source_proof_crc32c = request->source_proof_crc32c;
+	grant->page_checksum = request->page_checksum;
+	grant->proof_kind = request->proof_kind;
+	grant->source_disposition = request->source_disposition;
+	grant->requester_connection_generation
+		= requester_connection_generation;
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
 static ResourceXApplyResult
 pcm_resource_x_commit_grant_locked(struct GrdEntry *entry,
 							  ClusterPcmResourceXMasterState *state,
 							  ClusterPcmResourceXMasterRequest *request,
 							  int32 requester_node)
 {
+	ResourceXDecodedFrame grant;
+	ResourceXIntentBodyHandle body;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint64 final_authority_generation;
+	uint64 now_us;
+	uint16 payload_len = 0;
+	ResourceXApplyResult build_result;
+
 	Assert(entry != NULL);
 	Assert(state != NULL);
 	Assert(request != NULL);
@@ -5256,8 +5549,43 @@ pcm_resource_x_commit_grant_locked(struct GrdEntry *entry,
 		request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	state->authority_generation++;
-	request->final_authority_generation = state->authority_generation;
+	if (state->grant_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+		|| cluster_node_id < 0
+		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT) {
+		request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	final_authority_generation = state->authority_generation + 1;
+	build_result = pcm_resource_x_build_authority_grant_locked(
+		entry, request, requester_node, final_authority_generation, &grant);
+	if (build_result != RESOURCE_X_APPLY_APPLIED
+		|| !cluster_resource_x_wire_encode(
+			RESOURCE_X_MSG_IMAGE_OR_GRANT, &grant,
+			state->grant_intent.payload, sizeof(state->grant_intent.payload),
+			&payload_len, &reject)
+		|| payload_len != RESOURCE_X_PROOF_V1_BYTES) {
+		memset(&state->grant_intent, 0, sizeof(state->grant_intent));
+		request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
+		return build_result == RESOURCE_X_APPLY_APPLIED
+			? RESOURCE_X_APPLY_RECOVERY_BLOCKED : build_result;
+	}
+	memset(&body, 0, sizeof(body));
+	body.assertion = grant.common.logical_assertion;
+	body.owner_generation = final_authority_generation;
+	body.owner_node = (uint32)cluster_node_id;
+	body.owner_kind = RESOURCE_X_INTENT_OWNER_MASTER_GRANT;
+	now_us = pcm_resource_x_monotonic_us();
+	if (!cluster_pcm_lock_resource_x_intent_arm_exact(
+			&state->grant_intent.slot, &body, request->assertion_sequence,
+			final_authority_generation, now_us, (uint32)requester_node,
+			payload_len, RESOURCE_X_WIRE_AUTHORITY_GRANT)
+		|| !pcm_resource_x_intent_mark_dirty()) {
+		memset(&state->grant_intent, 0, sizeof(state->grant_intent));
+		request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	state->authority_generation = final_authority_generation;
+	request->final_authority_generation = final_authority_generation;
 	request->phase = RESOURCE_X_MASTER_GRANT_COMMITTED;
 	entry->pending_x_requester_node = requester_node;
 	entry->pending_x_since_lsn = request->final_authority_generation;
@@ -5837,9 +6165,8 @@ cluster_pcm_lock_resource_x_authority_grant_exact(
 {
 	ClusterPcmResourceXMasterState *state;
 	ClusterPcmResourceXMasterRequest *request;
-	ResourceXDecodedAuthorityGrant *grant;
 	struct GrdEntry *entry;
-	uint64 requester_connection_generation;
+	ResourceXApplyResult result;
 	int32 requester_node;
 
 	if (out != NULL)
@@ -5861,67 +6188,278 @@ cluster_pcm_lock_resource_x_authority_grant_exact(
 		LWLockRelease(&entry->entry_lock.lock);
 		return RESOURCE_X_APPLY_NOT_FOUND;
 	}
-	requester_connection_generation
-		= request->requester_connection_generation != 0
-		? request->requester_connection_generation
-		: (uint64)request->sender_connection_generation;
-	if (request->phase != RESOURCE_X_MASTER_GRANT_COMMITTED
-		|| request->final_authority_generation == 0
-		|| request->requester_target_generation == 0
-		|| requester_connection_generation == 0
-		|| request->proof_kind < RESOURCE_X_PROOF_KIND_MIN
-		|| request->proof_kind > RESOURCE_X_PROOF_KIND_MAX
-		|| request->dependency_count > RESOURCE_X_DEPENDENCY_MAX
-		|| (request->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER
-			&& (request->source_carrier_generation == 0
-				|| request->source_disposition
-					   != RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE))
-		|| (request->proof_kind == RESOURCE_X_PROOF_LOCAL_IMAGE
-			&& request->source_disposition
-				   != RESOURCE_X_DISPOSITION_LOCAL_IMAGE)
-		|| (request->proof_kind == RESOURCE_X_PROOF_DURABLE_STORAGE
-			&& request->source_disposition
-				   != RESOURCE_X_DISPOSITION_DURABLE_STORAGE)) {
+	if (request->phase != RESOURCE_X_MASTER_GRANT_COMMITTED) {
 		LWLockRelease(&entry->entry_lock.lock);
 		return RESOURCE_X_APPLY_BAD_STATE;
 	}
-	out->kind = RESOURCE_X_WIRE_AUTHORITY_GRANT;
-	out->payload_bytes = RESOURCE_X_PROOF_V1_BYTES;
-	out->common.logical_assertion = *assertion;
-	out->common.base_authority_generation
-		= request->base_authority_generation;
-	out->common.resource_formation = request->resource_formation;
-	out->common.master_session_incarnation
-		= request->master_session_incarnation;
-	out->common.assertion_sequence = request->assertion_sequence;
-	out->common.ordered_lane = request->ordered_lane;
-	out->common.action_node = requester_node;
-	out->common.observed_mode = (uint8)PCM_STATE_N;
-	out->common.target_mode = (uint8)PCM_STATE_X;
-	out->common.sender_connection_generation
-		= request->sender_connection_generation;
-	out->common.outcome = RESOURCE_X_OUTCOME_OK;
-	if (request->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER)
-		out->common.flags = RESOURCE_X_COMMON_FLAG_REMOTE_IMAGE_REQUIRED;
-	out->common.authority_generation = request->final_authority_generation;
-	grant = &out->body.authority_grant;
-	memcpy(grant->source_fence, request->source_fence,
-		   sizeof(grant->source_fence));
-	grant->final_authority_generation = request->final_authority_generation;
-	grant->source_carrier_generation = request->source_carrier_generation;
-	grant->requester_target_generation = request->requester_target_generation;
-	grant->page_scn_lsn = request->page_scn_lsn;
-	grant->dependency_count = request->dependency_count;
-	memcpy(grant->dependencies, request->dependencies,
-		   sizeof(grant->dependencies));
-	grant->source_proof_crc32c = request->source_proof_crc32c;
-	grant->page_checksum = request->page_checksum;
-	grant->proof_kind = request->proof_kind;
-	grant->source_disposition = request->source_disposition;
-	grant->requester_connection_generation
-		= requester_connection_generation;
+	result = pcm_resource_x_build_authority_grant_locked(
+		entry, request, requester_node, request->final_authority_generation, out);
+	LWLockRelease(&entry->entry_lock.lock);
+	return result;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
+	void *payload_out, uint16 payload_capacity)
+{
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXMasterRequest *request;
+	ClusterPcmResourceXControlIntent *intent;
+	struct GrdEntry *entry;
+	int32 requester_node;
+
+	if (slot_out != NULL)
+		memset(slot_out, 0, sizeof(*slot_out));
+	if (!resource_x_assertion_valid(assertion) || slot_out == NULL
+		|| payload_out == NULL || payload_capacity < RESOURCE_X_PROOF_V1_BYTES)
+		return RESOURCE_X_APPLY_INVALID;
+	entry = pcm_find_entry(assertion->resource);
+	if (entry == NULL)
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	requester_node = assertion->requester_node;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	state = pcm_resource_x_master_state_for_tag(&entry->tag);
+	if (state == NULL) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	request = &state->requests[requester_node];
+	intent = &state->grant_intent;
+	if (request->phase == RESOURCE_X_MASTER_NONE
+		|| intent->slot.state == RESOURCE_X_INTENT_SLOT_EMPTY) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	}
+	if (!resource_x_assertion_equal(assertion, &intent->slot.body.assertion)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return RESOURCE_X_APPLY_STALE;
+	}
+	if (request->phase != RESOURCE_X_MASTER_GRANT_COMMITTED
+		|| intent->slot.state > RESOURCE_X_INTENT_SLOT_STAGED
+		|| !pcm_resource_x_intent_body_valid(&intent->slot.body)
+		|| intent->slot.logical_generation != request->assertion_sequence
+		|| intent->slot.authority_generation
+			   != request->final_authority_generation
+		|| intent->slot.destination_node != (uint32)requester_node
+		|| intent->slot.payload_bytes != RESOURCE_X_PROOF_V1_BYTES
+		|| intent->slot.kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
+		|| intent->slot.body.owner_generation
+			   != request->final_authority_generation
+		|| intent->slot.body.owner_kind
+			   != RESOURCE_X_INTENT_OWNER_MASTER_GRANT) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	*slot_out = intent->slot;
+	memcpy(payload_out, intent->payload, intent->slot.payload_bytes);
 	LWLockRelease(&entry->entry_lock.lock);
 	return RESOURCE_X_APPLY_APPLIED;
+}
+
+static ResourceXIntentSlot *
+pcm_resource_x_grant_intent_lock_exact(
+	const ResourceXIntentSlot *expected, struct GrdEntry **entry_out)
+{
+	ClusterPcmResourceXMasterState *state;
+	struct GrdEntry *entry;
+
+	Assert(entry_out != NULL);
+	*entry_out = NULL;
+	if (expected == NULL || !pcm_resource_x_intent_body_valid(&expected->body)
+		|| expected->body.owner_kind
+			   != RESOURCE_X_INTENT_OWNER_MASTER_GRANT
+		|| expected->kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
+		|| expected->payload_bytes != RESOURCE_X_PROOF_V1_BYTES)
+		return NULL;
+	entry = pcm_find_entry(expected->body.assertion.resource);
+	if (entry == NULL)
+		return NULL;
+	pcm_entry_lock_exclusive(entry);
+	state = pcm_resource_x_master_state_for_tag(&entry->tag);
+	if (state == NULL) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return NULL;
+	}
+	*entry_out = entry;
+	return &state->grant_intent.slot;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_grant_intent_not_admitted_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us)
+{
+	ResourceXIntentSlot *slot;
+	struct GrdEntry *entry;
+	ResourceXIntentResult result;
+
+	slot = pcm_resource_x_grant_intent_lock_exact(expected, &entry);
+	if (slot == NULL)
+		return RESOURCE_X_INTENT_STALE;
+	result = cluster_pcm_lock_resource_x_intent_not_admitted_exact(
+		slot, expected, now_us);
+	if (result == RESOURCE_X_INTENT_NOT_ADMITTED
+		&& !pcm_resource_x_intent_mark_dirty())
+		result = RESOURCE_X_INTENT_STALE;
+	LWLockRelease(&entry->entry_lock.lock);
+	return result;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_grant_intent_stage_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us)
+{
+	ResourceXIntentSlot *slot;
+	struct GrdEntry *entry;
+	ResourceXIntentResult result;
+
+	slot = pcm_resource_x_grant_intent_lock_exact(expected, &entry);
+	if (slot == NULL)
+		return RESOURCE_X_INTENT_STALE;
+	result = cluster_pcm_lock_resource_x_intent_stage_exact(
+		slot, expected, now_us);
+	LWLockRelease(&entry->entry_lock.lock);
+	return result;
+}
+
+ResourceXIntentResult
+cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us)
+{
+	ResourceXIntentSlot *slot;
+	struct GrdEntry *entry;
+	ResourceXIntentResult result;
+
+	slot = pcm_resource_x_grant_intent_lock_exact(expected, &entry);
+	if (slot == NULL)
+		return RESOURCE_X_INTENT_STALE;
+	result = cluster_pcm_lock_resource_x_intent_hard_rearm_exact(
+		slot, expected, now_us);
+	if (result == RESOURCE_X_INTENT_HARD_REARMED
+		&& !pcm_resource_x_intent_mark_dirty())
+		result = RESOURCE_X_INTENT_STALE;
+	LWLockRelease(&entry->entry_lock.lock);
+	return result;
+}
+
+bool
+cluster_pcm_lock_resource_x_grant_intent_complete_exact(
+	const ResourceXIntentSlot *expected)
+{
+	ResourceXIntentSlot *slot;
+	struct GrdEntry *entry;
+	bool completed;
+
+	slot = pcm_resource_x_grant_intent_lock_exact(expected, &entry);
+	if (slot == NULL)
+		return false;
+	completed = cluster_pcm_lock_resource_x_intent_complete_exact(slot, expected);
+	LWLockRelease(&entry->entry_lock.lock);
+	return completed;
+}
+
+ResourceXIntentProbeResult
+cluster_pcm_lock_resource_x_grant_intent_probe_exact(
+	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,
+	uint16 payload_capacity, uint32 *examined_out)
+{
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXControlIntent *intent;
+	struct GrdEntry *entry;
+	uint64 arm_generation;
+	uint64 completed_generation;
+	uint64 cursor;
+	uint64 scan_generation;
+	uint64 capacity;
+	uint32 examined = 0;
+
+	if (slot_out != NULL)
+		memset(slot_out, 0, sizeof(*slot_out));
+	if (examined_out != NULL)
+		*examined_out = 0;
+	if (probe_budget == 0 || probe_budget > 4 || slot_out == NULL
+		|| payload_out == NULL || examined_out == NULL
+		|| payload_capacity < RESOURCE_X_PROOF_V1_BYTES || ClusterPcm == NULL
+		|| cluster_pcm_resource_x_slots == NULL
+		|| cluster_pcm_resource_x_master_states == NULL
+		|| pcm_grd_effective <= 0
+		|| pg_atomic_read_u32(
+			&ClusterPcm->resource_x_intent_generation_exhausted) != 0)
+		return RESOURCE_X_INTENT_PROBE_CORRUPT;
+
+	capacity = (uint64)pcm_grd_effective;
+	arm_generation
+		= pg_atomic_read_u64(&ClusterPcm->resource_x_intent_arm_generation);
+	cursor = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_intent_next_state_index);
+	scan_generation = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_intent_scan_generation);
+	completed_generation = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_intent_completed_generation);
+	if (cursor > capacity)
+		return RESOURCE_X_INTENT_PROBE_CORRUPT;
+	if (cursor == 0) {
+		if (completed_generation == arm_generation)
+			return RESOURCE_X_INTENT_PROBE_IDLE;
+		scan_generation = arm_generation;
+		pg_atomic_write_u64(
+			&ClusterPcm->resource_x_intent_scan_generation,
+			scan_generation);
+	}
+
+	while (cursor < capacity && examined < probe_budget) {
+		ClusterPcmResourceXSlot *registry_slot
+			= &cluster_pcm_resource_x_slots[cursor];
+
+		cursor++;
+		examined++;
+		if (registry_slot->initialized == 0)
+			continue;
+		entry = pcm_find_entry(registry_slot->tag);
+		if (entry == NULL) {
+			*examined_out = examined;
+			return RESOURCE_X_INTENT_PROBE_CORRUPT;
+		}
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		state = pcm_resource_x_master_state_for_tag(&entry->tag);
+		if (state == NULL) {
+			LWLockRelease(&entry->entry_lock.lock);
+			*examined_out = examined;
+			return RESOURCE_X_INTENT_PROBE_CORRUPT;
+		}
+		intent = &state->grant_intent;
+		if (intent->slot.state == RESOURCE_X_INTENT_SLOT_ARMED) {
+			if (!pcm_resource_x_intent_body_valid(&intent->slot.body)
+				|| intent->slot.kind != RESOURCE_X_WIRE_AUTHORITY_GRANT
+				|| intent->slot.payload_bytes != RESOURCE_X_PROOF_V1_BYTES) {
+				LWLockRelease(&entry->entry_lock.lock);
+				*examined_out = examined;
+				return RESOURCE_X_INTENT_PROBE_CORRUPT;
+			}
+			*slot_out = intent->slot;
+			memcpy(payload_out, intent->payload,
+				   intent->slot.payload_bytes);
+			LWLockRelease(&entry->entry_lock.lock);
+			pg_atomic_write_u64(
+				&ClusterPcm->resource_x_intent_next_state_index, cursor);
+			*examined_out = examined;
+			return RESOURCE_X_INTENT_PROBE_FOUND;
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+
+	*examined_out = examined;
+	if (cursor < capacity) {
+		pg_atomic_write_u64(
+			&ClusterPcm->resource_x_intent_next_state_index, cursor);
+		return RESOURCE_X_INTENT_PROBE_MORE;
+	}
+	pg_atomic_write_u64(
+		&ClusterPcm->resource_x_intent_next_state_index, 0);
+	pg_atomic_write_u64(
+		&ClusterPcm->resource_x_intent_completed_generation,
+		scan_generation);
+	return RESOURCE_X_INTENT_PROBE_COMPLETE;
 }
 
 static bool
