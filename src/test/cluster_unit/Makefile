@@ -222,7 +222,8 @@ CLUSTER_RESOURCE_X_IDENTITY_O = \
 CLUSTER_IC_TIER1_O = $(top_builddir)/src/backend/cluster/cluster_ic_tier1.o
 CLUSTER_GCS_O = $(top_builddir)/src/backend/cluster/cluster_gcs.o
 
-test_cluster_resource_x_identity: test_cluster_resource_x_identity.c unit_test.h \
+test_cluster_resource_x_identity: test_cluster_resource_x_identity.c \
+		cluster_resource_x_wire_f076.h unit_test.h \
 		$(CLUSTER_RESOURCE_X_IDENTITY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
