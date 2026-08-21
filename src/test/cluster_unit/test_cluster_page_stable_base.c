@@ -89,6 +89,9 @@ static const PgracExternalFenceNeedSetV1 *expected_needs;
 static const PgracExternalFenceAdmissionSetV1 *expected_admissions;
 static ClusterWalRetentionPin *expected_pin;
 static bool canonical_root_current;
+static bool bound_pin_current;
+static int preflight_pin_checks;
+static int bound_pin_checks;
 
 ClusterControlRootResult
 cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
@@ -144,7 +147,16 @@ ClusterWalPinResult
 cluster_wal_retention_pin_preflight_revalidate_wait_v1(
 	ClusterWalRetentionPin *pin)
 {
+	preflight_pin_checks++;
 	return pin == expected_pin ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
+{
+	bound_pin_checks++;
+	return bound_pin_current && pin == expected_pin ? CLUSTER_WAL_PIN_OK :
+		CLUSTER_WAL_PIN_STALE;
 }
 
 typedef struct GraphFixture
@@ -344,6 +356,9 @@ proof_request(GraphFixture *fixture, RfPageStableBaseProofRequestV1 *request)
 	expected_admissions = request->fence_admission_set;
 	expected_pin = request->retention_pin;
 	canonical_root_current = true;
+	bound_pin_current = true;
+	preflight_pin_checks = 0;
+	bound_pin_checks = 0;
 }
 
 UT_TEST(test_stable_proof_binds_exact_borrowed_owners)
@@ -364,6 +379,32 @@ UT_TEST(test_stable_proof_binds_exact_borrowed_owners)
 		request.retention_pin, &fixture.source, &fixture.vector, 1));
 	rf_page_stable_base_proof_destroy_v1(&proof);
 	UT_ASSERT(proof == NULL);
+	UT_ASSERT_EQ(preflight_pin_checks, 1);
+	UT_ASSERT_EQ(bound_pin_checks, 0);
+}
+
+UT_TEST(test_stable_proof_accepts_only_current_bound_pin)
+{
+	GraphFixture fixture;
+	RfPageStableBaseProofRequestV1 request;
+	RfPageStableBaseProofV1 *proof = NULL;
+
+	graph_init(&fixture);
+	proof_request(&fixture, &request);
+	UT_ASSERT_EQ(rf_page_stable_base_proof_build_bound_v1(&request,
+		fixture.chain, lengthof(fixture.chain), &proof),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(proof != NULL);
+	UT_ASSERT_EQ(preflight_pin_checks, 0);
+	UT_ASSERT_EQ(bound_pin_checks, 1);
+	rf_page_stable_base_proof_destroy_v1(&proof);
+	bound_pin_current = false;
+	UT_ASSERT_EQ(rf_page_stable_base_proof_build_bound_v1(&request,
+		fixture.chain, lengthof(fixture.chain), &proof),
+		RF_PAGE_PROOF_DETAIL_RETENTION_STALE);
+	UT_ASSERT(proof == NULL);
+	UT_ASSERT_EQ(preflight_pin_checks, 0);
+	UT_ASSERT_EQ(bound_pin_checks, 2);
 }
 
 UT_TEST(test_stable_proof_rejects_duplicate_owner_scalars)
@@ -1174,8 +1215,9 @@ UT_TEST(test_complete_release_order)
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(48);
 	UT_RUN(test_stable_proof_binds_exact_borrowed_owners);
+	UT_RUN(test_stable_proof_accepts_only_current_bound_pin);
 	UT_RUN(test_stable_proof_rejects_duplicate_owner_scalars);
 	UT_RUN(test_stable_proof_rejects_root_cut_order_mismatch);
 	UT_RUN(test_stable_proof_rejects_forged_root_current_boolean);

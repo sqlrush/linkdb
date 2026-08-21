@@ -145,14 +145,14 @@ cluster_epoch_get_current(void)
 }
 
 RfPageProofDetailV1
-rf_page_stable_base_proof_build_wait_v1(
+rf_page_stable_base_proof_build_bound_v1(
 	const RfPageStableBaseProofRequestV1 *request, uint32 *chain_indices,
-	uint32 chain_capacity, int timeout_ms, RfPageStableBaseProofV1 **out_proof)
+	uint32 chain_capacity, RfPageStableBaseProofV1 **out_proof)
 {
 	int index;
 
 	UT_ASSERT(request != NULL && request->graph != NULL &&
-		chain_indices != NULL && chain_capacity != 0 && timeout_ms == 1000);
+		chain_indices != NULL && chain_capacity != 0);
 	index = request->graph == &graphs[0] ? 0 :
 		(request->graph == &graphs[1] ? 1 : -1);
 	UT_ASSERT(index >= 0);

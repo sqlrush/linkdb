@@ -596,7 +596,8 @@ fail:
 }
 
 static RfPageProofDetailV1
-stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request)
+stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request,
+	bool bound_pin)
 {
 	const RfPageStableGraphRequestV1 *graph = request->graph;
 	const RfContributorVectorV1 *contributors = graph->contributors;
@@ -642,18 +643,18 @@ stable_owners_revalidate(const RfPageStableBaseProofRequestV1 *request)
 			request->fence_admission_set, request->fence_need_set,
 			request->formation, &fence_reason))
 		return RF_PAGE_PROOF_DETAIL_FENCE_STALE;
-	if (cluster_wal_retention_pin_preflight_revalidate_wait_v1(
-			request->retention_pin) !=
-			CLUSTER_WAL_PIN_OK)
+	if ((bound_pin ?
+		 cluster_wal_retention_pin_revalidate(request->retention_pin) :
+		 cluster_wal_retention_pin_preflight_revalidate_wait_v1(
+			request->retention_pin)) != CLUSTER_WAL_PIN_OK)
 		return RF_PAGE_PROOF_DETAIL_RETENTION_STALE;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-RfPageProofDetailV1
-rf_page_stable_base_proof_build_wait_v1(
-	const RfPageStableBaseProofRequestV1 *request,
-	uint32 *chain_indices, uint32 chain_capacity, int timeout_ms,
-	RfPageStableBaseProofV1 **out_proof)
+static RfPageProofDetailV1
+stable_proof_build(const RfPageStableBaseProofRequestV1 *request,
+	uint32 *chain_indices, uint32 chain_capacity,
+	RfPageStableBaseProofV1 **out_proof, bool bound_pin)
 {
 	RfPageStableBaseProofV1 *proof;
 	RfPageStableSelectionV1 selection;
@@ -667,10 +668,9 @@ rf_page_stable_base_proof_build_wait_v1(
 		request->duties == NULL || request->root_tokens == NULL ||
 		request->formation == NULL || request->fence_need_set == NULL ||
 		request->fence_admission_set == NULL ||
-		request->retention_pin == NULL || request->flags != 0 ||
-		timeout_ms < 0)
+		request->retention_pin == NULL || request->flags != 0)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	detail = stable_owners_revalidate(request);
+	detail = stable_owners_revalidate(request, bound_pin);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
 	verified_graph = *request->graph;
@@ -702,6 +702,31 @@ rf_page_stable_base_proof_build_wait_v1(
 	proof->contributors = request->graph->contributors;
 	*out_proof = proof;
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_page_stable_base_proof_build_wait_v1(
+	const RfPageStableBaseProofRequestV1 *request,
+	uint32 *chain_indices, uint32 chain_capacity, int timeout_ms,
+	RfPageStableBaseProofV1 **out_proof)
+{
+	if (out_proof == NULL)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	*out_proof = NULL;
+	if (timeout_ms < 0)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	return stable_proof_build(request, chain_indices, chain_capacity,
+		out_proof, false);
+}
+
+RfPageProofDetailV1
+rf_page_stable_base_proof_build_bound_v1(
+	const RfPageStableBaseProofRequestV1 *request,
+	uint32 *chain_indices, uint32 chain_capacity,
+	RfPageStableBaseProofV1 **out_proof)
+{
+	return stable_proof_build(request, chain_indices, chain_capacity,
+		out_proof, true);
 }
 
 bool

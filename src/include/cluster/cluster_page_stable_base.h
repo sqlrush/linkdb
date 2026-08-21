@@ -222,6 +222,10 @@ extern RfPageProofDetailV1 rf_page_stable_base_proof_build_wait_v1(
 	const RfPageStableBaseProofRequestV1 *request,
 	uint32 *chain_indices, uint32 chain_capacity, int timeout_ms,
 	RfPageStableBaseProofV1 **out_proof);
+extern RfPageProofDetailV1 rf_page_stable_base_proof_build_bound_v1(
+	const RfPageStableBaseProofRequestV1 *request,
+	uint32 *chain_indices, uint32 chain_capacity,
+	RfPageStableBaseProofV1 **out_proof);
 extern bool rf_page_stable_base_proof_matches_v1(
 	const RfPageStableBaseProofV1 *proof,
 	const RfPageIdentityV1 *page_identity,

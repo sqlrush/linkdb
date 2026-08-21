@@ -255,8 +255,8 @@ cluster_thread_recovery_fabric_apply_v1(
 			proof_request.fence_admission_set =
 				authority->fence_admission_set;
 			proof_request.retention_pin = authority->retention_pin;
-			detail = rf_page_stable_base_proof_build_wait_v1(&proof_request,
-				state.chain_indices, max_chain_count, 1000, &state.proofs[i]);
+			detail = rf_page_stable_base_proof_build_bound_v1(&proof_request,
+				state.chain_indices, max_chain_count, &state.proofs[i]);
 			if (detail != RF_PAGE_PROOF_DETAIL_OK)
 				goto done;
 			state.authority_targets[i].page_identity =
