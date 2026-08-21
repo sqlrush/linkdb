@@ -3387,7 +3387,7 @@ cluster_reconfig_prepare_join_commit(int32 node_id, uint64 admitted_incarnation,
 	}
 	lsn = GetXLogInsertRecPtr();
 	cluster_epoch_set_changed_at_lsn((uint64)lsn);
-	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_gcs_block_on_epoch_advance_exact(new_epoch, remaining_dead);
 	cluster_sinval_reset_all_on_reconfig();
 	cluster_tt_status_flush_all((uint32)new_epoch);
 
@@ -6714,7 +6714,7 @@ cluster_reconfig_apply_epoch_bump_as_coordinator(
 	 * before the reconfig event broadcast hits them).  Callsite uniqueness
 	 * enforced by DoD grep (spec-2.34 §7).
 	 */
-	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_gcs_block_on_epoch_advance_exact(new_epoch, full_dead);
 
 	/*
 	 * spec-2.39 D14:  reconfig RESET-all hook.  Triggers local SIResetAll
@@ -6921,7 +6921,7 @@ cluster_reconfig_apply_clean_leave_as_coordinator(int32 leaving_node_id, uint64 
 	 * they run here.  This is what invalidates stale leaving-node cache so the
 	 * post-epoch storage read returns the just-flushed current (CL-I5).
 	 */
-	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_gcs_block_on_epoch_advance_exact(new_epoch, dead_bitmap);
 	cluster_sinval_reset_all_on_reconfig();
 	cluster_tt_status_flush_all((uint32)new_epoch);
 
@@ -6997,29 +6997,9 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 
 	cssd_dead_generation = cluster_cssd_get_dead_generation();
 
-	/* CL-I3-style guarded advance: fail closed if a real death moved the epoch. */
-	old_epoch = baseline_epoch;
-	if (!cluster_epoch_advance_for_reconfig_if_baseline(baseline_epoch, &new_epoch)) {
-		if (out_contest != NULL)
-			*out_contest = true; /* another node moved the epoch -> real contest */
-		return 0;
-	}
-	lsn = GetXLogInsertRecPtr();
-	cluster_epoch_set_changed_at_lsn((uint64)lsn);
-
-	/* same epoch-advance side effects as the other coordinator paths (cache
-	 * invalidation happens-before): wake GCS slots, reset sinval, flush TT overlay. */
-	cluster_gcs_block_on_epoch_advance(new_epoch);
-	cluster_sinval_reset_all_on_reconfig();
-	cluster_tt_status_flush_all((uint32)new_epoch);
-
-	/* R14: event_id folds the removed set (current removed_bitmap | {N}) + the
-	 * per-attempt removal_event_id, so a clean-left removal (dead_bitmap unchanged)
-	 * still produces a distinct, non-deduped id. */
-	/* Frozen §17.6 marker-producer rule: take the currently applied DEAD set
-	 * and durable REMOVED set from one reconfig-lock snapshot, then add this
-	 * not-yet-applied removal delta.  A NODE_REMOVED marker is an authority
-	 * image for the full excluded set, not merely the event-local delta. */
+	/* Freeze the exact excluded set before the epoch callback.  Resource-X D2
+	 * consumes it during that callback, so the removed node must be present
+	 * even when a prior clean leave kept it out of last_applied.dead_bitmap. */
 	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
 	memcpy(current_dead, ReconfigShmem->last_applied.dead_bitmap,
 		   sizeof(current_dead));
@@ -7032,6 +7012,29 @@ cluster_reconfig_apply_node_removed_as_coordinator(int32 removed_node_id, uint64
 	removed_with_n[removed_node_id / 8] |= (uint8)(1u << (removed_node_id % 8));
 	excluded_with_n[removed_node_id / 8] |= (uint8)(1u << (removed_node_id % 8));
 
+	/* CL-I3-style guarded advance: fail closed if a real death moved the epoch. */
+	old_epoch = baseline_epoch;
+	if (!cluster_epoch_advance_for_reconfig_if_baseline(baseline_epoch, &new_epoch)) {
+		if (out_contest != NULL)
+			*out_contest = true; /* another node moved the epoch -> real contest */
+		return 0;
+	}
+	lsn = GetXLogInsertRecPtr();
+	cluster_epoch_set_changed_at_lsn((uint64)lsn);
+
+	/* same epoch-advance side effects as the other coordinator paths (cache
+	 * invalidation happens-before): wake GCS slots, reset sinval, flush TT overlay. */
+	cluster_gcs_block_on_epoch_advance_exact(new_epoch, excluded_with_n);
+	cluster_sinval_reset_all_on_reconfig();
+	cluster_tt_status_flush_all((uint32)new_epoch);
+
+	/* R14: event_id folds the removed set (current removed_bitmap | {N}) + the
+	 * per-attempt removal_event_id, so a clean-left removal (dead_bitmap unchanged)
+	 * still produces a distinct, non-deduped id. */
+	/* Frozen §17.6 marker-producer rule: take the currently applied DEAD set
+	 * and durable REMOVED set from one reconfig-lock snapshot, then add this
+	 * not-yet-applied removal delta.  A NODE_REMOVED marker is an authority
+	 * image for the full excluded set, not merely the event-local delta. */
 	/*
 	 * INV-LF2 (fence-before-shrink): arm the 4.12 write fence for the removed node
 	 * BEFORE publishing the membership shrink — exactly like the fail-stop coordinator
@@ -8914,40 +8917,39 @@ cluster_reconfig_apply_join_as_coordinator(
 					i, joiner_incarnations[i]);
 
 	cssd_dead_generation = cluster_cssd_get_dead_generation();
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	memcpy(pending_dead, ReconfigShmem->last_applied.dead_bitmap,
+		   sizeof(pending_dead));
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
+		pending_dead[i] |= ReconfigShmem->fast_rejoin_bitmap[i];
+	LWLockRelease(&ReconfigShmem->lock);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++)
+		if (dead_bitmap_test_bit(join_bitmap, i) && external_authorized[i])
+			pending_dead[i / 8] &= (uint8) ~(1u << (i % 8));
 
 	/* Phase-1 epoch bump (regular advance new=old+1) + the same epoch side
 	 * effects as the other coordinator paths. */
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
 	lsn = GetXLogInsertRecPtr();
 	cluster_epoch_set_changed_at_lsn((uint64)lsn);
-	cluster_gcs_block_on_epoch_advance(new_epoch);
+	cluster_gcs_block_on_epoch_advance_exact(new_epoch, pending_dead);
 	cluster_sinval_reset_all_on_reconfig();
 	cluster_tt_status_flush_all((uint32)new_epoch);
 
 	/* Mark joiners JOINING + pending (candidates, NOT members yet — INV-J2). */
 	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
 	cluster_write_fence_authority_cache_invalidate();
-	memcpy(pending_dead, ReconfigShmem->last_applied.dead_bitmap,
-		   sizeof(pending_dead));
 	/* RF-ROOT P6 (STOP-01 contract): a fast-rejoin eviction is the
 	 * fail-stop-equivalent death of the PRIOR incarnation (P04 "exclude the
 	 * prior incarnation first").  Carry the evicted set into the JOIN_PENDING
 	 * dead set so the JOIN episode's barrier skips the joiner exactly like
 	 * the fail-stop flow (its DONE is structurally impossible until the
 	 * admission this very event feeds);  the COMMITTED clears it again. */
-	{
-		int b;
-
-		for (b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; b++)
-			pending_dead[b] |= ReconfigShmem->fast_rejoin_bitmap[b];
-	}
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (!dead_bitmap_test_bit(join_bitmap, i))
 			continue;
 		cluster_membership_set_state(i, CLUSTER_MEMBER_JOINING);
 		dead_bitmap_set_bit(ReconfigShmem->pending_join_bitmap, i);
-		if (external_authorized[i])
-			pending_dead[i / 8] &= (uint8) ~(1u << (i % 8));
 	}
 	LWLockRelease(&ReconfigShmem->lock);
 

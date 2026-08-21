@@ -268,6 +268,31 @@ typedef struct ResourceXMasterSnapshot {
 StaticAssertDecl(sizeof(ResourceXMasterSnapshot) == 96,
 				 "ResourceXMasterSnapshot layout must remain 96 bytes");
 
+/* Exact, process-local D2 result retained for the R8 sweep owner.  This is
+ * deliberately not a wire structure and carries both the removed queue
+ * identity and the successor selected under the same resource-entry lock. */
+typedef struct ResourceXReclaimWitness {
+	ResourceXAssertion assertion;
+	uint64 base_authority_generation;
+	uint64 resource_formation;
+	uint64 master_session_incarnation;
+	uint64 assertion_sequence;
+	uint64 enqueue_order;
+	uint64 final_authority_generation;
+	uint64 successor_assertion_sequence;
+	uint64 successor_enqueue_order;
+	int32 successor_node;
+	uint32 result;
+	uint8 previous_phase;
+	uint8 successor_phase;
+	uint8 was_head;
+	uint8 source_evidence_preserved;
+	uint32 reserved;
+} ResourceXReclaimWitness;
+
+StaticAssertDecl(sizeof(ResourceXReclaimWitness) == 104,
+				 "ResourceXReclaimWitness layout must remain 104 bytes");
+
 /* Master-local durable-storage proof.  It is never a wire layout: the GCS
  * storage producer constructs it only after its real durable-image check. */
 typedef struct ResourceXDurableProof {
@@ -289,7 +314,12 @@ typedef struct ResourceXReconfigToken {
 	uint64 old_formation;
 	uint64 new_formation;
 	uint64 freeze_generation;
+	uint32 dead_requester_bitmap;
+	uint32 reserved;
 } ResourceXReconfigToken;
+
+#define RESOURCE_X_RECONFIG_RECLAIM_WITNESS_MAX \
+	(4 * RESOURCE_X_PROTOCOL_NODE_LIMIT)
 
 typedef struct ResourceXReconfigBatch {
 	uint32 examined_count;
@@ -300,8 +330,14 @@ typedef struct ResourceXReconfigBatch {
 	uint32 sidecar_neutralized_count;
 	uint32 complete_wrap;
 	uint32 zero_residual;
+	uint32 reclaim_count;
+	uint32 reclaim_nonhead_count;
+	uint32 reclaim_head_count;
+	uint32 reclaim_orphan_count;
 	uint64 next_state_index;
 	uint64 residual_count;
+	ResourceXReclaimWitness
+		reclaim_witnesses[RESOURCE_X_RECONFIG_RECLAIM_WITNESS_MAX];
 } ResourceXReconfigBatch;
 
 typedef struct ResourceXReconfigStats {
@@ -315,14 +351,17 @@ typedef struct ResourceXReconfigStats {
 	uint64 retry_count;
 	uint64 blocked_count;
 	uint64 thaw_count;
+	uint64 reclaim_nonhead_count;
+	uint64 reclaim_head_count;
+	uint64 reclaim_orphan_count;
 } ResourceXReconfigStats;
 
-StaticAssertDecl(sizeof(ResourceXReconfigToken) == 24,
-				 "ResourceXReconfigToken layout must remain 24 bytes");
-StaticAssertDecl(sizeof(ResourceXReconfigBatch) == 48,
-				 "ResourceXReconfigBatch layout must remain 48 bytes");
-StaticAssertDecl(sizeof(ResourceXReconfigStats) == 80,
-				 "ResourceXReconfigStats layout must remain 80 bytes");
+StaticAssertDecl(sizeof(ResourceXReconfigToken) == 32,
+				 "ResourceXReconfigToken layout must remain 32 bytes");
+StaticAssertDecl(sizeof(ResourceXReconfigBatch) == 13376,
+				 "ResourceXReconfigBatch layout must remain 13376 bytes");
+StaticAssertDecl(sizeof(ResourceXReconfigStats) == 104,
+				 "ResourceXReconfigStats layout must remain 104 bytes");
 
 static inline bool
 cluster_resource_x_next_freeze_generation(uint64 current, uint64 *out)
@@ -677,6 +716,9 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_settlement_exact
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_release_x_exact(
 	const ResourceXDecodedFrame *release, int32 authenticated_source_node,
 	ResourceXMasterSnapshot *out);
+extern ResourceXReclaimResult cluster_pcm_lock_resource_x_reclaim_requester_exact(
+	const BufferTag *tag, int32 dead_node, uint64 dead_formation,
+	ResourceXReclaimWitness *out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
 extern bool cluster_pcm_lock_resource_x_executor_enter(
@@ -686,10 +728,16 @@ cluster_pcm_lock_resource_x_executor_leave(ResourceXActivationGateToken *gate);
 extern uint64 cluster_pcm_lock_resource_x_activation_inflight_count(void);
 extern bool cluster_resource_x_reconfig_freeze_pending(uint64 old_formation,
 											ResourceXReconfigToken *out);
+extern bool cluster_resource_x_reconfig_freeze_pending_exact(
+	uint64 old_formation, uint32 dead_requester_bitmap,
+	ResourceXReconfigToken *out);
 extern bool cluster_resource_x_reconfig_bind_new_formation_exact(
 	ResourceXReconfigToken *token, uint64 new_formation);
 extern bool cluster_resource_x_reconfig_freeze(uint64 old_formation, uint64 new_formation,
 											   ResourceXReconfigToken *out);
+extern bool cluster_resource_x_reconfig_freeze_exact(
+	uint64 old_formation, uint64 new_formation, uint32 dead_requester_bitmap,
+	ResourceXReconfigToken *out);
 extern ResourceXReconfigResult cluster_resource_x_reconfig_sweep(
 	const ResourceXReconfigToken *token, uint32 probe_budget, ResourceXReconfigBatch *out);
 extern bool cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token);

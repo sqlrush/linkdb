@@ -12960,7 +12960,10 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 static void gcs_block_pcm_x_resource_retry_tick(
 	const PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT]);
 static void gcs_block_pcm_x_terminal_retry_tick(void);
-static bool gcs_block_resource_x_reconfig_epoch(uint64 new_epoch);
+static uint32 gcs_block_resource_x_dead_requester_bitmap(
+	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]);
+static bool gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
+										uint32 dead_requester_bitmap);
 static void gcs_block_pcm_x_master_retry_observe(const char *stage, PcmXQueueResult result,
 												 int32 peer_node, Size cursor_before,
 												 Size cursor_after, const BufferTag *tag,
@@ -12982,7 +12985,10 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 	PcmXRuntimeSnapshot runtime;
 	PcmXRuntimeSnapshot runtime_after;
 	PcmXQueueResult result;
+	ReconfigEvent resource_x_event;
 	ResourceXApplyResult gate_result;
+	uint32 dead_requester_bitmap;
+	uint64 current_epoch;
 	uint64 epoch_after;
 	uint64 epoch_before;
 	uint64 self_session_after;
@@ -12990,12 +12996,23 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 	bool rebase_all = false;
 	int i;
 
-	/* Remote epoch observers reach this same LMON-owned producer.  Reconcile
-	 * their local Resource-X formation before ordinary retry/bind work can
-	 * advance the PCM-X runtime independently. */
-	if (cluster_epoch_get_current() != CLUSTER_EPOCH_INITIAL
-		&& !gcs_block_resource_x_reconfig_epoch(cluster_epoch_get_current()))
-		return;
+	/* Remote epoch observers reach this same LMON-owned producer.  Only the
+	 * matching published reconfiguration event supplies D2's requester-loss
+	 * set; an epoch observed before that event is intentionally a no-op here,
+	 * so an empty observation cannot win the initial freeze race. */
+	current_epoch = cluster_epoch_get_current();
+	if (current_epoch != CLUSTER_EPOCH_INITIAL) {
+		memset(&resource_x_event, 0, sizeof(resource_x_event));
+		cluster_reconfig_get_last_event(&resource_x_event);
+		if (resource_x_event.event_id == 0
+			|| resource_x_event.new_epoch != current_epoch)
+			return;
+		dead_requester_bitmap = gcs_block_resource_x_dead_requester_bitmap(
+			resource_x_event.dead_bitmap);
+		if (!gcs_block_resource_x_reconfig_epoch(current_epoch,
+											 dead_requester_bitmap))
+			return;
+	}
 
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state == PCM_X_RUNTIME_ACTIVE) {
@@ -20431,8 +20448,24 @@ cluster_gcs_get_block_dedup_pcm_x_failclosed_count(void)
 #define GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET 4
 #define GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT 16
 
+static uint32
+gcs_block_resource_x_dead_requester_bitmap(
+	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES])
+{
+	uint32 result = 0;
+	int node;
+
+	if (dead_bitmap == NULL)
+		return 0;
+	for (node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++)
+		if ((dead_bitmap[node / 8] & (UINT8_C(1) << (node % 8))) != 0)
+			result |= UINT32_C(1) << (uint32)node;
+	return result;
+}
+
 static bool
-gcs_block_resource_x_reconfig_epoch(uint64 new_epoch)
+gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
+									uint32 dead_requester_bitmap)
 {
 	PcmXPeerBinding bindings_after[PCM_X_PROTOCOL_NODE_LIMIT];
 	PcmXPeerBinding bindings_before[PCM_X_PROTOCOL_NODE_LIMIT];
@@ -20510,7 +20543,8 @@ gcs_block_resource_x_reconfig_epoch(uint64 new_epoch)
 	expected_epoch
 		= pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation);
 	if (expected_epoch == 0
-		|| !cluster_resource_x_reconfig_freeze_pending(expected_epoch, &token))
+		|| !cluster_resource_x_reconfig_freeze_pending_exact(
+			expected_epoch, dead_requester_bitmap, &token))
 		goto actor_failed;
 
 	deadline = GetCurrentTimestamp()
@@ -20609,13 +20643,18 @@ actor_failed:
  *	does not touch backend-local ResourceOwner state (per L150).
  * ============================================================ */
 void
-cluster_gcs_block_on_epoch_advance(uint64 new_epoch)
+cluster_gcs_block_on_epoch_advance_exact(
+	uint64 new_epoch,
+	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES])
 {
 	ResourceXReconfigStats resource_x_stats;
+	uint32 dead_requester_bitmap;
 	int b;
 	int j;
 
-	if (!gcs_block_resource_x_reconfig_epoch(new_epoch)) {
+	dead_requester_bitmap
+		= gcs_block_resource_x_dead_requester_bitmap(dead_bitmap);
+	if (!gcs_block_resource_x_reconfig_epoch(new_epoch, dead_requester_bitmap)) {
 		cluster_pcm_x_runtime_fail_closed();
 		cluster_resource_x_reconfig_stats_snapshot(&resource_x_stats);
 		ereport(ERROR,
@@ -20650,6 +20689,12 @@ cluster_gcs_block_on_epoch_advance(uint64 new_epoch)
 		}
 		LWLockRelease(&blk->lock.lock);
 	}
+}
+
+void
+cluster_gcs_block_on_epoch_advance(uint64 new_epoch)
+{
+	cluster_gcs_block_on_epoch_advance_exact(new_epoch, NULL);
 }
 
 

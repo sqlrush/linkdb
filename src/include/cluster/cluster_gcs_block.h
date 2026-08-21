@@ -4994,6 +4994,8 @@ cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(const PcmXLocalWriterCl
  *	reply timeout safety net.
  * ============================================================ */
 extern void cluster_gcs_block_on_epoch_advance(uint64 new_epoch);
+extern void cluster_gcs_block_on_epoch_advance_exact(
+	uint64 new_epoch, const uint8 *dead_bitmap);
 
 
 /* ============================================================

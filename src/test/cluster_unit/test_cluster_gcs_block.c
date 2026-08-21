@@ -5851,7 +5851,7 @@ UT_TEST(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake
 			"resource_x_reconfig_actor_active",
 			"resource_x_reconfig_completed_epoch", "return true;",
 			"runtime = cluster_pcm_x_runtime_snapshot()",
-			"cluster_resource_x_reconfig_freeze_pending(",
+			"cluster_resource_x_reconfig_freeze_pending_exact(",
 			"cluster_pcm_x_runtime_fail_closed()", "gcs_block_pcm_x_collect_formation(",
 			"cluster_pcm_x_runtime_reform(", "cluster_pcm_x_runtime_snapshot()",
 			"cluster_resource_x_reconfig_bind_new_formation_exact(",
@@ -5860,11 +5860,17 @@ UT_TEST(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake
 			"cluster_resource_x_reconfig_stats_snapshot(",
 			"resource_x_reconfig_actor_active, 0" };
 	static const char *const hook_contract[]
-		= { "gcs_block_resource_x_reconfig_epoch(new_epoch)",
+		= { "gcs_block_resource_x_dead_requester_bitmap(dead_bitmap)",
+			"gcs_block_resource_x_reconfig_epoch(new_epoch, dead_requester_bitmap)",
 			"cluster_gcs_block_dedup_r4_route_sweep_epoch(new_epoch)",
 			"ConditionVariableBroadcast(&slot->reply_cv)" };
 	static const char *const observer_contract[]
-		= { "gcs_block_resource_x_reconfig_epoch(cluster_epoch_get_current())",
+		= { "cluster_reconfig_get_last_event(&resource_x_event)",
+			"resource_x_event.new_epoch != current_epoch)",
+			"gcs_block_resource_x_dead_requester_bitmap(",
+			"resource_x_event.dead_bitmap)",
+			"gcs_block_resource_x_reconfig_epoch(current_epoch,",
+			"dead_requester_bitmap))",
 			"runtime = cluster_pcm_x_runtime_snapshot()",
 			"cluster_pcm_lock_resource_x_gate_bind_formation_exact(runtime.gate_generation)" };
 	char *source = read_gcs_block_source();
@@ -5874,7 +5880,7 @@ UT_TEST(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake
 		"\n\n/* ============================================================\n * PGRAC: spec-2.34 D4",
 		actor_contract, lengthof(actor_contract));
 	assert_ordered_in_function(
-		source, "\ncluster_gcs_block_on_epoch_advance(",
+		source, "\ncluster_gcs_block_on_epoch_advance_exact(",
 		"\n\n/* ============================================================\n * PGRAC MODIFICATIONS by SqlRush — spec-5.13 D5",
 		hook_contract, lengthof(hook_contract));
 	assert_ordered_in_function(

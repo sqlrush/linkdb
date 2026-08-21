@@ -843,6 +843,11 @@ void
 cluster_gcs_block_on_epoch_advance(uint64 new_epoch pg_attribute_unused())
 {}
 
+void
+cluster_gcs_block_on_epoch_advance_exact(
+	uint64 new_epoch pg_attribute_unused(), const uint8 *dead_bitmap pg_attribute_unused())
+{}
+
 /* spec-2.39 D14 stub: cluster_reconfig_apply_epoch_bump_as_coordinator
  * calls cluster_sinval_reset_all_on_reconfig.  Fixture has no sinval shmem;
  * stub no-op. */
