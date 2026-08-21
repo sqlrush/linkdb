@@ -26,6 +26,20 @@ typedef struct ClusterThreadRecoveryFabricPlanRequestV1
 	uint8		reserved_zero[7];
 } ClusterThreadRecoveryFabricPlanRequestV1;
 
+typedef struct ClusterThreadRecoveryFabricApplyResultV1
+{
+	uint32		page_target_count;
+	uint32		side_operation_count;
+	uint32		page_write_count;
+	uint32		page_result_skip_count;
+	bool		page_durability_complete;
+	bool		page_postread_complete;
+	bool		side_apply_complete;
+	uint8		reserved_zero[5];
+} ClusterThreadRecoveryFabricApplyResultV1;
+
+struct ClusterThreadRecoveryAuthorityV1;
+
 extern RfPageProofDetailV1 cluster_thread_recovery_fabric_plan_create_v1(
 	const ClusterThreadRecoveryFabricPlanRequestV1 *request,
 	ClusterThreadRecoveryFabricPlanV1 **out_plan);
@@ -38,6 +52,18 @@ extern const RfPageOnlinePlanV1 *cluster_thread_recovery_fabric_page_plan_v1(
 	const ClusterThreadRecoveryFabricPlanV1 *plan);
 extern const RfSideOnlinePlanV1 *cluster_thread_recovery_fabric_side_plan_v1(
 	const ClusterThreadRecoveryFabricPlanV1 *plan);
+extern uint32 cluster_thread_recovery_fabric_participant_count_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan);
+extern bool cluster_thread_recovery_fabric_identity_matches_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan, uint64 system_identifier,
+	const uint8 storage_uuid[16]);
+extern bool cluster_thread_recovery_fabric_cut_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan, uint32 index,
+	RfContributorStreamCutV1 *out_cut);
+extern RfPageProofDetailV1 cluster_thread_recovery_fabric_apply_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan,
+	const struct ClusterThreadRecoveryAuthorityV1 *authority,
+	ClusterThreadRecoveryFabricApplyResultV1 *result);
 extern void cluster_thread_recovery_fabric_plan_destroy_v1(
 	ClusterThreadRecoveryFabricPlanV1 **plan);
 

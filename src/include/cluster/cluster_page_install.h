@@ -77,7 +77,6 @@ extern RfPageProofDetailV1 rf_page_storage_install_execute_v1(
 	const RfPageStorageInstallRequestV1 *request,
 	RfPageStorageInstallProofV1 *proof);
 
-#ifndef USE_CLUSTER_UNIT
 typedef struct RfPageSmgrPreopenV1 RfPageSmgrPreopenV1;
 
 extern RfPageProofDetailV1 rf_page_storage_smgr_preopen_v1(
@@ -92,6 +91,5 @@ extern void rf_page_storage_smgr_preopen_destroy_v1(
 extern RfPageProofDetailV1 rf_page_storage_install_smgr_v1(
 	const RfPageStorageInstallRequestV1 *request,
 	RfPageStorageInstallProofV1 *proof);
-#endif
 
 #endif							/* CLUSTER_PAGE_INSTALL_H */

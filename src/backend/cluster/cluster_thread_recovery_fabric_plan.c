@@ -41,7 +41,8 @@ fabric_preflight_side_record(void *arg, const RfOpcodeRouteV1 *route,
 {
 	(void) arg;
 	return route != NULL &&
-		route->record_owner == RF_ROUTE_OWNER_SIDE_TYPED &&
+		(route->record_owner == RF_ROUTE_OWNER_SIDE_TYPED ||
+		 route->record_owner == RF_ROUTE_OWNER_LOGICAL_NOOP) &&
 		edge == NULL && block == NULL ? RF_PAGE_PROOF_DETAIL_OK :
 		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }
@@ -251,6 +252,39 @@ cluster_thread_recovery_fabric_side_plan_v1(
 	return plan != NULL && plan->magic ==
 		CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC && plan->sealed &&
 		!plan->failed ? plan->side_plan : NULL;
+}
+
+uint32
+cluster_thread_recovery_fabric_participant_count_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan)
+{
+	return plan != NULL && plan->magic ==
+		CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC && plan->sealed &&
+		!plan->failed ? plan->participant_count : 0;
+}
+
+bool
+cluster_thread_recovery_fabric_identity_matches_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan, uint64 system_identifier,
+	const uint8 storage_uuid[16])
+{
+	return storage_uuid != NULL && plan != NULL && plan->magic ==
+		CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC && plan->sealed &&
+		!plan->failed && plan->system_identifier == system_identifier &&
+		memcmp(plan->storage_uuid, storage_uuid, 16) == 0;
+}
+
+bool
+cluster_thread_recovery_fabric_cut_v1(
+	const ClusterThreadRecoveryFabricPlanV1 *plan, uint32 index,
+	RfContributorStreamCutV1 *out_cut)
+{
+	if (out_cut == NULL || plan == NULL || plan->magic !=
+			CLUSTER_THREAD_RECOVERY_FABRIC_PLAN_MAGIC || !plan->sealed ||
+		plan->failed || index >= plan->participant_count)
+		return false;
+	*out_cut = plan->physical_cuts[index];
+	return true;
 }
 
 void

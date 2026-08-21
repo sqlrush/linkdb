@@ -65,9 +65,15 @@ rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
 		owner_ops->preflight_side_component != NULL &&
 		owner_ops->preflight_rebuildable_component != NULL);
 	memset(&route, 0, sizeof(route));
+	route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
+	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route,
+		NULL, NULL), RF_PAGE_PROOF_DETAIL_OK);
 	route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route,
 		NULL, NULL), RF_PAGE_PROOF_DETAIL_OK);
+	route.record_owner = RF_ROUTE_OWNER_INVALID;
+	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route,
+		NULL, NULL), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 	memset(plan, 0, sizeof(*plan));
 	plan->source_record = record;
 	plan->route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
@@ -252,6 +258,19 @@ UT_TEST(test_seal_closes_page_before_side_and_exposes_both)
 		(RfPageOnlinePlanV1 *) &page_plan_object);
 	UT_ASSERT(cluster_thread_recovery_fabric_side_plan_v1(plan) ==
 		(RfSideOnlinePlanV1 *) &side_plan_object);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_participant_count_v1(plan), 1);
+	UT_ASSERT(cluster_thread_recovery_fabric_identity_matches_v1(plan, 99,
+		(const uint8[16]) {3, 3, 3, 3, 3, 3, 3, 3,
+			3, 3, 3, 3, 3, 3, 3, 3}));
+	{
+		RfContributorStreamCutV1 cut;
+
+		UT_ASSERT(cluster_thread_recovery_fabric_cut_v1(plan, 0, &cut));
+		UT_ASSERT_EQ(cut.failed_thread, 2);
+		UT_ASSERT_EQ(cut.timeline_id, 7);
+		UT_ASSERT_EQ(cut.scan_begin_inclusive, 0x100);
+		UT_ASSERT_EQ(cut.scan_end_exclusive, 0x200);
+	}
 	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
 }
 
