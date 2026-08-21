@@ -52,6 +52,7 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_resource_x_identity.h"
+#include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_shmem.h"
 #include "storage/backendid.h"	   /* spec-6.14 D9 amend — MyBackendId stub */
 #include "storage/buf_internals.h" /* BufferTag */
@@ -1477,6 +1478,377 @@ UT_TEST(test_resource_x_reconfig_t2_newer_sidecar_survives_and_blocks_orphan)
 	UT_ASSERT_EQ(stats.sidecar_stale_count, 1);
 	UT_ASSERT_EQ(stats.orphan_count, 1);
 	UT_ASSERT_EQ(stats.blocked_count, 1);
+}
+
+static ResourceXDecodedFrame
+make_resource_x_master_frame(ResourceXWireKind kind, BufferTag tag,
+							 int32 requester_node, int32 action_node)
+{
+	ResourceXDecodedFrame frame;
+
+	memset(&frame, 0, sizeof(frame));
+	UT_ASSERT(resource_x_assertion_init(&tag, requester_node,
+										 &frame.common.logical_assertion));
+	frame.kind = kind;
+	frame.common.base_authority_generation = 1;
+	frame.common.resource_formation = 17;
+	frame.common.master_session_incarnation = 31;
+	frame.common.assertion_sequence = 41;
+	frame.common.ordered_lane = 7;
+	frame.common.action_node = action_node;
+	frame.common.observed_mode = PCM_STATE_N;
+	frame.common.target_mode = PCM_STATE_X;
+	frame.common.sender_connection_generation = 51;
+	frame.common.authority_generation = 1;
+	return frame;
+}
+
+UT_TEST(test_resource_x_master_remote_proof_is_retained_not_inferred)
+{
+	BufferTag tag = make_tag(143);
+	BufferTag s_tag = make_tag(148);
+	ResourceXDecodedFrame assertion;
+	ResourceXDecodedFrame blocked;
+	ResourceXDecodedFrame changed;
+	ResourceXDecodedFrame grant;
+	ResourceXMasterSnapshot snapshot;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,
+										  tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2,
+														&snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+	UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1));
+	UT_ASSERT_EQ(snapshot.blocked_holders_bitmap, 0);
+	UT_ASSERT_EQ(snapshot.proof_kind, 0);
+	UT_ASSERT_EQ(snapshot.final_authority_generation, 0);
+
+	/* A topology-known X holder and a positive status are not a source
+	 * proof.  The master must retain X and wait for the typed proof body. */
+	blocked = make_resource_x_master_frame(RESOURCE_X_WIRE_BLOCKED_TO_N,
+										tag, 2, 0);
+	blocked.common.observed_mode = PCM_STATE_X;
+	blocked.common.target_mode = PCM_STATE_N;
+	blocked.common.outcome = RESOURCE_X_OUTCOME_OK;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&blocked, 0,
+															 &snapshot),
+				 RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+	UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1));
+	UT_ASSERT_EQ(snapshot.blocked_holders_bitmap, 0);
+	UT_ASSERT_EQ(snapshot.proof_kind, 0);
+
+	blocked.blocked_has_remote_proof = true;
+	memset(blocked.body.blocked_to_n.source_fence, 0x5a,
+		   sizeof(blocked.body.blocked_to_n.source_fence));
+	blocked.body.blocked_to_n.source_carrier_generation = 61;
+	blocked.body.blocked_to_n.requester_target_generation = 62;
+	blocked.body.blocked_to_n.page_scn_lsn = 63;
+	blocked.body.blocked_to_n.dependency_count = 2;
+	blocked.body.blocked_to_n.dependencies[0] = 65;
+	blocked.body.blocked_to_n.dependencies[1] = 66;
+	blocked.body.blocked_to_n.source_proof_crc32c = UINT32_C(0x11223344);
+	blocked.body.blocked_to_n.page_checksum = UINT32_C(0x55667788);
+	blocked.body.blocked_to_n.source_disposition
+		= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+	blocked.body.blocked_to_n.proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
+	blocked.body.blocked_to_n.holder_connection_generation = 64;
+	blocked.body.blocked_to_n.acting_formation
+		= blocked.common.resource_formation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&blocked, 0,
+															 &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_GRANT_COMMITTED);
+	UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1));
+	UT_ASSERT_EQ(snapshot.blocked_holders_bitmap, UINT32_C(1));
+	UT_ASSERT_EQ(snapshot.proof_kind, RESOURCE_X_PROOF_REMOTE_CARRIER);
+	UT_ASSERT_EQ(snapshot.source_node, 0);
+	UT_ASSERT_EQ(snapshot.source_carrier_generation, 61);
+	UT_ASSERT_EQ(snapshot.requester_target_generation, 62);
+	UT_ASSERT_EQ(snapshot.final_authority_generation, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_authority_grant_exact(
+		&assertion.common.logical_assertion, &grant), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(grant.kind, RESOURCE_X_WIRE_AUTHORITY_GRANT);
+	UT_ASSERT_EQ(grant.payload_bytes, RESOURCE_X_PROOF_V1_BYTES);
+	UT_ASSERT(resource_x_assertion_equal(&grant.common.logical_assertion,
+		&assertion.common.logical_assertion));
+	UT_ASSERT_EQ(grant.common.base_authority_generation, 1);
+	UT_ASSERT_EQ(grant.common.resource_formation, 17);
+	UT_ASSERT_EQ(grant.common.master_session_incarnation, 31);
+	UT_ASSERT_EQ(grant.common.assertion_sequence, 41);
+	UT_ASSERT_EQ(grant.common.ordered_lane, 7);
+	UT_ASSERT_EQ(grant.common.action_node, 2);
+	UT_ASSERT_EQ(grant.common.target_mode, PCM_STATE_X);
+	UT_ASSERT_EQ(grant.common.outcome, RESOURCE_X_OUTCOME_OK);
+	UT_ASSERT_EQ(grant.common.flags,
+		RESOURCE_X_COMMON_FLAG_REMOTE_IMAGE_REQUIRED);
+	UT_ASSERT_EQ(grant.common.authority_generation, 2);
+	UT_ASSERT_EQ(memcmp(grant.body.authority_grant.source_fence,
+		blocked.body.blocked_to_n.source_fence,
+		sizeof(grant.body.authority_grant.source_fence)), 0);
+	UT_ASSERT_EQ(grant.body.authority_grant.final_authority_generation, 2);
+	UT_ASSERT_EQ(grant.body.authority_grant.source_carrier_generation, 61);
+	UT_ASSERT_EQ(grant.body.authority_grant.requester_target_generation, 62);
+	UT_ASSERT_EQ(grant.body.authority_grant.page_scn_lsn, 63);
+	UT_ASSERT_EQ(grant.body.authority_grant.dependency_count, 2);
+	UT_ASSERT_EQ(grant.body.authority_grant.dependencies[0], 65);
+	UT_ASSERT_EQ(grant.body.authority_grant.dependencies[1], 66);
+	UT_ASSERT_EQ(grant.body.authority_grant.source_proof_crc32c,
+		UINT32_C(0x11223344));
+	UT_ASSERT_EQ(grant.body.authority_grant.page_checksum,
+		UINT32_C(0x55667788));
+	UT_ASSERT_EQ(grant.body.authority_grant.proof_kind,
+		RESOURCE_X_PROOF_REMOTE_CARRIER);
+	UT_ASSERT_EQ(grant.body.authority_grant.source_disposition,
+		RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE);
+	UT_ASSERT_EQ(grant.body.authority_grant.requester_connection_generation,
+		51);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&blocked, 0,
+														 &snapshot),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	changed = blocked;
+	changed.body.blocked_to_n.source_fence[0] ^= UINT8_C(1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&changed, 0,
+														 &snapshot),
+				 RESOURCE_X_APPLY_STALE);
+	changed = blocked;
+	changed.body.blocked_to_n.page_scn_lsn++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&changed, 0,
+														 &snapshot),
+				 RESOURCE_X_APPLY_STALE);
+	changed = blocked;
+	changed.body.blocked_to_n.source_proof_crc32c++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&changed, 0,
+														 &snapshot),
+				 RESOURCE_X_APPLY_STALE);
+	changed = blocked;
+	changed.body.blocked_to_n.page_checksum++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&changed, 0,
+														 &snapshot),
+				 RESOURCE_X_APPLY_STALE);
+	changed = blocked;
+	changed.body.blocked_to_n.holder_connection_generation++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&changed, 0,
+														 &snapshot),
+				 RESOURCE_X_APPLY_STALE);
+	changed = blocked;
+	changed.body.blocked_to_n.acting_formation++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&changed, 0,
+														 &snapshot),
+				 RESOURCE_X_APPLY_STALE);
+
+	/* A remote carrier is valid only from the exact current X source. */
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(s_tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,
+										  s_tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2,
+		&snapshot), RESOURCE_X_APPLY_APPLIED);
+	blocked.common.logical_assertion = assertion.common.logical_assertion;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_blocked_to_n_exact(&blocked, 0,
+		&snapshot), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_query(s_tag), PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+	UT_ASSERT_EQ(snapshot.proof_kind, 0);
+}
+
+UT_TEST(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed)
+{
+	BufferTag local_tag = make_tag(144);
+	BufferTag durable_tag = make_tag(145);
+	BufferTag pi_tag = make_tag(146);
+	ResourceXDecodedFrame assertion;
+	ResourceXDecodedFrame local_proof;
+	ResourceXDurableProof durable_proof;
+	ResourceXMasterSnapshot snapshot;
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,
+										  local_tag, 1, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 1,
+														&snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_PROOF);
+
+	local_proof = make_resource_x_master_frame(
+		RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION, local_tag, 1, 1);
+	local_proof.common.observed_mode = PCM_STATE_S;
+	local_proof.common.outcome = RESOURCE_X_OUTCOME_OK;
+	local_proof.body.local_proof.local_holder_authority_generation = 71;
+	local_proof.body.local_proof.requester_target_generation = 72;
+	local_proof.body.local_proof.dependency_count = 2;
+	local_proof.body.local_proof.dependency_vector_crc32c
+		= UINT32_C(0x11223344);
+	local_proof.body.local_proof.page_checksum = UINT32_C(0x55667788);
+	local_proof.body.local_proof.local_image_proof_crc32c
+		= UINT32_C(0x99aabbcc);
+	local_proof.body.local_proof.requester_connection_generation = 73;
+	local_proof.body.local_proof.local_proof_generation = 74;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_local_proof_exact(&local_proof,
+		1, &snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_GRANT_COMMITTED);
+	UT_ASSERT_EQ(snapshot.proof_kind, RESOURCE_X_PROOF_LOCAL_IMAGE);
+	UT_ASSERT_EQ(snapshot.source_disposition,
+				 RESOURCE_X_DISPOSITION_LOCAL_IMAGE);
+	UT_ASSERT_EQ(snapshot.requester_target_generation, 72);
+	UT_ASSERT_EQ(snapshot.final_authority_generation, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_local_proof_exact(&local_proof,
+		1, &snapshot), RESOURCE_X_APPLY_DUPLICATE);
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,
+										  durable_tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2,
+														&snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	memset(&durable_proof, 0, sizeof(durable_proof));
+	durable_proof.assertion = assertion.common.logical_assertion;
+	durable_proof.base_authority_generation = 1;
+	durable_proof.resource_formation = 17;
+	durable_proof.master_session_incarnation = 31;
+	durable_proof.assertion_sequence = 41;
+	durable_proof.requester_target_generation = 81;
+	durable_proof.page_scn_lsn = 82;
+	durable_proof.page_checksum = UINT32_C(0x12345678);
+	durable_proof.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable_proof,
+		&snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_GRANT_COMMITTED);
+	UT_ASSERT_EQ(snapshot.proof_kind, RESOURCE_X_PROOF_DURABLE_STORAGE);
+	UT_ASSERT_EQ(snapshot.source_disposition,
+				 RESOURCE_X_DISPOSITION_DURABLE_STORAGE);
+	UT_ASSERT_EQ(snapshot.requester_target_generation, 81);
+	UT_ASSERT_EQ(snapshot.final_authority_generation, 2);
+
+	/* A retained PI makes durable storage non-authoritative. */
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(pi_tag, PCM_LOCK_MODE_X);
+	cluster_pcm_lock_downgrade(pi_tag, PCM_LOCK_MODE_N, true);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,
+										  pi_tag, 2, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 2,
+														&snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	durable_proof.assertion = assertion.common.logical_assertion;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable_proof,
+		&snapshot), RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_PROOF);
+	UT_ASSERT_EQ(snapshot.proof_kind, 0);
+}
+
+UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
+{
+	BufferTag tag = make_tag(147);
+	ResourceXDecodedFrame first_assert;
+	ResourceXDecodedFrame second_assert;
+	ResourceXDecodedFrame settlement;
+	ResourceXDecodedFrame release;
+	ResourceXDurableProof durable;
+	ResourceXMasterSnapshot snapshot;
+
+	reset_fake_pcm_runtime(4);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	first_assert = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,
+											tag, 1, 1);
+	second_assert = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,
+											 tag, 2, 2);
+	second_assert.common.assertion_sequence = 42;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&first_assert, 1,
+		&snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_PROOF);
+	UT_ASSERT_EQ(snapshot.is_head, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&second_assert, 2,
+		&snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_QUEUED);
+	UT_ASSERT_EQ(snapshot.is_head, 0);
+
+	memset(&durable, 0, sizeof(durable));
+	durable.assertion = first_assert.common.logical_assertion;
+	durable.base_authority_generation = 1;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = 41;
+	durable.requester_target_generation = 81;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable,
+		&snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.final_authority_generation, 2);
+
+	settlement = make_resource_x_master_frame(
+		RESOURCE_X_WIRE_INSTALL_SETTLEMENT, tag, 1, 1);
+	settlement.common.outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.common.authority_generation = 2;
+	settlement.body.install_settlement.conversion_base_generation = 1;
+	settlement.body.install_settlement.final_authority_generation = 2;
+	settlement.body.install_settlement.requester_connection_generation = 91;
+	settlement.body.install_settlement.requester_target_generation = 81;
+	settlement.body.install_settlement.page_scn_lsn = 82;
+	settlement.body.install_settlement.page_checksum = UINT32_C(0x12345678);
+	settlement.body.install_settlement.source_proof_crc32c
+		= UINT32_C(0x87654321);
+	settlement.body.install_settlement.installed_mode = PCM_STATE_X;
+	settlement.body.install_settlement.requester_role
+		= RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+	settlement.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.body.install_settlement.terminal_state
+		= RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(
+		&settlement, 1, &snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
+	UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_X);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+		&second_assert.common.logical_assertion, &snapshot),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+	UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1) << 1);
+
+	release = make_resource_x_master_frame(RESOURCE_X_WIRE_RELEASE_X,
+										tag, 1, 1);
+	release.common.observed_mode = PCM_STATE_X;
+	release.common.target_mode = PCM_STATE_N;
+	release.common.outcome = RESOURCE_X_OUTCOME_OK;
+	release.common.authority_generation = 2;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_release_x_exact(&release, 1,
+		&snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_RELEASED);
+	UT_ASSERT_EQ(cluster_pcm_lock_query(tag), PCM_LOCK_MODE_N);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_release_x_exact(&release, 1,
+		&snapshot), RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+		&second_assert.common.logical_assertion, &snapshot),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_PROOF);
+	UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1) << 1);
+	UT_ASSERT_EQ(snapshot.blocked_holders_bitmap, UINT32_C(1) << 1);
+	UT_ASSERT_EQ(snapshot.is_head, 1);
+
+	durable.assertion = second_assert.common.logical_assertion;
+	durable.assertion_sequence = 42;
+	durable.requester_target_generation = 83;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(&durable,
+		&snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_GRANT_COMMITTED);
+	UT_ASSERT_EQ(snapshot.final_authority_generation, 3);
 }
 
 UT_TEST(test_pcm_grd_convert_queue_placeholder_remains_null)
@@ -2909,7 +3281,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(70);
+	UT_PLAN(73);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -2945,6 +3317,9 @@ main(void)
 	UT_RUN(test_resource_x_reconfig_t1_orphan_blocks_once_and_retains_evidence);
 	UT_RUN(test_resource_x_reconfig_t2_neutralizes_outside_entry_lock_then_blocks_orphan);
 	UT_RUN(test_resource_x_reconfig_t2_newer_sidecar_survives_and_blocks_orphan);
+	UT_RUN(test_resource_x_master_remote_proof_is_retained_not_inferred);
+	UT_RUN(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed);
+	UT_RUN(test_resource_x_master_settlement_release_starts_fifo_successor);
 	UT_RUN(test_pcm_grd_convert_queue_placeholder_remains_null);
 	UT_RUN(test_pcm_real_wait_event_call_sites_are_exercised);
 	UT_RUN(test_pcm_H1_same_node_s_refcount_increments);

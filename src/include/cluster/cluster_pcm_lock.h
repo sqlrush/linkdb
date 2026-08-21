@@ -55,6 +55,7 @@
 #include "cluster/cluster_conf.h"		 /* cluster_conf_has_peers */
 #include "cluster/cluster_grd.h"		 /* ClusterGrdHolderId */
 #include "cluster/cluster_resource_x_identity.h"
+#include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_scn.h"		 /* spec-2.41 D2 — SCN dual watermark */
 #include "storage/buf_internals.h"		 /* BufferTag */
 
@@ -218,6 +219,71 @@ typedef enum ResourceXReconfigResult {
 	RESOURCE_X_RECONFIG_ORPHAN,
 	RESOURCE_X_RECONFIG_CORRUPT
 } ResourceXReconfigResult;
+
+/* R10 retained master state.  Intent/reclaim values are wire-independent,
+ * closed process-local result domains frozen by spec-8.10 D10-06. */
+typedef enum ResourceXIntentResult {
+	RESOURCE_X_INTENT_STAGED = 1,
+	RESOURCE_X_INTENT_NOT_ADMITTED = 2,
+	RESOURCE_X_INTENT_HARD_REARMED = 3,
+	RESOURCE_X_INTENT_STALE = 4
+} ResourceXIntentResult;
+
+typedef enum ResourceXReclaimResult {
+	RESOURCE_X_RECLAIM_NONE = 1,
+	RESOURCE_X_RECLAIM_NONHEAD = 2,
+	RESOURCE_X_RECLAIM_HEAD_SUCCESSOR_STARTED = 3,
+	RESOURCE_X_RECLAIM_ORPHAN_BLOCKED = 4
+} ResourceXReclaimResult;
+
+typedef enum ResourceXMasterPhase {
+	RESOURCE_X_MASTER_NONE = 0,
+	RESOURCE_X_MASTER_QUEUED = 1,
+	RESOURCE_X_MASTER_WAIT_BLOCKERS = 2,
+	RESOURCE_X_MASTER_WAIT_PROOF = 3,
+	RESOURCE_X_MASTER_GRANT_COMMITTED = 4,
+	RESOURCE_X_MASTER_SETTLED = 5,
+	RESOURCE_X_MASTER_RECOVERY_BLOCKED = 6,
+	RESOURCE_X_MASTER_RELEASED = 7
+} ResourceXMasterPhase;
+
+typedef struct ResourceXMasterSnapshot {
+	ResourceXAssertion assertion;
+	uint64 base_authority_generation;
+	uint64 resource_formation;
+	uint64 master_session_incarnation;
+	uint64 assertion_sequence;
+	uint64 final_authority_generation;
+	uint64 source_carrier_generation;
+	uint64 requester_target_generation;
+	uint32 incompatible_holders_bitmap;
+	uint32 blocked_holders_bitmap;
+	int32 source_node;
+	uint8 phase;
+	uint8 proof_kind;
+	uint8 source_disposition;
+	uint8 is_head;
+} ResourceXMasterSnapshot;
+
+StaticAssertDecl(sizeof(ResourceXMasterSnapshot) == 96,
+				 "ResourceXMasterSnapshot layout must remain 96 bytes");
+
+/* Master-local durable-storage proof.  It is never a wire layout: the GCS
+ * storage producer constructs it only after its real durable-image check. */
+typedef struct ResourceXDurableProof {
+	ResourceXAssertion assertion;
+	uint64 base_authority_generation;
+	uint64 resource_formation;
+	uint64 master_session_incarnation;
+	uint64 assertion_sequence;
+	uint64 requester_target_generation;
+	uint64 page_scn_lsn;
+	uint32 page_checksum;
+	uint32 source_proof_crc32c;
+} ResourceXDurableProof;
+
+StaticAssertDecl(sizeof(ResourceXDurableProof) == 80,
+				 "ResourceXDurableProof layout must remain 80 bytes");
 
 typedef struct ResourceXReconfigToken {
 	uint64 old_formation;
@@ -590,6 +656,27 @@ extern bool cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapsh
 extern bool cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_t1_grant_exact(const ResourceXAcquisitionRef *ref);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_exact(
+	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
+	ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_blocked_to_n_exact(
+	const ResourceXDecodedFrame *blocked, int32 authenticated_source_node,
+	ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_local_proof_exact(
+	const ResourceXDecodedFrame *local_proof, int32 authenticated_source_node,
+	ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_durable_proof_exact(
+	const ResourceXDurableProof *durable_proof, ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_master_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_authority_grant_exact(
+	const ResourceXAssertion *assertion, ResourceXDecodedFrame *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_settlement_exact(
+	const ResourceXDecodedFrame *settlement, int32 authenticated_source_node,
+	ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_release_x_exact(
+	const ResourceXDecodedFrame *release, int32 authenticated_source_node,
+	ResourceXMasterSnapshot *out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
 extern bool cluster_pcm_lock_resource_x_executor_enter(
