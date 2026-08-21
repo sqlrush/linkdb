@@ -12968,18 +12968,6 @@ gcs_block_pcm_x_saturating_add_us(uint64 base, uint64 delta)
 
 
 static uint64
-gcs_block_pcm_x_retry_delay_us(void)
-{
-	uint64 delay_ms
-		= (uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1);
-
-	return delay_ms > UINT64_MAX / UINT64_C(1000)
-		? UINT64_MAX
-		: delay_ms * UINT64_C(1000);
-}
-
-
-static uint64
 gcs_block_pcm_x_retry_timeout_us(void)
 {
 	uint64 timeout_ms = (uint64)Max(cluster_gcs_reply_timeout_ms, 1);
@@ -13015,15 +13003,13 @@ gcs_block_pcm_x_note_local_submission(const PcmXLocalHandle *leader,
 {
 	ResourceXRetryStateV1 state;
 	uint64 now_us = gcs_block_pcm_x_monotonic_us();
-	uint64 next_due = gcs_block_pcm_x_saturating_add_us(
-		now_us, gcs_block_pcm_x_retry_delay_us());
 	uint64 deadline = gcs_block_pcm_x_saturating_add_us(
 		now_us, gcs_block_pcm_x_retry_timeout_us());
 
-	if (next_due > deadline)
-		next_due = deadline;
 	return cluster_pcm_x_local_retry_submission_admitted_exact(
-		leader, token, now_us, next_due, deadline, &state);
+		leader, token, now_us, deadline,
+		(uint32)cluster_gcs_block_retransmit_max_retries,
+		(uint32)cluster_gcs_block_retransmit_initial_backoff_ms, &state);
 }
 
 
@@ -16653,6 +16639,7 @@ gcs_block_pcm_x_resource_retry_tick(
 	Size cursor_before;
 	Size payload_len;
 	uint64 next_due;
+	uint64 admitted_at_us;
 	uint64 now_us;
 	uint32 connection_after;
 	uint32 connection_before;
@@ -16734,9 +16721,12 @@ gcs_block_pcm_x_resource_retry_tick(
 										 work.payload, (uint16)payload_len);
 	if (!admitted)
 		return;
-	next_due = gcs_block_pcm_x_saturating_add_us(now_us, gcs_block_pcm_x_retry_delay_us());
-	if (next_due > work.retry_state.terminal_deadline_mono_us)
-		next_due = work.retry_state.terminal_deadline_mono_us;
+	admitted_at_us = gcs_block_pcm_x_monotonic_us();
+	if (!resource_x_retry_next_due_exact(&work.retry_state, admitted_at_us,
+										 work.retry_state.retry_count + 1, &next_due)) {
+		cluster_pcm_x_runtime_fail_closed();
+		return;
+	}
 	result = cluster_pcm_x_local_retry_admitted_exact(
 		&work.local_handle, &work.local_token, &action, next_due, &applied);
 	cluster_pcm_x_stats_note_queue_result(result);

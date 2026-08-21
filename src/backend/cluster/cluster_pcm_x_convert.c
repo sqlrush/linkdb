@@ -16897,8 +16897,9 @@ state_done:
 PcmXQueueResult
 cluster_pcm_x_local_retry_submission_admitted_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
-	uint64 first_submit_mono_us, uint64 next_retry_due_mono_us,
-	uint64 terminal_deadline_mono_us, ResourceXRetryStateV1 *state_out)
+	uint64 first_submit_mono_us, uint64 terminal_deadline_mono_us,
+	uint32 max_retries, uint32 initial_backoff_ms,
+	ResourceXRetryStateV1 *state_out)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
@@ -16941,8 +16942,8 @@ cluster_pcm_x_local_retry_submission_admitted_exact(
 		goto submission_done;
 	}
 	if (!resource_x_retry_state_init(&attempt, first_submit_mono_us,
-									 next_retry_due_mono_us,
-									 terminal_deadline_mono_us, 1, &state)) {
+									 terminal_deadline_mono_us, max_retries,
+									 initial_backoff_ms, 1, &state)) {
 		result = PCM_X_QUEUE_INVALID;
 		goto submission_done;
 	}

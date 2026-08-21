@@ -1481,8 +1481,19 @@ UT_TEST(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage)
 		UT_ASSERT_NOT_NULL(retry_tick);
 		UT_ASSERT_NOT_NULL(retry_tick_end);
 		if (retry_tick != NULL && retry_tick_end != NULL) {
+			const char *backoff_guc = strstr(
+				retry_tick, "cluster_gcs_block_retransmit_initial_backoff_ms");
+			const char *budget_guc = strstr(
+				retry_tick, "cluster_gcs_block_retransmit_max_retries");
+			const char *sampled_next = strstr(retry_tick,
+										  "resource_x_retry_next_due_exact");
+
 			UT_ASSERT_NOT_NULL(strstr(retry_tick, "\"work-next\""));
 			UT_ASSERT_NOT_NULL(strstr(retry_tick, "cursor_before"));
+			UT_ASSERT_NOT_NULL(sampled_next);
+			UT_ASSERT(sampled_next == NULL || sampled_next < retry_tick_end);
+			UT_ASSERT(backoff_guc == NULL || backoff_guc >= retry_tick_end);
+			UT_ASSERT(budget_guc == NULL || budget_guc >= retry_tick_end);
 		}
 		UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_x_retry_work_next"));
 		UT_ASSERT_NOT_NULL(strstr(source, "#define PCM_X_MASTER_DRIVE_SCAN_BUDGET 1024"));

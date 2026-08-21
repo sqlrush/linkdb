@@ -1899,8 +1899,9 @@ extern PcmXQueueResult cluster_pcm_x_local_retry_state_exact(
 	const PcmXLocalHandle *leader, ResourceXRetryStateV1 *state_out);
 extern PcmXQueueResult cluster_pcm_x_local_retry_submission_admitted_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
-	uint64 first_submit_mono_us, uint64 next_retry_due_mono_us,
-	uint64 terminal_deadline_mono_us, ResourceXRetryStateV1 *state_out);
+	uint64 first_submit_mono_us, uint64 terminal_deadline_mono_us,
+	uint32 max_retries, uint32 initial_backoff_ms,
+	ResourceXRetryStateV1 *state_out);
 extern PcmXQueueResult cluster_pcm_x_local_retry_admitted_exact(
 	const PcmXLocalHandle *leader, const PcmXLocalReliableToken *expected,
 	const ResourceXRetryAction *action, uint64 next_retry_due_mono_us,

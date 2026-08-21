@@ -15881,8 +15881,7 @@ UT_TEST(test_resource_x_retry_submission_is_visible_to_bounded_work_cursor)
 	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&leader, &enqueue, &token),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
-					 &leader, &token, UINT64_C(1000), UINT64_C(1010), UINT64_C(6000),
-					 &state),
+					 &leader, &token, UINT64_C(1000), UINT64_C(6000), 4, 1, &state),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(state.retry_count, 0);
 	UT_ASSERT_EQ(state.state_generation, 1);
@@ -15904,16 +15903,16 @@ UT_TEST(test_resource_x_retry_submission_is_visible_to_bounded_work_cursor)
 	transport.lane_id = 1;
 	UT_ASSERT_EQ(resource_x_retry_classify_exact(&work.retry_state,
 											 &work.retry_state.attempt, &transport,
-											 UINT64_C(1010), &action),
+											 UINT64_C(2000), &action),
 				 RESOURCE_X_RETRY_STAGE_EXACT);
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_admitted_exact(
-					 &work.local_handle, &work.local_token, &action, UINT64_C(1020), &state),
+					 &work.local_handle, &work.local_token, &action, UINT64_C(3000), &state),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(state.retry_count, 1);
 	UT_ASSERT_EQ(state.state_generation, 2);
-	UT_ASSERT_EQ(state.next_retry_due_mono_us, UINT64_C(1020));
+	UT_ASSERT_EQ(state.next_retry_due_mono_us, UINT64_C(3000));
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_admitted_exact(
-					 &work.local_handle, &work.local_token, &action, UINT64_C(1030), &state),
+					 &work.local_handle, &work.local_token, &action, UINT64_C(4000), &state),
 				 PCM_X_QUEUE_STALE);
 	UT_ASSERT_EQ(state.retry_count, 0);
 }
@@ -15947,16 +15946,14 @@ UT_TEST(test_resource_x_retry_cursor_is_bounded_and_resumes_past_retained_entry)
 	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&first, &enqueue, &token),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
-					 &first, &token, UINT64_C(1000), UINT64_C(1010), UINT64_C(6000),
-					 &state),
+					 &first, &token, UINT64_C(1000), UINT64_C(6000), 4, 1, &state),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&second_identity, 1, UINT64_C(7222), &second),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&second, &enqueue, &token),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(cluster_pcm_x_local_retry_submission_admitted_exact(
-					 &second, &token, UINT64_C(1000), UINT64_C(1010), UINT64_C(6000),
-					 &state),
+					 &second, &token, UINT64_C(1000), UINT64_C(6000), 4, 1, &state),
 				 PCM_X_QUEUE_OK);
 
 	total = header->layout.pools[PCM_X_POOL_MASTER_TAG].capacity

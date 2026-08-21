@@ -13,6 +13,10 @@
 
 #include "cluster/cluster_resource_x_identity.h"
 
+#define RESOURCE_X_RETRY_MAX_RETRIES 8
+#define RESOURCE_X_RETRY_MIN_BACKOFF_MS 1
+#define RESOURCE_X_RETRY_MAX_BACKOFF_MS 5000
+
 typedef enum ResourceXRetryPhase {
 	RESOURCE_X_RETRY_PRE_NO_RETURN = 1,
 	RESOURCE_X_RETRY_POST_NO_RETURN = 2,
@@ -28,6 +32,7 @@ typedef struct ResourceXRetryStateV1 {
 	uint32 retry_count;
 	uint32 terminal_errcode;
 	uint16 last_phase;
+	/* Mixed-radix snapshot: max_retries * 5000 + (backoff_ms - 1). */
 	uint16 flags;
 	uint32 state_generation;
 } ResourceXRetryStateV1;
@@ -74,12 +79,18 @@ StaticAssertDecl(offsetof(ResourceXRetryAction, attempt) == 0
 
 extern bool resource_x_retry_state_init(const ResourceXAttemptWitness *attempt,
 										uint64 first_submit_mono_us,
-										uint64 next_retry_due_mono_us,
 										uint64 terminal_deadline_mono_us,
+										uint32 max_retries,
+										uint32 initial_backoff_ms,
 										uint32 state_generation,
 										ResourceXRetryStateV1 *out);
 extern void resource_x_retry_state_clear(ResourceXRetryStateV1 *state);
 extern bool resource_x_retry_state_is_clear(const ResourceXRetryStateV1 *state);
+extern bool resource_x_retry_policy_exact(const ResourceXRetryStateV1 *state,
+	uint32 *max_retries_out, uint32 *initial_backoff_ms_out);
+extern bool resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state,
+	uint64 last_admitted_mono_us, uint32 admitted_retry_count,
+	uint64 *next_due_out);
 extern ResourceXRetryDecision resource_x_retry_classify_exact(
 	const ResourceXRetryStateV1 *state,
 	const ResourceXAttemptWitness *current_attempt,
