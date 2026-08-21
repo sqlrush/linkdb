@@ -149,6 +149,28 @@ rf_side_online_production_owner_init_v1(
 }
 
 RfPageProofDetailV1
+rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
+	RfSideOnlineProductionOwnerV1 *owner)
+{
+	RfSideOnlineApplyOpsV1 ops;
+
+	if (plan == NULL || owner == NULL || owner->protected_set_active)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	owner->protected_set_complete = false;
+	memset(&ops, 0, sizeof(ops));
+	ops.arg = owner;
+	ops.begin_protected_set = side_owner_begin_protected_set;
+	ops.end_protected_set = side_owner_end_protected_set;
+	ops.preflight_xact = side_owner_preflight_xact;
+	ops.preflight_undo = side_owner_preflight_undo;
+	ops.preflight_projection = side_owner_preflight_projection;
+	ops.apply_xact = side_owner_apply_xact;
+	ops.apply_undo = side_owner_apply_undo;
+	ops.apply_projection = side_owner_apply_projection;
+	return rf_side_online_plan_preflight_v1(plan, &ops);
+}
+
+RfPageProofDetailV1
 rf_side_online_production_apply_v1(const RfSideOnlinePlanV1 *plan,
 	RfSideOnlineProductionOwnerV1 *owner)
 {

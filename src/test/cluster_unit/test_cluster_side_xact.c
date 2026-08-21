@@ -1438,6 +1438,14 @@ UT_TEST(test_online_plan_preflights_all_targets_before_first_mutation)
 	apply_ops.preflight_undo = reject_undo_preflight;
 	apply_ops.apply_xact = capture_apply;
 	apply_ops.apply_undo = capture_apply_undo;
+	UT_ASSERT_EQ(rf_side_online_plan_preflight_v1(plan, &apply_ops),
+		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(capture.count, 0);
+	UT_ASSERT_EQ(capture.undo_count, 0);
+	UT_ASSERT_EQ(capture.begin_count, 1);
+	UT_ASSERT_EQ(capture.end_count, 1);
+	UT_ASSERT(!capture.end_complete);
+	memset(&capture, 0, sizeof(capture));
 	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
 		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 	UT_ASSERT_EQ(capture.count, 0);

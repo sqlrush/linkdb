@@ -130,6 +130,37 @@ cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
 }
 
 RfPageProofDetailV1
+rf_side_online_plan_preflight_v1(const RfSideOnlinePlanV1 *plan,
+	const RfSideOnlineApplyOpsV1 *ops)
+{
+	RfSideOnlineOperationV1 operations[3];
+	uint32 i;
+
+	UT_ASSERT(plan != NULL);
+	memset(operations, 0, sizeof(operations));
+	operations[0].kind = RF_SIDE_ONLINE_OPERATION_XACT;
+	operations[1].kind = RF_SIDE_ONLINE_OPERATION_UNDO;
+	operations[2].kind = RF_SIDE_ONLINE_OPERATION_PROJECTION;
+	if (!ops->begin_protected_set(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	for (i = 0; i < 3; i++)
+	{
+		bool accepted = i == 0 ? ops->preflight_xact(ops->arg,
+			&operations[i]) : i == 1 ? ops->preflight_undo(ops->arg,
+			&operations[i]) : ops->preflight_projection(ops->arg,
+			&operations[i]);
+
+		if (!accepted)
+		{
+			ops->end_protected_set(ops->arg, false);
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		}
+	}
+	ops->end_protected_set(ops->arg, false);
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
 rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 	const RfSideOnlineApplyOpsV1 *ops)
 {
@@ -181,6 +212,15 @@ UT_TEST(test_owner_runs_all_preflights_before_fresh_gated_mutations)
 	memset(&capture, 0, sizeof(capture));
 	UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &capture,
 		fresh_authority, 19, true));
+	UT_ASSERT_EQ(rf_side_online_production_preflight_v1(plan, &owner),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(capture.authority_calls, 4);
+	UT_ASSERT_EQ(capture.pushes, 1);
+	UT_ASSERT_EQ(capture.pops, 1);
+	UT_ASSERT_EQ(capture.xact_applies, 0);
+	UT_ASSERT_EQ(capture.undo_applies, 0);
+	UT_ASSERT_EQ(capture.projection_applies, 0);
+	memset(&capture, 0, sizeof(capture));
 	UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
 		RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(capture.authority_calls, 8);

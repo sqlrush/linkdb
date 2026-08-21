@@ -98,6 +98,8 @@ extern uint32 rf_side_online_plan_operation_count_v1(
 	const RfSideOnlinePlanV1 *plan);
 extern bool rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan,
 	uint32 index, RfSideOnlineOperationV1 *out_operation);
+extern RfPageProofDetailV1 rf_side_online_plan_preflight_v1(
+	const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOpsV1 *ops);
 extern RfPageProofDetailV1 rf_side_online_plan_apply_v1(
 	const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOpsV1 *ops);
 extern bool rf_side_online_projection_owner_init_v1(

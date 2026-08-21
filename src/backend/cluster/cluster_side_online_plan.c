@@ -638,19 +638,17 @@ rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan,
 	return true;
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
-						 const RfSideOnlineApplyOpsV1 *ops)
+static bool
+side_plan_apply_ops_valid(const RfSideOnlinePlanV1 *plan,
+	const RfSideOnlineApplyOpsV1 *ops)
 {
 	uint32		i;
 
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC ||
 		!plan->sealed || ops == NULL)
-		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	if (plan->operation_count == 0)
-		return RF_PAGE_PROOF_DETAIL_OK;
+		return false;
 	if (ops->begin_protected_set == NULL || ops->end_protected_set == NULL)
-		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+		return false;
 	for (i = 0; i < plan->operation_count; i++)
 		if ((plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_XACT &&
 			 (ops->preflight_xact == NULL || ops->apply_xact == NULL)) ||
@@ -660,9 +658,16 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 			 (ops->preflight_projection == NULL ||
 			  ops->apply_projection == NULL)) ||
 			plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
-			return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	if (!ops->begin_protected_set(ops->arg))
-		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			return false;
+	return true;
+}
+
+static RfPageProofDetailV1
+side_plan_preflight_active(const RfSideOnlinePlanV1 *plan,
+	const RfSideOnlineApplyOpsV1 *ops)
+{
+	uint32 i;
+
 	/*
 	 * STOP-06 section 9.2: classify every target before the first target
 	 * byte changes.  The caller keeps its protected-set certification stable
@@ -676,17 +681,11 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT &&
 			operation.xact.kind == RF_SIDE_XACT_COMMIT_PREPARED &&
 			!side_plan_commit_prepared_dependencies_closed(plan, i))
-		{
-			ops->end_protected_set(ops->arg, false);
 			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-		}
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT &&
 			operation.xact.kind == RF_SIDE_XACT_ABORT_PREPARED &&
 			!side_plan_abort_prepared_dependencies_closed(plan, i))
-		{
-			ops->end_protected_set(ops->arg, false);
 			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-		}
 		if (operation.owned_payload_length > 0)
 			operation.owned_payload = plan->owned_payload +
 				operation.owned_payload_offset;
@@ -697,10 +696,47 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 		else
 			accepted = ops->preflight_projection(ops->arg, &operation);
 		if (!accepted)
-		{
-			ops->end_protected_set(ops->arg, false);
 			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-		}
+	}
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_preflight_v1(const RfSideOnlinePlanV1 *plan,
+	const RfSideOnlineApplyOpsV1 *ops)
+{
+	RfPageProofDetailV1 detail;
+
+	if (!side_plan_apply_ops_valid(plan, ops))
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (plan->operation_count == 0)
+		return RF_PAGE_PROOF_DETAIL_OK;
+	if (!ops->begin_protected_set(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	detail = side_plan_preflight_active(plan, ops);
+	/* A preflight-only pass never publishes a complete protected set. */
+	ops->end_protected_set(ops->arg, false);
+	return detail;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
+						 const RfSideOnlineApplyOpsV1 *ops)
+{
+	RfPageProofDetailV1 detail;
+	uint32		i;
+
+	if (!side_plan_apply_ops_valid(plan, ops))
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (plan->operation_count == 0)
+		return RF_PAGE_PROOF_DETAIL_OK;
+	if (!ops->begin_protected_set(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	detail = side_plan_preflight_active(plan, ops);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+	{
+		ops->end_protected_set(ops->arg, false);
+		return detail;
 	}
 	for (i = 0; i < plan->operation_count; i++)
 	{
