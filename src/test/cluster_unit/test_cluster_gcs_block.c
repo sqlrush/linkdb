@@ -5884,11 +5884,73 @@ UT_TEST(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake
 	free(source);
 }
 
+UT_TEST(test_resource_x_reused_type_ingress_precedes_every_legacy_path)
+{
+	static const char *const handler_names[] = {
+		"\ncluster_gcs_handle_block_request_envelope(",
+		"\ncluster_gcs_handle_block_reply_envelope(",
+		"\ncluster_gcs_handle_block_done_envelope(",
+		"\ncluster_gcs_handle_block_invalidate_envelope(",
+		"\ncluster_gcs_handle_block_invalidate_ack_envelope("
+	};
+	static const char *const legacy_boundaries[] = {
+		"gcs_block_try_r4_request80(env, payload)",
+		"gcs_block_try_land_current_mx_reply(env, payload)",
+		"sizeof(GcsBlockDonePayload)",
+		"CLUSTER_INJECTION_POINT(\"cluster-gcs-block-invalidate-stall-ack\")",
+		"if (ClusterGcsBlock == NULL)"
+	};
+	char *source = read_gcs_block_source();
+	const char *helper;
+	int i;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	helper = strstr(source, "\ngcs_block_try_resource_x_frame(");
+	UT_ASSERT_NOT_NULL(helper);
+	if (helper != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(helper, "gcs_block_resource_x_payload_candidate("));
+		UT_ASSERT_NOT_NULL(strstr(helper, "cluster_resource_x_wire_decode("));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1"));
+		UT_ASSERT_NOT_NULL(strstr(helper, "cluster_sf_peer_capability_word_sample("));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"frame.common.sender_connection_generation != connection_generation"));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"cluster_pcm_lock_resource_x_assert_exact("));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"cluster_pcm_lock_resource_x_local_proof_exact("));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"cluster_pcm_lock_resource_x_blocked_to_n_exact("));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"cluster_pcm_lock_resource_x_install_settlement_exact("));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"cluster_pcm_lock_resource_x_release_x_exact("));
+	}
+	for (i = 0; i < (int)lengthof(handler_names); i++) {
+		const char *handler = strstr(source, handler_names[i]);
+		const char *intercept;
+		const char *legacy;
+
+		UT_ASSERT_NOT_NULL(handler);
+		if (handler == NULL)
+			continue;
+		intercept = strstr(handler, "gcs_block_try_resource_x_frame(env, payload)");
+		legacy = strstr(handler, legacy_boundaries[i]);
+		UT_ASSERT_NOT_NULL(intercept);
+		UT_ASSERT_NOT_NULL(legacy);
+		if (intercept != NULL && legacy != NULL)
+			UT_ASSERT(intercept < legacy);
+	}
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(108);
+	UT_PLAN(109);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5997,6 +6059,7 @@ main(void)
 	UT_RUN(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain);
 	UT_RUN(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return);
 	UT_RUN(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake);
+	UT_RUN(test_resource_x_reused_type_ingress_precedes_every_legacy_path);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

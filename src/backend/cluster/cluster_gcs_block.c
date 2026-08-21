@@ -80,6 +80,7 @@
 #include "cluster/cluster_pcm_own.h" /* S3 forensics — ownership gen in 53R93 errdetail */
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pcm_x_image_fetch.h"
+#include "cluster/cluster_resource_x_node_wire.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -8006,6 +8007,96 @@ gcs_block_queue_pending_x_authoritative(BufferTag tag)
 		   && (authority.pending_x_since_lsn & PCM_PENDING_X_QUEUE_KIND) != 0;
 }
 
+static bool
+gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
+{
+	if (msg_type == RESOURCE_X_MSG_ASSERT_X)
+		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
+			|| payload_length == RESOURCE_X_SHORT_V1_BYTES;
+	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
+		return payload_length == RESOURCE_X_PROOF_V1_BYTES
+			|| payload_length == RESOURCE_X_IMAGE_V1_BYTES;
+	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
+		return payload_length == RESOURCE_X_CONTROL_V1_BYTES;
+	if (msg_type == RESOURCE_X_MSG_BLOCKED_TO_N)
+		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
+			|| payload_length == RESOURCE_X_PROOF_V1_BYTES;
+	if (msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE)
+		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
+			|| payload_length == RESOURCE_X_SHORT_V1_BYTES;
+	return false;
+}
+
+/* Consume the exact Resource-X subdomain before any reused legacy parser.
+ * A candidate length never falls back after a malformed header, stale DATA
+ * connection, or unavailable consumer.  Capability publication remains off
+ * until the type-15/type-17 consumers and retained C-intent egress close. */
+static bool
+gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
+							   const void *payload)
+{
+	ResourceXDecodedFrame frame;
+	ResourceXMasterSnapshot snapshot;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_INVALID;
+	uint32 capability_word = 0;
+	uint32 connection_generation = 0;
+
+	if (env == NULL
+		|| !gcs_block_resource_x_payload_candidate(env->msg_type,
+											 env->payload_length))
+		return false;
+	if (payload == NULL || env->source_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| env->dest_node_id != (uint32)cluster_node_id
+		|| env->payload_length > PG_UINT16_MAX
+		|| !cluster_resource_x_wire_decode(env->msg_type, payload,
+			(uint16)env->payload_length, &frame, &reject))
+		return true;
+	if (env->epoch != frame.common.resource_formation)
+		return true;
+	if ((int32)env->source_node_id == cluster_node_id) {
+		if ((cluster_ic_local_capability_word()
+			 & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) == 0)
+			return true;
+		connection_generation = frame.common.sender_connection_generation;
+	} else if (!cluster_sf_peer_capability_word_sample(
+			   (int32)env->source_node_id,
+			   PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+			   &capability_word, &connection_generation))
+		return true;
+	if (frame.common.sender_connection_generation != connection_generation)
+		return true;
+
+	switch (frame.kind) {
+	case RESOURCE_X_WIRE_ASSERT_X:
+		result = cluster_pcm_lock_resource_x_assert_exact(
+			&frame, (int32)env->source_node_id, &snapshot);
+		break;
+	case RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION:
+		result = cluster_pcm_lock_resource_x_local_proof_exact(
+			&frame, (int32)env->source_node_id, &snapshot);
+		break;
+	case RESOURCE_X_WIRE_BLOCKED_TO_N:
+		result = cluster_pcm_lock_resource_x_blocked_to_n_exact(
+			&frame, (int32)env->source_node_id, &snapshot);
+		break;
+	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT:
+		result = cluster_pcm_lock_resource_x_install_settlement_exact(
+			&frame, (int32)env->source_node_id, &snapshot);
+		break;
+	case RESOURCE_X_WIRE_RELEASE_X:
+		result = cluster_pcm_lock_resource_x_release_x_exact(
+			&frame, (int32)env->source_node_id, &snapshot);
+		break;
+	case RESOURCE_X_WIRE_BLOCK_TO_N:
+	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
+	case RESOURCE_X_WIRE_AUTHORITY_GRANT:
+		break;
+	}
+	(void)result;
+	return true;
+}
+
 /*
  * cluster_gcs_handle_block_request_envelope — master-side dispatcher.
  *
@@ -8050,6 +8141,8 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	if (cluster_authority_readiness_managed()
 		&& !cluster_serving_ready_is_current())
+		return;
+	if (gcs_block_try_resource_x_frame(env, payload))
 		return;
 	if (gcs_block_try_r4_request80(env, payload))
 		return;
@@ -10258,6 +10351,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
 
+	if (gcs_block_try_resource_x_frame(env, payload))
+		return;
 	if (gcs_block_try_land_current_mx_reply(env, payload))
 		return;
 	if (gcs_block_try_land_r4_terminal_reply(env, payload))
@@ -17638,6 +17733,8 @@ cluster_gcs_handle_block_done_envelope(const ClusterICEnvelope *env, const void 
 	GcsBlockDedupKey key;
 	int dedup_worker_id;
 
+	if (gcs_block_try_resource_x_frame(env, payload))
+		return;
 	if (env == NULL || payload == NULL || env->payload_length != sizeof(GcsBlockDonePayload))
 		return;
 	done = (const GcsBlockDonePayload *)payload;
@@ -19064,6 +19161,8 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 	uint64 current_epoch;
 	uint64 source_session;
 
+	if (gcs_block_try_resource_x_frame(env, payload))
+		return;
 	/* D16 inject — stall ack for timeout testing. */
 	CLUSTER_INJECTION_POINT("cluster-gcs-block-invalidate-stall-ack");
 	if (cluster_injection_should_skip("cluster-gcs-block-invalidate-stall-ack"))
@@ -19197,6 +19296,8 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	bool queue_positive = false;
 	bool valid = false;
 
+	if (gcs_block_try_resource_x_frame(env, payload))
+		return;
 	if (ClusterGcsBlock == NULL)
 		return;
 

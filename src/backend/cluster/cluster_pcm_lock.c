@@ -5031,21 +5031,23 @@ cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
 	}
 	request = &state->requests[requester_node];
 	if (request->phase != RESOURCE_X_MASTER_NONE) {
-		ResourceXApplyResult result
+		bool same_attempt
 			= request->base_authority_generation
-					  == assertion->common.base_authority_generation
+				  == assertion->common.base_authority_generation
 				&& request->resource_formation
 					   == assertion->common.resource_formation
 				&& request->master_session_incarnation
 					   == assertion->common.master_session_incarnation
 				&& request->assertion_sequence
-					   == assertion->common.assertion_sequence
-				? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE;
+					   == assertion->common.assertion_sequence;
 
-		pcm_resource_x_master_snapshot(&entry->tag, requester_node, state,
-									   request, out);
-		LWLockRelease(&entry->entry_lock.lock);
-		return result;
+		if (same_attempt || request->phase != RESOURCE_X_MASTER_RELEASED) {
+			pcm_resource_x_master_snapshot(&entry->tag, requester_node, state,
+										   request, out);
+			LWLockRelease(&entry->entry_lock.lock);
+			return same_attempt ? RESOURCE_X_APPLY_DUPLICATE
+							: RESOURCE_X_APPLY_STALE;
+		}
 	}
 	if (assertion->common.base_authority_generation != state->authority_generation
 		|| (entry->pending_x_requester_node != -1

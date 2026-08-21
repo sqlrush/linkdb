@@ -1757,6 +1757,7 @@ UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
 {
 	BufferTag tag = make_tag(147);
 	ResourceXDecodedFrame first_assert;
+	ResourceXDecodedFrame next_assert;
 	ResourceXDecodedFrame second_assert;
 	ResourceXDecodedFrame settlement;
 	ResourceXDecodedFrame release;
@@ -1841,6 +1842,22 @@ UT_TEST(test_resource_x_master_settlement_release_starts_fifo_successor)
 	UT_ASSERT_EQ(snapshot.incompatible_holders_bitmap, UINT32_C(1) << 1);
 	UT_ASSERT_EQ(snapshot.blocked_holders_bitmap, UINT32_C(1) << 1);
 	UT_ASSERT_EQ(snapshot.is_head, 1);
+
+	/* The released requester slot accepts only a fresh attempt based on the
+	 * current monotonic authority.  A late old release cannot alias it. */
+	next_assert = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X,
+										 tag, 1, 1);
+	next_assert.common.base_authority_generation = 2;
+	next_assert.common.authority_generation = 2;
+	next_assert.common.assertion_sequence = 43;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&next_assert, 1,
+		&snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_QUEUED);
+	UT_ASSERT_EQ(snapshot.base_authority_generation, 2);
+	UT_ASSERT_EQ(snapshot.assertion_sequence, 43);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_release_x_exact(&release, 1,
+		&snapshot), RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_QUEUED);
 
 	durable.assertion = second_assert.common.logical_assertion;
 	durable.assertion_sequence = 42;
