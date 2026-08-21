@@ -198,8 +198,8 @@ cluster_pcm_x_writer_grant_snapshot_exact(const PcmXLocalWriterClaim *claim,
 		   && claim->writer.flags == 0 && claim->claim_generation != 0
 		   && claim->writer.identity.base_own_generation != UINT64_MAX
 		   && claim->grant_base_own_generation != UINT64_MAX
-		   /* A' rebase: the requester copies the published effective grant
-			* base into the claim; zero keeps the enqueue-time identity base. */
+		   /* A follower copies the canonical node-grant base into the claim;
+			* a leader keeps zero for ordinary enqueue-time identity math. */
 		   && granted->generation
 				  == (claim->grant_base_own_generation != 0
 						  ? claim->grant_base_own_generation

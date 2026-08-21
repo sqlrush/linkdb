@@ -15392,6 +15392,9 @@ pcm_x_local_follower_chain_ready(const PcmXLocalTagSlot *tag_slot, PcmXSlotRef t
 								 Size first_index, Size expected_prev_index,
 								 uint64 expected_prev_sequence, PcmXLocalMembershipSlot **first_out,
 								 PcmXSlotRef *first_ref_out, bool *first_promote_out);
+static bool pcm_x_local_unlink_member_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag_ref,
+											 PcmXLocalMembershipSlot *member,
+											 PcmXSlotRef member_ref);
 
 
 /* A promoted successor is directory-visible before terminal image/ticket
@@ -15846,6 +15849,8 @@ cluster_pcm_x_local_writer_claim_exact(const PcmXLocalHandle *writer,
 	Size previous_index = PCM_X_INVALID_SLOT_INDEX;
 	Size visited = 0;
 	uint64 previous_sequence = 0;
+	uint64 effective_grant_base = 0;
+	uint64 expected_grant_generation;
 	uint64 next_claim_generation;
 	bool gate_claimed = false;
 	bool fail_closed = false;
@@ -15946,6 +15951,15 @@ cluster_pcm_x_local_writer_claim_exact(const PcmXLocalHandle *writer,
 			fail_closed = true;
 			goto claim_done;
 		}
+		effective_grant_base = pcm_x_local_effective_grant_base(tag_slot);
+		if (tag_slot->committed_own_generation != 0
+			&& (!cluster_pcm_x_generation_next(effective_grant_base,
+												   &expected_grant_generation)
+				|| expected_grant_generation != tag_slot->committed_own_generation)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+			goto claim_done;
+		}
 		if (!pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_WAIT, &member_view)) {
 			result = PCM_X_QUEUE_CORRUPT;
 			fail_closed = true;
@@ -16037,11 +16051,13 @@ cluster_pcm_x_local_writer_claim_exact(const PcmXLocalHandle *writer,
 	claim_out->claim_generation = next_claim_generation;
 	claim_out->local_round = member->admitted_round;
 	claim_out->role = member->role;
-	/* A' rebase: every same-round claim inherits the published effective
-	 * grant base under this partition lock; zero (no rebase) keeps the
-	 * enqueue-time identity math.  Without this a FIFO follower would verify
-	 * the rebased X against its stale base+1 and fail closed. */
-	claim_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
+	/* A same-round follower inherits the canonical node grant under this
+	 * partition lock.  Its immutable member identity may predate either a
+	 * leader rekey or an A' rebase, so falling back to that local base would
+	 * reject the exact X generation already completed by the leader. */
+	claim_out->grant_base_own_generation
+		= member->role == PCM_X_LOCAL_ROLE_FOLLOWER ? effective_grant_base
+													  : tag_slot->grant_base_own_generation;
 	result = PCM_X_QUEUE_OK;
 
 claim_release_gate:
@@ -16072,11 +16088,14 @@ pcm_x_local_writer_claim_finish_exact(const PcmXLocalWriterClaim *claim, bool co
 	PcmXSlotRef tag_ref;
 	PcmXSlotRef member_ref;
 	PcmXSlotRef successor_ref;
+	PcmXSlotRef found;
 	PcmXWaitIdentity successor_identity;
 	PcmXQueueResult result;
+	uint32 flags;
 	uint32 successor_flags;
 	uint32 successor_state;
 	uint32 partition;
+	bool detach_follower = false;
 	bool gate_claimed = false;
 	bool fail_closed = false;
 	bool have_successor = false;
@@ -16203,20 +16222,79 @@ pcm_x_local_writer_claim_finish_exact(const PcmXLocalWriterClaim *claim, bool co
 			}
 		}
 	}
+	/* A completed coalesced writer has no independent global assertion or
+	 * terminal ticket.  The node leader is the sole R3 DRAIN/RETIRE member;
+	 * consume each successful follower locally before exposing the wake so a
+	 * closed round converges to that one terminal member.  The admission gate
+	 * remains held across the local-to-allocator handoff. */
+	if (complete && successor_out != NULL && member->role == PCM_X_LOCAL_ROLE_FOLLOWER) {
+		flags = pcm_x_slot_flags_read(&tag_slot->slot);
+		if (pcm_x_slot_state_read(&member->slot) != PCM_XL_JOINED_NONWAITABLE
+			|| member->graph_generation != 0 || tag_slot->membership_count < 2
+			|| member_ref.slot_index == tag_slot->leader_index
+			|| ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0
+				&& (member->admitted_round != tag_slot->local_round
+					|| member->local_sequence > tag_slot->cutoff_sequence
+					|| tag_slot->closed_round_member_count < 2))
+			|| ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) == 0
+				&& tag_slot->closed_round_member_count != 0)
+			|| !pcm_x_local_unlink_member_locked(tag_slot, tag_ref, member, member_ref)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+			goto release_done;
+		}
+		tag_slot->membership_count--;
+		if ((flags & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0)
+			tag_slot->closed_round_member_count--;
+		detach_follower = true;
+	}
 	if (complete)
 		(void)pcm_x_slot_flags_fetch_or(&member->slot, PCM_X_LOCAL_MEMBER_F_WRITER_COMPLETE);
 	pg_write_barrier();
 	tag_slot->active_writer_index = PCM_X_INVALID_SLOT_INDEX;
 	tag_slot->active_writer_slot_generation = 0;
+	if (detach_follower) {
+		pg_write_barrier();
+		pcm_x_slot_state_write(&member->slot, PCM_XL_DETACHING);
+	}
 	result = PCM_X_QUEUE_OK;
 
 release_gate:
-	if (!fail_closed && gate_claimed && !pcm_x_local_gate_release(tag_slot)) {
+	if (!fail_closed && gate_claimed && !detach_follower && !pcm_x_local_gate_release(tag_slot)) {
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 	}
 release_done:
 	LWLockRelease(&header->local_locks[partition].lock);
+	if (result == PCM_X_QUEUE_OK && detach_follower) {
+		pcm_x_local_gate_acquire_guarded(&header->allocator_lock.lock, LW_EXCLUSIVE, tag_slot);
+		member = (PcmXLocalMembershipSlot *)pcm_x_slot_ref_resolve_locked(
+			PCM_X_ALLOC_LOCAL_WAIT, member_ref);
+		tag_slot
+			= (PcmXLocalTagSlot *)pcm_x_slot_ref_resolve_locked(PCM_X_ALLOC_LOCAL_TAG, tag_ref);
+		if (member == NULL || tag_slot == NULL
+			|| pcm_x_slot_state_read(&member->slot) != PCM_XL_DETACHING
+			|| pcm_x_slot_state_read(&tag_slot->slot) != PCM_X_TAG_LIVE
+			|| !pcm_x_local_detaching_handle_exact(
+				&claim->writer, member_ref, member, tag_slot)
+			|| (pcm_x_slot_flags_read(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_ADMISSION_GATE) == 0
+			|| pcm_x_directory_find_locked(
+				   PCM_X_DIR_LOCAL_WAIT, &claim->writer.identity, &found)
+				   != PCM_X_DIRECTORY_OK
+			|| found.slot_index != member_ref.slot_index
+			|| found.slot_generation != member_ref.slot_generation
+			|| pcm_x_directory_delete_exact_locked(
+				   PCM_X_DIR_LOCAL_WAIT, &claim->writer.identity, member_ref)
+				   != PCM_X_DIRECTORY_OK
+			|| pcm_x_allocator_release_locked(
+				   PCM_X_ALLOC_LOCAL_WAIT, member_ref, PCM_XL_DETACHING)
+				   != PCM_X_ALLOC_OK
+			|| !pcm_x_local_gate_release(tag_slot)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+		}
+		LWLockRelease(&header->allocator_lock.lock);
+	}
 	if (result == PCM_X_QUEUE_OK && complete && successor_out != NULL && have_successor)
 		*successor_out = successor_identity;
 	if (fail_closed)
