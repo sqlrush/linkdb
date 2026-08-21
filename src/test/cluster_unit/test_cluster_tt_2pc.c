@@ -533,6 +533,111 @@ UT_TEST(test_s16_recovery_pending_activates_native_owner_before_success)
 	free(source);
 }
 
+/* RF-SIDE D-SIDE-03: a prepared transaction reconstructed by failed-origin
+ * recovery is owned by the recovery path until matching terminal redo and
+ * canonical TT/undo truth resolve it.  Ordinary COMMIT/ROLLBACK PREPARED must
+ * not be able to steal that responsibility after native activation finishes. */
+UT_TEST(test_s17_recovery_pending_remains_reco_owned_after_activation)
+{
+	char *source = read_source(TWOPHASE_SOURCE_PATH);
+	const char *definition;
+	const char *definition_end;
+	const char *install;
+	const char *install_end;
+	const char *mark_owned;
+	const char *clear_activation;
+	const char *lock_gxact;
+	const char *lock_end;
+
+	if (source == NULL)
+		return;
+	definition = strstr(source, "typedef struct GlobalTransactionData {");
+	definition_end = definition == NULL ? NULL : strstr(definition,
+		"} GlobalTransactionData;");
+	install = strstr(source, "\nTwoPhaseRecoveryPendingInstall(");
+	install_end = install == NULL ? NULL : strstr(install,
+		"\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
+	mark_owned = install == NULL ? NULL : strstr(install,
+		"gxact->recovery_managed = true;");
+	clear_activation = install == NULL ? NULL : strstr(install,
+		"gxact->recovery_activation_pending = false;");
+	lock_gxact = strstr(source, "\nLockGXact(");
+	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact,
+		"\n}\n\n/*\n * RemoveGXact");
+
+	UT_ASSERT_NOT_NULL(definition);
+	UT_ASSERT_NOT_NULL(definition_end);
+	UT_ASSERT_NOT_NULL(install);
+	UT_ASSERT_NOT_NULL(install_end);
+	UT_ASSERT_NOT_NULL(mark_owned);
+	UT_ASSERT_NOT_NULL(clear_activation);
+	UT_ASSERT_NOT_NULL(lock_gxact);
+	UT_ASSERT_NOT_NULL(lock_end);
+	if (definition != NULL && definition_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(definition, "bool recovery_managed;"));
+	if (install != NULL && install_end != NULL && mark_owned != NULL &&
+		clear_activation != NULL)
+		UT_ASSERT(install < mark_owned && mark_owned < clear_activation &&
+			clear_activation < install_end);
+	if (lock_gxact != NULL && lock_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(lock_gxact, "gxact->recovery_managed"));
+	free(source);
+}
+
+/* Restart/new-actor closure uses only existing authorities: the current
+ * FAIL_STOP dead set covers the crash-before-projection window, while an exact
+ * v2 PREPARED row is a conservative deny after publication.  Neither arm can
+ * grant PREPARED or terminal truth, and no new persistent marker is allowed. */
+UT_TEST(test_s18_restart_finish_fence_reuses_root_and_projection)
+{
+	char *source = read_source(TWOPHASE_SOURCE_PATH);
+	const char *helper;
+	const char *helper_end;
+	const char *event_read;
+	const char *dead_test;
+	const char *digest;
+	const char *projection;
+	const char *lock_gxact;
+	const char *lock_end;
+	const char *finish_fence;
+
+	if (source == NULL)
+		return;
+	helper = strstr(source, "\nTwoPhaseRecoveryFinishIsFenced(");
+	helper_end = helper == NULL ? NULL : strstr(helper,
+		"\n#endif\n\n/*\n * LockGXact");
+	event_read = helper == NULL ? NULL : strstr(helper,
+		"cluster_reconfig_get_last_event(");
+	dead_test = helper == NULL ? NULL : strstr(helper,
+		"RECONFIG_KIND_FAIL_STOP");
+	digest = helper == NULL ? NULL : strstr(helper,
+		"cluster_remote_xact_prepare_digest_v2(");
+	projection = helper == NULL ? NULL : strstr(helper,
+		"cluster_remote_xact_pending_matches_v2(");
+	lock_gxact = strstr(source, "\nLockGXact(");
+	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact,
+		"\n}\n\n/*\n * RemoveGXact");
+	finish_fence = lock_gxact == NULL ? NULL : strstr(lock_gxact,
+		"TwoPhaseRecoveryFinishIsFenced(");
+
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(helper_end);
+	UT_ASSERT_NOT_NULL(event_read);
+	UT_ASSERT_NOT_NULL(dead_test);
+	UT_ASSERT_NOT_NULL(digest);
+	UT_ASSERT_NOT_NULL(projection);
+	UT_ASSERT_NOT_NULL(lock_gxact);
+	UT_ASSERT_NOT_NULL(lock_end);
+	UT_ASSERT_NOT_NULL(finish_fence);
+	if (helper != NULL && helper_end != NULL && event_read != NULL &&
+		dead_test != NULL && digest != NULL && projection != NULL)
+		UT_ASSERT(helper < event_read && event_read < dead_test &&
+			dead_test < digest && digest < projection && projection < helper_end);
+	if (lock_gxact != NULL && lock_end != NULL && finish_fence != NULL)
+		UT_ASSERT(lock_gxact < finish_fence && finish_fence < lock_end);
+	UT_ASSERT(strstr(source, ".rfside") == NULL);
+	free(source);
+}
 
 int
 main(void)
@@ -553,6 +658,8 @@ main(void)
 	UT_RUN(test_s14_prefinish_is_modifier_gated_and_error_safe);
 	UT_RUN(test_s15_prefinish_preserves_binding_origin);
 	UT_RUN(test_s16_recovery_pending_activates_native_owner_before_success);
+	UT_RUN(test_s17_recovery_pending_remains_reco_owned_after_activation);
+	UT_RUN(test_s18_restart_finish_fence_reuses_root_and_projection);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

@@ -157,9 +157,12 @@
 #include "cluster/cluster_scn.h"
 /* PGRAC: spec-2.39 D1 — COMMIT PREPARED cluster sinval propagation. */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_sinval.h"
 /* PGRAC: spec-3.15 — prepared TT prefinish (C-P6). */
 #include "cluster/cluster_tt_2pc.h"
+#include "cluster/cluster_xid_stripe.h"
 #endif
 
 /*
@@ -223,6 +226,7 @@ typedef struct GlobalTransactionData {
 	bool ondisk;			   /* true if prepare state file is on disk */
 	bool inredo;			   /* true if entry was added via xlog_redo */
 	bool recovery_activation_pending; /* native owner recovery incomplete */
+	bool recovery_managed; /* failed-origin resolution belongs to RF-SIDE */
 	char gid[GIDSIZE];		   /* The GID assigned to the prepared xact */
 } GlobalTransactionData;
 
@@ -529,6 +533,7 @@ MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid, const char *gid,
 	gxact->valid = false;
 	gxact->inredo = false;
 	gxact->recovery_activation_pending = false;
+	gxact->recovery_managed = false;
 	strcpy(gxact->gid, gid);
 
 	/*
@@ -585,6 +590,40 @@ MarkAsPrepared(GlobalTransaction gxact, bool lock_held)
 	ProcArrayAdd(&ProcGlobal->allProcs[gxact->pgprocno]);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * TwoPhaseRecoveryFinishIsFenced
+ *
+ * Reconstruct the conservative RECO-ownership denial after a postmaster
+ * restart without introducing another persistent authority.  The current
+ * FAIL_STOP dead set covers the window before RF-SIDE publishes its v2 row;
+ * afterwards an exact v2 PREPARED projection continues to deny ordinary
+ * finish.  Neither arm grants PREPARED, terminal truth, readiness, or OPEN.
+ */
+static bool
+TwoPhaseRecoveryFinishIsFenced(GlobalTransaction gxact, PGPROC *proc)
+{
+	ReconfigEvent event;
+	uint8		digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+	int			origin_node;
+
+	origin_node = cluster_xid_origin_slot(gxact->xid);
+	if (origin_node < 0 || origin_node >= CLUSTER_MAX_NODES)
+		return false;
+	cluster_reconfig_get_last_event(&event);
+	if (event.reconfig_kind == RECONFIG_KIND_FAIL_STOP &&
+		event.event_id != 0 &&
+		(event.dead_bitmap[origin_node / 8] &
+		 (uint8) (UINT8_C(1) << (origin_node % 8))) != 0)
+		return true;
+	if (!cluster_remote_xact_prepare_digest_v2(GetSystemIdentifier(),
+			origin_node, gxact->xid, proc->databaseId, gxact->gid, digest))
+		return false;
+	return cluster_remote_xact_pending_matches_v2(origin_node, gxact->xid,
+		digest);
+}
+#endif
+
 /*
  * LockGXact
  *		Locate the prepared transaction and mark it busy for COMMIT or PREPARE.
@@ -617,6 +656,20 @@ LockGXact(const char *gid, Oid user)
 					 errmsg("prepared transaction with identifier \"%s\" has incomplete recovery activation",
 							gid),
 					 errhint("Restart recovery before finishing this prepared transaction.")));
+		if (gxact->recovery_managed)
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("prepared transaction with identifier \"%s\" is owned by recovery",
+							gid),
+					 errhint("Wait for failed-origin recovery to apply matching terminal redo.")));
+#ifdef USE_PGRAC_CLUSTER
+		if (TwoPhaseRecoveryFinishIsFenced(gxact, proc))
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("prepared transaction with identifier \"%s\" is fenced for failed-origin recovery",
+							gid),
+					 errhint("Wait for RECO-style recovery to resolve the matching terminal record.")));
+#endif
 
 		/* Found it, but has someone else got it locked? */
 		if (gxact->locking_backend != InvalidBackendId)
@@ -1716,6 +1769,13 @@ TwoPhaseRecoveryPendingInstall(TransactionId xid, Oid database, Oid owner,
 		LWLockRelease(TwoPhaseStateLock);
 		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
 	}
+	if (gxact->locking_backend != InvalidBackendId &&
+		gxact->locking_backend != MyBackendId)
+	{
+		LWLockRelease(TwoPhaseStateLock);
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	}
+	gxact->recovery_managed = true;
 
 	if (!gxact->valid)
 	{
@@ -3036,6 +3096,7 @@ PrepareRedoAddCommon(char *buf, XLogRecPtr start_lsn, XLogRecPtr end_lsn,
 	gxact->ondisk = XLogRecPtrIsInvalid(start_lsn);
 	gxact->inredo = true; /* yes, added in redo */
 	gxact->recovery_activation_pending = false;
+	gxact->recovery_managed = false;
 	strcpy(gxact->gid, gid);
 
 	/* And insert it into the active array */
