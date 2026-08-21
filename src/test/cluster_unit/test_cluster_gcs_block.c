@@ -3972,7 +3972,7 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 		&& rekey_helper_end != NULL)
 		UT_ASSERT(snapshot_before < rekey_exact && rekey_exact < snapshot_after
 				  && snapshot_after < rekey_helper_end);
-	join = strstr(driver, "cluster_pcm_x_local_join_begin(");
+	join = strstr(driver, "cluster_pcm_x_local_join_begin_semantic(");
 	leader_rekey = join != NULL ? strstr(join, "gcs_block_pcm_x_rekey_leader_base_exact(") : NULL;
 	claim = leader_rekey != NULL ? strstr(leader_rekey, "cluster_pcm_x_local_writer_claim_exact(")
 								 : NULL;
@@ -3995,6 +3995,10 @@ UT_TEST(test_pcm_x_requester_driver_owns_fifo_and_transfer_lifecycles)
 	clear_wait = strstr(driver, "cluster_lmd_wait_state_clear(");
 
 	UT_ASSERT_NOT_NULL(join);
+	UT_ASSERT_NOT_NULL(strstr(driver, "join_result == RESOURCE_X_LOCAL_LEADER_MUST_SUBMIT"));
+	UT_ASSERT_NOT_NULL(strstr(driver, "join_result == RESOURCE_X_LOCAL_JOINED_LOCAL_ASSERTION"));
+	UT_ASSERT_NOT_NULL(strstr(driver, "join_result == RESOURCE_X_LOCAL_WAIT_SUCCESSOR_ROUND"));
+	UT_ASSERT_NULL(strstr(driver, "cluster_pcm_x_local_join_begin(&identity"));
 	UT_ASSERT_NOT_NULL(leader_rekey);
 	UT_ASSERT_NOT_NULL(claim);
 	UT_ASSERT_NOT_NULL(enqueue);

@@ -11555,6 +11555,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 	PcmXLocalCutoff cutoff;
 	PcmXLocalProgress progress;
 	PcmXRuntimeSnapshot request_runtime;
+	ResourceXLocalJoinResult join_result = RESOURCE_X_LOCAL_JOIN_NONE;
 	ClusterLmdVertex blocker_vertex;
 	ClusterLmdVertex waiter_vertex;
 	ClusterPcmOwnSnapshot initial_own;
@@ -11717,10 +11718,18 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 		identity.wait_seq = wait_seq;
 		identity.base_own_generation = initial_own.generation;
 		fail_site = "local-join";
-		result = cluster_pcm_x_local_join_begin(&identity, master_node, master_session, &handle);
+		result = cluster_pcm_x_local_join_begin_semantic(&identity, master_node, master_session,
+			&handle, &join_result);
 		cluster_pcm_x_stats_note_queue_result(result);
-		if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
-			break;
+		if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+			if ((join_result == RESOURCE_X_LOCAL_LEADER_MUST_SUBMIT
+					&& handle.role == PCM_X_LOCAL_ROLE_NODE_LEADER)
+				|| ((join_result == RESOURCE_X_LOCAL_JOINED_LOCAL_ASSERTION
+						 || join_result == RESOURCE_X_LOCAL_WAIT_SUCCESSOR_ROUND)
+					&& handle.role == PCM_X_LOCAL_ROLE_FOLLOWER))
+				break;
+			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+		}
 		retry_action
 			= cluster_gcs_pcm_x_requester_retry_action(GCS_BLOCK_PCM_X_RETRY_SITE_JOIN, result);
 		if (retry_action != GCS_BLOCK_PCM_X_RETRY_WAIT)
@@ -11741,6 +11750,8 @@ requester_role_dispatch:
 	/* The leader claims before ENQUEUE, so every later local writer has one
 	 * concrete FIFO/WFG blocker while the remote grant is in flight. */
 	if (handle.role == PCM_X_LOCAL_ROLE_NODE_LEADER) {
+		if (join_result != RESOURCE_X_LOCAL_LEADER_MUST_SUBMIT)
+			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		for (;;) {
 			fail_site = "leader-rekey";
 			result = gcs_block_pcm_x_rekey_leader_base_exact(buf, &handle, &initial_own);
@@ -11804,6 +11815,9 @@ requester_role_dispatch:
 			}
 		}
 	} else if (handle.role == PCM_X_LOCAL_ROLE_FOLLOWER) {
+		if (join_result != RESOURCE_X_LOCAL_JOINED_LOCAL_ASSERTION
+			&& join_result != RESOURCE_X_LOCAL_WAIT_SUCCESSOR_ROUND)
+			GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 		for (;;) {
 			ClusterLmdGraphRemoveResult remove_result;
 
@@ -11844,6 +11858,8 @@ requester_role_dispatch:
 					if (!cluster_gcs_pcm_x_role_refresh_exact(&handle, &fresh_handle))
 						GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 					handle = fresh_handle;
+					if (handle.role == PCM_X_LOCAL_ROLE_NODE_LEADER)
+						join_result = RESOURCE_X_LOCAL_LEADER_MUST_SUBMIT;
 					gcs_block_pcm_x_requester_cleanup_context.handle = handle;
 					goto requester_role_dispatch;
 				}
@@ -11920,6 +11936,8 @@ requester_role_dispatch:
 						if (!cluster_gcs_pcm_x_role_refresh_exact(&handle, &fresh_handle))
 							GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
 						handle = fresh_handle;
+						if (handle.role == PCM_X_LOCAL_ROLE_NODE_LEADER)
+							join_result = RESOURCE_X_LOCAL_LEADER_MUST_SUBMIT;
 						gcs_block_pcm_x_requester_cleanup_context.handle = handle;
 						goto requester_role_dispatch;
 					}

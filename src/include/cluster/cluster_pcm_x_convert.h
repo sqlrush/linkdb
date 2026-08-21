@@ -1690,6 +1690,10 @@ extern PcmXQueueResult cluster_pcm_x_local_join_begin(const PcmXWaitIdentity *id
 													  int32 master_node,
 													  uint64 master_session_incarnation,
 													  PcmXLocalHandle *handle_out);
+extern PcmXQueueResult cluster_pcm_x_local_join_begin_semantic(
+	const PcmXWaitIdentity *identity, int32 master_node,
+	uint64 master_session_incarnation, PcmXLocalHandle *handle_out,
+	ResourceXLocalJoinResult *join_result_out);
 extern PcmXQueueResult cluster_pcm_x_local_lookup_exact(const PcmXWaitIdentity *identity,
 														PcmXLocalHandle *handle_out);
 /* A follower promoted after a completed round keeps its FIFO position but

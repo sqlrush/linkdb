@@ -2404,6 +2404,162 @@ UT_TEST(test_resource_x_semantic_projections_follow_master_and_local_admission)
 	UT_ASSERT_EQ(local_tag->semantic_generation, UINT64_C(0));
 }
 
+UT_TEST(test_resource_x_local_join_classifies_same_attempt_and_successor_round)
+{
+	PcmXShmemHeader *header;
+	PcmXLocalHandle leader;
+	PcmXLocalHandle follower;
+	PcmXLocalHandle successor;
+	PcmXLocalHandle terminalizing_join;
+	PcmXLocalHandle blocked_attempt;
+	PcmXLocalHandle promoted;
+	PcmXLocalHandle rekeyed;
+	PcmXLocalCutoff cutoff;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXWaitIdentity identity;
+	ResourceXLocalJoinResult join_result;
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	bind_local_master(1, UINT64_C(9), UINT64_C(177));
+	identity = make_wait_identity(614, 0, 18, UINT64_C(62001));
+	identity.base_own_generation = UINT64_C(44);
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin_semantic(&identity, 1,
+		UINT64_C(177), &leader, &join_result), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(join_result, RESOURCE_X_LOCAL_LEADER_MUST_SUBMIT);
+	UT_ASSERT_EQ(leader.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
+	UT_ASSERT_EQ(leader.local_round, UINT32_C(1));
+
+	identity.procno++;
+	identity.xid++;
+	identity.request_id++;
+	identity.wait_seq++;
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin_semantic(&identity, 1,
+		UINT64_C(177), &follower, &join_result), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(join_result, RESOURCE_X_LOCAL_JOINED_LOCAL_ASSERTION);
+	UT_ASSERT_EQ(follower.role, PCM_X_LOCAL_ROLE_FOLLOWER);
+	UT_ASSERT_EQ(follower.local_round, UINT32_C(1));
+
+	identity.procno++;
+	identity.xid++;
+	identity.request_id++;
+	identity.wait_seq++;
+	identity.base_own_generation = UINT64_C(45);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin_semantic(&identity, 1,
+		UINT64_C(177), &successor, &join_result), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(join_result, RESOURCE_X_LOCAL_WAIT_SUCCESSOR_ROUND);
+	UT_ASSERT_EQ(successor.role, PCM_X_LOCAL_ROLE_FOLLOWER);
+	UT_ASSERT_EQ(successor.local_round, UINT32_C(2));
+
+	/* Once a successor closes the cohort, another matching attempt joins that
+	 * successor without mutating the still-open predecessor projection. */
+	identity.procno++;
+	identity.xid++;
+	identity.request_id++;
+	identity.wait_seq++;
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin_semantic(&identity, 1,
+		UINT64_C(177), &terminalizing_join, &join_result), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(join_result, RESOURCE_X_LOCAL_WAIT_SUCCESSOR_ROUND);
+	UT_ASSERT_EQ(terminalizing_join.local_round, UINT32_C(2));
+
+	/* The one representable successor round is already bound to base 45.
+	 * A different attempt remains outside it until the exact transition opens
+	 * base 45 and allows a later retry to create the following round. */
+	identity.procno++;
+	identity.xid++;
+	identity.request_id++;
+	identity.wait_seq++;
+	identity.base_own_generation = UINT64_C(46);
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin_semantic(&identity, 1,
+		UINT64_C(177), &blocked_attempt, &join_result), PCM_X_QUEUE_BUSY);
+	UT_ASSERT_EQ(join_result, RESOURCE_X_LOCAL_WAIT_SUCCESSOR_ROUND);
+	UT_ASSERT_EQ(blocked_attempt.membership_slot.slot_index, PCM_X_INVALID_SLOT_INDEX);
+
+	tag_slot = &local_tag_slots(header)[leader.tag_slot.slot_index];
+	UT_ASSERT((test_slot_flags(&tag_slot->slot) & PCM_X_LOCAL_TAG_F_REVOKE_BARRIER) != 0);
+	UT_ASSERT_EQ(tag_slot->cutoff_sequence, follower.local_sequence);
+	UT_ASSERT_EQ(tag_slot->closed_round_member_count, (Size)2);
+	UT_ASSERT_EQ(tag_slot->membership_count, (Size)4);
+	UT_ASSERT_EQ(tag_slot->attempt_base_generation, UINT64_C(44));
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_current_cutoff_snapshot_exact(&leader.identity.tag,
+		leader.identity.cluster_epoch, 1, UINT64_C(177), &cutoff), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_cancel_exact(&follower, NULL), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_cancel_exact(&leader, NULL), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_detach_terminal_exact(&follower), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_detach_terminal_exact(&leader), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_local_retire_round_exact(&identity.tag, identity.cluster_epoch,
+		&cutoff, &promoted), PCM_X_QUEUE_OK);
+	UT_ASSERT(slot_refs_equal(promoted.membership_slot, successor.membership_slot));
+	UT_ASSERT_EQ(promoted.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
+	UT_ASSERT_EQ(tag_slot->attempt_base_generation, UINT64_C(45));
+
+	UT_ASSERT_EQ(cluster_pcm_x_local_leader_rekey_generation_exact(&promoted,
+		UINT64_C(47), &rekeyed), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(rekeyed.identity.base_own_generation, UINT64_C(47));
+	UT_ASSERT_EQ(tag_slot->attempt_base_generation, UINT64_C(47));
+}
+
+UT_TEST(test_resource_x_master_deduplicates_attempt_and_orders_same_node_successor)
+{
+	PcmXShmemHeader *header;
+	PcmXMasterAdmission first;
+	PcmXMasterAdmission duplicate;
+	PcmXMasterAdmission successor;
+	PcmXMasterAdmission successor_duplicate;
+	PcmXMasterTagSlot *tag_slot;
+	PcmXMasterTicketSlot *first_ticket;
+	PcmXMasterTicketSlot *successor_ticket;
+	PcmXEnqueuePayload request;
+	uint32 node_bit = UINT32_C(1) << 2;
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	request = make_enqueue(make_wait_identity(615, 2, 18, UINT64_C(63001)),
+		UINT64_C(603), UINT64_C(1));
+	request.identity.base_own_generation = UINT64_C(44);
+	bind_enqueue_peer(&request);
+	UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &first), PCM_X_QUEUE_OK);
+
+	request.identity.procno++;
+	request.identity.xid++;
+	request.identity.request_id++;
+	request.identity.wait_seq++;
+	request.prehandle.prehandle_sequence = UINT64_C(2);
+	UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &duplicate), PCM_X_QUEUE_BUSY);
+	UT_ASSERT(ticket_refs_equal(&duplicate.ref, &first.ref));
+	UT_ASSERT((duplicate.flags & PCM_X_ADMIT_F_NODE_COALESCED) != 0);
+	UT_ASSERT_EQ(header->peer_frontiers[2].next_expected_prehandle_sequence, UINT64_C(2));
+
+	request.identity.base_own_generation = UINT64_C(45);
+	UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &successor), PCM_X_QUEUE_OK);
+	UT_ASSERT(!ticket_refs_equal(&successor.ref, &first.ref));
+	UT_ASSERT_EQ(header->peer_frontiers[2].next_expected_prehandle_sequence, UINT64_C(3));
+
+	first_ticket = &master_ticket_slots(header)[first.ticket_slot.slot_index];
+	successor_ticket = &master_ticket_slots(header)[successor.ticket_slot.slot_index];
+	tag_slot = &master_tag_slots(header)[first.tag_slot.slot_index];
+	UT_ASSERT_EQ(first_ticket->next_index, successor.ticket_slot.slot_index);
+	UT_ASSERT_EQ(successor_ticket->prev_index, first.ticket_slot.slot_index);
+	UT_ASSERT_EQ(tag_slot->head_index, first.ticket_slot.slot_index);
+	UT_ASSERT_EQ(tag_slot->tail_index, successor.ticket_slot.slot_index);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&tag_slot->queued_node_bitmap), node_bit);
+
+	request.identity.procno++;
+	request.identity.xid++;
+	request.identity.request_id++;
+	request.identity.wait_seq++;
+	request.prehandle.prehandle_sequence = UINT64_C(3);
+	UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &successor_duplicate),
+		PCM_X_QUEUE_BUSY);
+	UT_ASSERT(ticket_refs_equal(&successor_duplicate.ref, &successor.ref));
+
+	UT_ASSERT_EQ(cluster_pcm_x_master_cancel_exact(&first.ref), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&tag_slot->queued_node_bitmap), node_bit);
+	UT_ASSERT_EQ(tag_slot->head_index, successor.ticket_slot.slot_index);
+}
+
 UT_TEST(test_lwlock_held_limit_is_shared_200)
 {
 	UT_ASSERT_EQ(LWLOCK_MAX_HELD_BY_PROC, 200);
@@ -17421,12 +17577,14 @@ UT_TEST(test_runtime_reform_tag_epoch_failure_keeps_blocked)
 int
 main(void)
 {
-	UT_PLAN(289);
+	UT_PLAN(291);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
 	UT_RUN(test_runtime_layout_abi_and_offsets_are_exact);
 	UT_RUN(test_resource_x_semantic_projections_follow_master_and_local_admission);
+	UT_RUN(test_resource_x_local_join_classifies_same_attempt_and_successor_round);
+	UT_RUN(test_resource_x_master_deduplicates_attempt_and_orders_same_node_successor);
 	UT_RUN(test_runtime_rebase_wire_active_is_activation_bound);
 	UT_RUN(test_lwlock_held_limit_is_shared_200);
 	UT_RUN(test_default_capacity_formulas_are_exact);

@@ -37,6 +37,16 @@ typedef struct ResourceXTransportWitness
 	uint16		flags;
 } ResourceXTransportWitness;
 
+/* Process-local D6-03 outcome.  These values are never persisted or sent on
+ * the legacy 41--64 wire family. */
+typedef enum ResourceXLocalJoinResult
+{
+	RESOURCE_X_LOCAL_JOIN_NONE = 0,
+	RESOURCE_X_LOCAL_LEADER_MUST_SUBMIT,
+	RESOURCE_X_LOCAL_JOINED_LOCAL_ASSERTION,
+	RESOURCE_X_LOCAL_WAIT_SUCCESSOR_ROUND
+} ResourceXLocalJoinResult;
+
 StaticAssertDecl(sizeof(BufferTag) == 20,
 				 "Resource-X requires the frozen 20-byte BufferTag layout");
 StaticAssertDecl(sizeof(ResourceXAssertion) == 24,
