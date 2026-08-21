@@ -40,12 +40,25 @@ make_attempt(uint64 base_generation)
 	return attempt;
 }
 
+static ResourceXTransportWitness
+make_transport(uint32 connection_generation)
+{
+	ResourceXTransportWitness transport;
+
+	MemSet(&transport, 0, sizeof(transport));
+	transport.cluster_epoch = 41;
+	transport.peer_session_incarnation = 73;
+	transport.connection_generation = connection_generation;
+	transport.lane_id = 1;
+	return transport;
+}
+
 UT_TEST(test_retry_state_layout_and_slot_embedding)
 {
 	UT_ASSERT_EQ(RESOURCE_X_RETRY_PRE_NO_RETURN, 1);
 	UT_ASSERT_EQ(RESOURCE_X_RETRY_POST_NO_RETURN, 2);
 	UT_ASSERT_EQ(RESOURCE_X_RETRY_TERMINAL, 3);
-	UT_ASSERT_EQ(RESOURCE_X_RETRY_RECOVERY_BLOCKED, 4);
+	UT_ASSERT_EQ(RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED, 4);
 	UT_ASSERT_EQ(sizeof(ResourceXRetryStateV1), 72);
 	UT_ASSERT_EQ(offsetof(ResourceXRetryStateV1, attempt), 0);
 	UT_ASSERT_EQ(offsetof(ResourceXRetryStateV1, first_submit_mono_us), 32);
@@ -122,14 +135,88 @@ UT_TEST(test_retry_state_clear_removes_all_attempt_state)
 	UT_ASSERT(!resource_x_retry_state_is_clear(NULL));
 }
 
+UT_TEST(test_classifier_stages_same_attempt_with_fresh_transport)
+{
+	ResourceXAttemptWitness attempt = make_attempt(17);
+	ResourceXTransportWitness transport = make_transport(9);
+	ResourceXRetryStateV1 state;
+	ResourceXRetryStateV1 before;
+	ResourceXRetryAction action;
+
+	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 1010, 6000, 7,
+										  &state));
+	before = state;
+	MemSet(&action, 0xa5, sizeof(action));
+	UT_ASSERT_EQ(resource_x_retry_classify_exact(&state, &attempt, &transport,
+											 1010, &action),
+			 RESOURCE_X_RETRY_STAGE_EXACT);
+	UT_ASSERT(memcmp(&action.attempt, &attempt, sizeof(attempt)) == 0);
+	UT_ASSERT(memcmp(&action.transport, &transport, sizeof(transport)) == 0);
+	UT_ASSERT_EQ(action.expected_state_generation, 7);
+	UT_ASSERT_EQ(action.expected_retry_count, 0);
+	UT_ASSERT(memcmp(&state, &before, sizeof(state)) == 0);
+
+	transport.connection_generation++;
+	UT_ASSERT_EQ(resource_x_retry_classify_exact(&state, &attempt, &transport,
+											 1010, &action),
+			 RESOURCE_X_RETRY_STAGE_EXACT);
+	UT_ASSERT(memcmp(&action.attempt, &attempt, sizeof(attempt)) == 0);
+	UT_ASSERT_EQ(action.transport.connection_generation, 10);
+}
+
+UT_TEST(test_classifier_never_retries_successor_attempt)
+{
+	ResourceXAttemptWitness attempt = make_attempt(17);
+	ResourceXAttemptWitness successor = make_attempt(18);
+	ResourceXTransportWitness transport = make_transport(9);
+	ResourceXRetryStateV1 state;
+	ResourceXRetryAction action;
+	ResourceXRetryAction zero;
+
+	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 1010, 6000, 7,
+										  &state));
+	MemSet(&action, 0xa5, sizeof(action));
+	MemSet(&zero, 0, sizeof(zero));
+	UT_ASSERT_EQ(resource_x_retry_classify_exact(&state, &successor, &transport,
+											 1010, &action),
+			 RESOURCE_X_RETRY_RECOVERY_BLOCKED);
+	UT_ASSERT(memcmp(&action, &zero, sizeof(action)) == 0);
+}
+
+UT_TEST(test_classifier_rejects_unbound_transport_without_staging)
+{
+	ResourceXAttemptWitness attempt = make_attempt(17);
+	ResourceXTransportWitness transport = make_transport(9);
+	ResourceXRetryStateV1 state;
+	ResourceXRetryAction action;
+	ResourceXRetryAction zero;
+
+	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 1010, 6000, 7,
+										  &state));
+	MemSet(&zero, 0, sizeof(zero));
+	transport.connection_generation = 0;
+	UT_ASSERT_EQ(resource_x_retry_classify_exact(&state, &attempt, &transport,
+											 1010, &action),
+			 RESOURCE_X_RETRY_RECOVERY_BLOCKED);
+	UT_ASSERT(memcmp(&action, &zero, sizeof(action)) == 0);
+	transport = make_transport(9);
+	transport.flags = 1;
+	UT_ASSERT_EQ(resource_x_retry_classify_exact(&state, &attempt, &transport,
+											 1010, &action),
+			 RESOURCE_X_RETRY_RECOVERY_BLOCKED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(7);
 	UT_RUN(test_retry_state_layout_and_slot_embedding);
 	UT_RUN(test_retry_state_initialization_publishes_exact_attempt);
 	UT_RUN(test_retry_state_initialization_rejects_unpublishable_state);
 	UT_RUN(test_retry_state_clear_removes_all_attempt_state);
+	UT_RUN(test_classifier_stages_same_attempt_with_fresh_transport);
+	UT_RUN(test_classifier_never_retries_successor_attempt);
+	UT_RUN(test_classifier_rejects_unbound_transport_without_staging);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
