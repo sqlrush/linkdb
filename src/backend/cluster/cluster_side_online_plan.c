@@ -189,6 +189,48 @@ side_ensure_payload_capacity(RfSideOnlinePlanV1 *plan, uint32 additional)
 	return true;
 }
 
+static bool
+side_plan_commit_prepared_dependencies_closed(
+	const RfSideOnlinePlanV1 *plan, uint32 terminal_index)
+{
+	const RfSideOnlineOperationV1 *terminal = &plan->operations[terminal_index];
+	RfSideXactCommitPreparedRequirementsV1 requirements;
+	uint16		i;
+
+	if (rf_side_xact_commit_prepared_requirements_v1(&terminal->xact,
+			&requirements) != RF_SIDE_XACT_APPLY_OK)
+		return false;
+	for (i = 0; i < requirements.count; i++)
+	{
+		const RfSideXactTTCommitRequirementV1 *required =
+			&requirements.bindings[i];
+		uint32		matches = 0;
+		uint32		j;
+
+		if (!required->requires_apply)
+			continue;
+		for (j = 0; j < terminal_index; j++)
+		{
+			const RfSideOnlineOperationV1 *candidate = &plan->operations[j];
+			const ClusterUndoDecoded *undo = &candidate->undo;
+
+			if (candidate->kind == RF_SIDE_ONLINE_OPERATION_UNDO &&
+				candidate->identity.participant_index ==
+					terminal->identity.participant_index &&
+				undo->kind == CLUSTER_UNDO_KIND_TT_COMMIT &&
+				undo->instance == required->instance &&
+				undo->segment_id == required->segment_id &&
+				undo->slot_offset == required->slot_offset &&
+				undo->wrap == required->wrap && undo->xid == required->xid &&
+				undo->commit_scn == required->commit_scn)
+				matches++;
+		}
+		if (matches != 1)
+			return false;
+	}
+	return true;
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
 						  RfSideOnlinePlanV1 **out_plan)
@@ -421,6 +463,13 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 		RfSideOnlineOperationV1 operation = plan->operations[i];
 		bool		accepted;
 
+		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT &&
+			operation.xact.kind == RF_SIDE_XACT_COMMIT_PREPARED &&
+			!side_plan_commit_prepared_dependencies_closed(plan, i))
+		{
+			ops->end_protected_set(ops->arg, false);
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		}
 		if (operation.owned_payload_length > 0)
 			operation.owned_payload = plan->owned_payload +
 				operation.owned_payload_offset;

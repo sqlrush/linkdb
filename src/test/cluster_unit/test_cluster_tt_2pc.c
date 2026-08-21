@@ -599,6 +599,8 @@ UT_TEST(test_s18_restart_finish_fence_reuses_root_and_projection)
 	const char *projection;
 	const char *lock_gxact;
 	const char *lock_end;
+	const char *claim_owner;
+	const char *release_owner_lock;
 	const char *finish_fence;
 
 	if (source == NULL)
@@ -617,6 +619,10 @@ UT_TEST(test_s18_restart_finish_fence_reuses_root_and_projection)
 	lock_gxact = strstr(source, "\nLockGXact(");
 	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact,
 		"\n}\n\n/*\n * RemoveGXact");
+	claim_owner = lock_gxact == NULL ? NULL : strstr(lock_gxact,
+		"gxact->locking_backend = MyBackendId;");
+	release_owner_lock = claim_owner == NULL ? NULL : strstr(claim_owner,
+		"LWLockRelease(TwoPhaseStateLock);");
 	finish_fence = lock_gxact == NULL ? NULL : strstr(lock_gxact,
 		"TwoPhaseRecoveryFinishIsFenced(");
 
@@ -628,14 +634,118 @@ UT_TEST(test_s18_restart_finish_fence_reuses_root_and_projection)
 	UT_ASSERT_NOT_NULL(projection);
 	UT_ASSERT_NOT_NULL(lock_gxact);
 	UT_ASSERT_NOT_NULL(lock_end);
+	UT_ASSERT_NOT_NULL(claim_owner);
+	UT_ASSERT_NOT_NULL(release_owner_lock);
 	UT_ASSERT_NOT_NULL(finish_fence);
 	if (helper != NULL && helper_end != NULL && event_read != NULL &&
 		dead_test != NULL && digest != NULL && projection != NULL)
 		UT_ASSERT(helper < event_read && event_read < dead_test &&
 			dead_test < digest && digest < projection && projection < helper_end);
-	if (lock_gxact != NULL && lock_end != NULL && finish_fence != NULL)
-		UT_ASSERT(lock_gxact < finish_fence && finish_fence < lock_end);
+	if (lock_gxact != NULL && lock_end != NULL && claim_owner != NULL &&
+		release_owner_lock != NULL && finish_fence != NULL)
+		UT_ASSERT(lock_gxact < claim_owner && claim_owner < release_owner_lock &&
+			release_owner_lock < finish_fence && finish_fence < lock_end);
 	UT_ASSERT(strstr(source, ".rfside") == NULL);
+	free(source);
+}
+
+/* Matching terminal redo must resolve the already-durable native owner without
+ * emitting a second COMMIT/ABORT PREPARED record.  The recovery-only primitive
+ * rechecks exact identity under the native owner lock, removes ProcArray before
+ * callbacks, and panics on a partially-run callback chain.  It retains the
+ * exact native file as a restart receipt until a separate post-OPEN cleanup. */
+UT_TEST(test_s19_recovery_terminal_resolves_native_owner_without_new_wal)
+{
+	char *source = read_source(TWOPHASE_SOURCE_PATH);
+	const char *read_exact;
+	const char *read_end;
+	const char *managed_read;
+	const char *read_file;
+	const char *resolve;
+	const char *resolve_end;
+	const char *hold;
+	const char *proc_remove;
+	const char *callbacks;
+	const char *catch_block;
+	const char *panic_transition;
+	const char *predicate_finish;
+	const char *cleanup_mark;
+	const char *cleanup;
+	const char *cleanup_end;
+	const char *remove_gxact;
+	const char *remove_file;
+
+	if (source == NULL)
+		return;
+	read_exact = strstr(source, "\nTwoPhaseRecoveryPendingReadExact(");
+	read_end = read_exact == NULL ? NULL : strstr(read_exact,
+		"\n}\n\nTwoPhaseRecoveryPendingResult\nTwoPhaseRecoveryPendingResolveExact(");
+	managed_read = read_exact == NULL ? NULL : strstr(read_exact,
+		"gxact->recovery_managed");
+	read_file = read_exact == NULL ? NULL : strstr(read_exact,
+		"ReadTwoPhaseFile(");
+	resolve = strstr(source, "\nTwoPhaseRecoveryPendingResolveExact(");
+	resolve_end = resolve == NULL ? NULL : strstr(resolve,
+		"\n}\n\nTwoPhaseRecoveryPendingResult\nTwoPhaseRecoveryPendingCleanupExact(");
+	hold = resolve == NULL ? NULL : strstr(resolve, "HOLD_INTERRUPTS();");
+	proc_remove = resolve == NULL ? NULL : strstr(resolve, "ProcArrayRemove(");
+	callbacks = resolve == NULL ? NULL : strstr(resolve, "ProcessRecords(");
+	catch_block = callbacks == NULL ? NULL : strstr(callbacks, "PG_CATCH();");
+	panic_transition = catch_block == NULL ? NULL : strstr(catch_block,
+		"ereport(PANIC");
+	predicate_finish = resolve == NULL ? NULL : strstr(resolve,
+		"PredicateLockTwoPhaseFinish(");
+	cleanup_mark = resolve == NULL ? NULL : strstr(resolve,
+		"recovery_terminal_cleanup_pending = true;");
+	cleanup = strstr(source, "\nTwoPhaseRecoveryPendingCleanupExact(");
+	cleanup_end = cleanup == NULL ? NULL : strstr(cleanup,
+		"\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
+	remove_gxact = cleanup == NULL ? NULL : strstr(cleanup, "RemoveGXact(");
+	remove_file = cleanup == NULL ? NULL : strstr(cleanup, "durable_unlink(");
+
+	UT_ASSERT_NOT_NULL(read_exact);
+	UT_ASSERT_NOT_NULL(read_end);
+	UT_ASSERT_NOT_NULL(managed_read);
+	UT_ASSERT_NOT_NULL(read_file);
+	UT_ASSERT_NOT_NULL(resolve);
+	UT_ASSERT_NOT_NULL(resolve_end);
+	UT_ASSERT_NOT_NULL(hold);
+	UT_ASSERT_NOT_NULL(proc_remove);
+	UT_ASSERT_NOT_NULL(callbacks);
+	UT_ASSERT_NOT_NULL(catch_block);
+	UT_ASSERT_NOT_NULL(panic_transition);
+	UT_ASSERT_NOT_NULL(predicate_finish);
+	UT_ASSERT_NOT_NULL(cleanup_mark);
+	UT_ASSERT_NOT_NULL(cleanup);
+	UT_ASSERT_NOT_NULL(cleanup_end);
+	UT_ASSERT_NOT_NULL(remove_gxact);
+	UT_ASSERT_NOT_NULL(remove_file);
+	if (read_exact != NULL && read_end != NULL && managed_read != NULL &&
+		read_file != NULL)
+		UT_ASSERT(read_exact < managed_read && managed_read < read_file &&
+			read_file < read_end);
+	if (resolve != NULL && resolve_end != NULL && hold != NULL &&
+		proc_remove != NULL && callbacks != NULL && catch_block != NULL &&
+		panic_transition != NULL && predicate_finish != NULL &&
+		cleanup_mark != NULL)
+		UT_ASSERT(resolve < hold && hold < proc_remove &&
+			proc_remove < callbacks && callbacks < catch_block &&
+			catch_block < panic_transition && panic_transition < predicate_finish &&
+			predicate_finish < cleanup_mark && cleanup_mark < resolve_end);
+	if (cleanup != NULL && cleanup_end != NULL && remove_gxact != NULL &&
+		remove_file != NULL)
+		UT_ASSERT(cleanup < remove_file && remove_file < remove_gxact &&
+			remove_gxact < cleanup_end);
+	if (resolve != NULL && resolve_end != NULL)
+	{
+		const char *duplicate_commit = strstr(resolve,
+			"RecordTransactionCommitPrepared(");
+		const char *duplicate_abort = strstr(resolve,
+			"RecordTransactionAbortPrepared(");
+
+		UT_ASSERT(duplicate_commit == NULL || duplicate_commit > resolve_end);
+		UT_ASSERT(duplicate_abort == NULL || duplicate_abort > resolve_end);
+	}
 	free(source);
 }
 
@@ -660,6 +770,7 @@ main(void)
 	UT_RUN(test_s16_recovery_pending_activates_native_owner_before_success);
 	UT_RUN(test_s17_recovery_pending_remains_reco_owned_after_activation);
 	UT_RUN(test_s18_restart_finish_fence_reuses_root_and_projection);
+	UT_RUN(test_s19_recovery_terminal_resolves_native_owner_without_new_wal);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

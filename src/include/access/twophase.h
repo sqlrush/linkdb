@@ -88,5 +88,14 @@ extern TwoPhaseRecoveryPendingResult TwoPhaseRecoveryPendingPreflight(
 extern TwoPhaseRecoveryPendingResult TwoPhaseRecoveryPendingInstall(
 	TransactionId xid, Oid database, Oid owner, TimestampTz prepared_at,
 	const char *gid, const void *content, uint32 len);
+extern TwoPhaseRecoveryPendingResult TwoPhaseRecoveryPendingReadExact(
+	TransactionId xid, Oid database, const char *gid, void **content_out,
+	uint32 *len_out);
+extern TwoPhaseRecoveryPendingResult TwoPhaseRecoveryPendingResolveExact(
+	TransactionId xid, Oid database, const char *gid, const void *content,
+	uint32 len, bool isCommit);
+extern TwoPhaseRecoveryPendingResult TwoPhaseRecoveryPendingCleanupExact(
+	TransactionId xid, Oid database, const char *gid, const void *content,
+	uint32 len, bool isCommit);
 #endif
 #endif							/* TWOPHASE_H */

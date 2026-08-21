@@ -227,6 +227,8 @@ typedef struct GlobalTransactionData {
 	bool inredo;			   /* true if entry was added via xlog_redo */
 	bool recovery_activation_pending; /* native owner recovery incomplete */
 	bool recovery_managed; /* failed-origin resolution belongs to RF-SIDE */
+	bool recovery_terminal_cleanup_pending; /* released; exact file retained */
+	bool recovery_terminal_is_commit; /* polarity of retained terminal receipt */
 	char gid[GIDSIZE];		   /* The GID assigned to the prepared xact */
 } GlobalTransactionData;
 
@@ -534,6 +536,8 @@ MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid, const char *gid,
 	gxact->inredo = false;
 	gxact->recovery_activation_pending = false;
 	gxact->recovery_managed = false;
+	gxact->recovery_terminal_cleanup_pending = false;
+	gxact->recovery_terminal_is_commit = false;
 	strcpy(gxact->gid, gid);
 
 	/*
@@ -601,13 +605,14 @@ MarkAsPrepared(GlobalTransaction gxact, bool lock_held)
  * finish.  Neither arm grants PREPARED, terminal truth, readiness, or OPEN.
  */
 static bool
-TwoPhaseRecoveryFinishIsFenced(GlobalTransaction gxact, PGPROC *proc)
+TwoPhaseRecoveryFinishIsFenced(TransactionId xid, Oid database,
+	const char *gid)
 {
 	ReconfigEvent event;
 	uint8		digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
 	int			origin_node;
 
-	origin_node = cluster_xid_origin_slot(gxact->xid);
+	origin_node = cluster_xid_origin_slot(xid);
 	if (origin_node < 0 || origin_node >= CLUSTER_MAX_NODES)
 		return false;
 	cluster_reconfig_get_last_event(&event);
@@ -617,10 +622,9 @@ TwoPhaseRecoveryFinishIsFenced(GlobalTransaction gxact, PGPROC *proc)
 		 (uint8) (UINT8_C(1) << (origin_node % 8))) != 0)
 		return true;
 	if (!cluster_remote_xact_prepare_digest_v2(GetSystemIdentifier(),
-			origin_node, gxact->xid, proc->databaseId, gxact->gid, digest))
+			origin_node, xid, database, gid, digest))
 		return false;
-	return cluster_remote_xact_pending_matches_v2(origin_node, gxact->xid,
-		digest);
+	return cluster_remote_xact_pending_matches_v2(origin_node, xid, digest);
 }
 #endif
 
@@ -662,15 +666,6 @@ LockGXact(const char *gid, Oid user)
 					 errmsg("prepared transaction with identifier \"%s\" is owned by recovery",
 							gid),
 					 errhint("Wait for failed-origin recovery to apply matching terminal redo.")));
-#ifdef USE_PGRAC_CLUSTER
-		if (TwoPhaseRecoveryFinishIsFenced(gxact, proc))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("prepared transaction with identifier \"%s\" is fenced for failed-origin recovery",
-							gid),
-					 errhint("Wait for RECO-style recovery to resolve the matching terminal record.")));
-#endif
-
 		/* Found it, but has someone else got it locked? */
 		if (gxact->locking_backend != InvalidBackendId)
 			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
@@ -701,6 +696,26 @@ LockGXact(const char *gid, Oid user)
 		MyLockedGxact = gxact;
 
 		LWLockRelease(TwoPhaseStateLock);
+
+#ifdef USE_PGRAC_CLUSTER
+		/* External ROOT/projection reads have their own locks.  Claim the GXACT
+		 * first, then perform those reads outside TwoPhaseStateLock. */
+		if (TwoPhaseRecoveryFinishIsFenced(gxact->xid, proc->databaseId,
+				gxact->gid))
+		{
+			LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+			Assert(MyLockedGxact == gxact);
+			Assert(gxact->locking_backend == MyBackendId);
+			gxact->locking_backend = InvalidBackendId;
+			MyLockedGxact = NULL;
+			LWLockRelease(TwoPhaseStateLock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("prepared transaction with identifier \"%s\" is fenced for failed-origin recovery",
+							gid),
+					 errhint("Wait for RECO-style recovery to resolve the matching terminal record.")));
+		}
+#endif
 
 		return gxact;
 	}
@@ -787,8 +802,11 @@ GetPreparedTransactionList(GlobalTransaction *gxacts)
 /*
  * GetNumberOfPreparedTransactions
  *
- * PGRAC (spec-4.12a D1): non-allocating count of prepared transactions
- * currently tracked in TwoPhaseState (live + crash-recovered).  The cluster
+ * PGRAC (spec-4.12a D1): non-allocating count of unresolved prepared
+ * transactions currently tracked in TwoPhaseState (live + crash-recovered).
+ * A recovery terminal whose native callbacks completed is invalid and is not
+ * counted while its exact file is retained as a post-OPEN cleanup receipt.
+ * The cluster
  * undo record-segment drain gate (硬门 6) uses it to retain ALL undo
  * record-segment ACTIVE -> COMMITTED advances while any prepared xact is
  * unresolved -- a prepared cluster-TT xact's undo may still be consumed by
@@ -803,10 +821,13 @@ GetPreparedTransactionList(GlobalTransaction *gxacts)
 int
 GetNumberOfPreparedTransactions(void)
 {
-	int num;
+	int num = 0;
+	int i;
 
 	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
-	num = TwoPhaseState->numPrepXacts;
+	for (i = 0; i < TwoPhaseState->numPrepXacts; i++)
+		if (TwoPhaseState->prepXacts[i]->valid)
+			num++;
 	LWLockRelease(TwoPhaseStateLock);
 
 	return num;
@@ -1843,6 +1864,264 @@ TwoPhaseRecoveryPendingInstall(TransactionId xid, Oid database, Oid owner,
 	pfree(postread);
 	LWLockRelease(TwoPhaseStateLock);
 	return result;
+}
+
+/* Caller holds TwoPhaseStateLock in shared or exclusive mode. */
+static TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingLookupLocked(TransactionId xid, Oid database,
+	const char *gid, bool require_managed, GlobalTransaction *gxact_out)
+{
+	GlobalTransaction exact = NULL;
+	int			i;
+
+	Assert(LWLockHeldByMe(TwoPhaseStateLock));
+	if (gxact_out != NULL)
+		*gxact_out = NULL;
+	for (i = 0; i < TwoPhaseState->numPrepXacts; i++)
+	{
+		GlobalTransaction gxact = TwoPhaseState->prepXacts[i];
+		bool		xid_match = TransactionIdEquals(gxact->xid, xid);
+		bool		gid_match = strcmp(gxact->gid, gid) == 0;
+
+		if (!xid_match && !gid_match)
+			continue;
+		if (!xid_match || !gid_match || exact != NULL)
+			return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+		exact = gxact;
+	}
+	if (exact == NULL)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	if (ProcGlobal->allProcs[exact->pgprocno].databaseId != database)
+		return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+	if ((!exact->valid && !exact->recovery_terminal_cleanup_pending) ||
+		exact->recovery_activation_pending || !exact->ondisk ||
+		(require_managed && !exact->recovery_managed) ||
+		exact->locking_backend != InvalidBackendId)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	if (gxact_out != NULL)
+		*gxact_out = exact;
+	return TWOPHASE_RECOVERY_PENDING_OK;
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingReadExact(TransactionId xid, Oid database,
+	const char *gid, void **content_out, uint32 *len_out)
+{
+	TwoPhaseRecoveryPendingResult result;
+	GlobalTransaction gxact = NULL;
+	TwoPhaseFileHeader *hdr;
+	char	   *buf;
+	const char *stored_gid;
+	uint32		len;
+
+	if (content_out != NULL)
+		*content_out = NULL;
+	if (len_out != NULL)
+		*len_out = 0;
+	if (content_out == NULL || len_out == NULL || !TransactionIdIsNormal(xid) ||
+		!OidIsValid(database) || gid == NULL || strnlen(gid, GIDSIZE) == 0 ||
+		strnlen(gid, GIDSIZE) >= GIDSIZE || max_prepared_xacts <= 0 ||
+		TwoPhaseState == NULL)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+	result = TwoPhaseRecoveryPendingLookupLocked(xid, database, gid, false,
+		&gxact);
+	if (result != TWOPHASE_RECOVERY_PENDING_OK)
+	{
+		LWLockRelease(TwoPhaseStateLock);
+		return result;
+	}
+	if (!gxact->recovery_managed)
+	{
+		LWLockRelease(TwoPhaseStateLock);
+		if (!TwoPhaseRecoveryFinishIsFenced(xid, database, gid))
+			return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+		LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+		result = TwoPhaseRecoveryPendingLookupLocked(xid, database, gid, false,
+			&gxact);
+		if (result != TWOPHASE_RECOVERY_PENDING_OK)
+		{
+			LWLockRelease(TwoPhaseStateLock);
+			return result;
+		}
+		gxact->recovery_managed = true;
+	}
+
+	buf = ReadTwoPhaseFile(xid, false);
+	hdr = (TwoPhaseFileHeader *) buf;
+	len = hdr->total_len - sizeof(pg_crc32c);
+	stored_gid = TwoPhaseRecoveryPayloadGid(buf, len, NULL);
+	if (stored_gid == NULL || !TransactionIdEquals(hdr->xid, xid) ||
+		hdr->database != database || hdr->owner != gxact->owner ||
+		hdr->prepared_at != gxact->prepared_at || strcmp(stored_gid, gid) != 0)
+	{
+		pfree(buf);
+		LWLockRelease(TwoPhaseStateLock);
+		return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+	}
+	*content_out = buf;
+	*len_out = len;
+	LWLockRelease(TwoPhaseStateLock);
+	return TWOPHASE_RECOVERY_PENDING_OK;
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingResolveExact(TransactionId xid, Oid database,
+	const char *gid, const void *content, uint32 len, bool isCommit)
+{
+	TwoPhaseRecoveryPendingResult result;
+	GlobalTransaction gxact = NULL;
+	PGPROC	   *proc;
+	TwoPhaseFileHeader *hdr;
+	char	   *observed = NULL;
+	char	   *buf;
+	char	   *bufptr;
+	uint32		observed_len = 0;
+	MemoryContext caller_context = CurrentMemoryContext;
+
+	if (content == NULL)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	result = TwoPhaseRecoveryPendingReadExact(xid, database, gid,
+		(void **) &observed, &observed_len);
+	if (result != TWOPHASE_RECOVERY_PENDING_OK)
+		return result;
+	if (!TwoPhaseRecoveryPayloadExact(observed, observed_len, content, len))
+	{
+		pfree(observed);
+		return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+	}
+	pfree(observed);
+	if (MyLockedGxact != NULL)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	if (!twophaseExitRegistered)
+	{
+		before_shmem_exit(AtProcExit_Twophase, 0);
+		twophaseExitRegistered = true;
+	}
+
+	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+	result = TwoPhaseRecoveryPendingLookupLocked(xid, database, gid, true,
+		&gxact);
+	if (result != TWOPHASE_RECOVERY_PENDING_OK)
+	{
+		LWLockRelease(TwoPhaseStateLock);
+		return result;
+	}
+	buf = ReadTwoPhaseFile(xid, false);
+	hdr = (TwoPhaseFileHeader *) buf;
+	observed_len = hdr->total_len - sizeof(pg_crc32c);
+	if (!TwoPhaseRecoveryPayloadExact(buf, observed_len, content, len) ||
+		hdr->nsubxacts != 0 || hdr->ncommitrels != 0 || hdr->nabortrels != 0 ||
+		hdr->ncommitstats != 0 || hdr->nabortstats != 0 ||
+		hdr->ninvalmsgs != 0 || hdr->initfileinval)
+	{
+		pfree(buf);
+		LWLockRelease(TwoPhaseStateLock);
+		return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+	}
+	if (gxact->recovery_terminal_cleanup_pending)
+	{
+		result = gxact->recovery_terminal_is_commit == isCommit
+			? TWOPHASE_RECOVERY_PENDING_OK :
+			TWOPHASE_RECOVERY_PENDING_CONFLICT;
+		pfree(buf);
+		LWLockRelease(TwoPhaseStateLock);
+		return result;
+	}
+	proc = &ProcGlobal->allProcs[gxact->pgprocno];
+	bufptr = buf + MAXALIGN(sizeof(TwoPhaseFileHeader));
+	bufptr += MAXALIGN(hdr->gidlen);
+	gxact->locking_backend = MyBackendId;
+	MyLockedGxact = gxact;
+
+	/* Matching terminal redo and canonical TT/undo truth are already durable;
+	 * this path releases the native pending owner and emits no second terminal
+	 * WAL record. */
+	HOLD_INTERRUPTS();
+	ProcArrayRemove(proc, xid);
+	gxact->valid = false;
+	PG_TRY();
+	{
+		if (isCommit)
+			ProcessRecords(bufptr, xid, twophase_postcommit_callbacks);
+		else
+			ProcessRecords(bufptr, xid, twophase_postabort_callbacks);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(caller_context);
+		edata = CopyErrorData();
+		FlushErrorState();
+		ereport(PANIC,
+				(errmsg("could not release recovered prepared transaction %u", xid),
+				 errdetail_internal("Native two-phase terminal callback failed: %s",
+							edata->message)));
+	}
+	PG_END_TRY();
+	PredicateLockTwoPhaseFinish(xid, isCommit);
+	Assert(gxact->ondisk);
+	gxact->recovery_terminal_cleanup_pending = true;
+	gxact->recovery_terminal_is_commit = isCommit;
+	gxact->locking_backend = InvalidBackendId;
+	LWLockRelease(TwoPhaseStateLock);
+	MyLockedGxact = NULL;
+	RESUME_INTERRUPTS();
+	pfree(buf);
+	return TWOPHASE_RECOVERY_PENDING_OK;
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingCleanupExact(TransactionId xid, Oid database,
+	const char *gid, const void *content, uint32 len, bool isCommit)
+{
+	TwoPhaseRecoveryPendingResult result;
+	GlobalTransaction gxact = NULL;
+	TwoPhaseFileHeader *hdr;
+	char	   *buf;
+	char		path[MAXPGPATH];
+	uint32		observed_len;
+
+	if (content == NULL)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+	result = TwoPhaseRecoveryPendingLookupLocked(xid, database, gid, true,
+		&gxact);
+	if (result != TWOPHASE_RECOVERY_PENDING_OK)
+	{
+		LWLockRelease(TwoPhaseStateLock);
+		return result;
+	}
+	if (!gxact->recovery_terminal_cleanup_pending ||
+		gxact->recovery_terminal_is_commit != isCommit)
+	{
+		LWLockRelease(TwoPhaseStateLock);
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	}
+	buf = ReadTwoPhaseFile(xid, false);
+	hdr = (TwoPhaseFileHeader *) buf;
+	observed_len = hdr->total_len - sizeof(pg_crc32c);
+	if (!TwoPhaseRecoveryPayloadExact(buf, observed_len, content, len))
+	{
+		pfree(buf);
+		LWLockRelease(TwoPhaseStateLock);
+		return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+	}
+	TwoPhaseFilePath(path, xid);
+	errno = 0;
+	if (durable_unlink(path, ERROR) != 0 || access(path, F_OK) == 0 ||
+		errno != ENOENT)
+	{
+		pfree(buf);
+		LWLockRelease(TwoPhaseStateLock);
+		return TWOPHASE_RECOVERY_PENDING_POST_READ_FAILED;
+	}
+	RemoveGXact(gxact);
+	LWLockRelease(TwoPhaseStateLock);
+	pfree(buf);
+	return TWOPHASE_RECOVERY_PENDING_OK;
 }
 #endif							/* USE_PGRAC_CLUSTER */
 
@@ -3097,6 +3376,8 @@ PrepareRedoAddCommon(char *buf, XLogRecPtr start_lsn, XLogRecPtr end_lsn,
 	gxact->inredo = true; /* yes, added in redo */
 	gxact->recovery_activation_pending = false;
 	gxact->recovery_managed = false;
+	gxact->recovery_terminal_cleanup_pending = false;
+	gxact->recovery_terminal_is_commit = false;
 	strcpy(gxact->gid, gid);
 
 	/* And insert it into the active array */

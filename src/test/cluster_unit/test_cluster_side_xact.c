@@ -40,16 +40,25 @@ typedef struct PrepareApplyCapture
 	TTSlot slot;
 	TwoPhaseRecoveryPendingResult pending_preflight;
 	TwoPhaseRecoveryPendingResult pending_install;
+	TwoPhaseRecoveryPendingResult pending_read;
+	TwoPhaseRecoveryPendingResult pending_resolve;
 	ClusterRemoteXactMutationV2 projection_store;
 	bool projection_postread;
+	uint8 native_payload[512];
+	uint32 native_payload_length;
 	uint32 tt_reads;
 	uint32 pending_preflights;
 	uint32 pending_installs;
+	uint32 pending_reads;
+	uint32 pending_resolves;
 	uint32 projection_stores;
+	uint32 terminal_projection_stores;
 	uint32 projection_postreads;
 	uint32 next_order;
 	uint32 install_order;
 	uint32 projection_order;
+	uint32 terminal_projection_order;
+	uint32 resolve_order;
 } PrepareApplyCapture;
 
 static PrepareApplyCapture prepare_apply;
@@ -66,6 +75,8 @@ reset_prepare_apply(void)
 	prepare_apply.slot.commit_scn = InvalidScn;
 	prepare_apply.pending_preflight = TWOPHASE_RECOVERY_PENDING_OK;
 	prepare_apply.pending_install = TWOPHASE_RECOVERY_PENDING_OK;
+	prepare_apply.pending_read = TWOPHASE_RECOVERY_PENDING_OK;
+	prepare_apply.pending_resolve = TWOPHASE_RECOVERY_PENDING_OK;
 	prepare_apply.projection_store = CLUSTER_REMOTE_XACT_MUTATION_STORED;
 	prepare_apply.projection_postread = true;
 }
@@ -118,6 +129,39 @@ TwoPhaseRecoveryPendingInstall(
 	prepare_apply.pending_installs++;
 	prepare_apply.install_order = ++prepare_apply.next_order;
 	return prepare_apply.pending_install;
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingReadExact(
+	TransactionId xid pg_attribute_unused(), Oid database pg_attribute_unused(),
+	const char *gid pg_attribute_unused(), void **content_out,
+	uint32 *len_out)
+{
+	prepare_apply.pending_reads++;
+	if (prepare_apply.pending_read != TWOPHASE_RECOVERY_PENDING_OK)
+		return prepare_apply.pending_read;
+	if (content_out == NULL || len_out == NULL ||
+		prepare_apply.native_payload_length == 0)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	*content_out = malloc(prepare_apply.native_payload_length);
+	memcpy(*content_out, prepare_apply.native_payload,
+		prepare_apply.native_payload_length);
+	*len_out = prepare_apply.native_payload_length;
+	return TWOPHASE_RECOVERY_PENDING_OK;
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingResolveExact(
+	TransactionId xid pg_attribute_unused(), Oid database pg_attribute_unused(),
+	const char *gid pg_attribute_unused(), const void *content,
+	uint32 len, bool isCommit pg_attribute_unused())
+{
+	prepare_apply.pending_resolves++;
+	prepare_apply.resolve_order = ++prepare_apply.next_order;
+	if (content == NULL || len != prepare_apply.native_payload_length ||
+		memcmp(content, prepare_apply.native_payload, len) != 0)
+		return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+	return prepare_apply.pending_resolve;
 }
 
 ClusterRemoteXactMutationV2
@@ -176,6 +220,8 @@ cluster_remote_xact_store_terminal_v2(
 	TimestampTz commit_timestamp pg_attribute_unused(),
 	bool wrap_valid pg_attribute_unused(), uint16 wrap pg_attribute_unused())
 {
+	prepare_apply.terminal_projection_stores++;
+	prepare_apply.terminal_projection_order = ++prepare_apply.next_order;
 	return CLUSTER_REMOTE_XACT_MUTATION_STORED;
 }
 
@@ -196,18 +242,6 @@ cluster_remote_commit_timestamp(
 	TimestampTz *commit_timestamp)
 {
 	*commit_timestamp = INT64_C(123456);
-	return true;
-}
-
-bool
-cluster_remote_xact_prepare_digest_v2(
-	uint64 system_identifier pg_attribute_unused(),
-	int origin_node pg_attribute_unused(),
-	TransactionId xid pg_attribute_unused(), Oid database pg_attribute_unused(),
-	const char *gid pg_attribute_unused(),
-	uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES])
-{
-	memset(digest, 0x5a, CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES);
 	return true;
 }
 
@@ -327,6 +361,51 @@ make_prepare(FakeXactRecord *fake, TransactionId xid, bool with_tt,
 	return &fake->reader;
 }
 
+static XLogReaderState *
+make_commit_prepared(FakeXactRecord *fake, TransactionId xid, Oid database,
+	SCN scn, TimestampTz timestamp)
+{
+	xl_xact_commit commit;
+	xl_xact_xinfo xinfo;
+	xl_xact_dbinfo dbinfo;
+	xl_xact_twophase twophase;
+	xl_xact_scn wal_scn;
+	char	   *cursor;
+
+	memset(fake, 0, sizeof(*fake));
+	memset(&commit, 0, sizeof(commit));
+	memset(&xinfo, 0, sizeof(xinfo));
+	memset(&dbinfo, 0, sizeof(dbinfo));
+	memset(&twophase, 0, sizeof(twophase));
+	memset(&wal_scn, 0, sizeof(wal_scn));
+	commit.xact_time = timestamp;
+	xinfo.xinfo = XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_TWOPHASE |
+		XACT_XINFO_HAS_GID | XACT_XINFO_HAS_SCN;
+	dbinfo.dbId = database;
+	twophase.xid = xid;
+	wal_scn.scn = scn;
+	cursor = (char *) fake->data;
+	memcpy(cursor, &commit, sizeof(commit));
+	cursor += sizeof(commit);
+	memcpy(cursor, &xinfo, sizeof(xinfo));
+	cursor += sizeof(xinfo);
+	memcpy(cursor, &dbinfo, sizeof(dbinfo));
+	cursor += sizeof(dbinfo);
+	memcpy(cursor, &twophase, sizeof(twophase));
+	cursor += sizeof(twophase);
+	memcpy(cursor, "gid", 4);
+	cursor += 4;
+	memcpy(cursor, &wal_scn, sizeof(wal_scn));
+	cursor += sizeof(wal_scn);
+	fake->u.decoded.header.xl_rmid = RM_XACT_ID;
+	fake->u.decoded.header.xl_info =
+		XLOG_XACT_COMMIT_PREPARED | XLOG_XACT_HAS_INFO;
+	fake->u.decoded.main_data = (char *) fake->data;
+	fake->u.decoded.main_data_len = (uint32) (cursor - (char *) fake->data);
+	fake->reader.record = &fake->u.decoded;
+	return &fake->reader;
+}
+
 static RfPageOnlineRecordIdentityV1
 make_identity(FakeXactRecord *fake, uint8 storage_uuid[16])
 {
@@ -376,6 +455,28 @@ make_undo_delta(FakeXactRecord *fake)
 	return &fake->reader;
 }
 
+static XLogReaderState *
+make_tt_commit_delta(FakeXactRecord *fake, TransactionId xid, SCN commit_scn)
+{
+	xl_undo_tt_slot_commit commit;
+
+	memset(fake, 0, sizeof(*fake));
+	memset(&commit, 0, sizeof(commit));
+	commit.instance = 3;
+	commit.segment_id = 513;
+	commit.slot_offset = 4;
+	commit.wrap = 7;
+	commit.xid = xid;
+	commit.commit_scn = commit_scn;
+	memcpy(fake->data, &commit, sizeof(commit));
+	fake->u.decoded.header.xl_rmid = RM_CLUSTER_UNDO_ID;
+	fake->u.decoded.header.xl_info = XLOG_UNDO_TT_SLOT_COMMIT;
+	fake->u.decoded.main_data = (char *) fake->data;
+	fake->u.decoded.main_data_len = sizeof(commit);
+	fake->reader.record = &fake->u.decoded;
+	return &fake->reader;
+}
+
 static RfDetachedRecordPlanV1
 make_undo_record_plan(FakeXactRecord *fake)
 {
@@ -384,7 +485,8 @@ make_undo_record_plan(FakeXactRecord *fake)
 	memset(&record_plan, 0, sizeof(record_plan));
 	record_plan.source_record = &fake->reader;
 	record_plan.route.rmid = RM_CLUSTER_UNDO_ID;
-	record_plan.route.normalized_info = XLOG_UNDO_BLOCK_WRITE;
+	record_plan.route.normalized_info =
+		fake->u.decoded.header.xl_info & XLR_RMGR_INFO_MASK;
 	record_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 	record_plan.route.block_policy = RF_ROUTE_BLOCKS_FORBIDDEN;
 	record_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_CLUSTER_UNDO;
@@ -400,7 +502,8 @@ make_record_plan(FakeXactRecord *fake)
 	memset(&record_plan, 0, sizeof(record_plan));
 	record_plan.source_record = &fake->reader;
 	record_plan.route.rmid = RM_XACT_ID;
-	record_plan.route.normalized_info = XLOG_XACT_COMMIT;
+	record_plan.route.normalized_info =
+		fake->u.decoded.header.xl_info & XLOG_XACT_OPMASK;
 	record_plan.route.legal_info_flags = XLOG_XACT_HAS_INFO;
 	record_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
 	record_plan.route.block_policy = RF_ROUTE_BLOCKS_FORBIDDEN;
@@ -456,9 +559,9 @@ capture_apply_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 	ApplyCapture *capture = (ApplyCapture *) arg;
 
 	capture->undo_count++;
-	capture->undo_first_byte = operation->owned_payload[0];
-	return operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO &&
-		operation->owned_payload_length > 0;
+	if (operation->owned_payload_length > 0)
+		capture->undo_first_byte = operation->owned_payload[0];
+	return operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO;
 }
 
 static bool
@@ -664,6 +767,36 @@ UT_TEST(test_prepare_apply_never_projects_unverified_pending)
 	UT_ASSERT_EQ(prepare_apply.pending_installs, 1);
 	UT_ASSERT_EQ(prepare_apply.projection_stores, 1);
 	UT_ASSERT_EQ(prepare_apply.projection_postreads, 0);
+}
+
+UT_TEST(test_commit_prepared_resolves_exact_native_owner_after_tt_truth)
+{
+	FakeXactRecord prepare_fake;
+	FakeXactRecord terminal_fake;
+	RfSideXactOperationV1 operation;
+	XLogReaderState *prepare_record;
+
+	reset_prepare_apply();
+	prepare_record = make_prepare(&prepare_fake, 802, true, false);
+	prepare_apply.native_payload_length = XLogRecGetDataLen(prepare_record);
+	memcpy(prepare_apply.native_payload, XLogRecGetData(prepare_record),
+		prepare_apply.native_payload_length);
+	prepare_apply.slot.status = TT_SLOT_COMMITTED;
+	prepare_apply.slot.commit_scn = UINT64_C(901);
+	prepare_apply.slot.first_undo_block = (UBA) InvalidUba_init;
+	UT_ASSERT(rf_side_xact_decode_v1(make_commit_prepared(&terminal_fake,
+		802, 16384, UINT64_C(901), INT64_C(123456)),
+		UINT64_C(0x11223344), 3, &operation));
+	UT_ASSERT_EQ(operation.kind, RF_SIDE_XACT_COMMIT_PREPARED);
+	UT_ASSERT_EQ(rf_side_xact_target_preflight_owned_v1(
+		&operation, NULL, 0), RF_SIDE_XACT_APPLY_OK);
+	UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&operation, NULL, 0),
+		RF_SIDE_XACT_APPLY_OK);
+	UT_ASSERT(prepare_apply.pending_reads > 0);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 1);
+	UT_ASSERT_EQ(prepare_apply.pending_resolves, 1);
+	UT_ASSERT(prepare_apply.terminal_projection_order <
+		prepare_apply.resolve_order);
 }
 
 UT_TEST(test_online_plan_owns_decoded_operation_not_raw_record)
@@ -924,10 +1057,137 @@ UT_TEST(test_online_plan_preflights_all_targets_before_first_mutation)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+UT_TEST(test_online_plan_denies_terminal_missing_required_tt_commit)
+{
+	FakeXactRecord prepare_fake;
+	FakeXactRecord terminal_fake;
+	RfDetachedRecordPlanV1 terminal_plan;
+	RfPageOnlineRecordIdentityV1 terminal_identity;
+	RfSideOnlinePlanRequestV1 request;
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut;
+	RfSideOnlineApplyOpsV1 apply_ops;
+	ApplyCapture capture;
+	XLogReaderState *prepare_record;
+	uint8 storage_uuid[16];
+
+	reset_prepare_apply();
+	prepare_record = make_prepare(&prepare_fake, 802, true, false);
+	prepare_apply.native_payload_length = XLogRecGetDataLen(prepare_record);
+	memcpy(prepare_apply.native_payload, XLogRecGetData(prepare_record),
+		prepare_apply.native_payload_length);
+	(void) make_commit_prepared(&terminal_fake, 802, 16384,
+		UINT64_C(901), INT64_C(123456));
+	memset(storage_uuid, 0x42, sizeof(storage_uuid));
+	terminal_identity = make_identity(&terminal_fake, storage_uuid);
+	terminal_plan = make_record_plan(&terminal_fake);
+	memset(&cut, 0, sizeof(cut));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 200;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	memset(&request, 0, sizeof(request));
+	request.system_identifier = terminal_identity.record.system_identifier;
+	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &terminal_plan,
+		&terminal_identity), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	memset(&capture, 0, sizeof(capture));
+	memset(&apply_ops, 0, sizeof(apply_ops));
+	apply_ops.arg = &capture;
+	apply_ops.begin_protected_set = capture_begin;
+	apply_ops.end_protected_set = capture_end;
+	apply_ops.preflight_xact = accept_preflight;
+	apply_ops.apply_xact = capture_apply;
+	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
+		RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(capture.count, 0);
+	UT_ASSERT_EQ(capture.begin_count, 1);
+	UT_ASSERT_EQ(capture.end_count, 1);
+	UT_ASSERT(!capture.end_complete);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_online_plan_accepts_exact_preceding_tt_commit_dependency)
+{
+	FakeXactRecord prepare_fake;
+	FakeXactRecord undo_fake;
+	FakeXactRecord terminal_fake;
+	RfDetachedRecordPlanV1 undo_plan;
+	RfDetachedRecordPlanV1 terminal_plan;
+	RfPageOnlineRecordIdentityV1 undo_identity;
+	RfPageOnlineRecordIdentityV1 terminal_identity;
+	RfSideOnlinePlanRequestV1 request;
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut;
+	RfSideOnlineApplyOpsV1 apply_ops;
+	ApplyCapture capture;
+	XLogReaderState *prepare_record;
+	uint8 storage_uuid[16];
+
+	reset_prepare_apply();
+	prepare_record = make_prepare(&prepare_fake, 802, true, false);
+	prepare_apply.native_payload_length = XLogRecGetDataLen(prepare_record);
+	memcpy(prepare_apply.native_payload, XLogRecGetData(prepare_record),
+		prepare_apply.native_payload_length);
+	(void) make_tt_commit_delta(&undo_fake, 802, UINT64_C(901));
+	(void) make_commit_prepared(&terminal_fake, 802, 16384,
+		UINT64_C(901), INT64_C(123456));
+	memset(storage_uuid, 0x42, sizeof(storage_uuid));
+	undo_identity = make_identity(&undo_fake, storage_uuid);
+	terminal_identity = make_identity(&terminal_fake, storage_uuid);
+	terminal_identity.record.read_rec_ptr = 200;
+	terminal_identity.record.end_rec_ptr = 300;
+	terminal_fake.reader.ReadRecPtr = 200;
+	terminal_fake.reader.EndRecPtr = 300;
+	terminal_fake.u.decoded.lsn = 200;
+	terminal_fake.u.decoded.next_lsn = 300;
+	undo_plan = make_undo_record_plan(&undo_fake);
+	terminal_plan = make_record_plan(&terminal_fake);
+	memset(&cut, 0, sizeof(cut));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 300;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	memset(&request, 0, sizeof(request));
+	request.system_identifier = undo_identity.record.system_identifier;
+	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &undo_plan,
+		&undo_identity), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &terminal_plan,
+		&terminal_identity), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	memset(&capture, 0, sizeof(capture));
+	memset(&apply_ops, 0, sizeof(apply_ops));
+	apply_ops.arg = &capture;
+	apply_ops.begin_protected_set = capture_begin;
+	apply_ops.end_protected_set = capture_end;
+	apply_ops.preflight_xact = accept_preflight;
+	apply_ops.preflight_undo = accept_preflight;
+	apply_ops.apply_xact = capture_apply;
+	apply_ops.apply_undo = capture_apply_undo;
+	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(capture.count, 1);
+	UT_ASSERT_EQ(capture.undo_count, 1);
+	UT_ASSERT(capture.end_complete);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);
@@ -936,11 +1196,14 @@ main(void)
 	UT_RUN(test_prepare_apply_blocks_underivable_or_wrong_system_before_pending);
 	UT_RUN(test_prepare_apply_blocks_wrong_origin_subxid_before_target_reads);
 	UT_RUN(test_prepare_apply_never_projects_unverified_pending);
+	UT_RUN(test_commit_prepared_resolves_exact_native_owner_after_tt_truth);
 	UT_RUN(test_online_plan_owns_decoded_operation_not_raw_record);
 	UT_RUN(test_online_plan_denies_incomplete_physical_cut);
 	UT_RUN(test_online_plan_owns_undo_payload_not_raw_record);
 	UT_RUN(test_online_plan_owns_prepare_state_not_raw_record);
 	UT_RUN(test_online_plan_preflights_all_targets_before_first_mutation);
+	UT_RUN(test_online_plan_denies_terminal_missing_required_tt_commit);
+	UT_RUN(test_online_plan_accepts_exact_preceding_tt_commit_dependency);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

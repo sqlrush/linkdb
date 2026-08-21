@@ -138,6 +138,7 @@ OBJS = \
 	cluster_thread_recovery_finalize.o \
 	cluster_thread_recovery_orchestrator_srf.o \
 	cluster_thread_recovery_worker.o \
+	cluster_remote_xact_identity.o \
 	cluster_remote_xact.o \
 	cluster_rfs.o \
 	cluster_reverse_key.o \

@@ -48,6 +48,16 @@ typedef struct RfSideTwoPhaseRecordOnDiskV1
 StaticAssertDecl(sizeof(RfSideTwoPhaseRecordOnDiskV1) == 8,
 	"RF-SIDE two-phase record header must match PostgreSQL's 8-byte layout");
 
+static void
+side_xact_payload_free(void *payload)
+{
+#ifdef RF_SIDE_XACT_TESTING
+	free(payload);
+#else
+	pfree(payload);
+#endif
+}
+
 static bool
 side_xact_take(RfSideXactCursorV1 *cursor, Size bytes, const char **start)
 {
@@ -88,22 +98,19 @@ side_xact_take_aligned_array(RfSideXactCursorV1 *cursor, int32 count,
 }
 
 static bool
-side_xact_prepare_shape_valid(XLogReaderState *record,
-							  RfSideXactOperationV1 *candidate)
+side_xact_prepare_payload_valid(const char *data, uint32 data_len,
+	RfSideXactOperationV1 *candidate)
 {
 	RfSideXactCursorV1 cursor;
 	xl_xact_prepare header;
 	ClusterTT2PCParsed parsed_tt;
-	const char *data;
 	const char *gid;
-	uint32		data_len;
 	bool		found_cluster_tt = false;
 	bool		found_end = false;
 	uint16		i;
 
-	data_len = XLogRecGetDataLen(record);
-	data = XLogRecGetData(record);
-	if (data == NULL || data_len < MAXALIGN(sizeof(header)))
+	if (candidate == NULL || data == NULL ||
+		data_len < MAXALIGN(sizeof(header)))
 		return false;
 	memcpy(&header, data, sizeof(header));
 	if (header.magic != RF_SIDE_XACT_TWOPHASE_MAGIC ||
@@ -191,11 +198,21 @@ side_xact_prepare_shape_valid(XLogReaderState *record,
 	}
 	if (!OidIsValid(header.owner))
 		return false;
+	candidate->xid = header.xid;
+	candidate->database = header.database;
 	candidate->prepared_owner = header.owner;
 	candidate->prepared_at = header.prepared_at;
 	candidate->prepare_payload_length = data_len;
 	memcpy(candidate->prepare_gid, gid, header.gidlen);
 	return true;
+}
+
+static bool
+side_xact_prepare_shape_valid(XLogReaderState *record,
+	RfSideXactOperationV1 *candidate)
+{
+	return record != NULL && side_xact_prepare_payload_valid(
+		XLogRecGetData(record), XLogRecGetDataLen(record), candidate);
 }
 
 static bool
@@ -593,7 +610,7 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 				parsed.nabortstats != 0 || parsed.nmsgs != 0 ||
 				xlrec->initfileinval ||
 				!cluster_remote_xact_prepare_digest_v2(system_identifier,
-					origin_thread, xid, parsed.dbId, parsed.twophase_gid,
+					origin_thread - 1, xid, parsed.dbId, parsed.twophase_gid,
 					candidate.prepare_binding))
 				return false;
 			candidate.kind = RF_SIDE_XACT_PREPARE;
@@ -618,7 +635,7 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 				!SCN_VALID(parsed.scn) || side_xact_commit_timestamp(&parsed) == 0 ||
 				parsed.has_tt_commit ||
 				!cluster_remote_xact_prepare_digest_v2(system_identifier,
-					origin_thread, xid, parsed.dbId, parsed.twophase_gid,
+					origin_thread - 1, xid, parsed.dbId, parsed.twophase_gid,
 					candidate.prepare_binding))
 				return false;
 			candidate.kind = RF_SIDE_XACT_COMMIT_PREPARED;
@@ -646,7 +663,7 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 					(XACT_XINFO_HAS_TWOPHASE | XACT_XINFO_HAS_GID |
 					 XACT_XINFO_HAS_DBINFO) || !SCN_VALID(parsed.scn) ||
 				!cluster_remote_xact_prepare_digest_v2(system_identifier,
-					origin_thread, xid, parsed.dbId, parsed.twophase_gid,
+					origin_thread - 1, xid, parsed.dbId, parsed.twophase_gid,
 					candidate.prepare_binding))
 				return false;
 			candidate.kind = RF_SIDE_XACT_ABORT_PREPARED;
@@ -736,6 +753,222 @@ side_xact_map_pending_result(TwoPhaseRecoveryPendingResult result)
 	}
 }
 
+static RfSideXactApplyResultV1
+side_xact_read_prepared_material(const RfSideXactOperationV1 *operation,
+	RfSideXactOperationV1 *prepared, uint8 **payload_out,
+	uint32 *payload_length_out)
+{
+	TwoPhaseRecoveryPendingResult pending;
+	void	   *payload = NULL;
+	uint32		payload_length = 0;
+	uint8		digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
+
+	if (prepared == NULL || payload_out == NULL || payload_length_out == NULL)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	memset(prepared, 0, sizeof(*prepared));
+	*payload_out = NULL;
+	*payload_length_out = 0;
+	pending = TwoPhaseRecoveryPendingReadExact(operation->xid,
+		operation->database, operation->prepare_gid, &payload,
+		&payload_length);
+	if (pending != TWOPHASE_RECOVERY_PENDING_OK)
+		return side_xact_map_pending_result(pending);
+	prepared->system_identifier = operation->system_identifier;
+	prepared->origin_thread = operation->origin_thread;
+	prepared->kind = RF_SIDE_XACT_PREPARE;
+	if (!side_xact_prepare_payload_valid(payload, payload_length, prepared) ||
+		!TransactionIdEquals(prepared->xid, operation->xid) ||
+		prepared->database != operation->database ||
+		strcmp(prepared->prepare_gid, operation->prepare_gid) != 0 ||
+		!cluster_remote_xact_prepare_digest_v2(operation->system_identifier,
+			operation->origin_thread - 1, operation->xid,
+			operation->database, operation->prepare_gid, digest) ||
+		memcmp(digest, operation->prepare_binding, sizeof(digest)) != 0 ||
+		!side_xact_prepared_material_valid(prepared))
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_CONFLICT;
+	}
+	memcpy(prepared->prepare_binding, digest, sizeof(digest));
+	*payload_out = payload;
+	*payload_length_out = payload_length;
+	return RF_SIDE_XACT_APPLY_OK;
+}
+
+static bool
+side_xact_prepared_commit_tt_requirements(
+	const RfSideXactOperationV1 *prepared, SCN terminal_scn,
+	RfSideXactCommitPreparedRequirementsV1 *requirements)
+{
+	uint16		i;
+
+	if (requirements == NULL)
+		return false;
+	memset(requirements, 0, sizeof(*requirements));
+	for (i = 0; i < prepared->prepared_binding_count; i++)
+		if (cluster_xid_origin_slot(prepared->prepared_bindings[i].xid) !=
+				(int) prepared->origin_thread - 1)
+			return false;
+	requirements->count = prepared->prepared_binding_count;
+	for (i = 0; i < prepared->prepared_binding_count; i++)
+	{
+		const ClusterTT2PCBinding *binding =
+			&prepared->prepared_bindings[i];
+		RfSideXactTTCommitRequirementV1 *requirement =
+			&requirements->bindings[i];
+		TTSlot		slot;
+
+		requirement->instance = prepared->origin_thread;
+		requirement->segment_id = binding->undo_segment_id;
+		requirement->slot_offset = binding->slot_offset;
+		requirement->wrap = binding->wrap;
+		requirement->xid = binding->xid;
+		requirement->commit_scn = terminal_scn;
+		if (!cluster_tt_slot_durable_read_exact_stable(
+				binding->undo_segment_id, binding->slot_offset, binding->xid,
+				binding->wrap, &slot))
+			return false;
+		if (slot.status == TT_SLOT_COMMITTED &&
+			slot.commit_scn == terminal_scn &&
+			UBA_is_invalid(slot.first_undo_block))
+			continue;
+		if (slot.status == TT_SLOT_ACTIVE &&
+			!SCN_VALID(slot.commit_scn) &&
+			memcmp(&slot.first_undo_block, &prepared->prepared_heads[i],
+				sizeof(slot.first_undo_block)) == 0)
+		{
+			requirement->requires_apply = true;
+			continue;
+		}
+		return false;
+	}
+	return true;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_commit_prepared_requirements_v1(
+	const RfSideXactOperationV1 *operation,
+	RfSideXactCommitPreparedRequirementsV1 *out_requirements)
+{
+	RfSideXactOperationV1 prepared;
+	RfSideXactApplyResultV1 result;
+	uint8	   *payload = NULL;
+	uint32		payload_length = 0;
+
+	if (out_requirements == NULL)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	memset(out_requirements, 0, sizeof(*out_requirements));
+	if (!rf_side_xact_structural_preflight_v1(operation) ||
+		operation->kind != RF_SIDE_XACT_COMMIT_PREPARED ||
+		operation->system_identifier != GetSystemIdentifier() ||
+		cluster_xid_origin_slot(operation->xid) !=
+			(int) operation->origin_thread - 1)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	result = side_xact_read_prepared_material(operation, &prepared, &payload,
+		&payload_length);
+	if (result != RF_SIDE_XACT_APPLY_OK)
+		return result;
+	result = side_xact_prepared_commit_tt_requirements(&prepared,
+		operation->terminal_scn, out_requirements) ? RF_SIDE_XACT_APPLY_OK :
+		RF_SIDE_XACT_APPLY_BLOCKED;
+	side_xact_payload_free(payload);
+	return result;
+}
+
+static RfSideXactApplyResultV1
+side_xact_preflight_commit_prepared(
+	const RfSideXactOperationV1 *operation)
+{
+	RfSideXactCommitPreparedRequirementsV1 requirements;
+
+	return rf_side_xact_commit_prepared_requirements_v1(operation,
+		&requirements);
+}
+
+static RfSideXactApplyResultV1
+side_xact_apply_commit_prepared(const RfSideXactOperationV1 *operation)
+{
+	RfSideXactOperationV1 prepared;
+	RfSideXactApplyResultV1 result;
+	TwoPhaseRecoveryPendingResult pending;
+	ClusterRemoteXactMutationV2 mutation;
+	ClusterRemoteXactOutcome outcome;
+	uint8	   *payload = NULL;
+	uint32		payload_length = 0;
+	SCN			post_scn;
+	TimestampTz post_timestamp;
+	uint16		post_wrap;
+	uint16		top_wrap = 0;
+	bool		post_wrap_valid;
+	uint16		i;
+	RfSideXactCommitPreparedRequirementsV1 requirements;
+
+	result = side_xact_read_prepared_material(operation, &prepared, &payload,
+		&payload_length);
+	if (result != RF_SIDE_XACT_APPLY_OK)
+		return result;
+	if (!side_xact_prepared_commit_tt_requirements(&prepared,
+			operation->terminal_scn, &requirements))
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	}
+	for (i = 0; i < requirements.count; i++)
+		if (requirements.bindings[i].requires_apply)
+		{
+			side_xact_payload_free(payload);
+			return RF_SIDE_XACT_APPLY_BLOCKED;
+		}
+	for (i = 0; i < prepared.prepared_binding_count; i++)
+		if (TransactionIdEquals(prepared.prepared_bindings[i].xid,
+				operation->xid))
+		{
+			top_wrap = prepared.prepared_bindings[i].wrap;
+			break;
+		}
+	if (top_wrap == 0)
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_CONFLICT;
+	}
+
+	cluster_scn_recovery_replay_observe(operation->terminal_scn);
+	mutation = cluster_remote_xact_store_terminal_v2(
+		operation->origin_thread - 1, operation->xid, true,
+		operation->prepare_binding, CLUSTER_REMOTE_XACT_COMMITTED,
+		operation->terminal_scn, operation->terminal_timestamp, true,
+		top_wrap);
+	if (mutation == CLUSTER_REMOTE_XACT_MUTATION_CONFLICT)
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_CONFLICT;
+	}
+	if (mutation != CLUSTER_REMOTE_XACT_MUTATION_STORED &&
+		mutation != CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED)
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	}
+	outcome = cluster_remote_commit_outcome_ex(operation->origin_thread - 1,
+		operation->xid, &post_scn, &post_wrap, &post_wrap_valid);
+	if (outcome != CLUSTER_REMOTE_XACT_COMMITTED ||
+		post_scn != operation->terminal_scn || !post_wrap_valid ||
+		post_wrap != top_wrap ||
+		!cluster_remote_commit_timestamp(operation->origin_thread - 1,
+			operation->xid, &post_timestamp) ||
+		post_timestamp != operation->terminal_timestamp)
+	{
+		side_xact_payload_free(payload);
+		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
+	}
+
+	pending = TwoPhaseRecoveryPendingResolveExact(operation->xid,
+		operation->database, operation->prepare_gid, payload, payload_length,
+		true);
+	side_xact_payload_free(payload);
+	return side_xact_map_pending_result(pending);
+}
+
 static bool
 side_xact_prepared_tt_undo_exact(const RfSideXactOperationV1 *operation)
 {
@@ -780,6 +1013,10 @@ rf_side_xact_target_preflight_owned_v1(
 	if (operation->kind == RF_SIDE_XACT_COMMIT)
 		return owned_payload == NULL && owned_payload_length == 0
 			? RF_SIDE_XACT_APPLY_OK : RF_SIDE_XACT_APPLY_BLOCKED;
+	if (operation->kind == RF_SIDE_XACT_COMMIT_PREPARED)
+		return owned_payload == NULL && owned_payload_length == 0
+			? side_xact_preflight_commit_prepared(operation)
+			: RF_SIDE_XACT_APPLY_BLOCKED;
 	if (operation->kind != RF_SIDE_XACT_PREPARE || owned_payload == NULL ||
 		owned_payload_length != operation->prepare_payload_length ||
 		!side_xact_prepared_tt_undo_exact(operation))
@@ -806,6 +1043,8 @@ rf_side_xact_apply_owned_v1(const RfSideXactOperationV1 *operation,
 		return preflight;
 	if (operation->kind == RF_SIDE_XACT_COMMIT)
 		return side_xact_apply_commit_v1(operation);
+	if (operation->kind == RF_SIDE_XACT_COMMIT_PREPARED)
+		return side_xact_apply_commit_prepared(operation);
 
 	/*
 	 * The native database-scoped pending record is the authority-bearing
