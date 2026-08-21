@@ -452,6 +452,24 @@ side_xact_commit_timestamp(const xl_xact_parsed_commit *parsed)
 		? parsed->origin_timestamp : parsed->xact_time;
 }
 
+static bool
+side_xact_abort_binding_valid(const RfSideXactOperationV1 *operation)
+{
+	uint32 owner;
+
+	if (operation == NULL || !operation->has_abort_tt_binding ||
+		operation->kind != RF_SIDE_XACT_ABORT ||
+		operation->abort_tt_reserved_zero != 0 ||
+		operation->abort_tt_instance != operation->origin_thread ||
+		operation->abort_tt_segment_id == 0 ||
+		operation->abort_tt_slot_offset >= TT_SLOTS_PER_SEGMENT ||
+		operation->abort_tt_wrap == 0)
+		return false;
+	owner = ((operation->abort_tt_segment_id - 1) /
+		CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1;
+	return owner == operation->abort_tt_instance;
+}
+
 bool
 rf_side_xact_structural_preflight_v1(
 	const RfSideXactOperationV1 *operation)
@@ -473,6 +491,17 @@ rf_side_xact_structural_preflight_v1(
 		binding_seen |= operation->prepare_binding[i];
 	gid_end = memchr(operation->prepare_gid, '\0',
 		sizeof(operation->prepare_gid));
+	if (operation->has_abort_tt_binding)
+	{
+		if (!side_xact_abort_binding_valid(operation))
+			return false;
+	}
+	else if (operation->abort_tt_instance != 0 ||
+		operation->abort_tt_slot_offset != 0 ||
+		operation->abort_tt_wrap != 0 ||
+		operation->abort_tt_reserved_zero != 0 ||
+		operation->abort_tt_segment_id != 0)
+		return false;
 
 	switch (operation->kind)
 	{
@@ -732,6 +761,42 @@ side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
 		!cluster_remote_commit_timestamp(operation->origin_thread - 1,
 			operation->xid, &timestamp) ||
 		timestamp != operation->terminal_timestamp)
+		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
+	return RF_SIDE_XACT_APPLY_OK;
+}
+
+static RfSideXactApplyResultV1
+side_xact_apply_abort_v1(const RfSideXactOperationV1 *operation)
+{
+	TTSlot slot;
+	ClusterRemoteXactMutationV2 mutation;
+	ClusterRemoteXactOutcome outcome;
+	SCN post_scn;
+	uint16 post_wrap;
+	bool post_wrap_valid;
+
+	if (!side_xact_abort_binding_valid(operation) ||
+		!cluster_tt_slot_durable_read_exact_stable(
+			operation->abort_tt_segment_id, operation->abort_tt_slot_offset,
+			operation->xid, operation->abort_tt_wrap, &slot) ||
+		slot.status != TT_SLOT_ABORTED || SCN_VALID(slot.commit_scn) ||
+		!UBA_is_invalid(slot.first_undo_block))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+
+	cluster_scn_recovery_replay_observe(operation->terminal_scn);
+	mutation = cluster_remote_xact_store_terminal_v2(
+		operation->origin_thread - 1, operation->xid, false, NULL,
+		CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, true,
+		operation->abort_tt_wrap);
+	if (mutation == CLUSTER_REMOTE_XACT_MUTATION_CONFLICT)
+		return RF_SIDE_XACT_APPLY_CONFLICT;
+	if (mutation != CLUSTER_REMOTE_XACT_MUTATION_STORED &&
+		mutation != CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	outcome = cluster_remote_commit_outcome_ex(operation->origin_thread - 1,
+		operation->xid, &post_scn, &post_wrap, &post_wrap_valid);
+	if (outcome != CLUSTER_REMOTE_XACT_ABORTED || SCN_VALID(post_scn) ||
+		!post_wrap_valid || post_wrap != operation->abort_tt_wrap)
 		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
 	return RF_SIDE_XACT_APPLY_OK;
 }
@@ -1175,6 +1240,23 @@ rf_side_xact_target_preflight_owned_v1(
 	if (operation->kind == RF_SIDE_XACT_COMMIT)
 		return owned_payload == NULL && owned_payload_length == 0
 			? RF_SIDE_XACT_APPLY_OK : RF_SIDE_XACT_APPLY_BLOCKED;
+	if (operation->kind == RF_SIDE_XACT_ABORT)
+	{
+		TTSlot slot;
+
+		if (owned_payload != NULL || owned_payload_length != 0 ||
+			!side_xact_abort_binding_valid(operation) ||
+			!cluster_tt_slot_durable_read_exact_stable(
+				operation->abort_tt_segment_id,
+				operation->abort_tt_slot_offset, operation->xid,
+				operation->abort_tt_wrap, &slot))
+			return RF_SIDE_XACT_APPLY_BLOCKED;
+		return ((slot.status == TT_SLOT_ACTIVE &&
+				 !SCN_VALID(slot.commit_scn)) ||
+			(slot.status == TT_SLOT_ABORTED && !SCN_VALID(slot.commit_scn) &&
+			 UBA_is_invalid(slot.first_undo_block)))
+			? RF_SIDE_XACT_APPLY_OK : RF_SIDE_XACT_APPLY_BLOCKED;
+	}
 	if (operation->kind == RF_SIDE_XACT_COMMIT_PREPARED)
 		return owned_payload == NULL && owned_payload_length == 0
 			? side_xact_preflight_commit_prepared(operation)
@@ -1209,6 +1291,8 @@ rf_side_xact_apply_owned_v1(const RfSideXactOperationV1 *operation,
 		return preflight;
 	if (operation->kind == RF_SIDE_XACT_COMMIT)
 		return side_xact_apply_commit_v1(operation);
+	if (operation->kind == RF_SIDE_XACT_ABORT)
+		return side_xact_apply_abort_v1(operation);
 	if (operation->kind == RF_SIDE_XACT_COMMIT_PREPARED)
 		return side_xact_apply_commit_prepared(operation);
 	if (operation->kind == RF_SIDE_XACT_ABORT_PREPARED)

@@ -51,6 +51,14 @@ typedef struct RfSideXactOperationV1
 	ClusterTT2PCBinding prepared_bindings[CLUSTER_TT_2PC_MAX_BINDINGS];
 	ClusterTT2PCSubLink prepared_sublinks[CLUSTER_TT_2PC_MAX_SUBLINKS];
 	UBA			prepared_heads[CLUSTER_TT_2PC_MAX_BINDINGS];
+	/* Plain ABORT carries no TT delta.  The immutable SIDE plan binds it to
+	 * the unique preceding TT_ABORT record before target preflight. */
+	bool		has_abort_tt_binding;
+	uint8		abort_tt_instance;
+	uint16		abort_tt_slot_offset;
+	uint16		abort_tt_wrap;
+	uint16		abort_tt_reserved_zero;
+	uint32		abort_tt_segment_id;
 } RfSideXactOperationV1;
 
 extern bool rf_side_xact_decode_v1(XLogReaderState *record,
