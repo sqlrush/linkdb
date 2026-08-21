@@ -45,6 +45,7 @@ typedef struct RfPageAuthorityTargetV1
 	RfPageVersionV1 expected_result;
 	const RfPageStableBaseProofV1 *stable_base;
 	const RfPagePinnedSourceV1 *source;
+	const RfContributorVectorV1 *contributors;
 } RfPageAuthorityTargetV1;
 
 typedef struct RfPageAuthorityBatchRequestV1
@@ -57,7 +58,6 @@ typedef struct RfPageAuthorityBatchRequestV1
 	ClusterWalRetentionPin *retention_pin;
 	const ClusterRecoveryDutyKey *duties;
 	const ClusterControlRootReadToken *root_tokens;
-	const RfContributorVectorV1 *contributors;
 	uint32		participant_count;
 	uint32		flags;
 } RfPageAuthorityBatchRequestV1;

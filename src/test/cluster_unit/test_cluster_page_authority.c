@@ -54,7 +54,7 @@ static char admissions_object;
 static char pin_object;
 static char stable_proof_objects[2];
 static RfPagePinnedSourceV1 source_objects[2];
-static RfContributorVectorV1 vector_object;
+static RfContributorVectorV1 vector_objects[2];
 static ClusterControlRootReadToken root_tokens[1];
 static ClusterRecoveryDutyKey duty_objects[1];
 static bool fence_need_current;
@@ -67,7 +67,6 @@ static ClusterRecoverySerialRevalidateResult serial_result;
 #define NEEDS ((const PgracExternalFenceNeedSetV1 *) &needs_object)
 #define ADMISSIONS ((const PgracExternalFenceAdmissionSetV1 *) &admissions_object)
 #define PIN ((ClusterWalRetentionPin *) &pin_object)
-#define VECTOR (&vector_object)
 #define ROOT_TOKENS (root_tokens)
 #define DUTIES (duty_objects)
 
@@ -91,7 +90,7 @@ rf_page_stable_base_proof_matches_v1(
 	if (!stable_proof_current || duties != DUTIES || roots != ROOT_TOKENS ||
 		formation != FORMATION || needs != NEEDS ||
 		fence_admissions != ADMISSIONS || pin != PIN ||
-		contributors != VECTOR || participant_count != 1)
+		participant_count != 1)
 		return false;
 	if (proof == (const RfPageStableBaseProofV1 *) &stable_proof_objects[0])
 		index = 0;
@@ -99,6 +98,8 @@ rf_page_stable_base_proof_matches_v1(
 			 (const RfPageStableBaseProofV1 *) &stable_proof_objects[1])
 		index = 1;
 	else
+		return false;
+	if (contributors != &vector_objects[index])
 		return false;
 	return page_identity != NULL && page_identity->blockno == (uint32) index + 1 &&
 		expected_result != NULL && expected_result->mutation_token ==
@@ -195,6 +196,8 @@ init_case(RfPageAuthorityBatchRequestV1 *request,
 		(const RfPageStableBaseProofV1 *) &stable_proof_objects[1];
 	targets[0].source = &source_objects[0];
 	targets[1].source = &source_objects[1];
+	targets[0].contributors = &vector_objects[0];
+	targets[1].contributors = &vector_objects[1];
 	request->targets = targets;
 	request->target_count = 2;
 	request->formation = FORMATION;
@@ -203,7 +206,6 @@ init_case(RfPageAuthorityBatchRequestV1 *request,
 	request->retention_pin = PIN;
 	request->duties = DUTIES;
 	request->root_tokens = ROOT_TOKENS;
-	request->contributors = VECTOR;
 	request->participant_count = 1;
 	serial->held = true;
 	serial->formation = FORMATION;

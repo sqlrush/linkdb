@@ -51,7 +51,6 @@ struct RfPageAuthorityPreflightV1
 	ClusterWalRetentionPin *retention_pin;
 	const ClusterRecoveryDutyKey *duties;
 	const ClusterControlRootReadToken *root_tokens;
-	const RfContributorVectorV1 *contributors;
 	uint32		participant_count;
 	RfPageAuthorityTargetV1 targets[RF_PAGE_STABLE_MAX_COMPONENTS];
 	RfPageGuardPreflightV1 page_preflights[RF_PAGE_STABLE_MAX_COMPONENTS];
@@ -142,7 +141,7 @@ stable_proofs_current(const RfPageAuthorityPreflightV1 *preflight)
 				preflight->formation, preflight->fence_need_set,
 				preflight->fence_admission_set,
 				preflight->retention_pin, target->source,
-				preflight->contributors, preflight->participant_count))
+				target->contributors, preflight->participant_count))
 			return false;
 	}
 	return true;
@@ -211,7 +210,7 @@ rf_page_authority_batch_preflight_wait_v1(
 		request->fence_admission_set == NULL ||
 		request->retention_pin == NULL || request->duties == NULL ||
 		request->root_tokens == NULL ||
-		request->contributors == NULL || request->participant_count == 0 ||
+		request->participant_count == 0 ||
 		request->participant_count != 1 ||
 		request->flags != 0 ||
 		timeout_ms < 0)
@@ -223,11 +222,16 @@ rf_page_authority_batch_preflight_wait_v1(
 				16) || request->targets[i].expected_result.mutation_token == 0 ||
 			request->targets[i].stable_base == NULL ||
 			request->targets[i].source == NULL ||
+			request->targets[i].contributors == NULL ||
 			(i > 0 && identity_compare(&request->targets[i - 1].page_identity,
 				&request->targets[i].page_identity) >= 0))
-			return request->targets[i].stable_base == NULL ?
-				RF_PAGE_AUTHORITY_NO_STABLE_BASE :
-				RF_PAGE_AUTHORITY_IDENTITY_MISMATCH;
+		{
+			if (request->targets[i].stable_base == NULL)
+				return RF_PAGE_AUTHORITY_NO_STABLE_BASE;
+			if (request->targets[i].contributors == NULL)
+				return RF_PAGE_AUTHORITY_CONTRIBUTOR_INCOMPLETE;
+			return RF_PAGE_AUTHORITY_IDENTITY_MISMATCH;
+		}
 	}
 	preflight = (RfPageAuthorityPreflightV1 *)
 		authority_alloc0(sizeof(*preflight));
@@ -242,7 +246,6 @@ rf_page_authority_batch_preflight_wait_v1(
 	preflight->retention_pin = request->retention_pin;
 	preflight->duties = request->duties;
 	preflight->root_tokens = request->root_tokens;
-	preflight->contributors = request->contributors;
 	preflight->participant_count = request->participant_count;
 	for (i = 0; i < request->target_count; i++)
 	{
