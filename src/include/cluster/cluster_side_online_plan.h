@@ -7,6 +7,7 @@
 #define CLUSTER_SIDE_ONLINE_PLAN_H
 
 #include "cluster/cluster_page_online_plan.h"
+#include "cluster/cluster_side_projection.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_side_xact.h"
 
@@ -19,7 +20,8 @@ typedef enum RfSideOnlineOperationKindV1
 {
 	RF_SIDE_ONLINE_OPERATION_INVALID = 0,
 	RF_SIDE_ONLINE_OPERATION_XACT = 1,
-	RF_SIDE_ONLINE_OPERATION_UNDO = 2
+	RF_SIDE_ONLINE_OPERATION_UNDO = 2,
+	RF_SIDE_ONLINE_OPERATION_PROJECTION = 3
 } RfSideOnlineOperationKindV1;
 
 typedef struct RfSideOnlinePlanRequestV1
@@ -41,15 +43,20 @@ typedef struct RfSideOnlineOperationV1
 	const uint8 *owned_payload;
 	RfSideXactOperationV1 xact;
 	ClusterUndoDecoded undo;
+	ClusterSideProjectionOperationV1 projection;
 } RfSideOnlineOperationV1;
 
 typedef bool (*RfSideOnlineApplyXactV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlineApplyUndoV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlineApplyProjectionV1)(void *arg,
+	const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlinePreflightXactV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlinePreflightUndoV1)(void *arg,
+	const RfSideOnlineOperationV1 *operation);
+typedef bool (*RfSideOnlinePreflightProjectionV1)(void *arg,
 	const RfSideOnlineOperationV1 *operation);
 typedef bool (*RfSideOnlineBeginProtectedSetV1)(void *arg);
 typedef void (*RfSideOnlineEndProtectedSetV1)(void *arg, bool complete);
@@ -62,8 +69,10 @@ typedef struct RfSideOnlineApplyOpsV1
 	/* Required per present kind; all preflights run before any apply. */
 	RfSideOnlinePreflightXactV1 preflight_xact;
 	RfSideOnlinePreflightUndoV1 preflight_undo;
+	RfSideOnlinePreflightProjectionV1 preflight_projection;
 	RfSideOnlineApplyXactV1 apply_xact;
 	RfSideOnlineApplyUndoV1 apply_undo;
+	RfSideOnlineApplyProjectionV1 apply_projection;
 } RfSideOnlineApplyOpsV1;
 
 extern RfPageProofDetailV1 rf_side_online_plan_create_v1(

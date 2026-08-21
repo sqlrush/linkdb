@@ -41,12 +41,46 @@
 #ifndef CLUSTER_SIDE_PROJECTION_H
 #define CLUSTER_SIDE_PROJECTION_H
 
+#include "access/multixact.h"
+#include "access/transam.h"
+
 typedef enum ClusterSideProjectionKind
 {
 	CLUSTER_SIDE_PROJECTION_CLOG = 0,
 	CLUSTER_SIDE_PROJECTION_MULTIXACT,
 	CLUSTER_SIDE_PROJECTION_COMMIT_TS
 } ClusterSideProjectionKind;
+
+typedef enum ClusterSideProjectionActionV1
+{
+	CLUSTER_SIDE_PROJECTION_ACTION_INVALID = 0,
+	CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE,
+	CLUSTER_SIDE_PROJECTION_ACTION_CREATE,
+	CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE
+} ClusterSideProjectionActionV1;
+
+/*
+ * Immutable, pointer-free description of one retained projection record.
+ * MULTIXACT CREATE members remain caller-owned bytes in the enclosing SIDE
+ * plan; member_count/member_offset describe their exact native identity.
+ */
+typedef struct ClusterSideProjectionOperationV1
+{
+	ClusterSideProjectionKind kind;
+	ClusterSideProjectionActionV1 action;
+	uint8		normalized_info;
+	uint8		reserved9[3];
+	int32		page_number;
+	Oid			oldest_database;
+	TransactionId oldest_xid;
+	MultiXactId multixact_id;
+	MultiXactOffset member_offset;
+	uint32		member_count;
+	MultiXactId truncate_start_multixact;
+	MultiXactId truncate_end_multixact;
+	MultiXactOffset truncate_start_member;
+	MultiXactOffset truncate_end_member;
+} ClusterSideProjectionOperationV1;
 
 /*
  * §2.4 verifier facts for one projection scope.

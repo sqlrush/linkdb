@@ -7,6 +7,9 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/multixact.h"
 #include "cluster/cluster_side_online_plan.h"
 
 #ifdef RF_SIDE_ONLINE_TESTING
@@ -187,6 +190,143 @@ side_ensure_payload_capacity(RfSideOnlinePlanV1 *plan, uint32 additional)
 	plan->owned_payload = payload;
 	plan->owned_payload_capacity = capacity;
 	return true;
+}
+
+static bool
+side_projection_decode(const RfDetachedRecordPlanV1 *record_plan,
+	RfSideOnlineOperationV1 *candidate, uint32 *payload_offset,
+	uint32 *payload_length)
+{
+	const XLogReaderState *record = record_plan->source_record;
+	const char *data = XLogRecGetData(record);
+	uint32		data_length = XLogRecGetDataLen(record);
+	uint8		info = record_plan->route.normalized_info;
+	ClusterSideProjectionOperationV1 *projection = &candidate->projection;
+
+	*payload_offset = 0;
+	*payload_length = 0;
+	projection->normalized_info = info;
+	projection->page_number = -1;
+	if (record_plan->route.rmid == RM_CLOG_ID)
+	{
+		projection->kind = CLUSTER_SIDE_PROJECTION_CLOG;
+		if (info == CLOG_ZEROPAGE)
+		{
+			if (data_length != sizeof(int))
+				return false;
+			memcpy(&projection->page_number, data, sizeof(int));
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+			return projection->page_number >= 0;
+		}
+		if (info == CLOG_TRUNCATE)
+		{
+			xl_clog_truncate trunc;
+
+			if (data_length != sizeof(trunc))
+				return false;
+			memcpy(&trunc, data, sizeof(trunc));
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
+			projection->page_number = trunc.pageno;
+			projection->oldest_xid = trunc.oldestXact;
+			projection->oldest_database = trunc.oldestXactDb;
+			return trunc.pageno >= 0 && TransactionIdIsNormal(trunc.oldestXact) &&
+				OidIsValid(trunc.oldestXactDb);
+		}
+		return false;
+	}
+	if (record_plan->route.rmid == RM_COMMIT_TS_ID)
+	{
+		projection->kind = CLUSTER_SIDE_PROJECTION_COMMIT_TS;
+		if (info == COMMIT_TS_ZEROPAGE)
+		{
+			if (data_length != sizeof(int))
+				return false;
+			memcpy(&projection->page_number, data, sizeof(int));
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+			return projection->page_number >= 0;
+		}
+		if (info == COMMIT_TS_TRUNCATE)
+		{
+			xl_commit_ts_truncate trunc;
+
+			if (data_length != SizeOfCommitTsTruncate)
+				return false;
+			memset(&trunc, 0, sizeof(trunc));
+			memcpy(&trunc, data, SizeOfCommitTsTruncate);
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
+			projection->page_number = trunc.pageno;
+			projection->oldest_xid = trunc.oldestXid;
+			return trunc.pageno >= 0 && TransactionIdIsNormal(trunc.oldestXid);
+		}
+		return false;
+	}
+	if (record_plan->route.rmid == RM_MULTIXACT_ID)
+	{
+		projection->kind = CLUSTER_SIDE_PROJECTION_MULTIXACT;
+		if (info == XLOG_MULTIXACT_ZERO_OFF_PAGE ||
+			info == XLOG_MULTIXACT_ZERO_MEM_PAGE)
+		{
+			if (data_length != sizeof(int))
+				return false;
+			memcpy(&projection->page_number, data, sizeof(int));
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+			return projection->page_number >= 0;
+		}
+		if (info == XLOG_MULTIXACT_CREATE_ID)
+		{
+			xl_multixact_create header;
+			Size expected;
+			int i;
+
+			if (data_length < SizeOfMultiXactCreate)
+				return false;
+			memset(&header, 0, sizeof(header));
+			memcpy(&header, data, SizeOfMultiXactCreate);
+			if (header.nmembers <= 0 || header.nmembers > 256 ||
+				!MultiXactIdIsValid(header.mid) || header.moff == 0)
+				return false;
+			expected = SizeOfMultiXactCreate +
+				(Size) header.nmembers * sizeof(MultiXactMember);
+			if (expected != data_length)
+				return false;
+			for (i = 0; i < header.nmembers; i++)
+			{
+				MultiXactMember member;
+
+				memcpy(&member, data + SizeOfMultiXactCreate +
+					(Size) i * sizeof(member), sizeof(member));
+				if (!TransactionIdIsNormal(member.xid) ||
+					member.status < MultiXactStatusForKeyShare ||
+					member.status > MaxMultiXactStatus)
+					return false;
+			}
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_CREATE;
+			projection->multixact_id = header.mid;
+			projection->member_offset = header.moff;
+			projection->member_count = (uint32) header.nmembers;
+			*payload_offset = SizeOfMultiXactCreate;
+			*payload_length = data_length - SizeOfMultiXactCreate;
+			return true;
+		}
+		if (info == XLOG_MULTIXACT_TRUNCATE_ID)
+		{
+			xl_multixact_truncate trunc;
+
+			if (data_length != SizeOfMultiXactTruncate)
+				return false;
+			memcpy(&trunc, data, sizeof(trunc));
+			projection->action = CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
+			projection->oldest_database = trunc.oldestMultiDB;
+			projection->truncate_start_multixact = trunc.startTruncOff;
+			projection->truncate_end_multixact = trunc.endTruncOff;
+			projection->truncate_start_member = trunc.startTruncMemb;
+			projection->truncate_end_member = trunc.endTruncMemb;
+			return OidIsValid(trunc.oldestMultiDB) &&
+				MultiXactIdIsValid(trunc.startTruncOff) &&
+				MultiXactIdIsValid(trunc.endTruncOff);
+		}
+	}
+	return false;
 }
 
 static bool
@@ -413,6 +553,32 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 				plan->owned_payload_bytes += candidate.owned_payload_length;
 			}
 		}
+		else if ((record_plan->route.rmid == RM_CLOG_ID ||
+				  record_plan->route.rmid == RM_MULTIXACT_ID ||
+				  record_plan->route.rmid == RM_COMMIT_TS_ID) &&
+				 record_plan->route.codec_id == RF_ROUTE_CODEC_SIDE_STANDARD)
+		{
+			uint32 payload_offset;
+			uint32 payload_length;
+
+			if (!side_projection_decode(record_plan, &candidate,
+					&payload_offset, &payload_length))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			if (!side_ensure_operation_capacity(plan))
+				return RF_PAGE_PROOF_DETAIL_CAPACITY;
+			candidate.kind = RF_SIDE_ONLINE_OPERATION_PROJECTION;
+			candidate.owned_payload_length = payload_length;
+			if (payload_length > 0)
+			{
+				if (!side_ensure_payload_capacity(plan, payload_length))
+					return RF_PAGE_PROOF_DETAIL_CAPACITY;
+				candidate.owned_payload_offset = plan->owned_payload_bytes;
+				memcpy(plan->owned_payload + plan->owned_payload_bytes,
+					XLogRecGetData(record_plan->source_record) + payload_offset,
+					payload_length);
+				plan->owned_payload_bytes += payload_length;
+			}
+		}
 		else
 			return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
 		candidate.identity = *identity;
@@ -490,6 +656,9 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 			 (ops->preflight_xact == NULL || ops->apply_xact == NULL)) ||
 			(plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_UNDO &&
 			 (ops->preflight_undo == NULL || ops->apply_undo == NULL)) ||
+			(plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_PROJECTION &&
+			 (ops->preflight_projection == NULL ||
+			  ops->apply_projection == NULL)) ||
 			plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_INVALID)
 			return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	if (!ops->begin_protected_set(ops->arg))
@@ -523,8 +692,10 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 				operation.owned_payload_offset;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT)
 			accepted = ops->preflight_xact(ops->arg, &operation);
-		else
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO)
 			accepted = ops->preflight_undo(ops->arg, &operation);
+		else
+			accepted = ops->preflight_projection(ops->arg, &operation);
 		if (!accepted)
 		{
 			ops->end_protected_set(ops->arg, false);
@@ -541,8 +712,10 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan,
 				operation.owned_payload_offset;
 		if (operation.kind == RF_SIDE_ONLINE_OPERATION_XACT)
 			applied = ops->apply_xact(ops->arg, &operation);
-		else
+		else if (operation.kind == RF_SIDE_ONLINE_OPERATION_UNDO)
 			applied = ops->apply_undo(ops->arg, &operation);
+		else
+			applied = ops->apply_projection(ops->arg, &operation);
 		if (!applied)
 		{
 			ops->end_protected_set(ops->arg, false);

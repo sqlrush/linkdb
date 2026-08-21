@@ -5,6 +5,9 @@
  */
 #include "postgres.h"
 
+#include "access/clog.h"
+#include "access/commit_ts.h"
+#include "access/multixact.h"
 #include "access/rmgr.h"
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
@@ -636,15 +639,49 @@ make_record_plan(FakeXactRecord *fake)
 	return record_plan;
 }
 
+static XLogReaderState *
+make_projection_record(FakeXactRecord *fake, RmgrId rmid, uint8 info,
+	const void *payload, uint32 payload_length)
+{
+	memset(fake, 0, sizeof(*fake));
+	UT_ASSERT(payload_length <= sizeof(fake->data));
+	memcpy(fake->data, payload, payload_length);
+	fake->u.decoded.header.xl_rmid = rmid;
+	fake->u.decoded.header.xl_info = info;
+	fake->u.decoded.main_data = (char *) fake->data;
+	fake->u.decoded.main_data_len = payload_length;
+	fake->reader.record = &fake->u.decoded;
+	return &fake->reader;
+}
+
+static RfDetachedRecordPlanV1
+make_projection_record_plan(FakeXactRecord *fake)
+{
+	RfDetachedRecordPlanV1 record_plan;
+
+	memset(&record_plan, 0, sizeof(record_plan));
+	record_plan.source_record = &fake->reader;
+	record_plan.route.rmid = fake->u.decoded.header.xl_rmid;
+	record_plan.route.normalized_info =
+		fake->u.decoded.header.xl_info & ~XLR_INFO_MASK;
+	record_plan.route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
+	record_plan.route.block_policy = RF_ROUTE_BLOCKS_FORBIDDEN;
+	record_plan.route.codec_id = RF_ROUTE_CODEC_SIDE_STANDARD;
+	record_plan.preflight_complete = true;
+	return record_plan;
+}
+
 typedef struct ApplyCapture
 {
 	uint32 count;
 	uint32 undo_count;
+	uint32 projection_count;
 	uint32 begin_count;
 	uint32 end_count;
 	TransactionId xid;
 	SCN scn;
 	uint8 undo_first_byte;
+	uint8 projection_first_byte;
 	bool end_complete;
 } ApplyCapture;
 
@@ -686,6 +723,17 @@ capture_apply_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 	if (operation->owned_payload_length > 0)
 		capture->undo_first_byte = operation->owned_payload[0];
 	return operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO;
+}
+
+static bool
+capture_apply_projection(void *arg, const RfSideOnlineOperationV1 *operation)
+{
+	ApplyCapture *capture = (ApplyCapture *) arg;
+
+	capture->projection_count++;
+	if (operation->owned_payload_length > 0)
+		capture->projection_first_byte = operation->owned_payload[0];
+	return operation->kind == RF_SIDE_ONLINE_OPERATION_PROJECTION;
 }
 
 static bool
@@ -1044,6 +1092,160 @@ UT_TEST(test_online_plan_owns_decoded_operation_not_raw_record)
 	UT_ASSERT(capture.end_complete);
 	rf_side_online_plan_destroy_v1(&plan);
 	UT_ASSERT(plan == NULL);
+}
+
+UT_TEST(test_online_plan_owns_typed_projection_records)
+{
+	FakeXactRecord clog_fake;
+	FakeXactRecord multi_fake;
+	FakeXactRecord commit_ts_fake;
+	RfDetachedRecordPlanV1 clog_plan;
+	RfDetachedRecordPlanV1 multi_plan;
+	RfDetachedRecordPlanV1 commit_ts_plan;
+	RfPageOnlineRecordIdentityV1 clog_identity;
+	RfPageOnlineRecordIdentityV1 multi_identity;
+	RfPageOnlineRecordIdentityV1 commit_ts_identity;
+	RfSideOnlinePlanRequestV1 request;
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut;
+	RfSideOnlineOperationV1 operation;
+	RfSideOnlineApplyOpsV1 apply_ops;
+	ApplyCapture capture;
+	xl_multixact_create *create;
+	xl_commit_ts_truncate commit_ts;
+	uint8 create_payload[SizeOfMultiXactCreate + 2 * sizeof(MultiXactMember)];
+	uint8 storage_uuid[16];
+	int clog_page = 17;
+
+	memset(storage_uuid, 0x45, sizeof(storage_uuid));
+	(void) make_projection_record(&clog_fake, RM_CLOG_ID, CLOG_ZEROPAGE,
+		&clog_page, sizeof(clog_page));
+	memset(create_payload, 0, sizeof(create_payload));
+	create = (xl_multixact_create *) create_payload;
+	create->mid = 33;
+	create->moff = 71;
+	create->nmembers = 2;
+	create->members[0].xid = 800;
+	create->members[0].status = MultiXactStatusForKeyShare;
+	create->members[1].xid = 816;
+	create->members[1].status = MultiXactStatusUpdate;
+	(void) make_projection_record(&multi_fake, RM_MULTIXACT_ID,
+		XLOG_MULTIXACT_CREATE_ID, create_payload, sizeof(create_payload));
+	memset(&commit_ts, 0, sizeof(commit_ts));
+	commit_ts.pageno = 19;
+	commit_ts.oldestXid = 800;
+	(void) make_projection_record(&commit_ts_fake, RM_COMMIT_TS_ID,
+		COMMIT_TS_TRUNCATE, &commit_ts, SizeOfCommitTsTruncate);
+
+	clog_identity = make_identity(&clog_fake, storage_uuid);
+	multi_identity = make_identity(&multi_fake, storage_uuid);
+	commit_ts_identity = make_identity(&commit_ts_fake, storage_uuid);
+	set_identity_range(&multi_fake, &multi_identity, 200, 300);
+	set_identity_range(&commit_ts_fake, &commit_ts_identity, 300, 400);
+	clog_plan = make_projection_record_plan(&clog_fake);
+	multi_plan = make_projection_record_plan(&multi_fake);
+	commit_ts_plan = make_projection_record_plan(&commit_ts_fake);
+	memset(&cut, 0, sizeof(cut));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 400;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	memset(&request, 0, sizeof(request));
+	request.system_identifier = clog_identity.record.system_identifier;
+	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &clog_plan,
+		&clog_identity), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &multi_plan,
+		&multi_identity), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &commit_ts_plan,
+		&commit_ts_identity), RF_PAGE_PROOF_DETAIL_OK);
+	memset(create_payload, 0xee, sizeof(create_payload));
+	memset(multi_fake.data, 0xee, sizeof(multi_fake.data));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 3);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	UT_ASSERT_EQ(operation.kind, RF_SIDE_ONLINE_OPERATION_PROJECTION);
+	UT_ASSERT_EQ(operation.projection.kind, CLUSTER_SIDE_PROJECTION_CLOG);
+	UT_ASSERT_EQ(operation.projection.action,
+		CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE);
+	UT_ASSERT_EQ(operation.projection.page_number, 17);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+	UT_ASSERT_EQ(operation.projection.kind,
+		CLUSTER_SIDE_PROJECTION_MULTIXACT);
+	UT_ASSERT_EQ(operation.projection.action,
+		CLUSTER_SIDE_PROJECTION_ACTION_CREATE);
+	UT_ASSERT_EQ(operation.projection.multixact_id, 33);
+	UT_ASSERT_EQ(operation.projection.member_offset, 71);
+	UT_ASSERT_EQ(operation.projection.member_count, 2);
+	UT_ASSERT_EQ(operation.owned_payload_length,
+		2 * sizeof(MultiXactMember));
+	UT_ASSERT_EQ(((const MultiXactMember *) operation.owned_payload)[1].xid,
+		816);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 2, &operation));
+	UT_ASSERT_EQ(operation.projection.kind,
+		CLUSTER_SIDE_PROJECTION_COMMIT_TS);
+	UT_ASSERT_EQ(operation.projection.action,
+		CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE);
+	UT_ASSERT_EQ(operation.projection.page_number, 19);
+	UT_ASSERT_EQ(operation.projection.oldest_xid, 800);
+
+	memset(&capture, 0, sizeof(capture));
+	memset(&apply_ops, 0, sizeof(apply_ops));
+	apply_ops.arg = &capture;
+	apply_ops.begin_protected_set = capture_begin;
+	apply_ops.end_protected_set = capture_end;
+	apply_ops.preflight_projection = accept_preflight;
+	apply_ops.apply_projection = capture_apply_projection;
+	UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &apply_ops),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(capture.projection_count, 3);
+	UT_ASSERT_EQ(capture.projection_first_byte, 0x20);
+	UT_ASSERT(capture.end_complete);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_online_plan_rejects_malformed_multixact_projection)
+{
+	FakeXactRecord fake;
+	RfDetachedRecordPlanV1 record_plan;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfSideOnlinePlanRequestV1 request;
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut;
+	xl_multixact_create create;
+	uint8 storage_uuid[16];
+
+	memset(storage_uuid, 0x46, sizeof(storage_uuid));
+	memset(&create, 0, sizeof(create));
+	create.mid = 33;
+	create.moff = 71;
+	create.nmembers = 2;
+	(void) make_projection_record(&fake, RM_MULTIXACT_ID,
+		XLOG_MULTIXACT_CREATE_ID, &create, SizeOfMultiXactCreate);
+	identity = make_identity(&fake, storage_uuid);
+	record_plan = make_projection_record_plan(&fake);
+	memset(&cut, 0, sizeof(cut));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 200;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	memset(&request, 0, sizeof(request));
+	request.system_identifier = identity.record.system_identifier;
+	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record_plan,
+		&identity), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 0);
+	rf_side_online_plan_destroy_v1(&plan);
 }
 
 UT_TEST(test_online_plan_denies_incomplete_physical_cut)
@@ -1598,7 +1800,7 @@ UT_TEST(test_online_plan_denies_nonempty_abort_without_undo_completion)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);
@@ -1611,6 +1813,8 @@ main(void)
 	UT_RUN(test_abort_prepared_resolves_exact_native_owner_after_tt_truth);
 	UT_RUN(test_abort_prepared_nonempty_undo_retains_native_owner);
 	UT_RUN(test_online_plan_owns_decoded_operation_not_raw_record);
+	UT_RUN(test_online_plan_owns_typed_projection_records);
+	UT_RUN(test_online_plan_rejects_malformed_multixact_projection);
 	UT_RUN(test_online_plan_denies_incomplete_physical_cut);
 	UT_RUN(test_online_plan_owns_undo_payload_not_raw_record);
 	UT_RUN(test_online_plan_owns_prepare_state_not_raw_record);
