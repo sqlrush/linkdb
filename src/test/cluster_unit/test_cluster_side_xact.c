@@ -6,12 +6,16 @@
 #include "postgres.h"
 
 #include "access/rmgr.h"
+#include "access/twophase.h"
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_undo.h"
+#include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_2pc.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
 #include "unit_test.h"
@@ -27,6 +31,173 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 }
 
 #include <stdio.h>
+
+typedef struct PrepareApplyCapture
+{
+	uint64 system_identifier;
+	int origin_slot;
+	TransactionId mismatched_origin_xid;
+	TTSlot slot;
+	TwoPhaseRecoveryPendingResult pending_preflight;
+	TwoPhaseRecoveryPendingResult pending_install;
+	ClusterRemoteXactMutationV2 projection_store;
+	bool projection_postread;
+	uint32 tt_reads;
+	uint32 pending_preflights;
+	uint32 pending_installs;
+	uint32 projection_stores;
+	uint32 projection_postreads;
+	uint32 next_order;
+	uint32 install_order;
+	uint32 projection_order;
+} PrepareApplyCapture;
+
+static PrepareApplyCapture prepare_apply;
+
+static void
+reset_prepare_apply(void)
+{
+	memset(&prepare_apply, 0, sizeof(prepare_apply));
+	prepare_apply.system_identifier = UINT64_C(0x11223344);
+	prepare_apply.origin_slot = 2;
+	prepare_apply.slot.xid = 802;
+	prepare_apply.slot.wrap = 7;
+	prepare_apply.slot.status = TT_SLOT_ACTIVE;
+	prepare_apply.slot.commit_scn = InvalidScn;
+	prepare_apply.pending_preflight = TWOPHASE_RECOVERY_PENDING_OK;
+	prepare_apply.pending_install = TWOPHASE_RECOVERY_PENDING_OK;
+	prepare_apply.projection_store = CLUSTER_REMOTE_XACT_MUTATION_STORED;
+	prepare_apply.projection_postread = true;
+}
+
+uint64
+GetSystemIdentifier(void)
+{
+	return prepare_apply.system_identifier;
+}
+
+int
+cluster_xid_origin_slot(TransactionId xid pg_attribute_unused())
+{
+	if (TransactionIdIsValid(prepare_apply.mismatched_origin_xid) &&
+		TransactionIdEquals(xid, prepare_apply.mismatched_origin_xid))
+		return prepare_apply.origin_slot + 1;
+	return prepare_apply.origin_slot;
+}
+
+bool
+cluster_tt_slot_durable_read_exact_stable(
+	uint32 segment_id pg_attribute_unused(),
+	uint16 slot_offset pg_attribute_unused(),
+	TransactionId xid pg_attribute_unused(),
+	uint16 expected_wrap pg_attribute_unused(), TTSlot *slot_out)
+{
+	prepare_apply.tt_reads++;
+	*slot_out = prepare_apply.slot;
+	return true;
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingPreflight(
+	TransactionId xid pg_attribute_unused(), Oid database pg_attribute_unused(),
+	Oid owner pg_attribute_unused(), TimestampTz prepared_at pg_attribute_unused(),
+	const char *gid pg_attribute_unused(), const void *content pg_attribute_unused(),
+	uint32 len pg_attribute_unused())
+{
+	prepare_apply.pending_preflights++;
+	return prepare_apply.pending_preflight;
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingInstall(
+	TransactionId xid pg_attribute_unused(), Oid database pg_attribute_unused(),
+	Oid owner pg_attribute_unused(), TimestampTz prepared_at pg_attribute_unused(),
+	const char *gid pg_attribute_unused(), const void *content pg_attribute_unused(),
+	uint32 len pg_attribute_unused())
+{
+	prepare_apply.pending_installs++;
+	prepare_apply.install_order = ++prepare_apply.next_order;
+	return prepare_apply.pending_install;
+}
+
+ClusterRemoteXactMutationV2
+cluster_remote_xact_store_prepared_v2(
+	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES] pg_attribute_unused())
+{
+	prepare_apply.projection_stores++;
+	prepare_apply.projection_order = ++prepare_apply.next_order;
+	return prepare_apply.projection_store;
+}
+
+bool
+cluster_remote_xact_pending_matches_v2(
+	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES] pg_attribute_unused())
+{
+	prepare_apply.projection_postreads++;
+	return prepare_apply.projection_postread;
+}
+
+void
+cluster_tt_durable_redo_stamp_slot(
+	uint8 instance pg_attribute_unused(), uint32 segment_id pg_attribute_unused(),
+	uint16 slot_offset pg_attribute_unused(), uint16 wrap pg_attribute_unused(),
+	TransactionId xid pg_attribute_unused(), SCN commit_scn pg_attribute_unused())
+{
+}
+
+ClusterTTDurableResolve
+cluster_tt_slot_durable_resolve_by_xid_origin(
+	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	uint32 expected_wrap pg_attribute_unused(), SCN *commit_scn,
+	uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap)
+{
+	*commit_scn = UINT64_C(901);
+	*out_seg = 9;
+	*out_slot = 4;
+	*out_wrap = 7;
+	return CLUSTER_TT_DURABLE_RESOLVED_SCN;
+}
+
+void
+cluster_scn_recovery_replay_observe(SCN scn pg_attribute_unused())
+{
+}
+
+ClusterRemoteXactMutationV2
+cluster_remote_xact_store_terminal_v2(
+	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	bool require_prepared pg_attribute_unused(),
+	const uint8 expected_prepare_digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES]
+		pg_attribute_unused(),
+	ClusterRemoteXactOutcome outcome pg_attribute_unused(),
+	SCN commit_scn pg_attribute_unused(),
+	TimestampTz commit_timestamp pg_attribute_unused(),
+	bool wrap_valid pg_attribute_unused(), uint16 wrap pg_attribute_unused())
+{
+	return CLUSTER_REMOTE_XACT_MUTATION_STORED;
+}
+
+ClusterRemoteXactOutcome
+cluster_remote_commit_outcome_ex(
+	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	SCN *commit_scn, uint16 *out_wrap, bool *out_wrap_valid)
+{
+	*commit_scn = UINT64_C(901);
+	*out_wrap = 7;
+	*out_wrap_valid = true;
+	return CLUSTER_REMOTE_XACT_COMMITTED;
+}
+
+bool
+cluster_remote_commit_timestamp(
+	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
+	TimestampTz *commit_timestamp)
+{
+	*commit_timestamp = INT64_C(123456);
+	return true;
+}
 
 bool
 cluster_remote_xact_prepare_digest_v2(
@@ -313,6 +484,7 @@ UT_TEST(test_commit_decodes_to_immutable_truth_operation)
 		make_commit(&fake, 800, UINT64_C(901), INT64_C(123456), false),
 		UINT64_C(0x11223344), 3, &operation));
 	UT_ASSERT_EQ(operation.kind, RF_SIDE_XACT_COMMIT);
+	UT_ASSERT_EQ(operation.system_identifier, UINT64_C(0x11223344));
 	UT_ASSERT_EQ(operation.origin_thread, 3);
 	UT_ASSERT_EQ(operation.xid, 800);
 	UT_ASSERT_EQ(operation.terminal_scn, UINT64_C(901));
@@ -378,6 +550,120 @@ UT_TEST(test_prepare_requires_bounded_aligned_gid)
 		make_prepare(&fake, 801, true, true), UINT64_C(0x11223344), 3,
 		&operation));
 	UT_ASSERT_EQ(operation.kind, RF_SIDE_XACT_INVALID);
+}
+
+UT_TEST(test_prepare_apply_installs_authoritative_pending_before_projection)
+{
+	FakeXactRecord fake;
+	RfSideXactOperationV1 operation;
+	XLogReaderState *record;
+
+	reset_prepare_apply();
+	record = make_prepare(&fake, 802, true, false);
+	UT_ASSERT(rf_side_xact_decode_v1(record, UINT64_C(0x11223344), 3,
+		&operation));
+	UT_ASSERT_EQ(rf_side_xact_target_preflight_owned_v1(&operation,
+		fake.data, operation.prepare_payload_length), RF_SIDE_XACT_APPLY_OK);
+	UT_ASSERT_EQ(prepare_apply.tt_reads, 1);
+	UT_ASSERT_EQ(prepare_apply.pending_preflights, 1);
+	UT_ASSERT_EQ(prepare_apply.pending_installs, 0);
+	UT_ASSERT_EQ(prepare_apply.projection_stores, 0);
+
+	UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&operation, fake.data,
+		operation.prepare_payload_length), RF_SIDE_XACT_APPLY_OK);
+	UT_ASSERT_EQ(prepare_apply.pending_installs, 1);
+	UT_ASSERT_EQ(prepare_apply.projection_stores, 1);
+	UT_ASSERT_EQ(prepare_apply.projection_postreads, 1);
+	UT_ASSERT(prepare_apply.install_order < prepare_apply.projection_order);
+}
+
+UT_TEST(test_prepare_apply_blocks_underivable_or_wrong_system_before_pending)
+{
+	FakeXactRecord fake;
+	RfSideXactOperationV1 operation;
+
+	reset_prepare_apply();
+	UT_ASSERT(rf_side_xact_decode_v1(make_prepare(&fake, 802, true, false),
+		UINT64_C(0x11223344), 3, &operation));
+	prepare_apply.origin_slot = -1;
+	UT_ASSERT_EQ(rf_side_xact_target_preflight_owned_v1(&operation,
+		fake.data, operation.prepare_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(prepare_apply.tt_reads, 0);
+	UT_ASSERT_EQ(prepare_apply.pending_preflights, 0);
+
+	prepare_apply.origin_slot = 2;
+	prepare_apply.system_identifier++;
+	UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&operation, fake.data,
+		operation.prepare_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(prepare_apply.pending_installs, 0);
+	UT_ASSERT_EQ(prepare_apply.projection_stores, 0);
+}
+
+UT_TEST(test_prepare_apply_blocks_wrong_origin_subxid_before_target_reads)
+{
+	FakeXactRecord fake;
+	RfSideXactOperationV1 operation;
+	ClusterTT2PCBinding *child;
+	ClusterTT2PCSubLink *link;
+
+	reset_prepare_apply();
+	UT_ASSERT(rf_side_xact_decode_v1(make_prepare(&fake, 802, true, false),
+		UINT64_C(0x11223344), 3, &operation));
+	child = &operation.prepared_bindings[1];
+	memset(child, 0, sizeof(*child));
+	child->undo_segment_id = 514;
+	child->slot_offset = 5;
+	child->wrap = 7;
+	child->cluster_epoch = 11;
+	child->xid = 803;
+	operation.prepared_binding_count = 2;
+	link = &operation.prepared_sublinks[0];
+	memset(link, 0, sizeof(*link));
+	link->child_key.origin_node_id = 2;
+	link->child_key.undo_segment_id = 514;
+	link->child_key.tt_slot_id = cluster_tt_slot_offset_to_id(5);
+	link->child_key.cluster_epoch = 11;
+	link->child_key.local_xid = 803;
+	link->parent_key.origin_node_id = 2;
+	link->parent_key.undo_segment_id = 513;
+	link->parent_key.tt_slot_id = cluster_tt_slot_offset_to_id(4);
+	link->parent_key.cluster_epoch = 11;
+	link->parent_key.local_xid = 802;
+	operation.prepared_sublink_count = 1;
+	UT_ASSERT(rf_side_xact_structural_preflight_v1(&operation));
+	prepare_apply.mismatched_origin_xid = 803;
+
+	UT_ASSERT_EQ(rf_side_xact_target_preflight_owned_v1(&operation,
+		fake.data, operation.prepare_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(prepare_apply.tt_reads, 0);
+	UT_ASSERT_EQ(prepare_apply.pending_preflights, 0);
+	UT_ASSERT_EQ(prepare_apply.pending_installs, 0);
+	UT_ASSERT_EQ(prepare_apply.projection_stores, 0);
+}
+
+UT_TEST(test_prepare_apply_never_projects_unverified_pending)
+{
+	FakeXactRecord fake;
+	RfSideXactOperationV1 operation;
+
+	reset_prepare_apply();
+	UT_ASSERT(rf_side_xact_decode_v1(make_prepare(&fake, 802, true, false),
+		UINT64_C(0x11223344), 3, &operation));
+	prepare_apply.pending_install =
+		TWOPHASE_RECOVERY_PENDING_POST_READ_FAILED;
+	UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&operation, fake.data,
+		operation.prepare_payload_length),
+		RF_SIDE_XACT_APPLY_POST_READ_FAILED);
+	UT_ASSERT_EQ(prepare_apply.pending_installs, 1);
+	UT_ASSERT_EQ(prepare_apply.projection_stores, 0);
+
+	reset_prepare_apply();
+	prepare_apply.projection_store = CLUSTER_REMOTE_XACT_MUTATION_CONFLICT;
+	UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&operation, fake.data,
+		operation.prepare_payload_length), RF_SIDE_XACT_APPLY_CONFLICT);
+	UT_ASSERT_EQ(prepare_apply.pending_installs, 1);
+	UT_ASSERT_EQ(prepare_apply.projection_stores, 1);
+	UT_ASSERT_EQ(prepare_apply.projection_postreads, 0);
 }
 
 UT_TEST(test_online_plan_owns_decoded_operation_not_raw_record)
@@ -641,11 +927,15 @@ UT_TEST(test_online_plan_preflights_all_targets_before_first_mutation)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(13);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);
 	UT_RUN(test_prepare_requires_bounded_aligned_gid);
+	UT_RUN(test_prepare_apply_installs_authoritative_pending_before_projection);
+	UT_RUN(test_prepare_apply_blocks_underivable_or_wrong_system_before_pending);
+	UT_RUN(test_prepare_apply_blocks_wrong_origin_subxid_before_target_reads);
+	UT_RUN(test_prepare_apply_never_projects_unverified_pending);
 	UT_RUN(test_online_plan_owns_decoded_operation_not_raw_record);
 	UT_RUN(test_online_plan_denies_incomplete_physical_cut);
 	UT_RUN(test_online_plan_owns_undo_payload_not_raw_record);

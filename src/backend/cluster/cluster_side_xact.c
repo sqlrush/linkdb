@@ -10,13 +10,16 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/rmgr.h"
+#include "access/twophase.h"
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "cluster/cluster_side_xact.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
@@ -440,7 +443,8 @@ rf_side_xact_structural_preflight_v1(
 	const char *gid_end;
 	Size		i;
 
-	if (operation == NULL || operation->kind == RF_SIDE_XACT_INVALID ||
+	if (operation == NULL || operation->system_identifier == 0 ||
+		operation->kind == RF_SIDE_XACT_INVALID ||
 		operation->origin_thread == 0 || operation->origin_thread > 128 ||
 		operation->reserved_zero != 0 ||
 		!TransactionIdIsNormal(operation->xid))
@@ -520,6 +524,7 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 		XLogRecGetRmid(record) != RM_XACT_ID)
 		return false;
 	memset(&candidate, 0, sizeof(candidate));
+	candidate.system_identifier = system_identifier;
 	candidate.origin_thread = origin_thread;
 	opcode = XLogRecGetInfo(record) & XLOG_XACT_OPMASK;
 	xid = XLogRecGetXid(record);
@@ -662,8 +667,8 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier,
 	return true;
 }
 
-RfSideXactApplyResultV1
-rf_side_xact_apply_v1(const RfSideXactOperationV1 *operation)
+static RfSideXactApplyResultV1
+side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
 {
 	ClusterRemoteXactMutationV2 mutation;
 	ClusterRemoteXactOutcome outcome;
@@ -675,11 +680,6 @@ rf_side_xact_apply_v1(const RfSideXactOperationV1 *operation)
 	uint16		durable_slot;
 	uint16		durable_wrap;
 	bool		post_wrap_valid;
-
-	if (!rf_side_xact_structural_preflight_v1(operation))
-		return RF_SIDE_XACT_APPLY_BLOCKED;
-	if (operation->kind != RF_SIDE_XACT_COMMIT)
-		return RF_SIDE_XACT_APPLY_BLOCKED;
 
 	/* Canonical TT truth first, using only the frozen typed delta. */
 	cluster_tt_durable_redo_stamp_slot(operation->tt_delta.instance,
@@ -717,6 +717,129 @@ rf_side_xact_apply_v1(const RfSideXactOperationV1 *operation)
 		timestamp != operation->terminal_timestamp)
 		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
 	return RF_SIDE_XACT_APPLY_OK;
+}
+
+static RfSideXactApplyResultV1
+side_xact_map_pending_result(TwoPhaseRecoveryPendingResult result)
+{
+	switch (result)
+	{
+		case TWOPHASE_RECOVERY_PENDING_OK:
+			return RF_SIDE_XACT_APPLY_OK;
+		case TWOPHASE_RECOVERY_PENDING_CONFLICT:
+			return RF_SIDE_XACT_APPLY_CONFLICT;
+		case TWOPHASE_RECOVERY_PENDING_POST_READ_FAILED:
+			return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
+		case TWOPHASE_RECOVERY_PENDING_BLOCKED:
+		default:
+			return RF_SIDE_XACT_APPLY_BLOCKED;
+	}
+}
+
+static bool
+side_xact_prepared_tt_undo_exact(const RfSideXactOperationV1 *operation)
+{
+	uint16		i;
+
+	/* Classify every top/subtransaction origin before the first target read. */
+	for (i = 0; i < operation->prepared_binding_count; i++)
+		if (cluster_xid_origin_slot(operation->prepared_bindings[i].xid) !=
+				(int) operation->origin_thread - 1)
+			return false;
+
+	for (i = 0; i < operation->prepared_binding_count; i++)
+	{
+		const ClusterTT2PCBinding *binding =
+			&operation->prepared_bindings[i];
+		TTSlot		slot;
+
+		if (!cluster_tt_slot_durable_read_exact_stable(
+				binding->undo_segment_id, binding->slot_offset,
+				binding->xid, binding->wrap, &slot) ||
+			slot.status != TT_SLOT_ACTIVE || SCN_VALID(slot.commit_scn) ||
+			memcmp(&slot.first_undo_block, &operation->prepared_heads[i],
+				sizeof(slot.first_undo_block)) != 0)
+			return false;
+	}
+	return true;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_target_preflight_owned_v1(
+	const RfSideXactOperationV1 *operation, const uint8 *owned_payload,
+	uint32 owned_payload_length)
+{
+	TwoPhaseRecoveryPendingResult pending;
+
+	if (!rf_side_xact_structural_preflight_v1(operation) ||
+		operation->system_identifier != GetSystemIdentifier() ||
+		cluster_xid_origin_slot(operation->xid) !=
+			(int) operation->origin_thread - 1)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+
+	if (operation->kind == RF_SIDE_XACT_COMMIT)
+		return owned_payload == NULL && owned_payload_length == 0
+			? RF_SIDE_XACT_APPLY_OK : RF_SIDE_XACT_APPLY_BLOCKED;
+	if (operation->kind != RF_SIDE_XACT_PREPARE || owned_payload == NULL ||
+		owned_payload_length != operation->prepare_payload_length ||
+		!side_xact_prepared_tt_undo_exact(operation))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+
+	pending = TwoPhaseRecoveryPendingPreflight(operation->xid,
+		operation->database, operation->prepared_owner,
+		operation->prepared_at, operation->prepare_gid, owned_payload,
+		owned_payload_length);
+	return side_xact_map_pending_result(pending);
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_owned_v1(const RfSideXactOperationV1 *operation,
+	const uint8 *owned_payload, uint32 owned_payload_length)
+{
+	RfSideXactApplyResultV1 preflight;
+	TwoPhaseRecoveryPendingResult pending;
+	ClusterRemoteXactMutationV2 mutation;
+
+	preflight = rf_side_xact_target_preflight_owned_v1(operation,
+		owned_payload, owned_payload_length);
+	if (preflight != RF_SIDE_XACT_APPLY_OK)
+		return preflight;
+	if (operation->kind == RF_SIDE_XACT_COMMIT)
+		return side_xact_apply_commit_v1(operation);
+
+	/*
+	 * The native database-scoped pending record is the authority-bearing
+	 * state.  Only after its exact durable post-read succeeds may the v2 SLRU
+	 * projection be materialized; that projection never grants PREPARED,
+	 * terminal state, readiness, or OPEN by itself.
+	 */
+	pending = TwoPhaseRecoveryPendingInstall(operation->xid,
+		operation->database, operation->prepared_owner,
+		operation->prepared_at, operation->prepare_gid, owned_payload,
+		owned_payload_length);
+	preflight = side_xact_map_pending_result(pending);
+	if (preflight != RF_SIDE_XACT_APPLY_OK)
+		return preflight;
+
+	mutation = cluster_remote_xact_store_prepared_v2(
+		operation->origin_thread - 1, operation->xid,
+		operation->prepare_binding);
+	if (mutation == CLUSTER_REMOTE_XACT_MUTATION_CONFLICT)
+		return RF_SIDE_XACT_APPLY_CONFLICT;
+	if (mutation != CLUSTER_REMOTE_XACT_MUTATION_STORED &&
+		mutation != CLUSTER_REMOTE_XACT_MUTATION_UNCHANGED)
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	if (!cluster_remote_xact_pending_matches_v2(
+			operation->origin_thread - 1, operation->xid,
+			operation->prepare_binding))
+		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
+	return RF_SIDE_XACT_APPLY_OK;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_v1(const RfSideXactOperationV1 *operation)
+{
+	return rf_side_xact_apply_owned_v1(operation, NULL, 0);
 }
 
 #endif

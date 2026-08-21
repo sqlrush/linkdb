@@ -130,6 +130,7 @@
 #include "access/xlogutils.h"
 #include "catalog/pg_type.h"
 #include "catalog/storage.h"
+#include "common/file_utils.h"
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -274,6 +275,8 @@ static void MarkAsPreparingGuts(GlobalTransaction gxact, TransactionId xid, cons
 								TimestampTz prepared_at, Oid owner, Oid databaseid);
 static void RemoveTwoPhaseFile(TransactionId xid, bool giveWarning);
 static void RecreateTwoPhaseFile(TransactionId xid, void *content, int len);
+static void PrepareRedoAddCommon(char *buf, XLogRecPtr start_lsn,
+	XLogRecPtr end_lsn, RepOriginId origin_id);
 
 /*
  * Initialization of shared memory
@@ -1401,6 +1404,288 @@ ReadTwoPhaseFile(TransactionId xid, bool missing_ok)
 
 	return buf;
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Return the bounded GID carried by one native PREPARE payload.  `len` does
+ * not include the state-file CRC.  This is intentionally only an identity
+ * decoder: cluster_side_xact has already performed the full immutable record
+ * shape validation before these recovery-only entry points are reachable.
+ */
+static const char *
+TwoPhaseRecoveryPayloadGid(const void *content, uint32 len,
+	const TwoPhaseFileHeader **header_out)
+{
+	const TwoPhaseFileHeader *hdr;
+	const char *stored_gid;
+	Size		header_bytes = MAXALIGN(sizeof(TwoPhaseFileHeader));
+
+	if (content == NULL || len < header_bytes ||
+		(uint64) len + sizeof(pg_crc32c) > PG_UINT32_MAX)
+		return NULL;
+	hdr = (const TwoPhaseFileHeader *) content;
+	if (hdr->magic != TWOPHASE_MAGIC ||
+		hdr->total_len != len + sizeof(pg_crc32c) ||
+		hdr->gidlen <= 1 || hdr->gidlen > GIDSIZE ||
+		header_bytes + MAXALIGN((Size) hdr->gidlen) > len)
+		return NULL;
+	stored_gid = (const char *) content + header_bytes;
+	if (stored_gid[hdr->gidlen - 1] != '\0' ||
+		memchr(stored_gid, '\0', hdr->gidlen - 1) != NULL)
+		return NULL;
+	if (header_out != NULL)
+		*header_out = hdr;
+	return stored_gid;
+}
+
+static bool
+TwoPhaseRecoveryInputValid(TransactionId xid, Oid database, Oid owner,
+	TimestampTz prepared_at, const char *gid, const void *content, uint32 len)
+{
+	const TwoPhaseFileHeader *hdr;
+	const char *stored_gid;
+	Size		gid_len;
+
+	if (!TransactionIdIsNormal(xid) || !OidIsValid(database) ||
+		!OidIsValid(owner) || prepared_at == 0 || gid == NULL ||
+		len > MaxAllocSize - sizeof(pg_crc32c))
+		return false;
+	gid_len = strnlen(gid, GIDSIZE);
+	if (gid_len == 0 || gid_len >= GIDSIZE)
+		return false;
+	stored_gid = TwoPhaseRecoveryPayloadGid(content, len, &hdr);
+	return stored_gid != NULL && TransactionIdEquals(hdr->xid, xid) &&
+		hdr->database == database && hdr->owner == owner &&
+		hdr->prepared_at == prepared_at && hdr->gidlen == gid_len + 1 &&
+		memcmp(stored_gid, gid, gid_len + 1) == 0;
+}
+
+static bool
+TwoPhaseRecoveryPayloadExact(const char *observed, uint32 observed_len,
+	const void *expected, uint32 expected_len)
+{
+	return observed != NULL && observed_len == expected_len &&
+		memcmp(observed, expected, expected_len) == 0;
+}
+
+/* Caller holds TwoPhaseStateLock. */
+static TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingClassifyLocked(TransactionId xid, const char *gid,
+	const void *content, uint32 len, GlobalTransaction *matched_gxact,
+	bool *matched_file)
+{
+	DIR		   *cldir;
+	struct dirent *clde;
+	GlobalTransaction exact_gxact = NULL;
+	bool		exact_file = false;
+	int			i;
+
+	Assert(LWLockHeldByMe(TwoPhaseStateLock));
+	if (matched_gxact != NULL)
+		*matched_gxact = NULL;
+	if (matched_file != NULL)
+		*matched_file = false;
+
+	for (i = 0; i < TwoPhaseState->numPrepXacts; i++)
+	{
+		GlobalTransaction gxact = TwoPhaseState->prepXacts[i];
+		char	   *buf = NULL;
+		int			buflen = 0;
+
+		if (!TransactionIdEquals(gxact->xid, xid) &&
+			strcmp(gxact->gid, gid) == 0)
+			return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+		if (!TransactionIdEquals(gxact->xid, xid))
+			continue;
+		if (gxact->ondisk)
+		{
+			TwoPhaseFileHeader *hdr;
+
+			buf = ReadTwoPhaseFile(gxact->xid, false);
+			hdr = (TwoPhaseFileHeader *) buf;
+			buflen = (int) (hdr->total_len - sizeof(pg_crc32c));
+		}
+		else
+		{
+			if (XLogRecPtrIsInvalid(gxact->prepare_start_lsn))
+				return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+			XlogReadTwoPhaseData(gxact->prepare_start_lsn, &buf, &buflen);
+		}
+		if (!TwoPhaseRecoveryPayloadExact(buf, (uint32) buflen,
+				content, len))
+		{
+			pfree(buf);
+			return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+		}
+		pfree(buf);
+		exact_gxact = gxact;
+	}
+
+	/*
+	 * Scan all canonical files, not just the target xid: native GID
+	 * uniqueness is cluster-visible recovery state and an orphaned exact file
+	 * from a crash-before-shmem-registration must still reserve its GID.
+	 */
+	cldir = AllocateDir(TWOPHASE_DIR);
+	if (cldir == NULL)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	while ((clde = ReadDir(cldir, TWOPHASE_DIR)) != NULL)
+	{
+		TransactionId file_xid;
+		char	   *buf;
+		TwoPhaseFileHeader *hdr;
+		const char *stored_gid;
+		uint32		buflen;
+
+		if (strlen(clde->d_name) != 8 ||
+			strspn(clde->d_name, "0123456789ABCDEF") != 8)
+			continue;
+		file_xid = (TransactionId) strtoul(clde->d_name, NULL, 16);
+		buf = ReadTwoPhaseFile(file_xid, false);
+		hdr = (TwoPhaseFileHeader *) buf;
+		buflen = hdr->total_len - sizeof(pg_crc32c);
+		stored_gid = TwoPhaseRecoveryPayloadGid(buf, buflen, NULL);
+		if (stored_gid == NULL || !TransactionIdEquals(hdr->xid, file_xid))
+		{
+			pfree(buf);
+			FreeDir(cldir);
+			return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+		}
+		if (TransactionIdEquals(file_xid, xid))
+		{
+			if (!TwoPhaseRecoveryPayloadExact(buf, buflen, content, len))
+			{
+				pfree(buf);
+				FreeDir(cldir);
+				return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+			}
+			exact_file = true;
+		}
+		else if (strcmp(stored_gid, gid) == 0)
+		{
+			pfree(buf);
+			FreeDir(cldir);
+			return TWOPHASE_RECOVERY_PENDING_CONFLICT;
+		}
+		pfree(buf);
+	}
+	FreeDir(cldir);
+
+	if (exact_gxact == NULL && TwoPhaseState->freeGXacts == NULL)
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	if (matched_gxact != NULL)
+		*matched_gxact = exact_gxact;
+	if (matched_file != NULL)
+		*matched_file = exact_file;
+	return TWOPHASE_RECOVERY_PENDING_OK;
+}
+
+static void
+TwoPhaseRecoveryWriteDurable(TransactionId xid, const void *content, uint32 len)
+{
+	char		path[MAXPGPATH];
+	char		tmp[MAXPGPATH];
+	pg_crc32c crc;
+	int			fd;
+
+	TwoPhaseFilePath(path, xid);
+	snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, MyProcPid);
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, content, len);
+	FIN_CRC32C(crc);
+
+	fd = OpenTransientFile(tmp, O_CREAT | O_TRUNC | O_WRONLY | PG_BINARY);
+	if (fd < 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not create recovery two-phase file \"%s\": %m", tmp)));
+	errno = 0;
+	if (write(fd, content, len) != len ||
+		write(fd, &crc, sizeof(crc)) != sizeof(crc))
+	{
+		if (errno == 0)
+			errno = ENOSPC;
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not write recovery two-phase file \"%s\": %m", tmp)));
+	}
+	if (pg_fsync(fd) != 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not fsync recovery two-phase file \"%s\": %m", tmp)));
+	if (CloseTransientFile(fd) != 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not close recovery two-phase file \"%s\": %m", tmp)));
+	if (durable_rename(tmp, path, ERROR) != 0)
+		ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not install recovery two-phase file \"%s\": %m", path)));
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingPreflight(TransactionId xid, Oid database, Oid owner,
+	TimestampTz prepared_at, const char *gid, const void *content, uint32 len)
+{
+	TwoPhaseRecoveryPendingResult result;
+
+	if (max_prepared_xacts <= 0 || TwoPhaseState == NULL ||
+		!TwoPhaseRecoveryInputValid(xid, database, owner, prepared_at,
+			gid, content, len))
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+	LWLockAcquire(TwoPhaseStateLock, LW_SHARED);
+	result = TwoPhaseRecoveryPendingClassifyLocked(xid, gid, content, len,
+		NULL, NULL);
+	LWLockRelease(TwoPhaseStateLock);
+	return result;
+}
+
+TwoPhaseRecoveryPendingResult
+TwoPhaseRecoveryPendingInstall(TransactionId xid, Oid database, Oid owner,
+	TimestampTz prepared_at, const char *gid, const void *content, uint32 len)
+{
+	TwoPhaseRecoveryPendingResult result;
+	GlobalTransaction gxact = NULL;
+	bool		has_file = false;
+	char	   *postread;
+	TwoPhaseFileHeader *post_header;
+	uint32		post_len;
+
+	if (max_prepared_xacts <= 0 || TwoPhaseState == NULL ||
+		!TwoPhaseRecoveryInputValid(xid, database, owner, prepared_at,
+			gid, content, len))
+		return TWOPHASE_RECOVERY_PENDING_BLOCKED;
+
+	LWLockAcquire(TwoPhaseStateLock, LW_EXCLUSIVE);
+	result = TwoPhaseRecoveryPendingClassifyLocked(xid, gid, content, len,
+		&gxact, &has_file);
+	if (result != TWOPHASE_RECOVERY_PENDING_OK)
+	{
+		LWLockRelease(TwoPhaseStateLock);
+		return result;
+	}
+	if (!has_file)
+		TwoPhaseRecoveryWriteDurable(xid, content, len);
+	if (gxact == NULL)
+		PrepareRedoAddCommon((char *) content, InvalidXLogRecPtr,
+			InvalidXLogRecPtr, InvalidRepOriginId);
+	else
+	{
+		gxact->ondisk = true;
+		gxact->prepare_start_lsn = InvalidXLogRecPtr;
+		gxact->prepare_end_lsn = InvalidXLogRecPtr;
+	}
+
+	postread = ReadTwoPhaseFile(xid, false);
+	post_header = (TwoPhaseFileHeader *) postread;
+	post_len = post_header->total_len - sizeof(pg_crc32c);
+	if (!TwoPhaseRecoveryPayloadExact(postread, post_len, content, len))
+		result = TWOPHASE_RECOVERY_PENDING_POST_READ_FAILED;
+	pfree(postread);
+	LWLockRelease(TwoPhaseStateLock);
+	return result;
+}
+#endif							/* USE_PGRAC_CLUSTER */
 
 
 /*
@@ -2574,13 +2859,21 @@ RecordTransactionAbortPrepared(TransactionId xid, int nchildren, TransactionId *
 void
 PrepareRedoAdd(char *buf, XLogRecPtr start_lsn, XLogRecPtr end_lsn, RepOriginId origin_id)
 {
+	Assert(LWLockHeldByMeInMode(TwoPhaseStateLock, LW_EXCLUSIVE));
+	Assert(RecoveryInProgress());
+	PrepareRedoAddCommon(buf, start_lsn, end_lsn, origin_id);
+}
+
+static void
+PrepareRedoAddCommon(char *buf, XLogRecPtr start_lsn, XLogRecPtr end_lsn,
+	RepOriginId origin_id)
+{
 	TwoPhaseFileHeader *hdr = (TwoPhaseFileHeader *)buf;
 	char *bufptr;
 	const char *gid;
 	GlobalTransaction gxact;
 
 	Assert(LWLockHeldByMeInMode(TwoPhaseStateLock, LW_EXCLUSIVE));
-	Assert(RecoveryInProgress());
 
 	bufptr = buf + MAXALIGN(sizeof(TwoPhaseFileHeader));
 	gid = (const char *)bufptr;

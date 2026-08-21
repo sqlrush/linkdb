@@ -9,6 +9,7 @@
 #define CLUSTER_SIDE_XACT_H
 
 #include "access/xact.h"
+#include "access/twophase.h"
 #include "access/xlogreader.h"
 #include "cluster/cluster_remote_xact.h"
 #include "cluster/cluster_tt_2pc.h"
@@ -27,6 +28,7 @@ typedef enum RfSideXactKindV1
 
 typedef struct RfSideXactOperationV1
 {
+	uint64		system_identifier;
 	RfSideXactKindV1 kind;
 	uint16		origin_thread;
 	uint16		reserved_zero;
@@ -68,5 +70,11 @@ typedef enum RfSideXactApplyResultV1
 /* Apply one already-decoded operation.  This function never reads WAL. */
 extern RfSideXactApplyResultV1 rf_side_xact_apply_v1(
 	const RfSideXactOperationV1 *operation);
+extern RfSideXactApplyResultV1 rf_side_xact_target_preflight_owned_v1(
+	const RfSideXactOperationV1 *operation, const uint8 *owned_payload,
+	uint32 owned_payload_length);
+extern RfSideXactApplyResultV1 rf_side_xact_apply_owned_v1(
+	const RfSideXactOperationV1 *operation, const uint8 *owned_payload,
+	uint32 owned_payload_length);
 
 #endif

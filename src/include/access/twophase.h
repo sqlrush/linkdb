@@ -67,5 +67,26 @@ extern bool LookupGXact(const char *gid, XLogRecPtr prepare_end_lsn,
 /* PGRAC (spec-4.12a D1): non-allocating prepared-xact count for the cluster
  * undo record-segment drain gate (硬门 6). */
 extern int GetNumberOfPreparedTransactions(void);
+
+/*
+ * RF-SIDE recovery-only durable pending owner.  The content is the complete
+ * native PREPARE payload (without the trailing state-file CRC).  These APIs
+ * never grant terminal state or OPEN; they only classify/install an exact
+ * database-scoped pg_twophase pending record.
+ */
+typedef enum TwoPhaseRecoveryPendingResult
+{
+	TWOPHASE_RECOVERY_PENDING_OK = 0,
+	TWOPHASE_RECOVERY_PENDING_BLOCKED,
+	TWOPHASE_RECOVERY_PENDING_CONFLICT,
+	TWOPHASE_RECOVERY_PENDING_POST_READ_FAILED
+} TwoPhaseRecoveryPendingResult;
+
+extern TwoPhaseRecoveryPendingResult TwoPhaseRecoveryPendingPreflight(
+	TransactionId xid, Oid database, Oid owner, TimestampTz prepared_at,
+	const char *gid, const void *content, uint32 len);
+extern TwoPhaseRecoveryPendingResult TwoPhaseRecoveryPendingInstall(
+	TransactionId xid, Oid database, Oid owner, TimestampTz prepared_at,
+	const char *gid, const void *content, uint32 len);
 #endif
 #endif							/* TWOPHASE_H */
