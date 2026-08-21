@@ -480,6 +480,46 @@ UT_TEST(test_baseline_tuple_identical_to_fence_same_issuer)
 	UT_ASSERT(fence.marker_kind == CLUSTER_FENCE_MARKER_KIND_FENCE);
 }
 
+UT_TEST(test_baseline_author_rejects_same_order_durable_conflict)
+{
+	ClusterFenceMarker durable;
+	ClusterFenceMarker baseline;
+	uint8 dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
+
+	memset(dead, 0, sizeof(dead));
+	durable = mk_marker(4, 0, 0x44, 1, 0x01);
+	cluster_fence_marker_build_baseline(&baseline, 4, dead, 0, 0,
+									 CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+
+	/* A restarting lowest-live node has not applied the survivor's current
+	 * membership yet.  It must not overwrite its self slot with a same-order,
+	 * different tuple: the direct durable reader correctly treats those two
+	 * identities as corruption. */
+	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(
+		&baseline, true, &durable));
+
+	baseline = durable;
+	baseline.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(
+		&baseline, true, &durable));
+
+	baseline.fence_epoch = 3;
+	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(
+		&baseline, true, &durable));
+
+	baseline = durable;
+	baseline.fence_epoch = 5;
+	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(
+		&baseline, true, &durable));
+
+	cluster_fence_marker_build_baseline(&baseline, 5, dead, 0, 0,
+									 CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(
+		&baseline, true, &durable));
+	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(
+		&baseline, false, NULL));
+}
+
 UT_TEST(test_baseline_pristine_issuer_is_sentinel_and_uniform)
 {
 	/* pristine baseline uses the fixed sentinel issuer so every node's pristine
@@ -734,7 +774,7 @@ UT_TEST(test_stop02_cache_rejects_bad_expiry_and_semantic_kind_mismatch)
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(38);
 	UT_RUN(test_enforcement_off_is_escape_hatch);
 	UT_RUN(test_baseline_authorized_is_allowed);
 	UT_RUN(test_detached_region_fails_closed);
@@ -762,6 +802,7 @@ main(void)
 	UT_RUN(test_authority_advances_dead_superset_required);
 	UT_RUN(test_build_baseline_fields);
 	UT_RUN(test_baseline_tuple_identical_to_fence_same_issuer);
+	UT_RUN(test_baseline_author_rejects_same_order_durable_conflict);
 	UT_RUN(test_baseline_pristine_issuer_is_sentinel_and_uniform);
 	UT_RUN(test_lowest_live_node);
 	UT_RUN(test_grace_before_engage);

@@ -616,6 +616,35 @@ cluster_write_fence_authority_advances(uint64 new_epoch, const uint8 *new_dead,
 }
 
 /*
+ * A deterministic baseline leader may reinforce the current durable tuple or
+ * advance beyond it, but it must never publish a different identity at the
+ * same ordering key or shrink the durable dead set.  Two competing same-order
+ * markers in different node slots make one disk's vote structurally corrupt;
+ * a higher-order shrink would persist authority that the later token refresh
+ * can only reject locally.  This is the author-side half of 4.12b D5.
+ */
+static inline bool
+cluster_fence_baseline_author_permitted_v1(
+	const ClusterFenceMarker *baseline, bool have_durable,
+	const ClusterFenceMarker *durable)
+{
+	int order;
+
+	if (!cluster_fence_marker_valid_v1(baseline))
+		return false;
+	if (!have_durable)
+		return true;
+	if (!cluster_fence_marker_valid_v1(durable)
+		|| !cluster_write_fence_authority_advances(
+			baseline->fence_epoch, baseline->fenced_dead_bitmap,
+			durable->fence_epoch, durable->fenced_dead_bitmap))
+		return false;
+	order = cluster_fence_marker_order_compare(baseline, durable);
+	return order > 0
+		|| (order == 0 && cluster_fence_marker_tuple_equal(baseline, durable));
+}
+
+/*
  * cluster_fence_marker_build_baseline -- the PURE baseline builder (spec-4.12b D2).
  *	Fill *out as a BASELINE-kind membership marker from the APPLIED membership tuple,
  *	which the caller MUST read atomically from cluster_reconfig_get_last_event() (NOT

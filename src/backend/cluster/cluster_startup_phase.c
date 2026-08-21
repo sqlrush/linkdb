@@ -1524,6 +1524,9 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 		&& !cluster_phase3_wait_for_live_formation(
 			phase3_deadline, &formation_result, &formation_origin_thread,
 			&formation_authority, &formation_snapshot)) {
+		ereport(LOG,
+				(errmsg("cluster phase 3: live formation wait failed with witness result %u",
+						(uint32) formation_result)));
 		fail_ctx->errcode = ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED;
 		fail_ctx->errmsg = "cluster phase 3: live formation did not become ready before recovery";
 		fail_ctx->errhint = "Verify exact self MEMBER admission, the current QVOTEC "

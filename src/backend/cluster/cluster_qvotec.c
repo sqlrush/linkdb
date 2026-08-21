@@ -2470,8 +2470,8 @@ qvotec_poll_once(void)
 	ClusterFenceMarker baseline_marker; /* spec-4.12b D2 */
 	bool author_baseline = false;		/* spec-4.12b D2: wrote a baseline this cycle */
 	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
-	uint64 durable_authority_epoch = 0; /* spec-4.12b D5/P1-1: highest durable fence */
-	bool durable_has_authority = false; /* epoch observed on disk THIS poll */
+	bool durable_has_authority = false; /* exact authority observed on disk THIS poll */
+	ClusterFenceMarker durable_authority_marker; /* exact tuple observed this poll */
 	bool fence_majority_written = false; /* RF-ROOT P6: this poll's marker tuple
 										 * reached quorum-majority durability */
 
@@ -2850,10 +2850,10 @@ qvotec_poll_once(void)
 			uint64 fence_lease_expire = now_us + (uint64)cluster_write_fence_lease_ms * 1000ULL;
 
 			cluster_write_fence_refresh_from_marker(&authority.marker, fence_lease_expire);
-			/* spec-4.12b D5/P1-1: remember the durable authority epoch this poll
-			 * observed, so the baseline author below never overwrites a
-			 * higher-epoch durable fence with a lower-epoch baseline. */
-			durable_authority_epoch = authority.marker.fence_epoch;
+			/* spec-4.12b D5/P1-1: retain the exact durable tuple so the
+			 * baseline author below cannot regress order/dead membership or
+			 * publish a competing identity at the same order. */
+			durable_authority_marker = authority.marker;
 			durable_has_authority = true;
 		} else if (authority.minority_seen)
 			cluster_write_fence_note_minority_marker();
@@ -2973,17 +2973,20 @@ qvotec_poll_once(void)
 	 * submitted fence would author a LOWER-epoch baseline and pack it over the SAME
 	 * self-slot that just received the (higher-epoch) fence marker -- erasing the
 	 * fence from disk before peers read it.  Guard fail-closed: if the would-be
-	 * baseline's epoch is BELOW the durable authority this very poll already
-	 * observed on disk, do NOT author it -- preserve the durable marker instead and
-	 * count it.  (The leader catches up the next poll once last_applied advances,
-	 * authoring a baseline tuple-identical to the fence.)
+	 * baseline is below the durable authority this very poll observed, shrinks its
+	 * dead set, or names a competing identity at the same ordering key, do NOT
+	 * author it -- preserve the durable marker instead and count it.  (The leader
+	 * catches up once last_applied advances, authoring a baseline tuple-identical
+	 * to the fence.)
 	 */
 	is_leader = qvotec_self_is_membership_leader(decision.alive_bitmap);
 	if (!have_submit && cluster_write_fence_enforcement == CLUSTER_WRITE_FENCE_ENFORCE_ON
 		&& is_leader) {
 		qvotec_build_baseline_marker(&baseline_marker);
-		if (durable_has_authority && baseline_marker.fence_epoch < durable_authority_epoch)
-			cluster_write_fence_note_baseline_stale(); /* fail-closed: would regress */
+		if (!cluster_fence_baseline_author_permitted_v1(
+				&baseline_marker, durable_has_authority,
+				durable_has_authority ? &durable_authority_marker : NULL))
+			cluster_write_fence_note_baseline_stale(); /* non-monotonic or same-order conflict */
 		else
 			author_baseline = true;
 	}
