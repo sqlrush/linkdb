@@ -77,6 +77,23 @@ resource_x_retry_state_valid(const ResourceXRetryStateV1 *state)
 	return state->terminal_errcode == 0;
 }
 
+ResourceXTerminalReason
+resource_x_terminal_reason_decode(uint32 reason)
+{
+	switch (reason) {
+	case 0:
+		return RESOURCE_X_TERMINAL_REASON_LEGACY_CANCEL;
+	case ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED:
+		return RESOURCE_X_TERMINAL_REASON_RETRY_EXHAUSTED;
+	case ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT:
+		return RESOURCE_X_TERMINAL_REASON_INVALIDATE_TIMEOUT;
+	case ERRCODE_CLUSTER_LOST_WRITE_DETECTED:
+		return RESOURCE_X_TERMINAL_REASON_LOST_WRITE;
+	default:
+		return RESOURCE_X_TERMINAL_REASON_INVALID;
+	}
+}
+
 static bool
 resource_x_retry_transport_valid(const ResourceXTransportWitness *transport)
 {
@@ -198,6 +215,8 @@ resource_x_retry_terminalize_exact(const ResourceXRetryStateV1 *current,
 	resource_x_retry_state_clear(terminal_out);
 	if (current == NULL || expected == NULL || terminal_out == NULL
 		|| terminal_errcode == 0 || terminal_at_mono_us == 0
+		|| resource_x_terminal_reason_decode(terminal_errcode)
+			   == RESOURCE_X_TERMINAL_REASON_INVALID
 		|| !resource_x_retry_state_valid(current)
 		|| !resource_x_retry_state_valid(expected))
 		return RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED;

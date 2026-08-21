@@ -1153,7 +1153,9 @@ cluster_gcs_pcm_x_cancel_ack_ingress_valid(const PcmXPhasePayload *ack, Size pay
 		   && ack->ref.identity.cluster_epoch == current_epoch && tag_master == authenticated_node
 		   && ack->ref.identity.request_id != 0 && ack->ref.identity.wait_seq != 0
 		   && ack->ref.handle.ticket_id != 0 && ack->ref.handle.queue_generation != 0
-		   && ack->ref.grant_generation == 0 && ack->reason == 0
+		   && ack->ref.grant_generation == 0
+		   && resource_x_terminal_reason_decode(ack->reason)
+			  != RESOURCE_X_TERMINAL_REASON_INVALID
 		   && ack->phase == PCM_X_LOCAL_RELIABLE_PHASE_CANCEL && ack->flags == 0;
 }
 

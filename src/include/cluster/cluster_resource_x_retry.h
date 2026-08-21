@@ -62,6 +62,16 @@ typedef enum ResourceXRetryApplyResult {
 	RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED
 } ResourceXRetryApplyResult;
 
+/* Existing type-60 PcmXPhasePayload.reason value domain.  The enum values
+ * are internal classifications, not wire values. */
+typedef enum ResourceXTerminalReason {
+	RESOURCE_X_TERMINAL_REASON_INVALID = 0,
+	RESOURCE_X_TERMINAL_REASON_LEGACY_CANCEL,
+	RESOURCE_X_TERMINAL_REASON_RETRY_EXHAUSTED,
+	RESOURCE_X_TERMINAL_REASON_INVALIDATE_TIMEOUT,
+	RESOURCE_X_TERMINAL_REASON_LOST_WRITE
+} ResourceXTerminalReason;
+
 StaticAssertDecl(sizeof(ResourceXRetryStateV1) == 72,
 				 "Resource-X retry state ABI");
 StaticAssertDecl(offsetof(ResourceXRetryStateV1, attempt) == 0,
@@ -94,6 +104,7 @@ extern bool resource_x_retry_state_init(const ResourceXAttemptWitness *attempt,
 										ResourceXRetryStateV1 *out);
 extern void resource_x_retry_state_clear(ResourceXRetryStateV1 *state);
 extern bool resource_x_retry_state_is_clear(const ResourceXRetryStateV1 *state);
+extern ResourceXTerminalReason resource_x_terminal_reason_decode(uint32 reason);
 extern bool resource_x_retry_policy_exact(const ResourceXRetryStateV1 *state,
 	uint32 *max_retries_out, uint32 *initial_backoff_ms_out);
 extern bool resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state,

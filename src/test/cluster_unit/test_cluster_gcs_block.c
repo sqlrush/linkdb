@@ -1123,6 +1123,19 @@ UT_TEST(test_pcm_x_cancel_acks_bind_exact_master_and_canonical_payload)
 	cancel_ack.phase = PCM_X_LOCAL_RELIABLE_PHASE_CANCEL;
 	UT_ASSERT(
 		cluster_gcs_pcm_x_cancel_ack_ingress_valid(&cancel_ack, sizeof(cancel_ack), 2, 9, 2, 1));
+	cancel_ack.reason = ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED;
+	UT_ASSERT(
+		cluster_gcs_pcm_x_cancel_ack_ingress_valid(&cancel_ack, sizeof(cancel_ack), 2, 9, 2, 1));
+	cancel_ack.reason = ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT;
+	UT_ASSERT(
+		cluster_gcs_pcm_x_cancel_ack_ingress_valid(&cancel_ack, sizeof(cancel_ack), 2, 9, 2, 1));
+	cancel_ack.reason = ERRCODE_CLUSTER_LOST_WRITE_DETECTED;
+	UT_ASSERT(
+		cluster_gcs_pcm_x_cancel_ack_ingress_valid(&cancel_ack, sizeof(cancel_ack), 2, 9, 2, 1));
+	cancel_ack.reason = ERRCODE_DATA_CORRUPTED;
+	UT_ASSERT(
+		!cluster_gcs_pcm_x_cancel_ack_ingress_valid(&cancel_ack, sizeof(cancel_ack), 2, 9, 2, 1));
+	cancel_ack.reason = 0;
 	cancel_ack.ref.grant_generation = 1;
 	UT_ASSERT(
 		!cluster_gcs_pcm_x_cancel_ack_ingress_valid(&cancel_ack, sizeof(cancel_ack), 2, 9, 2, 1));

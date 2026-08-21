@@ -7,6 +7,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_resource_x_retry.h"
 
@@ -292,7 +293,7 @@ UT_TEST(test_terminal_transition_is_attempt_generation_and_phase_exact)
 	ResourceXRetryStateV1 expected;
 	ResourceXRetryStateV1 terminal;
 	ResourceXRetryStateV1 before;
-	uint32 errcode = UINT32_C(0x123456);
+	uint32 errcode = ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED;
 
 	UT_ASSERT(resource_x_retry_state_init(&attempt, 1000, 6000, 0, 1, 7, &current));
 	expected = current;
@@ -321,12 +322,36 @@ UT_TEST(test_terminal_transition_is_attempt_generation_and_phase_exact)
 	UT_ASSERT_EQ(resource_x_retry_terminalize_exact(
 						 &current, &current, errcode, 2000, &terminal),
 				 RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED);
+	current = expected;
+	UT_ASSERT_EQ(resource_x_retry_terminalize_exact(
+						 &current, &current, ERRCODE_DATA_CORRUPTED, 2000, &terminal),
+				 RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED);
+}
+
+UT_TEST(test_type60_terminal_reason_codec_is_closed_and_zero_legacy)
+{
+	UT_ASSERT_EQ(sizeof(PcmXPhasePayload), 96);
+	UT_ASSERT_EQ((int)PGRAC_IC_MSG_PCM_X_CANCEL_ACK, 60);
+	UT_ASSERT_EQ(resource_x_terminal_reason_decode(0),
+				 RESOURCE_X_TERMINAL_REASON_LEGACY_CANCEL);
+	UT_ASSERT_EQ(resource_x_terminal_reason_decode(
+				 ERRCODE_CLUSTER_GCS_BLOCK_RETRANSMIT_EXHAUSTED),
+				 RESOURCE_X_TERMINAL_REASON_RETRY_EXHAUSTED);
+	UT_ASSERT_EQ(resource_x_terminal_reason_decode(
+				 ERRCODE_CLUSTER_GCS_BLOCK_INVALIDATE_TIMEOUT),
+				 RESOURCE_X_TERMINAL_REASON_INVALIDATE_TIMEOUT);
+	UT_ASSERT_EQ(resource_x_terminal_reason_decode(ERRCODE_CLUSTER_LOST_WRITE_DETECTED),
+				 RESOURCE_X_TERMINAL_REASON_LOST_WRITE);
+	UT_ASSERT_EQ(resource_x_terminal_reason_decode(1),
+				 RESOURCE_X_TERMINAL_REASON_INVALID);
+	UT_ASSERT_EQ(resource_x_terminal_reason_decode(ERRCODE_DATA_CORRUPTED),
+				 RESOURCE_X_TERMINAL_REASON_INVALID);
 }
 
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_retry_state_layout_and_slot_embedding);
 	UT_RUN(test_retry_state_initialization_publishes_exact_attempt);
 	UT_RUN(test_retry_state_initialization_rejects_unpublishable_state);
@@ -338,6 +363,7 @@ main(void)
 	UT_RUN(test_classifier_enforces_sampled_retry_budget);
 	UT_RUN(test_exponential_backoff_saturates_and_clamps_to_deadline);
 	UT_RUN(test_terminal_transition_is_attempt_generation_and_phase_exact);
+	UT_RUN(test_type60_terminal_reason_codec_is_closed_and_zero_legacy);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
