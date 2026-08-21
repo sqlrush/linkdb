@@ -5757,10 +5757,68 @@ UT_TEST(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain)
 }
 
 
+UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
+{
+	static const char *const executor_contract[]
+		= { "cluster_pcm_lock_resource_x_executor_enter(",
+			"cluster_pcm_lock_resource_x_t1_grant_exact(",
+			"cluster_pcm_lock_resource_x_executor_probe_exact(",
+			"cluster_bufmgr_pcm_own_capture_current_x_by_tag(",
+			"cluster_bufmgr_pcm_own_activate_x_by_tag(",
+			"cluster_pcm_lock_resource_x_requester_apply_exact(",
+			"cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(",
+			"cluster_pcm_lock_resource_x_requester_activate_exact(",
+			"cluster_pcm_lock_resource_x_executor_leave(" };
+	static const char *const requester_contract[]
+		= { "progress.member_state == PCM_XL_GRANTED",
+			"progress.identity.node_id != cluster_node_id",
+			"resource_x_episode_deadline_us = gcs_block_pcm_x_saturating_add_us(",
+			"cluster_pcm_lock_resource_x_executor_rearm_exact(",
+			"gcs_block_pcm_x_resource_x_terminal_try(",
+			"gcs_block_pcm_x_resource_x_wait_exact(",
+			"continue;",
+			"claim_out->semantic_generation = progress.semantic_generation",
+			"PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM", "break;" };
+	static const char *const wait_contract[]
+		= { "now_us >= episode_deadline_us",
+			"cluster_pcm_lock_resource_x_executor_wait_exact(ref, 0)",
+			"cluster_pcm_lock_resource_x_executor_wait_exact(ref, timeout_ms)",
+			"cluster_gcs_pcm_x_requester_wait_index_advance(current)" };
+	static const char *const no_progress_contract[]
+		= { "cluster_pcm_lock_resource_x_publish_no_progress_exact(",
+			"cluster_pcm_lock_resource_x_executor_probe_exact(",
+			"probe_result == RESOURCE_X_EXECUTOR_BLOCKED",
+			"*rearm_after_wait_out = true" };
+	static const char *const formation_contract[]
+		= { "runtime = cluster_pcm_x_runtime_snapshot()",
+			"cluster_pcm_lock_resource_x_gate_bind_formation_exact(runtime.gate_generation)",
+			"gcs_block_pcm_x_resource_retry_tick", "gcs_block_pcm_x_terminal_retry_tick" };
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_x_terminal_try(",
+							   "\nstatic PcmXQueueResult\n"
+							   "gcs_block_pcm_x_acquire_writer_impl(", executor_contract,
+							   lengthof(executor_contract));
+	assert_ordered_in_function(source, "\ngcs_block_pcm_x_acquire_writer_impl(",
+							   "\nPcmXQueueResult\ncluster_gcs_pcm_x_acquire_writer(",
+							   requester_contract, lengthof(requester_contract));
+	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_x_wait_exact(",
+							   "\n\n/*\n * Drive one ordinary", wait_contract,
+							   lengthof(wait_contract));
+	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_x_publish_and_arm_wait(",
+							   "\n\n/* One nonblocking terminal attempt", no_progress_contract,
+							   lengthof(no_progress_contract));
+	assert_ordered_in_function(source, "\ncluster_gcs_block_pcm_x_formation_tick(",
+							   "\n\nstatic void\ngcs_block_pcm_x_resource_retry_tick(",
+							   formation_contract, lengthof(formation_contract));
+	free(source);
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(106);
+	UT_PLAN(107);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5867,6 +5925,7 @@ main(void)
 	UT_RUN(test_pi_durable_note_drain_stages_before_consuming_on_data_plane);
 	UT_RUN(test_pi_durable_note_receive_is_observable_before_apply);
 	UT_RUN(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain);
+	UT_RUN(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

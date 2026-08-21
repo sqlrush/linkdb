@@ -126,6 +126,10 @@ static int fake_cv_prepare_count = 0;
 static int fake_cv_sleep_count = 0;
 static int fake_cv_cancel_count = 0;
 static int fake_cv_broadcast_count = 0;
+static long fake_cv_timed_sleep_timeout = 0;
+static bool fake_cv_timed_sleep_timed_out = false;
+static bool fake_cv_prepared = false;
+static bool fake_cv_signaled = false;
 static uint32 fake_cv_sleep_wait_event = 0;
 static struct {
 	BufferTag tag;
@@ -215,6 +219,10 @@ reset_fake_pcm_runtime(int max_entries)
 	fake_cv_sleep_count = 0;
 	fake_cv_cancel_count = 0;
 	fake_cv_broadcast_count = 0;
+	fake_cv_timed_sleep_timeout = 0;
+	fake_cv_timed_sleep_timed_out = false;
+	fake_cv_prepared = false;
+	fake_cv_signaled = false;
 	fake_cv_sleep_wait_event = 0;
 	fake_cv_wake_release.armed = false;
 	fake_cv_wake_pending_x_clear.armed = false;
@@ -473,6 +481,7 @@ void
 ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
 {
 	fake_cv_prepare_count++;
+	fake_cv_prepared = true;
 }
 
 void
@@ -497,9 +506,23 @@ ConditionVariableSleep(ConditionVariable *cv pg_attribute_unused(), uint32 wait_
 }
 
 bool
+ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long timeout,
+							uint32 wait_event_info)
+{
+	fake_cv_sleep_count++;
+	fake_cv_timed_sleep_timeout = timeout;
+	fake_cv_sleep_wait_event = wait_event_info;
+	fake_cv_timed_sleep_timed_out = !fake_cv_signaled;
+	fake_cv_signaled = false;
+	return fake_cv_timed_sleep_timed_out;
+}
+
+bool
 ConditionVariableCancelSleep(void)
 {
 	fake_cv_cancel_count++;
+	fake_cv_prepared = false;
+	fake_cv_signaled = false;
 	return false;
 }
 
@@ -507,6 +530,8 @@ void
 ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
 {
 	fake_cv_broadcast_count++;
+	if (fake_cv_prepared)
+		fake_cv_signaled = true;
 }
 
 void
@@ -1053,8 +1078,7 @@ UT_TEST(test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress)
 	changed.acquisition_generation++;
 	ungranted = make_resource_x_acquisition_ref(ungranted_tag, 2, 17, 42);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ungranted),
-				 RESOURCE_X_APPLY_BAD_STATE);
-	UT_ASSERT(cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_X, 2));
+				 RESOURCE_X_APPLY_APPLIED);
 
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref),
 				 RESOURCE_X_APPLY_APPLIED);
@@ -1065,6 +1089,9 @@ UT_TEST(test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress)
 	memset(&snapshot, 0, sizeof(snapshot));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &snapshot),
 				 RESOURCE_X_EXECUTOR_READY);
+	UT_ASSERT_EQ(fake_cv_prepare_count, 1);
+	UT_ASSERT_EQ(fake_cv_cancel_count, 1);
+	UT_ASSERT_EQ(fake_cv_sleep_count, 0);
 	UT_ASSERT_EQ(snapshot.progress_flags, RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1);
 	UT_ASSERT(resource_x_assertion_equal(&snapshot.ref.assertion, &ref.assertion));
 	UT_ASSERT_EQ(snapshot.ref.formation, ref.formation);
@@ -1074,8 +1101,30 @@ UT_TEST(test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress)
 		&ref, RESOURCE_X_NO_PROGRESS_BUFFER_BUSY);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &snapshot),
 				 RESOURCE_X_EXECUTOR_BLOCKED);
+	UT_ASSERT_EQ(fake_cv_prepare_count, 2);
+	UT_ASSERT_EQ(fake_cv_cancel_count, 1);
 	UT_ASSERT_EQ(snapshot.no_progress_generation, ref.acquisition_generation);
 	UT_ASSERT_EQ(snapshot.no_progress_reason, RESOURCE_X_NO_PROGRESS_BUFFER_BUSY);
+	/* Producer publication in the probe->sleep window must remain visible. */
+	ConditionVariableBroadcast(NULL);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_wait_exact(&ref, 8),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(fake_cv_sleep_count, 1);
+	UT_ASSERT_EQ(fake_cv_timed_sleep_timeout, 8);
+	UT_ASSERT(!fake_cv_timed_sleep_timed_out);
+	UT_ASSERT(!fake_cv_prepared);
+	UT_ASSERT_EQ((int)fake_cv_sleep_wait_event, (int)WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	UT_ASSERT_EQ(fake_cv_cancel_count, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_rearm_exact(&changed),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_rearm_exact(&ref),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_rearm_exact(&ref),
+				 RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &snapshot),
+				 RESOURCE_X_EXECUTOR_READY);
+	UT_ASSERT_EQ(snapshot.no_progress_generation, 0);
+	UT_ASSERT_EQ(snapshot.no_progress_reason, RESOURCE_X_NO_PROGRESS_NONE);
 
 	memset(&install, 0, sizeof(install));
 	install.ownership_generation = 9;
@@ -1111,7 +1160,7 @@ UT_TEST(test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress)
 				 RESOURCE_X_EXECUTOR_COMPLETE);
 	UT_ASSERT_EQ(snapshot.progress_flags,
 				 RESOURCE_X_PROGRESS_T1 | RESOURCE_X_PROGRESS_T2 | RESOURCE_X_PROGRESS_T3);
-	UT_ASSERT_EQ(fake_cv_broadcast_count, 4);
+	UT_ASSERT_EQ(fake_cv_broadcast_count, 7);
 }
 
 UT_TEST(test_resource_x_executor_admission_is_formation_exact_and_balanced)

@@ -240,6 +240,7 @@ cluster_pcm_x_writer_grant_snapshot_exact(const PcmXLocalWriterClaim *claim,
 {
 	return claim != NULL && granted != NULL && live != NULL && claim->flags == 0
 		   && claim->writer.flags == 0 && claim->claim_generation != 0
+		   && claim->semantic_generation != UINT64_MAX
 		   && claim->writer.identity.base_own_generation != UINT64_MAX
 		   && claim->grant_base_own_generation != UINT64_MAX
 		   /* A follower copies the canonical node-grant base into the claim;
@@ -260,9 +261,11 @@ cluster_pcm_x_writer_grant_snapshot_exact(const PcmXLocalWriterClaim *claim,
 		   /* One node grant carries one activation fence.  The leader consumes
 			* it; a FIFO follower may inherit that grant only after it is zero. */
 		   && granted->writer_activation_token
-				  == (claim->role == PCM_X_LOCAL_ROLE_NODE_LEADER
-						  ? granted->reservation_token
-						  : 0)
+				  == (claim->semantic_generation != 0
+						  ? 0
+						  : (claim->role == PCM_X_LOCAL_ROLE_NODE_LEADER
+								 ? granted->reservation_token
+								 : 0))
 		   && granted->resource_x_activation_generation == 0
 		   && BufferTagsEqual(&live->tag, &granted->tag) && live->generation == granted->generation
 		   && live->reservation_token == granted->reservation_token
@@ -508,7 +511,10 @@ cluster_pcm_own_eviction_reuse_allowed(const ClusterPcmOwnEvictionCapture *captu
 }
 
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf,
-														   ClusterPcmOwnSnapshot *out_snapshot);
+													   ClusterPcmOwnSnapshot *out_snapshot);
+extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_capture_current_x_by_tag(
+	const ResourceXAcquisitionRef *ref, const PcmXImageToken *expected_image,
+	char *page_bytes, ResourceXCurrentImage *out_image);
 extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_activate_x_by_tag(
 	const ResourceXAcquisitionRef *ref, const ResourceXCurrentImage *image,
 	ResourceXBufferInstallProof *out_proof);

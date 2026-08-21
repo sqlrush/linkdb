@@ -2283,9 +2283,10 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXSlotHeader, slot_generation_hi), 16);
 	UT_ASSERT_EQ(offsetof(PcmXSlotHeader, state_flags), 20);
 	UT_ASSERT_EQ(sizeof(PcmXReliableLegState), 56);
-	UT_ASSERT_EQ(sizeof(PcmXLocalProgress), 248);
+	UT_ASSERT_EQ(sizeof(PcmXLocalProgress), 256);
 	UT_ASSERT_EQ(offsetof(PcmXLocalProgress, master_session_incarnation), 224);
 	UT_ASSERT_EQ(offsetof(PcmXLocalProgress, master_node), 232);
+	UT_ASSERT_EQ(offsetof(PcmXLocalProgress, semantic_generation), 248);
 	UT_ASSERT_EQ(sizeof(PcmXLocalHolderProgress), 168);
 	UT_ASSERT_EQ(offsetof(PcmXLocalHolderProgress, required_page_scn), 128);
 	UT_ASSERT_EQ(offsetof(PcmXLocalHolderProgress, master_session_incarnation), 152);
@@ -10288,6 +10289,7 @@ UT_TEST(test_local_progress_is_exact_and_exposes_remote_wait_ledger)
 	UT_ASSERT_EQ(progress.role, PCM_X_LOCAL_ROLE_NODE_LEADER);
 	UT_ASSERT_EQ(progress.pending_opcode, 0);
 	UT_ASSERT_EQ(progress.last_response_opcode, 0);
+	UT_ASSERT_EQ(progress.semantic_generation, 0);
 
 	UT_ASSERT_EQ(cluster_pcm_x_local_enqueue_arm_exact(&leader, &enqueue, &token), PCM_X_QUEUE_OK);
 	memset(&ack, 0, sizeof(ack));
@@ -10314,6 +10316,7 @@ UT_TEST(test_local_progress_is_exact_and_exposes_remote_wait_ledger)
 	UT_ASSERT_EQ(progress.pending_opcode, 0);
 	UT_ASSERT_EQ(progress.last_response_opcode, PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK);
 	UT_ASSERT_EQ(progress.phase, PCM_X_LOCAL_RELIABLE_PHASE_NONE);
+	UT_ASSERT_EQ(progress.semantic_generation, 0);
 
 	stale = leader;
 	stale.local_sequence++;
@@ -10503,6 +10506,8 @@ UT_TEST(test_local_transfer_prepare_commit_and_final_ack_are_exact)
 	UT_ASSERT_EQ(progress.pending_opcode, PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM);
 	UT_ASSERT_EQ(progress.phase, PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM);
 	UT_ASSERT_EQ(progress.last_response_opcode, PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK);
+	UT_ASSERT_EQ(progress.semantic_generation, prepare.ref.grant_generation);
+	UT_ASSERT(progress.semantic_generation != prepare.ref.handle.ticket_id);
 	UT_ASSERT_EQ(cluster_pcm_x_local_reliable_snapshot_exact(&leader, &retry_token),
 				 PCM_X_QUEUE_OK);
 	UT_ASSERT_EQ(retry_token.pending_opcode, PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM);

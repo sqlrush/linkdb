@@ -540,6 +540,10 @@ cluster_pcm_lock_resource_x_executor_leave(ResourceXActivationGateToken *gate);
 extern uint64 cluster_pcm_lock_resource_x_activation_inflight_count(void);
 extern ResourceXExecutorProbeResult cluster_pcm_lock_resource_x_executor_probe_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXExecutorSnapshot *out_snapshot);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_executor_wait_exact(
+	const ResourceXAcquisitionRef *ref, long timeout_ms);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_executor_rearm_exact(
+	const ResourceXAcquisitionRef *ref);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_apply_exact(
 	const ResourceXAcquisitionRef *ref, const ResourceXBufferInstallProof *proof);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_activate_exact(

@@ -2740,6 +2740,13 @@ UT_TEST(test_resource_x_ordinary_mutation_gate_dominates_dirty_hint_and_flush)
 
 UT_TEST(test_resource_x_t2_t3_buffer_owner_is_generation_exact_and_ordered)
 {
+	static const char *const capture_contract[]
+		= { "BufTableLookup", "cluster_bufmgr_pin_for_gcs_locked",
+			"LWLockConditionalAcquire(content_lock, LW_SHARED)",
+			"cluster_pcm_x_resource_x_t2_snapshot_exact",
+			"cluster_gcs_block_compute_checksum((const char *)page)", "PageGetLSN(page)",
+			"memcpy(page_bytes, page, BLCKSZ)", "LWLockRelease(content_lock)",
+			"cluster_bufmgr_unpin_for_gcs" };
 	static const char *const t2_contract[]
 		= { "BufTableLookup", "cluster_bufmgr_pin_for_gcs_locked",
 			"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
@@ -2788,6 +2795,10 @@ UT_TEST(test_resource_x_t2_t3_buffer_owner_is_generation_exact_and_ordered)
 	UT_ASSERT(!cluster_pcm_x_resource_x_t3_snapshot_exact(&ref, &live));
 
 	source = read_bufmgr_source();
+	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_capture_current_x_by_tag(",
+							   "\nResourceXBufferActivationResult\n"
+							   "cluster_bufmgr_pcm_own_activate_x_by_tag(",
+							   capture_contract, lengthof(capture_contract));
 	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_own_activate_x_by_tag(",
 							   "\nResourceXBufferActivationResult\n"
 							   "cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(",
@@ -2993,6 +3004,20 @@ UT_TEST(test_queue_writer_grant_snapshot_is_claim_and_generation_exact)
 	granted.generation = 11;
 	live = granted;
 	UT_ASSERT(cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
+	claim.semantic_generation = 99;
+	granted.writer_activation_token = 0;
+	granted.resource_x_activation_generation = 0;
+	live = granted;
+	UT_ASSERT(cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
+	claim.semantic_generation = UINT64_MAX;
+	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
+	claim.semantic_generation = 99;
+	granted.writer_activation_token = granted.reservation_token;
+	live = granted;
+	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
+	claim.semantic_generation = 0;
+	granted.writer_activation_token = granted.reservation_token;
+	live = granted;
 	claim.active_slot.slot_generation++;
 	UT_ASSERT(!cluster_pcm_x_writer_grant_snapshot_exact(&claim, &granted, &live));
 

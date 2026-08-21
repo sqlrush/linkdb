@@ -860,13 +860,6 @@ cluster_pcm_lock_resource_x_t1_grant_exact(const ResourceXAcquisitionRef *ref)
 		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto done;
 	}
-	if ((PcmState)pg_atomic_read_u32(&entry->master_state) != PCM_STATE_X
-		|| entry->x_holder_node != ref->assertion.requester_node
-		|| pg_atomic_read_u32(&entry->s_holders_bitmap) != 0) {
-		result = RESOURCE_X_APPLY_BAD_STATE;
-		goto done;
-	}
-
 	entry->resource_x_requester_node = ref->assertion.requester_node;
 	entry->resource_x_formation = ref->formation;
 	entry->resource_x_acquisition_generation = ref->acquisition_generation;
@@ -899,6 +892,9 @@ cluster_pcm_lock_resource_x_executor_probe_exact(const ResourceXAcquisitionRef *
 	if (entry == NULL)
 		return RESOURCE_X_EXECUTOR_CHANGED;
 
+	/* Register before the predicate lock so every producer broadcast between
+	 * this probe and a possible sleep remains visible to this backend. */
+	ConditionVariablePrepareToSleep(&entry->wait_cv);
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	pcm_resource_x_snapshot_locked(entry, out_snapshot);
 	if (!pcm_resource_x_entry_exact(entry, ref))
@@ -917,6 +913,111 @@ cluster_pcm_lock_resource_x_executor_probe_exact(const ResourceXAcquisitionRef *
 	else
 		result = RESOURCE_X_EXECUTOR_READY;
 	LWLockRelease(&entry->entry_lock.lock);
+	if (result != RESOURCE_X_EXECUTOR_BLOCKED)
+		ConditionVariableCancelSleep();
+	return result;
+}
+
+/* Complete the wait armed by an exact BLOCKED probe.  The GRD hash entries
+ * are never removed, so finding the same tag identifies the same wait_cv;
+ * the complete ref check prevents a successor acquisition from borrowing
+ * this backend's prepared sleep. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_executor_wait_exact(const ResourceXAcquisitionRef *ref,
+												long timeout_ms)
+{
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+
+	if (!pcm_resource_x_ref_valid(ref) || timeout_ms <= 0) {
+		ConditionVariableCancelSleep();
+		return RESOURCE_X_APPLY_INVALID;
+	}
+	entry = pcm_find_entry(ref->assertion.resource);
+	if (entry == NULL) {
+		ConditionVariableCancelSleep();
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	}
+
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	if (!pcm_resource_x_entry_exact(entry, ref))
+		result = RESOURCE_X_APPLY_STALE;
+	else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else
+		result = RESOURCE_X_APPLY_APPLIED;
+	LWLockRelease(&entry->entry_lock.lock);
+	if (result != RESOURCE_X_APPLY_APPLIED) {
+		ConditionVariableCancelSleep();
+		return result;
+	}
+
+	PG_TRY();
+	{
+		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
+									 WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	}
+	PG_CATCH();
+	{
+		ConditionVariableCancelSleep();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	ConditionVariableCancelSleep();
+	return RESOURCE_X_APPLY_APPLIED;
+}
+
+/* One existing requester/master driver calls this only after a real wait or
+ * scheduled tick.  Clearing the exact observation here (never in probe)
+ * makes that producer change visible and prevents an immediate BUSY loop. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_executor_rearm_exact(const ResourceXAcquisitionRef *ref)
+{
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+	bool broadcast = false;
+
+	if (!pcm_resource_x_ref_valid(ref))
+		return RESOURCE_X_APPLY_INVALID;
+	entry = pcm_find_entry(ref->assertion.resource);
+	if (entry == NULL)
+		return RESOURCE_X_APPLY_NOT_FOUND;
+
+	pcm_entry_lock_exclusive(entry);
+	if (!pcm_resource_x_entry_exact(entry, ref))
+		result = RESOURCE_X_APPLY_STALE;
+	else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_RECOVERY_BLOCKED) != 0)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if ((entry->resource_x_progress_flags & RESOURCE_X_PROGRESS_T3) != 0)
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	else if ((entry->resource_x_progress_flags
+			  & (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1))
+			 != (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1))
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (entry->resource_x_no_progress_generation == 0
+			 && entry->resource_x_no_progress_reason == RESOURCE_X_NO_PROGRESS_NONE)
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	else if (entry->resource_x_no_progress_generation != ref->acquisition_generation
+			 || entry->resource_x_no_progress_reason <= RESOURCE_X_NO_PROGRESS_NONE
+			 || entry->resource_x_no_progress_reason > RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (entry->resource_x_dispatch_phase == UINT32_MAX)
+	{
+		entry->resource_x_progress_flags |= RESOURCE_X_PROGRESS_RECOVERY_BLOCKED;
+		broadcast = true;
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	else
+	{
+		entry->resource_x_dispatch_phase++;
+		entry->resource_x_no_progress_generation = 0;
+		entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_NONE;
+		broadcast = true;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
 	return result;
 }
 

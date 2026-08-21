@@ -15181,6 +15181,8 @@ cluster_pcm_x_local_progress_exact(const PcmXLocalHandle *handle, PcmXLocalProgr
 	progress_out->master_session_incarnation = tag_slot->master_session_incarnation;
 	progress_out->master_node = tag_slot->master_node;
 	progress_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
+	progress_out->semantic_generation
+		= member_state == PCM_XL_GRANTED ? tag_slot->ref.grant_generation : 0;
 	result = PCM_X_QUEUE_OK;
 
 progress_done:

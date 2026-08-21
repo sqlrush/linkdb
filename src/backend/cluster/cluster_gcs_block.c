@@ -600,6 +600,9 @@ static bool gcs_block_pcm_x_authenticated_session(int32 node_id, uint64 expected
 static bool gcs_block_pcm_x_revalidate_peer_binding(int32 node_id, uint64 epoch, uint64 session);
 static bool gcs_block_pcm_x_source_capable(int32 node_id);
 static PcmXQueueResult gcs_block_pcm_x_fetch_own_result(ClusterPcmOwnResult result);
+static uint64 gcs_block_pcm_x_monotonic_us(void);
+static uint64 gcs_block_pcm_x_saturating_add_us(uint64 base, uint64 delta);
+static uint64 gcs_block_pcm_x_retry_timeout_us(void);
 static PcmXQueueResult
 gcs_block_pcm_x_fetch_reservation_mismatch(const ClusterPcmOwnSnapshot *live);
 static void gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page_lsn);
@@ -11585,6 +11588,263 @@ static PcmXQueueResult gcs_block_pcm_x_note_local_submission(
 static void gcs_block_pcm_x_raise_terminal_if_exact(const PcmXLocalHandle *leader);
 
 
+static ResourceXNoProgressReason
+gcs_block_pcm_x_resource_x_no_progress_reason(ResourceXBufferActivationResult result)
+{
+	switch (result) {
+		case RESOURCE_X_BUFFER_BUSY:
+			return RESOURCE_X_NO_PROGRESS_BUFFER_BUSY;
+		case RESOURCE_X_BUFFER_ABSENT:
+			return RESOURCE_X_NO_PROGRESS_BUFFER_ABSENT;
+		case RESOURCE_X_BUFFER_STALE:
+			return RESOURCE_X_NO_PROGRESS_BUFFER_STALE;
+		case RESOURCE_X_BUFFER_CORRUPT:
+			return RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT;
+		case RESOURCE_X_BUFFER_T2_INSTALLED:
+		case RESOURCE_X_BUFFER_ALREADY_INSTALLED:
+			return RESOURCE_X_NO_PROGRESS_NONE;
+	}
+	return RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT;
+}
+
+
+static PcmXQueueResult
+gcs_block_pcm_x_resource_x_buffer_result(ResourceXBufferActivationResult result)
+{
+	switch (result) {
+		case RESOURCE_X_BUFFER_T2_INSTALLED:
+		case RESOURCE_X_BUFFER_ALREADY_INSTALLED:
+			return PCM_X_QUEUE_OK;
+		case RESOURCE_X_BUFFER_BUSY:
+			return PCM_X_QUEUE_BUSY;
+		case RESOURCE_X_BUFFER_ABSENT:
+			return PCM_X_QUEUE_NOT_READY;
+		case RESOURCE_X_BUFFER_STALE:
+			return PCM_X_QUEUE_STALE;
+		case RESOURCE_X_BUFFER_CORRUPT:
+		default:
+			return PCM_X_QUEUE_CORRUPT;
+	}
+}
+
+
+static PcmXQueueResult
+gcs_block_pcm_x_resource_x_apply_result(ResourceXApplyResult result)
+{
+	switch (result) {
+		case RESOURCE_X_APPLY_APPLIED:
+		case RESOURCE_X_APPLY_DUPLICATE:
+			return PCM_X_QUEUE_OK;
+		case RESOURCE_X_APPLY_NOT_FOUND:
+			return PCM_X_QUEUE_NOT_READY;
+		case RESOURCE_X_APPLY_STALE:
+			return PCM_X_QUEUE_STALE;
+		case RESOURCE_X_APPLY_BAD_STATE:
+			return PCM_X_QUEUE_BAD_STATE;
+		case RESOURCE_X_APPLY_RECOVERY_BLOCKED:
+			return PCM_X_QUEUE_CORRUPT;
+		case RESOURCE_X_APPLY_INVALID:
+		default:
+			return PCM_X_QUEUE_INVALID;
+	}
+}
+
+
+/* A READY probe cancels its CV registration.  If the subsequent buffer try
+ * cannot progress, publish the exact observation and probe again: only that
+ * second BLOCKED classification arms the resource CV consumed by the caller's
+ * bounded sleep. */
+static PcmXQueueResult
+gcs_block_pcm_x_resource_x_publish_and_arm_wait(
+	const ResourceXAcquisitionRef *ref, ResourceXNoProgressReason reason,
+	PcmXQueueResult retry_result, bool *rearm_after_wait_out)
+{
+	ResourceXExecutorProbeResult probe_result;
+	ResourceXExecutorSnapshot snapshot;
+
+	cluster_pcm_lock_resource_x_publish_no_progress_exact(ref, reason);
+	if (retry_result != PCM_X_QUEUE_BUSY && retry_result != PCM_X_QUEUE_NOT_READY)
+		return retry_result;
+	probe_result = cluster_pcm_lock_resource_x_executor_probe_exact(ref, &snapshot);
+	if (probe_result == RESOURCE_X_EXECUTOR_COMPLETE)
+		return PCM_X_QUEUE_OK;
+	if (probe_result == RESOURCE_X_EXECUTOR_BLOCKED) {
+		*rearm_after_wait_out = true;
+		return retry_result;
+	}
+	return probe_result == RESOURCE_X_EXECUTOR_CHANGED ? PCM_X_QUEUE_STALE
+												: PCM_X_QUEUE_CORRUPT;
+}
+
+
+/* One nonblocking terminal attempt.  It owns no resource entry pointer and
+ * never overlaps an entry lock with mapping/header/content authority.  A
+ * retryable buffer observation is published before return; the foreground
+ * loop then performs a real wait and explicitly rearms that observation. */
+static PcmXQueueResult
+gcs_block_pcm_x_resource_x_terminal_try(const PcmXLocalProgress *progress,
+										const PcmXRuntimeSnapshot *request_runtime,
+										bool *rearm_after_wait_out)
+{
+	PGAlignedBlock page_bytes;
+	ResourceXAcquisitionRef ref;
+	ResourceXActivationGateToken gate;
+	ResourceXExecutorSnapshot snapshot;
+	ResourceXCurrentImage image;
+	ResourceXBufferInstallProof install_proof;
+	ResourceXBufferActivationProof activation_proof;
+	ResourceXBufferActivationResult buffer_result;
+	ResourceXApplyResult apply_result;
+	ResourceXExecutorProbeResult probe_result;
+	PcmXQueueResult result = PCM_X_QUEUE_INVALID;
+	ResourceXNoProgressReason no_progress_reason;
+	bool entered = false;
+
+	if (rearm_after_wait_out != NULL)
+		*rearm_after_wait_out = false;
+	if (progress == NULL || request_runtime == NULL || rearm_after_wait_out == NULL
+		|| progress->member_state != PCM_XL_GRANTED || progress->semantic_generation == 0
+		|| progress->semantic_generation == UINT64_MAX || request_runtime->gate_generation == 0
+		|| request_runtime->state != PCM_X_RUNTIME_ACTIVE
+		|| !resource_x_assertion_init(&progress->identity.tag, cluster_node_id, &ref.assertion))
+		return PCM_X_QUEUE_INVALID;
+	ref.formation = request_runtime->gate_generation;
+	ref.acquisition_generation = progress->semantic_generation;
+	memset(&gate, 0, sizeof(gate));
+	if (!cluster_pcm_lock_resource_x_executor_enter(&ref, &gate))
+		return PCM_X_QUEUE_NOT_READY;
+	entered = true;
+
+	PG_TRY();
+	{
+		do
+		{
+			apply_result = cluster_pcm_lock_resource_x_t1_grant_exact(&ref);
+			result = gcs_block_pcm_x_resource_x_apply_result(apply_result);
+			if (result != PCM_X_QUEUE_OK)
+				break;
+
+			probe_result = cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &snapshot);
+			if (probe_result == RESOURCE_X_EXECUTOR_COMPLETE)
+			{
+				result = PCM_X_QUEUE_OK;
+				break;
+			}
+			if (probe_result == RESOURCE_X_EXECUTOR_BLOCKED)
+			{
+				*rearm_after_wait_out = true;
+				result = PCM_X_QUEUE_BUSY;
+				break;
+			}
+			if (probe_result != RESOURCE_X_EXECUTOR_READY)
+			{
+				result = probe_result == RESOURCE_X_EXECUTOR_CHANGED
+					? PCM_X_QUEUE_STALE
+					: PCM_X_QUEUE_CORRUPT;
+				break;
+			}
+
+			buffer_result = cluster_bufmgr_pcm_own_capture_current_x_by_tag(
+				&ref, &progress->image, page_bytes.data, &image);
+			result = gcs_block_pcm_x_resource_x_buffer_result(buffer_result);
+			if (result != PCM_X_QUEUE_OK)
+			{
+				no_progress_reason = gcs_block_pcm_x_resource_x_no_progress_reason(buffer_result);
+				result = gcs_block_pcm_x_resource_x_publish_and_arm_wait(
+					&ref, no_progress_reason, result, rearm_after_wait_out);
+				break;
+			}
+
+			buffer_result = cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &install_proof);
+			result = gcs_block_pcm_x_resource_x_buffer_result(buffer_result);
+			if (result != PCM_X_QUEUE_OK)
+			{
+				no_progress_reason = gcs_block_pcm_x_resource_x_no_progress_reason(buffer_result);
+				result = gcs_block_pcm_x_resource_x_publish_and_arm_wait(
+					&ref, no_progress_reason, result, rearm_after_wait_out);
+				break;
+			}
+
+			apply_result = cluster_pcm_lock_resource_x_requester_apply_exact(&ref, &install_proof);
+			result = gcs_block_pcm_x_resource_x_apply_result(apply_result);
+			if (result != PCM_X_QUEUE_OK)
+			{
+				cluster_pcm_lock_resource_x_publish_no_progress_exact(
+					&ref, RESOURCE_X_NO_PROGRESS_BUFFER_STALE);
+				break;
+			}
+
+			buffer_result
+				= cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(&ref,
+					&activation_proof);
+			result = gcs_block_pcm_x_resource_x_buffer_result(buffer_result);
+			if (result != PCM_X_QUEUE_OK)
+			{
+				no_progress_reason = gcs_block_pcm_x_resource_x_no_progress_reason(buffer_result);
+				result = gcs_block_pcm_x_resource_x_publish_and_arm_wait(
+					&ref, no_progress_reason, result, rearm_after_wait_out);
+				break;
+			}
+
+			apply_result
+				= cluster_pcm_lock_resource_x_requester_activate_exact(&ref, &activation_proof);
+			result = gcs_block_pcm_x_resource_x_apply_result(apply_result);
+			if (result != PCM_X_QUEUE_OK)
+				cluster_pcm_lock_resource_x_publish_no_progress_exact(
+					&ref, RESOURCE_X_NO_PROGRESS_BUFFER_STALE);
+		} while (false);
+	}
+	PG_CATCH();
+	{
+		if (entered)
+			cluster_pcm_lock_resource_x_executor_leave(&gate);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	cluster_pcm_lock_resource_x_executor_leave(&gate);
+	return result;
+}
+
+
+/* Sleep only on the exact Resource-X CV armed by the immediately preceding
+ * BLOCKED probe.  The acquisition episode owns one absolute deadline; the
+ * existing requester backoff only selects bounded slices within it. */
+static PcmXQueueResult
+gcs_block_pcm_x_resource_x_wait_exact(const ResourceXAcquisitionRef *ref,
+									 uint32 *wait_index, uint64 episode_deadline_us)
+{
+	ResourceXApplyResult wait_result;
+	uint64 now_us;
+	uint64 remaining_us;
+	long timeout_ms;
+	long retry_ms;
+	uint32 current;
+
+	if (ref == NULL || wait_index == NULL || episode_deadline_us == 0) {
+		(void)cluster_pcm_lock_resource_x_executor_wait_exact(ref, 0);
+		return PCM_X_QUEUE_INVALID;
+	}
+	now_us = gcs_block_pcm_x_monotonic_us();
+	if (now_us >= episode_deadline_us) {
+		(void)cluster_pcm_lock_resource_x_executor_wait_exact(ref, 0);
+		return PCM_X_QUEUE_NOT_READY;
+	}
+	remaining_us = episode_deadline_us - now_us;
+	current = *wait_index;
+	retry_ms = cluster_pcm_x_holder_retry_delay_ms(current);
+	timeout_ms = (long)Min((uint64)retry_ms, (remaining_us + UINT64_C(999)) / UINT64_C(1000));
+	if (timeout_ms <= 0)
+		timeout_ms = 1;
+	wait_result = cluster_pcm_lock_resource_x_executor_wait_exact(ref, timeout_ms);
+	if (wait_result != RESOURCE_X_APPLY_APPLIED)
+		return gcs_block_pcm_x_resource_x_apply_result(wait_result);
+	*wait_index = cluster_gcs_pcm_x_requester_wait_index_advance(current);
+	CHECK_FOR_INTERRUPTS();
+	return PCM_X_QUEUE_OK;
+}
+
+
 /*
  * Drive one ordinary BM_VALID N/S/X -> X request through the node FIFO.
  *
@@ -11613,6 +11873,8 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 	GcsBlockPcmXRetryAction retry_action;
 	PcmXQueueResult arm_result = PCM_X_QUEUE_NOT_READY;
 	PcmXQueueResult result;
+	ResourceXApplyResult resource_x_apply_result;
+	ResourceXAcquisitionRef resource_x_ref;
 	TransactionId xid;
 	uint64 cluster_epoch;
 	uint64 committed_generation = 0;
@@ -11620,6 +11882,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 	uint64 master_session = 0;
 	uint64 request_id = 0;
 	uint64 reservation_token = 0;
+	uint64 resource_x_episode_deadline_us = 0;
 	uint64 wait_seq = 0;
 	uint32 wait_index = 0;
 	int32 master_node;
@@ -11629,6 +11892,7 @@ gcs_block_pcm_x_acquire_writer_impl(BufferDesc *buf, PcmXLocalWriterClaim *claim
 	bool reservation_started = false;
 	bool self_source = false;
 	bool wait_published = false;
+	bool resource_x_rearm_pending = false;
 
 	if (claim_out != NULL)
 		memset(claim_out, 0, sizeof(*claim_out));
@@ -12269,6 +12533,41 @@ requester_role_dispatch:
 				}
 			}
 		} else if (progress.member_state == PCM_XL_GRANTED) {
+			if (progress.semantic_generation == 0
+				|| progress.semantic_generation == UINT64_MAX
+				|| progress.identity.node_id != cluster_node_id
+				|| request_runtime.gate_generation == 0
+				|| !resource_x_assertion_init(&progress.identity.tag, progress.identity.node_id,
+					&resource_x_ref.assertion))
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+			resource_x_ref.formation = request_runtime.gate_generation;
+			resource_x_ref.acquisition_generation = progress.semantic_generation;
+			if (resource_x_episode_deadline_us == 0)
+				resource_x_episode_deadline_us = gcs_block_pcm_x_saturating_add_us(
+					gcs_block_pcm_x_monotonic_us(), gcs_block_pcm_x_retry_timeout_us());
+			if (resource_x_rearm_pending)
+			{
+				resource_x_apply_result
+					= cluster_pcm_lock_resource_x_executor_rearm_exact(&resource_x_ref);
+				if (resource_x_apply_result != RESOURCE_X_APPLY_APPLIED
+					&& resource_x_apply_result != RESOURCE_X_APPLY_DUPLICATE)
+					GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+				resource_x_rearm_pending = false;
+			}
+			result = gcs_block_pcm_x_resource_x_terminal_try(
+				&progress, &request_runtime, &resource_x_rearm_pending);
+			if (result != PCM_X_QUEUE_OK)
+			{
+				if ((result == PCM_X_QUEUE_BUSY || result == PCM_X_QUEUE_NOT_READY)
+					&& resource_x_rearm_pending) {
+					result = gcs_block_pcm_x_resource_x_wait_exact(
+						&resource_x_ref, &wait_index, resource_x_episode_deadline_us);
+					if (result == PCM_X_QUEUE_OK)
+						continue;
+				}
+				GCS_BLOCK_PCM_X_REQUESTER_FAIL_CLOSED();
+			}
+			claim_out->semantic_generation = progress.semantic_generation;
 			if (progress.pending_opcode == PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM) {
 				PcmXPhasePayload final_confirm;
 
@@ -12550,6 +12849,7 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 	PcmXRuntimeSnapshot runtime;
 	PcmXRuntimeSnapshot runtime_after;
 	PcmXQueueResult result;
+	ResourceXApplyResult gate_result;
 	uint64 epoch_after;
 	uint64 epoch_before;
 	uint64 self_session_after;
@@ -12559,6 +12859,11 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 
 	runtime = cluster_pcm_x_runtime_snapshot();
 	if (runtime.state == PCM_X_RUNTIME_ACTIVE) {
+		gate_result
+			= cluster_pcm_lock_resource_x_gate_bind_formation_exact(runtime.gate_generation);
+		if (gate_result != RESOURCE_X_APPLY_APPLIED
+			&& gate_result != RESOURCE_X_APPLY_DUPLICATE)
+			goto fail_closed;
 		/*
 		 * Do not compare a half-old/half-new membership view with the bound
 		 * runtime.  Both complete samples must first agree; any transient read,
@@ -12655,7 +12960,16 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 	 * peer restart changes its session incarnation and permanently closes the
 	 * steady-state core), so formation-wide V2 coverage is sampled once. */
 	cluster_pcm_x_runtime_set_rebase_wire_active(rebase_all);
-	(void)cluster_pcm_x_runtime_activate_bound(self_session_before, bindings_before);
+	result = cluster_pcm_x_runtime_activate_bound(self_session_before, bindings_before);
+	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
+	{
+		runtime_after = cluster_pcm_x_runtime_snapshot();
+		gate_result = cluster_pcm_lock_resource_x_gate_bind_formation_exact(
+			runtime_after.gate_generation);
+		if (gate_result != RESOURCE_X_APPLY_APPLIED
+			&& gate_result != RESOURCE_X_APPLY_DUPLICATE)
+			goto fail_closed;
+	}
 	return;
 
 fail_closed:

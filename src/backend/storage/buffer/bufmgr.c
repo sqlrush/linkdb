@@ -446,6 +446,121 @@ cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf)
 	return permitted;
 }
 
+/* Copy the already-installed immutable carrier for the target executor.  This
+ * is a typed read-only fence owner: it accepts the closed writer token, never
+ * changes page/ownership bytes, and returns BUSY instead of waiting behind a
+ * content owner.  The later T2 call revalidates the same carrier from private
+ * storage before it mutates the Resource-X sidecar. */
+ResourceXBufferActivationResult
+cluster_bufmgr_pcm_own_capture_current_x_by_tag(
+	const ResourceXAcquisitionRef *ref, const PcmXImageToken *expected_image,
+	char *page_bytes, ResourceXCurrentImage *out_image)
+{
+	BufferDesc *buf;
+	BufferTag lookup_tag;
+	ClusterPcmOwnSnapshot expected;
+	ClusterPcmOwnSnapshot live;
+	LWLock *content_lock;
+	LWLock *partition_lock;
+	Page page;
+	uint32 hashcode;
+	uint32 buf_state;
+	uint32 checksum;
+	int buf_id;
+	ResourceXBufferActivationResult result = RESOURCE_X_BUFFER_STALE;
+
+	if (page_bytes != NULL)
+		memset(page_bytes, 0, BLCKSZ);
+	if (out_image != NULL)
+		memset(out_image, 0, sizeof(*out_image));
+	if (ref == NULL || expected_image == NULL || page_bytes == NULL || out_image == NULL
+		|| ref->formation == 0 || ref->acquisition_generation == 0
+		|| expected_image->image_id == 0
+		|| expected_image->source_node >= PCM_X_PROTOCOL_NODE_LIMIT)
+		return RESOURCE_X_BUFFER_CORRUPT;
+	if (ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_BUFFER_ABSENT;
+
+	lookup_tag = ref->assertion.resource;
+	hashcode = BufTableHashCode(&lookup_tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&lookup_tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return RESOURCE_X_BUFFER_ABSENT;
+	}
+
+	buf = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &expected);
+	if (!BufferTagsEqual(&buf->tag, &lookup_tag) || (buf_state & BM_VALID) == 0)
+		result = RESOURCE_X_BUFFER_ABSENT;
+	else if (!cluster_pcm_x_resource_x_t2_snapshot_exact(ref, &expected))
+		result = expected.flags != 0 ? RESOURCE_X_BUFFER_BUSY : RESOURCE_X_BUFFER_STALE;
+	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
+			 || (buf_state & BM_IO_ERROR) != 0)
+		result = RESOURCE_X_BUFFER_CORRUPT;
+	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
+		result = RESOURCE_X_BUFFER_BUSY;
+	else
+	{
+		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+		buf_state = 0;
+	}
+	if (buf_state != 0)
+		UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+	if (buf_state != 0)
+		return result;
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	if (!LWLockConditionalAcquire(content_lock, LW_SHARED))
+	{
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return RESOURCE_X_BUFFER_BUSY;
+	}
+
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	page = (Page) BufHdrGetBlock(buf);
+	if (!cluster_pcm_own_snapshot_matches_locked(buf, &expected)
+		|| live.writer_activation_token != expected.writer_activation_token
+		|| live.generation != expected.generation
+		|| live.reservation_token != expected.reservation_token
+		|| !cluster_pcm_x_resource_x_t2_snapshot_exact(ref, &live)
+		|| (buf_state & BM_VALID) == 0)
+		result = RESOURCE_X_BUFFER_STALE;
+	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
+			 || (buf_state & BM_IO_ERROR) != 0)
+		result = RESOURCE_X_BUFFER_CORRUPT;
+	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
+		result = RESOURCE_X_BUFFER_BUSY;
+	else
+	{
+		checksum = cluster_gcs_block_compute_checksum((const char *)page);
+		if (PageGetLSN(page) != (XLogRecPtr)expected_image->page_lsn
+			|| (uint64)((PageHeader)page)->pd_block_scn != expected_image->page_scn
+			|| checksum != expected_image->page_checksum)
+			result = RESOURCE_X_BUFFER_CORRUPT;
+		else
+		{
+			memcpy(page_bytes, page, BLCKSZ);
+			out_image->page_bytes = page_bytes;
+			out_image->page_lsn = PageGetLSN(page);
+			out_image->page_scn = ((PageHeader)page)->pd_block_scn;
+			out_image->page_checksum = checksum;
+			out_image->image_length = BLCKSZ;
+			result = RESOURCE_X_BUFFER_ALREADY_INSTALLED;
+		}
+	}
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(content_lock);
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return result;
+}
+
 /*
  * Install the exact current image for one admitted Resource-X acquisition.
  *

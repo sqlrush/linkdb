@@ -628,6 +628,9 @@ typedef struct PcmXLocalWriterClaim {
 	/* A' rebase: the requester copies the published effective grant base here
 	 * (0 = no drift) so the bufmgr grant-snapshot cross-check stays exact. */
 	uint64 grant_base_own_generation;
+	/* Nonzero only after the target Resource-X executor completed same-
+	 * generation T3; process local and never a ticket/session identity. */
+	uint64 semantic_generation;
 } PcmXLocalWriterClaim;
 
 /*
@@ -653,9 +656,12 @@ typedef struct PcmXLocalProgress {
 	uint32 reserved;
 	/* A' rebase: the tag's published effective grant base (0 = no drift). */
 	uint64 grant_base_own_generation;
+	/* Process-local Resource-X carrier: zero before authenticated local grant
+	 * terminal, then the logical grant generation (never ticket/session id). */
+	uint64 semantic_generation;
 } PcmXLocalProgress;
 
-StaticAssertDecl(sizeof(PcmXLocalProgress) == 248, "PCM-X local progress ABI");
+StaticAssertDecl(sizeof(PcmXLocalProgress) == 256, "PCM-X local progress ABI");
 
 /* Read-only process-local view of the independent holder transfer lane. */
 typedef struct PcmXLocalHolderProgress {
@@ -841,7 +847,7 @@ StaticAssertDecl(sizeof(PcmXLocalFollowerWfgSnapshot) == 248,
 				 "PCM-X local follower WFG snapshot process-local ABI");
 StaticAssertDecl(offsetof(PcmXLocalFollowerWfgSnapshot, waiter_graph_generation) == 192,
 				 "PCM-X local follower sampled graph offset");
-StaticAssertDecl(sizeof(PcmXLocalWriterClaim) == 152, "PCM-X local writer claim process-local ABI");
+StaticAssertDecl(sizeof(PcmXLocalWriterClaim) == 160, "PCM-X local writer claim process-local ABI");
 StaticAssertDecl(offsetof(PcmXLocalWriterClaim, claim_generation) == 128,
 				 "PCM-X local writer claim generation offset");
 StaticAssertDecl(sizeof(PcmXLocalCutoff) == 48, "PCM-X local cutoff process-local ABI");
