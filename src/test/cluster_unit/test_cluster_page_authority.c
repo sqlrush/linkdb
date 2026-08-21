@@ -52,9 +52,11 @@ static char formation_object;
 static char needs_object;
 static char admissions_object;
 static char pin_object;
-static char stable_proof_objects[2];
-static RfPagePinnedSourceV1 source_objects[2];
-static RfContributorVectorV1 vector_objects[2];
+#define TEST_AUTHORITY_TARGETS 40
+
+static char stable_proof_objects[TEST_AUTHORITY_TARGETS];
+static RfPagePinnedSourceV1 source_objects[TEST_AUTHORITY_TARGETS];
+static RfContributorVectorV1 vector_objects[TEST_AUTHORITY_TARGETS];
 static ClusterControlRootReadToken root_tokens[1];
 static ClusterRecoveryDutyKey duty_objects[1];
 static bool fence_need_current;
@@ -85,19 +87,21 @@ rf_page_stable_base_proof_matches_v1(
 	const RfContributorVectorV1 *contributors,
 	uint32 participant_count)
 {
-	int index;
+	int index = -1;
+	int i;
 
 	if (!stable_proof_current || duties != DUTIES || roots != ROOT_TOKENS ||
 		formation != FORMATION || needs != NEEDS ||
 		fence_admissions != ADMISSIONS || pin != PIN ||
 		participant_count != 1)
 		return false;
-	if (proof == (const RfPageStableBaseProofV1 *) &stable_proof_objects[0])
-		index = 0;
-	else if (proof ==
-			 (const RfPageStableBaseProofV1 *) &stable_proof_objects[1])
-		index = 1;
-	else
+	for (i = 0; i < TEST_AUTHORITY_TARGETS; i++)
+		if (proof == (const RfPageStableBaseProofV1 *) &stable_proof_objects[i])
+		{
+			index = i;
+			break;
+		}
+	if (index < 0)
 		return false;
 	if (contributors != &vector_objects[index])
 		return false;
@@ -251,6 +255,38 @@ UT_TEST(test_exact_owner_set_promotes_and_revalidates)
 	rf_page_authority_guard_release_v1(&guard);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 	UT_ASSERT(guard == NULL && preflight == NULL);
+}
+
+UT_TEST(test_batch_target_set_is_not_limited_by_record_components)
+{
+	RfPageAuthorityBatchRequestV1 request;
+	RfPageAuthorityTargetV1 targets[TEST_AUTHORITY_TARGETS];
+	ClusterRecoverySerialGuard serial;
+	RfPageAuthorityPreflightV1 *preflight = NULL;
+	RfPageAuthorityGuardV1 *guard = NULL;
+	uint32		i;
+
+	init_case(&request, targets, &serial);
+	for (i = 2; i < TEST_AUTHORITY_TARGETS; i++)
+	{
+		targets[i].page_identity = identity(i + 1);
+		memset(targets[i].expected_result.segment_incarnation, 7, 16);
+		targets[i].expected_result.mutation_token = i + 101;
+		targets[i].stable_base =
+			(const RfPageStableBaseProofV1 *) &stable_proof_objects[i];
+		targets[i].source = &source_objects[i];
+		targets[i].contributors = &vector_objects[i];
+	}
+	request.target_count = TEST_AUTHORITY_TARGETS;
+	rf_page_guard_shmem_init_v1();
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
+		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
+		preflight, &serial, &guard), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_revalidate_nowait_v1(
+		guard, &serial), RF_PAGE_AUTHORITY_OK);
+	rf_page_authority_guard_release_v1(&guard);
+	rf_page_authority_preflight_destroy_v1(&preflight);
 }
 
 UT_TEST(test_missing_live_stop04_object_is_invalid)
@@ -481,8 +517,9 @@ UT_TEST(test_install_adapter_runs_promote_publish_release)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_exact_owner_set_promotes_and_revalidates);
+	UT_RUN(test_batch_target_set_is_not_limited_by_record_components);
 	UT_RUN(test_missing_live_stop04_object_is_invalid);
 	UT_RUN(test_serial_pointer_identity_mismatch_is_fence_stale);
 	UT_RUN(test_fence_stale_blocks_before_page_promote);

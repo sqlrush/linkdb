@@ -49,13 +49,15 @@ main(void)
 
 #else
 
+#define TEST_INSTALL_BATCH_TARGETS 40
+
 typedef struct InstallFixture
 {
-	PGAlignedBlock disk[RF_PAGE_STABLE_MAX_COMPONENTS];
-	bool		exists[RF_PAGE_STABLE_MAX_COMPONENTS];
-	bool		read_ok[RF_PAGE_STABLE_MAX_COMPONENTS];
-	bool		write_ok[RF_PAGE_STABLE_MAX_COMPONENTS];
-	bool		sync_ok[RF_PAGE_STABLE_MAX_COMPONENTS];
+	PGAlignedBlock disk[TEST_INSTALL_BATCH_TARGETS];
+	bool		exists[TEST_INSTALL_BATCH_TARGETS];
+	bool		read_ok[TEST_INSTALL_BATCH_TARGETS];
+	bool		write_ok[TEST_INSTALL_BATCH_TARGETS];
+	bool		sync_ok[TEST_INSTALL_BATCH_TARGETS];
 	bool		identity_ok;
 	bool		promote_ok;
 	bool		publish_ok;
@@ -81,10 +83,10 @@ typedef struct InstallFixture
 typedef struct InstallCase
 {
 	InstallFixture fixture;
-	RfPageStorageInstallComponentV1 components[RF_PAGE_STABLE_MAX_COMPONENTS];
-	PGAlignedBlock canonical[RF_PAGE_STABLE_MAX_COMPONENTS];
-	PGAlignedBlock prepared[RF_PAGE_STABLE_MAX_COMPONENTS];
-	PGAlignedBlock io[RF_PAGE_STABLE_MAX_COMPONENTS];
+	RfPageStorageInstallComponentV1 components[TEST_INSTALL_BATCH_TARGETS];
+	PGAlignedBlock canonical[TEST_INSTALL_BATCH_TARGETS];
+	PGAlignedBlock prepared[TEST_INSTALL_BATCH_TARGETS];
+	PGAlignedBlock io[TEST_INSTALL_BATCH_TARGETS];
 	RfPageInstallStorageOpsV1 storage;
 	RfPageInstallAuthorityOpsV1 authority;
 	RfPageStorageInstallRequestV1 request;
@@ -262,7 +264,7 @@ init_case(InstallCase *test_case, uint32 count)
 	test_case->fixture.publish_ok = true;
 	test_case->fixture.release_ok = true;
 	test_case->fixture.initial_read_count = count;
-	for (i = 0; i < RF_PAGE_STABLE_MAX_COMPONENTS; i++)
+	for (i = 0; i < TEST_INSTALL_BATCH_TARGETS; i++)
 	{
 		test_case->fixture.read_ok[i] = true;
 		test_case->fixture.write_ok[i] = true;
@@ -463,16 +465,16 @@ UT_TEST(test_checksum_modes_canonicalize_exactly)
 	UT_ASSERT_EQ(((PageHeader) test_case.fixture.disk[0].data)->pd_checksum, 0);
 }
 
-UT_TEST(test_all_33_reads_precede_first_write)
+UT_TEST(test_whole_batch_reads_precede_first_write)
 {
 	InstallCase test_case;
 	RfPageStorageInstallProofV1 proof;
 
-	init_case(&test_case, RF_PAGE_STABLE_MAX_COMPONENTS);
+	init_case(&test_case, TEST_INSTALL_BATCH_TARGETS);
 	UT_ASSERT_EQ(rf_page_storage_install_execute_v1(&test_case.request, &proof),
 		RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(test_case.fixture.write_calls,
-		RF_PAGE_STABLE_MAX_COMPONENTS);
+		TEST_INSTALL_BATCH_TARGETS);
 	UT_ASSERT(test_case.fixture.first_initial_read_step >
 		test_case.fixture.promote_step);
 	UT_ASSERT(test_case.fixture.first_write_step >
@@ -526,7 +528,7 @@ main(void)
 	UT_RUN(test_postread_zero_page_fails_and_releases_without_publish);
 	UT_RUN(test_sync_failure_releases_without_proof);
 	UT_RUN(test_checksum_modes_canonicalize_exactly);
-	UT_RUN(test_all_33_reads_precede_first_write);
+	UT_RUN(test_whole_batch_reads_precede_first_write);
 	UT_RUN(test_promote_failure_performs_no_target_io);
 	UT_RUN(test_reserved_and_nonordinary_fork_are_rejected);
 	UT_DONE();

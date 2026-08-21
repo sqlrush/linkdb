@@ -35,8 +35,8 @@ struct RfPageAuthorityGuardV1
 	struct RfPageAuthorityPreflightV1 *preflight;
 	ClusterRecoverySerialGuard *serial_guard;
 	uint32		guard_count;
-	uint8		target_guard_index[RF_PAGE_STABLE_MAX_COMPONENTS];
-	RfPageGuardV1 page_guards[RF_PAGE_STABLE_MAX_COMPONENTS];
+	uint8	   *target_guard_index;
+	RfPageGuardV1 page_guards[RF_PAGE_GUARD_PARTITIONS];
 };
 
 struct RfPageAuthorityPreflightV1
@@ -52,10 +52,25 @@ struct RfPageAuthorityPreflightV1
 	const ClusterRecoveryDutyKey *duties;
 	const ClusterControlRootReadToken *root_tokens;
 	uint32		participant_count;
-	RfPageAuthorityTargetV1 targets[RF_PAGE_STABLE_MAX_COMPONENTS];
-	RfPageGuardPreflightV1 page_preflights[RF_PAGE_STABLE_MAX_COMPONENTS];
+	RfPageAuthorityTargetV1 *targets;
+	RfPageGuardPreflightV1 *page_preflights;
+	uint8	   *target_guard_index;
 	RfPageAuthorityGuardV1 guard_storage;
 };
+
+static void
+authority_preflight_free(RfPageAuthorityPreflightV1 *preflight)
+{
+	if (preflight == NULL)
+		return;
+	if (preflight->target_guard_index != NULL)
+		authority_free(preflight->target_guard_index);
+	if (preflight->page_preflights != NULL)
+		authority_free(preflight->page_preflights);
+	if (preflight->targets != NULL)
+		authority_free(preflight->targets);
+	authority_free(preflight);
+}
 
 static bool
 bytes_nonzero(const uint8 *bytes, Size length)
@@ -205,7 +220,7 @@ rf_page_authority_batch_preflight_wait_v1(
 	*out_preflight = NULL;
 	if (request == NULL || request->targets == NULL ||
 		request->target_count == 0 ||
-		request->target_count > RF_PAGE_STABLE_MAX_COMPONENTS ||
+		request->target_count > RF_PAGE_STABLE_MAX_EDGES ||
 		request->formation == NULL || request->fence_need_set == NULL ||
 		request->fence_admission_set == NULL ||
 		request->retention_pin == NULL || request->duties == NULL ||
@@ -237,6 +252,19 @@ rf_page_authority_batch_preflight_wait_v1(
 		authority_alloc0(sizeof(*preflight));
 	if (preflight == NULL)
 		return RF_PAGE_AUTHORITY_OOM;
+	preflight->targets = (RfPageAuthorityTargetV1 *) authority_alloc0(
+		(Size) request->target_count * sizeof(*preflight->targets));
+	preflight->page_preflights = (RfPageGuardPreflightV1 *)
+		authority_alloc0((Size) request->target_count *
+			sizeof(*preflight->page_preflights));
+	preflight->target_guard_index = (uint8 *)
+		authority_alloc0((Size) request->target_count);
+	if (preflight->targets == NULL || preflight->page_preflights == NULL ||
+		preflight->target_guard_index == NULL)
+	{
+		authority_preflight_free(preflight);
+		return RF_PAGE_AUTHORITY_OOM;
+	}
 	preflight->magic = RF_PAGE_AUTHORITY_PREFLIGHT_MAGIC;
 	preflight->state = RF_PAGE_AUTHORITY_STATE_PREFLIGHTED;
 	preflight->target_count = request->target_count;
@@ -253,18 +281,18 @@ rf_page_authority_batch_preflight_wait_v1(
 		if (!rf_page_guard_preflight_v1(&request->targets[i].page_identity,
 				&preflight->page_preflights[i]))
 		{
-			authority_free(preflight);
+			authority_preflight_free(preflight);
 			return RF_PAGE_AUTHORITY_INTERNAL;
 		}
 	}
 	if (!fence_current(preflight))
 	{
-		authority_free(preflight);
+		authority_preflight_free(preflight);
 		return RF_PAGE_AUTHORITY_FENCE_STALE;
 	}
 	if (!stable_proofs_current(preflight))
 	{
-		authority_free(preflight);
+		authority_preflight_free(preflight);
 		return RF_PAGE_AUTHORITY_NO_STABLE_BASE;
 	}
 	*out_preflight = preflight;
@@ -289,6 +317,7 @@ rf_page_authority_batch_promote_nowait_v1(
 {
 	RfPageAuthorityGuardV1 *guard;
 	RfPageAuthorityVerdictV1 verdict;
+	int16		partition_guard_index[RF_PAGE_GUARD_PARTITIONS];
 	uint32		i;
 
 	if (out_guard == NULL)
@@ -306,17 +335,16 @@ rf_page_authority_batch_promote_nowait_v1(
 	guard->magic = RF_PAGE_AUTHORITY_GUARD_MAGIC;
 	guard->preflight = preflight;
 	guard->serial_guard = serial_guard;
+	guard->target_guard_index = preflight->target_guard_index;
+	memset(partition_guard_index, -1, sizeof(partition_guard_index));
 	for (i = 0; i < preflight->target_count; i++)
 	{
-		uint32		j;
+		uint32		partition = preflight->page_preflights[i].partition;
+		int16		guard_index = partition_guard_index[partition];
 
-		for (j = 0; j < i; j++)
-			if (preflight->page_preflights[j].partition ==
-				preflight->page_preflights[i].partition)
-				break;
-		if (j < i)
+		if (guard_index >= 0)
 		{
-			guard->target_guard_index[i] = guard->target_guard_index[j];
+			guard->target_guard_index[i] = (uint8) guard_index;
 			continue;
 		}
 		if (!rf_page_guard_promote_nowait_v1(
@@ -328,6 +356,7 @@ rf_page_authority_batch_promote_nowait_v1(
 			return RF_PAGE_AUTHORITY_WOULD_BLOCK;
 		}
 		guard->target_guard_index[i] = (uint8) guard->guard_count;
+		partition_guard_index[partition] = (int16) guard->guard_count;
 		guard->guard_count++;
 	}
 	verdict = owners_current(preflight, serial_guard);
@@ -421,7 +450,7 @@ rf_page_authority_preflight_destroy_v1(
 		preflight->state == RF_PAGE_AUTHORITY_STATE_PROMOTED)
 		return;
 	preflight->magic = 0;
-	authority_free(preflight);
+	authority_preflight_free(preflight);
 	*preflight_pointer = NULL;
 }
 

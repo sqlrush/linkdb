@@ -10,6 +10,14 @@
 #include "cluster/cluster_page_install.h"
 #include "storage/bufpage.h"
 
+#ifdef USE_CLUSTER_UNIT
+#define page_install_alloc0(size_) calloc(1, (size_))
+#define page_install_free(pointer_) free((pointer_))
+#else
+#define page_install_alloc0(size_) palloc0(size_)
+#define page_install_free(pointer_) pfree(pointer_)
+#endif
+
 #ifndef USE_CLUSTER_UNIT
 #include "access/xlog.h"
 #include "storage/checksum.h"
@@ -128,15 +136,16 @@ rf_page_storage_install_execute_v1(
 	const RfPageInstallStorageOpsV1 *storage;
 	const RfPageInstallAuthorityOpsV1 *authority;
 	RfPageStorageInstallProofV1 completed;
-	bool		write_required[RF_PAGE_STABLE_MAX_COMPONENTS];
-	bool		extend_required[RF_PAGE_STABLE_MAX_COMPONENTS];
+	bool	   *write_required;
+	bool	   *extend_required;
+	RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
 	uint32		i;
 
 	if (request == NULL || proof == NULL || request->components == NULL ||
 		request->storage == NULL || request->authority == NULL ||
 		request->prepared_pages == NULL || request->io_pages == NULL ||
 		request->component_count == 0 ||
-		request->component_count > RF_PAGE_STABLE_MAX_COMPONENTS ||
+		request->component_count > RF_PAGE_STABLE_MAX_EDGES ||
 		request->prepared_capacity <
 		(Size) request->component_count * BLCKSZ ||
 		request->io_capacity < (Size) request->component_count * BLCKSZ)
@@ -150,8 +159,18 @@ rf_page_storage_install_execute_v1(
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	if (!request->global_preflight_ok)
 		return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
-	memset(write_required, 0, sizeof(write_required));
-	memset(extend_required, 0, sizeof(extend_required));
+	write_required = (bool *) page_install_alloc0(
+		(Size) request->component_count * sizeof(*write_required));
+	extend_required = (bool *) page_install_alloc0(
+		(Size) request->component_count * sizeof(*extend_required));
+	if (write_required == NULL || extend_required == NULL)
+	{
+		if (extend_required != NULL)
+			page_install_free(extend_required);
+		if (write_required != NULL)
+			page_install_free(write_required);
+		return RF_PAGE_PROOF_DETAIL_OOM;
+	}
 
 	for (i = 0; i < request->component_count; i++)
 	{
@@ -163,9 +182,15 @@ rf_page_storage_install_execute_v1(
 			!authority->validate_identity(authority->arg,
 				&component->page_identity,
 				component->expected_result.segment_incarnation))
-			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		{
+			detail = RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+			goto done;
+		}
 		if (!canonicalize_page(storage, component, prepared))
-			return RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED;
+		{
+			detail = RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED;
+			goto done;
+		}
 	}
 
 	/*
@@ -174,7 +199,10 @@ rf_page_storage_install_execute_v1(
 	 * but do not touch storage until promotion succeeds.
 	 */
 	if (!authority->promote(authority->arg))
-		return RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+	{
+		detail = RF_PAGE_PROOF_DETAIL_WOULD_BLOCK;
+		goto done;
+	}
 
 	for (i = 0; i < request->component_count; i++)
 	{
@@ -188,13 +216,19 @@ rf_page_storage_install_execute_v1(
 
 		if (!storage->read(storage->arg, i, &component->page_identity,
 				target, &exists))
-			return release_after_failure(authority,
+		{
+			detail = release_after_failure(authority,
 				RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+			goto done;
+		}
 		if (!exists)
 		{
 			if (component->before_kind != RF_PAGE_STATE_ABSENT)
-				return release_after_failure(authority,
+			{
+				detail = release_after_failure(authority,
 					RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
+				goto done;
+			}
 			write_required[i] = true;
 			extend_required[i] = true;
 			continue;
@@ -211,8 +245,11 @@ rf_page_storage_install_execute_v1(
 		if (token == component->expected_result.mutation_token)
 		{
 			if (memcmp(target, prepared, BLCKSZ) != 0)
-				return release_after_failure(authority,
+			{
+				detail = release_after_failure(authority,
 					RF_PAGE_PROOF_DETAIL_IMAGE_INTEGRITY_FAILED);
+				goto done;
+			}
 			continue;
 		}
 		if (component->before_kind == RF_PAGE_STATE_PRESENT &&
@@ -227,8 +264,9 @@ rf_page_storage_install_execute_v1(
 			write_required[i] = true;
 			continue;
 		}
-		return release_after_failure(authority,
+		detail = release_after_failure(authority,
 			RF_PAGE_PROOF_DETAIL_VERSION_MISMATCH);
+		goto done;
 	}
 
 	memset(&completed, 0, sizeof(completed));
@@ -245,16 +283,22 @@ rf_page_storage_install_execute_v1(
 				&request->components[i].page_identity,
 				request->prepared_pages + (Size) i * BLCKSZ,
 				extend_required[i]))
-			return release_after_failure(authority,
+		{
+			detail = release_after_failure(authority,
 				RF_PAGE_PROOF_DETAIL_INTERNAL);
+			goto done;
+		}
 		completed.write_count++;
 	}
 	for (i = 0; i < request->component_count; i++)
 	{
 		if (!storage->sync(storage->arg, i,
 				&request->components[i].page_identity))
-			return release_after_failure(authority,
+		{
+			detail = release_after_failure(authority,
 				RF_PAGE_PROOF_DETAIL_POSTREAD_FAILED);
+			goto done;
+		}
 	}
 	completed.durability_complete = true;
 
@@ -278,19 +322,33 @@ rf_page_storage_install_execute_v1(
 				&component->page_identity,
 				component->expected_result.segment_incarnation) ||
 			memcmp(postread, prepared, BLCKSZ) != 0)
-			return release_after_failure(authority,
+		{
+			detail = release_after_failure(authority,
 				RF_PAGE_PROOF_DETAIL_POSTREAD_FAILED);
+			goto done;
+		}
 	}
 	completed.postread_complete = true;
 	if (!authority->publish(authority->arg))
-		return release_after_failure(authority,
+	{
+		detail = release_after_failure(authority,
 			RF_PAGE_PROOF_DETAIL_INTERNAL);
+		goto done;
+	}
 	completed.proof_published = true;
 	if (!authority->release(authority->arg))
-		return RF_PAGE_PROOF_DETAIL_ORDER_VIOLATION;
+	{
+		detail = RF_PAGE_PROOF_DETAIL_ORDER_VIOLATION;
+		goto done;
+	}
 	completed.authority_released = true;
 	*proof = completed;
-	return RF_PAGE_PROOF_DETAIL_OK;
+	detail = RF_PAGE_PROOF_DETAIL_OK;
+
+done:
+	page_install_free(extend_required);
+	page_install_free(write_required);
+	return detail;
 }
 
 #ifndef USE_CLUSTER_UNIT
@@ -298,8 +356,8 @@ rf_page_storage_install_execute_v1(
 struct RfPageSmgrPreopenV1
 {
 	const RfPageStorageInstallRequestV1 *request;
-	SMgrRelation relations[RF_PAGE_STABLE_MAX_COMPONENTS];
-	bool		opened[RF_PAGE_STABLE_MAX_COMPONENTS];
+	SMgrRelation *relations;
+	bool	   *opened;
 };
 
 typedef struct RfPageSmgrAuthorityContextV1
@@ -455,11 +513,15 @@ rf_page_storage_smgr_preopen_v1(
 	*out_preopen = NULL;
 	if (request == NULL || request->components == NULL ||
 		request->component_count == 0 ||
-		request->component_count > RF_PAGE_STABLE_MAX_COMPONENTS ||
+		request->component_count > RF_PAGE_STABLE_MAX_EDGES ||
 		request->storage != NULL)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	context = palloc0(sizeof(*context));
 	context->request = request;
+	context->relations = palloc0((Size) request->component_count *
+		sizeof(*context->relations));
+	context->opened = palloc0((Size) request->component_count *
+		sizeof(*context->opened));
 	for (i = 0; i < request->component_count; i++)
 	{
 		context->relations[i] = smgropen(
@@ -476,6 +538,8 @@ rf_page_storage_smgr_preopen_destroy_v1(RfPageSmgrPreopenV1 **preopen)
 {
 	if (preopen == NULL || *preopen == NULL)
 		return;
+	pfree((*preopen)->opened);
+	pfree((*preopen)->relations);
 	pfree(*preopen);
 	*preopen = NULL;
 }
@@ -494,7 +558,7 @@ rf_page_storage_install_smgr_preopened_v1(
 
 	if (request == NULL || request->components == NULL ||
 		request->component_count == 0 ||
-		request->component_count > RF_PAGE_STABLE_MAX_COMPONENTS ||
+		request->component_count > RF_PAGE_STABLE_MAX_EDGES ||
 		preopen == NULL || preopen->request != request ||
 		request->storage != NULL ||
 		request->authority == NULL ||
