@@ -7,25 +7,17 @@
  *	  driver.  This layer assembles a COMPLETE online recovery of one dead thread
  *	  and is the corruption-critical core of the feature:
  *
- *	    1. visibility pass -- the driver now runs the COMBINED engine
- *	       (cluster_thread_recovery_drive with a visibility ctx): each foreign
- *	       XACT/CLOG/MULTIXACT/COMMIT_TS record's commit/abort OUTCOME is diverted
- *	       to the per-origin store, so the survivor can judge the dead thread's
- *	       transactions.  Without it, recovered pages would be served with an
- *	       unknown commit state -> false-visible (8.A).
- *	    2. R14 -- the visibility apply writes the per-origin store from this
- *	       bgworker; the drive brackets it in an episode-fenced online-writer
- *	       scope so the historically startup-only writer assert admits it.
+ *	    1. immutable planning -- decode the exact ROOT-owned WAL cut without
+ *	       mutation and seal one PAGE+SIDE recovery fabric.
+ *	    2. protected apply -- preflight every PAGE and SIDE target before the
+ *	       first mutation, then durably install/post-read PAGE before SIDE apply.
  *	    3. R13 -- the drive demotes a catchable ERROR (an online unmaterializable
  *	       record, or a barrier / publish I/O failure) to a result-returning
  *	       BLOCKED; the survivor keeps running (keep_frozen) unless the operator
  *	       set cluster.thread_recovery_on_unrecoverable=panic.
- *	    4. durability barrier (amend 2) -- on DONE, smgrimmedsync every touched
- *	       relation (cluster_fs write-back is not fsync'd and is invisible to the
- *	       survivor's checkpointer) and flush the per-origin outcome store BEFORE
- *	       publishing any authority, or a published "recovered" authority could
- *	       outlive un-fsync'd pages.
- *	    5. reader authority (Q4) -- only after a full DONE + durable barrier:
+ *	    4. durability barrier -- PAGE immediate-sync/post-read and SIDE durable
+ *	       post-read complete inside the protected fabric apply, before authority.
+ *	    5. reader authority (Q4) -- only after a full durable fabric apply:
  *	       publish the node-local merged.authority reader/serving gate LAST.
  *	       partial-apply (v0.3 P2): any failure before that LAST write
  *	       publishes no serving authority, so the thread stays frozen and never
@@ -77,9 +69,9 @@
 #include "cluster/cluster_recovery_merge.h"	   /* node-local authority publish (online)       */
 #include "cluster/cluster_recovery_plan.h"	   /* ClusterThreadReplaySlot + slot accessor     */
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
-#include "cluster/cluster_remote_xact.h"	   /* per-origin outcome store flush              */
 #include "cluster/cluster_thread_recovery.h"   /* engine / driver / pure gates                */
 #include "cluster/cluster_thread_recovery_authority.h"
+#include "cluster/cluster_thread_recovery_fabric.h"
 #include "cluster/cluster_wal_state.h"		   /* replay-window slot read                     */
 #include "cluster/cluster_write_fence.h"	   /* spec-4.12 D6 durable authority verify        */
 #include "cluster/storage/cluster_shared_fs.h" /* CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS         */
@@ -283,14 +275,76 @@ cluster_thread_recovery_capability_gate(ClusterThreadRecScope scope)
 	pg_unreachable();
 }
 
+static ClusterThreadRecResult
+cluster_thread_recovery_drive_fabric(uint16 dead_tid,
+	XLogRecPtr scan_lower, XLogRecPtr scan_upper,
+	const ClusterThreadRecoveryAuthorityV1 *authority,
+	ClusterThreadReplayStats *stats)
+{
+	volatile RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+	ClusterThreadRecoveryFabricApplyResultV1 apply_result;
+	uint64		record_count = 0;
+	MemoryContext caller_ctx = CurrentMemoryContext;
+
+	memset(&apply_result, 0, sizeof(apply_result));
+	PG_TRY();
+	{
+		detail = cluster_thread_recovery_fabric_execute_root_v1(dead_tid,
+			scan_lower, scan_upper, authority, false, &apply_result,
+			&record_count);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(caller_ctx);
+		edata = CopyErrorData();
+		if (cluster_thread_recovery_should_rethrow(edata->elevel))
+		{
+			FreeErrorData(edata);
+			PG_RE_THROW();
+		}
+		ereport(LOG,
+			(errmsg("cluster thread recovery: immutable fabric execution "
+					"blocked for dead thread %u: %s",
+					dead_tid, edata->message != NULL ? edata->message :
+					"unknown")));
+		FlushErrorState();
+		FreeErrorData(edata);
+		detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
+	}
+	PG_END_TRY();
+
+	if (detail != RF_PAGE_PROOF_DETAIL_OK || record_count == 0 ||
+		!apply_result.side_apply_complete ||
+		apply_result.page_write_count +
+			apply_result.page_result_skip_count !=
+			apply_result.page_target_count ||
+		(apply_result.page_target_count > 0 &&
+		 (!apply_result.page_durability_complete ||
+		  !apply_result.page_postread_complete)))
+	{
+		ereport(LOG,
+			(errmsg("cluster thread recovery: immutable fabric did not close "
+					"for dead thread %u (detail %d)", dead_tid,
+					(int) detail)));
+		memset(stats, 0, sizeof(*stats));
+		return CLUSTER_THREADREC_BLOCKED;
+	}
+	stats->records_scanned = record_count;
+	stats->blocks_applied = apply_result.page_write_count;
+	stats->blocks_gated = apply_result.page_result_skip_count;
+	stats->recovered_through = scan_upper;
+	return CLUSTER_THREADREC_DONE;
+}
+
 /*
  * cluster_thread_recovery_replay_one_window -- the orchestrator core, window
  *		EXPLICIT (spec-4.11 3b-2).  Online-recover ONE dead thread over
- *		[scan_lower, scan_upper]: drive the combined data + visibility pass under
- *		the R13 harness + episode-fenced online-writer scope; on DONE, issue the
- *		durability barrier and publish node-local reader authority; on BLOCKED,
- *		publish
- *		NOTHING and apply the on_unrecoverable policy.  This is what the public
+ *		[scan_lower, scan_upper]: scan and apply one immutable PAGE+SIDE fabric
+ *		under the R13 harness; on DONE, durable-fence-check and publish node-local
+ *		reader authority; on BLOCKED, publish NOTHING and apply the
+ *		on_unrecoverable policy.  This is what the public
  *		replay_one calls after deriving the window, and the TEST entry (the SRF
  *		drives it with a deterministic window on one machine).
  *
@@ -303,8 +357,6 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 										  ClusterThreadReplayStats *stats)
 {
 	int origin = (int)dead_tid - 1;
-	ClusterThreadVisCtx vis;
-	ClusterThreadTouchedRels touched;
 	ClusterThreadReplayStats local_stats;
 	ClusterThreadRecResult drive_res;
 	ClusterThreadRecResult result;
@@ -333,39 +385,32 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	 * spec-4.12 D6 re-checks it against the DURABLE voting-disk marker before the
 	 * authority publish below (8.A ground-truth cross-check). */
 
-	memset(&touched, 0, sizeof(touched));
-	touched.mcxt = caller_ctx; /* the items array must outlive the drive */
-	touched.origin_thread_id = dead_tid; /* D-SIDE-08: real origin identity */
-	vis.do_visibility = true;
-	vis.origin_node = origin;
-
 	/*
-	 * Drive the COMBINED data + visibility pass.  cluster_thread_recovery_drive
-	 * runs it under the R13 harness inside the online-writer scope (R14) and
-	 * returns DONE / BLOCKED -- never throws a catchable ERROR (it demotes one),
-	 * only re-throws a FATAL/PANIC.
+	 * Decode the exact ROOT cut into one immutable PAGE+SIDE plan, complete all
+	 * target preflight, then perform PAGE durable/post-read install before the
+	 * protected SIDE apply.  The wrapper demotes a catchable ERROR to BLOCKED and
+	 * rethrows FATAL/PANIC.
 	 */
 	INSTR_TIME_SET_CURRENT(tr_start); /* PGRAC: spec-4.13 D5 replay-phase start */
 	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
-	drive_res
-		= cluster_thread_recovery_drive(dead_tid, scan_lower, scan_upper, &vis, &touched, stats);
+	drive_res = cluster_thread_recovery_drive_fabric(dead_tid, scan_lower,
+		scan_upper, authority, stats);
 	pgstat_report_wait_end();
 	INSTR_TIME_SET_CURRENT(tr_replay_end); /* PGRAC: spec-4.13 D5 replay/visibility done */
 
 	if (drive_res != CLUSTER_THREADREC_DONE) {
 		/*
-		 * Data / visibility did not fully complete -> publish NOTHING
+			 * The immutable fabric did not fully complete -> publish NOTHING
 		 * (partial-apply = "never recovered", 8.A); drive already reset stats.
 		 */
-		cluster_thread_recovery_touched_free(&touched);
 		result = CLUSTER_THREADREC_BLOCKED;
 	} else {
 		volatile bool published = false;
 
 		/*
-		 * DONE: data + visibility are applied to shared storage (write-back).
-		 * Durability barrier + node-local authority publish, under a guard so an I/O
-		 * failure demotes to BLOCKED (keep_frozen) instead of crashing the
+		 * DONE: PAGE and SIDE are already durable and canonically post-read.
+		 * Durable fence recheck + node-local authority publish, under a guard so
+		 * an I/O failure demotes to BLOCKED (keep_frozen) instead of crashing the
 		 * survivor (R13).  Order mirrors the cold path (xlogrecovery.c): barrier
 		 * -> node-local reader authority LAST, so a
 		 * failure before the reader authority leaves the dead thread un-servable
@@ -396,26 +441,9 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 										  "serving authority is published) until the current "
 										  "episode recovers it.")));
 
-			/*
-			 * 1. data pages durable (amend 2): cluster_fs write-back is not
-			 * fsync'd and does not register a checkpointer sync request, so a
-			 * published authority could otherwise outlive un-fsync'd pages.
-			 */
-			cluster_thread_recovery_touched_sync_all(&touched);
-
-			/*
-			 * 2. per-origin outcome store durable (mirror the cold path's
-			 * cluster_remote_xact_flush).  The TT undo-header cross-check store
-			 * is WAL-protected and reaches disk via the survivor's normal
-			 * checkpoint; a crash before that checkpoint degrades to fail-closed
-			 * INDOUBT at read time (never false-commit, 8.A) -- a strict
-			 * TT-segment fsync here is an 8.A-safe forward (3b-4+).
-			 */
-			cluster_remote_xact_flush();
-
 			/* STOP04 publish gate: the same held IR/formation/NeedSet/
-			 * AdmissionSet must still be current after durability and immediately
-			 * before reader authority becomes visible. */
+			 * AdmissionSet must still be current after fabric durability and
+			 * immediately before reader authority becomes visible. */
 			if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
 					CLUSTER_THREAD_AUTHORITY_OK) {
 				cluster_write_fence_note_external_publish_gate_blocked();
@@ -443,7 +471,6 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 			/* R13: a FATAL/PANIC is never demoted -- re-throw it. */
 			if (cluster_thread_recovery_should_rethrow(edata->elevel)) {
 				FreeErrorData(edata);
-				cluster_thread_recovery_touched_free(&touched);
 				PG_RE_THROW();
 			}
 			FlushErrorState();
@@ -452,12 +479,10 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 		}
 		PG_END_TRY();
 
-		cluster_thread_recovery_touched_free(&touched);
-
 		if (published)
 			result = CLUSTER_THREADREC_DONE;
 		else {
-			/* barrier / publish failed -> nothing usable was published. */
+			/* fence/publish failed -> nothing usable was published. */
 			memset(stats, 0, sizeof(*stats));
 			result = CLUSTER_THREADREC_BLOCKED;
 		}

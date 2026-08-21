@@ -688,14 +688,14 @@ extern ClusterThreadRecResult cluster_thread_recovery_validated_end(uint16 dead_
 
 /*
  * ORCHESTRATOR core (spec-4.11 3b-2), window-EXPLICIT.  Online-recover ONE dead
- * thread over [scan_lower, scan_upper]: drive the combined data+visibility pass
- * under the R13 harness inside an episode-fenced online-writer scope; on DONE,
- * issue the durability barrier (immedsync touched rels + flush the outcome
- * store) and publish the 3-way authority (registry skip-bound + node-local
- * reader authority); on BLOCKED, publish NOTHING (partial-apply = "never
- * recovered", 8.A) and apply the on_unrecoverable policy.  This is what the
- * public replay_one calls after deriving the window; it is also the TEST entry
- * (the SRF drives it with an explicit, deterministic window on one machine).
+ * thread over [scan_lower, scan_upper]: build one immutable PAGE+SIDE fabric,
+ * preflight every target, durably install/post-read PAGE, then apply protected
+ * SIDE.  Only after a durable-fence and fresh ROOT recheck does it publish the
+ * node-local reader authority; on BLOCKED it publishes NOTHING (partial-apply
+ * = "never recovered", 8.A) and applies the on_unrecoverable policy.  This is
+ * what the public replay_one calls after deriving the window; it is also the
+ * TEST entry (the SRF drives it with an explicit, deterministic window on one
+ * machine).
  * Real validated-boundary derivation for replay_one(dead_tid, epoch) is D4
  * (3b-4); 3b-2 derives only a basic window.
  */

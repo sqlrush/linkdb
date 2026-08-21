@@ -133,7 +133,9 @@ OBJS = \
 	cluster_thread_recovery_apply_srf.o \
 	cluster_thread_recovery_replay.o \
 	cluster_thread_recovery_fabric_plan.o \
+	cluster_thread_recovery_fabric_scan.o \
 	cluster_thread_recovery_fabric_apply.o \
+	cluster_thread_recovery_fabric_execute.o \
 	cluster_thread_recovery_driver.o \
 	cluster_thread_recovery_driver_srf.o \
 	cluster_thread_recovery_orchestrator.o \

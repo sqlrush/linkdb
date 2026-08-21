@@ -60,10 +60,22 @@ extern bool cluster_thread_recovery_fabric_identity_matches_v1(
 extern bool cluster_thread_recovery_fabric_cut_v1(
 	const ClusterThreadRecoveryFabricPlanV1 *plan, uint32 index,
 	RfContributorStreamCutV1 *out_cut);
+extern RfPageProofDetailV1 cluster_thread_recovery_fabric_scan_root_v1(
+	uint16 dead_thread, XLogRecPtr scan_begin_inclusive,
+	XLogRecPtr scan_end_exclusive,
+	const struct ClusterThreadRecoveryAuthorityV1 *authority,
+	bool space_active, ClusterThreadRecoveryFabricPlanV1 **out_plan,
+	uint64 *out_record_count);
 extern RfPageProofDetailV1 cluster_thread_recovery_fabric_apply_v1(
 	const ClusterThreadRecoveryFabricPlanV1 *plan,
 	const struct ClusterThreadRecoveryAuthorityV1 *authority,
 	ClusterThreadRecoveryFabricApplyResultV1 *result);
+extern RfPageProofDetailV1 cluster_thread_recovery_fabric_execute_root_v1(
+	uint16 dead_thread, XLogRecPtr scan_begin_inclusive,
+	XLogRecPtr scan_end_exclusive,
+	const struct ClusterThreadRecoveryAuthorityV1 *authority,
+	bool space_active, ClusterThreadRecoveryFabricApplyResultV1 *result,
+	uint64 *out_record_count);
 extern void cluster_thread_recovery_fabric_plan_destroy_v1(
 	ClusterThreadRecoveryFabricPlanV1 **plan);
 

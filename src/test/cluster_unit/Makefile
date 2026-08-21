@@ -111,6 +111,8 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_thread_recovery_authority \
 		test_cluster_thread_recovery_fabric_plan \
 		test_cluster_thread_recovery_fabric_apply \
+		test_cluster_thread_recovery_fabric_scan \
+		test_cluster_thread_recovery_fabric_execute \
 		test_cluster_page_online_plan \
 		test_cluster_page_replay_batch \
 		test_cluster_page_install \
@@ -324,6 +326,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_guard,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_authority,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_apply,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_scan,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_fabric_execute,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_authority,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_online_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
@@ -729,6 +733,38 @@ test_cluster_thread_recovery_fabric_apply: \
 		$(CLUSTER_THREAD_RECOVERY_FABRIC_APPLY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
 		$(CLUSTER_THREAD_RECOVERY_FABRIC_APPLY_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+CLUSTER_THREAD_RECOVERY_FABRIC_SCAN_O = \
+		cluster_thread_recovery_fabric_scan_test.o
+
+$(CLUSTER_THREAD_RECOVERY_FABRIC_SCAN_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_fabric_scan.c \
+		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_fabric.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_thread_recovery_fabric_scan: \
+		test_cluster_thread_recovery_fabric_scan.c unit_test.h \
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_SCAN_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_SCAN_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+CLUSTER_THREAD_RECOVERY_FABRIC_EXECUTE_O = \
+		cluster_thread_recovery_fabric_execute_test.o
+
+$(CLUSTER_THREAD_RECOVERY_FABRIC_EXECUTE_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_fabric_execute.c \
+		$(top_srcdir)/src/include/cluster/cluster_thread_recovery_fabric.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -c $< -o $@
+
+test_cluster_thread_recovery_fabric_execute: \
+		test_cluster_thread_recovery_fabric_execute.c unit_test.h \
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_EXECUTE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT $< \
+		$(CLUSTER_THREAD_RECOVERY_FABRIC_EXECUTE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
