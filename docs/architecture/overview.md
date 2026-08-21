@@ -17,6 +17,9 @@ For transaction recovery authority, PREPARED / in-doubt handling, and the
 For external I/O failure isolation, terminal readback, recovery admission,
 and safe rejoin, see
 [外部 I/O Fencing：从节点驱逐到可验证的恢复权限](external-fencing/README.md).
+For the target block-X acquisition model, logical identity, bounded retry,
+T1/T2/T3 write fencing, reconfiguration sweep, and ticket-path cutover, see
+[Resource-X：从逻辑资源到可写 X 的完整链路](resource-x/README.md).
 
 ## High-level component map
 
