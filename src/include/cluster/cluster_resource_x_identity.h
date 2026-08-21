@@ -76,6 +76,9 @@ extern bool resource_x_assertion_valid(const ResourceXAssertion *assertion);
 extern bool resource_x_assertion_equal(const ResourceXAssertion *left,
 									   const ResourceXAssertion *right);
 extern uint32 resource_x_assertion_hash(const ResourceXAssertion *assertion);
+extern bool resource_x_attempt_init(const ResourceXAssertion *assertion,
+									uint64 base_authority_generation,
+									ResourceXAttemptWitness *out);
 extern bool resource_x_attempt_matches(const ResourceXAttemptWitness *left,
 									   const ResourceXAttemptWitness *right);
 /* R6 readiness only: no proof enum, proof value, producer, or proof-bearing key. */

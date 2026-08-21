@@ -83,6 +83,21 @@ resource_x_assertion_hash(const ResourceXAssertion *assertion)
 }
 
 bool
+resource_x_attempt_init(const ResourceXAssertion *assertion,
+						uint64 base_authority_generation,
+						ResourceXAttemptWitness *out)
+{
+	ResourceXAttemptWitness candidate;
+
+	if (!resource_x_assertion_valid(assertion) || out == NULL)
+		return false;
+	candidate.assertion = *assertion;
+	candidate.base_authority_generation = base_authority_generation;
+	*out = candidate;
+	return true;
+}
+
+bool
 resource_x_attempt_matches(const ResourceXAttemptWitness *left,
 						   const ResourceXAttemptWitness *right)
 {
