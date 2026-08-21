@@ -116,6 +116,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_page_anchor_cache \
 		test_cluster_page_stable_base \
 		test_cluster_side_xact \
+		test_cluster_side_online_owner \
         test_cluster_cf_storage \
         test_cluster_cf_enqueue \
         test_cluster_cf_phase2 \
@@ -327,6 +328,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_producer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner,$(SIMPLE_TESTS))
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -920,6 +922,13 @@ test_cluster_side_xact: test_cluster_side_xact.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport_srv.a \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
+
+CLUSTER_SIDE_ONLINE_OWNER_O = \
+	$(top_builddir)/src/backend/cluster/cluster_side_online_owner.o
+test_cluster_side_online_owner: test_cluster_side_online_owner.c unit_test.h \
+		$(CLUSTER_SIDE_ONLINE_OWNER_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_ONLINE_OWNER_O) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # RF-SIDE D-SIDE-03: PREPARED/in-doubt binding + RECO-style resolution
 # judgements.

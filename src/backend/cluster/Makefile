@@ -72,6 +72,7 @@ OBJS = \
 	cluster_side_route.o \
 	cluster_side_xact.o \
 	cluster_side_online_plan.o \
+	cluster_side_online_owner.o \
 	cluster_side_undo.o \
 	cluster_side_prepared.o \
 	cluster_side_projection.o \
