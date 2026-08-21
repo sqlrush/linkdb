@@ -355,6 +355,195 @@ cluster_remote_xact_pending_matches_v2(
 	return matches;
 }
 
+bool
+cluster_remote_xact_range_empty_v2(int origin_node, TransactionId first_xid,
+	uint32 count)
+{
+	uint64		cursor;
+	uint64		end;
+
+	if (RemoteXactShared == NULL ||
+		!cluster_remote_xact_reset_range_valid_v2(origin_node, first_xid, count))
+		return false;
+	cursor = first_xid;
+	end = cursor + count;
+	while (cursor < end)
+	{
+		TransactionId xid = (TransactionId) cursor;
+		uint32 entryno = (uint32) cluster_remote_xact_entryno(xid);
+		uint32 page_count = (uint32) Min(end - cursor,
+			(uint64) CLUSTER_REMOTE_XACT_ENTRIES_PER_PAGE - entryno);
+		int slotno = remote_xact_open_page(origin_node, xid, false);
+
+		if (slotno >= 0)
+		{
+			const ClusterRemoteXactEntryV2 *entries =
+				(const ClusterRemoteXactEntryV2 *)
+				ClusterRemoteXactCtl->shared->page_buffer[slotno];
+			uint32 i;
+
+			for (i = 0; i < page_count; i++)
+				if (!cluster_remote_xact_entry_is_empty_v2(
+						&entries[entryno + i]))
+				{
+					LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+					return false;
+				}
+		}
+		LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+		cursor += page_count;
+	}
+	return true;
+}
+
+bool
+cluster_remote_xact_reset_range_v2(int origin_node, TransactionId first_xid,
+	uint32 count)
+{
+	uint32		touched_segments[6];
+	uint32		touched_count = 0;
+	uint64		cursor;
+	uint64		end;
+	bool		changed = false;
+
+	if (RemoteXactShared == NULL ||
+		!cluster_remote_xact_reset_range_valid_v2(origin_node, first_xid, count))
+		return false;
+	Assert(!IsUnderPostmaster ||
+		   cluster_remote_xact_writer_allowed(AmStartupProcess(),
+										  remote_xact_online_writer_depth_v));
+	cursor = first_xid;
+	end = cursor + count;
+	while (cursor < end)
+	{
+		TransactionId xid = (TransactionId) cursor;
+		uint32 entryno = (uint32) cluster_remote_xact_entryno(xid);
+		uint32 page_count = (uint32) Min(end - cursor,
+			(uint64) CLUSTER_REMOTE_XACT_ENTRIES_PER_PAGE - entryno);
+		int pageno = cluster_remote_xact_pageno(origin_node, xid);
+		int slotno = remote_xact_open_page(origin_node, xid, false);
+
+		if (slotno >= 0)
+		{
+			ClusterRemoteXactEntryV2 *entries = (ClusterRemoteXactEntryV2 *)
+				ClusterRemoteXactCtl->shared->page_buffer[slotno];
+			uint32 i;
+			bool page_changed = false;
+
+			for (i = 0; i < page_count; i++)
+			{
+				ClusterRemoteXactEntryV2 next;
+
+				if (cluster_remote_xact_entry_reset_transition_v2(
+						&entries[entryno + i], &next) ==
+					CLUSTER_REMOTE_XACT_ENTRY_WRITE)
+				{
+					entries[entryno + i] = next;
+					page_changed = true;
+				}
+			}
+			if (page_changed)
+			{
+				uint32 segno = (uint32) (pageno / SLRU_PAGES_PER_SEGMENT);
+				uint32 i;
+
+				ClusterRemoteXactCtl->shared->page_dirty[slotno] = true;
+				changed = true;
+				for (i = 0; i < touched_count; i++)
+					if (touched_segments[i] == segno)
+						break;
+				if (i == touched_count)
+				{
+					Assert(touched_count < lengthof(touched_segments));
+					if (touched_count >= lengthof(touched_segments))
+					{
+						LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+						return false;
+					}
+					touched_segments[touched_count++] = segno;
+				}
+			}
+		}
+		LWLockRelease(ClusterRemoteXactCtl->shared->ControlLock);
+		cursor += page_count;
+	}
+	if (changed)
+	{
+		uint32 i;
+
+		SimpleLruWriteAll(ClusterRemoteXactCtl, true);
+		for (i = 0; i < touched_count; i++)
+		{
+			FileTag tag;
+			char path[MAXPGPATH];
+
+			MemSet(&tag, 0, sizeof(tag));
+			tag.segno = touched_segments[i];
+			if (SlruSyncFileTag(ClusterRemoteXactCtl, &tag, path) != 0)
+				ereport(ERROR,
+						(errcode_for_file_access(),
+						 errmsg("could not synchronize reset remote transaction segment \"%s\": %m",
+								path)));
+		}
+		fsync_fname(CLUSTER_REMOTE_XACT_DIR_V2, true);
+	}
+	return cluster_remote_xact_range_empty_v2(origin_node, first_xid, count);
+}
+
+typedef struct RemoteXactTruncateContextV2
+{
+	int64		origin_first_page;
+	int64		origin_end_page;
+	int64		cutoff_page;
+	bool		ok;
+	bool		deleted;
+} RemoteXactTruncateContextV2;
+
+static bool
+remote_xact_truncate_origin_callback(SlruCtl ctl, char *filename,
+	int segpage, void *arg)
+{
+	RemoteXactTruncateContextV2 *context =
+		(RemoteXactTruncateContextV2 *) arg;
+	int64 first = segpage;
+	int64 last = first + SLRU_PAGES_PER_SEGMENT - 1;
+
+	(void) filename;
+	if (first < context->origin_first_page ||
+		first >= context->origin_end_page || last >= context->cutoff_page)
+		return false;
+	SlruDeleteSegment(ctl, segpage / SLRU_PAGES_PER_SEGMENT);
+	context->deleted = true;
+	if (SimpleLruDoesPhysicalPageExist(ctl, segpage))
+		context->ok = false;
+	return false;
+}
+
+bool
+cluster_remote_xact_truncate_before_v2(int origin_node,
+	TransactionId oldest_xid)
+{
+	RemoteXactTruncateContextV2 context;
+
+	if (RemoteXactShared == NULL || origin_node < 0 || origin_node >= (1 << 7) ||
+		!TransactionIdIsNormal(oldest_xid))
+		return false;
+	Assert(!IsUnderPostmaster ||
+		   cluster_remote_xact_writer_allowed(AmStartupProcess(),
+										  remote_xact_online_writer_depth_v));
+	memset(&context, 0, sizeof(context));
+	context.origin_first_page = cluster_remote_xact_pageno(origin_node, 0);
+	context.origin_end_page = context.origin_first_page +
+		((int64) 1 << CLUSTER_REMOTE_XACT_ORIGIN_PAGE_SHIFT);
+	context.cutoff_page = cluster_remote_xact_pageno(origin_node, oldest_xid);
+	context.ok = true;
+	(void) SlruScanDirectory(ClusterRemoteXactCtl,
+		remote_xact_truncate_origin_callback, &context);
+	if (context.deleted)
+		fsync_fname(CLUSTER_REMOTE_XACT_DIR_V2, true);
+	return context.ok;
+}
+
 static void
 cluster_remote_xact_require_mutation(ClusterRemoteXactMutationV2 result,
 								 int blocked_elevel, int origin_node,

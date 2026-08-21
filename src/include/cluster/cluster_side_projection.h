@@ -82,6 +82,45 @@ typedef struct ClusterSideProjectionOperationV1
 	MultiXactOffset truncate_end_member;
 } ClusterSideProjectionOperationV1;
 
+typedef enum ClusterSideProjectionApplyResultV1
+{
+	CLUSTER_SIDE_PROJECTION_APPLY_OK = 0,
+	CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED,
+	CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED
+} ClusterSideProjectionApplyResultV1;
+
+typedef struct ClusterSideProjectionApplyInputV1
+{
+	const ClusterSideProjectionOperationV1 *operation;
+	const uint8 *owned_payload;
+	uint32		owned_payload_length;
+	uint16		origin_thread;
+	bool		source_retained;
+} ClusterSideProjectionApplyInputV1;
+
+typedef bool (*ClusterSideProjectionResetRangeV1)(void *arg,
+	int origin_slot, TransactionId first_xid, uint32 xid_count);
+typedef bool (*ClusterSideProjectionRangeEmptyV1)(void *arg,
+	int origin_slot, TransactionId first_xid, uint32 xid_count);
+typedef bool (*ClusterSideProjectionTruncateBeforeV1)(void *arg,
+	int origin_slot, TransactionId oldest_xid);
+
+typedef struct ClusterSideProjectionApplyOpsV1
+{
+	void *arg;
+	ClusterSideProjectionResetRangeV1 reset_remote_xact_range;
+	ClusterSideProjectionRangeEmptyV1 remote_xact_range_empty;
+	ClusterSideProjectionTruncateBeforeV1 truncate_remote_xact_before;
+} ClusterSideProjectionApplyOpsV1;
+
+extern ClusterSideProjectionApplyResultV1
+cluster_side_projection_target_preflight_v1(
+	const ClusterSideProjectionApplyInputV1 *input);
+extern ClusterSideProjectionApplyResultV1
+cluster_side_projection_apply_owned_v1(
+	const ClusterSideProjectionApplyInputV1 *input,
+	const ClusterSideProjectionApplyOpsV1 *ops);
+
 /*
  * §2.4 verifier facts for one projection scope.
  */

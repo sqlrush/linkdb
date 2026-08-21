@@ -190,6 +190,40 @@ UT_TEST(test_remote_xact_prepared_terminal_requires_pending_or_exact_result)
 		false, 0, &next), CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
 }
 
+UT_TEST(test_remote_xact_projection_reset_is_idempotent_invalidation)
+{
+	ClusterRemoteXactEntryV2 current;
+	ClusterRemoteXactEntryV2 next;
+
+	memset(&current, 0, sizeof(current));
+	UT_ASSERT_EQ(cluster_remote_xact_entry_reset_transition_v2(&current, &next),
+		CLUSTER_REMOTE_XACT_ENTRY_NOOP);
+	UT_ASSERT(cluster_remote_xact_entry_is_empty_v2(&next));
+	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&current,
+		CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(991), INT64_C(881), true, 7));
+	UT_ASSERT_EQ(cluster_remote_xact_entry_reset_transition_v2(&current, &next),
+		CLUSTER_REMOTE_XACT_ENTRY_WRITE);
+	UT_ASSERT(cluster_remote_xact_entry_is_empty_v2(&next));
+	/* Projection corruption is invalidated, never promoted to authority. */
+	memset(&current, 0xee, sizeof(current));
+	UT_ASSERT_EQ(cluster_remote_xact_entry_reset_transition_v2(&current, &next),
+		CLUSTER_REMOTE_XACT_ENTRY_WRITE);
+	UT_ASSERT(cluster_remote_xact_entry_is_empty_v2(&next));
+}
+
+UT_TEST(test_remote_xact_projection_reset_range_is_bounded)
+{
+	UT_ASSERT(cluster_remote_xact_reset_range_valid_v2(0, 0, 1));
+	UT_ASSERT(cluster_remote_xact_reset_range_valid_v2(127,
+		UINT32_MAX - 32767, 32768));
+	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(-1, 0, 1));
+	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(128, 0, 1));
+	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(0, 0, 0));
+	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(0, 0, 32769));
+	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(0,
+		UINT32_MAX - 2, 4));
+}
+
 UT_TEST(test_remote_xact_origin_no_cross_partition_overlap)
 {
 	/*
@@ -357,7 +391,7 @@ UT_TEST(test_remote_xact_writer_denied_outside_scope)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(20);
 	UT_RUN(test_remote_xact_entry_width);
 	UT_RUN(test_remote_xact_origin_partition_disjoint);
 	UT_RUN(test_remote_xact_origin_no_cross_partition_overlap);
@@ -365,6 +399,8 @@ main(void)
 	UT_RUN(test_remote_xact_terminal_codec_carries_commit_ts_and_wrap);
 	UT_RUN(test_remote_xact_prepare_transition_is_idempotent_and_conflict_closed);
 	UT_RUN(test_remote_xact_prepared_terminal_requires_pending_or_exact_result);
+	UT_RUN(test_remote_xact_projection_reset_is_idempotent_invalidation);
+	UT_RUN(test_remote_xact_projection_reset_range_is_bounded);
 	UT_RUN(test_remote_xact_pure_outcome_allowed);
 	UT_RUN(test_remote_xact_side_effects_blocked);
 	UT_RUN(test_remote_xact_prepared_commit_allows_2pc_lock_bits);

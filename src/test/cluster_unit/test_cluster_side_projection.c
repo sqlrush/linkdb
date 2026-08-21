@@ -47,6 +47,57 @@ ut_full_verify(void)
 	return in;
 }
 
+typedef struct ProjectionApplyCapture
+{
+	uint32 reset_count;
+	uint32 postread_count;
+	uint32 truncate_count;
+	int origin_slot;
+	TransactionId first_xid;
+	uint32 xid_count;
+	TransactionId oldest_xid;
+	bool reset_ok;
+	bool postread_ok;
+	bool truncate_ok;
+} ProjectionApplyCapture;
+
+static bool
+capture_reset(void *arg, int origin_slot, TransactionId first_xid,
+	uint32 xid_count)
+{
+	ProjectionApplyCapture *capture = (ProjectionApplyCapture *) arg;
+
+	capture->reset_count++;
+	capture->origin_slot = origin_slot;
+	capture->first_xid = first_xid;
+	capture->xid_count = xid_count;
+	return capture->reset_ok;
+}
+
+static bool
+capture_postread(void *arg, int origin_slot, TransactionId first_xid,
+	uint32 xid_count)
+{
+	ProjectionApplyCapture *capture = (ProjectionApplyCapture *) arg;
+
+	capture->postread_count++;
+	UT_ASSERT_EQ(origin_slot, capture->origin_slot);
+	UT_ASSERT_EQ(first_xid, capture->first_xid);
+	UT_ASSERT_EQ(xid_count, capture->xid_count);
+	return capture->postread_ok;
+}
+
+static bool
+capture_truncate(void *arg, int origin_slot, TransactionId oldest_xid)
+{
+	ProjectionApplyCapture *capture = (ProjectionApplyCapture *) arg;
+
+	capture->truncate_count++;
+	capture->origin_slot = origin_slot;
+	capture->oldest_xid = oldest_xid;
+	return capture->truncate_ok;
+}
+
 UT_TEST(test_projection_verified_conjunction)
 {
 	ClusterSideProjectionVerifyInput in = ut_full_verify();
@@ -117,14 +168,90 @@ UT_TEST(test_projection_rebuildable_per_kind)
 												   true, true));
 }
 
+UT_TEST(test_projection_zero_range_preflight_and_postread)
+{
+	ClusterSideProjectionOperationV1 operation;
+	ClusterSideProjectionApplyInputV1 input;
+	ClusterSideProjectionApplyOpsV1 ops;
+	ProjectionApplyCapture capture;
+
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = CLUSTER_SIDE_PROJECTION_CLOG;
+	operation.action = CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE;
+	operation.page_number = 7;
+	memset(&input, 0, sizeof(input));
+	input.operation = &operation;
+	input.origin_thread = 3;
+	UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
+		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+	memset(&capture, 0, sizeof(capture));
+	capture.reset_ok = true;
+	capture.postread_ok = true;
+	memset(&ops, 0, sizeof(ops));
+	ops.arg = &capture;
+	ops.reset_remote_xact_range = capture_reset;
+	ops.remote_xact_range_empty = capture_postread;
+	ops.truncate_remote_xact_before = capture_truncate;
+	UT_ASSERT_EQ(cluster_side_projection_apply_owned_v1(&input, &ops),
+		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+	UT_ASSERT_EQ(capture.reset_count, 1);
+	UT_ASSERT_EQ(capture.postread_count, 1);
+	UT_ASSERT_EQ(capture.origin_slot, 2);
+	UT_ASSERT_EQ(capture.first_xid, 7 * BLCKSZ * 4);
+	UT_ASSERT_EQ(capture.xid_count, BLCKSZ * 4);
+
+	capture.postread_ok = false;
+	UT_ASSERT_EQ(cluster_side_projection_apply_owned_v1(&input, &ops),
+		CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED);
+	UT_ASSERT_EQ(capture.reset_count, 2);
+	UT_ASSERT_EQ(capture.postread_count, 2);
+}
+
+UT_TEST(test_projection_commit_ts_requires_retained_source_and_truncates)
+{
+	ClusterSideProjectionOperationV1 operation;
+	ClusterSideProjectionApplyInputV1 input;
+	ClusterSideProjectionApplyOpsV1 ops;
+	ProjectionApplyCapture capture;
+
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = CLUSTER_SIDE_PROJECTION_COMMIT_TS;
+	operation.action = CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE;
+	operation.page_number = 9;
+	operation.oldest_xid = 800;
+	memset(&input, 0, sizeof(input));
+	input.operation = &operation;
+	input.origin_thread = 3;
+	UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
+		CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED);
+	input.source_retained = true;
+	UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
+		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+	memset(&capture, 0, sizeof(capture));
+	capture.truncate_ok = true;
+	memset(&ops, 0, sizeof(ops));
+	ops.arg = &capture;
+	ops.reset_remote_xact_range = capture_reset;
+	ops.remote_xact_range_empty = capture_postread;
+	ops.truncate_remote_xact_before = capture_truncate;
+	UT_ASSERT_EQ(cluster_side_projection_apply_owned_v1(&input, &ops),
+		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+	UT_ASSERT_EQ(capture.truncate_count, 1);
+	UT_ASSERT_EQ(capture.origin_slot, 2);
+	UT_ASSERT_EQ(capture.oldest_xid, 800);
+	UT_ASSERT_EQ(capture.reset_count, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(5);
 
 	UT_RUN(test_projection_verified_conjunction);
 	UT_RUN(test_projection_lookup_fail_closed);
 	UT_RUN(test_projection_rebuildable_per_kind);
+	UT_RUN(test_projection_zero_range_preflight_and_postread);
+	UT_RUN(test_projection_commit_ts_requires_retained_source_and_truncates);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

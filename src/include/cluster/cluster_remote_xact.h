@@ -212,6 +212,7 @@ typedef enum ClusterRemoteXactOutcome {
 #define CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES 28
 #define CLUSTER_REMOTE_XACT_ENTRY_PAYLOAD_BYTES 28
 #define CLUSTER_REMOTE_XACT_ENTRY_FLAG_WRAP_VALID UINT8_C(0x01)
+#define CLUSTER_REMOTE_XACT_RESET_MAX_ENTRIES UINT32_C(32768)
 
 typedef enum ClusterRemoteXactStoredStateV2
 {
@@ -458,6 +459,28 @@ cluster_remote_xact_entry_terminal_transition_v2(
 	return CLUSTER_REMOTE_XACT_ENTRY_CONFLICT;
 }
 
+static inline ClusterRemoteXactEntryTransitionV2
+cluster_remote_xact_entry_reset_transition_v2(
+	const ClusterRemoteXactEntryV2 *current, ClusterRemoteXactEntryV2 *next)
+{
+	if (current == NULL || next == NULL)
+		return CLUSTER_REMOTE_XACT_ENTRY_INVALID;
+	memset(next, 0, sizeof(*next));
+	/* Reset invalidates a projection scope.  Corrupt or old bytes are safe to
+	 * erase because they are never canonical transaction truth. */
+	return cluster_remote_xact_entry_is_empty_v2(current)
+		? CLUSTER_REMOTE_XACT_ENTRY_NOOP : CLUSTER_REMOTE_XACT_ENTRY_WRITE;
+}
+
+static inline bool
+cluster_remote_xact_reset_range_valid_v2(int origin_node,
+	TransactionId first_xid, uint32 count)
+{
+	return origin_node >= 0 && origin_node < (1 << 7) && count > 0 &&
+		count <= CLUSTER_REMOTE_XACT_RESET_MAX_ENTRIES &&
+		(uint64) first_xid + (uint64) count - 1 <= UINT32_MAX;
+}
+
 /* shmem request/init plumbing (cluster_shmem.c / ipci path). */
 extern Size cluster_remote_xact_shmem_size(void);
 extern void cluster_remote_xact_shmem_request(void);
@@ -504,6 +527,12 @@ extern ClusterRemoteXactMutationV2 cluster_remote_xact_store_terminal_v2(
 extern bool cluster_remote_xact_pending_matches_v2(
 	int origin_node, TransactionId xid,
 	const uint8 digest[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES]);
+extern bool cluster_remote_xact_reset_range_v2(int origin_node,
+	TransactionId first_xid, uint32 count);
+extern bool cluster_remote_xact_range_empty_v2(int origin_node,
+	TransactionId first_xid, uint32 count);
+extern bool cluster_remote_xact_truncate_before_v2(int origin_node,
+	TransactionId oldest_xid);
 
 /* Flush any residual dirty SLRU pages (normal v2 mutations fsync inline). */
 extern void cluster_remote_xact_flush(void);
