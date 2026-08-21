@@ -25,6 +25,7 @@
 
 #include "access/transam.h"
 #include "cluster/cluster_lmd.h"
+#include "cluster/cluster_resource_x_identity.h"
 #include "storage/buf_internals.h"
 #include "storage/lwlock.h"
 
@@ -32,8 +33,8 @@
 #define PCM_X_PROTOCOL_NODE_LIMIT 32
 #define PCM_X_SHMEM_REGION_NAME "pgrac cluster pcm convert queue"
 #define PCM_X_SHMEM_MAGIC ((uint32)0x50435851) /* "PCXQ" */
-/* 15: append passive writer-acquisition observation after the v14 prefix. */
-#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)15)
+/* 16: append volatile Resource-X semantic projections to local/master slots. */
+#define PCM_X_SHMEM_LAYOUT_VERSION ((uint32)16)
 #define PCM_X_INVALID_SLOT_INDEX ((Size) - 1)
 #define PCM_X_LOCK_PARTITIONS NUM_BUFFER_PARTITIONS
 #define PCM_X_LWLOCK_COUNT (1 + 2 * PCM_X_LOCK_PARTITIONS)
@@ -990,6 +991,14 @@ typedef struct PcmXMasterTicketSlot {
 	 * ref identity stays immutable and every exact committed==base+1 check
 	 * runs against the effective base instead. */
 	uint64 grant_base_own_generation;
+	/* R6 target semantics.  The legacy ticket remains only the adapter
+	 * container/locator; these fields are the claimant and stale-state
+	 * projection and add no queue or grant authority. */
+	ResourceXAssertion logical_assertion;
+	uint64 attempt_base_generation;
+	uint64 transport_epoch;
+	uint64 transport_session;
+	uint64 semantic_generation;
 } PcmXMasterTicketSlot;
 
 typedef struct PcmXBlockerSlot {
@@ -1047,6 +1056,13 @@ typedef struct PcmXLocalTagSlot {
 	 * base_own_generation.  Zero = no drift.  Writer-round evidence: cleared
 	 * with image/committed_own_generation, never with the holder lane. */
 	uint64 grant_base_own_generation;
+	/* R6 one-open-local-round semantic projection.  Backend membership keeps
+	 * its full legacy identity separately for wakeup and error routing. */
+	ResourceXAssertion logical_assertion;
+	uint64 attempt_base_generation;
+	uint64 transport_epoch;
+	uint64 transport_session;
+	uint64 semantic_generation;
 } PcmXLocalTagSlot;
 
 typedef struct PcmXLocalMembershipSlot {
@@ -1078,13 +1094,29 @@ StaticAssertDecl(sizeof(PcmXReliableLegState) == 56, "PCM-X reliable leg ABI");
 StaticAssertDecl(sizeof(PcmXMasterTagSlot) == 120, "PCM-X master tag slot ABI");
 StaticAssertDecl(offsetof(PcmXMasterTagSlot, outstanding_ticket_count) == 112,
 				 "PCM-X master outstanding-ticket count offset");
-StaticAssertDecl(sizeof(PcmXMasterTicketSlot) == 392, "PCM-X master ticket slot ABI");
+StaticAssertDecl(sizeof(PcmXMasterTicketSlot) == 448, "PCM-X master ticket slot ABI");
 StaticAssertDecl(offsetof(PcmXMasterTicketSlot, grant_base_own_generation) == 384,
 				 "PCM-X master ticket grant-base offset");
+StaticAssertDecl(offsetof(PcmXMasterTicketSlot, logical_assertion) == 392,
+				 "PCM-X master logical assertion offset");
+StaticAssertDecl(offsetof(PcmXMasterTicketSlot, attempt_base_generation) == 416,
+				 "PCM-X master attempt-base offset");
+StaticAssertDecl(offsetof(PcmXMasterTicketSlot, transport_epoch) == 424
+					 && offsetof(PcmXMasterTicketSlot, transport_session) == 432
+					 && offsetof(PcmXMasterTicketSlot, semantic_generation) == 440,
+				 "PCM-X master semantic witness offsets");
 StaticAssertDecl(sizeof(PcmXBlockerSlot) == 128, "PCM-X blocker slot ABI");
-StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 768, "PCM-X local tag slot ABI");
+StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 824, "PCM-X local tag slot ABI");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, grant_base_own_generation) == 760,
 				 "PCM-X local tag grant-base offset");
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, logical_assertion) == 768,
+				 "PCM-X local logical assertion offset");
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, attempt_base_generation) == 792,
+				 "PCM-X local attempt-base offset");
+StaticAssertDecl(offsetof(PcmXLocalTagSlot, transport_epoch) == 800
+					 && offsetof(PcmXLocalTagSlot, transport_session) == 808
+					 && offsetof(PcmXLocalTagSlot, semantic_generation) == 816,
+				 "PCM-X local semantic witness offsets");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, membership_count) == 384,
 				 "PCM-X local membership count offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, closed_round_member_count) == 392,

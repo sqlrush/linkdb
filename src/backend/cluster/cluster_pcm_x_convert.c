@@ -4039,6 +4039,11 @@ pcm_x_master_admit_begin_impl(const PcmXEnqueuePayload *request, PcmXMasterAdmis
 	ticket->blocker_set_source_node = -1;
 	ticket->involved_nodes_bitmap = node_bit;
 	ticket->grant_base_own_generation = 0;
+	ticket->logical_assertion = logical_assertion;
+	ticket->attempt_base_generation = request->identity.base_own_generation;
+	ticket->transport_epoch = request->identity.cluster_epoch;
+	ticket->transport_session = request->prehandle.sender_session_incarnation;
+	ticket->semantic_generation = 0;
 
 	if (new_tag) {
 		directory_result = pcm_x_directory_insert_locked(
@@ -4154,6 +4159,11 @@ allocator_done:
 		|| (new_tag && pcm_x_slot_state_read(&tag_slot->slot) != PCM_X_TAG_RESERVED_NONVISIBLE)
 		|| (!new_tag && pcm_x_slot_state_read(&tag_slot->slot) != PCM_X_TAG_LIVE)
 		|| !BufferTagsEqual(&tag_slot->tag, &request->identity.tag)
+		|| !resource_x_assertion_equal(&ticket->logical_assertion, &logical_assertion)
+		|| ticket->attempt_base_generation != request->identity.base_own_generation
+		|| ticket->transport_epoch != request->identity.cluster_epoch
+		|| ticket->transport_session != request->prehandle.sender_session_incarnation
+		|| ticket->semantic_generation != 0
 		|| ticket->tag_slot_index != tag_ref.slot_index
 		|| ticket->tag_slot_generation != tag_ref.slot_generation
 		|| pg_atomic_read_u32(&tag_slot->admission_gate) != 1) {
@@ -10715,6 +10725,11 @@ pcm_x_local_tag_init_common(PcmXLocalTagSlot *tag_slot, const BufferTag *tag, ui
 	tag_slot->terminal_drain_generation = 0;
 	tag_slot->committed_own_generation = 0;
 	tag_slot->grant_base_own_generation = 0;
+	memset(&tag_slot->logical_assertion, 0, sizeof(tag_slot->logical_assertion));
+	tag_slot->attempt_base_generation = 0;
+	tag_slot->transport_epoch = 0;
+	tag_slot->transport_session = 0;
+	tag_slot->semantic_generation = 0;
 	memset(&tag_slot->holder_ref, 0, sizeof(tag_slot->holder_ref));
 	memset(&tag_slot->holder_image, 0, sizeof(tag_slot->holder_image));
 	tag_slot->holder_required_page_scn = 0;
@@ -10723,6 +10738,21 @@ pcm_x_local_tag_init_common(PcmXLocalTagSlot *tag_slot, const BufferTag *tag, ui
 	memset(&tag_slot->blocker_snapshot_ref, 0, sizeof(tag_slot->blocker_snapshot_ref));
 	memset(&tag_slot->blocker_snapshot_reliable, 0, sizeof(tag_slot->blocker_snapshot_reliable));
 	pcm_x_slot_flags_write(&tag_slot->slot, PCM_X_LOCAL_TAG_F_ADMISSION_GATE);
+}
+
+
+static bool
+pcm_x_local_semantic_projection_clear(const PcmXLocalTagSlot *tag_slot)
+{
+	ResourceXAssertion zero;
+
+	memset(&zero, 0, sizeof(zero));
+	return tag_slot != NULL
+		&& memcmp(&tag_slot->logical_assertion, &zero, sizeof(zero)) == 0
+		&& tag_slot->attempt_base_generation == 0
+		&& tag_slot->transport_epoch == 0
+		&& tag_slot->transport_session == 0
+		&& tag_slot->semantic_generation == 0;
 }
 
 
@@ -13966,6 +13996,7 @@ cluster_pcm_x_local_join_begin(const PcmXWaitIdentity *identity, int32 master_no
 	bool member_directory_published = false;
 	bool fail_closed = false;
 	bool adopt_holder_only_tag = false;
+	bool initialize_logical_assertion = false;
 
 	pcm_x_local_handle_clear(handle_out);
 	if (header == NULL || handle_out == NULL || !pcm_x_wait_identity_valid(identity)
@@ -14055,6 +14086,15 @@ cluster_pcm_x_local_join_begin(const PcmXWaitIdentity *identity, int32 master_no
 			fail_closed = true;
 			goto allocator_done;
 		}
+		if (!resource_x_assertion_valid(&tag_slot->logical_assertion)) {
+			if (!pcm_x_local_semantic_projection_clear(tag_slot)
+				|| tag_slot->membership_count != 0) {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+				goto allocator_done;
+			}
+			initialize_logical_assertion = true;
+		}
 		flags = pcm_x_slot_flags_read(&tag_slot->slot);
 		if (tag_slot->next_sequence == 0 || tag_slot->next_sequence == UINT64_MAX
 			|| tag_slot->membership_count == SIZE_MAX
@@ -14077,6 +14117,10 @@ cluster_pcm_x_local_join_begin(const PcmXWaitIdentity *identity, int32 master_no
 		tag_slot = (PcmXLocalTagSlot *)raw_slot;
 		pcm_x_local_tag_init_common(tag_slot, &identity->tag, identity->cluster_epoch, master_node,
 									master_session_incarnation);
+		tag_slot->logical_assertion = logical_assertion;
+		tag_slot->attempt_base_generation = identity->base_own_generation;
+		tag_slot->transport_epoch = identity->cluster_epoch;
+		tag_slot->transport_session = master_session_incarnation;
 		local_sequence = 1;
 	} else {
 		result = pcm_x_queue_result_from_directory(directory_result);
@@ -14216,6 +14260,25 @@ allocator_done:
 		tag_slot->master_session_incarnation = master_session_incarnation;
 	} else if (tag_slot->master_node != master_node
 			   || tag_slot->master_session_incarnation != master_session_incarnation) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto domain_done;
+	}
+	if (initialize_logical_assertion) {
+		if (!pcm_x_local_semantic_projection_clear(tag_slot)
+			|| tag_slot->membership_count != 0) {
+			result = PCM_X_QUEUE_CORRUPT;
+			goto domain_done;
+		}
+		tag_slot->logical_assertion = logical_assertion;
+		tag_slot->attempt_base_generation = identity->base_own_generation;
+		tag_slot->transport_epoch = identity->cluster_epoch;
+		tag_slot->transport_session = master_session_incarnation;
+	}
+	if (!resource_x_assertion_equal(&tag_slot->logical_assertion, &logical_assertion)
+		|| !BufferTagsEqual(&tag_slot->logical_assertion.resource, &tag_slot->tag)
+		|| tag_slot->transport_epoch != tag_slot->cluster_epoch
+		|| tag_slot->transport_session != tag_slot->master_session_incarnation
+		|| tag_slot->semantic_generation != 0) {
 		result = PCM_X_QUEUE_CORRUPT;
 		goto domain_done;
 	}

@@ -2268,7 +2268,7 @@ UT_TEST(test_wire_abi_offsets_are_exact)
 
 UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 {
-	UT_ASSERT_EQ(PCM_X_SHMEM_LAYOUT_VERSION, 15);
+	UT_ASSERT_EQ(PCM_X_SHMEM_LAYOUT_VERSION, 16);
 	UT_ASSERT_EQ(PCM_X_LOCK_PARTITIONS, NUM_BUFFER_PARTITIONS);
 	UT_ASSERT_EQ(PCM_X_LWLOCK_COUNT, 257);
 	UT_ASSERT_EQ(sizeof(PcmXShmemLayout), 440);
@@ -2291,11 +2291,21 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(offsetof(PcmXLocalHolderProgress, master_node), 160);
 	UT_ASSERT_EQ(sizeof(PcmXLocalBlockerSnapshot), 112);
 	UT_ASSERT_EQ(sizeof(PcmXMasterTagSlot), 120);
-	UT_ASSERT_EQ(sizeof(PcmXMasterTicketSlot), 392);
+	UT_ASSERT_EQ(sizeof(PcmXMasterTicketSlot), 448);
 	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, grant_base_own_generation), 384);
 	UT_ASSERT_EQ(sizeof(PcmXBlockerSlot), 128);
-	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 768);
+	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 824);
 	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, grant_base_own_generation), 760);
+	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, logical_assertion), 392);
+	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, attempt_base_generation), 416);
+	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, transport_epoch), 424);
+	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, transport_session), 432);
+	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, semantic_generation), 440);
+	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, logical_assertion), 768);
+	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, attempt_base_generation), 792);
+	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, transport_epoch), 800);
+	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, transport_session), 808);
+	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, semantic_generation), 816);
 	UT_ASSERT_EQ(sizeof(PcmXLocalMembershipSlot), 168);
 	UT_ASSERT_EQ(sizeof(PcmXPeerFrontier), 48);
 	UT_ASSERT_EQ(sizeof(PcmXPeerBinding), 16);
@@ -2348,6 +2358,52 @@ UT_TEST(test_runtime_layout_abi_and_offsets_are_exact)
 	UT_ASSERT_EQ(sizeof(PcmXShmemHeader), 36920);
 }
 
+UT_TEST(test_resource_x_semantic_projections_follow_master_and_local_admission)
+{
+	PcmXShmemHeader *header;
+	PcmXMasterAdmission admission;
+	PcmXMasterTicketSlot *ticket;
+	PcmXLocalHandle local;
+	PcmXLocalTagSlot *local_tag;
+	PcmXEnqueuePayload request;
+	PcmXWaitIdentity identity;
+	ResourceXAssertion expected;
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	request = make_enqueue(make_wait_identity(612, 2, 17, UINT64_C(61001)),
+		UINT64_C(602), UINT64_C(1));
+	request.identity.base_own_generation = UINT64_C(44);
+	bind_enqueue_peer(&request);
+	UT_ASSERT(resource_x_assertion_init(&request.identity.tag,
+		request.identity.node_id, &expected));
+	UT_ASSERT_EQ(cluster_pcm_x_master_admit_begin(&request, &admission), PCM_X_QUEUE_OK);
+	ticket = &master_ticket_slots(header)[admission.ticket_slot.slot_index];
+	UT_ASSERT(resource_x_assertion_equal(&ticket->logical_assertion, &expected));
+	UT_ASSERT_EQ(ticket->attempt_base_generation, UINT64_C(44));
+	UT_ASSERT_EQ(ticket->transport_epoch, request.identity.cluster_epoch);
+	UT_ASSERT_EQ(ticket->transport_session,
+		request.prehandle.sender_session_incarnation);
+	UT_ASSERT_EQ(ticket->semantic_generation, UINT64_C(0));
+
+	init_active_pcm_x(UINT64_C(77));
+	header = ClusterPcmXConvertShmem;
+	bind_local_master(1, UINT64_C(9), UINT64_C(177));
+	identity = make_wait_identity(613, 0, 18, UINT64_C(61002));
+	identity.base_own_generation = UINT64_C(45);
+	UT_ASSERT(resource_x_assertion_init(&identity.tag, identity.node_id,
+		&expected));
+	UT_ASSERT_EQ(cluster_pcm_x_local_join_begin(&identity, 1,
+		UINT64_C(177), &local), PCM_X_QUEUE_OK);
+	local_tag = &local_tag_slots(header)[local.tag_slot.slot_index];
+	UT_ASSERT(resource_x_assertion_equal(&local_tag->logical_assertion,
+		&expected));
+	UT_ASSERT_EQ(local_tag->attempt_base_generation, UINT64_C(45));
+	UT_ASSERT_EQ(local_tag->transport_epoch, identity.cluster_epoch);
+	UT_ASSERT_EQ(local_tag->transport_session, UINT64_C(177));
+	UT_ASSERT_EQ(local_tag->semantic_generation, UINT64_C(0));
+}
+
 UT_TEST(test_lwlock_held_limit_is_shared_200)
 {
 	UT_ASSERT_EQ(LWLOCK_MAX_HELD_BY_PROC, 200);
@@ -2393,12 +2449,12 @@ UT_TEST(test_exactly_five_pools_and_bounded_directories)
 	UT_ASSERT_EQ(layout.local_holder.directory_capacity, layout.local_holder.capacity * 2);
 }
 
-UT_TEST(test_layout_v15_preserves_transfer_and_terminal_frontiers)
+UT_TEST(test_layout_v16_preserves_transfer_and_terminal_frontiers)
 {
 	PcmXShmemLayout layout;
 
 	cluster_pcm_x_layout_compute(122, 25, 16384, 1024, &layout);
-	UT_ASSERT_EQ(layout.version, 15);
+	UT_ASSERT_EQ(layout.version, 16);
 	UT_ASSERT_EQ(layout.lock_partition_count, PCM_X_LOCK_PARTITIONS);
 	UT_ASSERT_EQ(layout.lwlock_count, PCM_X_LWLOCK_COUNT);
 	UT_ASSERT_EQ(sizeof(PcmXPeerFrontier), 48);
@@ -17365,16 +17421,17 @@ UT_TEST(test_runtime_reform_tag_epoch_failure_keeps_blocked)
 int
 main(void)
 {
-	UT_PLAN(288);
+	UT_PLAN(289);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
 	UT_RUN(test_runtime_layout_abi_and_offsets_are_exact);
+	UT_RUN(test_resource_x_semantic_projections_follow_master_and_local_admission);
 	UT_RUN(test_runtime_rebase_wire_active_is_activation_bound);
 	UT_RUN(test_lwlock_held_limit_is_shared_200);
 	UT_RUN(test_default_capacity_formulas_are_exact);
 	UT_RUN(test_exactly_five_pools_and_bounded_directories);
-	UT_RUN(test_layout_v15_preserves_transfer_and_terminal_frontiers);
+	UT_RUN(test_layout_v16_preserves_transfer_and_terminal_frontiers);
 	UT_RUN(test_offsets_are_aligned_ordered_and_bounded);
 	UT_RUN(test_membership_wait_and_holder_partitions_do_not_overlap);
 	UT_RUN(test_generation_zero_advances_without_being_a_sentinel);
