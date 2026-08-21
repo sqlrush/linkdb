@@ -697,16 +697,16 @@ UT_TEST(test_parallel_s_cover_is_rechecked_before_legacy_token_mint)
 	/* Exercise the production cover predicate directly.  S readers may accept
 	 * a stable successor generation; X writers remain generation-exact. */
 	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_S, 1, 1, (uint8)PCM_STATE_S, 0));
+		(uint8)PCM_LOCK_MODE_S, 1, 1, (uint8)PCM_STATE_S, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
 		(uint8)PCM_LOCK_MODE_S, 1, 1, (uint8)PCM_STATE_S,
-		PCM_OWN_FLAG_GRANT_PENDING));
+		PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_X, 1, 1, (uint8)PCM_STATE_S, 0));
+		(uint8)PCM_LOCK_MODE_X, 1, 1, (uint8)PCM_STATE_S, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_X, 1, 2, (uint8)PCM_STATE_X, 0));
+		(uint8)PCM_LOCK_MODE_X, 1, 2, (uint8)PCM_STATE_X, 0, 0, 0));
 	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_S, 1, 2, (uint8)PCM_STATE_S, 0));
+		(uint8)PCM_LOCK_MODE_S, 1, 2, (uint8)PCM_STATE_S, 0, 0, 0));
 
 	/* bufmgr is not standalone-linkable; keep only narrow wiring pins around
 	 * the real helper above.  All three legacy callers must propagate COVERED
@@ -721,31 +721,65 @@ UT_TEST(test_parallel_s_cover_is_rechecked_before_legacy_token_mint)
 
 UT_TEST(test_share_cover_reverify_accepts_stable_successor_grant)
 {
+	static const char *const initial_fence_contract[]
+		= { "cluster_bufmgr_pcm_own_snapshot(buf, &pcm_initial_own)",
+			"!cluster_pcm_x_activation_fence_open(",
+			"cluster_bufmgr_pcm_x_holder_retry_wait(",
+			"cluster_pcm_x_cached_cover_bypasses_queue(" };
+	static const char *const post_content_fence_contract[]
+		= { "while (pcm_covered)", "cur_own.resource_x_activation_generation",
+			"LWLockRelease(BufferDescriptorGetContentLock(buf))",
+			"cluster_bufmgr_pcm_x_holder_abort_acquiring(pcm_x_holder)",
+			"cluster_bufmgr_pcm_x_holder_retry_wait(",
+			"cluster_pcm_x_cached_cover_reverify_accepts(",
+			"LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE)",
+			"continue;" };
+	char *source;
+
 	/* Once content authority is held, a stable current S/X successor is the
 	 * exact node-level grant for a read.  Generation drift alone must not open
 	 * a fresh legacy reservation from S (the forbidden S_NEW shape). */
 	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(13),
-														  UINT64_C(14), (uint8)PCM_STATE_S, 0));
+												  UINT64_C(14), (uint8)PCM_STATE_S, 0, 0, 0));
 	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(13),
-														  UINT64_C(14), (uint8)PCM_STATE_X, 0));
+												  UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
 
 	/* A writer keeps the stricter generation-exact gate and must re-enter the
 	 * convert queue after any ownership round.  A non-covering or live
 	 * lifecycle remains closed for both modes. */
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(13),
-														   UINT64_C(14), (uint8)PCM_STATE_X, 0));
+												   UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
 	UT_ASSERT(cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(14),
-														  UINT64_C(14), (uint8)PCM_STATE_X, 0));
+												  UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(14),
-														   UINT64_C(14), (uint8)PCM_STATE_S, 0));
+												   UINT64_C(14), (uint8)PCM_STATE_S, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(14),
-														   UINT64_C(14), (uint8)PCM_STATE_S,
-														   PCM_OWN_FLAG_GRANT_PENDING));
+												   UINT64_C(14), (uint8)PCM_STATE_S,
+												   PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_S, UINT64_C(14),
-														   UINT64_C(14), (uint8)PCM_STATE_S,
-														   PCM_OWN_FLAG_REVOKING));
+												   UINT64_C(14), (uint8)PCM_STATE_S,
+												   PCM_OWN_FLAG_REVOKING, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_N, UINT64_C(14),
-														   UINT64_C(14), (uint8)PCM_STATE_X, 0));
+												   UINT64_C(14), (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(14),
+												   UINT64_C(14), (uint8)PCM_STATE_X, 0,
+												   UINT64_C(91), 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts((uint8)PCM_LOCK_MODE_X, UINT64_C(14),
+												   UINT64_C(14), (uint8)PCM_STATE_X, 0,
+												   UINT64_C(91), UINT64_C(22)));
+
+	/* The production cached-X entrance must wait on the same live grant both
+	 * before queue bypass and after the content-lock race closes.  It may
+	 * re-arbitrate only after the coherent cover itself changes. */
+	source = read_bufmgr_source();
+	assert_ordered_in_function(source, "\nLockBufferInternal(",
+							   "\nvoid\nLockBuffer(", initial_fence_contract,
+							   lengthof(initial_fence_contract));
+	assert_ordered_in_function(source, "\t\t\twhile (pcm_covered)",
+							   "cluster_pcm_note_writer_reverify_reacquire();",
+							   post_content_fence_contract,
+							   lengthof(post_content_fence_contract));
+	free(source);
 }
 
 UT_TEST(test_revoke_commit_is_exact_and_classifies_live_races)
@@ -2967,14 +3001,18 @@ UT_TEST(test_queue_writer_grant_snapshot_is_claim_and_generation_exact)
 	UT_ASSERT(!cluster_pcm_x_should_release_legacy_on_unlock(true, false));
 	UT_ASSERT(!cluster_pcm_x_should_release_legacy_on_unlock(true, true));
 
-	UT_ASSERT(cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_X, 0));
-	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(false, true, (uint8)PCM_STATE_X, 0));
-	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, false, (uint8)PCM_STATE_X, 0));
-	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_S, 0));
+	UT_ASSERT(cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(false, true, (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, false, (uint8)PCM_STATE_X, 0, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_S, 0, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_X,
-														 PCM_OWN_FLAG_GRANT_PENDING));
+												 PCM_OWN_FLAG_GRANT_PENDING, 0, 0));
 	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_X,
-												 PCM_OWN_FLAG_REVOKING));
+										 PCM_OWN_FLAG_REVOKING, 0, 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_X, 0,
+												 UINT64_C(91), 0));
+	UT_ASSERT(!cluster_pcm_x_cached_cover_bypasses_queue(true, true, (uint8)PCM_STATE_X, 0,
+												 UINT64_C(91), UINT64_C(22)));
 }
 
 UT_TEST(test_queue_writer_activation_fence_is_leader_owned_per_grant)

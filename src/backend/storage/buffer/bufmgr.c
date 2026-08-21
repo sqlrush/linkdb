@@ -1063,11 +1063,18 @@ cluster_pcm_own_begin_grant_reservation(BufferDesc *buf, PcmLockMode requested_m
 	if (cluster_gcs_block_local_cache
 		&& cluster_pcm_x_cached_cover_reverify_accepts(
 			(uint8)requested_mode, out_base->generation, out_base->generation,
-			out_base->pcm_state, out_base->flags))
+			out_base->pcm_state, out_base->flags, out_base->writer_activation_token,
+			out_base->resource_x_activation_generation))
 	{
 		*out_covered = true;
 		result = CLUSTER_PCM_OWN_OK;
 	}
+	else if (cluster_gcs_block_local_cache && out_base->flags == 0
+			 && cluster_pcm_mode_covers((PcmLockMode)out_base->pcm_state, requested_mode)
+			 && !cluster_pcm_x_activation_fence_open(
+					out_base->writer_activation_token,
+					out_base->resource_x_activation_generation))
+		result = CLUSTER_PCM_OWN_BUSY;
 	else
 		result = cluster_pcm_own_reservation_begin_exact(buf->buf_id, out_base->generation,
 											 PCM_OWN_FLAG_GRANT_PENDING, out_token);
@@ -9110,7 +9117,7 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 	uint64		pcm_covered_gen = 0;	/* ownership generation captured at cover */
 	bool		pcm_pending_set = false;	/* we set GRANT_PENDING (W3), must clear */
 	MemoryContext pcm_error_context = CurrentMemoryContext;
-	ClusterPcmOwnSnapshot pcm_pending_base;
+	ClusterPcmOwnSnapshot pcm_pending_base = {0};
 	ClusterPcmOwnResult pcm_pending_result = CLUSTER_PCM_OWN_OK;
 	uint64		pcm_pending_token = 0;
 	uint64		pcm_committed_generation = 0;
@@ -9120,6 +9127,7 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 	bool pcm_x_writer_managed = false;
 	bool pcm_retry_denied = false;
 	uint32 pcm_retry_wait_index = 0;
+	ClusterPcmOwnSnapshot pcm_initial_own;
 #endif
 
 	Assert(BufferIsPinned(buffer));
@@ -9138,21 +9146,42 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 		cluster_pcm_is_active() &&
 		cluster_bufmgr_should_pcm_track(buf))
 	{
-		uint8		pcm_initial_state = (uint8)PCM_STATE_N;
-		uint32		pcm_initial_flags = 0;
-
 		pcm_mode = (mode == BUFFER_LOCK_SHARE) ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
 
 		/* A queue grant leaves node X cached until revoke.  Preserve that
 		 * authority before deciding that this LockBuffer is a new writer
 		 * conversion; otherwise every local write needlessly retires and
-		 * re-enqueues the same node X.  The post-content-lock generation
-		 * check below remains the race-closing authority. */
+		 * re-enqueues the same node X.  A coherent sidecar sample waits out an
+		 * already-granted activation before the cover decision; the
+		 * post-content-lock check below remains the race-closing authority. */
 		if (pcm_mode == PCM_LOCK_MODE_X && cluster_gcs_block_local_cache) {
-			cluster_pcm_own_read(buf, &pcm_initial_state, &pcm_covered_gen,
-								 &pcm_initial_flags);
-			pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(cluster_gcs_block_local_cache,
-				pcm_mode == PCM_LOCK_MODE_X, pcm_initial_state, pcm_initial_flags);
+			for (;;)
+			{
+				if (cluster_bufmgr_pcm_own_snapshot(buf, &pcm_initial_own)
+					!= CLUSTER_PCM_OWN_OK)
+					break;
+				pcm_covered_gen = pcm_initial_own.generation;
+				if (pcm_initial_own.pcm_state == (uint8)PCM_STATE_X
+					&& pcm_initial_own.flags == 0
+					&& !cluster_pcm_x_activation_fence_open(
+						pcm_initial_own.writer_activation_token,
+						pcm_initial_own.resource_x_activation_generation))
+				{
+					cluster_bufmgr_pcm_x_holder_retry_wait(
+						BufferDescriptorGetContentLock(buf), buf->buf_id,
+						pcm_retry_wait_index, pcm_barrier_refused);
+					if (pcm_retry_wait_index < PG_UINT32_MAX)
+						pcm_retry_wait_index++;
+					if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+						goto cluster_lockbuffer_barrier_refusal;
+					continue;
+				}
+				pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(
+					cluster_gcs_block_local_cache, true, pcm_initial_own.pcm_state,
+					pcm_initial_own.flags, pcm_initial_own.writer_activation_token,
+					pcm_initial_own.resource_x_activation_generation);
+				break;
+			}
 		}
 
 		if (!pcm_covered)
@@ -9405,7 +9434,7 @@ pcm_legacy_acquire_done:
 			/*
 			 * PGRAC ownership-generation wave (W1) — cached-cover
 			 * re-verify. The cover fast path decided we already held the mode
-			 * on a raw, unlocked pcm_state read.  A BAST X->S downgrade (or
+			 * on a coherent pre-lock sidecar sample.  A BAST X->S downgrade (or
 			 * any ownership round) can have raced this content-lock window.
 			 * Re-read the coherent ownership tuple now that content authority
 			 * serializes page-image transitions.  A stable successor S/X still
@@ -9416,19 +9445,94 @@ pcm_legacy_acquire_done:
 			 * content lock and the downgrade path serializes under it, so no
 			 * further downgrade can intervene -- at most one fallback.
 			 */
-			if (pcm_covered)
+			while (pcm_covered)
 			{
-				uint8		cur_state;
-				uint64		cur_gen;
-				uint32		cur_flags;
+				ClusterPcmOwnSnapshot cur_own;
+				bool		activation_wait;
 
-				cluster_pcm_own_read(buf, &cur_state, &cur_gen, &cur_flags);
+				if (cluster_bufmgr_pcm_own_snapshot(buf, &cur_own)
+					!= CLUSTER_PCM_OWN_OK)
+					cluster_bufmgr_pcm_x_writer_report_failure(
+						PCM_X_QUEUE_NOT_READY, buf, "cached cover snapshot");
 				if (!cluster_pcm_x_cached_cover_reverify_accepts(
-						(uint8) pcm_mode, pcm_covered_gen, cur_gen, cur_state, cur_flags))
+						(uint8) pcm_mode, pcm_covered_gen, cur_own.generation,
+						cur_own.pcm_state, cur_own.flags,
+						cur_own.writer_activation_token,
+						cur_own.resource_x_activation_generation))
 				{
+					activation_wait = cluster_pcm_x_cached_cover_reverify_accepts(
+						(uint8) pcm_mode, pcm_covered_gen, cur_own.generation,
+						cur_own.pcm_state, cur_own.flags, 0, 0)
+						&& !cluster_pcm_x_activation_fence_open(
+							cur_own.writer_activation_token,
+							cur_own.resource_x_activation_generation);
 					cluster_pcm_note_writer_cover_stale_detected();
 					pcm_covered = false;
 					LWLockRelease(BufferDescriptorGetContentLock(buf));
+
+					/* A T2/legacy activation that raced the content-lock window is
+					 * the same already-granted acquisition, not a new writer
+					 * conversion.  Detach this tentative local holder, wait off-lock,
+					 * and re-sample until that exact cover either opens or is replaced.
+					 * Only the latter case may fall through to ordinary re-arbitration. */
+					if (activation_wait)
+					{
+						if (pcm_x_holder != NULL)
+						{
+							cluster_bufmgr_pcm_x_holder_abort_acquiring(pcm_x_holder);
+							pcm_x_holder = NULL;
+						}
+						for (;;)
+						{
+							cluster_bufmgr_pcm_x_holder_retry_wait(
+								BufferDescriptorGetContentLock(buf), buf->buf_id,
+								pcm_retry_wait_index, pcm_barrier_refused);
+							if (pcm_retry_wait_index < PG_UINT32_MAX)
+								pcm_retry_wait_index++;
+							if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+								break;
+							if (cluster_bufmgr_pcm_own_snapshot(buf, &cur_own)
+								!= CLUSTER_PCM_OWN_OK)
+								cluster_bufmgr_pcm_x_writer_report_failure(
+									PCM_X_QUEUE_NOT_READY, buf,
+									"cached cover activation wait");
+							if (cluster_pcm_x_cached_cover_reverify_accepts(
+									(uint8) pcm_mode, pcm_covered_gen,
+									cur_own.generation, cur_own.pcm_state, cur_own.flags,
+									cur_own.writer_activation_token,
+									cur_own.resource_x_activation_generation))
+							{
+								pcm_covered = true;
+								pcm_covered_gen = cur_own.generation;
+								break;
+							}
+							if (!cluster_pcm_x_cached_cover_reverify_accepts(
+									(uint8) pcm_mode, pcm_covered_gen,
+									cur_own.generation, cur_own.pcm_state, cur_own.flags,
+									0, 0))
+								break;
+						}
+						if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+						{
+							if (pcm_covered)
+							{
+								pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
+									buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base,
+									&pcm_pending_token, &pcm_acquired, &pcm_pending_set,
+									&pcm_covered, &pcm_covered_gen, &pcm_retry_wait_index);
+								if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+								{
+									if (mode == BUFFER_LOCK_SHARE)
+										LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+									else
+										LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+									continue;
+								}
+							}
+						}
+					}
+					if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
+						break;
 
 					/*
 					 * PGRAC (t/400 fast-fail finish family): a stale X cover

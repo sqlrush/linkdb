@@ -282,15 +282,30 @@ cluster_pcm_x_should_release_legacy_on_unlock(bool local_cache, bool queue_manag
 	return !local_cache && !queue_managed;
 }
 
+/* A tracked current-X page is not an ordinary writable entrance until both
+ * the legacy grant->content activation and Resource-X T2->T3 activation have
+ * opened.  Every fast/conditional/direct write gate delegates to this one
+ * predicate so a newly added entrance cannot accidentally check only one
+ * sidecar field. */
+static inline bool
+cluster_pcm_x_activation_fence_open(uint64 writer_activation_token,
+									uint64 resource_x_activation_generation)
+{
+	return writer_activation_token == 0 && resource_x_activation_generation == 0;
+}
+
 /* A committed node X is cache residency authority, not a fresh writer
  * conversion.  Consult the coherent ownership tuple before JOIN so repeated
  * local LockBuffer(X) calls keep the spec-4.7a hold-until-revoked fast path.
  * Any transition flag forces the caller through normal arbitration/recheck. */
 static inline bool
 cluster_pcm_x_cached_cover_bypasses_queue(bool local_cache, bool requested_x, uint8 pcm_state,
-										  uint32 flags)
+										  uint32 flags, uint64 writer_activation_token,
+										  uint64 resource_x_activation_generation)
 {
-	return local_cache && requested_x && pcm_state == (uint8)PCM_STATE_X && flags == 0;
+	return local_cache && requested_x && pcm_state == (uint8)PCM_STATE_X && flags == 0
+		   && cluster_pcm_x_activation_fence_open(writer_activation_token,
+											  resource_x_activation_generation);
 }
 
 /* Revalidate a cached cover after the caller has acquired content authority.
@@ -304,13 +319,17 @@ cluster_pcm_x_cached_cover_bypasses_queue(bool local_cache, bool requested_x, ui
 static inline bool
 cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captured_generation,
 											uint64 current_generation, uint8 current_state,
-											uint32 current_flags)
+											uint32 current_flags,
+											uint64 writer_activation_token,
+											uint64 resource_x_activation_generation)
 {
 	bool covers;
 
 	if (requested_state != (uint8)PCM_STATE_S && requested_state != (uint8)PCM_STATE_X)
 		return false;
-	if (current_flags != 0)
+	if (current_flags != 0
+		|| !cluster_pcm_x_activation_fence_open(writer_activation_token,
+											 resource_x_activation_generation))
 		return false;
 	covers = current_state == (uint8)PCM_STATE_X
 			 || (requested_state == (uint8)PCM_STATE_S && current_state == (uint8)PCM_STATE_S);
@@ -330,8 +349,9 @@ cluster_pcm_x_ordinary_mutation_allowed(bool runtime_active, bool tracked, bool 
 {
 	return !retained_image && flags == 0
 		   && (!runtime_active || !tracked
-			   || (pcm_state == (uint8)PCM_STATE_X && writer_activation_token == 0
-				   && resource_x_activation_generation == 0));
+			   || (pcm_state == (uint8)PCM_STATE_X
+				   && cluster_pcm_x_activation_fence_open(
+						writer_activation_token, resource_x_activation_generation)));
 }
 
 static inline bool
@@ -349,8 +369,8 @@ static inline bool
 cluster_pcm_x_flush_fence_consistent(bool dirty, uint64 writer_activation_token,
 									 uint64 resource_x_activation_generation)
 {
-	return !dirty || (writer_activation_token == 0
-					&& resource_x_activation_generation == 0);
+	return !dirty || cluster_pcm_x_activation_fence_open(
+		writer_activation_token, resource_x_activation_generation);
 }
 
 typedef ClusterPcmOwnSnapshot ClusterPcmOwnEvictionCapture;
