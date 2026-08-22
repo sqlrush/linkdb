@@ -10,6 +10,11 @@ Resource-X 是 PGRAC 新一代全局数据块独占访问协议。它解决的�
 retry、reconnect、successor 和 formation recovery 如何区分”，可先阅读独立专题
 [Resource-X 请求代际：让重试、重连和恢复始终指向同一次获取](../resource-x-request-generation/README.md)。
 
+如果要理解 resource master 只看到 `N + PI`、却没有可直接路由的 current holder 时，为什么
+不能任选 PI，以及 exact last-current lineage、proof-image retained pair 和完整 grant 复核如何
+形成一个窄的 fail-closed fast path，请阅读
+[Resource-X Last-Current Carrier：从 N+PI 到唯一可写 X](../resource-x-last-current-carrier/README.md)。
+
 ## 阅读顺序
 
 ```mermaid

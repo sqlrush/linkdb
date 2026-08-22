@@ -20,6 +20,9 @@ and safe rejoin, see
 For the target block-X acquisition model, logical identity, bounded retry,
 T1/T2/T3 write fencing, reconfiguration sweep, and ticket-path cutover, see
 [Resource-X：从逻辑资源到可写 X 的完整链路](resource-x/README.md).
+For the narrowly proven `N + PI` case, exact last-current lineage,
+proof-image retention, master revalidation, and fail-closed fallback, see
+[Resource-X Last-Current Carrier：从 N+PI 到唯一可写 X](resource-x-last-current-carrier/README.md).
 For a focused explanation of how one immutable request generation keeps
 duplicates, retries, reconnects, successors, local buffer activation, and
 formation recovery attached to the same acquisition, see
