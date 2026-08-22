@@ -321,6 +321,35 @@ typedef struct ResourceXMasterSnapshot {
 StaticAssertDecl(sizeof(ResourceXMasterSnapshot) == 96,
 				 "ResourceXMasterSnapshot layout must remain 96 bytes");
 
+#define RESOURCE_X_REQUESTER_JOIN_HAS_IMAGE UINT32_C(0x00000001)
+#define RESOURCE_X_REQUESTER_JOIN_HAS_GRANT UINT32_C(0x00000002)
+#define RESOURCE_X_REQUESTER_JOIN_READY UINT32_C(0x00000004)
+#define RESOURCE_X_REQUESTER_JOIN_TERMINAL UINT32_C(0x00000008)
+#define RESOURCE_X_REQUESTER_JOIN_KNOWN_MASK UINT32_C(0x0000000f)
+
+/* Requester-local retained view of the two independent type-15 halves.
+ * Connection-generation freshness is validated by ingress but is not part
+ * of this logical equality snapshot. */
+typedef struct ResourceXRequesterJoinSnapshot {
+	ResourceXAssertion assertion;
+	uint64 base_authority_generation;
+	uint64 resource_formation;
+	uint64 master_session_incarnation;
+	uint64 assertion_sequence;
+	uint64 final_authority_generation;
+	uint64 source_carrier_generation;
+	uint64 requester_target_generation;
+	uint64 t_image_us;
+	uint64 t_grant_us;
+	int32 grant_source_node;
+	int32 image_source_node;
+	uint32 flags;
+	uint32 reserved;
+} ResourceXRequesterJoinSnapshot;
+
+StaticAssertDecl(sizeof(ResourceXRequesterJoinSnapshot) == 112,
+				 "ResourceXRequesterJoinSnapshot layout must remain 112 bytes");
+
 /* Exact, process-local D2 result retained for the R8 sweep owner.  This is
  * deliberately not a wire structure and carries both the removed queue
  * identity and the successor selected under the same resource-entry lock. */
@@ -751,6 +780,17 @@ cluster_pcm_lock_resource_x_t1_grant_exact(const ResourceXAcquisitionRef *ref);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_exact(
 	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
 	ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_block_to_n_source_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	const ResourceXDecodedFrame *blocked_status,
+	const ResourceXDecodedFrame *image_envelope);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_status_exact(
+	const ResourceXAssertion *assertion, ResourceXDecodedFrame *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_image_exact(
+	const ResourceXAssertion *assertion, ResourceXDecodedFrame *out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_blocked_to_n_exact(
 	const ResourceXDecodedFrame *blocked, int32 authenticated_source_node,
 	ResourceXMasterSnapshot *out);
@@ -763,6 +803,13 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_master_snapshot_exact(
 	const ResourceXAssertion *assertion, ResourceXMasterSnapshot *out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_authority_grant_exact(
 	const ResourceXAssertion *assertion, ResourceXDecodedFrame *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_exact(
+	const ResourceXDecodedFrame *frame, int32 authenticated_source_node,
+	ResourceXRequesterJoinSnapshot *out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_join_frames_exact(
+	const ResourceXAssertion *assertion, ResourceXDecodedFrame *grant_out,
+	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_settlement_exact(
 	const ResourceXDecodedFrame *settlement, int32 authenticated_source_node,
 	ResourceXMasterSnapshot *out);
@@ -788,6 +835,18 @@ extern ResourceXIntentResult cluster_pcm_lock_resource_x_intent_hard_rearm_exact
 	uint64 now_us);
 extern bool cluster_pcm_lock_resource_x_intent_complete_exact(
 	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, int32 holder_node,
+	ResourceXIntentSlot *slot_out, void *payload_out,
+	uint16 payload_capacity);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
+	void *payload_out, uint16 payload_capacity);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
+	void *payload_out, uint16 payload_capacity);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
 	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
 	void *payload_out, uint16 payload_capacity);
@@ -801,6 +860,25 @@ cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(
 	const ResourceXIntentSlot *expected, uint64 now_us);
 extern bool cluster_pcm_lock_resource_x_grant_intent_complete_exact(
 	const ResourceXIntentSlot *expected);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+	const ResourceXIntentSlot *expected, ResourceXIntentSlot *slot_out,
+	void *payload_out, uint16 payload_capacity);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
+	const ResourceXIntentSlot *expected, uint64 now_us);
+extern bool cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
+	const ResourceXIntentSlot *expected);
+extern ResourceXIntentProbeResult
+cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
+	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,
+	uint16 payload_capacity, uint32 *examined_out);
 extern ResourceXIntentProbeResult
 cluster_pcm_lock_resource_x_grant_intent_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,

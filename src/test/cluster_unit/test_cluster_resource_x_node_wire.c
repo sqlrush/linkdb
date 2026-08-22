@@ -278,6 +278,44 @@ UT_TEST(test_control_codec_is_network_order_and_crc_exact)
 		frame.common.authority_generation);
 }
 
+UT_TEST(test_physical_sender_generation_rebind_preserves_block_semantics)
+{
+	ResourceXDecodedFrame frame
+		= make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 encoded_len = 0;
+
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes),
+		&encoded_len, &reject));
+	UT_ASSERT_EQ(encoded_len, RESOURCE_X_CONTROL_V1_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(
+		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, 77, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.common.sender_connection_generation, 77);
+	UT_ASSERT_EQ(decoded.kind, RESOURCE_X_WIRE_BLOCK_TO_N);
+	UT_ASSERT(resource_x_assertion_equal(&decoded.common.logical_assertion,
+		&frame.common.logical_assertion));
+	UT_ASSERT_EQ(decoded.common.base_authority_generation,
+		frame.common.base_authority_generation);
+	UT_ASSERT_EQ(decoded.common.assertion_sequence,
+		frame.common.assertion_sequence);
+	UT_ASSERT_EQ(decoded.common.action_node, frame.common.action_node);
+	UT_ASSERT_EQ(decoded.common.observed_mode, frame.common.observed_mode);
+	UT_ASSERT_EQ(decoded.common.target_mode, frame.common.target_mode);
+	UT_ASSERT_EQ(decoded.common.source_candidate,
+		frame.common.source_candidate);
+	UT_ASSERT_EQ(decoded.common.retain_pi_if_dirty,
+		frame.common.retain_pi_if_dirty);
+	UT_ASSERT_EQ(decoded.common.authority_generation,
+		frame.common.authority_generation);
+	UT_ASSERT(!cluster_resource_x_wire_rebind_sender_generation(
+		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, 0, &reject));
+}
+
 UT_TEST(test_all_control_kind_type_pairs_round_trip)
 {
 	static const struct {
@@ -348,7 +386,8 @@ make_typed_frame(ResourceXWireKind kind)
 	frame.common.outcome = RESOURCE_X_OUTCOME_OK;
 	if (kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION) {
 		frame.body.local_proof.local_holder_authority_generation = 71;
-		frame.body.local_proof.requester_target_generation = 72;
+		frame.body.local_proof.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.local_proof.page_scn_lsn = 73;
 		frame.body.local_proof.dependency_count = 2;
 		frame.body.local_proof.dependency_vector_crc32c = UINT32_C(0x01020304);
@@ -365,7 +404,8 @@ make_typed_frame(ResourceXWireKind kind)
 		for (i = 0; i < RESOURCE_X_SOURCE_FENCE_BYTES; i++)
 			frame.body.blocked_to_n.source_fence[i] = (uint8)(i + 1);
 		frame.body.blocked_to_n.source_carrier_generation = 81;
-		frame.body.blocked_to_n.requester_target_generation = 82;
+		frame.body.blocked_to_n.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.blocked_to_n.page_scn_lsn = 83;
 		frame.body.blocked_to_n.dependency_count = 2;
 		frame.body.blocked_to_n.dependencies[0] = 84;
@@ -385,7 +425,8 @@ make_typed_frame(ResourceXWireKind kind)
 		frame.body.authority_grant.final_authority_generation
 			= frame.common.authority_generation;
 		frame.body.authority_grant.source_carrier_generation = 92;
-		frame.body.authority_grant.requester_target_generation = 93;
+		frame.body.authority_grant.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.authority_grant.page_scn_lsn = 94;
 		frame.body.authority_grant.dependency_count = 2;
 		frame.body.authority_grant.dependencies[0] = 95;
@@ -405,7 +446,8 @@ make_typed_frame(ResourceXWireKind kind)
 		for (i = 0; i < RESOURCE_X_SOURCE_FENCE_BYTES; i++)
 			frame.body.image_envelope.source_fence[i] = (uint8)(0x60 + i);
 		frame.body.image_envelope.source_carrier_generation = 102;
-		frame.body.image_envelope.requester_target_generation = 103;
+		frame.body.image_envelope.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.image_envelope.page_scn_lsn = 104;
 		frame.body.image_envelope.dependency_count = 2;
 		frame.body.image_envelope.dependencies[0] = 105;
@@ -424,7 +466,8 @@ make_typed_frame(ResourceXWireKind kind)
 		frame.body.install_settlement.final_authority_generation
 			= frame.common.authority_generation;
 		frame.body.install_settlement.requester_connection_generation = 113;
-		frame.body.install_settlement.requester_target_generation = 114;
+		frame.body.install_settlement.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.install_settlement.page_scn_lsn = 115;
 		frame.body.install_settlement.page_checksum = UINT32_C(0x91929394);
 		frame.body.install_settlement.source_proof_crc32c = UINT32_C(0xa1a2a3a4);
@@ -544,6 +587,12 @@ UT_TEST(test_typed_body_validation_is_fail_closed)
 
 	frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	frame.body.image_envelope.image_length--;
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		&frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
+
+	frame = make_typed_frame(RESOURCE_X_WIRE_AUTHORITY_GRANT);
+	frame.body.authority_grant.requester_target_generation++;
 	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
 		&frame, bytes, sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
@@ -668,7 +717,7 @@ UT_TEST(test_resource_x_capability_has_complete_collision_census)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -678,6 +727,7 @@ main(void)
 	UT_RUN(test_image_envelope_layout_is_exact);
 	UT_RUN(test_install_settlement_layout_is_exact);
 	UT_RUN(test_control_codec_is_network_order_and_crc_exact);
+	UT_RUN(test_physical_sender_generation_rebind_preserves_block_semantics);
 	UT_RUN(test_all_control_kind_type_pairs_round_trip);
 	UT_RUN(test_control_codec_rejects_pair_identity_crc_and_legacy_length);
 	UT_RUN(test_short_typed_frames_round_trip);

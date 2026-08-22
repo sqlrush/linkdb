@@ -5928,6 +5928,8 @@ UT_TEST(test_resource_x_reused_type_ingress_precedes_every_legacy_path)
 		UT_ASSERT_NOT_NULL(strstr(helper,
 			"cluster_pcm_lock_resource_x_local_proof_exact("));
 		UT_ASSERT_NOT_NULL(strstr(helper,
+			"cluster_pcm_lock_resource_x_block_to_n_exact("));
+		UT_ASSERT_NOT_NULL(strstr(helper,
 			"cluster_pcm_lock_resource_x_blocked_to_n_exact("));
 		UT_ASSERT_NOT_NULL(strstr(helper,
 			"cluster_pcm_lock_resource_x_install_settlement_exact("));
@@ -5952,11 +5954,104 @@ UT_TEST(test_resource_x_reused_type_ingress_precedes_every_legacy_path)
 	free(source);
 }
 
+UT_TEST(test_resource_x_type15_exact_join_is_the_only_new_r9_entry)
+{
+	static const char *const ingress_contract[] = {
+		"cluster_pcm_lock_resource_x_requester_join_exact(",
+		"RESOURCE_X_REQUESTER_JOIN_READY",
+		"gcs_block_pcm_x_resource_x_join_terminal_try("
+	};
+	static const char *const executor_contract[] = {
+		"cluster_pcm_lock_resource_x_requester_join_frames_exact(",
+		"join.requester_target_generation != join.assertion_sequence",
+		"ref.acquisition_generation = join.requester_target_generation",
+		"cluster_pcm_lock_resource_x_executor_enter(",
+		"cluster_pcm_lock_resource_x_t1_grant_exact(",
+		"cluster_bufmgr_pcm_own_activate_x_by_tag(",
+		"cluster_pcm_lock_resource_x_requester_apply_exact(",
+		"cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(",
+		"cluster_pcm_lock_resource_x_requester_activate_exact(",
+		"cluster_pcm_lock_resource_x_executor_leave("
+	};
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		source, "\ngcs_block_try_resource_x_frame(",
+		"\n/*\n * cluster_gcs_handle_block_request_envelope", ingress_contract,
+		lengthof(ingress_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_join_terminal_try(",
+		"\nstatic bool\ngcs_block_try_resource_x_frame(", executor_contract,
+		lengthof(executor_contract));
+	free(source);
+}
+
+UT_TEST(test_resource_x_type17_x_source_fences_before_retained_release)
+{
+	static const char *const source_contract[] = {
+		"cluster_pcm_lock_resource_x_holder_image_exact(",
+		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+		"cluster_bufmgr_pcm_own_begin_x_revoke(",
+		"cluster_bufmgr_copy_block_for_gcs(",
+		"gcs_block_pcm_x_resource_x_build_source_frames(",
+		"cluster_pcm_lock_resource_x_block_to_n_source_exact(",
+		"cluster_bufmgr_pcm_own_finish_revoke_retain("
+	};
+	char *source = read_gcs_block_source();
+	const char *ingress;
+	const char *source_call;
+	const char *s_consumer;
+	const char *builder;
+	const char *helper;
+	const char *abort;
+	const char *arm;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	helper = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_source_block_to_n(");
+	UT_ASSERT_NOT_NULL(helper);
+	if (helper != NULL)
+		assert_ordered_in_function(
+			source, "\ngcs_block_pcm_x_resource_x_source_block_to_n(",
+			"\n\n/* Consume the exact Resource-X subdomain", source_contract,
+			lengthof(source_contract));
+	ingress = strstr(source, "\ngcs_block_try_resource_x_frame(");
+	source_call = ingress != NULL
+		? strstr(ingress, "gcs_block_pcm_x_resource_x_source_block_to_n(")
+		: NULL;
+	s_consumer = source_call != NULL
+		? strstr(source_call, "cluster_pcm_lock_resource_x_block_to_n_exact(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(ingress);
+	UT_ASSERT_NOT_NULL(source_call);
+	UT_ASSERT_NOT_NULL(s_consumer);
+	if (source_call != NULL && s_consumer != NULL)
+		UT_ASSERT(source_call < s_consumer);
+	builder = strstr(source, "\ngcs_block_pcm_x_resource_x_build_source_frames(");
+	UT_ASSERT_NOT_NULL(builder);
+	if (builder != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(builder,
+			"requester_target_generation = block->common.assertion_sequence"));
+		UT_ASSERT_NOT_NULL(strstr(builder,
+			"source_proof_crc32c = image->common.semantic_crc32c"));
+	}
+	abort = strstr(source, "\ngcs_block_pcm_x_resource_x_abort_pre_arm(");
+	arm = strstr(source, "cluster_pcm_lock_resource_x_block_to_n_source_exact(");
+	UT_ASSERT_NOT_NULL(abort);
+	UT_ASSERT_NOT_NULL(arm);
+	if (abort != NULL)
+		UT_ASSERT_NOT_NULL(strstr(abort,
+			"cluster_bufmgr_pcm_own_abort_x_revoke("));
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(109);
+	UT_PLAN(111);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -6066,6 +6161,8 @@ main(void)
 	UT_RUN(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return);
 	UT_RUN(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake);
 	UT_RUN(test_resource_x_reused_type_ingress_precedes_every_legacy_path);
+	UT_RUN(test_resource_x_type15_exact_join_is_the_only_new_r9_entry);
+	UT_RUN(test_resource_x_type17_x_source_fences_before_retained_release);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

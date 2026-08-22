@@ -246,6 +246,9 @@ typedef struct ResourceXDecodedCommon
 	uint8		outcome;
 	uint8		flags;
 	uint64		authority_generation;
+	/* Decoder-verified CRC from wire bytes.  The encoder computes this field;
+	 * callers do not provide it as input. */
+	uint32		semantic_crc32c;
 } ResourceXDecodedCommon;
 
 typedef struct ResourceXDecodedLocalProof
@@ -388,6 +391,9 @@ extern bool cluster_resource_x_wire_encode(uint8 msg_type,
 	uint16 *payload_len_out, ResourceXWireReject *reject);
 extern bool cluster_resource_x_wire_decode(uint8 msg_type, const void *payload,
 	uint16 payload_len, ResourceXDecodedFrame *out,
+	ResourceXWireReject *reject);
+extern bool cluster_resource_x_wire_rebind_sender_generation(uint8 msg_type,
+	void *payload, uint16 payload_len, uint32 sender_connection_generation,
 	ResourceXWireReject *reject);
 
 #endif /* CLUSTER_RESOURCE_X_NODE_WIRE_H */

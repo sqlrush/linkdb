@@ -385,7 +385,8 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame,
 			const ResourceXDecodedBlockedToN *body = &frame->body.blocked_to_n;
 
 			valid = body->source_carrier_generation != 0
-				&& body->requester_target_generation != 0
+				&& body->requester_target_generation
+					== frame->common.assertion_sequence
 				&& body->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER
 				&& body->source_disposition
 				   == RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE
@@ -398,7 +399,8 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame,
 		break;
 	case RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION:
 		valid = frame->body.local_proof.local_holder_authority_generation != 0
-			&& frame->body.local_proof.requester_target_generation != 0
+			&& frame->body.local_proof.requester_target_generation
+				== frame->common.assertion_sequence
 			&& frame->body.local_proof.dependency_count <= RESOURCE_X_DEPENDENCY_MAX
 			&& frame->body.local_proof.requester_connection_generation != 0
 			&& frame->body.local_proof.local_proof_generation != 0;
@@ -411,7 +413,8 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame,
 
 			valid = body->final_authority_generation
 					== frame->common.authority_generation
-				&& body->requester_target_generation != 0
+				&& body->requester_target_generation
+					== frame->common.assertion_sequence
 				&& body->proof_kind >= RESOURCE_X_PROOF_KIND_MIN
 				&& body->proof_kind <= RESOURCE_X_PROOF_KIND_MAX
 				&& resource_x_disposition_matches(body->proof_kind,
@@ -434,7 +437,8 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame,
 			valid = body->conversion_base_generation
 					== frame->common.base_authority_generation
 				&& body->source_carrier_generation != 0
-				&& body->requester_target_generation != 0
+				&& body->requester_target_generation
+					== frame->common.assertion_sequence
 				&& body->image_length == RESOURCE_X_PAGE_BYTES
 				&& body->source_disposition
 				   == RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE
@@ -454,7 +458,8 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame,
 				&& body->final_authority_generation
 					== frame->common.authority_generation
 				&& body->requester_connection_generation != 0
-				&& body->requester_target_generation != 0
+				&& body->requester_target_generation
+					== frame->common.assertion_sequence
 				&& body->installed_mode == (uint8)PCM_STATE_X
 				&& body->requester_role == RESOURCE_X_REQUESTER_ROLE_ACQUIRER
 				&& body->terminal_outcome > RESOURCE_X_OUTCOME_NONE
@@ -799,9 +804,38 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload,
 		  && payload_len == RESOURCE_X_PROOF_V1_BYTES;
 	if (!resource_x_common_decode(bytes, kind, &decoded.common, reject))
 		return false;
+	decoded.common.semantic_crc32c = resource_x_get_u32(bytes + 4);
 	if (!resource_x_body_decode(bytes, &decoded, reject))
 		return false;
 	*out = decoded;
+	resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_NONE);
+	return true;
+}
+
+
+/* sender_connection_generation is transport freshness, not logical
+ * assertion identity.  Retained owner bytes therefore bind it only when a
+ * physical copy is staged for one exact HELLO-authenticated DATA session.
+ * Decode first so malformed retained bytes can never be repaired into a
+ * sendable frame merely by resealing their CRC. */
+bool
+cluster_resource_x_wire_rebind_sender_generation(uint8 msg_type,
+	void *payload, uint16 payload_len, uint32 sender_connection_generation,
+	ResourceXWireReject *reject)
+{
+	ResourceXDecodedFrame decoded;
+	uint8 *bytes = (uint8 *)payload;
+	uint32 crc;
+
+	resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_BAD_ARGUMENT);
+	if (bytes == NULL || sender_connection_generation == 0
+		|| !cluster_resource_x_wire_decode(
+			msg_type, bytes, payload_len, &decoded, reject))
+		return false;
+	resource_x_put_u32(bytes + 76, sender_connection_generation);
+	resource_x_put_u32(bytes + 4, 0);
+	crc = resource_x_wire_crc(bytes, payload_len);
+	resource_x_put_u32(bytes + 4, crc);
 	resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_NONE);
 	return true;
 }
