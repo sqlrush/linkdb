@@ -18,6 +18,10 @@ flowchart LR
 - [03：Recovery、故障重配置与节点生命周期](03-recovery-and-node-change.md)
 - [04：差异矩阵、运维流程与当前边界](04-differences-and-operations.md)
 
+专题深化：
+
+- [Clean Formation 的 Epoch 0：Oracle 对齐与 PGRAC 安全边界](../formation-epoch-zero/README.md)
+
 ## 先分清六个词
 
 | 术语 | 本文含义 |
