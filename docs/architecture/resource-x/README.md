@@ -6,6 +6,10 @@ Resource-X 是 PGRAC 新一代全局数据块独占访问协议。它解决的�
 
 这组文档给出 Resource-X 的目标架构设计。当前版本是 **设计版 v1**：重点描述稳定的身份、权威、状态机、失败语义和切换边界；代码实现完成后，将按公开主线中的生产调用点、测试编号和实测结果修订为实现版 v2。
 
+如果只想集中理解“为什么一次 acquisition 必须始终使用同一个请求代际，以及 duplicate、
+retry、reconnect、successor 和 formation recovery 如何区分”，可先阅读独立专题
+[Resource-X 请求代际：让重试、重连和恢复始终指向同一次获取](../resource-x-request-generation/README.md)。
+
 ## 阅读顺序
 
 ```mermaid

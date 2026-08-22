@@ -20,6 +20,10 @@ and safe rejoin, see
 For the target block-X acquisition model, logical identity, bounded retry,
 T1/T2/T3 write fencing, reconfiguration sweep, and ticket-path cutover, see
 [Resource-X：从逻辑资源到可写 X 的完整链路](resource-x/README.md).
+For a focused explanation of how one immutable request generation keeps
+duplicates, retries, reconnects, successors, local buffer activation, and
+formation recovery attached to the same acquisition, see
+[Resource-X 请求代际图解](resource-x-request-generation/README.md).
 
 ## High-level component map
 
@@ -382,6 +386,8 @@ strength and remaining boundaries are documented here:
 - [Oracle RAC 与 PGRAC 节点变化机制图解](rac-node-change/README.md)
 - [未决事务恢复：Oracle RECO 语义与 PGRAC 投影边界](transaction-recovery/pending-transaction-authority.md)
 - [外部 I/O Fencing：从节点驱逐到可验证的恢复权限](external-fencing/README.md)
+- [Resource-X：从逻辑资源到可写 X 的完整链路](resource-x/README.md)
+- [Resource-X 请求代际：重试、重连与恢复的一致性](resource-x-request-generation/README.md)
 
 Do not infer that every registered wait event or protocol enum represents an
 end-to-end production path.  Each deep dive distinguishes production wiring,
