@@ -29,7 +29,17 @@ my @pcm_numeric_keys = (
 	'pcm_x_acquire_exception_count',
 	(map { "pcm_x_acquire_result_${_}_count" } @result_labels),
 	(map { sprintf('pcm_x_acquire_success_us_le_2p%02d_count', $_) } 0 .. 31),
-	'pcm_x_acquire_success_us_overflow_count');
+	'pcm_x_acquire_success_us_overflow_count',
+	qw(
+		remote_install_observed_count
+		remote_grant_after_image_count
+		remote_image_at_or_after_grant_count
+		remote_episode_excluded_no_install
+		remote_episode_excluded_missing_grant
+		remote_episode_excluded_missing_image
+		last_remote_t_image_us
+		last_remote_t_grant_us
+		last_remote_t_install_us));
 my @lmon_numeric_keys =
 	qw(lmon_timed_duty_sample_count lmon_total_iter_us);
 my @undo_numeric_keys =

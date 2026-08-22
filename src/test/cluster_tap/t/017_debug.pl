@@ -98,8 +98,8 @@ is( $node->safe_psql(
 
 is(
 	$node->get_cluster_state_value('pcm', 'resource_x_proof_readiness'),
-	'UNAVAILABLE_PROOF_KIND',
-	'Resource-X proof readiness is explicitly unavailable');
+	'AVAILABLE_PROOF_KIND',
+	'Resource-X exact proof-kind observation is available');
 
 
 # ----------

@@ -1980,6 +1980,116 @@ UT_TEST(test_resource_x_requester_join_accepts_either_order_and_never_overwrites
 	UT_ASSERT_EQ(snapshot.t_grant_us, 0);
 }
 
+static void
+wait_for_resource_x_timestamp_after(uint64 timestamp_us)
+{
+	instr_time now;
+
+	do
+	{
+		INSTR_TIME_SET_CURRENT(now);
+	} while ((uint64)INSTR_TIME_GET_MICROSEC(now) <= timestamp_us);
+}
+
+static void
+complete_resource_x_remote_requester_terminal(
+	const ResourceXRequesterJoinSnapshot *join, ResourceXAcquisitionRef *ref_out,
+	ResourceXBufferActivationProof *activation_out)
+{
+	ResourceXBufferInstallProof install;
+
+	memset(ref_out, 0, sizeof(*ref_out));
+	ref_out->assertion = join->assertion;
+	ref_out->formation = join->resource_formation;
+	ref_out->acquisition_generation = join->requester_target_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(ref_out),
+				 RESOURCE_X_APPLY_APPLIED);
+	memset(&install, 0, sizeof(install));
+	install.ownership_generation = 9;
+	install.writer_activation_token = 12;
+	install.resource_x_activation_generation = ref_out->acquisition_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(ref_out, &install),
+				 RESOURCE_X_APPLY_APPLIED);
+	memset(activation_out, 0, sizeof(*activation_out));
+	activation_out->ownership_generation = install.ownership_generation;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(
+		ref_out, activation_out), RESOURCE_X_APPLY_APPLIED);
+}
+
+UT_TEST(test_resource_x_remote_terminal_settles_o1_once_and_keeps_first_times)
+{
+	BufferTag image_first_tag = make_tag(159);
+	BufferTag grant_first_tag = make_tag(160);
+	ResourceXDecodedFrame grant;
+	ResourceXDecodedFrame image;
+	ResourceXDecodedFrame retained_grant;
+	ResourceXDecodedFrame retained_image;
+	ResourceXRequesterJoinSnapshot join;
+	ResourceXAssertion assertion;
+	ResourceXAcquisitionRef ref;
+	ResourceXBufferActivationProof activation;
+	ResourceXO1Stats stats;
+	ResourceXO1Stats duplicate_stats;
+
+	reset_fake_pcm_runtime(8);
+	cluster_node_id = 2;
+	cluster_pcm_lock_acquire(image_first_tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_release(image_first_tag);
+	cluster_pcm_lock_acquire(grant_first_tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_release(grant_first_tag);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_lock_resource_x_o1_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.remote_install_observed_count, 0);
+
+	make_resource_x_remote_join_pair(image_first_tag, 2, &grant, &image);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(
+		&image, 0, &join), RESOURCE_X_APPLY_APPLIED);
+	wait_for_resource_x_timestamp_after(join.t_image_us);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(
+		&grant, 2, &join), RESOURCE_X_APPLY_APPLIED);
+	complete_resource_x_remote_requester_terminal(&join, &ref, &activation);
+	assertion = join.assertion;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_frames_exact(
+		&assertion, &retained_grant, &retained_image, &join),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT((join.flags & RESOURCE_X_REQUESTER_JOIN_TERMINAL) != 0);
+	UT_ASSERT(join.t_install_us != 0);
+	cluster_pcm_lock_resource_x_o1_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.remote_install_observed_count, 1);
+	UT_ASSERT_EQ(stats.remote_grant_after_image_count, 1);
+	UT_ASSERT_EQ(stats.remote_image_at_or_after_grant_count, 0);
+	UT_ASSERT_EQ(stats.remote_episode_excluded_no_install, 0);
+	UT_ASSERT_EQ(stats.remote_episode_excluded_missing_grant, 0);
+	UT_ASSERT_EQ(stats.remote_episode_excluded_missing_image, 0);
+	UT_ASSERT_EQ(stats.last_remote_t_image_us, join.t_image_us);
+	UT_ASSERT_EQ(stats.last_remote_t_grant_us, join.t_grant_us);
+	UT_ASSERT_EQ(stats.last_remote_t_install_us, join.t_install_us);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(
+		&ref, &activation), RESOURCE_X_APPLY_DUPLICATE);
+	cluster_pcm_lock_resource_x_o1_stats_snapshot(&duplicate_stats);
+	UT_ASSERT_EQ(memcmp(&duplicate_stats, &stats, sizeof(stats)), 0);
+
+	make_resource_x_remote_join_pair(grant_first_tag, 2, &grant, &image);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(
+		&grant, 2, &join), RESOURCE_X_APPLY_APPLIED);
+	wait_for_resource_x_timestamp_after(join.t_grant_us);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_exact(
+		&image, 0, &join), RESOURCE_X_APPLY_APPLIED);
+	complete_resource_x_remote_requester_terminal(&join, &ref, &activation);
+	assertion = join.assertion;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_join_frames_exact(
+		&assertion, &retained_grant, &retained_image, &join),
+		RESOURCE_X_APPLY_APPLIED);
+	cluster_pcm_lock_resource_x_o1_stats_snapshot(&stats);
+	UT_ASSERT_EQ(stats.remote_install_observed_count, 2);
+	UT_ASSERT_EQ(stats.remote_grant_after_image_count, 1);
+	UT_ASSERT_EQ(stats.remote_image_at_or_after_grant_count, 1);
+	UT_ASSERT_EQ(stats.last_remote_t_image_us, join.t_image_us);
+	UT_ASSERT_EQ(stats.last_remote_t_grant_us, join.t_grant_us);
+	UT_ASSERT_EQ(stats.last_remote_t_install_us, join.t_install_us);
+}
+
 UT_TEST(test_resource_x_x_source_arms_proof_and_image_before_x_to_n)
 {
 	BufferTag tag = make_tag(158);
@@ -4106,7 +4216,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(83);
+	UT_PLAN(84);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -4146,6 +4256,7 @@ main(void)
 	UT_RUN(test_resource_x_holder_retains_status_before_s_to_n);
 	UT_RUN(test_resource_x_master_remote_proof_is_retained_not_inferred);
 	UT_RUN(test_resource_x_requester_join_accepts_either_order_and_never_overwrites);
+	UT_RUN(test_resource_x_remote_terminal_settles_o1_once_and_keeps_first_times);
 	UT_RUN(test_resource_x_x_source_arms_proof_and_image_before_x_to_n);
 	UT_RUN(test_resource_x_master_local_and_durable_proofs_are_exact_and_closed);
 	UT_RUN(test_resource_x_master_settlement_release_starts_fifo_successor);

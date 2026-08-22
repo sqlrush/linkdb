@@ -341,14 +341,32 @@ typedef struct ResourceXRequesterJoinSnapshot {
 	uint64 requester_target_generation;
 	uint64 t_image_us;
 	uint64 t_grant_us;
+	uint64 t_install_us;
 	int32 grant_source_node;
 	int32 image_source_node;
 	uint32 flags;
 	uint32 reserved;
 } ResourceXRequesterJoinSnapshot;
 
-StaticAssertDecl(sizeof(ResourceXRequesterJoinSnapshot) == 112,
-				 "ResourceXRequesterJoinSnapshot layout must remain 112 bytes");
+StaticAssertDecl(sizeof(ResourceXRequesterJoinSnapshot) == 120,
+				 "ResourceXRequesterJoinSnapshot layout must remain 120 bytes");
+
+/* Requester-local ordinary Resource-X observation cohort.  These are
+ * postmaster-incarnation readings, not Recovery Foundation proof. */
+typedef struct ResourceXO1Stats {
+	uint64 remote_install_observed_count;
+	uint64 remote_grant_after_image_count;
+	uint64 remote_image_at_or_after_grant_count;
+	uint64 remote_episode_excluded_no_install;
+	uint64 remote_episode_excluded_missing_grant;
+	uint64 remote_episode_excluded_missing_image;
+	uint64 last_remote_t_image_us;
+	uint64 last_remote_t_grant_us;
+	uint64 last_remote_t_install_us;
+} ResourceXO1Stats;
+
+StaticAssertDecl(sizeof(ResourceXO1Stats) == 72,
+				 "ResourceXO1Stats must remain the exact nine-reading cohort");
 
 /* Exact, process-local D2 result retained for the R8 sweep owner.  This is
  * deliberately not a wire structure and carries both the removed queue
@@ -916,6 +934,7 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_apply_exact(
 	const ResourceXAcquisitionRef *ref, const ResourceXBufferInstallProof *proof);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_activate_exact(
 	const ResourceXAcquisitionRef *ref, const ResourceXBufferActivationProof *proof);
+extern void cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *out);
 extern void cluster_pcm_lock_resource_x_publish_no_progress_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXNoProgressReason reason);
 extern PcmXGrdHandoffResult

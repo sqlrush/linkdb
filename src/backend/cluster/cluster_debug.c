@@ -1920,6 +1920,8 @@ dump_buffer_format(ReturnSetInfo *rsinfo)
 static void
 dump_pcm(ReturnSetInfo *rsinfo)
 {
+	ResourceXO1Stats o1;
+
 	/*
 	 * PGRAC: spec-2.30 D9 — dump_pcm activation surface.
 	 *
@@ -1943,6 +1945,25 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 (cluster_pcm_grd_max_entries == 0) ? "stub" : "active");
 	emit_row(rsinfo, "pcm", "resource_x_proof_readiness",
 			 resource_x_proof_readiness_status());
+	cluster_pcm_lock_resource_x_o1_stats_snapshot(&o1);
+	emit_row(rsinfo, "pcm", "remote_install_observed_count",
+			 fmt_int64((int64)o1.remote_install_observed_count));
+	emit_row(rsinfo, "pcm", "remote_grant_after_image_count",
+			 fmt_int64((int64)o1.remote_grant_after_image_count));
+	emit_row(rsinfo, "pcm", "remote_image_at_or_after_grant_count",
+			 fmt_int64((int64)o1.remote_image_at_or_after_grant_count));
+	emit_row(rsinfo, "pcm", "remote_episode_excluded_no_install",
+			 fmt_int64((int64)o1.remote_episode_excluded_no_install));
+	emit_row(rsinfo, "pcm", "remote_episode_excluded_missing_grant",
+			 fmt_int64((int64)o1.remote_episode_excluded_missing_grant));
+	emit_row(rsinfo, "pcm", "remote_episode_excluded_missing_image",
+			 fmt_int64((int64)o1.remote_episode_excluded_missing_image));
+	emit_row(rsinfo, "pcm", "last_remote_t_image_us",
+			 fmt_int64((int64)o1.last_remote_t_image_us));
+	emit_row(rsinfo, "pcm", "last_remote_t_grant_us",
+			 fmt_int64((int64)o1.last_remote_t_grant_us));
+	emit_row(rsinfo, "pcm", "last_remote_t_install_us",
+			 fmt_int64((int64)o1.last_remote_t_install_us));
 
 	/*
 	 * PGRAC: spec-2.30 D9 — 5 NEW state summary row.

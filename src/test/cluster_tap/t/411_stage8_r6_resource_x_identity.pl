@@ -5,8 +5,8 @@
 #    Stage-8 R6 CURRENT-slice production closure for logical Resource-X
 #    identity.  Concurrent backends on one requester node fan in behind the
 #    same remote transfer; transport reconnect changes freshness witnesses,
-#    not the (BufferTag, requester-node) assertion.  R10 proof keys remain
-#    absent throughout.
+#    not the (BufferTag, requester-node) assertion.  The later D10-08 schema
+#    exposes its complete nine-row observation cohort throughout.
 #
 # Author: SqlRush <sqlrush@gmail.com>
 # Portions Copyright (c) 2026, pgrac contributors
@@ -268,10 +268,10 @@ for my $from (0 .. 3)
 			"L1 node$from sees node$to connected");
 	}
 	my ($readiness, $o1_count) = proof_contract($quad->node($from));
-	is($readiness, 'UNAVAILABLE_PROOF_KIND',
-		"L1 node$from reports explicit pre-R10 proof unavailability");
-	is($o1_count, 0,
-		"L1 node$from exposes none of the nine R10-owned O1 keys");
+	is($readiness, 'AVAILABLE_PROOF_KIND',
+		"L1 node$from reports exact proof-kind observation availability");
+	is($o1_count, 9,
+		"L1 node$from exposes the complete nine-row O1 cohort");
 }
 
 my $table = 'stage8_r6_resource_x_identity';
@@ -430,10 +430,10 @@ is($quad->node0->safe_psql(
 for my $node_id (0 .. 3)
 {
 	my ($readiness, $o1_count) = proof_contract($quad->node($node_id));
-	is($readiness, 'UNAVAILABLE_PROOF_KIND',
-		"L6 node$node_id proof readiness stayed unavailable after real transfers");
-	is($o1_count, 0,
-		"L6 node$node_id still exposes none of the nine O1 keys");
+	is($readiness, 'AVAILABLE_PROOF_KIND',
+		"L6 node$node_id proof-kind observation stayed available after transfers");
+	is($o1_count, 9,
+		"L6 node$node_id still exposes the complete nine-row O1 cohort");
 }
 $quad->stop_quad;
 $quad = undef;

@@ -397,14 +397,18 @@ typedef struct ClusterPcmResourceXHolderImage {
 typedef struct ClusterPcmResourceXRequesterJoin {
 	uint64 t_image_us;
 	uint64 t_grant_us;
+	uint64 t_install_us;
 	int32 grant_source_node;
 	int32 image_source_node;
 	uint16 grant_payload_bytes;
 	uint16 image_payload_bytes;
 	uint8 grant_valid;
 	uint8 image_valid;
-	uint8 terminal;
-	uint8 reserved;
+	uint8 proof_kind;
+	uint8 install_succeeded;
+	uint8 settled;
+	uint8 requester_loss_seen;
+	uint8 reserved[2];
 	uint32 image_semantic_crc32c;
 	uint32 crc_reserved;
 	uint8 grant_payload[RESOURCE_X_PROOF_V1_BYTES];
@@ -434,10 +438,10 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXHolderStatus) == 384,
 				 "Resource-X holder status layout must remain 384 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXHolderImage) == 8592,
 				 "Resource-X holder image layout must remain 8592 bytes");
-StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 8872,
-				 "Resource-X requester join layout must remain 8872 bytes");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 34856,
-				 "Resource-X master state layout must remain 34856 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 8888,
+				 "Resource-X requester join layout must remain 8888 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 34872,
+				 "Resource-X master state layout must remain 34872 bytes");
 
 typedef struct ClusterPcmShared {
 	LWLockPadded htab_lock;
@@ -474,6 +478,15 @@ typedef struct ClusterPcmShared {
 	pg_atomic_uint64 resource_x_intent_next_state_index;
 	pg_atomic_uint32 resource_x_intent_next_owner_index;
 	pg_atomic_uint32 resource_x_intent_generation_exhausted;
+	pg_atomic_uint64 resource_x_o1_remote_install_observed_count;
+	pg_atomic_uint64 resource_x_o1_remote_grant_after_image_count;
+	pg_atomic_uint64 resource_x_o1_remote_image_at_or_after_grant_count;
+	pg_atomic_uint64 resource_x_o1_remote_episode_excluded_no_install;
+	pg_atomic_uint64 resource_x_o1_remote_episode_excluded_missing_grant;
+	pg_atomic_uint64 resource_x_o1_remote_episode_excluded_missing_image;
+	pg_atomic_uint64 resource_x_o1_last_remote_t_image_us;
+	pg_atomic_uint64 resource_x_o1_last_remote_t_grant_us;
+	pg_atomic_uint64 resource_x_o1_last_remote_t_install_us;
 	pg_atomic_uint64 trans_n_to_s_count;
 	pg_atomic_uint64 trans_n_to_x_count;
 	pg_atomic_uint64 trans_s_to_x_upgrade_count;
@@ -564,6 +577,9 @@ static ResourceXReclaimResult pcm_resource_x_reclaim_requester_locked(
 static bool pcm_resource_x_arm_block_intents_locked(
 	struct GrdEntry *entry, ClusterPcmResourceXMasterState *state,
 	ClusterPcmResourceXMasterRequest *request, int32 requester_node);
+static ResourceXApplyResult pcm_resource_x_requester_settle_o1_locked(
+	struct GrdEntry *entry, const ResourceXAcquisitionRef *ref,
+	bool install_succeeded, bool requester_loss_seen);
 
 
 /* ============================================================
@@ -1549,6 +1565,34 @@ cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *out)
 		&ClusterPcm->resource_x_reconfig_reclaim_orphan_count);
 }
 
+void
+cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *out)
+{
+	if (out == NULL)
+		return;
+	memset(out, 0, sizeof(*out));
+	if (ClusterPcm == NULL)
+		return;
+	out->remote_install_observed_count = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_remote_install_observed_count);
+	out->remote_grant_after_image_count = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_remote_grant_after_image_count);
+	out->remote_image_at_or_after_grant_count = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_remote_image_at_or_after_grant_count);
+	out->remote_episode_excluded_no_install = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_remote_episode_excluded_no_install);
+	out->remote_episode_excluded_missing_grant = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_remote_episode_excluded_missing_grant);
+	out->remote_episode_excluded_missing_image = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_remote_episode_excluded_missing_image);
+	out->last_remote_t_image_us = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_last_remote_t_image_us);
+	out->last_remote_t_grant_us = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_last_remote_t_grant_us);
+	out->last_remote_t_install_us = pg_atomic_read_u64(
+		&ClusterPcm->resource_x_o1_last_remote_t_install_us);
+}
+
 static bool
 pcm_resource_x_intent_body_valid(const ResourceXIntentBodyHandle *body)
 {
@@ -2024,7 +2068,8 @@ cluster_pcm_lock_resource_x_requester_activate_exact(const ResourceXAcquisitionR
 			 != (RESOURCE_X_PROGRESS_BOUND | RESOURCE_X_PROGRESS_T1
 				 | RESOURCE_X_PROGRESS_T2))
 		result = RESOURCE_X_APPLY_BAD_STATE;
-	else {
+	else if ((result = pcm_resource_x_requester_settle_o1_locked(
+				  entry, ref, true, false)) == RESOURCE_X_APPLY_APPLIED) {
 		entry->resource_x_progress_flags
 			= (entry->resource_x_progress_flags | RESOURCE_X_PROGRESS_T3)
 			  & ~RESOURCE_X_PROGRESS_BOUND;
@@ -5133,6 +5178,19 @@ cluster_pcm_grd_init(void)
 		pg_atomic_init_u64(&ClusterPcm->resource_x_intent_next_state_index, 0);
 		pg_atomic_init_u32(&ClusterPcm->resource_x_intent_next_owner_index, 0);
 		pg_atomic_init_u32(&ClusterPcm->resource_x_intent_generation_exhausted, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_o1_remote_install_observed_count, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_o1_remote_grant_after_image_count, 0);
+		pg_atomic_init_u64(
+			&ClusterPcm->resource_x_o1_remote_image_at_or_after_grant_count, 0);
+		pg_atomic_init_u64(
+			&ClusterPcm->resource_x_o1_remote_episode_excluded_no_install, 0);
+		pg_atomic_init_u64(
+			&ClusterPcm->resource_x_o1_remote_episode_excluded_missing_grant, 0);
+		pg_atomic_init_u64(
+			&ClusterPcm->resource_x_o1_remote_episode_excluded_missing_image, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_o1_last_remote_t_image_us, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_o1_last_remote_t_grant_us, 0);
+		pg_atomic_init_u64(&ClusterPcm->resource_x_o1_last_remote_t_install_us, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_n_to_s_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_n_to_x_count, 0);
 		pg_atomic_init_u64(&ClusterPcm->trans_s_to_x_upgrade_count, 0);
@@ -6626,6 +6684,7 @@ pcm_resource_x_requester_join_snapshot_locked(
 		= identity->common.authority_generation;
 	out->t_image_us = join->t_image_us;
 	out->t_grant_us = join->t_grant_us;
+	out->t_install_us = join->t_install_us;
 	out->grant_source_node = join->grant_source_node;
 	out->image_source_node = join->image_source_node;
 	if (join->grant_valid != 0) {
@@ -6649,9 +6708,91 @@ pcm_resource_x_requester_join_snapshot_locked(
 				&& pcm_resource_x_requester_join_pair_matches(
 					&grant, &image, join->image_semantic_crc32c))))
 		out->flags |= RESOURCE_X_REQUESTER_JOIN_READY;
-	if (join->terminal != 0)
+	if (join->settled != 0)
 		out->flags |= RESOURCE_X_REQUESTER_JOIN_TERMINAL;
 	return true;
+}
+
+static ResourceXApplyResult
+pcm_resource_x_requester_settle_o1_locked(
+	struct GrdEntry *entry, const ResourceXAcquisitionRef *ref,
+	bool install_succeeded, bool requester_loss_seen)
+{
+	ClusterPcmResourceXMasterState *state;
+	ClusterPcmResourceXRequesterJoin *join;
+	ResourceXDecodedFrame grant;
+	ResourceXDecodedFrame image;
+	ResourceXRequesterJoinSnapshot snapshot;
+	uint64 now_us = 0;
+	uint8 proof_kind;
+
+	Assert(entry != NULL);
+	Assert(ref != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	state = pcm_resource_x_master_state_for_tag(&entry->tag);
+	if (state == NULL || ClusterPcm == NULL)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	join = &state->requester_join;
+	if (!pcm_resource_x_requester_join_decode_locked(join, &grant, &image))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (join->grant_valid == 0 && join->image_valid == 0)
+		return RESOURCE_X_APPLY_APPLIED;
+	if (!pcm_resource_x_requester_join_snapshot_locked(join, &snapshot))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if ((snapshot.flags & RESOURCE_X_REQUESTER_JOIN_READY) == 0
+		|| join->grant_valid == 0
+		|| !resource_x_assertion_equal(&snapshot.assertion, &ref->assertion)
+		|| snapshot.resource_formation != ref->formation
+		|| snapshot.requester_target_generation != ref->acquisition_generation)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (join->settled != 0)
+		return RESOURCE_X_APPLY_DUPLICATE;
+	proof_kind = grant.body.authority_grant.proof_kind;
+	if (proof_kind < RESOURCE_X_PROOF_KIND_MIN
+		|| proof_kind > RESOURCE_X_PROOF_KIND_MAX)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (install_succeeded) {
+		now_us = pcm_resource_x_monotonic_us();
+		if (now_us == 0 || now_us == UINT64_MAX)
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	join->t_install_us = now_us;
+	join->proof_kind = proof_kind;
+	join->install_succeeded = install_succeeded ? 1 : 0;
+	join->requester_loss_seen = requester_loss_seen ? 1 : 0;
+	join->settled = 1;
+	if (proof_kind != RESOURCE_X_PROOF_REMOTE_CARRIER || requester_loss_seen)
+		return RESOURCE_X_APPLY_APPLIED;
+	if (join->t_image_us != 0)
+		pg_atomic_write_u64(&ClusterPcm->resource_x_o1_last_remote_t_image_us,
+							join->t_image_us);
+	if (join->t_grant_us != 0)
+		pg_atomic_write_u64(&ClusterPcm->resource_x_o1_last_remote_t_grant_us,
+							join->t_grant_us);
+	if (join->t_install_us != 0)
+		pg_atomic_write_u64(&ClusterPcm->resource_x_o1_last_remote_t_install_us,
+							join->t_install_us);
+	if (install_succeeded && join->t_image_us != 0
+		&& join->t_grant_us != 0 && join->t_install_us != 0) {
+		pg_atomic_fetch_add_u64(
+			&ClusterPcm->resource_x_o1_remote_install_observed_count, 1);
+		if (join->t_grant_us > join->t_image_us)
+			pg_atomic_fetch_add_u64(
+				&ClusterPcm->resource_x_o1_remote_grant_after_image_count, 1);
+		else
+			pg_atomic_fetch_add_u64(
+				&ClusterPcm->resource_x_o1_remote_image_at_or_after_grant_count, 1);
+	} else {
+		pg_atomic_fetch_add_u64(
+			&ClusterPcm->resource_x_o1_remote_episode_excluded_no_install, 1);
+		if (join->t_grant_us == 0)
+			pg_atomic_fetch_add_u64(
+				&ClusterPcm->resource_x_o1_remote_episode_excluded_missing_grant, 1);
+		if (join->t_image_us == 0)
+			pg_atomic_fetch_add_u64(
+				&ClusterPcm->resource_x_o1_remote_episode_excluded_missing_image, 1);
+	}
+	return RESOURCE_X_APPLY_APPLIED;
 }
 
 ResourceXApplyResult

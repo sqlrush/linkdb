@@ -109,5 +109,5 @@ resource_x_attempt_matches(const ResourceXAttemptWitness *left,
 const char *
 resource_x_proof_readiness_status(void)
 {
-	return RESOURCE_X_PROOF_READINESS_UNAVAILABLE;
+	return RESOURCE_X_PROOF_READINESS_AVAILABLE;
 }

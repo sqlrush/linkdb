@@ -678,18 +678,23 @@ for my $key (@RESULT_KEYS, @BUCKET_KEYS,
 		"L5 $key unchanged by exception");
 }
 
-# L15: the nine proof-kind-dependent O1 rows are absent, not registered zeroes.
+# L15: D10-08 activates all nine proof-kind-dependent O1 rows together.
 my $o1_sql = join(',', map { "'$_'" } @O1_KEYS);
 is(
 	state_val($node1, 'pcm', 'resource_x_proof_readiness'),
-	'UNAVAILABLE_PROOF_KIND',
-	'L15 proof readiness is explicitly unavailable through R6');
+	'AVAILABLE_PROOF_KIND',
+	'L15 exact proof-kind observation is available');
 is(
 	$node1->safe_psql(
 		'postgres',
 		"SELECT count(*) FROM pg_cluster_state WHERE key IN ($o1_sql)"),
-	'0',
-	'L15 all proof-kind-dependent O1 SQL rows remain absent through R9');
+	'9',
+	'L15 all nine proof-kind-dependent O1 SQL rows are active together');
+for my $key (@O1_KEYS)
+{
+	like(state_val($node1, 'pcm', $key), qr/\A\d+\z/,
+		"L15 $key is an unsigned reading");
+}
 
 # L16: with no load in flight, active returns to each node's initial value.
 ok(
@@ -727,8 +732,8 @@ is($restart{segment_observation_status}, 'READY',
 	'L11 first post-restart observation is READY');
 is(
 	state_val($node0, 'pcm', 'resource_x_proof_readiness'),
-	'UNAVAILABLE_PROOF_KIND',
-	'L11 proof readiness stays explicitly unavailable after restart');
+	'AVAILABLE_PROOF_KIND',
+	'L11 proof-kind observation stays available after restart');
 ok(
 	is_u64($restart{segment_allocated_count})
 	  && $restart{segment_allocated_count} >= 1,

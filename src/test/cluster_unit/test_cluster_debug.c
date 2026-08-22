@@ -1001,6 +1001,17 @@ cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
 }
 
 void
+cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
+{
+	uint64 *values = (uint64 *)snapshot_out;
+	int i;
+
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	for (i = 0; i < 9; i++)
+		values[i] = UINT64CONST(301) + (uint64)i;
+}
+
+void
 cluster_pcm_x_acquire_observation_snapshot(PcmXAcquireObservationSnapshot *snapshot_out)
 {
 	int i;
@@ -4789,7 +4800,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, 14);
 	UT_ASSERT_EQ(PCM_X_ACQUIRE_HIST_BUCKETS, 32);
 	UT_ASSERT_EQ((int)lengthof(result_labels), PCM_X_QUEUE_RESULT_COUNT);
-	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 122);
+	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 131);
 	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
 	UT_ASSERT_EQ(captured_dump_count("lmon", NULL), 12);
 	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 121);
@@ -4812,7 +4823,7 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[3]), "999");
 	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_proof_readiness"), 1);
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_proof_readiness"),
-					 "UNAVAILABLE_PROOF_KIND");
+					 "AVAILABLE_PROOF_KIND");
 
 	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++) {
 		snprintf(key, sizeof(key), "pcm_x_acquire_result_%s_count", result_labels[i]);
@@ -4852,9 +4863,14 @@ UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
 	UT_ASSERT_STR_EQ(old_alias_value, new_alias_value);
 	UT_ASSERT_EQ(captured_pi_retire_accessor_calls, 1);
 
-	/* The complete R10-owned O1 cohort remains absent, never zero-valued. */
+	/* D10-08 activates the complete nine-row cohort in one dump schema. */
 	for (i = 0; i < (int)lengthof(o1_keys); i++)
-		UT_ASSERT_EQ(captured_dump_count(NULL, o1_keys[i]), 0);
+	{
+		snprintf(expected_value, sizeof(expected_value), "%d", 301 + i);
+		UT_ASSERT_EQ(captured_dump_count("pcm", o1_keys[i]), 1);
+		UT_ASSERT_STR_EQ(captured_dump_value("pcm", o1_keys[i]),
+						 expected_value);
+	}
 }
 
 

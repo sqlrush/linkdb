@@ -261,10 +261,10 @@ UT_TEST(test_null_comparisons_fail_closed)
 	UT_ASSERT(!resource_x_attempt_matches(&attempt, NULL));
 }
 
-UT_TEST(test_proof_readiness_is_explicitly_unavailable)
+UT_TEST(test_proof_readiness_is_explicitly_available)
 {
 	UT_ASSERT_STR_EQ(resource_x_proof_readiness_status(),
-		"UNAVAILABLE_PROOF_KIND");
+		"AVAILABLE_PROOF_KIND");
 }
 
 UT_TEST(test_f076_wire_opcode_and_length_manifest)
@@ -738,7 +738,7 @@ main(void)
 	UT_RUN(test_equality_is_exactly_resource_and_requester_node);
 	UT_RUN(test_attempt_match_adds_only_base_generation);
 	UT_RUN(test_null_comparisons_fail_closed);
-	UT_RUN(test_proof_readiness_is_explicitly_unavailable);
+	UT_RUN(test_proof_readiness_is_explicitly_available);
 	UT_RUN(test_f076_wire_opcode_and_length_manifest);
 	UT_RUN(test_f076_wire_layout_offsets_are_exact);
 	UT_RUN(test_f076_wire_payload_bytes_are_exact);

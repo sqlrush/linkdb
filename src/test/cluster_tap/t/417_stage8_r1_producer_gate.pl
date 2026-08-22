@@ -14,6 +14,7 @@ use strict;
 use warnings FATAL => 'all';
 
 use Cwd qw(abs_path);
+use Digest::SHA qw(sha256_hex);
 use File::Spec;
 use File::Temp qw(tempdir);
 use FindBin;
@@ -30,6 +31,8 @@ my %object_kind = map { $_ => 1 } qw(
 	STATE GUARD MESSAGE COUNTER GAUGE PAIR HISTOGRAM TEST_GATE);
 my $required_tap =
 	'src/test/cluster_tap/t/418_stage8_r1_observability_2node.pl';
+my $expected_active_set_sha256 =
+	'051f24f927d4050ea7e20013a8781d6eebb8fbb13e6e71330b998273a747e25c';
 my @nonpublic_patterns = (
 	[ private => qr/(?<![a-z0-9])private(?![a-z0-9])/i ],
 	[ future => qr/(?<![a-z0-9])future(?![a-z0-9])/i ],
@@ -214,12 +217,16 @@ sub has_error
 }
 
 ok(-f $manifest, 'L1 public observation manifest exists');
-my ($manifest_errors, $manifest_rows) = validate_manifest($manifest, 27);
+my ($manifest_errors, $manifest_rows) = validate_manifest($manifest, 36);
 is(scalar(@$manifest_errors), 0,
 	'L2 public manifest satisfies every structural and behavior anchor rule')
 	or diag(join(';', @$manifest_errors));
-is(scalar(@$manifest_rows), 27,
-	'L3 public manifest contains exactly twenty-seven current observation facts');
+is(scalar(@$manifest_rows), 36,
+	'L3 public manifest contains exactly thirty-six current observation facts');
+my $active_set_sha256 = sha256_hex(
+	join("\n", sort map { $_->{object_id} } @$manifest_rows) . "\n");
+is($active_set_sha256, $expected_active_set_sha256,
+	'L3 active object set has the frozen D10-08 SHA-256');
 
 my $temporary = tempdir(CLEANUP => 1);
 my $valid_rows = fixture_text();

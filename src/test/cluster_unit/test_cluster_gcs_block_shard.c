@@ -752,7 +752,8 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 		frame.blocked_has_remote_proof = capacity == RESOURCE_X_PROOF_V1_BYTES;
 		if (frame.blocked_has_remote_proof) {
 			frame.body.blocked_to_n.source_carrier_generation = 18;
-			frame.body.blocked_to_n.requester_target_generation = 19;
+			frame.body.blocked_to_n.requester_target_generation
+				= frame.common.assertion_sequence;
 			frame.body.blocked_to_n.source_disposition
 				= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
 			frame.body.blocked_to_n.proof_kind
@@ -768,14 +769,16 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 	} else if (kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION) {
 		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
 		frame.body.local_proof.local_holder_authority_generation = 21;
-		frame.body.local_proof.requester_target_generation = 22;
+		frame.body.local_proof.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.local_proof.requester_connection_generation = 23;
 		frame.body.local_proof.local_proof_generation = 24;
 	} else if (kind == RESOURCE_X_WIRE_AUTHORITY_GRANT) {
 		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
 		frame.body.authority_grant.final_authority_generation
 			= frame.common.authority_generation;
-		frame.body.authority_grant.requester_target_generation = 25;
+		frame.body.authority_grant.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.authority_grant.proof_kind
 			= RESOURCE_X_PROOF_DURABLE_STORAGE;
 		frame.body.authority_grant.source_disposition
@@ -787,7 +790,8 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 		frame.body.image_envelope.conversion_base_generation
 			= frame.common.base_authority_generation;
 		frame.body.image_envelope.source_carrier_generation = 27;
-		frame.body.image_envelope.requester_target_generation = 28;
+		frame.body.image_envelope.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.image_envelope.image_length = RESOURCE_X_PAGE_BYTES;
 		frame.body.image_envelope.source_disposition
 			= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
@@ -800,7 +804,8 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 		frame.body.install_settlement.final_authority_generation
 			= frame.common.authority_generation;
 		frame.body.install_settlement.requester_connection_generation = 29;
-		frame.body.install_settlement.requester_target_generation = 30;
+		frame.body.install_settlement.requester_target_generation
+			= frame.common.assertion_sequence;
 		frame.body.install_settlement.installed_mode = PCM_STATE_X;
 		frame.body.install_settlement.requester_role
 			= RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
