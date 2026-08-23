@@ -1995,7 +1995,8 @@ check: all check_cluster_undo_segment_half_page_oversized \
 	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage \
 	check_resource_x_send_c1_unit \
 	check_r11_predecessor_product_manifest_unit \
-	check_r11_predecessor_product_manifest
+	check_r11_predecessor_product_manifest \
+	check_r11_legacy_source_removed
 	@echo "# pgrac cluster unit tests"
 	@total=0; failed=0; \
 	for t in $(TESTS); do \
@@ -2043,6 +2044,10 @@ check_r11_predecessor_product_manifest:
 		$(top_srcdir)/src/tools/check_r11_predecessor_product_manifest.py \
 		--source-root "$(top_srcdir)" \
 		--manifest "$(top_srcdir)/src/test/cluster_unit/data/r11-predecessor-product-manifest-v1.json"
+
+check_r11_legacy_source_removed:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/test/cluster_unit/test_r11_legacy_source_removed.py
 
 
 # ----------
