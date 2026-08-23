@@ -36,12 +36,13 @@ UT_TEST(test_wire_kind_and_proof_domains_are_closed)
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_AUTHORITY_GRANT, 6);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_INSTALL_SETTLEMENT, 7);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION, 8);
+	UT_ASSERT_EQ(RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP, 9);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_REMOTE_CARRIER, 1);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_LOCAL_IMAGE, 2);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_DURABLE_STORAGE, 3);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_KIND_MIN, RESOURCE_X_WIRE_ASSERT_X);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_KIND_MAX,
-				 RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION);
+				 RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_KIND_MIN, RESOURCE_X_PROOF_REMOTE_CARRIER);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_KIND_MAX,
 				 RESOURCE_X_PROOF_DURABLE_STORAGE);
@@ -242,6 +243,154 @@ make_control_frame(ResourceXWireKind kind)
 }
 
 static ResourceXDecodedFrame make_typed_frame(ResourceXWireKind kind);
+static void test_reseal(uint8 *bytes, uint16 len);
+
+static ResourceXDecodedFrame
+make_bootstrap_frame(bool ack)
+{
+	ResourceXDecodedFrame frame
+		= make_control_frame(RESOURCE_X_WIRE_ASSERT_X);
+
+	frame.kind = RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP;
+	frame.common.base_authority_generation
+		= ack ? UINT64_C(0x0102030405060708) : 0;
+	frame.common.authority_generation = 0;
+	frame.common.ordered_lane = 0;
+	frame.common.observed_mode = PCM_STATE_N;
+	frame.common.target_mode = PCM_STATE_X;
+	frame.common.source_candidate = 0;
+	frame.common.retain_pi_if_dirty = 0;
+	frame.common.outcome
+		= ack ? RESOURCE_X_OUTCOME_OK : RESOURCE_X_OUTCOME_NONE;
+	frame.common.flags = 0;
+	return frame;
+}
+
+static void
+assert_bootstrap_encode_rejected(uint8 msg_type,
+								 ResourceXDecodedFrame *frame)
+{
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 len = 0;
+
+	UT_ASSERT(!cluster_resource_x_wire_encode(
+		msg_type, frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(reject != RESOURCE_X_WIRE_REJECT_NONE);
+}
+
+UT_TEST(test_preassert_bootstrap_request_and_ack_are_direction_exact)
+{
+	ResourceXDecodedFrame request = make_bootstrap_frame(false);
+	ResourceXDecodedFrame ack = make_bootstrap_frame(true);
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_BAD_ARGUMENT;
+	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 len = 0;
+
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_ASSERT_X, &request, bytes, sizeof(bytes), &len,
+		&reject));
+	UT_ASSERT_EQ(len, RESOURCE_X_CONTROL_V1_BYTES);
+	UT_ASSERT_EQ(bytes[1], RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_ASSERT_X, bytes, len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.common.base_authority_generation, 0);
+	UT_ASSERT_EQ(decoded.common.authority_generation, 0);
+	UT_ASSERT_EQ(decoded.common.outcome, RESOURCE_X_OUTCOME_NONE);
+
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, &ack, bytes, sizeof(bytes), &len,
+		&reject));
+	UT_ASSERT_EQ(len, RESOURCE_X_CONTROL_V1_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.common.base_authority_generation,
+		UINT64_C(0x0102030405060708));
+	UT_ASSERT_EQ(decoded.common.authority_generation, 0);
+	UT_ASSERT_EQ(decoded.common.outcome, RESOURCE_X_OUTCOME_OK);
+
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, &request);
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &ack);
+}
+
+UT_TEST(test_preassert_bootstrap_truth_tables_fail_closed)
+{
+	ResourceXDecodedFrame frame;
+
+	frame = make_bootstrap_frame(false);
+	frame.common.base_authority_generation = 1;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(true);
+	frame.common.base_authority_generation = 0;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.authority_generation = 1;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.resource_formation = 0;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.master_session_incarnation = 0;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.assertion_sequence = 0;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.ordered_lane = 1;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.action_node++;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.observed_mode = PCM_STATE_S;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.target_mode = PCM_STATE_N;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.source_candidate = 1;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.retain_pi_if_dirty = 1;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.sender_connection_generation = 0;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+	frame = make_bootstrap_frame(true);
+	frame.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame);
+	frame = make_bootstrap_frame(false);
+	frame.common.flags = 1;
+	assert_bootstrap_encode_rejected(RESOURCE_X_MSG_ASSERT_X, &frame);
+}
+
+UT_TEST(test_preassert_bootstrap_decode_rejects_reserved_length_and_pair_drift)
+{
+	ResourceXDecodedFrame request = make_bootstrap_frame(false);
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 len = 0;
+
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_ASSERT_X, &request, bytes, sizeof(bytes), &len,
+		&reject));
+	bytes[82] = 1;
+	test_reseal(bytes, len);
+	UT_ASSERT(!cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_ASSERT_X, bytes, len, &decoded, &reject));
+	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_RESERVED);
+	UT_ASSERT(!cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_ASSERT_X, bytes, len - 1, &decoded, &reject));
+	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_LEGACY_LENGTH);
+	UT_ASSERT(!cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
+	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
+}
 
 UT_TEST(test_control_codec_is_network_order_and_crc_exact)
 {
@@ -796,7 +945,7 @@ UT_TEST(test_resource_x_capability_has_complete_collision_census)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(24);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -805,6 +954,9 @@ main(void)
 	UT_RUN(test_authority_grant_layout_is_exact);
 	UT_RUN(test_image_envelope_layout_is_exact);
 	UT_RUN(test_install_settlement_layout_is_exact);
+	UT_RUN(test_preassert_bootstrap_request_and_ack_are_direction_exact);
+	UT_RUN(test_preassert_bootstrap_truth_tables_fail_closed);
+	UT_RUN(test_preassert_bootstrap_decode_rejects_reserved_length_and_pair_drift);
 	UT_RUN(test_control_codec_is_network_order_and_crc_exact);
 	UT_RUN(test_physical_sender_generation_rebind_preserves_block_semantics);
 	UT_RUN(test_shared_s_carrier_block_to_n_round_trip_is_exact);
