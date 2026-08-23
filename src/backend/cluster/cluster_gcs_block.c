@@ -15544,6 +15544,7 @@ gcs_block_pcm_x_collect_formation(PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_L
 static void gcs_block_pcm_x_resource_retry_tick(
 	const PcmXPeerBinding bindings[PCM_X_PROTOCOL_NODE_LIMIT]);
 static void gcs_block_pcm_x_terminal_retry_tick(void);
+static bool gcs_block_pcm_x_legacy_transport_current(void);
 static uint32 gcs_block_resource_x_dead_requester_bitmap(
 	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]);
 static bool gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
@@ -15649,6 +15650,8 @@ cluster_gcs_block_pcm_x_formation_tick(void)
 												 0, NULL, epoch_before);
 			return;
 		}
+		if (!gcs_block_pcm_x_legacy_transport_current())
+			return;
 		gcs_block_pcm_x_resource_retry_tick(bindings_before);
 		gcs_block_pcm_x_terminal_retry_tick();
 		return;
@@ -18088,6 +18091,8 @@ cluster_gcs_pcm_x_blocker_probe_kick(const PcmXTicketRef *ref, int32 holder_node
 	uint64 current_epoch;
 	uint64 holder_session;
 
+	if (!gcs_block_pcm_x_legacy_transport_current())
+		return;
 	current_epoch = cluster_epoch_get_current();
 	if (!cluster_gcs_pcm_x_ticket_ref_wire_valid(ref, current_epoch) || holder_node < 0
 		|| holder_node >= PCM_X_PROTOCOL_NODE_LIMIT || cluster_node_id < 0
@@ -19045,6 +19050,8 @@ cluster_gcs_block_pcm_x_image_pump_tick(int worker_id)
 	GcsBlockPcmXImageWork work;
 	GcsBlockPcmXImageResult result;
 
+	if (!gcs_block_pcm_x_legacy_transport_current())
+		return;
 	if (worker_id < 0 || worker_id >= cluster_lms_workers
 		|| (cluster_write_fence_enforcing() && !cluster_write_fence_allowed()))
 		return;
@@ -20226,6 +20233,8 @@ cluster_gcs_pcm_x_terminal_kick(const PcmXTicketRef *ref)
 	int node;
 	bool prehandle_cancel;
 
+	if (!gcs_block_pcm_x_legacy_transport_current())
+		return;
 	current_epoch = cluster_epoch_get_current();
 	if (!cluster_gcs_pcm_x_terminal_ref_wire_valid(ref, current_epoch))
 		return;

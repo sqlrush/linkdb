@@ -7300,11 +7300,93 @@ UT_TEST(test_r11_legacy_transport_drains_closed_but_rejects_target)
 	free(source);
 }
 
+UT_TEST(test_r11_legacy_retry_and_pump_roots_are_target_dormant)
+{
+	static const struct
+	{
+		const char *function;
+		const char *first_legacy_action;
+	} roots[] = {
+		{"\ncluster_gcs_block_pcm_x_image_pump_tick(",
+		 "cluster_gcs_block_dedup_pcm_x_next_work("},
+		{"\ncluster_gcs_pcm_x_terminal_kick(",
+		 "current_epoch = cluster_epoch_get_current()"},
+		{"\ncluster_gcs_pcm_x_blocker_probe_kick(",
+		 "current_epoch = cluster_epoch_get_current()"}
+	};
+	char *source = read_gcs_block_source();
+	const char *formation;
+	const char *formation_end;
+	const char *gate;
+	const char *guard;
+	const char *resource_retry;
+	const char *terminal_retry;
+	int i;
+
+	UT_ASSERT(cluster_gcs_pcm_x_legacy_transport_allowed(
+		RESOURCE_X_WRITER_CLOSED));
+	UT_ASSERT(!cluster_gcs_pcm_x_legacy_transport_allowed(
+		RESOURCE_X_WRITER_TARGET));
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+
+	formation = strstr(source, "\ncluster_gcs_block_pcm_x_formation_tick(");
+	formation_end = formation != NULL ? strstr(formation, "\nfail_closed:") : NULL;
+	gate = formation != NULL
+		? strstr(formation,
+			"cluster_pcm_lock_resource_x_gate_bind_formation_exact(")
+		: NULL;
+	guard = gate != NULL
+		? strstr(gate, "gcs_block_pcm_x_legacy_transport_current()")
+		: NULL;
+	resource_retry = formation != NULL
+		? strstr(formation, "gcs_block_pcm_x_resource_retry_tick(bindings_before);")
+		: NULL;
+	terminal_retry = formation != NULL
+		? strstr(formation, "gcs_block_pcm_x_terminal_retry_tick();")
+		: NULL;
+	UT_ASSERT_NOT_NULL(formation);
+	UT_ASSERT_NOT_NULL(formation_end);
+	UT_ASSERT_NOT_NULL(gate);
+	UT_ASSERT_NOT_NULL(guard);
+	UT_ASSERT_NOT_NULL(resource_retry);
+	UT_ASSERT_NOT_NULL(terminal_retry);
+	if (formation_end != NULL && gate != NULL && guard != NULL
+		&& resource_retry != NULL && terminal_retry != NULL) {
+		UT_ASSERT(gate < guard);
+		UT_ASSERT(guard < resource_retry);
+		UT_ASSERT(resource_retry < terminal_retry);
+		UT_ASSERT(terminal_retry < formation_end);
+	}
+
+	for (i = 0; i < lengthof(roots); i++) {
+		const char *begin = strstr(source, roots[i].function);
+		const char *end = begin != NULL ? strstr(begin, "\n}\n") : NULL;
+		const char *root_guard = begin != NULL
+			? strstr(begin, "gcs_block_pcm_x_legacy_transport_current()")
+			: NULL;
+		const char *action = begin != NULL
+			? strstr(begin, roots[i].first_legacy_action)
+			: NULL;
+
+		UT_ASSERT_NOT_NULL(begin);
+		UT_ASSERT_NOT_NULL(end);
+		UT_ASSERT_NOT_NULL(root_guard);
+		UT_ASSERT_NOT_NULL(action);
+		if (end != NULL && root_guard != NULL && action != NULL) {
+			UT_ASSERT(root_guard < action);
+			UT_ASSERT(action < end);
+		}
+	}
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(132);
+	UT_PLAN(133);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -7437,6 +7519,7 @@ main(void)
 	UT_RUN(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact);
 	UT_RUN(test_r11_legacy_source_requester_is_generation_bound);
 	UT_RUN(test_r11_legacy_transport_drains_closed_but_rejects_target);
+	UT_RUN(test_r11_legacy_retry_and_pump_roots_are_target_dormant);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
