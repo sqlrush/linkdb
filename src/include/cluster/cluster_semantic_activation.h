@@ -20,6 +20,8 @@
 #include "nodes/parsenodes.h"
 
 #define CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 (UINT64_C(1) << 0)
+#define CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1 (UINT64_C(1) << 10)
+#define CLUSTER_SEMANTIC_R11_RESOURCE_X_SOURCE_AVAILABLE true
 #define CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES 512
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_MAGIC UINT32_C(0x314B4341)
 #define CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_VERSION UINT16_C(1)
@@ -383,5 +385,7 @@ cluster_semantic_activation_submit(ClusterSemanticActivationAction action,
 								   ClusterSemanticActivationRefusal *refusal);
 extern void ExecAlterSystemRacTwoStage(AlterSystemRacTwoStageStmt *stmt);
 extern const ClusterSemanticActivationDescriptor *cluster_semantic_activation_r4_descriptor(void);
+extern const ClusterSemanticActivationDescriptor *
+cluster_semantic_activation_r11_resource_x_descriptor(void);
 
 #endif /* CLUSTER_SEMANTIC_ACTIVATION_H */

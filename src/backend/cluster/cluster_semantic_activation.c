@@ -4718,6 +4718,37 @@ bit22_stage_ok(uint64 record_generation)
 	return CLUSTER_SEMANTIC_ACTIVATION_OK;
 }
 
+/* The Resource-X cutover descriptor is compiled before its later callback
+ * owners become reachable.  Until those owners are wired, every callback is
+ * deliberately fail-closed and mutates no source or target state. */
+static ClusterSemanticActivationResult
+r11_resource_x_not_ready(uint64 expected_generation,
+						 ClusterSemanticActivationRefusal *refusal)
+{
+	semantic_activation_set_refusal(
+		refusal, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE,
+		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		expected_generation);
+	return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_zero_unavailable(uint64 generation,
+							ClusterSemanticZeroProof *proof)
+{
+	(void) generation;
+	if (proof != NULL)
+		memset(proof, 0, sizeof(*proof));
+	return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_stage_closed(uint64 generation)
+{
+	(void) generation;
+	return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+}
+
 static const ClusterSemanticActivationDescriptor r4_descriptor = {
 	.name = "R4_SYNC_CR_V1",
 	.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
@@ -4734,12 +4765,38 @@ static const ClusterSemanticActivationDescriptor r4_descriptor = {
 	.open_target_admission = r4_stage_fail_closed,
 };
 
+static const ClusterSemanticActivationDescriptor r11_resource_x_descriptor = {
+	.name = "R11_RESOURCE_X_D5_CUTOVER_V1",
+	.feature_bit = CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+	.required_hello_caps = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+						   | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+	.required_active_bits = 0,
+	.source_available = CLUSTER_SEMANTIC_R11_RESOURCE_X_SOURCE_AVAILABLE,
+	.pre_prepare_readiness = r11_resource_x_not_ready,
+	.close_source_admission = r11_resource_x_stage_closed,
+	.source_logical_debt_zero = r11_resource_x_zero_unavailable,
+	.source_transport_zero = r11_resource_x_zero_unavailable,
+	.prepare_target = r11_resource_x_stage_closed,
+	.apply_target_closed = r11_resource_x_stage_closed,
+	.revert_source_closed = r11_resource_x_stage_closed,
+	.open_target_admission = r11_resource_x_stage_closed,
+};
+
+StaticAssertDecl(
+	(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+	 & CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1) == 0,
+	"R11 Resource-X cutover feature bit must be unique");
+StaticAssertDecl(PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1
+				 == UINT32_C(0x00020000),
+	"R11 Resource-X cutover must retain the R10 capability value");
+
 /* Immutable after postmaster module registration.  R4 occupies bit zero in
  * every build; later feature modules register their compile-time descriptor
  * during the same shared-memory registration window. */
 static const ClusterSemanticActivationDescriptor
 	*SemanticActivationDescriptors[64] = {
 		[0] = &r4_descriptor,
+		[10] = &r11_resource_x_descriptor,
 	};
 
 /*
@@ -9497,6 +9554,12 @@ const ClusterSemanticActivationDescriptor *
 cluster_semantic_activation_r4_descriptor(void)
 {
 	return &r4_descriptor;
+}
+
+const ClusterSemanticActivationDescriptor *
+cluster_semantic_activation_r11_resource_x_descriptor(void)
+{
+	return &r11_resource_x_descriptor;
 }
 
 #ifdef USE_PGRAC_CLUSTER

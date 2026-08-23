@@ -1114,30 +1114,55 @@ UT_TEST(test_10_r4_descriptor_has_every_callback)
 	UT_ASSERT_NOT_NULL(descriptor->open_target_admission);
 }
 
-UT_TEST(test_10a_compiled_registry_accepts_future_bit10_descriptor)
+UT_TEST(test_10a_r11_resource_x_cutover_descriptor_is_compiled_exact)
 {
 	const ClusterSemanticActivationDescriptor *r4
 		= cluster_semantic_activation_r4_descriptor();
-	static ClusterSemanticActivationDescriptor future_cutover;
-	const uint64 future_cutover_bit = UINT64_C(1) << 10;
+	const ClusterSemanticActivationDescriptor *cutover
+		= cluster_semantic_activation_r11_resource_x_descriptor();
+	ClusterSemanticActivationRefusal refusal;
+	ClusterSemanticZeroProof proof;
 
-	UT_ASSERT_EQ(cluster_semantic_activation_compiled_feature_bitmap(),
-				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
-	future_cutover = *r4;
-	future_cutover.name = "R11_RESOURCE_X_D5_CUTOVER_V1";
-	future_cutover.feature_bit = future_cutover_bit;
-	future_cutover.required_hello_caps
-		= PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
-		  | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
-	cluster_semantic_activation_register(&future_cutover);
-
+	UT_ASSERT_NOT_NULL(cutover);
+	UT_ASSERT_STR_EQ(cutover->name, "R11_RESOURCE_X_D5_CUTOVER_V1");
+	UT_ASSERT_EQ(cutover->feature_bit,
+				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
+	UT_ASSERT_EQ(cutover->required_hello_caps,
+				 PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+				 | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1);
+	UT_ASSERT_EQ(cutover->required_active_bits, 0);
+	UT_ASSERT(cutover->source_available);
+	UT_ASSERT_NOT_NULL(cutover->pre_prepare_readiness);
+	UT_ASSERT_NOT_NULL(cutover->close_source_admission);
+	UT_ASSERT_NOT_NULL(cutover->source_logical_debt_zero);
+	UT_ASSERT_NOT_NULL(cutover->source_transport_zero);
+	UT_ASSERT_NOT_NULL(cutover->prepare_target);
+	UT_ASSERT_NOT_NULL(cutover->apply_target_closed);
+	UT_ASSERT_NOT_NULL(cutover->revert_source_closed);
+	UT_ASSERT_NOT_NULL(cutover->open_target_admission);
 	UT_ASSERT_EQ(cluster_semantic_activation_descriptor(
 				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1), r4);
-	UT_ASSERT_EQ(cluster_semantic_activation_descriptor(future_cutover_bit),
-				 &future_cutover);
+	UT_ASSERT_EQ(cluster_semantic_activation_descriptor(
+				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1),
+				 cutover);
 	UT_ASSERT_EQ(cluster_semantic_activation_compiled_feature_bitmap(),
 				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
-				 | future_cutover_bit);
+				 | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
+	memset(&refusal, 0, sizeof(refusal));
+	UT_ASSERT_EQ(cutover->pre_prepare_readiness(7, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(refusal.feature_bit,
+				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
+	UT_ASSERT_EQ(refusal.expected_generation, 7);
+	memset(&proof, 0x7f, sizeof(proof));
+	UT_ASSERT_EQ(cutover->source_logical_debt_zero(7, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(proof.record_generation, 0);
+	UT_ASSERT_EQ(proof.debt_count, 0);
+	UT_ASSERT_EQ(proof.sample_digest, 0);
+	UT_ASSERT_EQ(cutover->open_target_admission(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 }
 
 UT_TEST(test_11_source_only_is_exclusive)
@@ -5520,7 +5545,7 @@ main(void)
 	UT_RUN(test_08_r4_descriptor_caps_and_active_bits);
 	UT_RUN(test_09_r4_descriptor_retains_source);
 	UT_RUN(test_10_r4_descriptor_has_every_callback);
-	UT_RUN(test_10a_compiled_registry_accepts_future_bit10_descriptor);
+	UT_RUN(test_10a_r11_resource_x_cutover_descriptor_is_compiled_exact);
 	UT_RUN(test_11_source_only_is_exclusive);
 	UT_RUN(test_12_target_only_is_exclusive);
 	UT_RUN(test_13_enable_source_open_to_admission_stopped);
