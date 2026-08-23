@@ -76,6 +76,7 @@
 #include "cluster/cluster_pcm_own.h" /* ownership-generation wave — per-buffer gen + flags */
 #include "cluster/cluster_pcm_x_bufmgr.h" /* spec-2.36a C1 opaque reservation API */
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_semantic_activation.h"
 
 /*
  * PGRAC (spec-4.10 D1): ignore_checksum_failure is defined in bufpage.c with
@@ -3244,7 +3245,9 @@ cluster_bufmgr_pcm_x_writer_classify_null_claim(BufferDesc *buf)
 }
 
 static ClusterPcmXWriterLedgerEntry *
-cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode, bool *barrier_refused)
+cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode,
+										ResourceXWriterPath writer_path,
+										uint64 r4_generation, bool *barrier_refused)
 {
 	ClusterPcmXWriterLedgerEntry *entry;
 	ClusterPcmOwnSnapshot granted;
@@ -3253,7 +3256,11 @@ cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode, bool *bar
 	PcmXQueueResult result;
 	LWLock *content_lock;
 
-	if (mode != PCM_LOCK_MODE_X || buf == NULL || !cluster_bufmgr_should_pcm_track(buf))
+	if (mode != PCM_LOCK_MODE_X || buf == NULL || !cluster_bufmgr_should_pcm_track(buf)
+		|| (writer_path != RESOURCE_X_WRITER_SOURCE
+			&& writer_path != RESOURCE_X_WRITER_TARGET)
+		|| r4_generation == UINT64_MAX
+		|| (writer_path == RESOURCE_X_WRITER_TARGET && r4_generation == 0))
 		return NULL;
 	content_lock = BufferDescriptorGetContentLock(buf);
 	if (LWLockHeldByMe(content_lock))
@@ -3365,6 +3372,29 @@ cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode, bool *bar
 	entry->activation_fence_armed = granted.writer_activation_token != 0;
 	entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING;
 	return entry;
+}
+
+static ClusterPcmXWriterLedgerEntry *
+cluster_bufmgr_pcm_x_writer_prepare_source(BufferDesc *buf, PcmLockMode mode,
+										   uint64 pcm_writer_r4_generation,
+										   bool *pcm_barrier_refused)
+{
+	return cluster_bufmgr_pcm_x_writer_prepare(
+		buf, mode, RESOURCE_X_WRITER_SOURCE,
+		pcm_writer_r4_generation, pcm_barrier_refused);
+}
+
+static ClusterPcmXWriterLedgerEntry *
+cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, PcmLockMode mode,
+										   uint64 pcm_writer_r4_generation,
+										   bool *pcm_barrier_refused)
+{
+	/* D11-03 removes the legacy 41..64 adapter legs behind the existing
+	 * Resource-X requester owner.  Until then bit 10 cannot OPEN because its
+	 * descriptor callbacks remain fail-closed. */
+	return cluster_bufmgr_pcm_x_writer_prepare(
+		buf, mode, RESOURCE_X_WRITER_TARGET,
+		pcm_writer_r4_generation, pcm_barrier_refused);
 }
 
 static void
@@ -9671,6 +9701,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 	uint64		pcm_committed_generation = 0;
 	ClusterPcmXHolderLedgerEntry *pcm_x_holder = NULL;
 	ClusterPcmXWriterLedgerEntry *pcm_x_writer = NULL;
+	ResourceXWriterPath pcm_writer_path = RESOURCE_X_WRITER_CLOSED;
+	uint64 pcm_writer_r4_generation = 0;
 	ClusterPcmXWriterRoute pcm_route = CLUSTER_PCM_X_WRITER_LEGACY_SAFE;
 	bool pcm_x_writer_managed = false;
 	bool pcm_retry_denied = false;
@@ -9695,6 +9727,22 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 		cluster_bufmgr_should_pcm_track(buf))
 	{
 		pcm_mode = (mode == BUFFER_LOCK_SHARE) ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
+		if (pcm_mode == PCM_LOCK_MODE_X)
+		{
+			pcm_writer_path = cluster_resource_x_writer_path_snapshot(
+				&pcm_writer_r4_generation);
+			if (pcm_writer_path == RESOURCE_X_WRITER_CLOSED)
+			{
+				if (pcm_barrier_refused != NULL)
+				{
+					*pcm_barrier_refused = true;
+					cluster_pcm_x_stats_note_barrier_unwind();
+					goto cluster_lockbuffer_barrier_refusal;
+				}
+				cluster_bufmgr_pcm_x_writer_report_failure(
+					PCM_X_QUEUE_BARRIER_CLOSED, buf, "R11 writer selector");
+			}
+		}
 
 		/* A queue grant leaves node X cached until revoke.  Preserve that
 		 * authority before deciding that this LockBuffer is a new writer
@@ -9732,9 +9780,23 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 			}
 		}
 
-		if (!pcm_covered)
-			pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,
-															   pcm_barrier_refused);
+		if (!pcm_covered && pcm_mode == PCM_LOCK_MODE_X)
+		{
+			switch (pcm_writer_path)
+			{
+				case RESOURCE_X_WRITER_SOURCE:
+					pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_source(
+						buf, pcm_mode, pcm_writer_r4_generation, pcm_barrier_refused);
+					break;
+				case RESOURCE_X_WRITER_TARGET:
+					pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_target(
+						buf, pcm_mode, pcm_writer_r4_generation, pcm_barrier_refused);
+					break;
+				case RESOURCE_X_WRITER_CLOSED:
+				default:
+					goto cluster_lockbuffer_barrier_refusal;
+			}
+		}
 		if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
 			goto cluster_lockbuffer_barrier_refusal;	/* caller owns the unwind */
 
@@ -10109,8 +10171,22 @@ pcm_legacy_acquire_done:
 							cluster_bufmgr_pcm_x_holder_abort_acquiring(pcm_x_holder);
 							pcm_x_holder = NULL;
 						}
-						pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,
-																		   pcm_barrier_refused);
+						switch (pcm_writer_path)
+						{
+							case RESOURCE_X_WRITER_SOURCE:
+								pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_source(
+									buf, pcm_mode, pcm_writer_r4_generation,
+									pcm_barrier_refused);
+								break;
+							case RESOURCE_X_WRITER_TARGET:
+								pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_target(
+									buf, pcm_mode, pcm_writer_r4_generation,
+									pcm_barrier_refused);
+								break;
+							case RESOURCE_X_WRITER_CLOSED:
+							default:
+								goto cluster_lockbuffer_barrier_refusal;
+						}
 					}
 					if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
 					{

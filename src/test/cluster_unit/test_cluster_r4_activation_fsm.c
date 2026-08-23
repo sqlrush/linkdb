@@ -1165,6 +1165,41 @@ UT_TEST(test_10a_r11_resource_x_cutover_descriptor_is_compiled_exact)
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 }
 
+UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)
+{
+	uint64 generation = UINT64_MAX;
+
+	test_gate_reset();
+	test_gate_publish(2, 0, 19, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+				 RESOURCE_X_WRITER_SOURCE);
+	UT_ASSERT_EQ(generation, UINT64_C(19));
+
+	test_gate_publish(4,
+				  CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+				  20, test_current_epoch, false);
+	UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+				 RESOURCE_X_WRITER_TARGET);
+	UT_ASSERT_EQ(generation, UINT64_C(20));
+
+	test_gate_publish(6,
+				  CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+				  21, test_current_epoch, true);
+	UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+				 RESOURCE_X_WRITER_CLOSED);
+	UT_ASSERT_EQ(generation, UINT64_C(21));
+
+	/* A torn gate and a missing output owner both fail closed. */
+	test_gate_publish(7, 0, 22, test_current_epoch, false);
+	generation = UINT64_MAX;
+	UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(&generation),
+				 RESOURCE_X_WRITER_CLOSED);
+	UT_ASSERT_EQ(generation, UINT64_C(0));
+	UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(NULL),
+				 RESOURCE_X_WRITER_CLOSED);
+	test_gate_reset();
+}
+
 UT_TEST(test_11_source_only_is_exclusive)
 {
 	UT_ASSERT(semantic_activation_source_target_exclusive(true, false));
@@ -5534,7 +5569,7 @@ UT_TEST(test_145g_peer_open_matches_consumes_open_proof)
 int
 main(void)
 {
-	UT_PLAN(203);
+	UT_PLAN(204);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -5546,6 +5581,7 @@ main(void)
 	UT_RUN(test_09_r4_descriptor_retains_source);
 	UT_RUN(test_10_r4_descriptor_has_every_callback);
 	UT_RUN(test_10a_r11_resource_x_cutover_descriptor_is_compiled_exact);
+	UT_RUN(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation);
 	UT_RUN(test_11_source_only_is_exclusive);
 	UT_RUN(test_12_target_only_is_exclusive);
 	UT_RUN(test_13_enable_source_open_to_admission_stopped);

@@ -89,6 +89,13 @@ typedef enum ClusterSemanticAdmissionResult {
 	CLUSTER_SEMANTIC_ADMISSION_CLOSED = 4
 } ClusterSemanticAdmissionResult;
 
+/* One read-only R4 gate decision for the tracked buffer-writer choke point. */
+typedef enum ResourceXWriterPath {
+	RESOURCE_X_WRITER_SOURCE = 1,
+	RESOURCE_X_WRITER_TARGET = 2,
+	RESOURCE_X_WRITER_CLOSED = 3
+} ResourceXWriterPath;
+
 typedef struct ClusterSemanticAdmissionToken {
 	uint64 feature_bit;
 	uint64 record_generation;
@@ -252,6 +259,8 @@ typedef struct ClusterSemanticActivationDescriptor {
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
 								  ClusterSemanticAdmissionToken *token);
+extern ResourceXWriterPath
+cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out);
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter_r4_terminal_census(

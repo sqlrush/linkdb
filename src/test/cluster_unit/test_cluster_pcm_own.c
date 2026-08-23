@@ -2416,6 +2416,40 @@ UT_TEST(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires)
 	free(source);
 }
 
+UT_TEST(test_r11_lockbuffer_writer_selector_is_single_snapshot_and_exclusive)
+{
+	static const char *const selector_contract[] = {
+		"pcm_writer_path = cluster_resource_x_writer_path_snapshot(",
+		"switch (pcm_writer_path)",
+		"case RESOURCE_X_WRITER_SOURCE:",
+		"cluster_bufmgr_pcm_x_writer_prepare_source(",
+		"case RESOURCE_X_WRITER_TARGET:",
+		"cluster_bufmgr_pcm_x_writer_prepare_target(",
+		"case RESOURCE_X_WRITER_CLOSED:",
+		"cluster_lockbuffer_barrier_refusal"
+	};
+	char *source = read_bufmgr_source();
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	UT_ASSERT_EQ(count_occurrences(
+		source, "cluster_resource_x_writer_path_snapshot("), 1);
+	if (strstr(source, "cluster_resource_x_writer_path_snapshot(") == NULL)
+	{
+		free(source);
+		return;
+	}
+	assert_ordered_in_function(
+		source, "\nLockBufferInternal(Buffer buffer, int mode", "\nvoid\nLockBuffer(",
+		selector_contract, lengthof(selector_contract));
+	/* The generation is passed into the selected wrapper; neither arm may
+	 * silently resnapshot into the other implementation. */
+	UT_ASSERT_NOT_NULL(strstr(source,
+		"pcm_writer_r4_generation, pcm_barrier_refused"));
+	free(source);
+}
+
 UT_TEST(test_bufmgr_pcm_x_holder_ledger_is_bounded_and_uses_private_identity)
 {
 	static const char *const identity_contract[]
@@ -3310,7 +3344,8 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 			"cluster_pcm_lock_unlock_content_buffer(buf, old_mode)" };
 	static const char *const acquire_contract[]
 		= { "pcm_covered = cluster_pcm_x_cached_cover_bypasses_queue(",
-			"pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare(buf, pcm_mode,",
+			"switch (pcm_writer_path)",
+			"pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_source(",
 			"pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(",
 			"LWLockAcquire(BufferDescriptorGetContentLock(buf)",
 			"cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer)" };
@@ -3697,7 +3732,7 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(72);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_resource_x_activation_binding_is_exact_and_legacy_closed);
 	UT_RUN(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking);
@@ -3747,6 +3782,7 @@ main(void)
 	UT_RUN(test_queue_s_release_finish_is_header_exact_and_returns_fresh_n);
 	UT_RUN(test_resource_x_remote_s_finish_requires_content_and_exact_revoke);
 	UT_RUN(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires);
+	UT_RUN(test_r11_lockbuffer_writer_selector_is_single_snapshot_and_exclusive);
 	UT_RUN(test_bufmgr_pcm_x_holder_ledger_is_bounded_and_uses_private_identity);
 	UT_RUN(test_unlockbuffers_exceptionally_detaches_released_pcm_x_holders);
 	UT_RUN(test_bufmgr_pcm_x_holder_gate_retry_is_bounded_outside_content_lock);

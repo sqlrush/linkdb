@@ -6013,6 +6013,29 @@ semantic_activation_snapshot(SemanticActivationAdmissionSnapshot *snapshot)
 	return false;
 }
 
+ResourceXWriterPath
+cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out)
+{
+	SemanticActivationAdmissionSnapshot snapshot;
+
+	if (r4_generation_out == NULL)
+		return RESOURCE_X_WRITER_CLOSED;
+	*r4_generation_out = 0;
+	if (!semantic_activation_snapshot(&snapshot))
+		return RESOURCE_X_WRITER_CLOSED;
+	*r4_generation_out = snapshot.record_generation;
+	if (snapshot.transition_closed
+		|| (snapshot.record_generation != 0
+			&& snapshot.formation_epoch != cluster_epoch_get_current()))
+		return RESOURCE_X_WRITER_CLOSED;
+	if ((snapshot.active_bits
+		 & CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1) != 0)
+		return RESOURCE_X_WRITER_TARGET;
+	return CLUSTER_SEMANTIC_R11_RESOURCE_X_SOURCE_AVAILABLE
+		? RESOURCE_X_WRITER_SOURCE
+		: RESOURCE_X_WRITER_CLOSED;
+}
+
 /*
  * A remote member cannot inspect the coordinator's process-local utility
  * mailbox.  It accepts the authenticated current coordinator's SAMPLE nonce
