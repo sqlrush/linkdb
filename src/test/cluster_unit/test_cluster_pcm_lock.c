@@ -1952,7 +1952,7 @@ UT_TEST(test_resource_x_bootstrap_receipt_replays_and_consumes_exactly)
 				 RESOURCE_X_APPLY_APPLIED);
 	request = make_resource_x_bootstrap_request(tag, 1);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 1, 51, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+		&request, 1, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(ack.kind, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
 	UT_ASSERT(resource_x_assertion_equal(&ack.common.logical_assertion,
 		&request.common.logical_assertion));
@@ -1969,7 +1969,7 @@ UT_TEST(test_resource_x_bootstrap_receipt_replays_and_consumes_exactly)
 
 	memset(&replay_ack, 0, sizeof(replay_ack));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 1, 51, 77, 31, 71, &replay_ack),
+		&request, 1, 61, 77, 31, 71, &replay_ack),
 		RESOURCE_X_APPLY_DUPLICATE);
 	UT_ASSERT(memcmp(&ack, &replay_ack, sizeof(ack)) == 0);
 
@@ -1980,39 +1980,40 @@ UT_TEST(test_resource_x_bootstrap_receipt_replays_and_consumes_exactly)
 		= assertion.common.base_authority_generation;
 	assertion.common.outcome = RESOURCE_X_OUTCOME_NONE;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&assertion, 1, 51, 77, 31, 71, &snapshot),
+		&assertion, 1, 61, 77, 31, 71, &snapshot),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&assertion, 1, 51, 77, 31, 71, &snapshot),
+		&assertion, 1, 61, 77, 31, 71, &snapshot),
 		RESOURCE_X_APPLY_DUPLICATE);
 	mutated = assertion;
 	mutated.common.observed_mode = PCM_STATE_S;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&mutated, 1, 51, 77, 31, 71, &snapshot),
+		&mutated, 1, 61, 77, 31, 71, &snapshot),
 		RESOURCE_X_APPLY_INVALID);
 	mutated = assertion;
 	mutated.common.source_candidate = 1;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&mutated, 1, 51, 77, 31, 71, &snapshot),
+		&mutated, 1, 61, 77, 31, 71, &snapshot),
 		RESOURCE_X_APPLY_INVALID);
 	mutated = assertion;
 	mutated.common.ordered_lane = 1;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&mutated, 1, 51, 77, 31, 71, &snapshot),
+		&mutated, 1, 61, 77, 31, 71, &snapshot),
 		RESOURCE_X_APPLY_INVALID);
 	mutated = assertion;
 	mutated.payload_bytes--;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&mutated, 1, 51, 77, 31, 71, &snapshot),
+		&mutated, 1, 61, 77, 31, 71, &snapshot),
 		RESOURCE_X_APPLY_INVALID);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 1, 51, 77, 31, 71, &replay_ack), RESOURCE_X_APPLY_STALE);
+		&request, 1, 61, 77, 31, 71, &replay_ack), RESOURCE_X_APPLY_STALE);
 }
 
 UT_TEST(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor)
 {
 	BufferTag tag = make_tag(154);
 	ResourceXDecodedFrame request;
+	ResourceXDecodedFrame different_sender;
 	ResourceXDecodedFrame higher;
 	ResourceXDecodedFrame ack;
 	ResourceXDecodedFrame assertion;
@@ -2024,22 +2025,26 @@ UT_TEST(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor)
 		RESOURCE_X_APPLY_APPLIED);
 	request = make_resource_x_bootstrap_request(tag, 1);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 1, 51, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+		&request, 1, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
 
-	/* The master sender connection changed.  The old binding is invalidated,
+	/* The requester sender coordinate changed independently of the unchanged
+	 * master-receiver ingress coordinate.  The old binding is invalidated,
 	 * but the exact attempt cannot be reused. */
+	different_sender = make_resource_x_bootstrap_request_values(
+		tag, 1, 17, 31, 41, 52);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 1, 51, 77, 31, 72, &ack), RESOURCE_X_APPLY_STALE);
+		&different_sender, 1, 61, 77, 31, 71, &ack),
+		RESOURCE_X_APPLY_STALE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 1, 51, 77, 31, 72, &ack), RESOURCE_X_APPLY_STALE);
+		&request, 1, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_STALE);
 
 	higher = make_resource_x_bootstrap_request_values(
-		tag, 1, 17, 31, 42, 51);
+		tag, 1, 17, 31, 42, 52);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&higher, 1, 51, 77, 31, 72, &ack), RESOURCE_X_APPLY_APPLIED);
+		&higher, 1, 61, 77, 31, 72, &ack), RESOURCE_X_APPLY_APPLIED);
 	assertion = ack;
 	assertion.kind = RESOURCE_X_WIRE_ASSERT_X;
-	assertion.common.sender_connection_generation = 51;
+	assertion.common.sender_connection_generation = 52;
 	assertion.common.authority_generation
 		= assertion.common.base_authority_generation;
 	assertion.common.outcome = RESOURCE_X_OUTCOME_NONE;
@@ -2047,19 +2052,19 @@ UT_TEST(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor)
 	/* An R4 record-generation change destroys the receipt.  Returning to the
 	 * old value cannot resurrect it, and no canonical ASSERT was created. */
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&assertion, 1, 51, 78, 31, 72, &snapshot), RESOURCE_X_APPLY_STALE);
+		&assertion, 1, 61, 78, 31, 72, &snapshot), RESOURCE_X_APPLY_STALE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&assertion, 1, 51, 77, 31, 72, &snapshot), RESOURCE_X_APPLY_STALE);
+		&assertion, 1, 61, 77, 31, 72, &snapshot), RESOURCE_X_APPLY_STALE);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 		&higher.common.logical_assertion, &snapshot),
 		RESOURCE_X_APPLY_NOT_FOUND);
 
 	higher = make_resource_x_bootstrap_request_values(
-		tag, 1, 17, 31, 43, 51);
+		tag, 1, 17, 31, 43, 52);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&higher, 1, 51, 78, 31, 72, &ack), RESOURCE_X_APPLY_APPLIED);
+		&higher, 1, 61, 78, 31, 72, &ack), RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 1, 51, 78, 31, 72, &ack), RESOURCE_X_APPLY_STALE);
+		&request, 1, 61, 78, 31, 72, &ack), RESOURCE_X_APPLY_STALE);
 }
 
 UT_TEST(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor)
@@ -2082,7 +2087,7 @@ UT_TEST(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor)
 	request = make_resource_x_bootstrap_request_values(
 		tag, 3, 17, 31, 41, 51);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 3, 51, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
+		&request, 3, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_APPLIED);
 	assertion = ack;
 	assertion.kind = RESOURCE_X_WIRE_ASSERT_X;
 	assertion.common.sender_connection_generation = 51;
@@ -2090,7 +2095,7 @@ UT_TEST(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor)
 		= assertion.common.base_authority_generation;
 	assertion.common.outcome = RESOURCE_X_OUTCOME_NONE;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		&assertion, 3, 51, 77, 31, 71, &snapshot),
+		&assertion, 3, 61, 77, 31, 71, &snapshot),
 		RESOURCE_X_APPLY_APPLIED);
 
 	memset(&durable, 0, sizeof(durable));
@@ -2141,11 +2146,11 @@ UT_TEST(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor)
 		RESOURCE_X_APPLY_APPLIED);
 
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&request, 3, 51, 77, 31, 71, &ack), RESOURCE_X_APPLY_STALE);
+		&request, 3, 61, 77, 31, 71, &ack), RESOURCE_X_APPLY_STALE);
 	next_request = make_resource_x_bootstrap_request_values(
 		tag, 3, 17, 31, 42, 51);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&next_request, 3, 51, 77, 31, 71, &ack),
+		&next_request, 3, 61, 77, 31, 71, &ack),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(ack.common.base_authority_generation, UINT64_C(2));
 }
@@ -2167,7 +2172,7 @@ UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
 	old_request = make_resource_x_bootstrap_request_values(
 		tag, 1, 17, 31, 41, 51);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&old_request, 1, 51, 77, 31, 71, &ack),
+		&old_request, 1, 61, 77, 31, 71, &ack),
 		RESOURCE_X_APPLY_APPLIED);
 	broadcast_before = fake_cv_broadcast_count;
 
@@ -2182,12 +2187,12 @@ UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
 	new_request = make_resource_x_bootstrap_request_values(
 		tag, 1, 18, 32, 41, 52);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&new_request, 1, 52, 78, 32, 72, &ack),
+		&new_request, 1, 62, 78, 32, 72, &ack),
 		RESOURCE_X_APPLY_STALE);
 	new_request = make_resource_x_bootstrap_request_values(
 		tag, 1, 18, 32, 42, 52);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&new_request, 1, 52, 78, 32, 72, &ack),
+		&new_request, 1, 62, 78, 32, 72, &ack),
 		RESOURCE_X_APPLY_APPLIED);
 }
 

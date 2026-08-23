@@ -6957,8 +6957,8 @@ pcm_resource_x_bootstrap_request_valid(
 			== request->common.logical_assertion.requester_node
 		&& authenticated_ingress_connection_generation != 0
 		&& authenticated_ingress_connection_generation != UINT32_MAX
-		&& authenticated_ingress_connection_generation
-			== request->common.sender_connection_generation
+		&& request->common.sender_connection_generation != 0
+		&& request->common.sender_connection_generation != UINT32_MAX
 		&& r4_record_generation != 0
 		&& r4_record_generation != UINT64_MAX
 		&& current_master_session_incarnation != 0
@@ -7067,8 +7067,9 @@ pcm_resource_x_bootstrap_receipt_valid(
 		&& receipt->highest_attempt_floor != UINT64_MAX
 		&& receipt->r4_record_generation != 0
 		&& receipt->r4_record_generation != UINT64_MAX
+		&& receipt->authenticated_ingress_connection_generation != 0
 		&& receipt->authenticated_ingress_connection_generation
-			== request->sender_connection_generation;
+			!= UINT32_MAX;
 }
 
 static void
@@ -7117,8 +7118,8 @@ pcm_resource_x_bootstrapped_assert_matches_receipt(
 		&& assertion->common.source_candidate == 0
 		&& assertion->common.retain_pi_if_dirty == 0
 		&& assertion->common.sender_connection_generation
-			== authenticated_ingress_connection_generation
-		&& assertion->common.sender_connection_generation
+			== receipt->request.sender_connection_generation
+		&& authenticated_ingress_connection_generation
 			== receipt->authenticated_ingress_connection_generation
 		&& assertion->common.outcome == RESOURCE_X_OUTCOME_NONE
 		&& assertion->common.flags == 0
@@ -7480,6 +7481,8 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 			|| receipt->request.resource_formation != gate_formation
 			|| receipt->request.master_session_incarnation
 				!= current_master_session_incarnation
+			|| receipt->request.sender_connection_generation
+				!= request->common.sender_connection_generation
 			|| receipt->authenticated_ingress_connection_generation
 				!= authenticated_ingress_connection_generation
 			|| receipt->ack.sender_connection_generation
@@ -7578,7 +7581,7 @@ pcm_resource_x_assert_exact_internal(
 				|| authenticated_ingress_connection_generation == 0
 				|| authenticated_ingress_connection_generation == UINT32_MAX
 				|| assertion->common.sender_connection_generation
-					!= authenticated_ingress_connection_generation
+					== UINT32_MAX
 				|| r4_record_generation == 0
 				|| r4_record_generation == UINT64_MAX
 				|| current_master_session_incarnation == 0
