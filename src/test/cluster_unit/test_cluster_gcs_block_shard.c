@@ -741,10 +741,19 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 	frame.common.sender_connection_generation = 16;
 	frame.common.authority_generation = 17;
 
-	if (kind == RESOURCE_X_WIRE_BLOCK_TO_N) {
+	if (kind == RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP) {
+		frame.common.ordered_lane = 0;
+		frame.common.authority_generation = 0;
+		if (msg_type == RESOURCE_X_MSG_ASSERT_X)
+			frame.common.base_authority_generation = 0;
+		else
+			frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+	} else if (kind == RESOURCE_X_WIRE_BLOCK_TO_N) {
 		frame.common.action_node = 7;
 		frame.common.observed_mode = PCM_STATE_X;
 		frame.common.target_mode = PCM_STATE_N;
+		frame.common.source_candidate = 1;
+		frame.common.retain_pi_if_dirty = 1;
 	} else if (kind == RESOURCE_X_WIRE_BLOCKED_TO_N) {
 		frame.common.action_node = 7;
 		frame.common.observed_mode = PCM_STATE_X;
@@ -828,6 +837,9 @@ UT_TEST(test_resource_x_reused_types_route_only_after_strict_domain_decode)
 		ResourceXWireKind kind;
 		uint16 payload_len;
 	} cases[] = {
+		{ RESOURCE_X_MSG_ASSERT_X,
+		  RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP,
+		  RESOURCE_X_CONTROL_V1_BYTES },
 		{ RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_ASSERT_X,
 		  RESOURCE_X_CONTROL_V1_BYTES },
 		{ RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION,
@@ -842,6 +854,9 @@ UT_TEST(test_resource_x_reused_types_route_only_after_strict_domain_decode)
 		  RESOURCE_X_PROOF_V1_BYTES },
 		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_IMAGE_ENVELOPE,
 		  RESOURCE_X_IMAGE_V1_BYTES },
+		{ RESOURCE_X_MSG_IMAGE_OR_GRANT,
+		  RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP,
+		  RESOURCE_X_CONTROL_V1_BYTES },
 		{ RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, RESOURCE_X_WIRE_RELEASE_X,
 		  RESOURCE_X_CONTROL_V1_BYTES },
 		{ RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,

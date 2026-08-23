@@ -6274,6 +6274,61 @@ UT_TEST(test_resource_x_reused_type_ingress_precedes_every_legacy_path)
 	free(source);
 }
 
+UT_TEST(test_resource_x_kind9_ingress_is_target_native_and_no_fallback)
+{
+	char *source = read_gcs_block_source();
+	const char *candidate;
+	const char *ingress;
+	const char *ack_stage;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	candidate = strstr(source, "\ngcs_block_resource_x_payload_candidate(");
+	ingress = strstr(source, "\ngcs_block_resource_x_kind9_ingress(");
+	ack_stage = strstr(source,
+		"\ngcs_block_resource_x_bootstrap_ack_stage_exact(");
+	UT_ASSERT_NOT_NULL(candidate);
+	UT_ASSERT_NOT_NULL(ingress);
+	UT_ASSERT_NOT_NULL(ack_stage);
+	if (candidate != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(candidate,
+			"msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT"));
+		UT_ASSERT_NOT_NULL(strstr(candidate,
+			"payload_length == RESOURCE_X_CONTROL_V1_BYTES"));
+	}
+	if (ingress != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(ingress,
+			"CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1"));
+		UT_ASSERT_NOT_NULL(strstr(ingress,
+			"cluster_semantic_activation_enter("));
+		UT_ASSERT_NOT_NULL(strstr(ingress,
+			"cluster_pcm_lock_resource_x_bootstrap_request_exact("));
+		UT_ASSERT_NOT_NULL(strstr(ingress,
+			"cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact("));
+		UT_ASSERT_NOT_NULL(strstr(ingress,
+			"cluster_semantic_activation_recheck("));
+		UT_ASSERT_NOT_NULL(strstr(ingress,
+			"gcs_block_resource_x_bootstrap_ack_stage_exact("));
+		UT_ASSERT_NOT_NULL(strstr(ingress,
+			"gcs_block_pcm_x_resource_x_assert_stage_exact("));
+	}
+	UT_ASSERT_NOT_NULL(strstr(source,
+		"cluster_pcm_lock_resource_x_assert_bootstrapped_exact("));
+	if (ack_stage != NULL) {
+		const char *encode = strstr(ack_stage,
+			"cluster_resource_x_wire_encode(");
+		const char *enqueue = strstr(ack_stage,
+			"cluster_grd_outbound_enqueue_backend_msg(");
+
+		UT_ASSERT_NOT_NULL(encode);
+		UT_ASSERT_NOT_NULL(enqueue);
+		if (encode != NULL && enqueue != NULL)
+			UT_ASSERT(encode < enqueue);
+	}
+	free(source);
+}
+
 UT_TEST(test_resource_x_type15_exact_join_is_the_only_new_r9_entry)
 {
 	static const char *const ingress_contract[] = {
@@ -7053,7 +7108,7 @@ UT_TEST(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact)
 int
 main(void)
 {
-	UT_PLAN(128);
+	UT_PLAN(129);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -7170,6 +7225,7 @@ main(void)
 	UT_RUN(test_resource_x_self_x_to_x_commit_does_not_retire_acquisition);
 	UT_RUN(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake);
 	UT_RUN(test_resource_x_reused_type_ingress_precedes_every_legacy_path);
+	UT_RUN(test_resource_x_kind9_ingress_is_target_native_and_no_fallback);
 	UT_RUN(test_resource_x_type15_exact_join_is_the_only_new_r9_entry);
 	UT_RUN(test_resource_x_direct_n_uses_exact_durable_storage_proof);
 	UT_RUN(test_resource_x_passive_pi_waits_for_exact_remote_image_before_x);

@@ -118,7 +118,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &((const GcsBlockRequestPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_REPLY:
-		if (payload_len != RESOURCE_X_PROOF_V1_BYTES
+		if (payload_len != RESOURCE_X_CONTROL_V1_BYTES
+			&& payload_len != RESOURCE_X_PROOF_V1_BYTES
 			&& payload_len != RESOURCE_X_IMAGE_V1_BYTES)
 			return -1;
 		if (!cluster_resource_x_payload_route_tag(msg_type, payload, payload_len,

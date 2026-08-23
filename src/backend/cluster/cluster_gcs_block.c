@@ -8072,7 +8072,8 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
 			|| payload_length == RESOURCE_X_SHORT_V1_BYTES;
 	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
-		return payload_length == RESOURCE_X_PROOF_V1_BYTES
+		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
+			|| payload_length == RESOURCE_X_PROOF_V1_BYTES
 			|| payload_length == RESOURCE_X_IMAGE_V1_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES;
@@ -8247,6 +8248,30 @@ gcs_block_pcm_x_resource_x_assert_stage_exact(
 			   RESOURCE_X_MSG_ASSERT_X, master_node, proof_payload,
 			   proof_bytes)
 		? PCM_X_QUEUE_OK : PCM_X_QUEUE_BUSY;
+}
+
+/* PGRAC adaptation: the master receipt API has already copied the exact ACK
+ * semantic snapshot and released the resource entry lock.  Only then may the
+ * DATA-plane producer encode and enqueue the existing type-15 frame. */
+static bool
+gcs_block_resource_x_bootstrap_ack_stage_exact(
+	int32 requester_node, const ResourceXDecodedFrame *ack)
+{
+	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint16 payload_bytes = 0;
+
+	if (requester_node < 0
+		|| requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| ack == NULL
+		|| !cluster_resource_x_wire_encode(
+			RESOURCE_X_MSG_IMAGE_OR_GRANT, ack, payload, sizeof(payload),
+			&payload_bytes, &reject)
+		|| payload_bytes != RESOURCE_X_CONTROL_V1_BYTES)
+		return false;
+	return cluster_grd_outbound_enqueue_backend_msg(
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, (uint32)requester_node, payload,
+		payload_bytes);
 }
 
 /* Capture the requester-local current image while the legacy locator is
@@ -9773,6 +9798,179 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
+static bool
+gcs_block_resource_x_target_peer_matches_exact(
+	const ClusterSemanticAdmissionToken *admission, int32 peer_node,
+	uint32 authenticated_connection_generation)
+{
+	if (admission == NULL || !admission->entered
+		|| admission->feature_bit
+			!= CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
+		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| admission->record_generation == 0
+		|| admission->record_generation == UINT64_MAX
+		|| admission->formation_epoch != cluster_epoch_get_current()
+		|| peer_node < 0 || peer_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| authenticated_connection_generation == 0)
+		return false;
+	if (peer_node == cluster_node_id)
+		return (cluster_ic_local_capability_word()
+				& PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) != 0;
+	return cluster_semantic_activation_peer_open_matches(
+		admission, peer_node,
+		PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+		authenticated_connection_generation);
+}
+
+/* PGRAC adaptation: kind-9 is consumed as a closed subdomain.  Admission,
+ * receipt/round mutation and frozen-frame extraction complete before either
+ * encoder/stager runs; no malformed or stale kind-9 frame reaches legacy. */
+static void
+gcs_block_resource_x_kind9_ingress(
+	const ClusterICEnvelope *env, const ResourceXDecodedFrame *frame,
+	uint32 authenticated_connection_generation)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	PcmXRuntimeSnapshot runtime;
+	PcmXRuntimeSnapshot runtime_after;
+	ResourceXDecodedFrame outbound;
+	ResourceXApplyResult apply_result;
+	ResourceXBootstrapRoundAction round_action;
+	PcmXQueueResult stage_result;
+	uint32 outbound_connection_generation = 0;
+	uint32 rechecked_connection_generation = 0;
+	int32 source_node;
+	int32 master_node;
+
+	memset(&admission, 0, sizeof(admission));
+	memset(&outbound, 0, sizeof(outbound));
+	if (env == NULL || frame == NULL
+		|| frame->kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP)
+		return;
+	source_node = (int32)env->source_node_id;
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return;
+	if (!gcs_block_resource_x_target_peer_matches_exact(
+			&admission, source_node, authenticated_connection_generation))
+		goto done;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	master_node = cluster_gcs_lookup_master(
+		frame->common.logical_assertion.resource);
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.gate_generation == 0
+		|| runtime.gate_generation != frame->common.resource_formation
+		|| runtime.master_session_incarnation == 0
+		|| runtime.master_session_incarnation
+			!= frame->common.master_session_incarnation
+		|| !cluster_semantic_activation_recheck(&admission))
+		goto done;
+
+	if (env->msg_type == RESOURCE_X_MSG_ASSERT_X) {
+		if (master_node != cluster_node_id
+			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+				source_node, &outbound_connection_generation))
+			goto done;
+		apply_result = cluster_pcm_lock_resource_x_bootstrap_request_exact(
+			frame, source_node, authenticated_connection_generation,
+			admission.record_generation,
+			runtime.master_session_incarnation,
+			outbound_connection_generation, &outbound);
+		if (apply_result != RESOURCE_X_APPLY_APPLIED
+			&& apply_result != RESOURCE_X_APPLY_DUPLICATE)
+			goto done;
+		runtime_after = cluster_pcm_x_runtime_snapshot();
+		if (!cluster_semantic_activation_recheck(&admission)
+			|| runtime_after.state != runtime.state
+			|| runtime_after.gate_generation != runtime.gate_generation
+			|| runtime_after.master_session_incarnation
+				!= runtime.master_session_incarnation
+			|| cluster_gcs_lookup_master(
+					frame->common.logical_assertion.resource) != cluster_node_id
+			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+				source_node, &rechecked_connection_generation)
+			|| rechecked_connection_generation
+				!= outbound_connection_generation)
+			goto done;
+		(void)gcs_block_resource_x_bootstrap_ack_stage_exact(
+			source_node, &outbound);
+	} else if (env->msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT) {
+		if (master_node != source_node)
+			goto done;
+		round_action
+			= cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+				frame, source_node, authenticated_connection_generation,
+				admission.record_generation,
+				gcs_block_pcm_x_monotonic_us(), &outbound);
+		if (round_action != RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT
+			|| !cluster_semantic_activation_recheck(&admission))
+			goto done;
+		runtime_after = cluster_pcm_x_runtime_snapshot();
+		if (runtime_after.state != runtime.state
+			|| runtime_after.gate_generation != runtime.gate_generation
+			|| runtime_after.master_session_incarnation
+				!= runtime.master_session_incarnation)
+			goto done;
+		stage_result = gcs_block_pcm_x_resource_x_assert_stage_exact(
+			master_node, &outbound, NULL);
+		cluster_pcm_x_stats_note_queue_result(stage_result);
+	}
+
+done:
+	cluster_semantic_activation_leave(&admission);
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_bootstrapped_assert_ingress(
+	const ClusterICEnvelope *env, const ResourceXDecodedFrame *assertion,
+	uint32 authenticated_connection_generation,
+	ResourceXMasterSnapshot *snapshot)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	PcmXRuntimeSnapshot runtime;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	uint32 master_sender_connection_generation = 0;
+	int32 source_node;
+
+	memset(&admission, 0, sizeof(admission));
+	if (env == NULL || assertion == NULL || snapshot == NULL
+		|| assertion->kind != RESOURCE_X_WIRE_ASSERT_X
+		|| assertion->common.ordered_lane != 0)
+		return RESOURCE_X_APPLY_INVALID;
+	source_node = (int32)env->source_node_id;
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_STALE;
+	if (!gcs_block_resource_x_target_peer_matches_exact(
+			&admission, source_node, authenticated_connection_generation))
+		goto done;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.gate_generation != assertion->common.resource_formation
+		|| runtime.master_session_incarnation
+			!= assertion->common.master_session_incarnation
+		|| cluster_gcs_lookup_master(
+			assertion->common.logical_assertion.resource) != cluster_node_id
+		|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+			source_node, &master_sender_connection_generation)
+		|| !cluster_semantic_activation_recheck(&admission))
+		goto done;
+	result = cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
+		assertion, source_node, authenticated_connection_generation,
+		admission.record_generation, runtime.master_session_incarnation,
+		master_sender_connection_generation, snapshot);
+
+done:
+	cluster_semantic_activation_leave(&admission);
+	return result;
+}
+
 /* Consume the exact Resource-X subdomain before any reused legacy parser.
  * A candidate length never falls back after a malformed header, stale DATA
  * connection, or unavailable consumer.  Capability publication remains off
@@ -9804,10 +10002,9 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 	if (env->epoch != cluster_epoch_get_current())
 		return true;
 	if ((int32)env->source_node_id == cluster_node_id) {
-		if ((cluster_ic_local_capability_word()
-			 & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) == 0)
+		if (!gcs_block_pcm_x_resource_x_peer_ready_exact(
+				cluster_node_id, &connection_generation))
 			return true;
-		connection_generation = frame.common.sender_connection_generation;
 	} else if (!cluster_sf_peer_capability_word_sample(
 			   (int32)env->source_node_id,
 			   PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
@@ -9825,15 +10022,25 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 	memset(&join_snapshot, 0, sizeof(join_snapshot));
 
 	switch (frame.kind) {
+	case RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP:
+		gcs_block_resource_x_kind9_ingress(
+			env, &frame, authenticated_capability_generation);
+		break;
 	case RESOURCE_X_WIRE_ASSERT_X:
-		adapter_result
-			= cluster_pcm_x_master_resource_x_assertion_ready_exact(
-				&frame.common.logical_assertion,
-				frame.common.assertion_sequence);
-		if (adapter_result != PCM_X_QUEUE_OK)
-			break;
-		result = cluster_pcm_lock_resource_x_assert_exact(
-			&frame, (int32)env->source_node_id, &snapshot);
+		if (frame.common.ordered_lane == 0)
+			result = gcs_block_resource_x_bootstrapped_assert_ingress(
+				env, &frame, authenticated_capability_generation,
+				&snapshot);
+		else {
+			adapter_result
+				= cluster_pcm_x_master_resource_x_assertion_ready_exact(
+					&frame.common.logical_assertion,
+					frame.common.assertion_sequence);
+			if (adapter_result != PCM_X_QUEUE_OK)
+				break;
+			result = cluster_pcm_lock_resource_x_assert_exact(
+				&frame, (int32)env->source_node_id, &snapshot);
+		}
 		if ((result == RESOURCE_X_APPLY_APPLIED
 				|| result == RESOURCE_X_APPLY_DUPLICATE)
 			&& snapshot.phase == RESOURCE_X_MASTER_WAIT_PROOF
