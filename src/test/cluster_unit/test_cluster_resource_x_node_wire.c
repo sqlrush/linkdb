@@ -241,6 +241,8 @@ make_control_frame(ResourceXWireKind kind)
 	return frame;
 }
 
+static ResourceXDecodedFrame make_typed_frame(ResourceXWireKind kind);
+
 UT_TEST(test_control_codec_is_network_order_and_crc_exact)
 {
 	ResourceXDecodedFrame frame = make_control_frame(RESOURCE_X_WIRE_ASSERT_X);
@@ -314,6 +316,83 @@ UT_TEST(test_physical_sender_generation_rebind_preserves_block_semantics)
 		frame.common.authority_generation);
 	UT_ASSERT(!cluster_resource_x_wire_rebind_sender_generation(
 		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, 0, &reject));
+}
+
+UT_TEST(test_shared_s_carrier_block_to_n_round_trip_is_exact)
+{
+	ResourceXDecodedFrame frame
+		= make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 encoded_len = 0;
+
+	frame.common.observed_mode = PCM_STATE_S;
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes),
+		&encoded_len, &reject));
+	UT_ASSERT_EQ(encoded_len, RESOURCE_X_CONTROL_V1_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.common.observed_mode, PCM_STATE_S);
+	UT_ASSERT_EQ(decoded.common.target_mode, PCM_STATE_N);
+	UT_ASSERT_EQ(decoded.common.source_candidate, 1);
+	UT_ASSERT_EQ(decoded.common.retain_pi_if_dirty, 1);
+}
+
+UT_TEST(test_shared_s_carrier_proof_and_image_round_trip_preserve_mode)
+{
+	ResourceXDecodedFrame proof
+		= make_typed_frame(RESOURCE_X_WIRE_BLOCKED_TO_N);
+	ResourceXDecodedFrame image
+		= make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
+	uint16 encoded_len = 0;
+
+	proof.common.observed_mode = PCM_STATE_S;
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_BLOCKED_TO_N, &proof, bytes, sizeof(bytes),
+		&encoded_len, &reject));
+	UT_ASSERT_EQ(encoded_len, RESOURCE_X_PROOF_V1_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_BLOCKED_TO_N, bytes, encoded_len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.common.observed_mode, PCM_STATE_S);
+	UT_ASSERT_EQ(decoded.common.target_mode, PCM_STATE_N);
+	UT_ASSERT(decoded.blocked_has_remote_proof);
+
+	image.common.observed_mode = PCM_STATE_S;
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, &image, bytes, sizeof(bytes),
+		&encoded_len, &reject));
+	UT_ASSERT_EQ(encoded_len, RESOURCE_X_IMAGE_V1_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, encoded_len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.common.observed_mode, PCM_STATE_S);
+	UT_ASSERT_EQ(decoded.common.target_mode, PCM_STATE_X);
+}
+
+UT_TEST(test_block_to_n_source_polarity_truth_table_is_closed)
+{
+	ResourceXDecodedFrame frame
+		= make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 encoded_len = 0;
+
+	frame.common.observed_mode = PCM_STATE_S;
+	frame.common.source_candidate = 1;
+	frame.common.retain_pi_if_dirty = 0;
+	UT_ASSERT(!cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes),
+		&encoded_len, &reject));
+
+	frame.common.source_candidate = 0;
+	frame.common.retain_pi_if_dirty = 1;
+	UT_ASSERT(!cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes),
+		&encoded_len, &reject));
 }
 
 UT_TEST(test_all_control_kind_type_pairs_round_trip)
@@ -717,7 +796,7 @@ UT_TEST(test_resource_x_capability_has_complete_collision_census)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(21);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -728,6 +807,9 @@ main(void)
 	UT_RUN(test_install_settlement_layout_is_exact);
 	UT_RUN(test_control_codec_is_network_order_and_crc_exact);
 	UT_RUN(test_physical_sender_generation_rebind_preserves_block_semantics);
+	UT_RUN(test_shared_s_carrier_block_to_n_round_trip_is_exact);
+	UT_RUN(test_shared_s_carrier_proof_and_image_round_trip_preserve_mode);
+	UT_RUN(test_block_to_n_source_polarity_truth_table_is_closed);
 	UT_RUN(test_all_control_kind_type_pairs_round_trip);
 	UT_RUN(test_control_codec_rejects_pair_identity_crc_and_legacy_length);
 	UT_RUN(test_short_typed_frames_round_trip);

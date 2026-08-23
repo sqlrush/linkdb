@@ -189,6 +189,12 @@ errmsg(const char *fmt pg_attribute_unused(), ...)
 }
 
 int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	abort();
+}
+
+int
 errhint(const char *fmt pg_attribute_unused(), ...)
 {
 	abort();
@@ -1545,6 +1551,102 @@ UT_TEST(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage)
 }
 
 
+/* D10-13: capability publication does not remove the per-peer/runtime gate;
+ * a drifted or unavailable peer must still keep the Resource-X domain dark. */
+UT_TEST(test_resource_x_retry_domain_remains_capability_gated)
+{
+	char *source = read_gcs_block_source();
+	const char *driver;
+	const char *driver_end;
+	const char *driver_gate;
+	const char *submission;
+	const char *granted;
+	const char *granted_gate;
+	const char *target_executor;
+	const char *retry_tick;
+	const char *retry_end;
+	const char *tick_gate;
+	const char *target_work;
+	const char *work_next;
+	const char *master_drive;
+	const char *local_gate;
+	const char *local_drive;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	driver = strstr(source, "\ngcs_block_pcm_x_acquire_writer_impl(");
+	driver_end = driver != NULL ? strstr(driver, "\n}\n") : NULL;
+	driver_gate = driver != NULL
+		? strstr(driver, "gcs_block_pcm_x_resource_x_retry_enabled()")
+		: NULL;
+	submission = driver != NULL
+		? strstr(driver, "gcs_block_pcm_x_note_local_submission(&handle, &token)")
+		: NULL;
+	UT_ASSERT_NOT_NULL(driver);
+	UT_ASSERT_NOT_NULL(driver_end);
+	UT_ASSERT_NOT_NULL(driver_gate);
+	UT_ASSERT_NOT_NULL(submission);
+	if (driver_gate != NULL && submission != NULL && driver_end != NULL)
+		UT_ASSERT(driver_gate < submission && submission < driver_end);
+	granted = driver != NULL
+		? strstr(driver, "else if (progress.member_state == PCM_XL_GRANTED)")
+		: NULL;
+	granted_gate = granted != NULL
+		? strstr(granted, "gcs_block_pcm_x_resource_x_retry_enabled()")
+		: NULL;
+	target_executor = granted != NULL
+		? strstr(granted, "gcs_block_pcm_x_resource_x_terminal_try(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(granted);
+	UT_ASSERT_NOT_NULL(granted_gate);
+	UT_ASSERT_NOT_NULL(target_executor);
+	if (granted_gate != NULL && target_executor != NULL && driver_end != NULL)
+		UT_ASSERT(granted_gate < target_executor && target_executor < driver_end);
+
+	retry_tick = strstr(source, "\ngcs_block_pcm_x_resource_retry_tick(");
+	retry_end = retry_tick != NULL ? strstr(retry_tick, "\n}\n") : NULL;
+	tick_gate = retry_tick != NULL
+		? strstr(retry_tick,
+			"resource_x_enabled = gcs_block_pcm_x_resource_x_retry_enabled()")
+		: NULL;
+	target_work = retry_tick != NULL
+		? strstr(retry_tick, "cluster_pcm_x_local_target_activation_work_next(")
+		: NULL;
+	work_next = retry_tick != NULL
+		? strstr(retry_tick, "cluster_pcm_x_retry_work_next(")
+		: NULL;
+	master_drive = work_next != NULL
+		? strstr(work_next, "if (work.kind == PCM_X_RETRY_WORK_MASTER)")
+		: NULL;
+	local_gate = master_drive != NULL
+		? strstr(master_drive, "if (!resource_x_enabled)")
+		: NULL;
+	local_drive = local_gate != NULL
+		? strstr(local_gate, "if (work.kind != PCM_X_RETRY_WORK_LOCAL")
+		: NULL;
+	UT_ASSERT_NOT_NULL(retry_tick);
+	UT_ASSERT_NOT_NULL(retry_end);
+	UT_ASSERT_NOT_NULL(tick_gate);
+	UT_ASSERT_NOT_NULL(target_work);
+	UT_ASSERT_NOT_NULL(work_next);
+	UT_ASSERT_NOT_NULL(master_drive);
+	UT_ASSERT_NOT_NULL(local_gate);
+	UT_ASSERT_NOT_NULL(local_drive);
+	if (tick_gate != NULL && target_work != NULL && work_next != NULL
+		&& retry_end != NULL)
+		UT_ASSERT(tick_gate < target_work && target_work < work_next
+				  && work_next < retry_end);
+	if (work_next != NULL && master_drive != NULL && local_gate != NULL
+		&& local_drive != NULL && retry_end != NULL)
+		UT_ASSERT(work_next < master_drive && master_drive < local_gate
+				  && local_gate < local_drive && local_drive < retry_end);
+	UT_ASSERT_NULL(strstr(retry_tick,
+		"if (!gcs_block_pcm_x_resource_x_retry_enabled())\n\t\treturn;"));
+	free(source);
+}
+
+
 /* D7-08: the periodic producer may only publish an immutable terminal and
  * wake its exact requester.  The requester validates and raises that record;
  * ERROR cleanup releases the writer claim before completing/detaching the
@@ -2430,6 +2532,50 @@ UT_TEST(test_pcm_x_terminal_retry_reclaims_cancel_cleanup_after_owner_death)
 }
 
 
+UT_TEST(test_pcm_x_terminal_driver_selects_one_frozen_role_not_membership)
+{
+	char *source = read_gcs_block_source();
+	const char *kick;
+	const char *end;
+	const char *select;
+	const char *authenticate;
+	const char *arm;
+	const char *for_kind;
+	const char *for_node;
+	const char *membership_node;
+	const char *capability_node;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	kick = strstr(source, "\ncluster_gcs_pcm_x_terminal_kick(");
+	end = kick != NULL ? strstr(kick, "\n}\n\n\nstatic") : NULL;
+	UT_ASSERT_NOT_NULL(kick);
+	UT_ASSERT_NOT_NULL(end);
+	if (kick != NULL && end != NULL) {
+		select = strstr(kick, "cluster_pcm_x_master_terminal_work_exact(");
+		authenticate = select != NULL
+			? strstr(select, "gcs_block_pcm_x_authenticated_session_result(") : NULL;
+		arm = authenticate != NULL
+			? strstr(authenticate, "cluster_pcm_x_master_terminal_leg_arm_exact(") : NULL;
+		UT_ASSERT_NOT_NULL(select);
+		UT_ASSERT_NOT_NULL(authenticate);
+		UT_ASSERT_NOT_NULL(arm);
+		if (select != NULL && authenticate != NULL && arm != NULL)
+			UT_ASSERT(select < authenticate && authenticate < arm && arm < end);
+		for_kind = strstr(kick, "for (kind =");
+		for_node = strstr(kick, "for (node =");
+		membership_node = strstr(kick, "cluster_membership_is_member(node)");
+		capability_node = strstr(kick, "gcs_block_pcm_x_source_capable(node)");
+		UT_ASSERT(for_kind == NULL || for_kind > end);
+		UT_ASSERT(for_node == NULL || for_node > end);
+		UT_ASSERT(membership_node == NULL || membership_node > end);
+		UT_ASSERT(capability_node == NULL || capability_node > end);
+	}
+	free(source);
+}
+
+
 UT_TEST(test_pcm_x_invalidate_ack_matches_only_exact_unacked_holder)
 {
 	GcsBlockInvalidateAckPayload ack;
@@ -3117,6 +3263,15 @@ UT_TEST(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change)
 		UT_ASSERT_NOT_NULL(strstr(abort, "cluster_bufmgr_pcm_own_abort_x_revoke("));
 	}
 	if (drain != NULL) {
+		const char *pair_prepare = strstr(drain,
+			"cluster_pcm_lock_resource_x_holder_pair_drain_prepare_exact(");
+		const char *pair_release = pair_prepare != NULL
+			? strstr(pair_prepare, "cluster_bufmgr_pcm_own_release_retained_image(")
+			: NULL;
+		const char *pair_commit = pair_release != NULL
+			? strstr(pair_release,
+				"cluster_pcm_lock_resource_x_holder_pair_drain_commit_exact(")
+			: NULL;
 		const char *local_drain
 			= strstr(drain, "cluster_pcm_x_local_drain_poll_certificate_exact(");
 		const char *duplicate_guard
@@ -3141,8 +3296,14 @@ UT_TEST(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change)
 		const char *finish_mode_gate = strstr(drain, "cluster_pcm_x_revoke_finish_mode(");
 		const char *drop_arm = strstr(drain, "CLUSTER_PCM_X_REVOKE_FINISH_DROP");
 		const char *release_retained
-			= strstr(drain, "cluster_bufmgr_pcm_own_release_retained_image(");
+			= finish_mode_gate != NULL
+				  ? strstr(finish_mode_gate,
+						   "cluster_bufmgr_pcm_own_release_retained_image(")
+				  : NULL;
 
+		UT_ASSERT_NOT_NULL(pair_prepare);
+		UT_ASSERT_NOT_NULL(pair_release);
+		UT_ASSERT_NOT_NULL(pair_commit);
 		UT_ASSERT_NOT_NULL(local_drain);
 		UT_ASSERT_NOT_NULL(duplicate_guard);
 		UT_ASSERT_NOT_NULL(drain_status);
@@ -3153,6 +3314,10 @@ UT_TEST(test_pcm_x_ready_materializes_exact_n_s_or_x_source_without_wire_change)
 		UT_ASSERT_NOT_NULL(finish_mode_gate);
 		UT_ASSERT_NOT_NULL(drop_arm);
 		UT_ASSERT_NOT_NULL(release_retained);
+		if (pair_prepare != NULL && pair_release != NULL && pair_commit != NULL
+			&& local_drain != NULL)
+			UT_ASSERT(pair_prepare < pair_release && pair_release < pair_commit
+					  && pair_commit < local_drain);
 		if (local_drain != NULL && duplicate_guard != NULL && drain_status != NULL
 			&& drained_replay != NULL && certificate_policy != NULL && certificate_refusal != NULL
 			&& release_record != NULL && finish_mode_gate != NULL && drop_arm != NULL
@@ -3422,6 +3587,35 @@ UT_TEST(test_pcm_x_lms_owner_death_and_restart_audit_fail_closed)
 }
 
 
+UT_TEST(test_resource_x_scan_more_wakes_the_current_lms_latch)
+{
+	char *lms_source = read_source_path(LMS_SOURCE_PATH);
+	const char *wakeup;
+	const char *wakeup_end;
+	const char *self_branch;
+	const char *set_latch;
+	const char *signal_peer;
+
+	if (lms_source == NULL)
+		return;
+	wakeup = strstr(lms_source, "\ncluster_lms_wakeup(int worker_id)");
+	wakeup_end = wakeup != NULL ? strstr(wakeup + 1, "\n}\n") : NULL;
+	self_branch = wakeup != NULL ? strstr(wakeup, "if (pid == MyProcPid)") : NULL;
+	set_latch = self_branch != NULL ? strstr(self_branch, "SetLatch(MyLatch)") : NULL;
+	signal_peer = wakeup != NULL ? strstr(wakeup, "kill(pid, SIGUSR1)") : NULL;
+	UT_ASSERT_NOT_NULL(wakeup);
+	UT_ASSERT_NOT_NULL(wakeup_end);
+	UT_ASSERT_NOT_NULL(self_branch);
+	UT_ASSERT_NOT_NULL(set_latch);
+	UT_ASSERT_NOT_NULL(signal_peer);
+	if (wakeup_end != NULL && self_branch != NULL && set_latch != NULL
+		&& signal_peer != NULL)
+		UT_ASSERT(self_branch < set_latch && set_latch < signal_peer
+			&& signal_peer < wakeup_end);
+	free(lms_source);
+}
+
+
 UT_TEST(test_pcm_x_lms_reload_acknowledges_finish_flush_injection)
 {
 	char *lms_source = read_source_path(LMS_SOURCE_PATH);
@@ -3496,7 +3690,8 @@ UT_TEST(test_pcm_x_destructive_finish_fault_times_out_in_sql_before_harness)
 	relfilenode
 		= destructive_leg != NULL ? strstr(destructive_leg, "flush_error_relfilenode") : NULL;
 	exact_oracle = destructive_leg != NULL
-					   ? strstr(destructive_leg, "PCM-X finish-error evidence exact")
+					   ? strstr(destructive_leg,
+								"PCM-X Resource-X finish-error evidence exact")
 					   : NULL;
 	global_occupancy
 		= destructive_leg != NULL ? strstr(destructive_leg, "dedup_entry_count") : NULL;
@@ -3685,7 +3880,7 @@ UT_TEST(test_pcm_x_requester_fetch_revalidates_queue_and_reservation_before_inst
 		UT_ASSERT_NOT_NULL(proof_end);
 		if (proof != NULL && proof_end != NULL) {
 			UT_ASSERT_NOT_NULL(strstr(proof, "cluster_pcm_x_image_fetch_reservation_exact("));
-			UT_ASSERT_NOT_NULL(strstr(proof, "live->writer_activation_token == reservation_token"));
+			UT_ASSERT_NOT_NULL(strstr(proof, "live->writer_activation_token == 0"));
 			UT_ASSERT_NOT_NULL(strstr(proof, "live->resource_x_activation_generation == 0"));
 			UT_ASSERT_NOT_NULL(strstr(proof, "base->writer_activation_token == 0"));
 			UT_ASSERT_NOT_NULL(strstr(proof, "base->resource_x_activation_generation == 0"));
@@ -3821,7 +4016,9 @@ UT_TEST(test_pcm_x_self_source_handoff_is_no_copy_and_drain_preserves_x)
 	release_record = strstr(drain, "cluster_gcs_block_dedup_pcm_x_release_exact(");
 	self_return
 		= release_record != NULL ? strstr(release_record, "if (self_source_handoff)") : NULL;
-	release_retained = strstr(drain, "cluster_bufmgr_pcm_own_release_retained_image(");
+	release_retained = verify_x != NULL
+		? strstr(verify_x, "cluster_bufmgr_pcm_own_release_retained_image(")
+		: NULL;
 	UT_ASSERT_NOT_NULL(verify_x);
 	UT_ASSERT_NOT_NULL(release_record);
 	UT_ASSERT_NOT_NULL(self_return);
@@ -5349,6 +5546,46 @@ UT_TEST(test_remote_downgrade_prepares_exact_image_before_notify_and_reply)
 	free(bufmgr_source);
 }
 
+UT_TEST(test_preprepared_image_accepts_exact_zero_lsn_and_rejects_mismatch)
+{
+	char *source = read_gcs_block_source();
+	const char *produce = source != NULL ? strstr(source, "\ngcs_block_produce_reply(") : NULL;
+	const char *produce_end
+		= produce != NULL
+			  ? strstr(produce, "\n}\n\nstatic bool\ngcs_block_queue_pending_x_authoritative(")
+			  : NULL;
+	const char *prepared = produce != NULL ? strstr(produce, "if (!preprepared_image)") : NULL;
+	const char *nonzero_assert
+		= prepared != NULL ? strstr(prepared, "*out_page_lsn != InvalidXLogRecPtr") : NULL;
+	const char *lsn_match
+		= prepared != NULL
+			  ? strstr(prepared, "PageGetLSN((Page)block_buf) != *out_page_lsn")
+			  : NULL;
+	const char *payload_match
+		= prepared != NULL ? strstr(prepared, "*out_block_payload != block_buf") : NULL;
+	const char *fail_closed
+		= payload_match != NULL ? strstr(payload_match, "GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER")
+								: NULL;
+
+	/* A copied PostgreSQL page may legitimately carry pd_lsn == 0.  The
+	 * prepared fast path must preserve that exact sample just like the generic
+	 * ship path.  Its safety proof is payload identity plus byte/LSN equality;
+	 * an inconsistent prepared carrier is an explicit denial, not an LMS
+	 * assertion. */
+	UT_ASSERT_NOT_NULL(produce);
+	UT_ASSERT_NOT_NULL(produce_end);
+	UT_ASSERT_NOT_NULL(prepared);
+	UT_ASSERT(nonzero_assert == NULL || produce_end == NULL || nonzero_assert > produce_end);
+	UT_ASSERT_NOT_NULL(lsn_match);
+	UT_ASSERT_NOT_NULL(payload_match);
+	UT_ASSERT_NOT_NULL(fail_closed);
+	if (produce_end != NULL && prepared != NULL && payload_match != NULL && lsn_match != NULL
+		&& fail_closed != NULL)
+		UT_ASSERT(produce < prepared && prepared < payload_match && payload_match < lsn_match
+				  && lsn_match < fail_closed && fail_closed < produce_end);
+	free(source);
+}
+
 
 UT_TEST(test_pending_x_apply_race_maps_to_retryable_block_denial)
 {
@@ -5794,10 +6031,10 @@ UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
 			"resource_x_episode_deadline_us = gcs_block_pcm_x_saturating_add_us(",
 			"cluster_pcm_lock_resource_x_executor_rearm_exact(",
 			"gcs_block_pcm_x_resource_x_terminal_try(",
-			"gcs_block_pcm_x_resource_x_wait_exact(",
-			"continue;",
-			"claim_out->semantic_generation = progress.semantic_generation",
-			"PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM", "break;" };
+				"gcs_block_pcm_x_resource_x_wait_exact(",
+				"continue;",
+				"claim_out->semantic_generation = progress.semantic_generation",
+				"PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM", "break;" };
 	static const char *const wait_contract[]
 		= { "now_us >= episode_deadline_us",
 			"cluster_pcm_lock_resource_x_executor_wait_exact(ref, 0)",
@@ -5811,7 +6048,7 @@ UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
 	static const char *const formation_contract[]
 		= { "runtime = cluster_pcm_x_runtime_snapshot()",
 			"cluster_pcm_lock_resource_x_gate_bind_formation_exact(runtime.gate_generation)",
-			"gcs_block_pcm_x_resource_retry_tick", "gcs_block_pcm_x_terminal_retry_tick" };
+				"gcs_block_pcm_x_resource_retry_tick", "gcs_block_pcm_x_terminal_retry_tick" };
 	static const char *const target_tick_contract[]
 		= { "cluster_pcm_x_local_target_activation_work_next(",
 			"cluster_pcm_lock_resource_x_executor_rearm_exact(",
@@ -5820,14 +6057,41 @@ UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
 			"gcs_block_pcm_x_wake_requester(",
 			"cluster_pcm_x_retry_work_next(" };
 	char *source = read_gcs_block_source();
+	const char *requester;
+	const char *requester_end;
+	const char *adapter_granted;
+	const char *grant_projection;
+	const char *adapter_success;
 
 	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_x_terminal_try(",
 							   "\nstatic PcmXQueueResult\n"
 							   "gcs_block_pcm_x_acquire_writer_impl(", executor_contract,
 							   lengthof(executor_contract));
 	assert_ordered_in_function(source, "\ngcs_block_pcm_x_acquire_writer_impl(",
-							   "\nPcmXQueueResult\ncluster_gcs_pcm_x_acquire_writer(",
-							   requester_contract, lengthof(requester_contract));
+								   "\nPcmXQueueResult\ncluster_gcs_pcm_x_acquire_writer(",
+								   requester_contract, lengthof(requester_contract));
+	requester = strstr(source, "\ngcs_block_pcm_x_acquire_writer_impl(");
+	requester_end = requester != NULL
+		? strstr(requester,
+			"\nPcmXQueueResult\ncluster_gcs_pcm_x_acquire_writer(") : NULL;
+	adapter_granted = requester != NULL
+		? strstr(requester,
+			"progress.resource_x_authority_domain") : NULL;
+	grant_projection = adapter_granted != NULL
+		? strstr(adapter_granted,
+			"claim_out->grant_base_own_generation = progress.grant_base_own_generation")
+		: NULL;
+	adapter_success = grant_projection != NULL
+		? strstr(grant_projection, "result = PCM_X_QUEUE_OK") : NULL;
+	UT_ASSERT_NOT_NULL(requester_end);
+	UT_ASSERT_NOT_NULL(adapter_granted);
+	UT_ASSERT_NOT_NULL(grant_projection);
+	UT_ASSERT_NOT_NULL(adapter_success);
+	if (requester_end != NULL && adapter_granted != NULL
+		&& grant_projection != NULL && adapter_success != NULL)
+		UT_ASSERT(adapter_granted < grant_projection
+			&& grant_projection < adapter_success
+			&& adapter_success < requester_end);
 	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_x_wait_exact(",
 							   "\n\n/*\n * Drive one ordinary", wait_contract,
 							   lengthof(wait_contract));
@@ -5840,6 +6104,60 @@ UT_TEST(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return)
 	assert_ordered_in_function(source, "\ngcs_block_pcm_x_resource_retry_tick(",
 							   "\n\n#define GCS_BLOCK_PCM_X_TERMINAL_TICK_BUDGET",
 							   target_tick_contract, lengthof(target_tick_contract));
+	free(source);
+}
+
+UT_TEST(test_resource_x_writer_completion_does_not_own_acquisition_retirement)
+{
+	static const char *const completion_contract[] = {
+		"cluster_pcm_x_local_writer_claim_release_collect_exact(",
+		"gcs_block_pcm_x_wake_requester_exact("
+	};
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_pcm_x_writer_claim_release_and_wake_exact(",
+		"\n\n/* Cleanup runs while", completion_contract,
+		lengthof(completion_contract));
+	UT_ASSERT(strstr(source,
+		"cluster_pcm_lock_resource_x_executor_release_capture_exact") == NULL);
+	UT_ASSERT(strstr(source,
+		"cluster_pcm_lock_resource_x_executor_release_exact") == NULL);
+	UT_ASSERT(strstr(source,
+		"gcs_block_pcm_x_resource_x_writer_complete_release_exact") == NULL);
+	free(source);
+}
+
+UT_TEST(test_resource_x_common_x_to_n_finish_does_not_retire_acquisition)
+{
+	static const char *const finish_contract[] = {
+		"PG_TRY();",
+		"cluster_bufmgr_pcm_own_finish_revoke_retain(",
+		"PG_CATCH();",
+		"return (ClusterPcmOwnResult)result"
+	};
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_finish_revoke_retain(",
+		"\n\n/* Retry only the reversible", finish_contract,
+		lengthof(finish_contract));
+	free(source);
+}
+
+UT_TEST(test_resource_x_self_x_to_x_commit_does_not_retire_acquisition)
+{
+	static const char *const commit_contract[] = {
+		"cluster_bufmgr_pcm_own_finish_x_commit(",
+		"committed = true",
+		"*out_committed_generation = committed_generation"
+	};
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_pcm_x_finish_self_image_x(",
+		"\n\n/*\n * Fetch the immutable holder READY record", commit_contract,
+		lengthof(commit_contract));
 	free(source);
 }
 
@@ -5922,6 +6240,8 @@ UT_TEST(test_resource_x_reused_type_ingress_precedes_every_legacy_path)
 			"PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1"));
 		UT_ASSERT_NOT_NULL(strstr(helper, "cluster_sf_peer_capability_word_sample("));
 		UT_ASSERT_NOT_NULL(strstr(helper,
+			"authenticated_capability_generation = connection_generation"));
+		UT_ASSERT_NULL(strstr(helper,
 			"frame.common.sender_connection_generation != connection_generation"));
 		UT_ASSERT_NOT_NULL(strstr(helper,
 			"cluster_pcm_lock_resource_x_assert_exact("));
@@ -5964,6 +6284,7 @@ UT_TEST(test_resource_x_type15_exact_join_is_the_only_new_r9_entry)
 	static const char *const executor_contract[] = {
 		"cluster_pcm_lock_resource_x_requester_join_frames_exact(",
 		"join.requester_target_generation != join.assertion_sequence",
+		"cluster_pcm_x_local_resource_x_attempt_exact(",
 		"ref.acquisition_generation = join.requester_target_generation",
 		"cluster_pcm_lock_resource_x_executor_enter(",
 		"cluster_pcm_lock_resource_x_t1_grant_exact(",
@@ -5974,6 +6295,7 @@ UT_TEST(test_resource_x_type15_exact_join_is_the_only_new_r9_entry)
 		"cluster_pcm_lock_resource_x_executor_leave("
 	};
 	char *source = read_gcs_block_source();
+	const char *executor;
 
 	assert_ordered_in_function(
 		source, "\ngcs_block_try_resource_x_frame(",
@@ -5983,6 +6305,160 @@ UT_TEST(test_resource_x_type15_exact_join_is_the_only_new_r9_entry)
 		source, "\ngcs_block_pcm_x_resource_x_join_terminal_try(",
 		"\nstatic bool\ngcs_block_try_resource_x_frame(", executor_contract,
 		lengthof(executor_contract));
+	executor = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_join_terminal_try(");
+	if (executor != NULL)
+		UT_ASSERT_NULL(strstr(executor,
+			"&ref, join.base_authority_generation"));
+	free(source);
+}
+
+UT_TEST(test_resource_x_direct_n_uses_exact_durable_storage_proof)
+{
+	static const char *const requester_assert_contract[] = {
+		"cluster_pcm_x_local_resource_x_grant_rebase_publish_exact(",
+		"before.pcm_state == (uint8)PCM_STATE_N",
+		"cluster_bufmgr_pcm_own_n_assertion_candidate_exact(",
+		"gcs_block_pcm_x_resource_x_assert_stage_exact("
+	};
+	static const char *const master_proof_contract[] = {
+		"captured->incompatible_holders_bitmap != captured->blocked_holders_bitmap",
+		"cluster_bufmgr_read_storage_image_for_resource_x(",
+		"gcs_block_pcm_x_resource_x_durable_proof_crc(",
+		"cluster_pcm_lock_resource_x_durable_proof_exact("
+	};
+	static const char *const requester_join_contract[] = {
+		"cluster_pcm_lock_resource_x_t1_grant_exact(",
+		"cluster_bufmgr_read_storage_image_for_resource_x(",
+		"gcs_block_pcm_x_resource_x_durable_proof_crc(",
+		"gcs_block_pcm_x_resource_x_prepare_target_x(",
+		"cluster_bufmgr_pcm_own_activate_x_by_tag("
+	};
+	char *source = read_gcs_block_source();
+	const char *prepare;
+	const char *n_branch;
+	const char *copy;
+	const char *rebase;
+	const char *rebase_publish;
+	const char *zero_token_gate;
+
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_prepare_and_assert(",
+		"\n\n/* A READY probe", requester_assert_contract,
+		lengthof(requester_assert_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_master_durable_try(",
+		"\n\n/* Consume the exact Resource-X subdomain", master_proof_contract,
+		lengthof(master_proof_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_join_terminal_try(",
+		"\nstatic bool\ngcs_block_try_resource_x_frame(", requester_join_contract,
+		lengthof(requester_join_contract));
+	prepare = strstr(source, "\ngcs_block_pcm_x_resource_x_prepare_and_assert(");
+	rebase = prepare != NULL
+		? strstr(prepare, "if (before.generation != effective_own_generation)")
+		: NULL;
+	rebase_publish = rebase != NULL
+		? strstr(rebase,
+			"cluster_pcm_x_local_resource_x_grant_rebase_publish_exact(")
+		: NULL;
+	zero_token_gate = rebase != NULL
+		? strstr(rebase, "before.reservation_token != 0") : NULL;
+	UT_ASSERT_NOT_NULL(rebase);
+	UT_ASSERT_NOT_NULL(rebase_publish);
+	/* The token is a monotonic ABA witness and stays nonzero after an idle
+	 * revoke commit.  Eligibility keys on flags==0; the second snapshot below
+	 * still has to preserve the exact historical token. */
+	UT_ASSERT(zero_token_gate == NULL
+			  || (rebase_publish != NULL && zero_token_gate > rebase_publish));
+	n_branch = prepare != NULL
+		? strstr(prepare, "before.pcm_state == (uint8)PCM_STATE_N") : NULL;
+	copy = n_branch != NULL
+		? strstr(n_branch, "cluster_bufmgr_copy_block_for_gcs(") : NULL;
+	UT_ASSERT_NOT_NULL(n_branch);
+	/* The N branch must return through assertion-only staging before the
+	 * S/X current-image copy path can be reached. */
+	if (n_branch != NULL && copy != NULL)
+		UT_ASSERT_NOT_NULL(strstr(n_branch, "return gcs_block_pcm_x_resource_x_assert_stage_exact("));
+	free(source);
+}
+
+UT_TEST(test_resource_x_passive_pi_waits_for_exact_remote_image_before_x)
+{
+	static const char *const assertion_contract[] = {
+		"before.pcm_state == (uint8)PCM_STATE_N",
+		"cluster_bufmgr_pcm_own_n_assertion_candidate_exact(",
+		"gcs_block_pcm_x_resource_x_assert_stage_exact("
+	};
+	static const char *const target_contract[] = {
+		"cluster_bufmgr_pcm_own_begin_x_reservation(",
+		"gcs_block_pcm_x_resource_x_install_target_image_exact(",
+		"cluster_bufmgr_pcm_own_finish_x_commit("
+	};
+	char *source = read_gcs_block_source();
+	const char *join;
+	const char *remote_image;
+	const char *prepare_target;
+
+	/* The passive PI is not a proof source.  It only allows the no-local-proof
+	 * assertion to reach the master.  Once an exact retained remote image is
+	 * joined, install those bytes under GRANT_PENDING before X commit; never
+	 * relabel or read the PI as current authority. */
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_prepare_and_assert(",
+		"\n\n/* A READY probe", assertion_contract,
+		lengthof(assertion_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_prepare_target_x(",
+		"\n/* Consume one complete retained type-15 join", target_contract,
+		lengthof(target_contract));
+	join = strstr(source, "\ngcs_block_pcm_x_resource_x_join_terminal_try(");
+	remote_image = join != NULL
+		? strstr(join, "image_frame.body.image_envelope.page_bytes") : NULL;
+	prepare_target = join != NULL
+		? strstr(join, "gcs_block_pcm_x_resource_x_prepare_target_x(") : NULL;
+	UT_ASSERT_NOT_NULL(remote_image);
+	UT_ASSERT_NOT_NULL(prepare_target);
+	UT_ASSERT(remote_image < prepare_target);
+	free(source);
+}
+
+UT_TEST(test_resource_x_settlement_removes_exact_wfg_before_locator_completion)
+{
+	static const char *const completion_contract[] = {
+		"cluster_pcm_x_master_resource_x_owner_exact(",
+		"cluster_gcs_pcm_x_vertex_from_identity(",
+		"cluster_lmd_graph_remove_edge_by_waiter_exact_result(",
+		"CLUSTER_LMD_GRAPH_REMOVE_STALE",
+		"cluster_pcm_x_master_resource_x_complete_exact("
+	};
+	char *source = read_gcs_block_source();
+	const char *helper;
+	const char *ingress;
+	const char *master_wait;
+
+	/* A SETTLED Resource-X request no longer waits for its predecessor.  Drop
+	 * only its exact wait_seq graph before retiring the compatibility locator;
+	 * ABSENT is an idempotent settlement replay, while STALE protects a newer
+	 * backend wait instance from the old terminal frame. */
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_complete_and_remove_wfg_exact(",
+		"\n\nstatic PcmXQueueResult\ngcs_block_pcm_x_resource_x_master_wait_exact(",
+		completion_contract, lengthof(completion_contract));
+	helper = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_complete_and_remove_wfg_exact(");
+	ingress = strstr(source, "case RESOURCE_X_WIRE_INSTALL_SETTLEMENT:");
+	master_wait = strstr(source,
+		"\nstatic PcmXQueueResult\ngcs_block_pcm_x_resource_x_master_wait_exact(");
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(ingress);
+	UT_ASSERT_NOT_NULL(master_wait);
+	if (ingress != NULL)
+		UT_ASSERT_NOT_NULL(strstr(ingress,
+			"gcs_block_pcm_x_resource_x_complete_and_remove_wfg_exact("));
+	if (master_wait != NULL)
+		UT_ASSERT_NOT_NULL(strstr(master_wait,
+			"gcs_block_pcm_x_resource_x_complete_and_remove_wfg_exact("));
 	free(source);
 }
 
@@ -5990,12 +6466,23 @@ UT_TEST(test_resource_x_type17_x_source_fences_before_retained_release)
 {
 	static const char *const source_contract[] = {
 		"cluster_pcm_lock_resource_x_holder_image_exact(",
+		"cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(",
+		"cluster_pcm_x_local_writer_revoke_fence_acquire_exact(",
 		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+		"current.generation > image.body.image_envelope.source_carrier_generation",
+		"carrier_superseded = true;",
 		"cluster_bufmgr_pcm_own_begin_x_revoke(",
+		"cluster_pcm_x_local_writer_revoke_fence_revalidate_held_exact(",
 		"cluster_bufmgr_copy_block_for_gcs(",
 		"gcs_block_pcm_x_resource_x_build_source_frames(",
 		"cluster_pcm_lock_resource_x_block_to_n_source_exact(",
-		"cluster_bufmgr_pcm_own_finish_revoke_retain("
+		"semantic_retained && carrier_superseded",
+		"result == RESOURCE_X_APPLY_STALE",
+		"cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(",
+		"pair_result == RESOURCE_X_APPLY_APPLIED",
+		"cluster_bufmgr_pcm_own_finish_revoke_retain(",
+		"cluster_pcm_lock_resource_x_holder_pair_publish_exact(",
+		"cluster_pcm_x_local_writer_revoke_fence_release_exact("
 	};
 	char *source = read_gcs_block_source();
 	const char *ingress;
@@ -6017,6 +6504,16 @@ UT_TEST(test_resource_x_type17_x_source_fences_before_retained_release)
 			source, "\ngcs_block_pcm_x_resource_x_source_block_to_n(",
 			"\n\n/* Consume the exact Resource-X subdomain", source_contract,
 			lengthof(source_contract));
+	if (helper != NULL)
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"status_result != RESOURCE_X_APPLY_NOT_FOUND\n"
+			"\t\t&& status_result != RESOURCE_X_APPLY_STALE"));
+	if (helper != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"PCM-X Resource-X finish-error evidence exact"));
+		UT_ASSERT_NOT_NULL(strstr(helper, "CopyErrorData();"));
+		UT_ASSERT_NOT_NULL(strstr(helper, "pair_retained"));
+	}
 	ingress = strstr(source, "\ngcs_block_try_resource_x_frame(");
 	source_call = ingress != NULL
 		? strstr(ingress, "gcs_block_pcm_x_resource_x_source_block_to_n(")
@@ -6047,11 +6544,516 @@ UT_TEST(test_resource_x_type17_x_source_fences_before_retained_release)
 	free(source);
 }
 
+UT_TEST(test_resource_x_type17_selected_s_source_reuses_fenced_pair_core)
+{
+	static const char *const source_contract[] = {
+		"source_mode = block->common.observed_mode",
+		"cluster_pcm_x_local_writer_revoke_fence_acquire_exact(",
+		"cluster_bufmgr_pcm_own_prepare_s_source_image(",
+		"cluster_pcm_x_local_writer_revoke_fence_revalidate_held_exact(",
+		"gcs_block_pcm_x_resource_x_build_source_frames(",
+		"cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(",
+		"cluster_bufmgr_pcm_own_finish_revoke_retain(",
+		"cluster_pcm_lock_resource_x_holder_pair_publish_exact(",
+		"cluster_pcm_x_local_writer_revoke_fence_release_exact("
+	};
+	char *source = read_gcs_block_source();
+	const char *abort;
+	const char *builder;
+	const char *ingress;
+	const char *source_dispatch;
+	const char *status_dispatch;
+
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_source_block_to_n(",
+		"\n\n/* Install the exact retained remote carrier", source_contract,
+		lengthof(source_contract));
+	builder = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_build_source_frames(");
+	UT_ASSERT_NOT_NULL(builder);
+	if (builder != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(builder,
+			"revoking->pcm_state != source_mode"));
+		UT_ASSERT_NOT_NULL(strstr(builder,
+			"image->common.observed_mode = source_mode"));
+		UT_ASSERT_NOT_NULL(strstr(builder,
+			"image_body->source_fence[28] = source_mode"));
+	}
+	abort = strstr(source, "\ngcs_block_pcm_x_resource_x_abort_pre_arm(");
+	UT_ASSERT_NOT_NULL(abort);
+	if (abort != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(abort,
+			"cluster_bufmgr_pcm_own_abort_s_revoke("));
+		UT_ASSERT_NOT_NULL(strstr(abort,
+			"cluster_bufmgr_pcm_own_abort_x_revoke("));
+	}
+	ingress = strstr(source, "\ngcs_block_try_resource_x_frame(");
+	source_dispatch = ingress != NULL
+		? strstr(ingress,
+			"gcs_block_pcm_x_resource_x_source_block_to_n(") : NULL;
+	status_dispatch = ingress != NULL
+		? strstr(ingress,
+			"gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(") : NULL;
+	UT_ASSERT_NOT_NULL(source_dispatch);
+	UT_ASSERT_NOT_NULL(status_dispatch);
+	if (source_dispatch != NULL && status_dispatch != NULL)
+		UT_ASSERT(source_dispatch < status_dispatch);
+	free(source);
+}
+
+UT_TEST(test_resource_x_type17_remote_s_holder_uses_exact_buffer_evidence)
+{
+	static const char *const holder_contract[] = {
+		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+		"cluster_bufmgr_pcm_own_s_holder_candidate_exact(",
+		"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
+		"cluster_bufmgr_pcm_own_begin_s_revoke(",
+		"LWLockRelease(content_lock)",
+		"cluster_lms_outbound_stage_resource_x_remote_s_status_exact(",
+		"cluster_sf_peer_capability_generation_matches(",
+		"LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)",
+		"cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(",
+		"LWLockRelease(content_lock)",
+		"cluster_lms_outbound_publish_resource_x_remote_s_status_exact("
+	};
+	char *source = read_gcs_block_source();
+	const char *helper;
+	const char *helper_end;
+	const char *forbidden;
+	const char *ingress;
+	const char *remote_call;
+	const char *master_entry_call;
+
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(",
+		"\n\n/* Consume the exact Resource-X subdomain", holder_contract,
+		lengthof(holder_contract));
+	helper = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(");
+	helper_end = helper != NULL
+		? strstr(helper, "\n\n/* Consume the exact Resource-X subdomain")
+		: NULL;
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(helper_end);
+	if (helper != NULL && helper_end != NULL) {
+		forbidden = strstr(helper, "pcm_get_or_create_entry(");
+		UT_ASSERT(forbidden == NULL || forbidden >= helper_end);
+		forbidden = strstr(helper,
+			"cluster_pcm_lock_resource_x_block_to_n_exact(");
+		UT_ASSERT(forbidden == NULL || forbidden >= helper_end);
+		forbidden = strstr(helper,
+			"cluster_lms_outbound_enqueue_resource_x_remote_s_status_exact(");
+		UT_ASSERT(forbidden == NULL || forbidden >= helper_end);
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"cluster_lms_outbound_cancel_resource_x_remote_s_status_exact("));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"cluster_bufmgr_pcm_own_abort_s_revoke("));
+	}
+	ingress = strstr(source, "\ngcs_block_try_resource_x_frame(");
+	remote_call = ingress != NULL
+		? strstr(ingress,
+			"gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(")
+		: NULL;
+	master_entry_call = remote_call != NULL
+		? strstr(remote_call,
+			"cluster_pcm_lock_resource_x_block_to_n_exact(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(remote_call);
+	UT_ASSERT_NOT_NULL(master_entry_call);
+	if (remote_call != NULL && master_entry_call != NULL)
+		UT_ASSERT(remote_call < master_entry_call);
+	free(source);
+}
+
+UT_TEST(test_resource_x_preassert_late_bind_race_refreshes_exactly)
+{
+	PcmXLocalProgress before;
+	PcmXLocalProgress after;
+	PcmXLocalProgress changed;
+	char *source = read_gcs_block_source();
+	const char *caller;
+	const char *refresh;
+	const char *classify;
+	const char *retry;
+
+	memset(&before, 0, sizeof(before));
+	before.identity.node_id = 3;
+	before.identity.procno = 7;
+	before.identity.xid = 101;
+	before.identity.cluster_epoch = 11;
+	before.identity.request_id = 19;
+	before.identity.wait_seq = 23;
+	before.identity.base_own_generation = 5;
+	before.ref.identity = before.identity;
+	before.ref.handle.ticket_id = 29;
+	before.ref.handle.queue_generation = 31;
+	before.member_state = PCM_XL_REMOTE_WAIT;
+	before.role = PCM_X_LOCAL_ROLE_NODE_LEADER;
+	before.last_response_opcode = PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK;
+	before.master_session_incarnation = 37;
+	before.master_node = 0;
+	before.resource_x_admission_sequence = 7;
+	before.resource_x_base_authority_generation = 13;
+	before.resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_RESOURCE_X;
+
+	after = before;
+	after.resource_x_base_authority_generation = 15;
+	after.resource_x_reserved = PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY
+		| PCM_X_LOCAL_RESOURCE_X_F_LATE_BOUND;
+	UT_ASSERT(cluster_gcs_pcm_x_resource_x_preassert_late_bind_refresh_exact(
+		&before, &after));
+
+	changed = after;
+	changed.resource_x_base_authority_generation
+		= before.resource_x_base_authority_generation;
+	UT_ASSERT(!cluster_gcs_pcm_x_resource_x_preassert_late_bind_refresh_exact(
+		&before, &changed));
+	changed = after;
+	changed.resource_x_reserved |= PCM_X_LOCAL_RESOURCE_X_F_ASSERT_STARTED;
+	UT_ASSERT(!cluster_gcs_pcm_x_resource_x_preassert_late_bind_refresh_exact(
+		&before, &changed));
+	changed = after;
+	changed.resource_x_admission_sequence++;
+	UT_ASSERT(!cluster_gcs_pcm_x_resource_x_preassert_late_bind_refresh_exact(
+		&before, &changed));
+	changed = after;
+	changed.identity.request_id++;
+	UT_ASSERT(!cluster_gcs_pcm_x_resource_x_preassert_late_bind_refresh_exact(
+		&before, &changed));
+	changed = after;
+	changed.last_response_opcode = PGRAC_IC_MSG_PCM_X_ADMIT_ACK;
+	UT_ASSERT(!cluster_gcs_pcm_x_resource_x_preassert_late_bind_refresh_exact(
+		&before, &changed));
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	caller = strstr(source,
+		"result = gcs_block_pcm_x_resource_x_prepare_and_assert(");
+	refresh = caller != NULL
+		? strstr(caller, "cluster_pcm_x_local_progress_exact(&handle, &refreshed_progress)")
+		: NULL;
+	classify = refresh != NULL
+		? strstr(refresh,
+			"cluster_gcs_pcm_x_resource_x_preassert_late_bind_refresh_exact(")
+		: NULL;
+	retry = classify != NULL ? strstr(classify, "continue;") : NULL;
+	UT_ASSERT_NOT_NULL(caller);
+	UT_ASSERT_NOT_NULL(refresh);
+	UT_ASSERT_NOT_NULL(classify);
+	UT_ASSERT_NOT_NULL(retry);
+	free(source);
+}
+
+UT_TEST(test_pcm_x_local_s_barrier_covers_active_and_exact_late_bind_head)
+{
+	static const char *const barrier_contract[] = {
+		"cluster_pcm_x_master_drive_snapshot_exact(",
+		"goto barrier_active",
+		"cluster_pcm_x_master_resource_x_head_admission_work_exact(",
+		"goto barrier_active",
+		"barrier_active:",
+		"starvation_denied_pending_x_count"
+	};
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_block_pcm_x_local_s_barrier_active(",
+		"\n\nstatic bool\ngcs_block_resource_x_payload_candidate(",
+		barrier_contract, lengthof(barrier_contract));
+	free(source);
+}
+
+UT_TEST(test_resource_x_s_barrier_closes_remote_registration_race)
+{
+	static const char *const ingress_contract[] = {
+		"resource_x_s_barrier_before =",
+		"cluster_gcs_block_pcm_x_local_s_barrier_active(req->tag)",
+		"cluster_gcs_block_dedup_lookup_or_register(",
+		"resource_x_s_barrier_before",
+		"cluster_gcs_block_pcm_x_local_s_barrier_active(req->tag)",
+		"cluster_gcs_block_dedup_pending_x_deny_exact("
+	};
+	static const char *const selected_driver_contract[] = {
+		"cluster_pcm_x_master_resource_x_owner_exact(",
+		"gcs_block_pcm_x_resource_x_deny_legacy_readers(",
+		"gcs_block_pcm_x_resource_x_master_wait_exact("
+	};
+	static const char *const resource_x_scan_contract[] = {
+		"cluster_pcm_x_master_resource_x_owner_exact(",
+		"gcs_block_pcm_x_deny_s_dedup_rights("
+	};
+	char *source = read_gcs_block_source();
+	const char *resource_x_scan;
+	const char *resource_x_scan_end;
+
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_handle_block_request_envelope(",
+		"\ncluster_gcs_handle_block_reply_envelope(",
+		ingress_contract, lengthof(ingress_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_master_drive_tag(",
+		"\n\n/*\n * First convert-queue DATA slice",
+		selected_driver_contract, lengthof(selected_driver_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_deny_legacy_readers(",
+		"\n\nstatic PcmXQueueResult\ngcs_block_pcm_x_stage_queue_invalidations(",
+		resource_x_scan_contract, lengthof(resource_x_scan_contract));
+	resource_x_scan = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_deny_legacy_readers(");
+	resource_x_scan_end = resource_x_scan != NULL
+		? strstr(resource_x_scan,
+			"\n\nstatic PcmXQueueResult\ngcs_block_pcm_x_stage_queue_invalidations(")
+		: NULL;
+	UT_ASSERT_NOT_NULL(resource_x_scan);
+	UT_ASSERT_NOT_NULL(resource_x_scan_end);
+	if (resource_x_scan != NULL && resource_x_scan_end != NULL) {
+		const char *legacy_cookie = strstr(resource_x_scan,
+			"cluster_pcm_lock_queue_pending_x_exact(");
+
+		UT_ASSERT(legacy_cookie == NULL || legacy_cookie >= resource_x_scan_end);
+	}
+	free(source);
+}
+
+UT_TEST(test_resource_x_ticket_adapter_exposes_sequence_and_selects_one_revoke_owner)
+{
+	static const char *const assertion_ingress_contract[] = {
+		"cluster_pcm_x_master_resource_x_assertion_ready_exact(",
+		"cluster_pcm_lock_resource_x_assert_exact("
+	};
+	static const char *const admit_contract[] = {
+		"gcs_block_pcm_x_resource_x_peer_ready_exact(",
+		"cluster_pcm_x_master_resource_x_owner_bind_exact(",
+		"gcs_block_pcm_x_resource_x_admission_base_exact(",
+		"PCM_X_ADMIT_F_RESOURCE_X_ADAPTER",
+		"ack.ref.grant_generation = admission.admission_sequence"
+	};
+	static const char *const admission_base_contract[] = {
+		"cluster_pcm_lock_authority_snapshot(",
+		"cluster_pcm_lock_resource_x_adapter_base_bind_exact(",
+		"PCM_X_ADMIT_F_QUEUE_HEAD",
+		"cluster_pcm_lock_resource_x_adapter_head_rebind_exact(",
+		"cluster_pcm_lock_resource_x_adapter_successor_base_exact(",
+		"cluster_pcm_x_master_resource_x_owner_exact(",
+		"cluster_pcm_lock_authority_matches("
+	};
+	static const char *const requester_contract[] = {
+		"cluster_pcm_x_local_apply_admit_ack_resource_x_exact("
+	};
+	static const char *const assertion_contract[] = {
+		"cluster_pcm_x_local_resource_x_admission_exact(",
+		"gcs_block_pcm_x_resource_x_assert_stage_exact("
+	};
+	static const char *const assertion_stage_contract[] = {
+		"cluster_grd_outbound_enqueue_backend_msg(",
+		"cluster_grd_outbound_enqueue_backend_msg("
+	};
+	static const char *const master_contract[] = {
+		"cluster_pcm_x_master_resource_x_owner_exact(",
+		"gcs_block_pcm_x_resource_x_master_wait_exact("
+	};
+	static const char *const resource_x_drive_contract[] = {
+		"cluster_pcm_x_master_resource_x_owner_exact(",
+		"gcs_block_pcm_x_resource_x_master_wait_exact("
+	};
+	static const char *const head_refresh_contract[] = {
+		"cluster_pcm_x_master_resource_x_head_admission_exact(",
+		"gcs_block_pcm_x_resource_x_peer_ready_exact(",
+		"cluster_pcm_x_runtime_snapshot(",
+		"cluster_pcm_lock_authority_snapshot(",
+		"cluster_pcm_lock_resource_x_adapter_head_rebind_exact(",
+		"bind_result != RESOURCE_X_APPLY_APPLIED",
+		"bind_result != RESOURCE_X_APPLY_DUPLICATE",
+		"cluster_pcm_x_master_resource_x_head_admission_exact(",
+		"cluster_pcm_x_runtime_snapshot(",
+		"cluster_pcm_lock_authority_snapshot(",
+		"gcs_block_pcm_x_resource_x_peer_ready_exact(",
+		"gcs_block_pcm_x_stage_frame_cap_bound("
+	};
+	static const char *const historical_terminal_refresh_contract[] = {
+		"resource_x_assertion_equal(&snapshot.assertion, &assertion)",
+		"snapshot.assertion_sequence != admission_sequence",
+		"snapshot.phase == RESOURCE_X_MASTER_SETTLED",
+		"snapshot.phase == RESOURCE_X_MASTER_RELEASED",
+		"gcs_block_pcm_x_resource_x_head_ack_refresh_exact("
+	};
+	static const char *const queued_successor_post_assert_contract[] = {
+		"case RESOURCE_X_MASTER_QUEUED:",
+		"return PCM_X_QUEUE_OK;"
+	};
+	static const char *const requester_terminal_contract[] = {
+		"cluster_pcm_lock_resource_x_t1_grant_exact(",
+		"gcs_block_pcm_x_resource_x_prepare_target_x(",
+		"cluster_bufmgr_pcm_own_activate_x_by_tag(",
+		"cluster_pcm_lock_resource_x_requester_activate_exact(",
+		"cluster_pcm_x_local_resource_x_grant_publish_exact("
+	};
+	static const char *const master_terminal_contract[] = {
+		"cluster_pcm_lock_resource_x_install_settlement_exact(",
+		"gcs_block_pcm_x_resource_x_complete_and_remove_wfg_exact(",
+		"cluster_pcm_lock_resource_x_settled_retire_exact("
+	};
+	static const char *const ingress_freshness_contract[] = {
+		"cluster_resource_x_wire_decode(",
+		"env->epoch != cluster_epoch_get_current()",
+		"cluster_sf_peer_capability_word_sample(",
+		"authenticated_capability_generation = connection_generation"
+	};
+	char *source = read_gcs_block_source();
+	const char *prepare;
+	const char *assert_begin;
+	const char *assert_stage;
+	const char *head_refresh;
+	const char *resource_x_drive;
+	const char *resource_x_selected;
+	const char *resource_x_fallback;
+
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_handle_pcm_x_enqueue_envelope(",
+		"\n\n/*\n * Apply the exact ADMIT_ACK", admit_contract,
+		lengthof(admit_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_admission_base_exact(",
+		"\n\n/*\n * First convert-queue DATA slice", admission_base_contract,
+		lengthof(admission_base_contract));
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_handle_pcm_x_admit_ack_envelope(",
+		"\n\n/* Publish the exact queued-leader", requester_contract,
+		lengthof(requester_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_prepare_and_assert(",
+		"\n\n/* A READY probe", assertion_contract,
+		lengthof(assertion_contract));
+	prepare = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_prepare_and_assert(");
+	assert_begin = prepare != NULL ? strstr(prepare,
+		"cluster_pcm_x_local_resource_x_assert_begin_exact(") : NULL;
+	assert_stage = prepare != NULL ? strstr(prepare,
+		"gcs_block_pcm_x_resource_x_assert_stage_exact(") : NULL;
+	UT_ASSERT_NOT_NULL(assert_begin);
+	UT_ASSERT_NOT_NULL(assert_stage);
+	if (assert_begin != NULL && assert_stage != NULL)
+		UT_ASSERT(assert_begin < assert_stage);
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_assert_stage_exact(",
+		"\n\n/* Capture the requester-local", assertion_stage_contract,
+		lengthof(assertion_stage_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_master_begin_transfer(",
+		"\n\nstatic PcmXQueueResult\ngcs_block_pcm_x_master_drive_probe(",
+		master_contract, lengthof(master_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_master_drive_tag(",
+		"\n\n/*\n * First convert-queue DATA slice", resource_x_drive_contract,
+		lengthof(resource_x_drive_contract));
+	resource_x_drive = strstr(source,
+		"\ngcs_block_pcm_x_master_drive_tag(");
+	resource_x_selected = resource_x_drive != NULL
+		? strstr(resource_x_drive,
+			"result = cluster_pcm_x_master_resource_x_owner_exact(")
+		: NULL;
+	resource_x_fallback = resource_x_selected != NULL
+		? strstr(resource_x_selected,
+			"} else if (result == PCM_X_QUEUE_NOT_FOUND) {")
+		: NULL;
+	UT_ASSERT_NOT_NULL(resource_x_selected);
+	UT_ASSERT_NOT_NULL(resource_x_fallback);
+	if (resource_x_selected != NULL && resource_x_fallback != NULL) {
+		const char *legacy_claim = strstr(resource_x_selected,
+			"gcs_block_pcm_x_ensure_pending_x_claim(");
+		const char *legacy_deny = strstr(resource_x_selected,
+			"gcs_block_pcm_x_deny_legacy_readers(");
+		const char *legacy_transfer = strstr(resource_x_selected,
+			"gcs_block_pcm_x_master_begin_transfer(");
+		const char *wait = strstr(resource_x_selected,
+			"gcs_block_pcm_x_resource_x_master_wait_exact(");
+
+		UT_ASSERT_NOT_NULL(wait);
+		UT_ASSERT(wait == NULL || wait < resource_x_fallback);
+		UT_ASSERT(legacy_claim == NULL || legacy_claim >= resource_x_fallback);
+		UT_ASSERT(legacy_deny == NULL || legacy_deny >= resource_x_fallback);
+		UT_ASSERT(legacy_transfer == NULL || legacy_transfer >= resource_x_fallback);
+	}
+	head_refresh = strstr(source,
+		"\ngcs_block_pcm_x_resource_x_head_ack_refresh_exact(");
+	UT_ASSERT_NOT_NULL(head_refresh);
+	if (head_refresh != NULL)
+		assert_ordered_in_function(
+			source, "\ngcs_block_pcm_x_resource_x_head_ack_refresh_exact(",
+			"\n\nstatic PcmXQueueResult\ngcs_block_pcm_x_resource_x_master_wait_exact(",
+			head_refresh_contract, lengthof(head_refresh_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_master_wait_exact(",
+		"\n\nstatic PcmXQueueResult\ngcs_block_pcm_x_master_begin_transfer(",
+		historical_terminal_refresh_contract,
+		lengthof(historical_terminal_refresh_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_master_wait_exact(",
+		"\n\nstatic PcmXQueueResult\ngcs_block_pcm_x_master_begin_transfer(",
+		queued_successor_post_assert_contract,
+		lengthof(queued_successor_post_assert_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_join_terminal_try(",
+		"\nstatic bool\ngcs_block_try_resource_x_frame(",
+		requester_terminal_contract, lengthof(requester_terminal_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_try_resource_x_frame(",
+		"\n/*\n * cluster_gcs_handle_block_request_envelope",
+		master_terminal_contract, lengthof(master_terminal_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_try_resource_x_frame(",
+		"\n/*\n * cluster_gcs_handle_block_request_envelope",
+		ingress_freshness_contract, lengthof(ingress_freshness_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_try_resource_x_frame(",
+		"\n/*\n * cluster_gcs_handle_block_request_envelope",
+		assertion_ingress_contract, lengthof(assertion_ingress_contract));
+	UT_ASSERT_NULL(strstr(source,
+		"frame.common.sender_connection_generation != connection_generation"));
+	UT_ASSERT_NULL(strstr(source,
+		"env->epoch != frame.common.resource_formation"));
+	free(source);
+}
+
+UT_TEST(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact)
+{
+	static const char *const accept_contract[] = {
+		"forward->base.epoch != env->epoch",
+		"forward->base.epoch != cluster_epoch_get_current()",
+		"forward->base.epoch == 0 && cluster_conf_node_count() != 4",
+		"cluster_sf_peer_capability_family_sample(",
+		"capability_generation == 0",
+		"cluster_semantic_activation_enter_r4_terminal_census(",
+		"forward->base.epoch == 0 && admission.record_generation != 0",
+		"cluster_semantic_activation_recheck_r4_terminal_census("
+	};
+	static const char *const send_contract[] = {
+		"cluster_epoch_get_current()",
+		"context->forward.base.epoch",
+		"cluster_sf_peer_capability_family_sample(",
+		"capability_generation",
+		"context->requester_capability_generation",
+		"cluster_semantic_activation_recheck_r4_terminal_census("
+	};
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		source, "\ngcs_block_r4_tx_origin_try_accept(",
+		"\nstatic bool\ngcs_block_r4_tx_origin_terminal_resolution_valid(",
+		accept_contract, lengthof(accept_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_r4_tx_origin_step(",
+		"\nvoid\ncluster_gcs_block_r4_tx_resolve_drain(",
+		send_contract, lengthof(send_contract));
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(111);
+	UT_PLAN(128);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -6092,6 +7094,7 @@ main(void)
 	UT_RUN(test_pcm_x_formation_identical_complete_samples_may_revalidate);
 	UT_RUN(test_pcm_x_formation_transient_or_inconsistent_sample_is_tick_noop);
 	UT_RUN(test_pcm_x_periodic_retry_reports_pre_mutation_exit_stage);
+	UT_RUN(test_resource_x_retry_domain_remains_capability_gated);
 	UT_RUN(test_pcm_x_resource_terminal_result_replays_through_requester_cleanup);
 	UT_RUN(test_pcm_x_install_ready_v2_self_loopback_is_admissible);
 	UT_RUN(test_pcm_x_formation_samples_capability_family_atomically);
@@ -6112,6 +7115,7 @@ main(void)
 	UT_RUN(test_pcm_x_master_drive_wiring_binds_grd_barrier_to_exact_ticket);
 	UT_RUN(test_pcm_x_cancel_cleanup_classifies_exact_wfg_and_post_clear_failure);
 	UT_RUN(test_pcm_x_terminal_retry_reclaims_cancel_cleanup_after_owner_death);
+	UT_RUN(test_pcm_x_terminal_driver_selects_one_frozen_role_not_membership);
 	UT_RUN(test_pcm_x_invalidate_ack_matches_only_exact_unacked_holder);
 	UT_RUN(test_pcm_x_invalidate_busy_routes_to_exact_ticket_backoff);
 	UT_RUN(test_pcm_x_direct_invalidate_refusal_diagnosis_is_deterministic);
@@ -6128,6 +7132,7 @@ main(void)
 	UT_RUN(test_pcm_x_self_and_remote_drain_share_full_image_release_wrapper);
 	UT_RUN(test_pcm_x_ready_admission_marks_before_send_and_rolls_back_refusal);
 	UT_RUN(test_pcm_x_lms_owner_death_and_restart_audit_fail_closed);
+	UT_RUN(test_resource_x_scan_more_wakes_the_current_lms_latch);
 	UT_RUN(test_pcm_x_lms_reload_acknowledges_finish_flush_injection);
 	UT_RUN(test_pcm_x_destructive_finish_fault_times_out_in_sql_before_harness);
 	UT_RUN(test_pcm_x_image_fetch_intercepts_canonical_id_before_generic_dedup);
@@ -6150,6 +7155,7 @@ main(void)
 	UT_RUN(test_local_master_read_image_stops_retrying_displaced_holder_exactly);
 	UT_RUN(test_local_master_read_image_refusal_evidence_is_attempt_exact);
 	UT_RUN(test_remote_downgrade_prepares_exact_image_before_notify_and_reply);
+	UT_RUN(test_preprepared_image_accepts_exact_zero_lsn_and_rejects_mismatch);
 	UT_RUN(test_local_master_x_transfer_revalidates_exact_authority_and_retries_stale);
 	UT_RUN(test_pending_x_apply_race_maps_to_retryable_block_denial);
 	UT_RUN(test_gcs_apply_state_drift_restarts_with_fresh_request_identity);
@@ -6159,10 +7165,23 @@ main(void)
 	UT_RUN(test_pi_durable_note_receive_is_observable_before_apply);
 	UT_RUN(test_pcm_x_source_floor_v2_is_connection_bound_until_lms_drain);
 	UT_RUN(test_resource_x_target_executor_orders_t1_t2_t3_before_writable_return);
+	UT_RUN(test_resource_x_writer_completion_does_not_own_acquisition_retirement);
+	UT_RUN(test_resource_x_common_x_to_n_finish_does_not_retire_acquisition);
+	UT_RUN(test_resource_x_self_x_to_x_commit_does_not_retire_acquisition);
 	UT_RUN(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake);
 	UT_RUN(test_resource_x_reused_type_ingress_precedes_every_legacy_path);
 	UT_RUN(test_resource_x_type15_exact_join_is_the_only_new_r9_entry);
+	UT_RUN(test_resource_x_direct_n_uses_exact_durable_storage_proof);
+	UT_RUN(test_resource_x_passive_pi_waits_for_exact_remote_image_before_x);
+	UT_RUN(test_resource_x_settlement_removes_exact_wfg_before_locator_completion);
 	UT_RUN(test_resource_x_type17_x_source_fences_before_retained_release);
+	UT_RUN(test_resource_x_type17_selected_s_source_reuses_fenced_pair_core);
+	UT_RUN(test_resource_x_type17_remote_s_holder_uses_exact_buffer_evidence);
+	UT_RUN(test_resource_x_preassert_late_bind_race_refreshes_exactly);
+	UT_RUN(test_pcm_x_local_s_barrier_covers_active_and_exact_late_bind_head);
+	UT_RUN(test_resource_x_s_barrier_closes_remote_registration_race);
+	UT_RUN(test_resource_x_ticket_adapter_exposes_sequence_and_selects_one_revoke_owner);
+	UT_RUN(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

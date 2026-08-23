@@ -45,6 +45,7 @@
 #define PCM_X_MASTER_TICKET_ID_MAX UINT64CONST(0x7fffffffffffffff)
 
 struct ClusterSemanticActivationCallbackBundle;
+struct ResourceXMasterSnapshot;
 
 /* Image ids are opaque on the wire.  Reserve high bits 110 for PCM-X so an
  * image pull carried by the legacy block request/reply transport cannot
@@ -179,6 +180,18 @@ typedef struct PcmXAdmitAckPayload {
 	uint16 flags;
 } PcmXAdmitAckPayload;
 
+/* Resource-X adapter extension.  The V1 prefix remains byte-exact for legacy
+ * queue admission; only a capability-bound adapter ACK may carry the current
+ * tag-master authority generation in the suffix. */
+typedef struct PcmXAdmitAckPayloadV2 {
+	PcmXTicketRef ref;
+	PcmXPrehandleKey prehandle;
+	uint32 result;
+	uint16 phase;
+	uint16 flags;
+	uint64 resource_x_base_authority_generation;
+} PcmXAdmitAckPayloadV2;
+
 /*
  * Generic 96-byte phase payload.  For type 48, bytes [88,96) are one
  * lossless blocker-set generation encoded across reason/phase/flags:
@@ -268,6 +281,10 @@ typedef struct PcmXDrainPollPayload {
 StaticAssertDecl(sizeof(PcmXEnqueuePayload) == 80, "PCM-X ENQUEUE ABI");
 StaticAssertDecl(sizeof(PcmXPrehandleCancelPayload) == 80, "PCM-X pre-handle CANCEL ABI");
 StaticAssertDecl(sizeof(PcmXAdmitAckPayload) == 112, "PCM-X ADMIT_ACK ABI");
+StaticAssertDecl(sizeof(PcmXAdmitAckPayloadV2) == 120, "PCM-X ADMIT_ACK V2 ABI");
+StaticAssertDecl(offsetof(PcmXAdmitAckPayloadV2, resource_x_base_authority_generation)
+					 == sizeof(PcmXAdmitAckPayload),
+				 "PCM-X ADMIT_ACK V2 preserves the complete V1 prefix");
 StaticAssertDecl(sizeof(PcmXPhasePayload) == 96, "PCM-X phase ABI");
 StaticAssertDecl(sizeof(PcmXRevokePayload) == 96, "PCM-X revoke ABI");
 StaticAssertDecl(sizeof(PcmXRevokePayloadV2) == 104, "PCM-X revoke V2 ABI");
@@ -411,7 +428,10 @@ typedef enum PcmXLocalMembershipState {
 	/* Holder-only states; values are local shmem lifecycle, never wire ABI. */
 	PCM_XL_HOLDER_ACQUIRING = 12,
 	PCM_XL_HOLDER_ACTIVE = PCM_XL_CONTENT_ACTIVE,
-	PCM_XL_HOLDER_RELEASING = 13
+	PCM_XL_HOLDER_RELEASING = 13,
+	/* Content lock is released for one exact same-page terminal census,
+	 * while the existing holder remains revoke/probe occupancy. */
+	PCM_XL_HOLDER_RECYCLING = 14
 } PcmXLocalMembershipState;
 
 typedef enum PcmXBlockerState {
@@ -521,11 +541,39 @@ typedef struct PcmXTerminalLegToken {
 	uint16 reserved;
 } PcmXTerminalLegToken;
 
+/* Frozen, episode-derived cleanup roles.  In the temporary Resource-X
+ * coexistence slot, acked_s_holders_bitmap is interpreted only here as the
+ * drain-only carrier subset; it never grants resource authority. */
+typedef struct PcmXTerminalRoleMasks {
+	uint32 participants;
+	uint32 drain_required;
+	uint32 retire_required;
+	uint32 drained;
+	uint32 retired;
+} PcmXTerminalRoleMasks;
+
+/* One exact unresolved terminal leg selected under the master tag lock.
+ * Node order is deterministic scheduling only and never participant
+ * discovery.  This structure is process-local and does not change wire ABI. */
+typedef struct PcmXTerminalWork {
+	PcmXTicketRef ref;
+	uint64 master_session_incarnation;
+	uint64 state_sequence;
+	int32 responder_node;
+	uint16 kind;
+	uint16 reserved;
+} PcmXTerminalWork;
+
 StaticAssertDecl(sizeof(PcmXTerminalLegToken) == 32, "PCM-X terminal leg token ABI");
+StaticAssertDecl(sizeof(PcmXTerminalRoleMasks) == 20,
+				 "PCM-X terminal role masks process-local ABI");
+StaticAssertDecl(sizeof(PcmXTerminalWork) == 112,
+				 "PCM-X terminal work process-local ABI");
 
 #define PCM_X_ADMIT_F_EXACT_REPLAY UINT32_C(0x01)
 #define PCM_X_ADMIT_F_NODE_COALESCED UINT32_C(0x02)
 #define PCM_X_ADMIT_F_QUEUE_HEAD UINT32_C(0x04)
+#define PCM_X_ADMIT_F_RESOURCE_X_ADAPTER UINT32_C(0x08)
 
 /* Process-local admission result.  Slot references are never sent on wire. */
 typedef struct PcmXMasterAdmission {
@@ -633,6 +681,53 @@ typedef struct PcmXLocalWriterClaim {
 	uint64 semantic_generation;
 } PcmXLocalWriterClaim;
 
+/* Opaque held ownership of one tag-scoped writer admission gate.  The token
+ * spans the BufferDesc revoke/copy/retain/finish window but never enters
+ * shared memory, wire, WAL, or Resource-X equality. */
+typedef struct PcmXLocalWriterRevokeFence {
+	ResourceXAssertion assertion;
+	PcmXSlotRef tag_slot;
+	uint64 assertion_sequence;
+	uint64 resource_formation;
+	uint64 master_session_incarnation;
+	uint64 writer_claim_generation;
+	uint32 local_round;
+	int32 master_node;
+	uint16 flags;
+	uint16 reserved;
+} PcmXLocalWriterRevokeFence;
+
+#define PCM_X_WRITER_REVOKE_F_HELD UINT16_C(0x01)
+#define PCM_X_WRITER_REVOKE_F_CREATED_SHELL UINT16_C(0x02)
+#define PCM_X_WRITER_REVOKE_F_KNOWN \
+	(PCM_X_WRITER_REVOKE_F_HELD | PCM_X_WRITER_REVOKE_F_CREATED_SHELL)
+
+/* Temporary R10->R11 authority selector.  The Resource-X admission sequence
+ * is deliberately stored outside PcmXTicketRef.grant_generation: admission
+ * is queue position, not legacy transfer authority. */
+typedef enum PcmXAuthorityDomain {
+	PCM_X_AUTHORITY_DOMAIN_NONE = 0,
+	PCM_X_AUTHORITY_DOMAIN_RESOURCE_X = 1
+} PcmXAuthorityDomain;
+
+/* Master-local history needed to distinguish a promoted FIFO successor from
+ * an initial head.  This occupies the existing reserved word and never
+ * crosses wire or contributes Resource-X authority. */
+#define PCM_X_MASTER_RESOURCE_X_F_WAS_SUCCESSOR UINT32_C(0x01)
+#define PCM_X_MASTER_RESOURCE_X_F_KNOWN \
+	PCM_X_MASTER_RESOURCE_X_F_WAS_SUCCESSOR
+
+/* Requester-local gates for the temporary Resource-X adapter.  These bits
+ * occupy the existing process-local reserved word; they are never wire or
+ * global resource authority. */
+#define PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY UINT32_C(0x01)
+#define PCM_X_LOCAL_RESOURCE_X_F_ASSERT_STARTED UINT32_C(0x02)
+#define PCM_X_LOCAL_RESOURCE_X_F_LATE_BOUND UINT32_C(0x04)
+#define PCM_X_LOCAL_RESOURCE_X_F_KNOWN \
+	(PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY \
+	 | PCM_X_LOCAL_RESOURCE_X_F_ASSERT_STARTED \
+	 | PCM_X_LOCAL_RESOURCE_X_F_LATE_BOUND)
+
 /*
  * Read-only, process-local view of one exact queue membership.  This is the
  * only supported polling surface for pcm_lock/bufmgr callers: shared-memory
@@ -659,9 +754,13 @@ typedef struct PcmXLocalProgress {
 	/* Process-local Resource-X carrier: zero before authenticated local grant
 	 * terminal, then the logical grant generation (never ticket/session id). */
 	uint64 semantic_generation;
+	uint64 resource_x_admission_sequence;
+	uint64 resource_x_base_authority_generation;
+	uint32 resource_x_authority_domain;
+	uint32 resource_x_reserved;
 } PcmXLocalProgress;
 
-StaticAssertDecl(sizeof(PcmXLocalProgress) == 256, "PCM-X local progress ABI");
+StaticAssertDecl(sizeof(PcmXLocalProgress) == 280, "PCM-X local progress ABI");
 
 /* One bounded existing-tick candidate for completing target T1/T2/T3 after
  * the originating requester stopped driving.  Process-local only. */
@@ -857,6 +956,8 @@ StaticAssertDecl(offsetof(PcmXLocalFollowerWfgSnapshot, waiter_graph_generation)
 StaticAssertDecl(sizeof(PcmXLocalWriterClaim) == 160, "PCM-X local writer claim process-local ABI");
 StaticAssertDecl(offsetof(PcmXLocalWriterClaim, claim_generation) == 128,
 				 "PCM-X local writer claim generation offset");
+StaticAssertDecl(sizeof(PcmXLocalWriterRevokeFence) == 88,
+				 "PCM-X local writer revoke fence process-local ABI");
 StaticAssertDecl(sizeof(PcmXLocalCutoff) == 48, "PCM-X local cutoff process-local ABI");
 StaticAssertDecl(offsetof(PcmXLocalCutoff, master_session_incarnation) == 24,
 				 "PCM-X local cutoff session offset");
@@ -1039,6 +1140,9 @@ typedef struct PcmXMasterTicketSlot {
 	uint64 transport_session;
 	uint64 semantic_generation;
 	ResourceXRetryStateV1 retry_state;
+	uint64 resource_x_admission_sequence;
+	uint32 resource_x_authority_domain;
+	uint32 resource_x_reserved;
 } PcmXMasterTicketSlot;
 
 typedef struct PcmXBlockerSlot {
@@ -1108,6 +1212,10 @@ typedef struct PcmXLocalTagSlot {
 	 * Observation only: never part of attempt equality or wire identity. */
 	uint32 retry_connection_generation;
 	uint32 retry_connection_reserved;
+	uint64 resource_x_admission_sequence;
+	uint64 resource_x_base_authority_generation;
+	uint32 resource_x_authority_domain;
+	uint32 resource_x_reserved;
 } PcmXLocalTagSlot;
 
 typedef struct PcmXLocalMembershipSlot {
@@ -1145,7 +1253,7 @@ StaticAssertDecl(sizeof(PcmXReliableLegState) == 56, "PCM-X reliable leg ABI");
 StaticAssertDecl(sizeof(PcmXMasterTagSlot) == 120, "PCM-X master tag slot ABI");
 StaticAssertDecl(offsetof(PcmXMasterTagSlot, outstanding_ticket_count) == 112,
 				 "PCM-X master outstanding-ticket count offset");
-StaticAssertDecl(sizeof(PcmXMasterTicketSlot) == 520, "PCM-X master ticket slot ABI");
+StaticAssertDecl(sizeof(PcmXMasterTicketSlot) == 536, "PCM-X master ticket slot ABI");
 StaticAssertDecl(offsetof(PcmXMasterTicketSlot, grant_base_own_generation) == 384,
 				 "PCM-X master ticket grant-base offset");
 StaticAssertDecl(offsetof(PcmXMasterTicketSlot, logical_assertion) == 392,
@@ -1159,7 +1267,7 @@ StaticAssertDecl(offsetof(PcmXMasterTicketSlot, transport_epoch) == 424
 StaticAssertDecl(offsetof(PcmXMasterTicketSlot, retry_state) == 448,
 				 "PCM-X master retry-state offset");
 StaticAssertDecl(sizeof(PcmXBlockerSlot) == 128, "PCM-X blocker slot ABI");
-StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 904, "PCM-X local tag slot ABI");
+StaticAssertDecl(sizeof(PcmXLocalTagSlot) == 928, "PCM-X local tag slot ABI");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, grant_base_own_generation) == 760,
 				 "PCM-X local tag grant-base offset");
 StaticAssertDecl(offsetof(PcmXLocalTagSlot, logical_assertion) == 768,
@@ -1629,7 +1737,22 @@ extern bool cluster_pcm_x_ticket_retire_ready(const PcmXMasterTicketSlot *ticket
 extern PcmXQueueResult cluster_pcm_x_peer_bind_ack_publish(int32 peer_node, uint64 cluster_epoch,
 														   uint64 peer_session);
 extern PcmXQueueResult cluster_pcm_x_master_admit_begin(const PcmXEnqueuePayload *request,
-														PcmXMasterAdmission *admission_out);
+												PcmXMasterAdmission *admission_out);
+extern PcmXQueueResult cluster_pcm_x_master_resource_x_owner_bind_exact(
+	const PcmXTicketRef *ref, uint64 admission_sequence);
+extern PcmXQueueResult cluster_pcm_x_master_resource_x_owner_exact(
+	const PcmXTicketRef *ref, uint64 *admission_sequence_out);
+extern PcmXQueueResult cluster_pcm_x_master_resource_x_assertion_ready_exact(
+	const ResourceXAssertion *assertion, uint64 admission_sequence);
+extern PcmXQueueResult cluster_pcm_x_master_resource_x_head_admission_exact(
+	const PcmXTicketRef *ref, uint64 admission_sequence,
+	PcmXMasterAdmission *admission_out);
+extern PcmXQueueResult cluster_pcm_x_master_resource_x_head_admission_work_exact(
+	const BufferTag *tag, uint64 cluster_epoch,
+	PcmXMasterAdmission *admission_out);
+extern PcmXQueueResult cluster_pcm_x_master_resource_x_complete_exact(
+	const ResourceXAssertion *assertion, uint64 admission_sequence,
+	const struct ResourceXMasterSnapshot *settled);
 extern PcmXQueueResult
 cluster_pcm_x_master_admit_wfg_snapshot_exact(const PcmXTicketRef *ref,
 											  PcmXMasterWfgSnapshot *snapshot_out);
@@ -1764,9 +1887,11 @@ extern PcmXQueueResult cluster_pcm_x_master_retire_ack_exact(const PcmXRetirePay
 															 int32 authenticated_node,
 															 uint64 authenticated_session);
 extern PcmXQueueResult cluster_pcm_x_master_retire_ack_resolve_exact(const PcmXRetirePayload *ack,
-																	 int32 authenticated_node,
-																	 uint64 authenticated_session,
-																	 PcmXTicketRef *ref_out);
+														 int32 authenticated_node,
+														 uint64 authenticated_session,
+														 PcmXTicketRef *ref_out);
+extern PcmXQueueResult cluster_pcm_x_master_terminal_work_exact(
+	const PcmXTicketRef *ref, PcmXTerminalWork *work_out);
 extern PcmXQueueResult cluster_pcm_x_master_terminal_work_next(PcmXTicketRef *ref_out);
 extern PcmXQueueResult cluster_pcm_x_master_terminal_work_next_after(uint64 after_ticket_id,
 																	 PcmXTicketRef *ref_out);
@@ -1788,7 +1913,30 @@ extern PcmXQueueResult cluster_pcm_x_local_lookup_exact(const PcmXWaitIdentity *
 extern PcmXQueueResult cluster_pcm_x_local_leader_rekey_generation_exact(
 	const PcmXLocalHandle *leader, uint64 base_own_generation, PcmXLocalHandle *rekeyed_out);
 extern PcmXQueueResult cluster_pcm_x_local_progress_exact(const PcmXLocalHandle *handle,
-												  PcmXLocalProgress *progress_out);
+											  PcmXLocalProgress *progress_out);
+extern PcmXQueueResult cluster_pcm_x_local_resource_x_admission_bind_exact(
+	const PcmXLocalHandle *leader, const PcmXTicketRef *admission_ref,
+	uint64 admission_sequence, uint64 base_authority_generation);
+extern PcmXQueueResult cluster_pcm_x_local_resource_x_admission_exact(
+	const PcmXLocalHandle *leader, uint64 *admission_sequence_out);
+extern PcmXQueueResult cluster_pcm_x_local_resource_x_assert_begin_exact(
+	const PcmXLocalHandle *leader, uint64 admission_sequence,
+	uint64 base_authority_generation);
+/* Resource-X-selected counterpart of A' rebase.  It publishes only the
+ * requester-local effective ownership base; assertion identity, canonical
+ * authority and wire generations remain unchanged. */
+extern PcmXQueueResult
+cluster_pcm_x_local_resource_x_grant_rebase_publish_exact(
+	const PcmXLocalHandle *leader, uint64 admission_sequence,
+	uint64 base_authority_generation, uint64 rebased_own_generation);
+extern PcmXQueueResult cluster_pcm_x_local_resource_x_attempt_exact(
+	const ResourceXAssertion *assertion, uint64 admission_sequence,
+	uint64 base_authority_generation, uint64 *base_own_generation_out,
+	PcmXWaitIdentity *leader_identity_out);
+extern PcmXQueueResult cluster_pcm_x_local_resource_x_grant_publish_exact(
+	const ResourceXAssertion *assertion, uint64 admission_sequence,
+	uint64 committed_own_generation, const PcmXImageToken *image,
+	PcmXWaitIdentity *leader_identity_out);
 extern PcmXQueueResult cluster_pcm_x_local_target_activation_work_next(
 	Size *cursor_io, Size scan_budget, PcmXLocalTargetActivationWork *work_out);
 extern PcmXQueueResult cluster_pcm_x_local_target_activation_publish_exact(
@@ -1806,6 +1954,14 @@ extern PcmXQueueResult cluster_pcm_x_local_writer_claim_exact(const PcmXLocalHan
 extern PcmXQueueResult
 cluster_pcm_x_local_writer_claim_release_collect_exact(const PcmXLocalWriterClaim *claim,
 													   PcmXWaitIdentity *successor_out);
+extern PcmXQueueResult cluster_pcm_x_local_writer_revoke_fence_acquire_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence,
+	uint64 resource_formation, int32 master_node,
+	uint64 master_session_incarnation, PcmXLocalWriterRevokeFence *fence_out);
+extern PcmXQueueResult cluster_pcm_x_local_writer_revoke_fence_revalidate_held_exact(
+	const PcmXLocalWriterRevokeFence *fence);
+extern PcmXQueueResult cluster_pcm_x_local_writer_revoke_fence_release_exact(
+	PcmXLocalWriterRevokeFence *fence);
 extern PcmXQueueResult
 cluster_pcm_x_local_writer_claim_release_exact(const PcmXLocalWriterClaim *claim);
 extern PcmXQueueResult
@@ -1857,9 +2013,12 @@ extern PcmXQueueResult cluster_pcm_x_local_enqueue_arm_exact(const PcmXLocalHand
 															 PcmXEnqueuePayload *payload_out,
 															 PcmXLocalReliableToken *token_out);
 extern PcmXQueueResult cluster_pcm_x_local_apply_admit_ack_exact(const PcmXLocalHandle *leader,
-																 const PcmXAdmitAckPayload *ack,
-																 int32 authenticated_node,
-																 uint64 authenticated_session);
+														 const PcmXAdmitAckPayload *ack,
+														 int32 authenticated_node,
+														 uint64 authenticated_session);
+extern PcmXQueueResult cluster_pcm_x_local_apply_admit_ack_resource_x_exact(
+	const PcmXLocalHandle *leader, const PcmXAdmitAckPayloadV2 *ack,
+	int32 authenticated_node, uint64 authenticated_session);
 extern PcmXQueueResult
 cluster_pcm_x_local_admit_confirm_arm_exact(const PcmXLocalHandle *leader,
 											PcmXPhasePayload *payload_out,
@@ -2025,6 +2184,10 @@ cluster_pcm_x_local_holder_exceptional_detach_exact(const PcmXLocalHolderHandle 
 													LWLock *content_lock);
 extern PcmXQueueResult
 cluster_pcm_x_local_holder_activate_exact(const PcmXLocalHolderHandle *handle);
+extern PcmXQueueResult
+cluster_pcm_x_local_holder_begin_recycling_exact(const PcmXLocalHolderHandle *handle);
+extern PcmXQueueResult
+cluster_pcm_x_local_holder_finish_recycling_exact(const PcmXLocalHolderHandle *handle);
 extern PcmXQueueResult
 cluster_pcm_x_local_holder_mark_releasing_exact(const PcmXLocalHolderHandle *handle);
 extern PcmXQueueResult

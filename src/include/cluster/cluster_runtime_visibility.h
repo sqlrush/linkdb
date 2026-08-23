@@ -55,6 +55,7 @@ typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
 typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
 typedef struct ClusterUndoBlock0ResolvedRoot ClusterUndoBlock0ResolvedRoot;
 
+extern void cluster_runtime_visibility_ensure_exit_hooks(void);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode, uint64 formation_epoch,
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);

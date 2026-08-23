@@ -498,6 +498,29 @@ cluster_pcm_x_current_image_shape(uint8 pcm_state, uint8 buffer_type, bool valid
 			   || (pcm_state == (uint8)PCM_STATE_X && buffer_type == (uint8)BUF_TYPE_XCUR));
 }
 
+/* A requester-local N descriptor contributes no page proof to ASSERT_X.
+ * CURRENT is the ordinary clean-N residency; PI+BM_VALID is the passive
+ * retained mirror kept byte-exact under a pre-existing pin after exact
+ * DRAIN.  Both may identify the requester as a non-holder, but neither is
+ * read or shipped here.  All other descriptor shapes remain closed. */
+static inline ClusterPcmOwnResult
+cluster_pcm_x_n_assertion_shape(uint8 pcm_state, uint8 buffer_type,
+								uint32 buf_state)
+{
+	if (pcm_state != (uint8)PCM_STATE_N)
+		return CLUSTER_PCM_OWN_STALE;
+	if ((buf_state & BM_VALID) == 0 || (buf_state & BM_IO_ERROR) != 0)
+		return CLUSTER_PCM_OWN_CORRUPT;
+	if (buffer_type != (uint8)BUF_TYPE_CURRENT
+		&& buffer_type != (uint8)BUF_TYPE_PI)
+		return CLUSTER_PCM_OWN_CORRUPT;
+	if ((buf_state
+		 & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
+			| BM_IO_IN_PROGRESS)) != 0)
+		return CLUSTER_PCM_OWN_BUSY;
+	return CLUSTER_PCM_OWN_OK;
+}
+
 /* Post-release retag of a retained PI whose exact write-fence token was just
  * released, applied under the same header-lock hold.  With no pins the image
  * is dropped -- !BM_VALID plus a BUF_TYPE_CURRENT retag makes the next
@@ -547,6 +570,36 @@ cluster_pcm_own_eviction_reuse_allowed(const ClusterPcmOwnEvictionCapture *captu
 
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf,
 													   ClusterPcmOwnSnapshot *out_snapshot);
+/* Exact requester-side N assertion preflight.  A passive retained PI mirror
+ * is accepted only as a no-local-current shape; no page bytes or proof are
+ * returned, and the master still owns proof selection. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n);
+/* A passive N descriptor is eligible for a durable-storage assertion only
+ * while the exact ownership tuple still names clean, valid, non-IO CURRENT
+ * residency.  The page bytes are deliberately not returned as proof. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_storage_candidate_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n);
+/* Current-slice remote-S holder evidence.  This is a local BufferDesc
+ * predicate only: it neither creates nor consults a GRD/Resource-X authority
+ * record.  The caller holds content EXCLUSIVE across its final check and the
+ * atomic retained-ring publication that commits S->N. */
+extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_s_holder_candidate_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_s);
+/* Read one verified shared-storage page into actor-private aligned staging.
+ * This function takes no BufferDesc pin/content lock and publishes no
+ * ownership; callers bind the result with Resource-X snapshot/revalidation. */
+extern bool cluster_bufmgr_read_storage_image_for_resource_x(
+	BufferTag tag, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
+	uint64 *out_page_scn);
+/* Same-page terminal-census slow path.  The guard retains the current exact
+ * PCM-X holder as revoke occupancy while resolver waits run without the page
+ * content lock.  It is process-local orchestration, not a wire capability. */
+extern bool cluster_bufmgr_itl_recycle_guard_arm(
+	Buffer buffer, const ClusterPcmOwnSnapshot *expected);
+extern void cluster_bufmgr_itl_recycle_guard_unlock(Buffer buffer);
+extern bool cluster_bufmgr_itl_recycle_guard_relock(Buffer buffer);
+extern void cluster_bufmgr_itl_recycle_guard_cancel(Buffer buffer);
 extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_capture_current_x_by_tag(
 	const ResourceXAcquisitionRef *ref, const PcmXImageToken *expected_image,
 	char *page_bytes, ResourceXCurrentImage *out_image);
@@ -578,6 +631,13 @@ extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_finish_s_release_to_n(BufferDesc *buf,
 											 const ClusterPcmOwnSnapshot *expected_s,
 											 ClusterPcmOwnSnapshot *out_n_snapshot);
+/* Current-slice remote-S Resource-X adaptation.  The caller must hold
+ * content EXCLUSIVE and present the exact REVOKING S tuple whose immutable
+ * type-18 status is already retained in the existing LMS DATA ring. */
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
+	ClusterPcmOwnSnapshot *out_n_snapshot);
 /* A queue INVALIDATE may target a MAIN/INIT S mirror that has passive PG
  * pins, including the waiting writer's own pin.  This by-tag boundary drains
  * content authority, snapshots/flushes its page evidence, and atomically

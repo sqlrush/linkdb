@@ -214,6 +214,12 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		pcm_x_expected_len = sizeof(PcmXEnqueuePayload);
 		break;
 	case PGRAC_IC_MSG_PCM_X_ADMIT_ACK:
+		if (payload_len != sizeof(PcmXAdmitAckPayload)
+			&& payload_len != sizeof(PcmXAdmitAckPayloadV2))
+			return -1;
+		memcpy(&pcm_x_tag, payload, sizeof(pcm_x_tag));
+		tag = &pcm_x_tag;
+		break;
 	case PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL_ACK:
 		pcm_x_expected_len = sizeof(PcmXAdmitAckPayload);
 		break;

@@ -1623,6 +1623,35 @@ UT_TEST(test_retained_release_retag_respects_pin_contract)
 		(uint8)PCM_STATE_N, PCM_OWN_FLAG_GRANT_PENDING, 7, true, (uint8)BUF_TYPE_CURRENT));
 }
 
+UT_TEST(test_passive_retained_pi_is_an_n_assertion_candidate_only)
+{
+	/* A DRAINed retained image kept under a pre-existing pin is a legal
+	 * passive N requester shape.  It may originate ASSERT_X without a local
+	 * image proof, but dirty/IO/malformed variants remain closed. */
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
+		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_CURRENT, BM_VALID),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
+		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI, BM_VALID),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
+		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI, BM_VALID | BM_DIRTY),
+		CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
+		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI,
+		BM_VALID | BM_IO_IN_PROGRESS),
+		CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
+		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_PI, 0),
+		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
+		(uint8)PCM_STATE_N, (uint8)BUF_TYPE_XCUR, BM_VALID),
+		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_n_assertion_shape(
+		(uint8)PCM_STATE_S, (uint8)BUF_TYPE_PI, BM_VALID),
+		CLUSTER_PCM_OWN_STALE);
+}
+
 UT_TEST(test_retained_release_and_finish_never_cover_invalid_bytes)
 {
 	static const char *const release_retag_contract[]
@@ -2327,6 +2356,37 @@ UT_TEST(test_queue_s_release_finish_is_header_exact_and_returns_fresh_n)
 	free(source);
 }
 
+UT_TEST(test_resource_x_remote_s_finish_requires_content_and_exact_revoke)
+{
+	typedef ClusterPcmOwnResult (*RemoteSFinishFn)(
+		BufferDesc *, const ClusterPcmOwnSnapshot *, ClusterPcmOwnSnapshot *);
+	static const char *const finish_contract[] = {
+		"LWLockHeldByMe(BufferDescriptorGetContentLock(buf))",
+		"expected_revoking->pcm_state != (uint8)PCM_STATE_S",
+		"expected_revoking->flags != PCM_OWN_FLAG_REVOKING",
+		"expected_revoking->reservation_token == 0",
+		"LockBufHdr(buf)",
+		"cluster_pcm_own_snapshot_matches_locked(buf, expected_revoking)",
+		"cluster_bufmgr_pcm_current_image_locked(buf, buf_state)",
+		"BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED",
+		"cluster_pcm_own_revoke_commit_exact(",
+		"buf->pcm_state = (uint8)PCM_STATE_N",
+		"buf->buffer_type = (uint8)BUF_TYPE_CURRENT",
+		"cluster_pcm_own_snapshot_locked(buf, out_n_snapshot)",
+		"UnlockBufHdr(buf, buf_state)"
+	};
+	char *source = read_bufmgr_source();
+
+	UT_ASSERT(__builtin_types_compatible_p(
+		__typeof__(&cluster_bufmgr_pcm_own_finish_remote_s_block_to_n),
+		RemoteSFinishFn));
+	assert_ordered_in_function(
+		source, "\ncluster_bufmgr_pcm_own_finish_remote_s_block_to_n(",
+		"\n/*\n * Release a passively pinned MAIN/INIT S mirror",
+		finish_contract, lengthof(finish_contract));
+	free(source);
+}
+
 UT_TEST(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires)
 {
 	static const char *const unlock_contract[]
@@ -2619,7 +2679,7 @@ UT_TEST(test_bufmgr_pcm_x_holder_reuse_and_deferred_failure_are_fail_closed)
 			"MyProc == NULL",
 			"entry->handle.key.identity.procno != (uint32) MyProc->pgprocno",
 			"entry->handle.key.identity.request_id == 0",
-			"entry->handle.key.identity.wait_seq != entry->handle.key.identity.request_id",
+			"entry->handle.key.identity.wait_seq == 0",
 			"cluster_epoch = cluster_epoch_get_current()",
 			"runtime = cluster_pcm_x_runtime_snapshot()",
 			"entry->handle.key.identity.cluster_epoch != cluster_epoch",
@@ -2674,6 +2734,11 @@ UT_TEST(test_bufmgr_pcm_x_holder_reuse_and_deferred_failure_are_fail_closed)
 	UT_ASSERT(entry_begin == NULL || entry_end == NULL
 			  || strstr(entry_begin, "cluster_epoch == 0") == NULL
 			  || strstr(entry_begin, "cluster_epoch == 0") >= entry_end);
+	UT_ASSERT(entry_begin == NULL || entry_end == NULL
+			  || strstr(entry_begin,
+					"wait_seq != entry->handle.key.identity.request_id") == NULL
+			  || strstr(entry_begin,
+					"wait_seq != entry->handle.key.identity.request_id") >= entry_end);
 	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_x_holder_prepare(", "\nstatic ",
 							   prepare_contract, lengthof(prepare_contract));
 
@@ -3632,7 +3697,7 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 int
 main(void)
 {
-	UT_PLAN(69);
+	UT_PLAN(71);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_resource_x_activation_binding_is_exact_and_legacy_closed);
 	UT_RUN(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking);
@@ -3646,6 +3711,7 @@ main(void)
 	UT_RUN(test_parallel_s_cover_is_rechecked_before_legacy_token_mint);
 	UT_RUN(test_share_cover_reverify_accepts_stable_successor_grant);
 	UT_RUN(test_retained_release_retag_respects_pin_contract);
+	UT_RUN(test_passive_retained_pi_is_an_n_assertion_candidate_only);
 	UT_RUN(test_retained_release_and_finish_never_cover_invalid_bytes);
 	UT_RUN(test_legacy_byte_proof_republishes_kept_pi_mirror);
 	UT_RUN(test_revoke_commit_is_exact_and_classifies_live_races);
@@ -3679,6 +3745,7 @@ main(void)
 	UT_RUN(test_retained_image_release_and_writeback_gates_are_exact);
 	UT_RUN(test_retained_drain_retags_invalid_only_after_exact_token_release);
 	UT_RUN(test_queue_s_release_finish_is_header_exact_and_returns_fresh_n);
+	UT_RUN(test_resource_x_remote_s_finish_requires_content_and_exact_revoke);
 	UT_RUN(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires);
 	UT_RUN(test_bufmgr_pcm_x_holder_ledger_is_bounded_and_uses_private_identity);
 	UT_RUN(test_unlockbuffers_exceptionally_detaches_released_pcm_x_holders);

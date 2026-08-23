@@ -662,8 +662,12 @@ cluster_lms_wakeup(int worker_id)
 		return;
 
 	pid = cluster_lms_get_worker_pid(worker_id);
-	if (pid <= 0 || pid == MyProcPid)
+	if (pid <= 0)
 		return;
+	if (pid == MyProcPid) {
+		SetLatch(MyLatch);
+		return;
+	}
 
 	(void)kill(pid, SIGUSR1);
 }

@@ -82,12 +82,18 @@ cluster_tx_zero_epoch_terminal_census_is_admissible(
 	const ClusterSemanticAdmissionToken *admission,
 	bool caller_owned_terminal_census)
 {
+	NodeId origin = uba_origin_node_id(locator->uba);
+	int node_count = cluster_conf_node_count();
+	bool topology_admissible;
+
+	topology_admissible
+		= (node_count == 1 && origin == (NodeId)cluster_node_id)
+		  || (node_count == 4 && origin != InvalidNodeId);
 	return caller_owned_terminal_census
 		   && admission->record_generation == 0
 		   && cluster_storage_mode_enabled()
-		   && cluster_conf_node_count() == 1
+		   && topology_admissible
 		   && !cluster_recmerge_window_active
-		   && uba_origin_node_id(locator->uba) == (NodeId)cluster_node_id
 		   && cluster_epoch_get_current() == 0
 		   && cluster_semantic_activation_recheck_r4_terminal_census(admission);
 }
@@ -309,6 +315,12 @@ cluster_tx_resolve_exact_admitted(
 	}
 	return cluster_tx_resolve_exact_with_admission(
 		locator, mode, admission, out, reason_out, true);
+}
+
+void
+cluster_tx_resolve_terminal_census_batch_preflight(void)
+{
+	cluster_runtime_visibility_ensure_exit_hooks();
 }
 
 ClusterTxOutcome

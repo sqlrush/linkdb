@@ -84,6 +84,12 @@ cluster_runtime_visibility_direct_xid_status(TransactionId xid)
 	return TransactionIdGetStatus(xid, &xid_lsn);
 }
 
+void
+cluster_runtime_visibility_ensure_exit_hooks(void)
+{
+	cluster_undo_block0_current_ensure_exit_hooks();
+}
+
 static bool
 cluster_runtime_visibility_direct_xid_committed(TransactionId xid)
 {
@@ -551,6 +557,7 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 			logical.owner_instance, logical.segment_id, &root))
 		goto done;
 
+	cluster_runtime_visibility_ensure_exit_hooks();
 	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
 							PointerGetDatum(&cleanup));
 	{

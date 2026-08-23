@@ -358,6 +358,55 @@ cluster_gcs_pcm_x_role_refresh_exact(const PcmXLocalHandle *follower,
 		   && follower->local_round == promoted->local_round;
 }
 
+/* An authenticated promoted-head ACK may late-bind the canonical Resource-X
+ * base before ASSERT_X starts.  A caller holding the immediately preceding
+ * progress snapshot may retry only when those two fields are the entire
+ * change; every identity, sequence, locator, and authority byte stays exact. */
+static inline bool
+cluster_gcs_pcm_x_resource_x_preassert_late_bind_refresh_exact(
+	const PcmXLocalProgress *before, const PcmXLocalProgress *after)
+{
+	const uint32 late_bind_flags = PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY
+		| PCM_X_LOCAL_RESOURCE_X_F_LATE_BOUND;
+	PcmXLocalProgress expected;
+
+	if (before == NULL || after == NULL
+		|| before->identity.node_id < 0
+		|| before->identity.node_id >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| before->identity.request_id == 0 || before->identity.wait_seq == 0
+		|| before->identity.base_own_generation == 0
+		|| before->ref.handle.ticket_id == 0
+		|| before->ref.handle.queue_generation == 0
+		|| memcmp(&before->identity, &before->ref.identity,
+				  sizeof(before->identity)) != 0
+		|| before->ref.grant_generation != 0
+		|| before->member_state != PCM_XL_REMOTE_WAIT
+		|| before->role != PCM_X_LOCAL_ROLE_NODE_LEADER
+		|| before->pending_opcode != 0
+		|| before->last_response_opcode
+			!= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK
+		|| before->master_node < 0
+		|| before->master_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| before->master_session_incarnation == 0
+		|| before->resource_x_authority_domain
+			!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+		|| before->resource_x_admission_sequence == 0
+		|| before->resource_x_admission_sequence == UINT64_MAX
+		|| before->resource_x_base_authority_generation == 0
+		|| before->resource_x_base_authority_generation == UINT64_MAX
+		|| before->resource_x_reserved != 0
+		|| after->resource_x_base_authority_generation
+			<= before->resource_x_base_authority_generation
+		|| after->resource_x_base_authority_generation == UINT64_MAX
+		|| after->resource_x_reserved != late_bind_flags)
+		return false;
+	expected = *before;
+	expected.resource_x_base_authority_generation
+		= after->resource_x_base_authority_generation;
+	expected.resource_x_reserved = late_bind_flags;
+	return memcmp(&expected, after, sizeof(expected)) == 0;
+}
+
 /* A queue result is meaningful only at the operation that produced it.
  * Immutable-token failures (especially STALE) must never enter a generic
  * retry loop.  An arm may race a newer progress publication; a WFG commit
@@ -4562,8 +4611,16 @@ extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
  * bufmgr aborts/rearms GRANT_PENDING and selects a fresh holder identity.
  */
 extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf,
-														 const PcmAuthoritySnapshot *expected,
-														 bool *out_retry_denied);
+													 const PcmAuthoritySnapshot *expected,
+													 bool *out_retry_denied);
+/*
+ * R10/A' PGRAC adaptation: a master-local legacy N->S acquisition bypasses
+ * the data-plane dedup table, so consult the existing exact PCM-X active-head
+ * locator or approved pre-ASSERT late-bind head before publishing local S.
+ * This is a retry barrier only: it grants
+ * no PCM/PI authority and never reads or reconstructs page bytes.
+ */
+extern bool cluster_gcs_block_pcm_x_local_s_barrier_active(BufferTag tag);
 /* PGRAC: spec-5.2 D11 — local-master writer-transfer (revoke); durable X grant.
  * spec-5.2a D2/D3: clean_eligible routes a clean (sequence) page through the
  * flush-data-before-drop holder path + stale-holder storage-fallback recovery.

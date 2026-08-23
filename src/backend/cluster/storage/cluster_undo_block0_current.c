@@ -265,6 +265,13 @@ current_ensure_exit_hook(void)
 	}
 }
 
+void
+cluster_undo_block0_current_ensure_exit_hooks(void)
+{
+	current_ensure_exit_hook();
+	cluster_undo_smgr_ensure_exit_hook();
+}
+
 static void
 current_active_unlink(ClusterUndoBlock0CurrentGuardData *data)
 {
@@ -494,15 +501,17 @@ current_stage_no_wait_cleanup(ClusterUndoBlock0CurrentGuardData *data, bool exit
 		current_stage_pending_cleanup(data, exiting);
 		break;
 	case CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD:
-		if (data->remote_master)
+		if (data->remote_master) {
 			current_stage_remote_release(data);
-		else
+			(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
+		} else
 			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
 		break;
 	case CLUSTER_UNDO_BLOCK0_CURRENT_RELEASE_WAIT:
 		if (data->remote_master) {
 			current_reply_delete(data, GES_REQ_OPCODE_RELEASE);
 			current_stage_remote_release(data);
+			(void)cluster_grd_release_holder_by_id(&data->resid, &data->holder);
 		} else
 			cluster_ges_release_and_drain_local(&data->resid, &data->holder);
 		break;
@@ -617,7 +626,10 @@ current_promote_grant(ClusterUndoBlock0CurrentGuardData *data,
 	if (!current_live_recheck(data)) {
 		return current_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
 	}
-	result = cluster_grd_revalidate_and_promote(&data->resid, &data->holder, cluster_node_id,
+	result = data->remote_master
+			 ? cluster_grd_promote_remote_grant_exact(&data->resid, &data->holder)
+			 : cluster_grd_revalidate_and_promote(&data->resid, &data->holder,
+											 cluster_node_id,
 											 data->reservation_generation);
 	data->reservation_held = false; /* promote or the helper's failed revalidate consumed it */
 	if (result != CLUSTER_GRD_ENTRY_OK)
@@ -739,7 +751,7 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 			return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 		}
 	}
-	current_ensure_exit_hook();
+	cluster_undo_block0_current_ensure_exit_hooks();
 	current_active_link(data);
 	data->phase = CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT;
 
@@ -1310,8 +1322,7 @@ cluster_undo_block0_current_live_owner_ensure_resident(
 	cleanup.frame = &frame;
 	cleanup.pin = &pin;
 
-	current_ensure_exit_hook();
-	cluster_undo_smgr_ensure_exit_hook();
+	cluster_undo_block0_current_ensure_exit_hooks();
 	admission_result = cluster_semantic_activation_enter(
 		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 		CLUSTER_SEMANTIC_SOURCE_SIDE, &admission);

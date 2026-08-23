@@ -92,6 +92,7 @@ static int test_candidate_block0_copy_calls;
 static int test_candidate_data_copy_calls;
 static int test_candidate_release_calls;
 static int test_candidate_cancel_calls;
+static int test_candidate_exit_hooks_ensure_calls;
 static ClusterUndoBlock0CurrentStep test_candidate_acquire_step
 	= CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 static ClusterUndoBlock0CurrentStep test_candidate_poll_step
@@ -125,6 +126,12 @@ void
 cancel_before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
 						 Datum arg pg_attribute_unused())
 {}
+
+void
+cluster_undo_block0_current_ensure_exit_hooks(void)
+{
+	test_candidate_exit_hooks_ensure_calls++;
+}
 
 static bool
 test_uba_equal(UBA left, UBA right)
@@ -472,6 +479,7 @@ reset_exact_origin_fixture(void)
 	test_candidate_data_copy_calls = 0;
 	test_candidate_release_calls = 0;
 	test_candidate_cancel_calls = 0;
+	test_candidate_exit_hooks_ensure_calls = 0;
 	test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
@@ -628,6 +636,7 @@ UT_TEST(test_terminal_census_local_origin_uses_resident_candidate2_and_canonical
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
 	UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, TEST_ORIGIN_WRAP);
 	UT_ASSERT_EQ(test_candidate_acquire_calls, 1);
+	UT_ASSERT_EQ(test_candidate_exit_hooks_ensure_calls, 1);
 	UT_ASSERT_EQ(test_candidate_sample_calls, 2);
 	UT_ASSERT_EQ(test_candidate_block0_copy_calls, 1);
 	UT_ASSERT_EQ(test_candidate_data_copy_calls, 1);

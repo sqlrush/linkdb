@@ -8096,6 +8096,44 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid, const ClusterGrdHo
 }
 
 ClusterGrdEntryResult
+cluster_grd_promote_remote_grant_exact(const ClusterResId *resid,
+									   const ClusterGrdHolderId *holder)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult er = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	int i;
+
+	Assert(resid != NULL && holder != NULL);
+
+	if (cluster_grd_entry_lookup_or_create(resid, false, &entry)
+			!= CLUSTER_GRD_ENTRY_OK
+		|| entry == NULL)
+		return CLUSTER_GRD_ENTRY_NOT_FOUND;
+
+	SpinLockAcquire(&entry->lock);
+	for (i = 0; i < entry->nreservations; i++) {
+		if ((uint32)entry->reservations[i].id.node_id == holder->node_id
+			&& entry->reservations[i].id.procno == holder->procno
+			&& entry->reservations[i].id.cluster_epoch == holder->cluster_epoch
+			&& entry->reservations[i].id.request_id == holder->request_id) {
+			LOCKMODE mode = entry->reservations[i].mode;
+
+			if (i < entry->nreservations - 1)
+				entry->reservations[i]
+					= entry->reservations[entry->nreservations - 1];
+			memset(&entry->reservations[entry->nreservations - 1], 0,
+				   sizeof(entry->reservations[0]));
+			entry->nreservations--;
+			er = cluster_grd_entry_grant_holder(entry, holder, (int)mode);
+			break;
+		}
+	}
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	return er;
+}
+
+ClusterGrdEntryResult
 cluster_grd_release_holder_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder)
 {
 	ClusterGrdEntry *entry = NULL;

@@ -148,8 +148,50 @@ typedef struct ClusterHeapItlTerminalCensus
 	ClusterTxLocator locators[CLUSTER_ITL_INITRANS_DEFAULT];
 	ClusterTxResolution resolutions[CLUSTER_ITL_INITRANS_DEFAULT];
 	ClusterTxOutcome outcomes[CLUSTER_ITL_INITRANS_DEFAULT];
-	bool locator_valid[CLUSTER_ITL_INITRANS_DEFAULT];
+	uint8 locator_mask;
+	uint8 attempted_mask;
+	uint8 terminal_mask;
+	uint8 terminal_count;
 } ClusterHeapItlTerminalCensus;
+
+StaticAssertDecl(CLUSTER_ITL_INITRANS_DEFAULT == 8,
+				 "terminal census mask requires exactly eight ITL slots");
+#define CLUSTER_HEAP_ITL_SLOT_BIT(i) ((uint8) (UINT8_C(1) << (i)))
+
+typedef enum ClusterHeapItlTerminalBatchApplyKind
+{
+	CLUSTER_HEAP_ITL_BATCH_REFUSED = 0,
+	CLUSTER_HEAP_ITL_BATCH_EXACT_NO_TERMINAL,
+	CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X,
+	CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED
+} ClusterHeapItlTerminalBatchApplyKind;
+
+typedef struct ClusterHeapItlTerminalBatchApplyResult
+{
+	ClusterHeapItlTerminalBatchApplyKind kind;
+	uint8 stamped_mask;
+	uint8 stamped_count;
+} ClusterHeapItlTerminalBatchApplyResult;
+
+#ifdef USE_CLUSTER_UNIT
+static uint8 cluster_heap_test_itl_last_locator_mask;
+static uint8 cluster_heap_test_itl_last_attempted_mask;
+static uint8 cluster_heap_test_itl_last_terminal_mask;
+static uint8 cluster_heap_test_itl_last_terminal_count;
+#endif
+
+static uint8
+cluster_heap_itl_slot_mask_count(uint8 mask)
+{
+	uint8 count = 0;
+
+	while (mask != 0)
+	{
+		count += mask & UINT8_C(1);
+		mask >>= 1;
+	}
+	return count;
+}
 
 static void
 cluster_heap_itl_finish_terminal_census(
@@ -234,9 +276,10 @@ cluster_heap_itl_capture_terminal_census(Buffer buffer,
 	{
 		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
-		census->locator_valid[i] = cluster_tx_locator_from_itl_terminal_census(
-			page, i, &census->locators[i], &reason);
-		if (!census->locator_valid[i])
+		if (cluster_tx_locator_from_itl_terminal_census(
+				page, i, &census->locators[i], &reason))
+			census->locator_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
+		else
 			memset(&census->locators[i], 0, sizeof(census->locators[i]));
 	}
 	return cluster_semantic_activation_recheck_r4_terminal_census(
@@ -245,32 +288,47 @@ cluster_heap_itl_capture_terminal_census(Buffer buffer,
 
 static bool
 cluster_heap_itl_census_page_revalidated(
-	Buffer buffer, const ClusterHeapItlTerminalCensus *census)
+	Buffer buffer, const ClusterHeapItlTerminalCensus *census,
+	bool *current_page_authorized)
 {
 	ClusterPcmOwnSnapshot live_pcm;
 	Page page = BufferGetPage(buffer);
+	ClusterPcmOwnResult snapshot_result;
 
-	return PageHasItl(page)
-		&& cluster_bufmgr_pcm_own_snapshot(GetBufferDescriptor(buffer - 1),
-										   &live_pcm) == CLUSTER_PCM_OWN_OK
-		&& cluster_heap_itl_terminal_census_pcm_authority(&live_pcm)
-		&& memcmp(&live_pcm, &census->pcm, sizeof(live_pcm)) == 0
+	Assert(current_page_authorized != NULL);
+	*current_page_authorized = false;
+	snapshot_result = cluster_bufmgr_pcm_own_snapshot(
+		GetBufferDescriptor(buffer - 1), &live_pcm);
+	if (!PageHasItl(page)
+		|| snapshot_result != CLUSTER_PCM_OWN_OK
+		|| !cluster_heap_itl_terminal_census_pcm_authority(&live_pcm))
+		return false;
+	*current_page_authorized = live_pcm.pcm_state == (uint8) PCM_STATE_X;
+	return BufferTagsEqual(&live_pcm.tag, &census->pcm.tag)
+		&& live_pcm.generation == census->pcm.generation
+		&& live_pcm.reservation_token == census->pcm.reservation_token
+		&& live_pcm.resource_x_activation_generation
+			   == census->pcm.resource_x_activation_generation
+		&& live_pcm.flags == census->pcm.flags
+		&& live_pcm.pcm_state == census->pcm.pcm_state
 		&& PageGetLSN(page) == census->page_lsn;
 }
 
 static bool
-cluster_heap_itl_census_stamp_terminal(
+cluster_heap_itl_census_validate_terminal(
 	Buffer buffer, uint8 slot_index,
-	const ClusterHeapItlTerminalCensus *census)
+	const ClusterHeapItlTerminalCensus *census, uint8 *terminal_flags_out)
 {
 	Page page = BufferGetPage(buffer);
-	ClusterItlSlotData *slot = &ClusterPageGetItlSlots(page)[slot_index];
+	const ClusterItlSlotData *slot
+		= &ClusterPageGetItlSlots(page)[slot_index];
 	const ClusterItlSlotData *captured = &census->slots[slot_index];
 	const ClusterTxResolution *resolution = &census->resolutions[slot_index];
 	ClusterTxLocator live_locator;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 	uint8 terminal_flags;
 
+	Assert(terminal_flags_out != NULL);
 	if (memcmp(slot, captured, sizeof(*slot)) != 0
 		|| !cluster_tx_locator_from_itl_terminal_census(
 			page, slot_index, &live_locator, &reason)
@@ -293,17 +351,15 @@ cluster_heap_itl_census_stamp_terminal(
 	{
 		if (!SCN_VALID(resolution->commit_scn))
 			return false;
-		slot->commit_scn = resolution->commit_scn;
 	}
 	else if (census->outcomes[slot_index] == CLUSTER_TX_ABORTED)
 	{
 		if (SCN_VALID(resolution->commit_scn))
 			return false;
-		slot->commit_scn = InvalidScn;
 	}
 	else
 		return false;
-	slot->flags = terminal_flags;
+	*terminal_flags_out = terminal_flags;
 	return true;
 }
 
@@ -313,15 +369,17 @@ cluster_heap_itl_resolve_terminal_census(
 {
 	uint8 i;
 
+	cluster_tx_resolve_terminal_census_batch_preflight();
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
 	{
 		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 
-		if (!census->locator_valid[i])
+		if ((census->locator_mask & CLUSTER_HEAP_ITL_SLOT_BIT(i)) == 0)
 		{
 			census->outcomes[i] = CLUSTER_TX_UNKNOWN;
 			continue;
 		}
+		census->attempted_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
 		census->outcomes[i] = cluster_tx_resolve_exact_admitted(
 			&census->locators[i], CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
 			&census->admission, &census->resolutions[i], &reason);
@@ -329,31 +387,81 @@ cluster_heap_itl_resolve_terminal_census(
 			|| (census->outcomes[i] != CLUSTER_TX_COMMITTED
 				&& census->outcomes[i] != CLUSTER_TX_ABORTED))
 			census->outcomes[i] = CLUSTER_TX_UNKNOWN;
+		else
+		{
+			census->terminal_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
+			census->terminal_count++;
+		}
 	}
+#ifdef USE_CLUSTER_UNIT
+	cluster_heap_test_itl_last_locator_mask = census->locator_mask;
+	cluster_heap_test_itl_last_attempted_mask = census->attempted_mask;
+	cluster_heap_test_itl_last_terminal_mask = census->terminal_mask;
+	cluster_heap_test_itl_last_terminal_count = census->terminal_count;
+#endif
 }
 
-static bool
+static ClusterHeapItlTerminalBatchApplyResult
 cluster_heap_itl_apply_terminal_census(
 	Buffer buffer, const ClusterHeapItlTerminalCensus *census)
 {
-	bool recycled = false;
+	ClusterHeapItlTerminalBatchApplyResult result = {
+		CLUSTER_HEAP_ITL_BATCH_REFUSED, 0, 0};
+	bool current_page_authorized = false;
+	uint8 terminal_flags[CLUSTER_ITL_INITRANS_DEFAULT] = {0};
 	uint8 i;
 
 	if (!census->admission_owned
 		|| !cluster_semantic_activation_recheck_r4_terminal_census(
 			&census->admission)
-		|| !cluster_heap_itl_census_page_revalidated(buffer, census))
-		return false;
+		|| census->attempted_mask != census->locator_mask
+		|| census->terminal_count
+			   != cluster_heap_itl_slot_mask_count(census->terminal_mask))
+		return result;
+	if (!cluster_heap_itl_census_page_revalidated(
+			buffer, census, &current_page_authorized))
+	{
+		if (current_page_authorized)
+			result.kind = CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X;
+		return result;
+	}
+	if (census->terminal_mask == 0)
+	{
+		result.kind = CLUSTER_HEAP_ITL_BATCH_EXACT_NO_TERMINAL;
+		return result;
+	}
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
 	{
-		if ((census->outcomes[i] == CLUSTER_TX_COMMITTED
-			 || census->outcomes[i] == CLUSTER_TX_ABORTED)
-			&& cluster_heap_itl_census_stamp_terminal(buffer, i, census))
-			recycled = true;
+		if ((census->terminal_mask & CLUSTER_HEAP_ITL_SLOT_BIT(i)) != 0
+			&& !cluster_heap_itl_census_validate_terminal(
+				buffer, i, census, &terminal_flags[i]))
+		{
+			if (current_page_authorized)
+				result.kind = CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X;
+			return result;
+		}
 	}
-	if (recycled)
-		MarkBufferDirtyHint(buffer, true);
-	return recycled;
+	if (!cluster_semantic_activation_recheck_r4_terminal_census(
+			&census->admission))
+		return result;
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		ClusterItlSlotData *slot;
+
+		if ((census->terminal_mask & CLUSTER_HEAP_ITL_SLOT_BIT(i)) == 0)
+			continue;
+		slot = &ClusterPageGetItlSlots(BufferGetPage(buffer))[i];
+		slot->commit_scn = census->outcomes[i] == CLUSTER_TX_COMMITTED
+			? census->resolutions[i].commit_scn : InvalidScn;
+		slot->flags = terminal_flags[i];
+		result.stamped_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
+		result.stamped_count++;
+	}
+	Assert(result.stamped_count > 0);
+	Assert(result.stamped_count == census->terminal_count);
+	MarkBufferDirtyHint(buffer, true);
+	result.kind = CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED;
+	return result;
 }
 
 static bool
@@ -395,7 +503,7 @@ cluster_heap_itl_alloc_with_terminal_census(Buffer buffer, TransactionId xid,
 										bool lock_only, uint8 *slot_index_out)
 {
 	ClusterHeapItlTerminalCensus census;
-	bool result = false;
+	int round;
 
 	Assert(BufferIsValid(buffer));
 	Assert(TransactionIdIsValid(xid));
@@ -403,30 +511,83 @@ cluster_heap_itl_alloc_with_terminal_census(Buffer buffer, TransactionId xid,
 	*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
 	if (cluster_heap_itl_alloc_once(buffer, xid, lock_only, slot_index_out))
 		return true;
-	if (!cluster_heap_itl_begin_terminal_census(&census))
-		return false;
-	if (!cluster_heap_itl_capture_terminal_census(buffer, &census))
+	for (round = 0; round < 2; round++)
 	{
-		cluster_heap_itl_finish_terminal_census(&census);
-		return false;
-	}
+		bool result = false;
+		bool run_second_round = false;
+		volatile bool recycle_guard_armed = false;
+		volatile bool recycle_guard_unlocked = false;
 
-	PG_TRY();
-	{
-		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-		cluster_heap_itl_resolve_terminal_census(&census);
-		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		if (!cluster_heap_itl_begin_terminal_census(&census))
+			return false;
+		if (!cluster_heap_itl_capture_terminal_census(buffer, &census))
+		{
+			cluster_heap_itl_finish_terminal_census(&census);
+			return false;
+		}
+		if (census.pcm.pcm_state == (uint8) PCM_STATE_X)
+		{
+			if (!cluster_bufmgr_itl_recycle_guard_arm(buffer, &census.pcm))
+			{
+				cluster_heap_itl_finish_terminal_census(&census);
+				return false;
+			}
+			recycle_guard_armed = true;
+		}
 
-		if (cluster_heap_itl_apply_terminal_census(buffer, &census))
-			result = cluster_heap_itl_alloc_once(
-				buffer, xid, lock_only, slot_index_out);
+		PG_TRY();
+		{
+			ClusterHeapItlTerminalBatchApplyResult apply_result;
+
+			if (recycle_guard_armed)
+			{
+				cluster_bufmgr_itl_recycle_guard_unlock(buffer);
+				recycle_guard_unlocked = true;
+			}
+			else
+				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+			cluster_heap_itl_resolve_terminal_census(&census);
+			if (recycle_guard_armed)
+			{
+				if (!cluster_bufmgr_itl_recycle_guard_relock(buffer))
+					ereport(ERROR,
+							(errcode(ERRCODE_OBJECT_IN_USE),
+							 errmsg("cluster ITL recycle guard could not reacquire exact content authority")));
+				recycle_guard_unlocked = false;
+				recycle_guard_armed = false;
+			}
+			else
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+
+			apply_result = cluster_heap_itl_apply_terminal_census(
+				buffer, &census);
+			if (apply_result.kind
+				== CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED)
+				result = cluster_heap_itl_alloc_once(
+					buffer, xid, lock_only, slot_index_out);
+			else if (round == 0
+					 && apply_result.kind
+						== CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X)
+			{
+				result = cluster_heap_itl_alloc_once(
+					buffer, xid, lock_only, slot_index_out);
+				run_second_round = !result;
+			}
+		}
+		PG_FINALLY();
+		{
+			if (recycle_guard_armed && recycle_guard_unlocked)
+				cluster_bufmgr_itl_recycle_guard_cancel(buffer);
+			cluster_heap_itl_finish_terminal_census(&census);
+			memset(&census, 0, sizeof(census));
+		}
+		PG_END_TRY();
+		if (result)
+			return true;
+		if (!run_second_round)
+			return false;
 	}
-	PG_FINALLY();
-	{
-		cluster_heap_itl_finish_terminal_census(&census);
-	}
-	PG_END_TRY();
-	return result;
+	return false;
 }
 
 #ifdef USE_CLUSTER_UNIT
@@ -461,6 +622,21 @@ cluster_heap_test_itl_update_same_page_failure_cleanup(void)
 	census.admission_owned = true;
 	return cluster_heap_itl_finish_update_census_after_alloc_failure(
 		&census, false);
+}
+
+void
+cluster_heap_test_itl_last_census_stats(
+	uint8 *locator_mask, uint8 *attempted_mask,
+	uint8 *terminal_mask, uint8 *terminal_count)
+{
+	Assert(locator_mask != NULL);
+	Assert(attempted_mask != NULL);
+	Assert(terminal_mask != NULL);
+	Assert(terminal_count != NULL);
+	*locator_mask = cluster_heap_test_itl_last_locator_mask;
+	*attempted_mask = cluster_heap_test_itl_last_attempted_mask;
+	*terminal_mask = cluster_heap_test_itl_last_terminal_mask;
+	*terminal_count = cluster_heap_test_itl_last_terminal_count;
 }
 #endif
 
@@ -8153,6 +8329,8 @@ l_pgrac_reacquire:
 		uint32 tt_id_unused;
 		bool census_was_pending = cluster_itl_update_census_pending;
 		bool old_allocated;
+		ClusterHeapItlTerminalBatchApplyResult census_apply_result = {
+			CLUSTER_HEAP_ITL_BATCH_REFUSED, 0, 0};
 
 		if (cluster_tt_local_get_or_create_binding(xid, &tt_seg, &tt_off, &tt_id_unused))
 			cluster_itl_uba = uba_encode(tt_seg, 0, tt_off, 0);
@@ -8169,7 +8347,7 @@ l_pgrac_reacquire:
 			else if (newbuf != buffer)
 				census_buffer = newbuf;
 			if (BufferIsValid(census_buffer))
-				(void) cluster_heap_itl_apply_terminal_census(
+				census_apply_result = cluster_heap_itl_apply_terminal_census(
 					census_buffer, &cluster_itl_update_census);
 			cluster_itl_update_census_pending = false;
 		}
@@ -8177,6 +8355,11 @@ l_pgrac_reacquire:
 		old_allocated = newbuf == buffer && !census_was_pending
 			? cluster_heap_itl_alloc_with_terminal_census(
 				buffer, xid, false, &cluster_itl_old_slot)
+			: census_was_pending && cluster_itl_update_census_old_page
+				? census_apply_result.kind
+					  == CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED
+					&& cluster_heap_itl_alloc_once(
+						buffer, xid, false, &cluster_itl_old_slot)
 			: cluster_heap_itl_alloc_once(
 				buffer, xid, false, &cluster_itl_old_slot);
 		if (census_was_pending
@@ -8212,8 +8395,14 @@ l_pgrac_reacquire:
 
 		if (newbuf != buffer && PageHasItl(BufferGetPage(newbuf)))
 		{
-			bool new_allocated = cluster_heap_itl_alloc_once(
-				newbuf, xid, false, &cluster_itl_new_slot);
+			bool new_allocated
+				= census_was_pending && !cluster_itl_update_census_old_page
+				? census_apply_result.kind
+					  == CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED
+					&& cluster_heap_itl_alloc_once(
+						newbuf, xid, false, &cluster_itl_new_slot)
+				: cluster_heap_itl_alloc_once(
+					newbuf, xid, false, &cluster_itl_new_slot);
 
 			if (census_was_pending
 				&& !cluster_itl_update_census_old_page)

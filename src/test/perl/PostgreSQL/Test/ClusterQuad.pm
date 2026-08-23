@@ -90,6 +90,8 @@ sub _relocate_backup_pg_wal
 #	                        voting-disk files (QVOTEC reaches quorum OK)
 #	  wal_threads_root    : 1  -> shared per-thread WAL root
 #	  shared_data         : 1  -> shared data root (cluster_fs backend)
+#	  shared_system_identifier : 1 -> initialize node0 once and clone the
+#	                        other three nodes from that clean baseline
 #	  shared_catalog      : 1  -> t/337-style shared-catalog formation;
 #	                        implies shared_data + wal_threads_root and enables
 #	                        the required online-join/XID-striping substrate
@@ -215,6 +217,19 @@ EOC
 		die "shared_catalog seed did not create catalog authority"
 		  unless -e "$shared_data_root/global/pgrac_catalog_authority";
 		$nodes[0]->stop;
+	}
+	elsif ($opts{shared_system_identifier})
+	{
+		$nodes[0]->init(allows_streaming => 1);
+		$nodes[0]->start;
+		$nodes[0]->backup('clusterquad_homogeneous_baseline');
+		$nodes[0]->stop;
+
+		for my $i (1 .. $NODES - 1)
+		{
+			$nodes[$i]->init_from_backup(
+				$nodes[0], 'clusterquad_homogeneous_baseline');
+		}
 	}
 	else
 	{

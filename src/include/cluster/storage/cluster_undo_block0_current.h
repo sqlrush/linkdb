@@ -50,6 +50,7 @@ StaticAssertDecl(sizeof(ClusterUndoBlock0CurrentGuard) == 168,
 				 "block0 current guard ABI must remain exactly 168 bytes");
 
 extern void cluster_undo_block0_current_init(void);
+extern void cluster_undo_block0_current_ensure_exit_hooks(void);
 extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin(
 	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode, int timeout_ms,
 	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);

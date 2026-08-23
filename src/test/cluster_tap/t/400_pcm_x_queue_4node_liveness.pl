@@ -19,6 +19,8 @@ use PostgreSQL::Test::Utils;
 use Test::More;
 use Time::HiRes qw(time usleep);
 
+my $pgrd_voting_file_bytes = (8 * 128 + 3) * 512;
+
 sub state_int
 {
 	my ($node, $category, $key) = @_;
@@ -73,6 +75,18 @@ my @pcm_x_lmd_keys = qw(
 	pcm_convert_wfg_exact_remove_stale_count
 );
 
+my @resource_x_o1_keys = qw(
+	remote_install_observed_count
+	remote_grant_after_image_count
+	remote_image_at_or_after_grant_count
+	remote_episode_excluded_no_install
+	remote_episode_excluded_missing_grant
+	remote_episode_excluded_missing_image
+	last_remote_t_image_us
+	last_remote_t_grant_us
+	last_remote_t_install_us
+);
+
 my @pcm_x_final_gauge_keys = qw(
 	pcm_x_queue_depth
 	pcm_x_queue_active_tags
@@ -88,7 +102,6 @@ my @positive_pcm_lifecycle_keys = qw(
 	pcm_x_queue_admit_count
 	pcm_x_queue_confirm_count
 	pcm_x_queue_promotion_count
-	pcm_x_queue_transfer_count
 	pcm_x_queue_complete_count
 	pcm_x_queue_revoke_count
 	pcm_x_queue_wait_count
@@ -269,6 +282,7 @@ my $quad = PostgreSQL::Test::ClusterQuad->new_quad(
 	'pcm_xq_liveness',
 	quorum_voting_disks => 3,
 	shared_data         => 1,
+	shared_system_identifier => 1,
 	extra_conf          => [
 		'autovacuum = off',
 		'cluster.read_scache = on',
@@ -288,6 +302,20 @@ my $quad = PostgreSQL::Test::ClusterQuad->new_quad(
 		'cluster.cssd_dead_deadband_factor = 10',
 	]);
 
+my @pgrd_voting_disks = $quad->voting_disk_paths;
+die "D10-11 requires exactly three voting disks\n"
+	unless scalar(@pgrd_voting_disks) == 3;
+for my $path (@pgrd_voting_disks)
+{
+	truncate($path, $pgrd_voting_file_bytes)
+		or die "extend $path to PGRD minimum: $!";
+}
+for my $node ($quad->nodes)
+{
+	$node->append_conf('postgresql.conf',
+		"cluster.voting_disk_size_bytes = $pgrd_voting_file_bytes\n");
+}
+
 $quad->start_quad;
 usleep(3_000_000);
 
@@ -302,6 +330,40 @@ for my $from (0 .. 3)
 			"L1 node$from sees node$to connected");
 	}
 }
+
+# Establish the already-frozen pre-OPEN PGRD authority independently in
+# every postmaster.  The utility must remain RF_DEFERRED: this episode may
+# publish only the strict-majority descriptor plus its exact shared mirror,
+# never open ordinary R4 TARGET or change the workload below.
+my $pgrd_mirror
+	= $quad->shared_data_root . '/pg_undo/pgrac_undo_root.control';
+my $pgrd_root = $quad->shared_data_root . '/pg_undo';
+mkdir $pgrd_root or die "mkdir $pgrd_root: $!";
+for my $node ($quad->nodes)
+{
+	$node->poll_query_until('postgres',
+		q{SELECT in_quorum FROM pg_cluster_quorum_state}, 't')
+		or die "pre-OPEN M4 voting-disk majority did not become current\n";
+	my ($activation_rc, $activation_stdout, $activation_stderr);
+	my $activation_deadline = time() + 15;
+	while (time() < $activation_deadline)
+	{
+		($activation_rc, $activation_stdout, $activation_stderr)
+			= $node->psql('postgres',
+				'ALTER SYSTEM ENABLE RAC TWO_STAGE ROLLING UPDATES ALL',
+				timeout => 30);
+		last if $activation_rc != 0
+			&& $activation_stderr
+				=~ /(?:RF_DEFERRED|CONDITION_NOT_YET_MET)/;
+		usleep(100_000);
+	}
+	die "pre-OPEN M4 PGRD setup did not remain RF_DEFERRED: "
+		. ($activation_stderr // '<undef>')
+		unless defined($activation_rc) && $activation_rc != 0
+		&& defined($activation_stderr)
+		&& $activation_stderr =~ /(?:RF_DEFERRED|CONDITION_NOT_YET_MET)/;
+}
+die "pre-OPEN M4 PGRD mirror was not published\n" unless -f $pgrd_mirror;
 
 for my $node ($quad->nodes)
 {
@@ -422,8 +484,9 @@ for my $i (0 .. 3)
 # Build a deterministic sole-requester S source before the four-writer leg.
 # The cache-off INSERT above releases node0's X to N at content-lock unlock.
 # No other node has touched this relation, so this cache-on node0 read is the
-# unique N->S grant.  The following node0 UPDATE must therefore take the
-# sole-requester S->X handoff, not a remote-source transfer or cached-X path.
+# unique N->S grant.  The following node0 UPDATE must therefore exercise the
+# Resource-X sole-S conversion without falling back to the legacy fused
+# handoff/A-record path.
 my ($self_read_rc, $self_read_out, $self_read_err) = $quad->node0->psql(
 	'postgres', q{SELECT v FROM pcm_xq_self WHERE id = 1}, timeout => 30);
 is($self_read_rc, 0, 'L2S sole requester acquired the only S copy');
@@ -448,26 +511,14 @@ my ($self_write_rc, $self_write_out, $self_write_err) = $quad->node0->psql(
 is($self_write_rc, 0, 'L2S sole-S requester completed S-to-X conversion')
 	or diag("L2S sole-S write stdout=[$self_write_out] stderr=[$self_write_err]");
 
-my ($self_handoff_after, $self_handoff_drain_after);
-my $self_drain_deadline = time() + 15;
-# NB: a do{}while body is not a loop block in Perl -- "last" inside one is a
-# runtime error that fired exactly when the polled counters advanced.
-while (1)
-{
-	$self_handoff_after = state_int($quad->node0, 'gcs',
-		'pcm_x_self_handoff_count');
-	$self_handoff_drain_after = state_int($quad->node0, 'gcs',
-		'pcm_x_self_handoff_drain_count');
-	last if $self_handoff_after > $self_handoff_before
-		&& $self_handoff_drain_after > $self_handoff_drain_before;
-	last if time() >= $self_drain_deadline;
-	usleep(100_000);
-}
-
-cmp_ok($self_handoff_after - $self_handoff_before, '>', 0,
-	'L2S sole-requester S source exercised the fused revoke-to-grant handoff');
-cmp_ok($self_handoff_drain_after - $self_handoff_drain_before, '>', 0,
-	'L2S sole-requester S source released its immutable record at DRAIN');
+my $self_handoff_after = state_int($quad->node0, 'gcs',
+	'pcm_x_self_handoff_count');
+my $self_handoff_drain_after = state_int($quad->node0, 'gcs',
+	'pcm_x_self_handoff_drain_count');
+is($self_handoff_after, $self_handoff_before,
+	'L2S Resource-X sole-S conversion did not enter the legacy fused handoff');
+is($self_handoff_drain_after, $self_handoff_drain_before,
+	'L2S Resource-X sole-S conversion did not retain a legacy immutable record');
 for my $i (0 .. 3)
 {
 	is(state_int($quad->node($i), 'pcm', 'pcm_x_runtime_state'), 1,
@@ -495,11 +546,11 @@ ok(write_retry($quad->node0, 'CHECKPOINT'),
 	'L2F baseline checkpointed before the dirty retain leg');
 
 # The source INSERT leaves an uncheckpointed dirty X image on node0.  A
-# different node must materialize that exact image and retain it only after
-# FlushBuffer's caller-owned pin contract is satisfied.  This is a behavioral
-# gate: the immutable staging counter proves the DATA worker reached the dirty
-# remote-source leg, while h_pi_write_note_count increments only after
-# FlushBuffer's smgrwrite returned, proving the real flush completed.
+# different node must install that exact Resource-X image only after the
+# holder-side FlushBuffer contract is satisfied.  This is a behavioral gate:
+# the legacy A-record counter must stay unchanged, while
+# h_pi_write_note_count increments only after FlushBuffer's smgrwrite returned,
+# proving the holder-side physical flush completed before ownership commit.
 my $dirty_stage_before = state_int($quad->node0, 'gcs',
 	'dedup_pcm_x_stage_count');
 my $dirty_flush_before = state_int($quad->node0, 'xnode_lever',
@@ -540,9 +591,9 @@ my ($dirty_retain_rc, $dirty_retain_out, $dirty_retain_err) = $quad->node1->psql
 is($dirty_retain_rc, 0,
 	'L2F remote writer completed the dirty retain/flush lifecycle')
 	or diag("L2F dirty retain stdout=[$dirty_retain_out] stderr=[$dirty_retain_err]");
-cmp_ok(state_int($quad->node0, 'gcs', 'dedup_pcm_x_stage_count')
-		- $dirty_stage_before, '>', 0,
-	'L2F source DATA worker materialized the immutable dirty image');
+is(state_int($quad->node0, 'gcs', 'dedup_pcm_x_stage_count'),
+	$dirty_stage_before,
+	'L2F source DATA worker did not fabricate a legacy immutable A-record');
 cmp_ok(state_int($quad->node0, 'xnode_lever', 'h_pi_write_note_count')
 		- $dirty_flush_before, '>', 0,
 	'L2F source FlushBuffer completed smgrwrite before ownership commit');
@@ -607,8 +658,14 @@ my @pcm_before_by_node = map {
 my @lmd_before_by_node = map {
 	state_snapshot($quad->node($_), 'lmd', \@pcm_x_lmd_keys)
 } (0 .. 3);
+my @resource_x_o1_before_by_node = map {
+	state_snapshot($quad->node($_), 'pcm', \@resource_x_o1_keys)
+} (0 .. 3);
 my %pcm_before = %{aggregate_snapshots(\@pcm_before_by_node, \@pcm_x_pcm_keys)};
 my %lmd_before = %{aggregate_snapshots(\@lmd_before_by_node, \@pcm_x_lmd_keys)};
+my %resource_x_o1_before = %{
+	aggregate_snapshots(\@resource_x_o1_before_by_node, \@resource_x_o1_keys)
+};
 my $queue_before = $pcm_before{pcm_x_queue_enqueue_count};
 my $denied_before = 0;
 $denied_before += state_int($quad->node($_), 'gcs',
@@ -768,8 +825,14 @@ my @pcm_after_by_node = @{$pcm_after_by_node_ref};
 my @lmd_after_by_node = map {
 	state_snapshot($quad->node($_), 'lmd', \@pcm_x_lmd_keys)
 } (0 .. 3);
+my @resource_x_o1_after_by_node = map {
+	state_snapshot($quad->node($_), 'pcm', \@resource_x_o1_keys)
+} (0 .. 3);
 my %pcm_after = %{aggregate_snapshots(\@pcm_after_by_node, \@pcm_x_pcm_keys)};
 my %lmd_after = %{aggregate_snapshots(\@lmd_after_by_node, \@pcm_x_lmd_keys)};
+my %resource_x_o1_after = %{
+	aggregate_snapshots(\@resource_x_o1_after_by_node, \@resource_x_o1_keys)
+};
 my $queue_after = $pcm_after{pcm_x_queue_enqueue_count};
 my $denied_after = 0;
 $denied_after += state_int($quad->node($_), 'gcs',
@@ -935,13 +998,16 @@ cmp_ok($queue_after - $queue_before, '>=', 4,
 	'L3 aggregate PCM-X queue admission floor reached four');
 cmp_ok($denied_after - $denied_before, '>', 0,
 	'L3 Shape-B arbitration denied an in-flight legacy reader without a client error');
-cmp_ok($passive_s_after - $passive_s_before, '>', 0,
-	'L3 exact queue INVALIDATE exercised passive-pinned S release');
+is($passive_s_after, $passive_s_before,
+	'L3 Resource-X type-17 drain did not enter legacy passive-S INVALIDATE');
 for my $key (@positive_pcm_lifecycle_keys)
 {
 	cmp_ok($pcm_after{$key} - $pcm_before{$key}, '>', 0,
 		"L3 PCM-X lifecycle $key advanced");
 }
+is($pcm_after{pcm_x_queue_transfer_count},
+	$pcm_before{pcm_x_queue_transfer_count},
+	'L3 Resource-X target-only lifecycle did not enter legacy queue transfer');
 for my $key (@zero_pcm_failure_keys)
 {
 	is($pcm_after{$key} - $pcm_before{$key}, 0,
@@ -955,6 +1021,36 @@ for my $key (@positive_wfg_keys)
 {
 	cmp_ok($lmd_after{$key} - $lmd_before{$key}, '>', 0,
 		"L3 PCM-X WFG lifecycle $key advanced");
+}
+my $remote_install_delta
+	= $resource_x_o1_after{remote_install_observed_count}
+	- $resource_x_o1_before{remote_install_observed_count};
+my $grant_after_image_delta
+	= $resource_x_o1_after{remote_grant_after_image_count}
+	- $resource_x_o1_before{remote_grant_after_image_count};
+my $image_at_or_after_grant_delta
+	= $resource_x_o1_after{remote_image_at_or_after_grant_count}
+	- $resource_x_o1_before{remote_image_at_or_after_grant_count};
+cmp_ok($remote_install_delta, '>', 0,
+	'L3 Resource-X remote install cohort advanced on the four-node happy path');
+is($grant_after_image_delta + $image_at_or_after_grant_delta,
+	$remote_install_delta,
+	'L3 every remote install entered exactly one Resource-X ordering bucket');
+for my $key (qw(
+	remote_episode_excluded_no_install
+	remote_episode_excluded_missing_grant
+	remote_episode_excluded_missing_image))
+{
+	is($resource_x_o1_after{$key} - $resource_x_o1_before{$key}, 0,
+		"L3 Resource-X happy path left $key unchanged");
+}
+for my $key (qw(
+	last_remote_t_image_us
+	last_remote_t_grant_us
+	last_remote_t_install_us))
+{
+	cmp_ok($resource_x_o1_after{$key}, '>', 0,
+		"L3 Resource-X happy path published nonzero $key");
 }
 # Atomic replacement with a zero-blocker set removes the old waiter edges but
 # intentionally counts as a replace, so an explicit remove call is not
@@ -1085,17 +1181,17 @@ is($flush_error_runtime_after, 0,
 	'L5F node0 PCM-X runtime moved to RECOVERY_BLOCKED');
 cmp_ok($flush_error_blocked_after - $flush_error_blocked_before, '>', 0,
 	'L5F recovery-blocked counter recorded the finish error');
-cmp_ok(state_int($quad->node0, 'gcs', 'dedup_pcm_x_stage_count')
-		- $flush_error_stage_before, '>', 0,
-	'L5F immutable A-record reached MATERIALIZED_UNCOMMITTED before ERROR');
+is(state_int($quad->node0, 'gcs', 'dedup_pcm_x_stage_count'),
+	$flush_error_stage_before,
+	'L5F Resource-X pending pair did not fabricate a legacy A-record');
 my $flush_error_log = substr(slurp_file($quad->node0->logfile),
 	$flush_error_log_offset);
 like($flush_error_log,
-	qr/PCM-X finish-error evidence exact.*?preserve_result=12 retained=true worker=\d+ tag=\d+\/\d+\/\Q$flush_error_relfilenode\E\/0\/0 requester=1 backend=\d+ request_id=\d+ ticket=\d+ queue_generation=\d+ grant_generation=\d+ image_id=\d+ reservation_token=\d+ source_state=\d+/s,
-	'L5F exact immutable A-record remains retained after ERROR');
+	qr/PCM-X Resource-X finish-error evidence exact.*?retained=true tag=\d+\/\d+\/\Q$flush_error_relfilenode\E\/0\/0 requester=1 assertion_sequence=\d+ base=\d+ formation=\d+ master_session=\d+ source_generation=\d+ reservation_token=\d+ source_state=\d+/s,
+	'L5F exact Resource-X pair remains pending after ERROR');
 is(state_int($quad->node0, 'gcs', 'dedup_pcm_x_release_count'),
 	$flush_error_release_before,
-	'L5F ERROR did not release immutable evidence or its REVOKING fence');
+	'L5F ERROR did not release legacy evidence or the Resource-X REVOKING fence');
 like($flush_error_log,
 	qr/injected PCM-X retained-image FlushBuffer failure/,
 	'L5F exact pre-smgrwrite finish FlushBuffer ERROR reached the DATA worker');

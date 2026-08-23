@@ -113,6 +113,8 @@ static int reservation_cancel_calls;
 static int waiter_cancel_calls;
 static int local_release_calls;
 static int mirror_release_calls;
+static int generic_promote_calls;
+static int remote_promote_calls;
 static int cancel_wait_calls;
 static int cleanup_release_calls;
 static int semantic_enter_calls;
@@ -139,6 +141,7 @@ static int frame_reserve_event;
 static int provision_event;
 static int provision_abort_event;
 static int local_release_event;
+static int mirror_release_event;
 static int semantic_leave_event;
 static int pin_error_local_cleanup_event;
 static int unpin_event;
@@ -502,7 +505,17 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid pg_attribute_unused
 								   int32 self_node_id pg_attribute_unused(),
 								   uint64 gen_snapshot)
 {
+	generic_promote_calls++;
 	UT_ASSERT_EQ(gen_snapshot, 77);
+	return fake_promote_result;
+}
+
+ClusterGrdEntryResult
+cluster_grd_promote_remote_grant_exact(
+	const ClusterResId *resid pg_attribute_unused(),
+	const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	remote_promote_calls++;
 	return fake_promote_result;
 }
 
@@ -539,6 +552,7 @@ cluster_grd_release_holder_by_id(const ClusterResId *resid pg_attribute_unused()
 								 const ClusterGrdHolderId *holder pg_attribute_unused())
 {
 	mirror_release_calls++;
+	mirror_release_event = ++event_sequence;
 	return CLUSTER_GRD_ENTRY_OK;
 }
 
@@ -805,6 +819,7 @@ reset_fixture(void)
 	reply_delete_calls = reply_poll_calls = 0;
 	reservation_cancel_calls = waiter_cancel_calls = local_release_calls = 0;
 	mirror_release_calls = cancel_wait_calls = cleanup_release_calls = 0;
+	generic_promote_calls = remote_promote_calls = 0;
 	semantic_enter_calls = semantic_ordinary_recheck_calls = 0;
 	semantic_census_recheck_calls = semantic_leave_calls = 0;
 	sample_calls = copy_calls = 0;
@@ -814,7 +829,8 @@ reset_fixture(void)
 	semantic_enter_event = current_exit_hook_event = smgr_exit_hook_event = 0;
 	first_root_resolve_event = final_root_resolve_event = 0;
 	sample_event = frame_reserve_event = provision_event = 0;
-	provision_abort_event = local_release_event = semantic_leave_event = 0;
+	provision_abort_event = local_release_event = mirror_release_event = 0;
+	semantic_leave_event = 0;
 	pin_error_local_cleanup_event = unpin_event = cleanup_release_event = 0;
 	last_semantic_enter_side = CLUSTER_SEMANTIC_TARGET_SIDE;
 	last_outbound_len = 0;
@@ -906,13 +922,32 @@ UT_TEST(test_live_owner_resident_preregisters_persistent_exit_hooks)
 	fake_sample_generation = (ClusterUndoBlock0Generation){ true, 0 };
 	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_ensure_resident(
 		&key, 1000), CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(smgr_exit_hook_ensure_calls, 1);
+	/* The outer live-owner cleanup and the nested generic guard each ensure
+	 * the same idempotent persistent hook; only one callback is registered. */
+	UT_ASSERT_EQ(smgr_exit_hook_ensure_calls, 2);
 	UT_ASSERT(fake_exit_lifo_ok);
 	UT_ASSERT_EQ(fake_before_exit_count, 2);
 	UT_ASSERT_EQ(fake_before_exit_stack[0].function, current_backend_exit);
 	UT_ASSERT_EQ(fake_before_exit_stack[1].function, fake_smgr_exit);
 	UT_ASSERT(current_exit_hook_event < semantic_enter_event);
 	UT_ASSERT(smgr_exit_hook_event < semantic_enter_event);
+}
+
+UT_TEST(test_batch_preflight_and_eight_defensive_ensures_register_once)
+{
+	int callbacks_before;
+	int i;
+
+	reset_fixture();
+	callbacks_before = fake_before_exit_count;
+	UT_ASSERT_EQ(callbacks_before, 2);
+	for (i = 0; i < 9; i++)
+		cluster_undo_block0_current_ensure_exit_hooks();
+	UT_ASSERT_EQ(smgr_exit_hook_ensure_calls, 9);
+	UT_ASSERT_EQ(fake_before_exit_count, callbacks_before);
+	UT_ASSERT_EQ(fake_before_exit_stack[0].function, current_backend_exit);
+	UT_ASSERT_EQ(fake_before_exit_stack[1].function, fake_smgr_exit);
+	UT_ASSERT(fake_exit_lifo_ok);
 }
 
 UT_TEST(test_startup_fenced_xcur_begin_end_owns_exact_private_phase)
@@ -935,7 +970,7 @@ UT_TEST(test_startup_fenced_xcur_begin_end_owns_exact_private_phase)
 	UT_ASSERT(!cluster_undo_block0_current_startup_fenced_end(&guard));
 }
 
-UT_TEST(test_begin_installs_before_exact_72_byte_remote_send)
+UT_TEST(test_begin_preregisters_persistent_hooks_before_exact_72_byte_remote_send)
 {
 	ClusterUndoBlock0CurrentGuard guard = { 0 };
 	ClusterUndoBlock0LogicalKey key = test_key(1);
@@ -946,6 +981,8 @@ UT_TEST(test_begin_installs_before_exact_72_byte_remote_send)
 	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000,
 													 &guard, &failure),
 			 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT_EQ(smgr_exit_hook_ensure_calls, 1);
+	UT_ASSERT(fake_exit_lifo_ok);
 	UT_ASSERT(reserve_event < insert_event && insert_event < outbound_event);
 	UT_ASSERT_EQ(last_outbound_len, 72);
 	UT_ASSERT_EQ(last_outbound.opcode, GES_REQ_OPCODE_REQUEST);
@@ -1226,6 +1263,8 @@ UT_TEST(test_delivered_grant_promotes_to_held)
 	UT_ASSERT_EQ(current_guard_data(&guard)->phase, CLUSTER_UNDO_BLOCK0_CURRENT_PHASE_HELD);
 	UT_ASSERT(!current_guard_data(&guard)->reply_installed);
 	UT_ASSERT(!current_guard_data(&guard)->reservation_held);
+	UT_ASSERT_EQ(remote_promote_calls, 1);
+	UT_ASSERT_EQ(generic_promote_calls, 0);
 	cluster_undo_block0_current_cancel(&guard);
 }
 
@@ -1244,6 +1283,8 @@ UT_TEST(test_remote_grant_with_failed_promote_stages_reliable_release)
 	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
 				 CLUSTER_UNDO_BLOCK0_CURRENT_FAILED);
 	UT_ASSERT_EQ(failure, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(remote_promote_calls, 1);
+	UT_ASSERT_EQ(generic_promote_calls, 0);
 	UT_ASSERT_EQ(cleanup_release_calls, 1);
 	UT_ASSERT_EQ(last_cleanup_release.opcode, GES_REQ_OPCODE_RELEASE);
 	UT_ASSERT_EQ(cancel_wait_calls, 1);
@@ -1265,6 +1306,8 @@ UT_TEST(test_local_grant_with_failed_promote_drains_local_holder)
 				 &key, CLUSTER_UNDO_BLOCK0_XCUR, 1000, &guard, &failure),
 				 CLUSTER_UNDO_BLOCK0_CURRENT_FAILED);
 	UT_ASSERT_EQ(failure, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(generic_promote_calls, 1);
+	UT_ASSERT_EQ(remote_promote_calls, 0);
 	UT_ASSERT_EQ(local_release_calls, 1);
 	UT_ASSERT_EQ(cleanup_release_calls, 0);
 	UT_ASSERT_EQ(current_guard_data(&guard)->phase,
@@ -1389,6 +1432,22 @@ UT_TEST(test_release_retains_mirror_until_exact_ack_is_consumed)
 			 CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED);
 	UT_ASSERT_EQ(last_poll_key.request_opcode, GES_REQ_OPCODE_RELEASE);
 	UT_ASSERT_EQ(mirror_release_calls, 1);
+}
+
+UT_TEST(test_remote_held_cancel_stages_release_then_drops_exact_local_mirror)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+
+	reset_fixture();
+	acquire_remote_held(&guard);
+	UT_ASSERT_EQ(mirror_release_calls, 0);
+	cluster_undo_block0_current_cancel(&guard);
+	UT_ASSERT_EQ(cleanup_release_calls, 1);
+	UT_ASSERT_EQ(mirror_release_calls, 1);
+	UT_ASSERT(cleanup_release_event > 0);
+	UT_ASSERT(mirror_release_event > cleanup_release_event);
+	UT_ASSERT_EQ(current_guard_data(&guard)->phase,
+				 CLUSTER_UNDO_BLOCK0_CURRENT_CLEANUP);
 }
 
 UT_TEST(test_release_reuses_exact_canonical_72_byte_ges_shape)
@@ -1964,12 +2023,13 @@ UT_TEST(test_backend_exit_stages_exact_cleanup_without_poll_or_wait)
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(46);
 	UT_RUN(test_key_guard_and_phase_abi);
 	UT_RUN(test_startup_namespace_check_rejects_every_reserved_or_unfrozen_type);
 	UT_RUN(test_live_owner_resident_preregisters_persistent_exit_hooks);
+	UT_RUN(test_batch_preflight_and_eight_defensive_ensures_register_once);
 	UT_RUN(test_startup_fenced_xcur_begin_end_owns_exact_private_phase);
-	UT_RUN(test_begin_installs_before_exact_72_byte_remote_send);
+	UT_RUN(test_begin_preregisters_persistent_hooks_before_exact_72_byte_remote_send);
 	UT_RUN(test_census_borrows_one_caller_token_without_ordinary_reentry_or_leave);
 	UT_RUN(test_live_owner_source_borrows_only_xcur_and_target_cannot_produce);
 	UT_RUN(test_live_owner_resident_re_admit_obeys_exact_resource_order);
@@ -1987,6 +2047,7 @@ main(void)
 	UT_RUN(test_same_resid_nesting_refuses_second_guard_without_touching_first);
 	UT_RUN(test_preflight_failure_restores_reusable_zero_guard);
 	UT_RUN(test_release_retains_mirror_until_exact_ack_is_consumed);
+	UT_RUN(test_remote_held_cancel_stages_release_then_drops_exact_local_mirror);
 	UT_RUN(test_release_reuses_exact_canonical_72_byte_ges_shape);
 	UT_RUN(test_explicit_perpetual_timeout_survives_acquire_and_release);
 	UT_RUN(test_perpetual_acquire_retransmits_past_attempt_threshold);

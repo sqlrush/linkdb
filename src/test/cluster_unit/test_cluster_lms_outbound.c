@@ -53,6 +53,7 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope prototype */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_write_fence.h"
@@ -66,12 +67,49 @@
 
 UT_DEFINE_GLOBALS();
 
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
 /* Desired R10 C-intent boundary.  The standalone ring test supplies the
  * semantic-owner callbacks below and exercises the real ring/drain object. */
 extern bool cluster_lms_outbound_enqueue_resource_x_intent(
 	int worker_id, const ResourceXIntentSlot *intent,
 	uint32 connection_generation, uint64 deadline_us);
 extern int cluster_lms_outbound_resource_x_intent_pump(void);
+extern ClusterPcmOwnResult
+cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
+	int worker_id, uint32 dest_node_id, const void *payload,
+	uint16 payload_len, const ClusterPcmOwnSnapshot *expected_revoking,
+	ClusterLmsRemoteSStatusHandle *handle_out);
+extern ClusterPcmOwnResult
+cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
+	const ClusterLmsRemoteSStatusHandle *handle,
+	const ClusterPcmOwnSnapshot *released_n);
+extern ClusterPcmOwnResult
+cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
+	const ClusterLmsRemoteSStatusHandle *handle);
+extern bool cluster_lms_outbound_resource_x_transport_snapshot(
+	ClusterLmsResourceXTransportSnapshot *out);
 
 /* ============================================================
  * PG-runtime stubs.
@@ -227,7 +265,7 @@ cluster_pcm_lock_resource_x_grant_intent_complete_exact(
 }
 
 ResourceXIntentProbeResult
-cluster_pcm_lock_resource_x_grant_intent_probe_exact(
+cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,
 	uint16 payload_capacity, uint32 *examined_out)
 {
@@ -250,15 +288,6 @@ cluster_pcm_lock_resource_x_grant_intent_probe_exact(
 		return RESOURCE_X_INTENT_PROBE_FOUND;
 	}
 	return ut_resource_x_probe_mode;
-}
-
-ResourceXIntentProbeResult
-cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
-	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out,
-	uint16 payload_capacity, uint32 *examined_out)
-{
-	return cluster_pcm_lock_resource_x_grant_intent_probe_exact(
-		probe_budget, slot_out, payload_out, payload_capacity, examined_out);
 }
 
 ResourceXApplyResult
@@ -735,6 +764,20 @@ ut_resource_x_image_intent(int32 destination_node)
 	return intent;
 }
 
+static ResourceXIntentSlot
+ut_resource_x_settlement_intent(int32 destination_node)
+{
+	ResourceXIntentSlot intent = ut_resource_x_grant_intent(destination_node);
+
+	intent.payload_bytes = RESOURCE_X_SHORT_V1_BYTES;
+	intent.kind = RESOURCE_X_WIRE_INSTALL_SETTLEMENT;
+	intent.body.assertion.requester_node = cluster_node_id;
+	intent.body.owner_generation = intent.logical_generation;
+	intent.body.owner_node = (uint32)cluster_node_id;
+	intent.body.owner_kind = RESOURCE_X_INTENT_OWNER_REQUESTER_SETTLEMENT;
+	return intent;
+}
+
 /* ============================================================
  * Tests.
  * ============================================================ */
@@ -1161,6 +1204,8 @@ UT_TEST(test_cap_bound_frame_sends_on_exact_connection_capability)
 
 UT_TEST(test_resource_x_intent_admission_stages_and_completion_clears_owner)
 {
+	ClusterLmsResourceXTransportSnapshot after;
+	ClusterLmsResourceXTransportSnapshot before;
 	ResourceXIntentSlot intent;
 
 	ut_reset_log();
@@ -1172,14 +1217,25 @@ UT_TEST(test_resource_x_intent_admission_stages_and_completion_clears_owner)
 	ut_peer_cap_generation[UT_PEER_X] = 77;
 	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
 
+	UT_ASSERT(cluster_lms_outbound_resource_x_transport_snapshot(&before));
+	UT_ASSERT_EQ(before.staged_count, 0);
 	UT_ASSERT(cluster_lms_outbound_enqueue_resource_x_intent(
 		0, &intent, 77, UINT64_MAX));
 	UT_ASSERT_EQ(ut_resource_x_stage_count, 1);
 	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
 		RESOURCE_X_INTENT_SLOT_STAGED);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_staged_count(), 1);
+	UT_ASSERT(cluster_lms_outbound_resource_x_transport_snapshot(&after));
+	UT_ASSERT_EQ(after.staged_count, 1);
+	UT_ASSERT(after.mutation_sequence > before.mutation_sequence);
+	before = after;
 	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_staged_count(), 0);
+	UT_ASSERT(cluster_lms_outbound_resource_x_transport_snapshot(&after));
+	UT_ASSERT_EQ(after.staged_count, 0);
+	UT_ASSERT(after.mutation_sequence > before.mutation_sequence);
 	UT_ASSERT_EQ(ut_sent_n, 1);
 	UT_ASSERT_EQ(ut_sent_log[0].msg_type, RESOURCE_X_MSG_IMAGE_OR_GRANT);
 	UT_ASSERT_EQ(ut_sent_log[0].payload_len, RESOURCE_X_PROOF_V1_BYTES);
@@ -1217,7 +1273,34 @@ UT_TEST(test_resource_x_block_intent_uses_type17_and_control_payload)
 	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
 }
 
-UT_TEST(test_resource_x_image_intent_preserves_proof_bound_generation)
+UT_TEST(test_resource_x_settlement_intent_uses_type38_and_short_payload)
+{
+	ResourceXIntentSlot intent;
+
+	ut_reset_log();
+	intent = ut_resource_x_settlement_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = intent;
+	ut_resource_x_owner_payload[0] = 0xAB;
+	ut_peer_capabilities[UT_PEER_X]
+		= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 86;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+
+	UT_ASSERT(cluster_lms_outbound_enqueue_resource_x_intent(
+		0, &intent, 86, UINT64_MAX));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].msg_type,
+		RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len,
+		RESOURCE_X_SHORT_V1_BYTES);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAB);
+	UT_ASSERT_EQ(ut_resource_x_rebind_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_rebind_generation, 86);
+	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
+}
+
+UT_TEST(test_resource_x_image_intent_rebinds_transport_generation)
 {
 	ResourceXIntentSlot intent;
 
@@ -1238,8 +1321,9 @@ UT_TEST(test_resource_x_image_intent_preserves_proof_bound_generation)
 	UT_ASSERT_EQ(ut_sent_log[0].msg_type, RESOURCE_X_MSG_IMAGE_OR_GRANT);
 	UT_ASSERT_EQ(ut_sent_log[0].payload_len, RESOURCE_X_IMAGE_V1_BYTES);
 	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAA);
-	UT_ASSERT_EQ(ut_resource_x_decode_count, 1);
-	UT_ASSERT_EQ(ut_resource_x_rebind_count, 0);
+	UT_ASSERT_EQ(ut_resource_x_decode_count, 0);
+	UT_ASSERT_EQ(ut_resource_x_rebind_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_rebind_generation, 84);
 	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
 
 	ut_reset_log();
@@ -1251,12 +1335,15 @@ UT_TEST(test_resource_x_image_intent_preserves_proof_bound_generation)
 	ut_peer_cap_generation[UT_PEER_X] = 85;
 	UT_ASSERT(cluster_lms_outbound_enqueue_resource_x_intent(
 		0, &intent, 85, UINT64_MAX));
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 0);
-	UT_ASSERT_EQ(ut_sent_n, 0);
-	UT_ASSERT_EQ(ut_resource_x_rebind_count, 0);
-	UT_ASSERT_EQ(ut_resource_x_rearm_count, 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_resource_x_decode_count, 0);
+	UT_ASSERT_EQ(ut_resource_x_rebind_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_rebind_generation, 85);
+	UT_ASSERT_EQ(ut_resource_x_rearm_count, 0);
+	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
 	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
-		RESOURCE_X_INTENT_SLOT_ARMED);
+		RESOURCE_X_INTENT_SLOT_EMPTY);
 }
 
 UT_TEST(test_resource_x_intent_transport_refusal_rearms_without_ring_copy)
@@ -1354,20 +1441,239 @@ UT_TEST(test_resource_x_intent_pump_stages_found_owner_on_tag_shard)
 	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
 }
 
+UT_TEST(test_resource_x_intent_pump_not_admitted_preserves_owner)
+{
+	ResourceXIntentSlot intent;
+
+	ut_reset_log();
+	intent = ut_resource_x_grant_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = intent;
+	ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_FOUND;
+
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
+	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 2);
+	UT_ASSERT_EQ(ut_resource_x_stage_count, 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+		RESOURCE_X_INTENT_SLOT_ARMED);
+	UT_ASSERT(ut_resource_x_owner_slot.last_attempt_us != 0);
+	UT_ASSERT_EQ(ut_resource_x_complete_count, 0);
+}
+
 UT_TEST(test_resource_x_intent_pump_is_bounded_to_sixteen_four_probes)
 {
 	ut_reset_log();
 	ut_resource_x_probe_mode = RESOURCE_X_INTENT_PROBE_MORE;
+	ut_wakeup_count = 0;
 
 	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_intent_pump(), 0);
 	UT_ASSERT_EQ(ut_resource_x_probe_call_count, 16);
 	UT_ASSERT_EQ(ut_resource_x_probe_max_budget, 4);
+	UT_ASSERT_EQ(ut_wakeup_count, 1);
+}
+
+UT_TEST(test_resource_x_type14_assert_and_local_proof_share_one_data_fifo)
+{
+	uint8 assertion[RESOURCE_X_CONTROL_V1_BYTES] = { 0xA1 };
+	uint8 local_proof[RESOURCE_X_SHORT_V1_BYTES] = { 0xA2 };
+	int worker_id = 1;
+
+	ut_reset_log();
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT(cluster_lms_outbound_enqueue(
+		worker_id, RESOURCE_X_MSG_ASSERT_X, UT_PEER_X,
+		assertion, sizeof(assertion)));
+	UT_ASSERT(cluster_lms_outbound_enqueue(
+		worker_id, RESOURCE_X_MSG_ASSERT_X, UT_PEER_X,
+		local_proof, sizeof(local_proof)));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 2);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_staged_count(), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 2);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xA1);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len, RESOURCE_X_CONTROL_V1_BYTES);
+	UT_ASSERT_EQ(ut_sent_log[1].marker, 0xA2);
+	UT_ASSERT_EQ(ut_sent_log[1].payload_len, RESOURCE_X_SHORT_V1_BYTES);
+}
+
+/* The approved remote-S adaptation first retains an unsendable type-18 in
+ * the existing DATA ring.  Only the exact post-revoke N tuple may make it
+ * READY; transport/capability failures retain that READY proof. */
+UT_TEST(test_resource_x_remote_s_status_is_pending_then_exact_ready)
+{
+	ClusterLmsRemoteSStatusHandle handle;
+	ClusterLmsResourceXTransportSnapshot snapshot;
+	uint64 transport_sequence;
+	ClusterPcmOwnSnapshot released;
+	ClusterPcmOwnSnapshot revoking;
+	uint8 status[RESOURCE_X_CONTROL_V1_BYTES] = { 0xB1 };
+	int worker_id = 1;
+
+	ut_reset_log();
+	memset(&handle, 0, sizeof(handle));
+	memset(&revoking, 0, sizeof(revoking));
+	revoking.tag.spcOid = 11;
+	revoking.tag.dbOid = 12;
+	revoking.tag.relNumber = 13;
+	revoking.tag.forkNum = MAIN_FORKNUM;
+	revoking.tag.blockNum = 14;
+	revoking.generation = 17;
+	revoking.reservation_token = 9;
+	revoking.flags = PCM_OWN_FLAG_REVOKING;
+	revoking.pcm_state = (uint8)PCM_STATE_S;
+	UT_ASSERT(cluster_lms_outbound_resource_x_transport_snapshot(&snapshot));
+	transport_sequence = snapshot.mutation_sequence;
+
+	UT_ASSERT_EQ(
+		cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
+			worker_id, UT_PEER_X, status, sizeof(status),
+			&revoking, &handle),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT(handle.slot_cookie != 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_staged_count(), 1);
+	UT_ASSERT(cluster_lms_outbound_resource_x_transport_snapshot(&snapshot));
+	UT_ASSERT(snapshot.mutation_sequence > transport_sequence);
+	transport_sequence = snapshot.mutation_sequence;
+
+	/* PENDING is retained but never transport-visible. */
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 1);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+
+	released = revoking;
+	released.generation += 2;
+	released.flags = 0;
+	released.pcm_state = (uint8)PCM_STATE_N;
+	UT_ASSERT_EQ(
+		cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
+			&handle, &released),
+		CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 1);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+
+	released.generation = revoking.generation + 1;
+	UT_ASSERT_EQ(
+		cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
+			&handle, &released),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT(cluster_lms_outbound_resource_x_transport_snapshot(&snapshot));
+	UT_ASSERT(snapshot.mutation_sequence > transport_sequence);
+	transport_sequence = snapshot.mutation_sequence;
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 1);
+
+	/* READY without an exact capability is retained, not dropped. */
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 1);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+
+	ut_peer_capabilities[UT_PEER_X]
+		= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 88;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_HARD_ERROR;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 1);
+	UT_ASSERT_EQ(ut_resource_x_rebind_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_rebind_generation, 88);
+
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_resource_x_staged_count(), 0);
+	UT_ASSERT(cluster_lms_outbound_resource_x_transport_snapshot(&snapshot));
+	UT_ASSERT(snapshot.mutation_sequence > transport_sequence);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+	UT_ASSERT_EQ(ut_sent_log[1].msg_type,
+		RESOURCE_X_MSG_BLOCKED_TO_N);
+	UT_ASSERT_EQ(ut_sent_log[1].payload_len,
+		RESOURCE_X_CONTROL_V1_BYTES);
+	UT_ASSERT_EQ(ut_sent_log[1].marker, 0xB1);
+}
+
+UT_TEST(test_resource_x_remote_s_pending_can_cancel_without_send)
+{
+	ClusterLmsRemoteSStatusHandle handle;
+	ClusterPcmOwnSnapshot revoking;
+	uint8 status[RESOURCE_X_CONTROL_V1_BYTES] = { 0xB2 };
+	int worker_id = 1;
+
+	ut_reset_log();
+	memset(&handle, 0, sizeof(handle));
+	memset(&revoking, 0, sizeof(revoking));
+	revoking.tag.relNumber = 21;
+	revoking.tag.forkNum = MAIN_FORKNUM;
+	revoking.tag.blockNum = 22;
+	revoking.generation = 23;
+	revoking.reservation_token = 24;
+	revoking.flags = PCM_OWN_FLAG_REVOKING;
+	revoking.pcm_state = (uint8)PCM_STATE_S;
+
+	UT_ASSERT_EQ(
+		cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
+			worker_id, UT_PEER_X, status, sizeof(status),
+			&revoking, &handle),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
+			&handle),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
+			&handle),
+		CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+}
+
+UT_TEST(test_resource_x_nonrequester_s_status_self_master_loopback_is_retained)
+{
+	ClusterLmsRemoteSStatusHandle handle;
+	ClusterPcmOwnSnapshot released;
+	ClusterPcmOwnSnapshot revoking;
+	uint8 status[RESOURCE_X_CONTROL_V1_BYTES] = { 0xB3 };
+	int worker_id = 1;
+
+	ut_reset_log();
+	memset(&handle, 0, sizeof(handle));
+	memset(&revoking, 0, sizeof(revoking));
+	revoking.tag.relNumber = 31;
+	revoking.tag.forkNum = MAIN_FORKNUM;
+	revoking.tag.blockNum = 32;
+	revoking.generation = 33;
+	revoking.reservation_token = 34;
+	revoking.flags = PCM_OWN_FLAG_REVOKING;
+	revoking.pcm_state = (uint8)PCM_STATE_S;
+
+	UT_ASSERT_EQ(
+		cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
+			worker_id, (uint32)cluster_node_id, status, sizeof(status),
+			&revoking, &handle),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 1);
+	UT_ASSERT_EQ(ut_local_dispatch_count, 0);
+
+	released = revoking;
+	released.generation++;
+	released.flags = 0;
+	released.pcm_state = (uint8)PCM_STATE_N;
+	UT_ASSERT_EQ(
+		cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
+			&handle, &released),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(worker_id), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(worker_id), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
+	UT_ASSERT_EQ(ut_local_dispatch_count, 1);
+	UT_ASSERT_EQ(ut_local_dispatch_marker, 0xB3);
 }
 
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(32);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
@@ -1389,12 +1695,18 @@ main(void)
 	UT_RUN(test_cap_bound_frame_sends_on_exact_connection_capability);
 	UT_RUN(test_resource_x_intent_admission_stages_and_completion_clears_owner);
 	UT_RUN(test_resource_x_block_intent_uses_type17_and_control_payload);
-	UT_RUN(test_resource_x_image_intent_preserves_proof_bound_generation);
+	UT_RUN(test_resource_x_settlement_intent_uses_type38_and_short_payload);
+	UT_RUN(test_resource_x_image_intent_rebinds_transport_generation);
 	UT_RUN(test_resource_x_intent_transport_refusal_rearms_without_ring_copy);
 	UT_RUN(test_resource_x_intent_capability_drift_rearms_before_send);
 	UT_RUN(test_resource_x_intent_physical_deadline_rearms_before_send);
 	UT_RUN(test_resource_x_intent_pump_stages_found_owner_on_tag_shard);
+	UT_RUN(test_resource_x_intent_pump_not_admitted_preserves_owner);
 	UT_RUN(test_resource_x_intent_pump_is_bounded_to_sixteen_four_probes);
+	UT_RUN(test_resource_x_type14_assert_and_local_proof_share_one_data_fifo);
+	UT_RUN(test_resource_x_remote_s_status_is_pending_then_exact_ready);
+	UT_RUN(test_resource_x_remote_s_pending_can_cancel_without_send);
+	UT_RUN(test_resource_x_nonrequester_s_status_self_master_loopback_is_retained);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

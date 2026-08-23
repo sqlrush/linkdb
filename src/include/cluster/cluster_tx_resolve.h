@@ -203,6 +203,7 @@ extern ClusterTxOutcome cluster_tx_resolve_exact_admitted(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
+extern void cluster_tx_resolve_terminal_census_batch_preflight(void);
 extern ClusterTxOutcome cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 													 ClusterTxResolveReason *reason_out);
 extern const char *cluster_tx_resolve_reason_name(ClusterTxResolveReason reason);

@@ -90,6 +90,9 @@ extern bool cluster_heap_test_itl_alloc_with_terminal_census(
 extern bool cluster_heap_test_itl_resolve_pair_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer);
 extern bool cluster_heap_test_itl_update_same_page_failure_cleanup(void);
+extern void cluster_heap_test_itl_last_census_stats(
+	uint8 *locator_mask, uint8 *attempted_mask,
+	uint8 *terminal_mask, uint8 *terminal_count);
 #endif
 #endif
 

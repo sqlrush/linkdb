@@ -637,6 +637,7 @@ UT_TEST(test_pcm_x_route_truth_table)
 	} staged[] = {
 		{ PGRAC_IC_MSG_PCM_X_ENQUEUE, sizeof(PcmXEnqueuePayload) },
 		{ PGRAC_IC_MSG_PCM_X_ADMIT_ACK, sizeof(PcmXAdmitAckPayload) },
+		{ PGRAC_IC_MSG_PCM_X_ADMIT_ACK, sizeof(PcmXAdmitAckPayloadV2) },
 		{ PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM, sizeof(PcmXPhasePayload) },
 		{ PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK, sizeof(PcmXPhasePayload) },
 		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_BEGIN, sizeof(PcmXBlockerSetHeaderPayload) },

@@ -1122,6 +1122,13 @@ extern ClusterGrdEntryResult cluster_grd_revalidate_and_promote(const ClusterRes
 																int32 self_node_id,
 																uint64 gen_snapshot);
 
+/* Install one authenticated remote-master GRANT into the requester-local
+ * mirror.  Only the exact reservation identity is consumed; sibling
+ * reservations are neither authority nor a reason to reject the grant. */
+extern ClusterGrdEntryResult
+cluster_grd_promote_remote_grant_exact(const ClusterResId *resid,
+									   const ClusterGrdHolderId *holder);
+
 extern ClusterGrdEntryResult cluster_grd_release_holder_by_id(const ClusterResId *resid,
 														 const ClusterGrdHolderId *holder);
 /* Lookup an exact full-identity holder without creating an entry.  Used by

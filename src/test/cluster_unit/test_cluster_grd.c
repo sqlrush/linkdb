@@ -1699,6 +1699,52 @@ UT_TEST(test_grd_entry_release_overrelease_fail_safe)
 	reset_fake_grd_htab();
 }
 
+UT_TEST(test_grd_remote_grant_promotes_exact_reservation_amid_siblings)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdHolderId first;
+	ClusterGrdHolderId sibling;
+	ClusterGrdHolderId stale;
+	LOCKMODE mode = NoLock;
+
+	grd_lifecycle_reset(4);
+	grd_lifecycle_resid(6331, &resid);
+	first = grd_lifecycle_holder(1, 21, 201);
+	sibling = grd_lifecycle_holder(1, 22, 202);
+	stale = first;
+	stale.procno++;
+
+	UT_ASSERT_EQ((int)cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_reservation_create(entry, &first, ExclusiveLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_reservation_create(entry, &sibling, ExclusiveLock),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
+
+	UT_ASSERT_EQ((int)cluster_grd_promote_remote_grant_exact(&resid, &stale),
+				 (int)CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ((int)cluster_grd_promote_remote_grant_exact(&resid, &first),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &first, &mode));
+	UT_ASSERT_EQ((int)mode, (int)ExclusiveLock);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &sibling, &mode));
+
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &first),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_promote_remote_grant_exact(&resid, &sibling),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &sibling, &mode));
+	UT_ASSERT_EQ((int)mode, (int)ExclusiveLock);
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &sibling),
+				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+
+	cluster_grd_max_entries = 0;
+	reset_fake_grd_htab();
+}
+
 /* ============================================================
  * spec-2.26 T-grd-N..N+2 — LOCKTAG_TRANSACTION ClusterResId wrapper +
  * cleanup tests.
@@ -5073,7 +5119,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(96);
+	UT_PLAN(97);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -5094,6 +5140,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_reclaim_sweep_honors_large_batch_guc);
 	UT_RUN(test_grd_reclaim_excludes_live_state);
 	UT_RUN(test_grd_entry_release_overrelease_fail_safe);
+	UT_RUN(test_grd_remote_grant_promotes_exact_reservation_amid_siblings);
 
 	/* spec-2.26 T-grd-N..N+2 */
 	UT_RUN(test_grd_resid_encode_transaction_roundtrip);

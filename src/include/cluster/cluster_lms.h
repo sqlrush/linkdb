@@ -88,6 +88,7 @@
 #include "storage/lwlock.h"
 #include "cluster/cluster_grd.h"	   /* ClusterGrdHolderId for probe slot */
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS (spec-7.3) */
+#include "cluster/cluster_pcm_own.h"
 
 
 /*
@@ -467,6 +468,31 @@ struct ResourceXIntentSlot;
 extern bool cluster_lms_outbound_enqueue_resource_x_intent(
 	int worker_id, const struct ResourceXIntentSlot *intent,
 	uint32 connection_generation, uint64 deadline_us);
+
+/* Process-local handle for the current-slice remote-S holder adaptation.
+ * It names one exact PENDING slot in the existing LMS DATA ring; none of
+ * these fields is wire ABI or global resource authority. */
+typedef struct ClusterLmsRemoteSStatusHandle {
+	int32 worker_id;
+	uint32 slot_index;
+	BufferTag tag;
+	uint64 slot_cookie;
+	uint64 own_generation;
+	uint64 reservation_token;
+} ClusterLmsRemoteSStatusHandle;
+
+extern ClusterPcmOwnResult
+cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
+	int worker_id, uint32 dest_node_id, const void *payload,
+	uint16 payload_len, const ClusterPcmOwnSnapshot *expected_revoking,
+	ClusterLmsRemoteSStatusHandle *handle_out);
+extern ClusterPcmOwnResult
+cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
+	const ClusterLmsRemoteSStatusHandle *handle,
+	const ClusterPcmOwnSnapshot *released_n);
+extern ClusterPcmOwnResult
+cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
+	const ClusterLmsRemoteSStatusHandle *handle);
 extern int cluster_lms_outbound_resource_x_intent_pump(void);
 struct GcsBlockReplyHeader;
 extern bool cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
@@ -477,6 +503,20 @@ extern bool cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
 	uint32 required_capability, uint32 connection_generation);
 extern int cluster_lms_outbound_drain_send(int worker_id);
 extern uint32 cluster_lms_outbound_depth(int worker_id);
+
+/* Exact local transport witness for R10CleanCompletion(T).  This is shared
+ * memory evidence only: it is neither wire ABI nor Resource-X authority. */
+typedef struct ClusterLmsResourceXTransportSnapshot {
+	uint64 mutation_sequence;
+	uint64 staged_count;
+} ClusterLmsResourceXTransportSnapshot;
+
+StaticAssertDecl(sizeof(ClusterLmsResourceXTransportSnapshot) == 16,
+				 "Resource-X transport snapshot layout must remain 16 bytes");
+
+extern bool cluster_lms_outbound_resource_x_transport_snapshot(
+	ClusterLmsResourceXTransportSnapshot *out);
+extern uint64 cluster_lms_outbound_resource_x_staged_count(void);
 extern void cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary,
 														int result, int runtime_state,
 														bool fence_enforcing, bool fence_allowed,

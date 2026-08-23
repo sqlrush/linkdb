@@ -39,6 +39,7 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -84,7 +85,7 @@ StaticAssertDecl(PCM_X_RUNTIME_SHUTTING_DOWN < PCM_X_RUNTIME_GATE_STATE_MASK,
 	 | PCM_X_STATE_BIT(PCM_XL_CANCELLED) | PCM_X_STATE_BIT(PCM_XL_RECOVERY_BLOCKED))
 #define PCM_X_LOCAL_HOLDER_OCCUPANCY_STATES                                                        \
 	(PCM_X_STATE_BIT(PCM_XL_HOLDER_ACQUIRING) | PCM_X_STATE_BIT(PCM_XL_HOLDER_ACTIVE)              \
-	 | PCM_X_STATE_BIT(PCM_XL_HOLDER_RELEASING))
+	 | PCM_X_STATE_BIT(PCM_XL_HOLDER_RELEASING) | PCM_X_STATE_BIT(PCM_XL_HOLDER_RECYCLING))
 StaticAssertDecl(PCM_X_RUNTIME_GATE_ACTIVATING > PCM_X_RUNTIME_SHUTTING_DOWN,
 				 "PCM-X activating phase must not overlap public runtime states");
 StaticAssertDecl(PCM_X_RUNTIME_GATE_EXHAUSTED > PCM_X_RUNTIME_SHUTTING_DOWN,
@@ -123,6 +124,21 @@ static bool pcm_x_ticket_ref_is_zero(const PcmXTicketRef *ref);
 static bool pcm_x_local_terminal_ref_valid(const PcmXTicketRef *ref);
 static bool pcm_x_local_admission_ref_valid(const PcmXTicketRef *ref,
 											const PcmXWaitIdentity *identity);
+static PcmXQueueResult pcm_x_master_ticket_lookup_locked(
+	const PcmXTicketRef *ref, PcmXSlotRef *ticket_ref_out,
+	PcmXMasterTicketSlot **ticket_out);
+static PcmXQueueResult pcm_x_master_tag_lookup_locked(
+	const BufferTag *tag, PcmXSlotRef *tag_ref_out,
+	PcmXMasterTagSlot **tag_out);
+static bool pcm_x_transfer_leg_is_clear(const PcmXReliableLegState *leg);
+static PcmXQueueResult pcm_x_master_terminal_outcome_exact(
+	const PcmXMasterTicketSlot *ticket, uint32 state);
+static bool pcm_x_master_terminal_unlinked_locked(
+	PcmXMasterTagSlot *tag_slot, PcmXSlotRef tag_ref,
+	PcmXMasterTicketSlot *terminal, PcmXSlotRef terminal_ref);
+static PcmXQueueResult pcm_x_local_leader_slots_exact(
+	const PcmXLocalHandle *leader, PcmXSlotRef tag_ref, PcmXSlotRef member_ref,
+	PcmXLocalTagSlot **tag_slot_out, PcmXLocalMembershipSlot **member_out);
 static bool pcm_x_local_terminal_unlinked_locked(PcmXLocalTagSlot *tag_slot, PcmXSlotRef tag_ref,
 												 PcmXLocalMembershipSlot *terminal,
 												 PcmXSlotRef terminal_ref);
@@ -3417,18 +3433,78 @@ cluster_pcm_x_ownership_reservation_allowed(PcmXMasterTicketState state)
 }
 
 
-/* Terminal tickets detach from the hot queue only after every node drains. */
+/* Interpret terminal cleanup ownership from the frozen episode debt.  In a
+ * Resource-X SETTLED ticket, acked_s_holders_bitmap is the compatibility
+ * drain-only carrier subset.  No caller may derive roles from membership. */
+static PcmXQueueResult
+pcm_x_master_terminal_role_masks_exact(const PcmXMasterTicketSlot *ticket,
+									   uint32 state,
+									   PcmXTerminalRoleMasks *masks_out)
+{
+	PcmXTerminalRoleMasks masks;
+	uint32 drain_only = 0;
+
+	if (masks_out != NULL)
+		memset(masks_out, 0, sizeof(*masks_out));
+	if (ticket == NULL || masks_out == NULL)
+		return PCM_X_QUEUE_INVALID;
+	if (state != PCM_XT_COMPLETE && state != PCM_XT_CANCELLED
+		&& state != PCM_XT_RETIRE_CREDIT)
+		return PCM_X_QUEUE_BAD_STATE;
+
+	memset(&masks, 0, sizeof(masks));
+	masks.participants = ticket->involved_nodes_bitmap;
+	if (masks.participants == 0)
+		return PCM_X_QUEUE_CORRUPT;
+	if (ticket->resource_x_authority_domain
+		== PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		drain_only = ticket->acked_s_holders_bitmap;
+		if (ticket->pending_s_holders_bitmap != 0
+			|| (drain_only & ~masks.participants) != 0)
+			return PCM_X_QUEUE_CORRUPT;
+	} else if (ticket->resource_x_authority_domain
+			   != PCM_X_AUTHORITY_DOMAIN_NONE)
+		return PCM_X_QUEUE_CORRUPT;
+
+	masks.drain_required = masks.participants;
+	masks.retire_required
+		= ticket->resource_x_authority_domain
+				== PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+		? masks.participants & ~drain_only
+		: masks.participants;
+	masks.drained = ticket->drained_nodes_bitmap;
+	masks.retired = ticket->retire_acked_nodes_bitmap;
+	if ((masks.drained & ~masks.drain_required) != 0
+		|| (masks.retired & ~masks.retire_required) != 0)
+		return PCM_X_QUEUE_CORRUPT;
+	if ((state == PCM_XT_COMPLETE || state == PCM_XT_CANCELLED)
+		&& masks.retired != 0)
+		return PCM_X_QUEUE_CORRUPT;
+	if (state == PCM_XT_RETIRE_CREDIT
+		&& masks.drained != masks.drain_required)
+		return PCM_X_QUEUE_CORRUPT;
+
+	*masks_out = masks;
+	return PCM_X_QUEUE_OK;
+}
+
+
+/* Terminal tickets detach from the hot queue only after every required
+ * participant drains. */
 bool
 cluster_pcm_x_ticket_drain_ready(const PcmXMasterTicketSlot *ticket)
 {
+	PcmXTerminalRoleMasks masks;
 	uint32 state;
 
-	if (ticket == NULL || ticket->involved_nodes_bitmap == 0)
+	if (ticket == NULL)
 		return false;
 	state = pcm_x_slot_state_read(&ticket->slot);
 	if (state != PCM_XT_COMPLETE && state != PCM_XT_CANCELLED)
 		return false;
-	return ticket->drained_nodes_bitmap == ticket->involved_nodes_bitmap;
+	return pcm_x_master_terminal_role_masks_exact(ticket, state, &masks)
+			   == PCM_X_QUEUE_OK
+		&& masks.drained == masks.drain_required;
 }
 
 
@@ -3436,11 +3512,15 @@ cluster_pcm_x_ticket_drain_ready(const PcmXMasterTicketSlot *ticket)
 bool
 cluster_pcm_x_ticket_retire_ready(const PcmXMasterTicketSlot *ticket)
 {
-	if (ticket == NULL || ticket->involved_nodes_bitmap == 0
+	PcmXTerminalRoleMasks masks;
+
+	if (ticket == NULL
 		|| pcm_x_slot_state_read(&ticket->slot) != PCM_XT_RETIRE_CREDIT)
 		return false;
-	return ticket->drained_nodes_bitmap == ticket->involved_nodes_bitmap
-		   && ticket->retire_acked_nodes_bitmap == ticket->involved_nodes_bitmap;
+	return pcm_x_master_terminal_role_masks_exact(
+			   ticket, PCM_XT_RETIRE_CREDIT, &masks) == PCM_X_QUEUE_OK
+		&& masks.drained == masks.drain_required
+		&& masks.retired == masks.retire_required;
 }
 
 
@@ -3553,6 +3633,26 @@ pcm_x_local_effective_grant_base(const PcmXLocalTagSlot *tag_slot)
 {
 	return tag_slot->grant_base_own_generation != 0 ? tag_slot->grant_base_own_generation
 													: tag_slot->ref.identity.base_own_generation;
+}
+
+
+static bool
+pcm_x_master_resource_x_flags_valid(uint32 flags)
+{
+	return (flags & ~PCM_X_MASTER_RESOURCE_X_F_KNOWN) == 0;
+}
+
+
+static bool
+pcm_x_local_resource_x_flags_valid(uint32 flags)
+{
+	if ((flags & ~PCM_X_LOCAL_RESOURCE_X_F_KNOWN) != 0)
+		return false;
+	if ((flags & (PCM_X_LOCAL_RESOURCE_X_F_ASSERT_STARTED
+				  | PCM_X_LOCAL_RESOURCE_X_F_LATE_BOUND)) != 0
+		&& (flags & PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY) == 0)
+		return false;
+	return true;
 }
 
 
@@ -4199,6 +4299,7 @@ pcm_x_master_admit_begin_impl(const PcmXEnqueuePayload *request, PcmXMasterAdmis
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
 		goto allocator_done;
 	}
+	ticket_id = header->next_ticket_id;
 
 	directory_result
 		= pcm_x_directory_find_locked(PCM_X_DIR_MASTER_TAG, &request->identity.tag, &tag_ref);
@@ -4265,7 +4366,10 @@ node_successor_allowed:
 		tag_slot = (PcmXMasterTagSlot *)raw_slot;
 		tag_slot->tag = request->identity.tag;
 		tag_slot->cluster_epoch = request->identity.cluster_epoch;
-		tag_slot->next_admission_sequence = 1;
+		/* A detached tag may later occupy any allocator slot.  Seed its
+		 * resource-local sequence from the already checked, never-reused ticket
+		 * high-water so recreating the tag cannot repeat an old assertion. */
+		tag_slot->next_admission_sequence = ticket_id;
 		tag_slot->queue_state_sequence = 0;
 		tag_slot->head_index = PCM_X_INVALID_SLOT_INDEX;
 		tag_slot->tail_index = PCM_X_INVALID_SLOT_INDEX;
@@ -4274,14 +4378,13 @@ node_successor_allowed:
 		pg_atomic_init_u32(&tag_slot->queued_node_bitmap, 0);
 		pg_atomic_init_u32(&tag_slot->admission_gate, 1);
 		gate_claimed = true;
-		admission_sequence = 1;
+		admission_sequence = ticket_id;
 	} else {
 		result = pcm_x_queue_result_from_directory(directory_result);
 		fail_closed = result == PCM_X_QUEUE_CORRUPT || result == PCM_X_QUEUE_STALE;
 		goto allocator_done;
 	}
 
-	ticket_id = header->next_ticket_id;
 	allocator_result
 		= pcm_x_allocator_reserve_locked(PCM_X_ALLOC_MASTER_TICKET, &ticket_ref, &raw_slot);
 	if (allocator_result != PCM_X_ALLOC_OK) {
@@ -4321,6 +4424,9 @@ node_successor_allowed:
 	ticket->transport_session = request->prehandle.sender_session_incarnation;
 	ticket->semantic_generation = 0;
 	resource_x_retry_state_clear(&ticket->retry_state);
+	ticket->resource_x_admission_sequence = 0;
+	ticket->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_NONE;
+	ticket->resource_x_reserved = 0;
 
 	if (new_tag) {
 		directory_result = pcm_x_directory_insert_locked(
@@ -4497,6 +4603,14 @@ allocator_done:
 			pcm_x_runtime_fail_closed();
 			return PCM_X_QUEUE_CORRUPT;
 		}
+		/* A live tag with no hot FIFO but a positive outstanding count still
+		 * owns an exact terminal predecessor.  Freeze that lineage before this
+		 * gap-head is published: once the old ticket detaches, the new ADMITTING
+		 * head may use the approved one-shot pre-ASSERT V2 late bind.  A newly
+		 * allocated tag has no predecessor and never receives this proof. */
+		if (!new_tag && tag_slot->outstanding_ticket_count != 0)
+			ticket->resource_x_reserved
+				= PCM_X_MASTER_RESOURCE_X_F_WAS_SUCCESSOR;
 		tag_slot->head_index = ticket_ref.slot_index;
 	} else {
 		PcmXAllocatorView ticket_view;
@@ -4516,6 +4630,12 @@ allocator_done:
 			return PCM_X_QUEUE_CORRUPT;
 		}
 		ticket->prev_index = tag_slot->tail_index;
+		/* Freeze admission lineage before publishing the link.  A predecessor
+		 * may detach before the later Resource-X owner bind, so current
+		 * prev_index is not evidence that this ticket was originally a FIFO
+		 * successor. */
+		ticket->resource_x_reserved
+			= PCM_X_MASTER_RESOURCE_X_F_WAS_SUCCESSOR;
 		tail->next_index = ticket_ref.slot_index;
 	}
 	tag_slot->tail_index = ticket_ref.slot_index;
@@ -4546,6 +4666,554 @@ allocator_busy:
 		request->identity.base_own_generation, admission_out);
 	if (result == PCM_X_QUEUE_NOT_FOUND && !cancel_first && !allow_node_successor)
 		return pcm_x_master_admit_begin_impl(request, admission_out, false, true);
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_master_resource_x_owner_bind_exact(const PcmXTicketRef *ref,
+											 uint64 admission_sequence)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXMasterTicketSlot *ticket = NULL;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || ref == NULL || ref->grant_generation != 0
+		|| admission_sequence == 0 || admission_sequence == UINT64_MAX
+		|| !pcm_x_wait_identity_valid(&ref->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_ticket_lookup_locked(ref, &ticket_ref, &ticket);
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&ref->identity.tag));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_EXCLUSIVE);
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TICKET, ticket_ref, &ref->identity.tag,
+		PCM_X_MASTER_TICKET_DOMAIN_STATES);
+	if (ticket == NULL || !pcm_x_ticket_admission_ref_equal(&ticket->ref, ref))
+		result = PCM_X_QUEUE_STALE;
+	else if (!pcm_x_runtime_token_exact(&runtime, ticket->master_session_incarnation))
+		result = PCM_X_QUEUE_NOT_READY;
+	else if (ticket->admission_sequence != admission_sequence)
+		result = PCM_X_QUEUE_STALE;
+	else if (!pcm_x_master_resource_x_flags_valid(
+			 ticket->resource_x_reserved)
+			 || ticket->resource_x_authority_domain
+				> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else if (ticket->resource_x_authority_domain
+			   == PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = ticket->resource_x_admission_sequence == admission_sequence
+			? PCM_X_QUEUE_DUPLICATE : PCM_X_QUEUE_STALE;
+	} else if (ticket->resource_x_admission_sequence != 0
+			   || !pcm_x_master_resource_x_flags_valid(
+				   ticket->resource_x_reserved)
+			   || (ticket->prev_index != PCM_X_INVALID_SLOT_INDEX
+				   && (ticket->resource_x_reserved
+					   & PCM_X_MASTER_RESOURCE_X_F_WAS_SUCCESSOR) == 0)) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else {
+		ticket->resource_x_admission_sequence = admission_sequence;
+		pg_write_barrier();
+		ticket->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_RESOURCE_X;
+		result = PCM_X_QUEUE_OK;
+	}
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_master_resource_x_owner_exact(const PcmXTicketRef *ref,
+											uint64 *admission_sequence_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXMasterTicketSlot *ticket;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (admission_sequence_out != NULL)
+		*admission_sequence_out = 0;
+	if (header == NULL || ref == NULL || admission_sequence_out == NULL
+		|| ref->grant_generation != 0 || !pcm_x_wait_identity_valid(&ref->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_ticket_lookup_locked(ref, &ticket_ref, &ticket);
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&ref->identity.tag));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TICKET, ticket_ref, &ref->identity.tag,
+		PCM_X_MASTER_TICKET_DOMAIN_STATES);
+	if (ticket == NULL || !pcm_x_ticket_admission_ref_equal(&ticket->ref, ref))
+		result = PCM_X_QUEUE_STALE;
+	else if (!pcm_x_runtime_token_exact(&runtime, ticket->master_session_incarnation))
+		result = PCM_X_QUEUE_NOT_READY;
+	else if (!pcm_x_master_resource_x_flags_valid(
+			 ticket->resource_x_reserved)
+			 || ticket->resource_x_authority_domain
+				> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else if (ticket->resource_x_authority_domain
+			   != PCM_X_AUTHORITY_DOMAIN_RESOURCE_X)
+		result = PCM_X_QUEUE_NOT_FOUND;
+	else if (ticket->resource_x_admission_sequence == 0
+			 || ticket->resource_x_admission_sequence == UINT64_MAX
+			 || ticket->resource_x_admission_sequence != ticket->admission_sequence) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else {
+		*admission_sequence_out = ticket->resource_x_admission_sequence;
+		result = PCM_X_QUEUE_OK;
+	}
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (result != PCM_X_QUEUE_OK)
+		*admission_sequence_out = 0;
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+/* A node that still owns a prior conversion's exact remote-carrier DRAIN
+ * debt cannot become a new current-X requester for the same resource.  The
+ * old bounded retained pair is backpressure only: it never grants authority
+ * and its requester's own DRAIN does not substitute for the carrier ACK.
+ * Caller holds the resource's master tag lock. */
+static PcmXQueueResult
+pcm_x_master_resource_x_prior_carrier_drained_locked(
+	const PcmXAllocatorView *ticket_view, const BufferTag *tag,
+	uint64 admission_sequence, int32 requester_node)
+{
+	PcmXTerminalRoleMasks masks;
+	uint32 requester_bit;
+	Size index;
+
+	Assert(ticket_view != NULL);
+	Assert(tag != NULL);
+	Assert(admission_sequence != 0 && admission_sequence != UINT64_MAX);
+	Assert(requester_node >= 0
+		   && requester_node < PCM_X_PROTOCOL_NODE_LIMIT);
+	requester_bit = UINT32_C(1) << (uint32)requester_node;
+	for (index = 0; index < ticket_view->capacity; index++) {
+		PcmXMasterTicketSlot *raw;
+		PcmXMasterTicketSlot *terminal;
+		PcmXSlotRef terminal_ref;
+		PcmXQueueResult result;
+		uint64 generation_after;
+		uint32 state;
+
+		raw = (PcmXMasterTicketSlot *)pcm_x_allocator_slot(
+			ticket_view, index);
+		if (raw == NULL)
+			continue;
+		state = pcm_x_slot_state_read(&raw->slot);
+		if (state != PCM_XT_COMPLETE
+			&& state != PCM_XT_RETIRE_CREDIT)
+			continue;
+		if (!pcm_x_slot_generation_read(
+				&raw->slot, &terminal_ref.slot_generation))
+			continue;
+		terminal_ref.slot_index = index;
+		pg_read_barrier();
+		if (!pcm_x_slot_generation_read(
+				&raw->slot, &generation_after)
+			|| generation_after != terminal_ref.slot_generation
+			|| pcm_x_slot_state_read(&raw->slot) != state
+			|| !BufferTagsEqual(&raw->ref.identity.tag, tag))
+			continue;
+		terminal = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_MASTER_TICKET, terminal_ref, tag,
+			PCM_X_STATE_BIT(PCM_XT_COMPLETE)
+				| PCM_X_STATE_BIT(PCM_XT_RETIRE_CREDIT));
+		if (terminal == NULL
+			|| !pcm_x_master_resource_x_flags_valid(
+				terminal->resource_x_reserved)
+			|| terminal->resource_x_authority_domain
+				> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X)
+			return PCM_X_QUEUE_CORRUPT;
+		if (terminal->resource_x_authority_domain
+			!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X)
+			continue;
+		if (terminal->resource_x_admission_sequence == 0
+			|| terminal->resource_x_admission_sequence
+				>= admission_sequence
+			|| terminal->admission_sequence
+				!= terminal->resource_x_admission_sequence
+			|| terminal->ref.grant_generation
+				!= terminal->resource_x_admission_sequence)
+			return PCM_X_QUEUE_CORRUPT;
+		result = pcm_x_master_terminal_outcome_exact(terminal, state);
+		if (result != PCM_X_QUEUE_OK)
+			return result;
+		result = pcm_x_master_terminal_role_masks_exact(
+			terminal, state, &masks);
+		if (result != PCM_X_QUEUE_OK)
+			return result;
+		if ((terminal->acked_s_holders_bitmap
+			 & ~masks.drained & requester_bit) != 0)
+			return PCM_X_QUEUE_NOT_READY;
+	}
+	return PCM_X_QUEUE_OK;
+}
+
+
+/*
+ * Preserve the temporary PCM-X scheduler order without making its locator an
+ * authority input to Resource-X.  Every admitted ticket may already carry the
+ * irreversible RESOURCE_X domain choice, but only the exact active/head
+ * ACTIVE_PROBE is allowed to enter the global assertion state machine.  A
+ * successor is retryable and remains byte-unconsumed until ordinary PCM-X
+ * promotion makes it active.
+ */
+PcmXQueueResult
+cluster_pcm_x_master_resource_x_assertion_ready_exact(
+	const ResourceXAssertion *assertion, uint64 admission_sequence)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXAllocatorView ticket_view;
+	PcmXMasterTagSlot *tag_slot;
+	PcmXMasterTicketSlot *ticket;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	uint32 state;
+	bool fail_closed = false;
+
+	if (header == NULL || !resource_x_assertion_valid(assertion)
+		|| admission_sequence == 0 || admission_sequence == UINT64_MAX)
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_tag_lookup_locked(
+		&assertion->resource, &tag_ref, &tag_slot);
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&assertion->resource));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+	tag_slot = (PcmXMasterTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TAG, tag_ref, &assertion->resource,
+		PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	if (tag_slot == NULL)
+		result = PCM_X_QUEUE_STALE;
+	else if (tag_slot->active_index == PCM_X_INVALID_SLOT_INDEX
+			 || tag_slot->active_slot_generation == 0)
+		result = PCM_X_QUEUE_NOT_READY;
+	else if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET,
+				 &ticket_view)) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else {
+		ticket_ref.slot_index = tag_slot->active_index;
+		ticket_ref.slot_generation = tag_slot->active_slot_generation;
+		ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_MASTER_TICKET, ticket_ref, &assertion->resource,
+			PCM_X_MASTER_TICKET_DOMAIN_STATES);
+		if (ticket == NULL) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+		} else {
+			state = pcm_x_slot_state_read(&ticket->slot);
+			if (tag_slot->head_index != ticket_ref.slot_index
+				|| ticket->prev_index != PCM_X_INVALID_SLOT_INDEX) {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+			} else if (!pcm_x_runtime_token_exact(
+						   &runtime, ticket->master_session_incarnation))
+				result = PCM_X_QUEUE_NOT_READY;
+			else if (!pcm_x_master_resource_x_flags_valid(
+					 ticket->resource_x_reserved)
+					 || ticket->resource_x_authority_domain
+						> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+			} else if (ticket->resource_x_authority_domain
+					   != PCM_X_AUTHORITY_DOMAIN_RESOURCE_X)
+				result = PCM_X_QUEUE_NOT_FOUND;
+			else if (ticket->resource_x_admission_sequence == 0
+					 || ticket->resource_x_admission_sequence == UINT64_MAX
+					 || ticket->resource_x_admission_sequence
+						!= ticket->admission_sequence) {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+			} else if (!resource_x_assertion_equal(
+						   &ticket->logical_assertion, assertion)
+					   || ticket->resource_x_admission_sequence
+						  != admission_sequence)
+				result = PCM_X_QUEUE_NOT_READY;
+			else if (ticket->ref.grant_generation != 0
+					 || state != PCM_XT_ACTIVE_PROBE
+					 /* The exact selected Resource-X head enters ASSERT_X without
+					  * a legacy pending-X claim.  Any legacy claim, cancel, or
+					  * release flag is incompatible with this sole-path entry. */
+					 || pcm_x_slot_flags_read(&ticket->slot) != 0
+					 || !pcm_x_transfer_leg_is_clear(&ticket->reliable))
+				result = PCM_X_QUEUE_BAD_STATE;
+			else {
+				result
+					= pcm_x_master_resource_x_prior_carrier_drained_locked(
+						&ticket_view, &assertion->resource,
+						admission_sequence,
+						assertion->requester_node);
+				fail_closed = result == PCM_X_QUEUE_CORRUPT;
+			}
+		}
+	}
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/* Caller holds the exact tag's master-domain lock in shared or exclusive mode. */
+static PcmXQueueResult
+pcm_x_master_resource_x_head_admission_capture_locked(
+	PcmXRuntimeSnapshot runtime, PcmXMasterTagSlot *tag_slot,
+	PcmXSlotRef tag_ref, PcmXMasterTicketSlot *ticket,
+	PcmXSlotRef ticket_ref, uint64 admission_sequence,
+	PcmXMasterAdmission *admission_out)
+{
+	uint32 control_flags;
+	uint32 state;
+
+	if (tag_slot == NULL || ticket == NULL || admission_out == NULL)
+		return PCM_X_QUEUE_CORRUPT;
+	if (!pcm_x_runtime_token_exact(
+			&runtime, ticket->master_session_incarnation))
+		return PCM_X_QUEUE_NOT_READY;
+	if (!pcm_x_master_resource_x_flags_valid(ticket->resource_x_reserved)
+		|| ticket->resource_x_authority_domain
+			> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X)
+		return PCM_X_QUEUE_CORRUPT;
+	if (ticket->resource_x_authority_domain
+			!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X)
+		return PCM_X_QUEUE_NOT_FOUND;
+	if (ticket->resource_x_admission_sequence != admission_sequence
+		|| ticket->admission_sequence != admission_sequence)
+		return PCM_X_QUEUE_STALE;
+	state = pcm_x_slot_state_read(&ticket->slot);
+	if (state != PCM_XT_ACTIVE_PROBE && state != PCM_XT_ADMITTING)
+		return state == PCM_XT_QUEUED
+			? PCM_X_QUEUE_NOT_READY : PCM_X_QUEUE_BAD_STATE;
+	if ((ticket->resource_x_reserved
+		 & PCM_X_MASTER_RESOURCE_X_F_WAS_SUCCESSOR) == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	/* A successor is eligible only after predecessor unlink made it the exact
+	 * current head.  The ordinary confirmed path is ACTIVE_PROBE.  If its
+	 * first V2 ACK was deferred by an optimistic authority drift, it is still
+	 * ADMITTING and there must be no active locator at all. */
+	if (tag_slot->head_index != ticket_ref.slot_index
+		|| ticket->prev_index != PCM_X_INVALID_SLOT_INDEX)
+		return PCM_X_QUEUE_NOT_READY;
+	if ((state == PCM_XT_ACTIVE_PROBE
+		 && (tag_slot->active_index != ticket_ref.slot_index
+			 || tag_slot->active_slot_generation
+				!= ticket_ref.slot_generation))
+		|| (state == PCM_XT_ADMITTING
+			&& (tag_slot->active_index != PCM_X_INVALID_SLOT_INDEX
+				|| tag_slot->active_slot_generation != 0)))
+		return PCM_X_QUEUE_CORRUPT;
+	if (ticket->tag_slot_index != tag_ref.slot_index
+		|| ticket->tag_slot_generation != tag_ref.slot_generation)
+		return PCM_X_QUEUE_CORRUPT;
+	control_flags = pcm_x_slot_flags_read(&ticket->slot);
+	if (ticket->ref.grant_generation != 0
+		|| (control_flags != 0
+			&& control_flags != PCM_X_MASTER_TICKET_F_PENDING_X_CLAIMED)
+		|| !pcm_x_transfer_leg_is_clear(&ticket->reliable))
+		return PCM_X_QUEUE_BAD_STATE;
+	pcm_x_master_admission_from_ticket(admission_out, ticket_ref, ticket);
+	admission_out->flags = PCM_X_ADMIT_F_EXACT_REPLAY
+		| PCM_X_ADMIT_F_QUEUE_HEAD | PCM_X_ADMIT_F_RESOURCE_X_ADAPTER;
+	return PCM_X_QUEUE_OK;
+}
+
+
+/*
+ * Export the exact, already admitted successor only after ordinary PCM-X
+ * completion has unlinked its predecessor and made this ticket the current
+ * FIFO head.  A confirmed successor is ACTIVE_PROBE; a successor whose first
+ * V2 ACK was deferred may still be ADMITTING with no active locator.  Both
+ * shapes remain pre-ASSERT and use the same exact V2 ACK refresh.
+ */
+PcmXQueueResult
+cluster_pcm_x_master_resource_x_head_admission_exact(
+	const PcmXTicketRef *ref, uint64 admission_sequence,
+	PcmXMasterAdmission *admission_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXMasterTagSlot *tag_slot;
+	PcmXMasterTicketSlot *ticket;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (admission_out != NULL)
+		pcm_x_master_admission_clear(admission_out);
+	if (header == NULL || ref == NULL || admission_out == NULL
+		|| ref->grant_generation != 0 || admission_sequence == 0
+		|| admission_sequence == UINT64_MAX
+		|| !pcm_x_wait_identity_valid(&ref->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_ticket_lookup_locked(
+		ref, &ticket_ref, &ticket);
+	if (result == PCM_X_QUEUE_OK) {
+		tag_ref.slot_index = ticket->tag_slot_index;
+		tag_ref.slot_generation = ticket->tag_slot_generation;
+	}
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&ref->identity.tag));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+	tag_slot = (PcmXMasterTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TAG, tag_ref, &ref->identity.tag,
+		PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TICKET, ticket_ref, &ref->identity.tag,
+		PCM_X_MASTER_TICKET_DOMAIN_STATES);
+	if (tag_slot == NULL || ticket == NULL
+		|| !pcm_x_ticket_admission_ref_equal(&ticket->ref, ref)) {
+		result = PCM_X_QUEUE_STALE;
+		goto head_admission_done;
+	}
+	result = pcm_x_master_resource_x_head_admission_capture_locked(
+		runtime, tag_slot, tag_ref, ticket, ticket_ref,
+		admission_sequence, admission_out);
+	fail_closed = result == PCM_X_QUEUE_CORRUPT;
+
+head_admission_done:
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (result != PCM_X_QUEUE_OK)
+		pcm_x_master_admission_clear(admission_out);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/* Bounded master-drive discovery for the one legal unconfirmed late-bind
+ * shape.  It exports no slot locator and reuses the same capture validator as
+ * the by-reference revalidation immediately before staging the V2 ACK. */
+PcmXQueueResult
+cluster_pcm_x_master_resource_x_head_admission_work_exact(
+	const BufferTag *tag, uint64 cluster_epoch,
+	PcmXMasterAdmission *admission_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXAllocatorView ticket_view;
+	PcmXMasterTagSlot *tag_slot;
+	PcmXMasterTicketSlot *ticket;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (admission_out != NULL)
+		pcm_x_master_admission_clear(admission_out);
+	if (header == NULL || tag == NULL || admission_out == NULL)
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_tag_lookup_locked(tag, &tag_ref, &tag_slot);
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(tag));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+	tag_slot = (PcmXMasterTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TAG, tag_ref, tag,
+		PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	if (tag_slot == NULL || tag_slot->cluster_epoch != cluster_epoch) {
+		result = PCM_X_QUEUE_STALE;
+		goto head_admission_work_done;
+	}
+	if (tag_slot->active_index != PCM_X_INVALID_SLOT_INDEX
+		|| tag_slot->active_slot_generation != 0
+		|| tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto head_admission_work_done;
+	}
+	ticket_ref.slot_index = tag_slot->head_index;
+	if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET, &ticket_view)
+		|| ticket_ref.slot_index >= ticket_view.capacity) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto head_admission_work_done;
+	}
+	ticket = (PcmXMasterTicketSlot *)pcm_x_allocator_slot(
+		&ticket_view, ticket_ref.slot_index);
+	if (ticket == NULL || !pcm_x_slot_generation_read(
+			&ticket->slot, &ticket_ref.slot_generation)) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto head_admission_work_done;
+	}
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TICKET, ticket_ref, tag,
+		PCM_X_MASTER_TICKET_DOMAIN_STATES);
+	if (ticket == NULL) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto head_admission_work_done;
+	}
+	result = pcm_x_master_resource_x_head_admission_capture_locked(
+		runtime, tag_slot, tag_ref, ticket, ticket_ref,
+		ticket->admission_sequence, admission_out);
+
+head_admission_work_done:
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (result != PCM_X_QUEUE_OK)
+		pcm_x_master_admission_clear(admission_out);
+	fail_closed = result == PCM_X_QUEUE_CORRUPT;
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
 	return result;
 }
 
@@ -5268,19 +5936,65 @@ pcm_x_master_drive_candidate_exact(PcmXShmemHeader *header, PcmXSlotRef tag_ref,
 								   const BufferTag *tag, BufferTag *tag_out,
 								   uint64 *cluster_epoch_out)
 {
+	PcmXRuntimeSnapshot runtime;
+	PcmXMasterAdmission admission;
+	PcmXAllocatorView ticket_view;
 	PcmXMasterTagSlot *tag_slot;
 	PcmXMasterTicketSlot *ticket;
 	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
 	uint32 partition;
 	uint32 ticket_state;
 
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
 	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(tag));
 	LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
 	tag_slot = (PcmXMasterTagSlot *)pcm_x_domain_slot(PCM_X_ALLOC_MASTER_TAG, tag_ref, tag,
 													  PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
-	if (tag_slot == NULL || tag_slot->active_index == PCM_X_INVALID_SLOT_INDEX) {
+	if (tag_slot == NULL) {
 		LWLockRelease(&header->master_locks[partition].lock);
 		return PCM_X_QUEUE_NOT_FOUND;
+	}
+	if (tag_slot->active_index == PCM_X_INVALID_SLOT_INDEX) {
+		if (tag_slot->active_slot_generation != 0
+			|| !pcm_x_allocator_view(
+				PCM_X_ALLOC_MASTER_TICKET, &ticket_view)) {
+			LWLockRelease(&header->master_locks[partition].lock);
+			return PCM_X_QUEUE_CORRUPT;
+		}
+		if (tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX) {
+			LWLockRelease(&header->master_locks[partition].lock);
+			return PCM_X_QUEUE_NOT_FOUND;
+		}
+		ticket_ref.slot_index = tag_slot->head_index;
+		ticket = (PcmXMasterTicketSlot *)pcm_x_allocator_slot(
+			&ticket_view, ticket_ref.slot_index);
+		if (ticket == NULL || !pcm_x_slot_generation_read(
+				&ticket->slot, &ticket_ref.slot_generation)) {
+			LWLockRelease(&header->master_locks[partition].lock);
+			return PCM_X_QUEUE_CORRUPT;
+		}
+		ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_MASTER_TICKET, ticket_ref, tag,
+			PCM_X_MASTER_TICKET_DOMAIN_STATES);
+		if (ticket == NULL) {
+			LWLockRelease(&header->master_locks[partition].lock);
+			return PCM_X_QUEUE_CORRUPT;
+		}
+		pcm_x_master_admission_clear(&admission);
+		result = pcm_x_master_resource_x_head_admission_capture_locked(
+			runtime, tag_slot, tag_ref, ticket, ticket_ref,
+			ticket->admission_sequence, &admission);
+		if (result == PCM_X_QUEUE_OK) {
+			*tag_out = tag_slot->tag;
+			*cluster_epoch_out = tag_slot->cluster_epoch;
+		}
+		LWLockRelease(&header->master_locks[partition].lock);
+		return result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_CORRUPT
+			? result : PCM_X_QUEUE_NOT_FOUND;
 	}
 	ticket_ref.slot_index = tag_slot->active_index;
 	ticket_ref.slot_generation = tag_slot->active_slot_generation;
@@ -8073,7 +8787,7 @@ pcm_x_transfer_leg_advance_locked(PcmXMasterTicketSlot *ticket, uint16 expected_
 
 
 static PcmXQueueResult
-pcm_x_image_id_mint(uint64 *image_id_out)
+pcm_x_image_id_mint(int32 master_node, uint64 *image_id_out)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXQueueResult result;
@@ -8081,13 +8795,14 @@ pcm_x_image_id_mint(uint64 *image_id_out)
 
 	if (image_id_out != NULL)
 		*image_id_out = 0;
-	if (header == NULL || image_id_out == NULL)
+	if (header == NULL || image_id_out == NULL || master_node < 0
+		|| master_node >= PCM_X_PROTOCOL_NODE_LIMIT)
 		return PCM_X_QUEUE_INVALID;
 	LWLockAcquire(&header->allocator_lock.lock, LW_EXCLUSIVE);
 	raw_sequence = header->next_image_id;
 	if (raw_sequence == 0 || raw_sequence > PCM_X_IMAGE_ID_SEQ_MASK)
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
-	else if (!cluster_pcm_x_image_id_encode(cluster_node_id, raw_sequence, image_id_out))
+	else if (!cluster_pcm_x_image_id_encode(master_node, raw_sequence, image_id_out))
 		result = PCM_X_QUEUE_CORRUPT;
 	else {
 		header->next_image_id = raw_sequence + 1;
@@ -8173,6 +8888,7 @@ cluster_pcm_x_master_begin_transfer_exact(const PcmXTicketRef *ref, uint64 graph
 	PcmXSlotRef ticket_ref;
 	PcmXQueueResult result;
 	uint64 grant_generation = 0;
+	uint64 next_reliable_sequence = 0;
 	uint32 partition;
 	uint32 state;
 
@@ -8266,15 +8982,21 @@ cluster_pcm_x_master_begin_transfer_exact(const PcmXTicketRef *ref, uint64 graph
 		result = PCM_X_QUEUE_BAD_STATE;
 		goto begin_transfer_done;
 	}
-	/* grant_generation belongs to the durable master ticket, not to an outer
-	 * caller.  Mint it from the ticket's checked reliable sequence while the
-	 * exact tag partition is locked, then persist the same value in both the
-	 * full wire reference and the sequence that fences every later leg. */
-	if (!cluster_pcm_x_generation_next(ticket->reliable.state_sequence, &grant_generation)) {
+	/* The transfer grant is the resource-scoped admission identity.  It must
+	 * not reuse the per-ticket reliable-leg sequence, which restarts for every
+	 * successor ticket.  Admission assigned this nonzero, non-MAX value from
+	 * the tag's checked next_admission_sequence under the same partition. */
+	if (ticket->admission_sequence == 0 || ticket->admission_sequence == UINT64_MAX) {
+		result = PCM_X_QUEUE_CORRUPT;
+		goto begin_transfer_done;
+	}
+	if (!cluster_pcm_x_generation_next(ticket->reliable.state_sequence,
+									   &next_reliable_sequence)) {
 		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
 		goto begin_transfer_done;
 	}
-	ticket->reliable.state_sequence = grant_generation;
+	grant_generation = ticket->admission_sequence;
+	ticket->reliable.state_sequence = next_reliable_sequence;
 	ticket->ref.grant_generation = grant_generation;
 	pg_write_barrier();
 	pcm_x_slot_state_write(&ticket->slot, PCM_XT_ACTIVE_TRANSFER);
@@ -8363,7 +9085,7 @@ cluster_pcm_x_master_revoke_arm_exact(const PcmXTicketRef *ref, int32 responder_
 	if (!mint_image)
 		goto revoke_done;
 
-	result = pcm_x_image_id_mint(&image_id);
+	result = pcm_x_image_id_mint(cluster_node_id, &image_id);
 	if (result != PCM_X_QUEUE_OK)
 		goto revoke_done;
 	LWLockAcquire(&header->master_locks[partition].lock, LW_EXCLUSIVE);
@@ -8996,6 +9718,339 @@ cluster_pcm_x_master_complete_exact(const PcmXTicketRef *ref)
 complete_done:
 	LWLockRelease(&header->master_locks[partition].lock);
 	if (result == PCM_X_QUEUE_CORRUPT || result == PCM_X_QUEUE_COUNTER_EXHAUSTED)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/* A' permits post-settlement physical cleanup only for the exact remote
+ * carrier that produced the retained type-18/type-15 pair.  BLOCKED_TO_N from
+ * a remote S holder already proves its authenticated S-to-N transition and
+ * creates neither a retained pair nor a requester-local PCM-X locator. */
+static bool
+pcm_x_master_resource_x_terminal_carrier_bitmap(
+	const ResourceXMasterSnapshot *settled, uint32 *carrier_bitmap_out)
+{
+	uint32 requester_bit;
+	uint32 source_bit;
+
+	if (settled == NULL || carrier_bitmap_out == NULL
+		|| !resource_x_assertion_valid(&settled->assertion)
+		|| settled->blocked_holders_bitmap
+			!= settled->incompatible_holders_bitmap)
+		return false;
+	*carrier_bitmap_out = 0;
+	requester_bit
+		= UINT32_C(1) << (uint32)settled->assertion.requester_node;
+	if ((settled->blocked_holders_bitmap & requester_bit) != 0)
+		return false;
+
+	switch (settled->proof_kind) {
+	case RESOURCE_X_PROOF_REMOTE_CARRIER:
+		if (settled->source_node < 0
+			|| settled->source_node >= PCM_X_PROTOCOL_NODE_LIMIT
+			|| settled->source_node
+				== settled->assertion.requester_node)
+			return false;
+		source_bit = UINT32_C(1) << (uint32)settled->source_node;
+		if ((settled->blocked_holders_bitmap & source_bit) == 0)
+			return false;
+		*carrier_bitmap_out = source_bit;
+		return true;
+	case RESOURCE_X_PROOF_LOCAL_IMAGE:
+		return settled->source_node
+			== settled->assertion.requester_node;
+	case RESOURCE_X_PROOF_DURABLE_STORAGE:
+		return settled->source_node == -1;
+	default:
+		return false;
+	}
+}
+
+
+/*
+ * A repeated Resource-X settlement can arrive after the first exact cleanup
+ * has unlinked its PCM-X locator and promoted a successor.  The active slot is
+ * therefore not evidence about the old request.  Recognize only the exact,
+ * still-resident COMPLETE tombstone for the same admission sequence, and do
+ * so without mutating either the terminal or the successor queue.
+ *
+ * Caller holds the tag's master lock.  Slot generation/state are sampled and
+ * revalidated before any non-atomic payload is trusted, matching the terminal
+ * work scanner's read discipline.
+ */
+static PcmXQueueResult
+pcm_x_master_resource_x_completion_tombstone_locked(
+	PcmXMasterTagSlot *tag_slot, PcmXSlotRef tag_ref,
+	const PcmXAllocatorView *ticket_view, const ResourceXAssertion *assertion,
+	uint64 admission_sequence, const PcmXRuntimeSnapshot *runtime,
+	const ResourceXMasterSnapshot *settled)
+{
+	PcmXMasterTicketSlot *match = NULL;
+	PcmXTerminalRoleMasks masks;
+	PcmXSlotRef match_ref;
+	Size index;
+	uint32 carrier_bitmap;
+	uint32 participants;
+
+	if (!pcm_x_master_resource_x_terminal_carrier_bitmap(
+			settled, &carrier_bitmap))
+		return PCM_X_QUEUE_CORRUPT;
+	participants = (UINT32_C(1) << assertion->requester_node)
+		| carrier_bitmap;
+
+	for (index = 0; index < ticket_view->capacity; index++) {
+		PcmXMasterTicketSlot *raw;
+		PcmXMasterTicketSlot *ticket;
+		PcmXSlotRef ticket_ref;
+		uint64 generation_after;
+		uint32 state;
+
+		raw = (PcmXMasterTicketSlot *)pcm_x_allocator_slot(ticket_view, index);
+		if (raw == NULL)
+			continue;
+		state = pcm_x_slot_state_read(&raw->slot);
+		if (state != PCM_XT_COMPLETE && state != PCM_XT_RETIRE_CREDIT)
+			continue;
+		if (!pcm_x_slot_generation_read(&raw->slot,
+				&ticket_ref.slot_generation))
+			continue;
+		ticket_ref.slot_index = index;
+		pg_read_barrier();
+		if (!pcm_x_slot_generation_read(&raw->slot, &generation_after)
+			|| generation_after != ticket_ref.slot_generation
+			|| pcm_x_slot_state_read(&raw->slot) != state
+			|| !BufferTagsEqual(&raw->ref.identity.tag,
+				&assertion->resource))
+			continue;
+
+		ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+			PCM_X_ALLOC_MASTER_TICKET, ticket_ref, &assertion->resource,
+			PCM_X_STATE_BIT(PCM_XT_COMPLETE)
+				| PCM_X_STATE_BIT(PCM_XT_RETIRE_CREDIT));
+		if (ticket == NULL)
+			continue;
+		if (ticket->resource_x_admission_sequence != admission_sequence
+			&& ticket->admission_sequence != admission_sequence)
+			continue;
+		if (ticket->resource_x_admission_sequence != admission_sequence
+			|| ticket->admission_sequence != admission_sequence
+			|| !pcm_x_master_resource_x_flags_valid(
+				ticket->resource_x_reserved)
+			|| ticket->resource_x_authority_domain
+				!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+			|| !resource_x_assertion_equal(&ticket->logical_assertion,
+				assertion)
+			|| ticket->ref.grant_generation != admission_sequence
+			|| ticket->tag_slot_index != tag_ref.slot_index
+			|| ticket->tag_slot_generation != tag_ref.slot_generation
+			|| ticket->pending_s_holders_bitmap != 0
+			|| ticket->acked_s_holders_bitmap
+				!= carrier_bitmap
+			|| ticket->involved_nodes_bitmap != participants
+			|| pcm_x_master_terminal_role_masks_exact(
+				ticket, state, &masks) != PCM_X_QUEUE_OK)
+			return PCM_X_QUEUE_CORRUPT;
+		if (ticket->master_session_incarnation
+			!= settled->master_session_incarnation)
+			return PCM_X_QUEUE_STALE;
+		if (!pcm_x_runtime_token_exact(
+				runtime, ticket->master_session_incarnation))
+			return PCM_X_QUEUE_NOT_READY;
+		if (pcm_x_master_terminal_outcome_exact(ticket, state)
+			!= PCM_X_QUEUE_OK
+			|| !pcm_x_master_terminal_unlinked_locked(
+				tag_slot, tag_ref, ticket, ticket_ref))
+			return PCM_X_QUEUE_CORRUPT;
+		if (match != NULL)
+			return PCM_X_QUEUE_CORRUPT;
+		match = ticket;
+		match_ref = ticket_ref;
+	}
+
+	(void)match_ref;
+	return match == NULL ? PCM_X_QUEUE_NOT_FOUND : PCM_X_QUEUE_DUPLICATE;
+}
+
+
+/*
+ * Retire the temporary legacy locator only after the Resource-X master has
+ * accepted the exact install settlement.  Resource-X owns both authority and
+ * holder revocation in this domain, so a matching adapter ticket must still
+ * be ACTIVE_PROBE with no legacy pending-X or reliable transfer leg.
+ */
+PcmXQueueResult
+cluster_pcm_x_master_resource_x_complete_exact(
+	const ResourceXAssertion *assertion, uint64 admission_sequence,
+	const ResourceXMasterSnapshot *settled)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXAllocatorView ticket_view;
+	PcmXMasterTagSlot *tag_slot;
+	PcmXMasterTicketSlot *ticket = NULL;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	uint32 state;
+	uint32 flags = 0;
+	uint32 carrier_bitmap;
+	uint32 participants;
+	uint32 requester_bitmap;
+	bool fail_closed = false;
+
+	if (header == NULL || !resource_x_assertion_valid(assertion) || settled == NULL
+		|| admission_sequence == 0 || admission_sequence == UINT64_MAX)
+		return PCM_X_QUEUE_INVALID;
+	if (!resource_x_assertion_equal(&settled->assertion, assertion)
+		|| settled->assertion_sequence != admission_sequence)
+		return PCM_X_QUEUE_STALE;
+	if (settled->phase != RESOURCE_X_MASTER_SETTLED)
+		return settled->phase >= RESOURCE_X_MASTER_QUEUED
+			&& settled->phase <= RESOURCE_X_MASTER_GRANT_COMMITTED
+			? PCM_X_QUEUE_NOT_READY : PCM_X_QUEUE_BAD_STATE;
+	if (settled->base_authority_generation == 0
+		|| settled->base_authority_generation == UINT64_MAX
+		|| settled->resource_formation == 0
+		|| settled->master_session_incarnation == 0)
+		return PCM_X_QUEUE_STALE;
+	if (!pcm_x_master_resource_x_terminal_carrier_bitmap(
+			settled, &carrier_bitmap))
+		return PCM_X_QUEUE_STALE;
+	requester_bitmap = UINT32_C(1) << assertion->requester_node;
+	participants = requester_bitmap | carrier_bitmap;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_master_tag_lookup_locked(
+		&assertion->resource, &tag_ref, &tag_slot);
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&assertion->resource));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_EXCLUSIVE);
+	tag_slot = (PcmXMasterTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TAG, tag_ref, &assertion->resource,
+		PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	if (tag_slot == NULL) {
+		result = PCM_X_QUEUE_STALE;
+		goto resource_x_complete_done;
+	}
+	if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET, &ticket_view)) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto resource_x_complete_done;
+	}
+	result = pcm_x_master_resource_x_completion_tombstone_locked(
+		tag_slot, tag_ref, &ticket_view, assertion, admission_sequence,
+		&runtime, settled);
+	if (result == PCM_X_QUEUE_DUPLICATE)
+		goto resource_x_complete_done;
+	if (result != PCM_X_QUEUE_NOT_FOUND) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto resource_x_complete_done;
+	}
+	if (tag_slot->active_index == PCM_X_INVALID_SLOT_INDEX
+		|| tag_slot->active_slot_generation == 0) {
+		result = PCM_X_QUEUE_NOT_FOUND;
+		goto resource_x_complete_done;
+	}
+	ticket_ref.slot_index = tag_slot->active_index;
+	ticket_ref.slot_generation = tag_slot->active_slot_generation;
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TICKET, ticket_ref, &assertion->resource,
+		PCM_X_MASTER_TICKET_DOMAIN_STATES);
+	if (ticket == NULL) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto resource_x_complete_done;
+	}
+	state = pcm_x_slot_state_read(&ticket->slot);
+	if (!pcm_x_runtime_token_exact(&runtime,
+			ticket->master_session_incarnation))
+		result = PCM_X_QUEUE_NOT_READY;
+	else if (!pcm_x_master_resource_x_flags_valid(
+			 ticket->resource_x_reserved)
+			 || ticket->resource_x_authority_domain
+				!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X)
+		result = PCM_X_QUEUE_BAD_STATE;
+	else if (ticket->resource_x_admission_sequence != admission_sequence
+			 || ticket->admission_sequence != admission_sequence
+			 || !resource_x_assertion_equal(
+				 &ticket->logical_assertion, assertion))
+		result = PCM_X_QUEUE_STALE;
+	else if (ticket->master_session_incarnation
+			 != settled->master_session_incarnation)
+		result = PCM_X_QUEUE_STALE;
+	else if (ticket->ref.grant_generation != 0
+			 || state != PCM_XT_ACTIVE_PROBE
+			 || (((flags = pcm_x_slot_flags_read(&ticket->slot))
+				  & ~PCM_X_MASTER_TICKET_F_PENDING_X_CLAIMED) != 0)
+			 || ticket->pending_s_holders_bitmap != 0
+			 || ticket->acked_s_holders_bitmap != 0
+			 || ticket->involved_nodes_bitmap != requester_bitmap
+			 || ticket->drained_nodes_bitmap != 0
+			 || ticket->retire_acked_nodes_bitmap != 0
+			 || !pcm_x_transfer_leg_is_clear(&ticket->reliable))
+		result = PCM_X_QUEUE_BAD_STATE;
+	else if (tag_slot->head_index != ticket_ref.slot_index
+			 || ticket->prev_index != PCM_X_INVALID_SLOT_INDEX
+			 || (pg_atomic_read_u32(&tag_slot->queued_node_bitmap)
+				 & (UINT32_C(1) << assertion->requester_node)) == 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else if (tag_slot->queue_state_sequence == UINT64_MAX) {
+		result = PCM_X_QUEUE_COUNTER_EXHAUSTED;
+		fail_closed = true;
+	} else if (!pcm_x_master_unlink_ticket_locked(
+			   tag_slot, tag_ref, ticket, ticket_ref)) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else {
+		if (!pcm_x_master_queued_node_bitmap_rebuild_locked(tag_slot,
+													   tag_ref)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+			goto resource_x_complete_done;
+		}
+		tag_slot->queue_state_sequence++;
+		/* Resource-X has already settled the canonical authority.  Project the
+		 * same admission sequence used by requester T3 only as the exact
+		 * coexistence locator for the legacy DRAIN/RETIRE cleanup; it is not a
+		 * Resource-X authority generation or an independent legacy grant. */
+		ticket->ref.grant_generation = admission_sequence;
+		/* SETTLED freezes the complete blocker set, but A' authorizes retained
+		 * pair cleanup only for its unique exact remote carrier.  Reuse the
+		 * existing fixed terminal participant domain so that carrier receives
+		 * DRAIN only after requester install settlement.  Resource-X tickets have no
+		 * legacy S-holder work at this point, so acked_s_holders_bitmap becomes
+		 * the immutable drain-only subset for terminal cleanup.  It is cleanup
+		 * authority, never a GRD or Resource-X authority source. */
+		ticket->involved_nodes_bitmap = participants;
+		ticket->acked_s_holders_bitmap = carrier_bitmap;
+		ticket->reliable.response_tombstone_mask
+			|= PCM_X_RESPONSE_TOMBSTONE_COMPLETE;
+		/* The exact SETTLED Resource-X snapshot can exist only after its
+		 * entry-lock commit cleared the ticket-bound GRD pending-X cookie.
+		 * Consume the coexistence ticket flag here so a crash between those
+		 * domains is repaired by replay, without reopening authority. */
+		if ((flags & PCM_X_MASTER_TICKET_F_PENDING_X_CLAIMED) != 0)
+			pcm_x_slot_flags_write(&ticket->slot, 0);
+		pg_write_barrier();
+		pcm_x_slot_state_write(&ticket->slot, PCM_XT_COMPLETE);
+		pcm_x_stats_increment(&header->stats.complete_count);
+		result = PCM_X_QUEUE_OK;
+	}
+
+resource_x_complete_done:
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (fail_closed)
 		pcm_x_runtime_fail_closed();
 	return result;
 }
@@ -9719,19 +10774,97 @@ pcm_x_master_terminal_leg_is_clear(const PcmXReliableLegState *leg)
 static bool
 pcm_x_master_terminal_bitmaps_valid(const PcmXMasterTicketSlot *ticket, uint32 state)
 {
-	uint32 involved;
+	PcmXTerminalRoleMasks masks;
 
-	if (ticket == NULL)
-		return false;
-	involved = ticket->involved_nodes_bitmap;
-	if (involved == 0 || (ticket->drained_nodes_bitmap & ~involved) != 0
-		|| (ticket->retire_acked_nodes_bitmap & ~involved) != 0)
-		return false;
-	if (state == PCM_XT_COMPLETE || state == PCM_XT_CANCELLED)
-		return ticket->retire_acked_nodes_bitmap == 0;
-	if (state == PCM_XT_RETIRE_CREDIT)
-		return ticket->drained_nodes_bitmap == involved;
-	return false;
+	return pcm_x_master_terminal_role_masks_exact(ticket, state, &masks)
+		   == PCM_X_QUEUE_OK;
+}
+
+
+/* Select one unresolved debt from the frozen terminal role masks.  The
+ * lowest node bit is only deterministic scheduling; membership and current
+ * capability never create work. */
+PcmXQueueResult
+cluster_pcm_x_master_terminal_work_exact(const PcmXTicketRef *ref,
+									 PcmXTerminalWork *work_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXMasterTicketSlot *ticket;
+	PcmXTerminalRoleMasks masks;
+	PcmXSlotRef ticket_ref;
+	PcmXQueueResult result;
+	uint32 pending;
+	uint32 partition;
+	uint32 state;
+	int node;
+	bool fail_closed = false;
+
+	if (work_out != NULL)
+		memset(work_out, 0, sizeof(*work_out));
+	if (header == NULL || ref == NULL || work_out == NULL
+		|| !pcm_x_wait_identity_valid(&ref->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_master_terminal_lookup(ref, &ticket_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&ref->identity.tag));
+	LWLockAcquire(&header->master_locks[partition].lock, LW_SHARED);
+	ticket = (PcmXMasterTicketSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_MASTER_TICKET, ticket_ref, &ref->identity.tag,
+		PCM_X_STATE_BIT(PCM_XT_COMPLETE) | PCM_X_STATE_BIT(PCM_XT_CANCELLED)
+			| PCM_X_STATE_BIT(PCM_XT_RETIRE_CREDIT));
+	if (ticket == NULL || !pcm_x_ticket_ref_equal(&ticket->ref, ref))
+		result = PCM_X_QUEUE_STALE;
+	else if (!pcm_x_runtime_token_exact(
+			 &runtime, ticket->master_session_incarnation))
+		result = PCM_X_QUEUE_NOT_READY;
+	else if ((result = pcm_x_master_terminal_outcome_exact(
+				  ticket, (state = pcm_x_slot_state_read(&ticket->slot))))
+			 != PCM_X_QUEUE_OK)
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+	else if ((result = pcm_x_master_terminal_role_masks_exact(
+				  ticket, state, &masks)) != PCM_X_QUEUE_OK)
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+	else {
+		pending = state == PCM_XT_RETIRE_CREDIT
+			? masks.retire_required & ~masks.retired
+			: masks.drain_required & ~masks.drained;
+		if (pending == 0)
+			result = PCM_X_QUEUE_NOT_READY;
+		else {
+			for (node = 0; node < PCM_X_PROTOCOL_NODE_LIMIT; node++) {
+				if ((pending & (UINT32_C(1) << node)) != 0)
+					break;
+			}
+			if (node >= PCM_X_PROTOCOL_NODE_LIMIT) {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+			} else {
+				work_out->ref = ticket->ref;
+				work_out->master_session_incarnation
+					= ticket->master_session_incarnation;
+				work_out->state_sequence = ticket->reliable.state_sequence;
+				work_out->responder_node = node;
+				work_out->kind = state == PCM_XT_RETIRE_CREDIT
+					? PCM_X_TERMINAL_LEG_RETIRE
+					: PCM_X_TERMINAL_LEG_DRAIN;
+				result = PCM_X_QUEUE_OK;
+			}
+		}
+	}
+	LWLockRelease(&header->master_locks[partition].lock);
+	if (result != PCM_X_QUEUE_OK)
+		memset(work_out, 0, sizeof(*work_out));
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
 }
 
 
@@ -9744,6 +10877,7 @@ cluster_pcm_x_master_terminal_leg_arm_exact(const PcmXTicketRef *ref, PcmXTermin
 	PcmXRuntimeSnapshot runtime;
 	PcmXPeerFrontier *frontier;
 	PcmXMasterTicketSlot *ticket;
+	PcmXTerminalRoleMasks masks;
 	PcmXDirectoryResult directory_result;
 	PcmXRetirePayload retire_key;
 	PcmXSlotRef existing;
@@ -9751,8 +10885,12 @@ cluster_pcm_x_master_terminal_leg_arm_exact(const PcmXTicketRef *ref, PcmXTermin
 	PcmXQueueResult result;
 	uint64 next_sequence;
 	uint32 responder_bit;
+	uint32 completed;
+	uint32 pending;
+	uint32 required;
 	uint32 partition;
 	uint32 state;
+	int expected_node;
 	bool fail_closed = false;
 
 	if (token_out != NULL)
@@ -9821,12 +10959,49 @@ cluster_pcm_x_master_terminal_leg_arm_exact(const PcmXTicketRef *ref, PcmXTermin
 		fail_closed = result == PCM_X_QUEUE_CORRUPT;
 		goto arm_done;
 	}
-	if (!pcm_x_master_terminal_bitmaps_valid(ticket, state)) {
+	if (pcm_x_master_terminal_role_masks_exact(ticket, state, &masks)
+		!= PCM_X_QUEUE_OK) {
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto arm_done;
 	}
-	if ((ticket->involved_nodes_bitmap & responder_bit) == 0) {
+	required = kind == PCM_X_TERMINAL_LEG_DRAIN
+		? masks.drain_required : masks.retire_required;
+	completed = kind == PCM_X_TERMINAL_LEG_DRAIN
+		? masks.drained : masks.retired;
+	pending = required & ~completed;
+	if ((kind == PCM_X_TERMINAL_LEG_DRAIN
+		 && state != PCM_XT_COMPLETE && state != PCM_XT_CANCELLED)
+		|| (kind == PCM_X_TERMINAL_LEG_RETIRE
+			&& state != PCM_XT_RETIRE_CREDIT)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto arm_done;
+	}
+	if ((required & responder_bit) == 0) {
+		result = PCM_X_QUEUE_STALE;
+		goto arm_done;
+	}
+	if ((completed & responder_bit) != 0) {
+		if (!pcm_x_master_terminal_leg_is_clear(&ticket->reliable)
+			&& ticket->reliable.pending_opcode == (uint16)kind
+			&& ticket->reliable.phase == (uint16)kind
+			&& ticket->reliable.expected_responder_node == responder_node) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+		} else
+			result = PCM_X_QUEUE_NOT_READY;
+		goto arm_done;
+	}
+	for (expected_node = 0;
+		 expected_node < PCM_X_PROTOCOL_NODE_LIMIT; expected_node++) {
+		if ((pending & (UINT32_C(1) << expected_node)) != 0)
+			break;
+	}
+	if (expected_node >= PCM_X_PROTOCOL_NODE_LIMIT) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto arm_done;
+	}
+	if (responder_node != expected_node) {
 		result = PCM_X_QUEUE_STALE;
 		goto arm_done;
 	}
@@ -9855,11 +11030,6 @@ cluster_pcm_x_master_terminal_leg_arm_exact(const PcmXTicketRef *ref, PcmXTermin
 			fail_closed = true;
 		} else
 			result = PCM_X_QUEUE_NOT_READY;
-		goto arm_done;
-	}
-	if ((kind == PCM_X_TERMINAL_LEG_DRAIN && state == PCM_XT_RETIRE_CREDIT)
-		|| (kind == PCM_X_TERMINAL_LEG_RETIRE && state != PCM_XT_RETIRE_CREDIT)) {
-		result = PCM_X_QUEUE_NOT_READY;
 		goto arm_done;
 	}
 	if (!pcm_x_master_terminal_leg_is_clear(&ticket->reliable)) {
@@ -9924,6 +11094,7 @@ pcm_x_master_terminal_leg_ack_resolved(const PcmXTicketRef *ref, PcmXTerminalLeg
 	PcmXRuntimeSnapshot runtime;
 	PcmXPeerFrontier *frontier;
 	PcmXMasterTicketSlot *ticket;
+	PcmXTerminalRoleMasks masks;
 	PcmXSlotRef ticket_ref;
 	PcmXQueueResult result;
 	uint32 responder_bit;
@@ -9962,12 +11133,15 @@ pcm_x_master_terminal_leg_ack_resolved(const PcmXTicketRef *ref, PcmXTerminalLeg
 		fail_closed = result == PCM_X_QUEUE_CORRUPT;
 		goto ack_done;
 	}
-	if (!pcm_x_master_terminal_bitmaps_valid(ticket, state)) {
+	if (pcm_x_master_terminal_role_masks_exact(ticket, state, &masks)
+		!= PCM_X_QUEUE_OK) {
 		result = PCM_X_QUEUE_CORRUPT;
 		fail_closed = true;
 		goto ack_done;
 	}
-	if ((ticket->involved_nodes_bitmap & responder_bit) == 0) {
+	if (((actual_kind == PCM_X_TERMINAL_LEG_DRAIN
+		  ? masks.drain_required : masks.retire_required)
+		 & responder_bit) == 0) {
 		result = PCM_X_QUEUE_STALE;
 		goto ack_done;
 	}
@@ -10020,6 +11194,8 @@ pcm_x_master_terminal_leg_ack_resolved(const PcmXTicketRef *ref, PcmXTerminalLeg
 	if (actual_kind == PCM_X_TERMINAL_LEG_DRAIN) {
 		ticket->drained_nodes_bitmap |= responder_bit;
 		if (state != PCM_XT_RETIRE_CREDIT && cluster_pcm_x_ticket_drain_ready(ticket)) {
+			/* Drain-only carriers have no RETIRE debt.  Transition state without
+			 * fabricating ACK bits outside retire_required. */
 			pg_write_barrier();
 			pcm_x_slot_state_write(&ticket->slot, PCM_XT_RETIRE_CREDIT);
 		}
@@ -11075,6 +12251,10 @@ pcm_x_local_tag_init_common(PcmXLocalTagSlot *tag_slot, const BufferTag *tag, ui
 	resource_x_retry_state_clear(&tag_slot->retry_state);
 	tag_slot->retry_connection_generation = 0;
 	tag_slot->retry_connection_reserved = 0;
+	tag_slot->resource_x_admission_sequence = 0;
+	tag_slot->resource_x_base_authority_generation = 0;
+	tag_slot->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_NONE;
+	tag_slot->resource_x_reserved = 0;
 	memset(&tag_slot->holder_ref, 0, sizeof(tag_slot->holder_ref));
 	memset(&tag_slot->holder_image, 0, sizeof(tag_slot->holder_image));
 	tag_slot->holder_required_page_scn = 0;
@@ -11097,7 +12277,11 @@ pcm_x_local_semantic_projection_clear(const PcmXLocalTagSlot *tag_slot)
 		&& tag_slot->attempt_base_generation == 0
 		&& tag_slot->transport_epoch == 0
 		&& tag_slot->transport_session == 0
-		&& tag_slot->semantic_generation == 0;
+		&& tag_slot->semantic_generation == 0
+		&& tag_slot->resource_x_admission_sequence == 0
+		&& tag_slot->resource_x_base_authority_generation == 0
+		&& tag_slot->resource_x_authority_domain == PCM_X_AUTHORITY_DOMAIN_NONE
+		&& tag_slot->resource_x_reserved == 0;
 }
 
 
@@ -11729,6 +12913,22 @@ PcmXQueueResult
 cluster_pcm_x_local_holder_activate_exact(const PcmXLocalHolderHandle *handle)
 {
 	return pcm_x_local_holder_transition_exact(handle, PCM_XL_HOLDER_ACQUIRING,
+											   PCM_XL_HOLDER_ACTIVE);
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_holder_begin_recycling_exact(const PcmXLocalHolderHandle *handle)
+{
+	return pcm_x_local_holder_transition_exact(handle, PCM_XL_HOLDER_ACTIVE,
+											   PCM_XL_HOLDER_RECYCLING);
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_holder_finish_recycling_exact(const PcmXLocalHolderHandle *handle)
+{
+	return pcm_x_local_holder_transition_exact(handle, PCM_XL_HOLDER_RECYCLING,
 											   PCM_XL_HOLDER_ACTIVE);
 }
 
@@ -14472,7 +15672,18 @@ cluster_pcm_x_local_join_begin_semantic(const PcmXWaitIdentity *identity, int32 
 	if (directory_result == PCM_X_DIRECTORY_OK) {
 		tag_slot
 			= (PcmXLocalTagSlot *)pcm_x_slot_ref_resolve_locked(PCM_X_ALLOC_LOCAL_TAG, tag_ref);
-		result = pcm_x_resident_tag_state_result(tag_slot == NULL ? NULL : &tag_slot->slot);
+		/* A held-fence absent-tag shell is deliberately directory-visible before
+		 * it is LIVE.  New registration must retry behind its admission gate,
+		 * never reinterpret the reserved slot as invalid or create a second tag. */
+		if (tag_slot != NULL
+			&& pcm_x_slot_state_read(&tag_slot->slot)
+				   == PCM_X_TAG_RESERVED_NONVISIBLE
+			&& (pcm_x_slot_flags_read(&tag_slot->slot)
+				& PCM_X_LOCAL_TAG_F_ADMISSION_GATE) != 0)
+			result = PCM_X_QUEUE_GATE_RETRY;
+		else
+			result = pcm_x_resident_tag_state_result(
+				tag_slot == NULL ? NULL : &tag_slot->slot);
 		if (result != PCM_X_QUEUE_OK) {
 			fail_closed = result == PCM_X_QUEUE_CORRUPT;
 			goto allocator_done;
@@ -15117,6 +16328,774 @@ pcm_x_local_progress_copy_locked(const PcmXLocalTagSlot *tag_slot,
 	progress_out->grant_base_own_generation = tag_slot->grant_base_own_generation;
 	progress_out->semantic_generation
 		= member_state == PCM_XL_GRANTED ? tag_slot->ref.grant_generation : 0;
+	progress_out->resource_x_admission_sequence
+		= tag_slot->resource_x_admission_sequence;
+	progress_out->resource_x_base_authority_generation
+		= tag_slot->resource_x_base_authority_generation;
+	progress_out->resource_x_authority_domain
+		= tag_slot->resource_x_authority_domain;
+	progress_out->resource_x_reserved = tag_slot->resource_x_reserved;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_resource_x_admission_bind_exact(
+	const PcmXLocalHandle *leader, const PcmXTicketRef *admission_ref,
+	uint64 admission_sequence, uint64 base_authority_generation)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || leader == NULL || admission_ref == NULL
+		|| admission_ref->grant_generation != 0 || admission_sequence == 0
+		|| admission_sequence == UINT64_MAX || base_authority_generation == 0
+		|| base_authority_generation == UINT64_MAX
+		|| !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_leader_slots_exact(leader, tag_ref, member_ref,
+		&tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto bind_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto bind_done;
+	}
+	if (pcm_x_slot_state_read(&member->slot) != PCM_XL_NODE_LEADER
+		|| !pcm_x_local_admission_ref_valid(&tag_slot->ref, &member->identity)
+		|| !pcm_x_ticket_admission_ref_equal(&tag_slot->ref, admission_ref)
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.last_response_opcode != PGRAC_IC_MSG_PCM_X_ADMIT_ACK) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto bind_done;
+	}
+	if (!pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+		|| tag_slot->resource_x_authority_domain
+			> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else if (tag_slot->resource_x_authority_domain
+			   == PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = tag_slot->resource_x_admission_sequence == admission_sequence
+				 && tag_slot->resource_x_base_authority_generation
+					== base_authority_generation
+			? PCM_X_QUEUE_DUPLICATE : PCM_X_QUEUE_STALE;
+	} else if (tag_slot->resource_x_admission_sequence != 0
+			   || tag_slot->resource_x_base_authority_generation != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else {
+		tag_slot->resource_x_admission_sequence = admission_sequence;
+		tag_slot->resource_x_base_authority_generation
+			= base_authority_generation;
+		resource_x_retry_state_clear(&tag_slot->retry_state);
+		tag_slot->retry_connection_generation = 0;
+		tag_slot->retry_connection_reserved = 0;
+		pg_write_barrier();
+		tag_slot->resource_x_authority_domain
+			= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X;
+		result = PCM_X_QUEUE_OK;
+	}
+
+bind_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_resource_x_admission_exact(
+	const PcmXLocalHandle *leader, uint64 *admission_sequence_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (admission_sequence_out != NULL)
+		*admission_sequence_out = 0;
+	if (header == NULL || leader == NULL || admission_sequence_out == NULL
+		|| !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE || runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_SHARED);
+	result = pcm_x_local_leader_slots_exact(leader, tag_ref, member_ref,
+		&tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto read_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0))
+		result = PCM_X_QUEUE_NOT_READY;
+	else if (!pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+			 || tag_slot->resource_x_authority_domain
+				> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else if (tag_slot->resource_x_authority_domain
+			   != PCM_X_AUTHORITY_DOMAIN_RESOURCE_X)
+		result = PCM_X_QUEUE_NOT_FOUND;
+	else if ((tag_slot->resource_x_reserved
+			  & PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY) == 0)
+		result = PCM_X_QUEUE_NOT_READY;
+	else if (tag_slot->resource_x_admission_sequence == 0
+			 || tag_slot->resource_x_admission_sequence == UINT64_MAX
+			 || tag_slot->resource_x_base_authority_generation == 0
+			 || tag_slot->resource_x_base_authority_generation == UINT64_MAX
+			 || tag_slot->ref.grant_generation != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else {
+		*admission_sequence_out = tag_slot->resource_x_admission_sequence;
+		result = PCM_X_QUEUE_OK;
+	}
+
+read_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (result != PCM_X_QUEUE_OK)
+		*admission_sequence_out = 0;
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/*
+ * Close the one-time authority-base late-bind window immediately before the
+ * requester emits its first Resource-X ASSERT_X.  This marker is process
+ * local and changes neither the retained ticket identity nor either protocol
+ * sequence.  A physical retry of the same assertion start is idempotent.
+ */
+PcmXQueueResult
+cluster_pcm_x_local_resource_x_assert_begin_exact(
+	const PcmXLocalHandle *leader, uint64 admission_sequence,
+	uint64 base_authority_generation)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || leader == NULL || admission_sequence == 0
+		|| admission_sequence == UINT64_MAX || base_authority_generation == 0
+		|| base_authority_generation == UINT64_MAX
+		|| !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_leader_slots_exact(
+		leader, tag_ref, member_ref, &tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto assert_begin_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto assert_begin_done;
+	}
+	if (!pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+		|| tag_slot->resource_x_authority_domain
+			> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto assert_begin_done;
+	}
+	if (tag_slot->resource_x_authority_domain
+		!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_NOT_FOUND;
+		goto assert_begin_done;
+	}
+	if (tag_slot->resource_x_admission_sequence != admission_sequence
+		|| tag_slot->resource_x_base_authority_generation
+			!= base_authority_generation) {
+		result = PCM_X_QUEUE_STALE;
+		goto assert_begin_done;
+	}
+	if ((tag_slot->resource_x_reserved
+		 & PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY) == 0) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto assert_begin_done;
+	}
+	if (pcm_x_slot_state_read(&member->slot) != PCM_XL_REMOTE_WAIT
+		|| tag_slot->ref.grant_generation != 0
+		|| tag_slot->semantic_generation != 0
+		|| tag_slot->committed_own_generation != 0
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.last_response_opcode
+			!= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto assert_begin_done;
+	}
+	if ((tag_slot->resource_x_reserved
+		 & PCM_X_LOCAL_RESOURCE_X_F_ASSERT_STARTED) != 0) {
+		result = PCM_X_QUEUE_DUPLICATE;
+		goto assert_begin_done;
+	}
+	tag_slot->resource_x_reserved
+		|= PCM_X_LOCAL_RESOURCE_X_F_ASSERT_STARTED;
+	pg_write_barrier();
+	result = PCM_X_QUEUE_OK;
+
+assert_begin_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/*
+ * Publish the requester-local effective ownership base when an authenticated
+ * Resource-X holder revoke consumed the immutable enqueue-time base before
+ * this selected round emitted ASSERT_X.  This is deliberately local-only:
+ * neither the logical assertion nor either Resource-X generation domain is
+ * rewritten.  A different second value is contradictory retained evidence.
+ */
+PcmXQueueResult
+cluster_pcm_x_local_resource_x_grant_rebase_publish_exact(
+	const PcmXLocalHandle *leader, uint64 admission_sequence,
+	uint64 base_authority_generation, uint64 rebased_own_generation)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || leader == NULL || admission_sequence == 0
+		|| admission_sequence == UINT64_MAX || base_authority_generation == 0
+		|| base_authority_generation == UINT64_MAX
+		|| rebased_own_generation == 0 || rebased_own_generation == UINT64_MAX
+		|| !pcm_x_wait_identity_valid(&leader->identity))
+		return PCM_X_QUEUE_INVALID;
+	if (rebased_own_generation <= leader->identity.base_own_generation)
+		return PCM_X_QUEUE_STALE;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_leader_slots_exact(leader, tag_ref, member_ref,
+		&tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto resource_x_rebase_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto resource_x_rebase_done;
+	}
+	if (!pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+		|| tag_slot->resource_x_authority_domain
+			> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto resource_x_rebase_done;
+	}
+	if (tag_slot->resource_x_authority_domain
+			!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+		|| tag_slot->resource_x_admission_sequence != admission_sequence
+		|| tag_slot->resource_x_base_authority_generation
+			!= base_authority_generation) {
+		result = PCM_X_QUEUE_STALE;
+		goto resource_x_rebase_done;
+	}
+	if ((tag_slot->resource_x_reserved
+		 & PCM_X_LOCAL_RESOURCE_X_F_ASSERT_STARTED) != 0) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto resource_x_rebase_done;
+	}
+	if (pcm_x_slot_state_read(&member->slot) != PCM_XL_REMOTE_WAIT
+		|| tag_slot->attempt_base_generation
+			!= member->identity.base_own_generation
+		|| tag_slot->ref.grant_generation != 0
+		|| tag_slot->semantic_generation != 0
+		|| tag_slot->committed_own_generation != 0
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.last_response_opcode
+			!= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto resource_x_rebase_done;
+	}
+	if (tag_slot->grant_base_own_generation == rebased_own_generation) {
+		result = PCM_X_QUEUE_DUPLICATE;
+		goto resource_x_rebase_done;
+	}
+	if (tag_slot->grant_base_own_generation != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto resource_x_rebase_done;
+	}
+	tag_slot->grant_base_own_generation = rebased_own_generation;
+	pg_write_barrier();
+	result = PCM_X_QUEUE_OK;
+
+resource_x_rebase_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/*
+ * Snapshot the requester-local half of one Resource-X attempt.  Identity
+ * remains immutable; the returned reservation base is the one-shot effective
+ * ownership base when an interleaved holder revoke already consumed it.
+ * The canonical authority generation identifies the master assertion; the
+ * returned own generation identifies the current local BufferDesc base.
+ * They are deliberately validated as separate generation domains.
+ */
+PcmXQueueResult
+cluster_pcm_x_local_resource_x_attempt_exact(
+	const ResourceXAssertion *assertion, uint64 admission_sequence,
+	uint64 base_authority_generation, uint64 *base_own_generation_out,
+	PcmXWaitIdentity *leader_identity_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *leader;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef leader_ref;
+	PcmXDirectoryResult directory_result;
+	PcmXQueueResult result;
+	uint64 expected_committed_generation;
+	uint64 base_own_generation;
+	uint32 partition;
+	uint32 state;
+	bool fail_closed = false;
+
+	if (base_own_generation_out != NULL)
+		*base_own_generation_out = 0;
+	if (leader_identity_out != NULL)
+		memset(leader_identity_out, 0, sizeof(*leader_identity_out));
+	if (header == NULL || !resource_x_assertion_valid(assertion)
+		|| assertion->requester_node != cluster_node_id
+		|| admission_sequence == 0 || admission_sequence == UINT64_MAX
+		|| base_authority_generation == 0
+		|| base_authority_generation == UINT64_MAX
+		|| base_own_generation_out == NULL || leader_identity_out == NULL)
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	directory_result = pcm_x_directory_find_locked(
+		PCM_X_DIR_LOCAL_TAG, &assertion->resource, &tag_ref);
+	if (directory_result == PCM_X_DIRECTORY_OK
+		&& pcm_x_slot_ref_resolve_locked(PCM_X_ALLOC_LOCAL_TAG, tag_ref) == NULL)
+		directory_result = PCM_X_DIRECTORY_CORRUPT;
+	LWLockRelease(&header->allocator_lock.lock);
+	if (directory_result != PCM_X_DIRECTORY_OK) {
+		result = directory_result == PCM_X_DIRECTORY_NOT_FOUND
+			? PCM_X_QUEUE_NOT_FOUND
+			: pcm_x_queue_result_from_directory(directory_result);
+		if (result == PCM_X_QUEUE_CORRUPT)
+			pcm_x_runtime_fail_closed();
+		return result;
+	}
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&assertion->resource));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_SHARED);
+	tag_slot = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_TAG, tag_ref, &assertion->resource,
+		PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	if (tag_slot == NULL || tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
+		|| tag_slot->leader_slot_generation == 0) {
+		result = PCM_X_QUEUE_STALE;
+		goto attempt_done;
+	}
+	leader_ref.slot_index = tag_slot->leader_index;
+	leader_ref.slot_generation = tag_slot->leader_slot_generation;
+	leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &assertion->resource,
+		PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+	if (leader == NULL || leader->role != PCM_X_LOCAL_ROLE_NODE_LEADER
+		|| leader->tag_slot_index != tag_ref.slot_index
+		|| leader->tag_slot_generation != tag_ref.slot_generation
+		|| !resource_x_assertion_equal(&tag_slot->logical_assertion,
+									 assertion)
+		|| !pcm_x_wait_identity_equal(&tag_slot->ref.identity,
+								&leader->identity)) {
+		result = PCM_X_QUEUE_STALE;
+		goto attempt_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto attempt_done;
+	}
+	state = pcm_x_slot_state_read(&leader->slot);
+	base_own_generation = pcm_x_local_effective_grant_base(tag_slot);
+	if (!pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+		|| tag_slot->resource_x_authority_domain
+			> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto attempt_done;
+	}
+	if (tag_slot->resource_x_authority_domain
+		!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		if (tag_slot->resource_x_admission_sequence != 0
+			|| tag_slot->resource_x_base_authority_generation != 0) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+		} else
+			result = PCM_X_QUEUE_NOT_FOUND;
+		goto attempt_done;
+	}
+	if (tag_slot->resource_x_admission_sequence == 0
+		|| tag_slot->resource_x_admission_sequence == UINT64_MAX
+		|| tag_slot->resource_x_base_authority_generation == 0
+		|| tag_slot->resource_x_base_authority_generation == UINT64_MAX
+		|| tag_slot->ref.handle.ticket_id == 0
+		|| tag_slot->ref.handle.queue_generation == 0
+		|| base_own_generation == UINT64_MAX) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto attempt_done;
+	}
+	if (tag_slot->grant_base_own_generation != 0
+		&& tag_slot->grant_base_own_generation
+			<= leader->identity.base_own_generation) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto attempt_done;
+	}
+	if (tag_slot->resource_x_admission_sequence != admission_sequence
+		|| tag_slot->resource_x_base_authority_generation
+			!= base_authority_generation) {
+		result = PCM_X_QUEUE_STALE;
+		goto attempt_done;
+	}
+	if (!pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.last_response_opcode
+			!= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto attempt_done;
+	}
+	if (state == PCM_XL_REMOTE_WAIT) {
+		if (tag_slot->ref.grant_generation != 0
+			|| tag_slot->semantic_generation != 0
+			|| tag_slot->committed_own_generation != 0) {
+			result = PCM_X_QUEUE_BAD_STATE;
+			goto attempt_done;
+		}
+		result = PCM_X_QUEUE_OK;
+	} else if (state == PCM_XL_GRANTED) {
+		if (!cluster_pcm_x_generation_next(base_own_generation,
+				&expected_committed_generation)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+			goto attempt_done;
+		}
+		result = tag_slot->ref.grant_generation == admission_sequence
+			&& tag_slot->semantic_generation == admission_sequence
+			&& tag_slot->committed_own_generation
+				== expected_committed_generation
+			? PCM_X_QUEUE_DUPLICATE : PCM_X_QUEUE_STALE;
+	} else
+		result = PCM_X_QUEUE_BAD_STATE;
+
+	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE) {
+		*base_own_generation_out = base_own_generation;
+		*leader_identity_out = leader->identity;
+	}
+
+attempt_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+/*
+ * Publish the temporary queue projection only after Resource-X T3 completed.
+ * The input image deliberately has image_id zero: this engine mints the
+ * legacy-local token for the exact queue master, while every semantic field
+ * remains supplied by and checked against the Resource-X terminal proof.
+ */
+PcmXQueueResult
+cluster_pcm_x_local_resource_x_grant_publish_exact(
+	const ResourceXAssertion *assertion, uint64 admission_sequence,
+	uint64 committed_own_generation, const PcmXImageToken *image,
+	PcmXWaitIdentity *leader_identity_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *leader;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef leader_ref;
+	PcmXDirectoryResult directory_result;
+	PcmXQueueResult result;
+	PcmXImageToken published_image;
+	uint64 expected_generation;
+	uint64 image_id = 0;
+	uint32 partition;
+	uint32 state;
+	int32 master_node = -1;
+	bool fail_closed = false;
+
+	if (leader_identity_out != NULL)
+		memset(leader_identity_out, 0, sizeof(*leader_identity_out));
+	if (header == NULL || !resource_x_assertion_valid(assertion)
+		|| assertion->requester_node != cluster_node_id
+		|| admission_sequence == 0 || admission_sequence == UINT64_MAX
+		|| committed_own_generation == 0 || image == NULL
+		|| image->image_id != 0 || image->source_own_generation == 0
+		|| image->source_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| leader_identity_out == NULL)
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	directory_result = pcm_x_directory_find_locked(
+		PCM_X_DIR_LOCAL_TAG, &assertion->resource, &tag_ref);
+	if (directory_result == PCM_X_DIRECTORY_OK) {
+		tag_slot = (PcmXLocalTagSlot *)pcm_x_slot_ref_resolve_locked(
+			PCM_X_ALLOC_LOCAL_TAG, tag_ref);
+		if (tag_slot == NULL)
+			directory_result = PCM_X_DIRECTORY_CORRUPT;
+	}
+	LWLockRelease(&header->allocator_lock.lock);
+	if (directory_result != PCM_X_DIRECTORY_OK) {
+		result = directory_result == PCM_X_DIRECTORY_NOT_FOUND
+			? PCM_X_QUEUE_NOT_FOUND
+			: pcm_x_queue_result_from_directory(directory_result);
+		if (result == PCM_X_QUEUE_CORRUPT)
+			pcm_x_runtime_fail_closed();
+		return result;
+	}
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&assertion->resource));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_SHARED);
+	tag_slot = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_TAG, tag_ref, &assertion->resource,
+		PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	if (tag_slot == NULL || tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
+		|| tag_slot->leader_slot_generation == 0) {
+		result = PCM_X_QUEUE_STALE;
+		goto grant_probe_done;
+	}
+	leader_ref.slot_index = tag_slot->leader_index;
+	leader_ref.slot_generation = tag_slot->leader_slot_generation;
+	leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &assertion->resource,
+		PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+	if (leader == NULL || leader->role != PCM_X_LOCAL_ROLE_NODE_LEADER
+		|| leader->tag_slot_index != tag_ref.slot_index
+		|| leader->tag_slot_generation != tag_ref.slot_generation
+		|| !resource_x_assertion_equal(&tag_slot->logical_assertion,
+									 assertion)
+		|| !pcm_x_wait_identity_equal(&tag_slot->ref.identity,
+								&leader->identity)) {
+		result = PCM_X_QUEUE_STALE;
+		goto grant_probe_done;
+	}
+	state = pcm_x_slot_state_read(&leader->slot);
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto grant_probe_done;
+	}
+	if (state == PCM_XL_GRANTED) {
+		result = tag_slot->resource_x_authority_domain
+				 == PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+			&& tag_slot->resource_x_admission_sequence == admission_sequence
+			&& tag_slot->resource_x_base_authority_generation != 0
+			&& tag_slot->resource_x_base_authority_generation != UINT64_MAX
+			&& tag_slot->ref.grant_generation == admission_sequence
+			&& tag_slot->semantic_generation == admission_sequence
+			&& tag_slot->committed_own_generation == committed_own_generation
+			&& tag_slot->image.source_own_generation
+				 == image->source_own_generation
+			&& tag_slot->image.page_scn == image->page_scn
+			&& tag_slot->image.page_lsn == image->page_lsn
+			&& tag_slot->image.source_node == image->source_node
+			&& tag_slot->image.page_checksum == image->page_checksum
+			&& pcm_x_image_id_master_exact(tag_slot->image.image_id,
+										 tag_slot->master_node)
+			? PCM_X_QUEUE_DUPLICATE : PCM_X_QUEUE_STALE;
+		if (result == PCM_X_QUEUE_DUPLICATE)
+			*leader_identity_out = leader->identity;
+		goto grant_probe_done;
+	}
+	if (state != PCM_XL_REMOTE_WAIT
+		|| !pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+		|| tag_slot->resource_x_authority_domain
+			!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+		|| tag_slot->resource_x_admission_sequence != admission_sequence
+		|| tag_slot->resource_x_base_authority_generation == 0
+		|| tag_slot->resource_x_base_authority_generation == UINT64_MAX
+		|| tag_slot->ref.grant_generation != 0
+		|| tag_slot->semantic_generation != 0
+		|| tag_slot->committed_own_generation != 0
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.last_response_opcode
+			!= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto grant_probe_done;
+	}
+	if (!cluster_pcm_x_generation_next(
+			pcm_x_local_effective_grant_base(tag_slot),
+			&expected_generation)
+		|| committed_own_generation != expected_generation) {
+		result = PCM_X_QUEUE_STALE;
+		goto grant_probe_done;
+	}
+	master_node = tag_slot->master_node;
+	result = PCM_X_QUEUE_OK;
+
+grant_probe_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	result = pcm_x_image_id_mint(master_node, &image_id);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+
+	published_image = *image;
+	published_image.image_id = image_id;
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	tag_slot = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_TAG, tag_ref, &assertion->resource,
+		PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+	if (tag_slot == NULL || tag_slot->leader_index != leader_ref.slot_index
+		|| tag_slot->leader_slot_generation != leader_ref.slot_generation) {
+		result = PCM_X_QUEUE_STALE;
+		goto grant_publish_done;
+	}
+	leader = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_WAIT, leader_ref, &assertion->resource,
+		PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
+	if (leader == NULL || leader->role != PCM_X_LOCAL_ROLE_NODE_LEADER
+		|| leader->tag_slot_index != tag_ref.slot_index
+		|| leader->tag_slot_generation != tag_ref.slot_generation
+		|| !resource_x_assertion_equal(&tag_slot->logical_assertion,
+									 assertion)
+		|| !pcm_x_wait_identity_equal(&tag_slot->ref.identity,
+								&leader->identity)) {
+		result = PCM_X_QUEUE_STALE;
+		goto grant_publish_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto grant_publish_done;
+	}
+	state = pcm_x_slot_state_read(&leader->slot);
+	if (state == PCM_XL_GRANTED) {
+		result = tag_slot->resource_x_admission_sequence == admission_sequence
+			&& tag_slot->resource_x_base_authority_generation != 0
+			&& tag_slot->resource_x_base_authority_generation != UINT64_MAX
+			&& tag_slot->ref.grant_generation == admission_sequence
+			&& tag_slot->semantic_generation == admission_sequence
+			&& tag_slot->committed_own_generation == committed_own_generation
+			? PCM_X_QUEUE_DUPLICATE : PCM_X_QUEUE_STALE;
+		if (result == PCM_X_QUEUE_DUPLICATE)
+			*leader_identity_out = leader->identity;
+		goto grant_publish_done;
+	}
+	if (state != PCM_XL_REMOTE_WAIT
+		|| tag_slot->master_node != master_node
+		|| !pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+		|| tag_slot->resource_x_authority_domain
+			!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+		|| tag_slot->resource_x_admission_sequence != admission_sequence
+		|| tag_slot->resource_x_base_authority_generation == 0
+		|| tag_slot->resource_x_base_authority_generation == UINT64_MAX
+		|| tag_slot->ref.grant_generation != 0
+		|| tag_slot->semantic_generation != 0
+		|| tag_slot->committed_own_generation != 0
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.last_response_opcode
+			!= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK) {
+		result = PCM_X_QUEUE_BAD_STATE;
+		goto grant_publish_done;
+	}
+	if (!cluster_pcm_x_generation_next(
+			pcm_x_local_effective_grant_base(tag_slot),
+			&expected_generation)
+		|| committed_own_generation != expected_generation) {
+		result = PCM_X_QUEUE_STALE;
+		goto grant_publish_done;
+	}
+	tag_slot->ref.grant_generation = admission_sequence;
+	tag_slot->image = published_image;
+	tag_slot->committed_own_generation = committed_own_generation;
+	tag_slot->semantic_generation = admission_sequence;
+	pg_write_barrier();
+	pcm_x_slot_state_write(&leader->slot, PCM_XL_GRANTED);
+	*leader_identity_out = leader->identity;
+	result = PCM_X_QUEUE_OK;
+
+grant_publish_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
 }
 
 
@@ -16174,6 +18153,10 @@ rekey_allocator_commit_done:
 	tag_slot->attempt_base_generation = target_identity.base_own_generation;
 	tag_slot->transport_epoch = target_identity.cluster_epoch;
 	tag_slot->transport_session = tag_slot->master_session_incarnation;
+	tag_slot->resource_x_admission_sequence = 0;
+	tag_slot->resource_x_base_authority_generation = 0;
+	tag_slot->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_NONE;
+	tag_slot->resource_x_reserved = 0;
 	pcm_x_local_handle_from_member(rekeyed_out, member_ref, member, PCM_X_LOCAL_ROLE_NODE_LEADER);
 	if (!pcm_x_local_gate_release(tag_slot)) {
 		result = PCM_X_QUEUE_CORRUPT;
@@ -16437,6 +18420,457 @@ claim_done:
 		pcm_x_local_writer_claim_clear(claim_out);
 	if (fail_closed)
 		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+static void
+pcm_x_local_writer_revoke_fence_clear(PcmXLocalWriterRevokeFence *fence)
+{
+	if (fence == NULL)
+		return;
+	memset(fence, 0, sizeof(*fence));
+	fence->tag_slot.slot_index = PCM_X_INVALID_SLOT_INDEX;
+}
+
+
+/*
+ * Resource-X formation and DATA transport epoch are distinct domains.  The
+ * former is the PCM-X runtime-gate generation carried by type-17; the latter
+ * lives in the formation-bound peer frontier and in any resident local tag.
+ * Keep them separate while proving the exact master session.  A self-master
+ * frame has no remote frontier dependency, so its current ACTIVE runtime is
+ * the authority; when a self frontier is present, it must still agree.
+ */
+static bool
+pcm_x_local_writer_revoke_authority_exact(
+	PcmXShmemHeader *header, const PcmXRuntimeSnapshot *runtime,
+	uint64 resource_formation, int32 master_node,
+	uint64 master_session_incarnation)
+{
+	PcmXPeerFrontier *frontier;
+
+	if (header == NULL || runtime == NULL
+		|| runtime->gate_generation != resource_formation
+		|| !pcm_x_runtime_token_exact(runtime, 0))
+		return false;
+	frontier = &header->peer_frontiers[master_node];
+	if (master_node == cluster_node_id) {
+		if (runtime->master_session_incarnation
+				!= master_session_incarnation)
+			return false;
+		return frontier->sender_session_incarnation == 0
+			|| frontier->sender_session_incarnation
+				   == master_session_incarnation;
+	}
+	return frontier->sender_session_incarnation
+		   == master_session_incarnation;
+}
+
+
+static bool
+pcm_x_local_writer_revoke_tag_authority_exact(
+	PcmXShmemHeader *header, const PcmXLocalTagSlot *tag_slot,
+	uint64 resource_formation, int32 master_node,
+	uint64 master_session_incarnation)
+{
+	PcmXPeerFrontier *frontier;
+
+	if (header == NULL || tag_slot == NULL
+		|| resource_formation == 0
+		|| tag_slot->master_node != master_node
+		|| tag_slot->master_session_incarnation
+			   != master_session_incarnation)
+		return false;
+	/* Resource-X compatibility locators and fence-created shells bind their
+	 * tag epoch to the exact runtime formation.  Ordinary requester/holder
+	 * tags bind it to the DATA transport frontier instead.  These are two
+	 * explicit exact domains, not interchangeable generations. */
+	if (tag_slot->cluster_epoch == resource_formation)
+		return true;
+	frontier = &header->peer_frontiers[master_node];
+	/* Direct unit activation may omit the optional self binding.  Production
+	 * formation activation binds it; any present binding is exact. */
+	if (frontier->sender_session_incarnation == 0)
+		return master_node == cluster_node_id;
+	return frontier->sender_session_incarnation
+			   == master_session_incarnation
+		&& frontier->cluster_epoch == tag_slot->cluster_epoch;
+}
+
+
+static bool
+pcm_x_local_writer_revoke_fence_token_valid(
+	const PcmXLocalWriterRevokeFence *fence)
+{
+	return fence != NULL
+		&& resource_x_assertion_valid(&fence->assertion)
+		&& fence->tag_slot.slot_index != PCM_X_INVALID_SLOT_INDEX
+		&& fence->tag_slot.slot_generation != 0
+		&& fence->assertion_sequence != 0
+		&& fence->assertion_sequence != UINT64_MAX
+		&& fence->resource_formation != 0
+		&& fence->master_node >= 0
+		&& fence->master_node < PCM_X_PROTOCOL_NODE_LIMIT
+		&& fence->master_session_incarnation != 0
+		&& fence->local_round != 0
+		&& fence->reserved == 0
+		&& (fence->flags & ~PCM_X_WRITER_REVOKE_F_KNOWN) == 0
+		&& (fence->flags & PCM_X_WRITER_REVOKE_F_HELD) != 0;
+}
+
+
+static bool
+pcm_x_local_writer_revoke_shell_pristine(
+	const PcmXLocalTagSlot *tag_slot,
+	const PcmXLocalWriterRevokeFence *fence)
+{
+	return tag_slot != NULL && fence != NULL
+		&& pcm_x_slot_state_read(&tag_slot->slot)
+			   == PCM_X_TAG_RESERVED_NONVISIBLE
+		&& pcm_x_slot_flags_read(&tag_slot->slot)
+			   == PCM_X_LOCAL_TAG_F_ADMISSION_GATE
+		&& BufferTagsEqual(&tag_slot->tag, &fence->assertion.resource)
+		&& tag_slot->master_node == fence->master_node
+		&& tag_slot->master_session_incarnation
+			   == fence->master_session_incarnation
+		&& tag_slot->writer_claim_generation
+			   == fence->writer_claim_generation
+		&& tag_slot->local_round == fence->local_round
+		&& tag_slot->membership_count == 0
+		&& tag_slot->closed_round_member_count == 0
+		&& tag_slot->head_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->tail_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->leader_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->active_writer_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->active_writer_slot_generation == 0
+		&& tag_slot->active_holder_head_index == PCM_X_INVALID_SLOT_INDEX
+		&& tag_slot->blocker_snapshot_head_index == PCM_X_INVALID_SLOT_INDEX
+		&& pcm_x_local_semantic_projection_clear(tag_slot);
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_writer_revoke_fence_acquire_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence,
+	uint64 resource_formation, int32 master_node,
+	uint64 master_session_incarnation, PcmXLocalWriterRevokeFence *fence_out)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot = NULL;
+	PcmXSlotHeader *raw_slot;
+	PcmXSlotRef existing;
+	PcmXSlotRef tag_ref = { PCM_X_INVALID_SLOT_INDEX, 0 };
+	PcmXDirectoryResult directory_result;
+	PcmXAllocatorResult allocator_result;
+	PcmXQueueResult result;
+	uint64 shell_epoch;
+	uint32 partition;
+	bool created_shell = false;
+	bool fail_closed = false;
+	bool gate_held = false;
+
+	pcm_x_local_writer_revoke_fence_clear(fence_out);
+	if (header == NULL || !resource_x_assertion_valid(assertion)
+		|| assertion_sequence == 0 || assertion_sequence == UINT64_MAX
+		|| resource_formation == 0 || master_node < 0
+		|| master_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| master_session_incarnation == 0 || fence_out == NULL)
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	if (!pcm_x_local_writer_revoke_authority_exact(
+			header, &runtime, resource_formation, master_node,
+			master_session_incarnation))
+		return PCM_X_QUEUE_STALE;
+
+	LWLockAcquire(&header->allocator_lock.lock, LW_EXCLUSIVE);
+	result = pcm_x_local_retire_episode_state_locked(header);
+	if (result != PCM_X_QUEUE_OK)
+		goto fence_allocator_done;
+	directory_result = pcm_x_directory_find_locked(
+		PCM_X_DIR_LOCAL_TAG, &assertion->resource, &tag_ref);
+	if (directory_result == PCM_X_DIRECTORY_OK) {
+		tag_slot = (PcmXLocalTagSlot *)pcm_x_slot_ref_resolve_locked(
+			PCM_X_ALLOC_LOCAL_TAG, tag_ref);
+		result = pcm_x_resident_tag_state_result(
+			tag_slot == NULL ? NULL : &tag_slot->slot);
+		if (result != PCM_X_QUEUE_OK) {
+			if (result == PCM_X_QUEUE_NOT_READY)
+				result = PCM_X_QUEUE_BUSY;
+			goto fence_allocator_done;
+		}
+		if (!BufferTagsEqual(&tag_slot->tag, &assertion->resource)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+			goto fence_allocator_done;
+		}
+		result = pcm_x_local_handoff_gate_claim_locked(
+			header, tag_slot, false, PCM_X_QUEUE_BUSY);
+		gate_held = result == PCM_X_QUEUE_OK;
+		goto fence_allocator_done;
+	}
+	if (directory_result != PCM_X_DIRECTORY_NOT_FOUND) {
+		result = pcm_x_queue_result_from_directory(directory_result);
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto fence_allocator_done;
+	}
+	shell_epoch = resource_formation;
+	allocator_result = pcm_x_allocator_reserve_locked(
+		PCM_X_ALLOC_LOCAL_TAG, &tag_ref, &raw_slot);
+	if (allocator_result != PCM_X_ALLOC_OK) {
+		result = pcm_x_queue_result_from_allocator(allocator_result);
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto fence_allocator_done;
+	}
+	tag_slot = (PcmXLocalTagSlot *)raw_slot;
+	pcm_x_local_tag_init_common(tag_slot, &assertion->resource, shell_epoch,
+		master_node, master_session_incarnation);
+	directory_result = pcm_x_directory_insert_locked(
+		PCM_X_DIR_LOCAL_TAG, &assertion->resource, tag_ref, &existing);
+	if (directory_result != PCM_X_DIRECTORY_OK) {
+		result = directory_result == PCM_X_DIRECTORY_EXISTS
+			? PCM_X_QUEUE_CORRUPT
+			: pcm_x_queue_result_from_directory(directory_result);
+		if (pcm_x_allocator_release_locked(
+				PCM_X_ALLOC_LOCAL_TAG, tag_ref,
+				PCM_X_TAG_RESERVED_NONVISIBLE) != PCM_X_ALLOC_OK)
+			result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		tag_ref = (PcmXSlotRef){ PCM_X_INVALID_SLOT_INDEX, 0 };
+		goto fence_allocator_done;
+	}
+	created_shell = true;
+	gate_held = true;
+	result = PCM_X_QUEUE_OK;
+
+fence_allocator_done:
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != PCM_X_QUEUE_OK)
+		goto fence_acquire_done;
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&assertion->resource));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	tag_slot = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_TAG, tag_ref, &assertion->resource,
+		PCM_X_STATE_BIT(created_shell ? PCM_X_TAG_RESERVED_NONVISIBLE
+									: PCM_X_TAG_LIVE));
+	if (tag_slot == NULL)
+		result = PCM_X_QUEUE_STALE;
+	else if (!pcm_x_local_writer_revoke_authority_exact(
+				header, &runtime, resource_formation, master_node,
+				master_session_incarnation)
+			 || !pcm_x_local_writer_revoke_tag_authority_exact(
+				header, tag_slot, resource_formation, master_node,
+				master_session_incarnation))
+		result = PCM_X_QUEUE_STALE;
+	else if ((pcm_x_slot_flags_read(&tag_slot->slot)
+			  & PCM_X_LOCAL_TAG_F_ADMISSION_GATE) == 0
+			 || (tag_slot->active_writer_index == PCM_X_INVALID_SLOT_INDEX)
+					!= (tag_slot->active_writer_slot_generation == 0)) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else if (tag_slot->active_writer_index != PCM_X_INVALID_SLOT_INDEX)
+		result = PCM_X_QUEUE_BUSY;
+	else {
+		fence_out->assertion = *assertion;
+		fence_out->tag_slot = tag_ref;
+		fence_out->assertion_sequence = assertion_sequence;
+		fence_out->resource_formation = resource_formation;
+		fence_out->master_session_incarnation
+			= master_session_incarnation;
+		fence_out->writer_claim_generation
+			= tag_slot->writer_claim_generation;
+		fence_out->local_round = tag_slot->local_round;
+		fence_out->master_node = master_node;
+		fence_out->flags = PCM_X_WRITER_REVOKE_F_HELD
+			| (created_shell ? PCM_X_WRITER_REVOKE_F_CREATED_SHELL : 0);
+		result = PCM_X_QUEUE_OK;
+	}
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (result != PCM_X_QUEUE_OK && !fail_closed && gate_held) {
+		if (created_shell) {
+			if (!pcm_x_local_holder_transfer_tag_abort_new(
+					&assertion->resource, tag_ref, tag_slot)) {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+			}
+		} else if (!pcm_x_local_gate_release(tag_slot)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+		}
+	}
+
+fence_acquire_done:
+	if (result != PCM_X_QUEUE_OK)
+		pcm_x_local_writer_revoke_fence_clear(fence_out);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_writer_revoke_fence_revalidate_held_exact(
+	const PcmXLocalWriterRevokeFence *fence)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXSlotRef found;
+	PcmXDirectoryResult directory_result;
+	PcmXQueueResult result;
+	uint32 expected_state;
+	uint32 flags;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || !pcm_x_local_writer_revoke_fence_token_valid(fence))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (!pcm_x_local_writer_revoke_authority_exact(
+			header, &runtime, fence->resource_formation,
+			fence->master_node, fence->master_session_incarnation))
+		return PCM_X_QUEUE_STALE;
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	directory_result = pcm_x_directory_find_locked(
+		PCM_X_DIR_LOCAL_TAG, &fence->assertion.resource, &found);
+	LWLockRelease(&header->allocator_lock.lock);
+	if (directory_result != PCM_X_DIRECTORY_OK
+		|| found.slot_index != fence->tag_slot.slot_index
+		|| found.slot_generation != fence->tag_slot.slot_generation) {
+		if (directory_result != PCM_X_DIRECTORY_NOT_FOUND
+			&& directory_result != PCM_X_DIRECTORY_OK)
+			return pcm_x_queue_result_from_directory(directory_result);
+		pcm_x_runtime_fail_closed();
+		return PCM_X_QUEUE_CORRUPT;
+	}
+	expected_state
+		= (fence->flags & PCM_X_WRITER_REVOKE_F_CREATED_SHELL) != 0
+		? PCM_X_TAG_RESERVED_NONVISIBLE : PCM_X_TAG_LIVE;
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&fence->assertion.resource));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_SHARED);
+	tag_slot = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+		PCM_X_ALLOC_LOCAL_TAG, found, &fence->assertion.resource,
+		PCM_X_STATE_BIT(expected_state));
+	if (tag_slot == NULL
+		|| !pcm_x_local_writer_revoke_tag_authority_exact(
+			header, tag_slot, fence->resource_formation,
+			fence->master_node,
+			fence->master_session_incarnation)) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+	} else {
+		flags = pcm_x_slot_flags_read(&tag_slot->slot);
+		if ((flags & PCM_X_LOCAL_TAG_F_ADMISSION_GATE) == 0
+			|| tag_slot->local_round != fence->local_round
+			|| tag_slot->writer_claim_generation
+				   != fence->writer_claim_generation
+			|| (tag_slot->active_writer_index == PCM_X_INVALID_SLOT_INDEX)
+					!= (tag_slot->active_writer_slot_generation == 0)
+			|| tag_slot->active_writer_index != PCM_X_INVALID_SLOT_INDEX
+			|| ((fence->flags & PCM_X_WRITER_REVOKE_F_CREATED_SHELL) != 0
+				&& !pcm_x_local_writer_revoke_shell_pristine(
+					tag_slot, fence))) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+		} else
+			result = PCM_X_QUEUE_OK;
+	}
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
+PcmXQueueResult
+cluster_pcm_x_local_writer_revoke_fence_release_exact(
+	PcmXLocalWriterRevokeFence *fence)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXSlotRef found;
+	PcmXDirectoryResult directory_result;
+	PcmXQueueResult result = PCM_X_QUEUE_OK;
+	uint32 partition;
+	bool created_shell;
+	bool fail_closed = false;
+
+	if (header == NULL || !pcm_x_local_writer_revoke_fence_token_valid(fence))
+		return PCM_X_QUEUE_INVALID;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (!pcm_x_local_writer_revoke_authority_exact(
+			header, &runtime, fence->resource_formation,
+			fence->master_node, fence->master_session_incarnation))
+		return PCM_X_QUEUE_STALE;
+	created_shell
+		= (fence->flags & PCM_X_WRITER_REVOKE_F_CREATED_SHELL) != 0;
+	if (created_shell) {
+		LWLockAcquire(&header->allocator_lock.lock, LW_EXCLUSIVE);
+		directory_result = pcm_x_directory_find_locked(
+			PCM_X_DIR_LOCAL_TAG, &fence->assertion.resource, &found);
+		if (directory_result != PCM_X_DIRECTORY_OK
+			|| found.slot_index != fence->tag_slot.slot_index
+			|| found.slot_generation != fence->tag_slot.slot_generation)
+			result = PCM_X_QUEUE_CORRUPT;
+		else {
+			tag_slot = (PcmXLocalTagSlot *)pcm_x_slot_ref_resolve_locked(
+				PCM_X_ALLOC_LOCAL_TAG, found);
+			if (!pcm_x_local_writer_revoke_shell_pristine(tag_slot, fence)
+				|| pcm_x_directory_delete_exact_locked(
+					PCM_X_DIR_LOCAL_TAG, &fence->assertion.resource, found)
+					   != PCM_X_DIRECTORY_OK
+				|| pcm_x_allocator_release_locked(
+					PCM_X_ALLOC_LOCAL_TAG, found,
+					PCM_X_TAG_RESERVED_NONVISIBLE) != PCM_X_ALLOC_OK)
+				result = PCM_X_QUEUE_CORRUPT;
+		}
+		LWLockRelease(&header->allocator_lock.lock);
+	} else {
+		LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+		directory_result = pcm_x_directory_find_locked(
+			PCM_X_DIR_LOCAL_TAG, &fence->assertion.resource, &found);
+		LWLockRelease(&header->allocator_lock.lock);
+		if (directory_result != PCM_X_DIRECTORY_OK
+			|| found.slot_index != fence->tag_slot.slot_index
+			|| found.slot_generation != fence->tag_slot.slot_generation)
+			result = PCM_X_QUEUE_CORRUPT;
+		else {
+			partition = cluster_pcm_x_lock_partition(
+				cluster_pcm_x_tag_hash(&fence->assertion.resource));
+			LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+			tag_slot = (PcmXLocalTagSlot *)pcm_x_domain_slot(
+				PCM_X_ALLOC_LOCAL_TAG, found, &fence->assertion.resource,
+				PCM_X_STATE_BIT(PCM_X_TAG_LIVE));
+			if (tag_slot == NULL
+				|| !pcm_x_local_writer_revoke_tag_authority_exact(
+					header, tag_slot, fence->resource_formation,
+					fence->master_node,
+					fence->master_session_incarnation)
+				|| tag_slot->local_round != fence->local_round
+				|| tag_slot->writer_claim_generation
+					   != fence->writer_claim_generation
+				|| tag_slot->active_writer_index != PCM_X_INVALID_SLOT_INDEX
+				|| tag_slot->active_writer_slot_generation != 0
+				|| !pcm_x_local_gate_release(tag_slot))
+				result = PCM_X_QUEUE_CORRUPT;
+			LWLockRelease(&header->local_locks[partition].lock);
+		}
+	}
+	if (result == PCM_X_QUEUE_OK)
+		pcm_x_local_writer_revoke_fence_clear(fence);
+	else {
+		fail_closed = true;
+		pcm_x_runtime_fail_closed();
+	}
+	(void)fail_closed;
 	return result;
 }
 
@@ -16787,7 +19221,7 @@ pcm_x_local_outbound_authority_exact(const PcmXLocalTagSlot *tag_slot,
 
 static bool
 pcm_x_local_reliable_leg_valid(const PcmXLocalTagSlot *tag_slot,
-							   const PcmXLocalMembershipSlot *member)
+								   const PcmXLocalMembershipSlot *member)
 {
 	const PcmXReliableLegState *leg;
 	uint32 member_state;
@@ -16828,6 +19262,62 @@ pcm_x_local_reliable_leg_valid(const PcmXLocalTagSlot *tag_slot,
 			   && tag_slot->ref.grant_generation != 0 && pcm_x_image_token_valid(&tag_slot->image)
 			   && tag_slot->committed_own_generation != 0;
 	return false;
+}
+
+
+/* Resource-X publishes the local GRANTED compatibility projection only after
+ * T3 and deliberately never arms the legacy FINAL_CONFIRM leg.  Its terminal
+ * cleanup therefore consumes the exact, quiescent post-ADMIT_CONFIRM_ACK
+ * projection instead of manufacturing a legacy response. */
+static bool
+pcm_x_local_resource_x_terminal_projection_exact(
+	const PcmXLocalTagSlot *tag_slot, const PcmXLocalMembershipSlot *member)
+{
+	uint64 expected_committed_generation;
+
+	if (tag_slot == NULL || member == NULL
+		|| !pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+		|| tag_slot->resource_x_authority_domain
+			!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+		|| tag_slot->resource_x_admission_sequence == 0
+		|| tag_slot->resource_x_admission_sequence == UINT64_MAX
+		|| tag_slot->resource_x_base_authority_generation == 0
+		|| tag_slot->resource_x_base_authority_generation == UINT64_MAX
+		|| tag_slot->ref.grant_generation
+			!= tag_slot->resource_x_admission_sequence
+		|| tag_slot->semantic_generation
+			!= tag_slot->resource_x_admission_sequence
+		|| !resource_x_assertion_valid(&tag_slot->logical_assertion)
+		|| !BufferTagsEqual(&tag_slot->logical_assertion.resource,
+							&tag_slot->tag)
+		|| tag_slot->logical_assertion.requester_node != member->identity.node_id
+		|| tag_slot->logical_assertion.requester_node != cluster_node_id
+		|| tag_slot->attempt_base_generation
+			!= member->identity.base_own_generation
+		|| tag_slot->transport_epoch != tag_slot->cluster_epoch
+		|| tag_slot->transport_session
+			!= tag_slot->master_session_incarnation
+		|| tag_slot->image.source_own_generation == 0
+		|| !pcm_x_image_token_valid(&tag_slot->image)
+		|| !pcm_x_image_id_master_exact(tag_slot->image.image_id,
+									   tag_slot->master_node)
+		|| !pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)
+		|| tag_slot->reliable.state_sequence == 0
+		|| tag_slot->reliable.response_tombstone_mask != 0
+		|| tag_slot->reliable.last_responder_node
+			!= (uint32)tag_slot->master_node
+		|| tag_slot->reliable.last_response_opcode
+			!= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK)
+		return false;
+	if (tag_slot->grant_base_own_generation != 0
+		&& tag_slot->grant_base_own_generation
+			<= member->identity.base_own_generation)
+		return false;
+	if (!cluster_pcm_x_generation_next(pcm_x_local_effective_grant_base(tag_slot),
+			&expected_committed_generation))
+		return false;
+	return tag_slot->committed_own_generation
+		== expected_committed_generation;
 }
 
 
@@ -17215,6 +19705,10 @@ pcm_x_local_retry_projection_set_locked(PcmXLocalTagSlot *tag_slot,
 	tag_slot->transport_epoch = tag_slot->cluster_epoch;
 	tag_slot->transport_session = tag_slot->master_session_incarnation;
 	tag_slot->semantic_generation = 0;
+	tag_slot->resource_x_admission_sequence = 0;
+	tag_slot->resource_x_base_authority_generation = 0;
+	tag_slot->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_NONE;
+	tag_slot->resource_x_reserved = 0;
 	return true;
 }
 
@@ -17225,6 +19719,7 @@ pcm_x_local_retry_attempt_exact(const PcmXLocalTagSlot *tag_slot,
 								ResourceXAttemptWitness *attempt_out)
 {
 	ResourceXAttemptWitness attempt;
+	uint64 retry_base_generation;
 
 	if (tag_slot == NULL || member == NULL || attempt_out == NULL
 		|| !resource_x_assertion_valid(&tag_slot->logical_assertion)
@@ -17233,12 +19728,86 @@ pcm_x_local_retry_attempt_exact(const PcmXLocalTagSlot *tag_slot,
 		|| tag_slot->logical_assertion.requester_node != member->identity.node_id
 		|| tag_slot->attempt_base_generation != member->identity.base_own_generation
 		|| tag_slot->transport_epoch != tag_slot->cluster_epoch
-		|| tag_slot->transport_session != tag_slot->master_session_incarnation
-		|| !pcm_x_local_retry_member_attempt_exact(member, &attempt)
-		|| !resource_x_assertion_equal(&attempt.assertion, &tag_slot->logical_assertion))
+		|| tag_slot->transport_session != tag_slot->master_session_incarnation)
+		return false;
+	if (tag_slot->resource_x_authority_domain
+		== PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		if (!pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+			|| tag_slot->resource_x_admission_sequence == 0
+			|| tag_slot->resource_x_admission_sequence == UINT64_MAX
+			|| tag_slot->resource_x_base_authority_generation == 0
+			|| tag_slot->resource_x_base_authority_generation == UINT64_MAX)
+			return false;
+		retry_base_generation
+			= tag_slot->resource_x_base_authority_generation;
+	} else if (tag_slot->resource_x_authority_domain
+			   == PCM_X_AUTHORITY_DOMAIN_NONE) {
+		if (tag_slot->resource_x_reserved != 0
+			|| tag_slot->resource_x_admission_sequence != 0
+			|| tag_slot->resource_x_base_authority_generation != 0)
+			return false;
+		retry_base_generation = member->identity.base_own_generation;
+	} else
+		return false;
+	if (!resource_x_attempt_init(&tag_slot->logical_assertion,
+			retry_base_generation, &attempt))
 		return false;
 	*attempt_out = attempt;
 	return true;
+}
+
+
+/*
+ * Immutable terminal records are attached to individual memberships.  A
+ * different-base successor can share the tag while the current attempt is
+ * being published, so it must be classified from its own identity instead
+ * of being forced through the tag's current projection.  Current-attempt
+ * Resource-X members still use the canonical master authority generation.
+ */
+static bool
+pcm_x_local_retry_record_attempt_exact(const PcmXLocalTagSlot *tag_slot,
+									   const PcmXLocalMembershipSlot *member,
+									   ResourceXAttemptWitness *attempt_out)
+{
+	if (tag_slot == NULL || member == NULL || attempt_out == NULL)
+		return false;
+	if (tag_slot->resource_x_authority_domain
+			== PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+		&& tag_slot->attempt_base_generation
+			   == member->identity.base_own_generation)
+		return pcm_x_local_retry_attempt_exact(tag_slot, member, attempt_out);
+	return pcm_x_local_retry_member_attempt_exact(member, attempt_out);
+}
+
+
+static bool
+pcm_x_local_retry_terminal_replay_exact(const PcmXLocalTagSlot *tag_slot,
+									const PcmXLocalMembershipSlot *member,
+									const ResourceXTerminalRecordV1 *record,
+									ResourceXRetryStateV1 *state_out)
+{
+	ResourceXAssertion member_assertion;
+	ResourceXAttemptWitness attempt;
+
+	if (tag_slot == NULL || member == NULL || record == NULL || state_out == NULL)
+		return false;
+	if (pcm_x_local_retry_record_attempt_exact(tag_slot, member, &attempt)
+		&& resource_x_terminal_record_replay(record, &attempt, state_out))
+		return true;
+	/* Once a failed member is cancelled, the tag may already project a
+	 * different-base successor.  The immutable terminal then is the retained
+	 * authority witness; bind its assertion back to the owning membership
+	 * before replaying its exact embedded attempt. */
+	if (pcm_x_slot_state_read(&member->slot) != PCM_XL_CANCELLED
+		|| !resource_x_assertion_init(&member->identity.tag,
+			member->identity.node_id, &member_assertion)
+		|| !resource_x_assertion_equal(
+			&record->state.attempt.assertion, &member_assertion)
+		|| record->state.attempt.base_authority_generation == 0
+		|| record->state.attempt.base_authority_generation == UINT64_MAX)
+		return false;
+	attempt = record->state.attempt;
+	return resource_x_terminal_record_replay(record, &attempt, state_out);
 }
 
 
@@ -17278,7 +19847,7 @@ cluster_pcm_x_local_retry_state_exact(const PcmXLocalHandle *leader,
 		result = PCM_X_QUEUE_STALE;
 		goto state_done;
 	}
-	if (!pcm_x_local_retry_member_attempt_exact(member, &attempt)) {
+	if (!pcm_x_local_retry_attempt_exact(tag_slot, member, &attempt)) {
 		result = PCM_X_QUEUE_CORRUPT;
 		goto state_done;
 	}
@@ -17288,10 +19857,6 @@ cluster_pcm_x_local_retry_state_exact(const PcmXLocalHandle *leader,
 			goto state_done;
 		}
 		result = PCM_X_QUEUE_OK;
-		goto state_done;
-	}
-	if (!pcm_x_local_retry_attempt_exact(tag_slot, member, &attempt)) {
-		result = PCM_X_QUEUE_CORRUPT;
 		goto state_done;
 	}
 	if (resource_x_retry_state_is_clear(&tag_slot->retry_state)) {
@@ -17353,8 +19918,8 @@ pcm_x_local_retry_terminal_other_matching_locked(
 		candidate = (PcmXLocalMembershipSlot *)pcm_x_domain_slot(
 			PCM_X_ALLOC_LOCAL_WAIT, candidate_ref, &tag_slot->tag,
 			PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
-		if (candidate == NULL || !pcm_x_local_retry_member_attempt_exact(candidate,
-															  &candidate_attempt))
+		if (candidate == NULL || !pcm_x_local_retry_record_attempt_exact(tag_slot,
+															candidate, &candidate_attempt))
 			return PCM_X_QUEUE_CORRUPT;
 		if (!resource_x_terminal_record_is_clear(&candidate->retry_terminal)) {
 			if (!resource_x_terminal_record_replay(
@@ -17427,7 +19992,7 @@ cluster_pcm_x_local_retry_terminal_ready_exact(const PcmXLocalHandle *handle)
 		result = PCM_X_QUEUE_NOT_READY;
 		goto terminal_ready_done;
 	}
-	if (!pcm_x_local_retry_member_attempt_exact(member, &attempt)) {
+	if (!pcm_x_local_retry_attempt_exact(tag_slot, member, &attempt)) {
 		result = PCM_X_QUEUE_CORRUPT;
 		goto terminal_ready_done;
 	}
@@ -17875,7 +20440,8 @@ pcm_x_local_retry_terminal_publish_cohort_locked(
 				PCM_X_ALLOC_LOCAL_WAIT, candidate_ref, &tag_slot->tag,
 				PCM_X_LOCAL_MEMBER_DOMAIN_STATES);
 			if (candidate == NULL || !pcm_x_wait_identity_valid(&candidate->identity)
-				|| !pcm_x_local_retry_member_attempt_exact(candidate, &candidate_attempt))
+				|| !pcm_x_local_retry_record_attempt_exact(tag_slot, candidate,
+															 &candidate_attempt))
 				return PCM_X_QUEUE_CORRUPT;
 			if (resource_x_attempt_matches(&candidate_attempt, terminal_attempt)) {
 				matched = true;
@@ -18354,6 +20920,17 @@ cluster_pcm_x_retry_work_next(Size *cursor_io, Size scan_budget,
 			result = PCM_X_QUEUE_NOT_FOUND;
 			goto local_done;
 		}
+		result = pcm_x_local_terminal_cleanup_fence(tag_slot);
+		if (result == PCM_X_QUEUE_CORRUPT)
+			goto local_done;
+		if (result == PCM_X_QUEUE_BUSY) {
+			/* DRAIN deliberately unlinks the old leader before RETIRE consumes
+			 * its retained retry evidence.  A periodic retry scan must leave that
+			 * exact terminal window to RETIRE instead of treating the absent
+			 * leader as structural corruption. */
+			result = PCM_X_QUEUE_NOT_FOUND;
+			goto local_done;
+		}
 		if (tag_slot->retry_state.last_phase == RESOURCE_X_RETRY_TERMINAL
 			|| tag_slot->retry_state.last_phase
 				== RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED) {
@@ -18587,6 +21164,226 @@ cluster_pcm_x_local_apply_admit_ack_exact(const PcmXLocalHandle *leader,
 }
 
 
+/* Accept the temporary PCM-X ticket and publish its Resource-X admission
+ * identity under one local-tag lock.  The wire borrows grant_generation for
+ * the admission sequence, but the retained PCM-X ref remains non-granted. */
+PcmXQueueResult
+cluster_pcm_x_local_apply_admit_ack_resource_x_exact(
+	const PcmXLocalHandle *leader, const PcmXAdmitAckPayloadV2 *ack,
+	int32 authenticated_node, uint64 authenticated_session)
+{
+	const uint16 known_flags = (uint16)(PCM_X_ADMIT_F_EXACT_REPLAY
+		| PCM_X_ADMIT_F_NODE_COALESCED | PCM_X_ADMIT_F_QUEUE_HEAD
+		| PCM_X_ADMIT_F_RESOURCE_X_ADAPTER);
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXRuntimeSnapshot runtime;
+	PcmXOutboundTargetFrontier *outbound;
+	PcmXLocalReliableToken token;
+	PcmXLocalTagSlot *tag_slot;
+	PcmXLocalMembershipSlot *member;
+	PcmXTicketRef admission_ref;
+	PcmXSlotRef tag_ref;
+	PcmXSlotRef member_ref;
+	PcmXQueueResult result;
+	uint64 admission_sequence;
+	uint32 partition;
+	bool fail_closed = false;
+
+	if (header == NULL || leader == NULL || ack == NULL
+		|| !pcm_x_wait_identity_valid(&leader->identity)
+		|| authenticated_node < 0
+		|| authenticated_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| authenticated_session == 0
+		|| (ack->result != PCM_X_QUEUE_OK
+			&& ack->result != PCM_X_QUEUE_DUPLICATE)
+		|| ack->phase != PCM_X_LOCAL_RELIABLE_PHASE_ENQUEUE
+		|| (ack->flags & ~known_flags) != 0
+		|| (ack->flags & PCM_X_ADMIT_F_RESOURCE_X_ADAPTER) == 0
+		|| ack->prehandle.sender_session_incarnation == 0
+		|| ack->prehandle.prehandle_sequence == 0
+		|| !pcm_x_wait_identity_valid(&ack->ref.identity)
+		|| ack->ref.handle.ticket_id == 0
+		|| ack->ref.handle.queue_generation == 0
+		|| ack->ref.grant_generation == 0
+		|| ack->ref.grant_generation == UINT64_MAX
+		|| ack->resource_x_base_authority_generation == 0
+		|| ack->resource_x_base_authority_generation == UINT64_MAX)
+		return PCM_X_QUEUE_INVALID;
+	admission_sequence = ack->ref.grant_generation;
+	admission_ref = ack->ref;
+	admission_ref.grant_generation = 0;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.master_session_incarnation == 0)
+		return PCM_X_QUEUE_NOT_READY;
+	result = pcm_x_local_refs_lookup(leader, &tag_ref, &member_ref);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
+	result = cluster_pcm_x_local_reliable_snapshot_exact(leader, &token);
+	if (result != PCM_X_QUEUE_OK && result != PCM_X_QUEUE_NOT_READY)
+		return result;
+
+	partition = cluster_pcm_x_lock_partition(
+		cluster_pcm_x_tag_hash(&leader->identity.tag));
+	LWLockAcquire(&header->local_locks[partition].lock, LW_EXCLUSIVE);
+	result = pcm_x_local_leader_slots_exact(
+		leader, tag_ref, member_ref, &tag_slot, &member);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto resource_x_ack_done;
+	}
+	if (!pcm_x_runtime_token_exact(&runtime, 0)) {
+		result = PCM_X_QUEUE_NOT_READY;
+		goto resource_x_ack_done;
+	}
+	result = pcm_x_local_outbound_authority_exact(tag_slot, &outbound);
+	if (result != PCM_X_QUEUE_OK) {
+		fail_closed = result == PCM_X_QUEUE_CORRUPT
+			|| result == PCM_X_QUEUE_STALE;
+		goto resource_x_ack_done;
+	}
+	if (!pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+		|| tag_slot->resource_x_authority_domain
+			> PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto resource_x_ack_done;
+	}
+	if (pcm_x_local_reliable_leg_is_clear(&tag_slot->reliable)) {
+		uint32 member_state = pcm_x_slot_state_read(&member->slot);
+		bool ack_is_head
+			= (ack->flags & PCM_X_ADMIT_F_QUEUE_HEAD) != 0;
+		bool local_is_head
+			= (tag_slot->resource_x_reserved
+			   & PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY) != 0;
+
+		if (authenticated_node != tag_slot->master_node
+			|| authenticated_session
+				!= tag_slot->master_session_incarnation
+			|| !pcm_x_ticket_ref_equal(&admission_ref, &tag_slot->ref)
+			|| !pcm_x_prehandle_equal(
+				&ack->prehandle, &tag_slot->prehandle)) {
+			result = PCM_X_QUEUE_STALE;
+			goto resource_x_ack_done;
+		}
+		if (tag_slot->resource_x_authority_domain
+				!= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X
+			|| tag_slot->resource_x_admission_sequence
+				!= admission_sequence) {
+			result = PCM_X_QUEUE_STALE;
+			goto resource_x_ack_done;
+		}
+		if (member_state == PCM_XL_NODE_LEADER
+			&& tag_slot->reliable.last_response_opcode
+				== PGRAC_IC_MSG_PCM_X_ADMIT_ACK) {
+			result = local_is_head == ack_is_head
+				&& tag_slot->resource_x_base_authority_generation
+					== ack->resource_x_base_authority_generation
+				? PCM_X_QUEUE_DUPLICATE : PCM_X_QUEUE_STALE;
+			goto resource_x_ack_done;
+		}
+		if (member_state != PCM_XL_REMOTE_WAIT
+			|| tag_slot->reliable.last_response_opcode
+				!= PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK) {
+			result = PCM_X_QUEUE_NOT_READY;
+			goto resource_x_ack_done;
+		}
+		if (!ack_is_head) {
+			result = PCM_X_QUEUE_STALE;
+			goto resource_x_ack_done;
+		}
+		if (local_is_head) {
+			if (tag_slot->resource_x_base_authority_generation
+				== ack->resource_x_base_authority_generation)
+				result = PCM_X_QUEUE_DUPLICATE;
+			else {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+			}
+			goto resource_x_ack_done;
+		}
+		if ((tag_slot->resource_x_reserved
+			 & (PCM_X_LOCAL_RESOURCE_X_F_ASSERT_STARTED
+				| PCM_X_LOCAL_RESOURCE_X_F_LATE_BOUND)) != 0) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+			goto resource_x_ack_done;
+		}
+		if (ack->resource_x_base_authority_generation
+			< tag_slot->resource_x_base_authority_generation) {
+			result = PCM_X_QUEUE_STALE;
+			goto resource_x_ack_done;
+		}
+		tag_slot->resource_x_base_authority_generation
+			= ack->resource_x_base_authority_generation;
+		tag_slot->resource_x_reserved
+			|= PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY
+				| PCM_X_LOCAL_RESOURCE_X_F_LATE_BOUND;
+		pg_write_barrier();
+		result = PCM_X_QUEUE_OK;
+		goto resource_x_ack_done;
+	}
+	if (!pcm_x_local_reliable_leg_valid(tag_slot, member)) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto resource_x_ack_done;
+	}
+	if (result != PCM_X_QUEUE_OK
+		|| !pcm_x_local_reliable_token_exact(&token, tag_slot, member)
+		|| !pcm_x_local_response_matches(
+			tag_slot->reliable.pending_opcode,
+			PGRAC_IC_MSG_PCM_X_ADMIT_ACK)
+		|| authenticated_node
+			!= tag_slot->reliable.expected_responder_node
+		|| authenticated_session
+			!= tag_slot->reliable.expected_responder_session
+		|| tag_slot->reliable.pending_opcode
+			!= PGRAC_IC_MSG_PCM_X_ENQUEUE
+		|| !pcm_x_prehandle_equal(
+			&ack->prehandle, &tag_slot->prehandle)
+		|| !pcm_x_local_admission_ref_valid(
+			&admission_ref, &member->identity)) {
+		result = PCM_X_QUEUE_STALE;
+		goto resource_x_ack_done;
+	}
+	if (tag_slot->resource_x_authority_domain
+		!= PCM_X_AUTHORITY_DOMAIN_NONE
+		|| tag_slot->resource_x_admission_sequence != 0
+		|| tag_slot->resource_x_base_authority_generation != 0) {
+		result = PCM_X_QUEUE_CORRUPT;
+		fail_closed = true;
+		goto resource_x_ack_done;
+	}
+	tag_slot->ref = admission_ref;
+	member->handle = admission_ref.handle;
+	tag_slot->resource_x_admission_sequence = admission_sequence;
+	tag_slot->resource_x_base_authority_generation
+		= ack->resource_x_base_authority_generation;
+	tag_slot->resource_x_reserved
+		= (ack->flags & PCM_X_ADMIT_F_QUEUE_HEAD) != 0
+		? PCM_X_LOCAL_RESOURCE_X_F_HEAD_READY : 0;
+	/* The authenticated ACK closes the ENQUEUE retry episode.  The following
+	 * ADMIT_CONFIRM has a new reliable token and a canonical master-authority
+	 * base, so no timeout or transport witness may cross this phase boundary. */
+	resource_x_retry_state_clear(&tag_slot->retry_state);
+	tag_slot->retry_connection_generation = 0;
+	tag_slot->retry_connection_reserved = 0;
+	pg_write_barrier();
+	tag_slot->resource_x_authority_domain
+		= PCM_X_AUTHORITY_DOMAIN_RESOURCE_X;
+	pg_write_barrier();
+	pcm_x_local_reliable_clear(&tag_slot->reliable,
+		PGRAC_IC_MSG_PCM_X_ADMIT_ACK, authenticated_node);
+	result = PCM_X_QUEUE_OK;
+
+resource_x_ack_done:
+	LWLockRelease(&header->local_locks[partition].lock);
+	if (fail_closed)
+		pcm_x_runtime_fail_closed();
+	return result;
+}
+
+
 PcmXQueueResult
 cluster_pcm_x_local_admit_confirm_arm_exact(const PcmXLocalHandle *leader,
 											PcmXPhasePayload *payload_out,
@@ -18762,8 +21559,22 @@ cluster_pcm_x_local_admit_confirm_ack_exact(const PcmXLocalHandle *leader,
 		result = PCM_X_QUEUE_STALE;
 		goto confirm_ack_done;
 	}
-	pcm_x_local_reliable_clear(&tag_slot->reliable, PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK,
-							   authenticated_node);
+	if (tag_slot->resource_x_authority_domain
+		== PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+		if (!pcm_x_local_resource_x_flags_valid(tag_slot->resource_x_reserved)
+			|| tag_slot->resource_x_admission_sequence == 0
+			|| tag_slot->resource_x_base_authority_generation == 0
+			|| tag_slot->resource_x_base_authority_generation == UINT64_MAX) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+			goto confirm_ack_done;
+		}
+		resource_x_retry_state_clear(&tag_slot->retry_state);
+		tag_slot->retry_connection_generation = 0;
+		tag_slot->retry_connection_reserved = 0;
+	}
+	pcm_x_local_reliable_clear(&tag_slot->reliable,
+		PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK, authenticated_node);
 	pg_write_barrier();
 	pcm_x_slot_state_write(&member->slot, PCM_XL_REMOTE_WAIT);
 	result = PCM_X_QUEUE_OK;
@@ -20038,6 +22849,10 @@ cluster_pcm_x_local_retire_round_exact(const BufferTag *tag, uint64 cluster_epoc
 		tag_slot->attempt_base_generation = successor_base_generation;
 		tag_slot->transport_epoch = candidate->identity.cluster_epoch;
 		tag_slot->transport_session = tag_slot->master_session_incarnation;
+		tag_slot->resource_x_admission_sequence = 0;
+		tag_slot->resource_x_base_authority_generation = 0;
+		tag_slot->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_NONE;
+		tag_slot->resource_x_reserved = 0;
 		tag_slot->leader_index = candidate_ref.slot_index;
 		tag_slot->leader_slot_generation = candidate_ref.slot_generation;
 		candidate->role = PCM_X_LOCAL_ROLE_NODE_LEADER;
@@ -20788,7 +23603,7 @@ cluster_pcm_x_local_retry_terminal_complete_exact(const PcmXLocalHandle *leader,
 		result = PCM_X_QUEUE_NOT_READY;
 		goto terminal_complete_done;
 	}
-	if (!pcm_x_local_retry_member_attempt_exact(member, &attempt)
+	if (!pcm_x_local_retry_attempt_exact(tag_slot, member, &attempt)
 		|| !resource_x_terminal_record_replay(&member->retry_terminal, &attempt, &terminal)
 		|| resource_x_terminal_reason_decode(terminal.terminal_errcode)
 			   == RESOURCE_X_TERMINAL_REASON_INVALID) {
@@ -20895,6 +23710,10 @@ cluster_pcm_x_local_retry_terminal_complete_exact(const PcmXLocalHandle *leader,
 		tag_slot->transport_epoch = 0;
 		tag_slot->transport_session = 0;
 		tag_slot->semantic_generation = 0;
+		tag_slot->resource_x_admission_sequence = 0;
+		tag_slot->resource_x_base_authority_generation = 0;
+		tag_slot->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_NONE;
+		tag_slot->resource_x_reserved = 0;
 	}
 	reliable_state_sequence = tag_slot->reliable.state_sequence;
 	memset(&tag_slot->prehandle, 0, sizeof(tag_slot->prehandle));
@@ -21157,6 +23976,10 @@ pcm_x_local_empty_frozen_round_apply_locked(PcmXLocalTagSlot *tag_slot,
 		tag_slot->transport_epoch = tag_slot->cluster_epoch;
 		tag_slot->transport_session = tag_slot->master_session_incarnation;
 		tag_slot->semantic_generation = 0;
+		tag_slot->resource_x_admission_sequence = 0;
+		tag_slot->resource_x_base_authority_generation = 0;
+		tag_slot->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_NONE;
+		tag_slot->resource_x_reserved = 0;
 		tag_slot->leader_index = plan->candidate_ref.slot_index;
 		tag_slot->leader_slot_generation = plan->candidate_ref.slot_generation;
 		plan->candidate->role = PCM_X_LOCAL_ROLE_NODE_LEADER;
@@ -21551,6 +24374,7 @@ cluster_pcm_x_local_drain_poll_certificate_exact(const PcmXDrainPollPayload *pol
 	bool gate_claimed = false;
 	bool fail_closed = false;
 	bool promote_candidate;
+	bool resource_x_projection = false;
 
 	if (certificate_out != NULL)
 		memset(certificate_out, 0, sizeof(*certificate_out));
@@ -21649,10 +24473,29 @@ cluster_pcm_x_local_drain_poll_certificate_exact(const PcmXDrainPollPayload *pol
 			result = PCM_X_QUEUE_NOT_READY;
 			goto drain_done;
 		}
-		if (!pcm_x_local_reliable_leg_valid(tag_slot, member)
-			|| !pcm_x_transfer_leg_exact(&tag_slot->reliable, PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM,
-										 authenticated_master_node, authenticated_master_session)
-			|| tag_slot->leader_index != member_ref.slot_index
+		if (tag_slot->resource_x_authority_domain
+				== PCM_X_AUTHORITY_DOMAIN_RESOURCE_X) {
+			resource_x_projection
+				= pcm_x_local_resource_x_terminal_projection_exact(tag_slot, member);
+			if (!resource_x_projection) {
+				result = PCM_X_QUEUE_CORRUPT;
+				fail_closed = true;
+				goto drain_done;
+			}
+		} else if (tag_slot->resource_x_authority_domain
+				   != PCM_X_AUTHORITY_DOMAIN_NONE
+				   || tag_slot->resource_x_admission_sequence != 0
+				   || tag_slot->resource_x_base_authority_generation != 0
+				   || tag_slot->resource_x_reserved != 0
+				   || !pcm_x_local_reliable_leg_valid(tag_slot, member)
+				   || !pcm_x_transfer_leg_exact(
+					   &tag_slot->reliable, PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM,
+					   authenticated_master_node, authenticated_master_session)) {
+			result = PCM_X_QUEUE_CORRUPT;
+			fail_closed = true;
+			goto drain_done;
+		}
+		if (tag_slot->leader_index != member_ref.slot_index
 			|| tag_slot->leader_slot_generation != member_ref.slot_generation
 			|| member->role != PCM_X_LOCAL_ROLE_NODE_LEADER) {
 			result = PCM_X_QUEUE_CORRUPT;
@@ -21675,8 +24518,9 @@ cluster_pcm_x_local_drain_poll_certificate_exact(const PcmXDrainPollPayload *pol
 		}
 		tag_slot->leader_index = PCM_X_INVALID_SLOT_INDEX;
 		tag_slot->leader_slot_generation = 0;
-		pcm_x_transfer_leg_clear(&tag_slot->reliable, PGRAC_IC_MSG_PCM_X_DRAIN_POLL,
-								 authenticated_master_node);
+		if (!resource_x_projection)
+			pcm_x_transfer_leg_clear(&tag_slot->reliable, PGRAC_IC_MSG_PCM_X_DRAIN_POLL,
+									 authenticated_master_node);
 		(void)pcm_x_slot_flags_fetch_or(&tag_slot->slot, PCM_X_LOCAL_TAG_F_TERMINAL_READY);
 		flags |= PCM_X_LOCAL_TAG_F_TERMINAL_READY;
 	}
@@ -22001,6 +24845,10 @@ pcm_x_local_reset_holder_only_queue(PcmXLocalTagSlot *tag_slot)
 	resource_x_retry_state_clear(&tag_slot->retry_state);
 	tag_slot->retry_connection_generation = 0;
 	tag_slot->retry_connection_reserved = 0;
+	tag_slot->resource_x_admission_sequence = 0;
+	tag_slot->resource_x_base_authority_generation = 0;
+	tag_slot->resource_x_authority_domain = PCM_X_AUTHORITY_DOMAIN_NONE;
+	tag_slot->resource_x_reserved = 0;
 }
 
 
@@ -22141,7 +24989,6 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 			| (retire_protocol ? PCM_X_STATE_BIT(PCM_XL_GRANTED) : 0));
 	if (!retire_protocol && tag_slot != NULL && member != NULL
 		&& pcm_x_slot_state_read(&member->slot) == PCM_XL_CANCELLED) {
-		ResourceXAttemptWitness attempt;
 		ResourceXRetryStateV1 terminal;
 		ResourceXTerminalReason reason;
 
@@ -22150,8 +24997,8 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 			  && member->admitted_round != UINT32_MAX
 			  && tag_slot->local_round == member->admitted_round + 1
 			  && pcm_x_local_detaching_handle_exact(handle, member_ref, member, tag_slot)
-			  && pcm_x_local_retry_member_attempt_exact(member, &attempt)
-			  && resource_x_terminal_record_replay(&member->retry_terminal, &attempt, &terminal);
+			  && pcm_x_local_retry_terminal_replay_exact(tag_slot, member,
+														 &member->retry_terminal, &terminal);
 		if (retry_terminal_detach) {
 			reason = resource_x_terminal_reason_decode(terminal.terminal_errcode);
 			retry_terminal_detach = reason != RESOURCE_X_TERMINAL_REASON_INVALID
@@ -22193,7 +25040,7 @@ pcm_x_local_detach_terminal_common(const PcmXLocalHandle *handle, bool retire_pr
 		ResourceXAttemptWitness retry_attempt;
 		uint32 member_state = pcm_x_slot_state_read(&member->slot);
 
-		if (!pcm_x_local_retry_member_attempt_exact(member, &retry_attempt)
+		if (!pcm_x_local_retry_attempt_exact(tag_slot, member, &retry_attempt)
 			|| !resource_x_attempt_matches(&tag_slot->retry_state.attempt, &retry_attempt)
 			|| (tag_slot->retry_state.last_phase != RESOURCE_X_RETRY_PRE_NO_RETURN
 				&& tag_slot->retry_state.last_phase != RESOURCE_X_RETRY_POST_NO_RETURN)

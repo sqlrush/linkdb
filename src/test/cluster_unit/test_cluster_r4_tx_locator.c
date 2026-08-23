@@ -62,6 +62,7 @@ static int test_recheck_calls;
 static int test_terminal_census_recheck_calls;
 static int test_leave_calls;
 static int test_provider_calls;
+static int test_runtime_exit_hooks_calls;
 static int test_legacy_provider_calls;
 static int test_admitted_provider_calls;
 static bool test_provider_raise;
@@ -197,6 +198,12 @@ cluster_runtime_visibility_resolve_exact_origin(
 	*out = test_provider_resolution;
 	*reason_out = test_provider_reason;
 	return test_provider_outcome;
+}
+
+void
+cluster_runtime_visibility_ensure_exit_hooks(void)
+{
+	test_runtime_exit_hooks_calls++;
 }
 
 ClusterTxOutcome
@@ -722,6 +729,30 @@ UT_TEST(test_epoch_zero_terminal_census_local_single_node_publishes_exact_termin
 	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_COMMITTED);
 }
 
+UT_TEST(test_epoch_zero_terminal_census_homogeneous_four_node_foreign_publishes_exact_terminal)
+{
+	ClusterTxLocator locator = exact_locator();
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterSemanticAdmissionToken admission;
+
+	prepare_epoch_zero_terminal_fixture(&admission);
+	test_node_count = 4;
+	locator.uba.raw[0] = (locator.uba.raw[0] & UINT64_C(0xffffffff00000000))
+						 | UINT64_C(257);
+	test_provider_resolution.locator_echo = locator;
+	memset(&resolution, 0xA5, sizeof(resolution));
+	UT_ASSERT_EQ(cluster_tx_resolve_exact_admitted(
+		&locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+		&admission, &resolution, &reason), CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(test_provider_calls, 1);
+	UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+	UT_ASSERT_EQ(test_terminal_census_recheck_calls, 2);
+	UT_ASSERT_EQ(test_provider_epoch, 0);
+	UT_ASSERT_EQ(resolution.authority.origin_epoch, 0);
+}
+
 UT_TEST(test_epoch_zero_terminal_census_peer_topology_refuses_before_provider)
 {
 	ClusterTxLocator locator = exact_locator();
@@ -784,6 +815,18 @@ UT_TEST(test_epoch_zero_terminal_census_nonzero_generation_refuses_before_provid
 
 	prepare_epoch_zero_terminal_fixture(&admission);
 	admission.record_generation = 1;
+	assert_epoch_zero_refused(&locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+		&admission, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+}
+
+UT_TEST(test_epoch_zero_terminal_census_current_generation_drift_refuses_before_provider)
+{
+	ClusterTxLocator locator = exact_locator();
+	ClusterSemanticAdmissionToken admission;
+
+	prepare_epoch_zero_terminal_fixture(&admission);
+	test_node_count = 4;
+	test_terminal_census_recheck_result = false;
 	assert_epoch_zero_refused(&locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
 		&admission, CLUSTER_TX_RESOLVE_RF_DEFERRED);
 }
@@ -1166,10 +1209,17 @@ UT_TEST(test_epoch_is_absent_from_locator_value)
 				 sizeof(ClusterTxLocator));
 }
 
+UT_TEST(test_terminal_census_batch_preflight_delegates_exit_hook_ensure)
+{
+	test_runtime_exit_hooks_calls = 0;
+	cluster_tx_resolve_terminal_census_batch_preflight();
+	UT_ASSERT_EQ(test_runtime_exit_hooks_calls, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(53);
+	UT_PLAN(56);
 	UT_RUN(test_frozen_identity_layout);
 	UT_RUN(test_frozen_closed_domains);
 	UT_RUN(test_reason_names_are_stable);
@@ -1184,12 +1234,14 @@ main(void)
 	UT_RUN(test_exact_terminal_census_admitted_uses_caller_token_without_reentry);
 	UT_RUN(test_partial_terminal_census_accepts_one_canonical_provider_echo);
 	UT_RUN(test_epoch_zero_terminal_census_local_single_node_publishes_exact_terminal);
+	UT_RUN(test_epoch_zero_terminal_census_homogeneous_four_node_foreign_publishes_exact_terminal);
 	UT_RUN(test_epoch_zero_terminal_census_peer_topology_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_unknown_topology_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_foreign_locator_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_nonterminal_mode_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_recovery_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_nonzero_generation_refuses_before_provider);
+	UT_RUN(test_epoch_zero_terminal_census_current_generation_drift_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_storage_disabled_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_zero_to_nonzero_drift_discards_provider_result);
 	UT_RUN(test_exact_resolver_error_releases_target_admission_once);
@@ -1223,6 +1275,7 @@ main(void)
 	UT_RUN(test_reason_output_is_optional);
 	UT_RUN(test_failure_zeroes_previous_locator);
 	UT_RUN(test_epoch_is_absent_from_locator_value);
+	UT_RUN(test_terminal_census_batch_preflight_delegates_exit_hook_ensure);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

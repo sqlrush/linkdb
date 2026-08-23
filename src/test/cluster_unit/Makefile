@@ -161,7 +161,7 @@ override CPPFLAGS := -I. -I$(top_srcdir)/src/include $(CPPFLAGS)
 # ----------
 # Default target: build all tests
 # ----------
-all: $(TESTS)
+all: $(TESTS) check_resource_x_send_c1
 
 CLUSTER_SHMEM_O = $(top_builddir)/src/backend/cluster/cluster_shmem.o
 CLUSTER_SIGNAL_O = $(top_builddir)/src/backend/cluster/cluster_signal.o
@@ -1992,7 +1992,8 @@ test_cluster_lck: test_cluster_lck.c unit_test.h \
 # Run all tests sequentially
 # ----------
 check: all check_cluster_undo_segment_half_page_oversized \
-	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage
+	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage \
+	check_resource_x_send_c1_unit
 	@echo "# pgrac cluster unit tests"
 	@total=0; failed=0; \
 	for t in $(TESTS); do \
@@ -2017,6 +2018,20 @@ check_pcm_x_write_gate_coverage:
 		--source-root "$(top_srcdir)" --compile-directory "$(CURDIR)" \
 		--clang "$(CC)" --cflags '$(CFLAGS)' --cppflags '$(CPPFLAGS)'
 
+check_resource_x_send_c1_unit:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/test/cluster_unit/test_resource_x_send_c1.py
+
+check_resource_x_send_c1:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/tools/check_resource_x_send_c1.py \
+		--source-root "$(top_srcdir)" \
+		--manifest "$(top_srcdir)/src/test/cluster_unit/data/resource-x-send-c1.tsv" \
+		--artifact "$(top_srcdir)/src/test/cluster_unit/data/send-c1-9-plus-2.json" \
+		--unit-directory "$(CURDIR)" --cc "$(CC)" \
+		--cflags '$(CFLAGS)' --cppflags '$(CPPFLAGS)' \
+		--pthread-cflags '$(PTHREAD_CFLAGS)' --pthread-libs '$(PTHREAD_LIBS)'
+
 
 # ----------
 # Standard PG targets
@@ -2036,7 +2051,8 @@ install installdirs uninstall installcheck:
 
 .PHONY: all check check_cluster_undo_segment_half_page_oversized \
 	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage clean distclean \
-        maintainer-clean install installdirs uninstall installcheck
+	check_resource_x_send_c1 check_resource_x_send_c1_unit \
+	maintainer-clean install installdirs uninstall installcheck
 
 # Spec 8.4A U9: this deliberately oversized fixture must be rejected by the
 # compile-time first-half-page layout guard.  Accept only the named assertion;
@@ -2346,6 +2362,7 @@ test_cluster_pcm_lock: test_cluster_pcm_lock.c unit_test.h \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DPCM_LOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_pcm_lock.c"' \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
 		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \

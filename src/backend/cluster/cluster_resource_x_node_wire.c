@@ -230,6 +230,18 @@ resource_x_common_valid(ResourceXWireKind kind,
 			return false;
 		}
 	} else if (kind == RESOURCE_X_WIRE_BLOCK_TO_N) {
+		bool direct_x_source = common->observed_mode == (uint8)PCM_STATE_X
+			&& common->source_candidate == 1
+			&& common->retain_pi_if_dirty == 1;
+		bool shared_s_holder = common->observed_mode == (uint8)PCM_STATE_S
+			&& common->source_candidate
+				== common->retain_pi_if_dirty;
+
+		if (common->target_mode != (uint8)PCM_STATE_N
+			|| (!direct_x_source && !shared_s_holder)) {
+			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ROLE);
+			return false;
+		}
 		if (common->outcome != RESOURCE_X_OUTCOME_NONE) {
 			resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ENUM);
 			return false;
