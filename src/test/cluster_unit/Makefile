@@ -2628,9 +2628,11 @@ test_cluster_lms_outbound: test_cluster_lms_outbound.c unit_test.h \
 # cluster_pcm_lock.o (real acquire/release behavior) + reuses the same
 # stub family as test_cluster_pcm_lock.
 test_cluster_bufmgr_pcm_hook: test_cluster_bufmgr_pcm_hook.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_PCM_LOCK_O) $(CLUSTER_RESOURCE_X_IDENTITY_O) \
+		$(CLUSTER_RESOURCE_X_NODE_WIRE_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 

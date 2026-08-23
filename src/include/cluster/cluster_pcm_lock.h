@@ -920,6 +920,10 @@ cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
 	uint64 r4_record_generation, uint64 cached_ownership_generation,
 	uint64 now_us);
+extern bool
+cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
+	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
+	uint64 r4_record_generation, uint64 cached_ownership_generation);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node);
 extern ResourceXApplyResult

@@ -2416,7 +2416,7 @@ UT_TEST(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires)
 	free(source);
 }
 
-UT_TEST(test_r11_lockbuffer_writer_selector_is_single_snapshot_and_exclusive)
+UT_TEST(test_r11_lockbuffer_writer_selector_is_single_ingress_choice_and_exclusive)
 {
 	static const char *const selector_contract[] = {
 		"pcm_writer_path = cluster_resource_x_writer_path_snapshot(",
@@ -2433,8 +2433,10 @@ UT_TEST(test_r11_lockbuffer_writer_selector_is_single_snapshot_and_exclusive)
 	UT_ASSERT_NOT_NULL(source);
 	if (source == NULL)
 		return;
+	/* One ingress selection plus the two required TARGET post-T3/content-lock
+	 * revalidations.  The latter may only confirm the already-selected path. */
 	UT_ASSERT_EQ(count_occurrences(
-		source, "cluster_resource_x_writer_path_snapshot("), 1);
+		source, "cluster_resource_x_writer_path_snapshot("), 3);
 	if (strstr(source, "cluster_resource_x_writer_path_snapshot(") == NULL)
 	{
 		free(source);
@@ -3234,7 +3236,8 @@ UT_TEST(test_queue_writer_activation_fence_is_leader_owned_per_grant)
 	static const char *const activate_contract[]
 		= { "entry == NULL || buf == NULL",
 			"cluster_pcm_own_snapshot_locked(buf, &live)",
-			"cluster_pcm_x_writer_grant_snapshot_exact(&entry->claim, &entry->granted, &live)",
+			"cluster_pcm_x_writer_grant_snapshot_exact(",
+			"&entry->authority.source, &entry->granted, &live)",
 			"entry->activation_fence_armed != (entry->granted.writer_activation_token != 0)",
 			"cluster_pcm_own_writer_activation_token_get(buf->buf_id)",
 			"!= entry->granted.writer_activation_token",
@@ -3329,10 +3332,12 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 {
 	static const char *const prepare_contract[]
 		= { "entry->phase = PCM_X_WRITER_LEDGER_HANDOFF",
-			"cluster_gcs_pcm_x_acquire_writer(buf, &entry->claim",
+			"cluster_gcs_pcm_x_acquire_writer(",
+			"buf, &entry->authority.source, &entry->claim_handed_off)",
 			"entry->claim_handed_off",
 			"cluster_bufmgr_pcm_own_snapshot(buf, &granted)",
-			"cluster_pcm_x_writer_grant_snapshot_exact(&entry->claim, &granted, &granted)",
+			"cluster_pcm_x_writer_grant_snapshot_exact(",
+			"&entry->authority.source, &granted, &granted)",
 			"entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING" };
 	static const char *const unlock_contract[]
 		= { "pcm_x_writer_managed = pcm_x_writer != NULL",
@@ -3359,7 +3364,8 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 			"cluster_bufmgr_pcm_x_holder_owner_exit_drain_once(runtime_active)",
 			"if (!writer_retry && !holder_retry)", "pg_usleep(1000L)" };
 	static const char *const snapshot_failure_contract[] = {
-		"release_result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(&entry->claim)",
+		"release_result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(",
+		"&entry->authority.source)",
 		"entry->claim_cleanup_complete = true", "entry->phase = PCM_X_WRITER_LEDGER_DEFERRED",
 		"cluster_bufmgr_pcm_x_writer_report_failure(PCM_X_QUEUE_CORRUPT, buf"
 	};
@@ -3374,20 +3380,29 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 			"cluster_bufmgr_pcm_x_writer_report_failure(PCM_X_QUEUE_NOT_READY, buf",
 			"return NULL" };
 	static const char *const deferred_release_contract[]
-		= { "cluster_bufmgr_pcm_x_writer_claim_entry_exact(entry, buf)",
-			"cluster_gcs_pcm_x_writer_claim_release_and_wake_exact(&entry->claim)" };
+		= { "cluster_bufmgr_pcm_x_writer_entry_exact(entry, buf)",
+			"entry->writer_path == RESOURCE_X_WRITER_TARGET",
+			"cluster_gcs_pcm_x_writer_claim_release_and_wake_exact(",
+			"&entry->authority.source)" };
 	static const char *const deferred_cleanup_contract[]
-		= { "result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(&entry->claim)",
+		= { "result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(",
+			"&entry->authority.source)",
 			"entry->claim_cleanup_complete = true",
 			"cluster_bufmgr_pcm_x_writer_finish_claim_cleanup(entry" };
 	static const char *const abort_cleanup_contract[]
-		= { "result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(&entry->claim)",
+		= { "entry->writer_path == RESOURCE_X_WRITER_TARGET",
+			"result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(",
+			"&entry->authority.source)",
 			"entry->phase = PCM_X_WRITER_LEDGER_DEFERRED" };
 	static const char *const exception_cleanup_contract[]
-		= { "result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(&entry->claim)",
+		= { "entry->writer_path == RESOURCE_X_WRITER_TARGET",
+			"result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(",
+			"&entry->authority.source)",
 			"entry->phase = PCM_X_WRITER_LEDGER_DEFERRED" };
 	static const char *const owner_exit_cleanup_contract[]
-		= { "result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(&entry->claim)",
+		= { "entry->writer_path == RESOURCE_X_WRITER_TARGET",
+			"result = cluster_gcs_pcm_x_writer_claim_cleanup_and_wake_noexcept(",
+			"&entry->authority.source)",
 			"action = cluster_pcm_x_owner_exit_action(result, false, runtime_active)" };
 	char *source = read_bufmgr_source();
 	const char *writer_prepare;
@@ -3729,10 +3744,135 @@ UT_TEST(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_bo
 	free(source);
 }
 
+UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
+{
+	char *source = read_bufmgr_source();
+	const char *target;
+	const char *target_end;
+	const char *activate;
+	const char *activate_end;
+	const char *release;
+	const char *release_end;
+	const char *abort;
+	const char *abort_end;
+	const char *exception;
+	const char *exception_end;
+	const char *owner_exit;
+	const char *owner_exit_end;
+	static const char *const target_contract[] = {
+		"entry->writer_path = RESOURCE_X_WRITER_TARGET",
+		"cluster_gcs_resource_x_target_acquire_exact(",
+		"cluster_bufmgr_pcm_own_snapshot(buf, &granted)",
+		"granted.writer_activation_token != 0",
+		"granted.resource_x_activation_generation != 0",
+		"cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(",
+		"entry->authority.target.ref = terminal_ref",
+		"entry->authority.target.r4_record_generation = r4_generation",
+		"entry->authority.target.buffer_ownership_generation = granted.generation",
+		"entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING"
+	};
+	static const char *const activate_contract[] = {
+		"entry->writer_path == RESOURCE_X_WRITER_TARGET",
+		"cluster_resource_x_writer_path_snapshot(&current_r4_generation)",
+		"cluster_bufmgr_pcm_own_snapshot(buf, &live)",
+		"live.writer_activation_token != 0",
+		"live.resource_x_activation_generation != 0",
+		"cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(",
+		"entry->phase = PCM_X_WRITER_LEDGER_ACTIVE"
+	};
+	static const char *const cleanup_forbidden[] = {
+		"cluster_pcm_lock_release(",
+		"cluster_pcm_lock_resource_x_release_x_exact(",
+		"RESOURCE_X_WIRE_RELEASE_X"
+	};
+	size_t i;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	UT_ASSERT_NOT_NULL(strstr(source, "ResourceXWriterPath writer_path"));
+	UT_ASSERT_NOT_NULL(strstr(source, "ResourceXWriterUseContext target"));
+	UT_ASSERT_NOT_NULL(strstr(source, "union"));
+	UT_ASSERT_EQ(sizeof(ResourceXWriterUseContext), 72);
+	UT_ASSERT_NOT_NULL(strstr(source,
+		"&& pcm_writer_path != RESOURCE_X_WRITER_TARGET"));
+	UT_ASSERT_NOT_NULL(strstr(source,
+		"if (writer_entry->writer_path == RESOURCE_X_WRITER_TARGET)"));
+
+	target = strstr(source,
+		"\ncluster_bufmgr_pcm_x_writer_prepare_target(");
+	target_end = target != NULL ? strstr(target, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(target);
+	UT_ASSERT_NOT_NULL(target_end);
+	if (target != NULL && target_end != NULL) {
+		const char *cursor = target;
+
+		for (i = 0; i < lengthof(target_contract); i++) {
+			cursor = strstr(cursor, target_contract[i]);
+			UT_ASSERT_NOT_NULL(cursor);
+			if (cursor == NULL)
+				break;
+			UT_ASSERT(cursor < target_end);
+		}
+		UT_ASSERT(strstr(target, "cluster_gcs_pcm_x_acquire_writer(") == NULL
+			|| strstr(target, "cluster_gcs_pcm_x_acquire_writer(") >= target_end);
+	}
+
+	activate = strstr(source, "\ncluster_bufmgr_pcm_x_writer_activate(");
+	activate_end = activate != NULL ? strstr(activate, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(activate);
+	UT_ASSERT_NOT_NULL(activate_end);
+	if (activate != NULL && activate_end != NULL) {
+		const char *cursor = activate;
+
+		for (i = 0; i < lengthof(activate_contract); i++) {
+			cursor = strstr(cursor, activate_contract[i]);
+			UT_ASSERT_NOT_NULL(cursor);
+			if (cursor == NULL)
+				break;
+			UT_ASSERT(cursor < activate_end);
+		}
+	}
+
+	release = strstr(source, "\ncluster_bufmgr_pcm_x_writer_release(");
+	release_end = release != NULL ? strstr(release, "\n}\n") : NULL;
+	abort = strstr(source, "\ncluster_bufmgr_pcm_x_writer_abort_acquiring(");
+	abort_end = abort != NULL ? strstr(abort, "\n}\n") : NULL;
+	exception = strstr(source,
+		"\ncluster_bufmgr_pcm_x_writer_exception_cleanup_all(");
+	exception_end = exception != NULL ? strstr(exception, "\n}\n") : NULL;
+	owner_exit = strstr(source,
+		"\ncluster_bufmgr_pcm_x_writer_owner_exit_drain_once(");
+	owner_exit_end = owner_exit != NULL ? strstr(owner_exit, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(release_end);
+	UT_ASSERT_NOT_NULL(abort_end);
+	UT_ASSERT_NOT_NULL(exception_end);
+	UT_ASSERT_NOT_NULL(owner_exit_end);
+	if (release != NULL && release_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(release,
+			"entry->writer_path == RESOURCE_X_WRITER_TARGET"));
+	if (abort != NULL && abort_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(abort,
+			"entry->writer_path == RESOURCE_X_WRITER_TARGET"));
+	if (exception != NULL && exception_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(exception,
+			"entry->writer_path == RESOURCE_X_WRITER_TARGET"));
+	if (owner_exit != NULL && owner_exit_end != NULL)
+		UT_ASSERT_NOT_NULL(strstr(owner_exit,
+			"entry->writer_path == RESOURCE_X_WRITER_TARGET"));
+	for (i = 0; i < lengthof(cleanup_forbidden); i++) {
+		const char *site;
+
+		site = strstr(target, cleanup_forbidden[i]);
+		UT_ASSERT(site == NULL || site >= target_end);
+	}
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(72);
+	UT_PLAN(73);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_resource_x_activation_binding_is_exact_and_legacy_closed);
 	UT_RUN(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking);
@@ -3782,7 +3922,7 @@ main(void)
 	UT_RUN(test_queue_s_release_finish_is_header_exact_and_returns_fresh_n);
 	UT_RUN(test_resource_x_remote_s_finish_requires_content_and_exact_revoke);
 	UT_RUN(test_lockbuffer_pcm_x_holder_ledger_brackets_both_content_acquires);
-	UT_RUN(test_r11_lockbuffer_writer_selector_is_single_snapshot_and_exclusive);
+	UT_RUN(test_r11_lockbuffer_writer_selector_is_single_ingress_choice_and_exclusive);
 	UT_RUN(test_bufmgr_pcm_x_holder_ledger_is_bounded_and_uses_private_identity);
 	UT_RUN(test_unlockbuffers_exceptionally_detaches_released_pcm_x_holders);
 	UT_RUN(test_bufmgr_pcm_x_holder_gate_retry_is_bounded_outside_content_lock);
@@ -3805,6 +3945,7 @@ main(void)
 	UT_RUN(test_own_lifecycle_counters_land_on_exact_begin_and_x_commit);
 	UT_RUN(test_pcm_x_retain_flush_error_injection_is_exact_and_pre_write);
 	UT_RUN(test_writer_activation_diagnostic_covers_commit_clear_and_unguarded_n_boundaries);
+	UT_RUN(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

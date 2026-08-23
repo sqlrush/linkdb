@@ -5017,6 +5017,16 @@ extern void cluster_gcs_pcm_x_blocker_probe_kick(const PcmXTicketRef *ref, int32
  * dispatches the frame locally instead of relying on the IC self-send no-op. */
 extern bool cluster_gcs_pcm_x_stage_frame(uint8 msg_type, int32 dest_node_id, const void *payload,
 										  uint16 payload_len);
+typedef struct ResourceXWriterUseContext {
+	ResourceXAcquisitionRef ref;
+	uint64 r4_record_generation;
+	uint64 buffer_ownership_generation;
+	uint64 writer_activation_token;
+	uint64 resource_x_activation_generation;
+} ResourceXWriterUseContext;
+
+StaticAssertDecl(sizeof(ResourceXWriterUseContext) == 72,
+	"ResourceXWriterUseContext layout must remain 72 bytes");
 /* Join the node-local FIFO, drive the sole remote queue request when this
  * backend is leader, and return one exact writer claim.  claim_handed_off is
  * published before requester cleanup authority is dropped, closing the

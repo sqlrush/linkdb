@@ -7098,7 +7098,8 @@ pcm_resource_x_bootstrap_round_local_sole_x_locked(
 	struct GrdEntry *entry)
 {
 	Assert(entry != NULL);
-	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	return cluster_node_id >= 0
 		&& cluster_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
 		&& pg_atomic_read_u32(&entry->master_state) == (uint32)PCM_STATE_X
@@ -7529,6 +7530,45 @@ cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
 		ConditionVariableBroadcast(&entry->wait_cv);
 	LWLockRelease(&entry->entry_lock.lock);
 	return result;
+}
+
+bool
+cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
+	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
+	uint64 r4_record_generation, uint64 cached_ownership_generation)
+{
+	ClusterPcmResourceXBootstrapRound *round;
+	struct GrdEntry *entry;
+	bool matches;
+
+	if (!pcm_resource_x_ref_valid(ref)
+		|| master_session_incarnation == 0
+		|| master_session_incarnation == UINT64_MAX
+		|| r4_record_generation == 0
+		|| r4_record_generation == UINT64_MAX
+		|| cached_ownership_generation == 0
+		|| cached_ownership_generation == UINT64_MAX)
+		return false;
+	entry = pcm_find_entry(ref->assertion.resource);
+	if (entry == NULL)
+		return false;
+
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	matches = round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+		&& pcm_resource_x_ref_valid(&round->terminal_ref)
+		&& pcm_resource_x_acquisition_ref_equal(&round->terminal_ref, ref)
+		&& round->resource_formation == ref->formation
+		&& round->master_session_incarnation == master_session_incarnation
+		&& round->r4_record_generation == r4_record_generation
+		&& round->cached_ownership_generation
+			== cached_ownership_generation
+		&& round->highest_attempt_floor == ref->acquisition_generation
+		&& entry->resource_x_retired_acquisition_generation
+			== ref->acquisition_generation
+		&& pcm_resource_x_bootstrap_round_local_sole_x_locked(entry);
+	LWLockRelease(&entry->entry_lock.lock);
+	return matches;
 }
 
 static bool

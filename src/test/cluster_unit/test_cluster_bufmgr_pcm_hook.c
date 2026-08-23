@@ -80,6 +80,28 @@ cluster_lms_get_shard_master_generation(void)
 	return (UINT64_C(1) << 32) | UINT64_C(1);
 }
 
+void
+cluster_lms_wakeup(int worker_id pg_attribute_unused())
+{}
+
+bool
+cluster_lms_outbound_resource_x_transport_snapshot(
+	ClusterLmsResourceXTransportSnapshot *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
+ResourceXSidecarNeutralizeResult
+cluster_bufmgr_resource_x_neutralize_exact(
+	const BufferTag *tag pg_attribute_unused(),
+	uint64 old_formation pg_attribute_unused(),
+	uint64 acquisition_generation pg_attribute_unused())
+{
+	return RESOURCE_X_SIDECAR_NEUTRALIZED;
+}
+
 /* spec-4.7a D2 — the bufmgr PCM hook reads this GUC to decide hold-until-revoked
  * (preserve buf->pcm_state on content-lock unlock).  Stubbed ON (production
  * default) so these tests exercise the preserve path; that path is single-node
@@ -372,6 +394,12 @@ cluster_gcs_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 	abort();
 }
 
+bool
+cluster_gcs_block_pcm_x_local_s_barrier_active(BufferTag tag pg_attribute_unused())
+{
+	return false;
+}
+
 /* spec-2.33 D3 stub:  data-plane sender unreachable in this fixture. */
 bool
 cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unused(),
@@ -437,6 +465,14 @@ ConditionVariableSleep(ConditionVariable *cv pg_attribute_unused(),
 					   uint32 wait_event_info pg_attribute_unused())
 {
 	/* never reached in these tests (single-threaded; no contention) */
+}
+
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
+							long timeout pg_attribute_unused(),
+							uint32 wait_event_info pg_attribute_unused())
+{
+	return true;
 }
 
 bool
