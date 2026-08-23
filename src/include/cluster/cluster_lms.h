@@ -465,6 +465,7 @@ extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type
 											   uint16 payload_len, uint32 required_capability,
 											   uint32 connection_generation);
 struct ResourceXIntentSlot;
+struct ClusterPcmOwnSnapshot;
 extern bool cluster_lms_outbound_enqueue_resource_x_intent(
 	int worker_id, const struct ResourceXIntentSlot *intent,
 	uint32 connection_generation, uint64 deadline_us);
@@ -484,12 +485,12 @@ typedef struct ClusterLmsRemoteSStatusHandle {
 extern ClusterPcmOwnResult
 cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
 	int worker_id, uint32 dest_node_id, const void *payload,
-	uint16 payload_len, const ClusterPcmOwnSnapshot *expected_revoking,
+	uint16 payload_len, const struct ClusterPcmOwnSnapshot *expected_revoking,
 	ClusterLmsRemoteSStatusHandle *handle_out);
 extern ClusterPcmOwnResult
 cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
 	const ClusterLmsRemoteSStatusHandle *handle,
-	const ClusterPcmOwnSnapshot *released_n);
+	const struct ClusterPcmOwnSnapshot *released_n);
 extern ClusterPcmOwnResult
 cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
 	const ClusterLmsRemoteSStatusHandle *handle);
