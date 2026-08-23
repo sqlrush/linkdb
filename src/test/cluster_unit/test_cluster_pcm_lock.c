@@ -1632,12 +1632,15 @@ UT_TEST(test_resource_x_same_token_zero_and_clean_completion_proofs_are_exact)
 {
 	ResourceXCleanCompletionProof clean;
 	ResourceXCleanCompletionProof clean_copy;
+	ResourceXCleanCompletionProof cutover_clean;
 	ResourceXReconfigBatch batch;
 	ResourceXReconfigResult result;
+	ResourceXReconfigToken cutover_token;
 	ResourceXReconfigToken stale;
 	ResourceXReconfigToken token;
 	ResourceXZeroResidualProof zero;
 	ResourceXZeroResidualProof zero_copy;
+	ResourceXZeroResidualProof cutover_zero;
 	int calls = 0;
 
 	reset_fake_pcm_runtime(4);
@@ -1690,12 +1693,25 @@ UT_TEST(test_resource_x_same_token_zero_and_clean_completion_proofs_are_exact)
 	UT_ASSERT(cluster_pcm_lock_resource_x_clean_completion_proof_exact(
 		&token, &zero, &clean_copy));
 	UT_ASSERT_EQ(memcmp(&clean_copy, &clean, sizeof(clean)), 0);
+	UT_ASSERT(cluster_pcm_lock_resource_x_cutover_proofs_exact(
+		&cutover_token, &cutover_zero, &cutover_clean));
+	UT_ASSERT_EQ(memcmp(&cutover_token, &token, sizeof(token)), 0);
+	UT_ASSERT_EQ(memcmp(&cutover_zero, &zero, sizeof(zero)), 0);
+	UT_ASSERT_EQ(memcmp(&cutover_clean, &clean, sizeof(clean)), 0);
 
 	/* A late physical owner may already have drained, leaving count zero.
 	 * Its mutation generation still invalidates the older zero snapshot. */
 	fake_resource_x_transport_mutation_sequence++;
 	UT_ASSERT(!cluster_pcm_lock_resource_x_clean_completion_proof_exact(
 		&token, &zero, &clean_copy));
+	memset(&cutover_token, 0xff, sizeof(cutover_token));
+	memset(&cutover_zero, 0xff, sizeof(cutover_zero));
+	memset(&cutover_clean, 0xff, sizeof(cutover_clean));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_cutover_proofs_exact(
+		&cutover_token, &cutover_zero, &cutover_clean));
+	UT_ASSERT_EQ(cutover_token.old_formation, 0);
+	UT_ASSERT_EQ(cutover_zero.proof_generation, 0);
+	UT_ASSERT_EQ(cutover_clean.proof_generation, 0);
 	UT_ASSERT(cluster_pcm_lock_resource_x_clean_completion_prove_exact(
 		&token, &zero, &clean));
 	fake_resource_x_transport_snapshot_available = false;

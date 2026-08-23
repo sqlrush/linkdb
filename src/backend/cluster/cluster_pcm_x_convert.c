@@ -26677,87 +26677,121 @@ pcm_x_resource_x_drain_snapshot(uint64 *logical_debt_out,
 }
 
 static ClusterSemanticActivationResult
-pcm_x_resource_x_readiness(uint64 expected_generation,
-							 ClusterSemanticActivationRefusal *refusal)
+pcm_x_resource_x_cutover_prerequisite_exact(
+	uint64 record_generation, bool transport_first,
+	ClusterSemanticZeroProof *proof)
 {
-	if (refusal != NULL) {
-		refusal->result = CLUSTER_SEMANTIC_ACTIVATION_OK;
-		refusal->feature_bit = 0;
-		refusal->expected_generation = expected_generation;
+	const uint64 digest_offset = UINT64_C(1469598103934665603);
+	const uint64 digest_prime = UINT64_C(1099511628211);
+	ResourceXReconfigToken token;
+	ResourceXZeroResidualProof zero_proof;
+	ResourceXCleanCompletionProof clean_proof;
+	const uint8 *bytes;
+	uint64 digest = digest_offset;
+	uint64 logical_debt;
+	uint64 transport_debt;
+	Size index;
+
+	if (proof != NULL)
+		memset(proof, 0, sizeof(*proof));
+	if (record_generation == 0 || proof == NULL
+		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
+			&token, &zero_proof, &clean_proof)
+		|| !pcm_x_resource_x_drain_snapshot(
+			&logical_debt, &transport_debt))
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	if (transport_first && transport_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+	if (logical_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+	if (transport_debt != 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+
+	/* Bind the activation generation to the exact predecessor-owned bytes.
+	 * The digest is comparison evidence only; the R8/R10 accessors above are
+	 * the authority and revalidate every live field on every callback. */
+	bytes = (const uint8 *)&record_generation;
+	for (index = 0; index < sizeof(record_generation); index++) {
+		digest ^= bytes[index];
+		digest *= digest_prime;
 	}
+	bytes = (const uint8 *)&token;
+	for (index = 0; index < sizeof(token); index++) {
+		digest ^= bytes[index];
+		digest *= digest_prime;
+	}
+	bytes = (const uint8 *)&zero_proof;
+	for (index = 0; index < sizeof(zero_proof); index++) {
+		digest ^= bytes[index];
+		digest *= digest_prime;
+	}
+	bytes = (const uint8 *)&clean_proof;
+	for (index = 0; index < sizeof(clean_proof); index++) {
+		digest ^= bytes[index];
+		digest *= digest_prime;
+	}
+	if (digest == 0)
+		digest = digest_offset;
+	proof->record_generation = record_generation;
+	proof->debt_count = 0;
+	proof->sample_digest = digest;
 	return CLUSTER_SEMANTIC_ACTIVATION_OK;
 }
 
 static ClusterSemanticActivationResult
-pcm_x_resource_x_stage_ok(uint64 generation)
+pcm_x_resource_x_readiness(uint64 expected_generation,
+							 ClusterSemanticActivationRefusal *refusal)
 {
-	return generation == 0 ? CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
-						   : CLUSTER_SEMANTIC_ACTIVATION_OK;
+	ClusterSemanticZeroProof proof;
+	ClusterSemanticActivationResult result;
+
+	result = pcm_x_resource_x_cutover_prerequisite_exact(
+		expected_generation, false, &proof);
+	if (refusal != NULL) {
+		refusal->result = result;
+		refusal->feature_bit
+			= result == CLUSTER_SEMANTIC_ACTIVATION_OK
+				  ? 0
+				  : CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1;
+		refusal->expected_generation = expected_generation;
+	}
+	return result;
 }
 
 static ClusterSemanticActivationResult
 pcm_x_resource_x_logical_zero(uint64 generation,
 							ClusterSemanticZeroProof *proof)
 {
-	uint64 logical_debt;
-	uint64 transport_debt;
-
-	if (generation == 0 || proof == NULL)
-		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
-	memset(proof, 0, sizeof(*proof));
-	if (!pcm_x_resource_x_drain_snapshot(&logical_debt, &transport_debt))
-		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
-	(void) transport_debt;
-	if (logical_debt != 0)
-		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
-	proof->record_generation = generation;
-	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+	return pcm_x_resource_x_cutover_prerequisite_exact(
+		generation, false, proof);
 }
 
 static ClusterSemanticActivationResult
 pcm_x_resource_x_transport_zero(uint64 generation,
 							  ClusterSemanticZeroProof *proof)
 {
-	uint64 logical_debt;
-	uint64 transport_debt;
-
-	if (generation == 0 || proof == NULL)
-		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
-	memset(proof, 0, sizeof(*proof));
-	if (!pcm_x_resource_x_drain_snapshot(&logical_debt, &transport_debt))
-		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
-	(void) logical_debt;
-	if (transport_debt != 0)
-		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
-	proof->record_generation = generation;
-	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+	return pcm_x_resource_x_cutover_prerequisite_exact(
+		generation, true, proof);
 }
 
 static ClusterSemanticActivationResult
 pcm_x_resource_x_closed_zero(uint64 generation)
 {
-	uint64 logical_debt;
-	uint64 transport_debt;
+	ClusterSemanticZeroProof proof;
 
-	if (generation == 0
-		|| !pcm_x_resource_x_drain_snapshot(&logical_debt, &transport_debt))
-		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
-	if (logical_debt != 0)
-		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
-	if (transport_debt != 0)
-		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
-	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+	return pcm_x_resource_x_cutover_prerequisite_exact(
+		generation, false, &proof);
 }
 
 static const ClusterSemanticActivationCallbackBundle pcm_x_resource_x_callbacks = {
 	.pre_prepare_readiness = pcm_x_resource_x_readiness,
-	.close_source_admission = pcm_x_resource_x_stage_ok,
+	.close_source_admission = pcm_x_resource_x_closed_zero,
 	.source_logical_debt_zero = pcm_x_resource_x_logical_zero,
 	.source_transport_zero = pcm_x_resource_x_transport_zero,
 	.prepare_target = pcm_x_resource_x_closed_zero,
 	.apply_target_closed = pcm_x_resource_x_closed_zero,
 	.revert_source_closed = pcm_x_resource_x_closed_zero,
-	.open_target_admission = pcm_x_resource_x_stage_ok,
+	.open_target_admission = pcm_x_resource_x_closed_zero,
 };
 
 const ClusterSemanticActivationCallbackBundle *

@@ -120,6 +120,8 @@ static PcmXMasterTicketSlot *grant_interlock_ticket;
 static uint64 grant_interlock_generation;
 static bool resource_x_completion_runtime_drift_armed;
 static LWLock *resource_x_completion_runtime_drift_lock;
+static bool resource_x_cutover_proofs_available;
+static uint64 resource_x_cutover_proof_sequence;
 static bool drive_terminal_interlock_armed;
 static LWLock *drive_terminal_interlock_lock;
 static PcmXMasterTagSlot *drive_terminal_interlock_tag;
@@ -167,6 +169,44 @@ static PcmXSlotRef domain_holder_state_hook_ref;
 static PcmXLocalHolderHandle domain_holder_state_hook_handle;
 static PcmXLocalMembershipSlot *domain_holder_state_hook_slot;
 static PcmXQueueResult domain_holder_state_hook_result;
+
+bool
+cluster_pcm_lock_resource_x_cutover_proofs_exact(
+	ResourceXReconfigToken *token_out,
+	ResourceXZeroResidualProof *zero_proof_out,
+	ResourceXCleanCompletionProof *clean_proof_out)
+{
+	if (token_out != NULL)
+		memset(token_out, 0, sizeof(*token_out));
+	if (zero_proof_out != NULL)
+		memset(zero_proof_out, 0, sizeof(*zero_proof_out));
+	if (clean_proof_out != NULL)
+		memset(clean_proof_out, 0, sizeof(*clean_proof_out));
+	if (!resource_x_cutover_proofs_available || token_out == NULL
+		|| zero_proof_out == NULL || clean_proof_out == NULL)
+		return false;
+	token_out->old_formation = 17;
+	token_out->new_formation = 18;
+	token_out->freeze_generation = 3;
+	zero_proof_out->token = *token_out;
+	zero_proof_out->proof_generation = 3;
+	zero_proof_out->scan_capacity = 8;
+	zero_proof_out->scan_end_cursor = 8;
+	zero_proof_out->final_mutation_sequence
+		= resource_x_cutover_proof_sequence;
+	zero_proof_out->full_wrap_digest = UINT64_C(0x1020304050607080);
+	zero_proof_out->complete_wrap = 1;
+	zero_proof_out->zero_residual = 1;
+	clean_proof_out->token = *token_out;
+	clean_proof_out->proof_generation = 3;
+	clean_proof_out->final_mutation_sequence
+		= resource_x_cutover_proof_sequence;
+	clean_proof_out->logical_digest = UINT64_C(0x8877665544332211);
+	clean_proof_out->transport_mutation_sequence = 9;
+	clean_proof_out->logical_debt_zero = 1;
+	clean_proof_out->transport_debt_zero = 1;
+	return true;
+}
 
 static void maybe_publish_staged_prehandle_insert_exists(void);
 static void maybe_inject_local_rekey_insert_failure(void);
@@ -681,6 +721,8 @@ reset_fake_shmem(void)
 	grant_interlock_lock = NULL;
 	grant_interlock_ticket = NULL;
 	grant_interlock_generation = 0;
+	resource_x_cutover_proofs_available = false;
+	resource_x_cutover_proof_sequence = 11;
 	drive_terminal_interlock_armed = false;
 	drive_terminal_interlock_lock = NULL;
 	drive_terminal_interlock_tag = NULL;
@@ -18743,7 +18785,7 @@ UT_TEST(test_registration_exposes_one_exact_region)
 	UT_ASSERT_EQ(registered_region->reserved_flags, 0);
 }
 
-UT_TEST(test_resource_x_activation_callbacks_are_nonactivatable_and_zero_ready)
+UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pair)
 {
 	const ClusterSemanticActivationCallbackBundle *callbacks;
 	ClusterSemanticActivationRefusal refusal;
@@ -18763,24 +18805,50 @@ UT_TEST(test_resource_x_activation_callbacks_are_nonactivatable_and_zero_ready)
 
 	memset(&refusal, 0xff, sizeof(refusal));
 	UT_ASSERT_EQ(callbacks->pre_prepare_readiness(7, &refusal),
-				 CLUSTER_SEMANTIC_ACTIVATION_OK);
-	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
-	UT_ASSERT_EQ(refusal.feature_bit, 0);
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(refusal.feature_bit,
+				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
 	UT_ASSERT_EQ(refusal.expected_generation, 7);
 
 	cluster_pcm_x_convert_shmem_init();
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
-				 CLUSTER_SEMANTIC_ACTIVATION_OK);
-	UT_ASSERT_EQ(proof.record_generation, 7);
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(proof.record_generation, 0);
 	UT_ASSERT_EQ(proof.debt_count, 0);
 	UT_ASSERT_EQ(proof.sample_digest, 0);
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_transport_zero(7, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(proof.record_generation, 0);
+	UT_ASSERT_EQ(proof.debt_count, 0);
+	UT_ASSERT_EQ(proof.sample_digest, 0);
+	UT_ASSERT_EQ(callbacks->prepare_target(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+
+	resource_x_cutover_proofs_available = true;
+	memset(&refusal, 0xff, sizeof(refusal));
+	UT_ASSERT_EQ(callbacks->pre_prepare_readiness(7, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.feature_bit, 0);
+	memset(&proof, 0xff, sizeof(proof));
+	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 	UT_ASSERT_EQ(proof.record_generation, 7);
 	UT_ASSERT_EQ(proof.debt_count, 0);
-	UT_ASSERT_EQ(proof.sample_digest, 0);
+	UT_ASSERT(proof.sample_digest != 0);
+	{
+		uint64 logical_digest = proof.sample_digest;
+
+		memset(&proof, 0xff, sizeof(proof));
+		UT_ASSERT_EQ(callbacks->source_transport_zero(7, &proof),
+					 CLUSTER_SEMANTIC_ACTIVATION_OK);
+		UT_ASSERT_EQ(proof.sample_digest, logical_digest);
+	}
+	UT_ASSERT_EQ(callbacks->prepare_target(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 }
 
 UT_TEST(test_resource_x_activation_refuses_open_local_round)
@@ -18791,6 +18859,7 @@ UT_TEST(test_resource_x_activation_refuses_open_local_round)
 
 	reset_fake_shmem();
 	cluster_pcm_x_convert_shmem_init();
+	resource_x_cutover_proofs_available = true;
 	callbacks = cluster_pcm_x_resource_x_activation_callbacks();
 	(void) reserve_slot(PCM_X_ALLOC_LOCAL_TAG, &tag_ref);
 
@@ -18813,6 +18882,7 @@ UT_TEST(test_resource_x_activation_refuses_staged_local_frame)
 
 	reset_fake_shmem();
 	cluster_pcm_x_convert_shmem_init();
+	resource_x_cutover_proofs_available = true;
 	callbacks = cluster_pcm_x_resource_x_activation_callbacks();
 	tag = (PcmXLocalTagSlot *)reserve_slot(PCM_X_ALLOC_LOCAL_TAG, &tag_ref);
 	tag->reliable.pending_opcode = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
@@ -19935,7 +20005,7 @@ main(void)
 	UT_RUN(test_attach_validator_rejects_magic_capacity_and_offset_mismatch);
 	UT_RUN(test_exec_backend_init_fails_closed_on_layout_mismatch);
 	UT_RUN(test_registration_exposes_one_exact_region);
-	UT_RUN(test_resource_x_activation_callbacks_are_nonactivatable_and_zero_ready);
+	UT_RUN(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pair);
 	UT_RUN(test_resource_x_activation_refuses_open_local_round);
 	UT_RUN(test_resource_x_activation_refuses_staged_local_frame);
 	UT_RUN(test_stats_initialize_zero_and_narrow_note_apis_are_exact);

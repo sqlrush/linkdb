@@ -2793,6 +2793,50 @@ cluster_pcm_lock_resource_x_clean_completion_proof_exact(
 }
 
 bool
+cluster_pcm_lock_resource_x_cutover_proofs_exact(
+	ResourceXReconfigToken *token_out,
+	ResourceXZeroResidualProof *zero_proof_out,
+	ResourceXCleanCompletionProof *clean_proof_out)
+{
+	ResourceXReconfigToken token;
+	ResourceXZeroResidualProof zero_proof;
+	ResourceXCleanCompletionProof clean_proof;
+
+	if (token_out != NULL)
+		memset(token_out, 0, sizeof(*token_out));
+	if (zero_proof_out != NULL)
+		memset(zero_proof_out, 0, sizeof(*zero_proof_out));
+	if (clean_proof_out != NULL)
+		memset(clean_proof_out, 0, sizeof(*clean_proof_out));
+	if (ClusterPcm == NULL || token_out == NULL || zero_proof_out == NULL
+		|| clean_proof_out == NULL)
+		return false;
+
+	/* Copy only the candidate token while holding the owner lock.  Both
+	 * existing exact accessors below revalidate it against the live frozen
+	 * gate, semantic mutation sequence, stored proof bytes, and transport
+	 * sequence before any bytes escape this function. */
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	token = ClusterPcm->resource_x_zero_residual_proof.token;
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+	if (token.old_formation == 0 || token.old_formation == UINT64_MAX
+		|| token.new_formation == 0 || token.new_formation == UINT64_MAX
+		|| token.old_formation == token.new_formation
+		|| token.freeze_generation == 0
+		|| token.freeze_generation == UINT64_MAX || token.reserved != 0
+		|| !cluster_resource_x_reconfig_zero_proof_exact(
+			&token, &zero_proof)
+		|| !cluster_pcm_lock_resource_x_clean_completion_proof_exact(
+			&token, &zero_proof, &clean_proof))
+		return false;
+
+	*token_out = token;
+	*zero_proof_out = zero_proof;
+	*clean_proof_out = clean_proof;
+	return true;
+}
+
+bool
 cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token)
 {
 	uint32 expected_phase;

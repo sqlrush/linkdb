@@ -1102,6 +1102,13 @@ extern bool cluster_pcm_lock_resource_x_clean_completion_proof_exact(
 	const ResourceXReconfigToken *token,
 	const ResourceXZeroResidualProof *zero_proof,
 	ResourceXCleanCompletionProof *out);
+/* Read-only R11 prerequisite view of the current frozen R8/R10 pair.  The
+ * owning proof validators remain authoritative; this accessor only returns
+ * exact copies after both live checks succeed for one token. */
+extern bool cluster_pcm_lock_resource_x_cutover_proofs_exact(
+	ResourceXReconfigToken *token_out,
+	ResourceXZeroResidualProof *zero_proof_out,
+	ResourceXCleanCompletionProof *clean_proof_out);
 extern bool cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token);
 extern void cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *out);
 extern ResourceXExecutorProbeResult cluster_pcm_lock_resource_x_executor_probe_exact(
