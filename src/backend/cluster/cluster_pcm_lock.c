@@ -392,6 +392,24 @@ typedef struct ClusterPcmResourceXTerminalTombstone {
 	uint32 valid;
 } ClusterPcmResourceXTerminalTombstone;
 
+#define RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY UINT8_C(0)
+#define RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED UINT8_C(1)
+#define RESOURCE_X_BOOTSTRAP_RECEIPT_CONSUMED_BY_ASSERT UINT8_C(2)
+
+/* PGRAC adaptation: fixed, non-authority master receipt for one requester.
+ * highest_attempt_floor survives binding invalidation; every other byte is
+ * cleared when the receipt becomes unjoinable. */
+typedef struct ClusterPcmResourceXBootstrapReceipt {
+	ResourceXDecodedCommon request;
+	ResourceXDecodedCommon ack;
+	uint64 highest_attempt_floor;
+	uint64 sampled_base;
+	uint64 r4_record_generation;
+	uint32 authenticated_ingress_connection_generation;
+	uint8 state;
+	uint8 reserved[3];
+} ClusterPcmResourceXBootstrapReceipt;
+
 typedef struct ClusterPcmResourceXControlIntent {
 	ResourceXIntentSlot slot;
 	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
@@ -465,6 +483,8 @@ typedef struct ClusterPcmResourceXMasterState {
 	uint64 holder_pair_drained_master_session;
 	int32 holder_pair_drained_master_node;
 	uint32 holder_pair_drained_reserved;
+	ClusterPcmResourceXBootstrapReceipt
+		bootstrap_receipts[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 	ClusterPcmResourceXMasterRequest requests[RESOURCE_X_PROTOCOL_NODE_LIMIT];
 	ClusterPcmResourceXTerminalTombstone terminal_tombstone;
 	ClusterPcmResourceXBlockIntent block_intents[RESOURCE_X_PROTOCOL_NODE_LIMIT];
@@ -481,6 +501,8 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXMasterRequest) == 328,
 				 "Resource-X master request layout must remain 328 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXTerminalTombstone) == 336,
 				 "Resource-X terminal tombstone layout must remain 336 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXBootstrapReceipt) == 224,
+				 "Resource-X bootstrap receipt layout must remain 224 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXControlIntent) == 392,
 				 "Resource-X control intent layout must remain 392 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXBlockIntent) == 176,
@@ -491,8 +513,8 @@ StaticAssertDecl(sizeof(ClusterPcmResourceXHolderImage) == 8592,
 				 "Resource-X holder image layout must remain 8592 bytes");
 StaticAssertDecl(sizeof(ClusterPcmResourceXRequesterJoin) == 8888,
 				 "Resource-X requester join layout must remain 8888 bytes");
-StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 35880,
-				 "Resource-X master state layout must remain 35880 bytes");
+StaticAssertDecl(sizeof(ClusterPcmResourceXMasterState) == 43048,
+				 "Resource-X master state must include 32 fixed bootstrap receipts");
 
 typedef struct ClusterPcmShared {
 	LWLockPadded htab_lock;
@@ -631,6 +653,10 @@ static struct GrdEntry *pcm_find_entry(BufferTag tag);
 static void pcm_entry_lock_exclusive(struct GrdEntry *entry);
 static ClusterPcmResourceXMasterState *pcm_resource_x_master_state_for_tag(
 	const BufferTag *tag);
+static bool pcm_resource_x_bootstrap_receipt_valid(
+	const ClusterPcmResourceXBootstrapReceipt *receipt);
+static void pcm_resource_x_bootstrap_receipt_invalidate(
+	ClusterPcmResourceXBootstrapReceipt *receipt);
 static uint32 pcm_holder_bit(int holder_node_id);
 static PcmState pcm_transition_target(PcmLockTransition trans);
 static ResourceXReclaimResult pcm_resource_x_reclaim_requester_locked(
@@ -1254,8 +1280,33 @@ pcm_resource_x_reconfig_proof_slot_locked(
 	for (requester_node = 0;
 		 requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
 		 requester_node++) {
+		const ClusterPcmResourceXBootstrapReceipt *receipt
+			= &state->bootstrap_receipts[requester_node];
 		const ClusterPcmResourceXMasterRequest *request
 			= &state->requests[requester_node];
+
+		if (!pcm_resource_x_bootstrap_receipt_valid(receipt))
+			return false;
+		digest = pcm_resource_x_proof_digest_u64(
+			digest, receipt->highest_attempt_floor);
+		if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY) {
+			if (receipt->request.logical_assertion.requester_node
+					!= requester_node
+				|| (receipt->request.resource_formation
+						!= token->old_formation
+					&& receipt->request.resource_formation
+							!= token->new_formation))
+				return false;
+			if (receipt->request.resource_formation
+					== token->old_formation)
+				*old_residual_out = true;
+			digest = pcm_resource_x_proof_digest_u64(
+				digest, receipt->request.resource_formation);
+			digest = pcm_resource_x_proof_digest_u64(
+				digest, receipt->request.assertion_sequence);
+			digest = pcm_resource_x_proof_digest_u64(
+				digest, (uint64)receipt->state);
+		}
 
 		if (request->phase == RESOURCE_X_MASTER_NONE) {
 			if (memcmp(request, &empty_request, sizeof(*request)) != 0)
@@ -1898,6 +1949,8 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 	bool first_orphan = false;
 	bool holder_pair_drained;
 	int32 holder_pair_node;
+	bool bootstrap_receipt_invalidated;
+	int32 bootstrap_requester_node;
 
 	if (out == NULL)
 		return RESOURCE_X_RECONFIG_CORRUPT;
@@ -1969,6 +2022,36 @@ cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 pr
 			pcm_resource_x_reconfig_block();
 			return RESOURCE_X_RECONFIG_CORRUPT;
 		}
+		bootstrap_receipt_invalidated = false;
+		for (bootstrap_requester_node = 0;
+			 bootstrap_requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
+			 bootstrap_requester_node++) {
+			ClusterPcmResourceXBootstrapReceipt *receipt
+				= &master_state->bootstrap_receipts[
+					bootstrap_requester_node];
+
+			if (!pcm_resource_x_bootstrap_receipt_valid(receipt)
+				|| (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY
+					&& receipt->request.logical_assertion.requester_node
+						!= bootstrap_requester_node)
+				|| (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY
+					&& receipt->request.resource_formation
+						!= token->old_formation
+					&& receipt->request.resource_formation
+						!= token->new_formation)) {
+				LWLockRelease(&entry->entry_lock.lock);
+				pcm_resource_x_reconfig_block();
+				return RESOURCE_X_RECONFIG_CORRUPT;
+			}
+			if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY
+				&& receipt->request.resource_formation
+					== token->old_formation) {
+				pcm_resource_x_bootstrap_receipt_invalidate(receipt);
+				bootstrap_receipt_invalidated = true;
+			}
+		}
+		if (bootstrap_receipt_invalidated)
+			ConditionVariableBroadcast(&entry->wait_cv);
 		if (!pcm_resource_x_requester_join_empty_locked(
 				&master_state->requester_join)) {
 			if (!pcm_resource_x_requester_join_decode_locked(
@@ -2354,9 +2437,16 @@ pcm_resource_x_clean_state_locked(
 
 	digest = pcm_resource_x_proof_digest_tag(*digest_io, &entry->tag);
 	for (node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+		const ClusterPcmResourceXBootstrapReceipt *receipt
+			= &state->bootstrap_receipts[node];
 		const ClusterPcmResourceXMasterRequest *request
 			= &state->requests[node];
 
+		if (!pcm_resource_x_bootstrap_receipt_valid(receipt)
+			|| receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)
+			return false;
+		digest = pcm_resource_x_proof_digest_u64(
+			digest, receipt->highest_attempt_floor);
 		if (state->block_intents[node].slot.state
 				!= RESOURCE_X_INTENT_SLOT_EMPTY)
 			return false;
@@ -2746,6 +2836,10 @@ pcm_resource_x_intent_payload_exact(ResourceXWireKind kind,
 									uint16 payload_bytes)
 {
 	switch (kind) {
+		case RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP:
+			/* Bootstrap staging is non-authority and never uses the retained
+			 * authority intent family. */
+			return false;
 		case RESOURCE_X_WIRE_ASSERT_X:
 		case RESOURCE_X_WIRE_BLOCK_TO_N:
 		case RESOURCE_X_WIRE_RELEASE_X:
@@ -6791,6 +6885,252 @@ pcm_resource_x_assert_frame_valid(const ResourceXDecodedFrame *frame,
 		&& frame->common.outcome == RESOURCE_X_OUTCOME_NONE;
 }
 
+static void
+pcm_resource_x_common_copy(ResourceXDecodedCommon *destination,
+						   const ResourceXDecodedCommon *source)
+{
+	Assert(destination != NULL);
+	Assert(source != NULL);
+	memset(destination, 0, sizeof(*destination));
+	destination->logical_assertion = source->logical_assertion;
+	destination->base_authority_generation
+		= source->base_authority_generation;
+	destination->resource_formation = source->resource_formation;
+	destination->master_session_incarnation
+		= source->master_session_incarnation;
+	destination->assertion_sequence = source->assertion_sequence;
+	destination->ordered_lane = source->ordered_lane;
+	destination->action_node = source->action_node;
+	destination->observed_mode = source->observed_mode;
+	destination->target_mode = source->target_mode;
+	destination->source_candidate = source->source_candidate;
+	destination->retain_pi_if_dirty = source->retain_pi_if_dirty;
+	destination->sender_connection_generation
+		= source->sender_connection_generation;
+	destination->outcome = source->outcome;
+	destination->flags = source->flags;
+	destination->authority_generation = source->authority_generation;
+	destination->semantic_crc32c = source->semantic_crc32c;
+}
+
+static bool
+pcm_resource_x_common_equal(const ResourceXDecodedCommon *left,
+							const ResourceXDecodedCommon *right)
+{
+	return left != NULL && right != NULL
+		&& resource_x_assertion_equal(&left->logical_assertion,
+			&right->logical_assertion)
+		&& left->base_authority_generation
+			== right->base_authority_generation
+		&& left->resource_formation == right->resource_formation
+		&& left->master_session_incarnation
+			== right->master_session_incarnation
+		&& left->assertion_sequence == right->assertion_sequence
+		&& left->ordered_lane == right->ordered_lane
+		&& left->action_node == right->action_node
+		&& left->observed_mode == right->observed_mode
+		&& left->target_mode == right->target_mode
+		&& left->source_candidate == right->source_candidate
+		&& left->retain_pi_if_dirty == right->retain_pi_if_dirty
+		&& left->sender_connection_generation
+			== right->sender_connection_generation
+		&& left->outcome == right->outcome
+		&& left->flags == right->flags
+		&& left->authority_generation == right->authority_generation
+		&& left->semantic_crc32c == right->semantic_crc32c;
+}
+
+static bool
+pcm_resource_x_bootstrap_request_valid(
+	const ResourceXDecodedFrame *request, int32 authenticated_source_node,
+	uint32 authenticated_ingress_connection_generation,
+	uint64 r4_record_generation, uint64 current_master_session_incarnation,
+	uint32 master_sender_connection_generation)
+{
+	return request != NULL
+		&& request->kind == RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
+		&& request->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
+		&& !request->blocked_has_remote_proof
+		&& resource_x_assertion_valid(
+			&request->common.logical_assertion)
+		&& authenticated_source_node
+			== request->common.logical_assertion.requester_node
+		&& authenticated_ingress_connection_generation != 0
+		&& authenticated_ingress_connection_generation != UINT32_MAX
+		&& authenticated_ingress_connection_generation
+			== request->common.sender_connection_generation
+		&& r4_record_generation != 0
+		&& r4_record_generation != UINT64_MAX
+		&& current_master_session_incarnation != 0
+		&& current_master_session_incarnation != UINT64_MAX
+		&& current_master_session_incarnation
+			== request->common.master_session_incarnation
+		&& master_sender_connection_generation != 0
+		&& master_sender_connection_generation != UINT32_MAX
+		&& request->common.base_authority_generation == 0
+		&& request->common.authority_generation == 0
+		&& request->common.resource_formation != 0
+		&& request->common.resource_formation != UINT64_MAX
+		&& request->common.assertion_sequence != 0
+		&& request->common.assertion_sequence != UINT64_MAX
+		&& request->common.ordered_lane == 0
+		&& request->common.action_node == authenticated_source_node
+		&& request->common.observed_mode == (uint8)PCM_STATE_N
+		&& request->common.target_mode == (uint8)PCM_STATE_X
+		&& request->common.source_candidate == 0
+		&& request->common.retain_pi_if_dirty == 0
+		&& request->common.outcome == RESOURCE_X_OUTCOME_NONE
+		&& request->common.flags == 0;
+}
+
+static void
+pcm_resource_x_bootstrap_receipt_invalidate(
+	ClusterPcmResourceXBootstrapReceipt *receipt)
+{
+	uint64 highest_attempt_floor;
+
+	Assert(receipt != NULL);
+	highest_attempt_floor = receipt->highest_attempt_floor;
+	memset(receipt, 0, sizeof(*receipt));
+	receipt->highest_attempt_floor = highest_attempt_floor;
+}
+
+static bool
+pcm_resource_x_bootstrap_receipt_valid(
+	const ClusterPcmResourceXBootstrapReceipt *receipt)
+{
+	static const ResourceXDecodedCommon empty_common;
+	static const uint8 empty_reserved[3];
+	const ResourceXDecodedCommon *request;
+	const ResourceXDecodedCommon *ack;
+
+	if (receipt == NULL
+		|| memcmp(receipt->reserved, empty_reserved,
+			sizeof(empty_reserved)) != 0)
+		return false;
+	if (receipt->state == RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)
+		return memcmp(&receipt->request, &empty_common,
+				sizeof(empty_common)) == 0
+			&& memcmp(&receipt->ack, &empty_common,
+				sizeof(empty_common)) == 0
+			&& receipt->sampled_base == 0
+			&& receipt->r4_record_generation == 0
+			&& receipt->authenticated_ingress_connection_generation == 0
+			&& receipt->highest_attempt_floor != UINT64_MAX;
+	if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED
+		&& receipt->state
+			!= RESOURCE_X_BOOTSTRAP_RECEIPT_CONSUMED_BY_ASSERT)
+		return false;
+	request = &receipt->request;
+	ack = &receipt->ack;
+	return resource_x_assertion_valid(&request->logical_assertion)
+		&& request->base_authority_generation == 0
+		&& request->authority_generation == 0
+		&& request->resource_formation != 0
+		&& request->resource_formation != UINT64_MAX
+		&& request->master_session_incarnation != 0
+		&& request->master_session_incarnation != UINT64_MAX
+		&& request->assertion_sequence != 0
+		&& request->assertion_sequence != UINT64_MAX
+		&& request->ordered_lane == 0
+		&& request->action_node
+			== request->logical_assertion.requester_node
+		&& request->observed_mode == (uint8)PCM_STATE_N
+		&& request->target_mode == (uint8)PCM_STATE_X
+		&& request->source_candidate == 0
+		&& request->retain_pi_if_dirty == 0
+		&& request->sender_connection_generation != 0
+		&& request->sender_connection_generation != UINT32_MAX
+		&& request->outcome == RESOURCE_X_OUTCOME_NONE
+		&& request->flags == 0
+		&& resource_x_assertion_equal(&ack->logical_assertion,
+			&request->logical_assertion)
+		&& ack->base_authority_generation == receipt->sampled_base
+		&& ack->base_authority_generation != 0
+		&& ack->base_authority_generation != UINT64_MAX
+		&& ack->resource_formation == request->resource_formation
+		&& ack->master_session_incarnation
+			== request->master_session_incarnation
+		&& ack->assertion_sequence == request->assertion_sequence
+		&& ack->ordered_lane == 0
+		&& ack->action_node == request->logical_assertion.requester_node
+		&& ack->observed_mode == (uint8)PCM_STATE_N
+		&& ack->target_mode == (uint8)PCM_STATE_X
+		&& ack->source_candidate == 0
+		&& ack->retain_pi_if_dirty == 0
+		&& ack->sender_connection_generation != 0
+		&& ack->sender_connection_generation != UINT32_MAX
+		&& ack->outcome == RESOURCE_X_OUTCOME_OK
+		&& ack->flags == 0
+		&& ack->authority_generation == 0
+		&& receipt->highest_attempt_floor >= request->assertion_sequence
+		&& receipt->highest_attempt_floor != UINT64_MAX
+		&& receipt->r4_record_generation != 0
+		&& receipt->r4_record_generation != UINT64_MAX
+		&& receipt->authenticated_ingress_connection_generation
+			== request->sender_connection_generation;
+}
+
+static void
+pcm_resource_x_bootstrap_ack_snapshot(
+	const ClusterPcmResourceXBootstrapReceipt *receipt,
+	ResourceXDecodedFrame *ack_out)
+{
+	Assert(receipt != NULL);
+	Assert(ack_out != NULL);
+	memset(ack_out, 0, sizeof(*ack_out));
+	ack_out->kind = RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP;
+	ack_out->payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+	pcm_resource_x_common_copy(&ack_out->common, &receipt->ack);
+}
+
+static bool
+pcm_resource_x_bootstrapped_assert_matches_receipt(
+	const ResourceXDecodedFrame *assertion,
+	const ClusterPcmResourceXBootstrapReceipt *receipt,
+	uint32 authenticated_ingress_connection_generation,
+	uint64 r4_record_generation, uint64 current_master_session_incarnation,
+	uint32 current_master_sender_connection_generation)
+{
+	return assertion != NULL && receipt != NULL
+		&& receipt->state == RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED
+		&& assertion->payload_bytes == RESOURCE_X_CONTROL_V1_BYTES
+		&& !assertion->blocked_has_remote_proof
+		&& resource_x_assertion_equal(
+			&assertion->common.logical_assertion,
+			&receipt->request.logical_assertion)
+		&& assertion->common.base_authority_generation
+			== receipt->sampled_base
+		&& assertion->common.authority_generation
+			== receipt->sampled_base
+		&& assertion->common.resource_formation
+			== receipt->request.resource_formation
+		&& assertion->common.master_session_incarnation
+			== receipt->request.master_session_incarnation
+		&& assertion->common.assertion_sequence
+			== receipt->request.assertion_sequence
+		&& assertion->common.ordered_lane == 0
+		&& assertion->common.action_node
+			== receipt->request.logical_assertion.requester_node
+		&& assertion->common.observed_mode == (uint8)PCM_STATE_N
+		&& assertion->common.target_mode == (uint8)PCM_STATE_X
+		&& assertion->common.source_candidate == 0
+		&& assertion->common.retain_pi_if_dirty == 0
+		&& assertion->common.sender_connection_generation
+			== authenticated_ingress_connection_generation
+		&& assertion->common.sender_connection_generation
+			== receipt->authenticated_ingress_connection_generation
+		&& assertion->common.outcome == RESOURCE_X_OUTCOME_NONE
+		&& assertion->common.flags == 0
+		&& receipt->sampled_base != 0
+		&& receipt->sampled_base != UINT64_MAX
+		&& r4_record_generation == receipt->r4_record_generation
+		&& current_master_session_incarnation
+			== receipt->request.master_session_incarnation
+		&& current_master_sender_connection_generation
+			== receipt->ack.sender_connection_generation;
+}
+
 /* The initial module values are not an authority witness once legacy PCM has
  * already moved this resource.  The temporary production adapter may adopt
  * the exact selected-ticket base only while every Resource-X semantic owner
@@ -7082,10 +7422,131 @@ cluster_pcm_lock_resource_x_adapter_successor_base_exact(
 }
 
 ResourceXApplyResult
-cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
-										 int32 authenticated_source_node,
-										 ResourceXMasterSnapshot *out)
+cluster_pcm_lock_resource_x_bootstrap_request_exact(
+	const ResourceXDecodedFrame *request, int32 authenticated_source_node,
+	uint32 authenticated_ingress_connection_generation,
+	uint64 r4_record_generation, uint64 current_master_session_incarnation,
+	uint32 master_sender_connection_generation,
+	ResourceXDecodedFrame *ack_out)
 {
+	ClusterPcmResourceXBootstrapReceipt *receipt;
+	ClusterPcmResourceXMasterRequest *master_request;
+	ClusterPcmResourceXMasterState *state;
+	struct GrdEntry *entry;
+	uint32 gate_phase;
+	uint64 gate_formation;
+	uint64 attempt_floor;
+	int32 requester_node;
+	ResourceXApplyResult result;
+
+	if (ack_out != NULL)
+		memset(ack_out, 0, sizeof(*ack_out));
+	if (ack_out == NULL
+		|| !pcm_resource_x_bootstrap_request_valid(
+			request, authenticated_source_node,
+			authenticated_ingress_connection_generation,
+			r4_record_generation, current_master_session_incarnation,
+			master_sender_connection_generation)
+		|| ClusterPcm == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	gate_phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+	gate_formation = pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation);
+	if (gate_phase != RESOURCE_X_GATE_OPEN
+		|| gate_formation != request->common.resource_formation)
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+
+	entry = pcm_get_or_create_entry(
+		request->common.logical_assertion.resource);
+	if (entry == NULL)
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	requester_node = request->common.logical_assertion.requester_node;
+	pcm_entry_lock_exclusive(entry);
+	state = pcm_resource_x_master_state_for_tag(&entry->tag);
+	if (state == NULL || state->authority_generation == 0
+		|| state->authority_generation == UINT64_MAX
+		|| state->next_enqueue_order == 0) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	receipt = &state->bootstrap_receipts[requester_node];
+	master_request = &state->requests[requester_node];
+	if (!pcm_resource_x_bootstrap_receipt_valid(receipt)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (receipt->state == RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED
+		&& (receipt->sampled_base != state->authority_generation
+			|| receipt->r4_record_generation != r4_record_generation
+			|| receipt->request.resource_formation != gate_formation
+			|| receipt->request.master_session_incarnation
+				!= current_master_session_incarnation
+			|| receipt->authenticated_ingress_connection_generation
+				!= authenticated_ingress_connection_generation
+			|| receipt->ack.sender_connection_generation
+				!= master_sender_connection_generation))
+		pcm_resource_x_bootstrap_receipt_invalidate(receipt);
+
+	attempt_floor = receipt->highest_attempt_floor;
+	if (pcm_resource_x_terminal_tombstone_valid(
+			&state->terminal_tombstone)
+		&& state->terminal_tombstone.requester_node == requester_node
+		&& state->terminal_tombstone.request.assertion_sequence
+			> attempt_floor)
+		attempt_floor
+			= state->terminal_tombstone.request.assertion_sequence;
+	if (master_request->phase != RESOURCE_X_MASTER_NONE
+		&& master_request->assertion_sequence > attempt_floor)
+		attempt_floor = master_request->assertion_sequence;
+	if (attempt_floor > receipt->highest_attempt_floor)
+		receipt->highest_attempt_floor = attempt_floor;
+
+	if (receipt->state == RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED
+		&& pcm_resource_x_common_equal(
+			&request->common, &receipt->request)) {
+		pcm_resource_x_bootstrap_ack_snapshot(receipt, ack_out);
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	}
+	else if (request->common.assertion_sequence <= attempt_floor
+			 || receipt->state
+				== RESOURCE_X_BOOTSTRAP_RECEIPT_CONSUMED_BY_ASSERT
+			 || (master_request->phase != RESOURCE_X_MASTER_NONE
+				 && master_request->phase != RESOURCE_X_MASTER_RELEASED))
+		result = RESOURCE_X_APPLY_STALE;
+	else {
+		pcm_resource_x_bootstrap_receipt_invalidate(receipt);
+		pcm_resource_x_common_copy(
+			&receipt->request, &request->common);
+		pcm_resource_x_common_copy(&receipt->ack, &request->common);
+		receipt->ack.base_authority_generation
+			= state->authority_generation;
+		receipt->ack.sender_connection_generation
+			= master_sender_connection_generation;
+		receipt->ack.outcome = RESOURCE_X_OUTCOME_OK;
+		receipt->ack.semantic_crc32c = 0;
+		receipt->highest_attempt_floor
+			= request->common.assertion_sequence;
+		receipt->sampled_base = state->authority_generation;
+		receipt->r4_record_generation = r4_record_generation;
+		receipt->authenticated_ingress_connection_generation
+			= authenticated_ingress_connection_generation;
+		receipt->state = RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED;
+		pcm_resource_x_bootstrap_ack_snapshot(receipt, ack_out);
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	return result;
+}
+
+static ResourceXApplyResult
+pcm_resource_x_assert_exact_internal(
+	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
+	bool require_bootstrap,
+	uint32 authenticated_ingress_connection_generation,
+	uint64 r4_record_generation, uint64 current_master_session_incarnation,
+	uint32 current_master_sender_connection_generation,
+	ResourceXMasterSnapshot *out)
+{
+	ClusterPcmResourceXBootstrapReceipt *receipt = NULL;
 	ClusterPcmResourceXMasterState *state;
 	ClusterPcmResourceXMasterRequest *request;
 	struct GrdEntry *entry;
@@ -7100,7 +7561,33 @@ cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
 		out->source_node = -1;
 	}
 	if (out == NULL || !pcm_resource_x_assert_frame_valid(assertion,
-													 authenticated_source_node)
+												 authenticated_source_node)
+		|| (require_bootstrap
+			&& (assertion->payload_bytes
+					!= RESOURCE_X_CONTROL_V1_BYTES
+				|| assertion->blocked_has_remote_proof
+				|| assertion->common.base_authority_generation
+					== UINT64_MAX
+				|| assertion->common.resource_formation == UINT64_MAX
+				|| assertion->common.assertion_sequence == UINT64_MAX
+				|| assertion->common.ordered_lane != 0
+				|| assertion->common.observed_mode != (uint8)PCM_STATE_N
+				|| assertion->common.source_candidate != 0
+				|| assertion->common.retain_pi_if_dirty != 0
+				|| assertion->common.flags != 0
+				|| authenticated_ingress_connection_generation == 0
+				|| authenticated_ingress_connection_generation == UINT32_MAX
+				|| assertion->common.sender_connection_generation
+					!= authenticated_ingress_connection_generation
+				|| r4_record_generation == 0
+				|| r4_record_generation == UINT64_MAX
+				|| current_master_session_incarnation == 0
+				|| current_master_session_incarnation == UINT64_MAX
+				|| assertion->common.master_session_incarnation
+					!= current_master_session_incarnation
+				|| current_master_sender_connection_generation == 0
+				|| current_master_sender_connection_generation
+					== UINT32_MAX))
 		|| ClusterPcm == NULL)
 		return RESOURCE_X_APPLY_INVALID;
 	gate_phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
@@ -7161,6 +7648,33 @@ cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
 								: RESOURCE_X_APPLY_STALE);
 		}
 	}
+	if (require_bootstrap) {
+		receipt = &state->bootstrap_receipts[requester_node];
+		if (!pcm_resource_x_bootstrap_receipt_valid(receipt)) {
+			LWLockRelease(&entry->entry_lock.lock);
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+		if (!pcm_resource_x_bootstrapped_assert_matches_receipt(
+				assertion, receipt,
+				authenticated_ingress_connection_generation,
+				r4_record_generation, current_master_session_incarnation,
+				current_master_sender_connection_generation)
+			|| receipt->sampled_base != state->authority_generation) {
+			if (receipt->state == RESOURCE_X_BOOTSTRAP_RECEIPT_RECEIVED
+				&& (receipt->sampled_base != state->authority_generation
+					|| receipt->r4_record_generation
+						!= r4_record_generation
+					|| receipt->request.master_session_incarnation
+						!= current_master_session_incarnation
+					|| receipt->authenticated_ingress_connection_generation
+						!= authenticated_ingress_connection_generation
+					|| receipt->ack.sender_connection_generation
+						!= current_master_sender_connection_generation))
+				pcm_resource_x_bootstrap_receipt_invalidate(receipt);
+			LWLockRelease(&entry->entry_lock.lock);
+			return RESOURCE_X_APPLY_STALE;
+		}
+	}
 	if (assertion->common.base_authority_generation != state->authority_generation
 		|| (entry->pending_x_requester_node != -1
 			&& entry->pending_x_requester_node != requester_node)
@@ -7169,6 +7683,8 @@ cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
 		return assertion->common.base_authority_generation != state->authority_generation
 			? RESOURCE_X_APPLY_STALE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
+	if (require_bootstrap)
+		receipt->state = RESOURCE_X_BOOTSTRAP_RECEIPT_CONSUMED_BY_ASSERT;
 
 	memset(request, 0, sizeof(*request));
 	request->base_authority_generation = assertion->common.base_authority_generation;
@@ -7209,6 +7725,30 @@ cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
 	LWLockRelease(&entry->entry_lock.lock);
 	return request->phase == RESOURCE_X_MASTER_RECOVERY_BLOCKED
 		? RESOURCE_X_APPLY_RECOVERY_BLOCKED : RESOURCE_X_APPLY_APPLIED;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
+										 int32 authenticated_source_node,
+										 ResourceXMasterSnapshot *out)
+{
+	return pcm_resource_x_assert_exact_internal(
+		assertion, authenticated_source_node, false, 0, 0, 0, 0, out);
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
+	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
+	uint32 authenticated_ingress_connection_generation,
+	uint64 r4_record_generation, uint64 current_master_session_incarnation,
+	uint32 current_master_sender_connection_generation,
+	ResourceXMasterSnapshot *out)
+{
+	return pcm_resource_x_assert_exact_internal(
+		assertion, authenticated_source_node, true,
+		authenticated_ingress_connection_generation,
+		r4_record_generation, current_master_session_incarnation,
+		current_master_sender_connection_generation, out);
 }
 
 static bool
@@ -10577,6 +11117,7 @@ cluster_pcm_lock_resource_x_settled_retire_exact(
 	const ResourceXAssertion *assertion, uint64 assertion_sequence,
 	const ResourceXMasterSnapshot *settled)
 {
+	ClusterPcmResourceXBootstrapReceipt *receipt;
 	ClusterPcmResourceXTerminalTombstone *tombstone;
 	ClusterPcmResourceXMasterState *state;
 	ClusterPcmResourceXMasterRequest *request;
@@ -10597,6 +11138,7 @@ cluster_pcm_lock_resource_x_settled_retire_exact(
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	tombstone = &state->terminal_tombstone;
+	receipt = &state->bootstrap_receipts[requester_node];
 	request = &state->requests[requester_node];
 	if (request->phase == RESOURCE_X_MASTER_NONE) {
 		ResourceXApplyResult result
@@ -10616,9 +11158,16 @@ cluster_pcm_lock_resource_x_settled_retire_exact(
 		LWLockRelease(&entry->entry_lock.lock);
 		return RESOURCE_X_APPLY_STALE;
 	}
+	if (!pcm_resource_x_bootstrap_receipt_valid(receipt)) {
+		LWLockRelease(&entry->entry_lock.lock);
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 	tombstone->request = *request;
 	tombstone->requester_node = requester_node;
 	tombstone->valid = 1;
+	if (assertion_sequence > receipt->highest_attempt_floor)
+		receipt->highest_attempt_floor = assertion_sequence;
+	pcm_resource_x_bootstrap_receipt_invalidate(receipt);
 	memset(request, 0, sizeof(*request));
 	LWLockRelease(&entry->entry_lock.lock);
 	return RESOURCE_X_APPLY_APPLIED;

@@ -864,6 +864,24 @@ cluster_pcm_lock_resource_x_adapter_successor_base_exact(
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_exact(
 	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
 	ResourceXMasterSnapshot *out);
+/* PGRAC adaptation: kind-9 is a non-authority pre-ASSERT receipt.  The
+ * caller passes independently authenticated/current connection, R4, and
+ * master-session values; the exact ASSERT consumes the receipt under the
+ * same resource entry lock that creates the canonical master request. */
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_request_exact(
+	const ResourceXDecodedFrame *request, int32 authenticated_source_node,
+	uint32 authenticated_ingress_connection_generation,
+	uint64 r4_record_generation, uint64 current_master_session_incarnation,
+	uint32 master_sender_connection_generation,
+	ResourceXDecodedFrame *ack_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
+	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
+	uint32 authenticated_ingress_connection_generation,
+	uint64 r4_record_generation, uint64 current_master_session_incarnation,
+	uint32 current_master_sender_connection_generation,
+	ResourceXMasterSnapshot *out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node);
 extern ResourceXApplyResult
