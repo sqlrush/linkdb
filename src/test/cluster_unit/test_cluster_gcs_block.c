@@ -7251,11 +7251,60 @@ UT_TEST(test_r11_legacy_source_requester_is_generation_bound)
 	free(source);
 }
 
+UT_TEST(test_r11_legacy_transport_drains_closed_but_rejects_target)
+{
+	static const struct
+	{
+		const char *function;
+		const char *sink;
+	} producers[] = {
+		{"\ncluster_gcs_pcm_x_stage_frame(",
+		 "cluster_grd_outbound_enqueue_backend_msg("},
+		{"\ngcs_block_pcm_x_stage_frame_cap_bound(",
+		 "cluster_lms_outbound_enqueue_cap_bound("},
+		{"\ngcs_block_pcm_x_stage_retire_up_to(",
+		 "cluster_lms_outbound_enqueue("},
+		{"\ngcs_block_pcm_x_send_retire_ack(",
+		 "cluster_ic_send_envelope("}
+	};
+	char *source = read_gcs_block_source();
+	int i;
+
+	UT_ASSERT(cluster_gcs_pcm_x_legacy_transport_allowed(
+		RESOURCE_X_WRITER_SOURCE));
+	UT_ASSERT(cluster_gcs_pcm_x_legacy_transport_allowed(
+		RESOURCE_X_WRITER_CLOSED));
+	UT_ASSERT(!cluster_gcs_pcm_x_legacy_transport_allowed(
+		RESOURCE_X_WRITER_TARGET));
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	for (i = 0; i < lengthof(producers); i++) {
+		const char *begin = strstr(source, producers[i].function);
+		const char *end = begin != NULL ? strstr(begin, "\n}\n") : NULL;
+		const char *guard = begin != NULL
+			? strstr(begin, "gcs_block_pcm_x_legacy_transport_current()")
+			: NULL;
+		const char *sink = begin != NULL ? strstr(begin, producers[i].sink) : NULL;
+
+		UT_ASSERT_NOT_NULL(begin);
+		UT_ASSERT_NOT_NULL(end);
+		UT_ASSERT_NOT_NULL(guard);
+		UT_ASSERT_NOT_NULL(sink);
+		if (begin != NULL && end != NULL && guard != NULL && sink != NULL) {
+			UT_ASSERT(guard < sink);
+			UT_ASSERT(sink < end);
+		}
+	}
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(131);
+	UT_PLAN(132);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -7387,6 +7436,7 @@ main(void)
 	UT_RUN(test_resource_x_ticket_adapter_exposes_sequence_and_selects_one_revoke_owner);
 	UT_RUN(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact);
 	UT_RUN(test_r11_legacy_source_requester_is_generation_bound);
+	UT_RUN(test_r11_legacy_transport_drains_closed_but_rejects_target);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

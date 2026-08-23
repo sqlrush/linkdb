@@ -15717,6 +15717,17 @@ fail_closed:
 	cluster_pcm_x_runtime_fail_closed();
 }
 
+static bool
+gcs_block_pcm_x_legacy_transport_current(void)
+{
+	uint64 r4_generation = 0;
+	ResourceXWriterPath writer_path
+		= cluster_resource_x_writer_path_snapshot(&r4_generation);
+
+	return r4_generation != UINT64_MAX
+		&& cluster_gcs_pcm_x_legacy_transport_allowed(writer_path);
+}
+
 
 /*
  * PCM-X is an application protocol, including when resource master and
@@ -15734,6 +15745,8 @@ cluster_gcs_pcm_x_stage_frame(uint8 msg_type, int32 dest_node_id, const void *pa
 	if (msg_type < PGRAC_IC_MSG_PCM_X_ENQUEUE || msg_type > PGRAC_IC_MSG_PCM_X_RETIRE_ACK
 		|| dest_node_id < 0 || dest_node_id >= PCM_X_PROTOCOL_NODE_LIMIT || payload == NULL
 		|| payload_len == 0)
+		return false;
+	if (!gcs_block_pcm_x_legacy_transport_current())
 		return false;
 
 	return cluster_grd_outbound_enqueue_backend_msg(msg_type, (uint32)dest_node_id, payload,
@@ -15754,6 +15767,8 @@ gcs_block_pcm_x_stage_frame_cap_bound(uint8 msg_type, int32 dest_node_id, const 
 	if (msg_type < PGRAC_IC_MSG_PCM_X_ENQUEUE || msg_type > PGRAC_IC_MSG_PCM_X_RETIRE_ACK
 		|| dest_node_id < 0 || dest_node_id >= PCM_X_PROTOCOL_NODE_LIMIT || payload == NULL
 		|| payload_len == 0 || required_capability == 0 || cluster_lms_workers <= 0)
+		return false;
+	if (!gcs_block_pcm_x_legacy_transport_current())
 		return false;
 	worker = cluster_gcs_block_payload_shard(msg_type, payload, payload_len, cluster_lms_workers);
 	if (worker < 0 || worker >= cluster_lms_workers)
@@ -15777,6 +15792,8 @@ gcs_block_pcm_x_stage_retire_up_to(int32 dest_node_id, const PcmXRetirePayload *
 	if (dest_node_id < 0 || dest_node_id >= PCM_X_PROTOCOL_NODE_LIMIT || payload == NULL
 		|| tag == NULL || cluster_lms_workers <= 0)
 		return false;
+	if (!gcs_block_pcm_x_legacy_transport_current())
+		return false;
 	worker = cluster_lms_shard_for_tag(tag, cluster_lms_workers);
 	if (worker < 0 || worker >= cluster_lms_workers)
 		return false;
@@ -15791,6 +15808,8 @@ gcs_block_pcm_x_send_retire_ack(int32 dest_node_id, const PcmXRetirePayload *pay
 	ClusterICSendResult send_result;
 
 	if (dest_node_id < 0 || dest_node_id >= PCM_X_PROTOCOL_NODE_LIMIT || payload == NULL)
+		return false;
+	if (!gcs_block_pcm_x_legacy_transport_current())
 		return false;
 	send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_PCM_X_RETIRE_ACK, dest_node_id, payload,
 										   sizeof(*payload));

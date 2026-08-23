@@ -5046,6 +5046,16 @@ cluster_gcs_pcm_x_source_admission_exact(ResourceXWriterPath observed_path,
 	return PCM_X_QUEUE_OK;
 }
 
+/* D11-03: CLOSED still drains the already-retained legacy transport debt
+ * needed by R4 activation.  Once TARGET is open, no legacy PCM-X producer
+ * may create another outbound frame. */
+static inline bool
+cluster_gcs_pcm_x_legacy_transport_allowed(ResourceXWriterPath observed_path)
+{
+	return observed_path == RESOURCE_X_WRITER_SOURCE
+		|| observed_path == RESOURCE_X_WRITER_CLOSED;
+}
+
 /* Join the node-local FIFO, drive the sole remote queue request when this
  * backend is leader, and return one exact writer claim.  claim_handed_off is
  * published before requester cleanup authority is dropped, closing the
