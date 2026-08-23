@@ -96,6 +96,11 @@ static bool test_pgrd_snapshot_found;
 static bool test_bit22_latch_found;
 static bool test_bit22_seam_found;
 static bool test_source_close_found;
+static bool test_resource_x_callbacks_available = true;
+static int test_resource_x_readiness_calls;
+static int test_resource_x_stage_calls;
+static int test_resource_x_logical_zero_calls;
+static int test_resource_x_transport_zero_calls;
 static Size test_source_close_requested_size;
 static Size test_shmem_requested_size;
 static Size test_utility_mailbox_requested_size;
@@ -753,6 +758,68 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 	return 0;
 }
 
+static ClusterSemanticActivationResult
+test_resource_x_readiness(uint64 generation,
+						  ClusterSemanticActivationRefusal *refusal)
+{
+	test_resource_x_readiness_calls++;
+	if (refusal != NULL) {
+		refusal->result = CLUSTER_SEMANTIC_ACTIVATION_OK;
+		refusal->feature_bit = 0;
+		refusal->expected_generation = generation;
+	}
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static ClusterSemanticActivationResult
+test_resource_x_stage(uint64 generation)
+{
+	test_resource_x_stage_calls++;
+	return generation == 0 ? CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
+						   : CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static ClusterSemanticActivationResult
+test_resource_x_logical_zero(uint64 generation,
+						   ClusterSemanticZeroProof *proof)
+{
+	test_resource_x_logical_zero_calls++;
+	if (generation == 0 || proof == NULL)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	memset(proof, 0, sizeof(*proof));
+	proof->record_generation = generation;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static ClusterSemanticActivationResult
+test_resource_x_transport_zero(uint64 generation,
+							 ClusterSemanticZeroProof *proof)
+{
+	test_resource_x_transport_zero_calls++;
+	if (generation == 0 || proof == NULL)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	memset(proof, 0, sizeof(*proof));
+	proof->record_generation = generation;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+static const ClusterSemanticActivationCallbackBundle test_resource_x_callbacks = {
+	.pre_prepare_readiness = test_resource_x_readiness,
+	.close_source_admission = test_resource_x_stage,
+	.source_logical_debt_zero = test_resource_x_logical_zero,
+	.source_transport_zero = test_resource_x_transport_zero,
+	.prepare_target = test_resource_x_stage,
+	.apply_target_closed = test_resource_x_stage,
+	.revert_source_closed = test_resource_x_stage,
+	.open_target_admission = test_resource_x_stage,
+};
+
+const ClusterSemanticActivationCallbackBundle *
+cluster_pcm_x_resource_x_activation_callbacks(void)
+{
+	return test_resource_x_callbacks_available ? &test_resource_x_callbacks : NULL;
+}
+
 /* Exercise the real product-local policy helpers without exporting a test API. */
 #define cluster_undo_block0_r4_prerequisite_snapshot test_r4a_prerequisite_snapshot
 #define pg_usleep test_pg_usleep
@@ -1148,21 +1215,61 @@ UT_TEST(test_10a_r11_resource_x_cutover_descriptor_is_compiled_exact)
 	UT_ASSERT_EQ(cluster_semantic_activation_compiled_feature_bitmap(),
 				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
 				 | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
+	test_resource_x_callbacks_available = true;
+	test_resource_x_readiness_calls = 0;
+	test_resource_x_stage_calls = 0;
+	test_resource_x_logical_zero_calls = 0;
+	test_resource_x_transport_zero_calls = 0;
 	memset(&refusal, 0, sizeof(refusal));
 	UT_ASSERT_EQ(cutover->pre_prepare_readiness(7, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.feature_bit, 0);
+	UT_ASSERT_EQ(refusal.expected_generation, 7);
+	memset(&proof, 0x7f, sizeof(proof));
+	UT_ASSERT_EQ(cutover->source_logical_debt_zero(7, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(proof.record_generation, 7);
+	UT_ASSERT_EQ(proof.debt_count, 0);
+	UT_ASSERT_EQ(proof.sample_digest, 0);
+	memset(&proof, 0x7f, sizeof(proof));
+	UT_ASSERT_EQ(cutover->source_transport_zero(7, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(proof.record_generation, 7);
+	UT_ASSERT_EQ(proof.debt_count, 0);
+	UT_ASSERT_EQ(proof.sample_digest, 0);
+	UT_ASSERT_EQ(cutover->close_source_admission(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(cutover->prepare_target(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(cutover->apply_target_closed(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(cutover->revert_source_closed(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(cutover->open_target_admission(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(test_resource_x_readiness_calls, 1);
+	UT_ASSERT_EQ(test_resource_x_logical_zero_calls, 1);
+	UT_ASSERT_EQ(test_resource_x_transport_zero_calls, 1);
+	UT_ASSERT_EQ(test_resource_x_stage_calls, 5);
+
+	test_resource_x_callbacks_available = false;
+	memset(&refusal, 0, sizeof(refusal));
+	UT_ASSERT_EQ(cutover->pre_prepare_readiness(8, &refusal),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	UT_ASSERT_EQ(refusal.feature_bit,
 				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
-	UT_ASSERT_EQ(refusal.expected_generation, 7);
+	UT_ASSERT_EQ(refusal.expected_generation, 8);
 	memset(&proof, 0x7f, sizeof(proof));
-	UT_ASSERT_EQ(cutover->source_logical_debt_zero(7, &proof),
+	UT_ASSERT_EQ(cutover->source_logical_debt_zero(8, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	UT_ASSERT_EQ(proof.record_generation, 0);
 	UT_ASSERT_EQ(proof.debt_count, 0);
 	UT_ASSERT_EQ(proof.sample_digest, 0);
-	UT_ASSERT_EQ(cutover->open_target_admission(7),
+	UT_ASSERT_EQ(cutover->open_target_admission(8),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	test_resource_x_callbacks_available = true;
 }
 
 UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)

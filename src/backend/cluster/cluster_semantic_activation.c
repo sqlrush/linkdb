@@ -29,6 +29,7 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
+#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_replacement_wire.h"
@@ -4718,9 +4719,9 @@ bit22_stage_ok(uint64 record_generation)
 	return CLUSTER_SEMANTIC_ACTIVATION_OK;
 }
 
-/* The Resource-X cutover descriptor is compiled before its later callback
- * owners become reachable.  Until those owners are wired, every callback is
- * deliberately fail-closed and mutates no source or target state. */
+/* The Resource-X cutover descriptor owns only the bit-10 identity.  Its
+ * transition effects remain in the existing source/target owner bundle; a
+ * missing owner or missing directional callback is always fail-closed. */
 static ClusterSemanticActivationResult
 r11_resource_x_not_ready(uint64 expected_generation,
 						 ClusterSemanticActivationRefusal *refusal)
@@ -4749,6 +4750,97 @@ r11_resource_x_stage_closed(uint64 generation)
 	return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 }
 
+static ClusterSemanticActivationResult
+r11_resource_x_readiness(uint64 expected_generation,
+						 ClusterSemanticActivationRefusal *refusal)
+{
+	const ClusterSemanticActivationCallbackBundle *callbacks
+		= cluster_pcm_x_resource_x_activation_callbacks();
+
+	if (callbacks == NULL || callbacks->pre_prepare_readiness == NULL)
+		return r11_resource_x_not_ready(expected_generation, refusal);
+	return callbacks->pre_prepare_readiness(expected_generation, refusal);
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_close_source(uint64 generation)
+{
+	const ClusterSemanticActivationCallbackBundle *callbacks
+		= cluster_pcm_x_resource_x_activation_callbacks();
+
+	return callbacks != NULL && callbacks->close_source_admission != NULL
+		? callbacks->close_source_admission(generation)
+		: r11_resource_x_stage_closed(generation);
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_logical_zero(uint64 generation,
+						ClusterSemanticZeroProof *proof)
+{
+	const ClusterSemanticActivationCallbackBundle *callbacks
+		= cluster_pcm_x_resource_x_activation_callbacks();
+
+	if (callbacks == NULL || callbacks->source_logical_debt_zero == NULL)
+		return r11_resource_x_zero_unavailable(generation, proof);
+	return callbacks->source_logical_debt_zero(generation, proof);
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_transport_zero(uint64 generation,
+						  ClusterSemanticZeroProof *proof)
+{
+	const ClusterSemanticActivationCallbackBundle *callbacks
+		= cluster_pcm_x_resource_x_activation_callbacks();
+
+	if (callbacks == NULL || callbacks->source_transport_zero == NULL)
+		return r11_resource_x_zero_unavailable(generation, proof);
+	return callbacks->source_transport_zero(generation, proof);
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_prepare_target(uint64 generation)
+{
+	const ClusterSemanticActivationCallbackBundle *callbacks
+		= cluster_pcm_x_resource_x_activation_callbacks();
+
+	return callbacks != NULL && callbacks->prepare_target != NULL
+		? callbacks->prepare_target(generation)
+		: r11_resource_x_stage_closed(generation);
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_apply_target_closed(uint64 generation)
+{
+	const ClusterSemanticActivationCallbackBundle *callbacks
+		= cluster_pcm_x_resource_x_activation_callbacks();
+
+	return callbacks != NULL && callbacks->apply_target_closed != NULL
+		? callbacks->apply_target_closed(generation)
+		: r11_resource_x_stage_closed(generation);
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_revert_source_closed(uint64 generation)
+{
+	const ClusterSemanticActivationCallbackBundle *callbacks
+		= cluster_pcm_x_resource_x_activation_callbacks();
+
+	return callbacks != NULL && callbacks->revert_source_closed != NULL
+		? callbacks->revert_source_closed(generation)
+		: r11_resource_x_stage_closed(generation);
+}
+
+static ClusterSemanticActivationResult
+r11_resource_x_open_target(uint64 generation)
+{
+	const ClusterSemanticActivationCallbackBundle *callbacks
+		= cluster_pcm_x_resource_x_activation_callbacks();
+
+	return callbacks != NULL && callbacks->open_target_admission != NULL
+		? callbacks->open_target_admission(generation)
+		: r11_resource_x_stage_closed(generation);
+}
+
 static const ClusterSemanticActivationDescriptor r4_descriptor = {
 	.name = "R4_SYNC_CR_V1",
 	.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
@@ -4772,14 +4864,14 @@ static const ClusterSemanticActivationDescriptor r11_resource_x_descriptor = {
 						   | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
 	.required_active_bits = 0,
 	.source_available = CLUSTER_SEMANTIC_R11_RESOURCE_X_SOURCE_AVAILABLE,
-	.pre_prepare_readiness = r11_resource_x_not_ready,
-	.close_source_admission = r11_resource_x_stage_closed,
-	.source_logical_debt_zero = r11_resource_x_zero_unavailable,
-	.source_transport_zero = r11_resource_x_zero_unavailable,
-	.prepare_target = r11_resource_x_stage_closed,
-	.apply_target_closed = r11_resource_x_stage_closed,
-	.revert_source_closed = r11_resource_x_stage_closed,
-	.open_target_admission = r11_resource_x_stage_closed,
+	.pre_prepare_readiness = r11_resource_x_readiness,
+	.close_source_admission = r11_resource_x_close_source,
+	.source_logical_debt_zero = r11_resource_x_logical_zero,
+	.source_transport_zero = r11_resource_x_transport_zero,
+	.prepare_target = r11_resource_x_prepare_target,
+	.apply_target_closed = r11_resource_x_apply_target_closed,
+	.revert_source_closed = r11_resource_x_revert_source_closed,
+	.open_target_admission = r11_resource_x_open_target,
 };
 
 StaticAssertDecl(
