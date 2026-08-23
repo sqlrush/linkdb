@@ -7185,9 +7185,19 @@ cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 				round, assertion, current_master_node, resource_formation,
 				master_session_incarnation, r4_record_generation,
 				requester_sender_connection_generation,
-				master_ingress_connection_generation, retry_slice_us)
-			|| !cached_local_x
-			|| cached_ownership_generation
+				master_ingress_connection_generation, retry_slice_us)) {
+			if (pcm_resource_x_bootstrap_round_local_sole_x_locked(entry))
+				round->phase = RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED;
+			else
+				pcm_resource_x_bootstrap_round_clear_binding_locked(round);
+			broadcast = true;
+			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+		} else if (!cached_local_x) {
+			/* BufferDesc and the round are separate lock domains.  A caller may
+			 * have sampled the pre-T3 descriptor immediately before T3 published
+			 * this cover.  Re-probe instead of destroying exact terminal evidence. */
+			action = RESOURCE_X_BOOTSTRAP_ROUND_WAIT;
+		} else if (cached_ownership_generation
 				!= round->cached_ownership_generation
 			|| !pcm_resource_x_ref_valid(&round->terminal_ref)
 			|| round->terminal_ref.acquisition_generation
@@ -7370,6 +7380,85 @@ cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
 		ConditionVariableBroadcast(&entry->wait_cv);
 	LWLockRelease(&entry->entry_lock.lock);
 	return action;
+}
+
+/* Complete one bounded follower wait on the same per-resource CV used by the
+ * requester round.  Registration precedes the predicate lock, so an ACK/T3
+ * broadcast cannot be lost between the exact recheck and the sleep. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node,
+	uint64 resource_formation, uint64 master_session_incarnation,
+	uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation,
+	uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, long timeout_ms)
+{
+	ClusterPcmResourceXBootstrapRound *round;
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+
+	if (!resource_x_assertion_valid(assertion)
+		|| current_master_node < 0
+		|| current_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| resource_formation == 0 || resource_formation == UINT64_MAX
+		|| master_session_incarnation == 0
+		|| master_session_incarnation == UINT64_MAX
+		|| r4_record_generation == 0
+		|| r4_record_generation == UINT64_MAX
+		|| requester_sender_connection_generation == 0
+		|| requester_sender_connection_generation == UINT32_MAX
+		|| master_ingress_connection_generation == 0
+		|| master_ingress_connection_generation == UINT32_MAX
+		|| retry_slice_us == 0 || retry_slice_us == UINT64_MAX
+		|| timeout_ms <= 0) {
+		ConditionVariableCancelSleep();
+		return RESOURCE_X_APPLY_INVALID;
+	}
+	entry = pcm_find_entry(assertion->resource);
+	if (entry == NULL) {
+		ConditionVariableCancelSleep();
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	}
+
+	ConditionVariablePrepareToSleep(&entry->wait_cv);
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	if (!pcm_resource_x_bootstrap_round_identity_matches(
+			round, assertion, current_master_node, resource_formation,
+			master_session_incarnation, r4_record_generation,
+			requester_sender_connection_generation,
+			master_ingress_connection_generation, retry_slice_us))
+		result = RESOURCE_X_APPLY_STALE;
+	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+		result = RESOURCE_X_APPLY_DUPLICATE;
+	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+			 || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND
+			 || round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED)
+		result = RESOURCE_X_APPLY_APPLIED;
+	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	LWLockRelease(&entry->entry_lock.lock);
+	if (result != RESOURCE_X_APPLY_APPLIED) {
+		ConditionVariableCancelSleep();
+		return result;
+	}
+
+	PG_TRY();
+	{
+		(void)ConditionVariableTimedSleep(&entry->wait_cv, timeout_ms,
+			WAIT_EVENT_PCM_COMPATIBLE_STATE_WAIT);
+	}
+	PG_CATCH();
+	{
+		ConditionVariableCancelSleep();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	ConditionVariableCancelSleep();
+	return RESOURCE_X_APPLY_APPLIED;
 }
 
 ResourceXApplyResult

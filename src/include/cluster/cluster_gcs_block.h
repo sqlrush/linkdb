@@ -5023,8 +5023,13 @@ extern bool cluster_gcs_pcm_x_stage_frame(uint8 msg_type, int32 dest_node_id, co
  * owner-exit gap while bufmgr adopts the claim.  The caller must keep the
  * claim through content-lock ownership and release it after UNLOCK. */
 extern PcmXQueueResult cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf,
-														PcmXLocalWriterClaim *claim_out,
-														bool *claim_handed_off);
+												PcmXLocalWriterClaim *claim_out,
+												bool *claim_handed_off);
+/* TARGET-only requester: join/create the per-resource bootstrap round and
+ * return only its exact post-T3 retained acquisition ref. */
+extern PcmXQueueResult cluster_gcs_resource_x_target_acquire_exact(
+	BufferDesc *buf, uint64 r4_record_generation,
+	ResourceXAcquisitionRef *ref_out);
 /* Diagnostic: source line of this backend's most recent non-OK
  * acquire-writer exit (0 when it never failed). */
 extern int cluster_gcs_pcm_x_requester_last_fail_line(void);

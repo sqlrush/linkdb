@@ -908,6 +908,14 @@ cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
 	uint64 r4_record_generation, uint64 now_us,
 	ResourceXDecodedFrame *assertion_out);
 extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node,
+	uint64 resource_formation, uint64 master_session_incarnation,
+	uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation,
+	uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, long timeout_ms);
+extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
 	uint64 r4_record_generation, uint64 cached_ownership_generation,

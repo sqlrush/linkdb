@@ -2283,6 +2283,14 @@ UT_TEST(test_resource_x_bootstrap_round_fans_in_and_retries_same_attempt)
 	UT_ASSERT_EQ(first_dispatch.common.base_authority_generation,
 		UINT64_C(0));
 	UT_ASSERT_EQ(first_dispatch.common.authority_generation, UINT64_C(0));
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+			&assertion, 0, 17, 31, 78, 51, 61, UINT64_C(50), 1),
+		RESOURCE_X_APPLY_STALE);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+			&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), 0),
+		RESOURCE_X_APPLY_INVALID);
 
 	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		&assertion, 0, 17, 31, 77, 51, 61,
