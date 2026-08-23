@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import gzip
 import hashlib
 import json
@@ -13,6 +14,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 from typing import Any
 
 
@@ -36,12 +38,12 @@ ATTESTATIONS = [
     "no_judge_change",
 ]
 ANCHORS = ["producer", "consumer", "observable", "negative_counterexample"]
-EXECUTION_STATUS = {
-    "red_r6": 1,
-    "red_r7": 1,
-    "red_r8": 1,
-    "red_r9": 1,
-    "red_r10": 1,
+EXECUTION_STATUS: dict[str, int | None] = {
+    "red_r6": None,
+    "red_r7": None,
+    "red_r8": None,
+    "red_r9": None,
+    "red_r10": None,
     "configure": 0,
     "full_build": 0,
     "build_units": 0,
@@ -51,6 +53,56 @@ EXECUTION_STATUS = {
     "green_r9_r10_gcs_block": 0,
     "green_r10_wire": 0,
     "green_r10_lms": 0,
+}
+RED_REPLAYS = {
+    "red_r6": {
+        "base": "0471e307462c7ccc64287f698259e863cc2dc7ec",
+        "artifact_commit": "a97629cda5d91493403d487ad1f25b5050fa8682",
+        "artifact_paths": ["src/test/cluster_unit/test_cluster_pcm_x_convert.c"],
+        "target": "test_cluster_pcm_x_convert",
+        "failure_patterns": [r"ResourceXLocalJoinResult", r"resource_x_assertion_init"],
+    },
+    "red_r7": {
+        "base": "44222f69ca254626b78283396083eab00809c3f8",
+        "artifact_commit": "636f3683908dbcab135b8e3fbe3dc4ec6affde9a",
+        "artifact_paths": ["src/test/cluster_unit/test_cluster_pcm_x_convert.c"],
+        "target": "test_cluster_pcm_x_convert",
+        "failure_patterns": [r"retry_state", r"PcmXMasterTicketSlot"],
+    },
+    "red_r8": {
+        "base": "14751227f6fbc0926761f580562329e97c4efcd9",
+        "artifact_commit": "38f3963bd0e2df0254cd9d382cc61475f924aaca",
+        "artifact_paths": ["src/test/cluster_unit/test_cluster_pcm_lock.c"],
+        "target": "test_cluster_pcm_lock",
+        "failure_patterns": [r"ResourceXReconfigToken", r"cluster_resource_x_reconfig_freeze"],
+    },
+    "red_r9": {
+        "base": "33b53695036c0c9bca17327535b8bfb9e3d7db5a",
+        "artifact_commit": "f86cd2f4f7b84f6b5bcf2f042a55d1707e1bdd94",
+        "artifact_paths": ["src/test/cluster_unit/test_cluster_pcm_lock.c"],
+        "target": "test_cluster_pcm_lock",
+        "failure_patterns": [r"ResourceXAcquisitionRef", r"cluster_pcm_lock_resource_x_t1_grant_exact"],
+    },
+    "red_r10": {
+        "base": "38f3963bd0e2df0254cd9d382cc61475f924aaca",
+        "artifact_commit": "3fd96781f433542bbb9cdf769011a25d844cb0b4",
+        "artifact_paths": ["src/test/cluster_unit/test_cluster_pcm_lock.c"],
+        "target": "test_cluster_pcm_lock",
+        "failure_patterns": [r"cluster_resource_x_node_wire\.h", r"ResourceXMasterSnapshot"],
+    },
+}
+CAPTURE_ENV_ALLOWLIST = {
+    "CPPFLAGS",
+    "DEVELOPER_DIR",
+    "LANG",
+    "LC_ALL",
+    "LDFLAGS",
+    "MACOSX_DEPLOYMENT_TARGET",
+    "PATH",
+    "PERL5LIB",
+    "PKG_CONFIG_PATH",
+    "SDKROOT",
+    "TMPDIR",
 }
 EXECUTION_TAP_PLANS = {
     "green_r6_identity": 11,
@@ -140,25 +192,105 @@ def _load_execution_artifact(
         if not isinstance(record, dict):
             raise ManifestError("execution record is not an object")
         required = {
+            "binary_path",
+            "binary_sha256",
             "command",
             "cwd",
+            "end_wall_time_utc",
+            "environment",
             "exit_status",
+            "fixture_identity",
             "key",
             "log_bytes",
             "log_path",
             "log_sha256",
             "output_sha256",
+            "start_wall_time_utc",
+            "stderr_bytes",
+            "stderr_sha256",
+            "stdout_bytes",
+            "stdout_sha256",
+            "subject_commit",
+            "subject_tree",
             "tap_not_ok",
             "tap_ok",
             "tap_plan",
+            "test_artifacts",
+            "topology",
         }
         if set(record) != required:
             raise ManifestError("execution record fields are stale or incomplete")
         key = record["key"]
         if key not in EXECUTION_STATUS or key in by_key:
             raise ManifestError(f"unexpected or duplicate execution record: {key}")
-        if record["exit_status"] != EXECUTION_STATUS[key]:
+        expected_status = EXECUTION_STATUS[key]
+        if expected_status is None and (
+            not isinstance(record["exit_status"], int) or record["exit_status"] <= 0
+        ):
+            raise ManifestError(f"execution RED did not fail: {key}")
+        if expected_status is not None and record["exit_status"] != expected_status:
             raise ManifestError(f"execution record has wrong real exit status: {key}")
+        if (
+            not isinstance(record["subject_commit"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", record["subject_commit"])
+            or not isinstance(record["subject_tree"], str)
+            or not re.fullmatch(r"[0-9a-f]{40}", record["subject_tree"])
+        ):
+            raise ManifestError(f"execution subject identity is malformed: {key}")
+        actual_subject_tree = _git(
+            source_root, "rev-parse", f"{record['subject_commit']}^{{tree}}"
+        )
+        if actual_subject_tree != record["subject_tree"]:
+            raise ManifestError(f"execution subject tree mismatch: {key}")
+        if not isinstance(record["environment"], dict) or any(
+            name not in CAPTURE_ENV_ALLOWLIST
+            or not isinstance(value, str)
+            or not value
+            for name, value in record["environment"].items()
+        ):
+            raise ManifestError(f"execution environment is outside the allowlist: {key}")
+        try:
+            started = datetime.datetime.fromisoformat(
+                record["start_wall_time_utc"].replace("Z", "+00:00")
+            )
+            ended = datetime.datetime.fromisoformat(
+                record["end_wall_time_utc"].replace("Z", "+00:00")
+            )
+        except (AttributeError, ValueError) as error:
+            raise ManifestError(f"execution wall time is malformed: {key}") from error
+        if ended < started or started.tzinfo is None or ended.tzinfo is None:
+            raise ManifestError(f"execution wall time is not ordered UTC: {key}")
+        if not isinstance(record["fixture_identity"], str) or not record["fixture_identity"]:
+            raise ManifestError(f"execution fixture identity is absent: {key}")
+        if record["topology"] not in {"single_host_build", "single_process_cluster_unit"}:
+            raise ManifestError(f"execution topology is invalid: {key}")
+        artifacts = record["test_artifacts"]
+        if not isinstance(artifacts, list):
+            raise ManifestError(f"execution test artifacts are malformed: {key}")
+        for test_artifact in artifacts:
+            if not isinstance(test_artifact, dict) or set(test_artifact) != {
+                "blob_sha256",
+                "commit",
+                "path",
+            }:
+                raise ManifestError(f"execution test artifact is incomplete: {key}")
+            artifact_blob = _blob(
+                source_root, test_artifact["commit"], test_artifact["path"]
+            )
+            if hashlib.sha256(artifact_blob).hexdigest() != test_artifact["blob_sha256"]:
+                raise ManifestError(f"execution test artifact hash mismatch: {key}")
+        binary_path = record["binary_path"]
+        binary_hash = record["binary_sha256"]
+        if (binary_path is None) != (binary_hash is None):
+            raise ManifestError(f"execution binary identity is incomplete: {key}")
+        if binary_path is not None and (
+            not isinstance(binary_path, str)
+            or binary_path.startswith("/")
+            or ".." in pathlib.PurePosixPath(binary_path).parts
+            or not isinstance(binary_hash, str)
+            or not re.fullmatch(r"[0-9a-f]{64}", binary_hash)
+        ):
+            raise ManifestError(f"execution binary identity is malformed: {key}")
         log_relative = record["log_path"]
         if not isinstance(log_relative, str) or not log_relative.startswith("src/test/"):
             raise ManifestError(f"execution log path is unsafe: {key}")
@@ -171,6 +303,23 @@ def _load_execution_artifact(
             raise ManifestError(f"execution log is not valid gzip: {key}") from error
         if len(output) != record["log_bytes"] or hashlib.sha256(output).hexdigest() != record["output_sha256"]:
             raise ManifestError(f"execution log payload mismatch: {key}")
+        stdout_bytes = record["stdout_bytes"]
+        stderr_bytes = record["stderr_bytes"]
+        if (
+            not isinstance(stdout_bytes, int)
+            or stdout_bytes < 0
+            or not isinstance(stderr_bytes, int)
+            or stderr_bytes < 0
+            or stdout_bytes + stderr_bytes != len(output)
+        ):
+            raise ManifestError(f"execution stream lengths are invalid: {key}")
+        stdout = output[:stdout_bytes]
+        stderr = output[stdout_bytes:]
+        if (
+            hashlib.sha256(stdout).hexdigest() != record["stdout_sha256"]
+            or hashlib.sha256(stderr).hexdigest() != record["stderr_sha256"]
+        ):
+            raise ManifestError(f"execution stream hash mismatch: {key}")
         text = output.decode("utf-8", errors="replace")
         plan_match = re.search(r"(?m)^1\.\.(\d+)\s*$", text)
         tap_plan = int(plan_match.group(1)) if plan_match else 0
@@ -189,6 +338,33 @@ def _load_execution_artifact(
             raise ManifestError(f"execution TAP result is not exact GREEN: {key}")
         if expected_plan is not None and re.search(r"(?mi)^.*#\s*SKIP\b", text):
             raise ManifestError(f"execution log contains SKIP: {key}")
+        replay = RED_REPLAYS.get(key)
+        if replay is not None:
+            expected_tree = _git(source_root, "rev-parse", f"{replay['base']}^{{tree}}")
+            if (
+                record["subject_commit"] != replay["base"]
+                or record["subject_tree"] != expected_tree
+            ):
+                raise ManifestError(f"execution RED is not on the exact parent: {key}")
+            expected_artifacts = [
+                {
+                    "blob_sha256": hashlib.sha256(
+                        _blob(source_root, replay["artifact_commit"], path)
+                    ).hexdigest(),
+                    "commit": replay["artifact_commit"],
+                    "path": path,
+                }
+                for path in replay["artifact_paths"]
+            ]
+            if artifacts != expected_artifacts:
+                raise ManifestError(f"execution RED test artifact mismatch: {key}")
+            if not any(re.search(pattern, text) for pattern in replay["failure_patterns"]):
+                raise ManifestError(f"execution RED missed the intended contract: {key}")
+        elif (
+            record["subject_commit"] != PRODUCT_COMMIT
+            or record["subject_tree"] != PRODUCT_TREE
+        ):
+            raise ManifestError(f"execution GREEN is not on the product tree: {key}")
         by_key[key] = dict(record)
     if set(by_key) != set(EXECUTION_STATUS):
         raise ManifestError("execution artifact does not contain the exact command set")
@@ -232,8 +408,9 @@ def _verify_evidence(
     commit: str,
     evidence: object,
     field: str,
-    expected_exit: int,
+    expected_exit: int | None,
     executions: dict[str, dict[str, Any]],
+    expected_parent: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(evidence, dict):
         raise ManifestError(f"{field} must be an object")
@@ -249,12 +426,32 @@ def _verify_evidence(
         raise ManifestError(f"{field} evidence fields are stale or incomplete")
     if not isinstance(evidence["command"], str) or not evidence["command"].strip():
         raise ManifestError(f"{field} command is empty")
-    if evidence["exit_status"] != expected_exit:
-        raise ManifestError(f"{field} exit status must be {expected_exit}")
+    is_red = expected_exit is None or expected_exit != 0
     execution_key = evidence["execution_key"]
+    execution = executions.get(execution_key, {})
+    if is_red:
+        if re.search(r"(^|\s)git\s+diff(?:\s|$)", evidence["command"]):
+            raise ManifestError(f"{field} must be a behavioral replay, not a source diff")
+        replay_fields = {"subject_commit", "subject_tree", "test_artifacts"}
+        if not replay_fields.issubset(execution):
+            raise ManifestError(f"{field} exact parent replay metadata is incomplete")
+        if expected_parent is not None and (
+            execution["subject_commit"], execution["subject_tree"]
+        ) != expected_parent:
+            raise ManifestError(f"{field} exact parent replay identity mismatch")
+        artifact_commit = execution["test_artifacts"][0].get("commit") \
+            if execution["test_artifacts"] else None
+        if not artifact_commit:
+            raise ManifestError(f"{field} exact parent replay test artifact is absent")
+    else:
+        artifact_commit = commit
+    if expected_exit is None:
+        if not isinstance(evidence["exit_status"], int) or evidence["exit_status"] <= 0:
+            raise ManifestError(f"{field} exit status must be nonzero")
+    elif evidence["exit_status"] != expected_exit:
+        raise ManifestError(f"{field} exit status must be {expected_exit}")
     if execution_key not in executions:
         raise ManifestError(f"{field} execution record is absent")
-    execution = executions[execution_key]
     if (
         execution["command"] != evidence["command"]
         or execution["exit_status"] != evidence["exit_status"]
@@ -263,10 +460,17 @@ def _verify_evidence(
     if not isinstance(evidence["behavior"], str) or not evidence["behavior"].strip():
         raise ManifestError(f"{field} behavior is empty")
     path, symbol = _path_symbol(evidence["artifact"], f"{field} artifact")
-    blob = _blob(source_root, commit, path)
+    blob = _blob(source_root, artifact_commit, path)
     digest = hashlib.sha256(blob).hexdigest()
     if evidence["artifact_blob_sha256"] != digest:
         raise ManifestError(f"{field} artifact blob hash mismatch for {path}")
+    if is_red and not any(
+        item.get("commit") == artifact_commit
+        and item.get("path") == path
+        and item.get("blob_sha256") == digest
+        for item in execution["test_artifacts"]
+    ):
+        raise ManifestError(f"{field} exact parent replay does not bind its test artifact")
     text = blob.decode("utf-8", errors="replace")
     if re.search(rf"\b{re.escape(symbol)}\b", text) is None:
         raise ManifestError(f"{field} artifact anchor is absent: {symbol}")
@@ -405,8 +609,9 @@ def audit_manifest(
             PRODUCT_COMMIT,
             row.get("red_evidence"),
             f"{row_id} RED",
-            1,
+            None,
             executions,
+            (base, str(_git(source_root, "rev-parse", f"{base}^{{tree}}"))),
         )
         green = row.get("green_evidence")
         if not isinstance(green, list) or not green:
@@ -447,19 +652,107 @@ def audit_manifest(
     }
 
 
+def _capture_environment(env_update: dict[str, str] | None = None) -> dict[str, str]:
+    environment = {
+        name: value
+        for name in CAPTURE_ENV_ALLOWLIST
+        if (value := os.environ.get(name))
+    }
+    environment.setdefault("PATH", "/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+    environment.setdefault("LC_ALL", "C")
+    if env_update:
+        if set(env_update) - CAPTURE_ENV_ALLOWLIST:
+            raise ManifestError("capture environment update is outside the allowlist")
+        environment.update(env_update)
+    return dict(sorted(environment.items()))
+
+
+def _utc_now() -> str:
+    return datetime.datetime.now(datetime.timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 def _capture_command(
     source_root: pathlib.Path,
-    execution_root: pathlib.Path,
+    subject_root: pathlib.Path,
     output_dir: pathlib.Path,
     key: str,
     argv: list[str],
     cwd: pathlib.Path,
-    env_update: dict[str, str] | None = None,
+    environment: dict[str, str],
+    test_artifacts: list[dict[str, str]],
+    topology: str,
+    fixture_identity: str,
+    binary_path: pathlib.Path | None = None,
     command_display: str | None = None,
 ) -> dict[str, Any]:
-    environment = os.environ.copy()
-    if env_update:
-        environment.update(env_update)
+    started = _utc_now()
+    result = subprocess.run(
+        argv,
+        cwd=cwd,
+        env=environment,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    ended = _utc_now()
+    stdout = result.stdout
+    stderr = result.stderr
+    output = stdout + stderr
+    log_path = output_dir / f"{key}.log.gz"
+    log_path.write_bytes(gzip.compress(output, compresslevel=9, mtime=0))
+    text = output.decode("utf-8", errors="replace")
+    plan_match = re.search(r"(?m)^1\.\.(\d+)\s*$", text)
+    relative_log = log_path.relative_to(source_root).as_posix()
+    subject_commit = str(_git(subject_root, "rev-parse", "HEAD"))
+    subject_tree = str(_git(subject_root, "rev-parse", "HEAD^{tree}"))
+    relative_binary: str | None = None
+    binary_sha256: str | None = None
+    if binary_path is not None and binary_path.is_file():
+        relative_binary = binary_path.relative_to(subject_root).as_posix()
+        binary_sha256 = _sha256_file(binary_path)
+    record = {
+        "binary_path": relative_binary,
+        "binary_sha256": binary_sha256,
+        "command": command_display or shlex.join(argv),
+        "cwd": cwd.relative_to(subject_root).as_posix() or ".",
+        "end_wall_time_utc": ended,
+        "environment": environment,
+        "exit_status": result.returncode,
+        "fixture_identity": fixture_identity,
+        "key": key,
+        "log_bytes": len(output),
+        "log_path": relative_log,
+        "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
+        "output_sha256": hashlib.sha256(output).hexdigest(),
+        "start_wall_time_utc": started,
+        "stderr_bytes": len(stderr),
+        "stderr_sha256": hashlib.sha256(stderr).hexdigest(),
+        "stdout_bytes": len(stdout),
+        "stdout_sha256": hashlib.sha256(stdout).hexdigest(),
+        "subject_commit": subject_commit,
+        "subject_tree": subject_tree,
+        "tap_not_ok": len(re.findall(r"(?m)^not ok \d+ - ", text)),
+        "tap_ok": len(re.findall(r"(?m)^ok \d+ - ", text)),
+        "tap_plan": int(plan_match.group(1)) if plan_match else 0,
+        "test_artifacts": test_artifacts,
+        "topology": topology,
+    }
+    expected = EXECUTION_STATUS[key]
+    if expected is None and result.returncode <= 0:
+        raise ManifestError(
+            f"capture command {key} unexpectedly passed; see {relative_log}"
+        )
+    if expected is not None and result.returncode != expected:
+        raise ManifestError(
+            f"capture command {key} returned {result.returncode}, expected {expected}; "
+            f"see {relative_log}"
+        )
+    return record
+
+
+def _capture_setup(
+    argv: list[str], cwd: pathlib.Path, environment: dict[str, str], label: str
+) -> None:
     result = subprocess.run(
         argv,
         cwd=cwd,
@@ -468,32 +761,22 @@ def _capture_command(
         stderr=subprocess.STDOUT,
         check=False,
     )
-    output = result.stdout
-    log_path = output_dir / f"{key}.log.gz"
-    log_path.write_bytes(gzip.compress(output, compresslevel=9, mtime=0))
-    text = output.decode("utf-8", errors="replace")
-    plan_match = re.search(r"(?m)^1\.\.(\d+)\s*$", text)
-    relative_log = log_path.relative_to(source_root).as_posix()
-    record = {
-        "command": command_display or shlex.join(argv),
-        "cwd": cwd.relative_to(execution_root).as_posix() or ".",
-        "exit_status": result.returncode,
-        "key": key,
-        "log_bytes": len(output),
-        "log_path": relative_log,
-        "log_sha256": hashlib.sha256(log_path.read_bytes()).hexdigest(),
-        "output_sha256": hashlib.sha256(output).hexdigest(),
-        "tap_not_ok": len(re.findall(r"(?m)^not ok \d+ - ", text)),
-        "tap_ok": len(re.findall(r"(?m)^ok \d+ - ", text)),
-        "tap_plan": int(plan_match.group(1)) if plan_match else 0,
-    }
-    expected = EXECUTION_STATUS[key]
-    if result.returncode != expected:
-        raise ManifestError(
-            f"capture command {key} returned {result.returncode}, expected {expected}; "
-            f"see {relative_log}"
-        )
-    return record
+    if result.returncode != 0:
+        tail = result.stdout.decode("utf-8", errors="replace")[-4000:]
+        raise ManifestError(f"{label} failed with {result.returncode}:\n{tail}")
+
+
+def _capture_test_artifacts(
+    source_root: pathlib.Path, commit: str, paths: list[str]
+) -> list[dict[str, str]]:
+    return [
+        {
+            "blob_sha256": hashlib.sha256(_blob(source_root, commit, path)).hexdigest(),
+            "commit": commit,
+            "path": path,
+        }
+        for path in paths
+    ]
 
 
 def capture_execution_artifact(
@@ -517,41 +800,102 @@ def capture_execution_artifact(
     if (execution_root / "GNUmakefile").exists():
         raise ManifestError("capture root is not a fresh unconfigured checkout")
     output_dir.mkdir(parents=True, exist_ok=True)
+    for old_log in output_dir.glob("*.log.gz"):
+        old_log.unlink()
 
-    ranges = {
-        "red_r6": (
-            "0471e307462c7ccc64287f698259e863cc2dc7ec",
-            "44222f69ca254626b78283396083eab00809c3f8",
-        ),
-        "red_r7": (
-            "44222f69ca254626b78283396083eab00809c3f8",
-            "33b53695036c0c9bca17327535b8bfb9e3d7db5a",
-        ),
-        "red_r8": (
-            "14751227f6fbc0926761f580562329e97c4efcd9",
-            "38f3963bd0e2df0254cd9d382cc61475f924aaca",
-        ),
-        "red_r9": (
-            "33b53695036c0c9bca17327535b8bfb9e3d7db5a",
-            "14751227f6fbc0926761f580562329e97c4efcd9",
-        ),
-        "red_r10": (
-            "38f3963bd0e2df0254cd9d382cc61475f924aaca",
-            "5bb8e6d85bece75672fd490c480c163504cb9bf7",
-        ),
+    env_update = {
+        "PKG_CONFIG_PATH": "/opt/homebrew/opt/icu4c@78/lib/pkgconfig:/opt/homebrew/opt/openssl@3/lib/pkgconfig:/opt/homebrew/opt/lz4/lib/pkgconfig:/opt/homebrew/opt/zstd/lib/pkgconfig",
+        "LDFLAGS": "-L/opt/homebrew/opt/openssl@3/lib",
+        "CPPFLAGS": "-I/opt/homebrew/opt/openssl@3/include",
     }
+    environment = _capture_environment(env_update)
     records: list[dict[str, Any]] = []
-    for key, (base, head) in ranges.items():
-        records.append(
-            _capture_command(
+    for key, replay in RED_REPLAYS.items():
+        with tempfile.TemporaryDirectory(
+            prefix=f"pgrac-{key}-", dir=execution_root.parent
+        ) as tempdir:
+            red_root = pathlib.Path(tempdir) / "src"
+            _git(
                 source_root,
-                execution_root,
-                output_dir,
-                key,
-                ["git", "diff", "--exit-code", f"{base}..{head}", "--", *PATHSPECS],
-                execution_root,
+                "worktree",
+                "add",
+                "--detach",
+                str(red_root),
+                replay["base"],
             )
-        )
+            try:
+                if _git(red_root, "rev-parse", "HEAD") != replay["base"]:
+                    raise ManifestError(f"{key}: replay checkout is not the exact parent")
+                if _git(red_root, "status", "--porcelain", "--untracked-files=no"):
+                    raise ManifestError(f"{key}: replay checkout has tracked modifications")
+                red_configure_args = [
+                    f"--prefix={red_root.parent / 'install'}",
+                    "--with-openssl",
+                    "--with-icu",
+                    "--with-lz4",
+                    "--with-zstd",
+                    "--enable-cluster",
+                    "--enable-injection-points",
+                    "--enable-tap-tests",
+                    "--enable-cassert",
+                ]
+                _capture_setup(
+                    ["./configure", *red_configure_args],
+                    red_root,
+                    environment,
+                    f"{key} exact-parent configure",
+                )
+                _capture_setup(
+                    ["make", "-j8"],
+                    red_root,
+                    environment,
+                    f"{key} exact-parent clean build",
+                )
+                target = replay["target"]
+                artifact_paths = replay["artifact_paths"]
+                restore = " ".join(shlex.quote(path) for path in artifact_paths)
+                command = (
+                    f"rm -f src/test/cluster_unit/{shlex.quote(target)} && "
+                    f"git restore --source={replay['artifact_commit']} -- {restore} && "
+                    f"make -s -C src/test/cluster_unit {shlex.quote(target)} && "
+                    f"src/test/cluster_unit/{shlex.quote(target)}"
+                )
+                records.append(
+                    _capture_command(
+                        source_root,
+                        red_root,
+                        output_dir,
+                        key,
+                        ["/bin/sh", "-c", command],
+                        red_root,
+                        environment,
+                        _capture_test_artifacts(
+                            source_root, replay["artifact_commit"], artifact_paths
+                        ),
+                        "single_process_cluster_unit",
+                        f"git-test-overlay-v1:{replay['artifact_commit']}",
+                        red_root / "src" / "test" / "cluster_unit" / target,
+                        command,
+                    )
+                )
+                changed = str(
+                    _git(red_root, "diff", "--name-only", "--", "src/test/**")
+                ).splitlines()
+                if changed != artifact_paths:
+                    raise ManifestError(f"{key}: replay overlay path set drifted")
+                product_changed = _git(
+                    red_root,
+                    "diff",
+                    "--name-only",
+                    "--",
+                    "src/backend/**",
+                    "src/include/**",
+                    "src/tools/**",
+                )
+                if product_changed:
+                    raise ManifestError(f"{key}: replay changed parent product bytes")
+            finally:
+                _git(source_root, "worktree", "remove", "--force", str(red_root))
 
     install_prefix = execution_root.parent / "install"
     configure_args = [
@@ -565,13 +909,7 @@ def capture_execution_artifact(
         "--enable-tap-tests",
         "--enable-cassert",
     ]
-    env_update = {
-        "PKG_CONFIG_PATH": "/opt/homebrew/opt/icu4c@78/lib/pkgconfig:/opt/homebrew/opt/openssl@3/lib/pkgconfig:/opt/homebrew/opt/lz4/lib/pkgconfig:/opt/homebrew/opt/zstd/lib/pkgconfig",
-        "LDFLAGS": "-L/opt/homebrew/opt/openssl@3/lib",
-        "CPPFLAGS": "-I/opt/homebrew/opt/openssl@3/include",
-    }
-    env_display = " ".join(f"{name}={shlex.quote(value)}" for name, value in env_update.items())
-    configure_command = f"env {env_display} {shlex.join(['./configure', *configure_args])}"
+    configure_command = shlex.join(["./configure", *configure_args])
     records.append(
         _capture_command(
             source_root,
@@ -580,8 +918,11 @@ def capture_execution_artifact(
             "configure",
             ["./configure", *configure_args],
             execution_root,
-            env_update,
-            configure_command,
+            environment,
+            [],
+            "single_host_build",
+            "clean-product-checkout-v1",
+            command_display=configure_command,
         )
     )
     records.append(
@@ -592,6 +933,10 @@ def capture_execution_artifact(
             "full_build",
             ["make", "-j8"],
             execution_root,
+            environment,
+            [],
+            "single_host_build",
+            "clean-product-checkout-v1",
         )
     )
     unit_dir = execution_root / "src" / "test" / "cluster_unit"
@@ -611,6 +956,10 @@ def capture_execution_artifact(
             "build_units",
             ["make", "-j8", *unit_targets],
             unit_dir,
+            environment,
+            [],
+            "single_host_build",
+            "clean-product-checkout-v1",
         )
     )
     green_commands = [
@@ -630,6 +979,15 @@ def capture_execution_artifact(
                 key,
                 [f"./{binary}"],
                 unit_dir,
+                environment,
+                _capture_test_artifacts(
+                    source_root,
+                    PRODUCT_COMMIT,
+                    [f"src/test/cluster_unit/{binary}.c"],
+                ),
+                "single_process_cluster_unit",
+                f"product-unit-v1:{binary}",
+                unit_dir / binary,
             )
         )
 

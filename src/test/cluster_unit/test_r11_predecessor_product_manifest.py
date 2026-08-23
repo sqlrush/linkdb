@@ -71,6 +71,42 @@ class R11PredecessorProductManifestTests(unittest.TestCase):
                 )
             )
 
+    def test_red_evidence_cannot_be_a_source_diff(self) -> None:
+        evidence = copy.deepcopy(self._manifest()["rows"][0]["red_evidence"])
+        evidence["command"] = "git diff --exit-code base..head -- src/backend"
+        execution_key = evidence["execution_key"]
+        execution = {
+            "command": evidence["command"],
+            "exit_status": evidence["exit_status"],
+        }
+        with self.assertRaisesRegex(CHECKER.ManifestError, "behavioral replay"):
+            CHECKER._verify_evidence(
+                ROOT,
+                CHECKER.PRODUCT_COMMIT,
+                evidence,
+                "R6 RED",
+                1,
+                {execution_key: execution},
+            )
+
+    def test_red_evidence_requires_exact_parent_and_test_artifact(self) -> None:
+        evidence = copy.deepcopy(self._manifest()["rows"][0]["red_evidence"])
+        evidence["command"] = "make -s test_cluster_pcm_x_convert"
+        execution_key = evidence["execution_key"]
+        execution = {
+            "command": evidence["command"],
+            "exit_status": evidence["exit_status"],
+        }
+        with self.assertRaisesRegex(CHECKER.ManifestError, "exact parent replay"):
+            CHECKER._verify_evidence(
+                ROOT,
+                CHECKER.PRODUCT_COMMIT,
+                evidence,
+                "R6 RED",
+                1,
+                {execution_key: execution},
+            )
+
     def test_spec_hash_mismatch_is_rejected(self) -> None:
         with self.assertRaisesRegex(CHECKER.ManifestError, "normative body"):
             self._audit_mutation(

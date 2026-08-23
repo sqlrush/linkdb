@@ -4,7 +4,7 @@
     "build_system": "aarch64-apple-darwin25.6.0",
     "compiler": "Apple clang version 21.0.0 (clang-2100.1.1.101)",
     "configure_args": [
-      "--prefix=/private/tmp/pgrac-r11-capture.u1fcZq/install",
+      "--prefix=/private/tmp/pgrac-r11-behavioral-capture.VCdcDm/install",
       "--with-openssl",
       "--with-icu",
       "--with-lz4",
@@ -18,7 +18,7 @@
   },
   "execution_artifact": {
     "path": "src/test/cluster_unit/data/r11-predecessor-execution-v1.json",
-    "sha256": "b354b8d8e394879fe46e32adba1934c17f26e8c7c654573b1bf4130a83900fd0"
+    "sha256": "a61f28527c1e67976871478d3a0b2982654969e925d372ca674b0c5a84430391"
   },
   "execution_attestation": {
     "clean_checkout": true,
@@ -60,12 +60,12 @@
       },
       "predecessor_id": "R6",
       "red_evidence": {
-        "artifact": "src/test/cluster_unit/test_cluster_resource_x_identity.c::test_validation_rejects_invalid_native_tag_fields",
-        "artifact_blob_sha256": "bd11bfd6651bd76e9d27b71127abadf12235fdf76660d41c921c9a92f0367fd6",
-        "behavior": "RED witnessed absent exact assertion/attempt identity and fail-closed native-tag validation",
-        "command": "git diff --exit-code 0471e307462c7ccc64287f698259e863cc2dc7ec..44222f69ca254626b78283396083eab00809c3f8 -- 'src/backend/**' 'src/include/**' 'src/test/**' 'src/tools/**'",
+        "artifact": "src/test/cluster_unit/test_cluster_pcm_x_convert.c::test_resource_x_local_join_classifies_same_attempt_and_successor_round",
+        "artifact_blob_sha256": "8e48d935bf7fca1900d3c475f1c24d8d47443e561920c244a007f1bd6ab834ac",
+        "behavior": "Exact R6 parent compile rejected the real semantic-join test because assertion/attempt identity fields and ResourceXLocalJoinResult were absent",
+        "command": "rm -f src/test/cluster_unit/test_cluster_pcm_x_convert && git restore --source=a97629cda5d91493403d487ad1f25b5050fa8682 -- src/test/cluster_unit/test_cluster_pcm_x_convert.c && make -s -C src/test/cluster_unit test_cluster_pcm_x_convert && src/test/cluster_unit/test_cluster_pcm_x_convert",
         "execution_key": "red_r6",
-        "exit_status": 1
+        "exit_status": 2
       },
       "review_status": "NOT_REQUIRED",
       "source_paths": [
@@ -125,12 +125,12 @@
       },
       "predecessor_id": "R7",
       "red_evidence": {
-        "artifact": "src/test/cluster_unit/test_cluster_resource_x_retry.c::test_classifier_never_retries_successor_attempt",
-        "artifact_blob_sha256": "c43a2115f911da2f04078457284f3f9ddc99d9a6742abf7ae42e9b52e17204c4",
-        "behavior": "RED witnessed missing attempt-exact retry classification and terminal replay; final-tree audit also caught stale pre-R10 slot-size assertions",
-        "command": "git diff --exit-code 44222f69ca254626b78283396083eab00809c3f8..33b53695036c0c9bca17327535b8bfb9e3d7db5a -- 'src/backend/**' 'src/include/**' 'src/test/**' 'src/tools/**'",
+        "artifact": "src/test/cluster_unit/test_cluster_pcm_x_convert.c::test_runtime_layout_abi_and_offsets_are_exact",
+        "artifact_blob_sha256": "61d0373b44be36d19022c290b43929801afba37713dc73cbb20a41f73ce3d49f",
+        "behavior": "Exact R7 parent compile rejected the real retry-layout test because the attempt-bound retry_state fields were absent from both ticket and local-tag slots",
+        "command": "rm -f src/test/cluster_unit/test_cluster_pcm_x_convert && git restore --source=636f3683908dbcab135b8e3fbe3dc4ec6affde9a -- src/test/cluster_unit/test_cluster_pcm_x_convert.c && make -s -C src/test/cluster_unit test_cluster_pcm_x_convert && src/test/cluster_unit/test_cluster_pcm_x_convert",
         "execution_key": "red_r7",
-        "exit_status": 1
+        "exit_status": 2
       },
       "review_status": "NOT_REQUIRED",
       "source_paths": [
@@ -185,12 +185,12 @@
       },
       "predecessor_id": "R8",
       "red_evidence": {
-        "artifact": "src/test/cluster_unit/test_cluster_pcm_lock.c::test_resource_x_same_token_proofs_reject_postscan_entry_mutation",
-        "artifact_blob_sha256": "5bcc771483dcf1d812fd481ac1d476e066a38d329183c0aa2cf5e1cfdffa7a7a",
-        "behavior": "RED witnessed missing post-scan mutation rejection and exact same-token zero-residual proof",
-        "command": "git diff --exit-code 14751227f6fbc0926761f580562329e97c4efcd9..38f3963bd0e2df0254cd9d382cc61475f924aaca -- 'src/backend/**' 'src/include/**' 'src/test/**' 'src/tools/**'",
+        "artifact": "src/test/cluster_unit/test_cluster_pcm_lock.c::test_resource_x_reconfig_freeze_closes_activation_drains_and_thaws_empty",
+        "artifact_blob_sha256": "35b4d2bae68f68cc66e87840f8d86253af240b98591ebffea88302ce2c759912",
+        "behavior": "Exact R8 parent compile rejected the real freeze/sweep test because ResourceXReconfigToken, sidecar classification, and reconfiguration entry points were absent",
+        "command": "rm -f src/test/cluster_unit/test_cluster_pcm_lock && git restore --source=38f3963bd0e2df0254cd9d382cc61475f924aaca -- src/test/cluster_unit/test_cluster_pcm_lock.c && make -s -C src/test/cluster_unit test_cluster_pcm_lock && src/test/cluster_unit/test_cluster_pcm_lock",
         "execution_key": "red_r8",
-        "exit_status": 1
+        "exit_status": 2
       },
       "review_status": "NOT_REQUIRED",
       "source_paths": [
@@ -243,12 +243,12 @@
       },
       "predecessor_id": "R9",
       "red_evidence": {
-        "artifact": "src/test/cluster_unit/test_cluster_gcs_block.c::test_resource_x_writer_completion_does_not_own_acquisition_retirement",
-        "artifact_blob_sha256": "e9ec4a804da2fa6e9c77431815e1d795d7825b3e26235bd69b00046916c61746",
-        "behavior": "RED witnessed missing T1/T2/T3 executor ordering and writer-return fence",
-        "command": "git diff --exit-code 33b53695036c0c9bca17327535b8bfb9e3d7db5a..14751227f6fbc0926761f580562329e97c4efcd9 -- 'src/backend/**' 'src/include/**' 'src/test/**' 'src/tools/**'",
+        "artifact": "src/test/cluster_unit/test_cluster_pcm_lock.c::test_resource_x_executor_t1_t2_t3_is_exact_and_blocks_no_progress",
+        "artifact_blob_sha256": "c8b89904854aaea7892c45aadf08c43eced84daaa153d473df366f8d43220dc9",
+        "behavior": "Exact R9 parent compile rejected the real T1/T2/T3 executor test because ResourceXAcquisitionRef and the exact executor transition API were absent",
+        "command": "rm -f src/test/cluster_unit/test_cluster_pcm_lock && git restore --source=f86cd2f4f7b84f6b5bcf2f042a55d1707e1bdd94 -- src/test/cluster_unit/test_cluster_pcm_lock.c && make -s -C src/test/cluster_unit test_cluster_pcm_lock && src/test/cluster_unit/test_cluster_pcm_lock",
         "execution_key": "red_r9",
-        "exit_status": 1
+        "exit_status": 2
       },
       "review_status": "NOT_REQUIRED",
       "source_paths": [
@@ -336,12 +336,12 @@
       },
       "predecessor_id": "R10",
       "red_evidence": {
-        "artifact": "src/test/cluster_unit/test_cluster_resource_x_node_wire.c::test_typed_body_validation_is_fail_closed",
-        "artifact_blob_sha256": "6a19ce61bef0ad761f8810acb4be4e74aa689a493e9f677248d4433be2b9de30",
-        "behavior": "RED witnessed absent exact type-17/type-15 retained pair, wire-domain rejection, and clean completion",
-        "command": "git diff --exit-code 38f3963bd0e2df0254cd9d382cc61475f924aaca..5bb8e6d85bece75672fd490c480c163504cb9bf7 -- 'src/backend/**' 'src/include/**' 'src/test/**' 'src/tools/**'",
+        "artifact": "src/test/cluster_unit/test_cluster_pcm_lock.c::test_resource_x_master_remote_proof_is_retained_not_inferred",
+        "artifact_blob_sha256": "c9ad3e4279c2d843931d77aec39dc5ab4d29af1121f01d3588f05138567dbf5c",
+        "behavior": "Exact R10 parent compile rejected the real master-lifecycle test because the Resource-X node-wire contract and decoded master proof domain were absent",
+        "command": "rm -f src/test/cluster_unit/test_cluster_pcm_lock && git restore --source=3fd96781f433542bbb9cdf769011a25d844cb0b4 -- src/test/cluster_unit/test_cluster_pcm_lock.c && make -s -C src/test/cluster_unit test_cluster_pcm_lock && src/test/cluster_unit/test_cluster_pcm_lock",
         "execution_key": "red_r10",
-        "exit_status": 1
+        "exit_status": 2
       },
       "review_status": "USER_APPROVED_DEVIATIONS_RECORDED",
       "source_paths": [
@@ -416,7 +416,7 @@
       "artifact": "src/include/cluster/cluster_lms.h::ClusterPcmOwnSnapshot",
       "artifact_blob_sha256": "f332ea71b047157b67c82e87508b556a015c01c4317ca8fea18846c0bc293366",
       "behavior": "fresh detached checkout configured for cluster, injection points, TAP, cassert, OpenSSL, ICU, LZ4, and ZSTD",
-      "command": "env PKG_CONFIG_PATH=/opt/homebrew/opt/icu4c@78/lib/pkgconfig:/opt/homebrew/opt/openssl@3/lib/pkgconfig:/opt/homebrew/opt/lz4/lib/pkgconfig:/opt/homebrew/opt/zstd/lib/pkgconfig LDFLAGS=-L/opt/homebrew/opt/openssl@3/lib CPPFLAGS=-I/opt/homebrew/opt/openssl@3/include ./configure --prefix=/private/tmp/pgrac-r11-capture.u1fcZq/install --with-openssl --with-icu --with-lz4 --with-zstd --enable-cluster --enable-injection-points --enable-tap-tests --enable-cassert",
+      "command": "./configure --prefix=/private/tmp/pgrac-r11-behavioral-capture.VCdcDm/install --with-openssl --with-icu --with-lz4 --with-zstd --enable-cluster --enable-injection-points --enable-tap-tests --enable-cassert",
       "execution_key": "configure",
       "exit_status": 0
     },
