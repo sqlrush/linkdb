@@ -1178,7 +1178,7 @@ UT_TEST(test_pcm_real_summary_counts_live_entries)
 UT_TEST(test_pcm_grd_entry_abi_includes_resource_x_executor_state)
 {
 	reset_fake_pcm_runtime(4);
-	UT_ASSERT_EQ(fake_pcm_entrysize, 320);
+	UT_ASSERT_EQ(fake_pcm_entrysize, 736);
 	UT_ASSERT_EQ(cluster_pcm_grd_shmem_size(),
 		add_size(fake_pcm_header_requested_size,
 			hash_estimate_size(4, fake_pcm_entrysize)));
@@ -1936,6 +1936,29 @@ make_resource_x_bootstrap_request(BufferTag tag, int32 requester_node)
 		tag, requester_node, 17, 31, 41, 51);
 }
 
+static ResourceXDecodedFrame
+make_resource_x_bootstrap_ack_values(
+	const ResourceXDecodedFrame *request, uint64 base_authority_generation,
+	uint32 sender_connection_generation)
+{
+	ResourceXDecodedFrame ack = *request;
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 wire[RESOURCE_X_CONTROL_V1_BYTES];
+	uint16 wire_len = 0;
+
+	ack.common.base_authority_generation = base_authority_generation;
+	ack.common.sender_connection_generation = sender_connection_generation;
+	ack.common.outcome = RESOURCE_X_OUTCOME_OK;
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, &ack, wire, sizeof(wire),
+		&wire_len, &reject));
+	UT_ASSERT_EQ(wire_len, RESOURCE_X_CONTROL_V1_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_IMAGE_OR_GRANT, wire, wire_len, &decoded, &reject));
+	return decoded;
+}
+
 UT_TEST(test_resource_x_bootstrap_receipt_replays_and_consumes_exactly)
 {
 	BufferTag tag = make_tag(155);
@@ -2161,6 +2184,10 @@ UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
 	ResourceXDecodedFrame old_request;
 	ResourceXDecodedFrame new_request;
 	ResourceXDecodedFrame ack;
+	ResourceXDecodedFrame round_dispatch;
+	ResourceXAssertion round_assertion;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXBootstrapRoundAction round_action;
 	ResourceXReconfigToken token;
 	ResourceXReconfigBatch batch;
 	uint64 broadcast_before;
@@ -2174,6 +2201,14 @@ UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		&old_request, 1, 61, 77, 31, 71, &ack),
 		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 0, &round_assertion));
+	round_action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&round_assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(100), UINT64_C(50), false, 0,
+		&round_dispatch, &terminal_ref);
+	UT_ASSERT_EQ(round_action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(round_dispatch.common.assertion_sequence, UINT64_C(1));
 	broadcast_before = fake_cv_broadcast_count;
 
 	UT_ASSERT(cluster_resource_x_reconfig_freeze(17, 18, &token));
@@ -2194,6 +2229,173 @@ UT_TEST(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		&new_request, 1, 62, 78, 32, 72, &ack),
 		RESOURCE_X_APPLY_APPLIED);
+
+	round_action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&round_assertion, 0, 18, 32, 78, 52, 62,
+		UINT64_C(2000), UINT64_C(200), UINT64_C(50), false, 0,
+		&round_dispatch, &terminal_ref);
+	UT_ASSERT_EQ(round_action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(round_dispatch.common.assertion_sequence, UINT64_C(2));
+}
+
+UT_TEST(test_resource_x_bootstrap_round_fans_in_and_retries_same_attempt)
+{
+	BufferTag tag = make_tag(151);
+	ResourceXAssertion assertion;
+	ResourceXDecodedFrame first_dispatch;
+	ResourceXDecodedFrame retry_dispatch;
+	ResourceXDecodedFrame ack;
+	ResourceXDecodedFrame first_assertion;
+	ResourceXDecodedFrame retry_assertion;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXAcquisitionRef expected_ref;
+	ResourceXBufferInstallProof install;
+	ResourceXBufferActivationProof activation;
+	ResourceXBootstrapRoundAction action;
+	int caller;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+
+	for (caller = 0; caller < 4; caller++) {
+		action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+			&assertion, 0, 17, 31, 77, 51, 61,
+			UINT64_C(1000), UINT64_C(100), UINT64_C(50),
+			false, 0, caller == 0 ? &first_dispatch : &retry_dispatch,
+			&terminal_ref);
+		UT_ASSERT_EQ(action,
+			caller == 0
+				? RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST
+				: RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	}
+	UT_ASSERT_EQ(first_dispatch.kind,
+		RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
+	UT_ASSERT_EQ(first_dispatch.common.assertion_sequence, UINT64_C(1));
+	UT_ASSERT_EQ(first_dispatch.common.resource_formation, UINT64_C(17));
+	UT_ASSERT_EQ(first_dispatch.common.master_session_incarnation,
+		UINT64_C(31));
+	UT_ASSERT_EQ(first_dispatch.common.sender_connection_generation,
+		UINT32_C(51));
+	UT_ASSERT_EQ(first_dispatch.common.base_authority_generation,
+		UINT64_C(0));
+	UT_ASSERT_EQ(first_dispatch.common.authority_generation, UINT64_C(0));
+
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(149), UINT64_C(50),
+		false, 0, &retry_dispatch, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(150), UINT64_C(50),
+		false, 0, &retry_dispatch, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT(memcmp(&first_dispatch, &retry_dispatch,
+		sizeof(first_dispatch)) == 0);
+
+	ack = make_resource_x_bootstrap_ack_values(
+		&first_dispatch, UINT64_C(9), UINT32_C(71));
+	for (caller = 0; caller < 4; caller++) {
+		action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+			&ack, 0, 61, 77, UINT64_C(160),
+			caller == 0 ? &first_assertion : &retry_assertion);
+		UT_ASSERT_EQ(action,
+			caller == 0
+				? RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT
+				: RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	}
+	UT_ASSERT_EQ(first_assertion.kind, RESOURCE_X_WIRE_ASSERT_X);
+	UT_ASSERT_EQ(first_assertion.common.base_authority_generation,
+		UINT64_C(9));
+	UT_ASSERT_EQ(first_assertion.common.authority_generation, UINT64_C(9));
+	UT_ASSERT_EQ(first_assertion.common.assertion_sequence, UINT64_C(1));
+	UT_ASSERT_EQ(first_assertion.common.sender_connection_generation,
+		UINT32_C(51));
+
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(209), UINT64_C(50),
+		false, 0, &retry_assertion, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(210), UINT64_C(50),
+		false, 0, &retry_assertion, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+	UT_ASSERT(memcmp(&first_assertion, &retry_assertion,
+		sizeof(first_assertion)) == 0);
+
+	/* R9 T3 retires the active ledger but keeps node X cached.  The same
+	 * requester round becomes the only complete ref cover for later local
+	 * writers; the retired generation floor by itself is insufficient. */
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+	expected_ref = make_resource_x_acquisition_ref(tag, 1, 17, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&expected_ref),
+		RESOURCE_X_APPLY_APPLIED);
+	memset(&install, 0, sizeof(install));
+	install.ownership_generation = 91;
+	install.writer_activation_token = 12;
+	install.resource_x_activation_generation = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_apply_exact(
+		&expected_ref, &install), RESOURCE_X_APPLY_APPLIED);
+	memset(&activation, 0, sizeof(activation));
+	activation.ownership_generation = 91;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(
+		&expected_ref, &activation), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
+			&expected_ref, 31, 77, 91, UINT64_C(215)),
+		RESOURCE_X_APPLY_APPLIED);
+
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(220), UINT64_C(50),
+		true, 91, &retry_assertion, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL);
+	UT_ASSERT(memcmp(&terminal_ref, &expected_ref,
+		sizeof(terminal_ref)) == 0);
+
+	memset(&terminal_ref, 0xff, sizeof(terminal_ref));
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(221), UINT64_C(50),
+		true, 92, &retry_assertion, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	UT_ASSERT_EQ(terminal_ref.acquisition_generation, UINT64_C(0));
+
+	/* Losing node X clears only the joinable binding.  The next acquisition
+	 * advances past the retained/retired floor; a master-session drift clears
+	 * that new binding and advances again instead of resetting to one. */
+	cluster_pcm_lock_release(tag);
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(230), UINT64_C(50),
+		false, 0, &retry_dispatch, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(retry_dispatch.common.assertion_sequence, UINT64_C(2));
+
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 32, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(231), UINT64_C(50),
+		false, 0, &retry_dispatch, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 32, 77, 51, 61,
+		UINT64_C(2000), UINT64_C(232), UINT64_C(50),
+		false, 0, &retry_dispatch, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(retry_dispatch.common.assertion_sequence, UINT64_C(3));
+
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 32, 77, 51, 61,
+		UINT64_C(3000), UINT64_C(2000), UINT64_C(50),
+		false, 0, &retry_dispatch, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED);
 }
 
 static ResourceXDecodedFrame
@@ -7088,7 +7290,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(126);
+	UT_PLAN(127);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -7134,6 +7336,7 @@ main(void)
 	UT_RUN(test_resource_x_bootstrap_receipt_drift_invalidates_but_keeps_floor);
 	UT_RUN(test_resource_x_bootstrap_terminal_retire_clears_binding_not_floor);
 	UT_RUN(test_resource_x_bootstrap_r8_clears_old_binding_not_attempt_floor);
+	UT_RUN(test_resource_x_bootstrap_round_fans_in_and_retries_same_attempt);
 	UT_RUN(test_resource_x_adapter_adopts_only_exact_pristine_legacy_base);
 	UT_RUN(test_resource_x_adapter_head_rebinds_only_before_assert);
 	UT_RUN(test_resource_x_settled_retirement_tombstone_replays_and_frees_live_slot);

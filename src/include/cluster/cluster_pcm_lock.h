@@ -160,6 +160,14 @@ typedef enum ResourceXApplyResult {
 	RESOURCE_X_APPLY_RECOVERY_BLOCKED
 } ResourceXApplyResult;
 
+typedef enum ResourceXBootstrapRoundAction {
+	RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST = 1,
+	RESOURCE_X_BOOTSTRAP_ROUND_WAIT,
+	RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT,
+	RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL,
+	RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
+} ResourceXBootstrapRoundAction;
+
 typedef enum ResourceXExecutorProbeResult {
 	RESOURCE_X_EXECUTOR_READY = 0,
 	RESOURCE_X_EXECUTOR_COMPLETE,
@@ -882,6 +890,28 @@ cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	uint64 r4_record_generation, uint64 current_master_session_incarnation,
 	uint32 current_master_sender_connection_generation,
 	ResourceXMasterSnapshot *out);
+extern ResourceXBootstrapRoundAction
+cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node,
+	uint64 resource_formation, uint64 master_session_incarnation,
+	uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation,
+	uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
+	bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out,
+	ResourceXAcquisitionRef *terminal_ref_out);
+extern ResourceXBootstrapRoundAction
+cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+	const ResourceXDecodedFrame *ack, int32 authenticated_master_node,
+	uint32 authenticated_ingress_connection_generation,
+	uint64 r4_record_generation, uint64 now_us,
+	ResourceXDecodedFrame *assertion_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
+	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
+	uint64 r4_record_generation, uint64 cached_ownership_generation,
+	uint64 now_us);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node);
 extern ResourceXApplyResult
