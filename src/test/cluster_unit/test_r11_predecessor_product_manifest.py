@@ -45,6 +45,31 @@ class R11PredecessorProductManifestTests(unittest.TestCase):
         self.assertEqual([row["predecessor_id"] for row in report["rows"]], CHECKER.REQUIRED_IDS)
         self.assertEqual(report["product_commit"], CHECKER.PRODUCT_COMMIT)
         self.assertEqual(report["product_tree"], CHECKER.PRODUCT_TREE)
+        manifest = self._manifest()
+        self.assertIn(
+            "src/tools/check_pcm_x_write_gate_ast.py",
+            manifest["rows"][2]["source_paths"],
+        )
+        self.assertIn(
+            "src/test/cluster_unit/test_resource_x_send_c1.py",
+            manifest["rows"][4]["source_paths"],
+        )
+
+    def test_execution_artifact_hash_mismatch_is_rejected(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ManifestError, "execution artifact hash"):
+            self._audit_mutation(
+                lambda manifest: manifest["execution_artifact"].__setitem__(
+                    "sha256", "0" * 64
+                )
+            )
+
+    def test_manifest_command_cannot_override_real_execution(self) -> None:
+        with self.assertRaisesRegex(CHECKER.ManifestError, "real execution record"):
+            self._audit_mutation(
+                lambda manifest: manifest["rows"][0]["green_evidence"][0].__setitem__(
+                    "command", "true"
+                )
+            )
 
     def test_spec_hash_mismatch_is_rejected(self) -> None:
         with self.assertRaisesRegex(CHECKER.ManifestError, "normative body"):
