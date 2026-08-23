@@ -7195,11 +7195,67 @@ UT_TEST(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact)
 	free(source);
 }
 
+UT_TEST(test_r11_legacy_source_requester_is_generation_bound)
+{
+	char *source = read_gcs_block_source();
+	const char *wrapper;
+	const char *wrapper_end;
+	const char *first_sample;
+	const char *drive;
+	const char *second_sample;
+	const char *handoff;
+
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_source_admission_exact(
+		RESOURCE_X_WRITER_SOURCE, 7, 7), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_source_admission_exact(
+		RESOURCE_X_WRITER_SOURCE, 8, 7), PCM_X_QUEUE_STALE);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_source_admission_exact(
+		RESOURCE_X_WRITER_CLOSED, 7, 7), PCM_X_QUEUE_BARRIER_CLOSED);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_source_admission_exact(
+		RESOURCE_X_WRITER_TARGET, 7, 7), PCM_X_QUEUE_BARRIER_CLOSED);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_source_admission_exact(
+		RESOURCE_X_WRITER_SOURCE, 0, 0), PCM_X_QUEUE_OK);
+	UT_ASSERT_EQ(cluster_gcs_pcm_x_source_admission_exact(
+		RESOURCE_X_WRITER_SOURCE, UINT64_MAX, UINT64_MAX),
+		PCM_X_QUEUE_STALE);
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	wrapper = strstr(source, "\ncluster_gcs_pcm_x_acquire_writer(");
+	wrapper_end = wrapper != NULL ? strstr(wrapper, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(wrapper);
+	UT_ASSERT_NOT_NULL(wrapper_end);
+	if (wrapper != NULL && wrapper_end != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(wrapper, "uint64 r4_record_generation"));
+		first_sample = strstr(wrapper,
+			"cluster_resource_x_writer_path_snapshot(");
+		drive = strstr(wrapper, "gcs_block_pcm_x_acquire_writer_impl(");
+		second_sample = first_sample != NULL
+			? strstr(first_sample + 1,
+				"cluster_resource_x_writer_path_snapshot(")
+			: NULL;
+		handoff = strstr(wrapper, "*claim_handed_off = true");
+		UT_ASSERT_NOT_NULL(first_sample);
+		UT_ASSERT_NOT_NULL(drive);
+		UT_ASSERT_NOT_NULL(second_sample);
+		UT_ASSERT_NOT_NULL(handoff);
+		if (first_sample != NULL && drive != NULL)
+			UT_ASSERT(first_sample < drive);
+		if (drive != NULL && second_sample != NULL)
+			UT_ASSERT(drive < second_sample);
+		if (second_sample != NULL && handoff != NULL)
+			UT_ASSERT(second_sample < handoff);
+		UT_ASSERT(handoff == NULL || handoff < wrapper_end);
+	}
+	free(source);
+}
+
 
 int
 main(void)
 {
-	UT_PLAN(130);
+	UT_PLAN(131);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -7330,6 +7386,7 @@ main(void)
 	UT_RUN(test_resource_x_s_barrier_closes_remote_registration_race);
 	UT_RUN(test_resource_x_ticket_adapter_exposes_sequence_and_selects_one_revoke_owner);
 	UT_RUN(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact);
+	UT_RUN(test_r11_legacy_source_requester_is_generation_bound);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

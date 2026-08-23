@@ -74,6 +74,7 @@
 #include "cluster/cluster_pcm_lock.h" /* PcmLockTransition */
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h" /* ClusterSfDepVec / max origins */
 #include "cluster/cluster_tx_resolve.h"
 #include "storage/block.h"			/* BLCKSZ */
@@ -5027,12 +5028,31 @@ typedef struct ResourceXWriterUseContext {
 
 StaticAssertDecl(sizeof(ResourceXWriterUseContext) == 72,
 	"ResourceXWriterUseContext layout must remain 72 bytes");
+
+/* D11-03: one legacy requester remains admissible only under the exact
+ * SOURCE polarity and R4 generation captured by LockBufferInternal().  Zero
+ * is the valid implicit-source generation; UINT64_MAX is never admissible. */
+static inline PcmXQueueResult
+cluster_gcs_pcm_x_source_admission_exact(ResourceXWriterPath observed_path,
+										 uint64 observed_generation,
+										 uint64 expected_generation)
+{
+	if (observed_path != RESOURCE_X_WRITER_SOURCE)
+		return PCM_X_QUEUE_BARRIER_CLOSED;
+	if (observed_generation == UINT64_MAX
+		|| expected_generation == UINT64_MAX
+		|| observed_generation != expected_generation)
+		return PCM_X_QUEUE_STALE;
+	return PCM_X_QUEUE_OK;
+}
+
 /* Join the node-local FIFO, drive the sole remote queue request when this
  * backend is leader, and return one exact writer claim.  claim_handed_off is
  * published before requester cleanup authority is dropped, closing the
  * owner-exit gap while bufmgr adopts the claim.  The caller must keep the
  * claim through content-lock ownership and release it after UNLOCK. */
 extern PcmXQueueResult cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf,
+												uint64 r4_record_generation,
 												PcmXLocalWriterClaim *claim_out,
 												bool *claim_handed_off);
 /* TARGET-only requester: join/create the per-resource bootstrap round and

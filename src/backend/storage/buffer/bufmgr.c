@@ -3342,7 +3342,8 @@ cluster_bufmgr_pcm_x_writer_prepare(BufferDesc *buf, PcmLockMode mode,
 	entry->claim_handed_off = false;
 	pg_write_barrier();
 	result = cluster_gcs_pcm_x_acquire_writer(
-		buf, &entry->authority.source, &entry->claim_handed_off);
+		buf, r4_generation, &entry->authority.source,
+		&entry->claim_handed_off);
 	if (result != PCM_X_QUEUE_OK) {
 		if (entry->claim_handed_off) {
 			cluster_pcm_x_runtime_fail_closed();

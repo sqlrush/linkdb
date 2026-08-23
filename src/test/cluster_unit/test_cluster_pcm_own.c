@@ -3333,7 +3333,8 @@ UT_TEST(test_lockbuffer_pcm_x_writer_ledger_is_distinct_and_brackets_content_aut
 	static const char *const prepare_contract[]
 		= { "entry->phase = PCM_X_WRITER_LEDGER_HANDOFF",
 			"cluster_gcs_pcm_x_acquire_writer(",
-			"buf, &entry->authority.source, &entry->claim_handed_off)",
+			"buf, r4_generation, &entry->authority.source,",
+			"&entry->claim_handed_off)",
 			"entry->claim_handed_off",
 			"cluster_bufmgr_pcm_own_snapshot(buf, &granted)",
 			"cluster_pcm_x_writer_grant_snapshot_exact(",

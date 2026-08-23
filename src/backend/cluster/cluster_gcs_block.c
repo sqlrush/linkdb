@@ -15347,19 +15347,28 @@ requester_done:
 
 
 PcmXQueueResult
-cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf, PcmXLocalWriterClaim *claim_out,
+cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf, uint64 r4_record_generation,
+								 PcmXLocalWriterClaim *claim_out,
 								 bool *claim_handed_off)
 {
 	GcsBlockPcmXRequesterCleanupContext *cleanup = &gcs_block_pcm_x_requester_cleanup_context;
 	MemoryContext error_context = CurrentMemoryContext;
 	ErrorData *original_error;
 	PcmXQueueResult result = PCM_X_QUEUE_INVALID;
+	ResourceXWriterPath writer_path;
+	uint64 current_r4_generation = 0;
 	bool fail_closed_required;
 
 	if (claim_handed_off != NULL)
 		*claim_handed_off = false;
 	if (claim_handed_off == NULL)
 		return PCM_X_QUEUE_INVALID;
+	writer_path = cluster_resource_x_writer_path_snapshot(
+		&current_r4_generation);
+	result = cluster_gcs_pcm_x_source_admission_exact(
+		writer_path, current_r4_generation, r4_record_generation);
+	if (result != PCM_X_QUEUE_OK)
+		return result;
 
 	if (!gcs_block_pcm_x_requester_exit_hook_registered) {
 		before_shmem_exit(gcs_block_pcm_x_requester_owner_exit, (Datum)0);
@@ -15387,6 +15396,13 @@ cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf, PcmXLocalWriterClaim *claim_ou
 		ReThrowError(original_error);
 	}
 	PG_END_TRY();
+	if (result == PCM_X_QUEUE_OK) {
+		current_r4_generation = 0;
+		writer_path = cluster_resource_x_writer_path_snapshot(
+			&current_r4_generation);
+		result = cluster_gcs_pcm_x_source_admission_exact(
+			writer_path, current_r4_generation, r4_record_generation);
+	}
 
 	fail_closed_required = cleanup->fail_closed_required;
 	if (result == PCM_X_QUEUE_OK) {
