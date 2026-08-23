@@ -1993,7 +1993,9 @@ test_cluster_lck: test_cluster_lck.c unit_test.h \
 # ----------
 check: all check_cluster_undo_segment_half_page_oversized \
 	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage \
-	check_resource_x_send_c1_unit
+	check_resource_x_send_c1_unit \
+	check_r11_predecessor_product_manifest_unit \
+	check_r11_predecessor_product_manifest
 	@echo "# pgrac cluster unit tests"
 	@total=0; failed=0; \
 	for t in $(TESTS); do \
@@ -2032,6 +2034,16 @@ check_resource_x_send_c1:
 		--cflags '$(CFLAGS)' --cppflags '$(CPPFLAGS)' \
 		--pthread-cflags '$(PTHREAD_CFLAGS)' --pthread-libs '$(PTHREAD_LIBS)'
 
+check_r11_predecessor_product_manifest_unit:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/test/cluster_unit/test_r11_predecessor_product_manifest.py
+
+check_r11_predecessor_product_manifest:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/tools/check_r11_predecessor_product_manifest.py \
+		--source-root "$(top_srcdir)" \
+		--manifest "$(top_srcdir)/src/test/cluster_unit/data/r11-predecessor-product-manifest-v1.json"
+
 
 # ----------
 # Standard PG targets
@@ -2052,6 +2064,8 @@ install installdirs uninstall installcheck:
 .PHONY: all check check_cluster_undo_segment_half_page_oversized \
 	check_pcm_x_write_gate_ast check_pcm_x_write_gate_coverage clean distclean \
 	check_resource_x_send_c1 check_resource_x_send_c1_unit \
+	check_r11_predecessor_product_manifest \
+	check_r11_predecessor_product_manifest_unit \
 	maintainer-clean install installdirs uninstall installcheck
 
 # Spec 8.4A U9: this deliberately oversized fixture must be rejected by the
