@@ -55,6 +55,7 @@
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_multixact_current_stats.h"
+#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_enqueue.h"
@@ -491,7 +492,13 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key,
 	 */
 	PG_TRY();
 	{
-		for (;;) {
+		PcmXQueueResult guard_result;
+
+		guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+		if (guard_result != PCM_X_QUEUE_OK)
+			result = CLUSTER_TXW_RETRY;
+		else
+			for (;;) {
 				ClusterTTStatusResult cres;
 				ClusterTTStatusSourceRequest source_request;
 				ClusterTTStatusSourceResult source_result;
@@ -542,7 +549,7 @@ cluster_tx_enqueue_wait_internal(const ClusterTTStatusKey *holder_key,
 				(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
 								WAIT_EVENT_GES_TX_ENQUEUE_WAIT);
 				CHECK_FOR_INTERRUPTS();
-		}
+			}
 	}
 	PG_CATCH();
 	{
@@ -569,6 +576,7 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	ClusterTxResolveReason initial_reason = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
 	ClusterTxOutcome initial_outcome;
 	ClusterTxLocator target_locator;
+	PcmXQueueResult guard_result;
 	NodeId blocker_node;
 	TransactionId my_xid;
 	instr_time wait_started;
@@ -625,6 +633,13 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	blocker_node = uba_origin_node_id(target_locator.uba);
 	if (!SCN_NODE_ID_VALID(blocker_node)) {
 		final_reason = CLUSTER_TX_RESOLVE_BAD_UBA;
+		goto done;
+	}
+
+	guard_result = cluster_pcm_x_nested_wait_guard_before_block();
+	if (guard_result != PCM_X_QUEUE_OK) {
+		result = CLUSTER_TXW_RETRY;
+		final_reason = CLUSTER_TX_RESOLVE_NONE;
 		goto done;
 	}
 

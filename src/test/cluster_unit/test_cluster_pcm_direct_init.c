@@ -385,16 +385,13 @@ UT_TEST(test_vm_fsm_use_dedicated_init_wrappers)
 	}
 }
 
-UT_TEST(test_valid_n_s_x_without_proof_uses_target_or_s_reservation)
+UT_TEST(test_valid_n_s_x_without_proof_enters_queue_before_legacy_wire)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
-		= { "if (pcm_mode == PCM_LOCK_MODE_X)",
-			"cluster_bufmgr_pcm_x_writer_prepare_target(",
-			"else",
+		= { "pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_source(",
 			"cluster_bufmgr_pcm_begin_grant_reservation_wait(",
-			"cluster_pcm_lock_acquire_buffer(",
-			"buf, PCM_LOCK_MODE_S, &retry_denied" };
+			"cluster_pcm_lock_acquire_buffer(buf, pcm_mode," };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
@@ -446,15 +443,12 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 	UT_ASSERT(bufmgr != NULL);
 	UT_ASSERT(heapam != NULL);
 	if (bufmgr != NULL) {
-		/* The refusal arm sits between target acquire and the ERROR report,
-		 * and only the barrier-aware entry can consume it. */
+		/* The refusal arm sits between the queue acquire and the ERROR
+		 * report, and only the barrier-aware entry can consume it. */
 		static const char *const refusal_order[]
-			= { "cluster_gcs_resource_x_target_acquire_exact(",
-				"cluster_pcm_lock_resource_x_gate_snapshot(&gate)",
-				"gate.phase != RESOURCE_X_GATE_OPEN",
-				"*pcm_barrier_refused = true",
-				"return NULL",
-				"cluster_bufmgr_resource_x_writer_report_failure(" };
+			= { "cluster_gcs_pcm_x_acquire_writer(buf, &entry->claim",
+				"PCM_X_QUEUE_BARRIER_CLOSED && barrier_refused != NULL",
+				"cluster_bufmgr_pcm_x_writer_report_failure(result, buf, \"queue acquire\")" };
 
 		static const char *const wrapper_signature[]
 			= { "ClusterLockBufferExclusiveBarrierAware(Buffer buffer,",
@@ -757,7 +751,7 @@ main(void)
 	UT_RUN(test_read_miss_and_found_hit_have_no_raw_unproven_lock);
 	UT_RUN(test_extend_proof_is_after_zeroextend_and_before_lock);
 	UT_RUN(test_vm_fsm_use_dedicated_init_wrappers);
-	UT_RUN(test_valid_n_s_x_without_proof_uses_target_or_s_reservation);
+	UT_RUN(test_valid_n_s_x_without_proof_enters_queue_before_legacy_wire);
 	UT_RUN(test_direct_init_one_shot_image_cannot_return_without_x);
 	UT_RUN(test_wire_throw_exact_aborts_reservation_before_rethrow);
 	UT_RUN(test_precrit_vm_barrier_refusal_unwinds_to_caller);

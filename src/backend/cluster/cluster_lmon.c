@@ -1400,6 +1400,7 @@ LmonMain(void)
 			 */
 			cluster_grd_recovery_authority_lmon_tick();
 			cluster_grd_recovery_lmon_tick();
+			cluster_gcs_block_pcm_x_formation_tick();
 
 			/*
 			 * spec-2.9 D2 review fix: BOC_BROADCAST is triggered by
@@ -2064,6 +2065,7 @@ LmonMain(void)
 			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
 			cluster_grd_recovery_authority_lmon_tick();
 			cluster_grd_recovery_lmon_tick();
+			cluster_gcs_block_pcm_x_formation_tick();
 
 			/*
 			 * PGRAC: spec-5.3 — drain the GRD work queue in the stub /
