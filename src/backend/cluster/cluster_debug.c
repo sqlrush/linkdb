@@ -142,7 +142,6 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
 #include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
 #include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
-#include "cluster/cluster_pcm_x_convert.h"	 /* PCM-X external FIFO observability */
 #include "cluster/cluster_resource_x_identity.h" /* Resource-X proof readiness */
 #include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
 #include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
@@ -2040,195 +2039,6 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "pcm", "wm_prov_insert_fail_count",
 			 fmt_int64((int64)cluster_pcm_get_wm_prov_insert_fail_count()));
 
-	/* PCM-X queue core plus Resource-X retry observations in the existing pcm category,
-	 * plus one text-valued fail-closed provenance key (excluded from the
-	 * integer-only snapshot tooling in the TAP suite). */
-	{
-		PcmXStatsSnapshot stats = { 0 };
-		PcmXRuntimeSnapshot runtime = cluster_pcm_x_runtime_snapshot();
-		char fail_closed_site[PCM_X_FAIL_CLOSED_SITE_LEN];
-
-		(void)cluster_pcm_x_stats_snapshot(&stats);
-		emit_row(rsinfo, "pcm", "pcm_x_runtime_state", fmt_int32((int32)runtime.state));
-		emit_row(rsinfo, "pcm", "pcm_x_runtime_generation",
-				 fmt_int64((int64)runtime.gate_generation));
-		if (!cluster_pcm_x_runtime_fail_closed_site(fail_closed_site, sizeof(fail_closed_site)))
-			strlcpy(fail_closed_site, "(none)", sizeof(fail_closed_site));
-		emit_row(rsinfo, "pcm", "pcm_x_runtime_fail_closed_site", fail_closed_site);
-
-		/* Text-valued per-slot diagnostic rows; present only while master tag
-		 * or ticket slots are occupied, so the quiescent key count above is
-		 * unchanged. */
-		{
-			Size cursor = 0;
-			Size index = 0;
-			char line[768];
-			char key[64];
-
-			while (cluster_pcm_x_master_tag_debug_next(&cursor, &index, line, sizeof(line))) {
-				snprintf(key, sizeof(key), "pcm_x_tag_%zu", index);
-				emit_row(rsinfo, "pcm", key, line);
-			}
-			cursor = 0;
-			while (cluster_pcm_x_master_ticket_debug_next(&cursor, &index, line, sizeof(line))) {
-				snprintf(key, sizeof(key), "pcm_x_ticket_%zu", index);
-				emit_row(rsinfo, "pcm", key, line);
-			}
-			cursor = 0;
-			while (cluster_pcm_x_local_tag_debug_next(&cursor, &index, line, sizeof(line))) {
-				snprintf(key, sizeof(key), "pcm_x_ltag_%zu", index);
-				emit_row(rsinfo, "pcm", key, line);
-			}
-			{
-				uint32 note_op = 0;
-				uint32 note_result = 0;
-				uint32 note_count = 0;
-				uint64 note_ticket = 0;
-
-				if (cluster_pcm_x_terminal_note_read(&note_op, &note_result, &note_ticket,
-													 &note_count)) {
-					snprintf(line, sizeof(line),
-							 "op=%u result=%u ticket=" UINT64_FORMAT " count=%u", note_op,
-							 note_result, note_ticket, note_count);
-					emit_row(rsinfo, "pcm", "pcm_x_terminal_last_note", line);
-				}
-			}
-		}
-		emit_row(rsinfo, "pcm", "pcm_x_queue_enqueue_count", fmt_int64((int64)stats.enqueue_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_admit_count", fmt_int64((int64)stats.admit_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_confirm_count", fmt_int64((int64)stats.confirm_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_promotion_count",
-				 fmt_int64((int64)stats.promotion_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_transfer_count",
-				 fmt_int64((int64)stats.transfer_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_complete_count",
-				 fmt_int64((int64)stats.complete_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_cancel_count", fmt_int64((int64)stats.cancel_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_revoke_count", fmt_int64((int64)stats.revoke_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_coalesced_count",
-				 fmt_int64((int64)stats.coalesced_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_wait_count", fmt_int64((int64)stats.wait_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_full_count", fmt_int64((int64)stats.full_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_stale_count", fmt_int64((int64)stats.stale_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_miss_count", fmt_int64((int64)stats.miss_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_recovery_blocked_count",
-				 fmt_int64((int64)stats.recovery_blocked_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_activating_reset_count",
-				 fmt_int64((int64)stats.activating_reset_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_depth", fmt_int64((int64)stats.depth));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_depth_high_water",
-				 fmt_int64((int64)stats.depth_high_water));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_active_tags", fmt_int64((int64)stats.active_tags));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_live_tickets", fmt_int64((int64)stats.live_tickets));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_live_slots", fmt_int64((int64)stats.live_slots));
-		emit_row(rsinfo, "pcm", "pcm_x_local_retire_gate",
-				 fmt_int64((int64)stats.local_retire_gate));
-		emit_row(rsinfo, "pcm", "pcm_x_local_retire_marker_count",
-				 fmt_int64((int64)stats.local_retire_marker_count));
-		emit_row(rsinfo, "pcm", "pcm_x_local_retire_marker_ticket_id",
-				 fmt_int64((int64)stats.local_retire_marker_ticket_id));
-		emit_row(rsinfo, "pcm", "pcm_x_own_begin_count", fmt_int64((int64)stats.own_begin_count));
-		emit_row(rsinfo, "pcm", "pcm_x_own_commit_count", fmt_int64((int64)stats.own_commit_count));
-		emit_row(rsinfo, "pcm", "pcm_x_own_abort_count", fmt_int64((int64)stats.own_abort_count));
-		emit_row(rsinfo, "pcm", "pcm_x_own_busy_count", fmt_int64((int64)stats.own_busy_count));
-		emit_row(rsinfo, "pcm", "pcm_x_own_corrupt_count",
-				 fmt_int64((int64)stats.own_corrupt_count));
-		emit_row(rsinfo, "pcm", "pcm_x_queue_barrier_unwind_count",
-				 fmt_int64((int64)stats.barrier_unwind_count));
-		emit_row(rsinfo, "pcm", "retry_producer_due_count",
-				 fmt_uint64(stats.retry_producer_due_count));
-		emit_row(rsinfo, "pcm", "retry_wire_attempt_count",
-				 fmt_uint64(stats.retry_wire_attempt_count));
-		emit_row(rsinfo, "pcm", "retry_transport_rebound_count",
-				 fmt_uint64(stats.retry_transport_rebound_count));
-		emit_row(rsinfo, "pcm", "retry_terminal_success_count",
-				 fmt_uint64(stats.retry_terminal_success_count));
-		emit_row(rsinfo, "pcm", "retry_terminal_denied_count",
-				 fmt_uint64(stats.retry_terminal_denied_count));
-		emit_row(rsinfo, "pcm", "retry_budget_exhausted_count",
-				 fmt_uint64(stats.retry_budget_exhausted_count));
-		emit_row(rsinfo, "pcm", "retry_recovery_blocked_count",
-				 fmt_uint64(stats.retry_recovery_blocked_count));
-		emit_row(rsinfo, "pcm", "retry_terminal_latency_us_count",
-				 fmt_uint64(stats.retry_terminal_latency_us_count));
-		emit_row(rsinfo, "pcm", "retry_terminal_latency_us_max",
-				 fmt_uint64(stats.retry_terminal_latency_us_max));
-		emit_row(rsinfo, "pcm", "master_grant_delivery_pending_count",
-				 fmt_uint64(stats.master_grant_delivery_pending_count));
-		emit_row(rsinfo, "pcm", "master_grant_delivery_oldest_age_us",
-				 fmt_uint64(stats.master_grant_delivery_oldest_age_us));
-
-		{
-			static const char *const result_keys[PCM_X_QUEUE_RESULT_COUNT] = {
-				"pcm_x_acquire_result_ok_count",
-				"pcm_x_acquire_result_duplicate_count",
-				"pcm_x_acquire_result_retired_count",
-				"pcm_x_acquire_result_not_found_count",
-				"pcm_x_acquire_result_stale_count",
-				"pcm_x_acquire_result_no_capacity_count",
-				"pcm_x_acquire_result_counter_exhausted_count",
-				"pcm_x_acquire_result_not_ready_count",
-				"pcm_x_acquire_result_busy_count",
-				"pcm_x_acquire_result_bad_state_count",
-				"pcm_x_acquire_result_corrupt_count",
-				"pcm_x_acquire_result_invalid_count",
-				"pcm_x_acquire_result_gate_retry_count",
-				"pcm_x_acquire_result_barrier_closed_count",
-			};
-			static const char *const bucket_keys[PCM_X_ACQUIRE_HIST_BUCKETS] = {
-				"pcm_x_acquire_success_us_le_2p00_count",
-				"pcm_x_acquire_success_us_le_2p01_count",
-				"pcm_x_acquire_success_us_le_2p02_count",
-				"pcm_x_acquire_success_us_le_2p03_count",
-				"pcm_x_acquire_success_us_le_2p04_count",
-				"pcm_x_acquire_success_us_le_2p05_count",
-				"pcm_x_acquire_success_us_le_2p06_count",
-				"pcm_x_acquire_success_us_le_2p07_count",
-				"pcm_x_acquire_success_us_le_2p08_count",
-				"pcm_x_acquire_success_us_le_2p09_count",
-				"pcm_x_acquire_success_us_le_2p10_count",
-				"pcm_x_acquire_success_us_le_2p11_count",
-				"pcm_x_acquire_success_us_le_2p12_count",
-				"pcm_x_acquire_success_us_le_2p13_count",
-				"pcm_x_acquire_success_us_le_2p14_count",
-				"pcm_x_acquire_success_us_le_2p15_count",
-				"pcm_x_acquire_success_us_le_2p16_count",
-				"pcm_x_acquire_success_us_le_2p17_count",
-				"pcm_x_acquire_success_us_le_2p18_count",
-				"pcm_x_acquire_success_us_le_2p19_count",
-				"pcm_x_acquire_success_us_le_2p20_count",
-				"pcm_x_acquire_success_us_le_2p21_count",
-				"pcm_x_acquire_success_us_le_2p22_count",
-				"pcm_x_acquire_success_us_le_2p23_count",
-				"pcm_x_acquire_success_us_le_2p24_count",
-				"pcm_x_acquire_success_us_le_2p25_count",
-				"pcm_x_acquire_success_us_le_2p26_count",
-				"pcm_x_acquire_success_us_le_2p27_count",
-				"pcm_x_acquire_success_us_le_2p28_count",
-				"pcm_x_acquire_success_us_le_2p29_count",
-				"pcm_x_acquire_success_us_le_2p30_count",
-				"pcm_x_acquire_success_us_le_2p31_count",
-			};
-			PcmXAcquireObservationSnapshot observation;
-			int i;
-
-			cluster_pcm_x_acquire_observation_snapshot(&observation);
-			emit_row(rsinfo, "pcm", "pcm_x_acquire_started_count",
-					 fmt_uint64(observation.started_count));
-			emit_row(rsinfo, "pcm", "pcm_x_acquire_active_count",
-					 fmt_uint64(observation.active_count));
-			emit_row(rsinfo, "pcm", "pcm_x_acquire_exception_count",
-					 fmt_uint64(observation.exception_count));
-			for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
-				emit_row(rsinfo, "pcm", result_keys[i],
-						 fmt_uint64(observation.terminal_result_count[i]));
-			for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
-				emit_row(rsinfo, "pcm", bucket_keys[i],
-						 fmt_uint64(observation.success_latency_bucket[i]));
-			emit_row(rsinfo, "pcm", "pcm_x_acquire_success_us_overflow_count",
-					 fmt_uint64(observation.success_latency_overflow_count));
-		}
-	}
 }
 
 
@@ -2424,14 +2234,6 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_hint_violation_count()));
 	emit_row(rsinfo, "gcs", "dedup_legacy_pin_count",
 			 fmt_int64((int64)cluster_gcs_get_block_dedup_legacy_pin_count()));
-	emit_row(rsinfo, "gcs", "dedup_pcm_x_stage_count",
-			 fmt_int64((int64)cluster_gcs_get_block_dedup_pcm_x_stage_count()));
-	emit_row(rsinfo, "gcs", "dedup_pcm_x_replay_count",
-			 fmt_int64((int64)cluster_gcs_get_block_dedup_pcm_x_replay_count()));
-	emit_row(rsinfo, "gcs", "dedup_pcm_x_release_count",
-			 fmt_int64((int64)cluster_gcs_get_block_dedup_pcm_x_release_count()));
-	emit_row(rsinfo, "gcs", "dedup_pcm_x_failclosed_count",
-			 fmt_int64((int64)cluster_gcs_get_block_dedup_pcm_x_failclosed_count()));
 	emit_row(rsinfo, "gcs", "done_enqueue_drop_count",
 			 fmt_int64((int64)cluster_gcs_get_block_done_enqueue_drop_count()));
 
@@ -2604,8 +2406,6 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	/* PGRAC: spec-4.7 D6 — 8 NEW counter rows for GCS/PCM warm recovery. */
 	emit_row(rsinfo, "gcs_recovery", "block_resources_recovering",
 			 fmt_int64((int64)cluster_gcs_get_recovery_block_resources_recovering()));
-	emit_row(rsinfo, "gcs_recovery", "pcm_x_image_fetch_recovering_retry_count",
-			 fmt_int64((int64)cluster_gcs_get_pcm_x_image_fetch_recovering_retry_count()));
 	emit_row(rsinfo, "gcs_recovery", "buffers_redeclared",
 			 fmt_int64((int64)cluster_gcs_get_recovery_buffers_redeclared()));
 	emit_row(rsinfo, "gcs_recovery", "block_state_rebuilt",

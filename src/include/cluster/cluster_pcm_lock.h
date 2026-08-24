@@ -139,6 +139,39 @@ typedef struct ResourceXAcquisitionRef {
 StaticAssertDecl(sizeof(ResourceXAcquisitionRef) == 40,
 				 "ResourceXAcquisitionRef layout must remain 40 bytes");
 
+/* PGRAC adaptation: one fixed, local-only owner embedded in the existing
+ * per-resource entry.  It serializes a same-page terminal recycler with an
+ * exact type-17 source revoke; it is never grant authority or wire state. */
+typedef enum ResourceXLocalOwnerKind {
+	RESOURCE_X_LOCAL_OWNER_EMPTY = 0,
+	RESOURCE_X_LOCAL_OWNER_RECYCLING = 1,
+	RESOURCE_X_LOCAL_OWNER_REVOKING = 2
+} ResourceXLocalOwnerKind;
+
+typedef struct ResourceXLocalOwnerHandle {
+	/* Exact only for RECYCLING and X-source REVOKING.  An S-source owner
+	 * leaves this zero: local BufferDesc lineage is evidence, not a fabricated
+	 * Resource-X acquisition. */
+	ResourceXAcquisitionRef current_ref;
+	ResourceXAssertion action_assertion;
+	uint64 owner_generation;
+	uint64 action_sequence;
+	uint64 r4_record_generation;
+	uint64 buffer_ownership_generation;
+	uint64 reservation_token;
+	uint64 master_session_incarnation;
+	uint64 resource_formation;
+	uint64 base_authority_generation;
+	int32 master_node;
+	uint32 owner_procno;
+	uint8 kind;
+	uint8 source_mode;
+	uint8 reserved[6];
+} ResourceXLocalOwnerHandle;
+
+StaticAssertDecl(sizeof(ResourceXLocalOwnerHandle) == 144,
+				 "ResourceXLocalOwnerHandle layout must remain 144 bytes");
+
 #define RESOURCE_X_PROGRESS_BOUND UINT32_C(0x00000001)
 #define RESOURCE_X_PROGRESS_T1 UINT32_C(0x00000002)
 #define RESOURCE_X_PROGRESS_T2 UINT32_C(0x00000004)
@@ -567,39 +600,6 @@ typedef struct PcmAuthoritySnapshot {
 StaticAssertDecl(sizeof(PcmAuthoritySnapshot) == 64,
 				 "PcmAuthoritySnapshot process-local layout must remain 64 bytes");
 
-/*
- * Exact queue-to-GRD X handoff token.  The queue engine builds this only
- * after the source image and every required invalidation are acknowledged.
- * It is deliberately process-local: changing it does not change wire ABI.
- */
-typedef struct PcmXGrdHandoffToken {
-	BufferTag tag;
-	PcmAuthoritySnapshot authority;
-	uint64 cluster_epoch;
-	uint64 request_id;
-	uint64 ticket_id;
-	uint64 grant_generation;
-	uint64 image_id;
-	uint64 source_own_generation;
-	SCN page_scn;
-	uint64 page_lsn;
-	int32 requester_node;
-	int32 source_node;
-	uint32 requester_procno;
-	uint32 page_checksum;
-} PcmXGrdHandoffToken;
-
-StaticAssertDecl(sizeof(PcmXGrdHandoffToken) == 168,
-				 "PcmXGrdHandoffToken process-local layout must remain 168 bytes");
-
-typedef enum PcmXGrdHandoffResult {
-	PCM_X_GRD_HANDOFF_OK = 0,
-	PCM_X_GRD_HANDOFF_DUPLICATE,
-	PCM_X_GRD_HANDOFF_NOT_FOUND,
-	PCM_X_GRD_HANDOFF_STALE,
-	PCM_X_GRD_HANDOFF_BAD_STATE,
-	PCM_X_GRD_HANDOFF_INVALID
-} PcmXGrdHandoffResult;
 typedef enum PcmXTransferCommitResult {
 	PCM_X_TRANSFER_COMMIT_OK = 0,
 	PCM_X_TRANSFER_COMMIT_NOT_FOUND,
@@ -897,6 +897,8 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	uint64 r4_record_generation, uint64 current_master_session_incarnation,
 	uint32 master_sender_connection_generation,
 	ResourceXDecodedFrame *ack_out);
+extern bool cluster_pcm_lock_resource_x_s_barrier_active(
+	const BufferTag *tag);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
@@ -938,6 +940,32 @@ extern bool
 cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
 	uint64 r4_record_generation, uint64 cached_ownership_generation);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_recycler_arm_exact(
+	const ResourceXAcquisitionRef *ref, uint64 r4_record_generation,
+	uint64 buffer_ownership_generation, uint64 reservation_token,
+	uint32 owner_procno, ResourceXLocalOwnerHandle *handle_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_recycler_revalidate_exact(
+	const ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_recycler_release_exact(
+	ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_recycler_cancel_exact(
+	ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_source_revoke_enter_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	uint64 r4_record_generation, uint64 buffer_ownership_generation,
+	uint64 reservation_token, uint32 owner_procno,
+	ResourceXLocalOwnerHandle *handle_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_source_revoke_revalidate_exact(
+	const ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_source_revoke_release_exact(
+	ResourceXLocalOwnerHandle *handle);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node);
 extern ResourceXApplyResult
@@ -1143,8 +1171,6 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_activate_exact
 extern void cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *out);
 extern void cluster_pcm_lock_resource_x_publish_no_progress_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXNoProgressReason reason);
-extern PcmXGrdHandoffResult
-cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token);
 extern int cluster_pcm_grd_count(void);
 extern void cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count,
 										int *pi_holders_total, int *convert_queue_active);

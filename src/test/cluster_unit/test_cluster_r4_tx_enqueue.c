@@ -80,7 +80,6 @@ static int test_resolve_pos;
 static uint64 test_epochs[16];
 static int test_epoch_count;
 static int test_epoch_pos;
-static PcmXQueueResult test_guard_result;
 static NodeId test_uba_origin;
 static bool test_wfg_accept;
 static bool test_wfg_live;
@@ -236,12 +235,6 @@ cluster_epoch_get_current(void)
 	UT_ASSERT(test_epoch_count > 0);
 	pos = test_epoch_pos < test_epoch_count ? test_epoch_pos++ : test_epoch_count - 1;
 	return test_epochs[pos];
-}
-
-PcmXQueueResult
-cluster_pcm_x_nested_wait_guard_before_block(void)
-{
-	return test_guard_result;
 }
 
 NodeId
@@ -561,7 +554,6 @@ reset_fixture(void)
 	test_epochs[0] = TEST_EPOCH;
 	test_epoch_count = 1;
 	test_epoch_pos = 0;
-	test_guard_result = PCM_X_QUEUE_OK;
 	test_uba_origin = 0;
 	test_wfg_accept = true;
 	test_wfg_live = false;
@@ -868,21 +860,6 @@ UT_TEST(test_monotonic_timeout_uses_only_timeout_counter)
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_TIMEOUT);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->timeout_count), 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->wait_count), 1);
-	assert_slot_clean();
-}
-
-UT_TEST(test_nested_guard_retries_without_slot_mutation)
-{
-	ClusterTxLocator locator = test_locator();
-	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
-
-	reset_fixture();
-	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
-	test_guard_result = PCM_X_QUEUE_GATE_RETRY;
-	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1, &reason), CLUSTER_TXW_RETRY);
-	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->wait_count), 0);
-	UT_ASSERT_EQ(test_wait_publish_calls, 0);
 	assert_slot_clean();
 }
 
@@ -1477,7 +1454,7 @@ UT_TEST(test_backend_exit_counter_underflow_fails_stop_without_freeing_slot)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(37);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);
@@ -1488,7 +1465,6 @@ main(void)
 	UT_RUN(test_zero_epoch_is_a_valid_stable_formation);
 	UT_RUN(test_zero_to_nonzero_epoch_drift_fails_closed);
 	UT_RUN(test_monotonic_timeout_uses_only_timeout_counter);
-	UT_RUN(test_nested_guard_retries_without_slot_mutation);
 	UT_RUN(test_reentrant_source_and_target_slots_are_not_overwritten);
 	UT_RUN(test_wfg_capacity_refusal_runs_full_cleanup);
 	UT_RUN(test_error_longjmp_runs_same_cleanup_funnel);

@@ -7,6 +7,10 @@
  */
 #include "postgres.h"
 #include "access/xloginsert.h"
+#include "cluster/cluster_control_root.h"
+#include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_wal_retention.h"
 
 #if defined(__has_include)
 #if __has_include("cluster/cluster_page_anchor_cache.h")
@@ -26,6 +30,57 @@ ExceptionalCondition(const char *condition_name, const char *file_name,
 	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name,
 		   line_number);
 	abort();
+}
+
+/* This binary links stable-base only for shared key helpers.  Keep every
+ * external authority seam fail closed if its owner branch becomes reachable. */
+ClusterControlRootResult
+cluster_control_root_revalidate(
+	const ClusterControlRootReadToken *token pg_attribute_unused(),
+	const ClusterControlRootIdentity *expected_identity pg_attribute_unused(),
+	ClusterControlRootSnapshot *out_snapshot pg_attribute_unused())
+{
+	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_revalidate_nowait(
+	const ClusterFormationWitnessV1 *witness pg_attribute_unused())
+{
+	return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+}
+
+bool
+cluster_external_fence_need_set_revalidate_nowait(
+	const PgracExternalFenceNeedSetV1 *needs pg_attribute_unused(),
+	const ClusterFormationWitnessV1 *formation pg_attribute_unused(),
+	PgracExternalFenceDenyReason *reason pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+cluster_external_fence_revalidate_set_nowait(
+	const PgracExternalFenceAdmissionSetV1 *admissions pg_attribute_unused(),
+	const PgracExternalFenceNeedSetV1 *needs pg_attribute_unused(),
+	const ClusterFormationWitnessV1 *formation pg_attribute_unused(),
+	PgracExternalFenceDenyReason *reason pg_attribute_unused())
+{
+	return false;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_preflight_revalidate_wait_v1(
+	ClusterWalRetentionPin *pin pg_attribute_unused())
+{
+	return CLUSTER_WAL_PIN_STALE;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_revalidate(
+	ClusterWalRetentionPin *pin pg_attribute_unused())
+{
+	return CLUSTER_WAL_PIN_STALE;
 }
 
 #ifndef TEST_HAVE_CLUSTER_PAGE_ANCHOR_CACHE

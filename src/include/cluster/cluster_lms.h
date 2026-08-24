@@ -518,12 +518,6 @@ StaticAssertDecl(sizeof(ClusterLmsResourceXTransportSnapshot) == 16,
 extern bool cluster_lms_outbound_resource_x_transport_snapshot(
 	ClusterLmsResourceXTransportSnapshot *out);
 extern uint64 cluster_lms_outbound_resource_x_staged_count(void);
-extern void cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary,
-														int result, int runtime_state,
-														bool fence_enforcing, bool fence_allowed,
-														uint32 dest_node_id, uint64 request_id,
-														uint64 ticket_id, uint64 grant_generation,
-														uint64 image_id);
 
 /*
  * Read-only accessors for SQL view + diagnostics.

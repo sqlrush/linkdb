@@ -888,30 +888,25 @@ UT_TEST(test_closed_purge_removes_routes_but_preserves_generic_entry)
 					 TEST_LIFETIME_HINT_MS, true, NULL));
 }
 
-UT_TEST(test_generic_done_remove_and_pcm_restart_audit_ignore_route)
+UT_TEST(test_generic_done_and_remove_ignore_route)
 {
 	GcsBlockR4RouteIdentity identity = make_identity(16, 3, 56, (SCN)116, 25);
 	ClusterR4CrRouteProof proof = make_proof(&identity, 2);
 	GcsBlockR4RouteRecord record;
 	uint64 done_mismatch_before;
-	uint64 pcm_failclosed_before;
 
 	fixture_reset(8);
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&identity, &proof, &record));
 	done_mismatch_before = cluster_gcs_block_dedup_get_done_mismatch_count();
-	pcm_failclosed_before = cluster_gcs_block_dedup_get_pcm_x_failclosed_count();
 	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(
 		0, &identity.legacy_key, &identity.tag, TEST_ROUTE_TRANSITION));
 	cluster_gcs_block_dedup_remove(0, &identity.legacy_key);
-	UT_ASSERT(!cluster_gcs_block_dedup_pcm_x_restart_audit(0));
 	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_VALIDATION_FAIL,
 				 cluster_gcs_block_dedup_lookup_or_register(
 					 0, &identity.legacy_key, identity.tag, TEST_ROUTE_TRANSITION,
 					 TEST_LIFETIME_HINT_MS, true, NULL));
 	UT_ASSERT_EQ(done_mismatch_before,
 				 cluster_gcs_block_dedup_get_done_mismatch_count());
-	UT_ASSERT_EQ(pcm_failclosed_before,
-				 cluster_gcs_block_dedup_get_pcm_x_failclosed_count());
 	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_count());
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY, arm_route(&identity, &proof, &record));
 }
@@ -942,7 +937,7 @@ main(void)
 	UT_RUN(test_backend_exit_removes_exact_requester_route);
 	UT_RUN(test_node_death_removes_requester_route);
 	UT_RUN(test_closed_purge_removes_routes_but_preserves_generic_entry);
-	UT_RUN(test_generic_done_remove_and_pcm_restart_audit_ignore_route);
+	UT_RUN(test_generic_done_and_remove_ignore_route);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

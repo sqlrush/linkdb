@@ -552,7 +552,7 @@ cluster_heap_itl_alloc_with_terminal_census(Buffer buffer, TransactionId xid,
 				if (!cluster_bufmgr_itl_recycle_guard_relock(buffer))
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_IN_USE),
-							 errmsg("cluster ITL recycle guard could not reacquire exact content authority")));
+							 errmsg("Resource-X ITL recycle guard could not reacquire exact content authority")));
 				recycle_guard_unlocked = false;
 				recycle_guard_armed = false;
 			}

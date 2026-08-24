@@ -90,7 +90,7 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
  *	  [   45,    46) status              uint8 (GcsBlockReplyStatus)
  *	  [   46,    47) entry_kind          uint8
  *	  [   47,    48) _pad0               explicit pad to 8-align
- *	  [   48,    56) pcm_x_master_session uint64 (PCM-X kind only)
+ *	  [   48,    56) reserved_session     uint64
  *	  [   56,   104) reply_header        GcsBlockReplyHeader (48B)
  *	  [  104,   105) has_sf_dep          bool                    spec-6.2
  *	  [  105,   106) sf_flags            uint8                   spec-6.2
@@ -149,14 +149,6 @@ StaticAssertDecl(sizeof(GcsBlockDedupKey) == 24, "spec-2.34 D2 GcsBlockDedupKey 
  * ============================================================ */
 typedef enum GcsBlockDedupEntryKind {
 	GCS_BLOCK_DEDUP_ENTRY_GENERIC = 0,
-	GCS_BLOCK_DEDUP_ENTRY_PCM_X_RESERVED = 1,
-	GCS_BLOCK_DEDUP_ENTRY_PCM_X_IMAGE = 2,
-	/* Stable bytes exist, but X->N has not yet been positively committed.
-	 * This state is retained across LMS death and is never sendable. */
-	GCS_BLOCK_DEDUP_ENTRY_PCM_X_MATERIALIZED_UNCOMMITTED = 3,
-	/* Exact descriptor/byte cleanup completed after local TERMINAL_DRAINED.
-	 * Keep the binding as an ACK replay tombstone until exact RETIRE. */
-	GCS_BLOCK_DEDUP_ENTRY_PCM_X_DRAINED = 4,
 	GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE = 5
 } GcsBlockDedupEntryKind;
 
@@ -204,7 +196,7 @@ StaticAssertDecl(sizeof(GcsBlockR4RouteRecord) == 128,
 
 typedef union GcsBlockDedupPayloadMeta {
 	ClusterSfDepVec sf_dep_vec;
-	GcsBlockPcmXImageIdentity pcm_x_identity;
+	uint8 reserved[128];
 	GcsBlockR4RouteRecord r4_route;
 } GcsBlockDedupPayloadMeta;
 
@@ -219,7 +211,7 @@ typedef struct GcsBlockDedupEntry {
 	uint8 entry_kind;					   /*  1B — GcsBlockDedupEntryKind */
 	uint8 request_flags;				   /*  1B — generic request properties; PCM-X
 										* source state or drained master node + 1 */
-	uint64 pcm_x_master_session;		   /*  8B — PCM-X kind only */
+	uint64 reserved_session;			   /*  8B — reserved layout cell */
 	GcsBlockReplyHeader reply_header;	   /* 48B — full reply header (HC99) */
 	bool has_sf_dep;					   /*  1B — generic SF metadata; PCM-X */
 	uint8 sf_flags;						   /*  1B — metadata cell overlays the */
@@ -240,49 +232,14 @@ typedef struct GcsBlockDedupEntry {
 
 StaticAssertDecl(offsetof(GcsBlockDedupEntry, entry_kind) == 46,
 				 "dedup entry kind occupies established padding at offset 46");
-StaticAssertDecl(offsetof(GcsBlockDedupEntry, pcm_x_master_session) == 48,
-				 "PCM-X master session occupies established padding at offset 48");
+StaticAssertDecl(offsetof(GcsBlockDedupEntry, reserved_session) == 48,
+				 "reserved session cell remains at offset 48");
 StaticAssertDecl(offsetof(GcsBlockDedupEntry, reply_header) == 56,
 				 "dedup reply header offset remains 56");
 StaticAssertDecl(offsetof(GcsBlockDedupEntry, payload_meta) == 112,
 				 "dedup payload metadata offset remains 112");
 StaticAssertDecl(sizeof(GcsBlockDedupEntry) == 8472,
 				 "GcsBlockDedupEntry 8472B (8448 spec-6.2 + 24 round-2 DONE lifecycle)");
-
-typedef enum GcsBlockPcmXImageResult {
-	GCS_BLOCK_PCM_X_IMAGE_RESERVED = 0,
-	GCS_BLOCK_PCM_X_IMAGE_STORED,
-	GCS_BLOCK_PCM_X_IMAGE_DUPLICATE,
-	GCS_BLOCK_PCM_X_IMAGE_REPLAY,
-	GCS_BLOCK_PCM_X_IMAGE_RELEASED,
-	GCS_BLOCK_PCM_X_IMAGE_STAGED,
-	GCS_BLOCK_PCM_X_IMAGE_REARMED,
-	GCS_BLOCK_PCM_X_IMAGE_NOT_FOUND,
-	GCS_BLOCK_PCM_X_IMAGE_NOT_READY,
-	GCS_BLOCK_PCM_X_IMAGE_STALE,
-	GCS_BLOCK_PCM_X_IMAGE_FULL,
-	GCS_BLOCK_PCM_X_IMAGE_INVALID,
-	/* Immutable bytes exist, but ownership commit is still pending.  This
-	 * process-local work result is never a sendable READY classification. */
-	GCS_BLOCK_PCM_X_IMAGE_COMMIT_PENDING
-} GcsBlockPcmXImageResult;
-
-/* By-value LMS work descriptor.  It deliberately carries no page bytes:
- * RESERVED work materializes from the buffer manager, while READY work only
- * needs the exact ticket/image/session binding to arm or replay type 50. */
-typedef struct GcsBlockPcmXImageWork {
-	GcsBlockDedupKey key;
-	GcsBlockPcmXImageBinding binding;
-	uint64 reservation_token;
-	BufferTag tag;
-	uint8 source_pcm_state;
-	uint8 entry_kind;
-	uint8 _reserved[2];
-} GcsBlockPcmXImageWork;
-
-StaticAssertDecl(sizeof(GcsBlockPcmXImageWork) == 200,
-				 "PCM-X LMS work descriptor includes the exact source floor binding");
-
 
 /* ============================================================
  * GcsBlockDedupResult — outcome of lookup_or_register.
@@ -550,55 +507,6 @@ extern bool cluster_gcs_block_dedup_set_request_flags_exact(int worker_id,
 															uint8 transition_id,
 															uint8 request_flags);
 
-/* Dedicated PCM-X image storage over the existing dedup entry pool.  Reserve
- * claims capacity before the revoke lifecycle starts.  Materialize publishes
- * immutable bytes only after the caller has established its exact revoke
- * barrier.  Generic dedup APIs never mutate or retire these entries. */
-extern GcsBlockPcmXImageResult
-cluster_gcs_block_dedup_pcm_x_reserve(int worker_id, const GcsBlockDedupKey *key,
-									  const BufferTag *tag,
-									  const GcsBlockPcmXImageBinding *reserved_binding);
-extern GcsBlockPcmXImageResult cluster_gcs_block_dedup_pcm_x_materialize(
-	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
-	const GcsBlockPcmXImageBinding *ready_binding, uint64 reservation_token, uint8 source_pcm_state,
-	const GcsBlockReplyHeader *reply_header, const char *block_data);
-extern GcsBlockPcmXImageResult
-cluster_gcs_block_dedup_pcm_x_publish_ready_exact(int worker_id, const GcsBlockDedupKey *key,
-												  const BufferTag *tag,
-												  const GcsBlockPcmXImageBinding *ready_binding);
-extern GcsBlockPcmXImageResult cluster_gcs_block_dedup_pcm_x_lookup(
-	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
-	const GcsBlockPcmXImageBinding *expected_binding, GcsBlockDedupEntry *cached_reply_out);
-extern GcsBlockPcmXImageResult
-cluster_gcs_block_dedup_pcm_x_drain_status_exact(int worker_id, const GcsBlockDedupKey *key,
-												 const BufferTag *tag,
-												 const GcsBlockPcmXImageBinding *binding);
-extern GcsBlockPcmXImageResult cluster_gcs_block_dedup_pcm_x_release_exact(
-	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
-	const GcsBlockPcmXImageBinding *binding, int32 drained_master_node);
-extern bool cluster_gcs_block_dedup_pcm_x_retire_up_to(uint64 cluster_epoch,
-													   int32 authenticated_master_node,
-													   uint64 authenticated_master_session,
-													   uint64 retire_through_ticket_id);
-extern GcsBlockPcmXImageResult cluster_gcs_block_dedup_pcm_x_preserve_finish_error_exact(
-	int worker_id, const GcsBlockDedupKey *key, const BufferTag *tag,
-	const GcsBlockPcmXImageBinding *binding, uint64 reservation_token, uint8 source_pcm_state);
-extern GcsBlockPcmXImageResult
-cluster_gcs_block_dedup_pcm_x_next_work(int worker_id, GcsBlockPcmXImageWork *work_out);
-extern GcsBlockPcmXImageResult
-cluster_gcs_block_dedup_pcm_x_mark_staged_exact(int worker_id, const GcsBlockDedupKey *key,
-												const BufferTag *tag,
-												const GcsBlockPcmXImageBinding *ready_binding);
-extern GcsBlockPcmXImageResult
-cluster_gcs_block_dedup_pcm_x_unmark_staged_exact(int worker_id, const GcsBlockDedupKey *key,
-												  const BufferTag *tag,
-												  const GcsBlockPcmXImageBinding *ready_binding);
-extern GcsBlockPcmXImageResult
-cluster_gcs_block_dedup_pcm_x_rearm_exact(int worker_id, const GcsBlockDedupKey *key,
-										  const BufferTag *tag,
-										  const GcsBlockPcmXImageBinding *reserved_binding);
-extern bool cluster_gcs_block_dedup_pcm_x_restart_audit(int worker_id);
-
 /*
  * cluster_gcs_block_dedup_mark_done — consume a requester completion proof
  * (GCS_BLOCK_DONE).  Under the shard's exclusive lock, verifies the FULL
@@ -707,10 +615,6 @@ extern uint64 cluster_gcs_block_dedup_get_done_marked_count(void);	  /* RC-F DON
 extern uint64 cluster_gcs_block_dedup_get_done_mismatch_count(void);  /* RC-F DONE */
 extern uint64 cluster_gcs_block_dedup_get_hint_violation_count(void); /* review F5 */
 extern uint64 cluster_gcs_block_dedup_get_legacy_pin_count(void);	  /* review F5 */
-extern uint64 cluster_gcs_block_dedup_get_pcm_x_stage_count(void);
-extern uint64 cluster_gcs_block_dedup_get_pcm_x_replay_count(void);
-extern uint64 cluster_gcs_block_dedup_get_pcm_x_release_count(void);
-extern uint64 cluster_gcs_block_dedup_get_pcm_x_failclosed_count(void);
 
 /*
  * PGRAC: spec-7.3 D5 — count of dedup accesses rejected because worker_id

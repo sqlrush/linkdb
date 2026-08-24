@@ -277,8 +277,8 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_PCM_X_BLOCKER_SET_BEGIN = 45,
 	PGRAC_IC_MSG_PCM_X_BLOCKER_SET_EDGE = 46,
 	PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT = 47,
-	/* PcmXPhasePayload [88,96) generation: zero = master->holder PROBE;
-	 * nonzero = generation-exact master->holder BLOCKER_SET ACK. */
+	/* Retired type-48 payload distinguished PROBE from BLOCKER_SET ACK by
+	 * its final generation word; the value remains reserved. */
 	PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK = 48,
 	PGRAC_IC_MSG_PCM_X_REVOKE = 49,
 	PGRAC_IC_MSG_PCM_X_IMAGE_READY = 50,
