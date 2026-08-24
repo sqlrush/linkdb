@@ -1,0 +1,164 @@
+{
+  "build_link": {
+    "command": "make -C src/backend -j4",
+    "exit_status": 0,
+    "forbidden_objects": [
+      "cluster_pcm_x_convert.o",
+      "cluster_pcm_x_image_fetch.o"
+    ],
+    "manifest_path": "src/backend/cluster/Makefile",
+    "required_objects": [
+      "cluster_pcm_lock.o",
+      "cluster_resource_x_identity.o",
+      "cluster_resource_x_retry.o"
+    ]
+  },
+  "gates": {
+    "L1": {
+      "forbidden_patterns": [
+        "\\bPcmX(?:Allocator|MasterTicket|LocalTag|LocalMembership)\\b",
+        "\\bPcmX(?:PeerFrontier|OutboundTargetFrontier|RuntimeSnapshot|LegacyL3TerminalProof)\\b",
+        "\\bcluster_pcm_x_(?:allocator|master|local|convert|retry_work|nested_wait)_"
+      ],
+      "status": "GREEN"
+    },
+    "L2": {
+      "forbidden_patterns": [
+        "\\bPCM_X_RUNTIME_",
+        "\\bPcmXRuntimeSnapshot\\b",
+        "\\bPcmXPeerFrontier\\b",
+        "\\bPcmXOutboundTargetFrontier\\b",
+        "\\bcluster_gcs_block_pcm_x_formation_tick\\b",
+        "\\bcluster_gcs_block_pcm_x_image_pump_tick\\b",
+        "\\bcluster_gcs_pcm_x_terminal_kick\\b",
+        "\\bcluster_gcs_pcm_x_blocker_probe_kick\\b",
+        "\\bcluster_pcm_x_retry_work_next\\b"
+      ],
+      "status": "GREEN"
+    },
+    "L3": {
+      "anchors": [
+        {
+          "blob_sha256": "469457ca2f55ef3e6f6108e5172e4245909d8d683a2e1382540884f3111631c5",
+          "path": "src/backend/cluster/cluster_pcm_x_convert.c",
+          "required_symbols": [
+            "pcm_x_legacy_l3_source_digest_locked",
+            "pcm_x_legacy_l3_proof_matches",
+            "pcm_x_legacy_l3_publish_exact"
+          ]
+        },
+        {
+          "blob_sha256": "83d1abbda115d6d892bb3d77a217ef53512430c2f043aa520645cffd5a81909b",
+          "path": "src/test/cluster_unit/test_cluster_pcm_x_convert.c",
+          "required_symbols": [
+            "test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pair",
+            "test_resource_x_activation_refuses_open_local_round",
+            "test_resource_x_activation_refuses_staged_local_frame"
+          ]
+        },
+        {
+          "blob_sha256": "e975084d7a9153d4efa5b2b8bfb2c5fa889db43b3a82c4d0a45d8aecce331103",
+          "path": "src/test/cluster_unit/test_cluster_r4_activation_fsm.c",
+          "required_symbols": [
+            "test_93dc_r11_round_reuses_exact_r4_four_node_carrier",
+            "test_93dca_member_accepts_exact_r11_sample_and_barrier_on_r4_source"
+          ]
+        }
+      ],
+      "checkpoint_commit": "cc1c5a554276542a05c15f5f1e0e0c7317fba66e",
+      "checkpoint_tree": "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5",
+      "status": "GREEN",
+      "test_commands": [
+        {
+          "command": "src/test/cluster_unit/test_cluster_pcm_x_convert",
+          "plan": 325,
+          "required_tests": [
+            "test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pair",
+            "test_resource_x_activation_refuses_open_local_round",
+            "test_resource_x_activation_refuses_staged_local_frame"
+          ]
+        },
+        {
+          "command": "src/test/cluster_unit/test_cluster_r4_activation_fsm",
+          "plan": 207,
+          "required_tests": [
+            "test_93dc_r11_round_reuses_exact_r4_four_node_carrier",
+            "test_93dca_member_accepts_exact_r11_sample_and_barrier_on_r4_source"
+          ]
+        }
+      ]
+    }
+  },
+  "layers": {
+    "wire_authority": {
+      "forbidden_patterns": [
+        "\\bPcmX(?:EnqueuePayload|PrehandleCancelPayload|AdmitAckPayload|PhasePayload)\\b",
+        "\\bPcmX(?:RevokePayload|GrantPayload|InstallReadyPayload|FinalAckPayload)\\b",
+        "\\bPcmX(?:BlockerSetHeaderPayload|BlockerChunkPayload|DrainPollPayload|RetirePayload)\\b"
+      ],
+      "positive_anchors": [
+        {
+          "path": "src/backend/cluster/cluster_gcs_block.c",
+          "symbol": "gcs_block_legacy_pcm_x_stale_ingress"
+        },
+        {
+          "path": "src/backend/cluster/cluster_gcs_block.c",
+          "symbol": "gcs_block_resource_x_type17_ingress"
+        },
+        {
+          "path": "src/backend/cluster/cluster_lms_outbound.c",
+          "symbol": "cluster_lms_outbound_resource_x_intent_pump"
+        }
+      ]
+    },
+    "worker_authority": {
+      "forbidden_patterns": [
+        "\\bcluster_gcs_block_pcm_x_formation_tick\\b",
+        "\\bcluster_gcs_block_pcm_x_image_pump_tick\\b",
+        "\\bcluster_gcs_pcm_x_terminal_kick\\b",
+        "\\bcluster_gcs_pcm_x_blocker_probe_kick\\b",
+        "\\bcluster_pcm_x_retry_work_next\\b"
+      ],
+      "positive_anchors": [
+        {
+          "path": "src/backend/cluster/cluster_lms.c",
+          "symbol": "cluster_lms_outbound_resource_x_intent_pump"
+        },
+        {
+          "path": "src/backend/cluster/cluster_lms_outbound.c",
+          "symbol": "cluster_pcm_lock_resource_x_outbound_intent_probe_exact"
+        }
+      ]
+    },
+    "writer_root": {
+      "forbidden_patterns": [
+        "\\bcluster_gcs_pcm_x_acquire_writer\\b",
+        "\\bgcs_block_pcm_x_acquire_writer_impl\\b",
+        "\\bPcmXTicket",
+        "\\bPcmXLocal(?:Handle|Holder|WriterClaim|Progress|Cutoff)\\b",
+        "\\bcluster_pcm_x_local_",
+        "\\bcluster_pcm_x_master_"
+      ],
+      "positive_anchors": [
+        {
+          "path": "src/backend/storage/buffer/bufmgr.c",
+          "symbol": "cluster_resource_x_writer_path_snapshot"
+        },
+        {
+          "path": "src/backend/storage/buffer/bufmgr.c",
+          "symbol": "cluster_gcs_resource_x_target_acquire_exact"
+        },
+        {
+          "path": "src/backend/cluster/cluster_semantic_activation.c",
+          "symbol": "cluster_resource_x_writer_path_snapshot"
+        }
+      ]
+    }
+  },
+  "schema_version": "R11SourceRemovalCensusV1",
+  "source_removed_subject": {
+    "commit": "cb7c7b585cb63ea4906d49fe01352b005a89b8e8",
+    "parent_commit": "cc1c5a554276542a05c15f5f1e0e0c7317fba66e",
+    "tree": "e80f7dc31d269b5927a36cf393d9b2cccf70c02e"
+  }
+}

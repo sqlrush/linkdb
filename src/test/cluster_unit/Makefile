@@ -1988,7 +1988,9 @@ check: all check_cluster_undo_segment_half_page_oversized \
 	check_resource_x_send_c1_unit \
 	check_r11_predecessor_product_manifest_unit \
 	check_r11_predecessor_product_manifest \
-	check_r11_legacy_source_removed
+	check_r11_legacy_source_removed \
+	check_r11_source_removal_census_unit \
+	check_r11_source_removal_census
 	@echo "# pgrac cluster unit tests"
 	@total=0; failed=0; \
 	for t in $(TESTS); do \
@@ -2041,6 +2043,16 @@ check_r11_legacy_source_removed:
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		$(top_srcdir)/src/test/cluster_unit/test_r11_legacy_source_removed.py
 
+check_r11_source_removal_census_unit:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/test/cluster_unit/test_r11_source_removal_census.py
+
+check_r11_source_removal_census:
+	PYTHONDONTWRITEBYTECODE=1 python3 \
+		$(top_srcdir)/src/tools/check_r11_source_removal_census.py \
+		--source-root "$(top_srcdir)" \
+		--manifest "$(top_srcdir)/src/test/cluster_unit/data/r11-source-removal-census-v1.json"
+
 
 # ----------
 # Standard PG targets
@@ -2063,6 +2075,9 @@ install installdirs uninstall installcheck:
 	check_resource_x_send_c1 check_resource_x_send_c1_unit \
 	check_r11_predecessor_product_manifest \
 	check_r11_predecessor_product_manifest_unit \
+	check_r11_legacy_source_removed \
+	check_r11_source_removal_census \
+	check_r11_source_removal_census_unit \
 	maintainer-clean install installdirs uninstall installcheck
 
 # Spec 8.4A U9: this deliberately oversized fixture must be rejected by the
