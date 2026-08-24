@@ -39,7 +39,8 @@
 #define PCM_X_INVALID_SLOT_INDEX ((Size) - 1)
 #define PCM_X_LOCK_PARTITIONS NUM_BUFFER_PARTITIONS
 #define PCM_X_LWLOCK_COUNT (1 + 2 * PCM_X_LOCK_PARTITIONS)
-#define PCM_X_HEADER_LOCK_PADDING 92
+#define PCM_X_HEADER_L3_ALIGN_PADDING 4
+#define PCM_X_HEADER_LOCK_PADDING 24
 /* Ticket ids share the low 63 bits of the zero-growth GrdEntry pending-X
  * cookie; the high bit is the queue-vs-legacy namespace discriminator. */
 #define PCM_X_MASTER_TICKET_ID_MAX UINT64CONST(0x7fffffffffffffff)
@@ -1508,6 +1509,30 @@ typedef struct PcmXOutboundTargetFrontier {
 	uint64 next_prehandle_sequence;
 } PcmXOutboundTargetFrontier;
 
+/*
+ * One immutable pre-removal L3 artifact, owned by the legacy PCM-X source.
+ *
+ * Oracle's published RAC material establishes the freeze/claim/barrier phase
+ * shape, not this byte representation.  This is a PGRAC adaptation kept in
+ * the existing header cache-line padding: it adds no region, wire field,
+ * capability, actor, or header-size delta.  The source publishes it once,
+ * only after R4 has closed source admission and every legacy object/intent is
+ * terminal.  R11 may exact-match it but may never replace it.
+ */
+#define PCM_X_LEGACY_L3_PROOF_EMPTY UINT32_C(0)
+#define PCM_X_LEGACY_L3_PROOF_PUBLISHED UINT32_C(0x4c335031) /* "L3P1" */
+typedef struct PcmXLegacyL3TerminalProof {
+	uint64 record_generation;
+	uint64 old_formation;
+	uint64 new_formation;
+	uint64 freeze_generation;
+	uint64 predecessor_digest;
+	uint64 source_digest;
+	uint32 dead_requester_bitmap;
+	uint32 state;
+	uint64 reserved;
+} PcmXLegacyL3TerminalProof;
+
 /* Bytes reserved for the "file:line" fail-closed provenance string. */
 #define PCM_X_FAIL_CLOSED_SITE_LEN 80
 
@@ -1524,6 +1549,8 @@ typedef struct PcmXShmemHeader {
 	/* Serializes a multi-tag local RETIRE watermark against every ordinary
 	 * local-domain mutator without adding a sixth pool or moving lock offsets. */
 	pg_atomic_uint32 local_retire_gate;
+	uint8 l3_align_padding[PCM_X_HEADER_L3_ALIGN_PADDING];
+	PcmXLegacyL3TerminalProof legacy_l3_terminal_proof;
 	uint8 lock_padding[PCM_X_HEADER_LOCK_PADDING];
 	LWLockPadded allocator_lock;
 	LWLockPadded master_locks[PCM_X_LOCK_PARTITIONS];
@@ -1576,6 +1603,8 @@ StaticAssertDecl(sizeof(PcmXStats) == 256, "PCM-X stats ABI");
 StaticAssertDecl(sizeof(PcmXStatsSnapshot) == 320, "PCM-X stats snapshot ABI");
 StaticAssertDecl(sizeof(PcmXPeerBinding) == 16, "PCM-X peer binding ABI");
 StaticAssertDecl(sizeof(PcmXOutboundTargetFrontier) == 32, "PCM-X outbound target frontier ABI");
+StaticAssertDecl(sizeof(PcmXLegacyL3TerminalProof) == 64,
+				 "PCM-X legacy L3 terminal proof layout");
 StaticAssertDecl(offsetof(PcmXOutboundTargetFrontier, mint_gate) == 0,
 				 "PCM-X outbound target short gate offset");
 StaticAssertDecl(offsetof(PcmXOutboundTargetFrontier, next_prehandle_sequence) == 24,
@@ -1584,6 +1613,8 @@ StaticAssertDecl(offsetof(PcmXShmemHeader, activation_retry_generation) == 668,
 				 "PCM-X activation retry marker offset");
 StaticAssertDecl(offsetof(PcmXShmemHeader, local_retire_gate) == 672,
 				 "PCM-X local retire gate offset");
+StaticAssertDecl(offsetof(PcmXShmemHeader, legacy_l3_terminal_proof) == 680,
+				 "PCM-X legacy L3 terminal proof padding offset");
 StaticAssertDecl(offsetof(PcmXShmemHeader, allocator_lock) == 768,
 				 "PCM-X allocator lock cache-line offset");
 StaticAssertDecl(offsetof(PcmXShmemHeader, master_locks) == 896, "PCM-X master lock array offset");

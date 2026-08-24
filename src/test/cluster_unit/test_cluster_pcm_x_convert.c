@@ -18790,8 +18790,10 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 	const ClusterSemanticActivationCallbackBundle *callbacks;
 	ClusterSemanticActivationRefusal refusal;
 	ClusterSemanticZeroProof proof;
+	PcmXSlotHeader *late_slot;
+	PcmXSlotRef late_ref;
 
-	reset_fake_shmem();
+	init_active_pcm_x(UINT64_C(77));
 	callbacks = cluster_pcm_x_resource_x_activation_callbacks();
 	UT_ASSERT_NOT_NULL(callbacks);
 	UT_ASSERT_NOT_NULL(callbacks->pre_prepare_readiness);
@@ -18811,7 +18813,6 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
 	UT_ASSERT_EQ(refusal.expected_generation, 7);
 
-	cluster_pcm_x_convert_shmem_init();
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
@@ -18833,6 +18834,17 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
 	UT_ASSERT_EQ(refusal.feature_bit, 0);
+	/* Exact predecessor bytes and live allocator emptiness are not L3.  The
+	 * closed legacy owner must first publish one immutable same-G/T terminal
+	 * artifact. */
+	memset(&proof, 0xff, sizeof(proof));
+	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(proof.record_generation, 0);
+	UT_ASSERT_EQ(proof.debt_count, 0);
+	UT_ASSERT_EQ(proof.sample_digest, 0);
+	UT_ASSERT_EQ(callbacks->close_source_admission(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);
@@ -18849,6 +18861,26 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 	}
 	UT_ASSERT_EQ(callbacks->prepare_target(7),
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+
+	/* The artifact is immutable and exact.  Neither a new predecessor round,
+	 * a different activation generation, nor a late legacy allocation may be
+	 * accepted under the published terminal identity. */
+	resource_x_cutover_proof_sequence++;
+	memset(&proof, 0xff, sizeof(proof));
+	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	resource_x_cutover_proof_sequence--;
+	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(8, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	late_ref.slot_index = 0;
+	late_ref.slot_generation = 0;
+	late_slot = (PcmXSlotHeader *)(uintptr_t)1;
+	UT_ASSERT_EQ(cluster_pcm_x_allocator_reserve(
+				 PCM_X_ALLOC_LOCAL_TAG, &late_ref, &late_slot),
+				 PCM_X_ALLOC_BAD_STATE);
+	UT_ASSERT_EQ(late_ref.slot_index, PCM_X_INVALID_SLOT_INDEX);
+	UT_ASSERT_EQ(late_ref.slot_generation, 0);
+	UT_ASSERT_NULL(late_slot);
 }
 
 UT_TEST(test_resource_x_activation_refuses_open_local_round)
@@ -18857,12 +18889,13 @@ UT_TEST(test_resource_x_activation_refuses_open_local_round)
 	ClusterSemanticZeroProof proof;
 	PcmXSlotRef tag_ref;
 
-	reset_fake_shmem();
-	cluster_pcm_x_convert_shmem_init();
+	init_active_pcm_x(UINT64_C(78));
 	resource_x_cutover_proofs_available = true;
 	callbacks = cluster_pcm_x_resource_x_activation_callbacks();
 	(void) reserve_slot(PCM_X_ALLOC_LOCAL_TAG, &tag_ref);
 
+	UT_ASSERT_EQ(callbacks->close_source_admission(11),
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(11, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
@@ -18880,16 +18913,17 @@ UT_TEST(test_resource_x_activation_refuses_staged_local_frame)
 	PcmXSlotRef tag_ref;
 	PcmXLocalTagSlot *tag;
 
-	reset_fake_shmem();
-	cluster_pcm_x_convert_shmem_init();
+	init_active_pcm_x(UINT64_C(79));
 	resource_x_cutover_proofs_available = true;
 	callbacks = cluster_pcm_x_resource_x_activation_callbacks();
 	tag = (PcmXLocalTagSlot *)reserve_slot(PCM_X_ALLOC_LOCAL_TAG, &tag_ref);
 	tag->reliable.pending_opcode = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
 
+	UT_ASSERT_EQ(callbacks->close_source_admission(13),
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_transport_zero(13, &proof),
-				 CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO);
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
 	tag->reliable.pending_opcode = 0;
 	UT_ASSERT_EQ(cluster_pcm_x_allocator_release_exact(
 				 PCM_X_ALLOC_LOCAL_TAG, tag_ref,

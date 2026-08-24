@@ -704,6 +704,17 @@ pcm_x_allocator_state_valid_locked(const PcmXAllocatorView *view)
 }
 
 
+/* The once-published L3 artifact is also the legacy allocator's terminal
+ * latch.  A post-publication reserve would make the immutable proof a lie. */
+static bool
+pcm_x_legacy_l3_terminal_published(const PcmXShmemHeader *header)
+{
+	return header != NULL
+		   && header->legacy_l3_terminal_proof.state
+			  == PCM_X_LEGACY_L3_PROOF_PUBLISHED;
+}
+
+
 /* Reserve from one fixed allocator while the caller owns allocator_lock. */
 static PcmXAllocatorResult
 pcm_x_allocator_reserve_locked(PcmXAllocatorKind kind, PcmXSlotRef *ref_out,
@@ -723,6 +734,8 @@ pcm_x_allocator_reserve_locked(PcmXAllocatorKind kind, PcmXSlotRef *ref_out,
 	*slot_out = NULL;
 	if (!pcm_x_allocator_state_valid_locked(&view))
 		return PCM_X_ALLOC_CORRUPT;
+	if (pcm_x_legacy_l3_terminal_published(header))
+		return PCM_X_ALLOC_BAD_STATE;
 
 	while (view.state->free_head != PCM_X_INVALID_SLOT_INDEX && scanned < view.capacity) {
 		PcmXSlotHeader *slot;
@@ -1753,6 +1766,10 @@ cluster_pcm_x_allocator_reserve(PcmXAllocatorKind kind, PcmXSlotRef *ref_out,
 	LWLockAcquire(&header->allocator_lock.lock, LW_EXCLUSIVE);
 	if (!pcm_x_allocator_state_valid_locked(&view)) {
 		result = PCM_X_ALLOC_CORRUPT;
+		goto done;
+	}
+	if (pcm_x_legacy_l3_terminal_published(header)) {
+		result = PCM_X_ALLOC_BAD_STATE;
 		goto done;
 	}
 	while (view.state->free_head != PCM_X_INVALID_SLOT_INDEX && scanned < view.capacity) {
@@ -26606,132 +26623,273 @@ static const ClusterShmemRegion pcm_x_convert_region = {
 	.reserved_flags = 0,
 };
 
-static bool
-pcm_x_resource_x_drain_snapshot(uint64 *logical_debt_out,
-								uint64 *transport_debt_out)
+static uint64
+pcm_x_legacy_l3_digest_add(uint64 digest, const void *value, Size value_size)
 {
-	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
-	PcmXAllocatorView ticket_view;
-	PcmXAllocatorView local_tag_view;
-	uint64 logical_debt;
-	uint64 local_tag_debt;
-	uint64 local_wait_debt;
-	uint64 transport_debt = 0;
-	bool allocator_lock_held;
+	const uint8 *bytes = (const uint8 *)value;
 	Size index;
 
-	if (header == NULL || logical_debt_out == NULL
-		|| transport_debt_out == NULL)
-		return false;
-	allocator_lock_held = LWLockHeldByMe(&header->allocator_lock.lock);
-	if (!allocator_lock_held)
-		LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
-
-	logical_debt = (uint64)header->allocator[PCM_X_ALLOC_MASTER_TICKET].used;
-	local_tag_debt = (uint64)header->allocator[PCM_X_ALLOC_LOCAL_TAG].used;
-	local_wait_debt = (uint64)header->allocator[PCM_X_ALLOC_LOCAL_WAIT].used;
-	if (!pcm_x_allocator_view(PCM_X_ALLOC_MASTER_TICKET, &ticket_view)
-		|| !pcm_x_allocator_view(PCM_X_ALLOC_LOCAL_TAG, &local_tag_view)) {
-		if (!allocator_lock_held)
-			LWLockRelease(&header->allocator_lock.lock);
-		return false;
+	for (index = 0; index < value_size; index++) {
+		digest ^= bytes[index];
+		digest *= UINT64_C(1099511628211);
 	}
-	if (UINT64_MAX - logical_debt < local_tag_debt) {
-		if (!allocator_lock_held)
-			LWLockRelease(&header->allocator_lock.lock);
-		return false;
-	}
-	logical_debt += local_tag_debt;
-	if (UINT64_MAX - logical_debt < local_wait_debt) {
-		if (!allocator_lock_held)
-			LWLockRelease(&header->allocator_lock.lock);
-		return false;
-	}
-	logical_debt += local_wait_debt;
-
-	for (index = 0; index < ticket_view.capacity; index++) {
-		PcmXMasterTicketSlot *ticket
-			= (PcmXMasterTicketSlot *)pcm_x_allocator_slot(&ticket_view, index);
-
-		if (ticket != NULL && ticket->reliable.pending_opcode != 0)
-			transport_debt++;
-	}
-	for (index = 0; index < local_tag_view.capacity; index++) {
-		PcmXLocalTagSlot *tag
-			= (PcmXLocalTagSlot *)pcm_x_allocator_slot(&local_tag_view, index);
-
-		if (tag == NULL)
-			continue;
-		if (tag->reliable.pending_opcode != 0)
-			transport_debt++;
-		if (tag->holder_reliable.pending_opcode != 0)
-			transport_debt++;
-		if (tag->blocker_snapshot_reliable.pending_opcode != 0)
-			transport_debt++;
-	}
-	if (!allocator_lock_held)
-		LWLockRelease(&header->allocator_lock.lock);
-	*logical_debt_out = logical_debt;
-	*transport_debt_out = transport_debt;
-	return true;
+	return digest;
 }
 
-static ClusterSemanticActivationResult
-pcm_x_resource_x_cutover_prerequisite_exact(
-	uint64 record_generation, bool transport_first,
-	ClusterSemanticZeroProof *proof)
+
+static bool
+pcm_x_resource_x_predecessor_exact(
+	uint64 record_generation, ResourceXReconfigToken *token_out,
+	uint64 *digest_out)
 {
-	const uint64 digest_offset = UINT64_C(1469598103934665603);
-	const uint64 digest_prime = UINT64_C(1099511628211);
 	ResourceXReconfigToken token;
 	ResourceXZeroResidualProof zero_proof;
 	ResourceXCleanCompletionProof clean_proof;
-	const uint8 *bytes;
-	uint64 digest = digest_offset;
-	uint64 logical_debt;
-	uint64 transport_debt;
-	Size index;
+	uint64 digest = UINT64_C(1469598103934665603);
+
+	if (token_out != NULL)
+		memset(token_out, 0, sizeof(*token_out));
+	if (digest_out != NULL)
+		*digest_out = 0;
+	if (record_generation == 0 || token_out == NULL || digest_out == NULL
+		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
+			&token, &zero_proof, &clean_proof)
+		|| token.old_formation == 0 || token.new_formation == 0
+		|| token.freeze_generation == 0
+		|| token.old_formation == token.new_formation || token.reserved != 0
+		|| memcmp(&token, &zero_proof.token, sizeof(token)) != 0
+		|| memcmp(&token, &clean_proof.token, sizeof(token)) != 0
+		|| zero_proof.proof_generation == 0
+		|| zero_proof.complete_wrap != 1 || zero_proof.zero_residual != 1
+		|| clean_proof.proof_generation == 0
+		|| clean_proof.logical_debt_zero != 1
+		|| clean_proof.transport_debt_zero != 1
+		|| clean_proof.transport_staged_count != 0
+		|| zero_proof.final_mutation_sequence == 0
+		|| zero_proof.final_mutation_sequence
+		   != clean_proof.final_mutation_sequence)
+		return false;
+
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &record_generation, sizeof(record_generation));
+	digest = pcm_x_legacy_l3_digest_add(digest, &token, sizeof(token));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &zero_proof, sizeof(zero_proof));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &clean_proof, sizeof(clean_proof));
+	if (digest == 0)
+		digest = UINT64_C(1469598103934665603);
+	*token_out = token;
+	*digest_out = digest;
+	return true;
+}
+
+
+/* Build the source-owner side of L3 while allocator_lock prevents every new
+ * legacy object publication.  A used slot is debt regardless of its present
+ * state: exact terminal objects must have crossed DETACH and been released by
+ * their owning lifecycle before this artifact can exist. */
+static ClusterSemanticActivationResult
+pcm_x_legacy_l3_source_digest_locked(PcmXShmemHeader *header,
+									 uint64 *digest_out)
+{
+	PcmXRuntimeSnapshot runtime;
+	uint64 digest = UINT64_C(1469598103934665603);
+	uint64 acquire_active;
+	uint64 depth;
+	uint64 master_session_incarnation;
+	uint32 retire_gate;
+	uint32 packed_runtime;
+	int index;
+
+	if (digest_out != NULL)
+		*digest_out = 0;
+	if (header == NULL || digest_out == NULL
+		|| !LWLockHeldByMe(&header->allocator_lock.lock))
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	runtime = cluster_pcm_x_runtime_snapshot();
+	if (runtime.state != PCM_X_RUNTIME_ACTIVE
+		|| runtime.gate_generation == 0
+		|| runtime.master_session_incarnation == 0
+		|| runtime.master_session_incarnation
+		   != header->master_session_incarnation)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+
+	for (index = 0; index < PCM_X_ALLOC_COUNT; index++) {
+		PcmXAllocatorView view;
+
+		if (!pcm_x_allocator_view((PcmXAllocatorKind)index, &view)
+			|| !pcm_x_allocator_state_valid_locked(&view))
+			return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+		if (view.state->used != 0)
+			return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+		digest = pcm_x_legacy_l3_digest_add(
+			digest, view.state, sizeof(*view.state));
+	}
+
+	retire_gate = pg_atomic_read_u32(&header->local_retire_gate);
+	acquire_active
+		= pg_atomic_read_u64(&header->acquire_observation.active_count);
+	depth = pg_atomic_read_u64(&header->stats.depth);
+	if (retire_gate != 0 || acquire_active != 0 || depth != 0
+		|| header->next_ticket_id == 0
+		|| header->fully_retired_ticket_id == UINT64_MAX
+		|| header->fully_retired_ticket_id + 1 != header->next_ticket_id)
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+
+	packed_runtime = pg_atomic_read_u32(&header->runtime_gate);
+	master_session_incarnation = header->master_session_incarnation;
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &packed_runtime, sizeof(packed_runtime));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &master_session_incarnation,
+		sizeof(master_session_incarnation));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &header->next_ticket_id, sizeof(header->next_ticket_id));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &header->next_image_id, sizeof(header->next_image_id));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &header->fully_retired_ticket_id,
+		sizeof(header->fully_retired_ticket_id));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &retire_gate, sizeof(retire_gate));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &acquire_active, sizeof(acquire_active));
+	digest = pcm_x_legacy_l3_digest_add(digest, &depth, sizeof(depth));
+
+	for (index = 0; index < PCM_X_PROTOCOL_NODE_LIMIT; index++) {
+		PcmXPeerFrontier *peer = &header->peer_frontiers[index];
+		PcmXOutboundTargetFrontier *outbound
+			= &header->outbound_targets[index];
+		uint32 mint_gate = pg_atomic_read_u32(&outbound->mint_gate);
+
+		if (peer->next_expected_prehandle_sequence == 0
+			|| peer->retired_prehandle_sequence
+			   >= peer->next_expected_prehandle_sequence
+			|| peer->local_retire_in_progress_ticket_id != 0)
+			return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+		if (mint_gate != 0)
+			return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+		if ((outbound->flags & ~PCM_X_OUTBOUND_TARGET_KNOWN_FLAGS) != 0)
+			return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+		digest = pcm_x_legacy_l3_digest_add(
+			digest, peer, sizeof(*peer));
+		digest = pcm_x_legacy_l3_digest_add(
+			digest, &mint_gate, sizeof(mint_gate));
+		digest = pcm_x_legacy_l3_digest_add(
+			digest, &outbound->flags, sizeof(outbound->flags));
+		digest = pcm_x_legacy_l3_digest_add(
+			digest, &outbound->cluster_epoch,
+			sizeof(outbound->cluster_epoch));
+		digest = pcm_x_legacy_l3_digest_add(
+			digest, &outbound->target_session_incarnation,
+			sizeof(outbound->target_session_incarnation));
+		digest = pcm_x_legacy_l3_digest_add(
+			digest, &outbound->next_prehandle_sequence,
+			sizeof(outbound->next_prehandle_sequence));
+	}
+
+	if (digest == 0)
+		digest = UINT64_C(1469598103934665603);
+	*digest_out = digest;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
+}
+
+
+static bool
+pcm_x_legacy_l3_proof_matches(
+	const PcmXLegacyL3TerminalProof *proof, uint64 record_generation,
+	const ResourceXReconfigToken *token, uint64 predecessor_digest,
+	uint64 source_digest)
+{
+	return proof != NULL && token != NULL
+		   && proof->state == PCM_X_LEGACY_L3_PROOF_PUBLISHED
+		   && proof->record_generation == record_generation
+		   && proof->old_formation == token->old_formation
+		   && proof->new_formation == token->new_formation
+		   && proof->freeze_generation == token->freeze_generation
+		   && proof->dead_requester_bitmap == token->dead_requester_bitmap
+		   && proof->predecessor_digest == predecessor_digest
+		   && proof->source_digest == source_digest
+		   && proof->reserved == 0;
+}
+
+
+static ClusterSemanticActivationResult
+pcm_x_legacy_l3_publish_exact(
+	uint64 record_generation, const ResourceXReconfigToken *token,
+	uint64 predecessor_digest)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	PcmXLegacyL3TerminalProof next;
+	ClusterSemanticActivationResult result;
+	uint64 source_digest;
+
+	if (header == NULL || token == NULL || predecessor_digest == 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	LWLockAcquire(&header->allocator_lock.lock, LW_EXCLUSIVE);
+	result = pcm_x_legacy_l3_source_digest_locked(header, &source_digest);
+	if (result != CLUSTER_SEMANTIC_ACTIVATION_OK)
+		goto done;
+	if (header->legacy_l3_terminal_proof.state
+		== PCM_X_LEGACY_L3_PROOF_EMPTY) {
+		memset(&next, 0, sizeof(next));
+		next.record_generation = record_generation;
+		next.old_formation = token->old_formation;
+		next.new_formation = token->new_formation;
+		next.freeze_generation = token->freeze_generation;
+		next.predecessor_digest = predecessor_digest;
+		next.source_digest = source_digest;
+		next.dead_requester_bitmap = token->dead_requester_bitmap;
+		next.state = PCM_X_LEGACY_L3_PROOF_PUBLISHED;
+		header->legacy_l3_terminal_proof = next;
+		pg_write_barrier();
+	} else if (!pcm_x_legacy_l3_proof_matches(
+				   &header->legacy_l3_terminal_proof,
+				   record_generation, token, predecessor_digest,
+				   source_digest)) {
+		result = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	}
+done:
+	LWLockRelease(&header->allocator_lock.lock);
+	return result;
+}
+
+
+static ClusterSemanticActivationResult
+pcm_x_resource_x_cutover_prerequisite_exact(
+	uint64 record_generation, ClusterSemanticZeroProof *proof)
+{
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	ResourceXReconfigToken token;
+	ClusterSemanticActivationResult result;
+	uint64 predecessor_digest;
+	uint64 source_digest;
+	uint64 digest = UINT64_C(1469598103934665603);
 
 	if (proof != NULL)
 		memset(proof, 0, sizeof(*proof));
-	if (record_generation == 0 || proof == NULL
-		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
-			&token, &zero_proof, &clean_proof)
-		|| !pcm_x_resource_x_drain_snapshot(
-			&logical_debt, &transport_debt))
+	if (header == NULL || proof == NULL
+		|| !pcm_x_resource_x_predecessor_exact(
+			record_generation, &token, &predecessor_digest))
 		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
-	if (transport_first && transport_debt != 0)
-		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
-	if (logical_debt != 0)
-		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
-	if (transport_debt != 0)
-		return CLUSTER_SEMANTIC_ACTIVATION_TRANSPORT_NONZERO;
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	result = pcm_x_legacy_l3_source_digest_locked(header, &source_digest);
+	if (result == CLUSTER_SEMANTIC_ACTIVATION_OK
+		&& !pcm_x_legacy_l3_proof_matches(
+			&header->legacy_l3_terminal_proof, record_generation,
+			&token, predecessor_digest, source_digest))
+		result = CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	LWLockRelease(&header->allocator_lock.lock);
+	if (result != CLUSTER_SEMANTIC_ACTIVATION_OK)
+		return result;
 
-	/* Bind the activation generation to the exact predecessor-owned bytes.
-	 * The digest is comparison evidence only; the R8/R10 accessors above are
-	 * the authority and revalidate every live field on every callback. */
-	bytes = (const uint8 *)&record_generation;
-	for (index = 0; index < sizeof(record_generation); index++) {
-		digest ^= bytes[index];
-		digest *= digest_prime;
-	}
-	bytes = (const uint8 *)&token;
-	for (index = 0; index < sizeof(token); index++) {
-		digest ^= bytes[index];
-		digest *= digest_prime;
-	}
-	bytes = (const uint8 *)&zero_proof;
-	for (index = 0; index < sizeof(zero_proof); index++) {
-		digest ^= bytes[index];
-		digest *= digest_prime;
-	}
-	bytes = (const uint8 *)&clean_proof;
-	for (index = 0; index < sizeof(clean_proof); index++) {
-		digest ^= bytes[index];
-		digest *= digest_prime;
-	}
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &predecessor_digest, sizeof(predecessor_digest));
+	digest = pcm_x_legacy_l3_digest_add(
+		digest, &source_digest, sizeof(source_digest));
 	if (digest == 0)
-		digest = digest_offset;
+		digest = UINT64_C(1469598103934665603);
 	proof->record_generation = record_generation;
 	proof->debt_count = 0;
 	proof->sample_digest = digest;
@@ -26742,11 +26900,15 @@ static ClusterSemanticActivationResult
 pcm_x_resource_x_readiness(uint64 expected_generation,
 							 ClusterSemanticActivationRefusal *refusal)
 {
-	ClusterSemanticZeroProof proof;
-	ClusterSemanticActivationResult result;
+	ResourceXReconfigToken token;
+	uint64 predecessor_digest;
+	ClusterSemanticActivationResult result
+		= ClusterPcmXConvertShmem != NULL
+				  && pcm_x_resource_x_predecessor_exact(
+					  expected_generation, &token, &predecessor_digest)
+			  ? CLUSTER_SEMANTIC_ACTIVATION_OK
+			  : CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 
-	result = pcm_x_resource_x_cutover_prerequisite_exact(
-		expected_generation, false, &proof);
 	if (refusal != NULL) {
 		refusal->result = result;
 		refusal->feature_bit
@@ -26762,16 +26924,27 @@ static ClusterSemanticActivationResult
 pcm_x_resource_x_logical_zero(uint64 generation,
 							ClusterSemanticZeroProof *proof)
 {
-	return pcm_x_resource_x_cutover_prerequisite_exact(
-		generation, false, proof);
+	return pcm_x_resource_x_cutover_prerequisite_exact(generation, proof);
 }
 
 static ClusterSemanticActivationResult
 pcm_x_resource_x_transport_zero(uint64 generation,
 							  ClusterSemanticZeroProof *proof)
 {
-	return pcm_x_resource_x_cutover_prerequisite_exact(
-		generation, true, proof);
+	return pcm_x_resource_x_cutover_prerequisite_exact(generation, proof);
+}
+
+static ClusterSemanticActivationResult
+pcm_x_resource_x_close_and_publish(uint64 generation)
+{
+	ResourceXReconfigToken token;
+	uint64 predecessor_digest;
+
+	if (!pcm_x_resource_x_predecessor_exact(
+			generation, &token, &predecessor_digest))
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	return pcm_x_legacy_l3_publish_exact(
+		generation, &token, predecessor_digest);
 }
 
 static ClusterSemanticActivationResult
@@ -26779,13 +26952,12 @@ pcm_x_resource_x_closed_zero(uint64 generation)
 {
 	ClusterSemanticZeroProof proof;
 
-	return pcm_x_resource_x_cutover_prerequisite_exact(
-		generation, false, &proof);
+	return pcm_x_resource_x_cutover_prerequisite_exact(generation, &proof);
 }
 
 static const ClusterSemanticActivationCallbackBundle pcm_x_resource_x_callbacks = {
 	.pre_prepare_readiness = pcm_x_resource_x_readiness,
-	.close_source_admission = pcm_x_resource_x_closed_zero,
+	.close_source_admission = pcm_x_resource_x_close_and_publish,
 	.source_logical_debt_zero = pcm_x_resource_x_logical_zero,
 	.source_transport_zero = pcm_x_resource_x_transport_zero,
 	.prepare_target = pcm_x_resource_x_closed_zero,
