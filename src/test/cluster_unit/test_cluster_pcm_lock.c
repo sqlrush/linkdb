@@ -1465,6 +1465,41 @@ UT_TEST(test_resource_x_executor_admission_is_formation_exact_and_balanced)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_activation_inflight_count(), 0);
 }
 
+UT_TEST(test_resource_x_native_gate_snapshot_and_exact_fail_closed)
+{
+	ResourceXGateSnapshot snapshot;
+	ResourceXGateSnapshot stale;
+
+	reset_fake_pcm_runtime(4);
+	memset(&snapshot, 0xA5, sizeof(snapshot));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_gate_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_GATE_OPEN);
+	UT_ASSERT_EQ(snapshot.formation, UINT64_C(0));
+	UT_ASSERT_EQ(snapshot.freeze_generation, UINT64_C(0));
+
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_gate_snapshot(&snapshot));
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_GATE_OPEN);
+	UT_ASSERT_EQ(snapshot.formation, UINT64_C(17));
+	UT_ASSERT_EQ(snapshot.freeze_generation, UINT64_C(0));
+
+	stale = snapshot;
+	stale.formation++;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_fail_closed_exact(&stale),
+				 RESOURCE_X_APPLY_STALE);
+	UT_ASSERT(cluster_pcm_lock_resource_x_gate_open_exact(17));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_fail_closed_exact(&snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(!cluster_pcm_lock_resource_x_gate_open_exact(17));
+	UT_ASSERT(cluster_pcm_lock_resource_x_gate_snapshot(&stale));
+	UT_ASSERT_EQ(stale.phase, RESOURCE_X_GATE_RECOVERY_BLOCKED);
+	UT_ASSERT_EQ(stale.formation, snapshot.formation);
+	UT_ASSERT_EQ(stale.freeze_generation, snapshot.freeze_generation);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_fail_closed_exact(&snapshot),
+				 RESOURCE_X_APPLY_DUPLICATE);
+}
+
 UT_TEST(test_resource_x_reconfig_freeze_closes_activation_drains_and_thaws_empty)
 {
 	BufferTag tag = make_tag(68);
@@ -7324,7 +7359,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(127);
+	UT_PLAN(128);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -7356,6 +7391,7 @@ main(void)
 	UT_RUN(test_resource_x_retired_floor_rejects_late_generation_without_touching_successor);
 	UT_RUN(test_resource_x_probe_t3_wait_window_observes_retired_duplicate);
 	UT_RUN(test_resource_x_executor_admission_is_formation_exact_and_balanced);
+	UT_RUN(test_resource_x_native_gate_snapshot_and_exact_fail_closed);
 	UT_RUN(test_resource_x_reconfig_freeze_closes_activation_drains_and_thaws_empty);
 	UT_RUN(test_resource_x_reconfig_pending_freeze_binds_only_published_formation);
 	UT_RUN(test_resource_x_reconfig_nested_and_generation_exhaustion_fail_closed);

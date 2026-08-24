@@ -150,6 +150,20 @@ StaticAssertDecl(sizeof(ResourceXAcquisitionRef) == 40,
 #define RESOURCE_X_GATE_FROZEN UINT32_C(1)
 #define RESOURCE_X_GATE_RECOVERY_BLOCKED UINT32_C(2)
 
+/* Read-only projection of the native Resource-X admission gate.  This is
+ * the source-removed replacement for sampling the legacy PCM-X runtime: it
+ * carries no ticket/session authority and is valid only as one exact atomic
+ * gate observation. */
+typedef struct ResourceXGateSnapshot {
+	uint64 formation;
+	uint64 freeze_generation;
+	uint32 phase;
+	uint32 reserved;
+} ResourceXGateSnapshot;
+
+StaticAssertDecl(sizeof(ResourceXGateSnapshot) == 24,
+				 "ResourceXGateSnapshot layout must remain 24 bytes");
+
 typedef enum ResourceXApplyResult {
 	RESOURCE_X_APPLY_APPLIED = 0,
 	RESOURCE_X_APPLY_DUPLICATE,
@@ -1072,6 +1086,11 @@ cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
 	uint16 payload_capacity, uint32 *examined_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
+extern bool cluster_pcm_lock_resource_x_gate_snapshot(
+	ResourceXGateSnapshot *snapshot_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_gate_fail_closed_exact(
+	const ResourceXGateSnapshot *expected);
 extern bool cluster_pcm_lock_resource_x_gate_open_exact(uint64 formation);
 extern bool cluster_pcm_lock_resource_x_executor_enter(
 	const ResourceXAcquisitionRef *ref, ResourceXActivationGateToken *out_gate);

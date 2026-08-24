@@ -3763,22 +3763,22 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 	static const char *const target_contract[] = {
 		"entry->writer_path = RESOURCE_X_WRITER_TARGET",
 		"cluster_gcs_resource_x_target_acquire_exact(",
+		"cluster_pcm_lock_resource_x_gate_snapshot(&gate)",
 		"cluster_bufmgr_pcm_own_snapshot(buf, &granted)",
 		"granted.writer_activation_token != 0",
 		"granted.resource_x_activation_generation != 0",
-		"cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(",
-		"entry->authority.target.ref = terminal_ref",
-		"entry->authority.target.r4_record_generation = r4_generation",
-		"entry->authority.target.buffer_ownership_generation = granted.generation",
+		"cluster_gcs_resource_x_target_context_recheck_exact(&context)",
+		"entry->authority.target = context",
 		"entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING"
 	};
 	static const char *const activate_contract[] = {
 		"entry->writer_path == RESOURCE_X_WRITER_TARGET",
 		"cluster_resource_x_writer_path_snapshot(&current_r4_generation)",
+		"cluster_pcm_lock_resource_x_gate_snapshot(&gate)",
 		"cluster_bufmgr_pcm_own_snapshot(buf, &live)",
 		"live.writer_activation_token != 0",
 		"live.resource_x_activation_generation != 0",
-		"cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(",
+		"cluster_gcs_resource_x_target_context_recheck_exact(",
 		"entry->phase = PCM_X_WRITER_LEDGER_ACTIVE"
 	};
 	static const char *const cleanup_forbidden[] = {

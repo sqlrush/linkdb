@@ -1126,6 +1126,79 @@ cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation)
 }
 
 bool
+cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *snapshot_out)
+{
+	ResourceXGateSnapshot snapshot;
+	uint32 phase_after;
+	int attempt;
+
+	if (snapshot_out == NULL)
+		return false;
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	if (ClusterPcm == NULL)
+		return false;
+
+	for (attempt = 0; attempt < 8; attempt++) {
+		memset(&snapshot, 0, sizeof(snapshot));
+		snapshot.phase
+			= pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+		pg_read_barrier();
+		snapshot.formation
+			= pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation);
+		snapshot.freeze_generation
+			= pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation);
+		pg_read_barrier();
+		phase_after
+			= pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+		if (snapshot.phase != phase_after)
+			continue;
+		*snapshot_out = snapshot;
+		return snapshot.formation != 0
+			&& snapshot.formation != UINT64_MAX
+			&& snapshot.freeze_generation != UINT64_MAX
+			&& (snapshot.phase == RESOURCE_X_GATE_OPEN
+				|| snapshot.phase == RESOURCE_X_GATE_FROZEN
+				|| snapshot.phase == RESOURCE_X_GATE_RECOVERY_BLOCKED);
+	}
+	return false;
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_gate_fail_closed_exact(
+	const ResourceXGateSnapshot *expected)
+{
+	uint32 phase;
+
+	if (ClusterPcm == NULL || expected == NULL
+		|| expected->reserved != 0
+		|| expected->formation == 0
+		|| expected->formation == UINT64_MAX
+		|| expected->freeze_generation == UINT64_MAX
+		|| expected->phase != RESOURCE_X_GATE_OPEN)
+		return RESOURCE_X_APPLY_INVALID;
+	if (pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation)
+			!= expected->formation
+		|| pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation)
+			!= expected->freeze_generation)
+		return RESOURCE_X_APPLY_STALE;
+
+	phase = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+	for (;;) {
+		if (phase == RESOURCE_X_GATE_RECOVERY_BLOCKED)
+			return RESOURCE_X_APPLY_DUPLICATE;
+		if (phase != RESOURCE_X_GATE_OPEN)
+			return RESOURCE_X_APPLY_STALE;
+		if (pg_atomic_compare_exchange_u32(
+				&ClusterPcm->resource_x_gate_phase, &phase,
+				RESOURCE_X_GATE_RECOVERY_BLOCKED)) {
+			pg_atomic_fetch_add_u64(
+				&ClusterPcm->resource_x_reconfig_blocked_count, 1);
+			return RESOURCE_X_APPLY_APPLIED;
+		}
+	}
+}
+
+bool
 cluster_pcm_lock_resource_x_gate_open_exact(uint64 formation)
 {
 	return formation != 0 && formation != UINT64_MAX

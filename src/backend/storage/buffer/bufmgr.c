@@ -3131,7 +3131,7 @@ cluster_bufmgr_pcm_x_writer_entry_exact(const ClusterPcmXWriterLedgerEntry *entr
 
 static void
 cluster_bufmgr_pcm_x_writer_report_failure(PcmXQueueResult result, BufferDesc *buf,
-										   const char *operation)
+											const char *operation)
 {
 	BufferTag	guard_tag;
 	int			guard_result = 0;
@@ -3157,6 +3157,42 @@ cluster_bufmgr_pcm_x_writer_report_failure(PcmXQueueResult result, BufferDesc *b
 			 errdetail("operation=%s buffer=%d result=%d fail_line=%d%s", operation,
 					   buf != NULL ? buf->buf_id : -1, (int)result,
 					   cluster_gcs_pcm_x_requester_last_fail_line(), guard_detail)));
+}
+
+static void
+cluster_bufmgr_resource_x_writer_report_failure(ResourceXApplyResult result,
+											 BufferDesc *buf,
+											 const char *operation)
+{
+	if (result == RESOURCE_X_APPLY_BAD_STATE
+		|| result == RESOURCE_X_APPLY_NOT_FOUND)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("Resource-X writer operation is not ready"),
+				 errdetail("operation=%s buffer=%d result=%d", operation,
+						   buf != NULL ? buf->buf_id : -1, (int)result)));
+
+	ereport(ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("Resource-X writer operation failed"),
+			 errdetail("operation=%s buffer=%d result=%d", operation,
+					   buf != NULL ? buf->buf_id : -1, (int)result)));
+}
+
+static void
+cluster_bufmgr_resource_x_fail_closed_exact(
+	const ResourceXGateSnapshot *expected)
+{
+	ResourceXApplyResult result;
+
+	if (expected == NULL || expected->phase != RESOURCE_X_GATE_OPEN)
+		return;
+	result = cluster_pcm_lock_resource_x_gate_fail_closed_exact(expected);
+	if (result != RESOURCE_X_APPLY_APPLIED
+		&& result != RESOURCE_X_APPLY_DUPLICATE
+		&& result != RESOURCE_X_APPLY_STALE)
+		elog(LOG, "could not close exact Resource-X gate: result=%d",
+			 (int)result);
 }
 
 static void
@@ -3449,9 +3485,10 @@ cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, PcmLockMode mode,
 	ClusterPcmXWriterLedgerEntry *entry;
 	ClusterPcmOwnSnapshot granted;
 	ClusterPcmOwnResult own_result;
-	PcmXQueueResult result;
-	PcmXRuntimeSnapshot runtime;
+	ResourceXApplyResult result;
 	ResourceXAcquisitionRef terminal_ref;
+	ResourceXGateSnapshot gate;
+	ResourceXWriterUseContext context;
 	ResourceXWriterPath current_path;
 	uint64 current_r4_generation = 0;
 	LWLock *content_lock;
@@ -3490,33 +3527,40 @@ cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, PcmLockMode mode,
 	entry->activation_fence_armed = false;
 	MemSet(&entry->authority.target, 0, sizeof(entry->authority.target));
 	MemSet(&terminal_ref, 0, sizeof(terminal_ref));
+	MemSet(&gate, 0, sizeof(gate));
+	MemSet(&context, 0, sizeof(context));
 
 	result = cluster_gcs_resource_x_target_acquire_exact(
 		buf, r4_generation, &terminal_ref);
-	if (result != PCM_X_QUEUE_OK) {
+	if (result != RESOURCE_X_APPLY_APPLIED
+		&& result != RESOURCE_X_APPLY_DUPLICATE) {
 		cluster_bufmgr_pcm_x_writer_clear(entry);
-		if (result == PCM_X_QUEUE_BARRIER_CLOSED
+		(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
+		if (gate.phase != RESOURCE_X_GATE_OPEN
 			&& pcm_barrier_refused != NULL) {
 			*pcm_barrier_refused = true;
 			cluster_pcm_x_stats_note_barrier_unwind();
 			return NULL;
 		}
-		cluster_bufmgr_pcm_x_writer_report_failure(
+		cluster_bufmgr_resource_x_writer_report_failure(
 			result, buf, "Resource-X target acquire");
 	}
 
+	MemSet(&granted, 0, sizeof(granted));
+	(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &granted);
-	runtime = cluster_pcm_x_runtime_snapshot();
 	current_path = cluster_resource_x_writer_path_snapshot(
 		&current_r4_generation);
+	context.ref = terminal_ref;
+	context.r4_record_generation = r4_generation;
+	context.buffer_ownership_generation = granted.generation;
+	context.writer_activation_token = 0;
+	context.resource_x_activation_generation = 0;
 	if (own_result != CLUSTER_PCM_OWN_OK
 		|| current_path != RESOURCE_X_WRITER_TARGET
 		|| current_r4_generation != r4_generation
-		|| runtime.state != PCM_X_RUNTIME_ACTIVE
-		|| runtime.gate_generation == 0
-		|| runtime.gate_generation != terminal_ref.formation
-		|| runtime.master_session_incarnation == 0
-		|| runtime.master_session_incarnation == UINT64_MAX
+		|| gate.phase != RESOURCE_X_GATE_OPEN
+		|| gate.formation != terminal_ref.formation
 		|| !BufferTagsEqual(&granted.tag, &buf->tag)
 		|| granted.pcm_state != (uint8)PCM_STATE_X
 		|| granted.flags != 0
@@ -3524,20 +3568,15 @@ cluster_bufmgr_pcm_x_writer_prepare_target(BufferDesc *buf, PcmLockMode mode,
 		|| granted.generation == UINT64_MAX
 		|| granted.writer_activation_token != 0
 		|| granted.resource_x_activation_generation != 0
-		|| !cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
-			&terminal_ref, runtime.master_session_incarnation,
-			r4_generation, granted.generation)) {
+		|| !cluster_gcs_resource_x_target_context_recheck_exact(&context)) {
 		cluster_bufmgr_pcm_x_writer_clear(entry);
-		cluster_pcm_x_runtime_fail_closed();
-		cluster_bufmgr_pcm_x_writer_report_failure(
-			PCM_X_QUEUE_STALE, buf, "Resource-X target post-T3 snapshot");
+		cluster_bufmgr_resource_x_fail_closed_exact(&gate);
+		cluster_bufmgr_resource_x_writer_report_failure(
+			RESOURCE_X_APPLY_STALE, buf,
+			"Resource-X target post-T3 snapshot");
 	}
 
-	entry->authority.target.ref = terminal_ref;
-	entry->authority.target.r4_record_generation = r4_generation;
-	entry->authority.target.buffer_ownership_generation = granted.generation;
-	entry->authority.target.writer_activation_token = 0;
-	entry->authority.target.resource_x_activation_generation = 0;
+	entry->authority.target = context;
 	entry->granted = granted;
 	entry->grant_snapshot_exact = true;
 	entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING;
@@ -3549,7 +3588,7 @@ cluster_bufmgr_pcm_x_writer_activate(ClusterPcmXWriterLedgerEntry *entry)
 {
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult own_result;
-	PcmXRuntimeSnapshot runtime;
+	ResourceXGateSnapshot gate;
 	ResourceXWriterPath current_path;
 	uint64 current_r4_generation = 0;
 	BufferDesc *buf;
@@ -3562,18 +3601,17 @@ cluster_bufmgr_pcm_x_writer_activate(ClusterPcmXWriterLedgerEntry *entry)
 		|| !LWLockHeldByMe(entry->content_lock))
 		cluster_bufmgr_pcm_x_writer_report_failure(PCM_X_QUEUE_BAD_STATE, buf, "activate phase");
 	if (entry->writer_path == RESOURCE_X_WRITER_TARGET) {
+		MemSet(&gate, 0, sizeof(gate));
 		current_path = cluster_resource_x_writer_path_snapshot(&current_r4_generation);
-		runtime = cluster_pcm_x_runtime_snapshot();
+		(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
 		own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 		if (own_result != CLUSTER_PCM_OWN_OK
 			|| current_path != RESOURCE_X_WRITER_TARGET
 			|| current_r4_generation
 				!= entry->authority.target.r4_record_generation
-			|| runtime.state != PCM_X_RUNTIME_ACTIVE
-			|| runtime.gate_generation
+			|| gate.phase != RESOURCE_X_GATE_OPEN
+			|| gate.formation
 				!= entry->authority.target.ref.formation
-			|| runtime.master_session_incarnation == 0
-			|| runtime.master_session_incarnation == UINT64_MAX
 			|| !BufferTagsEqual(&live.tag, &buf->tag)
 			|| live.generation
 				!= entry->authority.target.buffer_ownership_generation
@@ -3581,14 +3619,11 @@ cluster_bufmgr_pcm_x_writer_activate(ClusterPcmXWriterLedgerEntry *entry)
 			|| live.flags != 0
 			|| live.writer_activation_token != 0
 			|| live.resource_x_activation_generation != 0
-			|| !cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
-				&entry->authority.target.ref,
-				runtime.master_session_incarnation,
-				entry->authority.target.r4_record_generation,
-				entry->authority.target.buffer_ownership_generation)) {
-			cluster_pcm_x_runtime_fail_closed();
-			cluster_bufmgr_pcm_x_writer_report_failure(
-				PCM_X_QUEUE_STALE, buf, "Resource-X target activate");
+			|| !cluster_gcs_resource_x_target_context_recheck_exact(
+				&entry->authority.target)) {
+			cluster_bufmgr_resource_x_fail_closed_exact(&gate);
+			cluster_bufmgr_resource_x_writer_report_failure(
+				RESOURCE_X_APPLY_STALE, buf, "Resource-X target activate");
 		}
 		entry->phase = PCM_X_WRITER_LEDGER_ACTIVE;
 		return;

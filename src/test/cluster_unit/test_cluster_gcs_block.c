@@ -118,6 +118,15 @@ BufferDescPadded *BufferDescriptors = observation_buffer_descriptors;
 static PROC_HDR observation_proc_global;
 PROC_HDR *ProcGlobal = &observation_proc_global;
 
+bool
+cluster_pcm_lock_resource_x_cutover_proofs_exact(
+	ResourceXReconfigToken *token_out pg_attribute_unused(),
+	ResourceXZeroResidualProof *zero_proof_out pg_attribute_unused(),
+	ResourceXCleanCompletionProof *clean_proof_out pg_attribute_unused())
+{
+	return false;
+}
+
 void
 pg_re_throw(void)
 {
@@ -6334,11 +6343,15 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 	char *source = read_gcs_block_source();
 	const char *driver;
 	const char *driver_end;
+	const char *gate_helper;
+	const char *gate_helper_end;
 	const char *terminal;
 	const char *terminal_end;
 	static const char *const required[] = {
 		"cluster_semantic_activation_enter(",
 		"CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1",
+		"gcs_block_resource_x_gate_session_snapshot(",
+		"gcs_block_resource_x_gate_session_recheck(",
 		"cluster_bufmgr_pcm_own_snapshot(",
 		"writer_activation_token == 0",
 		"resource_x_activation_generation == 0",
@@ -6357,7 +6370,9 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 		"cluster_pcm_x_local_resource_x_attempt_exact(",
 		"cluster_pcm_x_local_resource_x_grant_publish_exact(",
 		"cluster_pcm_x_local_writer_claim_exact(",
-		"cluster_pcm_x_master_"
+		"cluster_pcm_x_master_",
+		"cluster_pcm_x_runtime_snapshot(",
+		"cluster_pcm_x_holder_retry_delay_ms("
 	};
 	size_t i;
 
@@ -6382,6 +6397,25 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 
 			UT_ASSERT(site == NULL || site >= driver_end);
 		}
+	}
+	gate_helper = strstr(source,
+		"\ngcs_block_resource_x_gate_session_snapshot(");
+	gate_helper_end = gate_helper != NULL
+		? strstr(gate_helper, "\n}\n") : NULL;
+	UT_ASSERT_NOT_NULL(gate_helper);
+	UT_ASSERT_NOT_NULL(gate_helper_end);
+	if (gate_helper != NULL && gate_helper_end != NULL) {
+		const char *gate_snapshot = strstr(gate_helper,
+			"cluster_pcm_lock_resource_x_gate_snapshot(");
+		const char *session_snapshot = strstr(gate_helper,
+			"gcs_block_pcm_x_authenticated_session(");
+
+		UT_ASSERT_NOT_NULL(gate_snapshot);
+		UT_ASSERT_NOT_NULL(session_snapshot);
+		if (gate_snapshot != NULL)
+			UT_ASSERT(gate_snapshot < gate_helper_end);
+		if (session_snapshot != NULL)
+			UT_ASSERT(session_snapshot < gate_helper_end);
 	}
 
 	/* The shared R9 executor may retain the SOURCE adapter temporarily, but
