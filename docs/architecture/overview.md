@@ -27,6 +27,9 @@ For a focused explanation of how one immutable request generation keeps
 duplicates, retries, reconnects, successors, local buffer activation, and
 formation recovery attached to the same acquisition, see
 [Resource-X 请求代际图解](resource-x-request-generation/README.md).
+For the cluster-wide state model that carries an already-open capability set
+into the next activation round, see
+[连续语义激活：从 R4 OPEN 到 Resource-X](successive-semantic-activation/README.md).
 For the public safety contract around ITL pressure, stale terminal-state
 observations, and one bounded current-page allocation retry, see
 [ITL 终态复核与有界重试](itl-bounded-revalidation/README.md).
