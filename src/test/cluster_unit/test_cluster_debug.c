@@ -1002,21 +1002,6 @@ cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
 		values[i] = UINT64CONST(301) + (uint64)i;
 }
 
-bool
-cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *snapshot_out)
-{
-	if (snapshot_out != NULL)
-		memset(snapshot_out, 0, sizeof(*snapshot_out));
-	return false;
-}
-
-void
-cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *snapshot_out)
-{
-	if (snapshot_out != NULL)
-		memset(snapshot_out, 0, sizeof(*snapshot_out));
-}
-
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
 uint64
 cluster_pcm_get_trans_n_to_s_count(void)
@@ -4604,6 +4589,67 @@ captured_dump_value(const char *category, const char *key)
 	return NULL;
 }
 
+UT_TEST(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys)
+{
+	static const char *const pcm_keys[] = {
+		"pcm_x_runtime_state",
+		"pcm_x_runtime_generation",
+		"pcm_x_runtime_fail_closed_site",
+		"pcm_x_queue_enqueue_count",
+		"pcm_x_queue_admit_count",
+		"pcm_x_queue_confirm_count",
+		"pcm_x_queue_promotion_count",
+		"pcm_x_queue_transfer_count",
+		"pcm_x_queue_complete_count",
+		"pcm_x_queue_cancel_count",
+		"pcm_x_queue_revoke_count",
+		"pcm_x_queue_coalesced_count",
+		"pcm_x_queue_wait_count",
+		"pcm_x_queue_full_count",
+		"pcm_x_queue_stale_count",
+		"pcm_x_queue_miss_count",
+		"pcm_x_queue_recovery_blocked_count",
+		"pcm_x_queue_activating_reset_count",
+		"pcm_x_queue_depth",
+		"pcm_x_queue_depth_high_water",
+		"pcm_x_queue_active_tags",
+		"pcm_x_queue_live_tickets",
+		"pcm_x_queue_live_slots",
+		"pcm_x_local_retire_gate",
+		"pcm_x_local_retire_marker_count",
+		"pcm_x_local_retire_marker_ticket_id",
+		"pcm_x_own_begin_count",
+		"pcm_x_own_commit_count",
+		"pcm_x_own_abort_count",
+		"pcm_x_own_busy_count",
+		"pcm_x_own_corrupt_count",
+	};
+	static const char *const gcs_keys[] = {
+		"dedup_pcm_x_stage_count",
+		"dedup_pcm_x_replay_count",
+		"dedup_pcm_x_release_count",
+		"dedup_pcm_x_failclosed_count",
+	};
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int i;
+
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
+	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	memset(captured_dump_values, 0, sizeof(captured_dump_values));
+	captured_dump_row_count = 0;
+	captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+
+	for (i = 0; i < (int)lengthof(pcm_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_keys[i]), 0);
+	for (i = 0; i < (int)lengthof(gcs_keys); i++)
+		UT_ASSERT_EQ(captured_dump_count("gcs", gcs_keys[i]), 0);
+}
+
 /* ============================================================
  * Iterator API on cluster_inject (added in spec-0.29 §1.4).
  * ============================================================ */
@@ -5180,8 +5226,9 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_debug_dump_srf_linkable);
+	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);
 	UT_RUN(test_debug_inject_get_state_at_null_outs);
