@@ -1002,6 +1002,21 @@ cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
 		values[i] = UINT64CONST(301) + (uint64)i;
 }
 
+bool
+cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *snapshot_out)
+{
+	if (snapshot_out != NULL)
+		memset(snapshot_out, 0, sizeof(*snapshot_out));
+	return false;
+}
+
+void
+cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *snapshot_out)
+{
+	if (snapshot_out != NULL)
+		memset(snapshot_out, 0, sizeof(*snapshot_out));
+}
+
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
 uint64
 cluster_pcm_get_trans_n_to_s_count(void)

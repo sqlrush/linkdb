@@ -7118,10 +7118,16 @@ static void
 gcs_block_resource_x_fail_closed_current(void)
 {
 	ResourceXGateSnapshot gate;
+	ResourceXApplyResult result;
 
-	if (cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-		&& gate.phase == RESOURCE_X_GATE_OPEN)
-		(void)cluster_pcm_lock_resource_x_gate_fail_closed_exact(&gate);
+	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+		|| gate.phase != RESOURCE_X_GATE_OPEN)
+		return;
+	result = cluster_pcm_lock_resource_x_gate_fail_closed_exact(&gate);
+	if (result == RESOURCE_X_APPLY_APPLIED)
+		ereport(LOG,
+				(errmsg_internal("cluster PCM-X runtime fail-closed (recovery blocked): "
+								 "Resource-X gate fenced")));
 }
 
 static void
@@ -7253,6 +7259,136 @@ gcs_block_resource_x_assert_stage_exact(
 			   RESOURCE_X_MSG_ASSERT_X, master_node, proof_payload,
 			   proof_bytes)
 		? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_BAD_STATE;
+}
+
+/* The kind-9 ASSERT keeps its wire-neutral observed mode, but an exact local
+ * S/X requester must append the frozen R10 LOCAL_PROOF on the same DATA FIFO.
+ * Capture is bounded and conditional so the DATA callback never waits for
+ * BufferContent; a refusal leaves the round in ASSERT_DISPATCHED for ordinary
+ * R7 replay.  Direct-init and clean N rounds emit ASSERT only. */
+static ResourceXApplyResult
+gcs_block_resource_x_native_assert_stage_exact(
+	int32 master_node, const ResourceXDecodedFrame *assertion)
+{
+	PGAlignedBlock aligned_page;
+	ClusterPcmOwnSnapshot before;
+	ClusterPcmOwnSnapshot after;
+	ClusterPcmOwnResult own_result;
+	ClusterBufmgrGcsCopyRefusal copy_refusal
+		= CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
+	ResourceXAcquisitionRef ref;
+	ResourceXDecodedFrame local_proof;
+	uint64 zero_dependencies[RESOURCE_X_DEPENDENCY_MAX] = { 0 };
+	uint64 direct_generation = 0;
+	uint64 direct_token = 0;
+	uint32 page_checksum;
+	XLogRecPtr page_lsn = InvalidXLogRecPtr;
+	SCN page_scn = InvalidScn;
+	int before_buffer_id = -1;
+	int after_buffer_id = -1;
+
+	if (assertion == NULL
+		|| assertion->kind != RESOURCE_X_WIRE_ASSERT_X
+		|| assertion->common.observed_mode != (uint8)PCM_STATE_N
+		|| assertion->common.target_mode != (uint8)PCM_STATE_X)
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&ref, 0, sizeof(ref));
+	ref.assertion = assertion->common.logical_assertion;
+	ref.formation = assertion->common.resource_formation;
+	ref.acquisition_generation = assertion->common.assertion_sequence;
+	if (cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
+			&ref, &direct_generation, &direct_token)) {
+		own_result
+			= cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
+				&ref.assertion.resource, direct_generation, direct_token,
+				&before_buffer_id, &before);
+		if (own_result != CLUSTER_PCM_OWN_OK || before_buffer_id < 0)
+			return own_result == CLUSTER_PCM_OWN_BUSY
+				? RESOURCE_X_APPLY_BAD_STATE
+				: own_result == CLUSTER_PCM_OWN_STALE
+				? RESOURCE_X_APPLY_STALE
+				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		own_result = cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
+			GetBufferDescriptor(before_buffer_id), &before);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			return own_result == CLUSTER_PCM_OWN_BUSY
+				? RESOURCE_X_APPLY_BAD_STATE
+				: own_result == CLUSTER_PCM_OWN_STALE
+				? RESOURCE_X_APPLY_STALE
+				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return gcs_block_resource_x_assert_stage_exact(
+			master_node, assertion, NULL);
+	}
+
+	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
+		&assertion->common.logical_assertion.resource,
+		&before_buffer_id, &before);
+	if (own_result != CLUSTER_PCM_OWN_OK || before_buffer_id < 0)
+		return own_result == CLUSTER_PCM_OWN_BUSY
+			? RESOURCE_X_APPLY_BAD_STATE
+			: own_result == CLUSTER_PCM_OWN_STALE
+			? RESOURCE_X_APPLY_STALE
+			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!BufferTagsEqual(&before.tag,
+			&assertion->common.logical_assertion.resource)
+		|| before.flags != 0
+		|| before.writer_activation_token != 0
+		|| before.resource_x_activation_generation != 0
+		|| before.generation == UINT64_MAX)
+		return RESOURCE_X_APPLY_STALE;
+	if (before.pcm_state == (uint8)PCM_STATE_N) {
+		own_result = cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
+			GetBufferDescriptor(before_buffer_id), &before);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			return own_result == CLUSTER_PCM_OWN_BUSY
+				? RESOURCE_X_APPLY_BAD_STATE
+				: own_result == CLUSTER_PCM_OWN_STALE
+				? RESOURCE_X_APPLY_STALE
+				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return gcs_block_resource_x_assert_stage_exact(
+			master_node, assertion, NULL);
+	}
+	if (before.generation == 0
+		|| (before.pcm_state != (uint8)PCM_STATE_S
+			&& before.pcm_state != (uint8)PCM_STATE_X))
+		return RESOURCE_X_APPLY_STALE;
+	if (!cluster_bufmgr_copy_block_for_r4_cr(
+			before.tag, InvalidScn, &page_lsn, &page_scn,
+			aligned_page.data, &copy_refusal))
+		return RESOURCE_X_APPLY_BAD_STATE;
+	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
+		&assertion->common.logical_assertion.resource,
+		&after_buffer_id, &after);
+	if (own_result != CLUSTER_PCM_OWN_OK
+		|| before_buffer_id != after_buffer_id
+		|| memcmp(&before, &after, sizeof(before)) != 0
+		|| PageGetLSN((Page)aligned_page.data) != page_lsn
+		|| ((PageHeader)aligned_page.data)->pd_block_scn != page_scn)
+		return own_result == CLUSTER_PCM_OWN_CORRUPT
+			? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+			: RESOURCE_X_APPLY_BAD_STATE;
+	page_checksum = cluster_gcs_block_compute_checksum(aligned_page.data);
+	memset(&local_proof, 0, sizeof(local_proof));
+	local_proof.kind = RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION;
+	local_proof.payload_bytes = RESOURCE_X_SHORT_V1_BYTES;
+	local_proof.common = assertion->common;
+	local_proof.common.observed_mode = before.pcm_state;
+	local_proof.common.outcome = RESOURCE_X_OUTCOME_OK;
+	local_proof.body.local_proof.local_holder_authority_generation
+		= before.generation;
+	local_proof.body.local_proof.requester_target_generation
+		= assertion->common.assertion_sequence;
+	local_proof.body.local_proof.page_scn_lsn = (uint64)page_scn;
+	local_proof.body.local_proof.dependency_count = 0;
+	local_proof.body.local_proof.dependency_vector_crc32c
+		= gcs_block_pcm_x_resource_x_dependency_crc(zero_dependencies);
+	local_proof.body.local_proof.page_checksum = page_checksum;
+	local_proof.body.local_proof.local_image_proof_crc32c = page_checksum;
+	local_proof.body.local_proof.requester_connection_generation
+		= assertion->common.sender_connection_generation;
+	local_proof.body.local_proof.local_proof_generation = before.generation;
+	return gcs_block_resource_x_assert_stage_exact(
+		master_node, assertion, &local_proof);
 }
 
 /* PGRAC adaptation: requester round extraction has already released the
@@ -8146,7 +8282,7 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 		memset(image_out, 0, sizeof(*image_out));
 	if (committed_generation_out != NULL)
 		*committed_generation_out = 0;
-	if (ref == NULL || expected_local_generation == UINT64_MAX
+	if (ref == NULL || expected_local_generation >= UINT64_MAX - 1
 		|| aligned_page == NULL || image_out == NULL
 		|| committed_generation_out == NULL
 		|| (direct_init_bound && (!target_native || !require_clean_n))
@@ -8155,8 +8291,7 @@ gcs_block_pcm_x_resource_x_prepare_target_x(
 		|| (precommit_image != NULL
 			&& (capture_local_image || require_clean_n)))
 		return RESOURCE_X_BUFFER_CORRUPT;
-	if (expected_local_generation == UINT64_MAX)
-		return RESOURCE_X_BUFFER_CORRUPT;
+	expected_committed_generation = expected_local_generation + 1;
 	if (direct_init_bound) {
 		if (!cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
 				ref, &round_direct_generation, &round_direct_token)
@@ -9222,8 +9357,8 @@ gcs_block_resource_x_kind9_ingress(
 				&frame->common.logical_assertion.resource, &gate,
 				master_node, master_session))
 			goto done;
-		stage_result = gcs_block_resource_x_assert_stage_exact(
-			master_node, &outbound, NULL);
+		stage_result = gcs_block_resource_x_native_assert_stage_exact(
+			master_node, &outbound);
 		(void)stage_result;
 	}
 
@@ -9989,8 +10124,8 @@ gcs_block_resource_x_target_acquire_internal(
 					} else {
 						diagnostic_stage = "dispatch-assert";
 						stage_ok
-							= gcs_block_resource_x_assert_stage_exact(
-								master_node, &dispatch, NULL)
+							= gcs_block_resource_x_native_assert_stage_exact(
+								master_node, &dispatch)
 							  == RESOURCE_X_APPLY_APPLIED;
 					}
 					(void)stage_ok;
@@ -13536,6 +13671,15 @@ gcs_block_pcm_x_authenticated_session(int32 node_id, uint64 expected_epoch, uint
 		   == PCM_X_SESSION_AUTH_OK;
 }
 
+static void
+gcs_block_legacy_pcm_x_fail_closed(int32 source_node)
+{
+	if (source_node >= 0
+		&& source_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+		&& source_node != cluster_node_id)
+		cluster_lms_data_plane_close_peer_now(source_node);
+}
+
 /* D11-05: values 41-64 remain permanently reserved.  A verified DATA frame
  * in that range has no semantic decoder in the source-removed build.  The
  * one shared disposition confirms exact TARGET admission and then drops the
@@ -13549,7 +13693,10 @@ gcs_block_legacy_pcm_x_stale_ingress(
 	uint32 capability_word = 0;
 	uint32 connection_generation = 0;
 	int32 source_node;
+	bool admission_current;
 	bool malformed;
+	bool peer_exact;
+	bool peer_sampled = true;
 
 	if (env == NULL)
 		return;
@@ -13564,10 +13711,7 @@ gcs_block_legacy_pcm_x_stale_ingress(
 		|| payload == NULL
 		|| env->epoch != cluster_epoch_get_current();
 	if (malformed) {
-		if (source_node >= 0
-			&& source_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
-			&& source_node != cluster_node_id)
-			cluster_lms_data_plane_close_peer_now(source_node);
+		gcs_block_legacy_pcm_x_fail_closed(source_node);
 		return;
 	}
 
@@ -13575,21 +13719,26 @@ gcs_block_legacy_pcm_x_stale_ingress(
 	admission_result = cluster_semantic_activation_enter(
 		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
 		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
-	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		gcs_block_legacy_pcm_x_fail_closed(source_node);
 		return;
+	}
 	if (source_node == cluster_node_id) {
 		capability_word = cluster_ic_local_capability_word();
 		connection_generation = 1;
 	}
 	else
-		(void)cluster_sf_peer_capability_word_sample(
+		peer_sampled = cluster_sf_peer_capability_word_sample(
 			source_node, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
 			&capability_word, &connection_generation);
 	(void)capability_word;
-	(void)gcs_block_resource_x_target_peer_matches_exact(
-		&admission, source_node, connection_generation);
-	(void)cluster_semantic_activation_recheck(&admission);
+	peer_exact = peer_sampled
+		&& gcs_block_resource_x_target_peer_matches_exact(
+			&admission, source_node, connection_generation);
+	admission_current = cluster_semantic_activation_recheck(&admission);
 	cluster_semantic_activation_leave(&admission);
+	if (!peer_sampled || !peer_exact || !admission_current)
+		gcs_block_legacy_pcm_x_fail_closed(source_node);
 }
 
 #define LEGACY_PCM_X_STALE_INFO(msg, label)                                    \
@@ -16178,6 +16327,140 @@ cluster_gcs_get_block_dedup_legacy_pin_count(void)
  * this callback until an exact complete wrap has thawed the new formation. */
 #define GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET 4
 #define GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT 16
+
+/* R11 D11-09: the source-removed build retains the native R8/R10 cutover
+ * owner.  One LMON tick advances at most 64 registry slots.  A true return
+ * requests one cooperative event-loop reschedule only after actual bounded
+ * progress or a completed state transition; no-progress and retry paths use
+ * the ordinary timer.  This never revives the retired PCM-X runtime, ticket
+ * authority, or worker family. */
+bool
+cluster_gcs_block_resource_x_cutover_tick(void)
+{
+	ClusterSemanticR11CutoverSnapshot cutover;
+	ResourceXCleanCompletionProof clean;
+	ResourceXCleanCompletionProof observed_clean;
+	ResourceXGateSnapshot gate;
+	ResourceXReconfigBatch batch;
+	ResourceXReconfigResult result = RESOURCE_X_RECONFIG_RETRY;
+	ResourceXReconfigToken observed_token;
+	ResourceXReconfigToken token;
+	ResourceXZeroResidualProof observed_zero;
+	ResourceXZeroResidualProof zero;
+	ResourceXApplyResult bind_result;
+	uint32 calls;
+
+	if (!cluster_semantic_activation_r11_cutover_snapshot(&cutover))
+		return false;
+	if (cutover.record_generation == 0
+		|| cutover.record_generation == UINT64_MAX
+		|| cutover.formation_epoch == UINT64_MAX
+		|| cutover.resource_x_old_formation == 0
+		|| cutover.resource_x_old_formation == UINT64_MAX
+		|| cutover.record_generation
+			   != cutover.resource_x_old_formation + 1)
+		return false;
+	if (cutover.phase == CLUSTER_SEMANTIC_R11_CUTOVER_TARGET_OPEN)
+		return false;
+	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)) {
+		if (cutover.phase
+				!= CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED
+			|| !cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
+				&gate))
+			return false;
+	}
+	if (gate.reserved != 0)
+		return false;
+
+	if (cutover.phase == CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED) {
+		if (gate.phase == RESOURCE_X_GATE_OPEN && gate.formation == 0) {
+			bind_result
+				= cluster_pcm_lock_resource_x_gate_bind_formation_exact(
+					cutover.resource_x_old_formation);
+			if (bind_result != RESOURCE_X_APPLY_APPLIED
+				&& bind_result != RESOURCE_X_APPLY_DUPLICATE)
+				return false;
+			if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate))
+				return false;
+		}
+		if ((gate.phase != RESOURCE_X_GATE_OPEN
+			 && gate.phase != RESOURCE_X_GATE_FROZEN)
+			|| gate.formation != cutover.resource_x_old_formation
+			|| !cluster_resource_x_reconfig_cutover_freeze_exact(
+				cutover.resource_x_old_formation, &token))
+			return false;
+
+		if (token.new_formation == 0) {
+			for (calls = 0;
+				 calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT;
+				 calls++) {
+				result = cluster_resource_x_reconfig_sweep(
+					&token, GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET,
+					&batch);
+				if (result == RESOURCE_X_RECONFIG_DONE)
+					break;
+				if (result != RESOURCE_X_RECONFIG_MORE
+					&& result != RESOURCE_X_RECONFIG_RETRY)
+					return false;
+			}
+			if (result != RESOURCE_X_RECONFIG_DONE) {
+				return result == RESOURCE_X_RECONFIG_MORE
+					&& batch.examined_count != 0;
+			}
+			if (!cluster_resource_x_reconfig_bind_new_formation_exact(
+					&token, cutover.record_generation))
+				return false;
+			/* Binding is itself progress.  Resume through the event loop so
+			 * no tick traverses more than one 64-slot checkpoint. */
+			return true;
+		}
+		if (token.new_formation != cutover.record_generation)
+			return false;
+
+		for (calls = 0;
+			 calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT;
+			 calls++) {
+			result = cluster_resource_x_reconfig_sweep(
+				&token, GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET,
+				&batch);
+			if (result == RESOURCE_X_RECONFIG_DONE)
+				break;
+			if (result != RESOURCE_X_RECONFIG_MORE
+				&& result != RESOURCE_X_RECONFIG_RETRY)
+				return false;
+		}
+		if (result != RESOURCE_X_RECONFIG_DONE) {
+			return result == RESOURCE_X_RECONFIG_MORE
+				&& batch.examined_count != 0;
+		}
+		if (!cluster_resource_x_reconfig_zero_proof_exact(
+				&token, &zero)
+			|| !cluster_pcm_lock_resource_x_clean_completion_prove_exact(
+				&token, &zero, &clean)
+			|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
+				&observed_token, &observed_zero, &observed_clean)
+			|| memcmp(&observed_token, &token, sizeof(token)) != 0
+			|| memcmp(&observed_zero, &zero, sizeof(zero)) != 0
+			|| memcmp(&observed_clean, &clean, sizeof(clean)) != 0)
+			return false;
+		return batch.examined_count != 0;
+	}
+
+	if (cutover.phase
+			!= CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL
+		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
+			&token, &zero, &clean)
+		|| token.old_formation != cutover.resource_x_old_formation
+		|| token.new_formation != cutover.record_generation
+		|| !cluster_resource_x_reconfig_thaw_exact(&token)
+		|| !cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
+			&observed_token, &observed_zero, &observed_clean)
+		|| memcmp(&observed_token, &token, sizeof(token)) != 0
+		|| memcmp(&observed_zero, &zero, sizeof(zero)) != 0
+		|| memcmp(&observed_clean, &clean, sizeof(clean)) != 0)
+		return false;
+	return true;
+}
 
 static uint32
 gcs_block_resource_x_dead_requester_bitmap(

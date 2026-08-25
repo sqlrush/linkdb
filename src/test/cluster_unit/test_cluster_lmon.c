@@ -807,6 +807,12 @@ void
 cluster_gcs_block_pcm_x_formation_tick(void)
 {}
 
+bool
+cluster_gcs_block_resource_x_cutover_tick(void)
+{
+	return false;
+}
+
 /* spec-2.34 D6 L104 stub:  cluster_lmon.c LMON tick body calls
  * cluster_gcs_block_dedup_sweep_expired(now).  Standalone fixture has
  * no dedup HTAB linked; vacuous stub. */

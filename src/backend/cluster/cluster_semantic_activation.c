@@ -5952,86 +5952,177 @@ bit22_stage_ok(uint64 record_generation)
 	return CLUSTER_SEMANTIC_ACTIVATION_OK;
 }
 
-/* The Resource-X cutover descriptor owns only the bit-10 identity.  Its
- * transition effects remain in the existing source/target owner bundle; a
- * missing owner or missing directional callback is always fail-closed. */
-static ClusterSemanticActivationResult
-r11_resource_x_not_ready(uint64 expected_generation,
-						 ClusterSemanticActivationRefusal *refusal)
+/* The retired PCM-X source no longer supplies these callbacks.  The native
+ * Resource-X owner retains the same-T R8/R10 pair and the R4 ACK image
+ * supplies its external formation/generation identity.  Neither view grants
+ * authority; every callback only verifies one exact local prerequisite. */
+static bool
+r11_resource_x_cutover_digest_exact(
+	uint64 generation, ClusterSemanticR11CutoverPhase expected_phase,
+	bool thawed, uint64 *digest_out)
 {
-	semantic_activation_set_refusal(
-		refusal, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE,
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		expected_generation);
-	return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	ClusterSemanticR11CutoverSnapshot cutover;
+
+	if (digest_out == NULL)
+		return false;
+	*digest_out = 0;
+	return generation != 0 && generation != UINT64_MAX
+		&& cluster_semantic_activation_r11_cutover_snapshot(&cutover)
+		&& cutover.phase == expected_phase
+		&& cutover.record_generation == generation
+		&& cutover.formation_epoch == cluster_epoch_get_current()
+		&& cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
+			cutover.resource_x_old_formation, generation, thawed, digest_out)
+		&& *digest_out != 0;
+}
+
+/* Bound OPEN and FROZEN gates use the ordinary exact snapshot.  The narrow
+ * cutover snapshot exists only to admit the pristine, unbound formation-zero
+ * gate at the first R11 transition. */
+static bool
+r11_resource_x_gate_snapshot_exact(ResourceXGateSnapshot *gate)
+{
+	return gate != NULL
+		&& (cluster_pcm_lock_resource_x_gate_snapshot(gate)
+			|| cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(gate));
 }
 
 static ClusterSemanticActivationResult
-r11_resource_x_zero_unavailable(uint64 generation,
-							ClusterSemanticZeroProof *proof)
+r11_resource_x_frozen_stage(uint64 generation)
 {
-	(void) generation;
-	if (proof != NULL)
-		memset(proof, 0, sizeof(*proof));
-	return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
-}
+	uint64 digest;
 
-static ClusterSemanticActivationResult
-r11_resource_x_stage_closed(uint64 generation)
-{
-	(void) generation;
-	return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	return r11_resource_x_cutover_digest_exact(
+		generation, CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED,
+		false, &digest)
+		? CLUSTER_SEMANTIC_ACTIVATION_OK
+		: CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_readiness(uint64 expected_generation,
 						 ClusterSemanticActivationRefusal *refusal)
 {
-	return r11_resource_x_not_ready(expected_generation, refusal);
+	ResourceXGateSnapshot gate;
+	ResourceXWriterPath writer_path;
+	ClusterSemanticActivationResult result;
+	uint64 r4_generation = 0;
+
+	writer_path = cluster_resource_x_writer_path_snapshot(&r4_generation);
+	result = expected_generation != 0
+			 && expected_generation != UINT64_MAX
+			 && writer_path == RESOURCE_X_WRITER_CLOSED
+			 && r4_generation == expected_generation
+			 && r11_resource_x_gate_snapshot_exact(&gate)
+			 && gate.phase == RESOURCE_X_GATE_OPEN
+			 && gate.freeze_generation == 0 && gate.reserved == 0
+			 && (gate.formation == 0
+				 || gate.formation == expected_generation)
+			 ? CLUSTER_SEMANTIC_ACTIVATION_OK
+			 : CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	semantic_activation_set_refusal(
+		refusal, result,
+		result == CLUSTER_SEMANTIC_ACTIVATION_OK
+			? 0
+			: CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		expected_generation);
+	return result;
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_close_source(uint64 generation)
 {
-	return r11_resource_x_stage_closed(generation);
+	ClusterSemanticR11CutoverSnapshot cutover;
+	ResourceXGateSnapshot gate;
+
+	if (generation == 0 || generation == UINT64_MAX
+		|| !cluster_semantic_activation_r11_cutover_snapshot(&cutover)
+		|| cutover.phase != CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED
+		|| cutover.record_generation != generation
+		|| cutover.formation_epoch != cluster_epoch_get_current()
+		|| cutover.resource_x_old_formation != generation - 1
+		|| !r11_resource_x_gate_snapshot_exact(&gate)
+		|| gate.reserved != 0
+		|| (gate.phase != RESOURCE_X_GATE_OPEN
+			&& gate.phase != RESOURCE_X_GATE_FROZEN)
+		|| (gate.formation != 0
+			&& gate.formation != cutover.resource_x_old_formation))
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_logical_zero(uint64 generation,
 						ClusterSemanticZeroProof *proof)
 {
-	return r11_resource_x_zero_unavailable(generation, proof);
+	ClusterSemanticR11CutoverSnapshot cutover;
+	ResourceXGateSnapshot gate;
+	uint64 digest = 0;
+
+	if (proof != NULL)
+		memset(proof, 0, sizeof(*proof));
+	if (proof == NULL || generation == 0 || generation == UINT64_MAX
+		|| !cluster_semantic_activation_r11_cutover_snapshot(&cutover)
+		|| cutover.phase != CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED
+		|| cutover.record_generation != generation
+		|| cutover.formation_epoch != cluster_epoch_get_current()
+		|| cutover.resource_x_old_formation != generation - 1)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	if (!r11_resource_x_cutover_digest_exact(
+			generation, CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED,
+			false, &digest)) {
+		if (!r11_resource_x_gate_snapshot_exact(&gate)
+			|| gate.reserved != 0
+			|| (gate.phase != RESOURCE_X_GATE_OPEN
+				&& gate.phase != RESOURCE_X_GATE_FROZEN)
+			|| (gate.formation != 0
+				&& gate.formation != cutover.resource_x_old_formation))
+			return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+		return CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+	}
+	proof->record_generation = generation;
+	proof->debt_count = 0;
+	proof->sample_digest = digest;
+	return CLUSTER_SEMANTIC_ACTIVATION_OK;
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_transport_zero(uint64 generation,
 						  ClusterSemanticZeroProof *proof)
 {
-	return r11_resource_x_zero_unavailable(generation, proof);
+	return r11_resource_x_logical_zero(generation, proof);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_prepare_target(uint64 generation)
 {
-	return r11_resource_x_stage_closed(generation);
+	return r11_resource_x_frozen_stage(generation);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_apply_target_closed(uint64 generation)
 {
-	return r11_resource_x_stage_closed(generation);
+	return r11_resource_x_frozen_stage(generation);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_revert_source_closed(uint64 generation)
 {
-	return r11_resource_x_stage_closed(generation);
+	(void) generation;
+	return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_open_target(uint64 generation)
 {
-	return r11_resource_x_stage_closed(generation);
+	uint64 digest;
+
+	return r11_resource_x_cutover_digest_exact(
+		generation,
+		CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL,
+		true, &digest)
+		? CLUSTER_SEMANTIC_ACTIVATION_OK
+		: CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 }
 
 static const ClusterSemanticActivationDescriptor r4_descriptor = {
@@ -7829,9 +7920,14 @@ cluster_semantic_activation_r11_cutover_snapshot(
 			= table.stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_COMMIT_APPLIED
 				  ? table.record_generation - 1
 				  : table.record_generation;
-		if (out->record_generation == 0)
+		if (out->record_generation <= 1)
 			return false;
 		out->formation_epoch = table.transition_epoch;
+		/* The closed R4 generation G has one exact stable predecessor G-1.
+		 * Resource-X uses that nonzero pair for T even when the legal initial
+		 * membership epoch remains zero; the epoch is still revalidated as
+		 * admission identity and is never synthesized. */
+		out->resource_x_old_formation = out->record_generation - 1;
 		out->phase = CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED;
 		return true;
 	}
@@ -7844,6 +7940,7 @@ cluster_semantic_activation_r11_cutover_snapshot(
 			local_capability_word)) {
 		out->record_generation = table.record_generation - 2;
 		out->formation_epoch = table.transition_epoch;
+		out->resource_x_old_formation = out->record_generation - 1;
 		out->phase
 			= CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL;
 		return true;

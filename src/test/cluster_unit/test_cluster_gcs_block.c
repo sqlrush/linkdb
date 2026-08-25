@@ -1962,6 +1962,73 @@ UT_TEST(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake
 	free(source);
 }
 
+UT_TEST(test_resource_x_r11_cutover_tick_is_native_bounded_and_lmon_owned)
+{
+	static const char *const cutover_contract[] = {
+		"cluster_semantic_activation_r11_cutover_snapshot(",
+		"cluster_pcm_lock_resource_x_gate_snapshot(",
+		"cluster_pcm_lock_resource_x_gate_bind_formation_exact(",
+		"cluster_resource_x_reconfig_cutover_freeze_exact(",
+		"cluster_resource_x_reconfig_sweep(",
+		"cluster_resource_x_reconfig_bind_new_formation_exact(",
+		"cluster_resource_x_reconfig_sweep(",
+		"cluster_resource_x_reconfig_zero_proof_exact(",
+		"cluster_pcm_lock_resource_x_clean_completion_prove_exact(",
+		"cluster_pcm_lock_resource_x_cutover_proofs_exact(",
+		"cluster_resource_x_reconfig_thaw_exact(",
+		"cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact("
+	};
+	char *source = read_gcs_block_source();
+	char *lmon = read_source_path("../../../src/backend/cluster/cluster_lmon.c");
+	const char *first_semantic;
+	const char *first_recovery;
+	const char *first_cutover;
+	const char *first_reschedule;
+	const char *second_semantic;
+	const char *second_recovery;
+	const char *second_cutover;
+	const char *second_reschedule;
+
+	assert_ordered_in_function(
+		source, "\ncluster_gcs_block_resource_x_cutover_tick(",
+		"\n\n/* ============================================================",
+		cutover_contract, lengthof(cutover_contract));
+	UT_ASSERT_NULL(strstr(source, "cluster_gcs_block_pcm_x_formation_tick"));
+	UT_ASSERT_NULL(strstr(source, "cluster_pcm_x_runtime_snapshot"));
+	UT_ASSERT_NOT_NULL(strstr(source,
+		"return result == RESOURCE_X_RECONFIG_MORE\n"
+		"\t\t\t\t&& batch.examined_count != 0;"));
+
+	first_semantic = strstr(lmon, "cluster_semantic_activation_lmon_tick();");
+	first_recovery = first_semantic != NULL
+		? strstr(first_semantic, "cluster_grd_recovery_lmon_tick();") : NULL;
+	first_cutover = first_recovery != NULL
+		? strstr(first_recovery,
+			"if (cluster_gcs_block_resource_x_cutover_tick())") : NULL;
+	first_reschedule = first_cutover != NULL
+		? strstr(first_cutover, "SetLatch(MyLatch);") : NULL;
+	second_semantic = first_reschedule != NULL
+		? strstr(first_reschedule + 1,
+			"cluster_semantic_activation_lmon_tick();") : NULL;
+	second_recovery = second_semantic != NULL
+		? strstr(second_semantic, "cluster_grd_recovery_lmon_tick();") : NULL;
+	second_cutover = second_recovery != NULL
+		? strstr(second_recovery,
+			"if (cluster_gcs_block_resource_x_cutover_tick())") : NULL;
+	second_reschedule = second_cutover != NULL
+		? strstr(second_cutover, "SetLatch(MyLatch);") : NULL;
+	UT_ASSERT_NOT_NULL(first_semantic);
+	UT_ASSERT_NOT_NULL(first_recovery);
+	UT_ASSERT_NOT_NULL(first_cutover);
+	UT_ASSERT_NOT_NULL(first_reschedule);
+	UT_ASSERT_NOT_NULL(second_semantic);
+	UT_ASSERT_NOT_NULL(second_recovery);
+	UT_ASSERT_NOT_NULL(second_cutover);
+	UT_ASSERT_NOT_NULL(second_reschedule);
+	free(lmon);
+	free(source);
+}
+
 UT_TEST(test_resource_x_reused_type_ingress_precedes_every_legacy_path)
 {
 	static const char *const handler_names[] = {
@@ -2030,8 +2097,52 @@ UT_TEST(test_resource_x_reused_type_ingress_precedes_every_legacy_path)
 	free(source);
 }
 
+UT_TEST(test_retired_pcm_x_ingress_drops_only_authenticated_current_target_peer)
+{
+	static const char *const stale_contract[] = {
+		"cluster_semantic_activation_enter(",
+		"admission_result != CLUSTER_SEMANTIC_ADMISSION_OK",
+		"gcs_block_legacy_pcm_x_fail_closed(source_node)",
+		"cluster_sf_peer_capability_word_sample(",
+		"gcs_block_resource_x_target_peer_matches_exact(",
+		"cluster_semantic_activation_recheck(&admission)",
+		"cluster_semantic_activation_leave(&admission)",
+		"gcs_block_legacy_pcm_x_fail_closed(source_node)"
+	};
+	char *source = read_gcs_block_source();
+	const char *helper;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	helper = strstr(source, "\ngcs_block_legacy_pcm_x_stale_ingress(");
+	UT_ASSERT_NOT_NULL(helper);
+	if (helper != NULL) {
+		assert_ordered_in_function(
+			source, "\ngcs_block_legacy_pcm_x_stale_ingress(",
+			"\n\n#define LEGACY_PCM_X_STALE_INFO", stale_contract,
+			lengthof(stale_contract));
+		UT_ASSERT_NOT_NULL(strstr(helper,
+			"if (!peer_sampled || !peer_exact || !admission_current)"));
+	}
+	free(source);
+}
+
 UT_TEST(test_resource_x_kind9_ingress_is_target_native_and_no_fallback)
 {
+	static const char *const native_local_proof_contract[] = {
+		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+		"before.pcm_state == (uint8)PCM_STATE_S",
+		"before.pcm_state == (uint8)PCM_STATE_X",
+		"cluster_bufmgr_copy_block_for_r4_cr(",
+		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
+		"memcmp(&before, &after, sizeof(before)) != 0",
+		"local_proof.kind = RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION",
+		"local_proof.body.local_proof.local_holder_authority_generation",
+		"local_proof.body.local_proof.requester_target_generation",
+		"gcs_block_pcm_x_resource_x_dependency_crc(zero_dependencies)",
+		"gcs_block_resource_x_assert_stage_exact("
+	};
 	char *source = read_gcs_block_source();
 	const char *candidate;
 	const char *ingress;
@@ -2067,8 +2178,13 @@ UT_TEST(test_resource_x_kind9_ingress_is_target_native_and_no_fallback)
 		UT_ASSERT_NOT_NULL(strstr(ingress,
 			"gcs_block_resource_x_bootstrap_ack_stage_exact("));
 		UT_ASSERT_NOT_NULL(strstr(ingress,
-			"gcs_block_resource_x_assert_stage_exact("));
+			"gcs_block_resource_x_native_assert_stage_exact("));
 	}
+	assert_ordered_in_function(
+		source, "\ngcs_block_resource_x_native_assert_stage_exact(",
+		"\n/* PGRAC adaptation: requester round extraction",
+		native_local_proof_contract,
+		lengthof(native_local_proof_contract));
 	UT_ASSERT_NOT_NULL(strstr(source,
 		"cluster_pcm_lock_resource_x_assert_bootstrapped_exact("));
 	if (ack_stage != NULL) {
@@ -2106,7 +2222,7 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 		"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST",
 		"gcs_block_resource_x_bootstrap_request_stage_exact(",
 		"RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT",
-		"gcs_block_resource_x_assert_stage_exact(",
+		"gcs_block_resource_x_native_assert_stage_exact(",
 		"RESOURCE_X_BOOTSTRAP_ROUND_WAIT",
 		"cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(",
 		"RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL"
@@ -2294,6 +2410,24 @@ UT_TEST(test_resource_x_direct_n_uses_exact_durable_storage_proof)
 		"\nstatic bool\ngcs_block_try_resource_x_frame(",
 		target_direct_init_terminal_contract,
 		lengthof(target_direct_init_terminal_contract));
+	free(source);
+}
+
+UT_TEST(test_resource_x_target_x_freezes_exact_committed_generation_before_replay)
+{
+	static const char *const generation_contract[] = {
+		"expected_local_generation >= UINT64_MAX - 1",
+		"expected_committed_generation = expected_local_generation + 1;",
+		"cluster_pcm_x_resource_x_t2_snapshot_exact(ref, &current)",
+		"current.generation != expected_committed_generation",
+		"committed_generation != expected_committed_generation"
+	};
+	char *source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		source, "\ngcs_block_pcm_x_resource_x_prepare_target_x(",
+		"\n/* Consume one complete retained type-15 join",
+		generation_contract, lengthof(generation_contract));
 	free(source);
 }
 
@@ -3178,7 +3312,7 @@ UT_TEST(test_r4_tx_origin_pending_work_uses_bounded_lms_poll_slice)
 int
 main(void)
 {
-	UT_PLAN(66);
+	UT_PLAN(69);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -3225,11 +3359,14 @@ main(void)
 	UT_RUN(test_resource_x_common_x_to_n_finish_does_not_retire_acquisition);
 	UT_RUN(test_resource_x_self_x_to_x_commit_does_not_retire_acquisition);
 	UT_RUN(test_resource_x_epoch_hook_freezes_sweeps_and_thaws_before_existing_wake);
+	UT_RUN(test_resource_x_r11_cutover_tick_is_native_bounded_and_lmon_owned);
 	UT_RUN(test_resource_x_reused_type_ingress_precedes_every_legacy_path);
+	UT_RUN(test_retired_pcm_x_ingress_drops_only_authenticated_current_target_peer);
 	UT_RUN(test_resource_x_kind9_ingress_is_target_native_and_no_fallback);
 	UT_RUN(test_resource_x_native_target_driver_uses_round_and_no_ticket_family);
 	UT_RUN(test_resource_x_type15_exact_join_is_the_only_new_r9_entry);
 	UT_RUN(test_resource_x_direct_n_uses_exact_durable_storage_proof);
+	UT_RUN(test_resource_x_target_x_freezes_exact_committed_generation_before_replay);
 	UT_RUN(test_resource_x_native_target_accepts_only_exact_clean_n_before_bootstrap);
 	UT_RUN(test_resource_x_passive_pi_waits_for_exact_remote_image_before_x);
 	UT_RUN(test_resource_x_settlement_removes_exact_wfg_before_locator_completion);

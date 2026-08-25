@@ -109,12 +109,13 @@ typedef enum ClusterSemanticR11CutoverPhase {
 typedef struct ClusterSemanticR11CutoverSnapshot {
 	uint64 record_generation;
 	uint64 formation_epoch;
+	uint64 resource_x_old_formation;
 	uint32 phase;
 	uint32 reserved;
 } ClusterSemanticR11CutoverSnapshot;
 
-StaticAssertDecl(sizeof(ClusterSemanticR11CutoverSnapshot) == 24,
-				 "R11 cutover snapshot layout must remain 24 bytes");
+StaticAssertDecl(sizeof(ClusterSemanticR11CutoverSnapshot) == 32,
+				 "R11 cutover snapshot layout must remain 32 bytes");
 
 typedef struct ClusterSemanticAdmissionToken {
 	uint64 feature_bit;

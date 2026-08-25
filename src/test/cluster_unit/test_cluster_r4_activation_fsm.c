@@ -192,6 +192,13 @@ static bool test_qvotec_in_quorum = true;
 static uint64 test_qvotec_self_incarnation = UINT64_C(0x445566778899aabb);
 static uint64 test_last_admitted_incarnation = UINT64_C(0x445566778899aabb);
 static uint64 test_remote_admitted_incarnations[CLUSTER_MAX_NODES];
+static bool test_resource_x_gate_snapshot_valid;
+static ResourceXGateSnapshot test_resource_x_gate_snapshot;
+static bool test_resource_x_cutover_digest_valid;
+static uint64 test_resource_x_cutover_old_formation;
+static uint64 test_resource_x_cutover_record_generation;
+static bool test_resource_x_cutover_thawed;
+static uint64 test_resource_x_cutover_digest;
 
 int MyProcPid = 101;
 int cluster_node_id = 1;
@@ -208,6 +215,49 @@ ClusterICSendResult cluster_ic_send_envelope(
 	uint8 msg_type, int32 dest_node_id, const void *payload,
 	uint32 payload_len);
 void cluster_ic_tier1_close_peer(int32 peer_id, const char *reason);
+
+bool
+cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *snapshot_out)
+{
+	if (snapshot_out == NULL)
+		return false;
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	if (!test_resource_x_gate_snapshot_valid)
+		return false;
+	*snapshot_out = test_resource_x_gate_snapshot;
+	return true;
+}
+
+bool
+cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
+	ResourceXGateSnapshot *snapshot_out)
+{
+	if (!cluster_pcm_lock_resource_x_gate_snapshot(snapshot_out)
+		|| snapshot_out->phase != RESOURCE_X_GATE_OPEN) {
+		if (snapshot_out != NULL)
+			memset(snapshot_out, 0, sizeof(*snapshot_out));
+		return false;
+	}
+	return true;
+}
+
+bool
+cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
+	uint64 old_formation, uint64 record_generation, bool thawed,
+	uint64 *digest_out)
+{
+	if (digest_out == NULL)
+		return false;
+	*digest_out = 0;
+	if (!test_resource_x_cutover_digest_valid
+		|| old_formation != test_resource_x_cutover_old_formation
+		|| record_generation != test_resource_x_cutover_record_generation
+		|| thawed != test_resource_x_cutover_thawed
+		|| test_resource_x_cutover_digest == 0)
+		return false;
+	*digest_out = test_resource_x_cutover_digest;
+	return true;
+}
 
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
@@ -956,6 +1006,14 @@ test_gate_reset(void)
 	test_last_admitted_incarnation = UINT64_C(0x445566778899aabb);
 	memset(test_remote_admitted_incarnations, 0,
 		   sizeof(test_remote_admitted_incarnations));
+	test_resource_x_gate_snapshot_valid = false;
+	memset(&test_resource_x_gate_snapshot, 0,
+		   sizeof(test_resource_x_gate_snapshot));
+	test_resource_x_cutover_digest_valid = false;
+	test_resource_x_cutover_old_formation = 0;
+	test_resource_x_cutover_record_generation = 0;
+	test_resource_x_cutover_thawed = false;
+	test_resource_x_cutover_digest = 0;
 	cluster_shared_data_dir = NULL;
 	MyProcPid = 101;
 	cluster_node_id = 1;
@@ -1201,16 +1259,29 @@ UT_TEST(test_10a_r11_resource_x_cutover_descriptor_is_compiled_exact)
 	UT_ASSERT_EQ(cluster_semantic_activation_compiled_feature_bitmap(),
 				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
 				 | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
-	/* The exact transition callbacks and L3 owner existed in the immutable
-	 * pre-removal tree at cc1c5a5542.  A source-removed binary keeps the bit
-	 * identity compiled, but every attempt to run that transition is closed. */
+	/* Source removal does not remove the native Resource-X owner.  A clean
+	 * R4 formation may enter SAMPLE only while the target writer stays closed
+	 * and the native gate is an unfrozen zero/current-formation base. */
+	test_gate_reset();
+	test_gate_publish(2, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		7, test_current_epoch, false);
+	test_resource_x_gate_snapshot_valid = true;
+	test_resource_x_gate_snapshot.phase = RESOURCE_X_GATE_OPEN;
+	test_resource_x_gate_snapshot.formation = 0;
 	memset(&refusal, 0, sizeof(refusal));
 	UT_ASSERT_EQ(cutover->pre_prepare_readiness(7, &refusal),
-				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(refusal.feature_bit,
-				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.feature_bit, UINT64_C(0));
 	UT_ASSERT_EQ(refusal.expected_generation, 7);
+	test_resource_x_gate_snapshot.formation = test_current_epoch + 1;
+	UT_ASSERT_EQ(cutover->pre_prepare_readiness(7, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	test_resource_x_gate_snapshot.formation = 0;
+	UT_ASSERT_EQ(cutover->pre_prepare_readiness(8, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+
+	/* No exact SOURCE_CLOSED ACK image or same-T proof exists yet. */
 	memset(&proof, 0x7f, sizeof(proof));
 	UT_ASSERT_EQ(cutover->source_logical_debt_zero(7, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
@@ -1233,27 +1304,16 @@ UT_TEST(test_10a_r11_resource_x_cutover_descriptor_is_compiled_exact)
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	UT_ASSERT_EQ(cutover->open_target_admission(7),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	memset(&refusal, 0, sizeof(refusal));
-	UT_ASSERT_EQ(cutover->pre_prepare_readiness(8, &refusal),
-				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(refusal.feature_bit,
-				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
-	UT_ASSERT_EQ(refusal.expected_generation, 8);
-	memset(&proof, 0x7f, sizeof(proof));
-	UT_ASSERT_EQ(cutover->source_logical_debt_zero(8, &proof),
-				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(proof.record_generation, 0);
-	UT_ASSERT_EQ(proof.debt_count, 0);
-	UT_ASSERT_EQ(proof.sample_digest, 0);
-	UT_ASSERT_EQ(cutover->open_target_admission(8),
-				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	test_gate_reset();
 }
 
 UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)
 {
+	const ClusterSemanticActivationDescriptor *descriptor
+		= cluster_semantic_activation_r11_resource_x_descriptor();
 	ClusterSemanticR11CutoverSnapshot cutover;
 	ClusterSemanticActivationAckTableV1 *table;
+	ClusterSemanticZeroProof proof;
 	uint32 resource_x_caps
 		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
 		  | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
@@ -1291,8 +1351,13 @@ UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)
 				 RESOURCE_X_WRITER_CLOSED);
 
 	/* Exact R11 SOURCE_CLOSED is a read-only co-sample of the admission gate,
-	 * current formation/capabilities, and the complete SAMPLE ACK image. */
+	 * current formation/capabilities, and the complete SAMPLE ACK image.  The
+	 * initial homogeneous formation deliberately keeps membership epoch zero;
+	 * Resource-X must derive its nonzero predecessor from the exact R4 round,
+	 * never manufacture membership epoch one. */
 	test_gate_reset();
+	test_current_epoch = 0;
+	test_membership_snapshot_epoch = 0;
 	test_local_capability_word = resource_x_caps;
 	test_peer_capability_word_sample_ok = true;
 	test_peer_capability_matches = true;
@@ -1349,6 +1414,36 @@ UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)
 				 CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED);
 	UT_ASSERT_EQ(cutover.record_generation, UINT64_C(23));
 	UT_ASSERT_EQ(cutover.formation_epoch, test_current_epoch);
+	UT_ASSERT_EQ(cutover.resource_x_old_formation, UINT64_C(22));
+	test_resource_x_cutover_digest_valid = true;
+	test_resource_x_cutover_old_formation = 22;
+	test_resource_x_cutover_record_generation = 23;
+	test_resource_x_cutover_thawed = false;
+	test_resource_x_cutover_digest = UINT64_C(0xa55a9911);
+	test_resource_x_gate_snapshot_valid = true;
+	test_resource_x_gate_snapshot.phase = RESOURCE_X_GATE_FROZEN;
+	test_resource_x_gate_snapshot.formation = 22;
+	test_resource_x_gate_snapshot.freeze_generation = 1;
+	UT_ASSERT_EQ(descriptor->close_source_admission(23),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	memset(&proof, 0, sizeof(proof));
+	UT_ASSERT_EQ(descriptor->source_logical_debt_zero(23, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(proof.record_generation, UINT64_C(23));
+	UT_ASSERT_EQ(proof.debt_count, UINT64_C(0));
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0xa55a9911));
+	memset(&proof, 0, sizeof(proof));
+	UT_ASSERT_EQ(descriptor->source_transport_zero(23, &proof),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(proof.sample_digest, UINT64_C(0xa55a9911));
+	UT_ASSERT_EQ(descriptor->prepare_target(23),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(descriptor->apply_target_closed(23),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(descriptor->revert_source_closed(23),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	UT_ASSERT_EQ(descriptor->open_target_admission(23),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 
 	/* Durable OPEN is one record generation ahead of the still-closed local
 	 * selector.  It becomes TARGET_OPEN only after local publication. */
@@ -1366,6 +1461,12 @@ UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)
 	UT_ASSERT_EQ(cutover.phase,
 				 CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL);
 	UT_ASSERT_EQ(cutover.record_generation, UINT64_C(23));
+	UT_ASSERT_EQ(cutover.resource_x_old_formation, UINT64_C(22));
+	test_resource_x_cutover_thawed = true;
+	UT_ASSERT_EQ(descriptor->open_target_admission(23),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(descriptor->open_target_admission(24),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	test_gate_publish(12, table->target_feature_bitmap, 25,
 				  test_current_epoch, false);
 	UT_ASSERT(cluster_semantic_activation_r11_cutover_snapshot(&cutover));
@@ -3398,13 +3499,12 @@ UT_TEST(test_93db_coordinator_reaches_exact_prepared_origin)
 	test_gate_reset();
 }
 
-UT_TEST(test_93dc_source_removed_round_fails_before_ack_or_record)
+UT_TEST(test_93dc_source_removed_round_waits_without_reviving_source)
 {
-	ClusterSemanticActivationAckTableV1 before_table;
-	ClusterSemanticActivationAckTableV1 table;
 	ClusterSemanticActivationCasRequest cas_request;
 	ClusterSemanticActivationRefusal refusal;
-	bool had_table;
+	SemanticActivationUtilityRequest pending;
+	uint64 writer_generation = 0;
 	uint64 request_seq = 0;
 	uint64 r4 = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	uint64 r11 = CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1;
@@ -3419,8 +3519,9 @@ UT_TEST(test_93dc_source_removed_round_fails_before_ack_or_record)
 	test_peer_capability_word = test_local_capability_word;
 	test_peer_capability_generation = 23;
 	test_peer_capability_matches = true;
-	memset(&before_table, 0, sizeof(before_table));
-	had_table = semantic_activation_ack_table_snapshot(&before_table);
+	test_resource_x_gate_snapshot_valid = true;
+	test_resource_x_gate_snapshot.phase = RESOURCE_X_GATE_OPEN;
+	test_resource_x_gate_snapshot.formation = 0;
 
 	UT_ASSERT(semantic_activation_utility_mailbox_submit(
 		CLUSTER_SEMANTIC_ENABLE_ALL, r4, r4 | r11, 0, 7,
@@ -3428,18 +3529,17 @@ UT_TEST(test_93dc_source_removed_round_fails_before_ack_or_record)
 	cluster_semantic_activation_lmon_tick();
 
 	memset(&refusal, 0, sizeof(refusal));
-	UT_ASSERT(semantic_activation_utility_mailbox_poll_completion(
+	UT_ASSERT(!semantic_activation_utility_mailbox_poll_completion(
 		request_seq, &refusal));
-	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(refusal.feature_bit, r11);
-	UT_ASSERT_EQ(refusal.expected_generation, UINT64_C(7));
-	memset(&table, 0, sizeof(table));
-	UT_ASSERT_EQ(semantic_activation_ack_table_snapshot(&table), had_table);
-	if (had_table)
-		UT_ASSERT_EQ(memcmp(&table, &before_table, sizeof(table)), 0);
+	memset(&pending, 0, sizeof(pending));
+	UT_ASSERT(semantic_activation_utility_mailbox_poll(&pending));
+	UT_ASSERT_EQ(pending.request_seq, request_seq);
 	memset(&cas_request, 0, sizeof(cas_request));
 	UT_ASSERT(!cluster_semantic_activation_qvotec_poll_record_cas(
 		&cas_request));
+	UT_ASSERT_EQ(cluster_resource_x_writer_path_snapshot(
+		&writer_generation), RESOURCE_X_WRITER_CLOSED);
+	UT_ASSERT_EQ(writer_generation, UINT64_C(7));
 	UT_ASSERT_EQ(pg_atomic_read_u64(
 		test_gate_u64(TEST_GATE_ACTIVE_BITS_OFFSET)), r4);
 	UT_ASSERT_EQ(pg_atomic_read_u64(
@@ -6498,7 +6598,7 @@ main(void)
 	UT_RUN(test_g3_ack_complete_matches_round_binding);
 	UT_RUN(test_93daa_member_accumulates_sample_and_closes_barrier);
 	UT_RUN(test_93db_coordinator_reaches_exact_prepared_origin);
-	UT_RUN(test_93dc_source_removed_round_fails_before_ack_or_record);
+	UT_RUN(test_93dc_source_removed_round_waits_without_reviving_source);
 	UT_RUN(test_93dca_source_removed_open_target_remains_selectable);
 	UT_RUN(test_93e_utility_wait_returns_only_matching_terminal_result);
 	UT_RUN(test_93ea_utility_wait_does_not_synthesize_elapsed_terminal);

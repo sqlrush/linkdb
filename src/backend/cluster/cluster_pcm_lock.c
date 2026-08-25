@@ -800,6 +800,14 @@ static ResourceXReclaimResult pcm_resource_x_reclaim_requester_locked(
 static bool pcm_resource_x_arm_block_intents_locked(
 	struct GrdEntry *entry, ClusterPcmResourceXMasterState *state,
 	ClusterPcmResourceXMasterRequest *request, int32 requester_node);
+static ResourceXApplyResult pcm_resource_x_build_authority_grant_locked(
+	struct GrdEntry *entry,
+	const ClusterPcmResourceXMasterRequest *request,
+	int32 requester_node, uint64 final_authority_generation,
+	ResourceXDecodedFrame *out);
+static bool pcm_resource_x_redrive_grant_intent_locked(
+	struct GrdEntry *entry, ClusterPcmResourceXMasterState *state,
+	ClusterPcmResourceXMasterRequest *request, int32 requester_node);
 typedef struct PcmResourceXRetirementWitness {
 	bool had_join;
 	bool already_settled;
@@ -1216,6 +1224,67 @@ cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation)
 										formation))
 		return RESOURCE_X_APPLY_APPLIED;
 	return current == formation ? RESOURCE_X_APPLY_DUPLICATE : RESOURCE_X_APPLY_STALE;
+}
+
+/*
+ * R11 source-removal cutover is the sole consumer allowed to observe the
+ * pristine, not-yet-authoritative gate image.  The ordinary gate snapshot
+ * deliberately rejects formation zero because no Resource-X operation may
+ * use it as authority.  This narrower snapshot accepts zero only while every
+ * mutable reconfiguration field is still at its initial value; it therefore
+ * proves readiness to bind the current R4 formation, not permission to read
+ * or write a resource.
+ */
+bool
+cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
+	ResourceXGateSnapshot *snapshot_out)
+{
+	ResourceXGateSnapshot snapshot;
+	uint32 dead_requester_bitmap;
+	uint32 phase_after;
+	uint64 activation_inflight;
+	uint64 reconfig_new_formation;
+	uint64 reconfig_old_formation;
+	int attempt;
+
+	if (snapshot_out == NULL)
+		return false;
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	if (ClusterPcm == NULL)
+		return false;
+
+	for (attempt = 0; attempt < 8; attempt++) {
+		memset(&snapshot, 0, sizeof(snapshot));
+		snapshot.phase
+			= pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+		pg_read_barrier();
+		snapshot.formation
+			= pg_atomic_read_u64(&ClusterPcm->resource_x_gate_formation);
+		snapshot.freeze_generation
+			= pg_atomic_read_u64(&ClusterPcm->resource_x_freeze_generation);
+		activation_inflight = pg_atomic_read_u64(
+			&ClusterPcm->resource_x_activation_inflight_count);
+		reconfig_old_formation = pg_atomic_read_u64(
+			&ClusterPcm->resource_x_reconfig_old_formation);
+		reconfig_new_formation = pg_atomic_read_u64(
+			&ClusterPcm->resource_x_reconfig_new_formation);
+		dead_requester_bitmap = pg_atomic_read_u32(
+			&ClusterPcm->resource_x_reconfig_dead_requester_bitmap);
+		pg_read_barrier();
+		phase_after
+			= pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+		if (snapshot.phase != phase_after)
+			continue;
+		*snapshot_out = snapshot;
+		return snapshot.phase == RESOURCE_X_GATE_OPEN
+			&& snapshot.formation != UINT64_MAX
+			&& snapshot.freeze_generation == 0
+			&& activation_inflight == 0
+			&& reconfig_old_formation == 0
+			&& reconfig_new_formation == 0
+			&& dead_requester_bitmap == 0;
+	}
+	return false;
 }
 
 bool
@@ -3473,6 +3542,70 @@ cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
 	*token_out = token;
 	*zero_proof_out = zero_proof;
 	*clean_proof_out = clean_proof;
+	return true;
+}
+
+bool
+cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
+	uint64 old_formation, uint64 record_generation, bool thawed,
+	uint64 *digest_out)
+{
+	ResourceXCleanCompletionProof clean;
+	ResourceXReconfigToken token;
+	ResourceXZeroResidualProof zero;
+	uint64 digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
+
+	if (digest_out == NULL)
+		return false;
+	*digest_out = 0;
+	if (old_formation == 0 || old_formation == UINT64_MAX
+		|| record_generation == 0 || record_generation == UINT64_MAX
+		|| old_formation == record_generation)
+		return false;
+	if (thawed) {
+		if (!cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
+				&token, &zero, &clean))
+			return false;
+	}
+	else if (!cluster_pcm_lock_resource_x_cutover_proofs_exact(
+				 &token, &zero, &clean))
+		return false;
+	if (token.old_formation != old_formation
+		|| token.new_formation != record_generation
+		|| token.reserved != 0
+		|| memcmp(&zero.token, &token, sizeof(token)) != 0
+		|| memcmp(&clean.token, &token, sizeof(token)) != 0
+		|| zero.proof_generation != token.freeze_generation
+		|| clean.proof_generation != token.freeze_generation
+		|| zero.complete_wrap != 1 || zero.zero_residual != 1
+		|| clean.logical_debt_zero != 1
+		|| clean.transport_debt_zero != 1
+		|| clean.transport_staged_count != 0
+		|| zero.final_mutation_sequence
+		   != clean.final_mutation_sequence)
+		return false;
+
+	/* Fold only explicit, exact fields.  The result is a local prerequisite
+	 * identity, never authority and never a wire value. */
+	digest = pcm_resource_x_proof_digest_u64(
+		digest, token.old_formation);
+	digest = pcm_resource_x_proof_digest_u64(
+		digest, token.new_formation);
+	digest = pcm_resource_x_proof_digest_u64(
+		digest, token.freeze_generation);
+	digest = pcm_resource_x_proof_digest_u64(
+		digest, (uint64)token.dead_requester_bitmap);
+	digest = pcm_resource_x_proof_digest_u64(
+		digest, zero.full_wrap_digest);
+	digest = pcm_resource_x_proof_digest_u64(
+		digest, zero.final_mutation_sequence);
+	digest = pcm_resource_x_proof_digest_u64(
+		digest, clean.logical_digest);
+	digest = pcm_resource_x_proof_digest_u64(
+		digest, clean.transport_mutation_sequence);
+	if (digest == 0)
+		digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
+	*digest_out = digest;
 	return true;
 }
 
@@ -11094,6 +11227,12 @@ pcm_resource_x_assert_exact_internal(
 				&& !pcm_resource_x_arm_block_intents_locked(
 					entry, state, request, requester_node))
 				request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
+			else if (same_attempt
+					 && request->phase
+						== RESOURCE_X_MASTER_GRANT_COMMITTED
+					 && !pcm_resource_x_redrive_grant_intent_locked(
+						 entry, state, request, requester_node))
+				request->phase = RESOURCE_X_MASTER_RECOVERY_BLOCKED;
 			pcm_resource_x_master_snapshot(&entry->tag, requester_node, state,
 										   request, out);
 			LWLockRelease(&entry->entry_lock.lock);
@@ -14104,6 +14243,88 @@ pcm_resource_x_build_authority_grant_locked(
 	grant->requester_connection_generation
 		= requester_connection_generation;
 	return RESOURCE_X_APPLY_APPLIED;
+}
+
+/* A physical AUTHORITY_GRANT send completion is not requester T3.  While the
+ * exact canonical request remains GRANT_COMMITTED, an ordinary R7 replay of
+ * the same ASSERT must recreate the same frozen grant after the prior DATA
+ * copy has completed.  This changes only the retained physical-send owner:
+ * authority, request identity, attempt, formation and session remain fixed. */
+static bool
+pcm_resource_x_redrive_grant_intent_locked(
+	struct GrdEntry *entry, ClusterPcmResourceXMasterState *state,
+	ClusterPcmResourceXMasterRequest *request, int32 requester_node)
+{
+	ClusterPcmResourceXControlIntent pending;
+	ClusterPcmResourceXControlIntent *intent;
+	ResourceXDecodedFrame grant;
+	ResourceXIntentBodyHandle body;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint64 now_us;
+	uint16 payload_len = 0;
+
+	Assert(entry != NULL);
+	Assert(state != NULL);
+	Assert(request != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	intent = &state->grant_intent;
+	if (requester_node < 0
+		|| requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| cluster_node_id < 0
+		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| request->phase != RESOURCE_X_MASTER_GRANT_COMMITTED
+		|| request->assertion_sequence == 0
+		|| request->assertion_sequence == UINT64_MAX
+		|| request->final_authority_generation == 0
+		|| request->final_authority_generation == UINT64_MAX
+		|| state->authority_generation
+			!= request->final_authority_generation
+		|| (PcmState)pg_atomic_read_u32(&entry->master_state)
+			!= PCM_STATE_X
+		|| entry->x_holder_node != requester_node
+		|| pg_atomic_read_u32(&entry->s_holders_bitmap) != 0
+		|| pcm_resource_x_build_authority_grant_locked(
+			entry, request, requester_node,
+			request->final_authority_generation, &grant)
+			!= RESOURCE_X_APPLY_APPLIED)
+		return false;
+
+	memset(&pending, 0, sizeof(pending));
+	if (!cluster_resource_x_wire_encode(
+			RESOURCE_X_MSG_IMAGE_OR_GRANT, &grant, pending.payload,
+			sizeof(pending.payload), &payload_len, &reject)
+		|| payload_len != RESOURCE_X_PROOF_V1_BYTES)
+		return false;
+	memset(&body, 0, sizeof(body));
+	body.assertion = grant.common.logical_assertion;
+	body.owner_generation = request->final_authority_generation;
+	body.owner_node = (uint32)cluster_node_id;
+	body.owner_kind = RESOURCE_X_INTENT_OWNER_MASTER_GRANT;
+
+	if (intent->slot.state != RESOURCE_X_INTENT_SLOT_EMPTY)
+		return (intent->slot.state == RESOURCE_X_INTENT_SLOT_ARMED
+				|| intent->slot.state == RESOURCE_X_INTENT_SLOT_STAGED)
+			&& intent->slot.logical_generation
+				== request->assertion_sequence
+			&& intent->slot.authority_generation
+				== request->final_authority_generation
+			&& intent->slot.destination_node == (uint32)requester_node
+			&& intent->slot.payload_bytes == payload_len
+			&& intent->slot.kind == RESOURCE_X_WIRE_AUTHORITY_GRANT
+			&& memcmp(&intent->slot.body, &body, sizeof(body)) == 0
+			&& memcmp(intent->payload, pending.payload, payload_len) == 0;
+
+	now_us = pcm_resource_x_monotonic_us();
+	if (now_us == 0 || now_us == UINT64_MAX
+		|| !cluster_pcm_lock_resource_x_intent_arm_exact(
+			&pending.slot, &body, request->assertion_sequence,
+			request->final_authority_generation, now_us,
+			(uint32)requester_node, payload_len,
+			RESOURCE_X_WIRE_AUTHORITY_GRANT)
+		|| !pcm_resource_x_intent_mark_dirty())
+		return false;
+	*intent = pending;
+	return true;
 }
 
 static ResourceXApplyResult

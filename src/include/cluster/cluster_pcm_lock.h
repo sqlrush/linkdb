@@ -1241,6 +1241,8 @@ cluster_pcm_lock_resource_x_outbound_intent_probe_exact(
 	uint16 payload_capacity, uint32 *examined_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
+extern bool cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
+	ResourceXGateSnapshot *snapshot_out);
 extern bool cluster_pcm_lock_resource_x_gate_snapshot(
 	ResourceXGateSnapshot *snapshot_out);
 extern ResourceXApplyResult
@@ -1294,6 +1296,11 @@ extern bool cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
 	ResourceXReconfigToken *token_out,
 	ResourceXZeroResidualProof *zero_proof_out,
 	ResourceXCleanCompletionProof *clean_proof_out);
+/* Bind the exact current R8/R10 pair to one source formation and cutover
+ * generation without exposing either shared-memory record as authority. */
+extern bool cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
+	uint64 old_formation, uint64 record_generation, bool thawed,
+	uint64 *digest_out);
 extern bool cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token);
 extern void cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *out);
 extern ResourceXExecutorProbeResult cluster_pcm_lock_resource_x_executor_probe_exact(

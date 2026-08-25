@@ -1920,6 +1920,10 @@ static void
 dump_pcm(ReturnSetInfo *rsinfo)
 {
 	ResourceXO1Stats o1;
+	ResourceXGateSnapshot resource_x_gate;
+	ResourceXReconfigStats resource_x_reconfig;
+	uint64 resource_x_x_commit_count;
+	bool resource_x_gate_exact;
 
 	/*
 	 * PGRAC: spec-2.30 D9 — dump_pcm activation surface.
@@ -1963,6 +1967,57 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)o1.last_remote_t_grant_us));
 	emit_row(rsinfo, "pcm", "last_remote_t_install_us",
 			 fmt_int64((int64)o1.last_remote_t_install_us));
+
+	/* R11 source-removed compatibility surface.  These rows retain the
+	 * frozen operational judge without retaining the deleted ticket runtime:
+	 * the live state/generation come from the sole Resource-X gate, the two
+	 * positive ownership witnesses come from native PCM X transitions, and
+	 * every retired queue/gauge value is structurally zero. */
+	memset(&resource_x_gate, 0, sizeof(resource_x_gate));
+	memset(&resource_x_reconfig, 0, sizeof(resource_x_reconfig));
+	resource_x_gate_exact
+		= cluster_pcm_lock_resource_x_gate_snapshot(&resource_x_gate);
+	cluster_resource_x_reconfig_stats_snapshot(&resource_x_reconfig);
+	resource_x_x_commit_count
+		= cluster_pcm_get_trans_n_to_x_count()
+		  + cluster_pcm_get_trans_s_to_x_upgrade_count();
+	emit_row(rsinfo, "pcm", "pcm_x_runtime_state",
+			 fmt_int32(resource_x_gate_exact
+					   && resource_x_gate.phase == RESOURCE_X_GATE_OPEN));
+	emit_row(rsinfo, "pcm", "pcm_x_runtime_generation",
+			 fmt_uint64(resource_x_gate_exact ? resource_x_gate.formation : 0));
+	emit_row(rsinfo, "pcm", "pcm_x_runtime_fail_closed_site", "(none)");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_enqueue_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_admit_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_confirm_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_promotion_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_transfer_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_complete_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_cancel_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_revoke_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_coalesced_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_wait_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_full_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_stale_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_miss_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_recovery_blocked_count",
+			 fmt_uint64(resource_x_reconfig.blocked_count));
+	emit_row(rsinfo, "pcm", "pcm_x_queue_activating_reset_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_depth", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_depth_high_water", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_active_tags", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_live_tickets", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_queue_live_slots", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_local_retire_gate", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_local_retire_marker_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_local_retire_marker_ticket_id", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_own_begin_count",
+			 fmt_uint64(resource_x_x_commit_count));
+	emit_row(rsinfo, "pcm", "pcm_x_own_commit_count",
+			 fmt_uint64(resource_x_x_commit_count));
+	emit_row(rsinfo, "pcm", "pcm_x_own_abort_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_own_busy_count", "0");
+	emit_row(rsinfo, "pcm", "pcm_x_own_corrupt_count", "0");
 
 	/*
 	 * PGRAC: spec-2.30 D9 — 5 NEW state summary row.
@@ -2278,6 +2333,12 @@ dump_gcs(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_gcs_get_pcm_x_self_handoff_count()));
 	emit_row(rsinfo, "gcs", "pcm_x_self_handoff_drain_count",
 			 fmt_int64((int64)cluster_gcs_get_pcm_x_self_handoff_drain_count()));
+	/* The immutable-record source is absent after R11.  Preserve its four
+	 * diagnostic keys as constant zero witnesses, never as target progress. */
+	emit_row(rsinfo, "gcs", "dedup_pcm_x_stage_count", "0");
+	emit_row(rsinfo, "gcs", "dedup_pcm_x_replay_count", "0");
+	emit_row(rsinfo, "gcs", "dedup_pcm_x_release_count", "0");
+	emit_row(rsinfo, "gcs", "dedup_pcm_x_failclosed_count", "0");
 	emit_row(rsinfo, "gcs", "invalidate_park_expired_count",
 			 fmt_int64((int64)cluster_gcs_get_invalidate_park_expired_count()));
 	emit_row(rsinfo, "gcs", "invalidate_park_overflow_count",
