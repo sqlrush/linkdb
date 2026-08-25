@@ -27,6 +27,8 @@ flowchart LR
     F --> G[07 R4 切换与 ticket 退役]
     G --> H[08 Oracle RAC 对比与边界]
     H --> I[09 终态参与者与源端写入排他]
+    I --> J[10 Target Acquire 诊断与切换验收]
+    J --> K[11 高并发 current block 安全交接]
 ```
 
 - [01：总体架构、资源模型与权威边界](01-architecture-and-resource-model.md)
@@ -38,6 +40,8 @@ flowchart LR
 - [07：R4 OPEN、双路径切换与旧 ticket 家族退役](07-r4-open-cutover-and-ticket-retirement.md)
 - [08：Oracle RAC 行为对照、PGRAC 适配与公开边界](08-oracle-rac-comparison-and-boundaries.md)
 - [09：终态参与者集合与源端写入排他窗口](09-terminal-participants-and-writer-exclusion.md)
+- [10：Target Acquire 诊断与 target-only 切换验收](10-target-acquire-diagnostics-and-cutover-validation.md)
+- [11：高并发下的 current block 安全交接](11-contention-safe-current-block-handoff.md)
 
 ## 一张图定位 Resource-X
 
