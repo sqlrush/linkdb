@@ -424,32 +424,21 @@ UT_TEST(test_target_direct_init_uses_exact_resource_x_round_without_legacy_fallb
 		"cluster_pcm_own_reservation_begin_exact",
 		"cluster_pcm_direct_init_target_pending_validate(",
 		"cluster_resource_x_writer_path_snapshot(",
-		"case RESOURCE_X_WRITER_TARGET:",
+		"writer_path != RESOURCE_X_WRITER_TARGET",
+		"cluster_pcm_own_abort_grant_after_error(",
 		"cluster_gcs_resource_x_target_direct_init_acquire_exact(",
 		"pending_base.generation",
 		"pending_token",
 		"cluster_pcm_direct_init_target_commit_validate(",
-		"case RESOURCE_X_WRITER_SOURCE:",
-		"cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X"
+		"cluster_bufmgr_pcm_x_writer_track_target_direct_init("
 	};
-	const char *target_case;
-	const char *source_case;
-	const char *legacy;
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
 		assert_ordered(source, target_order, lengthof(target_order));
-		target_case = strstr(source, "case RESOURCE_X_WRITER_TARGET:");
-		source_case = target_case != NULL
-			? strstr(target_case, "case RESOURCE_X_WRITER_SOURCE:") : NULL;
-		legacy = target_case != NULL
-			? strstr(target_case,
-				"cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X") : NULL;
-		UT_ASSERT(target_case != NULL);
-		UT_ASSERT(source_case != NULL);
-		UT_ASSERT(legacy != NULL);
-		if (source_case != NULL && legacy != NULL)
-			UT_ASSERT(legacy > source_case);
+		UT_ASSERT(strstr(source, "case RESOURCE_X_WRITER_SOURCE:") == NULL);
+		UT_ASSERT(strstr(source,
+			"cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X") == NULL);
 		free(source);
 	}
 }
@@ -506,13 +495,16 @@ UT_TEST(test_vm_fsm_use_dedicated_init_wrappers)
 	}
 }
 
-UT_TEST(test_valid_n_s_x_without_proof_enters_queue_before_legacy_wire)
+UT_TEST(test_valid_n_s_x_without_proof_uses_target_or_s_reservation)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
-		= { "pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_source(",
+		= { "if (pcm_mode == PCM_LOCK_MODE_X)",
+			"cluster_bufmgr_pcm_x_writer_prepare_target(",
+			"else",
 			"cluster_bufmgr_pcm_begin_grant_reservation_wait(",
-			"cluster_pcm_lock_acquire_buffer(buf, pcm_mode," };
+			"cluster_pcm_lock_acquire_buffer(",
+			"buf, PCM_LOCK_MODE_S, &retry_denied" };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
@@ -525,8 +517,13 @@ UT_TEST(test_direct_init_one_shot_image_cannot_return_without_x)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
-		= { "cluster_pcm_own_abort_grant_or_error(buf, &pending_base, pending_token",
-			"cluster_bufmgr_pcm_direct_init_no_grant_failclosed" };
+		= { "resource_x_result\n\t\t\t\t\t= cluster_gcs_resource_x_target_direct_init_acquire_exact(",
+			"resource_x_result != RESOURCE_X_APPLY_APPLIED",
+			"cluster_pcm_own_abort_grant_after_error(",
+			"cluster_bufmgr_resource_x_writer_report_failure(",
+			"cluster_pcm_direct_init_target_commit_validate(",
+			"cluster_bufmgr_pcm_x_writer_track_target_direct_init(",
+			"return;" };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
@@ -539,9 +536,9 @@ UT_TEST(test_wire_throw_exact_aborts_reservation_before_rethrow)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
-		= { "cluster_bufmgr_pcm_gate_direct_init(", "PG_CATCH();",
-			"cluster_pcm_own_abort_grant_after_error(buf, &pending_base, pending_token",
-			"\"direct-init acquire\"", "PG_RE_THROW();" };
+		= { "cluster_gcs_resource_x_target_direct_init_acquire_exact(", "PG_CATCH();",
+			"cluster_pcm_own_abort_grant_after_error(",
+			"\"direct-init Resource-X acquire\"", "PG_RE_THROW();" };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
@@ -564,13 +561,15 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 	UT_ASSERT(bufmgr != NULL);
 	UT_ASSERT(heapam != NULL);
 	if (bufmgr != NULL) {
-		/* The refusal arm sits between the queue acquire and the ERROR
-		 * report, and only the barrier-aware entry can consume it. */
+		/* The refusal arm sits between target acquire and the ERROR report,
+		 * and only the barrier-aware entry can consume it. */
 		static const char *const refusal_order[]
-			= { "cluster_gcs_pcm_x_acquire_writer(",
-				"buf, r4_generation, &entry->authority.source",
-				"PCM_X_QUEUE_BARRIER_CLOSED && barrier_refused != NULL",
-				"cluster_bufmgr_pcm_x_writer_report_failure(result, buf, \"queue acquire\")" };
+			= { "cluster_gcs_resource_x_target_acquire_exact(",
+				"cluster_pcm_lock_resource_x_gate_snapshot(&gate)",
+				"gate.phase != RESOURCE_X_GATE_OPEN",
+				"*pcm_barrier_refused = true",
+				"return NULL",
+				"cluster_bufmgr_resource_x_writer_report_failure(" };
 
 		static const char *const wrapper_signature[]
 			= { "ClusterLockBufferExclusiveBarrierAware(Buffer buffer,",
@@ -877,7 +876,7 @@ main(void)
 	UT_RUN(test_read_miss_and_found_hit_have_no_raw_unproven_lock);
 	UT_RUN(test_extend_proof_is_after_zeroextend_and_before_lock);
 	UT_RUN(test_vm_fsm_use_dedicated_init_wrappers);
-	UT_RUN(test_valid_n_s_x_without_proof_enters_queue_before_legacy_wire);
+	UT_RUN(test_valid_n_s_x_without_proof_uses_target_or_s_reservation);
 	UT_RUN(test_direct_init_one_shot_image_cannot_return_without_x);
 	UT_RUN(test_wire_throw_exact_aborts_reservation_before_rethrow);
 	UT_RUN(test_precrit_vm_barrier_refusal_unwinds_to_caller);

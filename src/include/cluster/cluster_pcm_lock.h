@@ -608,39 +608,6 @@ typedef struct PcmAuthoritySnapshot {
 StaticAssertDecl(sizeof(PcmAuthoritySnapshot) == 64,
 				 "PcmAuthoritySnapshot process-local layout must remain 64 bytes");
 
-/*
- * Exact queue-to-GRD X handoff token.  The queue engine builds this only
- * after the source image and every required invalidation are acknowledged.
- * It is deliberately process-local: changing it does not change wire ABI.
- */
-typedef struct PcmXGrdHandoffToken {
-	BufferTag tag;
-	PcmAuthoritySnapshot authority;
-	uint64 cluster_epoch;
-	uint64 request_id;
-	uint64 ticket_id;
-	uint64 grant_generation;
-	uint64 image_id;
-	uint64 source_own_generation;
-	SCN page_scn;
-	uint64 page_lsn;
-	int32 requester_node;
-	int32 source_node;
-	uint32 requester_procno;
-	uint32 page_checksum;
-} PcmXGrdHandoffToken;
-
-StaticAssertDecl(sizeof(PcmXGrdHandoffToken) == 168,
-				 "PcmXGrdHandoffToken process-local layout must remain 168 bytes");
-
-typedef enum PcmXGrdHandoffResult {
-	PCM_X_GRD_HANDOFF_OK = 0,
-	PCM_X_GRD_HANDOFF_DUPLICATE,
-	PCM_X_GRD_HANDOFF_NOT_FOUND,
-	PCM_X_GRD_HANDOFF_STALE,
-	PCM_X_GRD_HANDOFF_BAD_STATE,
-	PCM_X_GRD_HANDOFF_INVALID
-} PcmXGrdHandoffResult;
 typedef enum PcmXTransferCommitResult {
 	PCM_X_TRANSFER_COMMIT_OK = 0,
 	PCM_X_TRANSFER_COMMIT_NOT_FOUND,
@@ -938,6 +905,8 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	uint64 r4_record_generation, uint64 current_master_session_incarnation,
 	uint32 master_sender_connection_generation,
 	ResourceXDecodedFrame *ack_out);
+extern bool cluster_pcm_lock_resource_x_s_barrier_active(
+	const BufferTag *tag);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
@@ -1340,8 +1309,6 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_activate_exact
 extern void cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *out);
 extern void cluster_pcm_lock_resource_x_publish_no_progress_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXNoProgressReason reason);
-extern PcmXGrdHandoffResult
-cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token);
 extern int cluster_pcm_grd_count(void);
 extern void cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count,
 										int *pi_holders_total, int *convert_queue_active);

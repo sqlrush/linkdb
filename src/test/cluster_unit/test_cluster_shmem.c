@@ -52,7 +52,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
-#include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_page_guard.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
 
@@ -398,9 +398,12 @@ void
 cluster_pcm_lock_module_init(void)
 {}
 
-/* spec-2.36a S3-core stub: the PCM-X substrate has its own unit binary. */
 void
-cluster_pcm_x_convert_shmem_register(void)
+rf_page_guard_request_lwlocks_v1(void)
+{}
+
+void
+rf_page_guard_shmem_init_v1(void)
 {}
 
 /* Spec-2.32 D2 stub: cluster_init_shmem_module also calls

@@ -594,10 +594,10 @@ cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
 		|| receive_admission->formation_epoch != forward->base.epoch
 		|| forward->base.request_id == 0
 		|| forward->base.original_requester_node < 0
-		|| forward->base.original_requester_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| forward->base.original_requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| forward->base.requester_backend_id <= 0
 		|| forward->base.master_node < 0
-		|| forward->base.master_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| forward->base.master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| forward->base.transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| !GcsBlockForwardPayloadIsCrRequest(&forward->base)
 		|| forward->base.reserved_0[0] != 0 || forward->base.reserved_0[1] != 0
@@ -635,7 +635,7 @@ cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
 	worker_id = cluster_ic_tier1_my_data_channel();
 	if (CrServerShared == NULL || lms_state == NULL || worker_id < 0
 		|| worker_id >= CLUSTER_LMS_MAX_WORKERS || cluster_node_id < 0
-		|| cluster_node_id >= PCM_X_PROTOCOL_NODE_LIMIT)
+		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
 
 	/*
@@ -941,10 +941,10 @@ cr_server_r4_queued_identity_valid(const ClusterLmsCrSlot *slot,
 		|| slot->r4.route_proof.activation_generation == 0
 		|| slot->reply_master_node != slot->r4.route_proof.real_master_node
 		|| slot->r4.route_proof.selected_holder_node != cluster_node_id
-		|| slot->requester_node < 0 || slot->requester_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| slot->requester_node < 0 || slot->requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| slot->requester_backend <= 0
 		|| slot->reply_master_node < 0
-		|| slot->reply_master_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| slot->reply_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| slot->transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| slot->r4.requester_capability_generation == 0
 		|| slot->r4.master_capability_generation == 0
@@ -1237,7 +1237,7 @@ cr_server_r4_foreign_request_valid(uint32 slot_index, const ClusterLmsCrSlot *sl
 		|| slot->r4.origin_live_hwm_lsn != 0 || slot->r4.origin_tt_generation != 0
 		|| SCN_VALID(slot->r4.origin_authority_scn)
 		|| slot->r4.foreign_origin_node < 0
-		|| slot->r4.foreign_origin_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| slot->r4.foreign_origin_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| slot->r4.foreign_origin_node == cluster_node_id
 		|| !TransactionIdIsNormal(slot->r4.foreign_xid)
 		|| (slot->r4.foreign_wrap > TT_WRAP_MAX
@@ -1532,7 +1532,7 @@ cr_server_r4_foreign_landing_key_valid(
 		   && slot->epoch == slot->r4.route_proof.formation_epoch
 		   && slot->r4.origin_formation_epoch == slot->epoch
 		   && slot->r4.foreign_origin_node >= 0
-		   && slot->r4.foreign_origin_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && slot->r4.foreign_origin_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
 		   && slot->r4.foreign_origin_node != cluster_node_id
 		   && slot->r4.origin_live_hwm_lsn == 0
 		   && slot->r4.origin_tt_generation == 0
@@ -1582,7 +1582,7 @@ cluster_cr_server_r4_land_foreign_undo(
 			   != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
 		|| header->transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| header->sender_node < 0
-		|| header->sender_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| header->sender_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| env->source_node_id != (uint32)header->sender_node
 		|| GcsBlockReplyHeaderGetForwardingMasterNode(header)
 			   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER

@@ -62,8 +62,8 @@ typedef enum ResourceXRetryApplyResult {
 	RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED
 } ResourceXRetryApplyResult;
 
-/* Existing type-60 PcmXPhasePayload.reason value domain.  The enum values
- * are internal classifications, not wire values. */
+/* Internal terminal classifications retained by Resource-X.  These values
+ * are not wire encodings. */
 typedef enum ResourceXTerminalReason {
 	RESOURCE_X_TERMINAL_REASON_INVALID = 0,
 	RESOURCE_X_TERMINAL_REASON_LEGACY_CANCEL,

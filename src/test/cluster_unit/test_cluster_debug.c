@@ -47,7 +47,7 @@
 #include "cluster/cluster_grd.h"		  /* ClusterGrdRecoveryCounters */
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
-#include "cluster/cluster_pcm_x_convert.h"
+#include "cluster/cluster_lmd.h"
 #include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched getter stubs */
 #include "cluster/cluster_touched_peers.h"	  /* spec-5.14 D6 self_hex stub */
 #include "cluster/cluster_xnode_profile.h"	  /* spec-5.59 D1 profiling gate stubs */
@@ -991,15 +991,6 @@ cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count, int *pi_ho
 	*convert_queue_active = 0;
 }
 
-bool
-cluster_pcm_x_stats_snapshot(PcmXStatsSnapshot *snapshot_out)
-{
-	if (snapshot_out == NULL)
-		return false;
-	memset(snapshot_out, 0, sizeof(*snapshot_out));
-	return false;
-}
-
 void
 cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
 {
@@ -1009,65 +1000,6 @@ cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
 	memset(snapshot_out, 0, sizeof(*snapshot_out));
 	for (i = 0; i < 9; i++)
 		values[i] = UINT64CONST(301) + (uint64)i;
-}
-
-void
-cluster_pcm_x_acquire_observation_snapshot(PcmXAcquireObservationSnapshot *snapshot_out)
-{
-	int i;
-
-	memset(snapshot_out, 0, sizeof(*snapshot_out));
-	snapshot_out->started_count = 11;
-	snapshot_out->active_count = 12;
-	snapshot_out->exception_count = 13;
-	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++)
-		snapshot_out->terminal_result_count[i] = UINT64CONST(100) + (uint64)i;
-	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++)
-		snapshot_out->success_latency_bucket[i] = UINT64CONST(200) + (uint64)i;
-	snapshot_out->success_latency_overflow_count = 999;
-}
-
-PcmXRuntimeSnapshot
-cluster_pcm_x_runtime_snapshot(void)
-{
-	PcmXRuntimeSnapshot snapshot = { 0 };
-
-	snapshot.state = PCM_X_RUNTIME_ACTIVE;
-	snapshot.gate_generation = 1;
-	return snapshot;
-}
-
-bool
-cluster_pcm_x_runtime_fail_closed_site(char *buf, Size buflen)
-{
-	if (buf != NULL && buflen > 0)
-		buf[0] = '\0';
-	return false;
-}
-
-bool
-cluster_pcm_x_master_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
-{
-	return false;
-}
-
-bool
-cluster_pcm_x_master_ticket_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
-{
-	return false;
-}
-
-bool
-cluster_pcm_x_local_tag_debug_next(Size *cursor_io, Size *index_out, char *buf, Size buflen)
-{
-	return false;
-}
-
-bool
-cluster_pcm_x_terminal_note_read(uint32 *op_out, uint32 *result_out, uint64 *ticket_out,
-								 uint32 *count_out)
-{
-	return false;
 }
 
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
@@ -4657,223 +4589,6 @@ captured_dump_value(const char *category, const char *key)
 	return NULL;
 }
 
-UT_TEST(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets)
-{
-	static const char *const pcm_keys[] = {
-		"pcm_x_runtime_state",
-		"pcm_x_runtime_generation",
-		"pcm_x_runtime_fail_closed_site",
-		"pcm_x_queue_enqueue_count",
-		"pcm_x_queue_admit_count",
-		"pcm_x_queue_confirm_count",
-		"pcm_x_queue_promotion_count",
-		"pcm_x_queue_transfer_count",
-		"pcm_x_queue_complete_count",
-		"pcm_x_queue_cancel_count",
-		"pcm_x_queue_revoke_count",
-		"pcm_x_queue_coalesced_count",
-		"pcm_x_queue_wait_count",
-		"pcm_x_queue_full_count",
-		"pcm_x_queue_stale_count",
-		"pcm_x_queue_miss_count",
-		"pcm_x_queue_recovery_blocked_count",
-		"pcm_x_queue_activating_reset_count",
-		"pcm_x_queue_depth",
-		"pcm_x_queue_depth_high_water",
-		"pcm_x_queue_active_tags",
-		"pcm_x_queue_live_tickets",
-		"pcm_x_queue_live_slots",
-		"pcm_x_local_retire_gate",
-		"pcm_x_local_retire_marker_count",
-		"pcm_x_local_retire_marker_ticket_id",
-		"pcm_x_own_begin_count",
-		"pcm_x_own_commit_count",
-		"pcm_x_own_abort_count",
-		"pcm_x_own_busy_count",
-		"pcm_x_own_corrupt_count",
-		"retry_producer_due_count",
-		"retry_wire_attempt_count",
-		"retry_transport_rebound_count",
-		"retry_terminal_success_count",
-		"retry_terminal_denied_count",
-		"retry_budget_exhausted_count",
-		"retry_recovery_blocked_count",
-		"retry_terminal_latency_us_count",
-		"retry_terminal_latency_us_max",
-		"master_grant_delivery_pending_count",
-		"master_grant_delivery_oldest_age_us",
-	};
-	static const char *const lmd_keys[] = {
-		"pcm_convert_wfg_replace_count",
-		"pcm_convert_wfg_remove_count",
-		"pcm_convert_wfg_replace_fail_count",
-		"pcm_convert_wfg_exact_remove_stale_count",
-	};
-	static const char *const lmon_keys[] = {
-		"lmon_timed_duty_sample_count",
-		"lmon_total_iter_us",
-	};
-	static const char *const gcs_keys[] = {
-		"dedup_pcm_x_stage_count",
-		"dedup_pcm_x_replay_count",
-		"dedup_pcm_x_release_count",
-		"dedup_pcm_x_failclosed_count",
-		"invalidate_passive_s_release_count",
-		"pcm_x_self_handoff_count",
-		"pcm_x_self_handoff_drain_count",
-		"pi_durable_note_apply_count",
-		"pi_master_metadata_retire_count",
-	};
-	static const char *const result_labels[] = {
-		"ok",
-		"duplicate",
-		"retired",
-		"not_found",
-		"stale",
-		"no_capacity",
-		"counter_exhausted",
-		"not_ready",
-		"busy",
-		"bad_state",
-		"corrupt",
-		"invalid",
-		"gate_retry",
-		"barrier_closed",
-	};
-	static const char *const pcm_acquire_scalar_keys[] = {
-		"pcm_x_acquire_started_count",
-		"pcm_x_acquire_active_count",
-		"pcm_x_acquire_exception_count",
-		"pcm_x_acquire_success_us_overflow_count",
-	};
-	static const char *const undo_capacity_keys[] = {
-		"segment_observation_status",
-		"segment_allocated_count",
-		"segment_allocated_high_water",
-		"segment_effective_cap",
-	};
-	static const char *const write_fence_external_keys[] = {
-		"external_admit_requested",
-		"external_write_excluded",
-		"external_rejected",
-		"external_unknown",
-		"external_unavailable",
-		"external_identity_mismatch",
-		"external_expired",
-		"external_daemon_disconnect",
-		"external_mutation_gate_blocked",
-		"external_publish_gate_blocked",
-		"external_last_journal_seq",
-		"external_last_proof_age_ms",
-	};
-	static const char *const o1_keys[] = {
-		"remote_install_observed_count",
-		"remote_grant_after_image_count",
-		"remote_image_at_or_after_grant_count",
-		"remote_episode_excluded_no_install",
-		"remote_episode_excluded_missing_grant",
-		"remote_episode_excluded_missing_image",
-		"last_remote_t_image_us",
-		"last_remote_t_grant_us",
-		"last_remote_t_install_us",
-	};
-	LOCAL_FCINFO(fcinfo, 0);
-	ReturnSetInfo rsinfo;
-	char key[96];
-	char expected_value[32];
-	const char *old_alias_value;
-	const char *new_alias_value;
-	int i;
-
-	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
-	memset(&rsinfo, 0, sizeof(rsinfo));
-	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
-	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
-	memset(captured_dump_values, 0, sizeof(captured_dump_values));
-	captured_dump_row_count = 0;
-	captured_formatted_value_count = 0;
-	captured_undo_observation_ensure_calls = 0;
-	captured_pi_retire_accessor_calls = 0;
-	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
-	(void)cluster_dump_state(fcinfo);
-
-	UT_ASSERT_EQ(PCM_X_QUEUE_RESULT_COUNT, 14);
-	UT_ASSERT_EQ(PCM_X_ACQUIRE_HIST_BUCKETS, 32);
-	UT_ASSERT_EQ((int)lengthof(result_labels), PCM_X_QUEUE_RESULT_COUNT);
-	UT_ASSERT_EQ(captured_dump_count("pcm", NULL), 131);
-	UT_ASSERT_EQ(captured_dump_count("lmd", NULL), 51);
-	UT_ASSERT_EQ(captured_dump_count("lmon", NULL), 12);
-	UT_ASSERT_EQ(captured_dump_count("gcs", NULL), 121);
-	UT_ASSERT_EQ(captured_dump_count("write_fence", NULL), 20);
-	for (i = 0; i < (int)lengthof(pcm_keys); i++)
-		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_keys[i]), 1);
-	for (i = 0; i < (int)lengthof(lmd_keys); i++)
-		UT_ASSERT_EQ(captured_dump_count("lmd", lmd_keys[i]), 1);
-	for (i = 0; i < (int)lengthof(lmon_keys); i++)
-		UT_ASSERT_EQ(captured_dump_count("lmon", lmon_keys[i]), 1);
-	for (i = 0; i < (int)lengthof(gcs_keys); i++)
-		UT_ASSERT_EQ(captured_dump_count("gcs", gcs_keys[i]), 1);
-
-	/* R1-A exact 57-row census: 4 scalar O2 rows include overflow. */
-	for (i = 0; i < (int)lengthof(pcm_acquire_scalar_keys); i++)
-		UT_ASSERT_EQ(captured_dump_count("pcm", pcm_acquire_scalar_keys[i]), 1);
-	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[0]), "11");
-	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[1]), "12");
-	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[2]), "13");
-	UT_ASSERT_STR_EQ(captured_dump_value("pcm", pcm_acquire_scalar_keys[3]), "999");
-	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_proof_readiness"), 1);
-	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_proof_readiness"),
-					 "AVAILABLE_PROOF_KIND");
-
-	for (i = 0; i < PCM_X_QUEUE_RESULT_COUNT; i++) {
-		snprintf(key, sizeof(key), "pcm_x_acquire_result_%s_count", result_labels[i]);
-		snprintf(expected_value, sizeof(expected_value), "%d", 100 + i);
-		UT_ASSERT_EQ(captured_dump_count("pcm", key), 1);
-		UT_ASSERT_STR_EQ(captured_dump_value("pcm", key), expected_value);
-	}
-	for (i = 0; i < PCM_X_ACQUIRE_HIST_BUCKETS; i++) {
-		snprintf(key, sizeof(key), "pcm_x_acquire_success_us_le_2p%02d_count", i);
-		snprintf(expected_value, sizeof(expected_value), "%d", 200 + i);
-		UT_ASSERT_EQ(captured_dump_count("pcm", key), 1);
-		UT_ASSERT_STR_EQ(captured_dump_value("pcm", key), expected_value);
-	}
-
-	UT_ASSERT_STR_EQ(captured_dump_value("lmon", lmon_keys[0]), "41");
-	UT_ASSERT_STR_EQ(captured_dump_value("lmon", lmon_keys[1]), "42");
-	for (i = 0; i < (int)lengthof(undo_capacity_keys); i++)
-		UT_ASSERT_EQ(captured_dump_count("undo", undo_capacity_keys[i]), 1);
-	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[0]), "READY");
-	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[1]), "51");
-	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[2]), "52");
-	UT_ASSERT_STR_EQ(captured_dump_value("undo", undo_capacity_keys[3]), "53");
-	UT_ASSERT_EQ(captured_undo_observation_ensure_calls, 1);
-	for (i = 0; i < (int)lengthof(write_fence_external_keys); i++)
-		UT_ASSERT_EQ(captured_dump_count("write_fence",
-										write_fence_external_keys[i]), 1);
-	UT_ASSERT_STR_EQ(captured_dump_value("write_fence",
-									 "external_last_journal_seq"), "0");
-	UT_ASSERT_STR_EQ(captured_dump_value("write_fence",
-									 "external_last_proof_age_ms"), "-");
-
-	old_alias_value = captured_dump_value("gcs", "pi_watermark_retire_count");
-	new_alias_value = captured_dump_value("gcs", "pi_master_metadata_retire_count");
-	UT_ASSERT_NOT_NULL(old_alias_value);
-	UT_ASSERT_NOT_NULL(new_alias_value);
-	UT_ASSERT_STR_EQ(old_alias_value, "73");
-	UT_ASSERT_STR_EQ(old_alias_value, new_alias_value);
-	UT_ASSERT_EQ(captured_pi_retire_accessor_calls, 1);
-
-	/* D10-08 activates the complete nine-row cohort in one dump schema. */
-	for (i = 0; i < (int)lengthof(o1_keys); i++)
-	{
-		snprintf(expected_value, sizeof(expected_value), "%d", 301 + i);
-		UT_ASSERT_EQ(captured_dump_count("pcm", o1_keys[i]), 1);
-		UT_ASSERT_STR_EQ(captured_dump_value("pcm", o1_keys[i]),
-						 expected_value);
-	}
-}
-
-
 /* ============================================================
  * Iterator API on cluster_inject (added in spec-0.29 §1.4).
  * ============================================================ */
@@ -5450,9 +5165,8 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(11);
 	UT_RUN(test_debug_dump_srf_linkable);
-	UT_RUN(test_debug_dump_exposes_exact_pcm_x_lmd_and_gcs_key_sets);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);
 	UT_RUN(test_debug_inject_get_state_at_null_outs);

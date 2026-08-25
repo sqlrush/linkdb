@@ -32,7 +32,6 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_multixact_current_wire.h"
-#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "storage/buf_internals.h"
 
@@ -67,15 +66,6 @@ StaticAssertDecl(offsetof(GcsBlockInvalidateAckPayload, tag) == 16,
 				 "spec-7.3 D4: GcsBlockInvalidateAckPayload.tag offset moved");
 StaticAssertDecl(offsetof(GcsBlockDonePayload, tag) == 16,
 				 "GCS-race round-2 review F4: GcsBlockDonePayload.tag offset moved");
-StaticAssertDecl(offsetof(PcmXWaitIdentity, tag) == 0, "PCM-X wait tag must lead payloads");
-StaticAssertDecl(offsetof(PcmXTicketRef, identity) == 0,
-				 "PCM-X ticket identity must lead payloads");
-StaticAssertDecl(offsetof(PcmXEnqueuePayload, identity) == 0,
-				 "PCM-X enqueue tag carrier must lead payload");
-StaticAssertDecl(offsetof(PcmXAdmitAckPayload, ref) == 0, "PCM-X ref carrier must lead payload");
-StaticAssertDecl(offsetof(PcmXBlockerChunkPayload, tag) == 0,
-				 "PCM-X blocker tag must lead payload");
-
 static bool
 cluster_resource_x_payload_route_tag(uint8 msg_type, const void *payload,
 									 uint16 payload_len, BufferTag *tag)
@@ -95,9 +85,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 								int n_workers)
 {
 	const BufferTag *tag;
-	BufferTag pcm_x_tag;
+	BufferTag route_tag;
 	BufferTag resource_x_tag;
-	uint16 pcm_x_expected_len = 0;
 
 	if (payload == NULL)
 		return -1;
@@ -139,11 +128,11 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 				|| frame->trailer.version != CLUSTER_CURRENT_MX_WIRE_VERSION
 				|| frame->trailer.flags != CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE)
 				return -1;
-			pcm_x_tag = GcsBlockCurrentMxRouteTagMake(
+			route_tag = GcsBlockCurrentMxRouteTagMake(
 				current_mx->request_id, current_mx->epoch,
 				current_mx->original_requester_node,
 				current_mx->requester_backend_id);
-			tag = &pcm_x_tag;
+			tag = &route_tag;
 			break;
 		}
 		if (payload_len != sizeof(GcsBlockForwardPayload)
@@ -212,18 +201,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &((const GcsBlockDonePayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_PCM_X_ENQUEUE:
-		pcm_x_expected_len = sizeof(PcmXEnqueuePayload);
-		break;
 	case PGRAC_IC_MSG_PCM_X_ADMIT_ACK:
-		if (payload_len != sizeof(PcmXAdmitAckPayload)
-			&& payload_len != sizeof(PcmXAdmitAckPayloadV2))
-			return -1;
-		memcpy(&pcm_x_tag, payload, sizeof(pcm_x_tag));
-		tag = &pcm_x_tag;
-		break;
 	case PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL_ACK:
-		pcm_x_expected_len = sizeof(PcmXAdmitAckPayload);
-		break;
 	case PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM:
 	case PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK:
 	case PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK:
@@ -233,56 +212,26 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 	case PGRAC_IC_MSG_PCM_X_CANCEL:
 	case PGRAC_IC_MSG_PCM_X_CANCEL_ACK:
 	case PGRAC_IC_MSG_PCM_X_DRAIN_ACK:
-		pcm_x_expected_len = sizeof(PcmXPhasePayload);
-		break;
 	case PGRAC_IC_MSG_PCM_X_BLOCKER_SET_BEGIN:
 	case PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT:
-		pcm_x_expected_len = sizeof(PcmXBlockerSetHeaderPayload);
-		break;
 	case PGRAC_IC_MSG_PCM_X_BLOCKER_SET_EDGE:
-		pcm_x_expected_len = sizeof(PcmXBlockerChunkPayload);
-		break;
 	case PGRAC_IC_MSG_PCM_X_REVOKE:
-		/* Source-floor V2 appends one SCN to the byte-identical V1 prefix. */
-		if (payload_len != sizeof(PcmXRevokePayload) && payload_len != sizeof(PcmXRevokePayloadV2))
-			return -1;
-		memcpy(&pcm_x_tag, payload, sizeof(pcm_x_tag));
-		tag = &pcm_x_tag;
-		break;
 	case PGRAC_IC_MSG_PCM_X_IMAGE_READY:
 	case PGRAC_IC_MSG_PCM_X_PREPARE_GRANT:
-		pcm_x_expected_len = sizeof(PcmXGrantPayload);
-		break;
 	case PGRAC_IC_MSG_PCM_X_INSTALL_READY:
-		/* A' rebase: the V1 104-byte and V2 112-byte exact frames are both
-		 * legal; the tag prefix is identical, so the shard key is too. */
-		if (payload_len != sizeof(PcmXInstallReadyPayload)
-			&& payload_len != PCM_X_INSTALL_READY_V1_LEN)
-			return -1;
-		memcpy(&pcm_x_tag, payload, sizeof(pcm_x_tag));
-		tag = &pcm_x_tag;
-		break;
 	case PGRAC_IC_MSG_PCM_X_FINAL_ACK:
-		pcm_x_expected_len = sizeof(PcmXFinalAckPayload);
-		break;
 	case PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL:
-		pcm_x_expected_len = sizeof(PcmXPrehandleCancelPayload);
-		break;
 	case PGRAC_IC_MSG_PCM_X_DRAIN_POLL:
-		pcm_x_expected_len = sizeof(PcmXDrainPollPayload);
-		break;
+	case PGRAC_IC_MSG_PCM_X_RETIRE_UP_TO:
+	case PGRAC_IC_MSG_PCM_X_RETIRE_ACK:
+		/* Source-removed values are routed to the one bounded stale-family
+		 * disposition.  No retired payload byte is parsed for a tag. */
+		return n_workers > 0 ? 0 : -1;
 	default:
 		/* Tagless replies are direct-sent, not staged; any other DATA type
 		 * needs an explicit shard key before it may enter an outbound ring. */
 		return -1;
 	}
-	if (pcm_x_expected_len != 0) {
-		if (payload_len != pcm_x_expected_len)
-			return -1;
-		memcpy(&pcm_x_tag, payload, sizeof(pcm_x_tag));
-		tag = &pcm_x_tag;
-	}
-
 	return cluster_lms_shard_for_tag(tag, n_workers);
 }
 

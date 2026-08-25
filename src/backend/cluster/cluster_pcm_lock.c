@@ -769,6 +769,8 @@ static ClusterPcmResourceXMasterRequest *pcm_resource_x_master_head(
 static bool pcm_resource_x_s_barrier_active_locked(struct GrdEntry *entry);
 static bool pcm_resource_x_bootstrap_receipt_valid(
 	const ClusterPcmResourceXBootstrapReceipt *receipt);
+static bool pcm_resource_x_local_owner_handle_valid(
+	const ResourceXLocalOwnerHandle *handle);
 static void pcm_resource_x_bootstrap_receipt_invalidate(
 	ClusterPcmResourceXBootstrapReceipt *receipt);
 static bool pcm_resource_x_bootstrap_priority_valid(
@@ -1536,9 +1538,12 @@ pcm_resource_x_reconfig_proof_slot_locked(
 	static const ClusterPcmResourceXMasterRequest empty_request;
 	static const ClusterPcmResourceXTerminalTombstone empty_tombstone;
 	const ClusterPcmResourceXBootstrapPriority *priority;
+	const ClusterPcmResourceXLocalOwner *local_owner;
 	ResourceXRequesterJoinSnapshot join;
 	ResourceXDecodedFrame source_settlement;
 	uint64 digest;
+	uint64 local_owner_formation;
+	uint64 local_owner_generation;
 	int requester_node;
 	int holder_node;
 
@@ -1574,6 +1579,40 @@ pcm_resource_x_reconfig_proof_slot_locked(
 			digest, entry->resource_x_acquisition_generation);
 		digest = pcm_resource_x_proof_digest_u64(
 			digest, (uint64)entry->resource_x_progress_flags);
+	}
+	local_owner = &entry->resource_x_local_owner;
+	if (!pcm_resource_x_local_owner_valid_locked(local_owner))
+		return false;
+	if (local_owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
+		if (local_owner->state == RESOURCE_X_LOCAL_OWNER_HANDOFF) {
+			if (!BufferTagsEqual(
+					&local_owner->handoff.successor_assertion.resource,
+					&entry->tag))
+				return false;
+			local_owner_formation = local_owner->handoff.holder_ref.formation;
+			local_owner_generation = local_owner->highest_owner_generation;
+		}
+		else {
+			if (!BufferTagsEqual(
+					&local_owner->handle.ref.assertion.resource,
+					&entry->tag))
+				return false;
+			local_owner_formation = local_owner->handle.ref.formation;
+			local_owner_generation = local_owner->handle.owner_generation;
+		}
+		if (local_owner_formation != token->old_formation
+			&& local_owner_formation != token->new_formation)
+			return false;
+		if (local_owner_formation == token->old_formation)
+			*old_residual_out = true;
+		else
+			(*successor_count_io)++;
+		digest = pcm_resource_x_proof_digest_u64(
+			digest, local_owner_formation);
+		digest = pcm_resource_x_proof_digest_u64(
+			digest, local_owner_generation);
+		digest = pcm_resource_x_proof_digest_u64(
+			digest, (uint64)local_owner->state);
 	}
 
 	priority = &state->bootstrap_priority;
@@ -4219,127 +4258,6 @@ cluster_pcm_lock_resource_x_publish_no_progress_exact(const ResourceXAcquisition
 		ConditionVariableBroadcast(&entry->wait_cv);
 }
 
-/*
- * Atomically install the queue winner as the sole X holder, but only if the
- * authority still exactly matches the snapshot captured when the transfer
- * began.  No engine lock is held here; callers prepare an immutable token,
- * perform this GRD barrier, then finalize their queue state.
- */
-PcmXGrdHandoffResult
-cluster_pcm_lock_queue_handoff_x_exact(const PcmXGrdHandoffToken *token)
-{
-	struct GrdEntry *entry;
-	PcmAuthoritySnapshot current;
-	ClusterGrdHolderId requester;
-	PcmXGrdHandoffResult result = PCM_X_GRD_HANDOFF_BAD_STATE;
-	bool found;
-	bool broadcast = false;
-	uint64 pending_x_value;
-	uint32 source_bit;
-
-	if (token == NULL || token->requester_node < 0 || token->requester_node >= 32
-		|| token->source_node < 0 || token->source_node >= 32 || token->request_id == 0
-		|| token->grant_generation == 0
-		|| !cluster_pcm_x_image_id_decode(token->image_id, NULL, NULL))
-		return PCM_X_GRD_HANDOFF_INVALID;
-	if (!PcmPendingXQueueValue(token->ticket_id, &pending_x_value))
-		return PCM_X_GRD_HANDOFF_INVALID;
-	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
-		return PCM_X_GRD_HANDOFF_NOT_FOUND;
-
-	requester.node_id = (uint32)token->requester_node;
-	requester.procno = token->requester_procno;
-	requester.cluster_epoch = token->cluster_epoch;
-	requester.request_id = token->request_id;
-	source_bit = (uint32)1u << (uint32)token->source_node;
-
-	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
-	entry = (struct GrdEntry *)hash_search(cluster_pcm_htab, &token->tag, HASH_FIND, &found);
-	if (!found || entry == NULL) {
-		LWLockRelease(&ClusterPcm->htab_lock.lock);
-		return PCM_X_GRD_HANDOFF_NOT_FOUND;
-	}
-
-	LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
-	pcm_authority_snapshot_locked(entry, &current);
-
-	/* A retry after the commit barrier is harmless only for the same full
-	 * requester identity and an image no newer than the installed Lamport-SCN
-	 * authority.  page_lsn is per-node A-record evidence, not a cross-node
-	 * version comparator. */
-	if (current.state == PCM_STATE_X && current.x_holder_node == token->requester_node
-		&& current.s_holders_bitmap == 0 && current.pending_x_requester_node == -1
-		&& memcmp(&current.master_holder, &requester, sizeof(requester)) == 0
-		&& (!SCN_VALID(token->page_scn)
-			|| scn_local(entry->pi_watermark_scn) >= scn_local(token->page_scn))) {
-		result = PCM_X_GRD_HANDOFF_DUPLICATE;
-		goto done;
-	}
-
-	if (!pcm_authority_snapshot_equal(&current, &token->authority)) {
-		result = PCM_X_GRD_HANDOFF_STALE;
-		goto done;
-	}
-	if (current.pending_x_requester_node != token->requester_node
-		|| current.pending_x_since_lsn != pending_x_value)
-		goto done;
-	/* The authority snapshot deliberately excludes watermarks, so close the
-	 * SCN window under the same entry lock as the pending-X cookie and GRD
-	 * transition.  Cross-node version authority is Lamport page_scn only;
-	 * page_lsn belongs to its source WAL stream and remains A-record evidence. */
-	if (SCN_VALID(entry->pi_watermark_scn)
-		&& (!SCN_VALID(token->page_scn)
-			|| scn_local(token->page_scn) < scn_local(entry->pi_watermark_scn)))
-		goto done;
-
-	if (current.state == PCM_STATE_X) {
-		if (current.x_holder_node != token->source_node || current.s_holders_bitmap != 0
-			|| current.master_holder.node_id != (uint32)token->source_node)
-			goto done;
-	} else if (current.state == PCM_STATE_S) {
-		if (current.x_holder_node != -1 || current.s_holders_bitmap != source_bit
-			|| current.master_holder.node_id != (uint32)token->source_node)
-			goto done;
-	} else if (current.state == PCM_STATE_N) {
-		/* A cold global-N round has no physical cache holder.  The queue names
-		 * the requester as synthetic source so the existing image/A-record path
-		 * remains mandatory and the final barrier stays ticket-exact. */
-		if (token->source_node != token->requester_node || current.x_holder_node != -1
-			|| current.s_holders_bitmap != 0 || pcm_master_holder_is_valid(entry))
-			goto done;
-	} else {
-		goto done;
-	}
-
-	pg_atomic_write_u32(&entry->master_state, (uint32)PCM_STATE_X);
-	entry->x_holder_node = token->requester_node;
-	pg_atomic_write_u32(&entry->s_holders_bitmap, 0);
-	entry->s_holder_refcount_local = 0;
-	pcm_master_holder_set_exact(entry, &requester);
-	entry->pending_x_requester_node = -1;
-	entry->pending_x_since_lsn = 0;
-	if (SCN_VALID(token->page_scn)
-		&& scn_local(token->page_scn) > scn_local(entry->pi_watermark_scn)) {
-		SCN old_scn = entry->pi_watermark_scn;
-
-		entry->pi_watermark_scn = token->page_scn;
-		pcm_wm_prov_record(token->tag, old_scn, token->page_scn, CLUSTER_PCM_WM_SRC_GRANT_X,
-						   token->source_node, token->request_id, token->cluster_epoch);
-	}
-	entry->last_transition_at = GetCurrentTimestamp();
-	pg_atomic_fetch_add_u64(&entry->transition_count_local, 1);
-	broadcast = true;
-	result = PCM_X_GRD_HANDOFF_OK;
-
-done:
-	LWLockRelease(&entry->entry_lock.lock);
-	LWLockRelease(&ClusterPcm->htab_lock.lock);
-	if (broadcast)
-		ConditionVariableBroadcast(&entry->wait_cv);
-	return result;
-}
-
-
 /* ============================================================
  * PGRAC: spec-2.36 D5 HC117 / HC124 — S barrier helpers.
  *
@@ -6600,7 +6518,7 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 			&& authority.x_holder_node != cluster_node_id
 			&& authority.s_holders_bitmap == 0
 			&& authority.master_holder.node_id == (uint32)authority.x_holder_node;
-		s_barrier_active = cluster_gcs_block_pcm_x_local_s_barrier_active(tag);
+		s_barrier_active = cluster_gcs_block_resource_x_local_s_barrier_active(tag);
 		if (s_barrier_active && !remote_x_exact) {
 			*out_retry_denied = true;
 			return false;
@@ -6710,7 +6628,7 @@ cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *out_ret
 		if (!pcm_lock_acquire_local(tag, mode, &raced_remote_x)) {
 			if (mode == PCM_LOCK_MODE_S)
 				return cluster_gcs_local_master_read_image_and_wait(buf, &raced_remote_x,
-					cluster_gcs_block_pcm_x_local_s_barrier_active(tag),
+					cluster_gcs_block_resource_x_local_s_barrier_active(tag),
 					out_retry_denied);
 			return cluster_gcs_local_master_x_transfer_and_wait(buf, &raced_remote_x,
 																clean_eligible, out_retry_denied);
@@ -11028,6 +10946,50 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	}
 	LWLockRelease(&entry->entry_lock.lock);
 	return result;
+}
+
+bool
+cluster_pcm_lock_resource_x_s_barrier_active(const BufferTag *tag)
+{
+	ClusterPcmResourceXMasterState *state;
+	struct GrdEntry *entry;
+	int32 requester_node;
+	bool barrier_active = false;
+
+	if (tag == NULL)
+		return true;
+	entry = pcm_find_entry(*tag);
+	if (entry == NULL)
+		return false;
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	state = pcm_resource_x_master_state_for_tag(&entry->tag);
+	if (state == NULL || state->authority_generation == 0
+		|| state->authority_generation == UINT64_MAX
+		|| state->next_enqueue_order == 0
+		|| state->next_enqueue_order == UINT64_MAX) {
+		barrier_active = true;
+		goto out;
+	}
+	for (requester_node = 0;
+		 requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
+		 requester_node++) {
+		const ClusterPcmResourceXBootstrapReceipt *receipt
+			= &state->bootstrap_receipts[requester_node];
+		const ClusterPcmResourceXMasterRequest *request
+			= &state->requests[requester_node];
+
+		if (!pcm_resource_x_bootstrap_receipt_valid(receipt)
+			|| receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY
+			|| (request->phase != RESOURCE_X_MASTER_NONE
+				&& request->phase != RESOURCE_X_MASTER_SETTLED
+				&& request->phase != RESOURCE_X_MASTER_RELEASED)) {
+			barrier_active = true;
+			break;
+		}
+	}
+out:
+	LWLockRelease(&entry->entry_lock.lock);
+	return barrier_active;
 }
 
 static ResourceXApplyResult

@@ -25,7 +25,6 @@
 #include "access/xlogdefs.h"
 #include "cluster/cluster_pcm_own.h"
 #include "cluster/cluster_pcm_lock.h"
-#include "cluster/cluster_pcm_x_convert.h"
 #include "storage/buf_internals.h"
 
 /* Compiler-visible identities consumed by the Stage-8 closed-world AST gate.
@@ -41,13 +40,6 @@
 #define PGRAC_PCM_X_FENCE_DOMINATED(proof)
 #endif
 
-/* A retry batch is bounded and cancellable.  Registration may begin another
- * batch while the runtime remains healthy because bypassing a closed holder
- * barrier would expose untracked page bytes.  Post-content-lock unregister
- * instead defers its exact handle after one batch so ordinary UNLOCK never
- * becomes a transaction ERROR merely because RETIRE owns the short gate. */
-#define CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS 5
-
 /* FSM pages are advisory and may be consumed without a content lock, so they
  * are outside PCM/PCM-X ownership.  Every other fork keeps the relation-level
  * user/shared-catalog tracking policy. */
@@ -57,98 +49,6 @@ cluster_pcm_x_buffer_tag_tracked(const BufferTag *tag, bool shared_catalog)
 	if (tag == NULL || tag->forkNum == FSM_FORKNUM)
 		return false;
 	return shared_catalog || tag->relNumber >= (RelFileNumber)FirstNormalObjectId;
-}
-
-typedef enum ClusterPcmXHolderRetryAction {
-	CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE = 0,
-	CLUSTER_PCM_X_HOLDER_RETRY_WAIT,
-	CLUSTER_PCM_X_HOLDER_RETRY_DEFER,
-	CLUSTER_PCM_X_HOLDER_RETRY_FAIL
-} ClusterPcmXHolderRetryAction;
-
-typedef enum ClusterPcmXWriterRetryAction {
-	CLUSTER_PCM_X_WRITER_RETRY_COMPLETE = 0,
-	CLUSTER_PCM_X_WRITER_RETRY_WAIT,
-	CLUSTER_PCM_X_WRITER_RETRY_DEFER,
-	CLUSTER_PCM_X_WRITER_RETRY_FAIL
-} ClusterPcmXWriterRetryAction;
-
-/* Exhaustive result for the EXCLUSIVE buffer-acquisition boundary. */
-typedef enum ClusterPcmXWriterRoute {
-	CLUSTER_PCM_X_WRITER_COVERED = 0,
-	CLUSTER_PCM_X_WRITER_CLAIM,
-	CLUSTER_PCM_X_WRITER_LEGACY_SAFE,
-	CLUSTER_PCM_X_WRITER_RETRY_CANONICAL,
-	CLUSTER_PCM_X_WRITER_FAIL_CLOSED
-} ClusterPcmXWriterRoute;
-
-/* A missing canonical claim is safe only when PCM tracking is inapplicable. */
-static inline ClusterPcmXWriterRoute
-cluster_pcm_x_writer_null_route(bool tracked)
-{
-	return tracked ? CLUSTER_PCM_X_WRITER_FAIL_CLOSED : CLUSTER_PCM_X_WRITER_LEGACY_SAFE;
-}
-
-typedef enum ClusterPcmXOwnerExitAction {
-	CLUSTER_PCM_X_OWNER_EXIT_COMPLETE = 0,
-	CLUSTER_PCM_X_OWNER_EXIT_RETRY,
-	CLUSTER_PCM_X_OWNER_EXIT_PRESERVE
-} ClusterPcmXOwnerExitAction;
-
-/* Exit callbacks have no later safe entrance: a short admission/retire gate
- * must be waited out while this exact runtime is still active.  Once the
- * runtime/incarnation changes, evidence is preserved behind RECOVERY_BLOCKED
- * rather than being retried against a different authority generation. */
-static inline ClusterPcmXOwnerExitAction
-cluster_pcm_x_owner_exit_action(PcmXQueueResult result, bool not_found_is_complete,
-								bool runtime_active)
-{
-	if (result == PCM_X_QUEUE_OK || (not_found_is_complete && result == PCM_X_QUEUE_NOT_FOUND))
-		return CLUSTER_PCM_X_OWNER_EXIT_COMPLETE;
-	if (runtime_active && (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BUSY))
-		return CLUSTER_PCM_X_OWNER_EXIT_RETRY;
-	return CLUSTER_PCM_X_OWNER_EXIT_PRESERVE;
-}
-
-static inline ClusterPcmXHolderRetryAction
-cluster_pcm_x_holder_register_retry_action(PcmXQueueResult result, bool runtime_active)
-{
-	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_DUPLICATE)
-		return CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE;
-	if (result == PCM_X_QUEUE_GATE_RETRY || result == PCM_X_QUEUE_BARRIER_CLOSED
-		|| (runtime_active && (result == PCM_X_QUEUE_NOT_READY || result == PCM_X_QUEUE_BUSY)))
-		return CLUSTER_PCM_X_HOLDER_RETRY_WAIT;
-	return CLUSTER_PCM_X_HOLDER_RETRY_FAIL;
-}
-
-static inline ClusterPcmXHolderRetryAction
-cluster_pcm_x_holder_unregister_retry_action(PcmXQueueResult result, uint32 waits_used)
-{
-	if (result == PCM_X_QUEUE_OK || result == PCM_X_QUEUE_NOT_FOUND)
-		return CLUSTER_PCM_X_HOLDER_RETRY_COMPLETE;
-	if (result != PCM_X_QUEUE_GATE_RETRY && result != PCM_X_QUEUE_BUSY)
-		return CLUSTER_PCM_X_HOLDER_RETRY_FAIL;
-	return waits_used < CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS ? CLUSTER_PCM_X_HOLDER_RETRY_WAIT
-															   : CLUSTER_PCM_X_HOLDER_RETRY_DEFER;
-}
-
-static inline ClusterPcmXWriterRetryAction
-cluster_pcm_x_writer_release_retry_action(PcmXQueueResult result, uint32 waits_used)
-{
-	if (result == PCM_X_QUEUE_OK)
-		return CLUSTER_PCM_X_WRITER_RETRY_COMPLETE;
-	if (result != PCM_X_QUEUE_GATE_RETRY && result != PCM_X_QUEUE_BUSY)
-		return CLUSTER_PCM_X_WRITER_RETRY_FAIL;
-	return waits_used < CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS ? CLUSTER_PCM_X_WRITER_RETRY_WAIT
-															   : CLUSTER_PCM_X_WRITER_RETRY_DEFER;
-}
-
-static inline long
-cluster_pcm_x_holder_retry_delay_ms(uint32 wait_index)
-{
-	uint32 bounded_index = Min(wait_index, (uint32)CLUSTER_PCM_X_HOLDER_RETRY_BATCH_WAITS - 1);
-
-	return 2L << bounded_index;
 }
 
 typedef struct ClusterPcmOwnSnapshot {
@@ -283,72 +183,6 @@ typedef enum ClusterPcmOwnSourcePrepareRefusal {
 	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_DIRTY_RACED,
 	CLUSTER_PCM_OWN_SOURCE_PREPARE_REFUSAL_IO_IN_PROGRESS
 } ClusterPcmOwnSourcePrepareRefusal;
-
-/* The queue returns execution authority before bufmgr takes content EXCLUSIVE.
- * Bind that claim to the one committed ownership generation and require the
- * same complete tuple again after the content-lock window. */
-static inline bool
-cluster_pcm_x_writer_grant_snapshot_exact(const PcmXLocalWriterClaim *claim,
-										  const ClusterPcmOwnSnapshot *granted,
-										  const ClusterPcmOwnSnapshot *live)
-{
-	return claim != NULL && granted != NULL && live != NULL && claim->flags == 0
-		   && claim->writer.flags == 0 && claim->claim_generation != 0
-		   && claim->semantic_generation != UINT64_MAX
-		   && claim->writer.identity.base_own_generation != UINT64_MAX
-		   && claim->grant_base_own_generation != UINT64_MAX
-		   /* A follower copies the canonical node-grant base into the claim;
-			* a leader keeps zero for ordinary enqueue-time identity math. */
-		   && granted->generation
-				  == (claim->grant_base_own_generation != 0
-						  ? claim->grant_base_own_generation
-						  : claim->writer.identity.base_own_generation)
-						 + 1
-		   && granted->reservation_token != 0 && granted->flags == 0
-		   && granted->pcm_state == (uint8)PCM_STATE_X
-		   && BufferTagsEqual(&granted->tag, &claim->writer.identity.tag)
-		   && claim->active_slot.slot_index == claim->writer.membership_slot.slot_index
-		   && claim->active_slot.slot_generation == claim->writer.membership_slot.slot_generation
-		   && claim->local_round == claim->writer.local_round && claim->role == claim->writer.role
-		   && (claim->role == PCM_X_LOCAL_ROLE_NODE_LEADER
-			   || claim->role == PCM_X_LOCAL_ROLE_FOLLOWER)
-		   /* One node grant carries one activation fence.  The leader consumes
-			* it; a FIFO follower may inherit that grant only after it is zero. */
-		   && granted->writer_activation_token
-				  == (claim->semantic_generation != 0
-						  ? 0
-						  : (claim->role == PCM_X_LOCAL_ROLE_NODE_LEADER
-								 ? granted->reservation_token
-								 : 0))
-		   && granted->resource_x_activation_generation == 0
-		   && BufferTagsEqual(&live->tag, &granted->tag) && live->generation == granted->generation
-		   && live->reservation_token == granted->reservation_token
-		   && live->writer_activation_token == granted->writer_activation_token
-		   && live->resource_x_activation_generation
-				  == granted->resource_x_activation_generation
-		   && live->flags == granted->flags
-		   && live->pcm_state == granted->pcm_state;
-}
-
-/* A queue-managed X remains node-owned until its exact DRAIN/RETIRE lane
- * releases it.  The legacy cache-off unlock is legal only when no queue claim
- * governed this content-lock interval. */
-static inline bool
-cluster_pcm_x_should_release_legacy_on_unlock(bool local_cache, bool queue_managed)
-{
-	return !local_cache && !queue_managed;
-}
-
-/* Once R4 selects the Resource-X TARGET path, holder-side revoke evidence is
- * the authenticated type-17 paired with the exact BufferDesc state.  The
- * pre-removal L3 proof has terminally closed the legacy local-holder
- * allocator, so only a non-TARGET interval may register in that allocator. */
-static inline bool
-cluster_pcm_x_legacy_holder_registration_required(
-	bool resource_x_target_selected)
-{
-	return !resource_x_target_selected;
-}
 
 /* A tracked current-X page is not an ordinary writable entrance until both
  * the legacy grant->content activation and Resource-X T2->T3 activation have
@@ -634,17 +468,14 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_s_holder_candidate_exact(
 extern bool cluster_bufmgr_read_storage_image_for_resource_x(
 	BufferTag tag, char block_data[BLCKSZ], XLogRecPtr *out_page_lsn,
 	uint64 *out_page_scn);
-/* Same-page terminal-census slow path.  The guard retains the current exact
- * PCM-X holder as revoke occupancy while resolver waits run without the page
- * content lock.  It is process-local orchestration, not a wire capability. */
+/* Same-page terminal-census slow path.  D11 retains the exact off-lock
+ * occupancy in the existing per-resource Resource-X entry, not the deleted
+ * ticket holder ledger. */
 extern bool cluster_bufmgr_itl_recycle_guard_arm(
 	Buffer buffer, const ClusterPcmOwnSnapshot *expected);
 extern void cluster_bufmgr_itl_recycle_guard_unlock(Buffer buffer);
 extern bool cluster_bufmgr_itl_recycle_guard_relock(Buffer buffer);
 extern void cluster_bufmgr_itl_recycle_guard_cancel(Buffer buffer);
-extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_capture_current_x_by_tag(
-	const ResourceXAcquisitionRef *ref, const PcmXImageToken *expected_image,
-	char *page_bytes, ResourceXCurrentImage *out_image);
 extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_activate_x_by_tag(
 	const ResourceXAcquisitionRef *ref, const ResourceXCurrentImage *image,
 	ResourceXBufferInstallProof *out_proof);

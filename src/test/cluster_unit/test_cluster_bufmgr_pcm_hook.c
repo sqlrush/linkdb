@@ -396,7 +396,7 @@ cluster_gcs_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 }
 
 bool
-cluster_gcs_block_pcm_x_local_s_barrier_active(BufferTag tag pg_attribute_unused())
+cluster_gcs_block_resource_x_local_s_barrier_active(BufferTag tag pg_attribute_unused())
 {
 	return false;
 }

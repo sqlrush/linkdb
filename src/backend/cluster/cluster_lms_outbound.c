@@ -47,7 +47,6 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sf_dep.h"
-#include "cluster/cluster_write_fence.h"
 #include "miscadmin.h"
 #include "portability/instr_time.h"
 #include "storage/lwlock.h"
@@ -192,44 +191,6 @@ lms_outbound_resource_x_transport_mutation_mark(void)
  * the resulting X grant to completion.  None may cross the final DATA
  * transport boundary while the protocol runtime or node write authority is
  * closed.  Admission/cancel/drain traffic remains independently routable. */
-static bool
-lms_outbound_pcm_x_grant_held(uint8 msg_type)
-{
-	PcmXRuntimeSnapshot runtime;
-
-	if (msg_type < PGRAC_IC_MSG_PCM_X_IMAGE_READY || msg_type > PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM)
-		return false;
-	runtime = cluster_pcm_x_runtime_snapshot();
-	if (runtime.state != PCM_X_RUNTIME_ACTIVE)
-		return true;
-	return cluster_write_fence_enforcing() && !cluster_write_fence_allowed();
-}
-
-
-static void
-lms_outbound_pcm_x_image_ready_note(const ClusterLmsOutboundSlot *slot, const char *boundary,
-									int result)
-{
-	const PcmXGrantPayload *ready;
-	PcmXRuntimeSnapshot runtime;
-	bool fence_enforcing;
-	bool fence_allowed;
-
-	if (slot == NULL || boundary == NULL
-		|| (slot->msg_type != PGRAC_IC_MSG_PCM_X_IMAGE_READY
-			&& slot->msg_type != PGRAC_IC_MSG_PCM_X_PREPARE_GRANT)
-		|| slot->payload_len != sizeof(PcmXGrantPayload))
-		return;
-	ready = (const PcmXGrantPayload *)slot->payload;
-	runtime = cluster_pcm_x_runtime_snapshot();
-	fence_enforcing = cluster_write_fence_enforcing();
-	fence_allowed = !fence_enforcing || cluster_write_fence_allowed();
-	cluster_lms_note_pcm_x_image_ready_boundary(
-		slot->msg_type, boundary, result, (int)runtime.state, fence_enforcing, fence_allowed,
-		slot->dest_node_id, ready->ref.identity.request_id, ready->ref.handle.ticket_id,
-		ready->ref.grant_generation, ready->image.image_id);
-}
-
 void
 cluster_lms_outbound_shmem_register(void)
 {
@@ -982,7 +943,6 @@ cluster_lms_outbound_drain_send(int worker_id)
 					&& !cluster_sf_peer_capability_generation_matches(
 						(int32)slot.dest_node_id, slot.required_capability,
 						slot.connection_generation)))) {
-			lms_outbound_pcm_x_image_ready_note(&slot, "capability-guard", -1);
 			cluster_lms_obs_note_outbound_cap_guard_drop(worker_id);
 			if (resource_x_slot) {
 				(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
@@ -1077,7 +1037,6 @@ cluster_lms_outbound_drain_send(int worker_id)
 		/* A peer that refused a frame this batch keeps its later frames
 		 * queued BEHIND the refused one (per-peer order). */
 		if (slot.dest_node_id < CLUSTER_MAX_NODES && peer_blocked[slot.dest_node_id]) {
-			lms_outbound_pcm_x_image_ready_note(&slot, "peer-blocked", -2);
 			if (remote_s_status_slot)
 				break;
 			if (resource_x_slot) {
@@ -1085,18 +1044,6 @@ cluster_lms_outbound_drain_send(int worker_id)
 					&resource_x_intent, lms_outbound_monotonic_us());
 				continue;
 			}
-			Assert(n_retained < (int)lengthof(retained));
-			retained[n_retained++] = slot;
-			continue;
-		}
-
-		/* Revalidate irreversible PCM-X grant authority immediately before
-		 * transport admission.  Retaining also blocks later same-peer frames,
-		 * preserving the DATA FIFO while unrelated peers keep flowing. */
-		if (lms_outbound_pcm_x_grant_held(slot.msg_type)) {
-			lms_outbound_pcm_x_image_ready_note(&slot, "grant-held", -3);
-			if (slot.dest_node_id < CLUSTER_MAX_NODES)
-				peer_blocked[slot.dest_node_id] = true;
 			Assert(n_retained < (int)lengthof(retained));
 			retained[n_retained++] = slot;
 			continue;
@@ -1134,7 +1081,6 @@ cluster_lms_outbound_drain_send(int worker_id)
 										  send_payload_len);
 
 handle_send_result:
-		lms_outbound_pcm_x_image_ready_note(&slot, "send-result", (int)rc);
 		if (slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_ZERO_BLOCK_REPLY
 			|| slot.kind == (uint8)CLUSTER_LMS_OUTBOUND_DIRECT_ZERO_BLOCK_REPLY)
 			cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, rc);

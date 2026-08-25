@@ -7,8 +7,6 @@
  */
 #include "postgres.h"
 
-#include "cluster/cluster_ic_envelope.h"
-#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_resource_x_retry.h"
 
 #include "unit_test.h"
@@ -54,7 +52,7 @@ make_transport(uint32 connection_generation)
 	return transport;
 }
 
-UT_TEST(test_retry_state_layout_and_slot_embedding)
+UT_TEST(test_retry_state_layout_is_exact)
 {
 	UT_ASSERT_EQ(RESOURCE_X_RETRY_PRE_NO_RETURN, 1);
 	UT_ASSERT_EQ(RESOURCE_X_RETRY_POST_NO_RETURN, 2);
@@ -70,12 +68,6 @@ UT_TEST(test_retry_state_layout_and_slot_embedding)
 	UT_ASSERT_EQ(offsetof(ResourceXRetryStateV1, last_phase), 64);
 	UT_ASSERT_EQ(offsetof(ResourceXRetryStateV1, flags), 66);
 	UT_ASSERT_EQ(offsetof(ResourceXRetryStateV1, state_generation), 68);
-
-	UT_ASSERT_EQ(offsetof(PcmXMasterTicketSlot, retry_state), 448);
-	UT_ASSERT_EQ(sizeof(PcmXMasterTicketSlot), 536);
-	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, retry_state), 824);
-	UT_ASSERT_EQ(offsetof(PcmXLocalTagSlot, retry_connection_generation), 896);
-	UT_ASSERT_EQ(sizeof(PcmXLocalTagSlot), 928);
 }
 
 UT_TEST(test_retry_state_initialization_publishes_exact_attempt)
@@ -329,10 +321,8 @@ UT_TEST(test_terminal_transition_is_attempt_generation_and_phase_exact)
 				 RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED);
 }
 
-UT_TEST(test_type60_terminal_reason_codec_is_closed_and_zero_legacy)
+UT_TEST(test_terminal_reason_codec_is_closed)
 {
-	UT_ASSERT_EQ(sizeof(PcmXPhasePayload), 96);
-	UT_ASSERT_EQ((int)PGRAC_IC_MSG_PCM_X_CANCEL_ACK, 60);
 	UT_ASSERT_EQ(resource_x_terminal_reason_decode(0),
 				 RESOURCE_X_TERMINAL_REASON_LEGACY_CANCEL);
 	UT_ASSERT_EQ(resource_x_terminal_reason_decode(
@@ -379,7 +369,7 @@ int
 main(void)
 {
 	UT_PLAN(13);
-	UT_RUN(test_retry_state_layout_and_slot_embedding);
+	UT_RUN(test_retry_state_layout_is_exact);
 	UT_RUN(test_retry_state_initialization_publishes_exact_attempt);
 	UT_RUN(test_retry_state_initialization_rejects_unpublishable_state);
 	UT_RUN(test_retry_state_clear_removes_all_attempt_state);
@@ -390,7 +380,7 @@ main(void)
 	UT_RUN(test_classifier_enforces_sampled_retry_budget);
 	UT_RUN(test_exponential_backoff_saturates_and_clamps_to_deadline);
 	UT_RUN(test_terminal_transition_is_attempt_generation_and_phase_exact);
-	UT_RUN(test_type60_terminal_reason_codec_is_closed_and_zero_legacy);
+	UT_RUN(test_terminal_reason_codec_is_closed);
 	UT_RUN(test_terminal_record_replays_one_exact_attempt_byte_for_byte);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

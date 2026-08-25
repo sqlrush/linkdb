@@ -56,7 +56,6 @@
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sf_dep.h"
-#include "cluster/cluster_write_fence.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -120,13 +119,8 @@ BackendType MyBackendType = B_LMS;
 int cluster_node_id = 0;
 int cluster_lms_workers = 2;
 int cluster_gcs_reply_timeout_ms = 5000;
-static PcmXRuntimeState ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
-static bool ut_write_fence_enforcing = false;
-static bool ut_write_fence_allowed = true;
 static uint32 ut_peer_capabilities[CLUSTER_MAX_NODES];
 static uint32 ut_peer_cap_generation[CLUSTER_MAX_NODES];
-static int ut_pcm_x_boundary_note_count = 0;
-static uint8 ut_pcm_x_boundary_msg_types[8];
 static ResourceXIntentSlot ut_resource_x_owner_slot;
 static uint8 ut_resource_x_owner_payload[RESOURCE_X_IMAGE_V1_BYTES];
 static int ut_resource_x_stage_count = 0;
@@ -334,28 +328,6 @@ cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
 	return cluster_pcm_lock_resource_x_grant_intent_complete_exact(expected);
 }
 
-void
-cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary, int result,
-											int runtime_state, bool fence_enforcing,
-											bool fence_allowed, uint32 dest_node_id,
-											uint64 request_id, uint64 ticket_id,
-											uint64 grant_generation, uint64 image_id)
-{
-	if (ut_pcm_x_boundary_note_count < (int)lengthof(ut_pcm_x_boundary_msg_types))
-		ut_pcm_x_boundary_msg_types[ut_pcm_x_boundary_note_count] = msg_type;
-	ut_pcm_x_boundary_note_count++;
-	(void)boundary;
-	(void)result;
-	(void)runtime_state;
-	(void)fence_enforcing;
-	(void)fence_allowed;
-	(void)dest_node_id;
-	(void)request_id;
-	(void)ticket_id;
-	(void)grant_generation;
-	(void)image_id;
-}
-
 bool
 cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
 											  uint32 expected_generation)
@@ -399,31 +371,6 @@ uint32
 cluster_ic_local_capability_word(void)
 {
 	return UINT32_MAX;
-}
-
-PcmXRuntimeSnapshot
-cluster_pcm_x_runtime_snapshot(void)
-{
-	PcmXRuntimeSnapshot snapshot = { 0 };
-
-	snapshot.state = ut_pcm_x_runtime_state;
-	if (snapshot.state == PCM_X_RUNTIME_ACTIVE) {
-		snapshot.master_session_incarnation = 1;
-		snapshot.gate_generation = 1;
-	}
-	return snapshot;
-}
-
-bool
-cluster_write_fence_enforcing(void)
-{
-	return ut_write_fence_enforcing;
-}
-
-bool
-cluster_write_fence_allowed(void)
-{
-	return ut_write_fence_allowed;
 }
 
 void
@@ -657,12 +604,7 @@ ut_reset_log(void)
 	ut_direct_zero_reply_count = 0;
 	ut_checksum_call_count = 0;
 	memset(&ut_direct_zero_reply_header, 0, sizeof(ut_direct_zero_reply_header));
-	ut_pcm_x_runtime_state = PCM_X_RUNTIME_ACTIVE;
-	ut_write_fence_enforcing = false;
-	ut_write_fence_allowed = true;
 	ut_cap_guard_drop_count = 0;
-	ut_pcm_x_boundary_note_count = 0;
-	memset(ut_pcm_x_boundary_msg_types, 0, sizeof(ut_pcm_x_boundary_msg_types));
 	memset(ut_peer_capabilities, 0, sizeof(ut_peer_capabilities));
 	memset(ut_peer_cap_generation, 0, sizeof(ut_peer_cap_generation));
 	memset(ut_sent_log, 0, sizeof(ut_sent_log));
@@ -944,73 +886,6 @@ UT_TEST(test_self_frame_dispatches_on_owning_worker)
 	UT_ASSERT_EQ(ut_local_dispatch_marker, 0xE1);
 }
 
-
-/* A fail-closed runtime must retain a grant leg before transport admission.
- * Later frames for the same peer stay behind it, while unrelated peers keep
- * flowing.  Core has no recovery proof that could make these old-incarnation
- * frames runnable, so repeated drains must keep them parked. */
-UT_TEST(test_pcm_x_grant_frame_waits_for_active_runtime)
-{
-	ut_reset_log();
-	ut_pcm_x_runtime_state = PCM_X_RUNTIME_RECOVERY_BLOCKED;
-
-	UT_ASSERT(ut_enqueue_typed_marker(6, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, UT_PEER_X, 0xF1));
-	UT_ASSERT(ut_enqueue_marker(6, UT_PEER_X, 0xF2));
-	UT_ASSERT(ut_enqueue_marker(6, UT_PEER_Y, 0xF3));
-	(void)cluster_lms_outbound_drain_send(6);
-
-	UT_ASSERT_EQ(ut_count_marker(0xF1), 0);
-	UT_ASSERT_EQ(ut_count_marker(0xF2), 0);
-	UT_ASSERT_EQ(ut_count_marker(0xF3), 1);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(6), 2);
-
-	(void)cluster_lms_outbound_drain_send(6);
-	UT_ASSERT_EQ(ut_count_marker(0xF1), 0);
-	UT_ASSERT_EQ(ut_count_marker(0xF2), 0);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(6), 2);
-}
-
-
-UT_TEST(test_pcm_x_grant_frame_waits_behind_write_fence)
-{
-	ut_reset_log();
-	ut_write_fence_enforcing = true;
-	ut_write_fence_allowed = false;
-
-	UT_ASSERT(ut_enqueue_typed_marker(7, PGRAC_IC_MSG_PCM_X_COMMIT_X, UT_PEER_X, 0xF4));
-	UT_ASSERT(ut_enqueue_marker(7, UT_PEER_Y, 0xF5));
-	(void)cluster_lms_outbound_drain_send(7);
-
-	UT_ASSERT_EQ(ut_count_marker(0xF4), 0);
-	UT_ASSERT_EQ(ut_count_marker(0xF5), 1);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(7), 1);
-
-	ut_write_fence_allowed = true;
-	(void)cluster_lms_outbound_drain_send(7);
-	UT_ASSERT_EQ(ut_count_marker(0xF4), 1);
-	UT_ASSERT_EQ(cluster_lms_outbound_depth(7), 0);
-}
-
-
-/* Both sides of the first reliable transfer hop share PcmXGrantPayload.  The
- * injected transport trace must identify type 50 and type 51 independently,
- * otherwise a successful master consume is indistinguishable from a lost
- * PREPARE_GRANT admission. */
-UT_TEST(test_pcm_x_image_ready_and_prepare_transport_boundaries_are_observable)
-{
-	PcmXGrantPayload payload;
-
-	ut_reset_log();
-	memset(&payload, 0, sizeof(payload));
-	UT_ASSERT(cluster_lms_outbound_enqueue(0, PGRAC_IC_MSG_PCM_X_IMAGE_READY, UT_PEER_X, &payload,
-										   sizeof(payload)));
-	UT_ASSERT(cluster_lms_outbound_enqueue(0, PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, UT_PEER_Y, &payload,
-										   sizeof(payload)));
-	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 2);
-	UT_ASSERT_EQ(ut_pcm_x_boundary_note_count, 2);
-	UT_ASSERT_EQ((int)ut_pcm_x_boundary_msg_types[0], (int)PGRAC_IC_MSG_PCM_X_IMAGE_READY);
-	UT_ASSERT_EQ((int)ut_pcm_x_boundary_msg_types[1], (int)PGRAC_IC_MSG_PCM_X_PREPARE_GRANT);
-}
 
 /*
  * Shape-B denial replay is driven by LMON, which owns only plane 0.  The
@@ -1733,7 +1608,7 @@ UT_TEST(test_resource_x_nonrequester_s_status_self_master_loopback_is_retained)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(31);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
@@ -1741,9 +1616,6 @@ main(void)
 	UT_RUN(test_refused_frame_retained_and_delivered);
 	UT_RUN(test_blocked_peer_batch_keeps_per_peer_order);
 	UT_RUN(test_self_frame_dispatches_on_owning_worker);
-	UT_RUN(test_pcm_x_grant_frame_waits_for_active_runtime);
-	UT_RUN(test_pcm_x_grant_frame_waits_behind_write_fence);
-	UT_RUN(test_pcm_x_image_ready_and_prepare_transport_boundaries_are_observable);
 	UT_RUN(test_zero_block_reply_is_expanded_by_data_owner);
 	UT_RUN(test_direct_zero_block_reply_uses_data_owner_direct_lane);
 	UT_RUN(test_r4_cap_bound_zero_reply_sends_only_on_exact_generation);

@@ -53,7 +53,6 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_multixact_current_wire.h"
-#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_resource_x_node_wire.h"
 #include "storage/buf_internals.h"
 
@@ -624,70 +623,6 @@ UT_TEST(test_current_mx_forward128_routes_by_request_identity)
 
 /* Every staged PCM-X frame is tag-affine.  RETIRE/RETIRE_ACK are the only
  * direct-send members because their compact payload intentionally has no tag. */
-UT_TEST(test_pcm_x_route_truth_table)
-{
-	BufferTag tag = make_tag(1663, 5, 24001, MAIN_FORKNUM, 73);
-	union {
-		PcmXGrantPayload largest;
-		uint8 bytes[sizeof(PcmXGrantPayload)];
-	} payload;
-	struct {
-		uint8 msg_type;
-		uint16 payload_len;
-	} staged[] = {
-		{ PGRAC_IC_MSG_PCM_X_ENQUEUE, sizeof(PcmXEnqueuePayload) },
-		{ PGRAC_IC_MSG_PCM_X_ADMIT_ACK, sizeof(PcmXAdmitAckPayload) },
-		{ PGRAC_IC_MSG_PCM_X_ADMIT_ACK, sizeof(PcmXAdmitAckPayloadV2) },
-		{ PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM, sizeof(PcmXPhasePayload) },
-		{ PGRAC_IC_MSG_PCM_X_ADMIT_CONFIRM_ACK, sizeof(PcmXPhasePayload) },
-		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_BEGIN, sizeof(PcmXBlockerSetHeaderPayload) },
-		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_EDGE, sizeof(PcmXBlockerChunkPayload) },
-		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_COMMIT, sizeof(PcmXBlockerSetHeaderPayload) },
-		{ PGRAC_IC_MSG_PCM_X_BLOCKER_SET_ACK, sizeof(PcmXPhasePayload) },
-		{ PGRAC_IC_MSG_PCM_X_REVOKE, sizeof(PcmXRevokePayload) },
-		{ PGRAC_IC_MSG_PCM_X_REVOKE, sizeof(PcmXRevokePayloadV2) },
-		{ PGRAC_IC_MSG_PCM_X_IMAGE_READY, sizeof(PcmXGrantPayload) },
-		{ PGRAC_IC_MSG_PCM_X_PREPARE_GRANT, sizeof(PcmXGrantPayload) },
-		{ PGRAC_IC_MSG_PCM_X_INSTALL_READY, sizeof(PcmXInstallReadyPayload) },
-		{ PGRAC_IC_MSG_PCM_X_COMMIT_X, sizeof(PcmXPhasePayload) },
-		{ PGRAC_IC_MSG_PCM_X_FINAL_ACK, sizeof(PcmXFinalAckPayload) },
-		{ PGRAC_IC_MSG_PCM_X_FINAL_COMMIT_ACK, sizeof(PcmXPhasePayload) },
-		{ PGRAC_IC_MSG_PCM_X_FINAL_CONFIRM, sizeof(PcmXPhasePayload) },
-		{ PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL, sizeof(PcmXPrehandleCancelPayload) },
-		{ PGRAC_IC_MSG_PCM_X_PREHANDLE_CANCEL_ACK, sizeof(PcmXAdmitAckPayload) },
-		{ PGRAC_IC_MSG_PCM_X_CANCEL, sizeof(PcmXPhasePayload) },
-		{ PGRAC_IC_MSG_PCM_X_CANCEL_ACK, sizeof(PcmXPhasePayload) },
-		{ PGRAC_IC_MSG_PCM_X_DRAIN_POLL, sizeof(PcmXDrainPollPayload) },
-		{ PGRAC_IC_MSG_PCM_X_DRAIN_ACK, sizeof(PcmXPhasePayload) },
-	};
-	Size i;
-	int expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
-
-	memset(&payload, 0, sizeof(payload));
-	memcpy(payload.bytes, &tag, sizeof(tag));
-	for (i = 0; i < lengthof(staged); i++) {
-		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(staged[i].msg_type, payload.bytes,
-													 staged[i].payload_len,
-													 CLUSTER_LMS_MAX_WORKERS),
-					 expected);
-		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(staged[i].msg_type, payload.bytes,
-													 staged[i].payload_len - 1,
-													 CLUSTER_LMS_MAX_WORKERS),
-					 -1);
-	}
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_PCM_X_RETIRE_UP_TO, payload.bytes,
-												 sizeof(PcmXRetirePayload),
-												 CLUSTER_LMS_MAX_WORKERS),
-				 -1);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_PCM_X_RETIRE_ACK, payload.bytes,
-												 sizeof(PcmXRetirePayload),
-												 CLUSTER_LMS_MAX_WORKERS),
-				 -1);
-}
-
-/* A status-3 PI durable note is an INVALIDATE_ACK frame and must use the
- * exact tag shard.  Exercise every live worker, including worker 1 (the
- * t/400 failure arm), against the real payload router. */
 UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
 {
 	bool seen[CLUSTER_LMS_MAX_WORKERS] = { false };
@@ -911,7 +846,7 @@ UT_TEST(test_resource_x_length_collisions_preserve_legacy_domains)
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(15);
 	UT_RUN(test_route_matches_shard_for_tag);
 	UT_RUN(test_route_ack_request_interleave_affinity);
 	UT_RUN(test_route_registry_partition);
@@ -924,7 +859,6 @@ main(void)
 	UT_RUN(test_r4_kind2_terminal_census_routes_to_existing_data_worker0);
 	UT_RUN(test_r4_extended_route_length_mismatch_refused);
 	UT_RUN(test_current_mx_forward128_routes_by_request_identity);
-	UT_RUN(test_pcm_x_route_truth_table);
 	UT_RUN(test_pi_durable_note_routes_to_exact_tag_worker);
 	UT_RUN(test_resource_x_reused_types_route_only_after_strict_domain_decode);
 	UT_RUN(test_resource_x_length_collisions_preserve_legacy_domains);

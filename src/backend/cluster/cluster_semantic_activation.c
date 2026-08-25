@@ -30,7 +30,6 @@
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
-#include "cluster/cluster_pcm_x_convert.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_replacement_wire.h"
@@ -5988,91 +5987,51 @@ static ClusterSemanticActivationResult
 r11_resource_x_readiness(uint64 expected_generation,
 						 ClusterSemanticActivationRefusal *refusal)
 {
-	const ClusterSemanticActivationCallbackBundle *callbacks
-		= cluster_pcm_x_resource_x_activation_callbacks();
-
-	if (callbacks == NULL || callbacks->pre_prepare_readiness == NULL)
-		return r11_resource_x_not_ready(expected_generation, refusal);
-	return callbacks->pre_prepare_readiness(expected_generation, refusal);
+	return r11_resource_x_not_ready(expected_generation, refusal);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_close_source(uint64 generation)
 {
-	const ClusterSemanticActivationCallbackBundle *callbacks
-		= cluster_pcm_x_resource_x_activation_callbacks();
-
-	return callbacks != NULL && callbacks->close_source_admission != NULL
-		? callbacks->close_source_admission(generation)
-		: r11_resource_x_stage_closed(generation);
+	return r11_resource_x_stage_closed(generation);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_logical_zero(uint64 generation,
 						ClusterSemanticZeroProof *proof)
 {
-	const ClusterSemanticActivationCallbackBundle *callbacks
-		= cluster_pcm_x_resource_x_activation_callbacks();
-
-	if (callbacks == NULL || callbacks->source_logical_debt_zero == NULL)
-		return r11_resource_x_zero_unavailable(generation, proof);
-	return callbacks->source_logical_debt_zero(generation, proof);
+	return r11_resource_x_zero_unavailable(generation, proof);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_transport_zero(uint64 generation,
 						  ClusterSemanticZeroProof *proof)
 {
-	const ClusterSemanticActivationCallbackBundle *callbacks
-		= cluster_pcm_x_resource_x_activation_callbacks();
-
-	if (callbacks == NULL || callbacks->source_transport_zero == NULL)
-		return r11_resource_x_zero_unavailable(generation, proof);
-	return callbacks->source_transport_zero(generation, proof);
+	return r11_resource_x_zero_unavailable(generation, proof);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_prepare_target(uint64 generation)
 {
-	const ClusterSemanticActivationCallbackBundle *callbacks
-		= cluster_pcm_x_resource_x_activation_callbacks();
-
-	return callbacks != NULL && callbacks->prepare_target != NULL
-		? callbacks->prepare_target(generation)
-		: r11_resource_x_stage_closed(generation);
+	return r11_resource_x_stage_closed(generation);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_apply_target_closed(uint64 generation)
 {
-	const ClusterSemanticActivationCallbackBundle *callbacks
-		= cluster_pcm_x_resource_x_activation_callbacks();
-
-	return callbacks != NULL && callbacks->apply_target_closed != NULL
-		? callbacks->apply_target_closed(generation)
-		: r11_resource_x_stage_closed(generation);
+	return r11_resource_x_stage_closed(generation);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_revert_source_closed(uint64 generation)
 {
-	const ClusterSemanticActivationCallbackBundle *callbacks
-		= cluster_pcm_x_resource_x_activation_callbacks();
-
-	return callbacks != NULL && callbacks->revert_source_closed != NULL
-		? callbacks->revert_source_closed(generation)
-		: r11_resource_x_stage_closed(generation);
+	return r11_resource_x_stage_closed(generation);
 }
 
 static ClusterSemanticActivationResult
 r11_resource_x_open_target(uint64 generation)
 {
-	const ClusterSemanticActivationCallbackBundle *callbacks
-		= cluster_pcm_x_resource_x_activation_callbacks();
-
-	return callbacks != NULL && callbacks->open_target_admission != NULL
-		? callbacks->open_target_admission(generation)
-		: r11_resource_x_stage_closed(generation);
+	return r11_resource_x_stage_closed(generation);
 }
 
 static const ClusterSemanticActivationDescriptor r4_descriptor = {

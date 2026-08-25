@@ -972,26 +972,6 @@ lms_note_pcm_x_finish_flush_injection_reload(int worker_id)
 
 
 void
-cluster_lms_note_pcm_x_image_ready_boundary(uint8 msg_type, const char *boundary, int result,
-											int runtime_state, bool fence_enforcing,
-											bool fence_allowed, uint32 dest_node_id,
-											uint64 request_id, uint64 ticket_id,
-											uint64 grant_generation, uint64 image_id)
-{
-	if (boundary == NULL || !cluster_injection_is_armed("cluster-pcm-x-retain-flush-error"))
-		return;
-	ereport(
-		LOG,
-		(errmsg_internal("PCM-X IMAGE_READY transport boundary: %s", boundary),
-		 errdetail("msg_type=%u result=%d runtime=%d fence_enforcing=%s fence_allowed=%s dest=%u "
-				   "request_id=%llu ticket=%llu grant_generation=%llu image_id=%llu",
-				   (unsigned)msg_type, result, runtime_state, fence_enforcing ? "true" : "false",
-				   fence_allowed ? "true" : "false", dest_node_id, (unsigned long long)request_id,
-				   (unsigned long long)ticket_id, (unsigned long long)grant_generation,
-				   (unsigned long long)image_id)));
-}
-
-void
 LmsMain(void)
 {
 	uint64 r4_worker_incarnation;
@@ -1076,8 +1056,6 @@ LmsMain(void)
 		pg_atomic_write_u64(&cluster_lms_state->recovery_ready_generation, 0);
 		proc_exit(0);
 	}
-
-	cluster_gcs_block_pcm_x_owner_start(0);
 
 	/* PGRAC: spec-7.2 D2 — bring up the LMS-owned DATA-plane listener +
 	 * mesh (false = plane off for this node;  the loop below then keeps
@@ -1169,7 +1147,6 @@ LmsMain(void)
 				cluster_lms_cr_ship_ready();
 				cluster_gcs_block_pi_discard_drain();
 			}
-			cluster_gcs_block_pcm_x_image_pump_tick(0);
 			/* R10 C-intent: worker 0 performs the sole bounded semantic
 			 * scan and stages each found owner handle onto its tag shard's
 			 * DATA ring before the normal per-worker drain consumes it. */
@@ -1277,8 +1254,6 @@ LmsWorkerMain(int worker_id)
 
 	ereport(LOG, (errmsg("cluster_lms: DATA-plane worker %d started (pid %d)", worker_id,
 						 (int)MyProcPid)));
-	cluster_gcs_block_pcm_x_owner_start(worker_id);
-
 	/*
 	 * PGRAC: spec-7.3 D3 — bring up this worker's DATA-plane channel + mesh
 	 * (its own tier1 instance, listener on data_port + worker_id, dial peer
@@ -1320,7 +1295,6 @@ LmsWorkerMain(int worker_id)
 			 * the mesh.  REPLY / INVALIDATE-ACK for blocks we received are
 			 * sent directly from the dispatch handler in THIS process, so
 			 * they already ride this worker's channel. */
-			cluster_gcs_block_pcm_x_image_pump_tick(worker_id);
 			(void)cluster_lms_outbound_drain_send(worker_id);
 			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
 			 * directives parked by this worker's dispatch handler. */
