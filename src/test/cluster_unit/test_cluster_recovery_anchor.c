@@ -87,10 +87,14 @@ UT_DEFINE_GLOBALS();
  */
 char *cluster_shared_data_dir = NULL;
 int cluster_node_id = 3;
+bool cluster_enabled = true;
+bool cluster_controlfile_shared_authority = true;
 static ClusterMembershipState test_membership_state = CLUSTER_MEMBER_MEMBER;
 static uint64 test_self_incarnation = UINT64_C(77);
 static uint64 test_admitted_incarnation = UINT64_C(77);
 static bool test_owner_eor_active;
+static bool test_exactly_one_declared_node = true;
+static bool test_cf_local_x_held = true;
 static int test_write_fence_calls;
 static ClusterStartupPhase test_startup_phase = CLUSTER_PHASE_RUNNING;
 static TimestampTz test_phase4_started_at = 1000;
@@ -197,6 +201,18 @@ bool
 cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
 	return mode == ExclusiveLock && test_cf_x_held;
+}
+
+bool
+cluster_cf_held(LOCKMODE mode)
+{
+	return mode == ExclusiveLock && test_cf_local_x_held;
+}
+
+bool
+cluster_cf_exactly_one_declared_node(void)
+{
+	return test_exactly_one_declared_node;
 }
 
 void
@@ -372,6 +388,10 @@ wipe_anchor_files(void)
 	test_self_incarnation = UINT64_C(77);
 	test_admitted_incarnation = UINT64_C(77);
 	test_owner_eor_active = false;
+	cluster_enabled = true;
+	cluster_controlfile_shared_authority = true;
+	test_exactly_one_declared_node = true;
+	test_cf_local_x_held = true;
 	test_write_fence_calls = 0;
 	test_startup_phase = CLUSTER_PHASE_RUNNING;
 	test_phase4_started_at = 1000;
@@ -729,6 +749,16 @@ configure_exact_phase4_publisher(void)
 }
 
 static void
+configure_exact_native_seed_publisher(void)
+{
+	wipe_anchor_files();
+	cluster_enabled = false;
+	test_membership_state = CLUSTER_MEMBER_ABSENT;
+	test_self_incarnation = 0;
+	test_admitted_incarnation = 0;
+}
+
+static void
 assert_phase4_publish_rejected_before_io(const CheckPoint *cp)
 {
 	ClusterRecoveryAnchor out;
@@ -783,6 +813,57 @@ UT_TEST(test_checkpoint_publish_requires_current_owner_before_io)
 	UT_ASSERT_EQ(test_write_fence_calls, 1);
 	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 	UT_ASSERT_EQ(out.checkPoint, 0x0000000398770000ULL);
+}
+
+/* ======================================================================
+ * RF-ROOT P5 regression: the frozen shared-catalog bootstrap contract uses
+ * an exact one-node, cluster-disabled native seed.  Its clean shutdown must
+ * seal the XID authority and publish the recovery anchor while holding local
+ * CF(X); no formed-cluster membership or phase4 identity may be invented.
+ * ====================================================================== */
+UT_TEST(test_checkpoint_publish_native_seed_proof_is_exact)
+{
+	CheckPoint cp;
+	ClusterRecoveryAnchor out;
+	bool used_bak;
+
+	memset(&cp, 0, sizeof(cp));
+	cp.redo = 0x0000000398760000ULL;
+	cp.ThisTimeLineID = 1;
+	cp.PrevTimeLineID = 1;
+
+	configure_exact_native_seed_publisher();
+	UT_ASSERT(!publish_checkpoint_panics(&cp));
+	UT_ASSERT_EQ(test_write_fence_calls, 1);
+	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
+
+	configure_exact_native_seed_publisher();
+	cluster_enabled = true;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_native_seed_publisher();
+	cluster_controlfile_shared_authority = false;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_native_seed_publisher();
+	test_exactly_one_declared_node = false;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_native_seed_publisher();
+	test_cf_local_x_held = false;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_native_seed_publisher();
+	test_self_incarnation = UINT64_C(77);
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_native_seed_publisher();
+	test_membership_state = CLUSTER_MEMBER_MEMBER;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_native_seed_publisher();
+	test_admitted_incarnation = UINT64_C(77);
+	assert_phase4_publish_rejected_before_io(&cp);
 }
 
 /* ======================================================================
@@ -952,7 +1033,7 @@ main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_layout);
 	UT_RUN(test_write_read_roundtrip);
 	UT_RUN(test_classify);
@@ -962,6 +1043,7 @@ main(void)
 	UT_RUN(test_state_carrier);
 	UT_RUN(test_publish_checkpoint);
 	UT_RUN(test_checkpoint_publish_requires_current_owner_before_io);
+	UT_RUN(test_checkpoint_publish_native_seed_proof_is_exact);
 	UT_RUN(test_checkpoint_publish_phase4_boot_proof_is_exact);
 	UT_RUN(test_refresh_state);
 	UT_RUN(test_load_adoption);
