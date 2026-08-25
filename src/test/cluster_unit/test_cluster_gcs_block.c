@@ -1967,10 +1967,9 @@ UT_TEST(test_resource_x_r11_cutover_tick_is_native_bounded_and_lmon_owned)
 	static const char *const cutover_contract[] = {
 		"cluster_semantic_activation_r11_cutover_snapshot(",
 		"cluster_pcm_lock_resource_x_gate_snapshot(",
-		"cluster_pcm_lock_resource_x_gate_bind_formation_exact(",
-		"cluster_resource_x_reconfig_cutover_freeze_exact(",
+		"cluster_resource_x_reconfig_cutover_begin_native_exact(",
 		"cluster_resource_x_reconfig_sweep(",
-		"cluster_resource_x_reconfig_bind_new_formation_exact(",
+		"cluster_resource_x_reconfig_cutover_bind_native_successor_exact(",
 		"cluster_resource_x_reconfig_sweep(",
 		"cluster_resource_x_reconfig_zero_proof_exact(",
 		"cluster_pcm_lock_resource_x_clean_completion_prove_exact(",
@@ -1981,6 +1980,11 @@ UT_TEST(test_resource_x_r11_cutover_tick_is_native_bounded_and_lmon_owned)
 	char *source = read_gcs_block_source();
 	char *lmon = read_source_path("../../../src/backend/cluster/cluster_lmon.c");
 	const char *first_semantic;
+	const char *cutover_start;
+	const char *cutover_end;
+	const char *forbidden_bind;
+	const char *forbidden_r4_arithmetic;
+	const char *forbidden_external_successor;
 	const char *first_recovery;
 	const char *first_cutover;
 	const char *first_reschedule;
@@ -1993,6 +1997,27 @@ UT_TEST(test_resource_x_r11_cutover_tick_is_native_bounded_and_lmon_owned)
 		source, "\ncluster_gcs_block_resource_x_cutover_tick(",
 		"\n\n/* ============================================================",
 		cutover_contract, lengthof(cutover_contract));
+	cutover_start = strstr(source,
+		"\ncluster_gcs_block_resource_x_cutover_tick(");
+	cutover_end = cutover_start != NULL
+		? strstr(cutover_start,
+			"\n\n/* ============================================================") : NULL;
+	forbidden_bind = cutover_start != NULL
+		? strstr(cutover_start,
+			"cluster_pcm_lock_resource_x_gate_bind_formation_exact(") : NULL;
+	forbidden_external_successor = cutover_start != NULL
+		? strstr(cutover_start,
+			"cluster_resource_x_reconfig_bind_new_formation_exact(") : NULL;
+	forbidden_r4_arithmetic = cutover_start != NULL
+		? strstr(cutover_start,
+			"cutover.resource_x_old_formation + 1") : NULL;
+	UT_ASSERT_NOT_NULL(cutover_start);
+	UT_ASSERT_NOT_NULL(cutover_end);
+	UT_ASSERT(forbidden_bind == NULL || forbidden_bind >= cutover_end);
+	UT_ASSERT(forbidden_external_successor == NULL
+			  || forbidden_external_successor >= cutover_end);
+	UT_ASSERT(forbidden_r4_arithmetic == NULL
+			  || forbidden_r4_arithmetic >= cutover_end);
 	UT_ASSERT_NULL(strstr(source, "cluster_gcs_block_pcm_x_formation_tick"));
 	UT_ASSERT_NULL(strstr(source, "cluster_pcm_x_runtime_snapshot"));
 	UT_ASSERT_NOT_NULL(strstr(source,

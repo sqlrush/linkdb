@@ -1266,11 +1266,13 @@ extern bool cluster_resource_x_reconfig_freeze(uint64 old_formation, uint64 new_
 extern bool cluster_resource_x_reconfig_freeze_exact(
 	uint64 old_formation, uint64 new_formation, uint32 dead_requester_bitmap,
 	ResourceXReconfigToken *out);
-/* R11 clean-cutover entry into the R8 owner sequence.  This only freezes a
- * pending token; full active/join sweep must finish before an external
- * current formation is bound. */
-extern bool cluster_resource_x_reconfig_cutover_freeze_exact(
-	uint64 old_formation, ResourceXReconfigToken *out);
+/* Source-removal cutover enters the R8 owner without supplying a formation
+ * value.  The Resource-X gate retains the exact current value and allocates
+ * its own checked successor after the pending full sweep. */
+extern bool cluster_resource_x_reconfig_cutover_begin_native_exact(
+	ResourceXReconfigToken *out);
+extern bool cluster_resource_x_reconfig_cutover_bind_native_successor_exact(
+	ResourceXReconfigToken *token);
 extern ResourceXReconfigResult cluster_resource_x_reconfig_sweep(
 	const ResourceXReconfigToken *token, uint32 probe_budget, ResourceXReconfigBatch *out);
 extern bool cluster_resource_x_reconfig_zero_proof_exact(
@@ -1296,11 +1298,11 @@ extern bool cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
 	ResourceXReconfigToken *token_out,
 	ResourceXZeroResidualProof *zero_proof_out,
 	ResourceXCleanCompletionProof *clean_proof_out);
-/* Bind the exact current R8/R10 pair to one source formation and cutover
- * generation without exposing either shared-memory record as authority. */
-extern bool cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-	uint64 old_formation, uint64 record_generation, bool thawed,
-	uint64 *digest_out);
+/* Read the exact current R8/R10 pair and a local digest without accepting an
+ * external formation coordinate.  The returned token remains the only
+ * Resource-X formation identity. */
+extern bool cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+	bool thawed, ResourceXReconfigToken *token_out, uint64 *digest_out);
 extern bool cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token);
 extern void cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *out);
 extern ResourceXExecutorProbeResult cluster_pcm_lock_resource_x_executor_probe_exact(

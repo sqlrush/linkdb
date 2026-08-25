@@ -1607,28 +1607,69 @@ UT_TEST(test_resource_x_reconfig_pending_freeze_binds_only_published_formation)
 	UT_ASSERT_EQ(stats.freeze_count, 1);
 	UT_ASSERT_EQ(stats.thaw_count, 1);
 
-	/* R11 consumes the R8 owner sequence: freeze pending, drain/full-sweep,
-	 * then bind the externally current R4 formation.  No caller or R11
-	 * callback predicts a successor and no pre-sweep bind is permitted. */
+	/* R11 consumes the R8 owner sequence: freeze the exact native gate,
+	 * drain/full-sweep, then let that same owner allocate its successor. */
 	reset_fake_pcm_runtime(4);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
 				 RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT(cluster_resource_x_reconfig_cutover_freeze_exact(17, &token));
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_begin_native_exact(&token));
 	UT_ASSERT_EQ(token.old_formation, 17);
 	UT_ASSERT_EQ(token.new_formation, 0);
 	UT_ASSERT_EQ(token.freeze_generation, 1);
 	UT_ASSERT_EQ(token.dead_requester_bitmap, 0);
 	UT_ASSERT_EQ(token.reserved, 0);
-	UT_ASSERT(cluster_resource_x_reconfig_cutover_freeze_exact(17, &replay));
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_begin_native_exact(&replay));
 	UT_ASSERT_EQ(memcmp(&replay, &token, sizeof(token)), 0);
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
 				 RESOURCE_X_RECONFIG_DONE);
 	UT_ASSERT_EQ(batch.complete_wrap, 1);
 	UT_ASSERT_EQ(batch.zero_residual, 0);
 	UT_ASSERT(!cluster_resource_x_reconfig_zero_proof_exact(&token, &zero));
-	UT_ASSERT(cluster_resource_x_reconfig_bind_new_formation_exact(
-		&token, 23));
-	UT_ASSERT_EQ(token.new_formation, 23);
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_bind_native_successor_exact(
+		&token));
+	UT_ASSERT_EQ(token.new_formation, 18);
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_MORE);
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_DONE);
+	UT_ASSERT(cluster_resource_x_reconfig_zero_proof_exact(&token, &zero));
+}
+
+/* R11-R4-RESOURCE-X-FORMATION-DOMAIN-01: the cutover caller supplies no R4
+ * generation as a Resource-X formation. */
+UT_TEST(test_resource_x_cutover_formation_pair_is_native_not_r4_arithmetic)
+{
+	const uint64 unrelated_r4_generation = UINT64_C(23);
+	ResourceXGateSnapshot gate;
+	ResourceXReconfigToken replay;
+	ResourceXReconfigToken token;
+	ResourceXReconfigBatch batch;
+	ResourceXZeroResidualProof zero;
+
+	reset_fake_pcm_runtime(4);
+	memset(&token, 0, sizeof(token));
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_begin_native_exact(&token));
+	UT_ASSERT(token.old_formation != 0);
+	UT_ASSERT(token.old_formation != UINT64_MAX);
+	UT_ASSERT(token.old_formation != unrelated_r4_generation - 1);
+	UT_ASSERT_EQ(token.new_formation, UINT64_C(0));
+	UT_ASSERT(token.freeze_generation != 0);
+	UT_ASSERT(cluster_pcm_lock_resource_x_gate_snapshot(&gate));
+	UT_ASSERT_EQ(gate.phase, RESOURCE_X_GATE_FROZEN);
+	UT_ASSERT_EQ(gate.formation, token.old_formation);
+
+	memset(&replay, 0, sizeof(replay));
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_begin_native_exact(&replay));
+	UT_ASSERT_EQ(memcmp(&replay, &token, sizeof(token)), 0);
+	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
+				 RESOURCE_X_RECONFIG_DONE);
+	UT_ASSERT(!cluster_resource_x_reconfig_zero_proof_exact(&token, &zero));
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_bind_native_successor_exact(
+		&token));
+	UT_ASSERT(token.new_formation != 0);
+	UT_ASSERT(token.new_formation != UINT64_MAX);
+	UT_ASSERT(token.new_formation != unrelated_r4_generation);
+	UT_ASSERT(token.new_formation != token.old_formation);
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
 				 RESOURCE_X_RECONFIG_MORE);
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
@@ -1656,7 +1697,7 @@ UT_TEST(test_resource_x_reconfig_pending_sweep_waits_for_registered_inflight_to_
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &before),
 				 RESOURCE_X_EXECUTOR_READY);
-	UT_ASSERT(cluster_resource_x_reconfig_cutover_freeze_exact(17, &token));
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_begin_native_exact(&token));
 
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
 				 RESOURCE_X_RECONFIG_MORE);
@@ -1674,7 +1715,8 @@ UT_TEST(test_resource_x_reconfig_pending_sweep_waits_for_registered_inflight_to_
 	UT_ASSERT_EQ(batch.complete_wrap, 1);
 	UT_ASSERT_EQ(batch.zero_residual, 0);
 	UT_ASSERT(!cluster_resource_x_reconfig_zero_proof_exact(&token, &zero));
-	UT_ASSERT(cluster_resource_x_reconfig_bind_new_formation_exact(&token, 23));
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_bind_native_successor_exact(
+		&token));
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
 				 RESOURCE_X_RECONFIG_MORE);
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
@@ -1696,7 +1738,7 @@ UT_TEST(test_resource_x_reconfig_pending_sweep_classifies_unowned_old_active_as_
 				 RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref),
 				 RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT(cluster_resource_x_reconfig_cutover_freeze_exact(17, &token));
+	UT_ASSERT(cluster_resource_x_reconfig_cutover_begin_native_exact(&token));
 
 	UT_ASSERT_EQ(cluster_resource_x_reconfig_sweep(&token, 4, &batch),
 				 RESOURCE_X_RECONFIG_ORPHAN);
@@ -1856,15 +1898,10 @@ UT_TEST(test_resource_x_same_token_zero_and_clean_completion_proofs_are_exact)
 	UT_ASSERT_EQ(memcmp(&cutover_token, &token, sizeof(token)), 0);
 	UT_ASSERT_EQ(memcmp(&cutover_zero, &zero, sizeof(zero)), 0);
 	UT_ASSERT_EQ(memcmp(&cutover_clean, &clean, sizeof(clean)), 0);
-	UT_ASSERT(cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-		17, 18, false, &frozen_digest));
+	UT_ASSERT(cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+		false, &cutover_token, &frozen_digest));
+	UT_ASSERT_EQ(memcmp(&cutover_token, &token, sizeof(token)), 0);
 	UT_ASSERT(frozen_digest != 0);
-	UT_ASSERT(!cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-		16, 18, false, &thawed_digest));
-	UT_ASSERT_EQ(thawed_digest, UINT64_C(0));
-	UT_ASSERT(!cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-		17, 19, false, &thawed_digest));
-	UT_ASSERT_EQ(thawed_digest, UINT64_C(0));
 
 	/* A late physical owner may already have drained, leaving count zero.
 	 * Its mutation generation still invalidates the older zero snapshot. */
@@ -1888,8 +1925,8 @@ UT_TEST(test_resource_x_same_token_zero_and_clean_completion_proofs_are_exact)
 	UT_ASSERT(!cluster_pcm_lock_resource_x_clean_completion_proof_exact(
 		&stale, &zero, &clean_copy));
 	frozen_digest = 0;
-	UT_ASSERT(cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-		17, 18, false, &frozen_digest));
+	UT_ASSERT(cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+		false, &cutover_token, &frozen_digest));
 	UT_ASSERT(frozen_digest != 0);
 
 	UT_ASSERT(cluster_resource_x_reconfig_thaw_exact(&token));
@@ -1903,16 +1940,17 @@ UT_TEST(test_resource_x_same_token_zero_and_clean_completion_proofs_are_exact)
 	UT_ASSERT_EQ(memcmp(&thawed_token, &token, sizeof(token)), 0);
 	UT_ASSERT_EQ(memcmp(&thawed_zero, &zero, sizeof(zero)), 0);
 	UT_ASSERT_EQ(memcmp(&thawed_clean, &clean, sizeof(clean)), 0);
-	UT_ASSERT(!cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-		17, 18, false, &thawed_digest));
-	UT_ASSERT(cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-		17, 18, true, &thawed_digest));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+		false, &cutover_token, &thawed_digest));
+	UT_ASSERT(cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+		true, &cutover_token, &thawed_digest));
+	UT_ASSERT_EQ(memcmp(&cutover_token, &token, sizeof(token)), 0);
 	UT_ASSERT_EQ(thawed_digest, frozen_digest);
 	fake_resource_x_transport_mutation_sequence++;
 	UT_ASSERT(!cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
 		&thawed_token, &thawed_zero, &thawed_clean));
-	UT_ASSERT(!cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-		17, 18, true, &thawed_digest));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+		true, &cutover_token, &thawed_digest));
 	UT_ASSERT_EQ(thawed_digest, UINT64_C(0));
 }
 
@@ -8780,6 +8818,7 @@ main(void)
 	UT_RUN(test_resource_x_native_gate_snapshot_and_exact_fail_closed);
 	UT_RUN(test_resource_x_reconfig_freeze_closes_activation_drains_and_thaws_empty);
 	UT_RUN(test_resource_x_reconfig_pending_freeze_binds_only_published_formation);
+	UT_RUN(test_resource_x_cutover_formation_pair_is_native_not_r4_arithmetic);
 	UT_RUN(test_resource_x_reconfig_pending_sweep_waits_for_registered_inflight_to_retire);
 	UT_RUN(test_resource_x_reconfig_pending_sweep_classifies_unowned_old_active_as_orphan);
 	UT_RUN(test_resource_x_reconfig_nested_and_generation_exhaustion_fail_closed);

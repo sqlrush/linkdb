@@ -195,8 +195,7 @@ static uint64 test_remote_admitted_incarnations[CLUSTER_MAX_NODES];
 static bool test_resource_x_gate_snapshot_valid;
 static ResourceXGateSnapshot test_resource_x_gate_snapshot;
 static bool test_resource_x_cutover_digest_valid;
-static uint64 test_resource_x_cutover_old_formation;
-static uint64 test_resource_x_cutover_record_generation;
+static ResourceXReconfigToken test_resource_x_cutover_token;
 static bool test_resource_x_cutover_thawed;
 static uint64 test_resource_x_cutover_digest;
 
@@ -242,19 +241,18 @@ cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
 }
 
 bool
-cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-	uint64 old_formation, uint64 record_generation, bool thawed,
-	uint64 *digest_out)
+cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+	bool thawed, ResourceXReconfigToken *token_out, uint64 *digest_out)
 {
-	if (digest_out == NULL)
+	if (token_out == NULL || digest_out == NULL)
 		return false;
+	memset(token_out, 0, sizeof(*token_out));
 	*digest_out = 0;
 	if (!test_resource_x_cutover_digest_valid
-		|| old_formation != test_resource_x_cutover_old_formation
-		|| record_generation != test_resource_x_cutover_record_generation
 		|| thawed != test_resource_x_cutover_thawed
 		|| test_resource_x_cutover_digest == 0)
 		return false;
+	*token_out = test_resource_x_cutover_token;
 	*digest_out = test_resource_x_cutover_digest;
 	return true;
 }
@@ -1010,8 +1008,8 @@ test_gate_reset(void)
 	memset(&test_resource_x_gate_snapshot, 0,
 		   sizeof(test_resource_x_gate_snapshot));
 	test_resource_x_cutover_digest_valid = false;
-	test_resource_x_cutover_old_formation = 0;
-	test_resource_x_cutover_record_generation = 0;
+	memset(&test_resource_x_cutover_token, 0,
+		   sizeof(test_resource_x_cutover_token));
 	test_resource_x_cutover_thawed = false;
 	test_resource_x_cutover_digest = 0;
 	cluster_shared_data_dir = NULL;
@@ -1259,25 +1257,25 @@ UT_TEST(test_10a_r11_resource_x_cutover_descriptor_is_compiled_exact)
 	UT_ASSERT_EQ(cluster_semantic_activation_compiled_feature_bitmap(),
 				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
 				 | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
-	/* Source removal does not remove the native Resource-X owner.  A clean
-	 * R4 formation may enter SAMPLE only while the target writer stays closed
-	 * and the native gate is an unfrozen zero/current-formation base. */
+	/* Source removal does not remove the native Resource-X owner.  R4 only
+	 * revalidates freshness: a nonzero native Resource-X formation is a
+	 * separate numeric domain and need not equal the R4 generation. */
 	test_gate_reset();
 	test_gate_publish(2, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 		7, test_current_epoch, false);
 	test_resource_x_gate_snapshot_valid = true;
 	test_resource_x_gate_snapshot.phase = RESOURCE_X_GATE_OPEN;
-	test_resource_x_gate_snapshot.formation = 0;
+	test_resource_x_gate_snapshot.formation = 17;
 	memset(&refusal, 0, sizeof(refusal));
 	UT_ASSERT_EQ(cutover->pre_prepare_readiness(7, &refusal),
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
 	UT_ASSERT_EQ(refusal.feature_bit, UINT64_C(0));
 	UT_ASSERT_EQ(refusal.expected_generation, 7);
-	test_resource_x_gate_snapshot.formation = test_current_epoch + 1;
+	test_resource_x_gate_snapshot.phase = RESOURCE_X_GATE_FROZEN;
 	UT_ASSERT_EQ(cutover->pre_prepare_readiness(7, &refusal),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	test_resource_x_gate_snapshot.formation = 0;
+	test_resource_x_gate_snapshot.phase = RESOURCE_X_GATE_OPEN;
 	UT_ASSERT_EQ(cutover->pre_prepare_readiness(8, &refusal),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 
@@ -1414,15 +1412,16 @@ UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)
 				 CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED);
 	UT_ASSERT_EQ(cutover.record_generation, UINT64_C(23));
 	UT_ASSERT_EQ(cutover.formation_epoch, test_current_epoch);
-	UT_ASSERT_EQ(cutover.resource_x_old_formation, UINT64_C(22));
 	test_resource_x_cutover_digest_valid = true;
-	test_resource_x_cutover_old_formation = 22;
-	test_resource_x_cutover_record_generation = 23;
+	/* Deliberately unrelated domains: R4 generation 23, Resource-X 17->18. */
+	test_resource_x_cutover_token.old_formation = 17;
+	test_resource_x_cutover_token.new_formation = 18;
+	test_resource_x_cutover_token.freeze_generation = 1;
 	test_resource_x_cutover_thawed = false;
 	test_resource_x_cutover_digest = UINT64_C(0xa55a9911);
 	test_resource_x_gate_snapshot_valid = true;
 	test_resource_x_gate_snapshot.phase = RESOURCE_X_GATE_FROZEN;
-	test_resource_x_gate_snapshot.formation = 22;
+	test_resource_x_gate_snapshot.formation = 17;
 	test_resource_x_gate_snapshot.freeze_generation = 1;
 	UT_ASSERT_EQ(descriptor->close_source_admission(23),
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);
@@ -1461,7 +1460,6 @@ UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)
 	UT_ASSERT_EQ(cutover.phase,
 				 CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL);
 	UT_ASSERT_EQ(cutover.record_generation, UINT64_C(23));
-	UT_ASSERT_EQ(cutover.resource_x_old_formation, UINT64_C(22));
 	test_resource_x_cutover_thawed = true;
 	UT_ASSERT_EQ(descriptor->open_target_admission(23),
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);

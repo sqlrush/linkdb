@@ -65,6 +65,7 @@
 	(RESOURCE_X_PROTOCOL_NODE_LIMIT + 5)
 #define PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET UINT64_C(1469598103934665603)
 #define PGRAC_RESOURCE_X_PROOF_DIGEST_PRIME UINT64_C(1099511628211)
+#define PGRAC_RESOURCE_X_NATIVE_INITIAL_FORMATION UINT64_C(1)
 
 /* PGRAC adaptation identifiers.  The external cutover manifest binds this
  * semantic creator fingerprint to the exact product tree; neither byte array
@@ -2235,11 +2236,51 @@ cluster_resource_x_reconfig_freeze(uint64 old_formation, uint64 new_formation,
 }
 
 bool
-cluster_resource_x_reconfig_cutover_freeze_exact(
-	uint64 old_formation, ResourceXReconfigToken *out)
+cluster_resource_x_reconfig_cutover_begin_native_exact(
+	ResourceXReconfigToken *out)
 {
+	ResourceXGateSnapshot gate;
+	ResourceXApplyResult bind_result;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)) {
+		if (!cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(&gate)
+			|| gate.phase != RESOURCE_X_GATE_OPEN
+			|| gate.formation != 0)
+			return false;
+		bind_result = cluster_pcm_lock_resource_x_gate_bind_formation_exact(
+			PGRAC_RESOURCE_X_NATIVE_INITIAL_FORMATION);
+		if (bind_result != RESOURCE_X_APPLY_APPLIED
+			&& bind_result != RESOURCE_X_APPLY_DUPLICATE)
+			return false;
+		if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate))
+			return false;
+	}
+	if ((gate.phase != RESOURCE_X_GATE_OPEN
+		 && gate.phase != RESOURCE_X_GATE_FROZEN)
+		|| gate.formation == 0 || gate.formation == UINT64_MAX
+		|| gate.reserved != 0)
+		return false;
 	return cluster_resource_x_reconfig_freeze_pending_exact(
-		old_formation, 0, out);
+		gate.formation, 0, out);
+}
+
+bool
+cluster_resource_x_reconfig_cutover_bind_native_successor_exact(
+	ResourceXReconfigToken *token)
+{
+	uint64 successor;
+
+	if (token == NULL || token->old_formation == 0
+		|| token->old_formation >= UINT64_MAX - 1) {
+		pcm_resource_x_reconfig_block();
+		return false;
+	}
+	successor = token->old_formation + 1;
+	return cluster_resource_x_reconfig_bind_new_formation_exact(
+		token, successor);
 }
 
 static ResourceXReconfigResult
@@ -3546,22 +3587,18 @@ cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
 }
 
 bool
-cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
-	uint64 old_formation, uint64 record_generation, bool thawed,
-	uint64 *digest_out)
+cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+	bool thawed, ResourceXReconfigToken *token_out, uint64 *digest_out)
 {
 	ResourceXCleanCompletionProof clean;
 	ResourceXReconfigToken token;
 	ResourceXZeroResidualProof zero;
 	uint64 digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
 
-	if (digest_out == NULL)
+	if (token_out == NULL || digest_out == NULL)
 		return false;
+	memset(token_out, 0, sizeof(*token_out));
 	*digest_out = 0;
-	if (old_formation == 0 || old_formation == UINT64_MAX
-		|| record_generation == 0 || record_generation == UINT64_MAX
-		|| old_formation == record_generation)
-		return false;
 	if (thawed) {
 		if (!cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
 				&token, &zero, &clean))
@@ -3570,9 +3607,7 @@ cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
 	else if (!cluster_pcm_lock_resource_x_cutover_proofs_exact(
 				 &token, &zero, &clean))
 		return false;
-	if (token.old_formation != old_formation
-		|| token.new_formation != record_generation
-		|| token.reserved != 0
+	if (token.reserved != 0
 		|| memcmp(&zero.token, &token, sizeof(token)) != 0
 		|| memcmp(&clean.token, &token, sizeof(token)) != 0
 		|| zero.proof_generation != token.freeze_generation
@@ -3605,6 +3640,7 @@ cluster_pcm_lock_resource_x_cutover_proof_digest_exact(
 		digest, clean.transport_mutation_sequence);
 	if (digest == 0)
 		digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
+	*token_out = token;
 	*digest_out = digest;
 	return true;
 }

@@ -16347,18 +16347,13 @@ cluster_gcs_block_resource_x_cutover_tick(void)
 	ResourceXReconfigToken token;
 	ResourceXZeroResidualProof observed_zero;
 	ResourceXZeroResidualProof zero;
-	ResourceXApplyResult bind_result;
 	uint32 calls;
 
 	if (!cluster_semantic_activation_r11_cutover_snapshot(&cutover))
 		return false;
 	if (cutover.record_generation == 0
 		|| cutover.record_generation == UINT64_MAX
-		|| cutover.formation_epoch == UINT64_MAX
-		|| cutover.resource_x_old_formation == 0
-		|| cutover.resource_x_old_formation == UINT64_MAX
-		|| cutover.record_generation
-			   != cutover.resource_x_old_formation + 1)
+		|| cutover.formation_epoch == UINT64_MAX)
 		return false;
 	if (cutover.phase == CLUSTER_SEMANTIC_R11_CUTOVER_TARGET_OPEN)
 		return false;
@@ -16373,21 +16368,14 @@ cluster_gcs_block_resource_x_cutover_tick(void)
 		return false;
 
 	if (cutover.phase == CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED) {
-		if (gate.phase == RESOURCE_X_GATE_OPEN && gate.formation == 0) {
-			bind_result
-				= cluster_pcm_lock_resource_x_gate_bind_formation_exact(
-					cutover.resource_x_old_formation);
-			if (bind_result != RESOURCE_X_APPLY_APPLIED
-				&& bind_result != RESOURCE_X_APPLY_DUPLICATE)
-				return false;
-			if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate))
-				return false;
-		}
 		if ((gate.phase != RESOURCE_X_GATE_OPEN
 			 && gate.phase != RESOURCE_X_GATE_FROZEN)
-			|| gate.formation != cutover.resource_x_old_formation
-			|| !cluster_resource_x_reconfig_cutover_freeze_exact(
-				cutover.resource_x_old_formation, &token))
+			|| !cluster_resource_x_reconfig_cutover_begin_native_exact(
+				&token)
+			|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
+			|| gate.phase != RESOURCE_X_GATE_FROZEN
+			|| gate.formation != token.old_formation
+			|| gate.freeze_generation != token.freeze_generation)
 			return false;
 
 		if (token.new_formation == 0) {
@@ -16407,16 +16395,13 @@ cluster_gcs_block_resource_x_cutover_tick(void)
 				return result == RESOURCE_X_RECONFIG_MORE
 					&& batch.examined_count != 0;
 			}
-			if (!cluster_resource_x_reconfig_bind_new_formation_exact(
-					&token, cutover.record_generation))
+			if (!cluster_resource_x_reconfig_cutover_bind_native_successor_exact(
+					&token))
 				return false;
 			/* Binding is itself progress.  Resume through the event loop so
 			 * no tick traverses more than one 64-slot checkpoint. */
 			return true;
 		}
-		if (token.new_formation != cutover.record_generation)
-			return false;
-
 		for (calls = 0;
 			 calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT;
 			 calls++) {
@@ -16450,8 +16435,6 @@ cluster_gcs_block_resource_x_cutover_tick(void)
 			!= CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL
 		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
 			&token, &zero, &clean)
-		|| token.old_formation != cutover.resource_x_old_formation
-		|| token.new_formation != cutover.record_generation
 		|| !cluster_resource_x_reconfig_thaw_exact(&token)
 		|| !cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
 			&observed_token, &observed_zero, &observed_clean)
