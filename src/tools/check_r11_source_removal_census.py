@@ -13,9 +13,11 @@ import sys
 from typing import Any
 
 
-SCHEMA = "R11SourceRemovalCensusV1"
-SOURCE_COMMIT = "cb7c7b585cb63ea4906d49fe01352b005a89b8e8"
-SOURCE_TREE = "e80f7dc31d269b5927a36cf393d9b2cccf70c02e"
+SCHEMA = "R11SourceRemovalCensusV2"
+SOURCE_REMOVAL_COMMIT = "cb7c7b585cb63ea4906d49fe01352b005a89b8e8"
+SOURCE_REMOVAL_TREE = "e80f7dc31d269b5927a36cf393d9b2cccf70c02e"
+PRODUCT_COMMIT = "f89298558c36f39883775da28e24233ed87150d1"
+PRODUCT_TREE = "e27057151d838c3f74a592219c95d1c545a93837"
 L3_COMMIT = "cc1c5a554276542a05c15f5f1e0e0c7317fba66e"
 L3_TREE = "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5"
 
@@ -233,9 +235,12 @@ def require_exact_manifest(manifest: dict[str, Any]) -> None:
     if manifest["schema_version"] != SCHEMA:
         raise CensusError("census schema is stale")
     if manifest["source_removed_subject"] != {
-        "commit": SOURCE_COMMIT,
-        "parent_commit": L3_COMMIT,
-        "tree": SOURCE_TREE,
+        "commit": PRODUCT_COMMIT,
+        "pre_removal_commit": L3_COMMIT,
+        "pre_removal_tree": L3_TREE,
+        "source_removal_commit": SOURCE_REMOVAL_COMMIT,
+        "source_removal_tree": SOURCE_REMOVAL_TREE,
+        "tree": PRODUCT_TREE,
     }:
         raise CensusError("source-removed subject is not exact")
     if manifest["layers"] != LAYERS:
@@ -261,29 +266,35 @@ def require_exact_manifest(manifest: dict[str, Any]) -> None:
 def validate(source_root: pathlib.Path, manifest_path: pathlib.Path) -> str:
     manifest = load_manifest(manifest_path)
     require_exact_manifest(manifest)
-    if git(source_root, "rev-parse", f"{SOURCE_COMMIT}^{{tree}}") != SOURCE_TREE:
+    if git(source_root, "rev-parse", f"{PRODUCT_COMMIT}^{{tree}}") != PRODUCT_TREE:
+        raise CensusError("final source-removed product tree identity mismatch")
+    if git(source_root, "rev-parse", f"{SOURCE_REMOVAL_COMMIT}^{{tree}}") != SOURCE_REMOVAL_TREE:
         raise CensusError("source-removed tree identity mismatch")
-    if git(source_root, "rev-parse", f"{SOURCE_COMMIT}^") != L3_COMMIT:
+    if git(source_root, "rev-parse", f"{SOURCE_REMOVAL_COMMIT}^") != L3_COMMIT:
         raise CensusError("pre-removal L3 is not the direct source-removal parent")
     if git(source_root, "rev-parse", f"{L3_COMMIT}^{{tree}}") != L3_TREE:
         raise CensusError("pre-removal L3 tree identity mismatch")
     try:
-        git(source_root, "merge-base", "--is-ancestor", SOURCE_COMMIT, "HEAD")
+        git(source_root, "merge-base", "--is-ancestor", SOURCE_REMOVAL_COMMIT, PRODUCT_COMMIT)
     except CensusError as error:
-        raise CensusError("source-removed subject is not an ancestor of HEAD") from error
+        raise CensusError("source-removal commit is not an ancestor of the final product") from error
+    try:
+        git(source_root, "merge-base", "--is-ancestor", PRODUCT_COMMIT, "HEAD")
+    except CensusError as error:
+        raise CensusError("final source-removed product is not an ancestor of HEAD") from error
 
     for diff_args in (
-        ("diff", "--name-only", f"{SOURCE_COMMIT}..HEAD", "--", "src/backend", "src/include"),
+        ("diff", "--name-only", f"{PRODUCT_COMMIT}..HEAD", "--", "src/backend", "src/include"),
         ("diff", "--name-only", "--", "src/backend", "src/include"),
         ("diff", "--cached", "--name-only", "--", "src/backend", "src/include"),
     ):
         if git(source_root, *diff_args):
             raise CensusError("production paths drifted after the census subject")
 
-    paths, production = tree_text(source_root, SOURCE_COMMIT)
+    paths, production = tree_text(source_root, PRODUCT_COMMIT)
     for path in REMOVED_PATHS:
         if path in paths or not path.startswith(("src/backend", "src/include")) and git(
-            source_root, "ls-tree", "-r", "--name-only", SOURCE_COMMIT, "--", path
+            source_root, "ls-tree", "-r", "--name-only", PRODUCT_COMMIT, "--", path
         ):
             raise CensusError(f"retired source path remains: {path}")
     for layer, contract in LAYERS.items():
@@ -291,7 +302,7 @@ def validate(source_root: pathlib.Path, manifest_path: pathlib.Path) -> str:
             if re.search(pattern, production):
                 raise CensusError(f"{layer} legacy match remains: {pattern}")
         for anchor in contract["positive_anchors"]:
-            body = git(source_root, "show", f"{SOURCE_COMMIT}:{anchor['path']}")
+            body = git(source_root, "show", f"{PRODUCT_COMMIT}:{anchor['path']}")
             if anchor["symbol"] not in body:
                 raise CensusError(f"{layer} positive anchor is missing: {anchor['symbol']}")
     for gate_name, patterns in (("L1", L1_PATTERNS), ("L2", L2_PATTERNS)):
@@ -299,10 +310,10 @@ def validate(source_root: pathlib.Path, manifest_path: pathlib.Path) -> str:
             if re.search(pattern, production):
                 raise CensusError(f"{gate_name} is nonzero: {pattern}")
 
-    stale_body = git(source_root, "show", f"{SOURCE_COMMIT}:src/backend/cluster/cluster_gcs_block.c")
+    stale_body = git(source_root, "show", f"{PRODUCT_COMMIT}:src/backend/cluster/cluster_gcs_block.c")
     if len(re.findall(r"(?m)^gcs_block_legacy_pcm_x_stale_ingress\($", stale_body)) != 1:
         raise CensusError("bounded stale-family ingress cardinality is not one")
-    build_body = git(source_root, "show", f"{SOURCE_COMMIT}:{BUILD_LINK['manifest_path']}")
+    build_body = git(source_root, "show", f"{PRODUCT_COMMIT}:{BUILD_LINK['manifest_path']}")
     for name in BUILD_LINK["forbidden_objects"]:
         if name in build_body:
             raise CensusError(f"retired object remains in build manifest: {name}")
