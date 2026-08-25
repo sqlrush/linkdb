@@ -1207,27 +1207,38 @@ UT_TEST(test_bufmgr_generation_bump_failure_is_classified_under_header_lock)
 	free(source);
 }
 
-UT_TEST(test_pending_x_denied_retry_leaves_master_invalidate_gap)
+UT_TEST(test_pending_x_denied_retry_drops_removed_queue_gap)
 {
 	static const char *const retry_contract[]
 		= { "cluster_pcm_own_abort_grant_reservation",
-			"cluster_bufmgr_pcm_pending_x_retry_delay_ms(wait_index)", "WaitLatch",
+			"cluster_bufmgr_resource_x_wait_retry",
 			"cluster_bufmgr_pcm_begin_grant_reservation_wait" };
-	static const char *const delay_contract[]
-		= { "cluster_gcs_block_starvation_backoff_ms", "cluster_lmon_main_loop_interval",
-			"retry_delay_ms <<= shift", "retry_delay_ms * 2" };
 	char *source = read_bufmgr_source();
+	const char *rearm = strstr(source, "\ncluster_bufmgr_pcm_retry_denied_rearm(");
+	const char *rearm_end = rearm != NULL ? strstr(rearm, "\n}\n\nstatic ") : NULL;
+	const char *old_delay = rearm != NULL
+		? strstr(rearm, "cluster_bufmgr_pcm_pending_x_retry_delay_ms")
+		: NULL;
+	const char *old_lmon = rearm != NULL ? strstr(rearm, "cluster_lmon_main_loop_interval") : NULL;
+	const char *old_backoff
+		= rearm != NULL ? strstr(rearm, "cluster_gcs_block_starvation_backoff_ms") : NULL;
+	const char *blocking_sleep = rearm != NULL ? strstr(rearm, "pg_usleep") : NULL;
 
-	/* A queue INVALIDATE that met mirror-N + GRANT_PENDING returns BUSY and
-	 * the PCM-X master schedules its retry no sooner than the LMON interval.
-	 * A DENIED_PENDING_X reader must therefore leave the exact reservation
-	 * absent for strictly longer than that master retry delay.  Otherwise the
-	 * two exponential schedules phase-lock forever: each reader request
-	 * republishes GRANT_PENDING just as every INVALIDATE retry arrives. */
+	/* R11 source removal deleted the PCM-X queue/LMON INVALIDATE pump whose
+	 * two-interval gap used to drive this rearm.  Keep the exact abort and the
+	 * existing short, gate-checked scheduling yield before a fresh reservation,
+	 * but never inherit the removed queue's 2s..120s exponential wait. */
 	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_retry_denied_rearm(", "\nstatic ",
 							   retry_contract, lengthof(retry_contract));
-	assert_ordered_in_function(source, "\ncluster_bufmgr_pcm_pending_x_retry_delay_ms(",
-							   "\nstatic ", delay_contract, lengthof(delay_contract));
+	UT_ASSERT_NOT_NULL(rearm);
+	UT_ASSERT_NOT_NULL(rearm_end);
+	if (rearm_end != NULL) {
+		UT_ASSERT(old_delay == NULL || old_delay >= rearm_end);
+		UT_ASSERT(old_lmon == NULL || old_lmon >= rearm_end);
+		UT_ASSERT(old_backoff == NULL || old_backoff >= rearm_end);
+		UT_ASSERT(blocking_sleep == NULL || blocking_sleep >= rearm_end);
+	}
+	UT_ASSERT_NULL(strstr(source, "\ncluster_bufmgr_pcm_pending_x_retry_delay_ms("));
 	free(source);
 }
 
@@ -2833,7 +2844,7 @@ main(void)
 	UT_RUN(test_bufmgr_finish_failure_rolls_back_acquired_master_grant);
 	UT_RUN(test_bufmgr_s_base_rollback_normalizes_to_n_under_header_authority);
 	UT_RUN(test_bufmgr_generation_bump_failure_is_classified_under_header_lock);
-	UT_RUN(test_pending_x_denied_retry_leaves_master_invalidate_gap);
+	UT_RUN(test_pending_x_denied_retry_drops_removed_queue_gap);
 	UT_RUN(test_bufmgr_finish_rejects_invalid_state_and_initializes_acquire_result);
 	UT_RUN(test_bufmgr_finish_and_abort_gate_on_exact_base_state);
 	UT_RUN(test_d5a_release_error_keeps_descriptor_out_of_freelist);

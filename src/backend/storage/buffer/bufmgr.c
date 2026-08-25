@@ -2248,36 +2248,14 @@ typedef enum ClusterBufmgrPcmRetryRearmResult
 	CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED
 } ClusterBufmgrPcmRetryRearmResult;
 
-/* A queue INVALIDATE that meets mirror-N + GRANT_PENDING returns BUSY.  Its
- * master retries no sooner than max(starvation backoff, LMON tick), while the
- * DENIED_PENDING_X requester owns this function's wait.  Keep the exact old
- * reservation absent for two such intervals before publishing the successor:
- * one interval lets the master stage its retry and the second lets the DATA
- * worker consume it.  Later denials widen that receive window, capped at the
- * configured GUC maximum (60s base, 120s quiesce) rather than overflowing.
- */
-static long
-cluster_bufmgr_pcm_pending_x_retry_delay_ms(uint32 wait_index)
-{
-	uint64 retry_delay_ms;
-	uint32 shift = Min(wait_index, UINT32_C(16));
-
-	retry_delay_ms = (uint64)Max(Max(cluster_gcs_block_starvation_backoff_ms,
-									  cluster_lmon_main_loop_interval),
-								  1);
-	if (retry_delay_ms >= UINT64_C(60000)
-		|| retry_delay_ms > (UINT64_C(60000) >> shift))
-		retry_delay_ms = UINT64_C(60000);
-	else
-		retry_delay_ms <<= shift;
-	return (long)(retry_delay_ms * 2);
-}
-
 /* Consume one authoritative DENIED_PENDING_X.  The exact old reservation is
- * aborted before sleeping; STALE is an ABA-safe zero-mutation result and is
- * handled by re-sampling the complete ownership tuple.  A successful rearm
- * always publishes a fresh token, while the subsequent GCS call allocates a
- * fresh request_id. */
+ * aborted before yielding; STALE is an ABA-safe zero-mutation result and is
+ * handled by re-sampling the complete ownership tuple.  Source removal also
+ * removed the queue/LMON INVALIDATE pump, so this path must not retain that
+ * pump's two-interval exponential gap.  The existing Resource-X gate-checked
+ * short yield is sufficient to avoid a busy spin.  A successful rearm always
+ * publishes a fresh token, while the subsequent GCS call allocates a fresh
+ * request_id. */
 static ClusterBufmgrPcmRetryRearmResult
 cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 										 ClusterPcmOwnSnapshot *base,
@@ -2287,7 +2265,6 @@ cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 	ClusterPcmOwnResult own_result;
 	uint8 current_state;
 	uint32 current_flags;
-	long backoff_ms;
 	bool begin_covered;
 
 	if (buf == NULL || base == NULL || reservation_token == NULL
@@ -2319,16 +2296,10 @@ cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 		&& cluster_pcm_mode_covers((PcmLockMode) current_state, pcm_mode))
 		return CLUSTER_BUFMGR_PCM_RETRY_COVERED;
 
-	backoff_ms = cluster_bufmgr_pcm_pending_x_retry_delay_ms(wait_index);
 	if (!cluster_bufmgr_resource_x_wait_retry(
 			BufferDescriptorGetContentLock(buf), buf->buf_id,
 			wait_index, barrier_refused))
 		return CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED;
-	CHECK_FOR_INTERRUPTS();
-	(void) WaitLatch(MyLatch, WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, backoff_ms,
-					 WAIT_EVENT_GCS_BLOCK_STARVATION_RETRY);
-	ResetLatch(MyLatch);
-	CHECK_FOR_INTERRUPTS();
 
 	own_result = cluster_bufmgr_pcm_begin_grant_reservation_wait(
 		buf, pcm_mode, base, reservation_token, &begin_covered, barrier_refused);
