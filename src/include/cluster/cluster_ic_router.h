@@ -296,16 +296,19 @@ extern int cluster_ic_router_count_registered(void);
  * ============================================================ */
 
 /*
- * ClusterICFanoutResult -- per-peer result enum 4 态 (扩 spec-2.3
- *   v1.0.1 L68 三态加 PEER_DOWN).
+ * ClusterICFanoutResult -- per-peer result enum 5 态.  The fanout layer
+ *   preserves the tier1 frame-ownership distinction: WOULD_BLOCK is
+ *   admitted/transport-owned, while NOT_ADMITTED is refused/caller-owned.
  *
  *   PEER_DOWN distinguishes "peer fd 不存在 / 未 connect / phase 4
  *   first-tick" 类 nonfatal "未连上" 情况 vs "曾经 up 现在 down" 类
  *   HARD_ERROR (tier1 已 close peer)。caller 必须区分以决定:
  *
  *     - DONE:        accepted; update last_send_at + counter
- *     - WOULD_BLOCK: nonfatal backpressure; retry next tick;
- *                    last_send_at 不更新 (per spec-2.3 v1.0.1 L68)
+ *     - WOULD_BLOCK: frame admitted; transport owns an exact copy;
+ *                    caller MUST NOT resubmit that frame
+ *     - NOT_ADMITTED: frame refused; caller retains ownership and may
+ *                     retry next tick
  *     - HARD_ERROR:  peer fd 已 close (LMON 自管 reconnect);
  *                    last_send_at 不更新; caller 不 close peer
  *                    (close 是 LMON-only 操作; per spec-2.4 v1.0.1 L74)
@@ -317,7 +320,9 @@ typedef enum ClusterICFanoutResult {
 	CLUSTER_IC_FANOUT_DONE = 0,
 	CLUSTER_IC_FANOUT_WOULD_BLOCK,
 	CLUSTER_IC_FANOUT_HARD_ERROR,
-	CLUSTER_IC_FANOUT_PEER_DOWN
+	CLUSTER_IC_FANOUT_PEER_DOWN,
+	/* Appended to preserve the existing shmem-visible numeric values. */
+	CLUSTER_IC_FANOUT_NOT_ADMITTED
 } ClusterICFanoutResult;
 
 /*

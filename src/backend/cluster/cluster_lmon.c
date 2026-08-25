@@ -1667,15 +1667,17 @@ LmonMain(void)
 								fanout_rc = CLUSTER_IC_FANOUT_DONE;
 								break;
 							case CLUSTER_IC_SEND_WOULD_BLOCK:
-							case CLUSTER_IC_SEND_NOT_ADMITTED:
-								/* Queued-but-admitted and refused both map
-								 * to the retryable fanout bucket. */
 								fanout_rc = CLUSTER_IC_FANOUT_WOULD_BLOCK;
 								/* RF-ROOT P6 (tier1 audit r5): the heartbeat
 								 * arm re-registers WRITEABLE on backpressure;
 								 * this arm must too, or a tail/FIFO queued
 								 * cssd frame only drains by hitching the next
 								 * send_bytes call. */
+								if (cluster_ic_tier1_pending_outbound(cs))
+									wes_dirty = true;
+								break;
+							case CLUSTER_IC_SEND_NOT_ADMITTED:
+								fanout_rc = CLUSTER_IC_FANOUT_NOT_ADMITTED;
 								if (cluster_ic_tier1_pending_outbound(cs))
 									wes_dirty = true;
 								break;

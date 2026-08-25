@@ -31,6 +31,8 @@ typedef struct ClusterPcmDirectInitSnapshot {
 	BufferTag tag;
 	uint64 generation;
 	uint64 reservation_token;
+	uint64 writer_activation_token;
+	uint64 resource_x_activation_generation;
 	uint32 flags;
 	uint32 buf_state;
 	int32 buf_id;
@@ -54,5 +56,15 @@ extern ClusterPcmOwnResult
 cluster_pcm_direct_init_proof_consume(ClusterPcmDirectInitKind kind,
 									  const ClusterPcmDirectInitSnapshot *snapshot,
 									  ClusterPcmDirectInitProof *proof);
+extern ClusterPcmOwnResult
+cluster_pcm_direct_init_target_pending_validate(
+	ClusterPcmDirectInitKind kind,
+	const ClusterPcmDirectInitSnapshot *pending,
+	const ClusterPcmDirectInitProof *consumed_proof);
+extern ClusterPcmOwnResult
+cluster_pcm_direct_init_target_commit_validate(
+	ClusterPcmDirectInitKind kind,
+	const ClusterPcmDirectInitSnapshot *committed,
+	const ClusterPcmDirectInitProof *consumed_proof);
 
 #endif /* CLUSTER_PCM_DIRECT_INIT_H */

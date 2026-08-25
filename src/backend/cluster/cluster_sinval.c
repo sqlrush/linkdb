@@ -622,6 +622,7 @@ cluster_sinval_drain_outbound_and_broadcast(void)
 				cluster_touched_peers_stamp(peer, CLUSTER_TOUCH_SINVAL);
 				break;
 			case CLUSTER_IC_FANOUT_WOULD_BLOCK:
+			case CLUSTER_IC_FANOUT_NOT_ADMITTED:
 				pg_atomic_fetch_add_u64(&ClusterSinval->fanout_would_block_count, 1);
 				break;
 			case CLUSTER_IC_FANOUT_HARD_ERROR:

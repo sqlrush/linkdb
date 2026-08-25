@@ -319,6 +319,88 @@ UT_TEST(test_vm_fsm_fork_and_valid_shape_are_exact)
 				 CLUSTER_PCM_OWN_STALE);
 }
 
+UT_TEST(test_target_pending_reservation_remains_bound_to_consumed_known_new_proof)
+{
+	ClusterPcmDirectInitProof proof;
+	ClusterPcmDirectInitSnapshot base
+		= make_snapshot(CLUSTER_PCM_DIRECT_INIT_EXTEND);
+	ClusterPcmDirectInitSnapshot pending;
+
+	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_arm(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_consume(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof), CLUSTER_PCM_OWN_OK);
+	pending = base;
+	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	pending.reservation_token++;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &pending, &proof), CLUSTER_PCM_OWN_OK);
+
+	pending.buf_state &= ~BM_IO_IN_PROGRESS;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &pending, &proof), CLUSTER_PCM_OWN_STALE);
+	pending = base;
+	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	pending.reservation_token += 2;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &pending, &proof), CLUSTER_PCM_OWN_STALE);
+}
+
+UT_TEST(test_target_post_t3_commit_revalidates_exact_known_new_identity)
+{
+	ClusterPcmDirectInitProof proof;
+	ClusterPcmDirectInitSnapshot base
+		= make_snapshot(CLUSTER_PCM_DIRECT_INIT_READ_MISS);
+	ClusterPcmDirectInitSnapshot committed;
+
+	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_arm(
+		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &base, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_consume(
+		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &base, &proof), CLUSTER_PCM_OWN_OK);
+	committed = base;
+	committed.generation++;
+	committed.reservation_token++;
+	committed.buffer_type = (uint8)BUF_TYPE_XCUR;
+	committed.pcm_state = (uint8)PCM_STATE_X;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(
+		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &committed, &proof), CLUSTER_PCM_OWN_OK);
+
+	committed.page_is_new = false;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(
+		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &committed, &proof), CLUSTER_PCM_OWN_STALE);
+	committed.page_is_new = true;
+	committed.generation++;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(
+		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &committed, &proof), CLUSTER_PCM_OWN_STALE);
+}
+
+UT_TEST(test_target_fresh_generation_zero_is_exact_known_new_identity)
+{
+	ClusterPcmDirectInitProof proof;
+	ClusterPcmDirectInitSnapshot base
+		= make_snapshot(CLUSTER_PCM_DIRECT_INIT_EXTEND);
+	ClusterPcmDirectInitSnapshot pending;
+	ClusterPcmDirectInitSnapshot committed;
+
+	base.generation = 0;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_arm(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_consume(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof), CLUSTER_PCM_OWN_OK);
+	pending = base;
+	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	pending.reservation_token++;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &pending, &proof), CLUSTER_PCM_OWN_OK);
+	committed = pending;
+	committed.generation = 1;
+	committed.flags = 0;
+	committed.buffer_type = (uint8)BUF_TYPE_XCUR;
+	committed.pcm_state = (uint8)PCM_STATE_X;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(
+		CLUSTER_PCM_DIRECT_INIT_EXTEND, &committed, &proof), CLUSTER_PCM_OWN_OK);
+}
+
 UT_TEST(test_bufmgr_consumes_proof_before_reservation_and_wire)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
@@ -329,6 +411,45 @@ UT_TEST(test_bufmgr_consumes_proof_before_reservation_and_wire)
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
 		assert_ordered(source, order, lengthof(order));
+		free(source);
+	}
+}
+
+UT_TEST(test_target_direct_init_uses_exact_resource_x_round_without_legacy_fallback)
+{
+	char *source = read_source(BUFMGR_SOURCE_PATH);
+	static const char *const target_order[] = {
+		"cluster_bufmgr_pcm_gate_direct_init(",
+		"cluster_pcm_direct_init_proof_consume",
+		"cluster_pcm_own_reservation_begin_exact",
+		"cluster_pcm_direct_init_target_pending_validate(",
+		"cluster_resource_x_writer_path_snapshot(",
+		"case RESOURCE_X_WRITER_TARGET:",
+		"cluster_gcs_resource_x_target_direct_init_acquire_exact(",
+		"pending_base.generation",
+		"pending_token",
+		"cluster_pcm_direct_init_target_commit_validate(",
+		"case RESOURCE_X_WRITER_SOURCE:",
+		"cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X"
+	};
+	const char *target_case;
+	const char *source_case;
+	const char *legacy;
+
+	UT_ASSERT(source != NULL);
+	if (source != NULL) {
+		assert_ordered(source, target_order, lengthof(target_order));
+		target_case = strstr(source, "case RESOURCE_X_WRITER_TARGET:");
+		source_case = target_case != NULL
+			? strstr(target_case, "case RESOURCE_X_WRITER_SOURCE:") : NULL;
+		legacy = target_case != NULL
+			? strstr(target_case,
+				"cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X") : NULL;
+		UT_ASSERT(target_case != NULL);
+		UT_ASSERT(source_case != NULL);
+		UT_ASSERT(legacy != NULL);
+		if (source_case != NULL && legacy != NULL)
+			UT_ASSERT(legacy > source_case);
 		free(source);
 	}
 }
@@ -446,7 +567,8 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 		/* The refusal arm sits between the queue acquire and the ERROR
 		 * report, and only the barrier-aware entry can consume it. */
 		static const char *const refusal_order[]
-			= { "cluster_gcs_pcm_x_acquire_writer(buf, &entry->claim",
+			= { "cluster_gcs_pcm_x_acquire_writer(",
+				"buf, r4_generation, &entry->authority.source",
 				"PCM_X_QUEUE_BARRIER_CLOSED && barrier_refused != NULL",
 				"cluster_bufmgr_pcm_x_writer_report_failure(result, buf, \"queue acquire\")" };
 
@@ -736,7 +858,7 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(25);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);
@@ -747,7 +869,11 @@ main(void)
 	UT_RUN(test_revalidate_rejects_state_pin_and_reservation_changes);
 	UT_RUN(test_missing_backend_pin_is_rejected);
 	UT_RUN(test_vm_fsm_fork_and_valid_shape_are_exact);
+	UT_RUN(test_target_pending_reservation_remains_bound_to_consumed_known_new_proof);
+	UT_RUN(test_target_post_t3_commit_revalidates_exact_known_new_identity);
+	UT_RUN(test_target_fresh_generation_zero_is_exact_known_new_identity);
 	UT_RUN(test_bufmgr_consumes_proof_before_reservation_and_wire);
+	UT_RUN(test_target_direct_init_uses_exact_resource_x_round_without_legacy_fallback);
 	UT_RUN(test_read_miss_and_found_hit_have_no_raw_unproven_lock);
 	UT_RUN(test_extend_proof_is_after_zeroextend_and_before_lock);
 	UT_RUN(test_vm_fsm_use_dedicated_init_wrappers);

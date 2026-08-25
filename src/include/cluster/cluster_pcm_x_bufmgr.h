@@ -167,6 +167,25 @@ typedef struct ClusterPcmOwnSnapshot {
 
 StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 64, "ClusterPcmOwnSnapshot must remain 64 bytes");
 
+#define CLUSTER_PCM_OWN_HELD_X_REVOKE_PIN_HELD UINT32_C(0x00000001)
+#define CLUSTER_PCM_OWN_HELD_X_REVOKE_STARTED UINT32_C(0x00000002)
+#define CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK \
+	(CLUSTER_PCM_OWN_HELD_X_REVOKE_PIN_HELD \
+	 | CLUSTER_PCM_OWN_HELD_X_REVOKE_STARTED)
+
+/* Opaque process-local holder for the post-L3 X-source path.  The raw pin is
+ * acquired under mapping authority before REVOKING begins and remains live
+ * through copy, pair retention, and the finish attempt.  It is never copied
+ * to shared memory, wire, WAL, or Resource-X identity. */
+typedef struct ClusterPcmOwnHeldXRevoke {
+	ClusterPcmOwnSnapshot revoking;
+	int32 buffer_id;
+	uint32 flags;
+} ClusterPcmOwnHeldXRevoke;
+
+StaticAssertDecl(sizeof(ClusterPcmOwnHeldXRevoke) == 72,
+				 "ClusterPcmOwnHeldXRevoke layout must remain 72 bytes");
+
 typedef struct ResourceXCurrentImage {
 	const char *page_bytes;
 	XLogRecPtr page_lsn;
@@ -318,6 +337,17 @@ static inline bool
 cluster_pcm_x_should_release_legacy_on_unlock(bool local_cache, bool queue_managed)
 {
 	return !local_cache && !queue_managed;
+}
+
+/* Once R4 selects the Resource-X TARGET path, holder-side revoke evidence is
+ * the authenticated type-17 paired with the exact BufferDesc state.  The
+ * pre-removal L3 proof has terminally closed the legacy local-holder
+ * allocator, so only a non-TARGET interval may register in that allocator. */
+static inline bool
+cluster_pcm_x_legacy_holder_registration_required(
+	bool resource_x_target_selected)
+{
+	return !resource_x_target_selected;
 }
 
 /* A tracked current-X page is not an ordinary writable entrance until both
@@ -575,11 +605,23 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf,
  * returned, and the master still owns proof selection. */
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n);
+/* Exact physical half of the former-source reacquire interlock.  It proves
+ * only a clean, valid N+PI descriptor held by one REVOKING token; the caller
+ * must independently bind that generation to the retained Resource-X pair. */
+extern bool cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n);
 /* A passive N descriptor is eligible for a durable-storage assertion only
  * while the exact ownership tuple still names clean, valid, non-IO CURRENT
  * residency.  The page bytes are deliberately not returned as proof. */
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_storage_candidate_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n);
+/* The only TARGET durable-proof exception to the ordinary BM_VALID/no-IO N
+ * preflight.  An exact direct-init proof has already published this existing
+ * N_NEW reservation before any Resource-X frame; T2 revalidates its known-new
+ * shared descriptor shape without treating page bytes as proof. */
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_pending_n);
 /* Current-slice remote-S holder evidence.  This is a local BufferDesc
  * predicate only: it neither creates nor consults a GRD/Resource-X authority
  * record.  The caller holds content EXCLUSIVE across its final check and the
@@ -609,6 +651,18 @@ extern ResourceXBufferActivationResult cluster_bufmgr_pcm_own_activate_x_by_tag(
 extern ResourceXBufferActivationResult
 cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 	const ResourceXAcquisitionRef *ref, ResourceXBufferActivationProof *out_proof);
+/* Exact known-new TARGET adaptation.  These calls bind/clear only the
+ * Resource-X sidecar around an already committed local X reservation; they
+ * never install durable-storage bytes into the direct-init descriptor. */
+extern ResourceXBufferActivationResult
+cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
+	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
+	uint64 expected_reservation_token, ResourceXBufferInstallProof *out_proof);
+extern ResourceXBufferActivationResult
+cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(
+	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
+	uint64 expected_reservation_token,
+	ResourceXBufferActivationProof *out_proof);
 extern ResourceXSidecarNeutralizeResult cluster_bufmgr_resource_x_neutralize_exact(
 	const BufferTag *tag, uint64 old_formation, uint64 acquisition_generation);
 /* Resolve one resident descriptor and snapshot its ownership tuple while the
@@ -618,6 +672,11 @@ extern ResourceXSidecarNeutralizeResult cluster_bufmgr_resource_x_neutralize_exa
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
 									   ClusterPcmOwnSnapshot *out_snapshot);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
+	const BufferTag *tag, uint64 expected_generation,
+	uint64 expected_reservation_token, int *out_buffer_id,
+	ClusterPcmOwnSnapshot *out_snapshot);
 /* Backstop direct content-lock mutation entrances that do not pass through
  * LockBuffer/W1.  GRANT_PENDING image installation is permitted; a live
  * source REVOKING lifecycle or retained PI+VALID descriptor is not. */
@@ -683,6 +742,24 @@ cluster_bufmgr_pcm_own_begin_x_revoke(BufferDesc *buf, const ClusterPcmOwnSnapsh
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_abort_x_revoke(BufferDesc *buf,
 									  const ClusterPcmOwnSnapshot *expected_revoking);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(
+	const BufferTag *tag, const ClusterPcmOwnSnapshot *expected_x,
+	ClusterPcmOwnHeldXRevoke *held_out);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_abort_held_x_revoke(
+	ClusterPcmOwnHeldXRevoke *held);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_try_drain_held_x_revoke(
+	const ClusterPcmOwnHeldXRevoke *held);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
+	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn,
+	ClusterPcmOwnSnapshot *out_retained,
+	ClusterPcmOwnFinishRefusal *out_refusal);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(
+	ClusterPcmOwnHeldXRevoke *held);
 
 /* Build an immutable requester-as-source image from a clean N descriptor and
  * shared storage.  Success leaves the exact same-generation REVOKING token
@@ -715,8 +792,11 @@ cluster_bufmgr_pcm_own_abort_s_revoke(BufferDesc *buf,
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking, XLogRecPtr expected_lsn,
 	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
+	const BufferTag *tag, uint64 source_generation);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
-																		 uint64 source_generation);
+															 uint64 source_generation);
 /* Process-local descriptor evidence captured by the DRAIN-time probe below
  * so the caller can log the observed shape as diagnostics.  The fields are
  * one header-locked snapshot; never persisted or sent on wire. */

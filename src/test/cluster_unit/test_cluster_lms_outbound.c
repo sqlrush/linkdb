@@ -778,6 +778,19 @@ ut_resource_x_settlement_intent(int32 destination_node)
 	return intent;
 }
 
+static ResourceXIntentSlot
+ut_resource_x_holder_release_intent(int32 destination_node)
+{
+	ResourceXIntentSlot intent = ut_resource_x_grant_intent(2);
+
+	intent.destination_node = (uint32)destination_node;
+	intent.payload_bytes = RESOURCE_X_PROOF_V1_BYTES;
+	intent.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2;
+	intent.body.owner_generation = intent.logical_generation;
+	intent.body.owner_kind = RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE;
+	return intent;
+}
+
 /* ============================================================
  * Tests.
  * ============================================================ */
@@ -1300,6 +1313,53 @@ UT_TEST(test_resource_x_settlement_intent_uses_type38_and_short_payload)
 	UT_ASSERT_EQ(ut_resource_x_complete_count, 1);
 }
 
+UT_TEST(test_resource_x_holder_release_transport_rearms_until_typed_ack)
+{
+	ResourceXIntentSlot intent;
+
+	ut_reset_log();
+	intent = ut_resource_x_holder_release_intent(UT_PEER_X);
+	ut_resource_x_owner_slot = intent;
+	ut_resource_x_owner_payload[0] = 0xAC;
+	ut_peer_capabilities[UT_PEER_X]
+		= PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	ut_peer_cap_generation[UT_PEER_X] = 87;
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+
+	UT_ASSERT(cluster_lms_outbound_enqueue_resource_x_intent(
+		0, &intent, 87, UINT64_MAX));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].msg_type, RESOURCE_X_MSG_BLOCK_TO_N);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len,
+		RESOURCE_X_PROOF_V1_BYTES);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAC);
+	UT_ASSERT_EQ(ut_resource_x_rearm_count, 1);
+	UT_ASSERT_EQ(ut_resource_x_complete_count, 0);
+	UT_ASSERT_EQ(ut_resource_x_owner_slot.state,
+		RESOURCE_X_INTENT_SLOT_ARMED);
+}
+
+UT_TEST(test_resource_x_source_settlement_ack_fits_ordinary_data_ring)
+{
+	uint8 ack[RESOURCE_X_PROOF_V1_BYTES] = { 0xAD };
+
+	ut_reset_log();
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+
+	UT_ASSERT(cluster_lms_outbound_enqueue(0,
+		RESOURCE_X_MSG_BLOCKED_TO_N, UT_PEER_X, ack, sizeof(ack)));
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 0);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].msg_type,
+		RESOURCE_X_MSG_BLOCKED_TO_N);
+	UT_ASSERT_EQ(ut_sent_log[0].payload_len,
+		RESOURCE_X_PROOF_V1_BYTES);
+	UT_ASSERT_EQ(ut_sent_log[0].marker, 0xAD);
+}
+
 UT_TEST(test_resource_x_image_intent_rebinds_transport_generation)
 {
 	ResourceXIntentSlot intent;
@@ -1673,7 +1733,7 @@ UT_TEST(test_resource_x_nonrequester_s_status_self_master_loopback_is_retained)
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(34);
 
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
@@ -1696,6 +1756,8 @@ main(void)
 	UT_RUN(test_resource_x_intent_admission_stages_and_completion_clears_owner);
 	UT_RUN(test_resource_x_block_intent_uses_type17_and_control_payload);
 	UT_RUN(test_resource_x_settlement_intent_uses_type38_and_short_payload);
+	UT_RUN(test_resource_x_holder_release_transport_rearms_until_typed_ack);
+	UT_RUN(test_resource_x_source_settlement_ack_fits_ordinary_data_ring);
 	UT_RUN(test_resource_x_image_intent_rebinds_transport_generation);
 	UT_RUN(test_resource_x_intent_transport_refusal_rearms_without_ring_copy);
 	UT_RUN(test_resource_x_intent_capability_drift_rearms_before_send);

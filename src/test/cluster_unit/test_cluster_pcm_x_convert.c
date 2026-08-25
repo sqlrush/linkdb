@@ -121,6 +121,7 @@ static uint64 grant_interlock_generation;
 static bool resource_x_completion_runtime_drift_armed;
 static LWLock *resource_x_completion_runtime_drift_lock;
 static bool resource_x_cutover_proofs_available;
+static bool resource_x_cutover_thawed_proofs_available;
 static uint64 resource_x_cutover_proof_sequence;
 static bool drive_terminal_interlock_armed;
 static LWLock *drive_terminal_interlock_lock;
@@ -206,6 +207,23 @@ cluster_pcm_lock_resource_x_cutover_proofs_exact(
 	clean_proof_out->logical_debt_zero = 1;
 	clean_proof_out->transport_debt_zero = 1;
 	return true;
+}
+
+bool
+cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
+	ResourceXReconfigToken *token_out,
+	ResourceXZeroResidualProof *zero_proof_out,
+	ResourceXCleanCompletionProof *clean_proof_out)
+{
+	bool frozen_available = resource_x_cutover_proofs_available;
+	bool result;
+
+	resource_x_cutover_proofs_available
+		= resource_x_cutover_thawed_proofs_available;
+	result = cluster_pcm_lock_resource_x_cutover_proofs_exact(
+		token_out, zero_proof_out, clean_proof_out);
+	resource_x_cutover_proofs_available = frozen_available;
+	return result;
 }
 
 static void maybe_publish_staged_prehandle_insert_exists(void);
@@ -722,6 +740,7 @@ reset_fake_shmem(void)
 	grant_interlock_ticket = NULL;
 	grant_interlock_generation = 0;
 	resource_x_cutover_proofs_available = false;
+	resource_x_cutover_thawed_proofs_available = false;
 	resource_x_cutover_proof_sequence = 11;
 	drive_terminal_interlock_armed = false;
 	drive_terminal_interlock_lock = NULL;
@@ -10152,6 +10171,31 @@ UT_TEST(test_local_writer_revoke_fence_reserves_absent_tag_shell)
 	UT_ASSERT_EQ(ClusterPcmXConvertShmem->allocator[PCM_X_ALLOC_LOCAL_TAG].used, 0);
 }
 
+UT_TEST(test_local_writer_revoke_fence_after_l3_never_resurrects_tag_shell)
+{
+	BufferTag tag = make_tag(819);
+	PcmXLocalWriterRevokeFence fence;
+	PcmXSlotRef found;
+	ResourceXAssertion assertion;
+	const uint64 master_session = UINT64_C(177);
+	uint64 resource_formation;
+
+	init_active_pcm_x(master_session);
+	resource_formation = cluster_pcm_x_runtime_snapshot().gate_generation;
+	cluster_node_id = 0;
+	bind_local_master(0, UINT64_C(28), master_session);
+	ClusterPcmXConvertShmem->legacy_l3_terminal_proof.state
+		= PCM_X_LEGACY_L3_PROOF_PUBLISHED;
+	UT_ASSERT(resource_x_assertion_init(&tag, 2, &assertion));
+	UT_ASSERT_EQ(cluster_pcm_x_local_writer_revoke_fence_acquire_exact(
+		&assertion, UINT64_C(43), resource_formation, 0,
+		master_session, &fence), PCM_X_QUEUE_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_pcm_x_directory_find(
+		PCM_X_DIR_LOCAL_TAG, &tag, &found), PCM_X_DIRECTORY_NOT_FOUND);
+	UT_ASSERT_EQ(
+		ClusterPcmXConvertShmem->allocator[PCM_X_ALLOC_LOCAL_TAG].used, 0);
+}
+
 UT_TEST(test_local_completed_follower_detaches_before_terminal_drain)
 {
 	PcmXLocalHandle leader;
@@ -18790,8 +18834,6 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 	const ClusterSemanticActivationCallbackBundle *callbacks;
 	ClusterSemanticActivationRefusal refusal;
 	ClusterSemanticZeroProof proof;
-	PcmXSlotHeader *late_slot;
-	PcmXSlotRef late_ref;
 
 	init_active_pcm_x(UINT64_C(77));
 	callbacks = cluster_pcm_x_resource_x_activation_callbacks();
@@ -18807,21 +18849,22 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 
 	memset(&refusal, 0xff, sizeof(refusal));
 	UT_ASSERT_EQ(callbacks->pre_prepare_readiness(7, &refusal),
-				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(refusal.feature_bit,
-				 CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1);
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(refusal.feature_bit, 0);
 	UT_ASSERT_EQ(refusal.expected_generation, 7);
+	UT_ASSERT_EQ(callbacks->close_source_admission(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
-				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
 	UT_ASSERT_EQ(proof.record_generation, 0);
 	UT_ASSERT_EQ(proof.debt_count, 0);
 	UT_ASSERT_EQ(proof.sample_digest, 0);
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_transport_zero(7, &proof),
-				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
 	UT_ASSERT_EQ(proof.record_generation, 0);
 	UT_ASSERT_EQ(proof.debt_count, 0);
 	UT_ASSERT_EQ(proof.sample_digest, 0);
@@ -18835,16 +18878,8 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_OK);
 	UT_ASSERT_EQ(refusal.feature_bit, 0);
 	/* Exact predecessor bytes and live allocator emptiness are not L3.  The
-	 * closed legacy owner must first publish one immutable same-G/T terminal
-	 * artifact. */
-	memset(&proof, 0xff, sizeof(proof));
-	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
-				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	UT_ASSERT_EQ(proof.record_generation, 0);
-	UT_ASSERT_EQ(proof.debt_count, 0);
-	UT_ASSERT_EQ(proof.sample_digest, 0);
-	UT_ASSERT_EQ(callbacks->close_source_admission(7),
-				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	 * closed legacy owner publishes one immutable same-G/T terminal artifact
+	 * only from the post-close logical-zero callback. */
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(7, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);
@@ -18861,6 +18896,13 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 	}
 	UT_ASSERT_EQ(callbacks->prepare_target(7),
 				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(callbacks->apply_target_closed(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(callbacks->open_target_admission(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+	resource_x_cutover_thawed_proofs_available = true;
+	UT_ASSERT_EQ(callbacks->open_target_admission(7),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 
 	/* The artifact is immutable and exact.  Neither a new predecessor round,
 	 * a different activation generation, nor a late legacy allocation may be
@@ -18872,15 +18914,6 @@ UT_TEST(test_resource_x_activation_callbacks_reject_missing_exact_predecessor_pa
 	resource_x_cutover_proof_sequence--;
 	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(8, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
-	late_ref.slot_index = 0;
-	late_ref.slot_generation = 0;
-	late_slot = (PcmXSlotHeader *)(uintptr_t)1;
-	UT_ASSERT_EQ(cluster_pcm_x_allocator_reserve(
-				 PCM_X_ALLOC_LOCAL_TAG, &late_ref, &late_slot),
-				 PCM_X_ALLOC_BAD_STATE);
-	UT_ASSERT_EQ(late_ref.slot_index, PCM_X_INVALID_SLOT_INDEX);
-	UT_ASSERT_EQ(late_ref.slot_generation, 0);
-	UT_ASSERT_NULL(late_slot);
 }
 
 UT_TEST(test_resource_x_activation_refuses_open_local_round)
@@ -18895,7 +18928,7 @@ UT_TEST(test_resource_x_activation_refuses_open_local_round)
 	(void) reserve_slot(PCM_X_ALLOC_LOCAL_TAG, &tag_ref);
 
 	UT_ASSERT_EQ(callbacks->close_source_admission(11),
-				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_logical_debt_zero(11, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
@@ -18920,7 +18953,7 @@ UT_TEST(test_resource_x_activation_refuses_staged_local_frame)
 	tag->reliable.pending_opcode = PGRAC_IC_MSG_PCM_X_INSTALL_READY;
 
 	UT_ASSERT_EQ(callbacks->close_source_admission(13),
-				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
 	memset(&proof, 0xff, sizeof(proof));
 	UT_ASSERT_EQ(callbacks->source_transport_zero(13, &proof),
 				 CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO);
@@ -19731,7 +19764,7 @@ UT_TEST(test_runtime_reform_tag_epoch_failure_keeps_blocked)
 int
 main(void)
 {
-	UT_PLAN(325);
+	UT_PLAN(326);
 	UT_RUN(test_image_id_domain_is_canonical_and_bounded);
 	UT_RUN(test_wire_abi_sizes_are_exact);
 	UT_RUN(test_wire_abi_offsets_are_exact);
@@ -19913,6 +19946,7 @@ main(void)
 	UT_RUN(test_local_writer_claim_runs_closed_cohort_and_blocks_next_round);
 	UT_RUN(test_local_writer_revoke_fence_blocks_claim_until_exact_release);
 	UT_RUN(test_local_writer_revoke_fence_reserves_absent_tag_shell);
+	UT_RUN(test_local_writer_revoke_fence_after_l3_never_resurrects_tag_shell);
 	UT_RUN(test_local_completed_follower_detaches_before_terminal_drain);
 	UT_RUN(test_local_writer_claim_completion_is_fifo_and_one_shot);
 	UT_RUN(test_writer_and_holder_owner_exit_retry_preserves_exact_evidence);

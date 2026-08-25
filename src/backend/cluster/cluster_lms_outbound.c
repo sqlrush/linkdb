@@ -57,7 +57,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #define PGRAC_LMS_OUTBOUND_CAPACITY 256
-#define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX RESOURCE_X_SHORT_V1_BYTES
+#define PGRAC_LMS_OUTBOUND_PAYLOAD_MAX RESOURCE_X_PROOF_V1_BYTES
 #define PGRAC_LMS_RESOURCE_X_PROBE_BUDGET 4
 #define PGRAC_LMS_RESOURCE_X_CALLS_PER_TICK 16
 
@@ -87,9 +87,9 @@ typedef struct ClusterLmsOutboundSlot {
 } ClusterLmsOutboundSlot;
 
 StaticAssertDecl(PGRAC_LMS_OUTBOUND_PAYLOAD_MAX
-					 >= RESOURCE_X_SHORT_V1_BYTES,
-				 "LMS outbound slot must hold a Resource-X local proof");
-StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 224,
+					 >= RESOURCE_X_PROOF_V1_BYTES,
+				 "LMS outbound slot must hold a Resource-X proof ACK");
+StaticAssertDecl(sizeof(ClusterLmsOutboundSlot) == 384,
 				 "LMS outbound slot capability guard layout changed");
 
 typedef struct ClusterLmsZeroBlockReplyWire {
@@ -559,6 +559,14 @@ lms_outbound_resource_x_intent_valid(const ResourceXIntentSlot *intent)
 			&& intent->body.owner_generation
 				   == intent->logical_generation
 			&& intent->body.owner_index == 0;
+	case RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE:
+		return intent->payload_bytes == RESOURCE_X_PROOF_V1_BYTES
+			&& intent->kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+			&& intent->body.assertion.requester_node
+				   != (int32)intent->destination_node
+			&& intent->body.owner_generation
+				   == intent->logical_generation
+			&& intent->body.owner_index == 0;
 	default:
 		return false;
 	}
@@ -571,6 +579,7 @@ lms_outbound_resource_x_intent_msg_type(const ResourceXIntentSlot *intent)
 		return 0;
 	switch ((ResourceXWireKind)intent->kind) {
 	case RESOURCE_X_WIRE_BLOCK_TO_N:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
 		return RESOURCE_X_MSG_BLOCK_TO_N;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
 		return RESOURCE_X_MSG_BLOCKED_TO_N;
@@ -643,11 +652,17 @@ cluster_lms_outbound_enqueue_resource_x_intent(
 		LWLockRelease(lock);
 		return false;
 	}
-	if (cluster_pcm_lock_resource_x_outbound_intent_stage_exact(intent, now_us)
-		!= RESOURCE_X_INTENT_STAGED) {
-		memset(slot, 0, sizeof(*slot));
-		LWLockRelease(lock);
+	{
+		ResourceXIntentResult stage_result;
+
+		stage_result
+			= cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
+				intent, now_us);
+		if (stage_result != RESOURCE_X_INTENT_STAGED) {
+			memset(slot, 0, sizeof(*slot));
+			LWLockRelease(lock);
 		return false;
+		}
 	}
 	ring->head = (ring->head + 1) % PGRAC_LMS_OUTBOUND_CAPACITY;
 	ring->count++;
@@ -969,9 +984,10 @@ cluster_lms_outbound_drain_send(int worker_id)
 						slot.connection_generation)))) {
 			lms_outbound_pcm_x_image_ready_note(&slot, "capability-guard", -1);
 			cluster_lms_obs_note_outbound_cap_guard_drop(worker_id);
-			if (resource_x_slot)
+			if (resource_x_slot) {
 				(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
 					&resource_x_intent, lms_outbound_monotonic_us());
+			}
 			continue;
 		}
 		send_payload = slot.payload_len > 0 ? slot.payload : NULL;
@@ -1126,9 +1142,16 @@ handle_send_result:
 		case CLUSTER_IC_SEND_DONE:
 		case CLUSTER_IC_SEND_WOULD_BLOCK:
 			/* On the wire or admitted (transport owns a copy). */
-			if (resource_x_slot)
-				(void)cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
-					&resource_x_intent);
+			if (resource_x_slot) {
+				if (resource_x_intent.body.owner_kind
+						== RESOURCE_X_INTENT_OWNER_HOLDER_RELEASE)
+					(void)cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
+						&resource_x_intent,
+						lms_outbound_monotonic_us());
+				else
+					(void)cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
+						&resource_x_intent);
+			}
 			if (remote_s_status_slot) {
 				LWLockAcquire(lock, LW_EXCLUSIVE);
 				if (ring->count == 0

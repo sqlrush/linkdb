@@ -96,6 +96,26 @@ typedef enum ResourceXWriterPath {
 	RESOURCE_X_WRITER_CLOSED = 3
 } ResourceXWriterPath;
 
+/* Stack-only R11 owner-phase observation.  It is neither persisted nor sent
+ * on the wire and grants no authority; it only identifies exact points in
+ * the existing R4 cutover round. */
+typedef enum ClusterSemanticR11CutoverPhase {
+	CLUSTER_SEMANTIC_R11_CUTOVER_NONE = 0,
+	CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED = 1,
+	CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL = 2,
+	CLUSTER_SEMANTIC_R11_CUTOVER_TARGET_OPEN = 3
+} ClusterSemanticR11CutoverPhase;
+
+typedef struct ClusterSemanticR11CutoverSnapshot {
+	uint64 record_generation;
+	uint64 formation_epoch;
+	uint32 phase;
+	uint32 reserved;
+} ClusterSemanticR11CutoverSnapshot;
+
+StaticAssertDecl(sizeof(ClusterSemanticR11CutoverSnapshot) == 24,
+				 "R11 cutover snapshot layout must remain 24 bytes");
+
 typedef struct ClusterSemanticAdmissionToken {
 	uint64 feature_bit;
 	uint64 record_generation;
@@ -261,6 +281,8 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 								  ClusterSemanticAdmissionToken *token);
 extern ResourceXWriterPath
 cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out);
+extern bool cluster_semantic_activation_r11_cutover_snapshot(
+	ClusterSemanticR11CutoverSnapshot *out);
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter_r4_terminal_census(
@@ -284,6 +306,9 @@ cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 extern bool cluster_semantic_activation_peer_open_matches(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 required_hello_caps, uint32 sampled_capability_generation);
+extern bool cluster_semantic_activation_resource_x_peer_open_matches(
+	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
+	uint32 sampled_capability_generation);
 extern bool cluster_semantic_activation_restore_open_proof_if_active(void);
 extern void cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token);
 extern ClusterSemanticAdmissionResult

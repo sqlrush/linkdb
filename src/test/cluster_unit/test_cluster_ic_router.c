@@ -779,7 +779,22 @@ UT_TEST(test_t_fanout_5_send_hard_error_maps_to_hard_error)
 	UT_ASSERT(per_peer[5] == CLUSTER_IC_FANOUT_HARD_ERROR);
 }
 
-UT_TEST(test_t_fanout_6_broadcast_ok_false_static_grep)
+UT_TEST(test_t_fanout_6_send_not_admitted_preserves_frame_ownership)
+{
+	ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
+
+	fanout_test_reset(CLUSTER_IC_PRODUCER_LMON, /*broadcast_ok=*/true);
+	MyBackendType = B_LMON;
+
+	test_tier1_peer_fd_mock[5] = 50;
+	test_send_bytes_mock_result = CLUSTER_IC_SEND_NOT_ADMITTED;
+
+	cluster_ic_send_envelope_fanout(TEST_FANOUT_MSG_TYPE, NULL, 0, per_peer);
+
+	UT_ASSERT(per_peer[5] == CLUSTER_IC_FANOUT_NOT_ADMITTED);
+}
+
+UT_TEST(test_t_fanout_7_broadcast_ok_false_static_grep)
 {
 	/* spec-2.5 R13 enforce: fanout API rejects broadcast_ok=false at
 	 * lookup time with ereport ERROR.  Static-grep verifies the enforce
@@ -809,7 +824,7 @@ UT_TEST(test_t_fanout_6_broadcast_ok_false_static_grep)
 	UT_ASSERT(saw_fanout_errhint);
 }
 
-UT_TEST(test_t_fanout_7_enum_4_states_distinct)
+UT_TEST(test_t_fanout_8_enum_5_states_distinct)
 {
 	/* sanity check: enum values are distinct + DONE = 0 (matches
 	 * pg_atomic_init_u32(0) idle default). */
@@ -817,9 +832,13 @@ UT_TEST(test_t_fanout_7_enum_4_states_distinct)
 	UT_ASSERT(CLUSTER_IC_FANOUT_DONE != CLUSTER_IC_FANOUT_WOULD_BLOCK);
 	UT_ASSERT(CLUSTER_IC_FANOUT_DONE != CLUSTER_IC_FANOUT_HARD_ERROR);
 	UT_ASSERT(CLUSTER_IC_FANOUT_DONE != CLUSTER_IC_FANOUT_PEER_DOWN);
+	UT_ASSERT(CLUSTER_IC_FANOUT_DONE != CLUSTER_IC_FANOUT_NOT_ADMITTED);
 	UT_ASSERT(CLUSTER_IC_FANOUT_WOULD_BLOCK != CLUSTER_IC_FANOUT_HARD_ERROR);
 	UT_ASSERT(CLUSTER_IC_FANOUT_WOULD_BLOCK != CLUSTER_IC_FANOUT_PEER_DOWN);
+	UT_ASSERT(CLUSTER_IC_FANOUT_WOULD_BLOCK != CLUSTER_IC_FANOUT_NOT_ADMITTED);
 	UT_ASSERT(CLUSTER_IC_FANOUT_HARD_ERROR != CLUSTER_IC_FANOUT_PEER_DOWN);
+	UT_ASSERT(CLUSTER_IC_FANOUT_HARD_ERROR != CLUSTER_IC_FANOUT_NOT_ADMITTED);
+	UT_ASSERT(CLUSTER_IC_FANOUT_PEER_DOWN != CLUSTER_IC_FANOUT_NOT_ADMITTED);
 }
 
 UT_DEFINE_GLOBALS();
@@ -841,7 +860,7 @@ cluster_lms_obs_note_dispatch(void)
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(19);
 
 	/* U6 register HEARTBEAT + count */
 	UT_RUN(test_u6_register_heartbeat_lmon_only);
@@ -862,14 +881,15 @@ main(void)
 	UT_RUN(test_u22_dispatch_accepts_broadcast_when_allowed);
 	UT_RUN(test_scheme_a_data_plane_requires_serving_ready);
 
-	/* T-fanout 1-7: spec-2.5 D2.5 fanout API */
+	/* T-fanout 1-8: spec-2.5 D2.5 fanout API */
 	UT_RUN(test_t_fanout_1_all_peers_down_writes_peer_down);
 	UT_RUN(test_t_fanout_2_one_peer_up_done_others_down);
 	UT_RUN(test_t_fanout_3_self_excluded);
 	UT_RUN(test_t_fanout_4_send_would_block_maps_to_would_block);
 	UT_RUN(test_t_fanout_5_send_hard_error_maps_to_hard_error);
-	UT_RUN(test_t_fanout_6_broadcast_ok_false_static_grep);
-	UT_RUN(test_t_fanout_7_enum_4_states_distinct);
+	UT_RUN(test_t_fanout_6_send_not_admitted_preserves_frame_ownership);
+	UT_RUN(test_t_fanout_7_broadcast_ok_false_static_grep);
+	UT_RUN(test_t_fanout_8_enum_5_states_distinct);
 
 	/* unused variable warning suppression for stub instance */
 	(void)test_handler_dummy_calls;

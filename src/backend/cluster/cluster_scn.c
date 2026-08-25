@@ -1736,13 +1736,24 @@ cluster_scn_emit_broadcast_pulse(void)
  *	boc_sweep_count in ClusterScnSharedState, so no new shmem fields are
  *	needed and the spec remains 0 catalog/shmem-surface churn.
  */
+typedef struct ClusterScnBocPeerRetry {
+	bool pending;
+	uint32 payload_len;
+	SCN frontier;
+} ClusterScnBocPeerRetry;
+
 void
 cluster_scn_lmon_drain_boc_broadcast(void)
 {
 	static uint64 last_drained_sweep_count = 0;
+	static SCN last_fanout_frontier = InvalidScn;
+	static ClusterScnBocPeerRetry peer_retry[CLUSTER_MAX_NODES];
 	ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
 	uint64 sweep_count;
 	bool event_pending;
+	bool have_retry = false;
+	bool frontier_advanced;
+	bool new_publication;
 	SCN frontier;
 	uint8 payload[CLUSTER_SCN_BOC_PAYLOAD_V1_LEN];
 	const void *send_payload = NULL;
@@ -1750,6 +1761,7 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 	int peer;
 	int done = 0;
 	int would_block = 0;
+	int not_admitted = 0;
 	int hard_error = 0;
 	ClusterXpScope xps; /* PGRAC: spec-5.59 D2 profiling */
 
@@ -1773,7 +1785,20 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 	 * new sweep beat or a commit event justifies a fanout. */
 	event_pending = cluster_scn_boc_event_consume();
 	sweep_count = pg_atomic_read_u64(&cluster_scn_state->boc_sweep_count);
-	if (sweep_count == last_drained_sweep_count && !event_pending)
+	frontier = cluster_scn_durable_safe_scn();
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		if (peer_retry[peer].pending) {
+			have_retry = true;
+			break;
+		}
+	}
+	frontier_advanced
+		= cluster_boc_event_publish && SCN_VALID(frontier)
+		  && (!SCN_VALID(last_fanout_frontier)
+			  || scn_total_cmp(frontier, last_fanout_frontier) > 0);
+	new_publication = sweep_count != last_drained_sweep_count || frontier_advanced
+					  || (event_pending && !have_retry);
+	if (!new_publication && !have_retry)
 		return;
 
 	/*
@@ -1783,7 +1808,7 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 	 * boc_event_publish_count : boc_sweep_fallback_count reads the event/sweep
 	 * balance regardless of fanout delivery outcome.
 	 */
-	if (!event_pending)
+	if (new_publication && !event_pending)
 		pg_atomic_fetch_add_u64(&cluster_scn_state->boc_sweep_fallback_count, 1);
 
 	/* PGRAC: spec-5.59 D2 profiling */
@@ -1793,15 +1818,63 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 	 * when event publish is on and a frontier exists;  otherwise keep
 	 * the pre-D1 0-length pulse (byte equivalence when the GUC is off,
 	 * and old receivers treat 0-length as pulse-only either way). */
-	frontier = cluster_scn_durable_safe_scn();
-	if (cluster_boc_event_publish && SCN_VALID(frontier)) {
+	if (new_publication && cluster_boc_event_publish && SCN_VALID(frontier)) {
 		cluster_scn_boc_payload_encode(frontier, payload);
 		send_payload = payload;
 		send_len = CLUSTER_SCN_BOC_PAYLOAD_V1_LEN;
 	}
 
-	cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_BOC_BROADCAST, send_payload, send_len, per_peer);
-	last_drained_sweep_count = sweep_count;
+	if (new_publication) {
+		cluster_ic_send_envelope_fanout(PGRAC_IC_MSG_BOC_BROADCAST, send_payload, send_len,
+										per_peer);
+		last_drained_sweep_count = sweep_count;
+		last_fanout_frontier = frontier;
+
+		for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+			peer_retry[peer].pending
+				= per_peer[peer] == CLUSTER_IC_FANOUT_NOT_ADMITTED;
+			if (peer_retry[peer].pending) {
+				peer_retry[peer].payload_len = send_len;
+				peer_retry[peer].frontier = frontier;
+			}
+		}
+	} else {
+		/* No newer publication exists.  Retry only exact refused peers;
+		 * every DONE/WOULD_BLOCK peer from the original fanout is excluded. */
+		for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+			ClusterICSendResult send_result;
+			uint8 retry_payload[CLUSTER_SCN_BOC_PAYLOAD_V1_LEN];
+			const void *retry_send_payload = NULL;
+
+			per_peer[peer] = CLUSTER_IC_FANOUT_PEER_DOWN;
+			if (!peer_retry[peer].pending)
+				continue;
+			if (peer_retry[peer].payload_len == CLUSTER_SCN_BOC_PAYLOAD_V1_LEN) {
+				cluster_scn_boc_payload_encode(peer_retry[peer].frontier, retry_payload);
+				retry_send_payload = retry_payload;
+			}
+			send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_BOC_BROADCAST, peer,
+										   retry_send_payload,
+										   peer_retry[peer].payload_len);
+			switch (send_result) {
+			case CLUSTER_IC_SEND_DONE:
+				per_peer[peer] = CLUSTER_IC_FANOUT_DONE;
+				peer_retry[peer].pending = false;
+				break;
+			case CLUSTER_IC_SEND_WOULD_BLOCK:
+				per_peer[peer] = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+				peer_retry[peer].pending = false;
+				break;
+			case CLUSTER_IC_SEND_NOT_ADMITTED:
+				per_peer[peer] = CLUSTER_IC_FANOUT_NOT_ADMITTED;
+				break;
+			case CLUSTER_IC_SEND_HARD_ERROR:
+				per_peer[peer] = CLUSTER_IC_FANOUT_HARD_ERROR;
+				peer_retry[peer].pending = false;
+				break;
+			}
+		}
+	}
 
 	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
 		switch (per_peer[peer]) {
@@ -1810,6 +1883,9 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 			break;
 		case CLUSTER_IC_FANOUT_WOULD_BLOCK:
 			would_block++;
+			break;
+		case CLUSTER_IC_FANOUT_NOT_ADMITTED:
+			not_admitted++;
 			break;
 		case CLUSTER_IC_FANOUT_HARD_ERROR:
 			hard_error++;
@@ -1831,12 +1907,24 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 								sweep_count, done)));
 	}
 
+	/*
+	 * Preserve exact frame ownership.  NOT_ADMITTED proves that no copy
+	 * exists below BOC, so retain the latest monotone frontier for the next
+	 * LMON tick; a later frontier may safely coalesce over it.  WOULD_BLOCK
+	 * is already transport-owned and MUST NOT be resubmitted.  Do not wake
+	 * LMON here: a full tier1 FIFO already installs WRITEABLE interest, while
+	 * the existing heartbeat remains the bounded backstop without a busy-loop.
+	 */
+	if (not_admitted > 0)
+		pg_atomic_write_u32(&cluster_scn_state->boc_event_dirty, 1);
+
 	cluster_xp_end(&xps); /* PGRAC: spec-5.59 D2 profiling */
 
-	if (would_block > 0 || hard_error > 0)
+	if (would_block > 0 || not_admitted > 0 || hard_error > 0)
 		ereport(DEBUG2, (errmsg("cluster_scn: BOC broadcast fanout partial "
-								"(sweep_count=" UINT64_FORMAT ", would_block=%d, hard_error=%d)",
-								sweep_count, would_block, hard_error)));
+								"(sweep_count=" UINT64_FORMAT
+								", would_block=%d, not_admitted=%d, hard_error=%d)",
+								sweep_count, would_block, not_admitted, hard_error)));
 }
 
 /*

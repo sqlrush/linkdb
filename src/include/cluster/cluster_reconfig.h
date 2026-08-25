@@ -902,6 +902,24 @@ extern bool cluster_reconfig_lmon_finalize_replacement_admitted(
 extern bool cluster_reconfig_lmon_snapshot_replacement_admitted(
 	ClusterReplacementEpisode *out_episode,
 	ClusterReplacementCommitMarkerV3 *out_marker);
+
+/* D13 initial-clean formation basis.  This stack-only image is not a new
+ * authority: it exposes the exact current four-node identity only while every
+ * replacement/reconfiguration carrier remains absent.  A zero marker
+ * generation means the exact INITIAL-epoch bootstrap seqlock/quorum branch;
+ * it is never synthesized into a formation-marker generation. */
+typedef struct ClusterInitialCleanFormationSnapshot {
+	uint64 formation_marker_generation;
+	uint64 formation_epoch;
+	uint64 members_lo;
+	uint64 members_hi;
+	uint64 arbiter_node;
+	uint64 arbiter_incarnation;
+	uint64 admitted_incarnation[4];
+} ClusterInitialCleanFormationSnapshot;
+
+extern bool cluster_reconfig_snapshot_initial_clean_formation(
+	ClusterInitialCleanFormationSnapshot *out);
 /* Formation-LMON-only coherent MEMBER/epoch sample for PGSA reconstruction. */
 extern bool cluster_reconfig_lmon_snapshot_admitted_membership(
 	uint64 *out_members_lo, uint64 *out_members_hi,

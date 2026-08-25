@@ -378,17 +378,27 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 	ClusterTxResolveReason *reason_out)
 {
 	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0LogicalKey tt_logical;
 	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0ResolvedRoot tt_root;
+	ClusterUndoBlock0ResolvedRoot tt_final_root;
 	ClusterUndoBlock0Generation generation;
 	ClusterUndoBlock0Generation final_generation;
+	ClusterUndoBlock0Generation tt_generation;
+	ClusterUndoBlock0Generation tt_final_generation;
+	ClusterRuntimeCandidateCleanup phase_cleanup;
 	ClusterTxResolution candidate;
 	ClusterTxLocator canonical_locator;
+	ClusterTxLocator rechecked_locator;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
 	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	ClusterUndoBlock0Result current_result;
 	PGAlignedBlock block0;
 	PGAlignedBlock data_page;
 	PGAlignedBlock record_buf;
+	PGAlignedBlock rechecked_data_page;
+	PGAlignedBlock rechecked_record_buf;
 	const UndoSegmentHeaderData *header;
 	const UndoRecordHeader *record;
 	TTSlot exact_slot;
@@ -400,6 +410,9 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 	uint16 tt_slot_offset;
 	uint16 row_offset;
 	size_t record_length = 0;
+	size_t rechecked_record_length = 0;
+	uint32 tt_segment_id;
+	bool cross_segment = false;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -407,8 +420,15 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 		*reason_out = reason;
 	memset(&candidate, 0, sizeof(candidate));
 	memset(&final_root, 0, sizeof(final_root));
+	memset(&tt_root, 0, sizeof(tt_root));
+	memset(&tt_final_root, 0, sizeof(tt_final_root));
 	memset(&generation, 0, sizeof(generation));
 	memset(&final_generation, 0, sizeof(final_generation));
+	memset(&tt_generation, 0, sizeof(tt_generation));
+	memset(&tt_final_generation, 0, sizeof(tt_final_generation));
+	memset(&rechecked_locator, 0, sizeof(rechecked_locator));
+	phase_cleanup.guard = guard;
+	phase_cleanup.active = false;
 
 	if (locator == NULL || out == NULL || admission == NULL || guard == NULL
 		|| root == NULL
@@ -437,28 +457,69 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);
 	logical.segment_id = segment_id;
-	if (cluster_undo_block0_current_sample_generation(
-			guard, root, &generation) != CLUSTER_UNDO_BLOCK0_OK
-			|| !generation.known || generation.value == UINT32_MAX
-			|| (expected_generation != NULL
-				&& (!expected_generation->known
-					|| expected_generation->value == UINT32_MAX
-					|| expected_generation->value != generation.value))
-			|| cluster_undo_block0_current_copy_resident(
-				guard, root, &generation, block0.data) != CLUSTER_UNDO_BLOCK0_OK
-			|| !cluster_undo_buf_copy_resident(
-				segment_id, logical.owner_instance, block_no, data_page.data)
-			|| !cluster_cr_r4_extract_resident_record(
-				data_page.data, locator, record_buf.data, &record_length,
-				&canonical_locator)
-			|| record_length < sizeof(UndoRecordHeader))
-			goto done;
+	current_result = cluster_undo_block0_current_sample_generation(
+		guard, root, &generation);
+	if (current_result != CLUSTER_UNDO_BLOCK0_OK
+		|| !generation.known || generation.value == UINT32_MAX)
+		goto done;
+	if (expected_generation != NULL
+		&& (!expected_generation->known
+			|| expected_generation->value == UINT32_MAX
+			|| expected_generation->value != generation.value))
+		goto done;
+	current_result = cluster_undo_block0_current_copy_resident(
+		guard, root, &generation, block0.data);
+	if (current_result != CLUSTER_UNDO_BLOCK0_OK)
+		goto done;
+	if (!cluster_undo_buf_copy_resident(
+			segment_id, logical.owner_instance, block_no, data_page.data))
+		goto done;
+	if (!cluster_cr_r4_extract_resident_record(
+			data_page.data, locator, record_buf.data, &record_length,
+			&canonical_locator))
+		goto done;
+	if (record_length < sizeof(UndoRecordHeader))
+		goto done;
 
 	record = (const UndoRecordHeader *)record_buf.data;
-	header = (const UndoSegmentHeaderData *)block0.data;
-	if (record->tt_slot_segment_id != segment_id
+	tt_segment_id = record->tt_slot_segment_id;
+	if (tt_segment_id == 0 || tt_segment_id > UINT16_MAX
+		|| ((tt_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1
+			   != logical.owner_instance
 		|| tt_slot_offset >= TT_SLOTS_PER_SEGMENT)
 		goto done;
+	cross_segment = tt_segment_id != segment_id;
+	if (cross_segment) {
+		/* The physical DATA alias and canonical TT resource are sampled by
+		 * the sole resolver in sequence.  Releasing DATA before acquiring TT
+		 * preserves the one-0xFB-SCUR invariant. */
+		if (cluster_runtime_visibility_candidate_release(
+				guard, &current_result)
+			!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+			goto done;
+		memset(guard, 0, sizeof(*guard));
+		tt_logical.owner_instance = logical.owner_instance;
+		tt_logical.segment_id = tt_segment_id;
+		if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+				admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				tt_logical.owner_instance, tt_logical.segment_id, &tt_root)
+			|| !cluster_semantic_activation_recheck_r4_terminal_census(
+				admission)
+			|| cluster_runtime_visibility_candidate_acquire(
+				&tt_logical, admission, guard, &phase_cleanup,
+				&current_result) != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+			goto done;
+		if (cluster_undo_block0_current_sample_generation(
+				guard, &tt_root, &tt_generation) != CLUSTER_UNDO_BLOCK0_OK
+			|| !tt_generation.known
+			|| tt_generation.value == UINT32_MAX
+			|| cluster_undo_block0_current_copy_resident(
+				guard, &tt_root, &tt_generation, block0.data)
+				   != CLUSTER_UNDO_BLOCK0_OK)
+			goto done;
+		header = (const UndoSegmentHeaderData *)block0.data;
+	} else
+		header = (const UndoSegmentHeaderData *)block0.data;
 	exact_slot = header->tt_slots[tt_slot_offset];
 	outcome = cluster_runtime_visibility_candidate_decide(
 		&canonical_locator, &exact_slot, &top_xid, &proof_kind,
@@ -466,16 +527,87 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 	if (outcome == CLUSTER_TX_UNKNOWN)
 		goto done;
 
-	candidate.locator_echo = canonical_locator;
-	candidate.top_xid = top_xid;
-	candidate.outcome = outcome;
-	candidate.proof_kind = proof_kind;
-	candidate.commit_scn = commit_scn;
-	candidate.authority.origin_epoch = cluster_epoch_get_current();
-	candidate.authority.live_hwm_lsn = GetFlushRecPtr(NULL);
-	candidate.authority.tt_generation
-		= cluster_undo_tt_retention_rollover_count();
-	candidate.authority.authority_scn = cluster_scn_current();
+	if (cross_segment) {
+		candidate.locator_echo = canonical_locator;
+		candidate.top_xid = top_xid;
+		candidate.outcome = outcome;
+		candidate.proof_kind = proof_kind;
+		candidate.commit_scn = commit_scn;
+		candidate.authority.origin_epoch = cluster_epoch_get_current();
+		candidate.authority.live_hwm_lsn = GetFlushRecPtr(NULL);
+		candidate.authority.tt_generation
+			= cluster_undo_tt_retention_rollover_count();
+		candidate.authority.authority_scn = cluster_scn_current();
+		if (candidate.authority.origin_epoch != admission->formation_epoch
+			|| XLogRecPtrIsInvalid(candidate.authority.live_hwm_lsn)
+			|| !SCN_VALID(candidate.authority.authority_scn)
+			|| cluster_undo_block0_current_sample_generation(
+				guard, &tt_root, &tt_final_generation)
+				   != CLUSTER_UNDO_BLOCK0_OK
+			|| !tt_final_generation.known
+			|| tt_final_generation.value != tt_generation.value
+			|| !cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+				admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				tt_logical.owner_instance, tt_logical.segment_id,
+				&tt_final_root)
+			|| !cluster_runtime_visibility_candidate_root_matches(
+				&tt_root, &tt_final_root)
+			|| !cluster_semantic_activation_recheck_r4_terminal_census(
+				admission)) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+			goto done;
+		}
+
+		/* The terminal TT sample linearizes between two byte-identical DATA
+		 * samples.  Reacquire the original DATA current and reject any alias,
+		 * root or physical-generation drift before publishing. */
+		if (cluster_runtime_visibility_candidate_release(
+				guard, &current_result)
+			!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+			goto done;
+		phase_cleanup.active = false;
+		memset(guard, 0, sizeof(*guard));
+		if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+				admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				logical.owner_instance, logical.segment_id, &final_root)
+			|| !cluster_runtime_visibility_candidate_root_matches(
+				root, &final_root)
+			|| cluster_runtime_visibility_candidate_acquire(
+				&logical, admission, guard, &phase_cleanup, &current_result)
+				   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD
+			|| cluster_undo_block0_current_sample_generation(
+				guard, root, &final_generation) != CLUSTER_UNDO_BLOCK0_OK
+			|| !final_generation.known
+			|| final_generation.value != generation.value
+			|| !cluster_undo_buf_copy_resident(
+				segment_id, logical.owner_instance, block_no,
+				rechecked_data_page.data)
+			|| !cluster_cr_r4_extract_resident_record(
+				rechecked_data_page.data, locator,
+				rechecked_record_buf.data, &rechecked_record_length,
+				&rechecked_locator)
+			|| rechecked_record_length != record_length
+			|| memcmp(rechecked_record_buf.data, record_buf.data,
+					  record_length) != 0
+			|| memcmp(&rechecked_locator, &canonical_locator,
+					  sizeof(canonical_locator)) != 0) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+			goto done;
+		}
+	}
+
+	if (!cross_segment) {
+		candidate.locator_echo = canonical_locator;
+		candidate.top_xid = top_xid;
+		candidate.outcome = outcome;
+		candidate.proof_kind = proof_kind;
+		candidate.commit_scn = commit_scn;
+		candidate.authority.origin_epoch = cluster_epoch_get_current();
+		candidate.authority.live_hwm_lsn = GetFlushRecPtr(NULL);
+		candidate.authority.tt_generation
+			= cluster_undo_tt_retention_rollover_count();
+		candidate.authority.authority_scn = cluster_scn_current();
+	}
 	if (candidate.authority.origin_epoch != admission->formation_epoch
 			|| XLogRecPtrIsInvalid(candidate.authority.live_hwm_lsn)
 			|| !SCN_VALID(candidate.authority.authority_scn)

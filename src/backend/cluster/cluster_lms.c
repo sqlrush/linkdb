@@ -1110,6 +1110,8 @@ LmsMain(void)
 	cluster_cr_server_publish_lms_latch(MyLatch);
 
 	for (;;) {
+		long lms_wait_timeout_ms;
+
 		CHECK_FOR_INTERRUPTS();
 
 		if (ConfigReloadPending) {
@@ -1128,6 +1130,12 @@ LmsMain(void)
 		/* PGRAC: spec-6.12b — construct parked CR-server requests (every
 		 * failure becomes a DENIED result; LMS never exits over a serve). */
 		cluster_lms_cr_drain();
+		/* A process-local R4 origin context polls an exact asynchronous SCUR
+		 * acquire/release.  Keep the ordinary 100ms idle sleep when no such
+		 * work exists, but do not multiply that sleep across an eight-slot
+		 * page census while the bounded context is genuinely pending. */
+		lms_wait_timeout_ms
+			= cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS);
 		(void)lms_r4_drain_ack_tick(cluster_lms_state, r4_worker_incarnation);
 
 		/* PGRAC: spec-7.2 D2 — with a live DATA plane the wait moves into
@@ -1171,10 +1179,10 @@ LmsMain(void)
 			 * directives parked by the dispatch handler (bounded, one
 			 * attempt each;  never waits on a pin). */
 			cluster_gcs_block_invalidate_park_tick();
-			cluster_lms_data_plane_tick(LMS_IDLE_TIMEOUT_MS);
+			cluster_lms_data_plane_tick(lms_wait_timeout_ms);
 		} else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-							LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
+							lms_wait_timeout_ms, WAIT_EVENT_PG_SLEEP);
 			ResetLatch(MyLatch);
 		}
 	}

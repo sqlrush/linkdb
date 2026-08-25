@@ -98,6 +98,11 @@ my @pcm_x_final_gauge_keys = qw(
 );
 
 my @positive_pcm_lifecycle_keys = qw(
+	pcm_x_own_begin_count
+	pcm_x_own_commit_count
+);
+
+my @zero_legacy_pcm_lifecycle_keys = qw(
 	pcm_x_queue_enqueue_count
 	pcm_x_queue_admit_count
 	pcm_x_queue_confirm_count
@@ -105,8 +110,6 @@ my @positive_pcm_lifecycle_keys = qw(
 	pcm_x_queue_complete_count
 	pcm_x_queue_revoke_count
 	pcm_x_queue_wait_count
-	pcm_x_own_begin_count
-	pcm_x_own_commit_count
 );
 
 my @zero_pcm_failure_keys = qw(
@@ -118,7 +121,7 @@ my @zero_pcm_failure_keys = qw(
 	pcm_x_own_corrupt_count
 );
 
-my @positive_wfg_keys = qw(
+my @zero_legacy_wfg_keys = qw(
 	pcm_convert_wfg_replace_count
 );
 
@@ -278,6 +281,35 @@ sub write_file
 	close($fh) or die "close $path: $!";
 }
 
+sub activate_semantic_round
+{
+	my ($node, $round_name, $timeout_seconds) = @_;
+	my $deadline = time() + $timeout_seconds;
+	my ($last_rc, $last_out, $last_err);
+
+	while (time() < $deadline)
+	{
+		my ($rc, $out, $err) = $node->psql('postgres',
+			'ALTER SYSTEM ENABLE RAC TWO_STAGE ROLLING UPDATES ALL',
+			timeout => 45);
+		($last_rc, $last_out, $last_err) = ($rc, $out, $err);
+		return if defined($rc) && $rc == 0;
+		die "$round_name activation result is unknown after SQL timeout: "
+			. ($err // '<undef>')
+			unless defined($rc);
+		die "$round_name activation failed with an untyped error: "
+			. ($err // '<undef>')
+			unless defined($err)
+			&& $err =~ /(?:RF_DEFERRED|CONDITION_NOT_YET_MET|activation request was refused)/;
+		usleep(100_000);
+	}
+
+	die "$round_name activation did not reach OPEN_APPLIED: rc="
+		. (defined($last_rc) ? $last_rc : '<undef>')
+		. ' stdout=[' . ($last_out // '') . '] stderr=['
+		. ($last_err // '') . "]";
+}
+
 my $quad = PostgreSQL::Test::ClusterQuad->new_quad(
 	'pcm_xq_liveness',
 	quorum_voting_disks => 3,
@@ -364,6 +396,14 @@ for my $node ($quad->nodes)
 		&& $activation_stderr =~ /(?:RF_DEFERRED|CONDITION_NOT_YET_MET)/;
 }
 die "pre-OPEN M4 PGRD mirror was not published\n" unless -f $pgrd_mirror;
+
+# Drive the two real pre-removal activation rounds through ProcessUtility and
+# the four-node R4 carrier.  The first round opens R4 bit0; the second opens
+# the Resource-X target-only bit10 after its exact same-T R8/R10 and L3
+# readiness checks.  This setup is deliberately count-neutral so the frozen
+# 236-item L3 workload and judge remain byte-for-byte unchanged.
+activate_semantic_round($quad->node0, 'R4 bit0', 60);
+activate_semantic_round($quad->node0, 'Resource-X bit10', 60);
 
 for my $node ($quad->nodes)
 {
@@ -978,6 +1018,33 @@ for my $i (0 .. 3)
 		diag("L3 node$i visibility state: $visibility");
 	}
 
+my @node_target_ok = map {
+	$runs[$_]->{result} == 0
+		&& $runs[$_]->{errors} == 0
+		&& $runs[$_]->{transactions} > 0
+} (0 .. 3);
+my $all_nodes_target_ok = 1;
+$all_nodes_target_ok &&= $_ for @node_target_ok;
+my $remote_install_delta
+	= $resource_x_o1_after{remote_install_observed_count}
+	- $resource_x_o1_before{remote_install_observed_count};
+my $grant_after_image_delta
+	= $resource_x_o1_after{remote_grant_after_image_count}
+	- $resource_x_o1_before{remote_grant_after_image_count};
+my $image_at_or_after_grant_delta
+	= $resource_x_o1_after{remote_image_at_or_after_grant_count}
+	- $resource_x_o1_before{remote_image_at_or_after_grant_count};
+my @resource_x_excluded_keys = qw(
+	remote_episode_excluded_no_install
+	remote_episode_excluded_missing_grant
+	remote_episode_excluded_missing_image
+);
+my @resource_x_excluded_deltas = map {
+	$resource_x_o1_after{$_} - $resource_x_o1_before{$_}
+} @resource_x_excluded_keys;
+my $remote_install_cohort_complete = $remote_install_delta > 0
+	&& !grep { $_ != 0 } @resource_x_excluded_deltas;
+
 for my $i (0 .. 3)
 {
 	is($runs[$i]->{timed_out}, 0, "L3 node$i writer met the hard deadline");
@@ -985,25 +1052,30 @@ for my $i (0 .. 3)
 	is($runs[$i]->{errors}, 0, "L3 node$i writer surfaced zero client errors");
 	cmp_ok($runs[$i]->{transactions}, '>', 0,
 		"L3 node$i writer made progress");
-	cmp_ok($pcm_after_by_node[$i]{pcm_x_queue_wait_count}
-			- $pcm_before_by_node[$i]{pcm_x_queue_wait_count}, '>', 0,
-		"L3 node$i requester identity entered the queue wait lifecycle");
+	ok($node_target_ok[$i]
+		&& $pcm_after_by_node[$i]{pcm_x_queue_wait_count}
+			- $pcm_before_by_node[$i]{pcm_x_queue_wait_count} == 0,
+		"L3 node$i completed target-only work without legacy queue wait");
 }
 
-# Queue counters live on the static tag master, not on each requester.  The
-# aggregate lifecycle plus every writer's committed progress proves that all
-# four requesters traversed the protocol; requiring a local enqueue delta on
-# non-master nodes is a false topology assumption.
-cmp_ok($queue_after - $queue_before, '>=', 4,
-	'L3 aggregate PCM-X queue admission floor reached four');
-cmp_ok($denied_after - $denied_before, '>', 0,
-	'L3 Shape-B arbitration denied an in-flight legacy reader without a client error');
+# Resource-X target-only admission is witnessed by all four real writers and
+# the remote install cohort.  Legacy ticket/queue counters must remain
+# dormant; they are not aliases for native Resource-X progress.
+ok($all_nodes_target_ok && $queue_after - $queue_before == 0,
+	'L3 all four nodes completed through target-only admission without legacy enqueue');
+ok($remote_install_cohort_complete,
+	'L3 Resource-X remote-install cohort advanced with no excluded episode');
 is($passive_s_after, $passive_s_before,
 	'L3 Resource-X type-17 drain did not enter legacy passive-S INVALIDATE');
 for my $key (@positive_pcm_lifecycle_keys)
 {
 	cmp_ok($pcm_after{$key} - $pcm_before{$key}, '>', 0,
-		"L3 PCM-X lifecycle $key advanced");
+		"L3 ownership witness $key advanced");
+}
+for my $key (@zero_legacy_pcm_lifecycle_keys)
+{
+	is($pcm_after{$key} - $pcm_before{$key}, 0,
+		"L3 legacy PCM-X lifecycle $key stayed dormant");
 }
 is($pcm_after{pcm_x_queue_transfer_count},
 	$pcm_before{pcm_x_queue_transfer_count},
@@ -1017,29 +1089,17 @@ for my $key (@zero_pcm_failure_keys)
 # refresh and idempotent replay.  They are observable churn, not terminal
 # failures; zero terminal gauges, zero client errors, and L4 conservation are
 # the authoritative safety/liveness verdicts.
-for my $key (@positive_wfg_keys)
+for my $key (@zero_legacy_wfg_keys)
 {
-	cmp_ok($lmd_after{$key} - $lmd_before{$key}, '>', 0,
-		"L3 PCM-X WFG lifecycle $key advanced");
+	is($lmd_after{$key} - $lmd_before{$key}, 0,
+		"L3 native Resource-X acquisition created no legacy WFG $key");
 }
-my $remote_install_delta
-	= $resource_x_o1_after{remote_install_observed_count}
-	- $resource_x_o1_before{remote_install_observed_count};
-my $grant_after_image_delta
-	= $resource_x_o1_after{remote_grant_after_image_count}
-	- $resource_x_o1_before{remote_grant_after_image_count};
-my $image_at_or_after_grant_delta
-	= $resource_x_o1_after{remote_image_at_or_after_grant_count}
-	- $resource_x_o1_before{remote_image_at_or_after_grant_count};
-cmp_ok($remote_install_delta, '>', 0,
-	'L3 Resource-X remote install cohort advanced on the four-node happy path');
+ok($grant_after_image_delta >= 0 && $image_at_or_after_grant_delta >= 0,
+	'L3 Resource-X remote install ordering counters remained monotone');
 is($grant_after_image_delta + $image_at_or_after_grant_delta,
 	$remote_install_delta,
 	'L3 every remote install entered exactly one Resource-X ordering bucket');
-for my $key (qw(
-	remote_episode_excluded_no_install
-	remote_episode_excluded_missing_grant
-	remote_episode_excluded_missing_image))
+for my $key (@resource_x_excluded_keys)
 {
 	is($resource_x_o1_after{$key} - $resource_x_o1_before{$key}, 0,
 		"L3 Resource-X happy path left $key unchanged");

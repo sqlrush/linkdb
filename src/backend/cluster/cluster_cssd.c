@@ -689,6 +689,7 @@ cssd_heartbeat_broadcast_tick(void)
 				}
 				break;
 			case CLUSTER_IC_FANOUT_WOULD_BLOCK:
+			case CLUSTER_IC_FANOUT_NOT_ADMITTED:
 			case CLUSTER_IC_FANOUT_HARD_ERROR:
 			case CLUSTER_IC_FANOUT_PEER_DOWN:
 				/* nonfatal;next tick will retry. */

@@ -159,6 +159,8 @@ static int g_current_empty_calls = 0;
 static int g_current_unpin_calls = 0;
 static int g_current_release_calls = 0;
 static int g_current_cancel_calls = 0;
+static int g_current_target_root_calls = 0;
+static int g_current_target_acquire_calls = 0;
 
 void ProcessInterrupts(void);
 
@@ -193,6 +195,25 @@ cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
 }
 
 bool
+cluster_semantic_activation_resolve_shared_undo_root(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id, ClusterUndoBlock0ResolvedRoot *out)
+{
+	g_current_root_calls++;
+	g_current_target_root_calls++;
+	if (!g_current_root_ok || token == NULL || !token->entered
+		|| token->side != CLUSTER_SEMANTIC_TARGET_SIDE
+		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		|| owner_instance != (uint32)cluster_node_id + 1 || segment_id != 1
+		|| out == NULL)
+		return false;
+	*out = g_current_root;
+	if (g_current_root_drift && g_current_target_root_calls > 1)
+		out->root_generation++;
+	return true;
+}
+
+bool
 cluster_undo_block0_root_matches(const ClusterUndoBlock0ResolvedRoot *observed,
 								 const ClusterUndoBlock0ResolvedRoot *expected)
 {
@@ -213,6 +234,26 @@ cluster_undo_block0_current_acquire_begin_live_owner_source(
 	if (!g_current_acquire_ok || key == NULL || key->owner_instance != 1
 		|| key->segment_id != 1 || admission == NULL || !admission->entered
 		|| admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE) {
+		if (failure != NULL)
+			*failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+	}
+	g_current_active = true;
+	return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
+}
+
+ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin_live_owner_target(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard pg_attribute_unused(),
+	ClusterUndoBlock0Result *failure)
+{
+	g_current_acquire_calls++;
+	g_current_target_acquire_calls++;
+	if (!g_current_acquire_ok || key == NULL || key->owner_instance != 1
+		|| key->segment_id != 1 || admission == NULL || !admission->entered
+		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE) {
 		if (failure != NULL)
 			*failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
@@ -534,6 +575,8 @@ reset_current_write_mock(void)
 	g_current_unpin_calls = 0;
 	g_current_release_calls = 0;
 	g_current_cancel_calls = 0;
+	g_current_target_root_calls = 0;
+	g_current_target_acquire_calls = 0;
 	last_ereport_errcode = 0;
 }
 
@@ -547,6 +590,15 @@ source_modifier_token(void)
 	token.formation_epoch = 17;
 	token.side = CLUSTER_SEMANTIC_SOURCE_SIDE;
 	token.entered = true;
+	return token;
+}
+
+static ClusterSemanticAdmissionToken
+target_modifier_token(void)
+{
+	ClusterSemanticAdmissionToken token = source_modifier_token();
+
+	token.side = CLUSTER_SEMANTIC_TARGET_SIDE;
 	return token;
 }
 
@@ -892,6 +944,45 @@ UT_TEST(test_precommit_writeonly_publishes_identical_durable_and_resident_succes
 	UT_ASSERT_EQ(g_current_pin_calls, 1);
 	UT_ASSERT_EQ(g_current_unpin_calls, 1);
 	UT_ASSERT_EQ(g_current_release_calls, 0);
+	UT_ASSERT_EQ(g_current_cancel_calls, 1);
+}
+
+UT_TEST(test_precommit_writeonly_target_open_reuses_same_block0_authority)
+{
+	ClusterSemanticAdmissionToken admission = target_modifier_token();
+	UndoSegmentHeaderData *resident = (UndoSegmentHeaderData *)g_current_resident;
+	TTSlot successor;
+	uint8 owner = 0;
+	volatile bool caught = false;
+
+	reset_current_write_mock();
+	memset(&g_canned_slot, 0, sizeof(g_canned_slot));
+	g_canned_slot.status = TT_SLOT_ACTIVE;
+	g_canned_slot.xid = 100;
+	g_canned_slot.wrap = 5;
+	resident->tt_slots[7] = g_canned_slot;
+	resident->tt_slots[7].status = TT_SLOT_UNUSED;
+	memset(&successor, 0xa5, sizeof(successor));
+
+	PG_TRY();
+	{
+		owner = cluster_tt_slot_durable_commit_writeonly(
+			1, 7, 100, 5, scn_encode(1, 42), &admission, &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(owner, 1);
+	UT_ASSERT(admission.entered);
+	UT_ASSERT_EQ(g_current_target_root_calls, 2);
+	UT_ASSERT_EQ(g_current_target_acquire_calls, 1);
+	UT_ASSERT_EQ(g_write_hdr_calls, 1);
+	UT_ASSERT_EQ(memcmp(&successor, &g_last_written_slot, sizeof(successor)), 0);
+	UT_ASSERT_EQ(memcmp(&resident->tt_slots[7], &successor, sizeof(successor)), 0);
 	UT_ASSERT_EQ(g_current_cancel_calls, 1);
 }
 
@@ -1736,7 +1827,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(78);
+	UT_PLAN(79);
 
 	UT_RUN(test_layout_sizes);
 
@@ -1766,6 +1857,7 @@ main(int argc, char **argv)
 	UT_RUN(test_read_exact_stable_rejects_torn_slot);
 	UT_RUN(test_read_exact_stable_rejects_either_io_failure);
 	UT_RUN(test_precommit_writeonly_publishes_identical_durable_and_resident_successor);
+	UT_RUN(test_precommit_writeonly_target_open_reuses_same_block0_authority);
 	UT_RUN(test_precommit_writeonly_root_drift_never_writes_or_publishes);
 	UT_RUN(test_precommit_writeonly_missing_current_authority_never_writes_or_publishes);
 	UT_RUN(test_precommit_writeonly_durable_failure_never_publishes_resident);

@@ -49,6 +49,16 @@ typedef union ClusterUndoBlock0CurrentGuard {
 StaticAssertDecl(sizeof(ClusterUndoBlock0CurrentGuard) == 168,
 				 "block0 current guard ABI must remain exactly 168 bytes");
 
+/* Process-local, non-authorizing receipt for an exact live-owner resident
+ * publication.  Its body is private to the current adapter. */
+typedef union ClusterUndoBlock0LiveOwnerPublication {
+	uint64 align;
+	uint8 opaque[192];
+} ClusterUndoBlock0LiveOwnerPublication;
+
+StaticAssertDecl(sizeof(ClusterUndoBlock0LiveOwnerPublication) == 192,
+				 "live-owner publication receipt ABI must remain 192 bytes");
+
 extern void cluster_undo_block0_current_init(void);
 extern void cluster_undo_block0_current_ensure_exit_hooks(void);
 extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin(
@@ -61,6 +71,11 @@ cluster_undo_block0_current_acquire_begin_admitted(
 	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
 extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_acquire_begin_live_owner_source(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
+extern ClusterUndoBlock0CurrentStep
+cluster_undo_block0_current_acquire_begin_live_owner_target(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
 	const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
@@ -93,6 +108,12 @@ extern ClusterUndoBlock0Result cluster_undo_block0_current_pin_exclusive(
 extern ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_ensure_resident(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_ensure_resident_exact(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
+	ClusterUndoBlock0LiveOwnerPublication *publication);
+extern bool cluster_undo_block0_current_live_owner_publication_recheck(
+	const ClusterUndoBlock0LiveOwnerPublication *publication);
 
 /* Target Startup's sole no-live-GES lane.  READY publication additionally
  * revalidates this process-local ownership through the query below. */

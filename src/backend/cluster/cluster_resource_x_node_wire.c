@@ -159,6 +159,12 @@ resource_x_pair_length(uint8 msg_type, ResourceXWireKind kind, uint16 len)
 	if (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT)
 		return msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE
 			&& len == RESOURCE_X_SHORT_V1_BYTES;
+	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2)
+		return msg_type == RESOURCE_X_MSG_BLOCK_TO_N
+			&& len == RESOURCE_X_PROOF_V1_BYTES;
+	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
+		return msg_type == RESOURCE_X_MSG_BLOCKED_TO_N
+			&& len == RESOURCE_X_PROOF_V1_BYTES;
 	return false;
 }
 
@@ -182,6 +188,8 @@ resource_x_frame_length(const ResourceXDecodedFrame *frame, uint16 *len)
 		*len = RESOURCE_X_SHORT_V1_BYTES;
 		return true;
 	case RESOURCE_X_WIRE_AUTHORITY_GRANT:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
 		*len = RESOURCE_X_PROOF_V1_BYTES;
 		return true;
 	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
@@ -226,6 +234,61 @@ resource_x_bootstrap_common_valid(uint8 msg_type,
 		|| common->target_mode != (uint8)PCM_STATE_X
 		|| common->source_candidate != 0
 		|| common->retain_pi_if_dirty != 0) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ROLE);
+		return false;
+	}
+	if (common->outcome
+		!= (request ? RESOURCE_X_OUTCOME_NONE : RESOURCE_X_OUTCOME_OK)) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ENUM);
+		return false;
+	}
+	if (common->flags != 0) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_FLAGS);
+		return false;
+	}
+	return true;
+}
+
+
+static bool
+resource_x_source_settlement_common_valid(
+	uint8 msg_type, ResourceXWireKind kind,
+	const ResourceXDecodedCommon *common, ResourceXWireReject *reject)
+{
+	bool request = kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2;
+	bool ack = kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2;
+
+	if ((!request && !ack)
+		|| (request && msg_type != RESOURCE_X_MSG_BLOCK_TO_N)
+		|| (ack && msg_type != RESOURCE_X_MSG_BLOCKED_TO_N)) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
+		return false;
+	}
+	if (!resource_x_assertion_valid(&common->logical_assertion)) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_IDENTITY);
+		return false;
+	}
+	if (common->base_authority_generation == 0
+		|| common->base_authority_generation == UINT64_MAX
+		|| common->authority_generation
+			<= common->base_authority_generation
+		|| common->authority_generation == UINT64_MAX
+		|| common->resource_formation == 0
+		|| common->master_session_incarnation == 0
+		|| common->assertion_sequence == 0
+		|| common->sender_connection_generation == 0) {
+		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_GENERATION);
+		return false;
+	}
+	if (common->ordered_lane != 0
+		|| common->action_node < 0
+		|| common->action_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| common->action_node
+			== common->logical_assertion.requester_node
+		|| common->observed_mode != (uint8)PCM_STATE_N
+		|| common->target_mode != (uint8)PCM_STATE_N
+		|| common->source_candidate != 1
+		|| common->retain_pi_if_dirty != 1) {
 		resource_x_wire_reject(reject, RESOURCE_X_WIRE_REJECT_ROLE);
 		return false;
 	}
@@ -362,6 +425,10 @@ resource_x_pair_common_valid(uint8 msg_type, ResourceXWireKind kind,
 {
 	if (kind == RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP)
 		return resource_x_bootstrap_common_valid(msg_type, common, reject);
+	if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+		|| kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
+		return resource_x_source_settlement_common_valid(
+			msg_type, kind, common, reject);
 	return resource_x_common_valid(kind, common, reject);
 }
 
@@ -476,6 +543,27 @@ resource_x_body_valid(const ResourceXDecodedFrame *frame,
 				&& body->acting_formation == frame->common.resource_formation
 				&& resource_x_dependencies_valid(body->dependencies,
 												 body->dependency_count);
+		}
+		break;
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
+		{
+			const ResourceXDecodedBlockedToN *body
+				= &frame->body.blocked_to_n;
+
+			valid = frame->blocked_has_remote_proof
+				&& body->source_carrier_generation != 0
+				&& body->requester_target_generation
+					== frame->common.assertion_sequence
+				&& body->proof_kind == RESOURCE_X_PROOF_REMOTE_CARRIER
+				&& body->source_disposition
+				   == RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE
+				&& body->proof_flags == 0
+				&& body->holder_connection_generation != 0
+				&& body->acting_formation
+					== frame->common.resource_formation
+				&& resource_x_dependencies_valid(
+					body->dependencies, body->dependency_count);
 		}
 		break;
 	case RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION:
@@ -606,6 +694,8 @@ resource_x_body_encode(uint8 *bytes, const ResourceXDecodedFrame *frame)
 			frame->body.local_proof.local_proof_generation);
 		break;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
 		if (frame->blocked_has_remote_proof) {
 			const ResourceXDecodedBlockedToN *body = &frame->body.blocked_to_n;
 
@@ -719,6 +809,8 @@ resource_x_body_decode(const uint8 *bytes, ResourceXDecodedFrame *frame,
 			= resource_x_get_u64(bytes + 144);
 		break;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
+	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
 		if (frame->blocked_has_remote_proof) {
 			ResourceXDecodedBlockedToN *body = &frame->body.blocked_to_n;
 
@@ -882,7 +974,9 @@ cluster_resource_x_wire_decode(uint8 msg_type, const void *payload,
 	decoded.kind = kind;
 	decoded.payload_bytes = payload_len;
 	decoded.blocked_has_remote_proof
-		= kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+		= (kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+		   || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+		   || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2)
 		  && payload_len == RESOURCE_X_PROOF_V1_BYTES;
 	if (!resource_x_common_decode(
 		msg_type, bytes, kind, &decoded.common, reject))

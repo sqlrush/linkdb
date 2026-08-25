@@ -84,13 +84,21 @@ cluster_tx_zero_epoch_terminal_census_is_admissible(
 {
 	NodeId origin = uba_origin_node_id(locator->uba);
 	int node_count = cluster_conf_node_count();
+	bool generation_admissible;
 	bool topology_admissible;
 
 	topology_admissible
 		= (node_count == 1 && origin == (NodeId)cluster_node_id)
 		  || (node_count == 4 && origin != InvalidNodeId);
+	/* The single-node sentinel exists only before the first PGSA record.
+	 * The approved homogeneous four-node clean-formation path instead binds
+	 * whatever record generation the caller-owned admission currently holds;
+	 * its exact-current check below is the freshness proof. */
+	generation_admissible
+		= (node_count == 1 && admission->record_generation == 0)
+		  || node_count == 4;
 	return caller_owned_terminal_census
-		   && admission->record_generation == 0
+		   && generation_admissible
 		   && cluster_storage_mode_enabled()
 		   && topology_admissible
 		   && !cluster_recmerge_window_active

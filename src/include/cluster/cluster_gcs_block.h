@@ -3086,11 +3086,23 @@ extern ClusterTxOutcome cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 	uint32 expected_physical_generation, uint64 formation_epoch,
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
 extern void cluster_gcs_block_r4_tx_resolve_drain(void);
+#define CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS 1
+static inline long
+cluster_gcs_block_r4_tx_resolve_wait_timeout_for_count(long idle_timeout_ms,
+													int active_contexts)
+{
+	if (idle_timeout_ms <= 0 || active_contexts <= 0)
+		return idle_timeout_ms;
+	return idle_timeout_ms < CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS
+		? idle_timeout_ms
+		: CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS;
+}
+extern long cluster_gcs_block_r4_tx_resolve_wait_timeout(long idle_timeout_ms);
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_gcs_block_test_r4_request80(const struct ClusterICEnvelope *env,
 											 const void *payload);
 extern bool cluster_gcs_block_test_r4_forward96(const struct ClusterICEnvelope *env,
-											 const void *payload);
+												 const void *payload);
 extern int cluster_gcs_block_test_r4_tx_origin_context_count(void);
 extern void cluster_gcs_block_test_r4_tx_origin_drain(void);
 extern bool cluster_gcs_block_test_current_mx_forward128(
@@ -4181,7 +4193,7 @@ typedef enum GcsXheldReadShipDecision {
 
 static inline GcsXheldReadShipDecision
 gcs_block_xheld_read_ship_decision(uint8 transition_id, int pre_state, int32 holder_node,
-								   int32 requester_node, int32 master_node, bool master_resident)
+									   int32 requester_node, int32 master_node, bool master_resident)
 {
 	/* Only plain cross-node reads (N→S) on an X-held block are in scope. */
 	if (transition_id != (uint8)PCM_TRANS_N_TO_S || pre_state != (int)PCM_LOCK_MODE_X)
@@ -4204,6 +4216,133 @@ gcs_block_xheld_read_ship_decision(uint8 transition_id, int pre_state, int32 hol
 	/* Master is recorded as holder but the buffer is not resident (evicted /
 	 * race) — cannot ship safely (Rule 8.A: never a silent stale read). */
 	return GCS_XHELD_READ_DENY;
+}
+
+/* A native Resource-X head bars durable S admission, not Oracle-style
+ * current-block shipping.  Permit that one-shot read only when two complete
+ * authority samples are byte-exact and name one valid current X holder other
+ * than the requester.  The returned fact is not authority and cannot be
+ * widened into an X->S downgrade or S registration. */
+static inline bool
+gcs_block_xheld_read_barrier_bypass_exact(const PcmAuthoritySnapshot *before,
+										  const PcmAuthoritySnapshot *after,
+										  int32 requester_node)
+{
+	int32 holder_node;
+
+	if (before == NULL || after == NULL || requester_node < 0
+		|| requester_node >= PCM_X_PROTOCOL_NODE_LIMIT
+		|| memcmp(before, after, sizeof(*before)) != 0
+		|| before->reserved[0] != 0 || before->reserved[1] != 0
+		|| before->state != PCM_STATE_X || before->transition_count == 0
+		|| before->transition_count == UINT64_MAX || before->s_holders_bitmap != 0)
+		return false;
+	holder_node = before->x_holder_node;
+	return holder_node >= 0 && holder_node < PCM_X_PROTOCOL_NODE_LIMIT
+		   && holder_node != requester_node
+		   && before->master_holder.node_id == (uint32)holder_node;
+}
+
+typedef enum GcsBlockSBarrierReadAction {
+	GCS_BLOCK_S_BARRIER_NONE = 0,
+	GCS_BLOCK_S_BARRIER_DENY,
+	GCS_BLOCK_S_BARRIER_IMAGE_ONLY
+} GcsBlockSBarrierReadAction;
+
+static inline GcsBlockSBarrierReadAction
+gcs_block_s_barrier_read_action_exact(bool queue_before, bool queue_after,
+									  bool resource_x_before, bool resource_x_after,
+									  const PcmAuthoritySnapshot *authority_before,
+									  bool authority_before_valid,
+									  const PcmAuthoritySnapshot *authority_after,
+									  bool authority_after_valid, int32 requester_node)
+{
+	if (!queue_before && !queue_after && !resource_x_before && !resource_x_after)
+		return GCS_BLOCK_S_BARRIER_NONE;
+	if (queue_before || queue_after || (!resource_x_before && !resource_x_after)
+		|| !authority_before_valid || !authority_after_valid)
+		return GCS_BLOCK_S_BARRIER_DENY;
+	return gcs_block_xheld_read_barrier_bypass_exact(
+		authority_before, authority_after, requester_node)
+		? GCS_BLOCK_S_BARRIER_IMAGE_ONLY
+		: GCS_BLOCK_S_BARRIER_DENY;
+}
+
+/* A FORWARDED_IN_FLIGHT dedup record caches routing, never authority.  Reuse
+ * it only while one coherent master snapshot still names the same canonical
+ * holder and the same request class remains live.  In particular, an ordered
+ * writer barrier invalidates an older read route before the X holder changes;
+ * a committed Resource-X handoff invalidates it through the holder fields.
+ * No PI bitmap participates in this decision. */
+static inline bool
+gcs_block_forward_replay_authority_exact(GcsBlockReplyStatus cached_status,
+										 uint8 transition_id, int32 cached_holder_node,
+										 int32 requester_node,
+										 const PcmAuthoritySnapshot *authority)
+{
+	uint32 holder_bit;
+
+	if (authority == NULL || cached_holder_node < 0
+		|| cached_holder_node >= PCM_X_PROTOCOL_NODE_LIMIT || requester_node < 0
+		|| requester_node >= PCM_X_PROTOCOL_NODE_LIMIT || cached_holder_node == requester_node
+		|| authority->reserved[0] != 0 || authority->reserved[1] != 0)
+		return false;
+	holder_bit = UINT32_C(1) << cached_holder_node;
+
+	switch (cached_status) {
+	case GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER:
+		return transition_id == (uint8)PCM_TRANS_N_TO_S
+			   && authority->state == PCM_STATE_X
+			   && authority->x_holder_node == cached_holder_node
+			   && authority->s_holders_bitmap == 0
+			   && authority->master_holder.node_id == (uint32)cached_holder_node
+			   && authority->pending_x_requester_node == -1
+			   && authority->pending_x_since_lsn == 0;
+	case GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER:
+		return transition_id == (uint8)PCM_TRANS_N_TO_S
+			   && authority->state == PCM_STATE_S && authority->x_holder_node == -1
+			   && (authority->s_holders_bitmap & holder_bit) != 0
+			   && authority->master_holder.node_id == (uint32)cached_holder_node
+			   && authority->pending_x_requester_node == -1
+			   && authority->pending_x_since_lsn == 0;
+	case GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER:
+		return (transition_id == (uint8)PCM_TRANS_N_TO_X
+				|| transition_id == (uint8)PCM_TRANS_S_TO_X_UPGRADE)
+			   && authority->state == PCM_STATE_X
+			   && authority->x_holder_node == cached_holder_node
+			   && authority->s_holders_bitmap == 0
+			   && authority->master_holder.node_id == (uint32)cached_holder_node
+			   && authority->pending_x_requester_node == requester_node
+			   && authority->pending_x_since_lsn != 0;
+	default:
+		return false;
+	}
+}
+
+/* A forwarded holder refusal invalidates the master's cached forwarding
+ * marker.  The master intentionally answers the same request's first
+ * re-entry with one direct refusal after removing that marker; only that
+ * immediately following cleanup response is retryable.  No direct refusal
+ * can start a retry round by itself. */
+static inline bool
+gcs_block_holder_refusal_retry_exact(int32 forwarding_master,
+									 bool *awaiting_master_cleanup,
+									 int retry_attempt, int max_retries)
+{
+	if (awaiting_master_cleanup == NULL || retry_attempt >= max_retries) {
+		if (awaiting_master_cleanup != NULL)
+			*awaiting_master_cleanup = false;
+		return false;
+	}
+	if (forwarding_master != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
+		*awaiting_master_cleanup = true;
+		return true;
+	}
+	if (*awaiting_master_cleanup) {
+		*awaiting_master_cleanup = false;
+		return true;
+	}
+	return false;
 }
 
 /* PGRAC: spec-5.2a D3 — pure master-side decision for an eligible clean-page
@@ -4612,8 +4751,9 @@ extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
  * bufmgr aborts/rearms GRANT_PENDING and selects a fresh holder identity.
  */
 extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf,
-													 const PcmAuthoritySnapshot *expected,
-													 bool *out_retry_denied);
+												 const PcmAuthoritySnapshot *expected,
+												 bool force_one_shot,
+												 bool *out_retry_denied);
 /*
  * R10/A' PGRAC adaptation: a master-local legacy N->S acquisition bypasses
  * the data-plane dedup table, so consult the existing exact PCM-X active-head
@@ -5070,8 +5210,27 @@ extern PcmXQueueResult cluster_gcs_pcm_x_acquire_writer(BufferDesc *buf,
 extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,
 	ResourceXAcquisitionRef *ref_out);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_direct_init_acquire_exact(
+	BufferDesc *buf, uint64 r4_record_generation,
+	uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token,
+	ResourceXAcquisitionRef *ref_out);
 extern bool cluster_gcs_resource_x_target_context_recheck_exact(
 	const ResourceXWriterUseContext *context);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_itl_recycle_begin_exact(
+	const ResourceXWriterUseContext *context,
+	const ClusterPcmOwnSnapshot *observed,
+	ResourceXLocalOwnerHandle *handle_out);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_itl_recycle_finish_exact(
+	const ResourceXWriterUseContext *context,
+	const ClusterPcmOwnSnapshot *observed,
+	const ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_itl_recycle_cancel_exact(
+	const ResourceXLocalOwnerHandle *handle);
 /* Diagnostic: source line of this backend's most recent non-OK
  * acquire-writer exit (0 when it never failed). */
 extern int cluster_gcs_pcm_x_requester_last_fail_line(void);

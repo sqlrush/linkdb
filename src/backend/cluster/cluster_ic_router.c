@@ -606,10 +606,12 @@ cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payl
 			per_peer[peer] = CLUSTER_IC_FANOUT_DONE;
 			break;
 		case CLUSTER_IC_SEND_WOULD_BLOCK:
-		case CLUSTER_IC_SEND_NOT_ADMITTED:
-			/* Admitted-but-queued and refused both land in the fanout's
-			 * retryable bucket (consumers re-send on WOULD_BLOCK). */
+			/* Admitted: transport owns an exact copy. */
 			per_peer[peer] = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+			break;
+		case CLUSTER_IC_SEND_NOT_ADMITTED:
+			/* Refused: caller retains ownership and may retry. */
+			per_peer[peer] = CLUSTER_IC_FANOUT_NOT_ADMITTED;
 			break;
 		case CLUSTER_IC_SEND_HARD_ERROR:
 			per_peer[peer] = CLUSTER_IC_FANOUT_HARD_ERROR;

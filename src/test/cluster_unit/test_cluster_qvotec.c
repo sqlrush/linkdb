@@ -173,6 +173,27 @@ cluster_wal_state_correctness_census_ok(void)
 	return true;
 }
 
+uint32
+cluster_grd_recovery_state_value(void)
+{
+	return 0;
+}
+
+bool
+cluster_reconfig_snapshot_initial_clean_formation(
+	ClusterInitialCleanFormationSnapshot *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
+const struct ClusterSemanticActivationCallbackBundle *
+cluster_pcm_x_resource_x_activation_callbacks(void)
+{
+	return NULL;
+}
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
@@ -2024,7 +2045,7 @@ UT_TEST(test_pgsa_02_generation_mismatch_is_conflict_without_mutation)
 	}
 	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 7, 0x11, 0x22),
 						  current));
-	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 7, 0x22, 0x22), desired));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 7, 0x11, 0x22), desired));
 	for (i = 0; i < PGSA_TEST_DISKS; i++)
 		UT_ASSERT(pgsa_write_image(set.fds[i], current));
 	UT_ASSERT(pgsa_snapshot(&set, before));
@@ -2048,7 +2069,7 @@ UT_TEST(test_pgsa_03_source_mismatch_is_conflict_without_mutation)
 	}
 	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 7, 0x11, 0x22),
 						  current));
-	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x22, 0x22), desired));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x44, 0x22), desired));
 	for (i = 0; i < PGSA_TEST_DISKS; i++)
 		UT_ASSERT(pgsa_write_image(set.fds[i], current));
 	UT_ASSERT(pgsa_snapshot(&set, before));
@@ -2072,14 +2093,98 @@ UT_TEST(test_pgsa_04_commit_to_open_requires_explicit_prior_source)
 	}
 	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_COMMIT, 7, 0x11, 0x22),
 						  current));
-	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x22, 0x22), desired));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x11, 0x22), desired));
 	for (i = 0; i < PGSA_TEST_DISKS; i++)
 		UT_ASSERT(pgsa_write_image(set.fds[i], current));
 	UT_ASSERT(pgsa_snapshot(&set, before));
 	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x22, desired),
-				 CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT);
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
 	UT_ASSERT(pgsa_snapshot_matches(&set, before));
 	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired), CLUSTER_SEMANTIC_ACTIVATION_OK);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_04a_open_to_next_prepare_uses_open_target_as_current_source)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(
+		CLUSTER_SEMANTIC_PHASE_OPEN, 7, 0x11, 0x22), current));
+	UT_ASSERT(pgsa_encode(pgsa_record(
+		CLUSTER_SEMANTIC_PHASE_PREPARE, 8, 0x22, 0x422), desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x22, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(pgsa_count_image(&set, desired), PGSA_TEST_DISKS);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_04b_desired_source_mismatch_is_bad_state_before_io)
+{
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+
+	UT_ASSERT(pgsa_encode(pgsa_record(
+		CLUSTER_SEMANTIC_PHASE_COMMIT, 8, 0x44, 0x55), desired));
+	UT_ASSERT_EQ(cluster_qvotec_test_semantic_activation_record_cas_write(
+				 NULL, 0, 7, 0x11, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE);
+}
+
+UT_TEST(test_pgsa_04c_rollback_complete_projects_target_as_current_source)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(
+		CLUSTER_SEMANTIC_PHASE_ROLLBACK_COMPLETE, 7, 0x11, 0x22),
+		current));
+	UT_ASSERT(pgsa_encode(pgsa_record(
+		CLUSTER_SEMANTIC_PHASE_PREPARE, 8, 0x22, 0x422), desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x22, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_OK);
+	UT_ASSERT_EQ(pgsa_count_image(&set, desired), PGSA_TEST_DISKS);
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_pgsa_04d_unknown_current_phase_holds_without_mutation)
+{
+	PgsaDiskSet set;
+	uint8 current[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 desired[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 before[PGSA_TEST_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	int i;
+
+	if (!pgsa_disk_set_open(&set)) {
+		UT_ASSERT(false);
+		return;
+	}
+	UT_ASSERT(pgsa_encode(pgsa_record(
+		CLUSTER_SEMANTIC_PHASE_COMMIT, 7, 0x11, 0x22), current));
+	current[16] = (uint8)(CLUSTER_SEMANTIC_PHASE_ROLLBACK_COMPLETE + 1);
+	UT_ASSERT(pgsa_encode(pgsa_record(
+		CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x11, 0x22), desired));
+	for (i = 0; i < PGSA_TEST_DISKS; i++)
+		UT_ASSERT(pgsa_write_image(set.fds[i], current));
+	UT_ASSERT(pgsa_snapshot(&set, before));
+	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired),
+				 CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
+	UT_ASSERT(pgsa_snapshot_matches(&set, before));
 	pgsa_disk_set_close(&set);
 }
 
@@ -2124,7 +2229,7 @@ UT_TEST(test_pgsa_06_split_or_no_disks_holds_without_mutation)
 							  images[i]));
 		UT_ASSERT(pgsa_write_image(set.fds[i], images[i]));
 	}
-	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x22, 0x22), desired));
+	UT_ASSERT(pgsa_encode(pgsa_record(CLUSTER_SEMANTIC_PHASE_OPEN, 8, 0x11, 0x22), desired));
 	UT_ASSERT(pgsa_snapshot(&set, before));
 	UT_ASSERT_EQ(pgsa_cas(&set, 7, 0x11, desired),
 				 CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD);
@@ -2809,7 +2914,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(52);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -2843,6 +2948,10 @@ main(void)
 	UT_RUN(test_pgsa_02_generation_mismatch_is_conflict_without_mutation);
 	UT_RUN(test_pgsa_03_source_mismatch_is_conflict_without_mutation);
 	UT_RUN(test_pgsa_04_commit_to_open_requires_explicit_prior_source);
+	UT_RUN(test_pgsa_04a_open_to_next_prepare_uses_open_target_as_current_source);
+	UT_RUN(test_pgsa_04b_desired_source_mismatch_is_bad_state_before_io);
+	UT_RUN(test_pgsa_04c_rollback_complete_projects_target_as_current_source);
+	UT_RUN(test_pgsa_04d_unknown_current_phase_holds_without_mutation);
 	UT_RUN(test_pgsa_05_lost_completion_replay_is_idempotent_ok);
 	UT_RUN(test_pgsa_06_split_or_no_disks_holds_without_mutation);
 	UT_RUN(test_pgsa_07_postwrite_one_of_three_desired_holds);

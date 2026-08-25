@@ -322,6 +322,12 @@ int test_fanout_calls = 0;
 uint8 test_fanout_last_msg_type = 0;
 uint32 test_fanout_last_len = 0;
 uint8 test_fanout_last_payload[64];
+ClusterICFanoutResult test_fanout_peer1_result = CLUSTER_IC_FANOUT_PEER_DOWN;
+ClusterICFanoutResult test_fanout_peer2_result = CLUSTER_IC_FANOUT_PEER_DOWN;
+ClusterICSendResult test_unicast_result[CLUSTER_MAX_NODES];
+int test_unicast_calls[CLUSTER_MAX_NODES];
+uint32 test_unicast_last_len[CLUSTER_MAX_NODES];
+uint8 test_unicast_last_payload[CLUSTER_MAX_NODES][CLUSTER_SCN_BOC_PAYLOAD_V1_LEN];
 
 void
 cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payload_len,
@@ -338,7 +344,24 @@ cluster_ic_send_envelope_fanout(uint8 msg_type, const void *payload, uint32 payl
 
 		for (i = 0; i < CLUSTER_MAX_NODES; i++)
 			per_peer[i] = CLUSTER_IC_FANOUT_PEER_DOWN;
+		per_peer[1] = test_fanout_peer1_result;
+		per_peer[2] = test_fanout_peer2_result;
 	}
+}
+
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
+						 uint32 payload_len)
+{
+	UT_ASSERT(dest_node_id >= 0 && dest_node_id < CLUSTER_MAX_NODES);
+	UT_ASSERT_EQ(msg_type, PGRAC_IC_MSG_BOC_BROADCAST);
+	test_unicast_calls[dest_node_id]++;
+	test_unicast_last_len[dest_node_id] = payload_len;
+	memset(test_unicast_last_payload[dest_node_id], 0,
+		   sizeof(test_unicast_last_payload[dest_node_id]));
+	if (payload != NULL && payload_len <= sizeof(test_unicast_last_payload[dest_node_id]))
+		memcpy(test_unicast_last_payload[dest_node_id], payload, payload_len);
+	return test_unicast_result[dest_node_id];
 }
 
 /* spec-7.4 D1-2: configurable so drain tests can pass the zero-peer
@@ -1003,6 +1026,79 @@ UT_TEST(test_spec74_drain_zero_len_when_off_even_if_dirty)
 	test_alive_peer_count = 0;
 }
 
+UT_TEST(test_spec74_drain_does_not_retry_transport_owned_would_block)
+{
+	SCN s;
+
+	cluster_scn_shmem_init();
+	test_alive_peer_count = 1;
+
+	/* WOULD_BLOCK means the transport owns an exact copy.  A second BOC
+	 * send here would duplicate that admitted frame. */
+	s = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s, (XLogRecPtr)18000));
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s));
+
+	test_fanout_calls = 0;
+	memset(test_unicast_calls, 0, sizeof(test_unicast_calls));
+	test_fanout_peer1_result = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(test_fanout_calls, 1);
+	UT_ASSERT_EQ(test_unicast_calls[1], 0);
+
+	test_fanout_peer1_result = CLUSTER_IC_FANOUT_DONE;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(test_fanout_calls, 1);
+
+	test_fanout_peer1_result = CLUSTER_IC_FANOUT_PEER_DOWN;
+	test_alive_peer_count = 0;
+}
+
+UT_TEST(test_spec74_drain_retries_only_exact_not_admitted_peer)
+{
+	SCN s;
+
+	cluster_scn_shmem_init();
+	test_alive_peer_count = 2;
+
+	/* Mixed result: peer1 refused and owns no copy; peer2's WOULD_BLOCK is
+	 * transport-owned.  Retry must target peer1 only, never fan out again. */
+	s = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(s, (XLogRecPtr)19000));
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(s));
+
+	test_fanout_calls = 0;
+	memset(test_unicast_calls, 0, sizeof(test_unicast_calls));
+	memset(test_unicast_last_len, 0, sizeof(test_unicast_last_len));
+	memset(test_unicast_result, CLUSTER_IC_SEND_DONE, sizeof(test_unicast_result));
+	test_fanout_peer1_result = CLUSTER_IC_FANOUT_NOT_ADMITTED;
+	test_fanout_peer2_result = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(test_fanout_calls, 1);
+	UT_ASSERT_EQ(test_unicast_calls[1], 0);
+	UT_ASSERT_EQ(test_unicast_calls[2], 0);
+
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(test_fanout_calls, 1);
+	UT_ASSERT_EQ(test_unicast_calls[1], 1);
+	UT_ASSERT_EQ(test_unicast_calls[2], 0);
+	UT_ASSERT_EQ(test_unicast_last_len[1], test_fanout_last_len);
+	UT_ASSERT(memcmp(test_unicast_last_payload[1], test_fanout_last_payload,
+					 test_fanout_last_len)
+			  == 0);
+
+	/* Once every live peer accepts the latest frontier, no duplicate
+	 * drain is scheduled in the absence of another event/sweep. */
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(test_fanout_calls, 1);
+	UT_ASSERT_EQ(test_unicast_calls[1], 1);
+	UT_ASSERT_EQ(test_unicast_calls[2], 0);
+
+	test_fanout_peer1_result = CLUSTER_IC_FANOUT_PEER_DOWN;
+	test_fanout_peer2_result = CLUSTER_IC_FANOUT_PEER_DOWN;
+	test_alive_peer_count = 0;
+}
+
 /*
  * MUST RUN LAST:  overflow freezes the frontier stickily (until
  * restart);  every test after this one would see frozen state.
@@ -1071,6 +1167,8 @@ main(void)
 	UT_RUN(test_spec74_event_injection_suppresses_signal);
 	UT_RUN(test_spec74_drain_attaches_payload_v1_when_on);
 	UT_RUN(test_spec74_drain_zero_len_when_off_even_if_dirty);
+	UT_RUN(test_spec74_drain_does_not_retry_transport_owned_would_block);
+	UT_RUN(test_spec74_drain_retries_only_exact_not_admitted_peer);
 	UT_RUN(test_spec74_frontier_overflow_freezes_sticky);
 
 	UT_DONE();

@@ -5697,6 +5697,106 @@ UT_TEST(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits)
 				 UINT64_C(77));
 }
 
+UT_TEST(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_replacement)
+{
+	ClusterReconfigState *state;
+	ClusterFormationCommitMarker marker;
+	ClusterInitialCleanFormationSnapshot snapshot;
+	ClusterReplacementEpisode replacement;
+	uint64 incarnations[CLUSTER_MAX_NODES] = {0};
+	int node;
+
+	ut_join_setup();
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->self_join_admitted = 1;
+	memset(&marker, 0, sizeof(marker));
+	marker.magic = CLUSTER_FORMATION_MARKER_MAGIC;
+	marker.version = CLUSTER_FORMATION_MARKER_VERSION;
+	marker.phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
+	marker.formation_generation = UINT64_C(3);
+	marker.formation_epoch = cluster_epoch_get_current();
+	marker.arbiter_node = 0;
+	marker.arbiter_incarnation = UINT64_C(60);
+	marker.commit_nonce = UINT64_C(71);
+	marker.n_admitted = 4;
+	marker.admitted_nodes[0] = UINT8_C(0x0f);
+	for (node = 0; node < 4; node++) {
+		ut_declared_set[node] = true;
+		incarnations[node] = UINT64_C(60) + (uint64)node;
+		cluster_membership_record_admitted(node, incarnations[node]);
+		cluster_membership_set_state(node, CLUSTER_MEMBER_MEMBER);
+	}
+	cluster_reconfig_formation_qvotec_publish_observed(
+		&marker, incarnations);
+
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(cluster_reconfig_snapshot_initial_clean_formation(&snapshot));
+	UT_ASSERT_EQ(snapshot.formation_marker_generation, UINT64_C(3));
+	UT_ASSERT_EQ(snapshot.formation_epoch, cluster_epoch_get_current());
+	UT_ASSERT_EQ(snapshot.members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(snapshot.members_hi, UINT64_C(0));
+	UT_ASSERT_EQ(snapshot.arbiter_node, UINT64_C(0));
+	UT_ASSERT_EQ(snapshot.arbiter_incarnation, UINT64_C(60));
+	for (node = 0; node < 4; node++)
+		UT_ASSERT_EQ(snapshot.admitted_incarnation[node],
+					 incarnations[node]);
+
+	replacement = ut_admitted_replacement_episode(3);
+	state->replacement_episode = replacement;
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(!cluster_reconfig_snapshot_initial_clean_formation(&snapshot));
+	for (node = 0; node < (int)sizeof(snapshot); node++)
+		UT_ASSERT_EQ(((uint8 *)&snapshot)[node], UINT8_C(0));
+}
+
+UT_TEST(test_initial_clean_snapshot_accepts_exact_initial_quorum_without_marker)
+{
+	ClusterReconfigState *state;
+	ClusterInitialCleanFormationSnapshot snapshot;
+	uint64 incarnations[4];
+	int node;
+
+	ut_join_setup();
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->self_join_admitted = 1;
+	ut_in_quorum_value = true;
+	ut_set_self_incarnation_sequence(
+		UINT64_C(80), UINT64_C(80), UINT64_C(80));
+	for (node = 0; node < 4; node++) {
+		incarnations[node] = UINT64_C(80) + (uint64)node;
+		ut_declared_set[node] = true;
+		cluster_reconfig_record_observed_slot(
+			node, incarnations[node], UINT64_C(1),
+			CLUSTER_EPOCH_INITIAL);
+		cluster_reconfig_record_observed_fresh_alive(node, true);
+		cluster_membership_record_admitted(node, incarnations[node]);
+		cluster_membership_set_state(node, CLUSTER_MEMBER_MEMBER);
+	}
+	cluster_reconfig_bootstrap_publish_begin();
+	cluster_reconfig_bootstrap_publish_in_quorum(true);
+	cluster_reconfig_bootstrap_publish_end();
+
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(cluster_reconfig_snapshot_initial_clean_formation(&snapshot));
+	UT_ASSERT_EQ(snapshot.formation_marker_generation, UINT64_C(0));
+	UT_ASSERT_EQ(snapshot.formation_epoch, CLUSTER_EPOCH_INITIAL);
+	UT_ASSERT_EQ(snapshot.members_lo, UINT64_C(0x0f));
+	for (node = 0; node < 4; node++)
+		UT_ASSERT_EQ(snapshot.admitted_incarnation[node],
+					 incarnations[node]);
+
+	cluster_reconfig_bootstrap_publish_begin();
+	cluster_reconfig_record_observed_slot(
+		2, incarnations[2] + 1, UINT64_C(2),
+		CLUSTER_EPOCH_INITIAL);
+	cluster_reconfig_bootstrap_publish_in_quorum(true);
+	cluster_reconfig_bootstrap_publish_end();
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(!cluster_reconfig_snapshot_initial_clean_formation(&snapshot));
+	for (node = 0; node < (int)sizeof(snapshot); node++)
+		UT_ASSERT_EQ(((uint8 *)&snapshot)[node], UINT8_C(0));
+}
+
 UT_TEST(test_cold_formation_leg2_live_survivor_refuses)
 {
 	ClusterReconfigState *state;
@@ -5819,7 +5919,7 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(98);
 
 	UT_RUN(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap);
 
@@ -5949,6 +6049,8 @@ main(void)
 	/* RF-ROOT P9 verification / cold-formation cold-formation negative
 	 * legs (run last: leg admissions latch process-local state). */
 	UT_RUN(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits);
+	UT_RUN(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_replacement);
+	UT_RUN(test_initial_clean_snapshot_accepts_exact_initial_quorum_without_marker);
 	UT_RUN(test_cold_formation_leg2_live_survivor_refuses);
 	UT_RUN(test_cold_formation_leg3_divergent_marker_rejected_no_majority);
 

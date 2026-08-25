@@ -455,6 +455,46 @@ cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
 	return result;
 }
 
+/* Physical half of the former-source local reacquire interlock.  The
+ * retained Resource-X pair is checked in its own lock domain by the caller;
+ * this predicate only proves that the same sampled generation still names a
+ * clean, valid N+PI carrier protected by one exact REVOKING token. */
+bool
+cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n)
+{
+	ClusterPcmOwnSnapshot live;
+	uint32 buf_state;
+	bool matches;
+
+	if (buf == NULL || expected_n == NULL
+		|| expected_n->generation == 0
+		|| expected_n->generation == UINT64_MAX
+		|| expected_n->reservation_token == 0
+		|| expected_n->reservation_token == UINT64_MAX
+		|| expected_n->pcm_state != (uint8)PCM_STATE_N
+		|| expected_n->flags != PCM_OWN_FLAG_REVOKING
+		|| expected_n->writer_activation_token != 0
+		|| expected_n->resource_x_activation_generation != 0
+		|| ClusterPcmOwnArray == NULL)
+		return false;
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	matches = cluster_pcm_own_snapshot_matches_locked(buf, expected_n)
+		&& live.writer_activation_token == 0
+		&& live.resource_x_activation_generation == 0
+		&& live.reservation_token == expected_n->reservation_token
+		&& live.flags == PCM_OWN_FLAG_REVOKING
+		&& buf->pcm_state == (uint8)PCM_STATE_N
+		&& buf->buffer_type == (uint8)BUF_TYPE_PI
+		&& (buf_state & BM_VALID) != 0
+		&& (buf_state
+			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
+				| BM_IO_IN_PROGRESS | BM_IO_ERROR)) == 0;
+	UnlockBufHdr(buf, buf_state);
+	return matches;
+}
+
 ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_n_storage_candidate_exact(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n)
@@ -489,6 +529,65 @@ cluster_bufmgr_pcm_own_n_storage_candidate_exact(
 		result = CLUSTER_PCM_OWN_BUSY;
 	else
 		result = CLUSTER_PCM_OWN_OK;
+	UnlockBufHdr(buf, buf_state);
+	return result;
+}
+
+static bool
+cluster_bufmgr_pcm_direct_init_known_new_locked(BufferDesc *buf,
+												 uint32 buf_state)
+{
+	bool io_known_new;
+	bool valid_aux_known_new;
+
+	Assert(buf != NULL);
+	Assert(buf_state & BM_LOCKED);
+	io_known_new = (buf_state & BM_VALID) == 0
+		&& (buf_state & BM_IO_IN_PROGRESS) != 0;
+	valid_aux_known_new = (buf_state & BM_VALID) != 0
+		&& (buf_state & BM_IO_IN_PROGRESS) == 0
+		&& (buf->tag.forkNum == VISIBILITYMAP_FORKNUM
+			|| buf->tag.forkNum == FSM_FORKNUM);
+	return buf->buffer_type != (uint8)BUF_TYPE_PI
+		&& BUF_STATE_GET_REFCOUNT(buf_state) != 0
+		&& (buf_state & BM_TAG_VALID) != 0
+		&& (buf_state
+			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
+			   | BM_IO_ERROR)) == 0
+		&& PageIsNew((Page)BufHdrGetBlock(buf))
+		&& (io_known_new || valid_aux_known_new);
+}
+
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_pending_n)
+{
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnResult result;
+	uint32 buf_state;
+
+	if (buf == NULL || expected_pending_n == NULL
+		|| expected_pending_n->pcm_state != (uint8)PCM_STATE_N
+		|| expected_pending_n->flags != PCM_OWN_FLAG_GRANT_PENDING
+		|| expected_pending_n->reservation_token == 0
+		|| expected_pending_n->writer_activation_token != 0
+		|| expected_pending_n->resource_x_activation_generation != 0)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	if (!cluster_pcm_own_snapshot_matches_locked(buf, expected_pending_n)
+		|| live.writer_activation_token != 0
+		|| live.resource_x_activation_generation != 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else {
+		if (buf->buffer_type != (uint8)BUF_TYPE_CURRENT
+			|| !cluster_bufmgr_pcm_direct_init_known_new_locked(buf, buf_state))
+			result = CLUSTER_PCM_OWN_STALE;
+		else
+			result = CLUSTER_PCM_OWN_OK;
+	}
 	UnlockBufHdr(buf, buf_state);
 	return result;
 }
@@ -964,6 +1063,183 @@ cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
 	return result;
 }
 
+/* User-approved PGRAC adaptation for an exact known-new direct-init
+ * descriptor.  The durable image is authority proof only: this helper never
+ * copies it into the shared page.  It changes only the Resource-X activation
+ * sidecar while mapping, ownership, X writer token, known-new bytes, and the
+ * original reservation token all still match. */
+static ResourceXBufferActivationResult
+cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact(
+	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
+	uint64 expected_reservation_token, bool clear,
+	ResourceXBufferInstallProof *install_proof,
+	ResourceXBufferActivationProof *activation_proof)
+{
+	BufferDesc *buf;
+	BufferTag lookup_tag;
+	ClusterPcmOwnSnapshot expected;
+	ClusterPcmOwnSnapshot live;
+	ClusterPcmOwnResult own_result;
+	LWLock *content_lock;
+	LWLock *partition_lock;
+	uint32 hashcode;
+	uint32 buf_state;
+	int buf_id;
+	bool already_bound;
+	ResourceXBufferActivationResult result = RESOURCE_X_BUFFER_STALE;
+
+	if (install_proof != NULL)
+		memset(install_proof, 0, sizeof(*install_proof));
+	if (activation_proof != NULL)
+		memset(activation_proof, 0, sizeof(*activation_proof));
+	if (ref == NULL || ref->formation == 0
+		|| ref->acquisition_generation == 0
+		|| expected_generation == 0
+		|| expected_generation == UINT64_MAX
+		|| expected_reservation_token == 0
+		|| expected_reservation_token == UINT64_MAX
+		|| (clear && activation_proof == NULL)
+		|| (!clear && install_proof == NULL))
+		return RESOURCE_X_BUFFER_CORRUPT;
+	if (ClusterPcmOwnArray == NULL)
+		return RESOURCE_X_BUFFER_ABSENT;
+
+	lookup_tag = ref->assertion.resource;
+	hashcode = BufTableHashCode(&lookup_tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&lookup_tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return RESOURCE_X_BUFFER_ABSENT;
+	}
+
+	buf = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &expected);
+	if (!BufferTagsEqual(&buf->tag, &lookup_tag))
+		result = RESOURCE_X_BUFFER_ABSENT;
+	else if (expected.generation != expected_generation
+			 || expected.reservation_token != expected_reservation_token
+			 || (clear
+				 ? !cluster_pcm_x_resource_x_t3_snapshot_exact(ref, &expected)
+				 : !cluster_pcm_x_resource_x_t2_snapshot_exact(ref, &expected)))
+		result = expected.flags != 0
+			? RESOURCE_X_BUFFER_BUSY : RESOURCE_X_BUFFER_STALE;
+	else if (buf->buffer_type != (uint8)BUF_TYPE_XCUR
+			 || !cluster_bufmgr_pcm_direct_init_known_new_locked(buf, buf_state))
+		result = RESOURCE_X_BUFFER_STALE;
+	else
+	{
+		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+		buf_state = 0;
+	}
+	if (buf_state != 0)
+		UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+	if (buf_state != 0)
+		return result;
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+	{
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return RESOURCE_X_BUFFER_BUSY;
+	}
+
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, &live);
+	if (!cluster_pcm_own_snapshot_matches_locked(buf, &expected)
+		|| live.writer_activation_token != expected.writer_activation_token
+		|| live.generation != expected_generation
+		|| live.reservation_token != expected_reservation_token
+		|| (clear
+			? !cluster_pcm_x_resource_x_t3_snapshot_exact(ref, &live)
+			: !cluster_pcm_x_resource_x_t2_snapshot_exact(ref, &live)))
+		result = live.flags != 0
+			? RESOURCE_X_BUFFER_BUSY : RESOURCE_X_BUFFER_STALE;
+	else if (buf->buffer_type != (uint8)BUF_TYPE_XCUR
+			 || !cluster_bufmgr_pcm_direct_init_known_new_locked(buf, buf_state))
+		result = RESOURCE_X_BUFFER_STALE;
+	else
+	{
+		already_bound = live.resource_x_activation_generation
+			== ref->acquisition_generation;
+		if (clear)
+			own_result = cluster_pcm_own_resource_x_activation_clear_exact(
+				buf->buf_id, expected_generation,
+				expected_reservation_token,
+				ref->acquisition_generation);
+		else
+			own_result = cluster_pcm_own_resource_x_activation_bind_exact(
+				buf->buf_id, expected_generation,
+				expected_reservation_token,
+				ref->acquisition_generation);
+		if (own_result == CLUSTER_PCM_OWN_OK)
+		{
+			cluster_pcm_own_snapshot_locked(buf, &live);
+			if (clear)
+			{
+				activation_proof->ownership_generation = live.generation;
+				activation_proof->writer_activation_token
+					= live.writer_activation_token;
+				activation_proof->resource_x_activation_generation
+					= live.resource_x_activation_generation;
+				result = RESOURCE_X_BUFFER_T2_INSTALLED;
+			}
+			else
+			{
+				install_proof->ownership_generation = live.generation;
+				install_proof->writer_activation_token
+					= live.writer_activation_token;
+				install_proof->resource_x_activation_generation
+					= live.resource_x_activation_generation;
+				result = already_bound
+					? RESOURCE_X_BUFFER_ALREADY_INSTALLED
+					: RESOURCE_X_BUFFER_T2_INSTALLED;
+			}
+		}
+		else
+			result = own_result == CLUSTER_PCM_OWN_BUSY
+				? RESOURCE_X_BUFFER_BUSY
+				: own_result == CLUSTER_PCM_OWN_NOT_READY
+				? RESOURCE_X_BUFFER_ABSENT
+				: own_result == CLUSTER_PCM_OWN_CORRUPT
+				? RESOURCE_X_BUFFER_CORRUPT
+				: RESOURCE_X_BUFFER_STALE;
+	}
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(content_lock);
+	cluster_bufmgr_unpin_for_gcs(buf);
+	return result;
+}
+
+PGRAC_PCM_X_FENCE_TERMINAL_OWNER(T2_DIRECT_INIT_BIND, ref,
+	cluster_pcm_x_resource_x_t2_snapshot_exact)
+ResourceXBufferActivationResult
+cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
+	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
+	uint64 expected_reservation_token, ResourceXBufferInstallProof *out_proof)
+{
+	return cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact(
+		ref, expected_generation, expected_reservation_token, false,
+		out_proof, NULL);
+}
+
+PGRAC_PCM_X_FENCE_TERMINAL_OWNER(T3_DIRECT_INIT_CLEAR, ref,
+	cluster_pcm_x_resource_x_t3_snapshot_exact)
+ResourceXBufferActivationResult
+cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(
+	const ResourceXAcquisitionRef *ref, uint64 expected_generation,
+	uint64 expected_reservation_token,
+	ResourceXBufferActivationProof *out_proof)
+{
+	return cluster_bufmgr_pcm_own_direct_init_sidecar_by_tag_exact(
+		ref, expected_generation, expected_reservation_token, true,
+		NULL, out_proof);
+}
+
 /* R8 reconfiguration owner for one exact T2/T3 gap.  It takes only the
  * mapping partition and BufferDesc header lock: no content lock, pin, I/O, or
  * Resource-X entry lock crosses this boundary.  The descriptor becomes a
@@ -1086,6 +1362,75 @@ cluster_bufmgr_pcm_own_snapshot_by_tag(const BufferTag *tag, int *out_buffer_id,
 	}
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(partition_lock);
+	return result;
+}
+
+/* Resolve the exact pending descriptor named by a requester bootstrap round.
+ * Unlike the ordinary resident lookup, the main-fork known-new window is
+ * deliberately !BM_VALID while StartBufferIO still owns BM_IO_IN_PROGRESS.
+ * The caller must revalidate the returned snapshot before every transition. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
+	const BufferTag *tag, uint64 expected_generation,
+	uint64 expected_reservation_token, int *out_buffer_id,
+	ClusterPcmOwnSnapshot *out_snapshot)
+{
+	BufferDesc *buf;
+	BufferTag lookup_tag;
+	LWLock *partition_lock;
+	uint32 hashcode;
+	uint32 buf_state;
+	int buf_id;
+	ClusterPcmOwnResult result;
+
+	if (out_buffer_id != NULL)
+		*out_buffer_id = -1;
+	if (out_snapshot != NULL)
+		memset(out_snapshot, 0, sizeof(*out_snapshot));
+	if (tag == NULL || out_buffer_id == NULL || out_snapshot == NULL
+		|| expected_generation == UINT64_MAX
+		|| expected_reservation_token == 0
+		|| expected_reservation_token == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+
+	lookup_tag = *tag;
+	hashcode = BufTableHashCode(&lookup_tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&lookup_tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return CLUSTER_PCM_OWN_STALE;
+	}
+	buf = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(buf);
+	cluster_pcm_own_snapshot_locked(buf, out_snapshot);
+	if (!BufferTagsEqual(&buf->tag, tag)
+		|| out_snapshot->generation != expected_generation
+		|| out_snapshot->reservation_token != expected_reservation_token
+		|| out_snapshot->flags != PCM_OWN_FLAG_GRANT_PENDING
+		|| out_snapshot->pcm_state != (uint8)PCM_STATE_N
+		|| out_snapshot->writer_activation_token != 0
+		|| out_snapshot->resource_x_activation_generation != 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if (buf->buffer_type != (uint8)BUF_TYPE_CURRENT
+			 || !cluster_bufmgr_pcm_direct_init_known_new_locked(buf, buf_state))
+		result = CLUSTER_PCM_OWN_STALE;
+	else
+	{
+		*out_buffer_id = buf_id;
+		result = CLUSTER_PCM_OWN_OK;
+	}
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+	if (result != CLUSTER_PCM_OWN_OK)
+	{
+		*out_buffer_id = -1;
+		memset(out_snapshot, 0, sizeof(*out_snapshot));
+	}
 	return result;
 }
 
@@ -2023,6 +2368,7 @@ typedef enum ClusterPcmXWriterLedgerPhase {
 	PCM_X_WRITER_LEDGER_HANDOFF,
 	PCM_X_WRITER_LEDGER_ACQUIRING,
 	PCM_X_WRITER_LEDGER_ACTIVE,
+	PCM_X_WRITER_LEDGER_RECYCLING,
 	PCM_X_WRITER_LEDGER_RELEASING,
 	PCM_X_WRITER_LEDGER_DEFERRED
 } ClusterPcmXWriterLedgerPhase;
@@ -2037,6 +2383,7 @@ typedef struct ClusterPcmXWriterLedgerEntry {
 		ResourceXWriterUseContext target;
 	} authority;
 	ClusterPcmOwnSnapshot granted;
+	ResourceXLocalOwnerHandle recycle_owner;
 	bool claim_handed_off;
 	bool claim_cleanup_complete;
 	bool grant_snapshot_exact;
@@ -2049,6 +2396,7 @@ StaticAssertDecl(lengthof(cluster_bufmgr_pcm_x_writer_ledger) == LWLOCK_MAX_HELD
 				 "PCM-X writer ledger must match the process held-LWLock bound");
 
 static ClusterPcmXWriterLedgerEntry *cluster_bufmgr_pcm_x_writer_find(BufferDesc *buf);
+static void cluster_bufmgr_pcm_x_writer_activate(ClusterPcmXWriterLedgerEntry *entry);
 static void cluster_bufmgr_pcm_x_writer_mark_releasing(ClusterPcmXWriterLedgerEntry *entry);
 static void cluster_bufmgr_pcm_x_writer_release(ClusterPcmXWriterLedgerEntry *entry);
 static void cluster_bufmgr_pcm_x_holder_report_failure(PcmXQueueResult result, BufferDesc *buf,
@@ -2056,7 +2404,11 @@ static void cluster_bufmgr_pcm_x_holder_report_failure(PcmXQueueResult result, B
 static bool cluster_bufmgr_pcm_x_writer_claim_entry_exact(const ClusterPcmXWriterLedgerEntry *entry,
 														  BufferDesc *buf);
 static bool cluster_bufmgr_pcm_x_writer_entry_exact(const ClusterPcmXWriterLedgerEntry *entry,
-													BufferDesc *buf);
+											BufferDesc *buf);
+static void cluster_bufmgr_resource_x_writer_report_failure(
+	ResourceXApplyResult result, BufferDesc *buf, const char *operation);
+static void cluster_bufmgr_pcm_x_writer_clear(
+	ClusterPcmXWriterLedgerEntry *entry);
 static void cluster_bufmgr_pcm_x_writer_report_failure(PcmXQueueResult result, BufferDesc *buf,
 													   const char *operation);
 static void cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint32 buf_state,
@@ -2905,9 +3257,12 @@ cluster_bufmgr_itl_recycle_guard_arm(
 	Buffer buffer, const ClusterPcmOwnSnapshot *expected)
 {
 	BufferDesc *buf;
-	ClusterPcmXHolderLedgerEntry *entry;
+	ClusterPcmXHolderLedgerEntry *holder;
+	ClusterPcmXWriterLedgerEntry *writer;
 	ClusterPcmOwnSnapshot live;
-	PcmXQueueResult result;
+	ClusterPcmOwnResult live_result;
+	PcmXQueueResult holder_result;
+	ResourceXApplyResult target_result;
 	LWLock *content_lock;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer) || expected == NULL
@@ -2919,25 +3274,60 @@ cluster_bufmgr_itl_recycle_guard_arm(
 	content_lock = BufferDescriptorGetContentLock(buf);
 	if (!LWLockHeldByMeInMode(content_lock, LW_EXCLUSIVE))
 		return false;
-	entry = cluster_bufmgr_pcm_x_holder_find(buf);
-	if (entry == NULL || entry->phase != PCM_X_HOLDER_LEDGER_ACTIVE
-		|| !cluster_bufmgr_pcm_x_holder_entry_exact(entry, buf)
-		|| entry->handle.key.identity.base_own_generation != expected->generation
-		|| cluster_bufmgr_pcm_own_snapshot(buf, &live) != CLUSTER_PCM_OWN_OK
+	live_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
+	if (live_result != CLUSTER_PCM_OWN_OK
 		|| !BufferTagsEqual(&live.tag, &expected->tag)
 		|| live.generation != expected->generation
 		|| live.reservation_token != expected->reservation_token
 		|| live.resource_x_activation_generation
 			   != expected->resource_x_activation_generation
 		|| live.flags != expected->flags
-		|| live.pcm_state != expected->pcm_state)
+		|| live.pcm_state != expected->pcm_state) {
 		return false;
+	}
+	holder = cluster_bufmgr_pcm_x_holder_find(buf);
+	if (holder != NULL) {
+		if (holder->phase != PCM_X_HOLDER_LEDGER_ACTIVE
+			|| !cluster_bufmgr_pcm_x_holder_entry_exact(holder, buf)
+			|| holder->handle.key.identity.base_own_generation
+				!= expected->generation) {
+			return false;
+		}
+		holder_result
+			= cluster_pcm_x_local_holder_begin_recycling_exact(
+				&holder->handle);
+		if (holder_result != PCM_X_QUEUE_OK)
+			cluster_bufmgr_pcm_x_holder_report_failure(
+				holder_result, buf, "arm ITL recycle guard");
+		holder->phase = PCM_X_HOLDER_LEDGER_RECYCLING;
+		return true;
+	}
 
-	result = cluster_pcm_x_local_holder_begin_recycling_exact(&entry->handle);
-	if (result != PCM_X_QUEUE_OK)
-		cluster_bufmgr_pcm_x_holder_report_failure(result, buf,
-											  "arm ITL recycle guard");
-	entry->phase = PCM_X_HOLDER_LEDGER_RECYCLING;
+	writer = cluster_bufmgr_pcm_x_writer_find(buf);
+	if (writer == NULL
+		|| writer->writer_path != RESOURCE_X_WRITER_TARGET
+		|| writer->phase != PCM_X_WRITER_LEDGER_ACTIVE
+		|| !cluster_bufmgr_pcm_x_writer_entry_exact(writer, buf)
+		|| !BufferTagsEqual(&writer->granted.tag, &expected->tag)
+		|| writer->granted.generation != expected->generation
+		|| writer->granted.reservation_token
+			!= expected->reservation_token
+		|| writer->granted.pcm_state != expected->pcm_state
+		|| writer->granted.flags != expected->flags
+		|| writer->granted.writer_activation_token
+			!= expected->writer_activation_token
+		|| writer->granted.resource_x_activation_generation
+			!= expected->resource_x_activation_generation) {
+		return false;
+	}
+	target_result = cluster_gcs_resource_x_target_itl_recycle_begin_exact(
+		&writer->authority.target, &live, &writer->recycle_owner);
+	if (target_result != RESOURCE_X_APPLY_APPLIED) {
+		memset(&writer->recycle_owner, 0,
+			   sizeof(writer->recycle_owner));
+		return false;
+	}
+	writer->phase = PCM_X_WRITER_LEDGER_RECYCLING;
 	return true;
 }
 
@@ -2955,6 +3345,23 @@ cluster_bufmgr_itl_recycle_guard_unlock(Buffer buffer)
 				 errmsg("invalid buffer for cluster ITL recycle guard unlock")));
 	buf = GetBufferDescriptor(buffer - 1);
 	content_lock = BufferDescriptorGetContentLock(buf);
+	writer = cluster_bufmgr_pcm_x_writer_find(buf);
+	if (writer != NULL
+		&& writer->writer_path == RESOURCE_X_WRITER_TARGET) {
+		if (writer->phase != PCM_X_WRITER_LEDGER_RECYCLING
+			|| !cluster_bufmgr_pcm_x_writer_entry_exact(writer, buf)
+			|| writer->recycle_owner.owner_generation == 0
+			|| cluster_bufmgr_pcm_x_holder_find(buf) != NULL
+			|| !LWLockHeldByMeInMode(content_lock, LW_EXCLUSIVE))
+			cluster_bufmgr_resource_x_writer_report_failure(
+				RESOURCE_X_APPLY_BAD_STATE, buf,
+				"unlock Resource-X ITL recycle guard");
+		/* RECYCLING is a non-authority owner in the same Resource-X entry.
+		 * Keep the exact target context only as cleanup identity; without the
+		 * content lock it cannot authorize page writes. */
+		LWLockRelease(content_lock);
+		return;
+	}
 	holder = cluster_bufmgr_pcm_x_holder_find(buf);
 	if (holder == NULL || holder->phase != PCM_X_HOLDER_LEDGER_RECYCLING
 		|| !cluster_bufmgr_pcm_x_holder_entry_exact(holder, buf)
@@ -2976,13 +3383,44 @@ cluster_bufmgr_itl_recycle_guard_relock(Buffer buffer)
 {
 	BufferDesc *buf;
 	ClusterPcmXHolderLedgerEntry *holder;
+	ClusterPcmXWriterLedgerEntry *writer;
+	ClusterPcmOwnSnapshot live;
 	PcmXQueueResult result;
+	ResourceXApplyResult target_result;
 	LWLock *content_lock;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer))
 		return false;
 	buf = GetBufferDescriptor(buffer - 1);
 	content_lock = BufferDescriptorGetContentLock(buf);
+	writer = cluster_bufmgr_pcm_x_writer_find(buf);
+	if (writer != NULL
+		&& writer->writer_path == RESOURCE_X_WRITER_TARGET) {
+		if (writer->phase != PCM_X_WRITER_LEDGER_RECYCLING
+			|| !cluster_bufmgr_pcm_x_writer_entry_exact(writer, buf)
+			|| writer->recycle_owner.owner_generation == 0
+			|| cluster_bufmgr_pcm_x_holder_find(buf) != NULL
+			|| LWLockHeldByMe(content_lock))
+			return false;
+		LWLockAcquire(content_lock, LW_EXCLUSIVE);
+		if (cluster_bufmgr_pcm_own_snapshot(buf, &live)
+				!= CLUSTER_PCM_OWN_OK) {
+			LWLockRelease(content_lock);
+			return false;
+		}
+		target_result
+			= cluster_gcs_resource_x_target_itl_recycle_finish_exact(
+				&writer->authority.target, &live,
+				&writer->recycle_owner);
+		if (target_result != RESOURCE_X_APPLY_APPLIED) {
+			LWLockRelease(content_lock);
+			return false;
+		}
+		memset(&writer->recycle_owner, 0,
+			   sizeof(writer->recycle_owner));
+		writer->phase = PCM_X_WRITER_LEDGER_ACTIVE;
+		return true;
+	}
 	holder = cluster_bufmgr_pcm_x_holder_find(buf);
 	if (holder == NULL || holder->phase != PCM_X_HOLDER_LEDGER_RECYCLING
 		|| !cluster_bufmgr_pcm_x_holder_entry_exact(holder, buf)
@@ -3009,11 +3447,37 @@ cluster_bufmgr_itl_recycle_guard_cancel(Buffer buffer)
 {
 	BufferDesc *buf;
 	ClusterPcmXHolderLedgerEntry *holder;
+	ClusterPcmXWriterLedgerEntry *writer;
 	PcmXQueueResult result;
+	ResourceXApplyResult target_result;
 
 	if (!BufferIsValid(buffer) || BufferIsLocal(buffer))
 		return;
 	buf = GetBufferDescriptor(buffer - 1);
+	writer = cluster_bufmgr_pcm_x_writer_find(buf);
+	if (writer != NULL
+		&& writer->writer_path == RESOURCE_X_WRITER_TARGET) {
+		if (writer->phase != PCM_X_WRITER_LEDGER_RECYCLING
+			|| writer->content_lock == NULL
+			|| LWLockHeldByMe(writer->content_lock)
+			|| writer->recycle_owner.owner_generation == 0) {
+			cluster_pcm_x_runtime_fail_closed();
+			elog(LOG, "could not cancel malformed Resource-X ITL recycle guard: buffer=%d phase=%d",
+				 writer->buffer_id, (int)writer->phase);
+			return;
+		}
+		target_result
+			= cluster_gcs_resource_x_target_itl_recycle_cancel_exact(
+				&writer->recycle_owner);
+		if (target_result != RESOURCE_X_APPLY_APPLIED
+			&& target_result != RESOURCE_X_APPLY_NOT_FOUND) {
+			cluster_pcm_x_runtime_fail_closed();
+			elog(LOG, "could not cancel exact Resource-X ITL recycle guard: buffer=%d result=%d",
+				 writer->buffer_id, (int)target_result);
+		}
+		cluster_bufmgr_pcm_x_writer_clear(writer);
+		return;
+	}
 	holder = cluster_bufmgr_pcm_x_holder_find(buf);
 	if (holder == NULL)
 		return;
@@ -3312,6 +3776,64 @@ cluster_bufmgr_pcm_x_writer_drain_deferred_nowait(void)
 			elog(LOG, "could not drain deferred exact cluster PCM-X writer: buffer=%d result=%d",
 				 entry->buffer_id, (int)result);
 		}
+	}
+}
+
+/* The exact known-new TARGET path acquires content authority outside
+ * LockBufferInternal().  Bind its already-terminal Resource-X context to the
+ * existing process-local writer ledger so the matching unlock takes the same
+ * TARGET cleanup as an ordinary writer and cannot race an asynchronous
+ * settlement with a legacy cache-off release.  ACTIVE here names the granted
+ * writer interval; the caller's next operation is the content-lock acquire. */
+static void
+cluster_bufmgr_pcm_x_writer_track_target_direct_init(
+	BufferDesc *buf, const ResourceXWriterUseContext *context)
+{
+	ClusterPcmXWriterLedgerEntry *entry;
+	ClusterPcmOwnSnapshot granted;
+	ClusterPcmOwnResult own_result;
+
+	if (buf == NULL || context == NULL)
+		cluster_bufmgr_resource_x_writer_report_failure(
+			RESOURCE_X_APPLY_INVALID, buf,
+			"Resource-X direct-init ledger arguments");
+	cluster_bufmgr_pcm_x_writer_drain_deferred_nowait();
+	if (cluster_bufmgr_pcm_x_writer_find(buf) != NULL)
+		cluster_bufmgr_resource_x_writer_report_failure(
+			RESOURCE_X_APPLY_BAD_STATE, buf,
+			"Resource-X direct-init ledger reuse");
+	MemSet(&granted, 0, sizeof(granted));
+	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &granted);
+	if (own_result != CLUSTER_PCM_OWN_OK
+		|| !BufferTagsEqual(&granted.tag, &buf->tag)
+		|| granted.generation != context->buffer_ownership_generation
+		|| granted.pcm_state != (uint8)PCM_STATE_X
+		|| granted.flags != 0
+		|| granted.writer_activation_token != 0
+		|| granted.resource_x_activation_generation != 0
+		|| !cluster_gcs_resource_x_target_context_recheck_exact(context))
+		cluster_bufmgr_resource_x_writer_report_failure(
+			RESOURCE_X_APPLY_STALE, buf,
+			"Resource-X direct-init ledger recheck");
+	entry = cluster_bufmgr_pcm_x_writer_free_entry();
+	if (entry == NULL)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("cluster PCM-X writer ledger is full"),
+						errdetail("maximum entries=%d",
+								  LWLOCK_MAX_HELD_BY_PROC)));
+	MemSet(entry, 0, sizeof(*entry));
+	entry->writer_path = RESOURCE_X_WRITER_TARGET;
+	entry->buffer_id = buf->buf_id;
+	entry->content_lock = BufferDescriptorGetContentLock(buf);
+	entry->authority.target = *context;
+	entry->granted = granted;
+	entry->grant_snapshot_exact = true;
+	entry->phase = PCM_X_WRITER_LEDGER_ACQUIRING;
+	if (!cluster_bufmgr_pcm_x_writer_entry_exact(entry, buf)) {
+		cluster_bufmgr_pcm_x_writer_clear(entry);
+		cluster_bufmgr_resource_x_writer_report_failure(
+			RESOURCE_X_APPLY_STALE, buf,
+			"Resource-X direct-init ledger bind");
 	}
 }
 
@@ -3660,6 +4182,27 @@ cluster_bufmgr_pcm_x_writer_activate(ClusterPcmXWriterLedgerEntry *entry)
 	entry->phase = PCM_X_WRITER_LEDGER_ACTIVE;
 }
 
+/* Direct-init obtains its exact TARGET grant before the caller can take the
+ * content lock.  Finish the existing TARGET activation under that lock and
+ * before the caller may initialize any page bytes.  SOURCE/non-cluster
+ * direct-init has no ledger and remains a no-op here. */
+static void
+cluster_bufmgr_pcm_x_writer_activate_target_direct_init(BufferDesc *buf)
+{
+	ClusterPcmXWriterLedgerEntry *entry;
+
+	if (buf == NULL)
+		return;
+	entry = cluster_bufmgr_pcm_x_writer_find(buf);
+	if (entry == NULL)
+		return;
+	if (entry->writer_path != RESOURCE_X_WRITER_TARGET)
+		cluster_bufmgr_pcm_x_writer_report_failure(
+			PCM_X_QUEUE_BAD_STATE, buf,
+			"direct-init TARGET activation identity");
+	cluster_bufmgr_pcm_x_writer_activate(entry);
+}
+
 static void
 cluster_bufmgr_pcm_x_writer_mark_releasing(ClusterPcmXWriterLedgerEntry *entry)
 {
@@ -3777,9 +4320,22 @@ cluster_bufmgr_pcm_x_writer_exception_cleanup_all(void)
 		if (entry->phase == PCM_X_WRITER_LEDGER_UNUSED)
 			continue;
 		if (entry->writer_path == RESOURCE_X_WRITER_TARGET) {
+			ResourceXApplyResult target_result;
+
 			if (entry->content_lock == NULL
 				|| LWLockHeldByMe(entry->content_lock))
 				continue;
+			if (entry->phase == PCM_X_WRITER_LEDGER_RECYCLING) {
+				target_result
+					= cluster_gcs_resource_x_target_itl_recycle_cancel_exact(
+						&entry->recycle_owner);
+				if (target_result != RESOURCE_X_APPLY_APPLIED
+					&& target_result != RESOURCE_X_APPLY_NOT_FOUND) {
+					cluster_pcm_x_runtime_fail_closed();
+					elog(LOG, "could not exception-cancel Resource-X ITL recycler: buffer=%d result=%d",
+						 entry->buffer_id, (int)target_result);
+				}
+			}
 			cluster_bufmgr_pcm_x_writer_clear(entry);
 			continue;
 		}
@@ -3831,6 +4387,8 @@ cluster_bufmgr_pcm_x_writer_owner_exit_drain_once(bool runtime_active)
 		if (entry->phase == PCM_X_WRITER_LEDGER_UNUSED)
 			continue;
 		if (entry->writer_path == RESOURCE_X_WRITER_TARGET) {
+			ResourceXApplyResult target_result;
+
 			if (entry->content_lock == NULL
 				|| LWLockHeldByMe(entry->content_lock)) {
 				cluster_pcm_x_runtime_fail_closed();
@@ -3838,6 +4396,17 @@ cluster_bufmgr_pcm_x_writer_owner_exit_drain_once(bool runtime_active)
 					 "could not owner-exit clear malformed Resource-X target writer: buffer=%d",
 					 entry->buffer_id);
 				continue;
+			}
+			if (entry->phase == PCM_X_WRITER_LEDGER_RECYCLING) {
+				target_result
+					= cluster_gcs_resource_x_target_itl_recycle_cancel_exact(
+						&entry->recycle_owner);
+				if (target_result != RESOURCE_X_APPLY_APPLIED
+					&& target_result != RESOURCE_X_APPLY_NOT_FOUND) {
+					cluster_pcm_x_runtime_fail_closed();
+					elog(LOG, "could not owner-exit cancel Resource-X ITL recycler: buffer=%d result=%d",
+						 entry->buffer_id, (int)target_result);
+				}
 			}
 			cluster_bufmgr_pcm_x_writer_clear(entry);
 			continue;
@@ -3991,6 +4560,10 @@ cluster_bufmgr_pcm_direct_init_snapshot_locked(BufferDesc *buf, uint32 buf_state
 	out->tag = buf->tag;
 	out->generation = cluster_pcm_own_gen_get(buf->buf_id);
 	out->reservation_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
+	out->writer_activation_token
+		= cluster_pcm_own_writer_activation_token_get(buf->buf_id);
+	out->resource_x_activation_generation
+		= cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id);
 	out->flags = cluster_pcm_own_flags_get(buf->buf_id);
 	out->buf_state = buf_state;
 	out->buf_id = buf->buf_id;
@@ -4070,15 +4643,25 @@ static void
 cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kind,
 									ClusterPcmDirectInitProof *proof)
 {
+	ClusterPcmDirectInitSnapshot committed_observed;
 	ClusterPcmDirectInitSnapshot observed;
+	ClusterPcmDirectInitSnapshot pending_observed;
 	ClusterPcmOwnSnapshot pending_base;
 	ClusterPcmOwnResult pending_result;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXApplyResult resource_x_result;
+	ResourceXGateSnapshot gate;
+	ResourceXWriterPath current_writer_path;
+	ResourceXWriterPath writer_path;
+	ResourceXWriterUseContext context;
 	bool		grant_acquired = false;
 	bool		retry_denied = false;
 	uint32		buf_state;
 	uint32		retry_wait_index = 0;
+	uint64		current_writer_r4_generation = 0;
 	uint64		pending_token = 0;
 	uint64		committed_generation;
+	uint64		writer_r4_generation = 0;
 
 	if (!cluster_pcm_is_active() || !cluster_bufmgr_should_pcm_track(buf))
 		return;
@@ -4101,14 +4684,109 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 		pending_base.reservation_token = observed.reservation_token;
 		pending_base.flags = observed.flags;
 		pending_base.pcm_state = observed.pcm_state;
+		cluster_bufmgr_pcm_direct_init_snapshot_locked(
+			buf, buf_state, PageIsNew((Page)BufHdrGetBlock(buf)),
+			&pending_observed);
 	}
 	UnlockBufHdr(buf, buf_state);
 
 	if (pending_result == CLUSTER_PCM_OWN_OK)
+		pending_result = cluster_pcm_direct_init_target_pending_validate(
+			kind, &pending_observed, proof);
+	if (pending_result == CLUSTER_PCM_OWN_OK)
 		cluster_pcm_x_stats_note_own_begin();
-	else
+	else {
+		if (pending_token != 0)
+			cluster_pcm_own_abort_grant_after_error(
+				buf, &pending_base, pending_token,
+				"direct-init pending proof recheck");
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, pending_result, &observed,
-												  "direct-init consume");
+											  "direct-init consume");
+	}
+
+	writer_path = cluster_resource_x_writer_path_snapshot(
+		&writer_r4_generation);
+	switch (writer_path)
+	{
+		case RESOURCE_X_WRITER_TARGET:
+			MemSet(&terminal_ref, 0, sizeof(terminal_ref));
+			PG_TRY();
+			{
+				resource_x_result
+					= cluster_gcs_resource_x_target_direct_init_acquire_exact(
+						buf, writer_r4_generation,
+						pending_base.generation, pending_token,
+						&terminal_ref);
+			}
+			PG_CATCH();
+			{
+				cluster_pcm_own_abort_grant_after_error(
+					buf, &pending_base, pending_token,
+					"direct-init Resource-X acquire");
+				PG_RE_THROW();
+			}
+			PG_END_TRY();
+			if (resource_x_result != RESOURCE_X_APPLY_APPLIED
+				&& resource_x_result != RESOURCE_X_APPLY_DUPLICATE)
+			{
+				cluster_pcm_own_abort_grant_after_error(
+					buf, &pending_base, pending_token,
+					"direct-init Resource-X refusal");
+				cluster_bufmgr_resource_x_writer_report_failure(
+					resource_x_result, buf,
+					"Resource-X direct-init target acquire");
+			}
+
+			/* The terminal round has already completed T2/T3.  Rebind that
+			 * exact retained cover to the consumed stack proof before the
+			 * caller is allowed to take content EXCLUSIVE and initialize. */
+			buf_state = LockBufHdr(buf);
+			cluster_bufmgr_pcm_direct_init_snapshot_locked(
+				buf, buf_state, PageIsNew((Page)BufHdrGetBlock(buf)),
+				&committed_observed);
+			UnlockBufHdr(buf, buf_state);
+			MemSet(&gate, 0, sizeof(gate));
+			MemSet(&context, 0, sizeof(context));
+			(void)cluster_pcm_lock_resource_x_gate_snapshot(&gate);
+			current_writer_path = cluster_resource_x_writer_path_snapshot(
+				&current_writer_r4_generation);
+			context.ref = terminal_ref;
+			context.r4_record_generation = writer_r4_generation;
+			context.buffer_ownership_generation
+				= committed_observed.generation;
+			context.writer_activation_token = 0;
+			context.resource_x_activation_generation = 0;
+			pending_result = cluster_pcm_direct_init_target_commit_validate(
+				kind, &committed_observed, proof);
+			if (pending_result != CLUSTER_PCM_OWN_OK
+				|| current_writer_path != RESOURCE_X_WRITER_TARGET
+				|| current_writer_r4_generation != writer_r4_generation
+				|| gate.phase != RESOURCE_X_GATE_OPEN
+				|| gate.formation != terminal_ref.formation
+				|| !cluster_gcs_resource_x_target_context_recheck_exact(
+					&context))
+			{
+				cluster_bufmgr_resource_x_fail_closed_exact(&gate);
+				cluster_bufmgr_resource_x_writer_report_failure(
+					RESOURCE_X_APPLY_STALE, buf,
+					"Resource-X direct-init target post-T3 proof");
+			}
+			cluster_bufmgr_pcm_x_writer_track_target_direct_init(
+				buf, &context);
+			return;
+
+		case RESOURCE_X_WRITER_SOURCE:
+			break;
+
+		case RESOURCE_X_WRITER_CLOSED:
+		default:
+			cluster_pcm_own_abort_grant_after_error(
+				buf, &pending_base, pending_token,
+				"direct-init writer selector");
+			cluster_bufmgr_pcm_direct_init_report_failure(
+				buf, CLUSTER_PCM_OWN_STALE, &observed,
+				"direct-init writer selector");
+	}
 
 	for (;;)
 	{
@@ -5371,6 +6049,9 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 			bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS, &direct_init_proof);
 #endif
 		LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+		cluster_bufmgr_pcm_x_writer_activate_target_direct_init(bufHdr);
+#endif
 	}
 
 	if (isLocalBuf)
@@ -6802,6 +7483,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof);
 #endif
 			LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+			cluster_bufmgr_pcm_x_writer_activate_target_direct_init(buf_hdr);
+#endif
 		}
 
 		TerminateBufferIO(buf_hdr, false, BM_VALID);
@@ -9977,10 +10661,10 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 		cluster_bufmgr_should_pcm_track(buf))
 	{
 		pcm_mode = (mode == BUFFER_LOCK_SHARE) ? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
+		pcm_writer_path = cluster_resource_x_writer_path_snapshot(
+			&pcm_writer_r4_generation);
 		if (pcm_mode == PCM_LOCK_MODE_X)
 		{
-			pcm_writer_path = cluster_resource_x_writer_path_snapshot(
-				&pcm_writer_r4_generation);
 			if (pcm_writer_path == RESOURCE_X_WRITER_CLOSED)
 			{
 				if (pcm_barrier_refused != NULL)
@@ -10266,7 +10950,9 @@ pcm_legacy_acquire_done:
 						"cluster-pcm-share-barrier-refuse-after-acquire"))
 					*pcm_barrier_refused = true;
 			}
-			if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+			if ((pcm_barrier_refused == NULL || !*pcm_barrier_refused)
+				&& cluster_pcm_x_legacy_holder_registration_required(
+					pcm_writer_path == RESOURCE_X_WRITER_TARGET))
 				pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
 					buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base, &pcm_pending_token,
 					&pcm_acquired, &pcm_pending_set, &pcm_covered, &pcm_covered_gen,
@@ -10383,17 +11069,22 @@ pcm_legacy_acquire_done:
 						{
 							if (pcm_covered)
 							{
-								pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
-									buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base,
-									&pcm_pending_token, &pcm_acquired, &pcm_pending_set,
-									&pcm_covered, &pcm_covered_gen, &pcm_retry_wait_index);
+								if (cluster_pcm_x_legacy_holder_registration_required(
+										pcm_writer_path
+										== RESOURCE_X_WRITER_TARGET))
+									pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
+											buf, pcm_mode, pcm_barrier_refused,
+											&pcm_pending_base, &pcm_pending_token,
+											&pcm_acquired, &pcm_pending_set,
+											&pcm_covered, &pcm_covered_gen,
+											&pcm_retry_wait_index);
 								if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
 								{
-									if (mode == BUFFER_LOCK_SHARE)
-										LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
-									else
-										LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
-									continue;
+								if (mode == BUFFER_LOCK_SHARE)
+									LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+								else
+									LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+								continue;
 								}
 							}
 						}
@@ -10521,18 +11212,21 @@ pcm_revalidate_acquire_done:
 						}
 						if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
 						{
-							pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
-								buf, pcm_mode, pcm_barrier_refused, &pcm_pending_base,
-								&pcm_pending_token,
-								&pcm_acquired, &pcm_pending_set, &pcm_covered,
-								&pcm_covered_gen, &pcm_retry_wait_index);
+							if (cluster_pcm_x_legacy_holder_registration_required(
+									pcm_writer_path == RESOURCE_X_WRITER_TARGET))
+								pcm_x_holder = cluster_bufmgr_pcm_x_holder_admit_owned_grant(
+										buf, pcm_mode, pcm_barrier_refused,
+										&pcm_pending_base, &pcm_pending_token,
+										&pcm_acquired, &pcm_pending_set,
+										&pcm_covered, &pcm_covered_gen,
+										&pcm_retry_wait_index);
 							if (pcm_barrier_refused == NULL || !*pcm_barrier_refused)
 							{
-								if (mode == BUFFER_LOCK_SHARE)
-									LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
-								else
-									LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
-								cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer);
+									if (mode == BUFFER_LOCK_SHARE)
+										LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_SHARED);
+									else
+										LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+									cluster_bufmgr_pcm_x_writer_activate(pcm_x_writer);
 								cluster_pcm_note_writer_reverify_reacquire();
 							}
 						}
@@ -10694,7 +11388,7 @@ pcm_revalidate_acquire_done:
 		 * same-round FIFO successor records WRITER_COMPLETE.
 		 */
 		if (cluster_pcm_x_should_release_legacy_on_unlock(cluster_gcs_block_local_cache,
-														  pcm_x_writer_managed)) {
+													  pcm_x_writer_managed)) {
 			cluster_pcm_lock_unlock_content_buffer(buf, old_mode);
 
 			/*
@@ -10824,6 +11518,7 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 		cluster_bufmgr_pcm_gate_direct_init(buf, kind, &direct_init_proof);
 	}
 	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
+	cluster_bufmgr_pcm_x_writer_activate_target_direct_init(buf);
 }
 #endif
 
@@ -15405,6 +16100,203 @@ cluster_bufmgr_pcm_own_abort_x_revoke(BufferDesc *buf,
 	return result;
 }
 
+static bool
+cluster_bufmgr_pcm_own_held_x_revoke_valid(
+	const ClusterPcmOwnHeldXRevoke *held)
+{
+	return held != NULL
+		&& held->flags == CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK
+		&& held->buffer_id >= 0
+		&& held->buffer_id < NBuffers
+		&& held->revoking.pcm_state == (uint8)PCM_STATE_X
+		&& held->revoking.flags == PCM_OWN_FLAG_REVOKING
+		&& held->revoking.reservation_token != 0;
+}
+
+/* Bind tag -> descriptor and take the caller's raw pin before beginning the
+ * exact X revoke.  This narrow handle is for retained MAIN/INIT images only;
+ * VM/FSM keep their zero-refcount drop contract. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(
+	const BufferTag *tag, const ClusterPcmOwnSnapshot *expected_x,
+	ClusterPcmOwnHeldXRevoke *held_out)
+{
+	BufferDesc *buf;
+	BufferTag lookup_tag;
+	LWLock *partition_lock;
+	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
+	ClusterPcmOwnSnapshot revoking;
+	uint32 hashcode;
+	uint32 buf_state;
+	int buffer_id;
+	bool caller_pinned = false;
+
+	if (held_out != NULL)
+		memset(held_out, 0, sizeof(*held_out));
+	if (tag == NULL || expected_x == NULL || held_out == NULL
+		|| !BufferTagsEqual(tag, &expected_x->tag)
+		|| expected_x->pcm_state != (uint8)PCM_STATE_X
+		|| expected_x->flags != 0
+		|| cluster_pcm_x_revoke_finish_mode(tag, 0)
+			!= CLUSTER_PCM_X_REVOKE_FINISH_RETAIN)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+
+	lookup_tag = *tag;
+	hashcode = BufTableHashCode(&lookup_tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buffer_id = BufTableLookup(&lookup_tag, hashcode);
+	if (buffer_id < 0) {
+		LWLockRelease(partition_lock);
+		return CLUSTER_PCM_OWN_STALE;
+	}
+	buf = GetBufferDescriptor(buffer_id);
+	buf_state = LockBufHdr(buf);
+	if (!cluster_pcm_own_snapshot_matches_locked(buf, expected_x)
+		|| (buf_state & BM_VALID) == 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
+		result = CLUSTER_PCM_OWN_BUSY;
+	else if ((buf_state & BM_IO_ERROR) != 0)
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else {
+		cluster_bufmgr_pin_for_gcs_locked(buf, buf_state);
+		caller_pinned = true;
+		buf_state = 0;
+	}
+	if (buf_state != 0)
+		UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+	if (result != CLUSTER_PCM_OWN_OK)
+		return result;
+
+	memset(&revoking, 0, sizeof(revoking));
+	result = cluster_bufmgr_pcm_own_begin_x_revoke(
+		buf, expected_x, &revoking);
+	if (result != CLUSTER_PCM_OWN_OK) {
+		cluster_bufmgr_unpin_for_gcs(buf);
+		return result;
+	}
+	Assert(caller_pinned);
+	held_out->revoking = revoking;
+	held_out->buffer_id = buffer_id;
+	held_out->flags = CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK;
+	return CLUSTER_PCM_OWN_OK;
+}
+
+/* Pre-arm unwind: restore the exact X first, then drop this call's pin.  A
+ * failed abort keeps both handle and pin so the caller can fail-close before
+ * using the explicit abandon boundary below. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_abort_held_x_revoke(
+	ClusterPcmOwnHeldXRevoke *held)
+{
+	BufferDesc *buf;
+	ClusterPcmOwnResult result;
+
+	if (!cluster_bufmgr_pcm_own_held_x_revoke_valid(held))
+		return CLUSTER_PCM_OWN_INVALID;
+	buf = GetBufferDescriptor(held->buffer_id);
+	result = cluster_bufmgr_pcm_own_abort_x_revoke(
+		buf, &held->revoking);
+	if (result != CLUSTER_PCM_OWN_OK)
+		return result;
+	cluster_bufmgr_unpin_for_gcs(buf);
+	memset(held, 0, sizeof(*held));
+	return CLUSTER_PCM_OWN_OK;
+}
+
+/* Before the type-17 caller copies or publishes anything, prove without
+ * waiting that every content holder predating REVOKING has drained.  The
+ * caller's raw pin keeps descriptor identity stable; this helper changes no
+ * ownership state and never performs I/O.  BUSY must be returned to the LMON
+ * event loop instead of retried here, because a content-S holder may itself
+ * be waiting for a visibility reply delivered by that loop. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_try_drain_held_x_revoke(
+	const ClusterPcmOwnHeldXRevoke *held)
+{
+	BufferDesc *buf;
+	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
+	LWLock *content_lock;
+	uint32 buf_state;
+
+	if (!cluster_bufmgr_pcm_own_held_x_revoke_valid(held))
+		return CLUSTER_PCM_OWN_INVALID;
+	buf = GetBufferDescriptor(held->buffer_id);
+	content_lock = BufferDescriptorGetContentLock(buf);
+	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+		return CLUSTER_PCM_OWN_BUSY;
+
+	buf_state = LockBufHdr(buf);
+	if (!cluster_pcm_own_snapshot_matches_locked(buf, &held->revoking)
+		|| (buf_state & BM_VALID) == 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state))
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if ((buf_state & BM_IO_IN_PROGRESS) != 0)
+		result = CLUSTER_PCM_OWN_BUSY;
+	else if ((buf_state & BM_IO_ERROR) != 0)
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(content_lock);
+	return result;
+}
+
+/* Post-arm finish.  Success proves the exact N+PI successor before releasing
+ * the long-lived pin.  Failure deliberately leaves the handle live so the
+ * caller must first fail-close and then use the abandon boundary. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
+	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn,
+	ClusterPcmOwnSnapshot *out_retained,
+	ClusterPcmOwnFinishRefusal *out_refusal)
+{
+	BufferDesc *buf;
+	ClusterPcmOwnResult result;
+
+	if (!cluster_bufmgr_pcm_own_held_x_revoke_valid(held))
+		return CLUSTER_PCM_OWN_INVALID;
+	buf = GetBufferDescriptor(held->buffer_id);
+	result = cluster_bufmgr_pcm_own_finish_revoke_retain(
+		buf, &held->revoking, expected_lsn, out_retained, out_refusal);
+	if (result != CLUSTER_PCM_OWN_OK)
+		return result;
+	cluster_bufmgr_unpin_for_gcs(buf);
+	memset(held, 0, sizeof(*held));
+	return CLUSTER_PCM_OWN_OK;
+}
+
+/* The runtime must already be fail-closed.  Do not mutate REVOKING or the
+ * retained pair; release only this call's untracked raw pin.  Snapshot drift
+ * remains CORRUPT but cannot justify leaking the shared refcount. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(
+	ClusterPcmOwnHeldXRevoke *held)
+{
+	BufferDesc *buf;
+	ClusterPcmOwnResult result;
+	uint32 buf_state;
+
+	if (!cluster_bufmgr_pcm_own_held_x_revoke_valid(held))
+		return CLUSTER_PCM_OWN_INVALID;
+	buf = GetBufferDescriptor(held->buffer_id);
+	buf_state = LockBufHdr(buf);
+	result = cluster_pcm_own_snapshot_matches_locked(
+		buf, &held->revoking)
+		&& (buf_state & BM_VALID) != 0
+		&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
+		? CLUSTER_PCM_OWN_OK : CLUSTER_PCM_OWN_CORRUPT;
+	UnlockBufHdr(buf, buf_state);
+	cluster_bufmgr_unpin_for_gcs(buf);
+	memset(held, 0, sizeof(*held));
+	return result;
+}
+
 /* Commit a staged VM/FSM source without leaving a BM_VALID mapping behind.
  * The exclusive mapping lock closes the lookup-to-pin window around the
  * zero-refcount proof.  The immutable A-record already owns the copied bytes,
@@ -15739,6 +16631,126 @@ cluster_bufmgr_pcm_own_finish_revoke_retain(
 
 	if (caller_pinned)
 		cluster_bufmgr_unpin_for_gcs(buf);
+	return result;
+}
+/* SourceSettlementV2 proves only that the exact immutable transfer carrier no
+ * longer needs its REVOKING fence.  It is not durable-current coverage and
+ * therefore must preserve the established N+PI/BM_VALID recovery image even
+ * when the descriptor has no PostgreSQL pin. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
+	const BufferTag *tag, uint64 source_generation)
+{
+	ClusterPcmOwnResult live_result;
+	ClusterPcmOwnResult result = CLUSTER_PCM_OWN_OK;
+	BufferDesc *buf;
+	BufferTag lookup_tag;
+	LWLock *content_lock;
+	LWLock *partition_lock;
+	uint64 committed_generation;
+	uint64 live_token;
+	uint64 retained_token = 0;
+	uint32 hashcode;
+	uint32 flags;
+	uint32 buf_state;
+	int buf_id;
+	bool released = false;
+
+	if (tag == NULL || source_generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (ClusterPcmOwnArray == NULL)
+		return CLUSTER_PCM_OWN_NOT_READY;
+	committed_generation = source_generation + 1;
+	lookup_tag = *tag;
+	hashcode = BufTableHashCode(&lookup_tag);
+	partition_lock = BufMappingPartitionLock(hashcode);
+	LWLockAcquire(partition_lock, LW_SHARED);
+	buf_id = BufTableLookup(&lookup_tag, hashcode);
+	if (buf_id < 0)
+	{
+		LWLockRelease(partition_lock);
+		return CLUSTER_PCM_OWN_STALE;
+	}
+	buf = GetBufferDescriptor(buf_id);
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, tag)
+		|| (buf_state & BM_VALID) == 0
+		|| buf->buffer_type != (uint8) BUF_TYPE_PI
+		|| buf->pcm_state != (uint8) PCM_STATE_N
+		|| cluster_pcm_own_gen_get(buf->buf_id) != committed_generation)
+		result = CLUSTER_PCM_OWN_STALE;
+	else
+	{
+		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
+		flags = cluster_pcm_own_flags_get(buf->buf_id);
+		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
+		if (live_result == CLUSTER_PCM_OWN_CORRUPT)
+			result = live_result;
+		else if (flags == 0)
+			result = CLUSTER_PCM_OWN_STALE;
+		else if (flags != PCM_OWN_FLAG_REVOKING)
+			result = CLUSTER_PCM_OWN_BUSY;
+		else
+			retained_token = live_token;
+	}
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(partition_lock);
+	if (result != CLUSTER_PCM_OWN_OK)
+		return result;
+
+	content_lock = BufferDescriptorGetContentLock(buf);
+	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+		return CLUSTER_PCM_OWN_BUSY;
+	buf_state = LockBufHdr(buf);
+	if (!BufferTagsEqual(&buf->tag, tag)
+		|| buf->buffer_type != (uint8) BUF_TYPE_PI
+		|| buf->pcm_state != (uint8) PCM_STATE_N
+		|| (buf_state & BM_VALID) == 0
+		|| cluster_pcm_own_gen_get(buf->buf_id) != committed_generation)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if ((buf_state
+			  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
+				 | BM_IO_ERROR)) != 0)
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else
+	{
+		live_token = cluster_pcm_own_reservation_token_get(buf->buf_id);
+		flags = cluster_pcm_own_flags_get(buf->buf_id);
+		live_result = cluster_pcm_own_classify_live_flags(flags, live_token);
+		if (live_result == CLUSTER_PCM_OWN_CORRUPT)
+			result = live_result;
+		else if (flags == 0)
+			result = CLUSTER_PCM_OWN_STALE;
+		else if (flags != PCM_OWN_FLAG_REVOKING)
+			result = CLUSTER_PCM_OWN_BUSY;
+		else if (live_token != retained_token)
+			result = CLUSTER_PCM_OWN_STALE;
+		else
+		{
+			result = cluster_pcm_own_revoke_retain_release_exact(
+				buf->buf_id, committed_generation, retained_token);
+			if (result == CLUSTER_PCM_OWN_OK)
+			{
+				/* Revalidate the recovery image shape after the exact token
+				 * release.  No retag, BM_VALID clear, byte copy or PI-discard
+				 * operation is authorized by SourceSettlement. */
+				if (buf->buffer_type != (uint8) BUF_TYPE_PI
+					|| buf->pcm_state != (uint8) PCM_STATE_N
+					|| (buf_state & BM_VALID) == 0)
+					result = CLUSTER_PCM_OWN_CORRUPT;
+				else
+					released = true;
+			}
+		}
+	}
+	UnlockBufHdr(buf, buf_state);
+	LWLockRelease(content_lock);
+	if (released)
+		elog(LOG,
+			 "cluster PCM retained transfer fence released: image=kept-pi buffer=%d rel=%u fork=%d blk=%u gen=%llu token=%llu",
+			 buf->buf_id, tag->relNumber, (int)tag->forkNum, tag->blockNum,
+			 (unsigned long long)committed_generation,
+			 (unsigned long long)retained_token);
 	return result;
 }
 

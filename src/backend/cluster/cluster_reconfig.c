@@ -4189,6 +4189,189 @@ out:
 	return true;
 }
 
+/*
+ * Expose the already-majority-selected cold-formation marker only while the
+ * local reconfiguration state still proves an untouched four-node formation.
+ * The marker generation is qvotec's publication latch: all marker fields are
+ * written before it and the generation is sampled again after the locked
+ * membership/reconfiguration image.  This creates no authority and retains
+ * no evidence outside the caller's stack.
+ */
+bool
+cluster_reconfig_snapshot_initial_clean_formation(
+	ClusterInitialCleanFormationSnapshot *out)
+{
+	ClusterInitialCleanFormationSnapshot snapshot;
+	uint64 bootstrap_incarnation[4] = {0};
+	uint64 bootstrap_generation[4] = {0};
+	uint64 bootstrap_epoch[4] = {0};
+	bool bootstrap_fresh[4] = {false};
+	uint64 bootstrap_seq = 0;
+	uint64 bootstrap_seq_after = 0;
+	uint64 marker_generation;
+	uint64 marker_generation_after;
+	uint64 current_epoch;
+	uint64 self_incarnation;
+	uint32 bootstrap_proven = 0;
+	int node;
+	bool initial_basis;
+	bool valid = false;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ReconfigShmem == NULL || cluster_node_id < 0
+		|| cluster_node_id >= 4)
+		return false;
+
+	marker_generation = pg_atomic_read_u64(
+		&ReconfigShmem->observed_formation_marker_generation);
+	memset(&snapshot, 0, sizeof(snapshot));
+	current_epoch = cluster_epoch_get_current();
+	initial_basis = marker_generation == 0;
+	if (initial_basis) {
+		if (current_epoch != CLUSTER_EPOCH_INITIAL)
+			return false;
+		bootstrap_seq = pg_atomic_read_u64(
+			&ReconfigShmem->observed_bootstrap_seq);
+		if (bootstrap_seq == 0 || (bootstrap_seq & UINT64_C(1)) != 0)
+			return false;
+		pg_read_barrier();
+		if (pg_atomic_read_u64(&ReconfigShmem->bootstrap_in_quorum) == 0)
+			return false;
+		for (node = 0; node < 4; node++) {
+			bootstrap_incarnation[node] = pg_atomic_read_u64(
+				&ReconfigShmem->observed_incarnation[node]);
+			bootstrap_generation[node] = pg_atomic_read_u64(
+				&ReconfigShmem->observed_generation[node]);
+			bootstrap_epoch[node] = pg_atomic_read_u64(
+				&ReconfigShmem->observed_epoch[node]);
+			bootstrap_fresh[node] = pg_atomic_read_u64(
+				&ReconfigShmem->observed_fresh_alive[node]) != 0;
+		}
+		pg_read_barrier();
+		if (pg_atomic_read_u64(
+				&ReconfigShmem->observed_bootstrap_seq) != bootstrap_seq
+			|| pg_atomic_read_u64(
+				&ReconfigShmem->observed_formation_marker_generation) != 0)
+			return false;
+		snapshot.formation_epoch = current_epoch;
+	} else {
+		pg_read_barrier();
+		snapshot.formation_marker_generation = marker_generation;
+		snapshot.formation_epoch = pg_atomic_read_u64(
+			&ReconfigShmem->observed_formation_marker_epoch);
+		snapshot.arbiter_node = pg_atomic_read_u64(
+			&ReconfigShmem->observed_formation_marker_arbiter_node);
+		snapshot.arbiter_incarnation = pg_atomic_read_u64(
+			&ReconfigShmem->observed_formation_marker_arbiter_incarnation);
+		for (node = 0; node < 4; node++)
+			snapshot.admitted_incarnation[node] = pg_atomic_read_u64(
+				&ReconfigShmem->observed_formation_marker_incarnation[node]);
+		pg_read_barrier();
+		if (pg_atomic_read_u64(
+				&ReconfigShmem->observed_formation_marker_generation)
+			!= marker_generation)
+			return false;
+	}
+
+	self_incarnation = cluster_qvotec_get_self_incarnation();
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	if (snapshot.formation_epoch != current_epoch
+		|| ReconfigShmem->last_applied.event_id != 0
+		|| ReconfigShmem->last_applied.reconfig_kind != RECONFIG_KIND_NONE
+		|| pg_atomic_read_u64(&ReconfigShmem->apply_counter) != 0
+		|| pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) != 0
+		|| ReconfigShmem->self_join_admitted != 1
+		|| ReconfigShmem->self_join_failed != 0
+		|| !dead_bitmap_is_zero(ReconfigShmem->pending_join_bitmap)
+		|| !dead_bitmap_is_zero(ReconfigShmem->clean_departed_bitmap)
+		|| !dead_bitmap_is_zero(ReconfigShmem->removed_bitmap)
+		|| !dead_bitmap_is_zero(ReconfigShmem->fast_rejoin_bitmap)
+		|| !cluster_replacement_episode_is_empty(
+			&ReconfigShmem->replacement_episode)
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_request_seq) != 0
+		|| pg_atomic_read_u64(&ReconfigShmem->join_marker_completion_seq) != 0
+		|| (initial_basis
+			&& (pg_atomic_read_u64(
+					&ReconfigShmem->formation_marker_request_seq) != 0
+				|| pg_atomic_read_u64(
+					&ReconfigShmem->formation_marker_completion_seq) != 0
+				|| pg_atomic_read_u64(
+					&ReconfigShmem->formation_marker_max_generation) != 0))
+		|| (!initial_basis
+			&& (snapshot.arbiter_node >= 4
+				|| snapshot.arbiter_incarnation == 0
+				|| snapshot.admitted_incarnation[snapshot.arbiter_node]
+				   != snapshot.arbiter_incarnation)))
+		goto out;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		if ((node < 4) != (cluster_conf_lookup_node(node) != NULL))
+			goto out;
+		if (node < 4) {
+			uint64 admitted_incarnation
+				= cluster_membership_get_last_admitted_incarnation(node);
+
+			if (admitted_incarnation == 0
+				|| cluster_membership_get_state(node)
+				   != CLUSTER_MEMBER_MEMBER
+				|| (!initial_basis
+					&& admitted_incarnation
+					   != snapshot.admitted_incarnation[node]))
+				goto out;
+			if (initial_basis) {
+				snapshot.admitted_incarnation[node]
+					= admitted_incarnation;
+				if (node == cluster_node_id) {
+					if (self_incarnation == 0
+						|| admitted_incarnation != self_incarnation)
+						goto out;
+					bootstrap_proven++;
+				} else if (bootstrap_fresh[node]
+						   && bootstrap_generation[node] > 0
+						   && bootstrap_epoch[node]
+							  == CLUSTER_EPOCH_INITIAL) {
+					if (bootstrap_incarnation[node]
+						!= admitted_incarnation)
+						goto out;
+					bootstrap_proven++;
+				} else if (bootstrap_epoch[node]
+						   > CLUSTER_EPOCH_INITIAL)
+					goto out;
+			}
+			snapshot.members_lo |= UINT64_C(1) << node;
+		} else if (cluster_membership_get_state(node)
+				   == CLUSTER_MEMBER_MEMBER
+			   || (!initial_basis && pg_atomic_read_u64(
+				   &ReconfigShmem->observed_formation_marker_incarnation[node])
+				  != 0))
+			goto out;
+	}
+	if (initial_basis && bootstrap_proven < UINT32_C(3))
+		goto out;
+	marker_generation_after = pg_atomic_read_u64(
+		&ReconfigShmem->observed_formation_marker_generation);
+	bootstrap_seq_after = pg_atomic_read_u64(
+		&ReconfigShmem->observed_bootstrap_seq);
+	if ((!initial_basis && marker_generation_after != marker_generation)
+		|| (initial_basis
+			&& (marker_generation_after != 0
+				|| bootstrap_seq_after != bootstrap_seq
+				|| (bootstrap_seq_after & UINT64_C(1)) != 0
+				|| pg_atomic_read_u64(
+					&ReconfigShmem->bootstrap_in_quorum) == 0))
+		|| cluster_epoch_get_current() != current_epoch)
+		goto out;
+	valid = !initial_basis || cluster_qvotec_in_quorum();
+
+out:
+	LWLockRelease(&ReconfigShmem->lock);
+	if (valid)
+		*out = snapshot;
+	return valid;
+}
+
 void
 cluster_reconfig_lmon_replacement_ready_tick(void)
 {
@@ -9727,6 +9910,15 @@ cluster_reconfig_lmon_snapshot_replacement_admitted(
 	ClusterReplacementEpisode *out_episode pg_attribute_unused(),
 	ClusterReplacementCommitMarkerV3 *out_marker pg_attribute_unused())
 {
+	return false;
+}
+
+bool
+cluster_reconfig_snapshot_initial_clean_formation(
+	ClusterInitialCleanFormationSnapshot *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
 	return false;
 }
 

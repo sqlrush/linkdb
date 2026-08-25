@@ -840,11 +840,81 @@ UT_TEST(test_record_allocator_owns_modifier_debt_outside_lifecycle_locks)
 	free(source);
 }
 
+/* The TT-only segment must become block0-current resident before the allocator
+ * publishes it as the canonical TT binding.  XCUR may not run while the
+ * lifecycle LWLock is held, so the producer is bracketed by an unlock and an
+ * exact current-segment recheck after relock. */
+UT_TEST(test_tt_rollover_publishes_current_before_binding_exposure)
+{
+	char *source = read_undo_record_source();
+	const char *start;
+	const char *end;
+	const char *mark_active;
+	const char *freeze_logical;
+	const char *unlock_for_current;
+	const char *ensure_current;
+	const char *relock;
+	const char *recheck_current;
+	const char *recheck_publication;
+	const char *publish_binding;
+
+	if (source == NULL)
+		return;
+	start = strstr(source, "\ncluster_undo_tt_rollover_locked(");
+	end = start == NULL ? NULL
+		: strstr(start, "\nuint64\ncluster_undo_tt_retention_rollover_count(");
+	mark_active = start == NULL ? NULL
+		: strstr(start, "cluster_undo_segment_mark_active(");
+	freeze_logical = mark_active == NULL ? NULL
+		: strstr(mark_active, "logical.segment_id = new_segment_id;");
+	unlock_for_current = freeze_logical == NULL ? NULL
+		: strstr(freeze_logical,
+			"LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);");
+	ensure_current = unlock_for_current == NULL ? NULL
+		: strstr(unlock_for_current,
+			"cluster_undo_block0_current_live_owner_ensure_resident_exact(");
+	relock = ensure_current == NULL ? NULL
+		: strstr(ensure_current,
+			"LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);");
+	recheck_current = relock == NULL ? NULL
+		: strstr(relock, "cluster_tt_slot_current_segment(node_id)");
+	recheck_publication = recheck_current == NULL ? NULL
+		: strstr(recheck_current,
+			"cluster_undo_block0_current_live_owner_publication_recheck(");
+	publish_binding = recheck_publication == NULL ? NULL
+		: strstr(recheck_publication, "cluster_tt_slot_rollover(");
+
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(mark_active);
+	UT_ASSERT_NOT_NULL(freeze_logical);
+	UT_ASSERT_NOT_NULL(unlock_for_current);
+	UT_ASSERT_NOT_NULL(ensure_current);
+	UT_ASSERT_NOT_NULL(relock);
+	UT_ASSERT_NOT_NULL(recheck_current);
+	UT_ASSERT_NOT_NULL(recheck_publication);
+	UT_ASSERT_NOT_NULL(publish_binding);
+	if (start != NULL && end != NULL && mark_active != NULL
+		&& freeze_logical != NULL
+		&& unlock_for_current != NULL && ensure_current != NULL
+		&& relock != NULL && recheck_current != NULL
+		&& recheck_publication != NULL
+		&& publish_binding != NULL)
+		UT_ASSERT(start < mark_active && mark_active < freeze_logical
+				  && freeze_logical < unlock_for_current
+				  && unlock_for_current < ensure_current
+				  && ensure_current < relock && relock < recheck_current
+				  && recheck_current < recheck_publication
+				  && recheck_publication < publish_binding
+				  && publish_binding < end);
+	free(source);
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);
@@ -866,6 +936,7 @@ main(int argc, char **argv)
 	UT_RUN(test_undo_pool_create_increments_but_reuse_keeps_cardinality);
 	UT_RUN(test_undo_effective_cap_clamps_and_never_falls_below_current);
 	UT_RUN(test_record_allocator_owns_modifier_debt_outside_lifecycle_locks);
+	UT_RUN(test_tt_rollover_publishes_current_before_binding_exposure);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

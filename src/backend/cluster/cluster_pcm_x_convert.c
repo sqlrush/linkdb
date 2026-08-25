@@ -18576,7 +18576,7 @@ cluster_pcm_x_local_writer_revoke_fence_acquire_exact(
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	PcmXRuntimeSnapshot runtime;
 	PcmXLocalTagSlot *tag_slot = NULL;
-	PcmXSlotHeader *raw_slot;
+	PcmXSlotHeader *raw_slot = NULL;
 	PcmXSlotRef existing;
 	PcmXSlotRef tag_ref = { PCM_X_INVALID_SLOT_INDEX, 0 };
 	PcmXDirectoryResult directory_result;
@@ -18633,6 +18633,14 @@ cluster_pcm_x_local_writer_revoke_fence_acquire_exact(
 	if (directory_result != PCM_X_DIRECTORY_NOT_FOUND) {
 		result = pcm_x_queue_result_from_directory(directory_result);
 		fail_closed = result == PCM_X_QUEUE_CORRUPT;
+		goto fence_allocator_done;
+	}
+	/* L3 is an immutable no-new-legacy-allocation latch.  An absent tag after
+	 * that point is an exact negative result for the caller to combine with
+	 * its native Resource-X/BufferDesc lineage; it must never be turned into a
+	 * compatibility shell. */
+	if (pcm_x_legacy_l3_terminal_published(header)) {
+		result = PCM_X_QUEUE_NOT_FOUND;
 		goto fence_allocator_done;
 	}
 	shell_epoch = resource_formation;
@@ -26640,7 +26648,7 @@ pcm_x_legacy_l3_digest_add(uint64 digest, const void *value, Size value_size)
 static bool
 pcm_x_resource_x_predecessor_exact(
 	uint64 record_generation, ResourceXReconfigToken *token_out,
-	uint64 *digest_out)
+	uint64 *digest_out, bool thawed)
 {
 	ResourceXReconfigToken token;
 	ResourceXZeroResidualProof zero_proof;
@@ -26652,8 +26660,11 @@ pcm_x_resource_x_predecessor_exact(
 	if (digest_out != NULL)
 		*digest_out = 0;
 	if (record_generation == 0 || token_out == NULL || digest_out == NULL
-		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
-			&token, &zero_proof, &clean_proof)
+		|| !(thawed
+			 ? cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
+				 &token, &zero_proof, &clean_proof)
+			 : cluster_pcm_lock_resource_x_cutover_proofs_exact(
+				 &token, &zero_proof, &clean_proof))
 		|| token.old_formation == 0 || token.new_formation == 0
 		|| token.freeze_generation == 0
 		|| token.old_formation == token.new_formation || token.reserved != 0
@@ -26858,7 +26869,7 @@ done:
 
 static ClusterSemanticActivationResult
 pcm_x_resource_x_cutover_prerequisite_exact(
-	uint64 record_generation, ClusterSemanticZeroProof *proof)
+	uint64 record_generation, ClusterSemanticZeroProof *proof, bool thawed)
 {
 	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 	ResourceXReconfigToken token;
@@ -26871,7 +26882,7 @@ pcm_x_resource_x_cutover_prerequisite_exact(
 		memset(proof, 0, sizeof(*proof));
 	if (header == NULL || proof == NULL
 		|| !pcm_x_resource_x_predecessor_exact(
-			record_generation, &token, &predecessor_digest))
+			record_generation, &token, &predecessor_digest, thawed))
 		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
 	result = pcm_x_legacy_l3_source_digest_locked(header, &source_digest);
@@ -26900,12 +26911,14 @@ static ClusterSemanticActivationResult
 pcm_x_resource_x_readiness(uint64 expected_generation,
 							 ClusterSemanticActivationRefusal *refusal)
 {
-	ResourceXReconfigToken token;
-	uint64 predecessor_digest;
+	PcmXRuntimeSnapshot runtime = cluster_pcm_x_runtime_snapshot();
 	ClusterSemanticActivationResult result
-		= ClusterPcmXConvertShmem != NULL
-				  && pcm_x_resource_x_predecessor_exact(
-					  expected_generation, &token, &predecessor_digest)
+		= expected_generation != 0 && ClusterPcmXConvertShmem != NULL
+				  && runtime.state == PCM_X_RUNTIME_ACTIVE
+				  && runtime.gate_generation != 0
+				  && runtime.master_session_incarnation != 0
+				  && runtime.master_session_incarnation
+					 == ClusterPcmXConvertShmem->master_session_incarnation
 			  ? CLUSTER_SEMANTIC_ACTIVATION_OK
 			  : CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 
@@ -26924,27 +26937,67 @@ static ClusterSemanticActivationResult
 pcm_x_resource_x_logical_zero(uint64 generation,
 							ClusterSemanticZeroProof *proof)
 {
-	return pcm_x_resource_x_cutover_prerequisite_exact(generation, proof);
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	ResourceXReconfigToken token;
+	ClusterSemanticActivationResult result;
+	uint64 predecessor_digest;
+	bool l3_published;
+
+	if (proof != NULL)
+		memset(proof, 0, sizeof(*proof));
+	if (header == NULL || proof == NULL || generation == 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
+	if (!pcm_x_resource_x_predecessor_exact(
+			generation, &token, &predecessor_digest, false)) {
+		LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+		l3_published = header->legacy_l3_terminal_proof.state
+			== PCM_X_LEGACY_L3_PROOF_PUBLISHED;
+		LWLockRelease(&header->allocator_lock.lock);
+		return l3_published ? CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
+							: CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
+	}
+	result = pcm_x_legacy_l3_publish_exact(
+		generation, &token, predecessor_digest);
+	if (result != CLUSTER_SEMANTIC_ACTIVATION_OK)
+		return result;
+	return pcm_x_resource_x_cutover_prerequisite_exact(
+		generation, proof, false);
 }
 
 static ClusterSemanticActivationResult
 pcm_x_resource_x_transport_zero(uint64 generation,
 							  ClusterSemanticZeroProof *proof)
 {
-	return pcm_x_resource_x_cutover_prerequisite_exact(generation, proof);
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
+	ClusterSemanticActivationResult result;
+	bool l3_published;
+
+	result = pcm_x_resource_x_cutover_prerequisite_exact(
+		generation, proof, false);
+	if (result != CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE || header == NULL)
+		return result;
+	LWLockAcquire(&header->allocator_lock.lock, LW_SHARED);
+	l3_published = header->legacy_l3_terminal_proof.state
+		== PCM_X_LEGACY_L3_PROOF_PUBLISHED;
+	LWLockRelease(&header->allocator_lock.lock);
+	return l3_published ? CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE
+						: CLUSTER_SEMANTIC_ACTIVATION_DEBT_NONZERO;
 }
 
 static ClusterSemanticActivationResult
-pcm_x_resource_x_close_and_publish(uint64 generation)
+pcm_x_resource_x_close_source(uint64 generation)
 {
-	ResourceXReconfigToken token;
-	uint64 predecessor_digest;
+	PcmXRuntimeSnapshot runtime = cluster_pcm_x_runtime_snapshot();
+	PcmXShmemHeader *header = ClusterPcmXConvertShmem;
 
-	if (!pcm_x_resource_x_predecessor_exact(
-			generation, &token, &predecessor_digest))
-		return CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
-	return pcm_x_legacy_l3_publish_exact(
-		generation, &token, predecessor_digest);
+	return generation != 0 && header != NULL
+		&& runtime.state == PCM_X_RUNTIME_ACTIVE
+		&& runtime.gate_generation != 0
+		&& runtime.master_session_incarnation != 0
+		&& runtime.master_session_incarnation
+		   == header->master_session_incarnation
+		? CLUSTER_SEMANTIC_ACTIVATION_OK
+		: CLUSTER_SEMANTIC_ACTIVATION_BAD_STATE;
 }
 
 static ClusterSemanticActivationResult
@@ -26952,18 +27005,28 @@ pcm_x_resource_x_closed_zero(uint64 generation)
 {
 	ClusterSemanticZeroProof proof;
 
-	return pcm_x_resource_x_cutover_prerequisite_exact(generation, &proof);
+	return pcm_x_resource_x_cutover_prerequisite_exact(
+		generation, &proof, false);
+}
+
+static ClusterSemanticActivationResult
+pcm_x_resource_x_open_zero(uint64 generation)
+{
+	ClusterSemanticZeroProof proof;
+
+	return pcm_x_resource_x_cutover_prerequisite_exact(
+		generation, &proof, true);
 }
 
 static const ClusterSemanticActivationCallbackBundle pcm_x_resource_x_callbacks = {
 	.pre_prepare_readiness = pcm_x_resource_x_readiness,
-	.close_source_admission = pcm_x_resource_x_close_and_publish,
+	.close_source_admission = pcm_x_resource_x_close_source,
 	.source_logical_debt_zero = pcm_x_resource_x_logical_zero,
 	.source_transport_zero = pcm_x_resource_x_transport_zero,
 	.prepare_target = pcm_x_resource_x_closed_zero,
 	.apply_target_closed = pcm_x_resource_x_closed_zero,
 	.revert_source_closed = pcm_x_resource_x_closed_zero,
-	.open_target_admission = pcm_x_resource_x_closed_zero,
+	.open_target_admission = pcm_x_resource_x_open_zero,
 };
 
 const ClusterSemanticActivationCallbackBundle *

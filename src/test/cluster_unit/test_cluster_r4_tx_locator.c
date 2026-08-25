@@ -738,6 +738,9 @@ UT_TEST(test_epoch_zero_terminal_census_homogeneous_four_node_foreign_publishes_
 
 	prepare_epoch_zero_terminal_fixture(&admission);
 	test_node_count = 4;
+	/* The homogeneous clean-formation override binds the exact current
+	 * admission generation; it is not limited to the pre-PGSA zero sentinel. */
+	admission.record_generation = UINT64_C(73);
 	locator.uba.raw[0] = (locator.uba.raw[0] & UINT64_C(0xffffffff00000000))
 						 | UINT64_C(257);
 	test_provider_resolution.locator_echo = locator;
@@ -808,7 +811,7 @@ UT_TEST(test_epoch_zero_terminal_census_recovery_refuses_before_provider)
 		&admission, CLUSTER_TX_RESOLVE_RF_DEFERRED);
 }
 
-UT_TEST(test_epoch_zero_terminal_census_nonzero_generation_refuses_before_provider)
+UT_TEST(test_epoch_zero_terminal_census_single_node_nonzero_generation_refuses_before_provider)
 {
 	ClusterTxLocator locator = exact_locator();
 	ClusterSemanticAdmissionToken admission;
@@ -1240,7 +1243,7 @@ main(void)
 	UT_RUN(test_epoch_zero_terminal_census_foreign_locator_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_nonterminal_mode_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_recovery_refuses_before_provider);
-	UT_RUN(test_epoch_zero_terminal_census_nonzero_generation_refuses_before_provider);
+	UT_RUN(test_epoch_zero_terminal_census_single_node_nonzero_generation_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_current_generation_drift_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_storage_disabled_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_zero_to_nonzero_drift_discards_provider_result);

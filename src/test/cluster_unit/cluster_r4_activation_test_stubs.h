@@ -265,6 +265,7 @@ bool cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 require
 											uint32 expected_generation);
 static bool cluster_r4_activation_test_capability_generation_matches;
 static int32 cluster_r4_activation_test_capability_peer = -1;
+static uint64 cluster_r4_activation_test_capability_peer_mask;
 static uint32 cluster_r4_activation_test_capability_required;
 static uint32 cluster_r4_activation_test_capability_expected_generation;
 bool
@@ -273,7 +274,10 @@ cluster_sf_peer_capability_generation_matches(int32 peer_id,
 											uint32 expected_generation)
 {
 	return cluster_r4_activation_test_capability_generation_matches
-		   && peer_id == cluster_r4_activation_test_capability_peer
+		   && (peer_id == cluster_r4_activation_test_capability_peer
+			   || (peer_id >= 0 && peer_id < 64
+				   && (cluster_r4_activation_test_capability_peer_mask
+					   & (UINT64_C(1) << peer_id)) != 0))
 		   && required_capabilities
 			  == cluster_r4_activation_test_capability_required
 		   && expected_generation

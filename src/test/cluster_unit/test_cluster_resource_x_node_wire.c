@@ -37,12 +37,14 @@ UT_TEST(test_wire_kind_and_proof_domains_are_closed)
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_INSTALL_SETTLEMENT, 7);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION, 8);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP, 9);
+	UT_ASSERT_EQ(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2, 10);
+	UT_ASSERT_EQ(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2, 11);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_REMOTE_CARRIER, 1);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_LOCAL_IMAGE, 2);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_DURABLE_STORAGE, 3);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_KIND_MIN, RESOURCE_X_WIRE_ASSERT_X);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_KIND_MAX,
-				 RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
+				 RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_KIND_MIN, RESOURCE_X_PROOF_REMOTE_CARRIER);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_KIND_MAX,
 				 RESOURCE_X_PROOF_DURABLE_STORAGE);
@@ -623,12 +625,27 @@ make_typed_frame(ResourceXWireKind kind)
 		frame.body.local_proof.local_image_proof_crc32c = UINT32_C(0x21222324);
 		frame.body.local_proof.requester_connection_generation = 74;
 		frame.body.local_proof.local_proof_generation = 75;
-	} else if (kind == RESOURCE_X_WIRE_BLOCKED_TO_N) {
+	} else if (kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+			   || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+			   || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2) {
 		frame.blocked_has_remote_proof = true;
 		frame.common.action_node = 7;
-		frame.common.observed_mode = PCM_STATE_X;
+		frame.common.observed_mode
+			= kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+				? PCM_STATE_X : PCM_STATE_N;
 		frame.common.target_mode = PCM_STATE_N;
-		frame.common.flags = RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED;
+		frame.common.flags
+			= kind == RESOURCE_X_WIRE_BLOCKED_TO_N
+				? RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED : 0;
+		if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+			|| kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2) {
+			frame.common.ordered_lane = 0;
+			frame.common.source_candidate = 1;
+			frame.common.retain_pi_if_dirty = 1;
+			frame.common.outcome
+				= kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+					? RESOURCE_X_OUTCOME_NONE : RESOURCE_X_OUTCOME_OK;
+		}
 		for (i = 0; i < RESOURCE_X_SOURCE_FENCE_BYTES; i++)
 			frame.body.blocked_to_n.source_fence[i] = (uint8)(i + 1);
 		frame.body.blocked_to_n.source_carrier_generation = 81;
@@ -707,6 +724,99 @@ make_typed_frame(ResourceXWireKind kind)
 			= RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
 	}
 	return frame;
+}
+
+static void
+assert_source_settlement_encode_rejected(uint8 msg_type,
+									 ResourceXDecodedFrame *frame)
+{
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_PROOF_V1_BYTES];
+	uint16 len = 0;
+
+	UT_ASSERT(!cluster_resource_x_wire_encode(
+		msg_type, frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(reject != RESOURCE_X_WIRE_REJECT_NONE);
+}
+
+UT_TEST(test_source_settlement_request_and_ack_are_direction_exact)
+{
+	ResourceXDecodedFrame request
+		= make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	ResourceXDecodedFrame ack
+		= make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+	ResourceXDecodedFrame decoded;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	uint8 bytes[RESOURCE_X_PROOF_V1_BYTES];
+	uint16 len = 0;
+
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_BLOCK_TO_N, &request, bytes, sizeof(bytes),
+		&len, &reject));
+	UT_ASSERT_EQ(len, RESOURCE_X_PROOF_V1_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.kind, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	UT_ASSERT_EQ(decoded.common.action_node, 7);
+	UT_ASSERT_EQ(decoded.common.authority_generation,
+		request.common.authority_generation);
+	UT_ASSERT_EQ(decoded.body.blocked_to_n.source_carrier_generation,
+		request.body.blocked_to_n.source_carrier_generation);
+	UT_ASSERT(!cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, &decoded, &reject));
+
+	UT_ASSERT(cluster_resource_x_wire_encode(
+		RESOURCE_X_MSG_BLOCKED_TO_N, &ack, bytes, sizeof(bytes),
+		&len, &reject));
+	UT_ASSERT_EQ(len, RESOURCE_X_PROOF_V1_BYTES);
+	UT_ASSERT(cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, &decoded, &reject));
+	UT_ASSERT_EQ(decoded.kind, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+	UT_ASSERT_EQ(decoded.common.outcome, RESOURCE_X_OUTCOME_OK);
+	UT_ASSERT(!cluster_resource_x_wire_decode(
+		RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
+}
+
+UT_TEST(test_source_settlement_truth_tables_fail_closed)
+{
+	ResourceXDecodedFrame frame
+		= make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+
+	frame.common.ordered_lane = 1;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	frame.common.authority_generation = 0;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	frame.common.observed_mode = PCM_STATE_X;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	frame.common.target_mode = PCM_STATE_X;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	frame.common.source_candidate = 0;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	frame.common.retain_pi_if_dirty = 0;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	frame.common.outcome = RESOURCE_X_OUTCOME_OK;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+	frame.common.outcome = RESOURCE_X_OUTCOME_NONE;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCKED_TO_N, &frame);
+	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+	frame.body.blocked_to_n.source_carrier_generation = 0;
+	assert_source_settlement_encode_rejected(
+		RESOURCE_X_MSG_BLOCKED_TO_N, &frame);
 }
 
 UT_TEST(test_short_typed_frames_round_trip)
@@ -945,7 +1055,7 @@ UT_TEST(test_resource_x_capability_has_complete_collision_census)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(26);
 	UT_RUN(test_wire_kind_and_proof_domains_are_closed);
 	UT_RUN(test_reused_message_numbers_remain_exact);
 	UT_RUN(test_common_wire_layout_is_exact);
@@ -970,6 +1080,8 @@ main(void)
 	UT_RUN(test_typed_body_validation_is_fail_closed);
 	UT_RUN(test_ingress_semantic_mutations_with_valid_crc_are_rejected);
 	UT_RUN(test_resource_x_capability_has_complete_collision_census);
+	UT_RUN(test_source_settlement_request_and_ack_are_direction_exact);
+	UT_RUN(test_source_settlement_truth_tables_fail_closed);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

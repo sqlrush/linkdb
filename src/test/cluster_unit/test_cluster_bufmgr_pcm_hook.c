@@ -72,6 +72,7 @@ UT_DEFINE_GLOBALS();
 int cluster_node_id = 0;
 int NBuffers = 0;
 int cluster_injection_armed_count = 0;
+int cluster_gcs_reply_timeout_ms = 1;
 bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
 
 uint64
@@ -416,6 +417,7 @@ bool
 cluster_gcs_local_master_read_image_and_wait(struct BufferDesc *buf pg_attribute_unused(),
 											 const PcmAuthoritySnapshot *expected
 												 pg_attribute_unused(),
+											 bool force_one_shot pg_attribute_unused(),
 											 bool *out_retry_denied pg_attribute_unused())
 {
 	abort();

@@ -263,12 +263,14 @@ cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset, 
 	bool root_available;
 	volatile bool current_active = false;
 	volatile bool pin_held = false;
+	bool target_side;
 
 	Assert(slot_offset < TT_SLOTS_PER_SEGMENT);
 	Assert(TransactionIdIsValid(xid));
 	Assert(SCN_VALID(commit_scn));
 	if (admission == NULL || successor_out == NULL || !admission->entered
-		|| admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
+		|| (admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
+			&& admission->side != CLUSTER_SEMANTIC_TARGET_SIDE)
 		|| cluster_node_id < 0 || owner != (uint8)(cluster_node_id + 1))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
@@ -280,12 +282,20 @@ cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset, 
 	memset(&final_root, 0, sizeof(final_root));
 	memset(&pin, 0, sizeof(pin));
 	pin.slot = -1;
-	root_available
-		= cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-			admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &root);
+	target_side = admission->side == CLUSTER_SEMANTIC_TARGET_SIDE;
+	root_available = target_side
+		? cluster_semantic_activation_resolve_shared_undo_root(
+			  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &root)
+		: cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+			  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &root);
 
-	step = cluster_undo_block0_current_acquire_begin_live_owner_source(
-		&key, cluster_ges_request_timeout_ms, admission, &guard, &current_failure);
+	step = target_side
+		? cluster_undo_block0_current_acquire_begin_live_owner_target(
+			  &key, cluster_ges_request_timeout_ms, admission, &guard,
+			  &current_failure)
+		: cluster_undo_block0_current_acquire_begin_live_owner_source(
+			  &key, cluster_ges_request_timeout_ms, admission, &guard,
+			  &current_failure);
 	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
@@ -344,9 +354,13 @@ cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset, 
 						(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 						 errmsg("cannot commit a transaction: nonresident undo block-zero state is not strictly empty"),
 						 errdetail("segment=%u result=%d", segment_id, (int)result)));
-		} else if (!cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-					 admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id,
-					 &final_root)
+		} else if (!(target_side
+					 ? cluster_semantic_activation_resolve_shared_undo_root(
+						   admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
+						   segment_id, &final_root)
+					 : cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+						   admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
+						   segment_id, &final_root))
 				   || !cluster_undo_block0_root_matches(&root, &final_root)) {
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),

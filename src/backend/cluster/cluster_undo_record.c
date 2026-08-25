@@ -89,6 +89,7 @@
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_extent.h"	  /* spec-3.18 D3 per-txn extent */
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D1 read/write-through */
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h" /* spec-3.18 D2a XLOG_UNDO_BLOCK_WRITE */
@@ -2237,6 +2238,9 @@ uint32
 cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at_hard_cap)
 {
 	uint8 owner_instance = (uint8)(node_id + 1);
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0LiveOwnerPublication publication;
+	ClusterUndoBlock0Result current_result;
 	uint32 cur;
 	uint32 new_segment_id = 0; /* assigned in PG_TRY; init silences cppcheck uninitvar */
 
@@ -2291,6 +2295,37 @@ cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at
 		/* step 1b: activation refused on a fresh segment — its own bucket (the
 		 * extend/hard-cap split above cannot see this failure). */
 		pg_atomic_fetch_add_u64(&UndoRecordShared->tt_rollover_fail_activate_count, 1);
+		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		cluster_undo_cleaner_wakeup();
+		return 0;
+	}
+
+	/* Candidate-2 current publication can acquire GES/XCUR and therefore
+	 * cannot run while lifecycle_lock is held.  The new segment is not yet
+	 * visible as the allocator's canonical TT binding, so release the local
+	 * lifecycle lock, publish through the sole live-owner producer, then
+	 * relock and revalidate before cluster_tt_slot_rollover exposes it. */
+	logical.owner_instance = owner_instance;
+	logical.segment_id = new_segment_id;
+	memset(&publication, 0, sizeof(publication));
+	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+	current_result = cluster_undo_block0_current_live_owner_ensure_resident_exact(
+		&logical, 10000, &publication);
+	LWLockAcquire(&UndoRecordShared->lifecycle_lock.lock, LW_EXCLUSIVE);
+
+	/* A peer may have completed a different exact rollover while XCUR was in
+	 * flight.  Adopt that already-published canonical segment and leave this
+	 * unused ACTIVE segment unbound; never overwrite the winner. */
+	cur = cluster_tt_slot_current_segment(node_id);
+	if (cur != 0 && cur != old_segment_id) {
+		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
+		return cur;
+	}
+	if (cur != old_segment_id || current_result != CLUSTER_UNDO_BLOCK0_OK
+		|| cluster_undo_segment_read_state(new_segment_id, owner_instance)
+			   != (uint8)SEGMENT_ACTIVE
+		|| !cluster_undo_block0_current_live_owner_publication_recheck(
+			&publication)) {
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		cluster_undo_cleaner_wakeup();
 		return 0;
