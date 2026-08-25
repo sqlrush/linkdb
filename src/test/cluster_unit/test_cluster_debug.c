@@ -3367,6 +3367,15 @@ cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unus
 	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 }
 
+ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(
+	uint16 origin_thread pg_attribute_unused(),
+	int timeout_ms pg_attribute_unused(), ClusterFormationWitnessV1 **out)
+{
+	*out = NULL;
+	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+}
+
 void
 cluster_formation_witness_destroy(ClusterFormationWitnessV1 **witness)
 {
@@ -3399,6 +3408,14 @@ cluster_formation_classification_revalidate_nowait(
 	const ClusterFormationSnapshotV1 *snapshot pg_attribute_unused())
 {
 	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+}
+
+bool
+cluster_formation_snapshot_matches_v1(
+	const ClusterFormationSnapshotV1 *expected pg_attribute_unused(),
+	const ClusterFormationSnapshotV1 *observed pg_attribute_unused())
+{
+	return false;
 }
 
 bool
