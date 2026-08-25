@@ -32,6 +32,12 @@ static bool cache_publish_ok;
 static ClusterFenceAuthorityCacheResult cache_result;
 static uint64 cache_sequence;
 
+/* Added to the product header by the GREEN; keep the RED link-exact rather
+ * than relying on an implicit declaration. */
+extern ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(
+	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out);
+
 void *palloc(Size size) { return malloc(size); }
 void pfree(void *pointer) { free(pointer); }
 void
@@ -420,15 +426,75 @@ UT_TEST(test_live_witness_requires_same_stable_member_formation)
 	UT_ASSERT_NULL(witness);
 }
 
+UT_TEST(test_recovery_control_witness_is_initial_only_and_survives_gate_open)
+{
+	ClusterFormationWitnessV1 *witness = NULL;
+	ClusterFenceAuthorityProof authority;
+	ClusterFormationSnapshotV1 classification;
+	uint16 origin_thread = 0;
+
+	build_ready_fixture();
+	memset(snapshots, 0, sizeof(snapshots));
+	snapshots[0].membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	snapshots[0].membership.last_admitted_incarnation[0] = UINT64_C(55);
+	snapshots[1] = snapshots[0];
+	memset(&durable_proof, 0, sizeof(durable_proof));
+	durable_proof.marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+	durable_proof.marker.version = CLUSTER_FENCE_MARKER_VERSION;
+	durable_proof.marker.issuer_node_id = CLUSTER_FENCE_BASELINE_INITIAL_ISSUER;
+	durable_proof.marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+	durable_proof.agree_disk_count = 2;
+	durable_proof.total_disk_count = 3;
+	snapshot_call = 0;
+
+	/* The ordinary live contract remains closed while the write admission byte
+	 * is zero; only the phase-3 recovery-control builder may accept this shape. */
+	UT_ASSERT_EQ(cluster_formation_witness_build_live_wait(1, 1, &witness),
+				 CLUSTER_FORMATION_WITNESS_UNSTABLE);
+	UT_ASSERT_NULL(witness);
+	snapshots[0].local_epoch = 1;
+	snapshots[1] = snapshots[0];
+	snapshot_call = 0;
+	UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(
+				 1, 1, &witness), CLUSTER_FORMATION_WITNESS_UNSTABLE);
+	UT_ASSERT_NULL(witness);
+	snapshots[0].local_epoch = UINT64_C(0);
+	snapshots[1] = snapshots[0];
+	snapshot_call = 0;
+	UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(
+				 1, 10, &witness), CLUSTER_FORMATION_WITNESS_READY);
+	UT_ASSERT_NOT_NULL(witness);
+	UT_ASSERT(cluster_formation_witness_copy_classification_v1(
+		witness, &origin_thread, &authority, &classification));
+	UT_ASSERT_EQ(origin_thread, 1);
+
+	/* StartupXLOG later opens the exact same formation's write gate.  That one
+	 * monotone edge keeps the control binding current; unrelated drift does not. */
+	snapshots[0].self_join_admitted = 1;
+	snapshots[1].self_join_admitted = 1;
+	snapshot_call = 0;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(
+				 origin_thread, &authority, &classification),
+				 CLUSTER_FORMATION_WITNESS_READY);
+	snapshots[0].membership.last_admitted_incarnation[0]++;
+	snapshots[1] = snapshots[0];
+	snapshot_call = 0;
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(
+				 origin_thread, &authority, &classification),
+				 CLUSTER_FORMATION_WITNESS_UNSTABLE);
+	cluster_formation_witness_destroy(&witness);
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(test_witness_bad_arguments_leave_null);
 	UT_RUN(test_witness_ready_borrow_revalidate_destroy);
 	UT_RUN(test_witness_unstable_or_unavailable_never_installs_handle);
 	UT_RUN(test_witness_revalidate_maps_stale_and_unavailable);
 	UT_RUN(test_live_witness_requires_same_stable_member_formation);
+	UT_RUN(test_recovery_control_witness_is_initial_only_and_survives_gate_open);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

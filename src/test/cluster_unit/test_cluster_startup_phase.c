@@ -344,6 +344,8 @@ static int phase_test_lms_start_calls = 0;
 static uint8 phase_test_formation_epoch = 1;
 static bool phase_test_expire_formation_during_lms = false;
 static bool phase_test_formation_expired = false;
+static int phase_test_live_formation_calls = 0;
+static int phase_test_recovery_control_formation_calls = 0;
 /* RF-ROOT P6 (L4/L5 wiring): steady-state defaults for the membership /
  * reconfig / GRD accessor stubs added below. */
 static bool phase_test_membership_member = true;
@@ -494,6 +496,25 @@ cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unus
 									  int timeout_ms pg_attribute_unused(),
 									  ClusterFormationWitnessV1 **out)
 {
+	phase_test_live_formation_calls++;
+	record_phase4_event('F');
+	if (phase_test_formation_unavailable_attempts > 0) {
+		phase_test_formation_unavailable_attempts--;
+		phase4_test_now += phase_test_formation_unavailable_advance_us;
+		*out = NULL;
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	}
+	*out = phase_test_formation_result == CLUSTER_FORMATION_WITNESS_READY
+		? (ClusterFormationWitnessV1 *)(uintptr_t)1 : NULL;
+	return phase_test_formation_result;
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(
+	uint16 origin_thread pg_attribute_unused(), int timeout_ms pg_attribute_unused(),
+	ClusterFormationWitnessV1 **out)
+{
+	phase_test_recovery_control_formation_calls++;
 	record_phase4_event('F');
 	if (phase_test_formation_unavailable_attempts > 0) {
 		phase_test_formation_unavailable_attempts--;
@@ -547,6 +568,15 @@ cluster_formation_classification_revalidate_nowait(
 		&& snapshot->reserved[0] == phase_test_formation_epoch
 		? CLUSTER_FORMATION_WITNESS_READY
 		: CLUSTER_FORMATION_WITNESS_UNSTABLE;
+}
+
+bool
+cluster_formation_snapshot_matches_v1(
+	const ClusterFormationSnapshotV1 *expected,
+	const ClusterFormationSnapshotV1 *observed)
+{
+	return expected != NULL && observed != NULL
+		&& memcmp(expected, observed, sizeof(*expected)) == 0;
 }
 
 bool
@@ -745,6 +775,9 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_formation_epoch = 1;
 	phase_test_expire_formation_during_lms = false;
 	phase_test_formation_expired = false;
+	phase_test_live_formation_calls = 0;
+	phase_test_recovery_control_formation_calls = 0;
+	phase_test_self_join_admitted = true;
 	cluster_enabled = true;
 	cluster_wal_threads_dir = formed_registry ? "/rf-a1/formed" : NULL;
 	cluster_phase_shmem_init();
@@ -956,6 +989,8 @@ UT_TEST(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn)
 	UT_ASSERT(cluster_recovery_authority_is_current());
 	UT_ASSERT(!cluster_serving_ready_is_current());
 	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
+	UT_ASSERT_EQ(phase_test_live_formation_calls, 0);
 
 	cluster_run_phase4_sequence();
 
@@ -964,6 +999,32 @@ UT_TEST(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn)
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
 				 (int)CLUSTER_AUTHORITY_SERVING_READY);
 	UT_ASSERT(cluster_serving_ready_is_current());
+}
+
+UT_TEST(test_rf_a1_phase4_waits_for_stripe_admission_before_serving)
+{
+	bool caught_fatal = false;
+	int saved_timeout = cluster_phase4_timeout;
+
+	reset_phase_service_fixture(true);
+	phase_test_self_join_admitted = false;
+	cluster_phase4_timeout = 1;
+	cluster_run_startup_sequence();
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_RECOVERY_READY);
+
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_phase4_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	cluster_phase4_timeout = saved_timeout;
+
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT(strchr(phase4_events, 'W') == NULL);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_RECOVERY_READY);
 }
 
 
@@ -1347,7 +1408,7 @@ UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(26);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -1358,6 +1419,7 @@ main(void)
 	UT_RUN(test_phase_shmem_register_init_linkable);
 	UT_RUN(test_rf_a1_no_pgproc_phase_reads_never_block);
 	UT_RUN(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn);
+	UT_RUN(test_rf_a1_phase4_waits_for_stripe_admission_before_serving);
 	UT_RUN(test_rf_a2_serving_does_not_consume_recovery_duty_cache);
 	UT_RUN(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);

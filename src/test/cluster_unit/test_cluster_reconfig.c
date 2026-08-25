@@ -1001,13 +1001,15 @@ cluster_grd_join_view_rebuilt(void)
 void
 cluster_grd_inc_offpath_crash_rejoin_fenced(void)
 {}
-/* spec-6.15 D5b: stripe joiner gate (not exercised here) — PROCEED so
- * the vanilla membership legs run unchanged. */
+/* spec-6.15 D5b: stripe joiner gate.  Most tests keep the legacy PROCEED
+ * fixture; the AD-023 cold-boot ordering test drives the HOLD edge. */
 #include "cluster/cluster_xid_stripe_boot.h"
+static ClusterXidStripeJoinVerdict ut_xid_stripe_verdict
+	= CLUSTER_XID_STRIPE_JOIN_PROCEED;
 ClusterXidStripeJoinVerdict
 cluster_xid_stripe_join_gate(bool self_may_seed pg_attribute_unused())
 {
-	return CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	return ut_xid_stripe_verdict;
 }
 /* pgstat backend global referenced by pgstat_report_wait_start/end (the D4 join
  * marker submit wait); provide a file-static fake so the standalone link works. */
@@ -1056,6 +1058,7 @@ ut_reset_mocks(void)
 	ut_offpath_boot_decided = true;
 	ut_prior_unclean_death = false;
 	ut_join_view_rebuilt = true;
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
 	ut_self_member_callback_seen = false;
 	ut_self_member_callback_gate = CLUSTER_JOIN_GATE_ALLOW;
 	ut_dead_generation = 0;
@@ -3200,6 +3203,63 @@ UT_TEST(test_cold_bootstrap_records_exact_floor_before_opening_gate)
 					 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
 
 		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(
+			cluster_membership_get_last_admitted_incarnation(cluster_node_id),
+			UINT64_C(61));
+		UT_ASSERT_EQ(state->self_join_admitted, 1);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+/* AD-023 recovery-control/serving split: a pre-StartupXLOG stripe HOLD must
+ * not leave phase 3 without an exact MEMBER formation.  The floor is current,
+ * but the ordinary write byte stays closed until the unchanged stripe gate
+ * later returns PROCEED. */
+UT_TEST(test_cold_bootstrap_stripe_hold_publishes_control_member_only)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		ut_in_quorum_value = true;
+		ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61),
+									 UINT64_C(61));
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_MEMBER);
+		UT_ASSERT_EQ(
+			cluster_membership_get_last_admitted_incarnation(cluster_node_id),
+			UINT64_C(61));
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+
+		/* HOLD remains idempotent and cannot latch the one-shot decision. */
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_MEMBER);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_MEMBER);
 		UT_ASSERT_EQ(
 			cluster_membership_get_last_admitted_incarnation(cluster_node_id),
 			UINT64_C(61));
@@ -5919,7 +5979,7 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 int
 main(void)
 {
-	UT_PLAN(98);
+	UT_PLAN(99);
 
 	UT_RUN(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap);
 
@@ -6010,6 +6070,7 @@ main(void)
 	UT_RUN(test_ordinary_bootstrap_cannot_open_replacement_admitted_member);
 	UT_RUN(test_nonempty_invalid_replacement_episode_blocks_ordinary_openers);
 	UT_RUN(test_cold_bootstrap_records_exact_floor_before_opening_gate);
+	UT_RUN(test_cold_bootstrap_stripe_hold_publishes_control_member_only);
 	UT_RUN(test_offpath_member_requires_decided_boot_and_exact_current_floor);
 	UT_RUN(test_ordinary_self_floor_drift_and_high_water_fail_closed_then_retry);
 

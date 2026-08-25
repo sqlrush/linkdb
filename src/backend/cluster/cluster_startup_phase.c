@@ -288,10 +288,11 @@ cluster_serving_formation_current(const ClusterAuthorityBindingLocal *binding)
 {
 	ClusterFormationSnapshotV1 current;
 
-	return binding != NULL
+	return binding != NULL && cluster_reconfig_self_join_admitted()
 		&& cluster_reconfig_capture_formation_snapshot_v1(
 			   binding->origin_thread, &current)
-		&& memcmp(&current, &binding->formation, sizeof(current)) == 0;
+		&& cluster_formation_snapshot_matches_v1(
+			&binding->formation, &current);
 }
 
 /* The formation and GRD seal may be replaced only by LMON after the ordinary
@@ -700,7 +701,7 @@ cluster_authority_readiness_publish_serving(void)
 		&& admitted_incarnation == binding.boot_incarnation
 		&& lms_generation == binding.lms_generation && lms_ready
 		&& formation_result == CLUSTER_FORMATION_WITNESS_READY
-		&& grd_current;
+		&& grd_current && cluster_reconfig_self_join_admitted();
 	if (!valid) {
 		ereport(LOG,
 				(errmsg("cluster phase 4: serving authority diagnostic"),
@@ -779,7 +780,8 @@ cluster_authority_serving_rebind_lmon(void)
 	capture_ok = cluster_reconfig_capture_formation_snapshot_v1(
 		binding.origin_thread, &current);
 	moved = capture_ok
-		&& memcmp(&current, &binding.formation, sizeof(current)) != 0;
+		&& !cluster_formation_snapshot_matches_v1(
+			&binding.formation, &current);
 	if (!gen_cur || !capture_ok || !moved)
 		return false;
 
@@ -841,7 +843,8 @@ cluster_authority_serving_rebind_leaver(void)
 	if (!cluster_serving_generation_current(&binding)
 		|| !cluster_reconfig_capture_formation_snapshot_v1(
 			   binding.origin_thread, &current)
-		|| memcmp(&current, &binding.formation, sizeof(current)) == 0) {
+		|| cluster_formation_snapshot_matches_v1(
+			&binding.formation, &current)) {
 		return false;
 	}
 
@@ -1388,7 +1391,7 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline,
 		attempt_ms = cluster_phase_remaining_budget_ms(deadline, 5000);
 		if (attempt_ms > 100)
 			attempt_ms = 100;
-		result = cluster_formation_witness_build_live_wait(
+		result = cluster_formation_witness_build_recovery_control_wait(
 			thread_id, attempt_ms, &witness);
 		if (result == CLUSTER_FORMATION_WITNESS_READY) {
 			if (!cluster_formation_witness_copy_classification_v1(
@@ -1986,6 +1989,24 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 				fail_ctx->errmsg = "cluster phase 4: recovery LMS authority is unavailable";
 				fail_ctx->errhint = "Restart after the phase-3 LMS generation and authority "
 									"binding are available.";
+				return PHASE_RUN_FATAL;
+			}
+			pg_usleep(20000L);
+		}
+		/* AD-023 recovery-control authority is sufficient for StartupXLOG,
+		 * never for ordinary service.  LMON keeps retrying the original
+		 * stripe join gate after recovery; wait for that exact admission byte
+		 * before issuing the existing LMS SERVING request. */
+		for (;;)
+		{
+			if (cluster_reconfig_self_join_admitted())
+				break;
+			if (GetCurrentTimestamp() >= phase4_deadline)
+			{
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 4: xid stripe admission is unavailable";
+				fail_ctx->errhint = "Recovery control authority cannot publish ordinary "
+								"service until the post-recovery xid stripe floor is durable.";
 				return PHASE_RUN_FATAL;
 			}
 			pg_usleep(20000L);

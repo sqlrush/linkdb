@@ -5579,6 +5579,7 @@ cluster_reconfig_joiner_self_tick(void)
 
 			if (sv != CLUSTER_XID_STRIPE_JOIN_PROCEED) {
 				static bool stripe_boot_logged = false;
+				uint64 control_incarnation = 0;
 
 				if (!stripe_boot_logged) {
 					stripe_boot_logged = true;
@@ -5599,10 +5600,22 @@ cluster_reconfig_joiner_self_tick(void)
 										"resolved",
 										cluster_node_id)));
 				}
+				/* AD-023: HOLD may publish the exact current MEMBER floor for
+				 * recovery control, but must keep ordinary writes closed.  REFUSE
+				 * retains the original fail-closed demotion. */
+				if (sv == CLUSTER_XID_STRIPE_JOIN_HOLD)
+					control_incarnation = cluster_qvotec_get_self_incarnation();
 				LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-				cluster_write_fence_authority_cache_invalidate();
 				ReconfigShmem->self_join_admitted = 0;
-				cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+				ReconfigShmem->self_join_failed = 0;
+				ReconfigShmem->self_join_deadline_us = 0;
+				if (sv != CLUSTER_XID_STRIPE_JOIN_HOLD
+					|| !cluster_reconfig_publish_self_current_floor_locked(
+						cluster_node_id, control_incarnation)) {
+					cluster_write_fence_authority_cache_invalidate();
+					cluster_membership_set_state(
+						cluster_node_id, CLUSTER_MEMBER_JOINING);
+				}
 				LWLockRelease(&ReconfigShmem->lock);
 				return;
 			}
@@ -6266,6 +6279,21 @@ cluster_reconfig_lmon_tick(void)
 		else if (cluster_reconfig_is_local_admitted_replacement(
 				 &ReconfigShmem->replacement_episode))
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
+		/* AD-023 recovery-control formation: joiner_self_tick may have
+		 * published this exact epoch-0 MEMBER floor while the xid-stripe gate
+		 * is still HOLD.  Preserve only that same retryable, write-closed
+		 * identity; the process-local bootstrap decision remains unlatched. */
+		else if (cluster_online_join && !joiner_gate_decided
+				 && !ReconfigShmem->self_join_admitted
+				 && !ReconfigShmem->self_join_failed
+				 && cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL
+				 && cluster_reconfig_bootstrap_quorum_at_initial()
+				 && cluster_membership_get_state(self_id)
+						== CLUSTER_MEMBER_MEMBER
+				 && cluster_reconfig_publish_self_current_floor_locked(
+					 self_id, self_floor_incarnation)) {
+			/* Exact helper retained MEMBER; ordinary writes remain closed. */
+		}
 		else if ((ReconfigShmem->self_join_admitted
 				  && !ReconfigShmem->self_join_failed
 				  && (cluster_online_join
