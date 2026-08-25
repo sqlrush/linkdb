@@ -9165,6 +9165,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
 	ClusterPcmResourceXBootstrapRound *round;
 	struct GrdEntry *entry;
 	uint64 committed_generation;
+	bool phase_matches = false;
 	bool matches = false;
 
 	if (!resource_x_assertion_valid(assertion)
@@ -9181,15 +9182,25 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
 
 	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
 	round = &entry->resource_x_bootstrap_round;
-	matches = round->phase
-			  == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
-		&& pcm_resource_x_bootstrap_round_identity_matches(
+	if (pcm_resource_x_bootstrap_round_identity_matches(
 			round, assertion, current_master_node, resource_formation,
 			master_session_incarnation, r4_record_generation,
 			requester_sender_connection_generation,
 			master_ingress_connection_generation, retry_slice_us,
 			direct_init_ownership_generation,
-			direct_init_reservation_token)
+			direct_init_reservation_token)) {
+		phase_matches = round->phase
+			== RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED;
+		if (!phase_matches
+			&& round->phase
+				== RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+			phase_matches
+				= pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+					entry, round, &round->terminal_ref,
+					master_session_incarnation, r4_record_generation,
+					committed_generation);
+	}
+	matches = phase_matches
 		&& round->request.assertion_sequence != 0
 		&& round->request.assertion_sequence != UINT64_MAX
 		&& round->request.assertion_sequence == round->highest_attempt_floor

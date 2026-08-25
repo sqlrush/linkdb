@@ -3516,6 +3516,23 @@ UT_TEST(test_resource_x_bootstrap_direct_init_cached_x_consumes_same_round_t3_ha
 	UT_ASSERT(cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
 		&expected_ref, 31, 77, 8));
 
+	/* BufferDesc and the requester round are separate lock domains.  A
+	 * foreground direct initializer may have sampled this exact pre-T3 X
+	 * sidecar immediately before the DATA worker published the terminal
+	 * cover.  The cover must make that stale-in-time sample waitable so the
+	 * caller reaches the existing BufferDesc re-probe; it must not grant X
+	 * from the sample itself. */
+	inflight.writer_activation_token = 5;
+	inflight.resource_x_activation_generation = 1;
+	UT_ASSERT(cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
+		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50),
+		7, 5, &inflight));
+	inflight.generation = 9;
+	UT_ASSERT(!cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
+		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50),
+		7, 5, &inflight));
+	inflight.generation = 8;
+
 	memset(&activation, 0, sizeof(activation));
 	activation.ownership_generation = 8;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_requester_activate_exact(
