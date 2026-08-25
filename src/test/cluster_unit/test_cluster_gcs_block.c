@@ -2132,8 +2132,8 @@ UT_TEST(test_resource_x_kind9_ingress_is_target_native_and_no_fallback)
 {
 	static const char *const native_local_proof_contract[] = {
 		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
-		"before.pcm_state == (uint8)PCM_STATE_S",
-		"before.pcm_state == (uint8)PCM_STATE_X",
+		"before.pcm_state != (uint8)PCM_STATE_S",
+		"before.pcm_state != (uint8)PCM_STATE_X",
 		"cluster_bufmgr_copy_block_for_r4_cr(",
 		"cluster_bufmgr_pcm_own_snapshot_by_tag(",
 		"memcmp(&before, &after, sizeof(before)) != 0",
