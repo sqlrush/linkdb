@@ -346,6 +346,7 @@ static bool phase_test_expire_formation_during_lms = false;
 static bool phase_test_formation_expired = false;
 static int phase_test_live_formation_calls = 0;
 static int phase_test_recovery_control_formation_calls = 0;
+static bool phase_test_live_refreshes_classification = false;
 /* RF-ROOT P6 (L4/L5 wiring): steady-state defaults for the membership /
  * reconfig / GRD accessor stubs added below. */
 static bool phase_test_membership_member = true;
@@ -498,6 +499,8 @@ cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unus
 {
 	phase_test_live_formation_calls++;
 	record_phase4_event('F');
+	if (phase_test_live_refreshes_classification)
+		phase_test_classification_current = true;
 	if (phase_test_formation_unavailable_attempts > 0) {
 		phase_test_formation_unavailable_attempts--;
 		phase4_test_now += phase_test_formation_unavailable_advance_us;
@@ -777,6 +780,7 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_formation_expired = false;
 	phase_test_live_formation_calls = 0;
 	phase_test_recovery_control_formation_calls = 0;
+	phase_test_live_refreshes_classification = false;
 	phase_test_self_join_admitted = true;
 	cluster_enabled = true;
 	cluster_wal_threads_dir = formed_registry ? "/rf-a1/formed" : NULL;
@@ -994,8 +998,9 @@ UT_TEST(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn)
 
 	cluster_run_phase4_sequence();
 
-	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrGDdWlEESs");
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrGDdFXWlEESs");
 	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+	UT_ASSERT_EQ(phase_test_live_formation_calls, 1);
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
 				 (int)CLUSTER_AUTHORITY_SERVING_READY);
 	UT_ASSERT(cluster_serving_ready_is_current());
@@ -1023,8 +1028,38 @@ UT_TEST(test_rf_a1_phase4_waits_for_stripe_admission_before_serving)
 
 	UT_ASSERT(caught_fatal);
 	UT_ASSERT(strchr(phase4_events, 'W') == NULL);
+	UT_ASSERT_EQ(phase_test_live_formation_calls, 0);
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
 				 (int)CLUSTER_AUTHORITY_RECOVERY_READY);
+}
+
+
+UT_TEST(test_rf_a1_phase4_refreshes_expired_recovery_proof_before_serving)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_RECOVERY_READY);
+
+	/* The phase-3 cache can expire while StartupXLOG and the exact stripe
+	 * admission complete.  A post-admission live reread must refresh the same
+	 * durable proof before ASSERTING ordinary LMS service. */
+	phase_test_classification_current = false;
+	phase_test_live_refreshes_classification = true;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_phase4_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+
+	UT_ASSERT(!caught_fatal);
+	UT_ASSERT_EQ(phase_test_live_formation_calls, 1);
+	UT_ASSERT(strstr(phase4_events, "DdFXW") != NULL);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_SERVING_READY);
 }
 
 
@@ -1408,7 +1443,7 @@ UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(27);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -1420,6 +1455,7 @@ main(void)
 	UT_RUN(test_rf_a1_no_pgproc_phase_reads_never_block);
 	UT_RUN(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn);
 	UT_RUN(test_rf_a1_phase4_waits_for_stripe_admission_before_serving);
+	UT_RUN(test_rf_a1_phase4_refreshes_expired_recovery_proof_before_serving);
 	UT_RUN(test_rf_a2_serving_does_not_consume_recovery_duty_cache);
 	UT_RUN(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);

@@ -1428,6 +1428,55 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline,
 	return false;
 }
 
+/*
+ * Refresh the finite durable-marker cache after StartupXLOG and the exact
+ * xid-stripe admission have completed.  The phase-3 recovery-control proof
+ * is an immutable authority binding, not a timeless cache lease: ordinary
+ * service may reuse it only after a fresh live witness proves the same
+ * marker and the same formation (apart from the frozen 0 -> 1 admission
+ * edge).  This does not replace the binding or create a second authority.
+ */
+static ClusterFormationWitnessResult
+cluster_phase4_refresh_serving_formation(int timeout_ms)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterFormationWitnessV1 *witness = NULL;
+	ClusterFenceAuthorityProof fresh_authority;
+	ClusterFormationSnapshotV1 fresh_formation;
+	ClusterFormationWitnessResult result;
+	uint16 fresh_origin_thread = 0;
+
+	if (timeout_ms <= 0 || !cluster_authority_binding_copy(&binding)
+		|| binding.state != CLUSTER_AUTHORITY_RECOVERY_READY
+		|| !cluster_reconfig_self_join_admitted())
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+
+	result = cluster_formation_witness_build_live_wait(
+		binding.origin_thread, timeout_ms, &witness);
+	if (result == CLUSTER_FORMATION_WITNESS_READY) {
+		if (!cluster_formation_witness_copy_classification_v1(
+				witness, &fresh_origin_thread, &fresh_authority,
+				&fresh_formation))
+			result = CLUSTER_FORMATION_WITNESS_CORRUPT;
+		else if (fresh_origin_thread != binding.origin_thread
+			|| fresh_authority.agree_disk_count
+				   != binding.authority.agree_disk_count
+			|| fresh_authority.total_disk_count
+				   != binding.authority.total_disk_count
+			|| !cluster_fence_marker_semantic_equal(
+				&fresh_authority.marker, &binding.authority.marker)
+			|| !cluster_formation_snapshot_matches_v1(
+				&binding.formation, &fresh_formation))
+			result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+		else
+			result = cluster_formation_classification_revalidate_nowait(
+				binding.origin_thread, &binding.authority,
+				&binding.formation);
+	}
+	cluster_formation_witness_destroy(&witness);
+	return result;
+}
+
 static PhaseRunResult
 phase_3_handler(PhaseRunFailContext *fail_ctx)
 {
@@ -2007,6 +2056,40 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 				fail_ctx->errmsg = "cluster phase 4: xid stripe admission is unavailable";
 				fail_ctx->errhint = "Recovery control authority cannot publish ordinary "
 								"service until the post-recovery xid stripe floor is durable.";
+				return PHASE_RUN_FATAL;
+			}
+			pg_usleep(20000L);
+		}
+		/* The phase-3 durable-marker cache is intentionally finite and can
+		 * expire while StartupXLOG completes.  Re-read the current durable
+		 * authority only after the exact stripe gate opens, and accept it only
+		 * when it is the same immutable marker/formation already bound to this
+		 * recovery generation. */
+		for (;;)
+		{
+			ClusterFormationWitnessResult refresh_result;
+			int refresh_ms = cluster_phase_remaining_budget_ms(
+				phase4_deadline, 5000);
+
+			if (refresh_ms > 100)
+				refresh_ms = 100;
+			refresh_result = cluster_phase4_refresh_serving_formation(
+				refresh_ms);
+			if (refresh_result == CLUSTER_FORMATION_WITNESS_READY)
+				break;
+			if ((refresh_result != CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH
+				 && refresh_result != CLUSTER_FORMATION_WITNESS_UNSTABLE
+				 && refresh_result != CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN
+				 && refresh_result != CLUSTER_FORMATION_WITNESS_IO_FAILED
+				 && refresh_result
+					!= CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE)
+				|| GetCurrentTimestamp() >= phase4_deadline)
+			{
+				cluster_authority_readiness_clear();
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 4: serving formation proof is unavailable";
+				fail_ctx->errhint = "The post-recovery durable marker and exact admitted "
+								"formation must still match the phase-3 authority binding.";
 				return PHASE_RUN_FATAL;
 			}
 			pg_usleep(20000L);
