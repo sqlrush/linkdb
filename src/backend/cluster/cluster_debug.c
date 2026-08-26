@@ -142,6 +142,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
 #include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
 #include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
+#include "cluster/cluster_semantic_activation.h" /* R4 writer-path snapshot */
 #include "cluster/cluster_resource_x_identity.h" /* Resource-X proof readiness */
 #include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
 #include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
@@ -1920,6 +1921,15 @@ static void
 dump_pcm(ReturnSetInfo *rsinfo)
 {
 	ResourceXO1Stats o1;
+	ResourceXGateSnapshot gate_before;
+	ResourceXGateSnapshot gate_after;
+	ResourceXWriterPath writer_before;
+	ResourceXWriterPath writer_after;
+	uint64 writer_generation_before = 0;
+	uint64 writer_generation_after = 0;
+	bool owner_snapshot_exact;
+	const char *gate_phase;
+	const char *writer_path;
 
 	/*
 	 * PGRAC: spec-2.30 D9 — dump_pcm activation surface.
@@ -1944,6 +1954,61 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 (cluster_pcm_grd_max_entries == 0) ? "stub" : "active");
 	emit_row(rsinfo, "pcm", "resource_x_proof_readiness",
 			 resource_x_proof_readiness_status());
+	memset(&gate_before, 0, sizeof(gate_before));
+	memset(&gate_after, 0, sizeof(gate_after));
+	owner_snapshot_exact
+		= cluster_pcm_lock_resource_x_gate_snapshot(&gate_before);
+	writer_before = cluster_resource_x_writer_path_snapshot(
+		&writer_generation_before);
+	owner_snapshot_exact
+		= owner_snapshot_exact
+		  && cluster_pcm_lock_resource_x_gate_snapshot(&gate_after);
+	writer_after = cluster_resource_x_writer_path_snapshot(
+		&writer_generation_after);
+	owner_snapshot_exact
+		= owner_snapshot_exact
+		  && memcmp(&gate_before, &gate_after, sizeof(gate_before)) == 0
+		  && writer_before == writer_after
+		  && writer_generation_before == writer_generation_after;
+	if (!owner_snapshot_exact) {
+		gate_phase = "unavailable";
+		writer_path = "closed";
+		memset(&gate_before, 0, sizeof(gate_before));
+		writer_generation_before = 0;
+	} else {
+		switch (gate_before.phase) {
+			case RESOURCE_X_GATE_OPEN:
+				gate_phase = "open";
+				break;
+			case RESOURCE_X_GATE_FROZEN:
+				gate_phase = "frozen";
+				break;
+			case RESOURCE_X_GATE_RECOVERY_BLOCKED:
+				gate_phase = "recovery-blocked";
+				break;
+			default:
+				gate_phase = "invalid";
+				break;
+		}
+		switch (writer_before) {
+			case RESOURCE_X_WRITER_SOURCE:
+				writer_path = "source";
+				break;
+			case RESOURCE_X_WRITER_TARGET:
+				writer_path = "target";
+				break;
+			case RESOURCE_X_WRITER_CLOSED:
+			default:
+				writer_path = "closed";
+				break;
+		}
+	}
+	emit_row(rsinfo, "pcm", "resource_x_gate_phase", gate_phase);
+	emit_row(rsinfo, "pcm", "resource_x_gate_formation",
+			 fmt_uint64(gate_before.formation));
+	emit_row(rsinfo, "pcm", "resource_x_writer_path", writer_path);
+	emit_row(rsinfo, "pcm", "resource_x_writer_r4_generation",
+			 fmt_uint64(writer_generation_before));
 	cluster_pcm_lock_resource_x_o1_stats_snapshot(&o1);
 	emit_row(rsinfo, "pcm", "remote_install_observed_count",
 			 fmt_int64((int64)o1.remote_install_observed_count));

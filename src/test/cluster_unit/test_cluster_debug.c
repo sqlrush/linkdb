@@ -49,6 +49,7 @@
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched getter stubs */
+#include "cluster/cluster_semantic_activation.h" /* R4 writer snapshot stub */
 #include "cluster/cluster_touched_peers.h"	  /* spec-5.14 D6 self_hex stub */
 #include "cluster/cluster_xnode_profile.h"	  /* spec-5.59 D1 profiling gate stubs */
 #include "cluster/cluster_xnode_lever.h"	  /* spec-6.12 lever counter stub */
@@ -1000,6 +1001,22 @@ cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
 	memset(snapshot_out, 0, sizeof(*snapshot_out));
 	for (i = 0; i < 9; i++)
 		values[i] = UINT64CONST(301) + (uint64)i;
+}
+
+bool
+cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *snapshot_out)
+{
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	snapshot_out->formation = 17;
+	snapshot_out->phase = RESOURCE_X_GATE_OPEN;
+	return true;
+}
+
+ResourceXWriterPath
+cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out)
+{
+	*r4_generation_out = 19;
+	return RESOURCE_X_WRITER_TARGET;
 }
 
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
@@ -4667,6 +4684,31 @@ UT_TEST(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys)
 		UT_ASSERT_EQ(captured_dump_count("gcs", gcs_keys[i]), 0);
 }
 
+UT_TEST(test_debug_dump_exposes_exact_resource_x_owner_state)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
+	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	memset(captured_dump_values, 0, sizeof(captured_dump_values));
+	captured_dump_row_count = 0;
+	captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_gate_phase"), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_gate_formation"), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_writer_path"), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_writer_r4_generation"), 1);
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_gate_phase"), "open");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_gate_formation"), "17");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_path"), "target");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_r4_generation"), "19");
+}
+
 /* ============================================================
  * Iterator API on cluster_inject (added in spec-0.29 §1.4).
  * ============================================================ */
@@ -5243,9 +5285,10 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
+	UT_RUN(test_debug_dump_exposes_exact_resource_x_owner_state);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);
 	UT_RUN(test_debug_inject_get_state_at_null_outs);
