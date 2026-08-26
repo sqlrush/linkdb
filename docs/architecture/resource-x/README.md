@@ -29,6 +29,7 @@ flowchart LR
     H --> I[09 终态参与者与源端写入排他]
     I --> J[10 Target Acquire 诊断与切换验收]
     J --> K[11 高并发 current block 安全交接]
+    K --> L[12 容量观测与失败隔离]
 ```
 
 - [01：总体架构、资源模型与权威边界](01-architecture-and-resource-model.md)
@@ -42,6 +43,7 @@ flowchart LR
 - [09：终态参与者集合与源端写入排他窗口](09-terminal-participants-and-writer-exclusion.md)
 - [10：Target Acquire 诊断与 target-only 切换验收](10-target-acquire-diagnostics-and-cutover-validation.md)
 - [11：高并发下的 current block 安全交接](11-contention-safe-current-block-handoff.md)
+- [12：PCM/GRD 容量观测、资源复用与 Resource-X 失败隔离](12-capacity-observability-and-failure-containment.md)
 
 ## 一张图定位 Resource-X
 
