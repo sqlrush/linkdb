@@ -30,6 +30,7 @@ flowchart LR
     I --> J[10 Target Acquire 诊断与切换验收]
     J --> K[11 高并发 current block 安全交接]
     K --> L[12 容量观测与失败隔离]
+    L --> M[13 cached-X 安全驱逐与运维]
 ```
 
 - [01：总体架构、资源模型与权威边界](01-architecture-and-resource-model.md)
@@ -44,6 +45,7 @@ flowchart LR
 - [10：Target Acquire 诊断与 target-only 切换验收](10-target-acquire-diagnostics-and-cutover-validation.md)
 - [11：高并发下的 current block 安全交接](11-contention-safe-current-block-handoff.md)
 - [12：PCM/GRD 容量观测、资源复用与 Resource-X 失败隔离](12-capacity-observability-and-failure-containment.md)
+- [13：cached-X 安全驱逐、资源关闭与运维观察](13-safe-cached-x-eviction-and-operations.md)
 
 ## 一张图定位 Resource-X
 
