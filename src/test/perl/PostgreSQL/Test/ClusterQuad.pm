@@ -92,6 +92,9 @@ sub _relocate_backup_pg_wal
 #	  shared_data         : 1  -> shared data root (cluster_fs backend)
 #	  shared_system_identifier : 1 -> initialize node0 once and clone the
 #	                        other three nodes from that clean baseline
+#	  shared_system_identifier_seed_sql : SQL executed by node0 before that
+#	                        baseline is cloned; requires shared_data so user
+#	                        relation files are seeded in the shared data root
 #	  shared_catalog      : 1  -> t/337-style shared-catalog formation;
 #	                        implies shared_data + wal_threads_root and enables
 #	                        the required online-join/XID-striping substrate
@@ -220,8 +223,38 @@ EOC
 	}
 	elsif ($opts{shared_system_identifier})
 	{
+		my $seed_sql = $opts{shared_system_identifier_seed_sql};
+		if (defined $seed_sql)
+		{
+			die "shared_system_identifier_seed_sql requires shared_data"
+			  unless defined $shared_data_root;
+			die "shared_system_identifier_seed_sql must be a nonempty scalar"
+			  if ref($seed_sql) || $seed_sql eq '';
+		}
+
 		$nodes[0]->init(allows_streaming => 1);
+		if (defined $seed_sql)
+		{
+			# This is the same native, pre-formation seed boundary used by the
+			# macOS harness.  Catalog rows stay in PGDATA for the physical clone;
+			# user-relation bytes go directly to the one shared data root.
+			$nodes[0]->append_conf('postgresql.conf', <<EOC);
+shared_buffers = 16MB
+cluster.shared_storage_backend = cluster_fs
+cluster.shared_data_dir = '$shared_data_root'
+cluster.smgr_user_relations = on
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.node_id = 0
+cluster.relation_extend_lock_enabled = off
+EOC
+		}
 		$nodes[0]->start;
+		if (defined $seed_sql)
+		{
+			$nodes[0]->safe_psql('postgres', $seed_sql,
+				timeout => ($opts{shared_system_identifier_seed_timeout} // 900));
+		}
 		$nodes[0]->backup('clusterquad_homogeneous_baseline');
 		$nodes[0]->stop;
 
@@ -277,6 +310,15 @@ EOC
 					"cluster.online_join = on\n");
 				$node->append_conf('postgresql.conf',
 					"cluster.xid_striping = on\n");
+			}
+			if (defined $opts{shared_system_identifier_seed_sql})
+			{
+				# Undo the native seed-only values before the four-node start.
+				# extra_conf remains last and may narrow either GUC deliberately.
+				$node->append_conf('postgresql.conf',
+					"cluster.lms_enabled = on\n");
+				$node->append_conf('postgresql.conf',
+					"cluster.relation_extend_lock_enabled = on\n");
 			}
 		}
 
