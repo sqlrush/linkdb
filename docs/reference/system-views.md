@@ -1,5 +1,10 @@
 # System views
 
+> 完整中文参考已经按功能域拆分到
+> [PGRAC 集群系统视图与参数参考](cluster-observability/README.md)。该手册逐列覆盖当前主干的
+> 全部集群视图，并包含 `pg_cluster_state` 全键字典、计数器、刷新/哨兵语义、查询成本和运维示例。
+> 本页保留作为旧链接兼容入口。
+
 linkdb adds cluster-aware system views to the standard PostgreSQL
 catalog.  These views are present in `--enable-cluster` builds; in
 `--disable-cluster` builds the backing functions are unavailable or

@@ -1,5 +1,10 @@
 # Configuration reference
 
+> 全部 `cluster.*` 参数的逐项中文参考（类型、默认值、范围、context、生效方式、单位、依赖、
+> 调高/调低影响和观察入口）见
+> [PGRAC 集群系统视图与参数参考](../reference/cluster-observability/README.md)。本页保留常用部署参数和
+> 配置示例；完整清单以新参考手册及运行实例的 `pg_settings` 为准。
+
 linkdb uses two configuration mechanisms layered on top of standard
 PostgreSQL configuration:
 
