@@ -67,6 +67,58 @@ typedef struct ClusterPcmOwnSnapshot {
 
 StaticAssertDecl(sizeof(ClusterPcmOwnSnapshot) == 64, "ClusterPcmOwnSnapshot must remain 64 bytes");
 
+/* A remote-S type-17 can race a local grant installation before the local
+ * descriptor has committed its S tuple.  This exact N+GRANT_PENDING shape is
+ * coherent but is not holder evidence: the caller must make zero mutation
+ * and let the existing Resource-X retry deadline resample it.  Malformed
+ * reservation/activation evidence remains a hard failure. */
+static inline ClusterPcmOwnResult
+cluster_pcm_x_remote_s_holder_pending_grant_result(
+	const ClusterPcmOwnSnapshot *snapshot)
+{
+	if (snapshot == NULL
+		|| snapshot->pcm_state != (uint8)PCM_STATE_N
+		|| snapshot->flags != PCM_OWN_FLAG_GRANT_PENDING)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (snapshot->generation == UINT64_MAX
+		|| snapshot->reservation_token == 0
+		|| snapshot->reservation_token == UINT64_MAX
+		|| snapshot->writer_activation_token != 0
+		|| snapshot->resource_x_activation_generation != 0)
+		return CLUSTER_PCM_OWN_CORRUPT;
+	return CLUSTER_PCM_OWN_BUSY;
+}
+
+/* An authenticated type-17 may be replayed after its first exact S->N has
+ * already published the retained status into reliable DATA transport.  This
+ * predicate recognizes only the resulting idle, post-transition N tuple; it
+ * does not manufacture attempt identity or grant authority.  A coherent live
+ * reservation is ordinary backpressure, while residual/illegal tuple axes
+ * remain corruption. */
+static inline ClusterPcmOwnResult
+cluster_pcm_x_remote_s_holder_stable_n_result(
+	const ClusterPcmOwnSnapshot *snapshot)
+{
+	ClusterPcmOwnResult live_result;
+
+	if (snapshot == NULL
+		|| snapshot->pcm_state != (uint8)PCM_STATE_N)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (snapshot->generation == 0)
+		return CLUSTER_PCM_OWN_STALE;
+	if (snapshot->generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_CORRUPT;
+	live_result = cluster_pcm_own_classify_live_flags(
+		snapshot->flags, snapshot->reservation_token);
+	if (live_result != CLUSTER_PCM_OWN_OK)
+		return live_result;
+	if (snapshot->reservation_token != 0
+		|| snapshot->writer_activation_token != 0
+		|| snapshot->resource_x_activation_generation != 0)
+		return CLUSTER_PCM_OWN_CORRUPT;
+	return CLUSTER_PCM_OWN_OK;
+}
+
 #define CLUSTER_PCM_OWN_HELD_X_REVOKE_PIN_HELD UINT32_C(0x00000001)
 #define CLUSTER_PCM_OWN_HELD_X_REVOKE_STARTED UINT32_C(0x00000002)
 #define CLUSTER_PCM_OWN_HELD_X_REVOKE_KNOWN_MASK \
@@ -438,7 +490,8 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf,
  * is accepted only as a no-local-current shape; no page bytes or proof are
  * returned, and the master still owns proof selection. */
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n);
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_n,
+	ClusterPcmOwnSnapshot *observed_out);
 /* Exact physical half of the former-source reacquire interlock.  It proves
  * only a clean, valid N+PI descriptor held by one REVOKING token; the caller
  * must independently bind that generation to the retained Resource-X pair. */
@@ -625,7 +678,7 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_revoke_retain(
 	ClusterPcmOwnSnapshot *out_retained, ClusterPcmOwnFinishRefusal *out_refusal);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
-	const BufferTag *tag, uint64 source_generation);
+	const BufferTag *tag, uint64 source_generation, bool *release_applied_out);
 extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_release_retained_image(const BufferTag *tag,
 															 uint64 source_generation);
 /* Process-local descriptor evidence captured by the DRAIN-time probe below

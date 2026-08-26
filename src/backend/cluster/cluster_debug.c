@@ -1920,6 +1920,44 @@ dump_buffer_format(ReturnSetInfo *rsinfo)
 static void
 dump_pcm(ReturnSetInfo *rsinfo)
 {
+	static const char *const reclaim_refusal_keys[PCM_RETIRE_REFUSAL_N] = {
+		[PCM_RETIRE_REFUSAL_GATE_NOT_OPEN]
+			= "pcm_grd_reclaim_refused_gate_not_open_count",
+		[PCM_RETIRE_REFUSAL_IDENTITY_MISMATCH]
+			= "pcm_grd_reclaim_refused_identity_mismatch_count",
+		[PCM_RETIRE_REFUSAL_LIFECYCLE_NOT_LIVE]
+			= "pcm_grd_reclaim_refused_lifecycle_not_live_count",
+		[PCM_RETIRE_REFUSAL_PINNED]
+			= "pcm_grd_reclaim_refused_pinned_count",
+		[PCM_RETIRE_REFUSAL_WAITER_PRESENT]
+			= "pcm_grd_reclaim_refused_waiter_present_count",
+		[PCM_RETIRE_REFUSAL_TRANSPORT_PRESENT]
+			= "pcm_grd_reclaim_refused_transport_present_count",
+		[PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N]
+			= "pcm_grd_reclaim_refused_pcm_mode_not_n_count",
+		[PCM_RETIRE_REFUSAL_HOLDER_PRESENT]
+			= "pcm_grd_reclaim_refused_holder_present_count",
+		[PCM_RETIRE_REFUSAL_PI_PRESENT]
+			= "pcm_grd_reclaim_refused_pi_present_count",
+		[PCM_RETIRE_REFUSAL_WATERMARK_PRESENT]
+			= "pcm_grd_reclaim_refused_watermark_present_count",
+		[PCM_RETIRE_REFUSAL_CONVERT_PENDING]
+			= "pcm_grd_reclaim_refused_convert_pending_count",
+		[PCM_RETIRE_REFUSAL_RESOURCE_X_ACTIVE]
+			= "pcm_grd_reclaim_refused_resource_x_active_count",
+		[PCM_RETIRE_REFUSAL_RETAINED_PAIR_PRESENT]
+			= "pcm_grd_reclaim_refused_retained_pair_present_count",
+		[PCM_RETIRE_REFUSAL_REQUESTER_NOT_TERMINAL]
+			= "pcm_grd_reclaim_refused_requester_not_terminal_count",
+		[PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL]
+			= "pcm_grd_reclaim_refused_sidecar_not_terminal_count",
+		[PCM_RETIRE_REFUSAL_FORMATION_STALE]
+			= "pcm_grd_reclaim_refused_formation_stale_count",
+		[PCM_RETIRE_REFUSAL_ENTRY_LOCK_BUSY]
+			= "pcm_grd_reclaim_refused_entry_lock_busy_count",
+	};
+	PcmGrdLifecycleStats lifecycle;
+	PcmGrdProtocolDebtStats protocol_debt;
 	ResourceXO1Stats o1;
 	ResourceXGateSnapshot gate_before;
 	ResourceXGateSnapshot gate_after;
@@ -1930,6 +1968,7 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	bool owner_snapshot_exact;
 	const char *gate_phase;
 	const char *writer_path;
+	int refusal;
 
 	/*
 	 * PGRAC: spec-2.30 D9 — dump_pcm activation surface.
@@ -1943,6 +1982,44 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	emit_row(rsinfo, "pcm", "pcm_grd_allocated_bytes",
 			 fmt_int64((int64)cluster_pcm_grd_shmem_size()));
 	emit_row(rsinfo, "pcm", "pcm_grd_active_entries", fmt_int32(cluster_pcm_grd_count()));
+	cluster_pcm_grd_lifecycle_stats_snapshot(&lifecycle);
+	emit_row(rsinfo, "pcm", "pcm_grd_live_entries",
+		fmt_uint64(lifecycle.live_entries));
+	emit_row(rsinfo, "pcm", "pcm_grd_tombstone_slots",
+		fmt_uint64(lifecycle.tombstone_slots));
+	emit_row(rsinfo, "pcm", "pcm_grd_binding_generation",
+		fmt_uint64(lifecycle.binding_generation));
+	emit_row(rsinfo, "pcm", "pcm_grd_reclaim_attempt_count",
+		fmt_uint64(lifecycle.reclaim_attempt_count));
+	emit_row(rsinfo, "pcm", "pcm_grd_reclaim_success_count",
+		fmt_uint64(lifecycle.reclaim_success_count));
+	emit_row(rsinfo, "pcm", "pcm_grd_reclaim_reuse_count",
+		fmt_uint64(lifecycle.reclaim_reuse_count));
+	emit_row(rsinfo, "pcm", "pcm_grd_capacity_retry_count",
+		fmt_uint64(lifecycle.capacity_retry_count));
+	emit_row(rsinfo, "pcm", "pcm_grd_capacity_fail_count",
+		fmt_uint64(lifecycle.capacity_fail_count));
+	emit_row(rsinfo, "pcm", "pcm_grd_peak_live_entries",
+		fmt_uint64(lifecycle.peak_live_entries));
+	cluster_pcm_grd_protocol_debt_snapshot(&protocol_debt);
+	emit_row(rsinfo, "pcm", "pcm_grd_wait_refcount",
+		fmt_uint64(protocol_debt.wait_refcount));
+	emit_row(rsinfo, "pcm", "pcm_grd_transport_refcount",
+		fmt_uint64(protocol_debt.transport_refcount));
+	emit_row(rsinfo, "pcm", "resource_x_retained_debt_count",
+		fmt_uint64(protocol_debt.retained_entry_count));
+	emit_row(rsinfo, "pcm", "resource_x_active_debt_count",
+		fmt_uint64(protocol_debt.active_resource_x_entry_count));
+	emit_row(rsinfo, "pcm", "resource_x_local_owner_debt_count",
+		fmt_uint64(protocol_debt.local_owner_entry_count));
+	emit_row(rsinfo, "pcm", "resource_x_evicting_debt_count",
+		fmt_uint64(protocol_debt.evicting_entry_count));
+	emit_row(rsinfo, "pcm", "resource_x_invalid_debt_count",
+		fmt_uint64(protocol_debt.invalid_entry_count));
+	for (refusal = PCM_RETIRE_REFUSAL_GATE_NOT_OPEN;
+		 refusal < PCM_RETIRE_REFUSAL_N; refusal++)
+		emit_row(rsinfo, "pcm", reclaim_refusal_keys[refusal],
+			fmt_uint64(lifecycle.reclaim_refused[refusal]));
 	emit_row(rsinfo, "pcm", "pcm_lock_mode_count", "3");
 	emit_row(rsinfo, "pcm", "pcm_transition_count", fmt_int32(PCM_TRANSITION_COUNT));
 	/*

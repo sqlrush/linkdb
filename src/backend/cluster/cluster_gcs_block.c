@@ -318,6 +318,11 @@ typedef struct ClusterGcsBlockShared {
 	pg_atomic_uint64 resource_x_reconfig_actor_active;
 	pg_atomic_uint64 resource_x_reconfig_old_formation;
 	pg_atomic_uint64 resource_x_reconfig_completed_epoch;
+	/* 8.15-PRE-CAP D1: diagnostic-only failure-domain counts. */
+	pg_atomic_uint64 resource_x_pre_mutation_backpressure_count;
+	pg_atomic_uint64 resource_x_authority_drift_count;
+	pg_atomic_uint64 resource_x_post_mutation_ambiguity_count;
+	pg_atomic_uint64 resource_x_internal_corruption_count;
 	pg_atomic_uint64 stale_reply_drop_count;
 	/* PGRAC: GCS-race round-2 RC-F — requester completion proofs emitted. */
 	pg_atomic_uint64 done_sent_count;
@@ -684,6 +689,14 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_actor_active, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch, 0);
+		pg_atomic_init_u64(
+			&ClusterGcsBlock->resource_x_pre_mutation_backpressure_count, 0);
+		pg_atomic_init_u64(
+			&ClusterGcsBlock->resource_x_authority_drift_count, 0);
+		pg_atomic_init_u64(
+			&ClusterGcsBlock->resource_x_post_mutation_ambiguity_count, 0);
+		pg_atomic_init_u64(
+			&ClusterGcsBlock->resource_x_internal_corruption_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->stale_reply_drop_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_enqueue_drop_count, 0);
@@ -3603,6 +3616,18 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				if (retry_attempt < max_retries)
 					continue;
 				terminal_denied = true;
+				break;
+			}
+
+			/* A one-shot N->S image forward may lose its exact carrier while a
+			 * Resource-X successor advances.  No holder/requester state changed:
+			 * close this request identity and let bufmgr exact-abort/rearm its
+			 * GRANT_PENDING reservation before issuing a fresh request. */
+			if (gcs_block_forwarded_s_refusal_requires_fresh_retry(
+					(GcsBlockReplyStatus)final_status, transition_id,
+					final_forwarding_master)) {
+				awaiting_holder_refusal_master_cleanup = false;
+				retry_denied = true;
 				break;
 			}
 
@@ -7338,7 +7363,7 @@ gcs_block_resource_x_native_assert_stage_exact(
 		return RESOURCE_X_APPLY_STALE;
 	if (before.pcm_state == (uint8)PCM_STATE_N) {
 		own_result = cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
-			GetBufferDescriptor(before_buffer_id), &before);
+			GetBufferDescriptor(before_buffer_id), &before, NULL);
 		if (own_result != CLUSTER_PCM_OWN_OK)
 			return own_result == CLUSTER_PCM_OWN_BUSY
 				? RESOURCE_X_APPLY_BAD_STATE
@@ -8662,7 +8687,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(
 			 * zero supplies no authority, while the joined grant and image do. */
 			own_result
 				= cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
-					GetBufferDescriptor(target_buffer_id), &target_base);
+					GetBufferDescriptor(target_buffer_id), &target_base, NULL);
 			if (own_result != CLUSTER_PCM_OWN_OK)
 				return own_result == CLUSTER_PCM_OWN_BUSY
 					? RESOURCE_X_APPLY_BAD_STATE
@@ -8962,6 +8987,489 @@ gcs_block_pcm_x_resource_x_remote_s_own_result(
 	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
+/* The remote-S transaction applies its failure-domain decision only after
+ * exact rollback outcomes are known.  Unlike the older requester mapper,
+ * this conversion must not fence as a side effect. */
+static ResourceXApplyResult
+gcs_block_resource_x_remote_s_own_result(ClusterPcmOwnResult result)
+{
+	if (result == CLUSTER_PCM_OWN_OK)
+		return RESOURCE_X_APPLY_APPLIED;
+	if (result == CLUSTER_PCM_OWN_STALE)
+		return RESOURCE_X_APPLY_STALE;
+	if (result == CLUSTER_PCM_OWN_BUSY)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+}
+
+static void
+gcs_block_resource_x_failure_decision_apply(
+	const ResourceXRemoteSFailureDecision *decision)
+{
+	if (decision != NULL && decision->global_fail_closed)
+		gcs_block_resource_x_fail_closed_current();
+}
+
+typedef enum ResourceXSourceSettlementStage {
+	RESOURCE_X_SOURCE_SETTLEMENT_STAGE_NONE = 0,
+	RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
+	RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
+	RESOURCE_X_SOURCE_SETTLEMENT_STAGE_COMMIT,
+	RESOURCE_X_SOURCE_SETTLEMENT_STAGE_ACK_BUILD,
+	RESOURCE_X_SOURCE_SETTLEMENT_STAGE_ACK_ENCODE
+} ResourceXSourceSettlementStage;
+
+typedef struct ResourceXFirstFailureEvidence {
+	BufferTag tag;
+	uint64 binding_generation;
+	uint64 request_sequence;
+	uint64 admission_generation;
+	uint64 buffer_generation_before;
+	uint64 buffer_generation_after;
+	uint64 buffer_token_before;
+	uint64 buffer_token_after;
+	uint64 buffer_writer_token_before;
+	uint64 buffer_writer_token_after;
+	uint64 buffer_resource_x_generation_before;
+	uint64 buffer_resource_x_generation_after;
+	uint32 buffer_flags_before;
+	uint32 buffer_flags_after;
+	int32 buffer_own_result;
+	uint8 buffer_pcm_state_before;
+	uint8 buffer_pcm_state_after;
+	uint64 base_authority_generation;
+	uint64 authority_generation;
+	uint64 assertion_sequence;
+	uint64 formation;
+	uint64 master_session;
+	uint64 r4_generation;
+	uint64 absolute_deadline_us;
+	uint32 round_progress_flags;
+	uint8 round_phase;
+	bool round_terminal;
+	int32 requester_node;
+	ResourceXRemoteSStage remote_s_stage;
+	ResourceXSourceSettlementStage source_settlement_stage;
+	ResourceXSourceSettlementCommitObservation source_settlement_commit;
+	int32 source_settlement_own_result;
+	ResourceXFailureDomain failure_domain;
+	ResourceXApplyResult result;
+	bool holder_mutation_started;
+	bool revoke_reversible;
+	bool rollback_cancel_attempted;
+	bool rollback_cancel_ok;
+	bool rollback_abort_attempted;
+	bool rollback_abort_ok;
+	bool status_staged;
+	bool status_published;
+	bool proof_staged;
+	bool proof_published;
+} ResourceXFirstFailureEvidence;
+
+#define RESOURCE_X_FIRST_FAILURE_LOG_SLOTS 64
+#define RESOURCE_X_FIRST_FAILURE_LOG_RATE_LIMIT 8
+#define RESOURCE_X_FIRST_FAILURE_LOG_INTERVAL_US UINT64_C(1000000)
+
+typedef struct ResourceXFirstFailureLogIdentity {
+	BufferTag tag;
+	uint64 request_sequence;
+	uint64 admission_generation;
+	uint64 assertion_sequence;
+	uint64 formation;
+	uint64 master_session;
+	int32 requester_node;
+	bool in_use;
+} ResourceXFirstFailureLogIdentity;
+
+/* Diagnostic suppression is deliberately process-local and bounded.  It is
+ * neither shared authority nor a protocol registry.  Exact retransmission of
+ * one wire request is logged once while resident; aggregate counters still
+ * retain every later failure/cascade. */
+static ResourceXFirstFailureLogIdentity
+	resource_x_first_failure_log_slots[RESOURCE_X_FIRST_FAILURE_LOG_SLOTS];
+static uint32 resource_x_first_failure_log_next_slot;
+static uint64 resource_x_first_failure_log_window_start_us;
+static uint32 resource_x_first_failure_log_window_count;
+static uint64 resource_x_target_diagnostic_request_sequence;
+
+static const char *
+gcs_block_resource_x_rollback_outcome(bool attempted, bool ok)
+{
+	return !attempted ? "n/a" : ok ? "true" : "false";
+}
+
+static uint64
+gcs_block_resource_x_next_diagnostic_request_sequence(void)
+{
+	resource_x_target_diagnostic_request_sequence++;
+	if (resource_x_target_diagnostic_request_sequence == 0
+		|| resource_x_target_diagnostic_request_sequence == UINT64_MAX)
+		resource_x_target_diagnostic_request_sequence = 1;
+	return resource_x_target_diagnostic_request_sequence;
+}
+
+static bool
+gcs_block_resource_x_first_failure_should_log(
+	const ResourceXFirstFailureEvidence *evidence, uint64 now_us)
+{
+	ResourceXFirstFailureLogIdentity identity;
+	uint32 i;
+
+	if (evidence == NULL || now_us == 0)
+		return false;
+	memset(&identity, 0, sizeof(identity));
+	identity.tag = evidence->tag;
+	identity.request_sequence = evidence->request_sequence;
+	identity.admission_generation = evidence->admission_generation != 0
+		? evidence->admission_generation : evidence->r4_generation;
+	identity.assertion_sequence = evidence->assertion_sequence;
+	identity.formation = evidence->formation;
+	identity.master_session = evidence->master_session;
+	identity.requester_node = evidence->requester_node;
+	identity.in_use = true;
+	for (i = 0; i < RESOURCE_X_FIRST_FAILURE_LOG_SLOTS; i++) {
+		ResourceXFirstFailureLogIdentity *slot
+			= &resource_x_first_failure_log_slots[i];
+
+		if (slot->in_use
+			&& BufferTagsEqual(&slot->tag, &identity.tag)
+			&& slot->request_sequence == identity.request_sequence
+			&& slot->admission_generation == identity.admission_generation
+			&& slot->assertion_sequence == identity.assertion_sequence
+			&& slot->formation == identity.formation
+			&& slot->master_session == identity.master_session
+			&& slot->requester_node == identity.requester_node)
+			return false;
+	}
+	resource_x_first_failure_log_slots[resource_x_first_failure_log_next_slot]
+		= identity;
+	resource_x_first_failure_log_next_slot
+		= (resource_x_first_failure_log_next_slot + 1)
+		  % RESOURCE_X_FIRST_FAILURE_LOG_SLOTS;
+
+	if (resource_x_first_failure_log_window_start_us == 0
+		|| now_us < resource_x_first_failure_log_window_start_us
+		|| now_us - resource_x_first_failure_log_window_start_us
+			>= RESOURCE_X_FIRST_FAILURE_LOG_INTERVAL_US) {
+		resource_x_first_failure_log_window_start_us = now_us;
+		resource_x_first_failure_log_window_count = 0;
+	}
+	if (resource_x_first_failure_log_window_count
+		>= RESOURCE_X_FIRST_FAILURE_LOG_RATE_LIMIT)
+		return false;
+	resource_x_first_failure_log_window_count++;
+	return true;
+}
+
+/* D1 only records evidence and increments one domain counter.  It neither
+ * maps the result nor fences/retries the request.  Callers invoke it at their
+ * first local failure boundary after any exact rollback attempt has ended. */
+static void
+gcs_block_resource_x_first_failure_record(
+	const ResourceXFirstFailureEvidence *evidence)
+{
+	uint64 now_us;
+	uint32 tag_hash;
+	uint32 capacity_used;
+	uint32 capacity_limit;
+	int live_entries;
+
+	if (evidence == NULL || evidence->failure_domain <= RESOURCE_X_FAIL_NONE
+		|| evidence->failure_domain > RESOURCE_X_FAIL_INTERNAL_CORRUPTION)
+		return;
+	if (ClusterGcsBlock != NULL) {
+		switch (evidence->failure_domain) {
+		case RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE:
+			pg_atomic_fetch_add_u64(
+				&ClusterGcsBlock->resource_x_pre_mutation_backpressure_count, 1);
+			break;
+		case RESOURCE_X_FAIL_AUTHORITY_DRIFT:
+			pg_atomic_fetch_add_u64(
+				&ClusterGcsBlock->resource_x_authority_drift_count, 1);
+			break;
+		case RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY:
+			pg_atomic_fetch_add_u64(
+				&ClusterGcsBlock->resource_x_post_mutation_ambiguity_count, 1);
+			break;
+		case RESOURCE_X_FAIL_INTERNAL_CORRUPTION:
+			pg_atomic_fetch_add_u64(
+				&ClusterGcsBlock->resource_x_internal_corruption_count, 1);
+			break;
+		case RESOURCE_X_FAIL_NONE:
+			break;
+		}
+	}
+	now_us = gcs_block_pcm_x_monotonic_us();
+	if (!gcs_block_resource_x_first_failure_should_log(evidence, now_us))
+		return;
+	live_entries = cluster_pcm_grd_count();
+	capacity_used = live_entries > 0 ? (uint32)live_entries : 0;
+	capacity_limit = cluster_pcm_grd_capacity() > 0
+		? (uint32)cluster_pcm_grd_capacity() : 0;
+	tag_hash = hash_any((const unsigned char *)&evidence->tag,
+		(int)sizeof(evidence->tag));
+	ereport(LOG,
+		(errmsg_internal("Resource-X first-failure diagnostic"),
+		 errdetail("tag_hash=%u binding_generation=%llu "
+				   "request_sequence=%llu admission_generation=%llu "
+				   "buffer_generation_before=%llu buffer_generation_after=%llu "
+				   "buffer_token_before=%llu buffer_token_after=%llu "
+				   "buffer_writer_token_before=%llu buffer_writer_token_after=%llu "
+				   "buffer_resource_x_generation_before=%llu "
+				   "buffer_resource_x_generation_after=%llu "
+				   "buffer_flags_before=0x%08x buffer_flags_after=0x%08x "
+				   "buffer_pcm_state_before=%u buffer_pcm_state_after=%u "
+				   "buffer_own_result=%d "
+				   "formation=%llu master_session=%llu r4_generation=%llu "
+				   "base_authority_generation=%llu authority_generation=%llu "
+				   "assertion_sequence=%llu remote_s_stage=%u "
+				   "source_settlement_stage=%u source_settlement_own_result=%d "
+				   "source_settlement_commit_stage=%u "
+				   "source_settlement_commit_mismatch=0x%08x "
+				   "source_settlement_current_formation=%llu "
+				   "source_settlement_current_master=%d "
+				   "source_settlement_current_session=%llu "
+				   "source_settlement_current_terminal_authority=%llu "
+				   "source_settlement_current_cached_generation=%llu "
+				   "source_settlement_current_round_phase=%u "
+				   "source_settlement_current_owner_state=%u "
+				   "source_settlement_pair_formation=%llu "
+				   "source_settlement_pair_session=%llu "
+				   "source_settlement_pair_sequence=%llu "
+				   "source_settlement_pair_source_generation=%llu "
+				   "source_settlement_pair_observed_mode=%u "
+				   "source_settlement_pair_destination=%u "
+				   "source_settlement_pair_status_valid=%u "
+				   "source_settlement_pair_image_valid=%u "
+				   "source_settlement_status_intent=%u "
+				   "source_settlement_image_intent=%u "
+				   "failure_domain=%u "
+				   "result=%d holder_mutation_started=%s revoke_reversible=%s "
+				   "rollback_cancel_ok=%s rollback_abort_ok=%s "
+				   "status_staged=%s status_published=%s "
+				   "proof_staged=%s proof_published=%s "
+				   "round_terminal=%s round_phase=%u round_progress_flags=0x%08x "
+				   "capacity_kind=%s capacity_used=%u capacity_limit=%u "
+				   "deadline=%llu",
+				   tag_hash,
+				   (unsigned long long)evidence->binding_generation,
+				   (unsigned long long)evidence->request_sequence,
+				   (unsigned long long)(evidence->admission_generation != 0
+					   ? evidence->admission_generation
+					   : evidence->r4_generation),
+				   (unsigned long long)evidence->buffer_generation_before,
+				   (unsigned long long)evidence->buffer_generation_after,
+				   (unsigned long long)evidence->buffer_token_before,
+				   (unsigned long long)evidence->buffer_token_after,
+				   (unsigned long long)evidence->buffer_writer_token_before,
+				   (unsigned long long)evidence->buffer_writer_token_after,
+				   (unsigned long long)
+					   evidence->buffer_resource_x_generation_before,
+				   (unsigned long long)
+					   evidence->buffer_resource_x_generation_after,
+				   evidence->buffer_flags_before,
+				   evidence->buffer_flags_after,
+				   (unsigned)evidence->buffer_pcm_state_before,
+				   (unsigned)evidence->buffer_pcm_state_after,
+				   evidence->remote_s_stage != RESOURCE_X_REMOTE_S_STAGE_NONE
+					   ? evidence->buffer_own_result : -1,
+				   (unsigned long long)evidence->formation,
+				   (unsigned long long)evidence->master_session,
+				   (unsigned long long)evidence->r4_generation,
+				   (unsigned long long)evidence->base_authority_generation,
+				   (unsigned long long)evidence->authority_generation,
+				   (unsigned long long)evidence->assertion_sequence,
+				   (unsigned)evidence->remote_s_stage,
+				   (unsigned)evidence->source_settlement_stage,
+				   evidence->source_settlement_stage
+						   != RESOURCE_X_SOURCE_SETTLEMENT_STAGE_NONE
+					   ? evidence->source_settlement_own_result : -1,
+				   (unsigned)evidence->source_settlement_commit.commit_stage,
+				   evidence->source_settlement_commit.mismatch_mask,
+				   (unsigned long long)evidence->source_settlement_commit
+					   .current_resource_formation,
+				   evidence->source_settlement_commit.current_master_node,
+				   (unsigned long long)evidence->source_settlement_commit
+					   .current_master_session,
+				   (unsigned long long)evidence->source_settlement_commit
+					   .current_terminal_authority_generation,
+				   (unsigned long long)evidence->source_settlement_commit
+					   .current_cached_ownership_generation,
+				   (unsigned)evidence->source_settlement_commit
+					   .current_round_phase,
+				   (unsigned)evidence->source_settlement_commit.current_owner_state,
+				   (unsigned long long)evidence->source_settlement_commit
+					   .current_pair_resource_formation,
+				   (unsigned long long)evidence->source_settlement_commit
+					   .current_pair_master_session,
+				   (unsigned long long)evidence->source_settlement_commit
+					   .current_pair_assertion_sequence,
+				   (unsigned long long)evidence->source_settlement_commit
+					   .current_pair_source_generation,
+				   (unsigned)evidence->source_settlement_commit
+					   .current_pair_observed_mode,
+				   evidence->source_settlement_commit
+					   .current_pair_destination_node,
+				   (unsigned)evidence->source_settlement_commit
+					   .current_holder_status_valid,
+				   (unsigned)evidence->source_settlement_commit
+					   .current_holder_image_valid,
+				   (unsigned)evidence->source_settlement_commit
+					   .current_status_intent_state,
+				   (unsigned)evidence->source_settlement_commit
+					   .current_image_intent_state,
+				   (unsigned)evidence->failure_domain,
+				   (int)evidence->result,
+				   evidence->holder_mutation_started ? "true" : "false",
+				   evidence->revoke_reversible ? "true" : "false",
+				   gcs_block_resource_x_rollback_outcome(
+					   evidence->rollback_cancel_attempted,
+					   evidence->rollback_cancel_ok),
+				   gcs_block_resource_x_rollback_outcome(
+					   evidence->rollback_abort_attempted,
+					   evidence->rollback_abort_ok),
+				   evidence->status_staged ? "true" : "false",
+				   evidence->status_published ? "true" : "false",
+				   evidence->proof_staged ? "true" : "false",
+				   evidence->proof_published ? "true" : "false",
+				   evidence->round_terminal ? "true" : "false",
+				   (unsigned)evidence->round_phase,
+				   evidence->round_progress_flags,
+				   "pcm_grd_live",
+				   capacity_used,
+				   capacity_limit,
+				   (unsigned long long)evidence->absolute_deadline_us)));
+}
+
+static ResourceXFailureDomain
+gcs_block_resource_x_pre_mutation_domain(ClusterPcmOwnResult own_result)
+{
+	if (own_result == CLUSTER_PCM_OWN_BUSY
+		|| own_result == CLUSTER_PCM_OWN_NOT_READY)
+		return RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE;
+	if (own_result == CLUSTER_PCM_OWN_STALE)
+		return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
+	return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+}
+
+static ResourceXFailureDomain
+gcs_block_resource_x_target_failure_domain(
+	ResourceXApplyResult result, ResourceXApplyResult round_snapshot_result,
+	const ResourceXBootstrapRoundFailureSnapshot *round,
+	ClusterPcmOwnResult live_snapshot_result)
+{
+	if (live_snapshot_result == CLUSTER_PCM_OWN_CORRUPT
+		|| live_snapshot_result == CLUSTER_PCM_OWN_NOT_READY
+		|| round_snapshot_result == RESOURCE_X_APPLY_RECOVERY_BLOCKED
+		|| round_snapshot_result == RESOURCE_X_APPLY_INVALID)
+		return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+	if (round_snapshot_result == RESOURCE_X_APPLY_STALE
+		|| result == RESOURCE_X_APPLY_STALE)
+		return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
+	if (round_snapshot_result == RESOURCE_X_APPLY_APPLIED
+		&& round != NULL) {
+		if ((round->progress_flags & RESOURCE_X_PROGRESS_T2) != 0)
+			return RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+		if (round->terminal != 0
+			|| (round->progress_flags & RESOURCE_X_PROGRESS_T1) != 0)
+			return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
+	}
+	if (result == RESOURCE_X_APPLY_BAD_STATE
+		|| result == RESOURCE_X_APPLY_NOT_FOUND)
+		return RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE;
+	return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+}
+
+static void
+gcs_block_resource_x_first_failure_from_block(
+	ResourceXFirstFailureEvidence *evidence,
+	const ResourceXDecodedFrame *block, ResourceXRemoteSStage stage,
+	ResourceXFailureDomain domain, ResourceXApplyResult result)
+{
+	memset(evidence, 0, sizeof(*evidence));
+	if (block != NULL) {
+		evidence->tag = block->common.logical_assertion.resource;
+		evidence->base_authority_generation
+			= block->common.base_authority_generation;
+		evidence->authority_generation
+			= block->common.authority_generation;
+		evidence->assertion_sequence
+			= block->common.assertion_sequence;
+		evidence->request_sequence = block->common.assertion_sequence;
+		evidence->requester_node
+			= block->common.logical_assertion.requester_node;
+		evidence->formation = block->common.resource_formation;
+		evidence->master_session
+			= block->common.master_session_incarnation;
+	}
+	evidence->remote_s_stage = stage;
+	evidence->buffer_own_result = -1;
+	evidence->source_settlement_own_result = -1;
+	evidence->failure_domain = domain;
+	evidence->result = result;
+}
+
+static ResourceXFailureDomain
+gcs_block_resource_x_source_settlement_apply_domain(
+	ResourceXApplyResult result)
+{
+	if (result == RESOURCE_X_APPLY_BAD_STATE)
+		return RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE;
+	if (result == RESOURCE_X_APPLY_STALE)
+		return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
+	return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+}
+
+static ResourceXFailureDomain
+gcs_block_resource_x_source_settlement_own_domain(
+	ClusterPcmOwnResult own_result, bool release_applied)
+{
+	if (own_result == CLUSTER_PCM_OWN_CORRUPT
+		|| own_result == CLUSTER_PCM_OWN_INVALID)
+		return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+	if (release_applied)
+		return RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+	if (own_result == CLUSTER_PCM_OWN_BUSY
+		|| own_result == CLUSTER_PCM_OWN_NOT_READY)
+		return RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE;
+	if (own_result == CLUSTER_PCM_OWN_STALE)
+		return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
+	return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+}
+
+static void
+gcs_block_resource_x_source_settlement_failure_record(
+	const ResourceXDecodedFrame *settlement,
+	const ResourceXSourceSettlementCommitObservation *commit_observation,
+	ResourceXSourceSettlementStage source_settlement_stage,
+	ResourceXFailureDomain failure_domain, ResourceXApplyResult result,
+	uint64 source_generation, int32 source_settlement_own_result,
+	bool release_applied, bool status_staged)
+{
+	ClusterSemanticR11CutoverSnapshot cutover;
+	ResourceXFirstFailureEvidence first_failure;
+
+	gcs_block_resource_x_first_failure_from_block(
+		&first_failure, settlement, RESOURCE_X_REMOTE_S_STAGE_NONE,
+		failure_domain, result);
+	first_failure.source_settlement_stage = source_settlement_stage;
+	first_failure.source_settlement_own_result
+		= source_settlement_own_result;
+	if (commit_observation != NULL)
+		first_failure.source_settlement_commit = *commit_observation;
+	first_failure.binding_generation = source_generation;
+	first_failure.holder_mutation_started = release_applied;
+	first_failure.status_staged = status_staged;
+	if (settlement != NULL
+		&& cluster_semantic_activation_r11_cutover_snapshot(&cutover)
+		&& cutover.formation_epoch
+			== settlement->common.resource_formation) {
+		first_failure.admission_generation = cutover.record_generation;
+		first_failure.r4_generation = cutover.record_generation;
+	}
+	gcs_block_resource_x_first_failure_record(&first_failure);
+}
+
 /* PGRAC adaptation approved for the current happy path only.  A
  * non-requester S holder (remote from the requester, including the
  * master/holder same-node transport shape) has no local Resource-X authority
@@ -8976,7 +9484,9 @@ static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	const ResourceXDecodedFrame *block,
 	int32 authenticated_master_node,
-	uint32 authenticated_capability_generation)
+	uint32 authenticated_capability_generation,
+	uint64 r4_record_generation,
+	const ClusterSemanticAdmissionToken *admission)
 {
 	BufferDesc *buf;
 	ClusterPcmOwnResult own_result;
@@ -8989,17 +9499,31 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	ClusterLmsRemoteSStatusHandle status_handle;
 	LWLock *content_lock;
 	ResourceXDecodedFrame status;
+	ResourceXFirstFailureEvidence first_failure;
+	ResourceXRemoteSStage remote_s_stage
+		= RESOURCE_X_REMOTE_S_STAGE_VALIDATE;
+	ResourceXFailureDomain failure_domain = RESOURCE_X_FAIL_NONE;
+	ResourceXRemoteSFailureDecision failure_decision;
+	ResourceXApplyResult mapped_result;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
 	uint16 payload_len = 0;
+	uint32 outbound_connection_generation = 0;
+	uint32 rechecked_outbound_connection_generation = 0;
 	int buffer_id = -1;
 	int worker_id;
+	bool rollback_cancel_ok = false;
+	bool rollback_abort_ok = false;
 
 	if (block == NULL || block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
 		|| !resource_x_assertion_valid(&block->common.logical_assertion)
 		|| authenticated_master_node < 0
 		|| authenticated_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| authenticated_capability_generation == 0
+		|| r4_record_generation == 0
+		|| r4_record_generation == UINT64_MAX
+		|| admission == NULL || !admission->entered
+		|| admission->record_generation != r4_record_generation
 		|| cluster_node_id < 0
 		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| block->common.logical_assertion.requester_node == cluster_node_id
@@ -9026,21 +9550,253 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	if (!gcs_block_resource_x_peer_session_matches_exact(
 			&block->common.logical_assertion.resource,
 			authenticated_master_node,
-			block->common.master_session_incarnation))
+			block->common.master_session_incarnation)) {
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, RESOURCE_X_FAIL_AUTHORITY_DRIFT,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage,
+			failure_decision.domain, RESOURCE_X_APPLY_STALE);
+		first_failure.r4_generation = r4_record_generation;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return RESOURCE_X_APPLY_STALE;
+	}
 
+	remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_SNAPSHOT;
 	memset(&current, 0, sizeof(current));
 	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
 		&block->common.logical_assertion.resource, &buffer_id, &current);
-	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0)
-		return gcs_block_pcm_x_resource_x_remote_s_own_result(
-			own_result == CLUSTER_PCM_OWN_OK
-				? CLUSTER_PCM_OWN_CORRUPT : own_result);
+	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0) {
+		if (own_result == CLUSTER_PCM_OWN_OK)
+			own_result = CLUSTER_PCM_OWN_CORRUPT;
+		mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
+		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, failure_domain,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage, failure_decision.domain,
+			mapped_result);
+		first_failure.r4_generation = r4_record_generation;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
+		return mapped_result;
+	}
+	if (current.pcm_state == (uint8)PCM_STATE_N
+		&& current.flags == PCM_OWN_FLAG_GRANT_PENDING) {
+		own_result
+			= cluster_pcm_x_remote_s_holder_pending_grant_result(&current);
+		mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
+		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, failure_domain,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage, failure_decision.domain,
+			mapped_result);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = current.generation;
+		first_failure.buffer_generation_after = current.generation;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
+		return mapped_result;
+	}
 	buf = GetBufferDescriptor(buffer_id);
+	if (current.pcm_state == (uint8)PCM_STATE_N) {
+		/* A prior exact S->N may have left its status on an old DATA
+		 * connection.  Revalidate the stable N tuple, then re-emit only the
+		 * existing status shape on the current connection.  This branch never
+		 * claims a BufferDesc/PCM owner or changes the local page state. */
+		memset(&revalidated, 0, sizeof(revalidated));
+		own_result
+			= cluster_pcm_x_remote_s_holder_stable_n_result(&current);
+		if (own_result == CLUSTER_PCM_OWN_OK)
+			own_result = cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
+				buf, &current, &revalidated);
+		if (own_result != CLUSTER_PCM_OWN_OK) {
+			mapped_result
+				= gcs_block_resource_x_remote_s_own_result(own_result);
+			failure_domain
+				= gcs_block_resource_x_pre_mutation_domain(own_result);
+			failure_decision
+				= cluster_gcs_resource_x_remote_s_failure_decide(
+					remote_s_stage, failure_domain,
+					false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(
+				&first_failure, block, remote_s_stage,
+				failure_decision.domain, mapped_result);
+			first_failure.r4_generation = r4_record_generation;
+			first_failure.buffer_generation_before = current.generation;
+			first_failure.buffer_generation_after = revalidated.generation;
+			first_failure.buffer_token_before = current.reservation_token;
+			first_failure.buffer_token_after = revalidated.reservation_token;
+			first_failure.buffer_writer_token_before
+				= current.writer_activation_token;
+			first_failure.buffer_writer_token_after
+				= revalidated.writer_activation_token;
+			first_failure.buffer_resource_x_generation_before
+				= current.resource_x_activation_generation;
+			first_failure.buffer_resource_x_generation_after
+				= revalidated.resource_x_activation_generation;
+			first_failure.buffer_flags_before = current.flags;
+			first_failure.buffer_flags_after = revalidated.flags;
+			first_failure.buffer_pcm_state_before = current.pcm_state;
+			first_failure.buffer_pcm_state_after = revalidated.pcm_state;
+			first_failure.buffer_own_result = (int32)own_result;
+			gcs_block_resource_x_first_failure_record(&first_failure);
+			gcs_block_resource_x_failure_decision_apply(&failure_decision);
+			return mapped_result;
+		}
+		if (!cluster_semantic_activation_recheck(admission)
+			|| ((authenticated_master_node == cluster_node_id)
+				&& (cluster_ic_local_capability_word()
+					& PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) == 0)
+			|| ((authenticated_master_node != cluster_node_id)
+				&& !cluster_sf_peer_capability_generation_matches(
+					authenticated_master_node,
+					PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+					authenticated_capability_generation))
+			|| !cluster_pcm_lock_resource_x_gate_open_exact(
+				block->common.resource_formation)
+			|| !gcs_block_resource_x_peer_session_matches_exact(
+				&block->common.logical_assertion.resource,
+				authenticated_master_node,
+				block->common.master_session_incarnation)
+			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+				authenticated_master_node,
+				&outbound_connection_generation)) {
+			failure_decision
+				= cluster_gcs_resource_x_remote_s_failure_decide(
+					remote_s_stage, RESOURCE_X_FAIL_AUTHORITY_DRIFT,
+					false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(
+				&first_failure, block, remote_s_stage,
+				failure_decision.domain, RESOURCE_X_APPLY_STALE);
+			first_failure.r4_generation = r4_record_generation;
+			first_failure.buffer_generation_before = current.generation;
+			first_failure.buffer_generation_after = revalidated.generation;
+			gcs_block_resource_x_first_failure_record(&first_failure);
+			gcs_block_resource_x_failure_decision_apply(&failure_decision);
+			return RESOURCE_X_APPLY_STALE;
+		}
+		memset(&status, 0, sizeof(status));
+		status.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
+		status.payload_bytes = RESOURCE_X_CONTROL_V1_BYTES;
+		status.common = block->common;
+		status.common.action_node = cluster_node_id;
+		status.common.source_candidate = 0;
+		status.common.retain_pi_if_dirty = 0;
+		status.common.sender_connection_generation
+			= outbound_connection_generation;
+		status.common.outcome = RESOURCE_X_OUTCOME_OK;
+		if (!cluster_resource_x_wire_encode(
+				RESOURCE_X_MSG_BLOCKED_TO_N, &status, payload,
+				sizeof(payload), &payload_len, &reject)
+			|| payload_len != RESOURCE_X_CONTROL_V1_BYTES) {
+			failure_decision
+				= cluster_gcs_resource_x_remote_s_failure_decide(
+					remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
+					false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(
+				&first_failure, block, remote_s_stage,
+				failure_decision.domain,
+				RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+			first_failure.r4_generation = r4_record_generation;
+			first_failure.buffer_generation_before = current.generation;
+			first_failure.buffer_generation_after = revalidated.generation;
+			gcs_block_resource_x_first_failure_record(&first_failure);
+			gcs_block_resource_x_failure_decision_apply(&failure_decision);
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+		worker_id = cluster_lms_shard_for_tag(
+			&block->common.logical_assertion.resource, cluster_lms_workers);
+		if (worker_id < 0 || worker_id >= cluster_lms_workers) {
+			failure_decision
+				= cluster_gcs_resource_x_remote_s_failure_decide(
+					remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
+					false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(
+				&first_failure, block, remote_s_stage,
+				failure_decision.domain,
+				RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+			first_failure.r4_generation = r4_record_generation;
+			first_failure.buffer_generation_before = current.generation;
+			first_failure.buffer_generation_after = revalidated.generation;
+			gcs_block_resource_x_first_failure_record(&first_failure);
+			gcs_block_resource_x_failure_decision_apply(&failure_decision);
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+		if (!cluster_semantic_activation_recheck(admission)
+			|| !cluster_pcm_lock_resource_x_gate_open_exact(
+				block->common.resource_formation)
+			|| !gcs_block_resource_x_peer_session_matches_exact(
+				&block->common.logical_assertion.resource,
+				authenticated_master_node,
+				block->common.master_session_incarnation)
+			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+				authenticated_master_node,
+				&rechecked_outbound_connection_generation)
+			|| rechecked_outbound_connection_generation
+				!= outbound_connection_generation) {
+			failure_decision
+				= cluster_gcs_resource_x_remote_s_failure_decide(
+					remote_s_stage, RESOURCE_X_FAIL_AUTHORITY_DRIFT,
+					false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(
+				&first_failure, block, remote_s_stage,
+				failure_decision.domain, RESOURCE_X_APPLY_STALE);
+			first_failure.r4_generation = r4_record_generation;
+			first_failure.buffer_generation_before = current.generation;
+			first_failure.buffer_generation_after = revalidated.generation;
+			gcs_block_resource_x_first_failure_record(&first_failure);
+			gcs_block_resource_x_failure_decision_apply(&failure_decision);
+			return RESOURCE_X_APPLY_STALE;
+		}
+		if (!cluster_lms_outbound_enqueue_cap_bound(
+				worker_id, RESOURCE_X_MSG_BLOCKED_TO_N,
+				(uint32)authenticated_master_node, payload, payload_len,
+				PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+				outbound_connection_generation)) {
+			failure_decision
+				= cluster_gcs_resource_x_remote_s_failure_decide(
+					remote_s_stage,
+					RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE,
+					false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(
+				&first_failure, block, remote_s_stage,
+				failure_decision.domain, RESOURCE_X_APPLY_BAD_STATE);
+			first_failure.r4_generation = r4_record_generation;
+			first_failure.buffer_generation_before = current.generation;
+			first_failure.buffer_generation_after = revalidated.generation;
+			gcs_block_resource_x_first_failure_record(&first_failure);
+			gcs_block_resource_x_failure_decision_apply(&failure_decision);
+			return RESOURCE_X_APPLY_BAD_STATE;
+		}
+		return RESOURCE_X_APPLY_APPLIED;
+	}
 	own_result = cluster_bufmgr_pcm_own_s_holder_candidate_exact(
 		buf, &current);
-	if (own_result != CLUSTER_PCM_OWN_OK)
-		return gcs_block_pcm_x_resource_x_remote_s_own_result(own_result);
+	if (own_result != CLUSTER_PCM_OWN_OK) {
+		mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
+		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, failure_domain,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage, failure_decision.domain,
+			mapped_result);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = current.generation;
+		first_failure.buffer_generation_after = current.generation;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
+		return mapped_result;
+	}
 
 	memset(&status, 0, sizeof(status));
 	status.kind = RESOURCE_X_WIRE_BLOCKED_TO_N;
@@ -9053,16 +9809,59 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	if (!cluster_resource_x_wire_encode(
 			RESOURCE_X_MSG_BLOCKED_TO_N, &status, payload,
 			sizeof(payload), &payload_len, &reject)
-		|| payload_len != RESOURCE_X_CONTROL_V1_BYTES)
+			|| payload_len != RESOURCE_X_CONTROL_V1_BYTES) {
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage,
+			failure_decision.domain,
+			RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = current.generation;
+		first_failure.buffer_generation_after = current.generation;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 	worker_id = cluster_lms_shard_for_tag(
 		&block->common.logical_assertion.resource, cluster_lms_workers);
-	if (worker_id < 0 || worker_id >= cluster_lms_workers)
+	if (worker_id < 0 || worker_id >= cluster_lms_workers) {
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage,
+			failure_decision.domain,
+			RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = current.generation;
+		first_failure.buffer_generation_after = current.generation;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 
 	content_lock = BufferDescriptorGetContentLock(buf);
-	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE))
+	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage,
+				RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage,
+			failure_decision.domain,
+			RESOURCE_X_APPLY_BAD_STATE);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = current.generation;
+		first_failure.buffer_generation_after = current.generation;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return RESOURCE_X_APPLY_BAD_STATE;
+	}
 	memset(&revalidated, 0, sizeof(revalidated));
 	memset(&revoking, 0, sizeof(revoking));
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &revalidated);
@@ -9076,8 +9875,24 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		own_result = cluster_bufmgr_pcm_own_begin_s_revoke(
 			buf, &revalidated, &revoking);
 	LWLockRelease(content_lock);
-	if (own_result != CLUSTER_PCM_OWN_OK)
-		return gcs_block_pcm_x_resource_x_remote_s_own_result(own_result);
+	if (own_result != CLUSTER_PCM_OWN_OK) {
+		mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
+		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, failure_domain,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage, failure_decision.domain,
+			mapped_result);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = current.generation;
+		first_failure.buffer_generation_after = revalidated.generation;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
+		return mapped_result;
+	}
+	remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_REVOKE_HELD;
 
 	memset(&status_handle, 0, sizeof(status_handle));
 	own_result = cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
@@ -9085,12 +9900,32 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		payload, payload_len, &revoking, &status_handle);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &revoking);
-		if (abort_result != CLUSTER_PCM_OWN_OK) {
-			gcs_block_resource_x_fail_closed_current();
+		rollback_abort_ok = abort_result == CLUSTER_PCM_OWN_OK;
+		mapped_result = rollback_abort_ok
+			? gcs_block_resource_x_remote_s_own_result(own_result)
+			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, failure_domain,
+				false, false, true, rollback_abort_ok);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage, failure_decision.domain,
+			mapped_result);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = revoking.generation;
+		first_failure.buffer_generation_after = current.generation;
+		first_failure.holder_mutation_started = true;
+		first_failure.revoke_reversible = true;
+		first_failure.rollback_abort_attempted = true;
+		first_failure.rollback_abort_ok = rollback_abort_ok;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
+		if (!failure_decision.rollback_complete)
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		}
-		return gcs_block_pcm_x_resource_x_remote_s_own_result(own_result);
+		return mapped_result;
 	}
+	remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_PENDING_STAGED;
 
 	/* The type-17's authority is sampled again after cross-domain staging.
 	 * A drift cancels the unsendable slot before reopening the local S tuple. */
@@ -9112,10 +9947,30 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
 				&status_handle);
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &revoking);
-		if (cancel_result != CLUSTER_PCM_OWN_OK
-			|| abort_result != CLUSTER_PCM_OWN_OK)
-			gcs_block_resource_x_fail_closed_current();
-		return RESOURCE_X_APPLY_STALE;
+		rollback_cancel_ok = cancel_result == CLUSTER_PCM_OWN_OK;
+		rollback_abort_ok = abort_result == CLUSTER_PCM_OWN_OK;
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, RESOURCE_X_FAIL_AUTHORITY_DRIFT,
+				true, rollback_cancel_ok, true, rollback_abort_ok);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage, failure_decision.domain,
+			RESOURCE_X_APPLY_STALE);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = revoking.generation;
+		first_failure.buffer_generation_after = current.generation;
+		first_failure.holder_mutation_started = true;
+		first_failure.revoke_reversible = true;
+		first_failure.rollback_cancel_attempted = true;
+		first_failure.rollback_cancel_ok = rollback_cancel_ok;
+		first_failure.rollback_abort_attempted = true;
+		first_failure.rollback_abort_ok = rollback_abort_ok;
+		first_failure.status_staged = true;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
+		return failure_decision.rollback_complete
+			? RESOURCE_X_APPLY_STALE
+			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 
 	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
@@ -9123,12 +9978,34 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
 				&status_handle);
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &revoking);
-		if (cancel_result != CLUSTER_PCM_OWN_OK
-			|| abort_result != CLUSTER_PCM_OWN_OK) {
-			gcs_block_resource_x_fail_closed_current();
-			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		}
-		return RESOURCE_X_APPLY_BAD_STATE;
+		rollback_cancel_ok = cancel_result == CLUSTER_PCM_OWN_OK;
+		rollback_abort_ok = abort_result == CLUSTER_PCM_OWN_OK;
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage,
+				RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE,
+				true, rollback_cancel_ok, true, rollback_abort_ok);
+		mapped_result = rollback_cancel_ok && rollback_abort_ok
+			? RESOURCE_X_APPLY_BAD_STATE
+			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage, failure_decision.domain,
+			mapped_result);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = revoking.generation;
+		first_failure.buffer_generation_after = current.generation;
+		first_failure.holder_mutation_started = true;
+		first_failure.revoke_reversible = true;
+		first_failure.rollback_cancel_attempted = true;
+		first_failure.rollback_cancel_ok = rollback_cancel_ok;
+		first_failure.rollback_abort_attempted = true;
+		first_failure.rollback_abort_ok = rollback_abort_ok;
+		first_failure.status_staged = true;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
+		return failure_decision.rollback_complete
+			? RESOURCE_X_APPLY_BAD_STATE
+			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	memset(&released, 0, sizeof(released));
 	own_result = cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(
@@ -9139,20 +10016,58 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
 				&status_handle);
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &revoking);
-		if (cancel_result != CLUSTER_PCM_OWN_OK
-			|| abort_result != CLUSTER_PCM_OWN_OK) {
-			gcs_block_resource_x_fail_closed_current();
-			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		}
-		return gcs_block_pcm_x_resource_x_remote_s_own_result(own_result);
+		rollback_cancel_ok = cancel_result == CLUSTER_PCM_OWN_OK;
+		rollback_abort_ok = abort_result == CLUSTER_PCM_OWN_OK;
+		mapped_result = rollback_cancel_ok && rollback_abort_ok
+			? gcs_block_resource_x_remote_s_own_result(own_result)
+			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, failure_domain,
+				true, rollback_cancel_ok, true, rollback_abort_ok);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage, failure_decision.domain,
+			mapped_result);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = revoking.generation;
+		first_failure.buffer_generation_after = current.generation;
+		first_failure.holder_mutation_started = true;
+		first_failure.revoke_reversible = true;
+		first_failure.rollback_cancel_attempted = true;
+		first_failure.rollback_cancel_ok = rollback_cancel_ok;
+		first_failure.rollback_abort_attempted = true;
+		first_failure.rollback_abort_ok = rollback_abort_ok;
+		first_failure.status_staged = true;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
+		return failure_decision.rollback_complete
+			? mapped_result : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
+	remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_COMMITTED_N;
 	own_result
 		= cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
 			&status_handle, &released);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
-		gcs_block_resource_x_fail_closed_current();
+		failure_decision
+			= cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage,
+				RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY,
+				false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(
+			&first_failure, block, remote_s_stage,
+			failure_decision.domain,
+			RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		first_failure.r4_generation = r4_record_generation;
+		first_failure.buffer_generation_before = revoking.generation;
+		first_failure.buffer_generation_after = released.generation;
+		first_failure.holder_mutation_started = true;
+		first_failure.status_staged = true;
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
+	remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_READY_PUBLISHED;
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
@@ -9232,7 +10147,8 @@ gcs_block_resource_x_type17_ingress(
 				result
 					= gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 						frame, master_node,
-						authenticated_connection_generation);
+						authenticated_connection_generation,
+						admission.record_generation, &admission);
 			else
 				result = cluster_pcm_lock_resource_x_block_to_n_exact(
 					frame, master_node);
@@ -9514,12 +10430,15 @@ gcs_block_resource_x_source_settlement_ingress(
 	uint32 sender_connection_generation)
 {
 	ResourceXDecodedFrame ack;
+	ResourceXSourceSettlementPlan plan;
+	ResourceXSourceSettlementCommitObservation commit_observation;
+	ResourceXApplyResult ack_result;
 	ResourceXApplyResult result;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	ClusterPcmOwnResult own_result;
 	bool ack_enqueued;
+	bool release_applied = false;
 	uint8 payload[RESOURCE_X_PROOF_V1_BYTES];
-	uint64 source_generation = 0;
 	uint16 payload_bytes = 0;
 
 	if (env == NULL || settlement == NULL
@@ -9527,37 +10446,96 @@ gcs_block_resource_x_source_settlement_ingress(
 		|| env->source_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| sender_connection_generation == 0)
 		return RESOURCE_X_APPLY_INVALID;
+	memset(&plan, 0, sizeof(plan));
+	memset(&commit_observation, 0, sizeof(commit_observation));
 	result = cluster_pcm_lock_resource_x_source_settlement_prepare_exact(
-		settlement, (int32)env->source_node_id, &source_generation);
-	if (result == RESOURCE_X_APPLY_APPLIED) {
+		settlement, (int32)env->source_node_id, &plan);
+	if (result == RESOURCE_X_APPLY_APPLIED && !plan.valid) {
+		gcs_block_resource_x_source_settlement_failure_record(
+			settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
+			RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
+			RESOURCE_X_APPLY_RECOVERY_BLOCKED, 0, -1, false, false);
+		gcs_block_resource_x_fail_closed_current();
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (result == RESOURCE_X_APPLY_APPLIED && plan.valid) {
 		own_result
 			= cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
-			&settlement->common.logical_assertion.resource,
-			source_generation);
+			&plan.assertion.resource, plan.source_generation,
+			&release_applied);
 		if (own_result == CLUSTER_PCM_OWN_BUSY
-			|| own_result == CLUSTER_PCM_OWN_NOT_READY)
+			|| own_result == CLUSTER_PCM_OWN_NOT_READY) {
+			gcs_block_resource_x_source_settlement_failure_record(
+				settlement, NULL,
+				RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
+				gcs_block_resource_x_source_settlement_own_domain(
+					own_result, release_applied),
+				RESOURCE_X_APPLY_BAD_STATE, plan.source_generation,
+				(int32)own_result, release_applied, false);
 			return RESOURCE_X_APPLY_BAD_STATE;
+		}
 		if (own_result != CLUSTER_PCM_OWN_OK) {
+			gcs_block_resource_x_source_settlement_failure_record(
+				settlement, NULL,
+				RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
+				gcs_block_resource_x_source_settlement_own_domain(
+					own_result, release_applied),
+				RESOURCE_X_APPLY_RECOVERY_BLOCKED, plan.source_generation,
+				(int32)own_result, release_applied, false);
+			gcs_block_resource_x_fail_closed_current();
+			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+		if (!release_applied) {
+			gcs_block_resource_x_source_settlement_failure_record(
+				settlement, NULL,
+				RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
+				RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
+				RESOURCE_X_APPLY_RECOVERY_BLOCKED,
+				plan.source_generation, (int32)own_result,
+				false, false);
 			gcs_block_resource_x_fail_closed_current();
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		}
 		result = cluster_pcm_lock_resource_x_source_settlement_commit_exact(
-			settlement, (int32)env->source_node_id, source_generation);
+			settlement, (int32)env->source_node_id, &plan,
+			&commit_observation);
 		if (result != RESOURCE_X_APPLY_APPLIED
 			&& result != RESOURCE_X_APPLY_DUPLICATE) {
+			gcs_block_resource_x_source_settlement_failure_record(
+				settlement, &commit_observation,
+				RESOURCE_X_SOURCE_SETTLEMENT_STAGE_COMMIT,
+				RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY, result,
+				plan.source_generation, -1, release_applied, false);
 			gcs_block_resource_x_fail_closed_current();
 			return result;
 		}
 	}
-	else if (result != RESOURCE_X_APPLY_DUPLICATE)
+	else if (result != RESOURCE_X_APPLY_DUPLICATE) {
+		gcs_block_resource_x_source_settlement_failure_record(
+			settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
+			gcs_block_resource_x_source_settlement_apply_domain(result),
+			result, plan.source_generation, -1, false, false);
 		return result;
-	if (cluster_pcm_lock_resource_x_source_settlement_ack_build_exact(
-			settlement, sender_connection_generation, &ack)
-			!= RESOURCE_X_APPLY_APPLIED
-		|| !cluster_resource_x_wire_encode(
+	}
+	ack_result = cluster_pcm_lock_resource_x_source_settlement_ack_build_exact(
+		settlement, sender_connection_generation, &ack);
+	if (ack_result != RESOURCE_X_APPLY_APPLIED) {
+		gcs_block_resource_x_source_settlement_failure_record(
+			settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_ACK_BUILD,
+			RESOURCE_X_FAIL_INTERNAL_CORRUPTION, ack_result,
+			plan.source_generation, -1, release_applied, false);
+		gcs_block_resource_x_fail_closed_current();
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
+	if (!cluster_resource_x_wire_encode(
 			RESOURCE_X_MSG_BLOCKED_TO_N, &ack, payload, sizeof(payload),
 			&payload_bytes, &reject)
 		|| payload_bytes != RESOURCE_X_PROOF_V1_BYTES) {
+		gcs_block_resource_x_source_settlement_failure_record(
+			settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_ACK_ENCODE,
+			RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
+			RESOURCE_X_APPLY_INVALID, plan.source_generation, -1,
+			release_applied, false);
 		gcs_block_resource_x_fail_closed_current();
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
@@ -9573,8 +10551,8 @@ gcs_block_resource_x_source_settlement_ingress(
 						   settlement->common.logical_assertion.requester_node,
 						   (unsigned long long)
 							settlement->common.assertion_sequence,
-						   (int)result,
-						   (unsigned long long)source_generation,
+							(int)result,
+							(unsigned long long)plan.source_generation,
 						   ack_enqueued ? 1U : 0U,
 						   sender_connection_generation)));
 	return result;
@@ -9763,6 +10741,7 @@ gcs_block_resource_x_target_acquire_internal(
 	ResourceXAcquisitionRef *ref_out)
 {
 	ClusterPcmOwnSnapshot own;
+	ClusterPcmOwnSnapshot failure_live;
 	ClusterPcmOwnResult own_result;
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -9772,17 +10751,21 @@ gcs_block_resource_x_target_acquire_internal(
 	ResourceXAcquisitionRef terminal_ref;
 	ResourceXBootstrapRoundAction action
 		= RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+	ResourceXBootstrapRoundFailureSnapshot failure_round;
+	ResourceXFirstFailureEvidence first_failure;
 	ResourceXApplyResult wait_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult ownership_loss_result = RESOURCE_X_APPLY_INVALID;
+	ResourceXApplyResult failure_snapshot_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult result = RESOURCE_X_APPLY_BAD_STATE;
 	ClusterPcmOwnResult direct_candidate_result;
 	uint64 absolute_deadline_us = 0;
 	uint64 admission_record_generation = 0;
 	uint64 direct_init_committed_generation = 0;
+	uint64 diagnostic_request_sequence = 0;
 	uint64 master_session = 0;
 	uint64 now_us = 0;
 	uint64 remaining_us;
-	uint64 retry_slice_us;
+	uint64 retry_slice_us = 0;
 	uint32 requester_sender_connection_generation = 0;
 	uint32 master_ingress_connection_generation = 0;
 	uint32 requester_sender_recheck = 0;
@@ -9792,6 +10775,7 @@ gcs_block_resource_x_target_acquire_internal(
 	bool cached_local_x = false;
 	bool direct_init;
 	bool direct_init_pending_n = false;
+	bool first_failure_recorded = false;
 	bool stage_ok = false;
 	bool target_install_inflight = false;
 	bool target_retained_release_inflight = false;
@@ -9801,6 +10785,7 @@ gcs_block_resource_x_target_acquire_internal(
 		memset(ref_out, 0, sizeof(*ref_out));
 	memset(&own, 0, sizeof(own));
 	memset(&gate, 0, sizeof(gate));
+	memset(&assertion, 0, sizeof(assertion));
 	direct_init = direct_init_reservation_token != 0;
 	if (buf == NULL || ref_out == NULL || r4_record_generation == 0
 		|| r4_record_generation == UINT64_MAX
@@ -9810,6 +10795,8 @@ gcs_block_resource_x_target_acquire_internal(
 		|| cluster_node_id < 0
 		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		return RESOURCE_X_APPLY_INVALID;
+	diagnostic_request_sequence
+		= gcs_block_resource_x_next_diagnostic_request_sequence();
 	if (direct_init)
 		direct_init_committed_generation
 			= direct_init_ownership_generation + 1;
@@ -9930,6 +10917,47 @@ gcs_block_resource_x_target_acquire_internal(
 								= cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
 									buf, &own);
 							if (direct_candidate_result != CLUSTER_PCM_OWN_OK) {
+								if (direct_candidate_result
+										== CLUSTER_PCM_OWN_STALE) {
+									memset(&failure_live, 0,
+										sizeof(failure_live));
+									own_result
+										= cluster_bufmgr_pcm_own_snapshot(
+											buf, &failure_live);
+									target_install_inflight
+										= own_result == CLUSTER_PCM_OWN_OK
+										  && cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
+											  &assertion, master_node,
+											  gate.formation, master_session,
+											  admission.record_generation,
+											  requester_sender_connection_generation,
+											  master_ingress_connection_generation,
+											  retry_slice_us,
+											  direct_init_ownership_generation,
+											  direct_init_reservation_token,
+											  &failure_live);
+									if (!target_install_inflight
+										&& own_result == CLUSTER_PCM_OWN_OK)
+										target_install_inflight
+											= BufferTagsEqual(
+												  &failure_live.tag,
+												  &assertion.resource)
+											  && failure_live.pcm_state
+												 == (uint8)PCM_STATE_X
+											  && failure_live.flags == 0
+											  && failure_live.generation
+												 == direct_init_committed_generation
+											  && failure_live.reservation_token
+												 == direct_init_reservation_token
+											  && failure_live.writer_activation_token
+												 == 0
+											  && failure_live.resource_x_activation_generation
+												 == 0;
+									if (target_install_inflight) {
+										own = failure_live;
+										continue;
+									}
+								}
 								result
 									= direct_candidate_result == CLUSTER_PCM_OWN_BUSY
 									? RESOURCE_X_APPLY_BAD_STATE
@@ -10000,14 +11028,93 @@ gcs_block_resource_x_target_acquire_internal(
 							 * through the existing exact BM_VALID/no-IO assertion
 							 * predicate; the master still selects DURABLE_STORAGE and
 							 * the requester installs only after the exact grant. */
+							memset(&failure_live, 0, sizeof(failure_live));
 							n_candidate_result
 								= cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
-									buf, &own);
+									buf, &own, &failure_live);
 							if (n_candidate_result != CLUSTER_PCM_OWN_OK) {
-								result
-									= gcs_block_pcm_x_resource_x_remote_s_own_result(
-										n_candidate_result);
-								break;
+								target_install_inflight
+									= n_candidate_result == CLUSTER_PCM_OWN_STALE
+									  && cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
+										  &assertion, master_node, gate.formation,
+										  master_session,
+										  admission.record_generation,
+										  requester_sender_connection_generation,
+										  master_ingress_connection_generation,
+										  retry_slice_us, &failure_live);
+								if (target_install_inflight)
+									own = failure_live;
+								else {
+									result
+										= gcs_block_pcm_x_resource_x_remote_s_own_result(
+											n_candidate_result);
+									memset(&failure_round, 0,
+										sizeof(failure_round));
+									failure_snapshot_result
+										= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+											&assertion, master_node, gate.formation,
+											master_session,
+											admission.record_generation,
+											requester_sender_connection_generation,
+											master_ingress_connection_generation,
+											retry_slice_us, &failure_round);
+									memset(&first_failure, 0,
+										sizeof(first_failure));
+									first_failure.tag = assertion.resource;
+									first_failure.request_sequence
+										= diagnostic_request_sequence;
+									first_failure.admission_generation
+										= admission.record_generation;
+									first_failure.requester_node
+										= assertion.requester_node;
+									first_failure.buffer_generation_before
+										= own.generation;
+									first_failure.buffer_generation_after
+										= failure_live.generation;
+									first_failure.buffer_token_before
+										= own.reservation_token;
+									first_failure.buffer_token_after
+										= failure_live.reservation_token;
+									first_failure.buffer_writer_token_before
+										= own.writer_activation_token;
+									first_failure.buffer_writer_token_after
+										= failure_live.writer_activation_token;
+									first_failure.buffer_resource_x_generation_before
+										= own.resource_x_activation_generation;
+									first_failure.buffer_resource_x_generation_after
+										= failure_live.resource_x_activation_generation;
+									first_failure.formation = gate.formation;
+									first_failure.master_session = master_session;
+									first_failure.r4_generation
+										= admission.record_generation;
+									first_failure.absolute_deadline_us
+										= absolute_deadline_us;
+									first_failure.remote_s_stage
+										= RESOURCE_X_REMOTE_S_STAGE_NONE;
+									first_failure.failure_domain
+										= gcs_block_resource_x_pre_mutation_domain(
+											n_candidate_result);
+									first_failure.result = result;
+									if (failure_snapshot_result
+											== RESOURCE_X_APPLY_APPLIED) {
+										first_failure.base_authority_generation
+											= failure_round.base_authority_generation;
+										first_failure.authority_generation
+											= failure_round.authority_generation;
+										first_failure.assertion_sequence
+											= failure_round.ref.acquisition_generation;
+										first_failure.round_terminal
+											= failure_round.terminal != 0;
+										first_failure.round_phase
+											= failure_round.round_phase;
+										first_failure.round_progress_flags
+											= failure_round.progress_flags;
+									}
+									gcs_block_resource_x_first_failure_record(
+										&first_failure);
+									first_failure_recorded = true;
+									break;
+								}
 							}
 						}
 					} else if (own.generation == 0) {
@@ -10207,6 +11314,63 @@ gcs_block_resource_x_target_acquire_internal(
 	}
 	PG_END_TRY();
 	cluster_semantic_activation_leave(&admission);
+	if (result != RESOURCE_X_APPLY_APPLIED && !first_failure_recorded) {
+		memset(&failure_round, 0, sizeof(failure_round));
+		failure_snapshot_result
+			= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+				&assertion, master_node, gate.formation, master_session,
+				admission_record_generation,
+				requester_sender_connection_generation,
+				master_ingress_connection_generation, retry_slice_us,
+				&failure_round);
+		memset(&failure_live, 0, sizeof(failure_live));
+		own_result = cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
+		memset(&first_failure, 0, sizeof(first_failure));
+		first_failure.tag = buf->tag;
+		first_failure.request_sequence = diagnostic_request_sequence;
+		first_failure.admission_generation = admission_record_generation;
+		first_failure.requester_node = cluster_node_id;
+		first_failure.buffer_generation_before = own.generation;
+		first_failure.buffer_generation_after
+			= own_result == CLUSTER_PCM_OWN_OK ? failure_live.generation : 0;
+		first_failure.buffer_token_before = own.reservation_token;
+		first_failure.buffer_token_after
+			= own_result == CLUSTER_PCM_OWN_OK
+			? failure_live.reservation_token : 0;
+		first_failure.buffer_writer_token_before
+			= own.writer_activation_token;
+		first_failure.buffer_writer_token_after
+			= own_result == CLUSTER_PCM_OWN_OK
+			? failure_live.writer_activation_token : 0;
+		first_failure.buffer_resource_x_generation_before
+			= own.resource_x_activation_generation;
+		first_failure.buffer_resource_x_generation_after
+			= own_result == CLUSTER_PCM_OWN_OK
+			? failure_live.resource_x_activation_generation : 0;
+		first_failure.formation = gate.formation;
+		first_failure.master_session = master_session;
+		first_failure.r4_generation = admission_record_generation;
+		first_failure.absolute_deadline_us = absolute_deadline_us;
+		first_failure.remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_NONE;
+		first_failure.failure_domain
+			= gcs_block_resource_x_target_failure_domain(
+				result, failure_snapshot_result, &failure_round, own_result);
+		first_failure.result = result;
+		if (failure_snapshot_result == RESOURCE_X_APPLY_APPLIED) {
+			first_failure.base_authority_generation
+				= failure_round.base_authority_generation;
+			first_failure.authority_generation
+				= failure_round.authority_generation;
+			first_failure.assertion_sequence
+				= failure_round.ref.acquisition_generation;
+			first_failure.round_terminal = failure_round.terminal != 0;
+			first_failure.round_phase = failure_round.round_phase;
+			first_failure.round_progress_flags
+				= failure_round.progress_flags;
+		}
+		gcs_block_resource_x_first_failure_record(&first_failure);
+		first_failure_recorded = true;
+	}
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		ereport(LOG,
 				(errmsg_internal("Resource-X target acquire diagnostic"),
@@ -10232,6 +11396,276 @@ gcs_block_resource_x_target_acquire_internal(
 						   (unsigned long long)own.resource_x_activation_generation,
 						   (unsigned long long)now_us,
 						   (unsigned long long)absolute_deadline_us)));
+	return result;
+}
+
+/* Freeze the existing kind-4 RELEASE_X while the descriptor is still the
+ * exact X+REVOKING residency.  Entry-local EVICTING is lifecycle ownership,
+ * never authority; every failure before local commit drops it exactly. */
+ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_prepare_exact(
+	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x,
+	uint64 r4_record_generation, uint64 reservation_token,
+	ResourceXTargetEvictionPlan *plan_out)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	ResourceXGateSnapshot gate;
+	ResourceXDecodedFrame release;
+	ResourceXLocalOwnerHandle owner;
+	volatile ResourceXLocalOwnerHandle cleanup_owner;
+	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
+	ResourceXApplyResult abort_result;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
+	uint64 master_session = 0;
+	uint16 payload_bytes = 0;
+	uint32 sender_connection_generation = 0;
+	uint32 sender_connection_recheck = 0;
+	int32 master_node = -1;
+	volatile bool owner_claimed = false;
+
+	if (plan_out != NULL)
+		memset(plan_out, 0, sizeof(*plan_out));
+	if (tag == NULL || exact_x == NULL || plan_out == NULL
+		|| !BufferTagsEqual(tag, &exact_x->tag)
+		|| exact_x->pcm_state != (uint8)PCM_STATE_X
+		|| exact_x->flags != PCM_OWN_FLAG_REVOKING
+		|| exact_x->generation == 0 || exact_x->generation == UINT64_MAX
+		|| reservation_token == 0 || reservation_token == UINT64_MAX
+		|| exact_x->reservation_token != reservation_token
+		|| exact_x->writer_activation_token != 0
+		|| exact_x->resource_x_activation_generation != 0
+		|| r4_record_generation == 0
+		|| r4_record_generation == UINT64_MAX || MyProc == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	memset(&admission, 0, sizeof(admission));
+	memset(&gate, 0, sizeof(gate));
+	memset(&release, 0, sizeof(release));
+	memset(&owner, 0, sizeof(owner));
+	memset((void *)&cleanup_owner, 0, sizeof(cleanup_owner));
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (admission.record_generation != r4_record_generation) {
+		cluster_semantic_activation_leave(&admission);
+		return RESOURCE_X_APPLY_STALE;
+	}
+
+	PG_TRY();
+	{
+		if (!gcs_block_resource_x_gate_session_snapshot(
+				tag, &gate, &master_node, &master_session)
+			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+				master_node, &sender_connection_generation)
+			|| !gcs_block_resource_x_target_peer_matches_exact(
+				&admission, master_node, sender_connection_generation)
+			|| !cluster_semantic_activation_recheck(&admission))
+			result = RESOURCE_X_APPLY_STALE;
+		else
+			result
+				= cluster_pcm_lock_resource_x_target_evict_prepare_exact(
+					tag, master_node, gate.formation, master_session,
+					r4_record_generation, exact_x->generation,
+					reservation_token, sender_connection_generation,
+					(int32)MyProc->pgprocno, &release, &owner);
+		if (result == RESOURCE_X_APPLY_APPLIED
+			|| result == RESOURCE_X_APPLY_DUPLICATE) {
+			memcpy((void *)&cleanup_owner, &owner, sizeof(owner));
+			owner_claimed = true;
+		}
+		if (owner_claimed
+			&& (!cluster_resource_x_wire_encode(
+					RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &release,
+					payload, sizeof(payload), &payload_bytes, &reject)
+				|| payload_bytes != RESOURCE_X_CONTROL_V1_BYTES
+				|| release.kind != RESOURCE_X_WIRE_RELEASE_X))
+			result = RESOURCE_X_APPLY_INVALID;
+		if (owner_claimed && result != RESOURCE_X_APPLY_INVALID
+			&& (!gcs_block_resource_x_gate_session_recheck(
+					tag, &gate, master_node, master_session)
+				|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+					master_node, &sender_connection_recheck)
+				|| sender_connection_recheck
+					!= sender_connection_generation
+				|| !gcs_block_resource_x_target_peer_matches_exact(
+					&admission, master_node,
+					sender_connection_recheck)
+					|| !cluster_semantic_activation_recheck(&admission)))
+			result = RESOURCE_X_APPLY_STALE;
+		if (result == RESOURCE_X_APPLY_APPLIED
+			|| result == RESOURCE_X_APPLY_DUPLICATE) {
+			plan_out->release = release;
+			plan_out->owner = owner;
+			plan_out->gate = gate;
+			plan_out->tag = *tag;
+			plan_out->cached_ownership_generation = exact_x->generation;
+			plan_out->r4_record_generation = r4_record_generation;
+			plan_out->sender_connection_generation
+				= sender_connection_generation;
+			plan_out->master_node = master_node;
+			plan_out->payload_bytes = payload_bytes;
+			memcpy(plan_out->release_payload, payload, payload_bytes);
+			plan_out->prepared = true;
+		}
+		else if (owner_claimed) {
+			abort_result
+				= cluster_pcm_lock_resource_x_target_evict_abort_exact(
+					&owner);
+			if (abort_result != RESOURCE_X_APPLY_APPLIED)
+				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		}
+	}
+	PG_CATCH();
+	{
+		if (owner_claimed) {
+			ResourceXLocalOwnerHandle catch_owner;
+
+			memcpy(&catch_owner, (const void *)&cleanup_owner,
+				sizeof(catch_owner));
+			abort_result
+				= cluster_pcm_lock_resource_x_target_evict_abort_exact(
+					&catch_owner);
+			if (abort_result != RESOURCE_X_APPLY_APPLIED)
+				gcs_block_resource_x_fail_closed_current();
+		}
+		cluster_semantic_activation_leave(&admission);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_semantic_activation_leave(&admission);
+	return result;
+}
+
+/* Publish exactly the bytes frozen by PREPARE.  A successful local apply or
+ * reliable outbound admission is recorded before the close attempt so a
+ * failed close can be retried without a second dispatch or rebuilt frame. */
+ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_publish_exact(
+	ResourceXTargetEvictionPlan *plan)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterSemanticAdmissionResult admission_result;
+	ResourceXMasterSnapshot master_snapshot;
+	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
+	uint32 sender_connection_recheck = 0;
+	uint64 master_session;
+
+	if (plan == NULL || !plan->prepared || !plan->local_n_committed
+		|| plan->payload_bytes != RESOURCE_X_CONTROL_V1_BYTES
+		|| plan->release.kind != RESOURCE_X_WIRE_RELEASE_X
+		|| plan->release.payload_bytes != RESOURCE_X_CONTROL_V1_BYTES
+		|| !BufferTagsEqual(
+			&plan->tag, &plan->release.common.logical_assertion.resource)
+		|| plan->cached_ownership_generation == 0
+		|| plan->cached_ownership_generation == UINT64_MAX
+		|| plan->r4_record_generation == 0
+		|| plan->r4_record_generation == UINT64_MAX
+		|| plan->sender_connection_generation == 0
+		|| plan->master_node < 0
+		|| plan->master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		return RESOURCE_X_APPLY_INVALID;
+	master_session = plan->release.common.master_session_incarnation;
+	memset(&admission, 0, sizeof(admission));
+	memset(&master_snapshot, 0, sizeof(master_snapshot));
+	admission_result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	if (admission.record_generation != plan->r4_record_generation) {
+		cluster_semantic_activation_leave(&admission);
+		return RESOURCE_X_APPLY_STALE;
+	}
+
+	PG_TRY();
+	{
+		if (!gcs_block_resource_x_gate_session_recheck(
+				&plan->tag, &plan->gate, plan->master_node,
+				master_session)
+			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+				plan->master_node, &sender_connection_recheck)
+			|| sender_connection_recheck
+				!= plan->sender_connection_generation
+			|| !gcs_block_resource_x_target_peer_matches_exact(
+				&admission, plan->master_node,
+				sender_connection_recheck)
+			|| !cluster_semantic_activation_recheck(&admission))
+			result = RESOURCE_X_APPLY_STALE;
+		else if (!plan->release_admitted) {
+			if (plan->master_node == cluster_node_id)
+				result = cluster_pcm_lock_resource_x_release_x_exact(
+					&plan->release, cluster_node_id, &master_snapshot);
+			else
+				result = cluster_grd_outbound_enqueue_backend_msg(
+					RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
+					(uint32)plan->master_node, plan->release_payload,
+					plan->payload_bytes)
+					? RESOURCE_X_APPLY_APPLIED
+					: RESOURCE_X_APPLY_BAD_STATE;
+			if (result == RESOURCE_X_APPLY_APPLIED
+				|| result == RESOURCE_X_APPLY_DUPLICATE)
+				plan->release_admitted = true;
+		}
+		else
+			result = RESOURCE_X_APPLY_DUPLICATE;
+
+		if ((result == RESOURCE_X_APPLY_APPLIED
+				 || result == RESOURCE_X_APPLY_DUPLICATE)
+			&& (!gcs_block_resource_x_gate_session_recheck(
+					&plan->tag, &plan->gate, plan->master_node,
+					master_session)
+				|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
+					plan->master_node, &sender_connection_recheck)
+				|| sender_connection_recheck
+					!= plan->sender_connection_generation
+				|| !gcs_block_resource_x_target_peer_matches_exact(
+					&admission, plan->master_node,
+					sender_connection_recheck)
+				|| !cluster_semantic_activation_recheck(&admission)))
+			result = RESOURCE_X_APPLY_STALE;
+		if ((result == RESOURCE_X_APPLY_APPLIED
+				 || result == RESOURCE_X_APPLY_DUPLICATE)
+			&& plan->release_admitted) {
+			result = cluster_pcm_lock_resource_x_target_evict_commit_exact(
+				&plan->release, plan->master_node,
+				plan->r4_record_generation,
+				plan->cached_ownership_generation, &plan->owner);
+			if (result == RESOURCE_X_APPLY_APPLIED
+				|| result == RESOURCE_X_APPLY_DUPLICATE)
+				plan->prepared = false;
+		}
+	}
+	PG_CATCH();
+	{
+		cluster_semantic_activation_leave(&admission);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_semantic_activation_leave(&admission);
+	return result;
+}
+
+/* PREPARE is reversible only until BufferDesc has committed X->N and before
+ * transport/apply owns the frozen release. */
+ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_abort_exact(
+	ResourceXTargetEvictionPlan *plan)
+{
+	ResourceXApplyResult result;
+
+	if (plan == NULL || !plan->prepared)
+		return RESOURCE_X_APPLY_INVALID;
+	if (plan->local_n_committed || plan->release_admitted)
+		return RESOURCE_X_APPLY_BAD_STATE;
+	result = cluster_pcm_lock_resource_x_target_evict_abort_exact(
+		&plan->owner);
+	if (result == RESOURCE_X_APPLY_APPLIED) {
+		plan->prepared = false;
+		memset(&plan->owner, 0, sizeof(plan->owner));
+	}
 	return result;
 }
 

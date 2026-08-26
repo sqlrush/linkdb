@@ -127,6 +127,156 @@ typedef enum PcmGcsTransitionApplyResult {
  */
 typedef struct GrdEntry GrdEntry;
 
+/* Stage 8 8.15-PRE-CAP D2: a directory entry may outlive the HTAB lock only
+ * through this pinned identity.  The pointer remains opaque; tag, binding
+ * generation and registry slot are the validation tuple used at release and
+ * by the later retire/reuse batches. */
+typedef enum PcmEntryLifecycle {
+	PCM_ENTRY_LIVE = 1,
+	PCM_ENTRY_QUIESCING,
+	PCM_ENTRY_RETIRING
+} PcmEntryLifecycle;
+
+typedef enum PcmEntryAcquireResult {
+	PCM_ENTRY_ACQUIRE_OK = 0,
+	PCM_ENTRY_ACQUIRE_NOT_FOUND,
+	PCM_ENTRY_ACQUIRE_RETRY_CURRENT,
+	PCM_ENTRY_ACQUIRE_NO_CAPACITY,
+	PCM_ENTRY_ACQUIRE_NOT_READY,
+	PCM_ENTRY_ACQUIRE_CORRUPT
+} PcmEntryAcquireResult;
+
+/* Stage 8 8.15-PRE-CAP D3: the sole closed refusal domain for retiring a
+ * PCM GRD binding.  These are object-lifecycle facts only; none grants or
+ * advances Resource-X authority. */
+typedef enum PcmRetireRefusal {
+	PCM_RETIRE_REFUSAL_NONE = 0,
+	PCM_RETIRE_REFUSAL_GATE_NOT_OPEN,
+	PCM_RETIRE_REFUSAL_IDENTITY_MISMATCH,
+	PCM_RETIRE_REFUSAL_LIFECYCLE_NOT_LIVE,
+	PCM_RETIRE_REFUSAL_PINNED,
+	PCM_RETIRE_REFUSAL_WAITER_PRESENT,
+	PCM_RETIRE_REFUSAL_TRANSPORT_PRESENT,
+	PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N,
+	PCM_RETIRE_REFUSAL_HOLDER_PRESENT,
+	PCM_RETIRE_REFUSAL_PI_PRESENT,
+	PCM_RETIRE_REFUSAL_WATERMARK_PRESENT,
+	PCM_RETIRE_REFUSAL_CONVERT_PENDING,
+	PCM_RETIRE_REFUSAL_RESOURCE_X_ACTIVE,
+	PCM_RETIRE_REFUSAL_RETAINED_PAIR_PRESENT,
+	PCM_RETIRE_REFUSAL_REQUESTER_NOT_TERMINAL,
+	PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL,
+	PCM_RETIRE_REFUSAL_FORMATION_STALE,
+	PCM_RETIRE_REFUSAL_ENTRY_LOCK_BUSY,
+	PCM_RETIRE_REFUSAL_N
+} PcmRetireRefusal;
+
+typedef enum PcmRetireReason {
+	PCM_RETIRE_REASON_HOLDER_RELEASE = 1,
+	PCM_RETIRE_REASON_RESOURCE_X_SETTLED,
+	PCM_RETIRE_REASON_PI_DISCARDED,
+	PCM_RETIRE_REASON_FORMATION_SWEEP,
+	PCM_RETIRE_REASON_BOUNDED_RECLAIM
+} PcmRetireReason;
+
+#define PCM_GRD_RECLAIM_SOFT_PERCENT 75
+#define PCM_GRD_LMON_RECLAIM_BUDGET 256
+#define PCM_GRD_SYNC_RECLAIM_BUDGET 64
+
+typedef struct PcmReclaimBatch {
+	uint32 examined_count;
+	uint32 attempted_count;
+	uint32 retired_count;
+	uint32 next_cursor;
+	uint8 complete_wrap;
+	uint8 reserved[7];
+} PcmReclaimBatch;
+
+StaticAssertDecl(sizeof(PcmReclaimBatch) == 24,
+				 "PcmReclaimBatch layout must remain 24 bytes");
+
+/* Read-only D5 lifecycle observability.  Every value is sourced from the
+ * native PCM directory/reclaim owner; none aliases the removed PCM-X ticket
+ * runtime or grants Resource-X authority. */
+typedef struct PcmGrdLifecycleStats {
+	uint64 live_entries;
+	uint64 tombstone_slots;
+	uint64 binding_generation;
+	uint64 reclaim_attempt_count;
+	uint64 reclaim_success_count;
+	uint64 reclaim_reuse_count;
+	uint64 capacity_retry_count;
+	uint64 capacity_fail_count;
+	uint64 peak_live_entries;
+	uint64 reclaim_refused[PCM_RETIRE_REFUSAL_N];
+} PcmGrdLifecycleStats;
+
+StaticAssertDecl(sizeof(PcmGrdLifecycleStats)
+				 == (9 + PCM_RETIRE_REFUSAL_N) * sizeof(uint64),
+				 "PcmGrdLifecycleStats must remain a fixed native counter cohort");
+
+/* Read-only current gauges for protocol debt which must drain before a
+ * lifecycle acceptance point.  These values are derived from the existing
+ * entry and Resource-X sidecar state; they are not persistent counters and
+ * carry no authority. */
+typedef struct PcmGrdProtocolDebtStats {
+	uint64 wait_refcount;
+	uint64 transport_refcount;
+	uint64 retained_entry_count;
+	uint64 active_resource_x_entry_count;
+	uint64 local_owner_entry_count;
+	uint64 evicting_entry_count;
+	uint64 invalid_entry_count;
+} PcmGrdProtocolDebtStats;
+
+StaticAssertDecl(sizeof(PcmGrdProtocolDebtStats) == 7 * sizeof(uint64),
+				 "PcmGrdProtocolDebtStats must remain a fixed read-only gauge cohort");
+
+typedef struct PcmEntryRef {
+	GrdEntry *entry;
+	BufferTag tag;
+	uint64 binding_generation;
+	uint32 registry_slot;
+	bool pinned;
+	uint8 reserved[3];
+} PcmEntryRef;
+
+StaticAssertDecl(sizeof(PcmEntryRef) == 48,
+				 "PcmEntryRef layout must remain 48 bytes");
+
+/* A staged transport may outlive the lookup pin that created it.  This
+ * exact identity keeps the binding non-retirable without granting PCM or
+ * Resource-X authority. */
+typedef struct PcmEntryTransportRef {
+	GrdEntry *entry;
+	BufferTag tag;
+	uint64 binding_generation;
+	uint32 registry_slot;
+	bool held;
+	uint8 reserved[3];
+} PcmEntryTransportRef;
+
+StaticAssertDecl(sizeof(PcmEntryTransportRef) == 48,
+				 "PcmEntryTransportRef layout must remain 48 bytes");
+
+extern bool pcm_entry_ref_acquire(const BufferTag *tag, bool create,
+	PcmEntryRef *out, PcmEntryAcquireResult *result);
+extern void pcm_entry_ref_release(PcmEntryRef *ref);
+extern bool pcm_entry_transport_ref_begin(const PcmEntryRef *entry_ref,
+	PcmEntryTransportRef *transport_ref);
+extern void pcm_entry_transport_ref_end(PcmEntryTransportRef *transport_ref);
+extern bool pcm_entry_retire_classify_exact(const BufferTag *tag,
+	uint64 expected_generation, PcmRetireRefusal *why);
+extern bool pcm_entry_try_retire_exact(const BufferTag *tag,
+	uint64 binding_generation, PcmRetireReason reason);
+extern bool cluster_pcm_lock_reclaim_bounded(uint32 probe_budget,
+	PcmReclaimBatch *out);
+extern void cluster_pcm_lock_lmon_reclaim_tick(void);
+extern void cluster_pcm_grd_lifecycle_stats_snapshot(
+	PcmGrdLifecycleStats *out);
+extern void cluster_pcm_grd_protocol_debt_snapshot(
+	PcmGrdProtocolDebtStats *out);
+
 /* Stage 8 R9: one logical Resource-X acquisition is the already-frozen D6
  * assertion plus exact formation and acquisition generation.  Transport
  * freshness remains outside logical equality. */
@@ -173,12 +323,13 @@ typedef struct ResourceXLocalOwnerHandle {
 	uint64 buffer_ownership_generation;
 	uint64 reservation_token;
 	uint64 owner_generation;
+	uint64 absolute_deadline_us;
 	int32 owner_procno;
 	uint32 reserved;
 } ResourceXLocalOwnerHandle;
 
-StaticAssertDecl(sizeof(ResourceXLocalOwnerHandle) == 88,
-				 "ResourceXLocalOwnerHandle layout must remain 88 bytes");
+StaticAssertDecl(sizeof(ResourceXLocalOwnerHandle) == 96,
+				 "ResourceXLocalOwnerHandle layout must remain 96 bytes");
 
 #define RESOURCE_X_PROGRESS_BOUND UINT32_C(0x00000001)
 #define RESOURCE_X_PROGRESS_T1 UINT32_C(0x00000002)
@@ -222,6 +373,29 @@ typedef enum ResourceXBootstrapRoundAction {
 	RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL,
 	RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
 } ResourceXBootstrapRoundAction;
+
+/* D1 read-only projection of the existing requester round.  It deliberately
+ * carries no new authority and no entry binding generation: D2 introduces
+ * that lifetime identity.  A zero binding generation in D1 logs therefore
+ * means "not yet present", never a fabricated value. */
+typedef struct ResourceXBootstrapRoundFailureSnapshot {
+	ResourceXAcquisitionRef ref;
+	uint64 base_authority_generation;
+	uint64 authority_generation;
+	uint64 buffer_ownership_generation;
+	uint64 r4_record_generation;
+	uint64 master_session_incarnation;
+	uint64 absolute_deadline_us;
+	uint64 requester_base_generation;
+	uint64 retired_acquisition_generation;
+	uint32 progress_flags;
+	uint8 round_phase;
+	uint8 terminal;
+	uint8 reserved[2];
+} ResourceXBootstrapRoundFailureSnapshot;
+
+StaticAssertDecl(sizeof(ResourceXBootstrapRoundFailureSnapshot) == 112,
+				 "ResourceXBootstrapRoundFailureSnapshot layout must remain 112 bytes");
 
 typedef enum ResourceXExecutorProbeResult {
 	RESOURCE_X_EXECUTOR_READY = 0,
@@ -865,6 +1039,7 @@ extern void cluster_pcm_lock_downgrade(BufferTag tag, PcmLockMode target_mode, b
  *	  initializes the header, HTAB, HTAB lock, and per-entry locks lazily.
  */
 extern PcmLockMode cluster_pcm_lock_query(BufferTag tag);
+extern int cluster_pcm_grd_capacity(void);
 extern bool cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out);
 extern bool cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *authority_out,
 										uint64 *master_authority_generation_out,
@@ -995,6 +1170,26 @@ cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
 	uint64 r4_record_generation, uint64 cached_ownership_generation,
 	uint64 terminal_authority_generation, uint64 now_us);
+/* TARGET cached-X eviction lifecycle.  PREPARE claims the sole entry-local
+ * EVICTING owner and freezes kind-4 while the BufferDesc is still exact
+ * X+REVOKING.  ABORT is pre-mutation only; COMMIT is called only after local
+ * apply or reliable transport admission and clears cover+owner together. */
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_prepare_exact(
+	const BufferTag *tag, int32 current_master_node,
+	uint64 resource_formation, uint64 master_session_incarnation,
+	uint64 r4_record_generation, uint64 cached_ownership_generation,
+	uint64 reservation_token, uint32 sender_connection_generation,
+	int32 owner_procno, ResourceXDecodedFrame *release_out,
+	ResourceXLocalOwnerHandle *handle_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_abort_exact(
+	const ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_target_evict_commit_exact(
+	const ResourceXDecodedFrame *release, int32 current_master_node,
+	uint64 r4_record_generation, uint64 cached_ownership_generation,
+	const ResourceXLocalOwnerHandle *handle);
 extern bool
 cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(
 	const ResourceXAcquisitionRef *ref,
@@ -1051,6 +1246,14 @@ cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
 	const ResourceXAcquisitionRef *ref,
 	uint64 *direct_init_ownership_generation_out,
 	uint64 *direct_init_reservation_token_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node,
+	uint64 resource_formation, uint64 master_session_incarnation,
+	uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation,
+	uint32 master_ingress_connection_generation, uint64 retry_slice_us,
+	ResourceXBootstrapRoundFailureSnapshot *out);
 extern bool
 cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
@@ -1063,6 +1266,10 @@ cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(
 	uint32 requester_sender_connection_generation,
 	uint32 master_ingress_connection_generation, uint64 retry_slice_us,
 	const struct ClusterPcmOwnSnapshot *observed);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_note_x_to_s_exact(
+	const struct ClusterPcmOwnSnapshot *revoking,
+	const struct ClusterPcmOwnSnapshot *shared);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node);
 extern ResourceXApplyResult
@@ -1153,14 +1360,103 @@ extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_source_settlement_intent_snapshot_exact(
 	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
 	void *payload_out, uint16 payload_capacity);
+
+/* Process-local freshness evidence for one SourceSettlement ingress.  The
+ * plan is never serialized or retained and grants no Resource-X authority. */
+typedef enum ResourceXSourceSettlementCoverAction {
+	RESOURCE_X_SETTLEMENT_COVER_NO_COVER = 0,
+	RESOURCE_X_SETTLEMENT_COVER_CLOSE_EXACT_X = 1
+} ResourceXSourceSettlementCoverAction;
+
+typedef struct ResourceXSourceSettlementPlan {
+	ResourceXAssertion assertion;
+	ResourceXAcquisitionRef terminal_ref;
+	uint64 resource_formation;
+	uint64 master_session_incarnation;
+	uint64 assertion_sequence;
+	uint64 pair_base_authority_generation;
+	uint64 pair_image_authority_generation;
+	uint64 source_generation;
+	uint64 carrier_generation;
+	uint64 terminal_cached_generation;
+	uint64 terminal_authority_generation;
+	uint64 terminal_r4_record_generation;
+	uint32 status_semantic_crc32c;
+	uint32 image_semantic_crc32c;
+	int32 authenticated_master_node;
+	uint8 source_mode;
+	uint8 cover_action;
+	uint16 reserved;
+	bool valid;
+} ResourceXSourceSettlementPlan;
+
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_source_settlement_prepare_exact(
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
-	uint64 *source_generation_out);
+	ResourceXSourceSettlementPlan *plan_out);
+
+/* Stack-only D1 observation of the entry-lock state that accepted or refused
+ * the post-BufferDesc half of SourceSettlementV2.  It is neither wire nor
+ * shared authority and must never be retained as protocol state. */
+typedef enum ResourceXSourceSettlementCommitStage {
+	RESOURCE_X_SOURCE_SETTLEMENT_COMMIT_STAGE_NONE = 0,
+	RESOURCE_X_SOURCE_SETTLEMENT_COMMIT_STAGE_ENTRY_LOOKUP,
+	RESOURCE_X_SOURCE_SETTLEMENT_COMMIT_STAGE_MASTER_STATE,
+	RESOURCE_X_SOURCE_SETTLEMENT_COMMIT_STAGE_DRAIN_DOMAIN,
+	RESOURCE_X_SOURCE_SETTLEMENT_COMMIT_STAGE_PAIR_DECODE,
+	RESOURCE_X_SOURCE_SETTLEMENT_COMMIT_STAGE_PAIR_IDENTITY,
+	RESOURCE_X_SOURCE_SETTLEMENT_COMMIT_STAGE_PAIR_STATE,
+	RESOURCE_X_SOURCE_SETTLEMENT_COMMIT_STAGE_TERMINAL_COVER
+} ResourceXSourceSettlementCommitStage;
+
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_PAIR_BYTES UINT32_C(0x00000001)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_GATE_FORMATION UINT32_C(0x00000002)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_PAIR_DESTINATION UINT32_C(0x00000004)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_SOURCE_GENERATION UINT32_C(0x00000008)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_ACTION UINT32_C(0x00000010)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_REQUESTER UINT32_C(0x00000020)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_MASTER UINT32_C(0x00000040)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_FORMATION UINT32_C(0x00000080)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_SESSION UINT32_C(0x00000100)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_AUTHORITY UINT32_C(0x00000200)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_OWNERSHIP UINT32_C(0x00000400)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_COVER UINT32_C(0x00000800)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_OWNER_INVALID UINT32_C(0x00001000)
+#define RESOURCE_X_SOURCE_SETTLEMENT_MISMATCH_TERMINAL_OWNER_NONEMPTY UINT32_C(0x00002000)
+
+typedef struct ResourceXSourceSettlementCommitObservation {
+	uint64 current_resource_formation;
+	uint64 current_master_session;
+	uint64 current_terminal_authority_generation;
+	uint64 current_cached_ownership_generation;
+	uint64 current_pair_resource_formation;
+	uint64 current_pair_master_session;
+	uint64 current_pair_assertion_sequence;
+	uint64 current_pair_source_generation;
+	uint64 current_pair_carrier_generation;
+	uint32 mismatch_mask;
+	int32 current_master_node;
+	uint32 current_pair_destination_node;
+	uint8 current_round_phase;
+	uint8 current_owner_state;
+	uint8 current_holder_status_valid;
+	uint8 current_holder_image_valid;
+	uint8 current_status_intent_state;
+	uint8 current_image_intent_state;
+	uint8 commit_stage;
+	uint8 current_pair_observed_mode;
+	uint8 current_cover_action;
+	uint8 current_terminal_cover_present;
+} ResourceXSourceSettlementCommitObservation;
+
+StaticAssertDecl(sizeof(ResourceXSourceSettlementCommitObservation) == 96,
+	"ResourceXSourceSettlementCommitObservation layout must remain 96 bytes");
+
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_source_settlement_commit_exact(
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
-	uint64 source_generation);
+	const ResourceXSourceSettlementPlan *plan,
+	ResourceXSourceSettlementCommitObservation *observation_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_source_settlement_ack_build_exact(
 	const ResourceXDecodedFrame *settlement,

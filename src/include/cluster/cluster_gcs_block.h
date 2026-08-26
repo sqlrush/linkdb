@@ -80,6 +80,104 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+/* Stage 8 8.15-PRE-CAP D1: diagnostic-only failure axes.  These values are
+ * process-internal observability, not wire outcomes or a second authority.
+ * NONE is retained so successful/unknown observations are never fabricated
+ * as one of the four frozen failure domains. */
+typedef enum ResourceXRemoteSStage {
+	RESOURCE_X_REMOTE_S_STAGE_NONE = 0,
+	RESOURCE_X_REMOTE_S_STAGE_VALIDATE,
+	RESOURCE_X_REMOTE_S_STAGE_SNAPSHOT,
+	RESOURCE_X_REMOTE_S_STAGE_REVOKE_HELD,
+	RESOURCE_X_REMOTE_S_STAGE_PENDING_STAGED,
+	RESOURCE_X_REMOTE_S_STAGE_COMMITTED_N,
+	RESOURCE_X_REMOTE_S_STAGE_READY_PUBLISHED
+} ResourceXRemoteSStage;
+
+typedef enum ResourceXFailureDomain {
+	RESOURCE_X_FAIL_NONE = 0,
+	RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE,
+	RESOURCE_X_FAIL_AUTHORITY_DRIFT,
+	RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY,
+	RESOURCE_X_FAIL_INTERNAL_CORRUPTION
+} ResourceXFailureDomain;
+
+typedef struct ResourceXRemoteSFailureDecision {
+	ResourceXFailureDomain domain;
+	bool global_fail_closed;
+	bool discard_old_round;
+	bool rollback_complete;
+} ResourceXRemoteSFailureDecision;
+
+/* D6 keeps result mapping separate from the safety policy.  The caller first
+ * performs every rollback operation required by the frozen remote-S stage,
+ * then feeds the observed outcomes here.  Missing or failed rollback after a
+ * reversible holder mutation is ambiguous; once S has committed to N, every
+ * publication failure is ambiguous.  This helper owns no state and grants no
+ * authority. */
+static inline ResourceXRemoteSFailureDecision
+cluster_gcs_resource_x_remote_s_failure_decide(
+	ResourceXRemoteSStage stage, ResourceXFailureDomain cause_domain,
+	bool cancel_attempted, bool cancel_ok,
+	bool abort_attempted, bool abort_ok)
+{
+	ResourceXRemoteSFailureDecision decision;
+
+	decision.domain = RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+	decision.global_fail_closed = true;
+	decision.discard_old_round = false;
+	decision.rollback_complete = false;
+	if (cause_domain <= RESOURCE_X_FAIL_NONE
+		|| cause_domain > RESOURCE_X_FAIL_INTERNAL_CORRUPTION)
+		return decision;
+
+	switch (stage) {
+	case RESOURCE_X_REMOTE_S_STAGE_VALIDATE:
+	case RESOURCE_X_REMOTE_S_STAGE_SNAPSHOT:
+		if (cancel_attempted || abort_attempted)
+			return decision;
+		decision.rollback_complete = true;
+		break;
+	case RESOURCE_X_REMOTE_S_STAGE_REVOKE_HELD:
+		if (cancel_attempted || !abort_attempted)
+			return decision;
+		if (!abort_ok) {
+			decision.domain
+				= RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+			return decision;
+		}
+		decision.rollback_complete = true;
+		break;
+	case RESOURCE_X_REMOTE_S_STAGE_PENDING_STAGED:
+		if (!cancel_attempted || !abort_attempted)
+			return decision;
+		if (!cancel_ok || !abort_ok) {
+			decision.domain
+				= RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+			return decision;
+		}
+		decision.rollback_complete = true;
+		break;
+	case RESOURCE_X_REMOTE_S_STAGE_COMMITTED_N:
+		if (cancel_attempted || abort_attempted)
+			return decision;
+		decision.domain = RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+		return decision;
+	case RESOURCE_X_REMOTE_S_STAGE_NONE:
+	case RESOURCE_X_REMOTE_S_STAGE_READY_PUBLISHED:
+	default:
+		return decision;
+	}
+
+	decision.domain = cause_domain;
+	decision.global_fail_closed
+		= cause_domain == RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY
+		  || cause_domain == RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+	decision.discard_old_round
+		= cause_domain == RESOURCE_X_FAIL_AUTHORITY_DRIFT;
+	return decision;
+}
+
 /* One lock-free authority observation.  The qvotec slot tuple and the
  * connection capability record have different publishers, so consumers must
  * sample both ends and reject a change as retryable rather than accepting a
@@ -3149,6 +3247,21 @@ gcs_block_holder_refusal_retry_exact(int32 forwarding_master,
 	return false;
 }
 
+/* A forwarded N->S refusal is a pre-mutation carrier drift, not a terminal
+ * reader error.  Return through the existing outer retry boundary so bufmgr
+ * first aborts the exact GRANT_PENDING reservation and the next attempt uses
+ * a fresh request identity.  Direct master denials and writer transitions do
+ * not qualify. */
+static inline bool
+gcs_block_forwarded_s_refusal_requires_fresh_retry(
+	GcsBlockReplyStatus status, uint8 transition_id,
+	int32 forwarding_master)
+{
+	return status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+		&& transition_id == (uint8)PCM_TRANS_N_TO_S
+		&& forwarding_master >= 0 && forwarding_master < 32;
+}
+
 /* PGRAC: spec-5.2a D3 — pure master-side decision for an eligible clean-page
  * (sequence) X request.  Kept pure (no shmem / no I/O) so the 5-branch truth
  * table is unit-tested standalone (U3).  The handler runs ON the GCS master,
@@ -3955,11 +4068,44 @@ typedef struct ResourceXWriterUseContext {
 StaticAssertDecl(sizeof(ResourceXWriterUseContext) == 72,
 	"ResourceXWriterUseContext layout must remain 72 bytes");
 
+/* Process-local TARGET cached-X eviction plan.  It is never serialized or
+ * stored in shared memory: PREPARE freezes the exact existing kind-4 bytes
+ * while BufferDesc is still X+REVOKING, LOCAL COMMIT is recorded by the
+ * caller, and PUBLISH transfers those same bytes before closing the exact
+ * EVICTING owner and terminal cover. */
+typedef struct ResourceXTargetEvictionPlan {
+	ResourceXDecodedFrame release;
+	ResourceXLocalOwnerHandle owner;
+	ResourceXGateSnapshot gate;
+	BufferTag tag;
+	uint64 cached_ownership_generation;
+	uint64 r4_record_generation;
+	uint32 sender_connection_generation;
+	int32 master_node;
+	uint16 payload_bytes;
+	bool prepared;
+	bool local_n_committed;
+	bool release_admitted;
+	uint8 reserved[3];
+	uint8 release_payload[RESOURCE_X_CONTROL_V1_BYTES];
+} ResourceXTargetEvictionPlan;
+
 /* TARGET-only requester: join/create the per-resource bootstrap round and
  * return only its exact post-T3 retained acquisition ref. */
 extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,
 	ResourceXAcquisitionRef *ref_out);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_prepare_exact(
+	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x,
+	uint64 r4_record_generation, uint64 reservation_token,
+	ResourceXTargetEvictionPlan *plan_out);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_publish_exact(
+	ResourceXTargetEvictionPlan *plan);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_abort_exact(
+	ResourceXTargetEvictionPlan *plan);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_direct_init_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,

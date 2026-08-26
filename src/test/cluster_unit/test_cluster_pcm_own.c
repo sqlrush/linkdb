@@ -531,6 +531,102 @@ UT_TEST(test_invalid_live_flag_shapes_are_corrupt_not_busy)
 	free(source);
 }
 
+UT_TEST(test_remote_s_holder_pending_grant_is_retryable_busy)
+{
+	ClusterPcmOwnSnapshot snapshot;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.pcm_state = (uint8)PCM_STATE_N;
+	snapshot.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	snapshot.reservation_token = 1;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+		CLUSTER_PCM_OWN_BUSY);
+
+	/* The narrow retry classification must not hide malformed reservation
+	 * evidence or an already active writer/Resource-X fence. */
+	snapshot.reservation_token = 0;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+	snapshot.reservation_token = UINT64_MAX;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+	snapshot.reservation_token = 1;
+	snapshot.generation = UINT64_MAX;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+	snapshot.generation = 0;
+	snapshot.writer_activation_token = 1;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+	snapshot.writer_activation_token = 0;
+	snapshot.resource_x_activation_generation = 1;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+
+	/* Clean S remains owned by the existing exact candidate path. */
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.pcm_state = (uint8)PCM_STATE_S;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_pending_grant_result(&snapshot),
+		CLUSTER_PCM_OWN_INVALID);
+}
+
+UT_TEST(test_remote_s_holder_stable_n_replay_requires_exact_idle_tuple)
+{
+	ClusterPcmOwnSnapshot snapshot;
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.pcm_state = (uint8)PCM_STATE_N;
+	snapshot.generation = 2;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
+		CLUSTER_PCM_OWN_OK);
+
+	/* Stable-N idempotence is narrower than the general N assertion shape:
+	 * it is unavailable before a committed transition and rejects every live
+	 * or residual ownership axis instead of manufacturing replay identity. */
+	snapshot.generation = 0;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
+		CLUSTER_PCM_OWN_STALE);
+	snapshot.generation = UINT64_MAX;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+	snapshot.generation = 2;
+	snapshot.flags = PCM_OWN_FLAG_REVOKING;
+	snapshot.reservation_token = 1;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
+		CLUSTER_PCM_OWN_BUSY);
+	snapshot.flags = 0;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+	snapshot.reservation_token = 0;
+	snapshot.writer_activation_token = 1;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+	snapshot.writer_activation_token = 0;
+	snapshot.resource_x_activation_generation = 1;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
+		CLUSTER_PCM_OWN_CORRUPT);
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.pcm_state = (uint8)PCM_STATE_S;
+	snapshot.generation = 2;
+	UT_ASSERT_EQ(
+		cluster_pcm_x_remote_s_holder_stable_n_result(&snapshot),
+		CLUSTER_PCM_OWN_INVALID);
+}
+
 UT_TEST(test_grant_commit_is_exact_and_bumps_once)
 {
 	uint64 token;
@@ -977,6 +1073,51 @@ UT_TEST(test_eviction_rejects_live_reservation_and_exhaustion)
 	UT_ASSERT(cluster_pcm_own_eviction_reuse_allowed(&capture));
 	capture.generation = UINT64_MAX;
 	UT_ASSERT(!cluster_pcm_own_eviction_reuse_allowed(&capture));
+}
+
+UT_TEST(test_target_eviction_bufferdesc_lifecycle_is_reversible_before_local_commit)
+{
+	static const char *const begin_contract[] = {
+		"base->pcm_state != (uint8) PCM_STATE_X",
+		"cluster_pcm_own_snapshot_matches_locked(buf, base)",
+		"cluster_pcm_own_reservation_begin_exact",
+		"PCM_OWN_FLAG_REVOKING",
+		"cluster_pcm_own_snapshot_locked(buf, revoking_out)"
+	};
+	static const char *const finish_contract[] = {
+		"expected_revoking->pcm_state != (uint8) PCM_STATE_X",
+		"expected_revoking->flags != PCM_OWN_FLAG_REVOKING",
+		"cluster_pcm_own_snapshot_matches_locked(buf, expected_revoking)",
+		"cluster_pcm_own_revoke_commit_exact",
+		"buf->pcm_state = (uint8) PCM_STATE_N",
+		"cluster_pcm_own_snapshot_locked(buf, committed_n_out)"
+	};
+	static const char *const abort_contract[] = {
+		"cluster_pcm_own_snapshot_matches_locked(buf, expected_revoking)",
+		"cluster_pcm_own_reservation_abort_exact",
+		"PCM_OWN_FLAG_REVOKING",
+		"cluster_pcm_own_snapshot_locked(buf, restored_x_out)"
+	};
+	char *source = read_bufmgr_source();
+
+	/* The TARGET cached-X release proof must be frozen while the descriptor is
+	 * still X.  These helpers define the reversible BufferDesc half: begin
+	 * publishes an exact REVOKING token without changing mode or tag, finish is
+	 * the sole X->N generation bump, and abort restores the same X residency.
+	 * Stale identity is rejected before any sidecar mutation. */
+	assert_ordered_in_function(
+		source, "\ncluster_pcm_own_eviction_begin_locked(",
+		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_finish_locked(",
+		begin_contract, lengthof(begin_contract));
+	assert_ordered_in_function(
+		source, "\ncluster_pcm_own_eviction_finish_locked(",
+		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_abort_locked(",
+		finish_contract, lengthof(finish_contract));
+	assert_ordered_in_function(
+		source, "\ncluster_pcm_own_eviction_abort_locked(",
+		"\nstatic ClusterPcmOwnResult\ncluster_pcm_own_eviction_commit_locked(",
+		abort_contract, lengthof(abort_contract));
+	free(source);
 }
 
 static char *
@@ -1439,6 +1580,104 @@ UT_TEST(test_d5a_release_error_keeps_descriptor_out_of_freelist)
 	assert_ordered_in_function(source, "\nInvalidateBufferCommitLocked(",
 							   "\n/*\n * InvalidateBufferTry", fail_closed_contract,
 							   lengthof(fail_closed_contract));
+	free(source);
+}
+
+UT_TEST(test_resource_x_target_cached_x_eviction_uses_native_exact_release)
+{
+	static const char *const lifecycle_contract[] = {
+		"cluster_pcm_own_eviction_begin_locked(",
+		"UnlockBufHdr",
+		"LWLockRelease(partition_lock)",
+		"cluster_gcs_resource_x_target_evict_prepare_exact(",
+		"LWLockAcquire(partition_lock, LW_EXCLUSIVE)",
+		"LockBufHdr(buf)",
+		"cluster_pcm_own_eviction_finish_locked(",
+		"ClearBufferTag(&buf->tag)",
+		"UnlockBufHdr(buf, buf_state)",
+		"BufTableDelete(tag, hash)",
+		"LWLockRelease(partition_lock)",
+		"plan.local_n_committed = true",
+		"cluster_gcs_resource_x_target_evict_publish_exact(&plan)",
+		"StrategyFreeBuffer"
+	};
+	static const char *const abort_contract[] = {
+		"cluster_gcs_resource_x_target_evict_abort_exact(&plan)",
+		"cluster_pcm_own_eviction_abort_locked(",
+		"cluster_bufmgr_resource_x_fail_closed_current()"
+	};
+	static const char *const commit_entry_contract[] = {
+		"cluster_pcm_own_eviction_capture_locked",
+		"cluster_resource_x_writer_path_snapshot(",
+		"current_writer_path == RESOURCE_X_WRITER_TARGET",
+		"eviction_capture.pcm_state == (uint8)PCM_STATE_X",
+		"return cluster_bufmgr_resource_x_target_evict_locked("
+	};
+	char *source = read_bufmgr_source();
+	const char *helper;
+	const char *helper_end;
+
+	/* TARGET cached-X eviction is one shared four-phase lifecycle.  The helper
+	 * fences X first, drops every buffer lock before PREPARE, commits the exact
+	 * token only after reacquiring the same mapping/header, and publishes the
+	 * frozen plan before an explicit invalidation returns it to the freelist. */
+	assert_ordered_in_function(
+		source, "\ncluster_bufmgr_resource_x_target_evict_locked(",
+		"\n/*\n * InvalidateBufferCommitLocked", lifecycle_contract,
+		lengthof(lifecycle_contract));
+	assert_ordered_in_function(
+		source, "\ncluster_bufmgr_resource_x_target_evict_locked(",
+		"\n/*\n * InvalidateBufferCommitLocked", abort_contract,
+		lengthof(abort_contract));
+	assert_ordered_in_function(source, "\nInvalidateBufferCommitLocked(",
+		"\n/*\n * InvalidateBufferCommitTailLocked", commit_entry_contract,
+		lengthof(commit_entry_contract));
+	helper = strstr(source,
+		"\ncluster_bufmgr_resource_x_target_evict_locked(");
+	helper_end = helper == NULL ? NULL : strstr(helper,
+		"\n/*\n * InvalidateBufferCommitLocked");
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(helper_end);
+	if (helper != NULL && helper_end != NULL) {
+		const char *late_commit = strstr(helper,
+			"cluster_pcm_own_eviction_commit_locked(");
+
+		UT_ASSERT(late_commit == NULL || late_commit >= helper_end);
+	}
+	UT_ASSERT_NULL(strstr(source,
+		"cluster_gcs_resource_x_target_evict_release_exact("));
+	free(source);
+}
+
+UT_TEST(test_resource_x_target_clock_sweep_eviction_uses_native_exact_release)
+{
+	static const char *const victim_contract[] = {
+		"ClusterPcmOwnEvictionCapture eviction_capture",
+		"cluster_pcm_own_eviction_capture_locked",
+		"cluster_resource_x_writer_path_snapshot(",
+		"current_writer_path == RESOURCE_X_WRITER_TARGET",
+		"eviction_capture.pcm_state == (uint8)PCM_STATE_X",
+		"return cluster_bufmgr_resource_x_target_evict_locked("
+	};
+	char *source = read_bufmgr_source();
+	const char *victim = strstr(source, "\nInvalidateVictimBuffer(");
+	const char *victim_end = victim != NULL
+		? strstr(victim, "\nstatic Buffer\nGetVictimBuffer(") : NULL;
+
+	/* Clock-sweep reuse joins the same pre-fenced helper while retaining its
+	 * caller pin.  It does not duplicate the protocol or rebuild kind-4 after
+	 * the descriptor has become N. */
+	assert_ordered_in_function(
+		source, "\nInvalidateVictimBuffer(",
+		"\nstatic Buffer\nGetVictimBuffer(", victim_contract,
+		lengthof(victim_contract));
+	UT_ASSERT_NOT_NULL(victim);
+	UT_ASSERT_NOT_NULL(victim_end);
+	if (victim != NULL && victim_end != NULL) {
+		const char *restore = strstr(victim, "buf_hdr->tag = tag");
+
+		UT_ASSERT(restore == NULL || restore >= victim_end);
+	}
 	free(source);
 }
 
@@ -2177,6 +2416,7 @@ UT_TEST(test_retained_drain_retags_invalid_only_after_exact_token_release)
 UT_TEST(test_source_settlement_releases_fence_without_discarding_pi)
 {
 	static const char *const preserve_contract[] = {
+		"source_generation == 0",
 		"cluster_pcm_own_revoke_retain_release_exact",
 		"result == CLUSTER_PCM_OWN_OK",
 		"buf->buffer_type != (uint8) BUF_TYPE_PI",
@@ -2279,10 +2519,12 @@ UT_TEST(test_r11_lockbuffer_writer_selector_is_single_ingress_choice_and_exclusi
 		return;
 	/* One LockBuffer ingress selection, two ordinary TARGET post-T3/content-lock
 	 * revalidations, two known-new direct-init proof revalidations, and the
-	 * direct-init ledger bind's exact post-T3 revalidation.  None may resnapshot
-	 * into the other implementation. */
+	 * direct-init ledger bind's exact post-T3 revalidation, plus one cached-X
+	 * explicit-invalidation and clock-sweep eviction snapshots under descriptor
+	 * authority.  None may resnapshot into
+	 * the other implementation. */
 	UT_ASSERT_EQ(count_occurrences(
-		source, "cluster_resource_x_writer_path_snapshot("), 6);
+		source, "cluster_resource_x_writer_path_snapshot("), 8);
 	if (strstr(source, "cluster_resource_x_writer_path_snapshot(") == NULL)
 	{
 		free(source);
@@ -2816,13 +3058,15 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(59);
+	UT_PLAN(64);
 	UT_RUN(test_shmem_initializes_complete_entry);
 	UT_RUN(test_resource_x_activation_binding_is_exact_and_legacy_closed);
 	UT_RUN(test_resource_x_reconfig_neutralize_is_generation_exact_and_nonblocking);
 	UT_RUN(test_writer_activation_fence_blocks_revoke_until_exact_clear);
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
+	UT_RUN(test_remote_s_holder_pending_grant_is_retryable_busy);
+	UT_RUN(test_remote_s_holder_stable_n_replay_requires_exact_idle_tuple);
 	UT_RUN(test_grant_commit_is_exact_and_bumps_once);
 	UT_RUN(test_s_revoke_handoff_reuses_exact_token_and_bumps_once);
 	UT_RUN(test_revoke_handoff_kinds_cover_n_s_x_with_one_lifecycle);
@@ -2839,6 +3083,7 @@ main(void)
 	UT_RUN(test_token_and_generation_never_wrap);
 	UT_RUN(test_ordinary_generation_bump_rejects_live_reservation);
 	UT_RUN(test_eviction_rejects_live_reservation_and_exhaustion);
+	UT_RUN(test_target_eviction_bufferdesc_lifecycle_is_reversible_before_local_commit);
 	UT_RUN(test_bufmgr_d5a_commitlocked_uses_locked_commit_and_saved_tag_release);
 	UT_RUN(test_bufmgr_abort_cleanup_is_never_silent);
 	UT_RUN(test_bufmgr_finish_failure_rolls_back_acquired_master_grant);
@@ -2848,6 +3093,8 @@ main(void)
 	UT_RUN(test_bufmgr_finish_rejects_invalid_state_and_initializes_acquire_result);
 	UT_RUN(test_bufmgr_finish_and_abort_gate_on_exact_base_state);
 	UT_RUN(test_d5a_release_error_keeps_descriptor_out_of_freelist);
+	UT_RUN(test_resource_x_target_cached_x_eviction_uses_native_exact_release);
+	UT_RUN(test_resource_x_target_clock_sweep_eviction_uses_native_exact_release);
 	UT_RUN(test_queue_begin_requires_normalized_n_snapshot);
 	UT_RUN(test_queue_contract_exposes_prepare_only_begin_api);
 	UT_RUN(test_queue_contract_exposes_opaque_retained_revoke_api);

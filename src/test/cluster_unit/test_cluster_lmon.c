@@ -83,6 +83,7 @@ static bool test_lmon_clock_active = false;
 static uint64 test_lmon_clock_ns[2];
 static int test_lmon_clock_calls = 0;
 static bool test_lmon_seed_saturation = false;
+static int test_pcm_reclaim_ticks = 0;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -787,6 +788,12 @@ cluster_grd_reclaim_sweep(void)
 	return 0;
 }
 
+void
+cluster_pcm_lock_lmon_reclaim_tick(void)
+{
+	test_pcm_reclaim_ticks++;
+}
+
 /* spec-5.10 fix-forward — cluster_lmon.c calls the runtime-off starvation sweep. */
 uint32 cluster_grd_lmon_tick_starvation_sweep(void);
 uint32
@@ -1023,6 +1030,7 @@ run_one_real_lmon_duty(uint64 start_us, uint64 finish_us, bool seed_saturation)
 	test_lmon_clock_calls = 0;
 	test_lmon_clock_active = true;
 	test_lmon_seed_saturation = seed_saturation;
+	test_pcm_reclaim_ticks = 0;
 	test_lmon_exit_armed = true;
 
 	if (setjmp(test_lmon_exit_jump) == 0)
@@ -1089,6 +1097,12 @@ UT_TEST(test_lmon_timed_pair_saturates_without_wrapping)
 	UT_ASSERT_EQ((long long)cluster_lmon_main_loop_iters(), 1LL);
 	UT_ASSERT_EQ(test_lmon_clock_calls, 2);
 	UT_ASSERT_EQ(test_lmon_wait_calls, 1);
+}
+
+UT_TEST(test_lmon_runs_pcm_reclaim_once_per_duty)
+{
+	run_one_real_lmon_duty(920, 930, false);
+	UT_ASSERT_EQ(test_pcm_reclaim_ticks, 1);
 }
 
 /*
@@ -1173,7 +1187,7 @@ UT_TEST(test_lmon_pid_no_pgproc_never_uses_blocking_lwlock)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -1184,6 +1198,7 @@ main(void)
 	UT_RUN(test_lmon_completed_duty_records_one_exact_timed_pair);
 	UT_RUN(test_lmon_zero_elapsed_is_still_one_completed_sample);
 	UT_RUN(test_lmon_timed_pair_saturates_without_wrapping);
+	UT_RUN(test_lmon_runs_pcm_reclaim_once_per_duty);
 	UT_RUN(test_lmon_duty_lazy_truth_table);
 	UT_RUN(test_lmon_pid_no_pgproc_never_uses_blocking_lwlock);
 	UT_DONE();

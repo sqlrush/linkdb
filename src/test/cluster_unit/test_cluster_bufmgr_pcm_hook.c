@@ -169,7 +169,7 @@ static uint32 ut_wait_event_info_storage = 0;
 uint32 *my_wait_event_info = &ut_wait_event_info_storage;
 
 #define FAKE_PCM_MAX_ENTRIES 8
-#define FAKE_PCM_ENTRY_BYTES 1024
+#define FAKE_PCM_ENTRY_BYTES 1032
 
 static union {
 	uint64 force_align;
@@ -338,6 +338,12 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	fake_lwlock_held = lock;
 	fake_lwlock_mode = mode;
 	return true;
+}
+
+bool
+LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
+{
+	return LWLockAcquire(lock, mode);
 }
 
 void
@@ -845,7 +851,6 @@ UT_TEST(test_L9_unlock_without_prior_pcm_ownership_skips_release)
 	UT_ASSERT(strcmp(call_log[0], "LWLock-release") == 0);
 	UT_ASSERT_EQ((int)cluster_pcm_lock_query(buf.tag), (int)PCM_LOCK_MODE_N);
 }
-
 
 int
 main(void)
