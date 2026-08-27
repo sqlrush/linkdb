@@ -18,11 +18,11 @@
 
 ## 阅读顺序
 
-1. [生命周期与共享存储](01-lifecycle-and-storage.md)  
+1. [生命周期与共享存储](01-lifecycle-and-storage.md)
    介绍 seed、首次形成、协调停机、块设备切换和第二次形成。
-2. [启动、停机、消息乱序与故障收束](02-ordering-and-failure-handling.md)  
+2. [启动、停机、消息乱序与故障收束](02-ordering-and-failure-handling.md)
    解释为什么节点必须按特定并发关系启动/停止，以及异常时如何不留进程或设备残骸。
-3. [验证层次、可观测性与 Oracle RAC 边界](03-validation-observability-and-oracle-comparison.md)  
+3. [验证层次、可观测性与 Oracle RAC 边界](03-validation-observability-and-oracle-comparison.md)
    说明 focused test、`t/430`、`t/400` 和性能预基线分别验证什么。
 
 ## 一张图看懂
@@ -52,4 +52,3 @@ flowchart LR
 - 任一身份、容量、DIO 或字节内容漂移都失败关闭；
 - 测试失败时先停止进程，再解绑设备，最后删除临时文件；
 - `t/400` 的正确性判官不能为适配基板而放宽。
-
