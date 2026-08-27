@@ -133,9 +133,46 @@ shutdown checkpoint 开始
 
 部分绑定失败时，已经绑定的设备必须反向解绑，整轮失败；不得使用“两块设备加一个文件”的混合形态。
 
+### 6.1 静态认证之后还要做 I/O 预检
+
+“路径是块设备、容量正确、DIO 已启用、内容一致”只说明映射关系正确，不等于内核和文件系统能在当前环境下稳定完成并发 direct I/O。为避免在数据库启动后才发现底层 I/O 卡住，基板还要创建一份与 voting backing 位于同一存储后端的临时 scratch file，并绑定独立 scratch loop device。
+
+```mermaid
+flowchart LR
+    A[三块 voting device<br/>静态认证] --> B[独立 scratch backing]
+    B --> C[独立 DIO loop]
+    C --> D[并发写入/同步/重开/读取/校验]
+    D --> E{全部在绝对期限内完成?}
+    E -- 否 --> F[BLOCK_DEVICE_UNQUALIFIED<br/>不启动 Phase 2]
+    E -- 是 --> G[清理 scratch<br/>进入 Phase 2]
+```
+
+scratch probe 必须满足：
+
+- 与 voting backing 使用同一挂载点、文件系统和影响 direct I/O 的挂载选项；
+- 使用独立文件和设备，任何写入都不能落到 voting 数据；
+- 使用对齐缓冲区和不重叠区域，完整执行写入、持久化、关闭重开、读取与逐字节校验；
+- 使用单个绝对截止时间，不通过无限重试或延长超时掩盖问题；
+- 所有 probe 进程、FD 和 scratch mapping 清零后才算通过。
+
+这项预检属于 PGRAC 测试基板的环境资格检查，不是 Oracle RAC 已公开的内部步骤，也不是生产裸盘认证。
+
 ## 7. Phase 2：仅使用块设备重新形成
 
-Phase 2 复用相同启动并发关系，但配置中的 voting paths 必须全部变成刚认证的 block device。
+Phase 2 复用相同启动并发关系，但配置中的 voting paths 必须全部变成刚认证的 block device。启动 readiness 按以下层次单调推进：
+
+```text
+设备静态认证
+  → scratch I/O 预检
+  → 当前启动打开 voting device
+  → 当前 WAL 状态可见
+  → 集群资源服务就绪
+  → 四成员 formation
+  → 当前成员准入
+  → R4 可以从普通 SAMPLE 入口开始
+```
+
+后面的成功不能反向证明前面的门。例如，最终等待 formation 超时不能覆盖更早发生的 I/O 或 WAL 状态失败；诊断必须保留第一个失败层次。
 
 第二阶段重新采集：
 

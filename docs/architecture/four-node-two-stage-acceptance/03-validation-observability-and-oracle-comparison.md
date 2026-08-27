@@ -77,6 +77,15 @@ PRE 在第二阶段的当前四节点身份上运行，目的是采集后续优�
 - voting 序号；
 - teardown 后是否仍有 loop binding。
 
+静态认证还应与动态资格检查分开记录：
+
+- `DEVICE_STATIC_ATTESTED`：类型、容量、DIO、内容与序号匹配；
+- `DEVICE_IO_QUALIFIED`：独立 scratch device 的有界 direct I/O 探针完整通过；
+- `BLOCK_DEVICE_UNQUALIFIED`：探针错码、校验差异、超时或进程进入不可中断 I/O；
+- `OPERATOR_CLEANUP_REQUIRED`：精确进程/FD 尚未退出，设备必须保留等待显式回收。
+
+不能用后一层超时覆盖前一层首错，也不能把清理成功改写成原测试成功。
+
 ### 5.3 资源与事务
 
 - PCM/GRD live、retire、reuse、tombstone；
@@ -100,6 +109,8 @@ Oracle 官方文档确认：
 
 PGRAC 的两阶段基板保持了同样的职责边界：先证明成员与存储就绪，再激活数据库全局资源；正常停机必须留下可验证的 clean terminal，不能用进程消失代替。
 
+Oracle 还明确把 voting file 可访问性作为 Clusterware 可用性的基础；进一步丢失 voting access 可能导致节点驱逐或功能丧失。因此，PGRAC 在 voting I/O 不可信时停止数据库资源激活，与这一外部安全边界一致。
+
 ### 6.2 PGRAC 自研适配
 
 Oracle 没有公开或要求以下测试实现：
@@ -109,6 +120,7 @@ Oracle 没有公开或要求以下测试实现：
 - PGRAC 的停机交付确认细节；
 - R4 早到消息的本地有界保留算法；
 - `t/430`、`t/400` 和 PRE 的断言结构。
+- loop scratch I/O 资格检查、不可中断进程清理清单和显式 reaper。
 
 因此这些只能描述为 PGRAC 的自动化验证实现，不能称为 Oracle 内部协议复刻。
 
@@ -119,3 +131,4 @@ Oracle 没有公开或要求以下测试实现：
 - [Starting Up and Shutting Down](https://docs.oracle.com/en/database/oracle/oracle-database/19/admin/starting-up-and-shutting-down.html)
 - [Introduction to Oracle RAC](https://docs.oracle.com/en/database/oracle/oracle-database/26/racad/introduction-to-oracle-rac.html)
 - [Cache Fusion and the Global Cache Service](https://docs.oracle.com/cd/A91202_01/901_doc/rac.901/a89867/pslkgdtl.htm)
+- [CRS-01672](https://docs.oracle.com/en/error-help/db/crs-01672/)
