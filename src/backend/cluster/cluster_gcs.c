@@ -42,6 +42,7 @@
 #include "cluster/cluster_cssd.h" /* spec-4.7 D7 — peer liveness for recovery-aware routing */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -137,7 +138,7 @@ static ClusterGcsOutstandingSlot *gcs_reserve_slot(BufferTag tag, uint8 transiti
 												   int32 master_node, uint64 *out_request_id);
 static void gcs_release_slot(ClusterGcsOutstandingSlot *slot);
 static bool gcs_slot_get_reply(ClusterGcsOutstandingSlot *slot, GcsReplyPayload *reply);
-static bool gcs_mark_slot_reply(const GcsReplyPayload *reply);
+static bool gcs_mark_slot_reply(const ClusterICEnvelope *env, const GcsReplyPayload *reply);
 static ClusterICSendResult gcs_send_envelope_or_loopback(uint8 msg_type, int32 dest_node,
 														 const void *payload, uint32 payload_len);
 static bool gcs_dispatch_loopback(uint8 msg_type, const void *payload, uint32 payload_len);
@@ -368,16 +369,32 @@ gcs_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node, uint64 *
 {
 	ClusterGcsBackendBlock *blk = gcs_my_block();
 	ClusterGcsOutstandingSlot *slot = NULL;
+	int backend_ord = MyBackendId - 1;
 	int i;
 	uint32 cur_outstanding;
 
+	if (cluster_node_id < 0 || cluster_node_id > (int)GCS_REQID_NODE_MASK
+		|| backend_ord < 0 || backend_ord > (int)GCS_REQID_BACKEND_MASK)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster_gcs: requester identity node=%d backend=%d is out of request-id domain",
+							   cluster_node_id, backend_ord)));
+
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
+	if (blk->next_request_id == 0
+		|| blk->next_request_id > GCS_REQID_REQUESTER_SEQ_MASK) {
+		LWLockRelease(&blk->lock.lock);
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("cluster_gcs: requester sequence exhausted for node=%d backend=%d",
+							   cluster_node_id, backend_ord)));
+	}
 	for (i = 0; i < MAX_OUTSTANDING_REQUESTS_PER_BACKEND; i++) {
 		if (!blk->slots[i].in_use) {
+			uint64 sequence = blk->next_request_id++;
+
 			slot = &blk->slots[i];
 			slot->in_use = true;
 			slot->reply_received = false;
-			slot->request_id = blk->next_request_id++;
+			slot->request_id = gcs_reqid_requester(cluster_node_id, backend_ord, sequence);
 			slot->transition_id = transition_id;
 			slot->tag = tag;
 			slot->master_node = master_node;
@@ -442,16 +459,18 @@ gcs_slot_get_reply(ClusterGcsOutstandingSlot *slot, GcsReplyPayload *reply)
 }
 
 static bool
-gcs_mark_slot_reply(const GcsReplyPayload *reply)
+gcs_mark_slot_reply(const ClusterICEnvelope *env, const GcsReplyPayload *reply)
 {
 	int b;
 	int i;
 
 	/*
-	 * spec-2.32 loopback:  request_id is unique per backend, so scan all
-	 * backend blocks for the matching slot.  The scan is LWLock-protected
-	 * per block because reply_received/reply are mutated by receiver context
-	 * while the sender wait loop polls the same slot.
+	 * Request ids carry an exact node/backend domain, so a raw per-backend
+	 * sequence collision cannot select another sender's slot.  The echoed
+	 * transition and authenticated master are also exact: this prevents a
+	 * delayed predecessor response from satisfying a successor transition.
+	 * The scan remains LWLock-protected per block because reply state is
+	 * mutated by receiver context while the sender wait loop polls it.
 	 */
 	for (b = 0; b < MaxBackends; b++) {
 		ClusterGcsBackendBlock *blk = &gcs_backend_blocks[b];
@@ -460,7 +479,10 @@ gcs_mark_slot_reply(const GcsReplyPayload *reply)
 		for (i = 0; i < MAX_OUTSTANDING_REQUESTS_PER_BACKEND; i++) {
 			ClusterGcsOutstandingSlot *slot = &blk->slots[i];
 
-			if (slot->in_use && slot->request_id == reply->request_id) {
+			if (slot->in_use && !slot->reply_received
+				&& cluster_gcs_reply_matches_outstanding(
+					reply, slot->request_id, slot->transition_id, slot->master_node,
+					env->source_node_id)) {
 				slot->reply = *reply;
 				slot->reply_received = true;
 				ConditionVariableSignal(&slot->reply_cv);
@@ -830,8 +852,6 @@ cluster_gcs_handle_reply_envelope(const ClusterICEnvelope *env, const void *payl
 {
 	const GcsReplyPayload *reply;
 
-	(void)env;
-
 	if (payload == NULL || env == NULL || env->payload_length != sizeof(GcsReplyPayload))
 		return;
 
@@ -840,7 +860,7 @@ cluster_gcs_handle_reply_envelope(const ClusterICEnvelope *env, const void *payl
 	pg_atomic_fetch_add_u64(&ClusterGcs->handle_reply_count, 1);
 	pg_atomic_fetch_add_u64(&ClusterGcs->decode_payload_bytes, sizeof(*reply));
 
-	if (!gcs_mark_slot_reply(reply)) {
+	if (!gcs_mark_slot_reply(env, reply)) {
 		/* HC74: unknown request_id = stale/late reply; local drop. */
 		pg_atomic_fetch_add_u64(&ClusterGcs->reply_late_drop_count, 1);
 		return;

@@ -134,6 +134,29 @@ StaticAssertDecl(sizeof(GcsReplyPayload) == 24,
 				 "(request_id 8 + transition_id 1 + status 1 + reserved 2 + "
 				 "sender_node 4 + epoch 8)");
 
+/*
+ * A reply may complete only the exact outstanding control transition that
+ * named its authenticated master.  request_id alone is insufficient: the
+ * old per-backend raw counters emitted the same values concurrently, and a
+ * predecessor reply could otherwise satisfy an unrelated successor wait.
+ *
+ * This predicate changes no wire or shared-memory layout.  The envelope
+ * source has already passed IC authentication before the handler calls it.
+ */
+static inline bool
+cluster_gcs_reply_matches_outstanding(const GcsReplyPayload *reply, uint64 expected_request_id,
+									  uint8 expected_transition_id, int32 expected_master_node,
+									  uint32 authenticated_source_node)
+{
+	return reply != NULL && expected_request_id != 0
+		   && reply->request_id == expected_request_id
+		   && reply->transition_id == expected_transition_id
+		   && reply->status <= GCS_REPLY_DENIED_EPOCH_STALE && reply->reserved_0[0] == 0
+		   && reply->reserved_0[1] == 0 && expected_master_node >= 0
+		   && reply->sender_node == expected_master_node
+		   && authenticated_source_node == (uint32)expected_master_node;
+}
+
 
 /* ============================================================
  * Public API.

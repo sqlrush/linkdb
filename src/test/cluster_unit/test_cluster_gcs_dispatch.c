@@ -48,6 +48,7 @@
 #include "cluster/cluster_conf.h" /* ClusterNodeInfo (spec-2.33 D2 stub) */
 #include "cluster/cluster_cssd.h" /* PGRAC_IC_MSG_CSSD_HEARTBEAT */
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
@@ -676,10 +677,67 @@ UT_TEST(test_gcs_module_init_helpers_linkable)
 }
 
 
+/* ----------
+ * L19: a control reply belongs to exactly one outstanding transition.
+ *
+ * Per-backend raw counters all begin at one.  The wire request id must
+ * therefore carry the requester node/backend domain, and reply admission
+ * must also bind the echoed transition and authenticated master identity.
+ * A denial for an X->S predecessor must never satisfy another backend's
+ * later S->N release wait.
+ * ----------
+ */
+UT_TEST(test_gcs_reply_identity_is_exact_across_backends)
+{
+	GcsReplyPayload reply;
+	uint64 backend0_request = gcs_reqid_requester(0, 0, 1);
+	uint64 backend1_request = gcs_reqid_requester(0, 1, 1);
+
+	UT_ASSERT(backend0_request != backend1_request);
+
+	memset(&reply, 0, sizeof(reply));
+	reply.request_id = backend1_request;
+	reply.transition_id = PCM_TRANS_S_TO_N_RELEASE;
+	reply.status = GCS_REPLY_GRANTED;
+	reply.sender_node = 3;
+	reply.epoch = 7;
+
+	UT_ASSERT(cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
+											PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+
+	/* Same raw sequence in another backend domain is not this request. */
+	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend0_request,
+											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+
+	/* A predecessor reply cannot complete the successor transition. */
+	reply.transition_id = PCM_TRANS_X_TO_S_DOWNGRADE;
+	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
+											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+	reply.transition_id = PCM_TRANS_S_TO_N_RELEASE;
+
+	/* Body sender and authenticated envelope source are both exact. */
+	reply.sender_node = 2;
+	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
+											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+	reply.sender_node = 3;
+	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
+											 PCM_TRANS_S_TO_N_RELEASE, 3, 2));
+
+	/* Reserved bytes and status domain remain fail closed. */
+	reply.reserved_0[0] = 1;
+	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
+											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+	reply.reserved_0[0] = 0;
+	reply.status = (uint8)(GCS_REPLY_DENIED_EPOCH_STALE + 1);
+	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
+											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
 	UT_RUN(test_gcs_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_payload_sizes_locked);
 	UT_RUN(test_gcs_payload_field_offsets);
@@ -699,6 +757,7 @@ main(void)
 	UT_RUN(test_gcs_lwlock_tranche_distinct_from_pcm);
 	UT_RUN(test_gcs_hc77_sender_no_double_apply_doc);
 	UT_RUN(test_gcs_module_init_helpers_linkable);
+	UT_RUN(test_gcs_reply_identity_is_exact_across_backends);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
