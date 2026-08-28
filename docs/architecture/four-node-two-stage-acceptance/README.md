@@ -28,6 +28,8 @@
    说明静态设备认证为何不等于可用 I/O、如何在不改 voting 数据的前提下预检，以及进程陷入不可中断 I/O 时如何留证和延迟回收。
 5. [成员关系先于数据库服务](05-membership-before-service-readiness.md)
    解释 `t/430` 前 16 项与第 17 项的边界、合法准入顺序，以及如何区分 quorum/membership 启动失败和后续资源回收失败。
+6. [Exact Membership 与 PGRD Readiness](06-exact-membership-and-pgrd-readiness.md)
+   展开第 17 项的实现：成员快照双重验证、慢节点安全拒绝、PGRD 三份一致性、pre-OPEN 结果极性和四节点验收证据。
 
 ## 一张图看懂
 
