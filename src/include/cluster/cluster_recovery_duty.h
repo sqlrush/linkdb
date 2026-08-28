@@ -76,6 +76,11 @@ typedef struct ClusterFormationSnapshotV1 {
 	uint8 reserved[2];
 } ClusterFormationSnapshotV1;
 
+/* AD-023 recovery-control classification tag.  Captured runtime snapshots
+ * always keep reserved[] zero; only the opaque phase-3 witness copy may carry
+ * this local tag.  It authorizes no serving or write operation. */
+#define CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL UINT8_C(1)
+
 StaticAssertDecl(sizeof(ClusterRecoveryDutyDigest) == 32,
 				 "ClusterRecoveryDutyDigest ABI");
 
@@ -148,11 +153,17 @@ extern ClusterFormationWitnessResult cluster_formation_witness_build_wait(
 	ClusterFormationWitnessV1 **out);
 extern ClusterFormationWitnessResult cluster_formation_witness_build_live_wait(
 	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out);
+extern ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(
+	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out);
 extern ClusterFormationWitnessResult cluster_formation_witness_revalidate_nowait(
 	const ClusterFormationWitnessV1 *witness);
 extern ClusterFormationWitnessResult cluster_formation_classification_revalidate_nowait(
 	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
 	const ClusterFormationSnapshotV1 *snapshot);
+extern bool cluster_formation_snapshot_matches_v1(
+	const ClusterFormationSnapshotV1 *expected,
+	const ClusterFormationSnapshotV1 *observed);
 /* Copy the immutable classification already owned by an admitted witness.
  * This performs no current-state read; callers must separately revalidate the
  * same opaque witness before consuming the copy. */

@@ -1975,16 +1975,26 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 	uint32 segment_id = 0;
 	uint32 block_no = 0;
 	int32 wire_owner = -1;
-	uint64 carrier;
+	uint64 carrier = 0;
+	TransactionId pair_xid = InvalidTransactionId;
+	SCN pair_scn = InvalidScn;
+	bool freshref_pair;
 
 	if (CrServerShared == NULL || fwd == NULL)
 		return false;
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
-	if (!GcsBlockUndoFetchTagDecode(fwd->tag, &segment_id, &block_no))
+	freshref_pair = GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(fwd);
+	if (freshref_pair) {
+		if (!cluster_cr_server_freshref_c1b_pair_request_decode(
+				fwd, fwd->original_requester_node, cluster_node_id,
+				cluster_epoch_get_current(), MaxBackends, &segment_id, &pair_xid,
+				&block_no, &pair_scn))
+			return false;
+	} else if (!GcsBlockUndoFetchTagDecode(fwd->tag, &segment_id, &block_no))
 		return false;
 
-	if (GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(fwd)) {
+	if (!freshref_pair && GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(fwd)) {
 		/* kind 4: decode + range-check the owner carrier; a request naming
 		 * US as the (dead) owner is malformed — our own xids are answered
 		 * by the live-owner kinds, never by an authority detour. */
@@ -1992,12 +2002,15 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 			return false;
 		if (wire_owner < 0 || wire_owner >= CLUSTER_MAX_NODES || wire_owner == cluster_node_id)
 			return false;
-	} else if (fwd->tag.relNumber != (RelFileNumber)0)
+	} else if (!freshref_pair && fwd->tag.relNumber != (RelFileNumber)0)
 		return false; /* owner-served kinds must leave the carrier empty */
 
-	carrier = (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
-	if (carrier > (uint64)PG_UINT32_MAX || !TransactionIdIsNormal((TransactionId)carrier))
-		return false;
+	if (!freshref_pair) {
+		carrier = (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+		if (carrier > (uint64)PG_UINT32_MAX
+			|| !TransactionIdIsNormal((TransactionId)carrier))
+			return false;
+	}
 
 	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
@@ -2006,7 +2019,7 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 			continue;
 
 		slot->tag = fwd->tag;
-		slot->read_scn = InvalidScn; /* the carrier held the xid, not a snapshot */
+		slot->read_scn = freshref_pair ? pair_scn : InvalidScn;
 		slot->request_id = fwd->request_id;
 		slot->epoch = fwd->epoch;
 		slot->requester_node = fwd->original_requester_node;
@@ -2017,7 +2030,7 @@ cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd)
 		slot->req_kind = (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT;
 		slot->undo_segment_id = segment_id;
 		slot->undo_block_no = block_no;
-		slot->undo_xid = (TransactionId)carrier;
+		slot->undo_xid = freshref_pair ? pair_xid : (TransactionId)carrier;
 		slot->undo_authoritative = GcsBlockForwardPayloadIsUndoVerdictAuthoritative(fwd);
 		slot->undo_owner = wire_owner; /* -1 on kinds 2/3; the dead owner on kind 4 */
 		memset(&slot->undo_auth, 0, sizeof(slot->undo_auth));
@@ -2195,6 +2208,108 @@ typedef enum LmsOwnXidReason {
 	LMS_OWN_XID_REFUSE_ZERO_MATCH,	/* recycled 0-match with no explicit CLOG terminal */
 	LMS_OWN_XID_REFUSE_INVALID_SCN	/* delayed-cleanout, not provably aborted */
 } LmsOwnXidReason;
+
+/* S8-815PRE-FRESHREF-C1B-01: exact retained-page pairing.  The native
+ * prehistory reader fence continuously covers the complete durable scan,
+ * literal CLOG C1b sample and (for a zero-match) frozen retention horizon.
+ * This is deliberately separate from the ordinary zero-match path: it may
+ * echo only the request's exact cached SCN, never reinterpret a horizon as
+ * an exact value. */
+static LmsOwnXidReason
+lms_resolve_own_xid_freshref_c1b_pair(
+	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
+	SCN proposed_scn, uint8 *out_verdict, SCN *out_commit_scn,
+	SCN *out_horizon_scn, uint16 *out_wrap)
+{
+	ClusterUndoVerdictKind pair_verdict
+		= CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	ClusterTTDurableResolve resolve = CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE;
+	SCN resolved_scn = InvalidScn;
+	SCN horizon_scn = InvalidScn;
+	uint16 matched_segment = 0;
+	uint16 matched_slot = 0;
+	uint16 matched_wrap = 0;
+	int raw_clog_status = TRANSACTION_STATUS_IN_PROGRESS;
+	bool retention_ok = false;
+
+	*out_verdict = 0;
+	*out_commit_scn = InvalidScn;
+	*out_horizon_scn = InvalidScn;
+	*out_wrap = 0;
+
+	if (!TransactionIdIsNormal(xid) || expected_segment_id == 0
+		|| expected_segment_id > UINT16_MAX || expected_tt_slot_id < 1
+		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT || !SCN_VALID(proposed_scn)
+		|| cluster_cr_native_prehistory_covered_hw() == 0)
+		return LMS_OWN_XID_REFUSE_OTHER;
+
+	PG_TRY(freshref_pair);
+	{
+		bool no_raw_reuse_window;
+		bool xid_is_mine;
+
+		cluster_cr_native_prehistory_reader_lock();
+		no_raw_reuse_window = cluster_cr_native_prehistory_covered_hw() != 0
+								  && !cluster_cr_native_prehistory_disabled();
+		xid_is_mine = no_raw_reuse_window && cluster_xid_is_mine(xid);
+
+		if (xid_is_mine) {
+			resolve = cluster_tt_slot_durable_resolve_by_xid(
+				xid, CLUSTER_TT_WRAP_ANY, &resolved_scn, &matched_segment,
+				&matched_slot, &matched_wrap);
+			if (resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN
+				|| resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH) {
+				XLogRecPtr clog_lsn = InvalidXLogRecPtr;
+				bool clog_sampled = false;
+
+				LWLockAcquire(XactTruncationLock, LW_SHARED);
+				if (!TransactionIdPrecedes(xid, ShmemVariableCache->oldestClogXid)) {
+					raw_clog_status = TransactionIdGetStatus(xid, &clog_lsn);
+					clog_sampled = true;
+				}
+				LWLockRelease(XactTruncationLock);
+
+				if (clog_sampled
+					&& resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
+					&& raw_clog_status == TRANSACTION_STATUS_COMMITTED) {
+					retention_ok
+						= cluster_cr_retention_proof_origin_legs(&horizon_scn);
+					if (retention_ok) {
+						horizon_scn = cluster_tt_slot_max_recycle_horizon();
+						retention_ok = SCN_VALID(horizon_scn);
+					}
+				}
+
+				if (clog_sampled)
+					pair_verdict = cluster_cr_server_freshref_c1b_pair_verdict(
+						true, true, expected_segment_id, expected_tt_slot_id,
+						no_raw_reuse_window, raw_clog_status, resolve,
+						matched_segment, matched_slot, resolved_scn, proposed_scn,
+						retention_ok, horizon_scn);
+			}
+		}
+		cluster_cr_native_prehistory_reader_unlock();
+	}
+	PG_CATCH(freshref_pair);
+	{
+		/* The pair owns no persistent state.  Release both the native fence
+		 * and any CLOG/retention LWLocks before the LMS converts the error to
+		 * a fail-closed DENIED reply. */
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY(freshref_pair);
+
+	if (pair_verdict != CLUSTER_UNDO_VERDICT_COMMITTED_EXACT)
+		return LMS_OWN_XID_REFUSE_OTHER;
+
+	*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+	*out_commit_scn = proposed_scn;
+	*out_wrap = resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN ? matched_wrap : 0;
+	return LMS_OWN_XID_PROVEN;
+}
 
 static LmsOwnXidReason
 lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
@@ -2476,6 +2591,33 @@ cluster_cr_server_test_own_xid_verdict(TransactionId xid, uint32 expected_segmen
 		return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
 	}
 }
+
+ClusterUndoVerdictResult
+cluster_cr_server_test_own_xid_pair_verdict(TransactionId xid,
+											uint32 expected_segment_id,
+											uint32 expected_tt_slot_id,
+											SCN proposed_scn)
+{
+	ClusterUndoVerdictResult result
+		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED,
+			.commit_scn = InvalidScn,
+			.wrap = 0 };
+	uint8 verdict = 0;
+	SCN commit_scn = InvalidScn;
+	SCN horizon_scn = InvalidScn;
+	uint16 wrap = 0;
+
+	if (lms_resolve_own_xid_freshref_c1b_pair(
+			xid, expected_segment_id, expected_tt_slot_id, proposed_scn,
+			&verdict, &commit_scn, &horizon_scn, &wrap)
+		== LMS_OWN_XID_PROVEN
+		&& verdict == (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT) {
+		result.kind = (uint8)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		result.commit_scn = commit_scn;
+		result.wrap = wrap;
+	}
+	return result;
+}
 #endif
 
 /*
@@ -2534,10 +2676,25 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	SCN commit_scn = InvalidScn;
 	SCN horizon_scn = InvalidScn;
 	uint16 wrap = 0;
+	uint32 pair_segment = 0;
+	uint32 pair_slot = 0;
+	TransactionId pair_xid = InvalidTransactionId;
+	bool freshref_pair = SCN_VALID(slot->read_scn);
+	LmsOwnXidReason reason;
 
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
 	if (!TransactionIdIsNormal(xid)) {
+		cluster_vis53r97_note_srv_other();
+		return false;
+	}
+	if (freshref_pair
+		&& (!slot->undo_authoritative || slot->undo_owner != -1
+			|| slot->epoch == 0 || slot->epoch != cluster_epoch_get_current()
+			|| !GcsBlockUndoFreshRefC1bTagDecode(
+				slot->tag, &pair_segment, &pair_xid, &pair_slot)
+			|| pair_segment != slot->undo_segment_id || pair_xid != xid
+			|| pair_slot != slot->undo_block_no)) {
 		cluster_vis53r97_note_srv_other();
 		return false;
 	}
@@ -2564,9 +2721,23 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	slot->undo_auth.authority_scn = cluster_scn_current();
 
 	/* Resolve the terminal/live verdict via the shared core; attribute the census leg. */
-	switch (lms_resolve_own_xid_verdict(xid, slot->undo_segment_id, slot->undo_block_no,
-										slot->undo_authoritative, &verdict, &commit_scn,
-										&horizon_scn, &wrap)) {
+	if (freshref_pair)
+		reason = lms_resolve_own_xid_freshref_c1b_pair(
+			xid, slot->undo_segment_id, slot->undo_block_no, slot->read_scn,
+			&verdict, &commit_scn, &horizon_scn, &wrap);
+	else
+		reason = lms_resolve_own_xid_verdict(
+			xid, slot->undo_segment_id, slot->undo_block_no,
+			slot->undo_authoritative, &verdict, &commit_scn, &horizon_scn, &wrap);
+	if (freshref_pair
+		&& (slot->epoch != cluster_epoch_get_current()
+			|| slot->undo_auth.origin_epoch != slot->epoch
+			|| !SCN_VALID(slot->undo_auth.authority_scn)
+			|| scn_time_cmp(slot->undo_auth.authority_scn, slot->read_scn) < 0)) {
+		cluster_vis53r97_note_srv_other();
+		return false;
+	}
+	switch (reason) {
 	case LMS_OWN_XID_PROVEN:
 		break;
 	case LMS_OWN_XID_PROVEN_UPGRADE:
@@ -3647,6 +3818,8 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 	MemoryContext old;
 	uint32 segment_id = 0;
 	uint32 block_no = 0;
+	TransactionId pair_xid = InvalidTransactionId;
+	SCN pair_scn = InvalidScn;
 	bool inject_refuse;
 	TimestampTz serve_started_at;
 
@@ -3746,17 +3919,31 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 
 	case CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT: {
 		uint64 carrier = (uint64)GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+		bool freshref_pair
+			= GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(fwd);
 
 		slot.read_scn = InvalidScn;
-		(void)GcsBlockUndoFetchTagDecode(fwd->tag, &segment_id, &block_no);
+		if (freshref_pair) {
+			if (cluster_cr_server_freshref_c1b_pair_request_decode(
+					fwd, fwd->original_requester_node, cluster_node_id,
+					cluster_epoch_get_current(), MaxBackends, &segment_id,
+					&pair_xid, &block_no, &pair_scn)) {
+				slot.read_scn = pair_scn;
+				slot.undo_xid = pair_xid;
+			} else
+				slot.undo_xid = InvalidTransactionId;
+		} else {
+			(void)GcsBlockUndoFetchTagDecode(fwd->tag, &segment_id, &block_no);
+			/* A malformed carrier (upper 32 bits set / non-normal) leaves xid
+			 * Invalid -> lms_undo_verdict_serve refuses. */
+			slot.undo_xid
+				= (carrier <= (uint64)PG_UINT32_MAX
+				   && TransactionIdIsNormal((TransactionId)carrier))
+					  ? (TransactionId)carrier
+					  : InvalidTransactionId;
+		}
 		slot.undo_segment_id = segment_id;
 		slot.undo_block_no = block_no;
-		/* A malformed carrier (upper 32 bits set / non-normal) leaves xid
-		 * Invalid -> lms_undo_verdict_serve refuses. */
-		slot.undo_xid
-			= (carrier <= (uint64)PG_UINT32_MAX && TransactionIdIsNormal((TransactionId)carrier))
-				  ? (TransactionId)carrier
-				  : InvalidTransactionId;
 		/* spec-5.22f D6-7: the AUTHORITATIVE sub-flag widens the own-xid
 		 * gate on the serve side (same decode as the park path). */
 		slot.undo_authoritative = GcsBlockForwardPayloadIsUndoVerdictAuthoritative(fwd);
@@ -3765,7 +3952,7 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 		 * malformed or self-naming carrier leaves the xid Invalid so the
 		 * serve refuses (our own xids are answered by the live-owner
 		 * kinds, never by an authority detour). */
-		if (GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(fwd)) {
+		if (!freshref_pair && GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(fwd)) {
 			int32 wire_owner = -1;
 
 			if (!GcsBlockUndoAuthorityFetchTagDecodeOwner(fwd->tag, &wire_owner) || wire_owner < 0
@@ -3773,7 +3960,7 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 				slot.undo_xid = InvalidTransactionId;
 			else
 				slot.undo_owner = wire_owner;
-		} else if (fwd->tag.relNumber != (RelFileNumber)0) {
+		} else if (!freshref_pair && fwd->tag.relNumber != (RelFileNumber)0) {
 			/* owner-served kinds must leave the owner carrier empty */
 			slot.undo_xid = InvalidTransactionId;
 		}

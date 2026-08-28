@@ -389,6 +389,22 @@ checkpoint_publisher_is_current(uint64 expected_sysid)
 	if (cluster_cf_owner_eor_local_active())
 		return true;
 	self_incarnation = cluster_qvotec_get_self_incarnation();
+	/*
+	 * The shared-catalog bootstrap contract ends with a normal shutdown
+	 * checkpoint after the delegated EOR handoff has closed.  It deliberately
+	 * runs outside formed-cluster membership, so admit only its exact native
+	 * owner shape: cluster mode disabled, shared control authority enabled,
+	 * one declared self node, no qvotec/admission identity, and a held local
+	 * CF(X).  This restores the frozen clean-seed path without allowing a
+	 * formed or stale member to use native bootstrap as a publication bypass.
+	 */
+	if (!cluster_enabled && cluster_controlfile_shared_authority
+		&& self_incarnation == 0
+		&& cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_ABSENT
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id) == 0
+		&& cluster_cf_exactly_one_declared_node()
+		&& cluster_cf_held(ExclusiveLock))
+		return true;
 	if (self_incarnation != 0
 		&& cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_MEMBER
 		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)

@@ -31,6 +31,12 @@
 
 #include "unit_test.h"
 
+extern bool cluster_vis_freshref_c1b_pair_request_eligible(
+	TransactionId raw_xid, TransactionId ref_xid, bool has_cached_status,
+	SCN cached_commit_scn, uint32 ref_epoch, uint64 current_epoch,
+	int32 origin_node, int32 local_node, uint32 segment_id,
+	uint32 expected_tt_slot_id);
+
 UT_DEFINE_GLOBALS();
 
 static char *
@@ -221,6 +227,30 @@ UT_TEST(test_committed_bound_admission_terminal_vs_snapshot)
 	/* An absent horizon is never evidence, for either consumer kind. */
 	UT_ASSERT_EQ(cluster_vis_committed_bound_admissible(InvalidScn, InvalidScn), false);
 	UT_ASSERT_EQ(cluster_vis_committed_bound_admissible(InvalidScn, (SCN)500), false);
+}
+
+UT_TEST(test_freshref_c1b_pair_request_eligibility)
+{
+	UT_ASSERT(cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, (SCN)10498, 11, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195137, true, (SCN)10498, 11, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, false, (SCN)10498, 11, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, InvalidScn, 11, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, (SCN)10498, 10, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, (SCN)10498, 11, 11, 0, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, (SCN)10498, 11, 11, 1, 0, 0, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, (SCN)10498, 11, 11, 1, 0, 7,
+		TT_SLOTS_PER_SEGMENT + 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, (SCN)10498, 11,
+		UINT64_C(0x100000000), 1, 0, 7, 1));
 }
 
 /* CP2: authority trailer little-endian carrier roundtrip (wire ABI). */
@@ -975,7 +1005,7 @@ UT_TEST(test_terminal_remote_wrapper_rejects_in_progress_verdict)
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -986,6 +1016,7 @@ main(void)
 	UT_RUN(test_failclosed_epoch_mismatch_dominates_good_scn);
 	UT_RUN(test_failclosed_epoch_differs_above_32bit);
 	UT_RUN(test_committed_bound_admission_terminal_vs_snapshot);
+	UT_RUN(test_freshref_c1b_pair_request_eligibility);
 	UT_RUN(test_ttproof_committed_and_aborted);
 	UT_RUN(test_ttproof_committed_is_evidence_not_verdict);
 	UT_RUN(test_ttproof_recycled_same_xid_reports_bumped_wrap_not_gated);

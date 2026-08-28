@@ -80,6 +80,104 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+/* Stage 8 8.15-PRE-CAP D1: diagnostic-only failure axes.  These values are
+ * process-internal observability, not wire outcomes or a second authority.
+ * NONE is retained so successful/unknown observations are never fabricated
+ * as one of the four frozen failure domains. */
+typedef enum ResourceXRemoteSStage {
+	RESOURCE_X_REMOTE_S_STAGE_NONE = 0,
+	RESOURCE_X_REMOTE_S_STAGE_VALIDATE,
+	RESOURCE_X_REMOTE_S_STAGE_SNAPSHOT,
+	RESOURCE_X_REMOTE_S_STAGE_REVOKE_HELD,
+	RESOURCE_X_REMOTE_S_STAGE_PENDING_STAGED,
+	RESOURCE_X_REMOTE_S_STAGE_COMMITTED_N,
+	RESOURCE_X_REMOTE_S_STAGE_READY_PUBLISHED
+} ResourceXRemoteSStage;
+
+typedef enum ResourceXFailureDomain {
+	RESOURCE_X_FAIL_NONE = 0,
+	RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE,
+	RESOURCE_X_FAIL_AUTHORITY_DRIFT,
+	RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY,
+	RESOURCE_X_FAIL_INTERNAL_CORRUPTION
+} ResourceXFailureDomain;
+
+typedef struct ResourceXRemoteSFailureDecision {
+	ResourceXFailureDomain domain;
+	bool global_fail_closed;
+	bool discard_old_round;
+	bool rollback_complete;
+} ResourceXRemoteSFailureDecision;
+
+/* D6 keeps result mapping separate from the safety policy.  The caller first
+ * performs every rollback operation required by the frozen remote-S stage,
+ * then feeds the observed outcomes here.  Missing or failed rollback after a
+ * reversible holder mutation is ambiguous; once S has committed to N, every
+ * publication failure is ambiguous.  This helper owns no state and grants no
+ * authority. */
+static inline ResourceXRemoteSFailureDecision
+cluster_gcs_resource_x_remote_s_failure_decide(
+	ResourceXRemoteSStage stage, ResourceXFailureDomain cause_domain,
+	bool cancel_attempted, bool cancel_ok,
+	bool abort_attempted, bool abort_ok)
+{
+	ResourceXRemoteSFailureDecision decision;
+
+	decision.domain = RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+	decision.global_fail_closed = true;
+	decision.discard_old_round = false;
+	decision.rollback_complete = false;
+	if (cause_domain <= RESOURCE_X_FAIL_NONE
+		|| cause_domain > RESOURCE_X_FAIL_INTERNAL_CORRUPTION)
+		return decision;
+
+	switch (stage) {
+	case RESOURCE_X_REMOTE_S_STAGE_VALIDATE:
+	case RESOURCE_X_REMOTE_S_STAGE_SNAPSHOT:
+		if (cancel_attempted || abort_attempted)
+			return decision;
+		decision.rollback_complete = true;
+		break;
+	case RESOURCE_X_REMOTE_S_STAGE_REVOKE_HELD:
+		if (cancel_attempted || !abort_attempted)
+			return decision;
+		if (!abort_ok) {
+			decision.domain
+				= RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+			return decision;
+		}
+		decision.rollback_complete = true;
+		break;
+	case RESOURCE_X_REMOTE_S_STAGE_PENDING_STAGED:
+		if (!cancel_attempted || !abort_attempted)
+			return decision;
+		if (!cancel_ok || !abort_ok) {
+			decision.domain
+				= RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+			return decision;
+		}
+		decision.rollback_complete = true;
+		break;
+	case RESOURCE_X_REMOTE_S_STAGE_COMMITTED_N:
+		if (cancel_attempted || abort_attempted)
+			return decision;
+		decision.domain = RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+		return decision;
+	case RESOURCE_X_REMOTE_S_STAGE_NONE:
+	case RESOURCE_X_REMOTE_S_STAGE_READY_PUBLISHED:
+	default:
+		return decision;
+	}
+
+	decision.domain = cause_domain;
+	decision.global_fail_closed
+		= cause_domain == RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY
+		  || cause_domain == RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+	decision.discard_old_round
+		= cause_domain == RESOURCE_X_FAIL_AUTHORITY_DRIFT;
+	return decision;
+}
+
 /* One lock-free authority observation.  The qvotec slot tuple and the
  * connection capability record have different publishers, so consumers must
  * sample both ends and reject a change as retryable rather than accepting a
@@ -2626,22 +2724,42 @@ GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
  * 5=authoritative single verdict (moved off the multi value).  Multi keeps its
  * shipped value 3; only this unshipped-on-main sub-kind moves.
  */
+#define GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR ((uint8)10)
+
+StaticAssertDecl(GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR
+					 > GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE,
+				 "fresh-ref C1b pair kind must not collide with kinds 1..9");
+
 static inline void
 GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool authoritative)
 {
 	p->reserved_0[6] = authoritative ? (uint8)5 : (uint8)2;
 }
 
+static inline void
+GcsBlockForwardPayloadSetUndoFreshRefC1bPairRequest(GcsBlockForwardPayload *p)
+{
+	p->reserved_0[6] = GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR;
+}
+
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictRequest(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)2 || p->reserved_0[6] == (uint8)5;
+	return p->reserved_0[6] == (uint8)2 || p->reserved_0[6] == (uint8)5
+		   || GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(p);
 }
 
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictAuthoritative(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)5;
+	return p->reserved_0[6] == (uint8)5
+		   || GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(p);
 }
 
 /* PGRAC: spec-5.22d D4-6 — reserved_0[6] VALUE 4 = dead-owner AUTHORITY
@@ -2775,6 +2893,40 @@ GcsBlockUndoAuthorityFetchTagDecodeOwner(BufferTag tag, int32 *owner_node)
 		return false; /* owner absent: an owner-served-kind tag */
 	if (owner_node != NULL)
 		*owner_node = (int32)tag.relNumber - 1;
+	return true;
+}
+
+/* S8-815PRE-FRESHREF-C1B-01: kind-10-only exact pairing tag.  The ordinary
+ * owner-served kinds require relNumber == 0; kind 10 instead binds the raw xid
+ * there while dbOid and blockNum retain the exact segment and 1-based TT slot.
+ * The discriminator is validated separately before this decoder is called. */
+static inline BufferTag
+GcsBlockUndoFreshRefC1bTagMake(uint32 segment_id, TransactionId xid,
+									 uint32 expected_tt_slot_id)
+{
+	BufferTag tag = GcsBlockUndoFetchTagMake(segment_id, expected_tt_slot_id);
+
+	tag.relNumber = (RelFileNumber)xid;
+	return tag;
+}
+
+static inline bool
+GcsBlockUndoFreshRefC1bTagDecode(BufferTag tag, uint32 *segment_id,
+									TransactionId *xid, uint32 *expected_tt_slot_id)
+{
+	TransactionId decoded_xid = (TransactionId)tag.relNumber;
+
+	if (tag.spcOid != GCS_BLOCK_UNDO_FETCH_TAG_MAGIC || tag.forkNum != MAIN_FORKNUM
+		|| tag.dbOid == (Oid)0 || (uint64)tag.dbOid > (uint64)UINT16_MAX
+		|| !TransactionIdIsNormal(decoded_xid) || (RelFileNumber)decoded_xid != tag.relNumber
+		|| tag.blockNum < 1 || tag.blockNum > TT_SLOTS_PER_SEGMENT)
+		return false;
+	if (segment_id != NULL)
+		*segment_id = (uint32)tag.dbOid;
+	if (xid != NULL)
+		*xid = decoded_xid;
+	if (expected_tt_slot_id != NULL)
+		*expected_tt_slot_id = (uint32)tag.blockNum;
 	return true;
 }
 
@@ -3147,6 +3299,21 @@ gcs_block_holder_refusal_retry_exact(int32 forwarding_master,
 		return true;
 	}
 	return false;
+}
+
+/* A forwarded N->S refusal is a pre-mutation carrier drift, not a terminal
+ * reader error.  Return through the existing outer retry boundary so bufmgr
+ * first aborts the exact GRANT_PENDING reservation and the next attempt uses
+ * a fresh request identity.  Direct master denials and writer transitions do
+ * not qualify. */
+static inline bool
+gcs_block_forwarded_s_refusal_requires_fresh_retry(
+	GcsBlockReplyStatus status, uint8 transition_id,
+	int32 forwarding_master)
+{
+	return status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
+		&& transition_id == (uint8)PCM_TRANS_N_TO_S
+		&& forwarding_master >= 0 && forwarding_master < 32;
 }
 
 /* PGRAC: spec-5.2a D3 — pure master-side decision for an eligible clean-page
@@ -3955,11 +4122,44 @@ typedef struct ResourceXWriterUseContext {
 StaticAssertDecl(sizeof(ResourceXWriterUseContext) == 72,
 	"ResourceXWriterUseContext layout must remain 72 bytes");
 
+/* Process-local TARGET cached-X eviction plan.  It is never serialized or
+ * stored in shared memory: PREPARE freezes the exact existing kind-4 bytes
+ * while BufferDesc is still X+REVOKING, LOCAL COMMIT is recorded by the
+ * caller, and PUBLISH transfers those same bytes before closing the exact
+ * EVICTING owner and terminal cover. */
+typedef struct ResourceXTargetEvictionPlan {
+	ResourceXDecodedFrame release;
+	ResourceXLocalOwnerHandle owner;
+	ResourceXGateSnapshot gate;
+	BufferTag tag;
+	uint64 cached_ownership_generation;
+	uint64 r4_record_generation;
+	uint32 sender_connection_generation;
+	int32 master_node;
+	uint16 payload_bytes;
+	bool prepared;
+	bool local_n_committed;
+	bool release_admitted;
+	uint8 reserved[3];
+	uint8 release_payload[RESOURCE_X_CONTROL_V1_BYTES];
+} ResourceXTargetEvictionPlan;
+
 /* TARGET-only requester: join/create the per-resource bootstrap round and
  * return only its exact post-T3 retained acquisition ref. */
 extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,
 	ResourceXAcquisitionRef *ref_out);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_prepare_exact(
+	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x,
+	uint64 r4_record_generation, uint64 reservation_token,
+	ResourceXTargetEvictionPlan *plan_out);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_publish_exact(
+	ResourceXTargetEvictionPlan *plan);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_evict_abort_exact(
+	ResourceXTargetEvictionPlan *plan);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_direct_init_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,

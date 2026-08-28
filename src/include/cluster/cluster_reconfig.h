@@ -873,6 +873,13 @@ extern bool cluster_reconfig_join_in_progress(void);
  */
 extern void cluster_reconfig_note_self_admitted(uint64 admitted_epoch);
 extern bool cluster_reconfig_self_join_admitted(void); /* RF-ROOT P6 */
+/* Approved epoch-0 late-founder bridge.  This is a read-only conjunction of
+ * current QVOTEC peer identity, exact admitted membership, and the already-
+ * published stripe face.  It grants neither membership nor xid authority. */
+extern bool cluster_reconfig_epoch0_late_founder_evidence_current(void);
+extern bool cluster_reconfig_stage_pre_publish_join_handoff(
+	uint64 expected_self_incarnation);
+extern bool cluster_reconfig_pre_publish_join_handoff_current(void);
 
 /* spec-5.15A closed replacement admission.  A canonical local ADMITTED
  * episode may publish self MEMBER while keeping the ordinary write gate

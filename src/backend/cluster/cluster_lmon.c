@@ -71,6 +71,7 @@
 #include "cluster/cluster_grd.h"			 /* cluster_grd_lmon_tick_dead_sweep (spec-2.16 D8) */
 #include "cluster/cluster_lms.h" /* cluster_lms_owns_grant (spec-2.18 Sprint A Step 3 D8 HC4) */
 #include "cluster/cluster_native_lock_probe.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_semantic_activation.h"
@@ -1322,6 +1323,7 @@ LmonMain(void)
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
 			cluster_grd_lmon_tick_dead_sweep();
 			(void)cluster_grd_reclaim_sweep();
+			cluster_pcm_lock_lmon_reclaim_tick();
 			/* spec-5.10 fix-forward — runtime-off starvation sweep (no-op
 			 * unless cluster.ges_starvation_protection was just turned off). */
 			(void)cluster_grd_lmon_tick_starvation_sweep();
@@ -2052,6 +2054,7 @@ LmonMain(void)
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
 			cluster_grd_lmon_tick_dead_sweep();
 			(void)cluster_grd_reclaim_sweep();
+			cluster_pcm_lock_lmon_reclaim_tick();
 			/* spec-5.10 fix-forward — runtime-off starvation sweep. */
 			(void)cluster_grd_lmon_tick_starvation_sweep();
 

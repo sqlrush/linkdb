@@ -613,9 +613,10 @@ cluster_wal_state_publish_active(void)
  *	RF A1 W3, called only by the checkpointer after ShutdownXLOG returns.
  *	The common formed-registry RMW reacquires verified CF(X), changes the
  *	frozen STOPPED mask, fsyncs and verifies the exact after-image.  Failure
- *	must never block shutdown: WARNING + carry on, leaving ACTIVE/evidence.
+ *	returns false after WARNING, leaving ACTIVE/evidence.  Ordinary shutdown
+ *	may carry on; phase-1 uses the result as its exact pre-barrier gate.
  */
-void
+bool
 cluster_wal_state_publish_stopped(void)
 {
 	ClusterWalStateUpdate update;
@@ -624,7 +625,7 @@ cluster_wal_state_publish_stopped(void)
 	XLogRecPtr write_ptr;
 
 	if (!registry_configured())
-		return;
+		return false;
 
 	if (RecoveryInProgress()) {
 		write_ptr = GetXLogReplayRecPtr(&tli);
@@ -650,6 +651,8 @@ cluster_wal_state_publish_stopped(void)
 								 (int)result),
 						  errhint("The slot stays ACTIVE; recovery readers treat it "
 								  "conservatively.")));
+	return result == CLUSTER_WAL_STATE_UPDATE_OK
+		|| result == CLUSTER_WAL_STATE_UPDATE_NOOP;
 }
 
 /*

@@ -2192,6 +2192,30 @@ cluster_grd_recovery_event_old_epoch(void)
 	return pg_atomic_read_u64(&cluster_grd_state->recovery_event_old_epoch);
 }
 
+/*
+ * Only terminal reconfiguration events may start a GRD recovery episode.
+ * JOIN_PENDING is membership staging: accepting it as a failure episode gives
+ * it an empty dead set and can wedge initial formation in WAIT_CLUSTER before
+ * JOIN_COMMITTED is ever published.  Keep this as a closed set so a future or
+ * malformed kind cannot silently inherit the failure direction.
+ */
+static bool
+grd_recovery_event_is_terminal(uint8 reconfig_kind)
+{
+	switch ((ClusterReconfigKind)reconfig_kind) {
+		case RECONFIG_KIND_FAIL_STOP:
+		case RECONFIG_KIND_CLEAN_LEAVE:
+		case RECONFIG_KIND_JOIN_COMMITTED:
+		case RECONFIG_KIND_NODE_REMOVED:
+		case RECONFIG_KIND_REPLACEMENT_COMMITTED:
+			return true;
+		case RECONFIG_KIND_NONE:
+		case RECONFIG_KIND_JOIN_PENDING:
+		default:
+			return false;
+	}
+}
+
 /* spec-4.6 D4/D5 — recovery counter bump helpers for out-of-module
  * call sites (S4 stale mapping in cluster_lock_acquire.c;  GCS block
  * fail-closed guard in cluster_gcs_block.c). */
@@ -2611,10 +2635,15 @@ grd_recovery_broadcast_done(uint64 epoch)
 }
 
 /* REDECLARE_DONE receiver (cluster_ges.c inbound handler). */
-/* Process-local once-gate for the symmetric done-key echo (回正清单 P1#4):
- * one echo per exact {epoch, dead_bitmap_hash} composite per process. */
-static uint64 grd_recovery_done_echo_epoch = 0;
-static uint64 grd_recovery_done_echo_hash = 0;
+/* Process-local bounded gate for the symmetric done-key echo (回正清单
+ * P1#4): one echo per exact {requester, epoch, dead_bitmap_hash}.  A single
+ * process-wide composite gate is insufficient during concurrent formation:
+ * its first broadcast can precede a later requester's CONTROL admission, and
+ * then that requester's exact DONE can no longer elicit the missing reply.
+ * The requester index bounds this to at most N-1 echoes per composite while
+ * retaining duplicate suppression without shared or wire state. */
+static uint64 grd_recovery_done_echo_epoch[CLUSTER_MAX_NODES];
+static uint64 grd_recovery_done_echo_hash[CLUSTER_MAX_NODES];
 
 void
 cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap_hash)
@@ -2725,11 +2754,11 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap
 	 * starved on the same composite forever (t243 run-42 bootstrap:
 	 * node0 terminaled at +1 tick with echo=0, node1's done0=0/0 for 70 s).
 	 *
-	 * Echo amplification guard (回正清单 P1#4): each exact {epoch, hash}
-	 * composite may trigger at most ONE echo per process.  A peer that
+	 * Echo amplification guard (回正清单 P1#4): each exact
+	 * {requester, epoch, hash} may trigger at most ONE echo.  A peer that
 	 * keeps re-broadcasting the same key therefore cannot drive an unbounded
-	 * per-frame echo storm; a NEW episode (different composite) re-arms the
-	 * echo exactly once.  This runs in the LMON dispatch context
+	 * per-frame echo storm; a distinct requester or NEW episode re-arms one
+	 * bounded echo.  This runs in the LMON dispatch context
 	 * (cluster_ges.c), where the shared outbound ring is the same path the
 	 * existing broadcasts use.
 	 */
@@ -2746,11 +2775,11 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap
 		if ((epoch == fsm_epoch && dead_bitmap_hash == fsm_hash)
 			|| (epoch == auth_epoch && dead_bitmap_hash == auth_hash))
 		{
-			if (epoch != grd_recovery_done_echo_epoch
-				|| dead_bitmap_hash != grd_recovery_done_echo_hash)
+			if (epoch != grd_recovery_done_echo_epoch[node]
+				|| dead_bitmap_hash != grd_recovery_done_echo_hash[node])
 			{
-				grd_recovery_done_echo_epoch = epoch;
-				grd_recovery_done_echo_hash = dead_bitmap_hash;
+				grd_recovery_done_echo_epoch[node] = epoch;
+				grd_recovery_done_echo_hash[node] = dead_bitmap_hash;
 				grd_recovery_broadcast_done_key(epoch, dead_bitmap_hash);
 			}
 		}
@@ -3572,6 +3601,19 @@ cluster_grd_recovery_lmon_tick(void)
 			 * WAIT_EPOCH — the coordinator wedging itself, no IC piggyback
 			 * needed.  Hold the last stable pre-reconfig baseline instead.
 			 */
+			if (!cluster_reconfig_has_pending_prebump_stage())
+				pg_atomic_write_u64(&cluster_grd_state->recovery_event_old_epoch,
+									cluster_epoch_get_current());
+			return;
+		}
+
+		/*
+		 * Membership staging is not a GRD episode.  In particular, an initial
+		 * JOIN_PENDING carries no dead set and must remain inert until the exact
+		 * JOIN_COMMITTED event arrives.  Do not consume its event_id: the
+		 * terminal publication is the only valid P0 trigger.
+		 */
+		if (!grd_recovery_event_is_terminal(evt.reconfig_kind)) {
 			if (!cluster_reconfig_has_pending_prebump_stage())
 				pg_atomic_write_u64(&cluster_grd_state->recovery_event_old_epoch,
 									cluster_epoch_get_current());

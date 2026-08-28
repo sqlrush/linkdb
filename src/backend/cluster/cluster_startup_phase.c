@@ -117,6 +117,7 @@ static const char *const cluster_phase_strings[] = {
  *	accessors all early-return safe defaults in that case.
  */
 static ClusterPhaseSharedState *cluster_phase_state = NULL;
+static bool phase3_join_readonly_deferred = false;
 
 static bool
 cluster_phase_state_lock_acquire(LWLockMode mode)
@@ -209,20 +210,29 @@ cluster_authority_binding_copy(ClusterAuthorityBindingLocal *out)
 	return true;
 }
 
-static void
+static bool
 cluster_authority_clear_matching(const ClusterAuthorityBindingLocal *binding,
 								 const char *caller)
 {
+	bool cleared = false;
+
 	if (cluster_phase_state == NULL || binding == NULL)
-		return;
+		return false;
 	if (!cluster_phase_state_lock_acquire(LW_EXCLUSIVE))
-		return;
-	if ((ClusterAuthorityReadiness)pg_atomic_read_u32(
+		return false;
+	if (pg_atomic_read_u32(&cluster_phase_state->authority_managed) != 0
+		&& (ClusterAuthorityReadiness)pg_atomic_read_u32(
 			&cluster_phase_state->authority_readiness) == binding->state
+		&& cluster_phase_state->authority_origin_thread
+			   == binding->origin_thread
 		&& cluster_phase_state->authority_boot_incarnation
 			   == binding->boot_incarnation
 		&& cluster_phase_state->authority_lms_generation
-			   == binding->lms_generation) {
+			   == binding->lms_generation
+		&& memcmp(&cluster_phase_state->authority_fence,
+				  &binding->authority, sizeof(binding->authority)) == 0
+		&& memcmp(&cluster_phase_state->authority_formation,
+				  &binding->formation, sizeof(binding->formation)) == 0) {
 		pg_atomic_write_u32(&cluster_phase_state->authority_readiness,
 							CLUSTER_AUTHORITY_OFF);
 		/* Managed is a boot-lifetime fail-closed latch.  Losing a bound
@@ -235,8 +245,10 @@ cluster_authority_clear_matching(const ClusterAuthorityBindingLocal *binding,
 			   sizeof(cluster_phase_state->authority_fence));
 		memset(&cluster_phase_state->authority_formation, 0,
 			   sizeof(cluster_phase_state->authority_formation));
+		cleared = true;
 	}
 	LWLockRelease(&cluster_phase_state->lwlock);
+	return cleared;
 }
 
 void
@@ -261,12 +273,22 @@ cluster_authority_readiness_clear(void)
 }
 
 static bool
+cluster_authority_setup_phase_current(void)
+{
+	ClusterStartupPhase phase = cluster_current_phase();
+
+	return phase == CLUSTER_PHASE_3_RECOVERY
+		|| (phase == CLUSTER_PHASE_4_NORMAL
+			&& phase3_join_readonly_deferred);
+}
+
+static bool
 cluster_authority_binding_preseal_current(
 	const ClusterAuthorityBindingLocal *binding)
 {
 	return binding != NULL && binding->boot_incarnation != 0
 		&& binding->lms_generation != 0
-		&& cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+		&& cluster_authority_setup_phase_current()
 		&& cluster_cssd_get_status() == CLUSTER_CSSD_READY
 		&& cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY
 		&& cluster_qvotec_in_quorum()
@@ -288,10 +310,11 @@ cluster_serving_formation_current(const ClusterAuthorityBindingLocal *binding)
 {
 	ClusterFormationSnapshotV1 current;
 
-	return binding != NULL
+	return binding != NULL && cluster_reconfig_self_join_admitted()
 		&& cluster_reconfig_capture_formation_snapshot_v1(
 			   binding->origin_thread, &current)
-		&& memcmp(&current, &binding->formation, sizeof(current)) == 0;
+		&& cluster_formation_snapshot_matches_v1(
+			&binding->formation, &current);
 }
 
 /* The formation and GRD seal may be replaced only by LMON after the ordinary
@@ -385,7 +408,7 @@ cluster_authority_readiness_begin(
 
 	if (cluster_phase_state == NULL || authority == NULL || formation == NULL
 		|| origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
-		|| cluster_current_phase() != CLUSTER_PHASE_3_RECOVERY)
+		|| !cluster_authority_setup_phase_current())
 		return false;
 	origin_node = (int32)origin_thread - 1;
 	boot_incarnation = cluster_qvotec_get_self_incarnation();
@@ -436,9 +459,7 @@ cluster_authority_readiness_bind_recovery_generation(uint64 lms_generation)
 		|| (ClusterAuthorityReadiness)pg_atomic_read_u32(
 			   &cluster_phase_state->authority_readiness)
 			   != CLUSTER_AUTHORITY_STARTING
-		|| (ClusterStartupPhase)pg_atomic_read_u32(
-			   &cluster_phase_state->current_phase)
-			   != CLUSTER_PHASE_3_RECOVERY
+		|| !cluster_authority_setup_phase_current()
 		|| (cluster_phase_state->authority_lms_generation != 0
 			&& cluster_phase_state->authority_lms_generation
 				   != lms_generation)) {
@@ -473,9 +494,7 @@ cluster_authority_readiness_publish_recovery(uint64 lms_generation)
 		|| (ClusterAuthorityReadiness)pg_atomic_read_u32(
 			   &cluster_phase_state->authority_readiness)
 			   != CLUSTER_AUTHORITY_STARTING
-		|| (ClusterStartupPhase)pg_atomic_read_u32(
-			   &cluster_phase_state->current_phase)
-			   != CLUSTER_PHASE_3_RECOVERY) {
+		|| !cluster_authority_setup_phase_current()) {
 		LWLockRelease(&cluster_phase_state->lwlock);
 		return false;
 	}
@@ -490,7 +509,7 @@ cluster_authority_readiness_publish_recovery(uint64 lms_generation)
 	if (!cluster_authority_binding_copy(&binding))
 		return false;
 	valid = binding.state == CLUSTER_AUTHORITY_STARTING
-		&& cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+		&& cluster_authority_setup_phase_current()
 		&& cluster_cssd_get_status() == CLUSTER_CSSD_READY
 		&& cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY
 		&& cluster_qvotec_in_quorum()
@@ -553,7 +572,7 @@ cluster_recovery_transport_is_current(void)
 		 * bound generation that drifted from the live formation is
 		 * genuinely stale.
 		 */
-		if (cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+		if (cluster_authority_setup_phase_current()
 			&& binding.lms_generation != 0)
 			cluster_authority_clear_matching(&binding,
 											 "recovery_transport_stale");
@@ -700,7 +719,7 @@ cluster_authority_readiness_publish_serving(void)
 		&& admitted_incarnation == binding.boot_incarnation
 		&& lms_generation == binding.lms_generation && lms_ready
 		&& formation_result == CLUSTER_FORMATION_WITNESS_READY
-		&& grd_current;
+		&& grd_current && cluster_reconfig_self_join_admitted();
 	if (!valid) {
 		ereport(LOG,
 				(errmsg("cluster phase 4: serving authority diagnostic"),
@@ -779,7 +798,8 @@ cluster_authority_serving_rebind_lmon(void)
 	capture_ok = cluster_reconfig_capture_formation_snapshot_v1(
 		binding.origin_thread, &current);
 	moved = capture_ok
-		&& memcmp(&current, &binding.formation, sizeof(current)) != 0;
+		&& !cluster_formation_snapshot_matches_v1(
+			&binding.formation, &current);
 	if (!gen_cur || !capture_ok || !moved)
 		return false;
 
@@ -841,7 +861,8 @@ cluster_authority_serving_rebind_leaver(void)
 	if (!cluster_serving_generation_current(&binding)
 		|| !cluster_reconfig_capture_formation_snapshot_v1(
 			   binding.origin_thread, &current)
-		|| memcmp(&current, &binding.formation, sizeof(current)) == 0) {
+		|| cluster_formation_snapshot_matches_v1(
+			&binding.formation, &current)) {
 		return false;
 	}
 
@@ -1259,6 +1280,60 @@ static bool cluster_phase4_wait_for_quorum(TimestampTz deadline);
 static int phase3_cssd_pid = 0;
 static int phase3_qvotec_pid = 0;
 static int phase3_lms_pid = 0;
+static TimestampTz phase3_recovery_deadline = 0;
+
+/*
+ * A recovery-control founder can discover the already-running cluster only
+ * after its first GRD barrier attempt.  The approved pivot is legal solely
+ * while the exact pre-publish STARTING binding is still reversible.  It
+ * neither owns admission nor creates or refreshes a deadline.
+ */
+static bool
+cluster_phase3_try_pre_publish_join_readonly_pivot(TimestampTz deadline,
+												uint64 lms_generation)
+{
+	ClusterAuthorityBindingLocal binding;
+
+	if (phase3_join_readonly_deferred || deadline == 0
+		|| lms_generation == 0 || GetCurrentTimestamp() >= deadline
+		|| !cluster_cf_phase2_peer_verified()
+		|| cluster_reconfig_self_join_admitted()
+		|| !cluster_reconfig_epoch0_late_founder_evidence_current()
+		|| !cluster_authority_binding_copy(&binding)
+		|| binding.state != CLUSTER_AUTHORITY_STARTING
+		|| binding.lms_generation != lms_generation
+		|| cluster_lms_get_lms_restart_generation()
+			   != binding.lms_generation
+		|| binding.boot_incarnation == 0
+		|| cluster_qvotec_get_self_incarnation()
+			   != binding.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   != binding.boot_incarnation)
+		return false;
+
+	if (!cluster_authority_clear_matching(&binding,
+									  "phase3_join_readonly_pivot")
+		|| cluster_authority_readiness_get() != CLUSTER_AUTHORITY_OFF
+		|| !cluster_authority_readiness_managed()
+		|| cluster_lms_get_lms_restart_generation()
+			   != binding.lms_generation
+		|| cluster_qvotec_get_self_incarnation()
+			   != binding.boot_incarnation
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   != binding.boot_incarnation
+		|| GetCurrentTimestamp() >= deadline
+		|| !cluster_cf_phase2_peer_verified()
+		|| cluster_reconfig_self_join_admitted()
+		|| !cluster_reconfig_epoch0_late_founder_evidence_current()
+		|| !cluster_reconfig_stage_pre_publish_join_handoff(
+			binding.boot_incarnation))
+		return false;
+
+	phase3_join_readonly_deferred = true;
+	elog(LOG,
+		 "cluster phase 3: exact pre-publish recovery binding pivoted to JOIN_READONLY");
+	return true;
+}
 
 static PhaseRunResult
 phase_1_handler(PhaseRunFailContext *fail_ctx)
@@ -1365,6 +1440,7 @@ phase_2_handler(PhaseRunFailContext *fail_ctx)
 
 static bool
 cluster_phase3_wait_for_live_formation(TimestampTz deadline,
+									   bool allow_join_readonly,
 									   ClusterFormationWitnessResult *out_result,
 									   uint16 *out_origin_thread,
 									   ClusterFenceAuthorityProof *out_authority,
@@ -1385,10 +1461,25 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline,
 
 		if (GetCurrentTimestamp() >= deadline)
 			break;
+		/* spec-5.6 JOIN_READONLY: an exact peer-attaching node may finish
+		 * StartupXLOG without shared-authority writes.  This is a one-way,
+		 * fail-closed deferral: only the initial phase-3 wait may select it,
+		 * and only while the fresh phase-2 peer proof and exact same-boot
+		 * late-founder evidence are both current.  A transient JOINING byte
+		 * can also be produced by the founding bootstrap stripe HOLD; it is
+		 * not evidence that another database instance is already running. */
+		if (allow_join_readonly && cluster_cf_phase2_peer_verified()
+			&& !cluster_reconfig_self_join_admitted()
+			&& cluster_reconfig_epoch0_late_founder_evidence_current()) {
+			phase3_join_readonly_deferred = true;
+			if (out_result != NULL)
+				*out_result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+			return true;
+		}
 		attempt_ms = cluster_phase_remaining_budget_ms(deadline, 5000);
 		if (attempt_ms > 100)
 			attempt_ms = 100;
-		result = cluster_formation_witness_build_live_wait(
+		result = cluster_formation_witness_build_recovery_control_wait(
 			thread_id, attempt_ms, &witness);
 		if (result == CLUSTER_FORMATION_WITNESS_READY) {
 			if (!cluster_formation_witness_copy_classification_v1(
@@ -1425,6 +1516,55 @@ cluster_phase3_wait_for_live_formation(TimestampTz deadline,
 	return false;
 }
 
+/*
+ * Refresh the finite durable-marker cache after StartupXLOG and the exact
+ * xid-stripe admission have completed.  The phase-3 recovery-control proof
+ * is an immutable authority binding, not a timeless cache lease: ordinary
+ * service may reuse it only after a fresh live witness proves the same
+ * marker and the same formation (apart from the frozen 0 -> 1 admission
+ * edge).  This does not replace the binding or create a second authority.
+ */
+static ClusterFormationWitnessResult
+cluster_phase4_refresh_serving_formation(int timeout_ms)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterFormationWitnessV1 *witness = NULL;
+	ClusterFenceAuthorityProof fresh_authority;
+	ClusterFormationSnapshotV1 fresh_formation;
+	ClusterFormationWitnessResult result;
+	uint16 fresh_origin_thread = 0;
+
+	if (timeout_ms <= 0 || !cluster_authority_binding_copy(&binding)
+		|| binding.state != CLUSTER_AUTHORITY_RECOVERY_READY
+		|| !cluster_reconfig_self_join_admitted())
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+
+	result = cluster_formation_witness_build_live_wait(
+		binding.origin_thread, timeout_ms, &witness);
+	if (result == CLUSTER_FORMATION_WITNESS_READY) {
+		if (!cluster_formation_witness_copy_classification_v1(
+				witness, &fresh_origin_thread, &fresh_authority,
+				&fresh_formation))
+			result = CLUSTER_FORMATION_WITNESS_CORRUPT;
+		else if (fresh_origin_thread != binding.origin_thread
+			|| fresh_authority.agree_disk_count
+				   != binding.authority.agree_disk_count
+			|| fresh_authority.total_disk_count
+				   != binding.authority.total_disk_count
+			|| !cluster_fence_marker_semantic_equal(
+				&fresh_authority.marker, &binding.authority.marker)
+			|| !cluster_formation_snapshot_matches_v1(
+				&binding.formation, &fresh_formation))
+			result = CLUSTER_FORMATION_WITNESS_UNSTABLE;
+		else
+			result = cluster_formation_classification_revalidate_nowait(
+				binding.origin_thread, &binding.authority,
+				&binding.formation);
+	}
+	cluster_formation_witness_destroy(&witness);
+	return result;
+}
+
 static PhaseRunResult
 phase_3_handler(PhaseRunFailContext *fail_ctx)
 {
@@ -1438,7 +1578,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 	int remaining_ms;
 	bool bind_failed;
 	bool barrier_failed;
-	TimestampTz phase3_deadline;
+	bool resume_join_readonly = phase3_join_readonly_deferred;
 
 	Assert(!IsUnderPostmaster);
 	Assert(fail_ctx != NULL);
@@ -1447,6 +1587,26 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 		elog(DEBUG1, "cluster phase 3: cluster.enabled=false; skipping CSSD + "
 					 "QVOTEC pre-recovery formation gate");
 		return PHASE_RUN_OK;
+	}
+
+	/* The post-StartupXLOG half of JOIN_READONLY reuses the exact phase-3
+	 * children.  Its authority-only budget is created after ordinary admission;
+	 * it cannot respawn a child or establish authority before that edge. */
+	if (resume_join_readonly) {
+		if (phase3_recovery_deadline == 0
+			|| GetCurrentTimestamp() >= phase3_recovery_deadline
+			|| cluster_cssd_get_status() != CLUSTER_CSSD_READY
+			|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
+			|| !cluster_qvotec_in_quorum()
+			|| !cluster_cf_phase2_peer_verified()
+			|| !cluster_reconfig_self_join_admitted()) {
+			fail_ctx->errcode = ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED;
+			fail_ctx->errmsg = "cluster phase 3: JOIN_READONLY admission is not current";
+			fail_ctx->errhint = "The fresh peer proof, quorum, original phase-3 deadline, "
+								"and exact post-recovery admission must all remain current.";
+			return PHASE_RUN_FATAL;
+		}
+		goto establish_recovery_authority;
 	}
 
 	/*
@@ -1471,7 +1631,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 	 * before StartupXLOG, using one bounded phase-3 deadline for both READY
 	 * waits and the configured multi-node quorum cut.
 	 */
-	phase3_deadline = TimestampTzPlusMilliseconds(
+	phase3_recovery_deadline = TimestampTzPlusMilliseconds(
 		GetCurrentTimestamp(),
 		cluster_phase_timeout_for(CLUSTER_PHASE_3_RECOVERY) * 1000);
 
@@ -1484,7 +1644,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	remaining_ms = cluster_phase_remaining_budget_ms(phase3_deadline, 5000);
+	remaining_ms = cluster_phase_remaining_budget_ms(phase3_recovery_deadline, 5000);
 	if (!cluster_cssd_wait_for_ready(remaining_ms)) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_CSSD_NOT_READY;
 		fail_ctx->errmsg = "cluster phase 3: CSSD did not publish READY in time";
@@ -1502,7 +1662,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
-	remaining_ms = cluster_phase_remaining_budget_ms(phase3_deadline, 5000);
+	remaining_ms = cluster_phase_remaining_budget_ms(phase3_recovery_deadline, 5000);
 	if (!cluster_qvotec_wait_for_ready(remaining_ms)) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_QVOTEC_NOT_READY;
 		fail_ctx->errmsg = "cluster phase 3: QVOTEC did not publish READY in time";
@@ -1512,7 +1672,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 	}
 
 	if (cluster_phase4_wal_state_configured() && cluster_conf_node_count() > 1
-		&& !cluster_phase4_wait_for_quorum(phase3_deadline)) {
+		&& !cluster_phase4_wait_for_quorum(phase3_recovery_deadline)) {
 		fail_ctx->errcode = ERRCODE_CLUSTER_QUORUM_LOST;
 		fail_ctx->errmsg = "cluster phase 3: QVOTEC did not establish quorum in time";
 		fail_ctx->errhint = "Restore a voting-disk majority and verify the lease-aware "
@@ -1520,9 +1680,11 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
+establish_recovery_authority:
 	if (cluster_phase4_wal_state_configured()
 		&& !cluster_phase3_wait_for_live_formation(
-			phase3_deadline, &formation_result, &formation_origin_thread,
+			phase3_recovery_deadline, !resume_join_readonly,
+			&formation_result, &formation_origin_thread,
 			&formation_authority, &formation_snapshot)) {
 		ereport(LOG,
 				(errmsg("cluster phase 3: live formation wait failed with witness result %u",
@@ -1533,6 +1695,14 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 							"incarnation floor, and durable voting-disk authority before "
 							"retrying startup.";
 		return PHASE_RUN_FATAL;
+	}
+	if (!resume_join_readonly && phase3_join_readonly_deferred) {
+		elog(LOG, "cluster phase 3: deferring recovery authority for exact JOIN_READONLY StartupXLOG");
+		/* The ordinary stripe/JCMK state machine owns admission timing.  The
+		 * pre-StartupXLOG phase budget must not become, or be mistaken for, a
+		 * second admission deadline. */
+		phase3_recovery_deadline = 0;
+		return PHASE_RUN_OK;
 	}
 
 	if (cluster_phase4_wal_state_configured()) {
@@ -1562,7 +1732,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 			return PHASE_RUN_FATAL;
 		}
 		lms_remaining_ms = cluster_phase_remaining_budget_ms(
-			phase3_deadline, 5000);
+			phase3_recovery_deadline, 5000);
 		if (!cluster_lms_wait_for_recovery_ready(lms_remaining_ms)) {
 			cluster_authority_readiness_clear();
 			fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
@@ -1616,9 +1786,9 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 				/* begin() only accepts OFF, so drop any stale STARTING
 				 * binding before reacquiring the exact live formation. */
 				cluster_authority_readiness_clear();
-				if (GetCurrentTimestamp() >= phase3_deadline
+				if (GetCurrentTimestamp() >= phase3_recovery_deadline
 					|| !cluster_phase3_wait_for_live_formation(
-						phase3_deadline, &formation_result,
+						phase3_recovery_deadline, false, &formation_result,
 						&formation_origin_thread, &formation_authority,
 						&formation_snapshot)
 					|| !cluster_authority_readiness_begin(
@@ -1632,14 +1802,18 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 			}
 			boot_incarnation = cluster_qvotec_get_self_incarnation();
 			lms_remaining_ms = cluster_phase_remaining_budget_ms(
-				phase3_deadline, 5000);
+				phase3_recovery_deadline, 5000);
 			if (cluster_grd_recovery_authority_barrier_wait(
 					&formation_snapshot, boot_incarnation, lms_generation,
-					lms_remaining_ms)
-				&& cluster_authority_readiness_publish_recovery(
-					lms_generation))
-				break;
-			if (GetCurrentTimestamp() >= phase3_deadline) {
+					lms_remaining_ms)) {
+				if (cluster_authority_readiness_publish_recovery(
+						lms_generation))
+					break;
+			} else if (cluster_phase3_try_pre_publish_join_readonly_pivot(
+						   phase3_recovery_deadline, lms_generation)) {
+				return PHASE_RUN_OK;
+			}
+			if (GetCurrentTimestamp() >= phase3_recovery_deadline) {
 				barrier_failed = true;
 				break;
 			}
@@ -1648,7 +1822,7 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 			 * stale binding first. */
 			cluster_authority_readiness_clear();
 			if (!cluster_phase3_wait_for_live_formation(
-					phase3_deadline, &formation_result,
+					phase3_recovery_deadline, false, &formation_result,
 					&formation_origin_thread, &formation_authority,
 					&formation_snapshot)
 				|| !cluster_authority_readiness_begin(
@@ -1682,11 +1856,147 @@ phase_3_handler(PhaseRunFailContext *fail_ctx)
 			return PHASE_RUN_FATAL;
 		}
 	}
+	phase3_join_readonly_deferred = false;
 
 	elog(DEBUG1,
 		 "cluster phase 3: CSSD ready (pid %d) + QVOTEC ready (pid %d); "
 		 "PG-native recovery starts with formation authority available",
 		 phase3_cssd_pid, phase3_qvotec_pid);
+	return PHASE_RUN_OK;
+}
+
+
+/* Complete a peer-attaching JOIN_READONLY boot inside the one phase-4
+ * publication budget.  StartupXLOG has already returned and ordinary
+ * stripe/JOIN-WAL/JCMK admission is terminal-positive.  The readiness FSM is
+ * unchanged: OFF -> STARTING -> RECOVERY_READY, followed by the existing
+ * phase-4 RECOVERY_READY -> SERVING_READY transition. */
+static PhaseRunResult
+cluster_phase4_establish_join_readonly_authority(
+	TimestampTz deadline, PhaseRunFailContext *fail_ctx)
+{
+	ClusterFenceAuthorityProof formation_authority;
+	ClusterFormationSnapshotV1 formation_snapshot;
+	ClusterFormationWitnessResult formation_result;
+	uint16 formation_origin_thread = 0;
+	uint64 boot_incarnation;
+	uint64 lms_generation;
+	int lms_remaining_ms;
+	bool bind_failed = false;
+	bool barrier_failed = false;
+
+	if (!phase3_join_readonly_deferred
+		|| cluster_current_phase() != CLUSTER_PHASE_4_NORMAL
+		|| !cluster_cf_phase2_peer_verified()
+		|| !cluster_reconfig_self_join_admitted()) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED;
+		fail_ctx->errmsg = "cluster phase 4: JOIN_READONLY admission is not current";
+		fail_ctx->errhint = "The fresh peer proof and exact stripe/JOIN-WAL/JCMK "
+							"admission must remain current before authority publication.";
+		return PHASE_RUN_FATAL;
+	}
+	if (!cluster_phase3_wait_for_live_formation(
+			deadline, false, &formation_result, &formation_origin_thread,
+			&formation_authority, &formation_snapshot)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED;
+		fail_ctx->errmsg = "cluster phase 4: admitted JOIN_READONLY formation is unavailable";
+		fail_ctx->errhint = "The current admitted formation and durable voting "
+							"authority must become exact within the phase-4 deadline.";
+		return PHASE_RUN_FATAL;
+	}
+	if (!cluster_lms_enabled) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+		fail_ctx->errmsg = "cluster phase 4: LMS is disabled for admitted JOIN_READONLY";
+		fail_ctx->errhint = "Set cluster.lms_enabled=on; no native serving fallback exists.";
+		return PHASE_RUN_FATAL;
+	}
+	if (!cluster_authority_readiness_begin(
+			formation_origin_thread, &formation_authority,
+			&formation_snapshot)) {
+		fail_ctx->errcode = ERRCODE_CLUSTER_WAL_RETENTION_BLOCKED;
+		fail_ctx->errmsg = "cluster phase 4: admitted JOIN_READONLY formation could not bind";
+		fail_ctx->errhint = "The admission incarnation and formation must remain exact.";
+		return PHASE_RUN_FATAL;
+	}
+
+	if (phase3_lms_pid <= 0 || cluster_lms_get_pid() != phase3_lms_pid)
+		phase3_lms_pid = cluster_lms_start();
+	if (phase3_lms_pid <= 0) {
+		cluster_authority_readiness_clear();
+		fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+		fail_ctx->errmsg = "cluster phase 4: failed to spawn admitted JOIN_READONLY LMS";
+		fail_ctx->errhint = "Check postmaster diagnostics and process limits.";
+		return PHASE_RUN_FATAL;
+	}
+	lms_remaining_ms = cluster_phase_remaining_budget_ms(deadline, 5000);
+	if (!cluster_lms_wait_for_recovery_ready(lms_remaining_ms)) {
+		cluster_authority_readiness_clear();
+		fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+		fail_ctx->errmsg = "cluster phase 4: admitted JOIN_READONLY LMS is not recovery-ready";
+		fail_ctx->errhint = "The LMS generation must become ready within the phase-4 deadline.";
+		return PHASE_RUN_FATAL;
+	}
+
+	for (;;) {
+		lms_generation = cluster_lms_get_lms_restart_generation();
+		if (!cluster_authority_readiness_bind_recovery_generation(
+				lms_generation)) {
+			cluster_authority_readiness_clear();
+			if (GetCurrentTimestamp() >= deadline
+				|| !cluster_phase3_wait_for_live_formation(
+					deadline, false, &formation_result,
+					&formation_origin_thread, &formation_authority,
+					&formation_snapshot)
+				|| !cluster_authority_readiness_begin(
+					formation_origin_thread, &formation_authority,
+					&formation_snapshot)) {
+				bind_failed = true;
+				break;
+			}
+			pg_usleep(20000L);
+			continue;
+		}
+
+		boot_incarnation = cluster_qvotec_get_self_incarnation();
+		lms_remaining_ms = cluster_phase_remaining_budget_ms(deadline, 5000);
+		if (cluster_grd_recovery_authority_barrier_wait(
+				&formation_snapshot, boot_incarnation, lms_generation,
+				lms_remaining_ms)
+			&& cluster_authority_readiness_publish_recovery(
+				lms_generation))
+			break;
+		if (GetCurrentTimestamp() >= deadline) {
+			barrier_failed = true;
+			break;
+		}
+		cluster_authority_readiness_clear();
+		if (!cluster_phase3_wait_for_live_formation(
+				deadline, false, &formation_result,
+				&formation_origin_thread, &formation_authority,
+				&formation_snapshot)
+			|| !cluster_authority_readiness_begin(
+				formation_origin_thread, &formation_authority,
+				&formation_snapshot)) {
+			bind_failed = true;
+			break;
+		}
+		pg_usleep(20000L);
+	}
+
+	if (bind_failed || barrier_failed
+		|| cluster_authority_readiness_get()
+			   != CLUSTER_AUTHORITY_RECOVERY_READY) {
+		cluster_authority_readiness_clear();
+		fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+		fail_ctx->errmsg = barrier_failed
+			? "cluster phase 4: admitted JOIN_READONLY GRD barrier is unavailable"
+			: "cluster phase 4: admitted JOIN_READONLY LMS generation could not bind";
+		fail_ctx->errhint = "Formation, admission, LMS generation, and GRD seal "
+							"must remain exact within the phase-4 deadline.";
+		return PHASE_RUN_FATAL;
+	}
+
+	phase3_join_readonly_deferred = false;
 	return PHASE_RUN_OK;
 }
 
@@ -1914,6 +2224,15 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 		return PHASE_RUN_FATAL;
 	}
 
+	/* A peer-attaching JOIN_READONLY boot deliberately reached StartupXLOG
+	 * without recovery authority.  After the unchanged admission terminal,
+	 * build that authority here under this same phase-4 absolute deadline;
+	 * the ordinary phase-3 path and all already-admitted boots are unchanged. */
+	if (registry_configured && phase3_join_readonly_deferred
+		&& cluster_phase4_establish_join_readonly_authority(
+			phase4_deadline, fail_ctx) == PHASE_RUN_FATAL)
+		return PHASE_RUN_FATAL;
+
 	/* ----------
 	 * spec-1.13 D6: DIAG spawn + sync wait ready (first phase 4 child).
 	 * ----------
@@ -1986,6 +2305,58 @@ phase_4_handler(PhaseRunFailContext *fail_ctx)
 				fail_ctx->errmsg = "cluster phase 4: recovery LMS authority is unavailable";
 				fail_ctx->errhint = "Restart after the phase-3 LMS generation and authority "
 									"binding are available.";
+				return PHASE_RUN_FATAL;
+			}
+			pg_usleep(20000L);
+		}
+		/* AD-023 recovery-control authority is sufficient for StartupXLOG,
+		 * never for ordinary service.  LMON keeps retrying the original
+		 * stripe join gate after recovery; wait for that exact admission byte
+		 * before issuing the existing LMS SERVING request. */
+		for (;;)
+		{
+			if (cluster_reconfig_self_join_admitted())
+				break;
+			if (GetCurrentTimestamp() >= phase4_deadline)
+			{
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 4: xid stripe admission is unavailable";
+				fail_ctx->errhint = "Recovery control authority cannot publish ordinary "
+								"service until the post-recovery xid stripe floor is durable.";
+				return PHASE_RUN_FATAL;
+			}
+			pg_usleep(20000L);
+		}
+		/* The phase-3 durable-marker cache is intentionally finite and can
+		 * expire while StartupXLOG completes.  Re-read the current durable
+		 * authority only after the exact stripe gate opens, and accept it only
+		 * when it is the same immutable marker/formation already bound to this
+		 * recovery generation. */
+		for (;;)
+		{
+			ClusterFormationWitnessResult refresh_result;
+			int refresh_ms = cluster_phase_remaining_budget_ms(
+				phase4_deadline, 5000);
+
+			if (refresh_ms > 100)
+				refresh_ms = 100;
+			refresh_result = cluster_phase4_refresh_serving_formation(
+				refresh_ms);
+			if (refresh_result == CLUSTER_FORMATION_WITNESS_READY)
+				break;
+			if ((refresh_result != CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH
+				 && refresh_result != CLUSTER_FORMATION_WITNESS_UNSTABLE
+				 && refresh_result != CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN
+				 && refresh_result != CLUSTER_FORMATION_WITNESS_IO_FAILED
+				 && refresh_result
+					!= CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE)
+				|| GetCurrentTimestamp() >= phase4_deadline)
+			{
+				cluster_authority_readiness_clear();
+				fail_ctx->errcode = ERRCODE_CLUSTER_LMS_UNAVAILABLE;
+				fail_ctx->errmsg = "cluster phase 4: serving formation proof is unavailable";
+				fail_ctx->errhint = "The post-recovery durable marker and exact admitted "
+								"formation must still match the phase-3 authority binding.";
 				return PHASE_RUN_FATAL;
 			}
 			pg_usleep(20000L);
@@ -2168,6 +2539,8 @@ cluster_run_startup_sequence(void)
 	 * cluster_init).  We advance into 0_BASE here as the explicit
 	 * skeleton starting point.
 	 */
+	phase3_join_readonly_deferred = false;
+	phase3_recovery_deadline = 0;
 	cluster_advance_phase(CLUSTER_PHASE_0_BASE);
 
 	/*
@@ -2357,6 +2730,30 @@ cluster_run_phase4_sequence(void)
 	int timeout_secs;
 	const ClusterStartupPhase phase = CLUSTER_PHASE_4_NORMAL;
 	PhaseRunFailContext fail_ctx = { 0 };
+
+	/* JOIN_READONLY runs StartupXLOG with every shared-authority mutation gate
+	 * closed.  Before crossing into phase 4, observe the unchanged
+	 * stripe/JOIN-WAL/JCMK owner until it admits or rejects this boot.  This
+	 * loop owns no deadline: classification/WAIT_EVIDENCE must not consume an
+	 * admission budget, and LMON remains the sole join-timeout owner. */
+	if (phase3_join_readonly_deferred) {
+		while (!cluster_reconfig_self_join_admitted()) {
+			ClusterMembershipState self_state
+				= cluster_membership_get_state(cluster_node_id);
+
+			if (self_state == CLUSTER_MEMBER_REJECTED
+				|| self_state == CLUSTER_MEMBER_REMOVED)
+				break;
+			pg_usleep(20000L);
+		}
+		if (!cluster_reconfig_self_join_admitted())
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_JOIN_REJECTED_STALE),
+					 errmsg("cluster startup phase %s failed: JOIN_READONLY admission rejected",
+							cluster_startup_phase_to_string(CLUSTER_PHASE_4_NORMAL)),
+					 errhint("The ordinary stripe/JOIN-WAL/JCMK owner reached its "
+								 "existing fail-closed terminal before phase 4.")));
+	}
 
 	Assert(!IsUnderPostmaster);
 

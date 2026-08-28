@@ -41,19 +41,8 @@
 #include "storage/fd.h"
 #include "utils/timestamp.h"
 
-/*
- * ClusterCfPhase2Record -- on-disk probe/ack file layout.  `nonce` carries the
- * prober's fresh nonce in a probe and the echoed nonce in an ack.
- */
 #define CLUSTER_CF_PHASE2_MAGIC 0x43465032 /* 'CFP2' */
-#define CLUSTER_CF_PHASE2_VERSION 1
-
-typedef struct ClusterCfPhase2Record {
-	uint32 magic;
-	uint32 version;
-	uint64 nonce;
-	pg_crc32c crc; /* over [0, offsetof(crc)) */
-} ClusterCfPhase2Record;
+#define CLUSTER_CF_PHASE2_VERSION 2
 
 /* Poll interval while waiting for the peer's probe/ack to appear. */
 #define CLUSTER_CF_PHASE2_POLL_US 100000 /* 100 ms */
@@ -79,110 +68,389 @@ ensure_p2_dir(const char *shared_dir)
  * Returns false on any I/O failure without throwing.
  */
 static bool
-write_record(const char *shared_dir, const char *rel, uint64 nonce)
+cf_phase2_node_valid(int node_id)
 {
-	ClusterCfPhase2Record rec;
-	char path[MAXPGPATH];
-	char tmp[MAXPGPATH];
-	int fd;
-
-	memset(&rec, 0, sizeof(rec));
-	rec.magic = CLUSTER_CF_PHASE2_MAGIC;
-	rec.version = CLUSTER_CF_PHASE2_VERSION;
-	rec.nonce = nonce;
-	INIT_CRC32C(rec.crc);
-	COMP_CRC32C(rec.crc, &rec, offsetof(ClusterCfPhase2Record, crc));
-	FIN_CRC32C(rec.crc);
-
-	snprintf(path, sizeof(path), "%s/%s", shared_dir, rel);
-	snprintf(tmp, sizeof(tmp), "%s/%s.tmp", shared_dir, rel);
-
-	fd = OpenTransientFile(tmp, O_RDWR | O_CREAT | O_TRUNC | PG_BINARY);
-	if (fd < 0)
-		return false;
-	if (write(fd, &rec, sizeof(rec)) != (int)sizeof(rec) || pg_fsync(fd) != 0) {
-		CloseTransientFile(fd);
-		unlink(tmp);
-		return false;
-	}
-	CloseTransientFile(fd);
-
-	if (durable_rename(tmp, path, LOG) != 0) {
-		unlink(tmp);
-		return false;
-	}
-	return true;
+	return node_id >= 0 && node_id < CLUSTER_MAX_NODES
+		&& cluster_conf_lookup_node(node_id) != NULL;
 }
 
-/*
- * read_record -- read + validate one record from <shared_dir>/<rel>.  Returns
- * false (out untouched) when the file is absent/short/foreign/CRC-bad.
- */
 static bool
-read_record(const char *shared_dir, const char *rel, uint64 *out_nonce)
+cf_phase2_path(char path[MAXPGPATH], const char *shared_dir, const char *rel)
 {
-	ClusterCfPhase2Record rec;
-	char path[MAXPGPATH];
-	pg_crc32c crc;
-	int fd;
-	int n;
+	int n = snprintf(path, MAXPGPATH, "%s/%s", shared_dir, rel);
 
-	snprintf(path, sizeof(path), "%s/%s", shared_dir, rel);
+	return n >= 0 && n < MAXPGPATH;
+}
+
+static bool
+cf_phase2_probe_paths(char final_rel[MAXPGPATH], char tmp_rel[MAXPGPATH],
+					  int probe_owner, uint64 nonce)
+{
+	int final_n;
+	int tmp_n;
+
+	final_n = snprintf(final_rel, MAXPGPATH, "%s/probe.%d",
+		CLUSTER_CF_PHASE2_DIR, probe_owner);
+	tmp_n = snprintf(tmp_rel, MAXPGPATH,
+		"%s/probe.%d.tmp.%016" INT64_MODIFIER "x",
+		CLUSTER_CF_PHASE2_DIR, probe_owner, nonce);
+	return final_n >= 0 && final_n < MAXPGPATH
+		&& tmp_n >= 0 && tmp_n < MAXPGPATH;
+}
+
+static bool
+cf_phase2_ack_paths(char final_rel[MAXPGPATH], char tmp_rel[MAXPGPATH],
+					int probe_owner, int responder, uint64 nonce)
+{
+	int final_n;
+	int tmp_n;
+
+	final_n = snprintf(final_rel, MAXPGPATH,
+		"%s/ack.%d.%d.%016" INT64_MODIFIER "x",
+		CLUSTER_CF_PHASE2_DIR, probe_owner, responder, nonce);
+	tmp_n = snprintf(tmp_rel, MAXPGPATH,
+		"%s/ack.%d.%d.%016" INT64_MODIFIER "x.tmp",
+		CLUSTER_CF_PHASE2_DIR, probe_owner, responder, nonce);
+	return final_n >= 0 && final_n < MAXPGPATH
+		&& tmp_n >= 0 && tmp_n < MAXPGPATH;
+}
+
+static void
+cf_phase2_init_record(ClusterCfPhase2RecordV2 *rec,
+					  ClusterCfPhase2Kind kind, int probe_owner,
+					  int responder, uint64 nonce)
+{
+	memset(rec, 0, sizeof(*rec));
+	rec->magic = CLUSTER_CF_PHASE2_MAGIC;
+	rec->version = CLUSTER_CF_PHASE2_VERSION;
+	rec->kind = kind;
+	rec->probe_owner_node = probe_owner;
+	rec->responder_node = responder;
+	rec->probe_nonce = nonce;
+	INIT_CRC32C(rec->crc);
+	COMP_CRC32C(rec->crc, rec, offsetof(ClusterCfPhase2RecordV2, crc));
+	FIN_CRC32C(rec->crc);
+}
+
+/* Read one exact V2 tuple.  V1, trailing bytes and path/body drift fail shut. */
+static bool
+cf_phase2_read_record(const char *shared_dir, const char *rel,
+					  ClusterCfPhase2Kind expected_kind,
+					  int expected_owner, int expected_responder,
+					  uint64 expected_nonce, bool exact_nonce,
+					  ClusterCfPhase2RecordV2 *out)
+{
+	ClusterCfPhase2RecordV2 rec;
+	char path[MAXPGPATH];
+	char extra;
+	pg_crc32c crc;
+	bool exact_size = false;
+	ssize_t n;
+	int fd;
+
+	if (!cf_phase2_path(path, shared_dir, rel))
+		return false;
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
 		return false;
 	n = read(fd, &rec, sizeof(rec));
+	if (n == (ssize_t)sizeof(rec)) {
+		n = read(fd, &extra, 1);
+		exact_size = (n == 0);
+	}
 	CloseTransientFile(fd);
-	if (n != (int)sizeof(rec) || rec.magic != CLUSTER_CF_PHASE2_MAGIC
-		|| rec.version != CLUSTER_CF_PHASE2_VERSION)
+	if (!exact_size || rec.magic != CLUSTER_CF_PHASE2_MAGIC
+		|| rec.version != CLUSTER_CF_PHASE2_VERSION
+		|| rec.kind != expected_kind || rec.reserved != 0
+		|| rec.probe_owner_node != expected_owner
+		|| rec.responder_node != expected_responder
+		|| rec.probe_nonce == 0
+		|| (exact_nonce && rec.probe_nonce != expected_nonce)
+		|| !cf_phase2_node_valid(rec.probe_owner_node))
+		return false;
+	if (rec.kind == CLUSTER_CF_P2_PROBE) {
+		if (rec.responder_node != -1)
+			return false;
+	} else if (rec.kind == CLUSTER_CF_P2_ACK) {
+		if (!cf_phase2_node_valid(rec.responder_node)
+			|| rec.responder_node == rec.probe_owner_node)
+			return false;
+	} else
 		return false;
 
 	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, &rec, offsetof(ClusterCfPhase2Record, crc));
+	COMP_CRC32C(crc, &rec, offsetof(ClusterCfPhase2RecordV2, crc));
 	FIN_CRC32C(crc);
 	if (crc != rec.crc)
 		return false;
 
-	*out_nonce = rec.nonce;
+	if (out != NULL)
+		*out = rec;
+	return true;
+}
+
+/* Tuple-scoped staging prevents independent responders sharing a tmp file. */
+static bool
+cf_phase2_write_record(const char *shared_dir, const char *final_rel,
+					   const char *tmp_rel, ClusterCfPhase2Kind kind,
+					   int probe_owner, int responder, uint64 nonce)
+{
+	ClusterCfPhase2RecordV2 rec;
+	char final_path[MAXPGPATH];
+	char tmp_path[MAXPGPATH];
+	int fd;
+
+	if (cf_phase2_read_record(shared_dir, final_rel, kind, probe_owner,
+			responder, nonce, true, NULL))
+		return true;
+	if (!cf_phase2_path(final_path, shared_dir, final_rel)
+		|| !cf_phase2_path(tmp_path, shared_dir, tmp_rel))
+		return false;
+
+	cf_phase2_init_record(&rec, kind, probe_owner, responder, nonce);
+	fd = OpenTransientFile(tmp_path,
+		O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
+	if (fd < 0) {
+		if (errno != EEXIST
+			|| !cf_phase2_read_record(shared_dir, tmp_rel, kind,
+				probe_owner, responder, nonce, true, NULL))
+			return false;
+	} else {
+		if (write(fd, &rec, sizeof(rec)) != (ssize_t)sizeof(rec)
+			|| pg_fsync(fd) != 0) {
+			CloseTransientFile(fd);
+			unlink(tmp_path);
+			return false;
+		}
+		if (CloseTransientFile(fd) != 0) {
+			unlink(tmp_path);
+			return false;
+		}
+	}
+
+	if (durable_rename(tmp_path, final_path, LOG) != 0)
+		return cf_phase2_read_record(shared_dir, final_rel, kind,
+			probe_owner, responder, nonce, true, NULL);
+	return cf_phase2_read_record(shared_dir, final_rel, kind,
+		probe_owner, responder, nonce, true, NULL);
+}
+
+static bool
+cf_phase2_parse_ack_name(const char *name, int probe_owner, int responder,
+						uint64 *nonce)
+{
+	char prefix[64];
+	const char *p;
+	size_t len;
+	uint64 value = 0;
+	int i;
+
+	if (snprintf(prefix, sizeof(prefix), "ack.%d.%d.",
+			probe_owner, responder) >= (int)sizeof(prefix))
+		return false;
+	if (strncmp(name, prefix, strlen(prefix)) != 0)
+		return false;
+	p = name + strlen(prefix);
+	len = strlen(p);
+	if (len == 20 && strcmp(p + 16, ".tmp") == 0)
+		len = 16;
+	if (len != 16)
+		return false;
+	for (i = 0; i < 16; i++) {
+		int digit;
+
+		if (p[i] >= '0' && p[i] <= '9')
+			digit = p[i] - '0';
+		else if (p[i] >= 'a' && p[i] <= 'f')
+			digit = p[i] - 'a' + 10;
+		else
+			return false;
+		value = (value << 4) | (uint64)digit;
+	}
+	*nonce = value;
+	return true;
+}
+
+#define CLUSTER_CF_PHASE2_GC_MAX 64
+#define CLUSTER_CF_PHASE2_GC_NAME_MAX 64
+
+typedef struct ClusterCfPhase2GcEntry {
+	char name[CLUSTER_CF_PHASE2_GC_NAME_MAX];
+	dev_t device;
+	ino_t inode;
+} ClusterCfPhase2GcEntry;
+
+typedef struct ClusterCfPhase2GcSnapshot {
+	int count;
+	ClusterCfPhase2GcEntry entries[CLUSTER_CF_PHASE2_GC_MAX];
+} ClusterCfPhase2GcSnapshot;
+
+/*
+ * Freeze a bounded set before publishing the caller's ACK.  A delayed old
+ * writer therefore cannot discover a later writer's current-nonce final.
+ */
+static void
+cf_phase2_capture_ack_pair(const char *shared_dir, int probe_owner,
+						   int responder, uint64 incoming_nonce,
+						   ClusterCfPhase2GcSnapshot *snapshot)
+{
+	char dirpath[MAXPGPATH];
+	DIR *dir;
+	struct dirent *de;
+
+	memset(snapshot, 0, sizeof(*snapshot));
+	if (!cf_phase2_path(dirpath, shared_dir, CLUSTER_CF_PHASE2_DIR))
+		return;
+	dir = AllocateDir(dirpath);
+	if (dir == NULL)
+		return;
+	while ((de = ReadDir(dir, dirpath)) != NULL) {
+		ClusterCfPhase2GcEntry *entry;
+		char rel[MAXPGPATH];
+		char path[MAXPGPATH];
+		struct stat st;
+		uint64 nonce;
+
+		if (!cf_phase2_parse_ack_name(de->d_name, probe_owner, responder,
+				&nonce) || nonce == incoming_nonce
+			|| snapshot->count >= CLUSTER_CF_PHASE2_GC_MAX
+			|| strlen(de->d_name) >= CLUSTER_CF_PHASE2_GC_NAME_MAX)
+			continue;
+		if (snprintf(rel, sizeof(rel), "%s/%s", CLUSTER_CF_PHASE2_DIR,
+				de->d_name) >= (int)sizeof(rel))
+			continue;
+		if (!cf_phase2_read_record(shared_dir, rel, CLUSTER_CF_P2_ACK,
+				probe_owner, responder, nonce, true, NULL))
+			continue;
+		if (!cf_phase2_path(path, shared_dir, rel) || lstat(path, &st) != 0
+			|| !S_ISREG(st.st_mode))
+			continue;
+		entry = &snapshot->entries[snapshot->count++];
+		strlcpy(entry->name, de->d_name, sizeof(entry->name));
+		entry->device = st.st_dev;
+		entry->inode = st.st_ino;
+	}
+	FreeDir(dir);
+}
+
+/* Delete only the pre-publication snapshot, never a later directory entry. */
+static void
+cf_phase2_cleanup_ack_snapshot(const char *shared_dir, int probe_owner,
+							   int responder, uint64 current_nonce,
+							   const ClusterCfPhase2GcSnapshot *snapshot)
+{
+	int i;
+
+	for (i = 0; i < snapshot->count; i++) {
+		const ClusterCfPhase2GcEntry *entry = &snapshot->entries[i];
+		ClusterCfPhase2RecordV2 probe;
+		char rel[MAXPGPATH];
+		char path[MAXPGPATH];
+		struct stat st;
+		uint64 nonce;
+
+		if (!cluster_cf_phase2_read_probe(shared_dir, probe_owner, &probe)
+			|| probe.probe_nonce != current_nonce)
+			return;
+		if (!cf_phase2_parse_ack_name(entry->name, probe_owner, responder,
+				&nonce) || nonce == current_nonce)
+			continue;
+		if (snprintf(rel, sizeof(rel), "%s/%s", CLUSTER_CF_PHASE2_DIR,
+				entry->name) >= (int)sizeof(rel)
+			|| !cf_phase2_read_record(shared_dir, rel, CLUSTER_CF_P2_ACK,
+				probe_owner, responder, nonce, true, NULL)
+			|| !cf_phase2_path(path, shared_dir, rel)
+			|| lstat(path, &st) != 0 || st.st_dev != entry->device
+			|| st.st_ino != entry->inode)
+			continue;
+		(void)unlink(path);
+	}
+}
+
+bool
+cluster_cf_phase2_write_probe(const char *shared_dir, int probe_owner,
+						  uint64 probe_nonce)
+{
+	char final_rel[MAXPGPATH];
+	char tmp_rel[MAXPGPATH];
+
+	if (shared_dir == NULL || shared_dir[0] == '\0' || probe_nonce == 0
+		|| !cf_phase2_node_valid(probe_owner))
+		return false;
+	ensure_p2_dir(shared_dir);
+	if (!cf_phase2_probe_paths(final_rel, tmp_rel, probe_owner, probe_nonce))
+		return false;
+	return cf_phase2_write_record(shared_dir, final_rel, tmp_rel,
+		CLUSTER_CF_P2_PROBE, probe_owner, -1, probe_nonce);
+}
+
+bool
+cluster_cf_phase2_read_probe(const char *shared_dir, int probe_owner,
+						 ClusterCfPhase2RecordV2 *out)
+{
+	char final_rel[MAXPGPATH];
+	char tmp_rel[MAXPGPATH];
+
+	if (shared_dir == NULL || out == NULL || !cf_phase2_node_valid(probe_owner)
+		|| !cf_phase2_probe_paths(final_rel, tmp_rel, probe_owner, 1))
+		return false;
+	return cf_phase2_read_record(shared_dir, final_rel, CLUSTER_CF_P2_PROBE,
+		probe_owner, -1, 0, false, out);
+}
+
+bool
+cluster_cf_phase2_write_ack(const char *shared_dir, int probe_owner,
+						int responder, uint64 probe_nonce)
+{
+	ClusterCfPhase2GcSnapshot gc_snapshot;
+	ClusterCfPhase2RecordV2 probe;
+	char final_rel[MAXPGPATH];
+	char tmp_rel[MAXPGPATH];
+	char final_path[MAXPGPATH];
+
+	if (shared_dir == NULL || shared_dir[0] == '\0' || probe_nonce == 0
+		|| !cf_phase2_node_valid(probe_owner)
+		|| !cf_phase2_node_valid(responder) || responder == probe_owner
+		|| !cluster_cf_phase2_read_probe(shared_dir, probe_owner, &probe)
+		|| probe.probe_nonce != probe_nonce
+		|| !cf_phase2_ack_paths(final_rel, tmp_rel, probe_owner, responder,
+			probe_nonce))
+		return false;
+	cf_phase2_capture_ack_pair(shared_dir, probe_owner, responder,
+		probe_nonce, &gc_snapshot);
+	if (!cf_phase2_write_record(shared_dir, final_rel, tmp_rel,
+			CLUSTER_CF_P2_ACK, probe_owner, responder, probe_nonce))
+		return false;
+
+	/* A delayed old-nonce writer cannot leave a positive ACK after drift. */
+	if (!cluster_cf_phase2_read_probe(shared_dir, probe_owner, &probe)
+		|| probe.probe_nonce != probe_nonce) {
+		if (cf_phase2_path(final_path, shared_dir, final_rel))
+			(void)unlink(final_path);
+		return false;
+	}
+	cf_phase2_cleanup_ack_snapshot(shared_dir, probe_owner, responder,
+		probe_nonce, &gc_snapshot);
 	return true;
 }
 
 bool
-cluster_cf_phase2_write_probe(const char *shared_dir, int self_id, uint64 nonce)
+cluster_cf_phase2_read_exact_ack(const char *shared_dir, int probe_owner,
+							 int expected_responder,
+							 uint64 expected_nonce)
 {
-	char rel[MAXPGPATH];
+	char final_rel[MAXPGPATH];
+	char tmp_rel[MAXPGPATH];
 
-	snprintf(rel, sizeof(rel), "%s/probe.%d", CLUSTER_CF_PHASE2_DIR, self_id);
-	return write_record(shared_dir, rel, nonce);
-}
-
-bool
-cluster_cf_phase2_read_probe(const char *shared_dir, int peer_id, uint64 *out_nonce)
-{
-	char rel[MAXPGPATH];
-
-	snprintf(rel, sizeof(rel), "%s/probe.%d", CLUSTER_CF_PHASE2_DIR, peer_id);
-	return read_record(shared_dir, rel, out_nonce);
-}
-
-bool
-cluster_cf_phase2_write_ack(const char *shared_dir, int peer_id, uint64 echo_nonce)
-{
-	char rel[MAXPGPATH];
-
-	/* ack.<peer_id> = "this node's ack of peer_id's probe", echoing its nonce. */
-	snprintf(rel, sizeof(rel), "%s/ack.%d", CLUSTER_CF_PHASE2_DIR, peer_id);
-	return write_record(shared_dir, rel, echo_nonce);
-}
-
-bool
-cluster_cf_phase2_read_ack(const char *shared_dir, int self_id, uint64 *out_echo)
-{
-	char rel[MAXPGPATH];
-
-	/* ack.<self_id> = "the peer's ack of my probe"; out_echo must equal my nonce. */
-	snprintf(rel, sizeof(rel), "%s/ack.%d", CLUSTER_CF_PHASE2_DIR, self_id);
-	return read_record(shared_dir, rel, out_echo);
+	if (shared_dir == NULL || expected_nonce == 0
+		|| !cf_phase2_node_valid(probe_owner)
+		|| !cf_phase2_node_valid(expected_responder)
+		|| expected_responder == probe_owner
+		|| !cf_phase2_ack_paths(final_rel, tmp_rel, probe_owner,
+			expected_responder, expected_nonce))
+		return false;
+	return cf_phase2_read_record(shared_dir, final_rel, CLUSTER_CF_P2_ACK,
+		probe_owner, expected_responder, expected_nonce, true, NULL);
 }
 
 /*
@@ -193,10 +461,11 @@ cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id, u
 							 int timeout_ms)
 {
 	TimestampTz deadline;
-	bool acked_peer = false;
-	bool my_ack_ok = false;
 
-	if (shared_dir == NULL || shared_dir[0] == '\0')
+	if (shared_dir == NULL || shared_dir[0] == '\0'
+		|| !cf_phase2_node_valid(self_id)
+		|| !cf_phase2_node_valid(peer_id) || self_id == peer_id
+		|| nonce == 0)
 		return false;
 
 	ensure_p2_dir(shared_dir);
@@ -208,26 +477,23 @@ cluster_cf_phase2_rendezvous(const char *shared_dir, int self_id, int peer_id, u
 	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms);
 
 	for (;;) {
-		/* Direction peer->self: I can see the peer's probe -> ack it. */
-		if (!acked_peer) {
-			uint64 peer_nonce;
+		int id;
 
-			if (cluster_cf_phase2_read_probe(shared_dir, peer_id, &peer_nonce)) {
-				if (cluster_cf_phase2_write_ack(shared_dir, peer_id, peer_nonce))
-					acked_peer = true;
-			}
+		/* Every responder has its own pairwise ACK namespace. */
+		for (id = 0; id < CLUSTER_MAX_NODES; id++) {
+			ClusterCfPhase2RecordV2 peer_probe;
+
+			if (id == self_id || !cf_phase2_node_valid(id))
+				continue;
+			if (cluster_cf_phase2_read_probe(shared_dir, id, &peer_probe))
+				(void)cluster_cf_phase2_write_ack(shared_dir, id, self_id,
+					peer_probe.probe_nonce);
 		}
 
-		/* Direction self->peer: the peer acked my probe and I can see the ack. */
-		if (!my_ack_ok) {
-			uint64 echo;
-
-			if (cluster_cf_phase2_read_ack(shared_dir, self_id, &echo) && echo == nonce)
-				my_ack_ok = true;
-		}
-
-		if (acked_peer && my_ack_ok)
-			return true; /* both directions verified */
+		/* Only the selected peer can complete this exact round trip. */
+		if (cluster_cf_phase2_read_exact_ack(shared_dir, self_id, peer_id,
+				nonce))
+			return true;
 
 		if (GetCurrentTimestamp() >= deadline)
 			return false; /* no peer / no cross-node visibility */
@@ -345,16 +611,13 @@ cluster_cf_phase2_verify_or_fail(const char *pgdata)
  *	its live-peer + cross-node-visibility proof (the same conclusion the
  *	concurrent-bootstrap rendezvous establishes; same files, same protocol).
  *
- *	Cheap and idempotent: one small read per configured peer per tick, an
- *	ack write only when a fresh probe appears.  Acking a stale leftover
- *	probe is harmless -- no one waits on it, and a rebooting peer always
- *	publishes a fresh nonce first.
+ *	Cheap and idempotent: one small read per configured peer per tick.  The
+ *	exact writer returns immediately for an existing valid tuple, while still
+ *	being able to restore an ephemeral ACK that disappeared.
  */
 void
 cluster_cf_phase2_respond_tick(void)
 {
-	static uint64 last_acked_nonce[CLUSTER_MAX_NODES]; /* CSSD process-local */
-	static bool last_acked_valid[CLUSTER_MAX_NODES];
 	int id;
 
 	if (!cluster_controlfile_shared_authority)
@@ -371,13 +634,16 @@ cluster_cf_phase2_respond_tick(void)
 			continue;
 		if (cluster_conf_lookup_node(id) == NULL)
 			continue;
-		if (!cluster_cf_phase2_read_probe(cluster_shared_data_dir, id, &nonce))
-			continue;
-		if (last_acked_valid[id] && last_acked_nonce[id] == nonce)
-			continue;
-		if (cluster_cf_phase2_write_ack(cluster_shared_data_dir, id, nonce)) {
-			last_acked_nonce[id] = nonce;
-			last_acked_valid[id] = true;
+		{
+			ClusterCfPhase2RecordV2 probe;
+
+			if (!cluster_cf_phase2_read_probe(cluster_shared_data_dir, id,
+					&probe))
+				continue;
+			nonce = probe.probe_nonce;
 		}
+		if (!cluster_cf_phase2_write_ack(cluster_shared_data_dir, id,
+				cluster_node_id, nonce))
+			continue;
 	}
 }

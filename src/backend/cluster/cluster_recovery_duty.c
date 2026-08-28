@@ -11,6 +11,7 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_semantic_activation.h" /* R4 cutover ACK proof (G3) */
@@ -1172,6 +1173,65 @@ formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
 	return CLUSTER_FORMATION_WITNESS_READY;
 }
 
+/* AD-023 recovery-control/serving split.  The cold initial formation is
+ * authority for recovery coordination before StartupXLOG, but it is not an
+ * ordinary write/serving admission.  This is deliberately narrower than the
+ * live witness: only the exact epoch-0 baseline with no reconfiguration debt
+ * may omit self_join_admitted. */
+static ClusterFormationWitnessResult
+formation_witness_decide_recovery_control_v1(
+	const ClusterFormationSnapshotV1 *f1,
+	const ClusterFenceAuthorityProof *authority,
+	const ClusterFormationSnapshotV1 *f2, uint16 origin_thread)
+{
+	ClusterFenceMarker expected;
+	int32 origin_node;
+	int i;
+
+	if (f1 == NULL || authority == NULL || f2 == NULL || origin_thread == 0
+		|| origin_thread > CLUSTER_MAX_NODES)
+		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
+	if (f2->self_join_admitted)
+		return formation_witness_decide_live_v1(
+			f1, authority, f2, origin_thread);
+	if (memcmp(f1, f2, sizeof(*f1)) != 0)
+		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	if (f2->prebump_sync_active != 0 || f2->self_join_failed
+		|| formation_bitmap_nonempty(f2->pending_join_bitmap)
+		|| formation_bitmap_nonempty(f2->clean_departed_bitmap)
+		|| formation_bitmap_nonempty(f2->removed_bitmap)
+		|| formation_bitmap_nonempty(f2->excluded_bitmap)
+		|| f2->local_epoch != CLUSTER_EPOCH_INITIAL
+		|| f2->applied.event_id != 0
+		|| f2->applied.old_epoch != CLUSTER_EPOCH_INITIAL
+		|| f2->applied.new_epoch != CLUSTER_EPOCH_INITIAL
+		|| f2->applied.event_seq != 0
+		|| f2->applied.cssd_dead_generation != 0
+		|| f2->applied.reconfig_kind != RECONFIG_KIND_NONE
+		|| formation_bitmap_nonempty(f2->applied.dead_bitmap)
+		|| formation_bitmap_nonempty(f2->applied.join_bitmap))
+		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	if (authority->total_disk_count == 0
+		|| authority->agree_disk_count <= authority->total_disk_count / 2
+		|| !cluster_fence_marker_valid_v1(&authority->marker))
+		return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+	formation_expected_marker(f2, &expected);
+	if (!cluster_fence_marker_valid_v1(&expected)
+		|| !cluster_fence_marker_tuple_equal(&authority->marker, &expected))
+		return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+
+	origin_node = (int32)origin_thread - 1;
+	if (f2->membership.membership_state[origin_node] != CLUSTER_MEMBER_MEMBER
+		|| f2->membership.last_admitted_incarnation[origin_node] == 0)
+		return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (f2->membership.membership_state[i] == CLUSTER_MEMBER_MEMBER
+			&& f2->membership.last_admitted_incarnation[i] == 0)
+			return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
+	}
+	return CLUSTER_FORMATION_WITNESS_READY;
+}
+
 #define CLUSTER_FORMATION_WITNESS_MAGIC UINT32_C(0x46575631) /* FWV1 */
 
 struct ClusterFormationWitnessV1 {
@@ -1183,6 +1243,12 @@ struct ClusterFormationWitnessV1 {
 	ClusterFormationSnapshotV1 f1;
 	ClusterFormationSnapshotV1 f2;
 };
+
+typedef enum ClusterFormationWitnessMode {
+	CLUSTER_FORMATION_WITNESS_MODE_DUTY = 0,
+	CLUSTER_FORMATION_WITNESS_MODE_LIVE = 1,
+	CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL = 2
+} ClusterFormationWitnessMode;
 
 static uint64
 formation_monotonic_us(void)
@@ -1220,7 +1286,8 @@ formation_authority_result(ClusterFenceAuthorityReadResult result)
 static ClusterFormationWitnessResult
 formation_witness_build_wait_internal(uint16 origin_thread,
 									  bool opening_new_duty,
-									  bool live_origin, int timeout_ms,
+									  ClusterFormationWitnessMode mode,
+									  int timeout_ms,
 									  ClusterFormationWitnessV1 **out)
 {
 	ClusterFormationWitnessResult last = CLUSTER_FORMATION_WITNESS_UNSTABLE;
@@ -1255,10 +1322,14 @@ formation_witness_build_wait_internal(uint16 origin_thread,
 		if (last == CLUSTER_FORMATION_WITNESS_READY) {
 			if (!cluster_reconfig_capture_formation_snapshot_v1(origin_thread, &f2))
 				return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
-			last = live_origin
-				? formation_witness_decide_live_v1(
-					&f1, &authority, &f2, origin_thread)
-				: cluster_formation_witness_decide_v1(
+			if (mode == CLUSTER_FORMATION_WITNESS_MODE_LIVE)
+				last = formation_witness_decide_live_v1(
+					&f1, &authority, &f2, origin_thread);
+			else if (mode == CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL)
+				last = formation_witness_decide_recovery_control_v1(
+					&f1, &authority, &f2, origin_thread);
+			else
+				last = cluster_formation_witness_decide_v1(
 					&f1, &authority, &f2, origin_thread,
 					opening_new_duty);
 			if (last == CLUSTER_FORMATION_WITNESS_READY) {
@@ -1277,10 +1348,16 @@ formation_witness_build_wait_internal(uint16 origin_thread,
 				witness->magic = CLUSTER_FORMATION_WITNESS_MAGIC;
 				witness->origin_thread = origin_thread;
 				witness->opening_new_duty = opening_new_duty;
-				witness->reserved = live_origin ? 1 : 0;
+				witness->reserved = (uint8)mode;
 				witness->authority = authority;
 				witness->f1 = f1;
 				witness->f2 = f2;
+				if (mode == CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL) {
+					witness->f1.reserved[0]
+						= CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
+					witness->f2.reserved[0]
+						= CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
+				}
 				*out = witness;
 				return CLUSTER_FORMATION_WITNESS_READY;
 			}
@@ -1303,7 +1380,8 @@ cluster_formation_witness_build_wait(uint16 origin_thread,
 									 ClusterFormationWitnessV1 **out)
 {
 	return formation_witness_build_wait_internal(
-		origin_thread, opening_new_duty, false, timeout_ms, out);
+		origin_thread, opening_new_duty,
+		CLUSTER_FORMATION_WITNESS_MODE_DUTY, timeout_ms, out);
 }
 
 ClusterFormationWitnessResult
@@ -1312,7 +1390,17 @@ cluster_formation_witness_build_live_wait(uint16 origin_thread,
 									  ClusterFormationWitnessV1 **out)
 {
 	return formation_witness_build_wait_internal(
-		origin_thread, false, true, timeout_ms, out);
+		origin_thread, false, CLUSTER_FORMATION_WITNESS_MODE_LIVE,
+		timeout_ms, out);
+}
+
+ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(
+	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out)
+{
+	return formation_witness_build_wait_internal(
+		origin_thread, false,
+		CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL, timeout_ms, out);
 }
 
 ClusterFormationWitnessResult
@@ -1340,6 +1428,35 @@ cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *wit
 	}
 }
 
+/* Compare an immutable classification with a freshly captured runtime
+ * snapshot.  Normal classifications remain byte-exact.  A recovery-control
+ * classification additionally tolerates only its one monotone local edge:
+ * self_join_admitted 0 -> 1 after StartupXLOG completes the stripe gate. */
+bool
+cluster_formation_snapshot_matches_v1(
+	const ClusterFormationSnapshotV1 *expected,
+	const ClusterFormationSnapshotV1 *observed)
+{
+	ClusterFormationSnapshotV1 normalized;
+
+	if (expected == NULL || observed == NULL)
+		return false;
+	if (expected->reserved[0] == 0 && expected->reserved[1] == 0)
+		return memcmp(expected, observed, sizeof(*expected)) == 0;
+	if (expected->reserved[0]
+			!= CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL
+		|| expected->reserved[1] != 0
+		|| observed->reserved[0] != 0 || observed->reserved[1] != 0)
+		return false;
+
+	normalized = *observed;
+	normalized.reserved[0] = CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
+	if (expected->self_join_admitted == 0
+		&& normalized.self_join_admitted == 1)
+		normalized.self_join_admitted = 0;
+	return memcmp(expected, &normalized, sizeof(*expected)) == 0;
+}
+
 /* Revalidate a copied live-formation classification against both present
  * membership bytes and the cached durable fence marker.  This is the
  * generation-bound counterpart of copy_classification_v1(): a copied proof
@@ -1358,7 +1475,7 @@ cluster_formation_classification_revalidate_nowait(
 		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
 	if (!cluster_reconfig_capture_formation_snapshot_v1(origin_thread, &current))
 		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
-	if (memcmp(&current, snapshot, sizeof(current)) != 0)
+	if (!cluster_formation_snapshot_matches_v1(snapshot, &current))
 		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
 
 	now_us = formation_monotonic_us();

@@ -109,13 +109,12 @@ typedef enum ClusterSemanticR11CutoverPhase {
 typedef struct ClusterSemanticR11CutoverSnapshot {
 	uint64 record_generation;
 	uint64 formation_epoch;
-	uint64 resource_x_old_formation;
 	uint32 phase;
 	uint32 reserved;
 } ClusterSemanticR11CutoverSnapshot;
 
-StaticAssertDecl(sizeof(ClusterSemanticR11CutoverSnapshot) == 32,
-				 "R11 cutover snapshot layout must remain 32 bytes");
+StaticAssertDecl(sizeof(ClusterSemanticR11CutoverSnapshot) == 24,
+				 "R11 cutover snapshot layout must remain 24 bytes");
 
 typedef struct ClusterSemanticAdmissionToken {
 	uint64 feature_bit;
@@ -282,6 +281,7 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 								  ClusterSemanticAdmissionToken *token);
 extern ResourceXWriterPath
 cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out);
+extern bool cluster_semantic_activation_phase1_pristine(void);
 extern bool cluster_semantic_activation_r11_cutover_snapshot(
 	ClusterSemanticR11CutoverSnapshot *out);
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);

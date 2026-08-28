@@ -49,6 +49,7 @@
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched getter stubs */
+#include "cluster/cluster_semantic_activation.h" /* R4 writer snapshot stub */
 #include "cluster/cluster_touched_peers.h"	  /* spec-5.14 D6 self_hex stub */
 #include "cluster/cluster_xnode_profile.h"	  /* spec-5.59 D1 profiling gate stubs */
 #include "cluster/cluster_xnode_lever.h"	  /* spec-6.12 lever counter stub */
@@ -1000,6 +1001,51 @@ cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *snapshot_out)
 	memset(snapshot_out, 0, sizeof(*snapshot_out));
 	for (i = 0; i < 9; i++)
 		values[i] = UINT64CONST(301) + (uint64)i;
+}
+
+void
+cluster_pcm_grd_lifecycle_stats_snapshot(PcmGrdLifecycleStats *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->live_entries = 11;
+	out->tombstone_slots = 2;
+	out->binding_generation = 17;
+	out->reclaim_attempt_count = 3;
+	out->reclaim_success_count = 4;
+	out->reclaim_reuse_count = 5;
+	out->capacity_retry_count = 6;
+	out->capacity_fail_count = 7;
+	out->peak_live_entries = 12;
+	out->reclaim_refused[PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N] = 9;
+}
+
+void
+cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->wait_refcount = 13;
+	out->transport_refcount = 14;
+	out->retained_entry_count = 15;
+	out->active_resource_x_entry_count = 16;
+	out->local_owner_entry_count = 17;
+	out->evicting_entry_count = 18;
+	out->invalid_entry_count = 19;
+}
+
+bool
+cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *snapshot_out)
+{
+	memset(snapshot_out, 0, sizeof(*snapshot_out));
+	snapshot_out->formation = 17;
+	snapshot_out->phase = RESOURCE_X_GATE_OPEN;
+	return true;
+}
+
+ResourceXWriterPath
+cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out)
+{
+	*r4_generation_out = 19;
+	return RESOURCE_X_WRITER_TARGET;
 }
 
 /* PGRAC spec-2.30 D9 R10 stub audit — 9 transition counter accessors. */
@@ -3367,6 +3413,15 @@ cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unus
 	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 }
 
+ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(
+	uint16 origin_thread pg_attribute_unused(),
+	int timeout_ms pg_attribute_unused(), ClusterFormationWitnessV1 **out)
+{
+	*out = NULL;
+	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+}
+
 void
 cluster_formation_witness_destroy(ClusterFormationWitnessV1 **witness)
 {
@@ -3399,6 +3454,14 @@ cluster_formation_classification_revalidate_nowait(
 	const ClusterFormationSnapshotV1 *snapshot pg_attribute_unused())
 {
 	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+}
+
+bool
+cluster_formation_snapshot_matches_v1(
+	const ClusterFormationSnapshotV1 *expected pg_attribute_unused(),
+	const ClusterFormationSnapshotV1 *observed pg_attribute_unused())
+{
+	return false;
 }
 
 bool
@@ -4650,6 +4713,84 @@ UT_TEST(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys)
 		UT_ASSERT_EQ(captured_dump_count("gcs", gcs_keys[i]), 0);
 }
 
+UT_TEST(test_debug_dump_exposes_exact_resource_x_owner_state)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
+	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	memset(captured_dump_values, 0, sizeof(captured_dump_values));
+	captured_dump_row_count = 0;
+	captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_gate_phase"), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_gate_formation"), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_writer_path"), 1);
+	UT_ASSERT_EQ(captured_dump_count("pcm", "resource_x_writer_r4_generation"), 1);
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_gate_phase"), "open");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_gate_formation"), "17");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_path"), "target");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_r4_generation"), "19");
+}
+
+UT_TEST(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
+	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	memset(captured_dump_values, 0, sizeof(captured_dump_values));
+	captured_dump_row_count = 0;
+	captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_live_entries"), "11");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_tombstone_slots"), "2");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_binding_generation"), "17");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_reclaim_attempt_count"), "3");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_reclaim_success_count"), "4");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_reclaim_reuse_count"), "5");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_capacity_retry_count"), "6");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_capacity_fail_count"), "7");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_peak_live_entries"), "12");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm",
+		"pcm_grd_reclaim_refused_pcm_mode_not_n_count"), "9");
+	UT_ASSERT_EQ(captured_dump_count("pcm", "pcm_x_runtime_state"), 0);
+}
+
+UT_TEST(test_debug_dump_exposes_exact_current_protocol_debt_gauges)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+
+	memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+	memset(&rsinfo, 0, sizeof(rsinfo));
+	memset(captured_dump_categories, 0, sizeof(captured_dump_categories));
+	memset(captured_dump_keys, 0, sizeof(captured_dump_keys));
+	memset(captured_dump_values, 0, sizeof(captured_dump_values));
+	captured_dump_row_count = 0;
+	captured_formatted_value_count = 0;
+	fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+	(void)cluster_dump_state(fcinfo);
+
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_wait_refcount"), "13");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_transport_refcount"), "14");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_retained_debt_count"), "15");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_active_debt_count"), "16");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_local_owner_debt_count"), "17");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_evicting_debt_count"), "18");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_invalid_debt_count"), "19");
+}
+
 /* ============================================================
  * Iterator API on cluster_inject (added in spec-0.29 §1.4).
  * ============================================================ */
@@ -5226,9 +5367,12 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
+	UT_RUN(test_debug_dump_exposes_exact_resource_x_owner_state);
+	UT_RUN(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats);
+	UT_RUN(test_debug_dump_exposes_exact_current_protocol_debt_gauges);
 	UT_RUN(test_debug_inject_get_count_callable);
 	UT_RUN(test_debug_inject_get_state_at_out_of_range);
 	UT_RUN(test_debug_inject_get_state_at_null_outs);

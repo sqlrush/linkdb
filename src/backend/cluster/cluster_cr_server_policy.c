@@ -28,6 +28,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "access/clog.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_tt_slot.h"
 
@@ -130,6 +131,88 @@ cluster_cr_server_c0_zero_match_verdict(bool authoritative, bool xid_is_mine,
 	if (clog_is_in_progress && xid_is_in_progress)
 		return CLUSTER_UNDO_VERDICT_IN_PROGRESS;
 	return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+}
+
+ClusterUndoVerdictKind
+cluster_cr_server_freshref_c1b_pair_verdict(
+	bool pair_request, bool xid_is_mine, uint32 expected_segment_id,
+	uint32 expected_tt_slot_id, bool no_raw_reuse_window, int raw_clog_status,
+	ClusterTTDurableResolve resolve, uint16 matched_segment, uint16 matched_slot,
+	SCN resolved_scn, SCN proposed_scn, bool retention_ok, SCN horizon_scn)
+{
+	if (!pair_request || !xid_is_mine || expected_segment_id == 0
+		|| expected_segment_id > UINT16_MAX || expected_tt_slot_id < 1
+		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT || !no_raw_reuse_window
+		|| raw_clog_status != TRANSACTION_STATUS_COMMITTED || !SCN_VALID(proposed_scn))
+		return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+
+	switch (resolve) {
+	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
+		if ((uint32)matched_segment == expected_segment_id
+			&& (uint32)matched_slot + 1 == expected_tt_slot_id
+			&& SCN_VALID(resolved_scn) && resolved_scn == proposed_scn)
+			return CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		break;
+	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:
+		/* SCN_CMP_OK: visibility time order is the local-SCN component. */
+		if (retention_ok && SCN_VALID(horizon_scn)
+			&& scn_local(proposed_scn) <= scn_local(horizon_scn))
+			return CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
+		break;
+	case CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN:
+	case CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP:
+	case CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE:
+	default:
+		break;
+	}
+
+	return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+}
+
+bool
+cluster_cr_server_freshref_c1b_pair_request_decode(
+	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node,
+	int32 local_node, uint64 current_epoch, int max_backends,
+	uint32 *segment_id, TransactionId *xid, uint32 *expected_tt_slot_id,
+	SCN *proposed_scn)
+{
+	uint32 decoded_segment = 0;
+	uint32 decoded_slot = 0;
+	TransactionId decoded_xid = InvalidTransactionId;
+	SCN decoded_scn;
+	int i;
+
+	if (fwd == NULL || !GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(fwd)
+		|| fwd->request_id == 0 || current_epoch == 0 || fwd->epoch != current_epoch
+		|| authenticated_source_node < 0
+		|| authenticated_source_node >= CLUSTER_MAX_NODES
+		|| local_node < 0 || local_node >= CLUSTER_MAX_NODES
+		|| authenticated_source_node == local_node
+		|| fwd->original_requester_node != authenticated_source_node
+		|| fwd->master_node != authenticated_source_node
+		|| max_backends <= 0 || fwd->requester_backend_id <= 0
+		|| fwd->requester_backend_id > max_backends
+		|| fwd->transition_id != (uint8)PCM_TRANS_N_TO_S)
+		return false;
+	for (i = 0; i < 6; i++)
+		if (fwd->reserved_0[i] != 0)
+			return false;
+	if (!GcsBlockUndoFreshRefC1bTagDecode(
+			fwd->tag, &decoded_segment, &decoded_xid, &decoded_slot))
+		return false;
+	decoded_scn = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
+	if (!SCN_VALID(decoded_scn))
+		return false;
+
+	if (segment_id != NULL)
+		*segment_id = decoded_segment;
+	if (xid != NULL)
+		*xid = decoded_xid;
+	if (expected_tt_slot_id != NULL)
+		*expected_tt_slot_id = decoded_slot;
+	if (proposed_scn != NULL)
+		*proposed_scn = decoded_scn;
+	return true;
 }
 
 #endif /* USE_PGRAC_CLUSTER */

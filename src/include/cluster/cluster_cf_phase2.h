@@ -8,18 +8,16 @@
  *	  image if the shared storage provides cross-node close-to-open /
  *	  metadata visibility for renames (L368: non-buffer-managed shared-file
  *	  coherence is a hard property, not a given).  Phase-2 PROVES that
- *	  property at bring-up via a symmetric nonce+ack rendezvous conducted
+ *	  property at bring-up via an exact nonce+ack rendezvous conducted
  *	  through the shared storage itself (the most direct test of the
  *	  property the authority depends on -- not the interconnect):
  *
  *	    1. each node writes probe.<self> = {fresh nonce} with the same
  *	       write-tmp + fsync + durable_rename + dir-fsync the authority uses;
- *	    2. each node reads the peer's probe.<peer> (proving it can see the
- *	       peer's durable_rename'd write) and writes ack.<peer> echoing the
- *	       peer's nonce;
- *	    3. each node reads ack.<self> and checks it echoes its own nonce
- *	       (proving the peer saw this node's write, and this node sees the
- *	       peer's write back).
+ *	    2. each responder reads probe.<owner> and writes the responder-scoped
+ *	       ack.<owner>.<responder>.<nonce>;
+ *	    3. the owner accepts only the selected peer's exact tuple, proving
+ *	       that peer saw this node's write and this node sees its write back.
  *
  *	  When both directions verify, the node persists CROSSNODE_VERIFIED
  *	  (bound to the storage uuid) so the multi-node bootstrap gate
@@ -46,8 +44,27 @@
 #ifndef CLUSTER_CF_PHASE2_H
 #define CLUSTER_CF_PHASE2_H
 
+#include "port/pg_crc32c.h"
+
 /* Subdirectory under the shared global/ dir holding the probe/ack files. */
 #define CLUSTER_CF_PHASE2_DIR "global/pgrac_cf_p2"
+
+typedef enum ClusterCfPhase2Kind {
+	CLUSTER_CF_P2_PROBE = 1,
+	CLUSTER_CF_P2_ACK = 2
+} ClusterCfPhase2Kind;
+
+/* Ephemeral shared-storage format; V1 records are intentionally rejected. */
+typedef struct ClusterCfPhase2RecordV2 {
+	uint32 magic;
+	uint16 version;
+	uint8 kind;
+	uint8 reserved;
+	int32 probe_owner_node;
+	int32 responder_node;	/* CLUSTER_CF_P2_PROBE uses -1 */
+	uint64 probe_nonce;
+	pg_crc32c crc;			/* over [0, offsetof(crc)) */
+} ClusterCfPhase2RecordV2;
 
 /*
  * Single-step I/O primitives (exposed for unit testing both roles in one
@@ -55,10 +72,15 @@
  * TAP).  All writes are torn-safe (tmp + fsync + durable_rename + dir-fsync);
  * all reads return false when the file is absent/short/CRC-bad.
  */
-extern bool cluster_cf_phase2_write_probe(const char *shared_dir, int self_id, uint64 nonce);
-extern bool cluster_cf_phase2_read_probe(const char *shared_dir, int peer_id, uint64 *out_nonce);
-extern bool cluster_cf_phase2_write_ack(const char *shared_dir, int peer_id, uint64 echo_nonce);
-extern bool cluster_cf_phase2_read_ack(const char *shared_dir, int self_id, uint64 *out_echo);
+extern bool cluster_cf_phase2_write_probe(const char *shared_dir, int probe_owner,
+										  uint64 probe_nonce);
+extern bool cluster_cf_phase2_read_probe(const char *shared_dir, int probe_owner,
+										 ClusterCfPhase2RecordV2 *out);
+extern bool cluster_cf_phase2_write_ack(const char *shared_dir, int probe_owner,
+										int responder, uint64 probe_nonce);
+extern bool cluster_cf_phase2_read_exact_ack(const char *shared_dir, int probe_owner,
+											 int expected_responder,
+											 uint64 expected_nonce);
 
 /*
  * Steady-state probe responder (spec-5.6a): acks any configured peer's
@@ -69,10 +91,10 @@ extern bool cluster_cf_phase2_read_ack(const char *shared_dir, int self_id, uint
 extern void cluster_cf_phase2_respond_tick(void);
 
 /*
- * cluster_cf_phase2_rendezvous -- run the symmetric nonce+ack handshake from
+ * cluster_cf_phase2_rendezvous -- run the exact nonce+ack handshake from
  * this node against `peer_id` over `shared_dir`, bounded by timeout_ms.
- * Returns true iff BOTH directions verified (this node saw the peer's probe,
- * and the peer acked this node's probe with the matching nonce).  Does not
+ * Returns true iff the selected peer's exact ack proves both storage
+ * directions and its current responder execution.  Does not
  * persist anything and does not ereport; the caller persists the contract and
  * decides the fail-closed action.  `nonce` is a caller-supplied fresh nonce
  * (so the loop body stays free of randomness for deterministic resume).

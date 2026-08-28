@@ -46,6 +46,8 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_thread_recovery.h"
+#include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b joiner gate */
 
 /* RF-ROOT P4 online launch producer.  The carrier contains only the exact
@@ -179,6 +181,61 @@ static ClusterReconfigState *ReconfigShmem = NULL;
 /* Process-local early-boot classifier. */
 static bool joiner_gate_decided = false;
 static bool offpath_fast_rejoin_active_local = false;
+
+/* Temporary 8.15-PRE D1 evidence.  A MEMBER byte without its exact admitted
+ * floor is the current t/430 first failed predicate.  Remember only the last
+ * LMON-local observation so a regression can be attributed to the interval
+ * that produced it; this creates no shared state and grants no authority. */
+static void
+cluster_reconfig_membership_floor_diagnostic(const char *stage)
+{
+	static uint64 prior_floor[4];
+	static uint8 prior_state[4];
+	static bool initialized;
+	uint64 floor[4];
+	uint8 state[4];
+	bool invalid = false;
+	bool regressed = false;
+	int node;
+
+	if (ReconfigShmem == NULL || stage == NULL)
+		return;
+	for (node = 0; node < 4; node++) {
+		floor[node]
+			= cluster_membership_get_last_admitted_incarnation(node);
+		state[node] = (uint8)cluster_membership_get_state(node);
+		if (state[node] == (uint8)CLUSTER_MEMBER_MEMBER
+			&& floor[node] == 0)
+			invalid = true;
+		if (initialized && prior_floor[node] != 0
+			&& floor[node] < prior_floor[node])
+			regressed = true;
+	}
+	if (invalid || regressed)
+		ereport(LOG,
+				(errmsg_internal("cluster membership floor diagnostic"),
+				 errdetail("stage=%s invalid=%u regressed=%u "
+						   "m0=%u/%llu<- %u/%llu "
+						   "m1=%u/%llu<- %u/%llu "
+						   "m2=%u/%llu<- %u/%llu "
+						   "m3=%u/%llu<- %u/%llu",
+						   stage, invalid ? 1U : 0U, regressed ? 1U : 0U,
+						   state[0], (unsigned long long)floor[0],
+						   prior_state[0],
+						   (unsigned long long)prior_floor[0],
+						   state[1], (unsigned long long)floor[1],
+						   prior_state[1],
+						   (unsigned long long)prior_floor[1],
+						   state[2], (unsigned long long)floor[2],
+						   prior_state[2],
+						   (unsigned long long)prior_floor[2],
+						   state[3], (unsigned long long)floor[3],
+						   prior_state[3],
+						   (unsigned long long)prior_floor[3])));
+	memcpy(prior_floor, floor, sizeof(prior_floor));
+	memcpy(prior_state, state, sizeof(prior_state));
+	initialized = true;
+}
 
 /*
  * RF-ROOT P9 verification / cold-formation cold-formation ruling —
@@ -5257,6 +5314,314 @@ cluster_reconfig_self_join_admitted(void)
 	return admitted;
 }
 
+/* Read one peer's qvotec-published slot identity, epoch, and freshness from a
+ * single stable poll window.  A writer-in-progress or changed window is not
+ * current evidence; the LMON retries on a later tick instead of combining
+ * fields from adjacent slot generations. */
+static bool
+cluster_reconfig_observed_peer_epoch_current(int32 node_id, uint64 *out_epoch)
+{
+	int attempt;
+
+	if (out_epoch != NULL)
+		*out_epoch = 0;
+	if (ReconfigShmem == NULL || node_id < 0
+		|| node_id >= CLUSTER_MAX_NODES || out_epoch == NULL)
+		return false;
+
+	for (attempt = 0; attempt < 8; attempt++) {
+		uint64 epoch;
+		uint64 fresh;
+		uint64 generation;
+		uint64 incarnation;
+		uint64 seq_after;
+		uint64 seq_before;
+
+		seq_before = pg_atomic_read_u64(
+			&ReconfigShmem->observed_bootstrap_seq);
+		if ((seq_before & UINT64_C(1)) != 0)
+			continue;
+		pg_read_barrier();
+		incarnation = pg_atomic_read_u64(
+			&ReconfigShmem->observed_incarnation[node_id]);
+		generation = pg_atomic_read_u64(
+			&ReconfigShmem->observed_generation[node_id]);
+		epoch = pg_atomic_read_u64(
+			&ReconfigShmem->observed_epoch[node_id]);
+		fresh = pg_atomic_read_u64(
+			&ReconfigShmem->observed_fresh_alive[node_id]);
+		pg_read_barrier();
+		seq_after = pg_atomic_read_u64(
+			&ReconfigShmem->observed_bootstrap_seq);
+		if (seq_after != seq_before)
+			continue;
+		if (incarnation == 0 || generation == 0 || fresh == 0)
+			return false;
+		*out_epoch = epoch;
+		return true;
+	}
+	return false;
+}
+
+typedef struct ClusterEpoch0LateFounderPeer {
+	int32 node_id;
+	uint64 incarnation;
+	uint64 generation;
+} ClusterEpoch0LateFounderPeer;
+
+/* Capture one admitted peer from one stable QVOTEC publication window.  The
+ * no-PGPROC phase-3 caller must never queue on this lock. */
+static bool
+cluster_reconfig_epoch0_peer_capture_current(
+	int32 node_id, ClusterEpoch0LateFounderPeer *out)
+{
+	bool current = false;
+	int attempt;
+
+	memset(out, 0, sizeof(*out));
+	if (ReconfigShmem == NULL || node_id < 0
+		|| node_id >= CLUSTER_MAX_NODES || node_id == cluster_node_id
+		|| cluster_conf_lookup_node(node_id) == NULL)
+		return false;
+	if (MyProc == NULL) {
+		if (!LWLockConditionalAcquire(&ReconfigShmem->lock, LW_SHARED))
+			return false;
+	} else
+		LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+
+	for (attempt = 0; attempt < 8; attempt++) {
+		uint64 epoch;
+		uint64 fresh;
+		uint64 generation;
+		uint64 incarnation;
+		uint64 seq_after;
+		uint64 seq_before;
+
+		seq_before = pg_atomic_read_u64(
+			&ReconfigShmem->observed_bootstrap_seq);
+		if ((seq_before & UINT64_C(1)) != 0)
+			continue;
+		pg_read_barrier();
+		incarnation = pg_atomic_read_u64(
+			&ReconfigShmem->observed_incarnation[node_id]);
+		generation = pg_atomic_read_u64(
+			&ReconfigShmem->observed_generation[node_id]);
+		epoch = pg_atomic_read_u64(
+			&ReconfigShmem->observed_epoch[node_id]);
+		fresh = pg_atomic_read_u64(
+			&ReconfigShmem->observed_fresh_alive[node_id]);
+		current = incarnation != 0 && generation != 0 && fresh != 0
+			&& epoch == CLUSTER_EPOCH_INITIAL
+			&& cluster_membership_get_state(node_id)
+				   == CLUSTER_MEMBER_MEMBER
+			&& cluster_membership_get_last_admitted_incarnation(node_id)
+				   == incarnation;
+		pg_read_barrier();
+		seq_after = pg_atomic_read_u64(
+			&ReconfigShmem->observed_bootstrap_seq);
+		if (seq_after != seq_before) {
+			current = false;
+			continue;
+		}
+		if (current) {
+			out->node_id = node_id;
+			out->incarnation = incarnation;
+			out->generation = generation;
+		}
+		break;
+	}
+
+	LWLockRelease(&ReconfigShmem->lock);
+	return current;
+}
+
+static bool
+cluster_reconfig_epoch0_peer_active_matches(
+	const ClusterEpoch0LateFounderPeer *peer,
+	const ClusterWalStateSlot *slot)
+{
+	uint16 thread_id;
+
+	if (peer == NULL || slot == NULL || peer->incarnation == 0
+		|| peer->incarnation > (uint64)PG_INT64_MAX)
+		return false;
+	thread_id = cluster_wal_thread_id_for(true, peer->node_id);
+	return thread_id != XLP_THREAD_ID_LEGACY
+		&& slot->thread_id == thread_id
+		&& slot->node_id == peer->node_id
+		&& slot->state == CLUSTER_WAL_SLOT_STATE_ACTIVE
+		&& slot->started_at >= (int64)peer->incarnation
+		&& slot->last_updated >= slot->started_at;
+}
+
+/*
+ * Exact epoch-0 late-founder evidence approved for the narrow JOIN_READONLY
+ * bridge.  A current admitted peer and shared PGXA are not enough: Phase 1 can
+ * leave a valid old ACTIVE image while every Phase-2 postmaster is still below
+ * StartupXLOG.  Deferral therefore requires that the peer's existing WAL slot
+ * was published after the exact current QVOTEC boot incarnation.  Two
+ * byte-identical reads bracket a complete QVOTEC/membership revalidation; all
+ * file I/O remains outside the reconfig LWLock.
+ *
+ * This predicate is observation only: it neither latches a bootstrap cohort
+ * nor admits self, stages a stripe claim, or starts a deadline.
+ */
+bool
+cluster_reconfig_epoch0_late_founder_evidence_current(void)
+{
+	int i;
+
+	if (ReconfigShmem == NULL || !cluster_online_join
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| cluster_epoch_get_current() != CLUSTER_EPOCH_INITIAL
+		|| !cluster_qvotec_in_quorum()
+		|| cluster_xid_stripe_disk_state()
+			   != CLUSTER_XID_STRIPE_DISK_PUBLISHED)
+		return false;
+
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ClusterEpoch0LateFounderPeer before;
+		ClusterEpoch0LateFounderPeer after;
+		ClusterWalStateSlot wal_before;
+		ClusterWalStateSlot wal_after;
+		uint16 thread_id;
+
+		if (!cluster_reconfig_epoch0_peer_capture_current(i, &before))
+			continue;
+		thread_id = cluster_wal_thread_id_for(true, i);
+		if (cluster_wal_state_read_slot(thread_id, &wal_before)
+				!= CLUSTER_WAL_SLOT_OK
+			|| !cluster_reconfig_epoch0_peer_active_matches(
+				&before, &wal_before))
+			continue;
+		if (!cluster_reconfig_epoch0_peer_capture_current(i, &after)
+			|| memcmp(&before, &after, sizeof(before)) != 0
+			|| cluster_epoch_get_current() != CLUSTER_EPOCH_INITIAL
+			|| !cluster_qvotec_in_quorum()
+			|| cluster_xid_stripe_disk_state()
+				   != CLUSTER_XID_STRIPE_DISK_PUBLISHED)
+			continue;
+		if (cluster_wal_state_read_slot(thread_id, &wal_after)
+				!= CLUSTER_WAL_SLOT_OK
+			|| memcmp(&wal_before, &wal_after, sizeof(wal_before)) != 0)
+			continue;
+		return true;
+	}
+	return false;
+}
+
+/* The phase-3 postmaster has no PGPROC and therefore cannot enter an LWLock
+ * wait queue.  Ordinary callers retain the established blocking semantics. */
+static bool
+cluster_reconfig_handoff_lock_acquire(LWLockMode mode)
+{
+	if (MyProc == NULL)
+		return LWLockConditionalAcquire(&ReconfigShmem->lock, mode);
+	LWLockAcquire(&ReconfigShmem->lock, mode);
+	return true;
+}
+
+/* External/current half of the frozen handoff identity.  All potentially
+ * changing evidence is sampled outside the reconfig lock and repeated after
+ * the locked transition; a changed sample leaves JOINING write-closed and is
+ * retried from current evidence rather than rolling membership back. */
+static bool
+cluster_reconfig_pre_publish_handoff_external_current(
+	uint64 expected_self_incarnation, bool require_recovery_complete)
+{
+	return ReconfigShmem != NULL && cluster_online_join
+		&& cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES
+		&& expected_self_incarnation != 0
+		&& cluster_authority_readiness_managed()
+		&& cluster_authority_readiness_get() == CLUSTER_AUTHORITY_OFF
+		&& cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL
+		&& (!require_recovery_complete || !RecoveryInProgress())
+		&& !cluster_clean_leave_in_progress()
+		&& !cluster_reconfig_is_removed_unlocked(cluster_node_id)
+		&& cluster_qvotec_get_self_incarnation()
+			   == expected_self_incarnation
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   == expected_self_incarnation
+		&& cluster_reconfig_epoch0_late_founder_evidence_current();
+}
+
+static bool
+cluster_reconfig_pre_publish_handoff_locked_current(
+	uint64 expected_self_incarnation, bool allow_member)
+{
+	ClusterMembershipState membership;
+
+	membership = cluster_membership_get_state(cluster_node_id);
+	return ReconfigShmem->self_join_admitted == 0
+		&& ReconfigShmem->self_join_failed == 0
+		&& ReconfigShmem->self_join_deadline_us == 0
+		&& cluster_replacement_episode_is_empty(
+			&ReconfigShmem->replacement_episode)
+		&& !clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap,
+										 cluster_node_id)
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   == expected_self_incarnation
+		&& (membership == CLUSTER_MEMBER_JOINING
+			|| (allow_member && membership == CLUSTER_MEMBER_MEMBER));
+}
+
+/*
+ * Transfer the exact, reversible pre-publish recovery binding to the existing
+ * ordinary join owner.  The only mutation is MEMBER -> JOINING in the existing
+ * shared membership table.  A byte-identical staged JOINING tuple is an
+ * idempotent success; no deadline, admission bit, or auxiliary latch is reset.
+ */
+bool
+cluster_reconfig_stage_pre_publish_join_handoff(
+	uint64 expected_self_incarnation)
+{
+	bool exact;
+
+	if (!cluster_reconfig_pre_publish_handoff_external_current(
+			expected_self_incarnation, false))
+		return false;
+	if (!cluster_reconfig_handoff_lock_acquire(LW_EXCLUSIVE))
+		return false;
+	exact = cluster_reconfig_pre_publish_handoff_locked_current(
+		expected_self_incarnation, true);
+	if (exact
+		&& cluster_membership_get_state(cluster_node_id)
+			   == CLUSTER_MEMBER_MEMBER)
+		cluster_membership_set_state(cluster_node_id,
+									 CLUSTER_MEMBER_JOINING);
+	LWLockRelease(&ReconfigShmem->lock);
+	if (!exact)
+		return false;
+	return cluster_reconfig_pre_publish_handoff_external_current(
+		expected_self_incarnation, false);
+}
+
+/* Read-only LMON classifier for the staged tuple.  Both external evidence and
+ * the locked shared tuple are sampled twice; this accessor neither starts the
+ * join deadline nor claims stripe/JCMK authority. */
+bool
+cluster_reconfig_pre_publish_join_handoff_current(void)
+{
+	uint64 expected_self_incarnation;
+	bool exact;
+
+	if (ReconfigShmem == NULL)
+		return false;
+	expected_self_incarnation = cluster_qvotec_get_self_incarnation();
+	if (!cluster_reconfig_pre_publish_handoff_external_current(
+			expected_self_incarnation, true))
+		return false;
+	if (!cluster_reconfig_handoff_lock_acquire(LW_SHARED))
+		return false;
+	exact = cluster_reconfig_pre_publish_handoff_locked_current(
+		expected_self_incarnation, false);
+	LWLockRelease(&ReconfigShmem->lock);
+	if (!exact)
+		return false;
+	return cluster_reconfig_pre_publish_handoff_external_current(
+		expected_self_incarnation, true);
+}
+
 /*
  * Is the cluster already running (so a freshly-booted node is REJOINING, not
  * bootstrapping — §3.4)?  Signal: a declared peer observed at a committed epoch
@@ -5272,6 +5637,8 @@ cluster_reconfig_cluster_already_running(void)
 	if (ReconfigShmem == NULL)
 		return false;
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		uint64 peer_epoch;
+
 		if (i == cluster_node_id)
 			continue;
 		if (cluster_conf_lookup_node(i) == NULL)
@@ -5286,8 +5653,8 @@ cluster_reconfig_cluster_already_running(void)
 		 * deny the 5.22 observation window on the peers (each side saw the
 		 * other "past INITIAL" and refused cold formation).
 		 */
-		if (cluster_reconfig_get_observed_fresh_alive(i)
-			&& cluster_reconfig_get_observed_epoch(i) > CLUSTER_EPOCH_INITIAL)
+		if (cluster_reconfig_observed_peer_epoch_current(i, &peer_epoch)
+			&& peer_epoch > CLUSTER_EPOCH_INITIAL)
 			return true;
 	}
 	return false;
@@ -5475,7 +5842,11 @@ cluster_reconfig_publish_self_current_floor_locked(int32 self_id,
 static void
 cluster_reconfig_joiner_self_tick(void)
 {
+	bool clean_leave_active;
+	bool epoch0_late_founder;
+	bool managed_join_readonly_pivot;
 	bool replacement_admitted;
+	bool in_quorum;
 	uint64 now_us;
 
 	if (ReconfigShmem == NULL
@@ -5505,6 +5876,18 @@ cluster_reconfig_joiner_self_tick(void)
 		return;
 
 	now_us = (uint64)GetCurrentTimestamp();
+	in_quorum = cluster_qvotec_in_quorum();
+	clean_leave_active = cluster_clean_leave_in_progress();
+	/* The managed bridge is not inferred from OFF+JOINING.  It is the exact
+	 * phase-3 staged tuple: current self incarnation/floor, zero admission/
+	 * failure/deadline, no competing membership episode, recovery complete,
+	 * and the same current epoch-0 late-founder evidence. */
+	managed_join_readonly_pivot
+		= cluster_reconfig_pre_publish_join_handoff_current();
+	epoch0_late_founder = !RecoveryInProgress()
+		&& (!cluster_authority_readiness_managed()
+			|| managed_join_readonly_pivot)
+		&& cluster_reconfig_epoch0_late_founder_evidence_current();
 
 	/*
 	 * Catch up to the cluster epoch observed on the durable voting disk (quorum-
@@ -5528,7 +5911,11 @@ cluster_reconfig_joiner_self_tick(void)
 
 			if (i == cluster_node_id || cluster_conf_lookup_node(i) == NULL)
 				continue;
-			pe = cluster_reconfig_get_observed_epoch(i);
+			/* Transport catch-up uses the exact current QVOTEC tuple also used
+			 * by running-peer classification; an odd/changed poll or stale slot
+			 * cannot contribute an epoch. */
+			if (!cluster_reconfig_observed_peer_epoch_current(i, &pe))
+				continue;
 			if (pe > max_peer_epoch)
 				max_peer_epoch = pe;
 		}
@@ -5543,27 +5930,50 @@ cluster_reconfig_joiner_self_tick(void)
 	 * membership reconfig at a time; the leave side refuses to start while a join is
 	 * pending via cluster_reconfig_join_in_progress).
 	 */
-	if (!joiner_gate_decided && !cluster_clean_leave_in_progress()) {
+	if (!joiner_gate_decided && !clean_leave_active) {
 		if (offpath_fast_rejoin_active_local
-			|| cluster_reconfig_cluster_already_running()) {
-			/* REJOINER: a running cluster exists.  Close the gate, start the
-			 * join, latch a convergence deadline (-> 53R61 on timeout).  A
+			|| cluster_reconfig_cluster_already_running()
+			|| epoch0_late_founder) {
+			/* REJOINER: a running cluster exists.  Close the gate and classify
+			 * the ordinary join.  Its convergence deadline remains unowned until
+			 * local quorum can drive the exact xid-stripe prerequisite.  A
 			 * prior-unclean shared-CF classification is already positive rejoin
 			 * evidence and may never fall back to the generic epoch-0 bootstrap
 			 * proof while the survivor's eviction bump is still in flight. */
-			joiner_gate_decided = true;
-			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-			cluster_write_fence_authority_cache_invalidate();
-			ReconfigShmem->self_join_admitted = 0;
-			ReconfigShmem->self_join_failed = 0;
-			ReconfigShmem->self_join_deadline_us
-				= now_us + (uint64)cluster_join_convergence_timeout_ms * 1000ULL;
-			cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
-			LWLockRelease(&ReconfigShmem->lock);
+			if (managed_join_readonly_pivot) {
+				/* The phase-3 Writer already installed the exact shared tuple.
+				 * Consume it without resetting any byte.  A second complete
+				 * sample closes the evidence-to-process-local-owner race. */
+				if (!cluster_reconfig_pre_publish_join_handoff_current())
+					return;
+				joiner_gate_decided = true;
+				if (!cluster_reconfig_pre_publish_join_handoff_current()) {
+					joiner_gate_decided = false;
+					return;
+				}
+			} else {
+				joiner_gate_decided = true;
+				LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+				cluster_write_fence_authority_cache_invalidate();
+				ReconfigShmem->self_join_admitted = 0;
+				ReconfigShmem->self_join_failed = 0;
+				ReconfigShmem->self_join_deadline_us = 0;
+				cluster_membership_set_state(cluster_node_id,
+										 CLUSTER_MEMBER_JOINING);
+				LWLockRelease(&ReconfigShmem->lock);
+			}
 			ereport(LOG,
 					(errmsg("cluster membership: node %d joining a running cluster — write gate "
 							"closed (53R60) pending admission",
 							cluster_node_id)));
+		} else if (!in_quorum) {
+			/* A slow founding node can fall out of the current local quorum
+			 * view when its peers advance formation first.  Their fresh,
+			 * QVOTEC-authenticated past-INITIAL slots above may still classify
+			 * this node as an ordinary joiner and close its gate, but absence of
+			 * local quorum is never authority to bootstrap, publish MEMBER, or
+			 * start an admission deadline.  Retry from current evidence. */
+			return;
 		} else if (cluster_reconfig_bootstrap_quorum_at_initial()) {
 			uint64 bootstrap_incarnation;
 
@@ -5579,6 +5989,7 @@ cluster_reconfig_joiner_self_tick(void)
 
 			if (sv != CLUSTER_XID_STRIPE_JOIN_PROCEED) {
 				static bool stripe_boot_logged = false;
+				uint64 control_incarnation = 0;
 
 				if (!stripe_boot_logged) {
 					stripe_boot_logged = true;
@@ -5599,10 +6010,22 @@ cluster_reconfig_joiner_self_tick(void)
 										"resolved",
 										cluster_node_id)));
 				}
+				/* AD-023: HOLD may publish the exact current MEMBER floor for
+				 * recovery control, but must keep ordinary writes closed.  REFUSE
+				 * retains the original fail-closed demotion. */
+				if (sv == CLUSTER_XID_STRIPE_JOIN_HOLD)
+					control_incarnation = cluster_qvotec_get_self_incarnation();
 				LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
-				cluster_write_fence_authority_cache_invalidate();
 				ReconfigShmem->self_join_admitted = 0;
-				cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+				ReconfigShmem->self_join_failed = 0;
+				ReconfigShmem->self_join_deadline_us = 0;
+				if (sv != CLUSTER_XID_STRIPE_JOIN_HOLD
+					|| !cluster_reconfig_publish_self_current_floor_locked(
+						cluster_node_id, control_incarnation)) {
+					cluster_write_fence_authority_cache_invalidate();
+					cluster_membership_set_state(
+						cluster_node_id, CLUSTER_MEMBER_JOINING);
+				}
 				LWLockRelease(&ReconfigShmem->lock);
 				return;
 			}
@@ -5688,7 +6111,64 @@ cluster_reconfig_joiner_self_tick(void)
 			}
 			LWLockRelease(&ReconfigShmem->lock);
 		}
+	}
+	/* A running-cluster classification continues below in this same tick when
+	 * quorum is present.  Clean-leave suppression and every other undecided arm
+	 * own no stripe progress and no join deadline. */
+	if (!joiner_gate_decided)
 		return;
+	/* Preserve the historical timeout domain: after classification, loss of
+	 * local quorum remains a fail-closed wait and does not consume the join
+	 * convergence deadline from an LMON tick that cannot drive admission. */
+	if (!in_quorum)
+		return;
+
+	/*
+	 * The ordinary joiner owns its prerequisite progress on every in-quorum
+	 * LMON tick.  WAIT_EVIDENCE cannot start the
+	 * timeout.  The first exact staged/pending self CLAIM (or a fully resolved
+	 * stripe face) arms the existing absolute deadline once; repeated ticks and
+	 * quorum wobble never refresh it.
+	 */
+	if (!clean_leave_active && !ReconfigShmem->self_join_admitted
+		&& !ReconfigShmem->self_join_failed) {
+		ClusterXidStripeJoinProgress progress
+			= cluster_xid_stripe_join_progress(false);
+
+		if (progress == STRIPE_JOIN_REFUSE) {
+			static bool stripe_join_refuse_logged = false;
+
+			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			if (!ReconfigShmem->self_join_admitted
+				&& !ReconfigShmem->self_join_failed) {
+				cluster_write_fence_authority_cache_invalidate();
+				ReconfigShmem->self_join_failed = 1;
+				ReconfigShmem->self_join_deadline_us = 0;
+				cluster_membership_set_state(cluster_node_id,
+					CLUSTER_MEMBER_REJECTED);
+			}
+			LWLockRelease(&ReconfigShmem->lock);
+			if (!stripe_join_refuse_logged) {
+				stripe_join_refuse_logged = true;
+				ereport(LOG,
+						(errcode(ERRCODE_CLUSTER_XID_STRIPE_JOIN_MISMATCH),
+						 errmsg("cluster xid stripe: refusing ordinary join of node %d — "
+								"stripe prerequisite mismatch (SQLSTATE 53RB1)",
+								cluster_node_id)));
+			}
+			return;
+		}
+		if (progress == STRIPE_JOIN_CLAIM_OWNED
+			|| progress == STRIPE_JOIN_PROCEED) {
+			LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+			if (!ReconfigShmem->self_join_admitted
+				&& !ReconfigShmem->self_join_failed
+				&& ReconfigShmem->self_join_deadline_us == 0)
+				ReconfigShmem->self_join_deadline_us
+					= now_us
+					  + (uint64)cluster_join_convergence_timeout_ms * 1000ULL;
+			LWLockRelease(&ReconfigShmem->lock);
+		}
 	}
 
 	/* Gate decided.  If closed + not yet admitted, fail closed on timeout (53R61);
@@ -6071,6 +6551,15 @@ cluster_reconfig_lmon_tick(void)
 	 * A hardening (lmon_tick has many early returns; clean wait_start/
 	 * wait_end pairing needs cleanup refactor). */
 
+	/* A fresh peer past INITIAL is sufficient only for the fail-closed
+	 * bootstrap->ordinary-join classification.  Run that narrow self tick before
+	 * the participation gate so a slow node can adopt the current transport epoch
+	 * and close its service gate.  The tick itself keeps bootstrap admission and
+	 * deadline consumption behind local in-quorum evidence. */
+	cluster_reconfig_membership_floor_diagnostic("before-joiner-self");
+	cluster_reconfig_joiner_self_tick();
+	cluster_reconfig_membership_floor_diagnostic("after-joiner-self");
+
 	/* I2 + I8: only in_quorum nodes participate in reconfig. */
 	if (!cluster_qvotec_in_quorum()) {
 		cluster_reconfig_fast_rejoin_control_clear();
@@ -6146,15 +6635,6 @@ cluster_reconfig_lmon_tick(void)
 		}
 	}
 	cssd_dead_generation = cluster_cssd_get_dead_generation();
-
-	/*
-	 * spec-5.15 D5 — joiner self-tick: decide (once, in the early boot window) if
-	 * THIS node is rejoining a running cluster and close its write gate; latch
-	 * 53R61 on convergence timeout.  Runs before the membership maintenance so the
-	 * self-state below reflects the gate.
-	 */
-	cluster_reconfig_joiner_self_tick();
-
 
 	/*
 	 * Shape A (crash-rejoin re-declare barrier) — the online_join=off
@@ -6266,6 +6746,25 @@ cluster_reconfig_lmon_tick(void)
 		else if (cluster_reconfig_is_local_admitted_replacement(
 				 &ReconfigShmem->replacement_episode))
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
+		/* A terminal stripe prerequisite refusal is stronger than the generic
+		 * closed-gate JOINING fallback below and remains fail-closed. */
+		else if (ReconfigShmem->self_join_failed)
+			cluster_membership_set_state(self_id, CLUSTER_MEMBER_REJECTED);
+		/* AD-023 recovery-control formation: joiner_self_tick may have
+		 * published this exact epoch-0 MEMBER floor while the xid-stripe gate
+		 * is still HOLD.  Preserve only that same retryable, write-closed
+		 * identity; the process-local bootstrap decision remains unlatched. */
+		else if (cluster_online_join && !joiner_gate_decided
+				 && !ReconfigShmem->self_join_admitted
+				 && !ReconfigShmem->self_join_failed
+				 && cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL
+				 && cluster_reconfig_bootstrap_quorum_at_initial()
+				 && cluster_membership_get_state(self_id)
+						== CLUSTER_MEMBER_MEMBER
+				 && cluster_reconfig_publish_self_current_floor_locked(
+					 self_id, self_floor_incarnation)) {
+			/* Exact helper retained MEMBER; ordinary writes remain closed. */
+		}
 		else if ((ReconfigShmem->self_join_admitted
 				  && !ReconfigShmem->self_join_failed
 				  && (cluster_online_join
@@ -6606,6 +7105,8 @@ cluster_reconfig_lmon_tick(void)
 		}
 
 		LWLockRelease(&ReconfigShmem->lock);
+		cluster_reconfig_membership_floor_diagnostic(
+			"after-membership-reconcile");
 
 		/*
 		 * spec-5.16 (3-node join participation) — publish an observer-role
@@ -8661,14 +9162,61 @@ static void
 cluster_reconfig_cold_formation_admit(const ClusterFormationCommitMarker *marker,
 									  const uint64 *incarnation_by_node)
 {
+	ClusterXidStripeJoinVerdict stripe_verdict;
+	uint64		self_incarnation;
 	int			i;
 
 	if (marker == NULL || incarnation_by_node == NULL)
+		return;
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| (marker->admitted_nodes[cluster_node_id / 8]
+			& (uint8) (1u << (cluster_node_id % 8))) == 0)
+		return;
+	self_incarnation = cluster_qvotec_get_self_incarnation();
+	if (self_incarnation == 0
+		|| incarnation_by_node[cluster_node_id] != self_incarnation)
 		return;
 	if (cluster_membership_get_last_admitted_incarnation(cluster_node_id) != 0)
 	{
 		cold_formation_state.admission_done = true;
 		return;					/* already admitted */
+	}
+
+	/*
+	 * spec-6.15 D5b / Oracle-first admission ordering: the exact durable
+	 * formation marker is membership evidence, not an xid-allocation bypass.
+	 * Reuse the same PGRAC xid-stripe prerequisite as ordinary JCMK admission:
+	 * PGXA must be current, this node's PGXS must be durable MINE, and the JOIN
+	 * record must be insertable.  HOLD leaves the marker available for the next
+	 * QVOTEC/LMON tick; REFUSE remains fail closed.  A cold-formation consumer
+	 * is never allowed to seed PGXA here.
+	 */
+	stripe_verdict = cluster_xid_stripe_join_gate(false);
+	if (stripe_verdict != CLUSTER_XID_STRIPE_JOIN_PROCEED)
+	{
+		static bool stripe_formation_admit_logged = false;
+
+		if (!stripe_formation_admit_logged)
+		{
+			stripe_formation_admit_logged = true;
+			if (stripe_verdict == CLUSTER_XID_STRIPE_JOIN_REFUSE)
+				ereport(LOG,
+						(errcode(ERRCODE_CLUSTER_XID_STRIPE_JOIN_MISMATCH),
+						 errmsg("cluster xid stripe: refusing cold-formation "
+								"admission of node %d — stripe mode handshake "
+								"mismatch (SQLSTATE 53RB1)",
+								cluster_node_id),
+						 errhint("cluster.xid_striping must match the cluster's "
+								 "durable activation state on every node; repair the "
+								 "voting-disk stripe region if it is corrupt.")));
+			else
+				ereport(LOG,
+						(errmsg("cluster xid stripe: holding cold-formation "
+								"admission of node %d until the stripe activation "
+								"state is resolved",
+								cluster_node_id)));
+		}
+		return;
 	}
 	for (i = 0; i < CLUSTER_MAX_NODES; i++)
 	{
