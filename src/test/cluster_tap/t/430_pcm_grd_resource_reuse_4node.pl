@@ -16,6 +16,7 @@ use Test::More;
 use Time::HiRes qw(time usleep);
 
 my $pcm_capacity = 128;
+my $shared_buffer_count = 64;
 my $working_set = 4 * $pcm_capacity;
 my $rows_per_node_round = 32;
 my $rounds = $working_set / (4 * $rows_per_node_round);
@@ -111,7 +112,7 @@ my $quad = PostgreSQL::Test::ClusterQuad->new_quad(
 	shared_data => 1,
 	shared_system_identifier => 1,
 	extra_conf => [
-		'shared_buffers = 1MB',
+		'shared_buffers = 512kB',
 		'autovacuum = off',
 		'cluster.read_scache = on',
 		'cluster.online_join = on',
@@ -189,6 +190,10 @@ activate_semantic_round($quad->node0, 'Resource-X bit10');
 for my $i (0 .. 3)
 {
 	is($quad->node($i)->safe_psql('postgres', q{
+		SELECT setting FROM pg_settings WHERE name='shared_buffers'}),
+		"$shared_buffer_count",
+		"node$i cache replacement starts before PCM directory exhaustion");
+	is($quad->node($i)->safe_psql('postgres', q{
 		SELECT value FROM pg_cluster_state
 		WHERE category='pcm' AND key='resource_x_gate_phase'}),
 		'open', "node$i Resource-X gate is open");
@@ -196,7 +201,10 @@ for my $i (0 .. 3)
 		$pcm_capacity, "node$i uses the bounded PCM directory");
 }
 
-for my $node ($quad->nodes)
+my @ddl_nodes = ($ENV{PGRAC_TEST_TWO_STAGE_VOTING_LOOP} // '') eq '1'
+  ? ($quad->node0)
+  : $quad->nodes;
+for my $node (@ddl_nodes)
 {
 	$node->safe_psql('postgres', q{
 		CREATE TABLE pcm_grd_reuse (
@@ -215,6 +223,15 @@ for my $node ($quad->nodes)
 # Seed one resource per autocommit transaction so preparation does not create
 # an unrelated multi-resource authority round.  The measured reuse delta below
 # starts only after all physical rows exist.
+my @seed_retire_before = map {
+	state_int($quad->node($_), 'pcm', 'pcm_grd_reclaim_success_count')
+} (0 .. 3);
+my @seed_capacity_fail_before = map {
+	state_int($quad->node($_), 'pcm', 'pcm_grd_capacity_fail_count')
+} (0 .. 3);
+my $seed_buffer_alloc_before = 0 + $quad->node0->safe_psql('postgres', q{
+	SELECT buffers_alloc FROM pg_stat_bgwriter
+});
 my $seed_sql = '';
 for my $id (1 .. $working_set)
 {
@@ -228,14 +245,41 @@ for my $id (1 .. $working_set)
 			repeat('x', 63)::name, repeat('x', 63)::name,
 			repeat('x', 63)::name, repeat('x', 63)::name,
 			repeat('x', 63)::name, repeat('x', 63)::name,
-			repeat('x', 63)::name, repeat('x', 63)::name);
+			repeat('x', 63)::name, repeat('x', 63)::name)
+		RETURNING ctid::text AS seeded_ctid \\gset
+		SELECT id FROM pcm_grd_reuse WHERE ctid = :'seeded_ctid'::tid;
 	};
 }
 $quad->node0->safe_psql('postgres', $seed_sql, timeout => 180);
+
+# Fresh TAP clusters begin near the xid-stripe floor, so the 512 one-row seed
+# transactions can recycle their TT slots before a peer first visits the page.
+# The ctid read after each INSERT commit applies the established owner-side
+# hint recipe one resource at a time, preserving the seed's single-resource
+# authority rounds.  This is setup hygiene only and leaves the measured
+# UPDATE+COMMIT workload, capacity, timeout, and exact-once accounting intact.
 for my $node ($quad->nodes)
 {
 	$node->safe_psql('postgres', 'CHECKPOINT');
 }
+
+my $seed_retire_delta = 0;
+my $seed_buffer_alloc_after = 0 + $quad->node0->safe_psql('postgres', q{
+	SELECT buffers_alloc FROM pg_stat_bgwriter
+});
+cmp_ok($seed_buffer_alloc_after - $seed_buffer_alloc_before, '>',
+	$shared_buffer_count,
+	'seed workload performed more buffer allocations than cache slots');
+for my $i (0 .. 3)
+{
+	$seed_retire_delta += state_int($quad->node($i), 'pcm',
+		'pcm_grd_reclaim_success_count') - $seed_retire_before[$i];
+	is(state_int($quad->node($i), 'pcm', 'pcm_grd_capacity_fail_count'),
+		$seed_capacity_fail_before[$i],
+		"node$i seed replacement preceded directory exhaustion");
+}
+cmp_ok($seed_retire_delta, '>', 0,
+	'seed workload produced terminal entries through cache replacement');
 
 my $distinct_heap_pages = $quad->node0->safe_psql('postgres', q{
 	SELECT count(DISTINCT split_part(trim(both '()' from ctid::text), ',', 1))

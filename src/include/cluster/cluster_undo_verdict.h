@@ -150,4 +150,12 @@ extern ClusterUndoVerdictResult cluster_undo_verdict_resolve(int origin_node,
 														 uint32 expected_tt_slot_id, SCN read_scn,
 														 bool authoritative);
 
+/* S8-815PRE-FRESHREF-C1B-01: exact retained-page pairing entry.  It is
+ * remote/live-origin only and can return COMMITTED_EXACT only when the
+ * current ref tuple, origin C1b and native no-reuse fence all agree. */
+extern ClusterUndoVerdictResult cluster_undo_verdict_resolve_freshref_c1b_pair(
+	int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
+	TransactionId ref_xid, uint32 expected_tt_slot_id, uint32 ref_epoch,
+	SCN cached_commit_scn, SCN read_scn);
+
 #endif /* CLUSTER_UNDO_VERDICT_H */

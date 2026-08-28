@@ -28,11 +28,20 @@ include $(top_builddir)/src/Makefile.global
 
 EXTRA_INSTALL=
 
+all:
+
+ifeq ($(PORTNAME), linux)
+all: pgrac_direct_io_probe
+endif
+
+pgrac_direct_io_probe: bin/pgrac_direct_io_probe.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(LDFLAGS) -o $@
+
 
 # ----------
 # PG-standard TAP test entry points
 # ----------
-check:
+check: all
 	$(prove_check)
 
 installcheck:
@@ -43,10 +52,10 @@ installcheck:
 # Cleanup
 # ----------
 clean distclean maintainer-clean:
-	rm -rf tmp_check
+	rm -rf tmp_check pgrac_direct_io_probe
 
 install installdirs uninstall:
 	@:
 
-.PHONY: check installcheck clean distclean maintainer-clean \
+.PHONY: all check installcheck clean distclean maintainer-clean \
         install installdirs uninstall

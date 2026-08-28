@@ -5227,7 +5227,8 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
  */
 static bool
 gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stamped_epoch,
-									 TransactionId xid, bool authoritative, bool authority_kind,
+									 TransactionId xid, SCN freshref_pair_scn,
+									 bool authoritative, bool authority_kind,
 									 GcsBlockReplyHeader *hdr_out,
 									 ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out,
 									 uint64 *authority_scn_out)
@@ -5237,6 +5238,10 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 	GcsBlockForwardPayload fwd;
 	bool got_reply = false;
 	bool fetched = false;
+	bool freshref_pair = SCN_VALID(freshref_pair_scn);
+
+	if (freshref_pair && (!authoritative || authority_kind))
+		return false;
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_reserve_slot(tag, (uint8)PCM_TRANS_N_TO_S, cluster_node_id, &request_id);
@@ -5269,12 +5274,16 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 		fwd.requester_backend_id = (int32)MyBackendId;
 		fwd.master_node = cluster_node_id;
 		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
-		if (authority_kind)
+		if (freshref_pair)
+			GcsBlockForwardPayloadSetUndoFreshRefC1bPairRequest(&fwd);
+		else if (authority_kind)
 			GcsBlockForwardPayloadSetUndoAuthorityVerdictRequest(&fwd);
 		else
 			GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, authoritative);
-		/* The widened xid rides the watermark carrier (upper 32 bits zero). */
-		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)(uint64)xid);
+		/* Kinds 2/4/5 carry the widened xid here.  Kind 10 binds xid in the
+		 * synthetic tag and carries the exact retained page SCN instead. */
+		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
+			&fwd, freshref_pair ? freshref_pair_scn : (SCN)(uint64)xid);
 
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 													  (uint32)dest_node, &fwd, sizeof(fwd))) {
@@ -5396,7 +5405,8 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 	tag = GcsBlockUndoFetchTagMake(segment_id, expected_tt_slot_id);
 
 	if (!gcs_block_undo_verdict_wire_exchange(origin_node, tag, cluster_epoch_get_current(), xid,
-											  authoritative, false /* owner-served kind */, &hdr,
+											  InvalidScn, authoritative,
+											  false /* owner-served kind */, &hdr,
 											  &page, &tt_generation, &authority_scn))
 		return false;
 
@@ -5411,6 +5421,59 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 	auth_out->authority_scn = (SCN)authority_scn;
 	/* spec-5.14 D2: the verdict is the origin's volatile
 	 * co-sample — depend on it for fail-stop (D-i3). */
+	gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	return true;
+}
+
+/* S8-815PRE-FRESHREF-C1B-01 requester leg.  The exact physical ref binds xid
+ * in tag.relNumber and the retained page SCN in the existing 64-bit scalar;
+ * no wire byte or authority is added. */
+bool
+cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
+	int32 origin_node, uint32 segment_id, uint32 expected_tt_slot_id,
+	TransactionId xid, uint32 ref_epoch, SCN proposed_scn,
+	ClusterGcsUndoVerdictPage *verdict_out, ClusterLiveAuthority *auth_out)
+{
+	GcsBlockReplyHeader hdr;
+	ClusterGcsUndoVerdictPage page;
+	uint64 tt_generation = 0;
+	uint64 authority_scn = 0;
+	uint64 stamped_epoch;
+	BufferTag tag;
+
+	if (verdict_out == NULL || auth_out == NULL || origin_node < 0
+		|| origin_node == cluster_node_id || segment_id == 0
+		|| segment_id > UINT16_MAX || expected_tt_slot_id < 1
+		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT
+		|| !TransactionIdIsNormal(xid) || !SCN_VALID(proposed_scn))
+		return false;
+	memset(verdict_out, 0, sizeof(*verdict_out));
+	memset(auth_out, 0, sizeof(*auth_out));
+
+	stamped_epoch = cluster_epoch_get_current();
+	if (stamped_epoch == 0 || stamped_epoch > UINT32_MAX
+		|| ref_epoch != (uint32)stamped_epoch)
+		return false;
+	tag = GcsBlockUndoFreshRefC1bTagMake(
+		segment_id, xid, expected_tt_slot_id);
+
+	if (!gcs_block_undo_verdict_wire_exchange(
+			origin_node, tag, stamped_epoch, xid, proposed_scn,
+			true /* physical fresh-ref authority */, false /* live owner */, &hdr,
+			&page, &tt_generation, &authority_scn))
+		return false;
+	if (hdr.sender_node != origin_node || hdr.epoch != stamped_epoch
+		|| cluster_epoch_get_current() != stamped_epoch
+		|| !cluster_vis_undo_verdict_page_usable(&page, xid)
+		|| page.verdict != (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
+		|| page.commit_scn != proposed_scn || SCN_VALID(page.horizon_scn))
+		return false;
+
+	*verdict_out = page;
+	auth_out->origin_epoch = hdr.epoch;
+	auth_out->live_hwm_lsn = (XLogRecPtr)hdr.page_lsn;
+	auth_out->tt_generation = tt_generation;
+	auth_out->authority_scn = (SCN)authority_scn;
 	gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	return true;
 }
@@ -5465,6 +5528,7 @@ cluster_gcs_block_undo_authority_verdict_fetch_and_wait(int32 authority_node, in
 	stamped_epoch = cluster_epoch_get_current();
 
 	if (!gcs_block_undo_verdict_wire_exchange(authority_node, tag, stamped_epoch, xid,
+											  InvalidScn,
 											  false /* no owner-served sub-kind */,
 											  true /* kind 4 */, &hdr, &page, &tt_generation,
 											  NULL /* authority co-sample: live-TT plane
@@ -9168,6 +9232,7 @@ static void
 gcs_block_resource_x_first_failure_record(
 	const ResourceXFirstFailureEvidence *evidence)
 {
+	PcmGrdLifecycleStats lifecycle;
 	uint64 now_us;
 	uint32 tag_hash;
 	uint32 capacity_used;
@@ -9202,6 +9267,7 @@ gcs_block_resource_x_first_failure_record(
 	now_us = gcs_block_pcm_x_monotonic_us();
 	if (!gcs_block_resource_x_first_failure_should_log(evidence, now_us))
 		return;
+	cluster_pcm_grd_lifecycle_stats_snapshot(&lifecycle);
 	live_entries = cluster_pcm_grd_count();
 	capacity_used = live_entries > 0 ? (uint32)live_entries : 0;
 	capacity_limit = cluster_pcm_grd_capacity() > 0
@@ -9250,6 +9316,12 @@ gcs_block_resource_x_first_failure_record(
 				   "proof_staged=%s proof_published=%s "
 				   "round_terminal=%s round_phase=%u round_progress_flags=0x%08x "
 				   "capacity_kind=%s capacity_used=%u capacity_limit=%u "
+				   "reclaim_attempts=%llu reclaim_successes=%llu "
+				   "reclaim_reuses=%llu capacity_retries=%llu "
+				   "capacity_failures=%llu refused_pcm_mode=%llu "
+				   "refused_holder=%llu refused_pi=%llu refused_watermark=%llu "
+				   "refused_resource_x=%llu refused_retained=%llu "
+				   "refused_requester=%llu refused_sidecar=%llu "
 				   "deadline=%llu",
 				   tag_hash,
 				   (unsigned long long)evidence->binding_generation,
@@ -9338,6 +9410,27 @@ gcs_block_resource_x_first_failure_record(
 				   "pcm_grd_live",
 				   capacity_used,
 				   capacity_limit,
+				   (unsigned long long)lifecycle.reclaim_attempt_count,
+				   (unsigned long long)lifecycle.reclaim_success_count,
+				   (unsigned long long)lifecycle.reclaim_reuse_count,
+				   (unsigned long long)lifecycle.capacity_retry_count,
+				   (unsigned long long)lifecycle.capacity_fail_count,
+				   (unsigned long long)lifecycle.reclaim_refused[
+					   PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N],
+				   (unsigned long long)lifecycle.reclaim_refused[
+					   PCM_RETIRE_REFUSAL_HOLDER_PRESENT],
+				   (unsigned long long)lifecycle.reclaim_refused[
+					   PCM_RETIRE_REFUSAL_PI_PRESENT],
+				   (unsigned long long)lifecycle.reclaim_refused[
+					   PCM_RETIRE_REFUSAL_WATERMARK_PRESENT],
+				   (unsigned long long)lifecycle.reclaim_refused[
+					   PCM_RETIRE_REFUSAL_RESOURCE_X_ACTIVE],
+				   (unsigned long long)lifecycle.reclaim_refused[
+					   PCM_RETIRE_REFUSAL_RETAINED_PAIR_PRESENT],
+				   (unsigned long long)lifecycle.reclaim_refused[
+					   PCM_RETIRE_REFUSAL_REQUESTER_NOT_TERMINAL],
+				   (unsigned long long)lifecycle.reclaim_refused[
+					   PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL],
 				   (unsigned long long)evidence->absolute_deadline_us)));
 }
 
@@ -10654,6 +10747,17 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
 		result = cluster_pcm_lock_resource_x_source_settlement_ack_exact(
 			&frame, (int32)env->source_node_id, &snapshot);
+		ereport(LOG,
+				(errmsg_internal("Resource-X source settlement ACK ingress diagnostic"),
+				 errdetail("source=%u requester=%d attempt=%llu result=%d "
+						   "phase=%u final=%llu",
+						   env->source_node_id,
+						   frame.common.logical_assertion.requester_node,
+						   (unsigned long long)
+							frame.common.assertion_sequence,
+						   (int)result, (unsigned)snapshot.phase,
+						   (unsigned long long)
+							snapshot.final_authority_generation)));
 		break;
 	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT:
 	{
@@ -11194,6 +11298,11 @@ gcs_block_resource_x_target_acquire_internal(
 					}
 					*ref_out = terminal_ref;
 					result = RESOURCE_X_APPLY_APPLIED;
+					break;
+				}
+				if (action == RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE) {
+					diagnostic_stage = "round-capacity-backpressure";
+					result = RESOURCE_X_APPLY_BAD_STATE;
 					break;
 				}
 				if (action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED) {
@@ -14498,6 +14607,20 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 	if (GcsBlockForwardPayloadIsCurrentMxRuntime(fwd)
 		|| fwd->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS)
 		return;
+	if (GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(fwd)) {
+		/* Kind 10 is usable only on the authenticated direct requester->origin
+		 * leg with a byte-canonical tuple.  Never let a malformed pair fall
+		 * through to ordinary BufferTag/holder interpretation. */
+		if (env->dest_node_id != (uint32)cluster_node_id
+			|| env->source_node_id != (uint32)fwd->original_requester_node)
+			return;
+		if (!cluster_cr_server_freshref_c1b_pair_request_decode(
+				fwd, (int32)env->source_node_id, cluster_node_id,
+				cluster_epoch_get_current(), MaxBackends, NULL, NULL, NULL, NULL)) {
+			gcs_block_forward_reply_immediate_deny(fwd);
+			return;
+		}
+	}
 	sf_peer_v2
 		= cluster_smart_fusion && cluster_sf_peer_supports_reply_v2(fwd->original_requester_node);
 	pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_received_count, 1);

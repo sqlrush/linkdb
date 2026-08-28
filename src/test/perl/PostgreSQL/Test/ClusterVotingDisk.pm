@@ -14,7 +14,11 @@ use Exporter 'import';
 
 our @EXPORT_OK = qw(format_voting_file);
 
-use constant VOTING_FILE_BYTES_MIN => 394240;
+# A voting backing file can later become the exact Linux block-device
+# authority used by the Stage-8 two-phase harness.  Allocate the final PGRD
+# extent from creation; growing a file after loop attachment does not update
+# the loop device's attested capacity.
+use constant VOTING_FILE_BYTES_MIN => 525824;
 use constant VOTING_SLOT_BYTES => 512;
 use constant VOTING_SLOT_CRC_OFFSET => 508;
 use constant VOTING_SLOT_MAGIC => 0x51564F54;

@@ -583,6 +583,7 @@ static bool ut_drive_authority_lmon_tick = false;
 static bool ut_in_authority_lmon_tick = false;
 static int ut_grd_blocking_lwlock_calls = 0;
 static int ut_grd_postmaster_lwlock_calls = 0;
+static int ut_done_enqueue_count[CLUSTER_MAX_NODES];
 int64
 GetCurrentTimestamp(void)
 {
@@ -608,10 +609,12 @@ cluster_grd_redeclare_all_registered(void)
  * ring.  Standalone fixture has no ring; no-op success.  (peer-state stub
  * for the dead-peer skip already exists above.) */
 bool
-cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id pg_attribute_unused(),
+cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id,
 											 const void *payload pg_attribute_unused(),
 											 uint32 payload_len pg_attribute_unused())
 {
+	if (dest_node_id < CLUSTER_MAX_NODES)
+		ut_done_enqueue_count[dest_node_id]++;
 	return true;
 }
 
@@ -4125,6 +4128,40 @@ ut_jr_stamp_episode_bitmap_hash(uint64 event_id)
 	return cluster_grd_recovery_event_bitmap_hash_value();
 }
 
+/* JOIN_PENDING is a nonterminal membership staging event.  Only
+ * JOIN_COMMITTED may start the join-remaster FSM; treating a zero-dead
+ * JOIN_PENDING as FAIL wedges initial formation in WAIT_CLUSTER. */
+UT_TEST(test_recovery_idle_ignores_join_pending)
+{
+	bool saved_enabled = cluster_enabled;
+	ClusterGrdRecoveryCounters counters;
+
+	ut_jr_setup_3node();
+	cluster_enabled = true;
+	ut_mock_epoch = 10;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_grd_recovery_lmon_tick(); /* capture stable IDLE baseline */
+
+	ut_mock_last_event.event_id = 610;
+	ut_mock_last_event.coordinator_node_id = 0;
+	ut_mock_last_event.old_epoch = 10;
+	ut_mock_last_event.new_epoch = 11;
+	ut_mock_last_event.reconfig_kind = (uint8)RECONFIG_KIND_JOIN_PENDING;
+	ut_mock_last_event.join_bitmap[0] = 0x04; /* node 2 */
+	cluster_grd_recovery_lmon_tick();
+	cluster_grd_recovery_lmon_tick(); /* persistent staging remains inert */
+
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(),
+				 (uint32)GRD_RECOVERY_IDLE);
+	UT_ASSERT_EQ(cluster_grd_recovery_last_event_id(), 0);
+	cluster_grd_recovery_counters_snapshot(&counters);
+	UT_ASSERT_EQ(counters.remaster_started, 0);
+	UT_ASSERT_EQ(counters.join_remaster_started, 0);
+
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_enabled = saved_enabled;
+}
+
 /* U1 — recompute moves the joiner's home shards back from the survivor. */
 UT_TEST(test_jr_u1_recompute_moves_joiner_home)
 {
@@ -4912,6 +4949,85 @@ setup_recovery_authority_singleton_fixture(
 	formation->membership.last_admitted_incarnation[0] = 11;
 }
 
+static void
+setup_recovery_authority_four_node_fixture(
+	ClusterFormationSnapshotV1 *formation)
+{
+	const int32 nodes[] = { 0, 1, 2, 3 };
+	int i;
+
+	reset_fake_grd_htab();
+	cluster_grd_max_entries = 16;
+	set_mock_declared(4, nodes);
+	ut_member_mask = 0xf;
+	ut_admitted_incarnation = 11;
+	ut_qvotec_quorum = true;
+	ut_mock_epoch = 77;
+	ut_mock_now = 0;
+	mock_lms_shard_master_generation = (UINT64_C(77) << 32) | 7;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_enabled = false;
+	cluster_grd_shmem_init();
+	cluster_grd_master_map_init();
+
+	memset(formation, 0, sizeof(*formation));
+	formation->local_epoch = 77;
+	formation->applied.new_epoch = 77;
+	for (i = 0; i < 4; i++) {
+		formation->membership.membership_state[i] = CLUSTER_MEMBER_MEMBER;
+		formation->membership.last_admitted_incarnation[i] = 11;
+	}
+}
+
+/*
+ * A terminal peer must answer each distinct late requester once for the exact
+ * recovery-authority composite.  A process-wide once gate loses the later
+ * requesters when the first echo was sent before their CONTROL path admitted
+ * traffic; per-requester duplicate suppression remains bounded at N-1 echoes.
+ */
+UT_TEST(test_recovery_authority_done_echo_is_bounded_per_requester)
+{
+	ClusterFormationSnapshotV1 formation;
+	uint64 bitmap_hash;
+	int dest;
+
+	setup_recovery_authority_four_node_fixture(&formation);
+	bitmap_hash = cluster_grd_dead_bitmap_hash(
+		formation.applied.dead_bitmap);
+	UT_ASSERT(bitmap_hash != 0);
+
+	/* Drive far enough to stamp our exact self-DONE, but withhold all three
+	 * peer DONEs so the authority request terminates fail-closed. */
+	ut_drive_authority_lmon_tick = true;
+	cluster_enabled = true;
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
+		&formation, 11, 7, 20));
+	ut_drive_authority_lmon_tick = false;
+	cluster_grd_recovery_authority_lmon_tick();
+	memset(ut_done_enqueue_count, 0, sizeof(ut_done_enqueue_count));
+
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
+										bitmap_hash);
+	for (dest = 1; dest < 4; dest++)
+		UT_ASSERT_EQ(ut_done_enqueue_count[dest], 1);
+
+	/* Exact duplicate from requester 1 is idempotent. */
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
+										bitmap_hash);
+	for (dest = 1; dest < 4; dest++)
+		UT_ASSERT_EQ(ut_done_enqueue_count[dest], 1);
+
+	/* Distinct late requesters at the same composite each re-arm one echo. */
+	cluster_grd_recovery_mark_peer_done(2, formation.local_epoch,
+										bitmap_hash);
+	cluster_grd_recovery_mark_peer_done(3, formation.local_epoch,
+										bitmap_hash);
+	for (dest = 1; dest < 4; dest++)
+		UT_ASSERT_EQ(ut_done_enqueue_count[dest], 3);
+
+	cluster_enabled = false;
+}
+
 UT_TEST(test_recovery_authority_postmaster_cannot_execute_blocking_barrier)
 {
 	ClusterFormationSnapshotV1 formation;
@@ -5119,7 +5235,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(97);
+	UT_PLAN(99);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -5214,6 +5330,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq);
 
 	/* spec-5.16 — online node-join GRD/PCM remaster (D7 unit suite). */
+	UT_RUN(test_recovery_idle_ignores_join_pending);
 	UT_RUN(test_jr_u1_recompute_moves_joiner_home);
 	UT_RUN(test_jr_u2_equivalence_with_failure_remaster);
 	UT_RUN(test_jr_u3_recompute_idempotent);
@@ -5241,6 +5358,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_authority_postmaster_cannot_execute_blocking_barrier);
 	UT_RUN(test_recovery_authority_lmon_tick_is_sole_blocking_executor);
 	UT_RUN(test_recovery_authority_initial_epoch_zero_is_valid);
+	UT_RUN(test_recovery_authority_done_echo_is_bounded_per_requester);
 	/* RF-ROOT P6 contract — same-composite re-post retains done slots;
 	 * composite-change re-post zeroes and requires fresh evidence. */
 	UT_RUN(test_recovery_authority_same_composite_repost_retains_done_slots);

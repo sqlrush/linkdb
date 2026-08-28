@@ -599,6 +599,9 @@ HandleCheckpointerInterrupts(void)
 	{
 #ifdef USE_PGRAC_CLUSTER
 		bool		clean_handoff_ok;
+		bool		wal_stopped_ok;
+		ClusterPhase1FullStopPrepareResult phase1_full_stop_prepare_result;
+		ClusterPhase1FullStopPlan phase1_full_stop_plan;
 #endif
 
 		/*
@@ -615,6 +618,17 @@ HandleCheckpointerInterrupts(void)
 		 * out pending statistic.
 		 */
 		PendingCheckpointerStats.requested_checkpoints++;
+#ifdef USE_PGRAC_CLUSTER
+		memset(&phase1_full_stop_plan, 0, sizeof(phase1_full_stop_plan));
+		phase1_full_stop_prepare_result
+			= cluster_clean_leave_phase1_full_stop_prepare_exact(
+				&phase1_full_stop_plan);
+		if (phase1_full_stop_prepare_result ==
+			CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED)
+			ereport(PANIC,
+					(errmsg("cluster clean-leave: phase-1 full-stop prepare "
+							"failed before the shutdown checkpoint")));
+#endif
 		ShutdownXLOG(0, 0);
 #ifdef USE_PGRAC_CLUSTER
 		/*
@@ -635,7 +649,7 @@ HandleCheckpointerInterrupts(void)
 		 * reaches STOPPED.  Checkpoint + STOPPED first keeps every
 		 * fence-gated write inside the still-valid pre-handoff authority.
 		 */
-		cluster_wal_state_publish_stopped();
+		wal_stopped_ok = cluster_wal_state_publish_stopped();
 
 		/*
 		 * RF-ROOT P6 contract 1 (serving rebind / authority transition):
@@ -651,10 +665,35 @@ HandleCheckpointerInterrupts(void)
 		 * is then skipped so the survivors treat this departure as an
 		 * ordinary death (no fake clean-leave).
 		 */
-		clean_handoff_ok = cluster_clean_leave_shutdown_drain();
+		if (phase1_full_stop_prepare_result ==
+			CLUSTER_PHASE1_FULL_STOP_READY) {
+			if (!wal_stopped_ok)
+				ereport(PANIC,
+						(errmsg("cluster clean-leave: phase-1 full-stop exact "
+								"WAL STOPPED publication failed")));
+			ereport(LOG,
+					(errmsg("cluster clean-leave: phase-1 full-stop exact "
+							"WAL STOPPED published")));
+			clean_handoff_ok
+				= cluster_clean_leave_phase1_full_stop_close_exact(
+					&phase1_full_stop_plan);
+			if (!clean_handoff_ok)
+				ereport(PANIC,
+						(errmsg("cluster clean-leave: phase-1 full-stop exact "
+								"post-STOPPED ACK barrier failed")));
+			ereport(LOG,
+					(errmsg("cluster clean-leave: phase-1 full-stop fresh-nonce "
+							"exact four-member ACK barrier complete")));
+			ereport(LOG,
+					(errmsg("cluster clean-leave: phase-1 full-stop exact "
+							"release/completion complete")));
+		} else {
+			Assert(phase1_full_stop_prepare_result ==
+				   CLUSTER_PHASE1_FULL_STOP_NOT_APPLICABLE);
+			clean_handoff_ok = cluster_clean_leave_shutdown_drain();
 
-		/*
-		 * RF-ROOT P6 (STOP-01 frozen THREAD_CLEAN_CLOSE, the Oracle
+			/*
+			 * RF-ROOT P6 (STOP-01 frozen THREAD_CLEAN_CLOSE, the Oracle
 		 * clean-close mainline):  with the shutdown checkpoint durable and
 		 * the STOPPED wal-state published, close this owner's own redo
 		 * thread (OPEN -> CLOSED, lineage unchanged).  Immediate / error
@@ -674,13 +713,14 @@ HandleCheckpointerInterrupts(void)
 		 * never blocking the shutdown, and never requiring a coordinator-
 		 * side repair.
 		 */
-		if (clean_handoff_ok)
-			(void)cluster_control_root_thread_clean_close_publish_retry();
-		else
-			ereport(LOG,
-					(errmsg("cluster clean-leave: shutdown handoff failed; "
-							"skipping THREAD_CLEAN_CLOSE so the survivors run "
-							"the ordinary fail-stop reconfiguration")));
+			if (clean_handoff_ok)
+				(void)cluster_control_root_thread_clean_close_publish_retry();
+			else
+				ereport(LOG,
+						(errmsg("cluster clean-leave: shutdown handoff failed; "
+								"skipping THREAD_CLEAN_CLOSE so the survivors run "
+								"the ordinary fail-stop reconfiguration")));
+		}
 #endif
 		pgstat_report_checkpointer();
 		pgstat_report_wal(true);

@@ -569,9 +569,15 @@ test_cluster_touched_peers: test_cluster_touched_peers.c unit_test.h $(CLUSTER_V
 CLUSTER_CLEAN_LEAVE_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_clean_leave_policy.o
 test_cluster_clean_leave: test_cluster_clean_leave.c unit_test.h $(CLUSTER_VERSION_O) \
 		$(CLUSTER_CLEAN_LEAVE_POLICY_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DCLEAN_LEAVE_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_clean_leave.c"' \
+		-DCHECKPOINTER_SOURCE_PATH='"$(top_srcdir)/src/backend/postmaster/checkpointer.c"' \
+		-DPOSTMASTER_SOURCE_PATH='"$(top_srcdir)/src/backend/postmaster/postmaster.c"' \
+		-DAUXPROCESS_SOURCE_PATH='"$(top_srcdir)/src/backend/postmaster/auxprocess.c"' \
+		-DPGSTAT_SOURCE_PATH='"$(top_srcdir)/src/backend/utils/activity/pgstat.c"' \
+		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CLEAN_LEAVE_POLICY_O) \
-		$(top_builddir)/src/port/libpgport_srv.a -o $@
+		$(top_builddir)/src/port/libpgport.a -o $@
 
 # spec-5.18 D18: test_cluster_node_remove links cluster_node_remove_policy.o (the
 # pure permanent-removal decision layer: phase-FSM transition validity, precheck

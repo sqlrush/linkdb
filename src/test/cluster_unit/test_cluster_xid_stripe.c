@@ -81,6 +81,36 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/* libpgport's runtime CRC chooser uses elog() for its self-test diagnostics.
+ * This standalone unit does not link the backend error subsystem, so provide
+ * the same inert logging surface used by the other CRC-backed unit binaries. */
+#undef errstart
+#undef errstart_cold
+#undef errfinish
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(),
+		  int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
 /* GUC / conf face consumed by cluster_xid_allocation_slot (cluster_guc.o
  * is not linked here; the gate is a pure function of these three). */
 bool cluster_enabled = false;

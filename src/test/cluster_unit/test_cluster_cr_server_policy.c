@@ -83,6 +83,19 @@ extern ClusterUndoVerdictKind cluster_cr_server_c0_zero_match_verdict(
 extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
 	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
 	bool authoritative);
+extern ClusterUndoVerdictResult cluster_cr_server_test_own_xid_pair_verdict(
+	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
+	SCN proposed_scn);
+extern bool cluster_cr_server_freshref_c1b_pair_request_decode(
+	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node,
+	int32 local_node, uint64 current_epoch, int max_backends,
+	uint32 *segment_id, TransactionId *xid, uint32 *expected_tt_slot_id,
+	SCN *proposed_scn);
+extern ClusterUndoVerdictKind cluster_cr_server_freshref_c1b_pair_verdict(
+	bool pair_request, bool xid_is_mine, uint32 expected_segment_id,
+	uint32 expected_tt_slot_id, bool no_raw_reuse_window, XidStatus raw_status,
+	ClusterTTDurableResolve resolve, uint16 matched_segment, uint16 matched_slot,
+	SCN resolved_scn, SCN proposed_scn, bool retention_ok, SCN horizon_scn);
 
 typedef enum C0TestEvent {
 	C0_EV_SCAN = 1,
@@ -103,6 +116,10 @@ typedef enum C0TestEvent {
 static C0TestEvent c0_events[32];
 static int c0_event_count;
 static ClusterTTDurableResolve c0_resolve;
+static SCN c0_resolved_scn;
+static SCN c0_horizon_scn;
+static uint16 c0_matched_segment;
+static uint16 c0_matched_slot;
 static bool c0_xid_is_mine;
 static uint64 c0_covered_hw;
 static bool c0_disabled;
@@ -158,6 +175,10 @@ c0_reset(void)
 	memset(c0_events, 0, sizeof(c0_events));
 	c0_event_count = 0;
 	c0_resolve = CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH;
+	c0_resolved_scn = InvalidScn;
+	c0_horizon_scn = (SCN)100;
+	c0_matched_segment = 0;
+	c0_matched_slot = 0;
 	c0_xid_is_mine = true;
 	c0_covered_hw = UINT64_C(816); /* armed-drain witness, NOT an xid bound */
 	c0_disabled = false;
@@ -190,11 +211,11 @@ cluster_tt_slot_durable_resolve_by_xid(TransactionId xid pg_attribute_unused(),
 {
 	c0_note(C0_EV_SCAN);
 	if (commit_scn != NULL)
-		*commit_scn = InvalidScn;
+		*commit_scn = c0_resolved_scn;
 	if (out_seg != NULL)
-		*out_seg = 0;
+		*out_seg = c0_matched_segment;
 	if (out_slot != NULL)
-		*out_slot = 0;
+		*out_slot = c0_matched_slot;
 	if (out_wrap != NULL)
 		*out_wrap = 0;
 	return c0_resolve;
@@ -249,6 +270,7 @@ TransactionIdGetStatus(TransactionId xid pg_attribute_unused(), XLogRecPtr *lsn)
 bool
 TransactionIdPrecedes(TransactionId id1, TransactionId id2)
 {
+	UT_ASSERT_EQ(c0_xact_lock_depth, 1);
 	return (int32)(id1 - id2) < 0;
 }
 
@@ -302,14 +324,14 @@ cluster_cr_retention_proof_origin_legs(SCN *out_horizon)
 	c0_retention_calls++;
 	c0_note(C0_EV_RETENTION);
 	if (out_horizon != NULL)
-		*out_horizon = c0_retention_ok ? (SCN)100 : InvalidScn;
+		*out_horizon = c0_retention_ok ? c0_horizon_scn : InvalidScn;
 	return c0_retention_ok;
 }
 
 SCN
 cluster_tt_slot_max_recycle_horizon(void)
 {
-	return c0_retention_ok ? (SCN)100 : InvalidScn;
+	return c0_retention_ok ? c0_horizon_scn : InvalidScn;
 }
 
 bool
@@ -646,6 +668,178 @@ UT_TEST(test_c0_zero_match_positive_proof_table)
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 }
 
+/* S8-815PRE-FRESHREF-C1B-01 RED: a retained page SCN becomes exact only when
+ * the pair discriminator, origin C1b, native no-reuse fence and either exact
+ * live TT binding or horizon-covered zero-match all agree.  It never returns
+ * COMMITTED_BOUND. */
+UT_TEST(test_freshref_c1b_pair_exact_truth_table)
+{
+	const SCN proposed = (SCN) 10498;
+
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 0, proposed, proposed,
+					  false, InvalidScn),
+				 (int) CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
+					  proposed, true, proposed),
+				 (int) CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+
+	/* Pair identity, no-reuse and literal origin CLOG are all mandatory. */
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  false, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
+					  proposed, true, proposed),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, false, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
+					  proposed, true, proposed),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_ABORTED,
+					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
+					  proposed, true, proposed),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+
+	/* Live match requires exact segment, 1-based slot and SCN. */
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RESOLVED_SCN, 8, 0, proposed, proposed,
+					  false, InvalidScn),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 1, proposed, proposed,
+					  false, InvalidScn),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 0, proposed + 1, proposed,
+					  false, InvalidScn),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+
+	/* Recycled zero-match requires retention and proposed <= frozen horizon. */
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
+					  proposed, false, proposed),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
+					  proposed, true, proposed - 1),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
+					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					  CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP, 0, 0, InvalidScn,
+					  proposed, true, proposed),
+				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+}
+
+UT_TEST(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b)
+{
+	ClusterUndoVerdictResult result;
+	const SCN proposed = (SCN)10498;
+
+	/* Recycled terminal: literal CLOG + retention horizon echo exact page SCN. */
+	c0_reset();
+	c0_retention_ok = true;
+	c0_horizon_scn = proposed + 2;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, proposed);
+	UT_ASSERT_EQ((int)result.kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((uint64)result.commit_scn, (uint64)proposed);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_retention_calls, 1);
+	UT_ASSERT_EQ(c0_did_commit_calls, 0);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK) < c0_event_pos(C0_EV_CLOG));
+	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_RETENTION));
+	UT_ASSERT(c0_event_pos(C0_EV_RETENTION) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
+
+	/* Still-bound terminal: exact segment/slot/scn plus the same raw CLOG fence. */
+	c0_reset();
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_resolved_scn = proposed;
+	c0_matched_segment = 7;
+	c0_matched_slot = 0;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, proposed);
+	UT_ASSERT_EQ((int)result.kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((uint64)result.commit_scn, (uint64)proposed);
+	UT_ASSERT_EQ(c0_retention_calls, 0);
+
+	/* A one-way reuse-disable race invalidates the whole pair before CLOG. */
+	c0_reset();
+	c0_retention_ok = true;
+	c0_horizon_scn = proposed;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	c0_disable_before_native_recheck = true;
+	result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, proposed);
+	UT_ASSERT_EQ((int)result.kind,
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 0);
+	UT_ASSERT_EQ(c0_retention_calls, 0);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+}
+
+UT_TEST(test_freshref_c1b_pair_request_canonical_decode)
+{
+	GcsBlockForwardPayload fwd;
+	uint32 segment = 0;
+	uint32 slot = 0;
+	TransactionId xid = InvalidTransactionId;
+	SCN proposed = InvalidScn;
+
+	memset(&fwd, 0, sizeof(fwd));
+	fwd.request_id = 77;
+	fwd.epoch = 11;
+	fwd.tag = GcsBlockUndoFreshRefC1bTagMake(7, (TransactionId)4195136, 1);
+	fwd.original_requester_node = 1;
+	fwd.requester_backend_id = 4;
+	fwd.master_node = 1;
+	fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)10498);
+	GcsBlockForwardPayloadSetUndoFreshRefC1bPairRequest(&fwd);
+
+	UT_ASSERT(cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 1, 0, 11, 8, &segment, &xid, &slot, &proposed));
+	UT_ASSERT_EQ(segment, 7);
+	UT_ASSERT_EQ(xid, (TransactionId)4195136);
+	UT_ASSERT_EQ(slot, 1);
+	UT_ASSERT_EQ((uint64)proposed, UINT64_C(10498));
+
+	/* Every transport/canonical identity axis independently fails closed. */
+	fwd.epoch = 12;
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	fwd.epoch = 11;
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 2, 0, 11, 8, NULL, NULL, NULL, NULL));
+	fwd.master_node = 2;
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	fwd.master_node = 1;
+	fwd.requester_backend_id = 9;
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	fwd.requester_backend_id = 4;
+	fwd.reserved_0[0] = 1;
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	fwd.reserved_0[0] = 0;
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, InvalidScn);
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)10498);
+	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, true);
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+}
+
 /*
  * Execute the real own-xid resolver at the exact formal zero-match shape.
  * retention=false makes both positive rows RED on 34b: the old branch never
@@ -882,7 +1076,7 @@ UT_TEST(test_r4_cr_build_inline_entry_is_denied_without_serve)
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(20);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -897,6 +1091,9 @@ main(void)
 	UT_RUN(test_resolved_scn_live_requires_every_exact_binding_gate);
 	UT_RUN(test_resolved_scn_explicit_abort_after_stamp_is_positive);
 	UT_RUN(test_c0_zero_match_positive_proof_table);
+	UT_RUN(test_freshref_c1b_pair_exact_truth_table);
+	UT_RUN(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b);
+	UT_RUN(test_freshref_c1b_pair_request_canonical_decode);
 	UT_RUN(test_c0_real_zero_match_abort_live_and_self_disable);
 	UT_RUN(test_undo_multi_verdict_inline_entry_is_denied_without_serve);
 	UT_RUN(test_r4_cr_build_inline_entry_is_denied_without_serve);

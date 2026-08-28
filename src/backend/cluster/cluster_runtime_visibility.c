@@ -1134,12 +1134,14 @@ cluster_undo_block_fetch_for_visibility(int origin_node, UBA uba, char *out_page
  */
 static bool
 rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-						 uint32 expected_tt_slot_id, SCN demand_scn, SCN read_scn,
+						 uint32 expected_tt_slot_id, uint32 ref_epoch,
+						 SCN freshref_pair_scn, SCN demand_scn, SCN read_scn,
 						 bool authoritative, bool *out_committed, bool *out_in_progress,
 						 SCN *out_commit_scn, bool *out_commit_scn_is_bound)
 {
 	ClusterGcsUndoVerdictPage verdict;
 	ClusterLiveAuthority auth;
+	bool freshref_pair = SCN_VALID(freshref_pair_scn);
 
 	/*
 	 * Q9: owner-as-master serve-gate precheck (coherent regime only).  A dead
@@ -1159,9 +1161,13 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 	}
 
 	cluster_rtvis_verdict_note_wire();
-	if (!cluster_gcs_block_undo_verdict_fetch_and_wait(
-			(int32)origin_node, undo_segment_id, expected_tt_slot_id, raw_xid,
-			authoritative, &verdict, &auth)) {
+	if (freshref_pair
+		? !cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
+			  (int32)origin_node, undo_segment_id, expected_tt_slot_id, raw_xid,
+			  ref_epoch, freshref_pair_scn, &verdict, &auth)
+		: !cluster_gcs_block_undo_verdict_fetch_and_wait(
+			  (int32)origin_node, undo_segment_id, expected_tt_slot_id, raw_xid,
+			  authoritative, &verdict, &auth)) {
 		cluster_rtvis_verdict_note_failclosed();
 		return false;
 	}
@@ -1172,9 +1178,17 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 	cluster_scn_observe((SCN)verdict.commit_scn);
 	cluster_scn_observe(auth.authority_scn);
 
-	if (!cluster_vis_live_authority_covers(demand_scn, auth)) {
+	if (!cluster_vis_live_authority_covers(
+			freshref_pair ? freshref_pair_scn : demand_scn, auth)) {
 		cluster_vis_bump_covers_scn_refuse_count(); /* spec-7.1a D6 */
 		cluster_vis53r97_note_covers_refuse();		/* spec-7.1 D0 census (union) */
+		cluster_rtvis_verdict_note_failclosed();
+		return false;
+	}
+	if (freshref_pair
+		&& (verdict.verdict
+				!= (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
+			|| verdict.commit_scn != freshref_pair_scn)) {
 		cluster_rtvis_verdict_note_failclosed();
 		return false;
 	}
@@ -1213,6 +1227,10 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 		return true;
 
 	case (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON:
+		if (freshref_pair) {
+			cluster_rtvis_verdict_note_failclosed();
+			return false;
+		}
 		/*
 		 * Requester leg (e) of the retention proof: the bound commit_scn <=
 		 * horizon decides against read_scn only when the horizon is not
@@ -1273,6 +1291,7 @@ rtvis_try_origin_verdict(int origin_node, uint32 undo_segment_id, TransactionId 
 static bool
 rtvis_try_resolve_remote_internal(int origin_node, uint32 undo_segment_id,
 								  uint32 expected_tt_slot_id, TransactionId raw_xid,
+								  uint32 ref_epoch, SCN freshref_pair_scn,
 								  SCN read_scn, bool authoritative, bool *out_committed,
 								  bool *out_in_progress, SCN *out_commit_scn,
 								  bool *out_commit_scn_is_bound)
@@ -1415,9 +1434,9 @@ rtvis_try_resolve_remote_internal(int origin_node, uint32 undo_segment_id,
 	 * complete own-TT verdict instead of failing closed outright.
 	 */
 	if (rtvis_try_origin_verdict(
-			origin_node, undo_segment_id, raw_xid, expected_tt_slot_id, demand_scn,
-			read_scn, authoritative, out_committed, out_in_progress, out_commit_scn,
-			out_commit_scn_is_bound)) {
+			origin_node, undo_segment_id, raw_xid, expected_tt_slot_id, ref_epoch,
+			freshref_pair_scn, demand_scn, read_scn, authoritative, out_committed,
+			out_in_progress, out_commit_scn, out_commit_scn_is_bound)) {
 		if (*out_in_progress) {
 			/* Non-terminal positive proof: do not fold it into either of the
 			 * terminal committed/aborted census buckets. */
@@ -1445,7 +1464,8 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
 	bool in_progress = false;
 
 	if (!rtvis_try_resolve_remote_internal(
-			origin_node, undo_segment_id, 0, raw_xid, read_scn, authoritative,
+			origin_node, undo_segment_id, 0, raw_xid, 0, InvalidScn,
+			read_scn, authoritative,
 			out_committed, &in_progress, out_commit_scn, out_commit_scn_is_bound))
 		return false;
 	if (in_progress) {
@@ -1558,9 +1578,11 @@ rtvis_authority_serve_block0(int origin_node, uint32 undo_segment_id, Transactio
  *	gate), not a consumer output; the self path carries it verbatim from the
  *	verdict page.
  */
-ClusterUndoVerdictResult
-cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-							 uint32 expected_tt_slot_id, SCN read_scn, bool authoritative)
+static ClusterUndoVerdictResult
+cluster_undo_verdict_resolve_internal(
+	int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
+	uint32 expected_tt_slot_id, SCN read_scn, bool authoritative,
+	TransactionId ref_xid, uint32 ref_epoch, SCN freshref_pair_scn)
 {
 	ClusterUndoVerdictResult unknown
 		= { .kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, .commit_scn = InvalidScn, .wrap = 0 };
@@ -1568,10 +1590,18 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 	bool in_progress = false;
 	bool is_bound = false;
 	SCN commit_scn = InvalidScn;
+	bool freshref_pair = SCN_VALID(freshref_pair_scn);
 
 	if (!cluster_crossnode_runtime_visibility)
 		return unknown;
 	if (!TransactionIdIsNormal(raw_xid) || origin_node < 0)
+		return unknown;
+	if (freshref_pair
+		&& (!authoritative
+			|| !cluster_vis_freshref_c1b_pair_request_eligible(
+				raw_xid, ref_xid, true, freshref_pair_scn, ref_epoch,
+				cluster_epoch_get_current(), origin_node, cluster_node_id,
+				undo_segment_id, expected_tt_slot_id)))
 		return unknown;
 
 	/*
@@ -1584,8 +1614,11 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 		return unknown;
 
 	/* master==self: own CLOG + own durable TT authority (Q5/D3-4). */
-	if (origin_node == cluster_node_id)
+	if (origin_node == cluster_node_id) {
+		if (freshref_pair)
+			return unknown;
 		return rtvis_resolve_own_xid(raw_xid, read_scn);
+	}
 
 	/*
 	 * D4-4 precision chain (spec-5.22d §2.4): under the armed data plane,
@@ -1603,10 +1636,15 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 		route = cluster_undo_serve_authority(&rid, cluster_epoch_get_current());
 		switch (cluster_undo_authority_serve_decide(&route, cluster_node_id)) {
 		case CLUSTER_UNDO_AUTHORITY_SERVE_SELF_BLOCK0:
+			if (freshref_pair)
+				return unknown;
 			/* self IS the elected authority for the dead owner */
 			return rtvis_authority_serve_block0(origin_node, undo_segment_id, raw_xid, &route);
 		case CLUSTER_UNDO_AUTHORITY_SERVE_PEER_BLOCK0: {
 			ClusterUndoVerdictResult r;
+
+			if (freshref_pair)
+				return unknown;
 
 			/*
 			 * D4-6: a PEER is the elected authority — kind-4 wire serve.
@@ -1651,8 +1689,9 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 	/* master!=self, owner live (or data plane unarmed): CP3 S-grant + CP5
 	 * origin verdict, byte-for-byte the pre-D4 path. */
 	if (rtvis_try_resolve_remote_internal(
-			origin_node, undo_segment_id, expected_tt_slot_id, raw_xid, read_scn,
-			authoritative, &committed, &in_progress, &commit_scn, &is_bound)) {
+			origin_node, undo_segment_id, expected_tt_slot_id, raw_xid,
+			ref_epoch, freshref_pair_scn, read_scn, authoritative, &committed,
+			&in_progress, &commit_scn, &is_bound)) {
 		if (in_progress) {
 			ClusterUndoVerdictResult live
 				= { .kind = CLUSTER_UNDO_VERDICT_IN_PROGRESS,
@@ -1664,6 +1703,27 @@ cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id, Transactio
 		return cluster_undo_verdict_from_resolve(true, committed, commit_scn, is_bound);
 	}
 	return unknown;
+}
+
+ClusterUndoVerdictResult
+cluster_undo_verdict_resolve(int origin_node, uint32 undo_segment_id,
+							 TransactionId raw_xid, uint32 expected_tt_slot_id,
+							 SCN read_scn, bool authoritative)
+{
+	return cluster_undo_verdict_resolve_internal(
+		origin_node, undo_segment_id, raw_xid, expected_tt_slot_id, read_scn,
+		authoritative, InvalidTransactionId, 0, InvalidScn);
+}
+
+ClusterUndoVerdictResult
+cluster_undo_verdict_resolve_freshref_c1b_pair(
+	int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
+	TransactionId ref_xid, uint32 expected_tt_slot_id, uint32 ref_epoch,
+	SCN cached_commit_scn, SCN read_scn)
+{
+	return cluster_undo_verdict_resolve_internal(
+		origin_node, undo_segment_id, raw_xid, expected_tt_slot_id, read_scn,
+		true, ref_xid, ref_epoch, cached_commit_scn);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

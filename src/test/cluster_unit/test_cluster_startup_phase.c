@@ -71,6 +71,39 @@
 
 #include "unit_test.h"
 
+#define STARTUP_PHASE_SOURCE_PATH "../../backend/cluster/cluster_startup_phase.c"
+
+static char *
+read_startup_phase_source(void)
+{
+	FILE *file;
+	char *source;
+	long length;
+
+	file = fopen(STARTUP_PHASE_SOURCE_PATH, "rb");
+	if (file == NULL)
+		return NULL;
+	if (fseek(file, 0, SEEK_END) != 0
+		|| (length = ftell(file)) < 0
+		|| fseek(file, 0, SEEK_SET) != 0) {
+		fclose(file);
+		return NULL;
+	}
+	source = malloc((size_t)length + 1);
+	if (source == NULL) {
+		fclose(file);
+		return NULL;
+	}
+	if (fread(source, 1, (size_t)length, file) != (size_t)length) {
+		free(source);
+		fclose(file);
+		return NULL;
+	}
+	source[length] = '\0';
+	fclose(file);
+	return source;
+}
+
 
 /* ----------
  * Stubs needed to link cluster_startup_phase.o standalone.  None of
@@ -341,15 +374,26 @@ static bool phase_test_grd_authority_ok = true;
 static bool phase_test_lms_recovery_ready_ok = true;
 static uint64 phase_test_lms_generation = 7;
 static int phase_test_lms_start_calls = 0;
+static int phase_test_lms_pid = 0;
 static uint8 phase_test_formation_epoch = 1;
 static bool phase_test_expire_formation_during_lms = false;
 static bool phase_test_formation_expired = false;
 static int phase_test_live_formation_calls = 0;
 static int phase_test_recovery_control_formation_calls = 0;
 static bool phase_test_live_refreshes_classification = false;
+static bool phase_test_cf_peer_verified = false;
+static bool phase_test_epoch0_late_founder_evidence = false;
+static bool phase_test_late_founder_after_grd_barrier = false;
+static bool phase_test_publish_recovery_after_grd_barrier = false;
+static bool phase_test_drift_lms_generation_after_grd_barrier = false;
+static int phase_test_grd_barrier_calls = 0;
+static int phase_test_join_readonly_handoff_calls = 0;
+static uint64 phase_test_join_readonly_handoff_incarnation = 0;
 /* RF-ROOT P6 (L4/L5 wiring): steady-state defaults for the membership /
  * reconfig / GRD accessor stubs added below. */
 static bool phase_test_membership_member = true;
+static ClusterMembershipState phase_test_nonmember_state
+	= CLUSTER_MEMBER_JOINING;
 static bool phase_test_self_join_admitted = false;
 static uint64 phase_test_episode_epoch = 0;
 static bool phase_test_join_remaster = false;
@@ -613,7 +657,21 @@ cluster_grd_recovery_authority_barrier_wait(
 	uint64 boot_incarnation, uint64 lms_generation,
 	int timeout_ms pg_attribute_unused())
 {
+	bool saved_grd_authority_ok;
+
 	record_phase4_event('G');
+	phase_test_grd_barrier_calls++;
+	if (phase_test_late_founder_after_grd_barrier)
+		phase_test_epoch0_late_founder_evidence = true;
+	if (phase_test_publish_recovery_after_grd_barrier) {
+		saved_grd_authority_ok = phase_test_grd_authority_ok;
+		phase_test_grd_authority_ok = true;
+		UT_ASSERT(cluster_authority_readiness_publish_recovery(
+			lms_generation));
+		phase_test_grd_authority_ok = saved_grd_authority_ok;
+	}
+	if (phase_test_drift_lms_generation_after_grd_barrier)
+		phase_test_lms_generation++;
 	return phase_test_grd_authority_ok && boot_incarnation == 11
 		&& lms_generation == phase_test_lms_generation;
 }
@@ -660,10 +718,35 @@ cluster_membership_is_member(int32 node_id pg_attribute_unused())
 	return phase_test_membership_member;
 }
 
+ClusterMembershipState
+cluster_membership_get_state(int32 node_id pg_attribute_unused())
+{
+	return phase_test_membership_member
+		? CLUSTER_MEMBER_MEMBER : phase_test_nonmember_state;
+}
+
 bool
 cluster_reconfig_self_join_admitted(void)
 {
 	return phase_test_self_join_admitted;
+}
+
+bool
+cluster_reconfig_epoch0_late_founder_evidence_current(void)
+{
+	return phase_test_epoch0_late_founder_evidence;
+}
+
+bool
+cluster_reconfig_stage_pre_publish_join_handoff(
+	uint64 expected_self_incarnation)
+{
+	phase_test_join_readonly_handoff_calls++;
+	phase_test_join_readonly_handoff_incarnation
+		= expected_self_incarnation;
+	phase_test_membership_member = false;
+	phase_test_nonmember_state = CLUSTER_MEMBER_JOINING;
+	return expected_self_incarnation == 11;
 }
 
 uint64
@@ -688,6 +771,12 @@ cluster_cf_phase2_verify_or_fail(const char *datadir pg_attribute_unused())
 }
 
 bool
+cluster_cf_phase2_peer_verified(void)
+{
+	return phase_test_cf_peer_verified;
+}
+
+bool
 cluster_control_root_thread_open_publish(uint64 boot_incarnation pg_attribute_unused())
 {
 	return false;
@@ -704,8 +793,14 @@ int
 cluster_lms_start(void)
 {
 	phase_test_lms_start_calls++;
+	phase_test_lms_pid = 14;
 	record_phase4_event('L');
-	return 14;
+	return phase_test_lms_pid;
+}
+pid_t
+cluster_lms_get_pid(void)
+{
+	return phase_test_lms_pid;
 }
 bool
 cluster_lms_wait_for_recovery_ready(int timeout_ms pg_attribute_unused())
@@ -775,12 +870,23 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_lms_recovery_ready_ok = true;
 	phase_test_lms_generation = 7;
 	phase_test_lms_start_calls = 0;
+	phase_test_lms_pid = 0;
 	phase_test_formation_epoch = 1;
 	phase_test_expire_formation_during_lms = false;
 	phase_test_formation_expired = false;
 	phase_test_live_formation_calls = 0;
 	phase_test_recovery_control_formation_calls = 0;
 	phase_test_live_refreshes_classification = false;
+	phase_test_cf_peer_verified = false;
+	phase_test_epoch0_late_founder_evidence = false;
+	phase_test_late_founder_after_grd_barrier = false;
+	phase_test_publish_recovery_after_grd_barrier = false;
+	phase_test_drift_lms_generation_after_grd_barrier = false;
+	phase_test_grd_barrier_calls = 0;
+	phase_test_join_readonly_handoff_calls = 0;
+	phase_test_join_readonly_handoff_incarnation = 0;
+	phase_test_membership_member = true;
+	phase_test_nonmember_state = CLUSTER_MEMBER_JOINING;
 	phase_test_self_join_admitted = true;
 	cluster_enabled = true;
 	cluster_wal_threads_dir = formed_registry ? "/rf-a1/formed" : NULL;
@@ -1004,6 +1110,239 @@ UT_TEST(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn)
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
 				 (int)CLUSTER_AUTHORITY_SERVING_READY);
 	UT_ASSERT(cluster_serving_ready_is_current());
+}
+
+UT_TEST(test_phase3_join_readonly_defers_authority_until_post_startup_admission)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	phase_test_membership_member = false;
+	phase_test_self_join_admitted = false;
+	phase_test_epoch0_late_founder_evidence = true;
+
+	/* A peer-attaching node may finish StartupXLOG under the existing
+	 * JOIN_READONLY contract, but it must not create recovery or serving
+	 * authority before its exact post-recovery admission. */
+	cluster_run_startup_sequence();
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqV");
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 0);
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 0);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
+
+	/* StartupXLOG has returned.  The unchanged stripe/JOIN-WAL/JCMK path now
+	 * admits this boot; only then may the same phase-3 recovery state machine
+	 * complete before phase 4 publishes ordinary serving. */
+	phase4_test_now = (TimestampTz)(cluster_phase3_timeout + 60)
+					  * INT64CONST(1000000);
+	phase_test_membership_member = true;
+	phase_test_self_join_admitted = true;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_phase4_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(!caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrGDdFXWlEESs");
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_SERVING_READY);
+}
+
+/* A transient bootstrap HOLD may expose JOINING before any peer from the
+ * current boot has published WAL ACTIVE.  JOINING is not late-founder
+ * evidence: without the exact same-boot peer proof phase 3 must retain the
+ * recovery-control owner and establish GRD authority normally. */
+UT_TEST(test_phase3_joining_without_exact_peer_active_stays_recovery_control)
+{
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	phase_test_membership_member = false;
+	phase_test_self_join_admitted = false;
+	phase_test_epoch0_late_founder_evidence = false;
+
+	cluster_run_startup_sequence();
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrG");
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
+	UT_ASSERT_EQ(phase_test_grd_barrier_calls, 1);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_RECOVERY_READY);
+}
+
+UT_TEST(test_phase3_epoch0_late_founder_defers_only_with_exact_current_evidence)
+{
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	/* AD-023 control membership is not service admission.  The approved
+	 * epoch-0 late-founder edge may use it only together with the new exact
+	 * current peer evidence, and only to finish StartupXLOG read-only. */
+	phase_test_membership_member = true;
+	phase_test_self_join_admitted = false;
+	phase_test_epoch0_late_founder_evidence = true;
+
+	cluster_run_startup_sequence();
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqV");
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 0);
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 0);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
+
+	/* Missing exact epoch-0 peer evidence preserves the existing recovery-
+	 * control path; CFP2 alone is never admission or a stripe owner. */
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	phase_test_membership_member = true;
+	phase_test_self_join_admitted = false;
+	phase_test_epoch0_late_founder_evidence = false;
+	cluster_run_startup_sequence();
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrG");
+}
+
+/* A founder can select recovery-control before the first same-boot peer has
+ * published WAL ACTIVE.  If its GRD barrier is still pre-publish and the exact
+ * late-founder evidence arrives after that failed attempt, the approved pivot
+ * clears the matching STARTING binding once and finishes StartupXLOG as
+ * JOIN_READONLY.  The already-running, authority-free LMS is reused only after
+ * ordinary stripe/JCMK admission; neither deadline nor worker is duplicated. */
+UT_TEST(test_phase3_pre_published_recovery_pivots_once_to_join_readonly)
+{
+	bool caught_fatal = false;
+	int saved_phase3_timeout = cluster_phase3_timeout;
+
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	phase_test_membership_member = true;
+	phase_test_self_join_admitted = false;
+	phase_test_grd_authority_ok = false;
+	phase_test_late_founder_after_grd_barrier = true;
+	cluster_phase3_timeout = 1;
+
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	cluster_phase3_timeout = saved_phase3_timeout;
+
+	UT_ASSERT(!caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqVFXLrG");
+	UT_ASSERT_EQ(phase_test_grd_barrier_calls, 1);
+	UT_ASSERT_EQ(phase_test_join_readonly_handoff_calls, 1);
+	UT_ASSERT_EQ(phase_test_join_readonly_handoff_incarnation, 11);
+	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
+
+	/* The pivot owns no admission.  Only the existing terminal ordinary join
+	 * permits Phase 4 to rebuild authority, reusing the same idle LMS. */
+	phase_test_membership_member = true;
+	phase_test_self_join_admitted = true;
+	phase_test_grd_authority_ok = true;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_phase4_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(!caught_fatal);
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_SERVING_READY);
+}
+
+/* The handoff owns only the exact reversible STARTING generation captured by
+ * phase 3.  A concurrently published RECOVERY_READY binding or a changed LMS
+ * generation is not this caller's transition and must never reach JOINING. */
+UT_TEST(test_phase3_pivot_rejects_published_or_generation_drift)
+{
+	bool caught_fatal = false;
+	int saved_phase3_timeout = cluster_phase3_timeout;
+
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	phase_test_membership_member = true;
+	phase_test_self_join_admitted = false;
+	phase_test_grd_authority_ok = false;
+	phase_test_late_founder_after_grd_barrier = true;
+	phase_test_publish_recovery_after_grd_barrier = true;
+	cluster_phase3_timeout = 1;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_EQ(phase_test_join_readonly_handoff_calls, 0);
+
+	caught_fatal = false;
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	phase_test_membership_member = true;
+	phase_test_self_join_admitted = false;
+	phase_test_grd_authority_ok = false;
+	phase_test_late_founder_after_grd_barrier = true;
+	phase_test_drift_lms_generation_after_grd_barrier = true;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_startup_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	cluster_phase3_timeout = saved_phase3_timeout;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_EQ(phase_test_join_readonly_handoff_calls, 0);
+}
+
+UT_TEST(test_phase3_join_readonly_obeys_existing_join_failure_terminal)
+{
+	bool caught_fatal = false;
+
+	reset_phase_service_fixture(true);
+	cluster_allow_single_node = false;
+	cluster_voting_disks = "disk1,disk2,disk3";
+	phase_test_cf_peer_verified = true;
+	phase_test_membership_member = false;
+	phase_test_self_join_admitted = false;
+	phase_test_epoch0_late_founder_evidence = true;
+	cluster_run_startup_sequence();
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqV");
+
+	/* LMON owns admission failure through its frozen stripe/JCMK deadline.
+	 * The postmaster observes that terminal and must not create another timer
+	 * or any recovery/serving authority. */
+	phase_test_nonmember_state = CLUSTER_MEMBER_REJECTED;
+	phase4_capture_fatal = true;
+	if (setjmp(phase4_fatal_jump) == 0)
+		cluster_run_phase4_sequence();
+	else
+		caught_fatal = true;
+	phase4_capture_fatal = false;
+	UT_ASSERT(caught_fatal);
+	UT_ASSERT_STR_EQ(phase4_events, "CcQqV");
+	UT_ASSERT_EQ(phase_test_lms_start_calls, 0);
+	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
+				 (int)CLUSTER_AUTHORITY_OFF);
 }
 
 UT_TEST(test_rf_a1_phase4_waits_for_stripe_admission_before_serving)
@@ -1436,6 +1775,42 @@ UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
 }
 
 
+/* The post-admission JOIN_READONLY rebuild owns one exact LMS generation
+ * bind per loop iteration.  A duplicate conditional lock transaction can
+ * observe an unrelated contender between identical calls and spuriously
+ * discard an already-bound STARTING tuple. */
+UT_TEST(test_join_readonly_rebuild_binds_generation_once_per_iteration)
+{
+	const char *function_end;
+	const char *function_start;
+	const char *match;
+	const char *needle
+		= "cluster_authority_readiness_bind_recovery_generation(";
+	char *source = read_startup_phase_source();
+	int count = 0;
+
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL)
+		return;
+	function_start = strstr(source,
+		"\ncluster_phase4_establish_join_readonly_authority(");
+	function_end = function_start == NULL ? NULL
+		: strstr(function_start, "\n\n/*\n * cluster_phase_remaining_budget_ms");
+	UT_ASSERT_NOT_NULL(function_start);
+	UT_ASSERT_NOT_NULL(function_end);
+	if (function_start != NULL && function_end != NULL) {
+		match = function_start;
+		while ((match = strstr(match, needle)) != NULL
+			&& match < function_end) {
+			count++;
+			match += strlen(needle);
+		}
+	}
+	UT_ASSERT_EQ(count, 1);
+	free(source);
+}
+
+
 /* ============================================================
  * Test runner
  * ============================================================ */
@@ -1443,7 +1818,7 @@ UT_TEST(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster)
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(34);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -1454,6 +1829,12 @@ main(void)
 	UT_RUN(test_phase_shmem_register_init_linkable);
 	UT_RUN(test_rf_a1_no_pgproc_phase_reads_never_block);
 	UT_RUN(test_rf_a1_phase3_establishes_formation_and_phase4_does_not_respawn);
+	UT_RUN(test_phase3_join_readonly_defers_authority_until_post_startup_admission);
+	UT_RUN(test_phase3_joining_without_exact_peer_active_stays_recovery_control);
+	UT_RUN(test_phase3_epoch0_late_founder_defers_only_with_exact_current_evidence);
+	UT_RUN(test_phase3_pre_published_recovery_pivots_once_to_join_readonly);
+	UT_RUN(test_phase3_pivot_rejects_published_or_generation_drift);
+	UT_RUN(test_phase3_join_readonly_obeys_existing_join_failure_terminal);
 	UT_RUN(test_rf_a1_phase4_waits_for_stripe_admission_before_serving);
 	UT_RUN(test_rf_a1_phase4_refreshes_expired_recovery_proof_before_serving);
 	UT_RUN(test_rf_a2_serving_does_not_consume_recovery_duty_cache);
@@ -1471,6 +1852,7 @@ main(void)
 	UT_RUN(test_rf_a1_phase3_snapshot_contention_expires_fail_closed);
 	UT_RUN(test_rf_a1_cluster_disabled_keeps_phase3_and_phase4_empty);
 	UT_RUN(test_rf_a1_phase4_refuses_lost_prestartup_service_without_respawn);
+	UT_RUN(test_join_readonly_rebuild_binds_generation_once_per_iteration);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

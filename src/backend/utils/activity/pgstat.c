@@ -227,6 +227,16 @@ static dlist_head pgStatPending = DLIST_STATIC_INIT(pgStatPending);
  */
 static bool pgStatForceNextFlush = false;
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC's phase-1 full-cluster stop keeps cluster auxiliaries alive until
+ * after the checkpointer has closed the server-wide statistics epoch.  This
+ * is process-local: it never reopens shared statistics or creates a second
+ * shutdown authority.
+ */
+static bool pgstat_server_shutdown_follower = false;
+#endif
+
 /*
  * Force-clear existing snapshot before next use when stats_fetch_consistency
  * is changed.
@@ -508,6 +518,34 @@ pgstat_shutdown_hook(int code, Datum arg)
 	Assert(!pgstat_is_shutdown);
 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
 
+#ifdef USE_PGRAC_CLUSTER
+	if (pgstat_server_shutdown_follower)
+	{
+		Assert(pgStatLocal.shmem->is_shutdown);
+		Assert(!OidIsValid(MyDatabaseId));
+
+		/*
+		 * The checkpointer has already written the final statistics file, so
+		 * this auxiliary's process-local deltas can no longer be published.
+		 * Drop only those local pending objects, then release the ordinary
+		 * shared references.  Fixed IO/SLRU/WAL deltas die with the process.
+		 */
+		while (!dlist_is_empty(&pgStatPending))
+		{
+			dlist_node *node = dlist_head_node(&pgStatPending);
+			PgStat_EntryRef *entry_ref =
+				dlist_container(PgStat_EntryRef, pending_node, node);
+
+			pgstat_delete_pending_entry(entry_ref);
+		}
+		pgstat_detach_shmem();
+#ifdef USE_ASSERT_CHECKING
+		pgstat_is_shutdown = true;
+#endif
+		return;
+	}
+#endif
+
 	/*
 	 * If we got as far as discovering our own database ID, we can flush out
 	 * what we did so far.  Otherwise, we'd be reporting an invalid database
@@ -529,6 +567,23 @@ pgstat_shutdown_hook(int code, Datum arg)
 	pgstat_is_shutdown = true;
 #endif
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * Called from the existing auxiliary-process before_shmem_exit callback.
+ * Only PGRAC cluster auxiliaries may become followers, and only after the
+ * checkpointer has irreversibly closed the shared statistics epoch.
+ */
+void
+pgstat_prepare_for_server_shutdown_follower(void)
+{
+	Assert(MyAuxProcType >= LmonProcess &&
+		   MyAuxProcType < NUM_AUXPROCTYPES);
+
+	if (pgStatLocal.shmem->is_shutdown)
+		pgstat_server_shutdown_follower = true;
+}
+#endif
 
 /*
  * Initialize pgstats state, and set up our on-proc-exit hook. Called from

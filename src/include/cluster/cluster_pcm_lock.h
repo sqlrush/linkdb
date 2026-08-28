@@ -371,7 +371,8 @@ typedef enum ResourceXBootstrapRoundAction {
 	RESOURCE_X_BOOTSTRAP_ROUND_WAIT,
 	RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT,
 	RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL,
-	RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
+	RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED,
+	RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE
 } ResourceXBootstrapRoundAction;
 
 /* D1 read-only projection of the existing requester round.  It deliberately
@@ -1376,6 +1377,7 @@ typedef struct ResourceXSourceSettlementPlan {
 	uint64 assertion_sequence;
 	uint64 pair_base_authority_generation;
 	uint64 pair_image_authority_generation;
+	uint64 settlement_authority_generation;
 	uint64 source_generation;
 	uint64 carrier_generation;
 	uint64 terminal_cached_generation;

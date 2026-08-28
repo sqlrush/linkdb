@@ -25,6 +25,36 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+/* libpgport's ARM CRC runtime chooser reports self-test diagnostics through
+ * elog().  Keep this standalone codec unit independent of the backend error
+ * subsystem with an inert logging surface. */
+#undef errstart
+#undef errstart_cold
+#undef errfinish
+bool
+errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+bool
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(),
+		  int lineno pg_attribute_unused(),
+		  const char *funcname pg_attribute_unused())
+{}
+
 #include <stdio.h>
 
 static int failures = 0;

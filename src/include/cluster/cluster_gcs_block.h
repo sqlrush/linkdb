@@ -2724,22 +2724,42 @@ GcsBlockForwardPayloadSetDirectLandFromRequest(GcsBlockForwardPayload *fwd,
  * 5=authoritative single verdict (moved off the multi value).  Multi keeps its
  * shipped value 3; only this unshipped-on-main sub-kind moves.
  */
+#define GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR ((uint8)10)
+
+StaticAssertDecl(GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR
+					 > GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE,
+				 "fresh-ref C1b pair kind must not collide with kinds 1..9");
+
 static inline void
 GcsBlockForwardPayloadSetUndoVerdictRequest(GcsBlockForwardPayload *p, bool authoritative)
 {
 	p->reserved_0[6] = authoritative ? (uint8)5 : (uint8)2;
 }
 
+static inline void
+GcsBlockForwardPayloadSetUndoFreshRefC1bPairRequest(GcsBlockForwardPayload *p)
+{
+	p->reserved_0[6] = GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR;
+}
+
+static inline bool
+GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(const GcsBlockForwardPayload *p)
+{
+	return p->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR;
+}
+
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictRequest(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)2 || p->reserved_0[6] == (uint8)5;
+	return p->reserved_0[6] == (uint8)2 || p->reserved_0[6] == (uint8)5
+		   || GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(p);
 }
 
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictAuthoritative(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)5;
+	return p->reserved_0[6] == (uint8)5
+		   || GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(p);
 }
 
 /* PGRAC: spec-5.22d D4-6 — reserved_0[6] VALUE 4 = dead-owner AUTHORITY
@@ -2873,6 +2893,40 @@ GcsBlockUndoAuthorityFetchTagDecodeOwner(BufferTag tag, int32 *owner_node)
 		return false; /* owner absent: an owner-served-kind tag */
 	if (owner_node != NULL)
 		*owner_node = (int32)tag.relNumber - 1;
+	return true;
+}
+
+/* S8-815PRE-FRESHREF-C1B-01: kind-10-only exact pairing tag.  The ordinary
+ * owner-served kinds require relNumber == 0; kind 10 instead binds the raw xid
+ * there while dbOid and blockNum retain the exact segment and 1-based TT slot.
+ * The discriminator is validated separately before this decoder is called. */
+static inline BufferTag
+GcsBlockUndoFreshRefC1bTagMake(uint32 segment_id, TransactionId xid,
+									 uint32 expected_tt_slot_id)
+{
+	BufferTag tag = GcsBlockUndoFetchTagMake(segment_id, expected_tt_slot_id);
+
+	tag.relNumber = (RelFileNumber)xid;
+	return tag;
+}
+
+static inline bool
+GcsBlockUndoFreshRefC1bTagDecode(BufferTag tag, uint32 *segment_id,
+									TransactionId *xid, uint32 *expected_tt_slot_id)
+{
+	TransactionId decoded_xid = (TransactionId)tag.relNumber;
+
+	if (tag.spcOid != GCS_BLOCK_UNDO_FETCH_TAG_MAGIC || tag.forkNum != MAIN_FORKNUM
+		|| tag.dbOid == (Oid)0 || (uint64)tag.dbOid > (uint64)UINT16_MAX
+		|| !TransactionIdIsNormal(decoded_xid) || (RelFileNumber)decoded_xid != tag.relNumber
+		|| tag.blockNum < 1 || tag.blockNum > TT_SLOTS_PER_SEGMENT)
+		return false;
+	if (segment_id != NULL)
+		*segment_id = (uint32)tag.dbOid;
+	if (xid != NULL)
+		*xid = decoded_xid;
+	if (expected_tt_slot_id != NULL)
+		*expected_tt_slot_id = (uint32)tag.blockNum;
 	return true;
 }
 

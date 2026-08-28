@@ -802,7 +802,7 @@ UT_TEST(test_a1_w3_publish_stopped_uses_verified_cf_rmw)
 
 	fixture_reset();
 	memcpy(&before, virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4), sizeof(before));
-	cluster_wal_state_publish_stopped();
+	UT_ASSERT(cluster_wal_state_publish_stopped());
 
 	UT_ASSERT_EQ(event_count, (int)lengthof(expected_events));
 	for (i = 0; i < lengthof(expected_events); i++)
@@ -829,7 +829,7 @@ UT_TEST(test_a1_w3_publish_stopped_is_idempotent)
 	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
 	slot->state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	slot->crc = cluster_wal_state_block_crc(slot);
-	cluster_wal_state_publish_stopped();
+	UT_ASSERT(cluster_wal_state_publish_stopped());
 
 	UT_ASSERT_EQ(stub_cf_lock_count, 1);
 	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
@@ -847,7 +847,7 @@ UT_TEST(test_a1_w3_publish_stopped_cf_failure_preserves_active)
 	fixture_reset();
 	memcpy(&before, virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4), sizeof(before));
 	stub_cf_lock_ok = false;
-	cluster_wal_state_publish_stopped();
+	UT_ASSERT(!cluster_wal_state_publish_stopped());
 
 	UT_ASSERT_EQ(stub_cf_lock_count, 1);
 	UT_ASSERT_EQ(stub_cf_unlock_count, 0);

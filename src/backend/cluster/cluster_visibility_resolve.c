@@ -702,10 +702,24 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			 * internally (cluster_runtime_visibility.c:424/427/444/446/449), so
 			 * the dedicated fresh-ref counter is the ONLY extra bump here -- an
 			 * explicit rtvis_resolve_note here would double-count. */
-			ClusterUndoVerdictResult v = cluster_undo_verdict_resolve(
-				(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid,
-				(uint32)ref->tt_slot_id, read_scn,
-				true /* fresh ref: physical-binding authority */);
+			bool freshref_pair = cluster_vis_freshref_c1b_pair_request_eligible(
+				raw_xid, ref->local_xid, ref->has_cached_status,
+				ref->cached_commit_scn, ref->cluster_epoch,
+				cluster_epoch_get_current(), (int32)ref->origin_node_id,
+				cluster_node_id, (uint32)ref->undo_segment_id,
+				(uint32)ref->tt_slot_id);
+			ClusterUndoVerdictResult v
+				= freshref_pair
+					  ? cluster_undo_verdict_resolve_freshref_c1b_pair(
+							(int)ref->origin_node_id,
+							(uint32)ref->undo_segment_id, raw_xid,
+							ref->local_xid, (uint32)ref->tt_slot_id,
+							ref->cluster_epoch, ref->cached_commit_scn, read_scn)
+					  : cluster_undo_verdict_resolve(
+							(int)ref->origin_node_id,
+							(uint32)ref->undo_segment_id, raw_xid,
+							(uint32)ref->tt_slot_id, read_scn,
+							true /* fresh ref: physical-binding authority */);
 
 			if (cluster_vis_from_undo_verdict(v, out)) {
 				cluster_vis_freshref_verdict_note_resolved();

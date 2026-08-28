@@ -281,6 +281,7 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 								  ClusterSemanticAdmissionToken *token);
 extern ResourceXWriterPath
 cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out);
+extern bool cluster_semantic_activation_phase1_pristine(void);
 extern bool cluster_semantic_activation_r11_cutover_snapshot(
 	ClusterSemanticR11CutoverSnapshot *out);
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);

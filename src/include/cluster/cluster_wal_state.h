@@ -514,9 +514,10 @@ cluster_wal_state_slot_verify_postread(const ClusterWalStateSlot *expected_after
  * when the registry is usable. */
 extern bool cluster_wal_state_ensure(void);
 
-/* Startup ACTIVE is FATAL on failure; clean-shutdown STOPPED only warns. */
+/* Startup ACTIVE is FATAL on failure; clean-shutdown STOPPED warns and returns
+ * whether the exact STOPPED after-image is durable. */
 extern void cluster_wal_state_publish_active(void);
-extern void cluster_wal_state_publish_stopped(void);
+extern bool cluster_wal_state_publish_stopped(void);
 
 /* spec-4.5 owner writes (read-modify-preserve the extension region):
  * publish this thread's checkpoint redo start after a checkpoint is

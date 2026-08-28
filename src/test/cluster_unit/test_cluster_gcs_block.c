@@ -1039,6 +1039,52 @@ UT_TEST(test_forward_payload_undo_verdict_kinds_no_collision)
 }
 
 
+/* S8-815PRE-FRESHREF-C1B-01 RED: the approved exact fresh-ref + origin C1b
+ * pairing uses the collision-censused reserved_0[6] value 10.  It is an
+ * owner-served authoritative single verdict, never a legacy fetch, MULTI
+ * verdict, or dead-owner authority request. */
+UT_TEST(test_forward_payload_freshref_c1b_pair_kind10_routes_as_single_verdict)
+{
+	GcsBlockForwardPayload fwd;
+
+	memset(&fwd, 0, sizeof(fwd));
+	fwd.reserved_0[6] = (uint8) 10;
+
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictRequest(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoVerdictAuthoritative(&fwd) ? 1 : 0, 1);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoMultiVerdictRequest(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoAuthorityVerdictRequest(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadIsUndoTtFetchRequest(&fwd) ? 1 : 0, 0);
+	UT_ASSERT_EQ((int) sizeof(GcsBlockForwardPayload), 64);
+}
+
+
+/* S8-815PRE-FRESHREF-C1B-01: only kind 10 may interpret the synthetic tag as
+ * {segment, raw xid, exact 1-based TT slot}. */
+UT_TEST(test_freshref_c1b_pair_tag_roundtrip_and_malformed_rejection)
+{
+	BufferTag tag = GcsBlockUndoFreshRefC1bTagMake(7, (TransactionId) 4202576, 48);
+	uint32 segment = 0;
+	uint32 slot = 0;
+	TransactionId xid = InvalidTransactionId;
+
+	UT_ASSERT(GcsBlockUndoFreshRefC1bTagDecode(tag, &segment, &xid, &slot));
+	UT_ASSERT_EQ(segment, 7);
+	UT_ASSERT_EQ(xid, (TransactionId) 4202576);
+	UT_ASSERT_EQ(slot, 48);
+
+	tag.dbOid = (Oid) 0;
+	UT_ASSERT(!GcsBlockUndoFreshRefC1bTagDecode(tag, NULL, NULL, NULL));
+	tag = GcsBlockUndoFreshRefC1bTagMake(7, (TransactionId) 4202576, 0);
+	UT_ASSERT(!GcsBlockUndoFreshRefC1bTagDecode(tag, NULL, NULL, NULL));
+	tag = GcsBlockUndoFreshRefC1bTagMake(7, (TransactionId) 4202576,
+											TT_SLOTS_PER_SEGMENT + 1);
+	UT_ASSERT(!GcsBlockUndoFreshRefC1bTagDecode(tag, NULL, NULL, NULL));
+	tag = GcsBlockUndoFreshRefC1bTagMake(7, InvalidTransactionId, 1);
+	UT_ASSERT(!GcsBlockUndoFreshRefC1bTagDecode(tag, NULL, NULL, NULL));
+}
+
+
 /* spec-5.22d D4-6: the authority fetch tag carries the dead OWNER in the
  * previously-empty tag.relNumber as owner+1 (0 stays "absent" so the three
  * owner-served kinds keep their strict empty-relNumber shape).  The serve
@@ -3620,6 +3666,13 @@ UT_TEST(test_resource_x_d1_records_exact_first_failure_before_policy_change)
 		"RESOURCE_X_FIRST_FAILURE_LOG_RATE_LIMIT"));
 	UT_ASSERT_NOT_NULL(strstr(source, "cluster_pcm_grd_capacity()"));
 	UT_ASSERT_NOT_NULL(strstr(source,
+		"cluster_pcm_grd_lifecycle_stats_snapshot(&lifecycle)"));
+	UT_ASSERT_NOT_NULL(strstr(source, "reclaim_attempts=%llu"));
+	UT_ASSERT_NOT_NULL(strstr(source, "reclaim_successes=%llu"));
+	UT_ASSERT_NOT_NULL(strstr(source, "refused_pcm_mode=%llu"));
+	UT_ASSERT_NOT_NULL(strstr(source, "refused_resource_x=%llu"));
+	UT_ASSERT_NOT_NULL(strstr(source, "refused_sidecar=%llu"));
+	UT_ASSERT_NOT_NULL(strstr(source,
 		"cluster_bufmgr_pcm_own_n_assertion_candidate_exact(\n"
 		"\t\t\t\t\t\t\t\t\tbuf, &own, &failure_live)"));
 
@@ -3900,7 +3953,7 @@ UT_TEST(test_resource_x_target_eviction_freezes_before_local_n_and_publishes_sam
 int
 main(void)
 {
-	UT_PLAN(76);
+	UT_PLAN(78);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -3929,6 +3982,8 @@ main(void)
 	UT_RUN(test_forwarded_n_to_s_holder_refusal_requires_fresh_outer_retry);
 	UT_RUN(test_forward_payload_undo_authority_verdict_kind4);
 	UT_RUN(test_forward_payload_undo_verdict_kinds_no_collision);
+	UT_RUN(test_forward_payload_freshref_c1b_pair_kind10_routes_as_single_verdict);
+	UT_RUN(test_freshref_c1b_pair_tag_roundtrip_and_malformed_rejection);
 	UT_RUN(test_undo_authority_fetch_tag_owner_roundtrip);
 	UT_RUN(test_undo_verdict_version_authority_distinct);
 	UT_RUN(test_local_master_read_image_retries_holder_busy_with_fresh_identity);

@@ -254,6 +254,19 @@ typedef struct ClusterLeaveState {
 	 *     keys on this, NOT the post-abort phase, which is back at IDLE).
 	 */
 	pg_atomic_uint32 request_in_progress;
+	/* Phase-1-only bounded release/completion proof.  These fields are volatile
+	 * current-round state, never authority or durable evidence. */
+	pg_atomic_uint32 phase1_release_pending;
+	pg_atomic_uint32 phase1_release_transport_drained;
+	uint8 phase1_post_stopped_reply_pending[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	uint8 phase1_post_stopped_reply_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	uint8 phase1_release_request_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	uint8 phase1_release_request_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	uint8 phase1_release_reply_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	uint8 phase1_release_reply_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	uint8 phase1_release_receipt_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	uint8 phase1_release_receipt_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+	uint64 phase1_release_request_nonce[4];
 	pg_atomic_uint32 abort_reason; /* ClusterLeaveAbortReason */
 
 	/*
@@ -315,12 +328,50 @@ typedef enum ClusterLeaveProducerKind {
 	CLUSTER_LEAVE_PRODUCER_SHUTDOWN = 1
 } ClusterLeaveProducerKind;
 
+/* Stage 8 phase-1 coordinated full-cluster clean stop.  The accepted harness
+ * topology is exactly nodes 0..3.  The plan itself is checkpointer-stack-only;
+ * the matching runtime proof is bounded, volatile and per-round, and no
+ * phase-1 identity can survive process exit. */
+#define CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT 4
+typedef enum ClusterPhase1FullStopPrepareResult {
+	CLUSTER_PHASE1_FULL_STOP_NOT_APPLICABLE = 0,
+	CLUSTER_PHASE1_FULL_STOP_READY = 1,
+	CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED = 2
+} ClusterPhase1FullStopPrepareResult;
+
+/* Existing type-26 discriminator values.  Value 1 remains the ordinary
+ * preflight/barrier request; value 2 is the user-approved, phase-1-only
+ * release request; value 3 is the exact consumption receipt for a value-2
+ * type-27 reply.  The payload layout and wire version do not change. */
+typedef enum ClusterPhase1FullStopWireRound {
+	CLUSTER_PHASE1_FULL_STOP_WIRE_BARRIER = 1,
+	CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE = 2,
+	CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT = 3
+} ClusterPhase1FullStopWireRound;
+
+typedef enum ClusterPhase1FullStopProbeNonceDecision {
+	CLUSTER_PHASE1_PROBE_NONCE_STALE_ACTIVE = 0,
+	CLUSTER_PHASE1_PROBE_NONCE_ACCEPT_STOPPED = 1,
+	CLUSTER_PHASE1_PROBE_NONCE_DUPLICATE_STOPPED = 2,
+	CLUSTER_PHASE1_PROBE_NONCE_CONFLICT = 3
+} ClusterPhase1FullStopProbeNonceDecision;
+
+typedef struct ClusterPhase1FullStopPlan {
+	bool valid;
+	uint8 _pad0[7];
+	uint64 epoch;
+	uint64 attempt_nonce;
+	uint64 absolute_deadline_us;
+	int64 own_wal_started_at;
+	uint64 member_incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+} ClusterPhase1FullStopPlan;
+
 typedef struct ClusterLeaveAnnouncePayload {
 	uint32 magic;
 	uint16 version;
 	uint16 _pad0;
 	int32 leaving_node_id;
-	uint8 preflight; /* 1 = enabled-probe, 0 = real announce */
+	uint8 preflight; /* 0=announce, 1=barrier, 2=release, 3=reply receipt */
 	uint8 producer_kind; /* ClusterLeaveProducerKind */
 	uint8 _pad1[2];
 	uint64 leave_epoch;			 /* 0 until bound (preflight / pre-commit) */
@@ -349,7 +400,8 @@ typedef struct ClusterLeaveAckPayload {
 						 * leaver drops a stale ACK/NAK from a prior attempt. */
 	uint8 nak;			/* 0 = ACK, 1 = NAK */
 	uint8 nak_reason;	/* ClusterLeaveNakReason when nak=1 */
-	uint8 _pad1[2];
+	uint8 phase1_round; /* 0=ordinary, 2=phase-1 release reply */
+	uint8 _pad1;
 	uint32 crc; /* CRC32C over [magic..nak_reason] */
 } ClusterLeaveAckPayload;
 
@@ -439,6 +491,58 @@ extern bool cluster_clean_leave_announce_payload_valid(const ClusterLeaveAnnounc
 extern void cluster_clean_leave_ack_compute_crc(ClusterLeaveAckPayload *p);
 extern bool cluster_clean_leave_ack_payload_valid(const ClusterLeaveAckPayload *p);
 
+/* Phase-1 full-stop pure policy.  SHUTDOWN+preflight is a side-effect-free
+ * coordinated-stop probe; it is never a clean-leave announce and grants no
+ * authority.  ACK completion is over the captured four members and never
+ * shrinks with CSSD liveness. */
+extern bool cluster_clean_leave_phase1_full_stop_plan_valid(
+	const ClusterPhase1FullStopPlan *plan);
+extern bool cluster_clean_leave_phase1_full_stop_probe_accepts(
+	uint8 producer_kind, bool preflight, int32 envelope_source_node,
+	int32 payload_leaving_node, uint64 envelope_epoch, uint64 payload_epoch,
+	uint64 attempt_nonce, bool local_fast_shutdown, bool exact_phase1_eligible);
+extern bool cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
+	bool source_active, bool source_stopped,
+	bool local_active, bool local_stopped);
+extern bool cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
+	bool local_stopped, bool request_in_progress, bool shutdown_driven,
+	bool preflight_pending, bool preflight_sent, bool release_pending);
+extern bool cluster_clean_leave_phase1_full_stop_release_probe_accepts(
+	uint8 producer_kind, uint8 wire_round, int32 envelope_source_node,
+	int32 payload_leaving_node, uint64 envelope_epoch, uint64 payload_epoch,
+	uint64 nonce, bool source_stopped, bool local_stopped,
+	bool exact_phase1_eligible);
+extern bool cluster_clean_leave_phase1_full_stop_receipt_accepts(
+	uint8 producer_kind, uint8 wire_round, bool release_pending,
+	uint64 stored_nonce, uint64 receipt_nonce, bool request_seen);
+extern bool cluster_clean_leave_phase1_full_stop_release_complete(
+	const ClusterPhase1FullStopPlan *plan, int32 self_node,
+	const uint8 *request_sent, const uint8 *request_seen,
+	const uint8 *reply_sent, const uint8 *reply_seen,
+	const uint8 *receipt_sent, const uint8 *receipt_seen,
+	int nbytes, bool transport_drained);
+extern bool cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
+	bool retained, bool retained_before_local_round,
+	uint64 retained_local_nonce, uint64 retained_deadline_us,
+	uint64 current_local_nonce, uint64 current_deadline_us,
+	bool exact_identity, bool request_in_progress,
+	bool shutdown_driven, bool post_requests_sent);
+extern bool cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
+	bool local_active, bool local_stopped, bool local_post_round_armed);
+extern bool cluster_clean_leave_phase1_full_stop_ack_matches(
+	const ClusterPhase1FullStopPlan *plan, int32 self_node,
+	int32 envelope_source_node, int32 survivor_node, int32 leaving_node,
+	uint64 payload_epoch, uint64 attempt_nonce,
+	uint64 current_survivor_incarnation);
+extern bool cluster_clean_leave_phase1_full_stop_ack_complete(
+	const ClusterPhase1FullStopPlan *plan, int32 self_node,
+	const uint8 *ack_bitmap, int nbytes);
+extern bool cluster_clean_leave_phase1_full_stop_nonce_fresh(
+	uint64 prior_nonce, uint64 next_nonce);
+extern ClusterPhase1FullStopProbeNonceDecision
+cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
+	uint64 active_nonce, uint64 stopped_nonce, uint64 incoming_nonce);
+
 
 /* ============================================================
  * Runtime layer (cluster_clean_leave.c).
@@ -508,6 +612,12 @@ typedef enum ClusterLeaveRequestResult {
 extern ClusterLeaveRequestResult
 cluster_clean_leave_request(void);				   /* internal C entry; gated by GUC + in_quorum */
 extern void cluster_clean_leave_drive_drain(void); /* phase state-machine step, backend ctx */
+extern bool cluster_clean_leave_phase1_full_stop_candidate(void);
+extern ClusterPhase1FullStopPrepareResult
+cluster_clean_leave_phase1_full_stop_prepare_exact(
+	ClusterPhase1FullStopPlan *plan_out);
+extern bool cluster_clean_leave_phase1_full_stop_close_exact(
+	ClusterPhase1FullStopPlan *plan);
 
 /* LMON orchestration (both sides): consume announce + advance barrier + escalate. */
 extern void cluster_clean_leave_lmon_tick(void);

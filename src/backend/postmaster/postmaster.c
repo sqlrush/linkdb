@@ -185,6 +185,7 @@
  */
 #include "cluster/cluster_cf_storage.h" /* cluster_cf_startup_prepare (spec-5.6 Da3) */
 #include "cluster/cluster_catalog_bootstrap.h" /* cluster_catalog_startup_prepare (spec-6.14 D2) */
+#include "cluster/cluster_clean_leave.h" /* phase-1 full-stop coordination retention */
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lmon.h"  /* cluster_lmon_suppress_reconfig (RF-ROOT P6) */
@@ -4262,6 +4263,11 @@ PostmasterStateMachine(void)
 #ifdef USE_PGRAC_CLUSTER
 		{
 			bool retain_rf_a1_coordination = cluster_registry_holds_admission();
+			bool retain_phase1_coordination
+				= !retain_rf_a1_coordination
+				  && cluster_clean_leave_phase1_full_stop_candidate();
+			bool retain_shutdown_coordination
+				= retain_rf_a1_coordination || retain_phase1_coordination;
 
 			/*
 			 * A formed RF A1 registry stops Stats first so W4 cannot race
@@ -4273,7 +4279,7 @@ PostmasterStateMachine(void)
 			 * path.  cluster_run_shutdown_sequence runs only after children
 			 * exit and therefore cannot enforce process close order.
 			 */
-			if (retain_rf_a1_coordination && ClusterStatsPID != 0)
+			if (retain_shutdown_coordination && ClusterStatsPID != 0)
 				signal_child(ClusterStatsPID, SIGTERM);
 
 			/* spec-2.38 LIFO: SinvalBcast first (last-spawned). */
@@ -4289,7 +4295,7 @@ PostmasterStateMachine(void)
 			if (LmdPID != 0)
 				signal_child(LmdPID, SIGTERM);
 
-			if (!retain_rf_a1_coordination) {
+			if (!retain_shutdown_coordination) {
 				int w;
 
 				for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
@@ -4314,7 +4320,7 @@ PostmasterStateMachine(void)
 			/* spec-1.12 Q10 LIFO: LCK next. */
 			if (LckPID != 0)
 				signal_child(LckPID, SIGTERM);
-			if (!retain_rf_a1_coordination && LmonPID != 0)
+			if (!retain_shutdown_coordination && LmonPID != 0)
 				signal_child(LmonPID, SIGTERM);
 
 			/*
@@ -4329,7 +4335,7 @@ PostmasterStateMachine(void)
 			 * the same flag once its own shutdown runs).  No-op when the LMON
 			 * child is absent.
 			 */
-			if (retain_rf_a1_coordination && LmonPID != 0)
+			if (retain_shutdown_coordination && LmonPID != 0)
 				cluster_lmon_suppress_reconfig();
 		}
 #endif
@@ -4379,7 +4385,7 @@ PostmasterStateMachine(void)
 			 * stack until the checkpointer exits.  Abnormal/immediate paths
 			 * retain the original all-reaped requirement.
 			 */
-			((cluster_registry_holds_admission() && !FatalError && Shutdown > NoShutdown
+			((cluster_lmon_reconfig_suppressed() && !FatalError && Shutdown > NoShutdown
 			  && Shutdown < ImmediateShutdown)
 			 || (LmonPID == 0 && CssdPID == 0 && QvotecPID == 0 && LmsPID == 0
 				 && LmsWorkersAllReaped())) &&

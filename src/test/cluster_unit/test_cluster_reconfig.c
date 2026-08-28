@@ -56,6 +56,7 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_write_fence.h" /* spec-4.12 D4 marker submit stubs */
 
 #undef printf
@@ -148,6 +149,8 @@ static ClusterControlRootIdentity ut_recovery_root_identity;
 static bool ut_rejoin_root_complete;
 static bool ut_external_fence_active;
 static bool ut_authority_managed;
+static ClusterAuthorityReadiness ut_authority_readiness
+	= CLUSTER_AUTHORITY_OFF;
 static bool ut_serving_ready;
 static uint64 ut_lms_generation = UINT64_C(1);
 static bool ut_rejoin_grd_clear_ready;
@@ -200,6 +203,12 @@ bool
 cluster_authority_readiness_managed(void)
 {
 	return ut_authority_managed;
+}
+
+ClusterAuthorityReadiness
+cluster_authority_readiness_get(void)
+{
+	return ut_authority_readiness;
 }
 
 bool
@@ -525,6 +534,7 @@ ShmemInitStruct(const char *name, Size size pg_attribute_unused(), bool *foundPt
 static bool ut_lwlock_conditional_result = true;
 static int ut_lwlock_blocking_calls = 0;
 static int ut_lwlock_conditional_calls = 0;
+static int ut_lwlock_conditional_fail_call = 0;
 
 void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
@@ -540,7 +550,10 @@ LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
 						 LWLockMode mode pg_attribute_unused())
 {
 	ut_lwlock_conditional_calls++;
-	return ut_lwlock_conditional_result;
+	return ut_lwlock_conditional_result
+		&& (ut_lwlock_conditional_fail_call == 0
+			|| ut_lwlock_conditional_calls
+				   != ut_lwlock_conditional_fail_call);
 }
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
@@ -692,16 +705,12 @@ cluster_cssd_get_dead_generation(void)
 	return ut_dead_generation;
 }
 
-/*
- * Hardening v1.0.4 stub: cluster_reconfig.c's join driver now consults
- * cluster_clean_leave_in_progress() (one membership reconfig at a time) — defined
- * in cluster_clean_leave.c, which this standalone unit does not link.  No clean
- * leave is ever in progress in these reconfig unit tests, so return false.
- */
+/* Hardening v1.0.4 stub: settable for the classify-before-own regression. */
+static bool ut_clean_leave_in_progress;
 bool
 cluster_clean_leave_in_progress(void)
 {
-	return false;
+	return ut_clean_leave_in_progress;
 }
 
 /* RF-ROOT P6 (L5 wiring): unit stubs for symbols cluster_reconfig.o pulls in
@@ -1006,10 +1015,51 @@ cluster_grd_inc_offpath_crash_rejoin_fenced(void)
 #include "cluster/cluster_xid_stripe_boot.h"
 static ClusterXidStripeJoinVerdict ut_xid_stripe_verdict
 	= CLUSTER_XID_STRIPE_JOIN_PROCEED;
+static int ut_xid_stripe_join_gate_calls;
+static bool ut_xid_stripe_last_may_seed;
+static ClusterXidStripeJoinProgress ut_xid_stripe_progress
+	= STRIPE_JOIN_PROCEED;
+static int ut_xid_stripe_join_progress_calls;
+static bool ut_xid_stripe_progress_last_may_seed;
+static ClusterXidStripeDiskState ut_xid_stripe_disk_state
+	= CLUSTER_XID_STRIPE_DISK_UNKNOWN;
+static ClusterWalSlotVerdict ut_wal_slot_verdict[CLUSTER_MAX_NODES];
+static ClusterWalStateSlot ut_wal_slot[CLUSTER_MAX_NODES];
+static bool ut_recovery_in_progress = false;
 ClusterXidStripeJoinVerdict
-cluster_xid_stripe_join_gate(bool self_may_seed pg_attribute_unused())
+cluster_xid_stripe_join_gate(bool self_may_seed)
 {
+	ut_xid_stripe_join_gate_calls++;
+	ut_xid_stripe_last_may_seed = self_may_seed;
 	return ut_xid_stripe_verdict;
+}
+ClusterXidStripeJoinProgress
+cluster_xid_stripe_join_progress(bool self_may_seed)
+{
+	ut_xid_stripe_join_progress_calls++;
+	ut_xid_stripe_progress_last_may_seed = self_may_seed;
+	return ut_xid_stripe_progress;
+}
+ClusterXidStripeDiskState
+cluster_xid_stripe_disk_state(void)
+{
+	return ut_xid_stripe_disk_state;
+}
+ClusterWalSlotVerdict
+cluster_wal_state_read_slot(uint16 thread_id, ClusterWalStateSlot *slot_out)
+{
+	int node_id = (int)thread_id - 1;
+
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_WAL_SLOT_CORRUPT;
+	if (slot_out != NULL)
+		*slot_out = ut_wal_slot[node_id];
+	return ut_wal_slot_verdict[node_id];
+}
+bool
+RecoveryInProgress(void)
+{
+	return ut_recovery_in_progress;
 }
 /* pgstat backend global referenced by pgstat_report_wait_start/end (the D4 join
  * marker submit wait); provide a file-static fake so the standalone link works. */
@@ -1059,6 +1109,18 @@ ut_reset_mocks(void)
 	ut_prior_unclean_death = false;
 	ut_join_view_rebuilt = true;
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	ut_xid_stripe_join_gate_calls = 0;
+	ut_xid_stripe_last_may_seed = false;
+	ut_xid_stripe_progress = STRIPE_JOIN_PROCEED;
+	ut_xid_stripe_join_progress_calls = 0;
+	ut_xid_stripe_progress_last_may_seed = false;
+	ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN;
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		ut_wal_slot_verdict[i] = CLUSTER_WAL_SLOT_EMPTY;
+		memset(&ut_wal_slot[i], 0, sizeof(ut_wal_slot[i]));
+	}
+	ut_recovery_in_progress = false;
+	ut_clean_leave_in_progress = false;
 	ut_self_member_callback_seen = false;
 	ut_self_member_callback_gate = CLUSTER_JOIN_GATE_ALLOW;
 	ut_dead_generation = 0;
@@ -1097,6 +1159,7 @@ ut_reset_mocks(void)
 	ut_rejoin_root_complete = false;
 	ut_external_fence_active = false;
 	ut_authority_managed = false;
+	ut_authority_readiness = CLUSTER_AUTHORITY_OFF;
 	ut_serving_ready = false;
 	ut_lms_generation = UINT64_C(1);
 	ut_rejoin_grd_clear_ready = true;
@@ -1109,6 +1172,10 @@ ut_reset_mocks(void)
 	ut_rejoin_consume_calls = 0;
 	ut_rejoin_release_calls = 0;
 	ut_rejoin_consume_saw_prior_marker_submit = false;
+	ut_lwlock_conditional_result = true;
+	ut_lwlock_conditional_fail_call = 0;
+	ut_lwlock_blocking_calls = 0;
+	ut_lwlock_conditional_calls = 0;
 	ut_rejoin_poll_status = PGRAC_EXTERNAL_FENCE_REJOIN_PENDING;
 	memset(&ut_rejoin_offer, 0, sizeof(ut_rejoin_offer));
 	memset(&ut_rejoin_failure_seen, 0, sizeof(ut_rejoin_failure_seen));
@@ -3220,7 +3287,7 @@ UT_TEST(test_cold_bootstrap_records_exact_floor_before_opening_gate)
  * not leave phase 3 without an exact MEMBER formation.  The floor is current,
  * but the ordinary write byte stays closed until the unchanged stripe gate
  * later returns PROCEED. */
-UT_TEST(test_cold_bootstrap_stripe_hold_publishes_control_member_only)
+UT_TEST(test_initial_bootstrap_stripe_gate_publishes_control_member_only)
 {
 	pid_t pid;
 	int status = 0;
@@ -3271,6 +3338,794 @@ UT_TEST(test_cold_bootstrap_stripe_hold_publishes_control_member_only)
 	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
 	UT_ASSERT(WIFEXITED(status));
 	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+/* Oracle-first startup classification: once any current, fresh peer has
+ * formed past INITIAL, a slower database instance is an ordinary online
+ * joiner.  An earlier xid-stripe HOLD at INITIAL is not retained as hidden
+ * bootstrap authority. */
+UT_TEST(test_late_initial_node_becomes_online_joiner)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+		int i;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		cluster_node_id = 1;
+		ut_in_quorum_value = true;
+		ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61),
+									 UINT64_C(61));
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+		for (i = 0; i < 4; i++) {
+			ut_declared_set[i] = true;
+			if (i == cluster_node_id)
+				continue;
+			cluster_reconfig_record_observed_slot(
+				i, UINT64_C(100) + (uint64)i, UINT64_C(1),
+				CLUSTER_EPOCH_INITIAL);
+			cluster_reconfig_record_observed_fresh_alive(i, true);
+		}
+
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+
+		/* Same peer incarnation, but current durable evidence now says the
+		 * cluster is formed.  The slow node may cease to be in the current
+		 * local quorum view at exactly this edge because the peers have already
+		 * advanced their formation.  Their fresh QVOTEC-authenticated slot is
+		 * still sufficient to close this node's gate and classify it as an
+		 * ordinary JCMK joiner; it is never authority to admit the node. */
+		cluster_reconfig_record_observed_slot(
+			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_fresh_alive(0, true);
+		ut_in_quorum_value = false;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_JOINING);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 0);
+		UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
+					 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+/* Transport epoch catch-up is permitted only from the same current, fresh
+ * QVOTEC slot evidence that can classify a running peer.  A durable slot whose
+ * heartbeat is no longer fresh is residue, not authority to move this node out
+ * of the founding epoch. */
+UT_TEST(test_late_joiner_does_not_adopt_stale_peer_epoch)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		cluster_node_id = 1;
+		ut_declared_set[0] = true;
+		ut_declared_set[1] = true;
+		ut_in_quorum_value = false;
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+		cluster_reconfig_record_observed_slot(
+			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_fresh_alive(0, false);
+
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(cluster_epoch_get_current(), CLUSTER_EPOCH_INITIAL);
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_ABSENT);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 0);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+/* A qvotec slot update is not current until its whole publish window closes.
+ * In particular, a new epoch written between begin/end must not be combined
+ * with the previous round's fresh bit or generation and adopted early. */
+UT_TEST(test_late_joiner_epoch_adoption_waits_for_exact_publish_window)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		cluster_node_id = 1;
+		ut_declared_set[0] = true;
+		ut_declared_set[1] = true;
+		ut_in_quorum_value = false;
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+
+		cluster_reconfig_bootstrap_publish_begin();
+		cluster_reconfig_record_observed_slot(
+			0, UINT64_C(101), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_fresh_alive(0, true);
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(cluster_epoch_get_current(), CLUSTER_EPOCH_INITIAL);
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_ABSENT);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+
+		cluster_reconfig_bootstrap_publish_end();
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(cluster_epoch_get_current(), UINT64_C(7));
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_JOINING);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 0);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+UT_TEST(test_late_joiner_deadline_starts_only_after_stripe_claim_owned)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+		uint64 first_deadline;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		cluster_node_id = 1;
+		ut_declared_set[0] = true;
+		ut_declared_set[1] = true;
+		ut_set_self_incarnation_sequence(UINT64_C(71), UINT64_C(71),
+									 UINT64_C(71));
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+		cluster_reconfig_record_observed_slot(
+			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_fresh_alive(0, true);
+
+		/* Classification is allowed without local quorum, but ownership and
+		 * its absolute deadline are not. */
+		ut_in_quorum_value = false;
+		ut_xid_stripe_progress = STRIPE_JOIN_WAIT_EVIDENCE;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_JOINING);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+		UT_ASSERT_EQ(state->self_join_failed, 0);
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 0);
+
+		/* Quorum without driveable disk evidence still owns no deadline. */
+		ut_in_quorum_value = true;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 1);
+		UT_ASSERT(!ut_xid_stripe_progress_last_may_seed);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+		UT_ASSERT_EQ(state->self_join_failed, 0);
+
+		/* The exact staged/pending own-slot claim starts the deadline once. */
+		ut_xid_stripe_progress = STRIPE_JOIN_CLAIM_OWNED;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 2);
+		UT_ASSERT(state->self_join_deadline_us != 0);
+		first_deadline = state->self_join_deadline_us;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 3);
+		UT_ASSERT_EQ(state->self_join_deadline_us, first_deadline);
+		UT_ASSERT_EQ(state->self_join_failed, 0);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+UT_TEST(test_clean_leave_suppresses_late_joiner_classification_and_progress)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+		uint64 first_deadline;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		cluster_node_id = 1;
+		ut_declared_set[0] = true;
+		ut_declared_set[1] = true;
+		ut_in_quorum_value = true;
+		ut_set_self_incarnation_sequence(UINT64_C(73), UINT64_C(73),
+									 UINT64_C(73));
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+		cluster_reconfig_record_observed_slot(
+			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_fresh_alive(0, true);
+		ut_xid_stripe_progress = STRIPE_JOIN_CLAIM_OWNED;
+
+		ut_clean_leave_in_progress = true;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 0);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+		UT_ASSERT_EQ(state->self_join_failed, 0);
+
+		ut_clean_leave_in_progress = false;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 1);
+		UT_ASSERT(state->self_join_deadline_us != 0);
+		first_deadline = state->self_join_deadline_us;
+		UT_ASSERT_EQ(state->self_join_failed, 0);
+
+		/* An already-classified joiner still must not drive a second
+		 * prerequisite owner while clean leave is active.  The original
+		 * absolute deadline remains armed and is never refreshed. */
+		ut_clean_leave_in_progress = true;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 1);
+		UT_ASSERT_EQ(state->self_join_deadline_us, first_deadline);
+		UT_ASSERT_EQ(state->self_join_failed, 0);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+UT_TEST(test_epoch0_late_founder_classifies_only_after_recovery)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		cluster_node_id = 3;
+		ut_declared_set[0] = true;
+		ut_declared_set[3] = true;
+		ut_in_quorum_value = true;
+		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
+									 UINT64_C(83));
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+		cluster_reconfig_record_observed_slot(
+			0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
+		cluster_reconfig_record_observed_fresh_alive(0, true);
+		cluster_membership_record_admitted(0, UINT64_C(80));
+		cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
+	ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
+		ut_wal_slot_verdict[0] = CLUSTER_WAL_SLOT_OK;
+		ut_wal_slot[0].thread_id = 1;
+		ut_wal_slot[0].node_id = 0;
+		ut_wal_slot[0].state = CLUSTER_WAL_SLOT_STATE_ACTIVE;
+		ut_wal_slot[0].started_at = INT64_C(81);
+		ut_wal_slot[0].last_updated = INT64_C(81);
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+		ut_xid_stripe_progress = STRIPE_JOIN_CLAIM_OWNED;
+
+		/* The exact peer evidence can authorize only the existing
+		 * JOIN_READONLY deferral while recovery is active.  It must not
+		 * classify, claim, or start the ordinary deadline yet. */
+		ut_recovery_in_progress = true;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 0);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+
+		/* After StartupXLOG, the same fresh/current admitted epoch-0 peer
+		 * classifies self as an ordinary JOINING node.  The existing stripe
+		 * owner stages the exact claim and owns the unrefreshed deadline. */
+		ut_recovery_in_progress = false;
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 1);
+		UT_ASSERT(!ut_xid_stripe_progress_last_may_seed);
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_JOINING);
+		UT_ASSERT(state->self_join_deadline_us != 0);
+		UT_ASSERT_EQ(state->self_join_failed, 0);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+/* A node that already bound the existing recovery authority before
+ * StartupXLOG is a normal founder, not a JOIN_READONLY late founder.  Exact
+ * epoch-0 peer evidence becoming visible after recovery must not demote that
+ * founder into ordinary JOINING or transfer its stripe progress to JCMK. */
+UT_TEST(test_epoch0_current_authority_is_not_reclassified_as_late_founder)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		cluster_node_id = 3;
+		ut_declared_set[0] = true;
+		ut_declared_set[3] = true;
+		ut_in_quorum_value = true;
+		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
+								 UINT64_C(83));
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+		cluster_reconfig_record_observed_slot(
+			0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
+		cluster_reconfig_record_observed_fresh_alive(0, true);
+		cluster_membership_record_admitted(0, UINT64_C(80));
+		cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
+		ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+		ut_xid_stripe_progress = STRIPE_JOIN_CLAIM_OWNED;
+		ut_recovery_in_progress = false;
+		ut_authority_managed = true;
+
+		cluster_reconfig_lmon_tick();
+
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 0);
+		UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
+		UT_ASSERT_EQ(state->self_join_admitted, 1);
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_MEMBER);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+static ClusterReconfigState *
+ut_prepare_epoch0_managed_handoff(void)
+{
+	ClusterReconfigState *state;
+
+	cluster_online_join = true;
+	ut_join_setup();
+	cluster_node_id = 3;
+	ut_declared_set[0] = true;
+	ut_declared_set[3] = true;
+	ut_in_quorum_value = true;
+	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
+								 UINT64_C(83));
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	cluster_reconfig_record_observed_slot(
+		0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
+	cluster_reconfig_record_observed_fresh_alive(0, true);
+	cluster_membership_record_admitted(0, UINT64_C(80));
+	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
+	cluster_membership_record_admitted(cluster_node_id, UINT64_C(83));
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
+	state->self_join_admitted = 0;
+	state->self_join_failed = 0;
+	state->self_join_deadline_us = 0;
+	ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
+	ut_wal_slot_verdict[0] = CLUSTER_WAL_SLOT_OK;
+	ut_wal_slot[0].thread_id = 1;
+	ut_wal_slot[0].node_id = 0;
+	ut_wal_slot[0].state = CLUSTER_WAL_SLOT_STATE_ACTIVE;
+	ut_wal_slot[0].started_at = INT64_C(81);
+	ut_wal_slot[0].last_updated = INT64_C(81);
+	ut_recovery_in_progress = false;
+	ut_authority_managed = true;
+	ut_authority_readiness = CLUSTER_AUTHORITY_OFF;
+	MyProc = NULL;
+	return state;
+}
+
+/* Phase 3 has no PGPROC.  The exact handoff must use conditional acquisition,
+ * leave MEMBER untouched when the reconfig lock is busy, and accept only the
+ * current self-incarnation floor.  Once staged, the byte-identical JOINING
+ * tuple is an idempotent success and may not refresh any field. */
+UT_TEST(test_pre_publish_join_handoff_is_exact_idempotent_and_nonblocking)
+{
+	ClusterReconfigState *state = ut_prepare_epoch0_managed_handoff();
+	uint64 deadline_before;
+	uint8 admitted_before;
+	uint8 failed_before;
+
+	ut_lwlock_conditional_calls = 0;
+	ut_lwlock_blocking_calls = 0;
+	/* Two exact peer captures precede the handoff's EXCLUSIVE claim. */
+	ut_lwlock_conditional_fail_call = 3;
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83)));
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 3);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_MEMBER);
+
+	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
+								 UINT64_C(83));
+	ut_lwlock_conditional_fail_call = 0;
+	ut_lwlock_conditional_calls = 0;
+	ut_lwlock_blocking_calls = 0;
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83)));
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT(cluster_reconfig_pre_publish_join_handoff_current());
+
+	admitted_before = state->self_join_admitted;
+	failed_before = state->self_join_failed;
+	deadline_before = state->self_join_deadline_us;
+	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
+								 UINT64_C(83));
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83)));
+	UT_ASSERT_EQ(state->self_join_admitted, admitted_before);
+	UT_ASSERT_EQ(state->self_join_failed, failed_before);
+	UT_ASSERT_EQ(state->self_join_deadline_us, deadline_before);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
+		cluster_node_id), UINT64_C(83));
+}
+
+/* Every conjunct is fail-closed: no generic managed+OFF+JOINING state may be
+ * promoted into the ordinary owner, and a post-write identity drift leaves
+ * only the write-closed staged tuple for a later exact revalidation. */
+UT_TEST(test_pre_publish_join_handoff_rejects_nonexact_state)
+{
+	ClusterReconfigState *state;
+
+	state = ut_prepare_epoch0_managed_handoff();
+	ut_authority_readiness = CLUSTER_AUTHORITY_RECOVERY_READY;
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_MEMBER);
+
+	state = ut_prepare_epoch0_managed_handoff();
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(84)));
+
+	state = ut_prepare_epoch0_managed_handoff();
+	cluster_membership_record_admitted(cluster_node_id, UINT64_C(84));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+
+	state = ut_prepare_epoch0_managed_handoff();
+	state->replacement_episode = ut_admitted_replacement_episode(cluster_node_id);
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+
+	state = ut_prepare_epoch0_managed_handoff();
+	ut_clean_leave_in_progress = true;
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+
+	state = ut_prepare_epoch0_managed_handoff();
+	state->removed_bitmap[cluster_node_id / 8]
+		|= (uint8)(1u << (cluster_node_id % 8));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+
+	state = ut_prepare_epoch0_managed_handoff();
+	state->self_join_failed = 1;
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+	UT_ASSERT(!cluster_reconfig_pre_publish_join_handoff_current());
+
+	state = ut_prepare_epoch0_managed_handoff();
+	state->self_join_deadline_us = UINT64_C(9001);
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+	UT_ASSERT(!cluster_reconfig_pre_publish_join_handoff_current());
+
+	state = ut_prepare_epoch0_managed_handoff();
+	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(84),
+								 UINT64_C(84));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ(state->self_join_failed, 0);
+	UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+	UT_ASSERT(!cluster_reconfig_pre_publish_join_handoff_current());
+}
+
+/* The approved pre-publish pivot retains the boot-lifetime managed latch but
+ * exposes its exact JOIN_READONLY edge to the ordinary classifier.  A forked
+ * LMON-side owner must consume that shared tuple, drive the non-seeding stripe
+ * prerequisite, reject an early JCMK callback, and publish terminal admission
+ * only after the existing stripe/JOIN-WAL gate reports PROCEED. */
+UT_TEST(test_epoch0_managed_pivot_drives_ordinary_join_owner)
+{
+	pid_t pid;
+	int status = 0;
+	ClusterReconfigState *state = ut_prepare_epoch0_managed_handoff();
+
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_JOINING);
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ut_current_failed = 0;
+		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
+									 UINT64_C(83));
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+		ut_xid_stripe_progress = STRIPE_JOIN_CLAIM_OWNED;
+		ut_recovery_in_progress = false;
+		ut_authority_managed = true;
+		ut_authority_readiness = CLUSTER_AUTHORITY_OFF;
+
+		cluster_reconfig_lmon_tick();
+
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 1);
+		UT_ASSERT(!ut_xid_stripe_progress_last_may_seed);
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_JOINING);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT(state->self_join_deadline_us != 0);
+
+		/* Exact JCMK may arrive before PGXS/JOIN WAL.  The existing admission
+		 * callback must keep the tuple write-closed until the unified stripe
+		 * gate is terminal-current. */
+		cluster_reconfig_note_self_admitted(UINT64_C(7));
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+						 (int)CLUSTER_MEMBER_JOINING);
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+		cluster_reconfig_note_self_admitted(UINT64_C(7));
+		UT_ASSERT_EQ(state->self_join_admitted, 1);
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+						 (int)CLUSTER_MEMBER_MEMBER);
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
+			cluster_node_id), UINT64_C(83));
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+UT_TEST(test_epoch0_late_founder_evidence_requires_exact_peer_and_pgxa)
+{
+	ut_join_setup();
+	cluster_online_join = true;
+	cluster_node_id = 3;
+	ut_declared_set[0] = true;
+	ut_declared_set[3] = true;
+	ut_in_quorum_value = true;
+	cluster_reconfig_record_observed_slot(
+		0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
+	cluster_reconfig_record_observed_fresh_alive(0, true);
+	cluster_membership_record_admitted(0, UINT64_C(80));
+	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
+
+	/* A current admitted peer is insufficient until the existing durable
+	 * activation face proves that some founder completed recovery and seeded
+	 * PGXA. */
+	ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN;
+	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
+	ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
+	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
+
+	/* A Phase-1 ACTIVE slot predating this peer's current QVOTEC boot is stale
+	 * for the Phase-2 bridge.  Only a current-boot ACTIVE pair proves that a
+	 * distinct database instance actually completed StartupXLOG. */
+	ut_wal_slot_verdict[0] = CLUSTER_WAL_SLOT_OK;
+	ut_wal_slot[0].thread_id = 1;
+	ut_wal_slot[0].node_id = 0;
+	ut_wal_slot[0].state = CLUSTER_WAL_SLOT_STATE_ACTIVE;
+	ut_wal_slot[0].started_at = INT64_C(79);
+	ut_wal_slot[0].last_updated = INT64_C(79);
+	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
+	ut_wal_slot[0].started_at = INT64_C(81);
+	ut_wal_slot[0].last_updated = INT64_C(81);
+	UT_ASSERT(cluster_reconfig_epoch0_late_founder_evidence_current());
+
+	cluster_reconfig_record_observed_fresh_alive(0, false);
+	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
+	cluster_reconfig_record_observed_fresh_alive(0, true);
+	cluster_reconfig_record_observed_slot(
+		0, UINT64_C(81), UINT64_C(8), CLUSTER_EPOCH_INITIAL);
+	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
+	cluster_membership_record_admitted(0, UINT64_C(81));
+	UT_ASSERT(cluster_reconfig_epoch0_late_founder_evidence_current());
+
+	/* An in-progress QVOTEC publication and a non-initial peer both remain
+	 * outside this narrow epoch-0 bridge. */
+	cluster_reconfig_bootstrap_publish_begin();
+	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
+	cluster_reconfig_bootstrap_publish_end();
+	cluster_reconfig_record_observed_slot(
+		0, UINT64_C(81), UINT64_C(9), UINT64_C(1));
+	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
+}
+
+UT_TEST(test_late_joiner_stripe_refuse_is_terminal_fail_closed)
+{
+	pid_t pid;
+	int status = 0;
+
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		ClusterReconfigState *state;
+
+		ut_current_failed = 0;
+		cluster_online_join = true;
+		ut_join_setup();
+		cluster_node_id = 1;
+		ut_declared_set[0] = true;
+		ut_declared_set[1] = true;
+		ut_in_quorum_value = true;
+		ut_set_self_incarnation_sequence(UINT64_C(72), UINT64_C(72),
+									 UINT64_C(72));
+		state = (ClusterReconfigState *)reconfig_shmem_storage;
+		cluster_reconfig_record_observed_slot(
+			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_fresh_alive(0, true);
+		ut_xid_stripe_progress = STRIPE_JOIN_REFUSE;
+
+		cluster_reconfig_lmon_tick();
+		UT_ASSERT_EQ(ut_xid_stripe_join_progress_calls, 1);
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(state->self_join_failed, 1);
+		UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+					 (int)CLUSTER_MEMBER_REJECTED);
+		UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
+					 (int)CLUSTER_JOIN_GATE_BLOCK_53R61);
+		fflush(stdout);
+		_exit(ut_current_failed == 0 ? 0 : 1);
+	}
+
+	UT_ASSERT_EQ(waitpid(pid, &status, 0), pid);
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(WEXITSTATUS(status), 0);
+}
+
+/* A durable ordinary JOIN_COMMITTED proof cannot open service while the
+ * existing xid-stripe gate is still staging the current node's own PGXS
+ * claim.  The callback is retried by QVOTEC and must never seed PGXA. */
+UT_TEST(test_online_join_waits_for_own_stripe_claim)
+{
+	ClusterReconfigState *state;
+
+	cluster_online_join = true;
+	ut_join_setup();
+	cluster_node_id = 1;
+	ut_declared_set[1] = true;
+	ut_set_self_incarnation_sequence(UINT64_C(81), UINT64_C(81),
+								 UINT64_C(81));
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+
+	cluster_reconfig_note_self_admitted(UINT64_C(7));
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
+	UT_ASSERT(!ut_xid_stripe_last_may_seed);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
+		cluster_node_id), UINT64_C(0));
+
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	cluster_reconfig_note_self_admitted(UINT64_C(7));
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
+	UT_ASSERT(!ut_xid_stripe_last_may_seed);
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
+		cluster_node_id), UINT64_C(81));
+	cluster_online_join = false;
+}
+
+/* PGXA=PUBLISHED and PGXS=MINE are still insufficient when the per-thread
+ * JOIN WAL record is not insertable.  The same ordinary admission callback
+ * must remain closed until the unified stripe gate reports PROCEED. */
+UT_TEST(test_online_join_waits_for_join_wal)
+{
+	ClusterReconfigState *state;
+
+	cluster_online_join = true;
+	ut_join_setup();
+	cluster_node_id = 2;
+	ut_declared_set[2] = true;
+	ut_set_self_incarnation_sequence(UINT64_C(82), UINT64_C(82),
+								 UINT64_C(82));
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+
+	cluster_reconfig_note_self_admitted(UINT64_C(9));
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
+	UT_ASSERT(!ut_xid_stripe_last_may_seed);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_JOINING);
+
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	cluster_reconfig_note_self_admitted(UINT64_C(9));
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
+	UT_ASSERT(!ut_xid_stripe_last_may_seed);
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
+		cluster_node_id), UINT64_C(82));
+	cluster_online_join = false;
 }
 
 UT_TEST(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap)
@@ -5694,6 +6549,58 @@ ut_cold_formation_setup_coboot(void)
 	cluster_reconfig_test_reset_cold_formation();
 }
 
+/* A quorum-majority formation marker is membership evidence, but it cannot
+ * bypass the shared PGXA/own-PGXS/JOIN-WAL admission prerequisite.  HOLD must
+ * leave both the membership floor and ordinary write gate untouched; the same
+ * exact marker may be consumed only after the gate reaches PROCEED. */
+UT_TEST(test_formation_marker_admission_waits_for_stripe)
+{
+	ClusterReconfigState *state;
+	ClusterFormationCommitMarker marker;
+	uint64 incs[CLUSTER_MAX_NODES] = {0};
+	int t;
+
+	cluster_online_join = false;
+	ut_cold_formation_setup_coboot();
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->self_join_admitted = 0;
+	memset(&marker, 0, sizeof(marker));
+	marker.magic = CLUSTER_FORMATION_MARKER_MAGIC;
+	marker.version = CLUSTER_FORMATION_MARKER_VERSION;
+	marker.phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
+	marker.formation_generation = UINT64_C(4);
+	marker.formation_epoch = UINT64_C(5);
+	marker.arbiter_node = 0;
+	marker.arbiter_incarnation = UINT64_C(66);
+	marker.commit_nonce = UINT64_C(1);
+	marker.n_admitted = 2;
+	marker.admitted_nodes[0] = UINT8_C(0x03);
+	incs[0] = UINT64_C(66);
+	incs[1] = UINT64_C(77);
+	cluster_reconfig_formation_qvotec_publish_observed(&marker, incs);
+
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+	for (t = 0; t < 3; t++)
+		cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
+	UT_ASSERT(!ut_xid_stripe_last_may_seed);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
+				 UINT64_C(0));
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
+	UT_ASSERT(!ut_xid_stripe_last_may_seed);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
+				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
+				 UINT64_C(77));
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+}
+
 UT_TEST(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits)
 {
 	ClusterReconfigState *state;
@@ -5979,7 +6886,7 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 int
 main(void)
 {
-	UT_PLAN(99);
+	UT_PLAN(114);
 
 	UT_RUN(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap);
 
@@ -6070,12 +6977,26 @@ main(void)
 	UT_RUN(test_ordinary_bootstrap_cannot_open_replacement_admitted_member);
 	UT_RUN(test_nonempty_invalid_replacement_episode_blocks_ordinary_openers);
 	UT_RUN(test_cold_bootstrap_records_exact_floor_before_opening_gate);
-	UT_RUN(test_cold_bootstrap_stripe_hold_publishes_control_member_only);
+	UT_RUN(test_initial_bootstrap_stripe_gate_publishes_control_member_only);
+	UT_RUN(test_late_initial_node_becomes_online_joiner);
+	UT_RUN(test_late_joiner_does_not_adopt_stale_peer_epoch);
+	UT_RUN(test_late_joiner_epoch_adoption_waits_for_exact_publish_window);
+	UT_RUN(test_late_joiner_deadline_starts_only_after_stripe_claim_owned);
+	UT_RUN(test_clean_leave_suppresses_late_joiner_classification_and_progress);
+	UT_RUN(test_epoch0_late_founder_classifies_only_after_recovery);
+	UT_RUN(test_epoch0_current_authority_is_not_reclassified_as_late_founder);
+	UT_RUN(test_pre_publish_join_handoff_is_exact_idempotent_and_nonblocking);
+	UT_RUN(test_pre_publish_join_handoff_rejects_nonexact_state);
+	UT_RUN(test_epoch0_managed_pivot_drives_ordinary_join_owner);
+	UT_RUN(test_epoch0_late_founder_evidence_requires_exact_peer_and_pgxa);
+	UT_RUN(test_late_joiner_stripe_refuse_is_terminal_fail_closed);
 	UT_RUN(test_offpath_member_requires_decided_boot_and_exact_current_floor);
 	UT_RUN(test_ordinary_self_floor_drift_and_high_water_fail_closed_then_retry);
 
 	/* spec-5.15 D5 — joiner write-gate lifecycle (INV-J9). */
 	UT_RUN(test_self_join_gate_lifecycle);
+	UT_RUN(test_online_join_waits_for_own_stripe_claim);
+	UT_RUN(test_online_join_waits_for_join_wal);
 	UT_RUN(test_replacement_member_publish_is_exact_and_write_closed);
 	UT_RUN(test_lmon_preserves_replacement_admitted_member_while_write_closed);
 	UT_RUN(test_uniform_open_requires_exact_replacement_episode_and_generation);
@@ -6109,6 +7030,7 @@ main(void)
 
 	/* RF-ROOT P9 verification / cold-formation cold-formation negative
 	 * legs (run last: leg admissions latch process-local state). */
+	UT_RUN(test_formation_marker_admission_waits_for_stripe);
 	UT_RUN(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits);
 	UT_RUN(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_replacement);
 	UT_RUN(test_initial_clean_snapshot_accepts_exact_initial_quorum_without_marker);

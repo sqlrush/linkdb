@@ -74,6 +74,14 @@ typedef enum ClusterXidStripeJoinVerdict {
 	CLUSTER_XID_STRIPE_JOIN_REFUSE		 /* config mismatch; fail-closed 53RB1 */
 } ClusterXidStripeJoinVerdict;
 
+/* Fine-grained progress used by the ordinary joiner's prerequisite owner. */
+typedef enum ClusterXidStripeJoinProgress {
+	STRIPE_JOIN_WAIT_EVIDENCE = 0,
+	STRIPE_JOIN_CLAIM_OWNED,
+	STRIPE_JOIN_PROCEED,
+	STRIPE_JOIN_REFUSE
+} ClusterXidStripeJoinProgress;
+
 /*
  * Published knowledge about THIS node's region-4 stripe slot (D5c).
  * MINE = a valid record naming this node, not retired (rejoin resumes
@@ -115,6 +123,7 @@ extern void cluster_xid_stripe_service_seed(const int *fds, int n_disks);
  * a seed request (single-shot) for qvotec when self_may_seed.
  */
 extern ClusterXidStripeJoinVerdict cluster_xid_stripe_join_gate(bool self_may_seed);
+extern ClusterXidStripeJoinProgress cluster_xid_stripe_join_progress(bool self_may_seed);
 
 /*
  * One-way lazy latch: populate the process-local stripe runtime from

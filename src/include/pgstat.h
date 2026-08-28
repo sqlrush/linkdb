@@ -467,6 +467,9 @@ extern void StatsShmemInit(void);
 extern void pgstat_restore_stats(void);
 extern void pgstat_discard_stats(void);
 extern void pgstat_before_server_shutdown(int code, Datum arg);
+#ifdef USE_PGRAC_CLUSTER
+extern void pgstat_prepare_for_server_shutdown_follower(void);
+#endif
 
 /* Functions for backend initialization */
 extern void pgstat_initialize(void);

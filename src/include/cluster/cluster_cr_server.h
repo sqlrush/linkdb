@@ -62,6 +62,7 @@
 #include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_tt_durable.h" /* ClusterTTDurableResolve */
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22d D4-6) */
 
 /* Split verdict for the server-side construction (see banner). */
@@ -129,10 +130,27 @@ extern ClusterUndoVerdictKind cluster_cr_server_c0_zero_match_verdict(
 	uint32 expected_tt_slot_id, bool no_raw_reuse_window, bool clog_is_committed,
 	bool clog_is_aborted, bool clog_is_in_progress, bool xid_is_in_progress);
 
+/* S8-815PRE-FRESHREF-C1B-01: pure exact-pair conjunction.  This classifier
+ * can return only COMMITTED_EXACT or UNKNOWN_FAIL_CLOSED; the existing
+ * COMMITTED_BOUND contract is intentionally unreachable here. */
+extern ClusterUndoVerdictKind cluster_cr_server_freshref_c1b_pair_verdict(
+	bool pair_request, bool xid_is_mine, uint32 expected_segment_id,
+	uint32 expected_tt_slot_id, bool no_raw_reuse_window, int raw_clog_status,
+	ClusterTTDurableResolve resolve, uint16 matched_segment, uint16 matched_slot,
+	SCN resolved_scn, SCN proposed_scn, bool retention_ok, SCN horizon_scn);
+extern bool cluster_cr_server_freshref_c1b_pair_request_decode(
+	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node,
+	int32 local_node, uint64 current_epoch, int max_backends,
+	uint32 *segment_id, TransactionId *xid, uint32 *expected_tt_slot_id,
+	SCN *proposed_scn);
+
 #ifdef USE_CLUSTER_UNIT
 extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
 	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
 	bool authoritative);
+extern ClusterUndoVerdictResult cluster_cr_server_test_own_xid_pair_verdict(
+	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
+	SCN proposed_scn);
 #endif
 
 /*
@@ -599,6 +617,10 @@ extern bool cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uin
 														  TransactionId xid, bool authoritative,
 														  ClusterGcsUndoVerdictPage *verdict_out,
 														  ClusterLiveAuthority *auth_out);
+extern bool cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
+	int32 origin_node, uint32 segment_id, uint32 expected_tt_slot_id,
+	TransactionId xid, uint32 ref_epoch, SCN proposed_scn,
+	ClusterGcsUndoVerdictPage *verdict_out, ClusterLiveAuthority *auth_out);
 
 /* Requester side (backend, spec-5.22d D4-6): ask the elected serve AUTHORITY
  * (a live survivor — NOT the dead owner) for a block0-proven verdict on the

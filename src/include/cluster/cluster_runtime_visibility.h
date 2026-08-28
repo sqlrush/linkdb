@@ -131,6 +131,15 @@ extern bool cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLive
  */
 extern bool cluster_vis_committed_bound_admissible(SCN horizon_scn, SCN read_scn);
 
+/* S8-815PRE-FRESHREF-C1B-01: requester-side immutable tuple gate for the
+ * exact retained-page pairing.  Pure and fail-closed; no authority/state is
+ * created by a true result. */
+extern bool cluster_vis_freshref_c1b_pair_request_eligible(
+	TransactionId raw_xid, TransactionId ref_xid, bool has_cached_status,
+	SCN cached_commit_scn, uint32 ref_epoch, uint64 current_epoch,
+	int32 origin_node, int32 local_node, uint32 segment_id,
+	uint32 expected_tt_slot_id);
+
 /*
  * Runtime wrapper: supplies the local membership epoch to the pure gate.
  * (cluster_runtime_visibility.c; the pure policy above is CP1.)

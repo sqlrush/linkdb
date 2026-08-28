@@ -418,4 +418,8 @@ ShutdownAuxiliaryProcess(int code, Datum arg)
 	LWLockReleaseAll();
 	ConditionVariableCancelSleep();
 	pgstat_report_wait_end();
+#ifdef USE_PGRAC_CLUSTER
+	if (MyAuxProcType >= LmonProcess && MyAuxProcType < NUM_AUXPROCTYPES)
+		pgstat_prepare_for_server_shutdown_follower();
+#endif
 }

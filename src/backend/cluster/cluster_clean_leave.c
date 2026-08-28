@@ -58,16 +58,22 @@
 #include "cluster/cluster_grd.h"	   /* GES cooperative drain + no-leftover verify (D4) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (D12) */
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_pcm_lock.h" /* PCM release-all-self + no-leftover verify (D5) */
 #include "cluster/cluster_qvotec.h"	  /* cluster_qvotec_in_quorum (request gate) */
 #include "cluster/cluster_reconfig.h" /* apply_clean_leave + record/is_clean_departed + join_in_progress */
+#include "cluster/cluster_recovery_duty.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_membership.h" /* v1.0.4 — cluster_membership_is_member (P1-2 INV-J8) */
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_voting_disk_io.h" /* leave-slot raw I/O + CLUSTER_VOTING_SLOT_BYTES */
+#include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
 
 /*
  * The shmem state must stay small enough to embed cheaply (§2.1).  The §2.5
@@ -84,6 +90,415 @@ volatile sig_atomic_t cluster_clean_leave_quiesce_pending = false;
 
 /* shmem singleton (NULL until attached). */
 static ClusterLeaveState *cl_state = NULL;
+
+/* LMON-only, boot-lifetime predecessor identity for the two same-wire Phase-1
+ * barrier rounds.  It is neither authority nor shared ABI: the receive handler
+ * records the exact ACTIVE-round nonce, then uses it only to reject a delayed
+ * ACTIVE frame after the sender's durable WAL state has advanced to STOPPED. */
+static uint64 cl_phase1_active_request_nonce[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+static uint64 cl_phase1_post_stopped_request_round_nonce;
+static uint8
+	cl_phase1_post_stopped_request_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+
+typedef struct ClPhase1PostStoppedRequestAhead {
+	bool valid;
+	bool retained_before_local_round;
+	uint8 _pad0[6];
+	uint64 source_active_nonce;
+	uint64 source_stopped_nonce;
+	uint64 local_attempt_nonce;
+	uint64 local_deadline_us;
+	uint64 epoch;
+	int64 own_wal_started_at;
+	uint64 member_incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+} ClPhase1PostStoppedRequestAhead;
+
+/* LMON-local receiver ownership for a transport-consumed STOPPED request that
+ * is exactly one lifecycle stage ahead of this node.  These four bounded slots
+ * are evidence retention only: they do not grant authority, extend a deadline,
+ * or survive the LMON process. */
+static ClPhase1PostStoppedRequestAhead
+	cl_phase1_post_stopped_request_ahead[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+
+
+static bool
+cl_phase1_bytes_zero(const uint8 *bytes, Size nbytes)
+{
+	Size i;
+
+	for (i = 0; i < nbytes; i++) {
+		if (bytes[i] != 0)
+			return false;
+	}
+	return true;
+}
+
+static bool
+cl_phase1_member_bit_is_set(const uint8 *bitmap, int32 node)
+{
+	return node >= 0 && node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		&& (bitmap[node / 8] & (uint8)(UINT8_C(1) << (node % 8))) != 0;
+}
+
+static void
+cl_phase1_member_bit_set(uint8 *bitmap, int32 node)
+{
+	Assert(node >= 0 && node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT);
+	bitmap[node / 8] |= (uint8)(UINT8_C(1) << (node % 8));
+}
+
+static void
+cl_phase1_full_stop_release_state_reset_locked(void)
+{
+	pg_atomic_write_u32(&cl_state->phase1_release_pending, 0);
+	pg_atomic_write_u32(&cl_state->phase1_release_transport_drained, 0);
+	memset(cl_state->phase1_post_stopped_reply_pending, 0,
+		   sizeof(cl_state->phase1_post_stopped_reply_pending));
+	memset(cl_state->phase1_post_stopped_reply_sent, 0,
+		   sizeof(cl_state->phase1_post_stopped_reply_sent));
+	memset(cl_state->phase1_release_request_sent, 0,
+		   sizeof(cl_state->phase1_release_request_sent));
+	memset(cl_state->phase1_release_request_seen, 0,
+		   sizeof(cl_state->phase1_release_request_seen));
+	memset(cl_state->phase1_release_reply_sent, 0,
+		   sizeof(cl_state->phase1_release_reply_sent));
+	memset(cl_state->phase1_release_reply_seen, 0,
+		   sizeof(cl_state->phase1_release_reply_seen));
+	memset(cl_state->phase1_release_receipt_sent, 0,
+		   sizeof(cl_state->phase1_release_receipt_sent));
+	memset(cl_state->phase1_release_receipt_seen, 0,
+		   sizeof(cl_state->phase1_release_receipt_seen));
+	memset(cl_state->phase1_release_request_nonce, 0,
+		   sizeof(cl_state->phase1_release_request_nonce));
+}
+
+
+/* Capture only existing authority/evidence.  The caller adds the local nonce
+ * and absolute deadline; neither is shared formation identity. */
+static bool
+cl_phase1_full_stop_capture_identity(uint32 expected_wal_state,
+									 bool require_shutdown_suppressed,
+									 ClusterPhase1FullStopPlan *out)
+{
+	ClusterFormationSnapshotV1 formation;
+	ClusterWalStateSlot wal_slot;
+	ReconfigEvent empty_event;
+	uint16 own_thread;
+	int node;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (cl_state == NULL || !cluster_enabled
+		|| cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| (require_shutdown_suppressed
+			&& !cluster_lmon_reconfig_suppressed())
+		|| cluster_qvotec_get_quorum_state() != CLUSTER_QVOTEC_QUORUM_OK
+		|| !cluster_qvotec_in_quorum()
+		|| !cluster_semantic_activation_phase1_pristine())
+		return false;
+	own_thread = cluster_wal_thread_id();
+	if (own_thread == 0
+		|| !cluster_reconfig_capture_formation_snapshot_v1(own_thread,
+													 &formation)
+		|| formation.local_epoch != 0
+		|| formation.prebump_sync_active != 0
+		|| formation.self_join_admitted == 0
+		|| formation.self_join_failed != 0)
+		return false;
+	memset(&empty_event, 0, sizeof(empty_event));
+	if (memcmp(&formation.applied, &empty_event, sizeof(empty_event)) != 0
+		|| !cl_phase1_bytes_zero(formation.pending_join_bitmap,
+									  sizeof(formation.pending_join_bitmap))
+		|| !cl_phase1_bytes_zero(formation.clean_departed_bitmap,
+									  sizeof(formation.clean_departed_bitmap))
+		|| !cl_phase1_bytes_zero(formation.removed_bitmap,
+									  sizeof(formation.removed_bitmap))
+		|| !cl_phase1_bytes_zero(formation.excluded_bitmap,
+									  sizeof(formation.excluded_bitmap)))
+		return false;
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		uint8 expected_state = node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+			? CLUSTER_MEMBER_MEMBER : CLUSTER_MEMBER_ABSENT;
+		uint64 incarnation
+			= formation.membership.last_admitted_incarnation[node];
+
+		if (formation.membership.membership_state[node] != expected_state)
+			return false;
+		if (node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT) {
+			if (incarnation == 0 || incarnation == UINT64_MAX)
+				return false;
+			out->member_incarnations[node] = incarnation;
+		} else if (incarnation != 0)
+			return false;
+	}
+	if (formation.victim_incarnation
+			!= out->member_incarnations[cluster_node_id]
+		|| cluster_qvotec_get_self_incarnation()
+			!= out->member_incarnations[cluster_node_id]
+		|| cluster_wal_state_read_slot(own_thread, &wal_slot)
+			!= CLUSTER_WAL_SLOT_OK
+		|| wal_slot.thread_id != own_thread
+		|| wal_slot.node_id != cluster_node_id
+		|| wal_slot.state != expected_wal_state
+		|| wal_slot.started_at <= 0)
+		return false;
+	out->epoch = formation.local_epoch;
+	out->own_wal_started_at = wal_slot.started_at;
+	return true;
+}
+
+
+static bool
+cl_phase1_full_stop_identity_matches(const ClusterPhase1FullStopPlan *plan,
+									 uint32 expected_wal_state)
+{
+	ClusterPhase1FullStopPlan current;
+
+	if (!cluster_clean_leave_phase1_full_stop_plan_valid(plan)
+		|| !cl_phase1_full_stop_capture_identity(expected_wal_state, true,
+												   &current))
+		return false;
+	return current.epoch == plan->epoch
+		&& current.own_wal_started_at == plan->own_wal_started_at
+		&& memcmp(current.member_incarnations, plan->member_incarnations,
+				  sizeof(plan->member_incarnations)) == 0;
+}
+
+
+static bool
+cl_phase1_full_stop_capture_barrier_identity(
+	ClusterPhase1FullStopPlan *out, uint32 *wal_state_out)
+{
+	if (cl_phase1_full_stop_capture_identity(
+			CLUSTER_WAL_SLOT_STATE_ACTIVE, true, out)) {
+		if (wal_state_out != NULL)
+			*wal_state_out = CLUSTER_WAL_SLOT_STATE_ACTIVE;
+		return true;
+	}
+	if (cl_phase1_full_stop_capture_identity(
+			CLUSTER_WAL_SLOT_STATE_STOPPED, true, out)) {
+		if (wal_state_out != NULL)
+			*wal_state_out = CLUSTER_WAL_SLOT_STATE_STOPPED;
+		return true;
+	}
+	return false;
+}
+
+
+/*
+ * Pre-shutdown retention predicate.  This reads the same exact phase-1
+ * formation/WAL identity as prepare_exact(), but intentionally does not
+ * require LMON suppression yet: the postmaster uses this result to retain the
+ * existing coordination stack and then establishes that suppression fence.
+ */
+bool
+cluster_clean_leave_phase1_full_stop_candidate(void)
+{
+	ClusterPhase1FullStopPlan candidate;
+
+	return cl_phase1_full_stop_capture_identity(
+		CLUSTER_WAL_SLOT_STATE_ACTIVE, false, &candidate);
+}
+
+
+/* Classify the authenticated sender from existing shared evidence.  The
+ * source's deterministic WAL thread identifies its current WAL slot.  In the
+ * pristine pre-R4 phase, exact current-formation STOPPED is the user-approved
+ * clean terminal; no control-root lifecycle exists or is inferred. */
+static bool
+cl_phase1_full_stop_capture_source_phase(
+	const ClusterPhase1FullStopPlan *current, int32 source_node,
+	bool *source_active_out, bool *source_stopped_out)
+{
+	ClusterWalStateSlot source_slot;
+	uint16 source_thread;
+
+	if (current == NULL
+		|| source_active_out == NULL
+		|| source_stopped_out == NULL
+		|| source_node < 0
+		|| source_node >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT)
+		return false;
+	*source_active_out = false;
+	*source_stopped_out = false;
+	source_thread = cluster_wal_thread_id_for(true, source_node);
+	if (source_thread == 0
+		|| cluster_wal_state_read_slot(source_thread, &source_slot)
+			!= CLUSTER_WAL_SLOT_OK
+		|| source_slot.thread_id != source_thread
+		|| source_slot.node_id != source_node
+		|| source_slot.started_at <= 0)
+		return false;
+	if (source_slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE) {
+		*source_active_out = true;
+		return true;
+	}
+	if (source_slot.state == CLUSTER_WAL_SLOT_STATE_STOPPED) {
+		*source_stopped_out = true;
+		return true;
+	}
+	return false;
+}
+
+
+static bool
+cl_phase1_full_stop_request_ahead_identity_matches(
+	const ClPhase1PostStoppedRequestAhead *ahead,
+	const ClusterPhase1FullStopPlan *current)
+{
+	return ahead != NULL && ahead->valid && current != NULL
+		&& ahead->epoch == current->epoch
+		&& ahead->own_wal_started_at == current->own_wal_started_at
+		&& memcmp(ahead->member_incarnations,
+				  current->member_incarnations,
+				  sizeof(ahead->member_incarnations)) == 0;
+}
+
+
+static ClusterPhase1FullStopProbeNonceDecision
+cl_phase1_full_stop_retain_request_ahead_locked(
+	const ClusterPhase1FullStopPlan *current, uint32 local_wal_state,
+	int32 source_node, uint64 incoming_nonce)
+{
+	ClPhase1PostStoppedRequestAhead *ahead;
+	ClusterPhase1FullStopProbeNonceDecision decision;
+	uint64 active_nonce;
+	uint64 local_nonce;
+	uint64 deadline_us;
+	bool same_local_round = false;
+
+	Assert(LWLockHeldByMeInMode(&cl_state->lock, LW_EXCLUSIVE));
+	Assert(source_node >= 0
+		   && source_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT);
+	ahead = &cl_phase1_post_stopped_request_ahead[source_node];
+	active_nonce = cl_phase1_active_request_nonce[source_node];
+	decision = cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
+		active_nonce, ahead->valid ? ahead->source_stopped_nonce : 0,
+		incoming_nonce);
+	if (decision == CLUSTER_PHASE1_PROBE_NONCE_STALE_ACTIVE
+		|| decision == CLUSTER_PHASE1_PROBE_NONCE_CONFLICT)
+		return decision;
+
+	local_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	deadline_us = cl_state->barrier_deadline_us;
+	if (ahead->valid) {
+		if (ahead->retained_before_local_round) {
+			if (local_wal_state == CLUSTER_WAL_SLOT_STATE_ACTIVE)
+				same_local_round = local_nonce == ahead->local_attempt_nonce;
+			else if (local_wal_state == CLUSTER_WAL_SLOT_STATE_STOPPED)
+				same_local_round
+					= cluster_clean_leave_phase1_full_stop_nonce_fresh(
+						ahead->local_attempt_nonce, local_nonce);
+		} else if (local_wal_state == CLUSTER_WAL_SLOT_STATE_STOPPED)
+			same_local_round = local_nonce == ahead->local_attempt_nonce;
+		if (!same_local_round
+			|| ahead->source_active_nonce != active_nonce
+			|| ahead->local_deadline_us != deadline_us
+			|| !cl_phase1_full_stop_request_ahead_identity_matches(
+				ahead, current))
+			return CLUSTER_PHASE1_PROBE_NONCE_CONFLICT;
+		return decision;
+	}
+
+	if (decision != CLUSTER_PHASE1_PROBE_NONCE_ACCEPT_STOPPED
+		|| current == NULL
+		|| (local_wal_state != CLUSTER_WAL_SLOT_STATE_ACTIVE
+			&& local_wal_state != CLUSTER_WAL_SLOT_STATE_STOPPED)
+		|| pg_atomic_read_u32(&cl_state->request_in_progress) == 0
+		|| pg_atomic_read_u32(&cl_state->shutdown_driven) == 0
+		|| active_nonce == 0 || active_nonce == UINT64_MAX
+		|| local_nonce == 0 || local_nonce == UINT64_MAX
+		|| deadline_us == 0 || deadline_us == UINT64_MAX)
+		return CLUSTER_PHASE1_PROBE_NONCE_CONFLICT;
+
+	memset(ahead, 0, sizeof(*ahead));
+	ahead->valid = true;
+	ahead->retained_before_local_round
+		= cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
+			local_wal_state == CLUSTER_WAL_SLOT_STATE_ACTIVE,
+			local_wal_state == CLUSTER_WAL_SLOT_STATE_STOPPED,
+			pg_atomic_read_u32(&cl_state->preflight_pending) != 0);
+	ahead->source_active_nonce = active_nonce;
+	ahead->source_stopped_nonce = incoming_nonce;
+	ahead->local_attempt_nonce = local_nonce;
+	ahead->local_deadline_us = deadline_us;
+	ahead->epoch = current->epoch;
+	ahead->own_wal_started_at = current->own_wal_started_at;
+	memcpy(ahead->member_incarnations, current->member_incarnations,
+		   sizeof(ahead->member_incarnations));
+	return decision;
+}
+
+
+static bool
+cl_phase1_full_stop_consume_request_ahead_locked(
+	const ClusterPhase1FullStopPlan *current, int32 source_node,
+	uint64 local_nonce, uint64 deadline_us, bool post_requests_sent)
+{
+	ClPhase1PostStoppedRequestAhead *ahead;
+	ClusterPhase1FullStopProbeNonceDecision decision;
+	uint64 stored_nonce;
+	bool exact_identity;
+
+	Assert(LWLockHeldByMeInMode(&cl_state->lock, LW_EXCLUSIVE));
+	Assert(source_node >= 0
+		   && source_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT);
+	ahead = &cl_phase1_post_stopped_request_ahead[source_node];
+	if (!ahead->valid)
+		return true;
+	exact_identity
+		= cl_phase1_full_stop_request_ahead_identity_matches(ahead, current)
+		  && ahead->source_active_nonce
+			 == cl_phase1_active_request_nonce[source_node];
+	if (!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
+			ahead->valid, ahead->retained_before_local_round,
+			ahead->local_attempt_nonce, ahead->local_deadline_us,
+			local_nonce, deadline_us, exact_identity,
+			pg_atomic_read_u32(&cl_state->request_in_progress) != 0,
+			pg_atomic_read_u32(&cl_state->shutdown_driven) != 0,
+			post_requests_sent))
+		return false;
+
+	stored_nonce = cl_state->phase1_release_request_nonce[source_node];
+	decision = cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
+		ahead->source_active_nonce, stored_nonce,
+		ahead->source_stopped_nonce);
+	if (decision == CLUSTER_PHASE1_PROBE_NONCE_ACCEPT_STOPPED)
+		cl_state->phase1_release_request_nonce[source_node]
+			= ahead->source_stopped_nonce;
+	else if (decision != CLUSTER_PHASE1_PROBE_NONCE_DUPLICATE_STOPPED)
+		return false;
+	cl_phase1_member_bit_set(
+		cl_state->phase1_post_stopped_reply_pending, source_node);
+	memset(ahead, 0, sizeof(*ahead));
+	return true;
+}
+
+
+static void
+cl_phase1_full_stop_release(const ClusterPhase1FullStopPlan *plan)
+{
+	if (cl_state == NULL || plan == NULL)
+		return;
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+		== plan->attempt_nonce) {
+		pg_atomic_write_u32(&cl_state->preflight_pending, 0);
+		pg_atomic_write_u32(&cl_state->preflight_sent, 0);
+		pg_atomic_write_u32(&cl_state->shutdown_driven, 0);
+		pg_atomic_write_u32(&cl_state->nak_received, 0);
+		pg_atomic_write_u32(&cl_state->nak_reason,
+							(uint32)CLUSTER_LEAVE_NAK_NONE);
+		pg_atomic_write_u64(&cl_state->leave_attempt_nonce, 0);
+		cl_state->barrier_deadline_us = 0;
+		memset(cl_state->ack_bitmap, 0, sizeof(cl_state->ack_bitmap));
+		cl_phase1_full_stop_release_state_reset_locked();
+		pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+	}
+	LWLockRelease(&cl_state->lock);
+}
 
 
 /* ============================================================
@@ -134,6 +549,8 @@ cluster_clean_leave_shmem_init(void)
 		pg_atomic_init_u32(&cl_state->shutdown_driven, 0);
 		/* Hardening v1.0.3 (P1 same-node serialization + preflight-incomplete reason). */
 		pg_atomic_init_u32(&cl_state->request_in_progress, 0);
+		pg_atomic_init_u32(&cl_state->phase1_release_pending, 0);
+		pg_atomic_init_u32(&cl_state->phase1_release_transport_drained, 0);
 		pg_atomic_init_u32(&cl_state->abort_reason, (uint32)CLUSTER_LEAVE_ABORT_NONE);
 		/* §2.5 leave-marker submit mailbox. */
 		cl_state->qvotec_latch = NULL;
@@ -392,6 +809,194 @@ cluster_clean_leave_check_pending_in_proc_interrupts(void)
 /* spec-2.29a ②b: forward decls — the bind sites (below) snapshot the
  * others-dead set that the coherence gate (defined near drive_drain) compares. */
 static void cl_others_dead_snapshot(int32 leaving, uint8 *out);
+static bool cl_phase1_full_stop_all_peer_bits(const uint8 *bitmap);
+
+static ClusterICSendResult
+cl_phase1_full_stop_send_release_announce(int32 dest_node, uint8 wire_round,
+										 uint64 nonce)
+{
+	ClusterLeaveAnnouncePayload p;
+
+	Assert(wire_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE
+		   || wire_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT);
+	memset(&p, 0, sizeof(p));
+	p.magic = CLUSTER_CLEAN_LEAVE_IC_MAGIC;
+	p.version = CLUSTER_CLEAN_LEAVE_IC_VERSION;
+	p.leaving_node_id = cluster_node_id;
+	p.preflight = wire_round;
+	p.producer_kind = CLUSTER_LEAVE_PRODUCER_SHUTDOWN;
+	p.leave_epoch = 0;
+	p.cssd_dead_generation = 0;
+	p.leave_nonce = nonce;
+	cluster_clean_leave_announce_compute_crc(&p);
+	return cluster_ic_send_envelope(PGRAC_IC_MSG_CLEAN_LEAVE_ANNOUNCE,
+								 dest_node, &p, (uint32)sizeof(p));
+}
+
+static ClusterICSendResult
+cl_phase1_full_stop_send_release_reply(int32 dest_node, uint64 nonce)
+{
+	ClusterLeaveAckPayload p;
+
+	memset(&p, 0, sizeof(p));
+	p.magic = CLUSTER_CLEAN_LEAVE_IC_MAGIC;
+	p.version = CLUSTER_CLEAN_LEAVE_IC_VERSION;
+	p.survivor_node_id = cluster_node_id;
+	p.leaving_node_id = dest_node;
+	p.leave_epoch = 0;
+	p.leave_nonce = nonce;
+	p.nak = 0;
+	p.nak_reason = CLUSTER_LEAVE_NAK_NONE;
+	p.phase1_round = CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE;
+	cluster_clean_leave_ack_compute_crc(&p);
+	return cluster_ic_send_envelope(PGRAC_IC_MSG_LEAVE_DRAIN_ACK,
+								 dest_node, &p, (uint32)sizeof(p));
+}
+
+static ClusterICSendResult
+cl_phase1_full_stop_send_post_stopped_request(int32 dest_node, uint64 nonce)
+{
+	ClusterLeaveAnnouncePayload p;
+
+	memset(&p, 0, sizeof(p));
+	p.magic = CLUSTER_CLEAN_LEAVE_IC_MAGIC;
+	p.version = CLUSTER_CLEAN_LEAVE_IC_VERSION;
+	p.leaving_node_id = cluster_node_id;
+	p.preflight = CLUSTER_PHASE1_FULL_STOP_WIRE_BARRIER;
+	p.producer_kind = CLUSTER_LEAVE_PRODUCER_SHUTDOWN;
+	p.leave_epoch = 0;
+	p.cssd_dead_generation = cluster_cssd_get_dead_generation();
+	p.leave_nonce = nonce;
+	cluster_clean_leave_announce_compute_crc(&p);
+	return cluster_ic_send_envelope(PGRAC_IC_MSG_CLEAN_LEAVE_ANNOUNCE,
+								 dest_node, &p, (uint32)sizeof(p));
+}
+
+/* The post-STOPPED barrier reply uses the existing ACK shape.  Unlike the
+ * generic inline ACK helper, its transport-admission result is retained by the
+ * current phase-1 round so NOT_ADMITTED can be retried by LMON without
+ * refreshing the round's absolute deadline. */
+static ClusterICSendResult
+cl_phase1_full_stop_send_post_stopped_reply(int32 dest_node, uint64 nonce)
+{
+	ClusterLeaveAckPayload p;
+
+	memset(&p, 0, sizeof(p));
+	p.magic = CLUSTER_CLEAN_LEAVE_IC_MAGIC;
+	p.version = CLUSTER_CLEAN_LEAVE_IC_VERSION;
+	p.survivor_node_id = cluster_node_id;
+	p.leaving_node_id = dest_node;
+	p.leave_epoch = 0;
+	p.leave_nonce = nonce;
+	p.nak = 0;
+	p.nak_reason = CLUSTER_LEAVE_NAK_NONE;
+	p.phase1_round = 0;
+	cluster_clean_leave_ack_compute_crc(&p);
+	return cluster_ic_send_envelope(PGRAC_IC_MSG_LEAVE_DRAIN_ACK,
+								 dest_node, &p, (uint32)sizeof(p));
+}
+
+static void
+cl_phase1_full_stop_release_announce_handler(
+	const ClusterICEnvelope *env, const ClusterLeaveAnnouncePayload *p)
+{
+	ClusterPhase1FullStopPlan current;
+	uint64 stored_nonce;
+	uint64 now_us;
+	int32 source_node = (int32)env->source_node_id;
+	bool source_active = false;
+	bool source_stopped = false;
+	bool phase_exact;
+	bool exact;
+	bool round_active;
+	bool wake = false;
+
+	exact = cl_phase1_full_stop_capture_identity(
+		CLUSTER_WAL_SLOT_STATE_STOPPED, true, &current);
+	phase_exact = exact && cl_phase1_full_stop_capture_source_phase(
+		&current, source_node, &source_active, &source_stopped);
+	(void)source_active;
+	exact = phase_exact
+		&& source_stopped
+		&& p->leaving_node_id == source_node
+		&& env->epoch == p->leave_epoch
+		&& p->leave_epoch == 0
+		&& p->leave_nonce != 0
+		&& p->leave_nonce != UINT64_MAX;
+
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	current.valid = true;
+	current.attempt_nonce
+		= pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	current.absolute_deadline_us = cl_state->barrier_deadline_us;
+	now_us = (uint64)GetCurrentTimestamp();
+	round_active
+		= pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+		  && pg_atomic_read_u32(&cl_state->shutdown_driven) != 0;
+	exact = exact
+		&& cluster_clean_leave_phase1_full_stop_plan_valid(&current)
+		&& round_active
+		&& now_us < current.absolute_deadline_us;
+	if (!exact) {
+		if (round_active) {
+			pg_atomic_write_u32(&cl_state->nak_received, 1);
+			wake = true;
+		}
+		LWLockRelease(&cl_state->lock);
+		goto out;
+	}
+
+	stored_nonce = cl_state->phase1_release_request_nonce[source_node];
+	if (p->preflight == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE) {
+		exact = cluster_clean_leave_phase1_full_stop_release_probe_accepts(
+			p->producer_kind, p->preflight, source_node,
+			p->leaving_node_id, env->epoch, p->leave_epoch,
+			p->leave_nonce, source_stopped, true, true);
+		if (!exact
+			|| (stored_nonce != 0 && stored_nonce != p->leave_nonce)) {
+			pg_atomic_write_u32(&cl_state->nak_received, 1);
+			wake = true;
+		} else {
+			if (stored_nonce == 0)
+				cl_state->phase1_release_request_nonce[source_node]
+					= p->leave_nonce;
+			if (!cl_phase1_member_bit_is_set(
+					cl_state->phase1_release_request_seen, source_node)) {
+				cl_phase1_member_bit_set(
+					cl_state->phase1_release_request_seen, source_node);
+				wake = true;
+			}
+		}
+	} else if (p->preflight == CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT) {
+		/* A receipt is accepted only for the exact reply already admitted for
+		 * this peer's retained request.  The peer may consume and return it
+		 * before this LMON publishes reply_sent after dispatch; final completion
+		 * still requires that local bit.  A receipt is terminal and receives no
+		 * reply. */
+		if (!cluster_clean_leave_phase1_full_stop_receipt_accepts(
+				p->producer_kind, p->preflight,
+				pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0,
+				stored_nonce, p->leave_nonce,
+				cl_phase1_member_bit_is_set(
+					cl_state->phase1_release_request_seen, source_node))) {
+			pg_atomic_write_u32(&cl_state->nak_received, 1);
+			wake = true;
+		} else if (!cl_phase1_member_bit_is_set(
+				   cl_state->phase1_release_receipt_seen, source_node)) {
+			cl_phase1_member_bit_set(
+				cl_state->phase1_release_receipt_seen, source_node);
+			wake = true;
+		}
+	} else {
+		pg_atomic_write_u32(&cl_state->nak_received, 1);
+		wake = true;
+	}
+	LWLockRelease(&cl_state->lock);
+
+out:
+	if (wake && ProcGlobal->checkpointerLatch != NULL)
+		SetLatch(ProcGlobal->checkpointerLatch);
+}
 
 static void
 cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
@@ -408,6 +1013,158 @@ cl_announce_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 	}
 	leaving = p->leaving_node_id;
+	if (p->producer_kind == CLUSTER_LEAVE_PRODUCER_SHUTDOWN
+		&& (p->preflight == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE
+			|| p->preflight == CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT)) {
+		cl_phase1_full_stop_release_announce_handler(env, p);
+		return;
+	}
+
+	/* User-approved phase-1 full-cluster clean stop: the existing SHUTDOWN
+	 * preflight kind is an exact, side-effect-free barrier probe.  It must run
+	 * before the ordinary single-leave busy gate because every participant owns
+	 * its own simultaneous local request reservation. */
+	if (p->producer_kind == CLUSTER_LEAVE_PRODUCER_SHUTDOWN
+		&& p->preflight == CLUSTER_PHASE1_FULL_STOP_WIRE_BARRIER) {
+		ClusterPhase1FullStopPlan current;
+		uint32 local_wal_state = 0;
+		bool source_active = false;
+		bool source_stopped = false;
+		bool local_post_stopped_receiver_ready = false;
+		bool local_post_stopped_requests_sent = false;
+		bool phase_exact = false;
+		bool base_eligible;
+		bool base_accept;
+		bool accept;
+		bool wake = false;
+
+		base_eligible = cl_phase1_full_stop_capture_barrier_identity(
+			&current, &local_wal_state);
+		if (base_eligible)
+			phase_exact = cl_phase1_full_stop_capture_source_phase(
+				&current, (int32)env->source_node_id,
+				&source_active, &source_stopped);
+		base_eligible = base_eligible && phase_exact;
+		base_accept = cluster_clean_leave_phase1_full_stop_probe_accepts(
+			p->producer_kind, p->preflight != 0,
+			(int32)env->source_node_id, leaving, env->epoch,
+			p->leave_epoch, p->leave_nonce,
+			cluster_lmon_reconfig_suppressed(), base_eligible);
+		if (base_accept && source_stopped) {
+			LWLockAcquire(&cl_state->lock, LW_SHARED);
+			local_post_stopped_requests_sent
+				= cl_phase1_post_stopped_request_round_nonce
+					  == pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+				  && cl_phase1_full_stop_all_peer_bits(
+					  cl_phase1_post_stopped_request_sent);
+			local_post_stopped_receiver_ready
+				= cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
+					local_wal_state == CLUSTER_WAL_SLOT_STATE_STOPPED,
+					pg_atomic_read_u32(&cl_state->request_in_progress) != 0,
+					pg_atomic_read_u32(&cl_state->shutdown_driven) != 0,
+					pg_atomic_read_u32(&cl_state->preflight_pending) != 0,
+					local_post_stopped_requests_sent,
+					pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0);
+			LWLockRelease(&cl_state->lock);
+		}
+		/* DONE/WOULD_BLOCK transferred semantic ownership of this exact frame
+		 * to the receiver.  If the peer is one lifecycle stage ahead, retain it
+		 * in the bounded LMON-local slot; never discard it and hope for a resend
+		 * after transport ownership has already moved. */
+		if (base_accept && source_stopped
+			&& !local_post_stopped_receiver_ready) {
+			ClusterPhase1FullStopProbeNonceDecision ahead_decision;
+
+			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+			ahead_decision
+				= cl_phase1_full_stop_retain_request_ahead_locked(
+					&current, local_wal_state,
+					(int32)env->source_node_id, p->leave_nonce);
+			if (ahead_decision == CLUSTER_PHASE1_PROBE_NONCE_CONFLICT) {
+				pg_atomic_write_u32(&cl_state->nak_received, 1);
+				wake = true;
+			}
+			LWLockRelease(&cl_state->lock);
+			if (wake && ProcGlobal->checkpointerLatch != NULL)
+				SetLatch(ProcGlobal->checkpointerLatch);
+			return;
+		}
+		accept = base_accept
+			&& cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
+				source_active, source_stopped,
+				local_wal_state == CLUSTER_WAL_SLOT_STATE_ACTIVE,
+				local_wal_state == CLUSTER_WAL_SLOT_STATE_STOPPED);
+		if (accept && source_active) {
+			int32 source_node = (int32)env->source_node_id;
+			uint64 active_nonce;
+
+			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+			active_nonce = cl_phase1_active_request_nonce[source_node];
+			if (active_nonce == 0)
+				cl_phase1_active_request_nonce[source_node] = p->leave_nonce;
+			else if (active_nonce != p->leave_nonce) {
+				pg_atomic_write_u32(&cl_state->nak_received, 1);
+				accept = false;
+				wake = true;
+			}
+			LWLockRelease(&cl_state->lock);
+		}
+		if (accept && source_stopped
+			&& local_wal_state == CLUSTER_WAL_SLOT_STATE_STOPPED) {
+			int32 source_node = (int32)env->source_node_id;
+			uint64 active_nonce;
+			uint64 local_nonce;
+			uint64 deadline_us;
+			uint64 stored_nonce;
+			ClusterPhase1FullStopProbeNonceDecision nonce_decision;
+
+			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+			local_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+			deadline_us = cl_state->barrier_deadline_us;
+			if (!cl_phase1_full_stop_consume_request_ahead_locked(
+					&current, source_node, local_nonce, deadline_us,
+					local_post_stopped_requests_sent)) {
+				pg_atomic_write_u32(&cl_state->nak_received, 1);
+				accept = false;
+				wake = true;
+				nonce_decision = CLUSTER_PHASE1_PROBE_NONCE_CONFLICT;
+			} else {
+				active_nonce = cl_phase1_active_request_nonce[source_node];
+				stored_nonce
+					= cl_state->phase1_release_request_nonce[source_node];
+				nonce_decision
+					= cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
+						active_nonce, stored_nonce, p->leave_nonce);
+			}
+			if (nonce_decision == CLUSTER_PHASE1_PROBE_NONCE_STALE_ACTIVE) {
+				LWLockRelease(&cl_state->lock);
+				return;
+			}
+			if (nonce_decision == CLUSTER_PHASE1_PROBE_NONCE_CONFLICT) {
+				pg_atomic_write_u32(&cl_state->nak_received, 1);
+				wake = true;
+			} else {
+				if (nonce_decision
+					== CLUSTER_PHASE1_PROBE_NONCE_ACCEPT_STOPPED)
+					cl_state->phase1_release_request_nonce[source_node]
+						= p->leave_nonce;
+				cl_phase1_member_bit_set(
+					cl_state->phase1_post_stopped_reply_pending,
+					source_node);
+				wake = true;
+			}
+			LWLockRelease(&cl_state->lock);
+		} else {
+			cluster_clean_leave_ic_send_ack(
+				(int32)env->source_node_id, leaving, p->leave_epoch,
+				p->leave_nonce, !accept,
+				accept ? (uint8)CLUSTER_LEAVE_NAK_NONE
+					   : (uint8)CLUSTER_LEAVE_NAK_LEAVE_IN_PROGRESS);
+		}
+		if (wake && ProcGlobal->checkpointerLatch != NULL)
+			SetLatch(ProcGlobal->checkpointerLatch);
+		return;
+	}
 
 	/* Disabled survivor: fail-closed reply NAK(disabled), never silent.  Echoes
 	 * the announce nonce (P2) and is reachable on BOTH the preflight probe and the
@@ -648,6 +1405,88 @@ cl_ack_handler(const ClusterICEnvelope *env, const void *payload)
 		return;
 
 	is_nak = (env->msg_type == PGRAC_IC_MSG_LEAVE_DRAIN_NAK);
+	if (p->phase1_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE) {
+		ClusterPhase1FullStopPlan current;
+		bool exact;
+
+		/* A release reply is the only nonzero ACK discriminator.  It is
+		 * consumed only in the exact STOPPED release round; a matching receipt
+		 * is then staged by LMON rather than emitted from this callback. */
+		exact = !is_nak
+			&& env->msg_type == PGRAC_IC_MSG_LEAVE_DRAIN_ACK
+			&& pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
+			&& cl_phase1_full_stop_capture_identity(
+				CLUSTER_WAL_SLOT_STATE_STOPPED, true, &current);
+		if (exact) {
+			current.valid = true;
+			current.attempt_nonce = pg_atomic_read_u64(
+				&cl_state->leave_attempt_nonce);
+			current.absolute_deadline_us = cl_state->barrier_deadline_us;
+			exact = env->epoch == p->leave_epoch
+				&& p->survivor_node_id >= 0
+				&& p->survivor_node_id
+					< CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+				&& cluster_clean_leave_phase1_full_stop_ack_matches(
+					&current, cluster_node_id,
+					(int32)env->source_node_id, p->survivor_node_id,
+					p->leaving_node_id, p->leave_epoch, p->leave_nonce,
+					current.member_incarnations[p->survivor_node_id]);
+		}
+		if (!exact)
+			return;
+		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		if (pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
+			&& p->leave_nonce
+				== pg_atomic_read_u64(&cl_state->leave_attempt_nonce))
+			cl_phase1_member_bit_set(
+				cl_state->phase1_release_reply_seen,
+				p->survivor_node_id);
+		LWLockRelease(&cl_state->lock);
+		if (ProcGlobal->checkpointerLatch != NULL)
+			SetLatch(ProcGlobal->checkpointerLatch);
+		return;
+	}
+
+	if (pg_atomic_read_u32(&cl_state->shutdown_driven) != 0
+		&& pg_atomic_read_u32(&cl_state->preflight_pending) != 0) {
+		ClusterPhase1FullStopPlan current;
+		bool exact;
+
+		exact = cl_phase1_full_stop_capture_barrier_identity(
+			&current, NULL);
+		if (exact) {
+			current.valid = true;
+			current.attempt_nonce = pg_atomic_read_u64(
+				&cl_state->leave_attempt_nonce);
+			current.absolute_deadline_us = cl_state->barrier_deadline_us;
+			exact = env->epoch == p->leave_epoch
+				&& p->survivor_node_id >= 0
+				&& p->survivor_node_id
+					< CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+				&& cluster_clean_leave_phase1_full_stop_ack_matches(
+					&current, cluster_node_id,
+					(int32)env->source_node_id, p->survivor_node_id,
+					p->leaving_node_id, p->leave_epoch, p->leave_nonce,
+					current.member_incarnations[p->survivor_node_id]);
+		}
+		if (!exact)
+			return;
+		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		if (p->leave_nonce
+			== pg_atomic_read_u64(&cl_state->leave_attempt_nonce)) {
+			if (is_nak) {
+				pg_atomic_write_u32(&cl_state->nak_reason,
+								(uint32)p->nak_reason);
+				pg_atomic_write_u32(&cl_state->nak_received, 1);
+			} else
+				cl_state->ack_bitmap[p->survivor_node_id / 8]
+					|= (uint8)(1u << (p->survivor_node_id % 8));
+		}
+		LWLockRelease(&cl_state->lock);
+		if (ProcGlobal->checkpointerLatch != NULL)
+			SetLatch(ProcGlobal->checkpointerLatch);
+		return;
+	}
 
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	if (is_nak) {
@@ -1602,6 +2441,432 @@ cluster_clean_leave_request(void)
 }
 
 /*
+ * User-approved phase-1 coordinated full-cluster clean stop.  This is a
+ * pre-checkpoint, non-authorizing barrier over the existing SHUTDOWN preflight
+ * frame.  It does not publish a leave marker, enter the leave FSM, drain any
+ * holder, remaster, or rebind a survivor.
+ */
+ClusterPhase1FullStopPrepareResult
+cluster_clean_leave_phase1_full_stop_prepare_exact(
+	ClusterPhase1FullStopPlan *plan_out)
+{
+	ClusterPhase1FullStopPlan plan;
+	uint64 now_us;
+	uint64 timeout_us;
+	uint64 prior_nonce;
+	uint32 expected = 0;
+	bool complete = false;
+
+	if (plan_out == NULL)
+		return CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED;
+	memset(plan_out, 0, sizeof(*plan_out));
+	if (!cl_phase1_full_stop_capture_identity(
+			CLUSTER_WAL_SLOT_STATE_ACTIVE, true, &plan))
+		return CLUSTER_PHASE1_FULL_STOP_NOT_APPLICABLE;
+	now_us = (uint64)GetCurrentTimestamp();
+	if (cluster_clean_leave_drain_timeout_ms <= 0
+		|| (uint64)cluster_clean_leave_drain_timeout_ms
+			> UINT64_MAX / UINT64_C(1000))
+		return CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED;
+	timeout_us
+		= (uint64)cluster_clean_leave_drain_timeout_ms * UINT64_C(1000);
+	if (now_us == 0 || now_us == UINT64_MAX
+		|| now_us > UINT64_MAX - timeout_us)
+		return CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED;
+	if (!pg_atomic_compare_exchange_u32(&cl_state->request_in_progress,
+										&expected, 1))
+		return CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED;
+
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	if (cl_state->leaving_node_id != -1
+		|| pg_atomic_read_u32(&cl_state->phase) != CLUSTER_LEAVE_IDLE) {
+		LWLockRelease(&cl_state->lock);
+		pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+		return CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED;
+	}
+	prior_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	plan.attempt_nonce = now_us;
+	if (plan.attempt_nonce == prior_nonce) {
+		if (plan.attempt_nonce == UINT64_MAX - 1) {
+			LWLockRelease(&cl_state->lock);
+			pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+			return CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED;
+		}
+		plan.attempt_nonce++;
+	}
+	plan.absolute_deadline_us = now_us + timeout_us;
+	plan.valid = true;
+	if (!cluster_clean_leave_phase1_full_stop_plan_valid(&plan)) {
+		LWLockRelease(&cl_state->lock);
+		pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+		return CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED;
+	}
+	pg_atomic_write_u64(&cl_state->leave_attempt_nonce,
+						plan.attempt_nonce);
+	cl_state->barrier_deadline_us = plan.absolute_deadline_us;
+	memset(cl_state->ack_bitmap, 0, sizeof(cl_state->ack_bitmap));
+	cl_phase1_full_stop_release_state_reset_locked();
+	pg_atomic_write_u32(&cl_state->nak_received, 0);
+	pg_atomic_write_u32(&cl_state->nak_reason,
+						(uint32)CLUSTER_LEAVE_NAK_NONE);
+	pg_atomic_write_u32(&cl_state->preflight_sent, 0);
+	pg_atomic_write_u32(&cl_state->shutdown_driven, 1);
+	pg_atomic_write_u32(&cl_state->preflight_pending, 1);
+	LWLockRelease(&cl_state->lock);
+
+	for (;;) {
+		uint8 ack_bitmap[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		bool nak;
+		long timeout_ms;
+
+		ResetLatch(MyLatch);
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		memcpy(ack_bitmap, cl_state->ack_bitmap, sizeof(ack_bitmap));
+		nak = pg_atomic_read_u32(&cl_state->nak_received) != 0;
+		LWLockRelease(&cl_state->lock);
+		if (nak)
+			break;
+		if (cluster_clean_leave_phase1_full_stop_ack_complete(
+				&plan, cluster_node_id, ack_bitmap, sizeof(ack_bitmap))) {
+			complete = cl_phase1_full_stop_identity_matches(
+				&plan, CLUSTER_WAL_SLOT_STATE_ACTIVE);
+			break;
+		}
+		now_us = (uint64)GetCurrentTimestamp();
+		if (now_us >= plan.absolute_deadline_us)
+			break;
+		timeout_ms = (long)((plan.absolute_deadline_us - now_us
+							 + UINT64_C(999)) / UINT64_C(1000));
+		if (timeout_ms > INT_MAX)
+			timeout_ms = INT_MAX;
+		(void)WaitLatch(MyLatch,
+						WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						timeout_ms,
+						WAIT_EVENT_RECONFIG_BARRIER_WAIT);
+		CHECK_FOR_INTERRUPTS();
+	}
+
+	if (!complete) {
+		cl_phase1_full_stop_release(&plan);
+		return CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED;
+	}
+	pg_atomic_write_u32(&cl_state->preflight_pending, 0);
+	memcpy(plan_out, &plan, sizeof(plan));
+	return CLUSTER_PHASE1_FULL_STOP_READY;
+}
+
+static bool
+cl_phase1_full_stop_post_stopped_barrier(
+	ClusterPhase1FullStopPlan *plan)
+{
+	uint64 prior_nonce;
+	uint64 next_nonce;
+	uint64 now_us;
+	bool complete = false;
+
+	if (!cluster_clean_leave_phase1_full_stop_plan_valid(plan)
+		|| !cl_phase1_full_stop_identity_matches(
+			plan, CLUSTER_WAL_SLOT_STATE_STOPPED))
+		return false;
+	now_us = (uint64)GetCurrentTimestamp();
+	if (now_us == 0 || now_us == UINT64_MAX
+		|| now_us >= plan->absolute_deadline_us)
+		return false;
+	prior_nonce = plan->attempt_nonce;
+	next_nonce = now_us;
+	if (!cluster_clean_leave_phase1_full_stop_nonce_fresh(
+			prior_nonce, next_nonce)) {
+		if (prior_nonce < UINT64_MAX - 1)
+			next_nonce = prior_nonce + 1;
+		else
+			next_nonce = prior_nonce - 1;
+	}
+	if (!cluster_clean_leave_phase1_full_stop_nonce_fresh(
+			prior_nonce, next_nonce))
+		return false;
+
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u32(&cl_state->request_in_progress) == 0
+		|| pg_atomic_read_u32(&cl_state->shutdown_driven) == 0
+		|| pg_atomic_read_u32(&cl_state->preflight_pending) != 0
+		|| pg_atomic_read_u64(&cl_state->leave_attempt_nonce) != prior_nonce
+		|| cl_state->barrier_deadline_us != plan->absolute_deadline_us) {
+		LWLockRelease(&cl_state->lock);
+		return false;
+	}
+	plan->attempt_nonce = next_nonce;
+	pg_atomic_write_u64(&cl_state->leave_attempt_nonce, next_nonce);
+	memset(cl_state->ack_bitmap, 0, sizeof(cl_state->ack_bitmap));
+	pg_atomic_write_u32(&cl_state->nak_received, 0);
+	pg_atomic_write_u32(&cl_state->nak_reason,
+						(uint32)CLUSTER_LEAVE_NAK_NONE);
+	/* The generic preflight fanout is ACTIVE-round-only.  STOPPED requests use
+	 * the exact per-peer transport owner below, so a NOT_ADMITTED peer remains
+	 * pending without replaying peers whose frames were already consumed. */
+	pg_atomic_write_u32(&cl_state->preflight_sent, 1);
+	pg_atomic_write_u32(&cl_state->preflight_pending, 1);
+	LWLockRelease(&cl_state->lock);
+
+	for (;;) {
+		uint8 ack_bitmap[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		bool nak;
+		long timeout_ms;
+
+		ResetLatch(MyLatch);
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		memcpy(ack_bitmap, cl_state->ack_bitmap, sizeof(ack_bitmap));
+		nak = pg_atomic_read_u32(&cl_state->nak_received) != 0;
+		LWLockRelease(&cl_state->lock);
+		if (nak)
+			break;
+		if (cluster_clean_leave_phase1_full_stop_ack_complete(
+				plan, cluster_node_id, ack_bitmap, sizeof(ack_bitmap))) {
+			complete = cl_phase1_full_stop_identity_matches(
+				plan, CLUSTER_WAL_SLOT_STATE_STOPPED);
+			break;
+		}
+		now_us = (uint64)GetCurrentTimestamp();
+		if (now_us >= plan->absolute_deadline_us)
+			break;
+		timeout_ms = (long)((plan->absolute_deadline_us - now_us
+							 + UINT64_C(999)) / UINT64_C(1000));
+		if (timeout_ms > INT_MAX)
+			timeout_ms = INT_MAX;
+		(void)WaitLatch(MyLatch,
+						WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						timeout_ms,
+						WAIT_EVENT_RECONFIG_BARRIER_WAIT);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (complete)
+		pg_atomic_write_u32(&cl_state->preflight_pending, 0);
+	else {
+		uint8 diagnostic_ack[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint32 diagnostic_pending;
+		uint32 diagnostic_sent;
+		uint32 diagnostic_nak;
+
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		memcpy(diagnostic_ack, cl_state->ack_bitmap,
+			   sizeof(diagnostic_ack));
+		diagnostic_pending
+			= pg_atomic_read_u32(&cl_state->preflight_pending);
+		diagnostic_sent = pg_atomic_read_u32(&cl_state->preflight_sent);
+		diagnostic_nak = pg_atomic_read_u32(&cl_state->nak_received);
+		LWLockRelease(&cl_state->lock);
+		ereport(LOG,
+				(errmsg_internal("cluster clean-leave: phase-1 full-stop "
+								 "failure-domain stage=post-STOPPED self=%d "
+								 "ack0=0x%02x pending=%u sent=%u nak=%u "
+								 "now=%llu deadline=%llu",
+								 cluster_node_id,
+								 (unsigned int)diagnostic_ack[0],
+								 diagnostic_pending, diagnostic_sent,
+								 diagnostic_nak,
+								 (unsigned long long)now_us,
+								 (unsigned long long)plan->absolute_deadline_us)));
+	}
+	return complete;
+}
+
+static bool
+cl_phase1_full_stop_release_completion(
+	ClusterPhase1FullStopPlan *plan)
+{
+	uint64 now_us;
+	bool complete = false;
+	int32 peer;
+
+	if (!cluster_clean_leave_phase1_full_stop_plan_valid(plan)
+		|| !cl_phase1_full_stop_identity_matches(
+			plan, CLUSTER_WAL_SLOT_STATE_STOPPED))
+		return false;
+	now_us = (uint64)GetCurrentTimestamp();
+	if (now_us >= plan->absolute_deadline_us)
+		return false;
+
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	if (pg_atomic_read_u32(&cl_state->request_in_progress) == 0
+		|| pg_atomic_read_u32(&cl_state->shutdown_driven) == 0
+		|| pg_atomic_read_u32(&cl_state->preflight_pending) != 0
+		|| pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+			!= plan->attempt_nonce
+		|| cl_state->barrier_deadline_us != plan->absolute_deadline_us
+		|| pg_atomic_read_u32(&cl_state->nak_received) != 0) {
+		LWLockRelease(&cl_state->lock);
+		return false;
+	}
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		bool request_seen;
+		uint64 request_nonce;
+
+		request_seen = cl_phase1_member_bit_is_set(
+			cl_state->phase1_release_request_seen, peer);
+		request_nonce = cl_state->phase1_release_request_nonce[peer];
+		if (peer == cluster_node_id) {
+			if (request_seen || request_nonce != 0) {
+				LWLockRelease(&cl_state->lock);
+				return false;
+			}
+		} else if (request_seen
+			&& (request_nonce == 0 || request_nonce == UINT64_MAX)) {
+			LWLockRelease(&cl_state->lock);
+			return false;
+		}
+	}
+	memset(cl_state->phase1_release_request_sent, 0,
+		   sizeof(cl_state->phase1_release_request_sent));
+	memset(cl_state->phase1_release_reply_sent, 0,
+		   sizeof(cl_state->phase1_release_reply_sent));
+	memset(cl_state->phase1_release_reply_seen, 0,
+		   sizeof(cl_state->phase1_release_reply_seen));
+	memset(cl_state->phase1_release_receipt_sent, 0,
+		   sizeof(cl_state->phase1_release_receipt_sent));
+	memset(cl_state->phase1_release_receipt_seen, 0,
+		   sizeof(cl_state->phase1_release_receipt_seen));
+	pg_atomic_write_u32(&cl_state->phase1_release_transport_drained, 0);
+	pg_atomic_write_u32(&cl_state->phase1_release_pending, 1);
+	LWLockRelease(&cl_state->lock);
+	cluster_lmon_wakeup();
+
+	for (;;) {
+		uint8 request_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 request_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 reply_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 reply_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 receipt_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 receipt_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		bool transport_drained;
+		bool exact_state;
+		bool nak;
+		long timeout_ms;
+
+		ResetLatch(MyLatch);
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		memcpy(request_sent, cl_state->phase1_release_request_sent,
+			   sizeof(request_sent));
+		memcpy(request_seen, cl_state->phase1_release_request_seen,
+			   sizeof(request_seen));
+		memcpy(reply_sent, cl_state->phase1_release_reply_sent,
+			   sizeof(reply_sent));
+		memcpy(reply_seen, cl_state->phase1_release_reply_seen,
+			   sizeof(reply_seen));
+		memcpy(receipt_sent, cl_state->phase1_release_receipt_sent,
+			   sizeof(receipt_sent));
+		memcpy(receipt_seen, cl_state->phase1_release_receipt_seen,
+			   sizeof(receipt_seen));
+		transport_drained = pg_atomic_read_u32(
+			&cl_state->phase1_release_transport_drained) != 0;
+		nak = pg_atomic_read_u32(&cl_state->nak_received) != 0;
+		exact_state
+			= pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
+			  && pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+				 == plan->attempt_nonce
+			  && cl_state->barrier_deadline_us
+				 == plan->absolute_deadline_us;
+		LWLockRelease(&cl_state->lock);
+		if (nak || !exact_state)
+			break;
+		if (cluster_clean_leave_phase1_full_stop_release_complete(
+				plan, cluster_node_id, request_sent, request_seen,
+				reply_sent, reply_seen, receipt_sent, receipt_seen,
+				sizeof(request_sent), transport_drained)) {
+			complete = cl_phase1_full_stop_identity_matches(
+				plan, CLUSTER_WAL_SLOT_STATE_STOPPED);
+			break;
+		}
+		now_us = (uint64)GetCurrentTimestamp();
+		if (now_us >= plan->absolute_deadline_us)
+			break;
+		timeout_ms = (long)((plan->absolute_deadline_us - now_us
+							 + UINT64_C(999)) / UINT64_C(1000));
+		if (timeout_ms > INT_MAX)
+			timeout_ms = INT_MAX;
+		(void)WaitLatch(MyLatch,
+					WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+					timeout_ms,
+					WAIT_EVENT_RECONFIG_BARRIER_WAIT);
+		CHECK_FOR_INTERRUPTS();
+	}
+	if (!complete) {
+		uint8 request_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 request_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 reply_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 reply_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 receipt_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 receipt_seen[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint32 transport_drained;
+		uint32 nak;
+
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		memcpy(request_sent, cl_state->phase1_release_request_sent,
+			   sizeof(request_sent));
+		memcpy(request_seen, cl_state->phase1_release_request_seen,
+			   sizeof(request_seen));
+		memcpy(reply_sent, cl_state->phase1_release_reply_sent,
+			   sizeof(reply_sent));
+		memcpy(reply_seen, cl_state->phase1_release_reply_seen,
+			   sizeof(reply_seen));
+		memcpy(receipt_sent, cl_state->phase1_release_receipt_sent,
+			   sizeof(receipt_sent));
+		memcpy(receipt_seen, cl_state->phase1_release_receipt_seen,
+			   sizeof(receipt_seen));
+		transport_drained = pg_atomic_read_u32(
+			&cl_state->phase1_release_transport_drained);
+		nak = pg_atomic_read_u32(&cl_state->nak_received);
+		LWLockRelease(&cl_state->lock);
+		ereport(LOG,
+				(errmsg_internal("cluster clean-leave: phase-1 full-stop "
+								 "failure-domain stage=release-completion self=%d "
+								 "request=%02x/%02x reply=%02x/%02x "
+								 "receipt=%02x/%02x drained=%u nak=%u "
+								 "now=%llu deadline=%llu",
+								 cluster_node_id,
+								 (unsigned int)request_sent[0],
+								 (unsigned int)request_seen[0],
+								 (unsigned int)reply_sent[0],
+								 (unsigned int)reply_seen[0],
+								 (unsigned int)receipt_sent[0],
+								 (unsigned int)receipt_seen[0],
+								 transport_drained, nak,
+								 (unsigned long long)now_us,
+								 (unsigned long long)plan->absolute_deadline_us)));
+	}
+	return complete;
+}
+
+bool
+cluster_clean_leave_phase1_full_stop_close_exact(
+	ClusterPhase1FullStopPlan *plan)
+{
+	bool exact_state;
+	bool terminal = false;
+	uint8 ack_bitmap[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+
+	if (!cluster_clean_leave_phase1_full_stop_plan_valid(plan))
+		return false;
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	memcpy(ack_bitmap, cl_state->ack_bitmap, sizeof(ack_bitmap));
+	exact_state
+		= pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+		  && pg_atomic_read_u32(&cl_state->shutdown_driven) != 0
+		  && pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+				 == plan->attempt_nonce
+		  && cl_state->barrier_deadline_us == plan->absolute_deadline_us;
+	LWLockRelease(&cl_state->lock);
+	if (exact_state
+		&& cluster_clean_leave_phase1_full_stop_ack_complete(
+			plan, cluster_node_id, ack_bitmap, sizeof(ack_bitmap))
+		&& cl_phase1_full_stop_identity_matches(
+			plan, CLUSTER_WAL_SLOT_STATE_STOPPED))
+		terminal = cl_phase1_full_stop_post_stopped_barrier(plan)
+			&& cl_phase1_full_stop_release_completion(plan);
+	cl_phase1_full_stop_release(plan);
+	memset(plan, 0, sizeof(*plan));
+	return terminal;
+}
+
+/*
  * cluster_clean_leave_drive_drain -- the synchronous leaving-node phases, run in
  * the requesting backend (CL-I9: the GCS flush is here, never in LMON).  Advances
  * REQUESTED -> QUIESCING -> GES_DRAINING -> GCS_FLUSHING -> BARRIER_WAIT, then
@@ -2368,6 +3633,477 @@ cl_survivor_tick(int32 leaving)
 	}
 }
 
+static bool
+cl_phase1_full_stop_send_admitted(ClusterICSendResult result)
+{
+	return result == CLUSTER_IC_SEND_DONE
+		|| result == CLUSTER_IC_SEND_WOULD_BLOCK;
+}
+
+static bool
+cl_phase1_full_stop_all_peer_bits(const uint8 *bitmap)
+{
+	int32 peer;
+
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		if (peer != cluster_node_id
+			&& !cl_phase1_member_bit_is_set(bitmap, peer))
+			return false;
+	}
+	return true;
+}
+
+static void
+cl_phase1_full_stop_post_stopped_request_lmon_tick(void)
+{
+	ClusterPhase1FullStopPlan current;
+	uint64 local_nonce;
+	uint64 deadline_us;
+	uint64 now_us;
+	uint32 local_wal_state = 0;
+	bool pending;
+	bool wake = false;
+	int32 peer;
+
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	pending = pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+		&& pg_atomic_read_u32(&cl_state->shutdown_driven) != 0
+		&& pg_atomic_read_u32(&cl_state->preflight_pending) != 0
+		&& pg_atomic_read_u32(&cl_state->preflight_sent) != 0
+		&& pg_atomic_read_u32(&cl_state->phase1_release_pending) == 0;
+	local_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	deadline_us = cl_state->barrier_deadline_us;
+	LWLockRelease(&cl_state->lock);
+	if (!pending)
+		return;
+
+	/* The same shared preflight flags also describe the predecessor ACTIVE
+	 * round.  Existing WAL state is the frozen phase discriminator: ACTIVE is
+	 * owned by the generic pre-checkpoint fanout and must remain untouched here. */
+	if (!cl_phase1_full_stop_capture_barrier_identity(
+			&current, &local_wal_state))
+		return;
+	if (local_wal_state != CLUSTER_WAL_SLOT_STATE_STOPPED)
+		return;
+	if (cl_phase1_post_stopped_request_round_nonce != local_nonce) {
+		cl_phase1_post_stopped_request_round_nonce = local_nonce;
+		memset(cl_phase1_post_stopped_request_sent, 0,
+			   sizeof(cl_phase1_post_stopped_request_sent));
+	}
+
+	now_us = (uint64)GetCurrentTimestamp();
+	if (local_nonce == 0 || local_nonce == UINT64_MAX
+		|| deadline_us == 0 || now_us == 0 || now_us >= deadline_us) {
+		pg_atomic_write_u32(&cl_state->nak_received, 1);
+		wake = true;
+		goto out;
+	}
+
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		ClusterICSendResult send_result;
+		bool send_request;
+
+		if (peer == cluster_node_id)
+			continue;
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		send_request
+			= pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+			  && pg_atomic_read_u32(&cl_state->shutdown_driven) != 0
+			  && pg_atomic_read_u32(&cl_state->preflight_pending) != 0
+			  && pg_atomic_read_u32(&cl_state->preflight_sent) != 0
+			  && pg_atomic_read_u32(&cl_state->phase1_release_pending) == 0
+			  && pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+				 == local_nonce
+			  && cl_state->barrier_deadline_us == deadline_us
+			  && !cl_phase1_member_bit_is_set(
+				  cl_phase1_post_stopped_request_sent, peer);
+		LWLockRelease(&cl_state->lock);
+		if (!send_request)
+			continue;
+
+		send_result = cl_phase1_full_stop_send_post_stopped_request(
+			peer, local_nonce);
+		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		if (pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+			&& pg_atomic_read_u32(&cl_state->shutdown_driven) != 0
+			&& pg_atomic_read_u32(&cl_state->preflight_pending) != 0
+			&& pg_atomic_read_u32(&cl_state->preflight_sent) != 0
+			&& pg_atomic_read_u32(&cl_state->phase1_release_pending) == 0
+			&& pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+				 == local_nonce
+			&& cl_state->barrier_deadline_us == deadline_us
+			&& !cl_phase1_member_bit_is_set(
+				cl_phase1_post_stopped_request_sent, peer)) {
+			if (cl_phase1_full_stop_send_admitted(send_result))
+				cl_phase1_member_bit_set(
+					cl_phase1_post_stopped_request_sent, peer);
+			else if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				pg_atomic_write_u32(&cl_state->nak_received, 1);
+			else if (send_result == CLUSTER_IC_SEND_NOT_ADMITTED) {
+				/* Retain this exact peer owner for the next LMON tick. */
+			}
+		}
+		LWLockRelease(&cl_state->lock);
+		if (send_result == CLUSTER_IC_SEND_HARD_ERROR) {
+			wake = true;
+			cluster_ic_tier1_close_peer(
+				peer, "phase-1 post-STOPPED request send hard error");
+		}
+	}
+
+out:
+	if (wake && ProcGlobal->checkpointerLatch != NULL)
+		SetLatch(ProcGlobal->checkpointerLatch);
+}
+
+static void
+cl_phase1_full_stop_consume_request_ahead_lmon_tick(void)
+{
+	ClusterPhase1FullStopPlan current;
+	uint32 local_wal_state = 0;
+	uint64 local_nonce;
+	uint64 deadline_us;
+	uint64 now_us;
+	bool have_ahead = false;
+	bool post_requests_sent;
+	bool fail_closed = false;
+	bool wake = false;
+	int32 peer;
+
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		if (peer != cluster_node_id
+			&& cl_phase1_post_stopped_request_ahead[peer].valid) {
+			have_ahead = true;
+			break;
+		}
+	}
+	if (!have_ahead)
+		return;
+	if (!cl_phase1_full_stop_capture_barrier_identity(
+			&current, &local_wal_state)) {
+		fail_closed = true;
+		goto out;
+	}
+	if (local_wal_state == CLUSTER_WAL_SLOT_STATE_ACTIVE)
+		return;
+	if (local_wal_state != CLUSTER_WAL_SLOT_STATE_STOPPED) {
+		fail_closed = true;
+		goto out;
+	}
+
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	local_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	deadline_us = cl_state->barrier_deadline_us;
+	post_requests_sent
+		= cl_phase1_post_stopped_request_round_nonce == local_nonce
+		  && cl_phase1_full_stop_all_peer_bits(
+			  cl_phase1_post_stopped_request_sent);
+	LWLockRelease(&cl_state->lock);
+	if (!post_requests_sent)
+		return;
+	now_us = (uint64)GetCurrentTimestamp();
+	if (now_us == 0 || now_us >= deadline_us) {
+		fail_closed = true;
+		goto out;
+	}
+
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		bool source_active = false;
+		bool source_stopped = false;
+
+		if (peer == cluster_node_id
+			|| !cl_phase1_post_stopped_request_ahead[peer].valid)
+			continue;
+		if (!cl_phase1_full_stop_capture_source_phase(
+				&current, peer, &source_active, &source_stopped)
+			|| source_active || !source_stopped) {
+			fail_closed = true;
+			break;
+		}
+
+		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		post_requests_sent
+			= cl_phase1_post_stopped_request_round_nonce == local_nonce
+			  && cl_phase1_full_stop_all_peer_bits(
+				  cl_phase1_post_stopped_request_sent);
+		if (pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+				!= local_nonce
+			|| cl_state->barrier_deadline_us != deadline_us
+			|| !cl_phase1_full_stop_consume_request_ahead_locked(
+				&current, peer, local_nonce, deadline_us,
+				post_requests_sent))
+			fail_closed = true;
+		else
+			wake = true;
+		LWLockRelease(&cl_state->lock);
+		if (fail_closed)
+			break;
+	}
+
+out:
+	if (fail_closed) {
+		memset(cl_phase1_post_stopped_request_ahead, 0,
+			   sizeof(cl_phase1_post_stopped_request_ahead));
+		pg_atomic_write_u32(&cl_state->nak_received, 1);
+		wake = true;
+	}
+	if (wake && ProcGlobal->checkpointerLatch != NULL)
+		SetLatch(ProcGlobal->checkpointerLatch);
+}
+
+static void
+cl_phase1_full_stop_post_stopped_reply_lmon_tick(void)
+{
+	ClusterPhase1FullStopPlan current;
+	uint64 deadline_us;
+	uint64 now_us;
+	bool have_pending = false;
+	bool round_active;
+	bool wake = false;
+	int32 peer;
+
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	round_active
+		= pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+		  && pg_atomic_read_u32(&cl_state->shutdown_driven) != 0;
+	deadline_us = cl_state->barrier_deadline_us;
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		if (peer != cluster_node_id
+			&& cl_phase1_member_bit_is_set(
+				cl_state->phase1_post_stopped_reply_pending, peer)
+			&& !cl_phase1_member_bit_is_set(
+				cl_state->phase1_post_stopped_reply_sent, peer)) {
+			have_pending = true;
+			break;
+		}
+	}
+	LWLockRelease(&cl_state->lock);
+	if (!have_pending)
+		return;
+
+	now_us = (uint64)GetCurrentTimestamp();
+	if (!round_active
+		|| deadline_us == 0
+		|| now_us == 0
+		|| now_us >= deadline_us
+		|| !cl_phase1_full_stop_capture_identity(
+			CLUSTER_WAL_SLOT_STATE_STOPPED, true, &current)) {
+		pg_atomic_write_u32(&cl_state->nak_received, 1);
+		wake = true;
+		goto out;
+	}
+
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		ClusterICSendResult send_result;
+		uint64 peer_nonce;
+		bool send_reply;
+
+		if (peer == cluster_node_id)
+			continue;
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		send_reply
+			= pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+			  && pg_atomic_read_u32(&cl_state->shutdown_driven) != 0
+			  && cl_state->barrier_deadline_us == deadline_us
+			  && cl_phase1_member_bit_is_set(
+				  cl_state->phase1_post_stopped_reply_pending, peer)
+			  && !cl_phase1_member_bit_is_set(
+				  cl_state->phase1_post_stopped_reply_sent, peer);
+		peer_nonce = cl_state->phase1_release_request_nonce[peer];
+		LWLockRelease(&cl_state->lock);
+		if (!send_reply)
+			continue;
+		if (peer_nonce == 0 || peer_nonce == UINT64_MAX) {
+			pg_atomic_write_u32(&cl_state->nak_received, 1);
+			wake = true;
+			continue;
+		}
+
+		send_result = cl_phase1_full_stop_send_post_stopped_reply(
+			peer, peer_nonce);
+		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+		if (pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+			&& pg_atomic_read_u32(&cl_state->shutdown_driven) != 0
+			&& cl_state->barrier_deadline_us == deadline_us
+			&& cl_state->phase1_release_request_nonce[peer] == peer_nonce
+			&& cl_phase1_member_bit_is_set(
+				cl_state->phase1_post_stopped_reply_pending, peer)
+			&& !cl_phase1_member_bit_is_set(
+				cl_state->phase1_post_stopped_reply_sent, peer)) {
+			if (cl_phase1_full_stop_send_admitted(send_result))
+				cl_phase1_member_bit_set(
+					cl_state->phase1_post_stopped_reply_sent, peer);
+			else if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				pg_atomic_write_u32(&cl_state->nak_received, 1);
+			else if (send_result == CLUSTER_IC_SEND_NOT_ADMITTED) {
+				/* Retain exact ownership for the next existing LMON tick. */
+			}
+		}
+		LWLockRelease(&cl_state->lock);
+		if (send_result == CLUSTER_IC_SEND_HARD_ERROR) {
+			wake = true;
+			cluster_ic_tier1_close_peer(
+				peer, "phase-1 post-STOPPED reply send hard error");
+		}
+	}
+
+out:
+	if (wake && ProcGlobal->checkpointerLatch != NULL)
+		SetLatch(ProcGlobal->checkpointerLatch);
+}
+
+static void
+cl_phase1_full_stop_release_lmon_tick(void)
+{
+	uint64 local_nonce;
+	uint64 deadline_us;
+	uint64 now_us;
+	bool pending;
+	bool wake = false;
+	int32 peer;
+
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	pending = pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0;
+	local_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	deadline_us = cl_state->barrier_deadline_us;
+	LWLockRelease(&cl_state->lock);
+	if (!pending)
+		return;
+	now_us = (uint64)GetCurrentTimestamp();
+	if (local_nonce == 0 || local_nonce == UINT64_MAX
+		|| deadline_us == 0 || now_us >= deadline_us) {
+		pg_atomic_write_u32(&cl_state->nak_received, 1);
+		wake = true;
+		goto out;
+	}
+
+	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		ClusterICSendResult send_result;
+		uint64 peer_nonce;
+		bool send_request;
+		bool send_reply;
+		bool send_receipt;
+
+		if (peer == cluster_node_id)
+			continue;
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		send_request = pg_atomic_read_u32(
+				&cl_state->phase1_release_pending) != 0
+			&& !cl_phase1_member_bit_is_set(
+				cl_state->phase1_release_request_sent, peer);
+		peer_nonce = cl_state->phase1_release_request_nonce[peer];
+		send_reply = peer_nonce != 0
+			&& cl_phase1_member_bit_is_set(
+				cl_state->phase1_release_request_seen, peer)
+			&& !cl_phase1_member_bit_is_set(
+				cl_state->phase1_release_reply_sent, peer);
+		send_receipt = cl_phase1_member_bit_is_set(
+				cl_state->phase1_release_reply_seen, peer)
+			&& !cl_phase1_member_bit_is_set(
+				cl_state->phase1_release_receipt_sent, peer);
+		LWLockRelease(&cl_state->lock);
+
+		if (send_request) {
+			send_result = cl_phase1_full_stop_send_release_announce(
+				peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, local_nonce);
+			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+			if (pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
+				&& pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+					== local_nonce) {
+				if (cl_phase1_full_stop_send_admitted(send_result))
+					cl_phase1_member_bit_set(
+						cl_state->phase1_release_request_sent, peer);
+				else if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+					pg_atomic_write_u32(&cl_state->nak_received, 1);
+			}
+			LWLockRelease(&cl_state->lock);
+			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				wake = true;
+			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				cluster_ic_tier1_close_peer(
+					peer, "phase-1 release request send hard error");
+		}
+		if (send_reply) {
+			send_result = cl_phase1_full_stop_send_release_reply(
+				peer, peer_nonce);
+			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+			if (pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
+				&& cl_state->phase1_release_request_nonce[peer]
+					== peer_nonce) {
+				if (cl_phase1_full_stop_send_admitted(send_result))
+					cl_phase1_member_bit_set(
+						cl_state->phase1_release_reply_sent, peer);
+				else if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+					pg_atomic_write_u32(&cl_state->nak_received, 1);
+			}
+			LWLockRelease(&cl_state->lock);
+			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				wake = true;
+			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				cluster_ic_tier1_close_peer(
+					peer, "phase-1 release reply send hard error");
+		}
+		if (send_receipt) {
+			send_result = cl_phase1_full_stop_send_release_announce(
+				peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, local_nonce);
+			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+			if (pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
+				&& pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+					== local_nonce) {
+				if (cl_phase1_full_stop_send_admitted(send_result))
+					cl_phase1_member_bit_set(
+						cl_state->phase1_release_receipt_sent, peer);
+				else if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+					pg_atomic_write_u32(&cl_state->nak_received, 1);
+			}
+			LWLockRelease(&cl_state->lock);
+			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				wake = true;
+			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+				cluster_ic_tier1_close_peer(
+					peer, "phase-1 release receipt send hard error");
+		}
+	}
+
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	pending = pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
+		&& cl_phase1_full_stop_all_peer_bits(
+			cl_state->phase1_release_request_sent)
+		&& cl_phase1_full_stop_all_peer_bits(
+			cl_state->phase1_release_reply_sent)
+		&& cl_phase1_full_stop_all_peer_bits(
+			cl_state->phase1_release_receipt_sent);
+	LWLockRelease(&cl_state->lock);
+	if (pending) {
+		bool drained = true;
+
+		for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+			if (peer != cluster_node_id
+				&& cluster_ic_mux_peer_has_pending_outbound(peer)) {
+				drained = false;
+				break;
+			}
+		}
+		if (drained) {
+			LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+			if (pg_atomic_read_u32(
+					&cl_state->phase1_release_pending) != 0
+				&& pg_atomic_read_u64(&cl_state->leave_attempt_nonce)
+					== local_nonce
+				&& cl_state->barrier_deadline_us == deadline_us) {
+				pg_atomic_write_u32(
+					&cl_state->phase1_release_transport_drained, 1);
+				wake = true;
+			}
+			LWLockRelease(&cl_state->lock);
+		}
+	}
+
+out:
+	if (wake && ProcGlobal->checkpointerLatch != NULL)
+		SetLatch(ProcGlobal->checkpointerLatch);
+}
+
 /*
  * cluster_clean_leave_lmon_tick -- D6 orchestration, called every LMON tick
  * (before cluster_reconfig_lmon_tick).  Branches on whether THIS node is the
@@ -2382,6 +4118,10 @@ cluster_clean_leave_lmon_tick(void)
 	if (cl_state == NULL || !cluster_enabled)
 		return;
 
+	cl_phase1_full_stop_post_stopped_request_lmon_tick();
+	cl_phase1_full_stop_consume_request_ahead_lmon_tick();
+	cl_phase1_full_stop_post_stopped_reply_lmon_tick();
+
 	/*
 	 * Hardening v1.0.2 (P1, F6 layer-1 preflight): the request backend staged a
 	 * side-effect-free preflight probe (IC sends are LMON-only).  Broadcast it once
@@ -2394,7 +4134,11 @@ cluster_clean_leave_lmon_tick(void)
 			0 /* leave_epoch=0 for a probe */, pg_atomic_read_u64(&cl_state->leave_attempt_nonce),
 			/*preflight*/ true);
 		pg_atomic_write_u32(&cl_state->preflight_sent, 1);
+		if (ProcGlobal->checkpointerLatch != NULL)
+			SetLatch(ProcGlobal->checkpointerLatch);
 	}
+
+	cl_phase1_full_stop_release_lmon_tick();
 
 	leaving = cl_state->leaving_node_id;
 	if (leaving < 0)

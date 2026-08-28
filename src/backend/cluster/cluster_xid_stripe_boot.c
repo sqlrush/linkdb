@@ -905,13 +905,13 @@ cluster_xid_stripe_service_seed(const int *fds, int n_disks)
  * Joiner gate (LMON / reconfig).
  * ============================================================ */
 
-ClusterXidStripeJoinVerdict
-cluster_xid_stripe_join_gate(bool self_may_seed)
+ClusterXidStripeJoinProgress
+cluster_xid_stripe_join_progress(bool self_may_seed)
 {
 	uint32 state;
 
 	if (StripeBootShmem == NULL || !cluster_enabled)
-		return CLUSTER_XID_STRIPE_JOIN_PROCEED;
+		return STRIPE_JOIN_PROCEED;
 
 	LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
 	state = StripeBootShmem->disk_state;
@@ -930,7 +930,7 @@ cluster_xid_stripe_join_gate(bool self_may_seed)
 		 * below is insertable.
 		 */
 		if (RecoveryInProgress())
-			return CLUSTER_XID_STRIPE_JOIN_HOLD;
+			return STRIPE_JOIN_WAIT_EVIDENCE;
 
 		switch ((ClusterXidStripeDiskState)state) {
 		case CLUSTER_XID_STRIPE_DISK_PUBLISHED:
@@ -938,11 +938,11 @@ cluster_xid_stripe_join_gate(bool self_may_seed)
 		case CLUSTER_XID_STRIPE_DISK_ABSENT:
 			if (self_may_seed)
 				stripe_stage_seed_request();
-			return CLUSTER_XID_STRIPE_JOIN_HOLD;
+			return STRIPE_JOIN_WAIT_EVIDENCE;
 		case CLUSTER_XID_STRIPE_DISK_CORRUPT:
-			return CLUSTER_XID_STRIPE_JOIN_REFUSE;
+			return STRIPE_JOIN_REFUSE;
 		case CLUSTER_XID_STRIPE_DISK_UNKNOWN:
-			return CLUSTER_XID_STRIPE_JOIN_HOLD;
+			return STRIPE_JOIN_WAIT_EVIDENCE;
 		}
 
 		/*
@@ -967,18 +967,39 @@ cluster_xid_stripe_join_gate(bool self_may_seed)
 			 * -> hold (retried next tick).
 			 */
 			if (!cluster_xid_stripe_emit_join_wal())
-				return CLUSTER_XID_STRIPE_JOIN_HOLD;
-			return CLUSTER_XID_STRIPE_JOIN_PROCEED;
-		case CLUSTER_XID_STRIPE_SLOT_ABSENT:
-			(void)stripe_stage_op(STRIPE_OP_CLAIM, cluster_node_id, 0);
-			return CLUSTER_XID_STRIPE_JOIN_HOLD;
+				return STRIPE_JOIN_CLAIM_OWNED;
+			return STRIPE_JOIN_PROCEED;
+		case CLUSTER_XID_STRIPE_SLOT_ABSENT: {
+			uint64 req;
+			uint64 done;
+			uint64 staged;
+			uint32 op;
+			int32 target;
+
+			staged = stripe_stage_op(STRIPE_OP_CLAIM, cluster_node_id, 0);
+			if (staged != 0)
+				return STRIPE_JOIN_CLAIM_OWNED;
+
+			/* Another producer may own the mailbox.  Only the exact pending
+			 * self CLAIM establishes this joiner's prerequisite ownership. */
+			LWLockAcquire(&StripeBootShmem->lock, LW_SHARED);
+			req = pg_atomic_read_u64(&StripeBootShmem->req_seq);
+			done = pg_atomic_read_u64(&StripeBootShmem->done_seq);
+			op = StripeBootShmem->op;
+			target = StripeBootShmem->op_target_node;
+			LWLockRelease(&StripeBootShmem->lock);
+			if (req > done && op == STRIPE_OP_CLAIM
+				&& target == cluster_node_id)
+				return STRIPE_JOIN_CLAIM_OWNED;
+			return STRIPE_JOIN_WAIT_EVIDENCE;
+		}
 		case CLUSTER_XID_STRIPE_SLOT_RETIRED:
 		case CLUSTER_XID_STRIPE_SLOT_CORRUPT:
-			return CLUSTER_XID_STRIPE_JOIN_REFUSE;
+			return STRIPE_JOIN_REFUSE;
 		case CLUSTER_XID_STRIPE_SLOT_UNKNOWN:
-			return CLUSTER_XID_STRIPE_JOIN_HOLD;
+			return STRIPE_JOIN_WAIT_EVIDENCE;
 		}
-		return CLUSTER_XID_STRIPE_JOIN_HOLD; /* unreachable; fail closed */
+		return STRIPE_JOIN_WAIT_EVIDENCE; /* unreachable; fail closed */
 	}
 
 	/* striping off: joining an ACTIVATED cluster is a config mismatch
@@ -991,13 +1012,28 @@ cluster_xid_stripe_join_gate(bool self_may_seed)
 	switch ((ClusterXidStripeDiskState)state) {
 	case CLUSTER_XID_STRIPE_DISK_PUBLISHED:
 	case CLUSTER_XID_STRIPE_DISK_CORRUPT:
-		return CLUSTER_XID_STRIPE_JOIN_REFUSE;
+		return STRIPE_JOIN_REFUSE;
 	case CLUSTER_XID_STRIPE_DISK_ABSENT:
-		return CLUSTER_XID_STRIPE_JOIN_PROCEED;
+		return STRIPE_JOIN_PROCEED;
 	case CLUSTER_XID_STRIPE_DISK_UNKNOWN:
+		return STRIPE_JOIN_WAIT_EVIDENCE;
+	}
+	return STRIPE_JOIN_WAIT_EVIDENCE; /* unreachable; fail closed */
+}
+
+ClusterXidStripeJoinVerdict
+cluster_xid_stripe_join_gate(bool self_may_seed)
+{
+	switch (cluster_xid_stripe_join_progress(self_may_seed)) {
+	case STRIPE_JOIN_PROCEED:
+		return CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	case STRIPE_JOIN_REFUSE:
+		return CLUSTER_XID_STRIPE_JOIN_REFUSE;
+	case STRIPE_JOIN_WAIT_EVIDENCE:
+	case STRIPE_JOIN_CLAIM_OWNED:
 		return CLUSTER_XID_STRIPE_JOIN_HOLD;
 	}
-	return CLUSTER_XID_STRIPE_JOIN_HOLD; /* unreachable; fail closed */
+	return CLUSTER_XID_STRIPE_JOIN_HOLD;
 }
 
 /* ============================================================
