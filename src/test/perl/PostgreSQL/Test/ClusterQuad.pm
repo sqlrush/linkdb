@@ -1620,17 +1620,16 @@ sub _two_stage_coordinated_clean_stop
 }
 
 
-sub _two_stage_attach_voting_loops
+sub _attach_voting_loops_exact
 {
-	my ($self) = @_;
+	my ($self, $scope) = @_;
 	my @backing = @{ $self->{voting_disk_paths} // [] };
 	my $gid = (split(/\s+/, $( ))[0];
 
-	die "two-stage voting loop requires exactly three backing files"
+	die "$scope voting loop requires exactly three backing files"
 	  unless @backing == 3;
-	$self->_two_stage_assert_phase1_offline();
 	$self->{two_stage_loop_devices} //= [];
-	die "two-stage voting loop attach started with retained devices"
+	die "$scope voting loop attach started with retained devices"
 	  if @{ $self->{two_stage_loop_devices} };
 	for my $i (0 .. $#backing)
 	{
@@ -1684,6 +1683,40 @@ sub _two_stage_attach_voting_loops
 			$_->{attach_order})
 	} @{ $self->{two_stage_loop_records} }));
 
+	return;
+}
+
+
+sub _two_stage_attach_voting_loops
+{
+	my ($self) = @_;
+
+	$self->_two_stage_assert_phase1_offline();
+	$self->_attach_voting_loops_exact('two-stage');
+	return;
+}
+
+
+sub _happy_path_prepare_voting_loops
+{
+	my ($self) = @_;
+
+	$self->_two_stage_register_cleanup_owner();
+	my $reap = $self->_two_stage_reap_previous_manifests();
+	die "happy-path voting lifecycle has unresolved cleanup ownership: $reap"
+	  unless $reap eq 'CLEAN';
+	for my $node (@{ $self->{nodes} })
+	{
+		$node->_update_pid(-1);
+		die "happy-path voting loop attach requires every postmaster offline"
+		  if defined($node->{_pid});
+	}
+	my $holders = $self->_two_stage_open_backing_fd_holders();
+	die "happy-path voting loop attach found open backing-file holders"
+	  if @$holders;
+
+	$self->_attach_voting_loops_exact('happy-path');
+	$self->_two_stage_install_device_only_voting_config();
 	return;
 }
 
@@ -3519,7 +3552,16 @@ EOC
 sub start_quad
 {
 	my ($self, %opts) = @_;
-	if (($ENV{PGRAC_TEST_TWO_STAGE_VOTING_LOOP} // '') eq '1')
+	if (($ENV{PGRAC_STAGE8_HAPPY_PATH_ONLY} // '') eq '1')
+	{
+		die "happy-path voting loop harness is Linux-only" unless $^O eq 'linux';
+		$self->_happy_path_prepare_voting_loops();
+		for my $node (@{ $self->{nodes} })
+		{
+			$node->start(%opts);
+		}
+	}
+	elsif (($ENV{PGRAC_TEST_TWO_STAGE_VOTING_LOOP} // '') eq '1')
 	{
 		die "two-stage voting loop harness is Linux-only" unless $^O eq 'linux';
 		$self->_two_stage_run_lifecycle();
