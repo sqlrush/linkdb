@@ -5527,11 +5527,16 @@ cluster_reconfig_handoff_lock_acquire(LWLockMode mode)
  * retried from current evidence rather than rolling membership back. */
 static bool
 cluster_reconfig_pre_publish_handoff_external_current(
-	uint64 expected_self_incarnation, bool require_recovery_complete)
+	uint64 expected_self_incarnation, uint64 expected_predecessor_floor,
+	bool require_recovery_complete)
 {
 	return ReconfigShmem != NULL && cluster_online_join
 		&& cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES
 		&& expected_self_incarnation != 0
+		&& (expected_predecessor_floor == 0
+			|| expected_predecessor_floor < expected_self_incarnation)
+		&& cluster_authority_handoff_identity_current(
+			expected_self_incarnation, expected_predecessor_floor)
 		&& cluster_authority_readiness_managed()
 		&& cluster_authority_readiness_get() == CLUSTER_AUTHORITY_OFF
 		&& cluster_epoch_get_current() == CLUSTER_EPOCH_INITIAL
@@ -5541,13 +5546,14 @@ cluster_reconfig_pre_publish_handoff_external_current(
 		&& cluster_qvotec_get_self_incarnation()
 			   == expected_self_incarnation
 		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   == expected_self_incarnation
+			   == expected_predecessor_floor
 		&& cluster_reconfig_epoch0_late_founder_evidence_current();
 }
 
 static bool
 cluster_reconfig_pre_publish_handoff_locked_current(
-	uint64 expected_self_incarnation, bool allow_member)
+	uint64 expected_self_incarnation, uint64 expected_predecessor_floor,
+	bool allow_member)
 {
 	ClusterMembershipState membership;
 
@@ -5560,7 +5566,9 @@ cluster_reconfig_pre_publish_handoff_locked_current(
 		&& !clean_departed_test_bit_locked(ReconfigShmem->removed_bitmap,
 										 cluster_node_id)
 		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   == expected_self_incarnation
+			   == expected_predecessor_floor
+		&& (expected_predecessor_floor == 0
+			|| expected_predecessor_floor < expected_self_incarnation)
 		&& (membership == CLUSTER_MEMBER_JOINING
 			|| (allow_member && membership == CLUSTER_MEMBER_MEMBER));
 }
@@ -5573,17 +5581,17 @@ cluster_reconfig_pre_publish_handoff_locked_current(
  */
 bool
 cluster_reconfig_stage_pre_publish_join_handoff(
-	uint64 expected_self_incarnation)
+	uint64 expected_self_incarnation, uint64 expected_predecessor_floor)
 {
 	bool exact;
 
 	if (!cluster_reconfig_pre_publish_handoff_external_current(
-			expected_self_incarnation, false))
+			expected_self_incarnation, expected_predecessor_floor, false))
 		return false;
 	if (!cluster_reconfig_handoff_lock_acquire(LW_EXCLUSIVE))
 		return false;
 	exact = cluster_reconfig_pre_publish_handoff_locked_current(
-		expected_self_incarnation, true);
+		expected_self_incarnation, expected_predecessor_floor, true);
 	if (exact
 		&& cluster_membership_get_state(cluster_node_id)
 			   == CLUSTER_MEMBER_MEMBER)
@@ -5593,7 +5601,7 @@ cluster_reconfig_stage_pre_publish_join_handoff(
 	if (!exact)
 		return false;
 	return cluster_reconfig_pre_publish_handoff_external_current(
-		expected_self_incarnation, false);
+		expected_self_incarnation, expected_predecessor_floor, false);
 }
 
 /* Read-only LMON classifier for the staged tuple.  Both external evidence and
@@ -5602,24 +5610,27 @@ cluster_reconfig_stage_pre_publish_join_handoff(
 bool
 cluster_reconfig_pre_publish_join_handoff_current(void)
 {
+	uint64 expected_predecessor_floor;
 	uint64 expected_self_incarnation;
 	bool exact;
 
 	if (ReconfigShmem == NULL)
 		return false;
 	expected_self_incarnation = cluster_qvotec_get_self_incarnation();
+	expected_predecessor_floor
+		= cluster_membership_get_last_admitted_incarnation(cluster_node_id);
 	if (!cluster_reconfig_pre_publish_handoff_external_current(
-			expected_self_incarnation, true))
+			expected_self_incarnation, expected_predecessor_floor, true))
 		return false;
 	if (!cluster_reconfig_handoff_lock_acquire(LW_SHARED))
 		return false;
 	exact = cluster_reconfig_pre_publish_handoff_locked_current(
-		expected_self_incarnation, false);
+		expected_self_incarnation, expected_predecessor_floor, false);
 	LWLockRelease(&ReconfigShmem->lock);
 	if (!exact)
 		return false;
 	return cluster_reconfig_pre_publish_handoff_external_current(
-		expected_self_incarnation, true);
+		expected_self_incarnation, expected_predecessor_floor, true);
 }
 
 /*
@@ -8157,16 +8168,144 @@ out:
 	return valid;
 }
 
-/* Formation-LMON-only coherent projection of the admitted MEMBER SSOT. */
+static bool
+cluster_reconfig_r4_membership_observations_current(
+	ClusterR4MembershipSnapshot *candidate, bool freeze_generations)
+{
+	int node;
+
+	if (candidate == NULL
+		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
+		|| !cluster_qvotec_in_quorum()
+		|| cluster_epoch_get_current() != candidate->formation_epoch
+		|| cluster_qvotec_get_self_incarnation()
+			   != candidate->local_self_boot_incarnation)
+		return false;
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		uint64 generation = 0;
+		uint64 incarnation = 0;
+		bool admitted
+			= node < 64
+				  ? (candidate->admitted_members_lo
+					 & (UINT64_C(1) << node)) != 0
+				  : (candidate->admitted_members_hi
+					 & (UINT64_C(1) << (node - 64))) != 0;
+
+		if (!admitted)
+			continue;
+		if (cluster_conf_lookup_node(node) == NULL
+			|| !cluster_reconfig_get_observed_slot(
+				node, &incarnation, &generation)
+			|| generation == 0
+			|| incarnation != candidate->admitted_incarnation[node]
+			|| !cluster_reconfig_get_observed_fresh_alive(node)
+			|| cluster_reconfig_get_observed_epoch(node)
+				   != candidate->formation_epoch)
+			return false;
+		if (freeze_generations)
+			candidate->observed_generation[node] = generation;
+		else if (candidate->observed_generation[node] != generation)
+			return false;
+	}
+	return true;
+}
+
+/* Formation-LMON-only exact projection of the admitted MEMBER SSOT.  This
+ * helper is observation-only: it copies under the reconfiguration lock,
+ * validates QVOTEC currentness outside the lock, then byte-revalidates the
+ * shared tuple and the same receiver-local observations. */
+bool
+cluster_reconfig_lmon_snapshot_r4_membership(
+	ClusterR4MembershipSnapshot *out)
+{
+	ClusterR4MembershipSnapshot candidate;
+	uint64 self_bit;
+	int node;
+	bool exact = true;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (ReconfigShmem == NULL || out == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| cluster_qvotec_get_status() != CLUSTER_QVOTEC_READY
+		|| !cluster_qvotec_in_quorum())
+		return false;
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.local_self_boot_incarnation
+		= cluster_qvotec_get_self_incarnation();
+	if (candidate.local_self_boot_incarnation == 0)
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	candidate.formation_epoch = cluster_epoch_get_current();
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		uint64 floor;
+
+		if (cluster_membership_get_state(node) != CLUSTER_MEMBER_MEMBER)
+			continue;
+		floor = cluster_membership_get_last_admitted_incarnation(node);
+		if (cluster_conf_lookup_node(node) == NULL || floor == 0) {
+			exact = false;
+			break;
+		}
+		if (node < 64)
+			candidate.admitted_members_lo |= UINT64_C(1) << node;
+		else
+			candidate.admitted_members_hi
+				|= UINT64_C(1) << (node - 64);
+		candidate.admitted_incarnation[node] = floor;
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	self_bit = UINT64_C(1) << (cluster_node_id < 64
+								 ? cluster_node_id : cluster_node_id - 64);
+	if (!exact
+		|| (candidate.admitted_members_lo | candidate.admitted_members_hi) == 0
+		|| (cluster_node_id < 64
+				? (candidate.admitted_members_lo & self_bit) == 0
+				: (candidate.admitted_members_hi & self_bit) == 0)
+		|| candidate.admitted_incarnation[cluster_node_id]
+			   != candidate.local_self_boot_incarnation
+		|| !cluster_reconfig_r4_membership_observations_current(
+			&candidate, true))
+		return false;
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	if (cluster_epoch_get_current() != candidate.formation_epoch)
+		exact = false;
+	for (node = 0; exact && node < CLUSTER_MAX_NODES; node++) {
+		bool admitted
+			= node < 64
+				  ? (candidate.admitted_members_lo
+					 & (UINT64_C(1) << node)) != 0
+				  : (candidate.admitted_members_hi
+					 & (UINT64_C(1) << (node - 64))) != 0;
+
+		if ((cluster_membership_get_state(node) == CLUSTER_MEMBER_MEMBER)
+			!= admitted
+			|| (admitted
+				&& (cluster_conf_lookup_node(node) == NULL
+					|| cluster_membership_get_last_admitted_incarnation(node)
+						   != candidate.admitted_incarnation[node])))
+			exact = false;
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+	if (!exact
+		|| !cluster_reconfig_r4_membership_observations_current(
+			&candidate, false))
+		return false;
+	*out = candidate;
+	return true;
+}
+
+/* Compatibility projection for callers that consume only the global bitmap
+ * and formation epoch.  Exactness comes from the stack-only snapshot above. */
 bool
 cluster_reconfig_lmon_snapshot_admitted_membership(
 	uint64 *out_members_lo, uint64 *out_members_hi,
 	uint64 *out_formation_epoch)
 {
-	uint64 members_lo = 0;
-	uint64 members_hi = 0;
-	uint64 formation_epoch;
-	int node;
+	ClusterR4MembershipSnapshot snapshot;
 
 	if (out_members_lo != NULL)
 		*out_members_lo = 0;
@@ -8174,27 +8313,13 @@ cluster_reconfig_lmon_snapshot_admitted_membership(
 		*out_members_hi = 0;
 	if (out_formation_epoch != NULL)
 		*out_formation_epoch = 0;
-	if (ReconfigShmem == NULL || out_members_lo == NULL
-		|| out_members_hi == NULL || out_formation_epoch == NULL)
+	if (out_members_lo == NULL || out_members_hi == NULL
+		|| out_formation_epoch == NULL
+		|| !cluster_reconfig_lmon_snapshot_r4_membership(&snapshot))
 		return false;
-
-	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
-	formation_epoch = cluster_epoch_get_current();
-	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
-		if (!cluster_membership_is_member(node))
-			continue;
-		if (node < 64)
-			members_lo |= UINT64_C(1) << node;
-		else
-			members_hi |= UINT64_C(1) << (node - 64);
-	}
-	LWLockRelease(&ReconfigShmem->lock);
-
-	if ((members_lo | members_hi) == 0)
-		return false;
-	*out_members_lo = members_lo;
-	*out_members_hi = members_hi;
-	*out_formation_epoch = formation_epoch;
+	*out_members_lo = snapshot.admitted_members_lo;
+	*out_members_hi = snapshot.admitted_members_hi;
+	*out_formation_epoch = snapshot.formation_epoch;
 	return true;
 }
 
@@ -10481,6 +10606,15 @@ cluster_reconfig_lmon_snapshot_admitted_membership(
 		*out_members_hi = 0;
 	if (out_formation_epoch != NULL)
 		*out_formation_epoch = 0;
+	return false;
+}
+
+bool
+cluster_reconfig_lmon_snapshot_r4_membership(
+	ClusterR4MembershipSnapshot *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
 	return false;
 }
 

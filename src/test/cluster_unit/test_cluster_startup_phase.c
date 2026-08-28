@@ -389,6 +389,8 @@ static bool phase_test_drift_lms_generation_after_grd_barrier = false;
 static int phase_test_grd_barrier_calls = 0;
 static int phase_test_join_readonly_handoff_calls = 0;
 static uint64 phase_test_join_readonly_handoff_incarnation = 0;
+static uint64 phase_test_join_readonly_handoff_predecessor_floor = 0;
+static uint64 phase_test_last_admitted_incarnation = 11;
 /* RF-ROOT P6 (L4/L5 wiring): steady-state defaults for the membership /
  * reconfig / GRD accessor stubs added below. */
 static bool phase_test_membership_member = true;
@@ -591,7 +593,8 @@ cluster_formation_witness_copy_classification_v1(
 	memset(snapshot, 0, sizeof(*snapshot));
 	*origin_thread = 1;
 	snapshot->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
-	snapshot->membership.last_admitted_incarnation[0] = 11;
+	snapshot->membership.last_admitted_incarnation[0]
+		= phase_test_last_admitted_incarnation;
 	snapshot->reserved[0] = phase_test_formation_epoch;
 	return true;
 }
@@ -634,7 +637,8 @@ cluster_reconfig_capture_formation_snapshot_v1(
 		return false;
 	memset(snapshot, 0, sizeof(*snapshot));
 	snapshot->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
-	snapshot->membership.last_admitted_incarnation[0] = 11;
+	snapshot->membership.last_admitted_incarnation[0]
+		= phase_test_last_admitted_incarnation;
 	snapshot->reserved[0] = phase_test_formation_epoch;
 	return true;
 }
@@ -648,7 +652,7 @@ cluster_qvotec_get_self_incarnation(void)
 uint64
 cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unused())
 {
-	return 11;
+	return phase_test_last_admitted_incarnation;
 }
 
 bool
@@ -739,14 +743,17 @@ cluster_reconfig_epoch0_late_founder_evidence_current(void)
 
 bool
 cluster_reconfig_stage_pre_publish_join_handoff(
-	uint64 expected_self_incarnation)
+	uint64 expected_self_incarnation, uint64 expected_predecessor_floor)
 {
 	phase_test_join_readonly_handoff_calls++;
 	phase_test_join_readonly_handoff_incarnation
 		= expected_self_incarnation;
+	phase_test_join_readonly_handoff_predecessor_floor
+		= expected_predecessor_floor;
 	phase_test_membership_member = false;
 	phase_test_nonmember_state = CLUSTER_MEMBER_JOINING;
-	return expected_self_incarnation == 11;
+	return expected_self_incarnation == 11
+		&& expected_predecessor_floor == 10;
 }
 
 uint64
@@ -885,6 +892,8 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_grd_barrier_calls = 0;
 	phase_test_join_readonly_handoff_calls = 0;
 	phase_test_join_readonly_handoff_incarnation = 0;
+	phase_test_join_readonly_handoff_predecessor_floor = 0;
+	phase_test_last_admitted_incarnation = 11;
 	phase_test_membership_member = true;
 	phase_test_nonmember_state = CLUSTER_MEMBER_JOINING;
 	phase_test_self_join_admitted = true;
@@ -1229,6 +1238,7 @@ UT_TEST(test_phase3_pre_published_recovery_pivots_once_to_join_readonly)
 	phase_test_self_join_admitted = false;
 	phase_test_grd_authority_ok = false;
 	phase_test_late_founder_after_grd_barrier = true;
+	phase_test_last_admitted_incarnation = 10;
 	cluster_phase3_timeout = 1;
 
 	phase4_capture_fatal = true;
@@ -1244,6 +1254,8 @@ UT_TEST(test_phase3_pre_published_recovery_pivots_once_to_join_readonly)
 	UT_ASSERT_EQ(phase_test_grd_barrier_calls, 1);
 	UT_ASSERT_EQ(phase_test_join_readonly_handoff_calls, 1);
 	UT_ASSERT_EQ(phase_test_join_readonly_handoff_incarnation, 11);
+	UT_ASSERT_EQ(phase_test_join_readonly_handoff_predecessor_floor, 10);
+	UT_ASSERT(cluster_authority_handoff_identity_current(11, 10));
 	UT_ASSERT_EQ(phase_test_recovery_control_formation_calls, 1);
 	UT_ASSERT_EQ(phase_test_lms_start_calls, 1);
 	UT_ASSERT_EQ((int)cluster_authority_readiness_get(),
@@ -1253,6 +1265,7 @@ UT_TEST(test_phase3_pre_published_recovery_pivots_once_to_join_readonly)
 	 * permits Phase 4 to rebuild authority, reusing the same idle LMS. */
 	phase_test_membership_member = true;
 	phase_test_self_join_admitted = true;
+	phase_test_last_admitted_incarnation = 11;
 	phase_test_grd_authority_ok = true;
 	phase4_capture_fatal = true;
 	if (setjmp(phase4_fatal_jump) == 0)
@@ -1283,6 +1296,9 @@ UT_TEST(test_phase3_pivot_rejects_published_or_generation_drift)
 	phase_test_grd_authority_ok = false;
 	phase_test_late_founder_after_grd_barrier = true;
 	phase_test_publish_recovery_after_grd_barrier = true;
+	/* A genuinely published recovery binding already has current admission
+	 * lineage; it is not the predecessor-floor handoff case. */
+	phase_test_last_admitted_incarnation = 11;
 	cluster_phase3_timeout = 1;
 	phase4_capture_fatal = true;
 	if (setjmp(phase4_fatal_jump) == 0)
@@ -1303,6 +1319,7 @@ UT_TEST(test_phase3_pivot_rejects_published_or_generation_drift)
 	phase_test_grd_authority_ok = false;
 	phase_test_late_founder_after_grd_barrier = true;
 	phase_test_drift_lms_generation_after_grd_barrier = true;
+	phase_test_last_admitted_incarnation = 10;
 	phase4_capture_fatal = true;
 	if (setjmp(phase4_fatal_jump) == 0)
 		cluster_run_startup_sequence();

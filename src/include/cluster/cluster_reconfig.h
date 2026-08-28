@@ -878,7 +878,7 @@ extern bool cluster_reconfig_self_join_admitted(void); /* RF-ROOT P6 */
  * published stripe face.  It grants neither membership nor xid authority. */
 extern bool cluster_reconfig_epoch0_late_founder_evidence_current(void);
 extern bool cluster_reconfig_stage_pre_publish_join_handoff(
-	uint64 expected_self_incarnation);
+	uint64 expected_self_incarnation, uint64 expected_predecessor_floor);
 extern bool cluster_reconfig_pre_publish_join_handoff_current(void);
 
 /* spec-5.15A closed replacement admission.  A canonical local ADMITTED
@@ -925,8 +925,22 @@ typedef struct ClusterInitialCleanFormationSnapshot {
 	uint64 admitted_incarnation[4];
 } ClusterInitialCleanFormationSnapshot;
 
+/* Stack-only derived identity for the existing R4 SAMPLE carrier.  The
+ * observation generations are receiver-local freshness and never become
+ * cluster-global wire bytes or shared authority. */
+typedef struct ClusterR4MembershipSnapshot {
+	uint64 formation_epoch;
+	uint64 admitted_members_lo;
+	uint64 admitted_members_hi;
+	uint64 admitted_incarnation[CLUSTER_MAX_NODES];
+	uint64 observed_generation[CLUSTER_MAX_NODES];
+	uint64 local_self_boot_incarnation;
+} ClusterR4MembershipSnapshot;
+
 extern bool cluster_reconfig_snapshot_initial_clean_formation(
 	ClusterInitialCleanFormationSnapshot *out);
+extern bool cluster_reconfig_lmon_snapshot_r4_membership(
+	ClusterR4MembershipSnapshot *out);
 /* Formation-LMON-only coherent MEMBER/epoch sample for PGSA reconstruction. */
 extern bool cluster_reconfig_lmon_snapshot_admitted_membership(
 	uint64 *out_members_lo, uint64 *out_members_hi,

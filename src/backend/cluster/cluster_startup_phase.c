@@ -211,8 +211,9 @@ cluster_authority_binding_copy(ClusterAuthorityBindingLocal *out)
 }
 
 static bool
-cluster_authority_clear_matching(const ClusterAuthorityBindingLocal *binding,
-								 const char *caller)
+cluster_authority_clear_matching_internal(
+	const ClusterAuthorityBindingLocal *binding, const char *caller,
+	bool preserve_handoff_identity)
 {
 	bool cleared = false;
 
@@ -238,17 +239,86 @@ cluster_authority_clear_matching(const ClusterAuthorityBindingLocal *binding,
 		/* Managed is a boot-lifetime fail-closed latch.  Losing a bound
 		 * generation invalidates readiness; it must never reactivate the
 		 * legacy one-dimensional LMS/native fallback in the same postmaster. */
-		cluster_phase_state->authority_origin_thread = 0;
-		cluster_phase_state->authority_boot_incarnation = 0;
+		cluster_phase_state->authority_origin_thread
+			= preserve_handoff_identity ? binding->origin_thread : 0;
+		cluster_phase_state->authority_boot_incarnation
+			= preserve_handoff_identity ? binding->boot_incarnation : 0;
 		cluster_phase_state->authority_lms_generation = 0;
 		memset(&cluster_phase_state->authority_fence, 0,
 			   sizeof(cluster_phase_state->authority_fence));
 		memset(&cluster_phase_state->authority_formation, 0,
 			   sizeof(cluster_phase_state->authority_formation));
+		if (preserve_handoff_identity) {
+			int32 origin_node = (int32)binding->origin_thread - 1;
+
+			cluster_phase_state->authority_formation.membership
+				.membership_state[origin_node] = CLUSTER_MEMBER_MEMBER;
+			cluster_phase_state->authority_formation.membership
+				.last_admitted_incarnation[origin_node]
+				= binding->formation.membership
+					.last_admitted_incarnation[origin_node];
+		}
 		cleared = true;
 	}
 	LWLockRelease(&cluster_phase_state->lwlock);
 	return cleared;
+}
+
+static bool
+cluster_authority_clear_matching(const ClusterAuthorityBindingLocal *binding,
+								 const char *caller)
+{
+	return cluster_authority_clear_matching_internal(
+		binding, caller, false);
+}
+
+/* The exact pivot clears authority readiness and every authority-bearing
+ * byte, but keeps the already-captured boot/predecessor tuple in existing
+ * phase-state storage.  OFF remains non-authoritative; the carrier exists
+ * solely so the forked LMON can reject floor or incarnation drift. */
+static bool
+cluster_authority_clear_matching_for_handoff(
+	const ClusterAuthorityBindingLocal *binding)
+{
+	return cluster_authority_clear_matching_internal(
+		binding, "phase3_join_readonly_pivot", true);
+}
+
+bool
+cluster_authority_handoff_identity_current(
+	uint64 expected_self_incarnation, uint64 expected_predecessor_floor)
+{
+	ClusterFenceAuthorityProof zero_fence;
+	bool current = false;
+	int32 origin_node;
+
+	if (cluster_phase_state == NULL || expected_self_incarnation == 0
+		|| (expected_predecessor_floor != 0
+			&& expected_predecessor_floor >= expected_self_incarnation)
+		|| !cluster_phase_state_lock_acquire(LW_SHARED))
+		return false;
+	origin_node = cluster_node_id;
+	memset(&zero_fence, 0, sizeof(zero_fence));
+	if (origin_node >= 0 && origin_node < CLUSTER_MAX_NODES
+		&& pg_atomic_read_u32(&cluster_phase_state->authority_managed) != 0
+		&& (ClusterAuthorityReadiness)pg_atomic_read_u32(
+			   &cluster_phase_state->authority_readiness)
+			   == CLUSTER_AUTHORITY_OFF
+		&& cluster_phase_state->authority_origin_thread
+			   == (uint16)(origin_node + 1)
+		&& cluster_phase_state->authority_boot_incarnation
+			   == expected_self_incarnation
+		&& cluster_phase_state->authority_lms_generation == 0
+		&& memcmp(&cluster_phase_state->authority_fence, &zero_fence,
+				  sizeof(zero_fence)) == 0
+		&& cluster_phase_state->authority_formation.membership
+			   .membership_state[origin_node] == CLUSTER_MEMBER_MEMBER
+		&& cluster_phase_state->authority_formation.membership
+			   .last_admitted_incarnation[origin_node]
+			   == expected_predecessor_floor)
+		current = true;
+	LWLockRelease(&cluster_phase_state->lwlock);
+	return current;
 }
 
 void
@@ -286,6 +356,16 @@ static bool
 cluster_authority_binding_preseal_current(
 	const ClusterAuthorityBindingLocal *binding)
 {
+	uint64 formation_floor;
+	uint64 live_floor;
+
+	if (binding == NULL || binding->origin_thread == 0
+		|| binding->origin_thread > CLUSTER_MAX_NODES)
+		return false;
+	formation_floor = binding->formation.membership
+		.last_admitted_incarnation[binding->origin_thread - 1];
+	live_floor = cluster_membership_get_last_admitted_incarnation(
+		cluster_node_id);
 	return binding != NULL && binding->boot_incarnation != 0
 		&& binding->lms_generation != 0
 		&& cluster_authority_setup_phase_current()
@@ -293,8 +373,13 @@ cluster_authority_binding_preseal_current(
 		&& cluster_qvotec_get_status() == CLUSTER_QVOTEC_READY
 		&& cluster_qvotec_in_quorum()
 		&& cluster_qvotec_get_self_incarnation() == binding->boot_incarnation
-		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   == binding->boot_incarnation
+		&& binding->formation.membership
+			   .membership_state[binding->origin_thread - 1]
+			   == CLUSTER_MEMBER_MEMBER
+		&& formation_floor == live_floor
+		&& (live_floor == binding->boot_incarnation
+			|| (!cluster_reconfig_self_join_admitted()
+				&& live_floor < binding->boot_incarnation))
 		&& cluster_lms_get_lms_restart_generation() == binding->lms_generation
 		&& cluster_lms_is_recovery_ready()
 		&& cluster_formation_classification_revalidate_nowait(
@@ -404,6 +489,8 @@ cluster_authority_readiness_begin(
 	const ClusterFormationSnapshotV1 *formation)
 {
 	uint64 boot_incarnation;
+	uint64 formation_floor;
+	uint64 live_floor;
 	int32 origin_node;
 
 	if (cluster_phase_state == NULL || authority == NULL || formation == NULL
@@ -412,13 +499,16 @@ cluster_authority_readiness_begin(
 		return false;
 	origin_node = (int32)origin_thread - 1;
 	boot_incarnation = cluster_qvotec_get_self_incarnation();
+	formation_floor
+		= formation->membership.last_admitted_incarnation[origin_node];
+	live_floor = cluster_membership_get_last_admitted_incarnation(origin_node);
 	if (origin_node != cluster_node_id || boot_incarnation == 0
 		|| formation->membership.membership_state[origin_node]
 			   != CLUSTER_MEMBER_MEMBER
-		|| formation->membership.last_admitted_incarnation[origin_node]
-			   != boot_incarnation
-		|| cluster_membership_get_last_admitted_incarnation(origin_node)
-			   != boot_incarnation
+		|| formation_floor != live_floor
+		|| (live_floor != boot_incarnation
+			&& (cluster_reconfig_self_join_admitted()
+				|| live_floor >= boot_incarnation))
 		|| cluster_formation_classification_revalidate_nowait(
 			   origin_thread, authority, formation) != CLUSTER_FORMATION_WITNESS_READY)
 		return false;
@@ -1290,9 +1380,10 @@ static TimestampTz phase3_recovery_deadline = 0;
  */
 static bool
 cluster_phase3_try_pre_publish_join_readonly_pivot(TimestampTz deadline,
-												uint64 lms_generation)
+											uint64 lms_generation)
 {
 	ClusterAuthorityBindingLocal binding;
+	uint64 predecessor_floor;
 
 	if (phase3_join_readonly_deferred || deadline == 0
 		|| lms_generation == 0 || GetCurrentTimestamp() >= deadline
@@ -1306,13 +1397,15 @@ cluster_phase3_try_pre_publish_join_readonly_pivot(TimestampTz deadline,
 			   != binding.lms_generation
 		|| binding.boot_incarnation == 0
 		|| cluster_qvotec_get_self_incarnation()
-			   != binding.boot_incarnation
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
 			   != binding.boot_incarnation)
 		return false;
+	predecessor_floor
+		= cluster_membership_get_last_admitted_incarnation(cluster_node_id);
+	if (predecessor_floor != 0
+		&& predecessor_floor >= binding.boot_incarnation)
+		return false;
 
-	if (!cluster_authority_clear_matching(&binding,
-									  "phase3_join_readonly_pivot")
+	if (!cluster_authority_clear_matching_for_handoff(&binding)
 		|| cluster_authority_readiness_get() != CLUSTER_AUTHORITY_OFF
 		|| !cluster_authority_readiness_managed()
 		|| cluster_lms_get_lms_restart_generation()
@@ -1320,13 +1413,13 @@ cluster_phase3_try_pre_publish_join_readonly_pivot(TimestampTz deadline,
 		|| cluster_qvotec_get_self_incarnation()
 			   != binding.boot_incarnation
 		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != binding.boot_incarnation
+			   != predecessor_floor
 		|| GetCurrentTimestamp() >= deadline
 		|| !cluster_cf_phase2_peer_verified()
 		|| cluster_reconfig_self_join_admitted()
 		|| !cluster_reconfig_epoch0_late_founder_evidence_current()
 		|| !cluster_reconfig_stage_pre_publish_join_handoff(
-			binding.boot_incarnation))
+			binding.boot_incarnation, predecessor_floor))
 		return false;
 
 	phase3_join_readonly_deferred = true;

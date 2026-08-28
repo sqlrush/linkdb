@@ -2631,6 +2631,173 @@ UT_TEST(test_93da_coordinator_begins_exact_four_node_sample_round)
 	test_gate_reset();
 }
 
+UT_TEST(test_93da0_early_sample_without_common_view_sends_one_directed_refusal)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	ClusterSemanticActivationAckWireV1 message;
+	ClusterSemanticActivationAckWireV1 sent;
+	ClusterICEnvelope envelope;
+	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+	int node;
+
+	test_gate_reset();
+	cluster_node_id = 3;
+	test_gate_publish(2, 0, 0, test_current_epoch, false);
+	test_membership_snapshot_valid = false;
+	test_local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	test_peer_capability_word_sample_ok = true;
+	test_peer_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	test_peer_capability_generation = 19;
+	test_peer_capability_matches = true;
+	test_send_results[0] = CLUSTER_IC_SEND_DONE;
+
+	memset(&message, 0, sizeof(message));
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST;
+	message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST;
+	message.coordinator_node = 0;
+	message.member_node = 3;
+	message.transition_epoch = test_current_epoch;
+	message.record_generation = 1;
+	message.round_nonce = UINT64_C(404);
+	message.target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	message.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(
+		&message, payload));
+	memset(&envelope, 0, sizeof(envelope));
+	envelope.msg_type = PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1;
+	envelope.source_node_id = 0;
+	envelope.dest_node_id = 3;
+	envelope.epoch = test_current_epoch;
+	envelope.payload_length = sizeof(payload);
+
+	cluster_semantic_activation_ack_handler(&envelope, payload);
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0));
+	UT_ASSERT_EQ(table.observed_members_lo, UINT64_C(0));
+	UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.message.result,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED);
+	UT_ASSERT(!semantic_activation_ack_local_pending_send.invalidated);
+	UT_ASSERT_EQ(
+		semantic_activation_ack_local_pending_send.refusal_connection_generation,
+		UINT32_C(19));
+	UT_ASSERT_EQ(semantic_activation_ack_local_pending_send.pending_members_lo,
+				 UINT64_C(0));
+	for (node = 0; node < 4; node++)
+		UT_ASSERT_EQ(test_send_calls[node], node == 0 ? 1 : 0);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_decode(
+		test_send_payloads[0], &sent));
+	UT_ASSERT_EQ(sent.kind, CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK);
+	UT_ASSERT_EQ(sent.stage, message.stage);
+	UT_ASSERT_EQ(sent.result,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED);
+	UT_ASSERT_EQ(sent.reason, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+	UT_ASSERT_EQ(sent.coordinator_node, UINT32_C(0));
+	UT_ASSERT_EQ(sent.member_node, UINT32_C(3));
+	UT_ASSERT_EQ(sent.transition_epoch, message.transition_epoch);
+	UT_ASSERT_EQ(sent.record_generation, message.record_generation);
+	UT_ASSERT_EQ(sent.round_nonce, message.round_nonce);
+	UT_ASSERT_EQ(sent.source_feature_bitmap, message.source_feature_bitmap);
+	UT_ASSERT_EQ(sent.target_feature_bitmap, message.target_feature_bitmap);
+	UT_ASSERT_EQ(sent.rollback_feature_bitmap,
+				 message.rollback_feature_bitmap);
+	UT_ASSERT_EQ(sent.admitted_members_lo, message.admitted_members_lo);
+	UT_ASSERT_EQ(sent.admitted_members_hi, message.admitted_members_hi);
+	UT_ASSERT_EQ(sent.capability_sample_digest,
+				 message.capability_sample_digest);
+	UT_ASSERT_EQ(sent.boot_id, UINT64_C(0));
+	UT_ASSERT_EQ(sent.admitted_incarnation, UINT64_C(0));
+	UT_ASSERT_EQ(sent.capability_word, UINT32_C(0));
+
+	/* Transport-admitted duplicate evidence is idempotent. */
+	cluster_semantic_activation_ack_handler(&envelope, payload);
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT_EQ(test_send_calls[0], 1);
+	UT_ASSERT(semantic_activation_ack_table_snapshot(&table));
+	UT_ASSERT_EQ(table.expected_members_lo, UINT64_C(0));
+	test_gate_reset();
+}
+
+UT_TEST(test_93da0_exact_refusal_completes_active_utility_as_deferred)
+{
+	const uint64 r4 = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	ClusterSemanticActivationAckTableV1 *table;
+	ClusterSemanticActivationAckWireV1 message;
+	ClusterSemanticActivationRefusal refusal;
+	ClusterICEnvelope envelope;
+	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+	uint64 request_seq = 0;
+
+	test_gate_reset();
+	cluster_node_id = 0;
+	test_local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	test_peer_capability_word_sample_ok = true;
+	test_peer_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	test_peer_capability_generation = 19;
+	test_peer_capability_matches = true;
+	UT_ASSERT(semantic_activation_utility_mailbox_submit(
+		CLUSTER_SEMANTIC_ENABLE_ALL, 0, r4, 0, 0, &request_seq));
+
+	table = SemanticActivationAckTable;
+	memset(table, 0, sizeof(*table));
+	pg_atomic_init_u64(&table->publication_seq, 0);
+	table->stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	table->coordinator_node = 0;
+	table->round_nonce = request_seq;
+	table->expected_members_lo = UINT64_C(0x0f);
+	table->observed_members_lo = UINT64_C(0x01);
+	table->transition_epoch = test_current_epoch;
+	table->record_generation = 1;
+	table->target_feature_bitmap = r4;
+
+	memset(&message, 0, sizeof(message));
+	message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	message.stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE;
+	message.result = CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED;
+	message.reason = CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+	message.coordinator_node = 0;
+	message.member_node = 3;
+	message.transition_epoch = test_current_epoch;
+	message.record_generation = 1;
+	message.round_nonce = request_seq + 1;
+	message.target_feature_bitmap = r4;
+	message.admitted_members_lo = UINT64_C(0x0f);
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(
+		&message, payload));
+	memset(&envelope, 0, sizeof(envelope));
+	envelope.msg_type = PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1;
+	envelope.source_node_id = 3;
+	envelope.dest_node_id = 0;
+	envelope.epoch = test_current_epoch;
+	envelope.payload_length = sizeof(payload);
+
+	/* A wrong-round refusal is stale and cannot complete or erase the round. */
+	cluster_semantic_activation_ack_handler(&envelope, payload);
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT_EQ(table->expected_members_lo, UINT64_C(0x0f));
+	UT_ASSERT(!semantic_activation_utility_mailbox_poll_completion(
+		request_seq, &refusal));
+
+	message.round_nonce = request_seq;
+	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(
+		&message, payload));
+	cluster_semantic_activation_ack_handler(&envelope, payload);
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT_EQ(table->expected_members_lo, UINT64_C(0));
+	UT_ASSERT_EQ(table->observed_members_lo, UINT64_C(0));
+	UT_ASSERT(semantic_activation_utility_mailbox_poll_completion(
+		request_seq, &refusal));
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+	UT_ASSERT_EQ(refusal.feature_bit, r4);
+	test_gate_reset();
+}
+
 UT_TEST(test_93da1_member_retains_sample_ack_until_exact_request_arrives)
 {
 	const uint64 system_identifier = UINT64_C(0x8070605040302010);
@@ -7628,7 +7795,7 @@ UT_TEST(test_145g_peer_open_matches_consumes_open_proof)
 int
 main(void)
 {
-	UT_PLAN(220);
+	UT_PLAN(222);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -7749,6 +7916,8 @@ main(void)
 	UT_RUN(test_93c_utility_mailbox_preserves_exact_owner_tuple_and_completion);
 	UT_RUN(test_93d_formation_lmon_alone_consumes_utility_request);
 	UT_RUN(test_93da_coordinator_begins_exact_four_node_sample_round);
+	UT_RUN(test_93da0_early_sample_without_common_view_sends_one_directed_refusal);
+	UT_RUN(test_93da0_exact_refusal_completes_active_utility_as_deferred);
 	UT_RUN(test_93da1_member_retains_sample_ack_until_exact_request_arrives);
 	UT_RUN(test_93da2_member_retains_next_round_sample_ack_until_exact_request_arrives);
 	UT_RUN(test_93da2a_next_sample_waits_for_exact_local_open_publish);

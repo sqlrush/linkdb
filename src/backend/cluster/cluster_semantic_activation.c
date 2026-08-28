@@ -410,6 +410,7 @@ typedef struct SemanticActivationAckPendingSend {
 	ClusterSemanticActivationAckWireV1 message;
 	uint64 pending_members_lo;
 	uint64 pending_members_hi;
+	uint32 refusal_connection_generation;
 	bool invalidated;
 } SemanticActivationAckPendingSend;
 
@@ -554,6 +555,10 @@ static bool semantic_activation_ack_pending_send_begin_positive(
 	const ClusterSemanticActivationAckWireV1 *request,
 	int32 local_node_id,
 	const SemanticActivationAckTuple *self) pg_attribute_unused();
+static bool semantic_activation_ack_pending_send_begin_refused(
+	SemanticActivationAckPendingSend *pending,
+	const SemanticActivationAckIngressItem *item,
+	ClusterSemanticActivationResult reason) pg_attribute_unused();
 static bool semantic_activation_ack_lmon_begin_sample_round(
 	const SemanticActivationUtilityRequest *request,
 	const SemanticActivationAdmissionSnapshot *snapshot)
@@ -751,6 +756,84 @@ semantic_activation_ack_pending_send_begin_positive(
 	else
 		candidate.pending_members_hi &= ~self_bit;
 	if (!semantic_activation_ack_wire_value_valid(&candidate.message))
+		return false;
+	*pending = candidate;
+	return true;
+}
+
+/*
+ * Build the existing-wire, authority-neutral reply for an initial R4 SAMPLE
+ * that reached this LMON before an exact four-member admission snapshot.
+ * The ingress item carries the authenticated coordinator connection sample;
+ * retaining the send does not install an ACK table row or create a deadline.
+ */
+static bool
+semantic_activation_ack_pending_send_begin_refused(
+	SemanticActivationAckPendingSend *pending,
+	const SemanticActivationAckIngressItem *item,
+	ClusterSemanticActivationResult reason)
+{
+	SemanticActivationAckPendingSend candidate;
+	const ClusterSemanticActivationAckWireV1 *request;
+	uint64 coordinator_bit;
+	int32 local_node_id;
+
+	if (pending == NULL || item == NULL
+		|| reason != CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED)
+		return false;
+	request = &item->message;
+	local_node_id = item->local_receiver_node_id;
+	if (!semantic_activation_ack_wire_value_valid(request)
+		|| request->kind
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_REQUEST
+		|| request->stage
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+		|| request->result
+		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REQUEST
+		|| request->coordinator_node != UINT32_C(0)
+		|| item->authenticated_source_node_id != 0
+		|| local_node_id <= 0 || local_node_id >= 4
+		|| request->member_node != (uint32)local_node_id
+		|| request->admitted_members_lo != UINT64_C(0x0f)
+		|| request->admitted_members_hi != 0
+		|| request->source_feature_bitmap != 0
+		|| request->target_feature_bitmap
+		   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| request->rollback_feature_bitmap != 0
+		|| request->capability_sample_digest != 0
+		|| item->sampled_capability_generation == 0)
+		return false;
+
+	memset(&candidate, 0, sizeof(candidate));
+	candidate.message = *request;
+	candidate.message.kind = CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK;
+	candidate.message.result
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED;
+	candidate.message.reason = (uint32)reason;
+	candidate.message.member_node = (uint32)local_node_id;
+	candidate.message.boot_id = 0;
+	candidate.message.admitted_incarnation = 0;
+	candidate.message.capability_word = 0;
+	coordinator_bit = UINT64_C(1) << request->coordinator_node;
+	candidate.pending_members_lo = coordinator_bit;
+	candidate.refusal_connection_generation
+		= item->sampled_capability_generation;
+	if (!semantic_activation_ack_wire_value_valid(&candidate.message))
+		return false;
+
+	/* The already-admitted exact refusal remains the duplicate receipt. */
+	if (!pending->invalidated
+		&& pending->message.kind
+		   == CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
+		&& pending->message.result
+		   == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED
+		&& memcmp(&pending->message, &candidate.message,
+				  sizeof(candidate.message)) == 0
+		&& pending->refusal_connection_generation
+		   == candidate.refusal_connection_generation)
+		return true;
+	if (pending->invalidated || pending->pending_members_lo != 0
+		|| pending->pending_members_hi != 0)
 		return false;
 	*pending = candidate;
 	return true;
@@ -1751,9 +1834,47 @@ semantic_activation_ack_lmon_apply_item(
 		   != image.capability_sample_digest)
 		return SEMANTIC_ACTIVATION_ACK_CONSUME_STALE;
 	if (message->result == CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED) {
-		return semantic_activation_ack_image_invalidate(&image)
-				   ? SEMANTIC_ACTIVATION_ACK_CONSUME_INVALIDATED
-				   : SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
+		uint32 required_caps;
+		bool exact_initial_r4_refusal
+			= semantic_activation_ack_wire_value_valid(message)
+			&& image.stage
+			   == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+			&& image.source_feature_bitmap == 0
+			&& image.target_feature_bitmap
+			   == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+			&& image.rollback_feature_bitmap == 0
+			&& image.expected_members_lo == UINT64_C(0x0f)
+			&& image.expected_members_hi == 0
+			&& message->reason
+			   == CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED
+			&& item->local_receiver_node_id == current_coordinator_node
+			&& item->authenticated_source_node_id
+			   == (int32)message->member_node
+			&& item->authenticated_source_node_id > 0
+			&& item->authenticated_source_node_id < 4
+			&& cluster_membership_get_state(
+				item->authenticated_source_node_id)
+			   == CLUSTER_MEMBER_MEMBER
+			&& item->sampled_capability_generation != 0
+			&& semantic_activation_ack_round_required_caps(
+				message->source_feature_bitmap,
+				message->target_feature_bitmap,
+				message->rollback_feature_bitmap, &required_caps)
+			&& (item->sampled_capability_word & required_caps)
+			   == required_caps
+			&& cluster_sf_peer_capability_generation_matches(
+				item->authenticated_source_node_id, required_caps,
+				item->sampled_capability_generation);
+
+		if (!semantic_activation_ack_image_invalidate(&image))
+			return SEMANTIC_ACTIVATION_ACK_CONSUME_REJECTED;
+		if (exact_initial_r4_refusal)
+			(void)semantic_activation_utility_mailbox_complete(
+				message->round_nonce,
+				CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED,
+				CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+				message->record_generation - 1);
+		return SEMANTIC_ACTIVATION_ACK_CONSUME_INVALIDATED;
 	}
 	if (message->result != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
 		|| !semantic_activation_ack_remote_tuple(
@@ -2980,45 +3101,91 @@ static void
 semantic_activation_ack_lmon_send_pending(void)
 {
 	ClusterSemanticActivationAckTableV1 image;
+	SemanticActivationAdmissionSnapshot snapshot;
 	SemanticActivationAckPendingSend *pending
 		= &semantic_activation_ack_local_pending_send;
 	uint8 payload[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
 	uint32 required_caps;
+	bool refused;
+	bool invalid;
 	int32 node;
 
 	if (pending->invalidated
 		|| (pending->pending_members_lo == 0
 			&& pending->pending_members_hi == 0))
 		return;
-	if (!semantic_activation_ack_table_snapshot(&image)
-		|| !semantic_activation_ack_round_required_caps(
-			image.source_feature_bitmap, image.target_feature_bitmap,
-			image.rollback_feature_bitmap, &required_caps)
-		|| (image.expected_members_lo == 0
-			&& image.expected_members_hi == 0)
+	refused = pending->message.result
+		== CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED;
+	invalid = !semantic_activation_ack_round_required_caps(
+		pending->message.source_feature_bitmap,
+		pending->message.target_feature_bitmap,
+		pending->message.rollback_feature_bitmap, &required_caps)
 		|| pending->message.kind
 		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_KIND_ACK
-		|| pending->message.result
-		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
-		|| pending->message.stage != image.stage
-		|| pending->message.coordinator_node != image.coordinator_node
-		|| pending->message.round_nonce != image.round_nonce
-		|| pending->message.admitted_members_lo
-		   != image.expected_members_lo
-		|| pending->message.admitted_members_hi
-		   != image.expected_members_hi
-		|| pending->message.transition_epoch != image.transition_epoch
-		|| pending->message.record_generation != image.record_generation
-		|| pending->message.source_feature_bitmap
-		   != image.source_feature_bitmap
-		|| pending->message.target_feature_bitmap
-		   != image.target_feature_bitmap
-		|| pending->message.rollback_feature_bitmap
-		   != image.rollback_feature_bitmap
-		|| pending->message.capability_sample_digest
-		   != image.capability_sample_digest
 		|| !cluster_semantic_activation_ack_wire_encode(
-			&pending->message, payload)) {
+			&pending->message, payload);
+	if (!invalid && refused) {
+		uint64 coordinator_bit
+			= UINT64_C(1) << pending->message.coordinator_node;
+
+		invalid = pending->message.stage
+				  != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE
+			|| pending->message.reason
+			   != CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED
+			|| pending->message.coordinator_node != UINT32_C(0)
+			|| pending->message.member_node != (uint32)cluster_node_id
+			|| pending->message.admitted_members_lo != UINT64_C(0x0f)
+			|| pending->message.admitted_members_hi != 0
+			|| pending->message.source_feature_bitmap != 0
+			|| pending->message.target_feature_bitmap
+			   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+			|| pending->message.rollback_feature_bitmap != 0
+			|| pending->message.capability_sample_digest != 0
+			|| pending->pending_members_lo != coordinator_bit
+			|| pending->pending_members_hi != 0
+			|| pending->refusal_connection_generation == 0
+			|| !cluster_qvotec_in_quorum()
+			|| pending->message.transition_epoch
+			   != cluster_epoch_get_current()
+			|| (cluster_ic_local_capability_word() & required_caps)
+			   != required_caps
+			|| !semantic_activation_snapshot(&snapshot)
+			|| snapshot.transition_closed
+			|| snapshot.formation_epoch
+			   != pending->message.transition_epoch
+			|| snapshot.active_bits
+			   != pending->message.source_feature_bitmap
+			|| snapshot.record_generation == UINT64_MAX
+			|| snapshot.record_generation + 1
+			   != pending->message.record_generation
+			|| !cluster_sf_peer_capability_generation_matches(
+				(int32)pending->message.coordinator_node, required_caps,
+				pending->refusal_connection_generation);
+	} else if (!invalid) {
+		invalid = pending->message.result
+				  != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_OK
+			|| !semantic_activation_ack_table_snapshot(&image)
+			|| (image.expected_members_lo == 0
+				&& image.expected_members_hi == 0)
+			|| pending->message.stage != image.stage
+			|| pending->message.coordinator_node != image.coordinator_node
+			|| pending->message.round_nonce != image.round_nonce
+			|| pending->message.admitted_members_lo
+			   != image.expected_members_lo
+			|| pending->message.admitted_members_hi
+			   != image.expected_members_hi
+			|| pending->message.transition_epoch != image.transition_epoch
+			|| pending->message.record_generation != image.record_generation
+			|| pending->message.source_feature_bitmap
+			   != image.source_feature_bitmap
+			|| pending->message.target_feature_bitmap
+			   != image.target_feature_bitmap
+			|| pending->message.rollback_feature_bitmap
+			   != image.rollback_feature_bitmap
+			|| pending->message.capability_sample_digest
+			   != image.capability_sample_digest;
+	}
+	if (invalid) {
 		pending->pending_members_lo = 0;
 		pending->pending_members_hi = 0;
 		pending->invalidated = true;
@@ -3043,7 +3210,10 @@ semantic_activation_ack_lmon_send_pending(void)
 		if (!cluster_sf_peer_capability_word_sample(
 				node, required_caps,
 				&capability_word, &capability_generation)
-			|| capability_generation == 0) {
+			|| capability_generation == 0
+			|| (refused
+				&& capability_generation
+				   != pending->refusal_connection_generation)) {
 			pending->pending_members_lo = 0;
 			pending->pending_members_hi = 0;
 			pending->invalidated = true;
@@ -3467,13 +3637,24 @@ semantic_activation_ack_lmon_drain(void)
 			cluster_node_id, &current_members_lo, &current_members_hi,
 			&current_epoch, &current_coordinator_node)) {
 		semantic_activation_ack_lmon_invalidate_active();
-		semantic_activation_ack_local_pending_send.pending_members_lo = 0;
-		semantic_activation_ack_local_pending_send.pending_members_hi = 0;
-		semantic_activation_ack_local_pending_send.invalidated = true;
+		if ((semantic_activation_ack_local_pending_send.pending_members_lo != 0
+			 || semantic_activation_ack_local_pending_send.pending_members_hi != 0)
+			&& semantic_activation_ack_local_pending_send.message.result
+			   != CLUSTER_SEMANTIC_ACTIVATION_ACK_RESULT_REFUSED) {
+			semantic_activation_ack_local_pending_send.pending_members_lo = 0;
+			semantic_activation_ack_local_pending_send.pending_members_hi = 0;
+			semantic_activation_ack_local_pending_send.invalidated = true;
+		}
 		while (consumed < CLUSTER_SEMANTIC_ACTIVATION_ACK_INGRESS_CAPACITY
 			   && semantic_activation_ack_ingress_poll(
-				   &semantic_activation_ack_local_ingress, &item))
+				   &semantic_activation_ack_local_ingress, &item)) {
 			consumed++;
+			if (!semantic_activation_ack_pending_send_begin_refused(
+					&semantic_activation_ack_local_pending_send, &item,
+					CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED))
+				continue;
+		}
+		semantic_activation_ack_lmon_send_pending();
 		return;
 	}
 	semantic_activation_ack_lmon_revalidate_active(

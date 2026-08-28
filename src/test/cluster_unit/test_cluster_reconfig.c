@@ -151,6 +151,8 @@ static bool ut_external_fence_active;
 static bool ut_authority_managed;
 static ClusterAuthorityReadiness ut_authority_readiness
 	= CLUSTER_AUTHORITY_OFF;
+static uint64 ut_handoff_identity_incarnation;
+static uint64 ut_handoff_identity_predecessor_floor;
 static bool ut_serving_ready;
 static uint64 ut_lms_generation = UINT64_C(1);
 static bool ut_rejoin_grd_clear_ready;
@@ -209,6 +211,17 @@ ClusterAuthorityReadiness
 cluster_authority_readiness_get(void)
 {
 	return ut_authority_readiness;
+}
+
+bool
+cluster_authority_handoff_identity_current(
+	uint64 expected_self_incarnation, uint64 expected_predecessor_floor)
+{
+	return ut_authority_managed
+		&& ut_authority_readiness == CLUSTER_AUTHORITY_OFF
+		&& expected_self_incarnation == ut_handoff_identity_incarnation
+		&& expected_predecessor_floor
+			   == ut_handoff_identity_predecessor_floor;
 }
 
 bool
@@ -1160,6 +1173,8 @@ ut_reset_mocks(void)
 	ut_external_fence_active = false;
 	ut_authority_managed = false;
 	ut_authority_readiness = CLUSTER_AUTHORITY_OFF;
+	ut_handoff_identity_incarnation = 0;
+	ut_handoff_identity_predecessor_floor = 0;
 	ut_serving_ready = false;
 	ut_lms_generation = UINT64_C(1);
 	ut_rejoin_grd_clear_ready = true;
@@ -2546,6 +2561,80 @@ ut_admitted_replacement_episode(int32 target_node_id)
 	return episode;
 }
 
+static void
+ut_prepare_exact_r4_membership(void)
+{
+	int node;
+
+	ut_join_setup();
+	ut_in_quorum_value = true;
+	ut_set_self_incarnation_sequence(UINT64_C(100), UINT64_C(100),
+								 UINT64_C(100));
+	for (node = 0; node < 4; node++) {
+		uint64 incarnation = UINT64_C(100) + (uint64)node;
+
+		ut_declared_set[node] = true;
+		cluster_membership_record_admitted(node, incarnation);
+		cluster_membership_set_state(node, CLUSTER_MEMBER_MEMBER);
+		cluster_reconfig_record_observed_slot(
+			node, incarnation, UINT64_C(20) + (uint64)node,
+			CLUSTER_EPOCH_INITIAL);
+		cluster_reconfig_record_observed_fresh_alive(node, true);
+	}
+}
+
+UT_TEST(test_r4_membership_snapshot_captures_exact_current_four_node_view)
+{
+	ClusterR4MembershipSnapshot snapshot;
+	int node;
+
+	ut_prepare_exact_r4_membership();
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(snapshot.formation_epoch, CLUSTER_EPOCH_INITIAL);
+	UT_ASSERT_EQ(snapshot.admitted_members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(snapshot.admitted_members_hi, 0);
+	UT_ASSERT_EQ(snapshot.local_self_boot_incarnation, UINT64_C(100));
+	for (node = 0; node < 4; node++) {
+		UT_ASSERT_EQ(snapshot.admitted_incarnation[node],
+					 UINT64_C(100) + (uint64)node);
+		UT_ASSERT_EQ(snapshot.observed_generation[node],
+					 UINT64_C(20) + (uint64)node);
+	}
+	for (; node < CLUSTER_MAX_NODES; node++) {
+		UT_ASSERT_EQ(snapshot.admitted_incarnation[node], 0);
+		UT_ASSERT_EQ(snapshot.observed_generation[node], 0);
+	}
+}
+
+UT_TEST(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence)
+{
+	ClusterR4MembershipSnapshot snapshot;
+
+	ut_prepare_exact_r4_membership();
+	cluster_membership_set_state(3, CLUSTER_MEMBER_JOINING);
+	UT_ASSERT(cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(snapshot.admitted_members_lo, UINT64_C(0x07));
+	UT_ASSERT_EQ(snapshot.admitted_incarnation[3], 0);
+
+	ut_prepare_exact_r4_membership();
+	cluster_reconfig_record_observed_slot(
+		3, UINT64_C(999), UINT64_C(23), CLUSTER_EPOCH_INITIAL);
+	UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
+
+	ut_prepare_exact_r4_membership();
+	cluster_reconfig_record_observed_fresh_alive(2, false);
+	UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
+
+	ut_prepare_exact_r4_membership();
+	ut_set_self_incarnation_sequence(UINT64_C(101), UINT64_C(101),
+								 UINT64_C(101));
+	UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
+}
+
 /* A decoded phase-1 frame is only a purge candidate after the current local
  * state exact-binds it to the settled RESERVE, its acting ballot proposer and
  * the majority-durable PREPARE.  Authorization itself must mutate nothing. */
@@ -3769,7 +3858,9 @@ ut_prepare_epoch0_managed_handoff(void)
 	cluster_reconfig_record_observed_fresh_alive(0, true);
 	cluster_membership_record_admitted(0, UINT64_C(80));
 	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
-	cluster_membership_record_admitted(cluster_node_id, UINT64_C(83));
+	/* This boot has not been admitted yet.  The retained floor is the exact
+	 * predecessor, strictly older than the presented boot incarnation. */
+	cluster_membership_record_admitted(cluster_node_id, UINT64_C(82));
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
 	state->self_join_admitted = 0;
 	state->self_join_failed = 0;
@@ -3784,13 +3875,15 @@ ut_prepare_epoch0_managed_handoff(void)
 	ut_recovery_in_progress = false;
 	ut_authority_managed = true;
 	ut_authority_readiness = CLUSTER_AUTHORITY_OFF;
+	ut_handoff_identity_incarnation = UINT64_C(83);
+	ut_handoff_identity_predecessor_floor = UINT64_C(82);
 	MyProc = NULL;
 	return state;
 }
 
 /* Phase 3 has no PGPROC.  The exact handoff must use conditional acquisition,
  * leave MEMBER untouched when the reconfig lock is busy, and accept only the
- * current self-incarnation floor.  Once staged, the byte-identical JOINING
+ * exact predecessor floor.  Once staged, the byte-identical JOINING
  * tuple is an idempotent success and may not refresh any field. */
 UT_TEST(test_pre_publish_join_handoff_is_exact_idempotent_and_nonblocking)
 {
@@ -3804,7 +3897,7 @@ UT_TEST(test_pre_publish_join_handoff_is_exact_idempotent_and_nonblocking)
 	/* Two exact peer captures precede the handoff's EXCLUSIVE claim. */
 	ut_lwlock_conditional_fail_call = 3;
 	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83)));
+		UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 3);
 	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
@@ -3816,7 +3909,7 @@ UT_TEST(test_pre_publish_join_handoff_is_exact_idempotent_and_nonblocking)
 	ut_lwlock_conditional_calls = 0;
 	ut_lwlock_blocking_calls = 0;
 	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83)));
+		UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 				 (int)CLUSTER_MEMBER_JOINING);
@@ -3828,12 +3921,12 @@ UT_TEST(test_pre_publish_join_handoff_is_exact_idempotent_and_nonblocking)
 	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
 								 UINT64_C(83));
 	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83)));
+		UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ(state->self_join_admitted, admitted_before);
 	UT_ASSERT_EQ(state->self_join_failed, failed_before);
 	UT_ASSERT_EQ(state->self_join_deadline_us, deadline_before);
 	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
-		cluster_node_id), UINT64_C(83));
+		cluster_node_id), UINT64_C(82));
 }
 
 /* Every conjunct is fail-closed: no generic managed+OFF+JOINING state may be
@@ -3845,29 +3938,46 @@ UT_TEST(test_pre_publish_join_handoff_rejects_nonexact_state)
 
 	state = ut_prepare_epoch0_managed_handoff();
 	ut_authority_readiness = CLUSTER_AUTHORITY_RECOVERY_READY;
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 				 (int)CLUSTER_MEMBER_MEMBER);
 
 	state = ut_prepare_epoch0_managed_handoff();
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(84)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(84), UINT64_C(82)));
+
+	state = ut_prepare_epoch0_managed_handoff();
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(81)));
+
+	state = ut_prepare_epoch0_managed_handoff();
+	cluster_membership_record_admitted(cluster_node_id, UINT64_C(83));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(83)));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
+				 (int)CLUSTER_MEMBER_MEMBER);
 
 	state = ut_prepare_epoch0_managed_handoff();
 	cluster_membership_record_admitted(cluster_node_id, UINT64_C(84));
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(84)));
 
 	state = ut_prepare_epoch0_managed_handoff();
 	state->replacement_episode = ut_admitted_replacement_episode(cluster_node_id);
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(82)));
 
 	state = ut_prepare_epoch0_managed_handoff();
 	ut_clean_leave_in_progress = true;
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(82)));
 
 	state = ut_prepare_epoch0_managed_handoff();
 	state->removed_bitmap[cluster_node_id / 8]
 		|= (uint8)(1u << (cluster_node_id % 8));
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(82)));
 
 	state = ut_prepare_epoch0_managed_handoff();
 	state->self_join_failed = 1;
@@ -3882,13 +3992,23 @@ UT_TEST(test_pre_publish_join_handoff_rejects_nonexact_state)
 	state = ut_prepare_epoch0_managed_handoff();
 	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(84),
 								 UINT64_C(84));
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 				 (int)CLUSTER_MEMBER_JOINING);
 	UT_ASSERT_EQ(state->self_join_admitted, 0);
 	UT_ASSERT_EQ(state->self_join_failed, 0);
 	UT_ASSERT_EQ(state->self_join_deadline_us, 0);
+	/* The failed call cannot publish admission or reopen writes.  A later
+	 * classifier starts from a fresh current incarnation/floor sample; the
+	 * handoff does not retain a second cross-boot identity authority. */
+
+	state = ut_prepare_epoch0_managed_handoff();
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(82)));
+	cluster_membership_record_admitted(cluster_node_id, UINT64_C(83));
 	UT_ASSERT(!cluster_reconfig_pre_publish_join_handoff_current());
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
 }
 
 /* The approved pre-publish pivot retains the boot-lifetime managed latch but
@@ -3902,7 +4022,8 @@ UT_TEST(test_epoch0_managed_pivot_drives_ordinary_join_owner)
 	int status = 0;
 	ClusterReconfigState *state = ut_prepare_epoch0_managed_handoff();
 
-	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83)));
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
+		UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 				 (int)CLUSTER_MEMBER_JOINING);
 
@@ -6886,7 +7007,7 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 int
 main(void)
 {
-	UT_PLAN(114);
+	UT_PLAN(116);
 
 	UT_RUN(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap);
 
@@ -6902,6 +7023,8 @@ main(void)
 	UT_RUN(test_reconfig_shmem_init_idempotent);
 	UT_RUN(test_formation_snapshot_no_pgproc_never_blocks_on_reconfig_lock);
 	UT_RUN(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock);
+	UT_RUN(test_r4_membership_snapshot_captures_exact_current_four_node_view);
+	UT_RUN(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence);
 	UT_RUN(test_reconfig_replacement_episode_is_embedded_and_zero_initialized);
 	UT_RUN(test_reconfig_publish_increments_apply_counter);
 	UT_RUN(test_reconfig_publish_overwrites_event_seq_monotonically);

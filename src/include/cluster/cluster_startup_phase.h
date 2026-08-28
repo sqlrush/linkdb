@@ -309,6 +309,8 @@ extern void cluster_phase_shmem_register(void);
  * transitions; every consumer gets a generation-revalidated predicate. */
 extern ClusterAuthorityReadiness cluster_authority_readiness_get(void);
 extern bool cluster_authority_readiness_managed(void);
+extern bool cluster_authority_handoff_identity_current(
+	uint64 expected_self_incarnation, uint64 expected_predecessor_floor);
 extern bool cluster_authority_readiness_begin(
 	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
 	const ClusterFormationSnapshotV1 *formation);

@@ -188,3 +188,19 @@ flowchart LR
 
 这也是为什么 `t/429` 通过不能直接保证 `t/430` 第 17 项通过：`t/429` 主要验证 harness
 生命周期；`t/430` 使用真实四节点进程重新证明 membership、资源 readiness 和 workload。
+
+## 8. 当前版本的验收范围
+
+`t/429` 和 `t/430` 作为后续阶段的测试基板原样保留，用于覆盖 two-stage restart、rejoin 与
+block-device lifecycle。它们不是当前 Stage 8 同构四节点 clean happy-path 的 completion gate，
+也不能通过修改 workload、judge、timeout 或成功极性来制造 GREEN。它们后续通过仍不代表产品
+已经完成以下更广能力：
+
+- 少于全部配置实例时的正向 OPEN；
+- 运行中实例加入后的自动 reformation；
+- repeated restart、online rejoin 或 replacement 的完整正向生命周期；
+- voting block device 的生产部署认证。
+
+当前正式正向验收仍是同构四节点 clean formation、四节点事务正确性，以及后续四节点自适应
+并发性能验收。上述恢复、降级运行和部署认证能力属于后续阶段；当前版本继续保留已有的
+fail-closed 检查，但不能把安全拒绝解释为这些能力已经可用。
