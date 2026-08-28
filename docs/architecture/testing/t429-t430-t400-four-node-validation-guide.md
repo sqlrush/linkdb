@@ -187,6 +187,14 @@ flowchart LR
 
 不得把 cleanup 成功解释成 workload 成功。
 
+### 3.6 如何解释“16 项通过后停止”
+
+前 16 项只覆盖四节点 SQL alive 和 12 条有向 peer connection。下一条可见断言是
+pre-OPEN durable mirror；在它之前还要通过每节点 quorum、membership admission 和
+pre-OPEN fail-closed 检查。因此，16 项后停止应先按
+[成员关系先于数据库服务](../four-node-two-stage-acceptance/05-membership-before-service-readiness.md)
+检查启动控制面，不能先归因于 PCM capacity 或 512-page workload。
+
 ## 4. t/400：四节点热块协议正确性
 
 ### 4.1 测试拓扑

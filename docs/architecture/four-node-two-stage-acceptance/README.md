@@ -26,6 +26,8 @@
    说明 focused test、`t/430`、`t/400` 和性能预基线分别验证什么。
 4. [块设备预检与卡住 I/O 的安全收束](04-block-device-preflight-and-stuck-io-recovery.md)
    说明静态设备认证为何不等于可用 I/O、如何在不改 voting 数据的前提下预检，以及进程陷入不可中断 I/O 时如何留证和延迟回收。
+5. [成员关系先于数据库服务](05-membership-before-service-readiness.md)
+   解释 `t/430` 前 16 项与第 17 项的边界、合法准入顺序，以及如何区分 quorum/membership 启动失败和后续资源回收失败。
 
 ## 一张图看懂
 
