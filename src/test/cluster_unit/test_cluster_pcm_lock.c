@@ -5975,6 +5975,8 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 	ResourceXDecodedFrame source_request;
 	ResourceXDecodedFrame source_ack;
 	ResourceXDecodedFrame stale_ack;
+	ResourceXDecodedFrame successor_request;
+	ResourceXDecodedFrame successor_ack;
 	ResourceXDecodedFrame release;
 	ResourceXIntentSlot intent;
 	ResourceXReconfigBatch batch;
@@ -6097,12 +6099,29 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
 
+	/* The live conversion is terminal, but its exact former-source release is
+	 * still protocol debt.  A successor may retain priority, but must not
+	 * sample a base or create a receipt until that debt is ACKED. */
+	successor_request = make_resource_x_bootstrap_request_values(
+		tag, 3, 17, 31, 41, 53);
+	memset(&successor_ack, 0, sizeof(successor_ack));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&successor_request, 3, 63, 77, 31, 71, &successor_ack),
+		RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(successor_ack.common.base_authority_generation,
+		UINT64_C(0));
+
 	source_ack = source_request;
 	source_ack.kind = RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2;
 	source_ack.common.sender_connection_generation = 64;
 	source_ack.common.outcome = RESOURCE_X_OUTCOME_OK;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(
 		&source_ack, 0, &after_ack), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&successor_request, 3, 63, 77, 31, 71, &successor_ack),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(successor_ack.common.base_authority_generation,
+		settled_snapshot.final_authority_generation);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
 		&assertion.common.logical_assertion, &after_ack),
 		RESOURCE_X_APPLY_APPLIED);

@@ -13117,15 +13117,31 @@ typedef enum PcmResourceXBootstrapDispatchState {
  * priority without retaining a base or ACK. */
 static PcmResourceXBootstrapDispatchState
 pcm_resource_x_bootstrap_dispatch_state_locked(
-	const ClusterPcmResourceXMasterState *state, int32 requester_node)
+	struct GrdEntry *entry, const ClusterPcmResourceXMasterState *state,
+	int32 requester_node)
 {
 	static const ClusterPcmResourceXMasterRequest empty_request;
+	ResourceXDecodedFrame source_settlement;
 	bool occupied = false;
 	int32 candidate_node;
 
+	Assert(entry != NULL);
 	Assert(state != NULL);
 	Assert(requester_node >= 0
 		&& requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	if (!pcm_resource_x_source_settlement_debt_decode_locked(
+			entry, state, &source_settlement))
+		return PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_CORRUPT;
+	/* INSTALL_SETTLEMENT is transport-reliable but has no semantic ACK.  Do
+	 * not admit another conversion while the previous exact former-source
+	 * release is still PENDING: a second REMOTE_CARRIER install could not arm
+	 * its sole debt and would strand the canonical request in GRANT_COMMITTED.
+	 * The bounded successor priority remains non-authoritative and retries the
+	 * same request after the exact source ACK changes PENDING to ACKED. */
+	if (state->source_settlement.state
+			== RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
+		occupied = true;
 
 	for (candidate_node = 0;
 		 candidate_node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
@@ -13680,7 +13696,7 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	}
 	else {
 		dispatch_state = pcm_resource_x_bootstrap_dispatch_state_locked(
-			state, requester_node);
+			entry, state, requester_node);
 		if (dispatch_state
 				== PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_CORRUPT) {
 			pcm_resource_x_bootstrap_priority_clear(priority);
