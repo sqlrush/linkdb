@@ -242,6 +242,7 @@ static uint8 semantic_activation_lmon_pgrd_candidate
 static uint64 semantic_activation_lmon_pgrd_read_request_seq;
 static uint64 semantic_activation_lmon_pgrd_read_utility_request_seq;
 static ClusterSemanticFormationBinding semantic_activation_lmon_pgrd_read_formation;
+static uint64 semantic_activation_lmon_member_pgrd_read_request_seq;
 static uint64 semantic_activation_lmon_prepare_cas_seq;
 static uint64 semantic_activation_lmon_prepare_cas_utility_request_seq;
 static uint64 semantic_activation_lmon_commit_cas_seq;
@@ -285,6 +286,8 @@ static bool semantic_activation_pgrd_snapshot_publish(
 	const uint8 descriptor_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
 static bool semantic_activation_pgrd_snapshot_copy(
 	uint8 descriptor_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
+static bool semantic_activation_undo_root_descriptor_read_mailbox_poll_completion(
+	uint64 request_seq, ClusterUndoRootDescriptorReadCompletion *out);
 static bool semantic_activation_lmon_shared_pgrd_root_directory(
 	char root_directory[MAXPGPATH]);
 
@@ -496,6 +499,9 @@ StaticAssertDecl(sizeof(SemanticActivationAckIngress) == 34832,
 				 "semantic activation ACK ingress must remain 34832 bytes");
 
 static ClusterSemanticActivationAckTableV1 *SemanticActivationAckTable = NULL;
+static bool semantic_activation_member_pgrd_read_mailbox_submit(
+	const ClusterSemanticActivationAckTableV1 *expected_table,
+	uint64 *out_request_seq);
 
 /* RF-ROOT P7 (contract): bit22 cutover round — member-side OPEN_APPLIED
  * stage apply.  Round-parameterized (member set driven by the ACK table,
@@ -3084,6 +3090,7 @@ semantic_activation_ack_lmon_invalidate_active(void)
 {
 	ClusterSemanticActivationAckTableV1 image;
 
+	semantic_activation_lmon_member_pgrd_read_request_seq = 0;
 	memset(&semantic_activation_ack_local_stage_ahead, 0,
 		   sizeof(semantic_activation_ack_local_stage_ahead));
 	memset(&semantic_activation_ack_local_request_ahead, 0,
@@ -8433,6 +8440,66 @@ semantic_activation_ack_member_prepared_image_current_bit22(
 }
 
 static bool
+semantic_activation_ack_lmon_member_pgrd_ready(
+	const ClusterSemanticActivationAckTableV1 *expected_table)
+{
+	ClusterSemanticActivationAckTableV1 current;
+	ClusterUndoRootDescriptorReadCompletion completion;
+	ClusterUndoSmgrRootMirrorState mirror_state;
+	SemanticActivationAckTuple self;
+	uint8 mirror[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 published[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	char root_directory[MAXPGPATH];
+
+	if (expected_table == NULL
+		|| !semantic_activation_ack_member_prepared_image_current(
+			expected_table, &self))
+		return false;
+	if (semantic_activation_initial_clean_pgrd_mirror(published))
+		return true;
+
+	if (semantic_activation_lmon_member_pgrd_read_request_seq == 0) {
+		if (!semantic_activation_member_pgrd_read_mailbox_submit(
+				expected_table,
+				&semantic_activation_lmon_member_pgrd_read_request_seq))
+			return false;
+		return false;
+	}
+	memset(&completion, 0, sizeof(completion));
+	if (!semantic_activation_undo_root_descriptor_read_mailbox_poll_completion(
+			semantic_activation_lmon_member_pgrd_read_request_seq,
+			&completion)
+		|| completion.state != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+		|| !semantic_activation_lmon_shared_pgrd_root_directory(
+			root_directory))
+		return false;
+
+	mirror_state = cluster_undo_smgr_root_descriptor_read_candidate(
+		root_directory, mirror);
+	if (mirror_state != CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT
+		|| memcmp(mirror, completion.selected_bytes, sizeof(mirror)) != 0
+		|| !semantic_activation_ack_table_snapshot(&current)
+		|| memcmp(expected_table, &current, sizeof(current)) != 0
+		|| !semantic_activation_ack_member_prepared_image_current(
+			&current, &self)
+		|| !semantic_activation_pgrd_snapshot_publish(
+			completion.selected_bytes)
+		|| !semantic_activation_initial_clean_pgrd_mirror(published)
+		|| memcmp(published, completion.selected_bytes,
+				  sizeof(published)) != 0
+		|| !semantic_activation_ack_table_snapshot(&current)
+		|| memcmp(expected_table, &current, sizeof(current)) != 0
+		|| !semantic_activation_ack_member_prepared_image_current(
+			&current, &self)) {
+		semantic_activation_pgrd_snapshot_clear();
+		return false;
+	}
+
+	semantic_activation_lmon_member_pgrd_read_request_seq = 0;
+	return true;
+}
+
+static bool
 semantic_activation_ack_lmon_progress_member_barrier(void)
 {
 	ClusterSemanticActivationAckTableV1 before;
@@ -8510,6 +8577,13 @@ semantic_activation_ack_lmon_progress_member_barrier(void)
 	if (before.stage == CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED) {
 		if (!semantic_activation_ack_member_prepared_image_current(
 				&before, &self))
+			return true;
+		if (round_descriptor == &r4_descriptor
+			&& before.source_feature_bitmap == 0
+			&& before.target_feature_bitmap
+			   == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+			&& before.rollback_feature_bitmap == 0
+			&& !semantic_activation_ack_lmon_member_pgrd_ready(&before))
 			return true;
 		self_bit = UINT64_C(1) << cluster_node_id;
 		if ((before.observed_members_lo & self_bit) != 0)
@@ -11353,6 +11427,44 @@ semantic_activation_authority_mailbox_submit(
 	return true;
 }
 
+/* Reconstruct the exact member-local PGRD read binding from the current R4
+ * PREPARED carrier.  The authority mailbox already stores the round nonce in
+ * expected_source_feature_bitmap; the remaining identity is re-derived from
+ * the current ACK table and local admitted incarnation on every poll. */
+static bool
+semantic_activation_member_pgrd_formation_binding(
+	ClusterSemanticFormationBinding *out)
+{
+	ClusterSemanticActivationAckTableV1 table;
+	SemanticActivationAckTuple self;
+
+	if (out == NULL || SemanticActivationShmem == NULL
+		|| pg_atomic_read_u32(
+			&SemanticActivationShmem->record_cas_request_kind)
+			   != CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ
+		|| !semantic_activation_ack_table_snapshot(&table)
+		|| table.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED
+		|| table.source_feature_bitmap != 0
+		|| table.target_feature_bitmap
+			   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| table.rollback_feature_bitmap != 0
+		|| table.round_nonce == 0
+		|| table.round_nonce
+			   != SemanticActivationShmem
+				  ->record_cas_expected_source_feature_bitmap
+		|| cluster_node_id < 0 || cluster_node_id >= 4
+		|| cluster_node_id == (int32)table.coordinator_node
+		|| !semantic_activation_ack_member_prepared_image_current(
+			&table, &self))
+		return false;
+
+	out->utility_request_seq = table.round_nonce;
+	out->formation_epoch = table.transition_epoch;
+	out->coordinator_incarnation = self.admitted_incarnation;
+	out->expected_record_generation = table.record_generation;
+	return out->coordinator_incarnation != 0;
+}
+
 static bool
 semantic_activation_authority_request_formation_binding(
 	ClusterSemanticAuthorityRequestKind request_kind,
@@ -11394,6 +11506,10 @@ semantic_activation_authority_request_formation_binding(
 		return true;
 	case CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR:
 	case CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ:
+		if (request_kind
+				== CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ
+			&& semantic_activation_member_pgrd_formation_binding(out))
+			return true;
 		out->utility_request_seq
 			= SemanticActivationShmem
 			  ->record_cas_expected_source_feature_bitmap;
@@ -11750,6 +11866,37 @@ semantic_activation_undo_root_descriptor_read_mailbox_submit(
 		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ,
 		system_identifier, formation->utility_request_seq, zero,
 		out_request_seq);
+}
+
+static bool
+semantic_activation_member_pgrd_read_mailbox_submit(
+	const ClusterSemanticActivationAckTableV1 *expected_table,
+	uint64 *out_request_seq)
+{
+	ClusterSemanticActivationAckTableV1 current;
+	SemanticActivationAckTuple self;
+	uint8 zero[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] = { 0 };
+	uint64 system_identifier = GetSystemIdentifier();
+
+	if (expected_table == NULL || out_request_seq == NULL
+		|| system_identifier == 0
+		|| !semantic_activation_ack_table_snapshot(&current)
+		|| memcmp(expected_table, &current, sizeof(current)) != 0
+		|| current.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED
+		|| current.source_feature_bitmap != 0
+		|| current.target_feature_bitmap
+			   != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		|| current.rollback_feature_bitmap != 0
+		|| current.round_nonce == 0
+		|| cluster_node_id < 0 || cluster_node_id >= 4
+		|| cluster_node_id == (int32)current.coordinator_node
+		|| !semantic_activation_ack_member_prepared_image_current(
+			&current, &self))
+		return false;
+
+	return semantic_activation_authority_mailbox_submit(
+		CLUSTER_SEMANTIC_AUTHORITY_REQUEST_UNDO_ROOT_DESCRIPTOR_READ,
+		system_identifier, current.round_nonce, zero, out_request_seq);
 }
 
 bool
@@ -12116,15 +12263,40 @@ bool
 cluster_semantic_activation_qvotec_pgrd_formation_matches(
 	const ClusterSemanticFormationBinding *formation)
 {
+	ClusterSemanticFormationBinding member_binding;
 	SemanticActivationAdmissionSnapshot snapshot;
 	uint64 current_epoch;
 	uint64 current_incarnation;
 
 	if (formation == NULL || formation->utility_request_seq == 0
 		|| formation->coordinator_incarnation == 0
-		|| SemanticActivationUtilityMailbox == NULL
 		|| SemanticActivationShmem == NULL
 		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| !cluster_qvotec_in_quorum())
+		return false;
+
+	memset(&member_binding, 0, sizeof(member_binding));
+	if (semantic_activation_member_pgrd_formation_binding(
+			&member_binding)
+		&& member_binding.utility_request_seq
+			   == formation->utility_request_seq
+		&& member_binding.formation_epoch == formation->formation_epoch
+		&& member_binding.coordinator_incarnation
+			   == formation->coordinator_incarnation
+		&& member_binding.expected_record_generation
+			   == formation->expected_record_generation) {
+		current_epoch = cluster_epoch_get_current();
+		current_incarnation = cluster_qvotec_get_self_incarnation();
+		return current_epoch == formation->formation_epoch
+			   && current_incarnation
+				  == formation->coordinator_incarnation
+			   && cluster_qvotec_in_quorum()
+			   && cluster_epoch_get_current() == current_epoch
+			   && cluster_qvotec_get_self_incarnation()
+				  == current_incarnation;
+	}
+
+	if (SemanticActivationUtilityMailbox == NULL
 		|| pg_atomic_read_u32(
 			   &SemanticActivationUtilityMailbox->utility_mailbox_state)
 			   != SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING
@@ -12139,7 +12311,7 @@ cluster_semantic_activation_qvotec_pgrd_formation_matches(
 		|| SemanticActivationUtilityMailbox->utility_rollback_feature_bitmap != 0
 		|| SemanticActivationUtilityMailbox->utility_expected_record_generation
 			   != formation->expected_record_generation
-		|| !cluster_qvotec_in_quorum())
+		)
 		return false;
 
 	current_epoch = cluster_epoch_get_current();
@@ -13032,9 +13204,10 @@ cluster_semantic_activation_lmon_tick(void)
 	}
 	if (snapshot.seq > UINT64_MAX - 2)
 		ereport(PANIC, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("semantic activation admission sequence exhausted"),
-						errhint("Retain the shared-memory image and restart the cluster.")));
+					errmsg("semantic activation admission sequence exhausted"),
+					errhint("Retain the shared-memory image and restart the cluster.")));
 
+	semantic_activation_lmon_member_pgrd_read_request_seq = 0;
 	semantic_activation_pgrd_snapshot_clear();
 	(void)semantic_activation_lmon_publish_gate(
 		&snapshot, snapshot.active_bits, snapshot.record_generation,

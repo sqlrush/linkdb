@@ -1041,6 +1041,7 @@ test_gate_reset(void)
 	semantic_activation_lmon_pgrd_read_utility_request_seq = 0;
 	memset(&semantic_activation_lmon_pgrd_read_formation, 0,
 		   sizeof(semantic_activation_lmon_pgrd_read_formation));
+	semantic_activation_lmon_member_pgrd_read_request_seq = 0;
 	semantic_activation_lmon_prepare_cas_seq = 0;
 	semantic_activation_lmon_prepare_cas_utility_request_seq = 0;
 	semantic_activation_lmon_commit_cas_seq = 0;
@@ -7472,6 +7473,129 @@ UT_TEST(test_140d_initial_r4_prepared_request_waits_for_local_source_close)
 	test_gate_reset();
 }
 
+/* A clean-formation coordinator publishes the durable PGRD before SAMPLE,
+ * but each member still owns its node-local snapshot.  PREPARED must drive
+ * the existing QVOTEC read mailbox and remain unobserved until that exact
+ * authority image also matches the shared mirror. */
+UT_TEST(test_140e_initial_r4_member_fetches_pgrd_before_prepared_ack)
+{
+	const uint64 system_identifier = UINT64_C(0x1122334455667788);
+	ClusterSemanticActivationAckTableV1 *table;
+	ClusterUndoRootDescriptorReadRequest read_request;
+	ClusterUndoRootDescriptorV1 pgrd;
+	uint8 snapshot[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	int node;
+
+	test_gate_reset();
+	test_current_epoch = CLUSTER_EPOCH_INITIAL;
+	test_membership_snapshot_epoch = CLUSTER_EPOCH_INITIAL;
+	cluster_node_id = 2;
+	test_initial_clean_snapshot_valid = true;
+	test_initial_clean_snapshot.formation_marker_generation = 0;
+	test_initial_clean_snapshot.formation_epoch = test_current_epoch;
+	test_initial_clean_snapshot.members_lo = UINT64_C(0x0f);
+	test_initial_clean_snapshot.members_hi = 0;
+	test_initial_clean_snapshot.arbiter_node = 0;
+	test_initial_clean_snapshot.arbiter_incarnation = 0;
+	test_system_identifier = system_identifier;
+	cluster_shared_data_dir = "/cluster-share";
+	test_local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	test_peer_capability_word_sample_ok = true;
+	test_peer_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS;
+	test_peer_capability_generation = 19;
+	test_peer_capability_matches = true;
+	for (node = 0; node < 4; node++) {
+		test_send_results[node] = CLUSTER_IC_SEND_DONE;
+		test_remote_admitted_incarnations[node]
+			= UINT64_C(0x100) + (uint64)node;
+		test_initial_clean_snapshot.admitted_incarnation[node]
+			= test_remote_admitted_incarnations[node];
+	}
+	test_initial_clean_snapshot.admitted_incarnation[cluster_node_id]
+		= test_qvotec_self_incarnation;
+	test_last_admitted_incarnation = test_qvotec_self_incarnation;
+
+	memset(&pgrd, 0, sizeof(pgrd));
+	pgrd.descriptor_incarnation = 1;
+	pgrd.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
+	pgrd.owner_node = -1;
+	memset(pgrd.root_uuid, 0x5c, sizeof(pgrd.root_uuid));
+	pgrd.namespace_id = 1;
+	pgrd.system_identifier = system_identifier;
+	UT_ASSERT(cluster_undo_root_descriptor_encode(
+		&pgrd, test_pgrd_candidate));
+	test_pgrd_candidate_state = CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT;
+
+	table = SemanticActivationAckTable;
+	memset(table, 0, sizeof(*table));
+	pg_atomic_init_u64(&table->publication_seq, 0);
+	table->stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED;
+	table->flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID;
+	table->coordinator_node = 0;
+	table->round_nonce = UINT64_C(42);
+	table->expected_members_lo = UINT64_C(0x0f);
+	table->observed_members_lo = UINT64_C(0x01);
+	table->transition_epoch = test_current_epoch;
+	table->record_generation = 1;
+	table->target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	table->capability_sample_digest = UINT64_C(0x3141592653589793);
+	for (node = 0; node < 4; node++) {
+		if (node == cluster_node_id) {
+			UT_ASSERT(semantic_activation_ack_self_tuple(
+				node, test_local_capability_word, test_current_epoch, 1,
+				&table->expected[node]));
+		} else {
+			table->expected[node].node_id = (uint32)node;
+			table->expected[node].boot_id
+				= test_remote_admitted_incarnations[node];
+			table->expected[node].admitted_incarnation
+				= test_remote_admitted_incarnations[node];
+			table->expected[node].control_connection_generation = 19;
+			table->expected[node].capability_word
+				= test_peer_capability_word;
+			table->expected[node].capability_generation = 19;
+			table->expected[node].transition_epoch = test_current_epoch;
+			table->expected[node].record_generation = 1;
+		}
+	}
+	table->observed[0] = table->expected[0];
+	test_gate_publish(2, 0, 1, test_current_epoch, true);
+
+	UT_ASSERT(!semantic_activation_pgrd_snapshot_copy(snapshot));
+	UT_ASSERT(semantic_activation_ack_lmon_progress_member_barrier());
+	UT_ASSERT_EQ(table->observed_members_lo, UINT64_C(0x01));
+	for (node = 0; node < 4; node++)
+		UT_ASSERT_EQ(test_send_calls[node], 0);
+
+	memset(&read_request, 0, sizeof(read_request));
+	UT_ASSERT(cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
+		&read_request));
+	UT_ASSERT_EQ(read_request.system_identifier, system_identifier);
+	UT_ASSERT_EQ(read_request.formation.utility_request_seq,
+				 UINT64_C(42));
+	UT_ASSERT_EQ(read_request.formation.formation_epoch,
+				 test_current_epoch);
+	UT_ASSERT_EQ(read_request.formation.coordinator_incarnation,
+				 test_qvotec_self_incarnation);
+	UT_ASSERT_EQ(read_request.formation.expected_record_generation,
+				 UINT64_C(1));
+	UT_ASSERT(cluster_semantic_activation_qvotec_complete_undo_root_descriptor_read(
+		read_request.request_seq, CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID,
+		test_pgrd_candidate));
+
+	UT_ASSERT(semantic_activation_ack_lmon_progress_member_barrier());
+	UT_ASSERT(semantic_activation_pgrd_snapshot_copy(snapshot));
+	UT_ASSERT_EQ(memcmp(snapshot, test_pgrd_candidate,
+					 sizeof(snapshot)), 0);
+	UT_ASSERT_EQ(table->observed_members_lo, UINT64_C(0x05));
+	for (node = 0; node < 4; node++)
+		UT_ASSERT_EQ(test_send_calls[node], node == cluster_node_id ? 0 : 1);
+	test_gate_reset();
+}
+
 UT_TEST(test_141_member_prepared_r4_round_keeps_four_member_shape)
 {
 	SemanticActivationAckTuple self;
@@ -8007,6 +8131,7 @@ main(void)
 	UT_RUN(test_140b_bit22_retained_successor_drift_invalidates_without_ack);
 	UT_RUN(test_140c_bit22_prepared_request_waits_for_local_source_close);
 	UT_RUN(test_140d_initial_r4_prepared_request_waits_for_local_source_close);
+	UT_RUN(test_140e_initial_r4_member_fetches_pgrd_before_prepared_ack);
 	UT_RUN(test_141_member_prepared_r4_round_keeps_four_member_shape);
 	UT_RUN(test_142_cutover_begin_stages_seam_and_publishes_prepared);
 	UT_RUN(test_143_cutover_begin_rejects_non_coordinator);
