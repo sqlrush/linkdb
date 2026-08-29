@@ -53,6 +53,7 @@
 #include "cluster/cluster_tt_durable.h"			/* spec-4.8 D2 remote_active_failclosed counter */
 #include "cluster/cluster_tt_status.h"			/* lookup_exact / Key / Result */
 #include "cluster/cluster_touched_peers.h"		/* spec-5.14 D2 class 4 */
+#include "cluster/cluster_tx_resolve.h"		/* exact DATA->canonical TT fallback */
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_wal_state.h"	   /* CLUSTER_WAL_STATE_SLOT_COUNT */
 #include "cluster/cluster_xid_authority.h" /* GCS-race round-2 RC-E: native-prehistory gate */
@@ -115,6 +116,42 @@ vis_origin_materialized(int origin)
  * so (Sub)AbortTransaction resets it via cluster_vis_resolve_abort_reset().
  */
 static int cluster_vis_resolve_depth = 0;
+
+static bool
+cluster_vis_from_exact_tx_resolution(
+	ClusterTxOutcome outcome, const ClusterTxResolution *resolution,
+	ClusterVisResolve *out)
+{
+	if (resolution == NULL || out == NULL || outcome != resolution->outcome)
+		return false;
+
+	out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+	out->commit_scn_is_bound = false;
+	switch (outcome) {
+	case CLUSTER_TX_COMMITTED:
+		if (!SCN_VALID(resolution->commit_scn))
+			break;
+		out->status = CLUSTER_TT_STATUS_COMMITTED;
+		out->commit_scn = resolution->commit_scn;
+		return true;
+	case CLUSTER_TX_ABORTED:
+		out->status = CLUSTER_TT_STATUS_ABORTED;
+		out->commit_scn = InvalidScn;
+		return true;
+	case CLUSTER_TX_IN_PROGRESS:
+		out->status = CLUSTER_TT_STATUS_IN_PROGRESS;
+		out->commit_scn = InvalidScn;
+		return true;
+	case CLUSTER_TX_PREPARED:
+	case CLUSTER_TX_UNKNOWN:
+	default:
+		break;
+	}
+	out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
+	out->status = CLUSTER_TT_STATUS_UNKNOWN;
+	out->commit_scn = InvalidScn;
+	return false;
+}
 
 bool
 cluster_vis_resolve_in_flight(void)
@@ -327,7 +364,8 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
  */
 static void
 classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
-				  SCN read_scn, ClusterVisResolve *out)
+				  SCN read_scn, const ClusterTxLocator *exact_locator,
+				  ClusterVisResolve *out)
 {
 	if (out == NULL || ref == NULL)
 		return;
@@ -695,6 +733,9 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 
 		case CLUSTER_VIS_FRESHREF_ORIGIN_ASK:
 		default: {
+			ClusterTxResolution exact_resolution;
+			ClusterTxResolveReason exact_reason;
+			ClusterTxOutcome exact_outcome;
 			/* origin = ref->origin_node_id (physical binding, authoritative);
 			 * every unproven leg inside D3 returns UNKNOWN_FAIL_CLOSED.
 			 * cluster_undo_verdict_resolve -> try_resolve_remote already bumps
@@ -725,12 +766,69 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 				cluster_vis_freshref_verdict_note_resolved();
 				return;
 			}
-			/* verdict UNKNOWN: cluster_vis_from_undo_verdict already set STALE. */
+
+			/* A page UBA names the DATA record, not necessarily the canonical
+			 * TT segment.  Only the page-derived full locator may enter the
+			 * existing status-22 resolver, whose origin choreography freezes the
+			 * DATA record, samples the same-owner canonical TT, then byte-exactly
+			 * revalidates DATA while holding at most one 0xFB SCUR. */
+			memset(&exact_resolution, 0, sizeof(exact_resolution));
+			exact_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			exact_outcome = exact_locator == NULL
+				? CLUSTER_TX_UNKNOWN
+				: cluster_tx_resolve_exact(
+					exact_locator, CLUSTER_TX_RESOLVE_VISIBILITY,
+					&exact_resolution, &exact_reason);
+			if (cluster_vis_from_exact_tx_resolution(
+					exact_outcome, &exact_resolution, out)) {
+				cluster_vis_freshref_verdict_note_resolved();
+				return;
+			}
+			/* Both reduced-key verdicts and the exact DATA->TT resolver are
+			 * unproven.  The latter never returns BOUND or installs a memo. */
 			cluster_vis_freshref_verdict_note_failclosed();
 			break;
 		}
 		}
 	}
+}
+
+static bool
+cluster_vis_exact_locator_for_ref(
+	Page page, TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
+	ClusterTxLocator *locator_out)
+{
+	ClusterTxLocator candidate;
+	ClusterTxResolveReason reason;
+	uint8 i;
+	bool found = false;
+
+	if (locator_out != NULL)
+		memset(locator_out, 0, sizeof(*locator_out));
+	if (page == NULL || ref == NULL || locator_out == NULL
+		|| !TransactionIdIsNormal(raw_xid))
+		return false;
+
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		ClusterUndoTTSlotRef candidate_ref;
+
+		if (!cluster_itl_get_tt_ref(page, i, &candidate_ref)
+			|| candidate_ref.local_xid != raw_xid
+			|| candidate_ref.origin_node_id != ref->origin_node_id
+			|| candidate_ref.undo_segment_id != ref->undo_segment_id
+			|| candidate_ref.tt_slot_id != ref->tt_slot_id
+			|| candidate_ref.cluster_epoch != ref->cluster_epoch)
+			continue;
+		if (found
+			|| !cluster_tx_locator_from_itl_terminal_census(
+				page, i, &candidate, &reason)) {
+			memset(locator_out, 0, sizeof(*locator_out));
+			return false;
+		}
+		*locator_out = candidate;
+		found = true;
+	}
+	return found;
 }
 
 /*
@@ -739,11 +837,25 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
  */
 static void
 classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
-			 SCN read_scn, ClusterVisResolve *out)
+			 SCN read_scn, const ClusterTxLocator *exact_locator,
+			 ClusterVisResolve *out)
 {
 	cluster_vis_resolve_depth++;
-	classify_ref_guts(raw_xid, ref, anchor_lsn, read_scn, out);
+	classify_ref_guts(raw_xid, ref, anchor_lsn, read_scn, exact_locator, out);
 	cluster_vis_resolve_depth--;
+}
+
+static void
+classify_page_ref(
+	Page page, TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
+	XLogRecPtr anchor_lsn, SCN read_scn, ClusterVisResolve *out)
+{
+	ClusterTxLocator locator;
+	const ClusterTxLocator *exact_locator = NULL;
+
+	if (cluster_vis_exact_locator_for_ref(page, raw_xid, ref, &locator))
+		exact_locator = &locator;
+	classify_ref(raw_xid, ref, anchor_lsn, read_scn, exact_locator, out);
 }
 
 
@@ -767,7 +879,7 @@ cluster_visibility_resolve_from_ref_scn(TransactionId raw_xid, const ClusterUndo
 	out->status = CLUSTER_TT_STATUS_UNKNOWN;
 	out->commit_scn = InvalidScn;
 
-	classify_ref(raw_xid, ref, anchor_lsn, read_scn, out);
+	classify_ref(raw_xid, ref, anchor_lsn, read_scn, NULL, out);
 }
 
 
@@ -834,7 +946,8 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 		if (htup->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
 			&& cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref)) {
 			if (ref.local_xid == raw_xid)
-				classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
+				classify_page_ref(page, raw_xid, &ref, anchor_lsn,
+							  read_scn, out);
 			else {
 				/*
 				 * An updated old tuple points at its xmax writer, not its
@@ -846,26 +959,28 @@ cluster_visibility_resolve_tuple_scn(Buffer buffer, HeapTupleHeader htup, Transa
 				ClusterUndoTTSlotRef xmin_ref;
 
 				if (cluster_itl_find_data_tt_ref_by_xid(page, raw_xid, &xmin_ref))
-					classify_ref(raw_xid, &xmin_ref, anchor_lsn, read_scn, out);
+					classify_page_ref(page, raw_xid, &xmin_ref, anchor_lsn,
+								  read_scn, out);
 				else
-					classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
+					classify_page_ref(page, raw_xid, &ref, anchor_lsn,
+								  read_scn, out);
 			}
 		} else if (cluster_itl_find_data_tt_ref_by_xid(page, raw_xid, &ref))
-			classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
+			classify_page_ref(page, raw_xid, &ref, anchor_lsn, read_scn, out);
 		break;
 
 	case CLUSTER_VIS_XMAX_UPDATE:
 		/* The tuple's own ITL slot is the authority for its last updater. */
 		if (htup->t_itl_slot_idx != CLUSTER_ITL_SLOT_UNALLOCATED
 			&& cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref))
-			classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
+			classify_page_ref(page, raw_xid, &ref, anchor_lsn, read_scn, out);
 		break;
 
 	case CLUSTER_VIS_XMAX_LOCK_ONLY:
 		/* Lock-only xmax: the writer slot is found by xmax, not by the
 		 * tuple's own slot index (spec-3.4d D1). */
 		if (cluster_itl_find_lock_tt_ref_by_xmax(page, raw_xid, &ref))
-			classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);
+			classify_page_ref(page, raw_xid, &ref, anchor_lsn, read_scn, out);
 		break;
 
 	case CLUSTER_VIS_XMAX_MULTI: {

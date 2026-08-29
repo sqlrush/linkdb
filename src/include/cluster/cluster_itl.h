@@ -228,7 +228,9 @@ extern uint8 cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixac
  *	    return its index (caller will stamp ACTIVE inside the critical
  *	    section).
  *	  - if no FREE slot exists, recycle the first completed slot
- *	    (COMMITTED / ABORTED / NEEDS_CLEANOUT).  spec-3.4a does not yet
+ *	    (COMMITTED / ABORTED).  NEEDS_CLEANOUT retains pre-CLOG commit
+ *	    evidence and first requires exact terminal promotion.  spec-3.4a
+ *	    does not yet
  *	    let production visibility consume the on-page history because
  *	    UBA/TT allocation stays zero until spec-3.4b; recycling completed
  *	    placeholder slots is therefore the minimal hot-page safety valve.

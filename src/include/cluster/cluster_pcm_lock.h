@@ -372,7 +372,8 @@ typedef enum ResourceXBootstrapRoundAction {
 	RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT,
 	RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL,
 	RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED,
-	RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE
+	RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE,
+	RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT
 } ResourceXBootstrapRoundAction;
 
 /* D1 read-only projection of the existing requester round.  It deliberately
@@ -1267,6 +1268,9 @@ cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(
 	uint32 requester_sender_connection_generation,
 	uint32 master_ingress_connection_generation, uint64 retry_slice_us,
 	const struct ClusterPcmOwnSnapshot *observed);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_x_to_s_preflight_exact(
+	const struct ClusterPcmOwnSnapshot *current);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_note_x_to_s_exact(
 	const struct ClusterPcmOwnSnapshot *revoking,

@@ -125,8 +125,12 @@ static uint64 c0_covered_hw;
 static bool c0_disabled;
 static bool c0_retention_ok;
 static bool c0_did_commit;
+static bool c0_commit_after_procarray;
+static bool c0_durable_drift_after_procarray;
 static bool c0_did_abort;
 static bool c0_procarray_live;
+static bool c0_expect_procarray_under_native_lock;
+static bool c0_accept_resolved_scn;
 static XidStatus c0_raw_status;
 static bool c0_throw_on_clog;
 static bool c0_disable_before_native_recheck;
@@ -184,8 +188,12 @@ c0_reset(void)
 	c0_disabled = false;
 	c0_retention_ok = false; /* exact RED: old zero-match abort cannot pass */
 	c0_did_commit = false;
+	c0_commit_after_procarray = false;
+	c0_durable_drift_after_procarray = false;
 	c0_did_abort = false;
 	c0_procarray_live = false;
+	c0_expect_procarray_under_native_lock = true;
+	c0_accept_resolved_scn = false;
 	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
 	c0_throw_on_clog = false;
 	c0_disable_before_native_recheck = false;
@@ -215,7 +223,8 @@ cluster_tt_slot_durable_resolve_by_xid(TransactionId xid pg_attribute_unused(),
 	if (out_seg != NULL)
 		*out_seg = c0_matched_segment;
 	if (out_slot != NULL)
-		*out_slot = c0_matched_slot;
+		*out_slot = c0_matched_slot
+					+ ((c0_durable_drift_after_procarray && c0_procarray_calls > 0) ? 1 : 0);
 	if (out_wrap != NULL)
 		*out_wrap = 0;
 	return c0_resolve;
@@ -225,7 +234,7 @@ bool
 TransactionIdDidCommit(TransactionId xid pg_attribute_unused())
 {
 	c0_did_commit_calls++;
-	return c0_did_commit;
+	return c0_did_commit || (c0_commit_after_procarray && c0_procarray_calls > 0);
 }
 
 bool
@@ -238,7 +247,8 @@ TransactionIdDidAbort(TransactionId xid pg_attribute_unused())
 bool
 TransactionIdIsInProgress(TransactionId xid pg_attribute_unused())
 {
-	UT_ASSERT_EQ(c0_native_lock_depth, 1);
+	UT_ASSERT_EQ(c0_native_lock_depth,
+				 c0_expect_procarray_under_native_lock ? 1 : 0);
 	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
 	c0_procarray_calls++;
 	c0_note(C0_EV_PROCARRAY);
@@ -337,7 +347,7 @@ cluster_tt_slot_max_recycle_horizon(void)
 bool
 cluster_cr_accept_resolved_scn(SCN scn pg_attribute_unused())
 {
-	return false;
+	return c0_accept_resolved_scn;
 }
 
 int
@@ -617,6 +627,54 @@ UT_TEST(test_resolved_scn_explicit_abort_after_stamp_is_positive)
 		UT_ASSERT(unknown != NULL && unknown < resolved_end);
 	}
 	free(source);
+}
+
+/*
+ * S8 happy-path regression: the origin may publish CLOG terminal state after
+ * the first DidCommit sample but before the following ProcArray sample.  The
+ * same verdict request must re-sample terminal authority and revalidate the
+ * exact durable segment/slot/scn binding instead of observing neither LIVE
+ * nor COMMITTED and returning a spurious UNKNOWN.
+ */
+UT_TEST(test_resolved_scn_commit_between_clog_and_procarray_rechecks_exact_binding)
+{
+	ClusterUndoVerdictKind kind;
+	int first_scan;
+	int second_scan;
+
+	c0_reset();
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_resolved_scn = (SCN)10498;
+	c0_matched_segment = 7;
+	c0_matched_slot = 0;
+	c0_commit_after_procarray = true;
+	c0_expect_procarray_under_native_lock = false;
+	c0_accept_resolved_scn = true;
+
+	kind = cluster_cr_server_test_own_xid_verdict(4195138, 7, 1, true);
+	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ(c0_did_commit_calls, 2);
+	UT_ASSERT_EQ(c0_did_abort_calls, 1);
+	UT_ASSERT_EQ(c0_procarray_calls, 1);
+	first_scan = c0_event_pos(C0_EV_SCAN);
+	second_scan = c0_event_pos_after(C0_EV_SCAN, first_scan);
+	UT_ASSERT(first_scan >= 0);
+	UT_ASSERT(second_scan > first_scan);
+	UT_ASSERT(c0_event_pos(C0_EV_PROCARRAY) < second_scan);
+
+	/* A slot drift during the terminal re-sample invalidates the whole proof. */
+	c0_reset();
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_resolved_scn = (SCN)10498;
+	c0_matched_segment = 7;
+	c0_matched_slot = 0;
+	c0_commit_after_procarray = true;
+	c0_durable_drift_after_procarray = true;
+	c0_expect_procarray_under_native_lock = false;
+	c0_accept_resolved_scn = true;
+	kind = cluster_cr_server_test_own_xid_verdict(4195138, 7, 1, true);
+	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_did_commit_calls, 2);
 }
 
 /*
@@ -1073,10 +1131,67 @@ UT_TEST(test_r4_cr_build_inline_entry_is_denied_without_serve)
 	free(source);
 }
 
+/*
+ * S8-815PRE-FRESHREF-C1B-01: a status-22 DATA->canonical-TT continuation
+ * shares LMS worker 0 with the legacy complete-TT verdict slots.  Serving all
+ * four legacy slots in one drain turn can keep the DATA socket undispatched
+ * for longer than the requester's unchanged absolute deadline.  Freeze the
+ * bounded scheduling contract: progress status-22 first, do no legacy scan
+ * while one remains active, and otherwise serve at most one legacy slot from
+ * a round-robin cursor before returning to the event loop.
+ */
+UT_TEST(test_lms_exact_status22_preempts_legacy_tt_scan_convoy)
+{
+	char *source = read_cr_server_source();
+	const char *function
+		= source != NULL ? strstr(source, "\ncluster_lms_cr_drain(") : NULL;
+	const char *function_end
+		= function != NULL
+			  ? strstr(function, "\n}\n\n/*\n * cluster_lms_cr_ship_ready")
+			  : NULL;
+	const char *exact_drain
+		= function != NULL
+			  ? strstr(function, "cluster_gcs_block_r4_tx_resolve_drain();")
+			  : NULL;
+	const char *exact_active
+		= exact_drain != NULL
+			  ? strstr(exact_drain, "cluster_gcs_block_r4_tx_resolve_active()")
+			  : NULL;
+	const char *cursor
+		= exact_active != NULL
+			  ? strstr(exact_active, "cluster_lms_cr_legacy_drain_cursor")
+			  : NULL;
+	const char *single_serve
+		= cursor != NULL ? strstr(cursor, "cr_serve_slot(slot);") : NULL;
+	const char *advance
+		= single_serve != NULL
+			  ? strstr(single_serve, "cluster_lms_cr_legacy_drain_cursor =")
+			  : NULL;
+	const char *bounded_break
+		= advance != NULL ? strstr(advance, "break;") : NULL;
+
+	UT_ASSERT_NOT_NULL(function);
+	UT_ASSERT_NOT_NULL(function_end);
+	UT_ASSERT_NOT_NULL(exact_drain);
+	UT_ASSERT_NOT_NULL(exact_active);
+	UT_ASSERT_NOT_NULL(cursor);
+	UT_ASSERT_NOT_NULL(single_serve);
+	UT_ASSERT_NOT_NULL(advance);
+	UT_ASSERT_NOT_NULL(bounded_break);
+	if (function != NULL && function_end != NULL && exact_drain != NULL
+		&& exact_active != NULL && cursor != NULL && single_serve != NULL
+		&& advance != NULL && bounded_break != NULL)
+		UT_ASSERT(function < exact_drain && exact_drain < exact_active
+				  && exact_active < cursor && cursor < single_serve
+				  && single_serve < advance && advance < bounded_break
+				  && bounded_break < function_end);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(22);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -1090,6 +1205,7 @@ main(void)
 	UT_RUN(test_resolved_scn_terminal_and_unknown_boundaries);
 	UT_RUN(test_resolved_scn_live_requires_every_exact_binding_gate);
 	UT_RUN(test_resolved_scn_explicit_abort_after_stamp_is_positive);
+	UT_RUN(test_resolved_scn_commit_between_clog_and_procarray_rechecks_exact_binding);
 	UT_RUN(test_c0_zero_match_positive_proof_table);
 	UT_RUN(test_freshref_c1b_pair_exact_truth_table);
 	UT_RUN(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b);
@@ -1097,6 +1213,7 @@ main(void)
 	UT_RUN(test_c0_real_zero_match_abort_live_and_self_disable);
 	UT_RUN(test_undo_multi_verdict_inline_entry_is_denied_without_serve);
 	UT_RUN(test_r4_cr_build_inline_entry_is_denied_without_serve);
+	UT_RUN(test_lms_exact_status22_preempts_legacy_tt_scan_convoy);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

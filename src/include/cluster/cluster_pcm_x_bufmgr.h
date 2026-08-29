@@ -112,7 +112,12 @@ cluster_pcm_x_remote_s_holder_stable_n_result(
 		snapshot->flags, snapshot->reservation_token);
 	if (live_result != CLUSTER_PCM_OWN_OK)
 		return live_result;
-	if (snapshot->reservation_token != 0
+	/* Every successful S->N revoke keeps its exact reservation token as a
+	 * monotonic ABA fence after clearing REVOKING.  Zero therefore cannot
+	 * identify this replay shape, while a finite nonzero idle token does. */
+	if (snapshot->reservation_token == 0)
+		return CLUSTER_PCM_OWN_STALE;
+	if (snapshot->reservation_token == UINT64_MAX
 		|| snapshot->writer_activation_token != 0
 		|| snapshot->resource_x_activation_generation != 0)
 		return CLUSTER_PCM_OWN_CORRUPT;
@@ -291,6 +296,35 @@ cluster_pcm_x_cached_cover_reverify_accepts(uint8 requested_state, uint64 captur
 		   && (requested_state == (uint8)PCM_STATE_S || current_generation == captured_generation);
 }
 
+/* A TARGET grant can be revoked after T3 but before this backend returns
+ * writable content authority.  Re-probing is safe only while the caller has
+ * not exposed that content interval and the enclosing R4/gate/tag domain is
+ * unchanged.  This predicate grants nothing: it merely validates that the
+ * fresh BufferDesc tuple is a legal stable or in-flight ownership shape that
+ * the ordinary Resource-X acquire may classify again under the same absolute
+ * deadline.  Corrupt tuples and identity drift retain their fail-closed
+ * polarity. */
+static inline bool
+cluster_pcm_x_target_preuse_drift_retryable(
+	const ClusterPcmOwnSnapshot *live, bool target_path_current,
+	bool gate_current, bool tag_current)
+{
+	ClusterPcmOwnResult shape;
+
+	if (live == NULL || !target_path_current || !gate_current || !tag_current
+		|| live->generation == 0 || live->generation == UINT64_MAX
+		|| live->reservation_token == UINT64_MAX
+		|| live->writer_activation_token == UINT64_MAX
+		|| live->resource_x_activation_generation == UINT64_MAX
+		|| (live->pcm_state != (uint8)PCM_STATE_N
+			&& live->pcm_state != (uint8)PCM_STATE_S
+			&& live->pcm_state != (uint8)PCM_STATE_X))
+		return false;
+	shape = cluster_pcm_own_classify_live_flags(
+		live->flags, live->reservation_token);
+	return shape == CLUSTER_PCM_OWN_OK || shape == CLUSTER_PCM_OWN_BUSY;
+}
+
 /* ConditionalLockBuffer cannot initiate a PCM conversion.  Preserve native
  * PostgreSQL behavior while PCM is inactive and for relations outside the
  * coherence domain; an active tracked page must already hold exact X.  Live
@@ -306,6 +340,31 @@ cluster_pcm_x_ordinary_mutation_allowed(bool runtime_active, bool tracked, bool 
 			   || (pcm_state == (uint8)PCM_STATE_X
 				   && cluster_pcm_x_activation_fence_open(
 						writer_activation_token, resource_x_activation_generation)));
+}
+
+/* A type-17 pre-retention drain first marks the exact current X REVOKING and
+ * then probes BufferContent with a conditional exclusive acquire.  A caller
+ * that already owns BufferContent predates that fence and must be allowed to
+ * finish its current mutation; its lock makes the drain return BUSY, after
+ * which the event-loop path exact-aborts REVOKING before replay.  New content
+ * entrants continue to use ordinary_mutation_allowed() and therefore cannot
+ * cross the fence.  Retained images and activation-sidecar debt are never
+ * covered by this narrow predecessor exception. */
+static inline bool
+cluster_pcm_x_content_holder_mutation_allowed(
+	bool runtime_active, bool tracked, bool retained_image,
+	uint8 pcm_state, uint32 flags, uint64 writer_activation_token,
+	uint64 resource_x_activation_generation)
+{
+	return cluster_pcm_x_ordinary_mutation_allowed(
+			runtime_active, tracked, retained_image, pcm_state, flags,
+			writer_activation_token, resource_x_activation_generation)
+		|| (runtime_active && tracked && !retained_image
+			&& pcm_state == (uint8)PCM_STATE_X
+			&& flags == PCM_OWN_FLAG_REVOKING
+			&& cluster_pcm_x_activation_fence_open(
+				writer_activation_token,
+				resource_x_activation_generation));
 }
 
 static inline bool

@@ -106,6 +106,26 @@ cluster_tx_zero_epoch_terminal_census_is_admissible(
 		   && cluster_semantic_activation_recheck_r4_terminal_census(admission);
 }
 
+/* Freshref §3.1 narrow override: status-22 reaches this resolver only with
+ * the caller-selected physical locator whose wrap is intentionally partial.
+ * Unlike terminal census it must own an ordinary current TARGET admission,
+ * and is admitted only for the homogeneous four-node clean formation. */
+static bool
+cluster_tx_zero_epoch_partial_visibility_is_admissible(
+	const ClusterTxLocator *locator,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	NodeId origin = uba_origin_node_id(locator->uba);
+
+	return cluster_conf_node_count() == 4
+		   && origin != InvalidNodeId
+		   && admission->record_generation != 0
+		   && cluster_storage_mode_enabled()
+		   && !cluster_recmerge_window_active
+		   && cluster_epoch_get_current() == 0
+		   && cluster_semantic_activation_recheck(admission);
+}
+
 static bool
 cluster_tx_resolution_is_publishable(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 									 uint64 formation_epoch, ClusterTxOutcome returned,
@@ -221,6 +241,9 @@ cluster_tx_resolve_exact_with_admission(
 	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
 	uint64 formation_epoch;
 	bool terminal_census = mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS;
+	bool partial_visibility
+		= mode == CLUSTER_TX_RESOLVE_VISIBILITY
+		  && locator != NULL && locator->tt_wrap == TT_WRAP_INVALID;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -234,14 +257,21 @@ cluster_tx_resolve_exact_with_admission(
 		|| (unsigned int)mode
 			   > (unsigned int)CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
 		goto done;
-	if (!cluster_tx_locator_is_well_formed(locator, terminal_census, &reason))
+	if (!cluster_tx_locator_is_well_formed(
+			locator, terminal_census || partial_visibility, &reason))
 		goto done;
 
 	formation_epoch = admission->formation_epoch;
 	if (formation_epoch == 0) {
-		if (!terminal_census
-			|| !cluster_tx_zero_epoch_terminal_census_is_admissible(
-				locator, admission, caller_owned_terminal_census)) {
+		bool zero_epoch_admissible
+			= terminal_census
+				  ? cluster_tx_zero_epoch_terminal_census_is_admissible(
+					  locator, admission, caller_owned_terminal_census)
+				  : partial_visibility
+					&& cluster_tx_zero_epoch_partial_visibility_is_admissible(
+						locator, admission);
+
+		if (!zero_epoch_admissible) {
 			reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
 			goto done;
 		}
@@ -249,7 +279,7 @@ cluster_tx_resolve_exact_with_admission(
 		reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
 		goto done;
 	}
-	if (terminal_census)
+	if (terminal_census || partial_visibility)
 		outcome = cluster_runtime_visibility_resolve_exact_origin_admitted(
 			locator, mode, admission, &candidate, &provider_reason);
 	else

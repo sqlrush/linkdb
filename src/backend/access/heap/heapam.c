@@ -341,6 +341,19 @@ cluster_heap_itl_census_validate_terminal(
 	if (captured->flags == ITL_FLAG_ACTIVE)
 		terminal_flags = census->outcomes[slot_index] == CLUSTER_TX_COMMITTED
 			? ITL_FLAG_COMMITTED : ITL_FLAG_ABORTED;
+	else if (captured->flags == ITL_FLAG_NEEDS_CLEANOUT)
+	{
+		/*
+		 * The precommit page stamp precedes CLOG publication.  Consume it
+		 * only after this exact census proves terminal, and require the
+		 * retained SCN to be the same C1b-confirmed SCN before promotion.
+		 */
+		if (census->outcomes[slot_index] == CLUSTER_TX_COMMITTED
+			&& captured->commit_scn != resolution->commit_scn)
+			return false;
+		terminal_flags = census->outcomes[slot_index] == CLUSTER_TX_COMMITTED
+			? ITL_FLAG_COMMITTED : ITL_FLAG_ABORTED;
+	}
 	else if (captured->flags == ITL_FLAG_LOCK_ONLY_ACTIVE)
 		terminal_flags = census->outcomes[slot_index] == CLUSTER_TX_COMMITTED
 			? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_LOCK_ONLY_ABORTED;

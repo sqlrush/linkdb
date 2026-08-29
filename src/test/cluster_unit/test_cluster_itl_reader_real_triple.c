@@ -26,6 +26,8 @@
  *	    T15  3-branch B3 with malformed UBA → ereport ERROR (ERRCODE_DATA_CORRUPTED)
  *	    T16  3-branch B3 with segment_id producing out-of-range node → ereport ERROR
  *	    T17  reader fills has_cached_status=true for COMMITTED+SCN_VALID
+ *	    T17a reader exposes a NEEDS_CLEANOUT retained SCN as a C1b
+ *	         candidate; it is not terminal authority without origin proof
  *	    T18  reader fills has_cached_status=false for ACTIVE
  *	    T19  lock-only raw_xmax scan ignores data ACTIVE slot for same xid
  *	    T20  lock-only raw_xmax scan rejects ambiguous duplicate same wrap
@@ -559,6 +561,26 @@ UT_TEST(test_t17_has_cached_status_true_for_committed_valid_scn)
 	s->commit_scn = (SCN)9999; /* valid */
 
 	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.has_cached_status, 1);
+}
+
+UT_TEST(test_t17a_has_cached_status_true_for_needs_cleanout_valid_scn)
+{
+	Page page = build_itl_page();
+	ClusterUndoTTSlotRef ref;
+	ClusterItlSlotData *s = slot_at(page, 0);
+
+	s->flags = ITL_FLAG_NEEDS_CLEANOUT;
+	s->xid = (TransactionId)4196256;
+	s->undo_segment_head = uba_encode(1, 25, 15, 63);
+	s->commit_scn = (SCN)111914;
+
+	UT_ASSERT_EQ((int)cluster_itl_get_tt_ref(page, 0, &ref), 1);
+	UT_ASSERT_EQ((int)ref.local_xid, 4196256);
+	UT_ASSERT_EQ((int)ref.origin_node_id, 0);
+	UT_ASSERT_EQ((int)ref.undo_segment_id, 1);
+	UT_ASSERT_EQ((int)ref.tt_slot_id, 16);
+	UT_ASSERT_EQ((int)ref.cached_commit_scn, 111914);
 	UT_ASSERT_EQ((int)ref.has_cached_status, 1);
 }
 
@@ -1305,6 +1327,26 @@ UT_TEST(test_d11_page_has_active_slot_no_itl_is_false)
 	UT_ASSERT_EQ((int)cluster_itl_page_has_active_slot((Page)no_itl), 0);
 }
 
+UT_TEST(test_precommit_cleanout_evidence_is_not_directly_reusable)
+{
+	Page page = build_itl_page();
+	Buffer buf = marker_buffer_for(page);
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	uint8 i;
+
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		slot_at(page, i)->flags = ITL_FLAG_ACTIVE;
+		slot_at(page, i)->xid = (TransactionId)(5000 + i);
+	}
+	slot_at(page, 3)->flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slot_at(page, 3)->commit_scn = (SCN)7001;
+
+	UT_ASSERT_EQ((int)cluster_itl_alloc_or_reuse_slot(
+		buf, (TransactionId)6000, &slot_index), 0);
+	UT_ASSERT_EQ((int)slot_index, (int)CLUSTER_ITL_SLOT_UNALLOCATED);
+}
+
 int
 main(void)
 {
@@ -1325,6 +1367,7 @@ main(void)
 	UT_RUN(test_t15_malformed_uba_raises);
 	UT_RUN(test_t16_out_of_range_node_raises);
 	UT_RUN(test_t17_has_cached_status_true_for_committed_valid_scn);
+	UT_RUN(test_t17a_has_cached_status_true_for_needs_cleanout_valid_scn);
 	UT_RUN(test_t18_has_cached_status_false_for_active);
 	UT_RUN(test_t19_lock_scan_ignores_data_active_same_xid);
 	UT_RUN(test_t20_lock_scan_rejects_ambiguous_same_wrap);
@@ -1364,6 +1407,7 @@ main(void)
 	UT_RUN(test_marker_collapses_legacy_stale_accumulation);
 	UT_RUN(test_d11_page_has_active_slot_detects_active);
 	UT_RUN(test_d11_page_has_active_slot_no_itl_is_false);
+	UT_RUN(test_precommit_cleanout_evidence_is_not_directly_reusable);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

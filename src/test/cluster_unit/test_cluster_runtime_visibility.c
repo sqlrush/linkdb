@@ -78,6 +78,45 @@ read_runtime_visibility_source(void)
 	return source;
 }
 
+static char *
+read_visibility_resolve_source(void)
+{
+	const char *source_file = __FILE__;
+	const char *source_suffix
+		= "/src/test/cluster_unit/test_cluster_runtime_visibility.c";
+	const char *suffix_at = strstr(source_file, source_suffix);
+	char path[MAXPGPATH];
+	FILE *file;
+	long length;
+	char *source;
+
+	if (suffix_at != NULL)
+		snprintf(path, sizeof(path),
+				 "%.*s/src/backend/cluster/cluster_visibility_resolve.c",
+				 (int)(suffix_at - source_file), source_file);
+	else
+		snprintf(path, sizeof(path),
+				 "../../../src/backend/cluster/cluster_visibility_resolve.c");
+	file = fopen(path, "rb");
+	UT_ASSERT_NOT_NULL(file);
+	if (file == NULL)
+		return NULL;
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_END), 0);
+	length = ftell(file);
+	UT_ASSERT(length > 0);
+	UT_ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
+	source = malloc((size_t)length + 1);
+	UT_ASSERT_NOT_NULL(source);
+	if (source == NULL) {
+		fclose(file);
+		return NULL;
+	}
+	UT_ASSERT_EQ(fread(source, 1, (size_t)length, file), (size_t)length);
+	source[length] = '\0';
+	fclose(file);
+	return source;
+}
+
 /* Assert hook stub so the cassert libpgport links standalone. */
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -1002,10 +1041,160 @@ UT_TEST(test_terminal_remote_wrapper_rejects_in_progress_verdict)
 	free(source);
 }
 
+/*
+ * S8 happy-path regression: an ITL slot can already carry its pre-commit
+ * COMMITTED/SCN stamp while the exact origin transaction is still live.
+ * Pair eligibility must not route that shape directly to the terminal-only
+ * C1b request (whose IN_PROGRESS row is intentionally negative).  The
+ * ordinary authoritative exact-slot verdict gets the first opportunity to
+ * return IN_PROGRESS; only its unproved result may fall through to the pair.
+ */
+UT_TEST(test_pair_eligible_freshref_tries_exact_live_before_terminal_pair)
+{
+	char *source = read_runtime_visibility_source();
+	const char *resolver
+		= source != NULL
+			  ? strstr(source, "\ncluster_undo_verdict_resolve_internal(")
+			  : NULL;
+	const char *resolver_end
+		= resolver != NULL
+			  ? strstr(resolver, "\n}\n\nClusterUndoVerdictResult\ncluster_undo_verdict_resolve(")
+			  : NULL;
+	const char *live_first
+		= resolver != NULL
+			  ? strstr(resolver, "freshref exact-live verdict precedes terminal C1b pair")
+			  : NULL;
+	const char *generic_call
+		= live_first != NULL
+			  ? strstr(live_first, "rtvis_try_resolve_remote_internal(")
+			  : NULL;
+	const char *generic_shape
+		= generic_call != NULL
+			  ? strstr(generic_call, "0, InvalidScn, read_scn, true")
+			  : NULL;
+	const char *pair_call
+		= generic_shape != NULL
+			  ? strstr(generic_shape, "ref_epoch, freshref_pair_scn, read_scn, authoritative")
+			  : NULL;
+
+	UT_ASSERT_NOT_NULL(resolver);
+	UT_ASSERT_NOT_NULL(resolver_end);
+	UT_ASSERT_NOT_NULL(live_first);
+	UT_ASSERT_NOT_NULL(generic_call);
+	UT_ASSERT_NOT_NULL(generic_shape);
+	UT_ASSERT_NOT_NULL(pair_call);
+	if (resolver_end != NULL && live_first != NULL && generic_call != NULL
+		&& generic_shape != NULL && pair_call != NULL)
+		UT_ASSERT(live_first < generic_call && generic_call < generic_shape
+				  && generic_shape < pair_call && pair_call < resolver_end);
+	free(source);
+}
+
+UT_TEST(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo)
+{
+	char *source = read_visibility_resolve_source();
+	const char *classifier
+		= source != NULL ? strstr(source, "\nclassify_ref_guts(") : NULL;
+	const char *classifier_end
+		= classifier != NULL ? strstr(classifier, "\n}\n\n/*\n * classify_ref") : NULL;
+	const char *pair
+		= classifier != NULL
+			  ? strstr(classifier,
+					   "cluster_undo_verdict_resolve_freshref_c1b_pair(")
+			  : NULL;
+	const char *exact
+		= pair != NULL
+			  ? strstr(pair, "cluster_tx_resolve_exact(")
+			  : NULL;
+	const char *visibility
+		= exact != NULL
+			  ? strstr(exact, "CLUSTER_TX_RESOLVE_VISIBILITY")
+			  : NULL;
+	const char *exact_map
+		= visibility != NULL
+			  ? strstr(visibility, "cluster_vis_from_exact_tx_resolution(")
+			  : NULL;
+
+	UT_ASSERT_NOT_NULL(classifier);
+	UT_ASSERT_NOT_NULL(classifier_end);
+	UT_ASSERT_NOT_NULL(pair);
+	UT_ASSERT_NOT_NULL(exact);
+	UT_ASSERT_NOT_NULL(visibility);
+	UT_ASSERT_NOT_NULL(exact_map);
+	UT_ASSERT_NOT_NULL(strstr(source,
+		"cluster_tx_locator_from_itl_terminal_census("));
+	if (classifier_end != NULL && pair != NULL && exact != NULL
+		&& visibility != NULL && exact_map != NULL)
+		UT_ASSERT(pair < exact && exact < visibility
+				  && visibility < exact_map && exact_map < classifier_end);
+	/* The exact fallback is operation-local evidence only. */
+	UT_ASSERT_NULL(strstr(exact != NULL ? exact : "", "cluster_vis_memo_install("));
+	free(source);
+}
+
+/*
+ * The page can contain several live ITL slots from the same cluster epoch.
+ * Only the slot carrying the full ref identity may become the status-22 DATA
+ * locator; an unrelated same-epoch slot must not set the uniqueness latch.
+ * A second exact duplicate remains ambiguous and therefore fail-closed.
+ */
+UT_TEST(test_page_exact_locator_filters_full_ref_before_uniqueness)
+{
+	char *source = read_visibility_resolve_source();
+	const char *helper
+		= source != NULL
+			  ? strstr(source, "\ncluster_vis_exact_locator_for_ref(")
+			  : NULL;
+	const char *helper_end
+		= helper != NULL ? strstr(helper, "\n}\n\n/*\n * classify_ref") : NULL;
+	const char *xid
+		= helper != NULL ? strstr(helper, "candidate_ref.local_xid != raw_xid") : NULL;
+	const char *origin
+		= xid != NULL
+			  ? strstr(xid, "candidate_ref.origin_node_id != ref->origin_node_id")
+			  : NULL;
+	const char *segment
+		= origin != NULL
+			  ? strstr(origin, "candidate_ref.undo_segment_id != ref->undo_segment_id")
+			  : NULL;
+	const char *slot
+		= segment != NULL
+			  ? strstr(segment, "candidate_ref.tt_slot_id != ref->tt_slot_id")
+			  : NULL;
+	const char *epoch
+		= slot != NULL
+			  ? strstr(slot, "candidate_ref.cluster_epoch != ref->cluster_epoch")
+			  : NULL;
+	const char *duplicate_guard
+		= epoch != NULL ? strstr(epoch, "if (found") : NULL;
+	const char *locator
+		= duplicate_guard != NULL
+			  ? strstr(duplicate_guard,
+					   "cluster_tx_locator_from_itl_terminal_census(")
+			  : NULL;
+
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(helper_end);
+	UT_ASSERT_NOT_NULL(xid);
+	UT_ASSERT_NOT_NULL(origin);
+	UT_ASSERT_NOT_NULL(segment);
+	UT_ASSERT_NOT_NULL(slot);
+	UT_ASSERT_NOT_NULL(epoch);
+	UT_ASSERT_NOT_NULL(duplicate_guard);
+	UT_ASSERT_NOT_NULL(locator);
+	if (helper_end != NULL && xid != NULL && origin != NULL
+		&& segment != NULL && slot != NULL && epoch != NULL
+		&& duplicate_guard != NULL && locator != NULL)
+		UT_ASSERT(xid < origin && origin < segment && segment < slot
+				  && slot < epoch && epoch < duplicate_guard
+				  && duplicate_guard < locator && locator < helper_end);
+	free(source);
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(29);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -1032,6 +1221,9 @@ main(void)
 	UT_RUN(test_undo_multi_verdict_page_usable);
 	UT_RUN(test_undo_fetch_tag_roundtrip);
 	UT_RUN(test_terminal_remote_wrapper_rejects_in_progress_verdict);
+	UT_RUN(test_pair_eligible_freshref_tries_exact_live_before_terminal_pair);
+	UT_RUN(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo);
+	UT_RUN(test_page_exact_locator_filters_full_ref_before_uniqueness);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

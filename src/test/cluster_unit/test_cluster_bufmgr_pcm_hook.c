@@ -402,6 +402,14 @@ cluster_gcs_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 }
 
 bool
+cluster_gcs_try_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
+									 PcmLockTransition trans pg_attribute_unused(),
+									 int master_node pg_attribute_unused())
+{
+	abort();
+}
+
+bool
 cluster_gcs_block_resource_x_local_s_barrier_active(BufferTag tag pg_attribute_unused())
 {
 	return false;

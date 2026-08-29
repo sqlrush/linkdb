@@ -89,6 +89,26 @@ typedef enum ClusterSemanticAdmissionResult {
 	CLUSTER_SEMANTIC_ADMISSION_CLOSED = 4
 } ClusterSemanticAdmissionResult;
 
+/* Stack-only reason for one Resource-X peer OPEN revalidation.  This is a
+ * read-only diagnostic result: it is neither shared state nor wire authority. */
+typedef enum ClusterSemanticResourceXPeerOpenResult {
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_NOT_CHECKED = 0,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH = 1,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_INVALID_INPUT = 2,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_ADMISSION_DRIFT = 3,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT = 4,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_AUTHORITY_UNAVAILABLE = 5,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_UNAVAILABLE = 6,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_STAGE_MISMATCH = 7,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_FLAGS_MISMATCH = 8,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_RECORD_MISMATCH = 9,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_FORMATION_MISMATCH = 10,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_FEATURE_MISMATCH = 11,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_PEER_ABSENT = 12,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_PEER_ROW_MISMATCH = 13,
+	CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT = 14
+} ClusterSemanticResourceXPeerOpenResult;
+
 /* One read-only R4 gate decision for the tracked buffer-writer choke point. */
 typedef enum ResourceXWriterPath {
 	RESOURCE_X_WRITER_SOURCE = 1,
@@ -308,6 +328,10 @@ extern bool cluster_semantic_activation_peer_open_matches(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 required_hello_caps, uint32 sampled_capability_generation);
 extern bool cluster_semantic_activation_resource_x_peer_open_matches(
+	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
+	uint32 sampled_capability_generation);
+extern ClusterSemanticResourceXPeerOpenResult
+cluster_semantic_activation_resource_x_peer_open_check(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 sampled_capability_generation);
 extern bool cluster_semantic_activation_restore_open_proof_if_active(void);

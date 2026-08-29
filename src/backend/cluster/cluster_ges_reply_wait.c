@@ -44,18 +44,9 @@
 
 #include "cluster/cluster_ges.h" /* spec-5.16: GES_REPLY_OPCODE_GRANT (orphan tombstone) */
 #include "cluster/cluster_ges_reply_wait.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D2 profiling */
-
-
-/*
- * spec-2.23 D1 cap — hardcoded for Step 1; Step 9 D11 replaces with
- * GUC cluster.ges_reply_wait_max_entries (PGC_POSTMASTER, default 1024,
- * min 64 max 65536).  HTAB and shmem sizing both consume this value at
- * shmem_size / shmem_init time.
- */
-#define CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX 1024
-
 
 /* ============================================================
  * Shmem state.
@@ -108,7 +99,7 @@ cluster_ges_reply_wait_shmem_size(void)
 {
 	Size sz = MAXALIGN(sizeof(ClusterGesReplyWaitShared));
 
-	sz = add_size(sz, hash_estimate_size((Size)CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX,
+	sz = add_size(sz, hash_estimate_size((Size)cluster_ges_reply_wait_max_entries,
 										 sizeof(GesReplyWaitEntry)));
 	return sz;
 }
@@ -135,8 +126,8 @@ cluster_ges_reply_wait_shmem_init(void)
 	hctl.keysize = sizeof(GesReplyWaitKey);
 	hctl.entrysize = sizeof(GesReplyWaitEntry);
 	reply_wait_htab
-		= ShmemInitHash("pgrac cluster ges reply wait htab", CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX,
-						CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX, &hctl, HASH_ELEM | HASH_BLOBS);
+		= ShmemInitHash("pgrac cluster ges reply wait htab", cluster_ges_reply_wait_max_entries,
+						cluster_ges_reply_wait_max_entries, &hctl, HASH_ELEM | HASH_BLOBS);
 }
 
 void
@@ -252,7 +243,7 @@ cluster_ges_reply_wait_insert(const GesReplyWaitKey *key, TimestampTz deadline)
 	 * no tombstone can be evicted (the table is genuinely full of live waiters) do
 	 * we fail closed.
 	 */
-	if (hash_get_num_entries(reply_wait_htab) >= CLUSTER_GES_REPLY_WAIT_DEFAULT_MAX) {
+	if (hash_get_num_entries(reply_wait_htab) >= cluster_ges_reply_wait_max_entries) {
 		if (!ges_reply_wait_evict_oldest_tombstone_locked()) {
 			LWLockRelease(&reply_wait_state->lwlock);
 			return NULL;

@@ -88,6 +88,41 @@ cluster_wal_state_correctness_census_ok(void)
 {
 	return true;
 }
+
+/* Unrelated R4 readiness dependencies are closed in this lock-order binary;
+ * the focused heap/ITL fixtures activate their own exact admission state. */
+uint32
+cluster_grd_recovery_state_value(void)
+{
+	return 0;
+}
+
+bool
+cluster_reconfig_snapshot_initial_clean_formation(
+	ClusterInitialCleanFormationSnapshot *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
+cluster_pcm_lock_resource_x_gate_snapshot(
+	ResourceXGateSnapshot *snapshot_out)
+{
+	if (snapshot_out != NULL)
+		memset(snapshot_out, 0, sizeof(*snapshot_out));
+	return false;
+}
+
+bool
+cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
+	ResourceXGateSnapshot *snapshot_out)
+{
+	if (snapshot_out != NULL)
+		memset(snapshot_out, 0, sizeof(*snapshot_out));
+	return false;
+}
 bool cluster_recmerge_window_active = false;
 uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
@@ -2792,10 +2827,80 @@ UT_TEST(test_60_same_page_peer_census_uses_exact_holder_singleflight)
 	ut_itl_census_end();
 }
 
+UT_TEST(test_61_precommit_cleanout_requires_exact_terminal_census)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
+	slots[0].flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slots[0].commit_scn = (SCN) UINT64_C(9001);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+
+	UT_ASSERT(cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1321, false, &slot_index));
+	UT_ASSERT_EQ(slot_index, 0);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ((uint64) slots[0].commit_scn, UINT64_C(9001));
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls,
+				 CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_62_in_progress_cleanout_evidence_is_never_stamped)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
+	slots[0].flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slots[0].commit_scn = (SCN) UINT64_C(8001);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_IN_PROGRESS;
+
+	UT_ASSERT(!cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1322, false, &slot_index));
+	UT_ASSERT_EQ(slot_index, CLUSTER_ITL_SLOT_UNALLOCATED);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_NEEDS_CLEANOUT);
+	UT_ASSERT_EQ((uint64) slots[0].commit_scn, UINT64_C(8001));
+	UT_ASSERT_EQ(ut_itl_census_resolve_calls,
+				 CLUSTER_ITL_INITRANS_DEFAULT);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_63_cleanout_evidence_scn_drift_is_never_stamped)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	uint8 slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &result, false);
+	slots = ClusterPageGetItlSlots((Page) fixture.live_page);
+	slots[0].flags = ITL_FLAG_NEEDS_CLEANOUT;
+	slots[0].commit_scn = (SCN) UINT64_C(8001);
+	ut_itl_census_outcomes[0] = CLUSTER_TX_COMMITTED;
+
+	UT_ASSERT(!cluster_heap_test_itl_alloc_with_terminal_census(
+		UT_HOT_BUFFER, (TransactionId) 1323, false, &slot_index));
+	UT_ASSERT_EQ(slot_index, CLUSTER_ITL_SLOT_UNALLOCATED);
+	UT_ASSERT_EQ(slots[0].flags, ITL_FLAG_NEEDS_CLEANOUT);
+	UT_ASSERT_EQ((uint64) slots[0].commit_scn, UINT64_C(8001));
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	ut_itl_census_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(60);
+	UT_PLAN(63);
 	UT_RUN(test_01_held_lock_bits_are_independent);
 	UT_RUN(test_02_wait_edge_values_are_closed);
 	UT_RUN(test_03_utility_to_lmon_wait_with_no_lock_is_allowed);
@@ -2856,6 +2961,9 @@ main(void)
 	UT_RUN(test_58_terminal_census_continues_past_nonterminal_outcomes);
 	UT_RUN(test_59_one_batch_leaves_capacity_for_three_stale_followers);
 	UT_RUN(test_60_same_page_peer_census_uses_exact_holder_singleflight);
+	UT_RUN(test_61_precommit_cleanout_requires_exact_terminal_census);
+	UT_RUN(test_62_in_progress_cleanout_evidence_is_never_stamped);
+	UT_RUN(test_63_cleanout_evidence_scn_drift_is_never_stamped);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

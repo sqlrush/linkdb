@@ -5976,12 +5976,14 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 	ResourceXDecodedFrame source_ack;
 	ResourceXDecodedFrame stale_ack;
 	ResourceXDecodedFrame successor_request;
+	ResourceXDecodedFrame successor_retry;
 	ResourceXDecodedFrame successor_ack;
 	ResourceXDecodedFrame release;
 	ResourceXIntentSlot intent;
 	ResourceXReconfigBatch batch;
 	ResourceXReconfigResult reconfig_result;
 	ResourceXReconfigToken token;
+	ResourceXApplyResult retry_result;
 	ResourceXZeroResidualProof zero;
 	ResourceXMasterSnapshot after_ack;
 	ResourceXMasterSnapshot settled_snapshot;
@@ -6008,6 +6010,21 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 		&assertion, 2, 61, 77, 31, 71, &snapshot),
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_BLOCKERS);
+
+	/* A requester that is still an unresolved physical blocker of the active
+	 * predecessor is not otherwise admissible for NEXT_ADMISSION.  Its local
+	 * type-17 transition can invalidate this pre-ASSERT attempt before the
+	 * predecessor retires, so retaining it would orphan the bounded priority
+	 * and reject the required higher attempt after settlement. */
+	successor_request = make_resource_x_bootstrap_request_values(
+		tag, 0, 17, 31, 41, 53);
+	memset(&successor_ack, 0, sizeof(successor_ack));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&successor_request, 0, 63, 77, 31, 71, &successor_ack),
+		RESOURCE_X_APPLY_BAD_STATE);
+	UT_ASSERT_EQ(successor_ack.common.base_authority_generation,
+		UINT64_C(0));
+
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
 		&assertion.common.logical_assertion, 0, &intent, payload,
 		sizeof(payload)), RESOURCE_X_APPLY_APPLIED);
@@ -6099,14 +6116,13 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 		RESOURCE_X_APPLY_APPLIED);
 	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
 
-	/* The live conversion is terminal, but its exact former-source release is
-	 * still protocol debt.  A successor may retain priority, but must not
-	 * sample a base or create a receipt until that debt is ACKED. */
-	successor_request = make_resource_x_bootstrap_request_values(
-		tag, 3, 17, 31, 41, 53);
+	/* The live conversion is terminal, but node 0 remains the selected
+	 * former-source while its exact physical release is protocol debt.  Its
+	 * local successor is not otherwise admissible under the SourceSettlement
+	 * interlock, so this rejected attempt must not claim master priority. */
 	memset(&successor_ack, 0, sizeof(successor_ack));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&successor_request, 3, 63, 77, 31, 71, &successor_ack),
+		&successor_request, 0, 63, 77, 31, 71, &successor_ack),
 		RESOURCE_X_APPLY_BAD_STATE);
 	UT_ASSERT_EQ(successor_ack.common.base_authority_generation,
 		UINT64_C(0));
@@ -6117,9 +6133,17 @@ UT_TEST(test_resource_x_remote_lane0_settlement_retires_only_after_exact_source_
 	source_ack.common.outcome = RESOURCE_X_OUTCOME_OK;
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_ack_exact(
 		&source_ack, 0, &after_ack), RESOURCE_X_APPLY_APPLIED);
-	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_request_exact(
-		&successor_request, 3, 63, 77, 31, 71, &successor_ack),
-		RESOURCE_X_APPLY_APPLIED);
+	/* Pair retention canceled the unbound local attempt and preserved its
+	 * floor, so the requester legitimately retries with a higher attempt.  It
+	 * must sample the current base immediately after the old carrier settles;
+	 * an orphan priority for attempt 41 would incorrectly reject it. */
+	successor_retry = make_resource_x_bootstrap_request_values(
+		tag, 0, 17, 31, 42, 53);
+	retry_result = cluster_pcm_lock_resource_x_bootstrap_request_exact(
+		&successor_retry, 0, 63, 77, 31, 71, &successor_ack);
+	UT_ASSERT_EQ(retry_result, RESOURCE_X_APPLY_APPLIED);
+	if (retry_result != RESOURCE_X_APPLY_APPLIED)
+		return;
 	UT_ASSERT_EQ(successor_ack.common.base_authority_generation,
 		settled_snapshot.final_authority_generation);
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
@@ -7617,6 +7641,10 @@ UT_TEST(test_resource_x_source_settlement_prepare_closes_total_cover_table)
 	PcmEntryAcquireResult acquire_result;
 	PcmEntryRef entry_ref;
 	ResourceXAcquisitionRef cover_ref;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXAssertion successor_assertion;
+	ResourceXBootstrapRoundAction action;
+	ResourceXDecodedFrame bootstrap;
 	ResourceXDecodedFrame settlement;
 	ResourceXSourceSettlementPlan plan;
 	ResourceXSourceSettlementCommitObservation observation;
@@ -7706,12 +7734,17 @@ UT_TEST(test_resource_x_source_settlement_prepare_closes_total_cover_table)
 	UT_ASSERT(plan.valid);
 	UT_ASSERT_EQ(plan.cover_action,
 		(uint8)RESOURCE_X_SETTLEMENT_COVER_NO_COVER);
-	cover_ref = setup_resource_x_test_terminal_cover(
-		new_cover_tag, UINT64_C(60));
+	UT_ASSERT(resource_x_assertion_init(
+		&new_cover_tag, 1, &successor_assertion));
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&successor_assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(100), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT);
+	UT_ASSERT_EQ(bootstrap.kind, UINT8_C(0));
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_commit_exact(
-		&settlement, 0, &plan, &observation), RESOURCE_X_APPLY_STALE);
-	UT_ASSERT(cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
-		&cover_ref, 31, 77, 60));
+		&settlement, 0, &plan, &observation), RESOURCE_X_APPLY_APPLIED);
 
 	reset_fake_pcm_runtime(4);
 	cluster_node_id = 1;
@@ -7764,6 +7797,198 @@ UT_TEST(test_resource_x_source_settlement_prepare_closes_total_cover_table)
 	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_prepare_exact(
 		&settlement, 0, &plan), RESOURCE_X_APPLY_INVALID);
 	UT_ASSERT(!plan.valid);
+}
+
+UT_TEST(test_resource_x_s_predecessor_retained_pair_blocks_local_bootstrap)
+{
+	BufferTag tag = make_tag(225);
+	ResourceXAssertion assertion;
+	ResourceXDecodedFrame bootstrap;
+	ResourceXDecodedFrame settlement;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXBootstrapRoundAction action;
+	ResourceXSourceSettlementCommitObservation observation;
+	ResourceXSourceSettlementPlan plan;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+		RESOURCE_X_APPLY_APPLIED);
+	retain_resource_x_test_settlement_pair(
+		tag, PCM_STATE_S, UINT64_C(60), UINT64_C(61), UINT64_C(5),
+		&settlement);
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+
+	/* The earlier holder settlement owns the ordering edge.  A local
+	 * successor must not allocate or dispatch kind-9 while that exact pair is
+	 * still undrained, otherwise SourceSettlement would encounter a non-EMPTY
+	 * round and correctly refuse the physical release. */
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(100), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT);
+	UT_ASSERT_EQ(bootstrap.kind, UINT8_C(0));
+
+	memset(&plan, 0, sizeof(plan));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_prepare_exact(
+		&settlement, 0, &plan), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(plan.valid);
+	UT_ASSERT_EQ(plan.source_mode, (uint8)PCM_STATE_S);
+	UT_ASSERT_EQ(plan.cover_action,
+		(uint8)RESOURCE_X_SETTLEMENT_COVER_NO_COVER);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_commit_exact(
+		&settlement, 0, &plan, &observation), RESOURCE_X_APPLY_APPLIED);
+
+	/* Draining the predecessor exposes the ordinary local bootstrap path.  Its
+	 * first attempt proves the wait did not create hidden requester state. */
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(150), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(bootstrap.common.assertion_sequence, UINT64_C(1));
+}
+
+UT_TEST(test_resource_x_s_predecessor_cancels_only_unbound_preassert_round)
+{
+	BufferTag tag = make_tag(226);
+	ResourceXAssertion assertion;
+	ResourceXDecodedFrame bootstrap;
+	ResourceXDecodedFrame settlement;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXBootstrapRoundAction action;
+	ResourceXApplyResult prepare_result;
+	ResourceXSourceSettlementCommitObservation observation;
+	ResourceXSourceSettlementPlan plan;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+
+	/* The successor sampled the resource before the predecessor pair became
+	 * visible, but it has dispatched only a non-authoritative kind-9 request:
+	 * no ACK/base or ASSERT exists yet.  Installing the exact older S pair must
+	 * atomically return that local round to EMPTY so SourceSettlement retains
+	 * its frozen EMPTY-only physical-release contract. */
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(100), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(bootstrap.common.assertion_sequence, UINT64_C(1));
+
+	retain_resource_x_test_settlement_pair(
+		tag, PCM_STATE_S, UINT64_C(60), UINT64_C(61), UINT64_C(5),
+		&settlement);
+	memset(&plan, 0, sizeof(plan));
+	prepare_result
+		= cluster_pcm_lock_resource_x_source_settlement_prepare_exact(
+			&settlement, 0, &plan);
+	UT_ASSERT_EQ(prepare_result, RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(plan.valid);
+	if (prepare_result != RESOURCE_X_APPLY_APPLIED || !plan.valid)
+		return;
+	UT_ASSERT_EQ(plan.source_mode, (uint8)PCM_STATE_S);
+	UT_ASSERT_EQ(plan.cover_action,
+		(uint8)RESOURCE_X_SETTLEMENT_COVER_NO_COVER);
+
+	/* Before drain, the same foreground invocation keeps its original absolute
+	 * deadline but owns no replacement round. */
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(125), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT);
+	UT_ASSERT_EQ(bootstrap.kind, UINT8_C(0));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_commit_exact(
+		&settlement, 0, &plan, &observation), RESOURCE_X_APPLY_APPLIED);
+
+	/* Cancellation preserves the attempt floor.  The next legal round uses a
+	 * strictly higher attempt without refreshing the caller's deadline. */
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(150), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(bootstrap.common.assertion_sequence, UINT64_C(2));
+}
+
+UT_TEST(test_resource_x_s_predecessor_cancellation_supersedes_old_wait)
+{
+	BufferTag tag = make_tag(227);
+	ResourceXAssertion assertion;
+	ResourceXDecodedFrame bootstrap;
+	ResourceXDecodedFrame settlement;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXBootstrapRoundAction action;
+	ResourceXSourceSettlementCommitObservation observation;
+	ResourceXSourceSettlementPlan plan;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	fake_gcs_master_node = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+
+	/* This caller has already received WAIT for attempt 1 when the exact older
+	 * S predecessor becomes retained.  Retention legally cancels only that
+	 * unbound request.  The subsequent wait recheck must report that its old
+	 * predicate was superseded, rather than terminating the acquisition as a
+	 * generic stale failure. */
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(100), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(bootstrap.common.assertion_sequence, UINT64_C(1));
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(125), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action, RESOURCE_X_BOOTSTRAP_ROUND_WAIT);
+
+	retain_resource_x_test_settlement_pair(
+		tag, PCM_STATE_S, UINT64_C(60), UINT64_C(61), UINT64_C(5),
+		&settlement);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
+			&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), 1),
+		RESOURCE_X_APPLY_DUPLICATE);
+
+	/* The old wait neither creates a replacement round nor refreshes the
+	 * caller's absolute deadline.  Until the exact pair drains, the next step
+	 * observes the predecessor; after drain it allocates attempt 2. */
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(150), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT);
+	memset(&plan, 0, sizeof(plan));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_prepare_exact(
+		&settlement, 0, &plan), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(plan.valid);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_source_settlement_commit_exact(
+		&settlement, 0, &plan, &observation), RESOURCE_X_APPLY_APPLIED);
+	action = cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+		&assertion, 0, 17, 31, 77, 51, 61,
+		UINT64_C(1000), UINT64_C(175), UINT64_C(50),
+		false, 0, &bootstrap, &terminal_ref);
+	UT_ASSERT_EQ(action,
+		RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	UT_ASSERT_EQ(bootstrap.common.assertion_sequence, UINT64_C(2));
 }
 
 UT_TEST(test_resource_x_source_settlement_accepts_multi_blocker_authority_span)
@@ -11457,7 +11682,7 @@ UT_TEST(test_clean_page_xfer_arm_is_one_shot)
 int
 main(void)
 {
-	UT_PLAN(169);
+	UT_PLAN(172);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
 	UT_RUN(test_pcm_lock_transition_enum_values_are_1_to_9);
@@ -11578,6 +11803,9 @@ main(void)
 	UT_RUN(test_resource_x_requester_join_gates_both_floors_before_successor);
 	UT_RUN(test_resource_x_x_source_defers_self_master_grd_transition_to_ingress);
 	UT_RUN(test_resource_x_source_settlement_prepare_closes_total_cover_table);
+	UT_RUN(test_resource_x_s_predecessor_retained_pair_blocks_local_bootstrap);
+	UT_RUN(test_resource_x_s_predecessor_cancels_only_unbound_preassert_round);
+	UT_RUN(test_resource_x_s_predecessor_cancellation_supersedes_old_wait);
 	UT_RUN(test_resource_x_source_settlement_accepts_multi_blocker_authority_span);
 	UT_RUN(test_resource_x_source_settlement_drains_only_the_exact_retained_pair);
 	UT_RUN(test_resource_x_source_settlement_debt_participates_in_same_token_r8_r10);

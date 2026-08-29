@@ -192,6 +192,10 @@ static bool test_qvotec_in_quorum = true;
 static uint64 test_qvotec_self_incarnation = UINT64_C(0x445566778899aabb);
 static uint64 test_last_admitted_incarnation = UINT64_C(0x445566778899aabb);
 static uint64 test_remote_admitted_incarnations[CLUSTER_MAX_NODES];
+static bool test_observed_slot_valid[CLUSTER_MAX_NODES];
+static uint64 test_observed_slot_incarnation[CLUSTER_MAX_NODES];
+static uint64 test_observed_slot_generation[CLUSTER_MAX_NODES];
+static uint64 test_observed_slot_epoch[CLUSTER_MAX_NODES];
 static bool test_resource_x_gate_snapshot_valid;
 static ResourceXGateSnapshot test_resource_x_gate_snapshot;
 static bool test_resource_x_cutover_digest_valid;
@@ -617,6 +621,31 @@ cluster_membership_get_state(int32 node_id)
 }
 
 bool
+cluster_reconfig_get_observed_slot(int32 node_id, uint64 *incarnation,
+								   uint64 *generation)
+{
+	if (incarnation != NULL)
+		*incarnation = 0;
+	if (generation != NULL)
+		*generation = 0;
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES
+		|| incarnation == NULL || generation == NULL
+		|| !test_observed_slot_valid[node_id])
+		return false;
+	*incarnation = test_observed_slot_incarnation[node_id];
+	*generation = test_observed_slot_generation[node_id];
+	return true;
+}
+
+uint64
+cluster_reconfig_get_observed_epoch(int32 node_id)
+{
+	return node_id >= 0 && node_id < CLUSTER_MAX_NODES
+			   ? test_observed_slot_epoch[node_id]
+			   : 0;
+}
+
+bool
 cluster_reconfig_lmon_observe_replacement_ready(
 	const ClusterReplacementPhase3HandoffItem *item)
 {
@@ -1010,6 +1039,13 @@ test_gate_reset(void)
 	test_last_admitted_incarnation = UINT64_C(0x445566778899aabb);
 	memset(test_remote_admitted_incarnations, 0,
 		   sizeof(test_remote_admitted_incarnations));
+	memset(test_observed_slot_valid, 0, sizeof(test_observed_slot_valid));
+	memset(test_observed_slot_incarnation, 0,
+		   sizeof(test_observed_slot_incarnation));
+	memset(test_observed_slot_generation, 0,
+		   sizeof(test_observed_slot_generation));
+	memset(test_observed_slot_epoch, 0,
+		   sizeof(test_observed_slot_epoch));
 	test_resource_x_gate_snapshot_valid = false;
 	memset(&test_resource_x_gate_snapshot, 0,
 		   sizeof(test_resource_x_gate_snapshot));
@@ -1371,6 +1407,15 @@ UT_TEST(test_10b_r11_writer_selector_snapshots_one_exact_gate_generation)
 	for (node = 0; node < 4; node++)
 		test_remote_admitted_incarnations[node]
 			= UINT64_C(0x100) + (uint64)node;
+	for (node = 0; node < 4; node++) {
+		test_observed_slot_valid[node] = true;
+		test_observed_slot_incarnation[node]
+			= node == cluster_node_id
+				  ? test_qvotec_self_incarnation
+				  : test_remote_admitted_incarnations[node];
+		test_observed_slot_generation[node] = UINT64_C(41) + (uint64)node;
+		test_observed_slot_epoch[node] = 7;
+	}
 	table = SemanticActivationAckTable;
 	memset(table, 0, sizeof(*table));
 	pg_atomic_init_u64(&table->publication_seq, 0);
@@ -7774,6 +7819,10 @@ ut_open_proof_env_setup(uint64 generation)
 	ClusterSemanticActivationRecord record;
 
 	ut_open_applied_env_setup_coordinator(); /* node 0, epoch 7, members 0x03 */
+	/* Model the production restart boundary: shmem initialization leaves the
+	 * volatile carrier byte-zero before durable OPEN reconstruction. */
+	memset(SemanticActivationAckTable, 0,
+		   sizeof(*SemanticActivationAckTable));
 	UT_ASSERT(cluster_r4_bit22_cutover_latch_apply(7, generation));
 	UT_ASSERT(cluster_r4_bit22_cutover_active());
 	memset(&record, 0, sizeof(record));
@@ -7916,10 +7965,245 @@ UT_TEST(test_145g_peer_open_matches_consumes_open_proof)
 	test_gate_reset();
 }
 
+static void
+ut_resource_x_open_carrier_setup_at_epoch(
+	ClusterSemanticAdmissionToken *token, uint64 transition_epoch)
+{
+	const uint32 resource_x_caps
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1;
+	const uint64 target_bits
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		  | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1;
+	ClusterSemanticActivationAckTableV1 *table = SemanticActivationAckTable;
+	int node;
+
+	UT_ASSERT(token != NULL);
+	test_gate_reset();
+	cluster_node_id = 0;
+	test_membership_snapshot_valid = true;
+	test_membership_snapshot_lo = UINT64_C(0x0f);
+	test_membership_snapshot_hi = 0;
+	test_membership_snapshot_epoch = transition_epoch;
+	test_current_epoch = transition_epoch;
+	test_local_capability_word = resource_x_caps;
+	test_peer_capability_word_sample_ok = true;
+	test_peer_capability_word = resource_x_caps;
+	test_peer_capability_generation = 19;
+	test_peer_capability_matches = true;
+	for (node = 0; node < 4; node++)
+		test_remote_admitted_incarnations[node]
+			= UINT64_C(0x100) + (uint64)node;
+
+	memset(table, 0, sizeof(*table));
+	table->stage = CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED;
+	table->flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+				 | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE;
+	table->coordinator_node = 0;
+	table->round_nonce = 3;
+	table->expected_members_lo = UINT64_C(0x0f);
+	table->observed_members_lo = UINT64_C(0x0f);
+	table->transition_epoch = transition_epoch;
+	table->record_generation = 6;
+	table->source_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	table->target_feature_bitmap = target_bits;
+	table->capability_sample_digest = UINT64_C(0xabc123);
+	for (node = 0; node < 4; node++) {
+		SemanticActivationAckTuple tuple;
+
+		memset(&tuple, 0, sizeof(tuple));
+		if (node == cluster_node_id)
+			UT_ASSERT(semantic_activation_ack_self_tuple(
+				node, test_local_capability_word, transition_epoch, 6,
+				&tuple));
+		else {
+			tuple.node_id = (uint32)node;
+			tuple.boot_id = test_remote_admitted_incarnations[node];
+			tuple.admitted_incarnation
+				= test_remote_admitted_incarnations[node];
+			tuple.control_connection_generation = 19;
+			tuple.capability_word = test_peer_capability_word;
+			tuple.capability_generation = 19;
+			tuple.transition_epoch = transition_epoch;
+			tuple.record_generation = 6;
+		}
+		table->expected[node] = tuple;
+		table->observed[node] = tuple;
+	}
+
+	test_gate_publish(2, target_bits, 6, transition_epoch, false);
+	memset(token, 0, sizeof(*token));
+	token->feature_bit
+		= CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1;
+	token->record_generation = 6;
+	token->formation_epoch = transition_epoch;
+	token->side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	token->entered = true;
+	UT_ASSERT(cluster_semantic_activation_resource_x_peer_open_matches(
+		token, 2, 19));
+}
+
+static void
+ut_resource_x_open_carrier_setup(ClusterSemanticAdmissionToken *token)
+{
+	ut_resource_x_open_carrier_setup_at_epoch(token, 7);
+}
+
+/* A completed ordinary R11 OPEN_APPLIED image is the positive Resource-X
+ * carrier after cutover.  A single LMON tick that cannot capture the current
+ * admission snapshot must not rewrite that terminal image into an empty
+ * tombstone: no contradictory identity was observed, and the next exact
+ * capture still has to revalidate every member/connection row before use. */
+UT_TEST(test_145h_resource_x_open_carrier_survives_unavailable_snapshot)
+{
+	ClusterSemanticActivationAckTableV1 *table = SemanticActivationAckTable;
+	ClusterSemanticAdmissionToken token;
+
+	ut_resource_x_open_carrier_setup(&token);
+
+	/* Unavailable is not contradictory.  Preserve the terminal carrier and
+	 * let every consumer remain fail-closed until a later exact capture. */
+	test_membership_snapshot_valid = false;
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT_EQ(table->stage,
+		CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED);
+	UT_ASSERT_EQ(table->flags,
+		CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+		| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE);
+	UT_ASSERT_EQ(table->expected_members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(table->observed_members_lo, UINT64_C(0x0f));
+
+	test_membership_snapshot_valid = true;
+	UT_ASSERT(cluster_semantic_activation_resource_x_peer_open_matches(
+		&token, 2, 19));
+	test_gate_reset();
+}
+
+/* An exact snapshot with a different formation is contradictory evidence,
+ * not temporary unavailability.  The completed carrier belongs to the old
+ * round and must be invalidated as a whole. */
+UT_TEST(test_145i_resource_x_open_carrier_invalidates_formation_drift)
+{
+	ClusterSemanticActivationAckTableV1 *table = SemanticActivationAckTable;
+	ClusterSemanticAdmissionToken token;
+
+	ut_resource_x_open_carrier_setup(&token);
+	test_membership_snapshot_epoch = 8;
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT_EQ(table->expected_members_lo, UINT64_C(0));
+	UT_ASSERT_EQ(table->expected_members_hi, UINT64_C(0));
+	UT_ASSERT_EQ(table->observed_members_lo, UINT64_C(0));
+	UT_ASSERT_EQ(table->observed_members_hi, UINT64_C(0));
+	UT_ASSERT(!cluster_semantic_activation_resource_x_peer_open_matches(
+		&token, 2, 19));
+	test_gate_reset();
+}
+
+UT_TEST(test_145j_resource_x_peer_match_reports_first_failed_predicate)
+{
+	ClusterSemanticActivationAckTableV1 *table = SemanticActivationAckTable;
+	ClusterSemanticAdmissionToken token;
+
+	ut_resource_x_open_carrier_setup(&token);
+	UT_ASSERT_EQ(
+		cluster_semantic_activation_resource_x_peer_open_check(
+			&token, 2, 19),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH);
+
+	table->flags = 0;
+	UT_ASSERT_EQ(
+		cluster_semantic_activation_resource_x_peer_open_check(
+			&token, 2, 19),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_FLAGS_MISMATCH);
+	table->flags = CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+				 | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE;
+
+	test_membership_snapshot_valid = false;
+	UT_ASSERT_EQ(
+		cluster_semantic_activation_resource_x_peer_open_check(
+			&token, 2, 19),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_AUTHORITY_UNAVAILABLE);
+	test_membership_snapshot_valid = true;
+
+	test_peer_capability_matches = false;
+	UT_ASSERT_EQ(
+		cluster_semantic_activation_resource_x_peer_open_check(
+			&token, 2, 19),
+		CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT);
+	test_gate_reset();
+}
+
+/* OPEN_PROOF reconstruction owns only the empty volatile table left by a
+ * postmaster restart.  A live ordinary Resource-X OPEN_APPLIED carrier is a
+ * different completed round and must remain byte-identical; otherwise the
+ * recovery-only flag makes its exact R11 validator reject every type-17. */
+UT_TEST(test_145k_restore_open_proof_does_not_overwrite_resource_x_carrier)
+{
+	const uint64 r4 = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	const uint64 target_bits
+		= r4 | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1;
+	ClusterSemanticActivationAckTableV1 before;
+	ClusterSemanticActivationRecord open;
+	ClusterSemanticAdmissionToken token;
+
+	ut_resource_x_open_carrier_setup(&token);
+	UT_ASSERT(cluster_r4_bit22_cutover_latch_apply(7, 6));
+	memset(&open, 0, sizeof(open));
+	open.source_feature_bitmap = r4;
+	open.target_feature_bitmap = target_bits;
+	open.transition_epoch = 7;
+	open.record_generation = 6;
+	open.admitted_members_lo = UINT64_C(0x0f);
+	open.capability_sample_digest = UINT64_C(0xabc123);
+	open.coordinator_incarnation = test_qvotec_self_incarnation;
+	open.coordinator_node = 0;
+	open.phase = CLUSTER_SEMANTIC_PHASE_OPEN;
+	test_r4fsm_bootstrap_read_result = CLUSTER_SEMANTIC_ACTIVATION_OK;
+	test_r4fsm_bootstrap_read_ok = true;
+	test_r4fsm_bootstrap_implicit_open = false;
+	UT_ASSERT(cluster_semantic_activation_record_encode(
+		&open, test_r4fsm_bootstrap_bytes));
+	memcpy(&before, SemanticActivationAckTable, sizeof(before));
+
+	UT_ASSERT(!cluster_semantic_activation_restore_open_proof_if_active());
+	UT_ASSERT_EQ(memcmp(&before, SemanticActivationAckTable,
+					   sizeof(before)), 0);
+	UT_ASSERT(cluster_semantic_activation_resource_x_peer_open_matches(
+		&token, 2, 19));
+	test_gate_reset();
+}
+
+/* The approved initial-clean four-node formation uses transition epoch zero.
+ * Its completed ordinary Resource-X OPEN_APPLIED carrier has the same
+ * terminal retention contract as a later nonzero formation: a temporarily
+ * unavailable coherent QVOTEC snapshot cannot erase it. */
+UT_TEST(test_145l_epoch_zero_resource_x_open_carrier_survives_unavailable_snapshot)
+{
+	ClusterSemanticActivationAckTableV1 *table = SemanticActivationAckTable;
+	ClusterSemanticAdmissionToken token;
+
+	ut_resource_x_open_carrier_setup_at_epoch(&token, 0);
+	test_membership_snapshot_valid = false;
+	semantic_activation_ack_lmon_drain();
+	UT_ASSERT_EQ(table->stage,
+		CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED);
+	UT_ASSERT_EQ(table->flags,
+		CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+		| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE);
+	UT_ASSERT_EQ(table->expected_members_lo, UINT64_C(0x0f));
+	UT_ASSERT_EQ(table->observed_members_lo, UINT64_C(0x0f));
+
+	test_membership_snapshot_valid = true;
+	UT_ASSERT(cluster_semantic_activation_resource_x_peer_open_matches(
+		&token, 2, 19));
+	test_gate_reset();
+}
+
 int
 main(void)
 {
-	UT_PLAN(222);
+	UT_PLAN(228);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -8143,6 +8427,11 @@ main(void)
 	UT_RUN(test_145e_restore_open_proof_is_idempotent);
 	UT_RUN(test_145f_restore_open_proof_requires_active_latch);
 	UT_RUN(test_145g_peer_open_matches_consumes_open_proof);
+	UT_RUN(test_145h_resource_x_open_carrier_survives_unavailable_snapshot);
+	UT_RUN(test_145i_resource_x_open_carrier_invalidates_formation_drift);
+	UT_RUN(test_145j_resource_x_peer_match_reports_first_failed_predicate);
+	UT_RUN(test_145k_restore_open_proof_does_not_overwrite_resource_x_carrier);
+	UT_RUN(test_145l_epoch_zero_resource_x_open_carrier_survives_unavailable_snapshot);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

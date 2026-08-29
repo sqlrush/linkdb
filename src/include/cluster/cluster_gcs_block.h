@@ -1988,6 +1988,7 @@ extern ClusterTxOutcome cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 	uint32 expected_physical_generation, uint64 formation_epoch,
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
 extern void cluster_gcs_block_r4_tx_resolve_drain(void);
+extern bool cluster_gcs_block_r4_tx_resolve_active(void);
 #define CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS 1
 static inline long
 cluster_gcs_block_r4_tx_resolve_wait_timeout_for_count(long idle_timeout_ms,
@@ -2019,6 +2020,11 @@ extern bool cluster_gcs_block_test_decode_r4_reply(
 	int32 expected_sender_node, int32 expected_forwarding_master_node,
 	uint8 expected_reply_domain);
 extern bool cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id,
+												 uint64 request_epoch,
+												 int32 requester_backend_id,
+												 uint8 transition_id,
+												 int32 expected_master_node);
+extern bool cluster_gcs_block_test_arm_legacy_reply_slot(uint64 request_id,
 													 uint64 request_epoch,
 													 int32 requester_backend_id,
 													 uint8 transition_id,
@@ -3395,10 +3401,11 @@ typedef enum ClusterBufmgrGcsCopyRefusal {
 } ClusterBufmgrGcsCopyRefusal;
 
 /* A DATA worker cannot wait for BufferContent: its owner may itself be waiting
- * for that worker to deliver a reply.  Only the two conditional-lock misses
- * are therefore retryable through the established fresh reservation/request
- * boundary.  Residency/current-image failures remain structural, while HC89
- * keeps its explicit one-retry hot-page bound. */
+ * for that worker to deliver a reply.  This mapping is shared by master-direct
+ * and holder-forward DATA replies.  Only the two conditional-lock misses are
+ * retryable through the established fresh reservation/request boundary.
+ * Residency/current-image failures remain structural, while HC89 keeps its
+ * explicit one-retry hot-page bound. */
 static inline GcsBlockReplyStatus
 GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
 {
@@ -4149,6 +4156,13 @@ typedef struct ResourceXTargetEvictionPlan {
 extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,
 	ResourceXAcquisitionRef *ref_out);
+/* Stack-only retry variant for the bufmgr pre-use handoff.  A zero input
+ * freezes the ordinary R7 absolute deadline; subsequent calls must present
+ * the same nonzero value and can never refresh it. */
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_acquire_until_exact(
+	BufferDesc *buf, uint64 r4_record_generation,
+	uint64 *absolute_deadline_us_io, ResourceXAcquisitionRef *ref_out);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_prepare_exact(
 	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x,

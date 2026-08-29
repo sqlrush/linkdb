@@ -340,6 +340,7 @@ admitted_done:
 
 static ClusterCrServerShared *CrServerShared = NULL;
 static ClusterR4CrWorkerContext CrServerR4Contexts[CLUSTER_LMS_CR_SLOTS];
+static uint32 cluster_lms_cr_legacy_drain_cursor;
 
 /*
  * This is deliberately only worker 0's process-local half of the close
@@ -2339,6 +2340,7 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		bool durable_binding_stable = false;
 		bool exact_binding = false;
 		bool exact_live = false;
+		bool terminal_rechecked = false;
 
 		/*
 		 * RESOLVED_SCN is stamped before the CLOG terminal record.  Only an
@@ -2363,16 +2365,41 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 				did_abort = TransactionIdDidAbort(xid);
 				if (!did_abort)
 					xid_is_in_progress = TransactionIdIsInProgress(xid);
-				if (xid_is_in_progress) {
+
+				/*
+				 * The xid can finish between the first DidCommit sample and
+				 * the following ProcArray sample.  In that interval both old
+				 * observations are false even though CLOG is now terminal.  A
+				 * second terminal sample closes that TOCTOU, but only while the
+				 * request's exact durable segment/slot/scn binding remains
+				 * byte-identical below.  No negative observation is promoted.
+				 */
+				if (!did_abort && !xid_is_in_progress) {
+					bool recheck_commit = TransactionIdDidCommit(xid);
+					bool recheck_abort = false;
+
+					if (!recheck_commit)
+						recheck_abort = TransactionIdDidAbort(xid);
+					if (recheck_commit || recheck_abort) {
+						did_commit = recheck_commit;
+						did_abort = recheck_abort;
+						terminal_rechecked = true;
+					}
+				}
+				if (xid_is_in_progress || terminal_rechecked) {
 					durable_binding_stable
 						= cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY,
-																			 &confirm_scn, &confirm_segment,
-																			 &confirm_slot, &confirm_wrap)
+																	 &confirm_scn, &confirm_segment,
+																	 &confirm_slot, &confirm_wrap)
 							  == CLUSTER_TT_DURABLE_RESOLVED_SCN
 						  && confirm_segment == matched_segment && confirm_slot == matched_slot
 						  && confirm_wrap == wrap && confirm_scn == scn;
+					if (terminal_rechecked && !durable_binding_stable) {
+						did_commit = false;
+						did_abort = false;
+					}
+				}
 			}
-		}
 		exact_live = cluster_cr_server_live_binding_exact(
 			xid_is_mine, expected_segment_id, expected_tt_slot_id, matched_segment,
 			matched_slot, xid_is_in_progress, durable_binding_stable);
@@ -3218,16 +3245,20 @@ cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 void
 cluster_lms_cr_drain(void)
 {
+	int i;
+
 	/* M4 Candidate-2 origin work shares this existing worker-0 tick and is
 	 * process-local, so it must progress even when the legacy CR table is
 	 * absent. */
 	cluster_gcs_block_r4_tx_resolve_drain();
+	if (cluster_gcs_block_r4_tx_resolve_active())
+		return;
 	if (CrServerShared == NULL)
 		return;
 
-	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+	/* R4 work remains independently bounded and retains its existing scan. */
+	for (i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
 		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
-		uint32 expected = CLUSTER_LMS_CR_PENDING;
 		uint32 state = pg_atomic_read_u32(&slot->state);
 
 		if (state == CLUSTER_LMS_CR_R4_QUEUED) {
@@ -3253,8 +3284,21 @@ cluster_lms_cr_drain(void)
 			|| state == CLUSTER_LMS_CR_R4_READY_FAIL
 			|| state == CLUSTER_LMS_CR_R4_CANCELLED) {
 			(void)cr_server_r4_ship_terminal((uint32)i);
-			continue;
 		}
+	}
+
+	/*
+	 * A complete-TT legacy verdict may perform a synchronous durable scan.
+	 * Serve at most one per worker-0 tick so the DATA event loop can dispatch
+	 * exact status-22 continuations between scans.  The process-local cursor
+	 * keeps the four fixed slots fair without adding shared protocol state.
+	 */
+	for (i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		uint32 slot_index
+			= (cluster_lms_cr_legacy_drain_cursor + (uint32)i)
+			  % CLUSTER_LMS_CR_SLOTS;
+		ClusterLmsCrSlot *slot = &CrServerShared->slots[slot_index];
+		uint32 expected = CLUSTER_LMS_CR_PENDING;
 
 		if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_BUSY))
 			continue;
@@ -3270,6 +3314,8 @@ cluster_lms_cr_drain(void)
 		 * kick. */
 		cluster_lmon_duty_mark_dirty(CLUSTER_LMON_DUTY_SHIP_READY);
 		cluster_lmon_wakeup();
+		cluster_lms_cr_legacy_drain_cursor = (slot_index + 1) % CLUSTER_LMS_CR_SLOTS;
+		break;
 	}
 }
 

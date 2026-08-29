@@ -98,6 +98,10 @@ static int test_candidate_held_count;
 static int test_candidate_max_held_count;
 static int test_candidate_extract_calls;
 static bool test_candidate_mutate_record_on_recheck;
+static int test_regular_admission_recheck_calls;
+static int test_terminal_census_recheck_calls;
+static int test_regular_root_resolve_calls;
+static int test_terminal_census_root_resolve_calls;
 static ClusterUndoBlock0CurrentStep test_candidate_acquire_step
 	= CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 static ClusterUndoBlock0CurrentStep test_candidate_poll_step
@@ -288,9 +292,8 @@ cluster_scn_current(void)
 	return test_authority_scn;
 }
 
-bool
-cluster_semantic_activation_recheck_r4_terminal_census(
-	const ClusterSemanticAdmissionToken *token)
+static bool
+test_admission_token_exact(const ClusterSemanticAdmissionToken *token)
 {
 	return token != NULL && token->entered
 		   && token->feature_bit == CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
@@ -299,12 +302,27 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 }
 
 bool
-cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
-	uint32 owner_instance, uint32 segment_id,
+cluster_semantic_activation_recheck(
+	const ClusterSemanticAdmissionToken *token)
+{
+	test_regular_admission_recheck_calls++;
+	return test_admission_token_exact(token);
+}
+
+bool
+cluster_semantic_activation_recheck_r4_terminal_census(
+	const ClusterSemanticAdmissionToken *token)
+{
+	test_terminal_census_recheck_calls++;
+	return test_admission_token_exact(token);
+}
+
+static bool
+test_resolve_shared_undo_root(const ClusterSemanticAdmissionToken *token,
+	ClusterUndoPathIntent intent, uint32 owner_instance, uint32 segment_id,
 	ClusterUndoBlock0ResolvedRoot *out)
 {
-	UT_ASSERT(cluster_semantic_activation_recheck_r4_terminal_census(token));
+	UT_ASSERT(test_admission_token_exact(token));
 	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RUNTIME_SHARED);
 	UT_ASSERT_EQ(owner_instance, 1);
 	UT_ASSERT(segment_id == TEST_RECORD_SEGMENT || segment_id == TEST_TT_SEGMENT);
@@ -312,6 +330,28 @@ cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 	out->root_id = segment_id == TEST_RECORD_SEGMENT ? 91 : 92;
 	out->root_generation = 7;
 	return true;
+}
+
+bool
+cluster_semantic_activation_resolve_shared_undo_root(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out)
+{
+	test_regular_root_resolve_calls++;
+	return test_resolve_shared_undo_root(token, intent, owner_instance,
+		segment_id, out);
+}
+
+bool
+cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out)
+{
+	test_terminal_census_root_resolve_calls++;
+	return test_resolve_shared_undo_root(token, intent, owner_instance,
+		segment_id, out);
 }
 
 ClusterUndoBlock0CurrentStep
@@ -331,7 +371,7 @@ cluster_undo_block0_current_acquire_begin_admitted(
 	UT_ASSERT(key->segment_id == TEST_RECORD_SEGMENT
 			  || key->segment_id == TEST_TT_SEGMENT);
 	UT_ASSERT_EQ(mode, CLUSTER_UNDO_BLOCK0_SCUR);
-	UT_ASSERT(cluster_semantic_activation_recheck_r4_terminal_census(admission));
+	UT_ASSERT(test_admission_token_exact(admission));
 	if (test_candidate_acquire_step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
 		test_candidate_held_count++;
 		if (test_candidate_max_held_count < test_candidate_held_count)
@@ -508,6 +548,10 @@ reset_exact_origin_fixture(void)
 	test_candidate_max_held_count = 0;
 	test_candidate_extract_calls = 0;
 	test_candidate_mutate_record_on_recheck = false;
+	test_regular_admission_recheck_calls = 0;
+	test_terminal_census_recheck_calls = 0;
+	test_regular_root_resolve_calls = 0;
+	test_terminal_census_root_resolve_calls = 0;
 	test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
@@ -706,6 +750,45 @@ UT_TEST(test_terminal_census_same_owner_cross_segment_is_sequential_and_exact)
 	UT_ASSERT_EQ(test_candidate_block0_copy_calls, 2);
 	UT_ASSERT_EQ(test_native_status_calls, 1);
 	UT_ASSERT_EQ(test_by_xid_scan_calls, 0);
+	UT_ASSERT_EQ(test_regular_admission_recheck_calls, 0);
+	UT_ASSERT(test_terminal_census_recheck_calls > 0);
+	UT_ASSERT_EQ(test_regular_root_resolve_calls, 0);
+	UT_ASSERT(test_terminal_census_root_resolve_calls > 0);
+}
+
+UT_TEST(test_visibility_same_owner_cross_segment_is_sequential_and_exact)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterSemanticAdmissionToken admission;
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+		&resolution, &reason), CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, TEST_ORIGIN_WRAP);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 3);
+	UT_ASSERT_EQ(test_candidate_acquire_segments[0], TEST_RECORD_SEGMENT);
+	UT_ASSERT_EQ(test_candidate_acquire_segments[1], TEST_TT_SEGMENT);
+	UT_ASSERT_EQ(test_candidate_acquire_segments[2], TEST_RECORD_SEGMENT);
+	UT_ASSERT_EQ(test_candidate_release_calls, 3);
+	UT_ASSERT_EQ(test_candidate_held_count, 0);
+	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
+	UT_ASSERT_EQ(test_candidate_extract_calls, 2);
+	UT_ASSERT_EQ(test_native_status_calls, 1);
+	UT_ASSERT(test_regular_admission_recheck_calls > 0);
+	UT_ASSERT_EQ(test_terminal_census_recheck_calls, 0);
+	UT_ASSERT(test_regular_root_resolve_calls > 0);
+	UT_ASSERT_EQ(test_terminal_census_root_resolve_calls, 0);
 }
 
 UT_TEST(test_terminal_census_cross_segment_data_drift_fails_closed)
@@ -1480,7 +1563,7 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(72);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -1525,6 +1608,7 @@ main(void)
 	UT_RUN(test_exact_origin_committed_uses_canonical_tt_identity_and_direct_clog);
 	UT_RUN(test_terminal_census_local_origin_uses_resident_candidate2_and_canonical_upgrade);
 	UT_RUN(test_terminal_census_same_owner_cross_segment_is_sequential_and_exact);
+	UT_RUN(test_visibility_same_owner_cross_segment_is_sequential_and_exact);
 	UT_RUN(test_terminal_census_cross_segment_data_drift_fails_closed);
 	UT_RUN(test_terminal_census_cross_owner_tt_alias_fails_closed);
 	UT_RUN(test_terminal_census_pending_acquire_failure_cancels_candidate_guard);

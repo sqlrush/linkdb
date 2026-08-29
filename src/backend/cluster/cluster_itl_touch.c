@@ -500,15 +500,19 @@ itl_finish_stamp_page(Page page, uint8 slot_idx, const ItlFinishCtx *ctx)
 	/*
 	 * spec-3.4d D4:  touch list now contains lock-only ITL slots (LOCK_ONLY_
 	 * ACTIVE) alongside the spec-3.4a data ITL slots (ACTIVE).  Both
-	 * states transition to their respective COMMITTED/ABORTED on
-	 * xact-end finish.  Distinguish via ITL_FLAG_IS_LOCK_ONLY().
+	 * states transition at xact-end finish.  A data commit is still before
+	 * TransactionIdCommitTree(), so retain its SCN as NEEDS_CLEANOUT rather
+	 * than publishing a reusable terminal page state.  The exact C1b-backed
+	 * lazy cleanout/census later promotes it to COMMITTED.  Distinguish the
+	 * lock-only category via ITL_FLAG_IS_LOCK_ONLY().
 	 */
 	is_lock_only = ITL_FLAG_IS_LOCK_ONLY(slot->flags);
 
 	Assert(slot->flags == ITL_FLAG_ACTIVE || slot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE);
 
 	if (ctx->is_commit) {
-		slot->flags = is_lock_only ? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_COMMITTED;
+		slot->flags = is_lock_only
+			? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_NEEDS_CLEANOUT;
 		/*
 		 * spec-3.4d:  lock-only commit_scn carries no visibility ordering
 		 * (lock release ≠ MVCC commit).  Still store for observability;

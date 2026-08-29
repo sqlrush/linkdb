@@ -62,6 +62,11 @@ extern bool cluster_gcs_block_test_decode_r4_reply(
 	int32 expected_sender_node, int32 expected_forwarding_master_node,
 	uint8 expected_reply_domain);
 extern bool cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id,
+												 uint64 request_epoch,
+												 int32 requester_backend_id,
+												 uint8 transition_id,
+												 int32 expected_master_node);
+extern bool cluster_gcs_block_test_arm_legacy_reply_slot(uint64 request_id,
 													 uint64 request_epoch,
 													 int32 requester_backend_id,
 													 uint8 transition_id,
@@ -240,6 +245,9 @@ typedef struct RouteSeamCapture {
 	int candidate_acquire_begin_calls;
 	int candidate_release_begin_calls;
 	int candidate_resolve_calls;
+	int candidate_canonical_sample_calls;
+	int candidate_data_recheck_calls;
+	bool candidate_cross_segment;
 	ClusterTxOutcome candidate_outcome;
 	ClusterTxProofKind candidate_proof;
 	int observe_calls;
@@ -1063,9 +1071,8 @@ cluster_semantic_activation_enter_r4_terminal_census(
 	ClusterSemanticAdmissionToken *token)
 {
 	route_seam.terminal_census_enter_calls++;
-	if (token == NULL
-		|| route_seam.admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
-		return route_seam.admission_result;
+	if (token == NULL)
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 	memset(token, 0, sizeof(*token));
 	token->feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	token->record_generation = route_seam.activation_generation;
@@ -1085,6 +1092,24 @@ cluster_semantic_activation_recheck_r4_terminal_census(
 }
 
 bool
+cluster_semantic_activation_resolve_shared_undo_root(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out)
+{
+	if (token == NULL || !token->entered || out == NULL
+		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		|| owner_instance != (uint32)UT_MASTER_NODE + 1
+		|| (segment_id != 5 && segment_id != 6))
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->intent = intent;
+	out->root_id = UINT64_C(0x8000) + segment_id - 5;
+	out->root_generation = UINT64_C(3);
+	return true;
+}
+
+bool
 cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
 	uint32 owner_instance, uint32 segment_id,
@@ -1094,11 +1119,11 @@ cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
 	if (token == NULL || !token->entered || out == NULL
 		|| intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
 		|| owner_instance != (uint32)UT_MASTER_NODE + 1
-		|| segment_id != 5)
+		|| (segment_id != 5 && segment_id != 6))
 		return false;
 	memset(out, 0, sizeof(*out));
 	out->intent = intent;
-	out->root_id = UINT64_C(0x8000);
+	out->root_id = UINT64_C(0x8000) + segment_id - 5;
 	out->root_generation = UINT64_C(3);
 	return true;
 }
@@ -1120,7 +1145,8 @@ cluster_undo_block0_current_acquire_begin_admitted(
 	if (failure != NULL)
 		*failure = CLUSTER_UNDO_BLOCK0_OK;
 	if (key == NULL || key->owner_instance != (uint8)(UT_MASTER_NODE + 1)
-		|| key->segment_id != 5 || mode != CLUSTER_UNDO_BLOCK0_SCUR
+		|| (key->segment_id != 5 && key->segment_id != 6)
+		|| mode != CLUSTER_UNDO_BLOCK0_SCUR
 		|| admission == NULL || !admission->entered || guard == NULL)
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
@@ -1157,6 +1183,113 @@ cluster_undo_block0_current_release_poll(
 	ClusterUndoBlock0Result *failure pg_attribute_unused())
 {
 	return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+}
+
+static ClusterTxOutcome
+route_test_fill_origin_resolution(
+	const ClusterTxLocator *locator,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
+{
+	if (locator == NULL || admission == NULL || !admission->entered
+		|| out == NULL || reason_out == NULL)
+		return CLUSTER_TX_UNKNOWN;
+	memset(out, 0, sizeof(*out));
+	out->locator_echo = *locator;
+	out->locator_echo.tt_wrap = 19;
+	out->top_xid = locator->xid;
+	out->outcome = route_seam.candidate_outcome;
+	out->proof_kind = route_seam.candidate_proof;
+	out->commit_scn = route_seam.candidate_outcome == CLUSTER_TX_COMMITTED
+						  ? (SCN)101
+						  : InvalidScn;
+	out->horizon_scn = (SCN)89;
+	out->authority.origin_epoch = admission->formation_epoch;
+	out->authority.live_hwm_lsn = (XLogRecPtr)UINT64_C(0xabcdef);
+	out->authority.tt_generation = UINT64_C(17);
+	out->authority.authority_scn = (SCN)103;
+	*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return route_seam.candidate_outcome;
+}
+
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_data_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out)
+{
+	route_seam.candidate_resolve_calls++;
+	if (locator == NULL || mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
+		|| admission == NULL || !admission->entered
+		|| expected_generation == NULL || !expected_generation->known
+		|| expected_generation->value != UINT32_C(9) || guard == NULL
+		|| root == NULL || root->root_id != UINT64_C(0x8000)
+		|| plan == NULL || out == NULL || reason_out == NULL)
+		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+	memset(plan, 0, sizeof(*plan));
+	plan->opaque[0] = 1;
+	memcpy(plan->opaque + 8, locator, sizeof(*locator));
+	if (route_seam.candidate_cross_segment)
+		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL;
+	(void)route_test_fill_origin_resolution(locator, admission, out, reason_out);
+	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_canonical_logical(
+	const ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterUndoBlock0LogicalKey *logical_out)
+{
+	if (plan == NULL || logical_out == NULL || plan->opaque[0] != 1)
+		return false;
+	logical_out->owner_instance = (uint8)(UT_MASTER_NODE + 1);
+	logical_out->segment_id = 6;
+	return true;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_sample_canonical_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolveReason *reason_out)
+{
+	route_seam.candidate_canonical_sample_calls++;
+	if (plan == NULL || plan->opaque[0] != 1
+		|| mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
+		|| admission == NULL || !admission->entered || guard == NULL
+		|| root == NULL || root->root_id != UINT64_C(0x8001)
+		|| reason_out == NULL)
+		return false;
+	plan->opaque[1] = 1;
+	*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return true;
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_recheck_data_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterTxLocator locator;
+
+	route_seam.candidate_data_recheck_calls++;
+	if (plan == NULL || plan->opaque[0] != 1 || plan->opaque[1] != 1
+		|| mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS
+		|| admission == NULL || !admission->entered || guard == NULL
+		|| root == NULL || root->root_id != UINT64_C(0x8000))
+		return CLUSTER_TX_UNKNOWN;
+	memcpy(&locator, plan->opaque + 8, sizeof(locator));
+	return route_test_fill_origin_resolution(
+		&locator, admission, out, reason_out);
 }
 
 ClusterTxOutcome
@@ -2302,6 +2435,53 @@ UT_TEST(test_r4_full_reply_lands_once_in_armed_r4_slot)
 	UT_ASSERT_EQ(reply_lock_release_calls, 2);
 	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
 	UT_ASSERT_EQ(stale_drop_count, 1);
+}
+
+/* A holder-side conditional BufferContent miss is pre-mutation backpressure.
+ * Its exact forwarded identity must reach the requester so the existing
+ * DENIED_PENDING_X boundary can abort GRANT_PENDING and mint a fresh request;
+ * treating it as an unauthorized holder status loses the only reply and makes
+ * a same-id retransmit observe an unrelated terminal master refusal. */
+UT_TEST(test_forwarded_holder_pending_x_lands_in_legacy_slot)
+{
+	typedef struct TestLegacyReply8240 {
+		GcsBlockReplyHeader header;
+		char block_data[GCS_BLOCK_DATA_SIZE];
+	} TestLegacyReply8240;
+	TestLegacyReply8240 reply;
+	ClusterICEnvelope env;
+	GcsBlockReplyHeader landed_header;
+	char landed_block[GCS_BLOCK_DATA_SIZE];
+	bool reply_received = false;
+	uint64 stale_drop_count = 0;
+
+	memset(&reply, 0, sizeof(reply));
+	reply.header.request_id = UT_REQUEST_ID;
+	reply.header.epoch = UT_FORMATION_EPOCH;
+	reply.header.sender_node = UT_HOLDER_NODE;
+	reply.header.requester_backend_id = 1;
+	reply.header.transition_id = PCM_TRANS_N_TO_S;
+	reply.header.status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
+	GcsBlockReplyHeaderSetForwardingMasterNode(&reply.header, UT_MASTER_NODE);
+	reply.header.checksum = cluster_gcs_block_compute_checksum(reply.block_data);
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, UT_HOLDER_NODE,
+						  cluster_node_id, sizeof(reply));
+
+	reply_lock_acquire_calls = 0;
+	reply_lock_release_calls = 0;
+	reply_cv_signal_calls = 0;
+	UT_ASSERT(cluster_gcs_block_test_arm_legacy_reply_slot(
+		UT_REQUEST_ID, UT_FORMATION_EPOCH, 1, PCM_TRANS_N_TO_S,
+		UT_MASTER_NODE));
+	cluster_gcs_handle_block_reply_envelope(&env, &reply);
+	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_reply_slot(
+		&landed_header, landed_block, &reply_received, &stale_drop_count));
+	UT_ASSERT(reply_received);
+	UT_ASSERT_EQ(memcmp(&landed_header, &reply.header, sizeof(reply.header)), 0);
+	UT_ASSERT_EQ(reply_lock_acquire_calls, 1);
+	UT_ASSERT_EQ(reply_lock_release_calls, 1);
+	UT_ASSERT_EQ(reply_cv_signal_calls, 1);
+	UT_ASSERT_EQ(stale_drop_count, 0);
 }
 
 /* The requester arm consumes one exact sequence only as it publishes a free
@@ -4241,10 +4421,12 @@ UT_TEST(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22
 						  UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
 
 	route_seam_reset();
+	route_seam.admission_result
+		= CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
 	route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
-	UT_ASSERT_EQ(route_seam.enter_calls, 0);
+	UT_ASSERT_EQ(route_seam.enter_calls, 1);
 	UT_ASSERT_EQ(route_seam.terminal_census_enter_calls, 1);
 	UT_ASSERT_EQ(route_seam.peer_open_calls, 0);
 	UT_ASSERT_EQ(route_seam.holder_submit_calls, 0);
@@ -4252,13 +4434,8 @@ UT_TEST(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22
 
 	cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, 1);
-	UT_ASSERT_EQ(route_seam.candidate_resolve_calls, 0);
-	cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(route_seam.candidate_resolve_calls, 1);
-	cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 1);
-	UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
-	cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(route_seam.raw_send_calls, 1);
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
 	UT_ASSERT_EQ(route_seam.raw_send_msg_type, PGRAC_IC_MSG_GCS_BLOCK_REPLY);
@@ -4303,6 +4480,8 @@ UT_TEST(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22
 	 * non-stamping: status 26 with a canonical zero page. */
 	forward.base.reserved_0[6] = 0;
 	route_seam_reset();
+	route_seam.admission_result
+		= CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
 	route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
 	route_seam.candidate_outcome = CLUSTER_TX_PREPARED;
 	route_seam.candidate_proof = CLUSTER_TX_PROOF_ORIGIN_TWOPHASE;
@@ -4319,12 +4498,22 @@ UT_TEST(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22
 	/* A capability-generation/connection drift before publication sends no
 	 * verdict on the replacement connection and leaves the sole token. */
 	route_seam_reset();
+	route_seam.admission_result
+		= CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
 	route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
+	route_seam.candidate_cross_segment = true;
 	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
-	for (i = 0; i < 3; i++)
-		cluster_gcs_block_test_r4_tx_origin_drain();
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, 2);
+	UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 2);
+	UT_ASSERT_EQ(route_seam.candidate_canonical_sample_calls, 1);
+	UT_ASSERT_EQ(route_seam.candidate_data_recheck_calls, 0);
+	UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
 	route_seam.capability_ok = false;
 	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, 3);
+	UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 3);
+	UT_ASSERT_EQ(route_seam.candidate_data_recheck_calls, 1);
 	UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
 	UT_ASSERT_EQ(route_seam.leave_calls, 1);
@@ -4334,7 +4523,7 @@ UT_TEST(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22
 int
 main(void)
 {
-	UT_PLAN(95);
+	UT_PLAN(96);
 	UT_RUN(test_01_null_authority_is_protocol);
 	UT_RUN(test_02_null_output_is_protocol);
 	UT_RUN(test_03_canonical_n_has_no_holder);
@@ -4392,6 +4581,7 @@ main(void)
 	UT_RUN(test_r4_status24_routes_only_to_internal_foreign_undo_landing);
 	UT_RUN(test_r4_reply_decoder_checks_minimum_length_before_header_read);
 	UT_RUN(test_r4_full_reply_lands_once_in_armed_r4_slot);
+	UT_RUN(test_forwarded_holder_pending_x_lands_in_legacy_slot);
 	UT_RUN(test_r4_requester_arm_selects_closed_domain_and_releases_cleanly);
 	UT_RUN(test_current_mx_describe_requester_is_capability_bound_and_times_out_cleanly);
 	UT_RUN(test_current_mx_describe_reply_lands_in_current_domain);

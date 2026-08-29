@@ -45,6 +45,7 @@ UT_DEFINE_GLOBALS();
 bool IsUnderPostmaster = false;
 bool cluster_xnode_profile_enabled = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
+int cluster_ges_reply_wait_max_entries = 1024;
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -107,6 +108,8 @@ typedef struct FakeReplyWaitHash {
 static FakeReplyWaitHash fake_hash;
 static Size fake_keysize;
 static Size fake_entrysize;
+static long fake_init_size;
+static long fake_max_size;
 static int fake_lock_depth;
 static int fake_lock_acquires;
 static int fake_lock_releases;
@@ -135,6 +138,8 @@ ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribut
 	Assert(infoP->entrysize == sizeof(GesReplyWaitEntry));
 	fake_keysize = infoP->keysize;
 	fake_entrysize = infoP->entrysize;
+	fake_init_size = init_size;
+	fake_max_size = max_size;
 	memset(&fake_hash, 0, sizeof(fake_hash));
 	return (HTAB *)&fake_hash;
 }
@@ -263,16 +268,25 @@ make_key(uint64 request_id, int32 source_node_id, int32 dest_node_id, uint32 req
 }
 
 static void
-reset_reply_wait(void)
+reset_reply_wait_with_cap(int max_entries)
 {
 	memset(&fake_shared, 0, sizeof(fake_shared));
 	fake_shared_found = false;
 	fake_keysize = 0;
 	fake_entrysize = 0;
+	fake_init_size = 0;
+	fake_max_size = 0;
 	fake_lock_depth = 0;
 	fake_lock_acquires = 0;
 	fake_lock_releases = 0;
+	cluster_ges_reply_wait_max_entries = max_entries;
 	cluster_ges_reply_wait_shmem_init();
+}
+
+static void
+reset_reply_wait(void)
+{
+	reset_reply_wait_with_cap(1024);
 }
 
 
@@ -389,15 +403,41 @@ UT_TEST(test_poll_matches_all_five_key_fields)
 	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_lookup(&base));
 }
 
+UT_TEST(test_configured_cap_controls_shmem_and_live_admission)
+{
+	GesReplyWaitKey keys[3] = {
+		make_key(31, 0, 1, 7, 300),
+		make_key(32, 0, 1, 7, 300),
+		make_key(33, 0, 1, 7, 300),
+	};
+	Size size_at_two;
+	Size size_at_five;
+
+	cluster_ges_reply_wait_max_entries = 2;
+	size_at_two = cluster_ges_reply_wait_shmem_size();
+	cluster_ges_reply_wait_max_entries = 5;
+	size_at_five = cluster_ges_reply_wait_shmem_size();
+	UT_ASSERT_EQ(size_at_five - size_at_two,
+				 (Size)(3 * sizeof(GesReplyWaitEntry)));
+
+	reset_reply_wait_with_cap(2);
+	UT_ASSERT_EQ(fake_init_size, 2);
+	UT_ASSERT_EQ(fake_max_size, 2);
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&keys[0], 9000));
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&keys[1], 9000));
+	UT_ASSERT_NULL(cluster_ges_reply_wait_insert(&keys[2], 9000));
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(test_poll_pending_keeps_exact_entry);
 	UT_RUN(test_poll_delivered_copies_complete_verdict_then_consumes);
 	UT_RUN(test_poll_abandoned_is_explicit_and_preserves_tombstone);
 	UT_RUN(test_poll_missing_is_explicit_without_output_mutation);
 	UT_RUN(test_poll_matches_all_five_key_fields);
+	UT_RUN(test_configured_cap_controls_shmem_and_live_admission);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

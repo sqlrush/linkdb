@@ -305,7 +305,15 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
 	ref->cluster_epoch = (uint32)cluster_epoch_get_current();
 	ref->local_xid = slot->xid;
 	ref->cached_commit_scn = slot->commit_scn;
-	ref->has_cached_status = (slot->flags == ITL_FLAG_COMMITTED && SCN_VALID(slot->commit_scn));
+	/* NEEDS_CLEANOUT carries the same retained SCN candidate as COMMITTED,
+	 * but it is not terminal authority.  Exposing the candidate lets the
+	 * exact fresh-ref C1b path ask the ordinary live verdict first and, only
+	 * if that is unproved, bind this SCN to origin CLOG plus no-raw-reuse.
+	 * ACTIVE and every invalid-SCN shape remain ineligible. */
+	ref->has_cached_status
+		= ((slot->flags == ITL_FLAG_COMMITTED
+			|| slot->flags == ITL_FLAG_NEEDS_CLEANOUT)
+		   && SCN_VALID(slot->commit_scn));
 	/* _padding cleared by memset above. */
 
 	return true;
@@ -452,7 +460,7 @@ static inline bool
 cluster_itl_slot_is_completed_reusable(uint8 flags)
 {
 	return flags == ITL_FLAG_COMMITTED || flags == ITL_FLAG_ABORTED
-		   || flags == ITL_FLAG_NEEDS_CLEANOUT || ITL_FLAG_IS_LOCK_ONLY_COMPLETED(flags);
+		   || ITL_FLAG_IS_LOCK_ONLY_COMPLETED(flags);
 }
 
 /*
@@ -573,9 +581,9 @@ cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_sl
 	 * existing ACTIVE slot if it already belongs to top_xid; otherwise
 	 * remember the first FREE slot we see.  If all slots are occupied
 	 * but none is ACTIVE for another transaction, recycle the first
-	 * completed slot.  Full delayed cleanout/freeing lands in 3.4c, but
-	 * 3.4a must not make every hot page fail after INITRANS completed
-	 * transactions.
+	 * completed slot.  NEEDS_CLEANOUT is retained pre-CLOG commit evidence,
+	 * not a completed slot; only exact lazy cleanout or the page-scoped
+	 * terminal census may promote it before reuse.
 	 */
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		if (slots[i].flags == ITL_FLAG_ACTIVE && slots[i].xid == top_xid) {

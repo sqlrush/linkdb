@@ -368,7 +368,7 @@ UT_TEST(u23_invalidated_record_performs_no_terminal_page_stamp)
 	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
 }
 
-UT_TEST(u24_known_single_node_pcm_n_stamps_terminal_slot)
+UT_TEST(u24_known_single_node_pcm_n_stages_delayed_cleanout)
 {
 	ClusterItlTouchHandle handle = registration_handle();
 	TransactionId xid = 700;
@@ -381,7 +381,11 @@ UT_TEST(u24_known_single_node_pcm_n_stamps_terminal_slot)
 	UT_ASSERT_EQ(cluster_itl_touch_count(), 1);
 
 	cluster_itl_xact_precommit_finish(xid, 99);
-	UT_ASSERT_EQ(slot->flags, ITL_FLAG_COMMITTED);
+	/*
+	 * The hook runs before TransactionIdCommitTree().  Its page byte is
+	 * therefore retained commit evidence, not reusable terminal authority.
+	 */
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_NEEDS_CLEANOUT);
 	UT_ASSERT_EQ(slot->commit_scn, 99);
 	UT_ASSERT_EQ(test_generic_register_calls, 1);
 	UT_ASSERT_EQ(test_generic_finish_calls, 1);
@@ -484,7 +488,7 @@ UT_TEST(u30_slot_drift_preserves_active_slot)
 	UT_ASSERT_EQ(test_stamp_skip_calls, 1);
 }
 
-UT_TEST(u31_peer_pcm_x_contract_still_stamps)
+UT_TEST(u31_peer_pcm_x_contract_stages_delayed_cleanout)
 {
 	ClusterItlTouchHandle handle = registration_handle();
 	TransactionId xid = 700;
@@ -494,7 +498,7 @@ UT_TEST(u31_peer_pcm_x_contract_still_stamps)
 	cluster_itl_touch_register_exact(&handle, 1, xid);
 	cluster_itl_xact_precommit_finish(xid, 99);
 
-	UT_ASSERT_EQ(slot->flags, ITL_FLAG_COMMITTED);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_NEEDS_CLEANOUT);
 	UT_ASSERT_EQ(test_generic_register_calls, 1);
 	UT_ASSERT_EQ(test_stamp_skip_calls, 0);
 }
@@ -564,14 +568,14 @@ main(void)
 	UT_RUN(u21_first_failed_capture_does_not_append);
 	UT_RUN(u22_failed_recapture_invalidates_one_existing_record);
 	UT_RUN(u23_invalidated_record_performs_no_terminal_page_stamp);
-	UT_RUN(u24_known_single_node_pcm_n_stamps_terminal_slot);
+	UT_RUN(u24_known_single_node_pcm_n_stages_delayed_cleanout);
 	UT_RUN(u25_peer_pcm_n_is_refused_before_registration);
 	UT_RUN(u26_unknown_topology_pcm_n_is_refused);
 	UT_RUN(u27_recovery_merge_pcm_n_is_refused);
 	UT_RUN(u28_tag_drift_preserves_active_slot);
 	UT_RUN(u29_generation_drift_preserves_active_slot);
 	UT_RUN(u30_slot_drift_preserves_active_slot);
-	UT_RUN(u31_peer_pcm_x_contract_still_stamps);
+	UT_RUN(u31_peer_pcm_x_contract_stages_delayed_cleanout);
 	UT_RUN(u32_known_single_node_pcm_x_is_refused);
 	UT_RUN(u33_busy_pcm_n_tuple_is_refused);
 	UT_RUN(u34_epoch_drift_preserves_active_slot);

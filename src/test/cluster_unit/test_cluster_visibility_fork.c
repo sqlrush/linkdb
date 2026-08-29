@@ -79,6 +79,9 @@ UT_DEFINE_GLOBALS();
 #ifndef HEAPAM_SOURCE_PATH
 #error "HEAPAM_SOURCE_PATH must identify production heapam.c"
 #endif
+#ifndef HEAPAM_VISIBILITY_SOURCE_PATH
+#error "HEAPAM_VISIBILITY_SOURCE_PATH must identify production heapam_visibility.c"
+#endif
 #ifndef TT_LOCAL_SOURCE_PATH
 #error "TT_LOCAL_SOURCE_PATH must identify production cluster_tt_local.c"
 #endif
@@ -425,6 +428,41 @@ UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 	free(source);
 }
 
+/* The L3 fail-closed diagnostic must identify the authority lookup that
+ * actually failed.  Naming raw_xmin as the deleting xid hides the exact
+ * xmax/ref tuple and prevents deterministic route classification. */
+UT_TEST(test_deleting_xmax_error_names_actual_xmax)
+{
+	char *source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	const char *message;
+	const char *hint;
+	const char *actual_xmax;
+	const char *wrong_xmin;
+	const char *wrong_hint;
+
+	if (source == NULL)
+		return;
+	message = strstr(source,
+		"errmsg(\"cluster TT status unknown for deleting xmax of xid %u\"");
+	hint = message != NULL ? strstr(message, "errhint(") : NULL;
+	actual_xmax = message != NULL
+		? strstr(message, "HeapTupleHeaderGetRawXmax(tuple)") : NULL;
+	wrong_xmin = message != NULL ? strstr(message, "raw_xmin),") : NULL;
+	wrong_hint = message != NULL
+		? strstr(message, "Remote deleter commit state not yet propagated") : NULL;
+
+	UT_ASSERT_NOT_NULL(message);
+	UT_ASSERT_NOT_NULL(hint);
+	UT_ASSERT_NOT_NULL(actual_xmax);
+	if (message != NULL && hint != NULL && actual_xmax != NULL)
+		UT_ASSERT(message < actual_xmax && actual_xmax < hint);
+	if (message != NULL && hint != NULL && wrong_xmin != NULL)
+		UT_ASSERT(wrong_xmin > hint);
+	if (message != NULL && hint != NULL && wrong_hint != NULL)
+		UT_ASSERT(wrong_hint > hint);
+	free(source);
+}
+
 
 int
 main(void)
@@ -444,5 +482,6 @@ main(void)
 	UT_RUN(test_p033_data_dml_publishes_active_identity);
 	UT_RUN(test_p033_active_and_safety_boundary_matrix);
 	UT_RUN(test_normal_commit_stamp_is_modifier_gated_and_error_safe);
+	UT_RUN(test_deleting_xmax_error_names_actual_xmax);
 	UT_DONE();
 }

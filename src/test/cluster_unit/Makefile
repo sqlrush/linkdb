@@ -2855,6 +2855,7 @@ test_cluster_visibility_fork: test_cluster_visibility_fork.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_VIS_VERDICT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DHEAPAM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DHEAPAM_VISIBILITY_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam_visibility.c"' \
 		-DTT_LOCAL_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_tt_local.c"' \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_VIS_VERDICT_O) \

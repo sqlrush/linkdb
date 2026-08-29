@@ -72,17 +72,17 @@
  *	to ITL_FLAG_FREE.  Stage 3 (AD-006 第五轮) implements the actual
  *	state machine:
  *	    FREE -> ACTIVE (transaction touches block)
- *	    ACTIVE -> COMMITTED (commit_scn populated)
+ *	    ACTIVE -> NEEDS_CLEANOUT (precommit commit_scn retained)
  *	         or -> ABORTED (abort path)
- *	    COMMITTED -> NEEDS_CLEANOUT (lazy row-level commit stamp)
- *	    NEEDS_CLEANOUT -> FREE (slot 复用 by next transaction)
+ *	    NEEDS_CLEANOUT -> COMMITTED (exact terminal cleanout/census)
+ *	    COMMITTED -> FREE (slot 复用 by next transaction)
  */
 typedef enum {
 	ITL_FLAG_FREE = 0,			 /* slot is reusable (zero-init occupies this state) */
 	ITL_FLAG_ACTIVE = 1,		 /* xid is currently writing; commit_scn unset */
 	ITL_FLAG_COMMITTED = 2,		 /* xid committed; commit_scn populated */
 	ITL_FLAG_ABORTED = 3,		 /* xid aborted; commit_scn = InvalidScn */
-	ITL_FLAG_NEEDS_CLEANOUT = 4, /* commit/abort done but heap rows not yet stamped */
+	ITL_FLAG_NEEDS_CLEANOUT = 4, /* retained precommit SCN; not directly reusable */
 	/* spec-3.4d (v0.2 F2 / Q1): lock-only ITL states for heap_lock_tuple.
 	 * Distinct enum values keep existing equality checks unchanged
 	 * (slot.flags == ITL_FLAG_ACTIVE etc.) while letting lock-only slot

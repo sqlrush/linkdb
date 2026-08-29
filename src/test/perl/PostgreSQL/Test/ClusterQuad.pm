@@ -2880,21 +2880,37 @@ sub _two_stage_reap_one_manifest
 	my @backings = map { $_->{backing_realpath} } @{ $manifest->{devices} };
 	my $holders = $self->_two_stage_device_holders(\@devices, \@backings);
 	return 'OPERATOR_CLEANUP_REQUIRED' if @$holders;
+	my @already_absent;
 	for my $record (@{ $manifest->{devices} })
 	{
 		my $current = eval {
 			$self->_two_stage_current_loop_mapping($record->{path})
 		};
+		if ($@ || !defined($current))
+		{
+			my $absent = eval {
+				$self->_two_stage_recorded_device_mapping_absent($record)
+			};
+			return 'CLEANUP_IDENTITY_CONFLICT' if $@ || !$absent;
+			push @already_absent, $record;
+			next;
+		}
 		my $record_major = $record->{major_minor} // '';
-		my $current_major = defined($current)
-		  ? ($current->{major_minor} // '') : '';
+		my $current_major = $current->{major_minor} // '';
 		$record_major =~ s/^\s+|\s+$//g;
 		$current_major =~ s/^\s+|\s+$//g;
-		return 'CLEANUP_IDENTITY_CONFLICT' if $@
-		  || !defined($current)
-		  || $current_major ne $record_major
+		return 'CLEANUP_IDENTITY_CONFLICT' if $current_major ne $record_major
 		  || ($current->{backing_realpath} // '')
 			ne ($record->{backing_realpath} // '');
+	}
+	for my $record (sort {
+		($b->{attach_order} // -1) <=> ($a->{attach_order} // -1)
+	} @already_absent)
+	{
+		@{ $manifest->{devices} } = grep {
+			$_->{path} ne $record->{path}
+		} @{ $manifest->{devices} };
+		$self->_two_stage_write_manifest_data($path, $manifest);
 	}
 	while (@{ $manifest->{devices} })
 	{
@@ -3311,7 +3327,6 @@ sub new_quad
 			  or die "mkdir $shared_data_root/global: $!";
 		}
 	}
-
 	if ($opts{shared_catalog})
 	{
 		my $sc_common = <<EOC;

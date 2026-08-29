@@ -205,7 +205,8 @@ typedef struct ClusterUndoTTSlotRef {
 	uint32 cluster_epoch;	 /* offset  8, 4B */
 	TransactionId local_xid; /* offset 12, 4B */
 	SCN cached_commit_scn;	 /* offset 16, 8B; InvalidScn if no cleanout */
-	bool has_cached_status;	 /* offset 24, 1B */
+	bool has_cached_status;	 /* offset 24, 1B; retained SCN candidate only,
+							  * never terminal authority by itself */
 	uint8 _padding[7];		 /* offset 25, 7B explicit padding to 32B */
 } ClusterUndoTTSlotRef;
 

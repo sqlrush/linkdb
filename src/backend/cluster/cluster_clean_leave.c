@@ -2609,18 +2609,23 @@ cl_phase1_full_stop_post_stopped_barrier(
 
 	for (;;) {
 		uint8 ack_bitmap[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
+		uint8 reply_sent[CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES];
 		bool nak;
 		long timeout_ms;
 
 		ResetLatch(MyLatch);
 		LWLockAcquire(&cl_state->lock, LW_SHARED);
 		memcpy(ack_bitmap, cl_state->ack_bitmap, sizeof(ack_bitmap));
+		memcpy(reply_sent, cl_state->phase1_post_stopped_reply_sent,
+			   sizeof(reply_sent));
 		nak = pg_atomic_read_u32(&cl_state->nak_received) != 0;
 		LWLockRelease(&cl_state->lock);
 		if (nak)
 			break;
 		if (cluster_clean_leave_phase1_full_stop_ack_complete(
-				plan, cluster_node_id, ack_bitmap, sizeof(ack_bitmap))) {
+				plan, cluster_node_id, ack_bitmap, sizeof(ack_bitmap))
+			&& cluster_clean_leave_phase1_full_stop_ack_complete(
+				plan, cluster_node_id, reply_sent, sizeof(reply_sent))) {
 			complete = cl_phase1_full_stop_identity_matches(
 				plan, CLUSTER_WAL_SLOT_STATE_STOPPED);
 			break;

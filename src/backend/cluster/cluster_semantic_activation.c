@@ -611,6 +611,8 @@ static bool semantic_activation_ack_current_authority(
 	int32 local_node_id, uint64 *out_members_lo, uint64 *out_members_hi,
 	uint64 *out_formation_epoch,
 	int32 *out_coordinator_node) pg_attribute_unused();
+static bool semantic_activation_ack_terminal_identity_not_contradicted(
+	const ClusterSemanticActivationAckTableV1 *image);
 static bool semantic_activation_ack_member_present(
 	uint64 members_lo, uint64 members_hi, int32 node_id);
 static bool semantic_activation_ack_wire_value_valid(
@@ -1111,6 +1113,77 @@ semantic_activation_ack_current_authority(
 	*out_members_hi = members_hi;
 	*out_formation_epoch = formation_epoch;
 	*out_coordinator_node = coordinator_node;
+	return true;
+}
+
+/*
+ * A failed coherent snapshot is not by itself contradictory: QVOTEC may be
+ * between publications.  Before retaining a completed OPEN carrier, however,
+ * reject every contradiction that is already observable without inventing a
+ * replacement authority.  A later consumer still needs the normal coherent
+ * snapshot and complete-image revalidation before using the carrier.
+ */
+static bool
+semantic_activation_ack_terminal_identity_not_contradicted(
+	const ClusterSemanticActivationAckTableV1 *image)
+{
+	uint64 snapshot_members_lo = 0;
+	uint64 snapshot_members_hi = 0;
+	uint64 snapshot_epoch = 0;
+	int node;
+
+	if (image == NULL
+		|| (image->expected_members_lo == 0
+			&& image->expected_members_hi == 0)
+		|| cluster_epoch_get_current() != image->transition_epoch)
+		return false;
+
+	/* A successfully captured snapshot is positive evidence.  If its exact
+	 * identity differs, this is drift rather than temporary unavailability. */
+	if (cluster_reconfig_lmon_snapshot_admitted_membership(
+			&snapshot_members_lo, &snapshot_members_hi, &snapshot_epoch)
+		&& (snapshot_members_lo != image->expected_members_lo
+			|| snapshot_members_hi != image->expected_members_hi
+			|| snapshot_epoch != image->transition_epoch))
+		return false;
+
+	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool expected_member = semantic_activation_ack_member_present(
+			image->expected_members_lo, image->expected_members_hi, node);
+		ClusterMembershipState state = cluster_membership_get_state(node);
+
+		if (!expected_member) {
+			if (state == CLUSTER_MEMBER_MEMBER)
+				return false;
+			continue;
+		}
+		if (state != CLUSTER_MEMBER_MEMBER
+			|| image->expected[node].node_id != (uint32)node
+			|| image->expected[node].admitted_incarnation == 0
+			|| cluster_membership_get_last_admitted_incarnation(node)
+			   != image->expected[node].admitted_incarnation)
+			return false;
+
+		if (node == cluster_node_id) {
+			uint64 self_incarnation = cluster_qvotec_get_self_incarnation();
+
+			if (self_incarnation != 0
+				&& self_incarnation != image->expected[node].boot_id)
+				return false;
+		} else {
+			uint64 observed_incarnation = 0;
+			uint64 observed_generation = 0;
+
+			if (cluster_reconfig_get_observed_slot(
+					node, &observed_incarnation, &observed_generation)
+				&& (observed_generation == 0
+					|| observed_incarnation != image->expected[node].boot_id
+					|| cluster_reconfig_get_observed_epoch(node)
+					   != image->transition_epoch))
+				return false;
+		}
+	}
+
 	return true;
 }
 
@@ -3621,6 +3694,8 @@ semantic_activation_ack_lmon_revalidate_active(
 static void
 semantic_activation_ack_lmon_drain(void)
 {
+	ClusterSemanticActivationAckTableV1 terminal_image;
+	SemanticActivationAdmissionSnapshot terminal_snapshot;
 	SemanticActivationAckIngressItem item;
 	uint64 current_members_lo;
 	uint64 current_members_hi;
@@ -3643,6 +3718,56 @@ semantic_activation_ack_lmon_drain(void)
 	if (!semantic_activation_ack_current_authority(
 			cluster_node_id, &current_members_lo, &current_members_hi,
 			&current_epoch, &current_coordinator_node)) {
+		/* A complete OPEN_APPLIED image is terminal evidence, not an active
+		 * membership candidate.  The exact admitted snapshot can be
+		 * temporarily unavailable while QVOTEC publishes its next observation;
+		 * that absence is not contradictory evidence and must not erase the
+		 * carrier that opened the already-current target gate.  Consumers still
+		 * call current_authority/complete_image_current and therefore remain
+		 * fail-closed until the snapshot is exact again.  A real epoch or gate
+		 * drift, any live protocol debt, or any non-terminal image keeps the
+		 * existing whole-round invalidation policy. */
+		if (semantic_activation_ack_ingress_pending(
+				&semantic_activation_ack_local_ingress) == 0
+			&& semantic_activation_ack_local_pending_send.pending_members_lo == 0
+			&& semantic_activation_ack_local_pending_send.pending_members_hi == 0
+			&& !semantic_activation_ack_local_pending_send.invalidated
+			&& !semantic_activation_ack_local_request_origin.active
+			&& semantic_activation_ack_local_stage_ahead.count == 0
+			&& !semantic_activation_ack_local_request_ahead.valid
+			&& semantic_activation_ack_table_snapshot(&terminal_image)
+			&& semantic_activation_snapshot(&terminal_snapshot)
+			&& terminal_image.stage
+				== CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
+			&& terminal_image.flags
+				== (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+					| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
+			&& terminal_image.expected_members_lo != 0
+			&& terminal_image.observed_members_lo
+				== terminal_image.expected_members_lo
+			&& terminal_image.observed_members_hi
+				== terminal_image.expected_members_hi
+			&& terminal_image.rollback_feature_bitmap == 0
+			&& semantic_activation_ack_image_structural(&terminal_image)
+			&& semantic_activation_full_ack_table_matches(
+				terminal_image.observed,
+				terminal_image.observed_members_lo,
+				terminal_image.observed_members_hi,
+				terminal_image.expected,
+				terminal_image.expected_members_lo,
+				terminal_image.expected_members_hi)
+			&& !terminal_snapshot.transition_closed
+			&& terminal_snapshot.active_bits
+				== terminal_image.target_feature_bitmap
+			&& terminal_snapshot.record_generation
+				== terminal_image.record_generation
+			&& terminal_snapshot.formation_epoch
+				== terminal_image.transition_epoch
+			&& cluster_epoch_get_current()
+				== terminal_snapshot.formation_epoch
+			&& semantic_activation_ack_terminal_identity_not_contradicted(
+				&terminal_image))
+			return;
 		semantic_activation_ack_lmon_invalidate_active();
 		if ((semantic_activation_ack_local_pending_send.pending_members_lo != 0
 			 || semantic_activation_ack_local_pending_send.pending_members_hi != 0)
@@ -10258,6 +10383,7 @@ bool
 cluster_semantic_activation_restore_open_proof_if_active(void)
 {
 	ClusterSemanticActivationAckTableV1 table;
+	ClusterSemanticActivationAckTableV1 empty_table;
 	ClusterSemanticActivationAckTableV1 rebuilt;
 	ClusterSemanticActivationRecord open;
 	SemanticActivationAckTuple self;
@@ -10279,6 +10405,13 @@ cluster_semantic_activation_restore_open_proof_if_active(void)
 		return false;
 	if ((table.flags & CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_OPEN_PROOF) != 0)
 		return true;
+	/* Reconstruction is authorized only for the byte-zero volatile image
+	 * created at postmaster start.  A nonempty table belongs to a live or
+	 * invalidated protocol round; in particular, never add the recovery-only
+	 * OPEN_PROOF flag to an ordinary Resource-X OPEN_APPLIED carrier. */
+	memset(&empty_table, 0, sizeof(empty_table));
+	if (memcmp(&table, &empty_table, sizeof(table)) != 0)
+		return false;
 
 	/* The DURABLE Target OPEN proof: a strict-majority OPEN record on the
 	 * voting disks (the cutover round's final record), cross-matched to
@@ -10424,8 +10557,8 @@ cluster_semantic_activation_peer_open_matches(
  * OPEN_PROOF flag.  Revalidate the complete current four-member image before
  * accepting the authenticated peer generation so a partial or cross-round
  * ACK table never authorizes kind-9 traffic. */
-bool
-cluster_semantic_activation_resource_x_peer_open_matches(
+ClusterSemanticResourceXPeerOpenResult
+cluster_semantic_activation_resource_x_peer_open_check(
 	const ClusterSemanticAdmissionToken *token,
 	int32 authenticated_peer_node_id,
 	uint32 sampled_capability_generation)
@@ -10447,39 +10580,64 @@ cluster_semantic_activation_resource_x_peer_open_matches(
 		|| token->side != CLUSTER_SEMANTIC_TARGET_SIDE
 		|| authenticated_peer_node_id < 0
 		|| authenticated_peer_node_id >= CLUSTER_MAX_NODES
-		|| sampled_capability_generation == 0
-		|| !cluster_semantic_activation_recheck(token)
-		|| !cluster_sf_peer_capability_generation_matches(
+		|| sampled_capability_generation == 0)
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_INVALID_INPUT;
+	if (!cluster_semantic_activation_recheck(token))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_ADMISSION_DRIFT;
+	if (!cluster_sf_peer_capability_generation_matches(
 			authenticated_peer_node_id,
 			PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-			sampled_capability_generation)
-		|| !semantic_activation_ack_current_authority(
+			sampled_capability_generation))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_CAPABILITY_DRIFT;
+	if (!semantic_activation_ack_current_authority(
 			cluster_node_id, &current_members_lo, &current_members_hi,
-			&current_epoch, &current_coordinator_node)
-		|| SemanticActivationAckTable == NULL
-		|| !semantic_activation_ack_table_snapshot(&table)
-		|| table.stage
-		   != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
-		|| table.flags
-		   != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
-			   | CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE)
-		|| table.record_generation != token->record_generation
-		|| table.transition_epoch != token->formation_epoch
-		|| table.source_feature_bitmap != source_bits
+			&current_epoch, &current_coordinator_node))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_AUTHORITY_UNAVAILABLE;
+	if (SemanticActivationAckTable == NULL
+		|| !semantic_activation_ack_table_snapshot(&table))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_TABLE_UNAVAILABLE;
+	if (table.stage
+		!= CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED)
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_STAGE_MISMATCH;
+	if (table.flags
+		!= (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
+			| CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_COMPLETE))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_FLAGS_MISMATCH;
+	if (table.record_generation != token->record_generation)
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_RECORD_MISMATCH;
+	if (table.transition_epoch != token->formation_epoch)
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_FORMATION_MISMATCH;
+	if (table.source_feature_bitmap != source_bits
 		|| table.target_feature_bitmap != target_bits
-		|| table.rollback_feature_bitmap != 0
-		|| !semantic_activation_ack_member_present(
+		|| table.rollback_feature_bitmap != 0)
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_FEATURE_MISMATCH;
+	if (!semantic_activation_ack_member_present(
 			table.expected_members_lo, table.expected_members_hi,
-			authenticated_peer_node_id)
-		|| !semantic_activation_ack_matches(
+			authenticated_peer_node_id))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_PEER_ABSENT;
+	if (!semantic_activation_ack_matches(
 			&table.observed[authenticated_peer_node_id],
 			&table.expected[authenticated_peer_node_id]))
-		return false;
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_PEER_ROW_MISMATCH;
 
 	local_capability_word = cluster_ic_local_capability_word();
-	return semantic_activation_ack_complete_image_current(
-		&table, current_members_lo, current_members_hi, current_epoch,
-		current_coordinator_node, cluster_node_id, local_capability_word);
+	if (!semantic_activation_ack_complete_image_current(
+			&table, current_members_lo, current_members_hi, current_epoch,
+			current_coordinator_node, cluster_node_id, local_capability_word))
+		return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_IMAGE_NOT_CURRENT;
+	return CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
+}
+
+bool
+cluster_semantic_activation_resource_x_peer_open_matches(
+	const ClusterSemanticAdmissionToken *token,
+	int32 authenticated_peer_node_id,
+	uint32 sampled_capability_generation)
+{
+	return cluster_semantic_activation_resource_x_peer_open_check(
+		token, authenticated_peer_node_id,
+		sampled_capability_generation)
+		== CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
 }
 
 void

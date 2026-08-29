@@ -53,7 +53,23 @@ typedef struct ClusterTxResolution ClusterTxResolution;
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
 typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
+typedef struct ClusterUndoBlock0LogicalKey ClusterUndoBlock0LogicalKey;
 typedef struct ClusterUndoBlock0ResolvedRoot ClusterUndoBlock0ResolvedRoot;
+
+/* Stack/process-local continuation for the exact origin DATA -> canonical TT
+ * -> DATA proof.  The representation is private to the provider; it is not a
+ * wire or shared-memory ABI and never grants authority by itself. */
+#define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES 8704
+typedef union ClusterRuntimeVisibilityOriginPlan {
+	uint64 align;
+	uint8 opaque[CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES];
+} ClusterRuntimeVisibilityOriginPlan;
+
+typedef enum ClusterRuntimeVisibilityOriginStep {
+	CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED = 0,
+	CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE,
+	CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
+} ClusterRuntimeVisibilityOriginStep;
 
 extern void cluster_runtime_visibility_ensure_exit_hooks(void);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin(
@@ -67,6 +83,31 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_held(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission,
 	const ClusterUndoBlock0Generation *expected_generation,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out);
+extern ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_data_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out);
+extern bool cluster_runtime_visibility_origin_plan_canonical_logical(
+	const ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterUndoBlock0LogicalKey *logical_out);
+extern bool cluster_runtime_visibility_origin_plan_sample_canonical_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_recheck_data_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);

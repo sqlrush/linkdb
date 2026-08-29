@@ -63,7 +63,8 @@ cluster_itl_cleanout_can_stamp(const ClusterItlSlotData *slot, TransactionId exp
 {
 	if (slot == NULL)
 		return false;
-	if (slot->flags != ITL_FLAG_ACTIVE)
+	if (slot->flags != ITL_FLAG_ACTIVE
+		&& slot->flags != ITL_FLAG_NEEDS_CLEANOUT)
 		return false;
 	if (slot->xid != expected_xid)
 		return false;
@@ -72,9 +73,14 @@ cluster_itl_cleanout_can_stamp(const ClusterItlSlotData *slot, TransactionId exp
 	 * stamped this slot already).  expected_commit_scn must itself be valid;
 	 * a caller passing InvalidScn is a logic bug.
 	 */
-	if (SCN_VALID(slot->commit_scn))
-		return false;
 	if (!SCN_VALID(expected_commit_scn))
+		return false;
+	if (slot->flags == ITL_FLAG_ACTIVE)
+	{
+		if (SCN_VALID(slot->commit_scn))
+			return false;
+	}
+	else if (slot->commit_scn != expected_commit_scn)
 		return false;
 	return true;
 }

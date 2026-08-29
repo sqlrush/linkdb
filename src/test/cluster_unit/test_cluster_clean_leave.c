@@ -842,6 +842,27 @@ UT_TEST(test_phase1_full_stop_exact_ack_barrier)
 		&plan, 0, ack_bitmap, sizeof(ack_bitmap)));
 }
 
+UT_TEST(test_phase1_full_stop_barrier_waits_for_local_positive_ack_fanout)
+{
+	char *clean_leave = read_source_path(CLEAN_LEAVE_SOURCE_PATH);
+	const char *barrier;
+	const char *barrier_end;
+
+	UT_ASSERT_NOT_NULL(clean_leave);
+	if (clean_leave == NULL)
+		return;
+	barrier = strstr(clean_leave,
+		"\ncl_phase1_full_stop_post_stopped_barrier(");
+	UT_ASSERT_NOT_NULL(barrier);
+	barrier_end = barrier == NULL ? NULL : strstr(barrier,
+		"\n}\n\nstatic bool\ncl_phase1_full_stop_release_completion(");
+	UT_ASSERT_NOT_NULL(barrier_end);
+	if (barrier != NULL && barrier_end != NULL)
+		UT_ASSERT_NOT_NULL(find_in_order(barrier, barrier_end,
+			"phase1_post_stopped_reply_sent"));
+	free(clean_leave);
+}
+
 UT_TEST(test_phase1_full_stop_post_stopped_nonce_is_fresh)
 {
 	UT_ASSERT(cluster_clean_leave_phase1_full_stop_nonce_fresh(61, 62));
@@ -1315,7 +1336,7 @@ UT_TEST(test_ic_payload_validation)
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(28);
 	UT_RUN(test_struct_layout);
 	UT_RUN(test_phase_fsm);
 	UT_RUN(test_version_coherent);
@@ -1336,6 +1357,7 @@ main(void)
 	UT_RUN(test_phase1_full_stop_exact_receipt_may_precede_local_reply_publication);
 	UT_RUN(test_phase1_full_stop_release_completion_requires_four_way_delivery);
 	UT_RUN(test_phase1_full_stop_exact_ack_barrier);
+	UT_RUN(test_phase1_full_stop_barrier_waits_for_local_positive_ack_fanout);
 	UT_RUN(test_phase1_full_stop_post_stopped_nonce_is_fresh);
 	UT_RUN(test_phase1_full_stop_two_round_nonce_lineage_is_closed);
 	UT_RUN(test_phase1_full_stop_prepare_disposition_is_closed);

@@ -2227,8 +2227,8 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 							ereport(ERROR,
 									(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 									 errmsg("cluster TT status unknown for deleting xmax of xid %u",
-											raw_xmin),
-									 errhint("Remote deleter commit state not yet propagated; "
+											HeapTupleHeaderGetRawXmax(tuple)),
+									 errhint("Exact deleter authority is not currently provable; "
 											 "retry or abort.")));
 						}
 						return true; /* unreachable */
@@ -2612,7 +2612,7 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
 							errmsg("cluster TT status unknown for deleting xmax of xid %u",
 								   HeapTupleHeaderGetRawXmax(tuple)),
-							errhint("Remote deleter commit state not yet propagated; "
+							errhint("Exact deleter authority is not currently provable; "
 									"retry or abort.")));
 		}
 	}

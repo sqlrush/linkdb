@@ -214,7 +214,8 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 {
 	test_provider_calls++;
 	test_admitted_provider_calls++;
-	UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS);
+	UT_ASSERT(mode == CLUSTER_TX_RESOLVE_VISIBILITY
+			  || mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS);
 	if (test_provider_raise)
 		siglongjmp(*PG_exception_stack, 1);
 	test_provider_locator = *locator;
@@ -350,6 +351,23 @@ prepare_epoch_zero_terminal_fixture(ClusterSemanticAdmissionToken *admission)
 	test_formation_epoch = 0;
 	test_provider_resolution.authority.origin_epoch = 0;
 	*admission = epoch_zero_terminal_admission();
+}
+
+static ClusterTxLocator
+prepare_epoch_zero_partial_visibility_fixture(void)
+{
+	ClusterTxLocator locator = exact_locator();
+
+	reset_exact_resolver_fixture();
+	test_formation_epoch = 0;
+	test_node_count = 4;
+	locator.tt_wrap = TT_WRAP_INVALID;
+	locator.uba.raw[0] = (locator.uba.raw[0] & UINT64_C(0xffffffff00000000))
+						 | UINT64_C(257);
+	test_provider_resolution.locator_echo = locator;
+	test_provider_resolution.locator_echo.tt_wrap = 7;
+	test_provider_resolution.authority.origin_epoch = 0;
+	return locator;
 }
 
 static void
@@ -708,6 +726,64 @@ UT_TEST(test_partial_terminal_census_accepts_one_canonical_provider_echo)
 	UT_ASSERT_EQ(test_terminal_census_recheck_calls, 1);
 }
 
+UT_TEST(test_partial_visibility_uses_exact_admitted_provider_and_canonical_echo)
+{
+	ClusterTxLocator locator = exact_locator();
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_resolver_fixture();
+	locator.tt_wrap = TT_WRAP_INVALID;
+	memset(&resolution, 0xA5, sizeof(resolution));
+	UT_ASSERT_EQ(cluster_tx_resolve_exact(
+		&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+		CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(test_enter_calls, 1);
+	UT_ASSERT_EQ(test_terminal_census_enter_calls, 0);
+	UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+	UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+	UT_ASSERT_EQ(test_provider_locator.tt_wrap, TT_WRAP_INVALID);
+	UT_ASSERT_EQ(test_provider_mode, CLUSTER_TX_RESOLVE_VISIBILITY);
+	UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, 7);
+	UT_ASSERT_EQ(test_recheck_calls, 1);
+	UT_ASSERT_EQ(test_leave_calls, 1);
+}
+
+UT_TEST(test_partial_visibility_publishes_exact_in_progress_but_terminal_census_does_not)
+{
+	ClusterTxLocator locator = exact_locator();
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_exact_resolver_fixture();
+	locator.tt_wrap = TT_WRAP_INVALID;
+	test_provider_outcome = CLUSTER_TX_IN_PROGRESS;
+	test_provider_resolution.outcome = CLUSTER_TX_IN_PROGRESS;
+	test_provider_resolution.proof_kind
+		= CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	test_provider_resolution.commit_scn = InvalidScn;
+	UT_ASSERT_EQ(cluster_tx_resolve_exact(
+		&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+		CLUSTER_TX_IN_PROGRESS);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+
+	reset_exact_resolver_fixture();
+	locator.tt_wrap = TT_WRAP_INVALID;
+	test_provider_outcome = CLUSTER_TX_IN_PROGRESS;
+	test_provider_resolution.outcome = CLUSTER_TX_IN_PROGRESS;
+	test_provider_resolution.proof_kind
+		= CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	test_provider_resolution.commit_scn = InvalidScn;
+	memset(&resolution, 0xA5, sizeof(resolution));
+	UT_ASSERT_EQ(cluster_tx_resolve_exact(
+		&locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+		&resolution, &reason), CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_PROTOCOL);
+	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+}
+
 UT_TEST(test_epoch_zero_terminal_census_local_single_node_publishes_exact_terminal)
 {
 	ClusterTxLocator locator = exact_locator();
@@ -754,6 +830,67 @@ UT_TEST(test_epoch_zero_terminal_census_homogeneous_four_node_foreign_publishes_
 	UT_ASSERT_EQ(test_terminal_census_recheck_calls, 2);
 	UT_ASSERT_EQ(test_provider_epoch, 0);
 	UT_ASSERT_EQ(resolution.authority.origin_epoch, 0);
+}
+
+/* Freshref §3.1: only the partial-wrap VISIBILITY/status-22 fallback may use
+ * the exact current four-node epoch-zero admission.  It retains regular R4
+ * admission/recheck semantics and does not borrow terminal-census authority. */
+UT_TEST(test_epoch_zero_partial_visibility_homogeneous_four_node_uses_exact_status22_path)
+{
+	ClusterTxLocator locator = prepare_epoch_zero_partial_visibility_fixture();
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	memset(&resolution, 0xA5, sizeof(resolution));
+	UT_ASSERT_EQ(cluster_tx_resolve_exact(
+		&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+		CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(test_enter_calls, 1);
+	UT_ASSERT_EQ(test_terminal_census_enter_calls, 0);
+	UT_ASSERT_EQ(test_provider_calls, 1);
+	UT_ASSERT_EQ(test_admitted_provider_calls, 1);
+	UT_ASSERT_EQ(test_legacy_provider_calls, 0);
+	UT_ASSERT_EQ(test_recheck_calls, 2);
+	UT_ASSERT_EQ(test_terminal_census_recheck_calls, 0);
+	UT_ASSERT_EQ(test_provider_mode, CLUSTER_TX_RESOLVE_VISIBILITY);
+	UT_ASSERT_EQ(test_provider_epoch, 0);
+	UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, 7);
+	UT_ASSERT_EQ(resolution.authority.origin_epoch, 0);
+}
+
+UT_TEST(test_epoch_zero_complete_visibility_remains_fail_closed)
+{
+	ClusterTxLocator locator = prepare_epoch_zero_partial_visibility_fixture();
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+	locator.tt_wrap = 7;
+	test_provider_resolution.locator_echo = locator;
+	memset(&resolution, 0xA5, sizeof(resolution));
+	UT_ASSERT_EQ(cluster_tx_resolve_exact(
+		&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+		CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+	UT_ASSERT_EQ(test_provider_calls, 0);
+	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
+}
+
+UT_TEST(test_epoch_zero_partial_visibility_generation_drift_refuses_before_provider)
+{
+	ClusterTxLocator locator = prepare_epoch_zero_partial_visibility_fixture();
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+
+	test_recheck_result = false;
+	memset(&resolution, 0xA5, sizeof(resolution));
+	UT_ASSERT_EQ(cluster_tx_resolve_exact(
+		&locator, CLUSTER_TX_RESOLVE_VISIBILITY, &resolution, &reason),
+		CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_RF_DEFERRED);
+	UT_ASSERT_EQ(test_provider_calls, 0);
+	UT_ASSERT_EQ(test_recheck_calls, 1);
+	UT_ASSERT(bytes_are_zero(&resolution, sizeof(resolution)));
 }
 
 UT_TEST(test_epoch_zero_terminal_census_peer_topology_refuses_before_provider)
@@ -1222,7 +1359,7 @@ UT_TEST(test_terminal_census_batch_preflight_delegates_exit_hook_ensure)
 int
 main(void)
 {
-	UT_PLAN(56);
+	UT_PLAN(61);
 	UT_RUN(test_frozen_identity_layout);
 	UT_RUN(test_frozen_closed_domains);
 	UT_RUN(test_reason_names_are_stable);
@@ -1236,8 +1373,13 @@ main(void)
 	UT_RUN(test_exact_terminal_census_rejects_prepared_provider_outcome);
 	UT_RUN(test_exact_terminal_census_admitted_uses_caller_token_without_reentry);
 	UT_RUN(test_partial_terminal_census_accepts_one_canonical_provider_echo);
+	UT_RUN(test_partial_visibility_uses_exact_admitted_provider_and_canonical_echo);
+	UT_RUN(test_partial_visibility_publishes_exact_in_progress_but_terminal_census_does_not);
 	UT_RUN(test_epoch_zero_terminal_census_local_single_node_publishes_exact_terminal);
 	UT_RUN(test_epoch_zero_terminal_census_homogeneous_four_node_foreign_publishes_exact_terminal);
+	UT_RUN(test_epoch_zero_partial_visibility_homogeneous_four_node_uses_exact_status22_path);
+	UT_RUN(test_epoch_zero_complete_visibility_remains_fail_closed);
+	UT_RUN(test_epoch_zero_partial_visibility_generation_drift_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_peer_topology_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_unknown_topology_refuses_before_provider);
 	UT_RUN(test_epoch_zero_terminal_census_foreign_locator_refuses_before_provider);

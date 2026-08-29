@@ -564,7 +564,7 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 		/* The refusal arm sits between target acquire and the ERROR report,
 		 * and only the barrier-aware entry can consume it. */
 		static const char *const refusal_order[]
-			= { "cluster_gcs_resource_x_target_acquire_exact(",
+			= { "cluster_gcs_resource_x_target_acquire_until_exact(",
 				"cluster_pcm_lock_resource_x_gate_snapshot(&gate)",
 				"gate.phase != RESOURCE_X_GATE_OPEN",
 				"*pcm_barrier_refused = true",

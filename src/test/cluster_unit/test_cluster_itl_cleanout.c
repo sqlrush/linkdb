@@ -217,6 +217,18 @@ UT_TEST(t10_can_stamp_happy_path_true)
 	UT_ASSERT_EQ((int)cluster_itl_cleanout_can_stamp(&s, 1234, 5678), 1);
 }
 
+UT_TEST(t10a_exact_precommit_evidence_can_be_cleaned_out)
+{
+	ClusterItlSlotData s = make_slot(ITL_FLAG_NEEDS_CLEANOUT, 1234, 5678);
+	UT_ASSERT_EQ((int)cluster_itl_cleanout_can_stamp(&s, 1234, 5678), 1);
+}
+
+UT_TEST(t10b_precommit_evidence_scn_mismatch_is_rejected)
+{
+	ClusterItlSlotData s = make_slot(ITL_FLAG_NEEDS_CLEANOUT, 1234, 5678);
+	UT_ASSERT_EQ((int)cluster_itl_cleanout_can_stamp(&s, 1234, 6789), 0);
+}
+
 
 /* ===== T11-T14: lazy() outer-guard short-circuits (reach via Invalid* args) ===== */
 
@@ -293,7 +305,7 @@ UT_TEST(t20_slot_field_offsets_stable)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(22);
 	UT_RUN(t1_lazy_symbol_linkable);
 	UT_RUN(t2_can_stamp_symbol_linkable);
 	UT_RUN(t3_can_stamp_null_slot_false);
@@ -304,6 +316,8 @@ main(void)
 	UT_RUN(t8_can_stamp_slot_commit_scn_already_set_false);
 	UT_RUN(t9_can_stamp_invalid_expected_scn_false);
 	UT_RUN(t10_can_stamp_happy_path_true);
+	UT_RUN(t10a_exact_precommit_evidence_can_be_cleaned_out);
+	UT_RUN(t10b_precommit_evidence_scn_mismatch_is_rejected);
 	UT_RUN(t11_lazy_invalid_buffer_false);
 	UT_RUN(t12_lazy_slot_idx_out_of_bound_false);
 	UT_RUN(t13_lazy_invalid_xid_false);

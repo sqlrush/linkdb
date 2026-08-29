@@ -368,6 +368,442 @@ cluster_runtime_visibility_candidate_decide(
 	return CLUSTER_TX_UNKNOWN;
 }
 
+static bool
+cluster_runtime_visibility_admission_current(
+	ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	if (mode == CLUSTER_TX_RESOLVE_VISIBILITY)
+		return cluster_semantic_activation_recheck(admission);
+	if (mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
+		return cluster_semantic_activation_recheck_r4_terminal_census(admission);
+	return false;
+}
+
+static bool
+cluster_runtime_visibility_resolve_root_admitted(
+	ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoPathIntent intent,
+	uint32 owner_instance, uint32 segment_id,
+	ClusterUndoBlock0ResolvedRoot *out)
+{
+	if (mode == CLUSTER_TX_RESOLVE_VISIBILITY)
+		return cluster_semantic_activation_resolve_shared_undo_root(
+			admission, intent, owner_instance, segment_id, out);
+	if (mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
+		return cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+			admission, intent, owner_instance, segment_id, out);
+	return false;
+}
+
+#define CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC UINT32_C(0x52564f50)
+
+typedef struct ClusterRuntimeVisibilityOriginPlanData {
+	uint32 magic;
+	bool valid;
+	bool candidate_valid;
+	ClusterTxResolveMode mode;
+	ClusterTxLocator locator;
+	ClusterTxLocator canonical_locator;
+	ClusterUndoBlock0LogicalKey data_logical;
+	ClusterUndoBlock0LogicalKey tt_logical;
+	ClusterUndoBlock0ResolvedRoot data_root;
+	ClusterUndoBlock0Generation data_generation;
+	uint32 data_block_no;
+	uint16 tt_slot_offset;
+	size_t record_length;
+	ClusterTxResolution candidate;
+	PGAlignedBlock record_buf;
+} ClusterRuntimeVisibilityOriginPlanData;
+
+StaticAssertDecl(sizeof(ClusterRuntimeVisibilityOriginPlanData)
+				 <= CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_BYTES,
+				 "exact origin continuation must fit its process-local envelope");
+
+static ClusterRuntimeVisibilityOriginPlanData *
+cluster_runtime_visibility_origin_plan_data(
+	ClusterRuntimeVisibilityOriginPlan *plan)
+{
+	return plan == NULL
+		? NULL : (ClusterRuntimeVisibilityOriginPlanData *)plan->opaque;
+}
+
+static const ClusterRuntimeVisibilityOriginPlanData *
+cluster_runtime_visibility_origin_plan_data_const(
+	const ClusterRuntimeVisibilityOriginPlan *plan)
+{
+	return plan == NULL
+		? NULL : (const ClusterRuntimeVisibilityOriginPlanData *)plan->opaque;
+}
+
+static void
+cluster_runtime_visibility_origin_candidate_stamp(
+	ClusterTxResolution *candidate,
+	const ClusterSemanticAdmissionToken *admission)
+{
+	candidate->authority.origin_epoch = cluster_epoch_get_current();
+	candidate->authority.live_hwm_lsn = GetFlushRecPtr(NULL);
+	candidate->authority.tt_generation
+		= cluster_undo_tt_retention_rollover_count();
+	candidate->authority.authority_scn = cluster_scn_current();
+	(void)admission;
+}
+
+ClusterRuntimeVisibilityOriginStep
+cluster_runtime_visibility_origin_plan_freeze_data_held(
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	const ClusterUndoBlock0Generation *expected_generation,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterRuntimeVisibilityOriginPlanData *plan_data;
+	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0Generation generation;
+	ClusterUndoBlock0Generation final_generation;
+	ClusterTxLocator canonical_locator;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	ClusterTxOutcome outcome;
+	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	ClusterUndoBlock0Result current_result;
+	PGAlignedBlock block0;
+	PGAlignedBlock data_page;
+	PGAlignedBlock record_buf;
+	const UndoSegmentHeaderData *header;
+	const UndoRecordHeader *record;
+	TTSlot exact_slot;
+	TransactionId top_xid = InvalidTransactionId;
+	SCN commit_scn = InvalidScn;
+	NodeId origin;
+	uint32 segment_id;
+	uint32 block_no;
+	uint16 tt_slot_offset;
+	uint16 row_offset;
+	size_t record_length = 0;
+	uint32 tt_segment_id;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (plan != NULL)
+		memset(plan, 0, sizeof(*plan));
+	if (reason_out != NULL)
+		*reason_out = reason;
+	memset(&final_root, 0, sizeof(final_root));
+	memset(&generation, 0, sizeof(generation));
+	memset(&final_generation, 0, sizeof(final_generation));
+	memset(&canonical_locator, 0, sizeof(canonical_locator));
+
+	if (locator == NULL || out == NULL || admission == NULL || guard == NULL
+		|| root == NULL || plan == NULL
+		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY
+			&& mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)) {
+		reason = locator == NULL ? CLUSTER_TX_RESOLVE_BAD_LOCATOR
+								 : CLUSTER_TX_RESOLVE_PROTOCOL;
+		goto failed;
+	}
+	if (!cluster_runtime_visibility_admission_current(mode, admission)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto failed;
+	}
+	if (!uba_decode(locator->uba, &segment_id, &block_no, &tt_slot_offset,
+					&row_offset) || block_no == 0) {
+		reason = CLUSTER_TX_RESOLVE_BAD_UBA;
+		goto failed;
+	}
+	origin = uba_origin_node_id(locator->uba);
+	if (origin == InvalidNodeId) {
+		reason = CLUSTER_TX_RESOLVE_BAD_UBA;
+		goto failed;
+	}
+	if (cluster_node_id < 0 || origin != (NodeId)cluster_node_id)
+		goto failed;
+
+	plan_data = cluster_runtime_visibility_origin_plan_data(plan);
+	plan_data->data_logical.owner_instance
+		= (uint8)((uint32)origin + 1);
+	plan_data->data_logical.segment_id = segment_id;
+	current_result = cluster_undo_block0_current_sample_generation(
+		guard, root, &generation);
+	if (current_result != CLUSTER_UNDO_BLOCK0_OK
+		|| !generation.known || generation.value == UINT32_MAX)
+		goto failed;
+	if (expected_generation != NULL
+		&& (!expected_generation->known
+			|| expected_generation->value == UINT32_MAX
+			|| expected_generation->value != generation.value))
+		goto failed;
+	if (cluster_undo_block0_current_copy_resident(
+			guard, root, &generation, block0.data)
+		!= CLUSTER_UNDO_BLOCK0_OK
+		|| !cluster_undo_buf_copy_resident(
+			segment_id, plan_data->data_logical.owner_instance, block_no,
+			data_page.data)
+		|| !cluster_cr_r4_extract_resident_record(
+			data_page.data, locator, record_buf.data, &record_length,
+			&canonical_locator)
+		|| record_length < sizeof(UndoRecordHeader))
+		goto failed;
+
+	record = (const UndoRecordHeader *)record_buf.data;
+	tt_segment_id = record->tt_slot_segment_id;
+	if (tt_segment_id == 0 || tt_segment_id > UINT16_MAX
+		|| ((tt_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1
+			   != plan_data->data_logical.owner_instance
+		|| tt_slot_offset >= TT_SLOTS_PER_SEGMENT)
+		goto failed;
+
+	plan_data->magic = CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC;
+	plan_data->valid = true;
+	plan_data->mode = mode;
+	plan_data->locator = *locator;
+	plan_data->canonical_locator = canonical_locator;
+	plan_data->data_root = *root;
+	plan_data->data_generation = generation;
+	plan_data->data_block_no = block_no;
+	plan_data->tt_slot_offset = tt_slot_offset;
+	plan_data->record_length = record_length;
+	memcpy(plan_data->record_buf.data, record_buf.data, record_length);
+	plan_data->tt_logical.owner_instance
+		= plan_data->data_logical.owner_instance;
+	plan_data->tt_logical.segment_id = tt_segment_id;
+	if (tt_segment_id != segment_id) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_NONE;
+		return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL;
+	}
+
+	header = (const UndoSegmentHeaderData *)block0.data;
+	exact_slot = header->tt_slots[tt_slot_offset];
+	outcome = cluster_runtime_visibility_candidate_decide(
+		&canonical_locator, &exact_slot, &top_xid, &proof_kind,
+		&commit_scn, &reason);
+	if (outcome == CLUSTER_TX_UNKNOWN)
+		goto failed;
+	plan_data->candidate.locator_echo = canonical_locator;
+	plan_data->candidate.top_xid = top_xid;
+	plan_data->candidate.outcome = outcome;
+	plan_data->candidate.proof_kind = proof_kind;
+	plan_data->candidate.commit_scn = commit_scn;
+	cluster_runtime_visibility_origin_candidate_stamp(
+		&plan_data->candidate, admission);
+	if (plan_data->candidate.authority.origin_epoch
+			!= admission->formation_epoch
+		|| XLogRecPtrIsInvalid(
+			plan_data->candidate.authority.live_hwm_lsn)
+		|| !SCN_VALID(plan_data->candidate.authority.authority_scn)
+		|| cluster_undo_block0_current_sample_generation(
+			guard, root, &final_generation) != CLUSTER_UNDO_BLOCK0_OK
+		|| !final_generation.known
+		|| final_generation.value != generation.value
+		|| !cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+			plan_data->data_logical.owner_instance,
+			plan_data->data_logical.segment_id, &final_root)
+		|| !cluster_runtime_visibility_candidate_root_matches(root, &final_root)
+		|| !cluster_runtime_visibility_admission_current(mode, admission)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto failed;
+	}
+	*out = plan_data->candidate;
+	plan_data->candidate_valid = true;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE;
+
+failed:
+	if (plan != NULL)
+		memset(plan, 0, sizeof(*plan));
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_canonical_logical(
+	const ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterUndoBlock0LogicalKey *logical_out)
+{
+	const ClusterRuntimeVisibilityOriginPlanData *plan_data
+		= cluster_runtime_visibility_origin_plan_data_const(plan);
+
+	if (plan_data == NULL || logical_out == NULL
+		|| plan_data->magic != CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC
+		|| !plan_data->valid || plan_data->candidate_valid
+		|| plan_data->tt_logical.segment_id
+			   == plan_data->data_logical.segment_id)
+		return false;
+	*logical_out = plan_data->tt_logical;
+	return true;
+}
+
+bool
+cluster_runtime_visibility_origin_plan_sample_canonical_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterRuntimeVisibilityOriginPlanData *plan_data
+		= cluster_runtime_visibility_origin_plan_data(plan);
+	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0Generation generation;
+	ClusterUndoBlock0Generation final_generation;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	ClusterTxOutcome outcome;
+	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	PGAlignedBlock block0;
+	const UndoSegmentHeaderData *header;
+	TTSlot exact_slot;
+	TransactionId top_xid = InvalidTransactionId;
+	SCN commit_scn = InvalidScn;
+
+	if (reason_out != NULL)
+		*reason_out = reason;
+	memset(&final_root, 0, sizeof(final_root));
+	memset(&generation, 0, sizeof(generation));
+	memset(&final_generation, 0, sizeof(final_generation));
+	if (plan_data == NULL || admission == NULL || guard == NULL || root == NULL
+		|| plan_data->magic != CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC
+		|| !plan_data->valid || plan_data->candidate_valid
+		|| plan_data->mode != mode
+		|| plan_data->tt_logical.segment_id
+			   == plan_data->data_logical.segment_id
+		|| !cluster_runtime_visibility_admission_current(mode, admission)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto failed;
+	}
+	if (cluster_undo_block0_current_sample_generation(
+			guard, root, &generation) != CLUSTER_UNDO_BLOCK0_OK
+		|| !generation.known || generation.value == UINT32_MAX
+		|| cluster_undo_block0_current_copy_resident(
+			guard, root, &generation, block0.data) != CLUSTER_UNDO_BLOCK0_OK)
+		goto failed;
+	header = (const UndoSegmentHeaderData *)block0.data;
+	exact_slot = header->tt_slots[plan_data->tt_slot_offset];
+	outcome = cluster_runtime_visibility_candidate_decide(
+		&plan_data->canonical_locator, &exact_slot, &top_xid, &proof_kind,
+		&commit_scn, &reason);
+	if (outcome == CLUSTER_TX_UNKNOWN)
+		goto failed;
+	memset(&plan_data->candidate, 0, sizeof(plan_data->candidate));
+	plan_data->candidate.locator_echo = plan_data->canonical_locator;
+	plan_data->candidate.top_xid = top_xid;
+	plan_data->candidate.outcome = outcome;
+	plan_data->candidate.proof_kind = proof_kind;
+	plan_data->candidate.commit_scn = commit_scn;
+	cluster_runtime_visibility_origin_candidate_stamp(
+		&plan_data->candidate, admission);
+	if (plan_data->candidate.authority.origin_epoch
+			!= admission->formation_epoch
+		|| XLogRecPtrIsInvalid(
+			plan_data->candidate.authority.live_hwm_lsn)
+		|| !SCN_VALID(plan_data->candidate.authority.authority_scn)
+		|| cluster_undo_block0_current_sample_generation(
+			guard, root, &final_generation) != CLUSTER_UNDO_BLOCK0_OK
+		|| !final_generation.known
+		|| final_generation.value != generation.value
+		|| !cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+			plan_data->tt_logical.owner_instance,
+			plan_data->tt_logical.segment_id, &final_root)
+		|| !cluster_runtime_visibility_candidate_root_matches(root, &final_root)
+		|| !cluster_runtime_visibility_admission_current(mode, admission)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto failed;
+	}
+	plan_data->candidate_valid = true;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return true;
+
+failed:
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return false;
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_origin_plan_recheck_data_held(
+	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out)
+{
+	ClusterRuntimeVisibilityOriginPlanData *plan_data
+		= cluster_runtime_visibility_origin_plan_data(plan);
+	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0Generation generation;
+	ClusterUndoBlock0Generation final_generation;
+	ClusterTxLocator rechecked_locator;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	PGAlignedBlock data_page;
+	PGAlignedBlock record_buf;
+	size_t record_length = 0;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (reason_out != NULL)
+		*reason_out = reason;
+	memset(&final_root, 0, sizeof(final_root));
+	memset(&generation, 0, sizeof(generation));
+	memset(&final_generation, 0, sizeof(final_generation));
+	memset(&rechecked_locator, 0, sizeof(rechecked_locator));
+	if (plan_data == NULL || admission == NULL || guard == NULL || root == NULL
+		|| out == NULL
+		|| plan_data->magic != CLUSTER_RUNTIME_VISIBILITY_ORIGIN_PLAN_MAGIC
+		|| !plan_data->valid || !plan_data->candidate_valid
+		|| plan_data->mode != mode
+		|| !cluster_runtime_visibility_candidate_root_matches(
+			&plan_data->data_root, root)
+		|| !cluster_runtime_visibility_admission_current(mode, admission)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto failed;
+	}
+	if (cluster_undo_block0_current_sample_generation(
+			guard, root, &generation) != CLUSTER_UNDO_BLOCK0_OK
+		|| !generation.known
+		|| generation.value != plan_data->data_generation.value
+		|| !cluster_undo_buf_copy_resident(
+			plan_data->data_logical.segment_id,
+			plan_data->data_logical.owner_instance,
+			plan_data->data_block_no, data_page.data)
+		|| !cluster_cr_r4_extract_resident_record(
+			data_page.data, &plan_data->locator, record_buf.data,
+			&record_length, &rechecked_locator)
+		|| record_length != plan_data->record_length
+		|| memcmp(record_buf.data, plan_data->record_buf.data,
+				  record_length) != 0
+		|| memcmp(&rechecked_locator, &plan_data->canonical_locator,
+				  sizeof(rechecked_locator)) != 0
+		|| cluster_undo_block0_current_sample_generation(
+			guard, root, &final_generation) != CLUSTER_UNDO_BLOCK0_OK
+		|| !final_generation.known
+		|| final_generation.value != plan_data->data_generation.value
+		|| !cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+			plan_data->data_logical.owner_instance,
+			plan_data->data_logical.segment_id, &final_root)
+		|| !cluster_runtime_visibility_candidate_root_matches(root, &final_root)
+		|| !cluster_runtime_visibility_admission_current(mode, admission)) {
+		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+		goto failed;
+	}
+	*out = plan_data->candidate;
+	plan_data->valid = false;
+	if (reason_out != NULL)
+		*reason_out = CLUSTER_TX_RESOLVE_NONE;
+	return out->outcome;
+
+failed:
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return CLUSTER_TX_UNKNOWN;
+}
+
 ClusterTxOutcome
 cluster_runtime_visibility_resolve_exact_origin_held(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
@@ -381,63 +817,37 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 	ClusterUndoBlock0LogicalKey tt_logical;
 	ClusterUndoBlock0ResolvedRoot final_root;
 	ClusterUndoBlock0ResolvedRoot tt_root;
-	ClusterUndoBlock0ResolvedRoot tt_final_root;
-	ClusterUndoBlock0Generation generation;
-	ClusterUndoBlock0Generation final_generation;
-	ClusterUndoBlock0Generation tt_generation;
-	ClusterUndoBlock0Generation tt_final_generation;
 	ClusterRuntimeCandidateCleanup phase_cleanup;
-	ClusterTxResolution candidate;
-	ClusterTxLocator canonical_locator;
-	ClusterTxLocator rechecked_locator;
+	ClusterRuntimeVisibilityOriginPlan plan;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
-	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
+	ClusterRuntimeVisibilityOriginStep origin_step;
 	ClusterUndoBlock0Result current_result;
-	PGAlignedBlock block0;
-	PGAlignedBlock data_page;
-	PGAlignedBlock record_buf;
-	PGAlignedBlock rechecked_data_page;
-	PGAlignedBlock rechecked_record_buf;
-	const UndoSegmentHeaderData *header;
-	const UndoRecordHeader *record;
-	TTSlot exact_slot;
-	TransactionId top_xid = InvalidTransactionId;
-	SCN commit_scn = InvalidScn;
 	NodeId origin;
 	uint32 segment_id;
 	uint32 block_no;
 	uint16 tt_slot_offset;
 	uint16 row_offset;
-	size_t record_length = 0;
-	size_t rechecked_record_length = 0;
-	uint32 tt_segment_id;
-	bool cross_segment = false;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (reason_out != NULL)
 		*reason_out = reason;
-	memset(&candidate, 0, sizeof(candidate));
 	memset(&final_root, 0, sizeof(final_root));
 	memset(&tt_root, 0, sizeof(tt_root));
-	memset(&tt_final_root, 0, sizeof(tt_final_root));
-	memset(&generation, 0, sizeof(generation));
-	memset(&final_generation, 0, sizeof(final_generation));
-	memset(&tt_generation, 0, sizeof(tt_generation));
-	memset(&tt_final_generation, 0, sizeof(tt_final_generation));
-	memset(&rechecked_locator, 0, sizeof(rechecked_locator));
+	memset(&plan, 0, sizeof(plan));
 	phase_cleanup.guard = guard;
 	phase_cleanup.active = false;
 
 	if (locator == NULL || out == NULL || admission == NULL || guard == NULL
 		|| root == NULL
-		|| mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS) {
+		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY
+			&& mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)) {
 		reason = locator == NULL ? CLUSTER_TX_RESOLVE_BAD_LOCATOR
 								 : CLUSTER_TX_RESOLVE_PROTOCOL;
 		goto done;
 	}
-	if (!cluster_semantic_activation_recheck_r4_terminal_census(admission)) {
+	if (!cluster_runtime_visibility_admission_current(mode, admission)) {
 		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
 		goto done;
 	}
@@ -457,177 +867,57 @@ cluster_runtime_visibility_resolve_exact_origin_held(
 	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);
 	logical.segment_id = segment_id;
-	current_result = cluster_undo_block0_current_sample_generation(
-		guard, root, &generation);
-	if (current_result != CLUSTER_UNDO_BLOCK0_OK
-		|| !generation.known || generation.value == UINT32_MAX)
-		goto done;
-	if (expected_generation != NULL
-		&& (!expected_generation->known
-			|| expected_generation->value == UINT32_MAX
-			|| expected_generation->value != generation.value))
-		goto done;
-	current_result = cluster_undo_block0_current_copy_resident(
-		guard, root, &generation, block0.data);
-	if (current_result != CLUSTER_UNDO_BLOCK0_OK)
-		goto done;
-	if (!cluster_undo_buf_copy_resident(
-			segment_id, logical.owner_instance, block_no, data_page.data))
-		goto done;
-	if (!cluster_cr_r4_extract_resident_record(
-			data_page.data, locator, record_buf.data, &record_length,
-			&canonical_locator))
-		goto done;
-	if (record_length < sizeof(UndoRecordHeader))
-		goto done;
-
-	record = (const UndoRecordHeader *)record_buf.data;
-	tt_segment_id = record->tt_slot_segment_id;
-	if (tt_segment_id == 0 || tt_segment_id > UINT16_MAX
-		|| ((tt_segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1
-			   != logical.owner_instance
-		|| tt_slot_offset >= TT_SLOTS_PER_SEGMENT)
-		goto done;
-	cross_segment = tt_segment_id != segment_id;
-	if (cross_segment) {
-		/* The physical DATA alias and canonical TT resource are sampled by
-		 * the sole resolver in sequence.  Releasing DATA before acquiring TT
-		 * preserves the one-0xFB-SCUR invariant. */
-		if (cluster_runtime_visibility_candidate_release(
-				guard, &current_result)
-			!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
-			goto done;
-		memset(guard, 0, sizeof(*guard));
-		tt_logical.owner_instance = logical.owner_instance;
-		tt_logical.segment_id = tt_segment_id;
-		if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				tt_logical.owner_instance, tt_logical.segment_id, &tt_root)
-			|| !cluster_semantic_activation_recheck_r4_terminal_census(
-				admission)
-			|| cluster_runtime_visibility_candidate_acquire(
-				&tt_logical, admission, guard, &phase_cleanup,
-				&current_result) != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-			goto done;
-		if (cluster_undo_block0_current_sample_generation(
-				guard, &tt_root, &tt_generation) != CLUSTER_UNDO_BLOCK0_OK
-			|| !tt_generation.known
-			|| tt_generation.value == UINT32_MAX
-			|| cluster_undo_block0_current_copy_resident(
-				guard, &tt_root, &tt_generation, block0.data)
-				   != CLUSTER_UNDO_BLOCK0_OK)
-			goto done;
-		header = (const UndoSegmentHeaderData *)block0.data;
-	} else
-		header = (const UndoSegmentHeaderData *)block0.data;
-	exact_slot = header->tt_slots[tt_slot_offset];
-	outcome = cluster_runtime_visibility_candidate_decide(
-		&canonical_locator, &exact_slot, &top_xid, &proof_kind,
-		&commit_scn, &reason);
-	if (outcome == CLUSTER_TX_UNKNOWN)
-		goto done;
-
-	if (cross_segment) {
-		candidate.locator_echo = canonical_locator;
-		candidate.top_xid = top_xid;
-		candidate.outcome = outcome;
-		candidate.proof_kind = proof_kind;
-		candidate.commit_scn = commit_scn;
-		candidate.authority.origin_epoch = cluster_epoch_get_current();
-		candidate.authority.live_hwm_lsn = GetFlushRecPtr(NULL);
-		candidate.authority.tt_generation
-			= cluster_undo_tt_retention_rollover_count();
-		candidate.authority.authority_scn = cluster_scn_current();
-		if (candidate.authority.origin_epoch != admission->formation_epoch
-			|| XLogRecPtrIsInvalid(candidate.authority.live_hwm_lsn)
-			|| !SCN_VALID(candidate.authority.authority_scn)
-			|| cluster_undo_block0_current_sample_generation(
-				guard, &tt_root, &tt_final_generation)
-				   != CLUSTER_UNDO_BLOCK0_OK
-			|| !tt_final_generation.known
-			|| tt_final_generation.value != tt_generation.value
-			|| !cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				tt_logical.owner_instance, tt_logical.segment_id,
-				&tt_final_root)
-			|| !cluster_runtime_visibility_candidate_root_matches(
-				&tt_root, &tt_final_root)
-			|| !cluster_semantic_activation_recheck_r4_terminal_census(
-				admission)) {
-			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
-			goto done;
-		}
-
-		/* The terminal TT sample linearizes between two byte-identical DATA
-		 * samples.  Reacquire the original DATA current and reject any alias,
-		 * root or physical-generation drift before publishing. */
-		if (cluster_runtime_visibility_candidate_release(
-				guard, &current_result)
-			!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
-			goto done;
-		phase_cleanup.active = false;
-		memset(guard, 0, sizeof(*guard));
-		if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				logical.owner_instance, logical.segment_id, &final_root)
-			|| !cluster_runtime_visibility_candidate_root_matches(
-				root, &final_root)
-			|| cluster_runtime_visibility_candidate_acquire(
-				&logical, admission, guard, &phase_cleanup, &current_result)
-				   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD
-			|| cluster_undo_block0_current_sample_generation(
-				guard, root, &final_generation) != CLUSTER_UNDO_BLOCK0_OK
-			|| !final_generation.known
-			|| final_generation.value != generation.value
-			|| !cluster_undo_buf_copy_resident(
-				segment_id, logical.owner_instance, block_no,
-				rechecked_data_page.data)
-			|| !cluster_cr_r4_extract_resident_record(
-				rechecked_data_page.data, locator,
-				rechecked_record_buf.data, &rechecked_record_length,
-				&rechecked_locator)
-			|| rechecked_record_length != record_length
-			|| memcmp(rechecked_record_buf.data, record_buf.data,
-					  record_length) != 0
-			|| memcmp(&rechecked_locator, &canonical_locator,
-					  sizeof(canonical_locator)) != 0) {
-			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
-			goto done;
-		}
+	origin_step = cluster_runtime_visibility_origin_plan_freeze_data_held(
+		locator, mode, admission, expected_generation, guard, root, &plan,
+		out, &reason);
+	if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_NONE;
+		return out->outcome;
 	}
-
-	if (!cross_segment) {
-		candidate.locator_echo = canonical_locator;
-		candidate.top_xid = top_xid;
-		candidate.outcome = outcome;
-		candidate.proof_kind = proof_kind;
-		candidate.commit_scn = commit_scn;
-		candidate.authority.origin_epoch = cluster_epoch_get_current();
-		candidate.authority.live_hwm_lsn = GetFlushRecPtr(NULL);
-		candidate.authority.tt_generation
-			= cluster_undo_tt_retention_rollover_count();
-		candidate.authority.authority_scn = cluster_scn_current();
-	}
-	if (candidate.authority.origin_epoch != admission->formation_epoch
-			|| XLogRecPtrIsInvalid(candidate.authority.live_hwm_lsn)
-			|| !SCN_VALID(candidate.authority.authority_scn)
-			|| cluster_undo_block0_current_sample_generation(
-				guard, root, &final_generation) != CLUSTER_UNDO_BLOCK0_OK
-			|| !final_generation.known
-			|| final_generation.value != generation.value
-			|| !cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				logical.owner_instance, logical.segment_id, &final_root)
-			|| !cluster_runtime_visibility_candidate_root_matches(root, &final_root)
-			|| !cluster_semantic_activation_recheck_r4_terminal_census(admission)) {
-		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+	if (origin_step != CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL)
 		goto done;
-	}
 
-	*out = candidate;
-	if (reason_out != NULL)
-		*reason_out = CLUSTER_TX_RESOLVE_NONE;
-	return outcome;
+	/* Synchronous backend callers retain the original wrapper.  The LMS
+	 * status-22 event loop uses the split functions directly and never enters
+	 * these polling waits. */
+	if (cluster_runtime_visibility_candidate_release(guard, &current_result)
+		!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+		goto done;
+	memset(guard, 0, sizeof(*guard));
+	if (!cluster_runtime_visibility_origin_plan_canonical_logical(
+			&plan, &tt_logical)
+		|| !cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+			tt_logical.owner_instance, tt_logical.segment_id, &tt_root)
+		|| !cluster_runtime_visibility_admission_current(mode, admission)
+		|| cluster_runtime_visibility_candidate_acquire(
+			&tt_logical, admission, guard, &phase_cleanup, &current_result)
+			   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+		goto done;
+	if (!cluster_runtime_visibility_origin_plan_sample_canonical_held(
+			&plan, mode, admission, guard, &tt_root, &reason))
+		goto done;
+	if (cluster_runtime_visibility_candidate_release(guard, &current_result)
+		!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
+		goto done;
+	phase_cleanup.active = false;
+	memset(guard, 0, sizeof(*guard));
+	if (!cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+			logical.owner_instance, logical.segment_id, &final_root)
+		|| !cluster_runtime_visibility_candidate_root_matches(root, &final_root)
+		|| cluster_runtime_visibility_candidate_acquire(
+			&logical, admission, guard, &phase_cleanup, &current_result)
+			   != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+		goto done;
+	outcome = cluster_runtime_visibility_origin_plan_recheck_data_held(
+		&plan, mode, admission, guard, &final_root, out, &reason);
+	if (outcome != CLUSTER_TX_UNKNOWN) {
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_NONE;
+		return outcome;
+	}
 
 done:
 	if (reason_out != NULL)
@@ -663,12 +953,13 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 	memset(&root, 0, sizeof(root));
 	memset(&generation, 0, sizeof(generation));
 	if (locator == NULL || out == NULL || admission == NULL
-		|| mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS) {
+		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY
+			&& mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)) {
 		reason = locator == NULL ? CLUSTER_TX_RESOLVE_BAD_LOCATOR
 								 : CLUSTER_TX_RESOLVE_PROTOCOL;
 		goto done;
 	}
-	if (!cluster_semantic_activation_recheck_r4_terminal_census(admission)) {
+	if (!cluster_runtime_visibility_admission_current(mode, admission)) {
 		reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
 		goto done;
 	}
@@ -684,8 +975,8 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);
 	logical.segment_id = segment_id;
-	if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-			admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+	if (!cluster_runtime_visibility_resolve_root_admitted(
+			mode, admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
 			logical.owner_instance, logical.segment_id, &root))
 		goto done;
 
@@ -730,7 +1021,7 @@ candidate_done:
 			out, &reason);
 	}
 	if (outcome != CLUSTER_TX_UNKNOWN
-		&& cluster_semantic_activation_recheck_r4_terminal_census(admission)) {
+		&& cluster_runtime_visibility_admission_current(mode, admission)) {
 		if (reason_out != NULL)
 			*reason_out = CLUSTER_TX_RESOLVE_NONE;
 		return outcome;
@@ -1688,6 +1979,35 @@ cluster_undo_verdict_resolve_internal(
 
 	/* master!=self, owner live (or data plane unarmed): CP3 S-grant + CP5
 	 * origin verdict, byte-for-byte the pre-D4 path. */
+	if (freshref_pair) {
+		/*
+		 * S8 happy path: freshref exact-live verdict precedes terminal C1b pair.
+		 *
+		 * A pre-commit ITL stamp can already carry COMMITTED + cached SCN while
+		 * the same exact origin {xid, segment, slot} remains in ProcArray.  The
+		 * C1b pair is deliberately terminal-only and must keep rejecting its
+		 * IN_PROGRESS CLOG row; routing directly to it would therefore turn a
+		 * proven live writer into 53R97.  Ask the existing ordinary authoritative
+		 * exact-slot verdict first.  Only an unproved result falls through to the
+		 * unchanged pair request below.  This creates no new proof kind, authority
+		 * or state, and a generic bound remains a bound.
+		 */
+		if (rtvis_try_resolve_remote_internal(
+				origin_node, undo_segment_id, expected_tt_slot_id, raw_xid,
+				0, InvalidScn, read_scn, true, &committed, &in_progress,
+				&commit_scn, &is_bound)) {
+			if (in_progress) {
+				ClusterUndoVerdictResult live
+					= { .kind = CLUSTER_UNDO_VERDICT_IN_PROGRESS,
+						.commit_scn = InvalidScn,
+						.wrap = 0 };
+
+				return live;
+			}
+			return cluster_undo_verdict_from_resolve(true, committed, commit_scn,
+											 is_bound);
+		}
+	}
 	if (rtvis_try_resolve_remote_internal(
 			origin_node, undo_segment_id, expected_tt_slot_id, raw_xid,
 			ref_epoch, freshref_pair_scn, read_scn, authoritative, &committed,

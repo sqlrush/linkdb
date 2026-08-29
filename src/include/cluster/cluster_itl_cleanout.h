@@ -67,7 +67,8 @@
  *
  *	Reader-path opportunistic lazy cleanout.  Invoked by
  *	HeapTupleSatisfiesMVCC spec-3.2 D5 fork AFTER decide_by_scn
- *	returns VISIBLE and slot state is still ACTIVE on page.
+ *	returns VISIBLE and the slot is still ACTIVE or carries the exact
+ *	NEEDS_CLEANOUT precommit evidence on page.
  *
  *	Attempts ConditionalLockBuffer(buf) (non-blocking exclusive
  *	content lock).  On failure (would block), returns false
@@ -75,7 +76,8 @@
  *
  *	On lock success:
  *	  1. Re-read slot.  If state has changed (already COMMITTED, xid
- *	     mismatch, commit_scn mismatch, or slot transitioned to FREE),
+ *	     mismatch, retained commit_scn mismatch, or slot transitioned to
+ *	     FREE),
  *	     release lock + return false.
  *	  2. Otherwise: stamp slot.commit_scn = expected_commit_scn;
  *	     slot.flags = ITL_FLAG_COMMITTED; MarkBufferDirtyHint(buf, true)
