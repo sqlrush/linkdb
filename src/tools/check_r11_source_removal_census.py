@@ -16,8 +16,8 @@ from typing import Any
 SCHEMA = "R11SourceRemovalCensusV2"
 SOURCE_REMOVAL_COMMIT = "cb7c7b585cb63ea4906d49fe01352b005a89b8e8"
 SOURCE_REMOVAL_TREE = "e80f7dc31d269b5927a36cf393d9b2cccf70c02e"
-PRODUCT_COMMIT = "045e0cff9c1c28d8d3f1833ef07791a232e3d7a0"
-PRODUCT_TREE = "36feb2941c56012f0d12c923057e076f1b81a1f0"
+PRODUCT_COMMIT = "0a6d4856844920a4dcda928dd7bc65e3d95aadd6"
+PRODUCT_TREE = "c0a92c06a400e1e49a7a37495b6645c938e9ad84"
 L3_COMMIT = "cc1c5a554276542a05c15f5f1e0e0c7317fba66e"
 L3_TREE = "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5"
 
@@ -78,7 +78,7 @@ LAYERS = {
             },
             {
                 "path": "src/backend/storage/buffer/bufmgr.c",
-                "symbol": "cluster_gcs_resource_x_target_acquire_exact",
+                "symbol": "cluster_gcs_resource_x_target_acquire_until_exact",
             },
             {
                 "path": "src/backend/cluster/cluster_semantic_activation.c",
