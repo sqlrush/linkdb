@@ -72,6 +72,8 @@ typedef enum ClusterRuntimeVisibilityOriginStep {
 } ClusterRuntimeVisibilityOriginStep;
 
 extern void cluster_runtime_visibility_ensure_exit_hooks(void);
+extern bool cluster_runtime_visibility_zero_epoch_pair_admission_enter(
+	ClusterSemanticAdmissionToken *token);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode, uint64 formation_epoch,
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);

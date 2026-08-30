@@ -1115,12 +1115,41 @@ cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
 	bool cached_local_x, uint64 cached_ownership_generation,
 	ResourceXDecodedFrame *dispatch_out,
 	ResourceXAcquisitionRef *terminal_ref_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
+	const ResourceXAssertion *assertion,
+	uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token,
+	uint64 now_us,
+	uint64 *r4_record_generation_out,
+	uint64 *absolute_deadline_us_out);
+extern ResourceXBootstrapRoundAction
+cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node,
+	uint64 resource_formation, uint64 master_session_incarnation,
+	uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation,
+	uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
+	uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token,
+	bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out,
+	ResourceXAcquisitionRef *terminal_ref_out);
 extern ResourceXBootstrapRoundAction
 cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
 	const ResourceXDecodedFrame *ack, int32 authenticated_master_node,
 	uint32 authenticated_ingress_connection_generation,
 	uint64 r4_record_generation, uint64 now_us,
 	ResourceXDecodedFrame *assertion_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_exact(
+	const ResourceXDecodedFrame *request, int32 expected_master_node,
+	uint64 expected_r4_record_generation,
+	uint32 expected_master_ingress_connection_generation,
+	uint64 expected_retry_slice_us, uint64 expected_absolute_deadline_us,
+	uint64 expected_direct_init_ownership_generation,
+	uint64 expected_direct_init_reservation_token);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_wait_exact(
 	const ResourceXAssertion *assertion, int32 current_master_node,

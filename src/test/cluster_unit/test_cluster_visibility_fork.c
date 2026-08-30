@@ -379,6 +379,40 @@ UT_TEST(test_p033_active_and_safety_boundary_matrix)
 				 (int)CVV_FAILCLOSED_UNKNOWN);
 }
 
+/* P0-27 already freezes the exact HEAP_XMIN_FROZEN bit pair as durable
+ * committed evidence.  The MVCC fork must consume that proof before any
+ * remote xmin resolver/wire leg, while still running the existing exact xmax
+ * gate so a foreign delete cannot become false-visible. */
+UT_TEST(test_mvcc_frozen_xmin_bypasses_remote_resolve_but_keeps_xmax_gate)
+{
+	char *source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	const char *mvcc;
+	const char *frozen;
+	const char *xmax_gate;
+	const char *xmin_resolve;
+
+	if (source == NULL)
+		return;
+	mvcc = strstr(source,
+		"if (cluster_enabled && BufferIsValid(buffer)");
+	frozen = mvcc == NULL ? NULL : strstr(mvcc,
+		"if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask))");
+	xmax_gate = frozen == NULL ? NULL : strstr(frozen,
+		"cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)");
+	xmin_resolve = mvcc == NULL ? NULL : strstr(mvcc,
+		"cluster_visibility_resolve_from_ref_scn(raw_xmin");
+
+	UT_ASSERT_NOT_NULL(mvcc);
+	UT_ASSERT_NOT_NULL(frozen);
+	UT_ASSERT_NOT_NULL(xmax_gate);
+	UT_ASSERT_NOT_NULL(xmin_resolve);
+	if (mvcc != NULL && frozen != NULL && xmax_gate != NULL
+		&& xmin_resolve != NULL)
+		UT_ASSERT(mvcc < frozen && frozen < xmax_gate
+				  && xmax_gate < xmin_resolve);
+	free(source);
+}
+
 /* Spec 8.4A I18/I19: the normal commit-stamp is a live block0 modifier. */
 UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 {
@@ -463,6 +497,57 @@ UT_TEST(test_deleting_xmax_error_names_actual_xmax)
 	free(source);
 }
 
+/* spec-3.12 C3b/Q11: a concurrent winner may fill the segment returned by a
+ * retention rollover before this backend allocates.  The follower must reread
+ * and reclassify CURRENT instead of assuming that returned segment is fresh. */
+UT_TEST(test_tt_retention_rollover_follower_reclassifies_current_segment)
+{
+	char *source = read_source(TT_LOCAL_SOURCE_PATH);
+	const char *start;
+	const char *end;
+	const char *retry_loop;
+	const char *classify;
+	const char *rollover;
+	const char *one_shot;
+	const char *fresh_error;
+
+	if (source == NULL)
+		return;
+	start = strstr(source, "\ncluster_tt_local_get_or_create_binding(");
+	end = start == NULL
+		? NULL
+		: strstr(start, "\n}\n\n/*\n * cluster_tt_local_peek_binding");
+	retry_loop = start == NULL ? NULL : strstr(start, "for (;;)");
+	classify = retry_loop == NULL
+		? NULL
+		: strstr(retry_loop,
+				 "cluster_tt_slot_alloc_ext(seg, top_xid, &retained_pressure)");
+	rollover = classify == NULL
+		? NULL
+		: strstr(classify, "cluster_undo_tt_rollover_locked(");
+	one_shot = rollover == NULL
+		? NULL
+		: strstr(rollover, "cluster_tt_slot_alloc(seg, top_xid)");
+	fresh_error = rollover == NULL
+		? NULL
+		: strstr(rollover, "fresh rollover segment");
+
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(retry_loop);
+	UT_ASSERT_NOT_NULL(classify);
+	UT_ASSERT_NOT_NULL(rollover);
+	if (start != NULL && end != NULL && retry_loop != NULL && classify != NULL
+		&& rollover != NULL)
+		UT_ASSERT(start < retry_loop && retry_loop < classify && classify < rollover
+				  && rollover < end);
+	if (one_shot != NULL && end != NULL)
+		UT_ASSERT(one_shot > end);
+	if (fresh_error != NULL && end != NULL)
+		UT_ASSERT(fresh_error > end);
+	free(source);
+}
+
 
 int
 main(void)
@@ -481,7 +566,9 @@ main(void)
 	UT_RUN(test_t12_status_enum_5_values);
 	UT_RUN(test_p033_data_dml_publishes_active_identity);
 	UT_RUN(test_p033_active_and_safety_boundary_matrix);
+	UT_RUN(test_mvcc_frozen_xmin_bypasses_remote_resolve_but_keeps_xmax_gate);
 	UT_RUN(test_normal_commit_stamp_is_modifier_gated_and_error_safe);
 	UT_RUN(test_deleting_xmax_error_names_actual_xmax);
+	UT_RUN(test_tt_retention_rollover_follower_reclassifies_current_segment);
 	UT_DONE();
 }

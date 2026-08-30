@@ -664,21 +664,82 @@ static bool
 cluster_tt_status_current_entries_agree(const ClusterTTOverlayEntry *a,
 										const ClusterTTOverlayEntry *b)
 {
-	return memcmp(&a->key, &b->key, sizeof(a->key)) == 0
-		   && a->status == b->status
+	return a->status == b->status
 		   && a->commit_scn == b->commit_scn && a->status_epoch == b->status_epoch
 		   && a->has_parent_key == b->has_parent_key
 		   && memcmp(&a->parent_key, &b->parent_key, sizeof(a->parent_key)) == 0;
 }
 
 static bool
-cluster_tt_status_key_precedes(const ClusterTTStatusKey *a, const ClusterTTStatusKey *b)
+cluster_tt_status_current_entry_matches(const ClusterTTOverlayEntry *entry,
+										TransactionId xid, uint32 epoch,
+										TimestampTz now)
 {
-	if (a->undo_segment_id != b->undo_segment_id)
-		return a->undo_segment_id < b->undo_segment_id;
-	if (a->tt_slot_id != b->tt_slot_id)
-		return a->tt_slot_id < b->tt_slot_id;
-	return memcmp(a, b, sizeof(*a)) < 0;
+	return entry->key.origin_node_id == (uint16)cluster_node_id
+		   && entry->key.local_xid == xid && entry->key.cluster_epoch == epoch
+		   && entry->key.undo_segment_id != 0 && entry->key.tt_slot_id != 0
+		   && entry->key._reserved == 0 && entry->key._reserved2 == 0
+		   && entry->status_epoch == epoch && is_entry_fresh(entry, now);
+}
+
+/* Caller holds ClusterTTStatusLock.  Multiple exact keys are legal only when
+ * they are byte-identical status projections of one transaction: the
+ * canonical TT key plus DATA-record segment aliases published by
+ * cluster_tt_local.  This helper classifies their status agreement; it never
+ * chooses which physical key is canonical. */
+static bool
+cluster_tt_status_current_group_locked(
+	TransactionId xid, uint32 epoch, TimestampTz now,
+	const ClusterTTStatusKey *candidate, ClusterTTOverlayEntry *sample,
+	uint32 *match_count, bool *candidate_found)
+{
+	HASH_SEQ_STATUS seq;
+	ClusterTTOverlayEntry *entry;
+
+	memset(sample, 0, sizeof(*sample));
+	*match_count = 0;
+	*candidate_found = false;
+	hash_seq_init(&seq, ClusterTTStatusHTAB);
+	while ((entry = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
+		if (!cluster_tt_status_current_entry_matches(entry, xid, epoch, now))
+			continue;
+		if (candidate != NULL
+			&& memcmp(&entry->key, candidate, sizeof(*candidate)) == 0)
+			*candidate_found = true;
+		if (*match_count == 0)
+			*sample = *entry;
+		else if (!cluster_tt_status_current_entries_agree(sample, entry)) {
+			hash_seq_term(&seq);
+			return false;
+		}
+		(*match_count)++;
+	}
+	return *match_count != 0;
+}
+
+static bool
+cluster_tt_status_overlay_matches_current_owner(
+	const ClusterTTOverlayEntry *entry,
+	const ClusterTTSlotCurrentOwner *owner)
+{
+	switch (owner->status) {
+	case CTS_ACTIVE:
+		return (entry->status == CLUSTER_TT_STATUS_IN_PROGRESS
+				|| entry->status == CLUSTER_TT_STATUS_SUBCOMMITTED)
+			   && entry->commit_scn == InvalidScn
+			   && owner->commit_scn == InvalidScn;
+	case CTS_COMMITTED:
+		return (entry->status == CLUSTER_TT_STATUS_COMMITTED
+				|| entry->status == CLUSTER_TT_STATUS_CLEANED_OUT)
+			   && SCN_VALID(entry->commit_scn)
+			   && entry->commit_scn == owner->commit_scn;
+	case CTS_ABORTED:
+		return entry->status == CLUSTER_TT_STATUS_ABORTED
+			   && entry->commit_scn == InvalidScn
+			   && owner->commit_scn == InvalidScn;
+	default:
+		return false;
+	}
 }
 
 static bool
@@ -686,14 +747,13 @@ cluster_tt_status_lookup_current_own_xid_internal(
 	TransactionId xid, const ClusterTTStatusKey *candidate, ClusterTTStatusKey *key,
 	ClusterTTStatusResult *result, ClusterTTCurrentKeyVerdict *candidate_verdict)
 {
-	HASH_SEQ_STATUS seq;
 	ClusterTTOverlayEntry *entry;
 	ClusterTTOverlayEntry selected;
 	TimestampTz now;
 	uint64 epoch;
-	bool found = false;
-	bool ambiguous = false;
+	uint32 match_count = 0;
 	bool candidate_found = false;
+	bool group_agrees;
 
 	if (key != NULL)
 		memset(key, 0, sizeof(*key));
@@ -720,38 +780,86 @@ cluster_tt_status_lookup_current_own_xid_internal(
 			|| candidate->_reserved != 0 || candidate->_reserved2 != 0))
 		return false;
 	now = GetCurrentTimestamp();
-	memset(&selected, 0, sizeof(selected));
-
 	LWLockAcquire(ClusterTTStatusLock, LW_SHARED);
-	hash_seq_init(&seq, ClusterTTStatusHTAB);
-	while ((entry = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
-		if (entry->key.origin_node_id != (uint16)cluster_node_id
-			|| entry->key.local_xid != xid || entry->key.cluster_epoch != (uint32)epoch
-			|| entry->key.undo_segment_id == 0 || entry->key.tt_slot_id == 0
-			|| entry->key._reserved != 0 || entry->key._reserved2 != 0
-			|| entry->status_epoch != (uint32)epoch || !is_entry_fresh(entry, now))
-			continue;
-		if (candidate != NULL && memcmp(&entry->key, candidate, sizeof(*candidate)) == 0)
-			candidate_found = true;
-		if (!found) {
-			selected = *entry;
-			found = true;
-			continue;
-		}
-		if (!cluster_tt_status_current_entries_agree(&selected, entry)) {
-			ambiguous = true;
-			hash_seq_term(&seq);
-			break;
-		}
-		if (cluster_tt_status_key_precedes(&entry->key, &selected.key))
-			selected = *entry;
-	}
+	group_agrees = cluster_tt_status_current_group_locked(
+		xid, (uint32)epoch, now, candidate, &selected, &match_count,
+		&candidate_found);
 	LWLockRelease(ClusterTTStatusLock);
 
-	if (!found || ambiguous) {
-		if (ambiguous)
-			pg_atomic_fetch_add_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+	if (!group_agrees) {
+		if (match_count != 0)
+			pg_atomic_fetch_add_u64(
+				&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
 		return false;
+	}
+
+	if (match_count > 1) {
+		ClusterTTOverlayEntry canonical_entry;
+		ClusterTTStatusKey canonical_key;
+		ClusterTTSlotCurrentOwner owner;
+		ClusterTTSlotCurrentOwner owner_check;
+		uint32 check_count;
+		bool check_candidate_found;
+
+		/* Multiple same-status keys cannot select themselves: key ordering is
+		 * not lineage.  The allocator's current owner is the bounded, exact
+		 * canonical binding for the active happy path.  Snapshot it outside the
+		 * overlay lock, recheck the complete overlay group, then snapshot it
+		 * again after releasing that lock to close the rollover/reuse window. */
+		if (!cluster_tt_slot_current_owner_by_xid(
+				cluster_node_id, xid, &owner)
+			|| owner.segment_id == 0 || owner.xid != xid
+			|| owner.slot_offset >= TT_SLOTS_PER_SEGMENT
+			|| owner.reserved8[0] != 0 || owner.reserved8[1] != 0
+			|| owner.reserved8[2] != 0) {
+			pg_atomic_fetch_add_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+			return false;
+		}
+		memset(&canonical_key, 0, sizeof(canonical_key));
+		canonical_key.origin_node_id = (uint16)cluster_node_id;
+		canonical_key.undo_segment_id = owner.segment_id;
+		canonical_key.tt_slot_id =
+			cluster_tt_slot_offset_to_id(owner.slot_offset);
+		canonical_key.cluster_epoch = (uint32)epoch;
+		canonical_key.local_xid = xid;
+
+		now = GetCurrentTimestamp();
+		LWLockAcquire(ClusterTTStatusLock, LW_SHARED);
+		entry = (ClusterTTOverlayEntry *)hash_search(
+			ClusterTTStatusHTAB, &canonical_key, HASH_FIND, NULL);
+		if (entry == NULL
+			|| !cluster_tt_status_current_entry_matches(
+				entry, xid, (uint32)epoch, now)) {
+			LWLockRelease(ClusterTTStatusLock);
+			pg_atomic_fetch_add_u64(
+				&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+			return false;
+		}
+		canonical_entry = *entry;
+		if (!cluster_tt_status_current_group_locked(
+				xid, (uint32)epoch, now, candidate, &selected, &check_count,
+				&check_candidate_found)
+			|| check_count < 2
+			|| !cluster_tt_status_current_entries_agree(
+				&canonical_entry, &selected)
+			|| !cluster_tt_status_overlay_matches_current_owner(
+				&canonical_entry, &owner)) {
+			LWLockRelease(ClusterTTStatusLock);
+			pg_atomic_fetch_add_u64(
+				&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+			return false;
+		}
+		LWLockRelease(ClusterTTStatusLock);
+
+		if (!cluster_tt_slot_current_owner_by_xid(
+				cluster_node_id, xid, &owner_check)
+			|| memcmp(&owner, &owner_check, sizeof(owner)) != 0) {
+			pg_atomic_fetch_add_u64(
+				&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+			return false;
+		}
+		selected = canonical_entry;
+		candidate_found = check_candidate_found;
 	}
 
 	*key = selected.key;

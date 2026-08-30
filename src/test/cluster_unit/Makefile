@@ -3264,9 +3264,9 @@ $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O): \
 		-c $< -o $@
 
 test_cluster_r4_scratch_resolver: test_cluster_r4_scratch_resolver.c unit_test.h \
-		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O)
+		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) \
+		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

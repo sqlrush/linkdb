@@ -3513,6 +3513,27 @@ EOC
 
 		# Keep shared_buffers small so 4 postmasters fit in CI runners.
 		$node->append_conf('postgresql.conf', "shared_buffers = 16MB\n");
+		if (($ENV{PGRAC_STAGE8_HAPPY_PATH_ONLY} // '') eq '1')
+		{
+			# Stage 8's dedicated Linux happy-path VM has enough memory for the
+			# correctness/PRE workload.  Keep the ordinary ClusterQuad CI default
+			# above; this last-value-wins block is intentionally scoped to the
+			# user-approved happy-path campaign.
+			$node->append_conf('postgresql.conf', <<'EOC');
+shared_buffers = 512MB
+cluster.pcm_grd_max_entries = 65536
+cluster.ges_dedup_max_entries = 65536
+cluster.gcs_block_dedup_max_entries = 32768
+wal_buffers = 64MB
+max_wal_size = 4GB
+min_wal_size = 1GB
+max_connections = 512
+work_mem = 4MB
+maintenance_work_mem = 64MB
+checkpoint_timeout = 5min
+checkpoint_completion_target = 0.9
+EOC
+		}
 
 		if ($opts{extra_conf})
 		{

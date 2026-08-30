@@ -3094,30 +3094,109 @@ cluster_bufmgr_pcm_direct_init_report_failure(BufferDesc *buf, ClusterPcmOwnResu
 					   (unsigned long long) generation, flags)));
 }
 
+/* Join only the exact VM/FSM direct-init reservation already published by
+ * another backend.  The existing per-resource round owns fan-in and its
+ * original deadline.  This observer creates neither a stack proof nor a
+ * second reservation, and receives no writer permission from this call. */
+static void
+cluster_bufmgr_pcm_join_aux_direct_init_exact(
+	BufferDesc *buf, ClusterPcmDirectInitKind kind,
+	const ClusterPcmDirectInitSnapshot *observed, uint32 wait_index)
+{
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXApplyResult result;
+
+	if (buf == NULL || observed == NULL
+		|| cluster_pcm_direct_init_aux_pending_observer_validate(
+			kind, observed) != CLUSTER_PCM_OWN_OK
+		|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		cluster_bufmgr_pcm_direct_init_report_failure(
+			buf, CLUSTER_PCM_OWN_STALE, observed,
+			"aux direct-init pending observer");
+	MemSet(&terminal_ref, 0, sizeof(terminal_ref));
+	result = cluster_gcs_resource_x_target_direct_init_join_exact(
+		buf, observed->generation,
+		observed->reservation_token, &terminal_ref);
+	/* The reservation sidecar can become visible just before its proof owner
+	 * creates the canonical round.  That EMPTY/STale observation is a
+	 * zero-mutation re-probe, never permission to create a second attempt. */
+	if (result == RESOURCE_X_APPLY_NOT_FOUND
+		|| result == RESOURCE_X_APPLY_STALE)
+	{
+		(void) cluster_bufmgr_resource_x_wait_retry(
+			BufferDescriptorGetContentLock(buf), buf->buf_id,
+			wait_index, NULL);
+		return;
+	}
+	if ((result != RESOURCE_X_APPLY_APPLIED
+		 && result != RESOURCE_X_APPLY_DUPLICATE)
+		|| !resource_x_assertion_valid(&terminal_ref.assertion)
+		|| !BufferTagsEqual(
+			&terminal_ref.assertion.resource, &observed->tag))
+		cluster_bufmgr_resource_x_writer_report_failure(
+			result == RESOURCE_X_APPLY_APPLIED
+				|| result == RESOURCE_X_APPLY_DUPLICATE
+				? RESOURCE_X_APPLY_STALE : result,
+			buf, "Resource-X auxiliary direct-init join");
+}
+
+typedef enum ClusterBufmgrPcmDirectInitArmResult
+{
+	CLUSTER_BUFMGR_PCM_DIRECT_INIT_ARMED = 0,
+	CLUSTER_BUFMGR_PCM_DIRECT_INIT_JOIN_PENDING,
+	CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X
+} ClusterBufmgrPcmDirectInitArmResult;
+
 /* Arm only at a source-authorized operation site.  This does not reserve the
  * buffer: the consumer revalidates the complete identity before publishing
  * GRANT_PENDING, so a changed/reused descriptor fails closed. */
-static void
+static ClusterBufmgrPcmDirectInitArmResult
 cluster_bufmgr_pcm_arm_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kind,
-								   ClusterPcmDirectInitProof *proof)
+								   ClusterPcmDirectInitProof *proof,
+								   ClusterPcmDirectInitSnapshot *pending_observed)
 {
 	ClusterPcmDirectInitSnapshot observed;
 	ClusterPcmOwnResult result;
+	ClusterBufmgrPcmDirectInitArmResult arm_result
+		= CLUSTER_BUFMGR_PCM_DIRECT_INIT_ARMED;
 	uint32		buf_state;
 
 	memset(proof, 0, sizeof(*proof));
+	if (pending_observed != NULL)
+		memset(pending_observed, 0, sizeof(*pending_observed));
 	if (!cluster_pcm_is_active() || !cluster_bufmgr_should_pcm_track(buf))
-		return;
+		return CLUSTER_BUFMGR_PCM_DIRECT_INIT_ARMED;
 
 	buf_state = LockBufHdr(buf);
 	cluster_bufmgr_pcm_direct_init_snapshot_locked(
 		buf, buf_state, PageIsNew((Page) BufHdrGetBlock(buf)), &observed);
-	result = cluster_pcm_direct_init_proof_arm(kind, &observed, proof);
+	if (pending_observed != NULL
+		&& observed.pcm_state == (uint8)PCM_STATE_X
+		&& observed.flags == 0)
+	{
+		*pending_observed = observed;
+		result = CLUSTER_PCM_OWN_OK;
+		arm_result = CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X;
+	}
+	else
+	{
+		result = cluster_pcm_direct_init_proof_arm(kind, &observed, proof);
+		if (result != CLUSTER_PCM_OWN_OK
+			&& pending_observed != NULL
+			&& cluster_pcm_direct_init_aux_pending_observer_validate(
+				kind, &observed) == CLUSTER_PCM_OWN_OK)
+		{
+			*pending_observed = observed;
+			result = CLUSTER_PCM_OWN_OK;
+			arm_result = CLUSTER_BUFMGR_PCM_DIRECT_INIT_JOIN_PENDING;
+		}
+	}
 	UnlockBufHdr(buf, buf_state);
 
 	if (result != CLUSTER_PCM_OWN_OK)
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, result, &observed,
-												  "direct-init arm");
+											  "direct-init arm");
+	return arm_result;
 }
 
 /*
@@ -3127,7 +3206,7 @@ cluster_bufmgr_pcm_arm_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kin
  * share one BufferDesc header-lock interval; no wire request can be emitted
  * from an unproved or stale descriptor.
  */
-static void
+static bool
 cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kind,
 									ClusterPcmDirectInitProof *proof)
 {
@@ -3148,7 +3227,7 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	uint64		writer_r4_generation = 0;
 
 	if (!cluster_pcm_is_active() || !cluster_bufmgr_should_pcm_track(buf))
-		return;
+		return true;
 	if (proof == NULL)
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, CLUSTER_PCM_OWN_INVALID, NULL,
 												  "direct-init missing proof");
@@ -3157,6 +3236,19 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	cluster_bufmgr_pcm_direct_init_snapshot_locked(
 		buf, buf_state, PageIsNew((Page) BufHdrGetBlock(buf)), &observed);
 	pending_result = cluster_pcm_direct_init_proof_consume(kind, &observed, proof);
+	if (pending_result != CLUSTER_PCM_OWN_OK
+		&& (kind == CLUSTER_PCM_DIRECT_INIT_VM
+			|| kind == CLUSTER_PCM_DIRECT_INIT_FSM)
+		&& cluster_pcm_direct_init_aux_pending_observer_validate(
+			kind, &observed) == CLUSTER_PCM_OWN_OK
+		&& cluster_pcm_direct_init_target_pending_validate(
+			kind, &observed, proof) == CLUSTER_PCM_OWN_OK)
+	{
+		UnlockBufHdr(buf, buf_state);
+		cluster_bufmgr_pcm_join_aux_direct_init_exact(
+			buf, kind, &observed, 0);
+		return false;
+	}
 	if (pending_result == CLUSTER_PCM_OWN_OK)
 		pending_result = cluster_pcm_own_reservation_begin_exact(
 			buf->buf_id, observed.generation, PCM_OWN_FLAG_GRANT_PENDING, &pending_token);
@@ -3262,7 +3354,7 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 			}
 			cluster_bufmgr_pcm_x_writer_track_target_direct_init(
 				buf, &context);
-			return;
+			return true;
 	}
 }
 
@@ -4375,8 +4467,9 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		MemSet((char *) bufBlock, 0, BLCKSZ);
 #ifdef USE_PGRAC_CLUSTER
 		if (!isLocalBuf)
-			cluster_bufmgr_pcm_arm_direct_init(
-				bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS, &direct_init_proof);
+			(void) cluster_bufmgr_pcm_arm_direct_init(
+				bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS,
+				&direct_init_proof, NULL);
 #endif
 	}
 	else
@@ -4482,7 +4575,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		!isLocalBuf)
 	{
 #ifdef USE_PGRAC_CLUSTER
-		cluster_bufmgr_pcm_gate_direct_init(
+		(void) cluster_bufmgr_pcm_gate_direct_init(
 			bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS, &direct_init_proof);
 #endif
 		LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
@@ -6211,9 +6304,10 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 
 			/* This exact buffer is in the range successfully zeroextended above
 			 * and still owns BM_IO_IN_PROGRESS + !BM_VALID. */
-			cluster_bufmgr_pcm_arm_direct_init(
-				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof);
-			cluster_bufmgr_pcm_gate_direct_init(
+			(void) cluster_bufmgr_pcm_arm_direct_init(
+				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND,
+				&direct_init_proof, NULL);
+			(void) cluster_bufmgr_pcm_gate_direct_init(
 				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof);
 #endif
 			LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
@@ -9680,23 +9774,40 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 	if (cluster_pcm_is_active() && cluster_bufmgr_should_pcm_track(buf))
 	{
 		ClusterPcmDirectInitProof direct_init_proof;
-		uint8		pcm_state;
-		uint32		flags;
+		ClusterPcmDirectInitSnapshot pending_observed;
+		ClusterBufmgrPcmDirectInitArmResult arm_result;
+		uint32		waits = 0;
 
-		/*
-		 * A concurrent initializer may already have established X while the
-		 * caller's unlocked PageIsNew probe was true.  The ordinary cached-X
-		 * path revalidates that grant after taking the content lock.
-		 */
-		cluster_pcm_own_read(buf, &pcm_state, NULL, &flags);
-		if (pcm_state == (uint8) PCM_STATE_X && flags == 0)
+		for (;;)
 		{
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-			return;
+			/* The sole arm helper classifies proof-owner, exact pending
+			 * follower, and already-cached X under one header-lock interval.
+			 * A follower can only drive the pre-existing canonical round. */
+			arm_result = cluster_bufmgr_pcm_arm_direct_init(
+				buf, kind, &direct_init_proof, &pending_observed);
+			if (arm_result == CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X)
+			{
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				return;
+			}
+			if (arm_result == CLUSTER_BUFMGR_PCM_DIRECT_INIT_JOIN_PENDING)
+			{
+				cluster_bufmgr_pcm_join_aux_direct_init_exact(
+					buf, kind, &pending_observed, waits);
+				if (waits < PG_UINT32_MAX)
+					waits++;
+				continue;
+			}
+			if (!cluster_bufmgr_pcm_gate_direct_init(
+					buf, kind, &direct_init_proof))
+			{
+				if (waits < PG_UINT32_MAX)
+					waits++;
+				continue;
+			}
+			break;
 		}
 
-		cluster_bufmgr_pcm_arm_direct_init(buf, kind, &direct_init_proof);
-		cluster_bufmgr_pcm_gate_direct_init(buf, kind, &direct_init_proof);
 	}
 	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
 	cluster_bufmgr_pcm_x_writer_activate_target_direct_init(buf);

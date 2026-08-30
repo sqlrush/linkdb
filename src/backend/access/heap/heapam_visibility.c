@@ -2133,6 +2133,26 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 									" current epoch=" UINT64_FORMAT "; retry transaction.",
 									snapshot->read_epoch, cluster_epoch_get_current())));
 
+		/* P0-27: VACUUM's exact FROZEN bit pair is already a durable
+		 * xmin-committed proof.  Do not turn that terminal cleanout back into
+		 * one origin verdict round per tuple.  The xmax half remains mandatory:
+		 * a frozen inserter says nothing about a later foreign deleter. */
+		if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask)) {
+			switch (cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)) {
+			case 1:
+				return true;
+			case 0:
+				return false;
+			default:
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("cluster TT status unknown for deleting xmax of xid %u",
+								HeapTupleHeaderGetRawXmax(tuple)),
+						 errhint("Exact deleter authority is not currently provable; "
+								 "retry or abort.")));
+			}
+		}
+
 #ifdef ENABLE_INJECTION
 		/* spec-3.2 D5b: test-only inject hook overrides placeholder
 		 * reader when cluster_test_force_visibility_cluster_path = on. */

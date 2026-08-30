@@ -271,6 +271,21 @@ typedef enum ClusterTTSlotAllocStatus {
 	CTS_ABORTED = 3	   /* aborted; immediately recyclable (spec-3.12 C7) */
 } ClusterTTSlotAllocStatus;
 
+/* Stack-only read snapshot of one exact owner in the allocator's current
+ * segment.  This is not shared or durable state and is never a wire format. */
+typedef struct ClusterTTSlotCurrentOwner {
+	uint32 segment_id;
+	TransactionId xid;
+	SCN commit_scn;
+	uint16 slot_offset;
+	uint16 wrap;
+	uint8 status;
+	uint8 reserved8[3];
+} ClusterTTSlotCurrentOwner;
+
+StaticAssertDecl(sizeof(ClusterTTSlotCurrentOwner) == 24,
+				 "current TT owner snapshot must remain stack-only 24 bytes");
+
 
 /*
  * cluster_tt_slot_offset_to_id / _id_to_offset
@@ -379,6 +394,8 @@ extern void cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, 
  *	  the SEGMENT_ACTIVE -> SEGMENT_COMMITTED transition.
  */
 extern uint32 cluster_tt_slot_current_segment(int node_id);
+extern bool cluster_tt_slot_current_owner_by_xid(
+	int node_id, TransactionId xid, ClusterTTSlotCurrentOwner *out);
 extern void cluster_tt_slot_rollover(int node_id, uint32 new_segment_id, bool *out_old_had_active);
 
 

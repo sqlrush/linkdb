@@ -18,6 +18,7 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
@@ -652,6 +653,77 @@ current_promote_grant(ClusterUndoBlock0CurrentGuardData *data,
 }
 
 static ClusterUndoBlock0CurrentStep
+current_acquire_reserve_and_dispatch(ClusterUndoBlock0CurrentGuardData *data,
+								 ClusterUndoBlock0Result *failure)
+{
+	ClusterGrdEntryResult reserve_result;
+	ClusterGrdGrantAction action;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	int nconflicts = 0;
+	bool fast_path = false;
+	GesRequestPayload request;
+
+	reserve_result
+		= cluster_grd_try_reserve(&data->resid, &data->holder, data->mode,
+							  cluster_node_id, &fast_path,
+							  &data->reservation_generation);
+	if (reserve_result == CLUSTER_GRD_ENTRY_FULL) {
+		cluster_ges_timeout_detail_set(
+			CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL, data->master_node, 0, 0, -1,
+			data->timeout_ms);
+		data->next_retry_at = TimestampTzPlusMilliseconds(
+			GetCurrentTimestamp(), CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS);
+		return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+	}
+	if (reserve_result != CLUSTER_GRD_ENTRY_OK)
+		return current_fail(data, current_failure_from_grd(reserve_result), failure);
+	data->reservation_held = true;
+
+	/* Correlation exists before either master can complete a grant decision. */
+	if (!current_reply_install(data, GES_REQ_OPCODE_REQUEST)) {
+		cluster_ges_timeout_detail_set(
+			CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL, data->master_node, 0, 0, -1,
+			data->timeout_ms);
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
+	}
+
+	if (!data->remote_master) {
+		action = cluster_grd_entry_enqueue_or_grant(
+			&data->resid, &data->holder, cluster_node_id, data->holder.request_id,
+			data->routing_generation, GES_REQ_OPCODE_REQUEST, data->mode, conflicts,
+			&nconflicts);
+		if (action == CLUSTER_GRD_GRANT_NOW) {
+			data->request_dispatched = true;
+			data->grant_observed = true;
+			current_reply_delete(data, GES_REQ_OPCODE_REQUEST);
+			return current_promote_grant(data, failure);
+		}
+		if (action != CLUSTER_GRD_ENQUEUED_WAITER) {
+			cluster_ges_timeout_detail_set(
+				CLUSTER_GES_TSRC_MASTER_WAIT_QUEUE_FULL, data->master_node, 0, 0,
+				nconflicts, data->timeout_ms);
+			return current_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
+		}
+		data->request_dispatched = true;
+		if (nconflicts > 0)
+			cluster_ges_send_bast_targeted(&data->resid, data->mode, conflicts, nconflicts);
+	} else {
+		current_fill_request(data, GES_REQ_OPCODE_REQUEST, &request);
+		if (!cluster_grd_outbound_enqueue_backend_request(
+				(uint32)data->master_node, &request, sizeof(request))) {
+			cluster_ges_timeout_detail_set(
+				CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, data->master_node, 0, 0, -1,
+				data->timeout_ms);
+			return current_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
+		}
+		data->request_dispatched = true;
+	}
+	data->next_retry_at = TimestampTzPlusMilliseconds(
+		GetCurrentTimestamp(), CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS);
+	return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+}
+
+static ClusterUndoBlock0CurrentStep
 current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 				  ClusterUndoBlock0CurrentMode mode, int timeout_ms,
 				  const ClusterSemanticAdmissionToken *caller_admission,
@@ -661,24 +733,18 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 {
 	ClusterUndoBlock0CurrentGuardData *data;
 	ClusterUndoBlock0CurrentStep step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
-	ClusterUndoBlock0Result fail = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterSemanticAdmissionResult admission_result;
-	ClusterGrdEntryResult reserve_result;
-	ClusterGrdGrantAction action;
-	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
-	int nconflicts = 0;
 	int effective_timeout_ms;
 	uint64 epoch;
 	uint64 routing_generation = 0;
 	int32 master;
-	bool fast_path = false;
-	GesRequestPayload request;
 
 	if (guard == NULL || key == NULL || (mode != CLUSTER_UNDO_BLOCK0_SCUR
 										 && mode != CLUSTER_UNDO_BLOCK0_XCUR)) {
 		current_set_failure(failure, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
 		return CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	}
+	cluster_ges_timeout_detail_reset();
 	data = current_guard_data(guard);
 	/* Only the all-zero public initializer is a legal UNUSED representation. */
 	if (!current_phase_valid(data->phase) || data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_UNUSED
@@ -775,54 +841,7 @@ current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
 
 	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
 	{
-		reserve_result
-			= cluster_grd_try_reserve(&data->resid, &data->holder, data->mode, cluster_node_id,
-									  &fast_path, &data->reservation_generation);
-		if (reserve_result != CLUSTER_GRD_ENTRY_OK) {
-			fail = current_failure_from_grd(reserve_result);
-			goto acquire_done;
-		}
-		data->reservation_held = true;
-
-		/* Correlation exists before either master can complete a grant decision. */
-		if (!current_reply_install(data, GES_REQ_OPCODE_REQUEST)) {
-			fail = CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
-			goto acquire_done;
-		}
-
-		if (!data->remote_master) {
-			action = cluster_grd_entry_enqueue_or_grant(
-				&data->resid, &data->holder, cluster_node_id, data->holder.request_id,
-				data->routing_generation, GES_REQ_OPCODE_REQUEST, data->mode, conflicts,
-				&nconflicts);
-			if (action == CLUSTER_GRD_GRANT_NOW) {
-				data->request_dispatched = true;
-				data->grant_observed = true;
-				current_reply_delete(data, GES_REQ_OPCODE_REQUEST);
-				step = current_promote_grant(data, failure);
-				goto acquire_done;
-			}
-			if (action != CLUSTER_GRD_ENQUEUED_WAITER) {
-				fail = CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
-				goto acquire_done;
-			}
-			data->request_dispatched = true;
-			if (nconflicts > 0)
-				cluster_ges_send_bast_targeted(&data->resid, data->mode, conflicts, nconflicts);
-		} else {
-			current_fill_request(data, GES_REQ_OPCODE_REQUEST, &request);
-			if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &request,
-														 sizeof(request))) {
-				fail = CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
-				goto acquire_done;
-			}
-			data->request_dispatched = true;
-		}
-		step = CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
-
-acquire_done:
-		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
-			step = current_fail(data, fail, failure);
+		step = current_acquire_reserve_and_dispatch(data, failure);
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
 	return step;
@@ -916,6 +935,25 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 		return CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	if (data->phase != CLUSTER_UNDO_BLOCK0_CURRENT_ACQUIRE_WAIT)
 		return current_fail(data, CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH, failure);
+	if (!data->reservation_held && !data->reply_installed && !data->request_dispatched) {
+		ClusterUndoBlock0CurrentStep step;
+
+		if (!current_live_recheck(data))
+			return current_fail(data, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED, failure);
+		now = GetCurrentTimestamp();
+		if (data->deadline != 0 && now >= data->deadline)
+			return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
+		if (now < data->next_retry_at)
+			return CLUSTER_UNDO_BLOCK0_CURRENT_PENDING;
+		PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+		{
+			step = current_acquire_reserve_and_dispatch(data, failure);
+		}
+		PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
+		return step;
+	}
+	if (!data->reservation_held || !data->reply_installed || !data->request_dispatched)
+		return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
 
 	memset(&verdict, 0, sizeof(verdict));
 	current_fill_reply_key(data, GES_REQ_OPCODE_REQUEST, &key);
@@ -931,6 +969,10 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 			data->grant_observed = true;
 			return current_promote_grant(data, failure);
 		}
+		if (verdict.reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL)
+			cluster_ges_timeout_detail_set(
+				CLUSTER_GES_TSRC_MASTER_REJECT_QUEUE_FULL, data->master_node, 0,
+				data->retry_attempt, -1, data->timeout_ms);
 		return current_fail(data, current_failure_from_reject(verdict.reject_reason), failure);
 	}
 	if (poll_result != GES_REPLY_WAIT_POLL_PENDING)
@@ -950,8 +992,12 @@ cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
 			return current_fail(data, CLUSTER_UNDO_BLOCK0_IO_ERROR, failure);
 		current_fill_request(data, GES_REQ_OPCODE_REQUEST, &request);
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)data->master_node, &request,
-														 sizeof(request)))
+														 sizeof(request))) {
+			cluster_ges_timeout_detail_set(
+				CLUSTER_GES_TSRC_OUTBOUND_RING_FULL, data->master_node, 0,
+				data->retry_attempt, -1, data->timeout_ms);
 			return current_fail(data, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE, failure);
+		}
 		data->retry_attempt++;
 		backoff_ms = CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_INITIAL_MS << Min(data->retry_attempt, 4);
 		if (backoff_ms > CLUSTER_UNDO_BLOCK0_CURRENT_RETRY_MAX_MS)

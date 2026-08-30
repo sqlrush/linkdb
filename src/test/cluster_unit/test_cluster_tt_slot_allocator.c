@@ -1147,6 +1147,41 @@ UT_TEST(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor)
 	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
 }
 
+UT_TEST(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded)
+{
+	ClusterTTSlotCurrentOwner owner;
+	uint16 off;
+
+	reset_allocator();
+	cluster_tt_slot_rollover(0, NODE0_SEG, NULL);
+	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	memset(&owner, 0xA5, sizeof(owner));
+	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(
+		0, (TransactionId)100, &owner));
+	UT_ASSERT_EQ((int)owner.segment_id, (int)NODE0_SEG);
+	UT_ASSERT_EQ((int)owner.xid, 100);
+	UT_ASSERT_EQ((int)owner.slot_offset, (int)off);
+	UT_ASSERT_EQ((int)owner.wrap, 0);
+	UT_ASSERT_EQ((int)owner.status, (int)CTS_ACTIVE);
+	UT_ASSERT_EQ((int)owner.commit_scn, (int)InvalidScn);
+	UT_ASSERT_EQ((int)owner.reserved8[0], 0);
+	UT_ASSERT_EQ((int)owner.reserved8[1], 0);
+	UT_ASSERT_EQ((int)owner.reserved8[2], 0);
+
+	cluster_tt_slot_mark_committed(
+		NODE0_SEG, off, (TransactionId)100, (SCN)77);
+	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(
+		0, (TransactionId)100, &owner));
+	UT_ASSERT_EQ((int)owner.status, (int)CTS_COMMITTED);
+	UT_ASSERT_EQ((int)owner.commit_scn, 77);
+
+	cluster_tt_slot_rollover(0, 2, NULL);
+	memset(&owner, 0xA5, sizeof(owner));
+	UT_ASSERT(!cluster_tt_slot_current_owner_by_xid(
+		0, (TransactionId)100, &owner));
+	UT_ASSERT_EQ(memcmp(&owner, &(ClusterTTSlotCurrentOwner){0}, sizeof(owner)), 0);
+}
+
 
 int
 main(void)
@@ -1205,6 +1240,7 @@ main(void)
 	UT_RUN(test_t48_peer_mode_committed_recycle_waits_for_cluster_floor_cleaner);
 	UT_RUN(test_t49_peer_mode_aborted_remains_directly_recyclable);
 	UT_RUN(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor);
+	UT_RUN(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

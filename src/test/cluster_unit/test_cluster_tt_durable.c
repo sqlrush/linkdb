@@ -44,6 +44,7 @@
 #include "storage/bufpage.h"
 
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_status.h"
@@ -72,6 +73,24 @@ scn_time_cmp(SCN a, SCN b)
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+static ClusterGesTimeoutDetail fake_ges_timeout_detail = {
+	.source = CLUSTER_GES_TSRC_NONE,
+	.master_node = -1,
+	.conflict_holders = -1,
+};
+
+const ClusterGesTimeoutDetail *
+cluster_ges_timeout_detail_get(void)
+{
+	return &fake_ges_timeout_detail;
+}
+
+const char *
+cluster_ges_timeout_src_text(ClusterGesTimeoutSrc src pg_attribute_unused())
+{
+	return "unit-test";
+}
 
 /*
  * R4 D5 expected seam.  Keep the declaration test-local for the immutable

@@ -830,6 +830,27 @@ UT_TEST(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b)
 	UT_ASSERT_EQ((uint64)result.commit_scn, (uint64)proposed);
 	UT_ASSERT_EQ(c0_retention_calls, 0);
 
+	/* A clean four-node formation can have no native-era prehistory at all.
+	 * For a derivable cluster-era xid, covered_hw is therefore legitimately
+	 * zero and is not an admission predicate: stripe ownership plus the
+	 * reader-fenced one-way reuse-disable state is the exact no-raw-reuse
+	 * proof.  This is the r30 happy-path shape. */
+	c0_reset();
+	c0_covered_hw = 0;
+	c0_retention_ok = true;
+	c0_horizon_scn = proposed + 2;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	result = cluster_cr_server_test_own_xid_pair_verdict(
+		4195136, 7, 1, proposed);
+	UT_ASSERT_EQ((int)result.kind,
+				 (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((uint64)result.commit_scn, (uint64)proposed);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_retention_calls, 1);
+	UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK) < c0_event_pos(C0_EV_CLOG));
+	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_RETENTION));
+	UT_ASSERT(c0_event_pos(C0_EV_RETENTION) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
+
 	/* A one-way reuse-disable race invalidates the whole pair before CLOG. */
 	c0_reset();
 	c0_retention_ok = true;
@@ -869,6 +890,14 @@ UT_TEST(test_freshref_c1b_pair_request_canonical_decode)
 	UT_ASSERT_EQ(xid, (TransactionId)4195136);
 	UT_ASSERT_EQ(slot, 1);
 	UT_ASSERT_EQ((uint64)proposed, UINT64_C(10498));
+
+	/* Decode is staging-only.  Exact epoch zero is syntactically canonical;
+	 * the runtime requester/origin pair gate must additionally hold a current
+	 * homogeneous R4 TARGET admission before it can send or consume it. */
+	fwd.epoch = 0;
+	UT_ASSERT(cluster_cr_server_freshref_c1b_pair_request_decode(
+		&fwd, 1, 0, 0, 8, NULL, NULL, NULL, NULL));
+	fwd.epoch = 11;
 
 	/* Every transport/canonical identity axis independently fails closed. */
 	fwd.epoch = 12;

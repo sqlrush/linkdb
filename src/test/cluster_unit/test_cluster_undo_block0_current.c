@@ -71,6 +71,7 @@ static bool fake_poll_throws;
 static bool fake_reply_insert_ok;
 static bool fake_outbound_ok;
 static bool fake_abandon_raced_grant;
+static ClusterGesTimeoutSrc fake_timeout_source;
 static ClusterUndoBlock0Result fake_sample_result;
 static ClusterUndoBlock0Generation fake_sample_generation;
 static bool fake_sample_invalidates_authority;
@@ -106,6 +107,7 @@ static bool fake_smgr_exit_registered;
 
 static int event_sequence;
 static int reserve_event;
+static int reserve_calls;
 static int insert_event;
 static int outbound_event;
 static int reply_delete_calls;
@@ -454,6 +456,7 @@ cluster_grd_try_reserve(const ClusterResId *resid pg_attribute_unused(),
 						const ClusterGrdHolderId *holder pg_attribute_unused(), int mode,
 						int32 self_node_id, bool *fast_path_out, uint64 *gen_snapshot_out)
 {
+	reserve_calls++;
 	reserve_event = ++event_sequence;
 	UT_ASSERT(mode == ShareLock || mode == ExclusiveLock);
 	UT_ASSERT_EQ(self_node_id, cluster_node_id);
@@ -510,6 +513,23 @@ cluster_grd_outbound_enqueue_backend_request(uint32 dest_node_id, const void *pa
 	last_outbound_len = payload_len;
 	memcpy(&last_outbound, payload, Min((Size)payload_len, sizeof(last_outbound)));
 	return fake_outbound_ok;
+}
+
+void
+cluster_ges_timeout_detail_reset(void)
+{
+	fake_timeout_source = CLUSTER_GES_TSRC_NONE;
+}
+
+void
+cluster_ges_timeout_detail_set(ClusterGesTimeoutSrc src,
+							   int32 master_node pg_attribute_unused(),
+							   long elapsed_ms pg_attribute_unused(),
+							   int attempts pg_attribute_unused(),
+							   int conflict_holders pg_attribute_unused(),
+							   int timeout_ms pg_attribute_unused())
+{
+	fake_timeout_source = src;
 }
 
 void
@@ -840,6 +860,7 @@ reset_fixture(void)
 	fake_reply_insert_ok = true;
 	fake_outbound_ok = true;
 	fake_abandon_raced_grant = false;
+	fake_timeout_source = CLUSTER_GES_TSRC_NONE;
 	fake_sample_result = CLUSTER_UNDO_BLOCK0_OK;
 	fake_sample_generation = (ClusterUndoBlock0Generation){ true, 0 };
 	fake_sample_invalidates_authority = false;
@@ -864,6 +885,7 @@ reset_fixture(void)
 	fake_exit_lifo_ok = true;
 	smgr_exit_hook_ensure_calls = 0;
 	event_sequence = reserve_event = insert_event = outbound_event = 0;
+	reserve_calls = 0;
 	reply_delete_calls = reply_poll_calls = 0;
 	reservation_cancel_calls = waiter_cancel_calls = local_release_calls = 0;
 	mirror_release_calls = cancel_wait_calls = cleanup_release_calls = 0;
@@ -1378,6 +1400,50 @@ UT_TEST(test_pending_poll_is_pure_nonblocking_and_keeps_correlation)
 	cluster_undo_block0_current_cancel(&guard);
 }
 
+UT_TEST(test_reservation_capacity_waits_then_retries_exact_round)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+	uint64 request_id;
+	TimestampTz deadline;
+
+	reset_fixture();
+	fake_reserve_result = CLUSTER_GRD_ENTRY_FULL;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(
+				 &key, CLUSTER_UNDO_BLOCK0_SCUR, 1000, &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	request_id = current_guard_data(&guard)->holder.request_id;
+	deadline = current_guard_data(&guard)->deadline;
+	UT_ASSERT_EQ(reserve_calls, 1);
+	UT_ASSERT(!current_guard_data(&guard)->reservation_held);
+	UT_ASSERT(!current_guard_data(&guard)->reply_installed);
+	UT_ASSERT(!current_guard_data(&guard)->request_dispatched);
+	UT_ASSERT_EQ(insert_event, 0);
+	UT_ASSERT_EQ(outbound_event, 0);
+	UT_ASSERT_EQ(failure, CLUSTER_UNDO_BLOCK0_NOT_FOUND);
+
+	/* The original round waits until its bounded retry point. */
+	fake_reserve_result = CLUSTER_GRD_ENTRY_OK;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT_EQ(reserve_calls, 1);
+	UT_ASSERT_EQ(reply_poll_calls, 0);
+	fake_now = current_guard_data(&guard)->next_retry_at;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_poll(&guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_PENDING);
+	UT_ASSERT_EQ(reserve_calls, 2);
+	UT_ASSERT(current_guard_data(&guard)->reservation_held);
+	UT_ASSERT(current_guard_data(&guard)->reply_installed);
+	UT_ASSERT(current_guard_data(&guard)->request_dispatched);
+	UT_ASSERT_EQ(current_guard_data(&guard)->holder.request_id, request_id);
+	UT_ASSERT_EQ(current_guard_data(&guard)->deadline, deadline);
+	UT_ASSERT_EQ(reply_poll_calls, 0);
+	UT_ASSERT(insert_event > reserve_event);
+	UT_ASSERT(outbound_event > insert_event);
+	cluster_undo_block0_current_cancel(&guard);
+}
+
 UT_TEST(test_delivered_grant_promotes_to_held)
 {
 	ClusterUndoBlock0CurrentGuard guard = { 0 };
@@ -1474,6 +1540,24 @@ UT_TEST(test_send_failure_cleans_only_created_local_obligations)
 	UT_ASSERT_EQ(cleanup_release_calls, 0);
 	UT_ASSERT_EQ(reservation_cancel_calls, 1);
 	UT_ASSERT_EQ(reply_delete_calls, 1);
+	UT_ASSERT_EQ(fake_timeout_source, CLUSTER_GES_TSRC_OUTBOUND_RING_FULL);
+}
+
+UT_TEST(test_reply_wait_capacity_records_exact_failure_domain)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Result failure = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+
+	reset_fixture();
+	fake_reply_insert_ok = false;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_SCUR, 1000,
+												 &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_FAILED);
+	UT_ASSERT_EQ(failure, CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+	UT_ASSERT_EQ(fake_timeout_source, CLUSTER_GES_TSRC_REPLY_WAIT_TABLE_FULL);
+	UT_ASSERT_EQ(outbound_event, 0);
+	UT_ASSERT_EQ(reservation_cancel_calls, 1);
 }
 
 UT_TEST(test_nonzero_unused_guard_is_rejected_before_any_mutation)
@@ -2147,7 +2231,7 @@ UT_TEST(test_backend_exit_stages_exact_cleanup_without_poll_or_wait)
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(51);
 	UT_RUN(test_key_guard_and_phase_abi);
 	UT_RUN(test_startup_namespace_check_rejects_every_reserved_or_unfrozen_type);
 	UT_RUN(test_live_owner_resident_preregisters_persistent_exit_hooks);
@@ -2165,11 +2249,13 @@ main(void)
 	UT_RUN(test_live_owner_resident_final_pgrd_drift_unpins_before_xcur_and_source);
 	UT_RUN(test_live_owner_resident_absent_or_invalid_generation_fails_closed);
 	UT_RUN(test_pending_poll_is_pure_nonblocking_and_keeps_correlation);
+	UT_RUN(test_reservation_capacity_waits_then_retries_exact_round);
 	UT_RUN(test_delivered_grant_promotes_to_held);
 	UT_RUN(test_remote_grant_with_failed_promote_stages_reliable_release);
 	UT_RUN(test_local_grant_with_failed_promote_drains_local_holder);
 	UT_RUN(test_cancel_tombstones_exact_pending_and_releases_raced_grant);
 	UT_RUN(test_send_failure_cleans_only_created_local_obligations);
+	UT_RUN(test_reply_wait_capacity_records_exact_failure_domain);
 	UT_RUN(test_nonzero_unused_guard_is_rejected_before_any_mutation);
 	UT_RUN(test_same_resid_nesting_refuses_second_guard_without_touching_first);
 	UT_RUN(test_preflight_failure_restores_reusable_zero_guard);

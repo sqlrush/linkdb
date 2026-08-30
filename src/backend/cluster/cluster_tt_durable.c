@@ -38,6 +38,7 @@
 #include "utils/elog.h"
 
 #include "cluster/cluster_guc.h"		  /* cluster_node_id */
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_scn.h"		  /* SCN, SCN_VALID, InvalidScn */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_cleaner.h" /* spec-3.13 D2-B scan-only pass */
@@ -258,6 +259,7 @@ cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset, 
 	ClusterUndoBlock0CurrentStep step;
 	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	const ClusterGesTimeoutDetail *ges_failure;
 	TTSlot successor;
 	char *resident_page = NULL;
 	bool root_available;
@@ -296,11 +298,16 @@ cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset, 
 		: cluster_undo_block0_current_acquire_begin_live_owner_source(
 			  &key, cluster_ges_request_timeout_ms, admission, &guard,
 			  &current_failure);
-	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+		ges_failure = cluster_ges_timeout_detail_get();
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 				 errmsg("cannot commit a transaction: undo block-zero current authority is unavailable"),
-				 errdetail("segment=%u result=%d", segment_id, (int)current_failure)));
+				 errdetail("segment=%u result=%d source=%s master=%d attempts=%d",
+						   segment_id, (int)current_failure,
+						   cluster_ges_timeout_src_text(ges_failure->source),
+						   ges_failure->master_node, ges_failure->attempts)));
+	}
 	current_active = true;
 
 	/*

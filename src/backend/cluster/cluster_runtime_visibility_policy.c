@@ -99,7 +99,7 @@ cluster_vis_freshref_c1b_pair_request_eligible(
 {
 	return TransactionIdIsNormal(raw_xid) && ref_xid == raw_xid
 		   && has_cached_status && SCN_VALID(cached_commit_scn)
-		   && current_epoch > 0 && current_epoch <= UINT32_MAX
+		   && current_epoch <= UINT32_MAX
 		   && ref_epoch == (uint32)current_epoch
 		   && origin_node >= 0 && origin_node < CLUSTER_MAX_NODES
 		   && local_node >= 0 && local_node < CLUSTER_MAX_NODES

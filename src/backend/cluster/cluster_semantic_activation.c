@@ -8815,6 +8815,7 @@ semantic_activation_ack_lmon_progress_member_barrier(void)
 	if (!semantic_activation_record_read_mailbox_poll_completion(
 			semantic_activation_lmon_record_read_seq, &completion))
 		return true;
+	semantic_activation_lmon_record_read_seq = 0;
 	if (completion.result != CLUSTER_SEMANTIC_ACTIVATION_OK
 		|| completion.implicit_open
 		|| !cluster_semantic_activation_record_decode(
@@ -8938,7 +8939,6 @@ semantic_activation_ack_lmon_progress_member_barrier(void)
 	if (!semantic_activation_ack_table_publish(&next))
 		return true;
 	semantic_activation_ack_local_pending_send = pending;
-	semantic_activation_lmon_record_read_seq = 0;
 	semantic_activation_ack_lmon_send_pending();
 	return true;
 }

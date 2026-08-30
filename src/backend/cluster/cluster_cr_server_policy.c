@@ -183,7 +183,7 @@ cluster_cr_server_freshref_c1b_pair_request_decode(
 	int i;
 
 	if (fwd == NULL || !GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(fwd)
-		|| fwd->request_id == 0 || current_epoch == 0 || fwd->epoch != current_epoch
+		|| fwd->request_id == 0 || fwd->epoch != current_epoch
 		|| authenticated_source_node < 0
 		|| authenticated_source_node >= CLUSTER_MAX_NODES
 		|| local_node < 0 || local_node >= CLUSTER_MAX_NODES

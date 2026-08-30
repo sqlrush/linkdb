@@ -272,6 +272,14 @@ UT_TEST(test_freshref_c1b_pair_request_eligibility)
 {
 	UT_ASSERT(cluster_vis_freshref_c1b_pair_request_eligible(
 		4195136, 4195136, true, (SCN)10498, 11, 11, 1, 0, 7, 1));
+	/* The homogeneous Stage-8 clean formation legitimately carries exact
+	 * epoch zero.  This pure classifier may select that exact pair; the
+	 * requester and origin still require a current R4 TARGET admission before
+	 * any zero-epoch frame can be sent or consumed. */
+	UT_ASSERT(cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, (SCN)10498, 0, 0, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
+		4195136, 4195136, true, (SCN)10498, 1, 0, 1, 0, 7, 1));
 	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
 		4195136, 4195137, true, (SCN)10498, 11, 11, 1, 0, 7, 1));
 	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
@@ -1132,6 +1140,48 @@ UT_TEST(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo)
 	free(source);
 }
 
+UT_TEST(test_freshref_failclosed_records_exact_first_local_predicate)
+{
+	static const char *const diagnostic_fields[] = {
+		"raw_xid",
+		"ref->origin_node_id",
+		"ref->undo_segment_id",
+		"ref->tt_slot_id",
+		"freshref_pair",
+		"(int)v.kind",
+		"exact_locator != NULL",
+		"(int)exact_outcome",
+		"cluster_tx_resolve_reason_name(exact_reason)"
+	};
+	char *source = read_visibility_resolve_source();
+	const char *classifier
+		= source != NULL ? strstr(source, "\nclassify_ref_guts(") : NULL;
+	const char *classifier_end
+		= classifier != NULL ? strstr(classifier, "\n}\n\n/*\n * classify_ref") : NULL;
+	const char *diagnostic
+		= classifier != NULL
+			  ? strstr(classifier, "cluster_vis_log_freshref_unproven(")
+			  : NULL;
+	const char *failclosed
+		= diagnostic != NULL
+			  ? strstr(diagnostic,
+					   "cluster_vis_freshref_verdict_note_failclosed()")
+			  : NULL;
+	size_t i;
+
+	/* This is observability only: the first local fail-closed predicate is
+	 * recorded before the unchanged verdict counter and return path. */
+	UT_ASSERT_NOT_NULL(classifier);
+	UT_ASSERT_NOT_NULL(classifier_end);
+	UT_ASSERT_NOT_NULL(diagnostic);
+	UT_ASSERT_NOT_NULL(failclosed);
+	if (classifier_end != NULL && diagnostic != NULL && failclosed != NULL)
+		UT_ASSERT(diagnostic < failclosed && failclosed < classifier_end);
+	for (i = 0; i < lengthof(diagnostic_fields); i++)
+		UT_ASSERT_NOT_NULL(strstr(source, diagnostic_fields[i]));
+	free(source);
+}
+
 /*
  * The page can contain several live ITL slots from the same cluster epoch.
  * Only the slot carrying the full ref identity may become the status-22 DATA
@@ -1194,7 +1244,7 @@ UT_TEST(test_page_exact_locator_filters_full_ref_before_uniqueness)
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(30);
 	UT_RUN(test_covers_when_epoch_match_and_scn_ge_demand);
 	UT_RUN(test_covers_ignores_cross_thread_lsn);
 	UT_RUN(test_failclosed_when_epoch_differs);
@@ -1223,6 +1273,7 @@ main(void)
 	UT_RUN(test_terminal_remote_wrapper_rejects_in_progress_verdict);
 	UT_RUN(test_pair_eligible_freshref_tries_exact_live_before_terminal_pair);
 	UT_RUN(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo);
+	UT_RUN(test_freshref_failclosed_records_exact_first_local_predicate);
 	UT_RUN(test_page_exact_locator_filters_full_ref_before_uniqueness);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

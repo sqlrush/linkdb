@@ -262,6 +262,49 @@ UT_TEST(test_state_s_and_live_reservations_are_rejected_by_class)
 				 CLUSTER_PCM_OWN_CORRUPT);
 }
 
+UT_TEST(test_aux_pending_observer_accepts_only_exact_existing_reservation)
+{
+	ClusterPcmDirectInitSnapshot snapshot
+		= make_snapshot(CLUSTER_PCM_DIRECT_INIT_VM);
+
+	snapshot.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	snapshot.reservation_token = 9;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
+		CLUSTER_PCM_DIRECT_INIT_VM, &snapshot), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
+		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &snapshot),
+		CLUSTER_PCM_OWN_INVALID);
+
+	snapshot.reservation_token = 0;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
+		CLUSTER_PCM_DIRECT_INIT_VM, &snapshot), CLUSTER_PCM_OWN_STALE);
+	snapshot.reservation_token = UINT64_MAX;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
+		CLUSTER_PCM_DIRECT_INIT_VM, &snapshot), CLUSTER_PCM_OWN_STALE);
+
+	snapshot = make_snapshot(CLUSTER_PCM_DIRECT_INIT_FSM);
+	snapshot.flags = PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING;
+	snapshot.reservation_token = 9;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
+		CLUSTER_PCM_DIRECT_INIT_FSM, &snapshot), CLUSTER_PCM_OWN_CORRUPT);
+
+	snapshot = make_snapshot(CLUSTER_PCM_DIRECT_INIT_FSM);
+	snapshot.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	snapshot.reservation_token = 9;
+	snapshot.page_is_new = false;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
+		CLUSTER_PCM_DIRECT_INIT_FSM, &snapshot), CLUSTER_PCM_OWN_STALE);
+	snapshot.page_is_new = true;
+	snapshot.pcm_state = (uint8)PCM_STATE_X;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
+		CLUSTER_PCM_DIRECT_INIT_FSM, &snapshot), CLUSTER_PCM_OWN_STALE);
+	snapshot.pcm_state = (uint8)PCM_STATE_N;
+	snapshot.generation = UINT64_MAX;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
+		CLUSTER_PCM_DIRECT_INIT_FSM, &snapshot),
+		CLUSTER_PCM_OWN_EXHAUSTED);
+}
+
 UT_TEST(test_revalidate_rejects_state_pin_and_reservation_changes)
 {
 	ClusterPcmDirectInitProof proof;
@@ -493,6 +536,77 @@ UT_TEST(test_vm_fsm_use_dedicated_init_wrappers)
 		UT_ASSERT(strstr(fsm_source, "LockBufferForFreeSpaceMapPageInit(buf)") != NULL);
 		free(fsm_source);
 	}
+}
+
+UT_TEST(test_aux_pending_direct_init_joins_exact_round_without_second_proof)
+{
+	char *source = read_source(BUFMGR_SOURCE_PATH);
+	const char *join_helper;
+	const char *join_helper_end;
+	const char *arm_helper;
+	const char *arm_helper_end;
+	const char *gate;
+	const char *gate_end;
+	const char *aux;
+	const char *aux_end;
+	static const char *const aux_order[] = {
+		"LockBufferForAuxiliaryPageInit(",
+		"cluster_bufmgr_pcm_arm_direct_init(",
+		"CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X",
+		"cluster_bufmgr_pcm_join_aux_direct_init_exact(",
+		"continue;",
+		"cluster_bufmgr_pcm_gate_direct_init("
+	};
+
+	UT_ASSERT(source != NULL);
+	if (source == NULL)
+		return;
+	assert_ordered(source, aux_order, lengthof(aux_order));
+	arm_helper = strstr(source, "cluster_bufmgr_pcm_arm_direct_init(");
+	arm_helper_end = arm_helper != NULL
+		? strstr(arm_helper, "\n}\n") : NULL;
+	UT_ASSERT(arm_helper != NULL && arm_helper_end != NULL);
+	if (arm_helper != NULL && arm_helper_end != NULL) {
+		UT_ASSERT(strstr(arm_helper,
+			"cluster_pcm_direct_init_proof_arm(") < arm_helper_end);
+		UT_ASSERT(strstr(arm_helper,
+			"cluster_pcm_direct_init_aux_pending_observer_validate(")
+			< arm_helper_end);
+	}
+	join_helper = strstr(source,
+		"cluster_bufmgr_pcm_join_aux_direct_init_exact(");
+	join_helper_end = join_helper != NULL
+		? strstr(join_helper, "\n}\n") : NULL;
+	UT_ASSERT(join_helper != NULL && join_helper_end != NULL);
+	if (join_helper != NULL && join_helper_end != NULL) {
+		UT_ASSERT(strstr(join_helper,
+			"cluster_gcs_resource_x_target_direct_init_join_exact(")
+			< join_helper_end);
+		UT_ASSERT(strstr(join_helper,
+			"cluster_gcs_resource_x_target_direct_init_acquire_exact(") == NULL
+			|| strstr(join_helper,
+				"cluster_gcs_resource_x_target_direct_init_acquire_exact(")
+				> join_helper_end);
+		UT_ASSERT(strstr(join_helper,
+			"cluster_pcm_own_reservation_begin_exact(") == NULL
+			|| strstr(join_helper,
+				"cluster_pcm_own_reservation_begin_exact(") > join_helper_end);
+		UT_ASSERT(strstr(join_helper,
+			"cluster_resource_x_writer_path_snapshot(") == NULL
+			|| strstr(join_helper,
+				"cluster_resource_x_writer_path_snapshot(") > join_helper_end);
+	}
+	aux = strstr(source, "LockBufferForAuxiliaryPageInit(");
+	aux_end = aux != NULL ? strstr(aux, "\n}\n") : NULL;
+	UT_ASSERT(aux != NULL && aux_end != NULL);
+	gate = strstr(source, "cluster_bufmgr_pcm_gate_direct_init(");
+	gate_end = gate != NULL ? strstr(gate, "\n}\n") : NULL;
+	UT_ASSERT(gate != NULL && gate_end != NULL);
+	if (gate != NULL && gate_end != NULL)
+		UT_ASSERT(strstr(gate,
+			"cluster_pcm_direct_init_target_pending_validate(")
+			< gate_end);
+	free(source);
 }
 
 UT_TEST(test_valid_n_s_x_without_proof_uses_target_or_s_reservation)
@@ -857,7 +971,7 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(27);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);
@@ -865,6 +979,7 @@ main(void)
 	UT_RUN(test_identity_mismatch_rejects_buf_tag_generation_and_token);
 	UT_RUN(test_reuse_dirty_and_shape_are_rejected);
 	UT_RUN(test_state_s_and_live_reservations_are_rejected_by_class);
+	UT_RUN(test_aux_pending_observer_accepts_only_exact_existing_reservation);
 	UT_RUN(test_revalidate_rejects_state_pin_and_reservation_changes);
 	UT_RUN(test_missing_backend_pin_is_rejected);
 	UT_RUN(test_vm_fsm_fork_and_valid_shape_are_exact);
@@ -876,6 +991,7 @@ main(void)
 	UT_RUN(test_read_miss_and_found_hit_have_no_raw_unproven_lock);
 	UT_RUN(test_extend_proof_is_after_zeroextend_and_before_lock);
 	UT_RUN(test_vm_fsm_use_dedicated_init_wrappers);
+	UT_RUN(test_aux_pending_direct_init_joins_exact_round_without_second_proof);
 	UT_RUN(test_valid_n_s_x_without_proof_uses_target_or_s_reservation);
 	UT_RUN(test_direct_init_one_shot_image_cannot_return_without_x);
 	UT_RUN(test_wire_throw_exact_aborts_reservation_before_rethrow);

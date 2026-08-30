@@ -276,6 +276,16 @@ static bool cluster_undo_touched_in_xact = false;
 static ClusterUndoExtent cluster_undo_current_extent = { 0 };
 
 /*
+ * Exact, process-local receipt for the DATA segment whose records this
+ * backend may expose.  It is not authority: the receipt is revalidated before
+ * every record allocation, and every segment switch requires a fresh exact
+ * publication before the first UBA for that segment is returned.
+ */
+static uint32 cluster_undo_record_block0_publication_segment_id = 0;
+static ClusterUndoBlock0LiveOwnerPublication
+	cluster_undo_record_block0_publication;
+
+/*
  * spec-3.25 D1b: deferred per-(xact,block) undo WAL merge.
  *
  *	D0 (clean CI run 27257818226) measured the per-record XLOG_UNDO_BLOCK_WRITE
@@ -1293,6 +1303,52 @@ claim_undo_extent(ClusterUndoExtent *ext, uint8 owner_instance, uint32 ensured_s
 
 
 /*
+ * Ensure that the actual record extent segment, rather than only the fixed
+ * bootstrap segment, has a current block-zero resident publication before a
+ * record can expose a UBA into it.  Autoextend can change ext->segment_id
+ * behind cluster_undo_active_segment_for_node_or_create(); accepting its
+ * segment-id-only cache left the new DATA segment's direct block0 slot EMPTY.
+ *
+ * The receipt remains non-authorizing.  Every reuse first rechecks its exact
+ * admission/root/generation tuple.  A different segment or a failed recheck
+ * clears the cache and runs the existing live-owner producer.
+ * This helper is called with no lifecycle/content LWLock held.
+ */
+static bool
+cluster_undo_record_ensure_block0_current(uint8 owner_instance,
+									  uint32 segment_id)
+{
+	ClusterUndoBlock0LogicalKey logical;
+	ClusterUndoBlock0LiveOwnerPublication publication;
+
+	if (segment_id == 0 || owner_instance < 1
+		|| owner_instance > UNDO_OWNER_INSTANCE_MAX)
+		return false;
+
+	if (cluster_undo_record_block0_publication_segment_id == segment_id
+		&& cluster_undo_block0_current_live_owner_publication_recheck(
+			&cluster_undo_record_block0_publication))
+		return true;
+
+	cluster_undo_record_block0_publication_segment_id = 0;
+	memset(&cluster_undo_record_block0_publication, 0,
+		   sizeof(cluster_undo_record_block0_publication));
+	logical.owner_instance = owner_instance;
+	logical.segment_id = segment_id;
+	memset(&publication, 0, sizeof(publication));
+	if (cluster_undo_block0_current_live_owner_ensure_resident_exact(
+			&logical, 10000, &publication) != CLUSTER_UNDO_BLOCK0_OK
+		|| !cluster_undo_block0_current_live_owner_publication_recheck(
+			&publication))
+		return false;
+
+	cluster_undo_record_block0_publication = publication;
+	cluster_undo_record_block0_publication_segment_id = segment_id;
+	return true;
+}
+
+
+/*
  * cluster_undo_record_alloc -- record-level allocator main API.
  *
  *	Implementation outline:
@@ -1561,6 +1617,10 @@ cluster_undo_record_alloc_body(uint8 record_type, const ClusterUndoRecordTarget 
 		current_block = ext->cur_block;
 		free_offset = ext->cur_free_offset;
 		slot_count = ext->cur_slot_count;
+	}
+	if (!cluster_undo_record_ensure_block0_current(owner_instance, segment_id)) {
+		cluster_xp_end(&xps);
+		return InvalidUba;
 	}
 
 	/*

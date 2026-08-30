@@ -747,6 +747,78 @@ cluster_tt_slot_current_segment(int node_id)
 
 
 /*
+ * cluster_tt_slot_current_owner_by_xid
+ *
+ *	Return one exact owner snapshot from the allocator's current segment.
+ *	This is a bounded shmem read (48 slots under one SHARED lock): it neither
+ *	initialises an allocator binding nor consults durable TT storage.  A
+ *	duplicate xid or an internally inconsistent status/commit tuple is not a
+ *	canonical owner and therefore fails closed with a zeroed result.
+ */
+bool
+cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
+									 ClusterTTSlotCurrentOwner *out)
+{
+	ClusterTTSlotAllocPerSegment *seg;
+	ClusterTTSlotCurrentOwner found;
+	bool have_owner = false;
+	bool valid = true;
+	int i;
+
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (ClusterTTSlotShm == NULL || node_id < 0
+		|| node_id >= CLUSTER_TT_SLOT_MAX_NODES
+		|| !TransactionIdIsNormal(xid))
+		return false;
+
+	memset(&found, 0, sizeof(found));
+	seg = &ClusterTTSlotShm->per_node[node_id];
+	LWLockAcquire(&seg->lock, LW_SHARED);
+	if (seg->segment_id == 0) {
+		LWLockRelease(&seg->lock);
+		return false;
+	}
+
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const ClusterTTSlotAllocEntry *entry = &seg->slots[i];
+
+		if (entry->status == CTS_FREE || entry->xid != xid)
+			continue;
+		if (have_owner) {
+			valid = false;
+			break;
+		}
+		if ((entry->status == CTS_COMMITTED
+			 && !SCN_VALID(entry->commit_scn))
+			|| ((entry->status == CTS_ACTIVE || entry->status == CTS_ABORTED)
+				&& entry->commit_scn != InvalidScn)
+			|| (entry->status != CTS_ACTIVE
+				&& entry->status != CTS_COMMITTED
+				&& entry->status != CTS_ABORTED)) {
+			valid = false;
+			break;
+		}
+
+		found.segment_id = seg->segment_id;
+		found.xid = entry->xid;
+		found.commit_scn = entry->commit_scn;
+		found.slot_offset = (uint16)i;
+		found.wrap = entry->wrap;
+		found.status = entry->status;
+		have_owner = true;
+	}
+	LWLockRelease(&seg->lock);
+
+	if (!valid || !have_owner)
+		return false;
+	*out = found;
+	return true;
+}
+
+
+/*
  * cluster_tt_slot_rollover -- spec-3.12 D2b.
  *
  *	Rebind the node's TT-slot allocator to `new_segment_id` and reset its 48

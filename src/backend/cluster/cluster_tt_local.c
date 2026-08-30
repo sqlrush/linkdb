@@ -249,20 +249,29 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 		ClusterTTLocalBinding *b;
 		uint32 seg;
 		uint16 off;
-		bool retained_pressure = false;
 
-		/*
-		 * spec-3.12 D2b: allocate on the node's CURRENT TT segment (which may
-		 * have been rolled forward by an earlier retention rollover); only the
-		 * first-ever bind falls back to the fixed spec-3.4b segment id (and
-		 * lazily provisions its file).
-		 */
-		seg = cluster_tt_slot_current_segment(cluster_node_id);
-		if (seg == 0)
-			seg = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
+		for (;;) {
+			bool retained_pressure = false;
 
-		off = cluster_tt_slot_alloc_ext(seg, top_xid, &retained_pressure);
-		if (off == INVALID_TT_SLOT_OFFSET) {
+			/*
+			 * spec-3.12 D2b: allocate on the node's CURRENT TT segment (which may
+			 * have been rolled forward by an earlier retention rollover); only the
+			 * first-ever bind falls back to the fixed spec-3.4b segment id (and
+			 * lazily provisions its file).
+			 *
+			 * C3b/Q11: rollover releases lifecycle_lock while publishing the live
+			 * owner.  A concurrent winner can therefore advance and fill CURRENT
+			 * before this backend resumes.  Always reread and reclassify CURRENT;
+			 * never assume the segment returned by rollover is still fresh.
+			 */
+			seg = cluster_tt_slot_current_segment(cluster_node_id);
+			if (seg == 0)
+				seg = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
+
+			off = cluster_tt_slot_alloc_ext(seg, top_xid, &retained_pressure);
+			if (off != INVALID_TT_SLOT_OFFSET)
+				break;
+
 			if (!retained_pressure)
 				/* All 48 slots ACTIVE -- genuine in-flight concurrency limit. */
 				ereport(
@@ -338,14 +347,6 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 								 "or raise cluster.undo_segments_max_per_instance.")));
 				}
 
-				seg = new_seg;
-				off = cluster_tt_slot_alloc(seg, top_xid);
-				if (off == INVALID_TT_SLOT_OFFSET)
-					ereport(ERROR,
-							(errcode(ERRCODE_INTERNAL_ERROR),
-							 errmsg("cluster TT slot allocator: fresh rollover segment %u already "
-									"full",
-									seg)));
 			}
 		}
 

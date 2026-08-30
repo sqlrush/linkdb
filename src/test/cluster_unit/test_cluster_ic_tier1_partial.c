@@ -297,6 +297,7 @@ cstring_to_text(const char *s)
 /* Router / envelope / chunk / smart-fusion deps of the recv paths —
  * the test never receives an envelope, so these are vacuous. */
 bool cluster_ic_suppress_caps_reply = false;
+static uint64 ut_dispatch_count = 0;
 
 bool
 cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES], ClusterICHelloMsg *out_msg)
@@ -329,6 +330,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	(void)env;
 	(void)payload;
 	(void)peer_id;
+	ut_dispatch_count++;
 	return true;
 }
 
@@ -692,6 +694,37 @@ UT_TEST(test_reconnect_after_close)
 }
 
 /*
+ * S8-815PRE-LMON-RECV-FAIR-01: one continuously readable peer must not pin
+ * the LMON socket-event pass until EAGAIN.  A single call consumes one fixed
+ * frame budget, preserving the next complete frame in the existing per-peer
+ * receive state; the next level-triggered readable wake resumes it.
+ */
+UT_TEST(test_recv_drain_yields_after_bounded_frames)
+{
+	ClusterICEnvelope frames[66];
+	ssize_t sent;
+	int i;
+
+	memset(frames, 0, sizeof(frames));
+	for (i = 0; i < lengthof(frames); i++)
+	{
+		frames[i].msg_type = PGRAC_IC_MSG_HEARTBEAT;
+		frames[i].source_node_id = UT_PEER_ID;
+		frames[i].dest_node_id = cluster_node_id;
+	}
+
+	sent = send(ut_rx_fd, frames, sizeof(frames), 0);
+	UT_ASSERT_EQ(sent, (ssize_t) sizeof(frames));
+
+	ut_dispatch_count = 0;
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(ut_dispatch_count, 64);
+
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(ut_dispatch_count, 66);
+}
+
+/*
  * T-10 (RED core): a second whole frame handed to tier1 while the first
  * frame's tail is still backpressured must not be lost.  Pre-fix code
  * returned WOULD_BLOCK from the drain arm without copying/queueing frame
@@ -949,7 +982,7 @@ UT_TEST(test_close_peer_clears_fifo)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(15);
 
 	UT_RUN(test_connect_registers_peer_fd);
 	UT_RUN(test_initial_eagain_queues_full_frame);
@@ -960,6 +993,7 @@ main(void)
 	UT_RUN(test_close_peer_resets_queued_tail);
 	UT_RUN(test_drain_on_dead_peer_hard_errors);
 	UT_RUN(test_reconnect_after_close);
+	UT_RUN(test_recv_drain_yields_after_bounded_frames);
 	UT_RUN(test_second_frame_survives_backpressure);
 	UT_RUN(test_fifo_preserves_multi_frame_order);
 	UT_RUN(test_backpressured_peer_does_not_block_other_peer);

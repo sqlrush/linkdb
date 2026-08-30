@@ -4520,10 +4520,63 @@ UT_TEST(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22
 	cluster_node_id = saved_node_id;
 }
 
+UT_TEST(test_kind2_origin_capacity_covers_three_remote_c32_bursts)
+{
+	ClusterR4CrForwardPayload forward;
+	ClusterICEnvelope env;
+	ClusterTxLocator locator;
+	int saved_max_backends = MaxBackends;
+	int saved_node_id = cluster_node_id;
+	int i;
+
+	/* Stage-8 PRE has three remote members with C=32.  Every authenticated
+	 * exact request already owns its original reply deadline; the bounded
+	 * process-local continuation pool must retain the whole 3*32 burst rather
+	 * than silently consuming request 5 and later without a reply. */
+	MaxBackends = 96;
+	cluster_node_id = UT_MASTER_NODE;
+	memset(&locator, 0, sizeof(locator));
+	locator.uba = uba_encode(5, 408, 6, 1);
+	locator.xid = (TransactionId)798;
+	locator.tt_wrap = TT_WRAP_INVALID;
+	locator.itl_kind = ITL_FLAG_ACTIVE;
+	locator.itl_slot_index = 3;
+	memset(&forward, 0, sizeof(forward));
+	forward.base.epoch = UT_FORMATION_EPOCH;
+	forward.base.tag = GcsBlockUndoFetchTagMake(5, 408);
+	forward.base.original_requester_node = UT_REQUESTER_NODE;
+	forward.base.master_node = UT_MASTER_NODE;
+	forward.base.transition_id = (uint8)PCM_TRANS_N_TO_S;
+	UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(
+		&forward.extension, CLUSTER_R4_WIRE_TX_RESOLVE, &locator, 9));
+	env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+						  UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
+
+	route_seam_reset();
+	route_seam.admission_result
+		= CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
+	route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
+	for (i = 0; i < 96; i++) {
+		forward.base.request_id = UT_REQUEST_ID + (uint64)i;
+		forward.base.requester_backend_id = i + 1;
+		UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+	}
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 96);
+	UT_ASSERT_EQ(route_seam.enter_calls, 96);
+	UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	UT_ASSERT_EQ(route_seam.raw_send_calls, 96);
+	UT_ASSERT_EQ(route_seam.leave_calls, 96);
+	MaxBackends = saved_max_backends;
+	cluster_node_id = saved_node_id;
+}
+
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(97);
 	UT_RUN(test_01_null_authority_is_protocol);
 	UT_RUN(test_02_null_output_is_protocol);
 	UT_RUN(test_03_canonical_n_has_no_holder);
@@ -4620,6 +4673,7 @@ main(void)
 	UT_RUN(test_kind2_requester_uses_existing_r4_slot_and_lands_status22);
 	UT_RUN(test_kind2_requester_sleep_error_cancels_cv_before_slot_release);
 	UT_RUN(test_kind2_origin_runs_candidate2_cooperatively_and_ships_exact_status22);
+	UT_RUN(test_kind2_origin_capacity_covers_three_remote_c32_bursts);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

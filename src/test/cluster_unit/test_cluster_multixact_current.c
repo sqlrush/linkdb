@@ -112,6 +112,7 @@ static int test_runtime_proof_fail_call;
 static ClusterSemanticAdmissionResult test_runtime_tt_admission;
 static ClusterTTStatusSourceResult test_runtime_tt_source_result;
 static bool test_runtime_origin_proof_source_enabled;
+static bool test_runtime_origin_proof_source_authoritative = true;
 static int test_runtime_origin_proof_source_calls;
 static int test_runtime_describe_send_calls;
 static int test_runtime_describe_capability_calls;
@@ -137,6 +138,9 @@ cluster_cr_server_test_current_mx_build_proof_page(
 	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	ClusterCurrentMxProofReplyPage *page);
+extern int cluster_cr_server_test_current_mx_member_proof_one(
+	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
+	uint32 current_epoch, ClusterCurrentMemberProof *proof);
 
 void
 pfree(void *pointer)
@@ -364,12 +368,13 @@ cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
 								  const ClusterTTStatusSourceRequest *request,
 								  ClusterTTStatusSourceResult *result)
 {
-	if (op == CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID
-		&& test_runtime_origin_proof_source_enabled) {
+	if (op == CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID) {
 		test_runtime_origin_proof_source_calls++;
 		UT_ASSERT_NOT_NULL(request);
 		UT_ASSERT_NOT_NULL(result);
 		memset(result, 0, sizeof(*result));
+		if (!test_runtime_origin_proof_source_enabled)
+			return CLUSTER_SEMANTIC_ADMISSION_OK;
 		result->bool_value = true;
 		result->current_key.origin_node_id = (uint16)cluster_node_id;
 		result->current_key.undo_segment_id = 1;
@@ -379,7 +384,8 @@ cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
 		result->lookup.status = CLUSTER_TT_STATUS_ABORTED;
 		result->lookup.commit_scn = InvalidScn;
 		result->lookup.status_epoch = (uint32)test_runtime_epoch;
-		result->lookup.authoritative = true;
+		result->lookup.authoritative
+			= test_runtime_origin_proof_source_authoritative;
 		return CLUSTER_SEMANTIC_ADMISSION_OK;
 	}
 	UT_ASSERT_EQ(op, CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE);
@@ -2172,10 +2178,57 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 }
 
 
+UT_TEST(test_current_multixact_origin_classifies_member_proof_unknown_stage)
+{
+	ClusterCurrentMemberProof proof;
+
+	/* These are process-local diagnostic stages, not wire values.  The test
+	 * catches a regression that merges a missing own-XID binding with a
+	 * structurally invalid origin proof before the unchanged UNKNOWN reply. */
+	const int stage_ok = 0;
+	const int stage_own_xid_lookup = 1;
+	const int stage_origin_resolve = 2;
+
+	cluster_node_id = 4;
+	test_runtime_epoch = 17;
+	test_runtime_origin_proof_source_calls = 0;
+	test_runtime_origin_proof_source_enabled = false;
+	test_runtime_origin_proof_source_authoritative = true;
+	memset(&proof, 0xa5, sizeof(proof));
+	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_member_proof_one(
+		(TransactionId)501, MultiXactStatusForShare, 0, 17, &proof),
+		stage_own_xid_lookup);
+	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 1);
+	UT_ASSERT_EQ(proof.state, CCM_UNKNOWN);
+
+	test_runtime_origin_proof_source_calls = 0;
+	test_runtime_origin_proof_source_enabled = true;
+	test_runtime_origin_proof_source_authoritative = false;
+	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_member_proof_one(
+		(TransactionId)501, MultiXactStatusForShare, 0, 17, &proof),
+		stage_origin_resolve);
+	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 1);
+	UT_ASSERT_EQ(proof.state, CCM_UNKNOWN);
+
+	test_runtime_origin_proof_source_calls = 0;
+	test_runtime_origin_proof_source_authoritative = true;
+	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_member_proof_one(
+		(TransactionId)501, MultiXactStatusForShare, 0, 17, &proof),
+		stage_ok);
+	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 1);
+	UT_ASSERT_EQ(proof.member_xid, (TransactionId)501);
+	UT_ASSERT_EQ(proof.state, CCM_ABORTED);
+
+	test_runtime_origin_proof_source_enabled = false;
+	test_runtime_origin_proof_source_authoritative = true;
+	cluster_node_id = -1;
+}
+
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(29);
 	UT_RUN(test_current_multixact_public_symbols_link);
 	UT_RUN(test_current_multixact_router_domain_binding);
 	UT_RUN(test_current_multixact_descriptor_validation);
@@ -2204,6 +2257,7 @@ main(void)
 	UT_RUN(test_current_multixact_origin_serves_describe_on_capability_bound_reply);
 	UT_RUN(test_current_multixact_origin_builds_strict_member_proof_page);
 	UT_RUN(test_current_multixact_origin_serves_member_proof_on_capability_bound_reply);
+	UT_RUN(test_current_multixact_origin_classifies_member_proof_unknown_stage);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

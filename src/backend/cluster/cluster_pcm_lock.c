@@ -10601,6 +10601,7 @@ pcm_resource_x_bootstrap_round_step_internal(
 	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
 	uint64 direct_init_ownership_generation,
 	uint64 direct_init_reservation_token,
+	bool allow_create,
 	bool cached_local_x, uint64 cached_ownership_generation,
 	ResourceXDecodedFrame *dispatch_out,
 	ResourceXAcquisitionRef *terminal_ref_out)
@@ -10658,16 +10659,51 @@ pcm_resource_x_bootstrap_round_step_internal(
 		|| !cluster_pcm_lock_resource_x_gate_open_exact(resource_formation))
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 
-	if (!pcm_entry_ref_acquire(&assertion->resource, true,
+	if (!pcm_entry_ref_acquire(&assertion->resource, allow_create,
 			&entry_ref, &acquire_result)) {
-		if (acquire_result == PCM_ENTRY_ACQUIRE_NO_CAPACITY)
+		if (allow_create
+			&& acquire_result == PCM_ENTRY_ACQUIRE_NO_CAPACITY)
 			return RESOURCE_X_BOOTSTRAP_ROUND_BACKPRESSURE;
 		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	}
 	entry = entry_ref.entry;
 
-	pcm_entry_lock_exclusive(entry);
+	if (allow_create)
+		pcm_entry_lock_exclusive(entry);
+	else {
+		/* A rejected observer must be byte-for-byte side-effect free.  Delay
+		 * the conservative semantic-mutation sequence mark until the exact
+		 * already-frozen round has been proven joinable. */
+		pgstat_report_wait_start(WAIT_EVENT_PCM_TRANSITION_APPLY);
+		LWLockAcquire(&entry->entry_lock.lock, LW_EXCLUSIVE);
+		pgstat_report_wait_end();
+	}
 	round = &entry->resource_x_bootstrap_round;
+	/* A pending-sidecar observer is a follower, never a requester-round
+	 * creator.  Reject every unjoinable shape before owner expiry, binding
+	 * cleanup, terminal mutation, or deadline transition.  Its caller must
+	 * present the round's already-frozen deadline byte-exactly. */
+	if (!allow_create
+		&& (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			|| round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+			|| round->absolute_deadline_us == 0
+			|| round->absolute_deadline_us == UINT64_MAX
+			|| absolute_deadline_us != round->absolute_deadline_us
+			|| now_us >= round->absolute_deadline_us
+			|| !pcm_resource_x_bootstrap_round_identity_matches(
+				round, assertion, current_master_node,
+				resource_formation, master_session_incarnation,
+				r4_record_generation,
+				requester_sender_connection_generation,
+				master_ingress_connection_generation, retry_slice_us,
+				direct_init_ownership_generation,
+				direct_init_reservation_token))) {
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+	}
+	if (!allow_create)
+		pcm_resource_x_semantic_mutation_mark();
 	if (!pcm_resource_x_local_owner_valid_locked(
 			&entry->resource_x_local_owner)) {
 		if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
@@ -10942,7 +10978,7 @@ cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
 		master_session_incarnation, r4_record_generation,
 		requester_sender_connection_generation,
 		master_ingress_connection_generation, absolute_deadline_us,
-		now_us, retry_slice_us, 0, 0, cached_local_x,
+		now_us, retry_slice_us, 0, 0, true, cached_local_x,
 		cached_ownership_generation, dispatch_out, terminal_ref_out);
 }
 
@@ -10968,8 +11004,205 @@ cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
 		requester_sender_connection_generation,
 		master_ingress_connection_generation, absolute_deadline_us,
 		now_us, retry_slice_us, direct_init_ownership_generation,
-		direct_init_reservation_token, cached_local_x,
+		direct_init_reservation_token, true, cached_local_x,
 		cached_ownership_generation, dispatch_out, terminal_ref_out);
+}
+
+/* Snapshot only the already-frozen direct-init follower budget.  This is a
+ * read-only admission probe: an EMPTY/failed/expired or inexact round cannot
+ * allocate an attempt, clear a binding, advance a phase, or mint a deadline. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
+	const ResourceXAssertion *assertion,
+	uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token,
+	uint64 now_us,
+	uint64 *r4_record_generation_out,
+	uint64 *absolute_deadline_us_out)
+{
+	ClusterPcmResourceXBootstrapRound *round;
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+
+	if (r4_record_generation_out != NULL)
+		*r4_record_generation_out = 0;
+	if (absolute_deadline_us_out != NULL)
+		*absolute_deadline_us_out = 0;
+	if (!resource_x_assertion_valid(assertion)
+		|| assertion->requester_node != cluster_node_id
+		|| direct_init_ownership_generation == UINT64_MAX
+		|| direct_init_reservation_token == 0
+		|| direct_init_reservation_token == UINT64_MAX
+		|| now_us == 0 || now_us == UINT64_MAX
+		|| r4_record_generation_out == NULL
+		|| absolute_deadline_us_out == NULL)
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(&assertion->resource, false,
+			&entry_ref, &acquire_result))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = entry_ref.entry;
+
+	LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+	round = &entry->resource_x_bootstrap_round;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
+		result = RESOURCE_X_APPLY_NOT_FOUND;
+	else if (!resource_x_assertion_equal(
+			&round->request.logical_assertion, assertion)
+			|| round->direct_init_ownership_generation
+				!= direct_init_ownership_generation
+			|| round->direct_init_reservation_token
+				!= direct_init_reservation_token)
+		result = RESOURCE_X_APPLY_STALE;
+	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED
+			 || round->r4_record_generation == 0
+			 || round->r4_record_generation == UINT64_MAX
+			 || round->absolute_deadline_us == 0
+			 || round->absolute_deadline_us == UINT64_MAX
+			 || now_us >= round->absolute_deadline_us)
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED
+			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_BASE_BOUND
+			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else {
+		*r4_record_generation_out = round->r4_record_generation;
+		*absolute_deadline_us_out = round->absolute_deadline_us;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
+}
+
+ResourceXBootstrapRoundAction
+cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node,
+	uint64 resource_formation, uint64 master_session_incarnation,
+	uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation,
+	uint32 master_ingress_connection_generation,
+	uint64 absolute_deadline_us, uint64 now_us, uint64 retry_slice_us,
+	uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token,
+	bool cached_local_x, uint64 cached_ownership_generation,
+	ResourceXDecodedFrame *dispatch_out,
+	ResourceXAcquisitionRef *terminal_ref_out)
+{
+	if (direct_init_reservation_token == 0)
+		return RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+	return pcm_resource_x_bootstrap_round_step_internal(
+		assertion, current_master_node, resource_formation,
+		master_session_incarnation, r4_record_generation,
+		requester_sender_connection_generation,
+		master_ingress_connection_generation, absolute_deadline_us,
+		now_us, retry_slice_us, direct_init_ownership_generation,
+		direct_init_reservation_token, false, cached_local_x,
+		cached_ownership_generation, dispatch_out, terminal_ref_out);
+}
+
+/* A dispatch-side authority recheck can fail while the requester-local kind-9
+ * round remains pre-ACK/pre-ASSERT.  Its request may already have installed a
+ * master RECEIVED receipt, but that receipt is explicitly non-authority and a
+ * same-requester higher attempt may replace it before ASSERT consumption.
+ * Clear only a byte-exact REQUEST_DISPATCHED binding so the caller recaptures
+ * current authority under the same absolute deadline; retain the monotonic
+ * attempt floor and reject every post-ACK or inexact shape. */
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_exact(
+	const ResourceXDecodedFrame *request, int32 expected_master_node,
+	uint64 expected_r4_record_generation,
+	uint32 expected_master_ingress_connection_generation,
+	uint64 expected_retry_slice_us, uint64 expected_absolute_deadline_us,
+	uint64 expected_direct_init_ownership_generation,
+	uint64 expected_direct_init_reservation_token)
+{
+	ClusterPcmResourceXBootstrapRound *round;
+	PcmEntryRef entry_ref;
+	PcmEntryAcquireResult acquire_result;
+	struct GrdEntry *entry;
+	ResourceXApplyResult result;
+	bool broadcast = false;
+
+	if (request == NULL
+		|| request->kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
+		|| request->payload_bytes != RESOURCE_X_CONTROL_V1_BYTES
+		|| request->blocked_has_remote_proof
+		|| !resource_x_assertion_valid(
+			&request->common.logical_assertion)
+		|| request->common.logical_assertion.requester_node
+			!= cluster_node_id
+		|| expected_master_node < 0
+		|| expected_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| expected_r4_record_generation == 0
+		|| expected_r4_record_generation == UINT64_MAX
+		|| expected_master_ingress_connection_generation == 0
+		|| expected_master_ingress_connection_generation == UINT32_MAX
+		|| expected_retry_slice_us == 0
+		|| expected_retry_slice_us == UINT64_MAX
+		|| expected_absolute_deadline_us == 0
+		|| expected_absolute_deadline_us == UINT64_MAX
+		|| expected_direct_init_ownership_generation == UINT64_MAX
+		|| expected_direct_init_reservation_token == UINT64_MAX
+		|| (expected_direct_init_reservation_token == 0
+			&& expected_direct_init_ownership_generation != 0))
+		return RESOURCE_X_APPLY_INVALID;
+	if (!pcm_entry_ref_acquire(
+			&request->common.logical_assertion.resource, false,
+			&entry_ref, &acquire_result))
+		return RESOURCE_X_APPLY_NOT_FOUND;
+	entry = entry_ref.entry;
+
+	pcm_entry_lock_exclusive(entry);
+	round = &entry->resource_x_bootstrap_round;
+	if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY)
+		result = RESOURCE_X_APPLY_NOT_FOUND;
+	else if (!pcm_resource_x_common_equal(
+			&round->request, &request->common)
+			 || !pcm_resource_x_bootstrap_round_identity_matches(
+				round, &request->common.logical_assertion,
+				expected_master_node,
+				request->common.resource_formation,
+				request->common.master_session_incarnation,
+				expected_r4_record_generation,
+				request->common.sender_connection_generation,
+				expected_master_ingress_connection_generation,
+				expected_retry_slice_us,
+				expected_direct_init_ownership_generation,
+				expected_direct_init_reservation_token)
+			 || round->absolute_deadline_us
+				!= expected_absolute_deadline_us
+			 || round->request.assertion_sequence
+				!= round->highest_attempt_floor)
+		result = RESOURCE_X_APPLY_STALE;
+	else if (round->phase
+			 != RESOURCE_X_BOOTSTRAP_ROUND_REQUEST_DISPATCHED)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (!pcm_resource_x_local_owner_valid_locked(
+			&entry->resource_x_local_owner))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else if (entry->resource_x_local_owner.state
+			 != RESOURCE_X_LOCAL_OWNER_EMPTY)
+		result = RESOURCE_X_APPLY_BAD_STATE;
+	else if (round->accepted_base != 0
+			 || round->terminal_authority_generation != 0
+			 || round->cached_ownership_generation != 0
+			 || round->ack.assertion_sequence != 0
+			 || round->assertion.assertion_sequence != 0
+			 || pcm_resource_x_ref_valid(&round->terminal_ref))
+		result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	else {
+		pcm_resource_x_bootstrap_round_clear_binding_locked(round);
+		broadcast = true;
+		result = RESOURCE_X_APPLY_APPLIED;
+	}
+	if (broadcast)
+		ConditionVariableBroadcast(&entry->wait_cv);
+	LWLockRelease(&entry->entry_lock.lock);
+	pcm_entry_ref_release(&entry_ref);
+	return result;
 }
 
 ResourceXBootstrapRoundAction

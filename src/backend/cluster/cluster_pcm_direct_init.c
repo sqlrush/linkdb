@@ -157,6 +157,37 @@ cluster_pcm_direct_init_target_shape_validate(
 	return CLUSTER_PCM_OWN_OK;
 }
 
+/* A second VM/FSM initializer may observe the exact GRANT_PENDING sidecar
+ * published by the process-local proof owner.  This predicate grants no
+ * initialization authority and cannot arm a proof: it only validates the
+ * immutable known-new shape needed to join that existing Resource-X round. */
+ClusterPcmOwnResult
+cluster_pcm_direct_init_aux_pending_observer_validate(
+	ClusterPcmDirectInitKind kind,
+	const ClusterPcmDirectInitSnapshot *snapshot)
+{
+	ClusterPcmOwnResult live_result;
+
+	if ((kind != CLUSTER_PCM_DIRECT_INIT_VM
+		 && kind != CLUSTER_PCM_DIRECT_INIT_FSM)
+		|| snapshot == NULL)
+		return CLUSTER_PCM_OWN_INVALID;
+	if (snapshot->generation == UINT64_MAX)
+		return CLUSTER_PCM_OWN_EXHAUSTED;
+	if (snapshot->reservation_token == 0
+		|| snapshot->reservation_token == UINT64_MAX)
+		return CLUSTER_PCM_OWN_STALE;
+	if (snapshot->flags != PCM_OWN_FLAG_GRANT_PENDING) {
+		live_result = cluster_pcm_own_classify_live_flags(
+			snapshot->flags, snapshot->reservation_token);
+		return live_result == CLUSTER_PCM_OWN_OK
+			? CLUSTER_PCM_OWN_STALE : live_result;
+	}
+	return cluster_pcm_direct_init_target_shape_validate(
+		kind, snapshot, (uint8)BUF_TYPE_CURRENT, (uint8)PCM_STATE_N,
+		PCM_OWN_FLAG_GRANT_PENDING);
+}
+
 static bool
 cluster_pcm_direct_init_target_identity_matches(
 	const ClusterPcmDirectInitSnapshot *snapshot,

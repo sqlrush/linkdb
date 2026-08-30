@@ -71,6 +71,7 @@
  * (false-negative) direction.
  */
 static int8 vis_origin_materialized_cache[CLUSTER_WAL_STATE_SLOT_COUNT]; /* 0 ? / 1 / -1 */
+static bool vis_freshref_first_unproven_logged = false;
 
 /* Round-3b RISK-1: the pure prehistory status mapper mirrors the CLOG
  * alphabet without dragging clog.h into the standalone unit layer; pin the
@@ -232,6 +233,7 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 	ClusterTTStatusResult result;
 	ClusterTTStatusSourceRequest source_request;
 	ClusterTTStatusSourceResult source_result;
+	bool defer_slotless_origin_pull;
 	ClusterXpScope xp_scope = { .active = false }; /* PGRAC: spec-5.59 D3 profiling */
 
 	cluster_xp_begin(&xp_scope, CLXP_R_TT_VISIBILITY_RESOLVE);
@@ -293,6 +295,20 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 		}
 	}
 
+	/*
+	 * The legacy overlay-miss pull carries no exact slot identity and may only
+	 * return a snapshot-relative bound.  A pair-eligible fresh ref has a
+	 * stronger frozen route: ordinary authoritative exact-slot first, then C1b
+	 * only if that result is unproven.  Do not let the slotless pull shadow that
+	 * route; eligibility is rechecked immediately before the exact request.
+	 */
+	defer_slotless_origin_pull = cluster_vis_freshref_c1b_pair_request_eligible(
+		raw_xid, ref->local_xid, ref->has_cached_status,
+		ref->cached_commit_scn, ref->cluster_epoch,
+		cluster_epoch_get_current(), (int32)ref->origin_node_id,
+		cluster_node_id, (uint32)ref->undo_segment_id,
+		(uint32)ref->tt_slot_id);
+
 	memset(&source_request, 0, sizeof(source_request));
 	source_request.key = &key;
 	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request, &source_result)
@@ -302,7 +318,8 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
 		/* PGRAC: spec-7.1a D4 -- overlay miss on a LIVE remote ref: pull the
 		 * origin verdict instead of staying UNKNOWN forever (HC181). */
-		resolve_live_overlay_miss_via_origin(raw_xid, ref, read_scn, &key, out);
+		if (!defer_slotless_origin_pull)
+			resolve_live_overlay_miss_via_origin(raw_xid, ref, read_scn, &key, out);
 		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;					   /* UNKNOWN -> caller 53R97 (C-V2: no PG-native fallback) */
 	}
@@ -321,7 +338,8 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 		/* PGRAC: spec-6.12c D0 -- lookup performed; no terminal verdict. */
 		cluster_lever_c_note_tt_lookup(ref->has_cached_status, false);
 		/* PGRAC: spec-7.1a D4 -- subtrans-chain miss: same origin pull. */
-		resolve_live_overlay_miss_via_origin(raw_xid, ref, read_scn, &key, out);
+		if (!defer_slotless_origin_pull)
+			resolve_live_overlay_miss_via_origin(raw_xid, ref, read_scn, &key, out);
 		cluster_xp_end(&xp_scope); /* PGRAC: spec-5.59 D3 profiling */
 		return;
 	}
@@ -346,6 +364,29 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 
 	/* PGRAC: spec-5.59 D3 profiling */
 	cluster_xp_end(&xp_scope);
+}
+
+static void
+cluster_vis_log_freshref_unproven(
+	TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
+	bool freshref_pair, ClusterUndoVerdictResult v,
+	const ClusterTxLocator *exact_locator, ClusterTxOutcome exact_outcome,
+	ClusterTxResolveReason exact_reason)
+{
+	if (vis_freshref_first_unproven_logged || ref == NULL)
+		return;
+	vis_freshref_first_unproven_logged = true;
+	elog(LOG,
+		 "PGRAC fresh-ref first unproven: xid=%u origin=%u segment=%u slot=%u "
+		 "ref_epoch=%u cached=%d cached_scn=" UINT64_FORMAT
+		 " freshref_pair=%d undo_verdict=%d exact_locator=%d "
+		 "exact_outcome=%d exact_reason=%s",
+		 raw_xid, (unsigned)ref->origin_node_id,
+		 (unsigned)ref->undo_segment_id, (unsigned)ref->tt_slot_id,
+		 ref->cluster_epoch, ref->has_cached_status,
+		 (uint64)ref->cached_commit_scn, freshref_pair, (int)v.kind,
+		 exact_locator != NULL, (int)exact_outcome,
+		 cluster_tx_resolve_reason_name(exact_reason));
 }
 
 
@@ -763,6 +804,29 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 							true /* fresh ref: physical-binding authority */);
 
 			if (cluster_vis_from_undo_verdict(v, out)) {
+				/* O2: an origin-proven exact terminal is immutable and may use
+				 * the existing backend-local, lxid-bound memo.  A bound or live
+				 * result remains request/snapshot relative and is never installed. */
+				if ((v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+					 && SCN_VALID(v.commit_scn))
+					|| v.kind == CLUSTER_UNDO_VERDICT_ABORTED) {
+					ClusterTTStatusKey memo_key;
+
+					memset(&memo_key, 0, sizeof(memo_key));
+					memo_key.origin_node_id = ref->origin_node_id;
+					memo_key.undo_segment_id = ref->undo_segment_id;
+					memo_key.tt_slot_id = ref->tt_slot_id;
+					memo_key.cluster_epoch = ref->cluster_epoch;
+					memo_key.local_xid = raw_xid;
+					cluster_vis_memo_install(
+						&memo_key,
+						v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+							? (uint8)CLUSTER_TT_STATUS_COMMITTED
+							: (uint8)CLUSTER_TT_STATUS_ABORTED,
+						v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+							? v.commit_scn
+							: InvalidScn);
+				}
 				cluster_vis_freshref_verdict_note_resolved();
 				return;
 			}
@@ -786,6 +850,9 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			}
 			/* Both reduced-key verdicts and the exact DATA->TT resolver are
 			 * unproven.  The latter never returns BOUND or installs a memo. */
+			cluster_vis_log_freshref_unproven(
+				raw_xid, ref, freshref_pair, v, exact_locator,
+				exact_outcome, exact_reason);
 			cluster_vis_freshref_verdict_note_failclosed();
 			break;
 		}

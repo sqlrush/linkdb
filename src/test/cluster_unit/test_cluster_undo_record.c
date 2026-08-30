@@ -910,11 +910,72 @@ UT_TEST(test_tt_rollover_publishes_current_before_binding_exposure)
 	free(source);
 }
 
+/* A record autoextend may publish a DATA segment different from the fixed
+ * segment returned by cluster_undo_active_segment_for_node_or_create().  The
+ * actual extent segment must therefore have an exact block0-current
+ * publication before the first undo record can expose a UBA for that segment.
+ * A process-local cache is usable only after its exact publication receipt is
+ * rechecked; a segment-id-only boolean must never authorize the write. */
+UT_TEST(test_record_segment_publishes_block0_current_before_uba_write)
+{
+	char *source = read_undo_record_source();
+	const char *helper;
+	const char *body;
+	const char *body_end;
+	const char *publication_recheck;
+	const char *ensure_exact;
+	const char *transaction_only_fast;
+	const char *actual_segment;
+	const char *ensure_actual;
+	const char *first_record_io;
+
+	if (source == NULL)
+		return;
+	helper = strstr(source, "\ncluster_undo_record_ensure_block0_current(");
+	body = strstr(source, "\ncluster_undo_record_alloc_body(");
+	body_end = body == NULL ? NULL
+		: strstr(body, "\n}\n\n\nUBA\ncluster_undo_record_alloc(");
+	publication_recheck = helper == NULL ? NULL
+		: strstr(helper,
+			"cluster_undo_block0_current_live_owner_publication_recheck(");
+	ensure_exact = publication_recheck == NULL ? NULL
+		: strstr(publication_recheck,
+			"cluster_undo_block0_current_live_owner_ensure_resident_exact(");
+	transaction_only_fast = helper == NULL ? NULL
+		: strstr(helper, "publication_validated_this_xact");
+	actual_segment = body == NULL ? NULL
+		: strstr(body, "segment_id = ext->segment_id;");
+	ensure_actual = actual_segment == NULL ? NULL
+		: strstr(actual_segment,
+			"cluster_undo_record_ensure_block0_current(owner_instance, segment_id)");
+	first_record_io = ensure_actual == NULL ? NULL
+		: strstr(ensure_actual, "use_defer =");
+
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(body);
+	UT_ASSERT_NOT_NULL(body_end);
+	UT_ASSERT_NOT_NULL(publication_recheck);
+	UT_ASSERT_NOT_NULL(ensure_exact);
+	UT_ASSERT_NOT_NULL(actual_segment);
+	UT_ASSERT_NOT_NULL(ensure_actual);
+	UT_ASSERT_NOT_NULL(first_record_io);
+	UT_ASSERT(transaction_only_fast == NULL || transaction_only_fast >= body);
+	if (helper != NULL && body != NULL && body_end != NULL
+		&& publication_recheck != NULL && ensure_exact != NULL
+		&& actual_segment != NULL && ensure_actual != NULL
+		&& first_record_io != NULL)
+		UT_ASSERT(helper < body && publication_recheck < ensure_exact
+				  && actual_segment < ensure_actual
+				  && ensure_actual < first_record_io
+				  && first_record_io < body_end);
+	free(source);
+}
+
 
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);
@@ -937,6 +998,7 @@ main(int argc, char **argv)
 	UT_RUN(test_undo_effective_cap_clamps_and_never_falls_below_current);
 	UT_RUN(test_record_allocator_owns_modifier_debt_outside_lifecycle_locks);
 	UT_RUN(test_tt_rollover_publishes_current_before_binding_exposure);
+	UT_RUN(test_record_segment_publishes_block0_current_before_uba_write);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

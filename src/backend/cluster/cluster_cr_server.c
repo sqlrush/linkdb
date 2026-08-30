@@ -58,6 +58,7 @@
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_r4_observe.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_elog.h" /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block_dedup.h" /* PGRAC: spec-7.3 P2-1 — note_misroute */
@@ -2240,8 +2241,8 @@ lms_resolve_own_xid_freshref_c1b_pair(
 
 	if (!TransactionIdIsNormal(xid) || expected_segment_id == 0
 		|| expected_segment_id > UINT16_MAX || expected_tt_slot_id < 1
-		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT || !SCN_VALID(proposed_scn)
-		|| cluster_cr_native_prehistory_covered_hw() == 0)
+		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT
+		|| !SCN_VALID(proposed_scn))
 		return LMS_OWN_XID_REFUSE_OTHER;
 
 	PG_TRY(freshref_pair);
@@ -2250,8 +2251,11 @@ lms_resolve_own_xid_freshref_c1b_pair(
 		bool xid_is_mine;
 
 		cluster_cr_native_prehistory_reader_lock();
-		no_raw_reuse_window = cluster_cr_native_prehistory_covered_hw() != 0
-								  && !cluster_cr_native_prehistory_disabled();
+		/* The pair is restricted to a derivable cluster-era xid below.  A
+		 * clean formation may legitimately have no native-era prehistory, so
+		 * covered_hw is not an admission predicate.  The existing reader
+		 * fence plus its one-way disable is the exact no-raw-reuse window. */
+		no_raw_reuse_window = !cluster_cr_native_prehistory_disabled();
 		xid_is_mine = no_raw_reuse_window && cluster_xid_is_mine(xid);
 
 		if (xid_is_mine) {
@@ -2707,7 +2711,12 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	uint32 pair_slot = 0;
 	TransactionId pair_xid = InvalidTransactionId;
 	bool freshref_pair = SCN_VALID(slot->read_scn);
+	bool zero_epoch_pair = freshref_pair && slot->epoch == 0;
+	bool zero_epoch_current = false;
+	ClusterSemanticAdmissionToken zero_epoch_admission;
 	LmsOwnXidReason reason;
+
+	memset(&zero_epoch_admission, 0, sizeof(zero_epoch_admission));
 
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
@@ -2717,7 +2726,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	}
 	if (freshref_pair
 		&& (!slot->undo_authoritative || slot->undo_owner != -1
-			|| slot->epoch == 0 || slot->epoch != cluster_epoch_get_current()
+			|| slot->epoch != cluster_epoch_get_current()
 			|| !GcsBlockUndoFreshRefC1bTagDecode(
 				slot->tag, &pair_segment, &pair_xid, &pair_slot)
 			|| pair_segment != slot->undo_segment_id || pair_xid != xid
@@ -2738,24 +2747,62 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		return false;
 	}
 
-	/* Co-sample the authority triple BEFORE the scan (see banner). */
-	slot->undo_auth.origin_epoch = cluster_epoch_get_current();
-	slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
-	slot->undo_auth.tt_generation = cluster_undo_tt_retention_rollover_count();
-	/* PGRAC: spec-7.1a D3 -- co-sample the origin SCN clock with the same
-	 * pre-content-read ordering (a stamp landing after the sample only makes
-	 * the content newer than claimed; additive and safe). */
-	slot->undo_auth.authority_scn = cluster_scn_current();
+	/* Exact epoch zero is a legitimate clean-formation identity, but only
+	 * while an ordinary current R4 TARGET token continuously covers the
+	 * origin proof.  Non-zero rounds retain their existing epoch binding. */
+	if (zero_epoch_pair) {
+		if (!cluster_runtime_visibility_zero_epoch_pair_admission_enter(
+				&zero_epoch_admission)) {
+			cluster_vis53r97_note_srv_other();
+			return false;
+		}
+		PG_TRY();
+		{
+			slot->undo_auth.origin_epoch = cluster_epoch_get_current();
+			slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
+			slot->undo_auth.tt_generation
+				= cluster_undo_tt_retention_rollover_count();
+			slot->undo_auth.authority_scn = cluster_scn_current();
+			reason = lms_resolve_own_xid_freshref_c1b_pair(
+				xid, slot->undo_segment_id, slot->undo_block_no,
+				slot->read_scn, &verdict, &commit_scn, &horizon_scn,
+				&wrap);
+			zero_epoch_current
+				= cluster_semantic_activation_recheck(
+					&zero_epoch_admission);
+		}
+		PG_FINALLY();
+		{
+			cluster_semantic_activation_leave(&zero_epoch_admission);
+		}
+		PG_END_TRY();
+		if (!zero_epoch_current) {
+			cluster_vis53r97_note_srv_other();
+			return false;
+		}
+	} else {
+		/* Co-sample the authority triple BEFORE the scan (see banner). */
+		slot->undo_auth.origin_epoch = cluster_epoch_get_current();
+		slot->undo_auth.live_hwm_lsn = GetFlushRecPtr(NULL);
+		slot->undo_auth.tt_generation
+			= cluster_undo_tt_retention_rollover_count();
+		/* PGRAC: spec-7.1a D3 -- co-sample the origin SCN clock with the same
+		 * pre-content-read ordering (a stamp landing after the sample only makes
+		 * the content newer than claimed; additive and safe). */
+		slot->undo_auth.authority_scn = cluster_scn_current();
 
-	/* Resolve the terminal/live verdict via the shared core; attribute the census leg. */
-	if (freshref_pair)
-		reason = lms_resolve_own_xid_freshref_c1b_pair(
-			xid, slot->undo_segment_id, slot->undo_block_no, slot->read_scn,
-			&verdict, &commit_scn, &horizon_scn, &wrap);
-	else
+		/* Resolve the terminal/live verdict via the shared core; attribute the
+		 * census leg. */
+		if (freshref_pair)
+			reason = lms_resolve_own_xid_freshref_c1b_pair(
+				xid, slot->undo_segment_id, slot->undo_block_no,
+				slot->read_scn, &verdict, &commit_scn, &horizon_scn,
+				&wrap);
+		else
 		reason = lms_resolve_own_xid_verdict(
 			xid, slot->undo_segment_id, slot->undo_block_no,
 			slot->undo_authoritative, &verdict, &commit_scn, &horizon_scn, &wrap);
+	}
 	if (freshref_pair
 		&& (slot->epoch != cluster_epoch_get_current()
 			|| slot->undo_auth.origin_epoch != slot->epoch
@@ -3672,6 +3719,75 @@ cr_current_mx_source_lookup_current_own_xid(
 	return true;
 }
 
+typedef enum CrCurrentMxMemberProofStage {
+	CR_CURRENT_MX_MEMBER_PROOF_OK = 0,
+	CR_CURRENT_MX_MEMBER_PROOF_OWN_XID_LOOKUP = 1,
+	CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE = 2
+} CrCurrentMxMemberProofStage;
+
+static CrCurrentMxMemberProofStage
+cr_current_mx_member_proof_one(
+	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
+	uint32 current_epoch, ClusterCurrentMemberProof *proof)
+{
+	ClusterTTStatusKey initial_key;
+	ClusterTTStatusResult initial_result;
+
+	if (proof == NULL)
+		return CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE;
+	memset(proof, 0, sizeof(*proof));
+	proof->state = CCM_UNKNOWN;
+	if (!cr_current_mx_source_lookup_current_own_xid(
+			member_xid, &initial_key, &initial_result))
+		return CR_CURRENT_MX_MEMBER_PROOF_OWN_XID_LOOKUP;
+	if (!cluster_multixact_current_resolve_origin_member_proof(
+			member_xid, member_status, member_ordinal,
+			(uint16)cluster_node_id, current_epoch, false,
+			&initial_key, &initial_result,
+			cr_current_mx_source_exact_lookup, NULL, proof))
+		return CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE;
+	return CR_CURRENT_MX_MEMBER_PROOF_OK;
+}
+
+#ifndef USE_CLUSTER_UNIT
+static void
+cr_current_mx_log_member_proof_failure_once(
+	CrCurrentMxMemberProofStage stage,
+	const ClusterCurrentMxProofForwardV2 *request,
+	const ClusterCurrentMxProofAskWire *ask)
+{
+	static bool logged[CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE + 1];
+	const char *stage_name;
+
+	if (stage <= CR_CURRENT_MX_MEMBER_PROOF_OK
+		|| stage > CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE
+		|| request == NULL || ask == NULL || logged[stage])
+		return;
+	logged[stage] = true;
+	stage_name = stage == CR_CURRENT_MX_MEMBER_PROOF_OWN_XID_LOOKUP
+		? "OWN_XID_LOOKUP" : "ORIGIN_RESOLVE";
+	ereport(LOG,
+			(errmsg_internal(
+				"current MultiXact member proof unresolved: stage=%s request_id=" UINT64_FORMAT " mxid=%u epoch=%u requester=%u backend=%u chunk=%u member_ordinal=%u member_xid=%u member_status=%u",
+				stage_name, request->prefix.request_id,
+				request->prefix.mxkey.multixact_id,
+				request->prefix.mxkey.cluster_epoch,
+				request->prefix.original_requester_node,
+				request->prefix.requester_backend_id,
+				request->prefix.chunk_ordinal, ask->member_ordinal,
+				ask->xid, ask->member_status)));
+}
+#else
+int
+cluster_cr_server_test_current_mx_member_proof_one(
+	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
+	uint32 current_epoch, ClusterCurrentMemberProof *proof)
+{
+	return (int)cr_current_mx_member_proof_one(
+		member_xid, member_status, member_ordinal, current_epoch, proof);
+}
+#endif
+
 /* Spec-3.6b: a member-XID origin proves only its own current TT binding.
  * Parent following is exact-key only; every uncertainty remains a typed
  * UNKNOWN/DENIED reply, and publication is capability-generation bound. */
@@ -3735,18 +3851,16 @@ cluster_gcs_current_mx_member_proof_serve_inline(
 				for (i = 0; i < request.prefix.entry_count; i++) {
 					const ClusterCurrentMxProofAskWire *ask
 						= &request.trailer.body.asks[i];
-					ClusterTTStatusKey initial_key;
-					ClusterTTStatusResult initial_result;
+					CrCurrentMxMemberProofStage member_stage;
 
-					if (!cr_current_mx_source_lookup_current_own_xid(
-							ask->xid, &initial_key, &initial_result)
-						|| !cluster_multixact_current_resolve_origin_member_proof(
-							ask->xid, ask->member_status,
-							ask->member_ordinal, (uint16)cluster_node_id,
-							request.prefix.mxkey.cluster_epoch, false,
-							&initial_key, &initial_result,
-							cr_current_mx_source_exact_lookup, NULL,
-							&proofs[i])) {
+					member_stage = cr_current_mx_member_proof_one(
+						ask->xid, ask->member_status, ask->member_ordinal,
+						request.prefix.mxkey.cluster_epoch, &proofs[i]);
+					if (member_stage != CR_CURRENT_MX_MEMBER_PROOF_OK) {
+					#ifndef USE_CLUSTER_UNIT
+						cr_current_mx_log_member_proof_failure_once(
+							member_stage, &request, ask);
+					#endif
 						proof_result = CMX_RESOLVE_UNKNOWN;
 						break;
 					}

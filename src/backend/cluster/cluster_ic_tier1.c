@@ -324,6 +324,16 @@ typedef struct Tier1OutboundFrame {
 #define PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_FRAMES 2048
 #define PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_BYTES PGRAC_IC_PAYLOAD_MAX
 
+/*
+ * PGRAC adaptation: a continuously readable CONTROL peer must yield the
+ * single-threaded LMON pump so the other peer sockets and heartbeat send
+ * tick remain live.  The socket is level-triggered; returning with complete
+ * frames still queued simply re-arms the same peer on the next event pass.
+ * Keep this compile-time bounded: it is local scheduling policy, not wire,
+ * shared-memory, membership, or authority state.
+ */
+#define PGRAC_IC_TIER1_RECV_FRAME_BUDGET 64
+
 static Tier1OutboundFrame *tier1_outbound_fifo_head[CLUSTER_MAX_NODES];
 static Tier1OutboundFrame *tier1_outbound_fifo_tail[CLUSTER_MAX_NODES];
 static int tier1_outbound_fifo_frames[CLUSTER_MAX_NODES];
@@ -2503,6 +2513,8 @@ cluster_ic_tier1_hello_send_remaining(int32 peer_id)
 bool
 cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 {
+	uint32 frames_consumed = 0;
+
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || Tier1Shmem == NULL)
 		return false;
 	if (peer_fd < 0)
@@ -2697,6 +2709,9 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 				tier1_recv_phase[peer_id] = 0;
 				tier1_recv_payload_filled[peer_id] = 0;
 				tier1_recv_payload_total[peer_id] = 0;
+				frames_consumed++;
+				if (frames_consumed >= PGRAC_IC_TIER1_RECV_FRAME_BUDGET)
+					return true;
 				continue; /* loop back to read next frame */
 			}
 			if (vrc == CLUSTER_IC_ENVELOPE_PEER_FAILURE) {
@@ -2751,6 +2766,9 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 		tier1_recv_phase[peer_id] = 0;
 		tier1_recv_payload_filled[peer_id] = 0;
 		tier1_recv_payload_total[peer_id] = 0;
+		frames_consumed++;
+		if (frames_consumed >= PGRAC_IC_TIER1_RECV_FRAME_BUDGET)
+			return true;
 		/* loop again; peer may have queued multiple frames */
 	}
 	}

@@ -569,6 +569,9 @@ cluster_cr_server_test_current_mx_build_proof_page(
 	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	struct ClusterCurrentMxProofReplyPage *page);
+extern int cluster_cr_server_test_current_mx_member_proof_one(
+	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
+	uint32 current_epoch, ClusterCurrentMemberProof *proof);
 #endif
 
 typedef enum ClusterR4SourceCrOp { CLUSTER_R4_SOURCE_CR_FETCH = 0 } ClusterR4SourceCrOp;

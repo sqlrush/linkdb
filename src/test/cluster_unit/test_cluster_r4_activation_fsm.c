@@ -3434,6 +3434,47 @@ UT_TEST(test_93da3_member_retains_barrier_request_and_fans_out_once)
 	memset(&read_request, 0, sizeof(read_request));
 	UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_read(
 		&read_request));
+	/* The member can complete its first read before the current Resource-X
+	 * PREPARE image wins the voting majority.  That completed-but-stale
+	 * result must be consumed without changing the gate or ACK table, and
+	 * must release the local read owner so a later tick can request the
+	 * exact current image. */
+	memset(&prepare, 0, sizeof(prepare));
+	prepare.phase = CLUSTER_SEMANTIC_PHASE_PREPARE;
+	prepare.record_generation = 1;
+	prepare.transition_epoch = test_current_epoch;
+	prepare.coordinator_node = 0;
+	prepare.coordinator_incarnation
+		= table->expected[0].admitted_incarnation;
+	prepare.admitted_members_lo = UINT64_C(0x0f);
+	prepare.source_feature_bitmap = r4;
+	prepare.target_feature_bitmap = r4;
+	prepare.capability_sample_digest = digest;
+	UT_ASSERT(cluster_semantic_activation_record_encode(
+		&prepare, record_bytes));
+	UT_ASSERT(cluster_semantic_activation_qvotec_complete_record_read(
+		read_request.request_seq, CLUSTER_SEMANTIC_ACTIVATION_OK,
+		false, record_bytes));
+	cluster_semantic_activation_lmon_tick();
+	UT_ASSERT_EQ(semantic_activation_lmon_record_read_seq, UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u64(
+		test_gate_u64(TEST_GATE_RECORD_GENERATION_OFFSET)), UINT64_C(1));
+	UT_ASSERT_EQ(pg_atomic_read_u32(
+		test_gate_u32(TEST_GATE_CLOSED_OFFSET)), UINT32_C(0));
+	UT_ASSERT_EQ(table->stage,
+				 CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_BARRIER);
+	UT_ASSERT_EQ(table->observed_members_lo, UINT64_C(0));
+	for (node = 0; node < 4; node++)
+		UT_ASSERT_EQ(test_send_calls[node], 0);
+	if (semantic_activation_lmon_record_read_seq != 0) {
+		test_gate_reset();
+		return;
+	}
+
+	cluster_semantic_activation_lmon_tick();
+	memset(&read_request, 0, sizeof(read_request));
+	UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_read(
+		&read_request));
 	memset(&prepare, 0, sizeof(prepare));
 	prepare.phase = CLUSTER_SEMANTIC_PHASE_PREPARE;
 	prepare.record_generation = 2;

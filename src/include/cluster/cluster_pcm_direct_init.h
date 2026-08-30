@@ -57,6 +57,10 @@ cluster_pcm_direct_init_proof_consume(ClusterPcmDirectInitKind kind,
 									  const ClusterPcmDirectInitSnapshot *snapshot,
 									  ClusterPcmDirectInitProof *proof);
 extern ClusterPcmOwnResult
+cluster_pcm_direct_init_aux_pending_observer_validate(
+	ClusterPcmDirectInitKind kind,
+	const ClusterPcmDirectInitSnapshot *snapshot);
+extern ClusterPcmOwnResult
 cluster_pcm_direct_init_target_pending_validate(
 	ClusterPcmDirectInitKind kind,
 	const ClusterPcmDirectInitSnapshot *pending,

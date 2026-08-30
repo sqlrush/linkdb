@@ -109,6 +109,115 @@ typedef struct ResourceXRemoteSFailureDecision {
 	bool rollback_complete;
 } ResourceXRemoteSFailureDecision;
 
+/* A clean requester N snapshot can race the same-node fan-in executor that
+ * installs the canonical terminal X between two BufferDesc header-lock
+ * acquisitions.  This predicate grants nothing: it permits only a fresh
+ * resample when the independently validated terminal-round snapshot names
+ * that exact new X generation.  The driver must loop and revalidate both
+ * lock domains before returning the terminal reference. */
+static inline bool
+cluster_gcs_resource_x_target_terminal_resample_exact(
+	ClusterPcmOwnResult candidate_result,
+	const ClusterPcmOwnSnapshot *before_n,
+	const ClusterPcmOwnSnapshot *live_x,
+	ResourceXApplyResult round_snapshot_result,
+	const ResourceXBootstrapRoundFailureSnapshot *round)
+{
+	if (candidate_result != CLUSTER_PCM_OWN_STALE
+		|| before_n == NULL || live_x == NULL || round == NULL
+		|| round_snapshot_result != RESOURCE_X_APPLY_APPLIED
+		|| round->terminal != 1)
+		return false;
+	if (!BufferTagsEqual(&before_n->tag, &live_x->tag)
+		|| !BufferTagsEqual(&live_x->tag,
+			&round->ref.assertion.resource)
+		|| before_n->pcm_state != (uint8) PCM_STATE_N
+		|| before_n->flags != 0
+		|| before_n->generation == UINT64_MAX
+		|| before_n->reservation_token == UINT64_MAX
+		|| before_n->writer_activation_token != 0
+		|| before_n->resource_x_activation_generation != 0
+		|| live_x->pcm_state != (uint8) PCM_STATE_X
+		|| live_x->flags != 0
+		|| live_x->generation == 0
+		|| live_x->generation == UINT64_MAX
+		|| live_x->generation == before_n->generation
+		|| live_x->reservation_token == 0
+		|| live_x->reservation_token == UINT64_MAX
+		|| live_x->writer_activation_token != 0
+		|| live_x->resource_x_activation_generation != 0)
+		return false;
+	return round->buffer_ownership_generation == live_x->generation
+		&& round->ref.assertion.requester_node >= 0
+		&& round->ref.formation != 0
+		&& round->ref.formation != UINT64_MAX
+		&& round->ref.acquisition_generation != 0
+		&& round->ref.acquisition_generation != UINT64_MAX
+		&& round->base_authority_generation != 0
+		&& round->base_authority_generation != UINT64_MAX
+		&& round->authority_generation
+			> round->base_authority_generation
+		&& round->authority_generation != UINT64_MAX
+		&& round->r4_record_generation != 0
+		&& round->r4_record_generation != UINT64_MAX
+		&& round->master_session_incarnation != 0
+		&& round->master_session_incarnation != UINT64_MAX
+		&& round->absolute_deadline_us != 0
+		&& round->absolute_deadline_us != UINT64_MAX
+		&& round->retired_acquisition_generation
+			== round->ref.acquisition_generation
+		&& round->progress_flags == 0;
+}
+
+/* D1 observability for the final requester-side dispatch fence.  Each bit
+ * names one already-frozen predicate; the mask changes no retry or failure
+ * policy and carries no authority. */
+#define RESOURCE_X_DISPATCH_RECHECK_OK UINT32_C(0)
+#define RESOURCE_X_DISPATCH_RECHECK_ADMISSION UINT32_C(0x00000001)
+#define RESOURCE_X_DISPATCH_RECHECK_GATE_SESSION UINT32_C(0x00000002)
+#define RESOURCE_X_DISPATCH_RECHECK_REQUESTER_SAMPLE UINT32_C(0x00000004)
+#define RESOURCE_X_DISPATCH_RECHECK_MASTER_SAMPLE UINT32_C(0x00000008)
+#define RESOURCE_X_DISPATCH_RECHECK_REQUESTER_GENERATION UINT32_C(0x00000010)
+#define RESOURCE_X_DISPATCH_RECHECK_MASTER_GENERATION UINT32_C(0x00000020)
+
+/* The type-17 DATA handler may run without an ordinary backend PGPROC in an
+ * auxiliary event loop.  The local-owner field is an opaque,
+ * process-local equality token only: prefer the backend slot when present,
+ * otherwise use the current positive PID.  It is never wire or authority. */
+static inline int32
+cluster_gcs_resource_x_event_owner_identity(int32 procno, int32 process_pid)
+{
+	if (procno >= 0)
+		return procno;
+	return process_pid > 0 ? process_pid : -1;
+}
+
+static inline uint32
+cluster_gcs_resource_x_dispatch_recheck_failure_mask(
+	bool admission_current, bool gate_session_current,
+	bool requester_sampled, bool master_sampled,
+	uint32 expected_requester_generation,
+	uint32 expected_master_generation,
+	uint32 observed_requester_generation,
+	uint32 observed_master_generation)
+{
+	uint32 mask = RESOURCE_X_DISPATCH_RECHECK_OK;
+
+	if (!admission_current)
+		mask |= RESOURCE_X_DISPATCH_RECHECK_ADMISSION;
+	if (!gate_session_current)
+		mask |= RESOURCE_X_DISPATCH_RECHECK_GATE_SESSION;
+	if (!requester_sampled)
+		mask |= RESOURCE_X_DISPATCH_RECHECK_REQUESTER_SAMPLE;
+	if (!master_sampled)
+		mask |= RESOURCE_X_DISPATCH_RECHECK_MASTER_SAMPLE;
+	if (observed_requester_generation != expected_requester_generation)
+		mask |= RESOURCE_X_DISPATCH_RECHECK_REQUESTER_GENERATION;
+	if (observed_master_generation != expected_master_generation)
+		mask |= RESOURCE_X_DISPATCH_RECHECK_MASTER_GENERATION;
+	return mask;
+}
+
 /* D6 keeps result mapping separate from the safety policy.  The caller first
  * performs every rollback operation required by the frozen remote-S stage,
  * then feeds the observed outcomes here.  Missing or failed rollback after a
@@ -240,6 +349,17 @@ cluster_gcs_pcm_x_auth_sample_classify(const ClusterGcsPcmXAuthSample *sample,
 	if (sample->connection_generation_before != sample->connection_generation_after)
 		return PCM_X_SESSION_AUTH_CONNECTION_TORN;
 	return PCM_X_SESSION_AUTH_OK;
+}
+
+/* A complete non-OK sample is retryable only before a Resource-X round has
+ * been created or any holder mutation has started.  The caller retains the
+ * first absolute deadline and must still recheck admission, gate, master,
+ * session and transport identity on every iteration. */
+static inline bool
+cluster_gcs_pcm_x_auth_result_retryable(PcmXSessionAuthResult result)
+{
+	return result >= PCM_X_SESSION_AUTH_CONNECTION_NOT_READY
+		&& result <= PCM_X_SESSION_AUTH_CONNECTION_TORN;
 }
 
 /* ============================================================
@@ -4178,6 +4298,11 @@ extern ResourceXApplyResult
 cluster_gcs_resource_x_target_direct_init_acquire_exact(
 	BufferDesc *buf, uint64 r4_record_generation,
 	uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token,
+	ResourceXAcquisitionRef *ref_out);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_direct_init_join_exact(
+	BufferDesc *buf, uint64 direct_init_ownership_generation,
 	uint64 direct_init_reservation_token,
 	ResourceXAcquisitionRef *ref_out);
 extern bool cluster_gcs_resource_x_target_context_recheck_exact(

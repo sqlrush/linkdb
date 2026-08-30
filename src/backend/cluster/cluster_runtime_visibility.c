@@ -51,6 +51,7 @@
 #include "cluster/cluster_cr_cache.h"
 #include "cluster/cluster_cr_pool.h"
 #include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h" /* cluster_cssd_get_peer_state (D3-3 Q9 serve-gate) */
 #include "cluster/cluster_elog.h" /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
@@ -58,6 +59,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h" /* peer HELLO D4-capability gate (D4-6) */
 #include "cluster/cluster_tt_durable.h"
@@ -88,6 +90,37 @@ void
 cluster_runtime_visibility_ensure_exit_hooks(void)
 {
 	cluster_undo_block0_current_ensure_exit_hooks();
+}
+
+/* The Stage-8 clean four-node formation legitimately keeps epoch zero.  A
+ * fresh-ref pair at that epoch is usable only while the ordinary R4 TARGET
+ * admission is exact-current; the token is held across the complete wire or
+ * origin proof so a cutover cannot turn an epoch-zero syntax match into
+ * authority.  The caller owns cluster_semantic_activation_leave(). */
+bool
+cluster_runtime_visibility_zero_epoch_pair_admission_enter(
+	ClusterSemanticAdmissionToken *token)
+{
+	ClusterSemanticAdmissionResult result;
+
+	if (token != NULL)
+		memset(token, 0, sizeof(*token));
+	if (token == NULL || cluster_conf_node_count() != 4
+		|| !cluster_storage_mode_enabled() || cluster_recmerge_window_active
+		|| cluster_epoch_get_current() != 0)
+		return false;
+	result = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, token);
+	if (result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return false;
+	if (token->record_generation == 0 || token->formation_epoch != 0
+		|| !cluster_semantic_activation_recheck(token)) {
+		cluster_semantic_activation_leave(token);
+		memset(token, 0, sizeof(*token));
+		return false;
+	}
+	return true;
 }
 
 static bool
@@ -277,7 +310,8 @@ cluster_runtime_visibility_candidate_root_matches(
 
 static ClusterTxOutcome
 cluster_runtime_visibility_candidate_decide(
-	const ClusterTxLocator *locator, const TTSlot *exact_slot,
+	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const TTSlot *exact_slot,
 	TransactionId *top_xid_out, ClusterTxProofKind *proof_kind_out,
 	SCN *commit_scn_out, ClusterTxResolveReason *reason_out)
 {
@@ -356,7 +390,10 @@ cluster_runtime_visibility_candidate_decide(
 			*commit_scn_out = InvalidScn;
 			return CLUSTER_TX_PREPARED;
 		}
-		if (!prepared && exact_slot->status == TT_SLOT_ACTIVE) {
+		if (!prepared && mode == CLUSTER_TX_RESOLVE_VISIBILITY
+			&& (exact_slot->status == TT_SLOT_ACTIVE
+				|| (exact_slot->status == TT_SLOT_COMMITTED
+					&& SCN_VALID(exact_slot->commit_scn)))) {
 			*top_xid_out = top_xid;
 			*proof_kind_out = proof_kind;
 			*commit_scn_out = InvalidScn;
@@ -577,7 +614,7 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	header = (const UndoSegmentHeaderData *)block0.data;
 	exact_slot = header->tt_slots[tt_slot_offset];
 	outcome = cluster_runtime_visibility_candidate_decide(
-		&canonical_locator, &exact_slot, &top_xid, &proof_kind,
+		&canonical_locator, mode, &exact_slot, &top_xid, &proof_kind,
 		&commit_scn, &reason);
 	if (outcome == CLUSTER_TX_UNKNOWN)
 		goto failed;
@@ -684,7 +721,7 @@ cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	header = (const UndoSegmentHeaderData *)block0.data;
 	exact_slot = header->tt_slots[plan_data->tt_slot_offset];
 	outcome = cluster_runtime_visibility_candidate_decide(
-		&plan_data->canonical_locator, &exact_slot, &top_xid, &proof_kind,
+		&plan_data->canonical_locator, mode, &exact_slot, &top_xid, &proof_kind,
 		&commit_scn, &reason);
 	if (outcome == CLUSTER_TX_UNKNOWN)
 		goto failed;
