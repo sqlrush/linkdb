@@ -80,6 +80,7 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "port/atomics.h"
+#include "portability/instr_time.h"
 #include "postmaster/interrupt.h"
 #include "storage/ipc.h"
 #include "storage/latch.h"
@@ -260,6 +261,29 @@ qvotec_pgstat_lookup_all(void)
  * GUC once that lands in Step 4 D12.  Until then, hard-code default.
  * ============================================================ */
 #define CLUSTER_QVOTEC_DEFAULT_POLL_INTERVAL_MS 2000
+
+/*
+ * Keep poll starts on the configured cadence.  Waiting a full interval after
+ * the disk cycle makes the effective period `cycle work + interval`, which can
+ * expire the fixed 2x lease even though the dedicated qvotec is progressing.
+ * A cycle that itself consumes the interval runs the successor immediately;
+ * an actual cycle lasting 2x the interval still expires the lease and remains
+ * fail-closed.
+ */
+static long
+qvotec_poll_wait_timeout_ms(uint64 elapsed_us, int poll_interval_ms)
+{
+	uint64 interval_us;
+	uint64 remaining_us;
+
+	if (poll_interval_ms <= 0)
+		return 0;
+	interval_us = (uint64)poll_interval_ms * 1000ULL;
+	if (elapsed_us >= interval_us)
+		return 0;
+	remaining_us = interval_us - elapsed_us;
+	return (long)((remaining_us + 999ULL) / 1000ULL);
+}
 
 
 /* ============================================================
@@ -1947,6 +1971,8 @@ cluster_qvotec_test_undo_root_descriptor_read(
 extern ClusterReplacementRequestSlotState
 cluster_qvotec_test_replacement_request_preserve(
 	ClusterVotingSlot *next, const ClusterVotingSlot *prior);
+extern long cluster_qvotec_test_poll_wait_timeout_ms(
+	uint64 elapsed_us, int poll_interval_ms);
 
 ClusterSemanticActivationResult
 cluster_qvotec_test_semantic_activation_record_cas_write(
@@ -2111,6 +2137,13 @@ cluster_qvotec_test_replacement_request_preserve(
 	ClusterVotingSlot *next, const ClusterVotingSlot *prior)
 {
 	return qvotec_replacement_request_preserve(next, prior);
+}
+
+long
+cluster_qvotec_test_poll_wait_timeout_ms(uint64 elapsed_us,
+									 int poll_interval_ms)
+{
+	return qvotec_poll_wait_timeout_ms(elapsed_us, poll_interval_ms);
 }
 #endif
 
@@ -3779,6 +3812,8 @@ ClusterQvotecMain(void)
 
 	for (;;) {
 		int rc;
+		instr_time cycle_started;
+		instr_time cycle_finished;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -3811,10 +3846,15 @@ ClusterQvotecMain(void)
 		/* P1.3 step 2/3 — real poll cycle: write self slot, read
 		 * matrix, decide quorum, publish shmem.  Counter bumps live
 		 * inside qvotec_poll_once. */
+		INSTR_TIME_SET_CURRENT(cycle_started);
 		qvotec_poll_once();
+		INSTR_TIME_SET_CURRENT(cycle_finished);
+		INSTR_TIME_SUBTRACT(cycle_finished, cycle_started);
 		cluster_pgstat_inc(qvotec_counter_poll_cycle);
 
-		timeout_ms = cluster_quorum_poll_interval_ms;
+		timeout_ms = qvotec_poll_wait_timeout_ms(
+			INSTR_TIME_GET_MICROSEC(cycle_finished),
+			cluster_quorum_poll_interval_ms);
 
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, timeout_ms,
 					   WAIT_EVENT_CLUSTER_BGPROC_QVOTEC_MAIN_LOOP);

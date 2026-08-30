@@ -65,6 +65,7 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_reconfig.h" /* ReconfigEvent for spec-4.12b D2 stub */
 #include "cluster/cluster_control_root.h" /* B′ bit22 cutover references */
 #include "cluster/cluster_replacement_request.h"
@@ -149,6 +150,8 @@ cluster_qvotec_test_undo_root_descriptor_read(
 extern ClusterReplacementRequestSlotState
 cluster_qvotec_test_replacement_request_preserve(
 	ClusterVotingSlot *next, const ClusterVotingSlot *prior);
+extern long cluster_qvotec_test_poll_wait_timeout_ms(
+	uint64 elapsed_us, int poll_interval_ms);
 
 
 /* ============================================================
@@ -192,6 +195,51 @@ const struct ClusterSemanticActivationCallbackBundle *
 cluster_pcm_x_resource_x_activation_callbacks(void)
 {
 	return NULL;
+}
+
+bool
+cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
+cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(ResourceXGateSnapshot *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	return false;
+}
+
+bool
+cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+	bool thawed pg_attribute_unused(), ResourceXReconfigToken *token_out,
+	uint64 *digest_out)
+{
+	if (token_out != NULL)
+		memset(token_out, 0, sizeof(*token_out));
+	if (digest_out != NULL)
+		*digest_out = 0;
+	return false;
+}
+
+bool
+cluster_reconfig_get_observed_slot(int32 node_id pg_attribute_unused(),
+	uint64 *incarnation, uint64 *generation)
+{
+	if (incarnation != NULL)
+		*incarnation = 0;
+	if (generation != NULL)
+		*generation = 0;
+	return false;
+}
+
+uint64
+cluster_reconfig_get_observed_epoch(int32 node_id pg_attribute_unused())
+{
+	return 0;
 }
 
 void
@@ -1475,6 +1523,16 @@ UT_TEST(test_qvotec_main_symbol_link_resolves)
 {
 	void (*p_main)(void) = ClusterQvotecMain;
 	UT_ASSERT_NOT_NULL((void *)p_main);
+}
+
+UT_TEST(test_qvotec_poll_cadence_subtracts_cycle_work)
+{
+	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(0, 500), 500);
+	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(125000, 500), 375);
+	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(499001, 500), 1);
+	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(500000, 500), 0);
+	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(900000, 500), 0);
+	UT_ASSERT_EQ(cluster_qvotec_test_poll_wait_timeout_ms(0, 0), 0);
 }
 
 
@@ -2914,7 +2972,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(52);
+	UT_PLAN(53);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -2931,6 +2989,7 @@ main(void)
 	UT_RUN(test_in_quorum_frozen_flag_overrides_to_false);
 	UT_RUN(test_freeze_thaw_round_trip);
 	UT_RUN(test_qvotec_main_symbol_link_resolves);
+	UT_RUN(test_qvotec_poll_cadence_subtracts_cycle_work);
 	UT_RUN(test_qvotec_status_enum_values);
 	UT_RUN(test_quorum_state_enum_values);
 	UT_RUN(test_voting_disk_io_state_enum_values);
