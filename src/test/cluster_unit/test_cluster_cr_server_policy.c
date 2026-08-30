@@ -27,7 +27,9 @@
 #include "access/transam.h"
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_xid_authority.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "miscadmin.h"
@@ -47,6 +49,7 @@ static LWLockPadded c0_lwlocks[64];
 LWLockPadded *MainLWLockArray = c0_lwlocks;
 static VariableCacheData c0_variable_cache;
 VariableCache ShmemVariableCache = &c0_variable_cache;
+int cluster_node_id = 0;
 
 /*
  * TT-P013-RULE25-B RED seam.  The implementation belongs in the pure
@@ -103,6 +106,7 @@ typedef enum C0TestEvent {
 	C0_EV_COVERED,
 	C0_EV_DISABLED,
 	C0_EV_IS_MINE,
+	C0_EV_TT_LOOKUP,
 	C0_EV_XACT_LOCK,
 	C0_EV_CLOG,
 	C0_EV_SLRU_LOCK,
@@ -134,6 +138,12 @@ static bool c0_accept_resolved_scn;
 static XidStatus c0_raw_status;
 static bool c0_throw_on_clog;
 static bool c0_disable_before_native_recheck;
+static bool c0_tt_alias_available;
+static bool c0_tt_alias_drift;
+static bool c0_tt_dispatch_admitted;
+static int c0_tt_lookup_calls;
+static ClusterTTStatusKey c0_tt_lookup_keys[2];
+static uint64 c0_epoch;
 static int c0_native_lock_depth;
 static int c0_xact_lock_depth;
 static int c0_slru_lock_depth;
@@ -197,6 +207,12 @@ c0_reset(void)
 	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
 	c0_throw_on_clog = false;
 	c0_disable_before_native_recheck = false;
+	c0_tt_alias_available = false;
+	c0_tt_alias_drift = false;
+	c0_tt_dispatch_admitted = true;
+	c0_tt_lookup_calls = 0;
+	memset(c0_tt_lookup_keys, 0, sizeof(c0_tt_lookup_keys));
+	c0_epoch = 0;
 	c0_native_lock_depth = 0;
 	c0_xact_lock_depth = 0;
 	c0_slru_lock_depth = 0;
@@ -289,6 +305,49 @@ cluster_xid_is_mine(TransactionId xid pg_attribute_unused())
 {
 	c0_note(C0_EV_IS_MINE);
 	return c0_xid_is_mine;
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return c0_epoch;
+}
+
+ClusterSemanticAdmissionResult
+cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
+								  const ClusterTTStatusSourceRequest *request,
+								  ClusterTTStatusSourceResult *result)
+{
+	int call_index = c0_tt_lookup_calls;
+
+	c0_tt_lookup_calls++;
+	c0_note(C0_EV_TT_LOOKUP);
+	if (result != NULL)
+		memset(result, 0, sizeof(*result));
+	if (op != CLUSTER_TT_SOURCE_LOOKUP || request == NULL
+		|| request->key == NULL || result == NULL || !c0_tt_dispatch_admitted)
+		return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	if (call_index < (int)lengthof(c0_tt_lookup_keys))
+		c0_tt_lookup_keys[call_index] = *request->key;
+	if (!c0_tt_alias_available
+		|| request->key->origin_node_id != 0
+		|| request->key->undo_segment_id != 7
+		|| request->key->tt_slot_id != 1
+		|| request->key->cluster_epoch != (uint32)c0_epoch
+		|| request->key->local_xid != (TransactionId)4195136
+		|| request->key->_reserved != 0 || request->key->_reserved2 != 0)
+		return CLUSTER_SEMANTIC_ADMISSION_OK;
+
+	result->bool_value = true;
+	result->lookup.status
+		= c0_tt_alias_drift && call_index > 0
+			  ? CLUSTER_TT_STATUS_COMMITTED
+			  : CLUSTER_TT_STATUS_IN_PROGRESS;
+	result->lookup.commit_scn
+		= c0_tt_alias_drift && call_index > 0 ? (SCN)10498 : InvalidScn;
+	result->lookup.status_epoch = (uint32)c0_epoch;
+	result->lookup.authoritative = true;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
 
 uint64
@@ -865,6 +924,73 @@ UT_TEST(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b)
 	UT_ASSERT_EQ(c0_native_lock_depth, 0);
 }
 
+/* S8-815PRE-FRESHREF-C1B-01 §3 live predecessor.  During precommit the page
+ * already carries NEEDS_CLEANOUT, while the durable committed-only scan is a
+ * zero-match.  The process-shared status overlay retains the exact DATA alias
+ * even after the allocator rolls to another segment.  A clean formation may
+ * have covered_hw=0, so the one-way no-raw-reuse fence plus two byte-stable
+ * exact alias samples, literal CLOG and ProcArray must prove IN_PROGRESS.
+ * Any alias/status drift remains fail closed. */
+UT_TEST(test_freshref_precommit_zero_match_uses_exact_active_alias)
+{
+	ClusterUndoVerdictKind kind;
+
+	c0_reset();
+	c0_covered_hw = 0;
+	c0_tt_alias_available = true;
+	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
+	c0_procarray_live = true;
+	kind = cluster_cr_server_test_own_xid_verdict(4195136, 7, 1, true);
+	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+	UT_ASSERT_EQ(c0_tt_lookup_calls, 2);
+	UT_ASSERT_EQ(c0_tt_lookup_keys[0].undo_segment_id, 7);
+	UT_ASSERT_EQ(c0_tt_lookup_keys[0].tt_slot_id, 1);
+	UT_ASSERT_EQ(c0_tt_lookup_keys[0].local_xid, (TransactionId)4195136);
+	UT_ASSERT_EQ(memcmp(&c0_tt_lookup_keys[0], &c0_tt_lookup_keys[1],
+						 sizeof(c0_tt_lookup_keys[0])), 0);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_procarray_calls, 1);
+	UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK)
+			  < c0_event_pos(C0_EV_TT_LOOKUP));
+	UT_ASSERT(c0_event_pos(C0_EV_TT_LOOKUP) < c0_event_pos(C0_EV_CLOG));
+	UT_ASSERT(c0_event_pos_after(
+				  C0_EV_TT_LOOKUP, c0_event_pos(C0_EV_PROCARRAY))
+			  < c0_event_pos(C0_EV_NATIVE_UNLOCK));
+
+	c0_reset();
+	c0_covered_hw = 0;
+	c0_tt_alias_available = true;
+	c0_tt_alias_drift = true;
+	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
+	c0_procarray_live = true;
+	kind = cluster_cr_server_test_own_xid_verdict(4195136, 7, 1, true);
+	UT_ASSERT_EQ((int)kind,
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_tt_lookup_calls, 2);
+
+	c0_reset();
+	c0_covered_hw = 0;
+	c0_tt_alias_available = true;
+	c0_disabled = true;
+	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
+	c0_procarray_live = true;
+	kind = cluster_cr_server_test_own_xid_verdict(4195136, 7, 1, true);
+	UT_ASSERT_EQ((int)kind,
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_tt_lookup_calls, 0);
+
+	c0_reset();
+	c0_covered_hw = 0;
+	c0_tt_alias_available = true;
+	c0_tt_dispatch_admitted = false;
+	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
+	c0_procarray_live = true;
+	kind = cluster_cr_server_test_own_xid_verdict(4195136, 7, 1, true);
+	UT_ASSERT_EQ((int)kind,
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_tt_lookup_calls, 1);
+}
+
 UT_TEST(test_freshref_c1b_pair_request_canonical_decode)
 {
 	GcsBlockForwardPayload fwd;
@@ -962,7 +1088,9 @@ UT_TEST(test_c0_real_zero_match_abort_live_and_self_disable)
 	UT_ASSERT(c0_event_pos(C0_EV_DISABLED) < c0_event_pos(C0_EV_CLOG));
 	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_XACT_UNLOCK));
 	UT_ASSERT(c0_event_pos(C0_EV_XACT_UNLOCK) < c0_event_pos(C0_EV_PROCARRAY));
-	UT_ASSERT(c0_event_pos(C0_EV_PROCARRAY) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
+	UT_ASSERT(c0_event_pos_after(
+				  C0_EV_NATIVE_UNLOCK, c0_event_pos(C0_EV_PROCARRAY))
+			  > c0_event_pos(C0_EV_PROCARRAY));
 	UT_ASSERT_EQ(c0_native_provable_calls, 0);
 
 	/* One-way disable and an unset boot witness both suppress C0. */
@@ -1220,7 +1348,7 @@ UT_TEST(test_lms_exact_status22_preempts_legacy_tt_scan_convoy)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -1238,6 +1366,7 @@ main(void)
 	UT_RUN(test_c0_zero_match_positive_proof_table);
 	UT_RUN(test_freshref_c1b_pair_exact_truth_table);
 	UT_RUN(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b);
+	UT_RUN(test_freshref_precommit_zero_match_uses_exact_active_alias);
 	UT_RUN(test_freshref_c1b_pair_request_canonical_decode);
 	UT_RUN(test_c0_real_zero_match_abort_live_and_self_disable);
 	UT_RUN(test_undo_multi_verdict_inline_entry_is_denied_without_serve);

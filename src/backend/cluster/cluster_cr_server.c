@@ -2211,6 +2211,157 @@ typedef enum LmsOwnXidReason {
 	LMS_OWN_XID_REFUSE_INVALID_SCN	/* delayed-cleanout, not provably aborted */
 } LmsOwnXidReason;
 
+/*
+ * The DATA undo record can live in a later segment than its canonical TT
+ * slot.  cluster_tt_local publishes an exact status-overlay alias for that
+ * DATA segment at first mutation and updates the same alias on commit/abort.
+ * Consult only that request-derived full key: selecting the allocator's
+ * current segment would lose an older live owner after allocator rollover.
+ */
+static bool
+lms_own_xid_status_alias_lookup_exact(const ClusterTTStatusKey *key,
+									  ClusterTTStatusResult *result)
+{
+	ClusterTTStatusSourceRequest source_request;
+	ClusterTTStatusSourceResult source_result;
+
+	if (key == NULL || result == NULL)
+		return false;
+	memset(&source_request, 0, sizeof(source_request));
+	memset(&source_result, 0, sizeof(source_result));
+	source_request.key = key;
+	if (cluster_tt_status_source_dispatch(
+			CLUSTER_TT_SOURCE_LOOKUP, &source_request, &source_result)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK
+		|| !source_result.bool_value)
+		return false;
+	*result = source_result.lookup;
+	return true;
+}
+
+static bool
+lms_own_xid_status_alias_is_active(const ClusterTTStatusResult *result,
+									   uint32 expected_epoch)
+{
+	ClusterTTStatusKey zero_parent;
+
+	if (result == NULL)
+		return false;
+	memset(&zero_parent, 0, sizeof(zero_parent));
+	return result->authoritative
+		   && result->status == CLUSTER_TT_STATUS_IN_PROGRESS
+		   && result->commit_scn == InvalidScn
+		   && result->status_epoch == expected_epoch
+		   && !result->has_parent_key
+		   && memcmp(&result->parent_key, &zero_parent, sizeof(zero_parent)) == 0;
+}
+
+static bool
+lms_own_xid_status_alias_same(const ClusterTTStatusResult *a,
+								  const ClusterTTStatusResult *b)
+{
+	return a != NULL && b != NULL
+		   && a->status == b->status
+		   && a->commit_scn == b->commit_scn
+		   && a->status_epoch == b->status_epoch
+		   && a->authoritative == b->authoritative
+		   && a->has_parent_key == b->has_parent_key
+		   && memcmp(&a->parent_key, &b->parent_key,
+					 sizeof(a->parent_key)) == 0;
+}
+
+/*
+ * Close the precommit interval in which the page already carries
+ * NEEDS_CLEANOUT but the durable committed-only TT scan is still a
+ * zero-match.  The status overlay is existing process-shared authority, not
+ * a new cache: require an exact request-derived DATA alias twice, with a
+ * literal IN_PROGRESS CLOG byte and a live ProcArray owner between them.
+ * The native-prehistory reader fence continuously prevents raw-xid reuse.
+ */
+static bool
+lms_own_xid_zero_match_active_alias_exact(
+	TransactionId xid, uint32 expected_segment_id,
+	uint32 expected_tt_slot_id)
+{
+	volatile bool exact_live = false;
+
+	if (!TransactionIdIsNormal(xid) || expected_segment_id == 0
+		|| expected_segment_id > UINT16_MAX || expected_tt_slot_id < 1
+		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT)
+		return false;
+
+	PG_TRY(active_alias_window);
+	{
+		ClusterTTStatusKey key;
+		ClusterTTStatusResult initial_result;
+		ClusterTTStatusResult confirm_result;
+		uint64 sampled_epoch;
+		bool no_raw_reuse_window;
+		bool xid_is_mine;
+
+		memset(&key, 0, sizeof(key));
+		memset(&initial_result, 0, sizeof(initial_result));
+		memset(&confirm_result, 0, sizeof(confirm_result));
+		cluster_cr_native_prehistory_reader_lock();
+		no_raw_reuse_window = !cluster_cr_native_prehistory_disabled();
+		xid_is_mine = no_raw_reuse_window && cluster_xid_is_mine(xid);
+		sampled_epoch = cluster_epoch_get_current();
+
+		if (xid_is_mine && cluster_node_id >= 0
+			&& cluster_node_id < CLUSTER_MAX_NODES
+			&& sampled_epoch <= UINT32_MAX) {
+			bool clog_is_in_progress = false;
+			bool xid_is_in_progress = false;
+
+			key.origin_node_id = (uint16)cluster_node_id;
+			key.undo_segment_id = (uint16)expected_segment_id;
+			key.tt_slot_id = expected_tt_slot_id;
+			key.cluster_epoch = (uint32)sampled_epoch;
+			key.local_xid = xid;
+
+			if (lms_own_xid_status_alias_lookup_exact(&key, &initial_result)
+				&& lms_own_xid_status_alias_is_active(
+					&initial_result, (uint32)sampled_epoch)) {
+				LWLockAcquire(XactTruncationLock, LW_SHARED);
+				if (!TransactionIdPrecedes(
+						xid, ShmemVariableCache->oldestClogXid)) {
+					XLogRecPtr clog_lsn = InvalidXLogRecPtr;
+
+					clog_is_in_progress
+						= TransactionIdGetStatus(xid, &clog_lsn)
+						  == TRANSACTION_STATUS_IN_PROGRESS;
+				}
+				LWLockRelease(XactTruncationLock);
+
+				if (clog_is_in_progress)
+					xid_is_in_progress = TransactionIdIsInProgress(xid);
+				if (xid_is_in_progress
+					&& cluster_epoch_get_current() == sampled_epoch
+					&& lms_own_xid_status_alias_lookup_exact(
+						&key, &confirm_result)
+					&& lms_own_xid_status_alias_is_active(
+						&confirm_result, (uint32)sampled_epoch)
+					&& lms_own_xid_status_alias_same(
+						&initial_result, &confirm_result))
+					exact_live = true;
+			}
+		}
+		cluster_cr_native_prehistory_reader_unlock();
+	}
+	PG_CATCH(active_alias_window);
+	{
+		/* The dispatch/CLOG/ProcArray stack can ERROR with internal LWLocks
+		 * held.  Release the complete reader window before rethrowing. */
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY(active_alias_window);
+
+	return exact_live;
+}
+
 /* S8-815PRE-FRESHREF-C1B-01: exact retained-page pairing.  The native
  * prehistory reader fence continuously covers the complete durable scan,
  * literal CLOG C1b sample and (for a zero-match) frozen retention horizon.
@@ -2484,6 +2635,12 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		 * a gone ProcArray entry, truncation and every other sampled doubt refuse
 		 * before that branch can reinterpret the CLOG byte.
 		 */
+		if (allow_live
+			&& lms_own_xid_zero_match_active_alias_exact(
+				xid, expected_segment_id, expected_tt_slot_id)) {
+			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS;
+			return LMS_OWN_XID_PROVEN_IN_PROGRESS;
+		}
 		if (allow_live && expected_segment_id > 0 && expected_segment_id <= UINT16_MAX
 			&& expected_tt_slot_id >= 1 && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT
 			&& cluster_cr_native_prehistory_covered_hw() != 0) {
