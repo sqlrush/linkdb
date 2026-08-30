@@ -76,6 +76,7 @@ User-facing manual:
 | Installation | [docs/user-guide/install.md](docs/user-guide/install.md) |
 | Bootstrap a node | [docs/user-guide/bootstrap.md](docs/user-guide/bootstrap.md) |
 | Configuration (`cluster.*` GUCs + `pgrac.conf`) | [docs/user-guide/configuration.md](docs/user-guide/configuration.md) |
+| Cross-node transaction visibility diagnosis | [docs/user-guide/transaction-visibility.md](docs/user-guide/transaction-visibility.md) |
 | System views reference | [docs/reference/system-views.md](docs/reference/system-views.md) |
 | Wait events reference | [docs/reference/wait-events.md](docs/reference/wait-events.md) |
 | Architecture overview | [docs/architecture/overview.md](docs/architecture/overview.md) |
