@@ -157,11 +157,11 @@
   },
   "schema_version": "R11SourceRemovalCensusV2",
   "source_removed_subject": {
-    "commit": "4f6a664c0e96a3b6e8367e5bddb3911dfe3918df",
+    "commit": "ddc8d0b7c87917156ba18ece171ce1e0259489a4",
     "pre_removal_commit": "cc1c5a554276542a05c15f5f1e0e0c7317fba66e",
     "pre_removal_tree": "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5",
     "source_removal_commit": "cb7c7b585cb63ea4906d49fe01352b005a89b8e8",
     "source_removal_tree": "e80f7dc31d269b5927a36cf393d9b2cccf70c02e",
-    "tree": "8176c49c52355ea0f356ab769cbc7fb7fdee57d2"
+    "tree": "2a6d44edac935c71fb5116300f5ff1c7aa5a74bb"
   }
 }
