@@ -1744,6 +1744,8 @@ UT_TEST(test_queue_contract_exposes_opaque_retained_revoke_api)
 		ClusterPcmOwnHeldXRevoke *);
 	typedef ClusterPcmOwnResult (*TryDrainHeldXRevokeFn)(
 		const ClusterPcmOwnHeldXRevoke *);
+	typedef ClusterPcmOwnResult (*TryDrainDropXRevokeFn)(
+		BufferDesc *, const ClusterPcmOwnSnapshot *);
 	typedef ClusterPcmOwnResult (*FinishHeldXRevokeFn)(
 		ClusterPcmOwnHeldXRevoke *, XLogRecPtr, ClusterPcmOwnSnapshot *,
 		ClusterPcmOwnFinishRefusal *);
@@ -1773,6 +1775,9 @@ UT_TEST(test_queue_contract_exposes_opaque_retained_revoke_api)
 	UT_ASSERT(__builtin_types_compatible_p(
 		__typeof__(&cluster_bufmgr_pcm_own_try_drain_held_x_revoke),
 		TryDrainHeldXRevokeFn));
+	UT_ASSERT(__builtin_types_compatible_p(
+		__typeof__(&cluster_bufmgr_pcm_own_try_drain_drop_x_revoke),
+		TryDrainDropXRevokeFn));
 	UT_ASSERT(__builtin_types_compatible_p(
 		__typeof__(&cluster_bufmgr_pcm_own_finish_held_x_revoke_retain),
 		FinishHeldXRevokeFn));
@@ -1905,6 +1910,140 @@ UT_TEST(test_revoke_finish_mode_rejects_pinned_vm_fsm_and_retains_main)
 	UT_ASSERT_EQ(cluster_pcm_x_revoke_finish_mode(NULL, 0), CLUSTER_PCM_X_REVOKE_FINISH_INVALID);
 }
 
+UT_TEST(test_aux_passive_pin_admission_closes_on_exact_revoking_fence)
+{
+	char *source;
+	const char *lookup_pin;
+	const char *lookup_pin_end;
+	const char *buffer_alloc;
+	const char *buffer_alloc_end;
+	const char *recent;
+	const char *recent_end;
+	const char *extend;
+	const char *extend_end;
+	static const char *const locked_gate_contract[] = {
+		"cluster_bufmgr_pcm_aux_pin_admission_locked(", "PinBuffer_Locked"
+	};
+
+	/* REVOKING is the already-frozen admission fence.  It blocks only a new
+	 * passive VM/FSM pin in the active tracked domain; inactive, untracked,
+	 * non-auxiliary, and non-REVOKING shapes retain PostgreSQL pin semantics. */
+	UT_ASSERT(!cluster_pcm_x_aux_pin_admission_allowed(
+		true, true, VISIBILITYMAP_FORKNUM, PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(!cluster_pcm_x_aux_pin_admission_allowed(
+		true, true, FSM_FORKNUM, PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
+		false, true, VISIBILITYMAP_FORKNUM, PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
+		true, false, VISIBILITYMAP_FORKNUM, PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
+		true, true, MAIN_FORKNUM, PCM_OWN_FLAG_REVOKING));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
+		true, true, VISIBILITYMAP_FORKNUM, 0));
+	UT_ASSERT(cluster_pcm_x_aux_pin_admission_allowed(
+		true, true, VISIBILITYMAP_FORKNUM, PCM_OWN_FLAG_GRANT_PENDING));
+
+	source = read_bufmgr_source();
+	lookup_pin = strstr(source, "\nPinBufferForLookup(");
+	lookup_pin_end = lookup_pin != NULL
+		? strstr(lookup_pin, "\nstatic bool\nPinBuffer(") : NULL;
+	buffer_alloc = strstr(source, "\nBufferAlloc(");
+	buffer_alloc_end = buffer_alloc != NULL
+		? strstr(buffer_alloc, "\n/*\n * InvalidateBuffer") : NULL;
+	recent = strstr(source, "\nReadRecentBuffer(");
+	recent_end = recent != NULL ? strstr(recent, "\n/*\n * ReadBuffer") : NULL;
+	extend = strstr(source, "\nstatic BlockNumber\nExtendBufferedRelShared(");
+	extend_end = extend != NULL
+		? strstr(extend, "\n/*\n * MarkBufferDirty") : NULL;
+	UT_ASSERT_NOT_NULL(lookup_pin);
+	UT_ASSERT_NOT_NULL(lookup_pin_end);
+	UT_ASSERT_NOT_NULL(buffer_alloc);
+	UT_ASSERT_NOT_NULL(buffer_alloc_end);
+	UT_ASSERT_NOT_NULL(recent);
+	UT_ASSERT_NOT_NULL(recent_end);
+	UT_ASSERT_NOT_NULL(extend);
+	UT_ASSERT_NOT_NULL(extend_end);
+	if (lookup_pin != NULL && lookup_pin_end != NULL) {
+		static const char *const atomic_contract[] = {
+			"GetPrivateRefCountEntry", "LockBufHdr",
+			"cluster_pcm_x_aux_pin_admission_allowed(",
+			"cluster_pcm_own_flags_get", "PIN_BUFFER_LOOKUP_RETRY",
+			"BUF_REFCOUNT_ONE", "UnlockBufHdr",
+			"NewPrivateRefCountEntry", "ResourceOwnerRememberBuffer"
+		};
+
+		assert_ordered_in_function(source, "\nPinBufferForLookup(",
+			"\nstatic bool\nPinBuffer(", atomic_contract,
+			lengthof(atomic_contract));
+	}
+	if (buffer_alloc != NULL && buffer_alloc_end != NULL) {
+		UT_ASSERT_NOT_NULL(strstr(buffer_alloc, "PinBufferForLookup("));
+		UT_ASSERT_NOT_NULL(strstr(buffer_alloc,
+			"cluster_bufmgr_resource_x_wait_retry("));
+		UT_ASSERT_NOT_NULL(strstr(buffer_alloc, "goto retry_lookup;"));
+	}
+	if (recent != NULL && recent_end != NULL) {
+		const char *admission = strstr(recent,
+			"cluster_pcm_x_aux_pin_admission_allowed(");
+		const char *pin = admission != NULL
+			? strstr(admission, "PinBuffer_Locked(bufHdr)") : NULL;
+
+		UT_ASSERT_NOT_NULL(admission);
+		UT_ASSERT_NOT_NULL(pin);
+		if (admission != NULL && pin != NULL)
+			UT_ASSERT(admission < pin && pin < recent_end);
+	}
+	if (extend != NULL && extend_end != NULL) {
+		const char *admission = strstr(extend,
+			"PinBufferForLookup(existing_hdr, strategy)");
+		const char *legacy = strstr(extend,
+			"PinBuffer(existing_hdr, strategy)");
+		const char *retry = strstr(extend,
+			"goto retry_extend_collision;");
+		const char *native_wait = strstr(extend,
+			"cluster_bufmgr_resource_x_wait_retry(");
+		const char *new_client_error = strstr(extend,
+			"cannot reuse revoking auxiliary cluster PCM image");
+
+		UT_ASSERT_NOT_NULL(admission);
+		UT_ASSERT(admission == NULL || admission < extend_end);
+		UT_ASSERT(legacy == NULL || legacy >= extend_end);
+		UT_ASSERT_NOT_NULL(retry);
+		UT_ASSERT(retry == NULL || retry < extend_end);
+		UT_ASSERT_NOT_NULL(native_wait);
+		UT_ASSERT(native_wait == NULL || native_wait < extend_end);
+		UT_ASSERT(new_client_error == NULL || new_client_error >= extend_end);
+	}
+	assert_ordered_in_function(source, "\nstatic Buffer\nGetVictimBuffer(",
+		"\n/*\n * Limit the number of pins", locked_gate_contract,
+		lengthof(locked_gate_contract));
+	assert_ordered_in_function(source, "\nSyncOneBuffer(",
+		"\n/*\n *\t\tAtEOXact_Buffers", locked_gate_contract,
+		lengthof(locked_gate_contract));
+	assert_ordered_in_function(source, "\nFlushRelationBuffers(",
+		"\n/* ---------------------------------------------------------------------\n *\t\tFlushRelationsAllBuffers",
+		locked_gate_contract, lengthof(locked_gate_contract));
+	assert_ordered_in_function(source, "\nFlushRelationsAllBuffers(",
+		"\n/* ---------------------------------------------------------------------\n *\t\tRelationCopyStorageUsingBuffer",
+		locked_gate_contract, lengthof(locked_gate_contract));
+	assert_ordered_in_function(source, "\nFlushDatabaseBuffers(",
+		"\n/*\n * Flush a previously", locked_gate_contract,
+		lengthof(locked_gate_contract));
+	assert_ordered_in_function(source,
+		"\ncluster_bufmgr_flush_and_release_x_for_leave(", "\n#endif",
+		locked_gate_contract, lengthof(locked_gate_contract));
+	assert_ordered_in_function(source,
+		"\ncluster_bufmgr_lock_resident_for_stamp(",
+		"\nvoid\ncluster_bufmgr_unlock_resident_stamp(",
+		(const char *const[]){"PinBufferForLookup("}, 1);
+	assert_ordered_in_function(source,
+		"\ncluster_bufmgr_lock_resident_for_exact_itl_stamp(",
+		"\n/* ========================================================================\n"
+		" * PGRAC MODIFICATIONS by SqlRush — spec-6.12a",
+		(const char *const[]){"PinBufferForLookup("}, 1);
+	free(source);
+}
+
 UT_TEST(test_pcm_tracking_excludes_only_fsm_for_user_and_shared_catalog_relations)
 {
 	BufferTag tag;
@@ -1980,7 +2119,7 @@ UT_TEST(test_pcm_tracking_uses_one_tag_gate_for_acquire_direct_init_and_eviction
 	 * common tag gate decides whether PCM proof is armed: FSM falls through to
 	 * the local content lock, while VM still arms and consumes the exact proof. */
 	direct_init = strstr(source, "\nLockBufferForAuxiliaryPageInit(");
-	direct_init_end = strstr(source, "\nvoid\nLockBufferForVisibilityMapPageInit(");
+	direct_init_end = strstr(source, "\nBuffer\nLockBufferForVisibilityMapPageInit(");
 	UT_ASSERT_NOT_NULL(direct_init);
 	UT_ASSERT_NOT_NULL(direct_init_end);
 	direct_gate
@@ -2209,9 +2348,9 @@ UT_TEST(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm)
 	if (begin_s != NULL && begin_x != NULL)
 		UT_ASSERT(strstr(begin_s, "BUF_STATE_GET_REFCOUNT") == NULL
 				  || strstr(begin_s, "BUF_STATE_GET_REFCOUNT") >= begin_x);
-	if (begin_x != NULL && drop_helper != NULL)
+	if (begin_x != NULL && abort_x != NULL)
 		UT_ASSERT(strstr(begin_x, "BUF_STATE_GET_REFCOUNT") == NULL
-				  || strstr(begin_x, "BUF_STATE_GET_REFCOUNT") >= drop_helper);
+				  || strstr(begin_x, "BUF_STATE_GET_REFCOUNT") >= abort_x);
 	if (finish != NULL && finish_end != NULL) {
 		const char *refcount = strstr(finish, "BUF_STATE_GET_REFCOUNT");
 		const char *drop = strstr(finish, "InvalidateBuffer");
@@ -3035,36 +3174,6 @@ UT_TEST(test_pcm_x_retain_flush_error_injection_is_exact_and_pre_write)
 	free(source);
 }
 
-UT_TEST(test_writer_activation_diagnostic_covers_commit_and_unguarded_n_boundaries)
-{
-	static const char *const commit_contract[]
-		= { "cluster_pcm_own_writer_grant_commit_exact(", "buf->pcm_state = new_pcm_state",
-			"cluster_pcm_own_snapshot_locked(buf, &activation_diag)",
-			"UnlockBufHdr(buf, buf_state)",
-			"cluster_pcm_own_activation_diag_emit(\"writer-commit\"" };
-	char *source = read_bufmgr_source();
-
-	UT_ASSERT_EQ(sizeof(ClusterPcmOwnSnapshot), 64);
-	UT_ASSERT_NOT_NULL(strstr(source, "out->writer_activation_token"));
-	UT_ASSERT_NOT_NULL(strstr(source, "out->resource_x_activation_generation"));
-	UT_ASSERT_NOT_NULL(strstr(source,
-		"writer_activation_token = cluster_pcm_own_writer_activation_token_get"));
-	UT_ASSERT_NOT_NULL(strstr(source,
-		"resource_x_activation_generation = "
-		"cluster_pcm_own_resource_x_activation_generation_get"));
-	UT_ASSERT_NOT_NULL(strstr(source, "writer_activation_token == 0"));
-	UT_ASSERT_NOT_NULL(strstr(source, "resource_x_activation_generation == 0"));
-	assert_ordered_in_function(source, "\ncluster_pcm_own_finish_grant_reservation(",
-							   "\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_finish_x_commit(",
-							   commit_contract, lengthof(commit_contract));
-	UT_ASSERT_NOT_NULL(strstr(source, "\"invalidate-stage-n-pi\""));
-	UT_ASSERT_NOT_NULL(strstr(source, "\"invalidate-stage-n-drop\""));
-	UT_ASSERT_NOT_NULL(strstr(source, "\"drop-no-wire-stage-n-pi\""));
-	UT_ASSERT_NOT_NULL(strstr(source, "\"drop-no-wire-stage-n-drop\""));
-	UT_ASSERT_NOT_NULL(strstr(source, "\"discard-pi-stage-n\""));
-	free(source);
-}
-
 UT_TEST(test_resource_x_preuse_drift_reprobes_only_current_valid_tuple)
 {
 	ClusterPcmOwnSnapshot live;
@@ -3281,6 +3390,7 @@ main(void)
 	UT_RUN(test_queue_n_source_refresh_is_exact_and_publishes_only_complete_image);
 	UT_RUN(test_queue_s_source_dirty_flush_makes_progress_and_reports_exact_refusal);
 	UT_RUN(test_revoke_finish_mode_rejects_pinned_vm_fsm_and_retains_main);
+	UT_RUN(test_aux_passive_pin_admission_closes_on_exact_revoking_fence);
 	UT_RUN(test_pcm_tracking_excludes_only_fsm_for_user_and_shared_catalog_relations);
 	UT_RUN(test_pcm_tracking_uses_one_tag_gate_for_acquire_direct_init_and_eviction);
 	UT_RUN(test_queue_revoke_retains_main_but_drops_unpinned_vm_fsm);
@@ -3303,7 +3413,6 @@ main(void)
 	UT_RUN(test_queue_passive_n_mirror_is_never_gcs_ship_authority);
 	UT_RUN(test_gcs_ship_copy_reports_exact_nonblocking_refusal_stage);
 	UT_RUN(test_pcm_x_retain_flush_error_injection_is_exact_and_pre_write);
-	UT_RUN(test_writer_activation_diagnostic_covers_commit_and_unguarded_n_boundaries);
 	UT_RUN(test_resource_x_preuse_drift_reprobes_only_current_valid_tuple);
 	UT_RUN(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only);
 	UT_DONE();

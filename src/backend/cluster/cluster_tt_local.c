@@ -144,9 +144,16 @@ cluster_tt_local_shmem_register(void)
  * ClusterTTStatusKey bytes.  Achieved by routing both through
  * cluster_tt_local_get_or_create_binding() / build_local_key().
  */
+typedef enum ClusterTTLocalTerminalState {
+	CLUSTER_TT_LOCAL_TERMINAL_NONE = 0,
+	CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED,
+	CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE
+} ClusterTTLocalTerminalState;
+
 typedef struct ClusterTTLocalBinding {
 	TransactionId top_xid; /* InvalidTransactionId == no binding */
 	uint32 segment_id;
+	uint32 segment_generation;
 	uint16 slot_offset;
 	/* spec-3.12 D2b: wrap counter captured at bind time.  The slot is held
 	 * ACTIVE for the whole xact (never recycled while ACTIVE), so wrap cannot
@@ -154,6 +161,10 @@ typedef struct ClusterTTLocalBinding {
 	 * TT slot without re-reading the shmem allocator, which may have rolled this
 	 * segment away (cluster_tt_slot_get_wrap would then ERROR on the stale id). */
 	uint16 wrap;
+	uint8 publish_state;
+	uint8 terminal_state;
+	uint8 reserved8[2];
+	XLogRecPtr active_lsn;
 	uint32 cluster_epoch; /* snapshot at bind time */
 	/* Real undo records use an independent record cursor.  Its segment may
 	 * differ from segment_id after rollover, while the page ref carries that
@@ -206,7 +217,7 @@ cluster_tt_local_append_binding(void)
 
 
 /*
- * cluster_tt_local_get_or_create_binding
+ * cluster_tt_local_reserve_binding
  *
  *	Public entry point for heap DML (D5).  On first call within an
  *	xact, allocates a real TT slot via cluster_tt_slot_alloc().  On
@@ -222,9 +233,9 @@ cluster_tt_local_append_binding(void)
  *	take LWLocks (allocator) and call cluster_undo_segment_allocate
  *	(which emits WAL on first segment creation).
  */
-bool
-cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segment_id,
-									   uint16 *out_slot_offset, uint32 *out_tt_slot_id)
+static bool
+cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
+								 uint16 *out_slot_offset, uint32 *out_tt_slot_id)
 {
 	if (!cluster_enabled || cluster_node_id < 0)
 		return false;
@@ -237,7 +248,12 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 		if (idx >= 0) {
 			const ClusterTTLocalBinding *b = &cluster_tt_local_bindings[idx];
 
-			/* Idempotent reuse. */
+			if (b->publish_state == CLUSTER_CANONICAL_TXN_FAILED)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						 errmsg("canonical ACTIVE publication previously failed for transaction %u",
+								b->top_xid)));
+			/* Idempotent reuse of the exact backend-local reservation. */
 			*out_segment_id = b->segment_id;
 			*out_slot_offset = b->slot_offset;
 			*out_tt_slot_id = cluster_tt_slot_offset_to_id(b->slot_offset);
@@ -249,9 +265,11 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 		ClusterTTLocalBinding *b;
 		uint32 seg;
 		uint16 off;
+		uint16 wrap;
 
 		for (;;) {
 			bool retained_pressure = false;
+			bool current_drift = false;
 
 			/*
 			 * spec-3.12 D2b: allocate on the node's CURRENT TT segment (which may
@@ -268,7 +286,11 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 			if (seg == 0)
 				seg = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
 
-			off = cluster_tt_slot_alloc_ext(seg, top_xid, &retained_pressure);
+			off = cluster_tt_slot_alloc_current_exact(
+				cluster_node_id, seg, top_xid, &retained_pressure,
+				&current_drift, &wrap);
+			if (current_drift)
+				continue;
 			if (off != INVALID_TT_SLOT_OFFSET)
 				break;
 
@@ -354,7 +376,8 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 		b->top_xid = top_xid;
 		b->segment_id = seg;
 		b->slot_offset = off;
-		b->wrap = cluster_tt_slot_get_wrap(seg, off); /* D2b: capture before any rollover */
+		b->wrap = wrap;
+		b->publish_state = CLUSTER_CANONICAL_TXN_RESERVED;
 		b->cluster_epoch = (uint32)cluster_epoch_get_current();
 
 		*out_segment_id = seg;
@@ -380,7 +403,9 @@ cluster_tt_local_peek_binding(TransactionId top_xid, uint32 *out_segment_id,
 	const ClusterTTLocalBinding *b;
 
 	idx = cluster_tt_local_find_binding(top_xid);
-	if (idx < 0 || !TransactionIdIsValid(top_xid))
+	if (idx < 0 || !TransactionIdIsValid(top_xid)
+		|| cluster_tt_local_bindings[idx].publish_state
+			!= CLUSTER_CANONICAL_TXN_PUBLISHED)
 		return false;
 
 	b = &cluster_tt_local_bindings[idx];
@@ -469,9 +494,16 @@ cluster_tt_local_finish_bindings(bool committed, SCN commit_scn)
 
 		if (!TransactionIdIsValid(b->top_xid))
 			continue;
-		if (committed)
+		if (committed
+			&& b->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
+			&& b->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED)
 			cluster_tt_slot_mark_committed(b->segment_id, b->slot_offset, b->top_xid, commit_scn);
-		else
+		else if (!committed
+				 && ((b->publish_state == CLUSTER_CANONICAL_TXN_RESERVED
+					  && b->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_NONE)
+					 || (b->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHED
+						 && b->terminal_state
+							== CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE)))
 			cluster_tt_slot_mark_aborted(b->segment_id, b->slot_offset, b->top_xid);
 	}
 
@@ -651,19 +683,193 @@ cluster_tt_local_modifier_recheck_or_error(const ClusterSemanticAdmissionToken *
 				 errhint("The transaction was refused before its commit record; retry is safe.")));
 }
 
+static bool
+cluster_tt_local_copy_published(const ClusterTTLocalBinding *binding,
+								ClusterCanonicalTxnBinding *out)
+{
+	if (binding == NULL || out == NULL
+		|| binding->publish_state != CLUSTER_CANONICAL_TXN_PUBLISHED
+		|| !TransactionIdIsNormal(binding->top_xid)
+		|| binding->segment_id == 0
+		|| binding->segment_generation == UINT32_MAX
+		|| binding->slot_offset >= TT_SLOTS_PER_SEGMENT
+		|| binding->wrap == TT_WRAP_INVALID
+		|| XLogRecPtrIsInvalid(binding->active_lsn)
+		|| binding->terminal_state != CLUSTER_TT_LOCAL_TERMINAL_NONE
+		|| binding->reserved8[0] != 0 || binding->reserved8[1] != 0)
+		return false;
+
+	memset(out, 0, sizeof(*out));
+	out->segment_id = binding->segment_id;
+	out->segment_generation = binding->segment_generation;
+	out->xid = binding->top_xid;
+	out->slot_offset = binding->slot_offset;
+	out->slot_wrap = binding->wrap;
+	out->origin_instance = (uint8)(cluster_node_id + 1);
+	out->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+	out->active_lsn = binding->active_lsn;
+	return true;
+}
+
+bool
+cluster_tt_local_get_published_binding(TransactionId top_xid,
+									   ClusterCanonicalTxnBinding *binding_out)
+{
+	int idx;
+
+	if (binding_out == NULL)
+		return false;
+	memset(binding_out, 0, sizeof(*binding_out));
+	if (!cluster_enabled || cluster_node_id < 0
+		|| !TransactionIdIsNormal(top_xid))
+		return false;
+	idx = cluster_tt_local_find_binding(top_xid);
+	return idx >= 0
+		&& cluster_tt_local_copy_published(&cluster_tt_local_bindings[idx],
+			binding_out);
+}
+
+bool
+cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
+									  ClusterCanonicalTxnBinding *binding_out)
+{
+	ClusterSemanticAdmissionToken modifier_token;
+	ClusterSemanticAdmissionResult admission;
+	ClusterTTSlotCurrentOwner expected_owner;
+	ClusterTTSlotCurrentOwner observed_owner;
+	ClusterTTLocalBinding *binding;
+	XLogRecPtr active_lsn;
+	uint32 segment_id;
+	uint32 segment_generation = UINT32_MAX;
+	uint32 tt_slot_id;
+	uint16 slot_offset;
+	TTSlot successor;
+	int idx;
+
+	if (binding_out == NULL)
+		return false;
+	memset(binding_out, 0, sizeof(*binding_out));
+	if (!cluster_enabled || cluster_node_id < 0
+		|| !TransactionIdIsNormal(top_xid))
+		return false;
+
+	idx = cluster_tt_local_find_binding(top_xid);
+	if (idx >= 0) {
+		binding = &cluster_tt_local_bindings[idx];
+		if (cluster_tt_local_copy_published(binding, binding_out))
+			return true;
+		if (binding->publish_state == CLUSTER_CANONICAL_TXN_PUBLISHING
+			|| binding->publish_state == CLUSTER_CANONICAL_TXN_FAILED)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("canonical ACTIVE publication is not reusable for transaction %u",
+							binding->top_xid)));
+	}
+
+	if (!cluster_tt_local_reserve_binding(top_xid, &segment_id,
+			&slot_offset, &tt_slot_id))
+		return false;
+	(void)segment_id;
+	(void)slot_offset;
+	(void)tt_slot_id;
+	idx = cluster_tt_local_find_binding(top_xid);
+	Assert(idx >= 0);
+	binding = &cluster_tt_local_bindings[idx];
+
+	memset(&expected_owner, 0, sizeof(expected_owner));
+	memset(&observed_owner, 0, sizeof(observed_owner));
+	if (!cluster_tt_slot_current_owner_by_xid(cluster_node_id, top_xid,
+			&observed_owner)
+		|| observed_owner.segment_id != binding->segment_id
+		|| observed_owner.slot_offset != binding->slot_offset
+		|| observed_owner.wrap != binding->wrap
+		|| observed_owner.status != CTS_ACTIVE
+		|| observed_owner.commit_scn != InvalidScn)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("canonical ACTIVE allocator reservation is not exact")));
+	expected_owner = observed_owner;
+	binding->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHING;
+
+	admission = cluster_semantic_activation_modifier_enter(
+		cluster_tt_local_writable_admission(), &modifier_token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK) {
+		binding->publish_state = CLUSTER_CANONICAL_TXN_FAILED;
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot publish canonical ACTIVE during cluster reconfiguration")));
+	}
+
+	PG_TRY();
+	{
+		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+		active_lsn = cluster_tt_slot_durable_publish_active(
+			&expected_owner, &modifier_token, &segment_generation, &successor);
+		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+		if (XLogRecPtrIsInvalid(active_lsn)
+			|| segment_generation == UINT32_MAX
+			|| successor.status != TT_SLOT_ACTIVE
+			|| successor.xid != top_xid
+			|| successor.wrap != binding->wrap
+			|| successor.flags != TT_FLAGS_RESERVED
+			|| SCN_VALID(successor.commit_scn)
+			|| !UBA_is_invalid(successor.first_undo_block))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publisher returned an invalid successor")));
+
+		binding->segment_generation = segment_generation;
+		binding->active_lsn = active_lsn;
+		binding->publish_state = CLUSTER_CANONICAL_TXN_PUBLISHED;
+		if (!cluster_tt_local_copy_published(binding, binding_out))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE publication receipt is inconsistent")));
+	}
+	PG_CATCH();
+	{
+		binding->publish_state = CLUSTER_CANONICAL_TXN_FAILED;
+		cluster_semantic_activation_leave(&modifier_token);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	cluster_semantic_activation_leave(&modifier_token);
+	return true;
+}
+
+/* Legacy shape retained for non-heap callers, but it is now strictly
+ * read-only and can never reserve or publish while a caller holds page locks. */
+bool
+cluster_tt_local_get_or_create_binding(TransactionId top_xid,
+									   uint32 *out_segment_id,
+									   uint16 *out_slot_offset,
+									   uint32 *out_tt_slot_id)
+{
+	ClusterCanonicalTxnBinding binding;
+
+	if (!cluster_tt_local_get_published_binding(top_xid, &binding))
+		return false;
+	*out_segment_id = binding.segment_id;
+	*out_slot_offset = binding.slot_offset;
+	*out_tt_slot_id = cluster_tt_slot_offset_to_id(binding.slot_offset);
+	return true;
+}
+
 bool
 cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 										  xl_xact_tt_commit *out_fold)
 {
 	ClusterSemanticAdmissionToken modifier_token;
 	ClusterSemanticAdmissionResult admission;
+	ClusterCanonicalTxnBinding binding;
 	uint32 segment_id;
+	uint32 segment_generation;
 	uint16 slot_offset;
-	uint32 tt_slot_id;
-	uint32 cluster_epoch;
 	uint16 wrap;
 	uint8 owner;
 	TTSlot successor;
+	int idx;
 
 	/*
 	 * spec-3.11 D4 / C1: durably stamp commit_scn on this xact's TT slot in the
@@ -683,9 +889,17 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 	 * durable atomically (no stamped-but-uncommitted window).  2PC keeps the
 	 * standalone 0x30 (cluster_tt_slot_durable_commit) -- not this path.
 	 */
-	if (!cluster_tt_local_peek_binding(xid, &segment_id, &slot_offset, &tt_slot_id, &cluster_epoch,
-									   &wrap))
+	if (!cluster_tt_local_get_published_binding(xid, &binding))
 		return false;
+	idx = cluster_tt_local_find_binding(xid);
+	if (idx < 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("canonical ACTIVE binding disappeared before commit")));
+	segment_id = binding.segment_id;
+	segment_generation = binding.segment_generation;
+	slot_offset = binding.slot_offset;
+	wrap = binding.slot_wrap;
 
 	admission = cluster_semantic_activation_modifier_enter(
 		cluster_tt_local_writable_admission(), &modifier_token);
@@ -706,7 +920,8 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 		 */
 		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
 		owner = cluster_tt_slot_durable_commit_writeonly(
-			segment_id, slot_offset, xid, wrap, commit_scn, &modifier_token,
+			segment_id, segment_generation, slot_offset, xid, wrap, commit_scn,
+			&modifier_token,
 			&successor);
 
 		/*
@@ -715,14 +930,75 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 		 * the slot's owner instance, needed for path resolution at redo.
 		 */
 		out_fold->segment_id = segment_id;
+		out_fold->segment_generation = segment_generation;
+		out_fold->xid = successor.xid;
 		out_fold->slot_offset = slot_offset;
 		out_fold->wrap = successor.wrap;
-		out_fold->xid = successor.xid;
 		out_fold->instance = owner;
-		out_fold->_pad[0] = 0;
-		out_fold->_pad[1] = 0;
-		out_fold->_pad[2] = 0;
+		out_fold->format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
+		out_fold->flags = 0;
+		out_fold->reserved = 0;
 		out_fold->commit_scn = successor.commit_scn;
+		cluster_tt_local_bindings[idx].terminal_state
+			= CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED;
+	}
+	PG_FINALLY();
+	{
+		cluster_semantic_activation_leave(&modifier_token);
+	}
+	PG_END_TRY();
+	return true;
+}
+
+bool
+cluster_tt_local_preabort_durable_finish(TransactionId xid)
+{
+	ClusterSemanticAdmissionToken modifier_token;
+	ClusterSemanticAdmissionResult admission;
+	ClusterTTLocalBinding *binding;
+	TTSlot successor;
+	XLogRecPtr abort_lsn;
+	int idx;
+
+	idx = cluster_tt_local_find_binding(xid);
+	if (idx < 0)
+		return false;
+	binding = &cluster_tt_local_bindings[idx];
+	if (binding->publish_state == CLUSTER_CANONICAL_TXN_RESERVED
+		&& binding->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_NONE)
+		return false;
+	if (binding->publish_state != CLUSTER_CANONICAL_TXN_PUBLISHED)
+		return false;
+	if (binding->terminal_state == CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE)
+		return true;
+	if (binding->terminal_state != CLUSTER_TT_LOCAL_TERMINAL_NONE)
+		return false;
+
+	admission = cluster_semantic_activation_modifier_enter(
+		cluster_tt_local_writable_admission(), &modifier_token);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cannot make canonical transaction abort durable during cluster reconfiguration")));
+	PG_TRY();
+	{
+		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+		abort_lsn = cluster_tt_slot_durable_abort_exact(
+			binding->segment_id, binding->segment_generation,
+			binding->slot_offset, binding->top_xid, binding->wrap,
+			&modifier_token, &successor);
+		cluster_tt_local_modifier_recheck_or_error(&modifier_token);
+		if (XLogRecPtrIsInvalid(abort_lsn)
+			|| successor.status != TT_SLOT_ABORTED
+			|| successor.xid != binding->top_xid
+			|| successor.wrap != binding->wrap
+			|| successor.flags != TT_FLAGS_RESERVED
+			|| SCN_VALID(successor.commit_scn)
+			|| !UBA_is_invalid(successor.first_undo_block))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical abort publisher returned an invalid successor")));
+		binding->terminal_state = CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE;
 	}
 	PG_FINALLY();
 	{
@@ -735,7 +1011,12 @@ cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
 void
 cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn)
 {
-	install_status(xid, CLUSTER_TT_STATUS_COMMITTED, commit_scn);
+	int idx = cluster_tt_local_find_binding(xid);
+
+	if (idx >= 0
+		&& cluster_tt_local_bindings[idx].terminal_state
+			== CLUSTER_TT_LOCAL_TERMINAL_COMMIT_STAGED)
+		install_status(xid, CLUSTER_TT_STATUS_COMMITTED, commit_scn);
 	/*
 	 * spec-3.12 D2: retain the binding's TT slot as COMMITTED + commit_scn
 	 * (replaces the spec-3.4b commit-time free).  Retention keeps the durable
@@ -751,7 +1032,12 @@ cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn)
 void
 cluster_tt_local_record_abort(TransactionId xid)
 {
-	install_status(xid, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+	int idx = cluster_tt_local_find_binding(xid);
+
+	if (idx >= 0
+		&& cluster_tt_local_bindings[idx].terminal_state
+			== CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE)
+		install_status(xid, CLUSTER_TT_STATUS_ABORTED, InvalidScn);
 	/* spec-3.12 D2 / C7: aborted slots are immediately recyclable. */
 	cluster_tt_local_finish_bindings(false /* aborted */, InvalidScn);
 }
@@ -875,6 +1161,13 @@ cluster_tt_local_record_abort(TransactionId xid)
 	(void)xid;
 }
 
+bool
+cluster_tt_local_preabort_durable_finish(TransactionId xid)
+{
+	(void)xid;
+	return false;
+}
+
 void
 cluster_tt_local_record_active(TransactionId xid)
 {
@@ -902,6 +1195,26 @@ cluster_tt_local_get_or_create_binding(TransactionId top_xid, uint32 *out_segmen
 	(void)out_segment_id;
 	(void)out_slot_offset;
 	(void)out_tt_slot_id;
+	return false;
+}
+
+bool
+cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
+									  ClusterCanonicalTxnBinding *binding_out)
+{
+	(void)top_xid;
+	if (binding_out != NULL)
+		memset(binding_out, 0, sizeof(*binding_out));
+	return false;
+}
+
+bool
+cluster_tt_local_get_published_binding(TransactionId top_xid,
+									   ClusterCanonicalTxnBinding *binding_out)
+{
+	(void)top_xid;
+	if (binding_out != NULL)
+		memset(binding_out, 0, sizeof(*binding_out));
 	return false;
 }
 

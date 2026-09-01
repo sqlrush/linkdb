@@ -304,8 +304,11 @@ side_xact_tt_delta_valid(const xl_xact_tt_commit *delta,
 						 uint16 origin_thread, TransactionId xid, SCN scn)
 {
 	return delta != NULL && delta->instance == origin_thread &&
-		delta->segment_id != 0 && delta->slot_offset < TT_SLOTS_PER_SEGMENT &&
-		delta->wrap != 0 && delta->xid == xid &&
+		delta->segment_id != 0 && delta->segment_generation != UINT32_MAX &&
+		delta->slot_offset < TT_SLOTS_PER_SEGMENT &&
+		delta->wrap != TT_WRAP_INVALID && delta->xid == xid &&
+		delta->format_version == CLUSTER_XACT_TT_COMMIT_VERSION &&
+		delta->flags == 0 && delta->reserved == 0 &&
 		delta->commit_scn == scn;
 }
 
@@ -699,8 +702,10 @@ side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
 	bool		post_wrap_valid;
 
 	/* Canonical TT truth first, using only the frozen typed delta. */
-	cluster_tt_durable_redo_stamp_slot(operation->tt_delta.instance,
-		operation->tt_delta.segment_id, operation->tt_delta.slot_offset,
+	cluster_tt_durable_redo_stamp_slot_exact(operation->tt_delta.instance,
+		operation->tt_delta.segment_id,
+		operation->tt_delta.segment_generation,
+		operation->tt_delta.slot_offset,
 		operation->tt_delta.wrap, operation->tt_delta.xid,
 		operation->tt_delta.commit_scn);
 	if (cluster_tt_slot_durable_resolve_by_xid_origin(

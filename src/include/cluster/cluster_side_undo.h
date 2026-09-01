@@ -48,6 +48,7 @@
 typedef enum ClusterUndoDecodedKind
 {
 	CLUSTER_UNDO_KIND_SEGMENT_INIT = 0,
+	CLUSTER_UNDO_KIND_TT_BIND,
 	CLUSTER_UNDO_KIND_TT_COMMIT,
 	CLUSTER_UNDO_KIND_TT_ABORT,
 	CLUSTER_UNDO_KIND_TT_SET_HEAD,
@@ -86,6 +87,8 @@ typedef struct ClusterUndoDecoded
 	uint32		payload_length;
 	uint32		expected_generation;
 	uint32		new_generation;
+	uint8		format_version;
+	uint8		flags;
 	uint8		old_state;
 	uint8		new_state;
 	uint8		reserved_zero[2];

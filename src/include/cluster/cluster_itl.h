@@ -251,6 +251,8 @@ extern uint8 cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixac
  *	cluster_itl_touch_register() for xact-end finalization.
  */
 extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_slot_idx);
+extern bool cluster_itl_has_allocatable_slot(Buffer buf, TransactionId top_xid,
+									 bool lock_only);
 
 /*
  * cluster_itl_alloc_or_reuse_lock_slot -- lock-only allocator for

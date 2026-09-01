@@ -444,17 +444,13 @@ UT_TEST(test_stage3_retention_active_retains_invariant)
 }
 
 
-/* ===== L8 — 0x20 BIND opcode byte still reserved (no #define) ===== */
+/* ===== L8 — 0x20 BIND opcode byte is exact and collision-free ===== */
 
 UT_TEST(test_stage3_bind_opcode_reserved)
 {
-	/* spec-3.x: 0x20 XLOG_UNDO_TT_SLOT_BIND is documented as reserved in
-	 * cluster_undo_xlog.h but intentionally has NO #define (BIND is not
-	 * WAL-logged;  FREE-path slot reuse handles binding).  The byte 0x20
-	 * therefore differs from every live opcode and leaves XLR_INFO_MASK
-	 * clear — verifying it stays unallocated and collision-safe. */
-	const int bind_byte = 0x20;
+	const int bind_byte = XLOG_UNDO_TT_SLOT_BIND;
 
+	UT_ASSERT_EQ(bind_byte, 0x20);
 	UT_ASSERT_EQ(bind_byte & XLR_INFO_MASK, 0);
 	UT_ASSERT(bind_byte != XLOG_UNDO_SEGMENT_INIT);
 	UT_ASSERT(bind_byte != XLOG_UNDO_TT_SLOT_COMMIT);

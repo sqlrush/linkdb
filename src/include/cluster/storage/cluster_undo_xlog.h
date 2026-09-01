@@ -59,6 +59,7 @@
  *     ... up to 0xF0 (low nibble used for XLR_INFO_MASK by xlog framework).
  */
 #define XLOG_UNDO_SEGMENT_INIT 0x10
+#define XLOG_UNDO_TT_SLOT_BIND 0x20
 #define XLOG_UNDO_TT_SLOT_COMMIT 0x30  /* spec-3.11 D3: durable TT slot commit_scn */
 #define XLOG_UNDO_SEGMENT_RECYCLE 0x40 /* spec-3.13 D3: COMMITTED -> RECYCLABLE */
 #define XLOG_UNDO_SEGMENT_REUSE 0x50   /* spec-3.13 D4: whole-segment rebirth */
@@ -76,6 +77,8 @@
 #define XLOG_HW_RESERVE 0xB0 /* per-batch HWM advance, flushed before the master replies */
 
 StaticAssertDecl((XLOG_UNDO_SEGMENT_INIT & XLR_INFO_MASK) == 0,
+				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
+StaticAssertDecl((XLOG_UNDO_TT_SLOT_BIND & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
 StaticAssertDecl((XLOG_UNDO_TT_SLOT_COMMIT & XLR_INFO_MASK) == 0,
 				 "cluster undo WAL opcodes must leave XLR_INFO_MASK bits clear");
@@ -134,6 +137,30 @@ StaticAssertDecl(sizeof(xl_cluster_undo_segment_init) == 12,
 StaticAssertDecl(offsetof(xl_cluster_undo_segment_init, segment_id) == 8,
 				 "xl_cluster_undo_segment_init.segment_id must be at offset 8 "
 				 "(uint32 8-byte alignment slot; Hardening v1.0.4 P2-1)");
+
+#define CLUSTER_UNDO_TT_BIND_VERSION 1
+
+typedef struct xl_undo_tt_slot_bind {
+	uint32 segment_id;
+	uint32 segment_generation;
+	TransactionId xid;
+	uint16 slot_offset;
+	uint16 wrap;
+	uint8 instance;
+	uint8 format_version;
+	uint8 flags;
+	uint8 reserved8;
+	uint32 reserved32;
+} xl_undo_tt_slot_bind;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_bind) == 24,
+				 "xl_undo_tt_slot_bind must be exactly 24 bytes");
+StaticAssertDecl(offsetof(xl_undo_tt_slot_bind, segment_generation) == 4,
+				 "bind segment generation offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_slot_bind, xid) == 8,
+				 "bind xid offset must remain fixed");
+StaticAssertDecl(offsetof(xl_undo_tt_slot_bind, instance) == 16,
+				 "bind identity trailer offset must remain fixed");
 
 /*
  * On-disk WAL payload for XLOG_HW_RESERVE (spec-5.7a D1, §3.1a M1c).
@@ -212,6 +239,25 @@ typedef struct xl_undo_tt_slot_abort {
 
 StaticAssertDecl(sizeof(xl_undo_tt_slot_abort) == 16,
 				 "spec-3.15: xl_undo_tt_slot_abort is 16 bytes, no implicit padding");
+
+#define CLUSTER_UNDO_TT_ABORT_EXACT_VERSION ((uint8)1)
+
+typedef struct xl_undo_tt_slot_abort_exact {
+	uint32 segment_id;
+	uint32 segment_generation;
+	TransactionId xid;
+	uint16 slot_offset;
+	uint16 wrap;
+	uint8 instance;
+	uint8 format_version;
+	uint16 flags;
+	uint32 reserved;
+} xl_undo_tt_slot_abort_exact;
+
+StaticAssertDecl(sizeof(xl_undo_tt_slot_abort_exact) == 24,
+				 "exact TT abort WAL payload must be 24 bytes");
+StaticAssertDecl(offsetof(xl_undo_tt_slot_abort_exact, segment_generation) == 4,
+				 "exact TT abort generation must be at offset 4");
 
 /*
  * On-disk WAL payload for XLOG_UNDO_TT_SLOT_SET_HEAD (spec-4.8 D7-A).
@@ -492,6 +538,12 @@ cluster_undo_apply_block_write_multi_delta(char *block, const xl_undo_block_writ
 extern XLogRecPtr cluster_undo_emit_segment_init(uint8 instance, uint32 segment_id,
 												 const char *page_image);
 
+/* Publish one exact canonical ACTIVE transaction-table identity. */
+extern XLogRecPtr cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id,
+												 uint32 segment_generation,
+												 uint16 slot_offset, uint16 wrap,
+												 TransactionId xid);
+
 /*
  * cluster_undo_emit_tt_slot_commit (spec-3.11 D3)
  *	  Backend: emit XLOG_UNDO_TT_SLOT_COMMIT for a durable commit_scn stamp on
@@ -514,11 +566,17 @@ extern XLogRecPtr cluster_undo_emit_tt_slot_commit(uint8 instance, uint32 segmen
 extern void cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id,
 											   uint16 slot_offset, uint16 wrap, TransactionId xid,
 											   SCN commit_scn);
+extern void cluster_tt_durable_redo_stamp_slot_exact(uint8 instance,
+	uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
+	uint16 wrap, TransactionId xid, SCN commit_scn);
 
 /* spec-3.15 D5: emit XLOG_UNDO_TT_SLOT_ABORT (prepared rollback). */
 extern XLogRecPtr cluster_undo_emit_tt_slot_abort(uint8 instance, uint32 segment_id,
 												  uint16 slot_offset, uint16 wrap,
 												  TransactionId xid);
+extern XLogRecPtr cluster_undo_emit_tt_slot_abort_exact(uint8 instance,
+	uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
+	uint16 wrap, TransactionId xid);
 
 /* spec-4.8 D7-A: emit XLOG_UNDO_TT_SLOT_SET_HEAD (durable undo-chain head). */
 extern XLogRecPtr cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id,

@@ -59,6 +59,8 @@ typedef bool (*ClusterR4HotFetchFullTestHook)(void *arg,
 typedef bool (*ClusterR4HotScratchSearchTestHook)(
 	void *arg, const ClusterR4HotScratchTestContext *context,
 	HeapTuple scratch_tuple);
+typedef void (*ClusterHeapDmlAuthorityGuardTestHook)(
+	Buffer buffer, HeapTuple tuple, void *arg);
 
 /* PK IndexScan companion; public heap_hot_search_buffer() remains unchanged. */
 extern HeapHotSearchResultKind heap_hot_search_buffer_result(
@@ -93,6 +95,9 @@ extern bool cluster_heap_test_itl_update_same_page_failure_cleanup(void);
 extern void cluster_heap_test_itl_last_census_stats(
 	uint8 *locator_mask, uint8 *attempted_mask,
 	uint8 *terminal_mask, uint8 *terminal_count);
+extern bool cluster_heap_test_dml_authority_guard_recheck_with_hook(
+	Buffer buffer, HeapTuple tuple,
+	ClusterHeapDmlAuthorityGuardTestHook hook, void *hook_arg);
 #endif
 #endif
 

@@ -455,8 +455,9 @@ xact_desc_commit(StringInfo buf, uint8 info, xl_xact_commit *xlrec, RepOriginId 
 	 * pg_waldump exposes the seg/slot/wrap/instance the redo will stamp.
 	 */
 	if (parsed.xinfo & XACT_XINFO_HAS_TT_COMMIT)
-		appendStringInfo(buf, "; tt_commit: seg %u slot %u wrap %u inst %u scn " SCN_FORMAT,
-						 parsed.tt_commit.segment_id, (unsigned) parsed.tt_commit.slot_offset,
+		appendStringInfo(buf, "; tt_commit: seg %u gen %u slot %u wrap %u inst %u scn " SCN_FORMAT,
+						 parsed.tt_commit.segment_id, parsed.tt_commit.segment_generation,
+						 (unsigned) parsed.tt_commit.slot_offset,
 						 (unsigned) parsed.tt_commit.wrap, (unsigned) parsed.tt_commit.instance,
 						 SCN_FORMAT_ARG(parsed.tt_commit.commit_scn));
 }

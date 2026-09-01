@@ -6463,99 +6463,6 @@ semantic_activation_r4_initial_clean_sample_candidate(
 		expected_generation, true);
 }
 
-/* Temporary 8.15-PRE D1 evidence: report the exact read-only conjunction
- * when an unchanged two-stage run cannot enter SAMPLE.  This creates no
- * protocol state, counter, authority, deadline, or alternate success path. */
-static void
-semantic_activation_r4_initial_clean_sample_diagnostic(
-	uint64 expected_generation)
-{
-	ClusterInitialCleanFormationSnapshot clean;
-	SemanticActivationAdmissionSnapshot gate;
-	uint8 pgrd[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
-	uint64 members_lo = 0;
-	uint64 members_hi = 0;
-	uint64 formation_epoch = 0;
-	uint64 admitted[4] = {0};
-	uint32 capability_generation[4] = {0};
-	uint32 capability_word[4] = {0};
-	uint32 membership[4] = {0};
-	int32 coordinator_node = -1;
-	bool clean_ok;
-	bool gate_ok;
-	bool pgrd_ok;
-	bool authority_ok;
-	int node;
-
-	memset(&clean, 0, sizeof(clean));
-	memset(&gate, 0, sizeof(gate));
-	clean_ok = cluster_reconfig_snapshot_initial_clean_formation(&clean);
-	pgrd_ok = semantic_activation_initial_clean_pgrd_mirror(pgrd);
-	gate_ok = semantic_activation_snapshot(&gate);
-	authority_ok = semantic_activation_ack_current_authority(
-		cluster_node_id, &members_lo, &members_hi, &formation_epoch,
-		&coordinator_node);
-	for (node = 0; node < 4; node++) {
-		membership[node] = (uint32)cluster_membership_get_state(node);
-		admitted[node]
-			= cluster_membership_get_last_admitted_incarnation(node);
-		if (node == cluster_node_id) {
-			capability_word[node] = cluster_ic_local_capability_word();
-			capability_generation[node] = 1;
-		}
-		else
-			(void)cluster_sf_peer_capability_word_sample(
-				node, CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS,
-				&capability_word[node], &capability_generation[node]);
-	}
-	ereport(LOG,
-			(errmsg_internal("R4 initial-clean SAMPLE basis diagnostic"),
-			 errdetail("expected=%llu recovery=%u clean=%u marker=%llu "
-					   "clean_epoch=%llu clean_members=0x%llx/0x%llx "
-					   "pgrd=%u gate=%u gate_bits=0x%llx gate_generation=%llu "
-					   "gate_closed=%u gate_epoch=%llu authority=%u "
-					   "authority_members=0x%llx/0x%llx authority_epoch=%llu "
-					   "coordinator=%d current_epoch=%llu quorum=%u "
-					   "self_incarnation=%llu "
-					   "m0=%u/%llu/%llu/cap=0x%x/%u "
-					   "m1=%u/%llu/%llu/cap=0x%x/%u "
-					   "m2=%u/%llu/%llu/cap=0x%x/%u "
-					   "m3=%u/%llu/%llu/cap=0x%x/%u",
-					   (unsigned long long)expected_generation,
-					   (unsigned)cluster_grd_recovery_state_value(),
-					   clean_ok ? 1U : 0U,
-					   (unsigned long long)clean.formation_marker_generation,
-					   (unsigned long long)clean.formation_epoch,
-					   (unsigned long long)clean.members_lo,
-					   (unsigned long long)clean.members_hi,
-					   pgrd_ok ? 1U : 0U, gate_ok ? 1U : 0U,
-					   (unsigned long long)gate.active_bits,
-					   (unsigned long long)gate.record_generation,
-					   gate.transition_closed ? 1U : 0U,
-					   (unsigned long long)gate.formation_epoch,
-					   authority_ok ? 1U : 0U,
-					   (unsigned long long)members_lo,
-					   (unsigned long long)members_hi,
-					   (unsigned long long)formation_epoch,
-					   coordinator_node,
-					   (unsigned long long)cluster_epoch_get_current(),
-					   cluster_qvotec_in_quorum() ? 1U : 0U,
-					   (unsigned long long)
-						cluster_qvotec_get_self_incarnation(),
-					   membership[0], (unsigned long long)admitted[0],
-					   (unsigned long long)clean.admitted_incarnation[0],
-					   capability_word[0], capability_generation[0],
-					   membership[1], (unsigned long long)admitted[1],
-					   (unsigned long long)clean.admitted_incarnation[1],
-					   capability_word[1], capability_generation[1],
-					   membership[2], (unsigned long long)admitted[2],
-					   (unsigned long long)clean.admitted_incarnation[2],
-					   capability_word[2], capability_generation[2],
-					   membership[3], (unsigned long long)admitted[3],
-					   (unsigned long long)clean.admitted_incarnation[3],
-					   capability_word[3], capability_generation[3])));
-}
-
 /*
  * Validate the read-only RECOVER_HEAD result used to repeat the mandatory
  * accepted-invalidator scan after ADMITTED.  CHOSEN means QVOTEC found no
@@ -6828,10 +6735,6 @@ r4_pre_prepare_readiness(uint64 expected_generation, ClusterSemanticActivationRe
 		   || initial_clean_basis)
 			  ? CLUSTER_SEMANTIC_ACTIVATION_OK
 						 : CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
-
-	if (!admitted_basis && !initial_clean_basis)
-		semantic_activation_r4_initial_clean_sample_diagnostic(
-			expected_generation);
 
 	/* The instantaneous READY snapshot belongs exclusively to target LMON's
 	 * phase-3 serializer.  The current-coordinator handoff becomes visible

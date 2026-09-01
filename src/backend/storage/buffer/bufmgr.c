@@ -125,6 +125,18 @@ cluster_bufmgr_should_pcm_track(BufferDesc *buf)
 	return cluster_pcm_x_buffer_tag_tracked(&buf->tag, cluster_shared_catalog);
 }
 
+/* Caller holds the BufferDesc header lock.  The sidecar REVOKING flag and
+ * the first shared-refcount increment are therefore one atomic choice. */
+static inline bool
+cluster_bufmgr_pcm_aux_pin_admission_locked(BufferDesc *buf)
+{
+	Assert(buf != NULL);
+	Assert(pg_atomic_read_u32(&buf->state) & BM_LOCKED);
+	return cluster_pcm_x_aux_pin_admission_allowed(
+		cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf),
+		buf->tag.forkNum, cluster_pcm_own_flags_get(buf->buf_id));
+}
+
 /* Defined with the GCS copy/drop substrate below.  The queue ownership
  * adapters live earlier so LockBuffer can share them without exposing raw
  * buffer-manager pin mechanics outside this file. */
@@ -292,29 +304,6 @@ cluster_pcm_own_snapshot_locked(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 		= cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id);
 	out->flags = cluster_pcm_own_flags_get(buf->buf_id);
 	out->pcm_state = buf->pcm_state;
-}
-
-/* Diagnostic only: callers capture under the BufferDesc header lock and emit
- * after releasing it.  Keeping one format for commit, exact clear, and the
- * unguarded legacy N boundaries makes a stale activation fence traceable to
- * its last exact tag/descriptor tuple without changing ownership semantics. */
-static void
-cluster_pcm_own_activation_diag_emit(const char *site, int buffer_id,
-									 const ClusterPcmOwnSnapshot *snapshot,
-									 ClusterPcmOwnResult result)
-{
-	if (site == NULL || snapshot == NULL)
-		return;
-	elog(LOG,
-		 "cluster PCM writer activation diagnostic: site=%s buffer=%d rel=%u fork=%d blk=%u "
-		 "generation=%llu reservation_token=%llu writer_activation_token=%llu "
-		 "resource_x_activation_generation=%llu flags=0x%x pcm_state=%u result=%d",
-		 site, buffer_id, snapshot->tag.relNumber, (int)snapshot->tag.forkNum,
-		 snapshot->tag.blockNum, (unsigned long long)snapshot->generation,
-		 (unsigned long long)snapshot->reservation_token,
-		 (unsigned long long)snapshot->writer_activation_token,
-		 (unsigned long long)snapshot->resource_x_activation_generation, snapshot->flags,
-		 (unsigned int)snapshot->pcm_state, (int)result);
 }
 
 /* A normal D-h1 PI is !BM_VALID.  PCM-X retained-image transfer deliberately
@@ -652,8 +641,13 @@ cluster_bufmgr_pcm_own_n_storage_candidate_exact(
 
 static bool
 cluster_bufmgr_pcm_direct_init_known_new_locked(BufferDesc *buf,
-												 uint32 buf_state)
+											 uint32 buf_state)
 {
+	uint32 flags;
+	uint64 reservation_token;
+	uint64 resource_x_activation_generation;
+	uint64 writer_activation_token;
+	bool aux_pin_handoff_protected = false;
 	bool io_known_new;
 	bool valid_aux_known_new;
 
@@ -665,8 +659,33 @@ cluster_bufmgr_pcm_direct_init_known_new_locked(BufferDesc *buf,
 		&& (buf_state & BM_IO_IN_PROGRESS) == 0
 		&& (buf->tag.forkNum == VISIBILITYMAP_FORKNUM
 			|| buf->tag.forkNum == FSM_FORKNUM);
+	if (valid_aux_known_new && BUF_STATE_GET_REFCOUNT(buf_state) == 0)
+	{
+		flags = cluster_pcm_own_flags_get(buf->buf_id);
+		reservation_token
+			= cluster_pcm_own_reservation_token_get(buf->buf_id);
+		writer_activation_token
+			= cluster_pcm_own_writer_activation_token_get(buf->buf_id);
+		resource_x_activation_generation
+			= cluster_pcm_own_resource_x_activation_generation_get(
+				buf->buf_id);
+		/* The fresh proof was armed and consumed while pinned.  Only its exact
+		 * VM/FSM GRANT_PENDING token, or that token's contiguous T2/T3 sidecar,
+		 * may cover the approved pinless network interval.  Mapping eviction
+		 * rejects both live shapes, so no raw descriptor reuse is admitted. */
+		aux_pin_handoff_protected
+			= reservation_token != 0
+			  && reservation_token != UINT64_MAX
+			  && ((flags == PCM_OWN_FLAG_GRANT_PENDING
+				   && writer_activation_token == 0
+				   && resource_x_activation_generation == 0)
+				  || (flags == 0
+					  && writer_activation_token == reservation_token
+					  && resource_x_activation_generation != UINT64_MAX));
+	}
 	return buf->buffer_type != (uint8)BUF_TYPE_PI
-		&& BUF_STATE_GET_REFCOUNT(buf_state) != 0
+		&& (BUF_STATE_GET_REFCOUNT(buf_state) != 0
+			|| aux_pin_handoff_protected)
 		&& (buf_state & BM_TAG_VALID) != 0
 		&& (buf_state
 			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
@@ -1949,12 +1968,10 @@ cluster_pcm_own_finish_grant_reservation(BufferDesc *buf, const ClusterPcmOwnSna
 										 uint64 *out_committed_generation,
 										 ClusterPcmOwnSnapshot *live_out)
 {
-	ClusterPcmOwnSnapshot activation_diag;
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmXGrantReservationKind kind;
 	ClusterPcmOwnResult result;
 	uint32 buf_state;
-	bool activation_diag_valid = false;
 
 	if (buf == NULL || base == NULL || out_committed_generation == NULL)
 		return CLUSTER_PCM_OWN_INVALID;
@@ -2003,16 +2020,9 @@ cluster_pcm_own_finish_grant_reservation(BufferDesc *buf, const ClusterPcmOwnSna
 			buf->buffer_type
 				= new_pcm_state == (uint8)PCM_STATE_S ? (uint8)BUF_TYPE_SCUR : (uint8)BUF_TYPE_XCUR;
 			buf->pcm_state = new_pcm_state;
-			if (new_pcm_state == (uint8)PCM_STATE_X && arm_writer_activation) {
-				cluster_pcm_own_snapshot_locked(buf, &activation_diag);
-				activation_diag_valid = true;
-			}
 		}
 	}
 	UnlockBufHdr(buf, buf_state);
-	if (activation_diag_valid)
-		cluster_pcm_own_activation_diag_emit("writer-commit", buf->buf_id,
-										 &activation_diag, result);
 	/* Every X ownership commit funnels through this exact commit; the S-grant
 	 * finish and every STALE/INVALID/CORRUPT refusal stay uncounted. */
 	return result;
@@ -2544,7 +2554,8 @@ cluster_bufmgr_pcm_x_writer_clear(ClusterPcmXWriterLedgerEntry *entry)
 
 static ClusterPcmXWriterLedgerEntry *
 cluster_bufmgr_pcm_x_writer_prepare_target(
-	BufferDesc *buf, PcmLockMode mode, uint64 r4_generation,
+	BufferDesc *buf, const BufferTag *expected_resource,
+	PcmLockMode mode, uint64 r4_generation,
 	uint64 *absolute_deadline_us,
 	bool *pcm_barrier_refused)
 {
@@ -2559,7 +2570,7 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 	uint64 current_r4_generation = 0;
 	LWLock *content_lock;
 
-	if (mode != PCM_LOCK_MODE_X || buf == NULL
+	if (mode != PCM_LOCK_MODE_X || buf == NULL || expected_resource == NULL
 		|| !cluster_bufmgr_should_pcm_track(buf)
 		|| r4_generation == 0 || r4_generation == UINT64_MAX
 		|| absolute_deadline_us == NULL
@@ -2596,7 +2607,8 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 		MemSet(&context, 0, sizeof(context));
 
 		result = cluster_gcs_resource_x_target_acquire_until_exact(
-			buf, r4_generation, absolute_deadline_us, &terminal_ref);
+			buf, expected_resource, r4_generation,
+			absolute_deadline_us, &terminal_ref);
 		if (result != RESOURCE_X_APPLY_APPLIED
 			&& result != RESOURCE_X_APPLY_DUPLICATE)
 		{
@@ -2627,8 +2639,9 @@ cluster_bufmgr_pcm_x_writer_prepare_target(
 		gate_current = gate.phase == RESOURCE_X_GATE_OPEN
 			&& gate.formation == terminal_ref.formation;
 		tag_current = own_result == CLUSTER_PCM_OWN_OK
-			&& BufferTagsEqual(&granted.tag, &buf->tag)
-			&& BufferTagsEqual(&terminal_ref.assertion.resource, &buf->tag);
+			&& BufferTagsEqual(&granted.tag, expected_resource)
+			&& BufferTagsEqual(
+				&terminal_ref.assertion.resource, expected_resource);
 		if (own_result != CLUSTER_PCM_OWN_OK
 			|| !path_current || !gate_current || !tag_current
 			|| granted.pcm_state != (uint8) PCM_STATE_X
@@ -3048,6 +3061,97 @@ cluster_bufmgr_pcm_x_writer_reset(void)
  * are captured in one critical section. */
 static inline int32 GetPrivateRefCount(Buffer buffer);
 
+/* VM/FSM readers may consume bytes under a pin without taking the content
+ * lock, so no such pin may cross a distributed Resource-X conversion.  This
+ * stack-only handoff releases every private reference owned by this backend
+ * and can restore them only to the same tag in the same descriptor.  The
+ * Resource-X round and the later ownership snapshot remain the authority;
+ * this object grants nothing and survives no call boundary. */
+typedef struct ClusterBufmgrPcmAuxPinHandoff
+{
+	BufferTag	tag;
+	Buffer		buffer;
+	int32		released_refs;
+	bool		active;
+} ClusterBufmgrPcmAuxPinHandoff;
+
+static bool
+cluster_bufmgr_pcm_aux_pin_handoff_begin(
+	BufferDesc *buf, const BufferTag *expected_resource,
+	ClusterBufmgrPcmAuxPinHandoff *handoff)
+{
+	Buffer		buffer;
+	int32		private_refcount;
+	uint32		buf_state;
+	int32		i;
+
+	if (handoff != NULL)
+		memset(handoff, 0, sizeof(*handoff));
+	if (buf == NULL || expected_resource == NULL || handoff == NULL
+		|| cluster_pcm_x_revoke_finish_mode(expected_resource, 0)
+			!= CLUSTER_PCM_X_REVOKE_FINISH_DROP
+		|| LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
+		return false;
+	buffer = BufferDescriptorGetBuffer(buf);
+	buf_state = LockBufHdr(buf);
+	private_refcount = GetPrivateRefCount(buffer);
+	if (private_refcount <= 0 || (buf_state & BM_VALID) == 0
+		|| !BufferTagsEqual(expected_resource, &buf->tag))
+	{
+		UnlockBufHdr(buf, buf_state);
+		return false;
+	}
+	handoff->tag = buf->tag;
+	handoff->buffer = buffer;
+	handoff->released_refs = private_refcount;
+	UnlockBufHdr(buf, buf_state);
+
+	for (i = 0; i < private_refcount; i++)
+		ReleaseBuffer(buffer);
+	handoff->active = true;
+	return true;
+}
+
+static bool
+cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(
+	BufferDesc *buf, ClusterBufmgrPcmAuxPinHandoff *handoff)
+{
+	RelFileLocator rlocator;
+	uint32		buf_state;
+	int32		reacquired = 0;
+	bool		exact;
+
+	if (buf == NULL || handoff == NULL || !handoff->active
+		|| handoff->buffer != BufferDescriptorGetBuffer(buf)
+		|| handoff->released_refs <= 0)
+		return false;
+	rlocator = BufTagGetRelFileLocator(&handoff->tag);
+	while (reacquired < handoff->released_refs)
+	{
+		if (!ReadRecentBuffer(rlocator,
+				BufTagGetForkNum(&handoff->tag), handoff->tag.blockNum,
+				handoff->buffer))
+			goto repin_failed;
+		reacquired++;
+	}
+	buf_state = LockBufHdr(buf);
+	exact = (buf_state & BM_VALID) != 0
+		&& BufferTagsEqual(&handoff->tag, &buf->tag)
+		&& cluster_pcm_x_revoke_finish_mode(&buf->tag, 0)
+			== CLUSTER_PCM_X_REVOKE_FINISH_DROP
+		&& cluster_bufmgr_pcm_current_image_locked(buf, buf_state);
+	UnlockBufHdr(buf, buf_state);
+	if (!exact)
+		goto repin_failed;
+	handoff->active = false;
+	return true;
+
+repin_failed:
+	while (reacquired-- > 0)
+		ReleaseBuffer(handoff->buffer);
+	return false;
+}
+
 /* Capture the proof projection while tag, ownership, and shared refcount are
  * serialized by the BufferDesc header lock.  The private refcount table is
  * process-local and cannot change concurrently inside this backend. */
@@ -3098,13 +3202,15 @@ cluster_bufmgr_pcm_direct_init_report_failure(BufferDesc *buf, ClusterPcmOwnResu
  * another backend.  The existing per-resource round owns fan-in and its
  * original deadline.  This observer creates neither a stack proof nor a
  * second reservation, and receives no writer permission from this call. */
-static void
+static bool
 cluster_bufmgr_pcm_join_aux_direct_init_exact(
 	BufferDesc *buf, ClusterPcmDirectInitKind kind,
 	const ClusterPcmDirectInitSnapshot *observed, uint32 wait_index)
 {
+	ClusterBufmgrPcmAuxPinHandoff pin_handoff;
 	ResourceXAcquisitionRef terminal_ref;
 	ResourceXApplyResult result;
+	bool retry_pending = false;
 
 	if (buf == NULL || observed == NULL
 		|| cluster_pcm_direct_init_aux_pending_observer_validate(
@@ -3113,9 +3219,14 @@ cluster_bufmgr_pcm_join_aux_direct_init_exact(
 		cluster_bufmgr_pcm_direct_init_report_failure(
 			buf, CLUSTER_PCM_OWN_STALE, observed,
 			"aux direct-init pending observer");
+	if (!cluster_bufmgr_pcm_aux_pin_handoff_begin(
+			buf, &observed->tag, &pin_handoff))
+		cluster_bufmgr_pcm_direct_init_report_failure(
+			buf, CLUSTER_PCM_OWN_STALE, observed,
+			"aux direct-init pin handoff");
 	MemSet(&terminal_ref, 0, sizeof(terminal_ref));
 	result = cluster_gcs_resource_x_target_direct_init_join_exact(
-		buf, observed->generation,
+		buf, &observed->tag, observed->generation,
 		observed->reservation_token, &terminal_ref);
 	/* The reservation sidecar can become visible just before its proof owner
 	 * creates the canonical round.  That EMPTY/STale observation is a
@@ -3126,9 +3237,9 @@ cluster_bufmgr_pcm_join_aux_direct_init_exact(
 		(void) cluster_bufmgr_resource_x_wait_retry(
 			BufferDescriptorGetContentLock(buf), buf->buf_id,
 			wait_index, NULL);
-		return;
+		retry_pending = true;
 	}
-	if ((result != RESOURCE_X_APPLY_APPLIED
+	else if ((result != RESOURCE_X_APPLY_APPLIED
 		 && result != RESOURCE_X_APPLY_DUPLICATE)
 		|| !resource_x_assertion_valid(&terminal_ref.assertion)
 		|| !BufferTagsEqual(
@@ -3138,6 +3249,21 @@ cluster_bufmgr_pcm_join_aux_direct_init_exact(
 				|| result == RESOURCE_X_APPLY_DUPLICATE
 				? RESOURCE_X_APPLY_STALE : result,
 			buf, "Resource-X auxiliary direct-init join");
+	if (!cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(
+			buf, &pin_handoff))
+	{
+		/* No heap/map bytes or BufferDesc state were changed by this
+		 * follower.  The old numeric Buffer handle may now name a different
+		 * tag, so hand ownership of the retry back to the relation-level
+		 * caller.  It will obtain a fresh pin and re-enter the complete
+		 * proof/Resource-X path; the stale handle is never dereferenced and a
+		 * pre-mutation replacement does not fence the cluster gate. */
+		pin_handoff.active = false;
+		return false;
+	}
+	if (retry_pending)
+		return true;
+	return true;
 }
 
 typedef enum ClusterBufmgrPcmDirectInitArmResult
@@ -3208,8 +3334,10 @@ cluster_bufmgr_pcm_arm_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kin
  */
 static bool
 cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind kind,
-									ClusterPcmDirectInitProof *proof)
+									ClusterPcmDirectInitProof *proof,
+									bool *pin_replaced)
 {
+	ClusterBufmgrPcmAuxPinHandoff pin_handoff;
 	ClusterPcmDirectInitSnapshot committed_observed;
 	ClusterPcmDirectInitSnapshot observed;
 	ClusterPcmDirectInitSnapshot pending_observed;
@@ -3225,12 +3353,18 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 	uint64		current_writer_r4_generation = 0;
 	uint64		pending_token = 0;
 	uint64		writer_r4_generation = 0;
+	bool		aux_pin_required;
+
+	if (pin_replaced != NULL)
+		*pin_replaced = false;
 
 	if (!cluster_pcm_is_active() || !cluster_bufmgr_should_pcm_track(buf))
 		return true;
 	if (proof == NULL)
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, CLUSTER_PCM_OWN_INVALID, NULL,
 												  "direct-init missing proof");
+	aux_pin_required = kind == CLUSTER_PCM_DIRECT_INIT_VM
+		|| kind == CLUSTER_PCM_DIRECT_INIT_FSM;
 
 	buf_state = LockBufHdr(buf);
 	cluster_bufmgr_pcm_direct_init_snapshot_locked(
@@ -3244,9 +3378,22 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 		&& cluster_pcm_direct_init_target_pending_validate(
 			kind, &observed, proof) == CLUSTER_PCM_OWN_OK)
 	{
+		bool current_ref;
+
 		UnlockBufHdr(buf, buf_state);
-		cluster_bufmgr_pcm_join_aux_direct_init_exact(
+		current_ref = cluster_bufmgr_pcm_join_aux_direct_init_exact(
 			buf, kind, &observed, 0);
+		if (!current_ref)
+		{
+			if (pin_replaced == NULL)
+			{
+				cluster_bufmgr_resource_x_fail_closed_current();
+				cluster_bufmgr_resource_x_writer_report_failure(
+					RESOURCE_X_APPLY_STALE, buf,
+					"Resource-X auxiliary direct-init repin");
+			}
+			*pin_replaced = true;
+		}
 		return false;
 	}
 	if (pending_result == CLUSTER_PCM_OWN_OK)
@@ -3275,7 +3422,18 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 				buf, &pending_base, pending_token,
 				"direct-init pending proof recheck");
 		cluster_bufmgr_pcm_direct_init_report_failure(buf, pending_result, &observed,
-											  "direct-init consume");
+										  "direct-init consume");
+	}
+	if (aux_pin_required
+		&& !cluster_bufmgr_pcm_aux_pin_handoff_begin(
+			buf, &pending_base.tag, &pin_handoff))
+	{
+		cluster_pcm_own_abort_grant_after_error(
+			buf, &pending_base, pending_token,
+			"direct-init pin handoff");
+		cluster_bufmgr_pcm_direct_init_report_failure(
+			buf, CLUSTER_PCM_OWN_STALE, &pending_observed,
+			"direct-init pin handoff");
 	}
 
 	writer_path = cluster_resource_x_writer_path_snapshot(
@@ -3295,7 +3453,7 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 			{
 				resource_x_result
 					= cluster_gcs_resource_x_target_direct_init_acquire_exact(
-						buf, writer_r4_generation,
+						buf, &pending_base.tag, writer_r4_generation,
 						pending_base.generation, pending_token,
 						&terminal_ref);
 			}
@@ -3316,6 +3474,21 @@ cluster_bufmgr_pcm_gate_direct_init(BufferDesc *buf, ClusterPcmDirectInitKind ki
 				cluster_bufmgr_resource_x_writer_report_failure(
 					resource_x_result, buf,
 					"Resource-X direct-init target acquire");
+			}
+			if (aux_pin_required
+				&& !cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(
+					buf, &pin_handoff))
+			{
+				if (pin_replaced == NULL)
+				{
+					cluster_bufmgr_resource_x_fail_closed_current();
+					cluster_bufmgr_resource_x_writer_report_failure(
+						RESOURCE_X_APPLY_STALE, buf,
+						"Resource-X direct-init target repin");
+				}
+				pin_handoff.active = false;
+				*pin_replaced = true;
+				return false;
 			}
 
 			/* The terminal round has already completed T2/T3.  Rebind that
@@ -3748,6 +3921,15 @@ static BlockNumber ExtendBufferedRelShared(BufferManagerRelation bmr,
 										   BlockNumber extend_upto,
 										   Buffer *buffers,
 										   uint32 *extended_by);
+typedef enum PinBufferLookupResult
+{
+	PIN_BUFFER_LOOKUP_RETRY = 0,
+	PIN_BUFFER_LOOKUP_INVALID,
+	PIN_BUFFER_LOOKUP_VALID
+} PinBufferLookupResult;
+
+static PinBufferLookupResult PinBufferForLookup(
+	BufferDesc *buf, BufferAccessStrategy strategy);
 static bool PinBuffer(BufferDesc *buf, BufferAccessStrategy strategy);
 static void PinBuffer_Locked(BufferDesc *buf);
 static void UnpinBuffer(BufferDesc *buf);
@@ -3986,6 +4168,18 @@ ReadRecentBuffer(RelFileLocator rlocator, ForkNumber forkNum, BlockNumber blockN
 			 * questions later, because it might confuse code paths like
 			 * InvalidateBuffer() if we pinned a random non-matching buffer.
 			 */
+#ifdef USE_PGRAC_CLUSTER
+			if (!have_private_ref
+				&& !cluster_pcm_x_aux_pin_admission_allowed(
+					cluster_pcm_is_active(),
+					cluster_bufmgr_should_pcm_track(bufHdr),
+					bufHdr->tag.forkNum,
+					cluster_pcm_own_flags_get(bufHdr->buf_id)))
+			{
+				UnlockBufHdr(bufHdr, buf_state);
+				return false;
+			}
+#endif
 			if (have_private_ref)
 				PinBuffer(bufHdr, NULL);	/* bump pin count */
 			else
@@ -4576,7 +4770,8 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	{
 #ifdef USE_PGRAC_CLUSTER
 		(void) cluster_bufmgr_pcm_gate_direct_init(
-			bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS, &direct_init_proof);
+			bufHdr, CLUSTER_PCM_DIRECT_INIT_READ_MISS, &direct_init_proof,
+			NULL);
 #endif
 		LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
@@ -4648,6 +4843,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	Buffer		victim_buffer;
 	BufferDesc *victim_buf_hdr;
 	uint32		victim_buf_state;
+	uint32		aux_pin_waits = 0;
 
 	/* create a tag so we can lookup the buffer */
 	InitBufferTag(&newTag, &smgr->smgr_rlocator.locator, forkNum, blockNum);
@@ -4657,12 +4853,14 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	newPartitionLock = BufMappingPartitionLock(newHash);
 
 	/* see if the block is in the buffer pool already */
+retry_lookup:
 	LWLockAcquire(newPartitionLock, LW_SHARED);
 	existing_buf_id = BufTableLookup(&newTag, newHash);
 	if (existing_buf_id >= 0)
 	{
 		BufferDesc *buf;
 		bool		valid;
+		PinBufferLookupResult pin_result;
 
 		/*
 		 * Found it.  Now, pin the buffer so no one can steal it from the
@@ -4671,10 +4869,22 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 		 */
 		buf = GetBufferDescriptor(existing_buf_id);
 
-		valid = PinBuffer(buf, strategy);
+		pin_result = PinBufferForLookup(buf, strategy);
 
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
+#ifdef USE_PGRAC_CLUSTER
+		if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
+		{
+			(void) cluster_bufmgr_resource_x_wait_retry(
+				BufferDescriptorGetContentLock(buf), buf->buf_id,
+				aux_pin_waits, NULL);
+			if (aux_pin_waits < PG_UINT32_MAX)
+				aux_pin_waits++;
+			goto retry_lookup;
+		}
+#endif
+		valid = pin_result == PIN_BUFFER_LOOKUP_VALID;
 
 		*foundPtr = true;
 
@@ -4725,6 +4935,7 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 	{
 		BufferDesc *existing_buf_hdr;
 		bool		valid;
+		PinBufferLookupResult pin_result;
 
 		/*
 		 * Got a collision. Someone has already done what we were about to do.
@@ -4749,10 +4960,22 @@ BufferAlloc(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 
 		existing_buf_hdr = GetBufferDescriptor(existing_buf_id);
 
-		valid = PinBuffer(existing_buf_hdr, strategy);
+		pin_result = PinBufferForLookup(existing_buf_hdr, strategy);
 
 		/* Can release the mapping lock as soon as we've pinned it */
 		LWLockRelease(newPartitionLock);
+#ifdef USE_PGRAC_CLUSTER
+		if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
+		{
+			(void) cluster_bufmgr_resource_x_wait_retry(
+				BufferDescriptorGetContentLock(existing_buf_hdr),
+				existing_buf_hdr->buf_id, aux_pin_waits, NULL);
+			if (aux_pin_waits < PG_UINT32_MAX)
+				aux_pin_waits++;
+			goto retry_lookup;
+		}
+#endif
+		valid = pin_result == PIN_BUFFER_LOOKUP_VALID;
 
 		*foundPtr = true;
 
@@ -5571,6 +5794,17 @@ again:
 
 	Assert(BUF_STATE_GET_REFCOUNT(buf_state) == 0);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* A revoking VM/FSM descriptor is not a victim candidate: pinning it here
+	 * would cross the exact zero-refcount drain.  Preserve clock-sweep's native
+	 * choose-another-victim behavior without waiting. */
+	if (!cluster_bufmgr_pcm_aux_pin_admission_locked(buf_hdr))
+	{
+		UnlockBufHdr(buf_hdr, buf_state);
+		goto again;
+	}
+#endif
+
 	/* Pin the buffer and then release the buffer spinlock */
 	PinBuffer_Locked(buf_hdr);
 
@@ -5832,6 +6066,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	HwLock		hwlk;
 	ClusterResId hw_resid;
 	uint32		hw_lease_tail = 0;	/* spec-6.12d: parked grant tail */
+	uint32		aux_pin_waits = 0;
 
 	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
 		&& fork == MAIN_FORKNUM && !RecoveryInProgress()
@@ -6125,6 +6360,9 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		hash = BufTableHashCode(&tag);
 		partition_lock = BufMappingPartitionLock(hash);
 
+#ifdef USE_PGRAC_CLUSTER
+retry_extend_collision:
+#endif
 		LWLockAcquire(partition_lock, LW_EXCLUSIVE);
 
 		existing_id = BufTableInsert(&tag, hash, victim_buf_hdr->buf_id);
@@ -6148,14 +6386,35 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			BufferDesc *existing_hdr = GetBufferDescriptor(existing_id);
 			Block		buf_block;
 			bool		valid;
+			PinBufferLookupResult pin_result;
 
 			/*
 			 * Pin the existing buffer before releasing the partition lock,
 			 * preventing it from being evicted.
 			 */
-			valid = PinBuffer(existing_hdr, strategy);
+			pin_result = PinBufferForLookup(existing_hdr, strategy);
 
 			LWLockRelease(partition_lock);
+
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * A type-17 auxiliary revoke owns the exact descriptor but has not
+			 * changed the mapping yet.  Preserve the native collision polarity:
+			 * keep our clean victim, wait off mapping/header/content locks, then
+			 * re-run the same insert against current mapping bytes.  The existing
+			 * Resource-X gate bounds and interrupts the wait; this creates no new
+			 * extension error, authority, or deadline.
+			 */
+			if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
+			{
+				(void) cluster_bufmgr_resource_x_wait_retry(
+					BufferDescriptorGetContentLock(existing_hdr),
+					existing_hdr->buf_id, aux_pin_waits, NULL);
+				if (aux_pin_waits < PG_UINT32_MAX)
+					aux_pin_waits++;
+				goto retry_extend_collision;
+			}
+#endif
 
 			/*
 			 * The victim buffer we acquired previously is clean and unused,
@@ -6163,6 +6422,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			 */
 			StrategyFreeBuffer(victim_buf_hdr);
 			UnpinBuffer(victim_buf_hdr);
+			valid = pin_result == PIN_BUFFER_LOOKUP_VALID;
 
 			buffers[i] = BufferDescriptorGetBuffer(existing_hdr);
 			buf_block = BufHdrGetBlock(existing_hdr);
@@ -6308,7 +6568,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND,
 				&direct_init_proof, NULL);
 			(void) cluster_bufmgr_pcm_gate_direct_init(
-				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof);
+				buf_hdr, CLUSTER_PCM_DIRECT_INIT_EXTEND, &direct_init_proof,
+				NULL);
 #endif
 			LWLockAcquire(BufferDescriptorGetContentLock(buf_hdr), LW_EXCLUSIVE);
 #ifdef USE_PGRAC_CLUSTER
@@ -6456,6 +6717,59 @@ ReleaseAndReadBuffer(Buffer buffer,
 	}
 
 	return ReadBuffer(relation, blockNum);
+}
+
+/* Pin a mapping-table lookup result.  A first passive VM/FSM pin is the one
+ * pin entrance that must share the BufferDesc header linearization with an
+ * exact REVOKING publication.  Existing private references already contribute
+ * one shared refcount and therefore predate the later zero-refcount drain. */
+static PinBufferLookupResult
+PinBufferForLookup(BufferDesc *buf, BufferAccessStrategy strategy)
+{
+	Buffer b = BufferDescriptorGetBuffer(buf);
+	PrivateRefCountEntry *ref;
+	uint32 buf_state;
+	bool valid;
+
+	Assert(!BufferIsLocal(b));
+	ref = GetPrivateRefCountEntry(b, true);
+#ifdef USE_PGRAC_CLUSTER
+	if (ref == NULL && cluster_pcm_is_active()
+		&& cluster_bufmgr_should_pcm_track(buf)
+		&& (buf->tag.forkNum == VISIBILITYMAP_FORKNUM
+			|| buf->tag.forkNum == FSM_FORKNUM))
+	{
+		ReservePrivateRefCountEntry();
+		buf_state = LockBufHdr(buf);
+		if (!cluster_pcm_x_aux_pin_admission_allowed(
+				cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf),
+				buf->tag.forkNum,
+				cluster_pcm_own_flags_get(buf->buf_id)))
+		{
+			UnlockBufHdr(buf, buf_state);
+			return PIN_BUFFER_LOOKUP_RETRY;
+		}
+
+		buf_state += BUF_REFCOUNT_ONE;
+		if (strategy == NULL)
+		{
+			if (BUF_STATE_GET_USAGECOUNT(buf_state) < BM_MAX_USAGE_COUNT)
+				buf_state += BUF_USAGECOUNT_ONE;
+		}
+		else if (BUF_STATE_GET_USAGECOUNT(buf_state) == 0)
+			buf_state += BUF_USAGECOUNT_ONE;
+		valid = (buf_state & BM_VALID) != 0;
+		UnlockBufHdr(buf, buf_state);
+
+		VALGRIND_MAKE_MEM_DEFINED(BufHdrGetBlock(buf), BLCKSZ);
+		ref = NewPrivateRefCountEntry(b);
+		ref->refcount++;
+		ResourceOwnerRememberBuffer(CurrentResourceOwner, b);
+		return valid ? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
+	}
+#endif
+	return PinBuffer(buf, strategy)
+		? PIN_BUFFER_LOOKUP_VALID : PIN_BUFFER_LOOKUP_INVALID;
 }
 
 /*
@@ -7338,6 +7652,11 @@ SyncOneBuffer(int buf_id, bool skip_recently_used, WritebackContext *wb_context)
 	 * advertising BUF_REUSABLE; finish/release serialize the later race with
 	 * the content-lock recheck below. */
 	if (cluster_bufmgr_pcm_x_retained_image_reuse_blocked_locked(bufHdr, buf_state))
+	{
+		UnlockBufHdr(bufHdr, buf_state);
+		return 0;
+	}
+	if (!cluster_bufmgr_pcm_aux_pin_admission_locked(bufHdr))
 	{
 		UnlockBufHdr(bufHdr, buf_state);
 		return 0;
@@ -8639,6 +8958,13 @@ FlushRelationBuffers(Relation rel)
 		ReservePrivateRefCountEntry();
 
 		buf_state = LockBufHdr(bufHdr);
+#ifdef USE_PGRAC_CLUSTER
+		if (!cluster_bufmgr_pcm_aux_pin_admission_locked(bufHdr))
+		{
+			UnlockBufHdr(bufHdr, buf_state);
+			continue;
+		}
+#endif
 		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &rel->rd_locator) &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
@@ -8737,6 +9063,13 @@ FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels)
 		ReservePrivateRefCountEntry();
 
 		buf_state = LockBufHdr(bufHdr);
+#ifdef USE_PGRAC_CLUSTER
+		if (!cluster_bufmgr_pcm_aux_pin_admission_locked(bufHdr))
+		{
+			UnlockBufHdr(bufHdr, buf_state);
+			continue;
+		}
+#endif
 		if (BufTagMatchesRelFileLocator(&bufHdr->tag, &srelent->rlocator) &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
@@ -8948,6 +9281,13 @@ FlushDatabaseBuffers(Oid dbid)
 		ReservePrivateRefCountEntry();
 
 		buf_state = LockBufHdr(bufHdr);
+#ifdef USE_PGRAC_CLUSTER
+		if (!cluster_bufmgr_pcm_aux_pin_admission_locked(bufHdr))
+		{
+			UnlockBufHdr(bufHdr, buf_state);
+			continue;
+		}
+#endif
 		if (bufHdr->tag.dbOid == dbid &&
 			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
 		{
@@ -9425,11 +9765,15 @@ ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_id,
 
 static void
 LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
-				   const ClusterBufferBarrierSiteId *barrier_site_id)
+				   const ClusterBufferBarrierSiteId *barrier_site_id,
+				   bool *pcm_pin_replaced)
 {
 	BufferDesc *buf;
 #ifdef USE_PGRAC_CLUSTER
+	BufferTag pcm_expected_resource = {0};
+	ClusterBufmgrPcmAuxPinHandoff pcm_aux_pin_handoff = {0};
 	bool pcm_acquired = false;
+	bool pcm_aux_pin_required = false;
 	bool pcm_covered = false;
 	bool pcm_pending_set = false;
 	bool pcm_x_writer_managed = false;
@@ -9447,6 +9791,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 	uint32 pcm_retry_wait_index = 0;
 #endif
 
+	if (pcm_pin_replaced != NULL)
+		*pcm_pin_replaced = false;
 	Assert(BufferIsPinned(buffer));
 	if (BufferIsLocal(buffer))
 		return;
@@ -9469,10 +9815,15 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 	else if (cluster_pcm_is_active()
 			 && cluster_bufmgr_should_pcm_track(buf))
 	{
+		pcm_expected_resource = buf->tag;
 		pcm_mode = mode == BUFFER_LOCK_SHARE
 			? PCM_LOCK_MODE_S : PCM_LOCK_MODE_X;
 		if (pcm_mode == PCM_LOCK_MODE_X)
 		{
+			pcm_aux_pin_required
+				= cluster_pcm_x_revoke_finish_mode(
+					&pcm_expected_resource, 0)
+				  == CLUSTER_PCM_X_REVOKE_FINISH_DROP;
 			pcm_writer_path = cluster_resource_x_writer_path_snapshot(
 				&pcm_writer_r4_generation);
 			if (pcm_writer_path != RESOURCE_X_WRITER_TARGET)
@@ -9488,8 +9839,19 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 			}
 			for (;;)
 			{
+				if (pcm_aux_pin_required
+					&& (!cluster_bufmgr_pcm_aux_pin_handoff_begin(
+							buf, &pcm_expected_resource,
+							&pcm_aux_pin_handoff)
+						|| !BufferTagsEqual(
+							&pcm_aux_pin_handoff.tag,
+							&pcm_expected_resource)))
+					cluster_bufmgr_resource_x_writer_report_failure(
+						RESOURCE_X_APPLY_STALE, buf,
+						"Resource-X target pin handoff");
 				pcm_x_writer = cluster_bufmgr_pcm_x_writer_prepare_target(
-					buf, pcm_mode, pcm_writer_r4_generation,
+					buf, &pcm_expected_resource, pcm_mode,
+					pcm_writer_r4_generation,
 					&pcm_x_absolute_deadline_us,
 					pcm_barrier_refused);
 				if (pcm_barrier_refused != NULL && *pcm_barrier_refused)
@@ -9498,6 +9860,33 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 					cluster_bufmgr_resource_x_writer_report_failure(
 						RESOURCE_X_APPLY_BAD_STATE, buf,
 						"Resource-X target writer context");
+				if (pcm_aux_pin_required
+					&& !cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(
+						buf, &pcm_aux_pin_handoff))
+				{
+					if (pcm_pin_replaced != NULL)
+					{
+						ClusterBufferBarrierCleanupResult cleanup;
+
+						cleanup = cluster_bufmgr_pcm_x_writer_abort_acquiring(
+							pcm_x_writer);
+						if (cleanup != CLUSTER_BUFFER_BARRIER_CLEAN)
+						{
+							cluster_bufmgr_resource_x_fail_closed_current();
+							cluster_bufmgr_resource_x_writer_report_failure(
+								RESOURCE_X_APPLY_BAD_STATE, buf,
+								"Resource-X target replacement cleanup");
+						}
+						pcm_x_writer = NULL;
+						pcm_aux_pin_handoff.active = false;
+						*pcm_pin_replaced = true;
+						return;
+					}
+					cluster_bufmgr_resource_x_fail_closed_current();
+					cluster_bufmgr_resource_x_writer_report_failure(
+						RESOURCE_X_APPLY_STALE, buf,
+						"Resource-X target exact repin");
+				}
 				LWLockAcquire(
 					BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
 				if (cluster_bufmgr_pcm_x_writer_activate(
@@ -9684,6 +10073,15 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 	return;
 
 cluster_lockbuffer_barrier_refusal:
+	if (pcm_aux_pin_handoff.active
+		&& !cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(
+			buf, &pcm_aux_pin_handoff))
+	{
+		cluster_bufmgr_resource_x_fail_closed_current();
+		cluster_bufmgr_resource_x_writer_report_failure(
+			RESOURCE_X_APPLY_STALE, buf,
+			"Resource-X barrier exact repin");
+	}
 	if (barrier_site_id != NULL)
 		ClusterObserveBufferBarrierReceipt(
 			*barrier_site_id,
@@ -9711,7 +10109,7 @@ cluster_lockbuffer_barrier_refusal:
 void
 LockBuffer(Buffer buffer, int mode)
 {
-	LockBufferInternal(buffer, mode, NULL, NULL);
+	LockBufferInternal(buffer, mode, NULL, NULL, NULL);
 }
 
 /*
@@ -9733,7 +10131,8 @@ ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
 {
 	bool		barrier_refused = false;
 
-	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused, &site_id);
+	LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE, &barrier_refused,
+		&site_id, NULL);
 	return !barrier_refused;
 }
 
@@ -9752,7 +10151,7 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
 {
 	bool		barrier_refused = false;
 
-	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused, NULL);
+	LockBufferInternal(buffer, BUFFER_LOCK_SHARE, &barrier_refused, NULL, NULL);
 	return !barrier_refused;
 }
 
@@ -9760,7 +10159,7 @@ ClusterLockBufferShareBarrierAware(Buffer buffer)
  * PageIsNew initialization.  Dedicated wrappers are the provenance: a plain
  * LockBuffer(X) on the same N buffer remains queue-only. */
 #ifdef USE_PGRAC_CLUSTER
-static void
+static Buffer
 LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 {
 	BufferDesc *buf;
@@ -9768,7 +10167,10 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 	Assert(BufferIsPinned(buffer));
 	Assert(kind == CLUSTER_PCM_DIRECT_INIT_VM || kind == CLUSTER_PCM_DIRECT_INIT_FSM);
 	if (BufferIsLocal(buffer))
-		return;
+	{
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+		return buffer;
+	}
 
 	buf = GetBufferDescriptor(buffer - 1);
 	if (cluster_pcm_is_active() && cluster_bufmgr_should_pcm_track(buf))
@@ -9776,6 +10178,7 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 		ClusterPcmDirectInitProof direct_init_proof;
 		ClusterPcmDirectInitSnapshot pending_observed;
 		ClusterBufmgrPcmDirectInitArmResult arm_result;
+		bool		pin_replaced = false;
 		uint32		waits = 0;
 
 		for (;;)
@@ -9787,20 +10190,24 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 				buf, kind, &direct_init_proof, &pending_observed);
 			if (arm_result == CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X)
 			{
-				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-				return;
+				LockBufferInternal(buffer, BUFFER_LOCK_EXCLUSIVE,
+					NULL, NULL, &pin_replaced);
+				return pin_replaced ? InvalidBuffer : buffer;
 			}
 			if (arm_result == CLUSTER_BUFMGR_PCM_DIRECT_INIT_JOIN_PENDING)
 			{
-				cluster_bufmgr_pcm_join_aux_direct_init_exact(
-					buf, kind, &pending_observed, waits);
+				if (!cluster_bufmgr_pcm_join_aux_direct_init_exact(
+						buf, kind, &pending_observed, waits))
+					return InvalidBuffer;
 				if (waits < PG_UINT32_MAX)
 					waits++;
 				continue;
 			}
 			if (!cluster_bufmgr_pcm_gate_direct_init(
-					buf, kind, &direct_init_proof))
+					buf, kind, &direct_init_proof, &pin_replaced))
 			{
+				if (pin_replaced)
+					return InvalidBuffer;
 				if (waits < PG_UINT32_MAX)
 					waits++;
 				continue;
@@ -9811,26 +10218,31 @@ LockBufferForAuxiliaryPageInit(Buffer buffer, ClusterPcmDirectInitKind kind)
 	}
 	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
 	cluster_bufmgr_pcm_x_writer_activate_target_direct_init(buf);
+	return buffer;
 }
 #endif
 
-void
+Buffer
 LockBufferForVisibilityMapPageInit(Buffer buffer)
 {
 #ifdef USE_PGRAC_CLUSTER
-	LockBufferForAuxiliaryPageInit(buffer, CLUSTER_PCM_DIRECT_INIT_VM);
+	return LockBufferForAuxiliaryPageInit(
+		buffer, CLUSTER_PCM_DIRECT_INIT_VM);
 #else
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	return buffer;
 #endif
 }
 
-void
+Buffer
 LockBufferForFreeSpaceMapPageInit(Buffer buffer)
 {
 #ifdef USE_PGRAC_CLUSTER
-	LockBufferForAuxiliaryPageInit(buffer, CLUSTER_PCM_DIRECT_INIT_FSM);
+	return LockBufferForAuxiliaryPageInit(
+		buffer, CLUSTER_PCM_DIRECT_INIT_FSM);
 #else
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	return buffer;
 #endif
 }
 
@@ -11927,6 +12339,7 @@ cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forkn
 	LWLock	   *partition_lock;
 	int			buf_id;
 	BufferDesc *buf;
+	PinBufferLookupResult pin_result;
 
 	InitBufferTag(&tag, &rlocator, forknum, blocknum);
 	hashcode = BufTableHashCode(&tag);
@@ -11961,8 +12374,10 @@ cluster_bufmgr_lock_resident_for_stamp(RelFileLocator rlocator, ForkNumber forkn
 	 * The standard buffer-hit path (BufferAlloc) pins the same way while
 	 * holding the partition lock, so this is a legal call sequence.
 	 */
-	(void)PinBuffer(buf, NULL);
+	pin_result = PinBufferForLookup(buf, NULL);
 	LWLockRelease(partition_lock);
+	if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
+		return InvalidBuffer;
 
 	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
 
@@ -12138,6 +12553,7 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 	BufferDesc *buf;
 	ClusterPcmOwnSnapshot own;
 	ClusterItlStampSkipReason reason = CLUSTER_ITL_STAMP_SKIP_NONE;
+	PinBufferLookupResult pin_result;
 	Page		page;
 	const ClusterItlSlotData *slot;
 	bool		header_valid;
@@ -12199,8 +12615,13 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 	}
 
 	/* Pin under the partition lock (PinBuffer handles an existing pin). */
-	(void) PinBuffer(buf, NULL);
+	pin_result = PinBufferForLookup(buf, NULL);
 	LWLockRelease(partition_lock);
+	if (pin_result == PIN_BUFFER_LOOKUP_RETRY)
+	{
+		*out_reason = CLUSTER_ITL_STAMP_SKIP_OWNERSHIP_FLAGS_BUSY;
+		return InvalidBuffer;
+	}
 
 	LWLockAcquire(BufferDescriptorGetContentLock(buf), LW_EXCLUSIVE);
 
@@ -12916,7 +13337,6 @@ ClusterBufmgrGcsDropResult
 cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode,
 										XLogRecPtr *out_page_lsn, SCN *out_page_scn)
 {
-	ClusterPcmOwnSnapshot activation_diag;
 	uint32		hashcode;
 	LWLock	   *partition_lock;
 	int			buf_id;
@@ -12927,7 +13347,6 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	bool		was_dirty = false;
 	uint8		saved_pcm_state;
 	uint64		staged_gen;		/* PGRAC W2: ownership gen captured at stage-N */
-	bool		activation_diag_valid = false;
 	bool		invalidate_succeeded;
 
 	(void) expected_mode;
@@ -13048,16 +13467,10 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	saved_pcm_state = buf->pcm_state;
 	staged_gen = cluster_pcm_own_gen_get(buf->buf_id);	/* PGRAC W2 */
 	buf->pcm_state = (uint8) PCM_STATE_N;
-	cluster_pcm_own_snapshot_locked(buf, &activation_diag);
-	activation_diag_valid = activation_diag.writer_activation_token != 0;
 
 	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping. */
-	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state)) {
-		if (activation_diag_valid)
-			cluster_pcm_own_activation_diag_emit("invalidate-stage-n-pi", buf->buf_id,
-										 &activation_diag, CLUSTER_PCM_OWN_CORRUPT);
+	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state))
 		return CLUSTER_BUFMGR_GCS_DROP_DROPPED;
-	}
 
 	/*
 	 * PGRAC: GCS serve-stall round-5 (A2) — bounded drop.  A pinner racing
@@ -13068,9 +13481,6 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	 */
 	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
 	invalidate_succeeded = InvalidateBufferTry(buf);	/* releases the header spinlock */
-	if (activation_diag_valid)
-		cluster_pcm_own_activation_diag_emit("invalidate-stage-n-drop", buf->buf_id,
-										 &activation_diag, CLUSTER_PCM_OWN_CORRUPT);
 	if (!invalidate_succeeded)
 	{
 		cluster_bufmgr_in_gcs_drop = false;
@@ -13415,7 +13825,6 @@ ClusterBufmgrGcsDropResult
 cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn,
 										  XLogRecPtr *out_page_lsn)
 {
-	ClusterPcmOwnSnapshot activation_diag;
 	uint32		hashcode;
 	LWLock	   *partition_lock;
 	int			buf_id;
@@ -13425,7 +13834,6 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	bool		was_dirty = false;
 	uint8		saved_pcm_state;
 	uint64		staged_gen;		/* PGRAC W2: ownership gen captured at stage-N */
-	bool		activation_diag_valid = false;
 	bool		invalidate_succeeded;
 
 	if (out_page_lsn != NULL)
@@ -13546,27 +13954,18 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 	saved_pcm_state = buf->pcm_state;
 	staged_gen = cluster_pcm_own_gen_get(buf->buf_id);	/* PGRAC W2 */
 	buf->pcm_state = (uint8) PCM_STATE_N;
-	cluster_pcm_own_snapshot_locked(buf, &activation_diag);
-	activation_diag_valid = activation_diag.writer_activation_token != 0;
 
 	/*
 	 * PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping (the
 	 * shipped current went to the new holder; our copy becomes the PI).
 	 */
-	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state)) {
-		if (activation_diag_valid)
-			cluster_pcm_own_activation_diag_emit("drop-no-wire-stage-n-pi", buf->buf_id,
-										 &activation_diag, CLUSTER_PCM_OWN_CORRUPT);
+	if (cluster_bufmgr_convert_to_pi_locked(buf, buf_state))
 		return CLUSTER_BUFMGR_GCS_DROP_DROPPED;
-	}
 
 	/* PGRAC: GCS serve-stall round-5 (A2) — bounded drop;  restore the
 	 * residency mode on a raced pin (mirrors the invalidate wrapper). */
 	cluster_bufmgr_in_gcs_drop = true;	/* gates the drop-prepin inject */
 	invalidate_succeeded = InvalidateBufferTry(buf);	/* releases the header spinlock */
-	if (activation_diag_valid)
-		cluster_pcm_own_activation_diag_emit("drop-no-wire-stage-n-drop", buf->buf_id,
-										 &activation_diag, CLUSTER_PCM_OWN_CORRUPT);
 	if (!invalidate_succeeded)
 	{
 		cluster_bufmgr_in_gcs_drop = false;
@@ -14617,6 +15016,41 @@ cluster_bufmgr_pcm_own_try_drain_held_x_revoke(
 	return result;
 }
 
+/* VM/FSM do not retain a descriptor image.  After REVOKING has atomically
+ * closed first-pin admission, prove that every passive predecessor pin has
+ * drained before any retained status/image pair is published.  This helper
+ * waits for nothing, performs no I/O, and changes no ownership state. */
+ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking)
+{
+	ClusterPcmOwnResult result;
+	uint32 buf_state;
+
+	if (buf == NULL || expected_revoking == NULL
+		|| expected_revoking->pcm_state != (uint8)PCM_STATE_X
+		|| expected_revoking->flags != PCM_OWN_FLAG_REVOKING
+		|| expected_revoking->reservation_token == 0
+		|| cluster_pcm_x_revoke_finish_mode(
+			&expected_revoking->tag, 0) != CLUSTER_PCM_X_REVOKE_FINISH_DROP)
+		return CLUSTER_PCM_OWN_INVALID;
+
+	buf_state = LockBufHdr(buf);
+	if (!cluster_pcm_own_snapshot_matches_locked(buf, expected_revoking)
+		|| (buf_state & BM_VALID) == 0)
+		result = CLUSTER_PCM_OWN_STALE;
+	else if (!cluster_bufmgr_pcm_current_image_locked(buf, buf_state)
+		|| (buf_state & BM_IO_ERROR) != 0)
+		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if (BUF_STATE_GET_REFCOUNT(buf_state) != 0
+		|| (buf_state & BM_IO_IN_PROGRESS) != 0)
+		result = CLUSTER_PCM_OWN_BUSY;
+	else
+		result = CLUSTER_PCM_OWN_OK;
+	UnlockBufHdr(buf, buf_state);
+	return result;
+}
+
 /* Post-arm finish.  Success proves the exact N+PI successor before releasing
  * the long-lived pin.  Failure deliberately leaves the handle live so the
  * caller must first fail-close and then use the abandon boundary. */
@@ -15377,13 +15811,11 @@ cluster_bufmgr_block_is_pi(BufferTag tag)
 bool
 cluster_bufmgr_discard_pi_block(BufferTag tag)
 {
-	ClusterPcmOwnSnapshot activation_diag;
 	uint32		hash = BufTableHashCode(&tag);
 	LWLock	   *partition_lock = BufMappingPartitionLock(hash);
 	int			buf_id;
 	BufferDesc *buf;
 	uint32		buf_state;
-	bool		activation_diag_valid;
 
 	LWLockAcquire(partition_lock, LW_SHARED);
 	buf_id = BufTableLookup(&tag, hash);
@@ -15407,8 +15839,6 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 	 * but clear it again under the lock so InvalidateBuffer's eviction hook
 	 * can never see a stale mode and emit a release wire from LMON. */
 	buf->pcm_state = (uint8) PCM_STATE_N;
-	cluster_pcm_own_snapshot_locked(buf, &activation_diag);
-	activation_diag_valid = activation_diag.writer_activation_token != 0;
 	/* PGRAC: spec-6.12h D-h3a — hygiene: drop the shadow stamp with the PI.
 	 * Correctness never depends on this clear (the D-h3 consumer
 	 * re-validates the PI shape + tag under this same header lock, and
@@ -15416,9 +15846,6 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 	 * slot should not linger as a plausible-looking stamp. */
 	cluster_pi_shadow_clear(buf->buf_id);
 	InvalidateBuffer(buf);		/* releases the header spinlock */
-	if (activation_diag_valid)
-		cluster_pcm_own_activation_diag_emit("discard-pi-stage-n", buf->buf_id,
-										 &activation_diag, CLUSTER_PCM_OWN_CORRUPT);
 
 	return true;
 }
@@ -15600,6 +16027,11 @@ cluster_bufmgr_flush_and_release_x_for_leave(void)
 		ReservePrivateRefCountEntry();
 
 		buf_state = LockBufHdr(bufHdr);
+		if (!cluster_bufmgr_pcm_aux_pin_admission_locked(bufHdr))
+		{
+			UnlockBufHdr(bufHdr, buf_state);
+			continue;
+		}
 		if ((buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY) &&
 			(PcmState) bufHdr->pcm_state == PCM_STATE_X)
 		{

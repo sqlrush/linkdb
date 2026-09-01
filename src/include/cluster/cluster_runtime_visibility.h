@@ -55,6 +55,23 @@ typedef struct ClusterUndoBlock0Generation ClusterUndoBlock0Generation;
 typedef union ClusterUndoBlock0CurrentGuard ClusterUndoBlock0CurrentGuard;
 typedef struct ClusterUndoBlock0LogicalKey ClusterUndoBlock0LogicalKey;
 typedef struct ClusterUndoBlock0ResolvedRoot ClusterUndoBlock0ResolvedRoot;
+typedef struct ClusterTTSlotCurrentOwner ClusterTTSlotCurrentOwner;
+
+/* Stack-only locator for one canonical physical TT slot.  It carries no
+ * status or transaction verdict: callers must acquire exact block-zero SCUR
+ * and sample the physical bytes before producing authority. */
+typedef struct ClusterTTSlotPhysicalLocator {
+	uint32 segment_id;
+	TransactionId xid;
+	uint16 slot_offset;
+	uint16 wrap;
+	uint32 reserved32;
+} ClusterTTSlotPhysicalLocator;
+
+StaticAssertDecl(sizeof(ClusterTTSlotPhysicalLocator) == 16,
+				 "physical TT locator must remain stack-only 16 bytes");
+typedef struct ClusterTTStatusKey ClusterTTStatusKey;
+typedef struct ClusterTTStatusResult ClusterTTStatusResult;
 
 /* Stack/process-local continuation for the exact origin DATA -> canonical TT
  * -> DATA proof.  The representation is private to the provider; it is not a
@@ -71,6 +88,61 @@ typedef enum ClusterRuntimeVisibilityOriginStep {
 	CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL
 } ClusterRuntimeVisibilityOriginStep;
 
+/* Process-local diagnostics for the canonical-TT sampling step.  These
+ * values are observability only: they neither grant authority nor change a
+ * resolver result. */
+typedef enum ClusterRuntimeVisibilityCanonicalFailure {
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_NONE = 0,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_PLAN_CURRENT,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_GENERATION_SAMPLE,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_GENERATION_UNKNOWN,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_GENERATION_OVERFLOW,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_RESIDENT_COPY,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_SLOT_DOMAIN,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_SLOT_IDENTITY,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_NATIVE_OUTCOME,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_AUTHORITY_STAMP,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_GENERATION_RECHECK,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_ROOT_RECHECK,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_ADMISSION_RECHECK,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_LIVE_OWNER_SAMPLE,
+	CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_LIVE_OWNER_RECHECK
+} ClusterRuntimeVisibilityCanonicalFailure;
+
+typedef struct ClusterRuntimeVisibilityCanonicalDiagnostic {
+	bool valid;
+	ClusterRuntimeVisibilityCanonicalFailure first_failure;
+	int32 generation_result;
+	bool generation_known;
+	uint32 generation_value;
+	int32 resident_copy_result;
+	uint32 locator_xid;
+	uint16 locator_wrap;
+	uint16 tt_slot_offset;
+	uint8 slot_status;
+	uint32 slot_xid;
+	uint16 slot_wrap;
+	SCN slot_commit_scn;
+	bool live_owner_sampled;
+	bool live_owner_exact;
+	uint32 live_owner_segment_id;
+	uint32 live_owner_xid;
+	uint16 live_owner_slot_offset;
+	uint16 live_owner_wrap;
+	uint8 live_owner_status;
+	bool native_sampled;
+	uint8 native_status;
+	bool prepared_sampled;
+	bool prepared;
+	uint64 root_id;
+	uint64 root_generation;
+	bool final_root_sampled;
+	uint64 final_root_id;
+	uint64 final_root_generation;
+	bool initial_admission_current;
+	bool final_admission_current;
+} ClusterRuntimeVisibilityCanonicalDiagnostic;
+
 extern void cluster_runtime_visibility_ensure_exit_hooks(void);
 extern bool cluster_runtime_visibility_zero_epoch_pair_admission_enter(
 	ClusterSemanticAdmissionToken *token);
@@ -79,6 +151,16 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin(
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_admitted(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome
+cluster_runtime_visibility_resolve_terminal_census_retained_exact(
+	const ClusterTxLocator *locator, SCN retained_commit_scn,
+	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome
+cluster_runtime_visibility_resolve_terminal_census_retained_local_exact(
+	const ClusterTxLocator *locator, SCN retained_commit_scn,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_held(
@@ -106,6 +188,27 @@ extern bool cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root,
 	ClusterTxResolveReason *reason_out);
+extern bool cluster_runtime_visibility_origin_plan_canonical_diagnostic(
+	const ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterRuntimeVisibilityCanonicalDiagnostic *out);
+/* Current-MultiXact consumes the R4 TARGET canonical physical TT slot.  The
+ * allocator snapshot is only a locator/corroboration input and cannot create
+ * an ACTIVE or terminal result by itself. */
+extern bool cluster_runtime_visibility_current_owner_sample_held(
+	TransactionId xid, const ClusterTTSlotCurrentOwner *expected_owner,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
+extern bool cluster_runtime_visibility_physical_locator_sample_held(
+	const ClusterTTSlotPhysicalLocator *locator,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
+extern bool cluster_runtime_visibility_current_owner_lookup_exact(
+	TransactionId xid, ClusterTTStatusKey *key_out,
+	ClusterTTStatusResult *result_out);
 extern ClusterTxOutcome
 cluster_runtime_visibility_origin_plan_recheck_data_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,

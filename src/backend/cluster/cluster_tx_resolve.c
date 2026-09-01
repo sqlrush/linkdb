@@ -233,7 +233,8 @@ static ClusterTxOutcome
 cluster_tx_resolve_exact_with_admission(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
-	ClusterTxResolveReason *reason_out, bool caller_owned_terminal_census)
+	ClusterTxResolveReason *reason_out, bool caller_owned_terminal_census,
+	SCN retained_commit_scn)
 {
 	ClusterTxResolution candidate;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
@@ -285,6 +286,17 @@ cluster_tx_resolve_exact_with_admission(
 	else
 		outcome = cluster_runtime_visibility_resolve_exact_origin(
 			locator, mode, formation_epoch, &candidate, &provider_reason);
+	if (outcome == CLUSTER_TX_UNKNOWN && terminal_census
+		&& locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT
+		&& SCN_VALID(retained_commit_scn))
+	{
+		memset(&candidate, 0, sizeof(candidate));
+		provider_reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		outcome
+			= cluster_runtime_visibility_resolve_terminal_census_retained_exact(
+				locator, retained_commit_scn, admission, &candidate,
+				&provider_reason);
+	}
 	if (outcome == CLUSTER_TX_UNKNOWN) {
 		reason = provider_reason == CLUSTER_TX_RESOLVE_NONE
 					 || !cluster_tx_resolve_reason_is_known(provider_reason)
@@ -352,7 +364,26 @@ cluster_tx_resolve_exact_admitted(
 		return CLUSTER_TX_UNKNOWN;
 	}
 	return cluster_tx_resolve_exact_with_admission(
-		locator, mode, admission, out, reason_out, true);
+		locator, mode, admission, out, reason_out, true, InvalidScn);
+}
+
+ClusterTxOutcome
+cluster_tx_resolve_terminal_census_retained_admitted(
+	const ClusterTxLocator *locator, SCN retained_commit_scn,
+	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out)
+{
+	if (!SCN_VALID(retained_commit_scn))
+	{
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		if (reason_out != NULL)
+			*reason_out = CLUSTER_TX_RESOLVE_PROTOCOL;
+		return CLUSTER_TX_UNKNOWN;
+	}
+	return cluster_tx_resolve_exact_with_admission(
+		locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, admission, out,
+		reason_out, true, retained_commit_scn);
 }
 
 void
@@ -394,7 +425,7 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode m
 	PG_TRY();
 	{
 		outcome = cluster_tx_resolve_exact_with_admission(
-			locator, mode, &admission, out, &reason, false);
+			locator, mode, &admission, out, &reason, false, InvalidScn);
 	}
 	PG_FINALLY();
 	{

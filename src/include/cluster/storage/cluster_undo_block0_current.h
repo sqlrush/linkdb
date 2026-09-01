@@ -37,6 +37,14 @@ typedef enum ClusterUndoBlock0CurrentStep {
 	CLUSTER_UNDO_BLOCK0_CURRENT_FAILED = 3
 } ClusterUndoBlock0CurrentStep;
 
+typedef enum ClusterUndoBlock0RecycleResult {
+	CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED = 0,
+	CLUSTER_UNDO_BLOCK0_RECYCLE_ALREADY = 1,
+	CLUSTER_UNDO_BLOCK0_RECYCLE_NOT_COMMITTED = 2,
+	CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED = 3,
+	CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED = 4
+} ClusterUndoBlock0RecycleResult;
+
 /*
  * Process-local guard.  Its body is deliberately private to the adapter.
  * uint64 supplies the alignment required by its embedded dlist_node.
@@ -105,6 +113,8 @@ extern ClusterUndoBlock0Result cluster_undo_block0_current_copy_resident(
 extern ClusterUndoBlock0Result cluster_undo_block0_current_pin_exclusive(
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
 	const ClusterUndoBlock0Generation *expected, ClusterUndoBlock0Pin *pin, char **page);
+extern ClusterUndoBlock0Result cluster_undo_block0_current_recheck_exclusive(
+	ClusterUndoBlock0CurrentGuard *guard);
 extern ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_ensure_resident(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms);
@@ -112,7 +122,25 @@ extern ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_ensure_resident_exact(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
 	ClusterUndoBlock0LiveOwnerPublication *publication);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_reuse_exact(
+	const ClusterUndoBlock0LogicalKey *key,
+	const ClusterUndoBlock0Generation *expected,
+	const char successor_page[BLCKSZ], int timeout_ms);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_mutate_exact(
+	const ClusterUndoBlock0LogicalKey *key,
+	const ClusterUndoBlock0Generation *expected,
+	const char predecessor_page[BLCKSZ],
+	const char successor_page[BLCKSZ], int timeout_ms);
+extern ClusterUndoBlock0RecycleResult
+cluster_undo_block0_current_live_owner_recycle_exact(
+	const ClusterUndoBlock0LogicalKey *key, SCN horizon,
+	uint64 expected_epoch, int timeout_ms);
 extern bool cluster_undo_block0_current_live_owner_publication_recheck(
+	const ClusterUndoBlock0LiveOwnerPublication *publication);
+extern bool
+cluster_undo_block0_current_live_owner_publication_recheck_conditional(
 	const ClusterUndoBlock0LiveOwnerPublication *publication);
 
 /* Target Startup's sole no-live-GES lane.  READY publication additionally

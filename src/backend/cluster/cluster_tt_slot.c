@@ -312,6 +312,102 @@ tt_slot_entry_recycle_locked(ClusterTTSlotAllocEntry *e, TransactionId new_owner
 
 
 /*
+ * Allocate from one already-locked allocator generation.  The caller samples
+ * the retention horizon before taking seg->lock (C17) and owns the exact
+ * current-segment check.  Returning the assigned wrap from this same critical
+ * section prevents a rollover from separating slot assignment from the
+ * binding's ABA token capture.
+ */
+static uint16
+cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_id,
+							 TransactionId top_xid, bool gate_enabled, bool peer_mode,
+							 SCN horizon, bool *out_retained_pressure, uint16 *out_wrap)
+{
+	int reusable_idx = -1;
+	int free_idx = -1;
+	bool retained_pressure = false;
+	uint16 chosen;
+	uint64 retain_skip_seen = 0; /* spec-3.12 D5 */
+	int i;
+
+	/* Pass 1: classify slots (idempotent reuse short-circuits). */
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		const ClusterTTSlotAllocEntry *e = &seg->slots[i];
+
+		if (e->status == CTS_ACTIVE && e->xid == top_xid) {
+			if (out_wrap)
+				*out_wrap = e->wrap;
+			return (uint16)i;
+		}
+		if (e->status == CTS_FREE) {
+			if (free_idx < 0 && !cluster_tt_slot_is_protected(segment_id, (uint16)i))
+				free_idx = i;
+		} else if (e->status == CTS_COMMITTED || e->status == CTS_ABORTED) {
+			/* A local ProcArray horizon cannot authorize destruction of evidence
+			 * still needed by a peer snapshot. */
+			bool recyclable
+				= (e->status == CTS_COMMITTED && peer_mode)
+					  ? false
+					  : (gate_enabled
+							 ? cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon)
+							 : true);
+
+			if (recyclable && tt_slot_entry_wrap_retired(e)) {
+				recyclable = false;
+				retained_pressure = true;
+				tt_slot_count_wrap_retired();
+			}
+
+			if (recyclable) {
+				if (reusable_idx < 0
+					&& !cluster_tt_slot_is_protected(segment_id, (uint16)i))
+					reusable_idx = i;
+			} else {
+				retained_pressure = true;
+				retain_skip_seen++;
+			}
+		}
+	}
+
+	if (retain_skip_seen > 0 && ClusterTTSlotShm != NULL)
+		pg_atomic_fetch_add_u64(&ClusterTTSlotShm->tt_slot_retain_skip_count,
+								retain_skip_seen);
+
+	/* Pass 2: prefer FREE over a retention-eligible recyclable slot. */
+	if (free_idx >= 0) {
+		ClusterTTSlotAllocEntry *e = &seg->slots[free_idx];
+
+		e->xid = top_xid;
+		e->status = CTS_ACTIVE;
+		e->commit_scn = InvalidScn;
+		chosen = (uint16)free_idx;
+	} else if (reusable_idx >= 0) {
+		ClusterTTSlotAllocEntry *e = &seg->slots[reusable_idx];
+		bool was_committed = (e->status == CTS_COMMITTED);
+
+		tt_slot_entry_recycle_locked(e, top_xid);
+		chosen = (uint16)reusable_idx;
+
+		if (was_committed && ClusterTTSlotShm != NULL) {
+			pg_atomic_fetch_add_u64(&ClusterTTSlotShm->retention_recycle_count, 1);
+			if (!gate_enabled || !SCN_VALID(horizon))
+				pg_atomic_fetch_add_u64(&ClusterTTSlotShm->retention_off_recycle_count, 1);
+			else
+				tt_slot_note_gated_recycle_horizon(horizon);
+		}
+	} else {
+		if (out_retained_pressure)
+			*out_retained_pressure = retained_pressure;
+		return INVALID_TT_SLOT_OFFSET;
+	}
+
+	if (out_wrap)
+		*out_wrap = seg->slots[chosen].wrap;
+	return chosen;
+}
+
+
+/*
  * cluster_tt_slot_alloc_ext
  *
  *	Three-tier fallback (L189 recycle policy) with the spec-3.12 retention
@@ -345,15 +441,10 @@ uint16
 cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_retained_pressure)
 {
 	ClusterTTSlotAllocPerSegment *seg;
-	int reusable_idx = -1;
-	int free_idx = -1;
-	bool retained_pressure = false;
 	bool gate_enabled;
 	bool peer_mode;
 	SCN horizon = InvalidScn;
-	uint16 chosen;
-	uint64 retain_skip_seen = 0; /* spec-3.12 D5 */
-	int i;
+	uint16 result;
 
 	if (out_retained_pressure)
 		*out_retained_pressure = false;
@@ -378,103 +469,74 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 	seg = cluster_tt_slot_get_or_init(segment_id);
 
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
+	result = cluster_tt_slot_alloc_locked(seg, segment_id, top_xid, gate_enabled,
+								 peer_mode, horizon, out_retained_pressure, NULL);
+	LWLockRelease(&seg->lock);
+	return result;
+}
 
-	/* Pass 1: classify slots (idempotent reuse short-circuits). */
-	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
-		const ClusterTTSlotAllocEntry *e = &seg->slots[i];
 
-		if (e->status == CTS_ACTIVE && e->xid == top_xid) {
-			LWLockRelease(&seg->lock);
-			return (uint16)i;
-		}
-		if (e->status == CTS_FREE) {
-			if (free_idx < 0 && !cluster_tt_slot_is_protected(segment_id, (uint16)i))
-				free_idx = i;
-		} else if (e->status == CTS_COMMITTED || e->status == CTS_ABORTED) {
-			/*
-			 * A local ProcArray horizon cannot authorize destruction of evidence
-			 * still needed by a peer snapshot.  In peer mode COMMITTED reclamation
-			 * is delegated to cluster_tt_slot_gc_current_pass(), whose production
-			 * caller supplies the epoch-paired proven cluster floor and rechecks
-			 * the epoch at the mutation.  This also overrides the diagnostic GUC-off
-			 * bypass: without a cluster proof the safe outcome is rollover/fail-closed.
-			 */
-			bool recyclable
-				= (e->status == CTS_COMMITTED && peer_mode)
-					  ? false
-					  : (gate_enabled
-							 ? cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon)
-							 : true); /* single-node GUC off: immediate recycle (C6) */
+/*
+ * Allocate only if expected_segment_id is still the node's exact CURRENT
+ * allocator generation.  A concurrent rollover/reuse is ordinary local
+ * backpressure: report current_drift with zero mutation so the binding owner
+ * can reread CURRENT.  The legacy segment-addressed API above intentionally
+ * keeps its strict mismatch ERROR contract for callers that name a non-current
+ * segment unexpectedly.
+ */
+uint16
+cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id,
+								TransactionId top_xid, bool *out_retained_pressure,
+								bool *out_current_drift, uint16 *out_wrap)
+{
+	ClusterTTSlotAllocPerSegment *seg;
+	bool gate_enabled;
+	bool peer_mode;
+	SCN horizon = InvalidScn;
+	uint16 result;
 
-			/* D5: wrap-retired entries are never re-selected this generation;
-			 * they read as pressure so the caller can roll over (C3b family). */
-			if (recyclable && tt_slot_entry_wrap_retired(e)) {
-				recyclable = false;
-				retained_pressure = true;
-				tt_slot_count_wrap_retired();
-			}
+	if (out_retained_pressure)
+		*out_retained_pressure = false;
+	if (out_current_drift)
+		*out_current_drift = false;
+	if (out_wrap)
+		*out_wrap = TT_WRAP_INVALID;
 
-			if (recyclable) {
-				if (reusable_idx < 0 && !cluster_tt_slot_is_protected(segment_id, (uint16)i))
-					reusable_idx = i;
-			} else {
-				/* COMMITTED lacks a cluster recycle proof, or is not older than horizon. */
-				retained_pressure = true;
-				retain_skip_seen++; /* C16: per skip event, not de-duped */
-			}
-		}
-		/* CTS_ACTIVE not owned by top_xid: in-flight; nothing to do. */
+	if (ClusterTTSlotShm == NULL)
+		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+						errmsg("cluster TT slot allocator shmem not initialised")));
+	if (node_id < 0 || node_id >= CLUSTER_TT_SLOT_MAX_NODES
+		|| expected_segment_id == 0 || expected_segment_id > UINT16_MAX
+		|| cluster_tt_slot_segment_to_node(expected_segment_id) != node_id)
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot_alloc_current_exact: invalid node/segment identity")));
+	if (!TransactionIdIsValid(top_xid))
+		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("cluster_tt_slot_alloc_current_exact: top_xid must be valid")));
+
+	gate_enabled = cluster_undo_retention_horizon_enabled;
+	peer_mode = cluster_peer_mode_enabled();
+	if (gate_enabled) {
+		horizon = cluster_undo_retention_horizon();
+		pg_atomic_write_u64(&ClusterTTSlotShm->retention_horizon_scn, (uint64)horizon);
 	}
 
-	if (retain_skip_seen > 0 && ClusterTTSlotShm != NULL)
-		pg_atomic_fetch_add_u64(&ClusterTTSlotShm->tt_slot_retain_skip_count, retain_skip_seen);
-
-	/* Pass 2: prefer FREE over a retention-eligible recyclable slot. */
-	if (free_idx >= 0) {
-		ClusterTTSlotAllocEntry *e = &seg->slots[free_idx];
-
-		e->xid = top_xid;
-		e->status = CTS_ACTIVE;
-		e->commit_scn = InvalidScn;
-		/* wrap unchanged on FREE → ACTIVE; first allocation keeps wrap=0 */
-		chosen = (uint16)free_idx;
-	} else if (reusable_idx >= 0) {
-		ClusterTTSlotAllocEntry *e = &seg->slots[reusable_idx];
-		bool was_committed = (e->status == CTS_COMMITTED);
-
-		tt_slot_entry_recycle_locked(e, top_xid); /* C-R1 single transition */
-		chosen = (uint16)reusable_idx;
-
-		/* spec-3.12 D5: a COMMITTED slot recycled past the horizon (ABORTED was
-		 * never retention-gated, so it does not count). */
-		if (was_committed && ClusterTTSlotShm != NULL) {
-			pg_atomic_fetch_add_u64(&ClusterTTSlotShm->retention_recycle_count, 1);
-
-			/*
-			 * spec-3.22: if this COMMITTED recycle was NOT horizon-gated (GUC off
-			 * -> immediate recycle C6, or an InvalidScn horizon -> recyclable
-			 * returns true freely), the slot's commit_scn was NOT proven below the
-			 * horizon.  Record it so the xmax 0-match shortcut fails closed for
-			 * this incarnation (cluster_cr_retention_proof_valid). */
-			if (!gate_enabled || !SCN_VALID(horizon))
-				pg_atomic_fetch_add_u64(&ClusterTTSlotShm->retention_off_recycle_count, 1);
-			else
-				tt_slot_note_gated_recycle_horizon(horizon); /* spec-6.12i CP5 */
-		}
-	} else {
-		/*
-		 * No FREE and no retention-eligible slot.  Hand the reason back so the
-		 * caller can decide rollover (retained pressure) vs hard error (all
-		 * ACTIVE) -- spec-3.12 D2b / C3b.
-		 */
+	seg = &ClusterTTSlotShm->per_node[node_id];
+	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
+	if (seg->segment_id == 0)
+		seg->segment_id = expected_segment_id;
+	else if (seg->segment_id != expected_segment_id) {
+		if (out_current_drift)
+			*out_current_drift = true;
 		LWLockRelease(&seg->lock);
-		if (out_retained_pressure)
-			*out_retained_pressure = retained_pressure;
 		return INVALID_TT_SLOT_OFFSET;
 	}
 
+	result = cluster_tt_slot_alloc_locked(seg, expected_segment_id, top_xid,
+								 gate_enabled, peer_mode, horizon,
+								 out_retained_pressure, out_wrap);
 	LWLockRelease(&seg->lock);
-	return chosen;
+	return result;
 }
 
 

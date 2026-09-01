@@ -22,6 +22,7 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
+#include "miscadmin.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -119,6 +120,7 @@ static ResourceReleaseCallback resource_release_callback = NULL;
 static void *resource_release_arg = NULL;
 static int lwlock_acquire_calls = 0;
 static int lwlock_throw_on_call = 0;
+static int lwlock_release_without_holdoff_count = 0;
 static ClusterUndoSmgrFinalState smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
 static ClusterUndoSmgrPublishResult smgr_publish_result
 	= CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED;
@@ -142,6 +144,7 @@ ResourceOwner CurTransactionResourceOwner = NULL;
 ResourceOwner TopTransactionResourceOwner = NULL;
 ResourceOwner AuxProcessResourceOwner = NULL;
 MemoryContext TopMemoryContext = (MemoryContext)(uintptr_t)1;
+volatile uint32 InterruptHoldoffCount = 0;
 
 /* Standalone substitute for the reconfiguration owner's lock co-sample. */
 ClusterR4PrerequisiteSnapshot
@@ -204,12 +207,19 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 		UT_ASSERT_NOT_NULL(PG_exception_stack);
 		siglongjmp(*PG_exception_stack, 1);
 	}
+	HOLD_INTERRUPTS();
 	return true;
 }
 
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	if (InterruptHoldoffCount == 0) {
+		lwlock_release_without_holdoff_count++;
+		return;
+	}
+	RESUME_INTERRUPTS();
+}
 
 bool
 cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
@@ -792,6 +802,36 @@ UT_TEST(test_block0_runtime_admission_preserves_generation_zero_and_exact_identi
 	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(token.frame_index != admitted_frame);
 	cluster_undo_block0_frame_release(&token);
+}
+
+UT_TEST(test_block0_unpin_after_error_interrupt_reset_is_balanced)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0ResolvedRoot root
+		= make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, UINT64CONST(0x1112), 7);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 0);
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	char *page = NULL;
+
+	fresh_block0_region(1);
+	make_valid_block0(1, 1, 0, 0x4e);
+	memset(&token, 0, sizeof(token));
+	memset(&pin, 0, sizeof(pin));
+	lwlock_release_without_holdoff_count = 0;
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
+				 &logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 1);
+
+	/* ereport(ERROR) resets the process holdoff counter before PG_FINALLY. */
+	InterruptHoldoffCount = 0;
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(lwlock_release_without_holdoff_count, 0);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
 }
 
 UT_TEST(test_block0_runtime_admission_rejects_exhausted_generation)
@@ -1990,7 +2030,7 @@ UT_TEST(test_r4_startup_completion_surface_refuses_without_owner_proofs)
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(48);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_requires_pgrd_identity_and_declared_intent);
@@ -2004,6 +2044,7 @@ main(void)
 	UT_RUN(test_block0_attach_rejects_impossible_free_count);
 	UT_RUN(test_block0_frame_bank_is_sparse_and_all_or_none);
 	UT_RUN(test_block0_runtime_admission_preserves_generation_zero_and_exact_identity);
+	UT_RUN(test_block0_unpin_after_error_interrupt_reset_is_balanced);
 	UT_RUN(test_block0_runtime_admission_rejects_exhausted_generation);
 	UT_RUN(test_block0_strict_empty_proof_excludes_filling_and_resident_states);
 	UT_RUN(test_block0_copy_readonly_is_recovery_only_and_generation_exact);

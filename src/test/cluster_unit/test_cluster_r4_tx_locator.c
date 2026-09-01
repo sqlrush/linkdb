@@ -23,6 +23,11 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	uint64 formation_epoch, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome
+cluster_runtime_visibility_resolve_terminal_census_retained_exact(
+	const ClusterTxLocator *locator, SCN retained_commit_scn,
+	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
+	ClusterTxResolveReason *reason_out);
 
 #undef printf
 #undef fprintf
@@ -227,6 +232,18 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 	*out = test_provider_resolution;
 	*reason_out = test_provider_reason;
 	return test_provider_outcome;
+}
+
+ClusterTxOutcome
+cluster_runtime_visibility_resolve_terminal_census_retained_exact(
+	const ClusterTxLocator *locator pg_attribute_unused(),
+	SCN retained_commit_scn pg_attribute_unused(),
+	const ClusterSemanticAdmissionToken *admission pg_attribute_unused(),
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
+{
+	memset(out, 0, sizeof(*out));
+	*reason_out = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+	return CLUSTER_TX_UNKNOWN;
 }
 
 void

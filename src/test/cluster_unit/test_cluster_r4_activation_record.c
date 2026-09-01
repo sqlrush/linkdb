@@ -68,6 +68,23 @@ cluster_reconfig_snapshot_initial_clean_formation(
 	return false;
 }
 
+bool
+cluster_reconfig_get_observed_slot(int32 node_id pg_attribute_unused(),
+								   uint64 *incarnation, uint64 *generation)
+{
+	if (incarnation != NULL)
+		*incarnation = 0;
+	if (generation != NULL)
+		*generation = 0;
+	return false;
+}
+
+uint64
+cluster_reconfig_get_observed_epoch(int32 node_id pg_attribute_unused())
+{
+	return 0;
+}
+
 const struct ClusterSemanticActivationCallbackBundle *
 cluster_pcm_x_resource_x_activation_callbacks(void)
 {

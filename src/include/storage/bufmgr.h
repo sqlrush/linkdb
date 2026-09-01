@@ -307,8 +307,11 @@ extern bool ClusterLockBufferExclusiveBarrierAware(Buffer buffer,
 /* PGRAC: SHARE counterpart with the same clean-refusal contract. */
 extern bool ClusterLockBufferShareBarrierAware(Buffer buffer);
 /* PGRAC: operation-scoped PCM-X direct-init entrances for zero VM/FSM pages. */
-extern void LockBufferForVisibilityMapPageInit(Buffer buffer);
-extern void LockBufferForFreeSpaceMapPageInit(Buffer buffer);
+/* Returns InvalidBuffer when the caller's pin was deliberately released for
+ * a Resource-X wait and the old descriptor was reused.  The relation-level
+ * VM/FSM reader must obtain a fresh pin and restart its exact init path. */
+extern Buffer LockBufferForVisibilityMapPageInit(Buffer buffer);
+extern Buffer LockBufferForFreeSpaceMapPageInit(Buffer buffer);
 extern bool ConditionalLockBuffer(Buffer buffer);
 extern void LockBufferForCleanup(Buffer buffer);
 extern bool ConditionalLockBufferForCleanup(Buffer buffer);

@@ -26,16 +26,20 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "cluster/cluster_cr.h"
 #include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/procarray.h"
 #include "utils/snapmgr.h"
 
 #undef printf
@@ -51,10 +55,17 @@ UT_DEFINE_GLOBALS();
 #define TEST_TT_OFFSET ((uint16)3)
 
 int cluster_node_id = 0;
+bool cluster_crossnode_runtime_visibility = true;
 TransactionId TransactionXmin = FirstNormalTransactionId;
 volatile sig_atomic_t InterruptPending = false;
+volatile uint32 InterruptHoldoffCount = 0;
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
+
+static LWLockPadded test_lwlocks[64];
+LWLockPadded *MainLWLockArray = test_lwlocks;
+static VariableCacheData test_variable_cache;
+VariableCache ShmemVariableCache = &test_variable_cache;
 
 static ClusterTxLocator test_origin_locator;
 static UndoRecordHeader test_origin_record;
@@ -98,10 +109,30 @@ static int test_candidate_held_count;
 static int test_candidate_max_held_count;
 static int test_candidate_extract_calls;
 static bool test_candidate_mutate_record_on_recheck;
+static ClusterUndoBlock0Result test_candidate_sample_result;
+static bool test_candidate_copy_physical_slot;
+static bool test_current_owner_available;
+static bool test_current_owner_drift_on_recheck;
+static int test_current_owner_calls;
+static ClusterTTSlotCurrentOwner test_current_owner;
+static uint32 test_current_segment;
+static bool test_current_segment_drift_on_recheck;
+static int test_current_segment_calls;
+static bool test_no_raw_reuse_window;
+static bool test_no_raw_reuse_drift_on_recheck;
+static bool test_xid_is_mine;
+static bool test_procarray_live;
+static int test_native_fence_depth;
+static int test_native_fence_lock_calls;
+static int test_native_fence_unlock_calls;
+static int test_procarray_calls;
+static int test_xact_lock_depth;
 static int test_regular_admission_recheck_calls;
 static int test_terminal_census_recheck_calls;
 static int test_regular_root_resolve_calls;
 static int test_terminal_census_root_resolve_calls;
+static bool test_local_freshref_pair_exact;
+static int test_local_freshref_pair_calls;
 static ClusterUndoBlock0CurrentStep test_candidate_acquire_step
 	= CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 static ClusterUndoBlock0CurrentStep test_candidate_poll_step
@@ -141,6 +172,14 @@ cluster_undo_block0_current_ensure_exit_hooks(void)
 {
 	test_candidate_exit_hooks_ensure_calls++;
 }
+
+void
+cluster_rtvis_resolve_note_committed(void)
+{}
+
+void
+cluster_rtvis_resolve_note_failclosed(void)
+{}
 
 static bool
 test_uba_equal(UBA left, UBA right)
@@ -396,9 +435,10 @@ cluster_undo_block0_current_sample_generation(
 {
 	test_candidate_sample_calls++;
 	UT_ASSERT(root->root_id == 91 || root->root_id == 92);
-	*observed = (ClusterUndoBlock0Generation){ true,
-		root->root_id == 91 ? 17 : 23 };
-	return CLUSTER_UNDO_BLOCK0_OK;
+	if (test_candidate_sample_result == CLUSTER_UNDO_BLOCK0_OK)
+		*observed = (ClusterUndoBlock0Generation){ true,
+			root->root_id == 91 ? 17 : 23 };
+	return test_candidate_sample_result;
 }
 
 ClusterUndoBlock0Result
@@ -413,8 +453,124 @@ cluster_undo_block0_current_copy_resident(
 	UT_ASSERT(expected->known);
 	UT_ASSERT(expected->value == 17 || expected->value == 23);
 	memset(private_page, 0, BLCKSZ);
-	header->tt_slots[TEST_TT_OFFSET] = test_tt_slot;
+	if (test_candidate_copy_physical_slot)
+		header->tt_slots[TEST_TT_OFFSET] = test_tt_slot;
 	return CLUSTER_UNDO_BLOCK0_OK;
+}
+
+bool
+cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
+								 ClusterTTSlotCurrentOwner *out)
+{
+	ClusterTTSlotCurrentOwner sampled;
+
+	test_current_owner_calls++;
+	UT_ASSERT_EQ(node_id, cluster_node_id);
+	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
+	UT_ASSERT(out != NULL);
+	memset(out, 0, sizeof(*out));
+	if (!test_current_owner_available)
+		return false;
+	sampled = test_current_owner;
+	if (test_current_owner_drift_on_recheck && test_current_owner_calls > 2)
+		sampled.wrap++;
+	*out = sampled;
+	return true;
+}
+
+uint32
+cluster_tt_slot_current_segment(int node_id)
+{
+	test_current_segment_calls++;
+	UT_ASSERT_EQ(node_id, cluster_node_id);
+	if (test_current_segment_drift_on_recheck
+		&& test_current_segment_calls > 1)
+		return test_current_segment + 1;
+	return test_current_segment;
+}
+
+bool
+cluster_xid_is_mine(TransactionId xid)
+{
+	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
+	return test_xid_is_mine;
+}
+
+bool
+cluster_cr_server_local_freshref_c1b_pair_exact(
+	TransactionId xid, uint32 expected_segment_id,
+	uint32 expected_tt_slot_id, SCN proposed_scn, uint16 *out_wrap)
+{
+	test_local_freshref_pair_calls++;
+	UT_ASSERT_EQ((int) xid, (int) TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(expected_segment_id, TEST_RECORD_SEGMENT);
+	UT_ASSERT_EQ(expected_tt_slot_id,
+				 (uint32) TEST_TT_OFFSET + 1);
+	UT_ASSERT_EQ((uint64) proposed_scn, (uint64) test_commit_scn);
+	UT_ASSERT_NOT_NULL(out_wrap);
+	if (!test_local_freshref_pair_exact)
+		return false;
+	*out_wrap = TEST_ORIGIN_WRAP;
+	return true;
+}
+
+void
+cluster_cr_native_prehistory_reader_lock(void)
+{
+	test_native_fence_lock_calls++;
+	test_native_fence_depth++;
+	if (test_no_raw_reuse_drift_on_recheck
+		&& test_native_fence_lock_calls > 1)
+		test_no_raw_reuse_window = false;
+}
+
+void
+cluster_cr_native_prehistory_reader_unlock(void)
+{
+	test_native_fence_unlock_calls++;
+	UT_ASSERT_EQ(test_native_fence_depth, 1);
+	test_native_fence_depth--;
+}
+
+bool
+cluster_cr_native_prehistory_disabled(void)
+{
+	UT_ASSERT_EQ(test_native_fence_depth, 1);
+	return !test_no_raw_reuse_window;
+}
+
+bool
+TransactionIdIsInProgress(TransactionId xid)
+{
+	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(test_native_fence_depth, 1);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+	test_procarray_calls++;
+	return test_procarray_live;
+}
+
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == XactTruncationLock);
+	UT_ASSERT_EQ(mode, LW_SHARED);
+	test_xact_lock_depth++;
+	return true;
+}
+
+void
+LWLockRelease(LWLock *lock)
+{
+	UT_ASSERT(lock == XactTruncationLock);
+	UT_ASSERT_EQ(test_xact_lock_depth, 1);
+	test_xact_lock_depth--;
+}
+
+void
+LWLockReleaseAll(void)
+{
+	test_xact_lock_depth = 0;
+	test_native_fence_depth = 0;
 }
 
 bool
@@ -548,10 +704,37 @@ reset_exact_origin_fixture(void)
 	test_candidate_max_held_count = 0;
 	test_candidate_extract_calls = 0;
 	test_candidate_mutate_record_on_recheck = false;
+	test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_OK;
+	test_candidate_copy_physical_slot = true;
+	test_current_owner_available = false;
+	test_current_owner_drift_on_recheck = false;
+	test_current_owner_calls = 0;
+	memset(&test_current_owner, 0, sizeof(test_current_owner));
+	test_current_owner.segment_id = TEST_TT_SEGMENT;
+	test_current_owner.xid = TEST_ORIGIN_XID;
+	test_current_owner.slot_offset = TEST_TT_OFFSET;
+	test_current_owner.wrap = TEST_ORIGIN_WRAP;
+	test_current_owner.status = CTS_ACTIVE;
+	test_current_segment = TEST_TT_SEGMENT + 1;
+	test_current_segment_drift_on_recheck = false;
+	test_current_segment_calls = 0;
+	test_no_raw_reuse_window = true;
+	test_no_raw_reuse_drift_on_recheck = false;
+	test_xid_is_mine = true;
+	test_procarray_live = true;
+	test_native_fence_depth = 0;
+	test_native_fence_lock_calls = 0;
+	test_native_fence_unlock_calls = 0;
+	test_procarray_calls = 0;
+	test_xact_lock_depth = 0;
+	memset(&test_variable_cache, 0, sizeof(test_variable_cache));
+	test_variable_cache.oldestClogXid = FirstNormalTransactionId;
 	test_regular_admission_recheck_calls = 0;
 	test_terminal_census_recheck_calls = 0;
 	test_regular_root_resolve_calls = 0;
 	test_terminal_census_root_resolve_calls = 0;
+	test_local_freshref_pair_exact = false;
+	test_local_freshref_pair_calls = 0;
 	test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 }
@@ -586,6 +769,16 @@ static const bool expected[5][8] = {
 		[CLUSTER_TX_PROOF_RECOVERY_MATERIALIZED] = true,
 	},
 };
+
+/* Current-MultiXact member proofs must
+ * consume the R4 TARGET canonical physical TT slot.  The allocator snapshot
+ * is only a locator/corroboration input; no SOURCE overlay participates. */
+extern bool cluster_runtime_visibility_current_owner_sample_held(
+	TransactionId xid, const ClusterTTSlotCurrentOwner *expected_owner,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
 
 static void
 run_pair(unsigned int pair)
@@ -648,6 +841,229 @@ UT_TEST(test_out_of_domain_values_fail_closed)
 	UT_ASSERT(!cluster_tx_outcome_proof_is_valid((ClusterTxOutcome)5, CLUSTER_TX_PROOF_NONE));
 	UT_ASSERT(!cluster_tx_outcome_proof_is_valid(CLUSTER_TX_UNKNOWN, (ClusterTxProofKind)-1));
 	UT_ASSERT(!cluster_tx_outcome_proof_is_valid(CLUSTER_TX_UNKNOWN, (ClusterTxProofKind)8));
+}
+
+UT_TEST(test_current_member_target_canonical_active_requires_exact_physical_slot)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+
+	reset_exact_origin_fixture();
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.xid = TEST_ORIGIN_XID;
+	test_tt_slot.wrap = TEST_ORIGIN_WRAP;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_current_owner_available = true;
+	test_current_owner.status = CTS_ACTIVE;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&guard, 0, sizeof(guard));
+	memset(&root, 0, sizeof(root));
+	root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	root.root_id = 92;
+	root.root_generation = 7;
+	memset(&key, 0xa5, sizeof(key));
+	memset(&result, 0xa5, sizeof(result));
+
+	UT_ASSERT(cluster_runtime_visibility_current_owner_sample_held(
+		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
+		&key, &result));
+	UT_ASSERT_EQ(key.origin_node_id, (uint16)cluster_node_id);
+	UT_ASSERT_EQ(key.undo_segment_id, (uint16)TEST_TT_SEGMENT);
+	UT_ASSERT_EQ(key.tt_slot_id,
+		cluster_tt_slot_offset_to_id(TEST_TT_OFFSET));
+	UT_ASSERT_EQ(key.cluster_epoch, (uint32)test_formation_epoch);
+	UT_ASSERT_EQ(key.local_xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(result.status_epoch, (uint32)test_formation_epoch);
+	UT_ASSERT(result.authoritative);
+	UT_ASSERT_EQ(test_candidate_block0_copy_calls, 1);
+	UT_ASSERT_EQ(test_current_owner_calls, 1);
+
+	/* Empty physical bytes cannot be promoted by the allocator snapshot. */
+	test_candidate_copy_physical_slot = false;
+	test_current_owner_calls = 0;
+	memset(&key, 0xa5, sizeof(key));
+	memset(&result, 0xa5, sizeof(result));
+	UT_ASSERT(!cluster_runtime_visibility_current_owner_sample_held(
+		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
+		&key, &result));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT(!result.authoritative);
+
+	/* A physical wrap mismatch and a post-sample allocator drift both remain
+	 * fail closed; neither can be repaired from raw xid/native state. */
+	test_candidate_copy_physical_slot = true;
+	test_tt_slot.wrap++;
+	UT_ASSERT(!cluster_runtime_visibility_current_owner_sample_held(
+		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
+		&key, &result));
+	test_tt_slot.wrap = TEST_ORIGIN_WRAP;
+	/* The shared fixture mutates on its third owner sample. */
+	test_current_owner_calls = 2;
+	test_current_owner_drift_on_recheck = true;
+	UT_ASSERT(!cluster_runtime_visibility_current_owner_sample_held(
+		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
+		&key, &result));
+}
+
+UT_TEST(test_current_member_rolled_terminal_uses_locator_then_canonical_scur)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterTTSlotPhysicalLocator locator;
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+
+	reset_exact_origin_fixture();
+	test_native_status = TRANSACTION_STATUS_ABORTED;
+	test_tt_slot.status = TT_SLOT_ABORTED;
+	test_tt_slot.xid = TEST_ORIGIN_XID;
+	test_tt_slot.wrap = TEST_ORIGIN_WRAP;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_current_owner_available = false;
+	test_current_segment = TEST_TT_SEGMENT + 1;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&guard, 0, sizeof(guard));
+	memset(&root, 0, sizeof(root));
+	root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	root.root_id = 92;
+	root.root_generation = 7;
+	memset(&locator, 0, sizeof(locator));
+	locator.segment_id = TEST_TT_SEGMENT;
+	locator.xid = TEST_ORIGIN_XID;
+	locator.slot_offset = TEST_TT_OFFSET;
+	locator.wrap = TEST_ORIGIN_WRAP;
+
+	UT_ASSERT(cluster_runtime_visibility_physical_locator_sample_held(
+		&locator, &admission, &guard, &root, &key, &result));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_ABORTED);
+	UT_ASSERT(result.authoritative);
+	UT_ASSERT_EQ(key.undo_segment_id, (uint16)TEST_TT_SEGMENT);
+	UT_ASSERT_EQ(key.tt_slot_id,
+		cluster_tt_slot_offset_to_id(TEST_TT_OFFSET));
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+	UT_ASSERT_EQ(test_current_segment_calls, 2);
+
+	/* Locator status is never a verdict: missing/mismatched canonical bytes
+	 * and allocator rollover drift remain UNKNOWN. */
+	test_candidate_copy_physical_slot = false;
+	UT_ASSERT(!cluster_runtime_visibility_physical_locator_sample_held(
+		&locator, &admission, &guard, &root, &key, &result));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT(!result.authoritative);
+	test_candidate_copy_physical_slot = true;
+	test_tt_slot.xid++;
+	UT_ASSERT(!cluster_runtime_visibility_physical_locator_sample_held(
+		&locator, &admission, &guard, &root, &key, &result));
+	test_tt_slot.xid = TEST_ORIGIN_XID;
+	test_current_segment_calls = 0;
+	test_current_segment_drift_on_recheck = true;
+	UT_ASSERT(!cluster_runtime_visibility_physical_locator_sample_held(
+		&locator, &admission, &guard, &root, &key, &result));
+}
+
+UT_TEST(test_current_member_terminal_on_current_segment_survives_retired_owner_index)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterTTSlotPhysicalLocator locator;
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+
+	reset_exact_origin_fixture();
+	test_native_status = TRANSACTION_STATUS_COMMITTED;
+	test_tt_slot.status = TT_SLOT_COMMITTED;
+	test_tt_slot.xid = TEST_ORIGIN_XID;
+	test_tt_slot.wrap = TEST_ORIGIN_WRAP;
+	test_tt_slot.commit_scn = test_commit_scn;
+	test_current_segment = TEST_TT_SEGMENT;
+	test_current_owner_available = false;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&guard, 0, sizeof(guard));
+	memset(&root, 0, sizeof(root));
+	root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	root.root_id = 92;
+	root.root_generation = 7;
+	memset(&locator, 0, sizeof(locator));
+	locator.segment_id = TEST_TT_SEGMENT;
+	locator.xid = TEST_ORIGIN_XID;
+	locator.slot_offset = TEST_TT_OFFSET;
+	locator.wrap = TEST_ORIGIN_WRAP;
+
+	/* A terminal canonical slot remains authoritative after its allocator
+	 * owner entry retires, even while the allocator still uses the segment. */
+	UT_ASSERT(cluster_runtime_visibility_physical_locator_sample_held(
+		&locator, &admission, &guard, &root, &key, &result));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_COMMITTED);
+	UT_ASSERT_EQ(result.commit_scn, test_commit_scn);
+	UT_ASSERT(result.authoritative);
+	UT_ASSERT_EQ(test_current_owner_calls, 2);
+	UT_ASSERT_EQ(test_current_segment_calls, 2);
+	UT_ASSERT_EQ(test_candidate_block0_copy_calls, 1);
+}
+
+UT_TEST(test_current_member_active_on_current_segment_requires_live_owner_index)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterTTSlotPhysicalLocator locator;
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+
+	reset_exact_origin_fixture();
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.xid = TEST_ORIGIN_XID;
+	test_tt_slot.wrap = TEST_ORIGIN_WRAP;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	test_current_segment = TEST_TT_SEGMENT;
+	test_current_owner_available = false;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&guard, 0, sizeof(guard));
+	memset(&root, 0, sizeof(root));
+	root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	root.root_id = 92;
+	root.root_generation = 7;
+	memset(&locator, 0, sizeof(locator));
+	locator.segment_id = TEST_TT_SEGMENT;
+	locator.xid = TEST_ORIGIN_XID;
+	locator.slot_offset = TEST_TT_OFFSET;
+	locator.wrap = TEST_ORIGIN_WRAP;
+
+	UT_ASSERT(!cluster_runtime_visibility_physical_locator_sample_held(
+		&locator, &admission, &guard, &root, &key, &result));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
+	UT_ASSERT(!result.authoritative);
 }
 
 UT_TEST(test_exact_origin_committed_uses_canonical_tt_identity_and_direct_clog)
@@ -716,6 +1132,84 @@ UT_TEST(test_terminal_census_local_origin_uses_resident_candidate2_and_canonical
 	UT_ASSERT_EQ(test_undo_read_calls, 0);
 	UT_ASSERT_EQ(test_tt_exact_calls, 0);
 	UT_ASSERT_EQ(test_tt_snapshot_calls, 0);
+}
+
+UT_TEST(test_terminal_census_nonresident_cleanout_uses_exact_local_c1b_pair)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterSemanticAdmissionToken admission;
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_origin_locator.itl_kind = ITL_FLAG_NEEDS_CLEANOUT;
+	test_local_freshref_pair_exact = true;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+
+	UT_ASSERT_EQ(
+		cluster_runtime_visibility_resolve_terminal_census_retained_local_exact(
+			&test_origin_locator, test_commit_scn, &admission,
+			&resolution, &reason),
+		CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT_EQ(resolution.outcome, CLUSTER_TX_COMMITTED);
+	UT_ASSERT_EQ(resolution.proof_kind,
+				 CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG);
+	UT_ASSERT_EQ((uint64) resolution.commit_scn,
+				 (uint64) test_commit_scn);
+	UT_ASSERT_EQ(memcmp(&resolution.locator_echo, &test_origin_locator,
+						 sizeof(test_origin_locator)), 0);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 1);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	UT_ASSERT_EQ(test_candidate_data_copy_calls, 0);
+}
+
+UT_TEST(test_terminal_census_retained_pair_negative_matrix_fails_closed)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason;
+	ClusterSemanticAdmissionToken admission;
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_origin_locator.itl_kind = ITL_FLAG_NEEDS_CLEANOUT;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+
+	/* Exact origin pair denial cannot be converted into a terminal stamp. */
+	reason = CLUSTER_TX_RESOLVE_NONE;
+	UT_ASSERT_EQ(
+		cluster_runtime_visibility_resolve_terminal_census_retained_local_exact(
+			&test_origin_locator, test_commit_scn, &admission,
+			&resolution, &reason),
+		CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+
+	/* The retained path is closed to ACTIVE and invalid-SCN carriers. */
+	test_local_freshref_pair_exact = true;
+	test_origin_locator.itl_kind = ITL_FLAG_ACTIVE;
+	reason = CLUSTER_TX_RESOLVE_NONE;
+	UT_ASSERT_EQ(
+		cluster_runtime_visibility_resolve_terminal_census_retained_local_exact(
+			&test_origin_locator, test_commit_scn, &admission,
+			&resolution, &reason),
+		CLUSTER_TX_UNKNOWN);
+	test_origin_locator.itl_kind = ITL_FLAG_NEEDS_CLEANOUT;
+	UT_ASSERT_EQ(
+		cluster_runtime_visibility_resolve_terminal_census_retained_local_exact(
+			&test_origin_locator, InvalidScn, &admission,
+			&resolution, &reason),
+		CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 1);
 }
 
 UT_TEST(test_terminal_census_same_owner_cross_segment_is_sequential_and_exact)
@@ -822,6 +1316,420 @@ UT_TEST(test_visibility_precommit_committed_slot_with_live_origin_stays_in_progr
 	UT_ASSERT_EQ(test_candidate_max_held_count, 1);
 	UT_ASSERT_EQ(test_candidate_extract_calls, 2);
 	UT_ASSERT_EQ(test_native_status_calls, 2);
+}
+
+UT_TEST(test_canonical_sample_reports_first_failed_predicate)
+{
+	ClusterRuntimeVisibilityOriginPlan plan;
+	ClusterRuntimeVisibilityCanonicalDiagnostic diagnostic;
+	ClusterTxResolution resolution;
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard data_guard;
+	ClusterUndoBlock0CurrentGuard tt_guard;
+	ClusterUndoBlock0ResolvedRoot data_root;
+	ClusterUndoBlock0ResolvedRoot tt_root;
+	ClusterUndoBlock0LogicalKey canonical_logical;
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&data_guard, 0, sizeof(data_guard));
+	memset(&tt_guard, 0, sizeof(tt_guard));
+	memset(&data_root, 0, sizeof(data_root));
+	data_root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	data_root.root_id = 91;
+	data_root.root_generation = 7;
+	memset(&tt_root, 0, sizeof(tt_root));
+	tt_root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	tt_root.root_id = 92;
+	tt_root.root_generation = 7;
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_data_held(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, NULL,
+		&data_guard, &data_root, &plan, &resolution, &reason),
+		CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL);
+	UT_ASSERT(cluster_runtime_visibility_origin_plan_canonical_logical(
+		&plan, &canonical_logical));
+	UT_ASSERT_EQ(canonical_logical.segment_id, TEST_TT_SEGMENT);
+	test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	UT_ASSERT(!cluster_runtime_visibility_origin_plan_sample_canonical_held(
+		&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &tt_guard, &tt_root,
+		&reason));
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+	memset(&diagnostic, 0xa5, sizeof(diagnostic));
+	UT_ASSERT(cluster_runtime_visibility_origin_plan_canonical_diagnostic(
+		&plan, &diagnostic));
+	UT_ASSERT(diagnostic.valid);
+	UT_ASSERT_EQ(diagnostic.first_failure,
+		CLUSTER_RUNTIME_VISIBILITY_CANONICAL_FAILURE_GENERATION_SAMPLE);
+	UT_ASSERT_EQ(diagnostic.generation_result,
+		CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	UT_ASSERT(!diagnostic.generation_known);
+	UT_ASSERT_EQ(diagnostic.locator_xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(diagnostic.locator_wrap, TEST_ORIGIN_WRAP);
+	UT_ASSERT_EQ(diagnostic.tt_slot_offset, TEST_TT_OFFSET);
+	UT_ASSERT_EQ(diagnostic.root_id, tt_root.root_id);
+	UT_ASSERT_EQ(diagnostic.root_generation, tt_root.root_generation);
+	UT_ASSERT(diagnostic.initial_admission_current);
+	UT_ASSERT_EQ(diagnostic.resident_copy_result, -1);
+	UT_ASSERT(!diagnostic.native_sampled);
+}
+
+UT_TEST(test_empty_physical_slot_remains_unknown_despite_current_allocator_owner)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterSemanticAdmissionToken admission;
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_candidate_copy_physical_slot = false;
+	test_current_owner_available = true;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+		&resolution, &reason), CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+	UT_ASSERT_EQ(test_native_status_calls, 0);
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 2);
+	UT_ASSERT_EQ(test_candidate_release_calls, 2);
+}
+
+UT_TEST(test_allocator_identity_never_overrides_empty_physical_slot)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason;
+	ClusterSemanticAdmissionToken admission;
+	int mismatch;
+
+	for (mismatch = 0; mismatch < 5; mismatch++) {
+		reset_exact_origin_fixture();
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		test_candidate_copy_physical_slot = false;
+		test_current_owner_available = true;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+		switch (mismatch) {
+			case 0:
+				test_current_owner.segment_id++;
+				break;
+			case 1:
+				test_current_owner.slot_offset++;
+				break;
+			case 2:
+				test_current_owner.xid++;
+				break;
+			case 3:
+				test_current_owner.wrap++;
+				break;
+			default:
+				test_current_owner.status = CTS_COMMITTED;
+				break;
+		}
+		memset(&admission, 0, sizeof(admission));
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = true;
+		memset(&resolution, 0xa5, sizeof(resolution));
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+			&resolution, &reason), CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(test_current_owner_calls, 0);
+		UT_ASSERT_EQ(test_native_status_calls, 0);
+	}
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_candidate_copy_physical_slot = false;
+	test_current_segment = TEST_TT_SEGMENT;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&resolution, 0xa5, sizeof(resolution));
+	reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+		&resolution, &reason), CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+	UT_ASSERT_EQ(test_native_status_calls, 0);
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_candidate_copy_physical_slot = false;
+	test_current_owner_available = true;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	test_twophase_prepared = true;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&resolution, 0xa5, sizeof(resolution));
+	reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+		&resolution, &reason), CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+	UT_ASSERT_EQ(test_native_status_calls, 0);
+	UT_ASSERT_EQ(test_twophase_calls, 0);
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_candidate_copy_physical_slot = false;
+	test_current_owner_available = true;
+	test_current_owner_drift_on_recheck = true;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&resolution, 0xa5, sizeof(resolution));
+	reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+		&resolution, &reason), CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+}
+
+UT_TEST(test_empty_physical_slot_remains_unknown_despite_rolled_live_xid)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterSemanticAdmissionToken admission;
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_candidate_copy_physical_slot = false;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+		&resolution, &reason), CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+	UT_ASSERT_EQ(test_current_segment_calls, 0);
+	UT_ASSERT_EQ(test_native_fence_lock_calls, 0);
+	UT_ASSERT_EQ(test_native_fence_unlock_calls, 0);
+	UT_ASSERT_EQ(test_native_fence_depth, 0);
+	UT_ASSERT_EQ(test_procarray_calls, 0);
+	UT_ASSERT_EQ(test_xact_lock_depth, 0);
+}
+
+UT_TEST(test_rolled_live_evidence_never_overrides_mismatched_physical_slot)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason;
+	ClusterSemanticAdmissionToken admission;
+	int physical_kind;
+
+	for (physical_kind = 0; physical_kind < 3; physical_kind++) {
+		reset_exact_origin_fixture();
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		test_tt_slot.xid = TEST_ORIGIN_XID + 1;
+		test_tt_slot.wrap = TEST_ORIGIN_WRAP + 1;
+		test_tt_slot.status = physical_kind == 0
+			? TT_SLOT_COMMITTED
+			: (physical_kind == 1 ? TT_SLOT_ABORTED : TT_SLOT_ACTIVE);
+		test_tt_slot.commit_scn = physical_kind == 0
+			? scn_encode(0, 79) : InvalidScn;
+		test_twophase_xid = TEST_ORIGIN_XID;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		memset(&admission, 0, sizeof(admission));
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = true;
+		memset(&resolution, 0xa5, sizeof(resolution));
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+			&resolution, &reason), CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+		UT_ASSERT_EQ(test_current_segment_calls, 0);
+		UT_ASSERT_EQ(test_procarray_calls, 0);
+	}
+}
+
+UT_TEST(test_empty_physical_slot_never_consults_rolled_native_axes)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason;
+	ClusterSemanticAdmissionToken admission;
+	int mismatch;
+
+	for (mismatch = 0; mismatch < 6; mismatch++) {
+		reset_exact_origin_fixture();
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		test_candidate_copy_physical_slot = false;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+		switch (mismatch) {
+		case 0:
+			test_current_segment = TEST_TT_SEGMENT;
+			break;
+		case 1:
+			test_no_raw_reuse_window = false;
+			break;
+		case 2:
+			test_xid_is_mine = false;
+			break;
+		case 3:
+			test_native_status = TRANSACTION_STATUS_COMMITTED;
+			break;
+		case 4:
+			test_procarray_live = false;
+			break;
+		default:
+			test_twophase_prepared = true;
+			break;
+		}
+		memset(&admission, 0, sizeof(admission));
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = true;
+		memset(&resolution, 0xa5, sizeof(resolution));
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+			&resolution, &reason), CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+		UT_ASSERT_EQ(test_current_segment_calls, 0);
+		UT_ASSERT_EQ(test_native_fence_lock_calls, 0);
+		UT_ASSERT_EQ(test_procarray_calls, 0);
+	}
+}
+
+UT_TEST(test_empty_physical_slot_cannot_reach_rolled_recheck)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason;
+	ClusterSemanticAdmissionToken admission;
+	int drift;
+
+	for (drift = 0; drift < 2; drift++) {
+		reset_exact_origin_fixture();
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		test_candidate_copy_physical_slot = false;
+		test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+		test_twophase_xid = TEST_ORIGIN_XID;
+		if (drift == 0)
+			test_current_segment_drift_on_recheck = true;
+		else
+			test_no_raw_reuse_drift_on_recheck = true;
+		memset(&admission, 0, sizeof(admission));
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = true;
+		memset(&resolution, 0xa5, sizeof(resolution));
+		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+		UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+			&resolution, &reason), CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+		UT_ASSERT_EQ(test_current_segment_calls, 0);
+		UT_ASSERT_EQ(test_native_fence_lock_calls, 0);
+		UT_ASSERT_EQ(test_procarray_calls, 0);
+	}
+}
+
+UT_TEST(test_terminal_census_never_projects_current_active_owner)
+{
+	ClusterTxResolution resolution;
+	ClusterTxResolution zero = { 0 };
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterSemanticAdmissionToken admission;
+
+	reset_exact_origin_fixture();
+	test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+	test_candidate_copy_physical_slot = false;
+	test_current_owner_available = true;
+	test_current_segment = TEST_TT_SEGMENT + 1;
+	test_no_raw_reuse_window = true;
+	test_procarray_live = true;
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&resolution, 0xa5, sizeof(resolution));
+
+	UT_ASSERT_EQ(cluster_runtime_visibility_resolve_exact_origin_admitted(
+		&test_origin_locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, &admission,
+		&resolution, &reason), CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE);
+	UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(resolution)), 0);
+	UT_ASSERT_EQ(test_current_owner_calls, 0);
+	UT_ASSERT_EQ(test_current_segment_calls, 0);
+	UT_ASSERT_EQ(test_native_fence_lock_calls, 0);
+	UT_ASSERT_EQ(test_procarray_calls, 0);
+	UT_ASSERT_EQ(test_native_status_calls, 0);
 }
 
 UT_TEST(test_terminal_census_rejects_precommit_committed_slot_with_live_origin)
@@ -1626,7 +2534,7 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 int
 main(void)
 {
-	UT_PLAN(74);
+	UT_PLAN(88);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -1668,11 +2576,25 @@ main(void)
 	RUN_PAIR_TEST(38);
 	RUN_PAIR_TEST(39);
 	UT_RUN(test_out_of_domain_values_fail_closed);
+	UT_RUN(test_current_member_target_canonical_active_requires_exact_physical_slot);
+	UT_RUN(test_current_member_rolled_terminal_uses_locator_then_canonical_scur);
+	UT_RUN(test_current_member_terminal_on_current_segment_survives_retired_owner_index);
+	UT_RUN(test_current_member_active_on_current_segment_requires_live_owner_index);
 	UT_RUN(test_exact_origin_committed_uses_canonical_tt_identity_and_direct_clog);
 	UT_RUN(test_terminal_census_local_origin_uses_resident_candidate2_and_canonical_upgrade);
+	UT_RUN(test_terminal_census_nonresident_cleanout_uses_exact_local_c1b_pair);
+	UT_RUN(test_terminal_census_retained_pair_negative_matrix_fails_closed);
 	UT_RUN(test_terminal_census_same_owner_cross_segment_is_sequential_and_exact);
 	UT_RUN(test_visibility_same_owner_cross_segment_is_sequential_and_exact);
 	UT_RUN(test_visibility_precommit_committed_slot_with_live_origin_stays_in_progress);
+	UT_RUN(test_canonical_sample_reports_first_failed_predicate);
+	UT_RUN(test_empty_physical_slot_remains_unknown_despite_current_allocator_owner);
+	UT_RUN(test_allocator_identity_never_overrides_empty_physical_slot);
+	UT_RUN(test_empty_physical_slot_remains_unknown_despite_rolled_live_xid);
+	UT_RUN(test_rolled_live_evidence_never_overrides_mismatched_physical_slot);
+	UT_RUN(test_empty_physical_slot_never_consults_rolled_native_axes);
+	UT_RUN(test_empty_physical_slot_cannot_reach_rolled_recheck);
+	UT_RUN(test_terminal_census_never_projects_current_active_owner);
 	UT_RUN(test_terminal_census_rejects_precommit_committed_slot_with_live_origin);
 	UT_RUN(test_terminal_census_cross_segment_data_drift_fails_closed);
 	UT_RUN(test_terminal_census_cross_owner_tt_alias_fails_closed);

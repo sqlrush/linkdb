@@ -2211,157 +2211,6 @@ typedef enum LmsOwnXidReason {
 	LMS_OWN_XID_REFUSE_INVALID_SCN	/* delayed-cleanout, not provably aborted */
 } LmsOwnXidReason;
 
-/*
- * The DATA undo record can live in a later segment than its canonical TT
- * slot.  cluster_tt_local publishes an exact status-overlay alias for that
- * DATA segment at first mutation and updates the same alias on commit/abort.
- * Consult only that request-derived full key: selecting the allocator's
- * current segment would lose an older live owner after allocator rollover.
- */
-static bool
-lms_own_xid_status_alias_lookup_exact(const ClusterTTStatusKey *key,
-									  ClusterTTStatusResult *result)
-{
-	ClusterTTStatusSourceRequest source_request;
-	ClusterTTStatusSourceResult source_result;
-
-	if (key == NULL || result == NULL)
-		return false;
-	memset(&source_request, 0, sizeof(source_request));
-	memset(&source_result, 0, sizeof(source_result));
-	source_request.key = key;
-	if (cluster_tt_status_source_dispatch(
-			CLUSTER_TT_SOURCE_LOOKUP, &source_request, &source_result)
-			!= CLUSTER_SEMANTIC_ADMISSION_OK
-		|| !source_result.bool_value)
-		return false;
-	*result = source_result.lookup;
-	return true;
-}
-
-static bool
-lms_own_xid_status_alias_is_active(const ClusterTTStatusResult *result,
-									   uint32 expected_epoch)
-{
-	ClusterTTStatusKey zero_parent;
-
-	if (result == NULL)
-		return false;
-	memset(&zero_parent, 0, sizeof(zero_parent));
-	return result->authoritative
-		   && result->status == CLUSTER_TT_STATUS_IN_PROGRESS
-		   && result->commit_scn == InvalidScn
-		   && result->status_epoch == expected_epoch
-		   && !result->has_parent_key
-		   && memcmp(&result->parent_key, &zero_parent, sizeof(zero_parent)) == 0;
-}
-
-static bool
-lms_own_xid_status_alias_same(const ClusterTTStatusResult *a,
-								  const ClusterTTStatusResult *b)
-{
-	return a != NULL && b != NULL
-		   && a->status == b->status
-		   && a->commit_scn == b->commit_scn
-		   && a->status_epoch == b->status_epoch
-		   && a->authoritative == b->authoritative
-		   && a->has_parent_key == b->has_parent_key
-		   && memcmp(&a->parent_key, &b->parent_key,
-					 sizeof(a->parent_key)) == 0;
-}
-
-/*
- * Close the precommit interval in which the page already carries
- * NEEDS_CLEANOUT but the durable committed-only TT scan is still a
- * zero-match.  The status overlay is existing process-shared authority, not
- * a new cache: require an exact request-derived DATA alias twice, with a
- * literal IN_PROGRESS CLOG byte and a live ProcArray owner between them.
- * The native-prehistory reader fence continuously prevents raw-xid reuse.
- */
-static bool
-lms_own_xid_zero_match_active_alias_exact(
-	TransactionId xid, uint32 expected_segment_id,
-	uint32 expected_tt_slot_id)
-{
-	volatile bool exact_live = false;
-
-	if (!TransactionIdIsNormal(xid) || expected_segment_id == 0
-		|| expected_segment_id > UINT16_MAX || expected_tt_slot_id < 1
-		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT)
-		return false;
-
-	PG_TRY(active_alias_window);
-	{
-		ClusterTTStatusKey key;
-		ClusterTTStatusResult initial_result;
-		ClusterTTStatusResult confirm_result;
-		uint64 sampled_epoch;
-		bool no_raw_reuse_window;
-		bool xid_is_mine;
-
-		memset(&key, 0, sizeof(key));
-		memset(&initial_result, 0, sizeof(initial_result));
-		memset(&confirm_result, 0, sizeof(confirm_result));
-		cluster_cr_native_prehistory_reader_lock();
-		no_raw_reuse_window = !cluster_cr_native_prehistory_disabled();
-		xid_is_mine = no_raw_reuse_window && cluster_xid_is_mine(xid);
-		sampled_epoch = cluster_epoch_get_current();
-
-		if (xid_is_mine && cluster_node_id >= 0
-			&& cluster_node_id < CLUSTER_MAX_NODES
-			&& sampled_epoch <= UINT32_MAX) {
-			bool clog_is_in_progress = false;
-			bool xid_is_in_progress = false;
-
-			key.origin_node_id = (uint16)cluster_node_id;
-			key.undo_segment_id = (uint16)expected_segment_id;
-			key.tt_slot_id = expected_tt_slot_id;
-			key.cluster_epoch = (uint32)sampled_epoch;
-			key.local_xid = xid;
-
-			if (lms_own_xid_status_alias_lookup_exact(&key, &initial_result)
-				&& lms_own_xid_status_alias_is_active(
-					&initial_result, (uint32)sampled_epoch)) {
-				LWLockAcquire(XactTruncationLock, LW_SHARED);
-				if (!TransactionIdPrecedes(
-						xid, ShmemVariableCache->oldestClogXid)) {
-					XLogRecPtr clog_lsn = InvalidXLogRecPtr;
-
-					clog_is_in_progress
-						= TransactionIdGetStatus(xid, &clog_lsn)
-						  == TRANSACTION_STATUS_IN_PROGRESS;
-				}
-				LWLockRelease(XactTruncationLock);
-
-				if (clog_is_in_progress)
-					xid_is_in_progress = TransactionIdIsInProgress(xid);
-				if (xid_is_in_progress
-					&& cluster_epoch_get_current() == sampled_epoch
-					&& lms_own_xid_status_alias_lookup_exact(
-						&key, &confirm_result)
-					&& lms_own_xid_status_alias_is_active(
-						&confirm_result, (uint32)sampled_epoch)
-					&& lms_own_xid_status_alias_same(
-						&initial_result, &confirm_result))
-					exact_live = true;
-			}
-		}
-		cluster_cr_native_prehistory_reader_unlock();
-	}
-	PG_CATCH(active_alias_window);
-	{
-		/* The dispatch/CLOG/ProcArray stack can ERROR with internal LWLocks
-		 * held.  Release the complete reader window before rethrowing. */
-		HOLD_INTERRUPTS();
-		LWLockReleaseAll();
-		RESUME_INTERRUPTS();
-		PG_RE_THROW();
-	}
-	PG_END_TRY(active_alias_window);
-
-	return exact_live;
-}
-
 /* S8-815PRE-FRESHREF-C1B-01: exact retained-page pairing.  The native
  * prehistory reader fence continuously covers the complete durable scan,
  * literal CLOG C1b sample and (for a zero-match) frozen retention horizon.
@@ -2465,6 +2314,35 @@ lms_resolve_own_xid_freshref_c1b_pair(
 	*out_commit_scn = proposed_scn;
 	*out_wrap = resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN ? matched_wrap : 0;
 	return LMS_OWN_XID_PROVEN;
+}
+
+/* Backend-local consumer of the same origin C1b pair used by the LMS wire
+ * handler.  It publishes no authority or cache entry: callers receive only
+ * the exact COMMITTED conjunction, with the retained SCN remaining the
+ * proposed value. */
+bool
+cluster_cr_server_local_freshref_c1b_pair_exact(
+	TransactionId xid, uint32 expected_segment_id,
+	uint32 expected_tt_slot_id, SCN proposed_scn, uint16 *out_wrap)
+{
+	LmsOwnXidReason reason;
+	uint8 verdict = 0;
+	SCN commit_scn = InvalidScn;
+	SCN horizon_scn = InvalidScn;
+	uint16 wrap = 0;
+
+	if (out_wrap != NULL)
+		*out_wrap = 0;
+	reason = lms_resolve_own_xid_freshref_c1b_pair(
+		xid, expected_segment_id, expected_tt_slot_id, proposed_scn,
+		&verdict, &commit_scn, &horizon_scn, &wrap);
+	if (reason != LMS_OWN_XID_PROVEN
+		|| verdict != (uint8) CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT
+		|| commit_scn != proposed_scn || SCN_VALID(horizon_scn))
+		return false;
+	if (out_wrap != NULL)
+		*out_wrap = wrap;
+	return true;
 }
 
 static LmsOwnXidReason
@@ -2635,12 +2513,6 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		 * a gone ProcArray entry, truncation and every other sampled doubt refuse
 		 * before that branch can reinterpret the CLOG byte.
 		 */
-		if (allow_live
-			&& lms_own_xid_zero_match_active_alias_exact(
-				xid, expected_segment_id, expected_tt_slot_id)) {
-			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS;
-			return LMS_OWN_XID_PROVEN_IN_PROGRESS;
-		}
 		if (allow_live && expected_segment_id > 0 && expected_segment_id <= UINT16_MAX
 			&& expected_tt_slot_id >= 1 && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT
 			&& cluster_cr_native_prehistory_covered_hw() != 0) {
@@ -3630,8 +3502,8 @@ cr_current_mx_build_describe_page(
 	return result;
 }
 
-static ClusterMxResolveResult
-cr_current_mx_build_proof_page(
+ClusterMxResolveResult
+cluster_cr_server_current_mx_build_proof_page(
 	uint16 source_node_id, const ClusterCurrentMxProofForwardV2 *request,
 	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
@@ -3715,7 +3587,7 @@ cluster_cr_server_test_current_mx_build_proof_page(
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	ClusterCurrentMxProofReplyPage *page)
 {
-	return cr_current_mx_build_proof_page(
+	return cluster_cr_server_current_mx_build_proof_page(
 		source_node_id, request, result, proofs, proof_count,
 		updater_proof, page);
 }
@@ -3829,138 +3701,20 @@ cluster_gcs_current_mx_describe_serve_inline(
 	MemoryContextReset(CrServeScratchCtx);
 }
 
-static bool
-cr_current_mx_source_exact_lookup(
-	const ClusterTTStatusKey *key, ClusterTTStatusResult *result,
-	void *arg)
-{
-	ClusterTTStatusSourceRequest source_request;
-	ClusterTTStatusSourceResult source_result;
-
-	(void)arg;
-	if (key == NULL || result == NULL)
-		return false;
-	memset(&source_request, 0, sizeof(source_request));
-	memset(&source_result, 0, sizeof(source_result));
-	source_request.key = key;
-	if (cluster_tt_status_source_dispatch(
-			CLUSTER_TT_SOURCE_LOOKUP, &source_request, &source_result)
-			!= CLUSTER_SEMANTIC_ADMISSION_OK
-		|| !source_result.bool_value)
-		return false;
-	*result = source_result.lookup;
-	return true;
-}
-
-static bool
-cr_current_mx_source_lookup_current_own_xid(
-	TransactionId xid, ClusterTTStatusKey *key,
-	ClusterTTStatusResult *result)
-{
-	ClusterTTStatusSourceRequest source_request;
-	ClusterTTStatusSourceResult source_result;
-
-	if (key == NULL || result == NULL)
-		return false;
-	memset(&source_request, 0, sizeof(source_request));
-	memset(&source_result, 0, sizeof(source_result));
-	source_request.xid = xid;
-	if (cluster_tt_status_source_dispatch(
-			CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID,
-			&source_request, &source_result)
-			!= CLUSTER_SEMANTIC_ADMISSION_OK
-		|| !source_result.bool_value)
-		return false;
-	*key = source_result.current_key;
-	*result = source_result.lookup;
-	return true;
-}
-
-typedef enum CrCurrentMxMemberProofStage {
-	CR_CURRENT_MX_MEMBER_PROOF_OK = 0,
-	CR_CURRENT_MX_MEMBER_PROOF_OWN_XID_LOOKUP = 1,
-	CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE = 2
-} CrCurrentMxMemberProofStage;
-
-static CrCurrentMxMemberProofStage
-cr_current_mx_member_proof_one(
-	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
-	uint32 current_epoch, ClusterCurrentMemberProof *proof)
-{
-	ClusterTTStatusKey initial_key;
-	ClusterTTStatusResult initial_result;
-
-	if (proof == NULL)
-		return CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE;
-	memset(proof, 0, sizeof(*proof));
-	proof->state = CCM_UNKNOWN;
-	if (!cr_current_mx_source_lookup_current_own_xid(
-			member_xid, &initial_key, &initial_result))
-		return CR_CURRENT_MX_MEMBER_PROOF_OWN_XID_LOOKUP;
-	if (!cluster_multixact_current_resolve_origin_member_proof(
-			member_xid, member_status, member_ordinal,
-			(uint16)cluster_node_id, current_epoch, false,
-			&initial_key, &initial_result,
-			cr_current_mx_source_exact_lookup, NULL, proof))
-		return CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE;
-	return CR_CURRENT_MX_MEMBER_PROOF_OK;
-}
-
-#ifndef USE_CLUSTER_UNIT
-static void
-cr_current_mx_log_member_proof_failure_once(
-	CrCurrentMxMemberProofStage stage,
-	const ClusterCurrentMxProofForwardV2 *request,
-	const ClusterCurrentMxProofAskWire *ask)
-{
-	static bool logged[CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE + 1];
-	const char *stage_name;
-
-	if (stage <= CR_CURRENT_MX_MEMBER_PROOF_OK
-		|| stage > CR_CURRENT_MX_MEMBER_PROOF_ORIGIN_RESOLVE
-		|| request == NULL || ask == NULL || logged[stage])
-		return;
-	logged[stage] = true;
-	stage_name = stage == CR_CURRENT_MX_MEMBER_PROOF_OWN_XID_LOOKUP
-		? "OWN_XID_LOOKUP" : "ORIGIN_RESOLVE";
-	ereport(LOG,
-			(errmsg_internal(
-				"current MultiXact member proof unresolved: stage=%s request_id=" UINT64_FORMAT " mxid=%u epoch=%u requester=%u backend=%u chunk=%u member_ordinal=%u member_xid=%u member_status=%u",
-				stage_name, request->prefix.request_id,
-				request->prefix.mxkey.multixact_id,
-				request->prefix.mxkey.cluster_epoch,
-				request->prefix.original_requester_node,
-				request->prefix.requester_backend_id,
-				request->prefix.chunk_ordinal, ask->member_ordinal,
-				ask->xid, ask->member_status)));
-}
-#else
-int
-cluster_cr_server_test_current_mx_member_proof_one(
-	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
-	uint32 current_epoch, ClusterCurrentMemberProof *proof)
-{
-	return (int)cr_current_mx_member_proof_one(
-		member_xid, member_status, member_ordinal, current_epoch, proof);
-}
-#endif
-
-/* Spec-3.6b: a member-XID origin proves only its own current TT binding.
- * Parent following is exact-key only; every uncertainty remains a typed
- * UNKNOWN/DENIED reply, and publication is capability-generation bound. */
+/* Positive current-member authority is staged by the
+ * bounded TARGET canonical-TT resolver in cluster_gcs_block.c.  This inline
+ * entry is now only the fail-closed fallback for a request that could not be
+ * admitted to that existing event-loop context; it never consults SOURCE or
+ * synthesizes a positive proof. */
 void
 cluster_gcs_current_mx_member_proof_serve_inline(
 	const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterCurrentMxProofForwardV2 request;
-	ClusterCurrentMemberProof proofs
-		[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
-	ClusterCurrentUpdaterProof updater_proof;
 	ClusterMxResolveResult proof_result = CMX_RESOLVE_UNKNOWN;
 	BufferTag route_tag;
 	int recv_worker;
 	int expected_worker;
-	uint16 proof_count = 0;
 	uint32 capability_generation = 0;
 	uint32 reply_total
 		= (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
@@ -3992,94 +3746,20 @@ cluster_gcs_current_mx_member_proof_serve_inline(
 	reply = (char *)palloc0(reply_total);
 	outer = (GcsBlockReplyHeader *)reply;
 	page = (ClusterCurrentMxProofReplyPage *)(reply + sizeof(*outer));
-	memset(proofs, 0, sizeof(proofs));
-	memset(&updater_proof, 0, sizeof(updater_proof));
-	updater_proof.verdict = CUCP_UNKNOWN;
-
-	if (!cluster_write_fence_enforcing()
-		|| cluster_write_fence_allowed()) {
-		PG_TRY();
-		{
-			uint8 i;
-
-			if (request.prefix.body_kind
-					== CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS) {
-				proof_result = CMX_RESOLVE_OK;
-				for (i = 0; i < request.prefix.entry_count; i++) {
-					const ClusterCurrentMxProofAskWire *ask
-						= &request.trailer.body.asks[i];
-					CrCurrentMxMemberProofStage member_stage;
-
-					member_stage = cr_current_mx_member_proof_one(
-						ask->xid, ask->member_status, ask->member_ordinal,
-						request.prefix.mxkey.cluster_epoch, &proofs[i]);
-					if (member_stage != CR_CURRENT_MX_MEMBER_PROOF_OK) {
-					#ifndef USE_CLUSTER_UNIT
-						cr_current_mx_log_member_proof_failure_once(
-							member_stage, &request, ask);
-					#endif
-						proof_result = CMX_RESOLVE_UNKNOWN;
-						break;
-					}
-				}
-				if (proof_result == CMX_RESOLVE_OK)
-					proof_count = request.prefix.entry_count;
-			} else {
-				const ClusterCurrentMxUpdaterChallengeWire *challenge
-					= &request.trailer.body.updater.challenge;
-				ClusterTTStatusKey initial_key;
-				ClusterTTStatusResult initial_result;
-				ClusterUpdaterCandidateVerdict candidate_verdict;
-
-				candidate_verdict
-					= cluster_multixact_current_updater_candidate_verdict(
-						&challenge->candidate_next_xmin_key,
-						challenge->updater_xid,
-						(uint16)cluster_node_id,
-						request.prefix.mxkey.cluster_epoch,
-						&initial_key, &initial_result);
-				if (candidate_verdict != CUCP_UNKNOWN
-					&& cluster_multixact_current_resolve_origin_member_proof(
-						challenge->updater_xid,
-						challenge->member_status,
-						challenge->member_ordinal,
-						(uint16)cluster_node_id,
-						request.prefix.mxkey.cluster_epoch, false,
-						&initial_key, &initial_result,
-						cr_current_mx_source_exact_lookup, NULL,
-						&proofs[0])) {
-					updater_proof.mxkey = request.prefix.mxkey;
-					updater_proof.candidate_next_xmin_key
-						= challenge->candidate_next_xmin_key;
-					updater_proof.updater_xid = challenge->updater_xid;
-					updater_proof.member_ordinal
-						= challenge->member_ordinal;
-					updater_proof.verdict = candidate_verdict;
-					proof_count = 1;
-					proof_result = CMX_RESOLVE_OK;
-				}
-			}
-		}
-		PG_CATCH();
-		{
-			proof_result = CMX_RESOLVE_DENIED;
-			MemoryContextSwitchTo(cr_serve_scratch_context());
-			FlushErrorState();
-		}
-		PG_END_TRY();
-	} else
+	if (cluster_write_fence_enforcing()
+		&& !cluster_write_fence_allowed())
 		proof_result = CMX_RESOLVE_DENIED;
 
 	if (cluster_epoch_get_current() != request.prefix.epoch
 		|| (cluster_write_fence_enforcing()
 			&& !cluster_write_fence_allowed()))
 		proof_result = CMX_RESOLVE_DENIED;
-	if (cr_current_mx_build_proof_page(
-			(uint16)cluster_node_id, &request, proof_result, proofs,
-			proof_count, &updater_proof, page)
+	if (cluster_cr_server_current_mx_build_proof_page(
+			(uint16)cluster_node_id, &request, proof_result, NULL,
+			0, NULL, page)
 		!= proof_result) {
 		proof_result = CMX_RESOLVE_UNKNOWN;
-		(void)cr_current_mx_build_proof_page(
+		(void)cluster_cr_server_current_mx_build_proof_page(
 			(uint16)cluster_node_id, &request, proof_result, NULL, 0,
 			NULL, page);
 	}

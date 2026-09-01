@@ -222,17 +222,25 @@ extern void cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instanc
  */
 extern uint32 cluster_undo_active_segment_for_node_or_create(int node_id);
 
+typedef struct ClusterUndoSegmentExtendPlan {
+	uint32 segment_id;
+	uint32 generation;
+	bool needs_reuse;
+	bool at_hard_cap;
+	uint8 reserved[6];
+} ClusterUndoSegmentExtendPlan;
+
+StaticAssertDecl(sizeof(ClusterUndoSegmentExtendPlan) == 16,
+				 "undo segment extend plan must remain stack-only and fixed-size");
+
 /*
- * spec-3.8 D2:  autoextend lazy at exhaustion.
- *
- *	Allocates the next free segment slot for owner_instance.  Returns
- *	NEW segment_id on success;  0 on failure.  Sets *out_at_hard_cap
- *	when no free slot remains (pool exhausted within encoding limit).
- *
- *	Caller MUST hold lifecycle_lock (NOT cursor_lock) per spec §3.2.
- *	NOT critical-section safe (does file I/O + fsync).
+ * Choose one fresh/available segment or
+ * freeze an exact RECYCLABLE candidate.  The selector never performs the
+ * generation-changing reuse transition; callers release lifecycle_lock and
+ * run cluster_undo_segment_reuse_in_place() through 0xFB current authority.
  */
-extern uint32 cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_cap);
+extern bool cluster_undo_segment_extend_or_create(
+	uint8 owner_instance, ClusterUndoSegmentExtendPlan *plan);
 
 
 /*
@@ -283,13 +291,14 @@ typedef enum ClusterUndoSegTryRecycle {
 											* longer covers the cluster) */
 } ClusterUndoSegTryRecycle;
 
-/* Caller holds undo lifecycle_lock and excluded the active record segment. */
+/* Caller holds no lifecycle/content lock; expected_epoch binds the folded floor. */
 extern ClusterUndoSegTryRecycle
-cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance, SCN horizon);
+cluster_undo_segment_try_mark_recyclable(uint32 segment_id,
+	uint8 owner_instance, SCN horizon, uint64 expected_epoch);
 
-/* spec-3.13 D4: in-place rebirth of a RECYCLABLE segment (caller holds lifecycle_lock). */
+/* spec-3.13 D4: exact in-place rebirth; caller holds no lifecycle/content lock. */
 extern uint32 cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance,
-												  uint32 old_generation);
+											  uint32 old_generation);
 
 /* spec-3.13 D4: durable segment generation (== header wrap_count; 0 = unknown). */
 extern uint32 cluster_undo_segment_generation(uint32 segment_id, uint8 owner_instance);

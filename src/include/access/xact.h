@@ -377,21 +377,28 @@ typedef struct xl_xact_scn
  * (PREPARE / COMMIT PREPARED) keeps the standalone 0x30 -- a prepared xact's
  * TT durability is not in a normal commit record.
  */
+#define CLUSTER_XACT_TT_COMMIT_VERSION ((uint8)1)
+
 typedef struct xl_xact_tt_commit
 {
 	uint32		segment_id;
+	uint32		segment_generation;
+	TransactionId xid;			/* exact canonical ACTIVE owner */
 	uint16		slot_offset;
 	uint16		wrap;
-	TransactionId xid;			/* slot owner xid; always == the committing xid (non-prepared) */
 	uint8		instance;		/* owner instance (1..128) for path resolution */
-	uint8		_pad[3];
+	uint8		format_version;
+	uint16		flags;
+	uint32		reserved;
 	SCN			commit_scn;
 } xl_xact_tt_commit;
 
-StaticAssertDecl(sizeof(xl_xact_tt_commit) == 24,
-				 "xl_xact_tt_commit must be 24 bytes — mirrors xl_undo_tt_slot_commit (D4.1)");
-StaticAssertDecl(offsetof(xl_xact_tt_commit, commit_scn) == 16,
-				 "xl_xact_tt_commit.commit_scn must be at offset 16 (SCN 8-byte alignment; D4.1)");
+StaticAssertDecl(sizeof(xl_xact_tt_commit) == 32,
+				 "xl_xact_tt_commit v1 must be exactly 32 bytes");
+StaticAssertDecl(offsetof(xl_xact_tt_commit, segment_generation) == 4,
+				 "xl_xact_tt_commit segment generation must be at offset 4");
+StaticAssertDecl(offsetof(xl_xact_tt_commit, commit_scn) == 24,
+				 "xl_xact_tt_commit.commit_scn must be at offset 24");
 
 typedef struct xl_xact_commit
 {

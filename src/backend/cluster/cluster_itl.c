@@ -545,6 +545,36 @@ itl_require_block_x_for_write(Buffer buf)
 								"still has an uncommitted ITL slot; retry the transaction.")));
 }
 
+
+bool
+cluster_itl_has_allocatable_slot(Buffer buf, TransactionId top_xid,
+								 bool lock_only)
+{
+	Page page;
+	const ClusterItlSlotData *slots;
+	uint8 i;
+
+	Assert(BufferIsValid(buf));
+	Assert(TransactionIdIsValid(top_xid));
+	page = BufferGetPage(buf);
+	if (!PageHasItl(page))
+		return false;
+	itl_require_block_x_for_write(buf);
+	slots = ClusterPageGetItlSlots(page);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if ((!lock_only && slots[i].flags == ITL_FLAG_ACTIVE
+			 && slots[i].xid == top_xid)
+			|| (lock_only
+				&& slots[i].flags == ITL_FLAG_LOCK_ONLY_ACTIVE
+				&& slots[i].xid == top_xid)
+			|| slots[i].flags == ITL_FLAG_FREE
+			|| (cluster_itl_slot_is_completed_reusable(slots[i].flags)
+				&& !cluster_itl_slot_is_protected_foreign(&slots[i])))
+			return true;
+	}
+	return false;
+}
+
 bool
 cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_slot_idx)
 {

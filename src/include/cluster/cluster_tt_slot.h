@@ -354,6 +354,9 @@ extern uint16 cluster_tt_slot_alloc(uint32 segment_id, TransactionId top_xid);
  */
 extern uint16 cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid,
 										bool *out_retained_pressure);
+extern uint16 cluster_tt_slot_alloc_current_exact(
+	int node_id, uint32 expected_segment_id, TransactionId top_xid,
+	bool *out_retained_pressure, bool *out_current_drift, uint16 *out_wrap);
 extern void cluster_tt_slot_free(uint32 segment_id, uint16 slot_offset);
 extern uint16 cluster_tt_slot_get_wrap(uint32 segment_id, uint16 slot_offset);
 

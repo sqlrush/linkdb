@@ -586,11 +586,103 @@ read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *bloc
 }
 
 
-static bool
-write_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, const char *blockbuf)
+typedef enum ClusterUndoLifecycleMutationKind
 {
-	return cluster_undo_smgr_write_block(cluster_undo_intent_for_owner(owner_instance), segment_id,
-										 owner_instance, 0, blockbuf, true);
+	CLUSTER_UNDO_LIFECYCLE_MARK_ACTIVE = 1,
+	CLUSTER_UNDO_LIFECYCLE_MARK_COMMITTED,
+	CLUSTER_UNDO_LIFECYCLE_MARK_FULL,
+	CLUSTER_UNDO_LIFECYCLE_INIT_TAIL,
+	CLUSTER_UNDO_LIFECYCLE_MARK_BLOCK,
+	CLUSTER_UNDO_LIFECYCLE_CLAIM_RANGE
+} ClusterUndoLifecycleMutationKind;
+
+/* Freeze one legal monotonic lifecycle successor, then let the sole live
+ * block-zero current/content-X owner compare and publish it.  This function
+ * may wait for 0xFB and therefore must run without lifecycle/content locks. */
+static bool
+cluster_undo_block0_current_live_owner_lifecycle_exact(
+	uint32 segment_id, uint8 owner_instance,
+	ClusterUndoLifecycleMutationKind kind, uint32 arg1, uint32 arg2)
+{
+	PGAlignedBlock predecessor;
+	PGAlignedBlock successor;
+	UndoSegmentHeaderData *before;
+	UndoSegmentHeaderData *after;
+	ClusterUndoBlock0LogicalKey key;
+	ClusterUndoBlock0Generation expected;
+	uint64 last;
+	uint32 block;
+
+	if (!read_segment_header_via_smgr(segment_id, owner_instance,
+			predecessor.data, &before)
+		|| !cluster_undo_segment_header_identity_ok(predecessor.data,
+			segment_id, owner_instance)
+		|| before->wrap_count == UINT32_MAX)
+		return false;
+	memcpy(successor.data, predecessor.data, BLCKSZ);
+	after = (UndoSegmentHeaderData *)successor.data;
+
+	switch (kind) {
+	case CLUSTER_UNDO_LIFECYCLE_MARK_ACTIVE:
+		if (!UndoSegmentState_can_become_active(before->segment_state))
+			return false;
+		after->segment_state = SEGMENT_ACTIVE;
+		break;
+	case CLUSTER_UNDO_LIFECYCLE_MARK_COMMITTED:
+		if (before->segment_state != SEGMENT_ACTIVE
+			&& before->segment_state != SEGMENT_COMMITTED)
+			return false;
+		after->segment_state = SEGMENT_COMMITTED;
+		break;
+	case CLUSTER_UNDO_LIFECYCLE_MARK_FULL:
+		if (before->segment_state != SEGMENT_ACTIVE)
+			return false;
+		after->segment_flags |= UNDO_SEGMENT_FLAG_FULL;
+		break;
+	case CLUSTER_UNDO_LIFECYCLE_INIT_TAIL:
+		if (before->segment_state != SEGMENT_ACTIVE || arg1 != 1
+			|| (before->tail_block != 0 && before->tail_block != arg1))
+			return false;
+		after->tail_block = arg1;
+		break;
+	case CLUSTER_UNDO_LIFECYCLE_MARK_BLOCK:
+		if (before->segment_state != SEGMENT_ACTIVE
+			|| arg1 >= UNDO_BLOCKS_PER_SEGMENT)
+			return false;
+		(void)UndoSegmentBitmap_mark_used(after->free_block_bitmap, arg1);
+		break;
+	case CLUSTER_UNDO_LIFECYCLE_CLAIM_RANGE:
+		last = (uint64)arg1 + arg2;
+		if (before->segment_state != SEGMENT_ACTIVE || arg1 < 1
+			|| arg2 == 0 || last > UNDO_BLOCKS_PER_SEGMENT)
+			return false;
+		/* An extent claim is intentionally not idempotent: accepting an
+		 * already-used bit could hand the same extent to two local writers. */
+		for (block = arg1; block < (uint32)last; block++) {
+			uint32 byte_idx = block / 8;
+			uint8 bit_mask = (uint8)(1u << (block % 8));
+
+			if ((before->free_block_bitmap[byte_idx] & bit_mask) != 0)
+				return false;
+		}
+		if (!UndoSegmentBitmap_mark_range_used(after->free_block_bitmap,
+				arg1, arg2, UNDO_BLOCKS_PER_SEGMENT))
+			return false;
+		break;
+	default:
+		return false;
+	}
+
+	key.segment_id = segment_id;
+	key.owner_instance = owner_instance;
+	expected.known = true;
+	expected.value = before->wrap_count;
+	if (cluster_undo_block0_current_live_owner_ensure_resident(
+			&key, 10000) != CLUSTER_UNDO_BLOCK0_OK)
+		return false;
+	return cluster_undo_block0_current_live_owner_mutate_exact(
+		&key, &expected, predecessor.data, successor.data, 10000)
+		== CLUSTER_UNDO_BLOCK0_OK;
 }
 
 
@@ -604,21 +696,9 @@ write_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, const cha
 bool
 cluster_undo_segment_mark_active(uint32 segment_id, uint8 owner_instance)
 {
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
-		return false;
-
-	/* Pure-kernel invariant check (covered by cluster_unit T11). */
-	if (!UndoSegmentState_can_become_active(hdr->segment_state))
-		return false;
-
-	if (hdr->segment_state == SEGMENT_ACTIVE)
-		return true; /* idempotent — already ACTIVE */
-
-	hdr->segment_state = SEGMENT_ACTIVE;
-	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
+	return cluster_undo_block0_current_live_owner_lifecycle_exact(
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_ACTIVE,
+		0, 0);
 }
 
 
@@ -637,80 +717,60 @@ cluster_undo_segment_mark_active(uint32 segment_id, uint8 owner_instance)
 bool
 cluster_undo_segment_mark_committed(uint32 segment_id, uint8 owner_instance)
 {
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
-		return false;
-
-	if (hdr->segment_state == SEGMENT_COMMITTED)
-		return true; /* idempotent */
-	if (hdr->segment_state != SEGMENT_ACTIVE)
-		return false; /* only ACTIVE -> COMMITTED (caller decides eligibility) */
-
-	hdr->segment_state = SEGMENT_COMMITTED;
-	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
+	return cluster_undo_block0_current_live_owner_lifecycle_exact(
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_COMMITTED,
+		0, 0);
 }
 
 
 /*
  * cluster_undo_segment_try_mark_recyclable -- spec-3.13 D3.
  *
- *	COMMITTED -> RECYCLABLE under the shipped 3.12 predicate
- *	(cluster_undo_segment_recyclable: watermark strictly below horizon,
- *	unresolved committed slot retains).  Durability order is the v0.3 (1)
- *	three-step contract for direct pg_undo metadata:
- *	  XLOG_UNDO_SEGMENT_RECYCLE insert -> XLogFlush -> pwrite block 0 ->
- *	  fsync segment file.
- *	Caller holds the undo lifecycle_lock (serializes against rollover /
- *	extend / future reuse claim) and has already excluded the active
- *	record segment.  No ereport on the WRITE_FAIL path: the cleaner is
- *	best-effort and retries next pass (observability lands in step 8).
+ *	COMMITTED -> RECYCLABLE through the generation-independent 0xFB XCUR and
+ *	exact resident content-X owner.  The folded horizon remains bound to the
+ *	caller's expected epoch; no lifecycle/content lock may be held here.
  */
 ClusterUndoSegTryRecycle
-cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance, SCN horizon)
+cluster_undo_segment_try_mark_recyclable(uint32 segment_id,
+	uint8 owner_instance, SCN horizon, uint64 expected_epoch)
 {
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-	XLogRecPtr lsn;
+	ClusterUndoBlock0LogicalKey key;
+	ClusterUndoBlock0RecycleResult result;
 
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
+	if (segment_id == 0 || owner_instance < 1
+		|| owner_instance > UNDO_OWNER_INSTANCE_MAX
+		|| !SCN_VALID(horizon) || expected_epoch == 0)
 		return CLUSTER_SEG_RECYCLE_READ_FAIL;
-	if (!cluster_undo_segment_header_identity_ok(blockbuf.data, segment_id, owner_instance))
-		return CLUSTER_SEG_RECYCLE_READ_FAIL; /* L212: identity, not template bytes */
-
-	if (hdr->segment_state == SEGMENT_RECYCLABLE)
-		return CLUSTER_SEG_RECYCLE_ALREADY; /* idempotent */
-	if (hdr->segment_state != SEGMENT_COMMITTED)
+	key.owner_instance = owner_instance;
+	key.segment_id = segment_id;
+	result = cluster_undo_block0_current_live_owner_recycle_exact(
+		&key, horizon, expected_epoch, 10000);
+	switch (result) {
+	case CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED:
+		return CLUSTER_SEG_RECYCLE_ADVANCED;
+	case CLUSTER_UNDO_BLOCK0_RECYCLE_ALREADY:
+		return CLUSTER_SEG_RECYCLE_ALREADY;
+	case CLUSTER_UNDO_BLOCK0_RECYCLE_NOT_COMMITTED:
 		return CLUSTER_SEG_RECYCLE_NOT_COMMITTED;
-
-	if (!cluster_undo_segment_recyclable(hdr, horizon))
-		return CLUSTER_SEG_RECYCLE_RETAINED; /* live reader may need it (8.A) */
-
-	lsn = cluster_undo_emit_segment_recycle(owner_instance, segment_id, hdr->wrap_count,
-											(uint8)SEGMENT_COMMITTED, (uint8)SEGMENT_RECYCLABLE);
-	XLogFlush(lsn);
-
-	hdr->segment_state = SEGMENT_RECYCLABLE;
-	if (!write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data))
-		return CLUSTER_SEG_RECYCLE_WRITE_FAIL;
-	if (!cluster_undo_smgr_fsync_segment_file(segment_id, owner_instance))
-		return CLUSTER_SEG_RECYCLE_WRITE_FAIL;
-
-	return CLUSTER_SEG_RECYCLE_ADVANCED;
+	case CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED:
+		return CLUSTER_SEG_RECYCLE_RETAINED;
+	case CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED:
+	default:
+		return CLUSTER_SEG_RECYCLE_READ_FAIL;
+	}
 }
 
 
 /*
  * cluster_undo_segment_reuse_in_place -- spec-3.13 D4.
  *
- *	Whole-segment rebirth of a RECYCLABLE segment: fresh block-0 image
- *	(SEGMENT_ALLOCATED, TT slots zeroed) at generation old+1, durable per
- *	the v0.3 (1) three-step contract (0x50 WAL + XLogFlush -> pwrite ->
- *	fsync).  Data blocks are NOT zeroed (lazy overwrite; C-R3/C-R4: no
+ *	Whole-segment rebirth of a RECYCLABLE segment: exact fresh block-0 image
+ *	(SEGMENT_ALLOCATED, TT slots/bitmap/reserved zero) at generation old+1,
+ *	serialized by the existing 0xFB XCUR/current resident owner.  Data blocks
+ *	are NOT zeroed (lazy overwrite; C-R3/C-R4: no
  *	live reader can legally dereference into a recyclable segment, and
  *	block headers carry first_change_scn for generation telling).
- *	Caller holds lifecycle_lock (extend/rollover path).  Returns the
+ *	Caller holds no lifecycle/content lock.  Returns the
  *	segment_id, or 0 on I/O failure (caller falls back to fresh create).
  */
 uint32
@@ -718,19 +778,24 @@ cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance, uin
 {
 	PGAlignedBlock page;
 	UndoSegmentHeaderData *hdr;
-	XLogRecPtr lsn;
+	ClusterUndoBlock0LogicalKey key;
+	ClusterUndoBlock0Generation expected;
+	ClusterUndoBlock0Result result;
+
+	if (segment_id == 0 || old_generation == UINT32_MAX
+		|| owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
+		return 0;
 
 	cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page.data);
 	hdr = (UndoSegmentHeaderData *)page.data;
 	hdr->wrap_count = old_generation + 1;
-
-	lsn = cluster_undo_emit_segment_reuse(owner_instance, segment_id, old_generation,
-										  old_generation + 1, page.data);
-	XLogFlush(lsn);
-
-	if (!write_segment_header_via_smgr(segment_id, owner_instance, page.data))
-		return 0;
-	if (!cluster_undo_smgr_fsync_segment_file(segment_id, owner_instance))
+	key.owner_instance = owner_instance;
+	key.segment_id = segment_id;
+	expected.known = true;
+	expected.value = old_generation;
+	result = cluster_undo_block0_current_live_owner_reuse_exact(
+		&key, &expected, page.data, 10000);
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
 		return 0;
 
 	/*
@@ -779,17 +844,9 @@ cluster_undo_segment_generation(uint32 segment_id, uint8 owner_instance)
 bool
 cluster_undo_segment_mark_full(uint32 segment_id, uint8 owner_instance)
 {
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
-		return false;
-
-	if (UndoSegmentFlags_is_full(hdr->segment_flags))
-		return true; /* idempotent — already FULL */
-
-	hdr->segment_flags |= UNDO_SEGMENT_FLAG_FULL;
-	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
+	return cluster_undo_block0_current_live_owner_lifecycle_exact(
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_FULL,
+		0, 0);
 }
 
 
@@ -806,14 +863,9 @@ bool
 cluster_undo_segment_tail_block_init(uint32 segment_id, uint8 owner_instance,
 									 BlockNumber initial_tail)
 {
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
-		return false;
-
-	hdr->tail_block = initial_tail;
-	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
+	return cluster_undo_block0_current_live_owner_lifecycle_exact(
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_INIT_TAIL,
+		initial_tail, 0);
 }
 
 
@@ -831,20 +883,9 @@ cluster_undo_segment_tail_block_init(uint32 segment_id, uint8 owner_instance,
 bool
 cluster_undo_segment_mark_block_used(uint32 segment_id, uint8 owner_instance, uint32 block_no)
 {
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-
-	if (block_no >= UNDO_BLOCKS_PER_SEGMENT)
-		return false; /* out-of-range */
-
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
-		return false;
-
-	/* Pure-kernel mutator (covered by cluster_unit T13/T14). */
-	if (!UndoSegmentBitmap_mark_used(hdr->free_block_bitmap, block_no))
-		return true; /* already marked; idempotent success */
-
-	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
+	return cluster_undo_block0_current_live_owner_lifecycle_exact(
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_BLOCK,
+		block_no, 0);
 }
 
 
@@ -860,18 +901,9 @@ bool
 cluster_undo_segment_mark_block_range_used(uint32 segment_id, uint8 owner_instance,
 										   uint32 first_block, uint32 nblocks)
 {
-	PGAlignedBlock blockbuf;
-	UndoSegmentHeaderData *hdr;
-
-	if (!read_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data, &hdr))
-		return false;
-
-	/* Pure-kernel batch mutator (cluster_unit-tested);  fail-closed on bad range. */
-	if (!UndoSegmentBitmap_mark_range_used(hdr->free_block_bitmap, first_block, nblocks,
-										   UNDO_BLOCKS_PER_SEGMENT))
-		return false;
-
-	return write_segment_header_via_smgr(segment_id, owner_instance, blockbuf.data);
+	return cluster_undo_block0_current_live_owner_lifecycle_exact(
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_CLAIM_RANGE,
+		first_block, nblocks);
 }
 
 
@@ -951,18 +983,20 @@ cluster_undo_segment_read_state(uint32 segment_id, uint8 owner_instance)
  *   File I/O happens under lifecycle_lock per spec §3.2.
  * ============================================================ */
 
-uint32
-cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_cap)
+bool
+cluster_undo_segment_extend_or_create(
+	uint8 owner_instance, ClusterUndoSegmentExtendPlan *plan)
 {
 	uint32 slot;
 	uint32 base_segment_id;
 	uint32 effective_cap;
 
-	if (out_at_hard_cap != NULL)
-		*out_at_hard_cap = false;
+	if (plan == NULL)
+		return false;
+	memset(plan, 0, sizeof(*plan));
 
 	if (owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
-		return 0;
+		return false;
 
 	/*
 	 * effective_cap = min(GUC, encoding limit 256).  Per spec-3.8 §3.6 F6
@@ -1056,16 +1090,23 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 
 			close(fd);
 			if (rb == BLCKSZ
-				&& cluster_undo_segment_header_identity_ok(peek.data, new_segment_id,
-														   owner_instance)
-				&& ((UndoSegmentHeaderData *)peek.data)->segment_state == SEGMENT_RECYCLABLE) {
-				uint32 reused = cluster_undo_segment_reuse_in_place(
-					new_segment_id, owner_instance,
-					((UndoSegmentHeaderData *)peek.data)->wrap_count);
+				&& cluster_undo_segment_header_identity_ok(peek.data,
+					new_segment_id, owner_instance)) {
+				UndoSegmentHeaderData *header
+					= (UndoSegmentHeaderData *)peek.data;
 
-				if (reused != 0)
-					return reused;
-				/* reuse failed (I/O): fall through as taken; retry next time */
+				if (header->segment_state == SEGMENT_RECYCLABLE) {
+					plan->segment_id = new_segment_id;
+					plan->generation = header->wrap_count;
+					plan->needs_reuse = true;
+					return true;
+				}
+				if (header->segment_state == SEGMENT_ALLOCATED) {
+					plan->segment_id = new_segment_id;
+					plan->generation = header->wrap_count;
+					plan->needs_reuse = false;
+					return true;
+				}
 			}
 			/* File exists — slot is taken. */
 			continue;
@@ -1073,7 +1114,7 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 
 		if (errno != ENOENT) {
 			/* Real I/O error reading slot N — abort autoextend. */
-			return 0;
+			return false;
 		}
 
 		/* Found free slot — create the segment file. */
@@ -1083,17 +1124,18 @@ cluster_undo_segment_extend_or_create(uint8 owner_instance, bool *out_at_hard_ca
 		 * is idempotent;  if it ereport'd ERROR we wouldn't reach here). */
 		fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
 		if (fd < 0)
-			return 0; /* create silently failed */
+			return false; /* create silently failed */
 		close(fd);
 
-		return new_segment_id;
+		plan->segment_id = new_segment_id;
+		plan->generation = 0;
+		plan->needs_reuse = false;
+		return true;
 	}
 
 	/* All slots taken — hard cap reached. */
-	if (out_at_hard_cap != NULL)
-		*out_at_hard_cap = true;
-
-	return 0;
+	plan->at_hard_cap = true;
+	return false;
 }
 
 

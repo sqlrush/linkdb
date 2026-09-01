@@ -868,6 +868,36 @@ cluster_undo_buf_unref_slot(int slot)
 }
 
 
+bool
+cluster_undo_buf_install_ref_conditional(int slot, uint32 segment_id,
+									 uint8 owner, uint32 block_no,
+									 const char image[BLCKSZ])
+{
+	UndoBufSlot *s;
+	bool exact;
+
+	if (UndoBufPool == NULL || UndoBufSlots == NULL || image == NULL
+		|| slot < 0 || slot >= UndoBufPool->nslots)
+		return false;
+	s = &UndoBufSlots[slot];
+	if (!s->valid || s->io_in_progress
+		|| s->segment_id != segment_id || s->owner != owner
+		|| s->block_no != block_no
+		|| pg_atomic_read_u32(&s->pincount) == 0)
+		return false;
+	if (!LWLockConditionalAcquire(&s->content_lock, LW_EXCLUSIVE))
+		return false;
+	exact = s->valid && !s->io_in_progress
+		&& s->segment_id == segment_id && s->owner == owner
+		&& s->block_no == block_no
+		&& pg_atomic_read_u32(&s->pincount) > 0;
+	if (exact)
+		memcpy(SLOT_DATA(slot), image, BLCKSZ);
+	LWLockRelease(&s->content_lock);
+	return exact;
+}
+
+
 void
 cluster_undo_buf_flush_all(bool is_checkpoint)
 {

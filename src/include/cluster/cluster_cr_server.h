@@ -143,6 +143,9 @@ extern bool cluster_cr_server_freshref_c1b_pair_request_decode(
 	int32 local_node, uint64 current_epoch, int max_backends,
 	uint32 *segment_id, TransactionId *xid, uint32 *expected_tt_slot_id,
 	SCN *proposed_scn);
+extern bool cluster_cr_server_local_freshref_c1b_pair_exact(
+	TransactionId xid, uint32 expected_segment_id,
+	uint32 expected_tt_slot_id, SCN proposed_scn, uint16 *out_wrap);
 
 #ifdef USE_CLUSTER_UNIT
 extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
@@ -545,8 +548,16 @@ extern ClusterMxDescribeResult cluster_gcs_current_mx_describe_fetch_and_wait(
 	uint16 members_cap, uint16 *members_count, uint32 *reported_total_members);
 extern void cluster_gcs_current_mx_describe_serve_inline(
 	const struct ClusterICEnvelope *env, const void *payload);
+struct ClusterCurrentMxProofForwardV2;
 extern void cluster_gcs_current_mx_member_proof_serve_inline(
 	const struct ClusterICEnvelope *env, const void *payload);
+struct ClusterCurrentMxProofReplyPage;
+extern ClusterMxResolveResult cluster_cr_server_current_mx_build_proof_page(
+	uint16 source_node_id,
+	const struct ClusterCurrentMxProofForwardV2 *request,
+	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
+	struct ClusterCurrentMxProofReplyPage *page);
 #ifdef USE_CLUSTER_UNIT
 struct ClusterCurrentMxDescribeReplyPage;
 extern ClusterMxDescribeResult
@@ -555,13 +566,11 @@ cluster_cr_server_test_current_mx_build_describe_page(
 	const MultiXactMember *native_members, int native_count,
 	struct ClusterCurrentMxDescribeReplyPage *page);
 #endif
-struct ClusterCurrentMxProofForwardV2;
 extern ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	int32 origin_node, struct ClusterCurrentMxProofForwardV2 *request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
 	ClusterCurrentUpdaterProof *updater_proof);
 #ifdef USE_CLUSTER_UNIT
-struct ClusterCurrentMxProofReplyPage;
 extern ClusterMxResolveResult
 cluster_cr_server_test_current_mx_build_proof_page(
 	uint16 source_node_id,
@@ -569,9 +578,6 @@ cluster_cr_server_test_current_mx_build_proof_page(
 	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	struct ClusterCurrentMxProofReplyPage *page);
-extern int cluster_cr_server_test_current_mx_member_proof_one(
-	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
-	uint32 current_epoch, ClusterCurrentMemberProof *proof);
 #endif
 
 typedef enum ClusterR4SourceCrOp { CLUSTER_R4_SOURCE_CR_FETCH = 0 } ClusterR4SourceCrOp;

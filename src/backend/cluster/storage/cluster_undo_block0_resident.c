@@ -19,6 +19,7 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
+#include "miscadmin.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "lib/ilist.h"
@@ -525,6 +526,17 @@ block0_drop_reservation(ClusterUndoBlock0SlotData *meta, ClusterUndoBlock0Pin *p
 	block0_pin_clear(pin);
 }
 
+/* ereport(ERROR) resets InterruptHoldoffCount before PG_FINALLY/PG_CATCH.
+ * Restore the one holdoff consumed by LWLockRelease so exact pin cleanup can
+ * release its content lock without underflowing the process counter. */
+static void
+block0_release_content_lock(ClusterUndoBlock0SlotData *meta)
+{
+	if (InterruptHoldoffCount == 0)
+		HOLD_INTERRUPTS();
+	LWLockRelease(&meta->content_lock);
+}
+
 
 static void
 block0_abort_pin(ClusterUndoBlock0Pin *pin)
@@ -538,7 +550,7 @@ block0_abort_pin(ClusterUndoBlock0Pin *pin)
 	meta = &Block0Slots[pin->slot].data;
 	owned = block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_LOCKED_PIN);
 	if (owned != NULL) {
-		LWLockRelease(&meta->content_lock);
+		block0_release_content_lock(meta);
 		if (pg_atomic_read_u32(&meta->pincount) > 0)
 			pg_atomic_fetch_sub_u32(&meta->pincount, 1);
 		block0_resource_forget(owned);
@@ -1151,6 +1163,51 @@ cluster_undo_block0_sample_resident_generation(
 
 
 ClusterUndoBlock0Result
+cluster_undo_block0_sample_resident_generation_conditional(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0ResolvedRoot *expected_root,
+	const ClusterUndoBlock0AuthorityProof *proof,
+	ClusterUndoBlock0Generation *observed_generation)
+{
+	ClusterUndoBlock0SlotData *meta;
+	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_OK;
+	uint32 slotno;
+	uint32 state;
+
+	if (observed_generation == NULL)
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	memset(observed_generation, 0, sizeof(*observed_generation));
+	if (Block0Ctl == NULL
+		|| cluster_undo_block0_logical_slot(logical, &slotno)
+			!= CLUSTER_UNDO_BLOCK0_OK
+		|| !cluster_undo_block0_root_valid(expected_root)
+		|| !block0_authority_proof_valid(logical, proof))
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+
+	meta = &Block0Slots[slotno].data;
+	if (!LWLockConditionalAcquire(&meta->content_lock, LW_SHARED))
+		return CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
+	state = pg_atomic_read_u32(&meta->state);
+	if (state != CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN
+		&& state != CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY)
+		result = state == CLUSTER_UNDO_BLOCK0_SLOT_RETIRING
+			? CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH
+			: CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	else if (meta->logical.segment_id != logical->segment_id
+		|| meta->logical.owner_instance != logical->owner_instance
+		|| !cluster_undo_block0_root_matches(
+			&meta->resolved_root, expected_root))
+		result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+	else if (!block0_authority_proof_matches(&meta->proof, proof))
+		result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	else
+		*observed_generation = meta->generation;
+	LWLockRelease(&meta->content_lock);
+	return result;
+}
+
+
+ClusterUndoBlock0Result
 cluster_undo_block0_prove_strict_empty(
 	const ClusterUndoBlock0LogicalKey *logical,
 	const ClusterUndoBlock0AuthorityProof *proof)
@@ -1472,7 +1529,7 @@ cluster_undo_block0_unpin(ClusterUndoBlock0Pin *pin)
 		return;
 	owned = block0_resource_find(pin, CLUSTER_UNDO_BLOCK0_OWNED_LOCKED_PIN);
 	meta = &Block0Slots[pin->slot].data;
-	LWLockRelease(&meta->content_lock);
+	block0_release_content_lock(meta);
 	pg_atomic_fetch_sub_u32(&meta->pincount, 1);
 	block0_resource_forget(owned);
 	block0_pin_clear(pin);

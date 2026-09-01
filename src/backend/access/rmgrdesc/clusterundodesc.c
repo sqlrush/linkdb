@@ -48,6 +48,17 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 						 (unsigned)hdr->instance, (unsigned)hdr->segment_id, BLCKSZ);
 		break;
 	}
+	case XLOG_UNDO_TT_SLOT_BIND: {
+		xl_undo_tt_slot_bind *rec = (xl_undo_tt_slot_bind *)payload;
+
+		appendStringInfo(buf,
+			"instance %u segment %u generation %u slot %u wrap %u xid %u (active bind v%u)",
+			(unsigned)rec->instance, (unsigned)rec->segment_id,
+			(unsigned)rec->segment_generation, (unsigned)rec->slot_offset,
+			(unsigned)rec->wrap, (unsigned)rec->xid,
+			(unsigned)rec->format_version);
+		break;
+	}
 	case XLOG_UNDO_TT_SLOT_COMMIT: {
 		xl_undo_tt_slot_commit *rec = (xl_undo_tt_slot_commit *)payload;
 
@@ -58,11 +69,32 @@ cluster_undo_desc(StringInfo buf, XLogReaderState *record)
 		break;
 	}
 	case XLOG_UNDO_TT_SLOT_ABORT: {
-		xl_undo_tt_slot_abort *xlrec = (xl_undo_tt_slot_abort *)payload;
+		if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_abort_exact))
+		{
+			xl_undo_tt_slot_abort_exact rec;
 
-		appendStringInfo(buf, "instance %u seg %u slot %u wrap %u xid %u (prepared abort)",
-						 xlrec->instance, xlrec->segment_id, xlrec->slot_offset, xlrec->wrap,
-						 xlrec->xid);
+			memcpy(&rec, payload, sizeof(rec));
+			appendStringInfo(buf,
+				"instance %u seg %u generation %u slot %u wrap %u xid %u (exact abort v%u)",
+				(unsigned) rec.instance, (unsigned) rec.segment_id,
+				(unsigned) rec.segment_generation, (unsigned) rec.slot_offset,
+				(unsigned) rec.wrap, (unsigned) rec.xid,
+				(unsigned) rec.format_version);
+		}
+		else if (XLogRecGetDataLen(record) == sizeof(xl_undo_tt_slot_abort))
+		{
+			xl_undo_tt_slot_abort rec;
+
+			memcpy(&rec, payload, sizeof(rec));
+			appendStringInfo(buf,
+				"instance %u seg %u slot %u wrap %u xid %u (prepared abort)",
+				(unsigned) rec.instance, (unsigned) rec.segment_id,
+				(unsigned) rec.slot_offset, (unsigned) rec.wrap,
+				(unsigned) rec.xid);
+		}
+		else
+			appendStringInfo(buf, "malformed abort payload length %u",
+				(unsigned) XLogRecGetDataLen(record));
 		break;
 	}
 	case XLOG_UNDO_SEGMENT_RECYCLE: {
@@ -127,6 +159,8 @@ cluster_undo_identify(uint8 info)
 	switch (info & ~XLR_INFO_MASK) {
 	case XLOG_UNDO_SEGMENT_INIT:
 		return "UNDO_SEGMENT_INIT";
+	case XLOG_UNDO_TT_SLOT_BIND:
+		return "UNDO_TT_SLOT_BIND";
 	case XLOG_UNDO_TT_SLOT_COMMIT:
 		return "UNDO_TT_SLOT_COMMIT";
 	case XLOG_UNDO_TT_SLOT_ABORT:

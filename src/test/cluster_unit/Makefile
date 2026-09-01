@@ -2480,9 +2480,11 @@ $(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runt
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_r4_tx_outcome: test_cluster_r4_tx_outcome.c unit_test.h \
-		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O)
+		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_CR_SERVER_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_R4_RUNTIME_VIS_TEST_O) $(CLUSTER_R4_RUNTIME_VIS_UBA_O) \
+		$(CLUSTER_CR_SERVER_POLICY_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
@@ -2857,6 +2859,7 @@ test_cluster_visibility_fork: test_cluster_visibility_fork.c unit_test.h \
 		-DHEAPAM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
 		-DHEAPAM_VISIBILITY_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam_visibility.c"' \
 		-DTT_LOCAL_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_tt_local.c"' \
+		-DXACT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/transam/xact.c"' \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_VIS_VERDICT_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -3279,6 +3282,8 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DUNDO_RECORD_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_undo_record.c"' \
+		-DUNDO_ALLOC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_alloc.c"' \
+		-DHEAPAM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/access/heap/heapam.c"' \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

@@ -49,8 +49,11 @@
 #include "storage/itemptr.h"					/* OffsetNumber */
 #include "common/relpath.h"						/* ForkNumber */
 #include "cluster/cluster_itl_slot.h"			/* UBA */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_record.h"		/* UndoRecordType */
+#include "cluster/cluster_undo_extent.h"		/* ClusterUndoExtent */
 #include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoSegTryRecycle (3.13) */
+#include "cluster/storage/cluster_undo_block0_current.h"
 
 
 /*
@@ -69,6 +72,52 @@ typedef struct ClusterUndoRecordTarget {
 
 StaticAssertDecl(sizeof(ClusterUndoRecordTarget) == 24,
 				 "ClusterUndoRecordTarget must be 24B — HC213a");
+
+typedef enum ClusterUndoRecordPrepareResult {
+	CLUSTER_UNDO_RECORD_PREPARE_READY = 0,
+	CLUSTER_UNDO_RECORD_PREPARE_RETRY_REQUIRED,
+	CLUSTER_UNDO_RECORD_PREPARE_REFUSED
+} ClusterUndoRecordPrepareResult;
+
+typedef enum ClusterUndoRecordConsumeResult {
+	CLUSTER_UNDO_RECORD_CONSUME_APPLIED = 0,
+	CLUSTER_UNDO_RECORD_CONSUME_RETRY_REQUIRED,
+	CLUSTER_UNDO_RECORD_CONSUME_REFUSED
+} ClusterUndoRecordConsumeResult;
+
+/* Stack-only identity for one backend-local prepared DATA reservation.  It is
+ * neither shared state nor authority: the block0 publication is a retained
+ * exact proof, while reservation_sequence names the sole backend-local owner.
+ * The absolute deadline is frozen by the heap operation and never refreshed
+ * by a receipt retry. */
+typedef struct ClusterUndoRecordPrepareReceipt {
+	uint32 magic;
+	uint8 record_type;
+	uint8 owner_instance;
+	uint16 payload_capacity;
+	uint16 tt_slot_segment_id;
+	uint16 tt_slot_offset;
+	uint32 actual_segment_id;
+	uint64 reservation_sequence;
+	uint64 absolute_deadline_us;
+	ClusterUndoExtent extent;
+	ClusterUndoBlock0LiveOwnerPublication block0_publication;
+	ClusterSemanticAdmissionToken modifier_admission;
+} ClusterUndoRecordPrepareReceipt;
+
+extern uint64 cluster_undo_record_prepare_deadline_us(void);
+extern ClusterUndoRecordPrepareResult cluster_undo_record_prepare(
+	uint8 record_type, uint16 payload_capacity,
+	uint16 tt_slot_segment_id, uint16 tt_slot_offset, UBA prev_uba,
+	uint64 absolute_deadline_us, ClusterUndoRecordPrepareReceipt *receipt);
+extern bool cluster_undo_record_prepared_recheck(
+	const ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len);
+extern void cluster_undo_record_cancel_prepared(
+	ClusterUndoRecordPrepareReceipt *receipt);
+extern ClusterUndoRecordConsumeResult cluster_undo_record_consume_prepared(
+	ClusterUndoRecordPrepareReceipt *receipt,
+	const ClusterUndoRecordTarget *target, const void *payload,
+	uint16 payload_len, UBA *out_uba);
 
 
 /*

@@ -114,6 +114,14 @@ extern void cluster_undo_buf_unpin(ClusterUndoBufPin *pin);
 extern void cluster_undo_buf_addref(const ClusterUndoBufPin *pin);
 extern void cluster_undo_buf_unref_slot(int slot);
 
+/* Copy a prepared DATA image into an already-referenced exact slot without a
+ * miss fill or storage write.  The content lock is conditional: callers that
+ * hold a heap content lock receive false rather than joining an undo-buffer
+ * wait queue. */
+extern bool cluster_undo_buf_install_ref_conditional(int slot, uint32 segment_id,
+										 uint8 owner, uint32 block_no,
+										 const char image[BLCKSZ]);
+
 /* checkpoint / shutdown flush hook.  is_checkpoint=true on checkpoint. */
 extern void cluster_undo_buf_flush_all(bool is_checkpoint);
 

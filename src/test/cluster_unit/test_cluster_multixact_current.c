@@ -109,11 +109,9 @@ static int test_runtime_remote_describe_calls;
 static bool test_runtime_remote_describe_ok;
 static int test_runtime_proof_calls;
 static int test_runtime_proof_fail_call;
-static ClusterSemanticAdmissionResult test_runtime_tt_admission;
-static ClusterTTStatusSourceResult test_runtime_tt_source_result;
-static bool test_runtime_origin_proof_source_enabled;
-static bool test_runtime_origin_proof_source_authoritative = true;
 static int test_runtime_origin_proof_source_calls;
+static bool test_runtime_target_owner_enabled;
+static int test_runtime_target_owner_calls;
 static int test_runtime_describe_send_calls;
 static int test_runtime_describe_capability_calls;
 static int test_runtime_describe_generation_match_calls;
@@ -138,9 +136,8 @@ cluster_cr_server_test_current_mx_build_proof_page(
 	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	ClusterCurrentMxProofReplyPage *page);
-extern int cluster_cr_server_test_current_mx_member_proof_one(
-	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
-	uint32 current_epoch, ClusterCurrentMemberProof *proof);
+extern bool cluster_runtime_visibility_current_owner_lookup_exact(
+	TransactionId xid, ClusterTTStatusKey *key, ClusterTTStatusResult *result);
 
 void
 pfree(void *pointer)
@@ -363,37 +360,42 @@ TransactionIdIsCurrentTransactionId(TransactionId xid pg_attribute_unused())
 	return false;
 }
 
+bool
+cluster_runtime_visibility_current_owner_lookup_exact(
+	TransactionId xid, ClusterTTStatusKey *key, ClusterTTStatusResult *result)
+{
+	test_runtime_target_owner_calls++;
+	UT_ASSERT_NOT_NULL(key);
+	UT_ASSERT_NOT_NULL(result);
+	memset(key, 0, sizeof(*key));
+	memset(result, 0, sizeof(*result));
+	result->status = CLUSTER_TT_STATUS_UNKNOWN;
+	result->commit_scn = InvalidScn;
+	if (!test_runtime_target_owner_enabled)
+		return false;
+	key->origin_node_id = (uint16)cluster_node_id;
+	key->undo_segment_id = 2;
+	key->tt_slot_id = (uint32)(xid % 8) + 1;
+	key->cluster_epoch = (uint32)test_runtime_epoch;
+	key->local_xid = xid;
+	result->status = CLUSTER_TT_STATUS_IN_PROGRESS;
+	result->status_epoch = (uint32)test_runtime_epoch;
+	result->commit_scn = InvalidScn;
+	result->authoritative = true;
+	return true;
+}
+
 ClusterSemanticAdmissionResult
 cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
 								  const ClusterTTStatusSourceRequest *request,
 								  ClusterTTStatusSourceResult *result)
 {
-	if (op == CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID) {
-		test_runtime_origin_proof_source_calls++;
-		UT_ASSERT_NOT_NULL(request);
-		UT_ASSERT_NOT_NULL(result);
-		memset(result, 0, sizeof(*result));
-		if (!test_runtime_origin_proof_source_enabled)
-			return CLUSTER_SEMANTIC_ADMISSION_OK;
-		result->bool_value = true;
-		result->current_key.origin_node_id = (uint16)cluster_node_id;
-		result->current_key.undo_segment_id = 1;
-		result->current_key.tt_slot_id = 2;
-		result->current_key.local_xid = request->xid;
-		result->current_key.cluster_epoch = (uint32)test_runtime_epoch;
-		result->lookup.status = CLUSTER_TT_STATUS_ABORTED;
-		result->lookup.commit_scn = InvalidScn;
-		result->lookup.status_epoch = (uint32)test_runtime_epoch;
-		result->lookup.authoritative
-			= test_runtime_origin_proof_source_authoritative;
-		return CLUSTER_SEMANTIC_ADMISSION_OK;
-	}
-	UT_ASSERT_EQ(op, CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE);
-	UT_ASSERT_NOT_NULL(request);
-	UT_ASSERT_NOT_NULL(request->key);
+	(void)op;
+	(void)request;
+	test_runtime_origin_proof_source_calls++;
 	if (result != NULL)
-		*result = test_runtime_tt_source_result;
-	return test_runtime_tt_admission;
+		memset(result, 0, sizeof(*result));
+	return CLUSTER_SEMANTIC_ADMISSION_SOURCE_DORMANT;
 }
 
 
@@ -1014,38 +1016,38 @@ UT_TEST(test_current_multixact_origin_member_proof_follows_exact_parent)
 
 UT_TEST(test_current_multixact_updater_candidate_requires_current_exact_binding)
 {
-	ClusterTTStatusKey current = test_ttkey(5, 100, 20);
+	ClusterTTStatusKey current = test_ttkey(5, 100, 5);
 	ClusterTTStatusKey candidate = current;
 	ClusterTTStatusKey selected;
 	ClusterTTStatusResult selected_result;
 
 	cluster_node_id = 5;
-	memset(&test_runtime_tt_source_result, 0, sizeof(test_runtime_tt_source_result));
-	test_runtime_tt_admission = CLUSTER_SEMANTIC_ADMISSION_OK;
-	test_runtime_tt_source_result.bool_value = true;
-	test_runtime_tt_source_result.current_key = current;
-	test_runtime_tt_source_result.lookup.status = CLUSTER_TT_STATUS_IN_PROGRESS;
-	test_runtime_tt_source_result.lookup.status_epoch = 9;
-	test_runtime_tt_source_result.lookup.authoritative = true;
-	test_runtime_tt_source_result.current_key_verdict = CLUSTER_TT_CURRENT_KEY_MATCH;
+	test_runtime_epoch = 9;
+	current.undo_segment_id = 2;
+	candidate = current;
+	test_runtime_target_owner_enabled = true;
+	test_runtime_target_owner_calls = 0;
+	test_runtime_origin_proof_source_calls = 0;
 	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
 					 &candidate, 100, 5, 9, &selected, &selected_result),
 				 CUCP_MATCH);
 	UT_ASSERT_EQ(memcmp(&selected, &current, sizeof(current)), 0);
+	UT_ASSERT_EQ(test_runtime_target_owner_calls, 1);
+	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 0);
 
-	test_runtime_tt_source_result.current_key_verdict = CLUSTER_TT_CURRENT_KEY_UNKNOWN;
+	candidate.tt_slot_id++;
 	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
 					 &candidate, 100, 5, 9, &selected, &selected_result),
-				 CUCP_UNKNOWN);
+				 CUCP_MISMATCH);
 	UT_ASSERT_EQ(selected_result.status, CLUSTER_TT_STATUS_UNKNOWN);
+	candidate = current;
 
-	test_runtime_tt_source_result.current_key_verdict = CLUSTER_TT_CURRENT_KEY_MATCH;
-	test_runtime_tt_admission = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+	test_runtime_target_owner_enabled = false;
 	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
 					 &candidate, 100, 5, 9, &selected, &selected_result),
 				 CUCP_UNKNOWN);
 
-	test_runtime_tt_admission = CLUSTER_SEMANTIC_ADMISSION_OK;
+	test_runtime_target_owner_enabled = true;
 	candidate.local_xid++;
 	UT_ASSERT_EQ(cluster_multixact_current_updater_candidate_verdict(
 					 &candidate, 100, 5, 9, &selected, &selected_result),
@@ -1057,8 +1059,7 @@ UT_TEST(test_current_multixact_updater_candidate_requires_current_exact_binding)
 				 CUCP_UNKNOWN);
 
 	cluster_node_id = -1;
-	memset(&test_runtime_tt_source_result, 0, sizeof(test_runtime_tt_source_result));
-	test_runtime_tt_admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+	test_runtime_target_owner_enabled = false;
 }
 
 
@@ -1201,6 +1202,40 @@ UT_TEST(test_current_multixact_members_resolve_all_or_nothing)
 	UT_ASSERT_EQ(updater_proof.verdict, CUCP_UNKNOWN);
 
 	test_runtime_proof_fail_call = 0;
+	cluster_node_id = -1;
+}
+
+UT_TEST(test_current_multixact_local_member_uses_target_canonical_not_source)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMemberProof proofs[2];
+	ClusterCurrentUpdaterProof updater_proof;
+	uint64 hash;
+
+	cluster_node_id = 4;
+	test_runtime_epoch = 9;
+	key.cluster_epoch = (uint32)test_runtime_epoch;
+	test_member(&members[0], 102, MultiXactStatusForShare);
+	test_member(&members[1], 105, MultiXactStatusForKeyShare);
+	hash = cluster_multixact_current_descriptor_hash(
+		&key, members, lengthof(members));
+	test_runtime_origin_proof_source_calls = 0;
+	test_runtime_target_owner_enabled = true;
+	test_runtime_target_owner_calls = 0;
+	memset(proofs, 0xa5, sizeof(proofs));
+	memset(&updater_proof, 0xa5, sizeof(updater_proof));
+
+	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
+		&key, members, lengthof(members), hash, NULL, proofs,
+		&updater_proof), CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(test_runtime_target_owner_calls, 2);
+	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 0);
+	UT_ASSERT_EQ(proofs[0].state, CCM_ACTIVE);
+	UT_ASSERT_EQ(proofs[1].state, CCM_ACTIVE);
+	UT_ASSERT_EQ(proofs[0].key.local_xid, members[0].xid);
+	UT_ASSERT_EQ(proofs[1].key.local_xid, members[1].xid);
+	test_runtime_target_owner_enabled = false;
 	cluster_node_id = -1;
 }
 
@@ -2111,7 +2146,6 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 	uint16 decoded_count = 0;
 
 	test_runtime_epoch = 17;
-	test_runtime_origin_proof_source_enabled = true;
 	test_runtime_origin_proof_source_calls = 0;
 	test_runtime_describe_send_calls = 0;
 	test_runtime_describe_capability_calls = 0;
@@ -2148,7 +2182,7 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 	cluster_node_id = 4;
 
 	cluster_gcs_current_mx_member_proof_serve_inline(&env, &request);
-	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 1);
+	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 0);
 	UT_ASSERT_EQ(test_runtime_describe_capability_calls, 1);
 	UT_ASSERT_EQ(test_runtime_describe_generation_match_calls, 1);
 	UT_ASSERT_EQ(test_runtime_describe_send_calls, 1);
@@ -2170,60 +2204,9 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 		page, sizeof(*page), 4, test_runtime_epoch, &request,
 		&decoded_result, decoded, lengthof(decoded), &decoded_count,
 		&updater));
-	UT_ASSERT_EQ(decoded_result, CMX_RESOLVE_OK);
-	UT_ASSERT_EQ(decoded_count, (uint16)1);
-	UT_ASSERT_EQ(decoded[0].member_xid, (TransactionId)501);
-	UT_ASSERT_EQ(decoded[0].state, CCM_ABORTED);
-	test_runtime_origin_proof_source_enabled = false;
+	UT_ASSERT_EQ(decoded_result, CMX_RESOLVE_UNKNOWN);
+	UT_ASSERT_EQ(decoded_count, (uint16)0);
 }
-
-
-UT_TEST(test_current_multixact_origin_classifies_member_proof_unknown_stage)
-{
-	ClusterCurrentMemberProof proof;
-
-	/* These are process-local diagnostic stages, not wire values.  The test
-	 * catches a regression that merges a missing own-XID binding with a
-	 * structurally invalid origin proof before the unchanged UNKNOWN reply. */
-	const int stage_ok = 0;
-	const int stage_own_xid_lookup = 1;
-	const int stage_origin_resolve = 2;
-
-	cluster_node_id = 4;
-	test_runtime_epoch = 17;
-	test_runtime_origin_proof_source_calls = 0;
-	test_runtime_origin_proof_source_enabled = false;
-	test_runtime_origin_proof_source_authoritative = true;
-	memset(&proof, 0xa5, sizeof(proof));
-	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_member_proof_one(
-		(TransactionId)501, MultiXactStatusForShare, 0, 17, &proof),
-		stage_own_xid_lookup);
-	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 1);
-	UT_ASSERT_EQ(proof.state, CCM_UNKNOWN);
-
-	test_runtime_origin_proof_source_calls = 0;
-	test_runtime_origin_proof_source_enabled = true;
-	test_runtime_origin_proof_source_authoritative = false;
-	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_member_proof_one(
-		(TransactionId)501, MultiXactStatusForShare, 0, 17, &proof),
-		stage_origin_resolve);
-	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 1);
-	UT_ASSERT_EQ(proof.state, CCM_UNKNOWN);
-
-	test_runtime_origin_proof_source_calls = 0;
-	test_runtime_origin_proof_source_authoritative = true;
-	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_member_proof_one(
-		(TransactionId)501, MultiXactStatusForShare, 0, 17, &proof),
-		stage_ok);
-	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 1);
-	UT_ASSERT_EQ(proof.member_xid, (TransactionId)501);
-	UT_ASSERT_EQ(proof.state, CCM_ABORTED);
-
-	test_runtime_origin_proof_source_enabled = false;
-	test_runtime_origin_proof_source_authoritative = true;
-	cluster_node_id = -1;
-}
-
 
 int
 main(void)
@@ -2239,6 +2222,7 @@ main(void)
 	UT_RUN(test_current_multixact_proof_forward_wire_binding);
 	UT_RUN(test_current_multixact_proof_reply_wire_binding);
 	UT_RUN(test_current_multixact_members_resolve_all_or_nothing);
+	UT_RUN(test_current_multixact_local_member_uses_target_canonical_not_source);
 	UT_RUN(test_current_multixact_proof_request_batches_by_member_origin);
 	UT_RUN(test_current_multixact_describe_wire_binding);
 	UT_RUN(test_current_multixact_describe_routes_by_mxid_authority);
@@ -2257,7 +2241,6 @@ main(void)
 	UT_RUN(test_current_multixact_origin_serves_describe_on_capability_bound_reply);
 	UT_RUN(test_current_multixact_origin_builds_strict_member_proof_page);
 	UT_RUN(test_current_multixact_origin_serves_member_proof_on_capability_bound_reply);
-	UT_RUN(test_current_multixact_origin_classifies_member_proof_unknown_stage);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

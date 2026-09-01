@@ -85,6 +85,9 @@ UT_DEFINE_GLOBALS();
 #ifndef TT_LOCAL_SOURCE_PATH
 #error "TT_LOCAL_SOURCE_PATH must identify production cluster_tt_local.c"
 #endif
+#ifndef XACT_SOURCE_PATH
+#error "XACT_SOURCE_PATH must identify production xact.c"
+#endif
 
 
 void
@@ -152,7 +155,8 @@ assert_data_active_publish(const char *source, const char *start_marker, const c
 	const char *publish;
 	const char *crit_end = start != NULL ? strstr(start, "END_CRIT_SECTION();") : NULL;
 
-	snprintf(publish_call, sizeof(publish_call), "cluster_tt_local_record_data_active(xid, %s);",
+	snprintf(publish_call, sizeof(publish_call),
+			 "cluster_tt_local_record_data_active(canonical_xid, %s);",
 			 uba_name);
 	publish = start != NULL ? strstr(start, publish_call) : NULL;
 
@@ -419,7 +423,7 @@ UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 	char *source = read_source(TT_LOCAL_SOURCE_PATH);
 	const char *start;
 	const char *end;
-	const char *peek;
+	const char *published;
 	const char *enter;
 	const char *try_block;
 	const char *recheck;
@@ -431,7 +435,8 @@ UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 		return;
 	start = strstr(source, "\ncluster_tt_local_precommit_durable_finish(");
 	end = start == NULL ? NULL : strstr(start, "\n}\n\nvoid\ncluster_tt_local_record_commit(");
-	peek = start == NULL ? NULL : strstr(start, "cluster_tt_local_peek_binding(");
+	published = start == NULL ? NULL
+		: strstr(start, "cluster_tt_local_get_published_binding(xid, &binding)");
 	enter = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_enter(");
 	try_block = start == NULL ? NULL : strstr(start, "PG_TRY();");
 	recheck = start == NULL
@@ -447,19 +452,81 @@ UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
-	UT_ASSERT_NOT_NULL(peek);
+	UT_ASSERT_NOT_NULL(published);
 	UT_ASSERT_NOT_NULL(enter);
 	UT_ASSERT_NOT_NULL(try_block);
 	UT_ASSERT_NOT_NULL(recheck);
 	UT_ASSERT_NOT_NULL(durable);
 	UT_ASSERT_NOT_NULL(finally_block);
 	UT_ASSERT_NOT_NULL(leave);
-	if (start != NULL && end != NULL && peek != NULL && enter != NULL && try_block != NULL
+	if (start != NULL && end != NULL && published != NULL && enter != NULL && try_block != NULL
 		&& recheck != NULL && durable != NULL && finally_block != NULL && leave != NULL)
-		UT_ASSERT(start < peek && peek < enter && enter < try_block && try_block < recheck
+		UT_ASSERT(start < published && published < enter && enter < try_block && try_block < recheck
 				  && recheck < durable && durable < finally_block && finally_block < leave
 				  && leave < end);
 	free(source);
+}
+
+UT_TEST(test_ordinary_abort_durable_receipt_precedes_allocator_reuse)
+{
+	char *xact_source = read_source(XACT_SOURCE_PATH);
+	char *tt_source = read_source(TT_LOCAL_SOURCE_PATH);
+	const char *abort_start;
+	const char *preabort;
+	const char *crit;
+	const char *record_abort;
+	const char *local_preabort;
+	const char *exact_abort;
+	const char *receipt;
+	const char *finish;
+	const char *terminal_gate;
+	const char *mark_aborted;
+
+	if (xact_source == NULL || tt_source == NULL) {
+		free(xact_source);
+		free(tt_source);
+		return;
+	}
+	abort_start = strstr(xact_source,
+		"\nRecordTransactionAbort(bool isSubXact)\n{");
+	preabort = abort_start == NULL ? NULL : strstr(abort_start,
+		"cluster_tt_local_preabort_durable_finish(xid)");
+	crit = abort_start == NULL ? NULL : strstr(abort_start, "START_CRIT_SECTION();");
+	record_abort = crit == NULL ? NULL : strstr(crit,
+		"cluster_tt_local_record_abort(xid)");
+	local_preabort = strstr(tt_source,
+		"cluster_tt_local_preabort_durable_finish(TransactionId xid)");
+	exact_abort = local_preabort == NULL ? NULL : strstr(local_preabort,
+		"cluster_tt_slot_durable_abort_exact(");
+	receipt = exact_abort == NULL ? NULL : strstr(exact_abort,
+		"CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE");
+	finish = strstr(tt_source, "cluster_tt_local_finish_bindings(bool committed");
+	terminal_gate = finish == NULL ? NULL : strstr(finish,
+		"CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE");
+	mark_aborted = finish == NULL ? NULL : strstr(finish,
+		"cluster_tt_slot_mark_aborted(");
+
+	UT_ASSERT_NOT_NULL(abort_start);
+	UT_ASSERT_NOT_NULL(preabort);
+	UT_ASSERT_NOT_NULL(crit);
+	UT_ASSERT_NOT_NULL(record_abort);
+	UT_ASSERT_NOT_NULL(local_preabort);
+	UT_ASSERT_NOT_NULL(exact_abort);
+	UT_ASSERT_NOT_NULL(receipt);
+	UT_ASSERT_NOT_NULL(finish);
+	UT_ASSERT_NOT_NULL(terminal_gate);
+	UT_ASSERT_NOT_NULL(mark_aborted);
+	if (abort_start != NULL && preabort != NULL && crit != NULL
+		&& record_abort != NULL)
+		UT_ASSERT(abort_start < preabort && preabort < crit
+			&& crit < record_abort);
+	if (local_preabort != NULL && exact_abort != NULL && receipt != NULL)
+		UT_ASSERT(local_preabort < exact_abort && exact_abort < receipt);
+	if (finish != NULL && terminal_gate != NULL && mark_aborted != NULL)
+		UT_ASSERT(finish < terminal_gate && terminal_gate < mark_aborted);
+
+	free(xact_source);
+	free(tt_source);
 }
 
 /* The L3 fail-closed diagnostic must identify the authority lookup that
@@ -507,13 +574,15 @@ UT_TEST(test_tt_retention_rollover_follower_reclassifies_current_segment)
 	const char *end;
 	const char *retry_loop;
 	const char *classify;
+	const char *drift_retry;
 	const char *rollover;
 	const char *one_shot;
 	const char *fresh_error;
+	const char *late_wrap_read;
 
 	if (source == NULL)
 		return;
-	start = strstr(source, "\ncluster_tt_local_get_or_create_binding(");
+	start = strstr(source, "\ncluster_tt_local_reserve_binding(");
 	end = start == NULL
 		? NULL
 		: strstr(start, "\n}\n\n/*\n * cluster_tt_local_peek_binding");
@@ -521,7 +590,10 @@ UT_TEST(test_tt_retention_rollover_follower_reclassifies_current_segment)
 	classify = retry_loop == NULL
 		? NULL
 		: strstr(retry_loop,
-				 "cluster_tt_slot_alloc_ext(seg, top_xid, &retained_pressure)");
+				 "cluster_tt_slot_alloc_current_exact(");
+	drift_retry = classify == NULL
+		? NULL
+		: strstr(classify, "if (current_drift)");
 	rollover = classify == NULL
 		? NULL
 		: strstr(classify, "cluster_undo_tt_rollover_locked(");
@@ -531,21 +603,64 @@ UT_TEST(test_tt_retention_rollover_follower_reclassifies_current_segment)
 	fresh_error = rollover == NULL
 		? NULL
 		: strstr(rollover, "fresh rollover segment");
+	late_wrap_read = classify == NULL
+		? NULL
+		: strstr(classify, "cluster_tt_slot_get_wrap(seg, off)");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
 	UT_ASSERT_NOT_NULL(retry_loop);
 	UT_ASSERT_NOT_NULL(classify);
+	UT_ASSERT_NOT_NULL(drift_retry);
 	UT_ASSERT_NOT_NULL(rollover);
 	if (start != NULL && end != NULL && retry_loop != NULL && classify != NULL
-		&& rollover != NULL)
+		&& drift_retry != NULL && rollover != NULL)
 		UT_ASSERT(start < retry_loop && retry_loop < classify && classify < rollover
-				  && rollover < end);
+				  && classify < drift_retry && drift_retry < rollover && rollover < end);
 	if (one_shot != NULL && end != NULL)
 		UT_ASSERT(one_shot > end);
+	if (late_wrap_read != NULL && end != NULL)
+		UT_ASSERT(late_wrap_read > end);
 	if (fresh_error != NULL && end != NULL)
 		UT_ASSERT(fresh_error > end);
 	free(source);
+}
+
+UT_TEST(test_canonical_active_is_prepared_before_heap_content_lock)
+{
+	char *heap_source = read_source(HEAPAM_SOURCE_PATH);
+	char *tt_source = read_source(TT_LOCAL_SOURCE_PATH);
+	const char *prepare;
+	const char *publish;
+	const char *published_accessor;
+
+	if (heap_source == NULL || tt_source == NULL) {
+		free(heap_source);
+		free(tt_source);
+		return;
+	}
+	prepare = strstr(tt_source,
+		"cluster_tt_local_prepare_canonical_active(TransactionId top_xid");
+	publish = prepare == NULL ? NULL : strstr(prepare,
+		"cluster_tt_slot_durable_publish_active(");
+	published_accessor = strstr(tt_source,
+		"cluster_tt_local_get_published_binding(TransactionId top_xid");
+
+	UT_ASSERT_NOT_NULL(prepare);
+	UT_ASSERT_NOT_NULL(publish);
+	UT_ASSERT_NOT_NULL(published_accessor);
+	UT_ASSERT(strstr(heap_source, "cluster_tt_local_get_or_create_binding(") == NULL);
+	UT_ASSERT(strstr(heap_source, "canonical_xid = GetTopTransactionId();") != NULL);
+	UT_ASSERT(strstr(heap_source,
+		"cluster_tt_local_prepare_canonical_active(\n\t\t\tcanonical_xid, &canonical_binding)") != NULL);
+	UT_ASSERT(strstr(heap_source,
+		"cluster_tt_local_get_published_binding(\n\t\t\t\tcanonical_xid, &canonical_binding)") != NULL);
+	UT_ASSERT(strstr(heap_source,
+		"cluster_tt_local_prepare_canonical_active(xid, &canonical_binding)") == NULL);
+	UT_ASSERT(strstr(tt_source, "CLUSTER_CANONICAL_TXN_PUBLISHED") != NULL);
+
+	free(heap_source);
+	free(tt_source);
 }
 
 
@@ -568,7 +683,9 @@ main(void)
 	UT_RUN(test_p033_active_and_safety_boundary_matrix);
 	UT_RUN(test_mvcc_frozen_xmin_bypasses_remote_resolve_but_keeps_xmax_gate);
 	UT_RUN(test_normal_commit_stamp_is_modifier_gated_and_error_safe);
+	UT_RUN(test_ordinary_abort_durable_receipt_precedes_allocator_reuse);
 	UT_RUN(test_deleting_xmax_error_names_actual_xmax);
 	UT_RUN(test_tt_retention_rollover_follower_reclassifies_current_segment);
+	UT_RUN(test_canonical_active_is_prepared_before_heap_content_lock);
 	UT_DONE();
 }

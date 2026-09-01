@@ -39,12 +39,43 @@
 
 #include "c.h"
 #include "access/transam.h"
+#include "access/xlogdefs.h"
 #include "cluster/cluster_itl_slot.h"  /* UBA */
 #include "cluster/cluster_scn.h"	   /* SCN */
 #include "cluster/cluster_tt_status.h" /* ClusterTTStatus */
 
 /* spec-3.18 D4.1: fold-delta out-param; full def in access/xact.h. */
 struct xl_xact_tt_commit;
+
+typedef enum ClusterCanonicalTxnPublishState {
+	CLUSTER_CANONICAL_TXN_NONE = 0,
+	CLUSTER_CANONICAL_TXN_RESERVED,
+	CLUSTER_CANONICAL_TXN_PUBLISHING,
+	CLUSTER_CANONICAL_TXN_PUBLISHED,
+	CLUSTER_CANONICAL_TXN_FAILED
+} ClusterCanonicalTxnPublishState;
+
+/* Backend-local publication receipt.  It is neither wire nor authority; the
+ * canonical TT bytes named here are the authority. */
+typedef struct ClusterCanonicalTxnBinding {
+	uint32 segment_id;
+	uint32 segment_generation;
+	TransactionId xid;
+	uint16 slot_offset;
+	uint16 slot_wrap;
+	uint8 origin_instance;
+	uint8 publish_state;
+	uint16 reserved16;
+	XLogRecPtr active_lsn;
+} ClusterCanonicalTxnBinding;
+
+StaticAssertDecl(sizeof(ClusterCanonicalTxnBinding) == 32,
+				 "canonical transaction binding must remain stack-only 32 bytes");
+
+extern bool cluster_tt_local_prepare_canonical_active(
+	TransactionId top_xid, ClusterCanonicalTxnBinding *binding_out);
+extern bool cluster_tt_local_get_published_binding(
+	TransactionId top_xid, ClusterCanonicalTxnBinding *binding_out);
 
 /*
  * cluster_tt_local_record_commit -- install COMMITTED status for a
@@ -75,7 +106,8 @@ extern void cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn);
  * must NOT do durable I/O).
  */
 extern bool cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
-													  struct xl_xact_tt_commit *out_fold);
+												  struct xl_xact_tt_commit *out_fold);
+extern bool cluster_tt_local_preabort_durable_finish(TransactionId xid);
 
 /*
  * cluster_tt_local_record_abort -- install ABORTED status for a local

@@ -29,6 +29,7 @@
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_mxid_stripe.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "storage/lock.h"
 
 #define CLUSTER_CURRENT_MX_MAX_PARENT_CHAIN_DEPTH 1024
@@ -180,9 +181,8 @@ cluster_multixact_current_updater_candidate_verdict(
 	uint16 updater_origin_node, uint32 current_epoch, ClusterTTStatusKey *current_binding,
 	ClusterTTStatusResult *current_result)
 {
-	ClusterTTStatusSourceRequest request;
-	ClusterTTStatusSourceResult result;
-	ClusterSemanticAdmissionResult admission;
+	ClusterTTStatusKey sampled_binding;
+	ClusterTTStatusResult sampled_result;
 
 	if (current_binding != NULL)
 		memset(current_binding, 0, sizeof(*current_binding));
@@ -192,35 +192,27 @@ cluster_multixact_current_updater_candidate_verdict(
 		current_result->commit_scn = InvalidScn;
 	}
 	if (candidate == NULL || current_binding == NULL || current_result == NULL
-		|| updater_origin_node >= CLUSTER_MAX_NODES || current_epoch == 0
+		|| updater_origin_node >= CLUSTER_MAX_NODES
 		|| cluster_node_id < 0 || updater_origin_node != (uint16)cluster_node_id
 		|| !tt_key_valid(candidate, updater_xid, current_epoch, updater_origin_node))
 		return CUCP_UNKNOWN;
 
-	memset(&request, 0, sizeof(request));
-	request.key = candidate;
-	request.xid = updater_xid;
-	memset(&result, 0, sizeof(result));
-	result.current_key_verdict = CLUSTER_TT_CURRENT_KEY_UNKNOWN;
-	admission = cluster_tt_status_source_dispatch(
-		CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE, &request, &result);
-	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK || !result.bool_value
-		|| !result.lookup.authoritative || result.lookup.status_epoch != current_epoch
-		|| !tt_key_valid(&result.current_key, InvalidTransactionId, current_epoch,
+	memset(&sampled_binding, 0, sizeof(sampled_binding));
+	memset(&sampled_result, 0, sizeof(sampled_result));
+	if (!cluster_runtime_visibility_current_owner_lookup_exact(
+			updater_xid, &sampled_binding, &sampled_result)
+		|| !sampled_result.authoritative
+		|| sampled_result.status_epoch != current_epoch
+		|| !tt_key_valid(&sampled_binding, updater_xid, current_epoch,
 						  updater_origin_node))
 		return CUCP_UNKNOWN;
 
-	switch (result.current_key_verdict) {
-	case CLUSTER_TT_CURRENT_KEY_MATCH:
-		*current_binding = result.current_key;
-		*current_result = result.lookup;
+	if (memcmp(candidate, &sampled_binding, sizeof(*candidate)) == 0) {
+		*current_binding = sampled_binding;
+		*current_result = sampled_result;
 		return CUCP_MATCH;
-	case CLUSTER_TT_CURRENT_KEY_MISMATCH:
-		return CUCP_MISMATCH;
-	case CLUSTER_TT_CURRENT_KEY_UNKNOWN:
-		break;
 	}
-	return CUCP_UNKNOWN;
+	return CUCP_MISMATCH;
 }
 
 
@@ -385,51 +377,6 @@ proof_array_set_unknown(ClusterCurrentMemberProof *proofs, uint16 nmembers)
 	memset(proofs, 0, sizeof(*proofs) * nmembers);
 	for (i = 0; i < nmembers; i++)
 		proofs[i].state = CCM_UNKNOWN;
-}
-
-
-static bool
-current_mx_source_exact_lookup(const ClusterTTStatusKey *key, ClusterTTStatusResult *result,
-							   void *arg)
-{
-	ClusterTTStatusSourceRequest request;
-	ClusterTTStatusSourceResult source_result;
-
-	(void)arg;
-	if (key == NULL || result == NULL)
-		return false;
-	memset(&request, 0, sizeof(request));
-	memset(&source_result, 0, sizeof(source_result));
-	request.key = key;
-	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &request, &source_result)
-			!= CLUSTER_SEMANTIC_ADMISSION_OK
-		|| !source_result.bool_value)
-		return false;
-	*result = source_result.lookup;
-	return true;
-}
-
-
-static bool
-current_mx_source_lookup_current_own_xid(TransactionId xid, ClusterTTStatusKey *key,
-									 ClusterTTStatusResult *result)
-{
-	ClusterTTStatusSourceRequest request;
-	ClusterTTStatusSourceResult source_result;
-
-	if (key == NULL || result == NULL)
-		return false;
-	memset(&request, 0, sizeof(request));
-	memset(&source_result, 0, sizeof(source_result));
-	request.xid = xid;
-	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID,
-									  &request, &source_result)
-			!= CLUSTER_SEMANTIC_ADMISSION_OK
-		|| !source_result.bool_value)
-		return false;
-	*key = source_result.current_key;
-	*result = source_result.lookup;
-	return true;
 }
 
 
@@ -1016,13 +963,13 @@ cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
 					ClusterTTStatusKey initial_key;
 					ClusterTTStatusResult initial_result;
 
-					if (!current_mx_source_lookup_current_own_xid(
+					if (!cluster_runtime_visibility_current_owner_lookup_exact(
 							ask->xid, &initial_key, &initial_result)
 						|| !cluster_multixact_current_resolve_origin_member_proof(
 							ask->xid, ask->member_status, ask->member_ordinal,
 							(uint16)cluster_node_id, (uint32)current_epoch,
 							TransactionIdIsCurrentTransactionId(ask->xid), &initial_key,
-							&initial_result, current_mx_source_exact_lookup, NULL,
+							&initial_result, NULL, NULL,
 							&chunk_proofs[j]))
 						goto unknown;
 				}
@@ -1044,7 +991,7 @@ cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
 						wire_challenge->member_ordinal, (uint16)cluster_node_id,
 						(uint32)current_epoch,
 						TransactionIdIsCurrentTransactionId(wire_challenge->updater_xid),
-						&initial_key, &initial_result, current_mx_source_exact_lookup, NULL,
+						&initial_key, &initial_result, NULL, NULL,
 						&chunk_proofs[0]))
 					goto unknown;
 				chunk_count = 1;

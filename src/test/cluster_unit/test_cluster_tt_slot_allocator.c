@@ -1182,6 +1182,62 @@ UT_TEST(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded)
 	UT_ASSERT_EQ(memcmp(&owner, &(ClusterTTSlotCurrentOwner){0}, sizeof(owner)), 0);
 }
 
+UT_TEST(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation)
+{
+	bool retained = true;
+	bool current_drift = false;
+	uint16 wrap = TT_WRAP_INVALID;
+	uint16 result;
+
+	reset_allocator();
+	cluster_tt_slot_rollover(0, NODE0_SEG, NULL);
+	cluster_tt_slot_rollover(0, 2, NULL);
+
+	result = cluster_tt_slot_alloc_current_exact(
+		0, NODE0_SEG, (TransactionId)100, &retained, &current_drift, &wrap);
+	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT_EQ((int)retained, 0);
+	UT_ASSERT_EQ((int)current_drift, 1);
+	UT_ASSERT_EQ((int)wrap, (int)TT_WRAP_INVALID);
+	UT_ASSERT_EQ((int)cluster_tt_slot_current_segment(0), 2);
+
+	result = cluster_tt_slot_alloc_current_exact(
+		0, 2, (TransactionId)100, &retained, &current_drift, &wrap);
+	UT_ASSERT_EQ((int)result, 0);
+	UT_ASSERT_EQ((int)retained, 0);
+	UT_ASSERT_EQ((int)current_drift, 0);
+	UT_ASSERT_EQ((int)wrap, 0);
+}
+
+UT_TEST(test_t53_current_exact_alloc_captures_recycle_wrap_atomically)
+{
+	bool retained = false;
+	bool current_drift = false;
+	uint16 wrap = TT_WRAP_INVALID;
+	uint16 recycled;
+	uint16 first;
+	int i;
+
+	reset_allocator();
+	first = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
+	cluster_tt_slot_mark_aborted(NODE0_SEG, first, (TransactionId)100);
+	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
+		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(1000 + i));
+
+	recycled = cluster_tt_slot_alloc_current_exact(
+		0, NODE0_SEG, (TransactionId)99999,
+		&retained, &current_drift, &wrap);
+	UT_ASSERT_EQ((int)recycled, (int)first);
+	UT_ASSERT_EQ((int)retained, 0);
+	UT_ASSERT_EQ((int)current_drift, 0);
+	UT_ASSERT_EQ((int)wrap, 1);
+
+	/* A later rollover cannot invalidate the wrap returned by the same
+	 * allocator critical section that assigned the slot. */
+	cluster_tt_slot_rollover(0, 2, NULL);
+	UT_ASSERT_EQ((int)wrap, 1);
+}
+
 
 int
 main(void)
@@ -1241,6 +1297,8 @@ main(void)
 	UT_RUN(test_t49_peer_mode_aborted_remains_directly_recyclable);
 	UT_RUN(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor);
 	UT_RUN(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded);
+	UT_RUN(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation);
+	UT_RUN(test_t53_current_exact_alloc_captures_recycle_wrap_atomically);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

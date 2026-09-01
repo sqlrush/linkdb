@@ -212,6 +212,15 @@ cluster_undo_block0_sample_resident_generation(
 	const ClusterUndoBlock0ResolvedRoot *expected_root,
 	const ClusterUndoBlock0AuthorityProof *proof,
 	ClusterUndoBlock0Generation *observed_generation);
+/* Same exact sample, but never queues behind the resident content lock and
+ * never fills a missing slot.  CAPACITY_UNAVAILABLE means the caller must
+ * drop its later-ranked lock and retry from its original deadline. */
+extern ClusterUndoBlock0Result
+cluster_undo_block0_sample_resident_generation_conditional(
+	const ClusterUndoBlock0LogicalKey *logical,
+	const ClusterUndoBlock0ResolvedRoot *expected_root,
+	const ClusterUndoBlock0AuthorityProof *proof,
+	ClusterUndoBlock0Generation *observed_generation);
 extern ClusterUndoBlock0Result
 cluster_undo_block0_prove_strict_empty(
 	const ClusterUndoBlock0LogicalKey *logical,

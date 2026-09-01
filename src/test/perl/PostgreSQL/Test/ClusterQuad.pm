@@ -3520,8 +3520,8 @@ EOC
 			# above; this last-value-wins block is intentionally scoped to the
 			# user-approved happy-path campaign.
 			$node->append_conf('postgresql.conf', <<'EOC');
-shared_buffers = 512MB
-cluster.pcm_grd_max_entries = 65536
+shared_buffers = 1GB
+cluster.pcm_grd_max_entries = 131072
 cluster.ges_dedup_max_entries = 65536
 cluster.gcs_block_dedup_max_entries = 32768
 wal_buffers = 64MB

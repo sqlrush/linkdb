@@ -253,6 +253,22 @@ cluster_pcm_x_activation_fence_open(uint64 writer_activation_token,
 	return writer_activation_token == 0 && resource_x_activation_generation == 0;
 }
 
+/* VM/FSM readers may consume bytes under a pin alone.  Once an exact revoke
+ * is published, a first passive pin must therefore serialize with that
+ * publication under the BufferDesc header lock and retry without changing
+ * refcount.  Existing pins predate the fence and are drained separately
+ * before retained intent; no new ownership state is introduced here. */
+static inline bool
+cluster_pcm_x_aux_pin_admission_allowed(bool runtime_active, bool tracked,
+										ForkNumber forknum, uint32 flags)
+{
+	bool auxiliary = forknum == VISIBILITYMAP_FORKNUM
+		|| forknum == FSM_FORKNUM;
+
+	return !runtime_active || !tracked || !auxiliary
+		|| (flags & PCM_OWN_FLAG_REVOKING) == 0;
+}
+
 /* A committed node X is cache residency authority, not a fresh writer
  * conversion.  Consult the coherent ownership tuple before JOIN so repeated
  * local LockBuffer(X) calls keep the spec-4.7a hold-until-revoked fast path.
@@ -695,6 +711,9 @@ cluster_bufmgr_pcm_own_abort_held_x_revoke(
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_try_drain_held_x_revoke(
 	const ClusterPcmOwnHeldXRevoke *held);
+extern ClusterPcmOwnResult
+cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(
+	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking);
 extern ClusterPcmOwnResult
 cluster_bufmgr_pcm_own_finish_held_x_revoke_retain(
 	ClusterPcmOwnHeldXRevoke *held, XLogRecPtr expected_lsn,

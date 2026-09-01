@@ -67,10 +67,11 @@ cluster_hio_lease_target_block(Relation relation)
 #endif
 
 /* P0-20: acquire an ordered pair without ever sleeping on the second PCM-X
- * conversion while the first content lock is held.  BARRIER_CLOSED means the
- * first page was frozen before this nested edge became visible.  Release our
- * first lock, resolve the second conversion alone, then retry in the original
- * block order; pins remain owned by the caller throughout. */
+ * conversion while the first content lock is held.  A revoke can freeze the
+ * first page after the second acquire starts, so a barrier-aware blocking
+ * acquire is insufficient here: probe the second lock conditionally, release
+ * the first on every miss, resolve the second conversion alone, then retry in
+ * the original block order.  Pins remain owned by the caller throughout. */
 static void
 cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
 {
@@ -81,33 +82,12 @@ cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
 	for (;;)
 	{
 		LockBuffer(first, BUFFER_LOCK_EXCLUSIVE);
-		if (ClusterLockBufferExclusiveBarrierAware(second,
-												 CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND))
+		if (ConditionalLockBuffer(second))
 			return;
 
-		{
-			RelFileLocator refused_rlocator;
-			ForkNumber	refused_forknum;
-			BlockNumber refused_blocknum;
-
-			BufferGetTag(second, &refused_rlocator, &refused_forknum,
-						 &refused_blocknum);
-			LockBuffer(first, BUFFER_LOCK_UNLOCK);
-			ClusterObserveBufferBarrierReceipt(
-				CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND,
-				CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST,
-				refused_rlocator, refused_forknum, refused_blocknum,
-				CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK,
-				CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST);
-			LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
-			LockBuffer(second, BUFFER_LOCK_UNLOCK);
-			ClusterObserveBufferBarrierReceipt(
-				CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND,
-				CLUSTER_BUFFER_BARRIER_PHASE_REENTRY,
-				refused_rlocator, refused_forknum, refused_blocknum,
-				CLUSTER_BUFFER_BARRIER_OUTCOME_HIO_RETRY,
-				CLUSTER_BUFFER_BARRIER_PROOF_REENTRY);
-		}
+		LockBuffer(first, BUFFER_LOCK_UNLOCK);
+		LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
+		LockBuffer(second, BUFFER_LOCK_UNLOCK);
 	}
 }
 

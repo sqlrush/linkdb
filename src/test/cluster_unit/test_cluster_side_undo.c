@@ -41,6 +41,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 #include <stdio.h>
 
 static TTSlot apply_slot;
+static uint32 apply_generation = 9;
 static int apply_read_calls;
 static int apply_fail_on_read;
 
@@ -54,6 +55,75 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance pg_attribute_unused(),
 	apply_slot.xid = xid;
 	apply_slot.wrap = wrap;
 	apply_slot.commit_scn = commit_scn;
+}
+
+ClusterTTActiveTransitionDecision
+cluster_tt_durable_bind_preflight_exact(uint8 instance pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(), uint32 segment_generation,
+	uint16 slot_offset pg_attribute_unused(), uint16 wrap, TransactionId xid)
+{
+	if (segment_generation != apply_generation)
+		return segment_generation < apply_generation
+			? CLUSTER_TT_ACTIVE_STALE : CLUSTER_TT_ACTIVE_CORRUPT;
+	if (apply_slot.status == TT_SLOT_UNUSED)
+		return memcmp(&apply_slot, &(TTSlot){0}, sizeof(apply_slot)) == 0
+			? CLUSTER_TT_ACTIVE_APPLY : CLUSTER_TT_ACTIVE_CORRUPT;
+	if (apply_slot.status == TT_SLOT_ACTIVE && apply_slot.xid == xid
+		&& apply_slot.wrap == wrap && apply_slot.flags == TT_FLAGS_RESERVED
+		&& !SCN_VALID(apply_slot.commit_scn)
+		&& UBA_is_invalid(apply_slot.first_undo_block))
+		return CLUSTER_TT_ACTIVE_IDEMPOTENT;
+	return CLUSTER_TT_ACTIVE_CONFLICT;
+}
+
+void
+cluster_tt_durable_redo_bind_slot(uint8 instance pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(), uint32 segment_generation,
+	uint16 slot_offset pg_attribute_unused(), uint16 wrap, TransactionId xid)
+{
+	if (cluster_tt_durable_bind_preflight_exact(instance, segment_id,
+			segment_generation, slot_offset, wrap, xid)
+		!= CLUSTER_TT_ACTIVE_APPLY)
+		return;
+	memset(&apply_slot, 0, sizeof(apply_slot));
+	apply_slot.status = TT_SLOT_ACTIVE;
+	apply_slot.xid = xid;
+	apply_slot.wrap = wrap;
+}
+
+ClusterTTTerminalTransitionDecision
+cluster_tt_durable_abort_preflight_exact(uint8 instance pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(), uint32 segment_generation,
+	uint16 slot_offset pg_attribute_unused(), uint16 wrap, TransactionId xid)
+{
+	if (segment_generation != apply_generation)
+		return segment_generation < apply_generation
+			? CLUSTER_TT_TERMINAL_STALE : CLUSTER_TT_TERMINAL_CORRUPT;
+	if (apply_slot.status == TT_SLOT_ACTIVE
+		&& apply_slot.xid == xid && apply_slot.wrap == wrap
+		&& !SCN_VALID(apply_slot.commit_scn))
+		return CLUSTER_TT_TERMINAL_APPLY;
+	if (apply_slot.status == TT_SLOT_ABORTED
+		&& apply_slot.xid == xid && apply_slot.wrap == wrap
+		&& !SCN_VALID(apply_slot.commit_scn)
+		&& UBA_is_invalid(apply_slot.first_undo_block))
+		return CLUSTER_TT_TERMINAL_IDEMPOTENT;
+	return CLUSTER_TT_TERMINAL_CONFLICT;
+}
+
+void
+cluster_tt_durable_redo_abort_slot_exact(uint8 instance pg_attribute_unused(),
+	uint32 segment_id pg_attribute_unused(), uint32 segment_generation,
+	uint16 slot_offset pg_attribute_unused(), uint16 wrap, TransactionId xid)
+{
+	if (cluster_tt_durable_abort_preflight_exact(instance, segment_id,
+			segment_generation, slot_offset, wrap, xid)
+		!= CLUSTER_TT_TERMINAL_APPLY)
+		return;
+	apply_slot.status = TT_SLOT_ABORTED;
+	apply_slot.commit_scn = InvalidScn;
+	memset(&apply_slot.first_undo_block, 0,
+		sizeof(apply_slot.first_undo_block));
 }
 
 void
@@ -156,11 +226,54 @@ UT_TEST(test_decode_tt_commit_fields)
 	UT_ASSERT(cluster_undo_preflight(&out));
 }
 
+UT_TEST(test_decode_tt_bind_exact_shape_and_reserved_bytes)
+{
+	FakeRecord fr;
+	xl_undo_tt_slot_bind payload;
+	ClusterUndoDecoded out;
+	XLogReaderState *rec;
+
+	memset(&payload, 0, sizeof(payload));
+	payload.instance = 1;
+	payload.segment_id = 7;
+	payload.segment_generation = 9;
+	payload.slot_offset = 3;
+	payload.wrap = 0;
+	payload.xid = 1234;
+	payload.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND,
+		&payload, sizeof(payload));
+	UT_ASSERT(cluster_undo_decode(rec, &out));
+	UT_ASSERT_EQ((int)out.kind, (int)CLUSTER_UNDO_KIND_TT_BIND);
+	UT_ASSERT_EQ(out.instance, 1);
+	UT_ASSERT_EQ(out.segment_id, 7);
+	UT_ASSERT_EQ(out.expected_generation, 9);
+	UT_ASSERT_EQ(out.slot_offset, 3);
+	UT_ASSERT_EQ(out.wrap, 0);
+	UT_ASSERT_EQ(out.xid, 1234);
+	UT_ASSERT_EQ(out.format_version, CLUSTER_UNDO_TT_BIND_VERSION);
+	UT_ASSERT(cluster_undo_preflight(&out));
+
+	payload.reserved32 = 1;
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND,
+		&payload, sizeof(payload));
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
+	payload.reserved32 = 0;
+	payload.format_version++;
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND,
+		&payload, sizeof(payload));
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND,
+		&payload, sizeof(payload) - 1);
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
+}
+
 UT_TEST(test_decode_malformed_and_unknown_blocked)
 {
 	FakeRecord fr;
 	xl_undo_tt_slot_commit payload;
 	xl_undo_tt_slot_abort abort_payload;
+	xl_undo_tt_slot_abort_exact exact_abort;
 	xl_undo_tt_slot_set_head head_payload;
 	ClusterUndoDecoded out;
 	XLogReaderState *rec;
@@ -183,6 +296,25 @@ UT_TEST(test_decode_malformed_and_unknown_blocked)
 	/* Malformed length (too long). */
 	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT,
 					  &payload, sizeof(payload) + 1);
+	UT_ASSERT(!cluster_undo_decode(rec, &out));
+
+	memset(&exact_abort, 0, sizeof(exact_abort));
+	exact_abort.segment_id = 513;
+	exact_abort.segment_generation = 9;
+	exact_abort.xid = 801;
+	exact_abort.slot_offset = 4;
+	exact_abort.wrap = 0;
+	exact_abort.instance = 3;
+	exact_abort.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT,
+		&exact_abort, sizeof(exact_abort));
+	UT_ASSERT(cluster_undo_decode(rec, &out));
+	UT_ASSERT_EQ(out.expected_generation, 9);
+	UT_ASSERT_EQ(out.format_version, CLUSTER_UNDO_TT_ABORT_EXACT_VERSION);
+	UT_ASSERT(cluster_undo_preflight(&out));
+	exact_abort.reserved = 1;
+	rec = make_record(&fr, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_ABORT,
+		&exact_abort, sizeof(exact_abort));
 	UT_ASSERT(!cluster_undo_decode(rec, &out));
 
 	/* Cold and online share this padding gate before either may mutate. */
@@ -413,17 +545,100 @@ UT_TEST(test_typed_tt_apply_requires_exact_post_read)
 	apply_fail_on_read = 0;
 }
 
+UT_TEST(test_typed_tt_bind_applies_only_exact_generation_and_predecessor)
+{
+	ClusterUndoDecoded operation;
+
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = CLUSTER_UNDO_KIND_TT_BIND;
+	operation.opcode = XLOG_UNDO_TT_SLOT_BIND;
+	operation.instance = 3;
+	operation.segment_id = 513;
+	operation.expected_generation = 9;
+	operation.slot_offset = 4;
+	operation.wrap = 0;
+	operation.xid = 801;
+	operation.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	memset(&apply_slot, 0, sizeof(apply_slot));
+	apply_read_calls = 0;
+	apply_fail_on_read = 0;
+
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_APPLY);
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&operation),
+		CLUSTER_UNDO_APPLY_OK);
+	UT_ASSERT_EQ(apply_slot.status, TT_SLOT_ACTIVE);
+	UT_ASSERT_EQ(apply_slot.xid, operation.xid);
+	UT_ASSERT_EQ(apply_slot.wrap, operation.wrap);
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_PROVED_NOOP);
+
+	operation.expected_generation--;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_PROVED_NOOP);
+
+	operation.expected_generation += 2;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_BLOCKED);
+}
+
+UT_TEST(test_typed_exact_abort_requires_same_active_predecessor)
+{
+	ClusterUndoDecoded operation;
+
+	memset(&operation, 0, sizeof(operation));
+	operation.kind = CLUSTER_UNDO_KIND_TT_ABORT;
+	operation.opcode = XLOG_UNDO_TT_SLOT_ABORT;
+	operation.instance = 3;
+	operation.segment_id = 513;
+	operation.expected_generation = 9;
+	operation.slot_offset = 4;
+	operation.wrap = 7;
+	operation.xid = 801;
+	operation.format_version = CLUSTER_UNDO_TT_ABORT_EXACT_VERSION;
+	apply_generation = operation.expected_generation;
+	memset(&apply_slot, 0, sizeof(apply_slot));
+	apply_slot.status = TT_SLOT_ACTIVE;
+	apply_slot.xid = operation.xid;
+	apply_slot.wrap = operation.wrap;
+	apply_read_calls = 0;
+	apply_fail_on_read = 0;
+
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_APPLY);
+	UT_ASSERT_EQ(cluster_undo_apply_tt_v1(&operation),
+		CLUSTER_UNDO_APPLY_OK);
+	UT_ASSERT_EQ((int) apply_slot.status, (int) TT_SLOT_ABORTED);
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_PROVED_NOOP);
+
+	operation.expected_generation--;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_PROVED_NOOP);
+	operation.expected_generation += 2;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_BLOCKED);
+	operation.expected_generation = apply_generation;
+	apply_slot.status = TT_SLOT_ACTIVE;
+	apply_slot.xid++;
+	UT_ASSERT_EQ(cluster_undo_preflight_tt_target_v1(&operation),
+		CLUSTER_UNDO_TARGET_BLOCKED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(9);
 
 	UT_RUN(test_decode_tt_commit_fields);
+	UT_RUN(test_decode_tt_bind_exact_shape_and_reserved_bytes);
 	UT_RUN(test_decode_malformed_and_unknown_blocked);
 	UT_RUN(test_preflight_field_integrity_and_route);
 	UT_RUN(test_decode_block_write_fields);
 	UT_RUN(test_decode_set_head_and_multi_exact_shape);
 	UT_RUN(test_typed_tt_apply_requires_exact_post_read);
+	UT_RUN(test_typed_tt_bind_applies_only_exact_generation_and_predecessor);
+	UT_RUN(test_typed_exact_abort_requires_same_active_predecessor);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

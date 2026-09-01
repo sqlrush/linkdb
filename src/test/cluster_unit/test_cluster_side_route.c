@@ -96,6 +96,8 @@ UT_TEST(test_route_matrix_named_rows)
 	UT_ASSERT_EQ((int) row.kind, (int) CLUSTER_SIDE_ROUTE_PAGE);
 
 	/* Cluster undo truth; HWM stays BLOCKED (STOP-RF-SIDE-SPACE-ABI). */
+	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND, &row));
+	UT_ASSERT_EQ((int) row.kind, (int) CLUSTER_SIDE_ROUTE_TT_UNDO);
 	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_COMMIT, &row));
 	UT_ASSERT_EQ((int) row.kind, (int) CLUSTER_SIDE_ROUTE_TT_UNDO);
 	UT_ASSERT(cluster_side_route_lookup(RM_CLUSTER_UNDO_ID, XLOG_HW_RESERVE, &row));
@@ -148,7 +150,7 @@ UT_TEST(test_route_consumes_the_exhaustive_manifest)
 	bool		active;
 	size_t		i;
 
-	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 137);
+	UT_ASSERT_EQ(rf_opcode_route_manifest_count_v1(), 138);
 	for (i = 0; i < rf_opcode_route_manifest_count_v1(); i++)
 	{
 		UT_ASSERT(rf_opcode_route_manifest_entry_v1(i, &route, &active));

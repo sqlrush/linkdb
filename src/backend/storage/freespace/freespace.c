@@ -592,41 +592,34 @@ fsm_readbuf(Relation rel, FSMAddress addr, bool extend)
 	 * relation, as a concurrent extension can end up with vm_extend()
 	 * returning an already-initialized page.
 	 */
-	if (blkno >= reln->smgr_cached_nblocks[FSM_FORKNUM])
+	for (;;)
 	{
-		if (extend)
-			buf = fsm_extend(rel, blkno + 1);
+		if (blkno >= reln->smgr_cached_nblocks[FSM_FORKNUM])
+		{
+			if (extend)
+				buf = fsm_extend(rel, blkno + 1);
+			else
+				return InvalidBuffer;
+		}
 		else
-			return InvalidBuffer;
-	}
-	else
-		buf = ReadBufferExtended(rel, FSM_FORKNUM, blkno, RBM_ZERO_ON_ERROR, NULL);
+			buf = ReadBufferExtended(rel, FSM_FORKNUM, blkno,
+									 RBM_ZERO_ON_ERROR, NULL);
 
-	/*
-	 * Initializing the page when needed is trickier than it looks, because of
-	 * the possibility of multiple backends doing this concurrently, and our
-	 * desire to not uselessly take the buffer lock in the normal path where
-	 * the page is OK.  We must take the lock to initialize the page, so
-	 * recheck page newness after we have the lock, in case someone else
-	 * already did it.  Also, because we initially check PageIsNew with no
-	 * lock, it's possible to fall through and return the buffer while someone
-	 * else is still initializing the page (i.e., we might see pd_upper as set
-	 * but other page header fields are still zeroes).  This is harmless for
-	 * callers that will take a buffer lock themselves, but some callers
-	 * inspect the page without any lock at all.  The latter is OK only so
-	 * long as it doesn't depend on the page header having correct contents.
-	 * Current usage is safe because PageGetContents() does not require that.
-	 */
-	if (PageIsNew(BufferGetPage(buf)))
-	{
-		/* PGRAC: authorize this known FSM zero-page initialization without
-		 * admitting an ordinary N->X writer outside the PCM-X queue. */
-		LockBufferForFreeSpaceMapPageInit(buf);
+		/* A Resource-X wait may release the only FSM pin.  Descriptor reuse
+		 * returns InvalidBuffer rather than lending meaning to the stale numeric
+		 * handle; restart through this relation-aware read path and re-arm the
+		 * full exact direct-init proof. */
 		if (PageIsNew(BufferGetPage(buf)))
-			PageInit(BufferGetPage(buf), BLCKSZ, 0);
-		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		{
+			buf = LockBufferForFreeSpaceMapPageInit(buf);
+			if (!BufferIsValid(buf))
+				continue;
+			if (PageIsNew(BufferGetPage(buf)))
+				PageInit(BufferGetPage(buf), BLCKSZ, 0);
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+		}
+		return buf;
 	}
-	return buf;
 }
 
 /*

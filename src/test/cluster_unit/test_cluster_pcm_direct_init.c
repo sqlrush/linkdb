@@ -817,11 +817,168 @@ UT_TEST(test_heap_update_drops_vm_pin_across_heap_pcm_wait)
 	}
 }
 
+/* VM/FSM pin-only readers cannot retain a caller pin across a distributed
+ * Resource-X conversion.  Ordinary X, direct-init leader, and pending
+ * follower all use the same stack-only handoff: release every private ref,
+ * wait, then repin only the same BufferTag in the same descriptor before any
+ * content lock or page access. */
+UT_TEST(test_vm_fsm_resource_x_wait_releases_and_exactly_repins)
+{
+	char *bufmgr = read_source(BUFMGR_SOURCE_PATH);
+	const char *handoff;
+	const char *handoff_end;
+	const char *ordinary;
+	const char *ordinary_end;
+	const char *direct;
+	const char *direct_end;
+	const char *follower;
+	const char *follower_end;
+	static const char *const handoff_order[] = {
+		"cluster_pcm_x_revoke_finish_mode(expected_resource, 0)",
+		"GetPrivateRefCount(buffer)",
+		"BufferTagsEqual(expected_resource, &buf->tag)",
+		"handoff->tag = buf->tag",
+		"ReleaseBuffer(buffer)",
+		"ReadRecentBuffer(",
+		"BufferTagsEqual(&handoff->tag, &buf->tag)"
+	};
+	static const char *const ordinary_order[] = {
+		"cluster_bufmgr_pcm_aux_pin_handoff_begin(",
+		"cluster_bufmgr_pcm_x_writer_prepare_target(",
+		"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(",
+		"LWLockAcquire("
+	};
+	static const char *const direct_order[] = {
+		"aux_pin_required = kind == CLUSTER_PCM_DIRECT_INIT_VM",
+		"cluster_pcm_own_reservation_begin_exact(",
+		"if (aux_pin_required\n\t\t&& !cluster_bufmgr_pcm_aux_pin_handoff_begin(",
+		"cluster_gcs_resource_x_target_direct_init_acquire_exact(",
+		"if (aux_pin_required\n\t\t\t\t&& !cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(",
+		"cluster_pcm_direct_init_target_commit_validate("
+	};
+	static const char *const follower_order[] = {
+		"cluster_bufmgr_pcm_aux_pin_handoff_begin(",
+		"cluster_gcs_resource_x_target_direct_init_join_exact(",
+		"cluster_bufmgr_resource_x_wait_retry(",
+		"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact("
+	};
+
+	UT_ASSERT(bufmgr != NULL);
+	if (bufmgr == NULL)
+		return;
+	handoff = strstr(bufmgr, "\ncluster_bufmgr_pcm_aux_pin_handoff_begin(");
+	handoff_end = handoff != NULL
+		? strstr(handoff,
+			"\nstatic bool\ncluster_bufmgr_pcm_aux_pin_handoff_finish_exact(")
+		: NULL;
+	ordinary = strstr(bufmgr, "\nLockBufferInternal(");
+	ordinary_end = ordinary != NULL
+		? strstr(ordinary, "\nvoid\nLockBuffer(") : NULL;
+	direct = strstr(bufmgr, "\ncluster_bufmgr_pcm_gate_direct_init(");
+	direct_end = direct != NULL
+		? strstr(direct, "\n}\n\n#endif") : NULL;
+	follower = strstr(bufmgr,
+		"\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
+	follower_end = follower != NULL
+		? strstr(follower, "\ntypedef enum ClusterBufmgrPcmDirectInitArmResult")
+		: NULL;
+
+	UT_ASSERT(handoff != NULL);
+	UT_ASSERT(handoff_end != NULL);
+	UT_ASSERT(ordinary != NULL);
+	UT_ASSERT(ordinary_end != NULL);
+	UT_ASSERT(direct != NULL);
+	UT_ASSERT(direct_end != NULL);
+	UT_ASSERT(follower != NULL);
+	UT_ASSERT(follower_end != NULL);
+	if (handoff != NULL && handoff_end != NULL)
+	{
+		const char *pregrant_current_image = strstr(
+			handoff,
+			"cluster_bufmgr_pcm_current_image_locked(buf, buf_state)");
+
+		assert_ordered(handoff, handoff_order, lengthof(handoff_order));
+		UT_ASSERT(pregrant_current_image == NULL
+			|| pregrant_current_image >= handoff_end);
+	}
+	if (ordinary != NULL && ordinary_end != NULL)
+		assert_ordered(ordinary, ordinary_order, lengthof(ordinary_order));
+	if (direct != NULL && direct_end != NULL)
+		assert_ordered(direct, direct_order, lengthof(direct_order));
+	if (follower != NULL && follower_end != NULL)
+		assert_ordered(follower, follower_order, lengthof(follower_order));
+	free(bufmgr);
+}
+
+/* Proof arm still requires the caller's fresh pin.  Once that proof has
+ * atomically published exact VM/FSM GRANT_PENDING, however, the approved
+ * pin handoff deliberately drives the Resource-X round with shared refcount
+ * zero.  The live token/T2/T3 sidecars and fork-exact descriptor shape must
+ * cover that bounded interval; MAIN/INIT must retain their pin requirement. */
+UT_TEST(test_aux_direct_init_pending_lifecycle_survives_pin_handoff_only)
+{
+	char *bufmgr = read_source(BUFMGR_SOURCE_PATH);
+	const char *known_new;
+	const char *known_new_end;
+	const char *candidate;
+	const char *candidate_end;
+
+	UT_ASSERT(bufmgr != NULL);
+	if (bufmgr == NULL)
+		return;
+	known_new = strstr(bufmgr,
+		"\ncluster_bufmgr_pcm_direct_init_known_new_locked(");
+	known_new_end = known_new != NULL
+		? strstr(known_new,
+			"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_n_direct_init_candidate_exact(")
+		: NULL;
+	candidate = known_new_end;
+	candidate_end = candidate != NULL
+		? strstr(candidate,
+			"\n/* PGRAC adaptation for the Stage-8 remote non-requester S-holder path.")
+		: NULL;
+
+	UT_ASSERT(known_new != NULL);
+	UT_ASSERT(known_new_end != NULL);
+	UT_ASSERT(candidate != NULL);
+	UT_ASSERT(candidate_end != NULL);
+	if (known_new != NULL && known_new_end != NULL)
+	{
+		const char *aux_guard = strstr(known_new,
+			"aux_pin_handoff_protected");
+		const char *pending = strstr(known_new,
+			"PCM_OWN_FLAG_GRANT_PENDING");
+		const char *writer = strstr(known_new,
+			"cluster_pcm_own_writer_activation_token_get");
+		const char *resource_x = strstr(known_new,
+			"cluster_pcm_own_resource_x_activation_generation_get");
+		const char *fork_vm = strstr(known_new, "VISIBILITYMAP_FORKNUM");
+		const char *fork_fsm = strstr(known_new, "FSM_FORKNUM");
+
+		UT_ASSERT(aux_guard != NULL && aux_guard < known_new_end);
+		UT_ASSERT(pending != NULL && pending < known_new_end);
+		UT_ASSERT(writer != NULL && writer < known_new_end);
+		UT_ASSERT(resource_x != NULL && resource_x < known_new_end);
+		UT_ASSERT(fork_vm != NULL && fork_vm < known_new_end);
+		UT_ASSERT(fork_fsm != NULL && fork_fsm < known_new_end);
+		UT_ASSERT(strstr(known_new,
+			"BUF_STATE_GET_REFCOUNT(buf_state) != 0\n\t\t|| aux_pin_handoff_protected")
+			< known_new_end);
+	}
+	if (candidate != NULL && candidate_end != NULL)
+		UT_ASSERT(strstr(candidate,
+			"cluster_bufmgr_pcm_direct_init_known_new_locked(buf, buf_state)")
+			< candidate_end);
+	free(bufmgr);
+}
+
 /* P0-20: RelationGetBufferForTuple acquires two heap content locks for a
- * cross-page UPDATE.  If the second queue acquire sees the first page under
- * a frozen revoke barrier, it must release the first lock, resolve the second
- * conversion with no content lock held, and retry the ordered pair. */
-UT_TEST(test_cross_page_heap_pair_barrier_refusal_retries_unlocked)
+ * cross-page UPDATE.  The second acquire must always be conditional: a
+ * Resource-X conversion can start before a later type-17 freezes the first
+ * page, so barrier-aware blocking is still an outer-lock wait.  On any miss,
+ * release the first lock, resolve the second conversion with no content lock
+ * held, and retry the ordered pair. */
+UT_TEST(test_cross_page_heap_pair_second_acquire_never_waits_under_first)
 {
 	char *hio = read_source(HIO_SOURCE_PATH);
 	const char *helper;
@@ -840,13 +997,10 @@ UT_TEST(test_cross_page_heap_pair_barrier_refusal_retries_unlocked)
 	static const char *const helper_order[]
 		= { "cluster_hio_lock_buffer_pair(Buffer first, Buffer second)",
 			"LockBuffer(first, BUFFER_LOCK_EXCLUSIVE)",
-			"ClusterLockBufferExclusiveBarrierAware(second,",
-			"CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND",
+			"ConditionalLockBuffer(second)",
 			"LockBuffer(first, BUFFER_LOCK_UNLOCK)",
-			"CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST",
 			"LockBuffer(second, BUFFER_LOCK_EXCLUSIVE)",
-			"LockBuffer(second, BUFFER_LOCK_UNLOCK)",
-			"CLUSTER_BUFFER_BARRIER_PHASE_REENTRY" };
+			"LockBuffer(second, BUFFER_LOCK_UNLOCK)" };
 
 	UT_ASSERT(hio != NULL);
 	if (hio == NULL)
@@ -874,7 +1028,11 @@ UT_TEST(test_cross_page_heap_pair_barrier_refusal_retries_unlocked)
 	UT_ASSERT(relation != NULL);
 	UT_ASSERT(relation_end != NULL);
 	if (helper != NULL && helper_end != NULL)
+	{
 		assert_ordered(helper, helper_order, lengthof(helper_order));
+		UT_ASSERT(strstr(helper,
+			"ClusterLockBufferExclusiveBarrierAware(second,") == NULL);
+	}
 	UT_ASSERT(pins != NULL && pins_end != NULL && pins_call != NULL && pins_call < pins_end);
 	UT_ASSERT(lower_branch != NULL && lower_call != NULL && upper_branch != NULL
 			  && lower_call < upper_branch);
@@ -962,16 +1120,131 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 	if (hio != NULL)
 	{
 		UT_ASSERT_EQ(count_occurrences(hio,
-									   "ClusterLockBufferExclusiveBarrierAware("), 1);
-		UT_ASSERT(strstr(hio, "CLUSTER_BUFFER_BARRIER_SITE_HIO_PAIR_SECOND") != NULL);
+									   "ClusterLockBufferExclusiveBarrierAware("), 0);
+		UT_ASSERT(strstr(hio, "ConditionalLockBuffer(second)") != NULL);
 		free(hio);
+	}
+}
+
+/* A VM/FSM handoff deliberately drops every backend pin before waiting on
+ * Resource-X.  If replacement reuses the old BufferDesc during that window,
+ * the stale numeric Buffer handle is no longer safe to return to the caller.
+ * This is pre-mutation authority drift: the exact round/proof must be retried
+ * through the relation read path, without globally fencing the current R4
+ * gate and without silently treating the old descriptor as current. */
+UT_TEST(test_aux_repin_replacement_restarts_from_fresh_relation_ref)
+{
+	char *bufmgr = read_source(BUFMGR_SOURCE_PATH);
+	char *vm = read_source(VM_SOURCE_PATH);
+	char *fsm = read_source(FSM_SOURCE_PATH);
+	const char *join;
+	const char *join_decl;
+	const char *join_end;
+	const char *gate;
+	const char *gate_end;
+	const char *aux;
+	const char *aux_end;
+	const char *repin;
+	const char *post_t3;
+
+	UT_ASSERT(bufmgr != NULL);
+	UT_ASSERT(vm != NULL);
+	UT_ASSERT(fsm != NULL);
+	if (bufmgr != NULL)
+	{
+		join_decl = strstr(bufmgr,
+			"static bool\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
+		join = join_decl == NULL ? NULL : strstr(join_decl,
+			"\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
+		join_end = join == NULL ? NULL
+			: strstr(join,
+				"\ntypedef enum ClusterBufmgrPcmDirectInitArmResult");
+		gate = strstr(bufmgr, "\ncluster_bufmgr_pcm_gate_direct_init(");
+		gate_end = gate == NULL ? NULL : strstr(gate, "\n}\n\n#endif");
+		aux = strstr(bufmgr, "\nLockBufferForAuxiliaryPageInit(");
+		aux_end = aux == NULL ? NULL
+			: strstr(aux,
+				"\nBuffer\nLockBufferForVisibilityMapPageInit(");
+
+		UT_ASSERT(join != NULL);
+		UT_ASSERT(join_end != NULL);
+		UT_ASSERT(gate != NULL);
+		UT_ASSERT(gate_end != NULL);
+		UT_ASSERT(aux != NULL);
+		UT_ASSERT(aux_end != NULL);
+		if (join != NULL && join_end != NULL)
+		{
+			UT_ASSERT(strstr(join, "pin_handoff.active = false;") < join_end);
+			UT_ASSERT(strstr(join,
+				"cluster_bufmgr_resource_x_fail_closed_current()") == NULL
+				|| strstr(join,
+					"cluster_bufmgr_resource_x_fail_closed_current()") >= join_end);
+		}
+		if (gate != NULL && gate_end != NULL)
+		{
+			UT_ASSERT(strstr(gate, "bool *pin_replaced") < gate_end);
+			repin = strstr(gate,
+				"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(");
+			post_t3 = strstr(gate,
+				"The terminal round has already completed T2/T3");
+			UT_ASSERT(repin != NULL);
+			UT_ASSERT(post_t3 != NULL);
+			if (repin != NULL && post_t3 != NULL)
+			{
+				UT_ASSERT(repin < post_t3);
+				UT_ASSERT(strstr(repin, "*pin_replaced = true;") < post_t3);
+				UT_ASSERT(strstr(repin, "return false;") < post_t3);
+				UT_ASSERT(strstr(repin, "if (pin_replaced == NULL)") < post_t3);
+				UT_ASSERT(strstr(repin,
+					"cluster_bufmgr_resource_x_fail_closed_current()") < post_t3);
+			}
+		}
+		if (aux != NULL && aux_end != NULL)
+		{
+			UT_ASSERT(strstr(aux, "static Buffer") < aux);
+			UT_ASSERT(strstr(aux, "bool pin_replaced = false;") < aux_end);
+			UT_ASSERT(strstr(aux, "return InvalidBuffer;") < aux_end);
+		}
+		free(bufmgr);
+	}
+	if (vm != NULL)
+	{
+		const char *lock = strstr(vm,
+			"buf = LockBufferForVisibilityMapPageInit(buf);");
+		const char *invalid = lock == NULL ? NULL
+			: strstr(lock, "if (!BufferIsValid(buf))");
+		const char *retry = invalid == NULL ? NULL
+			: strstr(invalid, "continue;");
+
+		UT_ASSERT(lock != NULL);
+		UT_ASSERT(invalid != NULL);
+		UT_ASSERT(retry != NULL);
+		if (lock != NULL && invalid != NULL && retry != NULL)
+			UT_ASSERT(lock < invalid && invalid < retry);
+		free(vm);
+	}
+	if (fsm != NULL)
+	{
+		const char *lock = strstr(fsm,
+			"buf = LockBufferForFreeSpaceMapPageInit(buf);");
+		const char *invalid = lock == NULL ? NULL
+			: strstr(lock, "if (!BufferIsValid(buf))");
+		const char *retry = invalid == NULL ? NULL
+			: strstr(invalid, "continue;");
+
+		UT_ASSERT(lock != NULL);
+		UT_ASSERT(invalid != NULL);
+		UT_ASSERT(retry != NULL);
+		if (lock != NULL && invalid != NULL && retry != NULL)
+			UT_ASSERT(lock < invalid && invalid < retry);
+		free(fsm);
 	}
 }
 
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(30);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);
@@ -997,8 +1270,11 @@ main(void)
 	UT_RUN(test_wire_throw_exact_aborts_reservation_before_rethrow);
 	UT_RUN(test_precrit_vm_barrier_refusal_unwinds_to_caller);
 	UT_RUN(test_heap_update_drops_vm_pin_across_heap_pcm_wait);
-	UT_RUN(test_cross_page_heap_pair_barrier_refusal_retries_unlocked);
+	UT_RUN(test_vm_fsm_resource_x_wait_releases_and_exactly_repins);
+	UT_RUN(test_aux_direct_init_pending_lifecycle_survives_pin_handoff_only);
+	UT_RUN(test_cross_page_heap_pair_second_acquire_never_waits_under_first);
 	UT_RUN(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain);
+	UT_RUN(test_aux_repin_replacement_restarts_from_fresh_relation_ref);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

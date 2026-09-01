@@ -54,6 +54,57 @@ typedef enum ClusterTTRedoDecision {
 	CLUSTER_TT_REDO_BADSTATUS /* on-disk slot.status out of [0,4] (garbage; PANIC) */
 } ClusterTTRedoDecision;
 
+/* Exact compare-before-transition result for canonical ACTIVE. */
+typedef enum ClusterTTActiveTransitionDecision {
+	CLUSTER_TT_ACTIVE_APPLY = 0,
+	CLUSTER_TT_ACTIVE_IDEMPOTENT,
+	CLUSTER_TT_ACTIVE_STALE,
+	CLUSTER_TT_ACTIVE_CONFLICT,
+	CLUSTER_TT_ACTIVE_CORRUPT
+} ClusterTTActiveTransitionDecision;
+
+extern ClusterTTActiveTransitionDecision cluster_tt_active_transition_decide(
+	const TTSlot *predecessor, uint32 disk_generation,
+	uint32 expected_generation, TransactionId xid, uint16 wrap,
+	bool identity_authorized);
+
+/* Exact ACTIVE-to-terminal compare-before-transition result. */
+typedef enum ClusterTTTerminalTransitionDecision {
+	CLUSTER_TT_TERMINAL_APPLY = 0,
+	CLUSTER_TT_TERMINAL_IDEMPOTENT,
+	CLUSTER_TT_TERMINAL_STALE,
+	CLUSTER_TT_TERMINAL_CONFLICT,
+	CLUSTER_TT_TERMINAL_CORRUPT
+} ClusterTTTerminalTransitionDecision;
+
+extern ClusterTTTerminalTransitionDecision cluster_tt_terminal_transition_decide(
+	const TTSlot *predecessor, uint32 disk_generation,
+	uint32 expected_generation, TransactionId xid, uint16 wrap,
+	uint8 terminal_status, SCN commit_scn);
+
+/*
+ * Publish the canonical physical ACTIVE predecessor for one exact current
+ * allocator owner.  This may wait for block-zero current authority and perform
+ * WAL/I/O, so callers must invoke it before taking heap content locks.
+ */
+extern XLogRecPtr cluster_tt_slot_durable_publish_active(
+	const ClusterTTSlotCurrentOwner *expected_owner,
+	const ClusterSemanticAdmissionToken *admission,
+	uint32 *segment_generation_out, TTSlot *successor_out);
+
+/* Recovery/online-replay exact BIND predecessor classification and apply. */
+extern ClusterTTActiveTransitionDecision
+cluster_tt_durable_bind_preflight_exact(uint8 instance, uint32 segment_id,
+	uint32 segment_generation, uint16 slot_offset, uint16 wrap,
+	TransactionId xid);
+extern ClusterTTTerminalTransitionDecision
+cluster_tt_durable_abort_preflight_exact(uint8 instance, uint32 segment_id,
+	uint32 segment_generation, uint16 slot_offset, uint16 wrap,
+	TransactionId xid);
+extern void cluster_tt_durable_redo_bind_slot(uint8 instance,
+	uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
+	uint16 wrap, TransactionId xid);
+
 /*
  * cluster_tt_durable_redo_decide -- decide what an XLOG_UNDO_TT_SLOT_COMMIT
  *	redo should do to the on-disk slot, given the slot's current
@@ -149,11 +200,19 @@ extern void cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset
  *	cluster_tt_durable_redo_stamp_slot() (cluster_undo_xlog.c), driven by
  *	xact_redo_commit instead of the 0x30 redo.
  */
-extern uint8 cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint16 slot_offset,
-												  TransactionId xid, uint16 wrap,
+extern uint8 cluster_tt_slot_durable_commit_writeonly(uint32 segment_id,
+												  uint32 segment_generation,
+												  uint16 slot_offset, TransactionId xid, uint16 wrap,
 												  SCN commit_scn,
 												  const ClusterSemanticAdmissionToken *admission,
 												  TTSlot *successor_out);
+
+/* Ordinary abort: verify exact ACTIVE, emit+flush exact 0x60, then
+ * apply the identical ABORTED successor before allocator reuse. */
+extern XLogRecPtr cluster_tt_slot_durable_abort_exact(uint32 segment_id,
+	uint32 segment_generation, uint16 slot_offset, TransactionId xid,
+	uint16 wrap, const ClusterSemanticAdmissionToken *admission,
+	TTSlot *successor_out);
 
 /*
  * cluster_tt_slot_durable_abort -- spec-3.15 D5 (ROLLBACK PREPARED).
@@ -220,6 +279,9 @@ extern bool cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 
  */
 extern void cluster_tt_durable_redo_abort_slot(uint8 instance,
 	uint32 segment_id, uint16 slot_offset, uint16 wrap, TransactionId xid);
+extern void cluster_tt_durable_redo_abort_slot_exact(uint8 instance,
+	uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
+	uint16 wrap, TransactionId xid);
 extern void cluster_tt_durable_redo_set_head_slot(uint8 instance,
 	uint32 segment_id, uint16 slot_offset, uint16 wrap, TransactionId xid,
 	UBA first_undo_block);

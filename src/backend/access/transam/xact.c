@@ -2176,6 +2176,16 @@ RecordTransactionAbort(bool isSubXact)
 	}
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+	/* An ordinary abort may release its allocator slot only after the
+	 * exact canonical ACTIVE entity has an explicitly flushed 0x60 carrier and
+	 * the byte-identical ABORTED successor.  This remains before CRIT: the
+	 * helper may acquire block-zero current authority and perform WAL I/O. */
+	if (!isSubXact && cluster_storage_mode_enabled()
+		&& cluster_tt_local_has_binding(xid))
+		(void)cluster_tt_local_preabort_durable_finish(xid);
+#endif
+
 	/* XXX do we really need a critical section here? */
 	START_CRIT_SECTION();
 
@@ -6786,8 +6796,9 @@ xact_redo_commit(xl_xact_parsed_commit *parsed,
 	 * ordering violation, same contract as the 0x30 redo).
 	 */
 	if (parsed->has_tt_commit)
-		cluster_tt_durable_redo_stamp_slot(parsed->tt_commit.instance,
+		cluster_tt_durable_redo_stamp_slot_exact(parsed->tt_commit.instance,
 										   parsed->tt_commit.segment_id,
+										   parsed->tt_commit.segment_generation,
 										   parsed->tt_commit.slot_offset,
 										   parsed->tt_commit.wrap,
 										   parsed->tt_commit.xid,

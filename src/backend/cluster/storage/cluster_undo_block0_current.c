@@ -25,8 +25,12 @@
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_resid.h"
+#include "cluster/cluster_undo_retention.h"
+#include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/storage/cluster_undo_xlog.h"
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "storage/ipc.h"
@@ -1194,6 +1198,16 @@ current_held_xcur_proof(ClusterUndoBlock0CurrentGuard *guard,
 }
 
 ClusterUndoBlock0Result
+cluster_undo_block0_current_recheck_exclusive(
+	ClusterUndoBlock0CurrentGuard *guard)
+{
+	ClusterUndoBlock0CurrentGuardData *data;
+	ClusterUndoBlock0AuthorityProof proof;
+
+	return current_held_xcur_proof(guard, &data, &proof);
+}
+
+ClusterUndoBlock0Result
 cluster_undo_block0_current_sample_generation(ClusterUndoBlock0CurrentGuard *guard,
 										  const ClusterUndoBlock0ResolvedRoot *root,
 										  ClusterUndoBlock0Generation *observed)
@@ -1563,6 +1577,674 @@ cluster_undo_block0_current_live_owner_ensure_resident(
 		key, timeout_ms, NULL);
 }
 
+static bool
+current_reuse_page_identity(const char page[BLCKSZ],
+						const ClusterUndoBlock0LogicalKey *key,
+						uint32 generation, uint8 expected_state)
+{
+	const PageHeader ph = (const PageHeader)page;
+	const UndoSegmentHeaderData *header
+		= (const UndoSegmentHeaderData *)page;
+
+	return page != NULL && key != NULL
+		   && (ph->pd_flags & PD_UNDO_SEG_HEADER) != 0
+		   && PageGetPageSize((Page)page) == BLCKSZ
+		   && PageGetPageLayoutVersion((Page)page) == PG_PAGE_LAYOUT_VERSION
+		   && header->segment_id == key->segment_id
+		   && header->segment_size_bytes == UNDO_SEGMENT_SIZE_BYTES
+		   && header->owner_instance == key->owner_instance
+		   && header->tt_slots_count == TT_SLOTS_PER_SEGMENT
+		   && header->wrap_count == generation
+		   && header->segment_state == expected_state;
+}
+
+static bool
+current_reuse_predecessor_exact(const char disk_page[BLCKSZ],
+							const char resident_page[BLCKSZ],
+							const ClusterUndoBlock0LogicalKey *key,
+							uint32 generation)
+{
+	const UndoSegmentHeaderData *disk
+		= (const UndoSegmentHeaderData *)disk_page;
+	uint32 i;
+
+	if (!current_reuse_page_identity(disk_page, key, generation,
+			SEGMENT_RECYCLABLE)
+		|| !current_reuse_page_identity(resident_page, key, generation,
+			SEGMENT_RECYCLABLE)
+		|| memcmp(disk_page, resident_page, BLCKSZ) != 0)
+		return false;
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		if (disk->tt_slots[i].status == TT_SLOT_ACTIVE
+			|| disk->tt_slots[i].status == TT_SLOT_INVALID)
+			return false;
+	}
+	return true;
+}
+
+static bool
+current_reuse_successor_exact(const char successor_page[BLCKSZ],
+						  const ClusterUndoBlock0LogicalKey *key,
+						  uint32 successor_generation)
+{
+	PGAlignedBlock fresh;
+	UndoSegmentHeaderData *fresh_header
+		= (UndoSegmentHeaderData *)fresh.data;
+
+	if (successor_page == NULL || key == NULL)
+		return false;
+	cluster_undo_segment_make_header_bytes(key->segment_id,
+		key->owner_instance, fresh.data);
+	fresh_header->wrap_count = successor_generation;
+	return memcmp(successor_page, fresh.data, BLCKSZ) == 0;
+}
+
+/* A normal live lifecycle transition may change only the monotonic metadata
+ * owned by the segment lifecycle.  Canonical TT bytes, generation, page
+ * identity and all unnamed/reserved bytes remain byte-identical. */
+static bool
+current_lifecycle_successor_exact(const char predecessor_page[BLCKSZ],
+							  const char successor_page[BLCKSZ],
+							  const ClusterUndoBlock0LogicalKey *key,
+							  uint32 generation)
+{
+	const UndoSegmentHeaderData *before
+		= (const UndoSegmentHeaderData *)predecessor_page;
+	const UndoSegmentHeaderData *after
+		= (const UndoSegmentHeaderData *)successor_page;
+	PGAlignedBlock allowed;
+	UndoSegmentHeaderData *allowed_header
+		= (UndoSegmentHeaderData *)allowed.data;
+	uint32 i;
+
+	if (predecessor_page == NULL || successor_page == NULL || key == NULL
+		|| !current_reuse_page_identity(predecessor_page, key, generation,
+			before->segment_state)
+		|| !current_reuse_page_identity(successor_page, key, generation,
+			after->segment_state))
+		return false;
+	if (!(after->segment_state == before->segment_state
+		  || (before->segment_state == SEGMENT_ALLOCATED
+			  && after->segment_state == SEGMENT_ACTIVE)
+		  || (before->segment_state == SEGMENT_ACTIVE
+			  && after->segment_state == SEGMENT_COMMITTED)))
+		return false;
+	if ((after->segment_flags & before->segment_flags) != before->segment_flags
+		|| (after->segment_flags & ~UNDO_SEGMENT_FLAG_FULL) != 0)
+		return false;
+	if (after->tail_block != before->tail_block
+		&& !(before->tail_block == 0 && after->tail_block == 1))
+		return false;
+	if (UndoSegmentHeader_record_seal_upper_scn(after)
+		!= UndoSegmentHeader_record_seal_upper_scn(before)
+		&& !(SCN_VALID(UndoSegmentHeader_record_seal_upper_scn(after))
+			 && !SCN_VALID(UndoSegmentHeader_record_seal_upper_scn(before))))
+		return false;
+	for (i = 0; i < UNDO_FREE_BITMAP_BYTES; i++) {
+		if ((after->free_block_bitmap[i] & before->free_block_bitmap[i])
+			!= before->free_block_bitmap[i])
+			return false;
+	}
+
+	memcpy(allowed.data, predecessor_page, BLCKSZ);
+	allowed_header->segment_state = after->segment_state;
+	allowed_header->segment_flags = after->segment_flags;
+	allowed_header->tail_block = after->tail_block;
+	UndoSegmentHeader_set_record_seal_upper_scn(allowed_header,
+		UndoSegmentHeader_record_seal_upper_scn(after));
+	memcpy(allowed_header->free_block_bitmap, after->free_block_bitmap,
+		sizeof(allowed_header->free_block_bitmap));
+	return memcmp(allowed.data, successor_page, BLCKSZ) == 0;
+}
+
+/* Apply one byte-exact, same-generation lifecycle successor under the sole
+ * live 0xFB XCUR/content-X domain.  Callers freeze both images with no local
+ * lifecycle/content lock held.  A byte-identical already-applied successor is
+ * idempotent; every other predecessor drift fails closed. */
+ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_mutate_exact(
+	const ClusterUndoBlock0LogicalKey *key,
+	const ClusterUndoBlock0Generation *expected,
+	const char predecessor_page[BLCKSZ],
+	const char successor_page[BLCKSZ], int timeout_ms)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0Generation observed = { false, 0 };
+	PGAlignedBlock disk_block;
+	PGAlignedBlock rebased_block;
+	UndoSegmentHeaderData *rebased
+		= (UndoSegmentHeaderData *)rebased_block.data;
+	const UndoSegmentHeaderData *disk
+		= (const UndoSegmentHeaderData *)disk_block.data;
+	const char *publish_page = successor_page;
+	char *resident_page = NULL;
+	volatile ClusterUndoBlock0LiveOwnerCleanup cleanup;
+	ClusterUndoBlock0CurrentStep step;
+	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterUndoBlock0Result current_failure
+		= CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterSemanticAdmissionResult admission_result;
+	bool root_ok;
+
+	if (key == NULL || expected == NULL || !expected->known
+		|| expected->value == UINT32_MAX || predecessor_page == NULL
+		|| successor_page == NULL || timeout_ms <= 0
+		|| cluster_node_id < 0
+		|| key->owner_instance != (uint8)(cluster_node_id + 1)
+		|| !current_lifecycle_successor_exact(predecessor_page,
+			successor_page, key, expected->value))
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+
+	memset(&admission, 0, sizeof(admission));
+	memset(&pin, 0, sizeof(pin));
+	pin.slot = -1;
+	memset(&root, 0, sizeof(root));
+	memset(&final_root, 0, sizeof(final_root));
+	memset((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup, 0,
+		sizeof(cleanup));
+	cleanup.admission = &admission;
+	cleanup.guard = &guard;
+	cleanup.pin = &pin;
+
+	cluster_undo_block0_current_ensure_exit_hooks();
+	admission_result = cluster_semantic_activation_modifier_enter(true,
+		&admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	cleanup.admission_held = true;
+
+	PG_ENSURE_ERROR_CLEANUP(
+		current_live_owner_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	{
+		root_ok = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				  key->owner_instance, key->segment_id, &root)
+			: admission.side == CLUSTER_SEMANTIC_TARGET_SIDE
+			  ? cluster_semantic_activation_resolve_shared_undo_root(
+					&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					key->owner_instance, key->segment_id, &root)
+			  : false;
+		if (!root_ok)
+			goto mutate_done;
+
+		step = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_undo_block0_current_acquire_begin_live_owner_source(
+				  key, timeout_ms, &admission, &guard, &current_failure)
+			: cluster_undo_block0_current_acquire_begin_live_owner_target(
+				  key, timeout_ms, &admission, &guard, &current_failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			result = current_failure;
+			goto mutate_done;
+		}
+		cleanup.current_active = true;
+		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			CHECK_FOR_INTERRUPTS();
+			step = cluster_undo_block0_current_acquire_poll(
+				&guard, &current_failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				pg_usleep(1000L);
+		}
+		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+			result = current_failure;
+			goto mutate_done;
+		}
+
+		result = cluster_undo_block0_current_sample_generation_exclusive(
+			&guard, &root, &observed);
+		if (result != CLUSTER_UNDO_BLOCK0_OK)
+			goto mutate_done;
+		if (!cluster_undo_block0_generation_matches(&observed, expected)) {
+			result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+			goto mutate_done;
+		}
+		result = cluster_undo_block0_current_pin_exclusive(
+			&guard, &root, expected, &pin, &resident_page);
+		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_page == NULL)
+			goto mutate_done;
+		cleanup.pin_held = true;
+
+		if (!cluster_undo_smgr_read_block(root.intent, key->segment_id,
+				key->owner_instance, 0, disk_block.data)) {
+			result = CLUSTER_UNDO_BLOCK0_IO_ERROR;
+			goto mutate_done;
+		}
+		if (memcmp(disk_block.data, resident_page, BLCKSZ) != 0) {
+			result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+			goto mutate_done;
+		}
+		if (memcmp(disk_block.data, successor_page, BLCKSZ) == 0
+			&& memcmp(resident_page, successor_page, BLCKSZ) == 0) {
+			result = CLUSTER_UNDO_BLOCK0_OK;
+			goto mutate_done;
+		}
+		if (memcmp(disk_block.data, predecessor_page, BLCKSZ) != 0) {
+			/* A canonical TT publish may have landed after the lifecycle
+			 * caller froze its predecessor.  Rebase only the requested,
+			 * monotonic lifecycle fields onto the exact current page; the
+			 * validator below rejects every non-TT or non-monotonic drift. */
+			memcpy(rebased_block.data, successor_page, BLCKSZ);
+			memcpy(rebased->tt_slots, disk->tt_slots,
+				sizeof(rebased->tt_slots));
+			if (!current_lifecycle_successor_exact(disk_block.data,
+					rebased_block.data, key, expected->value)) {
+				result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+				goto mutate_done;
+			}
+			publish_page = rebased_block.data;
+		}
+
+		memset(&final_root, 0, sizeof(final_root));
+		root_ok = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				  key->owner_instance, key->segment_id, &final_root)
+			: admission.side == CLUSTER_SEMANTIC_TARGET_SIDE
+			  ? cluster_semantic_activation_resolve_shared_undo_root(
+					&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					key->owner_instance, key->segment_id, &final_root)
+			  : false;
+		if (!root_ok || !cluster_undo_block0_root_matches(&root, &final_root)
+			|| !cluster_semantic_activation_modifier_recheck(&admission, true)
+			|| cluster_undo_block0_current_recheck_exclusive(&guard)
+			   != CLUSTER_UNDO_BLOCK0_OK) {
+			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			goto mutate_done;
+		}
+
+		cluster_undo_block0_flush_sync(&pin, publish_page,
+			InvalidXLogRecPtr, false);
+		result = CLUSTER_UNDO_BLOCK0_OK;
+
+mutate_done:
+		if (cleanup.pin_held) {
+			cluster_undo_block0_unpin(&pin);
+			cleanup.pin_held = false;
+		}
+		if (cleanup.current_active) {
+			cluster_undo_block0_current_cancel(&guard);
+			cleanup.current_active = false;
+		}
+		cluster_semantic_activation_leave(&admission);
+		cleanup.admission_held = false;
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(
+		current_live_owner_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	return result;
+}
+
+/*
+ * Whole-segment reuse is the only live runtime transition that replaces the
+ * complete block-zero image.  Serialize that exact old-generation -> next-
+ * generation edge through the existing generation-independent 0xFB XCUR and
+ * the resident content-X pin, then let the resident flush primitive publish
+ * identical durable and resident bytes.  The lifecycle caller must invoke
+ * this with no lifecycle/content lock held.
+ */
+ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_reuse_exact(
+	const ClusterUndoBlock0LogicalKey *key,
+	const ClusterUndoBlock0Generation *expected,
+	const char successor_page[BLCKSZ], int timeout_ms)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0Generation observed = { false, 0 };
+	ClusterUndoBlock0Generation successor_generation = { false, 0 };
+	PGAlignedBlock disk_block;
+	char *resident_page = NULL;
+	volatile ClusterUndoBlock0LiveOwnerCleanup cleanup;
+	ClusterUndoBlock0CurrentStep step;
+	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterUndoBlock0Result current_failure
+		= CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterSemanticAdmissionResult admission_result;
+	XLogRecPtr reuse_lsn;
+	bool root_ok;
+
+	if (key == NULL || expected == NULL || !expected->known
+		|| expected->value == UINT32_MAX || successor_page == NULL
+		|| timeout_ms <= 0
+		|| cluster_node_id < 0
+		|| key->owner_instance != (uint8)(cluster_node_id + 1)
+		|| !cluster_undo_block0_generation_advance(expected,
+			&successor_generation)
+		|| !current_reuse_successor_exact(successor_page, key,
+			successor_generation.value))
+		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+
+	memset(&admission, 0, sizeof(admission));
+	memset(&pin, 0, sizeof(pin));
+	pin.slot = -1;
+	memset(&root, 0, sizeof(root));
+	memset(&final_root, 0, sizeof(final_root));
+	memset((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup, 0,
+		   sizeof(cleanup));
+	cleanup.admission = &admission;
+	cleanup.guard = &guard;
+	cleanup.pin = &pin;
+
+	cluster_undo_block0_current_ensure_exit_hooks();
+	admission_result = cluster_semantic_activation_modifier_enter(true,
+		&admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	cleanup.admission_held = true;
+
+	PG_ENSURE_ERROR_CLEANUP(
+		current_live_owner_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	{
+		root_ok = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				  key->owner_instance, key->segment_id, &root)
+			: admission.side == CLUSTER_SEMANTIC_TARGET_SIDE
+			  ? cluster_semantic_activation_resolve_shared_undo_root(
+					&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					key->owner_instance, key->segment_id, &root)
+			  : false;
+		if (!root_ok)
+			goto reuse_done;
+
+		step = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_undo_block0_current_acquire_begin_live_owner_source(
+				  key, timeout_ms, &admission, &guard, &current_failure)
+			: cluster_undo_block0_current_acquire_begin_live_owner_target(
+				  key, timeout_ms, &admission, &guard, &current_failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			result = current_failure;
+			goto reuse_done;
+		}
+		cleanup.current_active = true;
+		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			CHECK_FOR_INTERRUPTS();
+			step = cluster_undo_block0_current_acquire_poll(
+				&guard, &current_failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				pg_usleep(1000L);
+		}
+		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+			result = current_failure;
+			goto reuse_done;
+		}
+
+		result = cluster_undo_block0_current_sample_generation_exclusive(
+			&guard, &root, &observed);
+		if (result != CLUSTER_UNDO_BLOCK0_OK)
+			goto reuse_done;
+		if (!cluster_undo_block0_generation_matches(&observed, expected)) {
+			result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+			goto reuse_done;
+		}
+		result = cluster_undo_block0_current_pin_exclusive(
+			&guard, &root, expected, &pin, &resident_page);
+		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_page == NULL)
+			goto reuse_done;
+		cleanup.pin_held = true;
+
+		if (!cluster_undo_smgr_read_block(root.intent, key->segment_id,
+				key->owner_instance, 0, disk_block.data)) {
+			result = CLUSTER_UNDO_BLOCK0_IO_ERROR;
+			goto reuse_done;
+		}
+		if (!current_reuse_page_identity(disk_block.data, key,
+				expected->value, SEGMENT_RECYCLABLE)
+			|| ((UndoSegmentHeaderData *)resident_page)->wrap_count
+			   != expected->value) {
+			result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+			goto reuse_done;
+		}
+		if (!current_reuse_predecessor_exact(disk_block.data,
+				resident_page, key, expected->value)) {
+			result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+			goto reuse_done;
+		}
+
+		memset(&final_root, 0, sizeof(final_root));
+		root_ok = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				  key->owner_instance, key->segment_id, &final_root)
+			: admission.side == CLUSTER_SEMANTIC_TARGET_SIDE
+			  ? cluster_semantic_activation_resolve_shared_undo_root(
+					&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					key->owner_instance, key->segment_id, &final_root)
+			  : false;
+		if (!root_ok || !cluster_undo_block0_root_matches(&root, &final_root)
+			|| !cluster_semantic_activation_modifier_recheck(&admission, true)
+			|| cluster_undo_block0_current_recheck_exclusive(&guard)
+			   != CLUSTER_UNDO_BLOCK0_OK) {
+			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			goto reuse_done;
+		}
+
+		reuse_lsn = cluster_undo_emit_segment_reuse(key->owner_instance,
+			key->segment_id, expected->value, successor_generation.value,
+			successor_page);
+		if (XLogRecPtrIsInvalid(reuse_lsn)) {
+			result = CLUSTER_UNDO_BLOCK0_IO_ERROR;
+			goto reuse_done;
+		}
+		cluster_undo_block0_flush_sync(&pin, successor_page, reuse_lsn,
+			false);
+		result = CLUSTER_UNDO_BLOCK0_OK;
+
+reuse_done:
+		if (cleanup.pin_held) {
+			cluster_undo_block0_unpin(&pin);
+			cleanup.pin_held = false;
+		}
+		if (cleanup.current_active) {
+			cluster_undo_block0_current_cancel(&guard);
+			cleanup.current_active = false;
+		}
+		cluster_semantic_activation_leave(&admission);
+		cleanup.admission_held = false;
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(
+		current_live_owner_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	return result;
+}
+
+static bool
+current_recycle_resident_identity(const char page[BLCKSZ],
+							  const ClusterUndoBlock0LogicalKey *key,
+							  uint32 generation)
+{
+	const UndoSegmentHeaderData *header
+		= (const UndoSegmentHeaderData *)page;
+
+	return header != NULL
+		   && (header->segment_state == SEGMENT_ACTIVE
+			   || header->segment_state == SEGMENT_COMMITTED
+			   || header->segment_state == SEGMENT_RECYCLABLE)
+		   && current_reuse_page_identity(page, key, generation,
+			   header->segment_state);
+}
+
+ClusterUndoBlock0RecycleResult
+cluster_undo_block0_current_live_owner_recycle_exact(
+	const ClusterUndoBlock0LogicalKey *key, SCN horizon,
+	uint64 expected_epoch, int timeout_ms)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0Pin pin;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0ResolvedRoot final_root;
+	ClusterUndoBlock0Generation observed = { false, 0 };
+	PGAlignedBlock disk_block;
+	PGAlignedBlock successor_block;
+	UndoSegmentHeaderData *disk
+		= (UndoSegmentHeaderData *)disk_block.data;
+	UndoSegmentHeaderData *successor
+		= (UndoSegmentHeaderData *)successor_block.data;
+	char *resident_page = NULL;
+	volatile ClusterUndoBlock0LiveOwnerCleanup cleanup;
+	ClusterUndoBlock0CurrentStep step;
+	ClusterUndoBlock0Result current_failure
+		= CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+	ClusterUndoBlock0Result result;
+	ClusterSemanticAdmissionResult admission_result;
+	ClusterUndoBlock0RecycleResult recycle_result
+		= CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED;
+	XLogRecPtr recycle_lsn;
+	bool root_ok;
+
+	if (key == NULL || !SCN_VALID(horizon) || expected_epoch == 0
+		|| cluster_epoch_get_current() != expected_epoch || timeout_ms <= 0
+		|| cluster_node_id < 0
+		|| key->owner_instance != (uint8)(cluster_node_id + 1))
+		return CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED;
+
+	memset(&admission, 0, sizeof(admission));
+	memset(&pin, 0, sizeof(pin));
+	pin.slot = -1;
+	memset(&root, 0, sizeof(root));
+	memset(&final_root, 0, sizeof(final_root));
+	memset((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup, 0,
+		   sizeof(cleanup));
+	cleanup.admission = &admission;
+	cleanup.guard = &guard;
+	cleanup.pin = &pin;
+
+	cluster_undo_block0_current_ensure_exit_hooks();
+	admission_result = cluster_semantic_activation_modifier_enter(true,
+		&admission);
+	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return CLUSTER_UNDO_BLOCK0_RECYCLE_FAILED;
+	cleanup.admission_held = true;
+
+	PG_ENSURE_ERROR_CLEANUP(
+		current_live_owner_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	{
+		root_ok = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				  key->owner_instance, key->segment_id, &root)
+			: admission.side == CLUSTER_SEMANTIC_TARGET_SIDE
+			  ? cluster_semantic_activation_resolve_shared_undo_root(
+					&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					key->owner_instance, key->segment_id, &root)
+			  : false;
+		if (!root_ok)
+			goto recycle_done;
+
+		step = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_undo_block0_current_acquire_begin_live_owner_source(
+				  key, timeout_ms, &admission, &guard, &current_failure)
+			: cluster_undo_block0_current_acquire_begin_live_owner_target(
+				  key, timeout_ms, &admission, &guard, &current_failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
+			goto recycle_done;
+		cleanup.current_active = true;
+		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			CHECK_FOR_INTERRUPTS();
+			step = cluster_undo_block0_current_acquire_poll(
+				&guard, &current_failure);
+			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+				pg_usleep(1000L);
+		}
+		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+			goto recycle_done;
+
+		result = cluster_undo_block0_current_sample_generation_exclusive(
+			&guard, &root, &observed);
+		if (result != CLUSTER_UNDO_BLOCK0_OK || !observed.known
+			|| observed.value == UINT32_MAX)
+			goto recycle_done;
+		result = cluster_undo_block0_current_pin_exclusive(
+			&guard, &root, &observed, &pin, &resident_page);
+		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_page == NULL)
+			goto recycle_done;
+		cleanup.pin_held = true;
+
+		if (!cluster_undo_smgr_read_block(root.intent, key->segment_id,
+				key->owner_instance, 0, disk_block.data))
+			goto recycle_done;
+		if (!current_recycle_resident_identity(resident_page, key,
+				observed.value)
+			|| memcmp(disk->tt_slots,
+				   ((UndoSegmentHeaderData *)resident_page)->tt_slots,
+				   sizeof(disk->tt_slots)) != 0)
+			goto recycle_done;
+
+		if (current_reuse_page_identity(disk_block.data, key,
+				observed.value, SEGMENT_RECYCLABLE)) {
+			if (memcmp(disk_block.data, resident_page, BLCKSZ) != 0)
+				cluster_undo_block0_flush_sync(&pin, disk_block.data,
+					InvalidXLogRecPtr, false);
+			recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_ALREADY;
+			goto recycle_done;
+		}
+		if (!current_reuse_page_identity(disk_block.data, key,
+				observed.value, SEGMENT_COMMITTED)) {
+			recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_NOT_COMMITTED;
+			goto recycle_done;
+		}
+		if (!cluster_undo_segment_recyclable(disk, horizon)) {
+			recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED;
+			goto recycle_done;
+		}
+
+		memcpy(successor_block.data, disk_block.data, BLCKSZ);
+		successor->segment_state = SEGMENT_RECYCLABLE;
+		memset(&final_root, 0, sizeof(final_root));
+		root_ok = admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+				  key->owner_instance, key->segment_id, &final_root)
+			: admission.side == CLUSTER_SEMANTIC_TARGET_SIDE
+			  ? cluster_semantic_activation_resolve_shared_undo_root(
+					&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					key->owner_instance, key->segment_id, &final_root)
+			  : false;
+		if (!root_ok || !cluster_undo_block0_root_matches(&root, &final_root)
+			|| !cluster_semantic_activation_modifier_recheck(&admission, true)
+			|| cluster_epoch_get_current() != expected_epoch
+			|| cluster_undo_block0_current_recheck_exclusive(&guard)
+			   != CLUSTER_UNDO_BLOCK0_OK)
+			goto recycle_done;
+
+		recycle_lsn = cluster_undo_emit_segment_recycle(
+			key->owner_instance, key->segment_id, observed.value,
+			(uint8)SEGMENT_COMMITTED, (uint8)SEGMENT_RECYCLABLE);
+		if (XLogRecPtrIsInvalid(recycle_lsn))
+			goto recycle_done;
+		cluster_undo_block0_flush_sync(&pin, successor_block.data,
+			recycle_lsn, false);
+		recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED;
+
+recycle_done:
+		if (cleanup.pin_held) {
+			cluster_undo_block0_unpin(&pin);
+			cleanup.pin_held = false;
+		}
+		if (cleanup.current_active) {
+			cluster_undo_block0_current_cancel(&guard);
+			cleanup.current_active = false;
+		}
+		cluster_semantic_activation_leave(&admission);
+		cleanup.admission_held = false;
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(
+		current_live_owner_error_cleanup,
+		PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+	return recycle_result;
+}
+
 bool
 cluster_undo_block0_current_live_owner_publication_recheck(
 	const ClusterUndoBlock0LiveOwnerPublication *publication)
@@ -1606,5 +2288,51 @@ cluster_undo_block0_current_live_owner_publication_recheck(
 			&generation, &data->item.generation))
 		return false;
 
+	return cluster_semantic_activation_recheck(&data->admission);
+}
+
+
+bool
+cluster_undo_block0_current_live_owner_publication_recheck_conditional(
+	const ClusterUndoBlock0LiveOwnerPublication *publication)
+{
+	const ClusterUndoBlock0LiveOwnerPublicationData *data;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterUndoBlock0Generation generation = { false, 0 };
+	ClusterUndoBlock0Result result;
+	bool root_resolved;
+
+	if (publication == NULL)
+		return false;
+	data = (const ClusterUndoBlock0LiveOwnerPublicationData *)(const void *)publication;
+	if (data->magic != CLUSTER_UNDO_BLOCK0_LIVE_OWNER_PUBLICATION_MAGIC
+		|| data->reserved != 0
+		|| !cluster_semantic_activation_recheck(&data->admission))
+		return false;
+
+	memset(&root, 0, sizeof(root));
+	root_resolved
+		= data->admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+			  ? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+					&data->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					data->item.logical.owner_instance,
+					data->item.logical.segment_id, &root)
+			  : data->admission.side == CLUSTER_SEMANTIC_TARGET_SIDE
+				? cluster_semantic_activation_resolve_shared_undo_root(
+					  &data->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+					  data->item.logical.owner_instance,
+					  data->item.logical.segment_id, &root)
+				: false;
+	if (!root_resolved
+		|| !cluster_undo_block0_root_matches(&root, &data->item.resolved_root))
+		return false;
+
+	result = cluster_undo_block0_sample_resident_generation_conditional(
+		&data->item.logical, &data->item.resolved_root, &data->item.proof,
+		&generation);
+	if (result != CLUSTER_UNDO_BLOCK0_OK
+		|| !cluster_undo_block0_generation_matches(
+			&generation, &data->item.generation))
+		return false;
 	return cluster_semantic_activation_recheck(&data->admission);
 }

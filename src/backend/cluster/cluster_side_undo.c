@@ -43,6 +43,8 @@ cluster_undo_kind_for_opcode(uint16 opcode)
 	{
 		case XLOG_UNDO_SEGMENT_INIT:
 			return CLUSTER_UNDO_KIND_SEGMENT_INIT;
+		case XLOG_UNDO_TT_SLOT_BIND:
+			return CLUSTER_UNDO_KIND_TT_BIND;
 		case XLOG_UNDO_TT_SLOT_COMMIT:
 			return CLUSTER_UNDO_KIND_TT_COMMIT;
 		case XLOG_UNDO_TT_SLOT_ABORT:
@@ -85,6 +87,27 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	 * shapes the production redo handlers validate). */
 	switch (kind)
 	{
+		case CLUSTER_UNDO_KIND_TT_BIND:
+			{
+				xl_undo_tt_slot_bind rec;
+
+				if (XLogRecGetDataLen(record) != sizeof(rec))
+					return false;
+				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+				if (rec.format_version != CLUSTER_UNDO_TT_BIND_VERSION
+					|| rec.flags != 0 || rec.reserved8 != 0
+					|| rec.reserved32 != 0)
+					return false;
+				out->instance = rec.instance;
+				out->segment_id = rec.segment_id;
+				out->expected_generation = rec.segment_generation;
+				out->slot_offset = rec.slot_offset;
+				out->wrap = rec.wrap;
+				out->xid = rec.xid;
+				out->format_version = rec.format_version;
+				out->flags = rec.flags;
+				break;
+			}
 		case CLUSTER_UNDO_KIND_TT_COMMIT:
 			{
 				xl_undo_tt_slot_commit rec;
@@ -104,18 +127,38 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 			}
 		case CLUSTER_UNDO_KIND_TT_ABORT:
 			{
-				xl_undo_tt_slot_abort rec;
+				if (XLogRecGetDataLen(record)
+					== sizeof(xl_undo_tt_slot_abort_exact)) {
+					xl_undo_tt_slot_abort_exact rec;
 
-				if (XLogRecGetDataLen(record) != sizeof(rec))
-					return false;
-				memcpy(&rec, XLogRecGetData(record), sizeof(rec));
-				if (rec._pad[0] != 0 || rec._pad[1] != 0 || rec._pad[2] != 0)
-					return false;
-				out->instance = rec.instance;
-				out->segment_id = rec.segment_id;
-				out->slot_offset = rec.slot_offset;
-				out->wrap = rec.wrap;
-				out->xid = rec.xid;
+					memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+					if (rec.format_version
+							!= CLUSTER_UNDO_TT_ABORT_EXACT_VERSION
+						|| rec.flags != 0 || rec.reserved != 0)
+						return false;
+					out->instance = rec.instance;
+					out->segment_id = rec.segment_id;
+					out->expected_generation = rec.segment_generation;
+					out->slot_offset = rec.slot_offset;
+					out->wrap = rec.wrap;
+					out->xid = rec.xid;
+					out->format_version = rec.format_version;
+					out->flags = rec.flags;
+				} else {
+					xl_undo_tt_slot_abort rec;
+
+					if (XLogRecGetDataLen(record) != sizeof(rec))
+						return false;
+					memcpy(&rec, XLogRecGetData(record), sizeof(rec));
+					if (rec._pad[0] != 0 || rec._pad[1] != 0
+						|| rec._pad[2] != 0)
+						return false;
+					out->instance = rec.instance;
+					out->segment_id = rec.segment_id;
+					out->slot_offset = rec.slot_offset;
+					out->wrap = rec.wrap;
+					out->xid = rec.xid;
+				}
 				break;
 			}
 		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
@@ -330,8 +373,15 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 	}
 	switch (decoded->kind)
 	{
+		case CLUSTER_UNDO_KIND_TT_BIND:
+			if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT
+				|| !TransactionIdIsNormal(decoded->xid)
+				|| decoded->wrap == TT_WRAP_INVALID
+				|| decoded->format_version != CLUSTER_UNDO_TT_BIND_VERSION
+				|| decoded->flags != 0)
+				return false;
+			break;
 		case CLUSTER_UNDO_KIND_TT_COMMIT:
-		case CLUSTER_UNDO_KIND_TT_ABORT:
 		case CLUSTER_UNDO_KIND_TT_SET_HEAD:
 			if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT)
 				return false;
@@ -353,6 +403,19 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 					slot_offset != decoded->slot_offset)
 					return false;
 			}
+			break;
+		case CLUSTER_UNDO_KIND_TT_ABORT:
+			if (decoded->slot_offset >= TT_SLOTS_PER_SEGMENT
+				|| !TransactionIdIsNormal(decoded->xid))
+				return false;
+			if (decoded->format_version
+				== CLUSTER_UNDO_TT_ABORT_EXACT_VERSION) {
+				if (decoded->expected_generation == UINT32_MAX
+					|| decoded->wrap == TT_WRAP_INVALID
+					|| decoded->flags != 0)
+					return false;
+			} else if (decoded->format_version != 0 || decoded->wrap == 0)
+				return false;
 			break;
 		case CLUSTER_UNDO_KIND_SEGMENT_RECYCLE:
 			if (decoded->old_state != SEGMENT_COMMITTED ||
@@ -385,9 +448,39 @@ ClusterUndoTargetPreflightV1
 cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 {
 	TTSlot		slot;
+	ClusterTTActiveTransitionDecision bind_decision;
+	ClusterTTTerminalTransitionDecision abort_decision;
 
 	if (!cluster_undo_preflight(decoded))
 		return CLUSTER_UNDO_TARGET_BLOCKED;
+	if (decoded->kind == CLUSTER_UNDO_KIND_TT_BIND)
+	{
+		bind_decision = cluster_tt_durable_bind_preflight_exact(
+			decoded->instance, decoded->segment_id,
+			decoded->expected_generation, decoded->slot_offset,
+			decoded->wrap, decoded->xid);
+		if (bind_decision == CLUSTER_TT_ACTIVE_APPLY)
+			return CLUSTER_UNDO_TARGET_APPLY;
+		if (bind_decision == CLUSTER_TT_ACTIVE_IDEMPOTENT)
+			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
+		if (bind_decision == CLUSTER_TT_ACTIVE_STALE)
+			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
+		return CLUSTER_UNDO_TARGET_BLOCKED;
+	}
+	if (decoded->kind == CLUSTER_UNDO_KIND_TT_ABORT
+		&& decoded->format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)
+	{
+		abort_decision = cluster_tt_durable_abort_preflight_exact(
+			decoded->instance, decoded->segment_id,
+			decoded->expected_generation, decoded->slot_offset,
+			decoded->wrap, decoded->xid);
+		if (abort_decision == CLUSTER_TT_TERMINAL_APPLY)
+			return CLUSTER_UNDO_TARGET_APPLY;
+		if (abort_decision == CLUSTER_TT_TERMINAL_IDEMPOTENT
+			|| abort_decision == CLUSTER_TT_TERMINAL_STALE)
+			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
+		return CLUSTER_UNDO_TARGET_BLOCKED;
+	}
 	if (decoded->kind != CLUSTER_UNDO_KIND_TT_COMMIT &&
 		decoded->kind != CLUSTER_UNDO_KIND_TT_ABORT &&
 		decoded->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD)
@@ -398,6 +491,11 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 
 	switch (decoded->kind)
 	{
+		case CLUSTER_UNDO_KIND_TT_BIND:
+			cluster_tt_durable_redo_bind_slot(decoded->instance,
+				decoded->segment_id, decoded->expected_generation,
+				decoded->slot_offset, decoded->wrap, decoded->xid);
+			break;
 		case CLUSTER_UNDO_KIND_TT_COMMIT:
 			if (slot.status == TT_SLOT_COMMITTED &&
 				slot.commit_scn == decoded->commit_scn &&
@@ -445,12 +543,31 @@ cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
 		return CLUSTER_UNDO_APPLY_OK;
 	switch (decoded->kind)
 	{
+		case CLUSTER_UNDO_KIND_TT_BIND:
+			cluster_tt_durable_redo_bind_slot(decoded->instance,
+				decoded->segment_id, decoded->expected_generation,
+				decoded->slot_offset, decoded->wrap, decoded->xid);
+			break;
 		case CLUSTER_UNDO_KIND_TT_COMMIT:
 			cluster_tt_durable_redo_stamp_slot(decoded->instance,
 				decoded->segment_id, decoded->slot_offset, decoded->wrap,
 				decoded->xid, decoded->commit_scn);
 			break;
 		case CLUSTER_UNDO_KIND_TT_ABORT:
+			if (decoded->format_version
+				== CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)
+			{
+				cluster_tt_durable_redo_abort_slot_exact(decoded->instance,
+					decoded->segment_id, decoded->expected_generation,
+					decoded->slot_offset, decoded->wrap, decoded->xid);
+				if (cluster_tt_durable_abort_preflight_exact(
+						decoded->instance, decoded->segment_id,
+						decoded->expected_generation, decoded->slot_offset,
+						decoded->wrap, decoded->xid)
+					!= CLUSTER_TT_TERMINAL_IDEMPOTENT)
+					return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
+				return CLUSTER_UNDO_APPLY_OK;
+			}
 			cluster_tt_durable_redo_abort_slot(decoded->instance,
 				decoded->segment_id, decoded->slot_offset, decoded->wrap,
 				decoded->xid);
@@ -468,6 +585,13 @@ cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded)
 		return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
 	switch (decoded->kind)
 	{
+		case CLUSTER_UNDO_KIND_TT_BIND:
+			if (post_slot.status != TT_SLOT_ACTIVE ||
+				SCN_VALID(post_slot.commit_scn) ||
+				post_slot.flags != TT_FLAGS_RESERVED ||
+				!UBA_is_invalid(post_slot.first_undo_block))
+				return CLUSTER_UNDO_APPLY_POST_READ_FAILED;
+			break;
 		case CLUSTER_UNDO_KIND_TT_COMMIT:
 			if (post_slot.status != TT_SLOT_COMMITTED ||
 				post_slot.commit_scn != decoded->commit_scn ||

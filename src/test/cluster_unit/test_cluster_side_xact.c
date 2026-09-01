@@ -198,6 +198,15 @@ cluster_tt_durable_redo_stamp_slot(
 {
 }
 
+void
+cluster_tt_durable_redo_stamp_slot_exact(
+	uint8 instance pg_attribute_unused(), uint32 segment_id pg_attribute_unused(),
+	uint32 segment_generation pg_attribute_unused(),
+	uint16 slot_offset pg_attribute_unused(), uint16 wrap pg_attribute_unused(),
+	TransactionId xid pg_attribute_unused(), SCN commit_scn pg_attribute_unused())
+{
+}
+
 ClusterTTDurableResolve
 cluster_tt_slot_durable_resolve_by_xid_origin(
 	int origin_node pg_attribute_unused(), TransactionId xid pg_attribute_unused(),
@@ -295,9 +304,11 @@ make_commit(FakeXactRecord *fake, TransactionId xid, SCN scn,
 	wal_scn.scn = scn;
 	tt.instance = 3;
 	tt.segment_id = 9;
+	tt.segment_generation = 11;
 	tt.slot_offset = 4;
 	tt.wrap = 7;
 	tt.xid = conflicting_tt ? xid + 1 : xid;
+	tt.format_version = CLUSTER_XACT_TT_COMMIT_VERSION;
 	tt.commit_scn = scn;
 	cursor = fake->data;
 	memcpy(cursor, &commit, sizeof(commit));
@@ -766,6 +777,7 @@ UT_TEST(test_commit_decodes_to_immutable_truth_operation)
 	UT_ASSERT_EQ(operation.terminal_timestamp, INT64_C(123456));
 	UT_ASSERT(operation.has_tt_delta);
 	UT_ASSERT_EQ(operation.tt_delta.xid, 800);
+	UT_ASSERT_EQ(operation.tt_delta.segment_generation, 11);
 	UT_ASSERT_EQ(operation.tt_delta.commit_scn, UINT64_C(901));
 	UT_ASSERT(rf_side_xact_structural_preflight_v1(&operation));
 }

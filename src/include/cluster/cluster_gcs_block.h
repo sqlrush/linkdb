@@ -169,6 +169,204 @@ cluster_gcs_resource_x_target_terminal_resample_exact(
 		&& round->progress_flags == 0;
 }
 
+/* The same-node T1 executor can finish its exact N+GRANT_PENDING install and
+ * publish TERMINAL_X_CACHED after a follower sampled the BufferDesc but before
+ * the follower inspected the requester round.  The pending snapshot is not a
+ * second authority.  Permit only a fresh driver iteration when one ownership
+ * generation, the unchanged reservation token, and the independently frozen
+ * terminal round all identify the same completed install. */
+static inline bool
+cluster_gcs_resource_x_target_pending_terminal_resample_exact(
+	const ClusterPcmOwnSnapshot *before_pending,
+	const ClusterPcmOwnSnapshot *live_x,
+	ResourceXApplyResult round_snapshot_result,
+	const ResourceXBootstrapRoundFailureSnapshot *round)
+{
+	if (before_pending == NULL || live_x == NULL || round == NULL
+		|| round_snapshot_result != RESOURCE_X_APPLY_APPLIED
+		|| round->terminal != 1)
+		return false;
+	if (!BufferTagsEqual(&before_pending->tag, &live_x->tag)
+		|| !BufferTagsEqual(&live_x->tag,
+			&round->ref.assertion.resource)
+		|| before_pending->pcm_state != (uint8) PCM_STATE_N
+		|| before_pending->flags != PCM_OWN_FLAG_GRANT_PENDING
+		|| before_pending->generation >= UINT64_MAX - 1
+		|| before_pending->reservation_token == 0
+		|| before_pending->reservation_token == UINT64_MAX
+		|| before_pending->writer_activation_token != 0
+		|| before_pending->resource_x_activation_generation != 0
+		|| live_x->pcm_state != (uint8) PCM_STATE_X
+		|| live_x->flags != 0
+		|| live_x->generation != before_pending->generation + 1
+		|| live_x->reservation_token
+			!= before_pending->reservation_token
+		|| live_x->writer_activation_token != 0
+		|| live_x->resource_x_activation_generation != 0)
+		return false;
+	return round->buffer_ownership_generation == live_x->generation
+		&& round->ref.assertion.requester_node >= 0
+		&& round->ref.formation != 0
+		&& round->ref.formation != UINT64_MAX
+		&& round->ref.acquisition_generation != 0
+		&& round->ref.acquisition_generation != UINT64_MAX
+		&& round->base_authority_generation != 0
+		&& round->base_authority_generation != UINT64_MAX
+		&& round->authority_generation
+			> round->base_authority_generation
+		&& round->authority_generation != UINT64_MAX
+		&& round->r4_record_generation != 0
+		&& round->r4_record_generation != UINT64_MAX
+		&& round->master_session_incarnation != 0
+		&& round->master_session_incarnation != UINT64_MAX
+		&& round->absolute_deadline_us != 0
+		&& round->absolute_deadline_us != UINT64_MAX
+		&& round->retired_acquisition_generation
+			== round->ref.acquisition_generation
+		&& round->progress_flags == 0;
+}
+
+/* A direct-init reservation remains non-authoritative.  Durable storage is
+ * the ordinary known-new proof; the sole auxiliary exception permits an
+ * already-joined remote carrier only for VM/FSM, whose exact retained image
+ * is installed by the existing Resource-X target path before X commit. */
+static inline bool
+GcsBlockResourceXDirectInitProofAllowedExact(
+	const BufferTag *tag, bool durable_proof, bool remote_proof)
+{
+	if (tag == NULL || durable_proof == remote_proof)
+		return false;
+	if (durable_proof)
+		return true;
+	return remote_proof
+		&& (tag->forkNum == VISIBILITYMAP_FORKNUM
+			|| tag->forkNum == FSM_FORKNUM);
+}
+
+/* A clean cached X observation can race one complete type-17 X-to-N
+ * settlement before this requester creates a bootstrap round.  This
+ * predicate grants no authority and preserves no evidence: it permits only
+ * one fresh driver iteration when the current descriptor is the exact
+ * one-generation/one-token clean N successor, the round is still absent,
+ * the sampled authority tuple is still current, and the original deadline
+ * remains live. */
+static inline bool
+cluster_gcs_resource_x_target_empty_round_drift_retry_exact(
+	ResourceXBootstrapRoundAction action,
+	bool direct_init, bool join_only,
+	const ClusterPcmOwnSnapshot *before_x,
+	ClusterPcmOwnResult live_result,
+	const ClusterPcmOwnSnapshot *live_n,
+	ResourceXApplyResult round_snapshot_result,
+	bool authority_current,
+	uint64 now_us, uint64 absolute_deadline_us)
+{
+	if (action != RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
+		|| direct_init || join_only
+		|| before_x == NULL || live_n == NULL
+		|| live_result != CLUSTER_PCM_OWN_OK
+		|| round_snapshot_result != RESOURCE_X_APPLY_NOT_FOUND
+		|| !authority_current
+		|| now_us == 0 || now_us == UINT64_MAX
+		|| absolute_deadline_us == 0
+		|| absolute_deadline_us == UINT64_MAX
+		|| now_us >= absolute_deadline_us)
+		return false;
+	if (!BufferTagsEqual(&before_x->tag, &live_n->tag)
+		|| before_x->pcm_state != (uint8) PCM_STATE_X
+		|| before_x->flags != 0
+		|| before_x->generation == 0
+		|| before_x->generation >= UINT64_MAX - 1
+		|| before_x->reservation_token == 0
+		|| before_x->reservation_token >= UINT64_MAX - 1
+		|| before_x->writer_activation_token != 0
+		|| before_x->resource_x_activation_generation != 0
+		|| live_n->pcm_state != (uint8) PCM_STATE_N
+		|| live_n->flags != 0
+		|| live_n->generation != before_x->generation + 1
+		|| live_n->reservation_token
+			!= before_x->reservation_token + 1
+		|| live_n->writer_activation_token != 0
+		|| live_n->resource_x_activation_generation != 0)
+		return false;
+	return true;
+}
+
+/* A cached-X observation may race the physical half of an exact predecessor
+ * conversion.  The retained pair and N+PI carrier are independent current
+ * witnesses; together they authorize no transition, only one fresh driver
+ * iteration under the original deadline. */
+static inline bool
+cluster_gcs_resource_x_target_retained_predecessor_retry_exact(
+	ResourceXBootstrapRoundAction action,
+	bool direct_init, bool join_only,
+	const ClusterPcmOwnSnapshot *before_x,
+	ClusterPcmOwnResult live_result,
+	const ClusterPcmOwnSnapshot *live_n,
+	bool retained_pair_exact, bool retained_buffer_exact,
+	bool authority_current,
+	uint64 now_us, uint64 absolute_deadline_us)
+{
+	if (action != RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
+		|| direct_init || join_only
+		|| before_x == NULL || live_n == NULL
+		|| live_result != CLUSTER_PCM_OWN_OK
+		|| !retained_pair_exact || !retained_buffer_exact
+		|| !authority_current
+		|| now_us == 0 || now_us == UINT64_MAX
+		|| absolute_deadline_us == 0
+		|| absolute_deadline_us == UINT64_MAX
+		|| now_us >= absolute_deadline_us)
+		return false;
+	if (!BufferTagsEqual(&before_x->tag, &live_n->tag)
+		|| before_x->pcm_state != (uint8) PCM_STATE_X
+		|| before_x->flags != 0
+		|| before_x->generation == 0
+		|| before_x->generation >= UINT64_MAX - 1
+		|| before_x->reservation_token == 0
+		|| before_x->reservation_token == UINT64_MAX
+		|| before_x->writer_activation_token != 0
+		|| before_x->resource_x_activation_generation != 0
+		|| live_n->pcm_state != (uint8) PCM_STATE_N
+		|| (live_n->flags != PCM_OWN_FLAG_REVOKING
+			&& live_n->flags != 0)
+		|| live_n->generation != before_x->generation + 1
+		|| live_n->reservation_token == 0
+		|| live_n->reservation_token == UINT64_MAX
+		|| live_n->reservation_token <= before_x->reservation_token
+		|| live_n->writer_activation_token != 0
+		|| live_n->resource_x_activation_generation != 0)
+		return false;
+	return true;
+}
+
+/* An exact undrained retained pair may coexist briefly with the clean
+ * N+CURRENT successor produced by VM/FSM DROP.  This classifier grants no
+ * authority and does not consume the pair: it only permits the ordinary
+ * empty bootstrap-round step to observe the predecessor and return
+ * PREDECESSOR_WAIT.  N+PI remains owned by SourceSettlement's physical
+ * retained-release interlock. */
+static inline bool
+cluster_gcs_resource_x_target_undrained_current_predecessor_exact(
+	bool retained_pair_exact, bool retained_buffer_exact,
+	ClusterPcmOwnResult current_candidate_result,
+	const ClusterPcmOwnSnapshot *current_n)
+{
+	if (!retained_pair_exact || retained_buffer_exact
+		|| current_candidate_result != CLUSTER_PCM_OWN_OK
+		|| current_n == NULL
+		|| current_n->pcm_state != (uint8) PCM_STATE_N
+		|| current_n->flags != 0
+		|| current_n->generation == 0
+		|| current_n->generation == UINT64_MAX
+		|| current_n->reservation_token == 0
+		|| current_n->reservation_token == UINT64_MAX
+		|| current_n->writer_activation_token != 0
+		|| current_n->resource_x_activation_generation != 0)
+		return false;
+	return true;
+}
+
 /* D1 observability for the final requester-side dispatch fence.  Each bit
  * names one already-frozen predicate; the mask changes no retry or failure
  * policy and carries no authority. */
@@ -4281,7 +4479,8 @@ extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_exact(
  * the same nonzero value and can never refresh it. */
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_acquire_until_exact(
-	BufferDesc *buf, uint64 r4_record_generation,
+	BufferDesc *buf, const BufferTag *expected_resource,
+	uint64 r4_record_generation,
 	uint64 *absolute_deadline_us_io, ResourceXAcquisitionRef *ref_out);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_prepare_exact(
@@ -4296,13 +4495,15 @@ cluster_gcs_resource_x_target_evict_abort_exact(
 	ResourceXTargetEvictionPlan *plan);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_direct_init_acquire_exact(
-	BufferDesc *buf, uint64 r4_record_generation,
+	BufferDesc *buf, const BufferTag *expected_resource,
+	uint64 r4_record_generation,
 	uint64 direct_init_ownership_generation,
 	uint64 direct_init_reservation_token,
 	ResourceXAcquisitionRef *ref_out);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_direct_init_join_exact(
-	BufferDesc *buf, uint64 direct_init_ownership_generation,
+	BufferDesc *buf, const BufferTag *expected_resource,
+	uint64 direct_init_ownership_generation,
 	uint64 direct_init_reservation_token,
 	ResourceXAcquisitionRef *ref_out);
 extern bool cluster_gcs_resource_x_target_context_recheck_exact(
