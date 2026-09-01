@@ -1,0 +1,2039 @@
+{
+  "schema_version": 2,
+  "matrix_id": "S8-8.4D-CURRENT-MX-AUTHORITY-V2-CTRC",
+  "title": "Stage 8 current-MultiXact canonical authority and terminal-reference release matrix",
+  "status": "FROZEN_FOR_IMPLEMENTATION",
+  "approved_date": "2026-09-01",
+  "scope": {
+    "included": [
+      "ordinary Stage 8 point UPDATE+COMMIT current-MultiXact member proof",
+      "canonical physical TT ACTIVE/COMMITTED/ABORTED classification",
+      "current and rolled canonical TT segment lookup",
+      "whole-descriptor all-or-nothing member proof",
+      "requester-local PostgreSQL MultiXact conflict reduction",
+      "pre-mutation retry and fail-closed polarity",
+      "CTRC grant, receipt, terminal close, exact cleanout, durability settlement, and release certification",
+      "pre-mutation census and terminal discharge for ordinary shared heap ITL/UBA"
+    ],
+    "excluded": [
+      "positive prepared-transaction member proof",
+      "survivor physical rollback",
+      "full crash/rejoin/repeated-recoverer certification",
+      "shared catalog and shared WAL parity",
+      "performance optimization before correctness closure",
+      "positive recovery of lost volatile CTRC journals or seal coordinators",
+      "a new transaction status authority or background process"
+    ]
+  },
+  "evidence_classes": {
+    "ORACLE_FACT": "Directly supported by cited Oracle public documentation.",
+    "EVIDENCE_INFERENCE": "Necessary implication of Oracle facts plus the frozen PGRAC architecture; not claimed as an Oracle internal implementation detail.",
+    "PGRAC_ADAPTATION": "PGRAC-specific representation, algorithm, wire, lock, or test contract.",
+    "POSTGRESQL_COMPATIBILITY": "PostgreSQL-native MultiXact, CLOG, subtrans, wait-policy, or TM_Result behavior retained by the approved adaptation."
+  },
+  "invariants": [
+    {
+      "id": "MXA-I01",
+      "name": "CANONICAL_BYTES_ONLY",
+      "text": "Only the exact canonical physical TT slot sampled under stable block-0 current authority may provide ACTIVE, COMMITTED, or ABORTED transaction state.",
+      "evidence": "EVIDENCE_INFERENCE"
+    },
+    {
+      "id": "MXA-I02",
+      "name": "EXACT_IDENTITY",
+      "text": "The accepted identity is the exact origin, canonical segment, segment generation, slot offset, slot wrap, and xid; locator or allocator metadata alone is never a verdict.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I03",
+      "name": "ACTIVE_BEFORE_DEPENDENCY",
+      "text": "Canonical ACTIVE publication happens before dependent undo, ITL, tuple, heap WAL, GCS image, or member-proof exposure.",
+      "evidence": "EVIDENCE_INFERENCE"
+    },
+    {
+      "id": "MXA-I04",
+      "name": "CURRENT_ACTIVE_OWNER",
+      "text": "An ACTIVE result from the allocator-current segment additionally requires a stable exact ACTIVE allocator-owner observation; terminal results may use an exact matching terminal owner or a stable absent owner.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I05",
+      "name": "ROLLED_OWNER_NOT_AUTHORITY",
+      "text": "For a stably rolled segment, the current-owner index is not consulted. A unique physical locator, canonical bytes, native bracket, generation, root, epoch, and admission remain mandatory.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I06",
+      "name": "TERMINAL_NATIVE_BRACKET",
+      "text": "A COMMITTED or ABORTED verdict requires matching canonical terminal bytes and a matching stable native terminal bracket. An exact COMMITTED slot with a stable native in-progress bracket is not a terminal verdict and may only enter the conservative live transition rows; every other conflict or incomplete terminal publication is UNKNOWN.",
+      "evidence": "POSTGRESQL_COMPATIBILITY"
+    },
+    {
+      "id": "MXA-I07",
+      "name": "PREPARED_DISTINCT",
+      "text": "PREPARED is neither ACTIVE nor terminal for the Stage 8 current-MultiXact positive path and therefore produces no positive member proof.",
+      "evidence": "POSTGRESQL_COMPATIBILITY"
+    },
+    {
+      "id": "MXA-I08",
+      "name": "WHOLE_BATCH",
+      "text": "Every descriptor member must have one exact proof bound to its ordinal, xid, role, origin, epoch, request, and descriptor hash; any missing, duplicate, partial, unknown, or mismatched member makes the whole proof set UNKNOWN.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I09",
+      "name": "NO_RETRY_AFTER_MUTATION",
+      "text": "RETRY_REQUIRED is legal only before any heap, ITL, undo, shared-page, or proof-publication mutation. Drift detected after mutation is an invariant violation and fails closed.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I10",
+      "name": "NO_WAIT_UNDER_HEAP_CONTENT",
+      "text": "No network, file I/O, block-0 current acquisition, extent claim, recycle, autoextend, victim selection, or blocking non-heap lock occurs while a heap content lock is held.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I11",
+      "name": "UNKNOWN_PRECEDENCE",
+      "text": "An UNKNOWN member, malformed context, or unprovable updater successor takes precedence over otherwise compatible or terminal members.",
+      "evidence": "POSTGRESQL_COMPATIBILITY"
+    },
+    {
+      "id": "MXA-I12",
+      "name": "NO_PARTIAL_FALLBACK",
+      "text": "No current-MultiXact failure may fall back to local pg_multixact decoding for a foreign descriptor, raw xid CLOG/ProcArray authority, request-local rolled-live projection, overlay repair, or legacy ticket authority.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I13",
+      "name": "RELEASE_NOT_STATUS_AUTHORITY",
+      "text": "CTRC journals, receipts, ACKs, digests, dependency vectors, WAL certificates, and release bits prove reference discharge only and never provide ACTIVE, COMMITTED, or ABORTED status.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I14",
+      "name": "REGISTER_BEFORE_REFERENCE",
+      "text": "A nonzero origin grant and requester-local PREPARED receipt exist before any ordinary ITL/UBA, current-MX, updater-edge or recomposed-survivor physical-TT dependency is published; APPLIED precedes the first page mutation.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I15",
+      "name": "CLOSE_BEFORE_CENSUS",
+      "text": "Terminal census closes the exact key and grant generation at every origin-recorded touched node before freezing its receipt range.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I16",
+      "name": "PREPARED_MUST_DRAIN",
+      "text": "A participant release ACK is impossible while any matching receipt remains PREPARED; timeout or backend loss cannot imply cancellation.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I17",
+      "name": "CLEANOUT_BEFORE_RELEASE",
+      "text": "Every APPLIED reference is proven absent or rewritten to a terminal-independent page representation before participant ACK, with successor receipts preceding predecessor removal.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I18",
+      "name": "DURABILITY_BEFORE_CERTIFICATE",
+      "text": "Every participant cleanout WAL LSN and dependency-vector component is durable before the origin emits the sole release certificate.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I19",
+      "name": "LOSS_RETAINS",
+      "text": "Journal, boot, formation, admission, participant, ACK, checksum, or pre-certificate coordinator uncertainty retains or blocks the exact terminal slot.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I20",
+      "name": "BOUNDED_FAIL_CLOSED",
+      "text": "CTRC shared memory is bounded and activation-sized; exhaustion refuses before mutation and never evicts a live receipt or permits untracked publication.",
+      "evidence": "PGRAC_ADAPTATION"
+    },
+    {
+      "id": "MXA-I21",
+      "name": "COMMIT_HORIZON_STILL_REQUIRED",
+      "text": "Committed release requires both exact CTRC proof and the existing valid commit-SCN horizon; aborted release requires exact CTRC proof and durable ABORTED predecessor.",
+      "evidence": "EVIDENCE_INFERENCE"
+    },
+    {
+      "id": "MXA-I22",
+      "name": "COMPLETE_DEPENDENCY_CENSUS",
+      "text": "Every Stage 8 ordinary ITL/UBA, current-MX, updater-edge and recomposed-survivor physical-TT dependency is registered before mutation or is source-proven local/unreachable; a missing or skipped legacy ITL terminal hint is never release evidence.",
+      "evidence": "PGRAC_ADAPTATION"
+    }
+  ],
+  "domains": {
+    "authority": {
+      "requester_relation": [
+        "SELF_EXACT",
+        "OTHER"
+      ],
+      "locator": [
+        "EXACT_PHYSICAL",
+        "MISSING_OR_AMBIGUOUS",
+        "MALFORMED_OR_IDENTITY_MISMATCH"
+      ],
+      "segment_relation": [
+        "CURRENT_STABLE",
+        "ROLLED_STABLE",
+        "DRIFT_OR_UNKNOWN"
+      ],
+      "owner_observation": [
+        "EXACT_ACTIVE_STABLE",
+        "EXACT_COMMITTED_STABLE",
+        "EXACT_ABORTED_STABLE",
+        "ABSENT_STABLE",
+        "NOT_SAMPLED_ROLLED",
+        "MISMATCH_DRIFT_OR_UNAVAILABLE"
+      ],
+      "tt_slot": [
+        "UNUSED",
+        "ACTIVE_EXACT",
+        "COMMITTED_EXACT_VALID_SCN",
+        "COMMITTED_EXACT_INVALID_SCN",
+        "ABORTED_EXACT",
+        "RECYCLABLE",
+        "IDENTITY_MISMATCH",
+        "INVALID_DOMAIN"
+      ],
+      "native_bracket": [
+        "IN_PROGRESS",
+        "COMMITTED",
+        "ABORTED",
+        "SUB_TOP_IN_PROGRESS",
+        "SUB_TOP_COMMITTED",
+        "SUB_TOP_ABORTED",
+        "PREPARED",
+        "UNKNOWN_OR_DRIFT"
+      ],
+      "canonical_generation": [
+        "STABLE",
+        "UNKNOWN_OVERFLOW_OR_DRIFT"
+      ],
+      "root_admission_epoch": [
+        "STABLE_CURRENT",
+        "DRIFT_OR_NOT_ADMITTED"
+      ],
+      "mutation_phase": [
+        "PRE_SHARED_MUTATION",
+        "POST_SHARED_MUTATION"
+      ]
+    },
+    "composition": {
+      "input_validity": [
+        "VALID",
+        "INVALID"
+      ],
+      "proof_set": [
+        "ALL_PROVEN",
+        "ANY_UNKNOWN"
+      ],
+      "precheck": [
+        "OK",
+        "INVISIBLE",
+        "SELF_MODIFIED",
+        "BEING_MODIFIED"
+      ],
+      "self_effect": [
+        "NONE",
+        "SELF_MODIFIED",
+        "INVISIBLE"
+      ],
+      "committed_updater": [
+        "NONE",
+        "DELETED_TUPLE",
+        "UPDATED_VALID_PROOF",
+        "UPDATED_INVALID_PROOF"
+      ],
+      "active_follow_candidate": [
+        "NONE",
+        "VALID_PROOF",
+        "INVALID_PROOF"
+      ],
+      "active_conflict": [
+        "NONE",
+        "PRESENT"
+      ],
+      "action_class": [
+        "UPDATE_DELETE",
+        "LOCK_HOT"
+      ],
+      "wait_policy": [
+        "BLOCK",
+        "SKIP",
+        "ERROR"
+      ],
+      "wait_for_conflict": [
+        "YES",
+        "NO"
+      ]
+    }
+  },
+  "positive_authority_verdicts": [
+    "MEMBER_SELF",
+    "MEMBER_ACTIVE",
+    "MEMBER_COMMITTED",
+    "MEMBER_ABORTED"
+  ],
+  "positive_required_axes": [
+    "requester_relation",
+    "locator",
+    "segment_relation",
+    "owner_observation",
+    "tt_slot",
+    "native_bracket",
+    "canonical_generation",
+    "root_admission_epoch",
+    "mutation_phase"
+  ],
+  "authority_rules": [
+    {
+      "id": "MXA-A00",
+      "priority": 0,
+      "when": {
+        "mutation_phase": "POST_SHARED_MUTATION"
+      },
+      "verdict": "INVARIANT_VIOLATION_FAIL_CLOSED",
+      "reason": "AUTHORITY_DRIFT_OR_CLASSIFICATION_AFTER_SHARED_MUTATION",
+      "invariants": [
+        "MXA-I03",
+        "MXA-I09"
+      ],
+      "tests": [
+        "MXA-T09"
+      ]
+    },
+    {
+      "id": "MXA-A01",
+      "priority": 10,
+      "when": {
+        "root_admission_epoch": "DRIFT_OR_NOT_ADMITTED"
+      },
+      "verdict": "RETRY_REQUIRED",
+      "reason": "ROOT_ADMISSION_OR_EPOCH_CHANGED_BEFORE_MUTATION",
+      "invariants": [
+        "MXA-I09"
+      ],
+      "tests": [
+        "MXA-T08"
+      ]
+    },
+    {
+      "id": "MXA-A02",
+      "priority": 20,
+      "when": {
+        "canonical_generation": "UNKNOWN_OVERFLOW_OR_DRIFT"
+      },
+      "verdict": "RETRY_REQUIRED",
+      "reason": "CANONICAL_GENERATION_UNSTABLE_BEFORE_MUTATION",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I09"
+      ],
+      "tests": [
+        "MXA-T08"
+      ]
+    },
+    {
+      "id": "MXA-A03",
+      "priority": 30,
+      "when": {
+        "segment_relation": "DRIFT_OR_UNKNOWN"
+      },
+      "verdict": "RETRY_REQUIRED",
+      "reason": "ALLOCATOR_CURRENT_SEGMENT_CHANGED_BEFORE_MUTATION",
+      "invariants": [
+        "MXA-I02",
+        "MXA-I09"
+      ],
+      "tests": [
+        "MXA-T08"
+      ]
+    },
+    {
+      "id": "MXA-A04",
+      "priority": 40,
+      "when": {
+        "locator": [
+          "MISSING_OR_AMBIGUOUS",
+          "MALFORMED_OR_IDENTITY_MISMATCH"
+        ]
+      },
+      "verdict": "UNKNOWN_FAIL_CLOSED",
+      "reason": "NO_UNIQUE_EXACT_PHYSICAL_LOCATOR",
+      "invariants": [
+        "MXA-I02",
+        "MXA-I12"
+      ],
+      "tests": [
+        "MXA-T06"
+      ]
+    },
+    {
+      "id": "MXA-A05",
+      "priority": 50,
+      "when": {
+        "tt_slot": [
+          "UNUSED",
+          "COMMITTED_EXACT_INVALID_SCN",
+          "RECYCLABLE",
+          "IDENTITY_MISMATCH",
+          "INVALID_DOMAIN"
+        ]
+      },
+      "verdict": "UNKNOWN_FAIL_CLOSED",
+      "reason": "CANONICAL_SLOT_CANNOT_PROVE_ENTITY_STATE",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I02"
+      ],
+      "tests": [
+        "MXA-T06"
+      ]
+    },
+    {
+      "id": "MXA-A06",
+      "priority": 60,
+      "when": {
+        "native_bracket": [
+          "SUB_TOP_COMMITTED",
+          "PREPARED",
+          "UNKNOWN_OR_DRIFT"
+        ]
+      },
+      "verdict": "UNKNOWN_FAIL_CLOSED",
+      "reason": "NATIVE_BRACKET_NOT_STAGE8_CONCLUSIVE",
+      "invariants": [
+        "MXA-I06",
+        "MXA-I07"
+      ],
+      "tests": [
+        "MXA-T07",
+        "MXA-T09"
+      ]
+    },
+    {
+      "id": "MXA-A07",
+      "priority": 70,
+      "when": {
+        "segment_relation": "ROLLED_STABLE",
+        "owner_observation": [
+          "EXACT_ACTIVE_STABLE",
+          "EXACT_COMMITTED_STABLE",
+          "EXACT_ABORTED_STABLE",
+          "ABSENT_STABLE",
+          "MISMATCH_DRIFT_OR_UNAVAILABLE"
+        ]
+      },
+      "verdict": "UNKNOWN_FAIL_CLOSED",
+      "reason": "ROLLED_SEGMENT_MUST_NOT_USE_CURRENT_OWNER_INDEX",
+      "invariants": [
+        "MXA-I05"
+      ],
+      "tests": [
+        "MXA-T04",
+        "MXA-T05"
+      ]
+    },
+    {
+      "id": "MXA-A10",
+      "priority": 100,
+      "when": {
+        "requester_relation": "SELF_EXACT",
+        "locator": "EXACT_PHYSICAL",
+        "segment_relation": "CURRENT_STABLE",
+        "owner_observation": "EXACT_ACTIVE_STABLE",
+        "tt_slot": [
+          "ACTIVE_EXACT",
+          "COMMITTED_EXACT_VALID_SCN"
+        ],
+        "native_bracket": [
+          "IN_PROGRESS",
+          "SUB_TOP_IN_PROGRESS"
+        ],
+        "canonical_generation": "STABLE",
+        "root_admission_epoch": "STABLE_CURRENT",
+        "mutation_phase": "PRE_SHARED_MUTATION"
+      },
+      "verdict": "MEMBER_SELF",
+      "reason": "EXACT_SELF_LIVE_CURRENT_SEGMENT",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I02",
+        "MXA-I04"
+      ],
+      "tests": [
+        "MXA-T01",
+        "MXA-T19"
+      ]
+    },
+    {
+      "id": "MXA-A11",
+      "priority": 110,
+      "when": {
+        "requester_relation": "SELF_EXACT",
+        "locator": "EXACT_PHYSICAL",
+        "segment_relation": "ROLLED_STABLE",
+        "owner_observation": "NOT_SAMPLED_ROLLED",
+        "tt_slot": [
+          "ACTIVE_EXACT",
+          "COMMITTED_EXACT_VALID_SCN"
+        ],
+        "native_bracket": [
+          "IN_PROGRESS",
+          "SUB_TOP_IN_PROGRESS"
+        ],
+        "canonical_generation": "STABLE",
+        "root_admission_epoch": "STABLE_CURRENT",
+        "mutation_phase": "PRE_SHARED_MUTATION"
+      },
+      "verdict": "MEMBER_SELF",
+      "reason": "EXACT_SELF_LIVE_ROLLED_SEGMENT",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I02",
+        "MXA-I05"
+      ],
+      "tests": [
+        "MXA-T05",
+        "MXA-T19"
+      ]
+    },
+    {
+      "id": "MXA-A12",
+      "priority": 120,
+      "when": {
+        "requester_relation": "OTHER",
+        "locator": "EXACT_PHYSICAL",
+        "segment_relation": "CURRENT_STABLE",
+        "owner_observation": "EXACT_ACTIVE_STABLE",
+        "tt_slot": [
+          "ACTIVE_EXACT",
+          "COMMITTED_EXACT_VALID_SCN"
+        ],
+        "native_bracket": [
+          "IN_PROGRESS",
+          "SUB_TOP_IN_PROGRESS"
+        ],
+        "canonical_generation": "STABLE",
+        "root_admission_epoch": "STABLE_CURRENT",
+        "mutation_phase": "PRE_SHARED_MUTATION"
+      },
+      "verdict": "MEMBER_ACTIVE",
+      "reason": "EXACT_LIVE_CURRENT_SEGMENT",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I02",
+        "MXA-I04"
+      ],
+      "tests": [
+        "MXA-T01",
+        "MXA-T02",
+        "MXA-T19"
+      ]
+    },
+    {
+      "id": "MXA-A13",
+      "priority": 130,
+      "when": {
+        "requester_relation": "OTHER",
+        "locator": "EXACT_PHYSICAL",
+        "segment_relation": "ROLLED_STABLE",
+        "owner_observation": "NOT_SAMPLED_ROLLED",
+        "tt_slot": [
+          "ACTIVE_EXACT",
+          "COMMITTED_EXACT_VALID_SCN"
+        ],
+        "native_bracket": [
+          "IN_PROGRESS",
+          "SUB_TOP_IN_PROGRESS"
+        ],
+        "canonical_generation": "STABLE",
+        "root_admission_epoch": "STABLE_CURRENT",
+        "mutation_phase": "PRE_SHARED_MUTATION"
+      },
+      "verdict": "MEMBER_ACTIVE",
+      "reason": "EXACT_LIVE_ROLLED_SEGMENT",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I02",
+        "MXA-I05"
+      ],
+      "tests": [
+        "MXA-T05",
+        "MXA-T19"
+      ]
+    },
+    {
+      "id": "MXA-A14",
+      "priority": 140,
+      "when": {
+        "requester_relation": "OTHER",
+        "locator": "EXACT_PHYSICAL",
+        "segment_relation": "CURRENT_STABLE",
+        "owner_observation": [
+          "EXACT_COMMITTED_STABLE",
+          "ABSENT_STABLE"
+        ],
+        "tt_slot": "COMMITTED_EXACT_VALID_SCN",
+        "native_bracket": "COMMITTED",
+        "canonical_generation": "STABLE",
+        "root_admission_epoch": "STABLE_CURRENT",
+        "mutation_phase": "PRE_SHARED_MUTATION"
+      },
+      "verdict": "MEMBER_COMMITTED",
+      "reason": "EXACT_TERMINAL_COMMIT_CURRENT_SEGMENT",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I04",
+        "MXA-I06"
+      ],
+      "tests": [
+        "MXA-T03"
+      ]
+    },
+    {
+      "id": "MXA-A15",
+      "priority": 150,
+      "when": {
+        "requester_relation": "OTHER",
+        "locator": "EXACT_PHYSICAL",
+        "segment_relation": "ROLLED_STABLE",
+        "owner_observation": "NOT_SAMPLED_ROLLED",
+        "tt_slot": "COMMITTED_EXACT_VALID_SCN",
+        "native_bracket": "COMMITTED",
+        "canonical_generation": "STABLE",
+        "root_admission_epoch": "STABLE_CURRENT",
+        "mutation_phase": "PRE_SHARED_MUTATION"
+      },
+      "verdict": "MEMBER_COMMITTED",
+      "reason": "EXACT_TERMINAL_COMMIT_ROLLED_SEGMENT",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I05",
+        "MXA-I06"
+      ],
+      "tests": [
+        "MXA-T04"
+      ]
+    },
+    {
+      "id": "MXA-A16",
+      "priority": 160,
+      "when": {
+        "requester_relation": "OTHER",
+        "locator": "EXACT_PHYSICAL",
+        "segment_relation": "CURRENT_STABLE",
+        "owner_observation": [
+          "EXACT_ABORTED_STABLE",
+          "ABSENT_STABLE"
+        ],
+        "tt_slot": "ABORTED_EXACT",
+        "native_bracket": [
+          "ABORTED",
+          "SUB_TOP_ABORTED"
+        ],
+        "canonical_generation": "STABLE",
+        "root_admission_epoch": "STABLE_CURRENT",
+        "mutation_phase": "PRE_SHARED_MUTATION"
+      },
+      "verdict": "MEMBER_ABORTED",
+      "reason": "EXACT_TERMINAL_ABORT_CURRENT_SEGMENT",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I04",
+        "MXA-I06"
+      ],
+      "tests": [
+        "MXA-T03",
+        "MXA-T07"
+      ]
+    },
+    {
+      "id": "MXA-A17",
+      "priority": 170,
+      "when": {
+        "requester_relation": "OTHER",
+        "locator": "EXACT_PHYSICAL",
+        "segment_relation": "ROLLED_STABLE",
+        "owner_observation": "NOT_SAMPLED_ROLLED",
+        "tt_slot": "ABORTED_EXACT",
+        "native_bracket": [
+          "ABORTED",
+          "SUB_TOP_ABORTED"
+        ],
+        "canonical_generation": "STABLE",
+        "root_admission_epoch": "STABLE_CURRENT",
+        "mutation_phase": "PRE_SHARED_MUTATION"
+      },
+      "verdict": "MEMBER_ABORTED",
+      "reason": "EXACT_TERMINAL_ABORT_ROLLED_SEGMENT",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I05",
+        "MXA-I06"
+      ],
+      "tests": [
+        "MXA-T04",
+        "MXA-T07"
+      ]
+    },
+    {
+      "id": "MXA-A99",
+      "priority": 999,
+      "when": {},
+      "verdict": "UNKNOWN_FAIL_CLOSED",
+      "reason": "NO_EXACT_POSITIVE_ROW",
+      "invariants": [
+        "MXA-I01",
+        "MXA-I06",
+        "MXA-I07",
+        "MXA-I12"
+      ],
+      "tests": [
+        "MXA-T02",
+        "MXA-T06",
+        "MXA-T07",
+        "MXA-T09"
+      ]
+    }
+  ],
+  "composition_rules": [
+    {
+      "id": "MXA-C00",
+      "priority": 0,
+      "when": {
+        "input_validity": "INVALID"
+      },
+      "decision": "CMDL_UNKNOWN",
+      "tests": [
+        "MXA-T10"
+      ]
+    },
+    {
+      "id": "MXA-C01",
+      "priority": 10,
+      "when": {
+        "proof_set": "ANY_UNKNOWN"
+      },
+      "decision": "CMDL_UNKNOWN",
+      "tests": [
+        "MXA-T10",
+        "MXA-T13"
+      ]
+    },
+    {
+      "id": "MXA-C02",
+      "priority": 20,
+      "when": {
+        "precheck": "INVISIBLE"
+      },
+      "decision": "CMDL_INVISIBLE",
+      "tests": [
+        "MXA-T11"
+      ]
+    },
+    {
+      "id": "MXA-C03",
+      "priority": 30,
+      "when": {
+        "precheck": "SELF_MODIFIED"
+      },
+      "decision": "CMDL_SELF_MODIFIED",
+      "tests": [
+        "MXA-T11"
+      ]
+    },
+    {
+      "id": "MXA-C04",
+      "priority": 40,
+      "when": {
+        "self_effect": "SELF_MODIFIED"
+      },
+      "decision": "CMDL_SELF_MODIFIED",
+      "tests": [
+        "MXA-T11"
+      ]
+    },
+    {
+      "id": "MXA-C05",
+      "priority": 50,
+      "when": {
+        "self_effect": "INVISIBLE"
+      },
+      "decision": "CMDL_INVISIBLE",
+      "tests": [
+        "MXA-T11"
+      ]
+    },
+    {
+      "id": "MXA-C06",
+      "priority": 60,
+      "when": {
+        "committed_updater": "DELETED_TUPLE"
+      },
+      "decision": "CMDL_DELETED",
+      "tests": [
+        "MXA-T11"
+      ]
+    },
+    {
+      "id": "MXA-C07",
+      "priority": 70,
+      "when": {
+        "committed_updater": "UPDATED_VALID_PROOF"
+      },
+      "decision": "CMDL_UPDATED",
+      "tests": [
+        "MXA-T11"
+      ]
+    },
+    {
+      "id": "MXA-C08",
+      "priority": 80,
+      "when": {
+        "committed_updater": "UPDATED_INVALID_PROOF"
+      },
+      "decision": "CMDL_UNKNOWN",
+      "tests": [
+        "MXA-T13"
+      ]
+    },
+    {
+      "id": "MXA-C09",
+      "priority": 90,
+      "when": {
+        "active_follow_candidate": "VALID_PROOF",
+        "active_conflict": "NONE"
+      },
+      "decision": "CMDL_FOLLOW_UPDATED",
+      "tests": [
+        "MXA-T11"
+      ]
+    },
+    {
+      "id": "MXA-C10",
+      "priority": 100,
+      "when": {
+        "active_follow_candidate": "INVALID_PROOF",
+        "active_conflict": "NONE"
+      },
+      "decision": "CMDL_UNKNOWN",
+      "tests": [
+        "MXA-T13"
+      ]
+    },
+    {
+      "id": "MXA-C11",
+      "priority": 110,
+      "when": {
+        "active_conflict": "PRESENT",
+        "action_class": "UPDATE_DELETE",
+        "wait_for_conflict": "NO"
+      },
+      "decision": "CMDL_BEING_MODIFIED",
+      "tests": [
+        "MXA-T12"
+      ]
+    },
+    {
+      "id": "MXA-C12",
+      "priority": 120,
+      "when": {
+        "active_conflict": "PRESENT",
+        "action_class": "UPDATE_DELETE",
+        "wait_for_conflict": "YES"
+      },
+      "decision": "CMDL_WAIT_MEMBER",
+      "tests": [
+        "MXA-T12"
+      ]
+    },
+    {
+      "id": "MXA-C13",
+      "priority": 130,
+      "when": {
+        "active_conflict": "PRESENT",
+        "action_class": "LOCK_HOT",
+        "wait_policy": "SKIP"
+      },
+      "decision": "CMDL_WOULD_BLOCK",
+      "tests": [
+        "MXA-T12"
+      ]
+    },
+    {
+      "id": "MXA-C14",
+      "priority": 140,
+      "when": {
+        "active_conflict": "PRESENT",
+        "action_class": "LOCK_HOT",
+        "wait_policy": "ERROR"
+      },
+      "decision": "CMDL_LOCK_NOT_AVAILABLE",
+      "tests": [
+        "MXA-T12"
+      ]
+    },
+    {
+      "id": "MXA-C15",
+      "priority": 150,
+      "when": {
+        "active_conflict": "PRESENT",
+        "action_class": "LOCK_HOT",
+        "wait_policy": "BLOCK"
+      },
+      "decision": "CMDL_WAIT_MEMBER",
+      "tests": [
+        "MXA-T12"
+      ]
+    },
+    {
+      "id": "MXA-C99",
+      "priority": 999,
+      "when": {},
+      "decision": "CMDL_CONTINUE",
+      "tests": [
+        "MXA-T11"
+      ]
+    }
+  ],
+  "native_conflict_matrix": {
+    "modes": [
+      "LockTupleKeyShare",
+      "LockTupleShare",
+      "LockTupleNoKeyExclusive",
+      "LockTupleExclusive"
+    ],
+    "rows": {
+      "MultiXactStatusForKeyShare": [
+        false,
+        false,
+        false,
+        true
+      ],
+      "MultiXactStatusForShare": [
+        false,
+        false,
+        true,
+        true
+      ],
+      "MultiXactStatusForNoKeyUpdate": [
+        false,
+        true,
+        true,
+        true
+      ],
+      "MultiXactStatusForUpdate": [
+        true,
+        true,
+        true,
+        true
+      ],
+      "MultiXactStatusNoKeyUpdate": [
+        false,
+        true,
+        true,
+        true
+      ],
+      "MultiXactStatusUpdate": [
+        true,
+        true,
+        true,
+        true
+      ]
+    }
+  },
+  "batch_contract": {
+    "descriptor_authority": "The MXID origin alone returns the immutable ordered member descriptor.",
+    "member_authority": "Each member xid origin alone returns its current exact member proof.",
+    "requester_authority": "The requester alone applies target lock mode, wait policy, tuple revalidation, successor proof, and recomposition.",
+    "success": "CMX_RESOLVE_OK only when every ordinal has one exact, non-UNKNOWN proof and every reply binding matches the request and full descriptor hash.",
+    "failure": "Any partial, missing, duplicate, overlap, wrong-origin, wrong-epoch, wrong-hash, malformed, timeout, denied, supported-limit, or UNKNOWN input produces whole-batch non-OK; no subset is consumed."
+  },
+  "terminal_reference_protocol": {
+    "protocol_id": "CTRC-V1",
+    "evidence_class": "PGRAC_ADAPTATION",
+    "status_authority": "canonical physical TT slot sampled under exact block-0 current authority",
+    "progress_owner": "existing cluster_undo_cleaner",
+    "normative_invariants": [
+      "MXA-I13",
+      "MXA-I14",
+      "MXA-I15",
+      "MXA-I16",
+      "MXA-I17",
+      "MXA-I18",
+      "MXA-I19",
+      "MXA-I20",
+      "MXA-I21",
+      "MXA-I22"
+    ],
+    "forbidden_authorities": [
+      "origin touched-node registry",
+      "participant receipt journal",
+      "participant release ACK",
+      "ACK digest or dependency vector",
+      "0xA0 release certificate",
+      "TT release-proven bit"
+    ],
+    "transaction_key_fields": [
+      "format_version",
+      "system_identifier",
+      "origin_node_id",
+      "owner_instance",
+      "origin_boot_incarnation",
+      "cluster_epoch",
+      "formation_epoch",
+      "admission_record_generation",
+      "root_descriptor_incarnation",
+      "root_id",
+      "root_generation",
+      "segment_id",
+      "segment_generation",
+      "slot_offset",
+      "slot_wrap",
+      "xid"
+    ],
+    "transaction_key_encoding": {
+      "version": 1,
+      "total_bytes": 96,
+      "endianness": "little",
+      "fields": [
+        {"name": "format_version", "offset": 0, "size": 1, "required": 1},
+        {"name": "owner_instance", "offset": 1, "size": 1},
+        {"name": "origin_node_id", "offset": 2, "size": 2},
+        {"name": "segment_id", "offset": 4, "size": 4},
+        {"name": "segment_generation", "offset": 8, "size": 4},
+        {"name": "slot_offset", "offset": 12, "size": 2},
+        {"name": "slot_wrap", "offset": 14, "size": 2},
+        {"name": "xid", "offset": 16, "size": 4},
+        {"name": "cluster_epoch", "offset": 20, "size": 4},
+        {"name": "system_identifier", "offset": 24, "size": 8},
+        {"name": "origin_boot_incarnation", "offset": 32, "size": 8},
+        {"name": "formation_epoch", "offset": 40, "size": 8},
+        {"name": "admission_record_generation", "offset": 48, "size": 8},
+        {"name": "root_descriptor_incarnation", "offset": 56, "size": 8},
+        {"name": "root_id", "offset": 64, "size": 8},
+        {"name": "root_generation", "offset": 72, "size": 8},
+        {"name": "reserved", "offset": 80, "size": 16, "required": 0}
+      ]
+    },
+    "publication_id_fields": [
+      "requester_node_id",
+      "requester_boot_incarnation",
+      "capability_record_generation",
+      "requester_backend_id",
+      "wire_request_id",
+      "operation_id",
+      "attempt_generation",
+      "descriptor_hash",
+      "member_ordinal",
+      "member_role",
+      "reference_kind",
+      "target_kind",
+      "journal_sequence",
+      "key_sequence",
+      "journal_slot_generation",
+      "grant_generation"
+    ],
+    "publication_id_encoding": {
+      "encoding": "ascending TLV: uint16 tag, uint16 byte length, fixed little-endian value; no omitted, duplicate or unknown tag",
+      "fields": [
+        {"tag": 1, "name": "requester_node_id", "size": 2},
+        {"tag": 2, "name": "requester_boot_incarnation", "size": 8},
+        {"tag": 3, "name": "capability_record_generation", "size": 4},
+        {"tag": 4, "name": "requester_backend_id", "size": 4, "signed": true},
+        {"tag": 5, "name": "wire_request_id", "size": 8},
+        {"tag": 6, "name": "operation_id", "size": 8},
+        {"tag": 7, "name": "attempt_generation", "size": 4},
+        {"tag": 8, "name": "descriptor_hash", "size": 8},
+        {"tag": 9, "name": "member_ordinal", "size": 2},
+        {"tag": 10, "name": "member_role", "size": 1},
+        {"tag": 11, "name": "reference_kind", "size": 1},
+        {"tag": 12, "name": "target_kind", "size": 1},
+        {"tag": 13, "name": "journal_sequence", "size": 8},
+        {"tag": 14, "name": "key_sequence", "size": 8},
+        {"tag": 15, "name": "journal_slot_generation", "size": 8},
+        {"tag": 16, "name": "grant_generation", "size": 4}
+      ],
+      "ordinary_itl_sentinels": {
+        "descriptor_hash": 0,
+        "member_ordinal": 65535,
+        "member_role": 0
+      }
+    },
+    "reference_kinds": [
+      "CTRC_REF_HEAP_ITL_UBA",
+      "CTRC_REF_CURRENT_MX_LOCKER",
+      "CTRC_REF_CURRENT_MX_UPDATER",
+      "CTRC_REF_RECOMPOSED_SURVIVOR",
+      "CTRC_REF_HOT_FOLLOW_EDGE"
+    ],
+    "reference_kind_values": {
+      "CTRC_REF_HEAP_ITL_UBA": 1,
+      "CTRC_REF_CURRENT_MX_LOCKER": 2,
+      "CTRC_REF_CURRENT_MX_UPDATER": 3,
+      "CTRC_REF_RECOMPOSED_SURVIVOR": 4,
+      "CTRC_REF_HOT_FOLLOW_EDGE": 5
+    },
+    "target_kinds": [
+      "CTRC_TARGET_EXACT_ITL_SLOT",
+      "CTRC_TARGET_EXACT_TID",
+      "CTRC_TARGET_PAGE_PENDING_ITL_SLOT",
+      "CTRC_TARGET_PAGE_PENDING_OFFNUM"
+    ],
+    "target_kind_values": {
+      "CTRC_TARGET_EXACT_ITL_SLOT": 1,
+      "CTRC_TARGET_EXACT_TID": 2,
+      "CTRC_TARGET_PAGE_PENDING_ITL_SLOT": 3,
+      "CTRC_TARGET_PAGE_PENDING_OFFNUM": 4
+    },
+    "target_encoding": {
+      "encoding": "ascending TLV: uint16 tag, uint16 byte length, fixed little-endian value; byte arrays use their exact listed length",
+      "common_fields": [
+        {"tag": 1, "name": "target_kind", "size": 1},
+        {"tag": 2, "name": "spc_oid", "size": 4},
+        {"tag": 3, "name": "db_oid", "size": 4},
+        {"tag": 4, "name": "rel_number", "size": 4},
+        {"tag": 5, "name": "fork_number", "size": 4, "signed": true},
+        {"tag": 6, "name": "block_number", "size": 4},
+        {"tag": 7, "name": "predecessor_page_lsn", "size": 8},
+        {"tag": 8, "name": "predecessor_page_scn", "size": 8},
+        {"tag": 9, "name": "publication_own_generation", "size": 8},
+        {"tag": 10, "name": "publication_acquisition_epoch", "size": 8},
+        {"tag": 11, "name": "relation_persistence", "size": 1},
+        {"tag": 12, "name": "needs_wal", "size": 1}
+      ],
+      "exact_itl_fields": [
+        {"tag": 20, "name": "itl_slot_index", "size": 2},
+        {"tag": 21, "name": "itl_slot_wrap", "size": 2},
+        {"tag": 22, "name": "itl_xid", "size": 4},
+        {"tag": 23, "name": "itl_class", "size": 1},
+        {"tag": 24, "name": "uba", "size": 16},
+        {"tag": 25, "name": "planned_predecessor_sha256", "size": 32},
+        {"tag": 26, "name": "planned_successor_sha256", "size": 32}
+      ],
+      "pending_itl_fields": [
+        {"tag": 27, "name": "page_operation_kind", "size": 1}
+      ],
+      "exact_tid_fields": [
+        {"tag": 30, "name": "offset_number", "size": 2},
+        {"tag": 31, "name": "itemid_flags", "size": 2},
+        {"tag": 32, "name": "itemid_offset", "size": 2},
+        {"tag": 33, "name": "itemid_length", "size": 2},
+        {"tag": 34, "name": "tuple_header_sha256", "size": 32},
+        {"tag": 35, "name": "mx_origin_node_id", "size": 2},
+        {"tag": 36, "name": "multixact_id", "size": 4},
+        {"tag": 37, "name": "mx_cluster_epoch", "size": 4},
+        {"tag": 38, "name": "descriptor_hash", "size": 8},
+        {"tag": 39, "name": "successor_topology_sha256", "size": 32}
+      ],
+      "pending_offnum_fields": [
+        {"tag": 40, "name": "intended_descriptor_hash", "size": 8}
+      ],
+      "finalization": "pending ITL/offnum target is rewritten field-by-field to its exact target before the PREPARED-to-APPLIED release-CAS; predecessor_page_lsn/scn are the exact pre-mutation sample, so later cleanout rejects regression but never requires an unknowable post-mutation equality or treats a newer LSN alone as absence; an unfinalized target cannot be ACKed except through exact CANCELLED_PREMUTATION disposition"
+    },
+    "generation_contract": {
+      "zero": "invalid for grant_generation, seal_generation, journal_sequence, key_sequence and journal_slot_generation",
+      "grant_generation": "uint32 node-global monotonic allocation when an exact ACTIVE key first opens; never changes while that key is OPEN; wrap or exhaustion BLOCKED",
+      "seal_generation": "uint64 node-global monotonic allocation at BEGIN_SEAL; no wrap or reuse",
+      "journal_sequence": "uint64 node-global monotonic allocation at PREPARE; no wrap or modulo alias",
+      "key_sequence": "uint64 participant-key-local contiguous allocation 1..N for each exact key/grant; duplicate exact publication reuses its sequence; conflict/gap/wrap BLOCKED",
+      "journal_slot_generation": "nonzero increment on every physical receipt-slot reuse; wrap retires the slot"
+    },
+    "origin_registry_contract": {
+      "creation": "reserve bounded origin-key entry before canonical ACTIVE publication and open it with nonzero grant plus empty touched set before publication success",
+      "missing": "an interrupted or missing registry is unknown/BLOCKED, never a positive empty touched set",
+      "touch_before_use": "record exact requester node, boot incarnation and capability generation before ACTIVE proof enqueue or local ordinary ITL receipt prepare",
+      "identity_change": "same node with different boot/capability/formation/admission under one grant blocks; never replace or merge",
+      "zero_touched": "legal only from the still-present exact OPEN registry proving no positive grant use",
+      "terminal_zero_grant": "terminal or UNKNOWN proof with grant zero is decision input only; it cannot prepare a receipt or move/copy a physical-TT-dependent member, which must be terminal-projected/removed in the same mutation or left/refused before mutation"
+    },
+    "source_classes": [
+      {
+        "id": "CTRC-S01",
+        "class": "REGISTERED_REFERENCE",
+        "owner": "heapam ordinary ITL/UBA, current-MX publication and recomposition",
+        "requirement": "origin grant, PREPARED receipt, pure page successor plan and nonblocking APPLIED before ITL/UBA/tuple/MX mutation",
+        "tests": ["MXA-T20", "MXA-T21", "MXA-T22", "MXA-T23"]
+      },
+      {
+        "id": "CTRC-S02",
+        "class": "TERMINAL_PROJECTION_DISCHARGE",
+        "owner": "ordinary heap ITL/UBA COMMIT, ABORT and lazy-cleanout hooks",
+        "requirement": "an existing APPLIED ordinary receipt becomes CLEANED only after exact terminal-independent page projection and WAL/dependency capture; missing/invalid/skipped touch proof and NEEDS_CLEANOUT retain",
+        "tests": ["MXA-T23"]
+      },
+      {
+        "id": "CTRC-S03",
+        "class": "SUCCESSOR_BEFORE_PREDECESSOR",
+        "owner": "cleanout, recomposition, HOT, prune, freeze, move/rewrite and KO/SMGR drop/truncate paths",
+        "requirement": "all retained ACTIVE successor receipts and descriptors precede predecessor removal; terminal zero-grant dependencies are projected/removed in the same mutation or left/refused and are never copied; KO DONE and physical drop/truncate require the bounded matching CTRC receipt set already cancelled/cleaned with durable dependencies, while PREPARED/ACTIVE/ambiguous state refuses before removal",
+        "tests": ["MXA-T26", "MXA-T27"]
+      },
+      {
+        "id": "CTRC-S04",
+        "class": "PROVEN_LOCAL_NONCLUSTER",
+        "owner": "source-census-only local relation paths",
+        "requirement": "runtime and source proof that no foreign/current cluster reference is publishable",
+        "tests": ["MXA-T35"]
+      },
+      {
+        "id": "CTRC-S05",
+        "class": "FAIL_CLOSED_UNREACHABLE",
+        "owner": "unsupported prepared, recovery and heterogeneous seams",
+        "requirement": "typed refusal before reference mutation",
+        "tests": ["MXA-T28", "MXA-T35"]
+      }
+    ],
+    "receipt_machine": {
+      "states": [
+        "FREE",
+        "PREPARED",
+        "APPLIED",
+        "CLEANED",
+        "CANCELLED",
+        "ACK_FROZEN",
+        "BLOCKED"
+      ],
+      "events": [
+        "PREPARE",
+        "APPLY",
+        "CANCEL",
+        "CLEANOUT_PROVEN",
+        "INCLUDE_IN_ACK",
+        "CERTIFICATE_COMMITTED",
+        "DRIFT_OR_LOSS"
+      ],
+      "default": "FAIL_CLOSED_NO_STATE_MUTATION",
+      "transitions": [
+        {"id": "CTRC-R01", "from": "FREE", "event": "PREPARE", "to": "PREPARED", "guard": "exact open nonzero grant; full key and publication id; capacity allocated outside heap lock", "tests": ["MXA-T20", "MXA-T21"]},
+        {"id": "CTRC-R02", "from": "PREPARED", "event": "APPLY", "to": "APPLIED", "guard": "pure nonmutating ITL/tuple successor plan, exact target recheck/finalize and release-CAS before page mutation; no blocking operation", "tests": ["MXA-T21", "MXA-T22", "MXA-T23"]},
+        {"id": "CTRC-R03", "from": "PREPARED", "event": "CANCEL", "to": "CANCELLED", "guard": "owner abandons before any descriptor/page/WAL mutation", "tests": ["MXA-T22"]},
+        {"id": "CTRC-R04", "from": "APPLIED", "event": "CLEANOUT_PROVEN", "to": "CLEANED", "guard": "exact ITL/tuple target absent through a censused transition or terminal-independent rewrite; all page and cross-origin WAL dependencies identified; skipped hint is not cleanout", "tests": ["MXA-T23", "MXA-T25", "MXA-T26", "MXA-T27"]},
+        {"id": "CTRC-R05", "from": "CLEANED", "event": "INCLUDE_IN_ACK", "to": "ACK_FROZEN", "guard": "complete per-key sequence 1..N and all local/vector WAL dependencies durable", "tests": ["MXA-T29"]},
+        {"id": "CTRC-R06", "from": "CANCELLED", "event": "INCLUDE_IN_ACK", "to": "ACK_FROZEN", "guard": "complete per-key sequence 1..N and exact pre-mutation cancellation", "tests": ["MXA-T29"]},
+        {"id": "CTRC-R07", "from": "ACK_FROZEN", "event": "CERTIFICATE_COMMITTED", "to": "FREE", "guard": "same full key and seal generation; durable origin certificate notification", "tests": ["MXA-T31"]},
+        {"id": "CTRC-R08", "from": "PREPARED", "event": "DRIFT_OR_LOSS", "to": "BLOCKED", "guard": "no timeout cancellation and no release ACK", "tests": ["MXA-T24", "MXA-T32"]},
+        {"id": "CTRC-R09", "from": "APPLIED", "event": "DRIFT_OR_LOSS", "to": "BLOCKED", "guard": "unknown target or identity retains terminal slot", "tests": ["MXA-T25", "MXA-T32"]}
+      ]
+    },
+    "seal_machine": {
+      "states": [
+        "OPEN",
+        "SEALING",
+        "SEALED",
+        "CLEANING",
+        "CERTIFYING",
+        "RELEASE_PROVEN",
+        "BLOCKED"
+      ],
+      "events": [
+        "ISSUE_GRANT",
+        "BEGIN_SEAL",
+        "ALL_PARTICIPANTS_CLOSED",
+        "BEGIN_CLEANOUT",
+        "ALL_ACKS_DURABLE",
+        "CERTIFICATE_DURABLE",
+        "DRIFT_OR_LOSS"
+      ],
+      "default": "FAIL_CLOSED_NO_STATE_MUTATION",
+      "transitions": [
+        {"id": "CTRC-G01", "from": "OPEN", "event": "ISSUE_GRANT", "to": "OPEN", "guard": "exact ACTIVE canonical slot; record touched node before reply enqueue", "tests": ["MXA-T20"]},
+        {"id": "CTRC-G02", "from": "OPEN", "event": "BEGIN_SEAL", "to": "SEALING", "guard": "exact terminal predecessor; release bit clear; freeze nonzero grant, touched set and seal generation", "tests": ["MXA-T24"]},
+        {"id": "CTRC-G03", "from": "SEALING", "event": "ALL_PARTICIPANTS_CLOSED", "to": "SEALED", "guard": "every frozen touched node exact-closed, including an exact persistent zero-range closed tombstone when close precedes local proof/receipt; no omission for death, timeout or capability loss", "tests": ["MXA-T24", "MXA-T28"]},
+        {"id": "CTRC-G04", "from": "SEALED", "event": "BEGIN_CLEANOUT", "to": "CLEANING", "guard": "every participant reports zero PREPARED and freezes exact key_sequence 1..N or the sole persistent N=0 tombstone", "tests": ["MXA-T24", "MXA-T25", "MXA-T29"]},
+        {"id": "CTRC-G05", "from": "CLEANING", "event": "ALL_ACKS_DURABLE", "to": "CERTIFYING", "guard": "one immutable 416-byte positive ACK per touched node; exact per-key range/count/digest/empty polarity; all LSN dependencies durable", "tests": ["MXA-T29", "MXA-T30"]},
+        {"id": "CTRC-G06", "from": "CERTIFYING", "event": "CERTIFICATE_DURABLE", "to": "RELEASE_PROVEN", "guard": "exact terminal recheck under block0 X-current; 0xA0 flush and release-bit write-through complete", "tests": ["MXA-T30", "MXA-T31"]},
+        {"id": "CTRC-G07", "from": "OPEN", "event": "DRIFT_OR_LOSS", "to": "BLOCKED", "guard": "missing origin registry is not an empty touched set", "tests": ["MXA-T32"]},
+        {"id": "CTRC-G08", "from": "SEALING", "event": "DRIFT_OR_LOSS", "to": "BLOCKED", "guard": "lost participant, generation drift or conflicting close retains", "tests": ["MXA-T28", "MXA-T32"]},
+        {"id": "CTRC-G09", "from": "SEALED", "event": "DRIFT_OR_LOSS", "to": "BLOCKED", "guard": "journal/range drift retains", "tests": ["MXA-T29", "MXA-T32"]},
+        {"id": "CTRC-G10", "from": "CLEANING", "event": "DRIFT_OR_LOSS", "to": "BLOCKED", "guard": "page/descriptor/WAL ambiguity retains", "tests": ["MXA-T25", "MXA-T32"]},
+        {"id": "CTRC-G11", "from": "CERTIFYING", "event": "DRIFT_OR_LOSS", "to": "BLOCKED", "guard": "pre-certificate uncertainty never sets release bit", "tests": ["MXA-T30", "MXA-T32"]}
+      ]
+    },
+    "wire_contract": {
+      "magic_name": "CLUSTER_CTRC_WIRE_MAGIC",
+      "magic_value": "0x50474354",
+      "hello_capability_name": "PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1",
+      "hello_capability_value": "0x00400000",
+      "defined_capability_count": 21,
+      "reserved_capability_holes": ["0x00004000", "0x00040000"],
+      "current_mx_wire_version": 2,
+      "grant_field": "ClusterCurrentMemberProof.reserved8[0..3] little-endian nonzero ctrc_grant_generation for ACTIVE/SELF only",
+      "forward_kind_name": "GCS_BLOCK_FORWARD_KIND_CURRENT_MX_CTRC_SEAL",
+      "forward_kind_value": 11,
+      "predecessor_forward_kind_name": "GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR",
+      "predecessor_forward_kind_value": 10,
+      "reply_status_name": "GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT",
+      "reply_status_value": 30,
+      "predecessor_reply_status_name": "GCS_BLOCK_REPLY_CURRENT_MX_STATS_RESULT",
+      "predecessor_reply_status_value": 29,
+      "suboperations": {"CLOSE_AND_CLEAN": 1, "CERTIFICATE_COMMITTED": 2},
+      "request_bytes": 128,
+      "request_fields": [
+        {"name": "request_id", "offset": 0, "size": 8},
+        {"name": "cluster_epoch_u64", "offset": 8, "size": 8},
+        {"name": "tt_status_key_bytes_0_19", "offset": 16, "size": 20},
+        {"name": "original_requester_node", "offset": 36, "size": 4},
+        {"name": "requester_backend_id", "offset": 40, "size": 4, "required": -2},
+        {"name": "tt_status_key_bytes_20_23", "offset": 44, "size": 4},
+        {"name": "grant_generation", "offset": 48, "size": 4},
+        {"name": "slot_wrap", "offset": 52, "size": 2},
+        {"name": "owner_instance", "offset": 54, "size": 1},
+        {"name": "suboperation", "offset": 55, "size": 1},
+        {"name": "segment_generation", "offset": 56, "size": 4},
+        {"name": "request_flags", "offset": 60, "size": 2, "required": 0},
+        {"name": "selector_version", "offset": 62, "size": 1, "required": 1},
+        {"name": "forward_kind", "offset": 63, "size": 1, "required": 11},
+        {"name": "magic", "offset": 64, "size": 4, "required": "0x50474354"},
+        {"name": "wire_version", "offset": 68, "size": 2, "required": 2},
+        {"name": "wire_length", "offset": 70, "size": 2, "required": 128},
+        {"name": "origin_boot_incarnation", "offset": 72, "size": 8},
+        {"name": "formation_epoch", "offset": 80, "size": 8},
+        {"name": "admission_record_generation", "offset": 88, "size": 8},
+        {"name": "root_descriptor_incarnation", "offset": 96, "size": 8},
+        {"name": "root_id", "offset": 104, "size": 8},
+        {"name": "root_generation", "offset": 112, "size": 8},
+        {"name": "seal_generation", "offset": 120, "size": 8}
+      ],
+      "request_key_reconstruction": "field-decode little-endian TT key with both reserved words zero; system_identifier from authenticated local cluster; segment_id=zero_extend(undo_segment_id); slot_offset=tt_slot_id-1; uint64 epoch fits uint32 and equals embedded epoch; derived owner/origin/slot, authenticated origin source, touched participant destination, capability/root/formation/admission all exact; source and destination node ids in 0..15; selector resolves exactly one stored full key",
+      "reply_page_bytes": 8192,
+      "reply_header_bytes": 64,
+      "reply_header_fields": [
+        {"name": "magic", "offset": 0, "size": 4, "required": "0x50474354"},
+        {"name": "wire_version", "offset": 4, "size": 2, "required": 2},
+        {"name": "header_length", "offset": 6, "size": 2, "required": 64},
+        {"name": "request_id", "offset": 8, "size": 8},
+        {"name": "cluster_epoch", "offset": 16, "size": 8},
+        {"name": "seal_generation", "offset": 24, "size": 8},
+        {"name": "source_node", "offset": 32, "size": 4},
+        {"name": "destination_node", "offset": 36, "size": 4},
+        {"name": "result", "offset": 40, "size": 1},
+        {"name": "suboperation", "offset": 41, "size": 1},
+        {"name": "first_reason", "offset": 42, "size": 2},
+        {"name": "reply_flags", "offset": 44, "size": 2, "required": 0},
+        {"name": "ack_length", "offset": 46, "size": 2},
+        {"name": "request_sha256_prefix", "offset": 48, "size": 8},
+        {"name": "body_length", "offset": 56, "size": 4, "required": 8192},
+        {"name": "header_crc32c", "offset": 60, "size": 4}
+      ],
+      "reply_results": {"DENIED": 0, "LOCAL_RELEASE_ACK": 1, "PENDING_DRAIN": 2, "BLOCKED_RETAIN": 3, "CERTIFICATE_RECLAIMED": 4},
+      "reply_ack_offset": 64,
+      "reply_ack_bytes": 416,
+      "reply_tail_offset": 480,
+      "reply_tail_rule": "all zero through BLCKSZ; ACK length is 416 only for LOCAL_RELEASE_ACK and zero otherwise; PENDING_DRAIN is never certificate evidence",
+      "formation_dependency_domain": "target OPEN requires every admitted node id in 0..15 and admitted count <= CLUSTER_SF_DEP_MAX_ORIGINS; v1 never truncates/remaps/hashes"
+    },
+    "participant_ack_contract": {
+      "version": 1,
+      "total_bytes": 416,
+      "dependency_entries": 16,
+      "fields": [
+        {"name": "transaction_key", "offset": 0, "size": 96},
+        {"name": "grant_generation", "offset": 96, "size": 4},
+        {"name": "result", "offset": 100, "size": 1, "positive": 1},
+        {"name": "first_failed_predicate", "offset": 101, "size": 1},
+        {"name": "flags", "offset": 102, "size": 2},
+        {"name": "seal_generation", "offset": 104, "size": 8},
+        {"name": "participant_node_id", "offset": 112, "size": 2},
+        {"name": "dependency_entry_count", "offset": 114, "size": 2, "required": 16},
+        {"name": "capability_record_generation", "offset": 116, "size": 4},
+        {"name": "participant_boot_incarnation", "offset": 120, "size": 8},
+        {"name": "formation_epoch", "offset": 128, "size": 8},
+        {"name": "admission_record_generation", "offset": 136, "size": 8},
+        {"name": "first_key_sequence", "offset": 144, "size": 8},
+        {"name": "last_key_sequence", "offset": 152, "size": 8},
+        {"name": "minimum_journal_sequence", "offset": 160, "size": 8},
+        {"name": "maximum_journal_sequence", "offset": 168, "size": 8},
+        {"name": "total_receipt_count", "offset": 176, "size": 8},
+        {"name": "prepared_count", "offset": 184, "size": 8},
+        {"name": "applied_count", "offset": 192, "size": 8},
+        {"name": "cancelled_count", "offset": 200, "size": 8},
+        {"name": "cleaned_count", "offset": 208, "size": 8},
+        {"name": "ack_frozen_count", "offset": 216, "size": 8},
+        {"name": "row_digest_sha256", "offset": 224, "size": 32},
+        {"name": "highest_local_cleanout_lsn", "offset": 256, "size": 8},
+        {"name": "required_lsn_vector", "offset": 264, "size": 128},
+        {"name": "reserved", "offset": 392, "size": 20, "required": 0},
+        {"name": "crc32c", "offset": 412, "size": 4}
+      ],
+      "known_flags": {"ZERO_RANGE": "0x0001", "ALL_DURABLE": "0x0002"},
+      "nonempty_positive": "first_key_sequence=1; last_key_sequence=total=N>0; PREPARED=APPLIED=0; CANCELLED+CLEANED=N; ACK_FROZEN=N; global journal min/max nonzero and gaps allowed",
+      "empty_positive": "persistent close-before-proof tombstone only; key/global sequences, counts, local LSN and vector all zero; ZERO_RANGE|ALL_DURABLE; SHA-256 empty digest",
+      "empty_digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "crc_rule": "CRC32C over bytes 0..411"
+    },
+    "digest_contract": {
+      "algorithm": "SHA-256",
+      "encoding": "canonical little-endian length-delimited bytes; nonempty participant rows sorted by key_sequence and exact 416-byte ACKs sorted by participant node_id",
+      "row_domain_hex": "50475241432d435452432d524f572d563100",
+      "ackset_domain_hex": "50475241432d435452432d41434b5345542d563100",
+      "release_disposition_values": {
+        "CANCELLED_PREMUTATION": 1,
+        "CLEANED_ABSENT": 2,
+        "CLEANED_TERMINAL_REWRITE": 3,
+        "CLEANED_SUCCESSOR_REPLACED": 4
+      },
+      "row_components": ["96-byte transaction_key_encoding", "uint32_le publication_id_encoding length plus bytes", "uint32_le canonical target_encoding length plus bytes", "uint8 release disposition", "uint64_le highest local WAL LSN", "16 uint64_le required-LSN entries in node-id order"],
+      "target_rule": "CLEANED dispositions require finalized exact target; only CANCELLED_PREMUTATION may retain canonical pending target",
+      "nonempty_row_derivation": "SHA-256(ROW domain || uint64_le(N) || for key_sequence 1..N: uint32_le(row_bytes_length) || row_bytes)",
+      "empty_row_derivation": "sole persistent N=0 tombstone uses SHA-256(empty byte string), with no domain or count bytes",
+      "ackset_derivation": "SHA-256(ACKSET domain || uint16_le(participant_count) || in ascending participant node id: uint32_le(416) || all 416 ACK bytes including CRC32C)",
+      "participant_ack_bytes": 32,
+      "wal_certificate_bytes": 16,
+      "wal_derivation": "first 16 hash-output bytes of ackset_derivation without integer byte-order conversion",
+      "authority": "digest is integrity, idempotency and audit evidence only; exact key, counts, ranges, durable LSNs and typed ACK results remain mandatory"
+    },
+    "wal_contract": {
+      "opcode_name": "XLOG_UNDO_TT_SLOT_CTRC_RELEASE",
+      "opcode_value": "0xA0",
+      "payload_version": 1,
+      "payload_size": 96,
+      "slot_flag_name": "TT_SLOT_FLAG_CTRC_RELEASE_PROVEN",
+      "slot_flag_value": "0x01",
+      "touched_bitmap_rule": "v1 permits only node-id bits 0..15; bits 16..127 must be zero and touched bitmap must equal the frozen origin registry exactly",
+      "payload_fields": [
+        {"name": "segment_id", "offset": 0, "size": 4},
+        {"name": "segment_generation", "offset": 4, "size": 4},
+        {"name": "xid", "offset": 8, "size": 4},
+        {"name": "cluster_epoch", "offset": 12, "size": 4},
+        {"name": "root_id", "offset": 16, "size": 8},
+        {"name": "root_generation", "offset": 24, "size": 8},
+        {"name": "formation_epoch", "offset": 32, "size": 8},
+        {"name": "admission_record_generation", "offset": 40, "size": 8},
+        {"name": "seal_generation", "offset": 48, "size": 8},
+        {"name": "touched_nodes_0_63", "offset": 56, "size": 8},
+        {"name": "touched_nodes_64_127", "offset": 64, "size": 8},
+        {"name": "ack_set_digest", "offset": 72, "size": 16},
+        {"name": "slot_offset", "offset": 88, "size": 2},
+        {"name": "slot_wrap", "offset": 90, "size": 2},
+        {"name": "owner_instance", "offset": 92, "size": 1},
+        {"name": "terminal_status", "offset": 93, "size": 1},
+        {"name": "format_version", "offset": 94, "size": 1},
+        {"name": "flags", "offset": 95, "size": 1}
+      ],
+      "apply_predecessors": ["COMMITTED_EXACT", "ABORTED_EXACT"],
+      "clear_on_states": ["UNUSED", "ACTIVE", "RECYCLABLE", "INVALID", "FRESH_TEMPLATE"],
+      "redo_admission_rule": "runtime emitter validates live root/formation/admission before WAL; redo trusts the valid WAL record and exact storage/segment/slot predecessor and does not require the historical formation to be currently OPEN",
+      "tests": ["MXA-T30", "MXA-T31", "MXA-T33"]
+    },
+    "release_rules": {
+      "committed": "exact COMMITTED predecessor plus canonical CTRC release bit plus valid commit_scn plus same-epoch valid folded horizon with commit_scn <= horizon",
+      "aborted": "exact durable ABORTED predecessor plus canonical CTRC release bit; no wall-clock or SCN guess",
+      "segment": "every terminal slot independently satisfies its committed or aborted rule before whole-segment recyclable/reuse",
+      "tests": ["MXA-T31", "MXA-T33"]
+    },
+    "capacity_contract": {
+      "origin_key_entries": "CLUSTER_UNDO_SEGS_PER_INSTANCE * TT_SLOTS_PER_SEGMENT",
+      "participant_key_entries": "origin_key_entries * min(max(cluster_conf_declared_node_count_early(), 1), CLUSTER_SF_DEP_MAX_ORIGINS)",
+      "receipt_entries": "NBuffers + MaxBackends * CLUSTER_CURRENT_MX_MAX_MEMBERS",
+      "ack_summary_entries": "participant_key_entries",
+      "allocation_time": "postmaster shared-memory sizing before R4 target OPEN",
+      "overflow": "checked Size arithmetic and activation refusal",
+      "runtime_full": "REFUSE_CAPACITY before mutation; wake existing cleaner outside locks; no eviction or untracked publication",
+      "tests": ["MXA-T34"]
+    },
+    "crash_cut_results": [
+      {"id": "CTRC-C01", "cut": "before touched-node record", "result": "no positive proof send; uncertainty retains", "tests": ["MXA-T20", "MXA-T32"]},
+      {"id": "CTRC-C02", "cut": "after touched record before proof send", "result": "extra touched node returns empty exact ACK", "tests": ["MXA-T20", "MXA-T32"]},
+      {"id": "CTRC-C03", "cut": "PREPARED before APPLIED", "result": "blocks participant ACK; no timeout cancellation", "tests": ["MXA-T24", "MXA-T32"]},
+      {"id": "CTRC-C04", "cut": "APPLIED before page mutation", "result": "target absence cleans conservative extra receipt", "tests": ["MXA-T25", "MXA-T32"]},
+      {"id": "CTRC-C05", "cut": "cleanout WAL inserted before durable", "result": "ACK unavailable until local and dependency-vector flush", "tests": ["MXA-T29", "MXA-T32"]},
+      {"id": "CTRC-C06", "cut": "all ACKs before 0xA0", "result": "release bit clear and slot retained", "tests": ["MXA-T30", "MXA-T32"]},
+      {"id": "CTRC-C07", "cut": "0xA0 inserted before flush or write-through", "result": "not usable until canonical release bit observed; redo exact", "tests": ["MXA-T30", "MXA-T32"]},
+      {"id": "CTRC-C08", "cut": "durable certificate before participant notification", "result": "L11/L12 may proceed; participant summary remains until notification", "tests": ["MXA-T31", "MXA-T32"]},
+      {"id": "CTRC-C09", "cut": "participant boot/reconnect or origin pre-certificate loss", "result": "BLOCKED/retained; Stage 8 has no positive reconstruction", "tests": ["MXA-T28", "MXA-T32"]}
+    ]
+  },
+  "lifecycle": {
+    "states": [
+      "FREE",
+      "RESERVED_LOCAL",
+      "ACTIVE_PUBLISHING",
+      "ACTIVE_CANONICAL",
+      "PREPARED_PROTECTED",
+      "COMMITTED_RETAINED",
+      "ABORTED_RETAINED",
+      "RECYCLABLE",
+      "BLOCKED"
+    ],
+    "events": [
+      "RESERVE",
+      "BEGIN_ACTIVE_PUBLISH",
+      "PUBLISH_ACTIVE",
+      "FAIL_PRE_BIND",
+      "FAIL_POST_WAL_OR_WRITE",
+      "COMMIT",
+      "ABORT",
+      "PREPARE",
+      "COMMIT_PREPARED",
+      "ROLLBACK_PREPARED",
+      "RETENTION_RELEASE",
+      "REUSE",
+      "IDENTITY_OR_AUTHORITY_DRIFT"
+    ],
+    "default": "FAIL_CLOSED_NO_STATE_MUTATION",
+    "transitions": [
+      {
+        "id": "MXA-L01",
+        "from": "FREE",
+        "event": "RESERVE",
+        "to": "RESERVED_LOCAL",
+        "guard": "fresh or exact recyclable predecessor; incremented nonzero wrap; complete successor template",
+        "tests": [
+          "MXA-T14"
+        ]
+      },
+      {
+        "id": "MXA-L02",
+        "from": "RESERVED_LOCAL",
+        "event": "BEGIN_ACTIVE_PUBLISH",
+        "to": "ACTIVE_PUBLISHING",
+        "guard": "writable admission; no forbidden lock; exact binding reserved",
+        "tests": [
+          "MXA-T14"
+        ]
+      },
+      {
+        "id": "MXA-L03",
+        "from": "ACTIVE_PUBLISHING",
+        "event": "PUBLISH_ACTIVE",
+        "to": "ACTIVE_CANONICAL",
+        "guard": "BIND WAL inserted; exact canonical write succeeded; resident bytes identical; final root/generation/admission recheck",
+        "tests": [
+          "MXA-T14"
+        ]
+      },
+      {
+        "id": "MXA-L04",
+        "from": "ACTIVE_PUBLISHING",
+        "event": "FAIL_PRE_BIND",
+        "to": "FREE",
+        "guard": "no BIND WAL and no canonical mutation occurred",
+        "tests": [
+          "MXA-T14"
+        ]
+      },
+      {
+        "id": "MXA-L05",
+        "from": "ACTIVE_PUBLISHING",
+        "event": "FAIL_POST_WAL_OR_WRITE",
+        "to": "BLOCKED",
+        "guard": "retain or fence exact entity; never expose binding or reuse",
+        "tests": [
+          "MXA-T14"
+        ]
+      },
+      {
+        "id": "MXA-L06",
+        "from": "ACTIVE_CANONICAL",
+        "event": "COMMIT",
+        "to": "COMMITTED_RETAINED",
+        "guard": "exact ACTIVE predecessor; matching xid/wrap/generation; valid commit SCN; ordered terminal WAL",
+        "tests": [
+          "MXA-T07",
+          "MXA-T14"
+        ]
+      },
+      {
+        "id": "MXA-L07",
+        "from": "ACTIVE_CANONICAL",
+        "event": "ABORT",
+        "to": "ABORTED_RETAINED",
+        "guard": "exact ACTIVE predecessor; matching xid/wrap/generation; durable abort evidence",
+        "tests": [
+          "MXA-T07",
+          "MXA-T14"
+        ]
+      },
+      {
+        "id": "MXA-L08",
+        "from": "ACTIVE_CANONICAL",
+        "event": "PREPARE",
+        "to": "PREPARED_PROTECTED",
+        "guard": "retained compatibility state only; no Stage 8 positive current-MultiXact proof",
+        "scope": "STAGE9_POSITIVE_STAGE8_FAIL_CLOSED_CONSUMER",
+        "tests": [
+          "MXA-T09"
+        ]
+      },
+      {
+        "id": "MXA-L09",
+        "from": "PREPARED_PROTECTED",
+        "event": "COMMIT_PREPARED",
+        "to": "COMMITTED_RETAINED",
+        "guard": "exact protected entity and exact native prepared terminal evidence",
+        "scope": "STAGE9_POSITIVE_STAGE8_RETAINED_CODE",
+        "tests": [
+          "MXA-T09"
+        ]
+      },
+      {
+        "id": "MXA-L10",
+        "from": "PREPARED_PROTECTED",
+        "event": "ROLLBACK_PREPARED",
+        "to": "ABORTED_RETAINED",
+        "guard": "exact protected entity and exact native prepared terminal evidence",
+        "scope": "STAGE9_POSITIVE_STAGE8_RETAINED_CODE",
+        "tests": [
+          "MXA-T09"
+        ]
+      },
+      {
+        "id": "MXA-L11",
+        "from": "COMMITTED_RETAINED",
+        "event": "RETENTION_RELEASE",
+        "to": "RECYCLABLE",
+        "guard": "exact COMMITTED predecessor; canonical CTRC release bit for the same full identity; valid commit_scn; same-epoch valid folded horizon with commit_scn <= horizon",
+        "tests": [
+          "MXA-T14",
+          "MXA-T31",
+          "MXA-T33"
+        ]
+      },
+      {
+        "id": "MXA-L12",
+        "from": "ABORTED_RETAINED",
+        "event": "RETENTION_RELEASE",
+        "to": "RECYCLABLE",
+        "guard": "exact durable ABORTED predecessor and canonical CTRC release bit for the same full identity; no wall-clock or SCN guess",
+        "tests": [
+          "MXA-T14",
+          "MXA-T31",
+          "MXA-T33"
+        ]
+      },
+      {
+        "id": "MXA-L13",
+        "from": "RECYCLABLE",
+        "event": "REUSE",
+        "to": "RESERVED_LOCAL",
+        "guard": "old and resident bytes are exact; every terminal predecessor passed CTRC release; complete fresh template clears release bit and all reserved bytes; wrap increments without zero or overflow",
+        "tests": [
+          "MXA-T14",
+          "MXA-T33"
+        ]
+      },
+      {
+        "id": "MXA-L14",
+        "from": "ACTIVE_CANONICAL",
+        "event": "IDENTITY_OR_AUTHORITY_DRIFT",
+        "to": "BLOCKED",
+        "guard": "no guessed terminal and no reuse",
+        "tests": [
+          "MXA-T08"
+        ]
+      },
+      {
+        "id": "MXA-L15",
+        "from": "PREPARED_PROTECTED",
+        "event": "IDENTITY_OR_AUTHORITY_DRIFT",
+        "to": "BLOCKED",
+        "guard": "no guessed terminal and no reuse",
+        "tests": [
+          "MXA-T08",
+          "MXA-T09"
+        ]
+      }
+    ]
+  },
+  "code_contracts": [
+    {
+      "id": "MXA-K01",
+      "path": "src/backend/cluster/cluster_gcs_block.c",
+      "symbol": "gcs_block_current_mx_origin_locate_physical",
+      "responsibility": "Choose only a current-owner exact physical locator or a unique durable physical locator; consume no status as a verdict."
+    },
+    {
+      "id": "MXA-K02",
+      "path": "src/backend/cluster/cluster_runtime_visibility.c",
+      "symbol": "cluster_runtime_visibility_physical_locator_sample_held",
+      "responsibility": "Sample exact canonical bytes and bracket segment, owner where applicable, generation, root, epoch, admission, and native status."
+    },
+    {
+      "id": "MXA-K03",
+      "path": "src/backend/cluster/cluster_runtime_visibility.c",
+      "symbol": "cluster_runtime_visibility_candidate_decide",
+      "responsibility": "Apply the physical TT and native-status precedence without producing authority from projections."
+    },
+    {
+      "id": "MXA-K04",
+      "path": "src/backend/cluster/cluster_multixact_current.c",
+      "symbol": "cluster_multixact_current_resolve_origin_member_proof",
+      "responsibility": "Convert one exact authoritative TT result into SELF/ACTIVE/COMMITTED/ABORTED or UNKNOWN with bounded parent-chain validation."
+    },
+    {
+      "id": "MXA-K05",
+      "path": "src/backend/cluster/cluster_multixact_current.c",
+      "symbol": "cluster_multixact_current_members_resolve",
+      "responsibility": "Assemble the exact all-or-nothing proof set by member origin."
+    },
+    {
+      "id": "MXA-K06",
+      "path": "src/backend/cluster/cluster_multixact_current.c",
+      "symbol": "cluster_multixact_current_decide",
+      "responsibility": "Apply native conflict semantics, wait policy, self-CID, updater successor proof, and UNKNOWN precedence."
+    },
+    {
+      "id": "MXA-K07",
+      "path": "src/backend/cluster/cluster_gcs_block.c",
+      "symbol": "gcs_block_current_mx_origin_advance",
+      "responsibility": "Drive asynchronous per-segment canonical sampling without blocking under heap content lock."
+    },
+    {
+      "id": "MXA-K08",
+      "path": "src/backend/access/heap/heapam.c",
+      "symbol": "cluster_multixact_current_decide",
+      "responsibility": "Consume only a complete proof after exact tuple/page revalidation and restart at the owning native loop on change."
+    },
+    {
+      "id": "MXA-K09",
+      "status": "REQUIRED_NEW",
+      "path": "src/include/cluster/cluster_terminal_ref_census.h",
+      "symbol": "ClusterCtrcTxnKeyV1",
+      "responsibility": "Define exact field-encoded transaction/publication/receipt/seal identities and closed typed results; define no transaction-status verdict."
+    },
+    {
+      "id": "MXA-K10",
+      "status": "REQUIRED_NEW",
+      "path": "src/backend/cluster/cluster_terminal_ref_census.c",
+      "symbol": "cluster_ctrc_receipt_prepare",
+      "responsibility": "Allocate a bounded PREPARED receipt and bind an exact open origin grant outside heap content lock; refuse capacity or drift before mutation."
+    },
+    {
+      "id": "MXA-K11",
+      "status": "REQUIRED_NEW",
+      "path": "src/backend/cluster/cluster_terminal_ref_census.c",
+      "symbol": "cluster_ctrc_receipt_apply_prepared",
+      "responsibility": "Perform the only heap-lock-side target finalize/recheck and PREPARED-to-APPLIED release-CAS; never block, allocate, wait or mutate after returning retry."
+    },
+    {
+      "id": "MXA-K12",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/backend/cluster/cluster_gcs_block.c",
+      "symbol": "gcs_block_current_mx_origin_advance",
+      "responsibility": "Before ACTIVE/SELF proof enqueue, record exact touched participant and grant generation; drive capability-gated CTRC seal request/reply without changing status authority."
+    },
+    {
+      "id": "MXA-K13",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/backend/cluster/cluster_undo_cleaner.c",
+      "symbol": "UndoCleanerMain",
+      "responsibility": "Remain the sole CTRC progress process and coordinate close, clean, ACK verification and certificate apply outside forbidden locks."
+    },
+    {
+      "id": "MXA-K14",
+      "status": "REQUIRED_NEW",
+      "path": "src/backend/cluster/cluster_terminal_ref_census.c",
+      "symbol": "cluster_ctrc_clean_reference",
+      "responsibility": "Discharge one exact target under Resource-X/page authority using the terminal-member table and successor-before-predecessor protocol."
+    },
+    {
+      "id": "MXA-K15",
+      "status": "REQUIRED_NEW",
+      "path": "src/include/cluster/storage/cluster_undo_xlog.h",
+      "symbol": "XLOG_UNDO_TT_SLOT_CTRC_RELEASE",
+      "responsibility": "Define opcode 0xA0 and the exact 96-byte release certificate payload with static offsets and no native-wire ambiguity."
+    },
+    {
+      "id": "MXA-K16",
+      "status": "REQUIRED_NEW",
+      "path": "src/backend/cluster/storage/cluster_undo_xlog.c",
+      "symbol": "cluster_undo_xlog_insert_tt_ctrc_release",
+      "responsibility": "Emit and redo the exact idempotent release certificate, setting only the release bit on an exact terminal predecessor."
+    },
+    {
+      "id": "MXA-K17",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/backend/cluster/cluster_tt_slot.c",
+      "symbol": "cluster_tt_slot_gc_current_pass",
+      "responsibility": "Use two-phase canonical release proof for current allocator GC; L11 additionally retains the existing valid horizon."
+    },
+    {
+      "id": "MXA-K18",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/backend/access/heap/heapam.c",
+      "symbol": "cluster_current_mx_make_stamp",
+      "responsibility": "Register/APPLY receipts for every retained ACTIVE publication and preserve exact native restart points; never publish an untracked successor."
+    },
+    {
+      "id": "MXA-K19",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/backend/cluster/cluster_semantic_activation.c",
+      "symbol": "cluster_semantic_activation",
+      "responsibility": "Require the formation-wide CTRC capability and activation-sized shared memory before target OPEN."
+    },
+    {
+      "id": "MXA-K20",
+      "status": "REQUIRED_NEW",
+      "path": "src/backend/access/heap/heapam.c",
+      "symbol": "cluster_heap_ctrc_plan_and_apply_itl_reference",
+      "responsibility": "Split ITL choice into a nonmutating exact plan and apply; finalize/APPLY one ordinary ITL/UBA receipt before the planned slot/page mutation, reusing only an exact existing per-page receipt."
+    },
+    {
+      "id": "MXA-K21",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/backend/cluster/cluster_itl_touch.c",
+      "symbol": "cluster_itl_xact_precommit_finish",
+      "responsibility": "Treat eager terminal stamping as receipt discharge only after exact terminal-independent projection and WAL/dependency capture; invalid/missing/skipped proof and NEEDS_CLEANOUT retain."
+    }
+  ],
+  "tests": [
+    {
+      "id": "MXA-T00",
+      "status": "NEW_MATRIX_GATE",
+      "path": "tools/check-spec-8.4d-authority-matrix.py",
+      "symbol": "main",
+      "purpose": "Enumerate every bounded authority and composition combination; validate deterministic coverage, positive-row exactness, lifecycle totality, test references, and optional public-code anchors."
+    },
+    {
+      "id": "MXA-T01",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_current_member_target_canonical_active_requires_exact_physical_slot",
+      "purpose": "Current canonical ACTIVE positive requires exact physical bytes, owner, generation, root, and admission."
+    },
+    {
+      "id": "MXA-T02",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_current_member_active_on_current_segment_requires_live_owner_index",
+      "purpose": "Current-segment ACTIVE with a retired or absent live owner remains UNKNOWN."
+    },
+    {
+      "id": "MXA-T03",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_current_member_terminal_on_current_segment_survives_retired_owner_index",
+      "purpose": "Exact terminal bytes plus matching native terminal state remain conclusive after stable owner retirement."
+    },
+    {
+      "id": "MXA-T04",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_current_member_rolled_terminal_uses_locator_then_canonical_scur",
+      "purpose": "Rolled terminal uses a physical locator followed by canonical SCUR and never current-owner status authority."
+    },
+    {
+      "id": "MXA-T05",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_current_member_rolled_active_requires_exact_canonical_slot_and_native_live_bracket",
+      "purpose": "Close the currently implicit rolled ACTIVE row and prove that no owner-index or native-only shortcut participates."
+    },
+    {
+      "id": "MXA-T06",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_empty_physical_slot_remains_unknown_despite_current_allocator_owner",
+      "purpose": "Empty, mismatched, missing, invalid, or recycled canonical bytes cannot be upgraded by allocator or rolled-live evidence."
+    },
+    {
+      "id": "MXA-T07",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_exact_origin_conflicting_terminal_evidence_fails_closed",
+      "purpose": "Canonical/native terminal conflicts, incomplete commit SCN, and abort/commit disagreement remain UNKNOWN."
+    },
+    {
+      "id": "MXA-T08",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_canonical_sample_reports_first_failed_predicate",
+      "purpose": "Every generation, segment, owner, root, epoch, and admission drift is attributed and cannot yield a positive proof; add table-driven rows for all matrix drift classes."
+    },
+    {
+      "id": "MXA-T09",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_exact_origin_prepared_is_distinct_live_outcome",
+      "purpose": "PREPARED remains distinct internally and is rejected by the Stage 8 current-MultiXact positive consumer."
+    },
+    {
+      "id": "MXA-T10",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_multixact_current.c",
+      "symbol": "test_current_multixact_proof_request_batches_by_member_origin",
+      "purpose": "Descriptor/proof requests are bound by origin, ordinal, full hash, request identity, and whole-list all-or-nothing assembly."
+    },
+    {
+      "id": "MXA-T11",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/test/cluster_unit/test_cluster_multixact_current.c",
+      "symbol": "test_current_multixact_compositor_status_mode_state_cross_product",
+      "purpose": "Enumerate native status, lock mode, member state, self, terminal updater, and successor decisions; extend to every aggregate composition rule."
+    },
+    {
+      "id": "MXA-T12",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_multixact_current.c",
+      "symbol": "test_current_multixact_active_wait_policies_and_stable_key",
+      "purpose": "Conflict selection is deterministic and wait policy maps exactly to WAIT, WOULD_BLOCK, LOCK_NOT_AVAILABLE, or BEING_MODIFIED."
+    },
+    {
+      "id": "MXA-T13",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_multixact_current.c",
+      "symbol": "test_current_multixact_terminal_nonconflict_and_unknown_precedence",
+      "purpose": "Any UNKNOWN member or invalid updater proof defeats otherwise compatible or terminal members."
+    },
+    {
+      "id": "MXA-T14",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/test/cluster_unit/test_cluster_undo_record.c",
+      "symbol": "test_prepared_consumer_rechecks_exact_receipt_before_record_mutation",
+      "purpose": "ACTIVE publication, prepared undo reservation, terminal transition, recycle template, and lock-order lifecycle rows have focused RED/GREEN coverage."
+    },
+    {
+      "id": "MXA-T15",
+      "status": "EXISTING_PLUS_EXTENSION",
+      "path": "src/test/cluster_tap/t/405_cluster_current_mx_foreign.pl",
+      "symbol": "current_mx_foreign",
+      "purpose": "Minimal four-node current-MultiXact causal witness proves exact descriptor/member authority and must be extended with deterministic ACTIVE, COMMIT, ABORT, current-terminal, and rolled-terminal cuts before the broad immutable judge."
+    },
+    {
+      "id": "MXA-T16",
+      "status": "CAMPAIGN_GATE",
+      "path": "src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl",
+      "symbol": "236/236",
+      "purpose": "Unchanged t/400 must remain exact 236/236."
+    },
+    {
+      "id": "MXA-T17",
+      "status": "CAMPAIGN_GATE",
+      "path": "src/test/cluster_tap/t/430_pcm_grd_resource_reuse_4node.pl",
+      "symbol": "7/7",
+      "purpose": "R11 target sole-path and source-removal proof remains exact 7/7."
+    },
+    {
+      "id": "MXA-T18",
+      "status": "CAMPAIGN_GATE",
+      "path": "specs/spec-8.15a-adaptive-four-node-saturation-acceptance-override.md",
+      "symbol": "PRE",
+      "purpose": "PRE is final integration and performance evidence only after focused, causal, t/400, and R11 gates; it is not a state-space discovery loop."
+    },
+    {
+      "id": "MXA-T19",
+      "status": "EXISTING",
+      "path": "src/test/cluster_unit/test_cluster_r4_tx_outcome.c",
+      "symbol": "test_visibility_precommit_committed_slot_with_live_origin_stays_in_progress",
+      "purpose": "An exact COMMITTED slot plus stable native in-progress remains conservative live with no commit SCN; it is never exposed as terminal COMMITTED."
+    },
+    {
+      "id": "MXA-T20",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_active_grant_records_touched_node_before_positive_proof",
+      "purpose": "ACTIVE/SELF proof carries a nonzero open grant only after exact touched-node registration; terminal/UNKNOWN grant is zero and all send-before-record cuts refuse."
+    },
+    {
+      "id": "MXA-T21",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_receipt_prepare_apply_full_identity_cross_product",
+      "purpose": "Table-test every full-key/publication/target/grant predicate and prove PREPARED-to-APPLIED is the only positive pre-mutation transition."
+    },
+    {
+      "id": "MXA-T22",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_heap_apply_is_nonblocking_and_precedes_all_reference_mutation",
+      "purpose": "All heap callers, including pending-ITL and pending-offnum paths, pure-plan then apply before ITL/UBA/descriptor/page/WAL mutation and restart before mutation on close/drift; forbidden slow symbols are unreachable."
+    },
+    {
+      "id": "MXA-T23",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_itl_uba_registers_before_mutation_and_only_exact_projection_discharges",
+      "purpose": "Every shared ordinary ITL/UBA successor has an APPLIED receipt before mutation; invalid/missing touch proof, typed terminal-stamp skip and NEEDS_CLEANOUT retain, while exact durable COMMITTED/ABORTED page projection cleans."
+    },
+    {
+      "id": "MXA-T24",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_close_race_drains_prepared_without_timeout_cancellation",
+      "purpose": "Deterministic close-versus-APPLY schedules prove either tracked APPLIED or pre-mutation retry; PREPARED loss blocks ACK forever in Stage 8."
+    },
+    {
+      "id": "MXA-T25",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_exact_target_absence_and_ambiguity_cleanout_table",
+      "purpose": "Exact current-page absence discharges only under successor-before-predecessor invariant; identity, page authority, HOT and descriptor ambiguity retain."
+    },
+    {
+      "id": "MXA-T26",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_terminal_member_cleanout_semantics_cross_product",
+      "purpose": "Table-test lock-only, aborted updater, committed updater, active companion, unknown companion and zero/one/many survivor rewrite outcomes."
+    },
+    {
+      "id": "MXA-T27",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_successor_receipts_and_descriptor_precede_predecessor_removal",
+      "purpose": "Recomposition, HOT, prune, freeze, move/rewrite and KO/SMGR drop/truncate schedules cannot create an unregistered moved reference, remove the old target first, or return KO DONE before matching receipts are durably discharged."
+    },
+    {
+      "id": "MXA-T28",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_participant_boot_capability_and_membership_loss_retain",
+      "purpose": "Missing/dead/reconnected/drifted touched participants are never removed from the seal set and cannot yield positive ACK or certificate."
+    },
+    {
+      "id": "MXA-T29",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_local_release_ack_range_digest_and_dependency_durability",
+      "purpose": "ACK requires exact per-key sequence 1..N, exhaustive counts, sole byte-exact N=0 tombstone form, stable double digest and durable local plus 16-entry dependency vector; inter-key global gaps are legal while per-key gaps/duplicates/insert-only WAL refuse."
+    },
+    {
+      "id": "MXA-T30",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_origin_certificate_requires_exact_complete_sorted_ack_set",
+      "purpose": "Origin rejects omitted, duplicate, extra, stale, wrong-key or nondurable ACKs and emits 0xA0 only after final exact block0 terminal recheck."
+    },
+    {
+      "id": "MXA-T31",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_release_certificate_enables_exact_l11_l12_and_ack_reclaim",
+      "purpose": "Durable certificate sets only the exact terminal release bit, L11 still requires horizon, L12 does not invent one, and notification reclaims only the matching ACK summary."
+    },
+    {
+      "id": "MXA-T32",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_crash_cut_matrix_releases_only_after_durable_certificate",
+      "purpose": "Exercise every CTRC-C01..C09 cut and prove uncertainty before durable certificate retains while replay after certificate is exact and idempotent."
+    },
+    {
+      "id": "MXA-T33",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_undo_record.c",
+      "symbol": "test_ctrc_release_flag_terminal_recycle_reuse_and_redo_matrix",
+      "purpose": "Release bit is legal only on exact terminal bytes, is cleared at terminal/recyclable/fresh transitions, gates every slot/segment reuse, and exact redo skips only proven newer identities."
+    },
+    {
+      "id": "MXA-T34",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_capacity_is_activation_sized_and_runtime_full_refuses_before_mutation",
+      "purpose": "Checked sizing uses the frozen formulas; allocation failure blocks OPEN and runtime full wakes the existing cleaner without eviction, deadline extension or page mutation."
+    },
+    {
+      "id": "MXA-T35",
+      "status": "REQUIRED_NEW",
+      "path": "src/test/cluster_unit/test_cluster_terminal_ref_census.c",
+      "symbol": "test_ctrc_source_census_has_no_unclassified_reference_or_release_writer",
+      "purpose": "Generated source manifest classifies every ordinary ITL/UBA and current-MX producer/mover/remover, terminal/recycle/reuse writer, flag writer and positive proof sender into one closed source class."
+    }
+  ]
+}
