@@ -57,7 +57,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 	        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_current_stats test_cluster_multixact_served test_cluster_mxid_stripe \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
-		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
+		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_terminal_ref_census test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
         test_cluster_wal_thread test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
@@ -332,7 +332,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_multixact_current_stats \
 		test_cluster_r4_scratch_resolver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_raw_device_capacity test_cluster_replacement_wire \
 		test_cluster_external_fence test_pgrac_external_fence_protocol \
-		test_cluster_wal_retention,$(SIMPLE_TESTS))
+		test_cluster_wal_retention test_cluster_terminal_ref_census,$(SIMPLE_TESTS))
 
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_journal test_pgrac_fenced_provider \
@@ -2669,6 +2669,7 @@ test_cluster_gcs_block: test_cluster_gcs_block.c unit_test.h $(CLUSTER_VERSION_O
 		$(CLUSTER_RESOURCE_X_RETRY_O)
 	$(CC) $(CFLAGS) $(PTHREAD_CFLAGS) $(CPPFLAGS) \
 		-DGCS_BLOCK_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c"' \
+		-DRUNTIME_VISIBILITY_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c"' \
 		-DBUFMGR_SOURCE_PATH='"$(top_srcdir)/src/backend/storage/buffer/bufmgr.c"' \
 		-DLMS_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms.c"' \
 		-DLMS_OUTBOUND_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c"' \
@@ -3068,12 +3069,23 @@ CLUSTER_MULTIXACT_CURRENT_WIRE_O = \
 	$(top_builddir)/src/backend/cluster/cluster_multixact_current_wire.o
 CLUSTER_MULTIXACT_CURRENT_STATS_O = \
 	$(top_builddir)/src/backend/cluster/cluster_multixact_current_stats.o
+CLUSTER_MULTIXACT_MATERIALIZER_TEST_O = \
+	test_cluster_multixact_materializer_product.o
+$(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O): \
+		$(top_srcdir)/src/backend/access/transam/multixact.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
+		-DGetMultiXactIdMembers=cluster_multixact_test_native_members_unused \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
 test_cluster_multixact_current: test_cluster_multixact_current.c unit_test.h \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
-		$(CLUSTER_CR_SERVER_C0_TEST_O)
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		-DHEAPAM_CURRENT_MX_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
+		-DMULTIXACT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/transam/multixact.c"' \
 		$(CLUSTER_MULTIXACT_CURRENT_O) $(CLUSTER_MULTIXACT_CURRENT_WIRE_O) \
-		$(CLUSTER_CR_SERVER_C0_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(CLUSTER_CR_SERVER_C0_TEST_O) $(CLUSTER_MULTIXACT_MATERIALIZER_TEST_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PGPORT) -o $@
 
@@ -3264,7 +3276,7 @@ CLUSTER_R4_SCRATCH_RESOLVER_TEST_O = test_cluster_r4_scratch_resolver_product.o
 $(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O): \
 		$(top_srcdir)/src/backend/cluster/cluster_visibility_resolve.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
-		-c $< -o $@
+		-DCLUSTER_CTRC_UNIT_TEST=1 -c $< -o $@
 
 test_cluster_r4_scratch_resolver: test_cluster_r4_scratch_resolver.c unit_test.h \
 		$(CLUSTER_R4_SCRATCH_RESOLVER_TEST_O) $(CLUSTER_VIS_VERDICT_O)
@@ -3284,10 +3296,39 @@ test_cluster_undo_record: test_cluster_undo_record.c unit_test.h \
 		-DUNDO_RECORD_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_undo_record.c"' \
 		-DUNDO_ALLOC_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_alloc.c"' \
 		-DHEAPAM_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/access/heap/heapam.c"' \
+		-DUNDO_XLOG_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/storage/cluster_undo_xlog.h"' \
+		-DUNDO_XLOG_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/storage/cluster_undo_xlog.c"' \
+		-DUNDO_FORMAT_HEADER_PATH='"$(abspath $(top_srcdir))/src/include/cluster/cluster_undo_format.h"' \
 		$< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_RECORD_TEST_O) $(CLUSTER_UNDO_ALLOC_TEST_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a $(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
+
+# CTRC focused contract: compile the real dependency-light state engine with
+# section GC.  The test supplies only PostgreSQL runtime boundary stubs; all
+# grant, receipt, close, ACK, certificate and release decisions are product
+# code.  The source manifest is a test input, not a status authority.
+CLUSTER_CTRC_TEST_O = test_cluster_terminal_ref_census_product.o
+
+$(CLUSTER_CTRC_TEST_O): \
+		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c \
+		$(top_srcdir)/src/include/cluster/cluster_terminal_ref_census.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-DCLUSTER_CTRC_UNIT_TEST=1 \
+		-c $< -o $@
+
+test_cluster_terminal_ref_census: test_cluster_terminal_ref_census.c \
+		ctrc_source_census.tsv heap_reference_producer_census.tsv \
+		current_mx_cardinality_census.tsv unit_test.h $(CLUSTER_CTRC_TEST_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DCTRC_SOURCE_MANIFEST_PATH='"$(abspath $(top_srcdir))/src/test/cluster_unit/ctrc_source_census.tsv"' \
+		-DHEAP_REFERENCE_PRODUCER_MANIFEST_PATH='"$(abspath $(top_srcdir))/src/test/cluster_unit/heap_reference_producer_census.tsv"' \
+		-DCURRENT_MX_CARDINALITY_MANIFEST_PATH='"$(abspath $(top_srcdir))/src/test/cluster_unit/current_mx_cardinality_census.tsv"' \
+		-DPGRAC_SOURCE_ROOT_PATH='"$(abspath $(top_srcdir))"' \
+		$< $(CLUSTER_CTRC_TEST_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a \
+		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
 
 
 # spec-4.2 D6: test_cluster_wal_state — 14 pure-helper tests for the

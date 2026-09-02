@@ -4355,13 +4355,21 @@ UT_TEST(test_current_mx_member_proof_reuses_nonblocking_target_origin_context)
 		"context->current_mx_locators[i].segment_id",
 		"context->tt_logical.segment_id",
 		"cluster_runtime_visibility_physical_locator_sample_held(",
-		"cluster_multixact_current_resolve_origin_member_proof("
+		"cluster_multixact_current_resolve_origin_member_proof(",
+		"cluster_ctrc_origin_touch_exact(",
+		"&context->current_mx_requester_identity",
+		"ClusterCurrentMemberProofSetCtrcGrant("
 	};
 	static const char *const advance_contract[] = {
 		"context->current_mx_sampled_bitmap",
 		"context->current_mx_locators[i].segment_id",
 		"gcs_block_r4_tx_origin_resolve_root_current(",
 		"context->current_mx_result = CMX_RESOLVE_OK"
+	};
+	static const char *const capability_carrier_contract[] = {
+		"gcs_block_current_mx_requester_identity_current(context)",
+		"context->current_mx_requester_identity.capability_record_generation",
+		"cluster_cr_server_current_mx_build_proof_page("
 	};
 	char *source = read_gcs_block_source();
 
@@ -4389,11 +4397,51 @@ UT_TEST(test_current_mx_member_proof_reuses_nonblocking_target_origin_context)
 		source, "\ngcs_block_current_mx_origin_advance(",
 		"\nstatic GcsBlockR4TxOriginPhase\ngcs_block_current_mx_origin_after_release(",
 		advance_contract, lengthof(advance_contract));
+	assert_ordered_in_function(
+		source, "\ngcs_block_current_mx_origin_prepare_reply(",
+		"\nstatic bool\ngcs_block_current_mx_origin_sample_held(",
+		capability_carrier_contract,
+		lengthof(capability_carrier_contract));
 	UT_ASSERT_NULL(strstr(source,
 		"owner->segment_id != segment_id"));
 	UT_ASSERT_NULL(strstr(source,
 		"gcs_block_current_mx_origin_try_accept(env, payload)\n\t\t&& cluster_runtime_visibility_current_owner_lookup_exact"));
 	free(source);
+}
+
+/* MXA-T19 x MXA-T20: VISIBILITY may conservatively report IN_PROGRESS while
+ * the exact physical predecessor is already COMMITTED.  CTRC must preserve
+ * that read result without turning it into a touch or a nonzero ACTIVE grant. */
+UT_TEST(test_current_mx_ctrc_grant_requires_same_sample_physical_active)
+{
+	static const char *const local_contract[] = {
+		"bool ctrc_physical_active = false",
+		"cluster_runtime_visibility_current_owner_sample_held(",
+		"&ctrc_physical_active",
+		"ctrc_required && !ctrc_physical_active",
+		"cluster_ctrc_origin_touch_exact("
+	};
+	static const char *const remote_contract[] = {
+		"bool ctrc_physical_active = false",
+		"cluster_runtime_visibility_physical_locator_sample_held(",
+		"&ctrc_physical_active",
+		"!ctrc_physical_active",
+		"cluster_ctrc_origin_touch_exact("
+	};
+	char *runtime_source = read_source_path(RUNTIME_VISIBILITY_SOURCE_PATH);
+	char *gcs_source = read_gcs_block_source();
+
+	assert_ordered_in_function(
+		runtime_source,
+		"\ncluster_runtime_visibility_current_owner_lookup_internal(",
+		"\nbool\ncluster_runtime_visibility_current_owner_lookup_exact(",
+		local_contract, lengthof(local_contract));
+	assert_ordered_in_function(
+		gcs_source, "\ngcs_block_current_mx_origin_sample_held(",
+		"\ntypedef enum GcsBlockCurrentMxAdvance",
+		remote_contract, lengthof(remote_contract));
+	free(runtime_source);
+	free(gcs_source);
 }
 
 UT_TEST(test_current_mx_origin_unknown_records_first_exact_failure_stage)
@@ -5510,7 +5558,7 @@ UT_TEST(test_recovering_denial_records_exact_master_gate_predicates)
 int
 main(void)
 {
-	UT_PLAN(103);
+	UT_PLAN(104);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -5596,6 +5644,7 @@ main(void)
 	UT_RUN(test_r4_tx_origin_epoch_zero_is_four_node_and_session_generation_exact);
 	UT_RUN(test_r4_tx_origin_pending_work_uses_bounded_lms_poll_slice);
 	UT_RUN(test_current_mx_member_proof_reuses_nonblocking_target_origin_context);
+	UT_RUN(test_current_mx_ctrc_grant_requires_same_sample_physical_active);
 	UT_RUN(test_current_mx_origin_unknown_records_first_exact_failure_stage);
 	UT_RUN(test_r4_tx_origin_cross_segment_resolution_is_cooperative);
 	UT_RUN(test_r4_tx_origin_serializes_existing_scur_owner_before_all_acquires);

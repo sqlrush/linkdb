@@ -74,7 +74,10 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tt_local.h"		/* PGRAC: spec-4.5a G4 peek binding wrap */
 #include "cluster/cluster_recovery_merge.h" /* PGRAC: spec-4.5a is_materialized */
 #include "cluster/cluster_scn.h"
@@ -2251,6 +2254,210 @@ cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity,
 	return CLUSTER_UNDO_RECORD_PREPARE_READY;
 }
 
+static bool
+cluster_undo_record_receipt_sync(
+	ClusterUndoRecordPrepareReceipt *receipt)
+{
+	ClusterUndoRecordReservation *reservation
+		= &cluster_undo_record_reservation;
+
+	if (receipt == NULL || !reservation->active
+		|| receipt->reservation_sequence == 0
+		|| receipt->reservation_sequence != reservation->sequence)
+		return false;
+	reservation->receipt = *receipt;
+	return true;
+}
+
+static bool
+cluster_undo_record_bytes_zero(const void *address, Size length)
+{
+	const uint8 *bytes = (const uint8 *)address;
+	Size i;
+
+	if (address == NULL)
+		return false;
+	for (i = 0; i < length; i++)
+		if (bytes[i] != 0)
+			return false;
+	return true;
+}
+
+bool
+cluster_undo_record_ctrc_stage_pending(
+	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
+	const ClusterCtrcTargetV1 *pending_target)
+{
+	uint8 target_bit;
+
+	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS)
+		return false;
+	target_bit = UINT8_C(1) << target_ordinal;
+	if (receipt == NULL || pending_target == NULL
+		|| pending_target->kind != CTRC_TARGET_PAGE_PENDING_ITL_SLOT
+		|| !cluster_undo_record_receipt_extent_matches(receipt)
+		|| (receipt->ctrc_prepared_mask & target_bit) != 0
+		|| (receipt->ctrc_applied_mask & target_bit) != 0
+		|| receipt->ctrc_handles[target_ordinal].valid
+		|| !cluster_undo_record_bytes_zero(receipt->ctrc_reserved8,
+									  sizeof(receipt->ctrc_reserved8)))
+		return false;
+	if ((receipt->ctrc_pending_mask & target_bit) != 0)
+		return memcmp(&receipt->ctrc_pending_targets[target_ordinal],
+			pending_target,
+					  sizeof(*pending_target)) == 0;
+	receipt->ctrc_pending_targets[target_ordinal] = *pending_target;
+	receipt->ctrc_pending_mask |= target_bit;
+	return cluster_undo_record_receipt_sync(receipt);
+}
+
+bool
+cluster_undo_record_ctrc_pending_matches(
+	const ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
+	const ClusterCtrcTargetV1 *pending_target)
+{
+	uint8 target_bit;
+
+	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS)
+		return false;
+	target_bit = UINT8_C(1) << target_ordinal;
+	return receipt != NULL && pending_target != NULL
+		&& (receipt->ctrc_pending_mask & target_bit) != 0
+		&& (receipt->ctrc_prepared_mask & target_bit) != 0
+		&& receipt->ctrc_handles[target_ordinal].valid
+		&& memcmp(&receipt->ctrc_pending_targets[target_ordinal],
+			pending_target,
+				  sizeof(*pending_target)) == 0;
+}
+
+bool
+cluster_undo_record_ctrc_required_prepared(
+	const ClusterUndoRecordPrepareReceipt *receipt, uint8 required_mask)
+{
+	const uint8 known_mask
+		= (UINT8_C(1) << CLUSTER_UNDO_RECORD_CTRC_TARGETS) - 1;
+	uint8 target_ordinal;
+
+	if (receipt == NULL || required_mask == 0
+		|| (required_mask & ~known_mask) != 0
+		|| (receipt->ctrc_pending_mask & known_mask) != required_mask
+		|| (receipt->ctrc_prepared_mask & known_mask) != required_mask
+		|| (receipt->ctrc_applied_mask & known_mask) != 0
+		|| !cluster_undo_record_bytes_zero(receipt->ctrc_reserved8,
+									  sizeof(receipt->ctrc_reserved8)))
+		return false;
+	for (target_ordinal = 0;
+		 target_ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS;
+		 target_ordinal++)
+	{
+		uint8 target_bit = UINT8_C(1) << target_ordinal;
+
+		if (((required_mask & target_bit) != 0)
+			!= receipt->ctrc_handles[target_ordinal].valid)
+			return false;
+	}
+	return true;
+}
+
+bool
+cluster_undo_record_ctrc_prepare_pending(
+	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal)
+{
+	ClusterTTStatusKey status_key;
+	ClusterTTStatusResult status;
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcParticipantIdentity participant;
+	ClusterCtrcPublicationIdV1 publication;
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcPrepareResult result;
+	TransactionId xid = GetTopTransactionIdIfAny();
+	uint32 grant = 0;
+	uint8 target_bit;
+
+	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS)
+		return false;
+	target_bit = UINT8_C(1) << target_ordinal;
+	if (receipt == NULL || (receipt->ctrc_pending_mask & target_bit) == 0
+		|| (receipt->ctrc_prepared_mask & target_bit) != 0
+		|| (receipt->ctrc_applied_mask & target_bit) != 0
+		|| receipt->ctrc_handles[target_ordinal].valid
+		|| !TransactionIdIsValid(xid)
+		|| MyBackendId <= 0
+		|| !cluster_undo_record_receipt_extent_matches(receipt)
+		|| receipt->absolute_deadline_us <= (uint64)GetCurrentTimestamp())
+		return false;
+	MemSet(&status_key, 0, sizeof(status_key));
+	MemSet(&status, 0, sizeof(status));
+	MemSet(&key, 0, sizeof(key));
+	MemSet(&participant, 0, sizeof(participant));
+	MemSet(&publication, 0, sizeof(publication));
+	MemSet(&handle, 0, sizeof(handle));
+	if (!cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
+			xid, &status_key, &status, &grant, &key, &participant)
+		|| status.status != CLUSTER_TT_STATUS_IN_PROGRESS || grant == 0)
+		return false;
+
+	publication.requester_node_id = participant.node_id;
+	publication.requester_boot_incarnation = participant.boot_incarnation;
+	publication.capability_record_generation
+		= participant.capability_record_generation;
+	publication.requester_backend_id = MyBackendId;
+	publication.wire_request_id = receipt->reservation_sequence;
+	publication.operation_id = receipt->reservation_sequence
+		+ target_ordinal;
+	if (publication.operation_id < receipt->reservation_sequence)
+		return false;
+	publication.attempt_generation = 1;
+	publication.descriptor_hash = 0;
+	publication.member_ordinal = UINT16_MAX;
+	publication.member_role = 0;
+	publication.reference_kind = CTRC_REF_HEAP_ITL_UBA;
+	publication.target_kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+	publication.grant_generation = grant;
+	result = cluster_ctrc_receipt_prepare_shared(&key, &participant, grant,
+		&publication, &receipt->ctrc_pending_targets[target_ordinal], &handle);
+	if (result != CLUSTER_CTRC_PREPARE_READY
+		&& result != CLUSTER_CTRC_PREPARE_DUPLICATE)
+		return false;
+	receipt->ctrc_handles[target_ordinal] = handle;
+	receipt->ctrc_prepared_mask |= target_bit;
+	if (!cluster_undo_record_receipt_sync(receipt))
+	{
+		(void)cluster_ctrc_receipt_cancel_shared(&handle);
+		return false;
+	}
+	return true;
+}
+
+ClusterCtrcApplyResult
+cluster_undo_record_ctrc_apply_prepared(
+	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
+	const ClusterCtrcTargetV1 *final_target,
+	ClusterCtrcApplyToken *token)
+{
+	ClusterCtrcApplyResult result;
+	uint8 target_bit;
+
+	if (target_ordinal >= CLUSTER_UNDO_RECORD_CTRC_TARGETS)
+		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+	target_bit = UINT8_C(1) << target_ordinal;
+	if (receipt == NULL || final_target == NULL || token == NULL
+		|| (receipt->ctrc_pending_mask & target_bit) == 0
+		|| (receipt->ctrc_prepared_mask & target_bit) == 0
+		|| (receipt->ctrc_applied_mask & target_bit) != 0
+		|| !receipt->ctrc_handles[target_ordinal].valid
+		|| !cluster_undo_record_receipt_extent_matches(receipt))
+		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+	result = cluster_ctrc_receipt_apply_shared(
+		&receipt->ctrc_handles[target_ordinal], final_target, token);
+	if (result != CLUSTER_CTRC_APPLY_APPLIED)
+		return result;
+	receipt->ctrc_applied_mask |= target_bit;
+	if (!cluster_undo_record_receipt_sync(receipt))
+		return CLUSTER_CTRC_APPLY_FAIL_CLOSED;
+	return CLUSTER_CTRC_APPLY_APPLIED;
+}
+
 
 bool
 cluster_undo_record_prepared_recheck(
@@ -2267,6 +2474,32 @@ cluster_undo_record_prepared_recheck(
 			&receipt->block0_publication);
 }
 
+bool
+cluster_undo_record_prepared_uba_exact(
+	const ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len,
+	UBA *uba_out)
+{
+	uint16 record_length;
+	UBA uba;
+
+	if (uba_out != NULL)
+		*uba_out = InvalidUba;
+	if (receipt == NULL || uba_out == NULL
+		|| payload_len > receipt->payload_capacity
+		|| !cluster_undo_record_receipt_extent_matches(receipt))
+		return false;
+	record_length = undo_record_total_length(receipt->record_type, payload_len);
+	if (!cluster_undo_block_has_space(receipt->extent.cur_free_offset,
+			receipt->extent.cur_slot_count, record_length))
+		return false;
+	uba = uba_encode(receipt->actual_segment_id, receipt->extent.cur_block,
+		receipt->tt_slot_offset, receipt->extent.cur_slot_count);
+	if (UBA_is_invalid(uba))
+		return false;
+	*uba_out = uba;
+	return true;
+}
+
 
 void
 cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
@@ -2279,6 +2512,22 @@ cluster_undo_record_cancel_prepared(ClusterUndoRecordPrepareReceipt *receipt)
 		|| receipt->reservation_sequence != reservation->sequence
 		|| memcmp(receipt, &reservation->receipt, sizeof(*receipt)) != 0)
 		return;
+	{
+		uint8 target_ordinal;
+
+		for (target_ordinal = 0;
+			 target_ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS;
+			 target_ordinal++)
+		{
+			uint8 target_bit = UINT8_C(1) << target_ordinal;
+
+			if ((receipt->ctrc_prepared_mask & target_bit) != 0
+				&& (receipt->ctrc_applied_mask & target_bit) == 0
+				&& receipt->ctrc_handles[target_ordinal].valid)
+				(void)cluster_ctrc_receipt_cancel_shared(
+					&receipt->ctrc_handles[target_ordinal]);
+		}
+	}
 	if (reservation->owns_ref && reservation->ref_slot >= 0)
 		cluster_undo_buf_unref_slot(reservation->ref_slot);
 	cluster_semantic_activation_leave(

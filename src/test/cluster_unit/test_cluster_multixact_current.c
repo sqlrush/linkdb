@@ -23,7 +23,9 @@
 #include "postgres.h"
 
 #include <stddef.h>
+#include <stdio.h>
 
+#include "access/htup_details.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic_router.h"
@@ -33,6 +35,7 @@
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_mxid_stripe.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_write_fence.h"
 #include "storage/lock.h"
@@ -92,6 +95,38 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 	abort();
 }
 
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	return elevel >= ERROR;
+}
+
+bool
+errstart_cold(int elevel,
+	const char *domain pg_attribute_unused())
+{
+	return elevel >= ERROR;
+}
+
+int
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	return 0;
+}
+
+int
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
+	const char *funcname pg_attribute_unused())
+{
+	abort();
+}
+
 
 /*
  * Runtime seams for the descriptor-authority routing test.  They keep this
@@ -105,6 +140,7 @@ static uint64 test_runtime_epoch;
 static int test_runtime_mxid_origin = -1;
 static bool test_runtime_mxid_mine;
 static int test_runtime_native_describe_calls;
+static int test_runtime_native_describe_count = 2;
 static int test_runtime_remote_describe_calls;
 static bool test_runtime_remote_describe_ok;
 static int test_runtime_proof_calls;
@@ -112,11 +148,21 @@ static int test_runtime_proof_fail_call;
 static int test_runtime_origin_proof_source_calls;
 static bool test_runtime_target_owner_enabled;
 static int test_runtime_target_owner_calls;
+static TransactionId test_runtime_target_owner_active_xid;
+static TransactionId test_runtime_local_terminal_xid;
+static ClusterTTStatus test_runtime_local_terminal_status;
+static bool test_runtime_local_terminal_rolled;
+static int test_runtime_local_terminal_calls;
+static TransactionId test_runtime_self_xid;
+static ClusterCurrentMemberState test_runtime_remote_member_state = CCM_ABORTED;
 static int test_runtime_describe_send_calls;
 static int test_runtime_describe_capability_calls;
 static int test_runtime_describe_generation_match_calls;
 static uint32 test_runtime_describe_dest;
 static uint32 test_runtime_describe_payload_len;
+static int test_runtime_materialize_calls;
+static int test_runtime_materialize_nmembers;
+static MultiXactMember test_runtime_materialize_member;
 static uint8 test_runtime_describe_payload[
 	sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE];
 
@@ -133,11 +179,28 @@ cluster_cr_server_test_current_mx_build_describe_page(
 extern ClusterMxResolveResult
 cluster_cr_server_test_current_mx_build_proof_page(
 	uint16 source_node_id, const ClusterCurrentMxProofForwardV2 *request,
-	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	ClusterMxResolveResult result, uint32 requester_capability_generation,
+	const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	ClusterCurrentMxProofReplyPage *page);
 extern bool cluster_runtime_visibility_current_owner_lookup_exact(
 	TransactionId xid, ClusterTTStatusKey *key, ClusterTTStatusResult *result);
+extern bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc(
+	TransactionId xid, ClusterTTStatusKey *key, ClusterTTStatusResult *result,
+	uint32 *ctrc_grant_out);
+MultiXactId cluster_multixact_test_materialize_local_current(
+	int nmembers, MultiXactMember *members);
+
+MultiXactId
+cluster_multixact_test_materialize_local_current(int nmembers,
+	MultiXactMember *members)
+{
+	test_runtime_materialize_calls++;
+	test_runtime_materialize_nmembers = nmembers;
+	if (nmembers == 1 && members != NULL)
+		test_runtime_materialize_member = members[0];
+	return (MultiXactId) 901;
+}
 
 void
 pfree(void *pointer)
@@ -257,18 +320,22 @@ GetMultiXactIdMembers(MultiXactId multi pg_attribute_unused(), MultiXactMember *
 					  bool isLockOnly pg_attribute_unused())
 {
 	MultiXactMember *out;
+	int count = test_runtime_native_describe_count;
 
 	test_runtime_native_describe_calls++;
-	if (members == NULL)
+	if (members == NULL || count < 1 || count > 2)
 		return -1;
-	out = (MultiXactMember *)malloc(2 * sizeof(*out));
-	memset(out, 0, 2 * sizeof(*out));
+	out = (MultiXactMember *)malloc((size_t)count * sizeof(*out));
+	memset(out, 0, (size_t)count * sizeof(*out));
 	out[0].xid = 100;
 	out[0].status = MultiXactStatusForShare;
-	out[1].xid = 101;
-	out[1].status = MultiXactStatusNoKeyUpdate;
+	if (count == 2)
+	{
+		out[1].xid = 101;
+		out[1].status = MultiXactStatusNoKeyUpdate;
+	}
 	*members = out;
-	return 2;
+	return count;
 }
 
 ClusterMxDescribeResult
@@ -298,7 +365,8 @@ ClusterMxResolveResult
 cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	int32 origin_node, ClusterCurrentMxProofForwardV2 *request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
-	ClusterCurrentUpdaterProof *updater_proof)
+	ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *requester_capability_generation_out)
 {
 	ClusterCurrentMxProofForwardV2 decoded;
 	uint8 i;
@@ -310,6 +378,8 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 		memset(updater_proof, 0, sizeof(*updater_proof));
 		updater_proof->verdict = CUCP_UNKNOWN;
 	}
+	if (requester_capability_generation_out != NULL)
+		*requester_capability_generation_out = 0;
 	if (test_runtime_proof_fail_call == test_runtime_proof_calls
 		|| !cluster_multixact_current_wire_validate_proof_forward(
 			request, sizeof(*request), request->prefix.original_requester_node, origin_node,
@@ -326,10 +396,13 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 			test_member(&member, decoded.trailer.body.asks[i].xid,
 						decoded.trailer.body.asks[i].member_status);
 			test_proof(&proofs[i], &member,
-					   decoded.trailer.body.asks[i].member_ordinal, CCM_ABORTED,
+					   decoded.trailer.body.asks[i].member_ordinal,
+					   test_runtime_remote_member_state,
 					   (uint16)origin_node, 20 + i);
 		}
 		*proof_count = decoded.prefix.entry_count;
+		*requester_capability_generation_out
+			= (uint32)(100 + origin_node);
 		return CMX_RESOLVE_OK;
 	}
 
@@ -351,13 +424,15 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	updater_proof->updater_xid = decoded.trailer.body.updater.challenge.updater_xid;
 	updater_proof->member_ordinal = decoded.trailer.body.updater.challenge.member_ordinal;
 	updater_proof->verdict = CUCP_MATCH;
+	*requester_capability_generation_out = (uint32)(100 + origin_node);
 	return CMX_RESOLVE_OK;
 }
 
 bool
-TransactionIdIsCurrentTransactionId(TransactionId xid pg_attribute_unused())
+TransactionIdIsCurrentTransactionId(TransactionId xid)
 {
-	return false;
+	return TransactionIdIsNormal(test_runtime_self_xid)
+		&& TransactionIdEquals(xid, test_runtime_self_xid);
 }
 
 bool
@@ -373,6 +448,9 @@ cluster_runtime_visibility_current_owner_lookup_exact(
 	result->commit_scn = InvalidScn;
 	if (!test_runtime_target_owner_enabled)
 		return false;
+	if (TransactionIdIsNormal(test_runtime_target_owner_active_xid)
+		&& !TransactionIdEquals(xid, test_runtime_target_owner_active_xid))
+		return false;
 	key->origin_node_id = (uint16)cluster_node_id;
 	key->undo_segment_id = 2;
 	key->tt_slot_id = (uint32)(xid % 8) + 1;
@@ -383,6 +461,79 @@ cluster_runtime_visibility_current_owner_lookup_exact(
 	result->commit_scn = InvalidScn;
 	result->authoritative = true;
 	return true;
+}
+
+bool
+cluster_runtime_visibility_current_owner_lookup_exact_ctrc(
+	TransactionId xid, ClusterTTStatusKey *key, ClusterTTStatusResult *result,
+	uint32 *ctrc_grant_out)
+{
+	bool found;
+
+	if (ctrc_grant_out != NULL)
+		*ctrc_grant_out = 0;
+	found = cluster_runtime_visibility_current_owner_lookup_exact(
+		xid, key, result);
+	if (found && ctrc_grant_out != NULL
+		&& result->status == CLUSTER_TT_STATUS_IN_PROGRESS)
+		*ctrc_grant_out = 7;
+	return found;
+}
+
+bool
+cluster_runtime_visibility_local_terminal_lookup_exact(
+	TransactionId xid, ClusterTTStatusKey *key, ClusterTTStatusResult *result)
+{
+	test_runtime_local_terminal_calls++;
+	UT_ASSERT_NOT_NULL(key);
+	UT_ASSERT_NOT_NULL(result);
+	memset(key, 0, sizeof(*key));
+	memset(result, 0, sizeof(*result));
+	result->status = CLUSTER_TT_STATUS_UNKNOWN;
+	result->commit_scn = InvalidScn;
+	if (!TransactionIdIsNormal(test_runtime_local_terminal_xid)
+		|| !TransactionIdEquals(xid, test_runtime_local_terminal_xid)
+		|| (test_runtime_local_terminal_status != CLUSTER_TT_STATUS_COMMITTED
+			&& test_runtime_local_terminal_status != CLUSTER_TT_STATUS_ABORTED))
+		return false;
+	key->origin_node_id = (uint16)cluster_node_id;
+	key->undo_segment_id = test_runtime_local_terminal_rolled ? 9 : 2;
+	key->tt_slot_id = (uint32)(xid % 8) + 1;
+	key->cluster_epoch = (uint32)test_runtime_epoch;
+	key->local_xid = xid;
+	result->status = test_runtime_local_terminal_status;
+	result->status_epoch = (uint32)test_runtime_epoch;
+	result->commit_scn = test_runtime_local_terminal_status
+		== CLUSTER_TT_STATUS_COMMITTED ? UINT64_C(901) : InvalidScn;
+	result->authoritative = true;
+	return true;
+}
+
+bool
+cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
+	TransactionId xid, ClusterTTStatusKey *key, ClusterTTStatusResult *result,
+	uint32 *ctrc_grant_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
+	ClusterCtrcParticipantIdentity *participant_out)
+{
+	bool found;
+
+	UT_ASSERT_NOT_NULL(ctrc_key_out);
+	UT_ASSERT_NOT_NULL(participant_out);
+	memset(ctrc_key_out, 0, sizeof(*ctrc_key_out));
+	memset(participant_out, 0, sizeof(*participant_out));
+	found = cluster_runtime_visibility_current_owner_lookup_exact_ctrc(
+		xid, key, result, ctrc_grant_out);
+	if (found && ctrc_grant_out != NULL && *ctrc_grant_out != 0)
+	{
+		ctrc_key_out->format_version = CLUSTER_CTRC_FORMAT_VERSION;
+		ctrc_key_out->xid = xid;
+		participant_out->node_id = (uint16)cluster_node_id;
+		participant_out->capability_record_generation = 55;
+		participant_out->boot_incarnation = 9;
+		participant_out->formation_epoch = test_runtime_epoch;
+		participant_out->admission_record_generation = 77;
+	}
+	return found;
 }
 
 ClusterSemanticAdmissionResult
@@ -548,6 +699,7 @@ UT_TEST(test_current_multixact_public_symbols_link)
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_build_proof_requests);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_reply);
 	UT_ASSERT_NOT_NULL(cluster_multixact_current_wire_validate_proof_reply_frame);
+	UT_ASSERT_EQ(CLUSTER_CURRENT_MX_WIRE_VERSION, 2);
 }
 
 
@@ -659,9 +811,10 @@ test_proof(ClusterCurrentMemberProof *proof, const ClusterCurrentMxMemberDesc *m
 	proof->member_status = member->member_status;
 	proof->state = state;
 
-	if (state == CCM_SELF || state == CCM_ACTIVE)
+	if (state == CCM_SELF || state == CCM_ACTIVE) {
 		proof->key = test_ttkey(origin, member->xid, slot);
-	else if (state == CCM_COMMITTED)
+		proof->reserved8[0] = 7;
+	} else if (state == CCM_COMMITTED)
 		proof->commit_scn = 100 + ordinal;
 }
 
@@ -716,7 +869,7 @@ UT_TEST(test_current_multixact_descriptor_validation)
 	UT_ASSERT_EQ(cluster_multixact_current_validate_descriptor(&key, 2, 9, NULL, 0, 0),
 				 CMX_DESC_DENIED);
 	UT_ASSERT_EQ(cluster_multixact_current_validate_descriptor(&key, 2, 9, members, 1, 1),
-				 CMX_DESC_DENIED);
+				 CMX_DESC_OK);
 	UT_ASSERT_EQ(cluster_multixact_current_validate_descriptor(&key, 2, 9, NULL, 0, 257),
 				 CMX_DESC_SUPPORTED_LIMIT);
 	UT_ASSERT_EQ(cluster_multixact_current_validate_descriptor(&key, 2, 9, members, 2, 257),
@@ -797,6 +950,7 @@ UT_TEST(test_current_multixact_proof_binding_and_order)
 	ClusterCurrentMemberProof proof01[2];
 	ClusterCurrentMemberProof proof2[1];
 	ClusterCurrentMemberProof ordered[3];
+	uint32 proof_capability_generations[CLUSTER_CURRENT_MX_MAX_MEMBERS];
 	ClusterCurrentProofChunkView chunks[3];
 	ClusterCurrentUpdaterProof limit_updater_proof;
 	uint16 member_origins[3] = { 4, 5, 6 };
@@ -839,6 +993,19 @@ UT_TEST(test_current_multixact_proof_binding_and_order)
 	UT_ASSERT_EQ(ordered[1].member_xid, 101);
 	UT_ASSERT_EQ(ordered[2].member_xid, 102);
 
+	memset(proof01[0].reserved8, 0, sizeof(proof01[0].reserved8));
+	UT_ASSERT_EQ(cluster_multixact_current_validate_proof_set(
+					 &key, members, member_origins, 3, 77, hash, chunks, 3,
+					 ordered),
+				 CMX_RESOLVE_UNKNOWN);
+	proof01[0].reserved8[0] = 7;
+	proof01[1].reserved8[0] = 7;
+	UT_ASSERT_EQ(cluster_multixact_current_validate_proof_set(
+					 &key, members, member_origins, 3, 77, hash, chunks, 3,
+					 ordered),
+				 CMX_RESOLVE_UNKNOWN);
+	proof01[1].reserved8[0] = 0;
+
 	chunks[0].request_id++;
 	UT_ASSERT_EQ(cluster_multixact_current_validate_proof_set(&key, members, member_origins, 3, 77,
 															  hash, chunks, 3, ordered),
@@ -862,7 +1029,8 @@ UT_TEST(test_current_multixact_proof_binding_and_order)
 	limit_updater_proof.verdict = CUCP_MATCH;
 	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
 					 &key, members, CLUSTER_CURRENT_MX_MAX_MEMBERS + 1, hash, NULL,
-					 capped_output.proofs, &limit_updater_proof),
+					 capped_output.proofs, &limit_updater_proof,
+					 proof_capability_generations),
 				 CMX_RESOLVE_SUPPORTED_LIMIT);
 	UT_ASSERT_EQ(capped_output.canary, UINT64CONST(0x8877665544332211));
 	UT_ASSERT_EQ(limit_updater_proof.verdict, CUCP_UNKNOWN);
@@ -932,7 +1100,9 @@ UT_TEST(test_current_multixact_proof_binding_and_order)
 
 	memset(ordered, 0xff, sizeof(ordered));
 	UT_ASSERT_EQ(
-		cluster_multixact_current_members_resolve(&key, members, 3, hash, NULL, ordered, NULL),
+		cluster_multixact_current_members_resolve(
+			&key, members, 3, hash, NULL, ordered, NULL,
+			proof_capability_generations),
 		CMX_RESOLVE_UNKNOWN);
 	UT_ASSERT_EQ(ordered[0].state, CCM_UNKNOWN);
 	UT_ASSERT_EQ(ordered[1].state, CCM_UNKNOWN);
@@ -1112,6 +1282,7 @@ UT_TEST(test_current_multixact_proof_reply_wire_binding)
 	ClusterCurrentMemberProof out[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
 	ClusterCurrentUpdaterProof updater_out;
 	ClusterMxResolveResult frame_result = CMX_RESOLVE_UNKNOWN;
+	uint32 requester_capability_generation = 0;
 	uint16 out_count = 0;
 	uint8 i;
 
@@ -1129,6 +1300,7 @@ UT_TEST(test_current_multixact_proof_reply_wire_binding)
 	page.header.entry_count = request.prefix.entry_count;
 	page.header.chunk_ordinal = request.prefix.chunk_ordinal;
 	page.header.chunk_count_minus_one = request.prefix.chunk_count_minus_one;
+	page.header.requester_capability_generation = 41;
 	page.header.wire_length
 		= sizeof(page.header) + page.header.entry_count * sizeof(ClusterCurrentMemberProof);
 	for (i = 0; i < page.header.entry_count; i++) {
@@ -1142,15 +1314,17 @@ UT_TEST(test_current_multixact_proof_reply_wire_binding)
 
 	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply(
 					 &page, sizeof(page), 5, 9, &request, out, lengthof(out), &out_count,
-					 &updater_out),
+					 &updater_out, &requester_capability_generation),
 				 CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(requester_capability_generation, (uint32)41);
 	UT_ASSERT_EQ(out_count, 2);
 	UT_ASSERT_EQ(out[1].member_xid, request.trailer.body.asks[1].xid);
 
 	page.header.source_node_id = 4;
 	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_proof_reply_frame(
 					 &page, sizeof(page), 5, 9, &request, &frame_result, out, lengthof(out),
-					 &out_count, &updater_out),
+					 &out_count, &updater_out,
+					 &requester_capability_generation),
 				 false);
 	UT_ASSERT_EQ(out_count, 0);
 	UT_ASSERT_EQ(out[0].state, CCM_UNKNOWN);
@@ -1164,6 +1338,7 @@ UT_TEST(test_current_multixact_members_resolve_all_or_nothing)
 	ClusterCurrentMemberProof proofs[3];
 	ClusterCurrentUpdaterChallenge challenge;
 	ClusterCurrentUpdaterProof updater_proof;
+	uint32 proof_capability_generations[3];
 	uint64 hash;
 	uint16 i;
 
@@ -1183,7 +1358,7 @@ UT_TEST(test_current_multixact_members_resolve_all_or_nothing)
 	test_runtime_proof_fail_call = 0;
 	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
 					 &key, members, lengthof(members), hash, &challenge, proofs,
-					 &updater_proof),
+					 &updater_proof, proof_capability_generations),
 				 CMX_RESOLVE_OK);
 	UT_ASSERT_EQ(test_runtime_proof_calls, 3);
 	UT_ASSERT_EQ(proofs[1].state, CCM_COMMITTED);
@@ -1195,7 +1370,7 @@ UT_TEST(test_current_multixact_members_resolve_all_or_nothing)
 	test_runtime_proof_fail_call = 2;
 	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
 					 &key, members, lengthof(members), hash, &challenge, proofs,
-					 &updater_proof),
+					 &updater_proof, proof_capability_generations),
 				 CMX_RESOLVE_UNKNOWN);
 	for (i = 0; i < lengthof(proofs); i++)
 		UT_ASSERT_EQ(proofs[i].state, CCM_UNKNOWN);
@@ -1211,6 +1386,7 @@ UT_TEST(test_current_multixact_local_member_uses_target_canonical_not_source)
 	ClusterCurrentMxMemberDesc members[2];
 	ClusterCurrentMemberProof proofs[2];
 	ClusterCurrentUpdaterProof updater_proof;
+	uint32 proof_capability_generations[2];
 	uint64 hash;
 
 	cluster_node_id = 4;
@@ -1228,15 +1404,568 @@ UT_TEST(test_current_multixact_local_member_uses_target_canonical_not_source)
 
 	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
 		&key, members, lengthof(members), hash, NULL, proofs,
-		&updater_proof), CMX_RESOLVE_OK);
+		&updater_proof, proof_capability_generations), CMX_RESOLVE_OK);
 	UT_ASSERT_EQ(test_runtime_target_owner_calls, 2);
 	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 0);
 	UT_ASSERT_EQ(proofs[0].state, CCM_ACTIVE);
 	UT_ASSERT_EQ(proofs[1].state, CCM_ACTIVE);
 	UT_ASSERT_EQ(proofs[0].key.local_xid, members[0].xid);
 	UT_ASSERT_EQ(proofs[1].key.local_xid, members[1].xid);
+	UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[0]), 7);
+	UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[1]), 7);
+	UT_ASSERT_EQ(proof_capability_generations[0], (uint32)55);
+	UT_ASSERT_EQ(proof_capability_generations[1], (uint32)55);
 	test_runtime_target_owner_enabled = false;
+	test_runtime_target_owner_active_xid = InvalidTransactionId;
 	cluster_node_id = -1;
+}
+
+
+/* CTRC local-origin proofs must split physical ACTIVE from terminal sampling.
+ * A retired current-segment owner and a rolled terminal slot carry no grant
+ * and no participant capability generation, while an exact ACTIVE/SELF peer
+ * in the same descriptor retains its own grant-bound identity. */
+UT_TEST(test_current_multixact_local_terminal_uses_physical_current_or_rolled)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMemberProof proofs[2];
+	ClusterCurrentUpdaterProof updater_proof;
+	uint32 proof_capability_generations[2];
+	uint64 hash;
+	int pass;
+
+	cluster_node_id = 4;
+	test_runtime_epoch = 9;
+	key.cluster_epoch = (uint32)test_runtime_epoch;
+	test_member(&members[0], 102, MultiXactStatusForShare);
+	test_member(&members[1], 105, MultiXactStatusForKeyShare);
+	hash = cluster_multixact_current_descriptor_hash(
+		&key, members, lengthof(members));
+	test_runtime_target_owner_enabled = true;
+	test_runtime_target_owner_active_xid = members[0].xid;
+	test_runtime_local_terminal_xid = members[1].xid;
+	test_runtime_self_xid = members[0].xid;
+
+	for (pass = 0; pass < 2; pass++)
+	{
+		test_runtime_local_terminal_status = pass == 0
+			? CLUSTER_TT_STATUS_COMMITTED : CLUSTER_TT_STATUS_ABORTED;
+		test_runtime_local_terminal_rolled = pass != 0;
+		test_runtime_target_owner_calls = 0;
+		test_runtime_local_terminal_calls = 0;
+		memset(proofs, 0xa5, sizeof(proofs));
+		memset(proof_capability_generations, 0xa5,
+			   sizeof(proof_capability_generations));
+		UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
+			&key, members, lengthof(members), hash, NULL, proofs,
+			&updater_proof, proof_capability_generations), CMX_RESOLVE_OK);
+		UT_ASSERT_EQ(test_runtime_target_owner_calls, 2);
+		UT_ASSERT_EQ(test_runtime_local_terminal_calls, 1);
+		UT_ASSERT_EQ(proofs[0].state, CCM_SELF);
+		UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[0]), 7);
+		UT_ASSERT_EQ(proof_capability_generations[0], (uint32)55);
+		UT_ASSERT_EQ(proofs[1].state,
+			pass == 0 ? CCM_COMMITTED : CCM_ABORTED);
+		UT_ASSERT_EQ(ClusterCurrentMemberProofGetCtrcGrant(&proofs[1]), 0);
+		UT_ASSERT_EQ(proof_capability_generations[1], (uint32)0);
+	}
+
+	test_runtime_target_owner_enabled = false;
+	test_runtime_target_owner_active_xid = InvalidTransactionId;
+	test_runtime_local_terminal_xid = InvalidTransactionId;
+	test_runtime_local_terminal_status = CLUSTER_TT_STATUS_UNKNOWN;
+	test_runtime_local_terminal_rolled = false;
+	test_runtime_self_xid = InvalidTransactionId;
+	cluster_node_id = -1;
+}
+
+
+/* Each ACTIVE proof keeps the capability generation observed by its own
+ * origin.  A failed leg invalidates the whole proof batch and clears every
+ * ordinal instead of leaving a stale carrier beside UNKNOWN. */
+UT_TEST(test_current_multixact_multi_origin_capability_generation_pairing)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc members[3];
+	ClusterCurrentMemberProof proofs[3];
+	ClusterCurrentUpdaterProof updater_proof;
+	uint32 proof_capability_generations[3];
+	uint64 hash;
+	uint16 i;
+
+	cluster_node_id = 3;
+	test_runtime_epoch = 9;
+	test_member(&members[0], 100, MultiXactStatusForShare); /* origin 5 */
+	test_member(&members[1], 101, MultiXactStatusForKeyShare); /* origin 6 */
+	test_member(&members[2], 102, MultiXactStatusForShare); /* origin 4 */
+	hash = cluster_multixact_current_descriptor_hash(
+		&key, members, lengthof(members));
+	test_runtime_remote_member_state = CCM_ACTIVE;
+	test_runtime_proof_calls = 0;
+	test_runtime_proof_fail_call = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
+		&key, members, lengthof(members), hash, NULL, proofs,
+		&updater_proof, proof_capability_generations), CMX_RESOLVE_OK);
+	for (i = 0; i < lengthof(members); i++)
+	{
+		UT_ASSERT_EQ(proofs[i].state, CCM_ACTIVE);
+		UT_ASSERT_EQ(proof_capability_generations[i],
+			(uint32)(100 + cluster_xid_origin_slot(members[i].xid)));
+	}
+
+	memset(proofs, 0xa5, sizeof(proofs));
+	memset(proof_capability_generations, 0xa5,
+		   sizeof(proof_capability_generations));
+	test_runtime_proof_calls = 0;
+	test_runtime_proof_fail_call = 2;
+	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
+		&key, members, lengthof(members), hash, NULL, proofs,
+		&updater_proof, proof_capability_generations), CMX_RESOLVE_UNKNOWN);
+	for (i = 0; i < lengthof(members); i++)
+	{
+		UT_ASSERT_EQ(proofs[i].state, CCM_UNKNOWN);
+		UT_ASSERT_EQ(proof_capability_generations[i], (uint32)0);
+	}
+
+	test_runtime_remote_member_state = CCM_ABORTED;
+	test_runtime_proof_fail_call = 0;
+	cluster_node_id = -1;
+}
+
+
+/* A: local materialization is not itself a publish authority.  The pure
+ * state contract only admits PREPARE from LOCAL_DESCRIPTOR and cannot skip
+ * directly to APPLY or reference publication. */
+UT_TEST(test_current_multixact_publication_requires_prepared_state)
+{
+	ClusterCurrentMxHeapPublishStage next_stage;
+
+	UT_ASSERT_EQ(cluster_multixact_current_heap_publish_transition(
+		CMX_HEAP_STAGE_LOCAL_DESCRIPTOR, CMX_HEAP_EVENT_PREPARE,
+		&next_stage), true);
+	UT_ASSERT_EQ(next_stage, CMX_HEAP_STAGE_RECEIPT_PREPARED);
+	UT_ASSERT_EQ(cluster_multixact_current_heap_publish_transition(
+		CMX_HEAP_STAGE_LOCAL_DESCRIPTOR, CMX_HEAP_EVENT_APPLY,
+		&next_stage), false);
+	UT_ASSERT_EQ(cluster_multixact_current_heap_publish_transition(
+		CMX_HEAP_STAGE_LOCAL_DESCRIPTOR, CMX_HEAP_EVENT_PUBLISH,
+		&next_stage), false);
+}
+
+
+/* B: exact receipt bytes are the complete caller-finalized header, including
+ * cmax, ctid, moved/HOT cleanup and ITL slot, not predecessor bytes. */
+UT_TEST(test_current_multixact_exact_target_uses_planned_successor_header)
+{
+	uint8 base[SizeofHeapTupleHeader]
+		pg_attribute_aligned(MAXIMUM_ALIGNOF);
+	uint8 actual[SizeofHeapTupleHeader]
+		pg_attribute_aligned(MAXIMUM_ALIGNOF);
+	uint8 planned[SizeofHeapTupleHeader]
+		pg_attribute_aligned(MAXIMUM_ALIGNOF);
+	HeapTupleHeader actual_header = (HeapTupleHeader)actual;
+	ClusterCurrentMxHeapHeaderPlan plan;
+
+	memset(base, 0x5a, sizeof(base));
+	memcpy(actual, base, sizeof(actual));
+	memset(&plan, 0, sizeof(plan));
+	plan.kind = CMX_HEAP_PUBLISH_DELETE;
+	plan.multixact_id = (MultiXactId)77;
+	plan.command_id = (CommandId)29;
+	ItemPointerSet(&plan.self_tid, 8, 3);
+	plan.infomask = HEAP_XMAX_IS_MULTI | HEAP_XMAX_EXCL_LOCK;
+	plan.infomask2 = HEAP_KEYS_UPDATED;
+	plan.itl_slot_index = 4;
+	plan.command_is_combo = true;
+	plan.changing_partition = true;
+
+	actual_header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+	actual_header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	actual_header->t_infomask |= plan.infomask;
+	actual_header->t_infomask2 |= plan.infomask2;
+	HeapTupleHeaderClearHotUpdated(actual_header);
+	HeapTupleHeaderSetXmax(actual_header, plan.multixact_id);
+	HeapTupleHeaderSetCmax(
+		actual_header, plan.command_id, plan.command_is_combo);
+	actual_header->t_ctid = plan.self_tid;
+	HeapTupleHeaderSetMovedPartitions(actual_header);
+	actual_header->t_itl_slot_idx = plan.itl_slot_index;
+
+	UT_ASSERT_EQ(cluster_multixact_current_plan_heap_header(
+		base, sizeof(base), &plan, planned), true);
+	UT_ASSERT_EQ(memcmp(planned, actual, sizeof(planned)), 0);
+	UT_ASSERT(memcmp(planned, base, sizeof(planned)) != 0);
+}
+
+
+/* C: receipt identity is the canonical descriptor key plus ordered members;
+ * changing the real MXID or member order changes the hash. */
+UT_TEST(test_current_multixact_receipt_uses_canonical_descriptor_hash)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxKey other_key;
+	ClusterCurrentMxMemberDesc members[2];
+	ClusterCurrentMxMemberDesc reversed[2];
+	uint64 hash;
+
+	test_member(&members[0], 101, MultiXactStatusForShare);
+	test_member(&members[1], 102, MultiXactStatusNoKeyUpdate);
+	reversed[0] = members[1];
+	reversed[1] = members[0];
+	hash = cluster_multixact_current_descriptor_hash(&key, members, 2);
+	UT_ASSERT(hash != 0);
+	UT_ASSERT_EQ(hash,
+		cluster_multixact_current_descriptor_hash(&key, members, 2));
+	other_key = key;
+	other_key.multixact_id++;
+	UT_ASSERT(hash != cluster_multixact_current_descriptor_hash(
+		&other_key, members, 2));
+	UT_ASSERT(hash != cluster_multixact_current_descriptor_hash(
+		&key, reversed, 2));
+}
+
+
+/* D: a local-only descriptor needs no eager overlay: local MXID authority is
+ * described on demand through native pg_multixact and never remote RPC. */
+UT_TEST(test_current_multixact_local_descriptor_is_described_on_demand)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc members[4];
+	uint16 member_count = 0;
+	uint32 reported_total = 0;
+
+	cluster_node_id = 0;
+	test_runtime_epoch = key.cluster_epoch;
+	test_runtime_mxid_origin = 0;
+	test_runtime_mxid_mine = true;
+	test_runtime_native_describe_calls = 0;
+	test_runtime_native_describe_count = 1;
+	test_runtime_remote_describe_calls = 0;
+	key.origin_node_id = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_describe(
+		&key, members, lengthof(members), &member_count, &reported_total),
+		CMX_DESC_OK);
+	UT_ASSERT_EQ(test_runtime_native_describe_calls, 1);
+	UT_ASSERT_EQ(test_runtime_remote_describe_calls, 0);
+	UT_ASSERT_EQ(member_count, 1);
+	UT_ASSERT_EQ(reported_total, 1);
+	UT_ASSERT_EQ(members[0].xid, 100);
+
+	cluster_node_id = -1;
+	test_runtime_epoch = 0;
+	test_runtime_mxid_origin = -1;
+	test_runtime_mxid_mine = false;
+	test_runtime_native_describe_count = 2;
+}
+
+
+/* E: a one-member successor is still represented by a real immutable MXID
+ * descriptor, so exact targets never place a raw xid in multixact_id. */
+UT_TEST(test_current_multixact_one_member_descriptor_is_valid)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc member;
+
+	test_member(&member, 101, MultiXactStatusForShare);
+	UT_ASSERT_EQ(cluster_multixact_current_validate_descriptor(
+		&key, key.origin_node_id, key.cluster_epoch, &member, 1, 1),
+		CMX_DESC_OK);
+}
+
+
+UT_TEST(test_current_multixact_one_member_local_materializer)
+{
+	MultiXactMember member;
+	MultiXactId multi;
+
+	MemSet(&member, 0, sizeof(member));
+	member.xid = 501;
+	member.status = MultiXactStatusForKeyShare;
+	test_runtime_materialize_calls = 0;
+	test_runtime_materialize_nmembers = 0;
+	MemSet(&test_runtime_materialize_member, 0,
+		sizeof(test_runtime_materialize_member));
+	multi = MultiXactIdCreateLocalCurrentMembers(1, &member);
+	UT_ASSERT_EQ(multi, (MultiXactId) 901);
+	UT_ASSERT_EQ(test_runtime_materialize_calls, 1);
+	UT_ASSERT_EQ(test_runtime_materialize_nmembers, 1);
+	UT_ASSERT_EQ(test_runtime_materialize_member.xid, member.xid);
+	UT_ASSERT_EQ(test_runtime_materialize_member.status, member.status);
+}
+
+
+UT_TEST(test_current_multixact_one_member_remote_descriptor_round_trip)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	MultiXactMember native_member;
+	ClusterCurrentMxDescribeReplyPage page;
+	ClusterCurrentMxMemberDesc decoded[1];
+	uint16 decoded_count = 0;
+	uint32 reported_total = 0;
+	const uint64 request_id = UINT64_C(0x0200000000000046);
+
+	memset(&native_member, 0, sizeof(native_member));
+	native_member.xid = 501;
+	native_member.status = MultiXactStatusForShare;
+	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_build_describe_page(
+		key.origin_node_id, request_id, &key, &native_member, 1, &page),
+		CMX_DESC_OK);
+	UT_ASSERT_EQ(cluster_multixact_current_wire_validate_describe_reply(
+		&page, sizeof(page), key.origin_node_id, key.cluster_epoch,
+		request_id, &key, decoded, lengthof(decoded), &decoded_count,
+		&reported_total), CMX_DESC_OK);
+	UT_ASSERT_EQ(decoded_count, (uint16)1);
+	UT_ASSERT_EQ(reported_total, (uint32)1);
+	UT_ASSERT_EQ(decoded[0].xid, native_member.xid);
+}
+
+
+UT_TEST(test_current_multixact_one_member_proof_resolves_on_demand)
+{
+	ClusterCurrentMxKey key = test_mxkey();
+	ClusterCurrentMxMemberDesc member;
+	ClusterCurrentMemberProof proof;
+	ClusterCurrentUpdaterProof updater_proof;
+	uint32 proof_capability_generation = 0;
+	uint64 hash;
+
+	cluster_node_id = 3;
+	test_runtime_epoch = key.cluster_epoch;
+	test_member(&member, 100, MultiXactStatusForShare);
+	hash = cluster_multixact_current_descriptor_hash(&key, &member, 1);
+	test_runtime_remote_member_state = CCM_ACTIVE;
+	test_runtime_proof_calls = 0;
+	test_runtime_proof_fail_call = 0;
+	UT_ASSERT_EQ(cluster_multixact_current_members_resolve(
+		&key, &member, 1, hash, NULL, &proof, &updater_proof,
+		&proof_capability_generation), CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(test_runtime_proof_calls, 1);
+	UT_ASSERT_EQ(proof.state, CCM_ACTIVE);
+	UT_ASSERT_EQ(proof.member_xid, member.xid);
+	UT_ASSERT_EQ(proof_capability_generation,
+		(uint32)(100 + cluster_xid_origin_slot(member.xid)));
+
+	test_runtime_remote_member_state = CCM_ABORTED;
+	cluster_node_id = -1;
+}
+
+
+typedef union TestCurrentMxFixedHeader {
+	uint64 align;
+	uint8 bytes[SizeofHeapTupleHeader];
+} TestCurrentMxFixedHeader;
+
+
+static void
+test_current_mx_fixed_header_init(TestCurrentMxFixedHeader *storage)
+{
+	HeapTupleHeader header = (HeapTupleHeader) storage->bytes;
+
+	MemSet(storage, 0, sizeof(*storage));
+	HeapTupleHeaderSetXmin(header, 41);
+	HeapTupleHeaderSetXmax(header, 42);
+	HeapTupleHeaderSetCmin(header, 7);
+	ItemPointerSet(&header->t_ctid, 11, 3);
+	header->t_infomask = HEAP_XMAX_INVALID;
+	header->t_infomask2 = 5 | HEAP_HOT_UPDATED | HEAP_ONLY_TUPLE;
+	header->t_hoff = SizeofHeapTupleHeader;
+	header->t_itl_slot_idx = 6;
+}
+
+
+static void
+test_current_mx_header_plan_init(ClusterCurrentMxHeapHeaderPlan *plan,
+	ClusterCurrentMxHeapPublishKind kind)
+{
+	MemSet(plan, 0, sizeof(*plan));
+	plan->kind = kind;
+	plan->multixact_id = 701;
+	plan->xmin = 301;
+	plan->command_id = 19;
+	plan->infomask = HEAP_XMAX_IS_MULTI | HEAP_XMAX_EXCL_LOCK;
+	plan->infomask2 = HEAP_KEYS_UPDATED;
+	plan->itl_slot_index = 2;
+	ItemPointerSet(&plan->self_tid, 12, 4);
+	ItemPointerSet(&plan->successor_tid, 13, 5);
+}
+
+
+/* Task 4 caller equivalence: DELETE hashes exactly the fixed header that its
+ * critical section will publish, including cmax, ctid/moved and ITL. */
+UT_TEST(test_current_multixact_delete_header_plan_matches_publication_bytes)
+{
+	TestCurrentMxFixedHeader base;
+	TestCurrentMxFixedHeader expected;
+	TestCurrentMxFixedHeader planned;
+	ClusterCurrentMxHeapHeaderPlan plan;
+	HeapTupleHeader header;
+
+	test_current_mx_fixed_header_init(&base);
+	expected = base;
+	test_current_mx_header_plan_init(&plan, CMX_HEAP_PUBLISH_DELETE);
+	plan.command_is_combo = true;
+	plan.changing_partition = true;
+	header = (HeapTupleHeader) expected.bytes;
+	header->t_itl_slot_idx = plan.itl_slot_index;
+	header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+	header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	header->t_infomask |= plan.infomask;
+	header->t_infomask2 |= plan.infomask2;
+	HeapTupleHeaderClearHotUpdated(header);
+	HeapTupleHeaderSetXmax(header, plan.multixact_id);
+	HeapTupleHeaderSetCmax(header, plan.command_id, plan.command_is_combo);
+	header->t_ctid = plan.self_tid;
+	HeapTupleHeaderSetMovedPartitions(header);
+
+	UT_ASSERT(cluster_multixact_current_plan_heap_header(
+		base.bytes, sizeof(base.bytes), &plan, planned.bytes));
+	UT_ASSERT_EQ(memcmp(planned.bytes, expected.bytes, sizeof(planned.bytes)), 0);
+}
+
+
+/* UPDATE binds both the old-version successor edge and the new-version
+ * heap-only/ITL header before either tuple becomes reachable. */
+UT_TEST(test_current_multixact_update_headers_match_publication_bytes)
+{
+	TestCurrentMxFixedHeader base;
+	TestCurrentMxFixedHeader expected;
+	TestCurrentMxFixedHeader planned;
+	ClusterCurrentMxHeapHeaderPlan plan;
+	HeapTupleHeader header;
+
+	test_current_mx_fixed_header_init(&base);
+	expected = base;
+	test_current_mx_header_plan_init(&plan, CMX_HEAP_PUBLISH_UPDATE_OLD);
+	plan.command_is_combo = true;
+	plan.hot_update = true;
+	header = (HeapTupleHeader) expected.bytes;
+	header->t_itl_slot_idx = plan.itl_slot_index;
+	HeapTupleHeaderSetHotUpdated(header);
+	header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+	header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	header->t_infomask |= plan.infomask;
+	header->t_infomask2 |= plan.infomask2;
+	HeapTupleHeaderSetXmax(header, plan.multixact_id);
+	HeapTupleHeaderSetCmax(header, plan.command_id, plan.command_is_combo);
+	header->t_ctid = plan.successor_tid;
+	UT_ASSERT(cluster_multixact_current_plan_heap_header(
+		base.bytes, sizeof(base.bytes), &plan, planned.bytes));
+	UT_ASSERT_EQ(memcmp(planned.bytes, expected.bytes, sizeof(planned.bytes)), 0);
+
+	expected = base;
+	test_current_mx_header_plan_init(&plan, CMX_HEAP_PUBLISH_UPDATE_NEW);
+	plan.hot_update = true;
+	header = (HeapTupleHeader) expected.bytes;
+	header->t_infomask &= ~HEAP_XACT_MASK;
+	header->t_infomask2 &= ~HEAP2_XACT_MASK;
+	HeapTupleHeaderSetXmin(header, plan.xmin);
+	HeapTupleHeaderSetCmin(header, plan.command_id);
+	header->t_infomask |= HEAP_UPDATED | plan.infomask;
+	header->t_infomask2 |= plan.infomask2;
+	HeapTupleHeaderSetXmax(header, plan.multixact_id);
+	HeapTupleHeaderSetHeapOnly(header);
+	header->t_itl_slot_idx = plan.itl_slot_index;
+	header->t_ctid = plan.self_tid;
+	UT_ASSERT(cluster_multixact_current_plan_heap_header(
+		base.bytes, sizeof(base.bytes), &plan, planned.bytes));
+	UT_ASSERT_EQ(memcmp(planned.bytes, expected.bytes, sizeof(planned.bytes)), 0);
+}
+
+
+UT_TEST(test_current_multixact_temp_lock_header_plan_matches_publication_bytes)
+{
+	TestCurrentMxFixedHeader base;
+	TestCurrentMxFixedHeader expected;
+	TestCurrentMxFixedHeader planned;
+	ClusterCurrentMxHeapHeaderPlan plan;
+	HeapTupleHeader header;
+
+	test_current_mx_fixed_header_init(&base);
+	expected = base;
+	test_current_mx_header_plan_init(&plan, CMX_HEAP_PUBLISH_TEMP_LOCK);
+	plan.itl_slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	header = (HeapTupleHeader) expected.bytes;
+	header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+	header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	HeapTupleHeaderClearHotUpdated(header);
+	HeapTupleHeaderSetXmax(header, plan.multixact_id);
+	header->t_infomask |= plan.infomask;
+	header->t_infomask2 |= plan.infomask2;
+	HeapTupleHeaderSetCmax(header, plan.command_id, plan.command_is_combo);
+	header->t_ctid = plan.self_tid;
+	UT_ASSERT(cluster_multixact_current_plan_heap_header(
+		base.bytes, sizeof(base.bytes), &plan, planned.bytes));
+	UT_ASSERT_EQ(memcmp(planned.bytes, expected.bytes, sizeof(planned.bytes)), 0);
+}
+
+
+UT_TEST(test_current_multixact_tuple_lock_header_plan_matches_publication_bytes)
+{
+	TestCurrentMxFixedHeader base;
+	TestCurrentMxFixedHeader expected;
+	TestCurrentMxFixedHeader planned;
+	ClusterCurrentMxHeapHeaderPlan plan;
+	HeapTupleHeader header;
+
+	test_current_mx_fixed_header_init(&base);
+	expected = base;
+	test_current_mx_header_plan_init(&plan, CMX_HEAP_PUBLISH_TUPLE_LOCK);
+	plan.infomask = HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY
+		| HEAP_XMAX_SHR_LOCK;
+	plan.infomask2 = 0;
+	header = (HeapTupleHeader) expected.bytes;
+	header->t_infomask &= ~HEAP_XMAX_BITS;
+	header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	header->t_infomask |= plan.infomask;
+	header->t_infomask2 |= plan.infomask2;
+	HeapTupleHeaderClearHotUpdated(header);
+	HeapTupleHeaderSetXmax(header, plan.multixact_id);
+	header->t_ctid = plan.self_tid;
+	header->t_itl_slot_idx = plan.itl_slot_index;
+	UT_ASSERT(cluster_multixact_current_plan_heap_header(
+		base.bytes, sizeof(base.bytes), &plan, planned.bytes));
+	UT_ASSERT_EQ(memcmp(planned.bytes, expected.bytes, sizeof(planned.bytes)), 0);
+}
+
+
+UT_TEST(test_current_multixact_one_member_heap_plan_stays_multixact)
+{
+	TestCurrentMxFixedHeader base;
+	TestCurrentMxFixedHeader planned;
+	ClusterCurrentMxHeapHeaderPlan plan;
+	HeapTupleHeader header = (HeapTupleHeader) planned.bytes;
+
+	test_current_mx_fixed_header_init(&base);
+	test_current_mx_header_plan_init(&plan, CMX_HEAP_PUBLISH_TUPLE_LOCK);
+	plan.infomask = HEAP_XMAX_IS_MULTI | HEAP_XMAX_LOCK_ONLY
+		| HEAP_XMAX_KEYSHR_LOCK;
+	plan.infomask2 = 0;
+	UT_ASSERT(cluster_multixact_current_plan_heap_header(
+		base.bytes, sizeof(base.bytes), &plan, planned.bytes));
+	UT_ASSERT((header->t_infomask & HEAP_XMAX_IS_MULTI) != 0);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(header), plan.multixact_id);
+}
+
+
+UT_TEST(test_current_multixact_applied_stage_rejects_retry)
+{
+	ClusterCurrentMxHeapPublishStage next;
+
+	UT_ASSERT(cluster_multixact_current_heap_publish_transition(
+		CMX_HEAP_STAGE_RECEIPT_PREPARED, CMX_HEAP_EVENT_RETRY, &next));
+	UT_ASSERT_EQ(next, CMX_HEAP_STAGE_CANCELLED);
+	UT_ASSERT(cluster_multixact_current_heap_publish_transition(
+		CMX_HEAP_STAGE_RECEIPT_PREPARED, CMX_HEAP_EVENT_ERROR, &next));
+	UT_ASSERT_EQ(next, CMX_HEAP_STAGE_CANCELLED);
+	UT_ASSERT(!cluster_multixact_current_heap_publish_transition(
+		CMX_HEAP_STAGE_RECEIPT_APPLIED, CMX_HEAP_EVENT_RETRY, &next));
+	UT_ASSERT(cluster_multixact_current_heap_publish_transition(
+		CMX_HEAP_STAGE_RECEIPT_APPLIED, CMX_HEAP_EVENT_ERROR, &next));
+	UT_ASSERT_EQ(next, CMX_HEAP_STAGE_RECEIPT_APPLIED);
+	UT_ASSERT(cluster_multixact_current_heap_publish_transition(
+		CMX_HEAP_STAGE_RECEIPT_APPLIED, CMX_HEAP_EVENT_PUBLISH, &next));
+	UT_ASSERT_EQ(next, CMX_HEAP_STAGE_REFERENCE_PUBLISHED);
 }
 
 
@@ -1649,6 +2378,7 @@ UT_TEST(test_current_multixact_terminal_nonconflict_and_unknown_precedence)
 
 	proofs[0].state = CCM_ABORTED;
 	memset(&proofs[0].key, 0, sizeof(proofs[0].key));
+	ClusterCurrentMemberProofSetCtrcGrant(&proofs[0], 0);
 	UT_ASSERT_EQ(cluster_multixact_current_decide(members, proofs, 2, &ctx, NULL, NULL, NULL),
 				 CMDL_CONTINUE);
 
@@ -1696,6 +2426,7 @@ UT_TEST(test_current_multixact_member_states_and_self_cid)
 
 	proofs[0].state = CCM_ABORTED;
 	memset(&proofs[0].key, 0, sizeof(proofs[0].key));
+	ClusterCurrentMemberProofSetCtrcGrant(&proofs[0], 0);
 	UT_ASSERT_EQ(cluster_multixact_current_decide(members, proofs, 2, &ctx, NULL, NULL, NULL),
 				 CMDL_CONTINUE);
 
@@ -1863,6 +2594,26 @@ UT_TEST(test_current_multixact_recompose_filters_terminal_members)
 	UT_ASSERT_EQ(normalized[0].xid, 502);
 	UT_ASSERT_EQ(normalized[0].status, MultiXactStatusForKeyShare);
 	UT_ASSERT_EQ(normalized[1].xid, 504);
+	UT_ASSERT_EQ(normalized[1].status, MultiXactStatusForShare);
+}
+
+
+UT_TEST(test_current_multixact_recompose_preserves_one_active_member)
+{
+	ClusterCurrentMxMemberDesc member;
+	ClusterCurrentMemberProof proof;
+	MultiXactMember normalized[2];
+	uint16 normalized_count = 0;
+
+	test_member(&member, 551, MultiXactStatusForKeyShare);
+	test_proof(&proof, &member, 0, CCM_ACTIVE, 2, 35);
+	UT_ASSERT_EQ(cluster_multixact_current_recompose(
+		&member, &proof, 1, 552, MultiXactStatusForShare, normalized,
+		lengthof(normalized), &normalized_count), CMX_RECOMPOSE_OK);
+	UT_ASSERT_EQ(normalized_count, 2);
+	UT_ASSERT_EQ(normalized[0].xid, member.xid);
+	UT_ASSERT_EQ(normalized[0].status, MultiXactStatusForKeyShare);
+	UT_ASSERT_EQ(normalized[1].xid, (TransactionId) 552);
 	UT_ASSERT_EQ(normalized[1].status, MultiXactStatusForShare);
 }
 
@@ -2083,6 +2834,7 @@ UT_TEST(test_current_multixact_origin_builds_strict_member_proof_page)
 	ClusterCurrentMemberProof decoded[1];
 	ClusterCurrentUpdaterProof updater;
 	ClusterMxResolveResult decoded_result = CMX_RESOLVE_UNKNOWN;
+	uint32 decoded_capability_generation = 0;
 	uint16 decoded_count = 0;
 
 	memset(&request, 0, sizeof(request));
@@ -2112,7 +2864,7 @@ UT_TEST(test_current_multixact_origin_builds_strict_member_proof_page)
 	memset(&page, 0xa5, sizeof(page));
 
 	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_build_proof_page(
-					 4, &request, CMX_RESOLVE_OK, &proof, 1, NULL,
+					 4, &request, CMX_RESOLVE_OK, 313, &proof, 1, NULL,
 					 &page),
 			 CMX_RESOLVE_OK);
 	UT_ASSERT_EQ(page.header.magic, CLUSTER_CURRENT_MX_WIRE_MAGIC);
@@ -2123,15 +2875,36 @@ UT_TEST(test_current_multixact_origin_builds_strict_member_proof_page)
 	UT_ASSERT_EQ(page.header.source_node_id, (uint32)4);
 	UT_ASSERT_EQ(page.header.request_id, request.prefix.request_id);
 	UT_ASSERT_EQ(page.header.entry_count, (uint16)1);
+	UT_ASSERT_EQ(page.header.requester_capability_generation,
+				 (uint32)313);
 	UT_ASSERT_EQ(page.header.wire_length,
 				 sizeof(page.header) + sizeof(proof));
 	UT_ASSERT(cluster_multixact_current_wire_validate_proof_reply_frame(
 		&page, sizeof(page), 4, 17, &request, &decoded_result,
-		decoded, lengthof(decoded), &decoded_count, &updater));
+		decoded, lengthof(decoded), &decoded_count, &updater,
+		&decoded_capability_generation));
 	UT_ASSERT_EQ(decoded_result, CMX_RESOLVE_OK);
+	UT_ASSERT_EQ(decoded_capability_generation, (uint32)313);
 	UT_ASSERT_EQ(decoded_count, (uint16)1);
 	UT_ASSERT_EQ(decoded[0].member_xid, (TransactionId)501);
 	UT_ASSERT_EQ(decoded[0].state, CCM_ABORTED);
+
+	page.header.requester_capability_generation = 0;
+	decoded_result = CMX_RESOLVE_OK;
+	decoded_capability_generation = 313;
+	decoded_count = 1;
+	UT_ASSERT(!cluster_multixact_current_wire_validate_proof_reply_frame(
+		&page, sizeof(page), 4, 17, &request, &decoded_result,
+		decoded, lengthof(decoded), &decoded_count, &updater,
+		&decoded_capability_generation));
+	UT_ASSERT_EQ(decoded_result, CMX_RESOLVE_UNKNOWN);
+	UT_ASSERT_EQ(decoded_capability_generation, (uint32)0);
+	UT_ASSERT_EQ(decoded_count, (uint16)0);
+
+	UT_ASSERT_EQ(cluster_cr_server_test_current_mx_build_proof_page(
+					 4, &request, CMX_RESOLVE_DENIED, 313, NULL, 0,
+					 NULL, &page),
+			 CMX_RESOLVE_UNKNOWN);
 }
 
 UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_reply)
@@ -2143,6 +2916,7 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 	ClusterCurrentMemberProof decoded[1];
 	ClusterCurrentUpdaterProof updater;
 	ClusterMxResolveResult decoded_result = CMX_RESOLVE_UNKNOWN;
+	uint32 decoded_capability_generation = 0;
 	uint16 decoded_count = 0;
 
 	test_runtime_epoch = 17;
@@ -2203,7 +2977,7 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 	UT_ASSERT(cluster_multixact_current_wire_validate_proof_reply_frame(
 		page, sizeof(*page), 4, test_runtime_epoch, &request,
 		&decoded_result, decoded, lengthof(decoded), &decoded_count,
-		&updater));
+		&updater, &decoded_capability_generation));
 	UT_ASSERT_EQ(decoded_result, CMX_RESOLVE_UNKNOWN);
 	UT_ASSERT_EQ(decoded_count, (uint16)0);
 }
@@ -2211,7 +2985,7 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(46);
 	UT_RUN(test_current_multixact_public_symbols_link);
 	UT_RUN(test_current_multixact_router_domain_binding);
 	UT_RUN(test_current_multixact_descriptor_validation);
@@ -2223,6 +2997,22 @@ main(void)
 	UT_RUN(test_current_multixact_proof_reply_wire_binding);
 	UT_RUN(test_current_multixact_members_resolve_all_or_nothing);
 	UT_RUN(test_current_multixact_local_member_uses_target_canonical_not_source);
+	UT_RUN(test_current_multixact_local_terminal_uses_physical_current_or_rolled);
+	UT_RUN(test_current_multixact_multi_origin_capability_generation_pairing);
+	UT_RUN(test_current_multixact_publication_requires_prepared_state);
+	UT_RUN(test_current_multixact_exact_target_uses_planned_successor_header);
+	UT_RUN(test_current_multixact_receipt_uses_canonical_descriptor_hash);
+	UT_RUN(test_current_multixact_local_descriptor_is_described_on_demand);
+	UT_RUN(test_current_multixact_one_member_descriptor_is_valid);
+	UT_RUN(test_current_multixact_one_member_local_materializer);
+	UT_RUN(test_current_multixact_one_member_remote_descriptor_round_trip);
+	UT_RUN(test_current_multixact_one_member_proof_resolves_on_demand);
+	UT_RUN(test_current_multixact_delete_header_plan_matches_publication_bytes);
+	UT_RUN(test_current_multixact_update_headers_match_publication_bytes);
+	UT_RUN(test_current_multixact_temp_lock_header_plan_matches_publication_bytes);
+	UT_RUN(test_current_multixact_tuple_lock_header_plan_matches_publication_bytes);
+	UT_RUN(test_current_multixact_one_member_heap_plan_stays_multixact);
+	UT_RUN(test_current_multixact_applied_stage_rejects_retry);
 	UT_RUN(test_current_multixact_proof_request_batches_by_member_origin);
 	UT_RUN(test_current_multixact_describe_wire_binding);
 	UT_RUN(test_current_multixact_describe_routes_by_mxid_authority);
@@ -2234,6 +3024,7 @@ main(void)
 	UT_RUN(test_current_multixact_committed_updater_requires_exact_hot_proof);
 	UT_RUN(test_current_multixact_rejects_context_mode_mismatch);
 	UT_RUN(test_current_multixact_recompose_filters_terminal_members);
+	UT_RUN(test_current_multixact_recompose_preserves_one_active_member);
 	UT_RUN(test_current_multixact_recompose_upgrades_requester_member);
 	UT_RUN(test_current_multixact_recompose_fails_closed_on_incomplete_proof);
 	UT_RUN(test_current_multixact_recompose_filters_before_cap_check);

@@ -283,6 +283,7 @@ OBJS = \
 	cluster_multixact_current.o \
 	cluster_multixact_current_stats.o \
 	cluster_multixact_current_wire.o \
+	cluster_terminal_ref_census.o \
 	cluster_multixact_served.o \
 	cluster_mxid_stripe.o \
 	cluster_visibility_inject.o \

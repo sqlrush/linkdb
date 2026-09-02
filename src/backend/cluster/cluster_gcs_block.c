@@ -65,6 +65,7 @@
 #include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
 #include "cluster/cluster_tt_durable.h"
@@ -204,6 +205,7 @@ typedef struct GcsBlockR4TxOriginContext {
 	ClusterTxResolveMode resolve_mode;
 	TimestampTz deadline;
 	uint32 requester_capability_generation;
+	ClusterCtrcParticipantIdentity current_mx_requester_identity;
 	ClusterR4CrForwardPayload forward;
 	ClusterTxLocator locator;
 	ClusterUndoBlock0LogicalKey logical;
@@ -4473,7 +4475,8 @@ ClusterMxResolveResult
 cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	int32 origin_node, ClusterCurrentMxProofForwardV2 *request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap,
-	uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof)
+	uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *requester_capability_generation_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	ClusterCurrentMxProofForwardV2 decoded;
@@ -4500,9 +4503,12 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 		memset(updater_proof, 0, sizeof(*updater_proof));
 		updater_proof->verdict = CUCP_UNKNOWN;
 	}
+	if (requester_capability_generation_out != NULL)
+		*requester_capability_generation_out = 0;
 	request_epoch = cluster_epoch_get_current();
 	if (request == NULL || proofs == NULL || proof_count == NULL
-		|| updater_proof == NULL || origin_node < 0
+		|| updater_proof == NULL
+		|| requester_capability_generation_out == NULL || origin_node < 0
 		|| origin_node == cluster_node_id || origin_node >= CLUSTER_MAX_NODES
 		|| !cluster_gcs_block_family_on_data_plane())
 		return CMX_RESOLVE_UNKNOWN;
@@ -4608,7 +4614,7 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 		if (!cluster_multixact_current_wire_validate_proof_reply_frame(
 				&reply_page, sizeof(reply_page), origin_node, request_epoch,
 				request, &result, proofs, proofs_cap, proof_count,
-				updater_proof))
+				updater_proof, requester_capability_generation_out))
 			result = CMX_RESOLVE_UNKNOWN;
 		if (result == CMX_RESOLVE_OK)
 			gcs_block_stamp_touched(
@@ -6733,6 +6739,110 @@ gcs_block_current_mx_origin_locate_physical(
 }
 
 static bool
+gcs_block_current_mx_requester_identity_capture(
+	int32 requester_node, uint32 capability_generation,
+	const ClusterSemanticAdmissionToken *admission,
+	ClusterCtrcParticipantIdentity *identity)
+{
+	uint64 observed_incarnation = 0;
+	uint64 observed_generation = 0;
+	uint32 required_capabilities
+		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+		  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+
+	if (identity == NULL)
+		return false;
+	memset(identity, 0, sizeof(*identity));
+	if (requester_node < 0
+		|| requester_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| capability_generation == 0 || admission == NULL
+		|| !admission->entered || admission->record_generation == 0
+		|| admission->formation_epoch != cluster_epoch_get_current()
+		|| !cluster_membership_is_member(requester_node)
+		|| !cluster_reconfig_get_observed_slot(
+			requester_node, &observed_incarnation, &observed_generation)
+		|| observed_incarnation == 0 || observed_generation == 0
+		|| cluster_reconfig_get_observed_epoch(requester_node)
+		   != admission->formation_epoch
+		|| cluster_membership_get_last_admitted_incarnation(requester_node)
+		   != observed_incarnation
+		|| !cluster_sf_peer_capability_generation_matches(
+			requester_node, required_capabilities, capability_generation))
+		return false;
+
+	identity->node_id = (uint16)requester_node;
+	identity->capability_record_generation = capability_generation;
+	identity->boot_incarnation = observed_incarnation;
+	identity->formation_epoch = admission->formation_epoch;
+	identity->admission_record_generation = admission->record_generation;
+	return true;
+}
+
+static bool
+gcs_block_current_mx_requester_identity_current(
+	const GcsBlockR4TxOriginContext *context)
+{
+	ClusterCtrcParticipantIdentity current;
+
+	if (context == NULL
+		|| context->domain != GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+		|| !gcs_block_current_mx_requester_identity_capture(
+			context->current_mx_request.prefix.original_requester_node,
+			context->requester_capability_generation,
+			&context->admission, &current))
+		return false;
+	return memcmp(&current, &context->current_mx_requester_identity,
+				  sizeof(current)) == 0;
+}
+
+static bool
+gcs_block_current_mx_ctrc_key(
+	const GcsBlockR4TxOriginContext *context, uint16 index,
+	const ClusterUndoBlock0Generation *generation,
+	ClusterCtrcTxnKeyV1 *key)
+{
+	const ClusterTTSlotPhysicalLocator *locator;
+	uint64 epoch;
+	uint64 boot_incarnation;
+	uint64 system_identifier;
+
+	if (context == NULL || generation == NULL || key == NULL
+		|| index >= context->current_mx_locator_count
+		|| !generation->known || generation->value == UINT32_MAX
+		|| context->tt_root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
+		|| context->tt_root.root_id == 0
+		|| context->tt_root.root_generation == 0
+		|| context->admission.record_generation == 0)
+		return false;
+	locator = &context->current_mx_locators[index];
+	epoch = cluster_epoch_get_current();
+	boot_incarnation = cluster_qvotec_get_self_incarnation();
+	system_identifier = GetSystemIdentifier();
+	if (epoch > UINT32_MAX || epoch != context->admission.formation_epoch
+		|| boot_incarnation == 0 || system_identifier == 0)
+		return false;
+
+	memset(key, 0, sizeof(*key));
+	key->format_version = CLUSTER_CTRC_FORMAT_VERSION;
+	key->owner_instance = (uint8)((uint32)cluster_node_id + 1);
+	key->origin_node_id = (uint16)cluster_node_id;
+	key->segment_id = locator->segment_id;
+	key->segment_generation = generation->value;
+	key->slot_offset = locator->slot_offset;
+	key->slot_wrap = locator->wrap;
+	key->xid = locator->xid;
+	key->cluster_epoch = (uint32)epoch;
+	key->system_identifier = system_identifier;
+	key->origin_boot_incarnation = boot_incarnation;
+	key->formation_epoch = context->admission.formation_epoch;
+	key->admission_record_generation = context->admission.record_generation;
+	key->root_descriptor_incarnation = context->tt_root.root_generation;
+	key->root_id = context->tt_root.root_id;
+	key->root_generation = context->tt_root.root_generation;
+	return true;
+}
+
+static bool
 gcs_block_current_mx_origin_try_accept(
 	const ClusterICEnvelope *env, const void *payload)
 {
@@ -6774,7 +6884,8 @@ gcs_block_current_mx_origin_try_accept(
 		|| capability_generation == 0
 		|| !cluster_sf_peer_capability_generation_matches(
 			request.prefix.original_requester_node,
-			PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+			PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+				| PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1,
 			capability_generation))
 		return false;
 
@@ -6850,6 +6961,12 @@ gcs_block_current_mx_origin_try_accept(
 		= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_NONE;
 	free_context->current_mx_updater_proof.verdict = CUCP_UNKNOWN;
 	free_context->admission = admission;
+	if (!gcs_block_current_mx_requester_identity_capture(
+			request.prefix.original_requester_node, capability_generation,
+			&admission, &free_context->current_mx_requester_identity)) {
+		gcs_block_r4_tx_origin_context_clear(free_context, false);
+		return false;
+	}
 	free_context->outcome = CLUSTER_TX_UNKNOWN;
 	free_context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 
@@ -7115,16 +7232,29 @@ gcs_block_current_mx_origin_prepare_reply(
 	GcsBlockReplyHeader *header;
 	ClusterCurrentMxProofReplyPage *page;
 	ClusterMxResolveResult built;
+	uint32 requester_capability_generation = 0;
 
+	if (context->current_mx_result == CMX_RESOLVE_OK
+		&& !gcs_block_current_mx_requester_identity_current(context))
+	{
+		context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+		context->current_mx_proof_count = 0;
+		context->current_mx_failure
+			= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
+	}
 	memset(context->reply_frame, 0, sizeof(context->reply_frame));
 	header = (GcsBlockReplyHeader *)context->reply_frame;
 	page = (ClusterCurrentMxProofReplyPage *)(
 		context->reply_frame + sizeof(*header));
 	if (context->current_mx_result == CMX_RESOLVE_UNKNOWN)
 		gcs_block_current_mx_origin_log_first_unknown(context);
+	if (context->current_mx_result == CMX_RESOLVE_OK)
+		requester_capability_generation
+			= context->current_mx_requester_identity.capability_record_generation;
 	built = cluster_cr_server_current_mx_build_proof_page(
 		(uint16)cluster_node_id, &context->current_mx_request,
-		context->current_mx_result, context->current_mx_proofs,
+		context->current_mx_result, requester_capability_generation,
+		context->current_mx_proofs,
 		context->current_mx_proof_count,
 		&context->current_mx_updater_proof, page);
 	if (built != context->current_mx_result) {
@@ -7132,7 +7262,7 @@ gcs_block_current_mx_origin_prepare_reply(
 		context->current_mx_proof_count = 0;
 		(void)cluster_cr_server_current_mx_build_proof_page(
 			(uint16)cluster_node_id, &context->current_mx_request,
-			CMX_RESOLVE_UNKNOWN, NULL, 0, NULL, page);
+			CMX_RESOLVE_UNKNOWN, 0, NULL, 0, NULL, page);
 	}
 	header->request_id = context->current_mx_request.prefix.request_id;
 	header->epoch = context->current_mx_request.prefix.epoch;
@@ -7166,6 +7296,16 @@ gcs_block_current_mx_origin_sample_held(
 		ClusterCurrentMxProofAskWire updater_ask;
 		ClusterTTStatusKey key;
 		ClusterTTStatusResult result;
+		ClusterUndoBlock0Generation generation = { false, 0 };
+		ClusterUndoBlock0Generation final_generation = { false, 0 };
+		ClusterUndoBlock0ResolvedRoot final_root;
+		ClusterCtrcTxnKeyV1 ctrc_key;
+		ClusterCtrcTouchResult touch_result;
+		bool ctrc_physical_active = false;
+		uint32 ctrc_grant = 0;
+
+		memset(&final_root, 0, sizeof(final_root));
+		memset(&ctrc_key, 0, sizeof(ctrc_key));
 
 		if ((context->current_mx_sampled_bitmap & (uint8)(1U << i)) != 0
 			|| context->current_mx_locators[i].segment_id
@@ -7189,7 +7329,7 @@ gcs_block_current_mx_origin_sample_held(
 		if (!cluster_runtime_visibility_physical_locator_sample_held(
 				&context->current_mx_locators[i],
 				&context->admission, &context->guard, &context->tt_root,
-				&key, &result))
+				&key, &result, &ctrc_physical_active))
 			return false;
 		context->current_mx_sampled_keys[i] = key;
 		if (!cluster_multixact_current_resolve_origin_member_proof(
@@ -7198,6 +7338,44 @@ gcs_block_current_mx_origin_sample_held(
 				request->prefix.mxkey.cluster_epoch, false, &key, &result,
 				NULL, NULL, &context->current_mx_proofs[i]))
 			return false;
+		if (context->current_mx_proofs[i].state == CCM_ACTIVE
+			|| context->current_mx_proofs[i].state == CCM_SELF)
+		{
+			if (!ctrc_physical_active)
+				return false;
+			if (cluster_undo_block0_current_sample_generation(
+					&context->guard, &context->tt_root, &generation)
+				!= CLUSTER_UNDO_BLOCK0_OK
+				|| !gcs_block_current_mx_ctrc_key(
+					context, i, &generation, &ctrc_key))
+				return false;
+			touch_result = cluster_ctrc_origin_touch_exact(
+				&ctrc_key, &context->current_mx_requester_identity,
+				context->current_mx_proofs[i].state == CCM_SELF
+					? CTRC_PROOF_SELF : CTRC_PROOF_ACTIVE,
+				&ctrc_grant);
+			if ((touch_result != CLUSTER_CTRC_TOUCH_RECORDED
+				 && touch_result != CLUSTER_CTRC_TOUCH_DUPLICATE)
+				|| ctrc_grant == 0
+				|| cluster_undo_block0_current_sample_generation(
+					&context->guard, &context->tt_root, &final_generation)
+				   != CLUSTER_UNDO_BLOCK0_OK
+				|| !final_generation.known
+				|| final_generation.value != generation.value
+				|| !gcs_block_r4_tx_origin_resolve_root_current(
+					context, &context->tt_logical, &final_root)
+				|| !cluster_undo_block0_root_matches(
+					&context->tt_root, &final_root)
+				|| !gcs_block_r4_tx_origin_admission_current(context)
+				|| cluster_qvotec_get_self_incarnation()
+				   != ctrc_key.origin_boot_incarnation)
+				return false;
+			ClusterCurrentMemberProofSetCtrcGrant(
+				&context->current_mx_proofs[i], ctrc_grant);
+		}
+		else
+			ClusterCurrentMemberProofSetCtrcGrant(
+				&context->current_mx_proofs[i], 0);
 		context->current_mx_sampled_bitmap |= (uint8)(1U << i);
 	}
 	if (request->prefix.body_kind
@@ -7254,6 +7432,13 @@ gcs_block_current_mx_origin_advance(
 			return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 		}
 		return GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT;
+	}
+	if (!gcs_block_current_mx_requester_identity_current(context))
+	{
+		context->current_mx_result = CMX_RESOLVE_UNKNOWN;
+		context->current_mx_failure
+			= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
+		return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 	}
 	context->current_mx_proof_count = context->current_mx_locator_count;
 	context->current_mx_result = CMX_RESOLVE_OK;
@@ -16159,6 +16344,7 @@ gcs_block_try_land_current_mx_reply(
 			[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
 		ClusterCurrentUpdaterProof scratch_updater;
 		uint16 scratch_count = 0;
+		uint32 scratch_capability_generation = 0;
 		uint32 scratch_total = 0;
 		ClusterMxDescribeResult typed_result = CMX_DESC_UNKNOWN;
 		ClusterMxResolveResult proof_result = CMX_RESOLVE_UNKNOWN;
@@ -16211,7 +16397,8 @@ gcs_block_try_land_current_mx_reply(
 						slot->expected_master_node, slot->request_epoch,
 						&slot->expected_current_mx_proof, &proof_result,
 						scratch_proofs, lengthof(scratch_proofs),
-						&scratch_count, &scratch_updater);
+						&scratch_count, &scratch_updater,
+						&scratch_capability_generation);
 		}
 		if (!typed_valid) {
 			pg_atomic_fetch_add_u64(

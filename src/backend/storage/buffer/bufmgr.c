@@ -12685,7 +12685,8 @@ cluster_bufmgr_lock_resident_for_exact_itl_stamp(const struct ClusterItlTouchRec
 	{
 		slot = &ClusterPageGetItlSlots(page)[record->key.slot_idx];
 		if (!cluster_itl_terminal_proof_slot_exact(proof, slot->xid, slot->wrap,
-											   slot->flags))
+											   slot->flags,
+											   &slot->undo_segment_head))
 		{
 			if (slot->xid != proof->xid)
 				reason = CLUSTER_ITL_STAMP_SKIP_XID_CHANGED;

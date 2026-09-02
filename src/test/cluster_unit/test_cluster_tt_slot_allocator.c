@@ -1102,12 +1102,15 @@ UT_TEST(test_t48_peer_mode_committed_recycle_waits_for_cluster_floor_cleaner)
 	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 1);
 }
 
-UT_TEST(test_t49_peer_mode_aborted_remains_directly_recyclable)
+UT_TEST(test_t49_peer_mode_aborted_retains_canonical_slot)
 {
-	/* ABORTED is invisible to every local or remote snapshot, so the peer-mode
-	 * COMMITTED proof gate must not force unnecessary rollover for it. */
+	/* Stage 8 current-MX A16/A17 consumes the physical canonical ABORTED
+	 * slot.  Without an exact L12 release owner, neither allocation nor the
+	 * current-generation cleaner may destroy it in peer mode. */
 	uint16 off;
 	uint16 result;
+	bool retained = false;
+	ClusterUndoCleanerPassStats stats = {0};
 	int i;
 
 	reset_allocator();
@@ -1118,9 +1121,18 @@ UT_TEST(test_t49_peer_mode_aborted_remains_directly_recyclable)
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
 		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(2000 + i));
 
-	result = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)99999);
-	UT_ASSERT_EQ((int)result, (int)off);
-	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 1);
+	result = cluster_tt_slot_alloc_ext(NODE0_SEG, (TransactionId)99999, &retained);
+	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT_EQ((int)retained, 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
+
+	cluster_tt_slot_gc_current_pass((SCN)1000, (uint64)7, &stats);
+	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
+	retained = false;
+	result = cluster_tt_slot_alloc_ext(NODE0_SEG, (TransactionId)99999, &retained);
+	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT_EQ((int)retained, 1);
+	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, off), 0);
 }
 
 UT_TEST(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor)
@@ -1294,7 +1306,7 @@ main(void)
 	UT_RUN(test_t46_alloc_gate_skips_protected_free_slot);
 	UT_RUN(test_t47_protect_idempotent_and_conflict);
 	UT_RUN(test_t48_peer_mode_committed_recycle_waits_for_cluster_floor_cleaner);
-	UT_RUN(test_t49_peer_mode_aborted_remains_directly_recyclable);
+	UT_RUN(test_t49_peer_mode_aborted_retains_canonical_slot);
 	UT_RUN(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor);
 	UT_RUN(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded);
 	UT_RUN(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation);

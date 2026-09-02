@@ -22,6 +22,7 @@
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_membership.h"
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_undo_resid.h"
@@ -2194,7 +2195,8 @@ cluster_undo_block0_current_live_owner_recycle_exact(
 			recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_NOT_COMMITTED;
 			goto recycle_done;
 		}
-		if (!cluster_undo_segment_recyclable(disk, horizon)) {
+		if (!cluster_undo_segment_recyclable_for_mode(
+				disk, horizon, cluster_peer_mode_enabled())) {
 			recycle_result = CLUSTER_UNDO_BLOCK0_RECYCLE_RETAINED;
 			goto recycle_done;
 		}

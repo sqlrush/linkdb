@@ -19,6 +19,7 @@
 #define HEAPAM_R4_PRIVATE_H
 
 #include "access/htup.h"
+#include "access/multixact.h"
 #include "access/tableam.h"
 #include "cluster/cluster_scn.h"
 #include "executor/tuptable.h"
@@ -62,6 +63,38 @@ typedef bool (*ClusterR4HotScratchSearchTestHook)(
 typedef void (*ClusterHeapDmlAuthorityGuardTestHook)(
 	Buffer buffer, HeapTuple tuple, void *arg);
 
+typedef enum ClusterHeapNoRetryTestCaller
+{
+	CLUSTER_HEAP_NO_RETRY_TEST_INSERT = 0,
+	CLUSTER_HEAP_NO_RETRY_TEST_DELETE,
+	CLUSTER_HEAP_NO_RETRY_TEST_UPDATE_PAIR,
+	CLUSTER_HEAP_NO_RETRY_TEST_TEMP_LOCK,
+	CLUSTER_HEAP_NO_RETRY_TEST_HEAP_LOCK,
+	CLUSTER_HEAP_NO_RETRY_TEST_UPDATE_CHAIN
+} ClusterHeapNoRetryTestCaller;
+
+typedef enum ClusterHeapNoRetryTestOutcome
+{
+	CLUSTER_HEAP_NO_RETRY_TEST_ZERO_APPLY_RETRY = 0,
+	CLUSTER_HEAP_NO_RETRY_TEST_APPLIED,
+	CLUSTER_HEAP_NO_RETRY_TEST_REFUSED
+} ClusterHeapNoRetryTestOutcome;
+
+typedef struct ClusterHeapNoRetryTestReport
+{
+	ClusterHeapNoRetryTestOutcome outcome;
+	uint8 preflight_calls;
+	uint8 apply_calls;
+	uint8 consume_calls;
+	bool retry_edge;
+} ClusterHeapNoRetryTestReport;
+
+typedef enum ClusterHeapMultiInsertRoute
+{
+	CLUSTER_HEAP_MULTI_INSERT_NATIVE_BATCH = 0,
+	CLUSTER_HEAP_MULTI_INSERT_RECEIPT_SAFE_PER_TUPLE
+} ClusterHeapMultiInsertRoute;
+
 /* PK IndexScan companion; public heap_hot_search_buffer() remains unchanged. */
 extern HeapHotSearchResultKind heap_hot_search_buffer_result(
 	ItemPointer tid, Relation relation, Buffer buffer, Snapshot snapshot,
@@ -98,6 +131,23 @@ extern void cluster_heap_test_itl_last_census_stats(
 extern bool cluster_heap_test_dml_authority_guard_recheck_with_hook(
 	Buffer buffer, HeapTuple tuple,
 	ClusterHeapDmlAuthorityGuardTestHook hook, void *hook_arg);
+extern bool cluster_heap_test_dml_authority_guard_slot_recheck_with_hook(
+	Buffer buffer, HeapTuple tuple, uint8 slot_index,
+	ClusterHeapDmlAuthorityGuardTestHook hook, void *hook_arg);
+extern bool cluster_heap_test_no_retry_boundary(
+	ClusterHeapNoRetryTestCaller caller, bool final_recheck_drift,
+	bool partial_apply_failure, ClusterHeapNoRetryTestReport *report);
+extern bool cluster_heap_test_itl_receipt_identity_admitted(
+	TransactionId canonical_xid, uint32 segment_id);
+extern ClusterHeapMultiInsertRoute cluster_heap_test_multi_insert_route(
+	bool current_itl_path);
+extern bool cluster_heap_test_update_needs_successor_prediction(
+	bool current_itl_path, bool current_mx_recomposed);
+extern bool cluster_heap_test_current_mx_authorize_keyshare(
+	Relation relation, Buffer buffer, HeapTuple tuple,
+	TransactionId requester_xid, TM_Result *result,
+	MultiXactMember *normalized, uint16 normalized_cap,
+	uint16 *normalized_count);
 #endif
 #endif
 

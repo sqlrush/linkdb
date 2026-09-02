@@ -45,8 +45,11 @@
 #include "storage/bufpage.h"
 
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_undo_cleaner.h" /* scan-pass stats (spec-3.13 D2-B) */
@@ -74,6 +77,24 @@ scn_time_cmp(SCN a, SCN b)
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+uint64
+GetSystemIdentifier(void)
+{
+	return UINT64_C(0x1122334455667788);
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return 17;
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return 23;
+}
 
 static ClusterGesTimeoutDetail fake_ges_timeout_detail = {
 	.source = CLUSTER_GES_TSRC_NONE,
@@ -418,6 +439,72 @@ static XLogRecPtr g_abort_exact_lsn = (XLogRecPtr)0xfedcba;
 static XLogRecPtr g_flushed_lsn = InvalidXLogRecPtr;
 static bool g_abort_flush_seen = false;
 static bool g_require_abort_flush_before_write = false;
+static int g_ctrc_event_sequence = 0;
+static int g_ctrc_reserve_calls = 0;
+static int g_ctrc_reserve_order = 0;
+static int g_ctrc_bind_order = 0;
+static int g_ctrc_write_order = 0;
+static int g_ctrc_open_calls = 0;
+static int g_ctrc_open_order = 0;
+static ClusterCtrcOriginReserveResult g_ctrc_reserve_result
+	= CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
+static bool g_ctrc_open_ok = true;
+static uint32 g_ctrc_open_grant = 7;
+static int g_ctrc_cancel_pre_bind_calls = 0;
+static int g_ctrc_block_post_bind_calls = 0;
+static bool g_bind_emit_error = false;
+static XLogRecPtr g_bind_emit_lsn = (XLogRecPtr)0xabcdef;
+
+ClusterCtrcOriginReserveResult
+cluster_ctrc_origin_reserve_active(const ClusterCtrcTxnKeyV1 *key,
+								   ClusterCtrcOriginReservation *reservation)
+{
+	g_ctrc_reserve_calls++;
+	g_ctrc_reserve_order = ++g_ctrc_event_sequence;
+	if (key == NULL || reservation == NULL)
+		return CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED;
+	memset(reservation, 0, sizeof(*reservation));
+	reservation->key = *key;
+	reservation->origin_index = 7;
+	reservation->reservation_generation = 41;
+	reservation->kind = g_ctrc_reserve_result
+		== CLUSTER_CTRC_ORIGIN_RESERVED_PENDING
+		? CTRC_ORIGIN_RESERVATION_PENDING_OWNED
+		: CTRC_ORIGIN_RESERVATION_EXISTING_OPEN;
+	reservation->valid = true;
+	return g_ctrc_reserve_result;
+}
+
+bool
+cluster_ctrc_origin_open_reserved(
+	const ClusterCtrcOriginReservation *reservation,
+	uint32 *grant_generation)
+{
+	g_ctrc_open_calls++;
+	g_ctrc_open_order = ++g_ctrc_event_sequence;
+	if (!g_ctrc_open_ok || reservation == NULL || grant_generation == NULL)
+		return false;
+	*grant_generation = g_ctrc_open_grant;
+	return true;
+}
+
+bool
+cluster_ctrc_origin_cancel_pre_bind(
+	const ClusterCtrcOriginReservation *reservation)
+{
+	g_ctrc_cancel_pre_bind_calls++;
+	return reservation != NULL
+		&& reservation->kind == CTRC_ORIGIN_RESERVATION_PENDING_OWNED;
+}
+
+bool
+cluster_ctrc_origin_block_post_bind(
+	const ClusterCtrcOriginReservation *reservation)
+{
+	g_ctrc_block_post_bind_calls++;
+	return reservation != NULL
+		&& reservation->kind == CTRC_ORIGIN_RESERVATION_PENDING_OWNED;
+}
 
 bool
 cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
@@ -457,6 +544,11 @@ cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id,
 								uint16 wrap, TransactionId xid)
 {
 	g_bind_emit_calls++;
+	g_ctrc_bind_order = ++g_ctrc_event_sequence;
+	if (g_bind_emit_error)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("injected pre-return BIND failure")));
 	memset(&g_last_bind, 0, sizeof(g_last_bind));
 	g_last_bind.instance = instance;
 	g_last_bind.segment_id = segment_id;
@@ -465,7 +557,7 @@ cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id,
 	g_last_bind.wrap = wrap;
 	g_last_bind.xid = xid;
 	g_last_bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
-	return (XLogRecPtr)0xabcdef;
+	return g_bind_emit_lsn;
 }
 
 /* spec-3.15 D5 stub: 0x31 emit (WAL machinery not linked in unit). */
@@ -591,6 +683,7 @@ cluster_undo_smgr_write_header_bytes(ClusterUndoPathIntent intent pg_attribute_u
 									 uint32 len)
 {
 	g_write_hdr_calls++;
+	g_ctrc_write_order = ++g_ctrc_event_sequence;
 	if (g_require_abort_flush_before_write && !g_abort_flush_seen)
 		return false;
 	if (buf != NULL && len == sizeof(TTSlot))
@@ -708,6 +801,20 @@ reset_current_write_mock(void)
 	g_flushed_lsn = InvalidXLogRecPtr;
 	g_abort_flush_seen = false;
 	g_require_abort_flush_before_write = false;
+	g_ctrc_event_sequence = 0;
+	g_ctrc_reserve_calls = 0;
+	g_ctrc_reserve_order = 0;
+	g_ctrc_bind_order = 0;
+	g_ctrc_write_order = 0;
+	g_ctrc_open_calls = 0;
+	g_ctrc_open_order = 0;
+	g_ctrc_reserve_result = CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
+	g_ctrc_open_ok = true;
+	g_ctrc_open_grant = 7;
+	g_ctrc_cancel_pre_bind_calls = 0;
+	g_ctrc_block_post_bind_calls = 0;
+	g_bind_emit_error = false;
+	g_bind_emit_lsn = (XLogRecPtr)0xabcdef;
 	g_current_root_ok = true;
 	g_current_root_drift = false;
 	g_current_acquire_ok = true;
@@ -738,6 +845,7 @@ source_modifier_token(void)
 
 	memset(&token, 0, sizeof(token));
 	token.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	token.record_generation = 19;
 	token.formation_epoch = 17;
 	token.side = CLUSTER_SEMANTIC_SOURCE_SIDE;
 	token.entered = true;
@@ -1215,6 +1323,11 @@ UT_TEST(test_active_publish_wal_precedes_identical_disk_and_resident_successor)
 	UT_ASSERT_EQ(memcmp(&successor, &resident->tt_slots[7], sizeof(successor)), 0);
 	UT_ASSERT_EQ(g_allocator_owner_calls, 2);
 	UT_ASSERT_EQ(g_current_recheck_calls, 1);
+	UT_ASSERT_EQ(g_ctrc_reserve_calls, 1);
+	UT_ASSERT_EQ(g_ctrc_open_calls, 1);
+	UT_ASSERT(g_ctrc_reserve_order < g_ctrc_bind_order);
+	UT_ASSERT(g_ctrc_bind_order < g_ctrc_write_order);
+	UT_ASSERT(g_ctrc_write_order < g_ctrc_open_order);
 }
 
 UT_TEST(test_active_publish_final_xcur_drift_stays_unpublished)
@@ -1251,6 +1364,172 @@ UT_TEST(test_active_publish_final_xcur_drift_stays_unpublished)
 	UT_ASSERT_EQ(g_write_hdr_calls, 1);
 	UT_ASSERT_EQ(g_current_recheck_calls, 1);
 	UT_ASSERT_EQ(generation, UINT32_MAX);
+	UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, 1);
+}
+
+UT_TEST(test_active_publish_prebind_failures_cancel_only_owned_pending_reservation)
+{
+	ClusterSemanticAdmissionToken admission = target_modifier_token();
+	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)g_canned_block;
+	UndoSegmentHeaderData *resident = (UndoSegmentHeaderData *)g_current_resident;
+	TTSlot successor;
+	uint32 generation = UINT32_MAX;
+	volatile bool caught = false;
+
+	reset_current_write_mock();
+	disk->segment_id = 1;
+	disk->owner_instance = 1;
+	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	disk->wrap_count = 4;
+	disk->tt_slots[7].status = TT_SLOT_ACTIVE;
+	disk->tt_slots[7].xid = 999;
+	disk->tt_slots[7].wrap = 0;
+	memcpy(resident, disk, BLCKSZ);
+	PG_TRY();
+	{
+		(void)cluster_tt_slot_durable_publish_active(
+			&g_allocator_owner, &admission, &generation, &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, 1);
+	UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, 0);
+
+	reset_current_write_mock();
+	disk->segment_id = 1;
+	disk->owner_instance = 1;
+	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	disk->wrap_count = 4;
+	memcpy(resident, disk, BLCKSZ);
+	g_bind_emit_error = true;
+	caught = false;
+	PG_TRY();
+	{
+		(void)cluster_tt_slot_durable_publish_active(
+			&g_allocator_owner, &admission, &generation, &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(g_bind_emit_calls, 1);
+	UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, 1);
+	UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, 0);
+
+	reset_current_write_mock();
+	disk->segment_id = 1;
+	disk->owner_instance = 1;
+	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	disk->wrap_count = 4;
+	memcpy(resident, disk, BLCKSZ);
+	g_bind_emit_lsn = InvalidXLogRecPtr;
+	caught = false;
+	PG_TRY();
+	{
+		(void)cluster_tt_slot_durable_publish_active(
+			&g_allocator_owner, &admission, &generation, &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, 1);
+	UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, 0);
+}
+
+UT_TEST(test_active_publish_postbind_failures_block_owned_pending_reservation)
+{
+	ClusterSemanticAdmissionToken admission = target_modifier_token();
+	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)g_canned_block;
+	UndoSegmentHeaderData *resident = (UndoSegmentHeaderData *)g_current_resident;
+	TTSlot successor;
+	uint32 generation = UINT32_MAX;
+	volatile bool caught = false;
+
+	reset_current_write_mock();
+	disk->segment_id = 1;
+	disk->owner_instance = 1;
+	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	disk->wrap_count = 4;
+	memcpy(resident, disk, BLCKSZ);
+	g_write_hdr_ok = false;
+	PG_TRY();
+	{
+		(void)cluster_tt_slot_durable_publish_active(
+			&g_allocator_owner, &admission, &generation, &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, 1);
+
+	reset_current_write_mock();
+	disk->segment_id = 1;
+	disk->owner_instance = 1;
+	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	disk->wrap_count = 4;
+	memcpy(resident, disk, BLCKSZ);
+	g_ctrc_open_ok = false;
+	caught = false;
+	PG_TRY();
+	{
+		(void)cluster_tt_slot_durable_publish_active(
+			&g_allocator_owner, &admission, &generation, &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, 1);
+}
+
+UT_TEST(test_active_publish_existing_open_error_never_cancels_or_blocks_entry)
+{
+	ClusterSemanticAdmissionToken admission = target_modifier_token();
+	UndoSegmentHeaderData *disk = (UndoSegmentHeaderData *)g_canned_block;
+	UndoSegmentHeaderData *resident = (UndoSegmentHeaderData *)g_current_resident;
+	TTSlot successor;
+	uint32 generation = UINT32_MAX;
+	volatile bool caught = false;
+
+	reset_current_write_mock();
+	disk->segment_id = 1;
+	disk->owner_instance = 1;
+	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
+	disk->wrap_count = 4;
+	memcpy(resident, disk, BLCKSZ);
+	g_ctrc_reserve_result = CLUSTER_CTRC_ORIGIN_RESERVED_EXISTING_OPEN;
+	g_write_hdr_ok = false;
+	PG_TRY();
+	{
+		(void)cluster_tt_slot_durable_publish_active(
+			&g_allocator_owner, &admission, &generation, &successor);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(g_ctrc_cancel_pre_bind_calls, 0);
+	UT_ASSERT_EQ(g_ctrc_block_post_bind_calls, 0);
 }
 
 UT_TEST(test_active_publish_requires_exact_root_and_resident_disk_generation)
@@ -2360,7 +2639,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(89);
+	UT_PLAN(92);
 
 	UT_RUN(test_layout_sizes);
 
@@ -2393,6 +2672,9 @@ main(int argc, char **argv)
 	UT_RUN(test_terminal_transition_requires_same_exact_active_entity);
 	UT_RUN(test_active_publish_wal_precedes_identical_disk_and_resident_successor);
 	UT_RUN(test_active_publish_final_xcur_drift_stays_unpublished);
+	UT_RUN(test_active_publish_prebind_failures_cancel_only_owned_pending_reservation);
+	UT_RUN(test_active_publish_postbind_failures_block_owned_pending_reservation);
+	UT_RUN(test_active_publish_existing_open_error_never_cancels_or_blocks_entry);
 	UT_RUN(test_active_publish_requires_exact_root_and_resident_disk_generation);
 	UT_RUN(test_active_publish_rejects_allocator_identity_drift_before_wal);
 	UT_RUN(test_active_publish_accepts_exact_rollover_after_initial_allocator_check);

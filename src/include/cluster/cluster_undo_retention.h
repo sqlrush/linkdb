@@ -69,7 +69,7 @@ extern bool cluster_undo_retention_all_quiescent(void);
  *	cluster_tt_slot_recyclable:
  *	  Given a TT-slot allocator status (ClusterTTSlotAllocStatus value), its
  *	  commit_scn, and the current horizon, decide whether the slot may be
- *	  recycled.  ABORTED -> always (C7); COMMITTED -> only when
+ *	  recycled.  ABORTED -> single-node C7 true; COMMITTED -> only when
  *	  commit_scn is strictly older than the horizon (a reader at the same SCN
  *	  as commit_scn still needs the pre-image).  InvalidScn horizon (cluster
  *	  disabled) -> the gate carries no constraint, so COMMITTED is recyclable.
@@ -84,11 +84,18 @@ extern bool cluster_undo_retention_all_quiescent(void);
  *	  A SEGMENT_COMMITTED segment with no live COMMITTED slot is recyclable; one
  *	  carrying a COMMITTED slot with an unresolved commit_scn is retained
  *	  (rule 8.A fail-closed).
+ *
+ *	cluster_undo_segment_recyclable_for_mode:
+ *	  Applies the same pure predicate while additionally retaining every
+ *	  segment containing a canonical ABORTED slot in peer mode.  The legacy
+ *	  wrapper keeps single-node C7 immediate reuse unchanged.
  */
 struct UndoSegmentHeaderData;
 
 extern bool cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon);
 extern bool cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN horizon);
+extern bool cluster_undo_segment_recyclable_for_mode(
+	const struct UndoSegmentHeaderData *hdr, SCN horizon, bool peer_mode);
 
 
 /*

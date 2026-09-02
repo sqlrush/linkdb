@@ -22,9 +22,9 @@
  *	    - An UNKNOWN (InvalidScn) commit_scn on a COMMITTED slot cannot be
  *	      proven below the horizon, so it is RETAINED (never recycled on a
  *	      guess).
- *	    - ABORTED versions are invisible to every read_scn (abort already
- *	      rolled the row back in place; CR rebuilds committed history only), so
- *	      no reader needs their undo => immediately recyclable (C7).
+ *	    - The single-node C7 predicate treats ABORTED as immediately recyclable.
+ *	      Peer-mode callers additionally retain its canonical physical TT bytes
+ *	      for current-MX proof until an exact release owner exists.
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
@@ -59,7 +59,7 @@
 bool
 cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
 {
-	/* C7: aborted versions are invisible to any read_scn -> always recyclable. */
+	/* Single-node C7 policy; peer-mode callers add the canonical-proof gate. */
 	if (cts_status == CTS_ABORTED)
 		return true;
 
@@ -87,15 +87,18 @@ cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon)
 
 
 /*
- * cluster_undo_segment_recyclable
+ * cluster_undo_segment_recyclable_for_mode
  *
  *	Decide whether an undo segment may be recycled under the current horizon.
  *	Precondition: SEGMENT_COMMITTED (C5).  The segment's retention watermark is
  *	the max commit_scn over the COMMITTED on-disk TT slots in its header; the
  *	segment is recyclable only when that watermark is strictly below horizon.
+ *	In peer mode, any canonical ABORTED slot retains the segment until an exact
+ *	distributed reference-release owner exists.
  */
 bool
-cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN horizon)
+cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr,
+									 SCN horizon, bool peer_mode)
 {
 	SCN watermark = InvalidScn;
 	bool saw_unresolved_committed = false;
@@ -112,6 +115,13 @@ cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN hor
 	 */
 	if (hdr->segment_state != SEGMENT_COMMITTED)
 		return false;
+
+	if (peer_mode) {
+		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			if (hdr->tt_slots[i].status == TT_SLOT_ABORTED)
+				return false;
+		}
+	}
 
 	/* InvalidScn horizon == cluster disabled -> no retention constraint. */
 	if (!SCN_VALID(horizon))
@@ -139,6 +149,14 @@ cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN hor
 		return true;
 
 	return scn_time_cmp(watermark, horizon) < 0;
+}
+
+
+/* Preserve the existing single-node C7 API and behavior. */
+bool
+cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN horizon)
+{
+	return cluster_undo_segment_recyclable_for_mode(hdr, horizon, false);
 }
 
 

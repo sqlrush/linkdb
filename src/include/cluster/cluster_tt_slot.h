@@ -268,7 +268,7 @@ typedef enum ClusterTTSlotAllocStatus {
 	CTS_FREE = 0,	   /* available for allocation */
 	CTS_ACTIVE = 1,	   /* owned by an in-flight xact */
 	CTS_COMMITTED = 2, /* committed; recyclable once commit_scn is older than horizon */
-	CTS_ABORTED = 3	   /* aborted; immediately recyclable (spec-3.12 C7) */
+	CTS_ABORTED = 3	   /* aborted; C7 local reuse or peer canonical retention */
 } ClusterTTSlotAllocStatus;
 
 /* Stack-only read snapshot of one exact owner in the allocator's current
@@ -372,8 +372,8 @@ extern uint16 cluster_tt_slot_get_wrap(uint32 segment_id, uint16 slot_offset);
  *	  the spec-3.4b commit-time cluster_tt_slot_free().
  *
  *	cluster_tt_slot_mark_aborted:
- *	  ACTIVE -> ABORTED.  Aborted versions are invisible to every read_scn so
- *	  the slot is immediately recyclable (spec-3.12 C7); commit_scn is cleared.
+ *	  ACTIVE -> ABORTED; commit_scn is cleared.  Single-node C7 permits immediate
+ *	  reuse, while peer mode retains the canonical slot until exact release.
  *
  *	Both are idempotent / defensive: a slot not currently ACTIVE-owned by
  *	`xid` is left unchanged (guards against double end-of-xact callbacks).

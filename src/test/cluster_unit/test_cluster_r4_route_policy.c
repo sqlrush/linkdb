@@ -1661,7 +1661,8 @@ cluster_multixact_current_wire_validate_proof_reply_frame(
 	ClusterMxResolveResult *result,
 	ClusterCurrentMemberProof *proofs pg_attribute_unused(),
 	uint16 proofs_cap pg_attribute_unused(), uint16 *proof_count,
-	ClusterCurrentUpdaterProof *updater_proof)
+	ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *requester_capability_generation_out)
 {
 	const ClusterCurrentMxProofReplyPage *page = payload;
 
@@ -1674,6 +1675,8 @@ cluster_multixact_current_wire_validate_proof_reply_frame(
 		memset(updater_proof, 0, sizeof(*updater_proof));
 		updater_proof->verdict = CUCP_UNKNOWN;
 	}
+	if (requester_capability_generation_out != NULL)
+		*requester_capability_generation_out = 0;
 	if (payload == NULL || payload_length != sizeof(*page)
 		|| expected_request == NULL || result == NULL
 		|| page->header.magic != CLUSTER_CURRENT_MX_WIRE_MAGIC
@@ -1689,6 +1692,10 @@ cluster_multixact_current_wire_validate_proof_reply_frame(
 		|| page->header.mxkey.cluster_epoch != (uint32)current_epoch)
 		return false;
 	*result = route_seam.current_mx_proof_validate_result;
+	if (*result == CMX_RESOLVE_OK
+		&& requester_capability_generation_out != NULL)
+		*requester_capability_generation_out
+			= page->header.requester_capability_generation;
 	return true;
 }
 
@@ -2729,6 +2736,7 @@ UT_TEST(test_current_mx_member_proof_requester_is_capability_bound_and_times_out
 	ClusterCurrentUpdaterProof updater;
 	BufferTag reset_tag = route_test_tag();
 	uint16 proof_count = UINT16_MAX;
+	uint32 requester_capability_generation = UINT32_MAX;
 	uint64 reset_request_id = 0;
 	int saved_node_id = cluster_node_id;
 	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
@@ -2764,8 +2772,10 @@ UT_TEST(test_current_mx_member_proof_requester_is_capability_bound_and_times_out
 
 	UT_ASSERT_EQ(cluster_gcs_current_mx_member_proof_fetch_and_wait(
 					 4, &request, proofs, lengthof(proofs),
-					 &proof_count, &updater),
-			 CMX_RESOLVE_TIMEOUT);
+					 &proof_count, &updater,
+					 &requester_capability_generation),
+				 CMX_RESOLVE_TIMEOUT);
+	UT_ASSERT_EQ(requester_capability_generation, (uint32)0);
 	UT_ASSERT_EQ(route_seam.current_mx_capability_calls, 1);
 	UT_ASSERT_EQ(route_seam.current_mx_capability_peer, 4);
 	UT_ASSERT_EQ(route_seam.enqueue_calls, 1);
@@ -2845,6 +2855,7 @@ UT_TEST(test_current_mx_member_proof_reply_lands_in_current_domain)
 	ClusterCurrentUpdaterProof updater;
 	BufferTag reset_tag = route_test_tag();
 	uint16 proof_count = UINT16_MAX;
+	uint32 requester_capability_generation = UINT32_MAX;
 	uint64 reset_request_id = 0;
 	int saved_node_id = cluster_node_id;
 	int saved_reply_timeout_ms = cluster_gcs_reply_timeout_ms;
@@ -2884,8 +2895,10 @@ UT_TEST(test_current_mx_member_proof_reply_lands_in_current_domain)
 
 	UT_ASSERT_EQ(cluster_gcs_current_mx_member_proof_fetch_and_wait(
 					 4, &request, proofs, lengthof(proofs),
-					 &proof_count, &updater),
-			 CMX_RESOLVE_DENIED);
+					 &proof_count, &updater,
+					 &requester_capability_generation),
+				 CMX_RESOLVE_DENIED);
+	UT_ASSERT_EQ(requester_capability_generation, (uint32)0);
 	UT_ASSERT_EQ(route_seam.enqueue_calls, 1);
 	UT_ASSERT(route_seam.current_mx_slot_armed);
 	UT_ASSERT_EQ(route_seam.current_mx_slot_domain,

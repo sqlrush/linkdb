@@ -344,9 +344,10 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
 				free_idx = i;
 		} else if (e->status == CTS_COMMITTED || e->status == CTS_ABORTED) {
 			/* A local ProcArray horizon cannot authorize destruction of evidence
-			 * still needed by a peer snapshot. */
+			 * still needed by a peer snapshot or current-MX canonical proof. */
 			bool recyclable
-				= (e->status == CTS_COMMITTED && peer_mode)
+				= (peer_mode
+				   && (e->status == CTS_COMMITTED || e->status == CTS_ABORTED))
 					  ? false
 					  : (gate_enabled
 							 ? cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon)
@@ -417,18 +418,19 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
  *	    3) recycle a *retention-eligible* COMMITTED / ABORTED slot, wrap++
  *	A COMMITTED slot is retention-eligible only when commit_scn is older than
  *	the horizon
- *	(cluster_tt_slot_recyclable); ABORTED is always eligible (C7).  When the
+ *	(cluster_tt_slot_recyclable); single-node ABORTED is eligible (C7).  When the
  *	retention GUC is off, the gate is bypassed (spec-3.11 immediate recycle, C6).
  *	In peer mode, allocator Pass 2 never recycles COMMITTED directly: the local
  *	ProcArray horizon does not cover remote snapshots.  The cluster undo cleaner
  *	is the sole COMMITTED recycler there; it folds every required peer report
  *	into an epoch-paired cluster floor and fences each COMMITTED -> FREE mutation.
- *	Allocator Pass 1 may then consume that proven FREE slot.  ABORTED remains
- *	immediately reusable because it is invisible to every snapshot.
+ *	Allocator Pass 1 may then consume that proven FREE slot.  In peer mode,
+ *	ABORTED is also retained as canonical current-MX evidence until an exact
+ *	reference-release owner exists.
  *
  *	Returns INVALID_TT_SLOT_OFFSET when no slot can be handed out.  In that
  *	case *out_retained_pressure (when non-NULL) distinguishes the two reasons:
- *	    true  -> at least one COMMITTED slot is being kept alive by retention
+ *	    true  -> at least one terminal slot is being kept alive by retention
  *	             (not all-ACTIVE); the caller may roll over to a new active
  *	             segment instead of failing (spec-3.12 D2b).
  *	    false -> every slot is ACTIVE (genuine in-flight concurrency limit).
@@ -553,7 +555,9 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id,
  *	with the retention gate enabled: with the GUC off, alloc Pass-2
  *	already recycles immediately (C6) and there is nothing to pre-free.
  *
- *	CTS_ACTIVE entries here are live in-flight transactions (this is the
+ *	Peer-mode ABORTED entries are canonical current-MX evidence and are skipped
+ *	until an exact release owner exists.  CTS_ACTIVE entries here are live
+ *	in-flight transactions (this is the
  *	current segment), NOT crash residue — they are simply skipped and
  *	NOT counted as stale (HC6 stale accounting is durable-side only).
  */
@@ -565,6 +569,7 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 	ClusterTTSlotAllocPerSegment *seg;
 	uint32 gcd = 0;
 	bool fence_ok = true;
+	bool peer_mode;
 	int i;
 
 	Assert(stats != NULL);
@@ -577,6 +582,7 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 		return true; /* no binding yet this incarnation */
 
 	seg = cluster_tt_slot_get_or_init(segment_id);
+	peer_mode = cluster_peer_mode_enabled();
 
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
@@ -584,6 +590,8 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 
 		if (e->status != CTS_COMMITTED && e->status != CTS_ABORTED)
 			continue;
+		if (peer_mode && e->status == CTS_ABORTED)
+			continue; /* Stage 8 current-MX canonical ABORTED is retained. */
 		if (!cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon))
 			continue; /* retained: a live reader may still need it (8.A) */
 		if (tt_slot_entry_wrap_retired(e)) {
@@ -751,11 +759,10 @@ cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, Transactio
 /*
  * cluster_tt_slot_mark_aborted -- spec-3.12 D2 / C7.
  *
- *	ACTIVE -> ABORTED.  Aborted versions are invisible to every read_scn (abort
- *	already rolled the row back in place; CR rebuilds committed history only),
- *	so the slot is immediately recyclable -- no horizon retention.  commit_scn
- *	is cleared.  Same defensive ownership + rolled-away (D2b) guards as
- *	mark_committed.
+ *	ACTIVE -> ABORTED.  commit_scn is cleared.  Single-node C7 may recycle it
+ *	immediately; peer mode retains the physical slot as canonical current-MX
+ *	evidence until an exact release owner exists.  Same defensive ownership +
+ *	rolled-away (D2b) guards as mark_committed.
  */
 void
 cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid)

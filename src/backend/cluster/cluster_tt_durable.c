@@ -39,9 +39,12 @@
 #include "utils/elog.h"
 
 #include "cluster/cluster_guc.h"		  /* cluster_node_id */
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_scn.h"		  /* SCN, SCN_VALID, InvalidScn */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_cleaner.h" /* spec-3.13 D2-B scan-only pass */
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"	  /* TTSlot, TT_SLOT_COMMITTED, TT_SLOTS_PER_SEGMENT */
@@ -276,6 +279,9 @@ cluster_tt_slot_durable_publish_active(
 	ClusterUndoBlock0Generation generation = {false, 0};
 	ClusterUndoBlock0CurrentGuard guard = {0};
 	ClusterUndoBlock0Pin pin;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	ClusterCtrcOriginReservation ctrc_reservation;
+	ClusterCtrcOriginReserveResult ctrc_reserve_result;
 	ClusterUndoBlock0CurrentStep step;
 	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterUndoBlock0Result result;
@@ -284,18 +290,25 @@ cluster_tt_slot_durable_publish_active(
 	UndoSegmentHeaderData *resident_header;
 	TTSlot successor;
 	const UBA invalid_uba = InvalidUba_init;
-	XLogRecPtr bind_lsn = InvalidXLogRecPtr;
+	volatile XLogRecPtr bind_lsn = InvalidXLogRecPtr;
+	uint64 publication_epoch;
+	uint64 publication_boot_incarnation;
+	uint32 ctrc_grant_generation = 0;
 	uint8 owner;
 	bool target_side;
 	bool root_available;
 	volatile bool current_active = false;
 	volatile bool pin_held = false;
+	volatile bool ctrc_pre_bind_cancel_armed = false;
+	volatile bool ctrc_post_bind_block_armed = false;
 
 	memset(&observed_owner, 0, sizeof(observed_owner));
 	memset(&root, 0, sizeof(root));
 	memset(&final_root, 0, sizeof(final_root));
 	memset(&pin, 0, sizeof(pin));
 	pin.slot = -1;
+	memset(&ctrc_key, 0, sizeof(ctrc_key));
+	memset(&ctrc_reservation, 0, sizeof(ctrc_reservation));
 	memset(&successor, 0, sizeof(successor));
 
 	if (expected_owner == NULL || admission == NULL
@@ -427,6 +440,43 @@ cluster_tt_slot_durable_publish_active(
 							   resident_header->tt_slots[expected_owner->slot_offset].wrap,
 							   resident_header->tt_slots[expected_owner->slot_offset].status)));
 
+		publication_epoch = cluster_epoch_get_current();
+		publication_boot_incarnation
+			= cluster_qvotec_get_self_incarnation();
+		if (publication_epoch > UINT32_MAX
+			|| publication_boot_incarnation == 0
+			|| admission->record_generation == 0
+			|| admission->formation_epoch == 0
+			|| root.root_id == 0 || root.root_generation == 0
+			|| GetSystemIdentifier() == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("canonical ACTIVE CTRC identity is unavailable")));
+		ctrc_key.format_version = CLUSTER_CTRC_FORMAT_VERSION;
+		ctrc_key.owner_instance = owner;
+		ctrc_key.origin_node_id = (uint16)cluster_node_id;
+		ctrc_key.segment_id = expected_owner->segment_id;
+		ctrc_key.segment_generation = generation.value;
+		ctrc_key.slot_offset = expected_owner->slot_offset;
+		ctrc_key.slot_wrap = expected_owner->wrap;
+		ctrc_key.xid = expected_owner->xid;
+		ctrc_key.cluster_epoch = (uint32)publication_epoch;
+		ctrc_key.system_identifier = GetSystemIdentifier();
+		ctrc_key.origin_boot_incarnation = publication_boot_incarnation;
+		ctrc_key.formation_epoch = admission->formation_epoch;
+		ctrc_key.admission_record_generation = admission->record_generation;
+		ctrc_key.root_descriptor_incarnation = root.root_generation;
+		ctrc_key.root_id = root.root_id;
+		ctrc_key.root_generation = root.root_generation;
+		ctrc_reserve_result = cluster_ctrc_origin_reserve_active(
+			&ctrc_key, &ctrc_reservation);
+		if (ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("canonical ACTIVE CTRC origin reservation is unavailable")));
+		ctrc_pre_bind_cancel_armed
+			= ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
+
 		switch (cluster_tt_active_transition_decide(
 			&disk_header->tt_slots[expected_owner->slot_offset],
 			disk_header->wrap_count, generation.value,
@@ -455,6 +505,15 @@ cluster_tt_slot_durable_publish_active(
 			owner, expected_owner->segment_id, generation.value,
 			expected_owner->slot_offset, expected_owner->wrap,
 			expected_owner->xid);
+		if (XLogRecPtrIsInvalid(bind_lsn))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE BIND WAL was not inserted")));
+		if (ctrc_pre_bind_cancel_armed)
+		{
+			ctrc_pre_bind_cancel_armed = false;
+			ctrc_post_bind_block_armed = true;
+		}
 
 		if (memcmp(&disk_header->tt_slots[expected_owner->slot_offset],
 				   &successor, sizeof(successor)) != 0) {
@@ -482,6 +541,9 @@ cluster_tt_slot_durable_publish_active(
 						expected_owner->segment_id, &final_root))
 			|| !cluster_undo_block0_root_matches(&root, &final_root)
 			|| !cluster_semantic_activation_modifier_recheck(admission, true)
+			|| cluster_epoch_get_current() != publication_epoch
+			|| cluster_qvotec_get_self_incarnation()
+			   != publication_boot_incarnation
 			|| cluster_undo_block0_current_recheck_exclusive(&guard)
 			   != CLUSTER_UNDO_BLOCK0_OK
 			|| resident_header->wrap_count != generation.value
@@ -491,12 +553,29 @@ cluster_tt_slot_durable_publish_active(
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 					 errmsg("canonical ACTIVE authority drifted during publication")));
+		if (!cluster_ctrc_origin_open_reserved(
+				&ctrc_reservation, &ctrc_grant_generation)
+			|| ctrc_grant_generation == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+					 errmsg("canonical ACTIVE CTRC origin grant is unavailable")));
+		ctrc_post_bind_block_armed = false;
 
 		*segment_generation_out = generation.value;
 		*successor_out = successor;
 	}
 	PG_FINALLY();
 	{
+		if (ctrc_pre_bind_cancel_armed)
+		{
+			(void)cluster_ctrc_origin_cancel_pre_bind(&ctrc_reservation);
+			ctrc_pre_bind_cancel_armed = false;
+		}
+		else if (ctrc_post_bind_block_armed)
+		{
+			(void)cluster_ctrc_origin_block_post_bind(&ctrc_reservation);
+			ctrc_post_bind_block_armed = false;
+		}
 		if (pin_held) {
 			cluster_undo_block0_unpin(&pin);
 			pin_held = false;
@@ -508,7 +587,7 @@ cluster_tt_slot_durable_publish_active(
 	}
 	PG_END_TRY();
 
-	return bind_lsn;
+	return (XLogRecPtr)bind_lsn;
 }
 
 ClusterTTActiveTransitionDecision

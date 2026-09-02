@@ -56,6 +56,10 @@
 
 UT_DEFINE_GLOBALS();
 
+/* Stage 8 peer-mode whole-segment retention contract. */
+extern bool cluster_undo_segment_recyclable_for_mode(
+	const struct UndoSegmentHeaderData *hdr, SCN horizon, bool peer_mode);
+
 
 /*
  * scn_time_cmp stub — mirrors the real comparator's contract: visibility
@@ -182,6 +186,22 @@ UT_TEST(test_u5_segment_committed_no_committed_slot_recyclable)
 	 * recyclable. */
 	init_header(&hdr, SEGMENT_COMMITTED);
 	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(&hdr, mk_scn(10)), 1);
+}
+
+UT_TEST(test_u5_peer_mode_segment_with_aborted_slot_retained)
+{
+	UndoSegmentHeaderData hdr;
+
+	init_header(&hdr, SEGMENT_COMMITTED);
+	hdr.tt_slots[0].status = TT_SLOT_ABORTED;
+
+	/* Preserve the single-node C7 policy while peer mode retains the exact
+	 * canonical bytes for current-MX A16/A17. */
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable(&hdr, mk_scn(10)), 1);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
+					 &hdr, mk_scn(10), false), 1);
+	UT_ASSERT_EQ((int)cluster_undo_segment_recyclable_for_mode(
+					 &hdr, mk_scn(10), true), 0);
 }
 
 UT_TEST(test_u5_segment_committed_invalid_commit_scn_retained)
@@ -480,6 +500,7 @@ main(void)
 	UT_RUN(test_u5_segment_committed_watermark_below_horizon);
 	UT_RUN(test_u5_segment_committed_watermark_at_or_above_horizon);
 	UT_RUN(test_u5_segment_committed_no_committed_slot_recyclable);
+	UT_RUN(test_u5_peer_mode_segment_with_aborted_slot_retained);
 	UT_RUN(test_u5_segment_committed_invalid_commit_scn_retained);
 	UT_RUN(test_u8_segment_invalid_horizon_recyclable);
 	UT_RUN(test_u10_segment_non_committed_state_never_recyclable);

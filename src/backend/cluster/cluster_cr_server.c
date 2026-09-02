@@ -3062,10 +3062,10 @@ lms_undo_multi_verdict_serve(ClusterLmsCrSlot *slot)
 	slot->undo_auth.authority_scn = cluster_scn_current();
 
 	nmembers = GetMultiXactIdMembers(mxid, &members, false, false);
-	if (nmembers < 2 || members == NULL) {
+	if (nmembers < 1 || members == NULL) {
 		if (members != NULL)
 			pfree(members);
-		return false; /* < 2 members: not a real multi / unreadable set */
+		return false; /* empty/unreadable descriptor */
 	}
 	if (nmembers > CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS) {
 		pfree(members);
@@ -3467,7 +3467,7 @@ cr_current_mx_build_describe_page(
 		page->header.total_count = (uint32)native_count;
 		return CMX_DESC_SUPPORTED_LIMIT;
 	}
-	if (native_members == NULL || native_count < 2)
+	if (native_members == NULL || native_count < 1)
 		return CMX_DESC_DENIED;
 
 	for (i = 0; i < native_count; i++) {
@@ -3505,7 +3505,8 @@ cr_current_mx_build_describe_page(
 ClusterMxResolveResult
 cluster_cr_server_current_mx_build_proof_page(
 	uint16 source_node_id, const ClusterCurrentMxProofForwardV2 *request,
-	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	ClusterMxResolveResult result, uint32 requester_capability_generation,
+	const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	ClusterCurrentMxProofReplyPage *page)
 {
@@ -3537,10 +3538,13 @@ cluster_cr_server_current_mx_build_proof_page(
 	if (result == CMX_RESOLVE_TIMEOUT || result > CMX_RESOLVE_UNKNOWN)
 		return CMX_RESOLVE_UNKNOWN;
 	if (result != CMX_RESOLVE_OK) {
+		if (requester_capability_generation != 0)
+			return CMX_RESOLVE_UNKNOWN;
 		page->header.result = (uint8)result;
 		return result;
 	}
-	if (proofs == NULL || proof_count != request->prefix.entry_count)
+	if (requester_capability_generation == 0 || proofs == NULL
+		|| proof_count != request->prefix.entry_count)
 		return CMX_RESOLVE_UNKNOWN;
 
 	switch ((ClusterCurrentMxProofBodyKind)request->prefix.body_kind) {
@@ -3564,6 +3568,8 @@ cluster_cr_server_current_mx_build_proof_page(
 	}
 
 	page->header.entry_count = proof_count;
+	page->header.requester_capability_generation
+		= requester_capability_generation;
 	page->header.wire_length = (uint16)wire_length;
 	page->header.result = (uint8)CMX_RESOLVE_OK;
 	return CMX_RESOLVE_OK;
@@ -3583,12 +3589,14 @@ cluster_cr_server_test_current_mx_build_describe_page(
 ClusterMxResolveResult
 cluster_cr_server_test_current_mx_build_proof_page(
 	uint16 source_node_id, const ClusterCurrentMxProofForwardV2 *request,
-	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	ClusterMxResolveResult result, uint32 requester_capability_generation,
+	const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	ClusterCurrentMxProofReplyPage *page)
 {
 	return cluster_cr_server_current_mx_build_proof_page(
-		source_node_id, request, result, proofs, proof_count,
+		source_node_id, request, result, requester_capability_generation,
+		proofs, proof_count,
 		updater_proof, page);
 }
 #endif
@@ -3755,12 +3763,12 @@ cluster_gcs_current_mx_member_proof_serve_inline(
 			&& !cluster_write_fence_allowed()))
 		proof_result = CMX_RESOLVE_DENIED;
 	if (cluster_cr_server_current_mx_build_proof_page(
-			(uint16)cluster_node_id, &request, proof_result, NULL,
+			(uint16)cluster_node_id, &request, proof_result, 0, NULL,
 			0, NULL, page)
 		!= proof_result) {
 		proof_result = CMX_RESOLVE_UNKNOWN;
 		(void)cluster_cr_server_current_mx_build_proof_page(
-			(uint16)cluster_node_id, &request, proof_result, NULL, 0,
+			(uint16)cluster_node_id, &request, proof_result, 0, NULL, 0,
 			NULL, page);
 	}
 

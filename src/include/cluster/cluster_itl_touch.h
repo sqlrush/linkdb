@@ -63,6 +63,7 @@
 #include "cluster/cluster_buffer_desc.h" /* PCM_STATE_N / PCM_STATE_X */
 #include "cluster/cluster_itl_slot.h" /* CLUSTER_ITL_INITRANS_DEFAULT (spec-3.4c D14) */
 #include "cluster/cluster_scn.h"	  /* SCN */
+#include "cluster/cluster_terminal_ref_census.h"
 
 /*
  * ClusterItlTouchHandle -- 24-byte fixed handle (HC: layout MUST stay
@@ -121,6 +122,7 @@ typedef struct ClusterItlTerminalProof {
 	int32 buffer_id;
 	uint64 own_generation;
 	uint64 acquisition_epoch;
+	UBA undo_segment_head;
 	uint16 slot_wrap;
 	uint8 slot_class;
 	uint8 pcm_state;
@@ -169,10 +171,14 @@ cluster_itl_terminal_proof_owner_exact(const ClusterItlTerminalProof *proof,
 static inline bool
 cluster_itl_terminal_proof_slot_exact(const ClusterItlTerminalProof *proof,
 									  TransactionId xid, uint16 slot_wrap,
-									  uint8 slot_class)
+									  uint8 slot_class,
+									  const UBA *undo_segment_head)
 {
 	return proof != NULL && proof->valid && xid == proof->xid
-		&& slot_wrap == proof->slot_wrap && slot_class == proof->slot_class;
+		&& slot_wrap == proof->slot_wrap && slot_class == proof->slot_class
+		&& undo_segment_head != NULL
+		&& undo_segment_head->raw[0] == proof->undo_segment_head.raw[0]
+		&& undo_segment_head->raw[1] == proof->undo_segment_head.raw[1];
 }
 
 /*
@@ -183,6 +189,7 @@ cluster_itl_terminal_proof_slot_exact(const ClusterItlTerminalProof *proof,
 typedef struct ClusterItlTouchRecord {
 	ClusterItlTouchHandle key; /* frozen 24-byte public value */
 	ClusterItlTerminalProof proof;
+	ClusterCtrcReceiptHandle ctrc_handle;
 } ClusterItlTouchRecord;
 
 /*
@@ -229,6 +236,13 @@ extern void cluster_itl_touch_register(const ClusterItlTouchHandle *handle);
  */
 extern void cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle, Buffer buffer,
 											 TransactionId xid);
+
+/* Receipt-bearing twin for an ordinary heap path that already crossed exact
+ * APPLY.  The receipt handle is copied only into the private touch record;
+ * ClusterItlTouchHandle remains the frozen 24-byte public ABI. */
+extern void cluster_itl_touch_register_exact_ctrc(
+	const ClusterItlTouchHandle *handle, Buffer buffer, TransactionId xid,
+	const ClusterCtrcReceiptHandle *ctrc_handle);
 
 /*
  * spec-3.5 hardening: subxact range ownership for touched ITL slots.

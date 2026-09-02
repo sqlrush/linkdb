@@ -893,12 +893,12 @@ UT_TEST(test_undo_multi_verdict_page_usable)
 	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
 	v->status = (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED;
 
-	/* nmembers bounds: < 2 refused (a real multi has >= 2 members; the origin
-	 * ships NO_MEMBERS for < 2), MAX ok (below), MAX+1 refused. */
+	/* One-member current-MX descriptors are real immutable MXIDs; only zero
+	 * members is malformed.  MAX remains valid and MAX+1 is refused. */
 	v->nmembers = 0;
 	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
 	v->nmembers = 1;
-	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
+	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), true);
 	v->nmembers = CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS + 1;
 	UT_ASSERT_EQ(cluster_vis_undo_multi_verdict_page_usable(v, asked), false);
 	v->nmembers = 2;

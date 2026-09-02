@@ -32,6 +32,7 @@
 #include "cluster/cluster_undo_record.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
@@ -244,6 +245,90 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node pg_attribute_unuse
 {
 	test_by_xid_scan_calls++;
 	return CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE;
+}
+
+ClusterTTDurableLocate
+cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
+	TransactionId xid, uint16 *out_seg, uint16 *out_slot,
+	uint16 *out_wrap, uint8 *out_status)
+{
+	UT_ASSERT_EQ(origin_node, 0);
+	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
+	UT_ASSERT_NOT_NULL(out_seg);
+	UT_ASSERT_NOT_NULL(out_slot);
+	UT_ASSERT_NOT_NULL(out_wrap);
+	*out_seg = TEST_TT_SEGMENT;
+	*out_slot = TEST_TT_OFFSET;
+	*out_wrap = TEST_ORIGIN_WRAP;
+	if (out_status != NULL)
+		*out_status = test_tt_slot.status;
+	return CLUSTER_TT_DURABLE_LOCATE_FOUND;
+}
+
+int
+cluster_xid_origin_slot(TransactionId xid)
+{
+	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
+	return 0;
+}
+
+uint64
+GetSystemIdentifier(void)
+{
+	return UINT64_C(0x1122334455667788);
+}
+
+uint64
+cluster_qvotec_get_self_incarnation(void)
+{
+	return UINT64_C(9001);
+}
+
+bool
+cluster_reconfig_get_observed_slot(int32 node_id pg_attribute_unused(),
+	uint64 *incarnation, uint64 *generation)
+{
+	if (incarnation != NULL)
+		*incarnation = 0;
+	if (generation != NULL)
+		*generation = 0;
+	return false;
+}
+
+uint64
+cluster_reconfig_get_observed_epoch(int32 node_id pg_attribute_unused())
+{
+	return 0;
+}
+
+uint64
+cluster_membership_get_last_admitted_incarnation(
+	int32 node_id pg_attribute_unused())
+{
+	return 0;
+}
+
+ClusterSemanticAdmissionResult
+cluster_semantic_activation_enter(uint64 feature_bit,
+	ClusterSemanticAdmissionSide side, ClusterSemanticAdmissionToken *token)
+{
+	UT_ASSERT_NOT_NULL(token);
+	UT_ASSERT_EQ(feature_bit, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	UT_ASSERT_EQ(side, CLUSTER_SEMANTIC_TARGET_SIDE);
+	memset(token, 0, sizeof(*token));
+	token->feature_bit = feature_bit;
+	token->record_generation = 77;
+	token->formation_epoch = test_formation_epoch;
+	token->side = side;
+	token->entered = true;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+void
+cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
+{
+	UT_ASSERT_NOT_NULL(token);
+	token->entered = false;
 }
 
 XidStatus
@@ -778,7 +863,8 @@ extern bool cluster_runtime_visibility_current_owner_sample_held(
 	const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
+	bool *ctrc_physical_active_out);
 
 static void
 run_pair(unsigned int pair)
@@ -876,7 +962,7 @@ UT_TEST(test_current_member_target_canonical_active_requires_exact_physical_slot
 
 	UT_ASSERT(cluster_runtime_visibility_current_owner_sample_held(
 		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
-		&key, &result));
+		&key, &result, NULL));
 	UT_ASSERT_EQ(key.origin_node_id, (uint16)cluster_node_id);
 	UT_ASSERT_EQ(key.undo_segment_id, (uint16)TEST_TT_SEGMENT);
 	UT_ASSERT_EQ(key.tt_slot_id,
@@ -897,7 +983,7 @@ UT_TEST(test_current_member_target_canonical_active_requires_exact_physical_slot
 	memset(&result, 0xa5, sizeof(result));
 	UT_ASSERT(!cluster_runtime_visibility_current_owner_sample_held(
 		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
-		&key, &result));
+		&key, &result, NULL));
 	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
 	UT_ASSERT(!result.authoritative);
 
@@ -907,14 +993,102 @@ UT_TEST(test_current_member_target_canonical_active_requires_exact_physical_slot
 	test_tt_slot.wrap++;
 	UT_ASSERT(!cluster_runtime_visibility_current_owner_sample_held(
 		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
-		&key, &result));
+		&key, &result, NULL));
 	test_tt_slot.wrap = TEST_ORIGIN_WRAP;
 	/* The shared fixture mutates on its third owner sample. */
 	test_current_owner_calls = 2;
 	test_current_owner_drift_on_recheck = true;
 	UT_ASSERT(!cluster_runtime_visibility_current_owner_sample_held(
 		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
-		&key, &result));
+		&key, &result, NULL));
+}
+
+/* MXA-T19 x MXA-T20: the visibility bracket deliberately keeps a physical
+ * COMMITTED/native-live predecessor conservative.  That result is not the
+ * exact physical ACTIVE sample required to issue a CTRC grant. */
+UT_TEST(test_ctrc_physical_active_sample_excludes_precommit_committed_window)
+{
+	ClusterSemanticAdmissionToken admission;
+	ClusterUndoBlock0CurrentGuard guard;
+	ClusterUndoBlock0ResolvedRoot root;
+	ClusterTTStatusKey key;
+	ClusterTTStatusResult result;
+	bool physical_active = true;
+
+	reset_exact_origin_fixture();
+	test_native_status = TRANSACTION_STATUS_IN_PROGRESS;
+	test_twophase_xid = TEST_ORIGIN_XID;
+	test_current_owner_available = true;
+	memset(&admission, 0, sizeof(admission));
+	admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	admission.record_generation = 5;
+	admission.formation_epoch = test_formation_epoch;
+	admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	admission.entered = true;
+	memset(&guard, 0, sizeof(guard));
+	memset(&root, 0, sizeof(root));
+	root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+	root.root_id = 92;
+	root.root_generation = 7;
+
+	UT_ASSERT(cluster_runtime_visibility_current_owner_sample_held(
+		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
+		&key, &result, &physical_active));
+	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_IN_PROGRESS);
+	UT_ASSERT_EQ(result.commit_scn, InvalidScn);
+	UT_ASSERT(!physical_active);
+
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_current_owner_calls = 0;
+	UT_ASSERT(cluster_runtime_visibility_current_owner_sample_held(
+		TEST_ORIGIN_XID, &test_current_owner, &admission, &guard, &root,
+		&key, &result, &physical_active));
+	UT_ASSERT(physical_active);
+}
+
+UT_TEST(test_current_mx_active_proof_reconstructs_exact_ctrc_identity)
+{
+	ClusterTTStatusKey proof_key;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	ClusterCtrcParticipantIdentity participant;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	memset(&proof_key, 0, sizeof(proof_key));
+	proof_key.origin_node_id = 0;
+	proof_key.undo_segment_id = TEST_TT_SEGMENT;
+	proof_key.tt_slot_id = cluster_tt_slot_offset_to_id(TEST_TT_OFFSET);
+	proof_key.cluster_epoch = (uint32)test_formation_epoch;
+	proof_key.local_xid = TEST_ORIGIN_XID;
+	memset(&ctrc_key, 0xa5, sizeof(ctrc_key));
+	memset(&participant, 0xa5, sizeof(participant));
+
+	UT_ASSERT(cluster_runtime_visibility_active_proof_ctrc_identity_exact(
+		&proof_key, 17, 313, &ctrc_key, &participant));
+	UT_ASSERT_EQ(ctrc_key.format_version, CLUSTER_CTRC_FORMAT_VERSION);
+	UT_ASSERT_EQ(ctrc_key.origin_node_id, 0);
+	UT_ASSERT_EQ(ctrc_key.owner_instance, 1);
+	UT_ASSERT_EQ(ctrc_key.segment_id, TEST_TT_SEGMENT);
+	UT_ASSERT_EQ(ctrc_key.segment_generation, 23);
+	UT_ASSERT_EQ(ctrc_key.slot_offset, TEST_TT_OFFSET);
+	UT_ASSERT_EQ(ctrc_key.slot_wrap, TEST_ORIGIN_WRAP);
+	UT_ASSERT_EQ(ctrc_key.xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(ctrc_key.cluster_epoch, test_formation_epoch);
+	UT_ASSERT_EQ(participant.node_id, 0);
+	UT_ASSERT(participant.boot_incarnation != 0);
+	UT_ASSERT_EQ(participant.capability_record_generation, (uint32)313);
+	UT_ASSERT_EQ(participant.formation_epoch, test_formation_epoch);
+	UT_ASSERT_EQ(participant.admission_record_generation, (uint64)77);
+	UT_ASSERT_EQ(participant.admission_record_generation,
+		ctrc_key.admission_record_generation);
+
+	memset(&ctrc_key, 0xa5, sizeof(ctrc_key));
+	memset(&participant, 0xa5, sizeof(participant));
+	UT_ASSERT(!cluster_runtime_visibility_active_proof_ctrc_identity_exact(
+		&proof_key, 17, 0, &ctrc_key, &participant));
+	UT_ASSERT_EQ(participant.capability_record_generation, (uint32)0);
 }
 
 UT_TEST(test_current_member_rolled_terminal_uses_locator_then_canonical_scur)
@@ -952,7 +1126,7 @@ UT_TEST(test_current_member_rolled_terminal_uses_locator_then_canonical_scur)
 	locator.wrap = TEST_ORIGIN_WRAP;
 
 	UT_ASSERT(cluster_runtime_visibility_physical_locator_sample_held(
-		&locator, &admission, &guard, &root, &key, &result));
+		&locator, &admission, &guard, &root, &key, &result, NULL));
 	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_ABORTED);
 	UT_ASSERT(result.authoritative);
 	UT_ASSERT_EQ(key.undo_segment_id, (uint16)TEST_TT_SEGMENT);
@@ -965,18 +1139,18 @@ UT_TEST(test_current_member_rolled_terminal_uses_locator_then_canonical_scur)
 	 * and allocator rollover drift remain UNKNOWN. */
 	test_candidate_copy_physical_slot = false;
 	UT_ASSERT(!cluster_runtime_visibility_physical_locator_sample_held(
-		&locator, &admission, &guard, &root, &key, &result));
+		&locator, &admission, &guard, &root, &key, &result, NULL));
 	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
 	UT_ASSERT(!result.authoritative);
 	test_candidate_copy_physical_slot = true;
 	test_tt_slot.xid++;
 	UT_ASSERT(!cluster_runtime_visibility_physical_locator_sample_held(
-		&locator, &admission, &guard, &root, &key, &result));
+		&locator, &admission, &guard, &root, &key, &result, NULL));
 	test_tt_slot.xid = TEST_ORIGIN_XID;
 	test_current_segment_calls = 0;
 	test_current_segment_drift_on_recheck = true;
 	UT_ASSERT(!cluster_runtime_visibility_physical_locator_sample_held(
-		&locator, &admission, &guard, &root, &key, &result));
+		&locator, &admission, &guard, &root, &key, &result, NULL));
 }
 
 UT_TEST(test_current_member_terminal_on_current_segment_survives_retired_owner_index)
@@ -1016,7 +1190,7 @@ UT_TEST(test_current_member_terminal_on_current_segment_survives_retired_owner_i
 	/* A terminal canonical slot remains authoritative after its allocator
 	 * owner entry retires, even while the allocator still uses the segment. */
 	UT_ASSERT(cluster_runtime_visibility_physical_locator_sample_held(
-		&locator, &admission, &guard, &root, &key, &result));
+		&locator, &admission, &guard, &root, &key, &result, NULL));
 	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_COMMITTED);
 	UT_ASSERT_EQ(result.commit_scn, test_commit_scn);
 	UT_ASSERT(result.authoritative);
@@ -1061,7 +1235,7 @@ UT_TEST(test_current_member_active_on_current_segment_requires_live_owner_index)
 	locator.wrap = TEST_ORIGIN_WRAP;
 
 	UT_ASSERT(!cluster_runtime_visibility_physical_locator_sample_held(
-		&locator, &admission, &guard, &root, &key, &result));
+		&locator, &admission, &guard, &root, &key, &result, NULL));
 	UT_ASSERT_EQ(result.status, CLUSTER_TT_STATUS_UNKNOWN);
 	UT_ASSERT(!result.authoritative);
 }
@@ -2534,7 +2708,7 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 int
 main(void)
 {
-	UT_PLAN(88);
+	UT_PLAN(90);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -2577,6 +2751,8 @@ main(void)
 	RUN_PAIR_TEST(39);
 	UT_RUN(test_out_of_domain_values_fail_closed);
 	UT_RUN(test_current_member_target_canonical_active_requires_exact_physical_slot);
+	UT_RUN(test_ctrc_physical_active_sample_excludes_precommit_committed_window);
+	UT_RUN(test_current_mx_active_proof_reconstructs_exact_ctrc_identity);
 	UT_RUN(test_current_member_rolled_terminal_uses_locator_then_canonical_scur);
 	UT_RUN(test_current_member_terminal_on_current_segment_survives_retired_owner_index);
 	UT_RUN(test_current_member_active_on_current_segment_requires_live_owner_index);

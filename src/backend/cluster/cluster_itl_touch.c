@@ -51,12 +51,14 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h" /* GenericXLog delta WAL (spec-3.4a D8) */
+#include "access/xlog.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_gcs_block.h" /* exact-proof stamp acquire */
 #include "cluster/cluster_guc.h"	   /* cluster_enabled */
 #include "cluster/cluster_itl.h"	   /* stamp_committed / stamp_aborted */
 #include "cluster/cluster_itl_touch.h"
 #include "cluster/cluster_mode.h"		 /* cluster_storage_mode_enabled */
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_xnode_lever.h" /* stamp-skip counter */
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
@@ -93,7 +95,9 @@ itl_touch_handle_matches(const ClusterItlTouchHandle *left, const ClusterItlTouc
  * applied its dedupe policy.
  */
 static void
-itl_touch_append(const ClusterItlTouchHandle *handle, const ClusterItlTerminalProof *proof)
+itl_touch_append(const ClusterItlTouchHandle *handle,
+				 const ClusterItlTerminalProof *proof,
+				 const ClusterCtrcReceiptHandle *ctrc_handle)
 {
 	if (touch_list == NULL) {
 		MemoryContext oldcxt;
@@ -115,6 +119,10 @@ itl_touch_append(const ClusterItlTouchHandle *handle, const ClusterItlTerminalPr
 
 	touch_list[touch_count].key = *handle;
 	touch_list[touch_count].proof = *proof;
+	MemSet(&touch_list[touch_count].ctrc_handle, 0,
+		   sizeof(touch_list[touch_count].ctrc_handle));
+	if (ctrc_handle != NULL && ctrc_handle->valid)
+		touch_list[touch_count].ctrc_handle = *ctrc_handle;
 	touch_count++;
 }
 
@@ -141,7 +149,7 @@ cluster_itl_touch_register(const ClusterItlTouchHandle *handle)
 	}
 
 	memset(&proof, 0, sizeof(proof));
-	itl_touch_append(handle, &proof);
+	itl_touch_append(handle, &proof, NULL);
 }
 
 /*
@@ -189,6 +197,7 @@ itl_touch_capture_proof(const ClusterItlTouchHandle *handle, Buffer buffer, Tran
 	 */
 	proof->xid = xid;
 	proof->buffer_id = buffer - 1;
+	proof->undo_segment_head = slot->undo_segment_head;
 	proof->slot_wrap = slot->wrap;
 	proof->slot_class = slot->flags;
 
@@ -203,9 +212,10 @@ itl_touch_capture_proof(const ClusterItlTouchHandle *handle, Buffer buffer, Tran
 	proof->valid = true;
 }
 
-void
-cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle, Buffer buffer,
-								 TransactionId xid)
+static void
+itl_touch_register_exact_internal(const ClusterItlTouchHandle *handle,
+								  Buffer buffer, TransactionId xid,
+								  const ClusterCtrcReceiptHandle *ctrc_handle)
 {
 	ClusterItlTerminalProof proof;
 	uint32 range_start = 0;
@@ -241,8 +251,13 @@ cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle, Buffer buf
 		 * moved on.
 		 */
 		existing->key.flags |= (handle->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL);
+		MemSet(&existing->ctrc_handle, 0, sizeof(existing->ctrc_handle));
 		if (proof.valid)
+		{
 			existing->proof = proof;
+			if (ctrc_handle != NULL && ctrc_handle->valid)
+				existing->ctrc_handle = *ctrc_handle;
+		}
 		else
 			existing->proof.valid = false;
 		return;
@@ -257,7 +272,22 @@ cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle, Buffer buf
 	if (!proof.valid)
 		return;
 
-	itl_touch_append(handle, &proof);
+	itl_touch_append(handle, &proof, ctrc_handle);
+}
+
+void
+cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle,
+								 Buffer buffer, TransactionId xid)
+{
+	itl_touch_register_exact_internal(handle, buffer, xid, NULL);
+}
+
+void
+cluster_itl_touch_register_exact_ctrc(
+	const ClusterItlTouchHandle *handle, Buffer buffer, TransactionId xid,
+	const ClusterCtrcReceiptHandle *ctrc_handle)
+{
+	itl_touch_register_exact_internal(handle, buffer, xid, ctrc_handle);
 }
 
 void
@@ -542,6 +572,35 @@ typedef struct ItlFinishBatchCtx {
 	bool needs_wal;
 } ItlFinishBatchCtx;
 
+typedef struct ItlFinishDischarge {
+	uint32 record_index;
+	uint8 dependency_index;
+} ItlFinishDischarge;
+
+#define CLUSTER_ITL_FINISH_MAX_DISCHARGES \
+	(MAX_GENERIC_XLOG_PAGES * CLUSTER_ITL_INITRANS_DEFAULT * 2)
+
+static void
+itl_finish_expected_target(const ClusterItlTouchRecord *record,
+						   ClusterCtrcItlTargetIdentity *expected)
+{
+	MemSet(expected, 0, sizeof(*expected));
+	expected->spc_oid = record->key.rloc.spcOid;
+	expected->db_oid = record->key.rloc.dbOid;
+	expected->rel_number = record->key.rloc.relNumber;
+	expected->fork_number = record->key.forknum;
+	expected->block_number = record->key.block;
+	expected->itl_xid = record->proof.xid;
+	expected->itl_slot_index = record->key.slot_idx;
+	expected->itl_slot_wrap = record->proof.slot_wrap;
+	expected->itl_class
+		= record->proof.slot_class == ITL_FLAG_LOCK_ONLY_ACTIVE ? 2 : 1;
+	expected->needs_wal
+		= (record->key.flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL) != 0;
+	memcpy(expected->uba, &record->proof.undo_segment_head,
+		   sizeof(record->proof.undo_segment_head));
+}
+
 /*
  * Flush one batch of same-WAL-requirement page runs as a single generic
  * WAL record.
@@ -560,6 +619,10 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 {
 	GenericXLogState *state;
 	Buffer bufs[MAX_GENERIC_XLOG_PAGES];
+	ClusterSfDepVec dependency_vecs[MAX_GENERIC_XLOG_PAGES];
+	ItlFinishDischarge discharges[CLUSTER_ITL_FINISH_MAX_DISCHARGES];
+	XLogRecPtr batch_lsn = InvalidXLogRecPtr;
+	uint32 ndischarges = 0;
 	uint8 nbufs = 0;
 	uint8 p;
 
@@ -621,7 +684,11 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 			if (ok) {
 				slot = &ClusterPageGetItlSlots(live_page)[record->key.slot_idx];
 				ok = slot->xid == record->proof.xid && slot->wrap == record->proof.slot_wrap
-					 && slot->flags == record->proof.slot_class;
+					 && slot->flags == record->proof.slot_class
+					 && slot->undo_segment_head.raw[0]
+						== record->proof.undo_segment_head.raw[0]
+					 && slot->undo_segment_head.raw[1]
+						== record->proof.undo_segment_head.raw[1];
 			}
 			stampable[r] = ok;
 			if (ok)
@@ -645,12 +712,28 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 			continue;
 		}
 
+		cluster_sf_dep_vec_reset(&dependency_vecs[p]);
+		(void)cluster_sf_dep_vec_for_ship(buf, &dependency_vecs[p]);
 		image = GenericXLogRegisterBuffer(state, buf, 0);
 		for (r = 0; r < run->count && r < lengthof(stampable); r++) {
 			const ClusterItlTouchRecord *record = &touch_list[run->first + r];
 
-			if (stampable[r])
+			if (stampable[r]) {
 				itl_finish_stamp_page(image, (uint8)record->key.slot_idx, &bctx->finish);
+				/* A data COMMIT intentionally remains NEEDS_CLEANOUT/APPLIED.
+				 * Abort and lock-only commit are terminal independently of the
+				 * later transaction-status publication and may discharge once
+				 * this page WAL and its dependency vector are durable. */
+				if (record->ctrc_handle.valid
+					&& (!bctx->finish.is_commit
+						|| record->proof.slot_class
+							== ITL_FLAG_LOCK_ONLY_ACTIVE)
+					&& ndischarges < lengthof(discharges)) {
+					discharges[ndischarges].record_index = run->first + r;
+					discharges[ndischarges].dependency_index = p;
+					ndischarges++;
+				}
+			}
 		}
 
 		bufs[nbufs] = buf;
@@ -661,10 +744,47 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 	if (nbufs == 0)
 		GenericXLogAbort(state);
 	else
-		GenericXLogFinish(state);
+		batch_lsn = GenericXLogFinish(state);
 
 	for (p = 0; p < nbufs; p++)
 		cluster_bufmgr_unlock_resident_stamp(bufs[p]);
+
+	/* Never wait for WAL or sample remote durability while holding a heap
+	 * content lock.  A missing local WAL position simply retains every
+	 * logged receipt; no state is weakened to manufacture cleanup. */
+	if (ndischarges > 0
+		&& (!bctx->needs_wal || !XLogRecPtrIsInvalid(batch_lsn))) {
+		XLogRecPtr local_flush_lsn;
+		uint32 d;
+
+		if (bctx->needs_wal)
+			XLogFlush(batch_lsn);
+		local_flush_lsn = GetFlushRecPtr(NULL);
+		for (d = 0; d < ndischarges; d++) {
+			const ItlFinishDischarge *pending = &discharges[d];
+			const ClusterItlTouchRecord *record
+				= &touch_list[pending->record_index];
+			ClusterCtrcItlTargetIdentity expected;
+			ClusterCtrcDurability durability;
+			int origin;
+
+			MemSet(&durability, 0, sizeof(durability));
+			durability.highest_local_lsn = batch_lsn;
+			durability.local_flush_lsn = local_flush_lsn;
+			memcpy(durability.required_lsn,
+				   dependency_vecs[pending->dependency_index].required,
+				   sizeof(durability.required_lsn));
+			for (origin = 0; origin < CLUSTER_SF_DEP_MAX_ORIGINS; origin++)
+				durability.durable_lsn[origin]
+					= origin == cluster_node_id
+					? local_flush_lsn
+					: cluster_sf_observed_origin_durable_lsn(origin);
+			itl_finish_expected_target(record, &expected);
+			(void)cluster_ctrc_receipt_discharge_itl_shared(
+				&record->ctrc_handle, &expected,
+				CTRC_ITL_TERMINAL_INDEPENDENT, &durability);
+		}
+	}
 
 	bctx->nruns = 0;
 }
@@ -817,6 +937,14 @@ void
 cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle pg_attribute_unused(),
 								 Buffer buffer pg_attribute_unused(),
 								 TransactionId xid pg_attribute_unused())
+{}
+
+void
+cluster_itl_touch_register_exact_ctrc(
+	const ClusterItlTouchHandle *handle pg_attribute_unused(),
+	Buffer buffer pg_attribute_unused(),
+	TransactionId xid pg_attribute_unused(),
+	const ClusterCtrcReceiptHandle *ctrc_handle pg_attribute_unused())
 {}
 
 void

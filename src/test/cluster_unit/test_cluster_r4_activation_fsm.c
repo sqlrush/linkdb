@@ -22,6 +22,7 @@
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 
@@ -120,6 +121,7 @@ static uint32 test_peer_capability_word;
 static uint32 test_peer_capability_generation;
 static int test_peer_capability_sample_calls[CLUSTER_MAX_NODES];
 static uint32 test_local_capability_word;
+static bool test_ctrc_shmem_is_ready = true;
 static ClusterICSendResult test_send_results[CLUSTER_MAX_NODES];
 static int test_send_calls[CLUSTER_MAX_NODES];
 static uint8 test_send_msg_types[CLUSTER_MAX_NODES];
@@ -316,6 +318,12 @@ bool
 cluster_wal_state_correctness_census_ok(void)
 {
 	return ut_r4fsm_census_ok;
+}
+
+bool
+cluster_ctrc_shmem_ready(void)
+{
+	return test_ctrc_shmem_is_ready;
 }
 
 /* RF-ROOT P7 (contract, step ②): the root activation stub — this binary
@@ -968,6 +976,7 @@ test_gate_reset(void)
 	memset(test_peer_capability_sample_calls, 0,
 		   sizeof(test_peer_capability_sample_calls));
 	test_local_capability_word = 0;
+	test_ctrc_shmem_is_ready = true;
 	memset(test_send_results, 0, sizeof(test_send_results));
 	memset(test_send_calls, 0, sizeof(test_send_calls));
 	memset(test_send_msg_types, 0, sizeof(test_send_msg_types));
@@ -2153,6 +2162,22 @@ UT_TEST(test_89h_pre_prepare_consumes_durable_admitted_not_ready_getter)
 	UT_ASSERT_EQ(refusal.feature_bit,
 				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
 	UT_ASSERT_EQ(refusal.expected_generation, 19);
+	test_gate_reset();
+}
+
+UT_TEST(test_89h1_pre_prepare_refuses_when_ctrc_storage_is_not_ready)
+{
+	ClusterSemanticActivationRefusal refusal;
+
+	test_gate_reset();
+	test_admitted_snapshot_valid = true;
+	test_admitted_snapshot_episode = valid_d13_admitted_episode();
+	test_admitted_snapshot_marker = valid_d13_admitted_marker();
+	test_ctrc_shmem_is_ready = false;
+	MemSet(&refusal, 0, sizeof(refusal));
+	UT_ASSERT_EQ(r4_pre_prepare_readiness(19, &refusal),
+				 CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
+	UT_ASSERT_EQ(refusal.result, CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED);
 	test_gate_reset();
 }
 
@@ -8244,7 +8269,7 @@ UT_TEST(test_145l_epoch_zero_resource_x_open_carrier_survives_unavailable_snapsh
 int
 main(void)
 {
-	UT_PLAN(228);
+	UT_PLAN(229);
 	UT_RUN(test_01_feature_bit_is_one);
 	UT_RUN(test_02_required_hello_caps_are_frozen);
 	UT_RUN(test_03_action_values_are_frozen);
@@ -8348,6 +8373,7 @@ main(void)
 	UT_RUN(test_89f_positive_ready_stays_deferred_until_full_d13_conjunction);
 	UT_RUN(test_89g_d13_current_coordinator_handoff_consumes_exact_admitted_basis);
 	UT_RUN(test_89h_pre_prepare_consumes_durable_admitted_not_ready_getter);
+	UT_RUN(test_89h1_pre_prepare_refuses_when_ctrc_storage_is_not_ready);
 	UT_RUN(test_89i_d13_invalidator_rescan_accepts_only_same_settled_closed_head);
 	UT_RUN(test_90_descriptor_uses_the_only_r4a_adapter);
 	UT_RUN(test_90aa_r4_logical_zero_requires_exact_closed_source_gate);

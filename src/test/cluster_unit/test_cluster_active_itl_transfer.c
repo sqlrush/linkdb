@@ -12,8 +12,10 @@
 #include "postgres.h"
 
 #include "access/generic_xlog.h"
+#include "access/xlog.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_itl_touch.h"
+#include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_xnode_lever.h"
 #include "storage/bufmgr.h"
@@ -50,6 +52,22 @@ static int test_generic_finish_calls;
 static int test_stamp_unlock_calls;
 static int test_stamp_skip_calls;
 static int test_generic_state_storage;
+static XLogRecPtr test_generic_finish_lsn;
+static XLogRecPtr test_local_flush_lsn;
+static ClusterSfDepVec test_dependency_vec;
+static XLogRecPtr test_origin_durable[CLUSTER_SF_DEP_MAX_ORIGINS];
+static int test_event_sequence;
+static int test_generic_finish_sequence;
+static int test_stamp_unlock_sequence;
+static int test_xlog_flush_sequence;
+static int test_discharge_sequence;
+static int test_discharge_calls;
+static ClusterCtrcItlProjection test_discharge_projection;
+static ClusterCtrcItlTargetIdentity test_discharge_target;
+static ClusterCtrcDurability test_discharge_durability;
+static ClusterCtrcReceipt *test_discharged_receipt;
+static ClusterCtrcParticipantEntry test_ctrc_participant;
+static ClusterCtrcReceipt test_ctrc_receipts[2];
 
 int NBuffers = 1;
 int NLocBuffer = 0;
@@ -140,6 +158,7 @@ cluster_bufmgr_unlock_resident_stamp(Buffer buffer)
 {
 	UT_ASSERT_EQ(buffer, 1);
 	test_stamp_unlock_calls++;
+	test_stamp_unlock_sequence = ++test_event_sequence;
 }
 
 void
@@ -168,7 +187,8 @@ GenericXLogFinish(GenericXLogState *state)
 {
 	UT_ASSERT(state == (GenericXLogState *)&test_generic_state_storage);
 	test_generic_finish_calls++;
-	return InvalidXLogRecPtr;
+	test_generic_finish_sequence = ++test_event_sequence;
+	return test_generic_finish_lsn;
 }
 
 void
@@ -176,6 +196,55 @@ GenericXLogAbort(GenericXLogState *state)
 {
 	UT_ASSERT(state == (GenericXLogState *)&test_generic_state_storage);
 	test_generic_abort_calls++;
+}
+
+void
+XLogFlush(XLogRecPtr record)
+{
+	test_xlog_flush_sequence = ++test_event_sequence;
+	if (record > test_local_flush_lsn)
+		test_local_flush_lsn = record;
+}
+
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *insert_tli pg_attribute_unused())
+{
+	return test_local_flush_lsn;
+}
+
+bool
+cluster_sf_dep_vec_for_ship(Buffer buffer, ClusterSfDepVec *out_vec)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	UT_ASSERT(out_vec != NULL);
+	*out_vec = test_dependency_vec;
+	return !cluster_sf_dep_vec_is_empty(out_vec);
+}
+
+XLogRecPtr
+cluster_sf_observed_origin_durable_lsn(int32 origin)
+{
+	UT_ASSERT(origin >= 0 && origin < CLUSTER_SF_DEP_MAX_ORIGINS);
+	return test_origin_durable[origin];
+}
+
+ClusterCtrcDischargeResult
+cluster_ctrc_receipt_discharge_itl_shared(
+	const ClusterCtrcReceiptHandle *handle,
+	const ClusterCtrcItlTargetIdentity *expected_target,
+	ClusterCtrcItlProjection projection,
+	const ClusterCtrcDurability *durability)
+{
+	UT_ASSERT(handle != NULL && handle->valid);
+	UT_ASSERT(expected_target != NULL);
+	UT_ASSERT(durability != NULL);
+	test_discharge_calls++;
+	test_discharge_sequence = ++test_event_sequence;
+	test_discharge_projection = projection;
+	test_discharge_target = *expected_target;
+	test_discharge_durability = *durability;
+	test_discharged_receipt = handle->receipt;
+	return CLUSTER_CTRC_DISCHARGE_CLEANED;
 }
 
 static ClusterItlSlotData *
@@ -215,6 +284,22 @@ reset_registration_fixture(TransactionId xid)
 	test_generic_finish_calls = 0;
 	test_stamp_unlock_calls = 0;
 	test_stamp_skip_calls = 0;
+	test_generic_finish_lsn = InvalidXLogRecPtr;
+	test_local_flush_lsn = InvalidXLogRecPtr;
+	cluster_sf_dep_vec_reset(&test_dependency_vec);
+	MemSet(test_origin_durable, 0, sizeof(test_origin_durable));
+	test_event_sequence = 0;
+	test_generic_finish_sequence = 0;
+	test_stamp_unlock_sequence = 0;
+	test_xlog_flush_sequence = 0;
+	test_discharge_sequence = 0;
+	test_discharge_calls = 0;
+	test_discharge_projection = CTRC_ITL_HINT_SKIPPED;
+	MemSet(&test_discharge_target, 0, sizeof(test_discharge_target));
+	MemSet(&test_discharge_durability, 0, sizeof(test_discharge_durability));
+	test_discharged_receipt = NULL;
+	MemSet(&test_ctrc_participant, 0, sizeof(test_ctrc_participant));
+	MemSet(test_ctrc_receipts, 0, sizeof(test_ctrc_receipts));
 	return slot;
 }
 
@@ -233,6 +318,43 @@ registration_handle(void)
 	return handle;
 }
 
+static ClusterCtrcReceiptHandle
+registration_ctrc_handle(int receipt_index, const ClusterItlTouchHandle *touch,
+						 const ClusterItlSlotData *slot)
+{
+	ClusterCtrcReceiptHandle handle;
+	ClusterCtrcReceipt *receipt;
+
+	UT_ASSERT(receipt_index >= 0 && receipt_index < (int)lengthof(test_ctrc_receipts));
+	UT_ASSERT(touch != NULL);
+	UT_ASSERT(slot != NULL);
+	receipt = &test_ctrc_receipts[receipt_index];
+	MemSet(&handle, 0, sizeof(handle));
+	handle.participant = &test_ctrc_participant;
+	handle.receipt = receipt;
+	handle.receipt_index = (uint64)receipt_index;
+	handle.journal_slot_generation = (uint64)receipt_index + 1;
+	handle.valid = true;
+	receipt->publication.reference_kind = CTRC_REF_HEAP_ITL_UBA;
+	receipt->publication.target_kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+	receipt->publication.journal_slot_generation = handle.journal_slot_generation;
+	receipt->target.kind = CTRC_TARGET_EXACT_ITL_SLOT;
+	receipt->target.spc_oid = touch->rloc.spcOid;
+	receipt->target.db_oid = touch->rloc.dbOid;
+	receipt->target.rel_number = touch->rloc.relNumber;
+	receipt->target.fork_number = touch->forknum;
+	receipt->target.block_number = touch->block;
+	receipt->target.itl_slot_index = touch->slot_idx;
+	receipt->target.itl_slot_wrap = slot->wrap;
+	receipt->target.itl_xid = slot->xid;
+	receipt->target.itl_class = slot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE ? 2 : 1;
+	receipt->target.needs_wal
+		= (touch->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL) != 0;
+	memcpy(receipt->target.uba, &slot->undo_segment_head,
+		   sizeof(slot->undo_segment_head));
+	return handle;
+}
+
 static ClusterItlTerminalProof
 valid_proof(void)
 {
@@ -245,6 +367,8 @@ valid_proof(void)
 	proof.acquisition_epoch = 17;
 	proof.slot_wrap = 3;
 	proof.slot_class = ITL_FLAG_ACTIVE;
+	proof.undo_segment_head.raw[0] = UINT64_C(0x1020304050607080);
+	proof.undo_segment_head.raw[1] = UINT64_C(0x90a0b0c0d0e0f000);
 	proof.pcm_state = PCM_STATE_X;
 	proof.valid = true;
 	return proof;
@@ -304,38 +428,178 @@ UT_TEST(u18_busy_owner_is_rejected)
 UT_TEST(u19_exact_slot_proof_matches)
 {
 	ClusterItlTerminalProof proof = valid_proof();
+	UBA uba = proof.undo_segment_head;
 
-	UT_ASSERT(cluster_itl_terminal_proof_slot_exact(&proof, 700, 3, ITL_FLAG_ACTIVE));
+	UT_ASSERT(cluster_itl_terminal_proof_slot_exact(&proof, 700, 3,
+		ITL_FLAG_ACTIVE, &uba));
 }
 
 UT_TEST(u20_slot_aba_or_class_change_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
+	UBA uba = proof.undo_segment_head;
 
-	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 701, 3, ITL_FLAG_ACTIVE));
-	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 4, ITL_FLAG_ACTIVE));
+	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 701, 3,
+		ITL_FLAG_ACTIVE, &uba));
+	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 4,
+		ITL_FLAG_ACTIVE, &uba));
 	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 3,
-											 ITL_FLAG_LOCK_ONLY_ACTIVE));
+		ITL_FLAG_LOCK_ONLY_ACTIVE, &uba));
+	uba.raw[1]++;
+	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 3,
+		ITL_FLAG_ACTIVE, &uba));
+}
+
+UT_TEST(u35_uba_drift_preserves_active_slot)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+	ClusterCtrcReceiptHandle ctrc;
+
+	slot->undo_segment_head.raw[0] = UINT64_C(0x1111222233334444);
+	slot->undo_segment_head.raw[1] = UINT64_C(0x5555666677778888);
+	ctrc = registration_ctrc_handle(0, &handle, slot);
+	test_capture_authority = true;
+	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc);
+	slot->undo_segment_head.raw[1]++;
+	cluster_itl_xact_abort_finish(xid);
+
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(test_generic_register_calls, 0);
+	UT_ASSERT_EQ(test_stamp_skip_calls, 1);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+}
+
+UT_TEST(u36_abort_discharge_waits_for_terminal_wal_and_dependency_frontier)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+	ClusterCtrcReceiptHandle ctrc;
+
+	touch.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+	slot->undo_segment_head.raw[0] = UINT64_C(0x1111222233334444);
+	slot->undo_segment_head.raw[1] = UINT64_C(0x5555666677778888);
+	ctrc = registration_ctrc_handle(0, &touch, slot);
+	test_capture_authority = true;
+	test_generic_finish_lsn = 300;
+	test_local_flush_lsn = 250;
+	test_dependency_vec.required[4] = 400;
+	test_origin_durable[4] = 400;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
+	cluster_itl_xact_abort_finish(xid);
+
+	UT_ASSERT_EQ(test_discharge_calls, 1);
+	UT_ASSERT_EQ(test_discharge_projection, CTRC_ITL_TERMINAL_INDEPENDENT);
+	UT_ASSERT(test_discharged_receipt == &test_ctrc_receipts[0]);
+	UT_ASSERT_EQ(test_discharge_target.itl_xid, xid);
+	UT_ASSERT_EQ(test_discharge_target.itl_slot_wrap, slot->wrap);
+	UT_ASSERT_EQ(test_discharge_target.itl_class, 1);
+	UT_ASSERT_EQ(test_discharge_target.uba[15],
+		((const uint8 *)&slot->undo_segment_head)[15]);
+	UT_ASSERT_EQ(test_discharge_durability.highest_local_lsn, 300);
+	UT_ASSERT_EQ(test_discharge_durability.local_flush_lsn, 300);
+	UT_ASSERT_EQ(test_discharge_durability.required_lsn[4], 400);
+	UT_ASSERT_EQ(test_discharge_durability.durable_lsn[4], 400);
+	UT_ASSERT(test_generic_finish_sequence > 0);
+	UT_ASSERT(test_stamp_unlock_sequence > test_generic_finish_sequence);
+	UT_ASSERT(test_xlog_flush_sequence > test_stamp_unlock_sequence);
+	UT_ASSERT(test_discharge_sequence > test_xlog_flush_sequence);
+}
+
+UT_TEST(u37_data_commit_retains_applied_receipt_for_lazy_cleanout)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+	ClusterCtrcReceiptHandle ctrc;
+
+	touch.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+	slot->undo_segment_head.raw[0] = 17;
+	ctrc = registration_ctrc_handle(0, &touch, slot);
+	test_capture_authority = true;
+	test_generic_finish_lsn = 300;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
+	cluster_itl_xact_precommit_finish(xid, 99);
+
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_NEEDS_CLEANOUT);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
+	UT_ASSERT_EQ(test_xlog_flush_sequence, 0);
+}
+
+UT_TEST(u38_lock_only_commit_discharges_terminal_independent_receipt)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+	ClusterCtrcReceiptHandle ctrc;
+
+	touch.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->undo_segment_head.raw[0] = 23;
+	ctrc = registration_ctrc_handle(0, &touch, slot);
+	test_capture_authority = true;
+	test_generic_finish_lsn = 500;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
+	cluster_itl_xact_precommit_finish(xid, 99);
+
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_COMMITTED);
+	UT_ASSERT_EQ(test_discharge_calls, 1);
+	UT_ASSERT_EQ(test_discharge_projection, CTRC_ITL_TERMINAL_INDEPENDENT);
+	UT_ASSERT_EQ(test_discharge_target.itl_class, 2);
+}
+
+UT_TEST(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle)
+{
+	ClusterItlTouchHandle touch = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+	ClusterCtrcReceiptHandle first;
+	ClusterCtrcReceiptHandle second;
+
+	slot->undo_segment_head.raw[0] = 31;
+	first = registration_ctrc_handle(0, &touch, slot);
+	test_capture_authority = true;
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &first);
+	slot->undo_segment_head.raw[0] = 32;
+	second = registration_ctrc_handle(1, &touch, slot);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &second);
+	UT_ASSERT_EQ(cluster_itl_touch_count(), 1);
+	cluster_itl_xact_abort_finish(xid);
+
+	UT_ASSERT_EQ(test_discharge_calls, 1);
+	UT_ASSERT(test_discharged_receipt == &test_ctrc_receipts[1]);
+	UT_ASSERT_EQ(test_discharge_target.uba[0],
+		((const uint8 *)&slot->undo_segment_head)[0]);
 }
 
 UT_TEST(u21_first_failed_capture_does_not_append)
 {
 	ClusterItlTouchHandle handle = registration_handle();
 	TransactionId xid = 700;
+	ClusterItlSlotData *slot;
+	ClusterCtrcReceiptHandle ctrc;
 
-	(void)reset_registration_fixture(xid);
-	cluster_itl_touch_register_exact(&handle, 1, xid);
+	slot = reset_registration_fixture(xid);
+	ctrc = registration_ctrc_handle(0, &handle, slot);
+	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc);
 	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
+	cluster_itl_xact_abort_finish(xid);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
 }
 
 UT_TEST(u22_failed_recapture_invalidates_one_existing_record)
 {
 	ClusterItlTouchHandle handle = registration_handle();
 	TransactionId xid = 700;
+	ClusterItlSlotData *slot;
+	ClusterCtrcReceiptHandle ctrc;
 
-	(void)reset_registration_fixture(xid);
+	slot = reset_registration_fixture(xid);
+	ctrc = registration_ctrc_handle(0, &handle, slot);
 	test_capture_authority = true;
-	cluster_itl_touch_register_exact(&handle, 1, xid);
+	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc);
 	UT_ASSERT_EQ(cluster_itl_touch_count(), 1);
 
 	test_capture_authority = false;
@@ -345,6 +609,7 @@ UT_TEST(u22_failed_recapture_invalidates_one_existing_record)
 	cluster_itl_xact_abort_finish(xid);
 	UT_ASSERT_EQ(test_stamp_lock_calls, 1);
 	UT_ASSERT(!test_stamp_lock_saw_valid_proof);
+	UT_ASSERT_EQ(test_discharge_calls, 0);
 	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
 }
 
@@ -556,7 +821,7 @@ UT_TEST(u34_epoch_drift_preserves_active_slot)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(27);
 	UT_RUN(u13_exact_owner_proof_matches);
 	UT_RUN(u14_missing_owner_proof_is_rejected);
 	UT_RUN(u15_later_x_generation_is_rejected);
@@ -579,5 +844,10 @@ main(void)
 	UT_RUN(u32_known_single_node_pcm_x_is_refused);
 	UT_RUN(u33_busy_pcm_n_tuple_is_refused);
 	UT_RUN(u34_epoch_drift_preserves_active_slot);
+	UT_RUN(u35_uba_drift_preserves_active_slot);
+	UT_RUN(u36_abort_discharge_waits_for_terminal_wal_and_dependency_frontier);
+	UT_RUN(u37_data_commit_retains_applied_receipt_for_lazy_cleanout);
+	UT_RUN(u38_lock_only_commit_discharges_terminal_independent_receipt);
+	UT_RUN(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle);
 	UT_DONE();
 }

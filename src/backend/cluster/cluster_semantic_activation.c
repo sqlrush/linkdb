@@ -35,6 +35,7 @@
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_control_root.h" /* bit22 feature bit (contract OPEN_APPLIED) */
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_wal_state.h" /* GATE-BOUND census self-check (implementation, follow-up contract ②) */
@@ -1077,7 +1078,8 @@ semantic_activation_ack_current_authority(
 		|| !cluster_qvotec_in_quorum()
 		|| !cluster_reconfig_lmon_snapshot_admitted_membership(
 			&members_lo, &members_hi, &formation_epoch)
-		|| (members_lo == 0 && members_hi == 0))
+		|| members_lo == 0 || members_hi != 0
+		|| (members_lo & ~UINT64_C(0x0000ffff)) != 0)
 		return false;
 
 	current_epoch = cluster_epoch_get_current();
@@ -6731,10 +6733,10 @@ r4_pre_prepare_readiness(uint64 expected_generation, ClusterSemanticActivationRe
 		= semantic_activation_r4_initial_clean_sample_candidate(
 			expected_generation);
 	ClusterSemanticActivationResult result
-		= (admitted_basis
-		   || initial_clean_basis)
+		= (cluster_ctrc_shmem_ready()
+		   && (admitted_basis || initial_clean_basis))
 			  ? CLUSTER_SEMANTIC_ACTIVATION_OK
-						 : CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
+			  : CLUSTER_SEMANTIC_ACTIVATION_RF_DEFERRED;
 
 	/* The instantaneous READY snapshot belongs exclusively to target LMON's
 	 * phase-3 serializer.  The current-coordinator handoff becomes visible

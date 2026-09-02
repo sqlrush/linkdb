@@ -769,6 +769,83 @@ ReadMultiXactIdRange(MultiXactId *oldest, MultiXactId *next)
 		*next = FirstMultiXactId;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+static void
+cluster_multixact_publish_created(MultiXactId multi, int nmembers,
+								 MultiXactMember *members)
+{
+	/*
+	 * PGRAC spec-3.6 D5: cluster-aware MultiXact composition emit.  This is
+	 * kept behind the physical descriptor publication so a CTRC-prepared
+	 * replacement cannot become remotely reachable before its receipts are
+	 * APPLIED.
+	 */
+	if (cluster_peer_mode_enabled() && nmembers > 0
+		&& nmembers <= cluster_multixact_member_overlay_max_members
+		&& nmembers <= CLUSTER_MULTIXACT_HINT_MAX_MEMBERS)
+	{
+		ClusterMultiXactMember c_members[CLUSTER_MULTIXACT_HINT_MAX_MEMBERS];
+		ClusterMultiXactKey c_key;
+		ClusterMultiXactSourceRequest multi_request;
+		ClusterMultiXactSourceResult multi_result;
+		ClusterTTStatusHintSourceRequest hint_request;
+		bool all_local = true;
+		int i;
+
+		for (i = 0; i < nmembers; i++)
+		{
+			uint32 seg;
+			uint16 off;
+			uint32 tt_id;
+			uint32 epoch;
+
+			if (!cluster_tt_local_peek_binding(members[i].xid, &seg, &off,
+										   &tt_id, &epoch, NULL))
+			{
+				all_local = false;
+				break;
+			}
+			c_members[i].xid = members[i].xid;
+			c_members[i].status = (uint8) members[i].status;
+			c_members[i]._pad8 = 0;
+			c_members[i].origin_node_id = (uint16) cluster_node_id;
+			c_members[i].undo_segment_id = (uint16) seg;
+			c_members[i]._pad16 = 0;
+			c_members[i].tt_slot_id = tt_id;
+			c_members[i].epoch = epoch;
+			c_members[i]._reserved2 = 0;
+		}
+
+		if (all_local)
+		{
+			memset(&c_key, 0, sizeof(c_key));
+			c_key.origin_node_id = (uint16) cluster_node_id;
+			c_key.multixact_id = multi;
+			c_key.cluster_epoch = (uint32) cluster_epoch_get_current();
+
+			memset(&multi_request, 0, sizeof(multi_request));
+			multi_request.key = &c_key;
+			multi_request.member_count = (uint16) nmembers;
+			multi_request.members = c_members;
+			if (cluster_multixact_source_dispatch(
+					CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL,
+					&multi_request, &multi_result)
+					== CLUSTER_SEMANTIC_ADMISSION_OK
+				&& multi_result.bool_value)
+			{
+				memset(&hint_request, 0, sizeof(hint_request));
+				hint_request.multi_key = &c_key;
+				hint_request.member_count = (uint16) nmembers;
+				hint_request.members = c_members;
+				(void) cluster_tt_status_hint_source_dispatch(
+					CLUSTER_TT_HINT_SOURCE_EMIT_MULTIXACT_OVERLAY,
+					&hint_request);
+			}
+		}
+	}
+}
+#endif
+
 
 /*
  * MultiXactIdCreateFromMembers
@@ -862,128 +939,108 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 	debug_elog2(DEBUG2, "Create: all done");
 
 #ifdef USE_PGRAC_CLUSTER
-	/*
-	 * PGRAC spec-3.6 D5:  cluster-aware MultiXact composition emit.
-	 *
-	 *   - L195 single-node fast path:  no peers → no emit.
-	 *   - Iterate members;  if ALL have a local TT binding (i.e. all
-	 *     members are this-node xids), build ClusterMultiXactMember[]
-	 *     + install local overlay + emit V4 to peers.
-	 *   - Remote-member case:  spec-3.4d 53R99 at heap_lock_tuple
-	 *     blocks the path before we reach here, so by contract this
-	 *     hook only sees local-all-member compose.  If any member
-	 *     lookup misses (corner case), skip emit defensively (caller
-	 *     visibility will fail-closed 53R9C on remote read — safer
-	 *     than emit partial overlay).
-	 *
-	 *   spec-7.1 D3-a note: an UPDATER-bearing multixact (the compose a
-	 *   cross-node read must resolve to a delete verdict) is composed at
-	 *   heap_update BEFORE the updater establishes its own TT binding
-	 *   (the binding lands when it stamps the new tuple, after this xmax
-	 *   compose).  peek_binding therefore misses the updater here and
-	 *   this proactive emit skips the overlay, so the fast-path V4
-	 *   overlay never covers updater-bearing multis.  Cross-node
-	 *   positive resolution of those multis is served by the member-
-	 *   serve slow path (origin reads its own SLRU + TT after the fact),
-	 *   which is spec-7.1 D3-b, software-ordered behind spec-7.2 D3.
-	 *   Until then the reader derives the origin (D3-a) and fails closed
-	 *   on the overlay miss.  This proactive hook is left unchanged.
-	 *
-	 *   member_count > GUC cap → defensive skip + emit_overlay 自身
-	 *   会 reject + counter；本 hook 不重复 ereport.
-	 */
-	if (cluster_peer_mode_enabled() && nmembers > 0
-		&& nmembers <= cluster_multixact_member_overlay_max_members
-		&& nmembers <= CLUSTER_MULTIXACT_HINT_MAX_MEMBERS) {
-		ClusterMultiXactMember c_members[CLUSTER_MULTIXACT_HINT_MAX_MEMBERS];
-		ClusterMultiXactKey c_key;
-		ClusterMultiXactSourceRequest multi_request;
-		ClusterMultiXactSourceResult multi_result;
-		ClusterTTStatusHintSourceRequest hint_request;
-		bool all_local = true;
-		int i;
-
-		for (i = 0; i < nmembers; i++) {
-			uint32 seg;
-			uint16 off;
-			uint32 tt_id;
-			uint32 epoch;
-
-			if (!cluster_tt_local_peek_binding(members[i].xid, &seg, &off, &tt_id, &epoch, NULL)) {
-				all_local = false;
-				break;
-			}
-			c_members[i].xid = members[i].xid;
-			c_members[i].status = (uint8)members[i].status;
-			c_members[i]._pad8 = 0;
-			c_members[i].origin_node_id = (uint16)cluster_node_id;
-			c_members[i].undo_segment_id = (uint16)seg;
-			c_members[i]._pad16 = 0;
-			c_members[i].tt_slot_id = tt_id;
-			c_members[i].epoch = epoch;
-			c_members[i]._reserved2 = 0;
-		}
-
-		if (all_local) {
-			memset(&c_key, 0, sizeof(c_key));
-			c_key.origin_node_id = (uint16)cluster_node_id;
-			c_key.multixact_id = multi;
-			c_key.cluster_epoch = (uint32)cluster_epoch_get_current();
-
-			memset(&multi_request, 0, sizeof(multi_request));
-			multi_request.key = &c_key;
-			multi_request.member_count = (uint16)nmembers;
-			multi_request.members = c_members;
-			if (cluster_multixact_source_dispatch(CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL,
-											 &multi_request, &multi_result)
-					== CLUSTER_SEMANTIC_ADMISSION_OK
-				&& multi_result.bool_value) {
-				memset(&hint_request, 0, sizeof(hint_request));
-				hint_request.multi_key = &c_key;
-				hint_request.member_count = (uint16)nmembers;
-				hint_request.members = c_members;
-				(void)cluster_tt_status_hint_source_dispatch(
-					CLUSTER_TT_HINT_SOURCE_EMIT_MULTIXACT_OVERLAY, &hint_request);
-			}
-		}
-	}
+	cluster_multixact_publish_created(multi, nmembers, members);
 #endif
 
 	return multi;
 }
 
 #ifdef USE_PGRAC_CLUSTER
+#ifdef USE_CLUSTER_UNIT
+extern MultiXactId cluster_multixact_test_materialize_local_current(
+	int nmembers, MultiXactMember *members);
+#endif
+
 /*
- * MultiXactIdCreateFromCurrentMembers
+ * MultiXactIdCreateLocalCurrentMembers
  *
- * Narrow current-DML replacement entry.  The heap caller has already
- * normalized a complete authority-proven list; this routine deliberately
- * accepts no old MXID, so a foreign ID can never reach
- * GetMultiXactIdMembers()/MultiXactIdExpand here.
+ * Materialize one complete requester-owned descriptor without publishing a
+ * cluster overlay.  Keep PostgreSQL's allocator, WAL and SLRU writes in the
+ * single critical section started by GetNewMultiXactId().  A caller may bind
+ * CTRC receipts to the returned immutable identity before making it reachable
+ * from a heap tuple; a failed recheck can therefore leave only a complete,
+ * cache-reusable local orphan.
  */
 MultiXactId
-MultiXactIdCreateFromCurrentMembers(int nmembers, MultiXactMember *members)
+MultiXactIdCreateLocalCurrentMembers(int nmembers, MultiXactMember *members)
 {
+#ifndef USE_CLUSTER_UNIT
 	MultiXactId multi;
+	MultiXactOffset offset;
+	xl_multixact_create xlrec;
+#endif
+	bool has_update = false;
 	int i;
 
-	if (nmembers < 2 || nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS || members == NULL)
+	if (nmembers < 1 || nmembers > CLUSTER_CURRENT_MX_MAX_MEMBERS
+		|| members == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cross-node current-DML cannot create an invalid MultiXact member set")));
 	for (i = 0; i < nmembers; i++)
+	{
 		if (!TransactionIdIsNormal(members[i].xid)
 			|| members[i].status > MaxMultiXactStatus)
 			ereport(ERROR,
 					(errcode(ERRCODE_DATA_CORRUPTED),
 					 errmsg("cross-node current-DML received an invalid MultiXact member")));
+		if (ISUPDATE_from_mxstatus(members[i].status))
+		{
+			if (has_update)
+				ereport(ERROR,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("cross-node current-DML received multiple updating MultiXact members")));
+			has_update = true;
+		}
+	}
 
-	multi = MultiXactIdCreateFromMembers(nmembers, members);
+#ifdef USE_CLUSTER_UNIT
+	/* The fixture replaces only the allocator/WAL/SLRU persistence tail. */
+	return cluster_multixact_test_materialize_local_current(nmembers, members);
+#else
+	/* The native cache lookup also establishes the canonical member order. */
+	multi = mXactCacheGetBySet(nmembers, members);
+	if (MultiXactIdIsValid(multi)
+		&& (!cluster_peer_mode_enabled() || cluster_mxid_is_mine(multi)))
+		return multi;
+
+	multi = GetNewMultiXactId(nmembers, &offset);
+
+	xlrec.mid = multi;
+	xlrec.moff = offset;
+	xlrec.nmembers = nmembers;
+	XLogBeginInsert();
+	XLogRegisterData((char *) &xlrec, SizeOfMultiXactCreate);
+	XLogRegisterData((char *) members,
+					 nmembers * sizeof(MultiXactMember));
+	(void) XLogInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID);
+	RecordNewMultiXact(multi, offset, nmembers, members);
+	END_CRIT_SECTION();
+
+	mXactCachePut(multi, nmembers, members);
 	if (cluster_peer_mode_enabled() && !cluster_mxid_is_mine(multi))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 				 errmsg("requester-created MultiXact %u is not owned by this node", multi),
 				 errhint("Retry after MultiXact striping activation completes.")));
+
+	return multi;
+#endif
+}
+
+/*
+ * Compatibility wrapper for callers that do not need CTRC ordering.  The
+ * receipt-bearing heap path calls the local-only constructor directly; local
+ * and remote consumers resolve that descriptor through the current-MX
+ * on-demand describe path, so heap publication needs no eager overlay RPC.
+ */
+MultiXactId
+MultiXactIdCreateFromCurrentMembers(int nmembers, MultiXactMember *members)
+{
+	MultiXactId multi;
+
+	multi = MultiXactIdCreateLocalCurrentMembers(nmembers, members);
+	cluster_multixact_publish_created(multi, nmembers, members);
 	return multi;
 }
 #endif

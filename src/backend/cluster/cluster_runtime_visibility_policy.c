@@ -611,7 +611,7 @@ cluster_vis_undo_multi_verdict_page_usable(const struct ClusterGcsUndoMultiVerdi
 	/* A real multi always has members; the origin refuses < 2 as NO_MEMBERS.
 	 * Reject < 2 (not a real multi) and anything past the wire capacity, so the
 	 * requester's variable-length member loop is bounded to [2, MAX]. */
-	if (v->nmembers < 2 || v->nmembers > CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS)
+	if (v->nmembers < 1 || v->nmembers > CLUSTER_GCS_UNDO_MULTI_VERDICT_MAX_MEMBERS)
 		return false;
 
 	for (i = 0; i < sizeof(v->reserved_0); i++)

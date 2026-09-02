@@ -555,7 +555,8 @@ struct ClusterCurrentMxProofReplyPage;
 extern ClusterMxResolveResult cluster_cr_server_current_mx_build_proof_page(
 	uint16 source_node_id,
 	const struct ClusterCurrentMxProofForwardV2 *request,
-	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	ClusterMxResolveResult result, uint32 requester_capability_generation,
+	const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	struct ClusterCurrentMxProofReplyPage *page);
 #ifdef USE_CLUSTER_UNIT
@@ -569,13 +570,15 @@ cluster_cr_server_test_current_mx_build_describe_page(
 extern ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	int32 origin_node, struct ClusterCurrentMxProofForwardV2 *request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
-	ClusterCurrentUpdaterProof *updater_proof);
+	ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *requester_capability_generation_out);
 #ifdef USE_CLUSTER_UNIT
 extern ClusterMxResolveResult
 cluster_cr_server_test_current_mx_build_proof_page(
 	uint16 source_node_id,
 	const struct ClusterCurrentMxProofForwardV2 *request,
-	ClusterMxResolveResult result, const ClusterCurrentMemberProof *proofs,
+	ClusterMxResolveResult result, uint32 requester_capability_generation,
+	const ClusterCurrentMemberProof *proofs,
 	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
 	struct ClusterCurrentMxProofReplyPage *page);
 #endif

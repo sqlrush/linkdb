@@ -80,6 +80,15 @@ UT_DEFINE_GLOBALS();
 #ifndef HEAPAM_SOURCE_PATH
 #error "HEAPAM_SOURCE_PATH must identify heapam.c"
 #endif
+#ifndef UNDO_XLOG_HEADER_PATH
+#error "UNDO_XLOG_HEADER_PATH must identify cluster_undo_xlog.h"
+#endif
+#ifndef UNDO_XLOG_SOURCE_PATH
+#error "UNDO_XLOG_SOURCE_PATH must identify cluster_undo_xlog.c"
+#endif
+#ifndef UNDO_FORMAT_HEADER_PATH
+#error "UNDO_FORMAT_HEADER_PATH must identify cluster_undo_format.h"
+#endif
 
 
 #define UNDO_TEST_SHMEM_BYTES 16384
@@ -165,6 +174,9 @@ read_heapam_source(void)
 {
 	return read_source_file(HEAPAM_SOURCE_PATH);
 }
+
+extern bool cluster_undo_record_ctrc_required_prepared(
+	const ClusterUndoRecordPrepareReceipt *receipt, uint8 required_mask);
 
 
 /*
@@ -1302,6 +1314,7 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 	const char *ensure;
 	const char *dml_recheck;
 	const char *receipt_recheck;
+	const char *ctrc_apply;
 	const char *alloc_once;
 	const char *consume;
 
@@ -1317,6 +1330,8 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 		: strstr(helper, "cluster_heap_dml_authority_guard_recheck(");
 	receipt_recheck = helper == NULL ? NULL
 		: strstr(helper, "cluster_undo_record_prepared_recheck(");
+	ctrc_apply = helper == NULL ? NULL
+		: strstr(helper, "cluster_undo_record_ctrc_apply_prepared(");
 	alloc_once = helper == NULL ? NULL
 		: strstr(helper, "cluster_heap_itl_alloc_once(");
 	consume = helper == NULL ? NULL
@@ -1327,16 +1342,135 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 	UT_ASSERT_NOT_NULL(ensure);
 	UT_ASSERT_NOT_NULL(dml_recheck);
 	UT_ASSERT_NOT_NULL(receipt_recheck);
+	UT_ASSERT_NOT_NULL(ctrc_apply);
 	UT_ASSERT_NOT_NULL(alloc_once);
 	UT_ASSERT_NOT_NULL(consume);
 	if (helper != NULL && helper_end != NULL && ensure != NULL
-		&& dml_recheck != NULL && receipt_recheck != NULL
+		&& dml_recheck != NULL && receipt_recheck != NULL && ctrc_apply != NULL
 		&& alloc_once != NULL && consume != NULL)
 		UT_ASSERT(helper < ensure && ensure < dml_recheck
 				  && dml_recheck < receipt_recheck
-				  && receipt_recheck < alloc_once && alloc_once < consume
+				  && receipt_recheck < alloc_once && alloc_once < ctrc_apply
+				  && ctrc_apply < consume
 				  && consume < helper_end);
 	free(source);
+}
+
+/* A cross-page UPDATE owns two independent page-reference receipts.  The
+ * pre-mutation gate must reject a partial pair, a missing exact handle, or a
+ * receipt that has already crossed APPLY. */
+UT_TEST(test_ctrc_cross_page_update_requires_both_prepared_receipts)
+{
+	ClusterUndoRecordPrepareReceipt receipt = {0};
+
+	receipt.ctrc_pending_mask = UINT8_C(3);
+	receipt.ctrc_prepared_mask = UINT8_C(3);
+	receipt.ctrc_handles[0].valid = true;
+	receipt.ctrc_handles[1].valid = true;
+	UT_ASSERT(cluster_undo_record_ctrc_required_prepared(
+		&receipt, UINT8_C(3)));
+
+	receipt.ctrc_prepared_mask = UINT8_C(1);
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
+		&receipt, UINT8_C(3)));
+	receipt.ctrc_prepared_mask = UINT8_C(3);
+	receipt.ctrc_handles[1].valid = false;
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
+		&receipt, UINT8_C(3)));
+	receipt.ctrc_handles[1].valid = true;
+	receipt.ctrc_applied_mask = UINT8_C(1);
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
+		&receipt, UINT8_C(3)));
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
+		&receipt, 0));
+	UT_ASSERT(!cluster_undo_record_ctrc_required_prepared(
+		&receipt, UINT8_C(4)));
+}
+
+/* The UPDATE caller must route both same-page and cross-page passes through
+ * the shared required-mask gate.  APPLY must precede undo consumption, and
+ * the later physical stamps must use the SCNs frozen by the exact plans. */
+UT_TEST(test_heap_update_applies_required_receipts_before_undo_and_page_mutation)
+{
+	char *source = read_heapam_source();
+	const char *update;
+	const char *update_end;
+	const char *stage;
+	const char *prepare;
+	const char *required;
+	const char *apply;
+	const char *consume;
+	const char *old_stamp_scn;
+	const char *new_stamp_scn;
+
+	if (source == NULL)
+		return;
+	update = strstr(source, "\nheap_update(");
+	update_end = update == NULL ? NULL : strstr(update, "\nheap_lock_tuple(");
+	stage = update == NULL ? NULL
+		: strstr(update, "cluster_undo_record_ctrc_stage_pending(");
+	prepare = update == NULL ? NULL
+		: strstr(update, "cluster_undo_record_ctrc_prepare_pending(");
+	required = update == NULL ? NULL
+		: strstr(update, "cluster_undo_record_ctrc_required_prepared(");
+	apply = update == NULL ? NULL
+		: strstr(update, "cluster_undo_record_ctrc_apply_prepared(");
+	consume = update == NULL ? NULL
+		: strstr(update, "cluster_undo_record_consume_prepared(");
+	old_stamp_scn = update == NULL ? NULL
+		: strstr(update, "cluster_itl_old_write_scn, cluster_itl_uba");
+	new_stamp_scn = update == NULL ? NULL
+		: strstr(update, "cluster_itl_new_write_scn, cluster_itl_uba");
+
+	UT_ASSERT_NOT_NULL(update);
+	UT_ASSERT_NOT_NULL(update_end);
+	UT_ASSERT_NOT_NULL(stage);
+	UT_ASSERT_NOT_NULL(prepare);
+	UT_ASSERT_NOT_NULL(required);
+	UT_ASSERT_NOT_NULL(apply);
+	UT_ASSERT_NOT_NULL(consume);
+	UT_ASSERT_NOT_NULL(old_stamp_scn);
+	UT_ASSERT_NOT_NULL(new_stamp_scn);
+	if (update != NULL && update_end != NULL && stage != NULL
+		&& prepare != NULL && required != NULL && apply != NULL
+		&& consume != NULL && old_stamp_scn != NULL && new_stamp_scn != NULL)
+		UT_ASSERT(update < stage && stage < required
+			&& required < apply && apply < consume && consume < prepare
+			&& prepare < old_stamp_scn && old_stamp_scn < new_stamp_scn
+			&& new_stamp_scn < update_end);
+	free(source);
+}
+
+/* MXA-T33: terminal transition, redo and fresh reuse must all share one
+ * canonical release-bit contract.  The focused CTRC runtime test exercises
+ * the transition table; this anchor additionally prevents the three product
+ * owners from silently omitting the frozen opcode or clear-on-reuse symbol. */
+UT_TEST(test_ctrc_release_flag_terminal_recycle_reuse_and_redo_matrix)
+{
+	char *xlog_header = read_source_file(UNDO_XLOG_HEADER_PATH);
+	char *xlog_source = read_source_file(UNDO_XLOG_SOURCE_PATH);
+	char *format_header = read_source_file(UNDO_FORMAT_HEADER_PATH);
+
+	if (xlog_header == NULL || xlog_source == NULL || format_header == NULL)
+	{
+		free(xlog_header);
+		free(xlog_source);
+		free(format_header);
+		return;
+	}
+	UT_ASSERT_NOT_NULL(strstr(xlog_header,
+		"XLOG_UNDO_TT_SLOT_CTRC_RELEASE"));
+	UT_ASSERT_NOT_NULL(strstr(xlog_header,
+		"xl_undo_tt_slot_ctrc_release_v1"));
+	UT_ASSERT_NOT_NULL(strstr(xlog_source,
+		"cluster_undo_xlog_insert_tt_ctrc_release"));
+	UT_ASSERT_NOT_NULL(strstr(xlog_source,
+		"TT_SLOT_FLAG_CTRC_RELEASE_PROVEN"));
+	UT_ASSERT_NOT_NULL(strstr(format_header,
+		"TT_SLOT_FLAG_CTRC_RELEASE_PROVEN"));
+	free(xlog_header);
+	free(xlog_source);
+	free(format_header);
 }
 
 /* A pre-lock prepare may legitimately lose a conditional block0/current
@@ -1466,7 +1600,7 @@ UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 	const char *helper_end;
 	const char *deadline_parameter;
 	const char *hit;
-	int retry_sites = 0;
+	int ctrc_prepare_sites = 0;
 	int cancel_sites = 0;
 	int deadline_locals = 0;
 
@@ -1492,9 +1626,9 @@ UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 
 	for (hit = source;
 		 (hit = strstr(hit,
-			"CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED")) != NULL;
+			"cluster_undo_record_ctrc_prepare_pending(")) != NULL;
 		 hit++)
-		retry_sites++;
+		ctrc_prepare_sites++;
 	for (hit = source;
 		 (hit = strstr(hit, "cluster_undo_record_cancel_prepared(")) != NULL;
 		 hit++)
@@ -1504,9 +1638,10 @@ UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 		 hit++)
 		deadline_locals++;
 
-	/* One enum value, helper classifications, update mapping, and exactly four
-	 * caller unwind branches. */
-	UT_ASSERT_EQ(retry_sites, 11);
+	/* Each heap DML family prepares its CTRC receipt only after dropping the
+	 * content lock.  Do not count enum/result spellings: UPDATE legitimately
+	 * has more than one pre-mutation retry classification. */
+	UT_ASSERT_EQ(ctrc_prepare_sites, 4);
 	UT_ASSERT(cancel_sites >= 4);
 	/* Four declarations plus initial/reprepare uses on all callers. */
 	UT_ASSERT(deadline_locals >= 12);
@@ -1767,7 +1902,7 @@ UT_TEST(test_live_lifecycle_writers_use_only_exact_block0_current)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(36);
+	UT_PLAN(39);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);
@@ -1796,6 +1931,9 @@ main(int argc, char **argv)
 	UT_RUN(test_record_prepare_owns_extent_and_block0_slow_paths);
 	UT_RUN(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation);
 	UT_RUN(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation);
+	UT_RUN(test_ctrc_cross_page_update_requires_both_prepared_receipts);
+	UT_RUN(test_heap_update_applies_required_receipts_before_undo_and_page_mutation);
+	UT_RUN(test_ctrc_release_flag_terminal_recycle_reuse_and_redo_matrix);
 	UT_RUN(test_heap_prepare_retries_transient_result_under_one_deadline);
 	UT_RUN(test_inlock_consume_preserves_retry_required_for_heap_unwind);
 	UT_RUN(test_all_heap_dml_callers_reprepare_outside_content_lock);

@@ -53,6 +53,8 @@ UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true;
 int cluster_node_id = 0;
+static ClusterConf test_cluster_conf = {.node_count = 2};
+ClusterConf *ClusterConfShmem = &test_cluster_conf;
 int cluster_ges_request_timeout_ms = 1000;
 int cluster_ges_retransmit_max_attempts = 5;
 struct PGPROC *MyProc = NULL;
@@ -819,10 +821,21 @@ cluster_undo_emit_segment_recycle(uint8 instance pg_attribute_unused(),
 }
 
 bool
-cluster_undo_segment_recyclable(
-	const struct UndoSegmentHeaderData *header, SCN horizon pg_attribute_unused())
+cluster_undo_segment_recyclable_for_mode(
+	const struct UndoSegmentHeaderData *header, SCN horizon pg_attribute_unused(),
+	bool peer_mode)
 {
-	return header != NULL && header->segment_state == SEGMENT_COMMITTED;
+	int i;
+
+	if (header == NULL || header->segment_state != SEGMENT_COMMITTED)
+		return false;
+	if (!peer_mode)
+		return true;
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		if (header->tt_slots[i].status == TT_SLOT_ABORTED)
+			return false;
+	}
+	return true;
 }
 
 ClusterUndoBlock0Result

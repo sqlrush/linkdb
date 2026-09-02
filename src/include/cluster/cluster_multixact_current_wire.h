@@ -23,7 +23,7 @@
 #include "cluster/cluster_multixact_current.h"
 
 #define CLUSTER_CURRENT_MX_WIRE_MAGIC ((uint32)0x5047434d)
-#define CLUSTER_CURRENT_MX_WIRE_VERSION 1
+#define CLUSTER_CURRENT_MX_WIRE_VERSION 2
 #define CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE 0
 #define CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE 128
 #define CLUSTER_CURRENT_MX_PROOF_FORWARD_SIZE 128
@@ -164,7 +164,7 @@ typedef struct ClusterCurrentMxProofReplyHeader {
 	uint8 chunk_count_minus_one;
 	uint16 wire_length;
 	uint16 reserved16;
-	uint32 reserved32;
+	uint32 requester_capability_generation;
 } ClusterCurrentMxProofReplyHeader;
 
 typedef struct ClusterCurrentMxUpdaterProofReplyBodyWire {
@@ -253,6 +253,9 @@ StaticAssertDecl(sizeof(ClusterCurrentMxDescribeReplyPage) == BLCKSZ,
 				 "current MX describe reply must fill one GCS page");
 StaticAssertDecl(sizeof(ClusterCurrentMxProofReplyHeader) == 64,
 				 "current MX proof reply header must remain 64 bytes");
+StaticAssertDecl(offsetof(ClusterCurrentMxProofReplyHeader,
+					  requester_capability_generation) == 60,
+				 "current MX requester capability carrier offset must remain 60");
 StaticAssertDecl(sizeof(ClusterCurrentMxUpdaterProofReplyBodyWire)
 					 == CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
 							* sizeof(ClusterCurrentMemberProof),
@@ -316,11 +319,13 @@ extern ClusterMxResolveResult cluster_multixact_current_wire_validate_proof_repl
 	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
 	const ClusterCurrentMxProofForwardV2 *expected_request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
-	ClusterCurrentUpdaterProof *updater_proof);
+	ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *requester_capability_generation_out);
 extern bool cluster_multixact_current_wire_validate_proof_reply_frame(
 	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
 	const ClusterCurrentMxProofForwardV2 *expected_request, ClusterMxResolveResult *result,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
-	ClusterCurrentUpdaterProof *updater_proof);
+	ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *requester_capability_generation_out);
 
 #endif /* CLUSTER_MULTIXACT_CURRENT_WIRE_H */

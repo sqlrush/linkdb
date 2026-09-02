@@ -72,6 +72,8 @@ StaticAssertDecl(sizeof(ClusterTTSlotPhysicalLocator) == 16,
 				 "physical TT locator must remain stack-only 16 bytes");
 typedef struct ClusterTTStatusKey ClusterTTStatusKey;
 typedef struct ClusterTTStatusResult ClusterTTStatusResult;
+typedef struct ClusterCtrcTxnKeyV1 ClusterCtrcTxnKeyV1;
+typedef struct ClusterCtrcParticipantIdentity ClusterCtrcParticipantIdentity;
 
 /* Stack/process-local continuation for the exact origin DATA -> canonical TT
  * -> DATA proof.  The representation is private to the provider; it is not a
@@ -199,16 +201,36 @@ extern bool cluster_runtime_visibility_current_owner_sample_held(
 	const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
+	bool *ctrc_physical_active_out);
 extern bool cluster_runtime_visibility_physical_locator_sample_held(
 	const ClusterTTSlotPhysicalLocator *locator,
 	const ClusterSemanticAdmissionToken *admission,
 	ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
+	bool *ctrc_physical_active_out);
 extern bool cluster_runtime_visibility_current_owner_lookup_exact(
 	TransactionId xid, ClusterTTStatusKey *key_out,
 	ClusterTTStatusResult *result_out);
+extern bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc(
+	TransactionId xid, ClusterTTStatusKey *key_out,
+	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out);
+extern bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
+	TransactionId xid, ClusterTTStatusKey *key_out,
+	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out,
+	ClusterCtrcTxnKeyV1 *ctrc_key_out,
+	ClusterCtrcParticipantIdentity *participant_out);
+/* Local current-MX terminal proof path.  It samples the exact current or
+ * rolled physical slot and never creates a CTRC touch/grant/participant. */
+extern bool cluster_runtime_visibility_local_terminal_lookup_exact(
+	TransactionId xid, ClusterTTStatusKey *key_out,
+	ClusterTTStatusResult *result_out);
+extern bool cluster_runtime_visibility_active_proof_ctrc_identity_exact(
+	const ClusterTTStatusKey *proof_key, uint32 ctrc_grant,
+	uint32 requester_capability_generation,
+	ClusterCtrcTxnKeyV1 *ctrc_key_out,
+	ClusterCtrcParticipantIdentity *participant_out);
 extern ClusterTxOutcome
 cluster_runtime_visibility_origin_plan_recheck_data_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,

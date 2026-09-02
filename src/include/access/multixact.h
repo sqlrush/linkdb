@@ -113,7 +113,9 @@ extern MultiXactId MultiXactIdCreateFromMembers(int nmembers,
  * This never decodes or expands an old (possibly foreign) MultiXact.
  */
 extern MultiXactId MultiXactIdCreateFromCurrentMembers(int nmembers,
-														MultiXactMember *members);
+												MultiXactMember *members);
+extern MultiXactId MultiXactIdCreateLocalCurrentMembers(
+	int nmembers, MultiXactMember *members);
 #endif
 
 extern MultiXactId ReadNextMultiXactId(void);

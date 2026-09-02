@@ -50,6 +50,7 @@
 #include "common/relpath.h"						/* ForkNumber */
 #include "cluster/cluster_itl_slot.h"			/* UBA */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_record.h"		/* UndoRecordType */
 #include "cluster/cluster_undo_extent.h"		/* ClusterUndoExtent */
 #include "cluster/storage/cluster_undo_alloc.h" /* ClusterUndoSegTryRecycle (3.13) */
@@ -85,6 +86,8 @@ typedef enum ClusterUndoRecordConsumeResult {
 	CLUSTER_UNDO_RECORD_CONSUME_REFUSED
 } ClusterUndoRecordConsumeResult;
 
+#define CLUSTER_UNDO_RECORD_CTRC_TARGETS 2
+
 /* Stack-only identity for one backend-local prepared DATA reservation.  It is
  * neither shared state nor authority: the block0 publication is a retained
  * exact proof, while reservation_sequence names the sole backend-local owner.
@@ -103,6 +106,12 @@ typedef struct ClusterUndoRecordPrepareReceipt {
 	ClusterUndoExtent extent;
 	ClusterUndoBlock0LiveOwnerPublication block0_publication;
 	ClusterSemanticAdmissionToken modifier_admission;
+	ClusterCtrcTargetV1 ctrc_pending_targets[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	ClusterCtrcReceiptHandle ctrc_handles[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+	uint8 ctrc_pending_mask;
+	uint8 ctrc_prepared_mask;
+	uint8 ctrc_applied_mask;
+	uint8 ctrc_reserved8[5];
 } ClusterUndoRecordPrepareReceipt;
 
 extern uint64 cluster_undo_record_prepare_deadline_us(void);
@@ -112,6 +121,23 @@ extern ClusterUndoRecordPrepareResult cluster_undo_record_prepare(
 	uint64 absolute_deadline_us, ClusterUndoRecordPrepareReceipt *receipt);
 extern bool cluster_undo_record_prepared_recheck(
 	const ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len);
+extern bool cluster_undo_record_prepared_uba_exact(
+	const ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len,
+	UBA *uba_out);
+extern bool cluster_undo_record_ctrc_stage_pending(
+	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
+	const ClusterCtrcTargetV1 *pending_target);
+extern bool cluster_undo_record_ctrc_prepare_pending(
+	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal);
+extern bool cluster_undo_record_ctrc_pending_matches(
+	const ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
+	const ClusterCtrcTargetV1 *pending_target);
+extern bool cluster_undo_record_ctrc_required_prepared(
+	const ClusterUndoRecordPrepareReceipt *receipt, uint8 required_mask);
+extern ClusterCtrcApplyResult cluster_undo_record_ctrc_apply_prepared(
+	ClusterUndoRecordPrepareReceipt *receipt, uint8 target_ordinal,
+	const ClusterCtrcTargetV1 *final_target,
+	ClusterCtrcApplyToken *token);
 extern void cluster_undo_record_cancel_prepared(
 	ClusterUndoRecordPrepareReceipt *receipt);
 extern ClusterUndoRecordConsumeResult cluster_undo_record_consume_prepared(
