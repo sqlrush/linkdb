@@ -57,6 +57,7 @@
 #include "cluster/cluster_scn.h"		  /* SCN */
 #include "cluster/cluster_tt_slot.h"	  /* ClusterUndoTTSlotRef */
 #include "cluster/cluster_tt_status.h"	  /* ClusterTTStatus */
+#include "cluster/cluster_tx_resolve.h"  /* ClusterTxLocator */
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22f D6) */
 
 
@@ -105,6 +106,11 @@ typedef struct ClusterVisResolve {
 								   * would read it as committed-after ->
 								   * false-invisible, Rule 8.A). */
 	ClusterUndoTTSlotRef ref;	 /* copied exact ref (REMOTE/LOCAL/STALE) */
+	/* Stage-8 PRE adjustment 23: a wait consumer may use only the exact
+	 * page-derived DATA locator captured under the same content lock as the
+	 * verdict.  The ref/raw xid is never promoted into a remote wait key. */
+	bool row_wait_locator_valid;
+	ClusterTxLocator row_wait_locator;
 	uint16 multi_marker_origin;	 /* XMAX_MULTI: origin node of marker, else 0 */
 	bool multi_marker_is_remote; /* XMAX_MULTI: marker hit + origin != self */
 } ClusterVisResolve;
@@ -193,6 +199,22 @@ extern ClusterVisVerdict cluster_vis_update_xmax_verdict(ClusterTTStatus status,
 extern ClusterVisVerdict cluster_vis_update_lock_only_xmax_verdict(ClusterTTStatus status);
 
 /*
+ * S3-P0-26: a LOCAL/NONE ITL route whose raw xmax belongs to the current
+ * transaction still has three distinct PostgreSQL outcomes when the xmin was
+ * proved remote-visible.  Keep that policy pure and exhaustive so the
+ * cluster fork cannot collapse a lock-only xmax into TM_SelfModified.
+ */
+typedef enum ClusterVisNativeSelfUpdateVerdict {
+	CLUSTER_VIS_NATIVE_SELF_BEING_MODIFIED = 0,
+	CLUSTER_VIS_NATIVE_SELF_MODIFIED,
+	CLUSTER_VIS_NATIVE_SELF_INVISIBLE
+} ClusterVisNativeSelfUpdateVerdict;
+
+extern ClusterVisNativeSelfUpdateVerdict
+cluster_vis_update_native_self_verdict(bool lock_only,
+									   bool cmax_at_or_after_curcid);
+
+/*
  * spec-3.21 §2.3: CR image xmax-side MVCC visibility verdict.
  *
  *	The SatisfiesUpdate verdict above (cluster_vis_update_xmax_verdict) is
@@ -219,6 +241,12 @@ cluster_vis_cr_xmax_verdict(ClusterTTStatus xmax_status,
 /* OBS-3 Dirty: no wait_policy layer, so remote in-progress -> 53R9H. */
 extern ClusterVisVerdict cluster_vis_dirty_verdict(ClusterTTStatus status, bool is_xmax,
 												   bool is_delete);
+
+/* The base OBS-3 verdict remains fail-closed.  Only the typed unique-index
+ * owner may turn an exact remote IN_PROGRESS xmax into an unlocked wait. */
+extern bool cluster_vis_dirty_remote_xmax_waitable(ClusterTTStatus status,
+											 bool is_xmax,
+											 bool exact_locator_valid);
 
 
 /*

@@ -1354,6 +1354,9 @@ UT_TEST(test_bufmgr_generation_bump_failure_is_classified_under_header_lock)
 	UT_ASSERT(count_occurrences(source, "cluster_pcm_own_bump_failure(") >= 2);
 	UT_ASSERT_NOT_NULL(strstr(source, "active reservation"));
 	UT_ASSERT_NOT_NULL(strstr(source, "generation exhausted"));
+	UT_ASSERT_NOT_NULL(strstr(source, "LockBuffer unlock READ_IMAGE"));
+	UT_ASSERT_NOT_NULL(strstr(source, "LockBuffer SHARE read-image publish"));
+	UT_ASSERT_NOT_NULL(strstr(source, "LockBuffer SHARE local-cache-off mirror"));
 	free(source);
 }
 

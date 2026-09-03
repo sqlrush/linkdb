@@ -247,6 +247,8 @@ typedef struct TableIndexFetchBarrierContext
 	ItemPointer tid;
 	Snapshot	snapshot;
 	TupleTableSlot *slot;
+	bool	   *remote_xmax_wait;
+	struct ClusterTxLocator *remote_wait_locator;
 } TableIndexFetchBarrierContext;
 
 static TableIndexFetchTupleResult
@@ -256,7 +258,8 @@ table_index_fetch_barrier_typed(void *arg, bool *call_again, bool *all_dead)
 
 	return context->scan->rel->rd_tableam->index_fetch_tuple_barrier_aware(
 		context->scan, context->tid, context->snapshot, context->slot,
-		call_again, all_dead);
+		call_again, all_dead, context->remote_xmax_wait,
+		context->remote_wait_locator);
 }
 
 static bool
@@ -292,14 +295,20 @@ TableIndexFetchTupleResult
 table_index_fetch_tuple_check_barrier_aware(Relation rel,
 										ItemPointer tid,
 										Snapshot snapshot,
-										bool *all_dead)
+										bool *all_dead,
+										bool *remote_xmax_wait,
+										struct ClusterTxLocator *remote_wait_locator)
 {
 	TableIndexFetchBarrierContext context;
 
+	if (remote_xmax_wait != NULL)
+		*remote_xmax_wait = false;
 	context.slot = table_slot_create(rel, NULL);
 	context.scan = table_index_fetch_begin(rel);
 	context.tid = tid;
 	context.snapshot = snapshot;
+	context.remote_xmax_wait = remote_xmax_wait;
+	context.remote_wait_locator = remote_wait_locator;
 	return table_index_fetch_barrier_execute(&table_index_fetch_barrier_ops,
 		&context, rel->rd_tableam->index_fetch_tuple_barrier_aware != NULL,
 		all_dead);

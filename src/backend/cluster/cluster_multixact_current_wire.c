@@ -388,7 +388,10 @@ wire_member_proof_valid(const ClusterCurrentMemberProof *proof,
 						const ClusterCurrentMxProofAskWire *ask, int32 expected_source,
 						uint64 current_epoch)
 {
-	static const ClusterTTStatusKey zero_key;
+	static const ClusterCurrentMemberProofKey zero_key;
+	ClusterTTStatusKey status_key;
+	uint32 segment_generation;
+	uint16 slot_wrap;
 
 	if (proof == NULL || ask == NULL || proof->member_ordinal != ask->member_ordinal
 		|| proof->member_xid != ask->xid || proof->member_status != ask->member_status
@@ -399,10 +402,12 @@ wire_member_proof_valid(const ClusterCurrentMemberProof *proof,
 	case CCM_ACTIVE:
 		return ClusterCurrentMemberProofGetCtrcGrant(proof) != 0
 			   && proof->commit_scn == InvalidScn
-			   && wire_tt_key_valid(&proof->key, current_epoch, expected_source,
+			   && ClusterCurrentMemberProofGetStatusKey(
+					proof, &status_key, &segment_generation, &slot_wrap)
+			   && wire_tt_key_valid(&status_key, current_epoch, expected_source,
 								InvalidTransactionId)
-			   && (proof->key.local_xid == ask->xid
-				   || TransactionIdPrecedes(proof->key.local_xid, ask->xid));
+			   && (status_key.local_xid == ask->xid
+				   || TransactionIdPrecedes(status_key.local_xid, ask->xid));
 	case CCM_COMMITTED:
 		return ClusterCurrentMemberProofGetCtrcGrant(proof) == 0
 			   && memcmp(&proof->key, &zero_key, sizeof(zero_key)) == 0
@@ -432,10 +437,10 @@ wire_updater_proof_valid(const ClusterCurrentUpdaterProof *proof,
 					 &challenge->candidate_next_xmin_alias,
 					 sizeof(ClusterCurrentMxSuccessorAlias))
 				  == 0
-		   && memcmp(&proof->candidate_next_xmin_locator,
-					 &challenge->candidate_next_xmin_locator,
-					 sizeof(ClusterTxLocator))
-				  == 0
+		   && proof->candidate_next_xmin_locator.tt_wrap <= TT_WRAP_MAX
+		   && cluster_tx_locator_reply_matches(
+				  &challenge->candidate_next_xmin_locator,
+				  &proof->candidate_next_xmin_locator)
 		   && proof->updater_xid == challenge->updater_xid
 		   && proof->member_ordinal == challenge->member_ordinal
 		   && proof->verdict < CUCP_UNKNOWN && proof->reserved8 == 0;
@@ -482,7 +487,7 @@ cluster_multixact_current_wire_validate_proof_reply(
 		|| header->total_count != decoded_request.prefix.total_count
 		|| header->chunk_ordinal != decoded_request.prefix.chunk_ordinal
 		|| header->chunk_count_minus_one != decoded_request.prefix.chunk_count_minus_one
-		|| header->result > CMX_RESOLVE_UNKNOWN || header->result == CMX_RESOLVE_TIMEOUT
+		|| header->result > CMX_RESOLVE_RETRY || header->result == CMX_RESOLVE_TIMEOUT
 		|| header->reserved16 != 0
 		|| header->wire_length < sizeof(*header) || header->wire_length > sizeof(page))
 		return CMX_RESOLVE_UNKNOWN;

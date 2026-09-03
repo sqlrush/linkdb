@@ -861,18 +861,22 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 }
 
 static bool
-cluster_vis_exact_locator_for_ref(
+cluster_vis_exact_locators_for_ref(
 	Page page, TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
-	ClusterTxLocator *locator_out)
+	ClusterTxLocator *visibility_locator_out,
+	ClusterTxLocator *row_wait_locator_out)
 {
 	ClusterTxLocator candidate;
 	ClusterTxResolveReason reason;
 	uint8 i;
 	bool found = false;
 
-	if (locator_out != NULL)
-		memset(locator_out, 0, sizeof(*locator_out));
-	if (page == NULL || ref == NULL || locator_out == NULL
+	if (visibility_locator_out != NULL)
+		memset(visibility_locator_out, 0, sizeof(*visibility_locator_out));
+	if (row_wait_locator_out != NULL)
+		memset(row_wait_locator_out, 0, sizeof(*row_wait_locator_out));
+	if (page == NULL || ref == NULL || visibility_locator_out == NULL
+		|| row_wait_locator_out == NULL
 		|| !TransactionIdIsNormal(raw_xid))
 		return false;
 
@@ -887,12 +891,18 @@ cluster_vis_exact_locator_for_ref(
 			|| candidate_ref.cluster_epoch != ref->cluster_epoch)
 			continue;
 		if (found
-			|| !cluster_tx_locator_from_itl_terminal_census(
-				page, i, &candidate, &reason)) {
-			memset(locator_out, 0, sizeof(*locator_out));
+			|| !cluster_tx_locator_from_itl(page, i, &candidate, &reason)) {
+			memset(visibility_locator_out, 0,
+				   sizeof(*visibility_locator_out));
+			memset(row_wait_locator_out, 0,
+				   sizeof(*row_wait_locator_out));
 			return false;
 		}
-		*locator_out = candidate;
+		*row_wait_locator_out = candidate;
+		/* Visibility Candidate-2 derives the canonical wrap at the origin;
+		 * ROW_WAIT instead retains the exact page witness. */
+		candidate.tt_wrap = TT_WRAP_INVALID;
+		*visibility_locator_out = candidate;
 		found = true;
 	}
 	return found;
@@ -918,11 +928,18 @@ classify_page_ref(
 	XLogRecPtr anchor_lsn, SCN read_scn, ClusterVisResolve *out)
 {
 	ClusterTxLocator locator;
+	ClusterTxLocator row_wait_locator;
 	const ClusterTxLocator *exact_locator = NULL;
 
-	if (cluster_vis_exact_locator_for_ref(page, raw_xid, ref, &locator))
+	if (cluster_vis_exact_locators_for_ref(
+			page, raw_xid, ref, &locator, &row_wait_locator))
 		exact_locator = &locator;
 	classify_ref(raw_xid, ref, anchor_lsn, read_scn, exact_locator, out);
+	if (exact_locator != NULL
+		&& out->evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
+		out->row_wait_locator = row_wait_locator;
+		out->row_wait_locator_valid = true;
+	}
 }
 
 

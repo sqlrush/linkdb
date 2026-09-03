@@ -552,7 +552,7 @@ legacy_d6_live_page_semantics_present(void)
 	const char *const ordered[]
 		= { "cluster_visibility_resolve_tuple_scn(", "page = BufferGetPage(buffer);",
 			"cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref)",
-			"classify_ref(raw_xid, &ref, anchor_lsn, read_scn, out);" };
+			"classify_page_ref(page, raw_xid, &ref, anchor_lsn, read_scn, out);" };
 
 	return source_has_ordered(sources.vis_resolve_source, ordered, lengthof(ordered));
 }

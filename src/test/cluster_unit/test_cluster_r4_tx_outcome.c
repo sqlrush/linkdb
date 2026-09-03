@@ -76,6 +76,7 @@ static int test_tt_exact_calls;
 static int test_tt_snapshot_calls;
 static int test_native_status_calls;
 static int test_by_xid_scan_calls;
+static bool test_durable_locator_available;
 static uint32 test_tt_segment_seen;
 static uint16 test_tt_slot_seen;
 static TransactionId test_tt_xid_seen;
@@ -263,6 +264,8 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
 {
 	UT_ASSERT_EQ(origin_node, 0);
 	UT_ASSERT_EQ((int)xid, (int)TEST_ORIGIN_XID);
+	if (!test_durable_locator_available)
+		return CLUSTER_TT_DURABLE_LOCATE_MISSING;
 	UT_ASSERT_NOT_NULL(out_seg);
 	UT_ASSERT_NOT_NULL(out_slot);
 	UT_ASSERT_NOT_NULL(out_wrap);
@@ -818,6 +821,7 @@ reset_exact_origin_fixture(void)
 	test_tt_snapshot_calls = 0;
 	test_native_status_calls = 0;
 	test_by_xid_scan_calls = 0;
+	test_durable_locator_available = true;
 	test_tt_segment_seen = 0;
 	test_tt_slot_seen = 0;
 	test_tt_xid_seen = InvalidTransactionId;
@@ -1207,7 +1211,7 @@ UT_TEST(test_ctrc_current_owner_uses_published_binding_across_rollover)
 
 UT_TEST(test_current_mx_active_proof_reconstructs_exact_ctrc_identity)
 {
-	ClusterTTStatusKey proof_key;
+	ClusterCurrentMemberProofKey proof_key;
 	ClusterCtrcTxnKeyV1 ctrc_key;
 	ClusterCtrcParticipantIdentity participant;
 
@@ -1220,6 +1224,9 @@ UT_TEST(test_current_mx_active_proof_reconstructs_exact_ctrc_identity)
 	proof_key.tt_slot_id = cluster_tt_slot_offset_to_id(TEST_TT_OFFSET);
 	proof_key.cluster_epoch = (uint32)test_formation_epoch;
 	proof_key.local_xid = TEST_ORIGIN_XID;
+	proof_key.segment_generation = 23;
+	proof_key.slot_wrap = TEST_ORIGIN_WRAP;
+	proof_key.binding_version = CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION;
 	memset(&ctrc_key, 0xa5, sizeof(ctrc_key));
 	memset(&participant, 0xa5, sizeof(participant));
 
@@ -1247,6 +1254,47 @@ UT_TEST(test_current_mx_active_proof_reconstructs_exact_ctrc_identity)
 	UT_ASSERT(!cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 		&proof_key, 17, 0, &ctrc_key, &participant));
 	UT_ASSERT_EQ(participant.capability_record_generation, (uint32)0);
+}
+
+/* MXA-T41: the member origin, not the requester, owns the canonical SCUR
+ * sample.  Its proof must carry the exact generation/wrap needed to rebuild
+ * the CTRC receipt identity; consuming that private proof must perform no
+ * requester-side block-0 acquire, sample, copy, or publication. */
+UT_TEST(test_current_mx_active_proof_uses_origin_binding_without_foreign_storage)
+{
+	ClusterCurrentMemberProofKey proof_key;
+	ClusterCtrcTxnKeyV1 ctrc_key;
+	ClusterCtrcParticipantIdentity participant;
+
+	reset_exact_origin_fixture();
+	test_tt_slot.status = TT_SLOT_ACTIVE;
+	test_tt_slot.commit_scn = InvalidScn;
+	test_durable_locator_available = false;
+	memset(&proof_key, 0, sizeof(proof_key));
+	proof_key.origin_node_id = 0;
+	proof_key.undo_segment_id = TEST_TT_SEGMENT;
+	proof_key.tt_slot_id = cluster_tt_slot_offset_to_id(TEST_TT_OFFSET);
+	proof_key.cluster_epoch = (uint32)test_formation_epoch;
+	proof_key.local_xid = TEST_ORIGIN_XID;
+	proof_key.segment_generation = 23;
+	proof_key.slot_wrap = TEST_ORIGIN_WRAP;
+	proof_key.binding_version = CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION;
+	test_candidate_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	memset(&ctrc_key, 0xa5, sizeof(ctrc_key));
+	memset(&participant, 0xa5, sizeof(participant));
+
+	UT_ASSERT(cluster_runtime_visibility_active_proof_ctrc_identity_exact(
+		&proof_key, 17, 313, &ctrc_key, &participant));
+	UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+	UT_ASSERT_EQ(test_candidate_sample_calls, 0);
+	UT_ASSERT_EQ(test_candidate_block0_copy_calls, 0);
+	UT_ASSERT_EQ(test_candidate_release_calls, 0);
+	UT_ASSERT_EQ(ctrc_key.segment_id, TEST_TT_SEGMENT);
+	UT_ASSERT_EQ(ctrc_key.segment_generation, (uint32)23);
+	UT_ASSERT_EQ(ctrc_key.slot_offset, TEST_TT_OFFSET);
+	UT_ASSERT_EQ(ctrc_key.slot_wrap, TEST_ORIGIN_WRAP);
+	UT_ASSERT_EQ(ctrc_key.xid, TEST_ORIGIN_XID);
+	UT_ASSERT_EQ(participant.capability_record_generation, (uint32)313);
 }
 
 UT_TEST(test_current_member_rolled_terminal_uses_locator_then_canonical_scur)
@@ -2902,7 +2950,7 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 int
 main(void)
 {
-	UT_PLAN(92);
+	UT_PLAN(93);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -2948,6 +2996,7 @@ main(void)
 	UT_RUN(test_ctrc_physical_active_sample_excludes_precommit_committed_window);
 	UT_RUN(test_ctrc_current_owner_uses_published_binding_across_rollover);
 	UT_RUN(test_current_mx_active_proof_reconstructs_exact_ctrc_identity);
+	UT_RUN(test_current_mx_active_proof_uses_origin_binding_without_foreign_storage);
 	UT_RUN(test_current_member_rolled_terminal_uses_locator_then_canonical_scur);
 	UT_RUN(test_current_member_terminal_on_current_segment_survives_retired_owner_index);
 	UT_RUN(test_current_member_local_terminal_accepts_clean_formation_epoch_zero);

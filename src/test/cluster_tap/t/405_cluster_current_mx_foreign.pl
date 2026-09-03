@@ -261,6 +261,10 @@ my $quad = PostgreSQL::Test::ClusterQuad->new_quad(
 	shared_system_identifier_seed_sql => q{
 		CREATE EXTENSION IF NOT EXISTS pageinspect;
 		CREATE TABLE cmxf_t (id int, v int);
+		CREATE TABLE cmxf_cross_churn (id int PRIMARY KEY, v int)
+		    WITH (fillfactor = 50);
+		CREATE TABLE cmxf_cross (id int PRIMARY KEY, v int, pad text)
+		    WITH (fillfactor = 50);
 	},
 	data_port_span      => 2,
 	extra_conf          => [
@@ -455,6 +459,29 @@ my $certificate_before
 	  + ctrc_int($node0, 'certificate_replayed_count');
 my $l11_before = ctrc_int($node0, 'l11_release_sample_count');
 my $l12_before = ctrc_int($node0, 'l12_recycle_count');
+my $transport_before = {};
+for my $node_diag ([node0 => $node0], [node1 => $node1])
+{
+	my ($name, $node) = @$node_diag;
+	$transport_before->{$name} = $node->safe_psql(
+		'postgres',
+		q{SELECT string_agg(category || '.' || key || '=' || value, ', '
+		                  ORDER BY category, key)
+		    FROM pg_cluster_state
+		   WHERE (category = 'lms' AND key IN
+		          ('lms_data_dispatch_count_w0',
+		           'lms_data_dispatch_count_w1',
+		           'lms_direct_reply_count_w0',
+		           'lms_direct_reply_count_w1',
+		           'lms_inline_serve_count_w0',
+		           'lms_inline_serve_count_w1'))
+		      OR (category = 'gcs' AND key IN
+		          ('block_reply_count', 'stale_reply_drop_count'))
+		      OR (category = 'ic' AND key IN
+		          ('tier1_fifo_admitted_data',
+		           'tier1_fifo_promoted_data',
+		           'tier1_fifo_dropped_close_data'))});
+}
 
 ok(ctrc_barrier($node0, 1, 1),
 	'origin ACTIVE-proof scheduling barrier armed');
@@ -499,6 +526,7 @@ unless ($entered_current_wait)
 	for my $node_diag ([node0 => $node0], [node1 => $node1])
 	{
 		my ($name, $node) = @$node_diag;
+		diag($name . ' transport baseline: ' . $transport_before->{$name});
 		diag($name . ' transport counters: ' . $node->safe_psql(
 			'postgres',
 			q{SELECT string_agg(category || '.' || key || '=' || value, ', '
@@ -506,9 +534,21 @@ unless ($entered_current_wait)
 			    FROM pg_cluster_state
 			   WHERE (category = 'lms' AND key IN
 			          ('lms_data_dispatch_count',
+			           'lms_data_dispatch_count_w0',
+			           'lms_data_dispatch_count_w1',
+			           'lms_direct_reply_count_w0',
+			           'lms_direct_reply_count_w1',
+			           'lms_inline_serve_count_w0',
+			           'lms_inline_serve_count_w1',
 			           'lms_outbound_not_admitted_count',
 			           'lms_outbound_cap_guard_drop_count'))
-			      OR (category = 'gcs' AND key = 'block_forward_received_count')}));
+			      OR (category = 'gcs' AND key IN
+			          ('block_forward_received_count',
+			           'block_reply_count', 'stale_reply_drop_count'))
+			      OR (category = 'ic' AND key IN
+			          ('tier1_fifo_admitted_data',
+			           'tier1_fifo_promoted_data',
+			           'tier1_fifo_dropped_close_data'))}));
 	}
 }
 ok($entered_current_wait,
@@ -602,17 +642,15 @@ cmp_ok(ctrc_int($node1, 'current_mx_publication_after_apply_count'), '>',
 	'remote-member receipt is APPLIED before current-MX tuple publication');
 
 # Adjustment 15: force a real DATA-record-segment != canonical-TT-segment
-# successor using only production lifecycle.  The held snapshot retains every
-# completed TT slot; at most 64 short commits therefore cross the 48-slot
-# current TT segment while the tiny DATA workload remains in its original
-# 64-MiB segment.
+# successor using only production lifecycle.  The empty fixture relations are
+# part of the native four-node baseline so this authority test does not depend
+# on an unrelated mid-run catalog-invalidation round.  The held snapshot
+# retains every completed TT slot; at most 64 short commits therefore cross
+# the 48-slot current TT segment while the tiny DATA workload remains in its
+# original 64-MiB segment.
 $node0->safe_psql(
 	'postgres',
-	q{CREATE TABLE cmxf_cross_churn (id int PRIMARY KEY, v int)
-	    WITH (fillfactor = 50);
-	  CREATE TABLE cmxf_cross (id int PRIMARY KEY, v int, pad text)
-	    WITH (fillfactor = 50);
-	  INSERT INTO cmxf_cross_churn VALUES (1, 0);
+	q{INSERT INTO cmxf_cross_churn VALUES (1, 0);
 	  INSERT INTO cmxf_cross VALUES
 	    (1, 0, repeat('a', 64)),
 	    (2, 0, repeat('b', 64)),
@@ -676,6 +714,11 @@ is($node1->safe_psql(
 		'UPDATE cmxf_cross SET v = v + 1 WHERE id = 1 RETURNING v'),
 	'2',
 	'remote native UPDATE follows the committed HOT successor exactly once');
+is($node1->safe_psql(
+		'postgres',
+		'UPDATE cmxf_cross SET v = v + 1 WHERE id = 3 RETURNING v'),
+	'1',
+	'drift actor is refreshed on the current page holder after retention rollover');
 ok(wait_for(
 		sub {
 			return state_int(
@@ -709,26 +752,26 @@ is($node1->safe_psql(
 		     split_part(trim(both '()' from ctid::text), ',', 1)) = 1
 		   FROM cmxf_cross WHERE id IN (2, 3)}),
 	't', 'drift target and unrelated actor tuple occupy the same heap page');
-my $drift_barrier_before = ctrc_int($node0, 'test_barrier_hit_count');
+my $drift_barrier_before = ctrc_int($node1, 'test_barrier_hit_count');
 my $aba_before = state_int($node1, 'aba_restart_count');
-ok(ctrc_barrier($node0, 1, 1),
-	'cross-segment proof-ready scheduling barrier armed for page drift');
+ok(ctrc_barrier($node1, 4, 1),
+	'requester requalification scheduling barrier armed for page drift');
 my $drift_writer = $node1->background_psql('postgres', on_error_die => 1);
 start_blocking($drift_writer,
 	'UPDATE cmxf_cross SET v = v + 1 WHERE id = 2');
 ok(wait_for(
 		sub {
-			return ctrc_int($node0, 'test_barrier_hit_count')
+			return ctrc_int($node1, 'test_barrier_hit_count')
 			  > $drift_barrier_before;
 		},
 		20),
-	'origin pauses only after completing the cross-segment proof');
+	'requester pauses after proof return and before page requalification');
 is($node1->safe_psql(
 		'postgres',
 		'UPDATE cmxf_cross SET v = v + 1 WHERE id = 3 RETURNING v'),
-	'1', 'same-page unrelated actor changes the saved requester witness');
-ok(ctrc_barrier($node0, 0, 0),
-	'cross-segment proof-ready scheduling barrier released');
+	'2', 'same-page unrelated actor changes the saved requester witness');
+ok(ctrc_barrier($node1, 0, 0),
+	'requester requalification scheduling barrier released');
 ok(wait_for(
 		sub {
 			return $node1->safe_psql(

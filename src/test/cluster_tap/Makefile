@@ -26,7 +26,7 @@ subdir = src/test/cluster_tap
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
-EXTRA_INSTALL=
+EXTRA_INSTALL=contrib/pageinspect
 
 all:
 

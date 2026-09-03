@@ -59,6 +59,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h" /* cluster_peer_mode_enabled (D3-2) */
 #include "cluster/cluster_membership.h"
+#include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_recovery_merge.h"
@@ -1356,7 +1357,7 @@ done:
 
 bool
 cluster_runtime_visibility_active_proof_ctrc_identity_exact(
-	const ClusterTTStatusKey *proof_key, uint32 ctrc_grant,
+	const ClusterCurrentMemberProofKey *proof_key, uint32 ctrc_grant,
 	uint32 requester_capability_generation,
 	ClusterCtrcTxnKeyV1 *ctrc_key_out,
 	ClusterCtrcParticipantIdentity *participant_out)
@@ -1365,28 +1366,17 @@ cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0ResolvedRoot root;
 	ClusterUndoBlock0ResolvedRoot final_root;
-	ClusterUndoBlock0Generation generation = { false, 0 };
-	ClusterUndoBlock0Generation final_generation = { false, 0 };
-	ClusterUndoBlock0CurrentGuard guard = { 0 };
-	ClusterRuntimeCandidateCleanup cleanup = { &guard, false };
-	ClusterUndoBlock0Result current_result
-		= CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
-	ClusterTTDurableLocate locate_result;
-	PGAlignedBlock block0;
-	const UndoSegmentHeaderData *header;
-	TTSlot exact_slot;
 	ClusterCtrcTxnKeyV1 key;
 	ClusterCtrcParticipantIdentity participant;
 	uint16 segment_id = 0;
 	uint16 slot_offset = 0;
-	uint16 slot_wrap = TT_WRAP_INVALID;
 	uint64 origin_boot = 0;
 	uint64 observed_generation = 0;
 	uint64 participant_boot;
 	uint64 system_identifier;
 	uint64 epoch;
 	bool entered = false;
-	bool sampled = false;
+	bool valid = false;
 
 	if (ctrc_key_out != NULL)
 		memset(ctrc_key_out, 0, sizeof(*ctrc_key_out));
@@ -1405,7 +1395,10 @@ cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 		|| proof_key->origin_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| proof_key->undo_segment_id == 0 || proof_key->tt_slot_id == 0
 		|| !TransactionIdIsNormal(proof_key->local_xid)
-		|| proof_key->_reserved != 0 || proof_key->_reserved2 != 0
+		|| proof_key->binding_version
+		   != CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION
+		|| proof_key->segment_generation == UINT32_MAX
+		|| proof_key->slot_wrap > TT_WRAP_MAX
 		|| cluster_xid_origin_slot(proof_key->local_xid)
 		   != proof_key->origin_node_id)
 		return false;
@@ -1413,18 +1406,14 @@ cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 	if (epoch > UINT32_MAX || proof_key->cluster_epoch != (uint32)epoch)
 		return false;
 
-	/* The scan supplies a physical locator only.  The resident block0 sample
-	 * below is the sole ACTIVE authority and is bracketed by exact generation,
-	 * root, formation and admission rechecks. */
-	locate_result = cluster_tt_slot_durable_locate_any_by_xid_origin(
-		proof_key->origin_node_id, proof_key->local_xid, &segment_id,
-		&slot_offset, &slot_wrap, NULL);
-	if (locate_result != CLUSTER_TT_DURABLE_LOCATE_FOUND
-		|| segment_id != proof_key->undo_segment_id
-		|| slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| slot_wrap == TT_WRAP_INVALID
-		|| cluster_tt_slot_offset_to_id(slot_offset) != proof_key->tt_slot_id)
+	/* The member origin sampled canonical block-0 under SCUR and bound its
+	 * exact incarnation into this private proof.  The requester rechecks the
+	 * surrounding admission/root/membership identities, but never acquires or
+	 * installs a foreign live-owner block-0 image. */
+	segment_id = proof_key->undo_segment_id;
+	if (proof_key->tt_slot_id > TT_SLOTS_PER_SEGMENT)
 		return false;
+	slot_offset = cluster_tt_slot_id_to_offset(proof_key->tt_slot_id);
 
 	if (cluster_semantic_activation_enter(
 			CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
@@ -1458,89 +1447,44 @@ cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 	if (participant_boot == 0 || origin_boot == 0 || system_identifier == 0)
 		goto done;
 
-	cluster_runtime_visibility_ensure_exit_hooks();
-	PG_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
-						  PointerGetDatum(&cleanup));
-	{
-		if (cluster_runtime_visibility_candidate_acquire(
-				&logical, &admission, &guard, &cleanup, &current_result)
-			!= CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-			goto candidate_done;
-		if (cluster_undo_block0_current_sample_generation(
-				&guard, &root, &generation) != CLUSTER_UNDO_BLOCK0_OK
-			|| !generation.known || generation.value == UINT32_MAX
-			|| cluster_undo_block0_current_copy_resident(
-				&guard, &root, &generation, block0.data)
-			   != CLUSTER_UNDO_BLOCK0_OK)
-			goto candidate_done;
-		header = (const UndoSegmentHeaderData *)block0.data;
-		exact_slot = header->tt_slots[slot_offset];
-		if (exact_slot.xid != proof_key->local_xid
-			|| exact_slot.wrap != slot_wrap
-			|| exact_slot.status != TT_SLOT_ACTIVE
-			|| exact_slot.commit_scn != InvalidScn
-			|| cluster_undo_block0_current_sample_generation(
-				&guard, &root, &final_generation) != CLUSTER_UNDO_BLOCK0_OK
-			|| !final_generation.known
-			|| final_generation.value != generation.value
-			|| !cluster_runtime_visibility_resolve_root_admitted(
-				CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
-				CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
-				logical.segment_id, &final_root)
-			|| !cluster_runtime_visibility_candidate_root_matches(
-				&root, &final_root)
-			|| !cluster_runtime_visibility_admission_current(
-				CLUSTER_TX_RESOLVE_VISIBILITY, &admission))
-			goto candidate_done;
-
-		key.format_version = CLUSTER_CTRC_FORMAT_VERSION;
-		key.owner_instance = logical.owner_instance;
-		key.origin_node_id = proof_key->origin_node_id;
-		key.segment_id = segment_id;
-		key.segment_generation = generation.value;
-		key.slot_offset = slot_offset;
-		key.slot_wrap = slot_wrap;
-		key.xid = proof_key->local_xid;
-		key.cluster_epoch = (uint32)epoch;
-		key.system_identifier = system_identifier;
-		key.origin_boot_incarnation = origin_boot;
-		key.formation_epoch = admission.formation_epoch;
-		key.admission_record_generation = admission.record_generation;
-		key.root_descriptor_incarnation = root.root_generation;
-		key.root_id = root.root_id;
-		key.root_generation = root.root_generation;
-		participant.node_id = (uint16)cluster_node_id;
-		participant.capability_record_generation
-			= requester_capability_generation;
-		participant.boot_incarnation = participant_boot;
-		participant.formation_epoch = admission.formation_epoch;
-		participant.admission_record_generation
-			= admission.record_generation;
-		sampled = true;
-
-candidate_done:
-		if (cleanup.active)
-		{
-			if (cluster_runtime_visibility_candidate_release(
-					&guard, &current_result)
-				!= CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED)
-			{
-				cluster_undo_block0_current_cancel(&guard);
-				sampled = false;
-			}
-			cleanup.active = false;
-		}
-	}
-	PG_END_ENSURE_ERROR_CLEANUP(cluster_runtime_visibility_candidate_cleanup,
-							  PointerGetDatum(&cleanup));
-
-	if (sampled
-		&& (cluster_epoch_get_current() != epoch
-			|| cluster_qvotec_get_self_incarnation() != participant_boot
-			|| !cluster_runtime_visibility_admission_current(
-				CLUSTER_TX_RESOLVE_VISIBILITY, &admission)))
-		sampled = false;
-	if (sampled && proof_key->origin_node_id != (uint16)cluster_node_id)
+	if (root.root_id == 0 || root.root_generation == 0)
+		goto done;
+	key.format_version = CLUSTER_CTRC_FORMAT_VERSION;
+	key.owner_instance = logical.owner_instance;
+	key.origin_node_id = proof_key->origin_node_id;
+	key.segment_id = segment_id;
+	key.segment_generation = proof_key->segment_generation;
+	key.slot_offset = slot_offset;
+	key.slot_wrap = proof_key->slot_wrap;
+	key.xid = proof_key->local_xid;
+	key.cluster_epoch = (uint32)epoch;
+	key.system_identifier = system_identifier;
+	key.origin_boot_incarnation = origin_boot;
+	key.formation_epoch = admission.formation_epoch;
+	key.admission_record_generation = admission.record_generation;
+	key.root_descriptor_incarnation = root.root_generation;
+	key.root_id = root.root_id;
+	key.root_generation = root.root_generation;
+	participant.node_id = (uint16)cluster_node_id;
+	participant.capability_record_generation
+		= requester_capability_generation;
+	participant.boot_incarnation = participant_boot;
+	participant.formation_epoch = admission.formation_epoch;
+	participant.admission_record_generation
+		= admission.record_generation;
+	if (!cluster_runtime_visibility_resolve_root_admitted(
+			CLUSTER_TX_RESOLVE_VISIBILITY, &admission,
+			CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+			logical.segment_id, &final_root)
+		|| !cluster_runtime_visibility_candidate_root_matches(
+			&root, &final_root)
+		|| cluster_epoch_get_current() != epoch
+		|| cluster_qvotec_get_self_incarnation() != participant_boot
+		|| !cluster_runtime_visibility_admission_current(
+			CLUSTER_TX_RESOLVE_VISIBILITY, &admission))
+		goto done;
+	valid = true;
+	if (proof_key->origin_node_id != (uint16)cluster_node_id)
 	{
 		uint64 final_origin_boot = 0;
 		uint64 final_observed_generation = 0;
@@ -1553,13 +1497,13 @@ candidate_done:
 			   != epoch
 			|| cluster_membership_get_last_admitted_incarnation(
 				proof_key->origin_node_id) != origin_boot)
-			sampled = false;
+			valid = false;
 	}
 
 done:
 	if (entered)
 		cluster_semantic_activation_leave(&admission);
-	if (!sampled)
+	if (!valid)
 		return false;
 	*ctrc_key_out = key;
 	*participant_out = participant;
@@ -1638,7 +1582,6 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	ClusterTxOutcome outcome;
 	ClusterTxProofKind proof_kind = CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG;
-	ClusterUndoBlock0Result current_result;
 	PGAlignedBlock block0;
 	PGAlignedBlock data_page;
 	PGAlignedBlock record_buf;
@@ -1647,13 +1590,13 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	TTSlot exact_slot;
 	TransactionId top_xid = InvalidTransactionId;
 	SCN commit_scn = InvalidScn;
-	NodeId origin;
-	uint32 segment_id;
-	uint32 block_no;
-	uint16 tt_slot_offset;
-	uint16 row_offset;
+	NodeId origin = InvalidNodeId;
+	uint32 segment_id = 0;
+	uint32 block_no = 0;
+	uint16 tt_slot_offset = 0;
+	uint16 row_offset = 0;
 	size_t record_length = 0;
-	uint32 tt_segment_id;
+	uint32 tt_segment_id = 0;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -1695,9 +1638,8 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 	plan_data->data_logical.owner_instance
 		= (uint8)((uint32)origin + 1);
 	plan_data->data_logical.segment_id = segment_id;
-	current_result = cluster_undo_block0_current_sample_generation(
-		guard, root, &generation);
-	if (current_result != CLUSTER_UNDO_BLOCK0_OK
+	if (cluster_undo_block0_current_sample_generation(
+			guard, root, &generation) != CLUSTER_UNDO_BLOCK0_OK
 		|| !generation.known || generation.value == UINT32_MAX)
 		goto failed;
 	if (expected_generation != NULL
@@ -1706,12 +1648,13 @@ cluster_runtime_visibility_origin_plan_freeze_data_held(
 			|| expected_generation->value != generation.value))
 		goto failed;
 	if (cluster_undo_block0_current_copy_resident(
-			guard, root, &generation, block0.data)
-		!= CLUSTER_UNDO_BLOCK0_OK
-		|| !cluster_undo_buf_copy_resident(
+			guard, root, &generation, block0.data) != CLUSTER_UNDO_BLOCK0_OK)
+		goto failed;
+	if (!cluster_undo_buf_copy_resident(
 			segment_id, plan_data->data_logical.owner_instance, block_no,
-			data_page.data)
-		|| !cluster_cr_r4_extract_resident_record(
+			data_page.data))
+		goto failed;
+	if (!cluster_cr_r4_extract_resident_record(
 			data_page.data, locator, record_buf.data, &record_length,
 			&canonical_locator)
 		|| record_length < sizeof(UndoRecordHeader))
@@ -2108,6 +2051,8 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
 	uint32 *ctrc_grant_out,
 	uint32 *participant_capability_generation_out,
+	ClusterCtrcTxnKeyV1 *ctrc_key_out,
+	ClusterTxLocator *canonical_locator_out,
 	bool *cross_segment_out)
 {
 	ClusterSemanticAdmissionToken admission;
@@ -2158,6 +2103,10 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 		*ctrc_grant_out = 0;
 	if (participant_capability_generation_out != NULL)
 		*participant_capability_generation_out = 0;
+	if (ctrc_key_out != NULL)
+		memset(ctrc_key_out, 0, sizeof(*ctrc_key_out));
+	if (canonical_locator_out != NULL)
+		memset(canonical_locator_out, 0, sizeof(*canonical_locator_out));
 	if (cross_segment_out != NULL)
 		*cross_segment_out = false;
 	memset(&admission, 0, sizeof(admission));
@@ -2181,11 +2130,12 @@ cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	if (locator == NULL || key_out == NULL || result_out == NULL
 		|| ctrc_grant_out == NULL
 		|| participant_capability_generation_out == NULL
+		|| ctrc_key_out == NULL
+		|| canonical_locator_out == NULL
 		|| cross_segment_out == NULL
 		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
 		|| !TransactionIdIsNormal(locator->xid)
-		|| locator->tt_wrap == TT_WRAP_INVALID
-		|| locator->tt_wrap > TT_WRAP_MAX
+		|| locator->tt_wrap != TT_WRAP_INVALID
 		|| !uba_decode(locator->uba, &data_segment, &block_no,
 					   &tt_slot_offset, &row_offset)
 		|| block_no == 0 || tt_slot_offset >= TT_SLOTS_PER_SEGMENT
@@ -2383,6 +2333,9 @@ done:
 	*ctrc_grant_out = grant;
 	*participant_capability_generation_out = grant == 0
 		? 0 : participant.capability_record_generation;
+	if (grant != 0)
+		*ctrc_key_out = ctrc_key;
+	*canonical_locator_out = resolution.locator_echo;
 	*cross_segment_out = !same_segment;
 	return true;
 }

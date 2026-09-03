@@ -64,6 +64,9 @@ bool cluster_multi_xmax_remote_resolve = false;
 int cluster_subtrans_max_chain_depth = 8;
 
 static ClusterSemanticAdmissionResult admission_result;
+static ClusterSemanticAdmissionResult target_admission_result;
+static ClusterSemanticAdmissionResult source_admission_result;
+static bool admission_result_by_side;
 static bool admission_recheck_ok;
 static int admission_enter_count;
 static int admission_recheck_count;
@@ -118,12 +121,26 @@ static void
 reset_admission(ClusterSemanticAdmissionResult result, bool recheck_ok)
 {
 	admission_result = result;
+	target_admission_result = result;
+	source_admission_result = result;
+	admission_result_by_side = false;
 	admission_recheck_ok = recheck_ok;
 	admission_enter_count = 0;
 	admission_recheck_count = 0;
 	admission_leave_count = 0;
 	admission_feature = 0;
 	admission_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+}
+
+static void
+reset_admission_sides(ClusterSemanticAdmissionResult target_result,
+					  ClusterSemanticAdmissionResult source_result,
+					  bool recheck_ok)
+{
+	reset_admission(target_result, recheck_ok);
+	target_admission_result = target_result;
+	source_admission_result = source_result;
+	admission_result_by_side = true;
 }
 
 void
@@ -138,11 +155,17 @@ ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
 								  ClusterSemanticAdmissionToken *token)
 {
+	ClusterSemanticAdmissionResult selected_result
+		= admission_result_by_side
+			? (side == CLUSTER_SEMANTIC_TARGET_SIDE
+				   ? target_admission_result : source_admission_result)
+			: admission_result;
+
 	admission_enter_count++;
 	admission_feature = feature_bit;
 	admission_side = side;
 	memset(token, 0, sizeof(*token));
-	if (admission_result == CLUSTER_SEMANTIC_ADMISSION_OK)
+	if (selected_result == CLUSTER_SEMANTIC_ADMISSION_OK)
 	{
 		token->feature_bit = feature_bit;
 		token->record_generation = 7;
@@ -150,7 +173,7 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 		token->side = (uint8) side;
 		token->entered = true;
 	}
-	return admission_result;
+	return selected_result;
 }
 
 bool
@@ -724,6 +747,71 @@ UT_TEST(t10_recovery_projection_create_has_exact_postread)
 		&operation, NULL, 0, 201, 202));
 }
 
+UT_TEST(t11_remote_visibility_follows_current_semantic_side)
+{
+	ClusterMultiXactKey key;
+	ClusterMultiXactMember member;
+	ClusterMultiXactSourceRequest request;
+	ClusterMultiXactSourceResult result;
+	SnapshotData snapshot;
+
+	memset(&key, 0, sizeof(key));
+	key.origin_node_id = 3;
+	key.multixact_id = 91;
+	key.cluster_epoch = 19;
+	memset(&member, 0, sizeof(member));
+	member.xid = FirstNormalTransactionId + 9;
+	member.status = MultiXactStatusForShare;
+	request = make_install_request(&key, &member);
+	reset_admission(CLUSTER_SEMANTIC_ADMISSION_OK, true);
+	UT_ASSERT_EQ((int) cluster_multixact_source_dispatch(
+		CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL, &request, &result),
+		(int) CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(result.bool_value);
+
+	memset(&snapshot, 0, sizeof(snapshot));
+	memset(&request, 0, sizeof(request));
+	request.snapshot = &snapshot;
+	request.origin_slot = 3;
+	request.mxid = 91;
+
+	/* OPEN R4 owns the frozen reader operation through TARGET admission. */
+	reset_admission_sides(CLUSTER_SEMANTIC_ADMISSION_OK,
+		CLUSTER_SEMANTIC_ADMISSION_SOURCE_DORMANT, true);
+	UT_ASSERT_EQ((int) cluster_multixact_remote_xmax_visibility_dispatch(
+		&request, &result), (int) CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(admission_enter_count, 1);
+	UT_ASSERT_EQ((int) admission_side, (int) CLUSTER_SEMANTIC_TARGET_SIDE);
+	UT_ASSERT_EQ(admission_recheck_count, 1);
+	UT_ASSERT_EQ(admission_leave_count, 1);
+	UT_ASSERT_EQ((int) result.visibility, (int) CLUSTER_VISIBILITY_VISIBLE);
+	UT_ASSERT(result.overlay_hit);
+
+	/* Before activation, exact TARGET_DISABLED may fall back to SOURCE. */
+	reset_admission_sides(CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED,
+		CLUSTER_SEMANTIC_ADMISSION_OK, true);
+	UT_ASSERT_EQ((int) cluster_multixact_remote_xmax_visibility_dispatch(
+		&request, &result), (int) CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(admission_enter_count, 2);
+	UT_ASSERT_EQ((int) admission_side, (int) CLUSTER_SEMANTIC_SOURCE_SIDE);
+	UT_ASSERT_EQ(admission_recheck_count, 1);
+	UT_ASSERT_EQ(admission_leave_count, 1);
+	UT_ASSERT_EQ((int) result.visibility, (int) CLUSTER_VISIBILITY_VISIBLE);
+
+	/* Generation drift is not a license to cross the cutover boundary. */
+	memset(&result, 0x7f, sizeof(result));
+	reset_admission_sides(CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED,
+		CLUSTER_SEMANTIC_ADMISSION_OK, true);
+	UT_ASSERT_EQ((int) cluster_multixact_remote_xmax_visibility_dispatch(
+		&request, &result),
+		(int) CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED);
+	UT_ASSERT_EQ(admission_enter_count, 1);
+	UT_ASSERT_EQ(admission_recheck_count, 0);
+	UT_ASSERT_EQ(admission_leave_count, 0);
+	UT_ASSERT_EQ((int) result.visibility, 0);
+	UT_ASSERT(!result.overlay_hit);
+}
+
 int
 main(void)
 {
@@ -732,7 +820,7 @@ main(void)
 	memset(&fake_hash_entry, 0, sizeof(fake_hash_entry));
 	cluster_multixact_shmem_init();
 
-	UT_PLAN(10);
+	UT_PLAN(11);
 	UT_RUN(t1_frozen_dispatch_surface);
 	UT_RUN(t2_dormant_refuses_before_request_and_mutation);
 	UT_RUN(t3_invalid_after_admission_closes_and_leaves);
@@ -743,6 +831,7 @@ main(void)
 	UT_RUN(t8_error_path_leaves_once_before_rethrow);
 	UT_RUN(t9_null_result_is_closed_after_balanced_admission);
 	UT_RUN(t10_recovery_projection_create_has_exact_postread);
+	UT_RUN(t11_remote_visibility_follows_current_semantic_side);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

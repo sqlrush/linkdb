@@ -88,6 +88,12 @@ UT_DEFINE_GLOBALS();
 #ifndef XACT_SOURCE_PATH
 #error "XACT_SOURCE_PATH must identify production xact.c"
 #endif
+#ifndef HEAPAM_HANDLER_SOURCE_PATH
+#error "HEAPAM_HANDLER_SOURCE_PATH must identify production heapam_handler.c"
+#endif
+#ifndef NBTINSERT_SOURCE_PATH
+#error "NBTINSERT_SOURCE_PATH must identify production nbtinsert.c"
+#endif
 
 
 void
@@ -180,6 +186,34 @@ assert_data_active_publish(const char *source, const char *start_marker, const c
 		crit_end = next;
 	}
 	UT_ASSERT(crit_end < publish);
+}
+
+static void
+assert_multi_insert_uses_receipt_safe_per_tuple_route(const char *source)
+{
+	const char *start = strstr(source, "\nheap_multi_insert(Relation");
+	const char *end = start == NULL
+		? NULL
+		: strstr(start, "\n/*\n *\tsimple_heap_insert - insert a tuple");
+	const char *route = start == NULL
+		? NULL
+		: strstr(start, "cluster_heap_multi_insert_route(");
+	const char *per_tuple = route == NULL
+		? NULL
+		: strstr(route, "heap_insert(relation, tuple, cid, options, bistate);");
+	const char *route_return = per_tuple == NULL
+		? NULL
+		: strstr(per_tuple, "\n\t\treturn;");
+
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(route);
+	UT_ASSERT_NOT_NULL(per_tuple);
+	UT_ASSERT_NOT_NULL(route_return);
+	if (start != NULL && end != NULL && route != NULL && per_tuple != NULL
+		&& route_return != NULL)
+		UT_ASSERT(start < route && route < per_tuple
+				  && per_tuple < route_return && route_return < end);
 }
 
 
@@ -339,8 +373,7 @@ UT_TEST(test_p033_data_dml_publishes_active_identity)
 	}
 	assert_data_active_publish(heap_source, "\nheap_insert(Relation",
 							   "\nheap_prepare_insert(Relation", "cluster_itl_uba");
-	assert_data_active_publish(heap_source, "\nheap_multi_insert(Relation",
-							   "\nsimple_heap_insert(Relation", "cluster_mi_uba");
+	assert_multi_insert_uses_receipt_safe_per_tuple_route(heap_source);
 	assert_data_active_publish(heap_source, "\nheap_delete(Relation",
 							   "\nsimple_heap_delete(Relation", "cluster_itl_uba");
 	assert_data_active_publish(heap_source, "\nheap_update(Relation",
@@ -381,6 +414,127 @@ UT_TEST(test_p033_active_and_safety_boundary_matrix)
 				 (int)CLUSTER_VIS_ROUTE_FAILCLOSED_UNKNOWN);
 	UT_ASSERT_EQ((int)cluster_vis_update_xmin_verdict(CLUSTER_TT_STATUS_UNKNOWN),
 				 (int)CVV_FAILCLOSED_UNKNOWN);
+}
+
+/* S3-P0-26 wiring: the HTSU fork must receive curcid and delegate the
+ * remote-xmin/current-xmax decision to the exhaustive three-state helper. */
+UT_TEST(test_update_fork_preserves_native_self_three_state)
+{
+	char *source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	const char *start;
+	const char *end;
+	const char *helper;
+	const char *entry;
+
+	if (source == NULL)
+		return;
+	start = strstr(source, "\ncluster_satisfies_update_fork(HeapTuple htup, CommandId curcid,");
+	end = start == NULL ? NULL : strstr(start, "\n}\n#endif /* USE_PGRAC_CLUSTER */");
+	helper = start == NULL
+		? NULL
+		: strstr(start, "cluster_vis_update_native_self_verdict(");
+	entry = strstr(source,
+		"cluster_satisfies_update_fork(htup, curcid, buffer, &cluster_res)");
+
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(helper);
+	UT_ASSERT_NOT_NULL(entry);
+	if (start != NULL && end != NULL && helper != NULL)
+		UT_ASSERT(start < helper && helper < end);
+	free(source);
+}
+
+/* S3-P0-26 local-xmax sibling: after a remote xmin has been proved visible,
+ * a LOCAL/NONE lock-only xmax still follows PostgreSQL's native lifecycle.
+ * A live locker is TM_BeingModified, while either terminal outcome releases
+ * the row lock and is TM_Ok; a committed locker must never become
+ * TM_Updated merely because is_delete is false. */
+UT_TEST(test_update_fork_preserves_terminal_local_lock_only)
+{
+	char *source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	const char *start;
+	const char *end;
+	const char *lock_only;
+	const char *lock_released;
+	const char *committed_writer;
+
+	if (source == NULL)
+		return;
+	start = strstr(source,
+		"if (xmin_remote_visible) {\n\t\tif (TransactionIdIsInProgress(raw_xmax))");
+	end = start == NULL ? NULL : strstr(start, "\n\t}\n\n\treturn false;");
+	lock_only = start == NULL ? NULL : strstr(start, "else if (lock_only)");
+	lock_released = lock_only == NULL ? NULL : strstr(lock_only, "*res = TM_Ok;");
+	committed_writer = start == NULL
+		? NULL
+		: strstr(start, "else if (TransactionIdDidCommit(raw_xmax))");
+
+	UT_ASSERT_NOT_NULL(start);
+	UT_ASSERT_NOT_NULL(end);
+	UT_ASSERT_NOT_NULL(lock_only);
+	UT_ASSERT_NOT_NULL(lock_released);
+	UT_ASSERT_NOT_NULL(committed_writer);
+	if (start != NULL && end != NULL && lock_only != NULL
+		&& lock_released != NULL && committed_writer != NULL)
+		UT_ASSERT(start < lock_only && lock_only < lock_released
+				  && lock_released < committed_writer
+				  && committed_writer < end);
+	free(source);
+}
+
+/* Stage-8 PRE adjustment 23: SnapshotDirty must not hand a foreign raw xid
+ * to native XactLockTableWait.  The built-in heap/TableAM path carries the
+ * exact DATA locator as a sidecar, and nbtree waits only after releasing its
+ * leaf before restarting from search. */
+UT_TEST(test_dirty_remote_xmax_wait_uses_exact_unlocked_route)
+{
+	char *visibility_source = read_source(HEAPAM_VISIBILITY_SOURCE_PATH);
+	char *heap_source = read_source(HEAPAM_SOURCE_PATH);
+	char *handler_source = read_source(HEAPAM_HANDLER_SOURCE_PATH);
+	char *nbtree_source = read_source(NBTINSERT_SOURCE_PATH);
+	const char *capture;
+	const char *propagate;
+	const char *wait_branch;
+	const char *release_leaf;
+	const char *exact_wait;
+	const char *research;
+
+	if (visibility_source == NULL || heap_source == NULL
+		|| handler_source == NULL || nbtree_source == NULL)
+		goto done;
+
+	capture = strstr(visibility_source,
+		"cluster_vis_dirty_remote_xmax_waitable(");
+	propagate = strstr(handler_source, "remote_xmax_wait");
+	wait_branch = strstr(nbtree_source, "if (remote_xmax_wait)");
+	release_leaf = wait_branch == NULL
+		? NULL
+		: strstr(wait_branch, "_bt_relbuf(rel, insertstate.buf);");
+	exact_wait = wait_branch == NULL
+		? NULL
+		: strstr(wait_branch, "cluster_tx_enqueue_wait_exact(");
+	research = exact_wait == NULL ? NULL : strstr(exact_wait, "goto search;");
+
+	UT_ASSERT_NOT_NULL(capture);
+	UT_ASSERT_NOT_NULL(strstr(heap_source, "row_wait_locator_valid"));
+	UT_ASSERT_NOT_NULL(propagate);
+	UT_ASSERT_NOT_NULL(wait_branch);
+	UT_ASSERT_NOT_NULL(release_leaf);
+	UT_ASSERT_NOT_NULL(exact_wait);
+	UT_ASSERT_NOT_NULL(research);
+	if (wait_branch != NULL && release_leaf != NULL && exact_wait != NULL
+		&& research != NULL)
+		UT_ASSERT(wait_branch < release_leaf && release_leaf < exact_wait
+				  && exact_wait < research);
+	UT_ASSERT(strstr(nbtree_source,
+		"XactLockTableWait(remote_wait_locator.xid") == NULL);
+
+done:
+	free(visibility_source);
+	free(heap_source);
+	free(handler_source);
+	free(nbtree_source);
 }
 
 /* P0-27 already freezes the exact HEAP_XMIN_FROZEN bit pair as durable
@@ -681,6 +835,9 @@ main(void)
 	UT_RUN(test_t12_status_enum_5_values);
 	UT_RUN(test_p033_data_dml_publishes_active_identity);
 	UT_RUN(test_p033_active_and_safety_boundary_matrix);
+	UT_RUN(test_update_fork_preserves_native_self_three_state);
+	UT_RUN(test_update_fork_preserves_terminal_local_lock_only);
+	UT_RUN(test_dirty_remote_xmax_wait_uses_exact_unlocked_route);
 	UT_RUN(test_mvcc_frozen_xmin_bypasses_remote_resolve_but_keeps_xmax_gate);
 	UT_RUN(test_normal_commit_stamp_is_modifier_gated_and_error_safe);
 	UT_RUN(test_ordinary_abort_durable_receipt_precedes_allocator_reuse);

@@ -3888,7 +3888,8 @@ UT_TEST(test_resource_x_type17_target_drains_before_semantic_retention)
 	copy = retry_return != NULL
 		? strstr(retry_return, "cluster_bufmgr_copy_block_for_gcs(") : NULL;
 	retain = copy != NULL
-		? strstr(copy, "cluster_pcm_lock_resource_x_block_to_n_source_exact(")
+		? strstr(copy,
+			"cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(")
 		: NULL;
 	finish = retain != NULL
 		? strstr(retain,
@@ -3922,7 +3923,7 @@ UT_TEST(test_resource_x_type17_target_drains_before_semantic_retention)
 		forbidden = strstr(preflight, "LWLockAcquireOrWait(");
 		UT_ASSERT(forbidden == NULL || forbidden >= helper_end);
 		forbidden = strstr(busy,
-			"cluster_pcm_lock_resource_x_block_to_n_source_exact(");
+			"cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(");
 		UT_ASSERT(forbidden == NULL || forbidden >= retry_return);
 		forbidden = strstr(busy,
 			"cluster_pcm_lock_resource_x_holder_pair_publish_exact(");
@@ -4971,6 +4972,38 @@ UT_TEST(test_resource_x_d1_records_exact_first_failure_before_policy_change)
 	free(source);
 }
 
+UT_TEST(test_resource_x_terminal_failure_distinguishes_final_authority_observations)
+{
+	static const char *const terminal_recheck_contract[] = {
+		"action == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL",
+		"diagnostic_stage = \"terminal-recheck\"",
+		"terminal_admission_current\n",
+		"= cluster_semantic_activation_recheck(&admission)",
+		"terminal_session_check\n",
+		"= gcs_block_resource_x_gate_session_snapshot_result(",
+		"terminal_gate_session_current",
+		"if (!terminal_admission_current\n",
+		"|| !terminal_gate_session_current)",
+		"result = RESOURCE_X_APPLY_STALE"
+	};
+	char *source = read_gcs_block_source();
+
+	/* A terminal round is already exact retained authority, so a final
+	 * refusal must say whether semantic admission or the independently
+	 * sampled gate/session tuple failed.  The diagnostic remains read-only
+	 * and the refusal stays STALE; this RED does not authorize retry. */
+	assert_ordered_in_function(
+		source, "\ngcs_block_resource_x_target_acquire_internal(",
+		"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(",
+		terminal_recheck_contract, lengthof(terminal_recheck_contract));
+	UT_ASSERT_NOT_NULL(strstr(source, "terminal_admission_current=%s"));
+	UT_ASSERT_NOT_NULL(strstr(source, "terminal_session_check=%d"));
+	UT_ASSERT_NOT_NULL(strstr(source, "terminal_gate_current=%s"));
+	UT_ASSERT_NOT_NULL(strstr(source, "terminal_master=%d"));
+	UT_ASSERT_NOT_NULL(strstr(source, "terminal_session=%llu"));
+	free(source);
+}
+
 UT_TEST(test_resource_x_d6_remote_s_failure_decision_matrix)
 {
 	ResourceXRemoteSFailureDecision decision;
@@ -5292,6 +5325,80 @@ UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_terminal_pu
 		UT_ASSERT(resample_stage < terminal_exact
 			&& terminal_exact < generic_candidate);
 	free(source);
+}
+
+UT_TEST(test_resource_x_pending_terminal_resample_diagnostic_names_exact_mismatch)
+{
+	ClusterPcmOwnSnapshot pending;
+	ClusterPcmOwnSnapshot live;
+	ResourceXBootstrapRoundFailureSnapshot round;
+	uint64 mismatch;
+
+	memset(&pending, 0, sizeof(pending));
+	memset(&live, 0, sizeof(live));
+	memset(&round, 0, sizeof(round));
+	pending.tag.spcOid = 1663;
+	pending.tag.dbOid = 5;
+	pending.tag.relNumber = 16384;
+	pending.tag.forkNum = MAIN_FORKNUM;
+	pending.tag.blockNum = 223;
+	pending.pcm_state = (uint8) PCM_STATE_N;
+	pending.generation = 14;
+	pending.reservation_token = 8;
+	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	live = pending;
+	live.pcm_state = (uint8) PCM_STATE_X;
+	live.generation = 15;
+	live.flags = 0;
+	round.ref.assertion.resource = pending.tag;
+	round.ref.assertion.requester_node = 3;
+	round.ref.formation = 2;
+	round.ref.acquisition_generation = 89;
+	round.base_authority_generation = 2;
+	round.authority_generation = 4;
+	round.buffer_ownership_generation = 15;
+	round.r4_record_generation = 6;
+	round.master_session_incarnation = 841757195326937;
+	round.absolute_deadline_us = 991101455494;
+	round.retired_acquisition_generation = 89;
+	round.terminal = 1;
+
+	mismatch = cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+		&pending, &live, RESOURCE_X_APPLY_APPLIED, &round);
+	UT_ASSERT_EQ(mismatch, RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE);
+
+	round.buffer_ownership_generation++;
+	mismatch = cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+		&pending, &live, RESOURCE_X_APPLY_APPLIED, &round);
+	UT_ASSERT_EQ(mismatch,
+		RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_BUFFER_GENERATION);
+	round.buffer_ownership_generation--;
+
+	round.retired_acquisition_generation++;
+	mismatch = cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+		&pending, &live, RESOURCE_X_APPLY_APPLIED, &round);
+	UT_ASSERT_EQ(mismatch,
+		RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_RETIRED);
+	round.retired_acquisition_generation--;
+
+	round.ref.formation = 0;
+	mismatch = cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+		&pending, &live, RESOURCE_X_APPLY_APPLIED, &round);
+	UT_ASSERT_EQ(mismatch,
+		RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_FORMATION);
+	round.ref.formation = 2;
+
+	round.progress_flags = 1;
+	mismatch = cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+		&pending, &live, RESOURCE_X_APPLY_APPLIED, &round);
+	UT_ASSERT_EQ(mismatch,
+		RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_PROGRESS);
+	round.progress_flags = 0;
+
+	mismatch = cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+		&pending, &live, RESOURCE_X_APPLY_STALE, &round);
+	UT_ASSERT_EQ(mismatch,
+		RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_RESULT);
 }
 
 UT_TEST(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup)
@@ -5746,15 +5853,39 @@ UT_TEST(test_resource_x_direct_init_reprobes_exact_same_round_after_candidate_dr
 		"= direct_candidate_result == CLUSTER_PCM_OWN_BUSY"
 	};
 	char *source = read_gcs_block_source();
+	const char *candidate;
+	const char *direct_inflight;
+	const char *install_inflight;
+	const char *accept_inflight;
 
-	/* The exact known-new N check may race the same round's R9 executor and
-	 * observe its post-commit X fence.  Only a fresh BufferDesc snapshot joined
-	 * to the existing direct-init identity may return to the existing loop;
-	 * every non-exact STALE remains a refusal and the outer deadline is reused. */
+	/* The exact known-new N check may race the same round's R9 executor in
+	 * either half of T2: after the remote image copy while the sidecar remains
+	 * N+GRANT_PENDING, or after the X writer fence is published.  The narrow
+	 * direct-init predicate covers the latter; the existing full install
+	 * predicate must cover the former before the caller accepts the re-probe.
+	 * Neither observation grants write authority, and the outer deadline is
+	 * reused. */
 	assert_ordered_in_function(
 		source, "\ngcs_block_resource_x_target_acquire_internal(",
 		"\nResourceXApplyResult\ncluster_gcs_resource_x_target_acquire_exact(",
 		drift_contract, lengthof(drift_contract));
+	candidate = strstr(source, "if (direct_init_pending_n)");
+	direct_inflight = candidate != NULL
+		? strstr(candidate,
+			"cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(")
+		: NULL;
+	install_inflight = direct_inflight != NULL
+		? strstr(direct_inflight,
+			"cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(")
+		: NULL;
+	accept_inflight = direct_inflight != NULL
+		? strstr(direct_inflight, "if (target_install_inflight)")
+		: NULL;
+	UT_ASSERT(candidate != NULL);
+	UT_ASSERT(direct_inflight != NULL);
+	UT_ASSERT(install_inflight != NULL);
+	UT_ASSERT(accept_inflight != NULL);
+	UT_ASSERT(install_inflight < accept_inflight);
 	free(source);
 }
 
@@ -6124,7 +6255,7 @@ UT_TEST(test_current_mx_updater_provenance_origin_plan_races)
 int
 main(void)
 {
-	UT_PLAN(111);
+	UT_PLAN(113);
 	UT_RUN(test_gcs_block_msg_type_enum_values_no_collision);
 	UT_RUN(test_gcs_block_payload_sizes_locked);
 	UT_RUN(test_gcs_block_request_field_offsets);
@@ -6221,10 +6352,12 @@ main(void)
 	UT_RUN(test_r4_tx_origin_mode_free_status22_uses_open_visibility_then_terminal_fallback);
 	UT_RUN(test_r4_tx_origin_first_denial_records_exact_local_phase);
 	UT_RUN(test_resource_x_d1_records_exact_first_failure_before_policy_change);
+	UT_RUN(test_resource_x_terminal_failure_distinguishes_final_authority_observations);
 	UT_RUN(test_resource_x_d6_remote_s_failure_decision_matrix);
 	UT_RUN(test_resource_x_target_rebinds_exact_same_round_install_after_snapshot_drift);
 	UT_RUN(test_resource_x_target_resamples_only_exact_terminal_install);
 	UT_RUN(test_resource_x_target_resamples_exact_pending_install_after_terminal_publish);
+	UT_RUN(test_resource_x_pending_terminal_resample_diagnostic_names_exact_mismatch);
 	UT_RUN(test_resource_x_target_resamples_exact_pending_install_after_wait_wakeup);
 	UT_RUN(test_resource_x_target_waits_out_unrelated_local_pending_reservation);
 	UT_RUN(test_resource_x_target_retries_clean_n_reservation_token_churn);

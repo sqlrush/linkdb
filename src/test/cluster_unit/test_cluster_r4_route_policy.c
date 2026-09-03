@@ -127,6 +127,23 @@ GetSystemIdentifier(void)
 	return UINT64_C(0x524f555445);
 }
 
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+bool
+cluster_multixact_current_member_proof_bind_ctrc(
+	ClusterCurrentMemberProof *proof, const ClusterCtrcTxnKeyV1 *ctrc_key)
+{
+	if (proof == NULL || ctrc_key == NULL)
+		return false;
+	ClusterCurrentMemberProofSetCtrcBinding(
+		proof, ctrc_key->segment_generation, ctrc_key->slot_wrap);
+	return true;
+}
+
 ClusterMxResolveResult
 cluster_cr_server_current_mx_build_proof_page(
 	uint16 source_node_id pg_attribute_unused(),

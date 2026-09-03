@@ -738,6 +738,31 @@ UT_TEST(test_t21c_data_scan_chooses_unique_highest_wrap)
 	UT_ASSERT_EQ((int)ref.tt_slot_id, 14);
 }
 
+/* A HOT successor can already have been updated again: its tuple-header ITL
+ * then names the later xmax writer, while proof of its xmin creator must keep
+ * the independently selected historical DATA slot index. */
+UT_TEST(test_t21d_data_slot_index_returns_historical_creator)
+{
+	Page page = build_itl_page();
+	ClusterItlSlotData *creator = slot_at(page, 2);
+	ClusterItlSlotData *later_updater = slot_at(page, 6);
+	uint8 index = CLUSTER_ITL_SLOT_UNALLOCATED;
+
+	creator->flags = ITL_FLAG_COMMITTED;
+	creator->xid = (TransactionId)1004;
+	creator->wrap = 3;
+	creator->undo_segment_head = uba_encode(257, 0, 17, 0);
+
+	later_updater->flags = ITL_FLAG_COMMITTED;
+	later_updater->xid = (TransactionId)2004;
+	later_updater->wrap = 8;
+	later_updater->undo_segment_head = uba_encode(1, 0, 18, 0);
+
+	UT_ASSERT_EQ((int)cluster_itl_find_data_slot_index_by_xid(
+						page, (TransactionId)1004, &index), 1);
+	UT_ASSERT_EQ((int)index, 2);
+}
+
 UT_TEST(test_t37_lock_slot_index_null_page_sets_sentinel)
 {
 	uint8 index = 3;
@@ -1375,6 +1400,7 @@ main(void)
 	UT_RUN(test_t21a_data_scan_ignores_lock_and_marker_same_xid);
 	UT_RUN(test_t21b_data_scan_rejects_ambiguous_highest_wrap);
 	UT_RUN(test_t21c_data_scan_chooses_unique_highest_wrap);
+	UT_RUN(test_t21d_data_slot_index_returns_historical_creator);
 	UT_RUN(test_t37_lock_slot_index_null_page_sets_sentinel);
 	UT_RUN(test_t38_lock_slot_index_miss_sets_sentinel);
 	UT_RUN(test_t39_lock_slot_index_unique_winner);

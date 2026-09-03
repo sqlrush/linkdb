@@ -122,6 +122,24 @@ UT_TEST(test_obs2_update_xmin_full_table)
 				 (int)CVV_FAILCLOSED_UNKNOWN);
 }
 
+/*
+ * S3-P0-26: preserve PostgreSQL's full current-xmax truth table after a
+ * remote xmin has already been proved visible.  A lock taken by this
+ * transaction is still being modified for the executor's wait/recheck path;
+ * it is never a self-update that may be silently discarded as zero rows.
+ */
+UT_TEST(test_update_native_self_xmax_full_table)
+{
+	UT_ASSERT_EQ((int)cluster_vis_update_native_self_verdict(true, false),
+				 (int)CLUSTER_VIS_NATIVE_SELF_BEING_MODIFIED);
+	UT_ASSERT_EQ((int)cluster_vis_update_native_self_verdict(true, true),
+				 (int)CLUSTER_VIS_NATIVE_SELF_BEING_MODIFIED);
+	UT_ASSERT_EQ((int)cluster_vis_update_native_self_verdict(false, true),
+				 (int)CLUSTER_VIS_NATIVE_SELF_MODIFIED);
+	UT_ASSERT_EQ((int)cluster_vis_update_native_self_verdict(false, false),
+				 (int)CLUSTER_VIS_NATIVE_SELF_INVISIBLE);
+}
+
 /* ---- OBS-2 Update xmax outcome (update vs delete) ---- */
 UT_TEST(test_obs2_update_xmax_full_table)
 {
@@ -145,7 +163,10 @@ UT_TEST(test_obs2_update_xmax_full_table)
 				 (int)CVV_VISIBLE);
 }
 
-/* ---- OBS-3 Dirty: in-progress -> 53R9H conflict (no wait layer) ---- */
+/* ---- OBS-3 Dirty: default in-progress -> 53R9H conflict.  The typed
+ * unique-index caller may separately route an exact remote xmax locator to
+ * the unlocked R4 TX waiter; the base visibility verdict remains unchanged
+ * for every other caller. ---- */
 UT_TEST(test_obs3_dirty_full_table)
 {
 	/* xmin side */
@@ -168,6 +189,25 @@ UT_TEST(test_obs3_dirty_full_table)
 				 (int)CVV_GONE_UPDATED);
 	UT_ASSERT_EQ((int)cluster_vis_dirty_verdict(CLUSTER_TT_STATUS_COMMITTED, true, true),
 				 (int)CVV_GONE_DELETED);
+}
+
+/* Stage-8 PRE adjustment 23: only a proved non-terminal xmax plus an exact
+ * DATA locator is eligible for the typed wait sidecar.  A raw xid, xmin,
+ * terminal outcome or unexpected SUBCOMMITTED value never opens the route. */
+UT_TEST(test_obs3_dirty_exact_remote_xmax_wait_gate)
+{
+	UT_ASSERT(cluster_vis_dirty_remote_xmax_waitable(
+		CLUSTER_TT_STATUS_IN_PROGRESS, true, true));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
+		CLUSTER_TT_STATUS_IN_PROGRESS, true, false));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
+		CLUSTER_TT_STATUS_IN_PROGRESS, false, true));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
+		CLUSTER_TT_STATUS_SUBCOMMITTED, true, true));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
+		CLUSTER_TT_STATUS_COMMITTED, true, true));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
+		CLUSTER_TT_STATUS_ABORTED, true, true));
 }
 
 /* ---- meta: no status maps to an out-of-range verdict (exhaustive sweep) ---- */
@@ -280,8 +320,10 @@ main(void)
 	UT_RUN(test_obs4_self_full_table);
 	UT_RUN(test_obs5_toast_full_table);
 	UT_RUN(test_obs2_update_xmin_full_table);
+	UT_RUN(test_update_native_self_xmax_full_table);
 	UT_RUN(test_obs2_update_xmax_full_table);
 	UT_RUN(test_obs3_dirty_full_table);
+	UT_RUN(test_obs3_dirty_exact_remote_xmax_wait_gate);
 	UT_RUN(test_obs_cr_xmax_full_table);
 	UT_RUN(test_all_verdicts_in_range);
 	UT_RUN(test_evidence_route_full_table);

@@ -235,13 +235,21 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 								  Snapshot snapshot,
 								  TupleTableSlot *slot,
 								  bool *call_again, bool *all_dead,
-								  bool barrier_aware)
+								  bool barrier_aware,
+								  bool *remote_xmax_wait,
+								  struct ClusterTxLocator *remote_wait_locator)
 {
 	IndexFetchHeapData *hscan = (IndexFetchHeapData *) scan;
 	HeapHotSearchResult hot_result;
 	bool		got_heap_tuple;
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
+	if (remote_xmax_wait != NULL)
+		*remote_xmax_wait = false;
+#ifdef USE_PGRAC_CLUSTER
+	if (remote_wait_locator != NULL)
+		memset(remote_wait_locator, 0, sizeof(*remote_wait_locator));
+#endif
 
 	/* We can skip the buffer-switching logic if we're in mid-HOT chain. */
 	if (!*call_again)
@@ -283,6 +291,19 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 											 all_dead,
 											 !*call_again);
 	LockBuffer(hscan->xs_cbuf, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+	if (hot_result.remote_xmax_wait)
+	{
+		if (!barrier_aware || remote_xmax_wait == NULL
+			|| remote_wait_locator == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+					 errmsg("cross-node write conflict: remote in-progress xmax"),
+					 errhint("Use the built-in typed unique-index wait path or retry.")));
+		*remote_xmax_wait = true;
+		*remote_wait_locator = hot_result.remote_wait_locator;
+	}
+#endif
 	got_heap_tuple = heapam_store_hot_search_result(&hot_result, slot,
 											 hscan->xs_cbuf, call_again, all_dead)
 					 == TABLE_INDEX_FETCH_FOUND;
@@ -301,7 +322,8 @@ heapam_index_fetch_tuple(struct IndexFetchTableData *scan,
 						 bool *call_again, bool *all_dead)
 {
 	return heapam_index_fetch_tuple_internal(scan, tid, snapshot, slot,
-										 call_again, all_dead, false)
+										 call_again, all_dead, false,
+										 NULL, NULL)
 		== TABLE_INDEX_FETCH_FOUND;
 }
 
@@ -310,10 +332,14 @@ heapam_index_fetch_tuple_barrier_aware(struct IndexFetchTableData *scan,
 									  ItemPointer tid,
 									  Snapshot snapshot,
 									  TupleTableSlot *slot,
-									  bool *call_again, bool *all_dead)
+									  bool *call_again, bool *all_dead,
+									  bool *remote_xmax_wait,
+									  struct ClusterTxLocator *remote_wait_locator)
 {
 	return heapam_index_fetch_tuple_internal(scan, tid, snapshot, slot,
-										 call_again, all_dead, true);
+										 call_again, all_dead, true,
+										 remote_xmax_wait,
+										 remote_wait_locator);
 }
 
 

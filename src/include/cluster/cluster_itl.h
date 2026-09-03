@@ -88,6 +88,18 @@ extern bool cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid
 												ClusterUndoTTSlotRef *ref);
 
 /*
+ * Return the exact slot index selected by the canonical data-writer raw-xid
+ * scan.  This is the xmin counterpart of
+ * cluster_itl_find_lock_slot_index_by_xmax(): an updated tuple's
+ * t_itl_slot_idx can name a later xmax writer, so current-MX HOT proof must
+ * carry the separately selected historical creator slot into
+ * cluster_tx_locator_from_itl().  Every failure writes the unallocated
+ * sentinel.
+ */
+extern bool cluster_itl_find_data_slot_index_by_xid(Page page, TransactionId raw_xid,
+												 uint8 *slot_index_out);
+
+/*
  * cluster_itl_find_lock_tt_ref_by_xmax (spec-3.4d D1 / F2 / F6):
  *
  *	Scan the ITL slot array on `page` for a LOCK_ONLY slot whose xid

@@ -2859,6 +2859,8 @@ test_cluster_visibility_fork: test_cluster_visibility_fork.c unit_test.h \
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-DHEAPAM_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam.c"' \
 		-DHEAPAM_VISIBILITY_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam_visibility.c"' \
+		-DHEAPAM_HANDLER_SOURCE_PATH='"$(top_srcdir)/src/backend/access/heap/heapam_handler.c"' \
+		-DNBTINSERT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/nbtree/nbtinsert.c"' \
 		-DTT_LOCAL_SOURCE_PATH='"$(top_srcdir)/src/backend/cluster/cluster_tt_local.c"' \
 		-DXACT_SOURCE_PATH='"$(top_srcdir)/src/backend/access/transam/xact.c"' \
 		$< \
@@ -3243,7 +3245,9 @@ $(CLUSTER_R4_HOT_HANDLER_TEST_O): $(top_srcdir)/src/backend/access/heap/heapam_h
 		-c $< -o $@
 
 $(CLUSTER_R4_HOT_VIS_TEST_O): $(top_srcdir)/src/backend/access/heap/heapam_visibility.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT -ffunction-sections -fdata-sections \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DUSE_CLUSTER_UNIT \
+		-DCLUSTER_R4_VISIBILITY_EXTERNAL_HINT_STUB \
+		-ffunction-sections -fdata-sections \
 		-c $< -o $@
 
 $(CLUSTER_R4_EXEC_TUPLES_TEST_O): $(top_srcdir)/src/backend/executor/execTuples.c
@@ -3259,7 +3263,7 @@ test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 		$(CLUSTER_R4_HOT_HEAPAM_TEST_O) $(CLUSTER_R4_HOT_HANDLER_TEST_O) \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_R4_EXEC_TUPLES_TEST_O) \
 		$(CLUSTER_R4_HEAPTUPLE_TEST_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) \
 		$(CLUSTER_R4_HOT_HEAPAM_TEST_O) $(CLUSTER_R4_HOT_HANDLER_TEST_O) \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_R4_EXEC_TUPLES_TEST_O) \

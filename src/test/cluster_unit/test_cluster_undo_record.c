@@ -1394,57 +1394,110 @@ UT_TEST(test_prepared_consume_lock_precedes_first_receipt_apply)
 	free(heap_source);
 }
 
-/* The terminal census may drop and reacquire heap content authority.  That
- * invalidates every earlier receipt check.  The shared heap helper must first
- * finish capacity cleanup, then recheck the exact prepared receipt, and only
- * then choose the current xid's ITL and consume the undo reservation. */
+/* The terminal census may drop and reacquire heap content authority.  The
+ * split heap pipeline must therefore finish capacity cleanup before capturing
+ * the DML guard, recheck the exact receipt before allocating an ITL, and then
+ * recheck every completed plan before the first APPLY and final consume. */
 UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 {
 	char *source = read_heapam_source();
-	const char *helper;
-	const char *helper_end;
+	const char *prepare_helper;
+	const char *prepare_end;
+	const char *plan_helper;
+	const char *plan_end;
+	const char *boundary;
+	const char *boundary_end;
 	const char *ensure;
-	const char *dml_recheck;
-	const char *receipt_recheck;
-	const char *ctrc_apply;
+	const char *prepare_guard;
+	const char *prepare_receipt_recheck;
+	const char *plan_guard;
+	const char *plan_receipt_recheck;
 	const char *alloc_once;
+	const char *bind_slot;
+	const char *plan_guard_recheck;
+	const char *boundary_recheck;
+	const char *boundary_apply;
 	const char *consume;
 
 	if (source == NULL)
 		return;
-	helper = strstr(source,
-		"\ncluster_heap_itl_alloc_and_consume_prepared_undo(");
-	helper_end = helper == NULL ? NULL
-		: strstr(helper, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
-	ensure = helper == NULL ? NULL
-		: strstr(helper, "cluster_heap_itl_ensure_capacity_with_terminal_census(");
-	dml_recheck = helper == NULL ? NULL
-		: strstr(helper, "cluster_heap_dml_authority_guard_recheck(");
-	receipt_recheck = helper == NULL ? NULL
-		: strstr(helper, "cluster_undo_record_prepared_recheck(");
-	ctrc_apply = helper == NULL ? NULL
-		: strstr(helper, "cluster_undo_record_ctrc_apply_prepared(");
-	alloc_once = helper == NULL ? NULL
-		: strstr(helper, "cluster_heap_itl_alloc_once(");
-	consume = helper == NULL ? NULL
-		: strstr(helper, "cluster_undo_record_consume_prepared(");
+	prepare_helper = strstr(source,
+		"\ncluster_heap_itl_prepare_prepared_undo(");
+	prepare_end = prepare_helper == NULL ? NULL
+		: strstr(prepare_helper,
+			"\n}\n\n\nstatic ClusterHeapPreparedUndoResult\ncluster_heap_itl_plan_prepared_undo_target(");
+	ensure = prepare_helper == NULL ? NULL
+		: strstr(prepare_helper,
+			"cluster_heap_itl_ensure_capacity_with_terminal_census(");
+	prepare_guard = prepare_helper == NULL ? NULL
+		: strstr(prepare_helper, "cluster_heap_dml_authority_guard_capture(");
+	prepare_receipt_recheck = prepare_helper == NULL ? NULL
+		: strstr(prepare_helper, "cluster_undo_record_prepared_recheck(");
 
-	UT_ASSERT_NOT_NULL(helper);
-	UT_ASSERT_NOT_NULL(helper_end);
+	plan_helper = strstr(source,
+		"\ncluster_heap_itl_plan_prepared_undo_target(");
+	plan_end = plan_helper == NULL ? NULL
+		: strstr(plan_helper, "\n}\n\n\n#ifndef USE_CLUSTER_UNIT");
+	plan_guard = plan_helper == NULL ? NULL
+		: strstr(plan_helper, "cluster_heap_dml_authority_guard_capture(");
+	plan_receipt_recheck = plan_helper == NULL ? NULL
+		: strstr(plan_helper, "cluster_undo_record_prepared_recheck(");
+	alloc_once = plan_helper == NULL ? NULL
+		: strstr(plan_helper, "cluster_heap_itl_alloc_once(");
+	bind_slot = plan_helper == NULL ? NULL
+		: strstr(plan_helper, "cluster_heap_dml_authority_guard_bind_itl_slot(");
+	plan_guard_recheck = bind_slot == NULL ? NULL
+		: strstr(bind_slot, "cluster_heap_dml_authority_guard_recheck(");
+
+	boundary = strstr(source, "/* One caller-owned final boundary.");
+	boundary = boundary == NULL ? NULL
+		: strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+	boundary_end = boundary == NULL ? NULL
+		: strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
+	boundary_recheck = boundary == NULL ? NULL
+		: strstr(boundary, "cluster_heap_boundary_undo_target_recheck(");
+	boundary_apply = boundary == NULL ? NULL
+		: strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
+	consume = boundary == NULL ? NULL
+		: strstr(boundary, "cluster_heap_boundary_consume_undo(");
+
+	UT_ASSERT_NOT_NULL(prepare_helper);
+	UT_ASSERT_NOT_NULL(prepare_end);
 	UT_ASSERT_NOT_NULL(ensure);
-	UT_ASSERT_NOT_NULL(dml_recheck);
-	UT_ASSERT_NOT_NULL(receipt_recheck);
-	UT_ASSERT_NOT_NULL(ctrc_apply);
+	UT_ASSERT_NOT_NULL(prepare_guard);
+	UT_ASSERT_NOT_NULL(prepare_receipt_recheck);
+	UT_ASSERT_NOT_NULL(plan_helper);
+	UT_ASSERT_NOT_NULL(plan_end);
+	UT_ASSERT_NOT_NULL(plan_guard);
+	UT_ASSERT_NOT_NULL(plan_receipt_recheck);
 	UT_ASSERT_NOT_NULL(alloc_once);
+	UT_ASSERT_NOT_NULL(bind_slot);
+	UT_ASSERT_NOT_NULL(plan_guard_recheck);
+	UT_ASSERT_NOT_NULL(boundary);
+	UT_ASSERT_NOT_NULL(boundary_end);
+	UT_ASSERT_NOT_NULL(boundary_recheck);
+	UT_ASSERT_NOT_NULL(boundary_apply);
 	UT_ASSERT_NOT_NULL(consume);
-	if (helper != NULL && helper_end != NULL && ensure != NULL
-		&& dml_recheck != NULL && receipt_recheck != NULL && ctrc_apply != NULL
-		&& alloc_once != NULL && consume != NULL)
-		UT_ASSERT(helper < ensure && ensure < dml_recheck
-				  && dml_recheck < receipt_recheck
-				  && receipt_recheck < alloc_once && alloc_once < ctrc_apply
-				  && ctrc_apply < consume
-				  && consume < helper_end);
+	if (prepare_helper != NULL && prepare_end != NULL && ensure != NULL
+		&& prepare_guard != NULL && prepare_receipt_recheck != NULL)
+		UT_ASSERT(prepare_helper < ensure && ensure < prepare_guard
+				  && prepare_guard < prepare_receipt_recheck
+				  && prepare_receipt_recheck < prepare_end);
+	if (plan_helper != NULL && plan_end != NULL && plan_guard != NULL
+		&& plan_receipt_recheck != NULL && alloc_once != NULL
+		&& bind_slot != NULL && plan_guard_recheck != NULL)
+		UT_ASSERT(plan_helper < plan_guard
+				  && plan_guard < plan_receipt_recheck
+				  && plan_receipt_recheck < alloc_once
+				  && alloc_once < bind_slot
+				  && bind_slot < plan_guard_recheck
+				  && plan_guard_recheck < plan_end);
+	if (boundary != NULL && boundary_end != NULL
+		&& boundary_recheck != NULL && boundary_apply != NULL
+		&& consume != NULL)
+		UT_ASSERT(boundary < boundary_recheck
+				  && boundary_recheck < boundary_apply
+				  && boundary_apply < consume && consume < boundary_end);
 	free(source);
 }
 
@@ -1574,13 +1627,15 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 	const char *helper;
 	const char *helper_end;
 	const char *deadline;
-	const char *prepare;
+	const char *prepare_call;
+	const char *production_alias;
 	const char *ready;
 	const char *retry;
 	const char *refused;
 	const char *interrupts;
 	const char *hit;
 	int helper_mentions = 0;
+	int wrapper_calls = 0;
 	int raw_prepare_calls = 0;
 
 	if (source == NULL)
@@ -1590,8 +1645,10 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 		: strstr(helper, "\n}\n\ntypedef enum ClusterHeapPreparedUndoResult");
 	deadline = helper == NULL ? NULL
 		: strstr(helper, "uint64 absolute_deadline_us");
-	prepare = helper == NULL ? NULL
-		: strstr(helper, "cluster_undo_record_prepare(");
+	prepare_call = helper == NULL ? NULL
+		: strstr(helper, "cluster_heap_prepare_undo_record_call(");
+	production_alias = strstr(source,
+		"#define cluster_heap_prepare_undo_record_call cluster_undo_record_prepare");
 	ready = helper == NULL ? NULL
 		: strstr(helper, "CLUSTER_UNDO_RECORD_PREPARE_READY");
 	retry = helper == NULL ? NULL
@@ -1603,16 +1660,17 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
 	UT_ASSERT_NOT_NULL(deadline);
-	UT_ASSERT_NOT_NULL(prepare);
+	UT_ASSERT_NOT_NULL(prepare_call);
+	UT_ASSERT_NOT_NULL(production_alias);
 	UT_ASSERT_NOT_NULL(ready);
 	UT_ASSERT_NOT_NULL(retry);
 	UT_ASSERT_NOT_NULL(refused);
 	UT_ASSERT_NOT_NULL(interrupts);
 	if (helper != NULL && helper_end != NULL && deadline != NULL
-		&& prepare != NULL && ready != NULL && retry != NULL
+		&& prepare_call != NULL && ready != NULL && retry != NULL
 		&& refused != NULL && interrupts != NULL)
-		UT_ASSERT(helper < deadline && deadline < prepare
-				  && prepare < ready && ready < retry && retry < refused
+		UT_ASSERT(helper < deadline && deadline < prepare_call
+				  && prepare_call < ready && ready < retry && retry < refused
 				  && refused < interrupts && interrupts < helper_end);
 
 	for (hit = source;
@@ -1620,68 +1678,100 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 		 hit++)
 		helper_mentions++;
 	for (hit = source;
+		 (hit = strstr(hit, "cluster_heap_prepare_undo_record_call(")) != NULL;
+		 hit++)
+		wrapper_calls++;
+	for (hit = source;
 		 (hit = strstr(hit, "cluster_undo_record_prepare(")) != NULL;
 		 hit++)
 		raw_prepare_calls++;
-	/* Definition + four initial prepares + four unlocked reprepares. */
-	UT_ASSERT_EQ(helper_mentions, 9);
-	UT_ASSERT_EQ(raw_prepare_calls, 1);
+	/* Definition + unit seam + all current producer initial/retry sites. */
+	UT_ASSERT_EQ(helper_mentions, 15);
+	UT_ASSERT_EQ(wrapper_calls, 2);
+	UT_ASSERT_EQ(raw_prepare_calls, 0);
 	free(source);
 }
 
 /* An in-lock conditional miss is not a terminal allocation failure.  The
- * shared helper must preserve the three-way result so every heap caller can
- * drop content authority before canceling and rebuilding the exact receipt.
- * Collapsing this back to bool recreates the first-DML 53R9D failure seen
- * under same-node concurrency. */
+ * split planner must preserve RETRY_REQUIRED before allocation, and the final
+ * boundary may expose a retry only while zero receipts have crossed APPLY.
+ * Once APPLY begins, every later failure is terminal for that attempt. */
 UT_TEST(test_inlock_consume_preserves_retry_required_for_heap_unwind)
 {
 	char *source = read_heapam_source();
 	const char *result_enum;
-	const char *helper;
-	const char *helper_end;
+	const char *plan;
+	const char *plan_end;
 	const char *recheck;
-	const char *consume;
+	const char *alloc_once;
 	const char *retry_result;
 	const char *refused_result;
+	const char *boundary;
+	const char *boundary_end;
+	const char *preflight;
+	const char *apply;
+	const char *consume;
+	const char *zero_apply_result;
 
 	if (source == NULL)
 		return;
 	result_enum = strstr(source, "typedef enum ClusterHeapPreparedUndoResult");
-	helper = strstr(source,
-		"\ncluster_heap_itl_alloc_and_consume_prepared_undo(");
-	helper_end = helper == NULL ? NULL
-		: strstr(helper, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
-	recheck = helper == NULL ? NULL
-		: strstr(helper, "cluster_undo_record_prepared_recheck(");
-	consume = helper == NULL ? NULL
-		: strstr(helper, "cluster_undo_record_consume_prepared(");
-	retry_result = helper == NULL ? NULL
-		: strstr(helper, "CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED");
-	refused_result = helper == NULL ? NULL
-		: strstr(helper, "CLUSTER_HEAP_PREPARED_UNDO_REFUSED");
+	plan = strstr(source, "\ncluster_heap_itl_plan_prepared_undo_target(");
+	plan_end = plan == NULL ? NULL
+		: strstr(plan, "\n}\n\n\n#ifndef USE_CLUSTER_UNIT");
+	recheck = plan == NULL ? NULL
+		: strstr(plan, "cluster_undo_record_prepared_recheck(");
+	alloc_once = plan == NULL ? NULL
+		: strstr(plan, "cluster_heap_itl_alloc_once(");
+	retry_result = plan == NULL ? NULL
+		: strstr(plan, "CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED");
+	refused_result = plan == NULL ? NULL
+		: strstr(plan, "CLUSTER_HEAP_PREPARED_UNDO_REFUSED");
+
+	boundary = strstr(source, "/* One caller-owned final boundary.");
+	boundary = boundary == NULL ? NULL
+		: strstr(boundary, "\ncluster_heap_no_retry_boundary_apply(");
+	boundary_end = boundary == NULL ? NULL
+		: strstr(boundary, "\n}\n\n\n#ifdef USE_CLUSTER_UNIT");
+	preflight = boundary == NULL ? NULL
+		: strstr(boundary, "cluster_undo_record_consume_preflight(");
+	apply = boundary == NULL ? NULL
+		: strstr(boundary, "cluster_heap_boundary_apply_undo_target(");
+	consume = boundary == NULL ? NULL
+		: strstr(boundary, "cluster_heap_boundary_consume_undo(");
+	zero_apply_result = boundary == NULL ? NULL
+		: strstr(boundary, "CLUSTER_HEAP_BOUNDARY_ZERO_APPLY_RETRY");
 
 	UT_ASSERT_NOT_NULL(result_enum);
-	UT_ASSERT_NOT_NULL(helper);
-	UT_ASSERT_NOT_NULL(helper_end);
+	UT_ASSERT_NOT_NULL(plan);
+	UT_ASSERT_NOT_NULL(plan_end);
 	UT_ASSERT_NOT_NULL(recheck);
-	UT_ASSERT_NOT_NULL(consume);
+	UT_ASSERT_NOT_NULL(alloc_once);
 	UT_ASSERT_NOT_NULL(retry_result);
 	UT_ASSERT_NOT_NULL(refused_result);
-	if (helper != NULL && helper_end != NULL && recheck != NULL
-		&& consume != NULL && retry_result != NULL && refused_result != NULL)
-		UT_ASSERT(helper < recheck && recheck < consume
-				  && consume < helper_end && retry_result < helper_end
-				  && refused_result < helper_end);
+	UT_ASSERT_NOT_NULL(boundary);
+	UT_ASSERT_NOT_NULL(boundary_end);
+	UT_ASSERT_NOT_NULL(preflight);
+	UT_ASSERT_NOT_NULL(apply);
+	UT_ASSERT_NOT_NULL(consume);
+	UT_ASSERT_NOT_NULL(zero_apply_result);
+	if (plan != NULL && plan_end != NULL && recheck != NULL
+		&& alloc_once != NULL && retry_result != NULL && refused_result != NULL)
+		UT_ASSERT(plan < recheck && recheck < alloc_once
+				  && retry_result < plan_end && refused_result < plan_end);
+	if (boundary != NULL && boundary_end != NULL && preflight != NULL
+		&& apply != NULL && consume != NULL && zero_apply_result != NULL)
+		UT_ASSERT(boundary < zero_apply_result
+				  && zero_apply_result < preflight && preflight < apply
+				  && apply < consume && consume < boundary_end);
 	free(source);
 }
 
-/* INSERT, DELETE, UPDATE, and heap_lock_tuple each own different heap-lock
- * unwind mechanics, but all must use the same frozen operation deadline.
- * Four retry sites are therefore required: each releases heap content
- * authority, cancels the exact reservation, and only then re-enters prepare.
- * The prepare helper itself must accept the already-frozen deadline rather
- * than manufacture a fresh one on every unwind. */
+/* INSERT, DELETE, UPDATE, heap_lock_tuple, and the update-chain lock producer
+ * each own different heap-lock unwind mechanics.  Their five CTRC PREPARE
+ * sites must remain outside heap content authority.  The four primary DML
+ * callers additionally reuse one frozen operation deadline across their
+ * initial preparation and full native restart paths. */
 UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 {
 	char *source = read_heapam_source();
@@ -1730,7 +1820,7 @@ UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 	/* Each heap DML family prepares its CTRC receipt only after dropping the
 	 * content lock.  Do not count enum/result spellings: UPDATE legitimately
 	 * has more than one pre-mutation retry classification. */
-	UT_ASSERT_EQ(ctrc_prepare_sites, 4);
+	UT_ASSERT_EQ(ctrc_prepare_sites, 5);
 	UT_ASSERT(cancel_sites >= 4);
 	/* Four declarations plus initial/reprepare uses on all callers. */
 	UT_ASSERT(deadline_locals >= 12);
@@ -2011,7 +2101,7 @@ UT_TEST(test_live_lifecycle_writers_use_only_exact_block0_current)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(36);
+	UT_PLAN(40);
 
 	UT_RUN(test_record_header_roundtrip);
 	UT_RUN(test_insert_payload_roundtrip);
@@ -2040,9 +2130,13 @@ main(int argc, char **argv)
 	UT_RUN(test_record_prepare_owns_extent_and_block0_slow_paths);
 	UT_RUN(test_prepared_consumer_rechecks_exact_receipt_before_record_mutation);
 	UT_RUN(test_prepared_consume_lock_precedes_first_receipt_apply);
+	UT_RUN(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation);
 	UT_RUN(test_ctrc_cross_page_update_requires_both_prepared_receipts);
 	UT_RUN(test_heap_update_applies_required_receipts_before_undo_and_page_mutation);
 	UT_RUN(test_ctrc_release_flag_terminal_recycle_reuse_and_redo_matrix);
+	UT_RUN(test_heap_prepare_retries_transient_result_under_one_deadline);
+	UT_RUN(test_inlock_consume_preserves_retry_required_for_heap_unwind);
+	UT_RUN(test_all_heap_dml_callers_reprepare_outside_content_lock);
 	UT_RUN(test_prepared_consumer_excludes_only_cluster_undo_slow_paths);
 	UT_RUN(test_prepared_receipt_is_single_use_and_exactly_cancelable);
 	UT_RUN(test_prepared_receipt_retains_exact_admission_until_close);

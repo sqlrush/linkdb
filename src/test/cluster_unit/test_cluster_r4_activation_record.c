@@ -802,6 +802,11 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	desired_record.transition_epoch = 0;
 	desired_record.coordinator_node = (uint32)cluster_node_id;
 	desired_record.coordinator_incarnation = 1;
+	desired_record.source_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+	desired_record.target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
+		  | CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1;
 	memset(&shmem, 0, sizeof(shmem));
 	pg_atomic_init_u64(&shmem.record_cas_request_seq, 0);
 	pg_atomic_init_u64(&shmem.record_cas_completion_seq, 0);
@@ -809,7 +814,8 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	pg_atomic_init_u32(&shmem.record_cas_request_kind,
 				   CLUSTER_SEMANTIC_AUTHORITY_REQUEST_NONE);
 	pg_atomic_init_u64(&shmem.admission_seq, 0);
-	pg_atomic_init_u64(&shmem.active_bits, 0);
+	pg_atomic_init_u64(&shmem.active_bits,
+				   CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
 	pg_atomic_init_u64(&shmem.record_generation, 7);
 	pg_atomic_init_u64(&shmem.formation_epoch, 0);
 	pg_atomic_init_u32(&shmem.transition_closed, 1);
@@ -818,17 +824,28 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	pg_atomic_init_u64(&utility.utility_completion_seq, 0);
 	pg_atomic_init_u32(&utility.utility_mailbox_state,
 				   SEMANTIC_ACTIVATION_UTILITY_MAILBOX_PENDING);
+	utility.utility_action = CLUSTER_SEMANTIC_ENABLE_ALL;
+	utility.utility_source_feature_bitmap
+		= desired_record.source_feature_bitmap;
+	utility.utility_target_feature_bitmap
+		= desired_record.target_feature_bitmap;
+	utility.utility_rollback_feature_bitmap
+		= desired_record.rollback_feature_bitmap;
 	utility.utility_expected_record_generation = 7;
 	SemanticActivationUtilityMailbox = &utility;
 	cluster_r4_activation_test_formation_valid = true;
 	SemanticActivationShmem = NULL;
 	UT_ASSERT(encode(desired_record, desired));
-	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
+	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(
+		7, desired_record.source_feature_bitmap, desired, &seq));
 
 	SemanticActivationShmem = &shmem;
-	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), NULL, &seq));
-	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, NULL));
-	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
+	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(
+		7, desired_record.source_feature_bitmap, NULL, &seq));
+	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(
+		7, desired_record.source_feature_bitmap, desired, NULL));
+	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(
+		7, desired_record.source_feature_bitmap, desired, &seq));
 	UT_ASSERT_EQ(seq, 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_request_seq), 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_completion_seq), 0);
@@ -838,7 +855,8 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	UT_ASSERT(cluster_semantic_activation_qvotec_poll_record_cas(&request));
 	UT_ASSERT_EQ(request.request_seq, 1);
 	UT_ASSERT_EQ(request.expected_generation, 7);
-	UT_ASSERT_EQ(request.expected_source_feature_bitmap, UINT64_C(0x11));
+	UT_ASSERT_EQ(request.expected_source_feature_bitmap,
+				 desired_record.source_feature_bitmap);
 	UT_ASSERT_EQ(memcmp(request.desired_bytes, desired, sizeof(desired)), 0);
 	UT_ASSERT(
 		!cluster_semantic_activation_qvotec_complete_record_cas(0, CLUSTER_SEMANTIC_ACTIVATION_OK));
@@ -853,11 +871,13 @@ UT_TEST(test_49_record_cas_mailbox_exact_sequence_lifecycle)
 	UT_ASSERT_EQ(result, CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT);
 	UT_ASSERT(!semantic_activation_record_cas_mailbox_poll_completion(2, &result));
 
-	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
+	UT_ASSERT(semantic_activation_record_cas_mailbox_submit(
+		7, desired_record.source_feature_bitmap, desired, &seq));
 	UT_ASSERT_EQ(seq, 2);
 	pg_atomic_write_u64(&shmem.record_cas_request_seq, UINT64_MAX);
 	pg_atomic_write_u64(&shmem.record_cas_completion_seq, UINT64_MAX);
-	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(7, UINT64_C(0x11), desired, &seq));
+	UT_ASSERT(!semantic_activation_record_cas_mailbox_submit(
+		7, desired_record.source_feature_bitmap, desired, &seq));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_request_seq), UINT64_MAX);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&shmem.record_cas_completion_seq), UINT64_MAX);
 	SemanticActivationShmem = NULL;
@@ -958,7 +978,7 @@ UT_TEST(test_51_ack_sample_request_has_exact_wire_bytes)
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1,
 				 UINT32_C(0x00008000));
 	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS,
-				 UINT32_C(0x0030B000));
+				 UINT32_C(0x0071B000));
 	UT_ASSERT_EQ(CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES, 120);
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, bytes));
 	UT_ASSERT_EQ(bytes[0], 0x41);
@@ -1596,8 +1616,9 @@ valid_positive_ack(void)
 	message.transition_epoch = 9;
 	message.record_generation = 10;
 	message.round_nonce = 11;
-	message.source_feature_bitmap = 1;
-	message.target_feature_bitmap = 2;
+	message.source_feature_bitmap = 0;
+	message.target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	message.admitted_members_lo = UINT64_C(0x0b);
 	message.boot_id = 12;
 	message.admitted_incarnation = 12;
@@ -1719,6 +1740,9 @@ UT_TEST(test_71_ack_ingress_accepts_request_and_refusal_roles)
 	message.transition_epoch = 9;
 	message.record_generation = 10;
 	message.round_nonce = 11;
+	message.source_feature_bitmap = 0;
+	message.target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	message.admitted_members_lo = UINT64_C(0x0a);
 	env = valid_ack_envelope(3, 1);
 	UT_ASSERT(cluster_semantic_activation_ack_wire_encode(&message, payload));
@@ -1957,6 +1981,8 @@ UT_TEST(test_76_lmon_self_ack_is_fail_closed_on_local_drift)
 	UT_ASSERT_EQ(memcmp(&output, &before, sizeof(output)), 0);
 }
 
+static void assert_current_ack_authority_rejected(int32 local_node_id);
+
 UT_TEST(test_77_lmon_current_ack_authority_uses_exact_member_snapshot)
 {
 	uint64 members_lo;
@@ -1985,11 +2011,7 @@ UT_TEST(test_77_lmon_current_ack_authority_uses_exact_member_snapshot)
 	cluster_r4_activation_test_admitted_members_lo = 0;
 	cluster_r4_activation_test_admitted_members_hi = UINT64_C(1) << 1;
 	cluster_r4_activation_test_membership_node = 65;
-	UT_ASSERT(semantic_activation_ack_current_authority(
-		65, &members_lo, &members_hi, &formation_epoch, &coordinator));
-	UT_ASSERT_EQ(members_lo, 0);
-	UT_ASSERT_EQ(members_hi, UINT64_C(1) << 1);
-	UT_ASSERT_EQ(coordinator, 65);
+	assert_current_ack_authority_rejected(65);
 }
 
 static void
@@ -2077,8 +2099,9 @@ init_current_sample_table(ClusterSemanticActivationAckTableV1 *table)
 	table->expected_members_lo = UINT64_C(0x09);
 	table->transition_epoch = 9;
 	table->record_generation = 10;
-	table->source_feature_bitmap = 1;
-	table->target_feature_bitmap = 2;
+	table->source_feature_bitmap = 0;
+	table->target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	table->observed_members_lo = UINT64_C(0x01);
 	table->observed[0] = valid_current_self_tuple();
 }
@@ -2371,8 +2394,9 @@ valid_current_sample_request_item(void)
 	item.message.transition_epoch = 9;
 	item.message.record_generation = 10;
 	item.message.round_nonce = 11;
-	item.message.source_feature_bitmap = 1;
-	item.message.target_feature_bitmap = 2;
+	item.message.source_feature_bitmap = 0;
+	item.message.target_feature_bitmap
+		= CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
 	item.message.admitted_members_lo = UINT64_C(0x09);
 	item.authenticated_source_node_id = 0;
 	item.local_receiver_node_id = 3;
@@ -2432,8 +2456,9 @@ UT_TEST(test_87_authorized_request_installs_self_and_duplicate_is_inert)
 	UT_ASSERT_EQ(table.observed_members_hi, 0);
 	UT_ASSERT_EQ(table.transition_epoch, UINT64_C(9));
 	UT_ASSERT_EQ(table.record_generation, UINT64_C(10));
-	UT_ASSERT_EQ(table.source_feature_bitmap, UINT64_C(1));
-	UT_ASSERT_EQ(table.target_feature_bitmap, UINT64_C(2));
+	UT_ASSERT_EQ(table.source_feature_bitmap, UINT64_C(0));
+	UT_ASSERT_EQ(table.target_feature_bitmap,
+				 CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
 	UT_ASSERT_EQ(table.rollback_feature_bitmap, 0);
 	UT_ASSERT_EQ(table.capability_sample_digest, 0);
 	UT_ASSERT_EQ(memcmp(table.expected,
@@ -2832,7 +2857,7 @@ UT_TEST(test_94_four_member_sample_digest_is_canonical)
 	init_four_member_digest_table(&reverse, true);
 	UT_ASSERT(semantic_activation_ack_sample_digest(
 		&forward, &forward_digest));
-	UT_ASSERT_EQ(forward_digest, UINT64_C(0x4e1a478a5d70e37e));
+	UT_ASSERT_EQ(forward_digest, UINT64_C(0x00db946c7c55c2f1));
 	UT_ASSERT(semantic_activation_ack_sample_digest(
 		&reverse, &reverse_digest));
 	UT_ASSERT_EQ(reverse_digest, forward_digest);
@@ -2857,9 +2882,42 @@ UT_TEST(test_95_four_node_barrier_request_retains_expected_without_ack)
 	SemanticActivationAckTuple expected[CLUSTER_MAX_NODES];
 	SemanticActivationAckIngressItem item;
 	uint64 digest = 0;
+	uint32 local_capability_word
+		= CLUSTER_SEMANTIC_ACTIVATION_ACK_REQUIRED_CAPS
+		  | PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
 	int node;
 
 	init_four_member_digest_table(&table, false);
+	set_current_sample_request_dependencies();
+	cluster_r4_activation_test_capability_word_sample_ok = true;
+	cluster_r4_activation_test_capability_word = local_capability_word;
+	cluster_r4_activation_test_capability_generation = 7;
+	cluster_r4_activation_test_local_capability_word = local_capability_word;
+	for (node = 0; node < 4; node++) {
+		SemanticActivationAckTuple tuple;
+		uint64 admitted_incarnation;
+
+		if (node == 3) {
+			UT_ASSERT(semantic_activation_ack_self_tuple(
+				3, local_capability_word, table.transition_epoch,
+				table.record_generation, &tuple));
+		} else {
+			admitted_incarnation
+				= cluster_membership_get_last_admitted_incarnation(node);
+			tuple = (SemanticActivationAckTuple){
+				.node_id = (uint32)node,
+				.boot_id = admitted_incarnation,
+				.admitted_incarnation = admitted_incarnation,
+				.control_connection_generation = 7,
+				.capability_word = local_capability_word,
+				.capability_generation = 7,
+				.transition_epoch = table.transition_epoch,
+				.record_generation = table.record_generation,
+			};
+		}
+		table.expected[node] = tuple;
+		table.observed[node] = tuple;
+	}
 	UT_ASSERT(semantic_activation_ack_sample_digest(&table, &digest));
 	memcpy(expected, table.expected, sizeof(expected));
 	memset(&item, 0, sizeof(item));
@@ -2890,7 +2948,6 @@ UT_TEST(test_95_four_node_barrier_request_retains_expected_without_ack)
 				   table.record_generation - 1);
 	pg_atomic_init_u64(&shmem.formation_epoch, table.transition_epoch);
 	pg_atomic_init_u32(&shmem.transition_closed, 0);
-	set_current_sample_request_dependencies();
 	cluster_r4_activation_test_admitted_snapshot_valid = true;
 	cluster_r4_activation_test_admitted_members_lo = UINT64_C(0x0f);
 	cluster_r4_activation_test_admitted_members_hi = 0;

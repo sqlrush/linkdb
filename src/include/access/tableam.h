@@ -39,6 +39,7 @@ extern PGDLLIMPORT bool synchronize_seqscans;
 
 
 struct BulkInsertStateData;
+struct ClusterTxLocator;
 struct IndexInfo;
 struct SampleScanState;
 struct TBMIterateResult;
@@ -892,7 +893,9 @@ typedef struct TableAmRoutine
 		ItemPointer tid,
 		Snapshot snapshot,
 		TupleTableSlot *slot,
-		bool *call_again, bool *all_dead);
+		bool *call_again, bool *all_dead,
+		bool *remote_xmax_wait,
+		struct ClusterTxLocator *remote_wait_locator);
 
 } TableAmRoutine;
 
@@ -1293,7 +1296,9 @@ extern bool table_index_fetch_tuple_check(Relation rel,
 
 /* PGRAC: preserve refusal as a third result for lock-owning callers. */
 extern TableIndexFetchTupleResult table_index_fetch_tuple_check_barrier_aware(
-	Relation rel, ItemPointer tid, Snapshot snapshot, bool *all_dead);
+	Relation rel, ItemPointer tid, Snapshot snapshot, bool *all_dead,
+	bool *remote_xmax_wait,
+	struct ClusterTxLocator *remote_wait_locator);
 
 
 /* ------------------------------------------------------------------------

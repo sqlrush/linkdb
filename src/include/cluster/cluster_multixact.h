@@ -218,6 +218,19 @@ extern ClusterSemanticAdmissionResult cluster_multixact_source_dispatch(
 	ClusterMultiXactSourceOp op, const ClusterMultiXactSourceRequest *request,
 	ClusterMultiXactSourceResult *result);
 
+/*
+ * Resolve the frozen D3-b snapshot-visibility contract under the semantic
+ * side that is current for this generation.  An OPEN R4 installation owns
+ * the request through TARGET admission; a pre-activation installation may
+ * fall back to the legacy SOURCE dispatcher only after an exact
+ * TARGET_DISABLED result.  The wire format and visibility truth table are
+ * unchanged.
+ */
+extern ClusterSemanticAdmissionResult
+cluster_multixact_remote_xmax_visibility_dispatch(
+	const ClusterMultiXactSourceRequest *request,
+	ClusterMultiXactSourceResult *result);
+
 struct ClusterSideProjectionOperationV1;
 
 /* RF-SIDE retained-redo rebuild path.  These callback-shaped APIs bypass the

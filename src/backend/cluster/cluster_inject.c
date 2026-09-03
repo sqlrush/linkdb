@@ -1643,7 +1643,8 @@ cluster_inject_fault(PG_FUNCTION_ARGS)
 						|| param >= CTRC_TEST_BARRIER_COUNT))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("cluster-ctrc-stage-barrier requires fault_type skip and phase 1..3")));
+					 errmsg("cluster-ctrc-stage-barrier requires fault_type skip and phase 1..%d",
+							CTRC_TEST_BARRIER_COUNT - 1)));
 		if (!cluster_ctrc_test_barrier_control(
 				armed ? (ClusterCtrcTestBarrierPhase)param
 					  : CTRC_TEST_BARRIER_NONE,

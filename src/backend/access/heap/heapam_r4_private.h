@@ -23,6 +23,8 @@
 #include "access/tableam.h"
 #include "cluster/cluster_scn.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_undo_record_api.h"
 #endif
 #include "executor/tuptable.h"
@@ -41,6 +43,10 @@ typedef struct HeapHotSearchResult
 {
 	HeapHotSearchResultKind kind;
 	HeapTupleData tuple;
+#ifdef USE_PGRAC_CLUSTER
+	bool		remote_xmax_wait;
+	ClusterTxLocator remote_wait_locator;
+#endif
 	char scratch_page[BLCKSZ] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 } HeapHotSearchResult;
 
@@ -120,6 +126,12 @@ extern bool HeapTupleSatisfiesMVCCScratch(
 	HeapTuple tuple, Snapshot snapshot,
 	const ClusterR4HotScratchTestContext *context);
 
+#ifdef USE_PGRAC_CLUSTER
+extern bool cluster_heap_tuple_satisfies_visibility_waitable(
+	HeapTuple tuple, Snapshot snapshot, Buffer buffer,
+	bool *remote_xmax_wait, ClusterTxLocator *remote_wait_locator);
+#endif
+
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_heap_test_r4_target_reachable(void);
 extern HeapHotSearchResultKind cluster_heap_test_r4_hot_full_cycle(
@@ -171,6 +183,9 @@ extern bool cluster_heap_test_current_mx_authorize_keyshare(
 	MultiXactMember *normalized, uint16 normalized_cap,
 	uint16 *normalized_count);
 extern bool cluster_heap_test_current_mx_epoch_supported(uint64 epoch);
+extern bool cluster_heap_test_current_mx_read_requalification(
+	const ClusterPcmOwnSnapshot *before,
+	const ClusterPcmOwnSnapshot *after);
 #endif
 #endif
 

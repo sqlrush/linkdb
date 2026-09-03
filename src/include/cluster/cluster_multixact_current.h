@@ -26,6 +26,7 @@
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_resolve.h"
+#include "datatype/timestamp.h"
 #include "nodes/lockoptions.h"
 
 
@@ -65,11 +66,31 @@ typedef enum ClusterCurrentMemberState {
 } ClusterCurrentMemberState;
 
 
+#define CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION UINT16_C(1)
+
+/*
+ * Proof-private canonical identity.  The first 16 bytes mirror the routing
+ * portion of ClusterTTStatusKey; the final eight bytes are the incarnation
+ * sampled by the member origin.  This type must be normalized explicitly
+ * before entering a generic TT-status or TX-wait API.
+ */
+typedef struct ClusterCurrentMemberProofKey {
+	uint16 origin_node_id;
+	uint16 undo_segment_id;
+	uint32 tt_slot_id;
+	uint32 cluster_epoch;
+	TransactionId local_xid;
+	uint32 segment_generation;
+	uint16 slot_wrap;
+	uint16 binding_version;
+} ClusterCurrentMemberProofKey;
+
+
 /*
  * Current-state proof returned by the origin of member_xid.
  */
 typedef struct ClusterCurrentMemberProof {
-	ClusterTTStatusKey key;
+	ClusterCurrentMemberProofKey key;
 	SCN commit_scn;
 	TransactionId member_xid;
 	uint16 member_ordinal;
@@ -77,6 +98,43 @@ typedef struct ClusterCurrentMemberProof {
 	uint8 state;
 	uint8 reserved8[4];
 } ClusterCurrentMemberProof;
+
+
+static inline void
+ClusterCurrentMemberProofSetCtrcBinding(ClusterCurrentMemberProof *proof,
+										uint32 segment_generation,
+										uint16 slot_wrap)
+{
+	proof->key.segment_generation = segment_generation;
+	proof->key.slot_wrap = slot_wrap;
+	proof->key.binding_version = CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION;
+}
+
+
+static inline bool
+ClusterCurrentMemberProofGetStatusKey(const ClusterCurrentMemberProof *proof,
+									  ClusterTTStatusKey *status_key,
+									  uint32 *segment_generation,
+									  uint16 *slot_wrap)
+{
+	if (proof == NULL || status_key == NULL || segment_generation == NULL
+		|| slot_wrap == NULL
+		|| (proof->state != CCM_ACTIVE && proof->state != CCM_SELF)
+		|| proof->key.binding_version
+		   != CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION
+		|| proof->key.segment_generation == UINT32_MAX
+		|| proof->key.slot_wrap == UINT16_MAX)
+		return false;
+	memset(status_key, 0, sizeof(*status_key));
+	status_key->origin_node_id = proof->key.origin_node_id;
+	status_key->undo_segment_id = proof->key.undo_segment_id;
+	status_key->tt_slot_id = proof->key.tt_slot_id;
+	status_key->cluster_epoch = proof->key.cluster_epoch;
+	status_key->local_xid = proof->key.local_xid;
+	*segment_generation = proof->key.segment_generation;
+	*slot_wrap = proof->key.slot_wrap;
+	return true;
+}
 
 
 static inline void
@@ -154,7 +212,9 @@ typedef enum ClusterMxResolveResult {
 	CMX_RESOLVE_DENIED,
 	CMX_RESOLVE_SUPPORTED_LIMIT,
 	CMX_RESOLVE_TIMEOUT,
-	CMX_RESOLVE_UNKNOWN
+	CMX_RESOLVE_UNKNOWN,
+	/* Whole-batch, zero-output pre-send freshness loss. */
+	CMX_RESOLVE_RETRY
 } ClusterMxResolveResult;
 
 
@@ -324,6 +384,8 @@ typedef enum ClusterCurrentMxHeapPublishEvent {
 StaticAssertDecl(sizeof(ClusterCurrentMxKey) == 16, "ClusterCurrentMxKey must remain 16 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMxMemberDesc) == 8,
 				 "ClusterCurrentMxMemberDesc must remain 8 bytes");
+StaticAssertDecl(sizeof(ClusterCurrentMemberProofKey) == 24,
+				 "ClusterCurrentMemberProofKey must remain 24 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMemberProof) == 48,
 				 "ClusterCurrentMemberProof must remain 48 bytes");
 StaticAssertDecl(sizeof(ClusterCurrentMxSuccessorAlias) == 24,
@@ -352,6 +414,9 @@ extern bool cluster_multixact_current_resolve_origin_member_proof(
 	const ClusterTTStatusKey *initial_key, const ClusterTTStatusResult *initial_result,
 	ClusterCurrentMxExactLookupFn exact_lookup, void *exact_lookup_arg,
 	ClusterCurrentMemberProof *proof);
+extern bool cluster_multixact_current_member_proof_bind_ctrc(
+	ClusterCurrentMemberProof *proof,
+	const struct ClusterCtrcTxnKeyV1 *ctrc_key);
 extern ClusterUpdaterCandidateVerdict cluster_multixact_current_updater_candidate_verdict(
 	const ClusterTTStatusKey *candidate, TransactionId updater_xid,
 	uint16 updater_origin_node, uint32 current_epoch, ClusterTTStatusKey *current_binding,
@@ -388,6 +453,11 @@ extern ClusterMxResolveResult cluster_multixact_current_members_resolve(
 	uint64 descriptor_hash, const ClusterCurrentUpdaterChallenge *challenge,
 	ClusterCurrentMemberProof *proofs, ClusterCurrentUpdaterProof *updater_proof,
 	uint32 *proof_capability_generations);
+extern ClusterMxResolveResult cluster_multixact_current_members_resolve_until(
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	uint64 descriptor_hash, const ClusterCurrentUpdaterChallenge *challenge,
+	ClusterCurrentMemberProof *proofs, ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *proof_capability_generations, TimestampTz *operation_deadline);
 extern ClusterMxRecomposeResult cluster_multixact_current_recompose(
 	const ClusterCurrentMxMemberDesc *members, const ClusterCurrentMemberProof *proofs,
 	uint16 nmembers, TransactionId requester_xid, MultiXactStatus requester_status,

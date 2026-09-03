@@ -329,9 +329,9 @@ cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx, ClusterUndoTTSlotRef *ref)
  * array.  Lock-only and MultiXact marker states are deliberately excluded:
  * their xid field has a different consumer (and the marker stores an MXID).
  */
-bool
-cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
-									ClusterUndoTTSlotRef *ref)
+static bool
+cluster_itl_select_data_slot_index(Page page, TransactionId raw_xid,
+								   uint8 *slot_index_out)
 {
 	const ClusterItlSlotData *slots;
 	int match_idx = -1;
@@ -339,9 +339,9 @@ cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
 	bool highest_wrap_ambiguous = false;
 	uint8 i;
 
-	Assert(page != NULL);
-	Assert(ref != NULL);
-
+	if (page == NULL || slot_index_out == NULL)
+		return false;
+	*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
 	if (!PageHasItl(page))
 		return false;
 	if (!TransactionIdIsValid(raw_xid))
@@ -370,8 +370,29 @@ cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
 
 	if (match_idx < 0 || highest_wrap_ambiguous)
 		return false;
+	*slot_index_out = (uint8)match_idx;
+	return true;
+}
 
-	return cluster_itl_get_tt_ref(page, (uint8)match_idx, ref);
+bool
+cluster_itl_find_data_slot_index_by_xid(Page page, TransactionId raw_xid,
+									uint8 *slot_index_out)
+{
+	return cluster_itl_select_data_slot_index(page, raw_xid, slot_index_out);
+}
+
+bool
+cluster_itl_find_data_tt_ref_by_xid(Page page, TransactionId raw_xid,
+									ClusterUndoTTSlotRef *ref)
+{
+	uint8 match_idx;
+
+	Assert(page != NULL);
+	Assert(ref != NULL);
+	if (!cluster_itl_select_data_slot_index(page, raw_xid, &match_idx))
+		return false;
+
+	return cluster_itl_get_tt_ref(page, match_idx, ref);
 }
 
 static bool

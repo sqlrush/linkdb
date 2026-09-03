@@ -715,6 +715,16 @@ UT_TEST(test_recv_drain_yields_after_bounded_frames)
 
 	sent = send(ut_rx_fd, frames, sizeof(frames), 0);
 	UT_ASSERT_EQ(sent, (ssize_t) sizeof(frames));
+	{
+		fd_set rfds;
+		struct timeval tv;
+
+		FD_ZERO(&rfds);
+		FD_SET(ut_tx_fd, &rfds);
+		tv.tv_sec = 5;
+		tv.tv_usec = 0;
+		UT_ASSERT_EQ(select(ut_tx_fd + 1, &rfds, NULL, NULL, &tv), 1);
+	}
 
 	ut_dispatch_count = 0;
 	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));

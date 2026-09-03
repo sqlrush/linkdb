@@ -39,7 +39,9 @@
 #include "storage/smgr.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h" /* exact TX wait enable/timeout */
 #include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f reverse-key */
+#include "cluster/cluster_tx_enqueue.h" /* remote SnapshotDirty xmax wait */
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D4 probe */
 #endif
 
@@ -53,7 +55,12 @@ static TransactionId _bt_check_unique(Relation rel, BTInsertState insertstate,
 									  Relation heapRel,
 									  IndexUniqueCheck checkUnique, bool *is_unique,
 									  uint32 *speculativeToken, bool *barrier_closed,
-									  ItemPointer barrier_tid);
+									  ItemPointer barrier_tid
+#ifdef USE_PGRAC_CLUSTER
+									  , bool *remote_xmax_wait,
+									  ClusterTxLocator *remote_wait_locator
+#endif
+	);
 static OffsetNumber _bt_findinsertloc(Relation rel,
 									  BTInsertState insertstate,
 									  bool checkingunique,
@@ -226,12 +233,24 @@ search:
 		uint32		speculativeToken;
 		bool		barrier_closed = false;
 		ItemPointerData barrier_tid;
+#ifdef USE_PGRAC_CLUSTER
+		bool		remote_xmax_wait = false;
+		ClusterTxLocator remote_wait_locator;
+#endif
 
 		ItemPointerSetInvalid(&barrier_tid);
+#ifdef USE_PGRAC_CLUSTER
+		memset(&remote_wait_locator, 0, sizeof(remote_wait_locator));
+#endif
 
 		xwait = _bt_check_unique(rel, &insertstate, heapRel, checkUnique,
 								 &is_unique, &speculativeToken,
-								 &barrier_closed, &barrier_tid);
+								 &barrier_closed, &barrier_tid
+#ifdef USE_PGRAC_CLUSTER
+								 , &remote_xmax_wait,
+								 &remote_wait_locator
+#endif
+			);
 
 		if (barrier_closed)
 		{
@@ -255,13 +274,70 @@ search:
 			{
 				warm_tid = barrier_tid;
 				warm_result = table_index_fetch_tuple_check_barrier_aware(
-					heapRel, &warm_tid, SnapshotAny, NULL);
+					heapRel, &warm_tid, SnapshotAny, NULL, NULL, NULL);
 				if (warm_result == TABLE_INDEX_FETCH_BARRIER_CLOSED)
 					CHECK_FOR_INTERRUPTS();
 			} while (warm_result == TABLE_INDEX_FETCH_BARRIER_CLOSED);
 
 			goto search;
 		}
+
+#ifdef USE_PGRAC_CLUSTER
+		if (remote_xmax_wait)
+		{
+			ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+			ClusterTxwResult txw;
+
+			/* _bt_check_unique has already released any right sibling. */
+			insertstate.bounds_valid = false;
+			insertstate.postingoff = 0;
+			_bt_relbuf(rel, insertstate.buf);
+			insertstate.buf = InvalidBuffer;
+			if (stack)
+			{
+				_bt_freestack(stack);
+				stack = NULL;
+			}
+
+			if (TransactionIdIsValid(xwait))
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+						 errmsg("conflicting local and remote unique-index wait identities")));
+			if (!cluster_tx_enqueue_wait_enabled)
+				ereport(ERROR,
+						(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
+						 errmsg("cross-node write conflict: remote in-progress xmax"),
+						 errhint("cluster.tx_enqueue_wait is off; retry the transaction or enable it.")));
+
+			txw = cluster_tx_enqueue_wait_exact(
+				&remote_wait_locator, cluster_ges_request_timeout_ms, &reason);
+			switch (txw)
+			{
+				case CLUSTER_TXW_RESOLVED:
+				case CLUSTER_TXW_DEAD_HOLDER:
+				case CLUSTER_TXW_RETRY:
+					goto search;
+				case CLUSTER_TXW_TIMEOUT:
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_GES_TIMEOUT),
+							 errmsg("timed out waiting for a remote unique-index conflict")));
+					break;
+				case CLUSTER_TXW_UNPROVABLE:
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_TT_STATUS_UNKNOWN),
+							 errmsg("could not establish an exact cluster TX wait for a remote unique-index conflict"),
+							 errdetail("Exact transaction resolution failed: %s.",
+									   cluster_tx_resolve_reason_name(reason))));
+					break;
+				case CLUSTER_TXW_DEADLOCK:
+					ereport(ERROR,
+							(errcode(ERRCODE_T_R_DEADLOCK_DETECTED),
+							 errmsg("deadlock detected"),
+							 errdetail("The remote unique-index TX wait was selected as the victim.")));
+					break;
+			}
+		}
+#endif
 
 		if (unlikely(TransactionIdIsValid(xwait)))
 		{
@@ -461,7 +537,12 @@ static TransactionId
 _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				 IndexUniqueCheck checkUnique, bool *is_unique,
 				 uint32 *speculativeToken, bool *barrier_closed,
-				 ItemPointer barrier_tid)
+				 ItemPointer barrier_tid
+#ifdef USE_PGRAC_CLUSTER
+				 , bool *remote_xmax_wait,
+				 ClusterTxLocator *remote_wait_locator
+#endif
+	)
 {
 	IndexTuple	itup = insertstate->itup;
 	IndexTuple	curitup = NULL;
@@ -480,6 +561,12 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 
 	*barrier_closed = false;
 	ItemPointerSetInvalid(barrier_tid);
+#ifdef USE_PGRAC_CLUSTER
+	if (remote_xmax_wait == NULL || remote_wait_locator == NULL)
+		elog(ERROR, "remote unique-index wait output is missing");
+	*remote_xmax_wait = false;
+	memset(remote_wait_locator, 0, sizeof(*remote_wait_locator));
+#endif
 
 	/* Assume unique until we find a duplicate */
 	*is_unique = true;
@@ -616,7 +703,13 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 				 * index entry for the entire chain.
 				 */
 				else if ((fetch_result = table_index_fetch_tuple_check_barrier_aware(
-							  heapRel, &htid, &SnapshotDirty, &all_dead))
+							  heapRel, &htid, &SnapshotDirty, &all_dead,
+#ifdef USE_PGRAC_CLUSTER
+							  remote_xmax_wait, remote_wait_locator
+#else
+							  NULL, NULL
+#endif
+							  ))
 						 == TABLE_INDEX_FETCH_FOUND)
 				{
 					TransactionId xwait;
@@ -633,9 +726,24 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 					{
 						if (nbuf != InvalidBuffer)
 							_bt_relbuf(rel, nbuf);
+#ifdef USE_PGRAC_CLUSTER
+						*remote_xmax_wait = false;
+						memset(remote_wait_locator, 0,
+							   sizeof(*remote_wait_locator));
+#endif
 						*is_unique = false;
 						return InvalidTransactionId;
 					}
+
+#ifdef USE_PGRAC_CLUSTER
+					if (*remote_xmax_wait)
+					{
+						if (nbuf != InvalidBuffer)
+							_bt_relbuf(rel, nbuf);
+						insertstate->bounds_valid = false;
+						return InvalidTransactionId;
+					}
+#endif
 
 					/*
 					 * If this tuple is being updated by other transaction
@@ -674,7 +782,7 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 					 */
 					htid = itup->t_tid;
 					fetch_result = table_index_fetch_tuple_check_barrier_aware(
-						heapRel, &htid, SnapshotSelf, NULL);
+						heapRel, &htid, SnapshotSelf, NULL, NULL, NULL);
 					if (fetch_result == TABLE_INDEX_FETCH_BARRIER_CLOSED)
 					{
 						*barrier_tid = htid;

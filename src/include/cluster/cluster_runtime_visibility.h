@@ -75,6 +75,7 @@ typedef struct ClusterTTStatusKey ClusterTTStatusKey;
 typedef struct ClusterTTStatusResult ClusterTTStatusResult;
 typedef struct ClusterCtrcTxnKeyV1 ClusterCtrcTxnKeyV1;
 typedef struct ClusterCtrcParticipantIdentity ClusterCtrcParticipantIdentity;
+typedef struct ClusterCurrentMemberProofKey ClusterCurrentMemberProofKey;
 
 /* Stack/process-local continuation for the exact origin DATA -> canonical TT
  * -> DATA proof.  The representation is private to the provider; it is not a
@@ -239,9 +240,11 @@ extern bool cluster_runtime_visibility_current_mx_updater_provenance_exact(
 	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
 	uint32 *ctrc_grant_out,
 	uint32 *participant_capability_generation_out,
+	ClusterCtrcTxnKeyV1 *ctrc_key_out,
+	ClusterTxLocator *canonical_locator_out,
 	bool *cross_segment_out);
 extern bool cluster_runtime_visibility_active_proof_ctrc_identity_exact(
-	const ClusterTTStatusKey *proof_key, uint32 ctrc_grant,
+	const ClusterCurrentMemberProofKey *proof_key, uint32 ctrc_grant,
 	uint32 requester_capability_generation,
 	ClusterCtrcTxnKeyV1 *ctrc_key_out,
 	ClusterCtrcParticipantIdentity *participant_out);

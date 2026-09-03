@@ -158,6 +158,23 @@ cluster_vis_update_lock_only_xmax_verdict(ClusterTTStatus status)
 }
 
 /*
+ * S3-P0-26: PostgreSQL's current-xmax branch has three outcomes.  The
+ * cluster HTSU fork must reproduce them when a remote xmin has already been
+ * accepted, because falling back to the native body would re-judge that xmin
+ * through local CLOG.  lock_only dominates the command-id comparison.
+ */
+ClusterVisNativeSelfUpdateVerdict
+cluster_vis_update_native_self_verdict(bool lock_only,
+									   bool cmax_at_or_after_curcid)
+{
+	if (lock_only)
+		return CLUSTER_VIS_NATIVE_SELF_BEING_MODIFIED;
+	if (cmax_at_or_after_curcid)
+		return CLUSTER_VIS_NATIVE_SELF_MODIFIED;
+	return CLUSTER_VIS_NATIVE_SELF_INVISIBLE;
+}
+
+/*
  * spec-3.21 §2.3: CR image xmax-side MVCC verdict (pure; mirrors OBS-1 amend
  * MVCC-accurate, the multixact-member table at cluster_visibility_resolve.c).
  *
@@ -230,6 +247,14 @@ cluster_vis_dirty_verdict(ClusterTTStatus status, bool is_xmax, bool is_delete)
 	default:
 		return CVV_FAILCLOSED_UNKNOWN;
 	}
+}
+
+bool
+cluster_vis_dirty_remote_xmax_waitable(ClusterTTStatus status, bool is_xmax,
+									   bool exact_locator_valid)
+{
+	return status == CLUSTER_TT_STATUS_IN_PROGRESS
+		&& is_xmax && exact_locator_valid;
 }
 
 /* ============================================================

@@ -2529,15 +2529,40 @@ bool
 cluster_undo_record_prepared_recheck(
 	const ClusterUndoRecordPrepareReceipt *receipt, uint16 payload_len)
 {
-	return receipt != NULL
-		&& payload_len <= receipt->payload_capacity
-		&& receipt->absolute_deadline_us > (uint64)GetCurrentTimestamp()
-		&& cluster_undo_record_receipt_extent_matches(receipt)
-		&& cluster_semantic_activation_modifier_recheck(
-			&receipt->modifier_admission,
-			cluster_undo_record_writable_admission())
-		&& cluster_undo_block0_current_live_owner_publication_recheck_conditional(
-			&receipt->block0_publication);
+	static int diagnostic_budget = 8;
+	const char *reason = NULL;
+
+	if (receipt == NULL)
+		reason = "null";
+	else if (payload_len > receipt->payload_capacity)
+		reason = "payload";
+	else if (receipt->absolute_deadline_us <= (uint64)GetCurrentTimestamp())
+		reason = "deadline";
+	else if (!cluster_undo_record_receipt_extent_matches(receipt))
+		reason = "extent";
+	else if (!cluster_semantic_activation_modifier_recheck(
+				 &receipt->modifier_admission,
+				 cluster_undo_record_writable_admission()))
+		reason = "modifier";
+	else if (!cluster_undo_block0_current_live_owner_publication_recheck_conditional(
+				 &receipt->block0_publication))
+		reason = "block0";
+	else
+		return true;
+
+	if (diagnostic_budget > 0)
+	{
+		diagnostic_budget--;
+		ereport(LOG,
+				(errmsg_internal(
+					"undo prepared-recheck diagnostic: reason=%s record_type=%u pending=%u prepared=%u deadline=" UINT64_FORMAT " now=" UINT64_FORMAT,
+					reason, receipt == NULL ? 0 : (unsigned int)receipt->record_type,
+					receipt == NULL ? 0 : (unsigned int)receipt->ctrc_pending_mask,
+					receipt == NULL ? 0 : (unsigned int)receipt->ctrc_prepared_mask,
+					receipt == NULL ? 0 : receipt->absolute_deadline_us,
+					(uint64)GetCurrentTimestamp())));
+	}
+	return false;
 }
 
 bool

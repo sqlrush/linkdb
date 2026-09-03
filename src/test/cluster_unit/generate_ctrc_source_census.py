@@ -532,13 +532,24 @@ _classify_owners(
 _classify_owners(
     "CURRENT_MX_RECOMPOSE",
     "src/backend/access/heap/heapam.c",
-    ("cluster_current_mx_authorize",),
+    ("cluster_current_mx_authorize", "cluster_current_mx_compose_remote_single"),
     "SUCCESSOR_BEFORE_PREDECESSOR",
     "CTRC_REF_RECOMPOSED_SURVIVOR",
     "CTRC_TARGET_EXACT_TID",
     "cluster_current_mx_stamp_prepare_plan",
     "cluster_ctrc_receipt_discharge_current_mx_shared",
     "MXA-T27",
+)
+_classify_owners(
+    "MULTIXACT_PUBLISHER",
+    "src/backend/access/heap/heapam.c",
+    ("cluster_current_mx_compose_remote_single",),
+    "PROVEN_LOCAL_NONCLUSTER",
+    "CURRENT_MX_PROOF_ONLY_DESCRIPTOR",
+    "NO_HEAP_TARGET_IN_CONSTRUCTOR",
+    "CALLER_BUILDS_REGISTERED_DESCRIPTOR",
+    "NO_REFERENCE_TO_DISCHARGE",
+    "MXA-T41",
 )
 _classify_owners(
     "CURRENT_MX_RECOMPOSE",
@@ -584,7 +595,7 @@ _classify_owners(
     "CURRENT_MX_PROOF_SENDER",
     "src/backend/cluster/cluster_multixact_current.c",
     (
-        "cluster_multixact_current_members_resolve",
+        "cluster_multixact_current_members_resolve_internal",
         "cluster_multixact_current_resolve_origin_member_proof",
     ),
     "REGISTERED_REFERENCE",

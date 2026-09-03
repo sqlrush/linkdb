@@ -176,6 +176,110 @@ cluster_gcs_resource_x_target_terminal_resample_exact(
  * second authority.  Permit only a fresh driver iteration when one ownership
  * generation, the unchanged reservation token, and the independently frozen
  * terminal round all identify the same completed install. */
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE UINT64_C(0)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_INPUT (UINT64_C(1) << 0)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_RESULT (UINT64_C(1) << 1)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_TERMINAL (UINT64_C(1) << 2)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_TAG (UINT64_C(1) << 3)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_STATE (UINT64_C(1) << 4)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_FLAGS (UINT64_C(1) << 5)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_GENERATION (UINT64_C(1) << 6)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_TOKEN (UINT64_C(1) << 7)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_ACTIVATION (UINT64_C(1) << 8)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_STATE (UINT64_C(1) << 9)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_FLAGS (UINT64_C(1) << 10)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_GENERATION (UINT64_C(1) << 11)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_TOKEN (UINT64_C(1) << 12)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_ACTIVATION (UINT64_C(1) << 13)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_BUFFER_GENERATION (UINT64_C(1) << 14)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_REQUESTER (UINT64_C(1) << 15)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_FORMATION (UINT64_C(1) << 16)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_ACQUISITION (UINT64_C(1) << 17)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_BASE_AUTHORITY (UINT64_C(1) << 18)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_AUTHORITY (UINT64_C(1) << 19)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_R4 (UINT64_C(1) << 20)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_SESSION (UINT64_C(1) << 21)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_DEADLINE (UINT64_C(1) << 22)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_RETIRED (UINT64_C(1) << 23)
+#define RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_PROGRESS (UINT64_C(1) << 24)
+
+/* Diagnostic decomposition of the admission predicate below.  It is neither
+ * a wire value nor a retry policy: callers may log the mask, but only a zero
+ * mask is the exact stable cover that permits a fresh driver iteration. */
+static inline uint64
+cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+	const ClusterPcmOwnSnapshot *before_pending,
+	const ClusterPcmOwnSnapshot *live_x,
+	ResourceXApplyResult round_snapshot_result,
+	const ResourceXBootstrapRoundFailureSnapshot *round)
+{
+	uint64 mismatch = RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE;
+
+	if (round_snapshot_result != RESOURCE_X_APPLY_APPLIED)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_RESULT;
+	if (before_pending == NULL || live_x == NULL || round == NULL)
+		return mismatch | RESOURCE_X_PENDING_TERMINAL_MISMATCH_INPUT;
+	if (round->terminal != 1)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_TERMINAL;
+	if (!BufferTagsEqual(&before_pending->tag, &live_x->tag)
+		|| !BufferTagsEqual(&live_x->tag, &round->ref.assertion.resource))
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_TAG;
+	if (before_pending->pcm_state != (uint8) PCM_STATE_N)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_STATE;
+	if (before_pending->flags != PCM_OWN_FLAG_GRANT_PENDING)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_FLAGS;
+	if (before_pending->generation >= UINT64_MAX - 1)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_GENERATION;
+	if (before_pending->reservation_token == 0
+		|| before_pending->reservation_token == UINT64_MAX)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_TOKEN;
+	if (before_pending->writer_activation_token != 0
+		|| before_pending->resource_x_activation_generation != 0)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_ACTIVATION;
+	if (live_x->pcm_state != (uint8) PCM_STATE_X)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_STATE;
+	if (live_x->flags != 0)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_FLAGS;
+	if (before_pending->generation >= UINT64_MAX - 1
+		|| live_x->generation != before_pending->generation + 1)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_GENERATION;
+	if (live_x->reservation_token != before_pending->reservation_token)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_TOKEN;
+	if (live_x->writer_activation_token != 0
+		|| live_x->resource_x_activation_generation != 0)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_ACTIVATION;
+	if (round->buffer_ownership_generation != live_x->generation)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_BUFFER_GENERATION;
+	if (round->ref.assertion.requester_node < 0)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_REQUESTER;
+	if (round->ref.formation == 0 || round->ref.formation == UINT64_MAX)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_FORMATION;
+	if (round->ref.acquisition_generation == 0
+		|| round->ref.acquisition_generation == UINT64_MAX)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_ACQUISITION;
+	if (round->base_authority_generation == 0
+		|| round->base_authority_generation == UINT64_MAX)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_BASE_AUTHORITY;
+	if (round->authority_generation <= round->base_authority_generation
+		|| round->authority_generation == UINT64_MAX)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_AUTHORITY;
+	if (round->r4_record_generation == 0
+		|| round->r4_record_generation == UINT64_MAX)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_R4;
+	if (round->master_session_incarnation == 0
+		|| round->master_session_incarnation == UINT64_MAX)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_SESSION;
+	if (round->absolute_deadline_us == 0
+		|| round->absolute_deadline_us == UINT64_MAX)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_DEADLINE;
+	if (round->retired_acquisition_generation
+		!= round->ref.acquisition_generation)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_RETIRED;
+	if (round->progress_flags != 0)
+		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_PROGRESS;
+	return mismatch;
+}
+
 static inline bool
 cluster_gcs_resource_x_target_pending_terminal_resample_exact(
 	const ClusterPcmOwnSnapshot *before_pending,
@@ -183,48 +287,9 @@ cluster_gcs_resource_x_target_pending_terminal_resample_exact(
 	ResourceXApplyResult round_snapshot_result,
 	const ResourceXBootstrapRoundFailureSnapshot *round)
 {
-	if (before_pending == NULL || live_x == NULL || round == NULL
-		|| round_snapshot_result != RESOURCE_X_APPLY_APPLIED
-		|| round->terminal != 1)
-		return false;
-	if (!BufferTagsEqual(&before_pending->tag, &live_x->tag)
-		|| !BufferTagsEqual(&live_x->tag,
-			&round->ref.assertion.resource)
-		|| before_pending->pcm_state != (uint8) PCM_STATE_N
-		|| before_pending->flags != PCM_OWN_FLAG_GRANT_PENDING
-		|| before_pending->generation >= UINT64_MAX - 1
-		|| before_pending->reservation_token == 0
-		|| before_pending->reservation_token == UINT64_MAX
-		|| before_pending->writer_activation_token != 0
-		|| before_pending->resource_x_activation_generation != 0
-		|| live_x->pcm_state != (uint8) PCM_STATE_X
-		|| live_x->flags != 0
-		|| live_x->generation != before_pending->generation + 1
-		|| live_x->reservation_token
-			!= before_pending->reservation_token
-		|| live_x->writer_activation_token != 0
-		|| live_x->resource_x_activation_generation != 0)
-		return false;
-	return round->buffer_ownership_generation == live_x->generation
-		&& round->ref.assertion.requester_node >= 0
-		&& round->ref.formation != 0
-		&& round->ref.formation != UINT64_MAX
-		&& round->ref.acquisition_generation != 0
-		&& round->ref.acquisition_generation != UINT64_MAX
-		&& round->base_authority_generation != 0
-		&& round->base_authority_generation != UINT64_MAX
-		&& round->authority_generation
-			> round->base_authority_generation
-		&& round->authority_generation != UINT64_MAX
-		&& round->r4_record_generation != 0
-		&& round->r4_record_generation != UINT64_MAX
-		&& round->master_session_incarnation != 0
-		&& round->master_session_incarnation != UINT64_MAX
-		&& round->absolute_deadline_us != 0
-		&& round->absolute_deadline_us != UINT64_MAX
-		&& round->retired_acquisition_generation
-			== round->ref.acquisition_generation
-		&& round->progress_flags == 0;
+	return cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+		before_pending, live_x, round_snapshot_result, round)
+		== RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE;
 }
 
 /* A legacy local acquire and the target-only Resource-X driver serialize

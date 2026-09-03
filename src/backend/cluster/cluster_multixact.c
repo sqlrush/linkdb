@@ -1141,3 +1141,67 @@ cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op,
 		PG_RE_THROW();
 	return admission;
 }
+
+/*
+ * cluster_multixact_remote_xmax_visibility_dispatch -- admit the frozen
+ * D3-b reader resolver through the semantic side that owns this generation.
+ *
+ * R4 OPEN makes the legacy SOURCE side dormant, but snapshot visibility is
+ * still a required TARGET consumer.  Keep its established wire request and
+ * pure visibility table byte-for-byte by invoking the same raw operation
+ * body under TARGET admission.  Before R4 activation, and only after the
+ * target gate returns the stable TARGET_DISABLED result, delegate to the
+ * existing SOURCE dispatcher.  Every other refusal is a cutover/generation
+ * fence and must remain fail closed rather than crossing sides.
+ */
+ClusterSemanticAdmissionResult
+cluster_multixact_remote_xmax_visibility_dispatch(
+	const ClusterMultiXactSourceRequest *request,
+	ClusterMultiXactSourceResult *result)
+{
+	ClusterSemanticAdmissionToken token;
+	ClusterMultiXactSourceResult local_result;
+	ClusterSemanticAdmissionResult admission;
+	volatile bool caught_error = false;
+
+	memset(&token, 0, sizeof(token));
+	memset(&local_result, 0, sizeof(local_result));
+	if (result != NULL)
+		memset(result, 0, sizeof(*result));
+
+	admission = cluster_semantic_activation_enter(
+		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+		CLUSTER_SEMANTIC_TARGET_SIDE, &token);
+	if (admission == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED)
+		return cluster_multixact_source_dispatch(
+			CLUSTER_MULTI_SOURCE_REMOTE_XMAX_RESOLVE, request, result);
+	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
+		return admission;
+
+	PG_TRY();
+	{
+		if (result == NULL)
+			admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+		else
+			admission = cluster_multixact_source_dispatch_body(
+				CLUSTER_MULTI_SOURCE_REMOTE_XMAX_RESOLVE, request,
+				&local_result);
+
+		if (admission == CLUSTER_SEMANTIC_ADMISSION_OK) {
+			if (!cluster_semantic_activation_recheck(&token))
+				admission = CLUSTER_SEMANTIC_ADMISSION_GENERATION_CHANGED;
+			else
+				*result = local_result;
+		}
+	}
+	PG_CATCH();
+	{
+		caught_error = true;
+	}
+	PG_END_TRY();
+
+	cluster_semantic_activation_leave(&token);
+	if (caught_error)
+		PG_RE_THROW();
+	return admission;
+}

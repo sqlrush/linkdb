@@ -26,6 +26,7 @@
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_undo_record_api.h"
@@ -162,6 +163,19 @@ cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
 		memset(snapshot_out, 0, sizeof(*snapshot_out));
 	return false;
 }
+
+bool
+cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
+	bool thawed pg_attribute_unused(), ResourceXReconfigToken *token_out,
+	uint64 *digest_out)
+{
+	if (token_out != NULL)
+		memset(token_out, 0, sizeof(*token_out));
+	if (digest_out != NULL)
+		*digest_out = 0;
+	return false;
+}
+
 bool cluster_recmerge_window_active = false;
 uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
@@ -234,6 +248,11 @@ static bool ut_hot_content_lock_held;
 static bool ut_hot_production_core_active;
 static bool ut_hot_r4_target_reachable;
 static bool ut_hot_current_mx_active;
+static uint8 ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_X;
+static bool ut_hot_current_mx_one_shot;
+static uint64 ut_hot_current_read_bracket;
+static int ut_hot_current_read_acquire_calls;
+static int ut_hot_current_read_clear_calls;
 static uint16 ut_hot_current_mx_member_count = 2;
 static bool ut_current_mx_ordinary_lock_only;
 static ClusterUndoTTSlotRef ut_hot_successor_ref;
@@ -251,6 +270,8 @@ static bool ut_itl_census_consume_allocated_slot;
 static int ut_hot_current_mx_describe_calls;
 static int ut_hot_current_mx_resolve_calls;
 static int ut_hot_current_mx_validate_calls;
+static int ut_hot_requester_requalify_barrier_calls;
+static int ut_hot_requester_requalify_barrier_lock_calls;
 static bool ut_itl_census_active;
 static bool ut_itl_census_mutate_wrap;
 static bool ut_itl_census_lock_only;
@@ -301,6 +322,48 @@ cluster_heap_test_r4_target_reachable(void)
 #define UT_HOT_AUTH_UPDATER ((TransactionId)901)
 #define UT_ORDINARY_LOCKER ((TransactionId)897)
 #define UT_ORDINARY_REQUESTER ((TransactionId)905)
+
+bool
+cluster_itl_find_data_slot_index_by_xid(Page page, TransactionId raw_xid,
+									uint8 *slot_index_out)
+{
+	const ClusterItlSlotData *slots;
+	int match = -1;
+	uint16 winning_wrap = 0;
+	bool ambiguous = false;
+	uint8 i;
+
+	if (page == NULL || slot_index_out == NULL)
+		return false;
+	*slot_index_out = CLUSTER_ITL_SLOT_UNALLOCATED;
+	if (!PageHasItl(page) || !TransactionIdIsValid(raw_xid))
+		return false;
+	slots = ClusterPageGetItlSlots(page);
+	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
+	{
+		const ClusterItlSlotData *slot = &slots[i];
+		bool data = slot->flags == ITL_FLAG_ACTIVE
+			|| slot->flags == ITL_FLAG_COMMITTED
+			|| slot->flags == ITL_FLAG_ABORTED
+			|| slot->flags == ITL_FLAG_NEEDS_CLEANOUT;
+
+		if (!data || slot->xid != raw_xid
+			|| UBA_is_invalid(slot->undo_segment_head))
+			continue;
+		if (match < 0 || slot->wrap > winning_wrap)
+		{
+			match = i;
+			winning_wrap = slot->wrap;
+			ambiguous = false;
+		}
+		else if (slot->wrap == winning_wrap)
+			ambiguous = true;
+	}
+	if (match < 0 || ambiguous)
+		return false;
+	*slot_index_out = (uint8) match;
+	return true;
+}
 
 bool
 cluster_itl_get_tt_ref(Page page, uint8 itl_slot_idx,
@@ -504,14 +567,25 @@ cluster_bufmgr_pcm_own_snapshot(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 		= (ut_itl_census_replace_current_page
 		   || ut_itl_census_stale_first_round_full)
 			&& ut_hot_pcm_snapshot_calls > 1 ? 18 : 17;
+	if (ut_hot_current_mx_active && ut_hot_current_mx_one_shot)
+	{
+		UT_ASSERT_EQ(ut_hot_current_mx_pcm_state,
+					 (uint8) PCM_STATE_READ_IMAGE);
+		UT_ASSERT(ut_hot_current_read_bracket > 0);
+		out->generation = 16 + ut_hot_current_read_bracket;
+		out->reservation_token = ut_hot_current_read_bracket;
+	}
 	if (ut_itl_census_second_round_drift
 		&& ut_hot_pcm_snapshot_calls > 3)
 		out->generation = 19;
 	out->writer_activation_token
 		= ut_itl_census_change_writer_activation_projection
 		  && ut_hot_pcm_snapshot_calls > 1 ? UINT64_C(99) : 0;
-	out->pcm_state = cluster_conf_has_peers() && !ut_itl_census_force_pcm_n
-		? (uint8) PCM_STATE_X : (uint8) PCM_STATE_N;
+	if (ut_hot_current_mx_active)
+		out->pcm_state = ut_hot_current_mx_pcm_state;
+	else
+		out->pcm_state = cluster_conf_has_peers() && !ut_itl_census_force_pcm_n
+			? (uint8) PCM_STATE_X : (uint8) PCM_STATE_N;
 	ut_hot_last_pcm_snapshot_state = out->pcm_state;
 	return CLUSTER_PCM_OWN_OK;
 }
@@ -687,7 +761,7 @@ cluster_multixact_current_successor_provenance_well_formed(
 		&& alias->cluster_epoch == current_epoch
 		&& alias->local_xid == updater_xid
 		&& locator->xid == updater_xid
-		&& locator->tt_wrap != TT_WRAP_INVALID;
+		&& locator->tt_wrap == TT_WRAP_INVALID;
 }
 
 ClusterTxOutcome
@@ -1029,10 +1103,35 @@ cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
 		= challenge->candidate_next_xmin_alias;
 	updater_proof->candidate_next_xmin_locator
 		= challenge->candidate_next_xmin_locator;
+	/* The origin's exact undo record supplies the canonical TT wrap; make it
+	 * deliberately distinct from the page ITL wrap in this fixture. */
+	updater_proof->candidate_next_xmin_locator.tt_wrap = 42;
 	updater_proof->updater_xid = challenge->updater_xid;
 	updater_proof->member_ordinal = challenge->member_ordinal;
 	updater_proof->verdict = CUCP_MATCH;
 	return CMX_RESOLVE_OK;
+}
+
+ClusterMxResolveResult
+cluster_multixact_current_members_resolve_until(
+	const ClusterCurrentMxKey *key,
+	const ClusterCurrentMxMemberDesc *members,
+	uint16 nmembers, uint64 descriptor_hash,
+	const ClusterCurrentUpdaterChallenge *challenge,
+	ClusterCurrentMemberProof *proofs,
+	ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *proof_capability_generations,
+	TimestampTz *operation_deadline)
+{
+	UT_ASSERT_NOT_NULL(operation_deadline);
+	if (*operation_deadline == 0)
+		*operation_deadline = (TimestampTz) UINT64_C(123456789);
+	else
+		UT_ASSERT_EQ(*operation_deadline,
+					 (TimestampTz) UINT64_C(123456789));
+	return cluster_multixact_current_members_resolve(
+		key, members, nmembers, descriptor_hash, challenge, proofs,
+		updater_proof, proof_capability_generations);
 }
 
 bool
@@ -1057,9 +1156,12 @@ cluster_multixact_current_validate_updater_proof(
 	UT_ASSERT(memcmp(&challenge->candidate_next_xmin_alias,
 				 &updater_proof->candidate_next_xmin_alias,
 				 sizeof(ClusterCurrentMxSuccessorAlias)) == 0);
-	UT_ASSERT(memcmp(&challenge->candidate_next_xmin_locator,
-				 &updater_proof->candidate_next_xmin_locator,
-				 sizeof(ClusterTxLocator)) == 0);
+	UT_ASSERT_EQ(challenge->candidate_next_xmin_locator.tt_wrap,
+				 TT_WRAP_INVALID);
+	UT_ASSERT_EQ(updater_proof->candidate_next_xmin_locator.tt_wrap, 42);
+	UT_ASSERT(cluster_tx_locator_reply_matches(
+		&challenge->candidate_next_xmin_locator,
+		&updater_proof->candidate_next_xmin_locator));
 	ut_hot_current_mx_validate_calls++;
 	return true;
 }
@@ -1501,6 +1603,19 @@ typedef struct UtR4HotProductFixture
 
 static UtR4HotProductFixture *ut_hot_product_fixture;
 
+void
+cluster_ctrc_test_barrier_wait(ClusterCtrcTestBarrierPhase phase)
+{
+	UT_ASSERT_EQ(phase, CTRC_TEST_BARRIER_REQUESTER_REQUALIFY);
+	UT_ASSERT(ut_hot_current_mx_active);
+	UT_ASSERT(!ut_hot_content_lock_held);
+	UT_ASSERT_EQ(ut_hot_current_mx_resolve_calls, 1);
+	UT_ASSERT_NOT_NULL(ut_hot_product_fixture);
+	ut_hot_requester_requalify_barrier_calls++;
+	ut_hot_requester_requalify_barrier_lock_calls
+		= ut_hot_product_fixture->lock_calls;
+}
+
 static HeapTupleHeader ut_r4_hot_tuple_at(Page page, OffsetNumber offnum);
 
 BlockNumber
@@ -1556,11 +1671,25 @@ LockBuffer(Buffer buffer, int mode)
 	{
 		UT_ASSERT(ut_hot_content_lock_held);
 		ut_hot_content_lock_held = false;
+		if (ut_hot_current_mx_active && ut_hot_current_mx_one_shot)
+		{
+			UT_ASSERT_EQ(ut_hot_current_mx_pcm_state,
+						 (uint8) PCM_STATE_READ_IMAGE);
+			ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_N;
+			ut_hot_current_read_clear_calls++;
+		}
 	}
 	else if (mode == BUFFER_LOCK_SHARE)
 	{
 		UT_ASSERT(!ut_hot_content_lock_held);
 		ut_hot_content_lock_held = true;
+		if (ut_hot_current_mx_active && ut_hot_current_mx_one_shot)
+		{
+			UT_ASSERT_EQ(ut_hot_current_mx_pcm_state, (uint8) PCM_STATE_N);
+			ut_hot_current_read_bracket++;
+			ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_READ_IMAGE;
+			ut_hot_current_read_acquire_calls++;
+		}
 	}
 	else if (mode == BUFFER_LOCK_EXCLUSIVE)
 	{
@@ -2397,7 +2526,7 @@ UT_TEST(test_38_changed_input_discards_old_fetch_failure_before_error_mapping)
 	BufferBlocks = NULL;
 }
 
-UT_TEST(test_39_peer_foreign_multixact_hot_chain_never_uses_native_decode)
+UT_TEST(test_peer_foreign_multixact_hot_chain_uses_shared_current_only)
 {
 	UtR4HotProductFixture fixture;
 	HeapHotSearchResult result;
@@ -2416,6 +2545,114 @@ UT_TEST(test_39_peer_foreign_multixact_hot_chain_never_uses_native_decode)
 	ut_native_multixact_updater = UT_HOT_AUTH_UPDATER;
 	cluster_r4_activation_test_current_epoch = UT_HOT_CURRENT_EPOCH;
 	ut_hot_current_mx_active = true;
+	ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_S;
+	memset(&ut_hot_successor_ref, 0, sizeof(ut_hot_successor_ref));
+	ut_hot_successor_ref.origin_node_id = UT_HOT_CURRENT_MX_ORIGIN;
+	ut_hot_successor_ref.undo_segment_id = 258;
+	ut_hot_successor_ref.tt_slot_id = 8;
+	ut_hot_successor_ref.cluster_epoch = UT_HOT_CURRENT_EPOCH;
+	ut_hot_successor_ref.local_xid = UT_HOT_AUTH_UPDATER;
+	ut_hot_pcm_snapshot_calls = 0;
+	ut_hot_current_mx_describe_calls = 0;
+	ut_hot_current_mx_resolve_calls = 0;
+	ut_hot_current_mx_validate_calls = 0;
+	ut_hot_requester_requalify_barrier_calls = 0;
+	ut_hot_requester_requalify_barrier_lock_calls = -1;
+	memset(&relation, 0, sizeof(relation));
+	memset(&relation_form, 0, sizeof(relation_form));
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &relation_form;
+	relation_form.relpersistence = RELPERSISTENCE_PERMANENT;
+	memset(&snapshot, 0, sizeof(snapshot));
+	snapshot.snapshot_type = SNAPSHOT_ANY;
+	ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+
+	kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER,
+										&snapshot, &result, NULL, true);
+	UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_BUFFER_BACKED);
+	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&tid), UT_HOT_SUCCESSOR_OFF);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(result.tuple.t_data),
+				 UT_HOT_AUTH_UPDATER);
+	/* Root and successor are each evaluated once; no XCUR upgrade restart. */
+	UT_ASSERT_EQ(ut_live_visibility_calls, 2);
+	UT_ASSERT_EQ(fixture.fetch_calls, 0);
+	UT_ASSERT_EQ(fixture.lock_calls, 4);
+	UT_ASSERT_EQ(fixture.lock_modes[0], BUFFER_LOCK_UNLOCK);
+	UT_ASSERT_EQ(fixture.lock_modes[1], BUFFER_LOCK_SHARE);
+	UT_ASSERT_EQ(fixture.lock_modes[2], BUFFER_LOCK_UNLOCK);
+	UT_ASSERT_EQ(fixture.lock_modes[3], BUFFER_LOCK_SHARE);
+	UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 5);
+	UT_ASSERT_EQ(ut_hot_last_pcm_snapshot_state, (uint8) PCM_STATE_S);
+	UT_ASSERT_EQ(ut_hot_live_ref_calls, 2);
+	UT_ASSERT_EQ(ut_hot_current_mx_describe_calls, 1);
+	UT_ASSERT_EQ(ut_hot_current_mx_resolve_calls, 1);
+	UT_ASSERT_EQ(ut_hot_current_mx_validate_calls, 1);
+	UT_ASSERT_EQ(ut_hot_requester_requalify_barrier_calls, 1);
+	/* describe unlock/relock, then proof unlock; SHARE requalification follows */
+	UT_ASSERT_EQ(ut_hot_requester_requalify_barrier_lock_calls, 3);
+	UT_ASSERT_EQ(ut_native_multixact_decode_calls, 0);
+
+	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_X;
+	ut_hot_current_mx_active = false;
+	ut_live_visible_offnum = InvalidOffsetNumber;
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+}
+
+UT_TEST(test_peer_foreign_multixact_hot_chain_revalidates_one_shot_current_images)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	RelationData relation;
+	FormData_pg_class relation_form;
+	SnapshotData snapshot;
+	ItemPointerData tid;
+	HeapHotSearchResultKind kind;
+	ClusterPcmOwnSnapshot one_shot_before;
+	ClusterPcmOwnSnapshot one_shot_after;
+
+	ut_r4_hot_init_product_fixture(&fixture, &result);
+	memset(&one_shot_before, 0, sizeof(one_shot_before));
+	one_shot_before.tag = fixture.expected_tag;
+	one_shot_before.generation = 17;
+	one_shot_before.reservation_token = 1;
+	one_shot_before.pcm_state = (uint8) PCM_STATE_READ_IMAGE;
+	one_shot_after = one_shot_before;
+	one_shot_after.generation = 18;
+	one_shot_after.reservation_token = 2;
+	UT_ASSERT(cluster_heap_test_current_mx_read_requalification(
+		&one_shot_before, &one_shot_after));
+	one_shot_after.generation = one_shot_before.generation;
+	UT_ASSERT(!cluster_heap_test_current_mx_read_requalification(
+		&one_shot_before, &one_shot_after));
+	one_shot_after.generation = 18;
+	one_shot_after.reservation_token = one_shot_before.reservation_token;
+	UT_ASSERT(!cluster_heap_test_current_mx_read_requalification(
+		&one_shot_before, &one_shot_after));
+	one_shot_after.reservation_token = 2;
+	one_shot_after.pcm_state = (uint8) PCM_STATE_S;
+	UT_ASSERT(!cluster_heap_test_current_mx_read_requalification(
+		&one_shot_before, &one_shot_after));
+	one_shot_after = one_shot_before;
+	one_shot_after.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	UT_ASSERT(!cluster_heap_test_current_mx_read_requalification(
+		&one_shot_before, &one_shot_after));
+	ut_r4_hot_build_foreign_multixact_chain(fixture.live_page);
+	memset(&ut_cluster_conf, 0, sizeof(ut_cluster_conf));
+	ut_cluster_conf.node_count = 2;
+	ut_live_visible_offnum = UT_HOT_SUCCESSOR_OFF;
+	ut_native_multixact_decode_calls = 0;
+	ut_native_multixact_updater = UT_HOT_AUTH_UPDATER;
+	cluster_r4_activation_test_current_epoch = UT_HOT_CURRENT_EPOCH;
+	ut_hot_current_mx_active = true;
+	ut_hot_current_mx_one_shot = true;
+	ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_READ_IMAGE;
+	ut_hot_current_read_bracket = 1;
+	ut_hot_current_read_acquire_calls = 1;
+	ut_hot_current_read_clear_calls = 0;
 	memset(&ut_hot_successor_ref, 0, sizeof(ut_hot_successor_ref));
 	ut_hot_successor_ref.origin_node_id = UT_HOT_CURRENT_MX_ORIGIN;
 	ut_hot_successor_ref.undo_segment_id = 258;
@@ -2441,25 +2678,28 @@ UT_TEST(test_39_peer_foreign_multixact_hot_chain_never_uses_native_decode)
 	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&tid), UT_HOT_SUCCESSOR_OFF);
 	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(result.tuple.t_data),
 				 UT_HOT_AUTH_UPDATER);
-	UT_ASSERT_EQ(ut_live_visibility_calls, 3);
-	UT_ASSERT_EQ(fixture.fetch_calls, 0);
-	UT_ASSERT_EQ(fixture.lock_calls, 8);
+	UT_ASSERT_EQ(fixture.lock_calls, 4);
 	UT_ASSERT_EQ(fixture.lock_modes[0], BUFFER_LOCK_UNLOCK);
-	UT_ASSERT_EQ(fixture.lock_modes[1], BUFFER_LOCK_EXCLUSIVE);
+	UT_ASSERT_EQ(fixture.lock_modes[1], BUFFER_LOCK_SHARE);
 	UT_ASSERT_EQ(fixture.lock_modes[2], BUFFER_LOCK_UNLOCK);
-	UT_ASSERT_EQ(fixture.lock_modes[3], BUFFER_LOCK_EXCLUSIVE);
-	UT_ASSERT_EQ(fixture.lock_modes[4], BUFFER_LOCK_UNLOCK);
-	UT_ASSERT_EQ(fixture.lock_modes[5], BUFFER_LOCK_EXCLUSIVE);
-	UT_ASSERT_EQ(fixture.lock_modes[6], BUFFER_LOCK_UNLOCK);
-	UT_ASSERT_EQ(fixture.lock_modes[7], BUFFER_LOCK_SHARE);
+	UT_ASSERT_EQ(fixture.lock_modes[3], BUFFER_LOCK_SHARE);
+	UT_ASSERT_EQ(ut_hot_current_read_acquire_calls, 3);
+	UT_ASSERT_EQ(ut_hot_current_read_clear_calls, 2);
+	UT_ASSERT_EQ(ut_hot_current_read_bracket, UINT64_C(3));
 	UT_ASSERT_EQ(ut_hot_pcm_snapshot_calls, 5);
-	UT_ASSERT_EQ(ut_hot_live_ref_calls, 2);
+	UT_ASSERT_EQ(ut_hot_last_pcm_snapshot_state,
+				 (uint8) PCM_STATE_READ_IMAGE);
 	UT_ASSERT_EQ(ut_hot_current_mx_describe_calls, 1);
 	UT_ASSERT_EQ(ut_hot_current_mx_resolve_calls, 1);
 	UT_ASSERT_EQ(ut_hot_current_mx_validate_calls, 1);
 	UT_ASSERT_EQ(ut_native_multixact_decode_calls, 0);
 
 	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	UT_ASSERT_EQ(ut_hot_current_read_clear_calls, 3);
+	UT_ASSERT_EQ(ut_hot_current_mx_pcm_state, (uint8) PCM_STATE_N);
+	ut_hot_current_mx_one_shot = false;
+	ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_X;
+	ut_hot_current_read_bracket = 0;
 	ut_hot_current_mx_active = false;
 	ut_live_visible_offnum = InvalidOffsetNumber;
 	ut_hot_production_core_active = false;
@@ -3529,6 +3769,7 @@ UT_TEST(test_66_one_member_current_mx_reaches_real_hot_companion)
 	ut_native_multixact_decode_calls = 0;
 	cluster_r4_activation_test_current_epoch = UT_HOT_CURRENT_EPOCH;
 	ut_hot_current_mx_active = true;
+	ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_S;
 	ut_hot_current_mx_member_count = 1;
 	memset(&ut_hot_successor_ref, 0, sizeof(ut_hot_successor_ref));
 	ut_hot_successor_ref.origin_node_id = UT_HOT_CURRENT_MX_ORIGIN;
@@ -3562,6 +3803,7 @@ UT_TEST(test_66_one_member_current_mx_reaches_real_hot_companion)
 	UT_ASSERT_EQ(ut_native_multixact_decode_calls, 0);
 
 	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_X;
 	ut_hot_current_mx_member_count = 2;
 	ut_hot_current_mx_active = false;
 	ut_live_visible_offnum = InvalidOffsetNumber;
@@ -3589,6 +3831,7 @@ UT_TEST(test_67_one_member_current_mx_reaches_standard_hot_consumer)
 	ut_native_multixact_decode_calls = 0;
 	cluster_r4_activation_test_current_epoch = UT_HOT_CURRENT_EPOCH;
 	ut_hot_current_mx_active = true;
+	ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_S;
 	ut_hot_current_mx_member_count = 1;
 	memset(&ut_hot_successor_ref, 0, sizeof(ut_hot_successor_ref));
 	ut_hot_successor_ref.origin_node_id = UT_HOT_CURRENT_MX_ORIGIN;
@@ -3623,6 +3866,7 @@ UT_TEST(test_67_one_member_current_mx_reaches_standard_hot_consumer)
 	UT_ASSERT_EQ(ut_native_multixact_decode_calls, 0);
 
 	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_current_mx_pcm_state = (uint8) PCM_STATE_X;
 	ut_hot_current_mx_member_count = 2;
 	ut_hot_current_mx_active = false;
 	ut_hot_production_core_active = false;
@@ -3722,7 +3966,7 @@ UT_TEST(test_79_current_mx_epoch_zero_requires_clean_four_node_formation)
 int
 main(void)
 {
-	UT_PLAN(79);
+	UT_PLAN(80);
 	UT_RUN(test_01_held_lock_bits_are_independent);
 	UT_RUN(test_02_wait_edge_values_are_closed);
 	UT_RUN(test_03_utility_to_lmon_wait_with_no_lock_is_allowed);
@@ -3761,7 +4005,8 @@ main(void)
 	UT_RUN(test_36_production_hot_core_full_result_is_owned);
 	UT_RUN(test_37_full_input_recheck_catches_non_target_itl_with_stable_tuple_and_lsn);
 	UT_RUN(test_38_changed_input_discards_old_fetch_failure_before_error_mapping);
-	UT_RUN(test_39_peer_foreign_multixact_hot_chain_never_uses_native_decode);
+	UT_RUN(test_peer_foreign_multixact_hot_chain_uses_shared_current_only);
+	UT_RUN(test_peer_foreign_multixact_hot_chain_revalidates_one_shot_current_images);
 	UT_RUN(test_40_dormant_r4_does_not_intercept_live_hot_path);
 	UT_RUN(test_41_data_itl_full_census_resolves_terminal_without_content_lock);
 	UT_RUN(test_42_lock_only_itl_full_census_recycles_exact_abort);

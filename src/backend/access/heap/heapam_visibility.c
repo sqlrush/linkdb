@@ -167,11 +167,15 @@ typedef enum ClusterForeignXmaxState {
 } ClusterForeignXmaxState;
 
 static ClusterForeignXmaxState
-cluster_foreign_xmax_state(Buffer buffer, HeapTupleHeader tuple, TransactionId raw_xmax)
+cluster_foreign_xmax_state(Buffer buffer, HeapTupleHeader tuple,
+						   TransactionId raw_xmax,
+						   ClusterVisResolve *resolve_out)
 {
 	ClusterVisResolve xr;
 
 	cluster_visibility_resolve_tuple(buffer, tuple, raw_xmax, CLUSTER_VIS_XMAX_UPDATE, &xr);
+	if (resolve_out != NULL)
+		*resolve_out = xr;
 	if (xr.evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
 		switch (xr.status) {
 		case CLUSTER_TT_STATUS_COMMITTED:
@@ -296,11 +300,13 @@ cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader tuple, Buffer buffer)
  * This must be separate because of C99's brain-dead notions about how to
  * implement inline functions.
  */
+#ifndef CLUSTER_R4_VISIBILITY_EXTERNAL_HINT_STUB
 void
 HeapTupleSetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId xid)
 {
 	SetHintBits(tuple, buffer, infomask, xid);
 }
+#endif
 
 
 /*
@@ -576,7 +582,8 @@ HeapTupleSatisfiesSelf(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	 * this native body, but the deleter is provably another node's xid, so
 	 * every native answer below is void for it.  Resolve it instead. */
 	if (cluster_plain_xmax_provably_foreign(tuple)) {
-		if (cluster_foreign_xmax_state(buffer, tuple, HeapTupleHeaderGetRawXmax(tuple))
+		if (cluster_foreign_xmax_state(buffer, tuple,
+									   HeapTupleHeaderGetRawXmax(tuple), NULL)
 			== CLUSTER_FOREIGN_XMAX_DELETED)
 			return false; /* updated by other */
 		return true;	  /* in-progress or aborted deleter: still visible to self */
@@ -807,7 +814,8 @@ HeapTupleSatisfiesToast(HeapTuple htup, Snapshot snapshot, Buffer buffer)
  *	lock-only remote path reuses the spec-3.4d bridge unchanged.
  */
 static bool
-cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
+cluster_satisfies_update_fork(HeapTuple htup, CommandId curcid, Buffer buffer,
+							  TM_Result *res)
 {
 	HeapTupleHeader tuple = htup->t_data;
 	TransactionId raw_xmin = HeapTupleHeaderGetRawXmin(tuple);
@@ -934,9 +942,30 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 						errhint("ITL slot no longer maps to this xid; retry.")));
 		break;
 	case CLUSTER_VIS_ROUTE_NATIVE_SELF:
-		/* Our own xmax: PG-native (self-modified). */
+		/*
+		 * Our own xmax over a remote-visible xmin cannot fall through to the
+		 * native body, which would re-judge that xmin through local CLOG.  Keep
+		 * the native current-xmax three-state table exact: a lock taken by this
+		 * transaction remains TM_BeingModified; only a real update at/after
+		 * curcid is TM_SelfModified, and an earlier update is TM_Invisible.
+		 */
 		if (xmin_remote_visible) {
-			*res = TM_SelfModified;
+			switch (cluster_vis_update_native_self_verdict(
+						lock_only,
+						!lock_only
+						&& HeapTupleHeaderGetCmax(tuple) >= curcid)) {
+			case CLUSTER_VIS_NATIVE_SELF_BEING_MODIFIED:
+				*res = TM_BeingModified;
+				break;
+			case CLUSTER_VIS_NATIVE_SELF_MODIFIED:
+				*res = TM_SelfModified;
+				break;
+			case CLUSTER_VIS_NATIVE_SELF_INVISIBLE:
+				*res = TM_Invisible;
+				break;
+			default:
+				pg_unreachable();
+			}
 			return true;
 		}
 		return false;
@@ -992,6 +1021,10 @@ cluster_satisfies_update_fork(HeapTuple htup, Buffer buffer, TM_Result *res)
 	if (xmin_remote_visible) {
 		if (TransactionIdIsInProgress(raw_xmax))
 			*res = TM_BeingModified;
+		else if (lock_only)
+			/* Match the native terminal lock-only arm: committed or aborted,
+			 * the row lock is released and the tuple remains updatable. */
+			*res = TM_Ok;
 		else if (TransactionIdDidCommit(raw_xmax))
 			*res = is_delete ? TM_Deleted : TM_Updated;
 		else
@@ -1015,7 +1048,7 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
 	{
 		TM_Result cluster_res;
 
-		if (cluster_satisfies_update_fork(htup, buffer, &cluster_res)) {
+		if (cluster_satisfies_update_fork(htup, curcid, buffer, &cluster_res)) {
 			cluster_vis_bump_vis_update_fork_count();
 			return cluster_res;
 		}
@@ -1267,7 +1300,9 @@ HeapTupleSatisfiesUpdate(HeapTuple htup, CommandId curcid, Buffer buffer)
  *	fail-closes to 53R9H.  Tuple ITL evidence gate.
  */
 static bool
-cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool *visible)
+cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer,
+							 bool *visible, bool *remote_xmax_wait,
+							 ClusterTxLocator *remote_wait_locator)
 {
 	HeapTupleHeader tuple = htup->t_data;
 	TransactionId raw_xid = HeapTupleHeaderGetRawXmin(tuple);
@@ -1354,6 +1389,15 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer, b
 		case CLUSTER_VIS_ROUTE_REMOTE_VERDICT:
 			switch (cluster_vis_dirty_verdict(xr.status, true, false)) {
 			case CVV_FAILCLOSED_CONFLICT:
+				if (cluster_vis_dirty_remote_xmax_waitable(
+						xr.status, true, xr.row_wait_locator_valid)
+					&& remote_xmax_wait != NULL
+					&& remote_wait_locator != NULL) {
+					*remote_xmax_wait = true;
+					*remote_wait_locator = xr.row_wait_locator;
+					*visible = true;
+					return true;
+				}
 				ereport(ERROR,
 						(errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 						 errmsg("cross-node write conflict: remote in-progress xmax %u", raw_xmax),
@@ -1392,7 +1436,12 @@ cluster_satisfies_dirty_fork(HeapTuple htup, Snapshot snapshot, Buffer buffer, b
 
 
 static bool
-HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+HeapTupleSatisfiesDirtyInternal(HeapTuple htup, Snapshot snapshot, Buffer buffer
+#ifdef USE_PGRAC_CLUSTER
+								, bool *remote_xmax_wait,
+								ClusterTxLocator *remote_wait_locator
+#endif
+	)
 {
 	HeapTupleHeader tuple = htup->t_data;
 
@@ -1406,7 +1455,9 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	{
 		bool cluster_vis;
 
-		if (cluster_satisfies_dirty_fork(htup, snapshot, buffer, &cluster_vis)) {
+		if (cluster_satisfies_dirty_fork(htup, snapshot, buffer, &cluster_vis,
+									 remote_xmax_wait,
+									 remote_wait_locator)) {
 			cluster_vis_bump_vis_dirty_fork_count();
 			return cluster_vis;
 		}
@@ -1547,12 +1598,24 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	 * XactLockTableWait cannot wait on another node's xid) — fail closed
 	 * retryable; the cross-node wait rides the writer's D2b bridge. */
 	if (cluster_plain_xmax_provably_foreign(tuple)) {
-		switch (cluster_foreign_xmax_state(buffer, tuple, HeapTupleHeaderGetRawXmax(tuple))) {
+		ClusterVisResolve xr;
+
+		switch (cluster_foreign_xmax_state(
+					buffer, tuple, HeapTupleHeaderGetRawXmax(tuple), &xr)) {
 		case CLUSTER_FOREIGN_XMAX_DELETED:
 			return false; /* updated by other */
 		case CLUSTER_FOREIGN_XMAX_NOT_DELETED:
 			return true;
 		case CLUSTER_FOREIGN_XMAX_IN_PROGRESS:
+			if (cluster_vis_dirty_remote_xmax_waitable(
+					xr.status, true, xr.row_wait_locator_valid)
+				&& remote_xmax_wait != NULL
+				&& remote_wait_locator != NULL) {
+				*remote_xmax_wait = true;
+				*remote_wait_locator = xr.row_wait_locator;
+				return true;
+			}
+			/* fall through */
 		default:
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CROSS_NODE_WRITE_CONFLICT),
 							errmsg("cross-node write conflict on tuple with in-progress "
@@ -1590,6 +1653,39 @@ HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 	SetHintBits(tuple, buffer, HEAP_XMAX_COMMITTED, HeapTupleHeaderGetRawXmax(tuple));
 	return false; /* updated by other */
 }
+
+static bool
+HeapTupleSatisfiesDirty(HeapTuple htup, Snapshot snapshot, Buffer buffer)
+{
+	return HeapTupleSatisfiesDirtyInternal(htup, snapshot, buffer
+#ifdef USE_PGRAC_CLUSTER
+									   , NULL, NULL
+#endif
+		);
+}
+
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * SnapshotDirty's native xid side channel cannot name a remote transaction.
+ * The built-in typed index-fetch path therefore receives the exact DATA
+ * locator separately; all other snapshot kinds retain the ordinary API.
+ */
+bool
+cluster_heap_tuple_satisfies_visibility_waitable(
+	HeapTuple tuple, Snapshot snapshot, Buffer buffer,
+	bool *remote_xmax_wait, ClusterTxLocator *remote_wait_locator)
+{
+	if (remote_xmax_wait != NULL)
+		*remote_xmax_wait = false;
+	if (remote_wait_locator != NULL)
+		memset(remote_wait_locator, 0, sizeof(*remote_wait_locator));
+
+	if (snapshot->snapshot_type == SNAPSHOT_DIRTY)
+		return HeapTupleSatisfiesDirtyInternal(
+			tuple, snapshot, buffer, remote_xmax_wait, remote_wait_locator);
+	return HeapTupleSatisfiesVisibility(tuple, snapshot, buffer);
+}
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 /*
@@ -1669,8 +1765,9 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 				source_request.origin_slot = (uint16)mx_origin;
 				source_request.mxid = (MultiXactId)HeapTupleHeaderGetRawXmax(tuple);
 				source_request.snapshot = snapshot;
-				source_admission = cluster_multixact_source_dispatch(
-					CLUSTER_MULTI_SOURCE_REMOTE_XMAX_RESOLVE, &source_request, &source_result);
+				source_admission
+					= cluster_multixact_remote_xmax_visibility_dispatch(
+						&source_request, &source_result);
 				if (source_admission == CLUSTER_SEMANTIC_ADMISSION_OK) {
 					mx_decision = source_result.visibility;
 				}
@@ -2421,9 +2518,9 @@ HeapTupleSatisfiesMVCC(HeapTuple htup, Snapshot snapshot, Buffer buffer)
 					source_request.origin_slot = (uint16)mx_origin;
 					source_request.mxid = (MultiXactId)raw_xmax_multi;
 					source_request.snapshot = snapshot;
-					source_admission = cluster_multixact_source_dispatch(
-						CLUSTER_MULTI_SOURCE_REMOTE_XMAX_RESOLVE, &source_request,
-						&source_result);
+					source_admission
+						= cluster_multixact_remote_xmax_visibility_dispatch(
+							&source_request, &source_result);
 					if (source_admission == CLUSTER_SEMANTIC_ADMISSION_OK) {
 						mx_decision = source_result.visibility;
 						mx_hit = source_result.overlay_hit;

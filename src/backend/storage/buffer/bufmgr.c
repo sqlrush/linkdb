@@ -221,7 +221,7 @@ static inline ClusterPcmOwnResult cluster_pcm_own_bump_locked(BufferDesc *buf,
  */
 static inline void
 cluster_pcm_own_transition(BufferDesc *buf, uint8 new_pcm_state, uint32 set_flags,
-						   uint32 clear_flags)
+						   uint32 clear_flags, const char *context)
 {
 	ClusterPcmOwnResult bump_result;
 	uint32 buf_state;
@@ -242,7 +242,7 @@ cluster_pcm_own_transition(BufferDesc *buf, uint8 new_pcm_state, uint32 set_flag
 	if (bump_result != CLUSTER_PCM_OWN_OK) {
 		UnlockBufHdr(buf, buf_state);
 		cluster_pcm_own_report_bump_failure(buf, bump_result, new_generation,
-										observed_flags, "ownership transition");
+										observed_flags, context);
 	}
 	if ((new_pcm_state == (uint8) PCM_STATE_S || new_pcm_state == (uint8) PCM_STATE_X)
 		&& (buf_state & BM_VALID) == 0)
@@ -9857,6 +9857,12 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 		pcm_x_writer = cluster_bufmgr_pcm_x_writer_find(buf);
 		pcm_x_writer_managed = pcm_x_writer != NULL;
 		cluster_bufmgr_pcm_x_writer_mark_releasing(pcm_x_writer);
+		/* MXA-I34: READ_IMAGE is valid only while this content bracket is
+		 * held.  Clear it before publishing the content unlock so no next
+		 * locker can observe a stale one-shot marker. */
+		if (buf->pcm_state == (uint8) PCM_STATE_READ_IMAGE)
+			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0,
+				"LockBuffer unlock READ_IMAGE");
 		LWLockRelease(BufferDescriptorGetContentLock(buf));
 		cluster_bufmgr_pcm_x_writer_release(pcm_x_writer);
 	}
@@ -10085,6 +10091,13 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 						buf, &pcm_pending_base, pcm_pending_token,
 						"LockBuffer S read-image");
 					pcm_pending_set = false;
+					/* The installed bytes are current for this SHARE bracket,
+					 * but no durable S grant was recorded.  Give read-only
+					 * consumers an explicit transient class; unlock clears it
+					 * before the bracket becomes observable to another locker. */
+					cluster_pcm_own_transition(
+						buf, (uint8) PCM_STATE_READ_IMAGE, 0, 0,
+						"LockBuffer SHARE read-image publish");
 				}
 				break;
 			}
@@ -10104,10 +10117,6 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 
 #ifdef USE_PGRAC_CLUSTER
 	if (mode == BUFFER_LOCK_UNLOCK
-		&& buf->pcm_state == (uint8) PCM_STATE_READ_IMAGE)
-		cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
-
-	if (mode == BUFFER_LOCK_UNLOCK
 		&& cluster_pcm_is_active()
 		&& cluster_bufmgr_should_pcm_track(buf)
 		&& buf->pcm_state != (uint8) PCM_STATE_N)
@@ -10118,7 +10127,8 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 		{
 			cluster_pcm_lock_unlock_content_buffer(buf, old_mode);
 			cluster_pcm_own_transition(
-				buf, (uint8) cluster_pcm_lock_query(buf->tag), 0, 0);
+				buf, (uint8) cluster_pcm_lock_query(buf->tag), 0, 0,
+				"LockBuffer SHARE local-cache-off mirror");
 		}
 	}
 	return;
@@ -13603,7 +13613,8 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 		 */
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-force-round");
 		if (cluster_injection_should_skip("cluster-pcm-restore-aba-force-round"))
-			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
+			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0,
+				"GCS drop restore ABA force round");
 
 		buf_state = LockBufHdr(buf);
 
@@ -14081,7 +14092,8 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 		/* W2 RED force-round — see the twin arm above. */
 		CLUSTER_INJECTION_POINT("cluster-pcm-restore-aba-force-round");
 		if (cluster_injection_should_skip("cluster-pcm-restore-aba-force-round"))
-			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0);
+			cluster_pcm_own_transition(buf, (uint8) PCM_STATE_N, 0, 0,
+				"GCS invalidate restore ABA force round");
 
 		buf_state = LockBufHdr(buf);
 

@@ -15571,6 +15571,48 @@ pcm_resource_x_s_predecessor_cancel_unbound_round_locked(
 	return RESOURCE_X_APPLY_APPLIED;
 }
 
+static bool
+pcm_resource_x_prepared_terminal_x_source_exact_locked(
+	struct GrdEntry *entry, const ResourceXDecodedFrame *block,
+	int32 authenticated_master_node,
+	const ClusterPcmOwnSnapshot *prepared_x_source,
+	const ResourceXLocalOwnerHandle *x_owner)
+{
+	ClusterPcmResourceXBootstrapRound *round;
+	ClusterPcmResourceXLocalOwner *local_owner;
+	ResourceXTerminalXLineage lineage;
+
+	Assert(entry != NULL);
+	Assert(block != NULL);
+	Assert(prepared_x_source != NULL);
+	Assert(x_owner != NULL);
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
+	round = &entry->resource_x_bootstrap_round;
+	local_owner = &entry->resource_x_local_owner;
+	memset(&lineage, 0, sizeof(lineage));
+	return pcm_resource_x_local_owner_valid_locked(local_owner)
+		&& local_owner->state == RESOURCE_X_LOCAL_OWNER_REVOKING
+		&& pcm_resource_x_local_owner_handle_equal(
+			&local_owner->handle, x_owner)
+		&& pcm_resource_x_local_handoff_valid(&local_owner->handoff)
+		&& pcm_resource_x_local_handoff_matches_handle(
+			&local_owner->handoff, x_owner)
+		&& pcm_resource_x_local_handoff_successor_exact(
+			&local_owner->handoff, block, authenticated_master_node,
+			x_owner->r4_record_generation, prepared_x_source->generation)
+		&& pcm_resource_x_local_handoff_round_current_locked(
+			&local_owner->handoff, round)
+		&& pcm_resource_x_terminal_x_lineage_locked(
+			entry, round, block, authenticated_master_node,
+			x_owner->r4_record_generation, prepared_x_source->generation,
+			false, &lineage)
+		&& pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
+			entry, round, &x_owner->ref,
+			x_owner->master_session_incarnation,
+			x_owner->r4_record_generation,
+			x_owner->buffer_ownership_generation);
+}
+
 static ResourceXApplyResult
 pcm_resource_x_block_to_n_source_exact_internal(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
@@ -15579,8 +15621,9 @@ pcm_resource_x_block_to_n_source_exact_internal(
 	const ClusterPcmOwnSnapshot *prepared_s_source,
 	XLogRecPtr prepared_page_lsn, uint64 prepared_page_scn,
 	uint32 prepared_page_checksum,
-	const ClusterPcmOwnSnapshot *prepared_drop_x_source,
-	const ResourceXLocalOwnerHandle *drop_x_owner)
+	const ClusterPcmOwnSnapshot *prepared_x_source,
+	const ResourceXLocalOwnerHandle *x_owner,
+	ClusterPcmXRevokeFinishMode required_x_finish_mode)
 {
 	ClusterPcmResourceXHolderStatus status_record;
 	ClusterPcmResourceXHolderImage image_record;
@@ -15602,7 +15645,8 @@ pcm_resource_x_block_to_n_source_exact_internal(
 	bool installed_remote_source;
 	bool local_grd_source;
 	bool prepared_remote_s_source = false;
-	bool prepared_drop_x_source_exact = false;
+	bool prepared_terminal_x_source_exact = false;
+	bool prepared_x_source_exact = false;
 	bool pristine_remote_source;
 	bool shared_s_source;
 	uint8 source_mode;
@@ -15724,45 +15768,48 @@ pcm_resource_x_block_to_n_source_exact_internal(
 	} else if (prepared_s_source != NULL) {
 		return RESOURCE_X_APPLY_INVALID;
 	}
-	if (prepared_drop_x_source != NULL || drop_x_owner != NULL) {
-		if (prepared_drop_x_source == NULL || drop_x_owner == NULL
+	if (prepared_x_source != NULL || x_owner != NULL
+		|| required_x_finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_INVALID) {
+		if (prepared_x_source == NULL || x_owner == NULL
 			|| shared_s_source)
 			return RESOURCE_X_APPLY_INVALID;
-		if (!pcm_resource_x_local_owner_handle_valid(drop_x_owner)
+		if ((required_x_finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_RETAIN
+				&& required_x_finish_mode != CLUSTER_PCM_X_REVOKE_FINISH_DROP)
+			|| !pcm_resource_x_local_owner_handle_valid(x_owner)
 			|| cluster_pcm_x_revoke_finish_mode(
 				&block->common.logical_assertion.resource, 0)
-				!= CLUSTER_PCM_X_REVOKE_FINISH_DROP
-			|| !BufferTagsEqual(&prepared_drop_x_source->tag,
+				!= required_x_finish_mode
+			|| !BufferTagsEqual(&prepared_x_source->tag,
 				&block->common.logical_assertion.resource)
-			|| prepared_drop_x_source->pcm_state != (uint8)PCM_STATE_X
-			|| prepared_drop_x_source->flags != PCM_OWN_FLAG_REVOKING
-			|| prepared_drop_x_source->generation == 0
-			|| prepared_drop_x_source->generation == UINT64_MAX
-			|| prepared_drop_x_source->reservation_token == 0
-			|| prepared_drop_x_source->reservation_token == UINT64_MAX
-			|| prepared_drop_x_source->writer_activation_token != 0
-			|| prepared_drop_x_source->resource_x_activation_generation != 0
-			|| drop_x_owner->buffer_ownership_generation
-				!= prepared_drop_x_source->generation
-			|| drop_x_owner->reservation_token == UINT64_MAX
-			|| drop_x_owner->reservation_token + 1
-				!= prepared_drop_x_source->reservation_token
-			|| !BufferTagsEqual(&drop_x_owner->ref.assertion.resource,
+			|| prepared_x_source->pcm_state != (uint8)PCM_STATE_X
+			|| prepared_x_source->flags != PCM_OWN_FLAG_REVOKING
+			|| prepared_x_source->generation == 0
+			|| prepared_x_source->generation == UINT64_MAX
+			|| prepared_x_source->reservation_token == 0
+			|| prepared_x_source->reservation_token == UINT64_MAX
+			|| prepared_x_source->writer_activation_token != 0
+			|| prepared_x_source->resource_x_activation_generation != 0
+			|| x_owner->buffer_ownership_generation
+				!= prepared_x_source->generation
+			|| x_owner->reservation_token == UINT64_MAX
+			|| x_owner->reservation_token + 1
+				!= prepared_x_source->reservation_token
+			|| !BufferTagsEqual(&x_owner->ref.assertion.resource,
 				&block->common.logical_assertion.resource)
-			|| drop_x_owner->ref.formation
+			|| x_owner->ref.formation
 				!= block->common.resource_formation
-			|| drop_x_owner->master_session_incarnation
+			|| x_owner->master_session_incarnation
 				!= block->common.master_session_incarnation
 			|| pcm_resource_x_source_fence_get_u64(
 				image_envelope->body.image_envelope.source_fence + 20)
-				!= prepared_drop_x_source->generation
+				!= prepared_x_source->generation
 			|| image_envelope->body.image_envelope.source_fence[28]
 				!= (uint8)PCM_STATE_X
 			|| image_envelope->body.image_envelope.source_fence[29] != 1
 			|| image_envelope->body.image_envelope.source_carrier_generation
-				!= prepared_drop_x_source->generation + 1)
+				!= prepared_x_source->generation + 1)
 			return RESOURCE_X_APPLY_STALE;
-		prepared_drop_x_source_exact = true;
+		prepared_x_source_exact = true;
 	}
 	memset(&status_record, 0, sizeof(status_record));
 	memset(&image_record, 0, sizeof(image_record));
@@ -15856,13 +15903,41 @@ pcm_resource_x_block_to_n_source_exact_internal(
 		pcm_entry_ref_release(&entry_ref);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
+	prepared_terminal_x_source_exact = prepared_x_source_exact
+		&& authenticated_master_node != cluster_node_id
+		&& entry->resource_x_requester_base_generation >= 1
+		&& entry->resource_x_requester_base_generation
+			<= block->common.base_authority_generation
+		&& entry->resource_x_retired_acquisition_generation != 0
+		&& pcm_resource_x_active_empty_locked(entry)
+		&& (PcmState)pg_atomic_read_u32(&entry->master_state) == PCM_STATE_N
+		&& entry->x_holder_node == -1
+		&& pg_atomic_read_u32(&entry->s_holders_bitmap) == 0
+		&& pcm_resource_x_prepared_terminal_x_source_exact_locked(
+			entry, block, authenticated_master_node, prepared_x_source,
+			x_owner);
+	/* The prepared terminal-X predicate is the remote-master provenance
+	 * class added for a holder whose local GRD is only an N mirror.  A
+	 * self-master DROP is instead admitted by local_grd_source below; its
+	 * exact REVOKING snapshot remains a physical-finish fence and must not
+	 * replace or veto that canonical local GRD authority. */
+	if (prepared_x_source_exact
+		&& authenticated_master_node != cluster_node_id
+		&& !prepared_terminal_x_source_exact) {
+		ResourceXApplyResult result
+			= pcm_resource_x_local_owner_valid_locked(
+				&entry->resource_x_local_owner)
+				? RESOURCE_X_APPLY_STALE
+				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+
+		LWLockRelease(&entry->entry_lock.lock);
+		pcm_entry_ref_release(&entry_ref);
+		return result;
+	}
 	if (state->holder_status.valid != 0 || state->holder_image.valid != 0) {
-		ClusterPcmResourceXBootstrapRound *round;
-		ClusterPcmResourceXLocalOwner *local_owner;
 		ResourceXDecodedFrame old_image;
 		ResourceXDecodedFrame old_status;
 		ResourceXApplyResult result;
-		ResourceXTerminalXLineage drop_lineage;
 		bool exact_existing;
 		bool exact_existing_drained;
 		bool exact_drop_episode_restart = false;
@@ -15940,44 +16015,21 @@ pcm_resource_x_block_to_n_source_exact_internal(
 				   == PCM_STATE_N
 			&& entry->x_holder_node == -1
 			&& pg_atomic_read_u32(&entry->s_holders_bitmap) == 0;
-		round = &entry->resource_x_bootstrap_round;
-		local_owner = &entry->resource_x_local_owner;
-		memset(&drop_lineage, 0, sizeof(drop_lineage));
 		if (result == RESOURCE_X_APPLY_APPLIED
-			&& prepared_drop_x_source_exact
+			&& prepared_terminal_x_source_exact
+			&& required_x_finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP
 			&& decoded_image.body.image_envelope.source_carrier_generation
 				== old_image.body.image_envelope.source_carrier_generation
 			&& resource_x_assertion_equal(
 				&block->common.logical_assertion,
 				&old_status.common.logical_assertion)
 			&& status_record.logical_generation
-				> state->holder_status.logical_generation
-			&& pcm_resource_x_local_owner_valid_locked(local_owner)
-			&& local_owner->state == RESOURCE_X_LOCAL_OWNER_REVOKING
-			&& pcm_resource_x_local_owner_handle_equal(
-				&local_owner->handle, drop_x_owner)
-			&& pcm_resource_x_local_handoff_valid(&local_owner->handoff)
-			&& pcm_resource_x_local_handoff_matches_handle(
-				&local_owner->handoff, drop_x_owner)
-			&& pcm_resource_x_local_handoff_successor_exact(
-				&local_owner->handoff, block, authenticated_master_node,
-				drop_x_owner->r4_record_generation,
-				prepared_drop_x_source->generation)
-			&& pcm_resource_x_local_handoff_round_current_locked(
-				&local_owner->handoff, round)
-			&& pcm_resource_x_terminal_x_lineage_locked(
-				entry, round, block, authenticated_master_node,
-				drop_x_owner->r4_record_generation,
-				prepared_drop_x_source->generation, false, &drop_lineage)
-			&& pcm_resource_x_bootstrap_round_terminal_cover_exact_locked(
-				entry, round, &drop_x_owner->ref,
-				drop_x_owner->master_session_incarnation,
-				drop_x_owner->r4_record_generation,
-				drop_x_owner->buffer_ownership_generation))
+				> state->holder_status.logical_generation)
 			exact_drop_episode_restart = true;
 		if (result != RESOURCE_X_APPLY_APPLIED
 				|| (!local_grd_source && !installed_remote_source
-					&& !prepared_remote_s_source)
+					&& !prepared_remote_s_source
+					&& !prepared_terminal_x_source_exact)
 			|| state->holder_status_intent.slot.state
 				   != RESOURCE_X_INTENT_SLOT_EMPTY
 			|| state->holder_image_intent.state
@@ -16073,7 +16125,8 @@ pcm_resource_x_block_to_n_source_exact_internal(
 		&& pg_atomic_read_u32(&entry->pi_holders_bitmap) == 0
 		&& pg_atomic_read_u64(&entry->transition_count_local) == 0;
 	if ((!local_grd_source && !installed_remote_source
-			&& !pristine_remote_source && !prepared_remote_s_source)
+			&& !pristine_remote_source && !prepared_remote_s_source
+			&& !prepared_terminal_x_source_exact)
 		|| state->holder_status_intent.slot.state
 			!= RESOURCE_X_INTENT_SLOT_EMPTY
 		|| state->holder_image_intent.state
@@ -16534,7 +16587,8 @@ cluster_pcm_lock_resource_x_block_to_n_source_exact(
 {
 	return pcm_resource_x_block_to_n_source_exact_internal(
 		block, authenticated_master_node, blocked_status, image_envelope,
-		NULL, InvalidXLogRecPtr, 0, 0, NULL, NULL);
+		NULL, InvalidXLogRecPtr, 0, 0, NULL, NULL,
+		CLUSTER_PCM_X_REVOKE_FINISH_INVALID);
 }
 
 ResourceXApplyResult
@@ -16549,7 +16603,25 @@ cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
 		return RESOURCE_X_APPLY_INVALID;
 	return pcm_resource_x_block_to_n_source_exact_internal(
 		block, authenticated_master_node, blocked_status, image_envelope,
-		NULL, InvalidXLogRecPtr, 0, 0, revoking, owner);
+		NULL, InvalidXLogRecPtr, 0, 0, revoking, owner,
+		CLUSTER_PCM_X_REVOKE_FINISH_DROP);
+}
+
+ResourceXApplyResult
+cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	const ResourceXDecodedFrame *blocked_status,
+	const ResourceXDecodedFrame *image_envelope,
+	const ClusterPcmOwnSnapshot *revoking,
+	const ResourceXLocalOwnerHandle *owner)
+{
+	if (block == NULL || revoking == NULL || owner == NULL
+		|| block->common.observed_mode != (uint8)PCM_STATE_X)
+		return RESOURCE_X_APPLY_INVALID;
+	return pcm_resource_x_block_to_n_source_exact_internal(
+		block, authenticated_master_node, blocked_status, image_envelope,
+		NULL, InvalidXLogRecPtr, 0, 0, revoking, owner,
+		CLUSTER_PCM_X_REVOKE_FINISH_RETAIN);
 }
 
 ResourceXApplyResult
@@ -16567,7 +16639,8 @@ cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
 	return pcm_resource_x_block_to_n_source_exact_internal(
 		block, authenticated_master_node, blocked_status, image_envelope,
 		prepared_source, prepared_page_lsn, prepared_page_scn,
-		prepared_page_checksum, NULL, NULL);
+		prepared_page_checksum, NULL, NULL,
+		CLUSTER_PCM_X_REVOKE_FINISH_INVALID);
 }
 
 ResourceXApplyResult

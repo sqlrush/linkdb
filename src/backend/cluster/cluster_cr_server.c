@@ -3535,7 +3535,7 @@ cluster_cr_server_current_mx_build_proof_page(
 		= request->prefix.chunk_count_minus_one;
 	page->header.wire_length = sizeof(page->header);
 
-	if (result == CMX_RESOLVE_TIMEOUT || result > CMX_RESOLVE_UNKNOWN)
+	if (result == CMX_RESOLVE_TIMEOUT || result > CMX_RESOLVE_RETRY)
 		return CMX_RESOLVE_UNKNOWN;
 	if (result != CMX_RESOLVE_OK) {
 		if (requester_capability_generation != 0)

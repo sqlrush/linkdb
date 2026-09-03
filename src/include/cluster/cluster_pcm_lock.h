@@ -934,8 +934,9 @@ extern void cluster_pcm_lock_acquire(BufferTag tag, PcmLockMode mode);
  *
  * Returns true if a DURABLE PCM grant was recorded (caller mirrors ownership
  * into buf->pcm_state).  Returns false for a spec-5.2 D2 one-shot READ_IMAGE:
- * bytes were installed for this read only and the caller MUST leave
- * buf->pcm_state == N so the next access re-fetches.  A false return with
+ * bytes were installed for this read only and LockBuffer marks a transient
+ * READ_IMAGE content bracket after aborting the exact grant reservation;
+ * unlock clears it to N so the next access re-fetches.  A false return with
  * *out_retry_denied set is instead a queue-arbitration retry boundary; the
  * caller must exact-abort and replace its GRANT_PENDING reservation.
  */
@@ -1336,6 +1337,13 @@ cluster_pcm_lock_resource_x_block_to_n_source_exact(
 	const ResourceXDecodedFrame *image_envelope);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	const ResourceXDecodedFrame *blocked_status,
+	const ResourceXDecodedFrame *image_envelope,
+	const struct ClusterPcmOwnSnapshot *revoking,
+	const ResourceXLocalOwnerHandle *owner);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
 	const ResourceXDecodedFrame *blocked_status,
 	const ResourceXDecodedFrame *image_envelope,
